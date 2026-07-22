@@ -2593,7 +2593,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const defaultInactiveToolNames = new Set(
 			registeredTools.filter(tool => tool.definition.defaultInactive).map(tool => tool.definition.name),
 		);
-		const requestedActiveToolNames = normalizedRequested.filter(name => name !== "goal");
+		const requestedActiveToolNames = normalizedRequested;
 		const explicitlyRequestedToolNameSet = explicitlyRequestedToolNames
 			? new Set(explicitlyRequestedToolNames)
 			: undefined;

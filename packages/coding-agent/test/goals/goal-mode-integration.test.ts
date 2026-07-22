@@ -171,7 +171,7 @@ describe("InteractiveMode goal mode integration", () => {
 	});
 
 	it("toggles goal tool exposure when goal mode enters and pauses", async () => {
-		expect(await toolNamesFor(harness)).not.toContain("goal");
+		expect(await toolNamesFor(harness)).toContain("goal");
 
 		await harness.mode.handleGoalModeCommand("Ship the release");
 
@@ -185,7 +185,29 @@ describe("InteractiveMode goal mode integration", () => {
 		expect(harness.mode.goalModeEnabled).toBe(false);
 		expect(harness.mode.goalModePaused).toBe(true);
 		expect(harness.session.getGoalModeState()?.goal.status).toBe("paused");
-		expect(await toolNamesFor(harness)).not.toContain("goal");
+		expect(await toolNamesFor(harness)).toContain("goal");
+	});
+
+	it("lets the agent create a goal before user-started goal mode", async () => {
+		expect(harness.session.getGoalModeState()).toBeUndefined();
+		const goalTool = (await createTools(harness.toolSession, harness.session.getActiveToolNames())).find(
+			tool => tool.name === "goal",
+		);
+		if (!goalTool) {
+			throw new Error("Expected goal tool to be active");
+		}
+
+		const result = await goalTool.execute("call-create", {
+			op: "create",
+			objective: "Agent-started goal",
+			token_budget: undefined,
+		});
+
+		expect(result.details?.op).toBe("create");
+		expect(result.details?.goal?.objective).toBe("Agent-started goal");
+		expect(result.details?.goal?.status).toBe("active");
+		expect(harness.session.getGoalModeState()?.enabled).toBe(true);
+		expect(harness.session.getGoalModeState()?.goal.objective).toBe("Agent-started goal");
 	});
 
 	it("replaces the active goal via /goal set", async () => {
@@ -477,7 +499,7 @@ describe("InteractiveMode goal mode integration", () => {
 		expect(harness.mode.goalModeEnabled).toBe(false);
 		expect(harness.mode.goalModePaused).toBe(false);
 		expect(harness.session.getGoalModeState()).toBeUndefined();
-		expect(await toolNamesFor(harness)).not.toContain("goal");
+		expect(await toolNamesFor(harness)).toContain("goal");
 		expect(appendCustomEntry).toHaveBeenCalledWith(
 			"goal-completed",
 			expect.objectContaining({

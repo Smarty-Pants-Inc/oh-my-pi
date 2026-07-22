@@ -127,6 +127,25 @@ describe("GoalTool", () => {
 		});
 	});
 
+	it("treats a null token_budget as an unbounded goal for strict tool schemas", async () => {
+		const harness = createRuntimeHarness();
+		const tool = new GoalTool(
+			createToolSession({
+				getGoalRuntime: () => harness.runtime,
+				getGoalModeState: () => harness.getState(),
+			}),
+		);
+
+		const result = await tool.execute("call-create-unbounded", {
+			op: "create",
+			objective: "Ship without a ceiling",
+			token_budget: null,
+		});
+
+		expect(harness.getState()?.goal.tokenBudget).toBeUndefined();
+		expect(result.details).toMatchObject({ remainingTokens: null });
+	});
+
 	it("rejects create when a goal already exists", async () => {
 		const harness = createRuntimeHarness({
 			enabled: true,

@@ -211,6 +211,29 @@ For the bash tool specifically:
 - NEVER commit unless asked.
 - Never use `tsc`/`npx tsc` — always `bun check`.
 
+## Smarty App Managed Fork
+
+When this checkout is managed from Smarty App's `omp-fork-agent-goals` lane, do
+not push from the local checkout. Export OMP changes as patches under Smarty
+App's `docs/smarty/omp-fork-agent-goals/patches/`, then let
+`config/scripts/omp-fork-manager.mjs` clone, sync, apply, build, and link them.
+The manager keeps `origin` and `upstream` push URLs disabled and installs only a
+reversible host shim ahead of Homebrew.
+
+Agent-started goals are intentional fork behavior: `goal` must be available
+when `goal.enabled` is true and the session has a `GoalRuntime`, even before the
+user starts `/goal`. Keep it hidden while goal mode is exiting so the completion
+cleanup path cannot re-enter the tool. Cover this with:
+
+```sh
+bun test packages/coding-agent/test/tools/index.test.ts \
+  packages/coding-agent/test/goals/goal-tool.test.ts \
+  packages/coding-agent/test/goals/goal-mode-integration.test.ts
+```
+
+Fresh source checkouts need Bun `>=1.3.14`, `bun install --frozen-lockfile`, and
+`bun --cwd=packages/natives run build` before those tests or source `omp` runs.
+
 ## Testing Guidance
 
 Test the contract the system exposes — not the easiest internal detail to assert.

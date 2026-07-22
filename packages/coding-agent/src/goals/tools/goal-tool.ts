@@ -17,7 +17,9 @@ import type { Goal, GoalStatus, GoalToolDetails } from "../state";
 const goalSchema = type({
 	op: type("'create' | 'get' | 'complete' | 'resume' | 'drop'").describe("goal operation"),
 	"objective?": type("string").describe("goal objective"),
-	"token_budget?": type("number.integer").describe("token budget"),
+	"token_budget?": type("number.integer | null").describe(
+		"optional cost/continuation ceiling; omit or pass null for an unbounded goal",
+	),
 });
 
 export type GoalToolInput = typeof goalSchema.infer;
@@ -48,7 +50,7 @@ function validateCreateParams(params: GoalToolInput): { objective: string; token
 	if (!objective) {
 		throw new ToolError("objective is required when op=create");
 	}
-	const tokenBudget = params.token_budget;
+	const tokenBudget = params.token_budget ?? undefined;
 	if (tokenBudget !== undefined && (!Number.isInteger(tokenBudget) || tokenBudget <= 0)) {
 		throw new ToolError("token_budget must be a positive integer when provided");
 	}
