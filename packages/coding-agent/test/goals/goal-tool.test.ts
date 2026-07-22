@@ -89,9 +89,9 @@ describe("GoalTool", () => {
 		const created = await tool.execute("call-create", {
 			op: "create",
 			objective: "  Create route  ",
-			token_budget: 10,
+			token_budget: undefined,
 		});
-		expect(runtime.createGoal).toHaveBeenCalledWith({ objective: "Create route", tokenBudget: 10 });
+		expect(runtime.createGoal).toHaveBeenCalledWith({ objective: "Create route" });
 		expect(created.details).toMatchObject({
 			op: "create",
 			goal: createGoalState.goal,
@@ -127,7 +127,7 @@ describe("GoalTool", () => {
 		});
 	});
 
-	it("treats a null token_budget as an unbounded goal for strict tool schemas", async () => {
+	it("creates an unbounded goal when token_budget is omitted", async () => {
 		const harness = createRuntimeHarness();
 		const tool = new GoalTool(
 			createToolSession({
@@ -139,7 +139,7 @@ describe("GoalTool", () => {
 		const result = await tool.execute("call-create-unbounded", {
 			op: "create",
 			objective: "Ship without a ceiling",
-			token_budget: null,
+			token_budget: undefined,
 		});
 
 		expect(harness.getState()?.goal.tokenBudget).toBeUndefined();
@@ -160,7 +160,7 @@ describe("GoalTool", () => {
 		);
 
 		await expect(
-			tool.execute("call-create", { op: "create", objective: "New goal", token_budget: 10 }),
+			tool.execute("call-create", { op: "create", objective: "New goal", token_budget: undefined }),
 		).rejects.toThrow("cannot create a new goal because this session already has a goal");
 	});
 
@@ -193,7 +193,7 @@ describe("GoalTool", () => {
 		expect(harness.getState()).toBeUndefined();
 	});
 
-	it("rejects op=create when the token_budget is zero or negative", async () => {
+	it("rejects every numeric agent token_budget with a stable machine-readable code", async () => {
 		const harness = createRuntimeHarness();
 		const tool = new GoalTool(
 			createToolSession({
@@ -202,12 +202,11 @@ describe("GoalTool", () => {
 			}),
 		);
 
-		await expect(tool.execute("call-zero", { op: "create", objective: "Ship it", token_budget: 0 })).rejects.toThrow(
-			"token_budget must be a positive integer when provided",
-		);
-		await expect(tool.execute("call-neg", { op: "create", objective: "Ship it", token_budget: -5 })).rejects.toThrow(
-			"token_budget must be a positive integer when provided",
-		);
+		for (const token_budget of [1, 0, -5]) {
+			await expect(tool.execute("call-budget", { op: "create", objective: "Ship it", token_budget })).rejects.toThrow(
+				"agent_goal_token_budget_not_allowed",
+			);
+		}
 		expect(harness.getState()).toBeUndefined();
 	});
 

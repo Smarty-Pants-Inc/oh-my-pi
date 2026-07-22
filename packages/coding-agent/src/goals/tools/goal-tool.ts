@@ -18,7 +18,7 @@ const goalSchema = type({
 	op: type("'create' | 'get' | 'complete' | 'resume' | 'drop'").describe("goal operation"),
 	"objective?": type("string").describe("goal objective"),
 	"token_budget?": type("number.integer | null").describe(
-		"optional cost/continuation ceiling; omit or pass null for an unbounded goal",
+		"must be omitted for agent-created goals; null is accepted only for strict tool schemas",
 	),
 });
 
@@ -50,11 +50,10 @@ function validateCreateParams(params: GoalToolInput): { objective: string; token
 	if (!objective) {
 		throw new ToolError("objective is required when op=create");
 	}
-	const tokenBudget = params.token_budget ?? undefined;
-	if (tokenBudget !== undefined && (!Number.isInteger(tokenBudget) || tokenBudget <= 0)) {
-		throw new ToolError("token_budget must be a positive integer when provided");
+	if (params.token_budget !== undefined && params.token_budget !== null) {
+		throw new ToolError("agent_goal_token_budget_not_allowed: agent-created goals must omit token_budget");
 	}
-	return { objective, tokenBudget };
+	return { objective };
 }
 
 export class GoalTool implements AgentTool<typeof goalSchema, GoalToolDetails> {

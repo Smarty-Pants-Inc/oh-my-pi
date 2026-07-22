@@ -250,6 +250,30 @@ describe("goal runtime", () => {
 		expect(harness.hiddenMessages).toHaveLength(2);
 	});
 
+	it("preserves owner caps across a runtime restart and resumes after cap removal", async () => {
+		const first = createHarness({
+			state: {
+				enabled: true,
+				mode: "active",
+				goal: createGoal({ tokenBudget: 10, tokensUsed: 8 }),
+			},
+		});
+
+		await first.runtime.onBudgetMutated(5);
+		const persisted = first.persists.at(-1)?.state;
+		if (!persisted) throw new Error("expected owner cap to persist");
+
+		const restarted = createHarness({ state: persisted });
+		await restarted.runtime.onThreadResumed();
+		expect(restarted.getState()?.goal.tokenBudget).toBe(5);
+		expect(restarted.getState()?.goal.status).toBe("budget-limited");
+
+		await restarted.runtime.onBudgetMutated(undefined);
+		expect(restarted.getState()?.goal.tokenBudget).toBeUndefined();
+		expect(restarted.getState()?.goal.status).toBe("active");
+		expect(restarted.getState()?.enabled).toBe(true);
+	});
+
 	it("pauses an active goal when an interruption aborts the task", async () => {
 		const harness = createHarness({
 			state: { enabled: true, mode: "active", goal: createGoal() },
