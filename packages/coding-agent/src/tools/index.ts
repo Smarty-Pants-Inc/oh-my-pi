@@ -463,8 +463,14 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 			? normalizeToolNames(toolNames)
 			: undefined;
 	const goalEnabled = session.settings.get("goal.enabled");
-	const goalModeActive = !restrictToolNames && goalEnabled && session.getGoalModeState?.()?.enabled === true;
-	if (goalModeActive && requestedTools && !requestedTools.includes("goal")) {
+	const goalModeExiting = session.getGoalModeState?.()?.mode === "exiting";
+	const goalExplicitlyRequested = requestedTools?.includes("goal") === true;
+	const goalAvailable =
+		!restrictToolNames &&
+		goalEnabled &&
+		!goalModeExiting &&
+		(session.getGoalRuntime?.() !== undefined || goalExplicitlyRequested);
+	if (goalAvailable && requestedTools && !requestedTools.includes("goal")) {
 		requestedTools.push("goal");
 	}
 	const backends = resolveEvalBackends(session);
@@ -537,7 +543,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 	// Auto-include AST counterparts when their text-based sibling is present.
 	// Restricted callers own the active list and must not have it widened.
 	if (requestedTools && !restrictToolNames) {
-		if (goalModeActive && !requestedTools.includes("goal")) {
+		if (goalAvailable && !requestedTools.includes("goal")) {
 			requestedTools.push("goal");
 		}
 		if (
@@ -580,16 +586,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 	}
 	const allTools: Record<string, ToolFactory> = { ...BUILTIN_TOOLS, ...HIDDEN_TOOLS };
 	const isToolAllowed = (name: string) => {
-		// Never in the default set. Explicitly activatable while goal.enabled and
-		// no goal record exists yet — /guided-goal enables it so the agent can
-		// finish the interview with `goal create`, which turns goal mode on. Once
-		// a goal record exists, only an enabled goal keeps the tool: a completed
-		// (exiting) or paused goal must stop advertising it on the next rebuild.
-		if (name === "goal") {
-			if (!goalEnabled || restrictToolNames) return false;
-			const goalState = session.getGoalModeState?.();
-			return goalState === undefined || goalState.enabled === true || goalState.goal.status === "dropped";
-		}
+		if (name === "goal") return goalAvailable;
 		if (name === "lsp") return enableLsp && session.settings.get("lsp.enabled");
 		if (name === "bash") return session.settings.get("bash.enabled");
 		if (name === "eval") return allowEval;
@@ -651,7 +648,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 						.filter(([name]) => isToolAllowed(name))
 						.map(([name, factory]) => [name, factory] as const),
 					...(includeYield ? ([["yield", HIDDEN_TOOLS.yield]] as const) : []),
-					...(goalModeActive ? ([["goal", HIDDEN_TOOLS.goal]] as const) : []),
+					...(goalAvailable ? ([["goal", HIDDEN_TOOLS.goal]] as const) : []),
 				];
 
 	const activeToolNames = new Set(baseEntries.map(([name]) => name));
