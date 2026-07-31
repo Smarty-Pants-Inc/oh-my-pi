@@ -201,11 +201,104 @@ async function runBazel(
 	return { exitCode, stdout: stdoutText, stderrTail: tail };
 }
 
+interface MachOStringTableLayout {
+	symtabCommandOffset: number;
+	stringOffset: number;
+	linkeditCommandOffset: number;
+	linkeditFileSize: number;
+	linkeditVmSize: number;
+}
+
+function parseMachOStringTableLayout(buffer: Buffer): MachOStringTableLayout {
+	if (buffer.length < 32 || buffer.readUInt32LE(0) !== 0xfeedfacf) {
+		throw new Error("expected a little-endian 64-bit Mach-O addon");
+	}
+	const commandCount = buffer.readUInt32LE(16);
+	let commandOffset = 32;
+	let symtabCommandOffset: number | undefined;
+	let stringOffset: number | undefined;
+	let linkeditCommandOffset: number | undefined;
+	let linkeditFileSize: number | undefined;
+	let linkeditVmSize: number | undefined;
+	for (let index = 0; index < commandCount; index++) {
+		if (commandOffset + 8 > buffer.length) throw new Error("truncated Mach-O load commands");
+		const command = buffer.readUInt32LE(commandOffset);
+		const commandSize = buffer.readUInt32LE(commandOffset + 4);
+		if (commandSize < 8 || commandOffset + commandSize > buffer.length) {
+			throw new Error("invalid Mach-O load command size");
+		}
+		if (command === 0x2) {
+			if (commandSize < 24) throw new Error("truncated Mach-O symbol table command");
+			symtabCommandOffset = commandOffset;
+			stringOffset = buffer.readUInt32LE(commandOffset + 16);
+		}
+		if (command === 0x19 && commandSize >= 72) {
+			const segmentName = buffer
+				.subarray(commandOffset + 8, commandOffset + 24)
+				.toString("ascii")
+				.replace(/\0.*$/, "");
+			if (segmentName === "__LINKEDIT") {
+				linkeditCommandOffset = commandOffset;
+				linkeditVmSize = Number(buffer.readBigUInt64LE(commandOffset + 32));
+				linkeditFileSize = Number(buffer.readBigUInt64LE(commandOffset + 48));
+			}
+		}
+		commandOffset += commandSize;
+	}
+	if (
+		symtabCommandOffset === undefined ||
+		stringOffset === undefined ||
+		linkeditCommandOffset === undefined ||
+		linkeditFileSize === undefined ||
+		linkeditVmSize === undefined
+	) {
+		throw new Error("Mach-O addon is missing symbol table or __LINKEDIT metadata");
+	}
+	const stringSize = buffer.readUInt32LE(symtabCommandOffset + 20);
+	if (stringOffset + stringSize > buffer.length) throw new Error("Mach-O string table exceeds file size");
+	return { symtabCommandOffset, stringOffset, linkeditCommandOffset, linkeditFileSize, linkeditVmSize };
+}
+
+export function alignMachOStringTable(buffer: Buffer): Buffer {
+	const layout = parseMachOStringTableLayout(buffer);
+	const padding = (8 - (layout.stringOffset % 8)) % 8;
+	if (padding === 0) return buffer;
+	if (layout.linkeditFileSize + padding > layout.linkeditVmSize) {
+		throw new Error("Mach-O __LINKEDIT has no room for string-table alignment padding");
+	}
+	const aligned = Buffer.alloc(buffer.length + padding);
+	buffer.copy(aligned, 0, 0, layout.stringOffset);
+	aligned.fill(0, layout.stringOffset, layout.stringOffset + padding);
+	buffer.copy(aligned, layout.stringOffset + padding, layout.stringOffset);
+	aligned.writeUInt32LE(layout.stringOffset + padding, layout.symtabCommandOffset + 16);
+	aligned.writeBigUInt64LE(BigInt(layout.linkeditFileSize + padding), layout.linkeditCommandOffset + 48);
+	return aligned;
+}
+
+function runCodesign(args: string[]): void {
+	const result = Bun.spawnSync(["codesign", ...args], { stdout: "pipe", stderr: "pipe" });
+	if (result.exitCode !== 0) {
+		const detail = Buffer.from(result.stderr).toString("utf8").trim();
+		throw new Error(`codesign ${args.join(" ")} failed${detail ? `: ${detail}` : ""}`);
+	}
+}
+
+async function repairDarwinAddon(filePath: string): Promise<void> {
+	if (process.platform !== "darwin") return;
+	const signed = Buffer.from(await fs.readFile(filePath));
+	if (parseMachOStringTableLayout(signed).stringOffset % 8 === 0) return;
+	runCodesign(["--remove-signature", filePath]);
+	const unsigned = Buffer.from(await fs.readFile(filePath));
+	await fs.writeFile(filePath, alignMachOStringTable(unsigned));
+	runCodesign(["--force", "--sign", "-", filePath]);
+}
+
 async function installAddon(sourcePath: string, destPath: string): Promise<void> {
 	const realSource = await fs.realpath(sourcePath); // bazel-bin outputs are symlink-reachable; copy the real bytes
 	const tempPath = `${destPath}.tmp.${process.pid}`;
 	await fs.copyFile(realSource, tempPath);
 	await fs.chmod(tempPath, 0o644);
+	if (path.basename(destPath).startsWith("pi_natives.darwin-")) await repairDarwinAddon(tempPath);
 	try {
 		await fs.rename(tempPath, destPath); // atomic even if dest is a loaded addon
 	} catch (err) {
