@@ -820,6 +820,10 @@
 - Fixed `/retry` reporting "Nothing to retry" after a stream stalled or aborted mid-tool-call.
 - Fixed locally consumed extension commands triggering automatic title generation and exposing their command text to the title model.
 
+### Changed
+
+- OMP goals now default to no token budget. `token_budget` is an opt-in cost/continuation ceiling, not a quality or performance setting; omit it or pass `null` when strict tool schemas require the field, and supply a positive integer only for a user-requested or task-defined stopping bound.
+
 ## [17.0.7] - 2026-07-21
 
 ### Fixed
