@@ -365,9 +365,9 @@ describe("runEvalAgent", () => {
 
 		const options = runSpy.mock.calls[0]?.[0];
 		if (!options) throw new Error("runSubprocess was not called");
-		expect(options.enableLsp).toBe(true);
-		expect(options.enableIrc).toBe(true);
-		expect(options.keepAlive).toBe(false);
+		expect(options.runtimeProfile?.capabilities.lsp).toBe(true);
+		expect(options.runtimeProfile?.capabilities.irc).toBe(true);
+		expect(options.runtimeProfile?.capabilities.keepAlive).toBe(false);
 	});
 
 	it("registers temp artifact dirs for in-memory handle results so agent URLs resolve", async () => {
@@ -406,7 +406,7 @@ describe("runEvalAgent", () => {
 				id: options.id,
 				session: cleanupSession,
 				aborted: false,
-				keepAlive: options.keepAlive !== false,
+				keepAlive: options.runtimeProfile?.capabilities.keepAlive ?? options.keepAlive !== false,
 				isolated: options.worktree !== undefined,
 				agentIdleTtlMs: 0,
 				reviveSession: null,

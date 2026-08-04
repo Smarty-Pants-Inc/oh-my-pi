@@ -2,9 +2,14 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type {
+	ExecutionEnvironmentLease,
+	ExecutionEnvironmentProvider,
+} from "@oh-my-pi/pi-coding-agent/session/execution-environment";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import {
 	applyEligibleNestedPatches,
+	type IsolatedRunOptions,
 	mergeIsolatedChanges,
 	runIsolatedSubprocess,
 } from "@oh-my-pi/pi-coding-agent/task/isolation-runner";
@@ -74,6 +79,314 @@ describe("runIsolatedSubprocess", () => {
 	afterEach(async () => {
 		vi.restoreAllMocks();
 		await Promise.all(tempRoots.splice(0).map(tempRoot => fs.rm(tempRoot, { force: true, recursive: true })));
+	});
+
+	function setupLifecycleMocks(events: string[], isolationDir: string) {
+		vi.spyOn(worktreeModule, "ensureIsolation").mockImplementation(async () => {
+			events.push("worktree");
+			return {
+				mergedDir: isolationDir,
+				backend: natives.IsoBackendKind.Rcopy,
+				fellBack: false,
+				fallbackReason: null,
+			};
+		});
+		const capture = vi.spyOn(worktreeModule, "commitToBranch").mockImplementation(async () => {
+			events.push("capture");
+			return null;
+		});
+		vi.spyOn(worktreeModule, "cleanupIsolation").mockImplementation(async () => {
+			events.push("cleanup");
+		});
+		return { capture };
+	}
+
+	function fakeEnvironment(
+		events: string[],
+		isolationDir: string,
+		behavior: {
+			acquireFails?: boolean;
+			acquireError?: unknown;
+			syncFails?: boolean;
+			syncError?: unknown;
+			releaseFails?: boolean;
+			releaseError?: unknown;
+			leaseId?: string;
+		} = {},
+	) {
+		const syncBack = vi.fn<ExecutionEnvironmentLease["syncBack"]>(async () => {
+			events.push("sync");
+			if (behavior.syncFails) throw behavior.syncError;
+		});
+		const release = vi.fn<ExecutionEnvironmentLease["release"]>(async () => {
+			events.push("release");
+			if (behavior.releaseFails) throw behavior.releaseError;
+		});
+		const lease: ExecutionEnvironmentLease = {
+			id: behavior.leaseId ?? "lease-1",
+			sourceRoot: isolationDir,
+			remoteRoot: "/workspace",
+			bridge: {
+				readTextFile: async () => "",
+				writeTextFile: async () => {},
+				createTerminal: async () => {
+					throw new Error("Unused fake terminal");
+				},
+			},
+			syncBack,
+			release,
+		};
+		const acquire = vi.fn<ExecutionEnvironmentProvider["acquire"]>(async () => {
+			events.push("acquire");
+			if (behavior.acquireFails) throw behavior.acquireError;
+			return lease;
+		});
+		return { provider: { acquire }, lease, acquire, syncBack, release };
+	}
+
+	function lifecycleOptions(
+		provider: ExecutionEnvironmentProvider,
+		overrides: Partial<IsolatedRunOptions["baseOptions"]> = {},
+	): IsolatedRunOptions {
+		const repoRoot = "/repo";
+		return {
+			baseOptions: {
+				cwd: repoRoot,
+				agent: {
+					name: "task",
+					description: "Task agent",
+					systemPrompt: "test",
+					source: "bundled",
+				},
+				task: "Do environment work",
+				index: 0,
+				id: "EnvironmentTask",
+				parentAgentId: "OwnerAgent",
+				...overrides,
+			},
+			executionEnvironmentProvider: provider,
+			context: {
+				repoRoot,
+				baseline: {
+					root: {
+						repoRoot,
+						headCommit: "base",
+						staged: "",
+						unstaged: "",
+						untracked: [],
+						untrackedPatch: "",
+					},
+					nested: [],
+				},
+			},
+			preferredBackend: undefined,
+			agentId: "EnvironmentTask",
+			mergeMode: "branch",
+			artifactsDir: "/artifacts",
+			buildFailureResult: error =>
+				result({
+					id: "EnvironmentTask",
+					exitCode: 1,
+					error: error instanceof Error ? error.message : String(error),
+				}),
+		};
+	}
+
+	it("orders worktree, acquire, child quiescence, sync, release, capture, and merge", async () => {
+		const events: string[] = [];
+		const isolationDir = "/repo/.omp/isolation/EnvironmentTask";
+		const signal = new AbortController().signal;
+		const { capture } = setupLifecycleMocks(events, isolationDir);
+		capture.mockImplementation(async () => {
+			events.push("capture");
+			return { branchName: "omp/task/EnvironmentTask", baseSha: "base", nestedPatches: [] };
+		});
+		vi.spyOn(worktreeModule, "mergeTaskBranches").mockImplementation(async () => {
+			events.push("merge");
+			return { merged: ["omp/task/EnvironmentTask"], failed: [] };
+		});
+		vi.spyOn(worktreeModule, "cleanupTaskBranches").mockResolvedValue();
+		const environment = fakeEnvironment(events, isolationDir);
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			events.push("child");
+			const binding = options.executionEnvironment;
+			expect(binding).toEqual({
+				id: environment.lease.id,
+				sourceRoot: isolationDir,
+				remoteRoot: "/workspace",
+				bridge: environment.lease.bridge,
+			});
+			expect(binding).not.toBe(environment.lease);
+			expect(binding).not.toHaveProperty("syncBack");
+			expect(binding).not.toHaveProperty("release");
+			events.push("quiescence");
+			return result({ id: "EnvironmentTask" });
+		});
+
+		const outcome = await runIsolatedSubprocess(lifecycleOptions(environment.provider, { signal }));
+		await mergeIsolatedChanges({ result: outcome, repoRoot: "/repo", mergeMode: "branch" });
+
+		expect(events).toEqual([
+			"worktree",
+			"acquire",
+			"child",
+			"quiescence",
+			"sync",
+			"release",
+			"capture",
+			"cleanup",
+			"merge",
+		]);
+		expect(events.indexOf("release")).toBeLessThan(events.indexOf("capture"));
+		expect(events.indexOf("capture")).toBeLessThan(events.indexOf("merge"));
+		expect(environment.acquire).toHaveBeenCalledWith({
+			ownerId: "OwnerAgent",
+			sessionId: "EnvironmentTask",
+			sourceRoot: isolationDir,
+			signal,
+		});
+		expect(environment.syncBack).toHaveBeenCalledWith(signal);
+		expect(environment.release).toHaveBeenCalledTimes(1);
+		expect(outcome.exitCode).toBe(0);
+	});
+
+	it("does not start the child or release when acquisition fails before returning a lease", async () => {
+		const events: string[] = [];
+		const isolationDir = "/repo/.omp/isolation/EnvironmentTask";
+		const { capture } = setupLifecycleMocks(events, isolationDir);
+		const environment = fakeEnvironment(events, isolationDir, {
+			acquireFails: true,
+			acquireError: new Error("acquire failed"),
+		});
+		const child = vi.spyOn(executorModule, "runSubprocess");
+
+		const outcome = await runIsolatedSubprocess(lifecycleOptions(environment.provider));
+
+		expect(events).toEqual(["worktree", "acquire", "cleanup"]);
+		expect(child).not.toHaveBeenCalled();
+		expect(environment.syncBack).not.toHaveBeenCalled();
+		expect(environment.release).not.toHaveBeenCalled();
+		expect(capture).not.toHaveBeenCalled();
+		expect(outcome.error).toContain("acquire failed");
+	});
+
+	it("releases once when child session startup throws", async () => {
+		const events: string[] = [];
+		const isolationDir = "/repo/.omp/isolation/EnvironmentTask";
+		const { capture } = setupLifecycleMocks(events, isolationDir);
+		const environment = fakeEnvironment(events, isolationDir);
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async () => {
+			events.push("child");
+			throw new Error("session start failed");
+		});
+
+		const outcome = await runIsolatedSubprocess(lifecycleOptions(environment.provider));
+
+		expect(events).toEqual(["worktree", "acquire", "child", "release", "cleanup"]);
+		expect(environment.syncBack).not.toHaveBeenCalled();
+		expect(environment.release).toHaveBeenCalledTimes(1);
+		expect(capture).not.toHaveBeenCalled();
+		expect(outcome.error).toContain("session start failed");
+	});
+
+	it("skips sync and releases once after child failure", async () => {
+		const events: string[] = [];
+		const isolationDir = "/repo/.omp/isolation/EnvironmentTask";
+		const { capture } = setupLifecycleMocks(events, isolationDir);
+		const environment = fakeEnvironment(events, isolationDir);
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async () => {
+			events.push("child", "quiescence");
+			return result({ id: "EnvironmentTask", error: "child failed" });
+		});
+
+		const outcome = await runIsolatedSubprocess(lifecycleOptions(environment.provider));
+
+		expect(events).toEqual(["worktree", "acquire", "child", "quiescence", "release", "cleanup"]);
+		expect(environment.syncBack).not.toHaveBeenCalled();
+		expect(environment.release).toHaveBeenCalledTimes(1);
+		expect(capture).not.toHaveBeenCalled();
+		expect(outcome.error).toBe("child failed");
+	});
+
+	it("skips sync and releases once after child cancellation", async () => {
+		const events: string[] = [];
+		const isolationDir = "/repo/.omp/isolation/EnvironmentTask";
+		const controller = new AbortController();
+		const { capture } = setupLifecycleMocks(events, isolationDir);
+		const environment = fakeEnvironment(events, isolationDir);
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async () => {
+			events.push("child");
+			controller.abort();
+			events.push("quiescence");
+			return result({ id: "EnvironmentTask" });
+		});
+
+		const outcome = await runIsolatedSubprocess(
+			lifecycleOptions(environment.provider, { signal: controller.signal }),
+		);
+
+		expect(events).toEqual(["worktree", "acquire", "child", "quiescence", "release", "cleanup"]);
+		expect(environment.syncBack).not.toHaveBeenCalled();
+		expect(environment.release).toHaveBeenCalledTimes(1);
+		expect(capture).not.toHaveBeenCalled();
+		expect(outcome.aborted).toBe(true);
+		expect(outcome.exitCode).toBe(1);
+		expect(outcome.error).toContain("cancelled before capture");
+	});
+
+	it("releases once and blocks capture when sync-back fails", async () => {
+		const events: string[] = [];
+		const isolationDir = "/repo/.omp/isolation/EnvironmentTask";
+		const { capture } = setupLifecycleMocks(events, isolationDir);
+		const environment = fakeEnvironment(events, isolationDir, {
+			syncFails: true,
+			syncError: new Error("manifest rejected"),
+		});
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async () => {
+			events.push("child", "quiescence");
+			return result({ id: "EnvironmentTask" });
+		});
+
+		const outcome = await runIsolatedSubprocess(lifecycleOptions(environment.provider));
+
+		expect(events).toEqual(["worktree", "acquire", "child", "quiescence", "sync", "release", "cleanup"]);
+		expect(environment.release).toHaveBeenCalledTimes(1);
+		expect(capture).not.toHaveBeenCalled();
+		expect(outcome.exitCode).toBe(1);
+		expect(outcome.error).toContain("sync-back failed");
+		expect(outcome.error).toContain("manifest rejected");
+		expect(outcome.patchPath).toBeUndefined();
+		expect(outcome.branchName).toBeUndefined();
+		expect(outcome.nestedPatches).toBeUndefined();
+	});
+
+	it("reports an escaped lease ID and blocks capture when release fails", async () => {
+		const events: string[] = [];
+		const isolationDir = "/repo/.omp/isolation/EnvironmentTask";
+		const leaseId = "lease-unsafe\nvalue";
+		const { capture } = setupLifecycleMocks(events, isolationDir);
+		const environment = fakeEnvironment(events, isolationDir, {
+			leaseId,
+			releaseFails: true,
+			releaseError: new Error("close failed"),
+		});
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async () => {
+			events.push("child", "quiescence");
+			return result({ id: "EnvironmentTask" });
+		});
+
+		const outcome = await runIsolatedSubprocess(lifecycleOptions(environment.provider));
+
+		expect(events).toEqual(["worktree", "acquire", "child", "quiescence", "sync", "release", "cleanup"]);
+		expect(environment.release).toHaveBeenCalledTimes(1);
+		expect(capture).not.toHaveBeenCalled();
+		expect(outcome.exitCode).toBe(1);
+		expect(outcome.error).toContain("release failed");
+		expect(outcome.error).toContain(JSON.stringify(leaseId));
+		expect(outcome.error).not.toContain(leaseId);
+		expect(outcome.patchPath).toBeUndefined();
+		expect(outcome.branchName).toBeUndefined();
+		expect(outcome.nestedPatches).toBeUndefined();
 	});
 
 	it("preserves branch-mode output as a patch when branch transfer fails", async () => {

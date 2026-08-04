@@ -217,6 +217,17 @@ function createTaskModeError(text: string): AgentToolResult<TaskToolDetails> {
  * `schema` remains an eval-only alias and is rejected.
  */
 function validateShapeParams(batchEnabled: boolean, params: TaskParams): string | undefined {
+	if (params.tasks !== undefined) {
+		if (Object.hasOwn(params, "execution")) {
+			return "`execution` is only available on the flat single-task input, not a batch call.";
+		}
+		for (let index = 0; index < (Array.isArray(params.tasks) ? params.tasks.length : 0); index++) {
+			const item = params.tasks[index];
+			if (item && Object.hasOwn(item, "execution")) {
+				return `Task ${index + 1} cannot set \`execution\`; environment selection is only available on a flat single-task input.`;
+			}
+		}
+	}
 	if (Object.hasOwn(params, "schema")) {
 		return "The task tool uses `outputSchema`; rename the stale `schema` field.";
 	}
@@ -285,7 +296,12 @@ function validateSpawnParams(params: TaskParams, batchEnabled: boolean): string 
 			? "Missing `tasks`. Provide a `tasks` array (one subagent per item) with a shared `context`."
 			: "Missing `task`. Provide complete, self-contained instructions for the agent.";
 	}
-	return validateEffort(params.effort, "The call");
+	const effortError = validateEffort(params.effort, "The call");
+	if (effortError) return effortError;
+	if (params.execution === undefined || params.execution === "local" || params.execution === "environment") {
+		return undefined;
+	}
+	return `The call has an invalid \`execution\` value ${JSON.stringify(params.execution)}. Use "local" or "environment".`;
 }
 
 /**
@@ -328,6 +344,7 @@ function spawnParamsFor(params: TaskParams, item: TaskItem, defaultAgent: string
 	} else if ("isolated" in params) {
 		spawn.isolated = params.isolated;
 	}
+	if (params.tasks === undefined && Object.hasOwn(params, "execution")) spawn.execution = params.execution;
 	return spawn;
 }
 
@@ -592,12 +609,17 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	get parameters(): TaskToolSchemaInstance {
 		const planMode = this.session.getPlanModeState?.()?.enabled === true;
 		const isolationEnabled = !planMode && this.session.settings.get("task.isolation.mode") !== "none";
+		const environmentEnabled =
+			isolationEnabled &&
+			(this.session.taskDepth ?? 0) === 0 &&
+			this.session.getExecutionEnvironmentProvider?.() !== undefined;
 		const defaultAgent = resolveSpawnPolicy(this.session.getSessionSpawns()).defaultAgent;
 		return getTaskSchema({
 			isolationEnabled,
 			batchEnabled: this.#isBatchEnabled(),
 			effortEnabled: this.session.settings.get("task.enableEffort"),
 			defaultAgent,
+			environmentEnabled,
 		});
 	}
 
@@ -665,6 +687,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			...(Object.hasOwn(params, "schemaMode") ? { schemaMode: params.schemaMode } : {}),
 			...(params.effort !== undefined ? { effort: params.effort } : {}),
 			...("isolated" in params ? { isolation: { requested: params.isolated } } : {}),
+			...(Object.hasOwn(params, "execution") ? { execution: params.execution } : {}),
 			blockedAgent: this.#blockedAgent,
 			enableLsp: (this.session.enableLsp ?? true) && this.session.settings.get("task.enableLsp"),
 			enableIrc: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
@@ -1435,6 +1458,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				invokedAt: launchTiming?.invokedAt,
 				acquiredAt: launchTiming?.acquiredAt,
 				...("isolated" in params ? { isolation: { requested: params.isolated } } : {}),
+				...(Object.hasOwn(params, "execution") ? { execution: params.execution } : {}),
 				blockedAgent: this.#blockedAgent,
 				enableLsp: (this.session.enableLsp ?? true) && this.session.settings.get("task.enableLsp"),
 				enableIrc: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),

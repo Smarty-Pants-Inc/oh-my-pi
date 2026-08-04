@@ -45,6 +45,7 @@ import type { InternalUrl } from "../internal-urls/types";
 import { getLanguageFromPath, isMarkdownPath, type Theme } from "../modes/theme/theme";
 import readDescription from "../prompts/tools/read.md" with { type: "text" };
 import type { ToolSession } from "../sdk";
+import { type ExecutionEnvironmentBinding, mapExecutionEnvironmentPath } from "../session/execution-environment";
 import {
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
@@ -217,10 +218,12 @@ function recordFullHashlineContext(
 	absolutePath: string | undefined,
 	displayPath: string,
 	fullText: string,
+	canonicalizePath = true,
 ): HashlineHeaderContext | undefined {
 	if (!absolutePath || !path.isAbsolute(absolutePath)) return undefined;
 	const normalized = normalizeToLF(fullText);
-	const tag = getFileSnapshotStore(session).record(canonicalSnapshotKey(absolutePath), normalized);
+	const snapshotPath = canonicalizePath ? canonicalSnapshotKey(absolutePath) : absolutePath;
+	const tag = getFileSnapshotStore(session).record(snapshotPath, normalized);
 	return {
 		header: formatReadHashlineHeader(displayPath, tag),
 		tag,
@@ -358,9 +361,11 @@ function recordInMemorySeenLines(
 	absolutePath: string | undefined,
 	fullText: string,
 	seenLines: readonly number[] | undefined,
+	canonicalizePath = true,
 ): void {
 	if (!absolutePath || !path.isAbsolute(absolutePath) || !seenLines || seenLines.length === 0) return;
-	getFileSnapshotStore(session).record(canonicalSnapshotKey(absolutePath), normalizeToLF(fullText), seenLines);
+	const snapshotPath = canonicalizePath ? canonicalSnapshotKey(absolutePath) : absolutePath;
+	getFileSnapshotStore(session).record(snapshotPath, normalizeToLF(fullText), seenLines);
 }
 
 function lineNumbersFromEntries(entries: readonly LineEntry[]): number[] {
@@ -1391,6 +1396,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			ignoreResultLimits?: boolean;
 			raw?: boolean;
 			immutable?: boolean;
+			environment?: boolean;
 		},
 	): AgentToolResult<ReadToolDetails> {
 		const displayMode = resolveFileDisplayMode(this.session, { raw: options.raw, immutable: options.immutable });
@@ -1456,6 +1462,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						options.sourcePath,
 						formatPathRelativeToCwd(options.sourcePath, this.session.cwd),
 						text,
+						options.environment !== true,
 					)
 				: undefined;
 		let emittedHashlineHeader = false;
@@ -1556,10 +1563,14 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		}
 
 		if (hashContext?.tag && options.sourcePath && seenLines) {
-			recordSeenLines(this.session, options.sourcePath, hashContext.tag, seenLines);
+			if (options.environment) {
+				getFileSnapshotStore(this.session).recordSeenLines(options.sourcePath, hashContext.tag, seenLines);
+			} else {
+				recordSeenLines(this.session, options.sourcePath, hashContext.tag, seenLines);
+			}
 		}
 		if (options.raw === true && options.sourcePath && options.immutable !== true && rawSeenLines) {
-			recordInMemorySeenLines(this.session, options.sourcePath, text, rawSeenLines);
+			recordInMemorySeenLines(this.session, options.sourcePath, text, rawSeenLines, options.environment !== true);
 		}
 		resultBuilder.text(outputText);
 		if (truncationInfo) {
@@ -1586,6 +1597,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			entityLabel: string;
 			raw?: boolean;
 			immutable?: boolean;
+			environment?: boolean;
 		},
 	): AgentToolResult<ReadToolDetails> {
 		const displayMode = resolveFileDisplayMode(this.session, { raw: options.raw, immutable: options.immutable });
@@ -1601,6 +1613,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						options.sourcePath,
 						formatPathRelativeToCwd(options.sourcePath, this.session.cwd),
 						text,
+						options.environment !== true,
 					)
 				: undefined;
 		let emittedHashlineHeader = false;
@@ -1652,10 +1665,20 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		const finalText =
 			notices.length > 0 ? (outputText ? `${outputText}\n${notices.join("\n")}` : notices.join("\n")) : outputText;
 		if (hashContext?.tag && options.sourcePath && seenLines) {
-			recordSeenLines(this.session, options.sourcePath, hashContext.tag, seenLines);
+			if (options.environment) {
+				getFileSnapshotStore(this.session).recordSeenLines(options.sourcePath, hashContext.tag, seenLines);
+			} else {
+				recordSeenLines(this.session, options.sourcePath, hashContext.tag, seenLines);
+			}
 		}
 		if (options.raw === true && options.sourcePath && options.immutable !== true && visibleSpans.length > 0) {
-			recordInMemorySeenLines(this.session, options.sourcePath, text, lineNumbersFromSpans(visibleSpans));
+			recordInMemorySeenLines(
+				this.session,
+				options.sourcePath,
+				text,
+				lineNumbersFromSpans(visibleSpans),
+				options.environment !== true,
+			);
 		}
 		resultBuilder.text(finalText);
 		return resultBuilder.done();
@@ -2090,13 +2113,6 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		return bridge.readTextFile({ path: absolutePath, ...options });
 	}
 
-	/**
-	 * Tag Markdown reads for the TUI's formatted preview, gated on the opt-in
-	 * `read.renderMarkdown` setting. Off by default; when disabled, no local
-	 * read is tagged `text/markdown`, so the renderer output is identical to
-	 * the pre-setting behavior. Internal-URL reads keep their protocol-supplied
-	 * `contentType` and render as Markdown regardless of the setting.
-	 */
 	#markMarkdownContentType(details: ReadToolDetails, filePath: string): ReadToolDetails {
 		if (!details.contentType && this.session.settings.get("read.renderMarkdown") && isMarkdownPath(filePath)) {
 			details.contentType = "text/markdown";
@@ -2104,32 +2120,24 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		return details;
 	}
 
-	async #trySummarize(absolutePath: string, fileSize: number, signal?: AbortSignal): Promise<SummaryResult | null> {
-		if (fileSize > MAX_SUMMARY_BYTES) return null;
-
+	#trySummarizeText(code: string, codePath: string, signal?: AbortSignal): SummaryResult | null {
+		if (Buffer.byteLength(code, "utf-8") > MAX_SUMMARY_BYTES) return null;
 		try {
-			throwIfAborted(signal);
-			const bridgePromise = this.#routeReadThroughBridge(absolutePath);
-			const code =
-				bridgePromise !== undefined
-					? await bridgePromise.catch(() => Bun.file(absolutePath).text())
-					: await Bun.file(absolutePath).text();
 			throwIfAborted(signal);
 			const lineCount = countTextLines(code);
 			if (lineCount > MAX_SUMMARY_LINES) return null;
 			if (lineCount < this.session.settings.get("read.summarize.minTotalLines")) return null;
-
 			const minBodyLines = this.session.settings.get("read.summarize.minBodyLines");
 			const minCommentLines = this.session.settings.get("read.summarize.minCommentLines");
 			const unfoldUntilLines = this.session.settings.get("read.summarize.unfoldUntil");
 			const unfoldLimitLines = this.session.settings.get("read.summarize.unfoldLimit");
 			const cache = getSummaryParseCache(this.session);
-			const cacheKey = `${absolutePath}\0${Bun.hash(code)}\0${minBodyLines},${minCommentLines},${unfoldUntilLines},${unfoldLimitLines}`;
+			const cacheKey = `${codePath}\0${Bun.hash(code)}\0${minBodyLines},${minCommentLines},${unfoldUntilLines},${unfoldLimitLines}`;
 			const memoized = cache.get(cacheKey);
 			if (memoized !== undefined) return memoized || null;
 			const result = summarizeCode({
 				code,
-				path: absolutePath,
+				path: codePath,
 				minBodyLines,
 				minCommentLines,
 				unfoldUntilLines,
@@ -2138,6 +2146,21 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			const usable = result.parsed && result.elided ? result : false;
 			cache.set(cacheKey, usable);
 			return usable || null;
+		} catch {
+			return null;
+		}
+	}
+
+	async #trySummarize(absolutePath: string, fileSize: number, signal?: AbortSignal): Promise<SummaryResult | null> {
+		if (fileSize > MAX_SUMMARY_BYTES) return null;
+		try {
+			throwIfAborted(signal);
+			const bridgePromise = this.#routeReadThroughBridge(absolutePath);
+			const code =
+				bridgePromise !== undefined
+					? await bridgePromise.catch(() => Bun.file(absolutePath).text())
+					: await Bun.file(absolutePath).text();
+			return this.#trySummarizeText(code, absolutePath, signal);
 		} catch {
 			return null;
 		}
@@ -2152,21 +2175,10 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		const displayMode = resolveFileDisplayMode(this.session);
 		const shouldAddHashLines = displayMode.hashLines;
 		const shouldAddLineNumbers = shouldAddHashLines ? false : displayMode.lineNumbers;
-
-		// Flatten segments into per-line units so we can merge a kept-head /
-		// elided / kept-tail sandwich into a single brace-pair line when the
-		// boundary lines look like `… {` and `}` (or matching variants).
 		type Unit =
 			| { kind: "line"; line: number; text: string }
 			| { kind: "elided"; startLine: number; endLine: number }
-			| {
-					kind: "merged";
-					startLine: number;
-					endLine: number;
-					headText: string;
-					tailText: string;
-			  };
-
+			| { kind: "merged"; startLine: number; endLine: number; headText: string; tailText: string };
 		const raw: Unit[] = [];
 		for (const segment of summary.segments) {
 			if (segment.kind === "elided") {
@@ -2175,36 +2187,31 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			}
 			const text = segment.text ?? "";
 			if (text.length === 0) continue;
-			const lines = text.split("\n");
-			for (let i = 0; i < lines.length; i++) {
-				raw.push({ kind: "line", line: segment.startLine + i, text: lines[i] });
+			for (const [index, line] of text.split("\n").entries()) {
+				raw.push({ kind: "line", line: segment.startLine + index, text: line });
 			}
 		}
-
 		const units: Unit[] = [];
-		let i = 0;
-		while (i < raw.length) {
-			const cur = raw[i];
-			if (cur.kind === "elided") {
-				const prev = units.length > 0 ? units[units.length - 1] : null;
-				const next = i + 1 < raw.length ? raw[i + 1] : null;
-				if (prev?.kind === "line" && next?.kind === "line" && canMergeBracePair(prev.text, next.text)) {
+		for (let index = 0; index < raw.length; index++) {
+			const current = raw[index]!;
+			if (current.kind === "elided") {
+				const previous = units.at(-1);
+				const next = raw[index + 1];
+				if (previous?.kind === "line" && next?.kind === "line" && canMergeBracePair(previous.text, next.text)) {
 					units.pop();
 					units.push({
 						kind: "merged",
-						startLine: prev.line,
+						startLine: previous.line,
 						endLine: next.line,
-						headText: prev.text,
+						headText: previous.text,
 						tailText: next.text,
 					});
-					i += 2;
+					index++;
 					continue;
 				}
 			}
-			units.push(cur);
-			i++;
+			units.push(current);
 		}
-
 		const modelParts: string[] = [];
 		const displayParts: string[] = [];
 		const elidedRanges: ElidedRange[] = [];
@@ -2228,18 +2235,118 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				);
 				modelParts.push(formatted.model);
 				displayParts.push(formatted.display);
-				// Suggest the full brace range so re-reading shows both braces
-				// plus the elided body in one shot.
 				elidedRanges.push({ start: unit.startLine, end: unit.endLine });
-				// Merged brace pair encloses (start+1)..(end-1) as elided.
 				elidedLines += Math.max(0, unit.endLine - unit.startLine - 1);
 				continue;
 			}
 			modelParts.push(formatSingleLine(unit.line, unit.text, shouldAddHashLines, shouldAddLineNumbers));
 			displayParts.push(unit.text);
 		}
-
 		return { text: modelParts.join("\n"), displayText: displayParts.join("\n"), elidedRanges, elidedLines };
+	}
+
+	async #readEnvironmentFile(
+		readPath: string,
+		environment: ExecutionEnvironmentBinding,
+		signal?: AbortSignal,
+	): Promise<AgentToolResult<ReadToolDetails>> {
+		const target = splitPathAndSel(readPath);
+		const parsed = parseSel(target.sel);
+		if (target.path.length === 0 || target.path === "." || target.path.endsWith("/")) {
+			throw new ToolError("Environment reads support regular UTF-8 files only; directories are unsupported.");
+		}
+		if (parsed.kind === "conflicts")
+			throw new ToolError("The :conflicts selector is unsupported for environment reads.");
+		if (parseArchivePathCandidates(readPath).length > 0) {
+			throw new ToolError("Archive paths and archive member selectors are unsupported for environment reads.");
+		}
+		if (parseSqlitePathCandidates(readPath).length > 0) {
+			throw new ToolError("Database paths and selectors are unsupported for environment reads.");
+		}
+		if (CONVERTIBLE_EXTENSIONS.has(path.extname(target.path).toLowerCase())) {
+			throw new ToolError("Binary document conversion is unsupported for environment reads.");
+		}
+		let remotePath: string;
+		try {
+			remotePath = mapExecutionEnvironmentPath(environment, target.path);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			throw new ToolError(`Environment read path '${target.path}' is outside the workspace: ${message}`);
+		}
+		if (remotePath === environment.remoteRoot) {
+			throw new ToolError("Environment reads support regular UTF-8 files only; directories are unsupported.");
+		}
+		let text: string;
+		try {
+			throwIfAborted(signal);
+			text = await environment.bridge.readTextFile({ path: remotePath });
+			throwIfAborted(signal);
+		} catch (error) {
+			if (error instanceof ToolAbortError) throw error;
+			const message = error instanceof Error ? error.message : String(error);
+			throw new ToolError(
+				`Environment read failed for '${remotePath}': only regular UTF-8 files are supported; directories, symlinks, and binary files are rejected by the provider. ${message}`,
+			);
+		}
+		const details = this.#markMarkdownContentType(
+			{ resolvedPath: remotePath, fileSize: Buffer.byteLength(text, "utf-8") },
+			remotePath,
+		);
+		if (
+			parsed.kind === "none" &&
+			this.session.settings.get("read.summarize.enabled") &&
+			(this.session.settings.get("read.summarize.prose") || !isProseSummaryPath(remotePath))
+		) {
+			const summary = this.#trySummarizeText(text, remotePath, signal);
+			if (summary?.parsed && summary.elided) {
+				const renderedSummary = this.#renderSummary(summary);
+				const footer = formatSummaryElisionFooter(
+					remotePath,
+					renderedSummary.elidedRanges,
+					renderedSummary.elidedLines,
+				);
+				const summaryHashContext = resolveFileDisplayMode(this.session).hashLines
+					? recordFullHashlineContext(this.session, remotePath, remotePath, text, false)
+					: undefined;
+				const bodyText = footer ? `${renderedSummary.text}\n\n${footer}` : renderedSummary.text;
+				const modelText = prependHashlineHeader(bodyText, summaryHashContext);
+				if (summaryHashContext?.tag) {
+					const seenLines = Array.from(renderedSummary.text.matchAll(/^(\d+)(?:-(\d+))?:/gm)).flatMap(match =>
+						match[2] === undefined ? [Number(match[1])] : [Number(match[1]), Number(match[2])],
+					);
+					getFileSnapshotStore(this.session).recordSeenLines(remotePath, summaryHashContext.tag, seenLines);
+				}
+				return toolResult<ReadToolDetails>({
+					...details,
+					displayContent: { text: renderedSummary.displayText, startLine: 1 },
+					summary: {
+						lines: countTextLines(renderedSummary.text),
+						elidedSpans: renderedSummary.elidedRanges.length,
+						elidedLines: renderedSummary.elidedLines,
+					},
+				})
+					.text(modelText)
+					.sourcePath(remotePath)
+					.done();
+			}
+		}
+		if (isMultiRange(parsed) && parsed.kind === "lines") {
+			return this.#buildInMemoryMultiRangeResult(text, parsed.ranges, {
+				details,
+				sourcePath: remotePath,
+				entityLabel: "file",
+				raw: isRawSelector(parsed),
+				environment: true,
+			});
+		}
+		const { offset, limit } = selToOffsetLimit(parsed);
+		return this.#buildInMemoryTextResult(text, offset, limit, {
+			details,
+			sourcePath: remotePath,
+			entityLabel: "file",
+			raw: isRawSelector(parsed),
+			environment: true,
+		});
 	}
 
 	async execute(
@@ -2306,6 +2413,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		// off the URL and surfaced via parseSel rather than confusing handlers.
 		const internalRouter = InternalUrlRouter.instance();
 		let promotedSelector: string | undefined;
+		let resolvedLocalProtocolFile = false;
 		if (internalRouter.canResolve(readPath)) {
 			const internalTarget = splitInternalUrlSel(readPath);
 			const parsed = parseSel(internalTarget.sel);
@@ -2320,12 +2428,14 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				const localFile = await resolveLocalUrlToFile(urlMeta, {
 					cwd: this.session.cwd,
 					settings: this.session.settings,
+
 					signal,
 					localProtocolOptions: this.session.localProtocolOptions,
 					skills: this.session.skills,
 				});
 				if (localFile) {
 					readPath = localFile.path;
+					resolvedLocalProtocolFile = true;
 					// Preserve a local:// selector separately so a sibling literal file
 					// cannot shadow the URL's selector semantics during filesystem routing.
 					promotedSelector = internalTarget.sel;
@@ -2335,6 +2445,11 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			} else {
 				return this.#handleInternalUrl(internalTarget.path, parsed, signal);
 			}
+		}
+
+		const environment = this.session.getExecutionEnvironment?.();
+		if (environment && !resolvedLocalProtocolFile) {
+			return this.#readEnvironmentFile(readPath, environment, signal);
 		}
 
 		// One suffix-glob memo per read call — archive, sqlite, and plain-path

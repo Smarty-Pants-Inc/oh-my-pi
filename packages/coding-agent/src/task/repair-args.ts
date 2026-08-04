@@ -24,9 +24,9 @@
  * string.
  *
  * This is deliberately scoped to the task tool's natural-language fields
- * (`task`, shared `context`); identifier fields (`name`, `agent`)
- * are never repaired. It is NOT applied to code-bearing
- * tools (write/edit/bash/search), where a backslash or quote is load-bearing
+ * (`task`, shared `context`); identifier fields (`name`, `agent`) and the
+ * `execution` selector are never repaired or normalized. It is NOT applied to
+ * code-bearing tools (write/edit/bash/search), where a backslash or quote is load-bearing
  * and a false-positive unescape would silently corrupt a file or command.
  */
 import type { TaskItem, TaskParams } from "./types";

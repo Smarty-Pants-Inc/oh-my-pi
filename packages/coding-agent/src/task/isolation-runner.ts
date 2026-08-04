@@ -9,8 +9,9 @@
  *
  * Shape:
  *   1. {@link prepareIsolationContext} — resolve git root + capture baseline.
- *   2. {@link runIsolatedSubprocess}    — start worktree, run, capture
- *                                        branch/patch, tear worktree down.
+ *   2. {@link runIsolatedSubprocess}    — start worktree, optionally acquire
+ *                                        an environment, run, fence, capture,
+ *                                        and tear the worktree down.
  *   3. {@link mergeIsolatedChanges}     — apply captured changes back to the
  *                                        parent repo (skip when the caller
  *                                        opted out).
@@ -20,6 +21,11 @@
  */
 import * as path from "node:path";
 import type * as natives from "@oh-my-pi/pi-natives";
+import type {
+	ExecutionEnvironmentBinding,
+	ExecutionEnvironmentLease,
+	ExecutionEnvironmentProvider,
+} from "../session/execution-environment";
 import type { ToolSession } from "../tools";
 import { generateCommitMessage } from "../utils/commit-message-generator";
 import * as git from "../utils/git";
@@ -93,6 +99,8 @@ export interface IsolatedRunOptions {
 	 * else unchanged.
 	 */
 	baseOptions: ExecutorOptions;
+	/** Provider selected for an explicit environment-backed isolated task. */
+	executionEnvironmentProvider?: ExecutionEnvironmentProvider;
 	/** Context returned by {@link prepareIsolationContext}. Baseline is cloned per spawn. */
 	context: IsolationContext;
 	/** PAL backend hint from `parseIsolationMode(...)` (undefined ⇒ resolver picks). */
@@ -127,6 +135,22 @@ async function writeIsolationPatch(
 	return { patchPath, nestedPatches: delta.nestedPatches };
 }
 
+function lifecycleFailure(result: SingleResult, message: string): SingleResult {
+	return {
+		...result,
+		exitCode: result.exitCode === 0 ? 1 : result.exitCode,
+		error: result.error ? `${result.error}; ${message}` : message,
+		patchPath: undefined,
+		branchName: undefined,
+		branchBaseSha: undefined,
+		nestedPatches: undefined,
+	};
+}
+
+function leaseFailureMessage(stage: "sync-back" | "release", lease: ExecutionEnvironmentLease, error: unknown): string {
+	const message = error instanceof Error ? error.message : String(error);
+	return `Execution environment ${stage} failed for lease ${JSON.stringify(lease.id)}: ${message}`;
+}
 /**
  * Run a subagent inside an isolation worktree and capture its changes.
  *
@@ -143,19 +167,93 @@ async function writeIsolationPatch(
  * itself routes through {@link IsolatedRunOptions.buildFailureResult}.
  *
  * The isolation handle is always torn down in `finally`.
+ * Environment-backed runs acquire only after worktree creation, then sync and
+ * release after subprocess quiescence and before any branch/patch capture.
+ * Every returned lease is released exactly once on all exit paths.
+ *
  */
 export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<SingleResult> {
 	let handle: IsolationHandle | undefined;
+	let lease: ExecutionEnvironmentLease | undefined;
+	let releaseAttempted = false;
+
+	const releaseLease = async (): Promise<{ ok: true } | { ok: false; error: unknown }> => {
+		if (!lease || releaseAttempted) return { ok: true };
+		releaseAttempted = true;
+		try {
+			await lease.release();
+			return { ok: true };
+		} catch (error) {
+			return { ok: false, error };
+		}
+	};
+
 	try {
 		const taskBaseline = structuredClone(opts.context.baseline);
 		handle = await ensureIsolation(opts.context.repoRoot, opts.agentId, opts.preferredBackend);
 		const isolationDir = handle.mergedDir;
+
+		if (opts.executionEnvironmentProvider) {
+			const acquiredLease = await opts.executionEnvironmentProvider.acquire({
+				ownerId: opts.baseOptions.parentAgentId ?? opts.baseOptions.id,
+				sessionId: opts.baseOptions.id,
+				sourceRoot: isolationDir,
+				signal: opts.baseOptions.signal,
+			});
+			if (!acquiredLease) throw new Error("Execution environment provider returned no lease");
+			lease = acquiredLease;
+		}
+
 		const result = await runSubprocess({
 			...opts.baseOptions,
 			worktree: isolationDir,
 			preloadedExtensionPaths: undefined,
 			preloadedCustomToolPaths: undefined,
+			...(lease
+				? {
+						executionEnvironment: {
+							id: lease.id,
+							sourceRoot: lease.sourceRoot,
+							remoteRoot: lease.remoteRoot,
+							bridge: lease.bridge,
+						} satisfies ExecutionEnvironmentBinding,
+					}
+				: {}),
 		});
+
+		if (lease) {
+			const childSucceeded = result.exitCode === 0 && !result.error && !result.aborted;
+			let syncFailed = false;
+			let syncError: unknown;
+			if (childSucceeded && !opts.baseOptions.signal?.aborted) {
+				try {
+					await lease.syncBack(opts.baseOptions.signal);
+				} catch (error) {
+					syncFailed = true;
+					syncError = error;
+				}
+			}
+
+			const releaseResult = await releaseLease();
+			if (syncFailed) {
+				let failed = lifecycleFailure(result, leaseFailureMessage("sync-back", lease, syncError));
+				if (!releaseResult.ok) {
+					failed = lifecycleFailure(failed, leaseFailureMessage("release", lease, releaseResult.error));
+				}
+				return failed;
+			}
+			if (!releaseResult.ok) {
+				return lifecycleFailure(result, leaseFailureMessage("release", lease, releaseResult.error));
+			}
+			if (childSucceeded && opts.baseOptions.signal?.aborted) {
+				return lifecycleFailure(
+					{ ...result, aborted: true },
+					"Execution environment task was cancelled before capture",
+				);
+			}
+			if (!childSucceeded) return result;
+		}
+
 		if (opts.mergeMode === "branch" && result.exitCode === 0) {
 			try {
 				const commitResult = await commitToBranch(
@@ -209,8 +307,15 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 			}
 		}
 		return result;
-	} catch (err) {
-		return opts.buildFailureResult(err);
+	} catch (error) {
+		const releaseResult = await releaseLease();
+		if (!releaseResult.ok && lease) {
+			const originalMessage = error instanceof Error ? error.message : String(error);
+			return opts.buildFailureResult(
+				`${originalMessage}; ${leaseFailureMessage("release", lease, releaseResult.error)}`,
+			);
+		}
+		return opts.buildFailureResult(error);
 	} finally {
 		if (handle) {
 			await cleanupIsolation(handle);
