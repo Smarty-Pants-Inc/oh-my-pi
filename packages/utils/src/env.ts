@@ -43,6 +43,8 @@ export function filterProcessEnv(env: Record<string, string | undefined>): Recor
 		if (
 			!isSafeEnvName(key) ||
 			isMacosMallocStackLoggingEnvName(key) ||
+			key === "FRESH_OMP_COMPANION" ||
+			key === "FRESH_OMP_COMPANION_TOKEN" ||
 			value === undefined ||
 			!isSafeEnvValue(value)
 		) {

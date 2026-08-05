@@ -51,12 +51,14 @@ import {
 	resolveActiveProjectRegistryPath,
 } from "./discovery/helpers";
 import { injectOmpExtensionCliRoots } from "./discovery/omp-extension-roots";
+import { loadExtensionFromFactory } from "./extensibility/extensions";
 import { formatExtensionLoadNotifications } from "./extensibility/extensions/load-errors";
 import { ExtensionRunner } from "./extensibility/extensions/runner";
 import type { ExtensionUIContext } from "./extensibility/extensions/types";
 import { scheduleMarketplaceAutoUpdate } from "./extensibility/plugins/marketplace-auto-update";
 import { registerDaemonProjectPresence } from "./launch/presence";
 import type { MCPManager } from "./mcp";
+import { createFreshOmpCompanionController } from "./modes/fresh-omp-companion";
 import { InteractiveMode } from "./modes/interactive-mode";
 import type { PrintModeOptions } from "./modes/print-mode";
 import { claimRpcInput } from "./modes/rpc/rpc-input";
@@ -103,6 +105,49 @@ type RunRpcMode = (
 	eventBus?: EventBus,
 	input?: ReadableStream<Uint8Array>,
 ) => Promise<never>;
+
+const FRESH_OMP_COMPANION_TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+
+/** Resolve the Fresh companion capability only for the canonical top-level interactive host. */
+export function resolveFreshOmpCompanionSecret(options: {
+	isInteractive: boolean;
+	noSession: boolean;
+	parentTaskPrefix?: string;
+	taskDepth?: number;
+	env: Readonly<Record<string, string | undefined>>;
+}): Uint8Array | undefined {
+	if (
+		!options.isInteractive ||
+		options.noSession ||
+		options.parentTaskPrefix !== undefined ||
+		(options.taskDepth ?? 0) !== 0
+	) {
+		return undefined;
+	}
+	if (options.env.FRESH_OMP_COMPANION !== "1" || options.env.TMUX || options.env.STY) return undefined;
+
+	const token = options.env.FRESH_OMP_COMPANION_TOKEN;
+	if (!token || !FRESH_OMP_COMPANION_TOKEN_PATTERN.test(token)) return undefined;
+	const secret = Buffer.from(token, "base64url");
+	if (secret.byteLength !== 32 || secret.toString("base64url") !== token) return undefined;
+	return secret;
+}
+
+/**
+ * Resolve the private Fresh companion capability, then remove its single-use
+ * transport values before public extensions or child-process setup can inherit
+ * them. The controller retains the decoded secret, never the environment token.
+ */
+export function consumeFreshOmpCompanionSecret(
+	options: Omit<Parameters<typeof resolveFreshOmpCompanionSecret>[0], "env"> & {
+		env: Record<string, string | undefined>;
+	},
+): Uint8Array | undefined {
+	const secret = resolveFreshOmpCompanionSecret(options);
+	delete options.env.FRESH_OMP_COMPANION;
+	delete options.env.FRESH_OMP_COMPANION_TOKEN;
+	return secret;
+}
 
 export function writeStartupNotice(parsedArgs: Pick<Args, "mode">, text: string): void {
 	(parsedArgs.mode === "json" ? process.stderr : process.stdout).write(text);
@@ -1183,16 +1228,10 @@ export async function runRootCommand(
 	// RPC owns stdin. Claim its singleton stream before plugin/extension discovery can load an in-process consumer.
 	const rpcInput = mode === "rpc" || mode === "rpc-ui" ? claimRpcInput() : undefined;
 
-	// Kick off plugin-root preload in parallel with the remaining startup work.
-	// Awaited later (before extension/skill discovery in createAgentSession needs it).
+	// Plugin roots may preload public extension modules. Start that work only
+	// after the one-shot Fresh companion capability is consumed below.
+	let pluginPreloadPromise: Promise<void>;
 	const home = os.homedir();
-	const pluginPreloadPromise =
-		parsedArgs.pluginDirs && parsedArgs.pluginDirs.length > 0
-			? logger.time("injectPluginDirRoots", injectPluginDirRoots, home, parsedArgs.pluginDirs, getProjectDir())
-			: logger.time("preloadPluginRoots", preloadPluginRoots, home, getProjectDir());
-	// Mark the promise as handled so a synchronous failure does not surface as an unhandled-rejection
-	// warning before we reach the await site below.
-	pluginPreloadPromise.catch(() => {});
 
 	// Register CLI-provided extension package paths (`--extension`, `--hook`) so
 	// the `omp-plugins` discovery provider can surface their `skills/`, `hooks/`,
@@ -1218,6 +1257,34 @@ export async function runRootCommand(
 	// tree; declare it so headless subagent optimizations (e.g. skipping replan
 	// title refresh) can tell a focusable process from a print/RPC/eval one.
 	setInteractiveHost(isInteractive);
+	const companionSecret = consumeFreshOmpCompanionSecret({
+		isInteractive,
+		noSession: parsedArgs.noSession === true,
+		parentTaskPrefix: undefined,
+		taskDepth: 0,
+		env: Bun.env,
+	});
+	let companionController: ReturnType<typeof createFreshOmpCompanionController> | undefined;
+	if (companionSecret) {
+		try {
+			companionController = createFreshOmpCompanionController(companionSecret);
+		} catch {
+			logger.warn("Fresh OMP companion disabled", { reason: "host_controller_create_failed" });
+		} finally {
+			// The controller copied its capability during construction; do not retain
+			// another live decoded secret on this long-running startup frame.
+			companionSecret.fill(0);
+		}
+	}
+
+	pluginPreloadPromise =
+		parsedArgs.pluginDirs && parsedArgs.pluginDirs.length > 0
+			? logger.time("injectPluginDirRoots", injectPluginDirRoots, home, parsedArgs.pluginDirs, getProjectDir())
+			: logger.time("preloadPluginRoots", preloadPluginRoots, home, getProjectDir());
+	// Mark the promise as handled so a synchronous failure does not surface as an unhandled-rejection
+	// warning before we reach the await site below.
+	pluginPreloadPromise.catch(() => {});
+
 	// Create AuthStorage and ModelRegistry upfront
 	const authStorage = await logger.time("discoverAuthStorage", deps.discoverAuthStorage ?? discoverAuthStorage);
 	const modelRegistry = logger.time("modelRegistry:init", () => new ModelRegistry(authStorage));
@@ -1548,6 +1615,27 @@ export async function runRootCommand(
 
 		const eventBus = new EventBus();
 		const extensionsResult = await loadSessionExtensions(sessionOptions, cwd, settingsInstance, eventBus);
+		if (companionController) {
+			try {
+				const extension = await loadExtensionFromFactory(
+					companionController.factory,
+					cwd,
+					eventBus,
+					extensionsResult.runtime,
+					"<host:fresh-omp-companion>",
+				);
+				sessionOptions.hostInternalExtensions = [
+					{
+						extension,
+						beforeSessionMutation: companionController.beforeSessionMutation,
+						afterDispatch: companionController.afterDispatch,
+						setHostTerminalInput: companionController.setHostTerminalInput,
+					},
+				];
+			} catch {
+				logger.warn("Fresh OMP companion disabled", { reason: "host_extension_load_failed" });
+			}
+		}
 		const extensionFlagSink: ExtensionFlagSink = {
 			getFlags: () => ExtensionRunner.aggregateFlags(extensionsResult.extensions),
 			setFlagValue: (name, value) => {

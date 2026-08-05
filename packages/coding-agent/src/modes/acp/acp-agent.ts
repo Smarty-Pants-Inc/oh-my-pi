@@ -2370,6 +2370,7 @@ export class AcpAgent implements Agent {
 			{
 				getModel: () => record.session.model,
 				isIdle: () => !record.session.isStreaming,
+				isCompacting: () => record.session.isCompacting,
 				abort: () => {
 					void record.session.abort({ reason: USER_INTERRUPT_LABEL });
 				},
@@ -2383,10 +2384,10 @@ export class AcpAgent implements Agent {
 				getContextUsage: () => record.session.getContextUsage(),
 				waitForIdle: () => record.session.agent.waitForIdle(),
 				newSession: async options => {
-					const success = await record.session.newSession({ parentSession: options?.parentSession });
-					if (success && options?.setup) {
-						await options.setup(record.session.sessionManager);
-					}
+					const success = await record.session.newSession(
+						{ parentSession: options?.parentSession },
+						options?.setup,
+					);
 					return { cancelled: !success };
 				},
 				branch: async entryId => {

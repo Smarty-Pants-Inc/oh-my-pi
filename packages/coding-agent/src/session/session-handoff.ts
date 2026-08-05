@@ -16,8 +16,8 @@ import type { Settings } from "../config/settings";
 import type { ExtensionRunner, SessionBeforeSwitchResult } from "../extensibility/extensions";
 import { obfuscateProviderContext, type SecretObfuscator } from "../secrets/obfuscator";
 import type { HandoffResult, SessionHandoffOptions } from "./agent-session-types";
-import type { BashSessionTransition } from "./bash-runner";
 import type { SessionContext } from "./session-context";
+import type { SessionLifecycleTransaction } from "./session-lifecycle-transaction";
 import type { SessionManager } from "./session-manager";
 
 function createHandoffContext(document: string): string {
@@ -37,6 +37,7 @@ export interface SessionHandoffHost {
 	modelRegistry: ModelRegistry;
 	extensionRunner: ExtensionRunner | undefined;
 	sideStreamFn: StreamFn;
+	beginLifecycleTransaction(): SessionLifecycleTransaction;
 	obfuscator: SecretObfuscator | undefined;
 	model(): Model | undefined;
 	thinkingLevel(): ThinkingLevel | undefined;
@@ -51,23 +52,16 @@ export interface SessionHandoffHost {
 	prepareSimpleStreamOptions(options: SimpleStreamOptions, provider?: string): SimpleStreamOptions;
 	effectiveServiceTier(model: Model | undefined): ServiceTier | undefined;
 	flushPendingBash(): Promise<void>;
-	beginBashSessionTransition(): BashSessionTransition;
-	markBashSessionTransition(transition: BashSessionTransition): void;
-	finishBashSessionTransition(transition: BashSessionTransition, success: boolean): void;
-	cancelOwnAsyncJobs(): void;
+	closeAllProviderSessions(reason: string): void;
 	clearCheckpointRuntimeState(): void;
-	clearSessionScopedToolState(): void;
 	clearFreshProviderSessionId(): void;
-	syncAgentSessionId(): void;
+	syncAgentSessionId(notifyChange?: boolean, refreshAdvisors?: boolean): void;
 	rekeyMemoryForCurrentSessionId(): void;
 	resetMemoryContextForNewTranscript(): Promise<void>;
 	clearPendingNextTurnMessages(): void;
 	resetTodoCycle(): void;
 	buildDisplaySessionContext(): SessionContext;
-	resetAdvisorSessionState(): void;
 	drainAndDetachAdvisorRecorders(): Promise<void>;
-	reattachAdvisorRecorderFeeds(): void;
-	clearAdvisorCost(): void;
 	syncTodoPhasesFromBranch(): void;
 }
 
@@ -127,8 +121,7 @@ export class SessionHandoff {
 			}
 		}
 
-		let advisorRecordersDetached = false;
-		let sessionTransitioned = false;
+		let lifecycle: SessionLifecycleTransaction | undefined;
 		try {
 			if (handoffSignal.aborted) {
 				throw new Error("Handoff cancelled");
@@ -214,63 +207,41 @@ export class SessionHandoff {
 				return undefined;
 			}
 
-			// Start a new session
+			// Start a new session only after every retained owner is rollback-capable.
 			const previousSessionFile = this.#host.sessionFile();
 			if (this.#host.extensionRunner?.hasHandlers("session_before_switch")) {
 				const result = (await this.#host.extensionRunner.emit({
 					type: "session_before_switch",
 					reason: "handoff",
 				})) as SessionBeforeSwitchResult | undefined;
-
 				if (result?.cancel) {
 					options?.onSwitchCancelled?.();
 					return undefined;
 				}
 			}
+
+			lifecycle = this.#host.beginLifecycleTransaction();
+			await lifecycle.captureRetained({ capturePersistedSessionFile: true });
 			await this.#host.flushPendingBash();
 			await this.#host.sessionManager.flush();
-			advisorRecordersDetached = true;
-			// Stop and settle in-flight advisors while the old-session feeds can still
-			// observe message_end, then mute before opening the replacement session.
 			await this.#host.drainAndDetachAdvisorRecorders();
-			const bashTransition = this.#host.beginBashSessionTransition();
-			this.#host.cancelOwnAsyncJobs();
-			try {
-				await this.#host.sessionManager.newSession(
-					previousSessionFile ? { parentSession: previousSessionFile } : undefined,
-				);
-				this.#host.markBashSessionTransition(bashTransition);
-				// The handoff opens a fresh conversation, so the spend of the one it
-				// summarizes stays with it. Clearing here, at the commit point, keeps the
-				// status line honest even if a later step throws.
-				this.#host.clearAdvisorCost();
-				sessionTransitioned = true;
-			} finally {
-				this.#host.finishBashSessionTransition(bashTransition, sessionTransitioned);
+			await lifecycle.captureRetained({ capturePersistedSessionFile: true });
+			await lifecycle.acquireOwnership();
+
+			if (this.#host.extensionRunner) {
+				lifecycle.markPublicationStarted();
+				await this.#host.extensionRunner.emit({ type: "session_switch", reason: "handoff", previousSessionFile });
 			}
 
-			this.#host.clearSessionScopedToolState();
-
-			this.#host.clearCheckpointRuntimeState();
-			// agent.reset() clears the core steering/follow-up queues. Preserve any queued
-			// steers/follow-ups (RPC/SDK steer()/followUp() issued during the handoff, or a
-			// pre-loader TUI steer) so they survive into the post-handoff session instead of
-			// being silently dropped. Capture is synchronous immediately before reset and
-			// restore is synchronous immediately after — no await gap — so a steer arriving
-			// later (during ensureOnDisk/Bun.write below) appends to the restored queue
-			// rather than being clobbered.
-			const preservedSteering = this.#host.agent.peekSteeringQueue().slice();
-			const preservedFollowUp = this.#host.agent.peekFollowUpQueue().slice();
-			this.#host.agent.reset();
-			this.#host.agent.replaceQueues(preservedSteering, preservedFollowUp);
+			await this.#host.sessionManager.newSession(
+				previousSessionFile ? { parentSession: previousSessionFile } : undefined,
+			);
+			lifecycle.markTarget();
 			this.#host.clearFreshProviderSessionId();
-			this.#host.syncAgentSessionId();
+			this.#host.syncAgentSessionId(false, false);
 			this.#host.rekeyMemoryForCurrentSessionId();
 			await this.#host.resetMemoryContextForNewTranscript();
-			this.#host.clearPendingNextTurnMessages();
-			this.#host.resetTodoCycle();
 
-			// Inject the handoff document as a custom message
 			const handoffContent = createHandoffContext(handoffText);
 			this.#host.sessionManager.appendCustomMessageEntry("handoff", handoffContent, true, undefined, "agent");
 			await this.#host.sessionManager.ensureOnDisk();
@@ -293,31 +264,46 @@ export class SessionHandoff {
 				}
 			}
 
-			// Rebuild agent messages from session
 			const sessionContext = this.#host.buildDisplaySessionContext();
+			const preservedSteering = this.#host.agent.peekSteeringQueue().slice();
+			const preservedFollowUp = this.#host.agent.peekFollowUpQueue().slice();
+			this.#host.agent.reset();
+			this.#host.agent.replaceQueues(preservedSteering, preservedFollowUp);
 			this.#host.agent.replaceMessages(sessionContext.messages);
-			this.#host.resetAdvisorSessionState();
-			advisorRecordersDetached = false;
+			this.#host.clearCheckpointRuntimeState();
+			this.#host.clearPendingNextTurnMessages();
+			this.#host.resetTodoCycle();
 			this.#host.syncTodoPhasesFromBranch();
-			if (this.#host.extensionRunner) {
-				await this.#host.extensionRunner.emit({
-					type: "session_switch",
-					reason: "handoff",
-					previousSessionFile,
-				});
-			}
 
+			const commitOptions = {
+				finalizeProviderSessions: () => this.#host.closeAllProviderSessions("handoff"),
+			};
+			if (this.#host.extensionRunner) {
+				const transaction = lifecycle;
+				await this.#host.extensionRunner.emitWithHostCompletion({ type: "session_ready" }, () =>
+					transaction.prepareCommit(commitOptions),
+				);
+				await lifecycle.activateCommitAfterHostPublication();
+			} else {
+				await lifecycle.commit(commitOptions);
+			}
 			return { document: handoffText, savedPath };
 		} catch (error) {
+			// Clear the generation gate before rollback publication so the retained
+			// post-host activation cannot be rejected as an in-progress handoff.
+			if (this.#handoffAbortController === handoffAbortController) this.#handoffAbortController = undefined;
+			if (lifecycle) {
+				await lifecycle.rollback({
+					cause: error,
+					message: "Handoff failed and rollback was incomplete",
+					cleanupReplacement: true,
+				});
+			}
 			if (handoffSignal.aborted || (error instanceof Error && error.name === "AbortError")) {
 				throw new Error("Handoff cancelled");
 			}
 			throw error;
 		} finally {
-			if (advisorRecordersDetached) {
-				if (sessionTransitioned) this.#host.resetAdvisorSessionState();
-				else this.#host.reattachAdvisorRecorderFeeds();
-			}
 			sourceSignal?.removeEventListener("abort", onSourceAbort);
 			this.#handoffAbortController = undefined;
 		}

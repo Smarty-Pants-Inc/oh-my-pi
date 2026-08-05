@@ -262,3 +262,45 @@ describe("onInvoked / peekInFlightInvoker", () => {
 		expect(invocationCount).toBe(1);
 	});
 });
+
+describe("session transitions", () => {
+	it("restores directives, in-flight state, served cursor, and preview invokers exactly on rollback", () => {
+		const q = new ToolChoiceQueue();
+		const retainedInvoker = (input: unknown) => input;
+		q.pushOnce(forced, { label: "served" });
+		expect(q.nextToolChoice()).toEqual(forced);
+		q.resolve();
+		q.pushSequence([forcedRead, "none"], { label: "retained-sequence" });
+		expect(q.nextToolChoice()).toEqual(forcedRead);
+		q.registerPendingInvoker("retained-preview", "ast_edit", retainedInvoker);
+
+		const transition = q.beginSessionTransition();
+		expect(q.inspect()).toEqual([]);
+		expect(q.hasInFlight).toBe(false);
+		expect(q.peekPendingInvoker()).toBeUndefined();
+
+		q.pushOnce(forced, { label: "target-only" });
+		q.registerPendingInvoker("target-preview", "edit", () => undefined);
+		transition.rollback();
+
+		expect(q.inspect()).toEqual(["retained-sequence"]);
+		expect(q.hasInFlight).toBe(true);
+		expect(q.consumeLastServedLabel()).toBe("served");
+		expect(q.peekPendingInvoker()).toBe(retainedInvoker);
+		q.resolve();
+		expect(q.nextToolChoice()).toBe("none");
+	});
+
+	it("commits the clean target state instead of restoring retained directives", () => {
+		const q = new ToolChoiceQueue();
+		q.pushOnce(forced, { label: "retained" });
+		q.registerPendingInvoker("retained-preview", "ast_edit", input => input);
+
+		const transition = q.beginSessionTransition();
+		transition.commit();
+
+		expect(q.inspect()).toEqual([]);
+		expect(q.hasInFlight).toBe(false);
+		expect(q.peekPendingInvoker()).toBeUndefined();
+	});
+});

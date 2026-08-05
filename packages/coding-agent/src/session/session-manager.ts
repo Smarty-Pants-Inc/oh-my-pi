@@ -19,7 +19,12 @@ import {
 	toError,
 } from "@oh-my-pi/pi-utils";
 import type { StructuredSubagentSchemaMode } from "../task/types";
-import { ArtifactManager } from "./artifacts";
+import {
+	ArtifactManager,
+	type ArtifactManagerTransaction,
+	type ArtifactTransaction,
+	type ArtifactWriterLease,
+} from "./artifacts";
 import { type BlobPutOptions, type BlobPutResult, BlobStore } from "./blob-store";
 import {
 	type BashExecutionMessage,
@@ -45,10 +50,12 @@ import {
 	type ModelChangeEntry,
 	type NewSessionOptions,
 	type ResetBoundaryEntry,
+	SESSION_LEAF_ENTRY_TYPE,
 	type ServiceTierChangeEntry,
 	type SessionEntry,
 	type SessionHeader,
 	type SessionInitEntry,
+	type SessionLeafEntry,
 	type SessionMessageEntry,
 	type SessionTitleSource,
 	type SessionTreeNode,
@@ -59,7 +66,12 @@ import {
 	type UsageStatistics,
 } from "./session-entries";
 import { findMostRecentSession, listAllSessions, listSessions, type SessionInfo } from "./session-listing";
-import { loadEntriesFromFile, readTitleSlotFromFile, resolveBlobRefsInEntries } from "./session-loader";
+import {
+	loadEntriesFromFile,
+	readTitleSlotFromFile,
+	resolveBlobRefsInEntries,
+	restoreSessionJournal,
+} from "./session-loader";
 import { generateId, migrateToCurrentVersion } from "./session-migrations";
 import {
 	computeDefaultSessionDir,
@@ -213,9 +225,10 @@ class SessionEntryIndex {
 		this.#usage = emptyUsageStatistics();
 	}
 
-	rebuild(entries: readonly SessionEntry[]): void {
+	rebuild(entries: readonly SessionEntry[], leafId?: string | null): void {
 		this.clear();
 		for (const entry of entries) this.insert(entry);
+		if (leafId === null || (leafId !== undefined && this.#entriesById.has(leafId))) this.#leaf = leafId;
 	}
 
 	insert(entry: SessionEntry): void {
@@ -347,9 +360,10 @@ export type ReadonlySessionManager = Pick<
 	| "getUsageStatistics"
 	| "putBlob"
 	| "putBlobSync"
+	| "ensureOnDisk"
 >;
 
-interface SessionManagerStateSnapshot {
+export interface SessionManagerStateSnapshot {
 	cwd: string;
 	sessionDir: string;
 	sessionId: string;
@@ -363,6 +377,32 @@ interface SessionManagerStateSnapshot {
 	draftOnlySessionCleanupArmed: boolean;
 	header: SessionHeader;
 	entries: SessionEntry[];
+	leafId: string | null;
+	forceFileCreation: boolean;
+	turnBudgetTotal: number | null;
+	turnBudgetHard: boolean;
+	turnOutputBaseline: number;
+	turnEvalOutput: number;
+	artifactManager: ArtifactManager | null;
+	artifactManagerSessionFile: string | null;
+	adoptedArtifactManager: ArtifactManager | null;
+	inMemoryArtifacts: Map<string, string> | null;
+	inMemoryArtifactCounter: number;
+	breadcrumbFresh: boolean;
+}
+
+/** Exact durable bytes captured for a fallible in-place session mutation. */
+export interface PersistedSessionFileSnapshot {
+	sessionFile: string;
+	/** Undefined records a path which did not exist at snapshot time. */
+	content: string | undefined;
+}
+
+/** A source-session artifact snapshot published only after a replacement session file exists. */
+export interface SessionArtifactCloneTransaction {
+	publish(destinationSessionFile: string): Promise<void>;
+	commit(): Promise<void>;
+	rollback(): Promise<void>;
 }
 
 interface DiskQueueOptions {
@@ -502,6 +542,7 @@ export class SessionManager {
 	#artifactManager: ArtifactManager | null = null;
 	#artifactManagerSessionFile: string | null = null;
 	#adoptedArtifactManager: ArtifactManager | null = null;
+	#activeArtifactTransaction: ArtifactManagerTransaction | null = null;
 	#inMemoryArtifacts: Map<string, string> | null = null;
 	#inMemoryArtifactCounter = 0;
 
@@ -751,10 +792,18 @@ export class SessionManager {
 		});
 	}
 
+	#leafRecord(): SessionLeafEntry | undefined {
+		const fallbackLeafId = this.#entries.at(-1)?.id ?? null;
+		const leafId = this.#index.leafId();
+		return leafId === fallbackLeafId ? undefined : { type: SESSION_LEAF_ENTRY_TYPE, leafId };
+	}
+
 	#fileBody(): string {
 		let body = this.#titleSlotLine();
 		body += this.#lineFor(this.#header);
 		for (const entry of this.#entries) body += this.#lineFor(entry);
+		const leafRecord = this.#leafRecord();
+		if (leafRecord) body += this.#lineFor(leafRecord);
 		return body;
 	}
 
@@ -883,7 +932,7 @@ export class SessionManager {
 		}
 	}
 
-	#appendToSessionFile(entry: SessionEntry): void {
+	#appendToSessionFile(entry: FileEntry): void {
 		if (!this.#persist || !this.#sessionFile) return;
 		if (this.#atomicEntryBatch) {
 			this.#fileIsCurrent = false;
@@ -1065,14 +1114,14 @@ export class SessionManager {
 		return this.#sessionFile;
 	}
 
-	#applyEntries(header: SessionHeader, entries: SessionEntry[]): void {
+	#applyEntries(header: SessionHeader, entries: SessionEntry[], leafId?: string | null): void {
 		this.#header = header;
 		this.#entries = entries;
 		this.#sessionId = header.id;
 		this.#sessionName = header.title;
 		this.#titleSource = header.titleSource;
 		this.#titleUpdatedAt = header.timestamp;
-		this.#index.rebuild(entries);
+		this.#index.rebuild(entries, leafId);
 	}
 
 	#freshEntryFields(): { id: string; parentId: string | null; timestamp: string } {
@@ -1211,11 +1260,71 @@ export class SessionManager {
 			onDisk: this.#fileIsCurrent,
 			needsRewrite: this.#rewriteRequired,
 			draftOnlySessionCleanupArmed: this.#draftOnlySessionCleanupArmed,
-			// Snapshot header + entries by reference: switch/reload replaces the
-			// active header/array wholesale, so rollback needs no deep clone.
-			header: this.#header,
-			entries: [...this.#entries],
+			// Header and entries are mutated in place by title, workspace, and
+			// migration paths. A rollback checkpoint must never share those objects.
+			header: structuredClone(this.#header),
+			entries: structuredClone(this.#entries) as SessionEntry[],
+			leafId: this.#index.leafId(),
+			forceFileCreation: this.#forceFileCreation,
+			turnBudgetTotal: this.#turnBudgetTotal,
+			turnBudgetHard: this.#turnBudgetHard,
+			turnOutputBaseline: this.#turnOutputBaseline,
+			turnEvalOutput: this.#turnEvalOutput,
+			// Manager identity is intentionally retained for adopted/shared managers;
+			// beginArtifactTransaction() snapshots and restores their mutable state in place.
+			artifactManager: this.#artifactManager,
+			artifactManagerSessionFile: this.#artifactManagerSessionFile,
+			adoptedArtifactManager: this.#adoptedArtifactManager,
+			inMemoryArtifacts: this.#inMemoryArtifacts ? new Map(this.#inMemoryArtifacts) : null,
+			inMemoryArtifactCounter: this.#inMemoryArtifactCounter,
+			breadcrumbFresh: this.#breadcrumbFresh,
 		};
+	}
+
+	/** Capture exact JSONL state, including a configured path that has not yet been materialized. */
+	async capturePersistedSessionFile(): Promise<PersistedSessionFileSnapshot | undefined> {
+		const sessionFile = this.#sessionFile;
+		if (!this.#persist || !sessionFile) return undefined;
+		await this.flush();
+		return this.#storage.existsSync(sessionFile)
+			? { sessionFile, content: await this.#storage.readText(sessionFile) }
+			: { sessionFile, content: undefined };
+	}
+
+	/**
+	 * Capture a target transcript before a fallible switch adopts it. This must not
+	 * flush or otherwise touch the currently active session.
+	 */
+	async capturePersistedSessionFileAt(sessionFile: string): Promise<PersistedSessionFileSnapshot | undefined> {
+		if (!this.#persist) return undefined;
+		const resolvedSessionFile = path.resolve(sessionFile);
+		return this.#storage.existsSync(resolvedSessionFile)
+			? { sessionFile: resolvedSessionFile, content: await this.#storage.readText(resolvedSessionFile) }
+			: { sessionFile: resolvedSessionFile, content: undefined };
+	}
+
+	/** Restore an exact durable JSONL snapshot after an in-place mutation rolls back. */
+	async restorePersistedSessionFile(snapshot: PersistedSessionFileSnapshot | undefined): Promise<boolean> {
+		if (!this.#persist || !snapshot || this.#sessionFile !== snapshot.sessionFile) return false;
+		let restored = false;
+		await this.#scheduleDiskWork(async () => {
+			await this.#closeWriterHandle();
+			if (this.#sessionFile !== snapshot.sessionFile) return;
+			if (snapshot.content === undefined) {
+				try {
+					await this.#storage.unlink(snapshot.sessionFile);
+				} catch (error) {
+					if (!isEnoent(error)) throw error;
+				}
+			} else {
+				await this.#storage.writeTextAtomic(snapshot.sessionFile, snapshot.content);
+			}
+			this.#fileIsCurrent = snapshot.content !== undefined;
+			this.#rewriteRequired = false;
+			this.#hasTitleSlot = snapshot.content !== undefined;
+			restored = true;
+		});
+		return restored;
 	}
 
 	/**
@@ -1228,7 +1337,21 @@ export class SessionManager {
 		const persist = options?.persist ?? this.#persist;
 		const clone = new SessionManager(this.#cwd, this.#sessionDir, persist, this.#storage);
 		clone.#suppressBreadcrumb = true;
-		clone.restoreState(this.captureState());
+		const snapshot = this.captureState();
+		clone.restoreState(snapshot);
+		// A clone owns fresh transient budget/artifact bookkeeping just as it did
+		// before rollback snapshots covered those fields.
+		clone.#forceFileCreation = snapshot.onDisk;
+		clone.#turnBudgetTotal = null;
+		clone.#turnBudgetHard = false;
+		clone.#turnOutputBaseline = 0;
+		clone.#turnEvalOutput = 0;
+		clone.#artifactManager = null;
+		clone.#artifactManagerSessionFile = null;
+		clone.#adoptedArtifactManager = null;
+		clone.#inMemoryArtifacts = null;
+		clone.#inMemoryArtifactCounter = 0;
+		clone.#breadcrumbFresh = false;
 		if (!persist) {
 			clone.#sessionFile = undefined;
 			clone.#fileIsCurrent = false;
@@ -1242,25 +1365,36 @@ export class SessionManager {
 		this.#closeWriterEventually();
 		this.#diskTail = Promise.resolve();
 		this.#clearDiskError();
-
+		// A snapshot may be restored more than once during rollback. Every restore
+		// must own fresh objects so reconciler/title mutations cannot alias the
+		// checkpoint and poison the authoritative second restore.
+		const header = structuredClone(snapshot.header);
+		const entries = structuredClone(snapshot.entries) as SessionEntry[];
 		this.#cwd = snapshot.cwd;
 		this.#sessionDir = snapshot.sessionDir;
 		this.#sessionFile = snapshot.sessionFile;
 		this.#fileIsCurrent = snapshot.onDisk;
 		this.#rewriteRequired = snapshot.needsRewrite;
-		this.#forceFileCreation = snapshot.onDisk;
 		this.#draftOnlySessionCleanupArmed = snapshot.draftOnlySessionCleanupArmed;
-		this.#applyEntries(snapshot.header, [...snapshot.entries]);
-		this.#additionalDirectories = snapshot.header.additionalDirectories ?? [];
+		this.#applyEntries(header, entries, snapshot.leafId);
+		this.#additionalDirectories = [...(header.additionalDirectories ?? [])];
 		this.#sessionName = snapshot.sessionName;
 		this.#titleSource = snapshot.titleSource;
 		this.#titleUpdatedAt = snapshot.titleUpdatedAt;
 		this.#hasTitleSlot = snapshot.hasTitleSlot;
-		this.#artifactManager = null;
-		this.#artifactManagerSessionFile = null;
-		this.#adoptedArtifactManager = null;
+		this.#forceFileCreation = snapshot.forceFileCreation;
+		this.#turnBudgetTotal = snapshot.turnBudgetTotal;
+		this.#turnBudgetHard = snapshot.turnBudgetHard;
+		this.#turnOutputBaseline = snapshot.turnOutputBaseline;
+		this.#turnEvalOutput = snapshot.turnEvalOutput;
+		this.#artifactManager = snapshot.artifactManager;
+		this.#artifactManagerSessionFile = snapshot.artifactManagerSessionFile;
+		this.#adoptedArtifactManager = snapshot.adoptedArtifactManager;
+		this.#inMemoryArtifacts = snapshot.inMemoryArtifacts ? new Map(snapshot.inMemoryArtifacts) : null;
+		this.#inMemoryArtifactCounter = snapshot.inMemoryArtifactCounter;
+		this.#breadcrumbFresh = snapshot.breadcrumbFresh;
 
-		if (this.#sessionFile) this.#rememberBreadcrumb(this.#cwd, this.#sessionFile);
+		if (this.#sessionFile) this.#rememberBreadcrumb(this.#cwd, this.#sessionFile, snapshot.breadcrumbFresh);
 	}
 
 	/** Switch to a different session file (resume / branch). */
@@ -1303,7 +1437,8 @@ export class SessionManager {
 			this.#rememberBreadcrumb(this.#cwd, resolvedSessionFile);
 		}
 
-		this.#applyEntries(header, fileEntries.slice(1) as SessionEntry[]);
+		const journal = restoreSessionJournal(fileEntries);
+		this.#applyEntries(header, journal.entries, journal.leafId);
 		this.#additionalDirectories = header.additionalDirectories ?? [];
 		this.#titleUpdatedAt = titleSlot?.updatedAt ?? header.timestamp;
 		this.#hasTitleSlot = titleSlot !== undefined;
@@ -1506,8 +1641,8 @@ export class SessionManager {
 	}
 
 	/**
-	 * Force the session onto disk even with no assistant message yet (ACP
-	 * session/new must create a discoverable file immediately).
+	 * Force the session onto disk even with no assistant message yet. Callers
+	 * that expose a resumable session ID must await this first.
 	 */
 	async ensureOnDisk(): Promise<void> {
 		if (!this.#persist || !this.#sessionFile) return;
@@ -1534,7 +1669,7 @@ export class SessionManager {
 		manager.#header.additionalDirectories =
 			manager.#additionalDirectories.length > 0 ? [...manager.#additionalDirectories] : undefined;
 		manager.#entries = structuredClone(this.#entries);
-		manager.#index.rebuild(manager.#entries);
+		manager.#index.rebuild(manager.#entries, this.#index.leafId());
 		manager.#forceFileCreation = true;
 		await manager.#rewriteAtomically();
 		return manager;
@@ -1833,12 +1968,98 @@ export class SessionManager {
 		return this.#artifactManagerForSession();
 	}
 
-	async allocateArtifactPath(toolType: string): Promise<{ id?: string; path?: string }> {
-		return (await this.#artifactManagerForSession()?.allocatePath(toolType)) ?? {};
+	/**
+	 * Fence the active session's artifact manager for inheritance by a future
+	 * replacement session. Publication validates that the replacement is the
+	 * manager's active session and maps its JSONL path to the sibling artifact
+	 * directory only after the replacement file has been created. Callers may
+	 * include exact top-level companion files whose lifecycle semantics require
+	 * continuity in addition to numeric artifacts.
+	 */
+	async beginArtifactCloneTransaction(
+		additionalFileNames: readonly string[] = [],
+	): Promise<SessionArtifactCloneTransaction | undefined> {
+		const sourceSessionFile = this.#sessionFile;
+		if (!this.#persist || !sourceSessionFile) return undefined;
+		const sourceManager = this.#artifactManagerForSession();
+		if (!sourceManager) return undefined;
+		const transaction = await sourceManager.beginCloneTransaction(additionalFileNames);
+
+		return {
+			publish: async destinationSessionFile => {
+				const resolvedDestinationSessionFile = path.resolve(destinationSessionFile);
+				if (!this.#sessionFile || path.resolve(this.#sessionFile) !== resolvedDestinationSessionFile) {
+					throw new Error("Artifact clone destination is not the active replacement session");
+				}
+				if (resolvedDestinationSessionFile === path.resolve(sourceSessionFile)) {
+					throw new Error("Artifact clone destination must differ from its source session");
+				}
+				const destinationDir = artifactsDirectoryFor(resolvedDestinationSessionFile);
+				if (!destinationDir) throw new Error("Artifact clone destination session is not persisted");
+				await transaction.publish(destinationDir);
+			},
+			commit: () => transaction.commit(),
+			rollback: () => transaction.rollback(),
+		};
+	}
+
+	/**
+	 * Snapshot artifact state for a fallible in-place session mutation. Persistent
+	 * managers are restored in place so adopted owners keep one shared allocator.
+	 */
+	async beginArtifactTransaction(): Promise<ArtifactTransaction> {
+		if (this.#activeArtifactTransaction) throw new Error("Artifact transaction already active");
+		const managerTransaction = await this.#artifactManagerForSession()?.beginTransaction();
+		this.#activeArtifactTransaction = managerTransaction ?? null;
+		const inMemoryArtifacts = this.#inMemoryArtifacts ? new Map(this.#inMemoryArtifacts) : null;
+		const inMemoryArtifactCounter = this.#inMemoryArtifactCounter;
+		let closed = false;
+		let rollbackPromise: Promise<void> | undefined;
+
+		return {
+			commit: async () => {
+				if (closed) return;
+				if (rollbackPromise) await rollbackPromise;
+				if (closed) return;
+				closed = true;
+				if (this.#activeArtifactTransaction === managerTransaction) {
+					this.#activeArtifactTransaction = null;
+				}
+				await managerTransaction?.commit();
+			},
+			rollback: () => {
+				if (rollbackPromise) return rollbackPromise;
+				if (closed) return Promise.resolve();
+				rollbackPromise = (async () => {
+					let failure: unknown;
+					try {
+						await managerTransaction?.rollback();
+					} catch (error) {
+						failure = error;
+					}
+					this.#inMemoryArtifacts = inMemoryArtifacts ? new Map(inMemoryArtifacts) : null;
+					this.#inMemoryArtifactCounter = inMemoryArtifactCounter;
+					if (failure) {
+						closed = true;
+						await managerTransaction?.commit();
+						if (this.#activeArtifactTransaction === managerTransaction) {
+							this.#activeArtifactTransaction = null;
+						}
+						throw failure;
+					}
+				})();
+				return rollbackPromise;
+			},
+		};
+	}
+
+	async allocateArtifactPath(toolType: string): Promise<Partial<ArtifactWriterLease>> {
+		const manager = this.#activeArtifactTransaction ?? this.#artifactManagerForSession();
+		return (await manager?.allocatePath(toolType)) ?? {};
 	}
 
 	async saveArtifact(content: string, toolType: string): Promise<string | undefined> {
-		const manager = this.#artifactManagerForSession();
+		const manager = this.#activeArtifactTransaction ?? this.#artifactManagerForSession();
 		if (manager) return manager.save(content, toolType);
 
 		// Non-persistent session: keep an in-memory copy so spill truncation works.
@@ -2016,6 +2237,8 @@ export class SessionManager {
 		};
 		this.#recordEntry(entry);
 		this.#index.setLeaf(activeLeafId);
+		const leafRecord = this.#leafRecord();
+		if (leafRecord) this.#appendToSessionFile(leafRecord);
 		return entry.id;
 	}
 
@@ -2117,6 +2340,16 @@ export class SessionManager {
 	 */
 	async rewriteEntries(): Promise<void> {
 		if (!this.#persist || !this.#sessionFile) return;
+		await this.#rewriteAtomically();
+	}
+
+	/** Materialize the current tree leaf before publishing an in-file navigation. */
+	async persistActiveLeaf(): Promise<void> {
+		if (!this.#persist || !this.#sessionFile) return;
+		this.#forceFileCreation = true;
+		// Always canonicalize the file. If a previous navigation appended a leaf
+		// record and this navigation returns to the physical last entry, the
+		// canonical body must remove that stale trailing record before resume.
 		await this.#rewriteAtomically();
 	}
 
@@ -2473,7 +2706,7 @@ export class SessionManager {
 		await resolveBlobRefsInEntries(sourceEntries, manager.#blobs);
 
 		const sourceHeader = sourceEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
-		const history = sourceEntries.filter(entry => entry.type !== "session") as SessionEntry[];
+		const journal = restoreSessionJournal(sourceEntries);
 		manager.#resetToNewSession(
 			{
 				parentSession: sourceHeader?.id,
@@ -2490,8 +2723,8 @@ export class SessionManager {
 		manager.#titleSource = manager.#header.titleSource;
 		manager.#titleUpdatedAt = nowIso();
 		manager.#hasTitleSlot = true;
-		manager.#entries = history;
-		manager.#index.rebuild(history);
+		manager.#entries = journal.entries;
+		manager.#index.rebuild(journal.entries, journal.leafId);
 		manager.sanitizeLoadedOpenAIResponsesReplayMetadata();
 		manager.#forceFileCreation = true;
 		await manager.#rewriteAtomically();

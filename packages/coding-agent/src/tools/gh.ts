@@ -2414,13 +2414,18 @@ function formatSearchReposResults(query: string, items: GhSearchRepoResult[]): s
 }
 
 async function saveArtifactText(session: ToolSession, toolType: string, text: string): Promise<string | undefined> {
-	const { path: artifactPath, id: artifactId } = (await session.allocateOutputArtifact?.(toolType)) ?? {};
-	if (!artifactPath || !artifactId) {
+	const artifact = (await session.allocateOutputArtifact?.(toolType)) ?? {};
+	if (!artifact.path || !artifact.id) {
+		artifact.release?.();
 		return undefined;
 	}
 
-	await Bun.write(artifactPath, text);
-	return artifactId;
+	try {
+		await Bun.write(artifact.path, text);
+		return artifact.id;
+	} finally {
+		artifact.release?.();
+	}
 }
 
 function appendArtifactReference(text: string, artifactId: string | undefined, label: string): string {

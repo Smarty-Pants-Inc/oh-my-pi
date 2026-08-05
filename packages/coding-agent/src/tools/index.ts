@@ -265,8 +265,8 @@ export interface ToolSession {
 	getArtifactsDir?: () => string | null;
 	/** Get the ArtifactManager backing this session (shared across parent + subagents). */
 	getArtifactManager?: () => ArtifactManager | null;
-	/** Allocate a new artifact path and ID for session-scoped truncated output. */
-	allocateOutputArtifact?: (toolType: string) => Promise<{ id?: string; path?: string }>;
+	/** Allocate a new artifact path and ID; release writer ownership after the final durable byte. */
+	allocateOutputArtifact?: (toolType: string) => Promise<{ id?: string; path?: string; release?: () => void }>;
 	/** Get session spawns */
 	getSessionSpawns: () => string | null;
 	/** Get resolved model string if explicitly set for this session */
@@ -388,7 +388,7 @@ export interface ToolSession {
 	/** Register cleanup that runs when this session is disposed; returns a handle that removes the cleanup. */
 	registerDisposeCallback?(callback: () => void): (() => void) | void;
 	/** Register cleanup that runs when this ToolSession adopts a different session ID. */
-	registerSessionChangeCallback?(callback: () => void): (() => void) | void;
+	registerSessionChangeCallback?(callback: () => void, options?: { onDiscard?: () => void }): (() => void) | void;
 	/** Queue late LSP diagnostics (arrived after an edit/write returned) to be shown
 	 *  in the transcript and delivered to the model at the next yield, like background
 	 *  job results. */

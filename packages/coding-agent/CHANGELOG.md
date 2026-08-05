@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added Fresh's opt-in native-TUI companion for direct local interactive sessions: authenticated bounded status snapshots; frozen HMAC-authenticated cancel/snapshot commands; one-shot capability consumption before public extensions with child-environment filtering; one lifecycle-stable consume-only host listener; exact pre-publication materialization; a single `SessionLifecycleTransaction` backed by a dedicated typed owner/checkpoint module; an initial durable retained preimage before destructive quiescence plus a later authoritative checkpoint; fail-closed selection of advisor/yield, Bash, concrete async, launch-completion, tool/directive/permission/mount, artifact, and callback ownership; post-host delivery, receipt settlement, provider/advisor finalization, callbacks, reconnection, and fence release; exact retained/target rollback with publication suppression on required cleanup or false journal restoration; exact persisted `/tree` leaf resume; and writer-fenced artifact/advisor continuity for fork, non-root branch, and `/btw`.
+
 ## [17.2.7] - 2026-08-03
 
 ### Changed

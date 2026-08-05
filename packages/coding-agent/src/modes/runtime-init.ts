@@ -101,6 +101,7 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 		{
 			getModel: () => session.model,
 			isIdle: () => !session.isStreaming,
+			isCompacting: () => session.isCompacting,
 			abort: () => session.abort({ reason: USER_INTERRUPT_LABEL }),
 			hasPendingMessages: () => session.queuedMessageCount > 0,
 			shutdown,
@@ -113,10 +114,7 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			getContextUsage: () => session.getContextUsage(),
 			waitForIdle: () => session.agent.waitForIdle(),
 			newSession: async newOptions => {
-				const success = await session.newSession({ parentSession: newOptions?.parentSession });
-				if (success && newOptions?.setup) {
-					await newOptions.setup(session.sessionManager);
-				}
+				const success = await session.newSession({ parentSession: newOptions?.parentSession }, newOptions?.setup);
 				return { cancelled: !success };
 			},
 			branch: async entryId => {

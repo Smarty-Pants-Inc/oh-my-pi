@@ -29,6 +29,16 @@ export interface SessionStartEvent {
 	type: "session_start";
 }
 
+/** Fired after a committed session transition has fully restored authoritative state. Extension-only. */
+export interface SessionReadyEvent {
+	type: "session_ready";
+}
+
+/** Fired after a failed session transition has fully restored its retained checkpoint. Extension-only. */
+export interface SessionRollbackEvent {
+	type: "session_rollback";
+}
+
 /** Fired before switching to another session (can be cancelled) */
 export interface SessionBeforeSwitchEvent {
 	type: "session_before_switch";

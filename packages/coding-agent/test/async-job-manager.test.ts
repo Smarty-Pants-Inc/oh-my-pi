@@ -1,5 +1,10 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test, vi } from "bun:test";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
+import { logger } from "@oh-my-pi/pi-utils";
+
+afterEach(() => {
+	vi.restoreAllMocks();
+});
 
 describe("AsyncJobManager", () => {
 	test("forwards progress updates and delivers completion", async () => {
@@ -189,6 +194,143 @@ describe("AsyncJobManager", () => {
 		expect(manager.getJob(jobId)?.status).toBe("completed");
 		await Bun.sleep(60);
 		expect(manager.getJob(jobId)).toBeUndefined();
+	});
+
+	test("does not evict or misroute a replacement when a discarded job later settles", async () => {
+		const oldStarted = Promise.withResolvers<void>();
+		const releaseOld = Promise.withResolvers<void>();
+		const releaseReplacement = Promise.withResolvers<void>();
+		const oldDeliveries: string[] = [];
+		const replacementDeliveries: Array<{ jobId: string; text: string; ownerId: string | undefined }> = [];
+		const manager = new AsyncJobManager({ retentionMs: 0 });
+		manager.registerDeliverySink("old-owner", jobId => {
+			oldDeliveries.push(jobId);
+			return;
+		});
+		manager.registerDeliverySink("replacement-owner", (jobId, text, job) => {
+			replacementDeliveries.push({ jobId, text, ownerId: job?.ownerId });
+			return;
+		});
+
+		const jobId = manager.register(
+			"bash",
+			"old job",
+			async () => {
+				oldStarted.resolve();
+				await releaseOld.promise;
+				return "old result";
+			},
+			{ id: "reused-job", ownerId: "old-owner" },
+		);
+		await oldStarted.promise;
+		const oldJob = manager.getJob(jobId);
+		if (!oldJob) throw new Error("Old job was not registered");
+
+		expect(manager.discardJobs([oldJob])).toBe(0);
+		expect(manager.getJob(jobId)).toBeUndefined();
+		const replacementJobId = manager.register(
+			"bash",
+			"replacement job",
+			async () => {
+				await releaseReplacement.promise;
+				return "replacement result";
+			},
+			{ id: jobId, ownerId: "replacement-owner" },
+		);
+		expect(replacementJobId).toBe(jobId);
+
+		releaseOld.resolve();
+		await oldJob.promise;
+		expect(manager.getJob(replacementJobId)?.status).toBe("running");
+
+		releaseReplacement.resolve();
+		await manager.waitForAll();
+		await manager.drainDeliveries({ timeoutMs: 500 });
+
+		expect(oldDeliveries).toEqual([]);
+		expect(replacementDeliveries).toEqual([
+			{ jobId: replacementJobId, text: "replacement result", ownerId: "replacement-owner" },
+		]);
+	});
+
+	test("requeues a deferred delivery while the same job object remains registered", async () => {
+		const deliveries: string[] = [];
+		const manager = new AsyncJobManager({ retentionMs: 60_000 });
+		manager.registerDeliverySink("owner", (_jobId, text) => {
+			deliveries.push(text);
+		});
+
+		const jobId = manager.register("task", "same object", async () => "initial result", {
+			id: "same-object-replay",
+			ownerId: "owner",
+		});
+		await manager.waitForAll();
+		await manager.drainDeliveries({ timeoutMs: 500 });
+		const job = manager.getJob(jobId);
+		if (!job) throw new Error("Expected completed job to remain registered");
+
+		expect(manager.requeueDelivery(job, "replayed result")).toBe(true);
+		await manager.drainDeliveries({ timeoutMs: 500 });
+
+		expect(deliveries).toEqual(["initial result", "replayed result"]);
+		expect(manager.getJob(jobId)).toBe(job);
+	});
+
+	test("dead-letters a deferred delivery when its job id now belongs to a replacement", async () => {
+		const oldDeliveryStarted = Promise.withResolvers<void>();
+		const releaseOldDelivery = Promise.withResolvers<void>();
+		const releaseReplacement = Promise.withResolvers<string>();
+		const staleRetryDeadLettered = Promise.withResolvers<void>();
+		const warn = vi.spyOn(logger, "warn").mockImplementation(message => {
+			if (message === "Async job delivery dead-lettered after failure: stale job identity") {
+				staleRetryDeadLettered.resolve();
+			}
+		});
+		const oldDeliveries: string[] = [];
+		const replacementDeliveries: string[] = [];
+		const manager = new AsyncJobManager({ retentionMs: 60_000 });
+		manager.registerDeliverySink("old-owner", async (_jobId, text) => {
+			oldDeliveries.push(text);
+			oldDeliveryStarted.resolve();
+			await releaseOldDelivery.promise;
+			throw new Error("force deferred delivery replay");
+		});
+		manager.registerDeliverySink("replacement-owner", (_jobId, text) => {
+			replacementDeliveries.push(text);
+		});
+
+		const jobId = manager.register("task", "old job", async () => "old result", {
+			id: "reused-deferred-job",
+			ownerId: "old-owner",
+		});
+		const oldJob = manager.getJob(jobId);
+		if (!oldJob) throw new Error("Expected old job to be registered");
+		await oldDeliveryStarted.promise;
+		expect(manager.discardJobs([oldJob], { ownerId: "old-owner" })).toBe(1);
+
+		const replacementJobId = manager.register("task", "replacement job", () => releaseReplacement.promise, {
+			id: jobId,
+			ownerId: "replacement-owner",
+		});
+		const replacementJob = manager.getJob(replacementJobId);
+		if (!replacementJob) throw new Error("Expected replacement job to be registered");
+		expect(replacementJobId).toBe(jobId);
+
+		// The transition replay owns the old object, not merely its reusable id.
+		expect(manager.requeueDelivery(oldJob, "stale replay text")).toBe(false);
+		releaseOldDelivery.resolve();
+		await staleRetryDeadLettered.promise;
+		warn.mockRestore();
+
+		expect(oldDeliveries).toEqual(["old result"]);
+		expect(replacementDeliveries).toEqual([]);
+		expect(manager.getJob(jobId)).toBe(replacementJob);
+		expect(replacementJob.status).toBe("running");
+
+		releaseReplacement.resolve("replacement result");
+		await manager.waitForAll();
+		await manager.drainDeliveries({ timeoutMs: 500 });
+		expect(replacementDeliveries).toEqual(["replacement result"]);
 	});
 
 	test("cancelAll does not clear retention timers for already completed jobs", async () => {

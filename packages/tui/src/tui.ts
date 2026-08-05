@@ -1657,6 +1657,7 @@ export class TUI extends Container {
 		};
 	}
 
+	/** Register an input transform in insertion order. */
 	addInputListener(listener: InputListener): () => void {
 		this.#inputListeners.add(listener);
 		return () => {

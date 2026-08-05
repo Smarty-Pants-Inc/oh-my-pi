@@ -3983,6 +3983,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#sttController = undefined;
 		}
 		this.#extensionUiController.clearExtensionTerminalInputListeners();
+		this.#extensionUiController.clearHostTerminalInputListeners();
 		this.#extensionUiController.clearHookWidgets();
 		for (const unsubscribe of this.#eventBusUnsubscribers) {
 			unsubscribe();

@@ -558,6 +558,7 @@ describe("ExtensionRunner", () => {
 				{
 					getModel: () => primaryModel,
 					isIdle: () => true,
+					isCompacting: () => false,
 					abort: () => {},
 					hasPendingMessages: () => false,
 					shutdown: () => {},
@@ -920,6 +921,7 @@ describe("ExtensionRunner", () => {
 				{
 					getModel: () => undefined,
 					isIdle: () => true,
+					isCompacting: () => false,
 					abort: () => controller.abort(),
 					hasPendingMessages: () => false,
 					shutdown: () => {},
@@ -1393,6 +1395,7 @@ describe("ExtensionRunner", () => {
 				{
 					getModel: () => undefined,
 					isIdle: () => true,
+					isCompacting: () => false,
 					abort: () => {},
 					hasPendingMessages: () => false,
 					shutdown: () => {},
@@ -1476,6 +1479,7 @@ describe("ExtensionRunner", () => {
 				{
 					getModel: () => undefined,
 					isIdle: () => true,
+					isCompacting: () => false,
 					abort: () => {},
 					hasPendingMessages: () => false,
 					shutdown: () => {},
@@ -1565,6 +1569,7 @@ describe("ExtensionRunner", () => {
 				{
 					getModel: () => undefined,
 					isIdle: () => true,
+					isCompacting: () => false,
 					abort: () => {},
 					hasPendingMessages: () => false,
 					shutdown: () => {},
@@ -1632,6 +1637,7 @@ describe("ExtensionRunner", () => {
 				{
 					getModel: () => undefined,
 					isIdle: () => true,
+					isCompacting: () => false,
 					abort: () => {},
 					hasPendingMessages: () => false,
 					shutdown: () => {},
@@ -1688,6 +1694,7 @@ describe("ExtensionRunner", () => {
 				{
 					getModel: () => undefined,
 					isIdle: () => true,
+					isCompacting: () => false,
 					abort: () => {},
 					hasPendingMessages: () => false,
 					shutdown: () => {},
@@ -2281,6 +2288,7 @@ describe("ExtensionRunner", () => {
 				{
 					getModel: () => undefined,
 					isIdle: () => true,
+					isCompacting: () => false,
 					abort: () => {},
 					hasPendingMessages: () => false,
 					shutdown: () => {},
@@ -2869,6 +2877,7 @@ describe("ExtensionRunner", () => {
 				{
 					getModel: () => undefined,
 					isIdle: () => true,
+					isCompacting: () => false,
 					abort: () => {},
 					hasPendingMessages: () => false,
 					shutdown: () => {},
@@ -2941,6 +2950,7 @@ describe("ExtensionRunner", () => {
 				{
 					getModel: () => undefined,
 					isIdle: () => true,
+					isCompacting: () => false,
 					abort: () => {},
 					hasPendingMessages: () => false,
 					shutdown: () => {},
@@ -3031,6 +3041,7 @@ describe("ExtensionRunner", () => {
 				{
 					getModel: () => undefined,
 					isIdle: () => true,
+					isCompacting: () => false,
 					abort: () => {},
 					hasPendingMessages: () => false,
 					shutdown: () => {},
@@ -3255,6 +3266,189 @@ describe("ExtensionRunner", () => {
 			);
 			// A fresh chain at depth 0 is unaffected by another chain's depth.
 			await expect(runner.invokeNativeTool("bash", { command: "echo hi" }, { depth: 0 })).resolves.toBeDefined();
+		});
+	});
+
+	describe("host-internal bindings", () => {
+		it("runs first, stays off public surfaces, finalizes after fan-out, and contains host faults", async () => {
+			const hostACode = `
+				export default function(pi) {
+					const { Type } = pi.typebox;
+					pi.registerTool({
+						name: "host_only_tool",
+						label: "host only",
+						description: "must remain internal",
+						parameters: Type.Object({}),
+						execute: async () => ({ content: [{ type: "text", text: "host" }], details: {} }),
+					});
+					pi.registerFlag("--host-only", { type: "boolean" });
+					pi.registerCommand("host-only", { handler: async () => {} });
+					pi.on("session_ready", (_event, ctx) => {
+						globalThis.__hostBindingOrder.push(\`host-a:\${ctx.isCompacting()}\`);
+						globalThis.__ordinaryHostContext = ctx;
+					});
+				}
+			`;
+			const hostBCode = `
+				export default function(pi) {
+					pi.on("session_ready", () => globalThis.__hostBindingOrder.push("host-b"));
+				}
+			`;
+			const publicCode = `
+				export default function(pi) {
+					const { Type } = pi.typebox;
+					pi.registerTool({
+						name: "public_tool",
+						label: "public",
+						description: "public tool",
+						parameters: Type.Object({}),
+						execute: async () => ({ content: [{ type: "text", text: "public" }], details: {} }),
+					});
+					pi.registerFlag("--public-only", { type: "boolean" });
+					pi.registerCommand("public-only", { handler: async () => {} });
+					pi.on("session_ready", async () => {
+						globalThis.__hostBindingOrder.push("public:start");
+						globalThis.__hostBindingCompacting = true;
+						await Promise.resolve();
+						globalThis.__hostBindingOrder.push("public:end");
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "host-a.ts"), hostACode);
+			fs.writeFileSync(path.join(extensionsDir, "host-b.ts"), hostBCode);
+			fs.writeFileSync(path.join(extensionsDir, "public.ts"), publicCode);
+
+			const order: string[] = [];
+			const globalState = globalThis as typeof globalThis & {
+				__hostBindingOrder?: string[];
+				__hostBindingCompacting?: boolean;
+				__ordinaryHostContext?: unknown;
+			};
+			globalState.__hostBindingOrder = order;
+			globalState.__hostBindingCompacting = false;
+
+			const result = await loadTestExtensions();
+			const hostA = result.extensions.find(extension => extension.path.endsWith("host-a.ts"));
+			const hostB = result.extensions.find(extension => extension.path.endsWith("host-b.ts"));
+			const publicExtension = result.extensions.find(extension => extension.path.endsWith("public.ts"));
+			if (!hostA || !hostB || !publicExtension) throw new Error("Expected all host binding fixtures to load");
+
+			const firstAfterContexts: unknown[] = [];
+			const secondAfterContexts: unknown[] = [];
+			const runner = new ExtensionRunner(
+				[publicExtension],
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				[
+					{
+						extension: hostA,
+						afterDispatch: (_event, ctx) => {
+							firstAfterContexts.push(ctx);
+							order.push(`after-a:${ctx.isCompacting()}`);
+							throw new Error("first host completion failed");
+						},
+					},
+					{
+						extension: hostB,
+						afterDispatch: (_event, ctx) => {
+							secondAfterContexts.push(ctx);
+							order.push(`after-b:${ctx.isCompacting()}`);
+						},
+					},
+				],
+			);
+			runner.initialize(
+				{
+					sendMessage: () => {},
+					sendUserMessage: () => {},
+					appendEntry: () => {},
+					setLabel: () => {},
+					getActiveTools: () => [],
+					getAllTools: () => [],
+					setActiveTools: async () => {},
+					getCommands: () => [],
+					setModel: async () => false,
+					getThinkingLevel: () => undefined,
+					setThinkingLevel: () => {},
+					getSessionName: () => undefined,
+					setSessionName: async () => {},
+				},
+				{
+					getModel: () => undefined,
+					isIdle: () => true,
+					isCompacting: () => globalState.__hostBindingCompacting === true,
+					abort: () => {},
+					hasPendingMessages: () => false,
+					shutdown: () => {},
+					getContextUsage: () => undefined,
+					compact: async () => {},
+					getSystemPrompt: () => [],
+				},
+			);
+			const errors: ExtensionError[] = [];
+			runner.onError(error => errors.push(error));
+
+			await expect(
+				runner.emitWithHostCompletion({ type: "session_ready" }, async () => {
+					order.push("finalizer:start");
+					await Promise.resolve();
+					order.push("finalizer:end");
+				}),
+			).resolves.toBeUndefined();
+			await expect(runner.emitWithHostCompletion({ type: "session_rollback" })).resolves.toBeUndefined();
+			const finalizerFailure = new Error("lifecycle finalizer failed");
+			await expect(
+				runner.emitWithHostCompletion({ type: "session_rollback" }, () => {
+					order.push("finalizer:reject");
+					throw finalizerFailure;
+				}),
+			).rejects.toBe(finalizerFailure);
+
+			expect(order).toEqual([
+				"host-a:false",
+				"host-b",
+				"public:start",
+				"public:end",
+				"finalizer:start",
+				"finalizer:end",
+				"after-a:true",
+				"after-b:true",
+				"after-a:true",
+				"after-b:true",
+				"finalizer:reject",
+			]);
+			expect(firstAfterContexts).toHaveLength(2);
+			expect(secondAfterContexts).toHaveLength(2);
+			expect(firstAfterContexts[0]).not.toBe(globalState.__ordinaryHostContext);
+			expect(secondAfterContexts[0]).toBe(firstAfterContexts[0]);
+			expect(secondAfterContexts[1]).toBe(firstAfterContexts[1]);
+			expect(firstAfterContexts[1]).not.toBe(firstAfterContexts[0]);
+			expect(errors).toEqual([
+				expect.objectContaining({
+					extensionPath: hostA.path,
+					event: "session_ready",
+					error: "first host completion failed",
+				}),
+				expect.objectContaining({
+					extensionPath: hostA.path,
+					event: "session_rollback",
+					error: "first host completion failed",
+				}),
+			]);
+			expect(runner.getExtensionPaths()).toEqual([publicExtension.path]);
+			expect(runner.getAllRegisteredTools().map(tool => tool.definition.name)).toEqual(["public_tool"]);
+			expect([...runner.getFlags().keys()]).toEqual(["--public-only"]);
+			expect(runner.getRegisteredCommands().map(command => command.name)).toEqual(["public-only"]);
+
+			delete globalState.__hostBindingOrder;
+			delete globalState.__hostBindingCompacting;
+			delete globalState.__ordinaryHostContext;
 		});
 	});
 });

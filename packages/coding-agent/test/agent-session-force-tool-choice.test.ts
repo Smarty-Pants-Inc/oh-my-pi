@@ -27,7 +27,7 @@ beforeEach(async () => {
 	authStorage.setRuntimeApiKey("anthropic", "test-key");
 	const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
 	const settings = Settings.isolated({ "compaction.enabled": false });
-	sessionManager = SessionManager.inMemory(tempDir.path());
+	sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
 
 	const emptyObjectSchema = type("object");
 
@@ -88,6 +88,30 @@ async function deferForcedWrite(): Promise<void> {
 	expect(mock.calls).toHaveLength(0);
 }
 
+async function createTargetSessionPath(label: string): Promise<string> {
+	const id = `${label}-${Bun.nanoseconds()}`;
+	const targetPath = path.join(tempDir.path(), `${id}.jsonl`);
+	await Bun.write(
+		targetPath,
+		`${JSON.stringify({
+			type: "session",
+			version: 3,
+			id,
+			timestamp: new Date().toISOString(),
+			cwd: tempDir.path(),
+		})}\n`,
+	);
+	return targetPath;
+}
+
+function failTargetMaterialization(targetPath: string, failure: Error): void {
+	const ensureOnDisk = sessionManager.ensureOnDisk.bind(sessionManager);
+	vi.spyOn(sessionManager, "ensureOnDisk").mockImplementation(async () => {
+		if (sessionManager.getSessionFile() === targetPath) throw failure;
+		await ensureOnDisk();
+	});
+}
+
 it("forces specific tool, then transitions to none, then clears", () => {
 	session.setForcedToolChoice("write");
 
@@ -133,14 +157,54 @@ it("drops a deferred forced choice when branching", async () => {
 	expect(mock.calls[0]?.options?.toolChoice).toBeUndefined();
 });
 
-it("retains a deferred forced choice when session switching rolls back", async () => {
+it("retains a deferred /force choice when target materialization rolls back", async () => {
 	await deferForcedWrite();
-	const failure = new Error("switch failed");
-	vi.spyOn(sessionManager, "setSessionFile").mockRejectedValueOnce(failure);
+	const targetPath = await createTargetSessionPath("force-rollback");
+	const failure = new Error("target materialization failed");
+	failTargetMaterialization(targetPath, failure);
 
-	await expect(session.switchSession(path.join(tempDir.path(), "target.jsonl"))).rejects.toBe(failure);
+	await expect(session.switchSession(targetPath)).rejects.toBe(failure);
 	await session.agent.prompt("retry current session");
 
 	expect(mock.calls).toHaveLength(1);
 	expect(mock.calls[0]?.options?.toolChoice).toEqual({ type: "tool", name: "write" });
+});
+
+it("restores pending preview identity and soft-directive progress after materialization rollback", async () => {
+	const retainedInvoker = (input: unknown) => input;
+	session.toolChoiceQueue.registerPendingInvoker("preview-1", "ast_edit", retainedInvoker);
+	session.agent.setBeforeModelCall(() => {
+		return { stop: true, reason: "defer preview" };
+	});
+	await session.agent.prompt("stage preview");
+	expect(mock.calls).toHaveLength(0);
+
+	const targetPath = await createTargetSessionPath("preview-rollback");
+	const failure = new Error("target materialization failed");
+	failTargetMaterialization(targetPath, failure);
+	await expect(session.switchSession(targetPath)).rejects.toBe(failure);
+	expect(session.peekPendingInvoker()).toBe(retainedInvoker);
+
+	let reminderCount = 0;
+	session.agent.setBeforeModelCall(context => {
+		reminderCount = context.messages.filter(message =>
+			JSON.stringify(message.content).includes("xd://resolve"),
+		).length;
+		return { stop: true, reason: "inspect restored preview" };
+	});
+	await session.agent.prompt("retry preview");
+	expect(reminderCount).toBe(1);
+});
+
+it("commits a clean target without retained /force or preview directives", async () => {
+	await deferForcedWrite();
+	session.toolChoiceQueue.registerPendingInvoker("preview-1", "ast_edit", input => input);
+	const targetPath = await createTargetSessionPath("force-success");
+
+	await expect(session.switchSession(targetPath)).resolves.toBe(true);
+	expect(session.peekPendingInvoker()).toBeUndefined();
+	await session.agent.prompt("target turn");
+
+	expect(mock.calls).toHaveLength(1);
+	expect(mock.calls[0]?.options?.toolChoice).toBeUndefined();
 });

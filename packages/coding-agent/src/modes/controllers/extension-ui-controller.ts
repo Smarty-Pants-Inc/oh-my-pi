@@ -63,6 +63,7 @@ function toWireSelectOptions(options: ExtensionUISelectItem[]): CollabUiSelectIt
 
 export class ExtensionUiController {
 	#extensionTerminalInputUnsubscribers = new Set<() => void>();
+	#hostTerminalInputUnsubscribers = new Set<() => void>();
 	#hookWidgetsAbove = new Map<string, ExtensionUiComponent>();
 	#hookWidgetsBelow = new Map<string, ExtensionUiComponent>();
 	// Single-file dialog surface (`editorContainer` + focus) is shared by the
@@ -143,6 +144,7 @@ export class ExtensionUiController {
 		if (!extensionRunner) {
 			return; // No hooks loaded
 		}
+		extensionRunner.setHostTerminalInput(handler => this.addHostTerminalInputListener(handler));
 
 		const actions: ExtensionActions = {
 			sendMessage: (message, options) => {
@@ -184,6 +186,7 @@ export class ExtensionUiController {
 		const contextActions: ExtensionContextActions = {
 			getModel: () => this.ctx.session.model,
 			isIdle: () => !this.ctx.session.isStreaming,
+			isCompacting: () => this.ctx.session.isCompacting,
 			abort: () => this.ctx.session.abort({ reason: USER_INTERRUPT_LABEL }),
 			hasPendingMessages: () => this.ctx.session.queuedMessageCount > 0,
 			shutdown: () => {
@@ -211,16 +214,14 @@ export class ExtensionUiController {
 				// Create new session
 				this.clearExtensionTerminalInputListeners();
 				this.clearHookWidgets();
-				const success = await this.ctx.session.newSession({ parentSession: options?.parentSession });
+				const success = await this.ctx.session.newSession(
+					{ parentSession: options?.parentSession },
+					options?.setup,
+				);
 				if (!success) {
 					return { cancelled: true };
 				}
 				setSessionTerminalTitle(this.ctx.sessionManager.getSessionName(), this.ctx.sessionManager.getCwd());
-
-				// Call setup callback if provided
-				if (options?.setup) {
-					await options.setup(this.ctx.sessionManager);
-				}
 
 				// Reset and update status line
 				this.ctx.statusLine.invalidate();
@@ -417,6 +418,7 @@ export class ExtensionUiController {
 		const contextActions: ExtensionContextActions = {
 			getModel: () => this.ctx.session.model,
 			isIdle: () => !this.ctx.session.isStreaming,
+			isCompacting: () => this.ctx.session.isCompacting,
 			abort: () => this.ctx.session.abort({ reason: USER_INTERRUPT_LABEL }),
 			hasPendingMessages: () => this.ctx.session.queuedMessageCount > 0,
 			shutdown: () => {
@@ -444,14 +446,12 @@ export class ExtensionUiController {
 				// Create new session
 				this.clearExtensionTerminalInputListeners();
 				this.clearHookWidgets();
-				const success = await this.ctx.session.newSession({ parentSession: options?.parentSession });
+				const success = await this.ctx.session.newSession(
+					{ parentSession: options?.parentSession },
+					options?.setup,
+				);
 				if (!success) {
 					return { cancelled: true };
-				}
-
-				// Call setup callback if provided
-				if (options?.setup) {
-					await options.setup(this.ctx.sessionManager);
 				}
 
 				// Clear UI state
@@ -1107,6 +1107,20 @@ export class ExtensionUiController {
 		};
 	}
 
+	/** Register a host-owned filter outside the public extension listener lifecycle. */
+	addHostTerminalInputListener(handler: TerminalInputHandler): () => void {
+		const unsubscribe = this.ctx.ui.addInputListener(handler);
+		let active = true;
+		const remove = () => {
+			if (!active) return;
+			active = false;
+			unsubscribe();
+			this.#hostTerminalInputUnsubscribers.delete(remove);
+		};
+		this.#hostTerminalInputUnsubscribers.add(remove);
+		return remove;
+	}
+
 	clearHookWidgets(): void {
 		for (const widget of this.#hookWidgetsAbove.values()) {
 			widget.dispose?.();
@@ -1124,6 +1138,13 @@ export class ExtensionUiController {
 			unsubscribe();
 		}
 		this.#extensionTerminalInputUnsubscribers.clear();
+	}
+
+	clearHostTerminalInputListeners(): void {
+		for (const unsubscribe of this.#hostTerminalInputUnsubscribers) {
+			unsubscribe();
+		}
+		this.#hostTerminalInputUnsubscribers.clear();
 	}
 
 	showExtensionError(extensionPath: string, error: string): void {

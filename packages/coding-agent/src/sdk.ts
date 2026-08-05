@@ -88,6 +88,7 @@ import {
 	ExtensionRunner,
 	ExtensionToolWrapper,
 	type ExtensionUIContext,
+	type HostInternalExtensionBinding,
 	type LoadExtensionsResult,
 	loadExtensionFromFactory,
 	loadExtensions,
@@ -439,6 +440,14 @@ export interface CreateAgentSessionOptions {
 	 * @internal
 	 */
 	preloadedExtensions?: LoadExtensionsResult;
+	/**
+	 * Host-owned extensions installed ahead of public handlers without entering
+	 * discovery, factory forwarding, public metadata, or the model-callable tool set.
+	 * Ignored for subagent/task sessions even if accidentally forwarded.
+	 *
+	 * @internal
+	 */
+	hostInternalExtensions?: HostInternalExtensionBinding[];
 	/**
 	 * Pre-discovered extension source paths. When provided, the filesystem-scan
 	 * inside `discoverExtensionPaths()` is skipped — the session still calls
@@ -1774,7 +1783,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				disposeCallbacks.add(callback);
 				return () => disposeCallbacks.delete(callback);
 			},
-			registerSessionChangeCallback: callback => session?.registerSessionChangeCallback(callback),
+			registerSessionChangeCallback: (callback, callbackOptions) =>
+				session?.registerSessionChangeCallback(callback, callbackOptions),
 			bumpFileMutationVersion: path => {
 				const next = (fileMutationVersions.get(path) ?? 0) + 1;
 				fileMutationVersions.set(path, next);
@@ -2579,6 +2589,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// (The builtin autoresearch extension is unconditionally loaded above, so this scenario
 		// is unreachable; unconditional runner construction keeps that invariant explicit and
 		// prevents future optional extensions from silently re-opening the hole.)
+		const hostInternalExtensions =
+			options.parentTaskPrefix === undefined && (options.taskDepth ?? 0) === 0
+				? (options.hostInternalExtensions ?? [])
+				: [];
 		const extensionRunner: ExtensionRunner = new ExtensionRunner(
 			extensionsResult.extensions,
 			extensionsResult.runtime,
@@ -2589,6 +2603,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			settings,
 			localProtocolOptions,
 			() => (hasSession ? session.getAsyncJobSnapshot() : null),
+			hostInternalExtensions,
 		);
 
 		credentialDisabledTarget = extensionRunner;

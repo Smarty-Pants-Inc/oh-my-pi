@@ -338,6 +338,12 @@ export interface AgentPromptOptions {
 	toolChoice?: ToolChoice;
 }
 
+/** Transactional ownership of Agent session-scoped tool-directive state. */
+export interface AgentToolDirectiveSessionTransition {
+	commit(): void;
+	rollback(): void;
+}
+
 /** Buffered Cursor exec-channel tool result waiting to be emitted after the assistant message. */
 interface CursorToolResultEntry {
 	toolResult: ToolResultMessage;
@@ -963,6 +969,28 @@ export class Agent {
 	clearDeferredToolDirectives() {
 		this.#deferredToolChoice = undefined;
 		this.#softToolRequirementState = { escalations: 0 };
+	}
+
+	/**
+	 * Install empty session-scoped tool-directive state while retaining the current
+	 * state for an enclosing session transition. Commit selects the target without
+	 * discarding the retained snapshot until the owner transaction closes, so a
+	 * later pre-publication failure can still roll back exactly.
+	 */
+	beginToolDirectiveSessionTransition(): AgentToolDirectiveSessionTransition {
+		const retainedDeferredToolChoice = this.#deferredToolChoice;
+		const retainedSoftToolRequirementState = this.#softToolRequirementState;
+		this.clearDeferredToolDirectives();
+		let restored = false;
+		return {
+			commit: () => {},
+			rollback: () => {
+				if (restored) return;
+				restored = true;
+				this.#deferredToolChoice = retainedDeferredToolChoice;
+				this.#softToolRequirementState = retainedSoftToolRequirementState;
+			},
+		};
 	}
 
 	clearAllQueues() {
