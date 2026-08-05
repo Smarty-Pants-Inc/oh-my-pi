@@ -25,6 +25,7 @@ import type { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import type { AgentRegistry } from "../registry/agent-registry";
 import type { ArtifactManager } from "../session/artifacts";
 import type { ClientBridge } from "../session/client-bridge";
+import type { ExecutionEnvironmentBinding, ExecutionEnvironmentProvider } from "../session/execution-environment";
 import type { CustomMessage } from "../session/messages";
 import type { UsageStatistics } from "../session/session-entries";
 import type { SessionManager } from "../session/session-manager";
@@ -320,6 +321,10 @@ export interface ToolSession {
 	getTurnBudget?: () => { total: number | null; spent: number; hard: boolean };
 	/** Record output tokens consumed by an eval-spawned subagent toward the current turn budget. */
 	recordEvalSubagentUsage?: (output: number) => void;
+	/** Get the authoritative execution environment binding for built-in filesystem and process tools. */
+	getExecutionEnvironment?: () => ExecutionEnvironmentBinding | undefined;
+	/** Get the session's resolved execution environment provider. */
+	getExecutionEnvironmentProvider?: () => ExecutionEnvironmentProvider | undefined;
 	/** Bridge to the connected client (e.g. ACP editor host). Tools should route fs/terminal/permission requests through this when available. */
 	getClientBridge?: () => ClientBridge | undefined;
 	/** Get cached todo phases for this session. */
