@@ -44,6 +44,7 @@ import type { AgentSession, AgentSessionEvent, Prewalk } from "../session/agent-
 import type { ArtifactManager } from "../session/artifacts";
 import { ASYNC_RESULT_MESSAGE_TYPE } from "../session/async-job-delivery";
 import type { AuthStorage } from "../session/auth-storage";
+import { type ExecutionEnvironmentBinding, mapExecutionEnvironmentPath } from "../session/execution-environment";
 import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../session/messages";
 import { SessionManager } from "../session/session-manager";
 import { truncateTail } from "../session/streaming-output";
@@ -61,6 +62,13 @@ import type { WorkspaceTree } from "../workspace-tree";
 import { generateTaskLabel } from "./label";
 import { resolveAgentPrewalkDefault } from "./prewalk";
 import { isReadOnlyAgent } from "./read-only-policy";
+import {
+	createLocalSubagentRuntimeProfile,
+	resolveSubagentRuntimeToolNames,
+	type SubagentRuntimeProfile,
+	subagentRuntimeAllows,
+	subagentRuntimeRestrictsToolNames,
+} from "./runtime-profile";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
 import {
 	type AgentDefinition,
@@ -322,6 +330,13 @@ export interface ExecutorOptions {
 	/** Exact provider credential resolver inherited from the parent session. */
 	getApiKey?: CreateAgentSessionOptions["getApiKey"];
 	worktree?: string;
+	/** Non-owning execution-environment binding injected into this child. */
+	executionEnvironment?: ExecutionEnvironmentBinding;
+	/**
+	 * Immutable capability profile resolved before this child is dispatched.
+	 * Omission preserves the ordinary local surface for direct executor callers.
+	 */
+	runtimeProfile?: SubagentRuntimeProfile;
 	agent: AgentDefinition;
 	task: string;
 	assignment?: string;
@@ -2629,12 +2644,22 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	}
 
 	const settings = options.settings ?? Settings.isolated();
+	const runtimeProfile =
+		options.runtimeProfile ??
+		createLocalSubagentRuntimeProfile({
+			restrictToolNames: options.restrictToolNames,
+			enableLsp: enableLsp ?? true,
+			enableIrc: options.enableIrc !== false,
+			enableMCP: options.enableMCP ?? true,
+			keepAlive: options.keepAlive !== false,
+		});
 	const subagentSettings = createSubagentSettings(
 		settings,
 		{
 			...(agent.readSummarize === false ? { "read.summarize.enabled": false } : undefined),
 			// Isolated runs must not expose roots outside the worktree.
 			...(worktree !== undefined ? { "workspace.additionalDirectories": [] } : undefined),
+			...(runtimeProfile.bash === "enabled" ? { "bash.enabled": true } : undefined),
 		},
 		options.parentServiceTier,
 	);
@@ -2655,24 +2680,27 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	const parentDepth = options.taskDepth ?? 0;
 	const childDepth = parentDepth + 1;
 	const atMaxDepth = maxRecursionDepth >= 0 && childDepth >= maxRecursionDepth;
-	const ircEnabled = options.enableIrc !== false && isIrcEnabled(subagentSettings, childDepth);
+	const ircEnabled = subagentRuntimeAllows(runtimeProfile, "irc") && isIrcEnabled(subagentSettings, childDepth);
 
-	// Add tools if specified
-	let toolNames: string[] | undefined;
-	if (agent.tools && agent.tools.length > 0) {
-		toolNames = agent.tools;
-		// Auto-include task tool if spawns defined but task not in tools
-		if (agent.spawns !== undefined && !toolNames.includes("task") && !atMaxDepth) {
-			toolNames = [...toolNames, "task"];
-		}
+	// Resolve the base tools from the profile. Only agent-derived profiles may
+	// gain the configured task tool; exact profiles are immutable allowlists.
+	let toolNames = resolveSubagentRuntimeToolNames(runtimeProfile, agent.tools);
+	if (
+		runtimeProfile.tools?.mode === "agent" &&
+		toolNames &&
+		subagentRuntimeAllows(runtimeProfile, "spawns") &&
+		agent.spawns !== undefined &&
+		!toolNames.includes("task") &&
+		!atMaxDepth
+	) {
+		toolNames = [...toolNames, "task"];
 	}
 
 	if (atMaxDepth && toolNames?.includes("task")) {
 		toolNames = toolNames.filter(name => name !== "task");
 	}
-	// Ordinary agents retain the host's always-on collaboration capability.
-	// Restricted sessions must not widen their explicit host tool list with hub.
-	if (toolNames && !options.restrictToolNames && !toolNames.includes("hub")) {
+	// Only unrestricted profiles gain the host's always-on hub tool.
+	if (toolNames && !subagentRuntimeRestrictsToolNames(runtimeProfile) && !toolNames.includes("hub")) {
 		toolNames = [...toolNames, "hub"];
 	}
 	if (toolNames?.includes("exec")) {
@@ -2685,15 +2713,17 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 
 	const modelPatterns = normalizeModelPatterns(modelOverride ?? agent.model);
 	const sessionFile = subtaskSessionFile ?? null;
-	const spawnsEnv = atMaxDepth
+	const spawnsEnv = !subagentRuntimeAllows(runtimeProfile, "spawns")
 		? ""
-		: agent.spawns === undefined
+		: atMaxDepth
 			? ""
-			: agent.spawns === "*"
-				? "*"
-				: agent.spawns.join(",");
+			: agent.spawns === undefined
+				? ""
+				: agent.spawns === "*"
+					? "*"
+					: agent.spawns.join(",");
 
-	const lspEnabled = enableLsp ?? true;
+	const lspEnabled = subagentRuntimeAllows(runtimeProfile, "lsp");
 	const skipPythonPreflight = Array.isArray(toolNames) && !toolNames.includes("eval");
 
 	const monitor = createSubagentRunMonitor({
@@ -2908,12 +2938,13 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			// session-level --prewalk. The bundled generic `task` agent has no
 			// frontmatter default; the `task.prewalk` toggle (default off) arms it.
 			// Resolution failures skip prewalk instead of failing the spawn.
+			const restrictToolNames = subagentRuntimeRestrictsToolNames(runtimeProfile);
 			let prewalk: Prewalk | undefined;
 			const prewalkPattern = resolveAgentPrewalkPattern({
 				settingsOverride: settings.get("task.agentPrewalk")[agent.name],
 				agentPrewalk: resolveAgentPrewalkDefault(agent, settings.get("task.prewalk")),
 			});
-			if (prewalkPattern) {
+			if (prewalkPattern && subagentRuntimeAllows(runtimeProfile, "prewalk")) {
 				await awaitAbortable(modelRegistry.awaitBackgroundRefresh());
 				const resolvedPrewalk = resolveModelOverride([prewalkPattern], modelRegistry, settings);
 				const target = resolvedPrewalk.model;
@@ -2936,8 +2967,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				}
 			}
 
-			const restrictToolNames = options.restrictToolNames === true;
-			const enableMCP = !restrictToolNames && (options.enableMCP ?? true);
+			const enableMCP = subagentRuntimeAllows(runtimeProfile, "mcp");
 			const mcpManager = enableMCP ? options.mcpManager : undefined;
 			const mcpProxyTools = mcpManager ? createMCPProxyTools(mcpManager) : [];
 
@@ -2976,6 +3006,14 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			}
 
 			const { normalized: normalizedOutputSchema } = normalizeSchema(outputSchema);
+			let planReferencePath = options.planReference?.path ?? "";
+			if (planReferencePath && options.executionEnvironment) {
+				try {
+					planReferencePath = mapExecutionEnvironmentPath(options.executionEnvironment, planReferencePath);
+				} catch {
+					planReferencePath = "";
+				}
+			}
 
 			// Captured by the lifecycle reviver: rebuilding an equivalent session from
 			// the same JSONL file re-invokes createAgentSession with the exact options
@@ -2991,6 +3029,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				modelRegistry,
 				getApiKey: options.getApiKey,
 				settings: subagentSettings,
+				executionEnvironment: options.executionEnvironment,
 				model,
 				modelPattern: model || modelOverride === undefined ? undefined : modelPatterns,
 				modelPatternAuthFallback:
@@ -3004,21 +3043,26 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				toolNames,
 				outputSchema,
 				outputSchemaMode: options.outputSchemaMode,
-				restrictToolNames: options.restrictToolNames,
+				restrictToolNames,
 				requireYieldTool: true,
 				contextFiles: options.contextFiles,
 				skills: options.skills,
 				promptTemplates: options.promptTemplates,
 				workspaceTree: options.workspaceTree,
 				rules: options.rules,
-				preloadedExtensionPaths: restrictToolNames ? [] : options.preloadedExtensionPaths,
-				preloadedCustomToolPaths: restrictToolNames ? [] : options.preloadedCustomToolPaths,
+				preloadedExtensionPaths: subagentRuntimeAllows(runtimeProfile, "extensions")
+					? options.preloadedExtensionPaths
+					: [],
+				preloadedCustomToolPaths: subagentRuntimeAllows(runtimeProfile, "customTools")
+					? options.preloadedCustomToolPaths
+					: [],
 				systemPrompt: defaultPrompt => {
 					const subagentPrompt = prompt.render(subagentSystemPromptTemplate, {
 						agent: agent.systemPrompt,
 						context: options.context?.trim() ?? "",
 						planReference: options.planReference?.content ?? "",
-						planReferencePath: options.planReference?.path ?? "",
+						planReferencePath,
+						operationalRoot: options.executionEnvironment?.remoteRoot ?? "",
 						worktree: worktree ?? "",
 						outputSchema: normalizedOutputSchema,
 						outputSchemaOverridesAgent: options.outputSchemaOverridesAgent === true,
@@ -3042,14 +3086,16 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				agentDisplayName: agent.name,
 				expectedAgentRef,
 				enableLsp: lspEnabled,
-				enableIrc: options.enableIrc,
+				enableIrc: subagentRuntimeAllows(runtimeProfile, "irc"),
 				skipPythonPreflight,
 				enableMCP,
 				mcpManager,
 				customTools: mcpProxyTools.length > 0 ? mcpProxyTools : undefined,
 				localProtocolOptions: options.localProtocolOptions,
 				telemetry: subagentTelemetry,
-				parentEvalSessionId: options.parentEvalSessionId,
+				parentEvalSessionId: subagentRuntimeAllows(runtimeProfile, "sharedEvalState")
+					? options.parentEvalSessionId
+					: undefined,
 				onFirstChatDispatch: () => {
 					firstChatDispatchAt ??= performance.now();
 				},
@@ -3076,7 +3122,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 
 			monitor.setActiveSession(session);
 			installRegistryStatusSync(session);
-			if (sessionFile !== null && worktree === undefined) {
+			if (subagentRuntimeAllows(runtimeProfile, "revival") && sessionFile !== null && worktree === undefined) {
 				// Lifecycle reviver: park closed the JSONL writer, so reopening takes
 				// the single-writer lock cleanly and restores the full message history
 				// (createAgentSession → agent.replaceMessages). Isolated runs are not
@@ -3304,7 +3350,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			const session = monitor.takeActiveSession();
 			if (session) {
 				monitor.captureSalvage(session);
-				if (options.keepAlive !== false && worktree === undefined) {
+				if (subagentRuntimeAllows(runtimeProfile, "keepAlive") && worktree === undefined) {
 					installIrcWakeTurnMonitor(session);
 				}
 				await finalizeSubagentLifecycle({
@@ -3312,7 +3358,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					session,
 					aborted,
 					abortKind: monitor.abortKind(),
-					keepAlive: options.keepAlive !== false,
+					keepAlive: subagentRuntimeAllows(runtimeProfile, "keepAlive"),
 					isolated: worktree !== undefined,
 					agentIdleTtlMs,
 					reviveSession,

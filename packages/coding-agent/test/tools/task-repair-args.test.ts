@@ -52,6 +52,7 @@ describe("repairTaskParams", () => {
 			name: "First\\nTask\\nCrew",
 			context: 'judge \\"sketch\\" accuracy',
 			task: "Score 0-100.\\nUse the full range.\\nNo bunching.",
+			execution: "environment",
 		};
 
 		const repaired = repairTaskParams(params);
@@ -59,13 +60,19 @@ describe("repairTaskParams", () => {
 		expect(repaired.name).toBe("First\\nTask\\nCrew");
 		expect(repaired.context).toBe('judge "sketch" accuracy');
 		expect(repaired.task).toBe("Score 0-100.\nUse the full range.\nNo bunching.");
+		expect(repaired.execution).toBe("environment");
 	});
 
-	it("repairs each batch item's task, leaving item name/agent intact", () => {
+	it("repairs each batch task while preserving identity and rejected execution intent", () => {
 		const params: TaskParams = {
 			context: "shared\\nbackground\\nnotes",
 			tasks: [
-				{ name: "Alpha\\nOne\\nTwo", agent: "task", task: "line one\\nline two\\nline three" },
+				{
+					name: "Alpha\\nOne\\nTwo",
+					agent: "task",
+					task: "line one\\nline two\\nline three",
+					execution: "environment",
+				} as never,
 				{ name: "Beta", task: "plain instructions" },
 			],
 		};
@@ -75,6 +82,7 @@ describe("repairTaskParams", () => {
 		expect(repaired.tasks?.[0]?.task).toBe("line one\nline two\nline three");
 		expect(repaired.tasks?.[0]?.name).toBe("Alpha\\nOne\\nTwo");
 		expect(repaired.tasks?.[0]?.agent).toBe("task");
+		expect((repaired.tasks?.[0] as unknown as { execution?: string } | undefined)?.execution).toBe("environment");
 		// Untouched items keep their identity.
 		expect(repaired.tasks?.[1]).toBe(params.tasks![1]!);
 	});

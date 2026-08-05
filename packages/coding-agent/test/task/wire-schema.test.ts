@@ -97,6 +97,33 @@ describe("task wire schema", () => {
 		expect("role" in item).toBe(false);
 		expect(item.task).toBe("x");
 	});
+
+	it("rejects execution on batch calls and items instead of deleting it", () => {
+		const batch = getTaskSchema({
+			isolationEnabled: true,
+			batchEnabled: true,
+			environmentEnabled: true,
+		});
+		const topLevel = batch({
+			context: "ctx",
+			tasks: [{ task: "x" }],
+			execution: "environment",
+		});
+		const perItem = batch({
+			context: "ctx",
+			tasks: [{ task: "x", execution: "environment" }],
+		});
+		expect(topLevel instanceof type.errors).toBe(true);
+		expect(perItem instanceof type.errors).toBe(true);
+		const json = batch.toJsonSchema({ io: "input" }) as {
+			properties?: {
+				execution?: unknown;
+				tasks?: { items?: { properties?: { execution?: unknown } } };
+			};
+		};
+		expect(Object.hasOwn(json.properties ?? {}, "execution")).toBe(false);
+		expect(Object.hasOwn(json.properties?.tasks?.items?.properties ?? {}, "execution")).toBe(false);
+	});
 });
 
 // Contract: `agent` and `name` shape the spawned subagent's identity and the
