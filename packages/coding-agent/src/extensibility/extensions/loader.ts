@@ -27,6 +27,7 @@ import type { ExecOptions } from "../../exec/exec";
 import { execCommand } from "../../exec/exec";
 // Runtime self-reference: dereference this namespace only inside loader functions to keep the index.ts cycle safe.
 import * as PiCodingAgent from "../../index";
+import type { ExecutionEnvironmentProvider } from "../../session/execution-environment";
 import type { CustomMessagePayload } from "../../session/messages";
 import { EventBus } from "../../utils/event-bus";
 import * as TypeBox from "../legacy-typebox";
@@ -287,6 +288,13 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 
 	setSessionName(name: string): Promise<void> {
 		return this.runtime.setSessionName(name);
+	}
+
+	registerExecutionEnvironmentProvider(provider: ExecutionEnvironmentProvider): void {
+		if (this.extension.executionEnvironmentProvider) {
+			throw new Error(`Extension ${this.extension.path} registered more than one execution environment provider`);
+		}
+		this.extension.executionEnvironmentProvider = provider;
 	}
 
 	registerProvider(name: string, config: ProviderConfig): void {

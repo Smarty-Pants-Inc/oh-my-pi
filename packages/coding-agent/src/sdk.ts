@@ -133,6 +133,7 @@ import {
 import { AgentSession, type InitialRetryFallbackState, type PlanYolo, type Prewalk } from "./session/agent-session";
 import { discoverAuthStorage as discoverAuthStorageFromConfig } from "./session/auth-broker-config";
 import type { AuthStorage } from "./session/auth-storage";
+import type { ExecutionEnvironmentBinding, ExecutionEnvironmentProvider } from "./session/execution-environment";
 import { createInterruptedTurnAbortMessage } from "./session/exit-diagnostics";
 import {
 	type CustomMessage,
@@ -158,6 +159,7 @@ import { createSnapcompactSavingsRecorder } from "./session/snapcompact-savings-
 import { closeAllConnections } from "./ssh/connection-manager";
 import { unmountAll } from "./ssh/sshfs-mount";
 import {
+	assertExecutionEnvironmentSystemPrompt,
 	type BuildSystemPromptResult,
 	buildSystemPrompt as buildSystemPromptInternal,
 	loadProjectContextFiles as loadContextFilesInternal,
@@ -409,6 +411,10 @@ export interface CreateAgentSessionOptions {
 	providerPromptCacheKeySource?: "explicit" | "fork";
 	/** Absolute wall-clock deadline in Unix epoch milliseconds. */
 	deadline?: number;
+	/** Immutable execution environment binding used by authoritative built-in tool routing. */
+	executionEnvironment?: ExecutionEnvironmentBinding;
+	/** Provider resolved after extensions load; mutually exclusive with an explicit binding. */
+	executionEnvironmentProvider?: ExecutionEnvironmentProvider;
 
 	/** Custom tools to register (in addition to built-in tools). Accepts both CustomTool and ToolDefinition. */
 	customTools?: (CustomTool | ToolDefinition)[];
@@ -632,6 +638,13 @@ export type { MCPManager, MCPServerConfig, MCPServerConnection, MCPToolsLoadResu
 // embedding several concurrent top-level sessions in one process (the default
 // global registry admits only one "Main" per process generation).
 export { type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "./registry/agent-registry";
+export type {
+	ExecutionEnvironmentBinding,
+	ExecutionEnvironmentBridge,
+	ExecutionEnvironmentLease,
+	ExecutionEnvironmentProvider,
+	ExecutionEnvironmentRequest,
+} from "./session/execution-environment";
 export type { Tool } from "./tools";
 export { buildDirectoryTree, buildWorkspaceTree, type DirectoryTree, type WorkspaceTree } from "./workspace-tree";
 
@@ -1585,6 +1598,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	let session!: AgentSession;
 	let hasSession = false;
 	let hasRegistered = false;
+	const resolvedExecutionEnvironment = options.executionEnvironment;
+	let resolvedExecutionEnvironmentProvider: ExecutionEnvironmentProvider | undefined;
 	const restrictToolNames = options.restrictToolNames === true;
 	const enableLsp = options.enableLsp ?? !restrictToolNames;
 	const lspReadOnly = options.lspReadOnly ?? restrictToolNames;
@@ -1661,6 +1676,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			toolRegistry,
 			hasUI: options.hasUI ?? false,
 			getApiKey: options.getApiKey,
+			getExecutionEnvironment: () => resolvedExecutionEnvironment,
+			getExecutionEnvironmentProvider: () => resolvedExecutionEnvironmentProvider,
 			get additionalDirectories() {
 				return sessionManager.getAdditionalDirectories();
 			},
@@ -2024,6 +2041,19 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				);
 				extensionsResult.extensions.push(loaded);
 			}
+		}
+
+		resolvedExecutionEnvironmentProvider = options.executionEnvironmentProvider;
+		for (const extension of extensionsResult.extensions) {
+			const extensionProvider = extension.executionEnvironmentProvider;
+			if (!extensionProvider) continue;
+			if (resolvedExecutionEnvironmentProvider) {
+				throw new Error("Multiple execution environment providers were registered for one session");
+			}
+			resolvedExecutionEnvironmentProvider = extensionProvider;
+		}
+		if (resolvedExecutionEnvironment && resolvedExecutionEnvironmentProvider) {
+			throw new Error("A session cannot contain both an execution environment binding and provider");
 		}
 
 		// Process provider registrations queued during extension loading.
@@ -2786,6 +2816,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			tools: Map<string, AgentTool>,
 		): Promise<BuildSystemPromptResult> => {
 			toolContextStore.setToolNames(toolNames);
+			const executionEnvironment = toolSession.getExecutionEnvironment?.();
 			const promptCwd = sessionManager.getCwd();
 			const activeRepoContext = hasSession
 				? await logger.time("resolveActiveRepoContext", resolveRepoContext, promptCwd)
@@ -2868,6 +2899,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			const defaultPrompt = await buildSystemPromptInternal({
 				cwd: promptCwd,
 				additionalWorkspaceRoots: sessionManager.getAdditionalDirectories(),
+				executionEnvironment,
 				xdevTools: toolSession.xdev ? xdevEntries(toolSession.xdev) : [],
 				xdevDocs: toolSession.xdev
 					? xdevDocsAll(toolSession.xdev, settings.get("tools.xdevDocs"), settings.get("tools.xdevInlineDevices"))
@@ -2913,9 +2945,13 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				typeof options.systemPrompt === "function"
 					? options.systemPrompt(defaultPrompt.systemPrompt)
 					: options.systemPrompt;
-			return {
+			const result = {
 				systemPrompt: typeof customPrompt === "string" ? [customPrompt] : customPrompt,
 			};
+			if (executionEnvironment) {
+				assertExecutionEnvironmentSystemPrompt(executionEnvironment, result.systemPrompt);
+			}
+			return result;
 		};
 
 		const toolNamesFromRegistry = Array.from(toolRegistry.keys());
@@ -3102,6 +3138,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					)
 				: undefined;
 		const transformProviderContext = async (context: Context, transformModel: Model): Promise<Context> => {
+			const executionEnvironment = toolSession.getExecutionEnvironment?.();
+			if (executionEnvironment && context.systemPrompt) {
+				assertExecutionEnvironmentSystemPrompt(executionEnvironment, context.systemPrompt);
+			}
 			let transformed = obfuscator ? obfuscateProviderContext(obfuscator, context) : context;
 			if (snapcompactInline) transformed = await snapcompactInline.transform(transformed, transformModel);
 			return clampProviderContextImages(transformed, transformModel);

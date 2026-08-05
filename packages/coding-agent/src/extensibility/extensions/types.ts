@@ -53,6 +53,7 @@ import type { CustomEditor } from "../../modes/components/custom-editor";
 import type { Theme } from "../../modes/theme/theme";
 import type { AsyncJobSnapshot } from "../../session/agent-session";
 import type { CompactMode } from "../../session/compact-modes";
+import type { ExecutionEnvironmentProvider } from "../../session/execution-environment";
 import type { CustomMessage, CustomMessagePayload } from "../../session/messages";
 import type { ReadonlySessionManager, SessionManager } from "../../session/session-manager";
 import type {
@@ -1335,6 +1336,13 @@ export interface ExtensionAPI {
 	setSessionName(name: string): Promise<void>;
 
 	// =========================================================================
+	// Execution Environment Registration
+	// =========================================================================
+
+	/** Register this extension's execution environment provider. */
+	registerExecutionEnvironmentProvider(provider: ExecutionEnvironmentProvider): void;
+
+	// =========================================================================
 	// Provider Registration
 	// =========================================================================
 
@@ -1575,6 +1583,7 @@ export interface Extension {
 	path: string;
 	resolvedPath: string;
 	label?: string;
+	executionEnvironmentProvider?: ExecutionEnvironmentProvider;
 	handlers: Map<string, HandlerFn[]>;
 	tools: Map<string, RegisteredTool<any, any>>;
 	assistantThinkingRenderers: AssistantThinkingRenderer[];

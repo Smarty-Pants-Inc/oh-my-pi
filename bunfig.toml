@@ -2,7 +2,11 @@ telemetry = false
 
 [install]
 minimumReleaseAge = 259200 # 3 days in seconds
-minimumReleaseAgeExcludes = ["@types/bun", "bun-types"]
+minimumReleaseAgeExcludes = [
+  "@types/bun",
+  "bun-types",
+  "@cloudflare/computer", # preview package has no stable release older than the policy window
+]
 linker = "hoisted"
 exact = true
 saveTextLockfile = true

@@ -67,6 +67,8 @@ export interface ClientBridgeCreateTerminalParams {
 	args?: string[];
 	env?: Array<{ name: string; value: string }>;
 	cwd?: string;
+	/** Model-requested execution deadline for authoritative environment bridges. ACP callers omit this field. */
+	timeoutMs?: number;
 	outputByteLimit?: number;
 }
 

@@ -1,0 +1,66 @@
+{
+  "type": "module",
+  "private": true,
+  "name": "@oh-my-pi/cloud-omp-cloudflare",
+  "version": "0.1.0",
+  "description": "Experimental Cloudflare Computer execution environment for OMP",
+  "homepage": "https://omp.sh",
+  "author": "Can Boluk",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Smarty-Pants-Inc/oh-my-pi.git",
+    "directory": "packages/cloud-omp-cloudflare"
+  },
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts"
+    },
+    "./extension": {
+      "types": "./src/extension.ts",
+      "import": "./src/extension.ts"
+    }
+  },
+  "scripts": {
+    "check": "biome check . && bun run check:types",
+    "check:types": "tsgo -p tsconfig.json --noEmit && tsgo -p tsconfig.worker.json --noEmit",
+    "lint": "biome lint .",
+    "fix": "biome check --write --unsafe .",
+    "fmt": "biome format --write .",
+    "test": "bun test --timeout 30000 test",
+    "test:fake": "bun test test --test-name-pattern='fake gateway|adapter package'",
+    "test:real:gateway": "bun test test/real-gateway.test.ts",
+    "test:real:omp-child": "bun test test/real-omp-child.test.ts",
+    "deploy": "wrangler deploy",
+    "deploy:dry-run": "wrangler deploy --dry-run"
+  },
+  "dependencies": {
+    "@cloudflare/computer": "0.1.1",
+    "@oh-my-pi/pi-coding-agent": "workspace:*"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20260801.1",
+    "@types/bun": "catalog:",
+    "wrangler": "4.118.0"
+  },
+  "peerDependencies": {
+    "@oh-my-pi/pi-coding-agent": "^17.2.8"
+  },
+  "engines": {
+    "bun": ">=1.3.14"
+  },
+  "cloudOmp": {
+    "computerGitHead": "63d363632e558f7e077794988d36ed75017c2a62"
+  },
+  "omp": {
+    "extensions": [
+      "./src/extension.ts"
+    ]
+  },
+  "files": [
+    "src",
+    "Dockerfile",
+    "wrangler.jsonc"
+  ]
+}
