@@ -24,6 +24,7 @@ import friendlyPersonality from "./prompts/system/personalities/friendly.md" wit
 import pragmaticPersonality from "./prompts/system/personalities/pragmatic.md" with { type: "text" };
 import projectPromptTemplate from "./prompts/system/project-prompt.md" with { type: "text" };
 import systemPromptTemplate from "./prompts/system/system-prompt.md" with { type: "text" };
+import { type ExecutionEnvironmentBinding, mapExecutionEnvironmentPath } from "./session/execution-environment";
 import { normalizeConcurrencyLimit } from "./task/parallel";
 import { usesCodexTaskPrompt } from "./task/prompt-policy";
 import { type ActiveRepoContext, resolveActiveRepoContext } from "./utils/active-repo-context";
@@ -508,6 +509,8 @@ export interface BuildSystemPromptOptions {
 	cwd?: string;
 	/** Additional workspace directories beyond cwd (multi-root), absolute. Injected into the project prompt. */
 	additionalWorkspaceRoots?: string[];
+	/** Remote operational workspace projected into model-visible prompt metadata; discovery still uses cwd. */
+	executionEnvironment?: Pick<ExecutionEnvironmentBinding, "sourceRoot" | "remoteRoot">;
 	/** Pre-loaded context files (skips discovery if provided). */
 	contextFiles?: Array<{ path: string; content: string; depth?: number }>;
 	/** Skills provided directly to system prompt construction. */
@@ -573,6 +576,33 @@ export interface BuildSystemPromptResult {
 	xdevCatalogNames?: readonly string[];
 }
 
+type PromptExecutionEnvironment = Pick<ExecutionEnvironmentBinding, "sourceRoot" | "remoteRoot">;
+
+function projectExecutionEnvironmentPromptPath(
+	environment: PromptExecutionEnvironment,
+	inputPath: string,
+): string | undefined {
+	try {
+		return normalizePromptPath(mapExecutionEnvironmentPath(environment, inputPath));
+	} catch {
+		return undefined;
+	}
+}
+
+/** Fail closed before an environment-bound system prompt can expose its local discovery root. */
+export function assertExecutionEnvironmentSystemPrompt(
+	environment: PromptExecutionEnvironment,
+	systemPrompt: readonly string[],
+): void {
+	const sourceRoots = new Set([environment.sourceRoot, normalizePromptPath(environment.sourceRoot)]);
+	for (const sourceRoot of sourceRoots) {
+		if (!sourceRoot) continue;
+		if (systemPrompt.some(block => block.includes(sourceRoot))) {
+			throw new Error("Execution environment system prompt contains the local source root");
+		}
+	}
+}
+
 /** Build the system prompt with tools, guidelines, and context */
 export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}): Promise<BuildSystemPromptResult> {
 	if ($env.NULL_PROMPT === "true") {
@@ -591,6 +621,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		toolNames: providedToolNames,
 		cwd,
 		additionalWorkspaceRoots = [],
+		executionEnvironment,
 		contextFiles: providedContextFiles,
 		skills: providedSkills,
 		rules,
@@ -762,7 +793,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		withDeadline("getCachedGpu", gpuPromise, prepDefaults.gpu),
 	]);
 	clearTimeout(deadlineTimer);
-	const agentsMdFiles = Array.from(new Set(workspaceTree.agentsMdFiles)).sort().slice(0, AGENTS_MD_LIMIT);
+	const localAgentsMdFiles = Array.from(new Set(workspaceTree.agentsMdFiles)).sort().slice(0, AGENTS_MD_LIMIT);
 
 	if (timedOut.length > 0) {
 		logger.warn("System prompt preparation steps timed out; using minimal fallback for those steps", {
@@ -786,7 +817,41 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 
 	const date = formatLocalCalendarDate();
 	const dateTime = date;
-	const promptCwd = normalizePromptPath(resolvedCwd);
+	// Model-visible workspace path metadata is centralized below: project cwd,
+	// context-file labels, dir-context paths, workspace-tree root metadata, and
+	// additional roots. The rendered tree and active-repo context are relative;
+	// arbitrary prompt content is covered by the final exact-sourceRoot guard.
+	const localAdditionalWorkspaceRoots = additionalWorkspaceRoots.filter(
+		directory => path.resolve(directory) !== path.resolve(resolvedCwd),
+	);
+	const promptCwd = normalizePromptPath(
+		executionEnvironment ? mapExecutionEnvironmentPath(executionEnvironment, ".") : resolvedCwd,
+	);
+	const promptContextFiles = executionEnvironment
+		? contextFiles.map(file => ({
+				...file,
+				path: projectExecutionEnvironmentPromptPath(executionEnvironment, file.path) ?? "",
+			}))
+		: contextFiles;
+	const promptAgentsMdFiles = executionEnvironment
+		? localAgentsMdFiles.flatMap(file => {
+				const projected = projectExecutionEnvironmentPromptPath(executionEnvironment, file);
+				return projected ? [projected] : [];
+			})
+		: localAgentsMdFiles;
+	const promptWorkspaceTree = executionEnvironment
+		? {
+				...workspaceTree,
+				rootPath: promptCwd,
+				agentsMdFiles: promptAgentsMdFiles,
+			}
+		: workspaceTree;
+	const promptAdditionalWorkspaceRoots = executionEnvironment
+		? localAdditionalWorkspaceRoots.flatMap(directory => {
+				const projected = projectExecutionEnvironmentPromptPath(executionEnvironment, directory);
+				return projected ? [projected] : [];
+			})
+		: localAdditionalWorkspaceRoots;
 	const activeRepoContextPrompt = renderActiveRepoContextPrompt(activeRepoContext);
 
 	// Build tool metadata for system prompt rendering.
@@ -843,7 +908,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		resolvedCustomPrompt,
 		resolvedAppendPrompt,
 	]);
-	const contextPromptSources = contextFiles.map(file => file.content);
+	const contextPromptSources = promptContextFiles.map(file => file.content);
 	const promptSources = [
 		effectiveSystemPromptCustomization,
 		resolvedCustomPrompt,
@@ -864,16 +929,16 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		toolListMode,
 		toolRefs,
 		environment,
-		contextFiles,
-		agentsMdSearch: { files: agentsMdFiles },
-		workspaceTree,
+		contextFiles: promptContextFiles,
+		agentsMdSearch: { files: promptAgentsMdFiles },
+		workspaceTree: promptWorkspaceTree,
 		skills: filteredSkills,
 		rules: rules ?? [],
 		alwaysApplyRules: injectedAlwaysApplyRules,
 		date,
 		dateTime,
 		cwd: promptCwd,
-		additionalWorkspaceRoots: additionalWorkspaceRoots.filter(d => path.resolve(d) !== path.resolve(resolvedCwd)),
+		additionalWorkspaceRoots: promptAdditionalWorkspaceRoots,
 		model: includeModelInPrompt ? (model ?? "") : "",
 		useCodexTaskPrompt: usesCodexTaskPrompt(model),
 		personality: personality === "none" ? "" : PERSONALITY_SPECS[personality].trim(),
@@ -917,5 +982,6 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 	// default template; a resolved custom prompt uses a template that omits it.
 	const xdevCatalogNames =
 		!resolvedCustomPrompt && xdevTools.length > 0 ? xdevTools.map(mounted => mounted.name) : undefined;
+	if (executionEnvironment) assertExecutionEnvironmentSystemPrompt(executionEnvironment, systemPrompt);
 	return { systemPrompt, xdevCatalogNames };
 }

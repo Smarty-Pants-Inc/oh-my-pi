@@ -353,9 +353,12 @@ describe("renderYieldSchema", () => {
 	// (jtdToTypeScript + renderYieldSchema); the render calls below rely on it.
 	const templatePath = path.resolve(import.meta.dir, "../src/prompts/system/subagent-system-prompt.md");
 
-	async function renderSubagentPrompt(outputSchema: unknown): Promise<string> {
+	async function renderSubagentPrompt(
+		outputSchema: unknown,
+		paths: { worktree?: string; operationalRoot?: string } = {},
+	): Promise<string> {
 		const templateSource = await fs.readFile(templatePath, "utf-8");
-		return prompt.render(templateSource, { agent: "test-agent", outputSchema });
+		return prompt.render(templateSource, { agent: "test-agent", outputSchema, ...paths });
 	}
 
 	test("wraps a JTD properties schema inside result.data so the model matches the yield envelope", async () => {
@@ -389,5 +392,22 @@ describe("renderYieldSchema", () => {
 		const rendered = await renderSubagentPrompt(undefined);
 		expect(rendered).not.toContain("result: {");
 		expect(rendered).not.toContain("Your terminal `yield` MUST use exactly this shape");
+	});
+
+	test("renders a remote operational root without exposing the local worktree", async () => {
+		const rendered = await renderSubagentPrompt(undefined, {
+			worktree: "/local/isolation/worktree",
+			operationalRoot: "/workspace",
+		});
+		expect(rendered).toContain("# Execution Environment");
+		expect(rendered).toContain("rooted at `/workspace`");
+		expect(rendered).not.toContain("/local/isolation/worktree");
+	});
+
+	test("preserves the ordinary local worktree guidance without an environment", async () => {
+		const rendered = await renderSubagentPrompt(undefined, { worktree: "/local/isolation/worktree" });
+		expect(rendered).toContain("# Working Tree");
+		expect(rendered).toContain("at `/local/isolation/worktree`");
+		expect(rendered).not.toContain("# Execution Environment");
 	});
 });
