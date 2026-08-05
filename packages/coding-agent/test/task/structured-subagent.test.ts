@@ -8,9 +8,14 @@ import {
 	resetRegisteredArtifactDirsForTests,
 } from "@oh-my-pi/pi-coding-agent/internal-urls/registry-helpers";
 import * as planHandoff from "@oh-my-pi/pi-coding-agent/plan-mode/plan-handoff";
+import type { ExecutionEnvironmentProvider } from "@oh-my-pi/pi-coding-agent/session/execution-environment";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import * as isolationRunner from "@oh-my-pi/pi-coding-agent/task/isolation-runner";
+import {
+	ENVIRONMENT_SUBAGENT_RUNTIME_PROFILE,
+	subagentRuntimeAllows,
+} from "@oh-my-pi/pi-coding-agent/task/runtime-profile";
 import {
 	buildStructuredSubagentRecoveryHint,
 	resolveEffectiveSubagentPolicy,
@@ -37,6 +42,8 @@ function session(
 		maxDepth?: number;
 		isolationMode?: "none" | "worktree";
 		isolationApply?: boolean;
+		provider?: ExecutionEnvironmentProvider;
+		taskDepth?: number;
 	} = {},
 ): ToolSession {
 	return {
@@ -49,9 +56,11 @@ function session(
 			"task.enableLsp": true,
 			...(options.isolationApply !== undefined ? { "task.isolation.apply": options.isolationApply } : {}),
 		}),
+		taskDepth: options.taskDepth,
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
 		getPlanModeState: () => (options.planMode ? { enabled: true } : undefined),
+		getExecutionEnvironmentProvider: () => options.provider,
 	} as unknown as ToolSession;
 }
 
@@ -153,8 +162,8 @@ describe("structured subagent primitive", () => {
 		);
 		expect(policy.effectiveAgent.tools).toEqual(["read", "grep", "glob", "web_search", "ast_grep"]);
 		expect(policy.effectiveAgent.spawns).toBeUndefined();
-		expect(policy.enableLsp).toBe(false);
-		expect(policy.enableIrc).toBe(false);
+		expect(subagentRuntimeAllows(policy.runtimeProfile, "lsp")).toBe(false);
+		expect(subagentRuntimeAllows(policy.runtimeProfile, "irc")).toBe(false);
 
 		vi.restoreAllMocks();
 		const discover = vi.spyOn(discoveryModule, "discoverAgents");
@@ -164,6 +173,143 @@ describe("structured subagent primitive", () => {
 			),
 		).rejects.toThrow("isolation, apply, and merge controls are unavailable in plan mode");
 		expect(discover).not.toHaveBeenCalled();
+	});
+
+	it("rejects every unsupported environment request before worktree creation or provider acquisition", async () => {
+		const provider = {
+			acquire: vi.fn(async () => {
+				throw new Error("provider acquisition must not run during rejected preflight");
+			}),
+		} satisfies ExecutionEnvironmentProvider;
+		mockDiscovery();
+		const prepare = vi.spyOn(isolationRunner, "prepareIsolationContext");
+		const candidates: Array<{ candidate: StructuredSubagentRequest; message: string }> = [
+			{
+				candidate: request({
+					session: session({ isolationMode: "worktree", provider }),
+					invocationKind: "eval",
+					isolation: { requested: true },
+					execution: "environment",
+				}),
+				message: "only available to task invocations",
+			},
+			{
+				candidate: request({
+					session: session({ isolationMode: "worktree" }),
+					isolation: { requested: true },
+					execution: "environment",
+				}),
+				message: "requires a registered execution environment provider",
+			},
+			{
+				candidate: request({ session: session({ isolationMode: "worktree", provider }), execution: "environment" }),
+				message: "requires explicit `isolated: true`",
+			},
+			{
+				candidate: request({
+					session: session({ planMode: true, isolationMode: "worktree", provider }),
+					isolation: { requested: true },
+					execution: "environment",
+				}),
+				message: "unavailable in plan mode",
+			},
+			{
+				candidate: request({
+					session: session({ isolationMode: "worktree", provider, taskDepth: 1 }),
+					isolation: { requested: true },
+					execution: "environment",
+				}),
+				message: "only available at task depth 0",
+			},
+			{
+				candidate: request({
+					session: session({ isolationMode: "worktree", provider }),
+					isolation: { requested: true },
+					execution: "environment",
+					detached: true,
+				}),
+				message: "must be blocking, not detached",
+			},
+			{
+				candidate: request({
+					session: session({ isolationMode: "worktree", provider }),
+					isolation: { requested: true },
+					execution: "environment",
+				}),
+				message: "requires a blocking agent",
+			},
+		];
+
+		for (const { candidate, message } of candidates) {
+			await expect(runStructuredSubagent(candidate)).rejects.toThrow(message);
+		}
+		expect(prepare).not.toHaveBeenCalled();
+		expect(provider.acquire).not.toHaveBeenCalled();
+	});
+
+	it("attenuates a valid environment task to the exact child authority and passes only the provider to isolation", async () => {
+		const provider = {
+			acquire: vi.fn(async () => {
+				throw new Error("mock isolation runner owns acquisition in this test");
+			}),
+		} satisfies ExecutionEnvironmentProvider;
+		const blockingAgent: AgentDefinition = {
+			...AGENT,
+			blocking: true,
+			tools: ["read", "write", "bash", "task", "hub", "eval"],
+			spawns: "*",
+			prewalk: true,
+		};
+		mockDiscovery(blockingAgent);
+		const environmentSession = session({
+			isolationMode: "worktree",
+			isolationApply: false,
+			provider,
+		});
+		Object.assign(environmentSession, {
+			enableMCP: true,
+			mcpManager: { getTools: () => [{ name: "mcp__hostile" }] },
+			extensionPaths: ["/hostile/extension.ts"],
+			customToolPaths: [{ path: "/hostile/tool.ts", source: "project" }],
+			getEvalSessionId: () => "parent-kernel",
+		});
+		const policy = await resolveEffectiveSubagentPolicy(
+			request({
+				session: environmentSession,
+				isolation: { requested: true },
+				execution: "environment",
+			}),
+		);
+		expect(policy.effectiveAgent).not.toBe(blockingAgent);
+		expect(policy.effectiveAgent.tools).toEqual(["read", "write", "bash"]);
+		expect(policy.effectiveAgent.spawns).toBeUndefined();
+		expect(policy.effectiveAgent.prewalk).toBeUndefined();
+		expect(policy.runtimeProfile).toBe(ENVIRONMENT_SUBAGENT_RUNTIME_PROFILE);
+
+		vi.spyOn(isolationRunner, "prepareIsolationContext").mockResolvedValue({ repoRoot: "/tmp" } as never);
+		let isolatedOptions: Parameters<typeof isolationRunner.runIsolatedSubprocess>[0] | undefined;
+		vi.spyOn(isolationRunner, "runIsolatedSubprocess").mockImplementation(async options => {
+			isolatedOptions = options;
+			return result();
+		});
+		const settled = await runStructuredSubagent(
+			request({
+				session: environmentSession,
+				isolation: { requested: true },
+				execution: "environment",
+			}),
+		);
+
+		expect(isolatedOptions?.executionEnvironmentProvider).toBe(provider);
+		expect(isolatedOptions?.baseOptions.runtimeProfile).toBe(ENVIRONMENT_SUBAGENT_RUNTIME_PROFILE);
+		expect(isolatedOptions?.baseOptions.agent.tools).toEqual(["read", "write", "bash"]);
+		expect(isolatedOptions?.baseOptions.agent.spawns).toBeUndefined();
+		expect(isolatedOptions?.baseOptions.agent.prewalk).toBeUndefined();
+		expect(isolatedOptions?.baseOptions.mcpManager).toBeUndefined();
+		expect(isolatedOptions?.baseOptions.parentEvalSessionId).toBeUndefined();
+		expect(isolatedOptions?.baseOptions.executionEnvironment).toBeUndefined();
+		expect(provider.acquire).not.toHaveBeenCalled();
+		await fs.rm(settled.artifactsDir, { recursive: true, force: true });
 	});
 
 	it("leases temporary artifacts for a retained invocation and registers them for agent URLs", async () => {
@@ -191,9 +337,15 @@ describe("structured subagent primitive", () => {
 		mockDiscovery();
 		const taskPolicy = await resolveEffectiveSubagentPolicy(request());
 		const evalPolicy = await resolveEffectiveSubagentPolicy(request({ invocationKind: "eval" }));
+		expect(Object.isFrozen(taskPolicy.runtimeProfile)).toBe(true);
+		expect(Object.isFrozen(evalPolicy.runtimeProfile)).toBe(true);
 
-		expect(evalPolicy.enableLsp).toBe(taskPolicy.enableLsp);
-		expect(evalPolicy.enableIrc).toBe(taskPolicy.enableIrc);
+		expect(subagentRuntimeAllows(evalPolicy.runtimeProfile, "lsp")).toBe(
+			subagentRuntimeAllows(taskPolicy.runtimeProfile, "lsp"),
+		);
+		expect(subagentRuntimeAllows(evalPolicy.runtimeProfile, "irc")).toBe(
+			subagentRuntimeAllows(taskPolicy.runtimeProfile, "irc"),
+		);
 	});
 
 	it("rejects an invalid caller schema before executor dispatch in both modes", async () => {
@@ -329,28 +481,31 @@ describe("structured subagent primitive", () => {
 		);
 		const restrictedRun = await runStructuredSubagent(request({ session: restrictedSession, retainArtifacts: true }));
 
-		expect(options[0]).toMatchObject({
-			enableMCP: false,
+		expect(options[0]?.runtimeProfile).toMatchObject({
 			restrictToolNames: true,
-			preloadedExtensionPaths: [],
-			preloadedCustomToolPaths: [],
+			capabilities: { mcp: false, extensions: false, customTools: false },
 		});
+		expect(options[0]?.preloadedExtensionPaths).toEqual([]);
+		expect(options[0]?.preloadedCustomToolPaths).toEqual([]);
 		expect(options[0]?.mcpManager).toBeUndefined();
+		expect(options[1]?.runtimeProfile).toMatchObject({
+			restrictToolNames: false,
+			capabilities: { mcp: true, extensions: true, customTools: true },
+		});
 		expect(options[1]).toMatchObject({
-			enableMCP: true,
 			mcpManager,
 			preloadedExtensionPaths: extensionPaths,
 			preloadedCustomToolPaths: customToolPaths,
 		});
-		expect(options[1]?.restrictToolNames).toBe(false);
-		expect(options[2]).toMatchObject({ enableMCP: false });
+		expect(options[1]?.runtimeProfile?.restrictToolNames).toBe(false);
+		expect(options[2]?.runtimeProfile).toMatchObject({ capabilities: { mcp: false } });
 		expect(options[2]?.mcpManager).toBeUndefined();
-		expect(options[3]).toMatchObject({
-			enableMCP: false,
+		expect(options[3]?.runtimeProfile).toMatchObject({
 			restrictToolNames: true,
-			preloadedExtensionPaths: [],
-			preloadedCustomToolPaths: [],
+			capabilities: { mcp: false, extensions: false, customTools: false },
 		});
+		expect(options[3]?.preloadedExtensionPaths).toEqual([]);
+		expect(options[3]?.preloadedCustomToolPaths).toEqual([]);
 		expect(options[3]?.mcpManager).toBeUndefined();
 		expect(options[3]?.getApiKey).toBe(getApiKey);
 		await fs.rm(planRun.artifactsDir, { recursive: true, force: true });

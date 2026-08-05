@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added provider-neutral execution environments for explicit top-level isolated tasks, allowing extension-supplied workspaces to serve unchanged built-in `read`, `write`, and foreground non-PTY `bash` tools. The experimental `@oh-my-pi/cloud-omp-cloudflare` package supplies the first adapter.
+
+### Changed
+
+- Environment-backed isolation now synchronizes and releases the remote lease before existing capture/merge, blocks merge on sync or release failure, and never falls back to local file or process execution after a remote error.
+
+## [17.2.8] - 2026-08-04
+
+### Changed
+
+- Upgraded the bundled omptype schema engine: intersection and pipe operators, bigint and RegExp literals in the string DSL, Standard Schema V1 interop, JSON Schema import via fromJsonSchema(), and richer union/collection error reporting.
+
 ## [17.2.7] - 2026-08-03
 
 ### Changed

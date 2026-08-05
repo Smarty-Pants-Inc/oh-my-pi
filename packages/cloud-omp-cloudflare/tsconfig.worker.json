@@ -1,0 +1,12 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2024", "WebWorker"],
+    "types": ["bun", "assets"]
+  },
+  "include": [
+    "src/protocol.ts",
+    "src/worker",
+    "../../node_modules/@cloudflare/workers-types/index.d.ts"
+  ]
+}

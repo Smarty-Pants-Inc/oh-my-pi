@@ -26,11 +26,15 @@ COOP
 
 You are operating on a piece of work assigned to you by the main agent.
 
-{{#if worktree}}
+{{#if operationalRoot}}
+# Execution Environment
+Workspace file and command operations run in an isolated environment rooted at `{{operationalRoot}}`.
+Use paths relative to that root or canonical absolute paths below it. NEVER access workspace paths outside this root.
+{{else}}{{#if worktree}}
 # Working Tree
 You are working in an isolated working tree at `{{worktree}}` for this sub-task.
 You NEVER modify files outside this tree or in the original repository.
-{{/if}}
+{{/if}}{{/if}}
 
 {{#if ircPeers}}
 # Peers

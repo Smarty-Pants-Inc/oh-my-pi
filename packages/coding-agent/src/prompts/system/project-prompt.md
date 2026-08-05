@@ -10,7 +10,7 @@ PROJECT
 <repo-rules>
 You MUST follow the context files below for all tasks:
 {{#each contextFiles}}
-<file path="{{path}}">
+{{#if path}}<file path="{{path}}">{{else}}<file>{{/if}}
 {{content}}
 </file>
 {{/each}}
