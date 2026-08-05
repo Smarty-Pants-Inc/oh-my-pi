@@ -92,6 +92,8 @@ import type {
 	SessionCompactingEvent,
 	SessionCompactingResult,
 	SessionEvent,
+	SessionReadyEvent,
+	SessionRollbackEvent,
 	SessionShutdownEvent,
 	SessionStartEvent,
 	SessionStopEvent,
@@ -419,6 +421,8 @@ export interface ExtensionContext {
 	ui: ExtensionUIContext;
 	/** Get current context usage for the active model. */
 	getContextUsage(): ContextUsage | undefined;
+	/** Whether manual or automatic context compaction is currently active. */
+	isCompacting(): boolean;
 	/** Get a read-only snapshot of async jobs owned by this session. */
 	getAsyncJobSnapshot(): AsyncJobSnapshot | null;
 	/** Compact the session context (interactive mode shows UI). */
@@ -647,7 +651,7 @@ export interface ResourcesDiscoverResult {
 }
 
 // ============================================================================
-// Session Events (shared with hooks subsystem)
+// Session Events (payloads shared with hooks except extension-only ready/rollback)
 // ============================================================================
 
 export type {
@@ -659,6 +663,8 @@ export type {
 	SessionCompactEvent,
 	SessionCompactingEvent,
 	SessionEvent,
+	SessionReadyEvent,
+	SessionRollbackEvent,
 	SessionShutdownEvent,
 	SessionStartEvent,
 	SessionSwitchEvent,
@@ -994,6 +1000,8 @@ export function isToolCallEventType(toolName: string, event: ToolCallEvent): boo
 export type ExtensionEvent =
 	| ResourcesDiscoverEvent
 	| SessionEvent
+	| SessionReadyEvent
+	| SessionRollbackEvent
 	| ContextEvent
 	| BeforeProviderRequestEvent
 	| AfterProviderResponseEvent
@@ -1025,6 +1033,20 @@ export type ExtensionEvent =
 	| ToolResultEvent
 	| ToolApprovalRequestedEvent
 	| ToolApprovalResolvedEvent;
+
+/** Host-only fence emitted immediately before a committed branch/tree mutation. */
+export interface HostInternalSessionMutationEvent {
+	type: "session_branch" | "session_tree";
+}
+
+/** Host-owned extension binding. Never exposed through public discovery or forwarded to child sessions. */
+export interface HostInternalExtensionBinding {
+	extension: Extension;
+	beforeSessionMutation?: (event: HostInternalSessionMutationEvent, ctx: ExtensionContext) => void | Promise<void>;
+	afterDispatch?: (event: ExtensionEvent, ctx: ExtensionContext) => void | Promise<void>;
+	/** Supplies a host-only terminal-input registrar after the interactive UI exists. */
+	setHostTerminalInput?: (register: (handler: TerminalInputHandler) => () => void) => void;
+}
 
 // ============================================================================
 // Event Results
@@ -1173,6 +1195,8 @@ export interface ExtensionAPI {
 
 	on(event: "resources_discover", handler: ExtensionHandler<ResourcesDiscoverEvent, ResourcesDiscoverResult>): void;
 	on(event: "session_start", handler: ExtensionHandler<SessionStartEvent>): void;
+	on(event: "session_ready", handler: ExtensionHandler<SessionReadyEvent>): void;
+	on(event: "session_rollback", handler: ExtensionHandler<SessionRollbackEvent>): void;
 	on(
 		event: "session_before_switch",
 		handler: ExtensionHandler<SessionBeforeSwitchEvent, SessionBeforeSwitchResult>,
@@ -1586,6 +1610,7 @@ export interface ExtensionActions {
 export interface ExtensionContextActions {
 	getModel: () => Model | undefined;
 	isIdle: () => boolean;
+	isCompacting: () => boolean;
 	abort: () => void;
 	hasPendingMessages: () => boolean;
 	shutdown: () => void;

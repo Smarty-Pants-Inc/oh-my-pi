@@ -294,9 +294,16 @@ function findBashApprovalPatternRule(
 async function saveBashOriginalArtifact(session: ToolSession, originalText: string): Promise<string | undefined> {
 	try {
 		const alloc = await session.allocateOutputArtifact?.("bash-original");
-		if (!alloc?.path || !alloc.id) return undefined;
-		await Bun.write(alloc.path, originalText);
-		return alloc.id;
+		if (!alloc?.path || !alloc.id) {
+			alloc?.release?.();
+			return undefined;
+		}
+		try {
+			await Bun.write(alloc.path, originalText);
+			return alloc.id;
+		} finally {
+			alloc.release?.();
+		}
 	} catch {
 		return undefined;
 	}
@@ -1147,10 +1154,11 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			"bash",
 			label,
 			async ({ jobId, signal: runSignal, reportProgress }) => {
-				const { path: artifactPath, id: artifactId } = (await this.session.allocateOutputArtifact?.("bash")) ?? {};
-				const tailBuffer = new TailBuffer(DEFAULT_MAX_BYTES);
-				const wallTimeStart = performance.now();
+				const artifact = (await this.session.allocateOutputArtifact?.("bash")) ?? {};
+				const { path: artifactPath, id: artifactId } = artifact;
 				try {
+					const tailBuffer = new TailBuffer(DEFAULT_MAX_BYTES);
+					const wallTimeStart = performance.now();
 					const result = await executeBash(options.command, {
 						cwd: options.commandCwd,
 						sessionKey: `${this.session.getSessionId?.() ?? ""}:async:${jobId}`,
@@ -1192,6 +1200,8 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 					completion.resolve({ kind: "failed", error });
 					await reportProgress(message, { async: { state: "failed", jobId, type: "bash" } });
 					throw error;
+				} finally {
+					artifact.release?.();
 				}
 			},
 			{
@@ -1636,40 +1646,46 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		const tailBuffer = new TailBuffer(DEFAULT_MAX_BYTES);
 
 		// Allocate artifact for truncated output storage
-		const { path: artifactPath, id: artifactId } = (await this.session.allocateOutputArtifact?.("bash")) ?? {};
+		const artifact = (await this.session.allocateOutputArtifact?.("bash")) ?? {};
+		const { path: artifactPath, id: artifactId } = artifact;
 
 		const interactiveUi = canUseInteractiveBashPty(pty, ctx) ? ctx?.ui : undefined;
 		if (pty && !interactiveUi) {
 			pendingNotices.push("pty requested but unavailable in this environment; ran without a terminal");
 		}
 		const wallTimeStart = performance.now();
-		const result: BashResult | BashInteractiveResult = interactiveUi
-			? await runInteractiveBashPty(interactiveUi, {
-					// PTY bypasses executeBash, so feed it the direnv-transformed
-					// command + merged env (backendPreflight is defined whenever this
-					// branch runs, since both gate on canUseInteractiveBashPty).
-					command: backendPreflight?.command ?? command,
-					cwd: commandCwd,
-					timeoutMs,
-					signal,
-					env: backendPreflight?.env ?? resolvedEnv,
-					artifactPath,
-					artifactId,
-				})
-			: // executeBash runs its OWN direnv preflight internally — pass the RAW
-				// command + resolvedEnv here so the unset prefix / env merge is not
-				// applied twice.
-				await executeBash(command, {
-					cwd: commandCwd,
-					sessionKey: this.session.getSessionId?.() ?? undefined,
-					timeout: timeoutMs ?? 0,
-					signal,
-					env: resolvedEnv,
-					artifactPath,
-					artifactId,
-					onChunk: streamTailUpdates(tailBuffer, onUpdate),
-					onMinimizedSave: originalText => saveBashOriginalArtifact(this.session, originalText),
-				});
+		let result: BashResult | BashInteractiveResult;
+		try {
+			result = interactiveUi
+				? await runInteractiveBashPty(interactiveUi, {
+						// PTY bypasses executeBash, so feed it the direnv-transformed
+						// command + merged env (backendPreflight is defined whenever this
+						// branch runs, since both gate on canUseInteractiveBashPty).
+						command: backendPreflight?.command ?? command,
+						cwd: commandCwd,
+						timeoutMs,
+						signal,
+						env: backendPreflight?.env ?? resolvedEnv,
+						artifactPath,
+						artifactId,
+					})
+				: // executeBash runs its OWN direnv preflight internally — pass the RAW
+					// command + resolvedEnv here so the unset prefix / env merge is not
+					// applied twice.
+					await executeBash(command, {
+						cwd: commandCwd,
+						sessionKey: this.session.getSessionId?.() ?? undefined,
+						timeout: timeoutMs ?? 0,
+						signal,
+						env: resolvedEnv,
+						artifactPath,
+						artifactId,
+						onChunk: streamTailUpdates(tailBuffer, onUpdate),
+						onMinimizedSave: originalText => saveBashOriginalArtifact(this.session, originalText),
+					});
+		} finally {
+			artifact.release?.();
+		}
 		const wallTimeMs = performance.now() - wallTimeStart;
 		if (result.cancelled) {
 			// A cancelled result is either a timeout (the command's deadline fired)

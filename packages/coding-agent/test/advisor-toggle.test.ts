@@ -683,6 +683,12 @@ describe("AgentSession advisor toggle", () => {
 		const extensionRunner = {
 			hasHandlers: (eventType: string) => eventType === "session_before_branch",
 			emit: async () => ({ skipConversationRestore: true }),
+			emitWithHostCompletion: async (
+				_event: { type: string },
+				finalizeBeforeHostCompletion?: () => void | Promise<void>,
+			) => {
+				await finalizeBeforeHostCompletion?.();
+			},
 		} as unknown as ExtensionRunner;
 		const branchDir = TempDir.createSync("@pi-advisor-branch-");
 		const branchManager = SessionManager.create(branchDir.path(), branchDir.path());
@@ -718,13 +724,17 @@ describe("AgentSession advisor toggle", () => {
 			await branchDir.remove().catch(() => {});
 		}
 	});
-	it("clears advisor cost when a branch hook throws after the session changed", async () => {
+	it("restores advisor cost when a branch hook throws after mutation", async () => {
 		const failure = new Error("session_branch handler failed");
 		const extensionRunner = {
 			hasHandlers: () => false,
-			emit: async (event: { type: string }) => {
+			emit: async () => undefined,
+			emitWithHostCompletion: async (
+				event: { type: string },
+				finalizeBeforeHostCompletion?: () => void | Promise<void>,
+			) => {
 				if (event.type === "session_branch") throw failure;
-				return undefined;
+				await finalizeBeforeHostCompletion?.();
 			},
 		} as unknown as ExtensionRunner;
 		const branchDir = TempDir.createSync("@pi-advisor-branch-fail-");
@@ -750,12 +760,12 @@ describe("AgentSession advisor toggle", () => {
 
 			await expect(branchSession.branch(entryId)).rejects.toThrow(failure);
 
-			// The hook failed only after the branch had already taken over the transcript,
-			// so the abandoned conversation's spend must not be billed to the new one.
-			expect(branchManager.getSessionFile()).not.toBe(previousSessionFile);
-			expect(branchSession.getAdvisorCost()).toBe(0);
+			// The branch was fenced but its ordinary event failed before finalization, so
+			// rollback restores the retained identity and spend ledger before later work.
+			expect(branchManager.getSessionFile()).toBe(previousSessionFile);
+			expect(branchSession.getAdvisorCost()).toBeCloseTo(0.5, 8);
 			appendAdvisorCost(advisor, 0.25, 2);
-			expect(branchSession.getAdvisorCost()).toBeCloseTo(0.25, 8);
+			expect(branchSession.getAdvisorCost()).toBeCloseTo(0.75, 8);
 		} finally {
 			await branchSession.dispose();
 			await branchDir.remove().catch(() => {});

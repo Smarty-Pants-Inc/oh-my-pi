@@ -15,7 +15,7 @@ import {
 	projectMountedMCPXdevGuidance,
 } from "@oh-my-pi/pi-coding-agent/session/session-tools";
 import { listXdevTools, XDEV_EXTERNAL_DESCRIPTION_CAP, type XdevState } from "@oh-my-pi/pi-coding-agent/tools/xdev";
-import { logger } from "@oh-my-pi/pi-utils";
+import { logger, TempDir } from "@oh-my-pi/pi-utils";
 
 // Cache-stability invariant: when MCP servers reconnect with byte-identical tool
 // definitions, `refreshMCPTools` must not rebuild the system prompt. A rebuild
@@ -88,13 +88,33 @@ function createTestXdevState(): XdevState {
 
 describe("AgentSession refreshMCPTools rebuild skipping", () => {
 	const sessions: AgentSession[] = [];
+	const tempDirs: TempDir[] = [];
 
 	afterEach(async () => {
 		for (const session of sessions.splice(0)) {
 			await session.dispose();
 		}
+		for (const tempDir of tempDirs.splice(0)) await tempDir.remove();
 		vi.restoreAllMocks();
 	});
+
+	async function createSwitchTarget(label: string): Promise<string> {
+		const tempDir = TempDir.createSync(`@pi-tool-state-${label}-`);
+		tempDirs.push(tempDir);
+		const id = `${label}-${Bun.nanoseconds()}`;
+		const targetPath = `${tempDir.path()}/${id}.jsonl`;
+		await Bun.write(
+			targetPath,
+			`${JSON.stringify({
+				type: "session",
+				version: 3,
+				id,
+				timestamp: new Date().toISOString(),
+				cwd: tempDir.path(),
+			})}\n`,
+		);
+		return targetPath;
+	}
 
 	interface NewSessionOptions {
 		getMcpServerInstructions?: () => Map<string, string> | undefined;
@@ -113,6 +133,8 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 		exposeXdevCatalog?: boolean;
 		/** Optional per-turn system prompt replacement returned by before_agent_start. */
 		beforeAgentStartSystemPrompt?: string[];
+		/** Use filesystem-backed session storage for lifecycle-switch fixtures. */
+		persist?: boolean;
 	}
 
 	function newSession(
@@ -158,9 +180,13 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 					}
 				: undefined,
 		});
+		const persistedSessionDir = options.persist ? TempDir.createSync("@pi-tool-state-session-") : undefined;
+		if (persistedSessionDir) tempDirs.push(persistedSessionDir);
 		const session = new AgentSession({
 			agent,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager: persistedSessionDir
+				? SessionManager.create(persistedSessionDir.path(), persistedSessionDir.path())
+				: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry: { getApiKey: async () => "test-key" } as never,
 			toolRegistry,
@@ -1049,6 +1075,64 @@ These tools became available:
 		expect(
 			session.agent.state.messages.filter(m => m.role === "custom" && m.customType === "xdev-mount-notice"),
 		).toHaveLength(0);
+	});
+
+	it("restores in-memory announced mounts when final ownership rolls back", async () => {
+		const { session, contexts } = newSession(async toolNames => `tools:${toolNames.join(",")}`, {
+			xdev: createTestXdevState(),
+			responses: [{ content: ["retained"] }, { content: ["after rollback"] }],
+			exposeXdevCatalog: true,
+			persist: true,
+		});
+		const search = createMcpCustomTool("mcp__nucleus_search", "nucleus", "search", "Search nucleus");
+		await session.refreshMCPTools([search]);
+		await session.prompt("announce through catalog");
+		expect(mountNoticesIn(contexts[0])).toHaveLength(0);
+
+		const targetPath = await createSwitchTarget("mount-rollback");
+		const failure = new Error("target ownership failed");
+		let commitAttempts = 0;
+		const beginArtifactTransaction = session.sessionManager.beginArtifactTransaction.bind(session.sessionManager);
+		vi.spyOn(session.sessionManager, "beginArtifactTransaction").mockImplementation(async () => {
+			const transaction = await beginArtifactTransaction();
+			return {
+				rollback: () => transaction.rollback(),
+				commit: async () => {
+					commitAttempts++;
+					if (commitAttempts === 1) throw failure;
+					await transaction.commit();
+				},
+			};
+		});
+
+		await expect(session.switchSession(targetPath)).rejects.toBe(failure);
+		await session.refreshMCPTools([]);
+		await session.prompt("observe retained unmount");
+
+		const notices = mountNoticesIn(contexts[1]);
+		expect(notices).toHaveLength(1);
+		expect(notices[0]).toContain("No longer mounted");
+		expect(notices[0]).toContain("xd://mcp__nucleus_search");
+	});
+
+	it("starts a committed target with clean announced-mount state", async () => {
+		const { session, contexts } = newSession(async toolNames => `tools:${toolNames.join(",")}`, {
+			xdev: createTestXdevState(),
+			responses: [{ content: ["retained"] }, { content: ["target"] }],
+			exposeXdevCatalog: true,
+			persist: true,
+		});
+		const search = createMcpCustomTool("mcp__nucleus_search", "nucleus", "search", "Search nucleus");
+		await session.refreshMCPTools([search]);
+		await session.prompt("announce through catalog");
+		expect(mountNoticesIn(contexts[0])).toHaveLength(0);
+
+		const targetPath = await createSwitchTarget("mount-success");
+		await expect(session.switchSession(targetPath)).resolves.toBe(true);
+		await session.refreshMCPTools([]);
+		await session.prompt("target never saw the mount");
+
+		expect(mountNoticesIn(contexts[1])).toHaveLength(0);
 	});
 
 	it("keeps the mount notice when before_agent_start replaces the catalog prompt (#7139)", async () => {

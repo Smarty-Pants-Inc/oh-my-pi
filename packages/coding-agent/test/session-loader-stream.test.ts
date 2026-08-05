@@ -44,7 +44,7 @@ function entryTypes(entries: FileEntry[]): string[] {
 }
 
 function entryIds(entries: FileEntry[]): string[] {
-	return entries.map(entry => entry.id);
+	return entries.flatMap(entry => ("id" in entry ? [entry.id] : []));
 }
 
 function messageIds(entries: FileEntry[]): string[] {

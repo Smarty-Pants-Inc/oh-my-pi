@@ -174,6 +174,12 @@ interface XdevMountNoticeDetails {
 	removed: string[];
 }
 
+/** Transactional ownership of permission and mount-announcement session state. */
+export interface SessionToolsStateTransition {
+	commit(): void;
+	rollback(): void;
+}
+
 /** Owns tool registration, presentation, prompt rebuilding, skills, and permissions. */
 export class SessionTools {
 	readonly #host: SessionToolsHost;
@@ -314,6 +320,32 @@ export class SessionTools {
 	/** Drops cached per-session ACP `allow_always`/`reject_always` decisions. */
 	clearAcpPermissionDecisions(): void {
 		this.#acpPermissionDecisions.clear();
+	}
+
+	/**
+	 * Install clean logical-session permission and mount-announcement state while
+	 * retaining the current state for rollback. Live mount inventory and pending
+	 * host deltas are intentionally not session-owned and remain in place. Commit
+	 * keeps the retained snapshot available until pre-publication selection seals.
+	 */
+	beginSessionTransition(): SessionToolsStateTransition {
+		const retainedPermissionDecisions = this.#acpPermissionDecisions;
+		const retainedAnnouncedMounts = this.#announcedMounts;
+		const retainedAnnouncedMountsSeeded = this.#announcedMountsSeeded;
+		this.#acpPermissionDecisions = new Map();
+		this.#announcedMounts = new Set();
+		this.#announcedMountsSeeded = false;
+		let restored = false;
+		return {
+			commit: () => {},
+			rollback: () => {
+				if (restored) return;
+				restored = true;
+				this.#acpPermissionDecisions = retainedPermissionDecisions;
+				this.#announcedMounts = retainedAnnouncedMounts;
+				this.#announcedMountsSeeded = retainedAnnouncedMountsSeeded;
+			},
+		};
 	}
 
 	/** Drops cached ACP decisions and re-wraps active tools after the client changes. */

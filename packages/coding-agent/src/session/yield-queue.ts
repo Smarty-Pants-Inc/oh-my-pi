@@ -17,6 +17,15 @@ export interface YieldQueueOptions {
 	scheduleIdleFlush(run: () => Promise<void>): void;
 }
 
+export interface YieldQueueTransaction {
+	/** Select the target queue while retaining discarded receipts until activation. */
+	commit(): void;
+	/** Select and expose the retained queue without settling provisional target receipts. */
+	rollback(): void;
+	/** Settle discarded receipts and schedule the selected queue after host publication. */
+	activate(): void;
+}
+
 type YieldFlushMode = "streaming" | "idle";
 
 interface StoredDispatcher {
@@ -102,6 +111,50 @@ export class YieldQueue {
 		return false;
 	}
 
+	/**
+	 * Quarantine one kind's retained entries without settling receipts. Commit or
+	 * rollback selects the authoritative queue before host publication; activation
+	 * later settles the discarded side and schedules only the selected entries.
+	 */
+	beginTransaction(kind: string): YieldQueueTransaction {
+		const retained = this.#drain(kind);
+		let selection: "commit" | "rollback" | undefined;
+		let discardedTarget: StoredEntry[] = [];
+		let activated = false;
+		const select = (outcome: "commit" | "rollback"): void => {
+			if (selection === outcome) return;
+			if (activated) throw new Error(`Yield queue transaction selected after activation: ${kind}`);
+			if (selection === "rollback") {
+				throw new Error(`Yield queue transaction already selected rollback: ${kind}`);
+			}
+			selection = outcome;
+			if (outcome === "commit") return;
+			discardedTarget = this.#drain(kind);
+			if (retained.length > 0) this.#entries.set(kind, retained);
+		};
+		return {
+			commit: () => select("commit"),
+			rollback: () => select("rollback"),
+			activate: () => {
+				if (activated) return;
+				if (!selection) throw new Error(`Yield queue transaction activated before selection: ${kind}`);
+				activated = true;
+				if (selection === "commit") {
+					this.#rejectEntries(retained, new Error("Yield queue entry cleared before dispatch"));
+				} else {
+					this.#rejectEntries(
+						discardedTarget,
+						new Error(`Yield queue entry discarded with rolled-back transition: ${kind}`),
+					);
+				}
+				const dispatcher = this.#dispatchers.get(kind);
+				if (dispatcher && !dispatcher.skipIdleFlush && !this.#options.isStreaming() && this.has(kind)) {
+					this.#scheduleIdleFlush();
+				}
+			},
+		};
+	}
+
 	/** Arrange an idle flush for entries queued near the end of a streaming run. */
 	requestIdleFlush(): void {
 		for (const [kind, dispatcher] of this.#dispatchers) {
@@ -179,8 +232,9 @@ export class YieldQueue {
 		return thunks;
 	}
 
-	/** Drop queued entries. With `kind`, drop only that kind's entries (leaving
-	 *  any pending idle-flush for other kinds intact); otherwise drop everything. */
+	/** Drop queued entries and reject their receipts. With `kind`, drop only that
+	 * kind's entries (leaving any pending idle-flush for other kinds intact);
+	 * otherwise drop everything. This cannot be transactionally undone after clear. */
 	clear(kind?: string): void {
 		const error = new Error("Yield queue entry cleared before dispatch");
 		if (kind !== undefined) {

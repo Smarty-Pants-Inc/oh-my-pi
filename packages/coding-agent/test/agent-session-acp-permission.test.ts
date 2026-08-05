@@ -901,6 +901,65 @@ it.each(boundaryCases)(
 	},
 );
 
+it.each(["allow_always", "reject_always"] as const)(
+	"restores cached %s decisions when switch materialization rolls back",
+	async decision => {
+		const bashTool = makeFakeTool("bash");
+		const bridge = makeBridge({ outcome: "selected", optionId: decision, kind: decision });
+		const permissionSpy = spyOn(bridge, "requestPermission");
+		session = await createSession([bashTool], bridge, {}, { persist: true });
+		await session.setActiveToolsByName(["bash"]);
+		const wrappedBash = session.agent.state.tools.find(tool => tool.name === "bash");
+		if (!wrappedBash) throw new Error("Expected wrapped bash tool");
+		const execute = (toolCallId: string) =>
+			wrappedBash.execute(
+				toolCallId,
+				{ command: "echo permission" },
+				undefined,
+				undefined as never,
+				undefined as never,
+			);
+
+		const retainedExecution = execute("call-retained");
+		if (decision === "reject_always") {
+			await expect(retainedExecution).rejects.toThrow(/rejected by user/);
+		} else {
+			await retainedExecution;
+		}
+		expect(permissionSpy).toHaveBeenCalledTimes(1);
+
+		const targetId = `permission-rollback-${Bun.nanoseconds()}`;
+		const targetPath = `${tempDir.path()}/${targetId}.jsonl`;
+		await Bun.write(
+			targetPath,
+			`${JSON.stringify({
+				type: "session",
+				version: 3,
+				id: targetId,
+				timestamp: new Date().toISOString(),
+				cwd: tempDir.path(),
+			})}\n`,
+		);
+		const failure = new Error("target materialization failed");
+		const ensureOnDisk = session.sessionManager.ensureOnDisk.bind(session.sessionManager);
+		spyOn(session.sessionManager, "ensureOnDisk").mockImplementation(async () => {
+			if (session?.sessionFile === targetPath) throw failure;
+			await ensureOnDisk();
+		});
+
+		await expect(session.switchSession(targetPath)).rejects.toBe(failure);
+		const restoredExecution = execute("call-restored");
+		if (decision === "reject_always") {
+			await expect(restoredExecution).rejects.toThrow(/rejected by user/);
+		} else {
+			await restoredExecution;
+		}
+
+		expect(permissionSpy).toHaveBeenCalledTimes(1);
+		expect(bashTool.executeCalls).toBe(decision === "allow_always" ? 2 : 0);
+	},
+);
+
 // ---------------------------------------------------------------------------
 // 4. Read tool not gated: bridge never called even when bridge is set
 // ---------------------------------------------------------------------------

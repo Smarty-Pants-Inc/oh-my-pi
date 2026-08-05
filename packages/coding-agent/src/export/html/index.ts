@@ -4,7 +4,7 @@ import type { AgentState } from "@oh-my-pi/pi-agent-core";
 import { APP_NAME, isEnoent } from "@oh-my-pi/pi-utils";
 import { getResolvedThemeColors, getThemeExportColors } from "../../modes/theme/theme";
 import type { SessionEntry, SessionHeader } from "../../session/session-entries";
-import { loadEntriesFromFile } from "../../session/session-loader";
+import { loadEntriesFromFile, restoreSessionJournal } from "../../session/session-loader";
 import { SessionManager } from "../../session/session-manager";
 import type { ExportThemeNames } from "./args";
 import templateCssPath from "./template.css" with { type: "file" };
@@ -234,13 +234,13 @@ async function collectSubSessionsFromDir(
 		// Empty/corrupt files (no valid session header) load as [] — skip silently.
 		if (fileEntries.length > 0) {
 			const header = (fileEntries.find(e => e.type === "session") as SessionHeader | undefined) ?? null;
-			const entries = fileEntries.filter((e): e is SessionEntry => e.type !== "session");
+			const journal = restoreSessionJournal(fileEntries);
 			out[key] = {
 				agentId,
 				parent: parentKey,
 				header: sessionHeaderForExport(header),
-				entries,
-				leafId: entries.length > 0 ? entries[entries.length - 1].id : null,
+				entries: journal.entries,
+				leafId: journal.leafId === undefined ? (journal.entries.at(-1)?.id ?? null) : journal.leafId,
 			};
 		}
 		await collectSubSessionsFromDir(path.join(dir, agentId), key, out);
