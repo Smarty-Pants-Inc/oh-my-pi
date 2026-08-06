@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
+import { interruptHint } from "@oh-my-pi/pi-coding-agent/modes/shared";
 import { initTheme, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -21,7 +22,10 @@ function defined<T>(value: T | undefined): T {
 	return value as T;
 }
 
-async function createHarness(sessionName: string): Promise<Harness> {
+async function createHarness(
+	sessionName: string,
+	companionStatusTextSink?: (statusText?: string) => void,
+): Promise<Harness> {
 	const tempDir = TempDir.createSync("@pi-working-accent-");
 	await Settings.init({ inMemory: true, cwd: tempDir.path() });
 	await initTheme(false);
@@ -43,7 +47,16 @@ async function createHarness(sessionName: string): Promise<Harness> {
 		model: undefined,
 		thinkingLevel: undefined,
 	} as unknown as AgentSession;
-	const mode = new InteractiveMode(session, "test");
+	const mode = new InteractiveMode(
+		session,
+		"test",
+		undefined,
+		undefined,
+		undefined,
+		undefined,
+		undefined,
+		companionStatusTextSink,
+	);
 	const harness = { mode, sessionManager, tempDir };
 	harnesses.push(harness);
 	return harness;
@@ -89,6 +102,20 @@ describe("InteractiveMode working-message session accent cache", () => {
 		// the animating loader out of immutable native scrollback.
 		startStableLoader(mode);
 		expect(statusContainer.getNativeScrollbackLiveRegionStart()).toBe(0);
+	});
+
+	it("publishes the canonical loader message without the keyboard hint", async () => {
+		const statuses: Array<string | undefined> = [];
+		const { mode } = await createHarness("Companion status", status => statuses.push(status));
+
+		startStableLoader(mode);
+		expect(statuses.at(-1)).toBe("Working…");
+
+		mode.setWorkingMessage(`Finding top-level files${interruptHint()}`);
+		expect(statuses.at(-1)).toBe("Finding top-level files");
+
+		mode.statusContainer.disposeChildren();
+		expect(statuses.at(-1)).toBeUndefined();
 	});
 
 	it("reuses one computed accent across loader spinner and message colorizers", async () => {

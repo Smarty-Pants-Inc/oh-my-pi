@@ -330,6 +330,30 @@ describe("Fresh OMP companion wire snapshots", () => {
 		expect(harness.registerTool).not.toHaveBeenCalled();
 	});
 
+	it("publishes canonical footer status text and clears it with the loader", async () => {
+		vi.useFakeTimers();
+		const write = vi.spyOn(process.stdout, "write").mockReturnValue(true);
+		const harness = new CompanionHarness();
+
+		await harness.start();
+		advance(1_000);
+		harness.invoke("agent_start");
+		harness.controller.setStatusText("Finding top-level files");
+		advance(50);
+		expect(parseFrame(write.mock.calls.at(-1)?.[0] as string, SECRET).envelope.snapshot).toMatchObject({
+			state: "working",
+			statusText: "Finding top-level files",
+		});
+
+		harness.controller.setStatusText("Working…");
+		advance(50);
+		expect(parseFrame(write.mock.calls.at(-1)?.[0] as string, SECRET).envelope.snapshot.statusText).toBe("Working…");
+
+		harness.controller.setStatusText(undefined);
+		advance(50);
+		expect(parseFrame(write.mock.calls.at(-1)?.[0] as string, SECRET).envelope.snapshot.statusText).toBeUndefined();
+	});
+
 	it("uses one process-wide incarnation and monotonically increasing sequence across controllers", async () => {
 		vi.useFakeTimers();
 		expect(() => createFreshOmpCompanionController(new Uint8Array(31))).toThrow(

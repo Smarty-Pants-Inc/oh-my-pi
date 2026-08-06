@@ -94,6 +94,7 @@ export interface SemanticSnapshot {
 	sessionName?: string;
 	cwd: string;
 	state: CompanionStateName;
+	statusText?: string;
 	model?: {
 		provider: string;
 		id: string;
@@ -352,6 +353,7 @@ function semanticFromWire(snapshot: WireSnapshot): SemanticSnapshot {
 		...(snapshot.sessionName === undefined ? {} : { sessionName: snapshot.sessionName }),
 		cwd: snapshot.cwd,
 		state: snapshot.state,
+		...(snapshot.statusText === undefined ? {} : { statusText: snapshot.statusText }),
 		...(snapshot.model === undefined ? {} : { model: snapshot.model }),
 		...(snapshot.thinkingLevel === undefined ? {} : { thinkingLevel: snapshot.thinkingLevel }),
 		runningTools: snapshot.runningTools,
@@ -415,6 +417,10 @@ function reduceSnapshotToBody(snapshot: WireSnapshot): { json: string; semantic:
 	json = envelopeJson(snapshot);
 	if (measure()) return { json, semantic: JSON.stringify(semanticFromWire(snapshot)) };
 
+	delete snapshot.statusText;
+	json = envelopeJson(snapshot);
+	if (measure()) return { json, semantic: JSON.stringify(semanticFromWire(snapshot)) };
+
 	snapshot.cwd = truncateUtf8(snapshot.cwd, 1_024);
 	json = envelopeJson(snapshot);
 	if (measure()) return { json, semantic: JSON.stringify(semanticFromWire(snapshot)) };
@@ -438,6 +444,7 @@ function wireSnapshot(semantic: SemanticSnapshot, sequence: number, timestampMs:
 		...(semantic.sessionName === undefined ? {} : { sessionName: semantic.sessionName }),
 		cwd: semantic.cwd,
 		state: semantic.state,
+		...(semantic.statusText === undefined ? {} : { statusText: semantic.statusText }),
 		...(semantic.model === undefined ? {} : { model: semantic.model }),
 		...(semantic.thinkingLevel === undefined ? {} : { thinkingLevel: semantic.thinkingLevel }),
 		runningTools: semantic.runningTools,
