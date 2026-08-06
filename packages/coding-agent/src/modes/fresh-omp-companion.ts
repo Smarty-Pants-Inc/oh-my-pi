@@ -56,6 +56,7 @@ export interface FreshOmpCompanionController {
 	): void | Promise<void>;
 	afterDispatch(event: ExtensionEvent, ctx: ExtensionContext): void | Promise<void>;
 	setHostTerminalInput(register: (handler: TerminalInputHandler) => () => void): void;
+	setStatusText(statusText?: string): void;
 }
 
 type ManagedTimerRef = {
@@ -88,6 +89,7 @@ interface CompanionRuntime {
 	retryActive: boolean;
 	compacting: boolean;
 	lastSettledFailed: boolean;
+	statusText?: string;
 	toolOrder: number;
 	runningTools: Map<string, ToolSummary>;
 	pendingApprovals: Set<string>;
@@ -257,6 +259,7 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 		state.retryActive = false;
 		state.compacting = false;
 		state.lastSettledFailed = false;
+		state.statusText = undefined;
 		state.toolOrder = 0;
 		state.runningTools.clear();
 		state.pendingApprovals.clear();
@@ -309,6 +312,7 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 		}
 		const currentToolName = normalizeString(currentTool?.name, 80, 320);
 		const currentToolIntent = normalizeString(currentTool?.intent, 160, 640);
+		const statusText = normalizeString(state.statusText, 240, 960);
 		const goalObjective = normalizeString(state.goal?.objective, 240, 960);
 		const todoCurrent = normalizeString(state.todos?.current, 240, 960);
 		const usage = ctx.getContextUsage();
@@ -337,6 +341,7 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 			...(sessionName === undefined ? {} : { sessionName }),
 			cwd,
 			state: derivedState(ctx),
+			...(statusText === undefined ? {} : { statusText }),
 			...(modelProvider === undefined || modelId === undefined
 				? {}
 				: { model: { provider: modelProvider, id: modelId } }),
@@ -859,6 +864,7 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 				state.quiesced = true;
 				clearAllScheduling();
 				state.pendingLifecycle = undefined;
+				state.statusText = undefined;
 				const snapshot = buildSemanticSnapshot(ctx);
 				if (snapshot) writeSnapshot(ctx, state.generation, snapshot, true, false);
 				state.disabled = true;
@@ -992,6 +998,11 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 		setHostTerminalInput(register): void {
 			registerHostTerminalInput = register;
 			if (inputContext && !state.shutdown) installInput(inputContext);
+		},
+		setStatusText(statusText): void {
+			if (state.disabled || state.shutdown) return;
+			state.statusText = normalizeString(statusText, 240, 960);
+			if (inputContext) scheduleChangedSnapshot(inputContext);
 		},
 	};
 }

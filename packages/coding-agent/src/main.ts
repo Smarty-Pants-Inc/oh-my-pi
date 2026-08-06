@@ -469,6 +469,7 @@ async function runInteractiveMode(
 	initialMessage?: string,
 	initialImages?: ImageContent[],
 	joinLink?: string,
+	companionStatusTextSink?: (statusText?: string) => void,
 ): Promise<void> {
 	const mode = new InteractiveMode(
 		session,
@@ -478,6 +479,7 @@ async function runInteractiveMode(
 		lspServers,
 		mcpManager,
 		eventBus,
+		companionStatusTextSink,
 	);
 
 	// Cold-launch gate: the full setup wizard (every scene + the overlay and
@@ -1795,6 +1797,7 @@ export async function runRootCommand(
 				initialMessage,
 				initialImages,
 				parsedArgs.join,
+				companionController?.setStatusText,
 			);
 		} else {
 			// Branch-only single-shot runner: keep print-mode code out of normal interactive startup.

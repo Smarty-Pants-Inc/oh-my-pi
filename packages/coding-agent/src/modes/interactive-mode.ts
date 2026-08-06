@@ -195,7 +195,7 @@ import {
 } from "./session-observer-registry";
 import { createSessionTeardown, type SessionTeardown } from "./session-teardown";
 import { runProviderSetupWizard } from "./setup-wizard/lazy";
-import { interruptHint } from "./shared";
+import { interruptHint, sanitizeStatusText } from "./shared";
 import { clearMermaidCache } from "./theme/mermaid-cache";
 import { type ShimmerPalette, shimmerEnabled, shimmerSegments, shimmerText } from "./theme/shimmer";
 import type { Theme } from "./theme/theme";
@@ -368,8 +368,36 @@ export interface InteractiveModeOptions {
  * when present, sits higher and wins (topmost-seam merge in TUI.render).
  */
 class AnchoredLiveContainer extends Container implements NativeScrollbackLiveRegion {
+	constructor(private readonly onChildrenChanged?: () => void) {
+		super();
+	}
+
+	override addChild(component: Component): void {
+		super.addChild(component);
+		this.#notifyChildrenChanged();
+	}
+
+	override removeChild(component: Component): void {
+		const previousLength = this.children.length;
+		super.removeChild(component);
+		if (this.children.length !== previousLength) this.#notifyChildrenChanged();
+	}
+
+	override clear(): void {
+		super.clear();
+		this.#notifyChildrenChanged();
+	}
+
 	getNativeScrollbackLiveRegionStart(): number | undefined {
 		return this.children.length > 0 ? 0 : undefined;
+	}
+
+	#notifyChildrenChanged(): void {
+		try {
+			this.onChildrenChanged?.();
+		} catch {
+			// Status observers are auxiliary and must never break TUI ownership.
+		}
 	}
 }
 
@@ -658,6 +686,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	#resizeHandler?: () => void;
 	#observerRegistry: SessionObserverRegistry;
 	#eventBus?: EventBus;
+	#companionStatusTextSink?: (statusText?: string) => void;
 	#eventBusUnsubscribers: Array<() => void> = [];
 	#observerUiSyncTimer?: NodeJS.Timeout;
 	#observerUiSyncNeedsTodoReconcile = false;
@@ -678,6 +707,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		lspServers: LspStartupServerInfo[] | undefined = undefined,
 		mcpManager?: MCPManager,
 		eventBus?: EventBus,
+		companionStatusTextSink?: (statusText?: string) => void,
 	) {
 		this.session = session;
 		this.sessionManager = session.sessionManager;
@@ -693,6 +723,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			new MCPCommandController(this).handleMCPAuthChallenge(serverName, challenge),
 		);
 		this.#eventBus = eventBus;
+		this.#companionStatusTextSink = companionStatusTextSink;
 		if (eventBus) {
 			this.#eventBusUnsubscribers.push(
 				eventBus.on(LSP_STARTUP_EVENT_CHANNEL, data => {
@@ -722,7 +753,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		setTerminalTextSizing(settings.get("tui.textSizing") && TERMINAL.textSizing);
 		this.chatContainer = new TranscriptContainer();
 		this.pendingMessagesContainer = new AnchoredLiveContainer();
-		this.statusContainer = new AnchoredLiveContainer();
+		this.statusContainer = new AnchoredLiveContainer(() => this.#publishCompanionStatusText());
 		this.todoContainer = new AnchoredLiveContainer();
 		this.subagentContainer = new AnchoredLiveContainer();
 		this.btwContainer = new AnchoredLiveContainer();
@@ -4303,6 +4334,31 @@ export class InteractiveMode implements InteractiveModeContext {
 		return this.#cacheWorkingMessageAccent(key, main && dim ? { main, dim } : undefined);
 	}
 
+	#publishCompanionStatusText(): void {
+		let message: string | undefined;
+		for (let index = this.statusContainer.children.length - 1; index >= 0; index--) {
+			const child = this.statusContainer.children[index];
+			if (child instanceof Loader) {
+				message = child.getMessage();
+				break;
+			}
+		}
+		if (message !== undefined) {
+			for (const suffix of [interruptHint(), " (esc to cancel)"]) {
+				if (message.endsWith(suffix)) {
+					message = message.slice(0, -suffix.length);
+					break;
+				}
+			}
+			message = sanitizeStatusText(message) || undefined;
+		}
+		try {
+			this.#companionStatusTextSink?.(message);
+		} catch {
+			// Companion transport is optional; footer rendering remains authoritative.
+		}
+	}
+
 	ensureLoadingAnimation(): void {
 		if (!this.loadingAnimation) {
 			this.#clearWorkingMessageAccentCache();
@@ -4349,12 +4405,14 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#pendingWorkingMessage = undefined;
 			if (this.loadingAnimation) {
 				this.loadingAnimation.setMessage(this.#defaultWorkingMessage);
+				this.#publishCompanionStatusText();
 			}
 			return;
 		}
 
 		if (this.loadingAnimation) {
 			this.loadingAnimation.setMessage(message);
+			this.#publishCompanionStatusText();
 			return;
 		}
 
