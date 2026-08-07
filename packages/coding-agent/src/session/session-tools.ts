@@ -47,7 +47,7 @@ export interface SessionToolsHost {
 	agentKind(): "main" | "sub";
 	isDisposed(): boolean;
 	isStreaming(): boolean;
-	queuedMessageCount(): number;
+	hasPendingMessages(): boolean;
 	planModeEnabled(): boolean;
 	model(): Model | undefined;
 	memoryBackendSession(): MemoryBackendStartOptions["session"];
@@ -1297,7 +1297,7 @@ export class SessionTools {
 			modelRegistry: this.#host.modelRegistry,
 			model: this.#host.model(),
 			isIdle: () => !this.#host.isStreaming(),
-			hasQueuedMessages: () => this.#host.queuedMessageCount() > 0,
+			hasQueuedMessages: () => this.#host.hasPendingMessages(),
 			abort: () => {
 				this.#host.agent.abort();
 			},

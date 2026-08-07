@@ -606,6 +606,7 @@ export class AgentSession {
 	#promptGeneration = 0;
 	#pendingAgentEndEmit: AgentSessionEvent | undefined;
 	#inFlightSettledCallbacks: Array<() => void | Promise<void>> = [];
+	#inFlightSettling = false;
 	#sessionStopContinuationCount = 0;
 	#sessionStopHookActive = false;
 	#obfuscator: SecretObfuscator | undefined;
@@ -677,24 +678,38 @@ export class AgentSession {
 		if (this.#promptInFlightCount !== 0) return;
 		this.yieldQueue.requestIdleFlush();
 		this.#releasePowerAssertion();
-		this.#flushPendingAgentEnd();
-		if (this.#inFlightSettledCallbacks.length === 0) {
-			this.#drainStrandedQueuedMessages();
-			return;
-		}
-		void this.#flushInFlightSettledCallbacks().finally(() => this.#drainStrandedQueuedMessages());
+		this.#scheduleInFlightSettlement();
 	}
 
-	async #flushInFlightSettledCallbacks(): Promise<void> {
-		const callbacks = this.#inFlightSettledCallbacks;
-		this.#inFlightSettledCallbacks = [];
-		for (const callback of callbacks) {
+	#scheduleInFlightSettlement(): void {
+		if (this.#promptInFlightCount !== 0 || this.#inFlightSettling) return;
+		this.#inFlightSettling = true;
+		void this.#settleInFlight().finally(() => {
+			this.#inFlightSettling = false;
+			if (this.#promptInFlightCount === 0 && this.#inFlightSettledCallbacks.length > 0) {
+				this.#scheduleInFlightSettlement();
+			}
+		});
+	}
+
+	async #settleInFlight(): Promise<void> {
+		while (this.#promptInFlightCount === 0) {
+			const callback = this.#inFlightSettledCallbacks.shift();
+			if (!callback) break;
 			try {
 				await callback();
 			} catch (error) {
 				logger.warn("In-flight settle callback failed", { error: String(error) });
 			}
 		}
+		if (this.#promptInFlightCount !== 0) return;
+		this.#flushPendingAgentEnd();
+		this.#drainStrandedQueuedMessages();
+	}
+
+	#enqueueInFlightSettledCallback(callback: () => void | Promise<void>): void {
+		this.#inFlightSettledCallbacks.push(callback);
+		this.#scheduleInFlightSettlement();
 	}
 
 	/** A steer/follow-up can land after the agent loop's final queue poll, or
@@ -863,12 +878,7 @@ export class AgentSession {
 		this.#promptInFlightCount = 0;
 		this.yieldQueue.requestIdleFlush();
 		this.#releasePowerAssertion();
-		this.#flushPendingAgentEnd();
-		if (this.#inFlightSettledCallbacks.length === 0) {
-			this.#drainStrandedQueuedMessages();
-			return;
-		}
-		void this.#flushInFlightSettledCallbacks().finally(() => this.#drainStrandedQueuedMessages());
+		this.#scheduleInFlightSettlement();
 	}
 
 	#flushPendingAgentEnd(): void {
@@ -1220,7 +1230,7 @@ export class AgentSession {
 			agentKind: () => this.#agentKind,
 			isDisposed: () => this.#isDisposed,
 			isStreaming: () => this.isStreaming,
-			queuedMessageCount: () => this.queuedMessageCount,
+			hasPendingMessages: () => this.hasPendingMessages(),
 			planModeEnabled: () => this.#planModeState?.enabled === true,
 			model: () => this.model,
 			memoryBackendSession: () => this,
@@ -5378,6 +5388,25 @@ export class AgentSession {
 		}
 	}
 
+	#queueExtensionCommandFollowUp(text: string, generation: number): Promise<void> {
+		return new Promise((resolve, reject) => {
+			this.#enqueueInFlightSettledCallback(async () => {
+				if (this.#promptGeneration !== generation || this.#isDisposed) {
+					reject(new Error("Extension command follow-up was superseded before execution"));
+					return;
+				}
+				try {
+					if (!(await this.#tryExecuteExtensionCommand(text))) {
+						throw new Error("Extension command follow-up is no longer registered");
+					}
+					resolve();
+				} catch (error) {
+					reject(error);
+				}
+			});
+		});
+	}
+
 	#createCommandContext(): ExtensionCommandContext {
 		if (this.#extensionRunner) {
 			return this.#extensionRunner.createCommandContext();
@@ -5395,7 +5424,7 @@ export class AgentSession {
 			abort: () => {
 				void this.abort();
 			},
-			hasPendingMessages: () => this.queuedMessageCount > 0,
+			hasPendingMessages: () => this.hasPendingMessages(),
 			shutdown: () => {
 				// Await the idempotent dispose() before exiting so the browser
 				// reaper and other bounded teardown complete — a fire-and-forget
@@ -5909,7 +5938,8 @@ export class AgentSession {
 	 * Send a user message through the prompt flow.
 	 *
 	 * Omitted `deliverAs` starts a turn when idle and queues as a steer while streaming.
-	 * Explicit `deliverAs` queues without starting a turn in either state.
+	 * A follow-up matching a registered extension command executes locally once the current turn is idle.
+	 * Other explicit `deliverAs` messages queue without starting a turn in either state.
 	 */
 	async sendUserMessage(
 		content: string | (TextContent | ImageContent)[],
@@ -5933,6 +5963,15 @@ export class AgentSession {
 			}
 			text = textParts.join("\n");
 			if (images.length === 0) images = undefined;
+		}
+		if (options?.deliverAs === "followUp" && text.startsWith("/") && this.#extensionRunner) {
+			const spaceIndex = text.indexOf(" ");
+			const commandName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
+			if (this.#extensionRunner.getCommand(commandName)) {
+				const generation = this.#promptGeneration;
+				await this.#queueExtensionCommandFollowUp(text, generation);
+				return;
+			}
 		}
 
 		if (options?.deliverAs === "followUp") {
@@ -5978,9 +6017,12 @@ export class AgentSession {
 		return { steering, followUp };
 	}
 
-	/** Number of pending displayable messages (includes steering, follow-up, and next-turn messages).
-	 *  Reflects actual queued work (advisor cards included) — feeds hasPendingMessages()/RPC and the
-	 *  empty-submit abort gate. The user-restorable subset is surfaced by getQueuedMessages()/clearQueue(). */
+	/** True when any visible or hidden message is waiting for this session. */
+	hasPendingMessages(): boolean {
+		return this.agent.hasQueuedMessages() || this.#pendingNextTurnMessages.length > 0;
+	}
+
+	/** Number of pending displayable messages for queue UI and RPC state. */
 	get queuedMessageCount(): number {
 		return (
 			this.agent.peekSteeringQueue().filter(isDisplayableQueuedMessage).length +
@@ -8243,7 +8285,7 @@ export class AgentSession {
 			modelRegistry: this.#modelRegistry,
 			model: this.model,
 			isIdle: () => !this.isStreaming,
-			hasQueuedMessages: () => this.queuedMessageCount > 0,
+			hasQueuedMessages: () => this.hasPendingMessages(),
 			abort: () => {
 				this.agent.abort();
 			},

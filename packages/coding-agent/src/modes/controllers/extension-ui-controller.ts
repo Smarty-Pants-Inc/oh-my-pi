@@ -186,7 +186,7 @@ export class ExtensionUiController {
 			getModel: () => this.ctx.session.model,
 			isIdle: () => !this.ctx.session.isStreaming,
 			abort: () => this.ctx.session.abort({ reason: USER_INTERRUPT_LABEL }),
-			hasPendingMessages: () => this.ctx.session.queuedMessageCount > 0,
+			hasPendingMessages: () => this.ctx.session.hasPendingMessages(),
 			shutdown: () => {
 				// Defer the actual teardown to the main loop, which calls
 				// `checkShutdownRequested()` at idle boundaries so any queued
@@ -419,7 +419,7 @@ export class ExtensionUiController {
 			getModel: () => this.ctx.session.model,
 			isIdle: () => !this.ctx.session.isStreaming,
 			abort: () => this.ctx.session.abort({ reason: USER_INTERRUPT_LABEL }),
-			hasPendingMessages: () => this.ctx.session.queuedMessageCount > 0,
+			hasPendingMessages: () => this.ctx.session.hasPendingMessages(),
 			shutdown: () => {
 				// Defer the actual teardown to the main loop, which calls
 				// `checkShutdownRequested()` at idle boundaries so any queued

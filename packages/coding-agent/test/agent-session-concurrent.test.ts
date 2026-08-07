@@ -179,6 +179,31 @@ describe("AgentSession concurrent prompt guard", () => {
 		await firstPrompt.catch(() => {});
 	});
 
+	it("reports hidden queued messages as pending without exposing them in the visible count", async () => {
+		await createSession();
+
+		const firstPrompt = session.prompt("First message");
+		await waitFor(() => session.isStreaming);
+		await session.sendCustomMessage(
+			{
+				customType: "hidden-follow-up",
+				content: "Hidden follow-up",
+				display: false,
+				attribution: "agent",
+			},
+			{ deliverAs: "followUp" },
+		);
+
+		expect(session.queuedMessageCount).toBe(0);
+		expect(session.hasPendingMessages()).toBe(true);
+		expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+
+		session.agent.clearAllQueues();
+		expect(session.hasPendingMessages()).toBe(false);
+		await session.abort();
+		await firstPrompt.catch(() => {});
+	});
+
 	it("queues sendUserMessage as steer while streaming without AgentBusyError", async () => {
 		await createSession();
 
@@ -257,6 +282,83 @@ describe("AgentSession concurrent prompt guard", () => {
 			await session.abort();
 			await turn;
 		}
+	});
+
+	it("serializes extension command follow-ups after the active turn fully settles", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const streamStarted = Promise.withResolvers<void>();
+		const finishStream = Promise.withResolvers<void>();
+		const releaseFirstCommand = Promise.withResolvers<void>();
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: createAssistantMessage("") });
+					streamStarted.resolve();
+					void finishStream.promise.then(() => {
+						stream.push({ type: "done", reason: "stop", message: createAssistantMessage("Done") });
+					});
+				});
+				return stream;
+			},
+		});
+		const commandCalls: string[] = [];
+		const commandStreamingStates: boolean[] = [];
+		const extensionRuntime = new ExtensionRuntime();
+		const extension = await loadExtensionFromFactory(
+			pi => {
+				pi.registerCommand("after-turn", {
+					handler: async args => {
+						commandCalls.push(args);
+						commandStreamingStates.push(session.isStreaming);
+						if (args === "first") await releaseFirstCommand.promise;
+					},
+				});
+			},
+			tempDir,
+			new EventBus(),
+			extensionRuntime,
+			"follow-up-command",
+		);
+		const sessionManager = SessionManager.inMemory();
+		const settings = Settings.isolated();
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"));
+		authStorages.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const extensionRunner = new ExtensionRunner(
+			[extension],
+			extensionRuntime,
+			tempDir,
+			sessionManager,
+			modelRegistry,
+		);
+		session = new AgentSession({ agent, sessionManager, settings, modelRegistry, extensionRunner });
+
+		const firstPrompt = session.prompt("First message");
+		await streamStarted.promise;
+		const firstCommand = session.sendUserMessage("/after-turn first", { deliverAs: "followUp" });
+		const secondCommand = session.sendUserMessage("/after-turn second", { deliverAs: "followUp" });
+
+		await scheduler.yield();
+		expect(commandCalls).toEqual([]);
+		finishStream.resolve();
+		await firstPrompt;
+		await waitFor(() => commandCalls.length > 0);
+		try {
+			expect(commandCalls).toEqual(["first"]);
+			expect(commandStreamingStates).toEqual([false]);
+		} finally {
+			releaseFirstCommand.resolve();
+		}
+		await Promise.all([firstCommand, secondCommand]);
+
+		expect(commandCalls).toEqual(["first", "second"]);
+		expect(commandStreamingStates).toEqual([false, false]);
+		expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+		expect(JSON.stringify(sessionManager.getEntries())).not.toContain("/after-turn");
 	});
 
 	it("delivers hidden nextTurn stop reactions through the next LLM call without exposing them in the visible queue", async () => {
