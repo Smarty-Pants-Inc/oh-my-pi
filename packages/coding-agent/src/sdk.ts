@@ -2595,7 +2595,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			modelRegistry,
 			model: agent.state.model,
 			isIdle: () => !session.isStreaming,
-			hasQueuedMessages: () => session.queuedMessageCount > 0,
+			hasQueuedMessages: () => session.hasPendingMessages(),
 			abort: () => {
 				session.abort({ reason: USER_INTERRUPT_LABEL });
 			},
