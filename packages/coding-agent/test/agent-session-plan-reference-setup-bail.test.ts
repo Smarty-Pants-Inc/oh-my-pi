@@ -34,6 +34,7 @@ import { AuthStorage } from "../src/session/auth-storage";
 import { convertToLlm, USER_INTERRUPT_LABEL } from "../src/session/messages";
 import { SessionManager } from "../src/session/session-manager";
 import * as fileMentions from "../src/utils/file-mentions";
+import { createTestRuntimeDependencies } from "./utilities";
 
 type ObservedPromptCall = { messageTexts: string[] };
 
@@ -132,7 +133,13 @@ describe("AgentSession plan-reference delivery tracking (issue #4094)", () => {
 			},
 		});
 
-		session = new AgentSession({ agent, sessionManager, settings, modelRegistry });
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings,
+			...createTestRuntimeDependencies(modelRegistry),
+			modelRegistry,
+		});
 
 		cleanups.push(async () => {
 			await session.dispose();

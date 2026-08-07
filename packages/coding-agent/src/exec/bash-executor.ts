@@ -7,7 +7,16 @@ import { ExponentialYield } from "@oh-my-pi/pi-agent-core/utils/yield";
 import { type MinimizerOptions, Shell, type ShellRunResult } from "@oh-my-pi/pi-natives";
 import { isCmdShell, isExecutable, type ShellConfig } from "@oh-my-pi/pi-utils/procmgr";
 import { Settings, type ShellMinimizerSettings } from "../config/settings";
+import type { CommandId } from "../registry/persistent-agent-contracts";
 import { OutputSink } from "../session/streaming-output";
+import {
+	canonicalRuntimeSha256,
+	deriveProviderSubrequestId,
+	type PersistentModelWorkspacePath,
+	type RuntimeAccessContext,
+	type RuntimeCommandSnapshot,
+	type WorkspaceOperationLease,
+} from "../session/workspace-runtime-contracts";
 import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../tools/output-meta";
 import { getOrCreateSnapshot } from "../utils/shell-snapshot";
 import { loadDirenvEnv } from "./direnv";
@@ -55,6 +64,157 @@ export interface BashResult {
 	outputBytes: number;
 	artifactId?: string;
 	workingDir?: string;
+}
+
+const PERSISTENT_BASH_OUTPUT_BYTE_LIMIT = 4_194_304;
+
+export interface PersistentBashExecutionOptions {
+	readonly lease: WorkspaceOperationLease;
+	readonly command: string;
+	readonly cwd: PersistentModelWorkspacePath;
+	readonly timeoutSeconds: number;
+	readonly signal?: AbortSignal;
+}
+
+export async function derivePersistentBashCommandId(lease: WorkspaceOperationLease): Promise<CommandId> {
+	return canonicalRuntimeSha256(["omp-persistent-bash-command-id-v1", lease.operationLeaseId]);
+}
+
+function persistentBashAccess(lease: WorkspaceOperationLease): RuntimeAccessContext {
+	return {
+		operationLeaseId: lease.operationLeaseId,
+		workspaceId: lease.binding.lease.replica.workspaceId,
+		expectedGeneration: lease.binding.lease.baseGeneration,
+		replicaId: lease.binding.lease.replica.replicaId,
+		leaseId: lease.binding.lease.leaseId,
+		fence: lease.binding.fence,
+	};
+}
+
+async function persistentBashMutation(
+	lease: WorkspaceOperationLease,
+	access: RuntimeAccessContext,
+	ordinal: number,
+	operation: "command_cancel" | "command_dispose",
+	commandId: CommandId,
+): Promise<{ readonly requestId: string; readonly requestSha256: string }> {
+	const requestId = await deriveProviderSubrequestId({
+		workspaceId: access.workspaceId,
+		parentKind: "workspace_operation",
+		parentId: lease.operationLeaseId,
+		ordinal,
+		operation,
+	});
+	const requestSha256 = await canonicalRuntimeSha256([
+		"omp-runtime-request-v1",
+		operation,
+		lease.operationLeaseId,
+		access.workspaceId,
+		access.expectedGeneration,
+		access.replicaId,
+		access.leaseId,
+		access.fence.fenceId,
+		commandId,
+		...(operation === "command_cancel" ? ["SIGTERM"] : []),
+	]);
+	return { requestId, requestSha256 };
+}
+
+function persistentBashResult(snapshot: RuntimeCommandSnapshot): BashResult {
+	const output = snapshot.output;
+	const outputLines = output.length === 0 ? 0 : output.split("\n").length;
+	const outputBytes = Buffer.byteLength(output, "utf8");
+	return {
+		output,
+		exitCode: snapshot.exitCode ?? undefined,
+		cancelled: snapshot.status === "cancelled",
+		truncated: snapshot.truncated,
+		totalLines: outputLines,
+		totalBytes: outputBytes,
+		outputLines,
+		outputBytes,
+	};
+}
+
+export async function executePersistentBash(options: PersistentBashExecutionOptions): Promise<BashResult> {
+	const { lease, command, cwd, timeoutSeconds, signal } = options;
+	try {
+		const access = persistentBashAccess(lease);
+		const commandId = await derivePersistentBashCommandId(lease);
+		const commandSpec = {
+			shell: "/bin/bash" as const,
+			source: command,
+			cwd,
+			environment: "omp-runtime-scrubbed-v1" as const,
+			timeoutMs: timeoutSeconds * 1_000,
+			outputByteLimit: PERSISTENT_BASH_OUTPUT_BYTE_LIMIT,
+			pty: false as const,
+		};
+		const requestSha256 = await canonicalRuntimeSha256([
+			"omp-runtime-request-v1",
+			"command_submit",
+			lease.operationLeaseId,
+			access.workspaceId,
+			access.expectedGeneration,
+			access.replicaId,
+			access.leaseId,
+			access.fence.fenceId,
+			commandSpec.shell,
+			commandSpec.source,
+			commandSpec.cwd,
+			commandSpec.environment,
+			commandSpec.timeoutMs,
+			commandSpec.outputByteLimit,
+			commandSpec.pty,
+		]);
+		let snapshot = await lease.binding.bridge.submitCommand({
+			...access,
+			commandId,
+			requestSha256,
+			command: commandSpec,
+		});
+		if (snapshot.status === "reserved" || snapshot.status === "start_unknown") {
+			const inspected = await lease.binding.bridge.inspectCommand({ ...access, commandId });
+			if (inspected.status === "absent")
+				throw new Error("Persistent bash command was not admitted by the provider.");
+			snapshot = inspected.snapshot;
+		}
+		if (snapshot.status === "reserved") throw new Error("Persistent bash command did not start.");
+		if (snapshot.status === "start_unknown") throw new Error("Persistent bash command start is indeterminate.");
+
+		let cancellationRequested = false;
+		while (snapshot.status === "running") {
+			if (signal?.aborted && !cancellationRequested) {
+				const mutation = await persistentBashMutation(lease, access, 0, "command_cancel", commandId);
+				snapshot = await lease.binding.bridge.cancelCommand({
+					...access,
+					...mutation,
+					commandId,
+					signal: "SIGTERM",
+				});
+				cancellationRequested = true;
+				continue;
+			}
+			const pause = Promise.withResolvers<void>();
+			const timer = setTimeout(pause.resolve, 25);
+			try {
+				await pause.promise;
+			} finally {
+				clearTimeout(timer);
+			}
+			const inspected = await lease.binding.bridge.inspectCommand({ ...access, commandId });
+			if (inspected.status === "absent") throw new Error("Persistent bash command disappeared before completion.");
+			snapshot = inspected.snapshot;
+		}
+		if (snapshot.status === "reserved") throw new Error("Persistent bash command did not start.");
+		if (snapshot.status === "start_unknown") throw new Error("Persistent bash command start is indeterminate.");
+		const mutation = await persistentBashMutation(lease, access, 1, "command_dispose", commandId);
+		await lease.binding.bridge.disposeCommand({ ...access, ...mutation, commandId });
+		if (snapshot.sync !== "complete") throw new Error("Persistent bash command synchronization is incomplete.");
+		return persistentBashResult(snapshot);
+	} finally {
+		lease.end();
+	}
 }
 
 /** POSIX-safe variable name — gates which direnv unsets we inject into the

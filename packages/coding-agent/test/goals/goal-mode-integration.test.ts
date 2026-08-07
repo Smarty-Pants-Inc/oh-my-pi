@@ -14,6 +14,7 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { createTools, type Tool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import type { TodoPhase } from "@oh-my-pi/pi-coding-agent/tools/todo";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "../utilities";
 
 function createToolSession(cwd: string, settings: Settings, overrides: Partial<ToolSession> = {}): ToolSession {
 	return {
@@ -87,6 +88,7 @@ async function createGoalHarness(shared: SharedFixture): Promise<GoalHarness> {
 		sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
 		settings,
 		modelRegistry,
+		...createTestRuntimeDependencies(modelRegistry),
 		toolRegistry,
 		rebuildSystemPrompt: async () => ({ systemPrompt: ["Test"] }),
 	});

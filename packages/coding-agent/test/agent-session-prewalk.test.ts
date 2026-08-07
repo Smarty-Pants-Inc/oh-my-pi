@@ -12,6 +12,7 @@ import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { AUTO_THINKING } from "@oh-my-pi/pi-coding-agent/thinking";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 /**
  * Prewalk: one-way switch from the starting model to a fast/cheap target
@@ -154,6 +155,7 @@ describe("AgentSession prewalk", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 			toolRegistry,
 			prewalk: { target },
@@ -216,6 +218,7 @@ describe("AgentSession prewalk", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 			toolRegistry,
 			prewalk: { target },
@@ -272,6 +275,7 @@ describe("AgentSession prewalk", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 			toolRegistry: new Map([...toolRegistry, ["todo", failingTodoTool as AgentTool]]),
 			prewalk: { target },
@@ -321,6 +325,7 @@ describe("AgentSession prewalk", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 			toolRegistry: new Map([
 				[recordTool.name, recordTool as AgentTool],
@@ -382,6 +387,7 @@ describe("AgentSession prewalk", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 			toolRegistry,
 			prewalk: { target },
@@ -451,6 +457,7 @@ describe("AgentSession prewalk", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 			toolRegistry: new Map([
 				[recordTool.name, recordTool as AgentTool],
@@ -511,6 +518,7 @@ describe("AgentSession prewalk", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 			toolRegistry: new Map([
 				[recordTool.name, recordTool as AgentTool],
@@ -571,6 +579,7 @@ describe("AgentSession prewalk", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 			toolRegistry,
 			prewalk: { target },
@@ -624,6 +633,7 @@ describe("AgentSession prewalk", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 			toolRegistry,
 			prewalk: { target },
@@ -667,6 +677,7 @@ describe("AgentSession prewalk", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 			toolRegistry: new Map([[writeTool.name, writeTool as AgentTool]]),
 		});
@@ -720,6 +731,7 @@ describe("AgentSession prewalk", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 			toolRegistry,
 			thinkingLevel: Effort.Medium,
@@ -768,6 +780,7 @@ describe("AgentSession prewalk", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 			toolRegistry,
 			thinkingLevel: Effort.Medium,
@@ -820,6 +833,7 @@ describe("AgentSession prewalk", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 			toolRegistry,
 			thinkingLevel: Effort.High,
@@ -869,6 +883,7 @@ describe("AgentSession prewalk", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 			toolRegistry,
 			thinkingLevel: AUTO_THINKING,

@@ -21,7 +21,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { createTools, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
-import { assistantMsg, createTestSession, e2eApiKey } from "./utilities";
+import { assistantMsg, createTestRuntimeDependencies, createTestSession, e2eApiKey } from "./utilities";
 
 describe.skipIf(!e2eApiKey("ANTHROPIC_API_KEY"))("AgentSession branching", () => {
 	let session: AgentSession;
@@ -76,6 +76,7 @@ describe.skipIf(!e2eApiKey("ANTHROPIC_API_KEY"))("AgentSession branching", () =>
 			sessionManager,
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 
 		// Must subscribe to enable session persistence

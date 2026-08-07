@@ -1,5 +1,12 @@
 import { hasExactObjectKeys, MAX_HTTP_BODY_BYTES } from "../boundary-policy";
-import { type CloudOmpWireErrorCode, isCloudOmpWireErrorCode, type WireErrorResponse } from "../protocol";
+import {
+	CLOUDFLARE_RUNTIME_PROTOCOL_ERROR_CODES_V1,
+	type CloudflareRuntimeProtocolErrorCodeV1,
+	CloudflareRuntimeProtocolErrorV1,
+	type CloudOmpWireErrorCode,
+	isCloudOmpWireErrorCode,
+	type WireErrorResponse,
+} from "../protocol";
 
 export type CloudOmpBearerRole = "ordinary" | "admin";
 export type CloudOmpHttpMethod = "GET" | "POST" | "PUT" | "DELETE";
@@ -15,6 +22,8 @@ export interface CloudOmpJsonRequest {
 	method: CloudOmpHttpMethod;
 	path: string;
 	body?: unknown;
+	/** Prevalidated JSON bytes; sent without parse/stringify reconstruction. */
+	bodyJson?: string;
 	signal?: AbortSignal;
 }
 export const CLOUD_OMP_PROTOCOL_ERROR_CODES = Object.freeze({
@@ -155,14 +164,19 @@ export class CloudOmpJsonClient {
 		url.pathname = `${this.#endpoint.pathname}${request.path}`.replace(/\/{2,}/g, "/");
 
 		let body: Uint8Array | undefined;
-		if (request.body !== undefined) {
+		if (request.body !== undefined && request.bodyJson !== undefined) {
+			throw new CloudOmpProtocolError("INVALID_REQUEST_BODY");
+		}
+		if (request.body !== undefined || request.bodyJson !== undefined) {
 			let encoded: string | undefined;
 			try {
-				encoded = JSON.stringify(request.body);
+				encoded = request.bodyJson ?? JSON.stringify(request.body);
+				if (encoded === undefined || (request.bodyJson !== undefined && JSON.parse(encoded) === undefined)) {
+					throw new Error();
+				}
 			} catch {
 				throw new CloudOmpProtocolError("INVALID_REQUEST_BODY");
 			}
-			if (encoded === undefined) throw new CloudOmpProtocolError("INVALID_REQUEST_BODY");
 			body = new TextEncoder().encode(encoded);
 			if (body.byteLength > this.#maxBodyBytes) {
 				throw new CloudOmpProtocolError("REQUEST_BODY_TOO_LARGE");
@@ -194,6 +208,10 @@ export class CloudOmpJsonClient {
 
 		const responseBody = await readBoundedBody(response, this.#maxBodyBytes);
 		if (!response.ok) {
+			if (request.path.startsWith("/v1/runtime/")) {
+				const runtimeError = tryParseRuntimeError(responseBody);
+				if (runtimeError) throw new CloudflareRuntimeProtocolErrorV1(runtimeError.error.code);
+			}
 			const wireError = tryParseWireError(responseBody);
 			throw new CloudOmpHttpError(response.status, wireError?.error.code);
 		}
@@ -290,4 +308,32 @@ function tryParseWireError(bytes: Uint8Array): WireErrorResponse | undefined {
 	if (!hasExactObjectKeys(value, ["error"]) || !hasExactObjectKeys(value.error, ["code", "message"])) return undefined;
 	if (typeof value.error.message !== "string" || !isCloudOmpWireErrorCode(value.error.code)) return undefined;
 	return { error: { code: value.error.code, message: value.error.message } };
+}
+
+interface CloudflareRuntimeWireError {
+	readonly error: {
+		readonly code: CloudflareRuntimeProtocolErrorCodeV1;
+		readonly message: string;
+	};
+}
+
+function tryParseRuntimeError(bytes: Uint8Array): CloudflareRuntimeWireError | undefined {
+	if (bytes.byteLength === 0) return undefined;
+	let value: unknown;
+	try {
+		value = parseJson(bytes);
+	} catch {
+		return undefined;
+	}
+	if (!hasExactObjectKeys(value, ["error"]) || !hasExactObjectKeys(value.error, ["code", "message"])) {
+		return undefined;
+	}
+	if (
+		typeof value.error.code !== "string" ||
+		!Object.hasOwn(CLOUDFLARE_RUNTIME_PROTOCOL_ERROR_CODES_V1, value.error.code) ||
+		typeof value.error.message !== "string"
+	) {
+		return undefined;
+	}
+	return value as unknown as CloudflareRuntimeWireError;
 }

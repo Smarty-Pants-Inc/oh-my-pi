@@ -9,6 +9,20 @@
  * destructive operations behind user permission prompts.
  */
 
+import type { ExecutionEnvironmentProvider } from "./execution-environment";
+
+interface ClaimedTransientTaskExecutionEnvironmentRuntimeV1 {
+	readonly executionEnvironmentProvider: ExecutionEnvironmentProvider;
+}
+
+/** Resolve execution authority only from the exact already-claimed transient runtime. */
+export function resolveClaimedTransientTaskExecutionEnvironmentProviderV1(
+	_session: unknown,
+	claimedTransientTaskRuntime: ClaimedTransientTaskExecutionEnvironmentRuntimeV1 | null,
+): ExecutionEnvironmentProvider | undefined {
+	return claimedTransientTaskRuntime?.executionEnvironmentProvider;
+}
+
 export interface ClientBridgeCapabilities {
 	/** Client implements `fs/read_text_file`. */
 	readTextFile?: boolean;

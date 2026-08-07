@@ -9,6 +9,7 @@ import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir, withTimeout } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 /**
  * Regression coverage for issue #2590: `#checkTodoCompletion` used to schedule
@@ -134,6 +135,7 @@ describe("AgentSession todo reminder self-continuation suppression", () => {
 				"todo.remindersMax": 3,
 			}),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 
 		reminderAttempts = [];

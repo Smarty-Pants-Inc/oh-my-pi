@@ -14,6 +14,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 /**
  * Regression: a submission arriving while the main loop has no input waiter
@@ -173,11 +174,13 @@ describe("InputController orphaned submit", () => {
 					messages: [{ role: "user", content: "stale prompt", timestamp: Date.now() }],
 				},
 			});
+			const modelRegistry = new ModelRegistry(authStorage);
 			session = new AgentSession({
 				agent,
 				sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
 				settings: Settings.isolated({}),
-				modelRegistry: new ModelRegistry(authStorage),
+				modelRegistry,
+				...createTestRuntimeDependencies(modelRegistry),
 			});
 			const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();
 			const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
@@ -300,6 +303,7 @@ describe("InputController orphaned submit", () => {
 				sessionManager,
 				settings,
 				modelRegistry,
+				...createTestRuntimeDependencies(modelRegistry),
 				extensionRunner,
 			});
 			const titleSpy = vi.spyOn(session, "generateTitle").mockResolvedValue(null);

@@ -31,6 +31,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import * as snapcompact from "@oh-my-pi/snapcompact";
+import { createTestRuntimeDependencies } from "./utilities";
 
 describe("AgentSession snapcompact frame-budget sizing", () => {
 	let tempDir: TempDir;
@@ -100,6 +101,7 @@ describe("AgentSession snapcompact frame-budget sizing", () => {
 				"compaction.keepRecentTokens": 4000,
 			}),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 	});
 
@@ -258,6 +260,7 @@ describe("AgentSession snapcompact frame-budget sizing", () => {
 				"compaction.keepRecentTokens": 4000,
 			}),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 
 		const branchEntries = sessionManager.getBranch();

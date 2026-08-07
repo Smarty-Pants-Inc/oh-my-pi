@@ -8,6 +8,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 // Regression: `#closeProviderSessionsForModelSwitch` historically only handled
 // the `openai-codex-responses` / `openai-responses` keys and left
@@ -68,6 +69,7 @@ describe("AgentSession openai-completions provider session eviction", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 	}

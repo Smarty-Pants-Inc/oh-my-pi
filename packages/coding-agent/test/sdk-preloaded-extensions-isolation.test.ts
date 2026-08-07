@@ -21,6 +21,7 @@ import type { LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibili
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { WorkspaceRuntimeProviderRegistry } from "@oh-my-pi/pi-coding-agent/session/workspace-provider-registry";
 import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
 
 describe("createAgentSession preloadedExtensions isolation (issue #2190)", () => {
@@ -46,6 +47,7 @@ describe("createAgentSession preloadedExtensions isolation (issue #2190)", () =>
 			runtime: {
 				flagValues: new Map(),
 				pendingProviderRegistrations: [],
+				runtimeProviderRegistry: new WorkspaceRuntimeProviderRegistry(),
 				// Cast: only the fields we touch matter; the SDK happily accepts a
 				// minimal runtime when no extension hooks fire.
 			} as unknown as LoadExtensionsResult["runtime"],

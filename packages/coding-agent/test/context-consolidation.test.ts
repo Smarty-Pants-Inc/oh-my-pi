@@ -13,6 +13,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 describe("Context usage consolidation", () => {
 	let sharedDir: TempDir;
@@ -89,6 +90,7 @@ describe("Context usage consolidation", () => {
 				"compaction.thresholdTokens": 8000,
 			}),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 
 		const sessionContext = session.buildDisplaySessionContext();

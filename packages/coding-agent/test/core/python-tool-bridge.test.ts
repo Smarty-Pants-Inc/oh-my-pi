@@ -59,11 +59,15 @@ describe("Python tool bridge HTTP server", () => {
 		});
 		const session = makeSession(new Map([["read", readTool]]));
 		const info = await ensurePyToolBridge();
-		const unregister = registerPyToolBridge("test-session-1", "run-1", { toolSession: session });
+		const registration = registerPyToolBridge("test-session-1", "run-1", {
+			toolSession: session,
+			bridgeCallKeyPrefix: "py",
+		});
 		try {
 			const res = await call(info, {
 				session: "test-session-1",
 				run: "run-1",
+				call: 0,
 				name: "read",
 				args: { path: "foo.ts", [INTENT_FIELD]: "py prelude" },
 			});
@@ -74,13 +78,14 @@ describe("Python tool bridge HTTP server", () => {
 			// `i` survives the bridge round trip so transcript renderers have a label.
 			expect((calls[0]!.args as Record<string, unknown>)[INTENT_FIELD]).toBe("py prelude");
 		} finally {
-			unregister();
+			await registration.drain();
+			registration.unregister();
 		}
 	});
 
 	it("returns ok=false when no session is registered for the given id", async () => {
 		const info = await ensurePyToolBridge();
-		const res = await call(info, { session: "missing", run: "run-missing", name: "read", args: {} });
+		const res = await call(info, { session: "missing", run: "run-missing", call: 0, name: "read", args: {} });
 		expect(res.status).toBe(200);
 		const body = (await res.json()) as { ok: boolean; error?: string };
 		expect(body.ok).toBe(false);
@@ -101,14 +106,18 @@ describe("Python tool bridge HTTP server", () => {
 				}) as unknown as AgentTool,
 		} as unknown as ToolSession;
 		const info = await ensurePyToolBridge();
-		const unregister = registerPyToolBridge("err-session", "run-err", { toolSession: session });
+		const registration = registerPyToolBridge("err-session", "run-err", {
+			toolSession: session,
+			bridgeCallKeyPrefix: "py",
+		});
 		try {
-			const res = await call(info, { session: "err-session", run: "run-err", name: "boom", args: {} });
+			const res = await call(info, { session: "err-session", run: "run-err", call: 0, name: "boom", args: {} });
 			expect(res.status).toBe(200);
 			const body = await res.json();
 			expect(body).toEqual({ ok: false, error: "kapow" });
 		} finally {
-			unregister();
+			await registration.drain();
+			registration.unregister();
 		}
 	});
 
@@ -116,7 +125,7 @@ describe("Python tool bridge HTTP server", () => {
 		const info = await ensurePyToolBridge();
 		const res = await call(
 			info,
-			{ session: "anything", run: "run-anything", name: "read", args: {} },
+			{ session: "anything", run: "run-anything", call: 0, name: "read", args: {} },
 			{ token: "wrong" },
 		);
 		expect(res.status).toBe(403);
@@ -136,14 +145,16 @@ describe("Python tool bridge HTTP server", () => {
 		const session = makeSession(new Map([["read", readTool]]));
 		const info = await ensurePyToolBridge();
 		const statusEvents: Array<{ op: string }> = [];
-		const unregister = registerPyToolBridge("status-session", "run-status", {
+		const registration = registerPyToolBridge("status-session", "run-status", {
 			toolSession: session,
+			bridgeCallKeyPrefix: "py",
 			emitStatus: event => statusEvents.push(event),
 		});
 		try {
 			const res = await call(info, {
 				session: "status-session",
 				run: "run-status",
+				call: 0,
 				name: "read",
 				args: { path: "foo.ts" },
 			});
@@ -151,7 +162,8 @@ describe("Python tool bridge HTTP server", () => {
 			expect(statusEvents).toHaveLength(1);
 			expect(statusEvents[0]!.op).toBe("read");
 		} finally {
-			unregister();
+			await registration.drain();
+			registration.unregister();
 		}
 	});
 });

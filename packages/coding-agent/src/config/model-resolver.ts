@@ -402,6 +402,19 @@ function getProviderModelIndex(availableModels: readonly Model<Api>[]): Map<stri
 	return index;
 }
 
+/**
+ * Return only an already-registered model object whose provider and ID exactly
+ * match the supplied profile reference. Persistent connections must use this
+ * rather than selector resolution, which may intentionally synthesize aliases.
+ */
+export function findExactProviderModelReference(
+	provider: string,
+	modelId: string,
+	availableModels: readonly Model<Api>[],
+): Model<Api> | undefined {
+	return availableModels.find(model => model.provider === provider && model.id === modelId);
+}
+
 export function resolveProviderModelReference(
 	provider: string,
 	modelId: string,
@@ -467,8 +480,8 @@ export interface ModelMatchPreferences {
 
 export type ModelLookupRegistry = Pick<ModelRegistry, "getAvailable">;
 type CliModelRegistry = Pick<ModelRegistry, "getAll" | "getAvailable">;
-type InitialModelRegistry = Pick<ModelRegistry, "getAvailable" | "find">;
-type RestorableModelRegistry = Pick<ModelRegistry, "getAvailable" | "find" | "getApiKey">;
+type InitialModelRegistry = Pick<ModelRegistry, "getAvailable" | "resolveSelector">;
+type RestorableModelRegistry = Pick<ModelRegistry, "getAvailable" | "resolveSelector" | "getApiKey">;
 
 interface ModelPreferenceContext {
 	modelUsageRank: Map<string, number>;
@@ -1885,7 +1898,7 @@ export async function findInitialModel(options: {
 
 	// 1. CLI args take priority
 	if (cliProvider && cliModel) {
-		const found = modelRegistry.find(cliProvider, cliModel);
+		const found = modelRegistry.resolveSelector(cliProvider, cliModel);
 		if (!found) {
 			console.error(chalk.red(`Model ${cliProvider}/${cliModel} not found`));
 			process.exit(1);
@@ -1912,7 +1925,7 @@ export async function findInitialModel(options: {
 
 	// 3. Try saved default from settings
 	if (defaultProvider && defaultModelId) {
-		const found = modelRegistry.find(defaultProvider, defaultModelId);
+		const found = modelRegistry.resolveSelector(defaultProvider, defaultModelId);
 		if (found) {
 			model = found;
 			thinkingLevel = clampThinkingLevelForModel(found, defaultThinkingSelector);
@@ -1942,7 +1955,7 @@ export async function restoreModelFromSession(
 	shouldPrintMessages: boolean,
 	modelRegistry: RestorableModelRegistry,
 ): Promise<{ model: Model<Api> | undefined; fallbackMessage: string | undefined }> {
-	const restoredModel = modelRegistry.find(savedProvider, savedModelId);
+	const restoredModel = modelRegistry.resolveSelector(savedProvider, savedModelId);
 
 	// Check if restored model exists and has a valid API key
 	const hasApiKey = restoredModel ? !!(await modelRegistry.getApiKey(restoredModel)) : false;

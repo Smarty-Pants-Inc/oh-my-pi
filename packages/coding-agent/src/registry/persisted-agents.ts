@@ -4,6 +4,9 @@ import { ADVISOR_TRANSCRIPT_FILENAME, isAdvisorTranscriptName } from "../advisor
 import { SessionManager } from "../session/session-manager";
 import { persistedVibeChildIds } from "../vibe/runtime";
 import { type AgentRegistry, MAIN_AGENT_ID } from "./agent-registry";
+import type { PersistentAgentStore } from "./persistent-agent-contracts";
+
+const AGENT_ID_PATTERN = /^[A-Za-z][A-Za-z0-9._-]{0,63}$/;
 
 /**
  * Child ids owned by the Vibe roster persisted in this session file. Vibe
@@ -28,11 +31,13 @@ async function readPersistedVibeChildIds(sessionFile: string): Promise<Set<strin
 export async function registerPersistedSubagents(
 	registry: AgentRegistry,
 	sessionFile: string | null | undefined,
+	persistentStore?: PersistentAgentStore,
 ): Promise<void> {
 	if (!sessionFile?.endsWith(".jsonl")) return;
+	const store = persistentStore ?? registry.requireProcessOwnedPersistentAgentStore();
 	const vibeOwnedIds = await readPersistedVibeChildIds(sessionFile);
 	const root = sessionFile.slice(0, -6);
-	await registerPersistedSubagentsFromDir(registry, root, undefined, vibeOwnedIds);
+	await registerPersistedSubagentsFromDir(registry, root, undefined, vibeOwnedIds, store, new Map());
 }
 
 async function registerPersistedSubagentsFromDir(
@@ -40,6 +45,8 @@ async function registerPersistedSubagentsFromDir(
 	dir: string,
 	parentId: string | undefined,
 	vibeOwnedIds: ReadonlySet<string>,
+	persistentStore: PersistentAgentStore,
+	persistentPresence: Map<string, Promise<boolean>>,
 ): Promise<void> {
 	let entries: fs.Dirent[];
 	try {
@@ -81,18 +88,54 @@ async function registerPersistedSubagentsFromDir(
 			continue;
 		}
 		const id = entry.name.slice(0, -6);
-		if (vibeOwnedIds.has(id) && registry.get(id)?.sessionFile !== sessionFile) continue;
-		if (!registry.get(id)) {
-			registry.register({
+		const existing = registry.get(id);
+		if (vibeOwnedIds.has(id) && existing?.sessionFile !== sessionFile) continue;
+		if (existing) {
+			await registerPersistedSubagentsFromDir(
+				registry,
+				path.join(dir, id),
 				id,
-				displayName: id,
-				kind: "sub",
-				parentId: parentId ?? MAIN_AGENT_ID,
-				session: null,
-				sessionFile,
-				status: "parked",
-			});
+				vibeOwnedIds,
+				persistentStore,
+				persistentPresence,
+			);
+			continue;
 		}
-		await registerPersistedSubagentsFromDir(registry, path.join(dir, id), id, vibeOwnedIds);
+		if (AGENT_ID_PATTERN.test(id)) {
+			const normalizedId = id.toLowerCase();
+			let presence = persistentPresence.get(normalizedId);
+			if (!presence) {
+				presence = persistentStore.lookup(id).then(result => result.kind !== "missing");
+				persistentPresence.set(normalizedId, presence);
+			}
+			if (await presence) {
+				await registerPersistedSubagentsFromDir(
+					registry,
+					path.join(dir, id),
+					id,
+					vibeOwnedIds,
+					persistentStore,
+					persistentPresence,
+				);
+				continue;
+			}
+		}
+		registry.register({
+			id,
+			displayName: id,
+			kind: "sub",
+			parentId: parentId ?? MAIN_AGENT_ID,
+			session: null,
+			sessionFile,
+			status: "parked",
+		});
+		await registerPersistedSubagentsFromDir(
+			registry,
+			path.join(dir, id),
+			id,
+			vibeOwnedIds,
+			persistentStore,
+			persistentPresence,
+		);
 	}
 }

@@ -8,6 +8,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { Snowflake, TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 const OLD_USER = "OLD_SESSION_USER_SENTINEL";
 const OLD_ASSISTANT = "OLD_SESSION_ASSISTANT_SENTINEL";
@@ -88,7 +89,13 @@ describe("newSession() atomic boundary vs queued hidden steer", () => {
 		authStorages.push(authStorage);
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 		const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
-		session = new AgentSession({ agent, sessionManager, settings, modelRegistry });
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings,
+			...createTestRuntimeDependencies(modelRegistry),
+			modelRegistry,
+		});
 
 		// Build an old session with recognizable user + assistant messages.
 		await session.prompt(OLD_USER);

@@ -17,6 +17,7 @@ import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { getProjectAgentDir, TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 describe("AgentSession advisor toggle", () => {
 	let sharedDir: TempDir;
@@ -68,6 +69,7 @@ describe("AgentSession advisor toggle", () => {
 			sessionManager,
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			advisorTools: [],
 		});
 	});
@@ -243,6 +245,7 @@ describe("AgentSession advisor toggle", () => {
 			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			advisorTools: [],
 		});
 
@@ -283,6 +286,7 @@ describe("AgentSession advisor toggle", () => {
 			sessionManager,
 			settings: session.settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			advisorTools: [],
 		});
 		expect(customSession.isAdvisorEnabled()).toBe(false);
@@ -328,6 +332,7 @@ describe("AgentSession advisor toggle", () => {
 			sessionManager,
 			settings: sharedSettings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			advisorTools: [],
 		});
 		const sessionB = new AgentSession({
@@ -335,6 +340,7 @@ describe("AgentSession advisor toggle", () => {
 			sessionManager,
 			settings: sharedSettings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			advisorTools: [],
 		});
 
@@ -479,6 +485,7 @@ describe("AgentSession advisor toggle", () => {
 			sessionManager: await SessionManager.open(sessionFile),
 			authStorage,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			settings,
 			model,
 			disableExtensionDiscovery: true,
@@ -693,6 +700,7 @@ describe("AgentSession advisor toggle", () => {
 			sessionManager: branchManager,
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			advisorTools: [],
 			extensionRunner,
 		});
@@ -736,6 +744,7 @@ describe("AgentSession advisor toggle", () => {
 			sessionManager: branchManager,
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			advisorTools: [],
 			extensionRunner,
 		});
@@ -779,6 +788,7 @@ describe("AgentSession advisor toggle", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			advisorTools: [],
 		});
 

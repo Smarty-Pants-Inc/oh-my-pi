@@ -1,967 +1,1533 @@
-import type { Dirent } from "node:fs";
+import { spawn } from "node:child_process";
+import { constants as fsConstants } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import * as natives from "@oh-my-pi/pi-natives";
-import { getWorktreeDir, logger, Snowflake } from "@oh-my-pi/pi-utils";
-import * as git from "../utils/git";
-import * as jj from "../utils/jj";
-import { writeIsolationOwner } from "./isolation-ownership";
-import { mapWithConcurrencyLimit } from "./parallel";
+import { getWorktreeDir } from "@oh-my-pi/pi-utils";
+import type { ISO8601, Sha256Ref } from "../registry/persistent-agent-contracts";
+import type {
+	CanonicalRuntimeValue,
+	ConfidentialTransientTaskCaptureBranchMaterializationPlanV1,
+	ConfidentialTransientTaskCaptureMaterializationStoreV1,
+	ConfidentialTransientTaskCaptureObjectImportRequestV1,
+	ConfidentialTransientTaskCaptureRefCompareAndSwapRequestV1,
+	ConfidentialTransientTaskCaptureRepositoryHandleV1,
+	ConfidentialTransientTaskCaptureRepositoryOpenRequestV1,
+	ConfidentialTransientTaskCaptureRepositoryOpenResultV1,
+	ConfidentialTransientTaskCaptureRepositoryResolverV1,
+	ConfidentialTransientTaskEnsureIsolationRequestV1,
+	ConfidentialTransientTaskEnsureIsolationResultV1,
+	ConfidentialTransientTaskGitCaptureRefCompareAndSwapInvocationV1,
+	ConfidentialTransientTaskGitCaptureRefDeleteInvocationV1,
+	ConfidentialTransientTaskGitObjectImportInvocationV1,
+	ConfidentialTransientTaskIsolationCleanupEffectV1,
+	ConfidentialTransientTaskIsolationCleanupComponentRequestV1,
+	ConfidentialTransientTaskIsolationCleanupRequestV1,
+	ConfidentialTransientTaskIsolationCreatorDescriptorV1,
+	ConfidentialTransientTaskIsolationOwnerLivenessEvidenceV1,
+	ConfidentialTransientTaskIsolationOwnerProcessIdentityProbeV1,
+	ConfidentialTransientTaskIsolationOwnershipClaimEffectAttemptV1,
+	ConfidentialTransientTaskIsolationOwnershipClaimEffectReceiptV1,
+	ConfidentialTransientTaskIsolationOwnershipClaimEffectRequestV1,
+	ConfidentialTransientTaskIsolationOwnershipClaimNotAppliedProofV1,
+	ConfidentialTransientTaskIsolationOwnershipClaimV1,
+	ConfidentialTransientTaskPostTerminalStoreV1,
+	TransientTaskCaptureMaterializationInspectResultV1,
+	TransientTaskCleanupAuthorityProofV1,
+	TransientTaskControllerAuthorityProofV1,
+	TransientTaskGitObjectFormatV1,
+	TransientTaskIsolationCleanupHandleV1,
+	TransientTaskIsolationCleanupInspectRequestV1,
+	TransientTaskIsolationCleanupResultV1,
+	TransientTaskIsolationOwnershipClaimEffectInspectRequestV1,
+	TransientTaskIsolationOwnershipClaimEffectV1,
+} from "../session/workspace-runtime-contracts";
+import { canonicalRuntimeSha256 } from "../session/workspace-runtime-contracts";
 
-const { IsoBackendKind } = natives;
-
-const TASK_ISOLATION_DIR_PREFIX = "t";
-const TASK_ISOLATION_DIR_DIGEST_CHARS = 9;
 const TASK_ISOLATION_MOUNT_DIR = "m";
-type IsoBackendKind = natives.IsoBackendKind;
 
-/** Baseline state for a single git repository. */
-export interface RepoBaseline {
-	repoRoot: string;
-	headCommit: string;
-	staged: string;
-	unstaged: string;
-	untracked: string[];
-	untrackedPatch: string;
+/** Captured nested-repository patch retained by the canonical SingleResult shape. */
+export interface NestedRepoPatch {
+	readonly relativePath: string;
+	readonly patch: string;
 }
 
-/** Baseline state for the project, including any nested git repos. */
-export interface WorktreeBaseline {
-	root: RepoBaseline;
-	/** Nested git repos (path relative to root.repoRoot). */
-	nested: Array<{ relativePath: string; baseline: RepoBaseline }>;
+export interface TransientTaskIsolationPhysicalIdentityV1 {
+	readonly namespaceSha256: string;
+	readonly directorySegment: string;
+	readonly baseDir: string;
+	readonly mergedDir: string;
+	readonly ownershipClaimPath: string;
+	readonly captureBranchRef: string;
 }
 
-export async function getRepoRoot(cwd: string): Promise<string> {
-	// Pure-jj check runs first so a jj workspace nested under an unrelated
-	// outer Git checkout is rejected at its own root rather than silently
-	// mutating the surrounding Git tree behind jj's back.
-	if (await jj.isPureJjRepo(cwd)) {
-		throw new Error(
-			"Isolated task execution requires a Git checkout, but this workspace is pure Jujutsu (`.jj/` without a colocated `.git/`). Run `jj git init --colocate` to add a Git checkout, or set `task.isolation.mode: none` to disable task isolation.",
-		);
-	}
-
-	const repoRoot = await git.repo.root(cwd);
-	if (repoRoot) return repoRoot;
-
-	throw new Error("Git repository not found for isolated task execution.");
-}
-
-const GIT_NO_INDEX_NULL_PATH = process.platform === "win32" ? "NUL" : "/dev/null";
-
-export function getGitNoIndexNullPath(): string {
-	return GIT_NO_INDEX_NULL_PATH;
-}
-
-/** Find nested git repositories (non-submodule) under the given root. */
-async function discoverNestedRepos(repoRoot: string): Promise<string[]> {
-	// Get submodule paths so we can exclude them
-	const submodulePaths = new Set(await git.ls.submodules(repoRoot));
-
-	// Find all .git dirs/files that aren't the root or known submodules
-	const result: string[] = [];
-	async function walk(dir: string): Promise<void> {
-		let entries: Dirent[];
-		try {
-			entries = await fs.readdir(dir, { withFileTypes: true });
-		} catch {
-			return;
-		}
-		for (const entry of entries) {
-			if (entry.name === "node_modules" || entry.name === ".git") continue;
-			if (!entry.isDirectory()) continue;
-			const full = path.join(dir, entry.name);
-			const rel = path.relative(repoRoot, full);
-			// Check if this directory is itself a git repo
-			const gitDir = path.join(full, ".git");
-			let hasGit = false;
-			try {
-				await fs.access(gitDir);
-				hasGit = true;
-			} catch {}
-			if (hasGit && !submodulePaths.has(rel)) {
-				result.push(rel);
-				// Don't recurse into nested repos — they manage their own tree
-				continue;
-			}
-			await walk(full);
-		}
-	}
-	await walk(repoRoot);
-	return result;
-}
-
-async function captureUntrackedPatch(repoRoot: string, untracked: readonly string[]): Promise<string> {
-	if (untracked.length === 0) return "";
-	const nullPath = getGitNoIndexNullPath();
-	// Bound concurrent git spawns; large untracked sets would otherwise fork one
-	// process per file at once.
-	const { results: untrackedDiffs } = await mapWithConcurrencyLimit([...untracked], 8, entry =>
-		git.diff(repoRoot, {
-			allowFailure: true,
-			binary: true,
-			noIndex: { left: nullPath, right: entry },
-		}),
-	);
-	return untrackedDiffs.filter((diff): diff is string => !!diff?.trim()).join("\n");
-}
-
-async function captureRepoBaseline(repoRoot: string): Promise<RepoBaseline> {
-	const headCommit = (await git.head.sha(repoRoot)) ?? "";
-	const staged = await git.diff(repoRoot, { binary: true, cached: true });
-	const unstaged = await git.diff(repoRoot, { binary: true });
-	const untracked = await git.ls.untracked(repoRoot);
-	const untrackedPatch = await captureUntrackedPatch(repoRoot, untracked);
-	return { repoRoot, headCommit, staged, unstaged, untracked, untrackedPatch };
-}
-
-interface SyntheticTreeOptions {
-	readonly threeWay?: boolean;
-}
-
-async function writeSyntheticTree(
-	repoDir: string,
-	baseTreeish: string,
-	patches: readonly string[],
-	options: SyntheticTreeOptions = {},
-): Promise<string> {
-	const tempIndex = path.join(os.tmpdir(), `omp-task-index-${Snowflake.next()}`);
-	try {
-		await git.readTree(repoDir, baseTreeish, {
-			env: { GIT_INDEX_FILE: tempIndex },
-		});
-		for (const patch of patches) {
-			if (!patch.trim()) continue;
-			await git.patch.applyText(repoDir, patch, {
-				cached: true,
-				env: { GIT_INDEX_FILE: tempIndex },
-				threeWay: options.threeWay,
-			});
-		}
-		return await git.writeTree(repoDir, {
-			env: { GIT_INDEX_FILE: tempIndex },
-		});
-	} finally {
-		await fs.rm(tempIndex, { force: true });
-	}
-}
-
-export async function captureBaseline(repoRoot: string): Promise<WorktreeBaseline> {
-	const [root, nestedPaths] = await Promise.all([captureRepoBaseline(repoRoot), discoverNestedRepos(repoRoot)]);
-	const nested = await Promise.all(
-		nestedPaths.map(async relativePath => ({
-			relativePath,
-			baseline: await captureRepoBaseline(path.join(repoRoot, relativePath)),
-		})),
-	);
-	return { root, nested };
-}
-
-async function captureRepoDeltaPatch(repoDir: string, rb: RepoBaseline, objectRepoDir = repoDir): Promise<string> {
-	const currentHead = (await git.head.sha(repoDir)) ?? "";
-	const currentStaged = await git.diff(repoDir, { binary: true, cached: true });
-	const currentUnstaged = await git.diff(repoDir, { binary: true });
-	const currentUntracked = await git.ls.untracked(repoDir);
-	const currentUntrackedPatch = await captureUntrackedPatch(repoDir, currentUntracked);
-	const committedPatch =
-		currentHead && currentHead !== rb.headCommit
-			? await git.diff.tree(repoDir, rb.headCommit, currentHead, {
-					allowFailure: true,
-					binary: true,
-				})
-			: "";
-
-	const baselineTree = await writeSyntheticTree(objectRepoDir, rb.headCommit, [
-		rb.staged,
-		rb.unstaged,
-		rb.untrackedPatch,
+/** Derive physical isolation only from the immutable task/run/create identity. */
+export async function deriveTransientTaskIsolationPhysicalIdentityV1(input: {
+	readonly taskId: string;
+	readonly runId: string;
+	readonly createId: string;
+}): Promise<TransientTaskIsolationPhysicalIdentityV1> {
+	const namespaceSha256 = await canonicalRuntimeSha256([
+		"omp-transient-task-isolation-namespace-v1",
+		1,
+		input.taskId,
+		input.runId,
+		input.createId,
 	]);
-	const currentTree = await writeSyntheticTree(objectRepoDir, rb.headCommit, [
-		committedPatch,
-		currentStaged,
-		currentUnstaged,
-		currentUntrackedPatch,
-	]);
-
-	return git.diff.tree(objectRepoDir, baselineTree, currentTree, {
-		allowFailure: true,
-		binary: true,
+	const directorySegment = `t1-${namespaceSha256}`;
+	const baseDir = getWorktreeDir(directorySegment);
+	return Object.freeze({
+		namespaceSha256,
+		directorySegment,
+		baseDir,
+		mergedDir: path.join(baseDir, TASK_ISOLATION_MOUNT_DIR),
+		ownershipClaimPath: `${baseDir}.owner-v1`,
+		captureBranchRef: `refs/heads/omp/task/v1/${namespaceSha256}`,
 	});
 }
 
-export interface NestedRepoPatch {
-	relativePath: string;
-	patch: string;
+/** Pre-bound physical materializer; it receives no presentation identity or ambient lookup authority. */
+export interface ConfidentialTransientTaskIsolationMaterializerV1 {
+	ensureIsolation(
+		request: ConfidentialTransientTaskEnsureIsolationRequestV1,
+	): Promise<ConfidentialTransientTaskEnsureIsolationResultV1>;
 }
 
-function unquoteGitDiffPath(rawPath: string): string {
-	let value = rawPath;
-	if (value.startsWith('"') && value.endsWith('"')) {
-		try {
-			value = JSON.parse(value) as string;
-		} catch {
-			value = value.slice(1, -1);
-		}
-	}
-	return value.replace(/^[ab]\//, "");
-}
-
-function parseDiffGitLinePaths(line: string): string[] {
-	if (!line.startsWith("diff --git ")) return [];
-	const rest = line.slice("diff --git ".length);
-	const quoted = rest.match(/^("(?:\\.|[^"])+"|\/dev\/null) ("(?:\\.|[^"])+"|\/dev\/null)$/);
-	const parts = quoted ? [quoted[1], quoted[2]] : rest.split(" ");
-	if (parts.length < 2) return [];
-	const paths = parts
-		.slice(0, 2)
-		.map(unquoteGitDiffPath)
-		.filter(file => file && file !== "/dev/null");
-	return [...new Set(paths)];
-}
-
-function patchTouchedFiles(patch: string): string[] {
-	const files = new Set<string>();
-	for (const line of patch.split("\n")) {
-		for (const file of parseDiffGitLinePaths(line)) files.add(file);
-	}
-	return [...files];
-}
-
-export interface DeltaPatchResult {
-	rootPatch: string;
-	nestedPatches: NestedRepoPatch[];
-}
-
-export async function captureDeltaPatch(isolationDir: string, baseline: WorktreeBaseline): Promise<DeltaPatchResult> {
-	const rootPatch = await captureRepoDeltaPatch(isolationDir, baseline.root, baseline.root.repoRoot);
-	const nestedPatches: NestedRepoPatch[] = [];
-
-	for (const { relativePath, baseline: nb } of baseline.nested) {
-		const nestedDir = path.join(isolationDir, relativePath);
-		try {
-			await fs.access(path.join(nestedDir, ".git"));
-		} catch {
-			continue;
-		}
-		const patch = await captureRepoDeltaPatch(nestedDir, nb, nb.repoRoot);
-		if (patch.trim()) nestedPatches.push({ relativePath, patch });
-	}
-
-	return { rootPatch, nestedPatches };
-}
-
-/**
- * Apply nested repo patches directly to their working directories after parent merge.
- *
- * Pre-existing dirty state in a nested repo is stashed before the patch is
- * applied and popped back (with `--index` so staged WIP stays staged) after
- * the commit, so unrelated user edits never get folded into the agent's
- * commit. A failing `git stash pop` (e.g. user edits collide with the patched
- * lines) leaves the stash entry intact, emits a `logger.warn`, and is
- * returned to the caller as a human-readable warning string — the agent
- * commit already landed, so this is a partial success the workflow needs to
- * see, not a thrown failure.
- *
- * Returns the collected stash-restore warnings (empty when every nested repo
- * was restored cleanly). Throws when the patch apply itself fails.
- *
- * @param commitMessage Optional async function to generate a commit message from the combined diff.
- *                      If omitted or returns null, falls back to a generic message.
- */
-export async function applyNestedPatches(
-	repoRoot: string,
-	patches: NestedRepoPatch[],
-	commitMessage?: (diff: string) => Promise<string | null>,
-): Promise<string[]> {
-	const warnings: string[] = [];
-	// Group patches by target repo to apply all at once and commit
-	const byRepo = new Map<string, NestedRepoPatch[]>();
-	for (const p of patches) {
-		if (!p.patch.trim()) continue;
-		const group = byRepo.get(p.relativePath) ?? [];
-		group.push(p);
-		byRepo.set(p.relativePath, group);
-	}
-
-	for (const [relativePath, repoPatches] of byRepo) {
-		const nestedDir = path.join(repoRoot, relativePath);
-		try {
-			await fs.access(path.join(nestedDir, ".git"));
-		} catch {
-			continue;
-		}
-
-		const combinedDiff = repoPatches.map(p => p.patch).join("\n");
-		const touchedFiles = [...new Set(repoPatches.flatMap(p => patchTouchedFiles(p.patch)))];
-
-		// Preserve any pre-existing dirty state (tracked + untracked) so we
-		// commit only the agent delta, not the user's in-flight work.
-		const stashed =
-			(await git.status(nestedDir)).trim().length > 0
-				? await git.stash.push(nestedDir, `omp-isolation-${Snowflake.next()}`)
-				: false;
-		try {
-			for (const { patch } of repoPatches) {
-				await git.patch.applyText(nestedDir, patch);
-			}
-			if ((await git.status(nestedDir)).trim().length > 0) {
-				if (touchedFiles.length === 0) {
-					throw new Error(`Nested repo patch for ${relativePath} did not include stageable file paths.`);
-				}
-				const msg = (await commitMessage?.(combinedDiff)) ?? "changes from isolated task(s)";
-				await git.stage.files(nestedDir, touchedFiles);
-				await git.commit(nestedDir, msg);
-			}
-		} finally {
-			if (stashed) {
-				const restored = await git.stash.tryPop(nestedDir, { index: true });
-				if (!restored) {
-					logger.warn("Pre-existing nested-repo dirty state could not be auto-restored", {
-						nestedDir,
-					});
-					warnings.push(
-						`Pre-existing dirty state in nested repo \`${relativePath}\` could not be auto-restored after the agent commit; stash entry preserved.`,
-					);
-				}
-			}
-		}
-	}
-	return warnings;
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Unified isolation lifecycle — picks the best backend via the PAL and
-// returns the merged-view path together with the resolved kind.
-// ═══════════════════════════════════════════════════════════════════════════
-
-/**
- * User-facing isolation mode names exposed by the `task.isolation.mode`
- * setting. Mapped to a backend-kind hint via {@link parseIsolationMode};
- * the PAL's `iso_resolve` then falls back through the kind order
- * whenever the hint isn't available on the current host.
- */
-export type TaskIsolationMode =
-	| "none"
-	| "auto"
-	| "apfs"
-	| "btrfs"
-	| "zfs"
-	| "reflink"
-	| "overlayfs"
-	| "projfs"
-	| "block-clone"
-	| "rcopy"
-	// Legacy values, accepted for back-compat with pre-PAL settings files.
-	| "worktree"
-	| "fuse-overlay"
-	| "fuse-projfs";
-
-/**
- * Translate a {@link TaskIsolationMode} string to an [`IsoBackendKind`]
- * the PAL can act on. `"none"` returns `null` (caller skips isolation
- * entirely); `"auto"` returns `undefined` (no hint — let the resolver
- * pick). Anything else returns the matching kind.
- */
-export function parseIsolationMode(mode: TaskIsolationMode): IsoBackendKind | undefined {
-	switch (mode) {
-		case "none":
-		case "auto":
-			return undefined;
-		case "apfs":
-			return IsoBackendKind.Apfs;
-		case "btrfs":
-			return IsoBackendKind.Btrfs;
-		case "zfs":
-			return IsoBackendKind.Zfs;
-		case "reflink":
-			return IsoBackendKind.LinuxReflink;
-		case "overlayfs":
-		case "fuse-overlay":
-			return IsoBackendKind.Overlayfs;
-		case "projfs":
-		case "fuse-projfs":
-			return IsoBackendKind.Projfs;
-		case "block-clone":
-			return IsoBackendKind.WindowsBlockClone;
-		case "rcopy":
-		case "worktree":
-			return IsoBackendKind.Rcopy;
-	}
-}
-
-export interface IsolationHandle {
-	/** Merged view materialised by the backend; pass this to the task. */
-	mergedDir: string;
-	/** Backend the PAL actually used. */
-	backend: IsoBackendKind;
-	/** True when the resolver downgraded from `preferred` to `backend`. */
-	fellBack: boolean;
-	/** Optional reason associated with `fellBack`. */
-	fallbackReason: string | null;
-}
-
-/**
- * Materialise `merged` for a single task. `preferred` is a hint — when
- * its prerequisites are missing the PAL silently falls back, and the
- * caller learns about that through `IsolationHandle.fellBack` +
- * `fallbackReason`.
- */
-
-function errorMessage(err: unknown): string {
-	return err instanceof Error ? err.message : String(err);
-}
-
-function getTaskIsolationSegment(repoRoot: string, id: string): string {
-	const key = `${path.resolve(repoRoot)}\0${id}`;
-	const digest = Bun.hash(key).toString(16).padStart(16, "0").slice(-TASK_ISOLATION_DIR_DIGEST_CHARS);
-	return `${TASK_ISOLATION_DIR_PREFIX}${digest}`;
-}
-
+/** Accept only the stored claim-current creator preparation and its exact derived locators. */
 export async function ensureIsolation(
-	baseCwd: string,
-	id: string,
-	preferred?: IsoBackendKind,
-): Promise<IsolationHandle> {
-	const repoRoot = await getRepoRoot(baseCwd);
-	const repository = await git.repo.resolve(repoRoot);
-	const sourceCommonDir = repository?.commonDir ?? path.join(repoRoot, ".git");
-	const baseDir = getWorktreeDir(getTaskIsolationSegment(repoRoot, id));
-	const mergedDir = path.join(baseDir, TASK_ISOLATION_MOUNT_DIR);
-	const resolution = natives.isoResolve(preferred ?? null);
-	const candidates = resolution.candidates.length > 0 ? resolution.candidates : [resolution.kind];
-	let fallbackReason = resolution.reason ?? null;
-
-	for (const candidate of candidates) {
-		await fs.rm(baseDir, { recursive: true, force: true });
-		// Claim ownership before the backend materialises `m`. Backends only
-		// create/replace `mergedDir` (and overlay upper/work), never the base
-		// dir, so the marker survives `isoStart` — and a concurrent
-		// `omp worktree clear` never sees this sandbox without a live owner,
-		// even while a large clone is still in progress.
-		await fs.mkdir(baseDir, { recursive: true });
-		await writeIsolationOwner(baseDir, id);
-		try {
-			await natives.isoStart(candidate, repoRoot, mergedDir);
-			// Sever the isolation's git metadata from the source checkout. Copy
-			// backends duplicate `repoRoot`'s `.git` verbatim — a linked-worktree
-			// pointer file (or the rcopy `git worktree add` registration) leaves
-			// the isolation sharing the source's HEAD/index/ref namespace, so a
-			// task's git operations would mutate the parent checkout and stack
-			// parallel task branches. Detaching gives each isolation a private,
-			// frozen repo that still borrows the source object DB via alternates.
-			await git.detachGitDir(mergedDir, sourceCommonDir);
-			return {
-				mergedDir,
-				backend: candidate,
-				fellBack: candidate !== resolution.kind || resolution.fellBack,
-				fallbackReason,
-			};
-		} catch (err) {
-			await fs.rm(baseDir, { recursive: true, force: true });
-			const message = errorMessage(err);
-			if (!natives.isoIsUnavailableError(message)) {
-				throw err;
-			}
-			fallbackReason ??= message;
-		}
+	request: ConfidentialTransientTaskEnsureIsolationRequestV1,
+	materializer: ConfidentialTransientTaskIsolationMaterializerV1,
+): Promise<ConfidentialTransientTaskEnsureIsolationResultV1> {
+	const preparation = request.preparation;
+	if (preparation.state !== "claim_current") {
+		return { status: "invalid", code: "ownership_claim_not_current" };
 	}
-
-	throw new Error(fallbackReason ?? "No isolation backend is available.");
-}
-
-/** Tear down a handle returned by {@link ensureIsolation}. */
-export async function cleanupIsolation(handle: IsolationHandle): Promise<void> {
-	try {
-		try {
-			await natives.isoStop(handle.backend, handle.mergedDir);
-		} catch (err) {
-			logger.warn("isolation backend stop failed during cleanup", {
-				backend: handle.backend,
-				mergedDir: handle.mergedDir,
-				error: err instanceof Error ? err.message : String(err),
-			});
-		}
-	} finally {
-		// baseDir is the parent of the merged directory
-		const baseDir = path.dirname(handle.mergedDir);
-		await fs.rm(baseDir, { recursive: true, force: true });
+	const descriptor = preparation.creatorDescriptor;
+	const controller = request.controller;
+	if (
+		descriptor.taskId !== controller.taskId ||
+		descriptor.runId !== controller.runId ||
+		descriptor.createId !== controller.createId ||
+		descriptor.ownerManifestSha256 !== preparation.ownershipClaim.ownerManifestSha256 ||
+		preparation.ownershipClaim.claimSha256 !== preparation.ownershipClaimReceipt.currentClaimSha256
+	) {
+		return { status: "invalid", code: "record_invariant_violation" };
 	}
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Branch-mode isolation
-// ═══════════════════════════════════════════════════════════════════════════
-
-export interface CommitToBranchResult {
-	branchName?: string;
-	nestedPatches: NestedRepoPatch[];
-	/**
-	 * SHA of the parent-repo commit the task branch was created on top of, so
-	 * {@link mergeTaskBranches} can cherry-pick the range `baseSha..branchName`
-	 * and preserve every agent commit's message and author.
-	 */
-	baseSha?: string;
-}
-
-function baselineHasRootWip(baseline: RepoBaseline): boolean {
-	return !!(baseline.staged.trim() || baseline.unstaged.trim() || baseline.untrackedPatch.trim());
-}
-
-/**
- * Baseline WIP context needed to safely apply a delta patch whose hunks were
- * captured against `HEAD + WIP` (see {@link captureRepoDeltaPatch}). Passed
- * whenever {@link baselineHasRootWip} is true so
- * {@link commitPatchToBranchWorktree} can replay the WIP into the temp
- * worktree first, then rewind WIP-only files after applying the delta.
- */
-interface BaselineWipContext {
-	readonly staged: string;
-	readonly unstaged: string;
-	readonly untrackedPatch: string;
-	/** Untracked file paths present in the baseline (never in HEAD). */
-	readonly untracked: readonly string[];
-}
-
-function collectWipPatches(wip: BaselineWipContext | undefined): string[] {
-	if (!wip) return [];
-	return [wip.staged, wip.unstaged, wip.untrackedPatch].filter(p => p.trim());
-}
-
-async function commitPatchToBranchWorktree(
-	tmpDir: string,
-	taskId: string,
-	patchText: string,
-	message: string,
-	author?: git.CommitAuthor,
-	baselineWip?: BaselineWipContext,
-): Promise<void> {
-	// Try the two clean paths first — they yield an agent-only commit and are
-	// the happy case when the temp worktree can resolve the patch against
-	// HEAD directly:
-	//
-	//   1. Plain apply — works when WIP context happens to match HEAD (e.g.
-	//      WIP-touched files that the delta patch doesn't reference).
-	//   2. `--3way`   — works when the WIP-side blob is tracked in HEAD and
-	//      lives in the shared ODB (captureDeltaPatch seeded it while writing
-	//      the synthetic baseline tree). The 3-way merge subtracts WIP,
-	//      producing an agent-only commit even when WIP and agent modify the
-	//      same tracked file at unrelated lines.
-	//
-	// If both fail (untracked WIP files, staged-new WIP files, or overlap that
-	// --3way can't resolve — see #4136), replay the WIP into the worktree
-	// first so the delta's context lines match, then rewind WIP-only files so
-	// they don't leak into the commit. Files touched by BOTH WIP and delta
-	// keep their combined state; the parent's stash-pop reconciles the WIP
-	// side via 3-way merge on merge-back.
-	let plainErr: git.GitCommandError | undefined;
-	try {
-		await git.patch.applyText(tmpDir, patchText);
-	} catch (err) {
-		if (!(err instanceof git.GitCommandError)) throw err;
-		plainErr = err;
+	const identity = await deriveTransientTaskIsolationPhysicalIdentityV1(descriptor);
+	if (
+		descriptor.namespaceSha256 !== identity.namespaceSha256 ||
+		descriptor.directorySegment !== identity.directorySegment ||
+		descriptor.baseDir !== identity.baseDir ||
+		descriptor.mergedDir !== identity.mergedDir ||
+		descriptor.ownershipClaimPath !== identity.ownershipClaimPath ||
+		descriptor.captureBranchRef !== identity.captureBranchRef
+	) {
+		return { status: "invalid", code: "record_invariant_violation" };
 	}
-	if (plainErr) {
-		let threeWayErr: git.GitCommandError | undefined;
-		try {
-			await git.patch.applyText(tmpDir, patchText, { threeWay: true });
-		} catch (err) {
-			if (!(err instanceof git.GitCommandError)) throw err;
-			threeWayErr = err;
-		}
-		if (threeWayErr) {
-			const wipPatches = collectWipPatches(baselineWip);
-			if (wipPatches.length === 0 || !baselineWip) {
-				const stderr = threeWayErr.result.stderr.slice(0, 2000);
-				logger.error("commitToBranch: git apply --3way failed", {
-					taskId,
-					exitCode: threeWayErr.result.exitCode,
-					stderr,
-					initialStderr: plainErr.result.stderr.slice(0, 2000),
-					patchSize: patchText.length,
-					patchHead: patchText.slice(0, 500),
-				});
-				throw new Error(`git apply --3way failed for task ${taskId}: ${stderr}`);
-			}
-			try {
-				// `git apply --3way` leaves conflict markers in `U` files when
-				// it can't resolve; reset the worktree so the WIP-seeded retry
-				// starts from a clean HEAD tree.
-				await git.reset(tmpDir, { hard: true, target: "HEAD" });
-				await applyDeltaOverBaselineWip(tmpDir, taskId, patchText, wipPatches, baselineWip);
-			} catch (wipErr) {
-				if (!(wipErr instanceof git.GitCommandError)) throw wipErr;
-				const stderr = wipErr.result.stderr.slice(0, 2000);
-				logger.error("commitToBranch: git apply with baseline WIP failed", {
-					taskId,
-					exitCode: wipErr.result.exitCode,
-					stderr,
-					threeWayStderr: threeWayErr.result.stderr.slice(0, 2000),
-					initialStderr: plainErr.result.stderr.slice(0, 2000),
-					patchSize: patchText.length,
-					patchHead: patchText.slice(0, 500),
-				});
-				throw new Error(`git apply with baseline WIP failed for task ${taskId}: ${stderr}`);
-			}
-		}
-	}
-
-	await git.stage.files(tmpDir);
-	await git.commit(tmpDir, message, author ? { author } : {});
+	return materializer.ensureIsolation(request);
 }
 
-/**
- * Replay baseline WIP into the temp worktree so the delta patch's HEAD+WIP
- * context matches, apply the delta, then rewind files WIP touched but the
- * delta didn't — HEAD-tracked files are restored via `git restore`, untracked
- * or staged-new WIP files are removed from the worktree. The commit that
- * follows reflects agent's delta plus any overlap with WIP; parent's
- * stash-pop reconciles the WIP side on merge-back.
- */
-async function applyDeltaOverBaselineWip(
-	tmpDir: string,
-	_taskId: string,
-	patchText: string,
-	wipPatches: readonly string[],
-	baselineWip: BaselineWipContext,
-): Promise<void> {
-	for (const wip of wipPatches) {
-		await git.patch.applyText(tmpDir, wip);
-	}
-	await git.patch.applyText(tmpDir, patchText);
-
-	const wipFiles = new Set(wipPatches.flatMap(patchTouchedFiles));
-	const deltaFiles = new Set(patchTouchedFiles(patchText));
-	const wipOnly = [...wipFiles].filter(f => !deltaFiles.has(f));
-	if (wipOnly.length === 0) return;
-
-	// Any wipOnly file baselined as untracked cannot be in HEAD.
-	// Everything else may or may not — verify against HEAD's tree.
-	const untrackedSet = new Set(baselineWip.untracked);
-	const candidates = wipOnly.filter(f => !untrackedSet.has(f));
-	const inHead = candidates.length > 0 ? new Set(await git.ls.tree(tmpDir, "HEAD", candidates)) : new Set<string>();
-	const toRestore = candidates.filter(f => inHead.has(f));
-	const toRemove = wipOnly.filter(f => !toRestore.includes(f));
-	if (toRestore.length > 0) {
-		await git.restore(tmpDir, { source: "HEAD", staged: true, worktree: true, files: toRestore });
-	}
-	for (const rel of toRemove) {
-		await fs.rm(path.join(tmpDir, rel), { force: true });
-	}
+function zeroObjectId(objectFormat: TransientTaskGitObjectFormatV1): string {
+	return "0".repeat(objectFormat === "sha1" ? 40 : 64);
 }
 
-interface FilteredAgentReplayOptions {
-	baseline: WorktreeBaseline;
-	branchName: string;
-	commitMessage?: (diff: string) => Promise<string | null>;
-	fallbackMessage: string;
-	isolationDir: string;
-	isolationHead: string;
-	repoRoot: string;
-	rootPatch: string;
-	taskId: string;
+/** Build the object-only import invocation from the already-durable exact request. */
+export function createTransientTaskCaptureObjectImportInvocationV1(
+	repository: ConfidentialTransientTaskCaptureRepositoryHandleV1,
+	request: ConfidentialTransientTaskCaptureObjectImportRequestV1,
+): ConfidentialTransientTaskGitObjectImportInvocationV1 {
+	return Object.freeze({
+		repository,
+		storeDispatchState: "outcome_unknown",
+		command: request.command,
+		expected: Object.freeze({
+			objectFormat: request.objectFormat,
+			objectType: request.object.objectType,
+			expectedObjectSha: request.object.expectedObjectSha,
+			objectBodyBytesBase64: request.object.objectBodyBytesBase64,
+			objectBodyByteLength: request.object.objectBodyByteLength,
+			objectBodySha256: request.object.objectBodySha256,
+		}),
+	});
 }
 
-async function replayFilteredAgentCommits(opts: FilteredAgentReplayOptions): Promise<void> {
-	const baselineSha = opts.baseline.root.headCommit;
-	await git.branch.create(opts.repoRoot, opts.branchName, baselineSha);
-
-	const tmpDir = path.join(os.tmpdir(), `omp-branch-${Snowflake.next()}`);
-	try {
-		await git.worktree.add(opts.repoRoot, tmpDir, opts.branchName);
-		const agentCommits = await git.revList.range(opts.isolationDir, baselineSha, opts.isolationHead);
-		const baselineWip = [opts.baseline.root.staged, opts.baseline.root.unstaged, opts.baseline.root.untrackedPatch];
-		// Seed the parent ODB with the dirty-side blobs needed by `git apply
-		// --3way`. Isolation repositories can read parent objects, but the parent
-		// cannot read objects created only inside isolation.
-		await writeSyntheticTree(opts.repoRoot, baselineSha, baselineWip);
-		const dirtyBaselineTree = await writeSyntheticTree(opts.isolationDir, baselineSha, baselineWip);
-		let previousFilteredTree = baselineSha;
-		let filteredCommitsApplied = 0;
-
-		for (const commitSha of agentCommits) {
-			const taskStatePatch = await git.diff.tree(opts.isolationDir, dirtyBaselineTree, `${commitSha}^{tree}`, {
-				allowFailure: true,
-				binary: true,
-			});
-			const currentFilteredTree = await writeSyntheticTree(opts.repoRoot, baselineSha, [taskStatePatch], {
-				threeWay: true,
-			});
-			const commitPatch = await git.diff.tree(opts.repoRoot, previousFilteredTree, currentFilteredTree, {
-				allowFailure: true,
-				binary: true,
-			});
-			if (commitPatch.trim()) {
-				const details = await git.commitDetails(opts.isolationDir, commitSha);
-				await commitPatchToBranchWorktree(
-					tmpDir,
-					opts.taskId,
-					commitPatch,
-					details.message || commitSha,
-					details.author,
-				);
-				filteredCommitsApplied++;
-			}
-			previousFilteredTree = currentFilteredTree;
-		}
-		if (filteredCommitsApplied === 0) {
-			// No filtered commit landed — tmpDir is still pinned at baselineSha.
-			// The `finalFilteredTree = writeSyntheticTree(HEAD, [rootPatch])`
-			// path here fails hard whenever rootPatch's WIP-context can't be
-			// applied to a HEAD-only index (untracked WIP + agent modifies,
-			// staged-new WIP + agent modifies — see #4136). Bypass the synthesis
-			// entirely and collapse the isolation output onto a single commit
-			// with WIP seed, matching the no-agent-commit path in commitToBranch.
-			// This also handles the "agent committed only baseline WIP" corner
-			// case where every filtered patch collapsed to empty.
-			if (opts.rootPatch.trim()) {
-				const msg = (opts.commitMessage && (await opts.commitMessage(opts.rootPatch))) || opts.fallbackMessage;
-				await commitPatchToBranchWorktree(tmpDir, opts.taskId, opts.rootPatch, msg, undefined, opts.baseline.root);
-			}
-		} else {
-			// A filtered commit landed; reconstruct the final HEAD-derived tree
-			// with the same dirty-side blobs and 3-way synthesis used above.
-			const finalFilteredTree = await writeSyntheticTree(opts.repoRoot, baselineSha, [opts.rootPatch], {
-				threeWay: true,
-			});
-			const leftoverPatch = await git.diff.tree(opts.repoRoot, previousFilteredTree, finalFilteredTree, {
-				allowFailure: true,
-				binary: true,
-			});
-			if (leftoverPatch.trim()) {
-				const msg = (opts.commitMessage && (await opts.commitMessage(leftoverPatch))) || opts.fallbackMessage;
-				await commitPatchToBranchWorktree(tmpDir, opts.taskId, leftoverPatch, msg);
-			}
-		}
-	} finally {
-		await git.worktree.tryRemove(opts.repoRoot, tmpDir);
-		await fs.rm(tmpDir, { recursive: true, force: true });
+/** Map a durable capture request without treating an all-zero old value as an object ID. */
+export function createTransientTaskCaptureRefCompareAndSwapInvocationV1(
+	repository: ConfidentialTransientTaskCaptureRepositoryHandleV1,
+	request: ConfidentialTransientTaskCaptureRefCompareAndSwapRequestV1,
+): ConfidentialTransientTaskGitCaptureRefCompareAndSwapInvocationV1 {
+	const absentObjectId = zeroObjectId(request.objectFormat);
+	if (
+		request.expectedNewCaptureRefSha === absentObjectId ||
+		request.command[2] !== request.captureBranchRef ||
+		request.command[3] !== request.expectedNewCaptureRefSha ||
+		request.command[4] !== request.expectedOldCaptureRefSha
+	) {
+		throw new TypeError("Invalid durable capture-ref compare-and-swap request");
 	}
+	return Object.freeze({
+		repository,
+		storeDispatchState: "outcome_unknown",
+		command: request.command,
+		expected: Object.freeze({
+			objectFormat: request.objectFormat,
+			refName: request.captureBranchRef,
+			expectedOld:
+				request.expectedOldCaptureRefSha === absentObjectId
+					? Object.freeze({ state: "absent" as const })
+					: Object.freeze({ state: "present" as const, objectId: request.expectedOldCaptureRefSha }),
+			expectedNew: Object.freeze({ state: "present" as const, objectId: request.expectedNewCaptureRefSha }),
+		}),
+	});
 }
 
-/**
- * Capture task-only changes from the isolation worktree onto a parent-repo
- * branch named `omp/task/${taskId}`. Only root-repo changes go on the branch;
- * nested-repo patches are returned separately because the parent git can't
- * track files inside gitlinks.
- *
- * If the agent committed inside isolation (HEAD moved past
- * `baseline.root.headCommit`), clean-baseline runs fetch the raw commit range
- * into the parent repo and later cherry-pick `baseSha..branchName`, preserving
- * every message and author verbatim. Dirty-baseline runs rewrite each agent
- * commit against the captured baseline WIP before committing it to the task
- * branch, so user staged/unstaged/untracked changes present at isolation
- * start are not replayed into the parent commit history.
- *
- * If the agent did not commit, the captured delta is collapsed onto a single
- * branch commit with an AI-generated (or fallback) message — the legacy
- * behaviour.
- *
- * Returns `null` when no root or nested changes exist.
- */
-export async function commitToBranch(
-	isolationDir: string,
-	baseline: WorktreeBaseline,
-	taskId: string,
-	description: string | undefined,
-	commitMessage?: (diff: string) => Promise<string | null>,
-): Promise<CommitToBranchResult | null> {
-	const baselineSha = baseline.root.headCommit;
-	const isolationHead = (await git.head.sha(isolationDir)) ?? "";
-	const agentCommitted = isolationHead !== "" && isolationHead !== baselineSha;
-
-	const { rootPatch, nestedPatches } = await captureDeltaPatch(isolationDir, baseline);
-	if (!rootPatch.trim() && nestedPatches.length === 0) return null;
-	if (!rootPatch.trim()) return { nestedPatches };
-
-	const repoRoot = baseline.root.repoRoot;
-	const branchName = `omp/task/${taskId}`;
-	const fallbackMessage = description || taskId;
-
-	let branchCreated = false;
-
-	if (agentCommitted) {
-		if (baselineHasRootWip(baseline.root)) {
-			await replayFilteredAgentCommits({
-				baseline,
-				branchName,
-				commitMessage,
-				fallbackMessage,
-				isolationDir,
-				isolationHead,
-				repoRoot,
-				rootPatch,
-				taskId,
-			});
-		} else {
-			// Transfer the agent's commit objects (which live in isolation's `.git`,
-			// stranded once `cleanupIsolation` tears the overlay down) into the parent
-			// repo's object DB and create the branch at the agent's HEAD. `+HEAD:…`
-			// force-overwrites a stale branch from a prior run.
-			await git.fetch(repoRoot, isolationDir, "HEAD", `refs/heads/${branchName}`);
-
-			// Leftover = anything still uncommitted in isolation on top of the
-			// agent's last commit (staged, unstaged, untracked). The agent didn't
-			// commit it, so it goes in as one AI-summarized trailing commit.
-			const leftoverPatch = await captureRepoDeltaPatch(isolationDir, {
-				repoRoot: isolationDir,
-				headCommit: isolationHead,
-				staged: "",
-				unstaged: "",
-				untracked: [],
-				untrackedPatch: "",
-			});
-			if (leftoverPatch.trim()) {
-				const tmpDir = path.join(os.tmpdir(), `omp-branch-${Snowflake.next()}`);
-				try {
-					await git.worktree.add(repoRoot, tmpDir, branchName);
-					const msg = (commitMessage && (await commitMessage(leftoverPatch))) || fallbackMessage;
-					await commitPatchToBranchWorktree(tmpDir, taskId, leftoverPatch, msg);
-				} finally {
-					await git.worktree.tryRemove(repoRoot, tmpDir);
-					await fs.rm(tmpDir, { recursive: true, force: true });
-				}
-			}
-		}
-		branchCreated = true;
-	} else if (rootPatch.trim()) {
-		await git.branch.create(repoRoot, branchName, baselineSha);
-		branchCreated = true;
-		const tmpDir = path.join(os.tmpdir(), `omp-branch-${Snowflake.next()}`);
-		try {
-			await git.worktree.add(repoRoot, tmpDir, branchName);
-
-			const msg = (commitMessage && (await commitMessage(rootPatch))) || fallbackMessage;
-			const wip = baselineHasRootWip(baseline.root) ? baseline.root : undefined;
-			await commitPatchToBranchWorktree(tmpDir, taskId, rootPatch, msg, undefined, wip);
-		} finally {
-			await git.worktree.tryRemove(repoRoot, tmpDir);
-			await fs.rm(tmpDir, { recursive: true, force: true });
-		}
+/** Map the ordered cleanup component to a CAS delete whose expected-new state is absence. */
+export function createTransientTaskCaptureRefDeleteInvocationV1(
+	repository: TransientTaskIsolationCleanupHandleV1,
+	objectFormat: TransientTaskGitObjectFormatV1,
+	request: Extract<
+		ConfidentialTransientTaskIsolationCleanupComponentRequestV1,
+		{ readonly component: "capture_ref_cas_delete" }
+	>,
+): ConfidentialTransientTaskGitCaptureRefDeleteInvocationV1 {
+	if (request.expectedOldCaptureRefSha === zeroObjectId(objectFormat)) {
+		throw new TypeError("Capture-ref cleanup requires a present expected-old object ID");
 	}
+	return Object.freeze({
+		repository,
+		storeDispatchState: "component_outcome_unknown",
+		command: Object.freeze([
+			"git",
+			"update-ref",
+			"-d",
+			request.captureBranchRef,
+			request.expectedOldCaptureRefSha,
+		] as const),
+		expected: Object.freeze({
+			objectFormat,
+			refName: request.captureBranchRef,
+			expectedOld: Object.freeze({ state: "present" as const, objectId: request.expectedOldCaptureRefSha }),
+			expectedNew: Object.freeze({ state: "absent" as const }),
+		}),
+	});
+}
 
+/** Open only the exact durable capture sink; no cwd, search, or fallback is accepted. */
+export async function openTransientTaskCaptureRepositoryV1(
+	resolver: ConfidentialTransientTaskCaptureRepositoryResolverV1,
+	request: ConfidentialTransientTaskCaptureRepositoryOpenRequestV1,
+): Promise<ConfidentialTransientTaskCaptureRepositoryOpenResultV1> {
+	return resolver.openCaptureRepository(request);
+}
+
+/** Execute the frozen object-import prefix and sole ref CAS through the durable store. */
+export async function materializeTransientTaskCaptureBranchV1(
+	store: ConfidentialTransientTaskCaptureMaterializationStoreV1,
+	repository: ConfidentialTransientTaskCaptureRepositoryHandleV1,
+	authority: TransientTaskCleanupAuthorityProofV1,
+	plan: ConfidentialTransientTaskCaptureBranchMaterializationPlanV1,
+): Promise<readonly TransientTaskCaptureMaterializationInspectResultV1[]> {
+	const results: TransientTaskCaptureMaterializationInspectResultV1[] = [];
+	for (const effect of plan.objectImports) {
+		const result = await store.runEffect({ effect, repository, authority });
+		results.push(result);
+		if (result.status !== "applied" && result.status !== "already_applied") return Object.freeze(results);
+	}
+	results.push(await store.runEffect({ effect: plan.captureRefCompareAndSwap, repository, authority }));
+	return Object.freeze(results);
+}
+
+function isolationCleanupInspectRequest(
+	request: ConfidentialTransientTaskIsolationCleanupRequestV1,
+): TransientTaskIsolationCleanupInspectRequestV1 {
+	const plan = request.plan;
 	return {
-		branchName: branchCreated ? branchName : undefined,
-		baseSha: baselineSha,
-		nestedPatches,
+		schemaVersion: 1,
+		taskId: plan.taskId,
+		runId: plan.runId,
+		isolationCleanupId: plan.isolationCleanupId,
+		planSha256: plan.planSha256,
+		cleanupRequestSha256: request.cleanupRequestSha256,
+		cleanupClaimSha256: plan.cleanupClaim.claimSha256,
+		cleanupDescriptorSha256: plan.cleanupDescriptorSha256,
+		isolationNamespaceSha256: plan.isolationNamespaceSha256,
+		isolationOwnerManifestSha256: plan.isolationOwnerManifestSha256,
+		isolationCreatorDescriptorSha256: plan.isolationCreatorDescriptorSha256,
 	};
 }
 
-export interface MergeBranchResult {
-	merged: string[];
-	failed: string[];
-	conflict?: string;
-	/** Set when cherry-picks landed on HEAD but restoring the stashed working tree failed. */
-	stashConflict?: string;
-}
-
-/**
- * Cherry-pick task branch commits sequentially onto HEAD. When `baseSha` is
- * provided the cherry-pick uses the inclusive range `baseSha..branchName`,
- * replaying every commit individually and preserving each commit's message
- * and author. When omitted, the branch is cherry-picked as a single commit
- * (legacy callers).
- *
- * Stops on the first conflict and reports which branches succeeded.
- */
-export async function mergeTaskBranches(
-	repoRoot: string,
-	branches: Array<{ branchName: string; taskId: string; description?: string; baseSha?: string }>,
-): Promise<MergeBranchResult> {
-	// Serialize against other in-process git mutations on this repo: concurrent
-	// background merges interleaving stash push/pop + cherry-pick would corrupt
-	// the working tree (lost uncommitted changes, mixed-up stash entries).
-	return git.withRepoLock(repoRoot, async () => {
-		const merged: string[] = [];
-		const failed: string[] = [];
-
-		// Stash dirty working tree so cherry-pick can operate on a clean HEAD.
-		// Without this, cherry-pick refuses to run when uncommitted changes exist.
-		const didStash = await git.stash.push(repoRoot, "omp-task-merge");
-
-		let conflictResult: MergeBranchResult | undefined;
-
-		try {
-			for (const { branchName, baseSha } of branches) {
-				try {
-					const target = baseSha ? `${baseSha}..${branchName}` : branchName;
-					await git.cherryPick(repoRoot, target);
-				} catch (initialErr) {
-					// Empty cherry-picks are not conflicts: a commit whose net
-					// effect is already on HEAD (redundant change, or 3-way
-					// merge auto-resolved to HEAD) leaves the sequencer stopped
-					// with a "The previous cherry-pick is now empty" message.
-					// Advance past every consecutive empty with `--skip` so the
-					// remaining non-redundant commits in the range still land.
-					// A genuine conflict (unmerged files, no "now empty"
-					// message) falls through to the abort path below.
-					let cursor: unknown = initialErr;
-					while (git.cherryPick.isEmptyError(cursor)) {
-						try {
-							await git.cherryPick.skip(repoRoot);
-							cursor = undefined;
-							break;
-						} catch (skipErr) {
-							cursor = skipErr;
-						}
-					}
-					if (cursor === undefined) {
-						merged.push(branchName);
-						continue;
-					}
-					try {
-						await git.cherryPick.abort(repoRoot);
-					} catch {
-						/* no state to abort */
-					}
-					const stderr =
-						cursor instanceof git.GitCommandError
-							? cursor.result.stderr.trim()
-							: cursor instanceof Error
-								? cursor.message
-								: String(cursor);
-					failed.push(branchName);
-					conflictResult = {
-						merged,
-						failed: [...failed, ...branches.slice(merged.length + failed.length).map(b => b.branchName)],
-						conflict: `${branchName}: ${stderr}`,
-					};
-					break;
-				}
-
-				merged.push(branchName);
-			}
-		} finally {
-			if (didStash) {
-				const restored = await git.stash.tryPop(repoRoot, { index: true });
-				if (!restored) {
-					// Stash pop would leave stage 1/2/3 unmerged entries in `.git/index`
-					// that overlay-isolated subsequent tasks inherit through the lower
-					// layer, corrupting every downstream `captureRepoDeltaPatch`. `tryPop`
-					// short-circuits the pop when the WIP would conflict with the
-					// cherry-picked HEAD (and reset-cleans up if a rarer conflict slips
-					// past). The merged branches DID land — surface a stash-restore
-					// warning without claiming the merge failed.
-					logger.warn("Failed to restore stashed changes after task merge; stash entry preserved");
-					const stashConflict =
-						"stash pop: cherry-picked changes conflict with uncommitted edits. The merged commits are on HEAD; run `git stash pop` and resolve manually.";
-					if (conflictResult) {
-						conflictResult.stashConflict = stashConflict;
-					} else {
-						conflictResult = { merged, failed: [], stashConflict };
-					}
-				}
-			}
-		}
-
-		return conflictResult ?? { merged, failed };
-	});
-}
-
-/** Clean up temporary task branches. */
-export async function cleanupTaskBranches(repoRoot: string, branches: string[]): Promise<void> {
-	for (const branch of branches) {
-		await git.branch.tryDelete(repoRoot, branch);
+async function adoptIsolationCleanup(
+	store: ConfidentialTransientTaskPostTerminalStoreV1,
+	request: ConfidentialTransientTaskIsolationCleanupRequestV1,
+) {
+	const inspectRequest = isolationCleanupInspectRequest(request);
+	const inspection = await store.inspectIsolationCleanup(inspectRequest);
+	switch (inspection.status) {
+		case "absent":
+			return null;
+		case "conflict":
+		case "invalid":
+			return inspection;
+		case "in_progress":
+		case "matching":
+			return store.adoptIsolationCleanup({
+				...inspectRequest,
+				expectedInspectionSha256: inspection.inspectionSha256,
+				expectedCleanupAttemptSha256: inspection.cleanupAttemptSha256,
+				expectedStatus: inspection.status,
+				expectedProgressSha256: inspection.status === "in_progress" ? inspection.progressSha256 : null,
+				expectedReceiptSha256: inspection.status === "matching" ? inspection.receiptSha256 : null,
+				authority: request.authority,
+				expectedPostTerminalRevision: request.expectedPostTerminalRevision,
+			});
 	}
+}
+
+async function dispatchIsolationCleanup(
+	store: ConfidentialTransientTaskPostTerminalStoreV1,
+	effect: ConfidentialTransientTaskIsolationCleanupEffectV1,
+): Promise<TransientTaskIsolationCleanupResultV1> {
+	try {
+		return await store.cleanupIsolation(effect);
+	} catch (dispatchError) {
+		try {
+			const adopted = await adoptIsolationCleanup(store, effect.request);
+			if (adopted?.status === "matching") return { status: "already_cleaned", receipt: adopted.receipt };
+			if (adopted?.status === "in_progress") return { status: "in_progress", progress: adopted.progress };
+			if (adopted?.status === "conflict" || adopted?.status === "invalid") {
+				return { status: adopted.status, code: "record_invariant_violation" };
+			}
+		} catch {
+			// Preserve the dispatch failure when the recovery store itself is unavailable.
+		}
+		throw dispatchError;
+	}
+}
+
+/** Resume the exact durable aggregate attempt; only a proven absent row may start it. */
+export async function cleanupIsolation(
+	store: ConfidentialTransientTaskPostTerminalStoreV1,
+	effect: ConfidentialTransientTaskIsolationCleanupEffectV1,
+): Promise<TransientTaskIsolationCleanupResultV1> {
+	const adopted = await adoptIsolationCleanup(store, effect.request);
+	if (adopted === null) return dispatchIsolationCleanup(store, effect);
+	if (adopted.status === "matching") return { status: "already_cleaned", receipt: adopted.receipt };
+	if (adopted.status === "in_progress") {
+		return dispatchIsolationCleanup(store, {
+			request: adopted.attempt.request,
+			cleanupTarget: adopted.cleanupTarget,
+		});
+	}
+	if (adopted.status === "conflict" || adopted.status === "invalid") {
+		return { status: adopted.status, code: "record_invariant_violation" };
+	}
+	return { status: "conflict", code: "record_invariant_violation" };
+}
+
+const CLAIM_SHA256_REF = /^sha256:[0-9a-f]{64}$/;
+
+function strictClaimRecord(value: unknown, keys: readonly string[]): Record<string, unknown> | undefined {
+	if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const prototype = Object.getPrototypeOf(value);
+	if ((prototype !== Object.prototype && prototype !== null) || Object.getOwnPropertySymbols(value).length !== 0)
+		return undefined;
+	const actual = Object.keys(value).sort();
+	const expected = [...keys].sort();
+	if (actual.length !== expected.length || actual.some((key, index) => key !== expected[index])) return undefined;
+	for (const key of actual) {
+		const descriptor = Object.getOwnPropertyDescriptor(value, key);
+		if (!descriptor || !("value" in descriptor) || descriptor.enumerable !== true) return undefined;
+	}
+	return value as Record<string, unknown>;
+}
+
+function validClaimIdentity(value: unknown): value is string {
+	return typeof value === "string" && value.length > 0 && !value.includes("\0");
+}
+
+function validClaimIso8601(value: unknown): value is ISO8601 {
+	if (typeof value !== "string") return false;
+	try {
+		return new Date(value).toISOString() === value;
+	} catch {
+		return false;
+	}
+}
+
+async function claimTupleRef(tuple: readonly CanonicalRuntimeValue[]): Promise<Sha256Ref> {
+	return `sha256:${await canonicalRuntimeSha256(tuple)}` as Sha256Ref;
+}
+
+function claimControllerProofTuple(proof: TransientTaskControllerAuthorityProofV1): readonly CanonicalRuntimeValue[] {
+	return [
+		1,
+		proof.taskId,
+		proof.runId,
+		proof.createId,
+		proof.controllerId,
+		proof.workspaceId,
+		proof.controlHostId,
+		proof.controllerEpoch,
+		proof.fencingGeneration,
+	];
+}
+
+function claimOwnershipTuple(
+	claim: ConfidentialTransientTaskIsolationOwnershipClaimV1,
+): readonly CanonicalRuntimeValue[] {
+	return [
+		"omp-transient-task-isolation-claim-v1",
+		1,
+		claim.ownerManifestSha256,
+		claim.claimOperationId,
+		claim.claimantInstanceId,
+		claim.controlHostId,
+		claim.pid,
+		claim.processStartToken,
+		claim.claimedAt,
+	];
+}
+
+async function claimOwnerManifestTuple(
+	descriptor: ConfidentialTransientTaskIsolationCreatorDescriptorV1,
+): Promise<readonly CanonicalRuntimeValue[]> {
+	const identity = await deriveTransientTaskIsolationPhysicalIdentityV1(descriptor);
+	return [
+		"omp-transient-task-isolation-owner-v1",
+		1,
+		["omp-transient-task-isolation-namespace-v1", 1, descriptor.taskId, descriptor.runId, descriptor.createId],
+		identity.namespaceSha256,
+		descriptor.effectIdentityManifestSha256,
+		[
+			"omp-transient-task-publication-target-v1",
+			"key",
+			1,
+			descriptor.taskId,
+			descriptor.runId,
+			descriptor.createId,
+			descriptor.publicationTargetId,
+		],
+		descriptor.worktreePublicationId,
+		descriptor.isolationCleanupId,
+		descriptor.bindingOperationId,
+		descriptor.ownershipClaimCreateOperationId,
+		descriptor.directorySegment,
+		descriptor.captureBranchRef,
+	];
+}
+
+async function claimCreatorDescriptorTuple(
+	descriptor: ConfidentialTransientTaskIsolationCreatorDescriptorV1,
+): Promise<readonly CanonicalRuntimeValue[]> {
+	return [
+		"omp-transient-task-isolation-creator-v1",
+		1,
+		await claimOwnerManifestTuple(descriptor),
+		descriptor.baseDir,
+		descriptor.mergedDir,
+		descriptor.ownershipClaimPath,
+	];
+}
+
+function claimLivenessEvidenceTuple(
+	evidence: ConfidentialTransientTaskIsolationOwnerLivenessEvidenceV1,
+): readonly CanonicalRuntimeValue[] {
+	return [
+		"omp-transient-task-isolation-owner-liveness-v1",
+		"evidence",
+		1,
+		evidence.taskId,
+		evidence.runId,
+		evidence.createId,
+		evidence.effectOperationId,
+		evidence.creatorDescriptorSha256,
+		evidence.requestSha256,
+		evidence.attemptSha256,
+		claimOwnershipTuple(evidence.observedClaim),
+		evidence.probingControlHostId,
+		evidence.verdict,
+		evidence.basis,
+	];
+}
+
+async function claimRequestTuple(
+	request: ConfidentialTransientTaskIsolationOwnershipClaimEffectRequestV1,
+): Promise<readonly CanonicalRuntimeValue[]> {
+	const prefix: CanonicalRuntimeValue[] = [
+		"omp-transient-task-isolation-claim-effect-v1",
+		"request",
+		1,
+		request.taskId,
+		request.runId,
+		request.createId,
+		request.operation,
+		request.effectOperationId,
+		await claimCreatorDescriptorTuple(request.creatorDescriptor),
+		claimControllerProofTuple(request.controller),
+		request.authoritySha256,
+		request.requestedAt,
+	];
+	if (request.operation === "exclusive_create")
+		return [...prefix, null, claimOwnershipTuple(request.nextClaim), true, true, false];
+	if (request.operation === "stale_same_owner_cas_adopt")
+		return [
+			...prefix,
+			[claimLivenessEvidenceTuple(request.staleOwnerEvidence), request.staleOwnerEvidence.evidenceSha256],
+			claimOwnershipTuple(request.expectedClaim),
+			claimOwnershipTuple(request.nextClaim),
+			true,
+			true,
+		];
+	return [...prefix, claimOwnershipTuple(request.expectedClaim), null, true, true, request.reason];
+}
+
+async function claimAttemptTuple(
+	attempt: ConfidentialTransientTaskIsolationOwnershipClaimEffectAttemptV1,
+): Promise<readonly CanonicalRuntimeValue[]> {
+	return [
+		"omp-transient-task-isolation-claim-effect-v1",
+		"attempt",
+		1,
+		attempt.state,
+		await claimRequestTuple(attempt.request),
+		attempt.openedAt,
+	];
+}
+
+async function claimReceiptTuple(
+	receipt: ConfidentialTransientTaskIsolationOwnershipClaimEffectReceiptV1,
+): Promise<readonly CanonicalRuntimeValue[]> {
+	const prefix: CanonicalRuntimeValue[] = [
+		"omp-transient-task-isolation-claim-effect-v1",
+		"receipt",
+		1,
+		receipt.taskId,
+		receipt.runId,
+		receipt.createId,
+		receipt.effectOperationId,
+		receipt.operation,
+		receipt.outcome,
+		receipt.requestSha256,
+		receipt.attemptSha256,
+		receipt.authoritySha256,
+		receipt.previousClaimSha256,
+	];
+	return receipt.operation === "pre_bind_cas_release"
+		? [...prefix, null, null, receipt.completedAt, receipt.reason]
+		: [...prefix, claimOwnershipTuple(receipt.claim), receipt.currentClaimSha256, receipt.completedAt];
+}
+
+async function validateClaimDescriptor(
+	descriptor: ConfidentialTransientTaskIsolationCreatorDescriptorV1,
+): Promise<boolean> {
+	if (
+		!strictClaimRecord(descriptor, [
+			"schemaVersion",
+			"taskId",
+			"runId",
+			"createId",
+			"publicationTargetId",
+			"worktreePublicationId",
+			"isolationCleanupId",
+			"bindingOperationId",
+			"ownershipClaimCreateOperationId",
+			"effectIdentityManifestSha256",
+			"namespaceSha256",
+			"directorySegment",
+			"baseDir",
+			"mergedDir",
+			"ownershipClaimPath",
+			"captureBranchRef",
+			"ownerManifestSha256",
+			"creatorDescriptorSha256",
+		]) ||
+		descriptor.schemaVersion !== 1 ||
+		![
+			descriptor.taskId,
+			descriptor.runId,
+			descriptor.createId,
+			descriptor.publicationTargetId,
+			descriptor.worktreePublicationId,
+			descriptor.isolationCleanupId,
+			descriptor.bindingOperationId,
+			descriptor.ownershipClaimCreateOperationId,
+		].every(validClaimIdentity) ||
+		![
+			descriptor.effectIdentityManifestSha256,
+			descriptor.ownerManifestSha256,
+			descriptor.creatorDescriptorSha256,
+		].every(value => CLAIM_SHA256_REF.test(value))
+	)
+		return false;
+	const identity = await deriveTransientTaskIsolationPhysicalIdentityV1(descriptor);
+	return (
+		descriptor.namespaceSha256 === identity.namespaceSha256 &&
+		descriptor.directorySegment === identity.directorySegment &&
+		descriptor.baseDir === identity.baseDir &&
+		descriptor.mergedDir === identity.mergedDir &&
+		descriptor.ownershipClaimPath === identity.ownershipClaimPath &&
+		descriptor.captureBranchRef === identity.captureBranchRef &&
+		descriptor.ownerManifestSha256 === (await claimTupleRef(await claimOwnerManifestTuple(descriptor))) &&
+		descriptor.creatorDescriptorSha256 === (await claimTupleRef(await claimCreatorDescriptorTuple(descriptor)))
+	);
+}
+
+async function validateClaimValue(claim: ConfidentialTransientTaskIsolationOwnershipClaimV1): Promise<boolean> {
+	return Boolean(
+		strictClaimRecord(claim, [
+			"schemaVersion",
+			"ownerManifestSha256",
+			"claimOperationId",
+			"claimantInstanceId",
+			"controlHostId",
+			"pid",
+			"processStartToken",
+			"claimedAt",
+			"claimSha256",
+		]) &&
+			claim.schemaVersion === 1 &&
+			CLAIM_SHA256_REF.test(claim.ownerManifestSha256) &&
+			CLAIM_SHA256_REF.test(claim.claimSha256) &&
+			[claim.claimOperationId, claim.claimantInstanceId, claim.controlHostId].every(validClaimIdentity) &&
+			Number.isSafeInteger(claim.pid) &&
+			claim.pid > 0 &&
+			(claim.processStartToken === null || validClaimIdentity(claim.processStartToken)) &&
+			validClaimIso8601(claim.claimedAt) &&
+			claim.claimSha256 === (await claimTupleRef(claimOwnershipTuple(claim))),
+	);
+}
+
+function sameClaimValue(
+	left: ConfidentialTransientTaskIsolationOwnershipClaimV1,
+	right: ConfidentialTransientTaskIsolationOwnershipClaimV1,
+): boolean {
+	return (
+		left.claimSha256 === right.claimSha256 &&
+		JSON.stringify(claimOwnershipTuple(left)) === JSON.stringify(claimOwnershipTuple(right))
+	);
+}
+
+function canonicalClaimBytes(claim: ConfidentialTransientTaskIsolationOwnershipClaimV1): Buffer {
+	return Buffer.from(
+		JSON.stringify({
+			schemaVersion: claim.schemaVersion,
+			ownerManifestSha256: claim.ownerManifestSha256,
+			claimOperationId: claim.claimOperationId,
+			claimantInstanceId: claim.claimantInstanceId,
+			controlHostId: claim.controlHostId,
+			pid: claim.pid,
+			processStartToken: claim.processStartToken,
+			claimedAt: claim.claimedAt,
+			claimSha256: claim.claimSha256,
+		}),
+		"utf8",
+	);
+}
+
+async function validateClaimController(
+	controller: TransientTaskControllerAuthorityProofV1,
+	descriptor: ConfidentialTransientTaskIsolationCreatorDescriptorV1,
+): Promise<boolean> {
+	return Boolean(
+		strictClaimRecord(controller, [
+			"schemaVersion",
+			"taskId",
+			"runId",
+			"createId",
+			"controllerId",
+			"workspaceId",
+			"controlHostId",
+			"controllerEpoch",
+			"fencingGeneration",
+		]) &&
+			controller.schemaVersion === 1 &&
+			controller.taskId === descriptor.taskId &&
+			controller.runId === descriptor.runId &&
+			controller.createId === descriptor.createId &&
+			[controller.controllerId, controller.workspaceId, controller.controlHostId].every(validClaimIdentity) &&
+			Number.isSafeInteger(controller.controllerEpoch) &&
+			controller.controllerEpoch > 0 &&
+			Number.isSafeInteger(controller.fencingGeneration) &&
+			controller.fencingGeneration > 0,
+	);
+}
+
+async function validateClaimStaleEvidence(
+	evidence: ConfidentialTransientTaskIsolationOwnerLivenessEvidenceV1,
+	request: Extract<
+		ConfidentialTransientTaskIsolationOwnershipClaimEffectRequestV1,
+		{ operation: "stale_same_owner_cas_adopt" }
+	>,
+): Promise<boolean> {
+	return Boolean(
+		strictClaimRecord(evidence, [
+			"schemaVersion",
+			"taskId",
+			"runId",
+			"createId",
+			"effectOperationId",
+			"creatorDescriptorSha256",
+			"requestSha256",
+			"attemptSha256",
+			"observedClaim",
+			"probingControlHostId",
+			"evidenceSha256",
+			"verdict",
+			"basis",
+		]) &&
+			evidence.schemaVersion === 1 &&
+			evidence.verdict === "stale" &&
+			(evidence.basis === "same_host_pid_absent" || evidence.basis === "same_host_process_start_token_mismatch") &&
+			![
+				evidence.taskId,
+				evidence.runId,
+				evidence.createId,
+				evidence.effectOperationId,
+				evidence.probingControlHostId,
+			].some(value => !validClaimIdentity(value)) &&
+			[
+				evidence.creatorDescriptorSha256,
+				evidence.requestSha256,
+				evidence.attemptSha256,
+				evidence.evidenceSha256,
+			].every(value => CLAIM_SHA256_REF.test(value)) &&
+			(await validateClaimValue(evidence.observedClaim)) &&
+			evidence.taskId === request.taskId &&
+			evidence.runId === request.runId &&
+			evidence.createId === request.createId &&
+			evidence.creatorDescriptorSha256 === request.creatorDescriptor.creatorDescriptorSha256 &&
+			evidence.probingControlHostId === request.controller.controlHostId &&
+			sameClaimValue(evidence.observedClaim, request.expectedClaim) &&
+			evidence.evidenceSha256 === (await claimTupleRef(claimLivenessEvidenceTuple(evidence))),
+	);
+}
+
+async function validateClaimRequest(
+	request: ConfidentialTransientTaskIsolationOwnershipClaimEffectRequestV1,
+): Promise<boolean> {
+	if (request === null || typeof request !== "object" || Array.isArray(request) || !("operation" in request))
+		return false;
+	const keys =
+		request.operation === "exclusive_create"
+			? [
+					"schemaVersion",
+					"taskId",
+					"runId",
+					"createId",
+					"operation",
+					"effectOperationId",
+					"creatorDescriptor",
+					"controller",
+					"authoritySha256",
+					"requestedAt",
+					"requestSha256",
+					"expectedClaim",
+					"nextClaim",
+					"exclusive",
+					"noFollow",
+					"createParentDirectories",
+				]
+			: request.operation === "stale_same_owner_cas_adopt"
+				? [
+						"schemaVersion",
+						"taskId",
+						"runId",
+						"createId",
+						"operation",
+						"effectOperationId",
+						"creatorDescriptor",
+						"controller",
+						"authoritySha256",
+						"requestedAt",
+						"requestSha256",
+						"expectedClaim",
+						"staleOwnerEvidence",
+						"nextClaim",
+						"compareAndSwap",
+						"noFollow",
+					]
+				: request.operation === "pre_bind_cas_release"
+					? [
+							"schemaVersion",
+							"taskId",
+							"runId",
+							"createId",
+							"operation",
+							"effectOperationId",
+							"creatorDescriptor",
+							"controller",
+							"authoritySha256",
+							"requestedAt",
+							"requestSha256",
+							"expectedClaim",
+							"nextClaim",
+							"compareAndSwap",
+							"noFollow",
+							"reason",
+						]
+					: null;
+	if (
+		!keys ||
+		!strictClaimRecord(request, keys) ||
+		request.schemaVersion !== 1 ||
+		![request.taskId, request.runId, request.createId, request.effectOperationId].every(validClaimIdentity) ||
+		!CLAIM_SHA256_REF.test(request.authoritySha256) ||
+		!CLAIM_SHA256_REF.test(request.requestSha256) ||
+		!validClaimIso8601(request.requestedAt) ||
+		!(await validateClaimDescriptor(request.creatorDescriptor)) ||
+		!(await validateClaimController(request.controller, request.creatorDescriptor)) ||
+		request.taskId !== request.creatorDescriptor.taskId ||
+		request.runId !== request.creatorDescriptor.runId ||
+		request.createId !== request.creatorDescriptor.createId
+	)
+		return false;
+	if (request.operation === "exclusive_create") {
+		if (
+			request.expectedClaim !== null ||
+			request.exclusive !== true ||
+			request.noFollow !== true ||
+			request.createParentDirectories !== false ||
+			!(await validateClaimValue(request.nextClaim)) ||
+			request.nextClaim.ownerManifestSha256 !== request.creatorDescriptor.ownerManifestSha256 ||
+			request.nextClaim.claimOperationId !== request.effectOperationId ||
+			request.nextClaim.controlHostId !== request.controller.controlHostId
+		)
+			return false;
+	} else if (request.operation === "stale_same_owner_cas_adopt") {
+		if (
+			request.compareAndSwap !== true ||
+			request.noFollow !== true ||
+			!(await validateClaimValue(request.expectedClaim)) ||
+			!(await validateClaimValue(request.nextClaim)) ||
+			request.expectedClaim.ownerManifestSha256 !== request.creatorDescriptor.ownerManifestSha256 ||
+			request.nextClaim.ownerManifestSha256 !== request.creatorDescriptor.ownerManifestSha256 ||
+			request.nextClaim.claimOperationId !== request.effectOperationId ||
+			request.nextClaim.controlHostId !== request.controller.controlHostId ||
+			!(await validateClaimStaleEvidence(request.staleOwnerEvidence, request))
+		)
+			return false;
+	} else if (
+		request.compareAndSwap !== true ||
+		request.noFollow !== true ||
+		!(await validateClaimValue(request.expectedClaim)) ||
+		request.expectedClaim.ownerManifestSha256 !== request.creatorDescriptor.ownerManifestSha256 ||
+		request.nextClaim !== null ||
+		(request.reason !== "create_aborted" && request.reason !== "isolation_create_failed")
+	)
+		return false;
+	return request.requestSha256 === (await claimTupleRef(await claimRequestTuple(request)));
+}
+
+async function validateClaimAttempt(
+	attempt: ConfidentialTransientTaskIsolationOwnershipClaimEffectAttemptV1,
+): Promise<boolean> {
+	return Boolean(
+		strictClaimRecord(attempt, ["state", "request", "openedAt", "attemptSha256"]) &&
+			(attempt.state === "claim_not_applied" || attempt.state === "claim_outcome_unknown") &&
+			validClaimIso8601(attempt.openedAt) &&
+			CLAIM_SHA256_REF.test(attempt.attemptSha256) &&
+			(await validateClaimRequest(attempt.request)) &&
+			attempt.attemptSha256 === (await claimTupleRef(await claimAttemptTuple(attempt))),
+	);
+}
+
+const CLAIM_HELPER_INPUT_LIMIT = 16 * 1024 * 1024;
+const CLAIM_HELPER_OUTPUT_LIMIT = 256 * 1024;
+const CLAIM_HELPER_TIMEOUT_MS = 60_000;
+
+async function resolveClaimHelperExecutable(): Promise<string> {
+	if (process.platform === "win32") throw new Error("transient_task_authority_platform_unsupported");
+	const directories = new Set(
+		(process.env.PATH ?? "").split(path.delimiter).filter(directory => path.isAbsolute(directory)),
+	);
+	directories.add("/usr/local/bin");
+	directories.add("/opt/homebrew/bin");
+	directories.add("/usr/bin");
+	for (const directory of directories) {
+		try {
+			const executable = await fs.realpath(path.join(directory, "python3"));
+			if ((await fs.stat(executable)).isFile()) {
+				await fs.access(executable, fsConstants.X_OK);
+				return executable;
+			}
+		} catch {}
+	}
+	throw new Error("transient_task_authority_helper_unavailable");
+}
+
+const CLAIM_AUTHORITY_HELPER_SOURCE = String.raw`
+import base64, fcntl, json, os, stat, sys
+
+NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+READ_DIR = os.O_RDONLY | DIRECTORY | NOFOLLOW | CLOEXEC
+READ_FILE = os.O_RDONLY | NOFOLLOW | CLOEXEC
+LOCK_NAME = ".omp-transient-task-isolation-exclusion-v1.lock"
+MAX_CLAIM = 64 * 1024
+if len(sys.argv) != 3:
+    raise SystemExit(2)
+INPUT_PATH, OUTPUT_PATH = sys.argv[1:]
+
+def canonical_absolute(value):
+    return isinstance(value, str) and value.startswith("/") and "\0" not in value and os.path.normpath(value) == value
+
+def open_absolute_directory(target):
+    if not canonical_absolute(target):
+        raise ValueError("invalid path")
+    current = os.open("/", READ_DIR)
+    try:
+        for component in [part for part in target.split("/") if part]:
+            if component in (".", ".."):
+                raise ValueError("invalid component")
+            child = os.open(component, READ_DIR, dir_fd=current)
+            os.close(current)
+            current = child
+        return current
+    except BaseException:
+        os.close(current)
+        raise
+
+def private_regular(info):
+    return stat.S_ISREG(info.st_mode) and not stat.S_IMODE(info.st_mode) & 0o077 and (not hasattr(os, "getuid") or info.st_uid == os.getuid())
+
+def read_all(descriptor, limit):
+    chunks = []
+    remaining = limit + 1
+    while remaining > 0:
+        chunk = os.read(descriptor, min(65536, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    value = b"".join(chunks)
+    if len(value) > limit:
+        raise ValueError("file too large")
+    return value
+
+def read_entry(parent, name, limit):
+    try:
+        expected = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    descriptor = os.open(name, READ_FILE, dir_fd=parent)
+    try:
+        actual = os.fstat(descriptor)
+        if not private_regular(actual) or (actual.st_dev, actual.st_ino) != (expected.st_dev, expected.st_ino):
+            raise ValueError("unsafe entry")
+        content = read_all(descriptor, limit)
+        final = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if (final.st_dev, final.st_ino) != (actual.st_dev, actual.st_ino):
+            raise ValueError("entry changed")
+        return content
+    finally:
+        os.close(descriptor)
+
+def read_absolute_file(target, limit):
+    parent_path, name = os.path.split(target)
+    if not canonical_absolute(target) or not name or name in (".", ".."):
+        raise ValueError("invalid input")
+    parent = open_absolute_directory(parent_path)
+    try:
+        value = read_entry(parent, name, limit)
+        if value is None:
+            raise FileNotFoundError(target)
+        return value
+    finally:
+        os.close(parent)
+
+def emit(value):
+    content = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8", "strict")
+    parent_path, name = os.path.split(OUTPUT_PATH)
+    parent = open_absolute_directory(parent_path)
+    descriptor = None
+    try:
+        descriptor = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW | CLOEXEC, 0o600, dir_fd=parent)
+        offset = 0
+        while offset < len(content):
+            offset += os.write(descriptor, content[offset:])
+        os.fsync(descriptor)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(parent)
+
+def write_private(parent, name, content):
+    descriptor = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW | CLOEXEC, 0o600, dir_fd=parent)
+    try:
+        offset = 0
+        while offset < len(content):
+            offset += os.write(descriptor, content[offset:])
+        os.fsync(descriptor)
+        info = os.fstat(descriptor)
+        if not private_regular(info):
+            raise ValueError("unsafe created entry")
+        return info
+    finally:
+        os.close(descriptor)
+
+def replace_private(parent, name, content):
+    temporary = ".omp-claim-" + os.urandom(12).hex()
+    try:
+        temporary_info = write_private(parent, temporary, content)
+        os.replace(temporary, name, src_dir_fd=parent, dst_dir_fd=parent)
+        final = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if (final.st_dev, final.st_ino) != (temporary_info.st_dev, temporary_info.st_ino) or read_entry(parent, name, len(content)) != content:
+            raise ValueError("replacement changed")
+        os.fsync(parent)
+    finally:
+        try:
+            os.unlink(temporary, dir_fd=parent)
+        except FileNotFoundError:
+            pass
+
+def validate_layout(request):
+    root_path = request["worktreesRoot"]
+    base_path = request["baseDir"]
+    merged_path = request["mergedDir"]
+    claim_path = request["ownershipClaimPath"]
+    segment = request["directorySegment"]
+    if not canonical_absolute(root_path) or not isinstance(segment, str) or not segment or "/" in segment or "\0" in segment:
+        raise ValueError("invalid layout")
+    if base_path != root_path + "/" + segment or merged_path != base_path + "/m" or claim_path != root_path + "/" + segment + ".owner-v1":
+        raise ValueError("layout mismatch")
+    return root_path, segment + ".owner-v1"
+
+def acquire_root(request):
+    root_path, claim_name = validate_layout(request)
+    root = open_absolute_directory(root_path)
+    lock = os.open(LOCK_NAME, os.O_RDWR | os.O_CREAT | NOFOLLOW | CLOEXEC, 0o600, dir_fd=root)
+    if not private_regular(os.fstat(lock)):
+        os.close(lock)
+        os.close(root)
+        raise ValueError("unsafe lock")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    return root, lock, claim_name
+
+def exclusive_install(root, name, content):
+    temporary = ".omp-claim-" + os.urandom(12).hex()
+    try:
+        temporary_info = write_private(root, temporary, content)
+        try:
+            os.link(temporary, name, src_dir_fd=root, dst_dir_fd=root, follow_symlinks=False)
+        except FileExistsError:
+            return "exact" if read_entry(root, name, MAX_CLAIM) == content else "conflict"
+        final = os.stat(name, dir_fd=root, follow_symlinks=False)
+        if (final.st_dev, final.st_ino) != (temporary_info.st_dev, temporary_info.st_ino) or read_entry(root, name, MAX_CLAIM) != content:
+            raise ValueError("claim changed")
+        os.fsync(root)
+        return "created"
+    finally:
+        try:
+            os.unlink(temporary, dir_fd=root)
+        except FileNotFoundError:
+            pass
+
+def cas_replace(root, name, expected, desired):
+    before = os.stat(name, dir_fd=root, follow_symlinks=False)
+    if read_entry(root, name, MAX_CLAIM) != expected:
+        return False
+    current = os.stat(name, dir_fd=root, follow_symlinks=False)
+    if (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino):
+        raise ValueError("claim changed")
+    replace_private(root, name, desired)
+    return True
+
+def cas_unlink(root, name, expected):
+    try:
+        before = os.stat(name, dir_fd=root, follow_symlinks=False)
+    except FileNotFoundError:
+        return "absent"
+    if read_entry(root, name, MAX_CLAIM) != expected:
+        return "conflict"
+    current = os.stat(name, dir_fd=root, follow_symlinks=False)
+    if (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino):
+        raise ValueError("claim changed")
+    moved = ".omp-released-" + os.urandom(12).hex()
+    os.rename(name, moved, src_dir_fd=root, dst_dir_fd=root)
+    try:
+        moved_info = os.stat(moved, dir_fd=root, follow_symlinks=False)
+        if (moved_info.st_dev, moved_info.st_ino) != (before.st_dev, before.st_ino) or read_entry(root, moved, MAX_CLAIM) != expected:
+            raise ValueError("released entry changed")
+        os.unlink(moved, dir_fd=root)
+        os.fsync(root)
+        return "released"
+    except BaseException:
+        try:
+            os.rename(moved, name, src_dir_fd=root, dst_dir_fd=root)
+        except BaseException:
+            pass
+        raise
+
+try:
+    if not NOFOLLOW or not CLOEXEC or not DIRECTORY:
+        emit({"status":"unsupported"})
+        raise SystemExit(0)
+    request = json.loads(read_absolute_file(INPUT_PATH, 16 * 1024 * 1024).decode("utf-8", "strict"))
+    if not isinstance(request, dict) or request.get("operation") not in ("claim_dispatch", "claim_inspect"):
+        raise ValueError("invalid request")
+    root, lock, claim_name = acquire_root(request)
+    try:
+        if request["operation"] == "claim_inspect":
+            current = read_entry(root, claim_name, MAX_CLAIM)
+            emit({"status":"absent"} if current is None else {"status":"present","claimBytesBase64":base64.b64encode(current).decode("ascii")})
+        else:
+            effect = request["claimOperation"]
+            expected = None if request["expectedClaimUtf8"] is None else request["expectedClaimUtf8"].encode("utf-8", "strict")
+            desired = None if request["nextClaimUtf8"] is None else request["nextClaimUtf8"].encode("utf-8", "strict")
+            if effect == "exclusive_create" and expected is None and desired is not None:
+                outcome = exclusive_install(root, claim_name, desired)
+                emit({"status":"applied","outcome":outcome} if outcome != "conflict" else {"status":"conflict"})
+            elif effect == "stale_same_owner_cas_adopt" and expected is not None and desired is not None:
+                emit({"status":"applied","outcome":"adopted"} if cas_replace(root, claim_name, expected, desired) else {"status":"conflict"})
+            elif effect == "pre_bind_cas_release" and expected is not None and desired is None:
+                outcome = cas_unlink(root, claim_name, expected)
+                emit({"status":"applied","outcome":outcome} if outcome != "conflict" else {"status":"conflict"})
+            else:
+                raise ValueError("invalid claim operation")
+    finally:
+        os.close(lock)
+        os.close(root)
+except SystemExit:
+    raise
+except (OSError, ValueError, TypeError, UnicodeError, KeyError, json.JSONDecodeError, base64.binascii.Error):
+    emit({"status":"outcome_unknown"})
+`;
+
+async function readClaimHelperOutput(outputPath: string): Promise<unknown> {
+	const descriptor = await fs.open(outputPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+	try {
+		const before = await descriptor.stat();
+		if (
+			!before.isFile() ||
+			before.size > CLAIM_HELPER_OUTPUT_LIMIT ||
+			(before.mode & 0o7777) !== 0o600 ||
+			(typeof process.getuid === "function" && before.uid !== process.getuid())
+		)
+			throw new Error("transient_task_authority_outcome_unknown");
+		const content = await descriptor.readFile();
+		const after = await descriptor.stat();
+		if (content.byteLength !== before.size || after.size !== before.size)
+			throw new Error("transient_task_authority_outcome_unknown");
+		return JSON.parse(content.toString("utf8"));
+	} finally {
+		await descriptor.close();
+	}
+}
+
+async function runClaimAuthorityHelper(request: Readonly<Record<string, unknown>>): Promise<unknown> {
+	const payload = Buffer.from(JSON.stringify(request), "utf8");
+	if (payload.byteLength > CLAIM_HELPER_INPUT_LIMIT) throw new Error("transient_task_authority_outcome_unknown");
+	const executable = await resolveClaimHelperExecutable();
+	let temporaryRoot: string | undefined;
+	try {
+		temporaryRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-worktree-authority-"));
+		await fs.chmod(temporaryRoot, 0o700);
+		const root = await fs.realpath(temporaryRoot);
+		const inputPath = path.join(root, "input");
+		const outputPath = path.join(root, "output");
+		await fs.writeFile(inputPath, payload, { flag: "wx", mode: 0o600 });
+		const result = await new Promise<unknown>((resolve, reject) => {
+			const child = spawn(executable, ["-I", "-S", "-c", CLAIM_AUTHORITY_HELPER_SOURCE, inputPath, outputPath], {
+				stdio: "ignore",
+			});
+			const timeout = setTimeout(() => child.kill("SIGKILL"), CLAIM_HELPER_TIMEOUT_MS);
+			timeout.unref();
+			child.once("error", () => {
+				clearTimeout(timeout);
+				reject(new Error("transient_task_authority_outcome_unknown"));
+			});
+			child.once("close", code => {
+				clearTimeout(timeout);
+				if (code !== 0) {
+					reject(new Error("transient_task_authority_outcome_unknown"));
+					return;
+				}
+				void readClaimHelperOutput(outputPath).then(resolve, () =>
+					reject(new Error("transient_task_authority_outcome_unknown")),
+				);
+			});
+		});
+		return result;
+	} catch (error) {
+		if (
+			error instanceof Error &&
+			(error.message === "transient_task_authority_platform_unsupported" ||
+				error.message === "transient_task_authority_helper_unavailable")
+		)
+			throw error;
+		throw new Error("transient_task_authority_outcome_unknown");
+	} finally {
+		if (temporaryRoot) await fs.rm(temporaryRoot, { recursive: true, force: true }).catch(() => undefined);
+	}
+}
+
+export type PackageInternalNativeTransientTaskIsolationOwnershipClaimInspectionV1 =
+	| { readonly status: "matching"; readonly receipt: ConfidentialTransientTaskIsolationOwnershipClaimEffectReceiptV1 }
+	| {
+			readonly status: "not_applied";
+			readonly proof: ConfidentialTransientTaskIsolationOwnershipClaimNotAppliedProofV1;
+	  }
+	| {
+			readonly status: "stale_same_owner";
+			readonly observedClaim: ConfidentialTransientTaskIsolationOwnershipClaimV1;
+			readonly ownerLivenessEvidence: Extract<
+				ConfidentialTransientTaskIsolationOwnerLivenessEvidenceV1,
+				{ readonly verdict: "stale" }
+			>;
+	  }
+	| {
+			readonly status: "same_owner_live";
+			readonly observedClaim: ConfidentialTransientTaskIsolationOwnershipClaimV1;
+			readonly ownerLivenessEvidence: Extract<
+				ConfidentialTransientTaskIsolationOwnerLivenessEvidenceV1,
+				{ readonly verdict: "live" }
+			>;
+	  }
+	| {
+			readonly status: "same_owner_liveness_indeterminate";
+			readonly observedClaim: ConfidentialTransientTaskIsolationOwnershipClaimV1;
+			readonly ownerLivenessEvidence: Extract<
+				ConfidentialTransientTaskIsolationOwnerLivenessEvidenceV1,
+				{ readonly verdict: "indeterminate" }
+			>;
+	  }
+	| {
+			readonly status: "live_different_owner";
+			readonly observedClaim: ConfidentialTransientTaskIsolationOwnershipClaimV1;
+	  }
+	| { readonly status: "outcome_unknown" | "conflict" | "invalid" };
+
+export interface PackageInternalNativeTransientTaskIsolationOwnershipClaimRuntimeV1
+	extends TransientTaskIsolationOwnershipClaimEffectV1 {
+	inspect(input: {
+		readonly attempt: ConfidentialTransientTaskIsolationOwnershipClaimEffectAttemptV1;
+		readonly request: TransientTaskIsolationOwnershipClaimEffectInspectRequestV1;
+	}): Promise<PackageInternalNativeTransientTaskIsolationOwnershipClaimInspectionV1>;
+}
+
+function claimHelperRequest(
+	descriptor: ConfidentialTransientTaskIsolationCreatorDescriptorV1,
+	operation: "claim_dispatch" | "claim_inspect",
+): Record<string, unknown> {
+	return {
+		operation,
+		worktreesRoot: path.dirname(descriptor.baseDir),
+		directorySegment: descriptor.directorySegment,
+		baseDir: descriptor.baseDir,
+		mergedDir: descriptor.mergedDir,
+		ownershipClaimPath: descriptor.ownershipClaimPath,
+	};
+}
+
+async function claimFromHelperResult(
+	value: unknown,
+): Promise<ConfidentialTransientTaskIsolationOwnershipClaimV1 | null | undefined> {
+	const result = strictClaimRecord(value, ["status", "claimBytesBase64"]);
+	if (result?.status !== "present" || typeof result.claimBytesBase64 !== "string") return undefined;
+	try {
+		const bytes = Buffer.from(result.claimBytesBase64, "base64");
+		if (bytes.toString("base64") !== result.claimBytesBase64) return undefined;
+		const parsed: unknown = JSON.parse(bytes.toString("utf8"));
+		if (!(await validateClaimValue(parsed as ConfidentialTransientTaskIsolationOwnershipClaimV1))) return undefined;
+		const claim = parsed as ConfidentialTransientTaskIsolationOwnershipClaimV1;
+		return bytes.equals(canonicalClaimBytes(claim)) ? Object.freeze({ ...claim }) : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+async function inspectPhysicalClaim(
+	descriptor: ConfidentialTransientTaskIsolationCreatorDescriptorV1,
+): Promise<ConfidentialTransientTaskIsolationOwnershipClaimV1 | null | undefined> {
+	const value = await runClaimAuthorityHelper(claimHelperRequest(descriptor, "claim_inspect"));
+	const absent = strictClaimRecord(value, ["status"]);
+	if (absent?.status === "absent") return null;
+	if (absent?.status === "unsupported") return undefined;
+	return claimFromHelperResult(value);
+}
+
+function inspectRequestMatchesAttempt(
+	request: TransientTaskIsolationOwnershipClaimEffectInspectRequestV1,
+	attempt: ConfidentialTransientTaskIsolationOwnershipClaimEffectAttemptV1,
+): boolean {
+	const effect = attempt.request;
+	return Boolean(
+		strictClaimRecord(request, [
+			"schemaVersion",
+			"taskId",
+			"runId",
+			"createId",
+			"operation",
+			"effectOperationId",
+			"creatorDescriptorSha256",
+			"requestSha256",
+			"attemptSha256",
+		]) &&
+			request.schemaVersion === 1 &&
+			request.taskId === effect.taskId &&
+			request.runId === effect.runId &&
+			request.createId === effect.createId &&
+			request.operation === effect.operation &&
+			request.effectOperationId === effect.effectOperationId &&
+			request.creatorDescriptorSha256 === effect.creatorDescriptor.creatorDescriptorSha256 &&
+			request.requestSha256 === effect.requestSha256 &&
+			request.attemptSha256 === attempt.attemptSha256,
+	);
+}
+
+async function mintClaimReceipt(
+	request: ConfidentialTransientTaskIsolationOwnershipClaimEffectRequestV1,
+	attemptSha256: Sha256Ref,
+	completedAt: ISO8601,
+	outcome: "created" | "exact_claim_adopted" | "stale_same_owner_adopted" | "released_before_bind",
+): Promise<ConfidentialTransientTaskIsolationOwnershipClaimEffectReceiptV1> {
+	const core =
+		request.operation === "pre_bind_cas_release"
+			? {
+					schemaVersion: 1 as const,
+					taskId: request.taskId,
+					runId: request.runId,
+					createId: request.createId,
+					effectOperationId: request.effectOperationId,
+					requestSha256: request.requestSha256,
+					attemptSha256,
+					authoritySha256: request.authoritySha256,
+					completedAt,
+					operation: request.operation,
+					outcome: "released_before_bind" as const,
+					previousClaimSha256: request.expectedClaim.claimSha256,
+					currentClaimSha256: null,
+					reason: request.reason,
+				}
+			: {
+					schemaVersion: 1 as const,
+					taskId: request.taskId,
+					runId: request.runId,
+					createId: request.createId,
+					effectOperationId: request.effectOperationId,
+					requestSha256: request.requestSha256,
+					attemptSha256,
+					authoritySha256: request.authoritySha256,
+					completedAt,
+					operation: request.operation,
+					outcome:
+						request.operation === "exclusive_create"
+							? outcome === "created"
+								? ("created" as const)
+								: ("exact_claim_adopted" as const)
+							: ("stale_same_owner_adopted" as const),
+					previousClaimSha256: request.operation === "exclusive_create" ? null : request.expectedClaim.claimSha256,
+					claim: request.nextClaim,
+					currentClaimSha256: request.nextClaim.claimSha256,
+				};
+	const receipt = {
+		...core,
+		receiptSha256: await claimTupleRef(
+			await claimReceiptTuple(core as ConfidentialTransientTaskIsolationOwnershipClaimEffectReceiptV1),
+		),
+	} as ConfidentialTransientTaskIsolationOwnershipClaimEffectReceiptV1;
+	return Object.freeze(receipt);
+}
+
+async function mintClaimLivenessEvidence(
+	request: ConfidentialTransientTaskIsolationOwnershipClaimEffectRequestV1,
+	attemptSha256: Sha256Ref,
+	observedClaim: ConfidentialTransientTaskIsolationOwnershipClaimV1,
+	processIdentityProbe: ConfidentialTransientTaskIsolationOwnerProcessIdentityProbeV1,
+): Promise<ConfidentialTransientTaskIsolationOwnerLivenessEvidenceV1> {
+	let verdict: ConfidentialTransientTaskIsolationOwnerLivenessEvidenceV1["verdict"];
+	let basis: ConfidentialTransientTaskIsolationOwnerLivenessEvidenceV1["basis"];
+	if (observedClaim.controlHostId !== request.controller.controlHostId) {
+		verdict = "indeterminate";
+		basis = "different_control_host";
+	} else if (observedClaim.processStartToken === null) {
+		verdict = "indeterminate";
+		basis = "missing_process_start_token";
+	} else {
+		const probe = await processIdentityProbe.inspect({
+			controlHostId: observedClaim.controlHostId,
+			pid: observedClaim.pid,
+			processStartToken: observedClaim.processStartToken,
+		});
+		if (probe.status === "pid_absent") {
+			verdict = "stale";
+			basis = "same_host_pid_absent";
+		} else if (probe.status === "process_start_token_mismatch") {
+			verdict = "stale";
+			basis = "same_host_process_start_token_mismatch";
+		} else if (probe.status === "live" && probe.observedProcessStartToken === observedClaim.processStartToken) {
+			verdict = "live";
+			basis = "same_host_process_identity_live";
+		} else {
+			verdict = "indeterminate";
+			basis =
+				probe.status === "unsupported"
+					? "process_probe_unsupported"
+					: probe.status === "permission_denied"
+						? "process_probe_permission_denied"
+						: "process_probe_unavailable";
+		}
+	}
+	const core = {
+		schemaVersion: 1 as const,
+		taskId: request.taskId,
+		runId: request.runId,
+		createId: request.createId,
+		effectOperationId: request.effectOperationId,
+		creatorDescriptorSha256: request.creatorDescriptor.creatorDescriptorSha256,
+		requestSha256: request.requestSha256,
+		attemptSha256,
+		observedClaim,
+		probingControlHostId: request.controller.controlHostId,
+		verdict,
+		basis,
+	} as ConfidentialTransientTaskIsolationOwnerLivenessEvidenceV1;
+	return Object.freeze({ ...core, evidenceSha256: await claimTupleRef(claimLivenessEvidenceTuple(core)) });
+}
+
+/** Package-internal runtime for the sole durable claim-effect store. */
+export function createPackageInternalNativeTransientTaskIsolationOwnershipClaimRuntimeV1(options: {
+	readonly processIdentityProbe: ConfidentialTransientTaskIsolationOwnerProcessIdentityProbeV1;
+	readonly now?: () => ISO8601;
+}): PackageInternalNativeTransientTaskIsolationOwnershipClaimRuntimeV1 {
+	const now = options.now ?? (() => new Date().toISOString() as ISO8601);
+	return Object.freeze({
+		async dispatch(request: ConfidentialTransientTaskIsolationOwnershipClaimEffectRequestV1) {
+			if (!(await validateClaimRequest(request)))
+				return { status: "invalid" as const, code: "record_invariant_violation" as const };
+			let result: unknown;
+			try {
+				result = await runClaimAuthorityHelper({
+					...claimHelperRequest(request.creatorDescriptor, "claim_dispatch"),
+					claimOperation: request.operation,
+					expectedClaimUtf8: request.expectedClaim
+						? canonicalClaimBytes(request.expectedClaim).toString("utf8")
+						: null,
+					nextClaimUtf8: request.nextClaim ? canonicalClaimBytes(request.nextClaim).toString("utf8") : null,
+				});
+			} catch (error) {
+				if (
+					error instanceof Error &&
+					(error.message === "transient_task_authority_platform_unsupported" ||
+						error.message === "transient_task_authority_helper_unavailable")
+				)
+					return { status: "unsupported" as const, code: "claim_cas_unsupported" as const };
+				throw new Error("claim_effect_outcome_unknown");
+			}
+			const applied = strictClaimRecord(result, ["status", "outcome"]);
+			if (applied?.status === "applied")
+				return {
+					status: "applied" as const,
+					observedClaimSha256: request.operation === "pre_bind_cas_release" ? null : request.nextClaim.claimSha256,
+				};
+			const status = strictClaimRecord(result, ["status"]);
+			if (status?.status === "unsupported")
+				return { status: "unsupported" as const, code: "claim_cas_unsupported" as const };
+			if (status?.status !== "conflict") throw new Error("claim_effect_outcome_unknown");
+			const observed = await inspectPhysicalClaim(request.creatorDescriptor).catch(() => undefined);
+			if (!observed) return { status: "conflict" as const, code: "claim_path_changed" as const };
+			if (observed.claimSha256 === (request.nextClaim?.claimSha256 ?? request.expectedClaim?.claimSha256))
+				return { status: "conflict" as const, code: "same_digest_different_owner_tuple" as const };
+			return {
+				status: "conflict" as const,
+				code:
+					observed.ownerManifestSha256 !== request.creatorDescriptor.ownerManifestSha256
+						? ("live_different_owner" as const)
+						: ("claim_path_changed" as const),
+			};
+		},
+		async inspect(input: {
+			readonly attempt: ConfidentialTransientTaskIsolationOwnershipClaimEffectAttemptV1;
+			readonly request: TransientTaskIsolationOwnershipClaimEffectInspectRequestV1;
+		}) {
+			if (
+				!(await validateClaimAttempt(input.attempt)) ||
+				!inspectRequestMatchesAttempt(input.request, input.attempt)
+			)
+				return { status: "invalid" as const };
+			let observed: ConfidentialTransientTaskIsolationOwnershipClaimV1 | null | undefined;
+			try {
+				observed = await inspectPhysicalClaim(input.attempt.request.creatorDescriptor);
+			} catch {
+				return { status: "outcome_unknown" as const };
+			}
+			if (observed === undefined) return { status: "outcome_unknown" as const };
+			const inspectedAt = now();
+			if (!validClaimIso8601(inspectedAt)) return { status: "invalid" as const };
+			const effect = input.attempt.request;
+			const matching =
+				effect.operation === "pre_bind_cas_release"
+					? observed === null
+					: observed !== null && sameClaimValue(observed, effect.nextClaim);
+			if (matching)
+				return {
+					status: "matching" as const,
+					receipt: await mintClaimReceipt(
+						effect,
+						input.attempt.attemptSha256,
+						inspectedAt,
+						effect.operation === "exclusive_create"
+							? "exact_claim_adopted"
+							: effect.operation === "stale_same_owner_cas_adopt"
+								? "stale_same_owner_adopted"
+								: "released_before_bind",
+					),
+				};
+			const observedState =
+				effect.operation === "exclusive_create" && observed === null
+					? ("claim_path_absent" as const)
+					: effect.operation === "stale_same_owner_cas_adopt" &&
+							observed !== null &&
+							sameClaimValue(observed, effect.expectedClaim)
+						? ("expected_stale_claim_present" as const)
+						: effect.operation === "pre_bind_cas_release" &&
+								observed !== null &&
+								sameClaimValue(observed, effect.expectedClaim)
+							? ("expected_current_claim_present" as const)
+							: null;
+			if (observedState) {
+				const core = {
+					schemaVersion: 1 as const,
+					request: effect,
+					attemptSha256: input.attempt.attemptSha256,
+					observedState,
+					inspectedAt,
+				};
+				return {
+					status: "not_applied" as const,
+					proof: Object.freeze({
+						...core,
+						proofSha256: await claimTupleRef([
+							"omp-transient-task-isolation-claim-effect-v1",
+							"not_applied",
+							1,
+							await claimRequestTuple(effect),
+							core.attemptSha256,
+							core.observedState,
+							core.inspectedAt,
+						]),
+					}),
+				};
+			}
+			if (observed === null) return { status: "conflict" as const };
+			if (observed.ownerManifestSha256 !== effect.creatorDescriptor.ownerManifestSha256)
+				return { status: "live_different_owner" as const, observedClaim: observed };
+			const evidence = await mintClaimLivenessEvidence(
+				effect,
+				input.attempt.attemptSha256,
+				observed,
+				options.processIdentityProbe,
+			);
+			if (evidence.verdict === "stale")
+				return { status: "stale_same_owner" as const, observedClaim: observed, ownerLivenessEvidence: evidence };
+			if (evidence.verdict === "live")
+				return { status: "same_owner_live" as const, observedClaim: observed, ownerLivenessEvidence: evidence };
+			return {
+				status: "same_owner_liveness_indeterminate" as const,
+				observedClaim: observed,
+				ownerLivenessEvidence: evidence,
+			};
+		},
+	} satisfies PackageInternalNativeTransientTaskIsolationOwnershipClaimRuntimeV1);
 }

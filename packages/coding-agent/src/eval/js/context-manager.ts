@@ -10,6 +10,7 @@ import { ToolAbortError, ToolError } from "../../tools/tool-errors";
 import { safeSend as safeSendIpc } from "../../utils/ipc";
 import { EVAL_TIMEOUT_PAUSE_OP, EVAL_TIMEOUT_RESUME_OP } from "../bridge-timeout";
 import { attachSessionOwner, resolveOwnerScopedSessionKey, type SessionOwners } from "../executor-base";
+import type { EvalAgentLifecycleContextV1 } from "../lifecycle";
 import { shouldDetachKernel } from "../py/spawn-options";
 import { callSessionTool, type JsStatusEvent } from "./tool-bridge";
 import { WorkerCore } from "./worker-core";
@@ -46,6 +47,7 @@ interface PendingRun {
 	runId: string;
 	runState: VmRunState;
 	toolSession: ToolSession;
+	evalAgentLifecycle?: EvalAgentLifecycleContextV1;
 	resolve(value: { value: unknown }): void;
 	reject(error: Error): void;
 	toolCalls: Map<string, AbortController>;
@@ -131,6 +133,7 @@ export async function executeInVmContext(options: {
 	ownerId?: string;
 	cwd: string;
 	session: ToolSession;
+	evalAgentLifecycle?: EvalAgentLifecycleContextV1;
 	localRoots?: Record<string, string>;
 	reset?: boolean;
 	code: string;
@@ -273,6 +276,7 @@ async function runOnce(
 		sessionId: string;
 		cwd: string;
 		session: ToolSession;
+		evalAgentLifecycle?: EvalAgentLifecycleContextV1;
 		localRoots?: Record<string, string>;
 		code: string;
 		filename: string;
@@ -285,6 +289,7 @@ async function runOnce(
 		runId,
 		runState: options.runState,
 		toolSession: options.session,
+		evalAgentLifecycle: options.evalAgentLifecycle,
 		resolve,
 		reject,
 		toolCalls: new Map(),
@@ -535,6 +540,8 @@ async function handleToolCall(session: JsSession, msg: Extract<WorkerOutbound, {
 	try {
 		const value = await callSessionTool(msg.name, msg.args, {
 			session: pending.toolSession,
+			lifecycle: pending.evalAgentLifecycle,
+			bridgeCallKey: `js:${pending.runId}:${msg.id}`,
 			signal: ctrl.signal,
 			emitStatus: (event: JsStatusEvent) => {
 				trackDeferPhase(pending, event);

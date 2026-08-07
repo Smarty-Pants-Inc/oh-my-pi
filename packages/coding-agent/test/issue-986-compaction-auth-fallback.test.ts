@@ -11,7 +11,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { assistantMsg, userMsg } from "./utilities";
+import { assistantMsg, createTestRuntimeDependencies, userMsg } from "./utilities";
 
 describe("issue #986 compaction auth fallback", () => {
 	let tempDir: TempDir;
@@ -65,6 +65,7 @@ describe("issue #986 compaction auth fallback", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 		session.subscribe(() => {});
 
@@ -116,6 +117,7 @@ describe("issue #986 compaction auth fallback", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 		session.subscribe(() => {});
 		for (const [userText, assistantText] of [

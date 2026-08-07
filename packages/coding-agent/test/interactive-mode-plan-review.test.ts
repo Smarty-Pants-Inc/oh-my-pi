@@ -25,6 +25,7 @@ import { AUTO_THINKING } from "@oh-my-pi/pi-coding-agent/thinking";
 import * as clipboard from "@oh-my-pi/pi-coding-agent/utils/clipboard";
 import { type OverlayHandle, type OverlayOptions, setKeybindings, Text } from "@oh-my-pi/pi-tui";
 import { formatNumber, TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 /**
  * Matches the plan-approved synthetic-prompt dispatch. `#approvePlan` calls
@@ -117,6 +118,7 @@ describe("InteractiveMode plan review rendering", () => {
 			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
 			settings: Settings.isolated(),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 		mode = new InteractiveMode(session, "test");
 	});
@@ -760,6 +762,7 @@ describe("InteractiveMode plan review rendering", () => {
 			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
 			settings: Settings.isolated({ modelRoles: { plan: `anthropic/${planModel.id}` } }),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 		mode = new InteractiveMode(session, "test");
 

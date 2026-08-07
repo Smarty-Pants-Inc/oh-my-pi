@@ -214,7 +214,7 @@ it("hands the tool bridge the unshielded signal so a deferred phase still cancel
 		.spyOn(pyToolBridge, "registerPyToolBridge")
 		.mockImplementation((_sessionId, _runId, entry) => {
 			bridgeSignal = entry.signal;
-			return () => {};
+			return { drain: async () => {}, unregister: () => {} };
 		});
 
 	const kernel: GenericKernel<Record<string, string | null>> = {
@@ -308,7 +308,7 @@ it("holds the cell open through a deferred phase while still aborting the tool a
 			const pending = fetch(`${bridge.url}/v1/tool`, {
 				method: "POST",
 				headers: { authorization: `Bearer ${bridge.token}`, "content-type": "application/json" },
-				body: JSON.stringify({ session: bridgeSessionId, run: options.id, name: "merge", args: {} }),
+				body: JSON.stringify({ session: bridgeSessionId, run: options.id, call: 0, name: "merge", args: {} }),
 			}).then(res => res.json() as Promise<{ ok: boolean; value?: unknown; error?: string }>);
 
 			await toolStarted.promise;

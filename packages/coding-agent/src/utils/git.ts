@@ -1,3 +1,5 @@
+import { Buffer } from "node:buffer";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -10,6 +12,32 @@ import {
 	parseNumstat,
 } from "../commit/git/diff";
 import type { FileDiff, FileHunks, NumstatEntry } from "../commit/types";
+import { TRANSIENT_TASK_GIT_RUNTIME_MINT_AUTHORITY } from "../registry/persistent-agent-store.js";
+import type {
+	ConfidentialTransientTaskCaptureRepositoryHandleV1,
+	ConfidentialTransientTaskGitCaptureRefCompareAndSwapInvocationV1,
+	ConfidentialTransientTaskGitCaptureRefDeleteInvocationV1,
+	ConfidentialTransientTaskGitObjectImportInvocationV1,
+	ConfidentialTransientTaskGitObjectInspectionV1,
+	ConfidentialTransientTaskGitRefInspectionV1,
+	ConfidentialTransientTaskGitRepositoryBindingSnapshotV1,
+	ConfidentialTransientTaskGitRepositoryHandleV1,
+	TransientTaskGitEffectSafetyV1,
+	TransientTaskGitExpectedObjectFactsV1,
+	TransientTaskGitExpectedRefFactsV1,
+	TransientTaskGitExpectedRefValueV1,
+	TransientTaskGitInvalidRequestReasonV1,
+	TransientTaskGitObjectFormatV1,
+	TransientTaskGitRawCommandObservationV1,
+	TransientTaskGitRawObjectEffectResultV1,
+	TransientTaskGitRawObjectObservationV1,
+	TransientTaskGitRawRefEffectResultV1,
+	TransientTaskGitRawRefObservationV1,
+	TransientTaskGitRepositoryEffectScopeV1,
+	TransientTaskIsolationCleanupHandleV1,
+	TransientTaskPreparedGitObjectTypeV1,
+	TransientTaskPublicationTargetCleanupClaimV1,
+} from "../session/workspace-runtime-contracts.js";
 import { ToolAbortError, ToolError, throwIfAborted } from "../tools/tool-errors";
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -272,21 +300,41 @@ async function waitForChildExit(child: Subprocess, timeoutMs: number): Promise<b
 	}
 }
 
-async function terminateTimedOutChild(child: Subprocess): Promise<void> {
+interface TimedOutTermination {
+	readonly terminalState: "reaped" | "unreaped";
+	readonly terminationSignalsSent: readonly ("SIGTERM" | "SIGKILL")[];
+}
+
+async function terminateTimedOutChild(child: Subprocess): Promise<TimedOutTermination> {
+	const terminationSignalsSent: ("SIGTERM" | "SIGKILL")[] = [];
 	child.kill("SIGTERM");
-	if (await waitForChildExit(child, GIT_COMMAND_TERMINATE_GRACE_MS)) return;
+	terminationSignalsSent.push("SIGTERM");
+	if (await waitForChildExit(child, GIT_COMMAND_TERMINATE_GRACE_MS))
+		return { terminalState: "reaped", terminationSignalsSent };
 	child.kill("SIGKILL");
-	await waitForChildExit(child, GIT_COMMAND_TERMINATE_GRACE_MS);
+	terminationSignalsSent.push("SIGKILL");
+	return {
+		terminalState: (await waitForChildExit(child, GIT_COMMAND_TERMINATE_GRACE_MS)) ? "reaped" : "unreaped",
+		terminationSignalsSent,
+	};
 }
 
 async function waitForExitWithTimeout(
 	child: Subprocess,
 	commandLabel: string,
 	timeoutMs: number,
-): Promise<{ exitCode: number | null; timedOut: false } | { timedOut: true; stderr: string }> {
+): Promise<
+	| { exitCode: number | null; timedOut: false; terminalState: "reaped"; terminationSignalsSent: readonly [] }
+	| {
+			timedOut: true;
+			stderr: string;
+			terminalState: "reaped" | "unreaped";
+			terminationSignalsSent: readonly ("SIGTERM" | "SIGKILL")[];
+	  }
+> {
 	if (timeoutMs === 0) {
-		await terminateTimedOutChild(child);
-		return { timedOut: true, stderr: `${commandLabel} timed out after 0ms` };
+		const termination = await terminateTimedOutChild(child);
+		return { timedOut: true, stderr: `${commandLabel} timed out after 0ms`, ...termination };
 	}
 	const timeout = Promise.withResolvers<"timeout">();
 	const timer = setTimeout(() => timeout.resolve("timeout"), timeoutMs);
@@ -296,11 +344,10 @@ async function waitForExitWithTimeout(
 			child.exited.then(exitCode => ({ kind: "exit" as const, exitCode })),
 			timeout.promise.then(() => ({ kind: "timeout" as const })),
 		]);
-		if (result.kind === "exit") {
-			return { timedOut: false, exitCode: result.exitCode };
-		}
-		await terminateTimedOutChild(child);
-		return { timedOut: true, stderr: `${commandLabel} timed out after ${timeoutMs}ms` };
+		if (result.kind === "exit")
+			return { timedOut: false, exitCode: result.exitCode, terminalState: "reaped", terminationSignalsSent: [] };
+		const termination = await terminateTimedOutChild(child);
+		return { timedOut: true, stderr: `${commandLabel} timed out after ${timeoutMs}ms`, ...termination };
 	} finally {
 		clearTimeout(timer);
 	}
@@ -555,6 +602,715 @@ async function tryText(
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+interface BoundGitRepository {
+	readonly commonDir: string;
+	readonly commonDirDevice: number;
+	readonly commonDirInode: number;
+	readonly gitDir: string;
+	readonly gitDirDevice: number;
+	readonly gitDirInode: number;
+	readonly objectFormat: TransientTaskGitObjectFormatV1;
+	readonly repositoryRoot: string;
+	readonly scope: TransientTaskGitRepositoryEffectScopeV1;
+}
+
+function objectFormatForRepository(commonDir: string): TransientTaskGitObjectFormatV1 {
+	const config = fs.readFileSync(path.join(commonDir, "config"), "utf8");
+	return /^\s*objectformat\s*=\s*sha256\s*$/im.test(config) ? "sha256" : "sha1";
+}
+
+function mintRepositoryHandle<T extends ConfidentialTransientTaskGitRepositoryHandleV1>(
+	handles: WeakMap<ConfidentialTransientTaskGitRepositoryHandleV1, BoundGitRepository>,
+	binding: ConfidentialTransientTaskGitRepositoryBindingSnapshotV1,
+	handle: T,
+): T {
+	const gitDir = fs.realpathSync.native(binding.gitDir);
+	const commonDir = fs.realpathSync.native(binding.commonDir);
+	const repositoryRoot = fs.realpathSync.native(binding.repositoryRoot);
+	const resolvedCommonDir = fs.realpathSync.native(resolveCommonDirSync(gitDir));
+	if (resolvedCommonDir !== commonDir)
+		throw new ToolError("Git common directory does not match the repository binding.");
+	const resolvedRepository = resolveRepositorySync(repositoryRoot);
+	if (
+		resolvedRepository &&
+		(fs.realpathSync.native(resolvedRepository.gitDir) !== gitDir ||
+			fs.realpathSync.native(resolvedRepository.commonDir) !== commonDir)
+	) {
+		throw new ToolError("Git repository paths do not match the repository binding.");
+	}
+	const gitDirStat = fs.statSync(gitDir);
+	const commonDirStat = fs.statSync(commonDir);
+	if (!gitDirStat.isDirectory() || !commonDirStat.isDirectory()) throw new ToolError("Git directory is unavailable.");
+	const objectFormat = objectFormatForRepository(commonDir);
+	if (objectFormat !== binding.objectFormat)
+		throw new ToolError("Git object format does not match the repository binding.");
+	handles.set(
+		handle,
+		Object.freeze({
+			commonDir,
+			commonDirDevice: commonDirStat.dev,
+			commonDirInode: commonDirStat.ino,
+			gitDir,
+			gitDirDevice: gitDirStat.dev,
+			gitDirInode: gitDirStat.ino,
+			objectFormat,
+			repositoryRoot,
+			scope: binding.scope,
+		}),
+	);
+	return handle;
+}
+
+type RepositoryResolution =
+	| { readonly status: "bound"; readonly repository: BoundGitRepository }
+	| { readonly status: "invalid"; readonly reason: TransientTaskGitInvalidRequestReasonV1 };
+
+function repositoryForHandle(
+	handles: WeakMap<ConfidentialTransientTaskGitRepositoryHandleV1, BoundGitRepository>,
+	handle: ConfidentialTransientTaskGitRepositoryHandleV1,
+	scope: TransientTaskGitRepositoryEffectScopeV1,
+): RepositoryResolution {
+	const repository = handles.get(handle);
+	if (!repository) return { status: "invalid", reason: "repository_handle_unavailable" };
+	if (repository.scope !== scope) return { status: "invalid", reason: "repository_scope_mismatch" };
+	try {
+		if (!repositoryMetadataIsCurrent(repository))
+			return { status: "invalid", reason: "repository_identity_mismatch" };
+		if (objectFormatForRepository(repository.commonDir) !== repository.objectFormat) {
+			return { status: "invalid", reason: "repository_object_format_mismatch" };
+		}
+		return { status: "bound", repository };
+	} catch {
+		return { status: "invalid", reason: "repository_identity_mismatch" };
+	}
+}
+
+function repositoryMetadataIsCurrent(repository: BoundGitRepository): boolean {
+	const gitDirStat = fs.statSync(repository.gitDir);
+	const commonDirStat = fs.statSync(repository.commonDir);
+	return (
+		gitDirStat.isDirectory() &&
+		gitDirStat.dev === repository.gitDirDevice &&
+		gitDirStat.ino === repository.gitDirInode &&
+		commonDirStat.isDirectory() &&
+		commonDirStat.dev === repository.commonDirDevice &&
+		commonDirStat.ino === repository.commonDirInode &&
+		fs.realpathSync.native(resolveCommonDirSync(repository.gitDir)) === repository.commonDir
+	);
+}
+
+function repositoryIdentityIsCurrent(repository: BoundGitRepository): boolean {
+	try {
+		return (
+			repositoryMetadataIsCurrent(repository) &&
+			objectFormatForRepository(repository.commonDir) === repository.objectFormat
+		);
+	} catch {
+		return false;
+	}
+}
+
+function base64(bytes: Uint8Array): string {
+	return Buffer.from(bytes).toString("base64");
+}
+
+interface ObjectRequestSnapshot {
+	readonly command: readonly string[];
+	readonly expected: TransientTaskGitExpectedObjectFactsV1;
+	readonly body: Uint8Array;
+	readonly repository: ConfidentialTransientTaskGitRepositoryHandleV1;
+}
+
+interface RefRequestSnapshot {
+	readonly command: readonly string[];
+	readonly expected: TransientTaskGitExpectedRefFactsV1;
+	readonly repository: ConfidentialTransientTaskGitRepositoryHandleV1;
+	readonly scope: TransientTaskGitRepositoryEffectScopeV1;
+}
+
+function isFullOid(value: unknown, objectFormat: TransientTaskGitObjectFormatV1): value is string {
+	return typeof value === "string" && new RegExp(`^[0-9a-f]{${objectFormat === "sha1" ? 40 : 64}}$`).test(value);
+}
+
+function isFullRefName(value: unknown): value is string {
+	if (typeof value !== "string" || !value.startsWith("refs/") || value.endsWith("/") || value.includes("//"))
+		return false;
+	if (/[\u0000-\u0020~^:?*[\\]|@\{|\.\./.test(value)) return false;
+	return value
+		.split("/")
+		.every(
+			component =>
+				component.length > 0 &&
+				!component.startsWith(".") &&
+				!component.endsWith(".") &&
+				!component.endsWith(".lock"),
+		);
+}
+
+function decodeCanonicalBase64(value: unknown): Uint8Array | undefined {
+	if (typeof value !== "string" || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value))
+		return undefined;
+	const bytes = new Uint8Array(Buffer.from(value, "base64"));
+	return base64(bytes) === value ? bytes : undefined;
+}
+
+type RequestSnapshot<T> =
+	| { readonly status: "valid"; readonly value: T }
+	| { readonly status: "invalid"; readonly reason: TransientTaskGitInvalidRequestReasonV1 };
+
+const NO_GIT_COMMANDS: readonly [] = [];
+
+function dataProperties(value: unknown, keys: readonly string[]): Record<string, unknown> | undefined {
+	if (typeof value !== "object" || value === null) return undefined;
+	const prototype = Object.getPrototypeOf(value);
+	if (prototype !== Object.prototype && prototype !== null) return undefined;
+	const snapshot = Object.create(null) as Record<string, unknown>;
+	for (const key of keys) {
+		const descriptor = Object.getOwnPropertyDescriptor(value, key);
+		if (!descriptor || !("value" in descriptor)) return undefined;
+		snapshot[key] = descriptor.value;
+	}
+	return snapshot;
+}
+
+function frozenTuple(value: unknown, values: readonly string[]): boolean {
+	if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype || !Object.isFrozen(value))
+		return false;
+	const length = Object.getOwnPropertyDescriptor(value, "length");
+	if (!length || !("value" in length) || length.value !== values.length) return false;
+	return values.every((expected, index) => {
+		const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+		return descriptor && "value" in descriptor && descriptor.value === expected;
+	});
+}
+
+function snapshotExpectedRefValue(
+	value: unknown,
+	objectFormat: TransientTaskGitObjectFormatV1,
+): TransientTaskGitExpectedRefValueV1 | undefined {
+	const fields = dataProperties(value, ["state"]);
+	if (!fields) return undefined;
+	if (fields.state === "absent") return Object.freeze({ state: "absent" });
+	if (fields.state !== "present") return undefined;
+	const objectId = Object.getOwnPropertyDescriptor(value as object, "objectId");
+	if (objectId && "value" in objectId && isFullOid(objectId.value, objectFormat)) {
+		return Object.freeze({ state: "present", objectId: objectId.value });
+	}
+	return undefined;
+}
+
+function snapshotObjectRequest(
+	request: ConfidentialTransientTaskGitObjectImportInvocationV1 | ConfidentialTransientTaskGitObjectInspectionV1,
+	kind: "import" | "inspect",
+): RequestSnapshot<ObjectRequestSnapshot> {
+	try {
+		const requestFields = dataProperties(
+			request,
+			kind === "import"
+				? ["repository", "storeDispatchState", "command", "expected"]
+				: ["repository", "purpose", "expected"],
+		);
+		if (!requestFields) return { status: "invalid", reason: "invalid_command" };
+		if (kind === "import" && requestFields.storeDispatchState !== "outcome_unknown")
+			return { status: "invalid", reason: "invalid_store_dispatch_state" };
+		if (
+			kind === "inspect" &&
+			requestFields.purpose !== "pre_effect_exact_check" &&
+			requestFields.purpose !== "outcome_unknown_reconciliation"
+		)
+			return { status: "invalid", reason: "invalid_command" };
+		if (typeof requestFields.repository !== "object" || requestFields.repository === null)
+			return { status: "invalid", reason: "repository_handle_unavailable" };
+		const expected = dataProperties(requestFields.expected, [
+			"objectFormat",
+			"objectType",
+			"expectedObjectSha",
+			"objectBodyBytesBase64",
+			"objectBodyByteLength",
+			"objectBodySha256",
+		]);
+		if (!expected || (expected.objectFormat !== "sha1" && expected.objectFormat !== "sha256"))
+			return { status: "invalid", reason: "invalid_command" };
+		if (expected.objectType !== "blob" && expected.objectType !== "tree" && expected.objectType !== "commit")
+			return { status: "invalid", reason: "invalid_object_id" };
+		if (!isFullOid(expected.expectedObjectSha, expected.objectFormat))
+			return { status: "invalid", reason: "invalid_object_id" };
+		if (
+			typeof expected.objectBodyBytesBase64 !== "string" ||
+			typeof expected.objectBodyByteLength !== "number" ||
+			!Number.isSafeInteger(expected.objectBodyByteLength) ||
+			expected.objectBodyByteLength < 0 ||
+			typeof expected.objectBodySha256 !== "string"
+		)
+			return { status: "invalid", reason: "invalid_command" };
+		const decodedBody = decodeCanonicalBase64(expected.objectBodyBytesBase64);
+		if (!decodedBody) return { status: "invalid", reason: "invalid_object_body_encoding" };
+		const body = new Uint8Array(decodedBody);
+		if (expected.objectBodyByteLength !== body.byteLength)
+			return { status: "invalid", reason: "object_body_byte_length_mismatch" };
+		const bodySha256 = createHash("sha256").update(body).digest("hex");
+		if (expected.objectBodySha256 !== `sha256:${bodySha256}`)
+			return { status: "invalid", reason: "object_body_sha256_mismatch" };
+		const objectId = createHash(expected.objectFormat)
+			.update(`${expected.objectType} ${body.byteLength}\0`)
+			.update(body)
+			.digest("hex");
+		if (objectId !== expected.expectedObjectSha) return { status: "invalid", reason: "object_id_mismatch" };
+		const command = ["git", "hash-object", "-t", expected.objectType, "-w", "--stdin"];
+		if (kind === "import" && !frozenTuple(requestFields.command, command))
+			return { status: "invalid", reason: "invalid_command" };
+		const expectedSnapshot = Object.freeze({
+			objectFormat: expected.objectFormat,
+			objectType: expected.objectType,
+			expectedObjectSha: expected.expectedObjectSha,
+			objectBodyBytesBase64: expected.objectBodyBytesBase64,
+			objectBodyByteLength: expected.objectBodyByteLength,
+			objectBodySha256: expected.objectBodySha256,
+		}) as TransientTaskGitExpectedObjectFactsV1;
+		return {
+			status: "valid",
+			value: Object.freeze({
+				command: kind === "import" ? Object.freeze(command) : NO_GIT_COMMANDS,
+				expected: expectedSnapshot,
+				body,
+				repository: requestFields.repository as ConfidentialTransientTaskGitRepositoryHandleV1,
+			}),
+		};
+	} catch {
+		return { status: "invalid", reason: "invalid_command" };
+	}
+}
+
+function snapshotRefRequest(
+	request:
+		| ConfidentialTransientTaskGitCaptureRefCompareAndSwapInvocationV1
+		| ConfidentialTransientTaskGitCaptureRefDeleteInvocationV1
+		| ConfidentialTransientTaskGitRefInspectionV1,
+	kind: "capture" | "cleanup" | "inspect",
+): RequestSnapshot<RefRequestSnapshot> {
+	try {
+		const requestFields = dataProperties(
+			request,
+			kind === "inspect"
+				? ["repository", "operation", "purpose", "expected"]
+				: ["repository", "storeDispatchState", "command", "expected"],
+		);
+		if (!requestFields) return { status: "invalid", reason: "invalid_command" };
+		const scope =
+			kind === "inspect"
+				? requestFields.operation === "capture_ref_compare_and_swap"
+					? "capture_materialization"
+					: requestFields.operation === "capture_ref_delete"
+						? "cleanup_ref_delete"
+						: undefined
+				: kind === "capture"
+					? "capture_materialization"
+					: "cleanup_ref_delete";
+		if (
+			!scope ||
+			(kind === "inspect" &&
+				requestFields.purpose !== "pre_effect_exact_check" &&
+				requestFields.purpose !== "outcome_unknown_reconciliation")
+		)
+			return { status: "invalid", reason: "invalid_command" };
+		if (
+			(kind === "capture" && requestFields.storeDispatchState !== "outcome_unknown") ||
+			(kind === "cleanup" && requestFields.storeDispatchState !== "component_outcome_unknown")
+		)
+			return { status: "invalid", reason: "invalid_store_dispatch_state" };
+		if (typeof requestFields.repository !== "object" || requestFields.repository === null)
+			return { status: "invalid", reason: "repository_handle_unavailable" };
+		const expected = dataProperties(requestFields.expected, [
+			"objectFormat",
+			"refName",
+			"expectedOld",
+			"expectedNew",
+		]);
+		if (!expected || (expected.objectFormat !== "sha1" && expected.objectFormat !== "sha256"))
+			return { status: "invalid", reason: "invalid_command" };
+		if (!isFullRefName(expected.refName)) return { status: "invalid", reason: "invalid_ref_name" };
+		const expectedOld = snapshotExpectedRefValue(expected.expectedOld, expected.objectFormat);
+		const expectedNew = snapshotExpectedRefValue(expected.expectedNew, expected.objectFormat);
+		if (!expectedOld || !expectedNew) return { status: "invalid", reason: "invalid_object_id" };
+		const operation = scope === "capture_materialization" ? "capture" : "cleanup";
+		if (operation === "capture" && expectedNew.state !== "present")
+			return { status: "invalid", reason: "invalid_operation_semantics" };
+		if (operation === "cleanup" && (expectedOld.state !== "present" || expectedNew.state !== "absent"))
+			return { status: "invalid", reason: "invalid_operation_semantics" };
+		const command =
+			operation === "capture"
+				? [
+						"git",
+						"update-ref",
+						expected.refName,
+						expectedNew.state === "present" ? expectedNew.objectId : "",
+						expectedRefArg(expectedOld, expected.objectFormat),
+					]
+				: ["git", "update-ref", "-d", expected.refName, expectedRefArg(expectedOld, expected.objectFormat)];
+		if (kind !== "inspect" && !frozenTuple(requestFields.command, command))
+			return { status: "invalid", reason: "invalid_command" };
+		return {
+			status: "valid",
+			value: Object.freeze({
+				command: kind === "inspect" ? NO_GIT_COMMANDS : Object.freeze(command),
+				expected: Object.freeze({
+					objectFormat: expected.objectFormat,
+					refName: expected.refName,
+					expectedOld,
+					expectedNew,
+				}),
+				repository: requestFields.repository as ConfidentialTransientTaskGitRepositoryHandleV1,
+				scope,
+			}),
+		};
+	} catch {
+		return { status: "invalid", reason: "invalid_command" };
+	}
+}
+
+function invalidObjectObservation(
+	reason: TransientTaskGitInvalidRequestReasonV1,
+): TransientTaskGitRawObjectObservationV1 {
+	return { status: "invalid_request", reason, commands: NO_GIT_COMMANDS };
+}
+
+function invalidRefObservation(reason: TransientTaskGitInvalidRequestReasonV1): TransientTaskGitRawRefObservationV1 {
+	return { status: "invalid_request", reason, commands: NO_GIT_COMMANDS };
+}
+
+function spawnErrorCode(error: unknown): string | null {
+	if (typeof error !== "object" || error === null || !("code" in error)) return null;
+	const code = error.code;
+	return typeof code === "string" ? code : null;
+}
+
+const CLEAN_GIT_EFFECT_CHILD = String.raw`
+const { readFileSync, writeFileSync } = await import("node:fs");
+const requestPath = process.env.OMP_GIT_EFFECT_REQUEST;
+const stdinPath = process.env.OMP_GIT_EFFECT_STDIN;
+const outputPath = process.env.OMP_GIT_EFFECT_OUTPUT;
+const rawLimit = Number(process.env.OMP_GIT_EFFECT_RAW_LIMIT);
+const envelopeLimit = Number(process.env.OMP_GIT_EFFECT_ENVELOPE_LIMIT);
+const oid = value => typeof value === "string" && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(value);
+const ref = value => typeof value === "string" && /^refs\/[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(value);
+const fixedCommand = (args, hasStdin) =>
+  (args.length === 3 && args[0] === "cat-file" && ["-e", "-t", "blob", "tree", "commit"].includes(args[1]) && oid(args[2])) ||
+  (!hasStdin && args.length === 4 && args[0] === "show-ref" && ((args[1] === "--verify" && args[2] === "--quiet") || (args[1] === "--hash" && args[2] === "--verify")) && ref(args[3])) ||
+  (hasStdin && args.length === 5 && args[0] === "hash-object" && args[1] === "-t" && ["blob", "tree", "commit"].includes(args[2]) && args[3] === "-w" && args[4] === "--stdin") ||
+  (!hasStdin && ((args.length === 4 && args[0] === "update-ref" && ref(args[1]) && oid(args[2]) && oid(args[3])) || (args.length === 4 && args[0] === "update-ref" && args[1] === "-d" && ref(args[2]) && oid(args[3]))));
+let payload;
+try {
+  if (!requestPath || !outputPath || !Number.isSafeInteger(rawLimit) || rawLimit < 1 || !Number.isSafeInteger(envelopeLimit) || envelopeLimit < 1) throw new Error("invalid Git effect transport");
+  const request = JSON.parse(readFileSync(requestPath, "utf8"));
+  if (!request || typeof request !== "object" || Array.isArray(request) || Object.keys(request).length !== 4 || !Array.isArray(request.args) || request.args.some(arg => typeof arg !== "string") || typeof request.cwd !== "string" || typeof request.gitDir !== "string" || typeof request.commonDir !== "string" || !fixedCommand(request.args, Boolean(stdinPath))) throw new Error("invalid Git effect request");
+  const stdin = stdinPath ? readFileSync(stdinPath) : undefined;
+  if (stdin && stdin.byteLength > rawLimit) throw new Error("Git effect stdin exceeded limit");
+  const result = Bun.spawnSync(["git", ...request.args], { cwd: request.cwd, env: { ...process.env, GIT_DIR: request.gitDir, GIT_COMMON_DIR: request.commonDir }, stdin: stdin ?? "ignore", stdout: "pipe", stderr: "pipe", windowsHide: true });
+  if (result.stdout.byteLength > rawLimit || result.stderr.byteLength > rawLimit) {
+    payload = { ok: false, error: "output_limit_exceeded" };
+  } else {
+    payload = { ok: true, exitCode: result.exitCode, stdoutBytesBase64: Buffer.from(result.stdout).toString("base64"), stderrBytesBase64: Buffer.from(result.stderr).toString("base64") };
+  }
+} catch (error) {
+  payload = { ok: false, error: error instanceof Error ? error.message : "clean_child_failed" };
+}
+const serialized = JSON.stringify(payload);
+if (new TextEncoder().encode(serialized).byteLength > envelopeLimit) throw new Error("Git effect envelope exceeded limit");
+writeFileSync(outputPath, serialized, { encoding: "utf8", mode: 0o600, flag: "wx" });
+`;
+
+function gitEffectObservation(
+	argv: [string, ...string[]],
+	stdinBytesBase64: string | null,
+	result: Omit<TransientTaskGitRawCommandObservationV1, "argv" | "stdinBytesBase64">,
+): TransientTaskGitRawCommandObservationV1 {
+	return { argv, stdinBytesBase64, ...result };
+}
+
+async function runRepositoryGit(
+	repository: BoundGitRepository | undefined,
+	args: readonly string[],
+	stdin: Uint8Array | undefined = undefined,
+): Promise<TransientTaskGitRawCommandObservationV1> {
+	const argv: [string, ...string[]] = repository
+		? ["git", `--git-dir=${repository.gitDir}`, ...args]
+		: ["git", ...args];
+	const stdinBytesBase64 = stdin === undefined ? null : base64(stdin);
+	const notStarted = (spawnErrorCode: string) =>
+		gitEffectObservation(argv, stdinBytesBase64, {
+			started: false,
+			exitCode: null,
+			signal: null,
+			spawnErrorCode,
+			timedOut: false,
+			timeoutMs: null,
+			terminationSignalsSent: [],
+			terminalState: "not_started",
+			captureErrorCode: null,
+			stdoutBytesBase64: "",
+			stderrBytesBase64: "",
+		});
+	if (!repository) return notStarted("repository_handle_unavailable");
+	if (!repositoryIdentityIsCurrent(repository)) return notStarted("repository_identity_mismatch");
+	const envelopeLimit = Math.ceil((2 * GIT_COMMAND_OUTPUT_LIMIT_BYTES * 4) / 3) + 1024;
+	let transportRoot: string | undefined;
+	try {
+		if (stdin && stdin.byteLength > GIT_COMMAND_OUTPUT_LIMIT_BYTES) return notStarted("output_limit_exceeded");
+		transportRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), "omp-git-effect-"));
+		await fs.promises.chmod(transportRoot, 0o700);
+		const requestPath = path.join(transportRoot, "request.json");
+		const stdinPath = stdin === undefined ? undefined : path.join(transportRoot, "stdin");
+		const outputPath = path.join(transportRoot, "result.json");
+		const request = JSON.stringify({
+			args,
+			cwd: repository.gitDir,
+			gitDir: repository.gitDir,
+			commonDir: repository.commonDir,
+		});
+		if (Buffer.byteLength(request) > GIT_COMMAND_OUTPUT_LIMIT_BYTES) return notStarted("output_limit_exceeded");
+		await fs.promises.writeFile(requestPath, request, { encoding: "utf8", mode: 0o600, flag: "wx" });
+		if (stdin !== undefined) await fs.promises.writeFile(stdinPath!, stdin, { mode: 0o600, flag: "wx" });
+		const child = Bun.spawn([process.execPath, "--no-addons", "-e", CLEAN_GIT_EFFECT_CHILD], {
+			cwd: transportRoot,
+			env: buildGitEnv({
+				GIT_DIR: undefined,
+				GIT_WORK_TREE: undefined,
+				GIT_COMMON_DIR: undefined,
+				GIT_OBJECT_DIRECTORY: undefined,
+				GIT_ALTERNATE_OBJECT_DIRECTORIES: undefined,
+				OMP_GIT_EFFECT_REQUEST: requestPath,
+				OMP_GIT_EFFECT_STDIN: stdinPath ?? "",
+				OMP_GIT_EFFECT_OUTPUT: outputPath,
+				OMP_GIT_EFFECT_RAW_LIMIT: String(GIT_COMMAND_OUTPUT_LIMIT_BYTES),
+				OMP_GIT_EFFECT_ENVELOPE_LIMIT: String(envelopeLimit),
+			}),
+			stdin: "ignore",
+			stdout: "ignore",
+			stderr: "ignore",
+			windowsHide: true,
+		});
+		const exit = await waitForExitWithTimeout(
+			child,
+			formatCommandLabel("git", ["effect", ...argv.slice(1)]),
+			GIT_COMMAND_TIMEOUT_MS,
+		);
+		if (exit.timedOut || exit.terminalState !== "reaped")
+			return gitEffectObservation(argv, stdinBytesBase64, {
+				started: true,
+				exitCode: null,
+				signal: null,
+				spawnErrorCode: "command_timeout",
+				timedOut: true,
+				timeoutMs: GIT_COMMAND_TIMEOUT_MS,
+				terminationSignalsSent: exit.terminationSignalsSent,
+				terminalState: exit.terminalState,
+				captureErrorCode: "output_capture_timeout",
+				stdoutBytesBase64: "",
+				stderrBytesBase64: "",
+			});
+		if (exit.exitCode !== 0)
+			return gitEffectObservation(argv, stdinBytesBase64, {
+				started: true,
+				exitCode: null,
+				signal: null,
+				spawnErrorCode: "clean_child_failed",
+				timedOut: false,
+				timeoutMs: null,
+				terminationSignalsSent: [],
+				terminalState: "reaped",
+				captureErrorCode: null,
+				stdoutBytesBase64: "",
+				stderrBytesBase64: "",
+			});
+		const stat = await fs.promises.stat(outputPath);
+		if (stat.size > envelopeLimit) throw new Error("output_limit_exceeded");
+		const envelopeValue: unknown = JSON.parse(await fs.promises.readFile(outputPath, "utf8"));
+		if (!envelopeValue || typeof envelopeValue !== "object" || Array.isArray(envelopeValue))
+			throw new Error("clean_child_failed");
+		const envelope = envelopeValue as Record<string, unknown>;
+		const exitCode = envelope.exitCode;
+		const stdoutBytesBase64 = envelope.stdoutBytesBase64;
+		const stderrBytesBase64 = envelope.stderrBytesBase64;
+		const outputExceeded =
+			Object.keys(envelope).length === 2 && envelope.ok === false && envelope.error === "output_limit_exceeded";
+		if (
+			Object.keys(envelope).length !== 4 ||
+			envelope.ok !== true ||
+			(exitCode !== null && (typeof exitCode !== "number" || !Number.isSafeInteger(exitCode))) ||
+			typeof stdoutBytesBase64 !== "string" ||
+			typeof stderrBytesBase64 !== "string"
+		)
+			throw new Error(outputExceeded ? "output_limit_exceeded" : "clean_child_failed");
+		const stdout = Buffer.from(stdoutBytesBase64, "base64");
+		const stderr = Buffer.from(stderrBytesBase64, "base64");
+		if (
+			stdout.byteLength > GIT_COMMAND_OUTPUT_LIMIT_BYTES ||
+			stderr.byteLength > GIT_COMMAND_OUTPUT_LIMIT_BYTES ||
+			stdout.toString("base64") !== stdoutBytesBase64 ||
+			stderr.toString("base64") !== stderrBytesBase64
+		)
+			throw new Error("output_limit_exceeded");
+		return gitEffectObservation(argv, stdinBytesBase64, {
+			started: true,
+			exitCode,
+			signal: null,
+			spawnErrorCode: null,
+			timedOut: false,
+			timeoutMs: null,
+			terminationSignalsSent: [],
+			terminalState: "reaped",
+			captureErrorCode: null,
+			stdoutBytesBase64,
+			stderrBytesBase64,
+		});
+	} catch (error) {
+		return gitEffectObservation(argv, stdinBytesBase64, {
+			started: Boolean(transportRoot),
+			exitCode: null,
+			signal: null,
+			spawnErrorCode:
+				spawnErrorCode(error) ??
+				(error instanceof Error && error.message === "output_limit_exceeded"
+					? "output_limit_exceeded"
+					: "clean_child_failed"),
+			timedOut: false,
+			timeoutMs: null,
+			terminationSignalsSent: [],
+			terminalState: transportRoot ? "reaped" : "not_started",
+			captureErrorCode: null,
+			stdoutBytesBase64: "",
+			stderrBytesBase64: "",
+		});
+	} finally {
+		if (transportRoot) await fs.promises.rm(transportRoot, { recursive: true, force: true });
+	}
+}
+
+function commandFailedForUnavailableRepository(command: TransientTaskGitRawCommandObservationV1): boolean {
+	return (
+		!command.started ||
+		command.captureErrorCode !== null ||
+		/not a git repository|cannot change to|no such file or directory|working directory does not exist/i.test(
+			new TextDecoder().decode(Buffer.from(command.stderrBytesBase64, "base64")),
+		)
+	);
+}
+function commandProvesMissing(command: TransientTaskGitRawCommandObservationV1): boolean {
+	return (
+		command.started &&
+		command.exitCode === 1 &&
+		command.signal === null &&
+		command.spawnErrorCode === null &&
+		!command.timedOut &&
+		command.terminalState === "reaped" &&
+		command.captureErrorCode === null &&
+		new TextDecoder().decode(Buffer.from(command.stderrBytesBase64, "base64")).length === 0
+	);
+}
+
+function objectUnavailable(
+	commands: readonly TransientTaskGitRawCommandObservationV1[],
+	reason: "repository_unavailable" | "object_read_failed",
+): TransientTaskGitRawObjectObservationV1 {
+	return { status: "unavailable", reason, commands };
+}
+
+function refUnavailable(
+	commands: readonly TransientTaskGitRawCommandObservationV1[],
+	reason: "repository_unavailable" | "ref_read_failed",
+): TransientTaskGitRawRefObservationV1 {
+	return { status: "unavailable", reason, commands };
+}
+
+async function inspectObjectExact(
+	repository: BoundGitRepository | undefined,
+	expected: TransientTaskGitExpectedObjectFactsV1,
+): Promise<TransientTaskGitRawObjectObservationV1> {
+	if (repository && repository.objectFormat !== expected.objectFormat)
+		return objectUnavailable([], "object_read_failed");
+	const exists = await runRepositoryGit(repository, ["cat-file", "-e", expected.expectedObjectSha]);
+	const commands = [exists];
+	if (exists.exitCode !== 0) {
+		if (commandFailedForUnavailableRepository(exists)) return objectUnavailable(commands, "repository_unavailable");
+		if (commandProvesMissing(exists)) return { status: "absent", commands };
+		return objectUnavailable(commands, "object_read_failed");
+	}
+
+	const type = await runRepositoryGit(repository, ["cat-file", "-t", expected.expectedObjectSha]);
+	commands.push(type);
+	if (type.exitCode !== 0) {
+		return objectUnavailable(
+			commands,
+			commandFailedForUnavailableRepository(type) ? "repository_unavailable" : "object_read_failed",
+		);
+	}
+	const observedObjectType = new TextDecoder().decode(Buffer.from(type.stdoutBytesBase64, "base64")).trim();
+	if (observedObjectType !== "blob" && observedObjectType !== "tree" && observedObjectType !== "commit") {
+		return objectUnavailable(commands, "object_read_failed");
+	}
+	const objectType: TransientTaskPreparedGitObjectTypeV1 = observedObjectType;
+
+	const body = await runRepositoryGit(repository, ["cat-file", objectType, expected.expectedObjectSha]);
+	commands.push(body);
+	if (body.exitCode !== 0) {
+		return objectUnavailable(
+			commands,
+			commandFailedForUnavailableRepository(body) ? "repository_unavailable" : "object_read_failed",
+		);
+	}
+	const objectBody = new Uint8Array(Buffer.from(body.stdoutBytesBase64, "base64"));
+	return {
+		status: "present",
+		objectId: expected.expectedObjectSha,
+		objectType,
+		objectBodyBytesBase64: base64(objectBody),
+		objectBodyByteLength: objectBody.byteLength,
+		commands,
+	};
+}
+
+async function inspectRefExact(
+	repository: BoundGitRepository | undefined,
+	expected: TransientTaskGitExpectedRefFactsV1,
+): Promise<TransientTaskGitRawRefObservationV1> {
+	if (repository && repository.objectFormat !== expected.objectFormat) return refUnavailable([], "ref_read_failed");
+	const exists = await runRepositoryGit(repository, ["show-ref", "--verify", "--quiet", expected.refName]);
+	const commands = [exists];
+	if (exists.exitCode !== 0) {
+		if (commandFailedForUnavailableRepository(exists)) return refUnavailable(commands, "repository_unavailable");
+		if (commandProvesMissing(exists)) return { status: "absent", commands };
+		return refUnavailable(commands, "ref_read_failed");
+	}
+	const hash = await runRepositoryGit(repository, ["show-ref", "--hash", "--verify", expected.refName]);
+	commands.push(hash);
+	if (hash.exitCode !== 0)
+		return refUnavailable(
+			commands,
+			commandFailedForUnavailableRepository(hash) ? "repository_unavailable" : "ref_read_failed",
+		);
+	const objectId = new TextDecoder().decode(Buffer.from(hash.stdoutBytesBase64, "base64")).trim();
+	return isFullOid(objectId, expected.objectFormat)
+		? { status: "present", objectId, commands }
+		: refUnavailable(commands, "ref_read_failed");
+}
+
+function matchesExpectedRef(
+	observation: TransientTaskGitRawRefObservationV1,
+	expected: TransientTaskGitExpectedRefValueV1,
+): boolean {
+	return expected.state === "absent"
+		? observation.status === "absent"
+		: observation.status === "present" && observation.objectId === expected.objectId;
+}
+
+function expectedRefArg(
+	expected: TransientTaskGitExpectedRefValueV1,
+	objectFormat: TransientTaskGitObjectFormatV1,
+): string {
+	return expected.state === "present" ? expected.objectId : "0".repeat(objectFormat === "sha1" ? 40 : 64);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // Internal: per-repo write serialization
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -566,6 +1322,7 @@ async function tryText(
 // failure mode. We give callers a single per-repo serialization point keyed by
 // the primary repo root: any block that mutates repo state should hold this
 // lock so unrelated callers cannot collide on git's internal locks.
+
 const repoWriteChain = new Map<string, Promise<unknown>>();
 
 /**
@@ -2222,15 +2979,29 @@ export const ls = {
 		cwd: string,
 		options: { others?: boolean; excludeStandard?: boolean; signal?: AbortSignal } = {},
 	): Promise<string[]> {
-		const args = ["ls-files"];
+		const args = ["ls-files", "-z"];
 		if (options.others) args.push("--others");
 		if (options.excludeStandard) args.push("--exclude-standard");
-		return splitLines(await runText(cwd, args, { readOnly: true, signal: options.signal }));
+		return (await runText(cwd, args, { readOnly: true, signal: options.signal })).split("\0").filter(Boolean);
 	},
 
 	/** List untracked files (excludes ignored). */
 	async untracked(cwd: string, signal?: AbortSignal): Promise<string[]> {
 		return ls.files(cwd, { others: true, excludeStandard: true, signal });
+	},
+
+	/** Return candidate paths excluded by repository ignore rules. */
+	async ignored(cwd: string, files: readonly string[], signal?: AbortSignal): Promise<string[]> {
+		if (files.length === 0) return [];
+		ensureAvailable();
+		const result = await git(cwd, ["check-ignore", "-z", "--stdin"], {
+			readOnly: true,
+			signal,
+			stdin: new TextEncoder().encode(`${files.join("\0")}\0`),
+		});
+		if (result.exitCode === 1) return [];
+		if (result.exitCode !== 0) throw new GitCommandError(["check-ignore", "-z", "--stdin"], result);
+		return result.stdout.split("\0").filter(Boolean);
 	},
 
 	/** List paths present in a ref, optionally filtered to specific paths. */
@@ -2371,6 +3142,169 @@ export const repo = {
 		return isReftableRepo(repository);
 	},
 };
+
+// ════════════════════════════════════════════════════════════════════════════
+// API: repository-bound Git effect safety
+// ════════════════════════════════════════════════════════════════════════════
+
+/** @internal Package-private source-module seam guarded by the store-owned mint authority. */
+export function createTransientTaskGitEffectSafetyRuntimeV1(authority: object) {
+	if (authority !== TRANSIENT_TASK_GIT_RUNTIME_MINT_AUTHORITY) {
+		throw new ToolError("Unauthorized Git runtime creation.");
+	}
+	const handles = new WeakMap<ConfidentialTransientTaskGitRepositoryHandleV1, BoundGitRepository>();
+
+	const resolveObjectRepository = (
+		handle: ConfidentialTransientTaskGitRepositoryHandleV1,
+		objectFormat: TransientTaskGitObjectFormatV1,
+	) => {
+		const resolution = repositoryForHandle(handles, handle, "capture_materialization");
+		if (resolution.status === "invalid") return resolution;
+		if (resolution.repository.objectFormat !== objectFormat) {
+			return { status: "invalid" as const, reason: "repository_object_format_mismatch" as const };
+		}
+		return resolution;
+	};
+	const resolveRefRepository = (
+		handle: ConfidentialTransientTaskGitRepositoryHandleV1,
+		scope: TransientTaskGitRepositoryEffectScopeV1,
+		objectFormat: TransientTaskGitObjectFormatV1,
+	) => {
+		const resolution = repositoryForHandle(handles, handle, scope);
+		if (resolution.status === "invalid") return resolution;
+		if (resolution.repository.objectFormat !== objectFormat) {
+			return { status: "invalid" as const, reason: "repository_object_format_mismatch" as const };
+		}
+		return resolution;
+	};
+
+	const effectSafety: TransientTaskGitEffectSafetyV1 = {
+		async importObjectOnly(request): Promise<TransientTaskGitRawObjectEffectResultV1> {
+			const snapshot = snapshotObjectRequest(request, "import");
+			if (snapshot.status === "invalid") {
+				const before = invalidObjectObservation(snapshot.reason);
+				return { before, command: null, after: before };
+			}
+			const resolution = resolveObjectRepository(snapshot.value.repository, snapshot.value.expected.objectFormat);
+			if (resolution.status === "invalid") {
+				const before = invalidObjectObservation(resolution.reason);
+				return { before, command: null, after: before };
+			}
+			const { repository } = resolution;
+			const before = await inspectObjectExact(repository, snapshot.value.expected);
+			if (before.status !== "absent") return { before, command: null, after: before };
+			const command = await runRepositoryGit(repository, snapshot.value.command.slice(1), snapshot.value.body);
+			const after = await inspectObjectExact(repository, snapshot.value.expected);
+			return { before, command, after };
+		},
+
+		async compareAndSwapCaptureRef(request): Promise<TransientTaskGitRawRefEffectResultV1> {
+			const snapshot = snapshotRefRequest(request, "capture");
+			if (snapshot.status === "invalid") {
+				const before = invalidRefObservation(snapshot.reason);
+				return { before, command: null, after: before };
+			}
+			const resolution = resolveRefRepository(
+				snapshot.value.repository,
+				snapshot.value.scope,
+				snapshot.value.expected.objectFormat,
+			);
+			if (resolution.status === "invalid") {
+				const before = invalidRefObservation(resolution.reason);
+				return { before, command: null, after: before };
+			}
+			const { repository } = resolution;
+			const before = await inspectRefExact(repository, snapshot.value.expected);
+			if (
+				matchesExpectedRef(before, snapshot.value.expected.expectedNew) ||
+				!matchesExpectedRef(before, snapshot.value.expected.expectedOld)
+			)
+				return { before, command: null, after: before };
+			const command = await runRepositoryGit(repository, snapshot.value.command.slice(1));
+			const after = await inspectRefExact(repository, snapshot.value.expected);
+			return { before, command, after };
+		},
+
+		async inspectObjectExact(request): Promise<TransientTaskGitRawObjectObservationV1> {
+			const snapshot = snapshotObjectRequest(request, "inspect");
+			if (snapshot.status === "invalid") return invalidObjectObservation(snapshot.reason);
+			const resolution = resolveObjectRepository(snapshot.value.repository, snapshot.value.expected.objectFormat);
+			return resolution.status === "invalid"
+				? invalidObjectObservation(resolution.reason)
+				: inspectObjectExact(resolution.repository, snapshot.value.expected);
+		},
+
+		async inspectRefExact(request): Promise<TransientTaskGitRawRefObservationV1> {
+			const snapshot = snapshotRefRequest(request, "inspect");
+			if (snapshot.status === "invalid") return invalidRefObservation(snapshot.reason);
+			const resolution = resolveRefRepository(
+				snapshot.value.repository,
+				snapshot.value.scope,
+				snapshot.value.expected.objectFormat,
+			);
+			return resolution.status === "invalid"
+				? invalidRefObservation(resolution.reason)
+				: inspectRefExact(resolution.repository, snapshot.value.expected);
+		},
+
+		async compareAndSwapDeleteCaptureRef(request): Promise<TransientTaskGitRawRefEffectResultV1> {
+			const snapshot = snapshotRefRequest(request, "cleanup");
+			if (snapshot.status === "invalid") {
+				const before = invalidRefObservation(snapshot.reason);
+				return { before, command: null, after: before };
+			}
+			const resolution = resolveRefRepository(
+				snapshot.value.repository,
+				snapshot.value.scope,
+				snapshot.value.expected.objectFormat,
+			);
+			if (resolution.status === "invalid") {
+				const before = invalidRefObservation(resolution.reason);
+				return { before, command: null, after: before };
+			}
+			const { repository } = resolution;
+			const before = await inspectRefExact(repository, snapshot.value.expected);
+			if (
+				matchesExpectedRef(before, snapshot.value.expected.expectedNew) ||
+				!matchesExpectedRef(before, snapshot.value.expected.expectedOld)
+			)
+				return { before, command: null, after: before };
+			const command = await runRepositoryGit(repository, snapshot.value.command.slice(1));
+			const after = await inspectRefExact(repository, snapshot.value.expected);
+			return { before, command, after };
+		},
+	};
+
+	const handleIssuer = {
+		mintCaptureRepositoryHandle(
+			binding: Extract<
+				ConfidentialTransientTaskGitRepositoryBindingSnapshotV1,
+				{ readonly scope: "capture_materialization" }
+			>,
+		): ConfidentialTransientTaskCaptureRepositoryHandleV1 {
+			if (binding.scope !== "capture_materialization")
+				throw new ToolError("Capture repository handle has an invalid scope.");
+			const handle = Object.freeze({}) as unknown as ConfidentialTransientTaskCaptureRepositoryHandleV1;
+			return mintRepositoryHandle(handles, binding, handle);
+		},
+		mintIsolationCleanupHandle(
+			binding: Extract<
+				ConfidentialTransientTaskGitRepositoryBindingSnapshotV1,
+				{ readonly scope: "cleanup_ref_delete" }
+			>,
+			claim: TransientTaskPublicationTargetCleanupClaimV1,
+		): TransientTaskIsolationCleanupHandleV1 {
+			if (binding.scope !== "cleanup_ref_delete")
+				throw new ToolError("Cleanup repository handle has an invalid scope.");
+			const handle = Object.freeze({
+				claim: Object.freeze({ ...claim }),
+			}) as unknown as TransientTaskIsolationCleanupHandleV1;
+			return mintRepositoryHandle(handles, binding, handle);
+		},
+	};
+
+	return Object.freeze({ effectSafety, handleIssuer });
+}
 
 // Helper used during head resolution — defined here to reference `head` namespace.
 async function resolveHead(cwd: string, signal?: AbortSignal): Promise<GitHeadState | null> {

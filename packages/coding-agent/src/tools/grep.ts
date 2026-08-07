@@ -22,6 +22,7 @@ import type { InternalResource, ResolveContext } from "../internal-urls/types";
 import type { Theme } from "../modes/theme/theme";
 import grepDescription from "../prompts/tools/grep.md" with { type: "text" };
 import { DEFAULT_MAX_COLUMN, type TruncationResult, truncateHead, truncateLine } from "../session/streaming-output";
+import type { PersistentWorkspacePathMapper, WorkspaceOperationLease } from "../session/workspace-runtime-contracts";
 import { isScoutSpawnable } from "../task/spawn-policy";
 import {
 	Ellipsis,
@@ -47,7 +48,9 @@ import {
 	hasGlobPathChars,
 	isLineInRanges,
 	type LineRange,
+	normalizePathLikeInput,
 	parseLineRanges,
+	parseSearchPath,
 	pathTargetsSsh,
 	type ResolvedSearchTarget,
 	resolveReadPath,
@@ -894,11 +897,19 @@ type SearchParams = typeof searchSchema.infer;
  * them. Unset means "use the session settings / built-in caps" — the behavior
  * every model-issued call keeps.
  */
+export interface PersistentGrepRouteV1 {
+	readonly paths: PersistentWorkspacePathMapper;
+	/** Acquires the sole, already identity-bound lease for this model-visible call. */
+	begin(signal?: AbortSignal): Promise<WorkspaceOperationLease>;
+}
+
 export interface GrepToolOptions {
 	/** Overrides `grep.contextBefore`/`grep.contextAfter` for every call on this instance. */
 	context?: number;
 	/** Caps total surfaced matches. Applied on top of the built-in per-file and file-window caps, never above them. */
 	totalMatchLimit?: number;
+	/** Persistent-agent route. It never falls back to local search. */
+	persistentRoute?: PersistentGrepRouteV1;
 }
 
 export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails> {
@@ -926,6 +937,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 
 	readonly #contextOverride?: number;
 	readonly #totalMatchLimit?: number;
+	readonly #persistentRoute?: PersistentGrepRouteV1;
 
 	constructor(
 		private readonly session: ToolSession,
@@ -935,6 +947,216 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 		this.#contextOverride = context !== undefined ? Math.max(0, Math.floor(context)) : undefined;
 		const total = options?.totalMatchLimit;
 		this.#totalMatchLimit = total !== undefined ? Math.max(1, Math.floor(total)) : undefined;
+		this.#persistentRoute = options?.persistentRoute;
+	}
+
+	#persistentEntries(rawPath: string | undefined): string[] {
+		const entries = toPathList(rawPath);
+		const expanded: string[] = [];
+		for (const entry of entries.length > 0 ? entries : ["."]) {
+			let braceDepth = 0;
+			let start = 0;
+			for (let index = 0; index < entry.length; index++) {
+				const character = entry[index];
+				if (character === "\\" && index + 1 < entry.length) {
+					index++;
+					continue;
+				}
+				if (character === "{") braceDepth++;
+				else if (character === "}" && braceDepth > 0) braceDepth--;
+				else if (character === ";" && braceDepth === 0) {
+					expanded.push(entry.slice(start, index));
+					start = index + 1;
+				}
+			}
+			expanded.push(entry.slice(start));
+		}
+		return expanded.map(entry => normalizePathLikeInput(entry));
+	}
+
+	async #executePersistent(params: SearchParams, signal?: AbortSignal): Promise<AgentToolResult<GrepToolDetails>> {
+		const route = this.#persistentRoute;
+		if (!route) throw new Error("Persistent grep route is unavailable");
+		const { pattern, case: caseSensitive, skip } = params;
+		if (!pattern.trim()) throw new ToolError("Pattern must not be empty");
+		const normalizedSkip =
+			skip === undefined || skip === null ? 0 : Number.isFinite(skip) ? Math.floor(skip) : Number.NaN;
+		if (normalizedSkip < 0 || !Number.isFinite(normalizedSkip)) {
+			throw new ToolError("Skip must be a non-negative number");
+		}
+		const targets = this.#persistentEntries(params.path).map(entry => {
+			if (!entry) throw new ToolError("Search path entries must be non-empty");
+			const split = splitPathAndSel(entry);
+			const parsedPath = parseSearchPath(split.path.replace(/\\/g, "/"));
+			if (
+				parsedPath.glob ||
+				split.path.startsWith("~") ||
+				path.win32.isAbsolute(split.path) ||
+				/^[a-z][a-z0-9+.-]*:/i.test(split.path)
+			) {
+				throw new ToolError(
+					`Persistent grep paths must be relative to or rooted at ${route.paths.modelRoot}: ${entry}`,
+				);
+			}
+			try {
+				const projection = route.paths.parse(
+					parsedPath.basePath === "." ? route.paths.modelRoot : parsedPath.basePath,
+				);
+				return { path: projection.modelPath, ranges: selectorLineRanges(split.sel) };
+			} catch {
+				throw new ToolError(
+					`Persistent grep paths must be relative to or rooted at ${route.paths.modelRoot}: ${entry}`,
+				);
+			}
+		});
+		const lease = await route.begin(signal);
+		try {
+			return await untilAborted(signal, async () => {
+				const access = {
+					operationLeaseId: lease.operationLeaseId,
+					workspaceId: lease.binding.lease.replica.workspaceId,
+					expectedGeneration: lease.binding.lease.baseGeneration,
+					replicaId: lease.binding.lease.replica.replicaId,
+					leaseId: lease.binding.lease.leaseId,
+					fence: lease.binding.fence,
+				};
+				const ignoreCase = !(caseSensitive ?? true);
+				const flags = `${ignoreCase ? "i" : ""}${pattern.includes("\n") || pattern.includes("\\n") ? "m" : ""}`;
+				const requestedMatchLimit = this.#totalMatchLimit;
+				const matchCap = Math.min(requestedMatchLimit ?? INTERNAL_TOTAL_CAP, INTERNAL_TOTAL_CAP);
+				const fetchCap =
+					requestedMatchLimit !== undefined && requestedMatchLimit < INTERNAL_TOTAL_CAP
+						? matchCap + 1
+						: INTERNAL_TOTAL_CAP;
+				const matches: GrepMatch[] = [];
+				let providerLimited = false;
+				for (const target of targets) {
+					if (matches.length === fetchCap) break;
+					let cursor: string | null = null;
+					const seenCursors = new Set<string>();
+					do {
+						const result = await lease.binding.bridge.searchText({
+							...access,
+							path: target.path,
+							pattern,
+							flags,
+							limit: fetchCap - matches.length,
+							cursor,
+						});
+						for (const match of result.matches) {
+							if (!Number.isSafeInteger(match.line) || match.line < 1) {
+								throw new ToolError("Persistent grep provider returned an invalid line number");
+							}
+							const returnedPath = route.paths.parseReturnedModelPath(match.path);
+							if (target.ranges && !isLineInRanges(match.line, target.ranges)) continue;
+							matches.push({
+								path: String(returnedPath.relativePath) || ".",
+								lineNumber: match.line,
+								line: match.text,
+							});
+							if (matches.length === fetchCap) break;
+						}
+						cursor = result.nextCursor;
+						if (cursor && (seenCursors.has(cursor) || matches.length === fetchCap)) {
+							providerLimited = true;
+							break;
+						}
+						if (cursor) seenCursors.add(cursor);
+					} while (cursor);
+					if (matches.length === fetchCap) providerLimited = true;
+				}
+				const totalMatchLimited = matches.length > matchCap;
+				const files = new Map<string, GrepMatch[]>();
+				for (const match of matches) {
+					const fileMatches = files.get(match.path) ?? [];
+					fileMatches.push(match);
+					files.set(match.path, fileMatches);
+				}
+				const allFiles = [...files.keys()];
+				const multiScope = allFiles.length > 1 || targets.length > 1;
+				const perFileLimit = multiScope ? MULTI_FILE_PER_FILE_MATCHES : SINGLE_FILE_MATCHES;
+				let perFileLimited = false;
+				for (const fileMatches of files.values()) {
+					if (fileMatches.length > perFileLimit) {
+						fileMatches.length = perFileLimit;
+						perFileLimited = true;
+					}
+				}
+				const skipFiles = multiScope ? Math.min(normalizedSkip, allFiles.length) : 0;
+				const fileWindow = this.#totalMatchLimit !== undefined ? this.#totalMatchLimit + 1 : DEFAULT_FILE_LIMIT;
+				const windowFiles = multiScope ? allFiles.slice(skipFiles, skipFiles + fileWindow) : allFiles;
+				const fileLimited = multiScope && allFiles.length > skipFiles + fileWindow;
+				const selectedMatches: GrepMatch[] = [];
+				if (windowFiles.length > 0) {
+					const lists = windowFiles.map(file => files.get(file) ?? []);
+					const cursors = new Array<number>(lists.length).fill(0);
+					let anyAdded = true;
+					while (anyAdded) {
+						anyAdded = false;
+						for (let index = 0; index < lists.length; index++) {
+							if (cursors[index] < lists[index].length) {
+								selectedMatches.push(lists[index][cursors[index]++]);
+								anyAdded = true;
+							}
+						}
+					}
+					if (selectedMatches.length > matchCap) selectedMatches.length = matchCap;
+				}
+				const selectedByFile = new Map<string, GrepMatch[]>();
+				for (const match of selectedMatches) {
+					const fileMatches = selectedByFile.get(match.path) ?? [];
+					fileMatches.push(match);
+					selectedByFile.set(match.path, fileMatches);
+				}
+				const selectedFiles = windowFiles.filter(file => selectedByFile.has(file));
+				if (selectedMatches.length === 0) {
+					return toolResult<GrepToolDetails>({
+						scopePath: route.paths.modelRoot,
+						searchPath: route.paths.modelRoot,
+						cwd: route.paths.modelRoot,
+						matchCount: 0,
+						fileCount: 0,
+						files: [],
+						truncated: providerLimited || totalMatchLimited,
+					})
+						.text("No matches found")
+						.useless()
+						.done();
+				}
+				const linesForFile = (file: string): string[] =>
+					(selectedByFile.get(file) ?? []).map(match =>
+						formatMatchLine(match.lineNumber, match.line, true, { useHashLines: false }),
+					);
+				const rendered = multiScope
+					? formatGroupedFiles(selectedFiles, file => ({ modelLines: linesForFile(file) }))
+					: { model: linesForFile(selectedFiles[0] ?? ""), display: linesForFile(selectedFiles[0] ?? "") };
+				const details: GrepToolDetails = {
+					scopePath: route.paths.modelRoot,
+					searchPath: route.paths.modelRoot,
+					cwd: route.paths.modelRoot,
+					matchCount: selectedMatches.length,
+					fileCount: selectedFiles.length,
+					files: selectedFiles,
+					fileMatches: selectedFiles.map(path => ({ path, count: selectedByFile.get(path)?.length ?? 0 })),
+					truncated: providerLimited || totalMatchLimited || perFileLimited || fileLimited,
+					fileLimitReached: fileLimited ? fileWindow : undefined,
+					perFileLimitReached: totalMatchLimited
+						? this.#totalMatchLimit
+						: perFileLimited
+							? perFileLimit
+							: undefined,
+					displayContent: rendered.display.join("\n"),
+				};
+				const limitMessage = fileLimited
+					? `Showing files ${skipFiles + 1}-${skipFiles + windowFiles.length} of ${allFiles.length}. Use skip=${skipFiles + windowFiles.length} for the next page, or narrow paths/pattern.`
+					: "";
+				return toolResult(details)
+					.text([...rendered.model, limitMessage].filter(Boolean).join("\n"))
+					.done();
+			});
+		} finally {
+			lease.end();
+		}
 	}
 
 	async execute(
@@ -944,6 +1166,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 		_onUpdate?: AgentToolUpdateCallback<GrepToolDetails>,
 		_toolContext?: AgentToolContext,
 	): Promise<AgentToolResult<GrepToolDetails>> {
+		if (this.#persistentRoute) return this.#executePersistent(params, signal);
 		const { pattern, path: rawPath, case: caseSensitive, gitignore, skip } = params;
 
 		return untilAborted(signal, async () => {

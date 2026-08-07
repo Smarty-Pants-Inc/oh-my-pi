@@ -16,39 +16,50 @@ import { loadOverallPlanReference } from "../plan-mode/plan-handoff";
 import planModeSubagentPrompt from "../prompts/system/plan-mode-subagent.md" with { type: "text" };
 import subagentUserPromptTemplate from "../prompts/system/subagent-user-prompt.md" with { type: "text" };
 import { MAIN_AGENT_ID } from "../registry/agent-registry";
-import type { ExecutionEnvironmentProvider } from "../session/execution-environment";
+import type {
+	AgentSessionTransientTaskCurrentParentLocatorV1,
+	AgentSessionTransientTaskRuntimeAuthorityV1,
+} from "../session/agent-session-types";
+import type {
+	ConfidentialTransientTaskEnsureIsolationRequestV1,
+	OrdinaryTransientTaskLifecycleRunV1,
+	TransientTaskCaptureModeV1,
+	TransientTaskEffectIdentityManifestV1,
+	TransientTaskOutcomePayloadByteBudgetV1,
+	TransientTaskPostTerminalCleanupEvidenceV1,
+	TransientTaskResultlessRepresentabilityPreflightV1,
+	TransientTaskResultlessTerminalProjectionV1,
+	TransientTaskResultPublicationPrePendingInitializeRequestV1,
+} from "../session/workspace-runtime-contracts";
 import type { TaskEffort } from "../thinking";
 import type { ToolSession } from "../tools";
 import { isIrcEnabled } from "../tools/hub";
 import { buildOutputValidator } from "../tools/output-schema-validator";
 import { type DiscoveryResult, discoverAgents, getAgent } from "./discovery";
-import { type ExecutorOptions, runSubprocess } from "./executor";
-import {
-	applyEligibleNestedPatches,
-	type IsolationContext,
-	makeIsolationCommitMessage,
-	mergeIsolatedChanges,
-	prepareIsolationContext,
-	runIsolatedSubprocess,
-} from "./isolation-runner";
+import { type ExecutorOptions, preflightTransientTaskResultlessRepresentabilityV1, runSubprocess } from "./executor";
+import { runIsolatedSubprocess } from "./isolation-runner";
 import { generateTaskName } from "./name-generator";
-import { AgentOutputManager } from "./output-manager";
+import { AgentOutputManager, createTransientTaskOutcomePayloadByteBudgetV1 } from "./output-manager";
 import {
 	createLocalSubagentRuntimeProfile,
 	ENVIRONMENT_SUBAGENT_RUNTIME_PROFILE,
 	resolveSubagentRuntimeToolNames,
 	type SubagentRuntimeProfile,
 	subagentRuntimeAllows,
+	type TransientTaskRuntimeInjectionV1,
+	validateTransientTaskRuntimeInjectionV1,
 } from "./runtime-profile";
 import { resolveSpawnPolicy } from "./spawn-policy";
 import {
 	type AgentDefinition,
 	type AgentProgress,
 	canSpawnAtDepth,
+	MAX_OUTPUT_BYTES,
 	type SingleResult,
+	StructuredSubagentError,
 	type StructuredSubagentOutput,
 } from "./types";
-import { type NestedRepoPatch, parseIsolationMode } from "./worktree";
+import type { ConfidentialTransientTaskIsolationMaterializerV1, NestedRepoPatch } from "./worktree";
 
 /** Validation behavior requested for an effective output schema. */
 export type StructuredSubagentSchemaMode = "permissive" | "strict";
@@ -75,6 +86,107 @@ export interface StructuredSubagentIsolationControls {
 	requested?: boolean;
 	merge?: "patch" | "branch";
 	apply?: boolean;
+}
+
+/** Exact ordinary-lifecycle authority consumed by one structured task execution. */
+export interface StructuredSubagentTransientTaskRuntimeV1 extends TransientTaskRuntimeInjectionV1 {
+	readonly materializer: ConfidentialTransientTaskIsolationMaterializerV1;
+	readonly ensureRequest: ConfidentialTransientTaskEnsureIsolationRequestV1;
+	readonly initializePrePendingRequest: TransientTaskResultPublicationPrePendingInitializeRequestV1;
+	readonly fail: OrdinaryTransientTaskLifecycleRunV1["fail"];
+	readonly finalized: OrdinaryTransientTaskLifecycleRunV1["finalized"];
+	readonly isolationReady: OrdinaryTransientTaskLifecycleRunV1["isolationReady"];
+	readonly releaseExecutionEnvironment: OrdinaryTransientTaskLifecycleRunV1["releaseExecutionEnvironment"];
+	readonly finalizeAfterPending: OrdinaryTransientTaskLifecycleRunV1["finalizeAfterPending"];
+}
+
+export interface StructuredSubagentTransientTaskRuntimeCreateOptionsV1 {
+	readonly authority: AgentSessionTransientTaskRuntimeAuthorityV1;
+	readonly parentToolCallId: string;
+	readonly spawnIndex: number;
+	readonly detachedJobId: string | null;
+	readonly childId: string;
+	readonly agentName: string;
+	readonly captureMode: TransientTaskCaptureModeV1;
+	readonly applyChanges: boolean;
+}
+
+/** Immutable per-child identity allocated by the sole ordinary lifecycle producer. */
+export interface StructuredSubagentForegroundHandoffIdentityV1 {
+	readonly resultTargetKey: TransientTaskResultPublicationPrePendingInitializeRequestV1["plan"]["resultTargetKey"];
+	readonly effectIdentityManifest: TransientTaskEffectIdentityManifestV1;
+}
+
+/** @internal Per-spawn runtime plus the only detached settlement authority TaskTool may retain. */
+export interface StructuredSubagentTransientTaskRuntimeAssemblyV1 {
+	readonly runtime: StructuredSubagentTransientTaskRuntimeV1;
+	readonly foregroundHandoffIdentity: StructuredSubagentForegroundHandoffIdentityV1;
+	readonly settleDetached: OrdinaryTransientTaskLifecycleRunV1["settleDetached"];
+	readonly abortBeforeRegistration: OrdinaryTransientTaskLifecycleRunV1["abortBeforeRegistration"];
+}
+
+/** Assemble one frozen runtime exclusively through the session-owned ordinary lifecycle. */
+export async function createStructuredSubagentTransientTaskRuntimeV1(
+	options: StructuredSubagentTransientTaskRuntimeCreateOptionsV1,
+): Promise<StructuredSubagentTransientTaskRuntimeAssemblyV1> {
+	const preflight = preflightTransientTaskResultlessRepresentabilityV1(
+		options.spawnIndex,
+		options.childId,
+		options.agentName,
+		MAX_OUTPUT_BYTES,
+	);
+	if (preflight.status !== "accepted") throw new StructuredSubagentError("preflight", preflight.toolResultText);
+
+	const executionEnvironmentProvider = options.authority.executionEnvironmentProvider;
+	if (
+		executionEnvironmentProvider === null ||
+		typeof executionEnvironmentProvider !== "object" ||
+		typeof executionEnvironmentProvider.acquire !== "function"
+	) {
+		throw new StructuredSubagentError(
+			"preflight",
+			"Transient task execution requires the exact caller-acquired execution environment provider.",
+		);
+	}
+
+	const lifecycle = await options.authority.stores.ordinaryTransientTaskLifecycle.create({
+		parentToolCallId: options.parentToolCallId,
+		spawnIndex: options.spawnIndex,
+		detachedJobId: options.detachedJobId,
+		resultlessPreflight: preflight.preflight,
+		captureMode: options.captureMode,
+		applyChanges: options.applyChanges,
+	});
+	const runtime: StructuredSubagentTransientTaskRuntimeV1 = validateTransientTaskRuntimeInjectionV1(
+		Object.freeze({
+			taskId: lifecycle.taskId,
+			runId: lifecycle.runId,
+			createId: lifecycle.createId,
+			executionEnvironmentProvider,
+			materializer: lifecycle.materializer,
+			ensureRequest: lifecycle.ensureRequest,
+			initializePrePendingRequest: lifecycle.initializePrePendingRequest,
+			fail: (input: Parameters<OrdinaryTransientTaskLifecycleRunV1["fail"]>[0]) => lifecycle.fail(input),
+			finalized: (input: Parameters<OrdinaryTransientTaskLifecycleRunV1["finalized"]>[0]) =>
+				lifecycle.finalized(input),
+			isolationReady: (cleanupDescriptor: Parameters<OrdinaryTransientTaskLifecycleRunV1["isolationReady"]>[0]) =>
+				lifecycle.isolationReady(cleanupDescriptor),
+			releaseExecutionEnvironment: (
+				authority: Parameters<OrdinaryTransientTaskLifecycleRunV1["releaseExecutionEnvironment"]>[0],
+			) => lifecycle.releaseExecutionEnvironment(authority),
+			finalizeAfterPending: (input: Parameters<OrdinaryTransientTaskLifecycleRunV1["finalizeAfterPending"]>[0]) =>
+				lifecycle.finalizeAfterPending(input),
+		}),
+	);
+	const abortBeforeRegistration: OrdinaryTransientTaskLifecycleRunV1["abortBeforeRegistration"] = reason =>
+		lifecycle.abortBeforeRegistration(reason);
+	const settleDetached: OrdinaryTransientTaskLifecycleRunV1["settleDetached"] = input =>
+		lifecycle.settleDetached(input);
+	const foregroundHandoffIdentity: StructuredSubagentForegroundHandoffIdentityV1 = Object.freeze({
+		resultTargetKey: lifecycle.initializePrePendingRequest.plan.resultTargetKey,
+		effectIdentityManifest: lifecycle.effectIdentityManifest,
+	});
+	return Object.freeze({ runtime, foregroundHandoffIdentity, abortBeforeRegistration, settleDetached });
 }
 
 /** Identity and presentation metadata supplied by the calling surface. */
@@ -123,6 +235,8 @@ export interface StructuredSubagentRequest {
 	maxRuntimeMs?: number;
 	signal?: AbortSignal;
 	onProgress?: (progress: AgentProgress) => void;
+	/** Exact durable task/run/store authority; never derived from ToolSession or agent id. */
+	transientTaskRuntime?: StructuredSubagentTransientTaskRuntimeV1;
 }
 
 /** A normalized preflight result, reusable by tests and adapters. */
@@ -132,7 +246,6 @@ export interface EffectiveSubagentPolicy {
 	agent: AgentDefinition;
 	effectiveAgent: AgentDefinition;
 	execution: "local" | "environment";
-	executionEnvironmentProvider?: ExecutionEnvironmentProvider;
 	modelOverride?: string | string[];
 	parentActiveModelPattern?: string;
 	schema: StructuredSubagentSchemaResolution;
@@ -149,19 +262,10 @@ export interface StructuredSubagentResult {
 	policy: EffectiveSubagentPolicy;
 	mergeSummary: string;
 	changesApplied: boolean | null;
+	/** @internal Exact validated evidence retained only for sealed parent settlement. */
+	terminalEvidence?: TransientTaskPostTerminalCleanupEvidenceV1;
 	artifactsDir: string;
 	temporaryArtifacts: boolean;
-}
-
-/** Machine-readable failure category so adapters can retain their native errors. */
-export class StructuredSubagentError extends Error {
-	readonly kind: "preflight" | "isolation" | "execution";
-
-	constructor(kind: "preflight" | "isolation" | "execution", message: string, options?: ErrorOptions) {
-		super(message, options);
-		this.name = "StructuredSubagentError";
-		this.kind = kind;
-	}
 }
 
 const PLAN_MODE_TOOLS = ["read", "grep", "glob", "web_search"] as const;
@@ -273,7 +377,6 @@ export async function resolveEffectiveSubagentPolicy(
 			`Unsupported subagent execution selection ${JSON.stringify(execution)}. Use "local" or "environment".`,
 		);
 	}
-	let executionEnvironmentProvider: ExecutionEnvironmentProvider | undefined;
 	if (execution === "environment") {
 		if (request.invocationKind !== "task") {
 			throw new StructuredSubagentError("preflight", "Environment execution is only available to task invocations.");
@@ -296,13 +399,6 @@ export async function resolveEffectiveSubagentPolicy(
 		}
 		if (request.detached === true) {
 			throw new StructuredSubagentError("preflight", "Environment execution must be blocking, not detached.");
-		}
-		executionEnvironmentProvider = request.session.getExecutionEnvironmentProvider?.();
-		if (!executionEnvironmentProvider) {
-			throw new StructuredSubagentError(
-				"preflight",
-				"Environment execution requires a registered execution environment provider.",
-			);
 		}
 	}
 	assertPlanControlsAllowed(request, planMode);
@@ -391,7 +487,6 @@ export async function resolveEffectiveSubagentPolicy(
 		parentActiveModelPattern,
 		schema,
 		execution,
-		...(executionEnvironmentProvider ? { executionEnvironmentProvider } : {}),
 		planMode,
 		isIsolated,
 		mergeMode: request.isolation?.merge ?? request.session.settings.get("task.isolation.merge"),
@@ -451,6 +546,7 @@ function buildExecutorOptions(
 	policy: EffectiveSubagentPolicy,
 	lease: ArtifactLease,
 	id: string,
+	transientRuntime: StructuredSubagentTransientTaskRuntimeV1 | undefined,
 ): ExecutorOptions {
 	const { session } = request;
 	const { skills, autoloadSkills } = resolveAutoloadSkills(session, policy.effectiveAgent);
@@ -493,6 +589,13 @@ function buildExecutorOptions(
 		persistArtifacts: !lease.temporary,
 		artifactsDir: lease.artifactsDir,
 		runtimeProfile,
+		transientTaskCurrentParentTaskLocator: transientRuntime
+			? (Object.freeze({
+					taskId: transientRuntime.taskId,
+					runId: transientRuntime.runId,
+					createId: transientRuntime.createId,
+				}) satisfies AgentSessionTransientTaskCurrentParentLocatorV1)
+			: undefined,
 		maxRuntimeMs: request.maxRuntimeMs,
 		signal: request.signal,
 		eventBus: session.eventBus,
@@ -534,35 +637,6 @@ async function loadPlanReference(
 	return loadOverallPlanReference(request.session.getPlanReferencePath?.() ?? "local://PLAN.md", localProtocolOptions);
 }
 
-function buildFailureResult(
-	request: StructuredSubagentRequest,
-	policy: EffectiveSubagentPolicy,
-	id: string,
-	startedAt: number,
-) {
-	return (error: unknown): SingleResult => {
-		const message = error instanceof Error ? error.message : String(error);
-		return {
-			index: request.index ?? 0,
-			id,
-			agent: policy.agent.name,
-			agentSource: policy.agent.source,
-			task: renderSubagentPrompt(request.assignment),
-			assignment: request.assignment.trim(),
-			description: trimToUndefined(request.identity?.label),
-			exitCode: 1,
-			output: "",
-			stderr: message,
-			truncated: false,
-			durationMs: Date.now() - startedAt,
-			tokens: 0,
-			requests: 0,
-			modelOverride: policy.modelOverride,
-			error: message,
-		};
-	};
-}
-
 async function persistNestedPatches(
 	artifactsDir: string,
 	agentId: string,
@@ -593,6 +667,7 @@ async function isolationRecoveryHint(result: SingleResult, artifactsDir: string)
 }
 
 function attachStructuredOutputMetadata(result: SingleResult, schema: StructuredSubagentSchemaResolution): void {
+	if (Object.isFrozen(result)) return;
 	if (schema.source === "none") {
 		delete result.structuredOutput;
 		return;
@@ -612,121 +687,293 @@ function attachStructuredOutputMetadata(result: SingleResult, schema: Structured
 	result.structuredOutput = output;
 }
 
+function exactJson(left: unknown, right: unknown): boolean {
+	try {
+		return JSON.stringify(left) === JSON.stringify(right);
+	} catch {
+		return false;
+	}
+}
+
+async function settlePreExecutionCancellationV1(
+	request: StructuredSubagentRequest,
+	runtime: StructuredSubagentTransientTaskRuntimeV1,
+): Promise<never> {
+	const error = new StructuredSubagentError("execution", "Transient task was interrupted before child execution.");
+	const terminal = await runtime.fail({
+		phase: "before_bind",
+		source: request.detached
+			? { kind: "detached_pre_execution_abort" }
+			: { kind: "controller_interrupted_before_cleanup" },
+	});
+	throw new StructuredSubagentLifecycleFailure(error, {
+		result: null,
+		terminalProjection: terminal.terminalSource,
+		mergeSummary: terminal.mergeSummary,
+		changesApplied: terminal.changesApplied,
+		terminalEvidence: terminal.terminalEvidence,
+	});
+}
+
+/** Internal terminalized failure carrying exact evidence to the detached settlement adapter. */
+export class StructuredSubagentLifecycleFailure extends StructuredSubagentError {
+	readonly result: SingleResult | null;
+	readonly terminalProjection: TransientTaskResultlessTerminalProjectionV1 | null;
+	readonly mergeSummary: string;
+	readonly changesApplied: boolean | null;
+	readonly terminalEvidence: TransientTaskPostTerminalCleanupEvidenceV1;
+
+	constructor(
+		error: unknown,
+		terminal: {
+			readonly result: SingleResult | null;
+			readonly terminalProjection: TransientTaskResultlessTerminalProjectionV1 | null;
+			readonly mergeSummary: string;
+			readonly changesApplied: boolean | null;
+			readonly terminalEvidence: TransientTaskPostTerminalCleanupEvidenceV1;
+		},
+	) {
+		super(
+			error instanceof StructuredSubagentError ? error.kind : "execution",
+			error instanceof Error ? error.message : "Subagent execution failed before child dispatch.",
+			{ cause: error },
+		);
+		this.name = "StructuredSubagentLifecycleFailure";
+		this.result = terminal.result;
+		this.terminalProjection = terminal.terminalProjection;
+		this.mergeSummary = terminal.mergeSummary;
+		this.changesApplied = terminal.changesApplied;
+		this.terminalEvidence = terminal.terminalEvidence;
+	}
+}
+
 /**
  * Execute a validated subagent. Preflight errors occur before any artifact
  * lease or child dispatch; callers keep responsibility for their result text.
  */
 export async function runStructuredSubagent(request: StructuredSubagentRequest): Promise<StructuredSubagentResult> {
-	const policy = await resolveEffectiveSubagentPolicy(request);
-	const lease = await leaseArtifacts(request.session, request.invocationKind);
+	const injectedRuntime = request.transientTaskRuntime;
+	let transientRuntime: StructuredSubagentTransientTaskRuntimeV1 | undefined;
+	if (injectedRuntime) {
+		try {
+			transientRuntime = validateTransientTaskRuntimeInjectionV1(injectedRuntime);
+		} catch (error) {
+			throw new StructuredSubagentError(
+				"preflight",
+				`Invalid transient task runtime: ${error instanceof Error ? error.message : String(error)}`,
+				{ cause: error },
+			);
+		}
+	}
+	const failBeforeBind = async (error: unknown): Promise<never> => {
+		if (!transientRuntime) throw error;
+		const terminal = await transientRuntime.fail({
+			phase: "before_bind",
+			source: { kind: "caught_value", caughtAt: "runtime", value: error },
+		});
+		throw new StructuredSubagentLifecycleFailure(error, {
+			result: null,
+			terminalProjection: terminal.terminalSource,
+			mergeSummary: terminal.mergeSummary,
+			changesApplied: terminal.changesApplied,
+			terminalEvidence: terminal.terminalEvidence,
+		});
+	};
+	const policy = await resolveEffectiveSubagentPolicy(request).catch(error => failBeforeBind(error));
+	if (transientRuntime && !policy.isIsolated) {
+		await failBeforeBind(
+			new StructuredSubagentError(
+				"preflight",
+				"Durable transient-task execution requires isolated workspace authority.",
+			),
+		);
+	}
+	if (policy.isIsolated && !transientRuntime) {
+		throw new StructuredSubagentError(
+			"preflight",
+			"Isolated subagent execution requires exact taskId/runId/createId authority and the claimed transient-task runtime contract.",
+		);
+	}
+	const executionEnvironmentProvider =
+		policy.execution === "environment" ? transientRuntime?.executionEnvironmentProvider : undefined;
+	if (policy.execution === "environment" && !executionEnvironmentProvider) {
+		await failBeforeBind(
+			new StructuredSubagentError(
+				"preflight",
+				"Environment execution requires the exact caller-acquired transient runtime authority.",
+			),
+		);
+	}
+
+	const id = await reserveStructuredSubagentId(request.session, {
+		...request.identity,
+		label: request.identity?.label ?? (request.invocationKind === "eval" ? "EvalAgent" : undefined),
+	}).catch(error =>
+		failBeforeBind(
+			error instanceof StructuredSubagentError
+				? error
+				: new StructuredSubagentError(
+						"execution",
+						`Subagent execution failed: ${error instanceof Error ? error.message : String(error)}`,
+						{ cause: error },
+					),
+		),
+	);
+
+	let resultlessRepresentabilityPreflight: TransientTaskResultlessRepresentabilityPreflightV1 | undefined;
+	let outcomePayloadBudget: TransientTaskOutcomePayloadByteBudgetV1 | undefined;
+	if (transientRuntime) {
+		const descriptor = transientRuntime.ensureRequest.preparation.creatorDescriptor;
+		const plan = transientRuntime.initializePrePendingRequest.plan;
+		const preflightResult = preflightTransientTaskResultlessRepresentabilityV1(
+			request.index ?? 0,
+			id,
+			policy.agent.name,
+			plan.maximumUtf8ByteLength,
+		);
+		const preflight =
+			preflightResult.status === "accepted"
+				? preflightResult.preflight
+				: await failBeforeBind(new StructuredSubagentError("preflight", preflightResult.toolResultText));
+		if (
+			transientRuntime.taskId !== descriptor.taskId ||
+			transientRuntime.runId !== descriptor.runId ||
+			transientRuntime.createId !== descriptor.createId ||
+			plan.resultTargetKey.taskId !== transientRuntime.taskId ||
+			plan.resultTargetKey.runId !== transientRuntime.runId ||
+			plan.resultTargetKey.createId !== transientRuntime.createId ||
+			plan.resultlessIdentity.index !== (request.index ?? 0) ||
+			plan.resultlessIdentity.id !== id ||
+			plan.resultlessIdentity.agent !== policy.agent.name ||
+			!exactJson(plan.representabilityPreflight, preflight)
+		) {
+			await failBeforeBind(
+				new StructuredSubagentError(
+					"preflight",
+					"Transient task identity does not match the prepared runtime authority.",
+				),
+			);
+		}
+		try {
+			outcomePayloadBudget = createTransientTaskOutcomePayloadByteBudgetV1({
+				preflight,
+				agentSource: policy.agent.source,
+				task: renderSubagentPrompt(request.assignment),
+				assignment: request.assignment.trim(),
+				...(policy.modelOverride !== undefined ? { modelOverride: policy.modelOverride } : {}),
+			});
+		} catch (error) {
+			await failBeforeBind(error);
+		}
+		resultlessRepresentabilityPreflight = preflight;
+		if (request.signal?.aborted) await settlePreExecutionCancellationV1(request, transientRuntime);
+	}
+
+	const lease = await leaseArtifacts(request.session, request.invocationKind).catch(async error => {
+		if (transientRuntime && request.signal?.aborted) {
+			await settlePreExecutionCancellationV1(request, transientRuntime);
+		}
+		return failBeforeBind(
+			new StructuredSubagentError(
+				"execution",
+				`Subagent artifact allocation failed: ${error instanceof Error ? error.message : String(error)}`,
+				{ cause: error },
+			),
+		);
+	});
 	let changesApplied: boolean | null = null;
 	let mergeSummary = "";
+	let terminalEvidence: TransientTaskPostTerminalCleanupEvidenceV1 | undefined;
 	let requiresRecoveryArtifacts = false;
 	let completedSuccessfully = false;
+	let transientLifecycleDispatchStarted = false;
 	try {
-		const id = await reserveStructuredSubagentId(request.session, {
-			...request.identity,
-			label: request.identity?.label ?? (request.invocationKind === "eval" ? "EvalAgent" : undefined),
-		});
-		const baseOptions = buildExecutorOptions(request, policy, lease, id);
-		baseOptions.planReference = await loadPlanReference(request, policy);
-		let isolationContext: IsolationContext | null = null;
-		if (policy.isIsolated) {
-			try {
-				isolationContext = await prepareIsolationContext(request.session.cwd);
-			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error);
-				throw new StructuredSubagentError(
-					"isolation",
-					`Isolated subagent execution requires a git repository. ${message}`,
-					{ cause: error },
-				);
-			}
+		if (transientRuntime && request.signal?.aborted) {
+			await settlePreExecutionCancellationV1(request, transientRuntime);
 		}
-		const result = !isolationContext
-			? await runSubprocess(baseOptions)
-			: await runIsolatedSubprocess({
-					baseOptions,
-					context: isolationContext,
-					preferredBackend: parseIsolationMode(request.session.settings.get("task.isolation.mode")),
-					agentId: id,
-					mergeMode: policy.mergeMode,
-					...(policy.executionEnvironmentProvider
-						? { executionEnvironmentProvider: policy.executionEnvironmentProvider }
-						: {}),
-					artifactsDir: lease.artifactsDir,
-					description: trimToUndefined(request.identity?.label),
-					buildCommitMessage: makeIsolationCommitMessage(request.session),
-					buildFailureResult: buildFailureResult(request, policy, id, Date.now()),
+		const baseOptions = buildExecutorOptions(request, policy, lease, id, transientRuntime);
+		try {
+			baseOptions.planReference = await loadPlanReference(request, policy);
+		} catch (error) {
+			if (transientRuntime && request.signal?.aborted) {
+				await settlePreExecutionCancellationV1(request, transientRuntime);
+			}
+			throw error;
+		}
+		if (transientRuntime && request.signal?.aborted) {
+			await settlePreExecutionCancellationV1(request, transientRuntime);
+		}
+		let result: SingleResult;
+		if (!policy.isIsolated) {
+			result = await runSubprocess(baseOptions);
+		} else if (transientRuntime && resultlessRepresentabilityPreflight && outcomePayloadBudget) {
+			transientLifecycleDispatchStarted = true;
+			const settlement = await runIsolatedSubprocess({
+				baseOptions,
+				lifecycle: transientRuntime,
+				resultlessRepresentabilityPreflight,
+				outcomePayloadBudget,
+				...(executionEnvironmentProvider ? { executionEnvironmentProvider } : {}),
+			});
+			mergeSummary = settlement.mergeSummary;
+			changesApplied = settlement.changesApplied;
+			terminalEvidence = settlement.terminalEvidence;
+			if (settlement.result === null) {
+				throw new StructuredSubagentLifecycleFailure(settlement.error, {
+					result: null,
+					terminalProjection: settlement.terminalProjection,
+					mergeSummary,
+					changesApplied,
+					terminalEvidence,
 				});
+			}
+			result = settlement.result;
+		} else {
+			throw new StructuredSubagentError(
+				"preflight",
+				"Isolated subagent execution requires exact taskId/runId/createId authority and the claimed transient-task runtime contract.",
+			);
+		}
 		attachStructuredOutputMetadata(result, policy.schema);
 		requiresRecoveryArtifacts =
 			policy.isIsolated &&
 			(result.exitCode !== 0 || result.error !== undefined || result.aborted === true) &&
 			(result.patchPath !== undefined || result.branchName !== undefined || (result.nestedPatches?.length ?? 0) > 0);
-
-		if (
-			policy.isIsolated &&
-			isolationContext &&
-			policy.applyChanges &&
-			result.exitCode === 0 &&
-			!result.error &&
-			!result.aborted
-		) {
-			const outcome = await mergeIsolatedChanges({
-				result,
-				repoRoot: isolationContext.repoRoot,
-				mergeMode: policy.mergeMode,
-			});
-			mergeSummary = outcome.summary;
-			changesApplied = outcome.changesApplied;
-			if (outcome.changesApplied !== false) {
-				const nestedPatchSummary = await applyEligibleNestedPatches({
-					result,
-					repoRoot: isolationContext.repoRoot,
-					mergeMode: policy.mergeMode,
-					changesApplied: outcome.changesApplied,
-					mergedBranchForNestedPatches: outcome.mergedBranchForNestedPatches,
-					commitMessage: makeIsolationCommitMessage(request.session)(),
-				});
-				mergeSummary += nestedPatchSummary;
-				requiresRecoveryArtifacts ||=
-					nestedPatchSummary.includes("<system-notification>") && (result.nestedPatches?.length ?? 0) > 0;
-			}
-		} else if (policy.isIsolated && isolationContext && !policy.applyChanges) {
-			if (result.branchName)
-				mergeSummary = `\n\nIsolation: changes captured on branch \`${result.branchName}\` (apply=false). Not merged.`;
-			else if (result.patchPath)
-				mergeSummary = `\n\nIsolation: changes captured at \`${result.patchPath}\` (apply=false). Not applied.`;
-			else if ((result.nestedPatches?.length ?? 0) > 0)
-				mergeSummary = `\n\nIsolation: changes captured for ${result.nestedPatches?.length} nested ${(result.nestedPatches?.length ?? 0) === 1 ? "repository" : "repositories"} (apply=false). Not applied.`;
-			else mergeSummary = "\n\nIsolation: no changes captured.";
-		}
-
 		completedSuccessfully = result.exitCode === 0 && !result.error && !result.aborted;
 		return {
 			result,
 			policy,
 			mergeSummary,
+			terminalEvidence,
 			changesApplied,
 			artifactsDir: lease.artifactsDir,
 			temporaryArtifacts: lease.temporary,
 		};
 	} catch (error) {
-		if (error instanceof StructuredSubagentError) throw error;
-		throw new StructuredSubagentError(
-			"execution",
-			`Subagent execution failed: ${error instanceof Error ? error.message : String(error)}`,
-			{ cause: error },
-		);
+		if (error instanceof StructuredSubagentLifecycleFailure) throw error;
+		const structuredError =
+			error instanceof StructuredSubagentError
+				? error
+				: new StructuredSubagentError(
+						"execution",
+						`Subagent execution failed: ${error instanceof Error ? error.message : String(error)}`,
+						{ cause: error },
+					);
+		if (transientRuntime && !transientLifecycleDispatchStarted) await failBeforeBind(structuredError);
+		throw structuredError;
 	} finally {
 		const shouldRetainArtifacts =
 			(request.retainArtifacts && completedSuccessfully) ||
 			(policy.isIsolated && (!policy.applyChanges || changesApplied === false || requiresRecoveryArtifacts));
 		const shouldCleanup = lease.temporary && !shouldRetainArtifacts;
 		if (shouldCleanup) {
-			await fs.rm(lease.artifactsDir, { recursive: true, force: true });
-			lease.unregister?.();
+			try {
+				await fs.rm(lease.artifactsDir, { recursive: true, force: true });
+			} catch {
+				// Durable terminal recovery owns cleanup truth; incidental artifact removal cannot replace it.
+			} finally {
+				lease.unregister?.();
+			}
 		}
 	}
 }

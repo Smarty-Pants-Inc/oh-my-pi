@@ -20,6 +20,7 @@ import {
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { postmortem, TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities.js";
 
 const pendingAssistant: AssistantMessage = {
 	role: "assistant",
@@ -82,6 +83,7 @@ describe("session exit diagnostics", () => {
 			sessionManager,
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 
 		agent.emitExternalEvent({ type: "message_end", message: pendingAssistant });
@@ -155,6 +157,7 @@ describe("session exit diagnostics", () => {
 			sessionManager,
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 		const activeSession = session;
 
@@ -220,6 +223,7 @@ describe("session exit diagnostics", () => {
 			sessionManager,
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 
 		await session.dispose();

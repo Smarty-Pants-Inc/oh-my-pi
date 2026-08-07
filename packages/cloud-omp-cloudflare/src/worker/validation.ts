@@ -6,7 +6,30 @@ import type {
 	FilePayload,
 	FileReadRequest,
 } from "../protocol";
-import { isJsonObject } from "../protocol";
+import {
+	type CloudflareCheckpointFetchRequestV1,
+	type CloudflareDurableDeadlineV1,
+	type CloudflareReplicaCacheEvictionPlanV1,
+	type CloudflareReplicaDeletionValidationV1,
+	CloudflareRuntimeProtocolErrorV1,
+	type CloudflareRuntimeStatusRequestV1,
+	type CloudflareValidatedRuntimeEffectTransportV1,
+	type CloudflareValidatedRuntimeInspectionTransportV1,
+	type CloudflareValidatedRuntimeOperationV1,
+	canonicalRuntimeSha256V1,
+	decodeCloudflareCheckpointFetchRequestV1,
+	decodeCloudflareDurableDeadlineV1,
+	decodeCloudflareReplicaCacheEvictionPlanV1,
+	decodeCloudflareReplicaDeleteRequestV1,
+	decodeCloudflareRuntimeEffectEnvelopeV1,
+	decodeCloudflareRuntimeEffectTransportEnvelopeV1,
+	decodeCloudflareRuntimeInspectionEnvelopeV1,
+	decodeCloudflareRuntimeInspectionTransportEnvelopeV1,
+	decodeCloudflareRuntimeStatusRequestV1,
+	encodeCanonicalRuntimeTupleV1,
+	isJsonObject,
+	projectCloudflareRuntimeInspectionTupleV1,
+} from "../protocol";
 import {
 	canonicalRelativePath,
 	canonicalWorkspaceDirectory,
@@ -162,4 +185,132 @@ function invalid(code: CloudOmpWireErrorCode, message: string): RequestValidatio
 
 function tooLarge(code: CloudOmpWireErrorCode, message: string): RequestValidationError {
 	return new RequestValidationError(413, code, message);
+}
+
+function workerProtocolFailure(error: unknown): never {
+	if (!(error instanceof CloudflareRuntimeProtocolErrorV1)) throw error;
+	const code: CloudOmpWireErrorCode =
+		error.code === "unknown_fields"
+			? "unknown_fields"
+			: error.code === "request_conflict"
+				? "request_conflict"
+				: error.code === "request_digest_mismatch" || error.code === "deletion_request_digest_mismatch"
+					? "request_digest_mismatch"
+					: error.code === "push_generation_mismatch"
+						? "checkpoint_generation_mismatch"
+						: error.code === "retention_deadline_mismatch" || error.code === "deadline_invalid"
+							? "retention_deadline_mismatch"
+							: error.code === "deletion_authority_domain_mismatch"
+								? "deletion_authority_domain_mismatch"
+								: "protocol_invalid";
+	throw new RequestValidationError(400, code, error.message);
+}
+
+async function assertWorkerRuntimeOperationV1(validation: CloudflareValidatedRuntimeOperationV1): Promise<void> {
+	const tuple = projectCloudflareRuntimeInspectionTupleV1(validation.inspection);
+	const digest = await canonicalRuntimeSha256V1(tuple);
+	const tupleUtf8 = new TextDecoder().decode(encodeCanonicalRuntimeTupleV1(tuple));
+	if (digest !== validation.requestSha256 || tupleUtf8 !== validation.canonicalTupleUtf8) {
+		throw new CloudflareRuntimeProtocolErrorV1("request_digest_mismatch");
+	}
+}
+
+async function validateWorkerRuntimeOperationV1(
+	value: unknown,
+	effect: boolean,
+): Promise<CloudflareValidatedRuntimeOperationV1> {
+	try {
+		const validation = effect
+			? await decodeCloudflareRuntimeEffectEnvelopeV1(value)
+			: await decodeCloudflareRuntimeInspectionEnvelopeV1(value);
+		await assertWorkerRuntimeOperationV1(validation);
+		return validation;
+	} catch (error) {
+		return workerProtocolFailure(error);
+	}
+}
+
+export function validateCloudflareRuntimeEffectEnvelopeV1(
+	value: unknown,
+): Promise<CloudflareValidatedRuntimeOperationV1> {
+	return validateWorkerRuntimeOperationV1(value, true);
+}
+
+export function validateCloudflareRuntimeInspectionEnvelopeV1(
+	value: unknown,
+): Promise<CloudflareValidatedRuntimeOperationV1> {
+	return validateWorkerRuntimeOperationV1(value, false);
+}
+
+export async function validateCloudflareRuntimeEffectTransportEnvelopeV1(
+	value: unknown,
+): Promise<CloudflareValidatedRuntimeEffectTransportV1> {
+	try {
+		const validation = await decodeCloudflareRuntimeEffectTransportEnvelopeV1(value);
+		if (validation.transportFamily === "lifecycle") await assertWorkerRuntimeOperationV1(validation);
+		return validation;
+	} catch (error) {
+		return workerProtocolFailure(error);
+	}
+}
+
+export async function validateCloudflareRuntimeInspectionTransportEnvelopeV1(
+	value: unknown,
+): Promise<CloudflareValidatedRuntimeInspectionTransportV1> {
+	try {
+		const validation = await decodeCloudflareRuntimeInspectionTransportEnvelopeV1(value);
+		if (validation.transportFamily === "lifecycle") await assertWorkerRuntimeOperationV1(validation);
+		return validation;
+	} catch (error) {
+		return workerProtocolFailure(error);
+	}
+}
+
+export async function validateCloudflareReplicaCacheEvictionPlanV1(
+	value: unknown,
+	options: { readonly workspaceRetentionMs?: number } = {},
+): Promise<CloudflareReplicaCacheEvictionPlanV1> {
+	try {
+		return await decodeCloudflareReplicaCacheEvictionPlanV1(value, options);
+	} catch (error) {
+		return workerProtocolFailure(error);
+	}
+}
+
+export async function validateCloudflareReplicaDeleteRequestV1(
+	value: unknown,
+	expectedDomain?: "persistent" | "transient_task",
+): Promise<CloudflareReplicaDeletionValidationV1> {
+	try {
+		return await decodeCloudflareReplicaDeleteRequestV1(value, expectedDomain);
+	} catch (error) {
+		return workerProtocolFailure(error);
+	}
+}
+
+export function validateCloudflareRuntimeStatusRequestV1(value: unknown): CloudflareRuntimeStatusRequestV1 {
+	try {
+		return decodeCloudflareRuntimeStatusRequestV1(value);
+	} catch (error) {
+		return workerProtocolFailure(error);
+	}
+}
+
+export function validateCloudflareCheckpointFetchRequestV1(value: unknown): CloudflareCheckpointFetchRequestV1 {
+	try {
+		return decodeCloudflareCheckpointFetchRequestV1(value);
+	} catch (error) {
+		return workerProtocolFailure(error);
+	}
+}
+
+export async function validateCloudflareDurableDeadlineV1(
+	value: unknown,
+	options: { readonly workspaceRetentionMs?: number } = {},
+): Promise<CloudflareDurableDeadlineV1> {
+	try {
+		return await decodeCloudflareDurableDeadlineV1(value, options);
+	} catch (error) {
+		return workerProtocolFailure(error);
+	}
 }

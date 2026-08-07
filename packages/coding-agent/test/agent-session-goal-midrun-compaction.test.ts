@@ -16,6 +16,7 @@ import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 function activeGoalState(): GoalModeState {
 	const now = Date.now();
@@ -144,6 +145,7 @@ describe("AgentSession mid-run threshold compaction", () => {
 			sessionManager,
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			toolRegistry: new Map([[mockBashTool.name, mockBashTool]]),
 			extensionRunner: options.extensionRunner,
 		});

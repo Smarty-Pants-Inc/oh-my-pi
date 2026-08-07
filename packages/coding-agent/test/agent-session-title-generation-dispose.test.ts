@@ -11,6 +11,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
+import { createTestRuntimeDependencies } from "./utilities";
 
 let session: AgentSession | undefined;
 let authStorage: AuthStorage | undefined;
@@ -53,6 +54,7 @@ describe("AgentSession title generation disposal", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			providerSessionId,
 		});
 		const started = Promise.withResolvers<void>();

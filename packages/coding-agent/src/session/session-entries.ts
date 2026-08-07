@@ -268,6 +268,11 @@ export type SessionEntry =
 	| CredentialPinEntry
 	| ResetBoundaryEntry;
 
+/** Confidential journal class for the exact canonical persisted entry line. */
+export function sessionEntryJournalPrivacyClass(entry: SessionEntry): "transcript" | "credential-pseudonym" {
+	return entry.type === "credential_pin" ? "credential-pseudonym" : "transcript";
+}
+
 /** Raw logical file entry after loaders strip any fixed-width title slot. */
 export type FileEntry = SessionHeader | SessionEntry;
 

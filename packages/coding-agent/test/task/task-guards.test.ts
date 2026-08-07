@@ -5,6 +5,7 @@ import type { LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibili
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { WorkspaceRuntimeProviderRegistry } from "@oh-my-pi/pi-coding-agent/session/workspace-provider-registry";
 import { formatResultOutputFallback } from "@oh-my-pi/pi-coding-agent/task";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
@@ -120,6 +121,7 @@ function createFakeSession(config: FakeSessionConfig = {}): FakeSessionHandle {
 function mockCreateAgentSession(session: AgentSession) {
 	return vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({
 		session,
+		runtimeProviderRegistry: new WorkspaceRuntimeProviderRegistry(),
 		extensionsResult: {} as unknown as LoadExtensionsResult,
 		setToolUIContext: () => {},
 		eventBus: new EventBus(),

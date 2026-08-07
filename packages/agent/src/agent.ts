@@ -42,6 +42,7 @@ import type {
 	AgentContext,
 	AgentEvent,
 	AgentLoopConfig,
+	AgentLoopLifecyclePersistenceAdapterV1,
 	AgentMessage,
 	AgentState,
 	AgentTool,
@@ -186,6 +187,9 @@ export interface AgentOptions {
 	 */
 	onAssistantMessageEvent?: (message: AssistantMessage, event: AssistantMessageEvent) => void;
 
+	/** Called once per run when the first semantic assistant content event is observed. */
+	onFirstAssistantContent?: (timestamp: number) => void;
+
 	/**
 	 * Called when GPT-5 Harmony protocol leakage is detected and mitigated.
 	 */
@@ -313,6 +317,8 @@ export interface AgentOptions {
 	 * message are emitted. See {@link AgentLoopConfig.afterToolCall} for full semantics.
 	 */
 	afterToolCall?: AgentLoopConfig["afterToolCall"];
+	/** Exact owner-defined lifecycle and primary persistence adapter. */
+	lifecyclePersistenceAdapter?: AgentLoopLifecyclePersistenceAdapterV1;
 
 	/**
 	 * Called once an assistant message is finalized, before it reaches the
@@ -418,6 +424,7 @@ export class Agent {
 	#onResponse?: SimpleStreamOptions["onResponse"];
 	#onSseEvent?: SimpleStreamOptions["onSseEvent"];
 	#onAssistantMessageEvent?: (message: AssistantMessage, event: AssistantMessageEvent) => void;
+	#onFirstAssistantContent?: (timestamp: number) => void;
 	#onHarmonyLeak?: (event: HarmonyAuditEvent) => void | Promise<void>;
 	#onBeforeYield?: () => Promise<void> | void;
 	#onTurnEnd?: (messages: AgentMessage[], signal?: AbortSignal, context?: AgentTurnEndContext) => Promise<void> | void;
@@ -426,6 +433,7 @@ export class Agent {
 	#asideMessageProvider?: () => AsideMessage[] | Promise<AsideMessage[]>;
 	#telemetry?: AgentLoopConfig["telemetry"];
 	#appendOnlyContext?: AppendOnlyContextManager;
+	lifecyclePersistenceAdapter: AgentLoopLifecyclePersistenceAdapterV1 | undefined;
 
 	/** Buffered Cursor tool results with text length at time of call (for correct ordering) */
 	#cursorToolResultBuffer: CursorToolResultEntry[] = [];
@@ -499,11 +507,13 @@ export class Agent {
 		this.#getToolChoice = opts.getToolChoice;
 		this.#onToolChoiceUnavailable = opts.onToolChoiceUnavailable;
 		this.#onAssistantMessageEvent = opts.onAssistantMessageEvent;
+		this.#onFirstAssistantContent = opts.onFirstAssistantContent;
 		this.#onHarmonyLeak = opts.onHarmonyLeak;
 		this.beforeToolCall = opts.beforeToolCall;
 		this.afterToolCall = opts.afterToolCall;
 		this.transformAssistantMessage = opts.transformAssistantMessage;
 		this.#telemetry = opts.telemetry;
+		this.lifecyclePersistenceAdapter = opts.lifecyclePersistenceAdapter;
 		this.#appendOnlyContext = opts.appendOnlyContext;
 		this.#transformProviderContext = opts.transformProviderContext;
 	}
@@ -1347,10 +1357,12 @@ export class Agent {
 			appendOnlyContext: this.#appendOnlyContext,
 			beforeToolCall: this.beforeToolCall ? (ctx, signal) => this.beforeToolCall?.(ctx, signal) : undefined,
 			afterToolCall: this.afterToolCall ? (ctx, signal) => this.afterToolCall?.(ctx, signal) : undefined,
+			lifecyclePersistenceAdapter: this.lifecyclePersistenceAdapter,
 			transformAssistantMessage: this.transformAssistantMessage
 				? (message, signal) => this.transformAssistantMessage?.(message, signal)
 				: undefined,
 			onAssistantMessageEvent: this.#onAssistantMessageEvent,
+			onFirstAssistantContent: this.#onFirstAssistantContent,
 			onHarmonyLeak: this.#onHarmonyLeak,
 			onTurnEnd: (messages, signal, context) => this.#onTurnEnd?.(messages, signal, context),
 			getToolChoice,

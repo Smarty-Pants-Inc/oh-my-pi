@@ -13,6 +13,7 @@
  * Modes use this class and add their own I/O layer on top.
  */
 
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -23,9 +24,11 @@ import type { Clipboard, InMemorySnapshotStore } from "@oh-my-pi/hashline";
 import {
 	type AfterToolCallContext,
 	type AfterToolCallResult,
+	AGENT_LOOP_SELECTED_TOOL_RESULT_PERSISTENCE,
 	type Agent,
 	AgentBusyError,
 	type AgentEvent,
+	type AgentLoopLifecyclePersistenceAdapterV1,
 	type AgentMessage,
 	type AgentState,
 	type AgentTool,
@@ -100,6 +103,7 @@ import {
 import { type AdvisorConfig, type AdvisorRuntimeStatus, loadAdvisorTranscriptCosts } from "../advisor";
 import { type AsyncJob, AsyncJobManager } from "../async";
 import { shouldEnableAppendOnlyContext } from "../config/append-only-context-mode";
+import type { ModelConnectionResolver } from "../config/model-connection-contracts";
 import type { ModelRegistry } from "../config/model-registry";
 import { type ResolvedModelRoleValue, resolveModelOverride } from "../config/model-resolver";
 import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-templates";
@@ -143,7 +147,7 @@ import { GoalRuntime } from "../goals/runtime";
 import type { GoalModeState } from "../goals/state";
 import type { HindsightSessionState } from "../hindsight/state";
 import { type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
-import type { IrcMessage } from "../irc/bus";
+import { IrcBus, type IrcMessage } from "../irc/bus";
 import type { DaemonCompletionNotification } from "../launch/protocol";
 import { shutdownMnemopiEmbedClient } from "../mnemopi/embed-client";
 import { getMnemopiSessionState, type MnemopiSessionState, setMnemopiSessionState } from "../mnemopi/state";
@@ -168,6 +172,9 @@ import planModeToolDecisionReminderPrompt from "../prompts/system/plan-mode-tool
 import rewindReportTemplate from "../prompts/system/rewind-report.md" with { type: "text" };
 import sideChannelNoToolsReminder from "../prompts/system/side-channel-no-tools.md" with { type: "text" };
 import vibeModeActivePrompt from "../prompts/system/vibe-mode-active.md" with { type: "text" };
+import { AgentLifecycleManager } from "../registry/agent-lifecycle";
+import { AgentRegistry } from "../registry/agent-registry";
+import type { ISO8601, OperationId, Sha256Ref } from "../registry/persistent-agent-contracts.js";
 import {
 	deobfuscateAssistantContent,
 	deobfuscateSessionContext,
@@ -213,6 +220,9 @@ import type { AgentSessionEvent, AgentSessionEventListener } from "./agent-sessi
 import type {
 	AgentSessionConfig,
 	AgentSessionDisposeOptions,
+	AgentSessionTransientEvalInlineDynamicInvocationV1,
+	AgentSessionTransientTaskCurrentParentLocatorV1,
+	AgentSessionTransientTaskRuntimeAuthorityV1,
 	AsyncJobSnapshot,
 	CommandMetadataChangedListener,
 	ContextUsageBreakdown,
@@ -221,6 +231,8 @@ import type {
 	HandoffResult,
 	ModelCycleResult,
 	Prewalk,
+	ProcessOwnedAgentDependenciesV1,
+	ProcessOwnedTransientTaskRuntimeStoreAssemblyV1,
 	PromptOptions,
 	ResetSessionContextResult,
 	ResolvedRoleModel,
@@ -263,6 +275,7 @@ import {
 } from "./codex-auto-reset";
 import { recordCredentialPin, seedCredentialPins } from "./credential-pin";
 import { EvalRunner, type EvalRunnerHost } from "./eval-runner";
+import type { ExecutionEnvironmentProvider } from "./execution-environment";
 import {
 	collectPendingToolCalls,
 	createInterruptedTurnAbortMessage,
@@ -319,13 +332,22 @@ import { getRestorableSessionModels } from "./session-context";
 import { formatSessionDumpText } from "./session-dump-format";
 import type { BranchSummaryEntry, NewSessionOptions } from "./session-entries";
 import { SessionHandoff, type SessionHandoffHost } from "./session-handoff";
+import type { SessionJournalService, SessionJournalStreamDescriptorV1 } from "./session-journal-contracts.js";
 import {
 	COMPACTION_CHECK_NONE,
 	createCodexCompactionContext as createMaintenanceCodexCompactionContext,
 	SessionMaintenance,
 	type SessionMaintenanceHost,
 } from "./session-maintenance";
-import { cleanupEmptyMoveSession, type SessionManager } from "./session-manager";
+import {
+	cleanupEmptyMoveSession,
+	createAgentSessionToolResultPersistenceSerializerV1,
+	createTransientTaskDetachedPrimarySessionAppendBridgeV1,
+	createTransientTaskForegroundBeforeReturnRecoveryBridgeV1,
+	createTransientTaskForegroundPendingTtsrOverlayStoreV1,
+	createTransientTaskForegroundSessionAppendBridgeV1,
+	type SessionManager,
+} from "./session-manager";
 import { SessionMemory, type SessionMemoryHost } from "./session-memory";
 import { buildSessionMetadata } from "./session-metadata";
 import { SessionProviderBoundary, type SessionProviderBoundaryHost } from "./session-provider-boundary";
@@ -335,6 +357,21 @@ import type { ShakeMode, ShakeResult } from "./shake-types";
 import { ToolChoiceQueue } from "./tool-choice-queue";
 import { planTurnPersistence, sameMessageContent, sessionMessagePersistenceKey } from "./turn-persistence";
 import { TurnRecovery, type TurnRecoveryHost } from "./turn-recovery";
+import type * as RuntimeContracts from "./workspace-runtime-contracts.js";
+import type {
+	AgentSessionTransientTaskLifecycleObservationAdapterV1,
+	ConfidentialAsyncJobTransientTaskRecoveryOwnerSessionIndexV1,
+	ConfidentialTransientTaskHubWaitMessageSelectorInstallRequestV1,
+	ConfidentialTransientTaskHubWaitMessageSourceSelectionResultV1,
+	TransientTaskHubWaitDurableMessageSelectorV1,
+	TransientTaskHubWaitMessageWinnerCompletionEffectV1,
+} from "./workspace-runtime-contracts.js";
+import {
+	buildTransientTaskHubWaitMessageCanonicalRecordV1,
+	canonicalTransientTaskSourceObservationDigestV1,
+	finalizeTransientTaskHubWaitMessageResultV1,
+	validateTransientTaskHubWaitMessageCanonicalRecordV1,
+} from "./workspace-runtime-contracts.js";
 import { YieldQueue } from "./yield-queue";
 
 export * from "./agent-session-events";
@@ -345,9 +382,43 @@ const SESSION_STOP_CONTINUATION_CAP = 8;
 
 import { LoopGuards, type StreamGuardsHost, StreamingEditGuard } from "./stream-guards";
 import { TodoTracker, type TodoTrackerHost } from "./todo-tracker";
-import { TtsrCoordinator, type TtsrCoordinatorHost } from "./ttsr-coordinator";
+import {
+	type TransientTaskTtsrPreDispatchStateV1,
+	TtsrCoordinator,
+	type TtsrCoordinatorHost,
+} from "./ttsr-coordinator";
 
 const PLAN_MODE_REMINDER_MAX = 3;
+
+function transientSessionDigestRef(domain: string, value: unknown): Sha256Ref {
+	return `sha256:${createHash("sha256")
+		.update(JSON.stringify([domain, value]), "utf8")
+		.digest("hex")}` as Sha256Ref;
+}
+
+function transientSessionTupleDigestRef(tuple: readonly unknown[]): Sha256Ref {
+	return `sha256:${createHash("sha256").update(JSON.stringify(tuple), "utf8").digest("hex")}` as Sha256Ref;
+}
+
+function transientSessionNow(): ISO8601 {
+	return new Date().toISOString() as ISO8601;
+}
+
+type AgentSessionTransientTaskPersistenceAuthorityV1 = AgentLoopLifecyclePersistenceAdapterV1 &
+	TransientTaskHubWaitMessageWinnerCompletionEffectV1;
+type HubWaitPrimaryCommitReceiptV1 = Extract<
+	RuntimeContracts.ConfidentialAgentSessionToolResultPrimaryCommitReceiptV1,
+	{ readonly core: { readonly route: "hub_wait_message_return" } }
+>;
+
+function isHubWaitPrimaryCommitReceiptV1(
+	receipt: RuntimeContracts.ConfidentialAgentSessionToolResultPrimaryCommitReceiptV1,
+): receipt is HubWaitPrimaryCommitReceiptV1 {
+	return (
+		receipt.core.route === "hub_wait_message_return" &&
+		receipt.core.primaryPersistenceReceipt.core.route === "hub_wait_message_return"
+	);
+}
 const POST_PROMPT_DRAIN_TIMEOUT_MS = 5_000;
 
 /** Internal marker for hook messages queued through the agent loop */
@@ -420,6 +491,27 @@ type SetSessionNameWithTrigger = (
 
 const kPersistedSessionEntryId = Symbol("persistedSessionEntryId");
 type PersistedAssistantMessage = AssistantMessage & { [kPersistedSessionEntryId]?: string };
+
+type TransientTaskSourceObservationProductionInputV1 = {
+	readonly indexKey: RuntimeContracts.ConfidentialTransientTaskPendingCaptureIndexKeyV1;
+	readonly reservationId: RuntimeContracts.ConfidentialAgentSessionTransientTaskSourceObservationProducerRequestV1["core"]["reservationId"];
+	readonly observedAt: ISO8601;
+	readonly requestedAt: ISO8601;
+} & (
+	| {
+			readonly producer: "task_tool";
+			readonly observationInput: RuntimeContracts.ConfidentialTransientTaskTaskToolSourceObservationInputV1;
+	  }
+	| {
+			readonly producer: "eval_tool";
+			readonly observationInput: RuntimeContracts.ConfidentialTransientEvalToolSourceObservationInputV1;
+	  }
+	| {
+			readonly producer: "agent_loop";
+
+			readonly observationInput: RuntimeContracts.AgentLoopTransientTaskLifecycleObservationInputV1;
+	  }
+);
 
 export class AgentSession {
 	readonly agent: Agent;
@@ -504,6 +596,8 @@ export class AgentSession {
 	 * this undefined and **MUST NOT** dispose the global instance on teardown.
 	 */
 	readonly #ownedAsyncJobManager: AsyncJobManager | undefined;
+	/** SDK coordinator release retained through complete owned-runtime and manager teardown. */
+	#releaseProcessAsyncJobManagerBinding: (() => void) | undefined;
 	/**
 	 * AsyncJobManager scoped to this session for introspection/cancellation.
 	 *
@@ -512,8 +606,55 @@ export class AgentSession {
 	 * undefined to avoid reading the primary's jobs.
 	 */
 	readonly #asyncJobManager: AsyncJobManager | undefined;
+	/** Durable primary-persistence serializer bound to this owner-session generation. */
+	#toolResultPrimarySerializer: RuntimeContracts.AgentSessionToolResultPersistenceSerializerV1 | undefined;
 	/** Clears this session's owner delivery sink registration; set when a manager + agent id exist. */
 	#unregisterAsyncDeliverySink: (() => void) | undefined;
+	/** Exact Agent-owned lifecycle, primary-persistence, Hub ticket, and selector authority. */
+	readonly #transientTaskPersistenceAuthority: AgentSessionTransientTaskPersistenceAuthorityV1;
+	/** Guarded process runtime/store binding retained for this owner-session generation. */
+	#transientTaskRuntimeStoreAssembly: ProcessOwnedTransientTaskRuntimeStoreAssemblyV1 | undefined;
+	/** Removes this session's exact ordinary transient lifecycle owner registration. */
+	#unregisterOrdinaryTransientTaskLifecycle: (() => void) | undefined;
+	/** Exact managed transient aggregate locator supplied only to managed child sessions. */
+	readonly #transientTaskCurrentParentTaskLocator: AgentSessionTransientTaskCurrentParentLocatorV1 | undefined;
+	/** Finalized foreground predispatch bindings, consumed exactly once by Task or Eval execution. */
+	#transientTaskPreDispatchBindings = new Map<string, TransientTaskTtsrPreDispatchStateV1>();
+	/** One-shot consumption guard; lifecycle state remains until the exact outer tool terminal boundary. */
+	#transientTaskConsumedPreDispatchBindings = new Set<string>();
+	/** Exact committed lifecycle authority retained for every child spawned by one foreground invocation. */
+	#transientTaskLifecycleAuthorities = new Map<
+		string,
+		RuntimeContracts.ConfidentialAgentSessionTransientTaskLifecycleAuthorityV1
+	>();
+	/** Startup rehydration barrier; delivery registration and transient admission wait on it. */
+	#transientTaskStartup: Promise<void> = Promise.resolve();
+	/** Captured startup failure keeps constructor publication and teardown fail-closed without an unhandled rejection. */
+	#transientTaskStartupFailure: Error | undefined;
+	/** Session journal attachment completes before any primary write or prompt admission. */
+	#sessionJournalStartup: Promise<void> = Promise.resolve();
+	#sessionJournalStartupFailure: Error | undefined;
+	/** Serializes owner-session generation cutover so no caller observes a half-rebound runtime. */
+	#transientTaskRuntimeBindingOperation: Promise<void> = Promise.resolve();
+	#transientTaskOwnerSessionIndex: ConfidentialAsyncJobTransientTaskRecoveryOwnerSessionIndexV1 | undefined;
+	/** Selected Hub returns awaiting the exact general-primary commit and durable acknowledgement. */
+	#transientTaskSelectedHubReturns = new Map<
+		string,
+		{
+			readonly completionReceipt: RuntimeContracts.ConfidentialTransientTaskHubWaitMessageWinnerCompletionReceiptV1;
+			readonly deliveryReceipt: RuntimeContracts.ConfidentialTransientTaskHubWaitMessageReturnDeliveryReceiptV1;
+			readonly captureRequest: RuntimeContracts.ConfidentialTransientTaskHubWaitMessageWinnerCaptureRequestV1;
+			readonly currentSelectorAuthority: RuntimeContracts.ConfidentialTransientTaskHubWaitMessageWinnerCurrentSelectorAuthorityV1;
+		}
+	>();
+	/** Buffered selectors whose exact source candidate remains owned during the durable callback. */
+	readonly #activeHubWaitSelectorInstallRequestSha256s = new Set<string>();
+	/** Releases this session's reference to the sole process-owned persistent store after journal close. */
+	#releaseProcessOwnedPersistentAgentStore: (() => void) | undefined;
+	/** Sole process-owned dependency seam used to assemble claimed transient task runtimes. */
+	readonly #processOwnedDependencies: ProcessOwnedAgentDependenciesV1 | undefined;
+	/** Exact resolved environment provider required by managed transient execution. */
+	readonly #executionEnvironmentProvider: ExecutionEnvironmentProvider | undefined;
 	/**
 	 * Async-delivery generation, bumped on every session transition that evicts
 	 * this owner's jobs (see {@link AgentSession.#cancelOwnAsyncJobs}). Stamped
@@ -558,6 +699,8 @@ export class AgentSession {
 
 	// Model registry for API key resolution
 	#modelRegistry: ModelRegistry;
+	readonly #runtimeProviderRegistry: RuntimeContracts.RuntimeProviderRegistry;
+	readonly #modelConnectionResolver: ModelConnectionResolver;
 	#usageFallbackConfirmer: ((confirmation: UsageFallbackConfirmation) => Promise<boolean>) | undefined;
 	#usageReserveApprovedSelector: string | undefined;
 	#usagePreflightAbortControllers = new Set<AbortController>();
@@ -749,7 +892,7 @@ export class AgentSession {
 			}
 			return;
 		}
-		this.#wakeForIrc(records);
+		void this.#wakeForIrc(records);
 	}
 
 	/** Fire-and-forget wake turn for incoming IRC — idle delivery and stranded-aside resume both
@@ -759,7 +902,7 @@ export class AgentSession {
 	 *  it, so park the follow-up queue across the wake and restore it after. It stays queued post-wake
 	 *  because #canAutoContinueForFollowUp suppresses follow-up auto-resume while a user interrupt is
 	 *  in effect, even though the wake left a provider-valid tail. */
-	#wakeForIrc(records: CustomMessage[]): void {
+	#wakeForIrc(records: CustomMessage[]): Promise<void> {
 		// Park only a *blocked* follow-up (one a user interrupt is intentionally holding); an
 		// already-resumable follow-up can ride the wake turn normally without reordering.
 		const parkedFollowUps =
@@ -787,32 +930,41 @@ export class AgentSession {
 		const generation = this.#promptGeneration;
 		this.#beginInFlight();
 		let turnError: unknown;
-		void this.agent
-			.prompt(records)
+		const finishTurn = async (): Promise<void> => {
+			try {
+				await this.#waitForPostPromptRecovery(generation);
+			} catch (error) {
+				turnError ??= error;
+				logger.warn("IRC wake turn recovery failed", { error: String(error) });
+			}
+			if (parkedFollowUps.length > 0) {
+				this.agent.replaceQueues(
+					[...this.agent.peekSteeringQueue()],
+					[...parkedFollowUps, ...this.agent.peekFollowUpQueue()],
+				);
+			}
+			this.#endInFlight(async () => {
+				try {
+					await finishObservation?.(turnError);
+				} catch (error) {
+					logger.warn("IRC wake turn observer failed to finish", { error: String(error) });
+				}
+			});
+		};
+		return this.#awaitSessionPromptAdmission()
+			.then(() => {
+				const turn = this.agent.prompt(records);
+				void turn
+					.catch(error => {
+						turnError = error;
+						logger.warn("IRC wake turn failed", { error: String(error) });
+					})
+					.finally(finishTurn);
+			})
 			.catch(error => {
 				turnError = error;
 				logger.warn("IRC wake turn failed", { error: String(error) });
-			})
-			.finally(async () => {
-				try {
-					await this.#waitForPostPromptRecovery(generation);
-				} catch (error) {
-					turnError ??= error;
-					logger.warn("IRC wake turn recovery failed", { error: String(error) });
-				}
-				if (parkedFollowUps.length > 0) {
-					this.agent.replaceQueues(
-						[...this.agent.peekSteeringQueue()],
-						[...parkedFollowUps, ...this.agent.peekFollowUpQueue()],
-					);
-				}
-				this.#endInFlight(async () => {
-					try {
-						await finishObservation?.(turnError);
-					} catch (error) {
-						logger.warn("IRC wake turn observer failed to finish", { error: String(error) });
-					}
-				});
+				void finishTurn();
 			});
 	}
 
@@ -899,6 +1051,539 @@ export class AgentSession {
 			cwd: this.sessionManager.getCwd(),
 		});
 	}
+	#registerTransientTaskLifecycleAuthority(
+		authority: RuntimeContracts.ConfidentialAgentSessionTransientTaskLifecycleAuthorityV1,
+	): RuntimeContracts.ConfidentialAgentSessionTransientTaskLifecycleAuthorityV1 {
+		const existing = this.#transientTaskLifecycleAuthorities.get(authority.toolCallId);
+		if (
+			existing &&
+			(JSON.stringify(existing.pendingCaptureIndexKey) !== JSON.stringify(authority.pendingCaptureIndexKey) ||
+				JSON.stringify(existing.pendingCaptureKey) !== JSON.stringify(authority.pendingCaptureKey) ||
+				JSON.stringify(existing.startedCaptureReceipt) !== JSON.stringify(authority.startedCaptureReceipt) ||
+				existing.parentSessionId !== authority.parentSessionId ||
+				existing.parentSessionGenerationSha256 !== authority.parentSessionGenerationSha256 ||
+				existing.parentBranchGenerationSha256 !== authority.parentBranchGenerationSha256 ||
+				existing.assistantAnchorEntryId !== authority.assistantAnchorEntryId ||
+				existing.toolCallId !== authority.toolCallId ||
+				existing.toolName !== authority.toolName ||
+				existing.sourceToolCallOrdinal !== authority.sourceToolCallOrdinal)
+		) {
+			throw new Error("Transient foreground lifecycle authority changed for one tool invocation");
+		}
+		if (existing) return existing;
+		this.#transientTaskLifecycleAuthorities.set(authority.toolCallId, authority);
+		return authority;
+	}
+
+	async #retryExactTransientTaskStoreCall<T>(operation: () => Promise<T>): Promise<T> {
+		for (;;) {
+			try {
+				return await operation();
+			} catch {
+				await scheduler.wait(10);
+			}
+		}
+	}
+
+	#transientTaskSourceObservationReservationRequest(
+		input: TransientTaskSourceObservationProductionInputV1,
+		expectedHead: RuntimeContracts.ConfidentialTransientTaskSourceObservationHeadV1,
+		expectedPredecessorObservationReceipt: RuntimeContracts.ConfidentialTransientTaskSourceObservationReceiptV1 | null,
+	): RuntimeContracts.ConfidentialTransientTaskSourceObservationReservationRequestV1 {
+		const observationInput = input.observationInput;
+		const core = {
+			indexKey: input.indexKey,
+			producer: input.producer,
+			eventKind: observationInput.eventKind,
+			observationInput,
+			observedAt: input.observedAt,
+			reservationId: input.reservationId,
+			expectedHead,
+			expectedPredecessorObservationReceipt,
+			requestedAt: input.requestedAt,
+		};
+		return {
+			core,
+			requestSha256: canonicalTransientTaskSourceObservationDigestV1("source_observation_reservation_request", core),
+		};
+	}
+
+	async #reserveAndCommitTransientTaskSourceObservation(
+		store: RuntimeContracts.TransientTaskSourceObservationStoreV1,
+		input: TransientTaskSourceObservationProductionInputV1,
+	): Promise<RuntimeContracts.ConfidentialAgentSessionTransientTaskSourceObservationProducerResultV1> {
+		for (;;) {
+			const inspectionCore = { indexKey: input.indexKey, requestedAt: input.requestedAt };
+			const inspectionRequest = {
+				core: inspectionCore,
+				requestSha256: canonicalTransientTaskSourceObservationDigestV1(
+					"source_observation_state_inspect_request",
+					inspectionCore,
+				),
+			};
+			const inspection = await this.#retryExactTransientTaskStoreCall(() =>
+				store.inspectObservationState(inspectionRequest),
+			);
+			if (inspection.status !== "matching") {
+				return { status: inspection.status === "sequence_conflict" ? "sequence_conflict" : "invalid" };
+			}
+
+			if (inspection.activeDraft) {
+				const active = inspection.activeDraft;
+				const inspectedAt = transientSessionNow();
+				const draftInspectCore = {
+					indexKey: input.indexKey,
+					reservationId: active.core.reservationId,
+					expectedReservationRequestSha256: active.core.reservationRequestSha256,
+					expectedDraftSha256: active.core.draftSha256,
+					inspectedAt,
+				};
+				const draftInspectRequest = {
+					...draftInspectCore,
+					requestSha256: canonicalTransientTaskSourceObservationDigestV1(
+						"source_observation_draft_inspect_request",
+						draftInspectCore,
+					),
+				};
+				const draftInspection = await this.#retryExactTransientTaskStoreCall(() =>
+					store.inspectObservationDraft(draftInspectRequest),
+				);
+				if (draftInspection.status !== "matching") {
+					return {
+						status:
+							draftInspection.status === "sequence_conflict"
+								? "sequence_conflict"
+								: draftInspection.status === "observation_conflict"
+									? "observation_conflict"
+									: "invalid",
+					};
+				}
+				const adoptedAt = transientSessionNow();
+				const draftAdoptCore = {
+					inspection: draftInspection,
+					expectedInspectionSha256: draftInspection.inspectionSha256,
+					adoptedAt,
+				};
+				const draftAdoptRequest = {
+					...draftAdoptCore,
+					requestSha256: canonicalTransientTaskSourceObservationDigestV1(
+						"source_observation_draft_adopt_request",
+						draftAdoptCore,
+					),
+				};
+				const adopted = await this.#retryExactTransientTaskStoreCall(() =>
+					store.adoptObservationDraft(draftAdoptRequest),
+				);
+				if (adopted.status !== "adopted" && adopted.status !== "already_adopted") {
+					return {
+						status:
+							adopted.status === "sequence_conflict"
+								? "sequence_conflict"
+								: adopted.status === "observation_conflict"
+									? "observation_conflict"
+									: "invalid",
+					};
+				}
+				const activeReservationRequest = this.#transientTaskSourceObservationReservationRequest(
+					input,
+					adopted.draft.core.priorHead,
+					adopted.draft.core.predecessorObservationReceipt,
+				);
+				const committedAt = transientSessionNow();
+				const draftCommitCore = {
+					draft: adopted.draft,
+					draftReceipt: adopted.receipt,
+					expectedHeadSha256: adopted.draft.core.priorHead.headSha256,
+					expectedPredecessorObservationReceiptSha256:
+						adopted.draft.core.predecessorObservationReceipt?.receiptSha256 ?? null,
+					committedAt,
+				};
+				const draftCommitRequest = {
+					...draftCommitCore,
+					requestSha256: canonicalTransientTaskSourceObservationDigestV1(
+						"source_observation_draft_commit_request",
+						draftCommitCore,
+					),
+				};
+				const commit = await this.#retryExactTransientTaskStoreCall(() =>
+					store.commitObservationDraft(draftCommitRequest),
+				);
+				if (commit.status !== "committed" && commit.status !== "already_committed") {
+					return {
+						status:
+							commit.status === "sequence_conflict"
+								? "sequence_conflict"
+								: commit.status === "observation_conflict"
+									? "observation_conflict"
+									: "invalid",
+					};
+				}
+				if (adopted.draft.core.reservationRequest.requestSha256 === activeReservationRequest.requestSha256) {
+					const accepted = commit.acceptedRow.core;
+					const authority = this.#registerTransientTaskLifecycleAuthority(
+						accepted.draft.core.record.core.authority,
+					);
+					return {
+						status: commit.status,
+						authority,
+						draft: accepted.draft,
+						draftReceipt: accepted.draftReceipt,
+						observationReceipt: accepted.observationReceipt,
+					};
+				}
+				continue;
+			}
+
+			const reservationRequest = this.#transientTaskSourceObservationReservationRequest(
+				input,
+				inspection.head,
+				inspection.latestAcceptedObservationReceipt,
+			);
+			const drafted = await this.#retryExactTransientTaskStoreCall(() =>
+				store.reserveAndFreezeObservationDraft(reservationRequest),
+			);
+			if (drafted.status !== "drafted" && drafted.status !== "already_drafted") {
+				return { status: drafted.status };
+			}
+			const commitCore = {
+				draft: drafted.draft,
+				draftReceipt: drafted.receipt,
+				expectedHeadSha256: drafted.draft.core.priorHead.headSha256,
+				expectedPredecessorObservationReceiptSha256:
+					drafted.draft.core.predecessorObservationReceipt?.receiptSha256 ?? null,
+				committedAt: transientSessionNow(),
+			};
+
+			const commitRequest = {
+				...commitCore,
+				requestSha256: canonicalTransientTaskSourceObservationDigestV1(
+					"source_observation_draft_commit_request",
+					commitCore,
+				),
+			};
+			const committed = await this.#retryExactTransientTaskStoreCall(() =>
+				store.commitObservationDraft(commitRequest),
+			);
+			if (committed.status !== "committed" && committed.status !== "already_committed") {
+				return {
+					status:
+						committed.status === "sequence_conflict"
+							? "sequence_conflict"
+							: committed.status === "observation_conflict"
+								? "observation_conflict"
+								: "invalid",
+				};
+			}
+			const accepted = committed.acceptedRow.core;
+
+			const authority = this.#registerTransientTaskLifecycleAuthority(accepted.draft.core.record.core.authority);
+			return {
+				status: committed.status,
+				authority,
+				draft: accepted.draft,
+				draftReceipt: accepted.draftReceipt,
+				observationReceipt: accepted.observationReceipt,
+			};
+		}
+	}
+	async #inspectAndAdoptTransientTaskSourceObservation(
+		store: RuntimeContracts.TransientTaskSourceObservationStoreV1,
+		indexKey: RuntimeContracts.ConfidentialTransientTaskPendingCaptureIndexKeyV1,
+		receipt: RuntimeContracts.ConfidentialTransientTaskSourceObservationReceiptV1,
+		requestedAt: ISO8601,
+	): Promise<
+		Extract<
+			RuntimeContracts.ConfidentialTransientTaskSourceObservationAdoptResultV1,
+			{ readonly status: "adopted" | "already_adopted" }
+		>
+	> {
+		const inspectCore = {
+			indexKey,
+			eventKind: receipt.core.eventKind,
+			lifecycleOrdinal: receipt.core.lifecycleOrdinal,
+			observationSequence: receipt.core.observationSequence,
+			expectedObservationSha256: receipt.core.observationSha256,
+			expectedReservationReceiptSha256: receipt.core.reservationReceiptSha256,
+			expectedPredecessorObservationReceiptSha256: receipt.core.predecessorObservationReceiptSha256,
+			expectedPriorHeadSha256: receipt.core.priorHeadSha256,
+			expectedAcceptedHeadSha256: receipt.core.acceptedHeadSha256,
+			requestedAt,
+		};
+		const inspected = await this.#retryExactTransientTaskStoreCall(() =>
+			store.inspectObservation({
+				core: inspectCore,
+				requestSha256: canonicalTransientTaskSourceObservationDigestV1(
+					"source_observation_inspect_request",
+					inspectCore,
+				),
+			}),
+		);
+		if (inspected.status !== "matching") {
+			throw new Error(`Transient Task source observation inspection failed: ${inspected.status}`);
+		}
+		const adoptCore = {
+			inspection: inspected,
+			expectedInspectionSha256: inspected.inspectionSha256,
+			requestedAt,
+		};
+		const adopted = await this.#retryExactTransientTaskStoreCall(() =>
+			store.adoptObservation({
+				core: adoptCore,
+				requestSha256: canonicalTransientTaskSourceObservationDigestV1(
+					"source_observation_adopt_request",
+					adoptCore,
+				),
+			}),
+		);
+		if (adopted.status !== "adopted" && adopted.status !== "already_adopted") {
+			throw new Error(`Transient Task source observation adoption failed: ${adopted.status}`);
+		}
+		return adopted;
+	}
+
+	#listOrderedTransientTaskPendingCaptureIndexKeys(
+		parentSessionId: string,
+		parentSessionGenerationSha256: Sha256Ref,
+	): readonly RuntimeContracts.ConfidentialTransientTaskPendingCaptureIndexKeyV1[] {
+		const ordered: RuntimeContracts.ConfidentialTransientTaskPendingCaptureIndexKeyV1[] = [];
+		for (const entry of this.sessionManager.getBranch()) {
+			if (entry.type !== "message" || entry.message.role !== "assistant" || entry.parentId === null) continue;
+			const authority = this.sessionManager.resolveTransientTaskJournalGenerationAuthority(entry.parentId);
+			if (
+				authority.status !== "matching" ||
+				authority.authority.sessionGeneration.core.sessionId !== parentSessionId ||
+				authority.authority.sessionGeneration.sessionGenerationSha256 !== parentSessionGenerationSha256 ||
+				authority.authority.branchGeneration.core.branchAnchorEntryId !== entry.parentId
+			) {
+				throw new Error("Persisted transient-task journal authority changed during restart enumeration");
+			}
+			let sourceToolCallOrdinal = 0;
+			for (const content of entry.message.content) {
+				if (content.type !== "toolCall") continue;
+				if (content.name === "task" || content.name === "eval") {
+					const core: RuntimeContracts.ConfidentialTransientTaskPendingCaptureIndexKeyCoreV1 = {
+						schemaVersion: 1 as const,
+						parentSessionId,
+						parentSessionGenerationSha256,
+						parentBranchGenerationSha256: authority.authority.branchGeneration.branchGenerationSha256,
+						assistantAnchorEntryId: entry.parentId,
+						toolCallId: content.id,
+						toolName: content.name,
+						sourceToolCallOrdinal,
+					};
+					ordered.push({
+						core,
+						indexKeySha256: canonicalTransientTaskSourceObservationDigestV1("pending_capture_index_key", core),
+					});
+				}
+				sourceToolCallOrdinal += 1;
+			}
+		}
+		return ordered;
+	}
+
+	async #hydrateTransientTaskLifecycleAuthority(
+		store: RuntimeContracts.TransientTaskSourceObservationStoreV1,
+		indexKey: RuntimeContracts.ConfidentialTransientTaskPendingCaptureIndexKeyV1,
+		requestedAt: ISO8601,
+	): Promise<void> {
+		const inspectState = async () => {
+			const core = { indexKey, requestedAt };
+			return this.#retryExactTransientTaskStoreCall(() =>
+				store.inspectObservationState({
+					core,
+					requestSha256: canonicalTransientTaskSourceObservationDigestV1(
+						"source_observation_state_inspect_request",
+						core,
+					),
+				}),
+			);
+		};
+		let state = await inspectState();
+		if (state.status === "absent") return;
+		if (state.status !== "matching") {
+			throw new Error(`Transient Task source observation restart inspection failed: ${state.status}`);
+		}
+		if (state.activeDraft) {
+			const active = state.activeDraft;
+			const inspectCore = {
+				indexKey,
+				reservationId: active.core.reservationId,
+				expectedReservationRequestSha256: active.core.reservationRequestSha256,
+				expectedDraftSha256: active.core.draftSha256,
+				inspectedAt: requestedAt,
+			};
+			const inspection = await this.#retryExactTransientTaskStoreCall(() =>
+				store.inspectObservationDraft({
+					...inspectCore,
+					requestSha256: canonicalTransientTaskSourceObservationDigestV1(
+						"source_observation_draft_inspect_request",
+						inspectCore,
+					),
+				}),
+			);
+			if (inspection.status !== "matching") {
+				throw new Error(`Transient Task active source draft restart inspection failed: ${inspection.status}`);
+			}
+			const adoptCore = {
+				inspection,
+				expectedInspectionSha256: inspection.inspectionSha256,
+				adoptedAt: requestedAt,
+			};
+			const adopted = await this.#retryExactTransientTaskStoreCall(() =>
+				store.adoptObservationDraft({
+					...adoptCore,
+					requestSha256: canonicalTransientTaskSourceObservationDigestV1(
+						"source_observation_draft_adopt_request",
+						adoptCore,
+					),
+				}),
+			);
+			if (adopted.status !== "adopted" && adopted.status !== "already_adopted") {
+				throw new Error(`Transient Task active source draft restart adoption failed: ${adopted.status}`);
+			}
+			const commitCore = {
+				draft: adopted.draft,
+				draftReceipt: adopted.receipt,
+				expectedHeadSha256: adopted.draft.core.priorHead.headSha256,
+				expectedPredecessorObservationReceiptSha256:
+					adopted.draft.core.predecessorObservationReceipt?.receiptSha256 ?? null,
+				committedAt: requestedAt,
+			};
+			const committed = await this.#retryExactTransientTaskStoreCall(() =>
+				store.commitObservationDraft({
+					...commitCore,
+					requestSha256: canonicalTransientTaskSourceObservationDigestV1(
+						"source_observation_draft_commit_request",
+						commitCore,
+					),
+				}),
+			);
+			if (committed.status !== "committed" && committed.status !== "already_committed") {
+				throw new Error(`Transient Task active source draft restart commit failed: ${committed.status}`);
+			}
+			state = await inspectState();
+			if (state.status !== "matching") {
+				throw new Error(`Transient Task source observation post-commit inspection failed: ${state.status}`);
+			}
+		}
+		let receipt = state.latestAcceptedObservationReceipt;
+		let earliest: RuntimeContracts.ConfidentialTransientTaskSourceObservationAcceptedRowV1 | null = null;
+		const visited = new Set<Sha256Ref>();
+		while (receipt) {
+			if (visited.has(receipt.receiptSha256)) {
+				throw new Error("Transient Task source observation predecessor cycle detected during restart");
+			}
+			visited.add(receipt.receiptSha256);
+			const adoption = await this.#inspectAndAdoptTransientTaskSourceObservation(
+				store,
+				indexKey,
+				receipt,
+				requestedAt,
+			);
+			earliest = adoption.acceptedRow;
+			receipt = earliest.core.draft.core.predecessorObservationReceipt;
+		}
+		if (earliest) this.#registerTransientTaskLifecycleAuthority(earliest.core.draft.core.record.core.authority);
+	}
+
+	async #rehydrateTransientTaskLifecycleAuthorities(
+		assembly: ProcessOwnedTransientTaskRuntimeStoreAssemblyV1,
+		ownerSessionIndex: ConfidentialAsyncJobTransientTaskRecoveryOwnerSessionIndexV1,
+		requestedAt: ISO8601,
+	): Promise<void> {
+		const ordered = this.#listOrderedTransientTaskPendingCaptureIndexKeys(
+			ownerSessionIndex.ownerSessionId,
+			ownerSessionIndex.ownerSessionGenerationSha256,
+		);
+		for (const indexKey of ordered) {
+			await this.#hydrateTransientTaskLifecycleAuthority(
+				assembly.facade.transientTaskSourceObservationStore,
+				indexKey,
+				requestedAt,
+			);
+		}
+	}
+
+	#resolveCurrentAssistantToolResultSerializerKey(toolCallId: string): {
+		readonly assistantAnchorEntryId: string;
+		readonly serializerKey: RuntimeContracts.ConfidentialAgentSessionToolResultSerializerKeyV1;
+	} {
+		const matchingAssistants = this.agent.state.messages.filter(
+			(message): message is AssistantMessage =>
+				message.role === "assistant" &&
+				message.content.some(content => content.type === "toolCall" && content.id === toolCallId),
+		);
+		if (matchingAssistants.length !== 1) {
+			throw new Error("Expected exactly one current assistant entry for the tool result serializer");
+		}
+		const assistantAnchorEntryId = (matchingAssistants[0] as PersistedAssistantMessage)[kPersistedSessionEntryId];
+		if (!assistantAnchorEntryId) throw new Error("Current assistant tool-call entry is not durably persisted");
+		const generation = this.sessionManager.resolveTransientTaskJournalGenerationAuthority(assistantAnchorEntryId);
+		if (generation.status !== "matching") {
+			throw new Error(`Current assistant journal generation authority is unavailable: ${generation.status}`);
+		}
+		const parentSessionId = generation.authority.sessionGeneration.core.sessionId;
+		const parentSessionGenerationSha256 = generation.authority.sessionGeneration.sessionGenerationSha256;
+		const parentBranchGenerationSha256 = generation.authority.branchGeneration.branchGenerationSha256;
+		return {
+			assistantAnchorEntryId,
+			serializerKey: {
+				schemaVersion: 1,
+				parentSessionId,
+				parentSessionGenerationSha256,
+				parentBranchGenerationSha256,
+				assistantAnchorEntryId,
+				serializerKeySha256: transientSessionTupleDigestRef([
+					"omp-agent-session-tool-result-serializer-v1",
+					"key-core",
+					1,
+					parentSessionId,
+					parentSessionGenerationSha256,
+					parentBranchGenerationSha256,
+					assistantAnchorEntryId,
+				]),
+			},
+		};
+	}
+
+	#takeTransientTaskPreDispatchBinding(toolCallId: string): {
+		readonly indexKey: RuntimeContracts.ConfidentialTransientTaskPendingCaptureIndexKeyV1;
+		readonly snapshot: RuntimeContracts.ConfidentialTransientTaskForegroundPendingTtsrOverlaySnapshotV1;
+		readonly binding: RuntimeContracts.ConfidentialTransientTaskForegroundPendingTtsrOverlayPreDispatchBindingV1;
+		readonly sourceToolCallOrdinal: number;
+		readonly assistantAnchorEntryId: string;
+		readonly serializerKey: RuntimeContracts.ConfidentialAgentSessionToolResultSerializerKeyV1;
+	} | null {
+		const preDispatch = this.#transientTaskPreDispatchBindings.get(toolCallId);
+		if (!preDispatch || this.#transientTaskConsumedPreDispatchBindings.has(toolCallId)) return null;
+		const serializer = this.#resolveCurrentAssistantToolResultSerializerKey(toolCallId);
+		this.#transientTaskConsumedPreDispatchBindings.add(toolCallId);
+		return { ...preDispatch, ...serializer };
+	}
+
+	async #reserveAndFreezeTransientTaskSourceObservationDraft(
+		request: RuntimeContracts.ConfidentialAgentSessionTransientTaskSourceObservationProducerRequestV1,
+	): Promise<RuntimeContracts.ConfidentialAgentSessionTransientTaskSourceObservationProducerResultV1> {
+		const expectedRequestSha256 = transientSessionTupleDigestRef([
+			"omp-agent-session-transient-task-lifecycle-v1",
+			"producer-draft-request-core",
+			1,
+			request.core.indexKey,
+			request.core.producer,
+			request.core.observationInput,
+			request.core.reservationId,
+			request.core.observedAt,
+			request.core.requestedAt,
+		]);
+		if (request.requestSha256 !== expectedRequestSha256) return { status: "invalid" };
+		const assembly = this.#transientTaskRuntimeStoreAssembly;
+		if (!assembly) return { status: "invalid" };
+		return this.#reserveAndCommitTransientTaskSourceObservation(
+			assembly.facade.transientTaskSourceObservationStore,
+			request.core,
+		);
+	}
 
 	/** `local://` URLs of plan files in the session-local root, newest first —
 	 *  a fallback for `resolveApprovedPlan` when the agent dropped `extra.title`. */
@@ -906,11 +1591,233 @@ export class AgentSession {
 		return listPlanFiles({ localProtocolOptions: this.#localProtocolOptions() });
 	}
 
+	#transientTaskLifecycleObservationAdapter(): AgentSessionTransientTaskLifecycleObservationAdapterV1 {
+		const assembly = this.#transientTaskRuntimeStoreAssembly;
+		if (!assembly) throw new Error("Transient task lifecycle observation authority is unavailable");
+		return assembly.transientTaskLifecycleObservationAdapter;
+	}
+	async #verifyCurrentHubWaitMessageSelectorOwnership(
+		request: Parameters<
+			TransientTaskHubWaitMessageWinnerCompletionEffectV1["verifyCurrentHubWaitMessageSelectorOwnership"]
+		>[0],
+	): Promise<"current" | "stale" | "outcome_unknown"> {
+		const capture = request.captureRequest;
+		const authority = request.currentSelectorAuthority;
+		const claim = authority.preselectionClaim;
+		const selectorSha256 = capture.selector.selectorInstallRequestSha256;
+		if (
+			capture.captureRequestSha256 !== authority.captureRequestSha256 ||
+			capture.message.messageSha256 !== authority.messageSha256 ||
+			capture.returnTargetRegistrationReceipt.receiptSha256 !== authority.returnTargetRegistrationReceiptSha256 ||
+			capture.preselectionClaimSha256 !== claim.claimSha256 ||
+			selectorSha256 !== claim.selector.selectorInstallRequestSha256 ||
+			authority.currentParentSessionAuthority.authoritySha256 !== claim.currentAuthority.authoritySha256 ||
+			authority.currentParentSessionAuthority.ownerId !== this.#agentId ||
+			authority.currentParentSessionAuthority.senderId !== this.#agentId
+		)
+			return "stale";
+		const buffered = this.#activeHubWaitSelectorInstallRequestSha256s.has(selectorSha256);
+		const busOwned =
+			this.#agentId !== undefined &&
+			IrcBus.global().hasExactHubWaiterOwnership(
+				this.#agentId,
+				selectorSha256,
+				claim.claimSha256,
+				claim.currentAuthority.authoritySha256,
+			);
+		return buffered || busOwned ? "current" : "stale";
+	}
+
+	#createTransientTaskPersistenceAuthority(): AgentSessionTransientTaskPersistenceAuthorityV1 {
+		return Object.freeze({
+			hasLifecycleAuthority: (toolCallId: string, toolName: string) =>
+				this.#transientTaskLifecycleAuthorities.get(toolCallId)?.toolName === toolName,
+			onLifecycleObservation: async (
+				event: Parameters<AgentLoopLifecyclePersistenceAdapterV1["onLifecycleObservation"]>[0],
+			) => {
+				await this.#awaitSessionJournalStartup();
+				if (event.toolName !== "task" && event.toolName !== "eval") {
+					throw new Error("Lifecycle observation authority does not support this tool");
+				}
+				return this.#transientTaskLifecycleObservationAdapter().onTransientTaskLifecycleObservation(
+					event as Parameters<
+						AgentSessionTransientTaskLifecycleObservationAdapterV1["onTransientTaskLifecycleObservation"]
+					>[0],
+				);
+			},
+			resumeLifecycleObservation: async (
+				request: Parameters<AgentLoopLifecyclePersistenceAdapterV1["resumeLifecycleObservation"]>[0],
+			) => {
+				await this.#awaitSessionJournalStartup();
+				const toolName = request.core.lifecycleObservation.toolName;
+				if (toolName !== "task" && toolName !== "eval") {
+					throw new Error("Lifecycle resume authority does not support this tool");
+				}
+				return this.#transientTaskLifecycleObservationAdapter().resumeTransientTaskLifecycleObservation(
+					request as Parameters<
+						AgentSessionTransientTaskLifecycleObservationAdapterV1["resumeTransientTaskLifecycleObservation"]
+					>[0],
+				);
+			},
+			persistToolResultBeforeEmission: async (
+				request: Parameters<AgentLoopLifecyclePersistenceAdapterV1["persistToolResultBeforeEmission"]>[0],
+			) => {
+				await this.#awaitSessionJournalStartup();
+				const adapter = this.#transientTaskLifecycleObservationAdapter();
+				if (request.selectedAuthority === undefined) {
+					return adapter.persistToolResultBeforeEmission({
+						mode: "allocate_on_first_callback",
+						toolCallId: request.toolCallId,
+						toolName: request.toolName,
+						exactToolResultMessage: request.exactToolResultMessage,
+					});
+				}
+				const pending = this.#transientTaskSelectedHubReturns.get(request.toolCallId);
+				if (!pending) throw new Error("Selected Hub return persistence authority is unavailable");
+				const completion = pending.completionReceipt;
+				if (
+					request.toolName !== "hub" ||
+					request.selectedAuthority !== completion ||
+					request.exactToolResultMessage.toolCallId !== completion.returnTarget.toolCallId
+				) {
+					throw new Error("Selected Hub return request did not match the preregistered completion");
+				}
+				const persisted = await adapter.persistToolResultBeforeEmission({
+					mode: "reuse_selected_hub",
+					serializerKey: completion.returnTarget.serializerKey,
+					toolCallId: request.toolCallId,
+					toolName: "hub",
+					hubCompletionReceipt: completion,
+					exactToolResultMessage: request.exactToolResultMessage,
+				});
+				const primaryReceipt = persisted.primaryReceipt;
+				if (
+					persisted.ticket.ticketSha256 !== completion.ordinaryPersistenceTicket.ticketSha256 ||
+					persisted.ticketAllocationReceipt.receiptSha256 !== completion.ticketAllocationReceipt.receiptSha256 ||
+					!isHubWaitPrimaryCommitReceiptV1(primaryReceipt)
+				) {
+					throw new Error("Selected Hub return primary persistence did not match the preregistered completion");
+				}
+				const primaryPersistenceReceipt = primaryReceipt.core.primaryPersistenceReceipt;
+				const injection = primaryPersistenceReceipt.core.hubWaitMessageInjectionResultReceipt;
+				const primaryCommitJoin: RuntimeContracts.ConfidentialTransientTaskHubWaitMessagePrimaryCommitJoinV1 = {
+					primaryCommitReceiptSha256: primaryReceipt.commitReceiptSha256,
+					primaryPersistenceReceiptSha256: primaryPersistenceReceipt.primaryReceiptSha256,
+					primaryCommitTransitionReceiptSha256: primaryReceipt.core.transitionReceiptSha256,
+					ticketAllocationReceiptSha256: completion.ticketAllocationReceipt.receiptSha256,
+					ordinaryAppendPlanSha256: injection.ordinaryAppendPlanSha256,
+					ordinaryAppendReceiptSha256: injection.ordinaryAppendReceipt.receiptSha256,
+					injectionResultPersistenceReceiptSha256: injection.receiptSha256,
+					previousSerializerQueueStateSha256: primaryReceipt.core.previousSerializerQueueStateSha256,
+					advancedSerializerQueueStateSha256: primaryReceipt.core.advancedSerializerQueueStateSha256,
+					previousCommittedTicketCount: primaryReceipt.core.previousCommittedTicketCount,
+					committedTicketCount: primaryReceipt.core.committedTicketCount,
+					previousPrimaryPersistenceReceiptSha256: primaryReceipt.core.previousPrimaryPersistenceReceiptSha256,
+					newPrimaryPersistenceReceiptSha256: primaryReceipt.core.newPrimaryPersistenceReceiptSha256,
+					nextPriorLeafEntryId: primaryReceipt.core.nextPriorLeafEntryId,
+					nextHeadTicketSha256: primaryReceipt.core.nextHeadTicketSha256,
+				};
+				const acknowledgementRequest = buildTransientTaskHubWaitMessageCanonicalRecordV1(
+					"return-acknowledgement-request",
+					{
+						key: completion.key,
+						completionReceiptSha256: completion.receiptSha256,
+						deliveryReceipt: pending.deliveryReceipt,
+						postHookFinalizationSha256: completion.postHookFinalization.finalizationSha256,
+						ordinaryPersistenceTicketSha256: completion.ordinaryPersistenceTicket.ticketSha256,
+						ticketAllocationReceiptSha256: completion.ticketAllocationReceipt.receiptSha256,
+						ttsrInjectionRegistrationReceiptSha256: completion.ttsrInjectionRegistrationReceipt.receiptSha256,
+						serializerHeadCommitReceipt: primaryReceipt,
+						primaryCommitJoin,
+						returnDeliveryOperationId: completion.returnTarget.returnDeliveryOperationId,
+						acknowledgedAt: transientSessionNow(),
+					},
+				);
+				const store = this.#transientTaskRuntimeStoreAssembly?.transientTaskHubWaitMessageWinnerContinuationStore;
+				if (!store) throw new Error("Selected Hub return acknowledgement store is unavailable");
+				let acknowledged:
+					| RuntimeContracts.ConfidentialTransientTaskHubWaitMessageReturnAcknowledgementResultV1
+					| undefined;
+				try {
+					acknowledged = await store.acknowledgeMessageReturn(acknowledgementRequest);
+				} catch {
+					// Inspect the durable acknowledgement before deciding whether a retry is safe.
+				}
+				if (
+					!acknowledged ||
+					(acknowledged.status !== "acknowledged" && acknowledged.status !== "already_acknowledged")
+				) {
+					const inspectRequest = buildTransientTaskHubWaitMessageCanonicalRecordV1(
+						"return-acknowledgement-inspect-request",
+						{
+							key: completion.key,
+							completionReceiptSha256: completion.receiptSha256,
+							deliveryReceiptSha256: pending.deliveryReceipt.receiptSha256,
+							postHookFinalizationSha256: completion.postHookFinalization.finalizationSha256,
+							ordinaryPersistenceTicketSha256: completion.ordinaryPersistenceTicket.ticketSha256,
+							ticketAllocationReceiptSha256: completion.ticketAllocationReceipt.receiptSha256,
+							ttsrInjectionRegistrationReceiptSha256: completion.ttsrInjectionRegistrationReceipt.receiptSha256,
+							primaryCommitJoin,
+							returnDeliveryOperationId: completion.returnTarget.returnDeliveryOperationId,
+							expectedAcknowledgementRequestSha256: acknowledgementRequest.requestSha256,
+							inspectedAt: transientSessionNow(),
+						},
+					);
+					const inspection = await store.inspectMessageReturnAcknowledgement(inspectRequest);
+					if (inspection.status !== "acknowledged") {
+						if (inspection.status !== "pending_acknowledgement") {
+							throw new Error(`Selected Hub return acknowledgement is indeterminate: ${inspection.status}`);
+						}
+						acknowledged = await store.acknowledgeMessageReturn(acknowledgementRequest);
+						if (acknowledged.status !== "acknowledged" && acknowledged.status !== "already_acknowledged") {
+							throw new Error(`Selected Hub return acknowledgement was rejected: ${acknowledged.status}`);
+						}
+					}
+				}
+				this.#transientTaskSelectedHubReturns.delete(request.toolCallId);
+				return persisted;
+			},
+			allocateOrReuseTicketBeforeEmission: async (
+				request: Parameters<
+					RuntimeContracts.AgentSessionToolResultPersistenceSerializerV1["allocateOrReuseTicketBeforeEmission"]
+				>[0],
+			) => {
+				await this.#awaitSessionJournalStartup();
+				const serializer = this.#toolResultPrimarySerializer;
+				if (!serializer) throw new Error("Tool result primary serializer is unavailable");
+				return serializer.allocateOrReuseTicketBeforeEmission(request);
+			},
+			verifyCurrentHubWaitMessageSelectorOwnership: async (
+				request: Parameters<
+					TransientTaskHubWaitMessageWinnerCompletionEffectV1["verifyCurrentHubWaitMessageSelectorOwnership"]
+				>[0],
+			) => {
+				await this.#awaitSessionJournalStartup();
+				return this.#verifyCurrentHubWaitMessageSelectorOwnership(request);
+			},
+		});
+	}
+
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
 		this.sessionManager = config.sessionManager;
+		this.#processOwnedDependencies = config.processOwnedDependencies;
+		this.#transientTaskCurrentParentTaskLocator = config.transientTaskCurrentParentTaskLocator
+			? Object.freeze({ ...config.transientTaskCurrentParentTaskLocator })
+			: undefined;
+		this.#transientTaskPersistenceAuthority = this.#createTransientTaskPersistenceAuthority();
+		this.agent.lifecyclePersistenceAdapter = this.#processOwnedDependencies
+			? this.#transientTaskPersistenceAuthority
+			: undefined;
 		this.settings = config.settings;
 		this.#modelRegistry = config.modelRegistry;
+		this.#runtimeProviderRegistry = config.runtimeProviderRegistry;
+		this.#modelConnectionResolver = config.modelConnectionResolver;
+		if (config.processOwnedDependencies) {
+			this.#releaseProcessOwnedPersistentAgentStore = AgentRegistry.global().bindProcessOwnedPersistentAgentStore(
+				config.processOwnedDependencies.persistentAgentStore,
+			);
+		}
 		this.#codexResetCoordinator = config.codexResetCoordinator ?? defaultCodexAutoRedeemCoordinator;
 		const bashHost: BashRunnerHost = {
 			agent: this.agent,
@@ -940,11 +1847,19 @@ export class AgentSession {
 			agent: this.agent,
 			sessionManager: this.sessionManager,
 			settings: this.settings,
+			getAgentId: () => {
+				if (!this.#agentId) throw new Error("IRC target session agent identity is unavailable");
+				return this.#agentId;
+			},
 			isDisposed: () => this.#isDisposed,
 			isStreaming: () => this.isStreaming,
 			planModeEnabled: () => this.#planModeState?.enabled === true,
 			emitSessionEvent: event => this.#emitSessionEvent(event),
 			wakeForIrc: records => this.#wakeForIrc(records),
+			wakeAfterDurableIrc: () => {
+				this.#resetPromptMaintenanceState();
+				this.#scheduleAgentContinue();
+			},
 			runEphemeralTurn: args => this.runEphemeralTurn(args),
 		};
 		this.#irc = new IrcBridge(ircHost);
@@ -987,6 +1902,7 @@ export class AgentSession {
 		};
 		this.#todo = new TodoTracker(todoHost);
 		this.#ownedAsyncJobManager = config.ownedAsyncJobManager;
+		this.#releaseProcessAsyncJobManagerBinding = config.releaseProcessAsyncJobManagerBinding;
 		this.#asyncJobManager = config.asyncJobManager ?? config.ownedAsyncJobManager;
 		const modelControlsHost: ModelControlsHost = {
 			agent: this.agent,
@@ -1133,6 +2049,7 @@ export class AgentSession {
 		this.yieldQueue = new YieldQueue({
 			isStreaming: () => this.isStreaming,
 			injectIdle: async messages => {
+				await this.#awaitSessionPromptAdmission();
 				const first = messages[0];
 				if (!first) return;
 				this.#beginInFlight();
@@ -1202,6 +2119,7 @@ export class AgentSession {
 		this.#tools = new SessionTools(sessionToolsHost, {
 			autoApprove: config.autoApprove,
 			toolRegistry: config.toolRegistry,
+			persistentToolSet: config.persistentToolSet,
 			createVibeTools: config.createVibeTools,
 			createComputerTool: config.createComputerTool,
 			createInspectImageTool: config.createInspectImageTool,
@@ -1265,24 +2183,16 @@ export class AgentSession {
 		this.#agentId = config.agentId;
 		this.#agentKind = config.agentKind ?? "main";
 		this.#scoutAllowedBySpawnPolicy = config.scoutAllowedBySpawnPolicy ?? true;
+		this.#executionEnvironmentProvider = config.executionEnvironmentProvider;
+		this.#initializeSessionJournal(config.sessionJournal);
 		this.#providerSessionId = config.providerSessionId;
 		this.#inheritedProviderPromptCacheKey =
 			config.providerPromptCacheKeySource === "fork" ? this.agent.promptCacheKey : undefined;
-		// Owner-routed async delivery: completions for jobs this agent owns are
-		// injected into THIS session's run as async-result follow-ups. Without a
-		// registered sink the manager dead-letters owned deliveries, so this
-		// registration is what makes background jobs usable — for the main
-		// session and for subagents inheriting the process manager alike.
-		if (this.#asyncJobManager && this.#agentId) {
-			const manager = this.#asyncJobManager;
-			this.#unregisterAsyncDeliverySink = manager.registerDeliverySink(this.#agentId, (jobId, text, job) =>
-				this.#deliverAsyncJobResult(manager, jobId, text, job),
-			);
-			this.yieldQueue.register<AsyncResultEntry>("async-result", {
-				isStale: entry => entry.epoch !== this.#asyncDeliveryEpoch || manager.isDeliverySuppressed(entry.jobId),
-				build: buildAsyncResultBatchMessage,
-			});
-		}
+		// Every owner-scoped async producer, including legacy bash/eval work, must
+		// have a live sink before the session becomes observable. Transient recovery
+		// remains asynchronous and gates only transient/isolated admission.
+		this.#registerAsyncDeliverySink();
+		this.#initializeTransientTaskRuntimeBinding();
 		this.agent.setAssistantMessageEventInterceptor((message, assistantMessageEvent) => {
 			const event: AgentEvent = {
 				type: "message_update",
@@ -1490,7 +2400,8 @@ export class AgentSession {
 			beginBashSessionTransition: () => this.#bash.beginSessionTransition(),
 			markBashSessionTransition: transition => this.#bash.markSessionTransition(transition),
 			finishBashSessionTransition: (transition, success) => this.#bash.finishSessionTransition(transition, success),
-			cancelOwnAsyncJobs: () => this.#cancelOwnAsyncJobs(),
+			prepareSessionGenerationChange: () => this.#prepareTransientTaskSessionGenerationChange(),
+			restoreSessionGenerationAfterFailedChange: () => this.#restoreSessionGenerationAfterFailedChange(),
 			clearCheckpointRuntimeState: () => this.#clearCheckpointRuntimeState(),
 			clearSessionScopedToolState: () => this.#clearSessionScopedToolState(),
 			clearFreshProviderSessionId: () => {
@@ -1524,13 +2435,493 @@ export class AgentSession {
 		this.#unsubscribeAppendOnly = onAppendOnlyModeChanged(_value => this.#syncAppendOnlyContext(this.model));
 		this.#unsubscribeModelRoles = onModelRolesChanged(() => this.#advisors.onModelRolesChanged());
 	}
+	#initializeSessionJournal(service: SessionJournalService | undefined): void {
+		if (!service) return;
+		const ownerAgentId = this.#agentId;
+		if (!ownerAgentId) {
+			this.#sessionJournalStartupFailure = new Error("Session journal requires an owner agent id");
+			return;
+		}
+		const sessionId = this.sessionManager.getSessionId();
+		const descriptor = Object.freeze({
+			schemaVersion: 1 as const,
+			streamId: `session:${sessionId}` as const,
+			sessionId,
+			kind: this.#agentKind,
+			ownerAgentId,
+		}) satisfies SessionJournalStreamDescriptorV1;
+		this.#sessionJournalStartup = this.sessionManager.attachSessionJournal(service, descriptor).catch(error => {
+			this.#sessionJournalStartupFailure =
+				error instanceof Error ? error : new Error(`Session journal attachment failed: ${String(error)}`);
+			logger.error("Session journal attachment blocked session admission", {
+				error: this.#sessionJournalStartupFailure.message,
+			});
+		});
+	}
+
+	async #awaitSessionJournalStartup(): Promise<void> {
+		await this.#sessionJournalStartup;
+		if (this.#sessionJournalStartupFailure) throw this.#sessionJournalStartupFailure;
+	}
+
+	/** @internal Await only the constructor-started journal attachment, never transient recovery. */
+	async awaitSessionJournalReady(): Promise<void> {
+		await this.#awaitSessionJournalStartup();
+	}
+
+	async #awaitTransientTaskLifecycleAdmission(
+		adapter: AgentSessionTransientTaskLifecycleObservationAdapterV1,
+		ownerSessionIndex: ConfidentialAsyncJobTransientTaskRecoveryOwnerSessionIndexV1,
+	): Promise<void> {
+		const requestedAt = transientSessionNow();
+		const core = {
+			parentSessionId: ownerSessionIndex.ownerSessionId,
+			parentSessionGenerationSha256: ownerSessionIndex.ownerSessionGenerationSha256,
+			requestedAt,
+		};
+		const result = await adapter.awaitTransientTaskLifecyclePromptAdmissionBarrier({
+			...core,
+			requestSha256: transientSessionDigestRef("transient-task-lifecycle-prompt-admission", core),
+		});
+		if (result.status === "blocked") {
+			throw new Error(
+				`Transient task lifecycle admission is blocked: ${result.orderedIndexKeys
+					.map(indexKey => indexKey.indexKeySha256)
+					.join(", ")}`,
+			);
+		}
+	}
+
+	async #awaitSessionPromptAdmission(): Promise<void> {
+		await this.#awaitSessionJournalStartup();
+		if (!(await this.#ensureCurrentTransientTaskRuntimeBinding())) return;
+		const ownerSessionIndex = this.#transientTaskOwnerSessionIndex;
+		if (!ownerSessionIndex) throw new Error("Transient task owner-session authority is unavailable");
+		await this.#awaitTransientTaskLifecycleAdmission(
+			this.#transientTaskLifecycleObservationAdapter(),
+			ownerSessionIndex,
+		);
+	}
+
 	/** Model registry for API key resolution and model discovery */
 	get modelRegistry(): ModelRegistry {
 		return this.#modelRegistry;
 	}
 
+	/** Shared adaptive runtime provider authority supplied by the control process. */
+	get runtimeProviderRegistry(): RuntimeContracts.RuntimeProviderRegistry {
+		return this.#runtimeProviderRegistry;
+	}
+
+	/** Session-affine model/auth connection authority supplied by the control process. */
+	get modelConnectionResolver(): ModelConnectionResolver {
+		return this.#modelConnectionResolver;
+	}
+
 	get asyncJobManager(): AsyncJobManager | undefined {
 		return this.#asyncJobManager;
+	}
+
+	async #resolveHubSendAwaitTargetSession(targetAgentId: string): Promise<AgentSession> {
+		const target = await AgentLifecycleManager.global().ensureLive(targetAgentId);
+		if (target.#isDisposed) throw new Error(`Hub send-await target ${targetAgentId} is disposed`);
+		return target;
+	}
+
+	#createHubSendAwaitTargetSourceEffect(): RuntimeContracts.TransientTaskHubSendAwaitTargetSourceEffectV1 {
+		return Object.freeze({
+			prepareAcceptedHubSendAwaitMessage: async input => {
+				const target = await this.#resolveHubSendAwaitTargetSession(input.entry.message.to);
+				const waiter = target.#irc.observeHubSendAwaitTargetWaiter(input.entry.message.from);
+				const sourcePermit =
+					await target.sessionManager.transientPersistence.observeHubSendAwaitAcceptedSourceMaterialization({
+						...input,
+						waiterSelectorAuthority: waiter.authority,
+					});
+				return target.#irc.buildHubSendAwaitTargetMaterializationPlan(input.entry.request, sourcePermit, waiter);
+			},
+			dispatchAcceptedHubSendAwaitMessage: async (transitionRequest, transitionReceipt) => {
+				const target = await this.#resolveHubSendAwaitTargetSession(transitionRequest.plan.request.message.to);
+				return target.#irc.dispatchAcceptedHubSendAwaitMessage(transitionRequest, transitionReceipt);
+			},
+			inspectAcceptedHubSendAwaitMessage: async request => {
+				const target = await this.#resolveHubSendAwaitTargetSession(request.plan.request.message.to);
+				return target.#irc.inspectAcceptedHubSendAwaitMessage(request);
+			},
+			adoptAcceptedHubSendAwaitMessage: async request => {
+				const target = await this.#resolveHubSendAwaitTargetSession(request.inspectRequest.plan.request.message.to);
+				return target.#irc.adoptAcceptedHubSendAwaitMessage(request);
+			},
+		} satisfies RuntimeContracts.TransientTaskHubSendAwaitTargetSourceEffectV1);
+	}
+
+	async #resumeRegisteredMessageSelections(
+		request: RuntimeContracts.ConfidentialTransientTaskHubWaitMessagePreselectionStartupResumeRequestV1,
+	): Promise<RuntimeContracts.ConfidentialTransientTaskHubWaitMessagePreselectionStartupResumeResultV1> {
+		const assembly = this.#transientTaskRuntimeStoreAssembly;
+		if (!assembly) throw new Error("Transient Hub wait preselection recovery store is unavailable");
+		const store = assembly.transientTaskHubWaitMessagePreselectionRecoveryStore;
+		const resumedAdoptionReceiptSha256s: Sha256Ref[] = [];
+		const selectionReceiptSha256s: Sha256Ref[] = [];
+		const retirementReceiptSha256s: Sha256Ref[] = [];
+		const staleAuthority =
+			(): RuntimeContracts.ConfidentialTransientTaskHubWaitMessagePreselectionStartupResumeResultV1 => {
+				const core = {
+					status: "blocked" as const,
+					currentAuthoritySha256: request.currentAuthority.authoritySha256,
+					resumedAdoptionReceiptSha256s: [] as const,
+					selectionReceiptSha256s: [] as const,
+					retirementReceiptSha256s: [] as const,
+					blockedRefSha256s: [] as const,
+					blockedReason: "stale_authority" as const,
+				};
+				return {
+					...core,
+					resultSha256: transientSessionDigestRef("hub-wait-message-preselection-startup-resume-result", core),
+				};
+			};
+		const blocked = (
+			ref: RuntimeContracts.TransientTaskHubWaitMessagePreselectionRecoveryRefV1,
+			reason: Exclude<
+				RuntimeContracts.TransientTaskHubWaitMessagePreselectionStartupBlockReasonV1,
+				"stale_authority"
+			>,
+		): RuntimeContracts.ConfidentialTransientTaskHubWaitMessagePreselectionStartupResumeResultV1 => {
+			const core = {
+				status: "blocked" as const,
+				currentAuthoritySha256: request.currentAuthority.authoritySha256,
+				resumedAdoptionReceiptSha256s: [...resumedAdoptionReceiptSha256s],
+				selectionReceiptSha256s: [...selectionReceiptSha256s],
+				retirementReceiptSha256s: [...retirementReceiptSha256s],
+				blockedRefSha256s: [ref.refSha256] as const,
+				blockedReason: reason,
+			};
+			return {
+				...core,
+				resultSha256: transientSessionDigestRef("hub-wait-message-preselection-startup-resume-result", core),
+			};
+		};
+		const resumed = (): RuntimeContracts.ConfidentialTransientTaskHubWaitMessagePreselectionStartupResumeResultV1 => {
+			const core = {
+				status: "resumed" as const,
+				currentAuthoritySha256: request.currentAuthority.authoritySha256,
+				resumedAdoptionReceiptSha256s: [...resumedAdoptionReceiptSha256s],
+				selectionReceiptSha256s: [...selectionReceiptSha256s],
+				retirementReceiptSha256s: [...retirementReceiptSha256s],
+				blockedRefSha256s: [] as const,
+				blockedReason: null,
+			};
+			return {
+				...core,
+				resultSha256: transientSessionDigestRef("hub-wait-message-preselection-startup-resume-result", core),
+			};
+		};
+		if (
+			request.currentAuthority.authoritySha256 !== request.enumeration.currentAuthority.authoritySha256 ||
+			request.currentAuthority.ownerId !== this.#agentId ||
+			request.currentAuthority.senderId !== this.#agentId
+		)
+			return staleAuthority();
+		const enumeration = await store.enumerateRegisteredMessageSelections(request.enumeration);
+		if (enumeration.status !== "enumerated") return staleAuthority();
+		for (const ref of enumeration.registrations) {
+			const inspectRequest = buildTransientTaskHubWaitMessageCanonicalRecordV1("preselection-inspect-request", {
+				currentAuthority: request.currentAuthority,
+				hubWaitInvocationId: ref.hubWaitInvocationId,
+				keySha256: ref.keySha256,
+				selectorInstallRequestSha256: ref.selectorInstallRequestSha256,
+				resumePlanSha256: ref.resumePlanSha256,
+				returnTargetSha256: ref.returnTargetSha256,
+				afterToolCallPlanSha256: ref.afterToolCallPlanSha256,
+				preselectionClaimSha256: ref.preselectionClaimSha256,
+				registrationRequestSha256: ref.registrationRequestSha256,
+				expectedRecoveryRefSha256: ref.refSha256,
+			});
+			let inspection = await store.inspectRegisteredMessageSelection(inspectRequest);
+			if (inspection.status === "stale_authority") return staleAuthority();
+			if (inspection.status === "absent") return blocked(ref, "registration_missing");
+			if (inspection.status === "conflict" || inspection.status === "invalid") {
+				return blocked(ref, "registration_digest_mismatch");
+			}
+			if (inspection.status === "selection_committed") {
+				selectionReceiptSha256s.push(inspection.selectionReceiptSha256);
+				continue;
+			}
+			if (inspection.status === "retired") {
+				retirementReceiptSha256s.push(inspection.retirementReceiptSha256);
+				continue;
+			}
+			if (!("ref" in inspection) || inspection.status !== "registered_unselected") {
+				return blocked(ref, "registration_digest_mismatch");
+			}
+			const adoptRequest = buildTransientTaskHubWaitMessageCanonicalRecordV1("preselection-adopt-request", {
+				currentAuthority: request.currentAuthority,
+				request: inspectRequest,
+				matchingInspection: inspection,
+				expectedInspectionSha256: inspection.inspectionSha256,
+				adoptedAt: request.requestedAt,
+			});
+			const adoption = await store.adoptRegisteredMessageSelection(adoptRequest);
+			if (adoption.status === "stale_authority") return staleAuthority();
+			if (adoption.status === "absent") return blocked(ref, "registration_missing");
+			if (adoption.status === "conflict" || adoption.status === "invalid") {
+				return blocked(ref, "registration_digest_mismatch");
+			}
+			if (adoption.status === "selection_committed" || adoption.status === "retired") {
+				inspection = await store.inspectRegisteredMessageSelection(inspectRequest);
+				if (inspection.status === "stale_authority") return staleAuthority();
+				if (inspection.status === "selection_committed") {
+					selectionReceiptSha256s.push(inspection.selectionReceiptSha256);
+					continue;
+				}
+				if (inspection.status === "retired") {
+					retirementReceiptSha256s.push(inspection.retirementReceiptSha256);
+					continue;
+				}
+				return blocked(
+					ref,
+					inspection.status === "absent" ? "registration_missing" : "registration_digest_mismatch",
+				);
+			}
+			if (!("receipt" in adoption)) return blocked(ref, "registration_digest_mismatch");
+			const resumeRequest = buildTransientTaskHubWaitMessageCanonicalRecordV1("preselection-resume-request", {
+				currentAuthority: request.currentAuthority,
+				adoption: adoption.receipt,
+				resumedAt: request.requestedAt,
+			});
+			const resume = await store.resumeRegisteredMessageSelection(resumeRequest);
+			if (resume.status === "stale_authority") return staleAuthority();
+			if (resume.status === "selection_committed") {
+				selectionReceiptSha256s.push(resume.selectionReceiptSha256);
+				continue;
+			}
+			if (resume.status === "retired") {
+				retirementReceiptSha256s.push(resume.retirementReceiptSha256);
+				continue;
+			}
+			if (resume.status !== "resumed") return blocked(ref, "claim_conflict");
+			resumedAdoptionReceiptSha256s.push(adoption.receipt.receiptSha256);
+		}
+		return resumed();
+	}
+
+	/** True only when this session owns every authority required for managed transient execution. */
+	supportsTransientTaskEnvironmentExecution(): boolean {
+		return (
+			this.#processOwnedDependencies !== undefined &&
+			this.#ownedAsyncJobManager !== undefined &&
+			this.#agentId !== undefined &&
+			this.#executionEnvironmentProvider !== undefined
+		);
+	}
+
+	/** @internal Claim the exact owner-session runtime and private post-terminal capabilities for one Task spawn. */
+	async acquireTransientTaskRuntimeAuthority(): Promise<AgentSessionTransientTaskRuntimeAuthorityV1> {
+		if (!this.supportsTransientTaskEnvironmentExecution()) {
+			throw new Error("Transient task runtime authority is unavailable");
+		}
+		await this.#awaitSessionPromptAdmission();
+		const runtimeStoreAssembly = this.#transientTaskRuntimeStoreAssembly;
+		const ownerSessionIndex = this.#transientTaskOwnerSessionIndex;
+		const executionEnvironmentProvider = this.#executionEnvironmentProvider;
+		if (!runtimeStoreAssembly || !ownerSessionIndex || !executionEnvironmentProvider) {
+			throw new Error("Transient task owner-session runtime is unavailable");
+		}
+		return Object.freeze({
+			stores: runtimeStoreAssembly.facade,
+			ownerSessionIndex,
+			executionEnvironmentProvider,
+			hubWait: Object.freeze({
+				returnTargetBridge: runtimeStoreAssembly.transientTaskHubWaitMessageReturnTargetBridge,
+				winnerContinuationStore: runtimeStoreAssembly.transientTaskHubWaitMessageWinnerContinuationStore,
+				preselectionRecoveryStore: runtimeStoreAssembly.transientTaskHubWaitMessagePreselectionRecoveryStore,
+				outboundEffect: runtimeStoreAssembly.transientTaskHubSendAwaitOutboundEffect,
+				currentParentTaskLocator: this.#transientTaskCurrentParentTaskLocator ?? null,
+				preselectionStartupRecovery: Object.freeze({
+					resumeRegisteredMessageSelections: (
+						request: Parameters<
+							AgentSessionTransientTaskRuntimeAuthorityV1["hubWait"]["preselectionStartupRecovery"]["resumeRegisteredMessageSelections"]
+						>[0],
+					) => this.#resumeRegisteredMessageSelections(request),
+				}),
+				winnerStartupRecovery: runtimeStoreAssembly.transientTaskHubWaitMessageWinnerStartupRecovery,
+				selectorOwnership: this.#transientTaskPersistenceAuthority,
+				claimMessageReturnPreparation: async (
+					locator: AgentSessionTransientTaskCurrentParentLocatorV1,
+					toolCallId: string,
+					frozenAt: ISO8601,
+				) => {
+					await this.#awaitSessionPromptAdmission();
+					const currentLocator = this.#transientTaskCurrentParentTaskLocator;
+					if (
+						!currentLocator ||
+						locator.taskId !== currentLocator.taskId ||
+						locator.runId !== currentLocator.runId ||
+						locator.createId !== currentLocator.createId
+					) {
+						throw new Error("Hub wait current-parent locator is unavailable or stale");
+					}
+					const { serializerKey } = this.#resolveCurrentAssistantToolResultSerializerKey(toolCallId);
+					if (
+						serializerKey.parentSessionId !== ownerSessionIndex.ownerSessionId ||
+						serializerKey.parentSessionGenerationSha256 !== ownerSessionIndex.ownerSessionGenerationSha256
+					) {
+						throw new Error("Hub wait serializer authority does not match the current owner session");
+					}
+					const ownerId = ownerSessionIndex.ownerId;
+					const senderId = ownerSessionIndex.ownerId;
+					const currentParentSessionAuthority = buildTransientTaskHubWaitMessageCanonicalRecordV1(
+						"current-parent-session-authority",
+						{
+							schemaVersion: 1 as const,
+							ownerId,
+							senderId,
+							...currentLocator,
+							serializerKey,
+						},
+					);
+					return {
+						currentParentSessionAuthority,
+						afterToolCallPlan: this.#ttsr.claimHubWaitAfterToolCallPlan(toolCallId, frozenAt),
+					};
+				},
+			}),
+			foregroundTask: Object.freeze({
+				sourceObservationProducer: Object.freeze({
+					reserveAndFreezeTransientTaskSourceObservationDraft: (
+						request: Parameters<
+							AgentSessionTransientTaskRuntimeAuthorityV1["foregroundTask"]["sourceObservationProducer"]["reserveAndFreezeTransientTaskSourceObservationDraft"]
+						>[0],
+					) => this.#reserveAndFreezeTransientTaskSourceObservationDraft(request),
+				}),
+				pendingOverlayBindingResolver: this.#ttsr,
+				takePreDispatchBinding: (toolCallId: string) => this.#takeTransientTaskPreDispatchBinding(toolCallId),
+				beforeReturnRecovery: createTransientTaskForegroundBeforeReturnRecoveryBridgeV1(this.sessionManager),
+				sessionAppend: createTransientTaskForegroundSessionAppendBridgeV1(this.sessionManager),
+				settlement: runtimeStoreAssembly.facade.transientTaskParentResultDeliveryStore.foregroundSettlement,
+				resolveJournalGenerationAuthority: (
+					branchAnchorEntryId: Parameters<
+						AgentSessionTransientTaskRuntimeAuthorityV1["foregroundTask"]["resolveJournalGenerationAuthority"]
+					>[0],
+				) => this.sessionManager.resolveTransientTaskJournalGenerationAuthority(branchAnchorEntryId),
+			}),
+			foregroundEval: Object.freeze({
+				sourceObservationProducer: Object.freeze({
+					reserveAndFreezeTransientTaskSourceObservationDraft: (
+						request: Parameters<
+							AgentSessionTransientTaskRuntimeAuthorityV1["foregroundEval"]["sourceObservationProducer"]["reserveAndFreezeTransientTaskSourceObservationDraft"]
+						>[0],
+					) => this.#reserveAndFreezeTransientTaskSourceObservationDraft(request),
+				}),
+				pendingOverlayBindingResolver: this.#ttsr,
+				takePreDispatchBinding: (toolCallId: string) => this.#takeTransientTaskPreDispatchBinding(toolCallId),
+				beforeReturnRecovery: createTransientTaskForegroundBeforeReturnRecoveryBridgeV1(this.sessionManager),
+				sessionAppend: createTransientTaskForegroundSessionAppendBridgeV1(this.sessionManager),
+				settlement: runtimeStoreAssembly.facade.transientTaskParentResultDeliveryStore.foregroundSettlement,
+				resolveJournalGenerationAuthority: (
+					branchAnchorEntryId: Parameters<
+						AgentSessionTransientTaskRuntimeAuthorityV1["foregroundEval"]["resolveJournalGenerationAuthority"]
+					>[0],
+				) => this.sessionManager.resolveTransientTaskJournalGenerationAuthority(branchAnchorEntryId),
+			}),
+		});
+	}
+
+	/** @internal Lazily admit the exact outer Eval invocation before its first isolated child runtime is assembled. */
+	async beginTransientEvalInlineDynamicInvocation(
+		toolCallId: string,
+		effectiveArgs: unknown,
+	): Promise<AgentSessionTransientEvalInlineDynamicInvocationV1 | null> {
+		const runtimeAuthority = await this.acquireTransientTaskRuntimeAuthority();
+		const authority = runtimeAuthority.foregroundEval;
+		const preDispatch = authority.takePreDispatchBinding(toolCallId);
+		if (!preDispatch) return null;
+		if (preDispatch.indexKey.core.toolName !== "eval") {
+			throw new Error("Eval foreground binding changed tool identity before execute entry");
+		}
+		const generation = authority.resolveJournalGenerationAuthority(preDispatch.assistantAnchorEntryId);
+		if (
+			generation.status !== "matching" ||
+			generation.authority.sessionGeneration.core.sessionId !== preDispatch.indexKey.core.parentSessionId ||
+			generation.authority.sessionGeneration.sessionGenerationSha256 !==
+				preDispatch.indexKey.core.parentSessionGenerationSha256 ||
+			generation.authority.branchGeneration.branchGenerationSha256 !==
+				preDispatch.serializerKey.parentBranchGenerationSha256 ||
+			preDispatch.serializerKey.parentSessionId !== preDispatch.indexKey.core.parentSessionId ||
+			preDispatch.serializerKey.parentSessionGenerationSha256 !==
+				preDispatch.indexKey.core.parentSessionGenerationSha256 ||
+			preDispatch.serializerKey.assistantAnchorEntryId !== preDispatch.assistantAnchorEntryId ||
+			preDispatch.sourceToolCallOrdinal !== preDispatch.indexKey.core.sourceToolCallOrdinal ||
+			preDispatch.binding.pendingOverlaySnapshotSha256 !== preDispatch.snapshot.pendingOverlaySnapshotSha256
+		) {
+			throw new Error("Eval foreground journal authority changed before execute entry");
+		}
+		const effectiveEvalArgumentsSha256 = transientSessionTupleDigestRef([
+			"omp-transient-eval-inline-dynamic-route-v1",
+			"effective-eval-arguments",
+			1,
+			effectiveArgs,
+		]);
+		const effectiveArgumentRevisionChainSha256 = transientSessionTupleDigestRef([
+			"omp-transient-eval-inline-dynamic-route-v1",
+			"effective-argument-revision-chain",
+			1,
+			effectiveArgs,
+		]);
+		const observedAt = new Date().toISOString() as ISO8601;
+		const core = {
+			indexKey: preDispatch.indexKey,
+			producer: "eval_tool" as const,
+			observationInput: {
+				schemaVersion: 1 as const,
+				eventKind: "eval_execute_entry" as const,
+				effectiveEvalArgumentsSha256,
+				effectiveArgumentRevisionChainSha256,
+			},
+			reservationId: crypto.randomUUID() as OperationId,
+			observedAt,
+			requestedAt: observedAt,
+		};
+		const committed = await authority.sourceObservationProducer.reserveAndFreezeTransientTaskSourceObservationDraft({
+			core,
+			requestSha256: transientSessionTupleDigestRef([
+				"omp-agent-session-transient-task-lifecycle-v1",
+				"producer-draft-request-core",
+				1,
+				core.indexKey,
+				core.producer,
+				core.observationInput,
+				core.reservationId,
+				core.observedAt,
+				core.requestedAt,
+			]),
+		});
+		if (committed.status !== "committed" && committed.status !== "already_committed") {
+			throw new Error(`Eval execute-entry observation was rejected: ${committed.status}`);
+		}
+		if (committed.observationReceipt.core.eventKind !== "eval_execute_entry") {
+			throw new Error("Eval execute-entry observation receipt changed event kind");
+		}
+		return {
+			runtimeAuthority,
+			authority,
+			indexKey: preDispatch.indexKey,
+			snapshot: preDispatch.snapshot,
+			preDispatchBinding: preDispatch.binding,
+			sourceToolCallOrdinal: preDispatch.sourceToolCallOrdinal,
+			assistantAnchorEntryId: preDispatch.assistantAnchorEntryId,
+			serializerKey: preDispatch.serializerKey,
+			effectiveEvalArgumentsSha256,
+			effectiveArgumentRevisionChainSha256,
+			executeEntryObservationReceipt:
+				committed.observationReceipt as RuntimeContracts.ConfidentialTransientEvalExecuteEntryObservationReceiptV1,
+		};
+	}
+
+	/** Await the managed-runtime recovery barrier before exposing transient admission. */
+	async awaitTransientTaskStartup(): Promise<void> {
+		await this.#transientTaskStartup;
+		if (this.#transientTaskStartupFailure) throw this.#transientTaskStartupFailure;
 	}
 
 	getAgentId(): string | undefined {
@@ -1751,6 +3142,83 @@ export class AgentSession {
 		this.yieldQueue.clear("async-result");
 	}
 
+	async #reconcileTransientTaskSessionCutover(): Promise<void> {
+		await this.#transientTaskStartup;
+		const ownerSessionIndex = this.#transientTaskOwnerSessionIndex;
+		const manager = this.#ownedAsyncJobManager;
+		const assembly = this.#transientTaskRuntimeStoreAssembly;
+		if (!ownerSessionIndex || !manager || !assembly) {
+			if (this.#transientTaskStartupFailure) throw this.#transientTaskStartupFailure;
+			return;
+		}
+		await this.#awaitTransientTaskLifecycleAdmission(
+			assembly.transientTaskLifecycleObservationAdapter,
+			ownerSessionIndex,
+		);
+		const cutover = await manager.reconcileTransientTaskSessionCutover({
+			ownerSessionIndex,
+			requestedAt: transientSessionNow(),
+		});
+		if (cutover.status !== "ready") {
+			throw new Error(
+				`Transient task session generation change is blocked: ${[
+					...cutover.recoveryStatuses,
+					...cutover.unresolvedJobIds.map(jobId => `unresolved:${jobId}`),
+				].join(", ")}`,
+			);
+		}
+		this.#transientTaskStartupFailure = undefined;
+	}
+
+	async #prepareTransientTaskSessionGenerationChange(options?: { detachJournal?: boolean }): Promise<void> {
+		await this.#awaitSessionJournalStartup();
+		const ownerId = this.#agentId;
+		const manager = this.#asyncJobManager;
+		if (ownerId && manager) {
+			manager.cancelAll({ ownerId });
+			await manager.waitForOwnerJobs(ownerId);
+		}
+		await this.#transientTaskRuntimeBindingOperation;
+		await this.#reconcileTransientTaskSessionCutover();
+		await this.#releaseTransientTaskRuntimeBindings();
+		if (ownerId && manager) manager.evictCompletedJobs({ ownerId });
+		this.#asyncDeliveryEpoch += 1;
+		this.yieldQueue.clear("async-result");
+		if (options?.detachJournal !== false) {
+			try {
+				await this.sessionManager.prepareSessionGenerationChange();
+			} catch (error) {
+				try {
+					this.#initializeTransientTaskRuntimeBinding();
+					await this.awaitTransientTaskStartup();
+				} catch (restoreError) {
+					throw new AggregateError(
+						[error, restoreError],
+						"Session generation preparation failed and transient runtime restoration also failed",
+					);
+				}
+				throw error;
+			}
+		}
+	}
+
+	async #restoreSessionGenerationAfterFailedChange(): Promise<void> {
+		const errors: unknown[] = [];
+		try {
+			this.sessionManager.resumeSessionGenerationAfterFailedChange();
+		} catch (error) {
+			errors.push(error);
+		}
+		try {
+			this.#initializeTransientTaskRuntimeBinding();
+			await this.awaitTransientTaskStartup();
+		} catch (error) {
+			errors.push(error);
+		}
+		if (errors.length === 1) throw errors[0];
+		if (errors.length > 1) throw new AggregateError(errors, "Failed to restore session generation authorities");
+	}
+
 	/**
 	 * True when a background async job owned by this agent is still running with
 	 * an unsuppressed delivery, a finished job's delivery is still queued or in
@@ -1814,6 +3282,9 @@ export class AgentSession {
 	async #deliverAsyncJobResult(manager: AsyncJobManager, jobId: string, text: string, job?: AsyncJob): Promise<void> {
 		if (this.#isDisposed) return;
 		if (manager.isDeliverySuppressed(jobId)) return;
+		// Managed transient Task completion is durably settled by the owner-bound
+		// completion sink. It must never be formatted into a model follow-up.
+		if (job?.transientTaskSettlementManaged) return;
 		// Snapshot the generation before the async format step: a `/new` during it
 		// bumps the epoch, so this delivery belongs to the replaced session and
 		// must not enqueue — the suppression marker alone is unreliable because
@@ -2027,6 +3498,7 @@ export class AgentSession {
 	 * the recovery wait always sees the in-flight handler and blocks until it — and
 	 * everything it schedules — settles. */
 	#handleAgentEvent = async (event: AgentEvent): Promise<void> => {
+		this.#ttsr.observeTransientTaskMessageUpdate(event);
 		if (event.type === "tool_execution_end" && this.#isTerminalYieldToolResult(event)) {
 			const alreadyTerminated = this.#synchronouslyTerminatedYieldToolCallIds.delete(event.toolCallId);
 			if (!alreadyTerminated) {
@@ -2979,6 +4451,7 @@ export class AgentSession {
 						this.#skipAgentContinue("post-restore-unavailable", options);
 						return;
 					}
+					await this.#awaitSessionPromptAdmission();
 					await this.agent.continue();
 				} catch (error) {
 					logger.warn("agent.continue failed after scheduling", {
@@ -3124,6 +4597,35 @@ export class AgentSession {
 			this.#synchronouslyTerminatedYieldToolCallIds.add(ctx.toolCall.id);
 			this.agent.abort(TERMINAL_TOOL_RESULT_ABORT_REASON);
 		}
+		const pending = this.#transientTaskSelectedHubReturns.get(ctx.toolCall.id);
+		if (pending) {
+			const completion = pending.completionReceipt;
+			if (
+				ctx.toolCall.name !== "hub" ||
+				completion.returnTarget.toolCallId !== ctx.toolCall.id ||
+				JSON.stringify(ctx.result.content) !== JSON.stringify(completion.returnResult.result.content) ||
+				JSON.stringify(ctx.result.details) !== JSON.stringify(completion.returnResult.result.details) ||
+				ctx.isError !== Boolean(completion.returnResult.result.isError)
+			) {
+				throw new Error("Selected Hub return does not match the exact tool execution result");
+			}
+			const exact = completion.postHookFinalization.exactToolResultMessage;
+			const exactToolResultMessage: ToolResultMessage = {
+				role: "toolResult",
+				toolCallId: exact.toolCallId,
+				toolName: "hub",
+				content: exact.content.map(part => ({ type: "text", text: part.text })),
+				details: exact.details,
+				isError: exact.isError,
+				timestamp: exact.timestamp,
+			};
+			return {
+				[AGENT_LOOP_SELECTED_TOOL_RESULT_PERSISTENCE]: {
+					authority: completion,
+					exactToolResultMessage,
+				},
+			};
+		}
 		return this.#ttsr.afterToolCall(ctx);
 	}
 	/**
@@ -3137,6 +4639,16 @@ export class AgentSession {
 	 * execution still emit there).
 	 */
 	async #beforeToolCall(ctx: BeforeToolCallContext): Promise<BeforeToolCallResult | undefined> {
+		if (ctx.toolCall.name === "task" || ctx.toolCall.name === "eval") {
+			const preDispatch =
+				ctx.toolCall.name === "task"
+					? await this.#ttsr.prepareTransientTaskBeforeToolCall(ctx.assistantMessage, ctx.toolCall)
+					: await this.#ttsr.prepareTransientEvalBeforeToolCall(ctx.assistantMessage, ctx.toolCall);
+			if (this.#transientTaskPreDispatchBindings.has(ctx.toolCall.id)) {
+				throw new Error("Transient foreground pre-dispatch binding already exists for this tool call");
+			}
+			this.#transientTaskPreDispatchBindings.set(ctx.toolCall.id, preDispatch);
+		}
 		const runner = this.#extensionRunner;
 		if (!runner?.hasHandlers("tool_call")) return undefined;
 		const metadata = ctx.toolCall.providerMetadata;
@@ -3574,13 +5086,14 @@ export class AgentSession {
 		this.#autolearnCaptureAbortController?.abort();
 	}
 
-	async #drainAutolearnCapture(): Promise<void> {
+	async #drainAutolearnCapture(rethrow = false): Promise<void> {
 		const task = this.#autolearnCaptureTask;
 		if (!task) return;
 		try {
 			await withTimeout(task, 3_000, "Timed out draining auto-learn capture during dispose");
 		} catch (error) {
 			logger.warn("Auto-learn capture did not settle during dispose", { error: String(error) });
+			if (rethrow) throw error;
 		}
 	}
 
@@ -3632,26 +5145,227 @@ export class AgentSession {
 		return this.#disposeCall;
 	}
 
-	async #disposeOwnedAsyncJobs(): Promise<void> {
-		// Unregister before cancelling: a job completing during teardown must
-		// dead-letter rather than enqueue a follow-up into a disposing session.
-		this.#unregisterAsyncDeliverySink?.();
-		this.#unregisterAsyncDeliverySink = undefined;
-		this.#cancelOwnAsyncJobs();
-		const manager = this.#ownedAsyncJobManager;
-		if (!manager) return;
+	#registerAsyncDeliverySink(): void {
+		if (this.#unregisterAsyncDeliverySink || !this.#asyncJobManager || !this.#agentId || this.#isDisposed) return;
+		const manager = this.#asyncJobManager;
+		this.#unregisterAsyncDeliverySink = manager.registerDeliverySink(this.#agentId, (jobId, text, job) =>
+			this.#deliverAsyncJobResult(manager, jobId, text, job),
+		);
+		this.yieldQueue.register<AsyncResultEntry>("async-result", {
+			isStale: entry => entry.epoch !== this.#asyncDeliveryEpoch || manager.isDeliverySuppressed(entry.jobId),
+			build: buildAsyncResultBatchMessage,
+		});
+	}
 
+	#createTransientTaskOwnerSessionIndex(): ConfidentialAsyncJobTransientTaskRecoveryOwnerSessionIndexV1 | undefined {
+		if (!this.#processOwnedDependencies || !this.#ownedAsyncJobManager || !this.#agentId) return undefined;
+		const ownerSessionId = this.sessionManager.getSessionId();
+		const resolved = this.sessionManager.resolveTransientTaskJournalGenerationAuthority(null);
+		if (resolved.status !== "matching") {
+			throw new Error(`Owner-session journal generation authority is unavailable: ${resolved.status}`);
+		}
+		const core = {
+			schemaVersion: 1 as const,
+			ownerId: this.#agentId,
+			ownerSessionId,
+			ownerSessionGenerationSha256: resolved.authority.sessionGeneration.sessionGenerationSha256,
+			deliveryEpoch: this.sessionManager.resolveTransientTaskDeliveryEpoch(),
+		};
+		return { ...core, indexSha256: transientSessionDigestRef("async-job-owner-session-index", core) };
+	}
+
+	#initializeTransientTaskRuntimeBinding(ownerSessionIndex = this.#createTransientTaskOwnerSessionIndex()): boolean {
+		const dependencies = this.#processOwnedDependencies;
+		const manager = this.#ownedAsyncJobManager;
+		if (!dependencies || !manager || !ownerSessionIndex) return false;
+		this.#transientTaskOwnerSessionIndex = ownerSessionIndex;
+		this.#toolResultPrimarySerializer = createAgentSessionToolResultPersistenceSerializerV1(this.sessionManager);
+		this.#transientTaskStartupFailure = undefined;
+		const transientTaskHubSendAwaitTargetSourceEffect = this.#createHubSendAwaitTargetSourceEffect();
+		const effects = Object.freeze({
+			asyncJobManager: manager,
+			ownerSessionIndex,
+			hubWinnerCompletion: this.#transientTaskPersistenceAuthority,
+			transientTaskHubSendAwaitTargetSourceEffect,
+			primarySessionAppend: createTransientTaskDetachedPrimarySessionAppendBridgeV1(this.sessionManager),
+		});
+		const assembly = dependencies.assembleTransientTaskRuntimeStoreFacade(effects);
 		try {
-			const drained = await manager.dispose({ timeoutMs: 3_000 });
-			const deliveryState = manager.getDeliveryState();
-			if (drained === false && deliveryState) {
-				logger.warn("Async job completion deliveries still pending during dispose", { ...deliveryState });
+			const ordinaryLifecycle = assembly.createOrdinaryTransientTaskLifecycle({
+				effects,
+				ownerSessionIndex,
+				resolveTransientTaskLifecycleAuthority: parentToolCallId =>
+					this.#transientTaskLifecycleAuthorities.get(parentToolCallId) ?? null,
+			});
+			this.#unregisterOrdinaryTransientTaskLifecycle =
+				assembly.installOrdinaryTransientTaskLifecycle(ordinaryLifecycle);
+			this.#transientTaskRuntimeStoreAssembly = assembly;
+			this.#ttsr.bindTransientTaskRuntime(createTransientTaskForegroundPendingTtsrOverlayStoreV1(this.sessionManager));
+		} catch (error) {
+			const unregisterOrdinaryTransientTaskLifecycle = this.#unregisterOrdinaryTransientTaskLifecycle;
+			this.#unregisterOrdinaryTransientTaskLifecycle = undefined;
+			this.#transientTaskRuntimeStoreAssembly = undefined;
+			this.#toolResultPrimarySerializer = undefined;
+			this.#transientTaskOwnerSessionIndex = undefined;
+			try {
+				unregisterOrdinaryTransientTaskLifecycle?.();
+			} finally {
+				assembly.release();
 			}
-		} finally {
-			if (AsyncJobManager.instance() === manager) {
-				AsyncJobManager.setInstance(undefined);
+			throw error;
+		}
+		this.#transientTaskStartup = this.#sessionJournalStartup
+			.then(async () => {
+				if (this.#sessionJournalStartupFailure) throw this.#sessionJournalStartupFailure;
+				await this.#rehydrateTransientTaskLifecycleAuthorities(assembly, ownerSessionIndex, transientSessionNow());
+				await this.#awaitTransientTaskLifecycleAdmission(
+					assembly.transientTaskLifecycleObservationAdapter,
+					ownerSessionIndex,
+				);
+				const cutover = await manager.reconcileTransientTaskSessionCutover({
+					ownerSessionIndex,
+					requestedAt: transientSessionNow(),
+				});
+				if (cutover.status !== "ready") {
+					throw new Error(
+						`Transient task startup recovery blocked: ${[
+							...cutover.recoveryStatuses,
+							...cutover.unresolvedJobIds.map(jobId => `unresolved:${jobId}`),
+						].join(", ")}`,
+					);
+				}
+				const requestedAt = transientSessionNow();
+				const enumeration = buildTransientTaskHubWaitMessageCanonicalRecordV1("winner-recovery-enumerate-request", {
+					ownerId: ownerSessionIndex.ownerId,
+					senderId: ownerSessionIndex.ownerId,
+					requestedAt,
+				});
+				const winnerRecovery = await assembly.transientTaskHubWaitMessageWinnerStartupRecovery.resumeMessageWinners(
+					buildTransientTaskHubWaitMessageCanonicalRecordV1("winner-startup-resume-request", {
+						enumeration,
+						requestedAt,
+					}),
+				);
+				if (winnerRecovery.status === "blocked") {
+					throw new Error(
+						`Transient Hub wait winner recovery blocked: ${winnerRecovery.blockedKeys
+							.map(key => key.hubWaitInvocationId)
+							.join(", ")}`,
+					);
+				}
+			})
+			.catch(async error => {
+				const startupError =
+					error instanceof Error ? error : new Error(`Transient task startup recovery failed: ${String(error)}`);
+				this.#transientTaskStartupFailure = startupError;
+				logger.error("Transient task startup recovery blocked admission", { error: startupError.message });
+				try {
+					await this.#releaseTransientTaskRuntimeBindings();
+				} catch (cleanupError) {
+					this.#transientTaskStartupFailure = new AggregateError(
+						[startupError, cleanupError],
+						"Transient task startup recovery failed and runtime cleanup was incomplete",
+					);
+				}
+			});
+		return true;
+	}
+
+	async #releaseTransientTaskRuntimeBindings(): Promise<void> {
+		const unregisterOrdinaryTransientTaskLifecycle = this.#unregisterOrdinaryTransientTaskLifecycle;
+		this.#unregisterOrdinaryTransientTaskLifecycle = undefined;
+		unregisterOrdinaryTransientTaskLifecycle?.();
+		this.#ttsr.releaseTransientTaskRuntime();
+		this.#transientTaskPreDispatchBindings.clear();
+		this.#transientTaskConsumedPreDispatchBindings.clear();
+		this.#transientTaskLifecycleAuthorities.clear();
+		this.#transientTaskRuntimeStoreAssembly?.release();
+		this.#toolResultPrimarySerializer = undefined;
+		this.#transientTaskRuntimeStoreAssembly = undefined;
+		this.#transientTaskOwnerSessionIndex = undefined;
+	}
+
+	async #ensureCurrentTransientTaskRuntimeBinding(): Promise<boolean> {
+		if (this.#isDisposed) return false;
+		let available = false;
+		const operation = this.#transientTaskRuntimeBindingOperation.then(async () => {
+			const ownerSessionIndex = this.#createTransientTaskOwnerSessionIndex();
+			if (!ownerSessionIndex) return;
+			if (
+				this.#transientTaskRuntimeStoreAssembly &&
+				this.#transientTaskOwnerSessionIndex?.indexSha256 === ownerSessionIndex.indexSha256
+			) {
+				await this.awaitTransientTaskStartup();
+				available = true;
+				return;
+			}
+			if (this.#transientTaskRuntimeStoreAssembly) {
+				await this.#ownedAsyncJobManager?.waitForOwnerJobs(ownerSessionIndex.ownerId);
+				await this.#reconcileTransientTaskSessionCutover();
+				await this.#releaseTransientTaskRuntimeBindings();
+			}
+			if (!this.#initializeTransientTaskRuntimeBinding(ownerSessionIndex)) return;
+			await this.awaitTransientTaskStartup();
+			available = true;
+		});
+		this.#transientTaskRuntimeBindingOperation = operation.then(
+			() => undefined,
+			() => undefined,
+		);
+		await operation;
+		return available;
+	}
+
+	async #disposeOwnedAsyncJobs(): Promise<void> {
+		const errors: unknown[] = [];
+		let ownershipTornDown = true;
+		const attempt = async (operation: () => void | Promise<void>, ownershipCritical = false): Promise<void> => {
+			try {
+				await operation();
+			} catch (error) {
+				if (ownershipCritical) ownershipTornDown = false;
+				errors.push(error);
+			}
+		};
+
+		await attempt(() => this.#transientTaskRuntimeBindingOperation, true);
+		await attempt(() => this.#cancelOwnAsyncJobs(), true);
+		const manager = this.#ownedAsyncJobManager;
+		if (manager) {
+			const agentId = this.#agentId;
+			if (agentId)
+				await attempt(async () => {
+					await manager.waitForOwnerJobs(agentId);
+				}, true);
+			await attempt(() => this.#transientTaskStartup, true);
+			if (!this.#transientTaskStartupFailure) {
+				await attempt(() => this.#reconcileTransientTaskSessionCutover(), true);
+			}
+			await attempt(() => this.#releaseTransientTaskRuntimeBindings(), true);
+		}
+		await attempt(() => this.#unregisterAsyncDeliverySink?.());
+		this.#unregisterAsyncDeliverySink = undefined;
+		if (manager) {
+			await attempt(async () => {
+				const drained = await manager.dispose({ timeoutMs: 3_000 });
+				const deliveryState = manager.getDeliveryState();
+				if (drained === false && deliveryState) {
+					logger.warn("Async job completion deliveries still pending during dispose", { ...deliveryState });
+				}
+			}, true);
+		}
+
+		if (manager && ownershipTornDown) {
+			const releaseProcessBinding = this.#releaseProcessAsyncJobManagerBinding;
+			if (releaseProcessBinding) {
+				await attempt(releaseProcessBinding);
+				this.#releaseProcessAsyncJobManagerBinding = undefined;
+			} else if (AsyncJobManager.instance() === manager) {
+				await attempt(() => AsyncJobManager.setInstance(undefined));
 			}
 		}
+		if (errors.length === 1) throw errors[0];
+		if (errors.length > 1) throw new AggregateError(errors, "Async job ownership teardown was incomplete");
 	}
 
 	async #releaseOwnedBrowserTabs(ownerId: string | undefined): Promise<void> {
@@ -3667,6 +5381,7 @@ export class AgentSession {
 			}
 		} catch (error) {
 			logger.warn("Failed to release owned browser tabs during dispose", { error: String(error) });
+			throw error;
 		}
 	}
 
@@ -3680,6 +5395,7 @@ export class AgentSession {
 			);
 		} catch (error) {
 			logger.warn("Failed to release native computer session during dispose", { error: String(error) });
+			throw error;
 		}
 	}
 
@@ -3693,6 +5409,7 @@ export class AgentSession {
 			);
 		} catch (error) {
 			logger.warn("Failed to disconnect owned MCP manager during dispose", { error: String(error) });
+			throw error;
 		}
 	}
 
@@ -3709,82 +5426,131 @@ export class AgentSession {
 	}
 
 	async #doDispose(options: AgentSessionDisposeOptions = {}): Promise<void> {
-		this.beginDispose();
-		this.#recordSessionExit(options.reason ?? "dispose");
-		this.#cancelExitRecorder?.();
+		const errors: unknown[] = [];
+		const attemptSync = <T>(operation: () => T, message: string): T | undefined => {
+			try {
+				return operation();
+			} catch (error) {
+				errors.push(error);
+				logger.warn(message, { error: String(error) });
+				return undefined;
+			}
+		};
+		const attempt = async (operation: () => void | Promise<void>, message: string): Promise<void> => {
+			try {
+				await operation();
+			} catch (error) {
+				errors.push(error);
+				logger.warn(message, { error: String(error) });
+			}
+		};
+
+		attemptSync(() => this.beginDispose(), "Failed to begin AgentSession disposal");
+		attemptSync(() => this.#recordSessionExit(options.reason ?? "dispose"), "Failed to record session exit");
+		const cancelExitRecorder = this.#cancelExitRecorder;
 		this.#cancelExitRecorder = undefined;
-		try {
+		attemptSync(() => cancelExitRecorder?.(), "Failed to cancel the session exit recorder");
+		await attempt(async () => {
 			await emitSessionShutdownEvent(this.#extensionRunner);
-		} catch (error) {
-			logger.warn("Failed to emit session_shutdown event", { error: String(error) });
-		}
+		}, "Failed to emit session_shutdown event");
 
 		// Stop fallback extension timers before aborting deferred work they could enqueue.
-		this.#fallbackExtensionTimers?.clearAll();
-		this.abortRetry();
-		this.abortCompaction();
-		const postPromptDrain = this.#cancelPostPromptTasks();
-		this.agent.abort();
-		try {
-			await withTimeout(
-				postPromptDrain,
-				POST_PROMPT_DRAIN_TIMEOUT_MS,
-				"Timed out draining post-prompt tasks during dispose",
-			);
-		} catch (error) {
-			logger.warn("Post-prompt tasks still draining at dispose deadline", { error: String(error) });
-		}
-		await this.#drainAutolearnCapture();
-		await this.#memory.transition;
+		attemptSync(() => this.#fallbackExtensionTimers?.clearAll(), "Failed to clear fallback extension timers");
+		attemptSync(() => this.abortRetry(), "Failed to abort retry work");
+		attemptSync(() => this.abortCompaction(), "Failed to abort compaction work");
+		const postPromptDrain =
+			attemptSync(() => this.#cancelPostPromptTasks(), "Failed to cancel post-prompt tasks") ?? Promise.resolve();
+		attemptSync(() => this.agent.abort(), "Failed to abort the agent loop");
+		await attempt(
+			() =>
+				withTimeout(
+					postPromptDrain,
+					POST_PROMPT_DRAIN_TIMEOUT_MS,
+					"Timed out draining post-prompt tasks during dispose",
+				),
+			"Post-prompt tasks still draining at dispose deadline",
+		);
+		await attempt(() => this.#drainAutolearnCapture(true), "Failed to drain auto-learn capture");
+		await attempt(() => this.#memory.transition, "Failed to settle memory transition");
 
-		const hindsightState = this.getHindsightSessionState();
-		const mnemopiState = setMnemopiSessionState(this, undefined);
-		const advisorRecorderClosed = this.#advisors.recorderClosed();
-		const results = await Promise.allSettled([
-			this.#disposeOwnedAsyncJobs(),
-			this.#eval.disposeKernels(),
-			this.#releaseOwnedBrowserTabs(this.sessionManager.getSessionId()),
-			this.#releaseOwnedComputerSessions(this.#eval.getKernelOwnerId()),
-			shutdownTinyTitleClient(),
-			this.#disconnectOwnedMcp(),
-			advisorRecorderClosed,
-			hindsightState?.flushRetainQueue() ?? Promise.resolve(),
-			this.#disposeMnemopi(mnemopiState, options.mnemopiConsolidateTimeoutMs),
-		]);
+		const hindsightState = attemptSync(
+			() => this.getHindsightSessionState(),
+			"Failed to read hindsight session state",
+		);
+		const mnemopiState = attemptSync(
+			() => setMnemopiSessionState(this, undefined),
+			"Failed to detach Mnemopi session state",
+		);
+		const advisorRecorderClosed =
+			attemptSync(() => this.#advisors.recorderClosed(), "Failed to close advisor recorder") ?? Promise.resolve();
+		const browserOwnerId = attemptSync(
+			() => this.sessionManager.getSessionId(),
+			"Failed to resolve browser owner during dispose",
+		);
+		const computerOwnerId = attemptSync(
+			() => this.#eval.getKernelOwnerId(),
+			"Failed to resolve computer owner during dispose",
+		);
+		const parallelTeardown = [
+			() => this.#disposeOwnedAsyncJobs(),
+			() => this.#eval.disposeKernels(),
+			() => this.#releaseOwnedBrowserTabs(browserOwnerId),
+			() => this.#releaseOwnedComputerSessions(computerOwnerId),
+			() => shutdownTinyTitleClient(),
+			() => this.#disconnectOwnedMcp(),
+			() => advisorRecorderClosed,
+			() => hindsightState?.flushRetainQueue() ?? Promise.resolve(),
+			() => this.#disposeMnemopi(mnemopiState, options.mnemopiConsolidateTimeoutMs),
+		];
+		const results = await Promise.allSettled(parallelTeardown.map(operation => Promise.resolve().then(operation)));
 		for (const result of results) {
 			if (result.status === "rejected") {
+				errors.push(result.reason);
 				logger.warn("Session dispose subsystem failed during parallel teardown", {
 					error: String(result.reason),
 				});
 			}
 		}
 
-		this.#releasePowerAssertion();
-		await cleanupEmptyMoveSession(this.sessionManager, this.#movedFromEmptySessionFile);
+		attemptSync(() => this.#releasePowerAssertion(), "Failed to release power assertion");
+		await attempt(
+			() => cleanupEmptyMoveSession(this.sessionManager, this.#movedFromEmptySessionFile),
+			"Failed to clean up empty moved session",
+		);
 		this.#movedFromEmptySessionFile = undefined;
-		// All teardown branches that can append session entries have settled.
-		await this.sessionManager.close();
-		this.#closeAllProviderSessions("dispose");
-		this.setHindsightSessionState(undefined);
-		hindsightState?.dispose();
-		this.#disconnectFromAgent();
-		if (this.#unsubscribeAppendOnly) {
-			this.#unsubscribeAppendOnly();
-			this.#unsubscribeAppendOnly = undefined;
-		}
-		if (this.#unsubscribeModelRoles) {
-			this.#unsubscribeModelRoles();
-			this.#unsubscribeModelRoles = undefined;
-		}
+		// All teardown branches that can append session entries have settled. The
+		// process-owned persistent authority remains bound through journal close.
+		await attempt(() => this.sessionManager.close(), "Failed to close SessionManager");
+		const releasePersistentStore = this.#releaseProcessOwnedPersistentAgentStore;
+		this.#releaseProcessOwnedPersistentAgentStore = undefined;
+		attemptSync(() => releasePersistentStore?.(), "Failed to release process-owned persistent agent store");
+		const providerCloseErrors = attemptSync(
+			() => this.#closeAllProviderSessions("dispose"),
+			"Failed to close provider session states",
+		);
+		if (providerCloseErrors) errors.push(...providerCloseErrors);
+		attemptSync(() => this.setHindsightSessionState(undefined), "Failed to clear hindsight session state");
+		attemptSync(() => hindsightState?.dispose(), "Failed to dispose hindsight session state");
+		attemptSync(() => this.#disconnectFromAgent(), "Failed to disconnect from the agent");
+		const unsubscribeAppendOnly = this.#unsubscribeAppendOnly;
+		this.#unsubscribeAppendOnly = undefined;
+		attemptSync(() => unsubscribeAppendOnly?.(), "Failed to unsubscribe append-only state");
+		const unsubscribeModelRoles = this.#unsubscribeModelRoles;
+		this.#unsubscribeModelRoles = undefined;
+		attemptSync(() => unsubscribeModelRoles?.(), "Failed to unsubscribe model roles");
 		this.#eventListeners = [];
 		this.#sessionChangeCallbacks.clear();
+		if (errors.length === 1) throw errors[0];
+		if (errors.length > 1) throw new AggregateError(errors, "AgentSession disposal was incomplete");
 	}
 
-	#closeAllProviderSessions(reason: string): void {
+	#closeAllProviderSessions(reason: string): unknown[] {
+		const errors: unknown[] = [];
 		for (const [providerKey, state] of this.#providerSessionState) {
 			try {
 				state.close();
 			} catch (error) {
+				errors.push(error);
 				logger.warn("Failed to close provider session state", {
 					providerKey,
 					reason,
@@ -3794,6 +5560,7 @@ export class AgentSession {
 		}
 
 		this.#providerSessionState.clear();
+		return errors;
 	}
 
 	freshSession(): FreshSessionResult | undefined {
@@ -3852,7 +5619,8 @@ export class AgentSession {
 		//     (mirrors newSession()).
 		this.#promptGeneration++;
 		await this.#cancelPostPromptTasks();
-		this.#cancelOwnAsyncJobs();
+		await this.#prepareTransientTaskSessionGenerationChange({ detachJournal: false });
+		this.sessionManager.appendResetBoundary();
 
 		// Drop the conversation: messages, queued steers/follow-ups, pending tool
 		// calls, and error state. agent.reset() keeps the model and system prompt.
@@ -3901,7 +5669,6 @@ export class AgentSession {
 		// boundary, so a rebuild across a `/clear` (theme change, focus attach,
 		// on-disk record and the plain `transcript:true` export path keep the full
 		// pre-reset history.
-		this.sessionManager.appendResetBoundary();
 
 		return { droppedCount };
 	}
@@ -5164,6 +6931,7 @@ export class AgentSession {
 			acceptTerminalEmptyStop?: boolean;
 		},
 	): Promise<void> {
+		await this.#awaitSessionPromptAdmission();
 		this.#beginInFlight();
 		const generation = this.#promptGeneration;
 		try {
@@ -5782,6 +7550,7 @@ export class AgentSession {
 		message: CustomMessage,
 		options?: { acceptTerminalEmptyStop?: boolean },
 	): Promise<void> {
+		await this.#awaitSessionPromptAdmission();
 		this.#beginInFlight();
 		try {
 			if (!(await this.#runUsageAwarePreflight())) return;
@@ -6305,12 +8074,15 @@ export class AgentSession {
 		this.#disconnectFromAgent();
 		let advisorRecordersDetached = false;
 		await this.abort();
-		this.#cancelOwnAsyncJobs();
 		this.#closeAllProviderSessions("new session");
 		await this.#bash.flushPending();
+		if (options?.drop !== true) await this.sessionManager.flush();
 		const bashTransition = this.#bash.beginSessionTransition({ persistDetached: options?.drop !== true });
 		let sessionTransitioned = false;
+		let generationPrepared = false;
 		try {
+			await this.#prepareTransientTaskSessionGenerationChange();
+			generationPrepared = true;
 			advisorRecordersDetached = true;
 			await this.#advisors.drainAndDetachRecorders();
 			try {
@@ -6321,8 +8093,6 @@ export class AgentSession {
 					} catch (err) {
 						logger.error("Failed to delete session during /drop", { err });
 					}
-				} else {
-					await this.sessionManager.flush();
 				}
 				await this.sessionManager.newSession({
 					...options,
@@ -6373,9 +8143,14 @@ export class AgentSession {
 
 			return true;
 		} finally {
-			if (advisorRecordersDetached) {
-				if (sessionTransitioned) this.#advisors.resetSessionState();
-				else this.#advisors.reattachRecorderFeeds();
+			try {
+				if (generationPrepared && !sessionTransitioned) await this.#restoreSessionGenerationAfterFailedChange();
+			} finally {
+				if (advisorRecordersDetached) {
+					if (sessionTransitioned) this.#advisors.resetSessionState();
+					else this.#advisors.reattachRecorderFeeds();
+				}
+				if (!sessionTransitioned) this.#reconnectToAgent();
 			}
 		}
 	}
@@ -6414,7 +8189,11 @@ export class AgentSession {
 		// Flush current session to ensure all entries are written
 		await this.sessionManager.flush();
 		let advisorRecordersDetached = false;
+		let sessionTransitioned = false;
+		let generationPrepared = false;
 		try {
+			await this.#prepareTransientTaskSessionGenerationChange();
+			generationPrepared = true;
 			advisorRecordersDetached = true;
 			// Fork keeps the conversation, but still needs a quiet artifact boundary:
 			// stop and settle in-flight advisors before muting their feeds.
@@ -6435,6 +8214,7 @@ export class AgentSession {
 			}
 			this.#bash.markSessionTransition(bashTransition);
 			this.#bash.finishSessionTransition(bashTransition, true);
+			sessionTransitioned = true;
 
 			// Copy artifacts directory if it exists
 			const oldArtifactDir = forkResult.oldSessionFile.slice(0, -6);
@@ -6475,7 +8255,11 @@ export class AgentSession {
 
 			return true;
 		} finally {
-			if (advisorRecordersDetached) this.#advisors.reattachRecorderFeeds();
+			try {
+				if (generationPrepared && !sessionTransitioned) await this.#restoreSessionGenerationAfterFailedChange();
+			} finally {
+				if (advisorRecordersDetached) this.#advisors.reattachRecorderFeeds();
+			}
 		}
 	}
 
@@ -7130,9 +8914,88 @@ export class AgentSession {
 	// IRC Delivery
 	// =========================================================================
 
-	/** Surfaces and consumes pending IRC records before automatic injection. */
-	drainPendingIrcInboxMessages(agentId: string, opts?: { from?: string; limit?: number }): IrcMessage[] {
+	/** Surfaces pending IRC records; destructive unless peek is requested. */
+	drainPendingIrcInboxMessages(
+		agentId: string,
+		opts?: { from?: string; limit?: number; peek?: boolean },
+	): IrcMessage[] {
 		return this.#irc.drainInboxMessages(agentId, opts);
+	}
+
+	/** Offers buffered Hub candidates to the durable selector before source removal. */
+	async selectPendingHubWaitMessage(
+		selector: ConfidentialTransientTaskHubWaitMessageSelectorInstallRequestV1,
+		select: TransientTaskHubWaitDurableMessageSelectorV1,
+		signal?: AbortSignal,
+	): Promise<ConfidentialTransientTaskHubWaitMessageSourceSelectionResultV1> {
+		this.#activeHubWaitSelectorInstallRequestSha256s.add(selector.selectorInstallRequestSha256);
+		try {
+			return await this.#irc.selectPendingHubWaitMessage(selector, select, signal);
+		} finally {
+			this.#activeHubWaitSelectorInstallRequestSha256s.delete(selector.selectorInstallRequestSha256);
+		}
+	}
+
+	/** Installs one selected Hub completion only after its durable return-target delivery commits. */
+	installTransientTaskHubWaitMessageCompletion(input: {
+		readonly completionReceipt: RuntimeContracts.ConfidentialTransientTaskHubWaitMessageWinnerCompletionReceiptV1;
+		readonly deliveryReceipt: RuntimeContracts.ConfidentialTransientTaskHubWaitMessageReturnDeliveryReceiptV1;
+		readonly captureRequest: RuntimeContracts.ConfidentialTransientTaskHubWaitMessageWinnerCaptureRequestV1;
+		readonly currentSelectorAuthority: RuntimeContracts.ConfidentialTransientTaskHubWaitMessageWinnerCurrentSelectorAuthorityV1;
+	}): AgentToolResult<unknown> {
+		const completion = input.completionReceipt;
+		const toolCallId = completion.returnTarget.toolCallId;
+		const serializer = this.#resolveCurrentAssistantToolResultSerializerKey(toolCallId);
+		if (
+			serializer.serializerKey.serializerKeySha256 !== completion.returnTarget.serializerKey.serializerKeySha256 ||
+			input.deliveryReceipt.completionReceiptSha256 !== completion.receiptSha256 ||
+			input.deliveryReceipt.returnResultSha256 !== completion.returnResult.resultSha256 ||
+			input.deliveryReceipt.returnDeliveryOperationId !== completion.returnTarget.returnDeliveryOperationId ||
+			input.captureRequest.captureRequestSha256 !== input.currentSelectorAuthority.captureRequestSha256
+		) {
+			throw new Error("Selected Hub completion does not match the current return authority");
+		}
+		const prior = this.#transientTaskSelectedHubReturns.get(toolCallId);
+		if (prior && prior.completionReceipt.receiptSha256 !== completion.receiptSha256) {
+			throw new Error("A conflicting selected Hub completion is already pending");
+		}
+		this.#transientTaskSelectedHubReturns.set(toolCallId, input);
+		return {
+			content: completion.returnResult.result.content.map(part => ({ type: "text", text: part.text })),
+			details: completion.returnResult.result.details,
+			...(completion.returnResult.result.isError ? { isError: true } : {}),
+		};
+	}
+
+	/** Applies one durably adopted retired Hub plan without consulting ambient afterToolCall state. */
+	installTransientTaskHubWaitNoSelectionReturn(input: {
+		readonly retiredPlanAdoptionReceipt: RuntimeContracts.ConfidentialTransientTaskHubWaitMessageRetiredPlanAdoptionReceiptV1;
+		readonly noSelectionReturnResult: RuntimeContracts.ConfidentialTransientTaskHubWaitMessageNoSelectionReturnResultV1;
+		readonly toolResultMessageTimestamp: number;
+	}): AgentToolResult<unknown> {
+		const adoption = input.retiredPlanAdoptionReceipt;
+		const target = adoption.target;
+		const plan = adoption.afterToolCallPlan;
+		const serializer = this.#resolveCurrentAssistantToolResultSerializerKey(target.toolCallId);
+		if (
+			!validateTransientTaskHubWaitMessageCanonicalRecordV1("retired-plan-adoption-receipt", adoption) ||
+			target.toolName !== "hub" ||
+			plan.toolName !== "hub" ||
+			plan.toolCallId !== target.toolCallId ||
+			serializer.serializerKey.serializerKeySha256 !== target.serializerKey.serializerKeySha256
+		) {
+			throw new Error("Retired Hub plan adoption does not match the current return authority");
+		}
+		const finalization = finalizeTransientTaskHubWaitMessageResultV1(
+			input.noSelectionReturnResult,
+			plan,
+			input.toolResultMessageTimestamp,
+		);
+		return {
+			content: finalization.finalAgentToolResult.content.map(part => ({ type: "text", text: part.text })),
+			details: finalization.finalAgentToolResult.details,
+			...(finalization.finalAgentToolResult.isError ? { isError: true } : {}),
+		};
 	}
 
 	/** Delivers an IRC message into this recipient session. */
@@ -7391,6 +9254,7 @@ export class AgentSession {
 		const previousCheckpointState = this.#checkpointState;
 		const previousPendingRewindReport = this.#pendingRewindReport;
 		const previousLastCompletedRewind = this.#lastCompletedRewind;
+		let generationPrepared = false;
 		const previousRewoundToolResultIds = new Set(this.#rewoundToolResultIds);
 
 		this.agent.clearAllQueues();
@@ -7398,6 +9262,8 @@ export class AgentSession {
 		this.#scheduledHiddenNextTurnGeneration = undefined;
 
 		try {
+			await this.#prepareTransientTaskSessionGenerationChange();
+			generationPrepared = true;
 			if (switchingToDifferentSession) {
 				// Stop and settle in-flight advisors while the old-session feeds can
 				// still observe message_end, then mute before swapping files.
@@ -7553,6 +9419,14 @@ export class AgentSession {
 			return true;
 		} catch (error) {
 			this.sessionManager.restoreState(previousSessionState);
+			let generationRestoreError: unknown;
+			if (generationPrepared) {
+				try {
+					await this.#restoreSessionGenerationAfterFailedChange();
+				} catch (restoreError) {
+					generationRestoreError = restoreError;
+				}
+			}
 			this.#freshProviderSessionId = previousFreshProviderSessionId;
 			this.#syncAgentSessionId(previousSessionState.sessionId, false);
 			this.#memory.rekeyForCurrentSessionId();
@@ -7605,6 +9479,12 @@ export class AgentSession {
 				});
 			}
 			this.#bash.finishSessionTransition(bashTransition, false);
+			if (generationRestoreError !== undefined) {
+				throw new AggregateError(
+					[error, generationRestoreError],
+					"Session switch and authority restoration both failed",
+				);
+			}
 			throw error;
 		}
 	}
@@ -7657,13 +9537,15 @@ export class AgentSession {
 		// Flush pending writes before branching
 		await this.sessionManager.flush();
 		const bashTransition = this.#bash.beginSessionTransition();
-		this.#cancelOwnAsyncJobs();
 		this.#abortAutolearnCapture();
 		await this.#drainAutolearnCapture();
 
 		let sessionTransitioned = false;
 		let advisorRecordersDetached = false;
+		let generationPrepared = false;
 		try {
+			await this.#prepareTransientTaskSessionGenerationChange();
+			generationPrepared = true;
 			advisorRecordersDetached = true;
 			await this.#advisors.drainAndDetachRecorders();
 			try {
@@ -7711,9 +9593,13 @@ export class AgentSession {
 			advisorRecordersDetached = false;
 			return { selectedText, selectedImages, cancelled: false };
 		} finally {
-			if (advisorRecordersDetached) {
-				if (sessionTransitioned) this.#advisors.resetSessionState();
-				else this.#advisors.reattachRecorderFeeds();
+			try {
+				if (generationPrepared && !sessionTransitioned) await this.#restoreSessionGenerationAfterFailedChange();
+			} finally {
+				if (advisorRecordersDetached) {
+					if (sessionTransitioned) this.#advisors.resetSessionState();
+					else this.#advisors.reattachRecorderFeeds();
+				}
 			}
 		}
 	}
@@ -7760,6 +9646,17 @@ export class AgentSession {
 			throw new Error("Cannot branch /btw: session changed since /btw started");
 		}
 
+		if (
+			this.isStreaming ||
+			this.isBashRunning ||
+			this.isEvalRunning ||
+			this.isCompacting ||
+			this.isGeneratingHandoff ||
+			this.isRetrying
+		) {
+			throw new Error("Cannot branch /btw while session maintenance or user work is still running");
+		}
+
 		await withTimeout(
 			this.#cancelPostPromptTasks(),
 			POST_PROMPT_DRAIN_TIMEOUT_MS,
@@ -7782,13 +9679,15 @@ export class AgentSession {
 		await this.#bash.flushPending();
 		await this.sessionManager.flush();
 		const bashTransition = this.#bash.beginSessionTransition();
-		this.#cancelOwnAsyncJobs();
 		this.#abortAutolearnCapture();
 		await this.#drainAutolearnCapture();
 
 		let sessionTransitioned = false;
 		let advisorRecordersDetached = false;
+		let generationPrepared = false;
 		try {
+			await this.#prepareTransientTaskSessionGenerationChange();
+			generationPrepared = true;
 			advisorRecordersDetached = true;
 			await this.#advisors.drainAndDetachRecorders();
 			try {
@@ -7834,9 +9733,13 @@ export class AgentSession {
 
 			return { cancelled: false, sessionFile: this.sessionFile };
 		} finally {
-			if (advisorRecordersDetached) {
-				if (sessionTransitioned) this.#advisors.resetSessionState();
-				else this.#advisors.reattachRecorderFeeds();
+			try {
+				if (generationPrepared && !sessionTransitioned) await this.#restoreSessionGenerationAfterFailedChange();
+			} finally {
+				if (advisorRecordersDetached) {
+					if (sessionTransitioned) this.#advisors.resetSessionState();
+					else this.#advisors.reattachRecorderFeeds();
+				}
 			}
 		}
 	}

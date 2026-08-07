@@ -17,6 +17,7 @@ import {
 	waitForPromiseWithCancellation,
 } from "../executor-base";
 import type { JsStatusEvent } from "../js/shared/types";
+import type { EvalAgentLifecycleContextV1 } from "../lifecycle";
 import { ensurePyToolBridge } from "../py/tool-bridge";
 import {
 	checkRubyKernelAvailability,
@@ -69,6 +70,7 @@ export interface RubyExecutorOptions {
 	 * omitted, the bridge env vars are not injected and `tool.foo(...)` raises.
 	 */
 	toolSession?: ToolSession;
+	evalAgentLifecycle?: EvalAgentLifecycleContextV1;
 	/** Callback for status events emitted by tool bridge invocations. */
 	emitStatus?: (event: JsStatusEvent) => void;
 	/** Live status events streamed as they are emitted. */

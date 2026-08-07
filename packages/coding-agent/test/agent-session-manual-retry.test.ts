@@ -10,6 +10,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 function lastAgentMessage(session: AgentSession): AssistantMessage {
 	const message = session.agent.state.messages.at(-1);
@@ -61,11 +62,13 @@ describe("AgentSession manual retry", () => {
 			},
 			streamFn: mock.stream,
 		});
+		const modelRegistry = new ModelRegistry(authStorage);
 		session = new AgentSession({
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false, "retry.enabled": false }),
-			modelRegistry: new ModelRegistry(authStorage),
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 		session.subscribe(() => {});
 
@@ -100,11 +103,13 @@ describe("AgentSession manual retry", () => {
 			},
 			streamFn: mock.stream,
 		});
+		const modelRegistry = new ModelRegistry(authStorage);
 		session = new AgentSession({
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: new ModelRegistry(authStorage),
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 		session.subscribe(() => {});
 
@@ -146,11 +151,13 @@ describe("AgentSession manual retry", () => {
 			},
 			streamFn: mock.stream,
 		});
+		const modelRegistry = new ModelRegistry(authStorage);
 		session = new AgentSession({
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false, "retry.enabled": false }),
-			modelRegistry: new ModelRegistry(authStorage),
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 		session.subscribe(() => {});
 
@@ -201,11 +208,13 @@ describe("AgentSession manual retry", () => {
 			},
 			streamFn: mock.stream,
 		});
+		const modelRegistry = new ModelRegistry(authStorage);
 		session = new AgentSession({
 			agent,
 			sessionManager,
 			settings: Settings.isolated({ "compaction.enabled": false, "retry.enabled": false }),
-			modelRegistry: new ModelRegistry(authStorage),
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 		session.subscribe(() => {});
 
@@ -247,7 +256,8 @@ describe("AgentSession manual retry", () => {
 			agent: reopenedAgent,
 			sessionManager: reopenedManager,
 			settings: Settings.isolated({ "compaction.enabled": false, "retry.enabled": false }),
-			modelRegistry: new ModelRegistry(authStorage),
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 		session.subscribe(() => {});
 

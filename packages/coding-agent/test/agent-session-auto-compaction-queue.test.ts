@@ -14,6 +14,7 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import * as unexpectedStopClassifier from "@oh-my-pi/pi-coding-agent/session/unexpected-stop-classifier";
 import { getProjectAgentDir, TempDir, withTimeout } from "@oh-my-pi/pi-utils";
 import * as logger from "@oh-my-pi/pi-utils/logger";
+import { createTestRuntimeDependencies } from "./utilities";
 
 const runtimeSignalStoreKey = "__ompRuntimeSignals";
 
@@ -131,6 +132,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 				"todo.remindersMax": 3,
 			}),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			extensionRunner,
 		});
 	});
@@ -1003,10 +1005,9 @@ describe("AgentSession auto-compaction queue resume", () => {
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
 
 		await withTimeout(reminderDone, 1000, "Todo reminder timed out");
-		await Promise.resolve();
+		await session.waitForIdle();
 
 		expect(getRuntimeSignals()).toContain("todo:1/3");
 		expect(continueSpy).toHaveBeenCalledTimes(1);
-		await session.waitForIdle();
 	});
 });

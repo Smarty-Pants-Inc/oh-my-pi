@@ -6,6 +6,7 @@ import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent, PromptOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { WorkspaceRuntimeProviderRegistry } from "@oh-my-pi/pi-coding-agent/session/workspace-provider-registry";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
@@ -62,6 +63,7 @@ function createMockSession(
 function createSessionResult(session: AgentSession): CreateAgentSessionResult {
 	return {
 		session,
+		runtimeProviderRegistry: new WorkspaceRuntimeProviderRegistry(),
 		extensionsResult:
 			{} as unknown as import("@oh-my-pi/pi-coding-agent/extensibility/extensions/types").LoadExtensionsResult,
 		setToolUIContext: () => {},

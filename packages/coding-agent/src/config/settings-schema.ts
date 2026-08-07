@@ -3,6 +3,8 @@ import { DEFAULT_SHARE_URL } from "@oh-my-pi/pi-wire";
 import { SHAPE_VARIANT_NAMES } from "@oh-my-pi/snapcompact";
 import { DEFAULT_RELAY_URL } from "../collab/protocol";
 import { DEFAULT_LIVE_VOICE, LIVE_VOICE_OPTIONS, LIVE_VOICE_VALUES } from "../live/voices";
+import type { PersistentRuntimePolicyOverlayV1 } from "../registry/persistent-agent-contracts.js";
+import type { WorkspaceRetentionPolicyOverlayV1 } from "../session/workspace-runtime-contracts.js";
 import { DEFAULT_STT_MODEL_KEY, STT_MODEL_OPTIONS, STT_MODEL_VALUES } from "../stt/models";
 import { STT_SUBMIT_TRIGGER_OPTIONS, STT_SUBMIT_TRIGGER_VALUES } from "../stt/submit-trigger";
 import { AUTO_THINKING, getConfiguredThinkingLevelMetadata, getThinkingLevelMetadata } from "../thinking";
@@ -43,6 +45,7 @@ import {
 	SEARCH_PROVIDER_CHOICES,
 	type SearchProviderId,
 } from "../web/search/types";
+import type { ModelConnectionProfile } from "./model-connection-contracts.js";
 import {
 	SERVICE_TIER_ANTHROPIC_OPTIONS,
 	SERVICE_TIER_ANTHROPIC_VALUES,
@@ -321,6 +324,14 @@ const DEFAULT_CYCLE_ORDER: string[] = ["smol", "default", "slow"];
 const DEFAULT_TOOL_CALL_LOOP_EXEMPT_TOOLS: string[] = ["hub"];
 const EMPTY_MODEL_TAGS_RECORD: ModelTagsSettings = {};
 const HINDSIGHT_RECALL_TYPES_DEFAULT: string[] = ["world", "experience"];
+const EMPTY_PERSISTENT_RUNTIME_POLICY_OVERLAY: PersistentRuntimePolicyOverlayV1 = {};
+const EMPTY_WORKSPACE_RETENTION_POLICY_OVERLAY: WorkspaceRetentionPolicyOverlayV1 = {};
+const DEFAULT_MODEL_CONNECTIONS: Record<string, ModelConnectionProfile> = Object.freeze({
+	"cliproxyapi-default": Object.freeze({
+		id: "cliproxyapi-default",
+		model: Object.freeze({ provider: "cliproxyapi", id: "gpt-5.6-terra" }),
+	}),
+});
 export const DEFAULT_BASH_INTERCEPTOR_RULES: BashInterceptorRule[] = [
 	{
 		pattern: "^\\s*(cat|head|tail|less|more)\\s+",
@@ -527,6 +538,30 @@ export const SETTINGS_SCHEMA = {
 	enabledModels: { type: "array", default: EMPTY_STRING_ARRAY },
 
 	disabledProviders: { type: "array", default: EMPTY_STRING_ARRAY },
+
+	"agents.persistent.enabled": { type: "boolean", default: false },
+
+	"agents.persistent.defaultRuntimePolicy": {
+		type: "record",
+		default: EMPTY_PERSISTENT_RUNTIME_POLICY_OVERLAY,
+	},
+
+	"agents.persistent.workspaceRetention": {
+		type: "record",
+		default: EMPTY_WORKSPACE_RETENTION_POLICY_OVERLAY,
+	},
+
+	"agents.persistent.providers.local.enabled": { type: "boolean", default: true },
+
+	"agents.persistent.providers.cloudflare.enabled": { type: "boolean", default: false },
+
+	"agents.persistent.providers.cloudflare.profile": { type: "string", default: "default" },
+
+	"agents.persistent.providers.cloudflare.workspaceRetentionMs": { type: "number", default: 3_600_000 },
+
+	modelConnections: { type: "record", default: DEFAULT_MODEL_CONNECTIONS },
+
+	"sessionJournal.enabled": { type: "boolean", default: false },
 
 	"providers.maxInFlightRequests": {
 		type: "record",

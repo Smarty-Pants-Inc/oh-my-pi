@@ -2,7 +2,17 @@ import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import { hasFsCode, isEnoent, logger, peekFileEnds, Snowflake, toError } from "@oh-my-pi/pi-utils";
+import type { PrimarySessionDurabilityReceipt } from "./session-journal-contracts.js";
 import { overlayTitleSlotContent, type SessionTitleUpdate, serializeTitleSlot } from "./session-title-slot";
+
+/** Capture the exact primary completion promise consumed by the post-primary journal queue. */
+export function createPrimarySessionDurabilityReceipt(
+	committed: PromiseLike<void> | void,
+): PrimarySessionDurabilityReceipt {
+	const promise = Promise.resolve(committed);
+	void promise.catch(() => undefined);
+	return Object.freeze({ committed: promise }) as PrimarySessionDurabilityReceipt;
+}
 
 const utf8Decoder = new TextDecoder("utf-8");
 
@@ -760,7 +770,12 @@ export class MemorySessionStorage implements SessionStorage {
 		this.#files.delete(path);
 		return Promise.resolve();
 	}
-	deleteSessionWithArtifacts(_sessionPath: string): Promise<void> {
+	deleteSessionWithArtifacts(sessionPath: string): Promise<void> {
+		this.#files.delete(sessionPath);
+		const artifactsPrefix = `${sessionPath.slice(0, -6)}/`;
+		for (const path of this.#files.keys()) {
+			if (path.startsWith(artifactsPrefix)) this.#files.delete(path);
+		}
 		return Promise.resolve();
 	}
 

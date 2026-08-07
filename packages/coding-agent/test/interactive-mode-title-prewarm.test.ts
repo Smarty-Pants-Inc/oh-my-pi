@@ -10,6 +10,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { tinyTitleClient } from "@oh-my-pi/pi-coding-agent/tiny/title-client";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 // Issue #6462: the first submit used to spawn the local tiny-title worker
 // synchronously ahead of the first frame, and title generation started before
@@ -64,6 +65,7 @@ describe("InteractiveMode tiny-title prewarm", () => {
 			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
 			settings: Settings.isolated(),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 		mode = new InteractiveMode(session, "test", undefined, () => {}, [], undefined, undefined);
 		// A real fs.watch on repo HEAD in a parallel Bun worker can trip a Bun

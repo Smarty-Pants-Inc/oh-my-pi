@@ -28,6 +28,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/task";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities.js";
 
 function makeSession(overrides: Partial<ObservableSession> & { id: string }): ObservableSession {
 	return {
@@ -266,6 +267,7 @@ describe("InteractiveMode subagent observer UI sync", () => {
 			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
 			settings: Settings.isolated({ "startup.quiet": true }),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 		mode = new InteractiveMode(session, "test", undefined, undefined, undefined, undefined, eventBus);
 	});

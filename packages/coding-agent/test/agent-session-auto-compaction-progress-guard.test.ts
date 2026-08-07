@@ -14,6 +14,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import type { CompactionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { getProjectAgentDir, TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 /**
  * Regression test for the auto-compaction thrash loop.
@@ -116,6 +117,7 @@ describe("AgentSession auto-compaction progress guard", () => {
 				"compaction.autoContinue": true,
 			}),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			extensionRunner,
 		});
 	});

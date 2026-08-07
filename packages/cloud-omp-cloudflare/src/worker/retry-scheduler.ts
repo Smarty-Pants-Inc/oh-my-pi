@@ -7,24 +7,30 @@ export { EXECUTIONS_TABLE, RETRY_INTENTS_TABLE, WORKSPACE_STATE_TABLE } from "./
 /** Owns the Durable Object's single alarm and always derives it from durable state. */
 export class WorkspaceAlarmCoordinator {
 	#tail: Promise<void> = Promise.resolve();
+	#now: () => number = Date.now;
 
 	constructor(
 		private readonly storage: SqlStorageLike,
 		private readonly store: WorkspaceStateStore,
 	) {}
 
-	rearm(): Promise<void> {
-		const run = this.#tail.then(() => this.#rearmNow());
+	setClock(now: () => number): void {
+		this.#now = now;
+	}
+
+	rearm(nowEpochMs: number = this.#now()): Promise<void> {
+		const run = this.#tail.then(() => this.#rearmNow(nowEpochMs));
 		this.#tail = run.catch(() => undefined);
 		return run;
 	}
 
-	async #rearmNow(): Promise<void> {
-		const alarmAt = this.store.alarmTarget();
-		if (alarmAt === undefined) {
+	async #rearmNow(nowEpochMs: number): Promise<void> {
+		const target = this.store.alarmTarget();
+		if (target === undefined) {
 			await this.storage.deleteAlarm();
 			return;
 		}
+		const alarmAt = Math.max(nowEpochMs, target);
 		const current = await this.storage.getAlarm?.();
 		if (current !== alarmAt) await this.storage.setAlarm(alarmAt);
 	}
@@ -44,9 +50,10 @@ export class SQLiteRetryScheduler implements SyncRetryScheduler {
 	async schedule(intent: SyncRetryIntent): Promise<void> {
 		if (
 			!intent.backend ||
-			!Number.isInteger(intent.attempt) ||
+			!Number.isSafeInteger(intent.attempt) ||
 			intent.attempt < 1 ||
-			!Number.isFinite(intent.notBefore)
+			!Number.isSafeInteger(intent.notBefore) ||
+			intent.notBefore < 0
 		) {
 			throw new Error("Invalid Workspace sync retry intent");
 		}

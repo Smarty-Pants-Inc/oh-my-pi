@@ -82,6 +82,7 @@ import {
 	persistForeignSession,
 } from "./session/foreign-session-import";
 import type { ForeignSessionInfo, ForeignSessionSource, ForeignSessionStore } from "./session/foreign-session-store";
+import type { SessionJournalService } from "./session/session-journal-contracts.js";
 import { resolveResumableSession, type SessionInfo } from "./session/session-listing";
 import { SessionManager } from "./session/session-manager";
 import { executeBuiltinSlashCommand } from "./slash-commands/builtin-registry";
@@ -1134,6 +1135,7 @@ interface RunRootCommandDependencies {
 	runAcpMode?: RunAcpMode;
 	createForeignSessionStore?: (source: ForeignSessionSource) => ForeignSessionStore;
 	settings?: Settings;
+	sessionJournal?: SessionJournalService;
 	forceSetupWizard?: boolean;
 }
 const DEFAULT_RUN_ROOT_DEPENDENCIES: RunRootCommandDependencies = {};
@@ -1486,6 +1488,7 @@ export async function runRootCommand(
 	sessionOptions.modelRegistry = modelRegistry;
 	sessionOptions.hasUI = isInteractive || mode === "rpc-ui";
 	sessionOptions.settings = settingsInstance;
+	if (deps.sessionJournal) sessionOptions.sessionJournal = deps.sessionJournal;
 
 	// OTEL: register global OTLP exporters when an endpoint is configured via
 	// env, then switch on the agent loop's telemetry hooks so traces, run-level

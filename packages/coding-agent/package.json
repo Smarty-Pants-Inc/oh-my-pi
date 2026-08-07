@@ -121,6 +121,19 @@
       "types": "./src/index.ts",
       "import": "./src/index.ts"
     },
+    "./sdk": {
+      "types": "./src/sdk.ts",
+      "import": "./src/sdk.ts"
+    },
+    "./registry/persistent-agent-contracts": {
+      "types": "./src/registry/persistent-agent-contracts.ts",
+      "import": "./src/registry/persistent-agent-contracts.ts"
+    },
+    "./registry/persistent-agent-lifecycle": {
+      "types": "./src/registry/persistent-agent-lifecycle.ts",
+      "import": "./src/registry/persistent-agent-lifecycle.ts"
+    },
+    "./registry/persistent-agent-store": null,
     "./*": {
       "types": "./src/*.ts",
       "import": "./src/*.ts"
@@ -232,6 +245,10 @@
     "./config/*": {
       "types": "./src/config/*.ts",
       "import": "./src/config/*.ts"
+    },
+    "./registry/*": {
+      "types": "./src/registry/*.ts",
+      "import": "./src/registry/*.ts"
     },
     "./dap": {
       "types": "./src/dap/index.ts",

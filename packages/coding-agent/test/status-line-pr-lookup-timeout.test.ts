@@ -110,11 +110,13 @@ describe("StatusLineComponent PR lookup timeout guard", () => {
 		}>();
 		const { promise: ghUnblock, resolve: releaseGh } = Promise.withResolvers<void>();
 
-		vi.spyOn(git.github, "run").mockImplementation(async (_cwd, args, signal) => {
-			markGhCalled({ args, signal });
-			await ghUnblock;
-			return { exitCode: 1, stdout: "", stderr: "" };
-		});
+		vi.spyOn(git.github, "run").mockImplementation(
+			async (_cwd: string, args: string[], signal: AbortSignal | undefined) => {
+				markGhCalled({ args, signal });
+				await ghUnblock;
+				return { exitCode: 1, stdout: "", stderr: "" };
+			},
+		);
 
 		const component = new StatusLineComponent(makeSession());
 		component.updateSettings(gitSegmentSettings);

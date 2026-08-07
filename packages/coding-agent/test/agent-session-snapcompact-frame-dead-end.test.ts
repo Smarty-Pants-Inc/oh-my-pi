@@ -14,6 +14,7 @@ import type { CompactionEntry } from "@oh-my-pi/pi-coding-agent/session/session-
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { getProjectAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import * as snapcompact from "@oh-my-pi/snapcompact";
+import { createTestRuntimeDependencies } from "./utilities";
 
 /**
  * Regression test for the snapcompact frame dead-end.
@@ -184,6 +185,7 @@ describe("AgentSession snapcompact frame dead-end rescue", () => {
 				"compaction.thresholdTokens": 60_000,
 			}),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			extensionRunner,
 		});
 	}

@@ -6,6 +6,7 @@ import { jsBackend, juliaBackend, pythonBackend, rubyBackend } from "../eval";
 import type { ExecutorBackend, ExecutorBackendResult } from "../eval/backend";
 import { EVAL_TIMEOUT_PAUSE_OP, EVAL_TIMEOUT_RESUME_OP } from "../eval/bridge-timeout";
 import { IdleTimeout } from "../eval/idle-timeout";
+import { createEvalAgentLifecycleV1 } from "../eval/lifecycle";
 import { defaultEvalSessionId } from "../eval/session-id";
 import type { EvalCellResult, EvalDisplayOutput, EvalLanguage, EvalStatusEvent, EvalToolDetails } from "../eval/types";
 import evalDescription from "../prompts/tools/eval.md" with { type: "text" };
@@ -390,7 +391,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 	}
 
 	async execute(
-		_toolCallId: string,
+		toolCallId: string,
 		params: typeof evalSchema.infer,
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback,
@@ -404,6 +405,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 			throw new ToolError("Eval tool requires a session when not using proxy executor");
 		}
 		const session = this.session;
+		const evalAgentLifecycle = createEvalAgentLifecycleV1(session, toolCallId, params);
 		const excludeWebP = webpExclusionForModel(session.getActiveModel?.());
 
 		const cellLanguage: EvalLanguage =
@@ -568,6 +570,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 							signal: combinedSignal,
 							session,
 							idleTimeoutMs,
+							evalAgentLifecycle,
 							reset: cell.reset,
 							onChunk: chunk => {
 								outputSink!.push(chunk);
@@ -739,7 +742,8 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 			}
 		})();
 
-		return await (session.trackEvalExecution?.(execution, sessionAbortController) ?? execution);
+		const trackedExecution = session.trackEvalExecution?.(execution, sessionAbortController) ?? execution;
+		return await evalAgentLifecycle.complete(await trackedExecution);
 	}
 }
 

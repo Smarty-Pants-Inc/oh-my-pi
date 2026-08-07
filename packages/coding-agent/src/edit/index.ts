@@ -1,4 +1,5 @@
-import { MismatchError as HashlineMismatchError } from "@oh-my-pi/hashline";
+import * as path from "node:path";
+import { MismatchError as HashlineMismatchError, Patch } from "@oh-my-pi/hashline";
 import hashlineGrammar from "@oh-my-pi/hashline/grammar.lark" with { type: "text" };
 import hashlineDescription from "@oh-my-pi/hashline/prompt.md" with { type: "text" };
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
@@ -10,15 +11,30 @@ import { getDiagnosticsLedger } from "../lsp/diagnostics-ledger";
 import applyPatchDescription from "../prompts/tools/apply-patch.md" with { type: "text" };
 import patchDescription from "../prompts/tools/patch.md" with { type: "text" };
 import replaceDescription from "../prompts/tools/replace.md" with { type: "text" };
+import {
+	canonicalRuntimeSha256,
+	deriveProviderSubrequestId,
+	type PersistentModelWorkspacePath,
+	type PersistentWorkspacePathMapper,
+	type WorkspaceOperationLease,
+} from "../session/workspace-runtime-contracts";
 import type { ToolSession } from "../tools";
 import { truncateForPrompt } from "../tools/approval";
 import { findUniqueWorkspaceSuffix, isInternalUrlPath } from "../tools/path-utils";
 import { resolvePlanPath } from "../tools/plan-mode-guard";
+import { ToolError } from "../tools/tool-errors";
 import { type EditMode, normalizeEditMode, resolveEditMode } from "../utils/edit-mode";
 import { executeHashlineSingle, hashlineEditParamsSchema } from "./hashline";
 import { type ApplyPatchParams, applyPatchSchema, expandApplyPatchToEntries } from "./modes/apply-patch";
 import applyPatchGrammar from "./modes/apply-patch.lark" with { type: "text" };
-import { executePatchSingle, type PatchEditEntry, type PatchParams, patchEditSchema } from "./modes/patch";
+import {
+	executePatchSingle,
+	type PatchEditEntry,
+	type PatchParams,
+	type PersistentEditMutation,
+	type PersistentEditMutationExecutor,
+	patchEditSchema,
+} from "./modes/patch";
 import { executeReplace, type ReplaceBatchParams, type ReplaceParams, replaceEditSchema } from "./modes/replace";
 import { type EditToolDetails, type EditToolPerFileResult, getLspBatchRequest, type LspBatchRequest } from "./renderer";
 import { pruneOversizedEditSnapshots } from "./snapshot-details";
@@ -48,6 +64,380 @@ type HashlineParams = typeof hashlineEditParamsSchema.infer;
 
 type EditParams = ReplaceParams | ReplaceBatchParams | PatchParams | HashlineParams | ApplyPatchParams;
 
+export interface PersistentEditRouteV1 {
+	readonly paths: PersistentWorkspacePathMapper;
+	begin(signal?: AbortSignal): Promise<WorkspaceOperationLease>;
+}
+
+function preparePersistentEditPaths(
+	route: PersistentEditRouteV1,
+	mode: EditMode,
+	params: EditParams,
+	session: ToolSession,
+): ReadonlyMap<string, PersistentModelWorkspacePath> {
+	const authoredPaths: string[] = [];
+	switch (mode) {
+		case "replace":
+			authoredPaths.push((params as ReplaceParams | ReplaceBatchParams).path);
+			break;
+		case "patch": {
+			const patchParams = params as PatchParams;
+			authoredPaths.push(patchParams.path);
+			for (const edit of patchParams.edits) {
+				if (edit.rename !== undefined) authoredPaths.push(edit.rename);
+			}
+			break;
+		}
+		case "apply_patch":
+			for (const entry of expandApplyPatchToEntries(params as ApplyPatchParams)) {
+				authoredPaths.push(entry.path);
+				if (entry.rename !== undefined) authoredPaths.push(entry.rename);
+			}
+			break;
+		case "hashline": {
+			const patch = Patch.parse((params as HashlineParams).input, { cwd: session.cwd });
+			if (patch.sections.length === 0) throw new ToolError("No hashline sections found in input.");
+			for (const section of patch.sections) {
+				authoredPaths.push(section.path);
+				const fileOp = section.fileOp;
+				if (fileOp?.kind === "move") authoredPaths.push(fileOp.dest);
+			}
+			break;
+		}
+		default: {
+			const unsupportedMode: never = mode;
+			throw new ToolError(`Unsupported persistent edit mode: ${unsupportedMode}`);
+		}
+	}
+
+	const admitted = new Map<string, PersistentModelWorkspacePath>();
+	for (const authoredPath of authoredPaths) {
+		let modelPath: PersistentModelWorkspacePath;
+		try {
+			modelPath = route.paths.parse(authoredPath).modelPath;
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			throw new ToolError(`Persistent edit path '${authoredPath}' is outside ${route.paths.modelRoot}: ${message}`);
+		}
+		if (modelPath === route.paths.modelRoot) {
+			throw new ToolError(`Persistent edits require file paths below ${route.paths.modelRoot}.`);
+		}
+		admitted.set(authoredPath, modelPath);
+		admitted.set(modelPath, modelPath);
+		let parentPath = path.posix.dirname(modelPath);
+		while (parentPath === route.paths.modelRoot || parentPath.startsWith(`${route.paths.modelRoot}/`)) {
+			admitted.set(parentPath, parentPath as PersistentModelWorkspacePath);
+			if (parentPath === route.paths.modelRoot) break;
+			parentPath = path.posix.dirname(parentPath);
+		}
+	}
+	return admitted;
+}
+
+class PersistentEditOperation implements PersistentEditMutationExecutor {
+	readonly modelRoot: string;
+	#ordinal = 0;
+	#plan: PersistentEditMutation[] = [];
+	#next = 0;
+
+	constructor(
+		private readonly lease: WorkspaceOperationLease,
+		private readonly paths: PersistentWorkspacePathMapper,
+		private readonly admittedPaths: ReadonlyMap<string, PersistentModelWorkspacePath>,
+	) {
+		this.modelRoot = paths.modelRoot;
+	}
+
+	modelPath(input: string): string {
+		const modelPath = this.admittedPaths.get(input);
+		if (!modelPath) throw new ToolError(`Persistent edit attempted to use an unadmitted path: ${input}`);
+		return modelPath;
+	}
+
+	#access() {
+		const { binding, operationLeaseId } = this.lease;
+		return {
+			operationLeaseId,
+			workspaceId: binding.lease.replica.workspaceId,
+			expectedGeneration: binding.lease.baseGeneration,
+			replicaId: binding.lease.replica.replicaId,
+			leaseId: binding.lease.leaseId,
+			fence: binding.fence,
+		};
+	}
+
+	async freeze(mutations: readonly PersistentEditMutation[]): Promise<void> {
+		if (this.#next !== this.#plan.length) {
+			throw new ToolError("Persistent edit mutation plan changed before completion.");
+		}
+		for (const mutation of mutations) {
+			switch (mutation.operation) {
+				case "write_text":
+					this.modelPath(mutation.path);
+					break;
+				case "mkdir":
+					this.modelPath(mutation.path);
+					if (!mutation.recursive) throw new ToolError("Persistent edit mkdir must be recursive.");
+					break;
+				case "remove":
+					this.modelPath(mutation.path);
+					if (mutation.recursive) throw new ToolError("Persistent edit remove must target one file.");
+					break;
+				case "rename":
+					this.modelPath(mutation.from);
+					this.modelPath(mutation.to);
+					break;
+				default: {
+					const unsupportedMutation: never = mutation;
+					throw new ToolError(`Unsupported persistent edit mutation: ${String(unsupportedMutation)}`);
+				}
+			}
+		}
+		this.#plan.push(...mutations);
+	}
+
+	#take(): PersistentEditMutation {
+		const mutation = this.#plan[this.#next++];
+		if (!mutation) throw new ToolError("Persistent edit attempted a mutation outside its frozen plan.");
+		return mutation;
+	}
+
+	async #identity(operation: string, tuple: readonly (string | number | boolean)[]) {
+		const access = this.#access();
+		const requestId = await deriveProviderSubrequestId({
+			workspaceId: access.workspaceId,
+			parentKind: "workspace_operation",
+			parentId: access.operationLeaseId,
+			ordinal: this.#ordinal++,
+			operation,
+		});
+		const requestSha256 = await canonicalRuntimeSha256([
+			"omp-runtime-request-v1",
+			operation,
+			access.operationLeaseId,
+			access.workspaceId,
+			access.expectedGeneration,
+			access.replicaId,
+			access.leaseId,
+			access.fence.fenceId,
+			...tuple,
+		]);
+		return { requestId, requestSha256 };
+	}
+
+	async read(input: string): Promise<string> {
+		const modelPath = this.modelPath(input) as PersistentModelWorkspacePath;
+		const result = await this.lease.binding.bridge.readTextFile({
+			...this.#access(),
+			path: modelPath,
+			line: null,
+			limit: null,
+			byteLimit: 2_097_152,
+		});
+		const returnedPath = this.paths.parseReturnedModelPath(result.path).modelPath;
+		const contentSha256 = new Bun.SHA256().update(result.content).digest("hex");
+		if (
+			returnedPath !== modelPath ||
+			result.sha256 !== contentSha256 ||
+			result.byteLength !== Buffer.byteLength(result.content, "utf8")
+		) {
+			throw new ToolError("Persistent runtime returned an invalid text read result.");
+		}
+		return result.content;
+	}
+
+	async readBinary(input: string): Promise<Uint8Array> {
+		const modelPath = this.modelPath(input) as PersistentModelWorkspacePath;
+		const result = await this.lease.binding.bridge.readBinaryFile({
+			...this.#access(),
+			path: modelPath,
+			offset: 0,
+			byteLimit: 2_097_152,
+		});
+		const returnedPath = this.paths.parseReturnedModelPath(result.path).modelPath;
+		const bytes = Buffer.from(result.contentBase64, "base64");
+		if (
+			returnedPath !== modelPath ||
+			result.truncated ||
+			result.byteLength !== bytes.byteLength ||
+			result.sha256 !== new Bun.SHA256().update(bytes).digest("hex")
+		) {
+			throw new ToolError("Persistent runtime returned an invalid binary read result.");
+		}
+		return bytes;
+	}
+
+	async exists(input: string): Promise<boolean> {
+		return this.lease.binding.bridge.exists({
+			...this.#access(),
+			path: this.modelPath(input) as PersistentModelWorkspacePath,
+		});
+	}
+
+	async #stat(input: string) {
+		const modelPath = this.modelPath(input) as PersistentModelWorkspacePath;
+		const result = await this.lease.binding.bridge.stat({ ...this.#access(), path: modelPath });
+		if (this.paths.parseReturnedModelPath(result.path).modelPath !== modelPath) {
+			throw new ToolError("Persistent runtime returned an invalid stat result.");
+		}
+		return result;
+	}
+
+	async write(input: string, content: string): Promise<void> {
+		const mutation = this.#take();
+		switch (mutation.operation) {
+			case "write_text": {
+				if (mutation.path !== input || mutation.content !== content) {
+					throw new ToolError("Persistent edit write diverged from its frozen plan.");
+				}
+				const modelPath = this.modelPath(input) as PersistentModelWorkspacePath;
+				const contentSha256 = new Bun.SHA256().update(content).digest("hex");
+				const byteLength = Buffer.byteLength(content, "utf8");
+				const identity = await this.#identity("write_text", [modelPath, contentSha256, byteLength]);
+				const result = await this.lease.binding.bridge.writeTextFile({
+					...this.#access(),
+					...identity,
+					path: modelPath,
+					content,
+					contentSha256,
+				});
+				if (
+					(result.status !== "written" && result.status !== "already_written") ||
+					result.path !== modelPath ||
+					result.sha256 !== contentSha256 ||
+					result.byteLength !== byteLength
+				) {
+					throw new ToolError("Persistent runtime returned an invalid write result.");
+				}
+				if ((await this.read(modelPath)) !== content) {
+					throw new ToolError("Persistent edit write verification failed.");
+				}
+				return;
+			}
+			case "mkdir":
+			case "remove":
+			case "rename":
+				break;
+			default: {
+				const unsupportedMutation: never = mutation;
+				throw new ToolError(`Unsupported persistent edit mutation: ${String(unsupportedMutation)}`);
+			}
+		}
+		throw new ToolError("Persistent edit attempted a write outside its frozen plan.");
+	}
+
+	async mkdir(input: string): Promise<void> {
+		const mutation = this.#take();
+		switch (mutation.operation) {
+			case "mkdir": {
+				if (mutation.path !== input || !mutation.recursive) {
+					throw new ToolError("Persistent edit mkdir diverged from its frozen plan.");
+				}
+				const modelPath = this.modelPath(input) as PersistentModelWorkspacePath;
+				const result = await this.lease.binding.bridge.mkdir({
+					...this.#access(),
+					...(await this.#identity("mkdir", [modelPath, true])),
+					path: modelPath,
+					recursive: true,
+				});
+				if (result.status !== "created" && result.status !== "already_exists") {
+					throw new ToolError("Persistent runtime returned an invalid mkdir result.");
+				}
+				if ((await this.#stat(modelPath)).kind !== "directory") {
+					throw new ToolError("Persistent edit mkdir verification failed.");
+				}
+				return;
+			}
+			case "write_text":
+			case "remove":
+			case "rename":
+				break;
+			default: {
+				const unsupportedMutation: never = mutation;
+				throw new ToolError(`Unsupported persistent edit mutation: ${String(unsupportedMutation)}`);
+			}
+		}
+		throw new ToolError("Persistent edit attempted a mkdir outside its frozen plan.");
+	}
+
+	async delete(input: string): Promise<void> {
+		const mutation = this.#take();
+		switch (mutation.operation) {
+			case "remove": {
+				if (mutation.path !== input || mutation.recursive) {
+					throw new ToolError("Persistent edit remove diverged from its frozen plan.");
+				}
+				const modelPath = this.modelPath(input) as PersistentModelWorkspacePath;
+				const result = await this.lease.binding.bridge.remove({
+					...this.#access(),
+					...(await this.#identity("remove", [modelPath, false])),
+					path: modelPath,
+					recursive: false,
+				});
+				if (result.status !== "removed" && result.status !== "already_absent") {
+					throw new ToolError("Persistent runtime returned an invalid remove result.");
+				}
+				if (await this.exists(modelPath)) {
+					throw new ToolError("Persistent edit remove verification failed.");
+				}
+				return;
+			}
+			case "write_text":
+			case "mkdir":
+			case "rename":
+				break;
+			default: {
+				const unsupportedMutation: never = mutation;
+				throw new ToolError(`Unsupported persistent edit mutation: ${String(unsupportedMutation)}`);
+			}
+		}
+		throw new ToolError("Persistent edit attempted a remove outside its frozen plan.");
+	}
+
+	async rename(from: string, to: string): Promise<void> {
+		const mutation = this.#take();
+		switch (mutation.operation) {
+			case "rename": {
+				if (mutation.from !== from || mutation.to !== to) {
+					throw new ToolError("Persistent edit rename diverged from its frozen plan.");
+				}
+				const source = this.modelPath(from) as PersistentModelWorkspacePath;
+				const destination = this.modelPath(to) as PersistentModelWorkspacePath;
+				const sourceStat = await this.#stat(source);
+				const result = await this.lease.binding.bridge.rename({
+					...this.#access(),
+					...(await this.#identity("rename", [source, destination])),
+					from: source,
+					to: destination,
+				});
+				if (result.status !== "renamed" && result.status !== "already_renamed") {
+					throw new ToolError("Persistent runtime returned an invalid rename result.");
+				}
+				const sourceStillExists = await this.exists(source);
+				const destinationStat = await this.#stat(destination);
+				if (
+					sourceStillExists ||
+					destinationStat.kind !== sourceStat.kind ||
+					destinationStat.byteLength !== sourceStat.byteLength ||
+					destinationStat.sha256 !== sourceStat.sha256
+				) {
+					throw new ToolError("Persistent edit rename verification failed.");
+				}
+				return;
+			}
+			case "write_text":
+			case "mkdir":
+			case "remove":
+				break;
+			default: {
+				const unsupportedMutation: never = mutation;
+				throw new ToolError(`Unsupported persistent edit mutation: ${String(unsupportedMutation)}`);
+			}
+		}
+		throw new ToolError("Persistent edit attempted a rename outside its frozen plan.");
+	}
+}
+
 type EditModeDefinition = {
 	description: (session: ToolSession) => string;
 	parameters: TInput;
@@ -58,6 +448,7 @@ type EditModeDefinition = {
 		signal: AbortSignal | undefined,
 		batchRequest: LspBatchRequest | undefined,
 		onUpdate?: (partialResult: AgentToolResult<EditToolDetails, TInput>) => void,
+		persistent?: PersistentEditMutationExecutor,
 	) => Promise<AgentToolResult<EditToolDetails, TInput>>;
 };
 
@@ -397,6 +788,7 @@ export class EditTool implements AgentTool<TInput> {
 	readonly #fuzzyThreshold: number;
 	readonly #writethrough: WritethroughCallback;
 	readonly #editMode?: EditMode;
+	readonly #persistentRoute?: PersistentEditRouteV1;
 	readonly #deferredDiagnostics: DeferredDiagnostics;
 
 	/**
@@ -409,7 +801,9 @@ export class EditTool implements AgentTool<TInput> {
 	constructor(
 		private readonly session: ToolSession,
 		mode?: EditMode,
+		persistentRoute?: PersistentEditRouteV1,
 	) {
+		this.#persistentRoute = persistentRoute;
 		const {
 			PI_EDIT_FUZZY: editFuzzy = "auto",
 			PI_EDIT_FUZZY_THRESHOLD: editFuzzyThreshold = "auto",
@@ -505,7 +899,17 @@ export class EditTool implements AgentTool<TInput> {
 		context?: AgentToolContext,
 	): Promise<AgentToolResult<EditToolDetails, TInput>> {
 		const modeDefinition = this.#getModeDefinition();
-		return modeDefinition.execute(this, params, signal, getLspBatchRequest(context?.toolCall), onUpdate);
+		if (!this.#persistentRoute) {
+			return modeDefinition.execute(this, params, signal, getLspBatchRequest(context?.toolCall), onUpdate);
+		}
+		const admittedPaths = preparePersistentEditPaths(this.#persistentRoute, this.mode, params, this.session);
+		const lease = await this.#persistentRoute.begin(signal);
+		try {
+			const operation = new PersistentEditOperation(lease, this.#persistentRoute.paths, admittedPaths);
+			return await modeDefinition.execute(this, params, signal, undefined, onUpdate, operation);
+		} finally {
+			lease.end();
+		}
 	}
 
 	#getModeDefinition(): EditModeDefinition {
@@ -552,12 +956,15 @@ export class EditTool implements AgentTool<TInput> {
 					signal: AbortSignal | undefined,
 					batchRequest: LspBatchRequest | undefined,
 					onUpdate?: (partialResult: AgentToolResult<EditToolDetails, TInput>) => void,
+					persistent?: PersistentEditMutationExecutor,
 				) => {
 					const { edits, path } = params as PatchParams;
-					const targetPath = await resolveEditPath(tool.session, path, {
-						mustExist: (edits[0]?.op ?? "update") !== "create",
-						signal,
-					});
+					const targetPath = persistent
+						? path
+						: await resolveEditPath(tool.session, path, {
+								mustExist: (edits[0]?.op ?? "update") !== "create",
+								signal,
+							});
 					const runs = (edits as PatchEditEntry[]).map(
 						entry => (br: LspBatchRequest | undefined) =>
 							executePatchSingle({
@@ -573,6 +980,7 @@ export class EditTool implements AgentTool<TInput> {
 								allowCreateOverwrite: true,
 								writethrough: tool.#writethrough,
 								beginDeferredDiagnosticsForPath: p => tool.#deferredDiagnostics.begin(p),
+								persistent,
 							}),
 					);
 					return executeSinglePathEntries(targetPath, runs, batchRequest, onUpdate, tool.session.cwd, signal);
@@ -595,6 +1003,7 @@ export class EditTool implements AgentTool<TInput> {
 					signal: AbortSignal | undefined,
 					batchRequest: LspBatchRequest | undefined,
 					onUpdate?: (partialResult: AgentToolResult<EditToolDetails, TInput>) => void,
+					persistent?: PersistentEditMutationExecutor,
 				) => {
 					const entries = expandApplyPatchToEntries(params as ApplyPatchParams);
 					// Resolve each authored path once per patch so paired hunks (e.g. delete
@@ -603,7 +1012,9 @@ export class EditTool implements AgentTool<TInput> {
 					const resolveOnce = (path: string, mustExist: boolean): Promise<string> => {
 						let pending = resolvedTargets.get(path);
 						if (!pending) {
-							pending = resolveEditPath(tool.session, path, { mustExist, signal });
+							pending = persistent
+								? Promise.resolve(path)
+								: resolveEditPath(tool.session, path, { mustExist, signal });
 							resolvedTargets.set(path, pending);
 						}
 						return pending;
@@ -624,6 +1035,7 @@ export class EditTool implements AgentTool<TInput> {
 									fuzzyThreshold: tool.#fuzzyThreshold,
 									writethrough: tool.#writethrough,
 									beginDeferredDiagnosticsForPath: p => tool.#deferredDiagnostics.begin(p),
+									persistent,
 								});
 							},
 						};
@@ -640,6 +1052,7 @@ export class EditTool implements AgentTool<TInput> {
 					signal: AbortSignal | undefined,
 					batchRequest: LspBatchRequest | undefined,
 					_onUpdate?: (partialResult: AgentToolResult<EditToolDetails, TInput>) => void,
+					persistent?: PersistentEditMutationExecutor,
 				) => {
 					const { input } = params as HashlineParams;
 					return executeHashlineSingle({
@@ -649,6 +1062,7 @@ export class EditTool implements AgentTool<TInput> {
 						batchRequest,
 						writethrough: tool.#writethrough,
 						beginDeferredDiagnosticsForPath: p => tool.#deferredDiagnostics.begin(p),
+						persistent,
 					});
 				},
 			},
@@ -661,6 +1075,7 @@ export class EditTool implements AgentTool<TInput> {
 					signal: AbortSignal | undefined,
 					batchRequest: LspBatchRequest | undefined,
 					onUpdate?: (partialResult: AgentToolResult<EditToolDetails, TInput>) => void,
+					persistent?: PersistentEditMutationExecutor,
 				) => {
 					// `edits` is the internal `ReplaceBatchParams` form only the Cursor
 					// exec bridge produces (multi-replacement `pi_edit` frames run as one
@@ -676,7 +1091,9 @@ export class EditTool implements AgentTool<TInput> {
 										replace_all: replaceParams.replace_all,
 									},
 								];
-					const targetPath = await resolveEditPath(tool.session, replaceParams.path, { mustExist: true, signal });
+					const targetPath = persistent
+						? replaceParams.path
+						: await resolveEditPath(tool.session, replaceParams.path, { mustExist: true, signal });
 					const runs = entries.map(
 						entry => (br: LspBatchRequest | undefined) =>
 							executeReplace({
@@ -689,6 +1106,7 @@ export class EditTool implements AgentTool<TInput> {
 								fuzzyThreshold: tool.#fuzzyThreshold,
 								writethrough: tool.#writethrough,
 								beginDeferredDiagnosticsForPath: p => tool.#deferredDiagnostics.begin(p),
+								persistent,
 							}),
 					);
 					return executeSinglePathEntries(targetPath, runs, batchRequest, onUpdate, tool.session.cwd, signal);

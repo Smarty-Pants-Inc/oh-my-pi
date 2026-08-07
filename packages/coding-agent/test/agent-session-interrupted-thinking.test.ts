@@ -19,6 +19,7 @@ import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-ent
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 const REASONING_TEXT = "I have partly reasoned through the implementation and should preserve this.";
 const VISIBLE_TEXT = "visible interrupted text";
@@ -133,11 +134,13 @@ describe("AgentSession interrupted thinking persistence", () => {
 		});
 		settings.setModelRole("default", `${model.provider}/${model.id}`);
 		const sessionManager = SessionManager.inMemory();
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
 		session = new AgentSession({
 			agent,
 			sessionManager,
 			settings,
-			modelRegistry: new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml")),
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			extensionRunner,
 		});
 		return { model, sessionManager, session };

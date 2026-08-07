@@ -28,6 +28,7 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
+import { createTestRuntimeDependencies } from "./utilities";
 
 // Mock stream that mimics AssistantMessageEventStream
 
@@ -114,6 +115,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			sessionManager,
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 
 		return session;
@@ -299,6 +301,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			sessionManager,
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 
 		const firstPrompt = session.prompt("First message");
@@ -377,7 +380,14 @@ describe("AgentSession concurrent prompt guard", () => {
 		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 
-		session = new AgentSession({ agent, sessionManager, settings, modelRegistry, extensionRunner });
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings,
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
+			extensionRunner,
+		});
 
 		await session.prompt("First message");
 		await session.waitForIdle();
@@ -448,7 +458,14 @@ describe("AgentSession concurrent prompt guard", () => {
 		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 
-		session = new AgentSession({ agent, sessionManager, settings, modelRegistry, extensionRunner });
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings,
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
+			extensionRunner,
+		});
 
 		await session.prompt("First message");
 		await session.waitForIdle();
@@ -492,7 +509,14 @@ describe("AgentSession concurrent prompt guard", () => {
 		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 
-		session = new AgentSession({ agent, sessionManager, settings, modelRegistry, extensionRunner });
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings,
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
+			extensionRunner,
+		});
 		vi.spyOn(session.goalRuntime, "onAgentEnd").mockImplementation(() => {
 			settleReached.resolve();
 			return settleGate.promise;
@@ -557,7 +581,14 @@ describe("AgentSession concurrent prompt guard", () => {
 		const extensionErrors: string[] = [];
 		extensionRunner.onError(error => extensionErrors.push(error.error));
 
-		session = new AgentSession({ agent, sessionManager, settings, modelRegistry, extensionRunner });
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings,
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
+			extensionRunner,
+		});
 
 		const promptPromise = session.prompt("First message");
 		await stopStarted.promise;
@@ -619,7 +650,14 @@ describe("AgentSession concurrent prompt guard", () => {
 		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 
-		session = new AgentSession({ agent, sessionManager, settings, modelRegistry, extensionRunner });
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings,
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
+			extensionRunner,
+		});
 
 		await session.prompt("First message");
 		await session.waitForIdle();
@@ -652,7 +690,14 @@ describe("AgentSession concurrent prompt guard", () => {
 		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 
-		session = new AgentSession({ agent, sessionManager, settings, modelRegistry, extensionRunner });
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings,
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
+			extensionRunner,
+		});
 
 		await session.prompt("First message");
 		await session.waitForIdle();
@@ -685,7 +730,14 @@ describe("AgentSession concurrent prompt guard", () => {
 		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 
-		session = new AgentSession({ agent, sessionManager, settings, modelRegistry, extensionRunner });
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings,
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
+			extensionRunner,
+		});
 
 		await session.prompt("First message");
 		await session.waitForIdle();
@@ -725,7 +777,14 @@ describe("AgentSession concurrent prompt guard", () => {
 		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 
-		session = new AgentSession({ agent, sessionManager, settings, modelRegistry, extensionRunner });
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings,
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
+			extensionRunner,
+		});
 		session.setClientBridge({
 			capabilities: {},
 			deferAgentInitiatedTurns: true,
@@ -775,6 +834,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			sessionManager,
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			extensionRunner,
 			agentKind: "sub",
 		});
@@ -813,6 +873,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			sessionManager,
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 
 		// First prompt completes
@@ -849,6 +910,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			sessionManager,
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 
 		await session.sendUserMessage("hello from session_start", { deliverAs: "followUp" });
@@ -883,7 +945,13 @@ describe("AgentSession concurrent prompt guard", () => {
 		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 
-		session = new AgentSession({ agent, sessionManager, settings, modelRegistry });
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings,
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
+		});
 
 		const observedIsStreamingAtAgentEnd: boolean[] = [];
 		const reentrantPromptResults: Array<"resolved" | { error: string }> = [];
@@ -930,7 +998,14 @@ describe("AgentSession concurrent prompt guard", () => {
 		authStorages.push(authStorage);
 		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
-		session = new AgentSession({ agent, sessionManager, settings, modelRegistry, extensionRunner });
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings,
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
+			extensionRunner,
+		});
 
 		const { promise: publicAgentEnd, resolve: onPublicAgentEnd } = Promise.withResolvers<void>();
 		session.subscribe(event => {
@@ -971,6 +1046,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			sessionManager,
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 		session.setClientBridge({
 			capabilities: {},
@@ -1046,6 +1122,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			sessionManager,
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			agentId: ownerId,
 			ownedAsyncJobManager: asyncJobManager,
 		});
@@ -1135,6 +1212,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			agentId: "acp-session-b",
 			asyncJobManager,
 		});
@@ -1143,6 +1221,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			agentId: "acp-session-a",
 			ownedAsyncJobManager: asyncJobManager,
 		});
@@ -1324,6 +1403,7 @@ describe("AgentSession TTSR resume gate", () => {
 			sessionManager,
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			ttsrManager,
 		});
 
@@ -1408,6 +1488,7 @@ describe("AgentSession TTSR resume gate", () => {
 			sessionManager,
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			ttsrManager,
 			extensionRunner,
 		});
@@ -1481,6 +1562,7 @@ describe("AgentSession TTSR resume gate", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			extensionRunner,
 		});
 
@@ -1584,7 +1666,14 @@ describe("AgentSession TTSR resume gate", () => {
 		authStorages.push(authStorage);
 		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
-		session = new AgentSession({ agent, sessionManager, settings, modelRegistry, ttsrManager });
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings,
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
+			ttsrManager,
+		});
 
 		await session.prompt("Write some Rust code");
 
@@ -1702,7 +1791,14 @@ describe("AgentSession TTSR resume gate", () => {
 		authStorages.push(authStorage);
 		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
-		session = new AgentSession({ agent, sessionManager, settings, modelRegistry, ttsrManager });
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings,
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
+			ttsrManager,
+		});
 
 		await session.prompt("Write some Rust code");
 
@@ -1773,7 +1869,14 @@ describe("AgentSession TTSR resume gate", () => {
 		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 
-		session = new AgentSession({ agent, sessionManager, settings, modelRegistry, ttsrManager });
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings,
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
+			ttsrManager,
+		});
 
 		await session.prompt("Write some Rust code");
 
@@ -1854,6 +1957,7 @@ describe("AgentSession TTSR resume gate", () => {
 			sessionManager,
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			ttsrManager,
 		});
 
@@ -1925,6 +2029,7 @@ describe("AgentSession TTSR resume gate", () => {
 			sessionManager,
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			ttsrManager,
 		});
 
@@ -2037,6 +2142,7 @@ describe("AgentSession TTSR resume gate", () => {
 			sessionManager,
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			ttsrManager,
 		});
 
@@ -2146,6 +2252,7 @@ describe("AgentSession TTSR resume gate", () => {
 			sessionManager,
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			ttsrManager,
 		});
 
@@ -2282,6 +2389,7 @@ describe("AgentSession TTSR resume gate", () => {
 			sessionManager,
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			ttsrManager,
 		});
 
@@ -2405,6 +2513,7 @@ describe("AgentSession TTSR resume gate", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false, "contextPromotion.enabled": true }),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			extensionRunner,
 		});
 

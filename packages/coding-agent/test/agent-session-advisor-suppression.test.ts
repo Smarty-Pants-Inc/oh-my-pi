@@ -31,6 +31,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { Snowflake, TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 interface MockYieldDetails {
 	status: "success";
@@ -116,7 +117,13 @@ describe("AgentSession advisor auto-resume suppression", () => {
 		authStorages.push(authStorage);
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 		const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
-		session = new AgentSession({ agent, sessionManager, settings, modelRegistry });
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings,
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
+		});
 		return { session, sessionManager, mock, streamStarted: started.promise };
 	}
 
@@ -212,6 +219,7 @@ describe("AgentSession advisor auto-resume suppression", () => {
 			sessionManager,
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			advisorTools: [],
 			advisorStreamFn: advisorMock.stream,
 			extensionRunner: extensionRunner as never,
@@ -624,7 +632,13 @@ describe("AgentSession advisor auto-resume suppression", () => {
 		authStorages.push(authStorage);
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 		const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
-		session = new AgentSession({ agent, sessionManager, settings, modelRegistry });
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings,
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
+		});
 		const msg: IrcMessage = { id: "m-yield", from: "peer", to: "me", body: "status?", ts: Date.now() };
 
 		const outcome = await session.deliverIrcMessage(msg);

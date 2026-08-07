@@ -3,15 +3,27 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { ToolPathWithSource } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools";
 import {
 	artifactsDirsFromRegistry,
 	resetRegisteredArtifactDirsForTests,
 } from "@oh-my-pi/pi-coding-agent/internal-urls/registry-helpers";
 import * as planHandoff from "@oh-my-pi/pi-coding-agent/plan-mode/plan-handoff";
 import type { ExecutionEnvironmentProvider } from "@oh-my-pi/pi-coding-agent/session/execution-environment";
+import type {
+	ConfidentialTransientTaskEnsureIsolationRequestV1,
+	TransientTaskPostTerminalCleanupEvidenceV1,
+	TransientTaskResultPublicationPrePendingInitializeRequestV1,
+} from "@oh-my-pi/pi-coding-agent/session/workspace-runtime-contracts";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
+import {
+	preflightTransientTaskResultlessRepresentabilityV1,
+	projectTransientTaskResultlessSourceV1,
+} from "@oh-my-pi/pi-coding-agent/task/executor";
+import type { TransientTaskIsolationSettlementV1 } from "@oh-my-pi/pi-coding-agent/task/isolation-runner";
 import * as isolationRunner from "@oh-my-pi/pi-coding-agent/task/isolation-runner";
+import { AgentOutputManager } from "@oh-my-pi/pi-coding-agent/task/output-manager";
 import {
 	ENVIRONMENT_SUBAGENT_RUNTIME_PROFILE,
 	subagentRuntimeAllows,
@@ -20,10 +32,16 @@ import {
 	buildStructuredSubagentRecoveryHint,
 	resolveEffectiveSubagentPolicy,
 	runStructuredSubagent,
-	StructuredSubagentError,
+	StructuredSubagentLifecycleFailure,
 	type StructuredSubagentRequest,
+	type StructuredSubagentTransientTaskRuntimeV1,
 } from "@oh-my-pi/pi-coding-agent/task/structured-subagent";
-import type { AgentDefinition, SingleResult } from "@oh-my-pi/pi-coding-agent/task/types";
+import {
+	type AgentDefinition,
+	MAX_OUTPUT_BYTES,
+	type SingleResult,
+	StructuredSubagentError,
+} from "@oh-my-pi/pi-coding-agent/task/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 
 const AGENT: AgentDefinition = {
@@ -42,7 +60,6 @@ function session(
 		maxDepth?: number;
 		isolationMode?: "none" | "worktree";
 		isolationApply?: boolean;
-		provider?: ExecutionEnvironmentProvider;
 		taskDepth?: number;
 	} = {},
 ): ToolSession {
@@ -59,9 +76,8 @@ function session(
 		taskDepth: options.taskDepth,
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
-		getPlanModeState: () => (options.planMode ? { enabled: true } : undefined),
-		getExecutionEnvironmentProvider: () => options.provider,
-	} as unknown as ToolSession;
+		getPlanModeState: () => (options.planMode ? { enabled: true, planFilePath: "/tmp/plan.md" } : undefined),
+	};
 }
 
 function request(overrides: Partial<StructuredSubagentRequest> = {}): StructuredSubagentRequest {
@@ -88,6 +104,120 @@ function result(): SingleResult {
 		durationMs: 1,
 		tokens: 0,
 		requests: 1,
+	};
+}
+
+const TASK_ID = "structured-subagent-task";
+const RUN_ID = "structured-subagent-run";
+const CREATE_ID = "structured-subagent-create";
+
+type ResultlessIsolationSettlementV1 = Extract<TransientTaskIsolationSettlementV1, { readonly result: null }>;
+
+function resultlessPreflight() {
+	const preflight = preflightTransientTaskResultlessRepresentabilityV1(0, "Worker", "worker", MAX_OUTPUT_BYTES);
+	if (preflight.status !== "accepted") throw new Error(preflight.toolResultText);
+	return preflight.preflight;
+}
+
+function terminalEvidence(outcome: "succeeded" | "failed"): TransientTaskPostTerminalCleanupEvidenceV1 {
+	return Object.freeze({
+		schemaVersion: 1,
+		taskId: TASK_ID,
+		runId: RUN_ID,
+		outcome,
+		evidenceId: `terminal-evidence-${outcome}`,
+	}) as TransientTaskPostTerminalCleanupEvidenceV1;
+}
+
+function transientTaskRuntime(
+	executionEnvironmentProvider: ExecutionEnvironmentProvider = {
+		acquire: async (): Promise<never> => {
+			throw new Error("Unexpected execution environment acquisition");
+		},
+	},
+): StructuredSubagentTransientTaskRuntimeV1 {
+	const preflight = resultlessPreflight();
+	const ensureRequest = {
+		preparation: {
+			creatorDescriptor: {
+				taskId: TASK_ID,
+				runId: RUN_ID,
+				createId: CREATE_ID,
+			},
+		},
+	} as ConfidentialTransientTaskEnsureIsolationRequestV1;
+	const initializePrePendingRequest = {
+		plan: {
+			resultTargetKey: {
+				schemaVersion: 1,
+				taskId: TASK_ID,
+				runId: RUN_ID,
+				createId: CREATE_ID,
+				resultPublicationId: "structured-subagent-publication",
+				resultPublicationTargetId: "structured-subagent-target",
+				resultPublicationTargetCleanupId: "structured-subagent-target-cleanup",
+			},
+			resultlessIdentity: preflight.identity,
+			maximumUtf8ByteLength: preflight.maximumUtf8ByteLength,
+			representabilityPreflight: preflight,
+		},
+	} as TransientTaskResultPublicationPrePendingInitializeRequestV1;
+	const unexpectedLifecycleCall = async (): Promise<never> => {
+		throw new Error("Unexpected lifecycle call from mocked isolation runner");
+	};
+	const fail: StructuredSubagentTransientTaskRuntimeV1["fail"] = async input => ({
+		terminalSource:
+			input.phase === "before_bind"
+				? projectTransientTaskResultlessSourceV1(preflight, "failed", input.source)
+				: input.projection,
+		mergeSummary: "Isolation failed before binding.",
+		changesApplied: null,
+		terminalEvidence: terminalEvidence("failed"),
+	});
+	return Object.freeze({
+		taskId: TASK_ID,
+		runId: RUN_ID,
+		createId: CREATE_ID,
+		executionEnvironmentProvider,
+		materializer: { ensureIsolation: unexpectedLifecycleCall },
+		ensureRequest,
+		initializePrePendingRequest,
+		fail,
+		finalized: unexpectedLifecycleCall,
+		isolationReady: unexpectedLifecycleCall,
+		releaseExecutionEnvironment: unexpectedLifecycleCall,
+		finalizeAfterPending: unexpectedLifecycleCall,
+	});
+}
+
+function isolatedSettlement(
+	completed: SingleResult = result(),
+	overrides: Partial<Pick<TransientTaskIsolationSettlementV1, "mergeSummary" | "changesApplied">> = {},
+): TransientTaskIsolationSettlementV1 {
+	return {
+		result: completed,
+		mergeSummary: overrides.mergeSummary ?? "",
+		changesApplied: overrides.changesApplied === undefined ? true : overrides.changesApplied,
+		terminalEvidence: terminalEvidence(
+			completed.exitCode === 0 && completed.error === undefined && completed.aborted !== true
+				? "succeeded"
+				: "failed",
+		),
+	};
+}
+
+function resultlessIsolationSettlement(error: unknown): ResultlessIsolationSettlementV1 {
+	return {
+		result: null,
+		terminalProjection: projectTransientTaskResultlessSourceV1(resultlessPreflight(), "failed", {
+			kind: "caught_value",
+			caughtAt: "runtime",
+			value: error,
+		}),
+		error,
+		mergeSummary: "Isolation failed before capture.",
+		changesApplied: null,
+		terminalEvidence: terminalEvidence("failed"),
 	};
 }
 
@@ -175,21 +305,28 @@ describe("structured subagent primitive", () => {
 		expect(discover).not.toHaveBeenCalled();
 	});
 
-	it("rejects every unsupported environment request before worktree creation or provider acquisition", async () => {
+	it("rejects unsupported environment requests before isolation dispatch or lifecycle provider acquisition", async () => {
 		const provider = {
 			acquire: vi.fn(async () => {
 				throw new Error("provider acquisition must not run during rejected preflight");
 			}),
 		} satisfies ExecutionEnvironmentProvider;
-		mockDiscovery();
-		const prepare = vi.spyOn(isolationRunner, "prepareIsolationContext");
+		const runtime = transientTaskRuntime(provider);
+		const blockingAgent: AgentDefinition = { ...AGENT, blocking: true };
+		const nonblockingAgent: AgentDefinition = { ...AGENT, name: "nonblocking" };
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+			agents: [blockingAgent, nonblockingAgent],
+			projectAgentsDir: null,
+		});
+		const isolatedRun = vi.spyOn(isolationRunner, "runIsolatedSubprocess");
 		const candidates: Array<{ candidate: StructuredSubagentRequest; message: string }> = [
 			{
 				candidate: request({
-					session: session({ isolationMode: "worktree", provider }),
+					session: session({ isolationMode: "worktree" }),
 					invocationKind: "eval",
 					isolation: { requested: true },
 					execution: "environment",
+					transientTaskRuntime: runtime,
 				}),
 				message: "only available to task invocations",
 			},
@@ -199,42 +336,51 @@ describe("structured subagent primitive", () => {
 					isolation: { requested: true },
 					execution: "environment",
 				}),
-				message: "requires a registered execution environment provider",
+				message: "requires exact taskId/runId/createId authority",
 			},
 			{
-				candidate: request({ session: session({ isolationMode: "worktree", provider }), execution: "environment" }),
+				candidate: request({
+					session: session({ isolationMode: "worktree" }),
+					execution: "environment",
+					transientTaskRuntime: runtime,
+				}),
 				message: "requires explicit `isolated: true`",
 			},
 			{
 				candidate: request({
-					session: session({ planMode: true, isolationMode: "worktree", provider }),
+					session: session({ planMode: true, isolationMode: "worktree" }),
 					isolation: { requested: true },
 					execution: "environment",
+					transientTaskRuntime: runtime,
 				}),
 				message: "unavailable in plan mode",
 			},
 			{
 				candidate: request({
-					session: session({ isolationMode: "worktree", provider, taskDepth: 1 }),
+					session: session({ isolationMode: "worktree", taskDepth: 1 }),
 					isolation: { requested: true },
 					execution: "environment",
+					transientTaskRuntime: runtime,
 				}),
 				message: "only available at task depth 0",
 			},
 			{
 				candidate: request({
-					session: session({ isolationMode: "worktree", provider }),
+					session: session({ isolationMode: "worktree" }),
 					isolation: { requested: true },
 					execution: "environment",
 					detached: true,
+					transientTaskRuntime: runtime,
 				}),
 				message: "must be blocking, not detached",
 			},
 			{
 				candidate: request({
-					session: session({ isolationMode: "worktree", provider }),
+					session: session({ isolationMode: "worktree" }),
+					agent: "nonblocking",
 					isolation: { requested: true },
 					execution: "environment",
+					transientTaskRuntime: runtime,
 				}),
 				message: "requires a blocking agent",
 			},
@@ -243,7 +389,7 @@ describe("structured subagent primitive", () => {
 		for (const { candidate, message } of candidates) {
 			await expect(runStructuredSubagent(candidate)).rejects.toThrow(message);
 		}
-		expect(prepare).not.toHaveBeenCalled();
+		expect(isolatedRun).not.toHaveBeenCalled();
 		expect(provider.acquire).not.toHaveBeenCalled();
 	});
 
@@ -264,7 +410,6 @@ describe("structured subagent primitive", () => {
 		const environmentSession = session({
 			isolationMode: "worktree",
 			isolationApply: false,
-			provider,
 		});
 		Object.assign(environmentSession, {
 			enableMCP: true,
@@ -286,17 +431,22 @@ describe("structured subagent primitive", () => {
 		expect(policy.effectiveAgent.prewalk).toBeUndefined();
 		expect(policy.runtimeProfile).toBe(ENVIRONMENT_SUBAGENT_RUNTIME_PROFILE);
 
-		vi.spyOn(isolationRunner, "prepareIsolationContext").mockResolvedValue({ repoRoot: "/tmp" } as never);
 		let isolatedOptions: Parameters<typeof isolationRunner.runIsolatedSubprocess>[0] | undefined;
+		const settlement = isolatedSettlement(result(), {
+			mergeSummary: "Environment changes captured without applying.",
+			changesApplied: false,
+		});
 		vi.spyOn(isolationRunner, "runIsolatedSubprocess").mockImplementation(async options => {
 			isolatedOptions = options;
-			return result();
+			return settlement;
 		});
 		const settled = await runStructuredSubagent(
 			request({
 				session: environmentSession,
 				isolation: { requested: true },
 				execution: "environment",
+				identity: { id: "Worker" },
+				transientTaskRuntime: transientTaskRuntime(provider),
 			}),
 		);
 
@@ -308,6 +458,9 @@ describe("structured subagent primitive", () => {
 		expect(isolatedOptions?.baseOptions.mcpManager).toBeUndefined();
 		expect(isolatedOptions?.baseOptions.parentEvalSessionId).toBeUndefined();
 		expect(isolatedOptions?.baseOptions.executionEnvironment).toBeUndefined();
+		expect(settled.mergeSummary).toBe("Environment changes captured without applying.");
+		expect(settled.changesApplied).toBe(false);
+		expect(settled.terminalEvidence).toBe(settlement.terminalEvidence);
 		expect(provider.acquire).not.toHaveBeenCalled();
 		await fs.rm(settled.artifactsDir, { recursive: true, force: true });
 	});
@@ -411,15 +564,39 @@ describe("structured subagent primitive", () => {
 		await fs.rm(artifactsDir, { recursive: true, force: true });
 	});
 
-	it("cleans ephemeral artifacts when isolation setup fails without recovery", async () => {
+	it("cleans ephemeral artifacts after a resultless isolation lifecycle failure", async () => {
 		mockDiscovery();
-		vi.spyOn(isolationRunner, "prepareIsolationContext").mockRejectedValue(new Error("not a repository"));
+		const isolationError = new Error("not a repository");
+		const settlement = resultlessIsolationSettlement(isolationError);
+		vi.spyOn(isolationRunner, "runIsolatedSubprocess").mockResolvedValue(settlement);
 
-		await expect(
-			runStructuredSubagent(
-				request({ session: session({ isolationMode: "worktree" }), isolation: { requested: true } }),
-			),
-		).rejects.toThrow("Isolated subagent execution requires a git repository");
+		let caught: unknown;
+		try {
+			await runStructuredSubagent(
+				request({
+					session: session({ isolationMode: "worktree" }),
+					isolation: { requested: true },
+					identity: { id: "Worker" },
+					transientTaskRuntime: transientTaskRuntime(),
+				}),
+			);
+		} catch (error) {
+			caught = error;
+		}
+		expect(caught).toBeInstanceOf(StructuredSubagentLifecycleFailure);
+		if (!(caught instanceof StructuredSubagentLifecycleFailure)) throw caught;
+		expect(caught.message).toBe("not a repository");
+		expect(caught.result).toBeNull();
+		expect(caught.terminalProjection).toBe(settlement.terminalProjection);
+		expect(caught.terminalProjection?.document.error).toEqual({
+			code: "runtime_interrupted_before_result",
+			source: "runtime",
+			structuredSubagentKind: null,
+			sourceMessage: "not a repository",
+		});
+		expect(caught.mergeSummary).toBe("Isolation failed before capture.");
+		expect(caught.changesApplied).toBeNull();
+		expect(caught.terminalEvidence).toBe(settlement.terminalEvidence);
 		expect(artifactsDirsFromRegistry()).toEqual([]);
 	});
 
@@ -450,9 +627,9 @@ describe("structured subagent primitive", () => {
 		mockDiscovery();
 		const mcpManager = {} as NonNullable<ToolSession["mcpManager"]>;
 		const extensionPaths = ["/plugins/example.ts"];
-		const customToolPaths = [{ path: "/tools/example.ts", source: "project" }] as unknown as NonNullable<
-			ToolSession["customToolPaths"]
-		>;
+		const customToolPaths: ToolPathWithSource[] = [
+			{ path: "/tools/example.ts", source: { provider: "test", providerName: "Test", level: "project" } },
+		];
 		const planSession = session({ planMode: true });
 		Object.assign(planSession, { mcpManager, extensionPaths, customToolPaths });
 		const nonPlanSession = session();
@@ -514,24 +691,20 @@ describe("structured subagent primitive", () => {
 		await fs.rm(restrictedRun.artifactsDir, { recursive: true, force: true });
 	});
 
-	it("unregisters and removes a temporary lease when output ID allocation fails", async () => {
+	it("does not allocate a temporary lease when output ID allocation fails", async () => {
 		mockDiscovery();
 		const failingSession = session();
-		failingSession.agentOutputManager = {
-			allocate: async () => {
-				throw new Error("allocate failed");
-			},
-		} as unknown as ToolSession["agentOutputManager"];
+		const outputManager = new AgentOutputManager(() => null);
+		vi.spyOn(outputManager, "allocate").mockRejectedValue(new Error("allocate failed"));
+		failingSession.agentOutputManager = outputManager;
 		const remove = vi.spyOn(fs, "rm");
 
 		await expect(runStructuredSubagent(request({ session: failingSession }))).rejects.toThrow(
 			"Subagent execution failed: allocate failed",
 		);
 
-		const artifactsDir = remove.mock.calls[0]?.[0];
-		expect(typeof artifactsDir).toBe("string");
+		expect(remove).not.toHaveBeenCalled();
 		expect(artifactsDirsFromRegistry()).toEqual([]);
-		await expect(fs.stat(artifactsDir as string)).rejects.toThrow();
 	});
 
 	it("unregisters and removes a temporary lease when plan reference loading fails", async () => {
@@ -564,16 +737,29 @@ describe("structured subagent primitive", () => {
 	it("retains isolated failure artifacts needed for recovery", async () => {
 		mockDiscovery();
 		let artifactsDir: string | undefined;
-		vi.spyOn(isolationRunner, "prepareIsolationContext").mockResolvedValue({ repoRoot: "/tmp" } as never);
+		const completed = { ...result(), exitCode: 1, error: "agent failed", patchPath: "/recovery/Worker.patch" };
+		const settlement = isolatedSettlement(completed, {
+			mergeSummary: "Failed changes captured at /recovery/Worker.patch.",
+			changesApplied: false,
+		});
 		vi.spyOn(isolationRunner, "runIsolatedSubprocess").mockImplementation(async ({ baseOptions }) => {
 			artifactsDir = baseOptions.artifactsDir;
-			return { ...result(), exitCode: 1, error: "agent failed", patchPath: "/recovery/Worker.patch" };
+			return settlement;
 		});
 
 		const settled = await runStructuredSubagent(
-			request({ session: session({ isolationMode: "worktree" }), isolation: { requested: true } }),
+			request({
+				session: session({ isolationMode: "worktree" }),
+				isolation: { requested: true },
+				identity: { id: "Worker" },
+				transientTaskRuntime: transientTaskRuntime(),
+			}),
 		);
 
+		expect(settled.result).toBe(completed);
+		expect(settled.mergeSummary).toContain("/recovery/Worker.patch");
+		expect(settled.changesApplied).toBe(false);
+		expect(settled.terminalEvidence).toBe(settlement.terminalEvidence);
 		expect(artifactsDirsFromRegistry()).toContain(settled.artifactsDir);
 		expect(await fs.stat(artifactsDir ?? "")).toBeDefined();
 		await fs.rm(settled.artifactsDir, { recursive: true, force: true });
@@ -607,23 +793,29 @@ describe("structured subagent primitive", () => {
 	it("retains successful isolated task artifacts when auto-apply is disabled", async () => {
 		mockDiscovery();
 		let artifactsDir: string | undefined;
-		vi.spyOn(isolationRunner, "prepareIsolationContext").mockResolvedValue({ repoRoot: "/tmp" } as never);
+		const completed = { ...result(), patchPath: "/recovery/Worker.patch" };
+		const settlement = isolatedSettlement(completed, {
+			mergeSummary: "Changes captured at /recovery/Worker.patch without applying them.",
+			changesApplied: false,
+		});
 		vi.spyOn(isolationRunner, "runIsolatedSubprocess").mockImplementation(async ({ baseOptions }) => {
 			artifactsDir = baseOptions.artifactsDir;
-			return { ...result(), patchPath: "/recovery/Worker.patch" };
+			return settlement;
 		});
-		const merge = vi.spyOn(isolationRunner, "mergeIsolatedChanges");
 
 		const settled = await runStructuredSubagent(
 			request({
 				session: session({ isolationMode: "worktree", isolationApply: false }),
 				isolation: { requested: true },
+				identity: { id: "Worker" },
+				transientTaskRuntime: transientTaskRuntime(),
 			}),
 		);
 
-		expect(merge).not.toHaveBeenCalled();
-		expect(settled.changesApplied).toBeNull();
-		expect(settled.mergeSummary).toContain("/recovery/Worker.patch");
+		expect(settled.result).toBe(completed);
+		expect(settled.changesApplied).toBe(false);
+		expect(settled.mergeSummary).toBe("Changes captured at /recovery/Worker.patch without applying them.");
+		expect(settled.terminalEvidence).toBe(settlement.terminalEvidence);
 		expect(artifactsDirsFromRegistry()).toContain(settled.artifactsDir);
 		expect(await fs.stat(artifactsDir ?? "")).toBeDefined();
 		await fs.rm(settled.artifactsDir, { recursive: true, force: true });

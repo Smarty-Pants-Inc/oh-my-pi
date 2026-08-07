@@ -24,6 +24,7 @@ import { VIBE_TOOL_NAMES } from "@oh-my-pi/pi-coding-agent/tools/vibe";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { VibeSessionRegistry } from "@oh-my-pi/pi-coding-agent/vibe/runtime";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 function stubTool(name: string): AgentTool {
 	return {
@@ -118,6 +119,7 @@ describe("InteractiveMode vibe mode toggle", () => {
 			sessionManager: SessionManager.create(tempDir.path(), tempDir.path(), storage),
 			settings: Settings.isolated({}),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			toolRegistry: new Map(registryTools.map(tool => [tool.name, tool])),
 			builtInToolNames: registryTools.map(tool => tool.name),
 			createVibeTools: () => VIBE_TOOL_NAMES.map(stubTool),
@@ -180,6 +182,7 @@ describe("InteractiveMode vibe mode toggle", () => {
 			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
 			settings: Settings.isolated({}),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			toolRegistry: new Map(["read", "todo"].map(name => [name, stubTool(name)])),
 			builtInToolNames: ["read"],
 			createVibeTools: () => VIBE_TOOL_NAMES.map(stubTool),

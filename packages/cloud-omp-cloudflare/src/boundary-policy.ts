@@ -183,9 +183,21 @@ export function classifySynchronizedRelativePath(value: unknown): SynchronizedPa
 	return canonical;
 }
 
-/** Tests that an untrusted JSON value has exactly the required own enumerable keys. */
+/** Tests that an untrusted JSON value is a plain record with exactly the required own data fields. */
 export function hasExactObjectKeys(value: unknown, expectedKeys: readonly string[]): value is Record<string, unknown> {
 	if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
-	const actualKeys = Object.keys(value);
-	return actualKeys.length === expectedKeys.length && actualKeys.every(key => expectedKeys.includes(key));
+	try {
+		const prototype = Object.getPrototypeOf(value);
+		if (prototype !== Object.prototype && prototype !== null) return false;
+		const actualKeys = Reflect.ownKeys(value);
+		if (actualKeys.length !== expectedKeys.length) return false;
+		const descriptors = Object.getOwnPropertyDescriptors(value);
+		return actualKeys.every(key => {
+			if (typeof key !== "string" || !expectedKeys.includes(key)) return false;
+			const descriptor = descriptors[key];
+			return descriptor?.enumerable === true && "value" in descriptor;
+		});
+	} catch {
+		return false;
+	}
 }

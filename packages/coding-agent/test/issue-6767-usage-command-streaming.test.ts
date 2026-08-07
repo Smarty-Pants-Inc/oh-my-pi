@@ -13,6 +13,7 @@ import { HistoryStorage } from "@oh-my-pi/pi-coding-agent/session/history-storag
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { Text } from "@oh-my-pi/pi-tui";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities.js";
 
 const usageReports: UsageReport[] = [
 	{
@@ -64,6 +65,7 @@ describe("issue #6767 /usage output during streaming", () => {
 			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
 			settings: Settings.isolated(),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 		streaming = true;
 		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => streaming });

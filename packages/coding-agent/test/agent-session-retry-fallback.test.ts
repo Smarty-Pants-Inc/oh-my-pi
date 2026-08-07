@@ -26,6 +26,7 @@ import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 type AutoRetryStartEvent = Extract<AgentSessionEvent, { type: "auto_retry_start" }>;
 type AutoRetryEndEvent = Extract<AgentSessionEvent, { type: "auto_retry_end" }>;
@@ -181,6 +182,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 
@@ -303,6 +305,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 		session.setUsageFallbackConfirmer(confirmFallback);
@@ -360,6 +363,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 		session.setUsageFallbackConfirmer(confirmFallback);
@@ -433,6 +437,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 
@@ -474,6 +479,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 
@@ -532,6 +538,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 			initialRetryFallback: {
 				role: "slow",
@@ -608,6 +615,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 			advisorTools: [],
 			advisorConfigs: [{ name: "fallback-test", model: advisorPrimarySelector }],
@@ -724,6 +732,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 			advisorTools: [],
 			advisorStreamFn: advisorMock.stream,
@@ -781,6 +790,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 
@@ -835,6 +845,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 
@@ -907,6 +918,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 		const { retryStartEvents, retryEndEvents } = trackRetryEvents(session);
@@ -955,6 +967,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 
@@ -1026,6 +1039,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 
@@ -1098,6 +1112,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 
@@ -1142,6 +1157,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 
@@ -1196,6 +1212,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 
@@ -1250,6 +1267,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 
@@ -1303,6 +1321,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 
@@ -1392,6 +1411,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 		session.subscribe(event => {
@@ -1508,6 +1528,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 			extensionRunner,
 		});
@@ -1577,6 +1598,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 
@@ -1661,6 +1683,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 		session.subscribe(event => {
@@ -1755,6 +1778,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 		const { retryStartEvents, retryEndEvents } = trackRetryEvents(session);
@@ -1815,6 +1839,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
@@ -1881,6 +1906,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
@@ -1957,6 +1983,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 		const { retryStartEvents, retryEndEvents } = trackRetryEvents(session);
@@ -2015,6 +2042,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 		const { retryStartEvents, retryEndEvents } = trackRetryEvents(session);
@@ -2074,6 +2102,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 		const { retryStartEvents, retryEndEvents } = trackRetryEvents(session);
@@ -2139,6 +2168,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 		session.subscribe(event => {
@@ -2220,6 +2250,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 		session.subscribe(event => {
@@ -2290,6 +2321,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 		const { retryStartEvents, retryEndEvents } = trackRetryEvents(session);
@@ -2355,6 +2387,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 		const { retryStartEvents } = trackRetryEvents(session);
@@ -2423,6 +2456,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 		const { retryStartEvents, retryEndEvents } = trackRetryEvents(session);
@@ -2477,6 +2511,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
@@ -2560,6 +2595,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 
@@ -2616,6 +2652,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 
@@ -2652,6 +2689,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 		let now = Date.now();
@@ -2746,6 +2784,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 		let now = Date.now();
@@ -2796,6 +2835,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 			thinkingLevel: Effort.High,
 		});
@@ -2851,6 +2891,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 			thinkingLevel: Effort.Low,
 			// Per-spawn cap (task.maxEffort resolved at spawn time): no recovery
@@ -2907,6 +2948,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 
@@ -2939,6 +2981,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 
@@ -3012,6 +3055,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 		const { retryStartEvents, retryEndEvents } = trackRetryEvents(session);
@@ -3070,6 +3114,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 		const { retryStartEvents, retryEndEvents } = trackRetryEvents(session);
@@ -3136,6 +3181,7 @@ describe("AgentSession retry fallback", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 		const { retryStartEvents, retryEndEvents } = trackRetryEvents(session);

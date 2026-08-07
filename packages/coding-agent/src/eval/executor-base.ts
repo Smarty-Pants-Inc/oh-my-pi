@@ -5,6 +5,7 @@ import type { ToolSession } from "../tools";
 import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../tools/output-meta";
 import { EVAL_TIMEOUT_PAUSE_OP, EVAL_TIMEOUT_RESUME_OP, isEvalTimeoutControlEvent } from "./bridge-timeout";
 import type { JsStatusEvent } from "./js/shared/types";
+import type { EvalAgentLifecycleContextV1 } from "./lifecycle";
 import type { KernelDisplayOutput } from "./py/display";
 import { registerPyToolBridge } from "./py/tool-bridge";
 
@@ -33,6 +34,7 @@ export interface KernelExecutorBaseOptions {
 	emitStatus?: (event: JsStatusEvent) => void;
 	toolSession?: ToolSession;
 	bridgeSessionId?: string;
+	evalAgentLifecycle?: EvalAgentLifecycleContextV1;
 	artifactId?: string;
 	artifactPath?: string;
 }
@@ -450,6 +452,8 @@ export async function executeWithKernelBase<
 		options?.toolSession && options?.bridgeSessionId
 			? registerPyToolBridge(options.bridgeSessionId, runId, {
 					toolSession: options.toolSession,
+					evalAgentLifecycle: options.evalAgentLifecycle,
+					bridgeCallKeyPrefix: runIdPrefix,
 					signal: options.signal,
 					shieldedSignal: abortShield.signal,
 					emitStatus,
@@ -555,8 +559,9 @@ export async function executeWithKernelBase<
 		logger.error(`${errorLogLabel} execution failed`, { error: error.message });
 		throw error;
 	} finally {
+		await unregisterBridge?.drain();
+		unregisterBridge?.unregister();
 		await sink.dispose();
-		unregisterBridge?.();
 		abortShield.dispose?.();
 	}
 }

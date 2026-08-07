@@ -13,6 +13,7 @@ import type { TodoPhase } from "@oh-my-pi/pi-coding-agent/tools/todo";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import type { NativeScrollbackLiveRegion } from "@oh-my-pi/pi-tui";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 function renderTodos(mode: InteractiveMode): string {
 	return Bun.stripANSI(mode.todoContainer.render(120).join("\n"));
@@ -68,6 +69,7 @@ describe("InteractiveMode todo HUD persistence", () => {
 			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
 			settings: Settings.isolated({ "tasks.todoClearDelay": todoClearDelay }),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 		mode = new InteractiveMode(session, "test", undefined, undefined, undefined, undefined, eventBus);
 	}
@@ -208,6 +210,7 @@ describe("InteractiveMode todo HUD anchor", () => {
 			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
 			settings: Settings.isolated({}),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 		mode = new InteractiveMode(session, "test");
 	});

@@ -19,6 +19,7 @@ import { createAcpSessionFactory } from "@oh-my-pi/pi-coding-agent/main";
 import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { WorkspaceRuntimeProviderRegistry } from "@oh-my-pi/pi-coding-agent/session/workspace-provider-registry";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 describe("createAcpSessionFactory MCP isolation (issue #1234)", () => {
@@ -35,6 +36,7 @@ describe("createAcpSessionFactory MCP isolation (issue #1234)", () => {
 				captured.push(options);
 				return {
 					session: fakeSession,
+					runtimeProviderRegistry: new WorkspaceRuntimeProviderRegistry(),
 					extensionsResult: {
 						extensions: [],
 						errors: [],
@@ -94,6 +96,7 @@ describe("createAcpSessionFactory TITLE_SYSTEM.md per-cwd resolution (PR #3736)"
 				captured.push(options);
 				return {
 					session: fakeSession,
+					runtimeProviderRegistry: new WorkspaceRuntimeProviderRegistry(),
 					extensionsResult: {
 						extensions: [],
 						errors: [],

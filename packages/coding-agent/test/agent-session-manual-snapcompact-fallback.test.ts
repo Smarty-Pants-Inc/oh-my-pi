@@ -10,6 +10,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 /**
  * Regression for issue #5064.
@@ -90,7 +91,13 @@ describe("AgentSession manual snapcompact text-only fallback", () => {
 			"compaction.strategy": "snapcompact",
 			"compaction.keepRecentTokens": 1,
 		});
-		session = new AgentSession({ agent, sessionManager, settings, modelRegistry });
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings,
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
+		});
 		const notices: string[] = [];
 		session.subscribe(event => {
 			if (event.type === "notice" && event.source === "compaction") notices.push(event.message);

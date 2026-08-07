@@ -12,6 +12,10 @@ import { prompt } from "@oh-my-pi/pi-utils";
 import type { AsyncJob } from "../async";
 import asyncResultTemplate from "../prompts/tools/async-result.md" with { type: "text" };
 import type { CustomMessage } from "./messages";
+import type {
+	ConfidentialAsyncJobSettledRowV1,
+	TransientTaskAsyncJobCompletionHandoffV1,
+} from "./workspace-runtime-contracts";
 
 /**
  * `customType` of the injected async-result follow-up message. The task
@@ -79,4 +83,33 @@ export function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): Custo
 		details,
 		timestamp: Date.now(),
 	};
+}
+
+/**
+ * Render one already-frozen managed completion without passing its result
+ * through the ordinary async artifact/truncation pipeline.
+ */
+export function buildManagedAsyncResultMessage(
+	row: Extract<
+		ConfidentialAsyncJobSettledRowV1,
+		{
+			readonly transientTaskCompletion: Exclude<
+				TransientTaskAsyncJobCompletionHandoffV1,
+				{ readonly terminalStatus: "cancelled" }
+			>;
+		}
+	>,
+	job: Pick<AsyncJob, "label">,
+): CustomMessage<AsyncResultDetails> | null {
+	const handoff = row.transientTaskCompletion;
+	const message = buildAsyncResultBatchMessage([
+		{
+			jobId: row.jobId,
+			result: handoff.settlementRequest.sinkResultUtf8,
+			job: { type: "task", label: job.label } as AsyncResultEntry["job"],
+			durationMs: undefined,
+			epoch: 0,
+		},
+	]);
+	return message && { ...message, timestamp: Date.parse(handoff.settledResultReceipt.publishedAt) };
 }

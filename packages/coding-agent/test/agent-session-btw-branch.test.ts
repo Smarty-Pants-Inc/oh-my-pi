@@ -14,6 +14,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { Snowflake } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 function createBtwAssistant(): AssistantMessage {
 	return {
@@ -96,6 +97,7 @@ describe("AgentSession.branchFromBtw", () => {
 			sessionManager,
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			extensionRunner: options?.extensionRunner,
 		});
 		return session;
@@ -403,7 +405,7 @@ describe("AgentSession.branchFromBtw", () => {
 			requiredLeafId(activeSession),
 			activeSession.sessionManager.getSessionId(),
 		);
-		await Promise.resolve();
+		while (!activeSession.isStreaming) await Bun.sleep(1);
 		hookRelease.resolve();
 
 		await expect(branchPromise).rejects.toThrow(

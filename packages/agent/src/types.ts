@@ -35,6 +35,8 @@ export type StreamFn = (
 export const ASIDE_MESSAGE_COMMIT = Symbol("aside-message-commit");
 /** Called when an aside was drained but the agent loop ended before inserting it. */
 export const ASIDE_MESSAGE_DISCARD = Symbol("aside-message-discard");
+/** Private after-hook carrier selecting an owner-defined persistence path. */
+export const AGENT_LOOP_SELECTED_TOOL_RESULT_PERSISTENCE = Symbol("agent-loop-selected-tool-result-persistence");
 
 export type CommittableAsideMessage = AgentMessage & {
 	[ASIDE_MESSAGE_COMMIT]?: () => void;
@@ -56,6 +58,145 @@ export interface AgentTurnEndContext {
 	toolResults: ToolResultMessage[];
 	/** True when the current tool-loop batch is continuing without yielding to post-turn steering. */
 	willContinue: boolean;
+}
+/** Package-local lifecycle result before an owner enriches or persists it. */
+export interface AgentLoopLifecycleResultDataV1 {
+	readonly result: AgentToolResult<unknown>;
+}
+
+interface AgentLoopLifecycleObservationBaseV1 {
+	readonly schemaVersion: 1;
+	readonly toolCallId: string;
+	readonly toolName: string;
+	readonly sourceToolCallOrdinal: number;
+}
+
+/** Closed package-local lifecycle observation; owner-specific authority never crosses into this layer. */
+export type AgentLoopLifecycleObservationInputV1 =
+	| (AgentLoopLifecycleObservationBaseV1 & {
+			readonly eventKind: "soft_requirement_detour";
+			readonly result: AgentLoopLifecycleResultDataV1;
+	  })
+	| (AgentLoopLifecycleObservationBaseV1 & {
+			readonly eventKind: "steering_skip";
+			readonly steeringSource: "user" | "agent" | "system" | "unknown" | "irc";
+			readonly result: AgentLoopLifecycleResultDataV1;
+	  })
+	| (AgentLoopLifecycleObservationBaseV1 & {
+			readonly eventKind: "signal_pre_execution_skip";
+			readonly signalKind: "external_abort" | "deadline" | "pre_execution_skip";
+			readonly result: AgentLoopLifecycleResultDataV1;
+	  })
+	| (AgentLoopLifecycleObservationBaseV1 & {
+			readonly eventKind: "assistant_stream_terminal";
+			readonly syntheticSource:
+				| "assistant_stop_aborted"
+				| "assistant_stop_error"
+				| "assistant_stop_length"
+				| "assistant_stop_skipped";
+			readonly result: AgentLoopLifecycleResultDataV1;
+	  })
+	| (AgentLoopLifecycleObservationBaseV1 & {
+			readonly eventKind: "tool_missing";
+			readonly result: AgentLoopLifecycleResultDataV1;
+	  })
+	| (AgentLoopLifecycleObservationBaseV1 & {
+			readonly eventKind: "validation_result";
+			readonly stage: "initial_validation" | "hook_revision_validation";
+			readonly result: AgentLoopLifecycleResultDataV1;
+	  })
+	| (AgentLoopLifecycleObservationBaseV1 & {
+			readonly eventKind: "before_tool_block";
+			readonly blockReasonUtf8: string;
+			readonly preAfterHookResult: AgentLoopLifecycleResultDataV1;
+	  })
+	| (AgentLoopLifecycleObservationBaseV1 & {
+			readonly eventKind: "before_tool_prepare_error";
+			readonly prepareErrorUtf8: string;
+			readonly preAfterHookResult: AgentLoopLifecycleResultDataV1;
+	  })
+	| (AgentLoopLifecycleObservationBaseV1 & {
+			readonly eventKind: "after_hook_result";
+			readonly executionState: "not_started" | "started";
+			readonly nonExecutionReason:
+				| "before_tool_block"
+				| "before_tool_prepare_error"
+				| "argument_transform_error"
+				| "pre_execute_error"
+				| null;
+			readonly afterToolCallInputResult: AgentLoopLifecycleResultDataV1;
+			readonly finalResult: AgentLoopLifecycleResultDataV1;
+	  });
+
+export type AgentLoopLifecycleObservationV1 = AgentLoopLifecycleObservationInputV1 & {
+	readonly lifecycleOrdinal: number;
+	readonly observationSequence: number;
+	readonly predecessorObservationReceiptSha256: string | null;
+	readonly sourceObservationReservationSha256: string;
+	readonly observedAt: string;
+};
+
+export interface AgentLoopLifecycleSuspensionV1 {
+	readonly core: {
+		readonly schemaVersion: 1;
+		readonly lifecycleObservationSha256: string;
+		readonly suspensionId: string;
+		readonly suspendedAt: string;
+	};
+	readonly suspensionSha256: string;
+}
+
+export interface AgentLoopLifecycleResumeRequestV1 {
+	readonly core: {
+		readonly lifecycleObservation: AgentLoopLifecycleObservationV1;
+		readonly suspension: AgentLoopLifecycleSuspensionV1;
+		readonly requestedAt: string;
+	};
+	readonly requestSha256: string;
+}
+
+export type AgentLoopLifecycleGateResultV1 =
+	| {
+			readonly status: "observation_durable";
+			readonly resultExposure: "continue_original_emission";
+			readonly terminalization: "awaiting_message_end_primary_persistence" | "terminalized";
+			readonly observationReceiptSha256: string;
+			readonly terminalReceiptSha256: string | null;
+			readonly suspension: null;
+			readonly resumeRequest: null;
+	  }
+	| {
+			readonly status: "suspended";
+			readonly resultExposure: "blocked";
+			readonly terminalization: null;
+			readonly observationReceiptSha256: null;
+			readonly terminalReceiptSha256: null;
+			readonly suspension: AgentLoopLifecycleSuspensionV1;
+			readonly resumeRequest: AgentLoopLifecycleResumeRequestV1;
+	  };
+
+/** Sole pre-emission persistence request; selected authority is opaque to agent-core. */
+export interface AgentLoopToolResultPrimaryPersistenceRequestV1 {
+	readonly toolCallId: string;
+	readonly toolName: string;
+	readonly exactToolResultMessage: ToolResultMessage;
+	readonly selectedAuthority?: unknown;
+}
+
+/** Exact per-Agent object reference forwarded unchanged into every prompt/continue loop config. */
+export interface AgentLoopLifecyclePersistenceAdapterV1 {
+	hasLifecycleAuthority(toolCallId: string, toolName: string): boolean;
+	onLifecycleObservation(event: AgentLoopLifecycleObservationInputV1): Promise<AgentLoopLifecycleGateResultV1>;
+	resumeLifecycleObservation(request: AgentLoopLifecycleResumeRequestV1): Promise<AgentLoopLifecycleGateResultV1>;
+	persistToolResultBeforeEmission(request: AgentLoopToolResultPrimaryPersistenceRequestV1): Promise<{
+		readonly exactToolResultMessage: ToolResultMessage;
+	}>;
+}
+
+/** Exact owner-defined selection carrier supplied by an after-hook. */
+export interface AgentLoopSelectedToolResultPersistenceV1 {
+	readonly authority: unknown;
+	readonly exactToolResultMessage: ToolResultMessage;
 }
 
 export interface AgentPreModelCallStop {
@@ -393,6 +534,9 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 */
 	onAssistantMessageEvent?: (message: AssistantMessage, event: AssistantMessageEvent) => void;
 
+	/** Called once per loop run when the first semantic assistant content event is observed. */
+	onFirstAssistantContent?: (timestamp: number) => void;
+
 	/**
 	 * Called when GPT-5 Harmony protocol leakage is detected and mitigated.
 	 */
@@ -527,6 +671,8 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 		context: AfterToolCallContext,
 		signal?: AbortSignal,
 	) => Promise<AfterToolCallResult | undefined> | AfterToolCallResult | undefined;
+	/** Awaited owner-defined lifecycle and primary persistence seam, forwarded unchanged by Agent. */
+	lifecyclePersistenceAdapter?: AgentLoopLifecyclePersistenceAdapterV1;
 	/**
 	 * Opt-in OpenTelemetry instrumentation. Passing `{}` enables the loop's
 	 * GenAI-semantic-convention spans (`invoke_agent`, `chat`, `execute_tool`)
@@ -598,6 +744,8 @@ export interface AfterToolCallResult {
 	isError?: boolean;
 	/** If provided, replaces the contextually-useless flag carried with the tool result. */
 	useless?: boolean;
+	/** Private selected persistence authority; never copied into the model-visible result. */
+	[AGENT_LOOP_SELECTED_TOOL_RESULT_PERSISTENCE]?: AgentLoopSelectedToolResultPersistenceV1;
 }
 
 /** Context passed to `beforeToolCall`. */

@@ -34,6 +34,7 @@ import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { convertToLlm } from "../src/session/messages";
 import { SessionManager } from "../src/session/session-manager";
+import { createTestRuntimeDependencies } from "./utilities";
 
 type Harness = {
 	session: AgentSession;
@@ -149,6 +150,7 @@ describe("AgentSession plan-mode compaction hook contract (issue #4359)", () => 
 			agent,
 			sessionManager,
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 			extensionRunner: extensionRunner as never,
 		});

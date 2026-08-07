@@ -22,6 +22,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { type CustomMessage, convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 const LOOP_PARAGRAPHS = [
 	"I am now verifying the test module to guarantee there are no compile errors and the code is completely safe.",
@@ -166,6 +167,7 @@ describe("AgentSession thinking-loop retry", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 		const retryStartEvents: Array<Extract<AgentSessionEvent, { type: "auto_retry_start" }>> = [];
@@ -225,6 +227,7 @@ describe("AgentSession thinking-loop retry", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 		const retryStartEvents: Array<Extract<AgentSessionEvent, { type: "auto_retry_start" }>> = [];
@@ -281,6 +284,7 @@ describe("AgentSession thinking-loop retry", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 
@@ -349,6 +353,7 @@ describe("AgentSession thinking-loop retry", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 

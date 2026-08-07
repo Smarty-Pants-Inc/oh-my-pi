@@ -26,6 +26,7 @@ import {
 import { readEditFileText, serializeEditFileText } from "../read-file";
 import type { EditToolDetails, LspBatchRequest } from "../renderer";
 import { pruneOversizedEditSnapshots } from "../snapshot-details";
+import type { PersistentEditMutationExecutor } from "./patch";
 
 export interface FuzzyMatch {
 	actualText: string;
@@ -1090,6 +1091,7 @@ export interface ExecuteReplaceOptions {
 	fuzzyThreshold: number;
 	writethrough: WritethroughCallback;
 	beginDeferredDiagnosticsForPath: (path: string) => WritethroughDeferredHandle;
+	persistent?: PersistentEditMutationExecutor;
 }
 
 export async function executeReplace(
@@ -1105,17 +1107,18 @@ export async function executeReplace(
 		fuzzyThreshold,
 		writethrough,
 		beginDeferredDiagnosticsForPath,
+		persistent,
 	} = options;
 	const { old_string, new_string, replace_all } = params;
 
-	enforcePlanModeWrite(session, path);
+	if (!persistent) enforcePlanModeWrite(session, path);
 
 	if (old_string.length === 0) {
 		throw new Error("old_string must not be empty.");
 	}
 
-	const absolutePath = resolvePlanPath(session, path);
-	const rawContent = await readEditFileText(absolutePath, path);
+	const absolutePath = persistent ? persistent.modelPath(path) : resolvePlanPath(session, path);
+	const rawContent = persistent ? await persistent.read(absolutePath) : await readEditFileText(absolutePath, path);
 	const { bom, text: content } = stripBom(rawContent);
 	const originalEnding = detectLineEnding(content);
 	const normalizedContent = normalizeToLF(content);
@@ -1149,15 +1152,15 @@ export async function executeReplace(
 		throw new Error(`Edits to ${path} resulted in no changes being made.`);
 	}
 
-	const finalContent = await serializeEditFileText(
-		absolutePath,
-		path,
-		bom + restoreLineEndings(result.content, originalEnding),
-	);
+	const editedContent = bom + restoreLineEndings(result.content, originalEnding);
+	const finalContent = persistent ? editedContent : await serializeEditFileText(absolutePath, path, editedContent);
 
 	// Route through ACP bridge when available; skips internal artifacts.
 	let diagnostics: FileDiagnosticsResult | undefined;
-	if (await routeWriteThroughBridge(session, path, absolutePath, finalContent, signal)) {
+	if (persistent) {
+		await persistent.freeze([{ operation: "write_text", path: absolutePath, content: finalContent }]);
+		await persistent.write(absolutePath, finalContent);
+	} else if (await routeWriteThroughBridge(session, path, absolutePath, finalContent, signal)) {
 		// bridge handled the write; diagnostics not available via writethrough
 	} else {
 		diagnostics = await writethrough(absolutePath, finalContent, signal, Bun.file(absolutePath), batchRequest, dst =>

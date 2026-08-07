@@ -421,6 +421,17 @@ end
 
 using Downloads
 
+const __omp_bridge_call_ordinals = Dict{String, Int}()
+const __omp_bridge_call_lock = ReentrantLock()
+
+function __omp_next_bridge_call_ordinal(run_id::String)
+    lock(__omp_bridge_call_lock) do
+        ordinal = get(__omp_bridge_call_ordinals, run_id, 0)
+        __omp_bridge_call_ordinals[run_id] = ordinal + 1
+        return ordinal
+    end
+end
+
 function __omp_call_bridge(name::String, args::Dict{String, Any})
     base_url = get(ENV, "PI_TOOL_BRIDGE_URL", nothing)
     token = get(ENV, "PI_TOOL_BRIDGE_TOKEN", nothing)
@@ -435,9 +446,11 @@ function __omp_call_bridge(name::String, args::Dict{String, Any})
         url = endswith(url, "/") ? (url * "v1/tool") : (url * "/v1/tool")
     end
 
+    call_ordinal = __omp_next_bridge_call_ordinal(string(Main.current_rid))
     payload_dict = Dict(
         "session" => session,
         "run" => Main.current_rid,
+        "call" => call_ordinal,
         "name" => name,
         "args" => args
     )

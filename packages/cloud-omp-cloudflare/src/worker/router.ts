@@ -1,6 +1,22 @@
+import type { RuntimeReplicaRef } from "@oh-my-pi/pi-coding-agent/session/workspace-runtime-contracts";
 import { MAX_HTTP_BODY_BYTES } from "../boundary-policy";
 import {
+	type CloudflareRuntimeEffectTransportEnvelopeV1,
+	type CloudflareRuntimeInspectionTransportEnvelopeV1,
+	type CloudflareValidatedRuntimeEffectTransportV1,
+	type CloudflareValidatedRuntimeInspectionTransportV1,
+	type CloudflareValidatedRuntimeOperationV1,
 	type CloudOmpWireErrorCode,
+	cloudflareRuntimeRoutesV1,
+	decodeCloudflareCheckpointFetchResponseV1,
+	decodeCloudflareReplicaCacheEvictionInspectResultV1,
+	decodeCloudflareReplicaCacheEvictionRequestResultV1,
+	decodeCloudflareReplicaDeleteInspectResultV1,
+	decodeCloudflareReplicaDeleteResultV1,
+	decodeCloudflareRuntimeEffectTransportResultEnvelopeV1,
+	decodeCloudflareRuntimeInspectionTransportResultEnvelopeV1,
+	decodeCloudflareRuntimeStatusResponseV1,
+	deriveCloudflareRuntimeDurableObjectNameV1,
 	type HealthResponse,
 	isCloudOmpWireErrorCode,
 	type WireErrorResponse,
@@ -9,6 +25,12 @@ import { bearerMatches } from "./auth";
 import {
 	RequestValidationError,
 	validateCanonicalId,
+	validateCloudflareCheckpointFetchRequestV1,
+	validateCloudflareReplicaCacheEvictionPlanV1,
+	validateCloudflareReplicaDeleteRequestV1,
+	validateCloudflareRuntimeEffectTransportEnvelopeV1,
+	validateCloudflareRuntimeInspectionTransportEnvelopeV1,
+	validateCloudflareRuntimeStatusRequestV1,
 	validateCreateWorkspaceRequest,
 	validateExecRequest,
 	validateFilePayload,
@@ -30,6 +52,17 @@ export interface WorkspaceRpc
 		| "quiesce"
 		| "release"
 		| "restartForTest"
+		| "applyRuntimeEffect"
+		| "inspectRuntimeOperation"
+		| "applyRuntimeControlEffect"
+		| "inspectRuntimeControl"
+		| "inspectRuntimeStatus"
+		| "fetchRuntimeCheckpoint"
+		| "requestReplicaCacheEviction"
+		| "inspectReplicaCacheEviction"
+		| "deleteRuntimeReplica"
+		| "inspectRuntimeReplicaDeletion"
+		| "applyRuntimeBridgeOperation"
 	> {}
 
 export interface WorkspaceNamespace {
@@ -54,6 +87,24 @@ const EXEC_COLLECTION_PATH = /^\/v1\/workspaces\/([^/]+)\/exec$/;
 const EXEC_PATH = /^\/v1\/workspaces\/([^/]+)\/exec\/([^/]+)$/;
 const EXEC_KILL_PATH = /^\/v1\/workspaces\/([^/]+)\/exec\/([^/]+)\/kill$/;
 const QUIESCE_PATH = /^\/v1\/workspaces\/([^/]+)\/quiesce$/;
+const RUNTIME_EFFECT_PATH = cloudflareRuntimeRoutesV1.effect;
+const RUNTIME_INSPECT_PATH = cloudflareRuntimeRoutesV1.inspect;
+const RUNTIME_STATUS_PATH = cloudflareRuntimeRoutesV1.status;
+const RUNTIME_CHECKPOINT_FETCH_PATH = cloudflareRuntimeRoutesV1.checkpointFetch;
+const RUNTIME_CACHE_EVICTION_PATH = cloudflareRuntimeRoutesV1.cacheEviction;
+const RUNTIME_CACHE_EVICTION_INSPECT_PATH = cloudflareRuntimeRoutesV1.cacheEvictionInspect;
+const RUNTIME_REPLICA_DELETE_PATH = cloudflareRuntimeRoutesV1.replicaDelete;
+const RUNTIME_REPLICA_DELETE_INSPECT_PATH = cloudflareRuntimeRoutesV1.replicaDeleteInspect;
+const RUNTIME_PATHS: Readonly<Record<string, true>> = Object.freeze({
+	[RUNTIME_EFFECT_PATH]: true,
+	[RUNTIME_INSPECT_PATH]: true,
+	[RUNTIME_STATUS_PATH]: true,
+	[RUNTIME_CHECKPOINT_FETCH_PATH]: true,
+	[RUNTIME_CACHE_EVICTION_PATH]: true,
+	[RUNTIME_CACHE_EVICTION_INSPECT_PATH]: true,
+	[RUNTIME_REPLICA_DELETE_PATH]: true,
+	[RUNTIME_REPLICA_DELETE_INSPECT_PATH]: true,
+});
 const WORKSPACE_ERROR_STATUSES: Partial<Record<number, true>> = {
 	400: true,
 	404: true,
@@ -82,10 +133,13 @@ const worker = {
 				return errorResponse(401, "unauthorized", "Unauthorized");
 			}
 
-			const body = await collectRequestBody(request);
 			if (url.search !== "") {
 				throw new RequestValidationError(400, "query_not_allowed", "Query parameters are not allowed");
 			}
+			if ((pathname === "/v1/runtime" || pathname.startsWith("/v1/runtime/")) && RUNTIME_PATHS[pathname] !== true) {
+				return notFound();
+			}
+			const body = await collectRequestBody(request);
 			return await dispatchAuthenticated(request, pathname, body, env);
 		} catch (error) {
 			return mapError(error);
@@ -106,6 +160,91 @@ async function dispatchAuthenticated(
 		if (methodError) return methodError;
 		requireEmptyBody(body);
 		return jsonResponse<HealthResponse>(200, { ok: true });
+	}
+
+	if (pathname === RUNTIME_EFFECT_PATH) {
+		const methodError = requireMethod(request.method, "POST");
+		if (methodError) return methodError;
+		const parsed = parseJsonBody(request, body);
+		const validated = await validateCloudflareRuntimeEffectTransportEnvelopeV1(parsed);
+		const stub = await runtimeStub(env, runtimeReplicaFromEffectTransport(validated));
+		const envelope = parsed as CloudflareRuntimeEffectTransportEnvelopeV1;
+		const result =
+			validated.transportFamily === "lifecycle"
+				? await stub.applyRuntimeEffect(envelope)
+				: validated.transportFamily === "control"
+					? await stub.applyRuntimeControlEffect(envelope)
+					: await stub.applyRuntimeBridgeOperation(envelope);
+		return jsonResponse(200, await decodeCloudflareRuntimeEffectTransportResultEnvelopeV1(result, validated));
+	}
+
+	if (pathname === RUNTIME_INSPECT_PATH) {
+		const methodError = requireMethod(request.method, "POST");
+		if (methodError) return methodError;
+		const parsed = parseJsonBody(request, body);
+		const validated = await validateCloudflareRuntimeInspectionTransportEnvelopeV1(parsed);
+		const stub = await runtimeStub(env, runtimeReplicaFromInspectionTransport(validated));
+		const envelope = parsed as CloudflareRuntimeInspectionTransportEnvelopeV1;
+		const result =
+			validated.transportFamily === "lifecycle"
+				? await stub.inspectRuntimeOperation(envelope)
+				: validated.transportFamily === "control"
+					? await stub.inspectRuntimeControl(envelope)
+					: await stub.applyRuntimeBridgeOperation(envelope);
+		return jsonResponse(200, await decodeCloudflareRuntimeInspectionTransportResultEnvelopeV1(result, validated));
+	}
+
+	if (pathname === RUNTIME_STATUS_PATH) {
+		const methodError = requireMethod(request.method, "POST");
+		if (methodError) return methodError;
+		const parsed = parseJsonBody(request, body);
+		const validated = validateCloudflareRuntimeStatusRequestV1(parsed);
+		const result = await (await runtimeStub(env, validated.replica)).inspectRuntimeStatus(parsed);
+		return jsonResponse(200, decodeCloudflareRuntimeStatusResponseV1(result, validated));
+	}
+
+	if (pathname === RUNTIME_CHECKPOINT_FETCH_PATH) {
+		const methodError = requireMethod(request.method, "POST");
+		if (methodError) return methodError;
+		const parsed = parseJsonBody(request, body);
+		const validated = validateCloudflareCheckpointFetchRequestV1(parsed);
+		const result = await (
+			await runtimeStub(env, {
+				providerId: validated.locator.providerId,
+				profileId: validated.locator.profileId,
+				replicaId: validated.locator.replicaId,
+				workspaceId: validated.locator.workspaceId,
+			})
+		).fetchRuntimeCheckpoint(parsed);
+		return jsonResponse(200, await decodeCloudflareCheckpointFetchResponseV1(result, validated));
+	}
+
+	if (pathname === RUNTIME_CACHE_EVICTION_PATH || pathname === RUNTIME_CACHE_EVICTION_INSPECT_PATH) {
+		const methodError = requireMethod(request.method, "POST");
+		if (methodError) return methodError;
+		const parsed = parseJsonBody(request, body);
+		const plan = await validateCloudflareReplicaCacheEvictionPlanV1(parsed);
+		const stub = await runtimeStub(env, plan.replica);
+		if (pathname === RUNTIME_CACHE_EVICTION_PATH) {
+			const result = await stub.requestReplicaCacheEviction(parsed);
+			return jsonResponse(200, await decodeCloudflareReplicaCacheEvictionRequestResultV1(result, plan));
+		}
+		const result = await stub.inspectReplicaCacheEviction(parsed);
+		return jsonResponse(200, await decodeCloudflareReplicaCacheEvictionInspectResultV1(result, plan));
+	}
+
+	if (pathname === RUNTIME_REPLICA_DELETE_PATH || pathname === RUNTIME_REPLICA_DELETE_INSPECT_PATH) {
+		const methodError = requireMethod(request.method, "POST");
+		if (methodError) return methodError;
+		const parsed = parseJsonBody(request, body);
+		const validated = await validateCloudflareReplicaDeleteRequestV1(parsed);
+		const stub = await runtimeStub(env, validated.request.replica);
+		if (pathname === RUNTIME_REPLICA_DELETE_PATH) {
+			const result = await stub.deleteRuntimeReplica(parsed);
+			return jsonResponse(200, await decodeCloudflareReplicaDeleteResultV1(result, validated.request));
+		}
+		const result = await stub.inspectRuntimeReplicaDeletion(parsed);
+		return jsonResponse(200, await decodeCloudflareReplicaDeleteInspectResultV1(result, validated.request));
 	}
 
 	const admin = pathname.match(ADMIN_RESTART_PATH);
@@ -210,6 +349,43 @@ async function dispatchAuthenticated(
 function workspaceStub(env: WorkerEnv, workspaceId: string): WorkspaceRpc {
 	const durableId = env.WORKSPACE.idFromName(workspaceId);
 	return env.WORKSPACE.get(durableId);
+}
+
+async function runtimeStub(env: WorkerEnv, replica: RuntimeReplicaRef): Promise<WorkspaceRpc> {
+	const name = await deriveCloudflareRuntimeDurableObjectNameV1(replica);
+	return env.WORKSPACE.get(env.WORKSPACE.idFromName(name));
+}
+
+function runtimeReplicaFromEffectTransport(validated: CloudflareValidatedRuntimeEffectTransportV1): RuntimeReplicaRef {
+	return validated.transportFamily === "lifecycle" ? runtimeReplicaFromLifecycle(validated) : validated.replica;
+}
+
+function runtimeReplicaFromInspectionTransport(
+	validated: CloudflareValidatedRuntimeInspectionTransportV1,
+): RuntimeReplicaRef {
+	return validated.transportFamily === "lifecycle" ? runtimeReplicaFromLifecycle(validated) : validated.replica;
+}
+
+function runtimeReplicaFromLifecycle(validated: CloudflareValidatedRuntimeOperationV1): RuntimeReplicaRef {
+	const inspection = validated.inspection;
+	switch (inspection.operation) {
+		case "acquire":
+			return inspection.request.plan.replica;
+		case "push":
+		case "quiesce":
+		case "checkpoint":
+			return inspection.request.lease.replica;
+		case "revoke":
+		case "release":
+			return inspection.request.replica;
+		case "checkpoint_acknowledgement":
+			return {
+				providerId: inspection.request.reference.providerId,
+				profileId: inspection.request.reference.profileId,
+				workspaceId: inspection.request.reference.workspaceId,
+				replicaId: inspection.request.reference.replicaId,
+			};
+	}
 }
 
 async function collectRequestBody(request: Request): Promise<Uint8Array> {

@@ -26,6 +26,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SILENT_ABORT_MARKER } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 function makeAbortedAssistantMessage(text = "partial draft"): AssistantMessage {
 	return {
@@ -82,6 +83,7 @@ async function createSessionWithObfuscator(obfuscator?: SecretObfuscator): Promi
 		sessionManager: SessionManager.inMemory(),
 		settings: Settings.isolated(),
 		modelRegistry,
+		...createTestRuntimeDependencies(modelRegistry),
 		obfuscator,
 	});
 

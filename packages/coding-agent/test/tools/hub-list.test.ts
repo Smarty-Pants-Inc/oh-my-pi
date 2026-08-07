@@ -1,8 +1,25 @@
 import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import type { PersistentAgentStore } from "@oh-my-pi/pi-coding-agent/registry/persistent-agent-contracts";
 import { executeList } from "@oh-my-pi/pi-coding-agent/tools/hub/messaging";
 import { TempDir } from "@oh-my-pi/pi-utils";
+
+const missingPersistentAgentStore = {
+	controlHostId: "test-host",
+	lookup: async agentId => ({ kind: "missing" as const, agentId }),
+	list: async () => [],
+	inspectOwnership: async () => ({
+		state: "unowned" as const,
+		controlHostId: "test-host",
+		processId: null,
+		intent: null,
+		acquiredAt: null,
+	}),
+	acquire: async () => {
+		throw new Error("Persistent ownership is not used by this fixture");
+	},
+} satisfies PersistentAgentStore;
 
 describe("hub list", () => {
 	it("restores persisted peers after the process registry is lost", async () => {
@@ -13,6 +30,7 @@ describe("hub list", () => {
 		await Bun.write(workerSessionFile, "");
 
 		const registry = new AgentRegistry();
+		registry.bindProcessOwnedPersistentAgentStore(missingPersistentAgentStore);
 		registry.register({
 			id: MAIN_AGENT_ID,
 			displayName: MAIN_AGENT_ID,

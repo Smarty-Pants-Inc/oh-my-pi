@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -38,6 +38,7 @@ describe("AsyncJobManager singleton across concurrent top-level sessions", () =>
 			removeSyncWithRetries(tempDir);
 		}
 		AsyncJobManager.resetForTests();
+		vi.restoreAllMocks();
 	});
 
 	async function spawnTopLevelSession(extraSettings?: Record<string, unknown>, extensions: ExtensionFactory[] = []) {
@@ -193,6 +194,70 @@ describe("AsyncJobManager singleton across concurrent top-level sessions", () =>
 		} finally {
 			await primary.dispose();
 		}
+	}, 60000);
+
+	it("retains the published manager until its owned teardown finishes", async () => {
+		const primary = await spawnTopLevelSession();
+		const manager = AsyncJobManager.instance();
+		if (!manager) throw new Error("expected owning AsyncJobManager");
+		const disposeStarted = Promise.withResolvers<void>();
+		const releaseDispose = Promise.withResolvers<void>();
+		vi.spyOn(manager, "dispose").mockImplementation(async () => {
+			disposeStarted.resolve();
+			await releaseDispose.promise;
+			return true;
+		});
+
+		const primaryDisposal = primary.dispose();
+		await disposeStarted.promise;
+		try {
+			expect(AsyncJobManager.instance()).toBe(manager);
+			const secondary = await spawnTopLevelSession();
+			try {
+				expect(AsyncJobManager.instance()).toBe(manager);
+			} finally {
+				await secondary.dispose();
+			}
+		} finally {
+			releaseDispose.resolve();
+		}
+		await primaryDisposal;
+		expect(AsyncJobManager.instance()).toBeUndefined();
+	}, 60000);
+
+	it("aggregates startup and cleanup failures instead of logging cleanup loss", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-sdk-async-cleanup-failure-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, `project-${Snowflake.next()}`);
+		const agentDir = path.join(tempDir, "agent");
+		fs.mkdirSync(cwd, { recursive: true });
+		const startupFailure = new Error("forced aggregate startup failure");
+		const cleanupFailure = new Error("forced manager cleanup failure");
+		vi.spyOn(AsyncJobManager.prototype, "dispose").mockRejectedValueOnce(cleanupFailure);
+
+		const failure = await createAgentSession({
+			cwd,
+			agentDir,
+			settings: Settings.isolated({ "bash.autoBackground.enabled": true }),
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			modelRegistry: sharedModelRegistry,
+			systemPrompt: () => {
+				throw startupFailure;
+			},
+		}).then(
+			() => undefined,
+			error => error,
+		);
+
+		expect(failure).toBeInstanceOf(AggregateError);
+		expect((failure as AggregateError).errors).toEqual([startupFailure, cleanupFailure]);
+		expect(AsyncJobManager.instance()).toBeUndefined();
 	}, 60000);
 
 	it("clears a manager installed before a top-level session startup failure takes ownership", async () => {

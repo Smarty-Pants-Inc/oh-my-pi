@@ -75,7 +75,11 @@ import {
 	resolveModelReference,
 } from "@oh-my-pi/pi-catalog/identity";
 import { $envExact, isBunTestRuntime, isRecord, logger, wrapFetchForExtraCa } from "@oh-my-pi/pi-utils";
-import { parseModelString, resolveProviderModelReference } from "../config/model-resolver";
+import {
+	findExactProviderModelReference,
+	parseModelString,
+	resolveProviderModelReference,
+} from "../config/model-resolver";
 import { generateCodexAttestation } from "../live/attestation";
 import type { AuthStorage, OAuthCredential } from "../session/auth-storage";
 import { type ApiKeyResolverModel, type ApiKeyResolverOptions, createApiKeyResolver } from "./api-key-resolver";
@@ -2360,9 +2364,20 @@ export class ModelRegistry {
 	}
 
 	/**
-	 * Find a model by provider and ID.
+	 * Find one exact, already-registered model object by provider and ID.
+	 * Persistent connection profiles use this method and never receive a
+	 * selector-derived alias, OpenRouter route/date clone, or Bedrock profile.
 	 */
 	find(provider: string, modelId: string): Model<Api> | undefined {
+		return findExactProviderModelReference(provider, modelId, this.#modelsForProviderLookup(provider));
+	}
+
+	/**
+	 * Resolve a user-facing selector. This intentionally retains legacy alias,
+	 * OpenRouter route/date, and Bedrock inference-profile synthesis and must
+	 * not be used for persistent connection profiles.
+	 */
+	resolveSelector(provider: string, modelId: string): Model<Api> | undefined {
 		return resolveProviderModelReference(provider, modelId, this.#modelsForProviderLookup(provider));
 	}
 
@@ -2727,7 +2742,7 @@ export class ModelRegistry {
 	 */
 	suppressSelector(selector: string, untilMs: number): void {
 		this.#suppressedSelectors.set(
-			normalizeSuppressedSelector(selector, (provider, id) => this.find(provider, id) !== undefined),
+			normalizeSuppressedSelector(selector, (provider, id) => this.resolveSelector(provider, id) !== undefined),
 			untilMs,
 		);
 	}
@@ -2738,7 +2753,7 @@ export class ModelRegistry {
 	isSelectorSuppressed(selector: string): boolean {
 		const normalizedSelector = normalizeSuppressedSelector(
 			selector,
-			(provider, id) => this.find(provider, id) !== undefined,
+			(provider, id) => this.resolveSelector(provider, id) !== undefined,
 		);
 		const suppressedUntil = this.#suppressedSelectors.get(normalizedSelector);
 		if (!suppressedUntil) return false;
@@ -2754,7 +2769,7 @@ export class ModelRegistry {
 	 */
 	clearSuppressedSelector(selector: string): void {
 		this.#suppressedSelectors.delete(
-			normalizeSuppressedSelector(selector, (provider, id) => this.find(provider, id) !== undefined),
+			normalizeSuppressedSelector(selector, (provider, id) => this.resolveSelector(provider, id) !== undefined),
 		);
 	}
 

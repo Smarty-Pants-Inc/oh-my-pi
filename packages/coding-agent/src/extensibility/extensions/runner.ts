@@ -293,13 +293,13 @@ export type ShutdownHandler = () => void;
 export async function emitSessionShutdownEvent(extensionRunner: ExtensionRunner | undefined): Promise<boolean> {
 	if (!extensionRunner) return false;
 	try {
-		if (!extensionRunner.hasHandlers("session_shutdown")) return false;
+		if (!extensionRunner.hasHandlers?.("session_shutdown")) return false;
 		await extensionRunner.emit({
 			type: "session_shutdown",
 		});
 		return true;
 	} finally {
-		extensionRunner.clearManagedTimers();
+		extensionRunner.clearManagedTimers?.();
 	}
 }
 

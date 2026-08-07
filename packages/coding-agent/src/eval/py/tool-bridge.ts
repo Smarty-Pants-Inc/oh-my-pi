@@ -10,9 +10,12 @@
 import { logger } from "@oh-my-pi/pi-utils";
 import type { ToolSession } from "../../tools";
 import { callSessionTool, type JsStatusEvent } from "../js/tool-bridge";
+import type { EvalAgentLifecycleContextV1 } from "../lifecycle";
 
 export interface PyToolBridgeEntry {
 	toolSession: ToolSession;
+	evalAgentLifecycle?: EvalAgentLifecycleContextV1;
+	bridgeCallKeyPrefix: string;
 	/**
 	 * Turn-cancel handed to the tool implementation. Raw and never deferred, so
 	 * delegated work — above all the subagents `agent()` spawns — stops at once.
@@ -35,12 +38,22 @@ export interface PyToolBridgeInfo {
 	token: string;
 }
 
+export interface PyToolBridgeRegistration {
+	drain(): Promise<void>;
+	unregister(): void;
+}
+
 interface BridgeServer {
 	info: PyToolBridgeInfo;
 	stop: () => Promise<void>;
 }
 
-const registrations = new Map<string, PyToolBridgeEntry>();
+interface RegisteredPyToolBridgeEntry extends PyToolBridgeEntry {
+	readonly activeCalls: Set<Promise<unknown>>;
+	accepting: boolean;
+}
+
+const registrations = new Map<string, RegisteredPyToolBridgeEntry>();
 let serverPromise: Promise<BridgeServer> | null = null;
 
 /**
@@ -63,7 +76,12 @@ let serverPromise: Promise<BridgeServer> | null = null;
  * matters for tools that ignore the signal, keeping the kernel unwinding
  * promptly instead of being hard-killed.
  */
-async function callSessionToolPromptOnAbort(name: string, args: unknown, entry: PyToolBridgeEntry): Promise<unknown> {
+async function callSessionToolPromptOnAbort(
+	name: string,
+	args: unknown,
+	entry: RegisteredPyToolBridgeEntry,
+	bridgeCallKey: string,
+): Promise<unknown> {
 	if (entry.abortRequested?.()) {
 		throw new Error(`bridge call ${JSON.stringify(name)} aborted: eval cell was interrupted`);
 	}
@@ -71,7 +89,14 @@ async function callSessionToolPromptOnAbort(name: string, args: unknown, entry: 
 		session: entry.toolSession,
 		signal: entry.signal,
 		emitStatus: entry.emitStatus,
+		lifecycle: entry.evalAgentLifecycle,
+		bridgeCallKey,
 	});
+	entry.activeCalls.add(call);
+	void call.then(
+		() => entry.activeCalls.delete(call),
+		() => entry.activeCalls.delete(call),
+	);
 	const signal = entry.shieldedSignal ?? entry.signal;
 	if (!signal) return await call;
 	if (signal.aborted) {
@@ -105,29 +130,42 @@ async function startServer(): Promise<BridgeServer> {
 				return new Response("Forbidden", { status: 403 });
 			}
 
-			let body: { session?: unknown; run?: unknown; name?: unknown; args?: unknown };
+			let body: { session?: unknown; run?: unknown; call?: unknown; name?: unknown; args?: unknown };
 			try {
-				body = (await req.json()) as { session?: unknown; run?: unknown; name?: unknown; args?: unknown };
+				body = (await req.json()) as {
+					session?: unknown;
+					run?: unknown;
+					call?: unknown;
+					name?: unknown;
+					args?: unknown;
+				};
 			} catch {
 				return Response.json({ ok: false, error: "Invalid JSON body" }, { status: 400 });
 			}
 			const sessionId = typeof body.session === "string" ? body.session : "";
 			const runId = typeof body.run === "string" ? body.run : "";
 			const name = typeof body.name === "string" ? body.name : "";
-			if (!sessionId || !runId || !name) {
-				return Response.json({ ok: false, error: "Missing session/run/name" }, { status: 400 });
+			const callOrdinal =
+				typeof body.call === "number" && Number.isSafeInteger(body.call) && body.call >= 0 ? body.call : null;
+			if (!sessionId || !runId || callOrdinal === null || !name) {
+				return Response.json({ ok: false, error: "Missing or invalid session/run/call/name" }, { status: 400 });
 			}
 			const registrationKey = bridgeRegistrationKey(sessionId, runId);
-			const entry = registrations.get(registrationKey) ?? registrations.get(sessionId);
-			if (!entry) {
+			const entry = registrations.get(registrationKey);
+			if (!entry?.accepting) {
 				return Response.json(
-					{ ok: false, error: `No active Python tool bridge session: ${registrationKey}` },
+					{ ok: false, error: `No active kernel tool bridge execution: ${registrationKey}` },
 					{ status: 200 },
 				);
 			}
 
 			try {
-				const value = await callSessionToolPromptOnAbort(name, body.args, entry);
+				const value = await callSessionToolPromptOnAbort(
+					name,
+					body.args,
+					entry,
+					`${entry.bridgeCallKeyPrefix}:${sessionId}:${runId}:${callOrdinal}`,
+				);
 				return Response.json({ ok: true, value });
 			} catch (err) {
 				return Response.json({
@@ -166,21 +204,29 @@ export async function ensurePyToolBridge(): Promise<PyToolBridgeInfo> {
 	}
 }
 
-/**
- * Register a tool session for the duration of one execution. The returned
- * function MUST be called to remove the entry once execution finishes.
- */
+/** Register one exact kernel execution. Drain it before removing its authority. */
 function bridgeRegistrationKey(sessionId: string, runId: string): string {
 	return `${sessionId}:${runId}`;
 }
 
-export function registerPyToolBridge(sessionId: string, runId: string, entry: PyToolBridgeEntry): () => void {
+export function registerPyToolBridge(
+	sessionId: string,
+	runId: string,
+	entry: PyToolBridgeEntry,
+): PyToolBridgeRegistration {
 	const key = bridgeRegistrationKey(sessionId, runId);
-	registrations.set(key, entry);
-	return () => {
-		if (registrations.get(key) === entry) {
-			registrations.delete(key);
-		}
+	const registered: RegisteredPyToolBridgeEntry = { ...entry, activeCalls: new Set(), accepting: true };
+	registrations.set(key, registered);
+	return {
+		async drain() {
+			registered.accepting = false;
+			while (registered.activeCalls.size > 0) {
+				await Promise.allSettled([...registered.activeCalls]);
+			}
+		},
+		unregister() {
+			if (registrations.get(key) === registered) registrations.delete(key);
+		},
 	};
 }
 

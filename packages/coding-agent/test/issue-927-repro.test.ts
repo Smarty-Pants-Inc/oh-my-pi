@@ -11,6 +11,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { HistoryStorage } from "@oh-my-pi/pi-coding-agent/session/history-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities.js";
 
 describe("issue #927 optimistic pending spinner", () => {
 	let authStorage: AuthStorage;
@@ -44,6 +45,7 @@ describe("issue #927 optimistic pending spinner", () => {
 			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
 			settings: Settings.isolated(),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 		vi.spyOn(session, "prompt").mockResolvedValue(true);
 		mode = new InteractiveMode(session, "test");

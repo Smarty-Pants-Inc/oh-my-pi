@@ -12,6 +12,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 const CONTEXT_WINDOW = 372_000;
 const CACHE_READ_TOKENS = 371_200;
@@ -75,6 +76,7 @@ describe("AgentSession advisor context maintenance", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			advisorTools: [],
 			advisorStreamFn: advisorMock.stream,
 		});
@@ -165,6 +167,7 @@ describe("AgentSession advisor context maintenance", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			advisorTools: [],
 			advisorStreamFn: advisorMock.stream,
 		});
@@ -357,6 +360,7 @@ describe("AgentSession advisor context maintenance", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			advisorTools: [],
 			advisorStreamFn: advisorMock.stream,
 		});

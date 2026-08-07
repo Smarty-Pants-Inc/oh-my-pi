@@ -851,6 +851,105 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		}
 	});
 
+	test("restores saved routed and Bedrock inference-profile selectors", async () => {
+		const authStorage = await AuthStorage.create(path.join(tempDir, "resume-selector-auth.db"));
+		authStoragesToClose.push(authStorage);
+		authStorage.setRuntimeApiKey("openrouter", "test-key");
+		authStorage.setRuntimeApiKey("amazon-bedrock", "test-key");
+		const modelsPath = path.join(tempDir, "resume-selector-models.json");
+		fs.writeFileSync(
+			modelsPath,
+			JSON.stringify({
+				providers: {
+					openrouter: {
+						baseUrl: "https://openrouter.ai/api/v1",
+						api: "openai-completions",
+						models: [
+							{
+								id: "z-ai/glm-4.7",
+								name: "GLM",
+								reasoning: false,
+								input: ["text"],
+								cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+								contextWindow: 128000,
+								maxTokens: 8192,
+							},
+						],
+					},
+					"amazon-bedrock": {
+						baseUrl: "https://bedrock-runtime.us-east-1.amazonaws.com",
+						api: "bedrock-converse-stream",
+						models: [
+							{
+								id: "us.anthropic.claude-opus-4-8",
+								name: "Claude",
+								reasoning: true,
+								input: ["text"],
+								cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+								contextWindow: 128000,
+								maxTokens: 8192,
+							},
+						],
+					},
+				},
+			}),
+		);
+		const modelRegistry = new ModelRegistry(authStorage, modelsPath);
+		const cases = [
+			{
+				provider: "openrouter",
+				model: "z-ai/glm-4.7-20251222:nitro",
+			},
+			{
+				provider: "amazon-bedrock",
+				model: "arn:aws:bedrock:us-east-2:123456789012:application-inference-profile/company-opus-48",
+			},
+		];
+
+		for (const [index, saved] of cases.entries()) {
+			const timestamp = "2026-06-01T00:00:00.000Z";
+			const sessionFile = path.join(tempDir, `resume-selector-${index}.jsonl`);
+			await Bun.write(
+				sessionFile,
+				`${[
+					{ type: "session", version: 3, id: `resume-selector-${index}`, timestamp, cwd: tempDir },
+					{
+						type: "model_change",
+						id: "default-model",
+						parentId: null,
+						timestamp,
+						model: `${saved.provider}/${saved.model}`,
+						role: "default",
+					},
+				]
+					.map(entry => JSON.stringify(entry))
+					.join("\n")}\n`,
+			);
+			const { session } = await createAgentSession({
+				cwd: tempDir,
+				agentDir: tempDir,
+				authStorage,
+				modelRegistry,
+				sessionManager: await SessionManager.open(sessionFile, path.join(tempDir, `resume-selector-${index}`)),
+				settings: Settings.isolated(),
+				disableExtensionDiscovery: true,
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableMCP: false,
+				enableLsp: false,
+				skipPythonPreflight: true,
+			});
+			try {
+				expect(session.model?.provider).toBe(saved.provider);
+				expect(session.model?.id).toBe(saved.model);
+			} finally {
+				await session.dispose();
+			}
+		}
+	});
+
 	test("prefers the provider default over catalog order in the startup fallback", async () => {
 		// Regression: with an Anthropic key but no configured `default` role and no
 		// session/CLI model, the step-4 startup fallback used to pick the first

@@ -29,6 +29,7 @@ import { invalidateFsScanAfterWrite } from "../../tools/fs-cache-invalidation";
 import { isInternalUrlPath } from "../../tools/path-utils";
 import { enforcePlanModeWrite, resolvePlanPath, targetsLocalSandbox } from "../../tools/plan-mode-guard";
 import { canonicalSnapshotKey } from "../file-snapshot-store";
+import type { PersistentEditMutationExecutor } from "../modes/patch";
 import { isNotebookPath } from "../notebook";
 import { readEditFileText, serializeEditFileText } from "../read-file";
 import type { LspBatchRequest } from "../renderer";
@@ -44,6 +45,7 @@ export interface HashlineFilesystemOptions {
 	 * via {@link HashlineFilesystem.setBatchRequest}.
 	 */
 	batchRequest?: LspBatchRequest;
+	persistent?: PersistentEditMutationExecutor;
 }
 
 export class HashlineFilesystem extends Filesystem {
@@ -51,6 +53,7 @@ export class HashlineFilesystem extends Filesystem {
 	readonly #writethrough: WritethroughCallback;
 	readonly #beginDeferredDiagnosticsForPath: (path: string) => WritethroughDeferredHandle;
 	readonly #signal: AbortSignal | undefined;
+	readonly #persistent: PersistentEditMutationExecutor | undefined;
 	#batchRequest: LspBatchRequest | undefined;
 	#diagnosticsByPath = new Map<string, FileDiagnosticsResult | undefined>();
 
@@ -61,6 +64,7 @@ export class HashlineFilesystem extends Filesystem {
 		this.#beginDeferredDiagnosticsForPath = options.beginDeferredDiagnosticsForPath;
 		this.#signal = options.signal;
 		this.#batchRequest = options.batchRequest;
+		this.#persistent = options.persistent;
 	}
 
 	/**
@@ -84,14 +88,17 @@ export class HashlineFilesystem extends Filesystem {
 	}
 
 	resolveAbsolute(relativePath: string): string {
-		return resolvePlanPath(this.session, relativePath);
+		return this.#persistent ? this.#persistent.modelPath(relativePath) : resolvePlanPath(this.session, relativePath);
 	}
 
 	canonicalPath(relativePath: string): string {
-		return canonicalSnapshotKey(this.resolveAbsolute(relativePath));
+		return this.#persistent
+			? this.#persistent.modelPath(relativePath)
+			: canonicalSnapshotKey(this.resolveAbsolute(relativePath));
 	}
 
 	allowTagPathRecovery(authoredPath: string, resolvedPath: string): boolean {
+		if (this.#persistent) return false;
 		// Internal-URL authored targets (`local://`, `vault://`, …) are approved
 		// at the lower "read" privilege; never let one redirect onto a "write".
 		if (isInternalUrlPath(authoredPath)) return false;
@@ -111,14 +118,18 @@ export class HashlineFilesystem extends Filesystem {
 	async readText(relativePath: string): Promise<string> {
 		const absolutePath = this.resolveAbsolute(relativePath);
 		let content: string;
-		try {
-			content = await readEditFileText(absolutePath, relativePath);
-		} catch (error) {
-			if (isEnoent(error)) throw new NotFoundError(relativePath, error);
-			if (error instanceof Error && error.message === `File not found: ${relativePath}`) {
-				throw new NotFoundError(relativePath, error);
+		if (this.#persistent) {
+			content = await this.#persistent.read(absolutePath);
+		} else {
+			try {
+				content = await readEditFileText(absolutePath, relativePath);
+			} catch (error) {
+				if (isEnoent(error)) throw new NotFoundError(relativePath, error);
+				if (error instanceof Error && error.message === `File not found: ${relativePath}`) {
+					throw new NotFoundError(relativePath, error);
+				}
+				throw error;
 			}
-			throw error;
 		}
 		// Refuse edits against generated files (lockfiles, models.json, …).
 		assertEditableFileContent(content, relativePath, this.session.settings);
@@ -127,6 +138,7 @@ export class HashlineFilesystem extends Filesystem {
 
 	async readBinary(relativePath: string): Promise<Uint8Array | undefined> {
 		const absolutePath = this.resolveAbsolute(relativePath);
+		if (this.#persistent) return this.#persistent.readBinary(absolutePath);
 		if (isNotebookPath(absolutePath)) return undefined;
 		try {
 			return await fs.readFile(absolutePath);
@@ -137,6 +149,7 @@ export class HashlineFilesystem extends Filesystem {
 	}
 
 	async preflightWrite(relativePath: string, options?: PreflightWriteOptions): Promise<void> {
+		if (this.#persistent) return;
 		const fileOp = options?.fileOp;
 		if (fileOp?.kind === "rem") {
 			enforcePlanModeWrite(this.session, relativePath, { op: "delete" });
@@ -150,8 +163,13 @@ export class HashlineFilesystem extends Filesystem {
 	}
 
 	async delete(relativePath: string): Promise<void> {
-		enforcePlanModeWrite(this.session, relativePath, { op: "delete" });
 		const absolutePath = this.resolveAbsolute(relativePath);
+		if (this.#persistent) {
+			await this.#persistent.freeze([{ operation: "remove", path: absolutePath, recursive: false }]);
+			await this.#persistent.delete(absolutePath);
+			return;
+		}
+		enforcePlanModeWrite(this.session, relativePath, { op: "delete" });
 		try {
 			await fs.rm(absolutePath);
 		} catch (error) {
@@ -169,9 +187,24 @@ export class HashlineFilesystem extends Filesystem {
 	}
 
 	async move(fromRelative: string, toRelative: string, content?: string): Promise<void> {
-		enforcePlanModeWrite(this.session, fromRelative, { op: "update", move: toRelative });
 		const fromAbsolute = this.resolveAbsolute(fromRelative);
 		const toAbsolute = this.resolveAbsolute(toRelative);
+		if (this.#persistent) {
+			const canRename = content === undefined || (await this.#persistent.read(fromAbsolute)) === content;
+			if (canRename) {
+				await this.#persistent.freeze([{ operation: "rename", from: fromAbsolute, to: toAbsolute }]);
+				await this.#persistent.rename(fromAbsolute, toAbsolute);
+			} else {
+				await this.#persistent.freeze([
+					{ operation: "write_text", path: toAbsolute, content },
+					{ operation: "remove", path: fromAbsolute, recursive: false },
+				]);
+				await this.#persistent.write(toAbsolute, content);
+				await this.#persistent.delete(fromAbsolute);
+			}
+			return;
+		}
+		enforcePlanModeWrite(this.session, fromRelative, { op: "update", move: toRelative });
 		if (content !== undefined) {
 			await Bun.write(toAbsolute, content);
 			await fs.rm(fromAbsolute);
@@ -195,6 +228,12 @@ export class HashlineFilesystem extends Filesystem {
 	async writeText(relativePath: string, content: string): Promise<WriteResult> {
 		await this.preflightWrite(relativePath);
 		const absolutePath = this.resolveAbsolute(relativePath);
+		if (this.#persistent) {
+			await this.#persistent.freeze([{ operation: "write_text", path: absolutePath, content }]);
+			await this.#persistent.write(absolutePath, content);
+			this.#diagnosticsByPath.set(relativePath, undefined);
+			return { text: content };
+		}
 		const finalContent = await serializeEditFileText(absolutePath, relativePath, content);
 
 		// Route through ACP bridge when available; skips internal artifacts.
@@ -242,6 +281,6 @@ export class HashlineFilesystem extends Filesystem {
 
 	async exists(relativePath: string): Promise<boolean> {
 		const absolutePath = this.resolveAbsolute(relativePath);
-		return Bun.file(absolutePath).exists();
+		return this.#persistent ? this.#persistent.exists(absolutePath) : Bun.file(absolutePath).exists();
 	}
 }

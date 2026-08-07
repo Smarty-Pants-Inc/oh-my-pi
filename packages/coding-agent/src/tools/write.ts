@@ -27,6 +27,13 @@ import { getLanguageFromPath, highlightCode, type Theme } from "../modes/theme/t
 import writeDescription from "../prompts/tools/write.md" with { type: "text" };
 import type { ToolSession } from "../sdk";
 import { mapExecutionEnvironmentPath } from "../session/execution-environment";
+import {
+	canonicalRuntimeSha256,
+	deriveProviderSubrequestId,
+	type PersistentModelWorkspacePath,
+	type PersistentWorkspacePathMapper,
+	type WorkspaceOperationLease,
+} from "../session/workspace-runtime-contracts";
 import { fileHyperlink, framedBlock, renderStatusLine } from "../tui";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import {
@@ -514,6 +521,17 @@ function assertEnvironmentWriteSupported(writePath: string, content: string): vo
 		throw new ToolError("Environment writes do not support executable-mode preservation");
 	}
 }
+/** Persistent-only write routing supplied by CentralIntegration. */
+export interface PersistentWriteRouteV1 {
+	readonly paths: PersistentWorkspacePathMapper;
+	/** Acquires the caller-preallocated operation lease for one complete write call. */
+	begin(signal?: AbortSignal): Promise<WorkspaceOperationLease>;
+}
+
+export interface WriteToolOptions {
+	/** When present, ordinary workspace writes route only through the runtime bridge. */
+	readonly persistentRoute?: PersistentWriteRouteV1;
+}
 
 /**
  * Write tool implementation.
@@ -592,9 +610,13 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 	}
 
 	readonly #writethrough: WritethroughCallback;
+	readonly #persistentRoute: PersistentWriteRouteV1 | undefined;
 	readonly #deferredDiagnostics: DeferredDiagnostics | undefined;
-
-	constructor(private readonly session: ToolSession) {
+	constructor(
+		private readonly session: ToolSession,
+		options: WriteToolOptions = {},
+	) {
+		this.#persistentRoute = options.persistentRoute;
 		const enableLsp = session.enableLsp ?? true;
 		const enableFormat = enableLsp && session.settings.get("lsp.formatOnWrite");
 		const enableDiagnostics = enableLsp && session.settings.get("lsp.diagnosticsOnWrite");
@@ -1150,6 +1172,114 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		};
 	}
 
+	async #executePersistent(
+		rawPath: string,
+		content: string,
+		signal?: AbortSignal,
+		onUpdate?: AgentToolUpdateCallback<WriteToolDetails>,
+	): Promise<AgentToolResult<WriteToolDetails>> {
+		const route = this.#persistentRoute;
+		if (!route) throw new ToolError("Persistent write route is unavailable.");
+		const writePath = peelWriteUrlSelector(unwrapHashlineHeaderPath(rawPath));
+		const { text: cleanContent, stripped } = stripWriteContent(this.session, content);
+		if (
+			writePath.startsWith("~") ||
+			path.win32.isAbsolute(writePath) ||
+			path.win32.parse(writePath).root !== "" ||
+			URI_LIKE_WRITE_PATH_RE.test(writePath)
+		) {
+			throw new ToolError(`Persistent writes accept only paths relative to or rooted at ${route.paths.modelRoot}`);
+		}
+		assertEnvironmentWriteSupported(writePath, cleanContent);
+
+		let modelPath: PersistentModelWorkspacePath;
+		try {
+			if (route.paths.modelRoot !== "/workspace") throw new Error("unexpected persistent workspace root");
+			modelPath = route.paths.parse(writePath).modelPath;
+		} catch {
+			throw new ToolError(`Persistent writes accept only canonical files below ${route.paths.modelRoot}`);
+		}
+
+		return untilAborted(signal, async () => {
+			const lease = await route.begin(signal);
+			try {
+				const access = {
+					operationLeaseId: lease.operationLeaseId,
+					workspaceId: lease.binding.lease.replica.workspaceId,
+					expectedGeneration: lease.binding.lease.baseGeneration,
+					replicaId: lease.binding.lease.replica.replicaId,
+					leaseId: lease.binding.lease.leaseId,
+					fence: lease.binding.fence,
+				};
+				const contentSha256 = new Bun.SHA256().update(cleanContent).digest("hex");
+				const byteLength = Buffer.byteLength(cleanContent, "utf8");
+				const requestId = await deriveProviderSubrequestId({
+					workspaceId: access.workspaceId,
+					parentKind: "workspace_operation",
+					parentId: lease.operationLeaseId,
+					ordinal: 0,
+					operation: "write_text",
+				});
+				const requestSha256 = await canonicalRuntimeSha256([
+					"omp-runtime-request-v1",
+					"write_text",
+					lease.operationLeaseId,
+					access.workspaceId,
+					access.expectedGeneration,
+					access.replicaId,
+					access.leaseId,
+					access.fence.fenceId,
+					modelPath,
+					contentSha256,
+					byteLength,
+				]);
+				emitWriteProgress(onUpdate, cleanContent, modelPath, modelPath);
+				const mutation = await lease.binding.bridge.writeTextFile({
+					...access,
+					requestId,
+					requestSha256,
+					path: modelPath,
+					content: cleanContent,
+					contentSha256,
+				});
+				if (
+					(mutation.status !== "written" && mutation.status !== "already_written") ||
+					mutation.path !== modelPath ||
+					mutation.sha256 !== contentSha256 ||
+					mutation.byteLength !== byteLength
+				) {
+					throw new ToolError("Persistent write provider returned an invalid mutation receipt");
+				}
+				const verification = await lease.binding.bridge.readTextFile({
+					...access,
+					path: modelPath,
+					line: null,
+					limit: null,
+					byteLimit: byteLength,
+				});
+				if (
+					verification.path !== modelPath ||
+					verification.content !== cleanContent ||
+					verification.sha256 !== contentSha256 ||
+					verification.byteLength !== byteLength
+				) {
+					throw new ToolError(
+						"Persistent write provider verification failed: remote content did not match the requested text",
+					);
+				}
+
+				let resultText = `Successfully wrote ${cleanContent.length} bytes to ${modelPath}`;
+				if (stripped) resultText += "\nNote: auto-stripped hashline display prefixes from content before writing.";
+				return { content: [{ type: "text", text: resultText }], details: { resolvedPath: modelPath } };
+			} catch (error) {
+				if (error instanceof ToolError) throw error;
+				throw new ToolError(error instanceof Error ? error.message : String(error));
+			} finally {
+				lease.end();
+			}
+		});
+	}
+
 	async execute(
 		_toolCallId: string,
 		{ path: rawPath, content }: WriteParams,
@@ -1157,6 +1287,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		onUpdate?: AgentToolUpdateCallback<WriteToolDetails>,
 		context?: AgentToolContext,
 	): Promise<AgentToolResult<WriteToolDetails>> {
+		if (this.#persistentRoute) return this.#executePersistent(rawPath, content, signal, onUpdate);
 		// Strip a hashline `[path#TAG]` wrapper up front so every downstream
 		// decision (scheme routing, internal-URL handler dispatch, plan-mode
 		// guard, plan path resolution, ACP bridge routing) sees the same

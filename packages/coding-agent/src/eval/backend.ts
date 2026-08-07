@@ -1,5 +1,6 @@
 import { buildEvalUrlRoots, type LocalProtocolOptions } from "../internal-urls";
 import type { ToolSession } from "../tools";
+import type { EvalAgentLifecycleContextV1 } from "./lifecycle";
 import type { EvalDisplayOutput, EvalLanguage, EvalStatusEvent } from "./types";
 
 /** Per-cell execute() options. */
@@ -10,6 +11,7 @@ export interface ExecutorBackendExecOptions {
 	kernelOwnerId: string | undefined;
 	signal?: AbortSignal;
 	session: ToolSession;
+	evalAgentLifecycle?: EvalAgentLifecycleContextV1;
 	/**
 	 * Runtime-work budget in milliseconds (the cell's `timeout`). Cancellation is
 	 * driven entirely by `signal`, which the eval tool arms as a watchdog that

@@ -14,9 +14,20 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import {
 	type ExecutionEnvironmentBinding,
 	type ExecutionEnvironmentProvider,
+	ExecutionEnvironmentReleaseIndeterminateErrorV1,
+	freezeExecutionEnvironmentRuntimeReleaseAuthorityV1,
 	mapExecutionEnvironmentPath,
+	reconcileExecutionEnvironmentRuntimeReleaseV1,
+	requireExecutionEnvironmentReleaseResultV1,
 } from "@oh-my-pi/pi-coding-agent/session/execution-environment";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import {
+	canonicalRuntimeProviderInspectionSha256V1,
+	type RuntimeLeaseRef,
+	type RuntimeLeaseReleaseInspectRequest,
+	type RuntimeLeaseReleaseResult,
+	type RuntimeReplicaRef,
+} from "@oh-my-pi/pi-coding-agent/session/workspace-runtime-contracts";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 
@@ -77,6 +88,139 @@ describe("execution environment workspace path mapping", () => {
 		expect(() => mapExecutionEnvironmentPath(roots, "/local/worktree/../outside.txt")).toThrow("canonical");
 		expect(() => mapExecutionEnvironmentPath(roots, "/workspace/src/../index.ts")).toThrow("canonical");
 		expect(() => mapExecutionEnvironmentPath(roots, "")).toThrow("non-empty");
+	});
+});
+
+describe("execution environment release authority", () => {
+	const replica: RuntimeReplicaRef = {
+		providerId: "provider-release-test",
+		profileId: "profile-release-test",
+		replicaId: "replica-release-test",
+		workspaceId: "workspace-release-test",
+	};
+	const lease: RuntimeLeaseRef = {
+		leaseId: "lease-release-test",
+		replica,
+		fenceId: "fence-release-test",
+		baseGeneration: 0,
+		renewalSequence: 0,
+		acquiredAt: "2030-01-01T00:00:00.000Z",
+		renewBy: "2030-01-01T00:05:00.000Z",
+		expiresAt: "2030-01-01T00:10:00.000Z",
+	};
+	const fence = { fenceId: lease.fenceId, token: "volatile-release-fence-token" };
+
+	async function fixture() {
+		const draft = {
+			requestId: "a".repeat(64),
+			requestSha256: "",
+			parentOperationId: "transition-release-test",
+			replica,
+			leaseId: lease.leaseId,
+		};
+		const request: RuntimeLeaseReleaseInspectRequest = {
+			...draft,
+			requestSha256: await canonicalRuntimeProviderInspectionSha256V1({ operation: "release", request: draft }),
+		};
+		const result: RuntimeLeaseReleaseResult = {
+			status: "released",
+			request: {
+				requestId: request.requestId,
+				requestSha256: request.requestSha256,
+				parentOperationId: request.parentOperationId,
+			},
+			replica,
+			leaseId: lease.leaseId,
+			compute: "stopped",
+		};
+		return { request, result };
+	}
+
+	test("accepts and freezes only the exact total release receipt", async () => {
+		const { result } = await fixture();
+		const decoded = await requireExecutionEnvironmentReleaseResultV1(result);
+		expect(decoded).toEqual(result);
+		expect(Object.isFrozen(decoded)).toBe(true);
+		expect(Object.isFrozen(decoded.request)).toBe(true);
+		expect(Object.isFrozen(decoded.replica)).toBe(true);
+		await expect(
+			requireExecutionEnvironmentReleaseResultV1({ status: "released", leaseId: lease.leaseId }),
+		).rejects.toMatchObject({ code: "EXECUTION_ENVIRONMENT_RELEASE_CONTRACT_INVALID" });
+	});
+
+	test("adopts a lost release response only from the exact inspection", async () => {
+		const { request, result } = await fixture();
+		let releaseCalls = 0;
+		let inspectionCalls = 0;
+		const authority = await freezeExecutionEnvironmentRuntimeReleaseAuthorityV1({
+			provider: {
+				id: replica.providerId,
+				async release() {
+					releaseCalls += 1;
+					throw new Error("response lost after commit");
+				},
+				async inspectRelease() {
+					inspectionCalls += 1;
+					return { status: "complete", result };
+				},
+			},
+			lease,
+			fence,
+			request,
+		});
+		expect(Object.isFrozen(authority)).toBe(true);
+		expect(Object.isFrozen(authority.provider)).toBe(true);
+		expect(Object.isFrozen(authority.lease)).toBe(true);
+		expect(Object.isFrozen(authority.lease.replica)).toBe(true);
+		expect(Object.isFrozen(authority.fence)).toBe(true);
+		expect(Object.isFrozen(authority.request)).toBe(true);
+		expect(authority.provider.id).toBe(authority.lease.replica.providerId);
+		expect(authority.fence.fenceId).toBe(authority.lease.fenceId);
+		expect(authority.request.replica).toEqual(authority.lease.replica);
+		expect(authority.request.leaseId).toBe(authority.lease.leaseId);
+		expect(await reconcileExecutionEnvironmentRuntimeReleaseV1(authority)).toEqual(result);
+		expect(releaseCalls).toBe(1);
+		expect(inspectionCalls).toBe(1);
+	});
+
+	test("keeps a repeatedly unobserved release typed and recoverable", async () => {
+		const { request } = await fixture();
+		const authority = await freezeExecutionEnvironmentRuntimeReleaseAuthorityV1({
+			provider: {
+				id: replica.providerId,
+				async release() {
+					throw new Error("release response unavailable");
+				},
+				async inspectRelease() {
+					return {
+						status: "not_requested" as const,
+						request: {
+							requestId: request.requestId,
+							requestSha256: request.requestSha256,
+							parentOperationId: request.parentOperationId,
+						},
+						replica,
+						leaseId: lease.leaseId,
+					};
+				},
+			},
+			lease,
+			fence,
+			request,
+		});
+		let failure: unknown;
+		try {
+			await reconcileExecutionEnvironmentRuntimeReleaseV1(authority);
+		} catch (error) {
+			failure = error;
+		}
+		expect(failure).toBeInstanceOf(ExecutionEnvironmentReleaseIndeterminateErrorV1);
+		expect(failure).toMatchObject({
+			code: "EXECUTION_ENVIRONMENT_RELEASE_INDETERMINATE",
+			recoverable: true,
+			request,
+			inspection: { status: "not_requested" },
+		});
 	});
 });
 

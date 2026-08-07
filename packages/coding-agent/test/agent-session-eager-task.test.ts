@@ -14,6 +14,7 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { TodoTool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
+import { createTestRuntimeDependencies } from "./utilities";
 
 type ObservedPromptCall = {
 	toolChoice: string | undefined;
@@ -175,6 +176,7 @@ describe("AgentSession eager task prelude", () => {
 			sessionManager,
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			toolRegistry,
 			agentId,
 			agentKind,

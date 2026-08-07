@@ -13,6 +13,7 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { Semaphore } from "@oh-my-pi/pi-coding-agent/task/parallel";
 import { wrapStreamFnWithProviderConcurrency } from "@oh-my-pi/pi-coding-agent/task/provider-concurrency";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities.js";
 
 interface Deferred {
 	promise: Promise<void>;
@@ -87,7 +88,13 @@ describe("issue #3464: ollama-cloud task backoff", () => {
 		});
 		settings.setModelRole("task", `${primary.provider}/${primary.id}`);
 
-		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
+		});
 
 		await session.prompt("Task role should inherit the default fallback chain");
 		await session.waitForIdle();

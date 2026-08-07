@@ -1578,6 +1578,68 @@ describe("agentLoop with AgentMessage", () => {
 		expect(sawInterruptInContext).toBe(true);
 	});
 
+	it("holds a missing owner-selected tool error until its lifecycle observation is durable", async () => {
+		const observed = Promise.withResolvers<void>();
+		const allowEmission = Promise.withResolvers<void>();
+		const mock = createMockModel({
+			responses: [
+				{
+					content: [
+						{ type: "toolCall", id: "missing-custom", name: "custom-lifecycle", arguments: { value: "inspect" } },
+					],
+				},
+				{ content: ["done"] },
+			],
+		});
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			lifecyclePersistenceAdapter: {
+				hasLifecycleAuthority: (toolCallId, toolName) =>
+					toolCallId === "missing-custom" && toolName === "custom-lifecycle",
+				onLifecycleObservation: async () => {
+					observed.resolve();
+					await allowEmission.promise;
+					return {
+						status: "observation_durable",
+						resultExposure: "continue_original_emission",
+						terminalization: "awaiting_message_end_primary_persistence",
+						observationReceiptSha256: "observation",
+						terminalReceiptSha256: null,
+						suspension: null,
+						resumeRequest: null,
+					};
+				},
+				resumeLifecycleObservation: async () => {
+					throw new Error("lifecycle observation must not resume after direct durability");
+				},
+				persistToolResultBeforeEmission: async request => ({
+					exactToolResultMessage: request.exactToolResultMessage,
+				}),
+			},
+		};
+		const events: AgentEvent[] = [];
+		const stream = agentLoop(
+			[createUserMessage("start")],
+			{ systemPrompt: [""], messages: [], tools: [] },
+			config,
+			undefined,
+			mock.stream,
+		);
+		const consuming = (async () => {
+			for await (const event of stream) events.push(event);
+		})();
+
+		await observed.promise;
+		expect(events.some(event => event.type === "tool_execution_end")).toBe(false);
+
+		allowEmission.resolve();
+		await consuming;
+		expect(events).toContainEqual(
+			expect.objectContaining({ type: "tool_execution_end", toolCallId: "missing-custom", isError: true }),
+		);
+	});
+
 	it("should skip remaining tool calls with system advisory wording when advisor steering is queued", async () => {
 		const toolSchema = type({ value: "string" });
 		const executed: string[] = [];
@@ -5120,5 +5182,107 @@ describe("agentLoop kCursorExecResolved (issue #4348)", () => {
 		if (executionStarts[0]?.type !== "tool_execution_start") throw new Error("expected tool_execution_start");
 		expect(executionStarts[0].toolCallId).toBe("runnable-1");
 		expect(executionStarts[0].toolName).toBe("echo");
+	});
+});
+
+describe("agentLoop first assistant content observation", () => {
+	async function collectTimestamps(events: AssistantMessageEvent[]): Promise<number[]> {
+		const timestamps: number[] = [];
+		const stream = agentLoop(
+			[createUserMessage("observe")],
+			{ systemPrompt: ["You are helpful."], messages: [], tools: [] },
+			{
+				model: createMockModel().model,
+				convertToLlm: identityConverter,
+				onFirstAssistantContent: timestamp => timestamps.push(timestamp),
+			},
+			undefined,
+			() => {
+				const response = new AssistantMessageEventStream();
+				for (const event of events) response.push(event);
+				return response;
+			},
+		);
+		await stream.result();
+		return timestamps;
+	}
+
+	it("observes a text-first stream", async () => {
+		const partial = createAssistantMessage([{ type: "text", text: "hello" }]);
+		const timestamps = await collectTimestamps([
+			{ type: "start", partial },
+			{ type: "text_delta", contentIndex: 0, delta: "hello", partial },
+			{ type: "done", reason: "stop", message: partial },
+		]);
+		expect(timestamps).toHaveLength(1);
+		expect(timestamps[0]).toBeGreaterThan(0);
+	});
+
+	it("observes a thinking-first stream", async () => {
+		const partial = createAssistantMessage([{ type: "thinking", thinking: "plan" }]);
+		const timestamps = await collectTimestamps([
+			{ type: "start", partial },
+			{ type: "thinking_delta", contentIndex: 0, delta: "plan", partial },
+			{ type: "done", reason: "stop", message: partial },
+		]);
+		expect(timestamps).toHaveLength(1);
+	});
+
+	it("observes a tool-call-first stream", async () => {
+		const toolCall = { type: "toolCall" as const, id: "first-call", name: "missing", arguments: {} };
+		const partial = createAssistantMessage([toolCall], "error");
+		const timestamps = await collectTimestamps([
+			{ type: "start", partial },
+			{ type: "toolcall_start", contentIndex: 0, partial },
+			{ type: "error", reason: "error", error: partial },
+		]);
+		expect(timestamps).toHaveLength(1);
+	});
+
+	it("does not duplicate the timestamp for repeated content deltas", async () => {
+		const partial = createAssistantMessage([{ type: "text", text: "hello" }]);
+		const timestamps = await collectTimestamps([
+			{ type: "start", partial },
+			{ type: "text_delta", contentIndex: 0, delta: "he", partial },
+			{ type: "text_delta", contentIndex: 0, delta: "llo", partial },
+			{ type: "done", reason: "stop", message: partial },
+		]);
+		expect(timestamps).toHaveLength(1);
+	});
+
+	it("does not observe a terminal assistant message without content", async () => {
+		const partial = createAssistantMessage([]);
+		const timestamps = await collectTimestamps([
+			{ type: "start", partial },
+			{ type: "done", reason: "stop", message: partial },
+		]);
+		expect(timestamps).toEqual([]);
+	});
+});
+
+describe("agentLoop first assistant content terminal observation", () => {
+	it("observes a tool-only terminal event without streamed content", async () => {
+		const timestamps: number[] = [];
+		const toolCall = { type: "toolCall" as const, id: "terminal-call", name: "missing", arguments: {} };
+		const partial = createAssistantMessage([toolCall], "error");
+		const stream = agentLoop(
+			[createUserMessage("observe terminal tool")],
+			{ systemPrompt: ["You are helpful."], messages: [], tools: [] },
+			{
+				model: createMockModel().model,
+				convertToLlm: identityConverter,
+				onFirstAssistantContent: timestamp => timestamps.push(timestamp),
+			},
+			undefined,
+			() => {
+				const response = new AssistantMessageEventStream();
+				response.push({ type: "start", partial });
+				response.push({ type: "error", reason: "error", error: partial });
+				return response;
+			},
+		);
+
+		await stream.result();
+		expect(timestamps).toHaveLength(1);
 	});
 });

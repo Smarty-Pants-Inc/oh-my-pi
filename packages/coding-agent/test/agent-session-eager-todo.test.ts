@@ -16,6 +16,7 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { TodoTool } from "@oh-my-pi/pi-coding-agent/tools";
 import { setInteractiveHost, TempDir } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
+import { createTestRuntimeDependencies } from "./utilities";
 
 type ObservedPromptCall = {
 	toolChoice: string | undefined;
@@ -104,7 +105,7 @@ describe("AgentSession eager todo enforcement", () => {
 
 	async function createSession(
 		settingsOverride: Record<string, unknown> = {},
-		sessionOverride: Partial<AgentSessionConfig> = {},
+		sessionOverride: Pick<AgentSessionConfig, "agentKind"> = {},
 	): Promise<void> {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");
@@ -181,19 +182,21 @@ describe("AgentSession eager todo enforcement", () => {
 			[mockBashTool.name, mockBashTool],
 		]);
 
-		session = new AgentSession({
+		const config: AgentSessionConfig = {
 			agent,
 			sessionManager,
 			settings,
 			modelRegistry,
 			toolRegistry,
-			...sessionOverride,
-		});
+			...createTestRuntimeDependencies(modelRegistry),
+		};
+		if (sessionOverride.agentKind !== undefined) config.agentKind = sessionOverride.agentKind;
+		session = new AgentSession(config);
 	}
 
 	async function recreateSession(
 		settingsOverride: Record<string, unknown> = {},
-		sessionOverride: Partial<AgentSessionConfig> = {},
+		sessionOverride: Pick<AgentSessionConfig, "agentKind"> = {},
 	): Promise<void> {
 		await session.dispose();
 		authStorage?.close();

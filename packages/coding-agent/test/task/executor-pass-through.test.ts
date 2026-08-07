@@ -18,6 +18,7 @@ import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent, PromptOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { ExecutionEnvironmentBinding } from "@oh-my-pi/pi-coding-agent/session/execution-environment";
+import { WorkspaceRuntimeProviderRegistry } from "@oh-my-pi/pi-coding-agent/session/workspace-provider-registry";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import {
 	ENVIRONMENT_SUBAGENT_RUNTIME_PROFILE,
@@ -77,6 +78,7 @@ function yieldEmittingSession(): AgentSession {
 function createSessionResult(session: AgentSession): CreateAgentSessionResult {
 	return {
 		session,
+		runtimeProviderRegistry: new WorkspaceRuntimeProviderRegistry(),
 		extensionsResult: { extensions: [], errors: [], runtime: {} as unknown } as unknown as LoadExtensionsResult,
 		setToolUIContext: () => {},
 		eventBus: new EventBus(),

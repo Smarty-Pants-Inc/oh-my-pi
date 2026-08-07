@@ -6,6 +6,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { RegistryModelConnectionResolver } from "@oh-my-pi/pi-coding-agent/config/model-connection-resolver";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
@@ -13,6 +14,7 @@ import type { SecretObfuscator } from "@oh-my-pi/pi-coding-agent/secrets/obfusca
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { WorkspaceRuntimeProviderRegistry } from "@oh-my-pi/pi-coding-agent/session/workspace-provider-registry";
 import { createTools, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { Snowflake } from "@oh-my-pi/pi-utils";
 import { e2eApiKey } from "../../ai/test/oauth";
@@ -43,6 +45,12 @@ export interface TestSessionContext {
 	sessionManager: SessionManager;
 	tempDir: string;
 	cleanup: () => Promise<void>;
+}
+export function createTestRuntimeDependencies(modelRegistry: ModelRegistry) {
+	return {
+		runtimeProviderRegistry: new WorkspaceRuntimeProviderRegistry(),
+		modelConnectionResolver: new RegistryModelConnectionResolver(modelRegistry),
+	};
 }
 
 /**
@@ -109,11 +117,13 @@ export async function createTestSession(options: TestSessionOptions = {}): Promi
 
 	const authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"));
 	const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+	const runtimeDependencies = createTestRuntimeDependencies(modelRegistry);
 	const session = new AgentSession({
 		agent,
 		sessionManager,
 		settings,
 		modelRegistry,
+		...runtimeDependencies,
 		extensionRunner: options.extensionRunner,
 		obfuscator: options.obfuscator,
 	});

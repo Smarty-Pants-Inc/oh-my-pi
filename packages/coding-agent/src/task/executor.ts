@@ -4,6 +4,7 @@
  * Runs each subagent on the main thread and forwards AgentEvents for progress tracking.
  */
 
+import { createHash } from "node:crypto";
 import path from "node:path";
 import type { AgentEvent, AgentIdentity, AgentMessage, AgentTelemetryConfig } from "@oh-my-pi/pi-agent-core";
 import { recordHandoff, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
@@ -39,7 +40,8 @@ import submitReminderTemplate from "../prompts/system/subagent-yield-reminder.md
 import { AgentLifecycleManager, type AgentReviver } from "../registry/agent-lifecycle";
 import { AgentRegistry } from "../registry/agent-registry";
 import { type CreateAgentSessionOptions, createAgentSession, discoverAuthStorage } from "../sdk";
-import type { AgentSession, AgentSessionEvent, Prewalk } from "../session/agent-session";
+import type { AgentSession, AgentSessionEvent, AsyncJobSnapshotItem, Prewalk } from "../session/agent-session";
+import type { AgentSessionTransientTaskCurrentParentLocatorV1 } from "../session/agent-session-types";
 import type { ArtifactManager } from "../session/artifacts";
 import { ASYNC_RESULT_MESSAGE_TYPE } from "../session/async-job-delivery";
 import type { AuthStorage } from "../session/auth-storage";
@@ -47,6 +49,32 @@ import { type ExecutionEnvironmentBinding, mapExecutionEnvironmentPath } from ".
 import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../session/messages";
 import { SessionManager } from "../session/session-manager";
 import { truncateTail } from "../session/streaming-output";
+import {
+	TRANSIENT_TASK_CONTROLLER_INTERRUPTED_RESULT_TEXT_V1,
+	TRANSIENT_TASK_DETACHED_PRE_EXECUTION_ABORT_JOB_ERROR_TEXT_V1,
+	TRANSIENT_TASK_OUTCOME_PAYLOAD_BYTES_MAX_V1,
+	TRANSIENT_TASK_OUTCOME_PAYLOAD_BYTES_MIN_V1,
+	TRANSIENT_TASK_RESULTLESS_REPRESENTABILITY_PREFLIGHT_TOOL_ERROR_TEXT_V1,
+	TRANSIENT_TASK_RESULTLESS_SOURCE_UNREPRESENTABLE_RESULT_TEXT_V1,
+	TRANSIENT_TASK_SINGLE_RESULT_INVALID_RESULT_TEXT_V1,
+	TRANSIENT_TASK_SINGLE_RESULT_PAYLOAD_TOO_LARGE_RESULT_TEXT_V1,
+	type TransientTaskOutcomeDocumentEncodingV1,
+	type TransientTaskOutcomeDocumentV1,
+	type TransientTaskOutcomePayloadByteBudgetV1,
+	type TransientTaskOutcomeStructuredOutputV1,
+	type TransientTaskOutcomeUsageV1,
+	type TransientTaskResultlessRepresentabilityPreflightResultV1,
+	type TransientTaskResultlessRepresentabilityPreflightV1,
+	type TransientTaskResultlessTerminalErrorEnvelopeV1,
+	type TransientTaskResultlessTerminalOutcomeDocumentV1,
+	type TransientTaskResultlessTerminalProjectionV1,
+	type TransientTaskResultlessTerminalSourceV1,
+	type TransientTaskSafeJsonValueV1,
+	type TransientTaskSingleResultDocumentV1,
+	type TransientTaskSingleResultOutcomeDocumentV1,
+	type TransientTaskSingleResultProjectionResultV1,
+	type TransientTaskSingleResultTerminalClassificationV1,
+} from "../session/workspace-runtime-contracts";
 import { type ConfiguredThinkingLevel, prewalkWouldBeNoop, resolveTaskEffortLevel, type TaskEffort } from "../thinking";
 import type { ContextFileEntry, ToolSession } from "../tools";
 import { resolveEvalBackends } from "../tools/eval-backends";
@@ -73,6 +101,7 @@ import {
 	MAX_OUTPUT_BYTES,
 	MAX_OUTPUT_LINES,
 	type SingleResult,
+	StructuredSubagentError,
 	type StructuredSubagentOutput,
 	type StructuredSubagentSchemaMode,
 	type StructuredSubagentSchemaSource,
@@ -87,6 +116,1022 @@ import { arrayValuedLabels, assembleYieldResult } from "./yield-assembly";
 export type { YieldItem } from "./types";
 
 const MCP_CALL_TIMEOUT_MS = 60_000;
+
+const OUTCOME_TEXT_ENCODER = new TextEncoder();
+const OUTCOME_TEXT_DECODER = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+const SINGLE_RESULT_REQUIRED_KEYS = [
+	"index",
+	"id",
+	"agent",
+	"agentSource",
+	"task",
+	"exitCode",
+	"output",
+	"stderr",
+	"truncated",
+	"durationMs",
+	"tokens",
+	"requests",
+] as const;
+const SINGLE_RESULT_OPTIONAL_KEYS = [
+	"assignment",
+	"description",
+	"lastIntent",
+	"structuredOutput",
+	"contextTokens",
+	"contextWindow",
+	"modelOverride",
+	"resolvedModel",
+	"resolvedModelIsFallback",
+	"error",
+	"aborted",
+	"abortReason",
+	"usage",
+	"outputPath",
+	"patchPath",
+	"branchName",
+	"branchBaseSha",
+	"nestedPatches",
+	"extractedToolData",
+	"retryFailure",
+	"outputMeta",
+] as const;
+const SINGLE_RESULT_KEYS = [...SINGLE_RESULT_REQUIRED_KEYS, ...SINGLE_RESULT_OPTIONAL_KEYS] as const;
+
+function isWellFormedOutcomeUnicode(value: string): boolean {
+	for (let index = 0; index < value.length; index++) {
+		const codeUnit = value.charCodeAt(index);
+		if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+			const next = value.charCodeAt(++index);
+			if (next < 0xdc00 || next > 0xdfff) return false;
+		} else if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
+			return false;
+		}
+	}
+	return true;
+}
+
+function copyOutcomeString(value: unknown, nonEmpty = false): string | null {
+	return typeof value === "string" && (!nonEmpty || value.length > 0) && isWellFormedOutcomeUnicode(value)
+		? value
+		: null;
+}
+
+function copyOutcomeInteger(value: unknown, minimum = 0): number | null {
+	return typeof value === "number" && Number.isSafeInteger(value) && !Object.is(value, -0) && value >= minimum
+		? value
+		: null;
+}
+
+function copyOutcomeNumber(value: unknown, minimum = 0): number | null {
+	return typeof value === "number" && Number.isFinite(value) && !Object.is(value, -0) && value >= minimum
+		? value
+		: null;
+}
+
+function readClosedOutcomeRecord(
+	value: unknown,
+	allowedKeys: readonly string[],
+): Readonly<Record<string, unknown>> | null {
+	if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+	try {
+		const prototype = Object.getPrototypeOf(value);
+		if (prototype !== Object.prototype && prototype !== null) return null;
+		const keys = Reflect.ownKeys(value);
+		const descriptors = Object.getOwnPropertyDescriptors(value);
+		const copy: Record<string, unknown> = Object.create(null);
+		for (const key of keys) {
+			if (typeof key !== "string" || !allowedKeys.includes(key)) return null;
+			const descriptor = descriptors[key];
+			if (!descriptor?.enumerable || !("value" in descriptor)) return null;
+			copy[key] = descriptor.value;
+		}
+		return copy;
+	} catch {
+		return null;
+	}
+}
+
+function hasExactOutcomeKeys(record: Readonly<Record<string, unknown>>, expected: readonly string[]): boolean {
+	const keys = Object.keys(record);
+	return keys.length === expected.length && expected.every(key => Object.hasOwn(record, key));
+}
+
+function compareOutcomeUtf8Keys(left: string, right: string): number {
+	return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
+}
+
+function copySafeOutcomeJson(
+	value: unknown,
+	ancestors = new WeakSet<object>(),
+): TransientTaskSafeJsonValueV1 | undefined {
+	if (value === null || typeof value === "boolean") return value;
+	if (typeof value === "string") return isWellFormedOutcomeUnicode(value) ? value : undefined;
+	if (typeof value === "number") {
+		return Number.isFinite(value) && !Object.is(value, -0) ? value : undefined;
+	}
+	if (typeof value !== "object") return undefined;
+	if (ancestors.has(value)) return undefined;
+	ancestors.add(value);
+	try {
+		if (Array.isArray(value)) {
+			if (Object.getPrototypeOf(value) !== Array.prototype) return undefined;
+			const descriptors = Object.getOwnPropertyDescriptors(value);
+			const keys = Reflect.ownKeys(value);
+			if (keys.length !== value.length + 1 || !keys.includes("length")) return undefined;
+			const result: TransientTaskSafeJsonValueV1[] = [];
+			for (let index = 0; index < value.length; index++) {
+				const key = String(index);
+				const descriptor = descriptors[key];
+				if (!descriptor?.enumerable || !("value" in descriptor)) return undefined;
+				const item = copySafeOutcomeJson(descriptor.value, ancestors);
+				if (item === undefined) return undefined;
+				result.push(item);
+			}
+			return result;
+		}
+		const prototype = Object.getPrototypeOf(value);
+		if (prototype !== Object.prototype && prototype !== null) return undefined;
+		const descriptors = Object.getOwnPropertyDescriptors(value);
+		const keys = Reflect.ownKeys(value);
+		if (keys.some(key => typeof key !== "string" || !isWellFormedOutcomeUnicode(key))) return undefined;
+		const result: Record<string, TransientTaskSafeJsonValueV1> = Object.create(null);
+		for (const key of (keys as string[]).sort(compareOutcomeUtf8Keys)) {
+			const descriptor = descriptors[key];
+			if (!descriptor?.enumerable || !("value" in descriptor)) return undefined;
+			const item = copySafeOutcomeJson(descriptor.value, ancestors);
+			if (item === undefined) return undefined;
+			result[key] = item;
+		}
+		return result;
+	} catch {
+		return undefined;
+	} finally {
+		ancestors.delete(value);
+	}
+}
+
+function copyStructuredOutcome(value: unknown): TransientTaskOutcomeStructuredOutputV1 | null {
+	const record = readClosedOutcomeRecord(value, ["source", "mode", "status", "data", "error"]);
+	if (!record) return null;
+	if (!(["caller", "agent", "session", "none"] as const).includes(record.source as never)) return null;
+	if (record.mode !== "permissive" && record.mode !== "strict") return null;
+	if (record.status !== "valid" && record.status !== "invalid" && record.status !== "unavailable") return null;
+	const output: {
+		source: TransientTaskOutcomeStructuredOutputV1["source"];
+		mode: TransientTaskOutcomeStructuredOutputV1["mode"];
+		status: TransientTaskOutcomeStructuredOutputV1["status"];
+		data?: TransientTaskSafeJsonValueV1;
+		error?: string;
+	} = {
+		source: record.source as TransientTaskOutcomeStructuredOutputV1["source"],
+		mode: record.mode,
+		status: record.status,
+	};
+	if (Object.hasOwn(record, "data") && record.data !== undefined) {
+		const data = copySafeOutcomeJson(record.data);
+		if (data === undefined) return null;
+		output.data = data;
+	}
+	if (Object.hasOwn(record, "error") && record.error !== undefined) {
+		const error = copyOutcomeString(record.error);
+		if (error === null) return null;
+		output.error = error;
+	}
+	return output;
+}
+
+function copyUsageSubrecord(value: unknown, keys: readonly string[]): Readonly<Record<string, number>> | null {
+	const record = readClosedOutcomeRecord(value, keys);
+	if (!record) return null;
+	const result: Record<string, number> = {};
+	for (const key of keys) {
+		if (!Object.hasOwn(record, key)) continue;
+		const number = copyOutcomeNumber(record[key]);
+		if (number === null) return null;
+		result[key] = number;
+	}
+	return result;
+}
+
+function copyOutcomeUsage(value: unknown): TransientTaskOutcomeUsageV1 | null {
+	const record = readClosedOutcomeRecord(value, [
+		"input",
+		"output",
+		"cacheRead",
+		"cacheWrite",
+		"totalTokens",
+		"contextTokens",
+		"orchestration",
+		"premiumRequests",
+		"reasoningTokens",
+		"cttl",
+		"server",
+		"cost",
+	]);
+	if (!record) return null;
+	const required = ["input", "output", "cacheRead", "cacheWrite", "totalTokens"] as const;
+	const base: Record<string, unknown> = {};
+	for (const key of required) {
+		if (!Object.hasOwn(record, key)) return null;
+		const number = copyOutcomeNumber(record[key]);
+		if (number === null) return null;
+		base[key] = number;
+	}
+	for (const key of ["contextTokens", "premiumRequests", "reasoningTokens"] as const) {
+		if (!Object.hasOwn(record, key) || record[key] === undefined) continue;
+		const number = copyOutcomeNumber(record[key]);
+		if (number === null) return null;
+		base[key] = number;
+	}
+	const orchestration =
+		Object.hasOwn(record, "orchestration") && record.orchestration !== undefined
+			? copyUsageSubrecord(record.orchestration, ["input", "cacheRead", "output"])
+			: undefined;
+	if (Object.hasOwn(record, "orchestration") && record.orchestration !== undefined && !orchestration) return null;
+	const cttl =
+		Object.hasOwn(record, "cttl") && record.cttl !== undefined
+			? copyUsageSubrecord(record.cttl, ["ephemeral5m", "ephemeral1h"])
+			: undefined;
+	if (Object.hasOwn(record, "cttl") && record.cttl !== undefined && !cttl) return null;
+	const server =
+		Object.hasOwn(record, "server") && record.server !== undefined
+			? copyUsageSubrecord(record.server, ["webSearch", "webFetch"])
+			: undefined;
+	if (Object.hasOwn(record, "server") && record.server !== undefined && !server) return null;
+	if (!Object.hasOwn(record, "cost")) return null;
+	const cost = copyUsageSubrecord(record.cost, ["input", "output", "cacheRead", "cacheWrite", "total"]);
+	if (!cost || Object.keys(cost).length !== 5) return null;
+	return {
+		input: base.input as number,
+		output: base.output as number,
+		cacheRead: base.cacheRead as number,
+		cacheWrite: base.cacheWrite as number,
+		totalTokens: base.totalTokens as number,
+		...(base.contextTokens !== undefined ? { contextTokens: base.contextTokens as number } : {}),
+		...(orchestration ? { orchestration } : {}),
+		...(base.premiumRequests !== undefined ? { premiumRequests: base.premiumRequests as number } : {}),
+		...(base.reasoningTokens !== undefined ? { reasoningTokens: base.reasoningTokens as number } : {}),
+		...(cttl ? { cttl } : {}),
+		...(server ? { server } : {}),
+		cost: cost as TransientTaskOutcomeUsageV1["cost"],
+	};
+}
+
+function copyStringArray(value: unknown): readonly string[] | null {
+	const copied = copySafeOutcomeJson(value);
+	if (!Array.isArray(copied) || !copied.every(item => typeof item === "string")) return null;
+	return copied as readonly string[];
+}
+
+function copyNestedPatches(value: unknown): TransientTaskSingleResultDocumentV1["nestedPatches"] | null {
+	if (!Array.isArray(value)) return null;
+	const copied = copySafeOutcomeJson(value);
+	if (!Array.isArray(copied)) return null;
+	const result: { relativePath: string; patch: string }[] = [];
+	for (const item of copied) {
+		if (item === null || Array.isArray(item) || typeof item !== "object") return null;
+		const keys = Object.keys(item);
+		if (keys.length !== 2 || !keys.includes("relativePath") || !keys.includes("patch")) return null;
+		const relativePath = copyOutcomeString(item.relativePath);
+		const patch = copyOutcomeString(item.patch);
+		if (relativePath === null || patch === null) return null;
+		result.push({ relativePath, patch });
+	}
+	return result;
+}
+
+function copyExtractedToolData(value: unknown): TransientTaskSingleResultDocumentV1["extractedToolData"] | null {
+	const copied = copySafeOutcomeJson(value);
+	if (copied === null || Array.isArray(copied) || typeof copied !== "object") return null;
+	for (const items of Object.values(copied)) {
+		if (!Array.isArray(items)) return null;
+	}
+	return copied as NonNullable<TransientTaskSingleResultDocumentV1["extractedToolData"]>;
+}
+
+function copySingleResultDocument(source: unknown): TransientTaskSingleResultDocumentV1 | null {
+	const record = readClosedOutcomeRecord(source, SINGLE_RESULT_KEYS);
+	if (!record) return null;
+	for (const key of SINGLE_RESULT_REQUIRED_KEYS) {
+		if (!Object.hasOwn(record, key) || record[key] === undefined) return null;
+	}
+	const index = copyOutcomeInteger(record.index);
+	const id = copyOutcomeString(record.id, true);
+	const agent = copyOutcomeString(record.agent, true);
+	const task = copyOutcomeString(record.task);
+	const exitCode = copyOutcomeInteger(record.exitCode, Number.MIN_SAFE_INTEGER);
+	const output = copyOutcomeString(record.output);
+	const stderr = copyOutcomeString(record.stderr);
+	const durationMs = copyOutcomeInteger(record.durationMs);
+	const tokens = copyOutcomeInteger(record.tokens);
+	const requests = copyOutcomeInteger(record.requests);
+	if (
+		index === null ||
+		id === null ||
+		agent === null ||
+		task === null ||
+		exitCode === null ||
+		output === null ||
+		stderr === null ||
+		durationMs === null ||
+		tokens === null ||
+		requests === null ||
+		(record.agentSource !== "bundled" && record.agentSource !== "user" && record.agentSource !== "project") ||
+		typeof record.truncated !== "boolean"
+	)
+		return null;
+
+	const result: Record<string, unknown> = {
+		index,
+		id,
+		agent,
+		agentSource: record.agentSource,
+		task,
+	};
+	for (const key of ["assignment", "description", "lastIntent"] as const) {
+		if (!Object.hasOwn(record, key) || record[key] === undefined) continue;
+		const text = copyOutcomeString(record[key]);
+		if (text === null) return null;
+		result[key] = text;
+	}
+	result.exitCode = exitCode;
+	result.output = output;
+	result.stderr = stderr;
+	result.truncated = record.truncated;
+	if (Object.hasOwn(record, "structuredOutput") && record.structuredOutput !== undefined) {
+		const structuredOutput = copyStructuredOutcome(record.structuredOutput);
+		if (!structuredOutput) return null;
+		result.structuredOutput = structuredOutput;
+	}
+	result.durationMs = durationMs;
+	result.tokens = tokens;
+	result.requests = requests;
+	for (const key of ["contextTokens", "contextWindow"] as const) {
+		if (!Object.hasOwn(record, key) || record[key] === undefined) continue;
+		const number = copyOutcomeInteger(record[key]);
+		if (number === null) return null;
+		result[key] = number;
+	}
+	if (Object.hasOwn(record, "modelOverride") && record.modelOverride !== undefined) {
+		if (typeof record.modelOverride === "string") {
+			const text = copyOutcomeString(record.modelOverride);
+			if (text === null) return null;
+			result.modelOverride = text;
+		} else {
+			const values = copyStringArray(record.modelOverride);
+			if (!values) return null;
+			result.modelOverride = values;
+		}
+	}
+	for (const key of [
+		"resolvedModel",
+		"error",
+		"abortReason",
+		"outputPath",
+		"patchPath",
+		"branchName",
+		"branchBaseSha",
+	] as const) {
+		if (!Object.hasOwn(record, key) || record[key] === undefined) continue;
+		const text = copyOutcomeString(record[key]);
+		if (text === null) return null;
+		result[key] = text;
+	}
+	for (const key of ["resolvedModelIsFallback", "aborted"] as const) {
+		if (!Object.hasOwn(record, key) || record[key] === undefined) continue;
+		if (typeof record[key] !== "boolean") return null;
+		result[key] = record[key];
+	}
+	if (Object.hasOwn(record, "usage") && record.usage !== undefined) {
+		const usage = copyOutcomeUsage(record.usage);
+		if (!usage) return null;
+		result.usage = usage;
+	}
+	if (Object.hasOwn(record, "nestedPatches") && record.nestedPatches !== undefined) {
+		const nestedPatches = copyNestedPatches(record.nestedPatches);
+		if (!nestedPatches) return null;
+		result.nestedPatches = nestedPatches;
+	}
+	if (Object.hasOwn(record, "extractedToolData") && record.extractedToolData !== undefined) {
+		const extractedToolData = copyExtractedToolData(record.extractedToolData);
+		if (!extractedToolData) return null;
+		result.extractedToolData = extractedToolData;
+	}
+	if (Object.hasOwn(record, "retryFailure") && record.retryFailure !== undefined) {
+		const retry = readClosedOutcomeRecord(record.retryFailure, ["attempt", "errorMessage"]);
+		const attempt = retry && copyOutcomeInteger(retry.attempt);
+		const errorMessage = retry && copyOutcomeString(retry.errorMessage);
+		if (
+			!retry ||
+			!Object.hasOwn(retry, "attempt") ||
+			!Object.hasOwn(retry, "errorMessage") ||
+			attempt === null ||
+			errorMessage === null
+		)
+			return null;
+		result.retryFailure = { attempt, errorMessage };
+	}
+	if (Object.hasOwn(record, "outputMeta") && record.outputMeta !== undefined) {
+		const meta = readClosedOutcomeRecord(record.outputMeta, ["lineCount", "charCount"]);
+		const lineCount = meta && copyOutcomeInteger(meta.lineCount);
+		const charCount = meta && copyOutcomeInteger(meta.charCount);
+		if (
+			!meta ||
+			!Object.hasOwn(meta, "lineCount") ||
+			!Object.hasOwn(meta, "charCount") ||
+			lineCount === null ||
+			charCount === null
+		)
+			return null;
+		result.outputMeta = { lineCount, charCount };
+	}
+	return result as unknown as TransientTaskSingleResultDocumentV1;
+}
+
+function copyResultlessError(value: unknown): TransientTaskResultlessTerminalErrorEnvelopeV1 | null {
+	const record = readClosedOutcomeRecord(value, [
+		"code",
+		"source",
+		"structuredSubagentKind",
+		"sourceMessage",
+		"observedUtf8ByteLength",
+		"maximumUtf8ByteLength",
+	]);
+	if (!record || typeof record.code !== "string" || typeof record.source !== "string") return null;
+	const base = {
+		code: record.code,
+		source: record.source,
+		structuredSubagentKind: record.structuredSubagentKind,
+		sourceMessage: record.sourceMessage,
+	};
+	const baseKeys = ["code", "source", "structuredSubagentKind", "sourceMessage"] as const;
+	if (record.code === "pre_result_failure" && record.source === "structured_subagent") {
+		if (
+			!hasExactOutcomeKeys(record, baseKeys) ||
+			!(["preflight", "isolation", "execution"] as const).includes(record.structuredSubagentKind as never)
+		)
+			return null;
+		const sourceMessage = copyOutcomeString(record.sourceMessage);
+		return sourceMessage === null
+			? null
+			: ({
+					...base,
+					structuredSubagentKind: record.structuredSubagentKind,
+					sourceMessage,
+				} as TransientTaskResultlessTerminalErrorEnvelopeV1);
+	}
+	if (
+		record.code === "pre_result_failure" &&
+		(record.source === "task_tool_caught_value" || record.source === "detached_outer_caught_value")
+	) {
+		const sourceMessage = copyOutcomeString(record.sourceMessage);
+		return hasExactOutcomeKeys(record, baseKeys) && record.structuredSubagentKind === null && sourceMessage !== null
+			? ({ ...base, structuredSubagentKind: null, sourceMessage } as TransientTaskResultlessTerminalErrorEnvelopeV1)
+			: null;
+	}
+	if (record.code === "detached_pre_execution_abort" && record.source === "async_job_abort") {
+		return hasExactOutcomeKeys(record, baseKeys) &&
+			record.structuredSubagentKind === null &&
+			record.sourceMessage === "Aborted before execution"
+			? (base as TransientTaskResultlessTerminalErrorEnvelopeV1)
+			: null;
+	}
+	if (record.code === "controller_interrupted_before_cleanup" && record.source === "runtime_controller") {
+		return hasExactOutcomeKeys(record, baseKeys) &&
+			record.structuredSubagentKind === null &&
+			record.sourceMessage === null
+			? (base as TransientTaskResultlessTerminalErrorEnvelopeV1)
+			: null;
+	}
+	if (record.code === "runtime_interrupted_before_result" && record.source === "runtime") {
+		const sourceMessage = copyOutcomeString(record.sourceMessage);
+		return hasExactOutcomeKeys(record, baseKeys) && record.structuredSubagentKind === null && sourceMessage !== null
+			? ({ ...base, structuredSubagentKind: null, sourceMessage } as TransientTaskResultlessTerminalErrorEnvelopeV1)
+			: null;
+	}
+	if (record.code === "single_result_invalid" && record.source === "single_result_projection") {
+		return hasExactOutcomeKeys(record, baseKeys) &&
+			record.structuredSubagentKind === null &&
+			record.sourceMessage === null
+			? (base as TransientTaskResultlessTerminalErrorEnvelopeV1)
+			: null;
+	}
+	if (record.code === "single_result_payload_too_large" && record.source === "single_result_projection") {
+		const observed = copyOutcomeInteger(record.observedUtf8ByteLength);
+		const maximum = copyOutcomeInteger(record.maximumUtf8ByteLength);
+		return hasExactOutcomeKeys(record, [...baseKeys, "observedUtf8ByteLength", "maximumUtf8ByteLength"]) &&
+			record.structuredSubagentKind === null &&
+			record.sourceMessage === null &&
+			observed !== null &&
+			maximum !== null
+			? ({
+					...base,
+					structuredSubagentKind: null,
+					sourceMessage: null,
+					observedUtf8ByteLength: observed,
+					maximumUtf8ByteLength: maximum,
+				} as TransientTaskResultlessTerminalErrorEnvelopeV1)
+			: null;
+	}
+	if (record.code === "resultless_source_unrepresentable" && record.source === "resultless_projection") {
+		return hasExactOutcomeKeys(record, baseKeys) &&
+			record.structuredSubagentKind === null &&
+			record.sourceMessage === null
+			? (base as TransientTaskResultlessTerminalErrorEnvelopeV1)
+			: null;
+	}
+	return null;
+}
+
+function normalizeOutcomeDocument(document: unknown): TransientTaskOutcomeDocumentV1 | null {
+	const record = readClosedOutcomeRecord(document, [
+		"schemaVersion",
+		"documentKind",
+		"singleResult",
+		"mergeSummary",
+		"changesApplied",
+		"index",
+		"id",
+		"agent",
+		"terminalOutcome",
+		"error",
+	]);
+	if (record?.schemaVersion !== 1) return null;
+	if (record.documentKind === "single_result") {
+		if (
+			!hasExactOutcomeKeys(record, [
+				"schemaVersion",
+				"documentKind",
+				"singleResult",
+				"mergeSummary",
+				"changesApplied",
+			])
+		)
+			return null;
+		const singleResult = copySingleResultDocument(record.singleResult);
+		const mergeSummary = copyOutcomeString(record.mergeSummary);
+		if (
+			!singleResult ||
+			mergeSummary === null ||
+			(record.changesApplied !== null && typeof record.changesApplied !== "boolean")
+		)
+			return null;
+		return {
+			schemaVersion: 1,
+			documentKind: "single_result",
+			singleResult,
+			mergeSummary,
+			changesApplied: record.changesApplied as boolean | null,
+		};
+	}
+	if (
+		record.documentKind !== "resultless_terminal" ||
+		!hasExactOutcomeKeys(record, [
+			"schemaVersion",
+			"documentKind",
+			"index",
+			"id",
+			"agent",
+			"terminalOutcome",
+			"error",
+		])
+	)
+		return null;
+	const index = copyOutcomeInteger(record.index);
+	const id = copyOutcomeString(record.id, true);
+	const agent = copyOutcomeString(record.agent, true);
+	const error = copyResultlessError(record.error);
+	if (
+		index === null ||
+		id === null ||
+		agent === null ||
+		!error ||
+		(record.terminalOutcome !== "failed" && record.terminalOutcome !== "cancelled")
+	)
+		return null;
+	return {
+		schemaVersion: 1,
+		documentKind: "resultless_terminal",
+		index,
+		id,
+		agent,
+		terminalOutcome: record.terminalOutcome,
+		error,
+	};
+}
+
+/** The sole canonical UTF-8 encoder for transient task outcome documents. */
+export function encodeTransientTaskOutcomeDocumentV1(
+	document: TransientTaskOutcomeDocumentV1,
+): Uint8Array<ArrayBuffer> {
+	const normalized = normalizeOutcomeDocument(document);
+	if (!normalized) throw new TypeError("Invalid transient task outcome document");
+	return OUTCOME_TEXT_ENCODER.encode(JSON.stringify(normalized));
+}
+
+/** Strict-decode only byte-identical canonical outcome encodings. */
+export function decodeTransientTaskOutcomeDocumentV1(
+	bytes: Uint8Array<ArrayBufferLike>,
+): TransientTaskOutcomeDocumentV1 {
+	let text: string;
+	let parsed: unknown;
+	try {
+		text = OUTCOME_TEXT_DECODER.decode(bytes);
+		parsed = JSON.parse(text);
+	} catch {
+		throw new TypeError("Invalid transient task outcome encoding");
+	}
+	const normalized = normalizeOutcomeDocument(parsed);
+	if (!normalized || JSON.stringify(normalized) !== text)
+		throw new TypeError("Noncanonical transient task outcome encoding");
+	return normalized;
+}
+
+function encodeOutcomeWithMetadata<T extends TransientTaskOutcomeDocumentV1>(
+	document: T,
+): TransientTaskOutcomeDocumentEncodingV1 & { readonly outcomeDocument: T } {
+	const bytes = encodeTransientTaskOutcomeDocumentV1(document);
+	const outcomeDocumentUtf8 = OUTCOME_TEXT_DECODER.decode(bytes);
+	return {
+		schemaVersion: 1,
+		outcomeDocument: document,
+		outcomeDocumentUtf8,
+		outcomeDocumentUtf8ByteLength: bytes.byteLength,
+		outcomeDocumentUtf8Sha256: `sha256:${createHash("sha256").update(bytes).digest("hex")}`,
+	};
+}
+
+function copyOutcomePayloadByteBudget(value: unknown): TransientTaskOutcomePayloadByteBudgetV1 | null {
+	const keys = [
+		"schemaVersion",
+		"maximumUtf8ByteLength",
+		"requiredResultlessFallbackUtf8ByteLength",
+		"reservedCanonicalEnvelopeUtf8ByteLength",
+		"availableCollectedValueUtf8ByteLength",
+	] as const;
+	const record = readClosedOutcomeRecord(value, keys);
+	if (!record || !hasExactOutcomeKeys(record, keys) || record.schemaVersion !== 1) return null;
+	const maximumUtf8ByteLength = copyOutcomeInteger(record.maximumUtf8ByteLength);
+	const requiredResultlessFallbackUtf8ByteLength = copyOutcomeInteger(record.requiredResultlessFallbackUtf8ByteLength);
+	const reservedCanonicalEnvelopeUtf8ByteLength = copyOutcomeInteger(record.reservedCanonicalEnvelopeUtf8ByteLength);
+	const availableCollectedValueUtf8ByteLength = copyOutcomeInteger(record.availableCollectedValueUtf8ByteLength);
+	if (
+		maximumUtf8ByteLength === null ||
+		requiredResultlessFallbackUtf8ByteLength === null ||
+		reservedCanonicalEnvelopeUtf8ByteLength === null ||
+		availableCollectedValueUtf8ByteLength === null ||
+		maximumUtf8ByteLength < TRANSIENT_TASK_OUTCOME_PAYLOAD_BYTES_MIN_V1 ||
+		maximumUtf8ByteLength > TRANSIENT_TASK_OUTCOME_PAYLOAD_BYTES_MAX_V1 ||
+		requiredResultlessFallbackUtf8ByteLength > maximumUtf8ByteLength ||
+		availableCollectedValueUtf8ByteLength !==
+			Math.max(0, maximumUtf8ByteLength - reservedCanonicalEnvelopeUtf8ByteLength)
+	)
+		return null;
+	return {
+		schemaVersion: 1,
+		maximumUtf8ByteLength,
+		requiredResultlessFallbackUtf8ByteLength,
+		reservedCanonicalEnvelopeUtf8ByteLength,
+		availableCollectedValueUtf8ByteLength,
+	};
+}
+
+/** Total projection of the actual finalizeRunResult own-property shape. */
+export function projectSingleResultToOutcomeDocumentV1(
+	source: unknown,
+	budget: TransientTaskOutcomePayloadByteBudgetV1,
+): TransientTaskSingleResultProjectionResultV1 {
+	try {
+		const copiedBudget = copyOutcomePayloadByteBudget(budget);
+		const singleResult = copySingleResultDocument(source);
+		if (!copiedBudget || !singleResult) return { status: "rejected", code: "single_result_invalid" };
+		const maximum = copiedBudget.maximumUtf8ByteLength;
+		const document: TransientTaskSingleResultOutcomeDocumentV1 = {
+			schemaVersion: 1,
+			documentKind: "single_result",
+			singleResult,
+			mergeSummary: "",
+			changesApplied: null,
+		};
+		const encoding = encodeOutcomeWithMetadata(document);
+		if (encoding.outcomeDocumentUtf8ByteLength > maximum) {
+			return {
+				status: "rejected",
+				code: "single_result_payload_too_large",
+				observedUtf8ByteLength: encoding.outcomeDocumentUtf8ByteLength,
+				maximumUtf8ByteLength: maximum,
+			};
+		}
+		return {
+			status: "projected",
+			document,
+			encoding,
+			accounting: {
+				schemaVersion: 1,
+				maximumUtf8ByteLength: maximum,
+				outcomeDocumentUtf8ByteLength: encoding.outcomeDocumentUtf8ByteLength,
+				remainingUtf8ByteLength: maximum - encoding.outcomeDocumentUtf8ByteLength,
+			},
+		};
+	} catch {
+		return { status: "rejected", code: "single_result_invalid" };
+	}
+}
+
+/** Sole terminal classifier after projection. */
+export function classifyTransientTaskSingleResultProjectionV1(
+	projection: TransientTaskSingleResultProjectionResultV1,
+): TransientTaskSingleResultTerminalClassificationV1 {
+	return projection.status === "projected" &&
+		projection.document.singleResult.exitCode === 0 &&
+		!projection.document.singleResult.error &&
+		!projection.document.singleResult.aborted
+		? { outcome: "succeeded", classification: "child_completion" }
+		: { outcome: "failed", classification: "child_failure" };
+}
+
+/** Source-compatible base renderer for resultless terminal documents. */
+export function renderTransientTaskResultlessTerminalBaseTextV1(
+	error: TransientTaskResultlessTerminalErrorEnvelopeV1,
+): string {
+	switch (error.source) {
+		case "structured_subagent":
+		case "task_tool_caught_value":
+		case "runtime":
+			return `Task execution failed: ${error.sourceMessage}`;
+		case "detached_outer_caught_value":
+			return error.sourceMessage;
+		case "async_job_abort":
+			return TRANSIENT_TASK_DETACHED_PRE_EXECUTION_ABORT_JOB_ERROR_TEXT_V1;
+		case "runtime_controller":
+			return TRANSIENT_TASK_CONTROLLER_INTERRUPTED_RESULT_TEXT_V1;
+		case "single_result_projection":
+			return error.code === "single_result_invalid"
+				? TRANSIENT_TASK_SINGLE_RESULT_INVALID_RESULT_TEXT_V1
+				: TRANSIENT_TASK_SINGLE_RESULT_PAYLOAD_TOO_LARGE_RESULT_TEXT_V1;
+		case "resultless_projection":
+			return TRANSIENT_TASK_RESULTLESS_SOURCE_UNREPRESENTABLE_RESULT_TEXT_V1;
+	}
+}
+
+function deepFreezeOutcome<T>(value: T, seen = new WeakSet<object>()): T {
+	if (value === null || typeof value !== "object" || seen.has(value)) return value;
+	seen.add(value);
+	for (const nested of Object.values(value as object)) deepFreezeOutcome(nested, seen);
+	return Object.freeze(value);
+}
+
+function fixedResultlessDocument<T extends "failed" | "cancelled">(
+	index: number,
+	id: string,
+	agent: string,
+	terminalOutcome: T,
+): TransientTaskResultlessTerminalOutcomeDocumentV1 & {
+	readonly terminalOutcome: T;
+	readonly error: Extract<
+		TransientTaskResultlessTerminalErrorEnvelopeV1,
+		{ readonly code: "resultless_source_unrepresentable" }
+	>;
+} {
+	return {
+		schemaVersion: 1,
+		documentKind: "resultless_terminal",
+		index,
+		id,
+		agent,
+		terminalOutcome,
+		error: {
+			code: "resultless_source_unrepresentable",
+			source: "resultless_projection",
+			structuredSubagentKind: null,
+			sourceMessage: null,
+		},
+	};
+}
+
+/** Freeze the exact failed and cancelled bounded fallback documents before dispatch. */
+export function preflightTransientTaskResultlessRepresentabilityV1(
+	indexValue: unknown,
+	idValue: unknown,
+	agentValue: unknown,
+	configuredMaximumUtf8ByteLength: unknown,
+): TransientTaskResultlessRepresentabilityPreflightResultV1 {
+	try {
+		const index = copyOutcomeInteger(indexValue);
+		const id = copyOutcomeString(idValue, true);
+		const agent = copyOutcomeString(agentValue, true);
+		if (index === null || id === null || agent === null) {
+			return {
+				status: "rejected",
+				code: "resultless_identity_invalid",
+				noHandoffReason: "preflight_error",
+				toolResultText: TRANSIENT_TASK_RESULTLESS_REPRESENTABILITY_PREFLIGHT_TOOL_ERROR_TEXT_V1,
+			};
+		}
+		const maximum = copyOutcomeInteger(configuredMaximumUtf8ByteLength);
+		if (maximum === null || maximum > TRANSIENT_TASK_OUTCOME_PAYLOAD_BYTES_MAX_V1) {
+			return {
+				status: "rejected",
+				code: "resultless_maximum_invalid",
+				noHandoffReason: "preflight_error",
+				toolResultText: TRANSIENT_TASK_RESULTLESS_REPRESENTABILITY_PREFLIGHT_TOOL_ERROR_TEXT_V1,
+			};
+		}
+		const failedDocument = fixedResultlessDocument(index, id, agent, "failed");
+		const cancelledDocument = fixedResultlessDocument(index, id, agent, "cancelled");
+		const failed = encodeOutcomeWithMetadata(failedDocument);
+		const cancelled = encodeOutcomeWithMetadata(cancelledDocument);
+		const requiredResultlessFallbackUtf8ByteLength = Math.max(
+			failed.outcomeDocumentUtf8ByteLength,
+			cancelled.outcomeDocumentUtf8ByteLength,
+		);
+		if (requiredResultlessFallbackUtf8ByteLength > maximum) {
+			return {
+				status: "rejected",
+				code: "resultless_fallback_exceeds_maximum",
+				noHandoffReason: "preflight_error",
+				toolResultText: TRANSIENT_TASK_RESULTLESS_REPRESENTABILITY_PREFLIGHT_TOOL_ERROR_TEXT_V1,
+			};
+		}
+		return {
+			status: "accepted",
+			preflight: deepFreezeOutcome({
+				schemaVersion: 1,
+				identity: { index, id, agent },
+				maximumUtf8ByteLength: maximum,
+				requiredResultlessFallbackUtf8ByteLength,
+				fallbackEncodings: { failed, cancelled },
+			}),
+		};
+	} catch {
+		return {
+			status: "rejected",
+			code: "resultless_identity_invalid",
+			noHandoffReason: "preflight_error",
+			toolResultText: TRANSIENT_TASK_RESULTLESS_REPRESENTABILITY_PREFLIGHT_TOOL_ERROR_TEXT_V1,
+		};
+	}
+}
+
+function projectResultlessEnvelope(
+	source: TransientTaskResultlessTerminalSourceV1,
+): TransientTaskResultlessTerminalErrorEnvelopeV1 | null {
+	try {
+		const record = readClosedOutcomeRecord(source, [
+			"kind",
+			"caughtAt",
+			"value",
+			"observedUtf8ByteLength",
+			"maximumUtf8ByteLength",
+		]);
+		if (!record || typeof record.kind !== "string") return null;
+		if (record.kind === "caught_value" && !hasExactOutcomeKeys(record, ["kind", "caughtAt", "value"])) return null;
+		if (
+			record.kind === "single_result_payload_too_large" &&
+			!hasExactOutcomeKeys(record, ["kind", "observedUtf8ByteLength", "maximumUtf8ByteLength"])
+		)
+			return null;
+		if (
+			record.kind !== "caught_value" &&
+			record.kind !== "single_result_payload_too_large" &&
+			!hasExactOutcomeKeys(record, ["kind"])
+		)
+			return null;
+		if (record.kind === "caught_value") {
+			if (record.caughtAt !== "task_tool" && record.caughtAt !== "detached_outer" && record.caughtAt !== "runtime")
+				return null;
+			const value = record.value;
+			if (record.caughtAt === "task_tool" && value instanceof StructuredSubagentError) {
+				const kind = value.kind;
+				const message = value.message;
+				if (
+					!(kind === "preflight" || kind === "isolation" || kind === "execution") ||
+					!isWellFormedOutcomeUnicode(message)
+				)
+					return null;
+				return {
+					code: "pre_result_failure",
+					source: "structured_subagent",
+					structuredSubagentKind: kind,
+					sourceMessage: message,
+				};
+			}
+			const message = value instanceof Error ? value.message : String(value);
+			if (!isWellFormedOutcomeUnicode(message)) return null;
+			if (record.caughtAt === "detached_outer")
+				return {
+					code: "pre_result_failure",
+					source: "detached_outer_caught_value",
+					structuredSubagentKind: null,
+					sourceMessage: message,
+				};
+			if (record.caughtAt === "runtime")
+				return {
+					code: "runtime_interrupted_before_result",
+					source: "runtime",
+					structuredSubagentKind: null,
+					sourceMessage: message,
+				};
+			return {
+				code: "pre_result_failure",
+				source: "task_tool_caught_value",
+				structuredSubagentKind: null,
+				sourceMessage: message,
+			};
+		}
+		if (record.kind === "detached_pre_execution_abort")
+			return {
+				code: "detached_pre_execution_abort",
+				source: "async_job_abort",
+				structuredSubagentKind: null,
+				sourceMessage: "Aborted before execution",
+			};
+		if (record.kind === "controller_interrupted_before_cleanup")
+			return {
+				code: "controller_interrupted_before_cleanup",
+				source: "runtime_controller",
+				structuredSubagentKind: null,
+				sourceMessage: null,
+			};
+		if (record.kind === "single_result_invalid")
+			return {
+				code: "single_result_invalid",
+				source: "single_result_projection",
+				structuredSubagentKind: null,
+				sourceMessage: null,
+			};
+		if (record.kind === "single_result_payload_too_large") {
+			const observedUtf8ByteLength = copyOutcomeInteger(record.observedUtf8ByteLength);
+			const maximumUtf8ByteLength = copyOutcomeInteger(record.maximumUtf8ByteLength);
+			return observedUtf8ByteLength === null || maximumUtf8ByteLength === null
+				? null
+				: {
+						code: "single_result_payload_too_large",
+						source: "single_result_projection",
+						structuredSubagentKind: null,
+						sourceMessage: null,
+						observedUtf8ByteLength,
+						maximumUtf8ByteLength,
+					};
+		}
+		return null;
+	} catch {
+		return null;
+	}
+}
+
+/** Total resultless projector; hostile producer values select the frozen fallback. */
+export function projectTransientTaskResultlessSourceV1(
+	preflight: TransientTaskResultlessRepresentabilityPreflightV1,
+	terminalOutcome: "failed" | "cancelled",
+	source: TransientTaskResultlessTerminalSourceV1,
+): TransientTaskResultlessTerminalProjectionV1 {
+	const fallback = preflight.fallbackEncodings[terminalOutcome];
+	try {
+		const error = projectResultlessEnvelope(source);
+		if (!error) throw new TypeError("Unrepresentable resultless source");
+		const document: TransientTaskResultlessTerminalOutcomeDocumentV1 = {
+			schemaVersion: 1,
+			documentKind: "resultless_terminal",
+			index: preflight.identity.index,
+			id: preflight.identity.id,
+			agent: preflight.identity.agent,
+			terminalOutcome,
+			error,
+		};
+		const encoding = encodeOutcomeWithMetadata(document) as TransientTaskOutcomeDocumentEncodingV1 & {
+			outcomeDocument: TransientTaskResultlessTerminalOutcomeDocumentV1;
+		};
+		if (encoding.outcomeDocumentUtf8ByteLength > preflight.maximumUtf8ByteLength)
+			throw new RangeError("Resultless source exceeds maximum");
+		return {
+			status: "projected",
+			sourceDisposition: "exact",
+			document,
+			encoding,
+			accounting: {
+				schemaVersion: 1,
+				maximumUtf8ByteLength: preflight.maximumUtf8ByteLength,
+				outcomeDocumentUtf8ByteLength: encoding.outcomeDocumentUtf8ByteLength,
+				remainingUtf8ByteLength: preflight.maximumUtf8ByteLength - encoding.outcomeDocumentUtf8ByteLength,
+			},
+		};
+	} catch {
+		return {
+			status: "projected",
+			sourceDisposition: "fixed_unrepresentable_fallback",
+			document: fallback.outcomeDocument,
+			encoding: fallback,
+			accounting: {
+				schemaVersion: 1,
+				maximumUtf8ByteLength: preflight.maximumUtf8ByteLength,
+				outcomeDocumentUtf8ByteLength: fallback.outcomeDocumentUtf8ByteLength,
+				remainingUtf8ByteLength: preflight.maximumUtf8ByteLength - fallback.outcomeDocumentUtf8ByteLength,
+			},
+		};
+	}
+}
 
 /**
  * Soft per-agent request budgets (assistant requests per run). Crossing the
@@ -319,6 +1364,8 @@ export interface ExecutorOptions {
 	worktree?: string;
 	/** Non-owning execution-environment binding injected into this child. */
 	executionEnvironment?: ExecutionEnvironmentBinding;
+	/** @internal Exact claimed transient parent locator; absent for ordinary/top-level children. */
+	transientTaskCurrentParentTaskLocator?: AgentSessionTransientTaskCurrentParentLocatorV1;
 	/**
 	 * Immutable capability profile resolved before this child is dispatched.
 	 * Omission preserves the ordinary local surface for direct executor callers.
@@ -471,6 +1518,10 @@ export interface ExecutorOptions {
 	 */
 	keepAlive?: boolean;
 }
+
+type ManagedTransientTaskCreateAgentSessionOptionsV1 = CreateAgentSessionOptions & {
+	readonly transientTaskCurrentParentTaskLocator?: AgentSessionTransientTaskCurrentParentLocatorV1;
+};
 
 function parseStringifiedJson(value: unknown): unknown {
 	if (typeof value !== "string") return value;
@@ -1952,7 +3003,9 @@ async function driveSessionToYield(
 				asyncPendingNoticeSent = true;
 				const running = session.getAsyncJobSnapshot()?.running ?? [];
 				if (running.length > 0) {
-					const jobs = running.map(job => `${job.id}${job.label ? ` (${job.label})` : ""}`).join(", ");
+					const jobs = running
+						.map((job: AsyncJobSnapshotItem) => `${job.id}${job.label ? ` (${job.label})` : ""}`)
+						.join(", ");
 					const notice = prompt.render(subagentAsyncPendingTemplate, {
 						count: running.length,
 						multiple: running.length > 1,
@@ -2557,9 +3610,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		onProgress,
 	} = options;
 	const startTime = Date.now();
-	// Set by the session's onFirstChatDispatch hook the first time the agent
-	// loop dispatches a chat request to the provider — the launch-complete boundary.
-	let firstChatDispatchAt: number | undefined;
+	// Set by the session's semantic first-assistant-content callback — the first-model-token boundary.
+	let firstAssistantContentAt: number | undefined;
 
 	// Check if already aborted
 	if (signal?.aborted) {
@@ -2968,7 +4020,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			const buildSubagentSessionOptions = (
 				sessionManagerForRun: SessionManager,
 				expectedAgentRef: CreateAgentSessionOptions["expectedAgentRef"],
-			): CreateAgentSessionOptions => ({
+			): ManagedTransientTaskCreateAgentSessionOptionsV1 => ({
 				cwd: worktree ?? cwd,
 				additionalDirectories: worktree !== undefined ? undefined : options.additionalDirectories,
 				authStorage,
@@ -2976,6 +4028,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				getApiKey: options.getApiKey,
 				settings: subagentSettings,
 				executionEnvironment: options.executionEnvironment,
+				transientTaskCurrentParentTaskLocator: options.transientTaskCurrentParentTaskLocator,
 				model,
 				modelPattern: model || modelOverride === undefined ? undefined : modelPatterns,
 				modelPatternAuthFallback:
@@ -3042,8 +4095,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				parentEvalSessionId: subagentRuntimeAllows(runtimeProfile, "sharedEvalState")
 					? options.parentEvalSessionId
 					: undefined,
-				onFirstChatDispatch: () => {
-					firstChatDispatchAt ??= performance.now();
+				onFirstAssistantContent: timestamp => {
+					firstAssistantContentAt ??= timestamp - performance.timeOrigin;
 				},
 			});
 
@@ -3286,7 +4339,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			}
 		}
 
-		// Launch-latency breakdown (subagent invocation → first chat dispatch).
+		// First-model-token timing (subagent invocation → first semantic assistant content).
 		// Phase deltas are performance.now() spans; the task-tool concurrency
 		// brackets use the Date.now epochs captured by the spawn site
 		// (invokedAt before acquire, acquiredAt after) so queue wait and
@@ -3298,12 +4351,12 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				? Math.round(options.acquiredAt - options.invokedAt)
 				: undefined;
 		const preRunMs = options.acquiredAt !== undefined ? Math.round(startTime - options.acquiredAt) : undefined;
-		const setupToFirstChatMs = span(perfStart, firstChatDispatchAt);
-		const invokeToFirstChatMs =
-			options.invokedAt !== undefined && setupToFirstChatMs !== undefined
-				? Math.round(startTime - options.invokedAt) + setupToFirstChatMs
+		const setupToFirstModelTokenMs = span(perfStart, firstAssistantContentAt);
+		const invokeToFirstModelTokenMs =
+			options.invokedAt !== undefined && setupToFirstModelTokenMs !== undefined
+				? Math.round(startTime - options.invokedAt) + setupToFirstModelTokenMs
 				: undefined;
-		logger.debug("subagent launch timing", {
+		logger.debug("subagent first-model-token timing", {
 			id,
 			agent: agent.name,
 			queueMs,
@@ -3312,9 +4365,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			sessionOpenMs: span(resolvedAt, sessionOpenedAt),
 			createSessionMs: span(sessionOpenedAt, sessionCreatedAt),
 			readyMs: span(sessionCreatedAt, readyAt),
-			promptToFirstChatMs: span(readyAt, firstChatDispatchAt),
-			setupToFirstChatMs,
-			invokeToFirstChatMs,
+			promptToFirstModelTokenMs: span(readyAt, firstAssistantContentAt),
+			setupToFirstModelTokenMs,
+			invokeToFirstModelTokenMs,
 		});
 		return {
 			exitCode,

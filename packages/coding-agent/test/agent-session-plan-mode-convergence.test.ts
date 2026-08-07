@@ -25,6 +25,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { Snowflake, TempDir } from "@oh-my-pi/pi-utils";
 import planModeReminderPrompt from "../src/prompts/system/plan-mode-tool-decision-reminder.md" with { type: "text" };
+import { createTestRuntimeDependencies } from "./utilities";
 
 /** A stable, literal (non-templated) line of the reminder prompt, so the test
  *  pins the reminder by its real content rather than a hardcoded copy. */
@@ -149,6 +150,7 @@ describe("AgentSession plan-mode convergence", () => {
 				"compaction.enabled": false,
 				"retry.enabled": false,
 			}),
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 			toolRegistry: new Map<string, AgentTool>([
 				["ask", askTool],

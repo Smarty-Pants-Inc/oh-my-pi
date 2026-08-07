@@ -10,6 +10,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { createTools, type Tool } from "@oh-my-pi/pi-coding-agent/tools";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "../../utilities.js";
 
 beforeAll(async () => {
 	await initTheme();
@@ -46,6 +47,7 @@ async function createMode(opts: { flushFails?: boolean } = {}): Promise<{
 		sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
 		settings,
 		modelRegistry,
+		...createTestRuntimeDependencies(modelRegistry),
 		toolRegistry,
 		rebuildSystemPrompt: async () => ({ systemPrompt: ["Test"] }),
 	});

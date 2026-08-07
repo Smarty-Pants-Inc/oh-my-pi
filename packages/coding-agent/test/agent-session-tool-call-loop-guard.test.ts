@@ -12,6 +12,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { type CustomMessage, convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 const zeroUsage = {
 	input: 0,
@@ -102,6 +103,7 @@ describe("AgentSession tool-call loop guard", () => {
 			sessionManager: SessionManager.inMemory(tempDir.path()),
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			toolRegistry: new Map([[bashTool.name, bashTool]]),
 		});
 

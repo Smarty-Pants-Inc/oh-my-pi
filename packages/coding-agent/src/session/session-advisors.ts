@@ -95,6 +95,7 @@ import {
 import { formatSessionDumpText } from "./session-dump-format";
 import type { CompactionEntry, SessionEntry } from "./session-entries";
 import { formatSessionHistoryMarkdown } from "./session-history-format";
+import type { SessionJournalService } from "./session-journal-contracts";
 import type { SessionManager } from "./session-manager";
 import { buildSessionMetadata } from "./session-metadata";
 import type { YieldQueue } from "./yield-queue";
@@ -143,6 +144,16 @@ interface AdvisorRetryFallbackState {
 	originalSelector: string;
 	originalThinkingLevel: ThinkingLevel;
 	lastAppliedThinkingLevel: ThinkingLevel;
+}
+
+/** @internal Process-owned journal authority supplied only by AgentSession. */
+interface SessionAdvisorJournalAuthority {
+	readonly service: SessionJournalService;
+	readonly primarySessionId: () => string;
+}
+
+interface SessionAdvisorsConstructorOptions {
+	readonly sessionJournal?: SessionAdvisorJournalAuthority;
 }
 
 interface ActiveAdvisor {
@@ -292,6 +303,7 @@ export class SessionAdvisors {
 	#advisorSharedInstructions: string | undefined;
 	#advisorContextPrompt: string | undefined;
 	#advisorStreamFn: StreamFn | undefined;
+	#sessionJournal: SessionAdvisorJournalAuthority | undefined;
 	#transformProviderContext: ((context: Context, model: Model) => Context | Promise<Context>) | undefined;
 	#advisors: ActiveAdvisor[] = [];
 	#advisorConfigs: AdvisorConfig[] | undefined;
@@ -306,7 +318,7 @@ export class SessionAdvisors {
 	#pendingAdvisorCardEvents = new Set<Promise<void>>();
 	#advisorYieldQueueUnsubscribe: (() => void) | undefined;
 
-	constructor(host: SessionAdvisorsHost, options: SessionAdvisorsOptions) {
+	constructor(host: SessionAdvisorsHost, options: SessionAdvisorsOptions & SessionAdvisorsConstructorOptions) {
 		this.#host = host;
 		this.#advisorEnabled = options.enabled;
 		this.#advisorTools = options.tools;
@@ -319,6 +331,7 @@ export class SessionAdvisors {
 		this.#advisorContextPrompt = options.contextPrompt;
 		this.#advisorConfigs = options.configs;
 		this.#advisorStreamFn = options.streamFn;
+		this.#sessionJournal = options.sessionJournal;
 		this.#transformProviderContext = options.transformProviderContext;
 		if (options.initialCosts) this.#advisorCosts = new Map(options.initialCosts);
 		if (this.#advisorEnabled) this.#buildAdvisorRuntime();
@@ -859,9 +872,10 @@ export class SessionAdvisors {
 				state: advisorAgent.state,
 			};
 
-			// Persist this advisor's turns to `<session>/__advisor[.<slug>].jsonl`
-			// (resolved lazily so it follows session switches) for stats attribution
-			// and Agent Hub observability, without registering it as a peer.
+			// Persist this advisor's turns to `<session>/__advisor[.<slug>].jsonl`.
+			// Resolve the primary once here: the file resolver may follow moves and
+			// switches, but this recorder's journal parent can never silently reparent.
+			const journal = this.#sessionJournal;
 			const recorder = new AdvisorTranscriptRecorder(
 				() => this.#host.sessionManager.getSessionFile(),
 				() => this.#host.sessionManager.getCwd(),
@@ -869,6 +883,13 @@ export class SessionAdvisors {
 				// On the advisor on→off→on toggle, wait for the prior recorders' closes
 				// so two SessionManagers never hold the same file at once.
 				this.#advisorRecorderClosed,
+				journal
+					? {
+							service: journal.service,
+							parentSessionId: journal.primarySessionId(),
+							advisorId: slug || "default",
+						}
+					: undefined,
 			);
 			const runtime = new AdvisorRuntime(advisorAgentFacade, {
 				snapshotMessages: () => this.#host.agent.state.messages,

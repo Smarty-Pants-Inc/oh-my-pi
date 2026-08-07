@@ -17,6 +17,21 @@ describe("Agent", () => {
 		expect(agent.state.messages).not.toContainEqual(message);
 	});
 
+	it("forwards first assistant content observation once", async () => {
+		const timestamps: number[] = [];
+		const mock = createMockModel({ responses: [{ content: ["hello"] }] });
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["Test"], messages: [] },
+			streamFn: mock.stream,
+			onFirstAssistantContent: timestamp => timestamps.push(timestamp),
+		});
+
+		await agent.prompt("Say hello");
+
+		expect(timestamps).toHaveLength(1);
+		expect(timestamps[0]).toBeGreaterThan(0);
+	});
+
 	it("classifies agent-authored steering as a parent steering message", async () => {
 		const toolSchema = z.object({ value: z.string() });
 		const executed: string[] = [];

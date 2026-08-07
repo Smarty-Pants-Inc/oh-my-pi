@@ -37,11 +37,14 @@ import { type Settings as SettingsCapabilityItem, settingsCapability } from "../
 import type { ModelRole } from "../config/model-roles";
 import { loadCapability } from "../discovery";
 import { isLightTheme, setAutoThemeMapping, setColorBlindMode, setSymbolPreset } from "../modes/theme/theme";
+import { decodePersistentRuntimePolicyOverlayV1 } from "../registry/persistent-agent-contracts.js";
 import { AgentStorage } from "../session/agent-storage";
+import { decodeWorkspaceRetentionPolicyOverlayV1 } from "../session/workspace-runtime-contracts.js";
 import { AUTO_IMAGE_PROVIDER_ORDER, isImageProviderId } from "../tools/image-providers";
 import { type EditMode, normalizeEditMode } from "../utils/edit-mode";
 import { INSPECT_IMAGE_MODES } from "../utils/inspect-image-mode";
 import { isSearchProviderId, SEARCH_PROVIDER_ORDER } from "../web/search/types";
+import { decodeModelConnectionProfileV1, type ModelConnectionProfile } from "./model-connection-contracts.js";
 import {
 	type BashInterceptorRule,
 	type GroupPrefix,
@@ -184,6 +187,68 @@ function stringArrayFromUnknown(value: unknown): string[] {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function validateAdaptivePersistentSetting(path: SettingPath, value: unknown): unknown {
+	switch (path) {
+		case "agents.persistent.defaultRuntimePolicy":
+			return decodePersistentRuntimePolicyOverlayV1(value);
+		case "agents.persistent.workspaceRetention":
+			return decodeWorkspaceRetentionPolicyOverlayV1(value);
+		case "agents.persistent.enabled":
+		case "agents.persistent.providers.local.enabled":
+		case "agents.persistent.providers.cloudflare.enabled":
+		case "sessionJournal.enabled":
+			if (typeof value !== "boolean") throw new TypeError(`${path} must be a boolean`);
+			return value;
+		case "agents.persistent.providers.cloudflare.profile":
+			if (typeof value !== "string" || value.length === 0 || value.trim() !== value) {
+				throw new TypeError(`${path} must be a non-empty canonical profile id`);
+			}
+			return value;
+		case "agents.persistent.providers.cloudflare.workspaceRetentionMs":
+			if (typeof value !== "number" || !Number.isSafeInteger(value) || Object.is(value, -0) || value <= 0) {
+				throw new TypeError(`${path} must be a positive safe integer`);
+			}
+			return value;
+		case "modelConnections": {
+			if (value === null || typeof value !== "object" || Array.isArray(value)) {
+				throw new TypeError("modelConnections must be a record of closed profiles");
+			}
+			try {
+				const prototype = Object.getPrototypeOf(value);
+				if (prototype !== Object.prototype && prototype !== null) {
+					throw new TypeError("modelConnections must be a plain record");
+				}
+				const profileIds = Reflect.ownKeys(value);
+				const descriptors = Object.getOwnPropertyDescriptors(value);
+				const profiles: Record<string, ModelConnectionProfile> = Object.create(null);
+				for (const profileId of profileIds) {
+					if (typeof profileId !== "string") {
+						throw new TypeError("modelConnections must contain only string profile keys");
+					}
+					const descriptor = descriptors[profileId];
+					if (!descriptor?.enumerable || !("value" in descriptor)) {
+						throw new TypeError("modelConnections must contain only enumerable data properties");
+					}
+					if (profileId.length === 0 || profileId.trim() !== profileId) {
+						throw new TypeError("modelConnections contains an invalid profile key");
+					}
+					const profile = decodeModelConnectionProfileV1(descriptor.value);
+					if (profile.id !== profileId) {
+						throw new TypeError(`modelConnections.${profileId}.id must equal its record key`);
+					}
+					profiles[profileId] = profile;
+				}
+				return Object.freeze(profiles);
+			} catch (error) {
+				if (error instanceof TypeError) throw error;
+				throw new TypeError("modelConnections must be a plain closed record", { cause: error });
+			}
+		}
+		default:
+			return value;
+	}
 }
 
 /**
@@ -476,8 +541,9 @@ export class Settings {
 		}
 
 		const value = getByPath(this.#merged, SETTING_PATH_SEGMENTS[path]);
-		const resolved =
+		const unvalidated =
 			value !== undefined ? (resolvePathScopedStringArray(path, value, this.#cwd) ?? value) : getDefault(path);
+		const resolved = validateAdaptivePersistentSetting(path, unvalidated);
 		this.#resolvedCache.set(path, resolved);
 		return resolved as SettingValue<P>;
 	}
@@ -496,9 +562,10 @@ export class Settings {
 	 * Triggers hooks for settings that have side effects.
 	 */
 	set<P extends SettingPath>(path: P, value: SettingValue<P>): void {
+		const validated = validateAdaptivePersistentSetting(path, value);
 		const prev = this.get(path);
 		const segments = path.split(".");
-		setByPath(this.#global, segments, value);
+		setByPath(this.#global, segments, validated);
 		this.#modified.add(path);
 		this.#rebuildMerged();
 		const next = this.get(path);
@@ -516,12 +583,13 @@ export class Settings {
 	 * Apply runtime overrides (not persisted).
 	 */
 	override<P extends SettingPath>(path: P, value: SettingValue<P>): void {
+		const validated = validateAdaptivePersistentSetting(path, value);
 		if (path === "modelRoles") {
 			this.#savedRuntimeModelRoleOverrides.clear();
 		}
 		const prev = this.get(path);
 		const segments = path.split(".");
-		setByPath(this.#overrides, segments, value);
+		setByPath(this.#overrides, segments, validated);
 		this.#rebuildMerged();
 		this.#fireEffectiveSettingChanged(path, this.get(path), prev);
 	}

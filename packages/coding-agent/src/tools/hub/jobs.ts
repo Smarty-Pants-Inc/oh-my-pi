@@ -12,7 +12,24 @@ import { settings } from "../../config/settings";
 import type { RenderResultOptions } from "../../extensibility/custom-tools/types";
 import { shimmerEnabled, shimmerText } from "../../modes/theme/shimmer";
 import type { Theme } from "../../modes/theme/theme";
+import type { OperationId } from "../../registry/persistent-agent-contracts";
 import { USER_INTERRUPT_LABEL } from "../../session/messages";
+import {
+	type ConfidentialAsyncJobSettledRowInspectResultV1,
+	type ConfidentialAsyncJobSettledRowV1,
+	type ConfidentialTransientTaskDetachedSettlementAttemptV1,
+	type ConfidentialTransientTaskDetachedSettlementCurrentAuthorityV1,
+	type ConfidentialTransientTaskDetachedSettlementOperationReceiptV1,
+	type ConfidentialTransientTaskDetachedSettlementOperationRequestV1,
+	type ConfidentialTransientTaskDetachedSettlementReservationReceiptV1,
+	type ConfidentialTransientTaskDetachedSettlementTerminalReceiptV1,
+	deriveTransientTaskHubDetachedCommitAttemptV1,
+	deriveTransientTaskHubDetachedReservationAttemptV1,
+	type TransientTaskDetachedSettlementDispositionV1,
+	type TransientTaskDetachedSettlementInspectRequestV1,
+	type TransientTaskDetachedSettlementNotAppliedReceiptV1,
+	type TransientTaskDetachedSettlementStoreV1,
+} from "../../session/workspace-runtime-contracts";
 import { Ellipsis, Hasher, type RenderCache, renderStatusLine, renderTreeList, truncateToWidth } from "../../tui";
 import type { ToolSession } from "..";
 import {
@@ -79,6 +96,428 @@ export function visibleJobs(manager: AsyncJobManager, ids: string[], ownerId: st
 	return out;
 }
 
+type ImmediateHubConsumptionDisposition = Extract<
+	TransientTaskDetachedSettlementDispositionV1,
+	"hub_jobs_consumption" | "hub_cancel_consumption"
+>;
+type HubConsumptionDisposition = ImmediateHubConsumptionDisposition | "hub_wait_consumption";
+type HubReservationSelector =
+	| { readonly disposition: ImmediateHubConsumptionDisposition }
+	| { readonly disposition: "hub_wait_consumption"; readonly hubWaitInvocationId: OperationId };
+type HubCurrentAuthority = Extract<
+	ConfidentialTransientTaskDetachedSettlementCurrentAuthorityV1,
+	{ readonly kind: "current_owner_epoch" }
+>;
+type HubDetachedOperation = Extract<
+	ConfidentialTransientTaskDetachedSettlementOperationRequestV1,
+	{ readonly stage: "reservation" | "terminal_commit" }
+>;
+type HubReservationReceipt = Extract<
+	ConfidentialTransientTaskDetachedSettlementReservationReceiptV1,
+	{ readonly disposition: HubConsumptionDisposition }
+>;
+type HubTerminalReceipt = Extract<
+	ConfidentialTransientTaskDetachedSettlementTerminalReceiptV1,
+	{ readonly disposition: HubConsumptionDisposition }
+>;
+type TransientSettledRow = Exclude<ConfidentialAsyncJobSettledRowV1, { readonly transientTaskCompletion: null }>;
+type HubObservedCurrentAuthority = TransientSettledRow["transientTaskCompletion"]["currentAuthority"];
+
+type HubAttemptRecovery =
+	| {
+			readonly status: "not_applied";
+			readonly notAppliedReceipt: TransientTaskDetachedSettlementNotAppliedReceiptV1;
+	  }
+	| {
+			readonly status: "applied";
+			readonly receipt: ConfidentialTransientTaskDetachedSettlementOperationReceiptV1;
+	  }
+	| { readonly status: "blocked_indeterminate" };
+
+function isHubReservationReceipt(
+	receipt: ConfidentialTransientTaskDetachedSettlementOperationReceiptV1,
+): receipt is HubReservationReceipt {
+	return (
+		"reservationId" in receipt &&
+		(receipt.disposition === "hub_jobs_consumption" ||
+			receipt.disposition === "hub_wait_consumption" ||
+			receipt.disposition === "hub_cancel_consumption")
+	);
+}
+
+function isHubTerminalReceipt(
+	receipt: ConfidentialTransientTaskDetachedSettlementOperationReceiptV1,
+): receipt is HubTerminalReceipt {
+	return (
+		"commitOperationId" in receipt &&
+		(receipt.disposition === "hub_jobs_consumption" ||
+			receipt.disposition === "hub_wait_consumption" ||
+			receipt.disposition === "hub_cancel_consumption")
+	);
+}
+
+function isHubCurrentAuthority(authority: HubObservedCurrentAuthority): authority is HubCurrentAuthority {
+	return authority.kind === "current_owner_epoch" && "ownerSinkAuthoritySha256" in authority;
+}
+
+async function reconcileHubDetachedAttempt(
+	store: TransientTaskDetachedSettlementStoreV1,
+	operation: HubDetachedOperation,
+	attempt: ConfidentialTransientTaskDetachedSettlementAttemptV1,
+	inspectRequest: TransientTaskDetachedSettlementInspectRequestV1,
+	currentAuthority: HubCurrentAuthority,
+): Promise<HubAttemptRecovery> {
+	try {
+		const inspection = await store.inspect(inspectRequest);
+		if (
+			inspection.status !== "not_applied" &&
+			inspection.status !== "outcome_unknown" &&
+			inspection.status !== "matching"
+		)
+			return { status: "blocked_indeterminate" };
+		const adopted = await store.adopt({
+			...inspectRequest,
+			expectedIdentity: operation.request.settlement.identity,
+			expectedOperation: operation,
+			expectedAttempt: attempt,
+			expectedNotAppliedReceiptSha256: inspection.notAppliedReceiptSha256,
+			expectedReceiptSha256: inspection.status === "matching" ? inspection.receiptSha256 : null,
+			expectedCurrentAuthority: currentAuthority,
+		});
+		if (
+			(adopted.status === "not_applied" || adopted.status === "outcome_unknown" || adopted.status === "adopted") &&
+			adopted.attempt.attemptSha256 !== attempt.attemptSha256
+		)
+			return { status: "blocked_indeterminate" };
+		if (adopted.status === "not_applied") {
+			return { status: "not_applied", notAppliedReceipt: adopted.notAppliedReceipt };
+		}
+		if (adopted.status === "adopted") return { status: "applied", receipt: adopted.receipt };
+		return { status: "blocked_indeterminate" };
+	} catch {
+		return { status: "blocked_indeterminate" };
+	}
+}
+
+async function prepareHubDetachedAttempt(
+	store: TransientTaskDetachedSettlementStoreV1,
+	operation: HubDetachedOperation,
+	attempt: ConfidentialTransientTaskDetachedSettlementAttemptV1,
+	inspectRequest: TransientTaskDetachedSettlementInspectRequestV1,
+	currentAuthority: HubCurrentAuthority,
+): Promise<HubAttemptRecovery> {
+	try {
+		const prepared = await store.prepare({ attempt });
+		if (prepared.status === "prepared" || prepared.status === "already_prepared") {
+			if (
+				prepared.attempt.attemptSha256 !== attempt.attemptSha256 ||
+				prepared.notAppliedReceipt.attemptSha256 !== attempt.attemptSha256
+			)
+				return { status: "blocked_indeterminate" };
+			return { status: "not_applied", notAppliedReceipt: prepared.notAppliedReceipt };
+		}
+		if (prepared.status !== "prepare_outcome_unknown") return { status: "blocked_indeterminate" };
+	} catch {
+		// Response loss is resolved below from the exact frozen attempt.
+	}
+	return reconcileHubDetachedAttempt(store, operation, attempt, inspectRequest, currentAuthority);
+}
+
+type HubReservationOutcome =
+	| { readonly status: "reserved"; readonly receipt: HubReservationReceipt }
+	| { readonly status: "terminal"; readonly disposition: TransientTaskDetachedSettlementDispositionV1 }
+	| { readonly status: "blocked_indeterminate" };
+
+async function reserveTransientJobResult(
+	store: TransientTaskDetachedSettlementStoreV1,
+	row: TransientSettledRow,
+	selector: HubReservationSelector,
+	currentAuthority: HubCurrentAuthority,
+): Promise<HubReservationOutcome> {
+	const common = {
+		settlement: row.transientTaskCompletion.settlementRequest,
+		currentAuthority,
+		preparedAt: row.transientTaskCompletion.settledResultReceipt.publishedAt,
+	};
+	const derived =
+		selector.disposition === "hub_wait_consumption"
+			? deriveTransientTaskHubDetachedReservationAttemptV1({
+					...common,
+					disposition: "hub_wait_consumption",
+					hubWaitInvocationId: selector.hubWaitInvocationId,
+				})
+			: deriveTransientTaskHubDetachedReservationAttemptV1({ ...common, disposition: selector.disposition });
+	const disposition = selector.disposition;
+	let prepared = await prepareHubDetachedAttempt(
+		store,
+		derived.operation,
+		derived.attempt,
+		derived.inspectRequest,
+		currentAuthority,
+	);
+	if (prepared.status === "applied") {
+		return isHubReservationReceipt(prepared.receipt) && prepared.receipt.disposition === disposition
+			? { status: "reserved", receipt: prepared.receipt }
+			: { status: "blocked_indeterminate" };
+	}
+	if (prepared.status === "blocked_indeterminate") return prepared;
+
+	for (let pass = 0; pass < 2; pass += 1) {
+		try {
+			const result = await store.reserve({
+				operation: derived.operation,
+				expectedAttemptSha256: derived.attempt.attemptSha256,
+				expectedNotAppliedReceiptSha256: prepared.notAppliedReceipt.receiptSha256,
+			});
+			if (result.status === "reserved" || result.status === "already_reserved") {
+				return isHubReservationReceipt(result.receipt) && result.receipt.disposition === disposition
+					? { status: "reserved", receipt: result.receipt }
+					: { status: "blocked_indeterminate" };
+			}
+			if (result.status === "already_terminal") {
+				return { status: "terminal", disposition: result.terminalDisposition };
+			}
+			if (result.status !== "reservation_outcome_unknown") return { status: "blocked_indeterminate" };
+		} catch {
+			// Inspect below; retry only when the exact attempt is proven not applied.
+		}
+
+		const recovered = await reconcileHubDetachedAttempt(
+			store,
+			derived.operation,
+			derived.attempt,
+			derived.inspectRequest,
+			currentAuthority,
+		);
+		if (recovered.status === "applied") {
+			return isHubReservationReceipt(recovered.receipt) && recovered.receipt.disposition === disposition
+				? { status: "reserved", receipt: recovered.receipt }
+				: { status: "blocked_indeterminate" };
+		}
+		if (recovered.status === "blocked_indeterminate") return recovered;
+		prepared = recovered;
+	}
+	return { status: "blocked_indeterminate" };
+}
+
+export type HubConsumptionOutcome = "consumed" | "already_terminal" | "blocked_indeterminate";
+
+async function commitTransientJobResult(
+	store: TransientTaskDetachedSettlementStoreV1,
+	row: TransientSettledRow,
+	disposition: HubConsumptionDisposition,
+	currentAuthority: HubCurrentAuthority,
+	reservation: HubReservationReceipt,
+): Promise<HubConsumptionOutcome> {
+	const derived = deriveTransientTaskHubDetachedCommitAttemptV1({
+		settlement: row.transientTaskCompletion.settlementRequest,
+		currentAuthority,
+		reservation,
+		preparedAt: row.transientTaskCompletion.settledResultReceipt.publishedAt,
+	});
+	let prepared = await prepareHubDetachedAttempt(
+		store,
+		derived.operation,
+		derived.attempt,
+		derived.inspectRequest,
+		currentAuthority,
+	);
+	if (prepared.status === "applied") {
+		if (!isHubTerminalReceipt(prepared.receipt)) return "blocked_indeterminate";
+		if (prepared.receipt.disposition !== disposition) return "already_terminal";
+		return prepared.receipt.reservationReceiptSha256 === reservation.receiptSha256
+			? "consumed"
+			: "blocked_indeterminate";
+	}
+	if (prepared.status === "blocked_indeterminate") return "blocked_indeterminate";
+
+	for (let pass = 0; pass < 2; pass += 1) {
+		try {
+			const result = await store.commit({
+				operation: derived.operation,
+				expectedAttemptSha256: derived.attempt.attemptSha256,
+				expectedNotAppliedReceiptSha256: prepared.notAppliedReceipt.receiptSha256,
+			});
+			if (
+				result.status === "committed" ||
+				result.status === "already_committed" ||
+				result.status === "already_terminal"
+			) {
+				if (result.receipt.disposition !== disposition) return "already_terminal";
+				return result.receipt.reservationReceiptSha256 === reservation.receiptSha256
+					? "consumed"
+					: "blocked_indeterminate";
+			}
+			if (result.status !== "commit_outcome_unknown") return "blocked_indeterminate";
+		} catch {
+			// Inspect below; retry only when the exact attempt is proven not applied.
+		}
+
+		const recovered = await reconcileHubDetachedAttempt(
+			store,
+			derived.operation,
+			derived.attempt,
+			derived.inspectRequest,
+			currentAuthority,
+		);
+		if (recovered.status === "applied") {
+			if (!isHubTerminalReceipt(recovered.receipt)) return "blocked_indeterminate";
+			if (recovered.receipt.disposition !== disposition) return "already_terminal";
+			return recovered.receipt.reservationReceiptSha256 === reservation.receiptSha256
+				? "consumed"
+				: "blocked_indeterminate";
+		}
+		if (recovered.status === "blocked_indeterminate") return "blocked_indeterminate";
+		prepared = recovered;
+	}
+	return "blocked_indeterminate";
+}
+
+async function consumeTransientJobResult(
+	manager: AsyncJobManager,
+	job: AsyncJob,
+	row: TransientSettledRow,
+	disposition: ImmediateHubConsumptionDisposition,
+): Promise<HubConsumptionOutcome> {
+	const completion = row.transientTaskCompletion;
+	const currentAuthority = completion.currentAuthority;
+	const recovery = job.transientTaskRecoveryRecord;
+	if (
+		!isHubCurrentAuthority(currentAuthority) ||
+		job.ownerId !== row.ownerId ||
+		completion.ownerId !== row.ownerId ||
+		completion.jobId !== row.jobId ||
+		completion.settlementRequest.identity.ownerId !== row.ownerId ||
+		completion.settlementRequest.identity.jobId !== row.jobId ||
+		currentAuthority.ownerId !== row.ownerId ||
+		currentAuthority.deliveryEpoch !== completion.settlementRequest.identity.deliveryEpoch ||
+		!recovery ||
+		recovery.recoveryState !== "handoff_ready" ||
+		recovery.recoveryRecordSha256 !== row.transientTaskRecoveryRecordSha256 ||
+		recovery.transientTaskCompletion?.handoffSha256 !== completion.handoffSha256 ||
+		recovery.coordinates.jobId !== row.jobId ||
+		recovery.coordinates.ownerSessionIndex.ownerId !== row.ownerId ||
+		recovery.coordinates.ownerSessionIndex.deliveryEpoch !== currentAuthority.deliveryEpoch
+	)
+		return "blocked_indeterminate";
+	const resolved = manager.resolveTransientTaskParentResultDeliveryStore(recovery.coordinates.ownerSessionIndex);
+	if (resolved.status !== "resolved") return "blocked_indeterminate";
+	const store = resolved.store.detachedSettlement;
+	const reservation = await reserveTransientJobResult(store, row, { disposition }, currentAuthority);
+	if (reservation.status === "terminal") {
+		return reservation.disposition === disposition ? "consumed" : "already_terminal";
+	}
+	if (reservation.status !== "reserved") return "blocked_indeterminate";
+	return commitTransientJobResult(store, row, disposition, currentAuthority, reservation.receipt);
+}
+
+export type HubWaitTransientJobReservationResultV1 =
+	| { readonly status: "not_settled" | "plain_job" | "cancelled" | "blocked_indeterminate" | "already_terminal" }
+	| { readonly status: "already_consumed" }
+	| {
+			readonly status: "reserved";
+			commit(): Promise<HubConsumptionOutcome>;
+	  };
+
+/**
+ * Freezes one settled managed-job reservation for a specific Hub wait. The
+ * winner store serializes this reservation against message capture by the same
+ * invocation id. Plain/running jobs retain their ordinary AsyncJobManager path.
+ */
+export async function reserveTransientJobResultForHubWait(
+	manager: AsyncJobManager,
+	job: AsyncJob,
+	hubWaitInvocationId: OperationId,
+): Promise<HubWaitTransientJobReservationResultV1> {
+	let inspected: ConfidentialAsyncJobSettledRowInspectResultV1;
+	try {
+		inspected = await manager.inspectSettledRow({ jobId: job.id, ownerId: job.ownerId ?? null });
+	} catch {
+		return { status: "blocked_indeterminate" };
+	}
+	if (inspected.status === "running") return { status: "not_settled" };
+	if (inspected.status === "cancelled") return { status: "cancelled" };
+	if (inspected.status === "blocked_indeterminate") return { status: "blocked_indeterminate" };
+	if (inspected.status !== "settled") return { status: "blocked_indeterminate" };
+	if (inspected.row.transientTaskCompletion === null) return { status: "plain_job" };
+	const row = inspected.row;
+	const completion = row.transientTaskCompletion;
+	const currentAuthority = completion.currentAuthority;
+	const recovery = job.transientTaskRecoveryRecord;
+	if (
+		!isHubCurrentAuthority(currentAuthority) ||
+		job.ownerId !== row.ownerId ||
+		completion.ownerId !== row.ownerId ||
+		completion.jobId !== row.jobId ||
+		completion.settlementRequest.identity.ownerId !== row.ownerId ||
+		completion.settlementRequest.identity.jobId !== row.jobId ||
+		currentAuthority.ownerId !== row.ownerId ||
+		currentAuthority.deliveryEpoch !== completion.settlementRequest.identity.deliveryEpoch ||
+		!recovery ||
+		recovery.recoveryState !== "handoff_ready" ||
+		recovery.recoveryRecordSha256 !== row.transientTaskRecoveryRecordSha256 ||
+		recovery.transientTaskCompletion?.handoffSha256 !== completion.handoffSha256 ||
+		recovery.coordinates.jobId !== row.jobId ||
+		recovery.coordinates.ownerSessionIndex.ownerId !== row.ownerId ||
+		recovery.coordinates.ownerSessionIndex.deliveryEpoch !== currentAuthority.deliveryEpoch
+	)
+		return { status: "blocked_indeterminate" };
+	const resolved = manager.resolveTransientTaskParentResultDeliveryStore(recovery.coordinates.ownerSessionIndex);
+	if (resolved.status !== "resolved") return { status: "blocked_indeterminate" };
+	const store = resolved.store.detachedSettlement;
+	const reserved = await reserveTransientJobResult(
+		store,
+		row,
+		{ disposition: "hub_wait_consumption", hubWaitInvocationId },
+		currentAuthority,
+	);
+	if (reserved.status === "terminal") {
+		return reserved.disposition === "hub_wait_consumption"
+			? { status: "already_consumed" }
+			: { status: "already_terminal" };
+	}
+	if (reserved.status !== "reserved") return { status: "blocked_indeterminate" };
+	return {
+		status: "reserved",
+		commit: () => commitTransientJobResult(store, row, "hub_wait_consumption", currentAuthority, reserved.receipt),
+	};
+}
+
+async function jobsAuthorizedForHubResult(
+	manager: AsyncJobManager,
+	jobs: AsyncJob[],
+	disposition: ImmediateHubConsumptionDisposition,
+	alreadyConsumed: ReadonlySet<string> = new Set<string>(),
+): Promise<AsyncJob[]> {
+	const authorized: AsyncJob[] = [];
+	for (const job of jobs) {
+		let inspected: ConfidentialAsyncJobSettledRowInspectResultV1;
+		try {
+			inspected = await manager.inspectSettledRow({ jobId: job.id, ownerId: job.ownerId ?? null });
+		} catch {
+			continue;
+		}
+		if (
+			inspected.status === "running" ||
+			inspected.status === "cancelled" ||
+			inspected.status === "blocked_indeterminate"
+		) {
+			authorized.push(job);
+			continue;
+		}
+		if (inspected.status !== "settled") continue;
+		if (inspected.row.transientTaskCompletion === null) {
+			authorized.push(job);
+			continue;
+		}
+		const consumption = alreadyConsumed.has(job.id)
+			? "consumed"
+			: await consumeTransientJobResult(manager, job, inspected.row, disposition);
+		if (consumption === "consumed") authorized.push(job);
+	}
+	return authorized;
+}
+
 /**
  * Running subagents from the registry that are not covered by one of the
  * caller's running jobs. Agents woken via hub messaging (idle wake / park
@@ -137,6 +576,7 @@ interface TrackedJobLike {
 	label: string;
 	startTime: number;
 	latestDetails?: Record<string, unknown>;
+	transientTaskSettlementManaged?: boolean;
 	resultText?: string;
 	errorText?: string;
 }
@@ -197,7 +637,16 @@ export function buildJobResult(
 	});
 	const jobResults = snapshotJobs(session, uniqueJobs);
 
-	manager.acknowledgeDeliveries(jobResults.filter(j => j.status !== "running").map(j => j.id));
+	manager.acknowledgeDeliveries(
+		uniqueJobs
+			.filter(
+				(job, index) =>
+					jobResults[index]?.status !== "running" &&
+					job.transientTaskSettlementManaged !== true &&
+					manager.getJob(job.id)?.transientTaskSettlementManaged !== true,
+			)
+			.map(job => job.id),
+	);
 
 	const completed = jobResults.filter(j => j.status !== "running");
 	const running = jobResults.filter(j => j.status === "running");
@@ -313,20 +762,56 @@ export async function executeCancel(
 ): Promise<AgentToolResult<CoordinationDetails>> {
 	const ownerFilter = ownerId ? { ownerId } : undefined;
 	const cancelOutcomes: CancelOutcome[] = [];
+	const consumedTransientIds = new Set<string>();
 	for (const id of ids) {
 		const existing = manager.getJob(id);
 		if (!existing || (ownerId && existing.ownerId !== ownerId)) {
 			// No job by this id (or it belongs to another agent): a budget-aborted
-			// keep-alive subagent lives on as a jobless registration long after its
-			// job row is reaped, so let cancel reach the agent registration too.
+			// keep-alive subagent may still have a cancellable registration.
 			cancelOutcomes.push(await cancelAgentRegistration(session, ownerId, id));
 			continue;
 		}
-		if (existing.status !== "running") {
-			// The job row settled but may still be inside the retention window.
-			// The agent registration behind it (job id == agent id for task
-			// spawns) can outlive the row as an idle/parked zombie — try the
-			// registration kill before reporting the row as already done.
+
+		let inspected: ConfidentialAsyncJobSettledRowInspectResultV1;
+		try {
+			inspected = await manager.inspectSettledRow({ jobId: id, ownerId: existing.ownerId ?? null });
+		} catch {
+			cancelOutcomes.push({
+				id,
+				status: "already_completed",
+				message: `Background job ${id} could not be authoritatively inspected; no cancellation was applied.`,
+			});
+			continue;
+		}
+
+		if (inspected.status === "blocked_indeterminate") {
+			cancelOutcomes.push({
+				id,
+				status: "already_completed",
+				message: `Background job ${id} has an indeterminate durable settlement; cancellation was rejected and the recovery state was preserved.`,
+			});
+			continue;
+		}
+
+		if (inspected.status === "settled") {
+			if (inspected.row.transientTaskCompletion !== null) {
+				const consumption = await consumeTransientJobResult(
+					manager,
+					existing,
+					inspected.row,
+					"hub_cancel_consumption",
+				);
+				if (consumption === "blocked_indeterminate") {
+					cancelOutcomes.push({
+						id,
+						status: "already_completed",
+						message: `Background job ${id} is already settled; its durable result could not be authoritatively resolved, so recovery state was preserved.`,
+					});
+					continue;
+				}
+				if (consumption === "consumed") consumedTransientIds.add(id);
+			}
+			// A settled task registration can remain idle or parked after its job row.
 			const regOutcome = await cancelAgentRegistration(session, ownerId, id);
 			cancelOutcomes.push(
 				regOutcome.status === "cancelled"
@@ -339,6 +824,37 @@ export async function executeCancel(
 			);
 			continue;
 		}
+
+		if (inspected.status === "cancelled") {
+			if (existing.transientTaskSettlementManaged) {
+				cancelOutcomes.push({
+					id,
+					status: "already_completed",
+					message: `Background job ${id} cancellation is already settling durably.`,
+				});
+				continue;
+			}
+			const regOutcome = await cancelAgentRegistration(session, ownerId, id);
+			cancelOutcomes.push(
+				regOutcome.status === "cancelled"
+					? regOutcome
+					: { id, status: "already_completed", message: `Background job ${id} is already cancelled.` },
+			);
+			continue;
+		}
+
+		if (inspected.status !== "running") {
+			const notFound = inspected.status === "absent" || inspected.status === "owner_mismatch";
+			cancelOutcomes.push({
+				id,
+				status: notFound ? "not_found" : "already_completed",
+				message: notFound
+					? `Background job not found: ${id}`
+					: `Background job ${id} could not be authoritatively verified; no cancellation was applied.`,
+			});
+			continue;
+		}
+
 		const cancelled = manager.cancel(id, ownerFilter);
 		cancelOutcomes.push(
 			cancelled
@@ -346,7 +862,13 @@ export async function executeCancel(
 				: { id, status: "already_completed", message: `Background job ${id} is already completed.` },
 		);
 	}
-	return buildJobResult(session, manager, "cancel", visibleJobs(manager, ids, ownerId), cancelOutcomes);
+	const jobs = await jobsAuthorizedForHubResult(
+		manager,
+		visibleJobs(manager, ids, ownerId),
+		"hub_cancel_consumption",
+		consumedTransientIds,
+	);
+	return buildJobResult(session, manager, "cancel", jobs, cancelOutcomes);
 }
 
 /**
@@ -395,13 +917,17 @@ async function cancelAgentRegistration(
 	return { id, status: "cancelled", message: `Cancelled agent ${id} (killed session, dropped registration).` };
 }
 
-/** `jobs`: read-only snapshot of every job plus the jobless running-agent roster. */
-export function executeJobsSnapshot(
+/** `jobs`: consumes settled transient handoffs durably; plain jobs retain legacy acknowledgement. */
+export async function executeJobsSnapshot(
 	session: ToolSession,
 	manager: AsyncJobManager,
 	ownerId: string | undefined,
-): AgentToolResult<CoordinationDetails> {
-	const jobs = manager.getAllJobs(ownerId ? { ownerId } : undefined);
+): Promise<AgentToolResult<CoordinationDetails>> {
+	const jobs = await jobsAuthorizedForHubResult(
+		manager,
+		manager.getAllJobs(ownerId ? { ownerId } : undefined),
+		"hub_jobs_consumption",
+	);
 	return buildJobResult(session, manager, "jobs", jobs, [], runningAgentsOutsideJobs(session));
 }
 

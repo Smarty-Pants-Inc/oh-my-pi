@@ -13,6 +13,7 @@ import { ModelRegistry } from "../src/config/model-registry";
 import type { CustomTool } from "../src/extensibility/custom-tools/types";
 import { InteractiveMode } from "../src/modes/interactive-mode";
 import { resolveXdevTool, type XdevState } from "../src/tools/xdev";
+import { createTestRuntimeDependencies } from "./utilities";
 
 function makeTool(name: string): AgentTool {
 	return {
@@ -103,6 +104,7 @@ describe("InteractiveMode plan.defaultOnStartup", () => {
 			sessionManager: manager,
 			settings,
 			modelRegistry: registry,
+			...createTestRuntimeDependencies(registry),
 			toolRegistry,
 			builtInToolNames: options.builtInToolNames ?? ["read"],
 			rebuildSystemPrompt: options.rebuildGate

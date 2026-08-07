@@ -11,6 +11,7 @@ import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities.js";
 
 const usage = {
 	input: 16,
@@ -48,6 +49,7 @@ describe("AgentSession shake", () => {
 			sessionManager,
 			settings: Settings.isolated({ "compaction.enabled": true, "compaction.autoContinue": false }),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 		session.subscribe(event => events.push(event));
 	});

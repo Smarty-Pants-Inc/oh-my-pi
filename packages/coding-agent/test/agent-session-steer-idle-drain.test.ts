@@ -10,6 +10,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 /**
  * Regression: a steer can land on an idle session — the submit path checks
@@ -69,11 +70,13 @@ describe("AgentSession steer idle drain", () => {
 			initialState: { model, systemPrompt: ["Test"], tools: [], messages },
 		});
 		const sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
+		const modelRegistry = new ModelRegistry(authStorage);
 		session = new AgentSession({
 			agent,
 			sessionManager,
 			settings: Settings.isolated({}),
-			modelRegistry: new ModelRegistry(authStorage),
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 	}
 
@@ -148,11 +151,13 @@ describe("AgentSession steer idle drain", () => {
 			streamFn: mock.stream,
 		});
 		const sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
+		const modelRegistry = new ModelRegistry(authStorage);
 		session = new AgentSession({
 			agent,
 			sessionManager,
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: new ModelRegistry(authStorage),
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 
 		const running = session.prompt("do the thing");

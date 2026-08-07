@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { registerPersistedSubagents } from "@oh-my-pi/pi-coding-agent/registry/persisted-agents";
+import type { PersistentAgentStore } from "@oh-my-pi/pi-coding-agent/registry/persistent-agent-contracts";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
@@ -36,6 +37,24 @@ async function flushAsync(): Promise<void> {
 	for (let i = 0; i < 5; i++) await Promise.resolve();
 }
 
+function bindMissingPersistentAgentStore(registry: AgentRegistry): void {
+	registry.bindProcessOwnedPersistentAgentStore({
+		controlHostId: "test-host",
+		lookup: async agentId => ({ kind: "missing", agentId }),
+		list: async () => [],
+		inspectOwnership: async () => ({
+			state: "unowned",
+			controlHostId: "test-host",
+			processId: null,
+			intent: null,
+			acquiredAt: null,
+		}),
+		acquire: async () => {
+			throw new Error("Persistent ownership is not used by this fixture");
+		},
+	} satisfies PersistentAgentStore);
+}
+
 const TTL = 20;
 
 describe("AgentLifecycleManager", () => {
@@ -46,6 +65,7 @@ describe("AgentLifecycleManager", () => {
 		AgentRegistry.resetGlobalForTests();
 		AgentLifecycleManager.resetGlobalForTests();
 		registry = AgentRegistry.global();
+		bindMissingPersistentAgentStore(registry);
 		lifecycle = AgentLifecycleManager.global();
 	});
 	afterEach(() => {

@@ -9,6 +9,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 /**
  * Regression: the per-turn supersede/useless prune pass rewrote the LIVE agent
@@ -96,6 +97,7 @@ describe("AgentSession per-turn prune persistence", () => {
 				"compaction.dropUseless": true,
 				"compaction.supersedeReads": true,
 			}),
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);

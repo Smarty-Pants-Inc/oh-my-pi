@@ -66,6 +66,8 @@ import type {
 	AgentContext,
 	AgentEvent,
 	AgentLoopConfig,
+	AgentLoopLifecycleObservationInputV1,
+	AgentLoopSelectedToolResultPersistenceV1,
 	AgentMessage,
 	AgentPreModelCallResult,
 	AgentTool,
@@ -80,7 +82,12 @@ import type {
 	SteeringQueueState,
 	StreamFn,
 } from "./types";
-import { ASIDE_MESSAGE_COMMIT, ASIDE_MESSAGE_DISCARD, isSoftToolRequirement } from "./types";
+import {
+	AGENT_LOOP_SELECTED_TOOL_RESULT_PERSISTENCE,
+	ASIDE_MESSAGE_COMMIT,
+	ASIDE_MESSAGE_DISCARD,
+	isSoftToolRequirement,
+} from "./types";
 import { yieldIfDue } from "./utils/yield";
 
 /** Stop-details marker for a provider error after assistant content/tool args already streamed. */
@@ -151,6 +158,21 @@ export function createToolScopedAbortReason(
  * boundary; this reason stops after persisting the completed tool batch.
  */
 export const TERMINAL_TOOL_RESULT_ABORT_REASON = Symbol.for("pi-agent-core.terminal-tool-result");
+
+async function awaitLifecycleObservation(
+	config: AgentLoopConfig,
+	observation: AgentLoopLifecycleObservationInputV1,
+): Promise<void> {
+	const adapter = config.lifecyclePersistenceAdapter;
+	if (!adapter) return;
+	let gate = await adapter.onLifecycleObservation(observation);
+	while (gate.status === "suspended") {
+		gate = await adapter.resumeLifecycleObservation(gate.resumeRequest);
+	}
+	if (gate.resultExposure !== "continue_original_emission") {
+		throw new Error("Lifecycle durability did not authorize result exposure");
+	}
+}
 
 const STEERING_INTERRUPT_POLL_MS = 250;
 
@@ -986,6 +1008,15 @@ async function runLoopBody(
 	initialMessages: AgentMessage[],
 	streamFn?: StreamFn,
 ): Promise<void> {
+	const onFirstAssistantContent = config.onFirstAssistantContent;
+	let firstAssistantContentObserved = false;
+	const observeFirstAssistantContent = onFirstAssistantContent
+		? () => {
+				if (firstAssistantContentObserved) return;
+				firstAssistantContentObserved = true;
+				onFirstAssistantContent(Date.now());
+			}
+		: undefined;
 	let deadlineTimer: Timer | undefined;
 	if (config.deadline !== undefined) {
 		const deadlineAbortController = new AbortController();
@@ -1178,6 +1209,7 @@ async function runLoopBody(
 						hostToolChoice,
 						softRequirementState.forcedToolChoice,
 						preparedProviderCall,
+						observeFirstAssistantContent,
 					);
 					harmonyRetryAttempt = 0;
 					harmonyTruncateResumeCount = 0;
@@ -1245,9 +1277,17 @@ async function runLoopBody(
 						message.toolCallAbortMessages ??
 						(scopedAbort ? buildToolCallAbortMessages(message, scopedAbort) : undefined);
 					const toolResults: ToolResultMessage[] = [];
-					for (const toolCall of toolCalls) {
+					for (const [sourceToolCallOrdinal, toolCall] of toolCalls.entries()) {
 						const errorMessage = toolCallAbortMessages?.[toolCall.id] ?? message.errorMessage;
-						const result = createAbortedToolResult(toolCall, stream, message.stopReason, errorMessage);
+						const result = await createAbortedToolResult(
+							toolCall,
+							sourceToolCallOrdinal,
+							stream,
+							config,
+							message.stopReason,
+							errorMessage,
+							"assistant_stream_terminal",
+						);
 						currentContext.messages.push(result);
 						newMessages.push(result);
 						toolResults.push(result);
@@ -1326,12 +1366,15 @@ async function runLoopBody(
 					// only turn that changes toolChoice; a model that complies with the
 					// reminder pays no message-cache invalidation. Re-engage so the loop
 					// never yields while the requirement is unmet.
-					for (const toolCall of toolCalls) {
-						const result = createAbortedToolResult(
+					for (const [sourceToolCallOrdinal, toolCall] of toolCalls.entries()) {
+						const result = await createAbortedToolResult(
 							toolCall,
+							sourceToolCallOrdinal,
 							stream,
+							config,
 							"skipped",
 							`Not executed: call the \`${softRequiredTool}\` tool to resolve the pending action before using other tools.`,
+							"soft_requirement_detour",
 						);
 						currentContext.messages.push(result);
 						newMessages.push(result);
@@ -1367,8 +1410,16 @@ async function runLoopBody(
 					// but left toolCall blocks behind. pair each with a placeholder result.
 					const skipReason = deadlinePassed ? "aborted" : message.stopReason === "length" ? "length" : "skipped";
 					const skipErrMsg = deadlinePassed ? "Deadline exceeded" : undefined;
-					for (const toolCall of toolCalls) {
-						const result = createAbortedToolResult(toolCall, stream, skipReason, skipErrMsg);
+					for (const [sourceToolCallOrdinal, toolCall] of toolCalls.entries()) {
+						const result = await createAbortedToolResult(
+							toolCall,
+							sourceToolCallOrdinal,
+							stream,
+							config,
+							skipReason,
+							skipErrMsg,
+							"assistant_stream_terminal",
+						);
 						currentContext.messages.push(result);
 						newMessages.push(result);
 						toolResults.push(result);
@@ -1550,6 +1601,38 @@ async function prepareProviderCall(
 	return { model, context: llmContext, promptToolWireTools, ownedDialect };
 }
 
+function hasSemanticAssistantContent(message: AssistantMessage): boolean {
+	return message.content.some(
+		block =>
+			block.type === "image" ||
+			block.type === "toolCall" ||
+			(block.type === "text" && block.text.length > 0) ||
+			(block.type === "thinking" && block.thinking.length > 0),
+	);
+}
+
+function isSemanticAssistantContentEvent(event: AssistantMessageEvent): boolean {
+	switch (event.type) {
+		case "text_delta":
+		case "thinking_delta":
+		case "toolcall_delta":
+			return event.delta.length > 0;
+		case "text_end":
+		case "thinking_end":
+			return event.content.length > 0;
+		case "image_end":
+		case "toolcall_start":
+		case "toolcall_end":
+			return true;
+		case "done":
+			return hasSemanticAssistantContent(event.message);
+		case "error":
+			return hasSemanticAssistantContent(event.error);
+		default:
+			return false;
+	}
+}
+
 /**
  * Stream an assistant response from the LLM.
  * This is where AgentMessage[] gets transformed to Message[] for the LLM.
@@ -1567,6 +1650,7 @@ async function streamAssistantResponse(
 	hostToolChoice?: ToolChoice,
 	forcedToolChoice?: ToolChoice,
 	prepared?: PreparedProviderCall,
+	onFirstAssistantContent?: () => void,
 ): Promise<AssistantMessage> {
 	const providerCall = prepared ?? (await prepareProviderCall(context, config, signal));
 	const { model, context: llmContext, promptToolWireTools, ownedDialect } = providerCall;
@@ -1743,6 +1827,7 @@ async function streamAssistantResponse(
 					if (next.done) break;
 
 					const event = next.value;
+					if (isSemanticAssistantContentEvent(event)) onFirstAssistantContent?.();
 					if (event.type === "done" || event.type === "error") {
 						let finalMessage = recoverTransientErrorToolTurn(
 							retainCompletedToolCalls(await response.result(), completedToolCallIds),
@@ -2089,6 +2174,7 @@ interface PreparedToolCall {
 	tool: AgentTool<any> | undefined;
 	/** Validated (possibly hook-revised) execution args; raw args when validation failed. */
 	args: Record<string, unknown>;
+	validationStage?: "initial_validation" | "hook_revision_validation";
 	validationErrorMessage?: string;
 	blocked?: boolean;
 	blockReason?: string;
@@ -2163,7 +2249,10 @@ async function prepareToolCallDispatch(
 				}
 			}
 		}
-		const validate = (args: Record<string, unknown>): Record<string, unknown> | undefined => {
+		const validate = (
+			args: Record<string, unknown>,
+			stage: "initial_validation" | "hook_revision_validation",
+		): Record<string, unknown> | undefined => {
 			try {
 				if (!tool) throw new Error(`Tool ${toolCall.name} not found`);
 				return validateToolArguments(tool, { ...toolCall, arguments: args });
@@ -2175,12 +2264,13 @@ async function prepareToolCallDispatch(
 					return fallback;
 				}
 				entry.args = "__parseError" in args ? { __parseError: args.__parseError } : args;
+				entry.validationStage = stage;
 				entry.validationErrorMessage =
 					validationError instanceof Error ? validationError.message : String(validationError);
 				return undefined;
 			}
 		};
-		const effectiveArgs = validate(argsForExecution);
+		const effectiveArgs = validate(argsForExecution, "initial_validation");
 		if (effectiveArgs === undefined) continue;
 		entry.args = effectiveArgs;
 		if (!beforeToolCall || !tool) continue;
@@ -2202,8 +2292,7 @@ async function prepareToolCallDispatch(
 			continue;
 		}
 		if (beforeResult?.args !== undefined) {
-			// Revalidate: a hook revision is untrusted input to the tool schema.
-			const revised = validate(beforeResult.args);
+			const revised = validate(beforeResult.args, "hook_revision_validation");
 			if (revised === undefined) continue;
 			// Bake the revision into the message itself. On the streamed path this
 			// precedes every consumer snapshot, so there is exactly one version of
@@ -2274,7 +2363,7 @@ async function executeToolCalls(
 		preparedDispatchByMessage.get(assistantMessage) ??
 		(await prepareToolCallDispatch(assistantMessage, currentContext, config, signal));
 
-	const records = toolCalls.map(toolCall => {
+	const records = toolCalls.map((toolCall, sourceToolCallOrdinal) => {
 		const prepared = preparedDispatch.get(toolCall.id) ?? {
 			tool: resolveToolForCall(tools, toolCall, resolveFallbackTool),
 			args: toolCall.arguments as Record<string, unknown>,
@@ -2298,6 +2387,7 @@ async function executeToolCalls(
 			toolCall,
 			tool,
 			args,
+			sourceToolCallOrdinal,
 			interruptible,
 			signal: interruptible ? interruptibleSignal : nonInterruptibleSignal,
 			started: false,
@@ -2308,6 +2398,16 @@ async function executeToolCalls(
 			resultEmitted: false,
 			validationErrorMessage: prepared.validationErrorMessage,
 			blocked: prepared.blocked === true,
+			validationStage: prepared.validationStage,
+			afterToolCallInputResult: undefined as AgentToolResult<any> | undefined,
+			selectedPersistence: undefined as AgentLoopSelectedToolResultPersistenceV1 | undefined,
+			executionStarted: false,
+			nonExecutionReason: null as
+				| "before_tool_block"
+				| "before_tool_prepare_error"
+				| "argument_transform_error"
+				| "pre_execute_error"
+				| null,
 			blockReason: prepared.blockReason,
 			prepareError: prepared.prepareError,
 		};
@@ -2368,7 +2468,11 @@ async function executeToolCalls(
 		await checkIrcInterrupts();
 	};
 
-	const emitToolResult = (record: (typeof records)[number], result: AgentToolResult<any>, isError: boolean): void => {
+	const emitToolResult = async (
+		record: (typeof records)[number],
+		result: AgentToolResult<any>,
+		isError: boolean,
+	): Promise<void> => {
 		if (record.resultEmitted) return;
 		const { toolCall } = record;
 		if (!record.started) {
@@ -2380,15 +2484,10 @@ async function executeToolCalls(
 				intent: toolCall.intent,
 			});
 		}
-		stream.push({
-			type: "tool_execution_end",
-			toolCallId: toolCall.id,
-			toolName: toolCall.name,
-			result,
-			isError,
-		});
 
-		const toolResultMessage: ToolResultMessage = {
+		const selectedPersistence = record.selectedPersistence;
+		const lifecycleAdapter = config.lifecyclePersistenceAdapter;
+		const exactToolResultMessage: ToolResultMessage = selectedPersistence?.exactToolResultMessage ?? {
 			role: "toolResult",
 			toolCallId: toolCall.id,
 			toolName: toolCall.name,
@@ -2399,6 +2498,104 @@ async function executeToolCalls(
 			...(result.useless && !isError ? { useless: true } : {}),
 			timestamp: Date.now(),
 		};
+		if (lifecycleAdapter?.hasLifecycleAuthority(toolCall.id, toolCall.name) === true) {
+			let observation: AgentLoopLifecycleObservationInputV1;
+			if (!record.tool) {
+				observation = {
+					schemaVersion: 1,
+					toolCallId: toolCall.id,
+					toolName: toolCall.name,
+					sourceToolCallOrdinal: record.sourceToolCallOrdinal,
+					eventKind: "tool_missing",
+					result: { result },
+				};
+			} else if (record.validationErrorMessage !== undefined) {
+				observation = {
+					schemaVersion: 1,
+					toolCallId: toolCall.id,
+					toolName: toolCall.name,
+					sourceToolCallOrdinal: record.sourceToolCallOrdinal,
+					eventKind: "validation_result",
+					stage: record.validationStage ?? "initial_validation",
+					result: { result },
+				};
+			} else if (record.blocked) {
+				observation = {
+					schemaVersion: 1,
+					toolCallId: toolCall.id,
+					toolName: toolCall.name,
+					sourceToolCallOrdinal: record.sourceToolCallOrdinal,
+					eventKind: "before_tool_block",
+					blockReasonUtf8: record.blockReason ?? "Blocked by beforeToolCall hook",
+					preAfterHookResult: { result },
+				};
+			} else if (record.prepareError !== undefined) {
+				observation = {
+					schemaVersion: 1,
+					toolCallId: toolCall.id,
+					toolName: toolCall.name,
+					sourceToolCallOrdinal: record.sourceToolCallOrdinal,
+					eventKind: "before_tool_prepare_error",
+					prepareErrorUtf8:
+						record.prepareError instanceof Error ? record.prepareError.message : String(record.prepareError),
+					preAfterHookResult: { result },
+				};
+			} else if (record.skipped && interruptState.triggered) {
+				observation = {
+					schemaVersion: 1,
+					toolCallId: toolCall.id,
+					sourceToolCallOrdinal: record.sourceToolCallOrdinal,
+					toolName: toolCall.name,
+					eventKind: "steering_skip",
+					steeringSource: interruptState.source ?? "unknown",
+					result: { result },
+				};
+			} else if (record.skipped || (record.signal.aborted && !record.executionStarted)) {
+				observation = {
+					schemaVersion: 1,
+					toolCallId: toolCall.id,
+					sourceToolCallOrdinal: record.sourceToolCallOrdinal,
+					toolName: toolCall.name,
+					eventKind: "signal_pre_execution_skip",
+					signalKind:
+						config.deadline !== undefined && Date.now() >= config.deadline ? "deadline" : "external_abort",
+					result: { result },
+				};
+			} else {
+				observation = {
+					schemaVersion: 1,
+					toolCallId: toolCall.id,
+					sourceToolCallOrdinal: record.sourceToolCallOrdinal,
+					toolName: toolCall.name,
+					eventKind: "after_hook_result",
+					executionState: record.executionStarted ? "started" : "not_started",
+					nonExecutionReason: record.nonExecutionReason,
+					afterToolCallInputResult: { result: record.afterToolCallInputResult ?? result },
+					finalResult: { result },
+				};
+			}
+			await awaitLifecycleObservation(config, observation);
+		}
+		if (selectedPersistence && !lifecycleAdapter) {
+			throw new Error("Selected tool result requires the owner persistence adapter");
+		}
+		const persisted = lifecycleAdapter
+			? await lifecycleAdapter.persistToolResultBeforeEmission({
+					toolCallId: toolCall.id,
+					toolName: toolCall.name,
+					exactToolResultMessage,
+					...(selectedPersistence ? { selectedAuthority: selectedPersistence.authority } : {}),
+				})
+			: undefined;
+		const toolResultMessage = persisted?.exactToolResultMessage ?? exactToolResultMessage;
+
+		stream.push({
+			type: "tool_execution_end",
+			toolCallId: toolCall.id,
+			toolName: toolCall.name,
+			result,
+			isError,
+		});
 		record.result = result;
 		record.isError = isError;
 		record.toolResultMessage = toolResultMessage;
@@ -2438,7 +2635,7 @@ async function executeToolCalls(
 		// failure recorded there surfaces here at the record's scheduled slot so
 		// result emission keeps batch order.
 		if (record.validationErrorMessage !== undefined) {
-			emitToolResult(
+			await emitToolResult(
 				record,
 				{
 					content: [{ type: "text" as const, text: record.validationErrorMessage }],
@@ -2456,7 +2653,7 @@ async function executeToolCalls(
 				toolName: toolCall.name,
 				status: "aborted",
 			});
-			emitToolResult(record, createToolSignalAbortedResult(record.signal), true);
+			await emitToolResult(record, createToolSignalAbortedResult(record.signal), true);
 			return;
 		}
 		record.started = true;
@@ -2518,6 +2715,7 @@ async function executeToolCalls(
 						})
 					: undefined;
 				executionStarted = true;
+				record.executionStarted = true;
 				const rawResult = await tool.execute(
 					toolCall.id,
 					executionArgs,
@@ -2546,6 +2744,8 @@ async function executeToolCalls(
 				isError = true;
 			}
 
+			record.afterToolCallInputResult = result;
+
 			if (afterToolCall && (!record.signal.aborted || completedToolExecution)) {
 				try {
 					const after = await afterToolCall(
@@ -2560,19 +2760,35 @@ async function executeToolCalls(
 						record.signal,
 					);
 					if (after) {
-						// Re-normalize the post-hook result: `afterToolCall` is untyped user/extension
-						// code and may return malformed `content` (non-array / invalid blocks), which
-						// would otherwise be persisted verbatim and corrupt the session — the same
-						// hazard `coerceToolResult` guards on the execute path.
-						const coerced = coerceToolResult({
-							content: after.content ?? result.content,
-							details: after.details ?? result.details,
-							isError: after.isError ?? result.isError,
-							providerMetadata: after.providerMetadata ?? result.providerMetadata,
-							useless: after.useless ?? result.useless,
-						});
-						result = coerced.result;
-						isError = coerced.malformed || (after.isError ?? isError);
+						const selectedPersistence = after[AGENT_LOOP_SELECTED_TOOL_RESULT_PERSISTENCE];
+						if (selectedPersistence) {
+							const exact = selectedPersistence.exactToolResultMessage;
+							if (
+								exact.role !== "toolResult" ||
+								exact.toolCallId !== toolCall.id ||
+								exact.toolName !== toolCall.name
+							) {
+								throw new Error("Selected persistence authority does not match the current tool call");
+							}
+							const coerced = coerceToolResult(exact);
+							result = coerced.result;
+							isError = coerced.malformed || exact.isError === true;
+							record.selectedPersistence = selectedPersistence;
+						} else {
+							// Re-normalize the post-hook result: `afterToolCall` is untyped user/extension
+							// code and may return malformed `content` (non-array / invalid blocks), which
+							// would otherwise be persisted verbatim and corrupt the session — the same
+							// hazard `coerceToolResult` guards on the execute path.
+							const coerced = coerceToolResult({
+								content: after.content ?? result.content,
+								details: after.details ?? result.details,
+								isError: after.isError ?? result.isError,
+								providerMetadata: after.providerMetadata ?? result.providerMetadata,
+								useless: after.useless ?? result.useless,
+							});
+							result = coerced.result;
+							isError = coerced.malformed || (after.isError ?? isError);
+						}
 					}
 				} catch (e) {
 					caughtError = e;
@@ -2585,6 +2801,16 @@ async function executeToolCalls(
 			}
 		});
 
+		if (!executionStarted) {
+			record.nonExecutionReason = record.blocked
+				? "before_tool_block"
+				: record.prepareError !== undefined
+					? "before_tool_prepare_error"
+					: caughtError !== undefined
+						? "argument_transform_error"
+						: "pre_execute_error";
+		}
+
 		const interrupted = interruptState.triggered;
 		const perToolAborted = record.signal.aborted;
 		const abortedDuringExecution = perToolAborted && isError && !completedToolExecution;
@@ -2593,7 +2819,7 @@ async function executeToolCalls(
 			// execution may already have performed partial work before throwing on
 			// abort, so preserve that distinction in the placeholder metadata.
 			record.skipped = true;
-			emitToolResult(record, createSkippedToolResult(interruptState.source, executionStarted), true);
+			await emitToolResult(record, createSkippedToolResult(interruptState.source, executionStarted), true);
 		} else {
 			// No interrupt on this signal, or the tool finished before the interrupt landed
 			// (`completedToolExecution`) — even if the signal aborted around completion. Keep
@@ -2602,7 +2828,7 @@ async function executeToolCalls(
 			// false "skipped" that discards work the tool performed (#4752). A peer-IRC interrupt
 			// on the batch leaves non-interruptible tools' signals untouched — their genuine
 			// errors survive here too.
-			emitToolResult(record, result, isError);
+			await emitToolResult(record, result, isError);
 		}
 
 		const firstTextBlock = result.content?.[0];
@@ -2734,7 +2960,7 @@ async function executeToolCalls(
 				toolName: record.toolCall.name,
 				status: "skipped",
 			});
-			emitToolResult(record, createSkippedToolResult(interruptState.source, false), true);
+			await emitToolResult(record, createSkippedToolResult(interruptState.source, false), true);
 		}
 	}
 
@@ -2849,21 +3075,58 @@ export function createSyntheticToolResultMessage(
 }
 
 /**
- * Create and emit a tool result for a tool call that was emitted by the
- * assistant but never invoked locally.
+ * Persist and emit a synthetic result for a tool call that never invoked its
+ * implementation. Owner-selected lifecycle durability and primary persistence
+ * both complete before any externally visible result event.
  */
-function createAbortedToolResult(
+async function createAbortedToolResult(
 	toolCall: Extract<AssistantMessage["content"][number], { type: "toolCall" }>,
+	sourceToolCallOrdinal: number,
 	stream: EventStream<AgentEvent, AgentMessage[]>,
+	config: AgentLoopConfig,
 	reason: "aborted" | "error" | "skipped" | "length",
-	errorMessage?: string,
-): ToolResultMessage {
-	const toolResultMessage = createSyntheticToolResultMessage(toolCall, reason, errorMessage);
+	errorMessage: string | undefined,
+	lifecycleEventKind: "soft_requirement_detour" | "assistant_stream_terminal",
+): Promise<ToolResultMessage> {
+	const exactToolResultMessage = createSyntheticToolResultMessage(toolCall, reason, errorMessage);
+	const details = exactToolResultMessage.details;
 	const result: AgentToolResult<SyntheticToolResultDetails> = {
-		content: toolResultMessage.content,
-		details: toolResultMessage.details,
+		content: exactToolResultMessage.content,
+		details,
 	};
-
+	if (config.lifecyclePersistenceAdapter?.hasLifecycleAuthority(toolCall.id, toolCall.name) === true) {
+		if (lifecycleEventKind === "soft_requirement_detour") {
+			await awaitLifecycleObservation(config, {
+				schemaVersion: 1,
+				toolCallId: toolCall.id,
+				toolName: toolCall.name,
+				sourceToolCallOrdinal,
+				eventKind: "soft_requirement_detour",
+				result: { result },
+			});
+		} else {
+			if (!details || details.source === "interrupt_skipped") {
+				throw new Error("Assistant-stream terminal synthetic result must have an assistant-stop source");
+			}
+			await awaitLifecycleObservation(config, {
+				schemaVersion: 1,
+				toolCallId: toolCall.id,
+				toolName: toolCall.name,
+				sourceToolCallOrdinal,
+				eventKind: "assistant_stream_terminal",
+				syntheticSource: details.source,
+				result: { result },
+			});
+		}
+	}
+	const persisted = config.lifecyclePersistenceAdapter
+		? await config.lifecyclePersistenceAdapter.persistToolResultBeforeEmission({
+				toolCallId: toolCall.id,
+				toolName: toolCall.name,
+				exactToolResultMessage,
+			})
+		: undefined;
+	const toolResultMessage = persisted?.exactToolResultMessage ?? exactToolResultMessage;
 	stream.push({
 		type: "tool_execution_start",
 		toolCallId: toolCall.id,
@@ -2880,7 +3143,6 @@ function createAbortedToolResult(
 	});
 	stream.push({ type: "message_start", message: toolResultMessage });
 	stream.push({ type: "message_end", message: toolResultMessage });
-
 	return toolResultMessage;
 }
 

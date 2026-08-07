@@ -52,6 +52,7 @@ import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { BashTool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 /** Scripted assistant turn that issues a single `bash` tool call. */
 function bashCall(command: string, callId: string): MockResponse {
@@ -188,6 +189,7 @@ describe("BashTool through AgentSession runs children in their own session (e2e)
 			sessionManager,
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			toolRegistry: new Map([[bashTool.name, bashTool as unknown as AgentTool]]),
 		});
 	});

@@ -1,9 +1,485 @@
+import { createHash } from "node:crypto";
+import { isProxy } from "node:util/types";
 import { type BaseType, type } from "@oh-my-pi/omptype";
 import type { Usage } from "@oh-my-pi/pi-ai";
-import { $env } from "@oh-my-pi/pi-utils";
+import { $env, sanitizeText } from "@oh-my-pi/pi-utils";
 import type { AgentSessionEvent } from "../session/agent-session";
+import {
+	type ConfidentialTransientTaskForegroundSourceResultSnapshotV1,
+	type ConfidentialTransientTaskSourceObservationResultV1,
+	TRANSIENT_EVAL_FOREGROUND_SOURCE_VALUE_TOOL_ERROR_TEXT_V1,
+	TRANSIENT_TASK_FOREGROUND_SOURCE_VALUE_TOOL_ERROR_TEXT_V1,
+	type TransientEvalForegroundSourceAgentToolResultV1,
+	type TransientEvalForegroundSourceProjectionResultV1,
+	type TransientEvalForegroundSourceValueToolErrorResultV1,
+	type TransientForegroundAgentToolResultV1,
+	type TransientForegroundSourceAgentToolResultV1,
+	type TransientTaskForegroundSourceAgentToolResultV1,
+	type TransientTaskForegroundSourceProjectionResultV1,
+	type TransientTaskForegroundSourceValueToolErrorResultV1,
+	type TransientTaskForegroundTaggedSourceValueV1,
+} from "../session/workspace-runtime-contracts";
 import type { ConfiguredThinkingLevel, TaskEffort } from "../thinking";
 import type { NestedRepoPatch } from "./worktree";
+
+const stringifyTransientTaskForegroundValue = JSON.stringify.bind(JSON);
+
+function transientTaskForegroundUtf8Sha256(value: string): `sha256:${string}` {
+	return `sha256:${createHash("sha256").update(value, "utf8").digest("hex")}`;
+}
+
+function transientTaskForegroundTupleSha256(tuple: readonly unknown[]): `sha256:${string}` {
+	const utf8 = stringifyTransientTaskForegroundValue(tuple);
+	if (utf8 === undefined) throw new TypeError("Foreground tuple is not JSON-representable");
+	return transientTaskForegroundUtf8Sha256(utf8);
+}
+
+function transientTaskForegroundPointer(parent: string, key: string): string {
+	return `${parent}/${key.replaceAll("~", "~0").replaceAll("/", "~1")}`;
+}
+
+function tagTransientTaskForegroundSourceValue(
+	input: unknown,
+	pointer: string,
+	active: Set<object>,
+	ownUndefinedJsonPointers: string[],
+): TransientTaskForegroundTaggedSourceValueV1 {
+	if (input === undefined) {
+		ownUndefinedJsonPointers.push(pointer);
+		return { kind: "undefined" };
+	}
+	if (input === null) return { kind: "null" };
+	if (typeof input === "boolean") return { kind: "boolean", value: input };
+	if (typeof input === "number") {
+		if (!Number.isFinite(input) || Object.is(input, -0)) throw new TypeError("Invalid foreground source number");
+		return { kind: "number", value: input };
+	}
+	if (typeof input === "string") {
+		if (!input.isWellFormed()) throw new TypeError("Invalid foreground source string");
+		return { kind: "string", value: input };
+	}
+	if (typeof input !== "object" || isProxy(input) || active.has(input)) {
+		throw new TypeError("Invalid foreground source value");
+	}
+
+	active.add(input);
+	try {
+		if (Array.isArray(input)) {
+			if (Object.getPrototypeOf(input) !== Array.prototype) throw new TypeError("Invalid foreground source array");
+			const descriptors = Object.getOwnPropertyDescriptors(input);
+			const keys = Reflect.ownKeys(input);
+			if (keys.length !== input.length + 1 || keys.some(key => typeof key !== "string")) {
+				throw new TypeError("Invalid foreground source array shape");
+			}
+			const items: TransientTaskForegroundTaggedSourceValueV1[] = [];
+			for (let index = 0; index < input.length; index++) {
+				const descriptor = descriptors[String(index)];
+				if (descriptor?.enumerable !== true || !("value" in descriptor) || descriptor.value === undefined) {
+					throw new TypeError("Invalid foreground source array entry");
+				}
+				items.push(
+					tagTransientTaskForegroundSourceValue(
+						descriptor.value,
+						transientTaskForegroundPointer(pointer, String(index)),
+						active,
+						ownUndefinedJsonPointers,
+					),
+				);
+			}
+			return { kind: "array", items };
+		}
+
+		const prototype = Object.getPrototypeOf(input);
+		if (prototype !== Object.prototype && prototype !== null) throw new TypeError("Invalid foreground source object");
+		const descriptors = Object.getOwnPropertyDescriptors(input);
+		const keys = Reflect.ownKeys(input);
+		if (keys.some(key => typeof key !== "string")) throw new TypeError("Invalid foreground source object key");
+		const entries: Array<{ key: string; value: TransientTaskForegroundTaggedSourceValueV1 }> = [];
+		for (const key of keys as string[]) {
+			if (!key.isWellFormed()) throw new TypeError("Invalid foreground source object key");
+			const descriptor = descriptors[key];
+			if (descriptor?.enumerable !== true || !("value" in descriptor)) {
+				throw new TypeError("Invalid foreground source object entry");
+			}
+			entries.push({
+				key,
+				value: tagTransientTaskForegroundSourceValue(
+					descriptor.value,
+					transientTaskForegroundPointer(pointer, key),
+					active,
+					ownUndefinedJsonPointers,
+				),
+			});
+		}
+		return { kind: "object", entries };
+	} finally {
+		active.delete(input);
+	}
+}
+
+function transientTaskForegroundDataRecord(input: unknown): Record<string, unknown> {
+	if (input === null || typeof input !== "object" || Array.isArray(input) || isProxy(input)) {
+		throw new TypeError("Invalid foreground source record");
+	}
+	const prototype = Object.getPrototypeOf(input);
+	if (prototype !== Object.prototype && prototype !== null) throw new TypeError("Invalid foreground source record");
+	return input as Record<string, unknown>;
+}
+
+function transientTaskForegroundExactKeys(
+	record: Record<string, unknown>,
+	required: readonly string[],
+	optional: readonly string[] = [],
+): void {
+	const allowed = new Set([...required, ...optional]);
+	const keys = Object.keys(record);
+	if (required.some(key => !Object.hasOwn(record, key)) || keys.some(key => !allowed.has(key))) {
+		throw new TypeError("Invalid foreground source DTO shape");
+	}
+}
+
+function validateTransientTaskForegroundSourceShape(input: unknown): TransientTaskForegroundSourceAgentToolResultV1 {
+	const result = transientTaskForegroundDataRecord(input);
+	transientTaskForegroundExactKeys(result, ["content"], ["details", "isError", "providerMetadata", "useless"]);
+	if (!Array.isArray(result.content)) throw new TypeError("Invalid foreground source content");
+	for (const member of result.content) {
+		const content = transientTaskForegroundDataRecord(member);
+		if (content.type === "text") {
+			transientTaskForegroundExactKeys(content, ["type", "text"], ["textSignature"]);
+			if (
+				typeof content.text !== "string" ||
+				(content.textSignature !== undefined && typeof content.textSignature !== "string")
+			) {
+				throw new TypeError("Invalid foreground source text content");
+			}
+		} else if (content.type === "image") {
+			transientTaskForegroundExactKeys(content, ["type", "data", "mimeType"], ["detail"]);
+			if (
+				typeof content.data !== "string" ||
+				typeof content.mimeType !== "string" ||
+				(content.detail !== undefined && !["auto", "low", "high", "original"].includes(content.detail as string))
+			) {
+				throw new TypeError("Invalid foreground source image content");
+			}
+		} else {
+			throw new TypeError("Invalid foreground source content type");
+		}
+	}
+	if (result.isError !== undefined && typeof result.isError !== "boolean") {
+		throw new TypeError("Invalid foreground source error flag");
+	}
+	if (result.useless !== undefined && typeof result.useless !== "boolean") {
+		throw new TypeError("Invalid foreground source useless flag");
+	}
+	if (result.details !== undefined) {
+		const details = transientTaskForegroundDataRecord(result.details);
+		transientTaskForegroundExactKeys(
+			details,
+			["projectAgentsDir", "results", "totalDurationMs"],
+			["usage", "outputPaths", "progress", "async"],
+		);
+		if (
+			(details.projectAgentsDir !== null && typeof details.projectAgentsDir !== "string") ||
+			!Array.isArray(details.results) ||
+			typeof details.totalDurationMs !== "number" ||
+			(details.outputPaths !== undefined &&
+				(!Array.isArray(details.outputPaths) || details.outputPaths.some(value => typeof value !== "string"))) ||
+			(details.progress !== undefined && !Array.isArray(details.progress))
+		) {
+			throw new TypeError("Invalid foreground source task details");
+		}
+		if (details.async !== undefined) {
+			const asynchronous = transientTaskForegroundDataRecord(details.async);
+			transientTaskForegroundExactKeys(asynchronous, ["state", "jobId", "type"]);
+			if (
+				!["running", "completed", "failed"].includes(asynchronous.state as string) ||
+				typeof asynchronous.jobId !== "string" ||
+				asynchronous.type !== "task"
+			) {
+				throw new TypeError("Invalid foreground source async details");
+			}
+		}
+	}
+	if (result.providerMetadata !== undefined) {
+		const metadata = transientTaskForegroundDataRecord(result.providerMetadata);
+		transientTaskForegroundExactKeys(metadata, ["type", "screenshot", "acknowledgedSafetyChecks"]);
+		if (metadata.type !== "computer" || !Array.isArray(metadata.acknowledgedSafetyChecks)) {
+			throw new TypeError("Invalid foreground source provider metadata");
+		}
+		const screenshot = transientTaskForegroundDataRecord(metadata.screenshot);
+		if (screenshot.type !== "computer_screenshot") throw new TypeError("Invalid foreground source screenshot");
+		if (Object.hasOwn(screenshot, "image_url")) {
+			transientTaskForegroundExactKeys(screenshot, ["type", "image_url"]);
+			if (typeof screenshot.image_url !== "string") throw new TypeError("Invalid foreground source screenshot URL");
+		} else {
+			transientTaskForegroundExactKeys(screenshot, ["type", "file_id"]);
+			if (typeof screenshot.file_id !== "string") throw new TypeError("Invalid foreground source screenshot id");
+		}
+	}
+	return result as unknown as TransientTaskForegroundSourceAgentToolResultV1;
+}
+
+function validateTransientEvalForegroundSourceShape(input: unknown): TransientEvalForegroundSourceAgentToolResultV1 {
+	const result = transientTaskForegroundDataRecord(input);
+	transientTaskForegroundExactKeys(result, ["content"], ["details", "isError", "providerMetadata", "useless"]);
+	if (!Array.isArray(result.content)) throw new TypeError("Invalid eval foreground source content");
+	for (const member of result.content) {
+		const content = transientTaskForegroundDataRecord(member);
+		if (content.type === "text") {
+			transientTaskForegroundExactKeys(content, ["type", "text"], ["textSignature"]);
+			if (
+				typeof content.text !== "string" ||
+				(content.textSignature !== undefined && typeof content.textSignature !== "string")
+			) {
+				throw new TypeError("Invalid eval foreground source text content");
+			}
+		} else if (content.type === "image") {
+			transientTaskForegroundExactKeys(content, ["type", "data", "mimeType"], ["detail"]);
+			if (
+				typeof content.data !== "string" ||
+				typeof content.mimeType !== "string" ||
+				(content.detail !== undefined && !["auto", "low", "high", "original"].includes(content.detail as string))
+			) {
+				throw new TypeError("Invalid eval foreground source image content");
+			}
+		} else {
+			throw new TypeError("Invalid eval foreground source content type");
+		}
+	}
+	if (result.isError !== undefined && typeof result.isError !== "boolean") {
+		throw new TypeError("Invalid eval foreground source error flag");
+	}
+	if (result.useless !== undefined && typeof result.useless !== "boolean") {
+		throw new TypeError("Invalid eval foreground source useless flag");
+	}
+	if (result.details !== undefined) transientTaskForegroundDataRecord(result.details);
+	if (result.providerMetadata !== undefined) {
+		const metadata = transientTaskForegroundDataRecord(result.providerMetadata);
+		transientTaskForegroundExactKeys(metadata, ["type", "screenshot", "acknowledgedSafetyChecks"]);
+		if (metadata.type !== "computer" || !Array.isArray(metadata.acknowledgedSafetyChecks)) {
+			throw new TypeError("Invalid eval foreground source provider metadata");
+		}
+		const screenshot = transientTaskForegroundDataRecord(metadata.screenshot);
+		if (screenshot.type !== "computer_screenshot") throw new TypeError("Invalid eval foreground source screenshot");
+		if (Object.hasOwn(screenshot, "image_url")) {
+			transientTaskForegroundExactKeys(screenshot, ["type", "image_url"]);
+			if (typeof screenshot.image_url !== "string")
+				throw new TypeError("Invalid eval foreground source screenshot URL");
+		} else {
+			transientTaskForegroundExactKeys(screenshot, ["type", "file_id"]);
+			if (typeof screenshot.file_id !== "string")
+				throw new TypeError("Invalid eval foreground source screenshot id");
+		}
+	}
+	return result as unknown as TransientEvalForegroundSourceAgentToolResultV1;
+}
+
+function projectTransientTaskForegroundWireValue(input: unknown): unknown {
+	if (input === undefined) return undefined;
+	if (input === null || typeof input === "boolean" || typeof input === "number" || typeof input === "string")
+		return input;
+	if (Array.isArray(input)) return input.map(projectTransientTaskForegroundWireValue);
+	const source = input as Record<string, unknown>;
+	const projected: Record<string, unknown> = {};
+	for (const key of Object.keys(source)) {
+		const value = projectTransientTaskForegroundWireValue(source[key]);
+		if (value !== undefined) projected[key] = value;
+	}
+	return projected;
+}
+
+function projectTransientTaskForegroundWireResult(
+	source: TransientForegroundSourceAgentToolResultV1,
+): TransientForegroundAgentToolResultV1 {
+	const content = source.content.map(member => {
+		if (member.type === "text") return { type: "text" as const, text: sanitizeText(member.text) };
+		return {
+			type: "image" as const,
+			data: member.data,
+			mimeType: member.mimeType,
+			...(member.detail !== undefined ? { detail: member.detail } : {}),
+		};
+	});
+	const projected = {
+		content,
+		...(source.details !== undefined ? { details: projectTransientTaskForegroundWireValue(source.details) } : {}),
+		...(source.providerMetadata !== undefined
+			? { providerMetadata: projectTransientTaskForegroundWireValue(source.providerMetadata) }
+			: {}),
+		...(source.isError === true
+			? { isError: true as const }
+			: source.useless === true
+				? { useless: true as const }
+				: {}),
+	};
+	return projected as TransientForegroundAgentToolResultV1;
+}
+
+function projectValidTransientTaskForegroundSourceResult(
+	source: TransientForegroundSourceAgentToolResultV1,
+	taggedSourceResult: TransientTaskForegroundTaggedSourceValueV1,
+	ownUndefinedJsonPointers: string[],
+): ConfidentialTransientTaskSourceObservationResultV1 {
+	const sourceSnapshotUtf8 = stringifyTransientTaskForegroundValue(taggedSourceResult);
+	if (sourceSnapshotUtf8 === undefined) throw new TypeError("Foreground source snapshot encoding failed");
+	const sourceResultSnapshot: ConfidentialTransientTaskForegroundSourceResultSnapshotV1 = {
+		schemaVersion: 1,
+		taggedSourceResult,
+		ownUndefinedJsonPointers,
+		sourceSnapshotUtf8,
+		sourceSnapshotUtf8Sha256: transientTaskForegroundUtf8Sha256(sourceSnapshotUtf8),
+		sourceSnapshotUtf8ByteLength: Buffer.byteLength(sourceSnapshotUtf8, "utf8"),
+	};
+	const wireResult = projectTransientTaskForegroundWireResult(source);
+	const resultUtf8 = stringifyTransientTaskForegroundValue(wireResult);
+	if (resultUtf8 === undefined) throw new TypeError("Foreground wire result encoding failed");
+	const core = {
+		sourceResult: source,
+		sourceResultSnapshot,
+		wireResult,
+		resultUtf8,
+		resultUtf8Sha256: transientTaskForegroundUtf8Sha256(resultUtf8),
+		resultUtf8ByteLength: Buffer.byteLength(resultUtf8, "utf8"),
+	};
+	return {
+		core,
+		resultProjectionSha256: transientTaskForegroundTupleSha256([
+			"omp-transient-task-source-observation-v1",
+			"result-projection-core",
+			1,
+			core.sourceResult,
+			core.sourceResultSnapshot,
+			core.wireResult,
+			core.resultUtf8,
+			core.resultUtf8Sha256,
+			core.resultUtf8ByteLength,
+		]),
+	};
+}
+
+/** Total TaskTool producer boundary. Valid results retain their exact original reference. */
+export function validateAndProjectTransientTaskForegroundSourceAgentToolResultV1(
+	source: unknown,
+): TransientTaskForegroundSourceProjectionResultV1 {
+	try {
+		const ownUndefinedJsonPointers: string[] = [];
+		const taggedSourceResult = tagTransientTaskForegroundSourceValue(source, "", new Set(), ownUndefinedJsonPointers);
+		const sourceResult = validateTransientTaskForegroundSourceShape(source);
+		const projection = projectValidTransientTaskForegroundSourceResult(
+			sourceResult,
+			taggedSourceResult,
+			ownUndefinedJsonPointers,
+		);
+		return { status: "projected", sourceDisposition: "unchanged_valid", sourceResult, projection };
+	} catch {
+		const toolResult = Object.freeze({
+			content: Object.freeze([
+				Object.freeze({
+					type: "text" as const,
+					text: TRANSIENT_TASK_FOREGROUND_SOURCE_VALUE_TOOL_ERROR_TEXT_V1,
+				}),
+			]),
+			isError: true as const,
+		}) as TransientTaskForegroundSourceValueToolErrorResultV1;
+		const toolResultOwnUndefinedJsonPointers: string[] = [];
+		const toolResultTaggedSourceResult = tagTransientTaskForegroundSourceValue(
+			toolResult,
+			"",
+			new Set(),
+			toolResultOwnUndefinedJsonPointers,
+		);
+		const toolResultProjection = projectValidTransientTaskForegroundSourceResult(
+			toolResult,
+			toolResultTaggedSourceResult,
+			toolResultOwnUndefinedJsonPointers,
+		);
+		const core = {
+			schemaVersion: 1 as const,
+			code: "foreground_source_value_unrepresentable" as const,
+			noHandoffReason: "source_value_unrepresentable" as const,
+			toolResult,
+			toolResultProjection,
+		};
+		return {
+			status: "rejected",
+			sourceDisposition: "fixed_tool_error",
+			rejection: {
+				core,
+				rejectionSha256: transientTaskForegroundTupleSha256([
+					"omp-transient-task-foreground-source-result-v1",
+					"rejection-core",
+					1,
+					core.code,
+					core.noHandoffReason,
+					core.toolResult,
+					core.toolResultProjection,
+				]),
+			},
+		};
+	}
+}
+
+/** Total EvalTool producer boundary. Valid results retain their exact original reference. */
+export function validateAndProjectTransientEvalForegroundSourceAgentToolResultV1(
+	source: unknown,
+): TransientEvalForegroundSourceProjectionResultV1 {
+	try {
+		const ownUndefinedJsonPointers: string[] = [];
+		const taggedSourceResult = tagTransientTaskForegroundSourceValue(source, "", new Set(), ownUndefinedJsonPointers);
+		const sourceResult = validateTransientEvalForegroundSourceShape(source);
+		const projection = projectValidTransientTaskForegroundSourceResult(
+			sourceResult,
+			taggedSourceResult,
+			ownUndefinedJsonPointers,
+		);
+		return { status: "projected", sourceDisposition: "unchanged_valid", sourceResult, projection };
+	} catch {
+		const toolResult = Object.freeze({
+			content: Object.freeze([
+				Object.freeze({
+					type: "text" as const,
+					text: TRANSIENT_EVAL_FOREGROUND_SOURCE_VALUE_TOOL_ERROR_TEXT_V1,
+				}),
+			]),
+			isError: true as const,
+		}) as TransientEvalForegroundSourceValueToolErrorResultV1;
+		const ownUndefinedJsonPointers: string[] = [];
+		const taggedSourceResult = tagTransientTaskForegroundSourceValue(
+			toolResult,
+			"",
+			new Set(),
+			ownUndefinedJsonPointers,
+		);
+		const toolResultProjection = projectValidTransientTaskForegroundSourceResult(
+			toolResult,
+			taggedSourceResult,
+			ownUndefinedJsonPointers,
+		);
+		const core = {
+			schemaVersion: 1 as const,
+			code: "eval_foreground_source_value_unrepresentable" as const,
+			noHandoffReason: "source_value_unrepresentable" as const,
+			toolResult,
+			toolResultProjection,
+		};
+		return {
+			status: "rejected",
+			sourceDisposition: "fixed_tool_error",
+			rejection: {
+				core,
+				rejectionSha256: transientTaskForegroundTupleSha256([
+					"omp-transient-eval-foreground-source-result-v1",
+					"rejection-core",
+					1,
+					core.code,
+					core.noHandoffReason,
+					core.toolResult,
+					core.toolResultProjection,
+				]),
+			},
+		};
+	}
+}
 
 /** Source of an agent definition */
 export type AgentSource = "bundled" | "user" | "project";
@@ -35,6 +511,17 @@ export interface StructuredSubagentOutput {
 	status: StructuredSubagentValidationStatus;
 	data?: unknown;
 	error?: string;
+}
+
+/** Machine-readable structured-subagent failure retained by resultless projection. */
+export class StructuredSubagentError extends Error {
+	readonly kind: "preflight" | "isolation" | "execution";
+
+	constructor(kind: "preflight" | "isolation" | "execution", message: string, options?: ErrorOptions) {
+		super(message, options);
+		this.name = "StructuredSubagentError";
+		this.kind = kind;
+	}
 }
 
 const parseNumber = (value: string | undefined, defaultValue: number): number => {

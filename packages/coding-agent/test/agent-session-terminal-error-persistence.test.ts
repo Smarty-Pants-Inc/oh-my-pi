@@ -11,6 +11,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 const failingToolSchema = z.object({ value: z.string() });
 const failingTool: AgentTool<typeof failingToolSchema, Record<string, never>> = {
@@ -52,6 +53,7 @@ async function createHarness(responses: MockResponse[]): Promise<Harness & { ses
 		sessionManager,
 		settings,
 		modelRegistry,
+		...createTestRuntimeDependencies(modelRegistry),
 		toolRegistry: new Map(tools.map(tool => [tool.name, tool])),
 	});
 	const harness = { session, authStorage, tempDir };

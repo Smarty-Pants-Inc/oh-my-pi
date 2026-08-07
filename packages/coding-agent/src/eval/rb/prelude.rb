@@ -281,6 +281,16 @@ unless defined?($__omp_prelude_loaded) && $__omp_prelude_loaded
     INTENT_FIELD = "i"
 
     module_function
+    @call_ordinals = Hash.new(0)
+    @call_ordinal_lock = Mutex.new
+
+    def next_call_ordinal(run_id)
+      @call_ordinal_lock.synchronize do
+        ordinal = @call_ordinals[run_id]
+        @call_ordinals[run_id] = ordinal + 1
+        ordinal
+      end
+    end
 
     def proxy_env
       base = ENV["PI_TOOL_BRIDGE_URL"]
@@ -297,7 +307,8 @@ unless defined?($__omp_prelude_loaded) && $__omp_prelude_loaded
       require "uri"
       base, token, session = proxy_env
       uri = URI("#{base}/v1/tool")
-      payload = JSON.generate("session" => session, "run" => $__omp_current_rid, "name" => name, "args" => args)
+      call_ordinal = next_call_ordinal($__omp_current_rid)
+      payload = JSON.generate("session" => session, "run" => $__omp_current_rid, "call" => call_ordinal, "name" => name, "args" => args)
       http = Net::HTTP.new(uri.hostname, uri.port)
       http.open_timeout = 10
       http.read_timeout = 7 * 24 * 3600

@@ -50,7 +50,28 @@ describe("Cloudflare execution environment provider", () => {
 		expect(puts[0]).toEqual(puts[1]);
 		expect(Object.isFrozen(lease)).toBe(true);
 		expect(Object.isFrozen(lease.bridge)).toBe(true);
-		await lease.release();
+		const authority = lease.releaseAuthority;
+		expect(Object.isFrozen(authority)).toBe(true);
+		expect(Object.isFrozen(authority.provider)).toBe(true);
+		expect(Object.isFrozen(authority.lease)).toBe(true);
+		expect(Object.isFrozen(authority.fence)).toBe(true);
+		expect(Object.isFrozen(authority.request)).toBe(true);
+		expect(authority.provider.id).toBe(authority.lease.replica.providerId);
+		expect(authority.fence.fenceId).toBe(authority.lease.fenceId);
+		expect(authority.request.replica).toEqual(authority.lease.replica);
+		expect(authority.request.leaseId).toBe(authority.lease.leaseId);
+		const receipt = await lease.release();
+		expect(receipt).toEqual({
+			status: "released",
+			request: {
+				requestId: authority.request.requestId,
+				requestSha256: authority.request.requestSha256,
+				parentOperationId: authority.request.parentOperationId,
+			},
+			replica: authority.lease.replica,
+			leaseId: authority.lease.leaseId,
+			compute: "stopped",
+		});
 	});
 
 	it("performs one best-effort DELETE after unresolved acquisition", async () => {
@@ -512,7 +533,13 @@ describe("Cloudflare execution environment provider", () => {
 		};
 		const lease = await makeProvider(fetch, fixture.auditRoot).acquire(request(fixture.sourceRoot));
 		await lease.syncBack();
-		await Promise.all([lease.release(), lease.release()]);
+		const [firstRelease, secondRelease] = await Promise.all([lease.release(), lease.release()]);
+		expect(secondRelease).toBe(firstRelease);
+		expect(firstRelease).toMatchObject({
+			status: "released",
+			leaseId: lease.releaseAuthority.lease.leaseId,
+			compute: "stopped",
+		});
 		expect(workspaceDeletes).toBe(1);
 	});
 });
@@ -538,7 +565,7 @@ function dependenciesFor(fetch: typeof globalThis.fetch): CloudflareEnvironmentD
 }
 
 function request(sourceRoot: string) {
-	return { ownerId: "owner-id", sessionId: "session-id", sourceRoot };
+	return { taskId: "task-id", runId: "run-id", sourceRoot };
 }
 
 function terminalRequest(source: string, timeoutMs = 120_000): ClientBridgeCreateTerminalParams {

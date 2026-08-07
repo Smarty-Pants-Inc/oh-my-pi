@@ -16,6 +16,11 @@ import { resolveMemoryBackend } from "../memory-backend/resolve";
 import { MEMORY_BACKEND_TOOL_NAMES } from "../memory-backend/tool-names";
 import type { MemoryBackendStartOptions } from "../memory-backend/types";
 import xdevMountNoticePrompt from "../prompts/system/xdev-mount-notice.md" with { type: "text" };
+import {
+	PERSISTENT_TOOL_FINGERPRINT_SHA256_V1,
+	PERSISTENT_TOOL_NAMES,
+	type PersistentToolSet,
+} from "../registry/persistent-agent-contracts.js";
 import { usesCodexTaskPrompt } from "../task/prompt-policy";
 import { isMCPToolName, normalizeToolNames } from "../tools/builtin-names";
 import { computerExposureMode } from "../tools/computer/exposure";
@@ -85,6 +90,8 @@ interface SessionToolsOptions {
 	skillWarnings?: SkillWarning[];
 	skillsSettings?: SkillsSettings;
 	skillsReloadable?: boolean;
+	/** Frozen core-only surface for a persistent agent; no runtime tool mutation is permitted. */
+	persistentToolSet?: PersistentToolSet;
 }
 
 export interface MountedMCPToolRouteSource {
@@ -197,6 +204,7 @@ export class SessionTools {
 	#announcedMountsSeeded = false;
 	#presentationPinnedToolNames: ReadonlySet<string> | undefined;
 	#runtimeSelectedToolNames: ReadonlySet<string> | undefined;
+	#persistentToolSet: PersistentToolSet | undefined;
 	#baseSystemPrompt: string[];
 	#lastAppliedToolSignature: string | undefined;
 	/**
@@ -228,6 +236,28 @@ export class SessionTools {
 		this.#createComputerTool = options.createComputerTool;
 		this.#createInspectImageTool = options.createInspectImageTool;
 		this.#builtInToolNames = new Set(options.builtInToolNames ?? []);
+		this.#persistentToolSet = options.persistentToolSet;
+		if (this.#persistentToolSet) {
+			if (
+				options.xdev !== undefined ||
+				options.createVibeTools !== undefined ||
+				options.createComputerTool !== undefined ||
+				options.createInspectImageTool !== undefined ||
+				options.ensureWriteRegistered !== undefined ||
+				options.getMcpServerInstructions !== undefined
+			) {
+				throw new Error("Persistent session cannot install dynamic tool providers");
+			}
+			if (
+				this.#persistentToolSet.fingerprintSha256 !== PERSISTENT_TOOL_FINGERPRINT_SHA256_V1 ||
+				this.#persistentToolSet.activeNames.length !== PERSISTENT_TOOL_NAMES.length ||
+				this.#persistentToolSet.activeNames.some((name, index) => name !== PERSISTENT_TOOL_NAMES[index]) ||
+				this.#toolRegistry.size !== PERSISTENT_TOOL_NAMES.length ||
+				PERSISTENT_TOOL_NAMES.some(name => !this.#toolRegistry.has(name))
+			) {
+				throw new Error("Persistent session tool set does not match the frozen core contract");
+			}
+		}
 		this.#presentationPinnedToolNames = options.presentationPinnedToolNames;
 		this.#ensureWriteRegistered = options.ensureWriteRegistered;
 		this.#rebuildSystemPrompt = options.rebuildSystemPrompt;
@@ -277,18 +307,32 @@ export class SessionTools {
 		return this.#skillsSettings;
 	}
 
+	#assertPersistentToolSelection(toolNames: readonly string[], mountedToolNames: readonly string[] = []): void {
+		if (!this.#persistentToolSet) return;
+		if (
+			mountedToolNames.length !== 0 ||
+			toolNames.length !== PERSISTENT_TOOL_NAMES.length ||
+			toolNames.some((name, index) => name !== PERSISTENT_TOOL_NAMES[index])
+		) {
+			throw new Error("Persistent session tool surface is immutable");
+		}
+	}
+
+	#assertMutableToolSurface(): void {
+		if (this.#persistentToolSet) throw new Error("Persistent session tool surface is immutable");
+	}
+
 	/** Drops cached per-session ACP `allow_always`/`reject_always` decisions. */
 	clearAcpPermissionDecisions(): void {
 		this.#acpPermissionDecisions.clear();
 	}
 
-	/** Drops cached ACP decisions and re-wraps active tools after the client changes. */
 	refreshAcpPermissionGates(): void {
 		this.#acpPermissionDecisions.clear();
 		const activeTools = this.getActiveToolNames()
 			.map(name => this.#toolRegistry.get(name))
 			.filter((tool): tool is AgentTool => tool !== undefined)
-			.map(tool => this.#wrapToolForAcpPermission(tool));
+			.map(tool => (this.#persistentToolSet ? tool : this.#wrapToolForAcpPermission(tool)));
 		this.#host.agent.setTools(activeTools);
 	}
 
@@ -341,6 +385,7 @@ export class SessionTools {
 
 	/** Installs and activates the ephemeral vibe tool set. */
 	async activateVibeTools(baseToolNames: string[]): Promise<void> {
+		this.#assertMutableToolSurface();
 		const createVibeTools = this.#createVibeTools;
 		if (!createVibeTools) {
 			throw new Error("Vibe tools are unavailable in this session.");
@@ -364,12 +409,14 @@ export class SessionTools {
 
 	/** Uninstalls vibe tools and activates the replacement set. */
 	async deactivateVibeTools(nextToolNames: string[]): Promise<void> {
+		this.#assertMutableToolSurface();
 		this.#uninstallVibeTools();
 		await this.applyActiveToolsByName(nextToolNames);
 	}
 
 	/** Removes vibe tools without restoring a source-session snapshot. */
 	async removeVibeToolsPreservingActive(): Promise<void> {
+		this.#assertMutableToolSurface();
 		const removed = new Set(this.#installedVibeToolNames);
 		this.#uninstallVibeTools();
 		const nextActive = this.getActiveToolNames().filter(name => !removed.has(name));
@@ -573,6 +620,7 @@ export class SessionTools {
 
 	/** Applies an enabled tool set and reconciles its `xd://` partition. */
 	async applyActiveToolsByName(toolNames: string[]): Promise<void> {
+		this.#assertPersistentToolSelection(toolNames);
 		toolNames = normalizeToolNames(toolNames);
 		let builtInWriteAvailable = this.#builtInToolNames.has("write");
 		if (toolNames.includes("write") && !builtInWriteAvailable) {
@@ -600,7 +648,7 @@ export class SessionTools {
 		const validToolNames: string[] = [];
 		for (const { name, tool } of selectedTools) {
 			if (mountNames.has(name)) continue;
-			tools.push(this.#wrapToolForAcpPermission(tool));
+			tools.push(this.#persistentToolSet ? tool : this.#wrapToolForAcpPermission(tool));
 			validToolNames.push(name);
 		}
 
@@ -857,6 +905,7 @@ export class SessionTools {
 
 	/** Selects enabled tools, ignoring names absent from the registry. */
 	async setActiveToolsByName(toolNames: string[]): Promise<void> {
+		this.#assertPersistentToolSelection(toolNames);
 		const normalized = normalizeToolNames(toolNames);
 		// Transport-write eligibility keys off the *current* active set: an ordinary
 		// selection change should not demote `write` unless it is already active.
@@ -882,6 +931,7 @@ export class SessionTools {
 	 * selection if that apply throws.
 	 */
 	async setActiveToolPresentation(toolNames: string[], mountedToolNames: string[]): Promise<void> {
+		this.#assertPersistentToolSelection(toolNames, mountedToolNames);
 		const normalized = normalizeToolNames(toolNames);
 		// Restoration targets a snapshot, so write eligibility comes from the
 		// *target* set rather than whatever happens to be active mid-rollback.
@@ -922,6 +972,7 @@ export class SessionTools {
 
 	/** Replaces memory-backend tools while preserving unrelated selections. */
 	async replaceMemoryTools(tools: AgentTool[]): Promise<void> {
+		this.#assertMutableToolSurface();
 		const removed = new Set<string>(MEMORY_BACKEND_TOOL_NAMES.filter(name => this.#builtInToolNames.has(name)));
 		const nextActive = this.getEnabledToolNames().filter(name => !removed.has(name));
 		for (const name of removed) {
@@ -955,6 +1006,7 @@ export class SessionTools {
 	 * tool (e.g. restricted child sessions have no factory).
 	 */
 	async setComputerToolEnabled(enabled: boolean): Promise<boolean> {
+		this.#assertMutableToolSurface();
 		const logState = (): void => this.#logComputerState("Computer tool state changed", enabled);
 		const active = this.getEnabledToolNames();
 		if (!enabled) {
@@ -1005,6 +1057,13 @@ export class SessionTools {
 	 *   build it (e.g. restricted child sessions have no factory).
 	 */
 	async reconcileInspectImageTool(): Promise<boolean> {
+		if (this.#persistentToolSet) {
+			const readTool = this.#toolRegistry.get("read") as
+				| { syncInspectImageState?: (available?: boolean) => boolean }
+				| undefined;
+			readTool?.syncInspectImageState?.(false);
+			return true;
+		}
 		const expected = isInspectImageToolActive({
 			settings: this.#host.settings,
 			getActiveModel: () => this.#host.model(),
@@ -1079,6 +1138,7 @@ export class SessionTools {
 	 * @returns false when `on` was requested but the tool cannot be built here.
 	 */
 	async setInspectImageMode(mode: InspectImageMode): Promise<boolean> {
+		this.#assertMutableToolSurface();
 		this.#host.setInspectImageModeOverride(mode === "auto" ? undefined : mode);
 		const applied = await this.reconcileInspectImageTool();
 		const { active, model } = this.inspectImageState();
@@ -1237,6 +1297,7 @@ export class SessionTools {
 	 * (mounted under `xd://` when that transport is active, else top-level).
 	 */
 	refreshMCPTools(mcpTools: CustomTool[]): Promise<void> {
+		this.#assertMutableToolSurface();
 		const snapshot = [...mcpTools];
 		const refresh = this.#mcpRefreshTail.then(() =>
 			this.#host.isDisposed() ? undefined : this.#applyMCPToolRefresh(snapshot),
@@ -1302,6 +1363,7 @@ export class SessionTools {
 
 	/** Replaces RPC host-owned tools and refreshes the active set before the next model call. */
 	async refreshRpcHostTools(rpcTools: AgentTool[]): Promise<void> {
+		this.#assertMutableToolSurface();
 		const nextToolNames = rpcTools.map(tool => tool.name);
 		const uniqueToolNames = new Set(nextToolNames);
 		if (uniqueToolNames.size !== nextToolNames.length) {

@@ -26,8 +26,8 @@ describe("Cloud OMP local audit", () => {
 			{
 				correlationId: createAuditCorrelationId(),
 				workspaceIdSha256: hashWorkspaceId("0123456789abcdef0123456789abcdef"),
-				ownerId: "task-owner",
-				sessionId: "session-id",
+				taskId: "task-owner",
+				runId: "session-id",
 				containerInternetEnabled: true,
 			},
 			{ path: auditPath, now: () => new Date("2026-08-04T00:00:00.000Z") },
@@ -59,8 +59,8 @@ describe("Cloud OMP local audit", () => {
 			{
 				correlationId: createAuditCorrelationId(),
 				workspaceIdSha256: hashWorkspaceId("0123456789abcdef0123456789abcdef"),
-				ownerId: "owner",
-				sessionId: "session",
+				taskId: "owner",
+				runId: "session",
 				containerInternetEnabled: true,
 			},
 			{ path: join(root, "audit.jsonl") },
@@ -105,7 +105,7 @@ describe("Cloud OMP extension hydration", () => {
 		});
 	});
 
-	it("registers exactly one execution environment provider", () => {
+	it("registers exactly one runtime and one legacy environment provider", () => {
 		const previousEndpoint = process.env.CLOUD_OMP_CLOUDFLARE_ENDPOINT;
 		const previousBearer = process.env.CLOUD_OMP_CLOUDFLARE_BEARER;
 		const previousSentinel = process.env.CLOUD_OMP_TEST_REMOTE_SENTINEL;
@@ -113,14 +113,19 @@ describe("Cloud OMP extension hydration", () => {
 		process.env.CLOUD_OMP_CLOUDFLARE_BEARER = "ordinary-bearer";
 		delete process.env.CLOUD_OMP_TEST_REMOTE_SENTINEL;
 		try {
-			const providers: unknown[] = [];
+			const runtimeProviders: unknown[] = [];
+			const environmentProviders: unknown[] = [];
 			cloudflareExtension({
 				setLabel() {},
+				registerRuntimeProvider(provider: unknown) {
+					runtimeProviders.push(provider);
+				},
 				registerExecutionEnvironmentProvider(provider: unknown) {
-					providers.push(provider);
+					environmentProviders.push(provider);
 				},
 			} as never);
-			expect(providers).toHaveLength(1);
+			expect(runtimeProviders).toHaveLength(1);
+			expect(environmentProviders).toHaveLength(1);
 		} finally {
 			setOrDeleteEnvironment("CLOUD_OMP_CLOUDFLARE_ENDPOINT", previousEndpoint);
 			setOrDeleteEnvironment("CLOUD_OMP_CLOUDFLARE_BEARER", previousBearer);

@@ -3,6 +3,7 @@ import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { Message, UserMessage } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
+import type { SessionJournalService, SessionJournalStreamDescriptorV1 } from "../session/session-journal-contracts";
 import { visitEntriesFromFileStream } from "../session/session-loader";
 import { SessionManager } from "../session/session-manager";
 
@@ -87,6 +88,13 @@ export async function loadAdvisorTranscriptCosts(sessionFile: string | undefined
 	return costs;
 }
 
+/** @internal Package-owned journal lineage frozen when the recorder is constructed. */
+interface AdvisorTranscriptJournalAuthority {
+	readonly service: SessionJournalService;
+	readonly parentSessionId: string;
+	readonly advisorId: string;
+}
+
 /**
  * Append-only persister for an advisor agent's transcript.
  *
@@ -112,6 +120,7 @@ export class AdvisorTranscriptRecorder {
 	#manager: SessionManager | undefined;
 	#file: string | undefined;
 	#filename: string;
+	readonly #journal: AdvisorTranscriptJournalAuthority | undefined;
 	/** Serializes the async open/close against synchronous appends so records land in order. */
 	#queue: Promise<void>;
 
@@ -122,14 +131,19 @@ export class AdvisorTranscriptRecorder {
 	 * @param after Optional barrier the queue starts behind — used on the advisor
 	 *   on→off→on toggle so a fresh recorder's first `open` waits for the prior
 	 *   recorder's `close` and the two never hold the same file at once.
+	 * @param journal Optional process-owned journal authority. When present, each
+	 *   opened advisor SessionManager attaches its distinct advisor stream before
+	 *   the first message is appended.
 	 */
 	constructor(
 		private readonly resolveSessionFile: () => string | undefined,
 		private readonly resolveCwd: () => string,
 		filename: string = ADVISOR_TRANSCRIPT_FILENAME,
 		after?: Promise<unknown>,
+		journal?: AdvisorTranscriptJournalAuthority,
 	) {
 		this.#filename = filename;
+		this.#journal = journal ? Object.freeze({ ...journal }) : undefined;
 		this.#queue = after
 			? after.then(
 					() => {},
@@ -164,13 +178,34 @@ export class AdvisorTranscriptRecorder {
 		if (!sessionFile?.endsWith(JSONL_SUFFIX)) return;
 		const file = path.join(sessionFile.slice(0, -JSONL_SUFFIX.length), this.#filename);
 		const cwd = this.resolveCwd();
+		const journal = this.#journal;
 		this.#enqueue(async () => {
 			if (file !== this.#file) {
 				await this.#closeManager();
-				this.#manager = await SessionManager.open(file, undefined, undefined, {
+				const manager = await SessionManager.open(file, undefined, undefined, {
 					initialCwd: cwd,
 					suppressBreadcrumb: true,
 				});
+				try {
+					if (journal) {
+						const advisorSessionId = manager.getSessionId();
+						await manager.attachSessionJournal(
+							journal.service,
+							Object.freeze({
+								schemaVersion: 1 as const,
+								streamId: `session:${advisorSessionId}` as const,
+								sessionId: advisorSessionId,
+								kind: "advisor" as const,
+								parentStreamId: `session:${journal.parentSessionId}` as const,
+								advisorId: journal.advisorId,
+							}) satisfies SessionJournalStreamDescriptorV1,
+						);
+					}
+				} catch (error) {
+					await manager.close().catch(() => undefined);
+					throw error;
+				}
+				this.#manager = manager;
 				this.#file = file;
 			}
 			this.#manager?.appendMessage(persisted);

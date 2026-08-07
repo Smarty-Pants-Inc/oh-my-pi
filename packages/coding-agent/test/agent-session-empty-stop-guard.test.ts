@@ -12,6 +12,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 const recordToolSchema = z.object({ value: z.string() });
 
@@ -125,6 +126,7 @@ async function createHarness(
 		sessionManager,
 		settings,
 		modelRegistry,
+		...createTestRuntimeDependencies(modelRegistry),
 		toolRegistry: new Map(tools.map(tool => [tool.name, tool])),
 		extensionRunner: options.extensionRunner,
 	});

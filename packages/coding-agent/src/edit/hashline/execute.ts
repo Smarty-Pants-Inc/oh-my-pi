@@ -31,6 +31,7 @@ import { ToolError } from "../../tools/tool-errors";
 import { generateDiffString } from "../diff";
 import { getEditClipboard } from "../edit-clipboard";
 import { getFileSnapshotStore } from "../file-snapshot-store";
+import type { PersistentEditMutationExecutor } from "../modes/patch";
 import type { EditToolDetails, EditToolPerFileResult, LspBatchRequest } from "../renderer";
 import { pruneOversizedEditSnapshots } from "../snapshot-details";
 import { nativeBlockResolver } from "./block-resolver";
@@ -45,6 +46,7 @@ export interface ExecuteHashlineSingleOptions {
 	batchRequest?: LspBatchRequest;
 	writethrough: WritethroughCallback;
 	beginDeferredDiagnosticsForPath: (path: string) => WritethroughDeferredHandle;
+	persistent?: PersistentEditMutationExecutor;
 }
 
 function noChangeDiagnostic(path: string): string {
@@ -225,6 +227,7 @@ export async function executeHashlineSingle(
 		beginDeferredDiagnosticsForPath: options.beginDeferredDiagnosticsForPath,
 		signal: options.signal,
 		batchRequest: options.batchRequest,
+		persistent: options.persistent,
 	});
 	const snapshots = getFileSnapshotStore(options.session);
 	const enforceSeenLines = options.session.settings.get("edit.enforceSeenLines");

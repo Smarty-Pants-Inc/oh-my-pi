@@ -21,6 +21,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { AutocompleteProvider } from "@oh-my-pi/pi-tui";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 function makeTool(name: string): AgentTool {
 	return {
@@ -114,6 +115,7 @@ describe("InteractiveMode prompt-template autocomplete (#2462)", () => {
 			sessionManager: manager,
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry: registry,
+			...createTestRuntimeDependencies(registry),
 			toolRegistry: new Map(tools.map(tool => [tool.name, tool])),
 			promptTemplates: templates,
 		});

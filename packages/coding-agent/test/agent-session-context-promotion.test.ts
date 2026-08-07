@@ -9,6 +9,7 @@ import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 describe("AgentSession context promotion", () => {
 	let tempDir: TempDir;
@@ -181,6 +182,7 @@ describe("AgentSession context promotion", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 
 		const closeSpy = vi.fn();
@@ -226,6 +228,7 @@ describe("AgentSession context promotion", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 
 		const overflowMessage = createOverflowMessage(
@@ -262,6 +265,7 @@ describe("AgentSession context promotion", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 
 		const closeSpy = vi.fn();
@@ -299,6 +303,7 @@ describe("AgentSession context promotion", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 
 		const closeSpy = vi.fn();
@@ -334,6 +339,7 @@ describe("AgentSession context promotion", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 
 		const firstUserId = session.sessionManager.appendMessage(createUserMessage("first"));
@@ -375,6 +381,7 @@ describe("AgentSession context promotion", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 
 		const firstUserId = session.sessionManager.appendMessage(createUserMessage("first"));
@@ -421,6 +428,7 @@ describe("AgentSession context promotion", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 
 		const closeSpy = vi.fn();
@@ -460,6 +468,7 @@ describe("AgentSession context promotion", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 
 		const overflowMessage = createOverflowMessage(smallModel);
@@ -505,6 +514,7 @@ describe("AgentSession context promotion", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 		session.sessionManager.appendMessage(createUserMessage("old context ".repeat(80_000)));
 		session.sessionManager.appendMessage(createAssistantMessage(model, "old response"));
@@ -559,6 +569,7 @@ describe("AgentSession context promotion", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 
 		const incompleteMessage = createIncompleteMessage(smallModel);
@@ -600,6 +611,7 @@ describe("AgentSession context promotion", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 
 		// Stale incomplete from the smaller model — current session is already on the large model.

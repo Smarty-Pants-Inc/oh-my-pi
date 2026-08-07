@@ -7,10 +7,57 @@ import type {
 import { hasExactObjectKeys } from "../boundary-policy";
 import {
 	CLOUD_OMP_REMOTE_ROOT,
+	CLOUDFLARE_RUNTIME_PROTOCOL_ERROR_CODES_V1,
+	type CloudflareCheckpointFetchRequestV1,
+	type CloudflareCheckpointFetchResponseV1,
+	type CloudflareDurableDeadlineV1,
+	type CloudflareReplicaCacheEvictionAcceptanceV1,
+	type CloudflareReplicaCacheEvictionInspectResultV1,
+	type CloudflareReplicaCacheEvictionRequestResultV1,
+	type CloudflareReplicaDeleteInspectResultV1,
+	type CloudflareReplicaDeleteResultV1,
+	type CloudflareReplicaDeletionValidationV1,
+	type CloudflareRuntimeEffectEnvelopeV1,
+	type CloudflareRuntimeEffectResultEnvelopeV1,
+	type CloudflareRuntimeEffectTransportEnvelopeV1,
+	type CloudflareRuntimeEffectTransportResultEnvelopeV1,
+	type CloudflareRuntimeInspectionEnvelopeV1,
+	type CloudflareRuntimeInspectionResultEnvelopeV1,
+	type CloudflareRuntimeInspectionTransportEnvelopeV1,
+	type CloudflareRuntimeInspectionTransportResultEnvelopeV1,
+	type CloudflareRuntimeProtocolErrorCodeV1,
+	CloudflareRuntimeProtocolErrorV1,
+	type CloudflareRuntimeStatusRequestV1,
+	type CloudflareRuntimeStatusResponseV1,
+	type CloudflareValidatedRuntimeEffectTransportV1,
+	type CloudflareValidatedRuntimeInspectionTransportV1,
+	type CloudflareValidatedRuntimeOperationV1,
 	type CreateWorkspaceRequest,
+	canonicalRuntimeSha256V1,
 	cloudOmpRoutes,
+	decodeCloudflareCheckpointFetchRequestV1,
+	decodeCloudflareCheckpointFetchResponseV1,
+	decodeCloudflareDurableDeadlineV1,
+	decodeCloudflareReplicaCacheEvictionAcceptanceV1,
+	decodeCloudflareReplicaCacheEvictionInspectResultV1,
+	decodeCloudflareReplicaCacheEvictionPlanV1,
+	decodeCloudflareReplicaCacheEvictionRequestResultV1,
+	decodeCloudflareReplicaDeleteInspectResultV1,
+	decodeCloudflareReplicaDeleteRequestV1,
+	decodeCloudflareReplicaDeleteResultV1,
+	decodeCloudflareRuntimeEffectEnvelopeV1,
+	decodeCloudflareRuntimeEffectResultEnvelopeV1,
+	decodeCloudflareRuntimeEffectTransportEnvelopeV1,
+	decodeCloudflareRuntimeEffectTransportResultEnvelopeV1,
+	decodeCloudflareRuntimeInspectionEnvelopeV1,
+	decodeCloudflareRuntimeInspectionResultEnvelopeV1,
+	decodeCloudflareRuntimeInspectionTransportEnvelopeV1,
+	decodeCloudflareRuntimeInspectionTransportResultEnvelopeV1,
+	decodeCloudflareRuntimeStatusRequestV1,
+	decodeCloudflareRuntimeStatusResponseV1,
 	type ExecCreateResponse,
 	type ExecSnapshot,
+	encodeCanonicalRuntimeTupleV1,
 	type FilePayload,
 	isJsonObject,
 	isWireId,
@@ -19,6 +66,7 @@ import {
 	MAX_EXEC_OUTPUT_BYTES,
 	MAX_SYNC_FILE_BYTES,
 	type ManifestResponse,
+	projectCloudflareRuntimeInspectionTupleV1,
 	type WorkspaceState,
 } from "../protocol";
 import {
@@ -52,7 +100,10 @@ export const CLOUD_OMP_ENVIRONMENT_ERROR_CODES = Object.freeze({
 } as const);
 
 export type CloudOmpEnvironmentErrorCode = keyof typeof CLOUD_OMP_ENVIRONMENT_ERROR_CODES;
-export type CloudOmpClientErrorCode = CloudOmpEnvironmentErrorCode | CloudOmpProtocolErrorCode;
+export type CloudOmpClientErrorCode =
+	| CloudOmpEnvironmentErrorCode
+	| CloudOmpProtocolErrorCode
+	| CloudflareRuntimeProtocolErrorCodeV1;
 export type CloudOmpEnvironmentErrorKind = "abort" | "transport" | "protocol" | "http" | "environment" | "unexpected";
 export type CloudOmpOperationStage =
 	| "acquire"
@@ -96,7 +147,9 @@ export class CloudOmpEnvironmentError extends Error {
 export function isCloudOmpClientErrorCode(value: unknown): value is CloudOmpClientErrorCode {
 	return (
 		typeof value === "string" &&
-		(Object.hasOwn(CLOUD_OMP_ENVIRONMENT_ERROR_CODES, value) || Object.hasOwn(CLOUD_OMP_PROTOCOL_ERROR_CODES, value))
+		(Object.hasOwn(CLOUD_OMP_ENVIRONMENT_ERROR_CODES, value) ||
+			Object.hasOwn(CLOUD_OMP_PROTOCOL_ERROR_CODES, value) ||
+			Object.hasOwn(CLOUDFLARE_RUNTIME_PROTOCOL_ERROR_CODES_V1, value))
 	);
 }
 
@@ -359,6 +412,9 @@ export function sanitizeEnvironmentError(
 	if (error instanceof CloudOmpHttpError) {
 		return new CloudOmpEnvironmentError("http", stage, "REMOTE_ERROR", { status: error.status, cause: error });
 	}
+	if (error instanceof CloudflareRuntimeProtocolErrorV1) {
+		return new CloudOmpEnvironmentError("protocol", stage, error.code, { cause: error });
+	}
 	return new CloudOmpEnvironmentError("unexpected", stage, "UNEXPECTED_FAILURE", { cause: error });
 }
 
@@ -404,3 +460,174 @@ function encodeStrictUtf8(value: string, code: CloudOmpEnvironmentErrorCode): Ui
 	if (new TextDecoder("utf-8", { fatal: true }).decode(bytes) !== value) throw environmentFailure(code);
 	return bytes;
 }
+
+async function validateClientRuntimeOperationV1(
+	input: unknown,
+	effect: boolean,
+): Promise<CloudflareValidatedRuntimeOperationV1> {
+	const validation = effect
+		? await decodeCloudflareRuntimeEffectEnvelopeV1(input)
+		: await decodeCloudflareRuntimeInspectionEnvelopeV1(input);
+	const tuple = projectCloudflareRuntimeInspectionTupleV1(validation.inspection);
+	const digest = await canonicalRuntimeSha256V1(tuple);
+	const tupleUtf8 = new TextDecoder().decode(encodeCanonicalRuntimeTupleV1(tuple));
+	if (digest !== validation.requestSha256 || tupleUtf8 !== validation.canonicalTupleUtf8) {
+		throw new CloudflareRuntimeProtocolErrorV1("request_digest_mismatch");
+	}
+	return validation;
+}
+
+export async function encodeCloudflareRuntimeEffectWireV1(input: CloudflareRuntimeEffectEnvelopeV1): Promise<string> {
+	const validation = await validateClientRuntimeOperationV1(input, true);
+	return JSON.stringify(validation.envelope);
+}
+
+export async function encodeCloudflareRuntimeInspectionWireV1(
+	input: CloudflareRuntimeInspectionEnvelopeV1,
+): Promise<string> {
+	const validation = await validateClientRuntimeOperationV1(input, false);
+	return JSON.stringify(validation.envelope);
+}
+
+export async function decodeCloudflareRuntimeEffectResultWireV1(
+	input: unknown,
+	expectedRequest: CloudflareRuntimeEffectEnvelopeV1,
+): Promise<CloudflareRuntimeEffectResultEnvelopeV1> {
+	const expected = await validateClientRuntimeOperationV1(expectedRequest, true);
+	return decodeCloudflareRuntimeEffectResultEnvelopeV1(input, expected);
+}
+
+export async function decodeCloudflareRuntimeInspectionResultWireV1(
+	input: unknown,
+	expectedRequest: CloudflareRuntimeInspectionEnvelopeV1,
+): Promise<CloudflareRuntimeInspectionResultEnvelopeV1> {
+	const expected = await validateClientRuntimeOperationV1(expectedRequest, false);
+	return decodeCloudflareRuntimeInspectionResultEnvelopeV1(input, expected);
+}
+
+async function validateClientRuntimeEffectTransportV1(
+	input: CloudflareRuntimeEffectTransportEnvelopeV1,
+): Promise<CloudflareValidatedRuntimeEffectTransportV1> {
+	const validation = await decodeCloudflareRuntimeEffectTransportEnvelopeV1(input);
+	if (validation.transportFamily === "lifecycle") await validateClientRuntimeOperationV1(validation.envelope, true);
+	return validation;
+}
+
+async function validateClientRuntimeInspectionTransportV1(
+	input: CloudflareRuntimeInspectionTransportEnvelopeV1,
+): Promise<CloudflareValidatedRuntimeInspectionTransportV1> {
+	const validation = await decodeCloudflareRuntimeInspectionTransportEnvelopeV1(input);
+	if (validation.transportFamily === "lifecycle") await validateClientRuntimeOperationV1(validation.envelope, false);
+	return validation;
+}
+
+export async function encodeCloudflareRuntimeEffectTransportWireV1(
+	input: CloudflareRuntimeEffectTransportEnvelopeV1,
+): Promise<string> {
+	const validation = await validateClientRuntimeEffectTransportV1(input);
+	if (validation.transportFamily === "lifecycle") return JSON.stringify(validation.envelope);
+	const { transportFamily: _transportFamily, ...envelope } = validation;
+	return JSON.stringify(envelope);
+}
+
+export async function encodeCloudflareRuntimeInspectionTransportWireV1(
+	input: CloudflareRuntimeInspectionTransportEnvelopeV1,
+): Promise<string> {
+	const validation = await validateClientRuntimeInspectionTransportV1(input);
+	if (validation.transportFamily === "lifecycle") return JSON.stringify(validation.envelope);
+	const { transportFamily: _transportFamily, ...envelope } = validation;
+	return JSON.stringify(envelope);
+}
+
+export async function decodeCloudflareRuntimeEffectTransportResultWireV1(
+	input: unknown,
+	expectedRequest: CloudflareRuntimeEffectTransportEnvelopeV1,
+): Promise<CloudflareRuntimeEffectTransportResultEnvelopeV1> {
+	const expected = await validateClientRuntimeEffectTransportV1(expectedRequest);
+	return decodeCloudflareRuntimeEffectTransportResultEnvelopeV1(input, expected);
+}
+
+export async function decodeCloudflareRuntimeInspectionTransportResultWireV1(
+	input: unknown,
+	expectedRequest: CloudflareRuntimeInspectionTransportEnvelopeV1,
+): Promise<CloudflareRuntimeInspectionTransportResultEnvelopeV1> {
+	const expected = await validateClientRuntimeInspectionTransportV1(expectedRequest);
+	return decodeCloudflareRuntimeInspectionTransportResultEnvelopeV1(input, expected);
+}
+
+export async function encodeCloudflareReplicaCacheEvictionWireV1(
+	input: unknown,
+	options: { readonly workspaceRetentionMs?: number } = {},
+): Promise<string> {
+	const plan = await decodeCloudflareReplicaCacheEvictionPlanV1(input, options);
+	return JSON.stringify(plan);
+}
+
+export async function decodeCloudflareReplicaCacheEvictionAcceptanceWireV1(
+	input: unknown,
+	plan: unknown,
+	options: { readonly workspaceRetentionMs?: number } = {},
+): Promise<CloudflareReplicaCacheEvictionAcceptanceV1> {
+	return decodeCloudflareReplicaCacheEvictionAcceptanceV1(input, plan, options);
+}
+
+export async function decodeCloudflareReplicaCacheEvictionResultWireV1(
+	input: unknown,
+	plan: unknown,
+	inspection: boolean,
+	options: { readonly workspaceRetentionMs?: number } = {},
+): Promise<CloudflareReplicaCacheEvictionInspectResultV1 | CloudflareReplicaCacheEvictionRequestResultV1> {
+	return inspection
+		? decodeCloudflareReplicaCacheEvictionInspectResultV1(input, plan, options)
+		: decodeCloudflareReplicaCacheEvictionRequestResultV1(input, plan, options);
+}
+
+export async function encodeCloudflareReplicaDeleteWireV1(
+	input: unknown,
+	expectedDomain?: "persistent" | "transient_task",
+): Promise<string> {
+	const validation = await decodeCloudflareReplicaDeleteRequestV1(input, expectedDomain);
+	return JSON.stringify(validation.request);
+}
+
+export async function decodeCloudflareReplicaDeleteResultWireV1(
+	input: unknown,
+	request: unknown,
+	inspection: boolean,
+	expectedDomain?: "persistent" | "transient_task",
+): Promise<CloudflareReplicaDeleteInspectResultV1 | CloudflareReplicaDeleteResultV1> {
+	return inspection
+		? decodeCloudflareReplicaDeleteInspectResultV1(input, request, expectedDomain)
+		: decodeCloudflareReplicaDeleteResultV1(input, request, expectedDomain);
+}
+
+export function encodeCloudflareRuntimeStatusWireV1(input: CloudflareRuntimeStatusRequestV1): string {
+	return JSON.stringify(decodeCloudflareRuntimeStatusRequestV1(input));
+}
+
+export function decodeCloudflareRuntimeStatusWireV1(
+	input: unknown,
+	expectedRequest?: CloudflareRuntimeStatusRequestV1,
+): CloudflareRuntimeStatusResponseV1 {
+	return decodeCloudflareRuntimeStatusResponseV1(input, expectedRequest);
+}
+
+export function encodeCloudflareCheckpointFetchWireV1(input: CloudflareCheckpointFetchRequestV1): string {
+	return JSON.stringify(decodeCloudflareCheckpointFetchRequestV1(input));
+}
+
+export function decodeCloudflareCheckpointFetchWireV1(
+	input: unknown,
+	expectedRequest?: CloudflareCheckpointFetchRequestV1,
+): Promise<CloudflareCheckpointFetchResponseV1> {
+	return decodeCloudflareCheckpointFetchResponseV1(input, expectedRequest);
+}
+
+export function decodeCloudflareDurableDeadlineWireV1(
+	input: unknown,
+	options: { readonly workspaceRetentionMs?: number } = {},
+): Promise<CloudflareDurableDeadlineV1> {
+	return decodeCloudflareDurableDeadlineV1(input, options);
+}
+
+export type { CloudflareReplicaDeletionValidationV1 };

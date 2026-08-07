@@ -13,6 +13,7 @@ import { buildSessionContext } from "@oh-my-pi/pi-coding-agent/session/session-c
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities.js";
 
 /**
  * Regression for issue #6516 — a tool call renders twice in the transcript.
@@ -82,6 +83,7 @@ describe("issue #6516 — tool output appears twice", () => {
 			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
 			settings: Settings.isolated(),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 		mode = new InteractiveMode(session, "test");
 		mode.ui.requestRender = vi.fn();

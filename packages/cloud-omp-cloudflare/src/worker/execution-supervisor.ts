@@ -1,3 +1,9 @@
+import type {
+	RuntimeCommandInspectResult,
+	RuntimeCommandRequest,
+	RuntimeCommandSnapshot,
+	RuntimeCommandStartReconcileResult,
+} from "@oh-my-pi/pi-coding-agent/session/workspace-runtime-contracts";
 import {
 	type ExecCreateResponse,
 	type ExecRequest,
@@ -15,10 +21,19 @@ import {
 	workspaceAuditOutcomeForError,
 } from "./workspace-audit";
 import type { WorkspaceFilesystemLike } from "./workspace-files";
-import { type ExecutionRow, isTerminalExecution, type WorkspaceStateStore } from "./workspace-state-store";
+import {
+	type ExecutionRow,
+	isTerminalExecution,
+	type RuntimeCommandState,
+	type WorkspaceStateStore,
+} from "./workspace-state-store";
 
 const BACKEND_ID = "container-shell";
 const CLEANUP_TIMEOUT_MS = MAX_COMMAND_TIMEOUT_MS;
+const runtimeEncoder = new TextEncoder();
+const runtimeDecoder = new TextDecoder("utf-8", { fatal: true });
+const RUNTIME_COMMAND_PREFIX =
+	"/usr/bin/env -i HOME=/workspace LANG=C LC_ALL=C PATH=/usr/bin:/bin TMPDIR=/workspace /bin/bash --noprofile --norc -c ";
 
 export interface RuntimeEvent {
 	id: string;
@@ -89,6 +104,8 @@ export class ExecutionSupervisor {
 	readonly #waitUntil: (promise: Promise<unknown>) => void;
 	readonly #collectors = new Map<string, Promise<void>>();
 	readonly #handles = new Map<string, RuntimeHandle>();
+	readonly #runtimeCollectors = new Map<string, Promise<void>>();
+	readonly #runtimeHandles = new Map<string, RuntimeHandle>();
 
 	constructor(options: ExecutionSupervisorOptions) {
 		this.#store = options.store;
@@ -217,6 +234,246 @@ export class ExecutionSupervisor {
 		}
 	}
 
+	async submitRuntimeCommand(request: RuntimeCommandRequest, context: unknown): Promise<RuntimeCommandSnapshot> {
+		const now = iso8601(this.#now());
+		let state = this.#store.reserveRuntimeCommand({
+			commandId: request.commandId,
+			requestSha256: request.requestSha256,
+			context,
+			status: "reserved",
+			certainty: "not_started",
+			proof: "reservation_without_attempt",
+			backend: BACKEND_ID,
+			output: "",
+			outputBytes: 0,
+			outputStoredBytes: 0,
+			outputByteLimit: request.command.outputByteLimit,
+			truncated: false,
+			lastSeq: -1,
+			sync: "complete",
+			exitCode: null,
+			signal: null,
+			updatedAt: now,
+			disposed: false,
+		});
+		if (state.status !== "reserved" || state.disposed) return this.runtimeCommandSnapshot(state);
+		state = this.#store.saveRuntimeCommand({
+			...state,
+			status: "start_unknown",
+			certainty: "unknown",
+			proof: null,
+			sync: "pending",
+			updatedAt: iso8601(this.#now()),
+		});
+
+		let handle: RuntimeHandle;
+		try {
+			handle = await this.#workspace.runtime.exec(scrubbedRuntimeCommand(request.command.source), {
+				id: request.commandId,
+				cwd: request.command.cwd,
+				timeoutMs: request.command.timeoutMs,
+				encoding: "utf8",
+			});
+		} catch {
+			return this.runtimeCommandSnapshot(state);
+		}
+		if (handle.id !== request.commandId) {
+			await this.#killHandle(handle, "SIGKILL");
+			handle[Symbol.dispose]();
+			return this.runtimeCommandSnapshot(state);
+		}
+		state = this.#store.saveRuntimeCommand({
+			...state,
+			backend: handle.backend,
+			status: "running",
+			certainty: "started",
+			updatedAt: iso8601(this.#now()),
+		});
+		this.#startRuntimeCollector(request.commandId, handle);
+		return this.runtimeCommandSnapshot(state);
+	}
+
+	inspectRuntimeCommand(commandId: string): RuntimeCommandInspectResult {
+		const state = this.#store.runtimeCommand(commandId);
+		if (!state || state.disposed) {
+			return {
+				status: "absent",
+				commandId,
+				execution: { certainty: "not_started", proof: "provider_reservation_absent" },
+			};
+		}
+		return { status: "present", snapshot: this.runtimeCommandSnapshot(state) };
+	}
+
+	async reconcileRuntimeCommandStart(commandId: string): Promise<RuntimeCommandStartReconcileResult> {
+		let state = this.#store.runtimeCommand(commandId);
+		if (!state || state.disposed) {
+			throw new WorkspaceObjectError(404, "execution_not_found", "Runtime command reservation does not exist");
+		}
+		if (state.status === "reserved") {
+			return {
+				status: "not_started",
+				snapshot: this.runtimeCommandSnapshot(state) as Extract<RuntimeCommandSnapshot, { status: "reserved" }>,
+			};
+		}
+		if (state.status === "start_unknown") {
+			let handle: RuntimeHandle;
+			try {
+				handle = await this.#workspace.runtime.getExec(commandId, { resume: state.lastSeq, encoding: "utf8" });
+			} catch (error) {
+				if (!isComputerMissingRecordError(error)) {
+					return {
+						status: "unknown",
+						snapshot: this.runtimeCommandSnapshot(state) as Extract<
+							RuntimeCommandSnapshot,
+							{ status: "start_unknown" }
+						>,
+					};
+				}
+				state = this.#store.saveRuntimeCommand({
+					...state,
+					status: "reserved",
+					certainty: "not_started",
+					proof: "backend_absent",
+					sync: "complete",
+					updatedAt: iso8601(this.#now()),
+				});
+				return {
+					status: "not_started",
+					snapshot: this.runtimeCommandSnapshot(state) as Extract<RuntimeCommandSnapshot, { status: "reserved" }>,
+				};
+			}
+			if (handle.id !== commandId) {
+				handle[Symbol.dispose]();
+				return {
+					status: "unknown",
+					snapshot: this.runtimeCommandSnapshot(state) as Extract<
+						RuntimeCommandSnapshot,
+						{ status: "start_unknown" }
+					>,
+				};
+			}
+			state = this.#store.saveRuntimeCommand({
+				...state,
+				backend: handle.backend,
+				status: "running",
+				certainty: "started",
+				updatedAt: iso8601(this.#now()),
+			});
+			this.#startRuntimeCollector(commandId, handle);
+		}
+		return {
+			status: "observed",
+			snapshot: this.runtimeCommandSnapshot(state) as Exclude<
+				RuntimeCommandSnapshot,
+				{ status: "reserved" | "start_unknown" }
+			>,
+		};
+	}
+
+	async cancelRuntimeCommand(
+		commandId: string,
+		signal: "SIGTERM" | "SIGKILL" | "SIGINT" | "SIGHUP",
+	): Promise<RuntimeCommandSnapshot> {
+		let state = this.#store.runtimeCommand(commandId);
+		if (!state || state.disposed)
+			throw new WorkspaceObjectError(404, "execution_not_found", "Runtime command does not exist");
+		if (state.status === "reserved") {
+			state = this.#store.saveRuntimeCommand({
+				...state,
+				status: "cancelled",
+				certainty: "completed",
+				proof: null,
+				sync: "complete",
+				signal,
+				updatedAt: iso8601(this.#now()),
+			});
+			return this.runtimeCommandSnapshot(state);
+		}
+		if (state.status === "start_unknown") return this.runtimeCommandSnapshot(state);
+		if (state.status === "running") {
+			if (!this.#runtimeCollectors.has(commandId)) {
+				try {
+					const handle = await this.#workspace.runtime.getExec(commandId, {
+						resume: state.lastSeq,
+						encoding: "utf8",
+					});
+					if (handle.id === commandId) this.#startRuntimeCollector(commandId, handle);
+					else handle[Symbol.dispose]();
+				} catch (error) {
+					if (!isComputerMissingRecordError(error)) throw error;
+				}
+			}
+			state = this.#store.runtimeCommand(commandId) ?? state;
+			if (state.status !== "running") return this.runtimeCommandSnapshot(state);
+			state = this.#store.saveRuntimeCommand({ ...state, signal, updatedAt: iso8601(this.#now()) });
+			try {
+				const handle = this.#runtimeHandles.get(commandId);
+				if (handle) await handle.kill(signal);
+				else await this.#workspace.runtime.killExec(commandId, { signal });
+			} catch (error) {
+				if (!isComputerMissingRecordError(error)) throw error;
+				return this.runtimeCommandSnapshot(state);
+			}
+			const collector = this.#runtimeCollectors.get(commandId);
+			if (collector)
+				await withTimeout(collector, CLEANUP_TIMEOUT_MS, "Runtime command did not stop after cancellation");
+			state = this.#store.runtimeCommand(commandId) ?? state;
+		}
+		return this.runtimeCommandSnapshot(state);
+	}
+
+	async disposeRuntimeCommand(
+		commandId: string,
+	): Promise<{ status: "disposed" | "already_disposed"; commandId: string }> {
+		let state = this.#store.runtimeCommand(commandId);
+		if (!state || state.disposed) return { status: "already_disposed", commandId };
+		if (state.status === "running") await this.cancelRuntimeCommand(commandId, "SIGKILL");
+		state = this.#store.runtimeCommand(commandId) ?? state;
+		if (state.status === "running" || state.status === "start_unknown") {
+			throw new WorkspaceObjectError(409, "sync_unsettled", "Runtime command execution certainty is not settled");
+		}
+		if (state.status !== "reserved") await this.#disposeRuntimeExecution(commandId);
+		this.#store.saveRuntimeCommand({ ...state, disposed: true, updatedAt: iso8601(this.#now()) });
+		return { status: "disposed", commandId };
+	}
+
+	runtimeCommandSnapshot(state: RuntimeCommandState): RuntimeCommandSnapshot {
+		const base = {
+			commandId: state.commandId,
+			requestSha256: state.requestSha256,
+			sync: state.sync,
+			output: state.output,
+			truncated: state.truncated,
+			exitCode: state.exitCode,
+			signal: state.signal,
+			updatedAt: state.updatedAt,
+		};
+		if (state.status === "reserved") {
+			return {
+				...base,
+				status: "reserved",
+				execution: { certainty: "not_started", proof: state.proof ?? "reservation_without_attempt" },
+			};
+		}
+		if (state.status === "start_unknown")
+			return { ...base, status: "start_unknown", execution: { certainty: "unknown" } };
+		if (state.status === "running") return { ...base, status: "running", execution: { certainty: "started" } };
+		return { ...base, status: state.status, execution: { certainty: "completed" } };
+	}
+
+	async stopRuntimeCommands(): Promise<void> {
+		for (const command of this.#store.runtimeCommandRows()) {
+			if (command.disposed) continue;
+			let state = command;
+			if (state.status === "start_unknown") {
+				await this.reconcileRuntimeCommandStart(state.commandId);
+				state = this.#store.runtimeCommand(state.commandId) ?? state;
+			}
+			if (state.status === "running") await this.cancelRuntimeCommand(state.commandId, "SIGKILL");
+		}
+	}
+
 	execution(execId: string): ExecutionRow | undefined {
 		if (!/^[0-9a-f]{32}$/.test(execId)) {
 			throw new WorkspaceObjectError(400, "invalid_execution_id", "Execution ID is malformed");
@@ -281,12 +538,12 @@ export class ExecutionSupervisor {
 		this.#startCollector(execId, handle);
 	}
 
-	async retryDueSync(): Promise<void> {
-		const now = this.#now();
+	async retryDueSync(now: number = this.#now()): Promise<void> {
 		for (const intent of this.#retryScheduler.list()) {
 			if (intent.notBefore > now) continue;
 			const pending = this.#store.pendingExecution(intent.backend);
-			if (!pending) continue;
+			const runtimePending = this.#store.runtimePendingCommands(intent.backend);
+			if (!pending && runtimePending.length === 0) continue;
 			const startedAt = this.#now();
 			const result = await this.#workspace.retryPendingSync(intent.backend);
 			if (result.status === "pending") {
@@ -300,7 +557,10 @@ export class ExecutionSupervisor {
 			}
 			if (result.status === "complete" && result.skipped.length === 0) {
 				const complete = this.#store.completePendingSync(result.backend);
-				await this.#alarms.rearm();
+				for (const command of runtimePending) {
+					this.#store.saveRuntimeCommand({ ...command, sync: "complete", updatedAt: iso8601(this.#now()) });
+				}
+				await this.#retryScheduler.clear(result.backend);
 				this.#auditEvent("sync_retry", startedAt, "success", { fileCount: result.applied });
 				if (complete) this.#auditExecutionComplete(complete, executionOutcome(complete));
 				continue;
@@ -311,9 +571,20 @@ export class ExecutionSupervisor {
 					: result.status === "idle"
 						? "Pending synchronization unexpectedly became idle"
 						: "Remote synchronization retries were exhausted";
-			const failed = this.#store.markExecutionFailed(pending.id, reason, "exhausted");
+			if (pending) {
+				const failed = this.#store.markExecutionFailed(pending.id, reason, "exhausted");
+				this.#auditExecutionComplete(failed, "failed", "SYNC_RETRY_EXHAUSTED");
+			}
+			for (const command of runtimePending) {
+				this.#store.saveRuntimeCommand({
+					...command,
+					status: command.status === "succeeded" ? "failed" : command.status,
+					sync: "exhausted",
+					updatedAt: iso8601(this.#now()),
+				});
+			}
+			await this.#retryScheduler.clear(intent.backend);
 			this.#auditEvent("sync_retry", startedAt, "failed", { errorCode: "SYNC_RETRY_EXHAUSTED" });
-			this.#auditExecutionComplete(failed, "failed", "SYNC_RETRY_EXHAUSTED");
 		}
 	}
 
@@ -338,6 +609,116 @@ export class ExecutionSupervisor {
 			...(row.exitCode === null ? {} : { exitCode: row.exitCode }),
 			...(row.signal === null ? {} : { signal: row.signal }),
 		};
+	}
+
+	#startRuntimeCollector(commandId: string, handle: RuntimeHandle): void {
+		if (this.#runtimeCollectors.has(commandId)) {
+			handle[Symbol.dispose]();
+			return;
+		}
+		this.#runtimeHandles.set(commandId, handle);
+		const collector = this.#collectRuntimeCommand(commandId, handle).finally(() => {
+			this.#runtimeHandles.delete(commandId);
+			this.#runtimeCollectors.delete(commandId);
+			handle[Symbol.dispose]();
+		});
+		this.#runtimeCollectors.set(commandId, collector);
+		this.#waitUntil(collector);
+	}
+
+	async #collectRuntimeCommand(commandId: string, handle: RuntimeHandle): Promise<void> {
+		let resultHandle: RuntimeHandle | undefined;
+		try {
+			const reader = handle.getReader();
+			try {
+				for (;;) {
+					const { done, value } = await reader.read();
+					if (done) break;
+					if (value.id !== commandId || !Number.isSafeInteger(value.seq)) continue;
+					this.#applyRuntimeCommandEvent(commandId, value);
+				}
+			} finally {
+				reader.releaseLock();
+			}
+			resultHandle = await this.#workspace.runtime.getExec(commandId, { resume: "full", encoding: "utf8" });
+			if (resultHandle.id !== commandId) return;
+			await this.#applyRuntimeCommandResult(commandId, handle.backend, await resultHandle.result());
+		} catch {
+			// Durable state remains running/start-known. Inspection or recovery reconciles the backend without replay.
+		} finally {
+			resultHandle?.[Symbol.dispose]();
+		}
+	}
+
+	#applyRuntimeCommandEvent(commandId: string, event: RuntimeEvent): void {
+		const state = this.#store.runtimeCommand(commandId);
+		if (!state || state.disposed || state.certainty === "completed" || event.seq <= state.lastSeq) return;
+		let output = state.output;
+		let outputBytes = state.outputBytes;
+		let outputStoredBytes = state.outputStoredBytes;
+		let truncated = state.truncated;
+		let exitCode = state.exitCode;
+		if (event.name === "stdout" || event.name === "stderr") {
+			if (typeof event.value !== "string") return;
+			const chunkBytes = runtimeEncoder.encode(event.value).byteLength;
+			outputBytes += chunkBytes;
+			const remaining = Math.max(0, state.outputByteLimit - outputStoredBytes);
+			const appended = remaining === 0 ? "" : truncateRuntimeUtf8(event.value, remaining);
+			const appendedBytes = runtimeEncoder.encode(appended).byteLength;
+			output += appended;
+			outputStoredBytes += appendedBytes;
+			truncated ||= appendedBytes !== chunkBytes;
+		} else if (event.name === "exit" && typeof event.value === "number" && Number.isSafeInteger(event.value)) {
+			exitCode = event.value;
+		}
+		this.#store.saveRuntimeCommand({
+			...state,
+			output,
+			outputBytes,
+			outputStoredBytes,
+			truncated,
+			lastSeq: event.seq,
+			exitCode,
+			updatedAt: iso8601(this.#now()),
+		});
+	}
+
+	async #applyRuntimeCommandResult(commandId: string, backend: string, result: RuntimeResult): Promise<void> {
+		let state = this.#store.runtimeCommand(commandId);
+		if (!state || state.disposed || state.certainty === "completed") return;
+		const skipped = [...result.skipped, ...result.sync.skipped];
+		let status: RuntimeCommandState["status"] =
+			result.status === "completed" ? "succeeded" : result.status === "cancelled" ? "cancelled" : "failed";
+		let sync: RuntimeCommandState["sync"] = result.sync.status === "complete" ? "complete" : "pending";
+		if (skipped.length !== 0) {
+			status = "failed";
+			sync = "exhausted";
+		}
+		state = this.#store.saveRuntimeCommand({
+			...state,
+			backend,
+			status,
+			certainty: "completed",
+			proof: null,
+			sync,
+			exitCode: result.exitCode,
+			updatedAt: iso8601(this.#now()),
+		});
+		if (sync === "pending") {
+			const intent = await this.#retryScheduler.get(backend);
+			if (!intent) {
+				this.#store.saveRuntimeCommand({
+					...state,
+					status: "failed",
+					sync: "exhausted",
+					updatedAt: iso8601(this.#now()),
+				});
+			} else {
+				await this.#alarms.rearm();
+			}
+		} else if (!this.#store.pendingExecution(backend) && this.#store.runtimePendingCommands(backend).length === 0) {
+			await this.#retryScheduler.clear(backend);
+		}
 	}
 
 	#startCollector(execId: string, handle: RuntimeHandle): void {
@@ -425,8 +806,10 @@ export class ExecutionSupervisor {
 		}
 		const row = this.#store.requireExecution(execId);
 		const status = row.error === "Execution output exceeded the hard cap" ? "failed" : result.status;
-		await this.#retryScheduler.clear(backend);
 		const complete = this.#store.completeExecution(execId, status, result.status, result.exitCode);
+		if (!this.#store.pendingExecution(backend) && this.#store.runtimePendingCommands(backend).length === 0) {
+			await this.#retryScheduler.clear(backend);
+		}
 		this.#auditExecutionComplete(complete, executionOutcome(complete));
 	}
 
@@ -507,4 +890,26 @@ function withTimeout<T>(promise: Promise<T>, milliseconds: number, message: stri
 		milliseconds,
 	);
 	return Promise.race([promise, timeout.promise]).finally(() => clearTimeout(timer));
+}
+
+function iso8601(epochMs: number): string {
+	return new Date(epochMs).toISOString();
+}
+
+function scrubbedRuntimeCommand(source: string): string {
+	return `${RUNTIME_COMMAND_PREFIX}'${source.replace(/'/g, `'"'"'`)}'`;
+}
+
+function truncateRuntimeUtf8(value: string, byteLimit: number): string {
+	const bytes = runtimeEncoder.encode(value);
+	if (bytes.byteLength <= byteLimit) return value;
+	let end = byteLimit;
+	while (end > 0) {
+		try {
+			return runtimeDecoder.decode(bytes.subarray(0, end));
+		} catch {
+			end--;
+		}
+	}
+	return "";
 }

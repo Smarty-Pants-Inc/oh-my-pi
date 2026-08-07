@@ -9,6 +9,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 // Switching the active model (Ctrl+P role cycling, /models selection) must be a
 // cheap, synchronous operation. It used to call the async `getApiKey`, which can
@@ -68,6 +69,7 @@ describe("AgentSession model switch auth pre-flight", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings,
 			modelRegistry: registry,
+			...createTestRuntimeDependencies(registry),
 		});
 		return session;
 	}

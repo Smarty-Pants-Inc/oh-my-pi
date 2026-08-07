@@ -231,11 +231,13 @@ describe("ModelRegistry", () => {
 			});
 		});
 
-		test("find synthesizes a routed model id from the base OpenRouter metadata", () => {
-			const model = registry.find("openrouter", "z-ai/glm-4.7-20251222:nitro");
+		test("find stays exact while resolveSelector synthesizes a routed model id", () => {
+			const selector = "z-ai/glm-4.7-20251222:nitro";
+			expect(registry.find("openrouter", selector)).toBeUndefined();
+			const model = registry.resolveSelector("openrouter", selector);
 			expect(model?.provider).toBe("openrouter");
-			expect(model?.id).toBe("z-ai/glm-4.7-20251222:nitro");
-			expect(model?.name).toBe("z-ai/glm-4.7-20251222:nitro");
+			expect(model?.id).toBe(selector);
+			expect(model?.name).toBe(selector);
 		});
 	});
 
@@ -253,9 +255,10 @@ describe("ModelRegistry", () => {
 			});
 		});
 
-		test("find restores synthetic inference profile ARN models", () => {
+		test("find stays exact while resolveSelector restores inference profile ARN models", () => {
 			const profileArn = "arn:aws:bedrock:us-east-2:123456789012:application-inference-profile/company-opus-48";
-			const model = registry.find("amazon-bedrock", profileArn);
+			expect(registry.find("amazon-bedrock", profileArn)).toBeUndefined();
+			const model = registry.resolveSelector("amazon-bedrock", profileArn);
 
 			expect(model?.provider).toBe("amazon-bedrock");
 			expect(model?.id).toBe(profileArn);
@@ -2306,15 +2309,21 @@ describe("ModelRegistry", () => {
 			expect(models[0]?.reasoning).toBe(true);
 			expect(models[0]?.thinking?.effortRouting?.[Effort.High]).toBe("[Kiro] claude-opus-4-7-thinking");
 			expect(models[0]?.thinking?.effortRouting?.off).toBe("[Kiro] claude-opus-4-7");
-			// Saved selectors for the consumed twin resolve via the grammar alias.
-			expect(kiroTwins.find("newapi", "[Kiro] claude-opus-4-7-thinking")?.id).toBe("[Kiro] claude-opus-4-7");
+			// Consumed variants remain selector-only, never exact registered models.
+			expect(kiroTwins.find("newapi", "[Kiro] claude-opus-4-7-thinking")).toBeUndefined();
+			expect(kiroTwins.resolveSelector("newapi", "[Kiro] claude-opus-4-7-thinking")?.id).toBe(
+				"[Kiro] claude-opus-4-7",
+			);
 		});
 
 		test("modelOverrides keyed by retired variant ids re-key onto the collapsed model", () => {
 			const collapsed = antigravityOverride.find("google-antigravity", "gemini-3-pro");
 			expect(collapsed?.contextWindow).toBe(222_222);
-			// The retired selector resolves to the same collapsed model.
-			expect(antigravityOverride.find("google-antigravity", "gemini-3-pro-high")?.id).toBe("gemini-3-pro");
+			// The retired variant remains selector-only after the re-key.
+			expect(antigravityOverride.find("google-antigravity", "gemini-3-pro-high")).toBeUndefined();
+			expect(antigravityOverride.resolveSelector("google-antigravity", "gemini-3-pro-high")?.id).toBe(
+				"gemini-3-pro",
+			);
 		});
 
 		test("suppressed selectors keyed by retired variant ids bind to the collapsed id", () => {

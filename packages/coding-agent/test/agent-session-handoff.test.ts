@@ -20,6 +20,7 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import * as snapcompact from "@oh-my-pi/snapcompact";
+import { createTestRuntimeDependencies } from "./utilities";
 
 const HANDOFF_SECRET = "HANDOFF_SECRET_TOKEN_12345";
 const UNRENDERABLE_SNAPCOMPACT_TEXT = "\uE000\uE001\uE002\uE003\uE004\uE005\uE006\uE007\uE008\uE009";
@@ -105,6 +106,7 @@ describe("AgentSession handoff", () => {
 				"compaction.autoContinue": false,
 			}),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			obfuscator,
 		});
 
@@ -228,6 +230,7 @@ describe("AgentSession handoff", () => {
 				"compaction.autoContinue": false,
 			}),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			extensionRunner,
 			obfuscator,
 		});
@@ -307,6 +310,7 @@ describe("AgentSession handoff", () => {
 				"compaction.autoContinue": false,
 			}),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			obfuscator,
 			sideStreamFn,
 		});
@@ -685,6 +689,7 @@ describe("AgentSession handoff", () => {
 				"compaction.strategy": "context-full",
 			}),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			extensionRunner,
 		});
 
@@ -758,6 +763,7 @@ describe("AgentSession handoff", () => {
 				"compaction.strategy": "context-full",
 			}),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			extensionRunner,
 		});
 
@@ -958,6 +964,7 @@ describe("AgentSession handoff", () => {
 				"contextPromotion.enabled": false,
 			}),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 		session.subscribe(event => {
 			events.push(event);
@@ -1043,6 +1050,7 @@ describe("AgentSession handoff", () => {
 				"contextPromotion.enabled": false,
 			}),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 		session.subscribe(event => {
 			events.push(event);
@@ -1126,6 +1134,7 @@ describe("AgentSession handoff", () => {
 				"contextPromotion.enabled": false,
 			}),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			extensionRunner,
 		});
 		session.subscribe(event => {
@@ -1211,6 +1220,7 @@ describe("AgentSession handoff", () => {
 				"contextPromotion.enabled": false,
 			}),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 		session.subscribe(event => {
 			events.push(event);
@@ -1570,6 +1580,7 @@ describe("AgentSession handoff", () => {
 			}),
 			extensionRunner,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 		session.subscribe(event => {
 			events.push(event);
@@ -1790,6 +1801,7 @@ describe("AgentSession handoff", () => {
 			sessionManager,
 			settings: session.settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			extensionRunner,
 			obfuscator,
 		});
@@ -1877,6 +1889,7 @@ describe("AgentSession handoff", () => {
 			sessionManager,
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			extensionRunner,
 		});
 		sessionManager.appendMessage({
@@ -1932,6 +1945,7 @@ describe("AgentSession handoff", () => {
 			sessionManager,
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 		sessionManager.appendMessage({
 			role: "user",

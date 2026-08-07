@@ -11,6 +11,7 @@ import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir, withTimeout } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 /**
  * Regression coverage for the `#hasPendingAsyncWake()` gate shared by the
@@ -145,6 +146,7 @@ describe("AgentSession todo reminder async-job deferral", () => {
 				"todo.remindersMax": 3,
 			}),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			agentId: "Main",
 			asyncJobManager: manager,
 			extensionRunner,

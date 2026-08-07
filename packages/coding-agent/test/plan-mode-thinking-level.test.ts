@@ -15,6 +15,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities.js";
 
 describe("plan mode thinking level", () => {
 	let tempDir: TempDir;
@@ -51,6 +52,7 @@ describe("plan mode thinking level", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ modelRoles }),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 		return session;
 	}

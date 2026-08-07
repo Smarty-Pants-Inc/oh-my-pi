@@ -15,6 +15,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { logger, TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 /**
  * Behavioral wiring guard for MCP startup status (mirrors
@@ -67,6 +68,7 @@ describe("InteractiveMode MCP connection status", () => {
 			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
 			settings: Settings.isolated(),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 		eventBus = new EventBus();
 		mode = new InteractiveMode(session, "test", undefined, () => {}, [], undefined, eventBus);

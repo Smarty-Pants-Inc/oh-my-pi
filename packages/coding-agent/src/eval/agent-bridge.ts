@@ -4,16 +4,21 @@
 import { type } from "@oh-my-pi/omptype";
 import {
 	buildStructuredSubagentRecoveryHint,
+	reserveStructuredSubagentId,
+	resolveEffectiveSubagentPolicy,
 	runStructuredSubagent,
-	StructuredSubagentError,
+	StructuredSubagentLifecycleFailure,
+	type StructuredSubagentRequest,
 	type StructuredSubagentSchemaMode,
+	type StructuredSubagentTransientTaskRuntimeAssemblyV1,
 } from "../task/structured-subagent";
-import type { AgentProgress, SingleResult } from "../task/types";
+import { type AgentProgress, type SingleResult, StructuredSubagentError } from "../task/types";
 import type { NestedRepoPatch } from "../task/worktree";
 import type { ToolSession } from "../tools";
 import { ToolError } from "../tools/tool-errors";
 import { withBridgeTimeoutPause } from "./bridge-timeout";
 import type { JsStatusEvent } from "./js/shared/types";
+import type { EvalAgentLifecycleContextV1 } from "./lifecycle";
 // Import review tools for side effects (registers subagent tool handlers).
 import "../tools/review";
 
@@ -50,6 +55,8 @@ export interface EvalAgentBridgeOptions {
 	session: ToolSession;
 	signal?: AbortSignal;
 	emitStatus?: (event: JsStatusEvent) => void;
+	lifecycle?: EvalAgentLifecycleContextV1;
+	bridgeCallKey?: string;
 }
 
 export interface EvalAgentResult {
@@ -124,6 +131,9 @@ function buildSubagentFailureMessage(agentName: string, result: SingleResult): s
  */
 export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOptions): Promise<EvalAgentResult> {
 	const parsed = parseAgentArgs(args);
+	const spawnIndex = options.lifecycle
+		? options.lifecycle.claimAgentBridgeCall(options.bridgeCallKey ?? "", parsed)
+		: 0;
 	const turnBudget = options.session.getTurnBudget?.();
 	if (turnBudget?.hard && turnBudget.total !== null && turnBudget.spent >= turnBudget.total) {
 		throw new ToolError(
@@ -138,34 +148,55 @@ export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOption
 					...(parsed.apply !== undefined ? { apply: parsed.apply } : {}),
 				}
 			: undefined;
+	const request: StructuredSubagentRequest = {
+		session: options.session,
+		invocationKind: "eval",
+		assignment: parsed.prompt,
+		...(parsed.agent !== undefined ? { agent: parsed.agent } : {}),
+		...(parsed.model !== undefined ? { model: parsed.model } : {}),
+		...(Object.hasOwn(parsed, "schema") ? { outputSchema: parsed.schema } : {}),
+		...(parsed.schemaMode !== undefined ? { schemaMode: parsed.schemaMode } : {}),
+		...(parsed.label !== undefined ? { identity: { label: parsed.label } } : {}),
+		...(isolation ? { isolation } : {}),
+		...(parsed.handle ? { retainArtifacts: true } : {}),
+		keepAlive: false,
+		shareEvalSession: false,
+		index: spawnIndex,
+		...(options.signal !== undefined ? { signal: options.signal } : {}),
+		...(options.emitStatus
+			? { onProgress: (progress: AgentProgress) => emitProgressStatus(options.emitStatus, progress) }
+			: {}),
+	};
 
+	let runtimeAssembly: StructuredSubagentTransientTaskRuntimeAssemblyV1 | undefined;
 	try {
-		const execution = await withBridgeTimeoutPause(
-			options.emitStatus,
-			() =>
-				runStructuredSubagent({
-					session: options.session,
-					invocationKind: "eval",
-					assignment: parsed.prompt,
-					...(parsed.agent !== undefined ? { agent: parsed.agent } : {}),
-					...(parsed.model !== undefined ? { model: parsed.model } : {}),
-					...(Object.hasOwn(parsed, "schema") ? { outputSchema: parsed.schema } : {}),
-					...(parsed.schemaMode !== undefined ? { schemaMode: parsed.schemaMode } : {}),
-					...(parsed.label !== undefined ? { identity: { label: parsed.label } } : {}),
-					...(isolation ? { isolation } : {}),
-					...(parsed.handle ? { retainArtifacts: true } : {}),
-					keepAlive: false,
-					// `maxRuntimeMs` is intentionally omitted: the executor then inherits
-					// `task.maxRuntimeMs`, matching the task tool. Pinning it to 0 here
-					// silently overrode the user's wall-clock cap for eval fan-outs.
-					shareEvalSession: false,
-					...(options.signal !== undefined ? { signal: options.signal } : {}),
-					...(options.emitStatus
-						? { onProgress: (progress: AgentProgress) => emitProgressStatus(options.emitStatus, progress) }
-						: {}),
-				}),
-			{ deferExternalAbort: true },
-		);
+		const resolvedPolicy = await resolveEffectiveSubagentPolicy(request);
+		if (resolvedPolicy.isIsolated) {
+			if (!options.lifecycle) {
+				throw new StructuredSubagentError(
+					"preflight",
+					"Isolated eval execution requires the outer Eval lifecycle authority.",
+				);
+			}
+			const childId = await reserveStructuredSubagentId(options.session, request.identity);
+			runtimeAssembly = await options.lifecycle.createIsolatedRuntime(spawnIndex, childId, resolvedPolicy);
+			request.identity = { id: childId, label: parsed.label };
+			request.parentToolCallId = options.lifecycle.parentToolCallId;
+			request.transientTaskRuntime = runtimeAssembly.runtime;
+		}
+		const execution = await withBridgeTimeoutPause(options.emitStatus, () => runStructuredSubagent(request), {
+			deferExternalAbort: true,
+		});
+		if (runtimeAssembly) {
+			if (!execution.terminalEvidence) {
+				throw new StructuredSubagentError(
+					"execution",
+					"Isolated eval execution completed without exact terminal evidence.",
+				);
+			}
+			options.lifecycle!.recordTerminal(spawnIndex, execution.terminalEvidence);
+			options.lifecycle!.recordResultful(spawnIndex, runtimeAssembly.foregroundHandoffIdentity);
+		}
 		const { result, policy, mergeSummary, changesApplied, artifactsDir } = execution;
 		if (result.exitCode !== 0 || result.error || result.aborted) {
 			const failureMessage = buildSubagentFailureMessage(policy.agentName, result)
@@ -220,6 +251,12 @@ export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOption
 			},
 		};
 	} catch (error) {
+		if (error instanceof StructuredSubagentLifecycleFailure && runtimeAssembly) {
+			options.lifecycle!.recordTerminal(spawnIndex, error.terminalEvidence);
+			if (error.result !== null) {
+				options.lifecycle!.recordResultful(spawnIndex, runtimeAssembly.foregroundHandoffIdentity);
+			}
+		}
 		if (error instanceof StructuredSubagentError) throw new ToolError(error.message);
 		throw error;
 	}

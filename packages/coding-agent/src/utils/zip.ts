@@ -33,14 +33,7 @@ export function unzipText(entries: Unzipped, entryPath: string): string | undefi
  * central-directory record parser with the lazy, file-backed reader.
  */
 export function unzip(bytes: Uint8Array): Unzipped {
-	const info = readCentralDirectoryInfoSync(bytes);
-	const centralDirectory = readMemoryRange(bytes, info.offset, info.offset + info.size);
-	const out: Unzipped = {};
-	for (const entry of parseZipCentralDirectory(memoryByteSource(bytes), centralDirectory, info.entries)) {
-		if (entry.isDirectory || entry.storage?.type !== "zip") continue;
-		out[entry.path] = extractZipMember(bytes, entry.storage, entry.size);
-	}
-	return out;
+	return unzipWithLimits(bytes, MAX_ARCHIVE_MEMBER_BYTES, Number.MAX_SAFE_INTEGER);
 }
 
 /**
@@ -55,6 +48,115 @@ const MAX_TAR_ARCHIVE_BYTES = 256 * 1024 * 1024;
  * multi-GB sizes that would be allocated up front before any data inflates.
  */
 const MAX_ARCHIVE_MEMBER_BYTES = 64 * 1024 * 1024;
+const TAR_BLOCK_BYTES = 512;
+const TAR_END_BYTES = TAR_BLOCK_BYTES * 2;
+
+function assertArchiveByteLimit(byteLimit: number): void {
+	if (!Number.isSafeInteger(byteLimit) || byteLimit < 0) {
+		throw new ToolError("Archive materialization requires a safe non-negative byte limit");
+	}
+}
+
+function addArchiveMemberSize(total: number, size: number, byteLimit: number, memberPath: string): number {
+	if (!Number.isSafeInteger(size) || size < 0 || size > byteLimit) {
+		throw new ToolError(
+			`Archive member '${memberPath}' exceeds the bounded materialization limit (${formatBytes(size)} > ${formatBytes(byteLimit)} limit)`,
+		);
+	}
+	const next = total + size;
+	if (!Number.isSafeInteger(next) || next > byteLimit) {
+		throw new ToolError(
+			`Archive contents exceed the aggregate bounded materialization limit (${formatBytes(next)} > ${formatBytes(byteLimit)} limit)`,
+		);
+	}
+	return next;
+}
+
+function readTarNumber(bytes: Uint8Array, start: number, length: number): number {
+	const first = bytes[start]!;
+	if ((first & 0x80) !== 0) {
+		if ((first & 0x40) !== 0) throw new ToolError("Invalid tar archive: negative member size");
+		let value = BigInt(first & 0x3f);
+		for (let index = 1; index < length; index++) value = (value << 8n) | BigInt(bytes[start + index]!);
+		if (value > BigInt(Number.MAX_SAFE_INTEGER)) {
+			throw new ToolError("Tar archive member size is too large to read safely");
+		}
+		return Number(value);
+	}
+
+	let value = 0;
+	let sawDigit = false;
+	let ended = false;
+	for (let index = 0; index < length; index++) {
+		const byte = bytes[start + index]!;
+		if (byte === 0 || byte === 0x20) {
+			if (sawDigit) ended = true;
+			continue;
+		}
+		if (ended || byte < 0x30 || byte > 0x37) {
+			throw new ToolError("Invalid tar archive: malformed member size");
+		}
+		sawDigit = true;
+		value = value * 8 + byte - 0x30;
+		if (!Number.isSafeInteger(value)) throw new ToolError("Tar archive member size is too large to read safely");
+	}
+	return value;
+}
+
+function isZeroTarBlock(bytes: Uint8Array, offset: number): boolean {
+	for (let index = 0; index < TAR_BLOCK_BYTES; index++) {
+		if (bytes[offset + index] !== 0) return false;
+	}
+	return true;
+}
+
+function tarEntryCountsAsFile(type: number): boolean {
+	return type === 0 || type === 0x30 || type === 0x37 || type === 0x53;
+}
+
+function assertBoundedTarDeclarations(bytes: Uint8Array, byteLimit: number): void {
+	let offset = 0;
+	let total = 0;
+	while (offset + TAR_BLOCK_BYTES <= bytes.byteLength) {
+		if (isZeroTarBlock(bytes, offset)) return;
+		const size = readTarNumber(bytes, offset + 124, 12);
+		if (tarEntryCountsAsFile(bytes[offset + 156]!)) {
+			let end = offset;
+			while (end < offset + 100 && bytes[end] !== 0) end++;
+			const memberPath = UTF8_DECODER.decode(bytes.subarray(offset, end)) || "(unnamed)";
+			total = addArchiveMemberSize(total, size, byteLimit, memberPath);
+		}
+		const dataBlocks = Math.ceil(size / TAR_BLOCK_BYTES);
+		const next = offset + TAR_BLOCK_BYTES + dataBlocks * TAR_BLOCK_BYTES;
+		if (!Number.isSafeInteger(next) || next > bytes.byteLength) {
+			throw new ToolError("Invalid tar archive: truncated member data");
+		}
+		offset = next;
+	}
+}
+
+function archiveMemberByteLength(content: ArchiveMemberContent): number {
+	if (typeof content === "string") return Buffer.byteLength(content, "utf8");
+	if (content instanceof Uint8Array) return content.byteLength;
+	return content.size;
+}
+
+function tarPathFitsUstar(name: string): boolean {
+	if (Buffer.byteLength(name, "utf8") <= 100) return true;
+	for (let slash = name.lastIndexOf("/"); slash > 0; slash = name.lastIndexOf("/", slash - 1)) {
+		if (
+			Buffer.byteLength(name.slice(0, slash), "utf8") <= 155 &&
+			Buffer.byteLength(name.slice(slash + 1), "utf8") <= 100
+		) {
+			return true;
+		}
+	}
+	return false;
+}
+
+function gzipUpperBound(byteLength: number): number {
+	return byteLength + Math.ceil(byteLength / 16_383) * 5 + 18;
+}
 
 /** Inflate one raw DEFLATE stream, bounded to its declared uncompressed size. */
 function inflateRaw(bytes: Uint8Array, declaredSize: number): Uint8Array {
@@ -878,6 +980,153 @@ export async function readArchiveEntries(source: ArchiveSource): Promise<Map<str
 	return entries;
 }
 
+async function resolveArchiveBytesBounded(
+	source: ArchiveSource,
+	byteLimit: number,
+	signal?: AbortSignal,
+): Promise<{ bytes: Uint8Array; format: ArchiveFormat }> {
+	assertArchiveByteLimit(byteLimit);
+	if (typeof source !== "string") {
+		if (source.bytes.byteLength > byteLimit) {
+			throw new ToolError(
+				`Archive source exceeds the bounded materialization limit (${formatBytes(source.bytes.byteLength)} > ${formatBytes(byteLimit)} limit)`,
+			);
+		}
+		return source;
+	}
+
+	const format = archiveFormatFromPath(source);
+	if (!format) throw new ToolError(`Unsupported archive format: ${source}`);
+	const file = Bun.file(source);
+	if (!Number.isSafeInteger(file.size) || file.size > byteLimit) {
+		throw new ToolError(
+			`Archive source exceeds the bounded materialization limit (${formatBytes(file.size)} > ${formatBytes(byteLimit)} limit)`,
+		);
+	}
+	const bytes = await file.bytes();
+	signal?.throwIfAborted();
+	if (bytes.byteLength > byteLimit) throw new ToolError("Archive source exceeded its bounded materialization limit");
+	return { bytes, format };
+}
+
+/**
+ * Persistent-RMW archive reader. Unlike {@link readArchiveEntries}, this mode
+ * bounds source bytes, each declared member, aggregate expanded bytes, ZIP
+ * inflation, and gzip expansion before materializing member payloads.
+ */
+export async function readArchiveEntriesBounded(
+	source: ArchiveSource,
+	byteLimit: number,
+	signal?: AbortSignal,
+): Promise<Map<string, ArchiveMemberContent>> {
+	const { bytes, format } = await resolveArchiveBytesBounded(source, byteLimit, signal);
+	signal?.throwIfAborted();
+	if (format === "zip") {
+		const entries = new Map<string, ArchiveMemberContent>();
+		const unzipped = unzipWithLimits(bytes, byteLimit, byteLimit);
+		for (const name in unzipped) entries.set(name, unzipped[name]!);
+		return entries;
+	}
+
+	let tarBytes = bytes;
+	if (format === "tar.gz") {
+		try {
+			tarBytes = zlib.gunzipSync(bytes, { maxOutputLength: Math.max(byteLimit, 1) });
+		} catch (error) {
+			throw new ToolError(
+				`Compressed tar expansion exceeds the bounded materialization limit: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+		if (tarBytes.byteLength > byteLimit) {
+			throw new ToolError("Compressed tar expansion exceeds the bounded materialization limit");
+		}
+	}
+	assertBoundedTarDeclarations(tarBytes, byteLimit);
+	const indexed = await readTarEntries(tarBytes);
+	signal?.throwIfAborted();
+	let declaredTotal = 0;
+	for (const entry of indexed) {
+		if (entry.isDirectory) continue;
+		declaredTotal = addArchiveMemberSize(declaredTotal, entry.size, byteLimit, entry.path);
+	}
+
+	const entries = new Map<string, ArchiveMemberContent>();
+	let observedTotal = 0;
+	for (const entry of indexed) {
+		if (entry.isDirectory || entry.storage?.type !== "tar") continue;
+		const member = await entry.storage.file.bytes();
+		signal?.throwIfAborted();
+		if (member.byteLength !== entry.size)
+			throw new ToolError(`Archive member '${entry.path}' size did not match its header`);
+		observedTotal = addArchiveMemberSize(observedTotal, member.byteLength, byteLimit, entry.path);
+		entries.set(entry.path, member);
+	}
+	return entries;
+}
+
+/** Serialize a bridge-backed archive only after member and container preflight fit `byteLimit`. */
+export async function serializeArchiveBounded(
+	format: ArchiveFormat,
+	entries: Iterable<readonly [string, ArchiveMemberContent]>,
+	byteLimit: number,
+	signal?: AbortSignal,
+): Promise<Uint8Array> {
+	assertArchiveByteLimit(byteLimit);
+	const measured: Array<readonly [string, ArchiveMemberContent]> = [];
+	let aggregate = 0;
+	let containerBound = format === "zip" ? ZIP_EOCD_MIN_LENGTH : TAR_END_BYTES;
+	for (const [rawName, content] of entries) {
+		const name = rawName.replace(/\\/g, "/");
+		const size = archiveMemberByteLength(content);
+		aggregate = addArchiveMemberSize(aggregate, size, byteLimit, name);
+		const nameBytes = Buffer.byteLength(name, "utf8");
+		if (format === "zip") {
+			containerBound += 30 + 46 + nameBytes * 2 + gzipUpperBound(size);
+		} else {
+			if (!tarPathFitsUstar(name)) {
+				throw new ToolError(`Archive member path '${name}' exceeds bounded tar path metadata limits`);
+			}
+			containerBound += TAR_BLOCK_BYTES + Math.ceil(size / TAR_BLOCK_BYTES) * TAR_BLOCK_BYTES;
+		}
+		if (!Number.isSafeInteger(containerBound) || containerBound > byteLimit) {
+			throw new ToolError(
+				`Archive serialization exceeds the bounded byte limit (${formatBytes(containerBound)} > ${formatBytes(byteLimit)} limit)`,
+			);
+		}
+		measured.push([name, content]);
+	}
+	if (format === "tar.gz" && gzipUpperBound(containerBound) > byteLimit) {
+		throw new ToolError("Compressed tar serialization can exceed the bounded byte limit");
+	}
+	signal?.throwIfAborted();
+	const serialized = await serializeArchive(format, measured);
+	signal?.throwIfAborted();
+	if (serialized.byteLength > byteLimit) {
+		throw new ToolError("Archive serialization exceeded the bounded byte limit");
+	}
+	return serialized;
+}
+
+/** Serialize archive entries in memory for bridge-backed workspace mutations. */
+export async function serializeArchive(
+	format: ArchiveFormat,
+	entries: Iterable<readonly [string, ArchiveMemberContent]>,
+): Promise<Uint8Array> {
+	if (format === "zip") {
+		const record: Unzipped = {};
+		for (const [name, content] of entries) {
+			record[name.replace(/\\/g, "/")] = await memberToBytes(content);
+		}
+		return zip(record);
+	}
+
+	const record: Record<string, ArchiveMemberContent> = {};
+	for (const [name, content] of entries) {
+		record[name.replace(/\\/g, "/")] = content;
+	}
+	return new Bun.Archive(record, format === "tar.gz" ? { compress: "gzip" } : undefined).bytes();
+}
+
 /**
  * Serialize `entries` into an archive of `format` and write it to `destPath`.
  * ZIP is framed in memory, tar / tar.gz via `Bun.Archive` (gzip for tar.gz).
@@ -888,20 +1137,7 @@ export async function writeArchive(
 	format: ArchiveFormat,
 	entries: Iterable<readonly [string, ArchiveMemberContent]>,
 ): Promise<void> {
-	if (format === "zip") {
-		const record: Record<string, Uint8Array> = {};
-		for (const [name, content] of entries) {
-			record[name.replace(/\\/g, "/")] = await memberToBytes(content);
-		}
-		await Bun.write(destPath, zip(record));
-		return;
-	}
-
-	const record: Record<string, ArchiveMemberContent> = {};
-	for (const [name, content] of entries) {
-		record[name.replace(/\\/g, "/")] = content;
-	}
-	await Bun.Archive.write(destPath, record, format === "tar.gz" ? { compress: "gzip" } : undefined);
+	await Bun.write(destPath, await serializeArchive(format, entries));
 }
 
 /**
@@ -1102,5 +1338,33 @@ function extractZipMember(bytes: Uint8Array, storage: ZipStorage, uncompressedSi
 	const extraLength = readUInt16LE(localHeader, 28);
 	const dataStart = headerStart + 30 + fileNameLength + extraLength;
 	const compressed = readMemoryRange(bytes, dataStart, dataStart + storage.compressedSize);
-	return decodeZipMember(compressed, storage.compression, uncompressedSize);
+	const member = decodeZipMember(compressed, storage.compression, uncompressedSize);
+	if (member.byteLength !== uncompressedSize) {
+		throw new ToolError("Invalid ZIP archive: member size did not match the central directory");
+	}
+	return member;
+}
+
+function unzipWithLimits(bytes: Uint8Array, memberByteLimit: number, aggregateByteLimit: number): Unzipped {
+	assertArchiveByteLimit(memberByteLimit);
+	assertArchiveByteLimit(aggregateByteLimit);
+	const info = readCentralDirectoryInfoSync(bytes);
+	const centralDirectory = readMemoryRange(bytes, info.offset, info.offset + info.size);
+	const indexed = parseZipCentralDirectory(memoryByteSource(bytes), centralDirectory, info.entries);
+	let declaredTotal = 0;
+	for (const entry of indexed) {
+		if (entry.isDirectory || entry.storage?.type !== "zip") continue;
+		addArchiveMemberSize(0, entry.size, memberByteLimit, entry.path);
+		declaredTotal = addArchiveMemberSize(declaredTotal, entry.size, aggregateByteLimit, entry.path);
+	}
+
+	const out: Unzipped = {};
+	let observedTotal = 0;
+	for (const entry of indexed) {
+		if (entry.isDirectory || entry.storage?.type !== "zip") continue;
+		const member = extractZipMember(bytes, entry.storage, entry.size);
+		observedTotal = addArchiveMemberSize(observedTotal, member.byteLength, aggregateByteLimit, entry.path);
+		out[entry.path] = member;
+	}
+	return out;
 }

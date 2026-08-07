@@ -1,4 +1,11 @@
-import type { ExecutionEnvironmentBridge, ExecutionEnvironmentLease } from "@oh-my-pi/pi-coding-agent";
+import {
+	type ExecutionEnvironmentBridge,
+	type ExecutionEnvironmentLease,
+	ExecutionEnvironmentReleaseIndeterminateErrorV1,
+	type ExecutionEnvironmentRuntimeReleaseAuthorityV1,
+	reconcileExecutionEnvironmentRuntimeReleaseV1,
+} from "@oh-my-pi/pi-coding-agent/session/execution-environment";
+import type { RuntimeLeaseReleaseResult } from "@oh-my-pi/pi-coding-agent/session/workspace-runtime-contracts";
 import {
 	type BoundaryManifestEntry,
 	CLOUD_OMP_REMOTE_ROOT,
@@ -13,15 +20,13 @@ import {
 	assertNotAborted,
 	CloudOmpEnvironmentError,
 	elapsedMs,
-	once,
 	retryTransportOnce,
 	sanitizeEnvironmentError,
-	scheduleReleaseAtExpiry,
 	validateFilePayload,
 	validateManifestResponse,
 	validateWorkspaceState,
 } from "./environment-wire";
-import { type CloudOmpJsonClient, CloudOmpTransportError } from "./http";
+import type { CloudOmpJsonClient } from "./http";
 import { type SyncBackResult, syncBack } from "./manifest";
 
 export interface LeaseOptions {
@@ -32,8 +37,7 @@ export interface LeaseOptions {
 	audit: CloudOmpAuditWriter;
 	seedManifest: BoundaryManifestEntry[];
 	seedRootSha256: string;
-	expiresAt: number;
-	releaseSlot: () => void;
+	releaseAuthority: ExecutionEnvironmentRuntimeReleaseAuthorityV1;
 }
 
 export class CloudflareEnvironmentLease implements ExecutionEnvironmentLease {
@@ -41,15 +45,14 @@ export class CloudflareEnvironmentLease implements ExecutionEnvironmentLease {
 	readonly sourceRoot: string;
 	readonly remoteRoot = CLOUD_OMP_REMOTE_ROOT;
 	readonly bridge: ExecutionEnvironmentBridge;
+	readonly releaseAuthority: ExecutionEnvironmentRuntimeReleaseAuthorityV1;
 
 	readonly #http: CloudOmpJsonClient;
 	readonly #audit: CloudOmpAuditWriter;
 	readonly #seedManifest: readonly BoundaryManifestEntry[];
 	readonly #seedRootSha256: string;
-	readonly #expiresAt: number;
-	readonly #releaseSlot: () => void;
 	#syncPromise?: Promise<void>;
-	#releasePromise?: Promise<void>;
+	#releasePromise?: Promise<RuntimeLeaseReleaseResult>;
 
 	constructor(options: LeaseOptions) {
 		this.id = options.id;
@@ -59,8 +62,7 @@ export class CloudflareEnvironmentLease implements ExecutionEnvironmentLease {
 		this.#audit = options.audit;
 		this.#seedManifest = Object.freeze(options.seedManifest.map(entry => Object.freeze({ ...entry })));
 		this.#seedRootSha256 = options.seedRootSha256;
-		this.#expiresAt = options.expiresAt;
-		this.#releaseSlot = once(options.releaseSlot);
+		this.releaseAuthority = options.releaseAuthority;
 		Object.freeze(this);
 	}
 
@@ -71,7 +73,7 @@ export class CloudflareEnvironmentLease implements ExecutionEnvironmentLease {
 		return this.#syncPromise;
 	}
 
-	release(): Promise<void> {
+	release(): Promise<RuntimeLeaseReleaseResult> {
 		this.#releasePromise ??= this.#performRelease();
 		return this.#releasePromise;
 	}
@@ -114,37 +116,35 @@ export class CloudflareEnvironmentLease implements ExecutionEnvironmentLease {
 		}
 	}
 
-	async #performRelease(): Promise<void> {
+	async #performRelease(): Promise<RuntimeLeaseReleaseResult> {
 		if (this.#syncPromise) await this.#syncPromise.catch(() => {});
 		const startedAt = performance.now();
-		let remoteReleased = false;
-		let cleanupAmbiguous = false;
 		try {
-			await retryTransportOnce(() =>
-				this.#http.requestEmpty({ method: "DELETE", path: cloudOmpRoutes.workspace(this.id) }),
-			);
-			remoteReleased = true;
-			await this.#audit.record({
-				operation: "release",
-				durationMs: elapsedMs(startedAt),
-				outcome: "success",
-				cleanupState: "completed",
-			});
+			const receipt = await reconcileExecutionEnvironmentRuntimeReleaseV1(this.releaseAuthority);
+			await this.#audit
+				.record({
+					operation: "release",
+					durationMs: elapsedMs(startedAt),
+					outcome: "success",
+					cleanupState: "completed",
+				})
+				.catch(() => {});
+			return receipt;
 		} catch (error) {
-			cleanupAmbiguous = error instanceof CloudOmpTransportError;
+			const failure =
+				error instanceof ExecutionEnvironmentReleaseIndeterminateErrorV1 && error.errors.length > 0
+					? error.errors[0]
+					: error;
 			await this.#audit
 				.record({
 					operation: "release",
 					durationMs: elapsedMs(startedAt),
 					outcome: "failed",
-					cleanupState: remoteReleased ? "completed" : "failed",
-					errorCode: auditErrorCode(error),
+					cleanupState: "failed",
+					errorCode: auditErrorCode(failure),
 				})
 				.catch(() => {});
-			throw sanitizeEnvironmentError(error, undefined, "release");
-		} finally {
-			if (remoteReleased) this.#releaseSlot();
-			else if (cleanupAmbiguous) scheduleReleaseAtExpiry(this.#releaseSlot, this.#expiresAt);
+			throw failure;
 		}
 	}
 

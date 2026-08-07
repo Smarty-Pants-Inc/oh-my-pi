@@ -14,12 +14,31 @@ import { SessionObserverRegistry } from "@oh-my-pi/pi-coding-agent/modes/session
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import type { PersistentAgentStore } from "@oh-my-pi/pi-coding-agent/registry/persistent-agent-contracts";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 const AGENT_ID = "Worker";
 const TEST_CWD = path.resolve("agent-hub-cwd");
+
+function bindMissingPersistentAgentStore(registry: AgentRegistry): void {
+	registry.bindProcessOwnedPersistentAgentStore({
+		controlHostId: "test-host",
+		lookup: async agentId => ({ kind: "missing", agentId }),
+		list: async () => [],
+		inspectOwnership: async () => ({
+			state: "unowned",
+			controlHostId: "test-host",
+			processId: null,
+			intent: null,
+			acquiredAt: null,
+		}),
+		acquire: async () => {
+			throw new Error("Persistent ownership is not used by this fixture");
+		},
+	} satisfies PersistentAgentStore);
+}
 
 function makeHub(focusAgent: (id: string) => Promise<void>) {
 	const agents = new AgentRegistry();
@@ -98,6 +117,7 @@ describe("Agent hub Enter activation", () => {
 		await Bun.write(sessionFile, "");
 		await Bun.write(workerSessionFile, "");
 		const agents = new AgentRegistry();
+		bindMissingPersistentAgentStore(agents);
 		const hub = new AgentHubOverlayComponent({
 			observers: new SessionObserverRegistry(),
 			hubKeys: [],
@@ -159,6 +179,7 @@ describe("Agent hub Enter activation", () => {
 		await manager.close();
 
 		const agents = new AgentRegistry();
+		bindMissingPersistentAgentStore(agents);
 		const hub = new AgentHubOverlayComponent({
 			observers: new SessionObserverRegistry(),
 			hubKeys: [],
@@ -336,6 +357,7 @@ describe("Agent hub double-← gating", () => {
 		await Bun.write(sessionFile, "");
 		await Bun.write(workerSessionFile, "");
 		const agents = new AgentRegistry();
+		bindMissingPersistentAgentStore(agents);
 		const { controller, shown, shownReady } = setup(agents, sessionFile);
 
 		controller.showAgentHub(new SessionObserverRegistry(), { requireContent: true });

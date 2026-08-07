@@ -48,6 +48,7 @@ export default {
 			onChunk: opts.onChunk,
 			onStatus: opts.onStatus,
 			toolSession: opts.session,
+			evalAgentLifecycle: opts.evalAgentLifecycle,
 		});
 		return toExecutorBackendResult(result);
 	},

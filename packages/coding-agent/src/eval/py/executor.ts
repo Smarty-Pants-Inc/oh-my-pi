@@ -18,6 +18,7 @@ import {
 	waitForPromiseWithCancellation,
 } from "../executor-base";
 import type { JsStatusEvent } from "../js/shared/types";
+import type { EvalAgentLifecycleContextV1 } from "../lifecycle";
 import {
 	checkPythonKernelAvailability,
 	type KernelDisplayOutput,
@@ -86,6 +87,7 @@ export interface PythonExecutorOptions {
 	 * not injected and any `tool.foo(...)` raises in Python.
 	 */
 	toolSession?: ToolSession;
+	evalAgentLifecycle?: EvalAgentLifecycleContextV1;
 	/** Callback for status events emitted by tool bridge invocations. */
 	emitStatus?: (event: JsStatusEvent) => void;
 	/**

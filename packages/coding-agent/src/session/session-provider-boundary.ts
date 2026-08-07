@@ -133,7 +133,10 @@ export class SessionProviderBoundary {
 	}
 
 	/** Applies session-level stream hooks and provider defaults to a side request. */
-	prepareSimpleStreamOptions(options: SimpleStreamOptions, provider = "anthropic"): SimpleStreamOptions {
+	prepareSimpleStreamOptions(options: SimpleStreamOptions, provider: string): SimpleStreamOptions {
+		if (provider.length === 0 || provider.trim() !== provider) {
+			throw new TypeError("Side requests require a canonical provider id");
+		}
 		const sessionOnPayload = this.#host.onPayload;
 		const sessionOnResponse = this.#host.onResponse;
 		const sessionMetadata = this.#host.agent.metadataForProvider(provider);

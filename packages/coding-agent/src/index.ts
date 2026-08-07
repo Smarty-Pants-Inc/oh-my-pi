@@ -9,6 +9,7 @@ export { getAgentDir, logger, VERSION } from "@oh-my-pi/pi-utils";
 export * as zod from "zod/v4";
 export { z } from "zod/v4";
 export * from "./config/keybindings";
+export * from "./config/model-connection-contracts.js";
 export * from "./config/model-registry";
 // Prompt templates
 export type * from "./config/prompt-templates";
@@ -48,17 +49,87 @@ export * from "./session/redis-session-storage";
 export * from "./session/session-context";
 export * from "./session/session-dump-format";
 export * from "./session/session-entries";
+export * from "./session/session-journal-contracts.js";
 export * from "./session/session-listing";
 export * from "./session/session-loader";
 export * from "./session/session-manager";
 export * from "./session/session-migrations";
 export * from "./session/session-storage";
 export * from "./session/sql-session-storage";
+export * from "./session/workspace-runtime-contracts.js";
 export * from "./task/executor";
 export type * from "./task/types";
+export {
+	validateAndProjectTransientEvalForegroundSourceAgentToolResultV1,
+	validateAndProjectTransientTaskForegroundSourceAgentToolResultV1,
+} from "./task/types";
 // Tools (detail types and utilities)
 export * from "./tools";
-export * from "./utils/git";
+export type {
+	CloneOptions,
+	CommitAuthor,
+	CommitDetails,
+	CommitOptions,
+	DetachGitDirResult,
+	DiffOptions,
+	FetchOptions,
+	GhCommandOptions,
+	GhCommandResult,
+	GitCommandResult,
+	GitDetachedHead,
+	GitHeadState,
+	GitRefHead,
+	GitRepository,
+	GitStatusSummary,
+	GitWorktreeEntry,
+	HunkSelection,
+	HunkSelectionValidationError,
+	PatchOptions,
+	PushOptions,
+	RestoreOptions,
+	StageHunksOptions,
+	StatusOptions,
+} from "./utils/git";
+export {
+	branch,
+	checkout,
+	cherryPick,
+	clean,
+	clone,
+	commit,
+	commitDetails,
+	config,
+	createHunkSelectionValidator,
+	detachGitDir,
+	diff,
+	fetch,
+	GIT_COMMAND_OUTPUT_LIMIT_BYTES,
+	GIT_COMMAND_TIMEOUT_MS,
+	GIT_NETWORK_TIMEOUT_MS,
+	GIT_SPAWN_SYNC_TIMEOUT_MS,
+	GitCommandError,
+	github,
+	head,
+	log,
+	ls,
+	patch,
+	push,
+	readTree,
+	ref,
+	remote,
+	repo,
+	reset,
+	restore,
+	revList,
+	show,
+	stage,
+	stash,
+	status,
+	validateHunkSelections,
+	withRepoLock,
+	worktree,
+	writeTree,
+} from "./utils/git";
 // UI components for extensions
 export {
 	HookEditorComponent as ExtensionEditorComponent,

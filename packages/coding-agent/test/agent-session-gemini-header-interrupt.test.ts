@@ -20,6 +20,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 function emptyUsage(): AssistantMessage["usage"] {
 	return {
@@ -177,7 +178,13 @@ describe("AgentSession Gemini header-runaway interrupt", () => {
 			...overrides,
 		});
 		settings.setModelRole("default", `${model.provider}/${model.id}`);
-		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
+		});
 	}
 
 	it("interrupts the reasoning runaway, injects a tool-call reminder, and continues", async () => {

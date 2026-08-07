@@ -55,6 +55,11 @@ import {
 	truncateHeadBytes,
 	truncateLine,
 } from "../session/streaming-output";
+import type {
+	PersistentModelWorkspacePath,
+	PersistentWorkspacePathMapper,
+	WorkspaceOperationLease,
+} from "../session/workspace-runtime-contracts.js";
 import { fileHyperlink, renderCodeCell, renderMarkdownCell, renderStatusLine, tryResolveInternalUrlSync } from "../tui";
 import { CachedOutputBlock, markFramedBlockComponent } from "../tui/output-block";
 import { buildLineEntriesWithBlockContext, type LineEntry, lineEntriesToPlainText } from "../utils/block-context";
@@ -758,6 +763,12 @@ export interface ReadToolDetails {
 }
 type ReadParams = ReadToolInput;
 
+/** Persistent-only workspace admission supplied by CentralIntegration. */
+export interface PersistentReadRouteV1 {
+	readonly paths: PersistentWorkspacePathMapper;
+	begin(signal?: AbortSignal): Promise<WorkspaceOperationLease>;
+}
+
 /** Parsed representation of a path-embedded selector. */
 type ParsedSelector =
 	| { kind: "none" }
@@ -876,7 +887,10 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 	readonly #defaultLimit: number;
 	#inspectImageActive: boolean;
 
-	constructor(private readonly session: ToolSession) {
+	constructor(
+		private readonly session: ToolSession,
+		private readonly persistentRoute?: PersistentReadRouteV1,
+	) {
 		this.#autoResizeImages = session.settings.get("images.autoResize");
 		this.#defaultLimit = Math.max(
 			1,
@@ -2235,6 +2249,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				);
 				modelParts.push(formatted.model);
 				displayParts.push(formatted.display);
+
 				elidedRanges.push({ start: unit.startLine, end: unit.endLine });
 				elidedLines += Math.max(0, unit.endLine - unit.startLine - 1);
 				continue;
@@ -2245,6 +2260,143 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		return { text: modelParts.join("\n"), displayText: displayParts.join("\n"), elidedRanges, elidedLines };
 	}
 
+	async #readPersistentWorkspaceFile(
+		readPath: string,
+		route: PersistentReadRouteV1,
+		signal?: AbortSignal,
+	): Promise<AgentToolResult<ReadToolDetails>> {
+		const delimitedPaths = readPath.split(";");
+		if (delimitedPaths.length > 1) {
+			for (const entry of delimitedPaths) {
+				if (entry.length === 0)
+					throw new ToolError("Persistent reads do not support empty semicolon-delimited paths.");
+				route.paths.parse(splitPathAndSel(entry).path);
+			}
+			throw new ToolError("Persistent reads do not support semicolon-delimited paths.");
+		}
+
+		const target = splitPathAndSel(readPath);
+		const parsed = parseSel(target.sel);
+		if (target.path.length === 0 || target.path === "." || target.path.endsWith("/")) {
+			throw new ToolError("Persistent reads support regular UTF-8 files only; directories are unsupported.");
+		}
+		let workspacePath: PersistentModelWorkspacePath;
+		try {
+			workspacePath = route.paths.parse(target.path).modelPath;
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			throw new ToolError(`Persistent read path '${target.path}' is outside the workspace: ${message}`);
+		}
+		if (String(workspacePath) === route.paths.modelRoot) {
+			throw new ToolError("Persistent reads support regular UTF-8 files only; directories are unsupported.");
+		}
+		if (parsed.kind === "conflicts") {
+			throw new ToolError("The :conflicts selector is unsupported for persistent reads.");
+		}
+		const archiveCandidates = parseArchivePathCandidates(readPath);
+		if (archiveCandidates.length > 0) {
+			for (const candidate of archiveCandidates) route.paths.parse(candidate.archivePath);
+			throw new ToolError("Archive paths and archive member selectors are unsupported for persistent reads.");
+		}
+		const sqliteCandidates = parseSqlitePathCandidates(readPath);
+		if (sqliteCandidates.length > 0) {
+			for (const candidate of sqliteCandidates) route.paths.parse(candidate.sqlitePath);
+			throw new ToolError("Database paths and selectors are unsupported for persistent reads.");
+		}
+		const pdfImageMemberPath = splitPdfImageMemberReadPath(readPath);
+		if (pdfImageMemberPath) {
+			route.paths.parse(pdfImageMemberPath.pdfPath);
+			throw new ToolError("PDF image member selectors are unsupported for persistent reads.");
+		}
+		if (CONVERTIBLE_EXTENSIONS.has(path.extname(target.path).toLowerCase())) {
+			throw new ToolError("Binary document conversion is unsupported for persistent reads.");
+		}
+
+		const operation = await route.begin(signal);
+		try {
+			throwIfAborted(signal);
+			const { binding } = operation;
+			const result = await binding.bridge.readTextFile({
+				operationLeaseId: operation.operationLeaseId,
+				workspaceId: binding.lease.replica.workspaceId,
+				expectedGeneration: binding.lease.baseGeneration,
+				replicaId: binding.lease.replica.replicaId,
+				leaseId: binding.lease.leaseId,
+				fence: binding.fence,
+				path: workspacePath,
+				line: null,
+				limit: null,
+				byteLimit: DEFAULT_MAX_BYTES,
+			});
+			throwIfAborted(signal);
+			const returnedPath = route.paths.parseReturnedModelPath(result.path).modelPath;
+			if (returnedPath !== workspacePath) {
+				throw new ToolError("Persistent read provider returned a different workspace path.");
+			}
+
+			const details = this.#markMarkdownContentType(
+				{ resolvedPath: returnedPath, fileSize: result.byteLength },
+				returnedPath,
+			);
+			if (
+				parsed.kind === "none" &&
+				this.session.settings.get("read.summarize.enabled") &&
+				(this.session.settings.get("read.summarize.prose") || !isProseSummaryPath(returnedPath))
+			) {
+				const summary = this.#trySummarizeText(result.content, returnedPath, signal);
+				if (summary?.parsed && summary.elided) {
+					const renderedSummary = this.#renderSummary(summary);
+					const footer = formatSummaryElisionFooter(
+						returnedPath,
+						renderedSummary.elidedRanges,
+						renderedSummary.elidedLines,
+					);
+					const summaryHashContext = resolveFileDisplayMode(this.session).hashLines
+						? recordFullHashlineContext(this.session, returnedPath, returnedPath, result.content, false)
+						: undefined;
+					const bodyText = footer ? `${renderedSummary.text}\n\n${footer}` : renderedSummary.text;
+					const modelText = prependHashlineHeader(bodyText, summaryHashContext);
+					if (summaryHashContext?.tag) {
+						const seenLines = Array.from(renderedSummary.text.matchAll(/^(\d+)(?:-(\d+))?:/gm)).flatMap(match =>
+							match[2] === undefined ? [Number(match[1])] : [Number(match[1]), Number(match[2])],
+						);
+						getFileSnapshotStore(this.session).recordSeenLines(returnedPath, summaryHashContext.tag, seenLines);
+					}
+					return toolResult<ReadToolDetails>({
+						...details,
+						displayContent: { text: renderedSummary.displayText, startLine: 1 },
+						summary: {
+							lines: countTextLines(renderedSummary.text),
+							elidedSpans: renderedSummary.elidedRanges.length,
+							elidedLines: renderedSummary.elidedLines,
+						},
+					})
+						.text(modelText)
+						.sourcePath(returnedPath)
+						.done();
+				}
+			}
+			if (isMultiRange(parsed) && parsed.kind === "lines") {
+				return this.#buildInMemoryMultiRangeResult(result.content, parsed.ranges, {
+					details,
+					sourcePath: returnedPath,
+					entityLabel: "file",
+					raw: isRawSelector(parsed),
+					environment: true,
+				});
+			}
+			const { offset, limit } = selToOffsetLimit(parsed);
+			return this.#buildInMemoryTextResult(result.content, offset, limit, {
+				details,
+				sourcePath: returnedPath,
+				entityLabel: "file",
+				raw: isRawSelector(parsed),
+				environment: true,
+			});
+		} finally {
+			operation.end();
+		}
+	}
 	async #readEnvironmentFile(
 		readPath: string,
 		environment: ExecutionEnvironmentBinding,
@@ -2356,6 +2508,9 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		_onUpdate?: AgentToolUpdateCallback<ReadToolDetails>,
 		_toolContext?: AgentToolContext,
 	): Promise<AgentToolResult<ReadToolDetails>> {
+		if (this.persistentRoute) {
+			return this.#readPersistentWorkspaceFile(params.path, this.persistentRoute, signal);
+		}
 		let { path: readPath } = params;
 		if (readPath.startsWith("file://")) {
 			readPath = expandPath(readPath);

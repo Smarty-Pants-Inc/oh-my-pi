@@ -6,6 +6,7 @@ import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry
 import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent, PromptOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { WorkspaceRuntimeProviderRegistry } from "@oh-my-pi/pi-coding-agent/session/workspace-provider-registry";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
@@ -65,6 +66,7 @@ function createHangingSession(): HangingSessionHandle {
 function mockCreateAgentSession(session: AgentSession) {
 	return vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({
 		session,
+		runtimeProviderRegistry: new WorkspaceRuntimeProviderRegistry(),
 		extensionsResult: {} as unknown as LoadExtensionsResult,
 		setToolUIContext: () => {},
 		eventBus: new EventBus(),
@@ -182,6 +184,7 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 			await new Promise(resolve => setTimeout(resolve, 200));
 			return {
 				session: handle.session,
+				runtimeProviderRegistry: new WorkspaceRuntimeProviderRegistry(),
 				extensionsResult: {} as unknown as LoadExtensionsResult,
 				setToolUIContext: () => {},
 				eventBus: new EventBus(),
@@ -230,6 +233,7 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 			);
 			return {
 				session: lateSession,
+				runtimeProviderRegistry: new WorkspaceRuntimeProviderRegistry(),
 				extensionsResult: {} as unknown as LoadExtensionsResult,
 				setToolUIContext: () => {},
 				eventBus: new EventBus(),

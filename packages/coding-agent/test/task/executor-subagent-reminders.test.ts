@@ -7,6 +7,7 @@ import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent, PromptOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { WorkspaceRuntimeProviderRegistry } from "@oh-my-pi/pi-coding-agent/session/workspace-provider-registry";
 import {
 	finalizeSubprocessOutput,
 	runSubprocess,
@@ -88,6 +89,7 @@ function createMockSession(
 function createSessionResult(session: AgentSession): CreateAgentSessionResult {
 	return {
 		session,
+		runtimeProviderRegistry: new WorkspaceRuntimeProviderRegistry(),
 		extensionsResult: {} as unknown as LoadExtensionsResult,
 		setToolUIContext: () => {},
 		eventBus: new EventBus(),

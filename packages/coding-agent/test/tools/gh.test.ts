@@ -6,6 +6,7 @@ import type { ToolCall } from "@oh-my-pi/pi-ai";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { validateToolArguments } from "@oh-my-pi/pi-ai/utils/validation";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { tryAcquireTaskIsolationExclusionLock } from "@oh-my-pi/pi-coding-agent/task/isolation-ownership";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import {
 	buildSearchDateQualifier,
@@ -1025,6 +1026,36 @@ describe("github tool", () => {
 			expect(cfg).toContain(`branch.pr-123.merge refs/heads/${fixture.headRefName}`);
 			expect(runGit(fixture.repoRoot, ["worktree", "list", "--porcelain"])).toContain(`worktree ${worktreePath}`);
 			expect(runGit(worktreePath, ["branch", "--show-current"])).toBe("pr-123");
+		});
+
+		it("fails closed before PR worktree namespace mutation while the root lock is held", async () => {
+			vi.spyOn(git.github, "json")
+				.mockResolvedValueOnce({
+					number: 124,
+					title: "Locked",
+					url: "https://github.com/base/repo/pull/124",
+					baseRefName: "main",
+					headRefName: fixture.headRefName,
+					headRefOid: fixture.headRefOid,
+					headRepository: { nameWithOwner: "contrib/repo" },
+					headRepositoryOwner: { login: "contrib" },
+					isCrossRepository: true,
+					maintainerCanModify: true,
+				})
+				.mockResolvedValueOnce({ nameWithOwner: "contrib/repo", sshUrl: fixture.forkBare, url: fixture.forkBare });
+			const lock = await tryAcquireTaskIsolationExclusionLock();
+			expect(lock?.acquired).toBe(true);
+			try {
+				await expect(
+					new GithubTool(createSession(fixture.repoRoot)).execute("pr-checkout", { op: "pr_checkout", pr: "124" }),
+				).rejects.toThrow("Worktree namespace is busy");
+			} finally {
+				lock?.release();
+			}
+			const primaryRoot = (await git.repo.primaryRoot(fixture.repoRoot)) ?? fixture.repoRoot;
+			await expect(
+				fs.stat(path.join(tempHome.home, ".omp", "wt", `124-${hashPath(primaryRoot)}`)),
+			).rejects.toMatchObject({ code: "ENOENT" });
 		});
 	});
 

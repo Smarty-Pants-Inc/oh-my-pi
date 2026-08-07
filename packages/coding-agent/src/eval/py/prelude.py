@@ -4,7 +4,7 @@ from __future__ import annotations
 if "__omp_prelude_loaded__" not in globals():
     __omp_prelude_loaded__ = True
     from pathlib import Path
-    import os, json, math, re
+    import os, json, math, re, threading
     from urllib.parse import unquote
 
     INTENT_FIELD = "i"
@@ -382,6 +382,15 @@ if "__omp_prelude_loaded__" not in globals():
     # host-owned loopback endpoint must always connect directly.
     _BRIDGE_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
+    _BRIDGE_CALL_ORDINALS: dict[str, int] = {}
+    _BRIDGE_CALL_LOCK = threading.Lock()
+
+    def _next_bridge_call_ordinal(run_id: str) -> int:
+        with _BRIDGE_CALL_LOCK:
+            ordinal = _BRIDGE_CALL_ORDINALS.get(run_id, 0)
+            _BRIDGE_CALL_ORDINALS[run_id] = ordinal + 1
+            return ordinal
+
     def _bridge_call(name: str, args: dict):
         """POST one request to the host tool bridge and return its `value`."""
         base, token, session = _tool_proxy_from_env()
@@ -391,8 +400,9 @@ if "__omp_prelude_loaded__" not in globals():
             if callable(_run_id_getter)
             else globals().get("__omp_run_id__")
         )
+        _call_ordinal = _next_bridge_call_ordinal(str(_run_id))
         payload = json.dumps(
-            {"session": session, "run": _run_id, "name": name, "args": args}
+            {"session": session, "run": _run_id, "call": _call_ordinal, "name": name, "args": args}
         ).encode("utf-8")
         req = urllib.request.Request(
             f"{base}/v1/tool",

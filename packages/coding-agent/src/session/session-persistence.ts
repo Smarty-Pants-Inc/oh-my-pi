@@ -1,4 +1,5 @@
 import { isAnthropicWebSearchHistoryBlock } from "@oh-my-pi/pi-ai/providers/anthropic-wire";
+import { stringifyJson } from "@oh-my-pi/pi-utils";
 import {
 	type BlobStore,
 	externalizeImageDataSync,
@@ -6,7 +7,13 @@ import {
 	isBlobRef,
 	isImageDataUrl,
 } from "./blob-store";
-import type { FileEntry } from "./session-entries";
+import {
+	type FileEntry,
+	type SessionEntry,
+	type SessionHeader,
+	sessionEntryJournalPrivacyClass,
+} from "./session-entries";
+import type { CanonicalSessionEntryProjectionV1, CanonicalSessionProjectionV1 } from "./session-journal-contracts.js";
 
 const MAX_PERSIST_CHARS = 500_000;
 const TRUNCATION_NOTICE = "\n\n[Session persistence truncated large content]";
@@ -290,4 +297,67 @@ function stripReplayedReasoningSignatures(entry: FileEntry): FileEntry {
 
 export function prepareEntryForPersistence(entry: FileEntry, blobStore: BlobStore): FileEntry {
 	return truncateForPersistence(stripReplayedReasoningSignatures(entry), blobStore) as FileEntry;
+}
+
+export interface CanonicalSessionPersistenceProjection {
+	/** Exact primary JSONL body, byte-identical to the journal Replace projection. */
+	readonly canonicalBody: string;
+	readonly journal: CanonicalSessionProjectionV1;
+}
+
+/** Project one entry once for both primary append bytes and journal metadata. */
+export function projectSessionEntryForPersistence(
+	entry: SessionEntry,
+	ordinal: number,
+	blobStore: BlobStore,
+): CanonicalSessionEntryProjectionV1 {
+	if (!Number.isSafeInteger(ordinal) || ordinal < 0 || Object.is(ordinal, -0))
+		throw new TypeError("session_persistence_invalid_entry_ordinal");
+	const persisted = prepareEntryForPersistence(entry, blobStore) as SessionEntry;
+	return Object.freeze({
+		ordinal,
+		entryId: persisted.id,
+		entryType: persisted.type,
+		timestamp: persisted.timestamp,
+		canonicalLine: `${stringifyJson(persisted) ?? "null"}\n`,
+		privacyClass: sessionEntryJournalPrivacyClass(persisted),
+	});
+}
+
+/** Project the complete session once for primary replacement and journal reconciliation. */
+export function projectSessionForPersistence(
+	titleSlotLine: string,
+	header: SessionHeader,
+	entries: readonly SessionEntry[],
+	blobStore: BlobStore,
+): CanonicalSessionPersistenceProjection {
+	// The fixed-width title slot is the sole physical title authority. Keeping
+	// mutable title fields in the header would make in-place title updates diverge
+	// from the canonical journal projection.
+	const canonicalHeader: SessionHeader = { ...header };
+	delete canonicalHeader.title;
+	delete canonicalHeader.titleSource;
+	const persistedHeader = prepareEntryForPersistence(canonicalHeader, blobStore);
+	if (persistedHeader.type !== "session" || persistedHeader.id !== header.id)
+		throw new TypeError("session_persistence_invalid_header_projection");
+	const headerProjection = Object.freeze({
+		canonicalLine: `${stringifyJson(persistedHeader) ?? "null"}\n`,
+	});
+	const entryProjections = Object.freeze(
+		entries.map((entry, ordinal) => projectSessionEntryForPersistence(entry, ordinal, blobStore)),
+	);
+	const journal = Object.freeze({
+		schemaVersion: 1 as const,
+		sessionId: persistedHeader.id,
+		titleSlotLine,
+		header: headerProjection,
+		entries: entryProjections,
+	});
+	return Object.freeze({
+		canonicalBody:
+			journal.titleSlotLine +
+			journal.header.canonicalLine +
+			journal.entries.map(entry => entry.canonicalLine).join(""),
+		journal,
+	});
 }

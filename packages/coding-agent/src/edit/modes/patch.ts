@@ -60,6 +60,24 @@ import {
 	seekSequence,
 } from "./replace";
 
+export type PersistentEditMutation =
+	| { readonly operation: "write_text"; readonly path: string; readonly content: string }
+	| { readonly operation: "mkdir"; readonly path: string; readonly recursive: boolean }
+	| { readonly operation: "remove"; readonly path: string; readonly recursive: boolean }
+	| { readonly operation: "rename"; readonly from: string; readonly to: string };
+
+export interface PersistentEditMutationExecutor {
+	modelPath(path: string): string;
+	read(path: string): Promise<string>;
+	readBinary(path: string): Promise<Uint8Array>;
+	exists(path: string): Promise<boolean>;
+	freeze(mutations: readonly PersistentEditMutation[]): Promise<void>;
+	write(path: string, content: string): Promise<void>;
+	mkdir(path: string): Promise<void>;
+	delete(path: string): Promise<void>;
+	rename(from: string, to: string): Promise<void>;
+	readonly modelRoot: string;
+}
 export type Operation = "create" | "delete" | "update";
 
 export interface PatchInput {
@@ -76,6 +94,7 @@ export interface FileSystem {
 	write(path: string, content: string): Promise<void>;
 	delete(path: string): Promise<void>;
 	mkdir(path: string): Promise<void>;
+	freezeMutations?: (mutations: readonly PersistentEditMutation[]) => Promise<void>;
 }
 
 interface FileChange {
@@ -1531,9 +1550,13 @@ async function applyNormalizedPatch(input: PatchInput, options: ApplyPatchOption
 		// Strip + prefixes if present (handles diffs formatted as additions)
 		const normalizedContent = normalizeCreateContent(input.diff);
 		const content = normalizedContent.endsWith("\n") ? normalizedContent : `${normalizedContent}\n`;
+		const parentDir = path.dirname(absolutePath);
+		await fs.freezeMutations?.([
+			...(parentDir && parentDir !== "." ? [{ operation: "mkdir" as const, path: parentDir, recursive: true }] : []),
+			{ operation: "write_text", path: absolutePath, content },
+		]);
 
 		if (!dryRun) {
-			const parentDir = path.dirname(absolutePath);
 			if (parentDir && parentDir !== ".") {
 				await fs.mkdir(parentDir);
 			}
@@ -1552,9 +1575,8 @@ async function applyNormalizedPatch(input: PatchInput, options: ApplyPatchOption
 	// Handle DELETE operation
 	if (op === "delete") {
 		const oldContent = await readExistingPatchFile(fs, absolutePath, input.path);
-		if (!dryRun) {
-			await fs.delete(absolutePath);
-		}
+		await fs.freezeMutations?.([{ operation: "remove", path: absolutePath, recursive: false }]);
+		if (!dryRun) await fs.delete(absolutePath);
 
 		return {
 			change: {
@@ -1597,6 +1619,16 @@ async function applyNormalizedPatch(input: PatchInput, options: ApplyPatchOption
 	const finalContent = bom + restoreLineEndings(newContent, lineEnding);
 	const destPath = input.rename ? resolvePath(input.rename) : absolutePath;
 	const isMove = Boolean(input.rename) && destPath !== absolutePath;
+	const mutationPlan: PersistentEditMutation[] = isMove
+		? [
+				...(path.dirname(destPath) !== "."
+					? [{ operation: "mkdir" as const, path: path.dirname(destPath), recursive: true }]
+					: []),
+				{ operation: "write_text", path: destPath, content: finalContent },
+				{ operation: "remove", path: absolutePath, recursive: false },
+			]
+		: [{ operation: "write_text", path: absolutePath, content: finalContent }];
+	await fs.freezeMutations?.(mutationPlan);
 
 	if (!dryRun) {
 		if (isMove) {
@@ -1692,6 +1724,7 @@ export interface ExecutePatchSingleOptions {
 	allowCreateOverwrite?: boolean;
 	writethrough: WritethroughCallback;
 	beginDeferredDiagnosticsForPath: (path: string) => WritethroughDeferredHandle;
+	persistent?: PersistentEditMutationExecutor;
 }
 
 class LspFileSystem implements FileSystem {
@@ -1705,6 +1738,7 @@ class LspFileSystem implements FileSystem {
 		private readonly signal?: AbortSignal,
 		private readonly batchRequest?: LspBatchRequest,
 		private readonly deferredForPath?: (path: string) => WritethroughDeferredHandle,
+		private readonly persistent?: PersistentEditMutationExecutor,
 	) {}
 
 	#getFile(path: string): Bun.BunFile {
@@ -1717,19 +1751,22 @@ class LspFileSystem implements FileSystem {
 	}
 
 	async exists(path: string): Promise<boolean> {
-		return this.#getFile(path).exists();
+		return this.persistent ? this.persistent.exists(path) : this.#getFile(path).exists();
 	}
 
 	async read(path: string): Promise<string> {
-		return readEditFileText(path, path);
+		return this.persistent ? this.persistent.read(path) : readEditFileText(path, path);
 	}
 
 	async readBinary(path: string): Promise<Uint8Array> {
-		const bytes = await fs.promises.readFile(path);
-		return bytes;
+		return this.persistent ? this.persistent.readBinary(path) : fs.promises.readFile(path);
 	}
 
 	async write(path: string, content: string): Promise<void> {
+		if (this.persistent) {
+			await this.persistent.write(path, content);
+			return;
+		}
 		const finalContent = await serializeEditFileText(path, path, content);
 
 		// Route through ACP bridge when available; skips internal artifacts and local:// paths.
@@ -1753,6 +1790,10 @@ class LspFileSystem implements FileSystem {
 	}
 
 	async delete(path: string): Promise<void> {
+		if (this.persistent) {
+			await this.persistent.delete(path);
+			return;
+		}
 		await this.#getFile(path).unlink();
 		if (this.session.enableLsp ?? true) {
 			await notifyWorkspaceWatchedFiles(
@@ -1764,7 +1805,15 @@ class LspFileSystem implements FileSystem {
 	}
 
 	async mkdir(path: string): Promise<void> {
+		if (this.persistent) {
+			await this.persistent.mkdir(path);
+			return;
+		}
 		await fs.promises.mkdir(path, { recursive: true });
+	}
+
+	async freezeMutations(mutations: readonly PersistentEditMutation[]): Promise<void> {
+		await this.persistent?.freeze(mutations);
 	}
 
 	getDiagnostics(): FileDiagnosticsResult | undefined {
@@ -1807,16 +1856,21 @@ export async function executePatchSingle(
 		allowCreateOverwrite,
 		writethrough,
 		beginDeferredDiagnosticsForPath,
+		persistent,
 	} = options;
 	const { op: rawOp, rename, diff } = params;
 
 	const op: Operation = rawOp === "create" || rawOp === "delete" ? rawOp : "update";
 
-	enforcePlanModeWrite(session, path, { op, move: rename });
-	const resolvedPath = resolvePlanPath(session, path);
-	const resolvedRename = rename ? resolvePlanPath(session, rename) : undefined;
+	if (!persistent) enforcePlanModeWrite(session, path, { op, move: rename });
+	const resolvedPath = persistent ? persistent.modelPath(path) : resolvePlanPath(session, path);
+	const resolvedRename = rename
+		? persistent
+			? persistent.modelPath(rename)
+			: resolvePlanPath(session, rename)
+		: undefined;
 
-	await assertEditableFile(resolvedPath, path, session.settings);
+	if (!persistent) await assertEditableFile(resolvedPath, path, session.settings);
 
 	// Capture pre-edit content so we can verify the write actually hit disk.
 	// `LspFileSystem.writeFile` delegates to a writethrough callback that, in
@@ -1828,7 +1882,7 @@ export async function executePatchSingle(
 	// timestamp resolution can record an unchanged mtime even when the
 	// content was rewritten, and same-length rewrites leave size unchanged.
 	let preEditContent: Uint8Array | undefined;
-	if (op === "update") {
+	if (!persistent && op === "update") {
 		try {
 			preEditContent = await fs.promises.readFile(resolvedPath);
 		} catch (err) {
@@ -1844,18 +1898,20 @@ export async function executePatchSingle(
 		signal,
 		batchRequest,
 		beginDeferredDiagnosticsForPath,
+		persistent,
 	);
 	const result = await applyPatch(input, {
-		cwd: session.cwd,
+		cwd: persistent?.modelRoot ?? session.cwd,
 		fs: patchFileSystem,
 		fuzzyThreshold,
 		allowFuzzy,
 		allowCreateOverwrite,
 	});
 
-	// Post-write verification: only meaningful for in-place updates where the
-	// patch actually changes content and the file is not being renamed away.
+	// Post-write verification: only meaningful for in-place local updates where
+	// the patch actually changes content and the file is not being renamed away.
 	if (
+		!persistent &&
 		result.change.type === "update" &&
 		!result.change.newPath &&
 		preEditContent !== undefined &&
@@ -1880,12 +1936,14 @@ export async function executePatchSingle(
 		}
 	}
 
-	if (resolvedRename) {
-		invalidateFsScanAfterRename(resolvedPath, resolvedRename);
-	} else if (result.change.type === "delete") {
-		invalidateFsScanAfterDelete(resolvedPath);
-	} else {
-		invalidateFsScanAfterWrite(resolvedPath);
+	if (!persistent) {
+		if (resolvedRename) {
+			invalidateFsScanAfterRename(resolvedPath, resolvedRename);
+		} else if (result.change.type === "delete") {
+			invalidateFsScanAfterDelete(resolvedPath);
+		} else {
+			invalidateFsScanAfterWrite(resolvedPath);
+		}
 	}
 	const effectiveRename = result.change.newPath ? rename : undefined;
 
@@ -1924,7 +1982,7 @@ export async function executePatchSingle(
 	}
 
 	let diagnostics = patchFileSystem.getDiagnostics();
-	if (op === "delete" && batchRequest?.flush) {
+	if (!persistent && op === "delete" && batchRequest?.flush) {
 		const flushedDiagnostics = await flushLspWritethroughBatch(batchRequest.id, session.cwd, signal);
 		diagnostics ??= flushedDiagnostics;
 	}

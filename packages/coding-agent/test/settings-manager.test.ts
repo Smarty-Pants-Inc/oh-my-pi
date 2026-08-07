@@ -421,6 +421,21 @@ describe("Settings", () => {
 			expect(getDefault("providers.maxInFlightRequests")).toEqual({});
 		});
 
+		it("seeds the CLIProxyAPI model connection profile", () => {
+			expect(Settings.isolated().get("modelConnections")).toEqual({
+				"cliproxyapi-default": {
+					id: "cliproxyapi-default",
+					model: { provider: "cliproxyapi", id: "gpt-5.6-terra" },
+				},
+			});
+			expect(getDefault("modelConnections")).toEqual({
+				"cliproxyapi-default": {
+					id: "cliproxyapi-default",
+					model: { provider: "cliproxyapi", id: "gpt-5.6-terra" },
+				},
+			});
+		});
+
 		it("exposes all tool calling mode options", () => {
 			const values = getEnumValues("tools.format");
 			expect(values).toEqual([

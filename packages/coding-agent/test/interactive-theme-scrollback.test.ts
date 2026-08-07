@@ -20,6 +20,7 @@ import { TUI } from "@oh-my-pi/pi-tui";
 import type { TerminalAppearance, TerminalAppearanceRequestToken } from "@oh-my-pi/pi-tui/terminal";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal";
+import { createTestRuntimeDependencies } from "./utilities";
 
 const MULTIPLEXER_ENV_KEYS = ["TMUX", "STY", "ZELLIJ", "CMUX_WORKSPACE_ID", "CMUX_SURFACE_ID", "TERM"] as const;
 
@@ -125,6 +126,7 @@ describe("InteractiveMode theme scrollback refresh", () => {
 			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
 			settings: Settings.isolated({ "startup.quiet": true }),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 		mode = new InteractiveMode(session, "test");
 		terminal = new AppearanceVirtualTerminal(100, 20);

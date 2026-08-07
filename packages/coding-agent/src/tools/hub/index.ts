@@ -25,12 +25,38 @@ import type {
 } from "@oh-my-pi/pi-agent-core";
 import type { ToolExample } from "@oh-my-pi/pi-ai";
 import type { Component } from "@oh-my-pi/pi-tui";
-import { prompt } from "@oh-my-pi/pi-utils";
+import { prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import type { RenderResultOptions } from "../../extensibility/custom-tools/types";
 import { IrcBus } from "../../irc/bus";
 import type { Theme } from "../../modes/theme/theme";
 import hubDescription from "../../prompts/tools/hub.md" with { type: "text" };
 import type { AgentRegistry } from "../../registry/agent-registry";
+import type { ISO8601, OperationId } from "../../registry/persistent-agent-contracts";
+import type { AgentSessionTransientTaskRuntimeAuthorityV1 } from "../../session/agent-session-types";
+import {
+	buildTransientTaskHubWaitMessageCanonicalRecordV1,
+	buildTransientTaskHubWaitMessagePreselectionStartupResumeRequestV1,
+	encodeTransientTaskHubWaitMessageNoSelectionReturnResultV1,
+	encodeTransientTaskHubWaitMessageReturnResultV1,
+	hashTransientTaskHubWaitMessageCanonicalRecordV1,
+	type ConfidentialTransientTaskHubSendAwaitOutboundPlanV1,
+	type ConfidentialTransientTaskHubSendAwaitOutboundReceiptV1,
+	type ConfidentialTransientTaskHubWaitConsumedMessageV1,
+	type ConfidentialTransientTaskHubWaitMessageCurrentParentSessionAuthorityV1,
+	type ConfidentialTransientTaskHubWaitMessageNoSelectionExitV1,
+	type ConfidentialTransientTaskHubWaitMessageNoSelectionReturnResultV1,
+	type ConfidentialTransientTaskHubWaitMessageReturnDeliveryReceiptV1,
+	type ConfidentialTransientTaskHubWaitMessageReturnTargetRegistrationReceiptV1,
+	type ConfidentialTransientTaskHubWaitMessageRetiredPlanAdoptionReceiptV1,
+	type ConfidentialTransientTaskHubWaitMessageSelectionResumePlanV1,
+	type ConfidentialTransientTaskHubWaitMessageSelectorInstallRequestV1,
+	type ConfidentialTransientTaskHubWaitMessageSourceSelectionResultV1,
+	type ConfidentialTransientTaskHubWaitMessageWinnerCaptureRequestV1,
+	type ConfidentialTransientTaskHubWaitMessageWinnerCompletionReceiptV1,
+	type ConfidentialTransientTaskHubWaitMessageWinnerContinuationV1,
+	type ConfidentialTransientTaskHubWaitMessageWinnerCurrentSelectorAuthorityV1,
+	type TransientTaskHubWaitDurableMessageSelectorV1,
+} from "../../session/workspace-runtime-contracts";
 import type { ToolSession } from "..";
 import {
 	buildJobResult,
@@ -53,7 +79,6 @@ import {
 	launchRenderResult,
 } from "./launch";
 import {
-	drainPendingInbox,
 	executeInbox,
 	executeList,
 	executeMessageWait,
@@ -62,6 +87,7 @@ import {
 	messagingRenderCall,
 	messagingRenderResult,
 	normalizeIrcTimeoutMs,
+	resolveMessageTimeoutMs,
 } from "./messaging";
 import { type HubDetails, type HubRenderArgs, hubErrorResult } from "./types";
 
@@ -123,8 +149,58 @@ interface MessagingDeps {
 	settings: ToolSession["settings"];
 }
 
-const PROGRESS_INTERVAL_MS = 500;
+interface ManagedHubLiveSession extends ToolSession {
+	supportsTransientTaskEnvironmentExecution(): boolean;
+	acquireTransientTaskRuntimeAuthority(): Promise<AgentSessionTransientTaskRuntimeAuthorityV1>;
+	selectPendingHubWaitMessage(
+		selector: ConfidentialTransientTaskHubWaitMessageSelectorInstallRequestV1,
+		select: TransientTaskHubWaitDurableMessageSelectorV1,
+		signal?: AbortSignal,
+	): Promise<ConfidentialTransientTaskHubWaitMessageSourceSelectionResultV1>;
+	installTransientTaskHubWaitMessageCompletion(input: {
+		readonly completionReceipt: ConfidentialTransientTaskHubWaitMessageWinnerCompletionReceiptV1;
+		readonly deliveryReceipt: ConfidentialTransientTaskHubWaitMessageReturnDeliveryReceiptV1;
+		readonly captureRequest: ConfidentialTransientTaskHubWaitMessageWinnerCaptureRequestV1;
+		readonly currentSelectorAuthority: ConfidentialTransientTaskHubWaitMessageWinnerCurrentSelectorAuthorityV1;
+	}): AgentToolResult<unknown>;
+	installTransientTaskHubWaitNoSelectionReturn(input: {
+		readonly retiredPlanAdoptionReceipt: ConfidentialTransientTaskHubWaitMessageRetiredPlanAdoptionReceiptV1;
+		readonly noSelectionReturnResult: ConfidentialTransientTaskHubWaitMessageNoSelectionReturnResultV1;
+		readonly toolResultMessageTimestamp: number;
+	}): AgentToolResult<unknown>;
+}
 
+interface ManagedHubRuntimeV1 {
+	readonly liveSession: ManagedHubLiveSession;
+	readonly runtime: AgentSessionTransientTaskRuntimeAuthorityV1;
+}
+
+interface ManagedHubPreparedInvocationV1 extends ManagedHubRuntimeV1 {
+	readonly currentAuthority: ConfidentialTransientTaskHubWaitMessageCurrentParentSessionAuthorityV1;
+	readonly registration: ConfidentialTransientTaskHubWaitMessageReturnTargetRegistrationReceiptV1;
+	readonly selector: ConfidentialTransientTaskHubWaitMessageSelectorInstallRequestV1;
+}
+
+interface ManagedHubSelectedCompletionV1 {
+	readonly completionReceipt: ConfidentialTransientTaskHubWaitMessageWinnerCompletionReceiptV1;
+	readonly deliveryReceipt: ConfidentialTransientTaskHubWaitMessageReturnDeliveryReceiptV1;
+	readonly captureRequest: ConfidentialTransientTaskHubWaitMessageWinnerCaptureRequestV1;
+	readonly currentSelectorAuthority: ConfidentialTransientTaskHubWaitMessageWinnerCurrentSelectorAuthorityV1;
+}
+
+function hubNow(): ISO8601 {
+	return new Date().toISOString() as ISO8601;
+}
+
+function hubOperationId(): OperationId {
+	return Snowflake.next() as OperationId;
+}
+
+function managedHubResult(result: AgentToolResult<unknown>): AgentToolResult<HubDetails> {
+	return result as AgentToolResult<HubDetails>;
+}
+
+const PROGRESS_INTERVAL_MS = 500;
 /** Mutating process ops require exec approval; messaging, jobs, and inspection are read-only. */
 function hubApproval(params: unknown): ToolApprovalDecision {
 	if (typeof params !== "object" || params === null || !("op" in params)) return "exec";
@@ -243,6 +319,185 @@ export class HubTool implements AgentTool<typeof hubSchema, HubDetails> {
 		return { registry, senderId, settings: this.session.settings };
 	}
 
+	async #managedHubRuntime(messaging: MessagingDeps): Promise<ManagedHubRuntimeV1 | null> {
+		const candidate = messaging.registry.get(messaging.senderId)?.session;
+		if (candidate === null || candidate === undefined || (candidate as unknown) !== this.session) return null;
+		if (
+			!("supportsTransientTaskEnvironmentExecution" in candidate) ||
+			typeof candidate.supportsTransientTaskEnvironmentExecution !== "function" ||
+			!("acquireTransientTaskRuntimeAuthority" in candidate) ||
+			typeof candidate.acquireTransientTaskRuntimeAuthority !== "function"
+		)
+			return null;
+		const liveSession = candidate as unknown as ManagedHubLiveSession;
+		if (!liveSession.supportsTransientTaskEnvironmentExecution()) return null;
+		const runtime = await liveSession.acquireTransientTaskRuntimeAuthority();
+		return runtime.hubWait.currentParentTaskLocator === null ? null : { liveSession, runtime };
+	}
+
+	async #recoverManagedHubBarriers(
+		runtime: AgentSessionTransientTaskRuntimeAuthorityV1,
+		currentAuthority: ConfidentialTransientTaskHubWaitMessageCurrentParentSessionAuthorityV1,
+		requestedAt: ISO8601,
+	): Promise<void> {
+		const preselectionEnumeration = buildTransientTaskHubWaitMessageCanonicalRecordV1(
+			"preselection-enumerate-request",
+			{ currentAuthority, requestedAt },
+		);
+		const preselection = await runtime.hubWait.preselectionStartupRecovery.resumeRegisteredMessageSelections(
+			buildTransientTaskHubWaitMessagePreselectionStartupResumeRequestV1({
+				currentAuthority,
+				enumeration: preselectionEnumeration,
+				requestedAt,
+			}),
+		);
+		if (preselection.status !== "resumed") throw new Error("Managed Hub preselection recovery is blocked");
+		const winnerEnumeration = buildTransientTaskHubWaitMessageCanonicalRecordV1("winner-recovery-enumerate-request", {
+			ownerId: currentAuthority.ownerId,
+			senderId: currentAuthority.senderId,
+			requestedAt,
+		});
+		const winners = await runtime.hubWait.winnerStartupRecovery.resumeMessageWinners(
+			buildTransientTaskHubWaitMessageCanonicalRecordV1("winner-startup-resume-request", {
+				enumeration: winnerEnumeration,
+				requestedAt,
+			}),
+		);
+		if (winners.status !== "resumed") throw new Error("Managed Hub winner recovery is blocked");
+	}
+
+	async #recoverManagedHubRegistration(
+		runtime: AgentSessionTransientTaskRuntimeAuthorityV1,
+		currentAuthority: ConfidentialTransientTaskHubWaitMessageCurrentParentSessionAuthorityV1,
+		selector: ConfidentialTransientTaskHubWaitMessageSelectorInstallRequestV1,
+		resumePlan: ConfidentialTransientTaskHubWaitMessageSelectionResumePlanV1,
+		afterToolCallPlanSha256: ConfidentialTransientTaskHubWaitMessageReturnTargetRegistrationReceiptV1["afterToolCallPlan"]["planSha256"],
+		preselectionClaimSha256: ConfidentialTransientTaskHubWaitMessageReturnTargetRegistrationReceiptV1["claim"]["claimSha256"],
+		registrationRequestSha256: ConfidentialTransientTaskHubWaitMessageReturnTargetRegistrationReceiptV1["registrationRequestSha256"],
+		recoveredAt: ISO8601,
+	): Promise<ConfidentialTransientTaskHubWaitMessageReturnTargetRegistrationReceiptV1> {
+		const inspectRequest = buildTransientTaskHubWaitMessageCanonicalRecordV1("preselection-inspect-request", {
+			currentAuthority,
+			hubWaitInvocationId: selector.key.hubWaitInvocationId,
+			keySha256: hashTransientTaskHubWaitMessageCanonicalRecordV1("winner-key", selector.key),
+			selectorInstallRequestSha256: selector.selectorInstallRequestSha256,
+			resumePlanSha256: resumePlan.resumePlanSha256,
+			returnTargetSha256: selector.returnTarget.returnTargetSha256,
+			afterToolCallPlanSha256,
+			preselectionClaimSha256,
+			registrationRequestSha256,
+			expectedRecoveryRefSha256: null,
+		});
+		const inspection = await runtime.hubWait.preselectionRecoveryStore.inspectRegisteredMessageSelection(inspectRequest);
+		if (inspection.status !== "registered_unselected") {
+			throw new Error(`Managed Hub registration recovery failed: ${inspection.status}`);
+		}
+		const adoption = await runtime.hubWait.preselectionRecoveryStore.adoptRegisteredMessageSelection(
+			buildTransientTaskHubWaitMessageCanonicalRecordV1("preselection-adopt-request", {
+				currentAuthority,
+				request: inspectRequest,
+				matchingInspection: inspection,
+				expectedInspectionSha256: inspection.inspectionSha256,
+				adoptedAt: recoveredAt,
+			}),
+		);
+		if (adoption.status !== "adopted" && adoption.status !== "already_adopted") {
+			throw new Error(`Managed Hub registration adoption failed: ${adoption.status}`);
+		}
+		const resumed = await runtime.hubWait.preselectionRecoveryStore.resumeRegisteredMessageSelection(
+			buildTransientTaskHubWaitMessageCanonicalRecordV1("preselection-resume-request", {
+				currentAuthority,
+				adoption: adoption.receipt,
+				resumedAt: recoveredAt,
+			}),
+		);
+		if (resumed.status !== "resumed") throw new Error(`Managed Hub registration resume failed: ${resumed.status}`);
+		return adoption.receipt.registration;
+	}
+
+	async #prepareManagedHubInvocation(
+		toolCallId: string,
+		managed: ManagedHubRuntimeV1,
+		fromFilter: string | null,
+		watchedJobIds: readonly string[],
+		resumePlan: ConfidentialTransientTaskHubWaitMessageSelectionResumePlanV1,
+		preparedAt: ISO8601,
+	): Promise<ManagedHubPreparedInvocationV1> {
+		const locator = managed.runtime.hubWait.currentParentTaskLocator;
+		if (locator === null) throw new Error("Managed Hub current-parent locator is unavailable");
+		const preparation = await managed.runtime.hubWait.claimMessageReturnPreparation(locator, toolCallId, preparedAt);
+		await this.#recoverManagedHubBarriers(managed.runtime, preparation.currentParentSessionAuthority, preparedAt);
+		const returnTarget = buildTransientTaskHubWaitMessageCanonicalRecordV1("return-target", {
+			schemaVersion: 1 as const,
+			serializerKey: preparation.currentParentSessionAuthority.serializerKey,
+			toolCallId,
+			toolName: "hub" as const,
+			returnDeliveryOperationId: hubOperationId(),
+		});
+		const key = buildTransientTaskHubWaitMessageCanonicalRecordV1("winner-key", {
+			schemaVersion: 1 as const,
+			hubWaitInvocationId: hubOperationId(),
+			ownerId: preparation.currentParentSessionAuthority.ownerId,
+			senderId: preparation.currentParentSessionAuthority.senderId,
+			fromFilter,
+			watchedJobIds,
+			returnTargetSha256: returnTarget.returnTargetSha256,
+		});
+		const selector = buildTransientTaskHubWaitMessageCanonicalRecordV1("selector-install-request", {
+			schemaVersion: 1 as const,
+			key,
+			returnTarget,
+			releaseAttemptPreparedAt: preparedAt,
+			completionOperationId: hubOperationId(),
+			selectionPreparedAt: preparedAt,
+		});
+		const claim = buildTransientTaskHubWaitMessageCanonicalRecordV1("preselection-claim", {
+			schemaVersion: 1 as const,
+			currentAuthority: preparation.currentParentSessionAuthority,
+			selector,
+			resumePlan,
+			returnTargetSha256: returnTarget.returnTargetSha256,
+			afterToolCallPlanSha256: preparation.afterToolCallPlan.planSha256,
+		});
+		const registrationRequest = buildTransientTaskHubWaitMessageCanonicalRecordV1(
+			"return-target-registration-request",
+			{
+				claim,
+				target: returnTarget,
+				afterToolCallPlan: preparation.afterToolCallPlan,
+				preparedAt,
+			},
+		);
+		let registration: ConfidentialTransientTaskHubWaitMessageReturnTargetRegistrationReceiptV1;
+		try {
+			const result = await managed.runtime.hubWait.returnTargetBridge.registerMessageReturnTarget(registrationRequest);
+			if (result.status !== "registered" && result.status !== "already_registered") {
+				throw new Error(`Managed Hub target registration failed: ${result.status}`);
+			}
+			registration = result.receipt;
+		} catch {
+			registration = await this.#recoverManagedHubRegistration(
+				managed.runtime,
+				preparation.currentParentSessionAuthority,
+				selector,
+				resumePlan,
+				preparation.afterToolCallPlan.planSha256,
+				claim.claimSha256,
+				registrationRequest.requestSha256,
+				preparedAt,
+			);
+		}
+		if (registration.claim.claimSha256 !== claim.claimSha256) {
+			throw new Error("Managed Hub target registration claim conflicts");
+		}
+		return {
+			...managed,
+			currentAuthority: preparation.currentParentSessionAuthority,
+			registration,
+			selector,
+		};
+	}
+
 	async execute(
 		_toolCallId: string,
 		params: HubParams,
@@ -288,7 +543,7 @@ export class HubTool implements AgentTool<typeof hubSchema, HubDetails> {
 			case "jobs": {
 				const manager = this.session.asyncJobManager;
 				if (!manager) return this.#asyncDisabled("jobs");
-				return executeJobsSnapshot(this.session, manager, this.#ownerId());
+				return await executeJobsSnapshot(this.session, manager, this.#ownerId());
 			}
 			case "start":
 			case "ps":
@@ -344,9 +599,11 @@ export class HubTool implements AgentTool<typeof hubSchema, HubDetails> {
 		const ownerId = this.#ownerId();
 		const from = params.from?.trim() || undefined;
 
-		// A message already buffered on the session satisfies the wait first.
+		// The owning AgentSession/IrcBridge claims buffered source state before a future bus waiter is parked.
 		if (messaging) {
-			const pending = drainPendingInbox(messaging.registry, messaging.senderId, from);
+			const pending = messaging.registry
+				.get(messaging.senderId)
+				?.session?.drainPendingIrcInboxMessages(messaging.senderId, { from, limit: 1 })[0];
 			if (pending) return messageResult(messaging.senderId, pending);
 		}
 

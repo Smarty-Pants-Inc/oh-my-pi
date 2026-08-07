@@ -30,6 +30,26 @@ export class WorkspaceMutationFence {
 		this.#accepting = false;
 	}
 
+	reset(): void {
+		if (this.#inFlight !== 0) {
+			throw new WorkspaceObjectError(
+				409,
+				"workspace_busy",
+				"Cannot reopen a mutation fence while operations are active",
+			);
+		}
+		this.#accepting = true;
+		this.#drained = undefined;
+	}
+
+	get accepting(): boolean {
+		return this.#accepting;
+	}
+
+	get inFlight(): number {
+		return this.#inFlight;
+	}
+
 	async waitForDrain(): Promise<void> {
 		if (this.#inFlight === 0) return;
 		this.#drained ??= Promise.withResolvers<void>();

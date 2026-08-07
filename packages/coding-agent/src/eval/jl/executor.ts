@@ -7,6 +7,7 @@ import {
 	executeWithKernelBase,
 	resolveOwnerScopedSessionKey,
 } from "../executor-base";
+import type { EvalAgentLifecycleContextV1 } from "../lifecycle";
 import { ensurePyToolBridge, type PyToolBridgeInfo } from "../py/tool-bridge";
 import type { EvalDisplayOutput, EvalStatusEvent } from "../types";
 import {
@@ -35,6 +36,7 @@ export interface JuliaExecutorOptions {
 	kernelOwnerId?: string;
 	reset?: boolean;
 	toolSession?: ToolSession;
+	evalAgentLifecycle?: EvalAgentLifecycleContextV1;
 	bridge?: PyToolBridgeInfo;
 	bridgeSessionId?: string;
 	artifactId?: string;

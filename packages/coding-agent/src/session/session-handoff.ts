@@ -54,7 +54,8 @@ export interface SessionHandoffHost {
 	beginBashSessionTransition(): BashSessionTransition;
 	markBashSessionTransition(transition: BashSessionTransition): void;
 	finishBashSessionTransition(transition: BashSessionTransition, success: boolean): void;
-	cancelOwnAsyncJobs(): void;
+	prepareSessionGenerationChange(): Promise<void>;
+	restoreSessionGenerationAfterFailedChange(): Promise<void>;
 	clearCheckpointRuntimeState(): void;
 	clearSessionScopedToolState(): void;
 	clearFreshProviderSessionId(): void;
@@ -128,6 +129,7 @@ export class SessionHandoff {
 		}
 
 		let advisorRecordersDetached = false;
+		let generationPrepared = false;
 		let sessionTransitioned = false;
 		try {
 			if (handoffSignal.aborted) {
@@ -234,8 +236,9 @@ export class SessionHandoff {
 			// observe message_end, then mute before opening the replacement session.
 			await this.#host.drainAndDetachAdvisorRecorders();
 			const bashTransition = this.#host.beginBashSessionTransition();
-			this.#host.cancelOwnAsyncJobs();
 			try {
+				await this.#host.prepareSessionGenerationChange();
+				generationPrepared = true;
 				await this.#host.sessionManager.newSession(
 					previousSessionFile ? { parentSession: previousSessionFile } : undefined,
 				);
@@ -247,6 +250,8 @@ export class SessionHandoff {
 				sessionTransitioned = true;
 			} finally {
 				this.#host.finishBashSessionTransition(bashTransition, sessionTransitioned);
+				if (generationPrepared && !sessionTransitioned)
+					await this.#host.restoreSessionGenerationAfterFailedChange();
 			}
 
 			this.#host.clearSessionScopedToolState();

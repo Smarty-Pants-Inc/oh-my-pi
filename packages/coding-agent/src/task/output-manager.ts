@@ -12,6 +12,68 @@
  */
 import * as fs from "node:fs/promises";
 import { ADVISOR_TRANSCRIPT_STEM } from "../advisor/transcript-recorder";
+import type {
+	TransientTaskOutcomePayloadByteBudgetV1,
+	TransientTaskResultlessRepresentabilityPreflightV1,
+	TransientTaskSingleResultOutcomeDocumentV1,
+} from "../session/workspace-runtime-contracts";
+import { encodeTransientTaskOutcomeDocumentV1 } from "./executor";
+
+export interface TransientTaskOutcomePayloadByteBudgetInputV1 {
+	readonly preflight: TransientTaskResultlessRepresentabilityPreflightV1;
+	readonly agentSource: "bundled" | "user" | "project";
+	readonly task: string;
+	readonly assignment?: string;
+	readonly modelOverride?: string | readonly string[];
+}
+
+/** Freeze the exact dispatch-known canonical envelope reserve before child dispatch. */
+export function createTransientTaskOutcomePayloadByteBudgetV1(
+	input: TransientTaskOutcomePayloadByteBudgetInputV1,
+): TransientTaskOutcomePayloadByteBudgetV1 {
+	const singleResult = {
+		index: input.preflight.identity.index,
+		id: input.preflight.identity.id,
+		agent: input.preflight.identity.agent,
+		agentSource: input.agentSource,
+		task: input.task,
+		...(input.assignment !== undefined ? { assignment: input.assignment } : {}),
+		exitCode: Number.MIN_SAFE_INTEGER,
+		output: "",
+		stderr: "",
+		truncated: false,
+		durationMs: Number.MAX_SAFE_INTEGER,
+		tokens: Number.MAX_SAFE_INTEGER,
+		requests: Number.MAX_SAFE_INTEGER,
+		...(input.modelOverride !== undefined
+			? {
+					modelOverride: Array.isArray(input.modelOverride)
+						? Object.freeze([...input.modelOverride])
+						: input.modelOverride,
+				}
+			: {}),
+		aborted: false,
+	};
+	const document: TransientTaskSingleResultOutcomeDocumentV1 = {
+		schemaVersion: 1,
+		documentKind: "single_result",
+		singleResult,
+		mergeSummary: "",
+		changesApplied: null,
+	};
+	const reservedCanonicalEnvelopeUtf8ByteLength = encodeTransientTaskOutcomeDocumentV1(document).byteLength;
+	const maximumUtf8ByteLength = input.preflight.maximumUtf8ByteLength;
+	return Object.freeze({
+		schemaVersion: 1,
+		maximumUtf8ByteLength,
+		requiredResultlessFallbackUtf8ByteLength: input.preflight.requiredResultlessFallbackUtf8ByteLength,
+		reservedCanonicalEnvelopeUtf8ByteLength,
+		availableCollectedValueUtf8ByteLength: Math.max(
+			0,
+			maximumUtf8ByteLength - reservedCanonicalEnvelopeUtf8ByteLength,
+		),
+	});
+}
 
 /**
  * Manages agent output ID allocation to ensure uniqueness.

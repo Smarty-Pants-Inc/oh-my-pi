@@ -2,6 +2,7 @@ import { DEFAULT_MAX_BYTES, OutputSink } from "../../session/streaming-output";
 import type { ToolSession } from "../../tools";
 import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../../tools/output-meta";
 import { isEvalTimeoutControlEvent } from "../bridge-timeout";
+import type { EvalAgentLifecycleContextV1 } from "../lifecycle";
 import { executeInVmContext, type JsDisplayOutput } from "./context-manager";
 import type { JsStatusEvent } from "./shared/types";
 
@@ -26,6 +27,7 @@ export interface JsExecutorOptions {
 	artifactPath?: string;
 	artifactId?: string;
 	session: ToolSession;
+	evalAgentLifecycle?: EvalAgentLifecycleContextV1;
 	/** On-disk roots the helpers substitute for internal-URL schemes (e.g. `local://`). */
 	localRoots?: Record<string, string>;
 }
@@ -105,6 +107,7 @@ export async function executeJs(code: string, options: JsExecutorOptions): Promi
 			ownerId: options.kernelOwnerId,
 			cwd: options.cwd ?? options.session.cwd,
 			session: options.session,
+			evalAgentLifecycle: options.evalAgentLifecycle,
 			localRoots: options.localRoots,
 			reset: options.reset,
 			code,

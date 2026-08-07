@@ -1,5 +1,144 @@
 import { describe, expect, test } from "bun:test";
-import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
+import { createHash } from "node:crypto";
+import { AsyncJobManager, type ManagedAsyncJobCompletionRow } from "@oh-my-pi/pi-coding-agent/async/job-manager";
+import type {
+	ConfidentialAsyncJobTransientTaskRecoveryOwnerSessionIndexV1,
+	TransientTaskAsyncJobCompletionHandoffV1,
+	TransientTaskParentResultDeliveryStoreV1,
+} from "@oh-my-pi/pi-coding-agent/session/workspace-runtime-contracts";
+
+const SHA = `sha256:${"a".repeat(64)}` as const;
+
+type ManagedRecoveryTestRecord = {
+	readonly coordinates: {
+		readonly ownerSessionIndex: ConfidentialAsyncJobTransientTaskRecoveryOwnerSessionIndexV1;
+		readonly jobId: string;
+		readonly agentId: string;
+		readonly label: string;
+		readonly startedAtEpochMs: number;
+	};
+	readonly recoveryRecordSha256: string;
+	readonly [key: string]: unknown;
+};
+
+function managedOwnerIndex(ownerId = "Main"): ConfidentialAsyncJobTransientTaskRecoveryOwnerSessionIndexV1 {
+	const core = {
+		schemaVersion: 1 as const,
+		ownerId,
+		ownerSessionId: "session-1",
+		ownerSessionGenerationSha256: SHA,
+		deliveryEpoch: 0,
+	};
+	return {
+		...core,
+		indexSha256: `sha256:${createHash("sha256")
+			.update(JSON.stringify(["async-job-owner-session-index", core]), "utf8")
+			.digest("hex")}` as typeof SHA,
+	};
+}
+
+function managedHandoff(
+	ownerId: string,
+	jobId: string,
+	text: string,
+	terminalStatus: "completed" | "cancelled" = "completed",
+) {
+	return {
+		schemaVersion: 1,
+		jobType: "task",
+		ownerId,
+		jobId,
+		notAppliedReceiptSha256: SHA,
+		handoffSha256: `sha256:${createHash("sha256").update(["managed-handoff", ownerId, jobId, text, terminalStatus].join("\0")).digest("hex")}`,
+		terminalStatus,
+		text,
+		jobErrorTextUtf8: terminalStatus === "cancelled" ? text : null,
+		attempt: {
+			attemptSha256: SHA,
+			operation: { request: { identity: { identitySha256: SHA }, settlementRequestSha256: SHA } },
+		},
+		settlementRequest: { sinkResultUtf8: text },
+		settledResultReceipt: { publishedAt: "2026-01-01T00:00:00.000Z" },
+		currentAuthority: {},
+	} as unknown as TransientTaskAsyncJobCompletionHandoffV1;
+}
+
+function managedRecord(
+	ownerSessionIndex: ConfidentialAsyncJobTransientTaskRecoveryOwnerSessionIndexV1,
+	jobId: string,
+	text: string,
+	startedAtEpochMs: number,
+	terminalStatus: "completed" | "cancelled" = "completed",
+): ManagedRecoveryTestRecord {
+	const completion = managedHandoff(ownerSessionIndex.ownerId, jobId, text, terminalStatus);
+	return {
+		schemaVersion: 1,
+		jobType: "task",
+		coordinates: { ownerSessionIndex, jobId, agentId: jobId, label: jobId, startedAtEpochMs },
+		recoveryState: "handoff_ready",
+		terminalStatus,
+		status: terminalStatus === "cancelled" ? "cancelled" : "completed",
+		resultText: terminalStatus === "cancelled" ? null : text,
+		errorText: terminalStatus === "cancelled" ? text : null,
+		transientTaskCompletion: completion,
+		transientTaskSettlementBlock: null,
+		notAppliedReceiptSha256: SHA,
+		blockSha256: null,
+		handoffSha256: completion.handoffSha256,
+		recoveryRecordSha256: SHA,
+	};
+}
+
+function committedManagedHandoff(row: ManagedAsyncJobCompletionRow) {
+	return { status: "committed", handoffSha256: row.transientTaskCompletion.handoffSha256 } as const;
+}
+
+function notAppliedManagedHandoff(row: ManagedAsyncJobCompletionRow) {
+	return { status: "not_applied", handoffSha256: row.transientTaskCompletion.handoffSha256 } as const;
+}
+
+function bindManagedRecoveryStore(
+	manager: AsyncJobManager,
+	ownerSessionIndex: ConfidentialAsyncJobTransientTaskRecoveryOwnerSessionIndexV1,
+	rows: Map<string, ManagedRecoveryTestRecord>,
+	options?: { readonly terminalJobIds?: ReadonlySet<string> },
+): void {
+	const store = {
+		detachedSettlement: {
+			prepareAsyncJobRecovery: async (request: { readonly record: ManagedRecoveryTestRecord }) => {
+				rows.set(request.record.coordinates.jobId, request.record);
+				return { status: "prepared", record: request.record };
+			},
+			transitionAsyncJobRecovery: async (request: { readonly record: ManagedRecoveryTestRecord }) => {
+				rows.set(request.record.coordinates.jobId, request.record);
+				return { status: "transitioned", record: request.record, receipt: {} };
+			},
+			enumerateAsyncJobRecovery: async () => ({
+				status: "matching",
+				entries: Array.from(rows.values()).map(record => ({
+					jobId: record.coordinates.jobId,
+					startedAtEpochMs: record.coordinates.startedAtEpochMs,
+					recoveryRecordSha256: record.recoveryRecordSha256,
+				})),
+			}),
+			inspectAsyncJobRecovery: async (request: { readonly jobId: string }) =>
+				options?.terminalJobIds?.has(request.jobId)
+					? { status: "terminal", terminalReceiptSha256: SHA }
+					: {
+							status: "matching",
+							entry: { jobId: request.jobId },
+						},
+			adoptAsyncJobRecovery: async (request: {
+				readonly inspection: { readonly entry: { readonly jobId: string } };
+			}) => ({
+				status: "adopted",
+				record: rows.get(request.inspection.entry.jobId)!,
+			}),
+		},
+	} as unknown as TransientTaskParentResultDeliveryStoreV1;
+	const bound = manager.bindTransientTaskParentResultDeliveryStore({ ownerSessionIndex, store });
+	if (bound.status !== "bound") throw new Error("Expected managed recovery store to bind");
+}
 
 describe("AsyncJobManager", () => {
 	test("forwards progress updates and delivers completion", async () => {
@@ -472,6 +611,117 @@ describe("AsyncJobManager", () => {
 		expect(manager.getJob("orphan-1")?.resultText).toBe("orphan result");
 	});
 
+	test("keeps plain registration while a managed task blocks and rehydrates only for its exact owner session", async () => {
+		const digest = `sha256:${"a".repeat(64)}` as `sha256:${string}`;
+		const ownerCore = {
+			schemaVersion: 1 as const,
+			ownerId: "Main",
+			ownerSessionId: "session-a",
+			ownerSessionGenerationSha256: digest,
+			deliveryEpoch: 7,
+		};
+		const ownerSessionIndex = {
+			...ownerCore,
+			indexSha256: `sha256:${createHash("sha256")
+				.update(JSON.stringify(["async-job-owner-session-index", ownerCore]), "utf8")
+				.digest("hex")}` as `sha256:${string}`,
+		};
+		let recoveryRecord: { readonly recoveryRecordSha256: string } | undefined;
+		let enumerated = 0;
+		const manager = new AsyncJobManager({ onJobComplete: () => {} });
+		const bound = manager.bindTransientTaskParentResultDeliveryStore({
+			ownerSessionIndex,
+			store: {
+				detachedSettlement: {
+					prepareAsyncJobRecovery: async (request: {
+						readonly record: { readonly recoveryRecordSha256: string };
+					}) => {
+						recoveryRecord = request.record;
+						return { status: "prepared", record: request.record } as never;
+					},
+					transitionAsyncJobRecovery: async (request: {
+						readonly record: { readonly recoveryRecordSha256: string };
+					}) => {
+						recoveryRecord = request.record;
+						return { status: "transitioned", record: request.record } as never;
+					},
+					enumerateAsyncJobRecovery: async (_request: unknown) => {
+						enumerated++;
+						return {
+							status: "matching",
+							entries: [{ jobId: "managed-1", recoveryRecordSha256: recoveryRecord!.recoveryRecordSha256 }],
+						} as never;
+					},
+					inspectAsyncJobRecovery: async (_request: unknown) =>
+						({ status: "terminal", terminalReceiptSha256: digest }) as never,
+				},
+			},
+		} as never);
+		expect(bound.status).toBe("bound");
+
+		const plainJobId = manager.register("bash", "plain", async () => "plain result");
+		const attempt = {
+			attemptSha256: digest,
+			operation: { request: { identity: { identitySha256: digest }, settlementRequestSha256: digest } },
+		};
+		const managedJobId = manager.registerTransientTask(
+			"managed",
+			async context => {
+				await context.freezeSettlementRecovery({
+					attempt,
+					terminalStatus: "completed",
+					text: "managed result",
+					jobErrorTextUtf8: null,
+					parentDeliveryRequest: {},
+					inspectRequest: {},
+				} as never);
+				return {
+					state: "blocked_indeterminate",
+					cancellationPolicy: "reject_preserve_block",
+					jobType: "task",
+					ownerId: "Main",
+					jobId: context.jobId,
+					blockedAt: new Date().toISOString(),
+					terminalStatus: "completed",
+					text: "managed result",
+					jobErrorTextUtf8: null,
+					attempt,
+					notAppliedReceipt: null,
+					inspectRequest: {},
+					blockSha256: digest,
+				} as never;
+			},
+			{
+				id: "managed-1",
+				agentId: "Worker",
+				...ownerCore,
+			},
+		);
+
+		await manager.getJob(plainJobId)!.promise;
+		await manager.getJob(managedJobId)!.promise;
+		expect(manager.getJob(plainJobId)).toMatchObject({ status: "completed", resultText: "plain result" });
+		expect(manager.getJob(managedJobId)).toMatchObject({
+			status: "running",
+			transientTaskSettlementManaged: true,
+		});
+		expect(manager.cancel(managedJobId)).toBe(false);
+
+		const wrongOwner = { ...ownerSessionIndex, ownerSessionId: "session-b" };
+		expect(
+			await manager.rehydrateTransientTaskSettlements({
+				ownerSessionIndex: wrongOwner,
+				requestedAt: new Date().toISOString(),
+			}),
+		).toEqual([{ status: "session_mismatch" }]);
+		expect(enumerated).toBe(0);
+
+		expect(
+			await manager.rehydrateTransientTaskSettlements({ ownerSessionIndex, requestedAt: new Date().toISOString() }),
+		).toEqual([{ status: "terminal", terminalReceiptSha256: digest }]);
+		expect(enumerated).toBe(1);
+	});
+
 	test("waitForOwnerJobs settles cancelled jobs and skips suppressed ones on request", async () => {
 		const manager = new AsyncJobManager({});
 		manager.register(
@@ -498,6 +748,334 @@ describe("AsyncJobManager", () => {
 		manager.cancelAll({ ownerId: "Sub" });
 		await expect(reap).resolves.toBe(true);
 		expect(manager.getJob("hung-1")?.status).toBe("cancelled");
+	});
+
+	test("notifies only after a durable managed handoff row is present", async () => {
+		const managed: string[] = [];
+		const manager = new AsyncJobManager({});
+		const ownerSessionIndex = managedOwnerIndex();
+		const rows = new Map<string, ManagedRecoveryTestRecord>();
+		manager.registerManagedCompletionSink("Main", row => {
+			managed.push(row.jobId);
+			return committedManagedHandoff(row);
+		});
+		bindManagedRecoveryStore(manager, ownerSessionIndex, rows);
+
+		await manager.rehydrateTransientTaskSettlements({
+			ownerSessionIndex,
+			requestedAt: "2026-01-01T00:00:01.000Z",
+		});
+		expect(managed).toEqual([]);
+
+		rows.set("live-managed-1", managedRecord(ownerSessionIndex, "live-managed-1", "frozen result", 1));
+		await manager.rehydrateTransientTaskSettlements({
+			ownerSessionIndex,
+			requestedAt: "2026-01-01T00:00:02.000Z",
+		});
+
+		expect(managed).toEqual(["live-managed-1"]);
+		expect(await manager.inspectSettledRow({ jobId: "live-managed-1", ownerId: "Main" })).toMatchObject({
+			status: "settled",
+		});
+	});
+
+	test("rehydrates retained handoffs in durable source order", async () => {
+		const manager = new AsyncJobManager({});
+		const ownerSessionIndex = managedOwnerIndex();
+		const rows = new Map([
+			["first", managedRecord(ownerSessionIndex, "first", "one", 1)],
+			["second", managedRecord(ownerSessionIndex, "second", "two", 2)],
+		]);
+		const delivered: string[] = [];
+		manager.registerManagedCompletionSink("Main", row => {
+			delivered.push(row.jobId);
+			return committedManagedHandoff(row);
+		});
+		bindManagedRecoveryStore(manager, ownerSessionIndex, rows);
+
+		await manager.rehydrateTransientTaskSettlements({ ownerSessionIndex, requestedAt: "2026-01-01T00:00:01.000Z" });
+		expect(delivered).toEqual(["first", "second"]);
+	});
+
+	test("keeps an explicitly not-applied handoff at the owner queue head", async () => {
+		const manager = new AsyncJobManager({});
+		const ownerSessionIndex = managedOwnerIndex();
+		const rows = new Map([
+			["first", managedRecord(ownerSessionIndex, "first", "one", 1)],
+			["second", managedRecord(ownerSessionIndex, "second", "two", 2)],
+		]);
+		bindManagedRecoveryStore(manager, ownerSessionIndex, rows);
+		await manager.rehydrateTransientTaskSettlements({ ownerSessionIndex, requestedAt: "2026-01-01T00:00:01.000Z" });
+
+		const firstAttempt = Promise.withResolvers<void>();
+		const attempted: string[] = [];
+		const release = manager.registerManagedCompletionSink("Main", row => {
+			attempted.push(row.jobId);
+			firstAttempt.resolve();
+			return notAppliedManagedHandoff(row);
+		});
+		await firstAttempt.promise;
+		await Promise.resolve();
+		expect(attempted).toEqual(["first"]);
+		await release();
+
+		const delivered: string[] = [];
+		const drained = Promise.withResolvers<void>();
+		const rebound = manager.registerManagedCompletionSink("Main", row => {
+			delivered.push(row.jobId);
+			if (delivered.length === 2) drained.resolve();
+			return committedManagedHandoff(row);
+		});
+		await drained.promise;
+		expect(delivered).toEqual(["first", "second"]);
+		await rebound();
+	});
+
+	test("retries an ambiguously rejected handoff idempotently before later work", async () => {
+		const manager = new AsyncJobManager({});
+		const ownerSessionIndex = managedOwnerIndex();
+		const rows = new Map([
+			["first", managedRecord(ownerSessionIndex, "first", "one", 1)],
+			["second", managedRecord(ownerSessionIndex, "second", "two", 2)],
+		]);
+		bindManagedRecoveryStore(manager, ownerSessionIndex, rows);
+		await manager.rehydrateTransientTaskSettlements({ ownerSessionIndex, requestedAt: "2026-01-01T00:00:01.000Z" });
+
+		const committed = new Set<string>();
+		let effectCount = 0;
+		const ambiguousAttempt = Promise.withResolvers<void>();
+		const release = manager.registerManagedCompletionSink("Main", row => {
+			if (!committed.has(row.transientTaskCompletion.handoffSha256)) {
+				committed.add(row.transientTaskCompletion.handoffSha256);
+				effectCount += 1;
+			}
+			ambiguousAttempt.resolve();
+			throw new Error("commit acknowledgement lost");
+		});
+		await ambiguousAttempt.promise;
+		await release();
+
+		const delivered: string[] = [];
+		const drained = Promise.withResolvers<void>();
+		const rebound = manager.registerManagedCompletionSink("Main", row => {
+			if (!committed.has(row.transientTaskCompletion.handoffSha256)) {
+				committed.add(row.transientTaskCompletion.handoffSha256);
+				effectCount += 1;
+			}
+			delivered.push(row.jobId);
+			if (delivered.length === 2) drained.resolve();
+			return committedManagedHandoff(row);
+		});
+		await drained.promise;
+		expect(delivered).toEqual(["first", "second"]);
+		expect(effectCount).toBe(2);
+		await rebound();
+	});
+
+	test("fences the exact managed sink binding before allowing replacement", async () => {
+		const manager = new AsyncJobManager({});
+		const ownerSessionIndex = managedOwnerIndex();
+		const rows = new Map([["retained", managedRecord(ownerSessionIndex, "retained", "one", 1)]]);
+		bindManagedRecoveryStore(manager, ownerSessionIndex, rows);
+		await manager.rehydrateTransientTaskSettlements({ ownerSessionIndex, requestedAt: "2026-01-01T00:00:01.000Z" });
+
+		const oldStarted = Promise.withResolvers<void>();
+		const oldGate = Promise.withResolvers<void>();
+		const release = manager.registerManagedCompletionSink("Main", async row => {
+			oldStarted.resolve();
+			await oldGate.promise;
+			return committedManagedHandoff(row);
+		});
+		await oldStarted.promise;
+		const fence = release();
+		expect(() => manager.registerManagedCompletionSink("Main", committedManagedHandoff)).toThrow(
+			"Managed completion sink is already registered for owner: Main",
+		);
+		oldGate.resolve();
+		await fence;
+
+		const replacementDelivered = Promise.withResolvers<void>();
+		const rebound = manager.registerManagedCompletionSink("Main", row => {
+			replacementDelivered.resolve();
+			return committedManagedHandoff(row);
+		});
+		await release();
+		expect(() => manager.registerManagedCompletionSink("Main", committedManagedHandoff)).toThrow(
+			"Managed completion sink is already registered for owner: Main",
+		);
+		await replacementDelivered.promise;
+		await rebound();
+	});
+
+	test("dispose fences managed replay and rejects later registration", async () => {
+		const manager = new AsyncJobManager({});
+		const ownerSessionIndex = managedOwnerIndex();
+		const rows = new Map([["retained", managedRecord(ownerSessionIndex, "retained", "one", 1)]]);
+		bindManagedRecoveryStore(manager, ownerSessionIndex, rows);
+		await manager.rehydrateTransientTaskSettlements({ ownerSessionIndex, requestedAt: "2026-01-01T00:00:01.000Z" });
+
+		const callbackStarted = Promise.withResolvers<void>();
+		const callbackGate = Promise.withResolvers<void>();
+		let callbackFinished = false;
+		manager.registerManagedCompletionSink("Main", async row => {
+			callbackStarted.resolve();
+			await callbackGate.promise;
+			callbackFinished = true;
+			return committedManagedHandoff(row);
+		});
+		await callbackStarted.promise;
+		let disposeSettled = false;
+		const disposing = manager.dispose({ timeoutMs: 1_000 }).then(result => {
+			disposeSettled = true;
+			return result;
+		});
+		await Promise.resolve();
+		expect(disposeSettled).toBe(false);
+		callbackGate.resolve();
+		expect(await disposing).toBe(true);
+		expect(callbackFinished).toBe(true);
+		expect(() => manager.registerManagedCompletionSink("Main", committedManagedHandoff)).toThrow(
+			"Async job manager is disposed",
+		);
+	});
+
+	test("fails closed without mutating an unrelated colliding job", async () => {
+		const manager = new AsyncJobManager({});
+		const foreignId = manager.register("bash", "foreign", async () => "foreign result", {
+			id: "collision",
+			ownerId: "Other",
+			agentId: "Other",
+		});
+		await manager.getJob(foreignId)!.promise;
+		const foreign = manager.getJob(foreignId)!;
+		const ownerSessionIndex = managedOwnerIndex();
+		const rows = new Map([[foreignId, managedRecord(ownerSessionIndex, foreignId, "managed result", 1)]]);
+		bindManagedRecoveryStore(manager, ownerSessionIndex, rows);
+
+		expect(
+			await manager.rehydrateTransientTaskSettlements({
+				ownerSessionIndex,
+				requestedAt: "2026-01-01T00:00:01.000Z",
+			}),
+		).toEqual([{ status: "conflict" }]);
+		expect(manager.getJob(foreignId)).toBe(foreign);
+		expect(foreign).toMatchObject({ ownerId: "Other", agentId: "Other", resultText: "foreign result" });
+		expect(foreign.transientTaskRecoveryRecord).toBeUndefined();
+	});
+
+	test("fails closed on a recovery identity collision for the same managed job", async () => {
+		const manager = new AsyncJobManager({});
+		const ownerSessionIndex = managedOwnerIndex();
+		const original = managedRecord(ownerSessionIndex, "collision", "one", 1);
+		const rows = new Map([["collision", original]]);
+		bindManagedRecoveryStore(manager, ownerSessionIndex, rows);
+		await manager.rehydrateTransientTaskSettlements({ ownerSessionIndex, requestedAt: "2026-01-01T00:00:01.000Z" });
+		rows.set("collision", { ...original, recoveryRecordSha256: `sha256:${"b".repeat(64)}` });
+
+		expect(
+			await manager.rehydrateTransientTaskSettlements({
+				ownerSessionIndex,
+				requestedAt: "2026-01-01T00:00:02.000Z",
+			}),
+		).toEqual([{ status: "conflict" }]);
+		expect(manager.getJob("collision")?.transientTaskRecoveryRecord?.recoveryRecordSha256).toBe(SHA);
+	});
+
+	test("queues the complete retained snapshot before a live settlement", async () => {
+		const manager = new AsyncJobManager({});
+		const ownerSessionIndex = managedOwnerIndex();
+		const rows = new Map([
+			["first", managedRecord(ownerSessionIndex, "first", "one", 1)],
+			["second", managedRecord(ownerSessionIndex, "second", "two", 2)],
+		]);
+		bindManagedRecoveryStore(manager, ownerSessionIndex, rows);
+		await manager.rehydrateTransientTaskSettlements({ ownerSessionIndex, requestedAt: "2026-01-01T00:00:01.000Z" });
+
+		const firstStarted = Promise.withResolvers<void>();
+		const firstGate = Promise.withResolvers<void>();
+		const delivered: string[] = [];
+		const release = manager.registerManagedCompletionSink("Main", async row => {
+			delivered.push(row.jobId);
+			if (row.jobId === "first") {
+				firstStarted.resolve();
+				await firstGate.promise;
+			}
+			return committedManagedHandoff(row);
+		});
+		await firstStarted.promise;
+		const live = managedRecord(ownerSessionIndex, "live", "three", 3);
+		rows.set("live", live);
+		const liveResume = manager.resumeTransientTaskSettlement({
+			ownerSessionIndex,
+			jobId: "live",
+			expectedRecoveryRecordSha256: SHA,
+			requestedAt: "2026-01-01T00:00:02.000Z",
+		});
+		await Promise.resolve();
+		await Promise.resolve();
+		firstGate.resolve();
+		expect(await liveResume).toMatchObject({ status: "settled" });
+		expect(delivered).toEqual(["first", "second", "live"]);
+		await release();
+	});
+
+	test("reclaims delivered digests only after safe managed eviction", async () => {
+		const manager = new AsyncJobManager({});
+		const ownerSessionIndex = managedOwnerIndex();
+		const rows = new Map([["reclaim", managedRecord(ownerSessionIndex, "reclaim", "one", 1)]]);
+		const terminalJobIds = new Set<string>();
+		bindManagedRecoveryStore(manager, ownerSessionIndex, rows, { terminalJobIds });
+
+		let deliveryCount = 0;
+		const firstRelease = manager.registerManagedCompletionSink("Main", row => {
+			deliveryCount += 1;
+			return committedManagedHandoff(row);
+		});
+		await manager.rehydrateTransientTaskSettlements({ ownerSessionIndex, requestedAt: "2026-01-01T00:00:01.000Z" });
+		expect(deliveryCount).toBe(1);
+		await firstRelease();
+
+		terminalJobIds.add("reclaim");
+		expect(
+			await manager.reconcileTransientTaskSessionCutover({
+				ownerSessionIndex,
+				requestedAt: "2026-01-01T00:00:02.000Z",
+			}),
+		).toEqual({ status: "ready", evictedTerminalJobIds: ["reclaim"] });
+		terminalJobIds.delete("reclaim");
+		await manager.rehydrateTransientTaskSettlements({ ownerSessionIndex, requestedAt: "2026-01-01T00:00:03.000Z" });
+
+		const replayed = Promise.withResolvers<void>();
+		const secondRelease = manager.registerManagedCompletionSink("Main", row => {
+			deliveryCount += 1;
+			replayed.resolve();
+			return committedManagedHandoff(row);
+		});
+		await replayed.promise;
+		expect(deliveryCount).toBe(2);
+		await secondRelease();
+	});
+
+	test("never notifies managed sinks for cancelled durable rows", async () => {
+		const manager = new AsyncJobManager({});
+		const ownerSessionIndex = managedOwnerIndex();
+		const rows = new Map([["cancelled", managedRecord(ownerSessionIndex, "cancelled", "cancelled", 1, "cancelled")]]);
+		const delivered: string[] = [];
+		manager.registerManagedCompletionSink("Main", row => {
+			delivered.push(row.jobId);
+			return committedManagedHandoff(row);
+		});
+		bindManagedRecoveryStore(manager, ownerSessionIndex, rows);
+
+		await manager.rehydrateTransientTaskSettlements({
+			ownerSessionIndex,
+			requestedAt: "2026-01-01T00:00:01.000Z",
+		});
+
+		expect(delivered).toEqual([]);
+		expect(await manager.inspectSettledRow({ jobId: "cancelled", ownerId: "Main" })).toMatchObject({
+			status: "settled",
+		});
 	});
 });
 

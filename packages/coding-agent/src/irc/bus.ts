@@ -15,10 +15,24 @@
  * generates an ephemeral side-channel auto-reply.
  */
 
+import { createHash } from "node:crypto";
 import { logger, Snowflake } from "@oh-my-pi/pi-utils";
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
+import type { ISO8601, Sha256Ref } from "../registry/persistent-agent-contracts.js";
 import type { CustomMessage } from "../session/messages";
+import {
+	buildTransientTaskHubWaitMessageCanonicalRecordV1,
+	type ConfidentialTransientTaskHubSendAwaitTargetDeliverySourceMaterializationPlanV1,
+	type ConfidentialTransientTaskHubSendAwaitTargetDeliverySourceMaterializationReceiptV1,
+	type ConfidentialTransientTaskHubWaitConsumedMessageV1,
+	type ConfidentialTransientTaskHubWaitDurableMessageSelectorDecisionV1,
+	type ConfidentialTransientTaskHubWaitMessageSelectorInstallRequestV1,
+	type ConfidentialTransientTaskHubWaitMessageSourceSelectionResultV1,
+	canonicalRuntimeSha256,
+	type TransientTaskHubWaitDurableMessageSelectorV1,
+	type TransientTaskHubWaitIrcBusSelectionBridgeV1,
+} from "../session/workspace-runtime-contracts";
 
 export interface IrcMessage {
 	id: string;
@@ -40,14 +54,19 @@ export interface IrcDeliveryReceipt {
 
 interface IrcWaiter {
 	from?: string;
-	resolve: (msg: IrcMessage) => void;
+	offered: boolean;
+	hubSelector?: ConfidentialTransientTaskHubWaitMessageSelectorInstallRequestV1;
+	preselectionClaimSha256?: Sha256Ref;
+	currentAuthoritySha256?: Sha256Ref;
+	decision?: ConfidentialTransientTaskHubWaitDurableMessageSelectorDecisionV1;
+	offer: (msg: IrcMessage) => Promise<"consumed" | "pass" | "blocked">;
 	cancel: () => void;
 }
 
 /** Mailbox cap per agent; oldest messages are dropped beyond it. */
 const MAILBOX_CAP = 100;
 
-export class IrcBus {
+export class IrcBus implements TransientTaskHubWaitIrcBusSelectionBridgeV1 {
 	static #global: IrcBus | undefined;
 
 	static global(): IrcBus {
@@ -65,6 +84,11 @@ export class IrcBus {
 	readonly #registry: AgentRegistry;
 	readonly #lifecycle: () => AgentLifecycleManager;
 	readonly #mailboxes = new Map<string, IrcMessage[]>();
+	#hubWaiterRevision = 0;
+	readonly #hubWaiterSelections = new Map<
+		string,
+		ConfidentialTransientTaskHubSendAwaitTargetDeliverySourceMaterializationReceiptV1
+	>();
 	readonly #waiters = new Map<string, IrcWaiter[]>();
 
 	constructor(registry: AgentRegistry = AgentRegistry.global(), lifecycle?: AgentLifecycleManager) {
@@ -160,14 +184,30 @@ export class IrcBus {
 			}
 		}
 
-		// A pending `wait` from the recipient consumes the message directly —
-		// it is returned from their irc tool call and never hits the inbox or
-		// the session injection path.
-		const waiter = this.#takeMatchingWaiter(message.to, message.from);
+		// A pending waiter receives first refusal, but source ownership is retained
+		// until its offer resolves. Durable Hub waiters run their selector before
+		// this method acknowledges, removes, relays, or hands the candidate onward.
+		const waiter = this.#claimMatchingWaiter(message.to, message.from);
 		if (waiter) {
-			waiter.resolve(message);
-			if (!opts?.suppressRelay) this.#relayToMainUi(message);
-			return { to: message.to, outcome: revived ? "revived" : "injected" };
+			let disposition: "consumed" | "pass" | "blocked";
+			try {
+				disposition = await waiter.offer(message);
+			} catch (error) {
+				this.#enqueue(message);
+				return {
+					to: message.to,
+					outcome: "failed",
+					error: error instanceof Error ? error.message : String(error),
+				};
+			}
+			if (disposition === "consumed") {
+				if (!opts?.suppressRelay) this.#relayToMainUi(message);
+				return { to: message.to, outcome: revived ? "revived" : "injected" };
+			}
+			if (disposition === "blocked") {
+				this.#enqueue(message);
+				return { to: message.to, outcome: "failed", error: "Hub message selection is durably indeterminate." };
+			}
 		}
 
 		const session = this.#registry.get(message.to)?.session;
@@ -249,7 +289,11 @@ export class IrcBus {
 
 		const waiter: IrcWaiter = {
 			from: filter.from,
-			resolve: msg => settle({ kind: "message", msg }),
+			offered: false,
+			offer: async msg => {
+				settle({ kind: "message", msg });
+				return "consumed";
+			},
 			cancel: () => cleanup(),
 		};
 
@@ -321,14 +365,14 @@ export class IrcBus {
 		}
 	}
 
-	/** Resolve the OLDEST waiter for `agentId` whose from-filter accepts `from`. */
-	#takeMatchingWaiter(agentId: string, from: string): IrcWaiter | undefined {
+	/** Claim the oldest matching waiter without removing it before its offer settles. */
+	#claimMatchingWaiter(agentId: string, from: string): IrcWaiter | undefined {
 		const waiters = this.#waiters.get(agentId);
 		if (!waiters) return undefined;
-		const index = waiters.findIndex(waiter => !waiter.from || waiter.from === from);
-		if (index === -1) return undefined;
-		const [waiter] = waiters.splice(index, 1);
-		if (waiters.length === 0) this.#waiters.delete(agentId);
+		const waiter = waiters.find(candidate => !candidate.offered && (!candidate.from || candidate.from === from));
+		if (!waiter) return undefined;
+		waiter.offered = true;
+		this.#hubWaiterRevision += 1;
 		return waiter;
 	}
 
@@ -337,7 +381,323 @@ export class IrcBus {
 		if (!waiters) return;
 		const index = waiters.indexOf(waiter);
 		if (index !== -1) waiters.splice(index, 1);
+		this.#hubWaiterRevision += 1;
 		if (waiters.length === 0) this.#waiters.delete(agentId);
+	}
+
+	#peekFromMailbox(agentId: string, from?: string): IrcMessage | undefined {
+		const mailbox = this.#mailboxes.get(agentId);
+		if (!mailbox || mailbox.length === 0) return undefined;
+		return from ? mailbox.find(message => message.from === from) : mailbox[0];
+	}
+
+	#removeMailboxMessage(agentId: string, expected: IrcMessage): boolean {
+		const mailbox = this.#mailboxes.get(agentId);
+		if (!mailbox) return false;
+		const index = mailbox.indexOf(expected);
+		if (index === -1) return false;
+		mailbox.splice(index, 1);
+		if (mailbox.length === 0) this.#mailboxes.delete(agentId);
+		return true;
+	}
+
+	async #hubCandidate(message: IrcMessage): Promise<ConfidentialTransientTaskHubWaitConsumedMessageV1> {
+		const core = {
+			schemaVersion: 1 as const,
+			id: message.id,
+			from: message.from,
+			to: message.to,
+			body: message.body,
+			ts: message.ts,
+			replyTo: message.replyTo ?? null,
+		};
+		return {
+			...core,
+			messageSha256: `sha256:${await canonicalRuntimeSha256([
+				"omp-transient-task-hub-wait-v1",
+				"hub_wait_consumed_message",
+				1,
+				core.id,
+				core.from,
+				core.to,
+				core.body,
+				core.ts,
+				core.replyTo,
+			])}`,
+		};
+	}
+
+	async waitForHubMessageWithDurableSelection(
+		selector: ConfidentialTransientTaskHubWaitMessageSelectorInstallRequestV1,
+		preselectionClaimSha256: Sha256Ref,
+		currentAuthoritySha256: Sha256Ref,
+		timeoutMs: number,
+		select: TransientTaskHubWaitDurableMessageSelectorV1,
+		signal?: AbortSignal,
+	): Promise<ConfidentialTransientTaskHubWaitMessageSourceSelectionResultV1> {
+		const agentId = selector.key.senderId;
+		const from = selector.key.fromFilter ?? undefined;
+		const closeWithoutCandidate = (
+			status: "timeout_before_selection" | "cancelled_before_selection",
+		): ConfidentialTransientTaskHubWaitMessageSourceSelectionResultV1 => ({
+			status,
+			key: selector.key,
+			selectorInstallRequestSha256: selector.selectorInstallRequestSha256,
+		});
+		if (signal?.aborted) return closeWithoutCandidate("cancelled_before_selection");
+
+		const pending = this.#peekFromMailbox(agentId, from);
+		if (pending) {
+			const decision = await select(await this.#hubCandidate(pending));
+			if (
+				decision.status === "selected" ||
+				decision.status === "already_selected" ||
+				decision.status === "adopted"
+			) {
+				if (!this.#removeMailboxMessage(agentId, pending)) {
+					throw new Error("Hub-selected IRC mailbox candidate changed before dequeue");
+				}
+			}
+			return decision;
+		}
+
+		const { promise, resolve, reject } =
+			Promise.withResolvers<ConfidentialTransientTaskHubWaitMessageSourceSelectionResultV1>();
+		let timer: NodeJS.Timeout | undefined;
+		let onAbort: (() => void) | undefined;
+		let unsubscribeLiveness: (() => void) | undefined;
+		let settled = false;
+		const cleanup = (): void => {
+			this.#removeWaiter(agentId, waiter);
+			clearTimeout(timer);
+			if (signal && onAbort) signal.removeEventListener("abort", onAbort);
+			unsubscribeLiveness?.();
+		};
+		const finish = (result: ConfidentialTransientTaskHubWaitMessageSourceSelectionResultV1): void => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			resolve(result);
+		};
+		const fail = (error: unknown): void => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			reject(error);
+		};
+		const waiter: IrcWaiter = {
+			from,
+			offered: false,
+			offer: async message => {
+				let decision: ConfidentialTransientTaskHubWaitDurableMessageSelectorDecisionV1;
+				try {
+					decision = await select(await this.#hubCandidate(message));
+				} catch (error) {
+					fail(error);
+					throw error;
+				}
+				waiter.decision = decision;
+				finish(decision);
+				return decision.status === "selected" ||
+					decision.status === "already_selected" ||
+					decision.status === "adopted"
+					? "consumed"
+					: decision.status === "blocked_indeterminate"
+						? "blocked"
+						: "pass";
+			},
+			hubSelector: selector,
+			preselectionClaimSha256,
+			currentAuthoritySha256,
+			cancel: () => finish(closeWithoutCandidate("cancelled_before_selection")),
+		};
+		let waiters = this.#waiters.get(agentId);
+		if (!waiters) {
+			waiters = [];
+			this.#waiters.set(agentId, waiters);
+		}
+		waiters.push(waiter);
+		this.#hubWaiterRevision += 1;
+		if (signal) {
+			onAbort = () => finish(closeWithoutCandidate("cancelled_before_selection"));
+			signal.addEventListener("abort", onAbort, { once: true });
+		}
+		if (timeoutMs > 0) {
+			timer = setTimeout(() => finish(closeWithoutCandidate("timeout_before_selection")), timeoutMs);
+			timer.unref?.();
+		}
+		const hasRunningSender = (candidate?: string): boolean =>
+			this.#registry
+				.listVisibleTo(agentId)
+				.some(ref => ref.status === "running" && (!candidate || ref.id === candidate));
+		const checkLiveness = (): void => {
+			if (from ? hasRunningSender(from) : hasRunningSender()) return;
+			if (from) {
+				const errorTextUtf8 = `IRC wait aborted: agent "${from}" is not running` as const;
+				finish({
+					status: "peer_liveness_ended_before_selection",
+					peerLivenessExit: {
+						reason: "filtered_sender_not_running",
+						fromFilter: from,
+						errorTextUtf8,
+						errorTextUtf8Sha256: `sha256:${createHash("sha256").update(errorTextUtf8, "utf8").digest("hex")}`,
+						errorTextUtf8ByteLength: Buffer.byteLength(errorTextUtf8, "utf8"),
+					},
+					key: selector.key,
+					selectorInstallRequestSha256: selector.selectorInstallRequestSha256,
+				});
+				return;
+			}
+			const errorTextUtf8 = "IRC wait aborted: no running peers remain" as const;
+			finish({
+				status: "peer_liveness_ended_before_selection",
+				peerLivenessExit: {
+					reason: "no_running_peers",
+					fromFilter: null,
+					errorTextUtf8,
+					errorTextUtf8Sha256: `sha256:${createHash("sha256").update(errorTextUtf8, "utf8").digest("hex")}`,
+					errorTextUtf8ByteLength: Buffer.byteLength(errorTextUtf8, "utf8"),
+				},
+				key: selector.key,
+				selectorInstallRequestSha256: selector.selectorInstallRequestSha256,
+			});
+		};
+		unsubscribeLiveness = this.#registry.onChange(checkLiveness);
+		checkLiveness();
+		return promise;
+	}
+
+	#hubWaiterAuthority(agentId: string): { readonly authoritySha256: Sha256Ref; readonly revision: number } {
+		const members = (this.#waiters.get(agentId) ?? [])
+			.filter(waiter => waiter.hubSelector && waiter.preselectionClaimSha256 && waiter.currentAuthoritySha256)
+			.map(
+				waiter =>
+					[
+						waiter.hubSelector!.selectorInstallRequestSha256,
+						waiter.preselectionClaimSha256!,
+						waiter.currentAuthoritySha256!,
+						waiter.offered,
+					] as const,
+			)
+			.sort((left, right) => left[0].localeCompare(right[0]));
+		return {
+			authoritySha256: `sha256:${createHash("sha256")
+				.update(
+					JSON.stringify([
+						"omp-hub-send-await-outbound-v1",
+						"waiter-selector-authority",
+						1,
+						agentId,
+						this.#hubWaiterRevision,
+						members,
+					]),
+					"utf8",
+				)
+				.digest("hex")}`,
+			revision: this.#hubWaiterRevision,
+		};
+	}
+
+	observeHubSendAwaitTargetWaiter(
+		agentId: string,
+		from: string,
+	): {
+		readonly authority: { readonly authoritySha256: Sha256Ref; readonly revision: number };
+		readonly selector: ConfidentialTransientTaskHubWaitMessageSelectorInstallRequestV1 | null;
+		readonly preselectionClaimSha256: Sha256Ref | null;
+		readonly currentAuthoritySha256: Sha256Ref | null;
+	} {
+		const waiter = (this.#waiters.get(agentId) ?? []).find(
+			candidate =>
+				!candidate.offered &&
+				candidate.hubSelector !== undefined &&
+				candidate.preselectionClaimSha256 !== undefined &&
+				candidate.currentAuthoritySha256 !== undefined &&
+				(candidate.from === undefined || candidate.from === from),
+		);
+		return {
+			authority: this.#hubWaiterAuthority(agentId),
+			selector: waiter?.hubSelector ?? null,
+			preselectionClaimSha256: waiter?.preselectionClaimSha256 ?? null,
+			currentAuthoritySha256: waiter?.currentAuthoritySha256 ?? null,
+		};
+	}
+
+	hasExactHubWaiterOwnership(
+		agentId: string,
+		selectorInstallRequestSha256: string,
+		preselectionClaimSha256: Sha256Ref,
+		currentAuthoritySha256: Sha256Ref,
+	): boolean {
+		return (this.#waiters.get(agentId) ?? []).some(
+			waiter =>
+				waiter.hubSelector?.selectorInstallRequestSha256 === selectorInstallRequestSha256 &&
+				waiter.preselectionClaimSha256 === preselectionClaimSha256 &&
+				waiter.currentAuthoritySha256 === currentAuthoritySha256,
+		);
+	}
+
+	async dispatchExactHubSendAwaitTargetWaiter(
+		plan: Extract<
+			ConfidentialTransientTaskHubSendAwaitTargetDeliverySourceMaterializationPlanV1,
+			{ route: "waiter_selector" }
+		>,
+		message: IrcMessage,
+		materializedAt: ISO8601,
+	): Promise<ConfidentialTransientTaskHubSendAwaitTargetDeliverySourceMaterializationReceiptV1> {
+		const current = this.#hubWaiterAuthority(message.to);
+		if (
+			current.authoritySha256 !== plan.sourcePermit.waiterSelectorAuthority.authoritySha256 ||
+			current.revision !== plan.sourcePermit.waiterSelectorAuthority.revision
+		) {
+			throw new Error("Hub send-await target waiter authority changed before dispatch");
+		}
+		const waiter = (this.#waiters.get(message.to) ?? []).find(
+			candidate =>
+				!candidate.offered &&
+				candidate.hubSelector?.selectorInstallRequestSha256 === plan.selector.selectorInstallRequestSha256 &&
+				candidate.preselectionClaimSha256 === plan.preselectionClaimSha256 &&
+				candidate.currentAuthoritySha256 === plan.currentAuthoritySha256 &&
+				(candidate.from === undefined || candidate.from === message.from),
+		);
+		if (!waiter) throw new Error("Hub send-await target waiter is unavailable");
+		waiter.offered = true;
+		this.#hubWaiterRevision += 1;
+		const disposition = await waiter.offer(message);
+		const decision = waiter.decision;
+		if (
+			disposition !== "consumed" ||
+			!decision ||
+			(decision.status !== "selected" && decision.status !== "already_selected" && decision.status !== "adopted")
+		) {
+			throw new Error("Hub send-await target waiter did not durably select the message");
+		}
+		const receipt = buildTransientTaskHubWaitMessageCanonicalRecordV1(
+			"send-await-target-delivery-source-materialization-receipt",
+			{
+				route: "waiter_selector" as const,
+				sourceReceipt: { to: message.to, outcome: "injected" as const },
+				selectionReceipt: decision.selectionReceipt,
+				materializedAt,
+			},
+		);
+		this.#hubWaiterSelections.set(plan.planSha256, receipt);
+		return receipt;
+	}
+
+	inspectExactHubSendAwaitTargetWaiter(
+		plan: Extract<
+			ConfidentialTransientTaskHubSendAwaitTargetDeliverySourceMaterializationPlanV1,
+			{ route: "waiter_selector" }
+		>,
+	): {
+		readonly receipt: ConfidentialTransientTaskHubSendAwaitTargetDeliverySourceMaterializationReceiptV1 | null;
+		readonly authority: { readonly authoritySha256: Sha256Ref; readonly revision: number };
+	} {
+		return {
+			receipt: this.#hubWaiterSelections.get(plan.planSha256) ?? null,
+			authority: this.#hubWaiterAuthority(plan.sourcePermit.targetAgentId),
+		};
 	}
 
 	#takeFromMailbox(agentId: string, from?: string): IrcMessage | undefined {

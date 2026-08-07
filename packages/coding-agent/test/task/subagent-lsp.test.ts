@@ -3,17 +3,21 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
-import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import type { LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import { ExtensionRuntime } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import type { PlanModeState } from "@oh-my-pi/pi-coding-agent/plan-mode/state";
 import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
-import type { AgentSession, AgentSessionEvent, PromptOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import {
+	AgentSession,
+	type AgentSessionEvent,
+	type PromptOptions,
+} from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { WorkspaceRuntimeProviderRegistry } from "@oh-my-pi/pi-coding-agent/session/workspace-provider-registry";
+import type { OrdinaryTransientTaskLifecycleCreateInputV1 } from "@oh-my-pi/pi-coding-agent/session/workspace-runtime-contracts";
 import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import type { AgentDefinition, TaskParams } from "@oh-my-pi/pi-coding-agent/task/types";
-import type { IsolationHandle, WorktreeBaseline } from "@oh-my-pi/pi-coding-agent/task/worktree";
 import * as worktreeModule from "@oh-my-pi/pi-coding-agent/task/worktree";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
@@ -21,6 +25,15 @@ import "@oh-my-pi/pi-coding-agent/tools/yield";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 
 const TEST_TASK: TaskParams = { agent: "task", name: "CheckLsp", task: "Inspect LSP tools." };
+interface IsolationRuntimeAuthorityFixture {
+	readonly executionEnvironmentProvider: { acquire(): Promise<never> };
+	readonly ownerSessionIndex: Readonly<Record<string, never>>;
+	readonly stores: {
+		readonly ordinaryTransientTaskLifecycle: {
+			create(input: OrdinaryTransientTaskLifecycleCreateInputV1): Promise<object>;
+		};
+	};
+}
 
 function createAssistantStopMessage(text: string): AssistantMessage {
 	return {
@@ -44,17 +57,16 @@ function createAssistantStopMessage(text: string): AssistantMessage {
 
 function createYieldingSession(): AgentSession {
 	const listeners: Array<(event: AgentSessionEvent) => void> = [];
-	const state = { messages: [] as AssistantMessage[] };
+	const state = { messages: [] as AssistantMessage[], model: undefined, systemPrompt: ["test"] };
 
 	const emit = (event: AgentSessionEvent) => {
 		for (const listener of listeners) listener(event);
 	};
+	const session = Object.create(AgentSession.prototype);
+	Object.defineProperty(session, "extensionRunner", { value: undefined });
 
-	return {
-		state,
-		agent: { state: { systemPrompt: ["test"] } },
-		model: undefined,
-		extensionRunner: undefined,
+	return Object.assign(session, {
+		agent: { state },
 		sessionManager: {
 			appendSessionInit: () => {},
 		},
@@ -86,7 +98,7 @@ function createYieldingSession(): AgentSession {
 		abort: async () => {},
 		dispose: async () => {},
 		setIrcWakeTurnObserver: () => {},
-	} as unknown as AgentSession;
+	});
 }
 
 function createSession(
@@ -94,18 +106,14 @@ function createSession(
 		isolationMode?: "none" | "auto";
 		parentEnableLsp?: boolean;
 		planMode?: PlanModeState;
+		runtimeAuthority?: IsolationRuntimeAuthorityFixture;
 		sessionFile?: string | null;
 		taskEnableLsp?: boolean;
 	} = {},
 ): ToolSession {
-	const modelRegistry = {
-		authStorage: undefined,
-		refresh: async () => {},
-		getAvailable: () => [],
-		getApiKey: async () => null,
-	} as unknown as ModelRegistry;
+	const runtimeAuthority = options.runtimeAuthority;
 
-	return {
+	const session: ToolSession = {
 		cwd: "/tmp",
 		hasUI: false,
 		enableLsp: options.parentEnableLsp,
@@ -116,9 +124,12 @@ function createSession(
 		}),
 		getSessionFile: () => options.sessionFile ?? null,
 		getSessionSpawns: () => "*",
-		modelRegistry,
 		getPlanModeState: () => options.planMode,
-	} as unknown as ToolSession;
+	};
+	if (runtimeAuthority) {
+		Object.assign(session, { acquireTransientTaskRuntimeAuthority: async () => runtimeAuthority });
+	}
+	return session;
 }
 
 function mockAgents(agent: AgentDefinition): void {
@@ -134,7 +145,8 @@ function mockCreateAgentSession(): { getOptions: () => CreateAgentSessionOptions
 		capturedOptions = options;
 		return {
 			session: createYieldingSession(),
-			extensionsResult: {} as unknown as LoadExtensionsResult,
+			runtimeProviderRegistry: new WorkspaceRuntimeProviderRegistry(),
+			extensionsResult: { extensions: [], errors: [], runtime: new ExtensionRuntime() },
 			setToolUIContext: () => {},
 			eventBus: new EventBus(),
 		} satisfies CreateAgentSessionResult;
@@ -142,30 +154,90 @@ function mockCreateAgentSession(): { getOptions: () => CreateAgentSessionOptions
 	return { getOptions: () => capturedOptions };
 }
 
-function mockIsolation(): void {
-	const baseline: WorktreeBaseline = {
-		root: {
-			repoRoot: "/repo",
-			headCommit: "HEAD",
-			staged: "",
-			unstaged: "",
-			untracked: [],
-			untrackedPatch: "",
-		},
-		nested: [],
-	};
-	const isolationHandle: IsolationHandle = {
+function mockIsolation() {
+	const taskId = "task-id";
+	const runId = "run-id";
+	const createId = "create-id";
+	const creatorDescriptor = {
+		taskId,
+		runId,
+		createId,
 		mergedDir: "/tmp/isolated-subagent",
-		backend: worktreeModule.parseIsolationMode("rcopy")!,
+	};
+	const cleanupDescriptor = {
+		schemaVersion: 1,
+		creatorDescriptor,
+		mergedDir: creatorDescriptor.mergedDir,
+		backend: "rcopy",
 		fellBack: false,
 		fallbackReason: null,
+		cleanupDescriptorSha256: `sha256:${"a".repeat(64)}`,
+	};
+	const terminalEvidence = { outcome: "succeeded" };
+	const materialize = vi.fn(async () => ({ status: "created" as const, cleanupDescriptor }));
+	const isolationReady = vi.fn(async () => ({
+		preparation: { state: "bound" as const },
+		cleanupDescriptor,
+		releaseBarrier: { status: "not_applicable" as const },
+	}));
+	const finalized = vi.fn(async () => ({ pending: {}, receipt: {} }));
+	const finalize = vi.fn(async () => ({
+		mergeSummary: "Captured isolated changes and cleaned up the execution environment.",
+		changesApplied: true,
+		terminalEvidence,
+	}));
+	const unused = async (): Promise<never> => {
+		throw new Error("Unexpected transient-task lifecycle call");
+	};
+	const create = vi.fn(async (input: OrdinaryTransientTaskLifecycleCreateInputV1) => ({
+		taskId,
+		runId,
+		createId,
+		effectIdentityManifest: {},
+		materializer: { ensureIsolation: materialize },
+		ensureRequest: {
+			preparation: { state: "claim_current" as const, creatorDescriptor },
+			controller: { taskId, runId, createId },
+			authoritySha256: `sha256:${"b".repeat(64)}`,
+			requestSha256: `sha256:${"c".repeat(64)}`,
+			requestedAt: "2026-01-01T00:00:00.000Z",
+		},
+		initializePrePendingRequest: {
+			plan: {
+				schemaVersion: 1,
+				resultTargetKey: { schemaVersion: 1, taskId, runId, createId, publicationTargetId: "target-id" },
+				resultlessIdentity: input.resultlessPreflight.identity,
+				maximumUtf8ByteLength: input.resultlessPreflight.maximumUtf8ByteLength,
+				representabilityPreflight: input.resultlessPreflight,
+				preflightSha256: `sha256:${"d".repeat(64)}`,
+				planSha256: `sha256:${"e".repeat(64)}`,
+			},
+			expectedAuthorityRevision: 1,
+			fencingGeneration: 1,
+			controller: { taskId, runId, createId },
+			initializedAt: "2026-01-01T00:00:00.000Z",
+			requestSha256: "f".repeat(64),
+		},
+		abortBeforeRegistration: unused,
+		fail: unused,
+		finalized,
+		cancelled: unused,
+		releaseBeforeBind: unused,
+		isolationReady,
+		releaseExecutionEnvironment: unused,
+		finalize,
+		settleDetached: unused,
+	}));
+	const authority: IsolationRuntimeAuthorityFixture = {
+		executionEnvironmentProvider: { acquire: unused },
+		ownerSessionIndex: {},
+		stores: { ordinaryTransientTaskLifecycle: { create } },
 	};
 
-	vi.spyOn(worktreeModule, "getRepoRoot").mockResolvedValue("/repo");
-	vi.spyOn(worktreeModule, "captureBaseline").mockResolvedValue(baseline);
-	vi.spyOn(worktreeModule, "ensureIsolation").mockResolvedValue(isolationHandle);
-	vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({ rootPatch: "", nestedPatches: [] });
-	vi.spyOn(worktreeModule, "cleanupIsolation").mockResolvedValue();
+	vi.spyOn(worktreeModule, "ensureIsolation").mockImplementation((request, materializer) =>
+		materializer.ensureIsolation(request),
+	);
+	return { authority, create, materialize, isolationReady, finalized, finalize, cleanupDescriptor };
 }
 
 describe("subagent LSP availability", () => {
@@ -230,14 +302,28 @@ describe("subagent LSP availability", () => {
 			source: "bundled",
 			tools: ["lsp"],
 		});
-		mockIsolation();
+		const isolation = mockIsolation();
 		const { getOptions } = mockCreateAgentSession();
 
-		const tool = await TaskTool.create(createSession({ isolationMode: "auto" }));
-		await tool.execute("tool-call", { ...TEST_TASK, isolated: true });
+		const tool = await TaskTool.create(
+			createSession({ isolationMode: "auto", runtimeAuthority: isolation.authority }),
+		);
+		const result = await tool.execute("tool-call", { ...TEST_TASK, isolated: true });
 
 		expect(getOptions()?.cwd).toBe("/tmp/isolated-subagent");
 		expect(getOptions()?.enableLsp).toBe(false);
+		expect(result.details?.results).toEqual([
+			expect.objectContaining({ exitCode: 0, output: JSON.stringify({ ok: true }, null, 2) }),
+		]);
+		const summaryContent = result.content[0];
+		if (summaryContent?.type !== "text") throw new TypeError("Expected a text task summary");
+		expect(summaryContent.text).toContain("Captured isolated changes and cleaned up the execution environment.");
+		expect(isolation.materialize).toHaveBeenCalledTimes(1);
+		expect(isolation.isolationReady).toHaveBeenCalledWith(isolation.cleanupDescriptor);
+		expect(isolation.finalized).toHaveBeenCalledTimes(1);
+		expect(isolation.finalize).toHaveBeenCalledWith(
+			expect.objectContaining({ cleanupDescriptor: isolation.cleanupDescriptor }),
+		);
 	});
 
 	it("opens isolated persisted subagent sessions with the worktree cwd", async () => {
@@ -248,17 +334,22 @@ describe("subagent LSP availability", () => {
 			source: "bundled",
 			tools: ["write"],
 		});
-		mockIsolation();
+		const isolation = mockIsolation();
 		const { getOptions } = mockCreateAgentSession();
 		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-isolated-session-cwd-"));
 		try {
 			const parentSessionFile = path.join(tempDir, "parent.jsonl");
-			const tool = await TaskTool.create(createSession({ isolationMode: "auto", sessionFile: parentSessionFile }));
+			const tool = await TaskTool.create(
+				createSession({
+					isolationMode: "auto",
+					runtimeAuthority: isolation.authority,
+					sessionFile: parentSessionFile,
+				}),
+			);
 			await tool.execute("tool-call", { ...TEST_TASK, isolated: true });
 
-			const sessionManager = getOptions()?.sessionManager as { getCwd?: () => string } | undefined;
 			expect(getOptions()?.cwd).toBe("/tmp/isolated-subagent");
-			expect(sessionManager?.getCwd?.()).toBe("/tmp/isolated-subagent");
+			expect(getOptions()?.sessionManager?.getCwd()).toBe("/tmp/isolated-subagent");
 		} finally {
 			await removeWithRetries(tempDir);
 		}

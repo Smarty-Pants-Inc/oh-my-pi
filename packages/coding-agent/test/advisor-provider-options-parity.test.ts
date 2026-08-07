@@ -22,6 +22,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 /** Provider-facing advisor session ids must be UUIDv7 (issue #5040): Codex writes
  *  them verbatim onto `conversation_id`/`session_id` headers, so `-advisor`
@@ -95,6 +96,7 @@ describe("AgentSession advisor provider-options parity", () => {
 			sessionManager,
 			settings: settings(),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			advisorTools: [],
 			advisorStreamFn,
 			preferWebsockets: true,
@@ -145,6 +147,7 @@ describe("AgentSession advisor provider-options parity", () => {
 			sessionManager,
 			settings: settings(),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			advisorTools: [],
 			advisorStreamFn: captureStreamFn,
 			onPayload,
@@ -208,6 +211,7 @@ describe("AgentSession advisor provider-options parity", () => {
 			sessionManager,
 			settings: settings(),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			advisorTools: [],
 			advisorStreamFn: captureStreamFn,
 		});
@@ -240,6 +244,7 @@ describe("AgentSession advisor provider-options parity", () => {
 			sessionManager,
 			settings: settings(),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			advisorTools: [],
 		});
 		session.settings.setModelRole("advisor", "anthropic/claude-sonnet-4-5");
@@ -277,6 +282,7 @@ describe("AgentSession advisor provider-options parity", () => {
 			sessionManager,
 			settings: settings(),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			advisorTools: [],
 			advisorStreamFn: captureStreamFn,
 		});
@@ -316,6 +322,7 @@ describe("AgentSession advisor provider-options parity", () => {
 			sessionManager,
 			settings: settings(),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			advisorTools: [],
 			advisorStreamFn: captureStreamFn,
 		});
@@ -358,6 +365,7 @@ describe("AgentSession advisor provider-options parity", () => {
 			sessionManager,
 			settings: settings(),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			advisorTools: [],
 			advisorStreamFn: captureStreamFn,
 		});

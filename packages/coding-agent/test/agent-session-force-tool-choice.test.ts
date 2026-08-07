@@ -4,17 +4,25 @@ import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import { createMockModel, type MockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type {
+	ProcessOwnedAgentDependenciesV1,
+	ProcessOwnedTransientTaskRuntimeStoreAssemblyV1,
+} from "@oh-my-pi/pi-coding-agent/session/agent-session-types";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
+import type { SessionJournalService } from "@oh-my-pi/pi-coding-agent/session/session-journal-contracts";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 let tempDir: TempDir;
 let authStorage: AuthStorage | undefined;
 let session: AgentSession;
+let modelRegistry: ModelRegistry;
 let sessionManager: SessionManager;
 let mock: MockModel;
 
@@ -25,7 +33,7 @@ beforeEach(async () => {
 
 	authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
 	authStorage.setRuntimeApiKey("anthropic", "test-key");
-	const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
+	modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
 	const settings = Settings.isolated({ "compaction.enabled": false });
 	sessionManager = SessionManager.inMemory(tempDir.path());
 
@@ -66,6 +74,7 @@ beforeEach(async () => {
 		sessionManager,
 		settings,
 		modelRegistry,
+		...createTestRuntimeDependencies(modelRegistry),
 		toolRegistry: new Map([
 			[bashTool.name, bashTool],
 			[writeTool.name, writeTool],
@@ -143,4 +152,56 @@ it("retains a deferred forced choice when session switching rolls back", async (
 
 	expect(mock.calls).toHaveLength(1);
 	expect(mock.calls[0]?.options?.toolChoice).toEqual({ type: "tool", name: "write" });
+});
+
+it("releases a partial transient runtime binding after startup recovery rejects", async () => {
+	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+	if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");
+	const failingAgent = new Agent({
+		getApiKey: () => "test-key",
+		initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+		convertToLlm,
+		streamFn: createMockModel({ handler: () => ({ content: ["done"] }) }).stream,
+	});
+	const manager = new AsyncJobManager({});
+	let releaseCount = 0;
+	const assembly = {
+		facade: { transientTaskSourceObservationStore: {} },
+		installTransientTaskLifecycleObservationAdapter: () => {},
+		release: () => {
+			releaseCount++;
+		},
+	} as unknown as ProcessOwnedTransientTaskRuntimeStoreAssemblyV1;
+	const processOwnedDependencies = {
+		persistentAgentStore: {},
+		assembleTransientTaskRuntimeStoreFacade: () => assembly,
+	} as unknown as ProcessOwnedAgentDependenciesV1;
+	const failingJournal = {
+		openStream: () => {
+			throw new Error("journal open must not run for an in-memory primary");
+		},
+	} as unknown as SessionJournalService;
+	const failingSession = new AgentSession({
+		agent: failingAgent,
+		sessionManager: SessionManager.inMemory(tempDir.path()),
+		settings: Settings.isolated({ "compaction.enabled": false }),
+		modelRegistry,
+		...createTestRuntimeDependencies(modelRegistry),
+		toolRegistry: new Map(),
+		ownedAsyncJobManager: manager,
+		asyncJobManager: manager,
+		agentId: "startup-rejection-test",
+		sessionJournal: failingJournal,
+		processOwnedDependencies,
+	});
+
+	try {
+		await expect(failingSession.awaitTransientTaskStartup()).rejects.toThrow(
+			"session_journal_requires_primary_persistence",
+		);
+		expect(releaseCount).toBe(1);
+	} finally {
+		await failingSession.dispose();
+	}
+	expect(releaseCount).toBe(1);
 });

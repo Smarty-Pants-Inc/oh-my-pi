@@ -12,6 +12,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { resetMemoryForTests } from "@oh-my-pi/pi-mnemopi";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 function createTool(name: string): AgentTool {
 	return {
@@ -71,11 +72,13 @@ describe("AgentSession memory backend lifecycle", () => {
 			streamFn: createMockModel({ responses: [{ content: ["ok"] }] }).stream,
 		});
 		const toolRegistry = new Map<string, AgentTool>([[read.name, read]]);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
 		session = new AgentSession({
 			agent,
 			sessionManager: SessionManager.inMemory(tempDir.path()),
 			settings,
-			modelRegistry: new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml")),
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			memoryAgentDir: tempDir.path(),
 			memoryTaskDepth: 0,
 			createMemoryTools,

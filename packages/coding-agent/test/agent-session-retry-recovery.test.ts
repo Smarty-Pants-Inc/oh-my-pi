@@ -15,6 +15,7 @@ import { SILENT_ABORT_MARKER } from "@oh-my-pi/pi-coding-agent/session/messages"
 import type { SessionMessageEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 type AutoRetryEndEvent = Extract<AgentSessionEvent, { type: "auto_retry_end" }>;
 
@@ -193,6 +194,7 @@ describe("AgentSession retry recovery", () => {
 			agent,
 			sessionManager,
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 		sessions.push(session);
@@ -300,6 +302,7 @@ describe("AgentSession retry recovery", () => {
 			agent,
 			sessionManager,
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 		sessions.push(session);

@@ -41,6 +41,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/codex-auto-reset";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 const ACCOUNT_ID = "acct-1";
 const EMAIL = "user@example.com";
@@ -193,6 +194,7 @@ describe("codex saved-reset trigger integration", () => {
 			sessionManager,
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			codexResetCoordinator: coordinator,
 		});
 		sessions.push(session);

@@ -24,6 +24,7 @@ import { SKILL_PROMPT_MESSAGE_TYPE, type SkillPromptDetails } from "@oh-my-pi/pi
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { Container } from "@oh-my-pi/pi-tui";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 type StubEditor = {
 	setText: (text: string) => void;
@@ -400,6 +401,7 @@ async function createRealSession(): Promise<SessionFixture> {
 		sessionManager: SessionManager.inMemory(),
 		settings: Settings.isolated(),
 		modelRegistry,
+		...createTestRuntimeDependencies(modelRegistry),
 	});
 
 	return { tempDir, authStorage, session };

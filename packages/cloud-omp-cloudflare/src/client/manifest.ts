@@ -25,7 +25,48 @@ const AUDIT_CORRELATION_ID_PATTERN = /^[0-9a-f]{32}$/;
 const BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 const STRICT_UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
 const DOWNLOAD_CONCURRENCY = 8;
-const MAX_GIT_LISTED_PATHS = MAX_SYNC_FILE_COUNT * 2;
+
+async function runGitListing(
+	cwd: string,
+	args: readonly string[],
+	signal?: AbortSignal,
+	stdin?: Uint8Array,
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+	const process = Bun.spawn(["git", "--no-optional-locks", ...args], {
+		cwd,
+		stdin: stdin ?? "ignore",
+		stdout: "pipe",
+		stderr: "pipe",
+		signal,
+	});
+	const [exitCode, stdout, stderr] = await Promise.all([
+		process.exited,
+		new Response(process.stdout).text(),
+		new Response(process.stderr).text(),
+	]);
+	return { exitCode, stdout, stderr };
+}
+
+async function listGitFiles(
+	cwd: string,
+	options: { others?: boolean; excludeStandard?: boolean; signal?: AbortSignal } = {},
+): Promise<string[]> {
+	const args = ["ls-files", "-z"];
+	if (options.others) args.push("--others");
+	if (options.excludeStandard) args.push("--exclude-standard");
+	const result = await runGitListing(cwd, args, options.signal);
+	if (result.exitCode !== 0) throw new Error(`git ${args.join(" ")} failed: ${result.stderr.trim()}`);
+	return result.stdout.split("\0").filter(Boolean);
+}
+
+async function listIgnoredGitFiles(cwd: string, files: readonly string[], signal?: AbortSignal): Promise<string[]> {
+	if (files.length === 0) return [];
+	const args = ["check-ignore", "-z", "--stdin"];
+	const result = await runGitListing(cwd, args, signal, new TextEncoder().encode(`${files.join("\0")}\0`));
+	if (result.exitCode === 1) return [];
+	if (result.exitCode !== 0) throw new Error(`git ${args.join(" ")} failed: ${result.stderr.trim()}`);
+	return result.stdout.split("\0").filter(Boolean);
+}
 
 export class ManifestBoundaryError extends Error {
 	readonly code: string;
@@ -74,12 +115,6 @@ export interface SyncBackResult {
 interface LocalFile {
 	readonly entry: BoundaryManifestEntry;
 	readonly bytes: Uint8Array;
-}
-
-interface GitCommandOutput {
-	readonly paths: string[];
-	readonly exitCode: number;
-	readonly stderr: string;
 }
 
 export const compareUtf8Paths = compareUtf8;
@@ -292,21 +327,27 @@ function freezeSnapshot(
 async function enumerateLocalFiles(sourceRootValue: string, signal?: AbortSignal): Promise<LocalFile[]> {
 	throwIfAborted(signal);
 	const sourceRoot = path.resolve(sourceRootValue);
-	await requireRegularDirectoryRoot(sourceRoot);
-	const output = await runGitNulCommand(
-		sourceRoot,
-		["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
-		signal,
-	);
-	if (output.exitCode !== 0) {
-		fail("git_enumeration_failed", `git ls-files failed: ${output.stderr.trim() || `exit ${output.exitCode}`}`);
+	const sourceRootStat = await requireRegularDirectoryRoot(sourceRoot);
+	let trackedPaths: string[];
+	let untrackedPaths: string[];
+	try {
+		[trackedPaths, untrackedPaths] = await Promise.all([
+			listGitFiles(sourceRoot, { signal }),
+			listGitFiles(sourceRoot, { others: true, excludeStandard: true, signal }),
+		]);
+	} catch (error) {
+		throwIfAborted(signal);
+		fail("git_enumeration_failed", "Git synchronization listing failed", error);
 	}
+	await assertDirectoryIdentity(sourceRoot, sourceRootStat, ".");
+	const relativePaths = [...new Set([...trackedPaths, ...untrackedPaths])].sort(compareUtf8Paths);
 
 	const files: LocalFile[] = [];
 	const destinationKeys = new Set<string>();
 	let totalBytes = 0;
-	for (const relativePath of output.paths) {
+	for (const relativePath of relativePaths) {
 		throwIfAborted(signal);
+		await assertDirectoryIdentity(sourceRoot, sourceRootStat, ".");
 		assertCanonicalRelativePath(relativePath);
 		const absolutePath = resolveBoundaryPath(sourceRoot, relativePath);
 		const stat = await lstatOrNull(absolutePath);
@@ -340,6 +381,7 @@ async function enumerateLocalFiles(sourceRootValue: string, signal?: AbortSignal
 			bytes,
 		});
 	}
+	await assertDirectoryIdentity(sourceRoot, sourceRootStat, ".");
 	return files;
 }
 
@@ -359,90 +401,26 @@ async function readRegularFileNoFollow(absolutePath: string, displayPath: string
 	}
 }
 
-async function runGitNulCommand(
-	cwd: string,
-	args: readonly string[],
-	signal?: AbortSignal,
-	stdin?: Blob,
-): Promise<GitCommandOutput> {
-	throwIfAborted(signal);
-	const child = Bun.spawn(["git", ...args], {
-		cwd,
-		env: {
-			...process.env,
-			GIT_DIR: undefined,
-			GIT_WORK_TREE: undefined,
-			GIT_INDEX_FILE: undefined,
-			GIT_OBJECT_DIRECTORY: undefined,
-			GIT_ALTERNATE_OBJECT_DIRECTORIES: undefined,
-			GIT_OPTIONAL_LOCKS: "0",
-			GIT_TERMINAL_PROMPT: "0",
-			GIT_PAGER: "cat",
-			PAGER: "cat",
-		},
-		stdin: stdin ?? "ignore",
-		stdout: "pipe",
-		stderr: "pipe",
-		signal,
-	});
-	try {
-		const [paths, stderr, exitCode] = await Promise.all([
-			readNulDelimitedUtf8(child.stdout),
-			new Response(child.stderr).text(),
-			child.exited,
-		]);
-		return { paths, stderr, exitCode };
-	} catch (error) {
-		child.kill();
-		await child.exited.catch(() => undefined);
-		throw error;
-	}
-}
-
-async function readNulDelimitedUtf8(stream: ReadableStream<Uint8Array>): Promise<string[]> {
-	const reader = stream.getReader();
-	const paths: string[] = [];
-	let pending = new Uint8Array(0);
-	try {
-		for (;;) {
-			const { done, value } = await reader.read();
-			if (done) break;
-			const combined = new Uint8Array(pending.byteLength + value.byteLength);
-			combined.set(pending);
-			combined.set(value, pending.byteLength);
-			let start = 0;
-			for (let index = 0; index < combined.byteLength; index += 1) {
-				if (combined[index] !== 0) continue;
-				if (paths.length >= MAX_GIT_LISTED_PATHS) {
-					fail("file_count_exceeded", "Git synchronization path set exceeds the bounded seed/final file envelope");
-				}
-				paths.push(decodeStrictUtf8(combined.subarray(start, index), "Git returned a non-UTF-8 path"));
-				start = index + 1;
-			}
-			pending = combined.slice(start);
-		}
-	} finally {
-		reader.releaseLock();
-	}
-	if (pending.byteLength !== 0) fail("invalid_git_output", "git -z output was not NUL terminated");
-	return paths;
-}
-
 async function assertPathsNotIgnored(
-	sourceRoot: string,
+	sourceRootValue: string,
 	candidatePaths: readonly string[],
 	signal?: AbortSignal,
 ): Promise<void> {
 	if (candidatePaths.length === 0) return;
-	const input = new Blob([`${candidatePaths.join("\0")}\0`]);
-	const output = await runGitNulCommand(sourceRoot, ["check-ignore", "-z", "--stdin"], signal, input);
-	if (output.exitCode !== 0 && output.exitCode !== 1) {
-		fail("git_ignore_check_failed", `git check-ignore failed: ${output.stderr.trim() || `exit ${output.exitCode}`}`);
+	const sourceRoot = path.resolve(sourceRootValue);
+	const sourceRootStat = await requireRegularDirectoryRoot(sourceRoot);
+	let ignoredPaths: string[];
+	try {
+		ignoredPaths = await listIgnoredGitFiles(sourceRoot, candidatePaths, signal);
+	} catch (error) {
+		throwIfAborted(signal);
+		fail("git_ignore_check_failed", "Git ignore check failed", error);
 	}
-	if (output.paths.length > 0) {
+	await assertDirectoryIdentity(sourceRoot, sourceRootStat, ".");
+	if (ignoredPaths.length > 0) {
 		fail(
 			"ignored_remote_path",
-			`Remote manifest contains a path excluded from local synchronization: ${output.paths[0]}`,
+			`Remote manifest contains a path excluded from local synchronization: ${ignoredPaths[0]}`,
 		);
 	}
 }
@@ -634,10 +612,24 @@ function assertManifestEqual(
 	}
 }
 
-async function requireRegularDirectoryRoot(root: string): Promise<void> {
+async function requireRegularDirectoryRoot(root: string): Promise<fs.Stats> {
 	const stat = await lstatOrNull(root);
 	if (!stat || stat.isSymbolicLink() || !stat.isDirectory()) {
 		fail("invalid_source_root", "Synchronization sourceRoot must be an existing non-symlink directory");
+	}
+	return stat;
+}
+
+async function assertDirectoryIdentity(absolutePath: string, expected: fs.Stats, displayPath: string): Promise<void> {
+	const actual = await lstatOrNull(absolutePath);
+	if (
+		!actual ||
+		actual.isSymbolicLink() ||
+		!actual.isDirectory() ||
+		actual.dev !== expected.dev ||
+		actual.ino !== expected.ino
+	) {
+		fail("local_file_changed", `Synchronized directory changed or became unsafe while reading: ${displayPath}`);
 	}
 }
 

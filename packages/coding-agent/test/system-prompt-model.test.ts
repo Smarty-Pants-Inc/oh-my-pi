@@ -13,6 +13,7 @@ import { buildSystemPrompt } from "@oh-my-pi/pi-coding-agent/system-prompt";
 import { usesCodexTaskPrompt } from "@oh-my-pi/pi-coding-agent/task/prompt-policy";
 import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
 import { cleanupTempHome } from "./helpers/temp-home-cleanup";
+import { createTestRuntimeDependencies } from "./utilities.js";
 
 const EMPTY_TREE = {
 	rootPath: "",
@@ -201,6 +202,7 @@ describe("AgentSession model-change prompt refresh", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			toolRegistry: new Map(),
 			rebuildSystemPrompt: async () => rebuild(),
 		});

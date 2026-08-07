@@ -31,6 +31,7 @@ import { initTheme } from "../src/modes/theme/theme";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
+import { createTestRuntimeDependencies } from "./utilities.js";
 
 function makeTool(name: string): AgentTool {
 	return {
@@ -132,6 +133,7 @@ describe("extension autocomplete provider API (#4919)", () => {
 			sessionManager: manager,
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry: registry,
+			...createTestRuntimeDependencies(registry),
 			toolRegistry: new Map(tools.map(tool => [tool.name, tool])),
 			promptTemplates: [],
 		});

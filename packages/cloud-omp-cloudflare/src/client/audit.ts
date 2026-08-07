@@ -33,8 +33,8 @@ export type CloudOmpCleanupState = "not_started" | "completed" | "failed" | "exp
 export interface CloudOmpAuditContext {
 	correlationId: string;
 	workspaceIdSha256: string;
-	ownerId: string;
-	sessionId: string;
+	taskId: string;
+	runId: string;
 	containerInternetEnabled: boolean;
 }
 
@@ -173,8 +173,8 @@ export function validateAuditRecord(value: unknown): asserts value is CloudOmpAu
 		"timestamp",
 		"correlationId",
 		"workspaceIdSha256",
-		"ownerId",
-		"sessionId",
+		"taskId",
+		"runId",
 		"containerInternetEnabled",
 		"wireVersion",
 		"packageVersion",
@@ -221,7 +221,7 @@ function copyEvent(event: CloudOmpAuditEvent): CloudOmpAuditEvent {
 
 function validateContext(context: CloudOmpAuditContext): void {
 	if (!HEX_32.test(context.correlationId) || !HEX_64.test(context.workspaceIdSha256)) throw new CloudOmpAuditError();
-	if (!isBoundedId(context.ownerId) || !isBoundedId(context.sessionId)) throw new CloudOmpAuditError();
+	if (!isBoundedId(context.taskId) || !isBoundedId(context.runId)) throw new CloudOmpAuditError();
 	if (typeof context.containerInternetEnabled !== "boolean") throw new CloudOmpAuditError();
 }
 

@@ -14,6 +14,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "../utilities.js";
 
 function makeEvent(): AgentEvent {
 	return { type: "tool_execution_start", toolCallId: "probe-1", toolName: "probe", args: {} };
@@ -86,6 +87,7 @@ describe("#emit listener isolation", () => {
 				sessionManager: SessionManager.inMemory(),
 				settings: Settings.isolated(),
 				modelRegistry,
+				...createTestRuntimeDependencies(modelRegistry),
 			});
 		});
 

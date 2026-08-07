@@ -6,6 +6,7 @@ import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { WorkspaceRuntimeProviderRegistry } from "@oh-my-pi/pi-coding-agent/session/workspace-provider-registry";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -74,6 +75,7 @@ it("overlaps registry refresh with session-file opening and session setup", asyn
 		sessionCreated = true;
 		const result: CreateAgentSessionResult = {
 			session,
+			runtimeProviderRegistry: new WorkspaceRuntimeProviderRegistry(),
 			extensionsResult: { extensions: [], errors: [], runtime: new ExtensionRuntime() },
 			setToolUIContext: () => {},
 			eventBus: new EventBus(),

@@ -1,13 +1,15 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentMessage, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { Message, Model } from "@oh-my-pi/pi-ai";
 import { createMockModel, type MockResponseSource } from "@oh-my-pi/pi-ai/providers/mock";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { CustomTool } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools/types";
 import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { type CustomMessage, convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import {
@@ -15,7 +17,8 @@ import {
 	projectMountedMCPXdevGuidance,
 } from "@oh-my-pi/pi-coding-agent/session/session-tools";
 import { listXdevTools, XDEV_EXTERNAL_DESCRIPTION_CAP, type XdevState } from "@oh-my-pi/pi-coding-agent/tools/xdev";
-import { logger } from "@oh-my-pi/pi-utils";
+import { logger, TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 // Cache-stability invariant: when MCP servers reconnect with byte-identical tool
 // definitions, `refreshMCPTools` must not rebuild the system prompt. A rebuild
@@ -88,11 +91,25 @@ function createTestXdevState(): XdevState {
 
 describe("AgentSession refreshMCPTools rebuild skipping", () => {
 	const sessions: AgentSession[] = [];
+	let authStorage: AuthStorage | undefined;
+	let modelRegistry: ModelRegistry;
+	let modelConfigDir: TempDir | undefined;
+
+	beforeEach(async () => {
+		authStorage = await AuthStorage.create(":memory:");
+		modelConfigDir = TempDir.createSync("@agent-session-tool-rebuild-skip-");
+		modelRegistry = new ModelRegistry(authStorage, modelConfigDir.join("models.yml"));
+		vi.spyOn(modelRegistry, "getApiKey").mockResolvedValue("test-key");
+	});
 
 	afterEach(async () => {
 		for (const session of sessions.splice(0)) {
 			await session.dispose();
 		}
+		authStorage?.close();
+		authStorage = undefined;
+		modelConfigDir?.removeSync();
+		modelConfigDir = undefined;
 		vi.restoreAllMocks();
 	});
 
@@ -162,7 +179,8 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: { getApiKey: async () => "test-key" } as never,
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			toolRegistry,
 			builtInToolNames: options.xdev && !options.lazyWrite ? ["read", "write"] : ["read"],
 			ensureWriteRegistered: async () => {
@@ -540,7 +558,8 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: {} as never,
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			toolRegistry,
 			setActiveToolNames: names => {
 				activeToolNames.clear();

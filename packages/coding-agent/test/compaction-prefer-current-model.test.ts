@@ -11,7 +11,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { assistantMsg, userMsg } from "./utilities";
+import { assistantMsg, createTestRuntimeDependencies, userMsg } from "./utilities";
 
 /**
  * Regression: when the user sets `modelRoles.default` to a model on a different
@@ -72,6 +72,7 @@ describe("compaction prefers the current session model over modelRoles.default",
 			sessionManager: SessionManager.inMemory(),
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 		session.subscribe(() => {});
 
@@ -132,6 +133,7 @@ describe("compaction prefers the current session model over modelRoles.default",
 			sessionManager: SessionManager.inMemory(),
 			settings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 		session.subscribe(() => {});
 
@@ -204,6 +206,7 @@ describe("compaction prefers the current session model over modelRoles.default",
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.keepRecentTokens": 1, "compaction.strategy": "context-full" }),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 		session.subscribe(() => {});
 
@@ -275,6 +278,7 @@ describe("compaction prefers the current session model over modelRoles.default",
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.keepRecentTokens": 1 }),
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 		session.subscribe(() => {});
 

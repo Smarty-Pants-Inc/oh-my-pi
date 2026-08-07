@@ -13,6 +13,7 @@
  *   - Progress tracking via JSON events
  *   - Session artifacts for debugging
  */
+import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import type { AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 import type { Usage } from "@oh-my-pi/pi-ai";
@@ -23,6 +24,37 @@ import subagentUserPromptTemplate from "../prompts/system/subagent-user-prompt.m
 import taskDescriptionTemplate from "../prompts/tools/task.md" with { type: "text" };
 import taskAsyncContractTemplate from "../prompts/tools/task-async-contract.md" with { type: "text" };
 import taskSummaryTemplate from "../prompts/tools/task-summary.md" with { type: "text" };
+import type { AgentSessionTransientTaskRuntimeAuthorityV1 } from "../session/agent-session-types";
+import {
+	type AgentSessionTransientTaskSourceObservationProducerV1,
+	type ConfidentialAgentSessionToolResultSerializerKeyV1,
+	type ConfidentialAsyncJobTransientTaskRecoveryOwnerSessionIndexV1,
+	type ConfidentialTransientTaskExecuteEntryObservationReceiptV1,
+	type ConfidentialTransientTaskForegroundBeforeReturnRecordV1,
+	type ConfidentialTransientTaskForegroundBeforeReturnSuspensionV1,
+	type ConfidentialTransientTaskForegroundPendingTtsrOverlayBindingV1,
+	type ConfidentialTransientTaskForegroundPendingTtsrOverlayPreDispatchBindingV1,
+	type ConfidentialTransientTaskForegroundPendingTtsrOverlaySnapshotV1,
+	type ConfidentialTransientTaskForegroundResultHandoffBatchV1,
+	type ConfidentialTransientTaskForegroundResultHandoffV1,
+	type ConfidentialTransientTaskPendingCaptureIndexKeyV1,
+	type ConfidentialTransientTaskSourceObservationReceiptV1,
+	type ConfidentialTransientTaskSourceObservationResultV1,
+	type ConfidentialTransientTaskTaskToolSourceObservationInputV1,
+	deriveTransientTaskEffectOperationIdV1,
+	deriveTransientTaskForegroundAppendBatchKeyV1,
+	type SessionManagerJournalGenerationAuthorityResolverV1,
+	TRANSIENT_TASK_DETACHED_PRE_EXECUTION_ABORT_JOB_ERROR_TEXT_V1,
+	type TransientTaskForegroundBeforeReturnRecoveryBridgeV1,
+	type TransientTaskForegroundDispatchClassificationV1,
+	type TransientTaskForegroundPendingTtsrOverlayBindingResolverV1,
+	type TransientTaskForegroundPreReturnIdentityEnvelopeListV1,
+	type TransientTaskForegroundPreReturnIdentityV1,
+	type TransientTaskForegroundResultSettlementStoreV1,
+	type TransientTaskForegroundSessionAppendBridgeV1,
+	type TransientTaskPostTerminalCleanupEvidenceV1,
+	type TransientTaskResultlessTerminalProjectionV1,
+} from "../session/workspace-runtime-contracts";
 import { TASK_EFFORTS, type TaskEffort } from "../thinking";
 import { truncateForPrompt } from "../tools/approval";
 import { isIrcEnabled } from "../tools/hub";
@@ -34,28 +66,135 @@ import {
 	canSpawnAtDepth,
 	getTaskSchema,
 	type SingleResult,
+	StructuredSubagentError,
 	type TaskItem,
 	type TaskParams,
 	type TaskToolDetails,
 	type TaskToolSchemaInstance,
+	validateAndProjectTransientTaskForegroundSourceAgentToolResultV1,
 } from "./types";
 // Import review tools for side effects (registers subagent tool handlers)
 import "../tools/review";
-import type { AsyncJobManager } from "../async";
+import type { AsyncJobManager, AsyncJobTransientTaskRunContextV1 } from "../async";
 import { hasResolvableTranscript } from "../internal-urls/registry-helpers";
 import { AgentRegistry } from "../registry/agent-registry";
+import type { OperationId, Sha256Ref } from "../registry/persistent-agent-contracts";
 import { type DiscoveryResult, discoverAgents } from "./discovery";
 import { generateTaskName } from "./name-generator";
 import { AgentOutputManager } from "./output-manager";
 import { mapWithConcurrencyLimitAllSettled, Semaphore } from "./parallel";
 import { renderResult, renderCall as renderTaskCall } from "./render";
 import { repairTaskParams } from "./repair-args";
-import { resolveEffectiveSubagentPolicy, runStructuredSubagent, StructuredSubagentError } from "./structured-subagent";
+import {
+	createStructuredSubagentTransientTaskRuntimeV1,
+	type EffectiveSubagentPolicy,
+	reserveStructuredSubagentId,
+	resolveEffectiveSubagentPolicy,
+	runStructuredSubagent,
+	type StructuredSubagentForegroundHandoffIdentityV1,
+	StructuredSubagentLifecycleFailure,
+	type StructuredSubagentRequest,
+	type StructuredSubagentTransientTaskRuntimeAssemblyV1,
+} from "./structured-subagent";
+
+type TaskForegroundRuntimeAuthorityV1 = {
+	readonly sourceObservationProducer: AgentSessionTransientTaskSourceObservationProducerV1;
+	readonly pendingOverlayBindingResolver: TransientTaskForegroundPendingTtsrOverlayBindingResolverV1;
+	readonly takePreDispatchBinding: (toolCallId: string) => {
+		readonly indexKey: ConfidentialTransientTaskPendingCaptureIndexKeyV1;
+		readonly snapshot: ConfidentialTransientTaskForegroundPendingTtsrOverlaySnapshotV1;
+		readonly binding: ConfidentialTransientTaskForegroundPendingTtsrOverlayPreDispatchBindingV1;
+		readonly sourceToolCallOrdinal: number;
+		readonly assistantAnchorEntryId: string;
+		readonly serializerKey: ConfidentialAgentSessionToolResultSerializerKeyV1;
+	} | null;
+	readonly beforeReturnRecovery: TransientTaskForegroundBeforeReturnRecoveryBridgeV1;
+	readonly sessionAppend: TransientTaskForegroundSessionAppendBridgeV1;
+	readonly settlement: TransientTaskForegroundResultSettlementStoreV1;
+	readonly resolveJournalGenerationAuthority: SessionManagerJournalGenerationAuthorityResolverV1["resolveTransientTaskJournalGenerationAuthority"];
+};
+
+type TaskRuntimeAuthorityWithForegroundV1 = AgentSessionTransientTaskRuntimeAuthorityV1 & {
+	readonly foregroundTask?: TaskForegroundRuntimeAuthorityV1;
+};
+
+interface TaskForegroundInvocationV1 {
+	readonly authority: TaskForegroundRuntimeAuthorityV1;
+	readonly runtimeAuthority: AgentSessionTransientTaskRuntimeAuthorityV1;
+	readonly indexKey: ConfidentialTransientTaskPendingCaptureIndexKeyV1;
+	readonly snapshot: ConfidentialTransientTaskForegroundPendingTtsrOverlaySnapshotV1;
+	readonly preDispatchBinding: ConfidentialTransientTaskForegroundPendingTtsrOverlayPreDispatchBindingV1;
+	readonly sourceToolCallOrdinal: number;
+	readonly assistantAnchorEntryId: string;
+	readonly serializerKey: ConfidentialAgentSessionToolResultSerializerKeyV1;
+	readonly effectiveTaskArgumentsSha256: Sha256Ref;
+	readonly effectiveArgumentRevisionChainSha256: Sha256Ref;
+	readonly executeEntryObservationReceipt: ConfidentialTransientTaskExecuteEntryObservationReceiptV1;
+}
+
+interface TaskForegroundCompletedChildV1 {
+	readonly spawnIndex: number;
+	readonly handoffIdentity: StructuredSubagentForegroundHandoffIdentityV1;
+}
+type TaskForegroundPresentDispatchClassificationV1 = Extract<
+	TransientTaskForegroundDispatchClassificationV1,
+	{ core: { classification: "foreground_present" } }
+>;
+
+function isTaskExecuteEntryObservationReceipt(
+	receipt: ConfidentialTransientTaskSourceObservationReceiptV1,
+): receipt is ConfidentialTransientTaskExecuteEntryObservationReceiptV1 {
+	return receipt.core.eventKind === "task_execute_entry";
+}
+
+function isTaskForegroundPresentDispatchClassification(
+	classification: TransientTaskForegroundDispatchClassificationV1,
+): classification is TaskForegroundPresentDispatchClassificationV1 {
+	return classification.core.classification === "foreground_present";
+}
+
+const transientTaskForegroundStringify = JSON.stringify.bind(JSON);
+
+function transientTaskForegroundTupleSha256(tuple: readonly unknown[]): Sha256Ref {
+	const utf8 = transientTaskForegroundStringify(tuple);
+	if (utf8 === undefined) throw new TypeError("Foreground canonical tuple is not JSON-representable");
+	return `sha256:${createHash("sha256").update(utf8, "utf8").digest("hex")}` as Sha256Ref;
+}
+
+function transientTaskForegroundOperationId(): OperationId {
+	return randomUUID() as OperationId;
+}
+
+function transientTaskForegroundResultTargetTuple(
+	key: StructuredSubagentForegroundHandoffIdentityV1["resultTargetKey"],
+): readonly unknown[] {
+	return [
+		key.taskId,
+		key.runId,
+		key.createId,
+		key.resultPublicationId,
+		key.resultPublicationTargetId,
+		key.resultPublicationTargetCleanupId,
+	];
+}
+
+function transientTaskForegroundPendingForever(): Promise<never> {
+	return new Promise<never>(() => {});
+}
 
 function renderSubagentUserPrompt(assignment: string): string {
 	return prompt.render(subagentUserPromptTemplate, {
 		assignment: assignment.trim(),
 	});
+}
+
+function resolveTransientTaskRuntimeAuthorityAcquirer(
+	session: ToolSession,
+): (() => Promise<AgentSessionTransientTaskRuntimeAuthorityV1>) | null {
+	if (!("acquireTransientTaskRuntimeAuthority" in session)) return null;
+	const acquire = session.acquireTransientTaskRuntimeAuthority;
+	if (typeof acquire !== "function") return null;
+	return () => (acquire as (this: ToolSession) => Promise<AgentSessionTransientTaskRuntimeAuthorityV1>).call(session);
 }
 
 function createUsageTotals(): Usage {
@@ -612,7 +751,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const environmentEnabled =
 			isolationEnabled &&
 			(this.session.taskDepth ?? 0) === 0 &&
-			this.session.getExecutionEnvironmentProvider?.() !== undefined;
+			"supportsTransientTaskEnvironmentExecution" in this.session &&
+			typeof this.session.supportsTransientTaskEnvironmentExecution === "function" &&
+			this.session.supportsTransientTaskEnvironmentExecution();
 		const defaultAgent = resolveSpawnPolicy(this.session.getSessionSpawns()).defaultAgent;
 		return getTaskSchema({
 			isolationEnabled,
@@ -695,6 +836,691 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		});
 	}
 
+	async #recordTaskForegroundObservation(
+		invocation: Pick<TaskForegroundInvocationV1, "authority" | "indexKey">,
+		observationInput: ConfidentialTransientTaskTaskToolSourceObservationInputV1,
+	): Promise<ConfidentialTransientTaskSourceObservationReceiptV1> {
+		const observedAt = new Date().toISOString();
+		const requestedAt = observedAt;
+		const reservationId = transientTaskForegroundOperationId();
+		const core = {
+			indexKey: invocation.indexKey,
+			producer: "task_tool" as const,
+			observationInput,
+			reservationId,
+			observedAt,
+			requestedAt,
+		};
+		const result =
+			await invocation.authority.sourceObservationProducer.reserveAndFreezeTransientTaskSourceObservationDraft({
+				core,
+				requestSha256: transientTaskForegroundTupleSha256([
+					"omp-agent-session-transient-task-lifecycle-v1",
+					"producer-draft-request-core",
+					1,
+					core.indexKey,
+					core.producer,
+					core.observationInput,
+					core.reservationId,
+					core.observedAt,
+					core.requestedAt,
+				]),
+			});
+		if (result.status !== "committed" && result.status !== "already_committed") {
+			throw new StructuredSubagentError(
+				"execution",
+				`Task foreground source observation was rejected: ${result.status}`,
+			);
+		}
+		return result.observationReceipt;
+	}
+
+	async #beginTaskForegroundInvocation(
+		toolCallId: string,
+		params: TaskParams,
+	): Promise<TaskForegroundInvocationV1 | null> {
+		const acquireAuthority = resolveTransientTaskRuntimeAuthorityAcquirer(this.session);
+		if (!acquireAuthority) return null;
+		const runtimeAuthority = (await acquireAuthority()) as TaskRuntimeAuthorityWithForegroundV1;
+		const authority = runtimeAuthority.foregroundTask;
+		if (!authority) return null;
+		const preDispatch = authority.takePreDispatchBinding(toolCallId);
+		if (!preDispatch) return null;
+		const generation = authority.resolveJournalGenerationAuthority(preDispatch.assistantAnchorEntryId);
+		if (
+			generation.status !== "matching" ||
+			generation.authority.sessionGeneration.core.sessionId !== preDispatch.indexKey.core.parentSessionId ||
+			generation.authority.sessionGeneration.sessionGenerationSha256 !==
+				preDispatch.indexKey.core.parentSessionGenerationSha256 ||
+			generation.authority.branchGeneration.branchGenerationSha256 !==
+				preDispatch.serializerKey.parentBranchGenerationSha256 ||
+			preDispatch.serializerKey.parentSessionId !== preDispatch.indexKey.core.parentSessionId ||
+			preDispatch.serializerKey.parentSessionGenerationSha256 !==
+				preDispatch.indexKey.core.parentSessionGenerationSha256 ||
+			preDispatch.serializerKey.assistantAnchorEntryId !== preDispatch.assistantAnchorEntryId ||
+			preDispatch.sourceToolCallOrdinal !== preDispatch.indexKey.core.sourceToolCallOrdinal ||
+			preDispatch.binding.pendingOverlaySnapshotSha256 !== preDispatch.snapshot.pendingOverlaySnapshotSha256
+		) {
+			throw new StructuredSubagentError(
+				"execution",
+				"Task foreground journal authority changed before execute entry.",
+			);
+		}
+		const effectiveTaskArgumentsSha256 = transientTaskForegroundTupleSha256([
+			"omp-transient-task-foreground-route-v1",
+			"effective-task-arguments",
+			1,
+			params,
+		]);
+		const effectiveArgumentRevisionChainSha256 = transientTaskForegroundTupleSha256([
+			"omp-transient-task-foreground-route-v1",
+			"effective-argument-revision-chain",
+			1,
+			params,
+		]);
+		const partial = {
+			authority,
+			indexKey: preDispatch.indexKey,
+		};
+		const executeEntryObservationReceipt = await this.#recordTaskForegroundObservation(partial, {
+			schemaVersion: 1,
+			eventKind: "task_execute_entry",
+			effectiveTaskArgumentsSha256,
+			effectiveArgumentRevisionChainSha256,
+		});
+		if (!isTaskExecuteEntryObservationReceipt(executeEntryObservationReceipt)) {
+			throw new StructuredSubagentError("execution", "Task execute-entry observation receipt changed event kind.");
+		}
+		return {
+			...partial,
+			runtimeAuthority,
+			snapshot: preDispatch.snapshot,
+			preDispatchBinding: preDispatch.binding,
+			sourceToolCallOrdinal: preDispatch.sourceToolCallOrdinal,
+			assistantAnchorEntryId: preDispatch.assistantAnchorEntryId,
+			serializerKey: preDispatch.serializerKey,
+			effectiveTaskArgumentsSha256,
+			effectiveArgumentRevisionChainSha256,
+			executeEntryObservationReceipt,
+		};
+	}
+
+	#createTaskForegroundDispatchClassification(
+		invocation: TaskForegroundInvocationV1,
+		blockingChildCount: number,
+		asyncChildCount: number,
+	): TransientTaskForegroundDispatchClassificationV1 {
+		const classifiedAt = new Date().toISOString();
+		const core =
+			blockingChildCount > 0
+				? {
+						schemaVersion: 1 as const,
+						classification: "foreground_present" as const,
+						blockingChildCount,
+						asyncChildCount,
+						effectiveTaskArgumentsSha256: invocation.effectiveTaskArgumentsSha256,
+						effectiveArgumentRevisionChainSha256: invocation.effectiveArgumentRevisionChainSha256,
+						classifiedAt,
+					}
+				: {
+						schemaVersion: 1 as const,
+						classification: "async_only" as const,
+						blockingChildCount: 0 as const,
+						asyncChildCount,
+						effectiveTaskArgumentsSha256: invocation.effectiveTaskArgumentsSha256,
+						effectiveArgumentRevisionChainSha256: invocation.effectiveArgumentRevisionChainSha256,
+						classifiedAt,
+					};
+		return {
+			core,
+			classificationSha256: transientTaskForegroundTupleSha256([
+				"omp-transient-task-foreground-route-v1",
+				"classification-core",
+				1,
+				core.classification,
+				core.blockingChildCount,
+				core.asyncChildCount,
+				core.effectiveTaskArgumentsSha256,
+				core.effectiveArgumentRevisionChainSha256,
+				core.classifiedAt,
+			]),
+		} as TransientTaskForegroundDispatchClassificationV1;
+	}
+
+	async #suspendTaskForegroundBeforeReturn(
+		invocation: TaskForegroundInvocationV1,
+		record: ConfidentialTransientTaskForegroundBeforeReturnRecordV1,
+		reason: ConfidentialTransientTaskForegroundBeforeReturnSuspensionV1["reason"],
+	): Promise<never> {
+		const suspendedAt = new Date().toISOString();
+		const projection = {
+			schemaVersion: 1 as const,
+			state: "before_return_suspended" as const,
+			foregroundAppendBatchKeySha256: record.preallocationRequest.foregroundAppendBatchKeySha256,
+			beforeReturnRecordSha256: record.recordSha256,
+			returnedSourceResultSnapshotSha256: record.returnedSourceResultSnapshot.sourceSnapshotUtf8Sha256,
+			reason,
+		};
+		const suspension: ConfidentialTransientTaskForegroundBeforeReturnSuspensionV1 = {
+			schemaVersion: 1,
+			record,
+			projection,
+			reason,
+			suspendedAt,
+			suspensionSha256: transientTaskForegroundTupleSha256([
+				"omp-transient-task-foreground-settlement-v1",
+				"before-return-suspension-core",
+				1,
+				record,
+				projection.foregroundAppendBatchKeySha256,
+				projection.returnedSourceResultSnapshotSha256,
+				reason,
+				suspendedAt,
+			]),
+		};
+		await invocation.authority.beforeReturnRecovery.persistBeforeReturnSuspension(suspension).catch(() => undefined);
+		return transientTaskForegroundPendingForever();
+	}
+
+	async #prepareTaskForegroundHandoff(
+		toolCallId: string,
+		invocation: TaskForegroundInvocationV1,
+		classification: Extract<
+			TransientTaskForegroundDispatchClassificationV1,
+			{ core: { classification: "foreground_present" } }
+		>,
+		children: readonly TaskForegroundCompletedChildV1[],
+		result: ConfidentialTransientTaskSourceObservationResultV1,
+	): Promise<ConfidentialTransientTaskForegroundResultHandoffBatchV1> {
+		const parentSessionId = invocation.serializerKey.parentSessionId;
+		const parentSessionGenerationSha256 = invocation.serializerKey.parentSessionGenerationSha256;
+		const parentBranchGenerationSha256 = invocation.serializerKey.parentBranchGenerationSha256;
+		const parentBranchAnchorEntryId = invocation.assistantAnchorEntryId;
+		const bindingRequestedAt = new Date().toISOString();
+		const bindingRequest = {
+			schemaVersion: 1 as const,
+			preDispatchBinding: invocation.preDispatchBinding,
+			parentSessionId,
+			parentSessionGenerationSha256,
+			parentBranchGenerationSha256,
+			parentBranchAnchorEntryId,
+			toolCallId,
+			requestedAt: bindingRequestedAt,
+			requestSha256: transientTaskForegroundTupleSha256([
+				"omp-transient-task-foreground-settlement-v1",
+				"pending-ttsr-anchor-resolve-core",
+				1,
+				invocation.preDispatchBinding,
+				parentSessionId,
+				parentSessionGenerationSha256,
+				parentBranchGenerationSha256,
+				parentBranchAnchorEntryId,
+				toolCallId,
+				bindingRequestedAt,
+			]),
+		};
+		const bindingResult = await invocation.authority.pendingOverlayBindingResolver
+			.resolveFinalizedPendingOverlayForBeforeReturn(bindingRequest)
+			.catch(() => null);
+		if (bindingResult === null) return transientTaskForegroundPendingForever();
+		if (bindingResult.status !== "resolved" && bindingResult.status !== "already_resolved") {
+			return transientTaskForegroundPendingForever();
+		}
+		const pendingOverlayBinding: ConfidentialTransientTaskForegroundPendingTtsrOverlayBindingV1 =
+			bindingResult.binding;
+		if (
+			pendingOverlayBinding.parentBranchGenerationSha256 !== parentBranchGenerationSha256 ||
+			pendingOverlayBinding.parentBranchAnchorEntryId !== parentBranchAnchorEntryId ||
+			pendingOverlayBinding.preDispatchBinding.bindingSha256 !== invocation.preDispatchBinding.bindingSha256
+		) {
+			return transientTaskForegroundPendingForever();
+		}
+
+		const orderedChildren = [...children].sort((left, right) => left.spawnIndex - right.spawnIndex);
+		if (orderedChildren.length === 0) return transientTaskForegroundPendingForever();
+		for (let index = 1; index < orderedChildren.length; index++) {
+			if (orderedChildren[index - 1]!.spawnIndex === orderedChildren[index]!.spawnIndex) {
+				return transientTaskForegroundPendingForever();
+			}
+		}
+
+		const entryPreallocationOperationId = transientTaskForegroundOperationId();
+		const entryIdUtf8 = transientTaskForegroundStringify([
+			"omp-transient-task-foreground-session-entry-id-v1",
+			1,
+			entryPreallocationOperationId,
+		]);
+		if (entryIdUtf8 === undefined) return transientTaskForegroundPendingForever();
+		const toolResultEntryId = createHash("sha256").update(entryIdUtf8, "utf8").digest("hex").slice(0, 8);
+		const memberCount = orderedChildren.length;
+		const orderedPreReturnIdentities = orderedChildren.map((child, foregroundMemberIndex) => {
+			const target = child.handoffIdentity.resultTargetKey;
+			const manifest = child.handoffIdentity.effectIdentityManifest;
+			const deliverySelectorBinding = {
+				resultPublicationTargetId: target.resultPublicationTargetId,
+				parentSessionId,
+				toolCallId,
+				foregroundMemberIndex,
+			};
+			const appendSelectorBinding = { parentSessionId, toolCallId, foregroundMemberIndex };
+			const deliverySelectorUtf8 = transientTaskForegroundStringify([
+				"omp-transient-task-parent-delivery-selector-v1",
+				"foreground-settlement",
+				1,
+				target.resultPublicationTargetId,
+				parentSessionId,
+				toolCallId,
+				foregroundMemberIndex,
+			]);
+			const appendSelectorUtf8 = transientTaskForegroundStringify([
+				"omp-transient-task-parent-delivery-selector-v1",
+				"foreground-session-append",
+				1,
+				parentSessionId,
+				toolCallId,
+				foregroundMemberIndex,
+			]);
+			if (deliverySelectorUtf8 === undefined || appendSelectorUtf8 === undefined) {
+				throw new TypeError("Foreground effect selector is not JSON-representable");
+			}
+			const deliveryOperationId = deriveTransientTaskEffectOperationIdV1({
+				namespace: "parent_delivery",
+				namespaceId: manifest.parentDeliveryNamespaceId,
+				domain: "foreground_settlement",
+				selector: { kind: "key", keyUtf8: deliverySelectorUtf8 },
+				selectorBinding: deliverySelectorBinding,
+			});
+			const appendOperationId = deriveTransientTaskEffectOperationIdV1({
+				namespace: "parent_delivery",
+				namespaceId: manifest.parentDeliveryNamespaceId,
+				domain: "foreground_session_append",
+				selector: { kind: "key", keyUtf8: appendSelectorUtf8 },
+				selectorBinding: appendSelectorBinding,
+			});
+			const core = {
+				...target,
+				schemaVersion: 1 as const,
+				effectIdentityManifestSha256: manifest.manifestSha256,
+				deliveryOperationId,
+				appendOperationId,
+				foregroundMemberIndex,
+				foregroundMemberCount: memberCount,
+				parentSessionId,
+				parentSessionGenerationSha256,
+				parentBranchGenerationSha256,
+				parentBranchAnchorEntryId,
+				toolCallId,
+				toolResultSerializerKeySha256: invocation.serializerKey.serializerKeySha256,
+				sourceToolCallOrdinal: invocation.sourceToolCallOrdinal,
+				entryPreallocationOperationId,
+				toolResultEntryId,
+				returnedAgentToolResultUtf8Sha256: result.core.resultUtf8Sha256,
+				returnedAgentToolResultUtf8ByteLength: result.core.resultUtf8ByteLength,
+				returnedSourceResultSnapshotSha256: result.core.sourceResultSnapshot.sourceSnapshotUtf8Sha256,
+				returnedSourceResultSnapshotByteLength: result.core.sourceResultSnapshot.sourceSnapshotUtf8ByteLength,
+			};
+			return {
+				core,
+				preReturnIdentitySha256: transientTaskForegroundTupleSha256([
+					"omp-transient-task-foreground-settlement-v1",
+					"pre-return-identity-core",
+					1,
+					transientTaskForegroundResultTargetTuple(target),
+					core.effectIdentityManifestSha256,
+					core.deliveryOperationId,
+					core.appendOperationId,
+					core.foregroundMemberIndex,
+					core.foregroundMemberCount,
+					core.parentSessionId,
+					core.parentSessionGenerationSha256,
+					core.parentBranchGenerationSha256,
+					core.parentBranchAnchorEntryId,
+					core.toolCallId,
+					core.toolResultSerializerKeySha256,
+					core.sourceToolCallOrdinal,
+					core.entryPreallocationOperationId,
+					core.toolResultEntryId,
+					core.returnedAgentToolResultUtf8Sha256,
+					core.returnedAgentToolResultUtf8ByteLength,
+					core.returnedSourceResultSnapshotSha256,
+					core.returnedSourceResultSnapshotByteLength,
+				]),
+			} satisfies TransientTaskForegroundPreReturnIdentityV1;
+		}) as unknown as TransientTaskForegroundPreReturnIdentityEnvelopeListV1;
+		const orderedPreReturnIdentitySha256s = orderedPreReturnIdentities.map(
+			identity => identity.preReturnIdentitySha256,
+		) as [Sha256Ref, ...Sha256Ref[]];
+		const orderedAppendOperationIds = orderedPreReturnIdentities.map(identity => identity.core.appendOperationId) as [
+			OperationId,
+			...OperationId[],
+		];
+		const batchKeyInput = {
+			parentSessionId,
+			parentSessionGenerationSha256,
+			parentBranchGenerationSha256,
+			parentBranchAnchorEntryId,
+			toolCallId,
+			orderedPreReturnIdentitySha256s,
+		};
+		const foregroundAppendBatchKeySha256 = deriveTransientTaskForegroundAppendBatchKeyV1(batchKeyInput);
+		const preallocationRequest = {
+			schemaVersion: 1 as const,
+			entryPreallocationOperationId,
+			expectedToolResultEntryId: toolResultEntryId,
+			foregroundAppendBatchKeySha256,
+			parentSessionId,
+			parentSessionGenerationSha256,
+			parentBranchGenerationSha256,
+			parentBranchAnchorEntryId,
+			toolCallId,
+			orderedPreReturnIdentitySha256s,
+		};
+		const frozenBeforeReturnAt = new Date().toISOString();
+		const recordCoreTuple = [
+			"omp-transient-task-foreground-settlement-v1",
+			"before-return-core",
+			1,
+			classification,
+			invocation.serializerKey.serializerKeySha256,
+			invocation.sourceToolCallOrdinal,
+			[
+				"omp-transient-task-foreground-settlement-v1",
+				"batch-key-core",
+				1,
+				parentSessionId,
+				parentSessionGenerationSha256,
+				parentBranchGenerationSha256,
+				parentBranchAnchorEntryId,
+				toolCallId,
+				orderedPreReturnIdentitySha256s,
+			],
+			[
+				"omp-transient-task-foreground-settlement-v1",
+				"entry-preallocation-core",
+				1,
+				entryPreallocationOperationId,
+				toolResultEntryId,
+				foregroundAppendBatchKeySha256,
+				parentSessionId,
+				parentSessionGenerationSha256,
+				parentBranchGenerationSha256,
+				parentBranchAnchorEntryId,
+				toolCallId,
+				orderedPreReturnIdentitySha256s,
+			],
+			pendingOverlayBinding,
+			result.core.sourceResult,
+			result.core.sourceResultSnapshot,
+			result.core.wireResult,
+			result.core.resultUtf8,
+			orderedPreReturnIdentities,
+			orderedPreReturnIdentitySha256s,
+			frozenBeforeReturnAt,
+		] as const;
+		const record: ConfidentialTransientTaskForegroundBeforeReturnRecordV1 = {
+			schemaVersion: 1,
+			dispatchClassification: classification,
+			toolResultSerializerKeySha256: invocation.serializerKey.serializerKeySha256,
+			sourceToolCallOrdinal: invocation.sourceToolCallOrdinal,
+			batchKeyInput,
+			preallocationRequest,
+			pendingOverlayBinding,
+			returnedAgentToolResult: result.core.sourceResult,
+			returnedSourceResultSnapshot: result.core.sourceResultSnapshot,
+			returnedAgentToolResultWire: result.core.wireResult,
+			returnedAgentToolResultUtf8: result.core.resultUtf8,
+			orderedPreReturnIdentities,
+			orderedPreReturnIdentitySha256s,
+			frozenBeforeReturnAt,
+			recordSha256: transientTaskForegroundTupleSha256(recordCoreTuple),
+		};
+		const recordPrepare = await invocation.authority.beforeReturnRecovery
+			.prepareBeforeReturnRecord(record)
+			.catch(() => null);
+		if (recordPrepare === null) {
+			return this.#suspendTaskForegroundBeforeReturn(invocation, record, "record_prepare_response_lost");
+		}
+		if (recordPrepare.status !== "prepared" && recordPrepare.status !== "already_prepared") {
+			const reason =
+				recordPrepare.status === "pending_overlay_missing"
+					? "pending_overlay_missing"
+					: recordPrepare.status === "pending_overlay_conflict"
+						? "pending_overlay_conflict"
+						: recordPrepare.status === "session_generation_replaced"
+							? "session_generation_replaced"
+							: recordPrepare.status === "branch_generation_replaced"
+								? "branch_generation_replaced"
+								: recordPrepare.status === "branch_anchor_missing"
+									? "branch_anchor_missing"
+									: recordPrepare.status === "invalid"
+										? "invalid"
+										: "conflict";
+			return this.#suspendTaskForegroundBeforeReturn(invocation, record, reason);
+		}
+		const preallocation = await invocation.authority.sessionAppend
+			.preallocateExactToolResultEntry(preallocationRequest)
+			.catch(() => null);
+		if (preallocation === null) {
+			return this.#suspendTaskForegroundBeforeReturn(invocation, record, "preallocation_response_lost");
+		}
+		if (preallocation.status !== "preallocated" && preallocation.status !== "already_preallocated") {
+			const reason =
+				preallocation.status === "session_generation_replaced"
+					? "session_generation_replaced"
+					: preallocation.status === "branch_generation_replaced"
+						? "branch_generation_replaced"
+						: preallocation.status === "branch_anchor_missing"
+							? "branch_anchor_missing"
+							: preallocation.status === "invalid"
+								? "invalid"
+								: "conflict";
+			return this.#suspendTaskForegroundBeforeReturn(invocation, record, reason);
+		}
+		if (
+			preallocation.foregroundAppendBatchKeySha256 !== foregroundAppendBatchKeySha256 ||
+			preallocation.toolResultEntryId !== toolResultEntryId
+		) {
+			return this.#suspendTaskForegroundBeforeReturn(invocation, record, "conflict");
+		}
+		const preparedBeforeReturnAt = new Date().toISOString();
+		const handoffs = orderedPreReturnIdentities.map(preReturnIdentity => {
+			const handoff: ConfidentialTransientTaskForegroundResultHandoffV1 = {
+				schemaVersion: 1,
+				preReturnIdentity,
+				pendingOverlayBinding,
+				returnedAgentToolResult: result.core.sourceResult,
+				returnedSourceResultSnapshot: result.core.sourceResultSnapshot,
+				returnedAgentToolResultWire: result.core.wireResult,
+				returnedAgentToolResultUtf8: result.core.resultUtf8,
+				preparedBeforeReturnAt,
+				handoffSha256: transientTaskForegroundTupleSha256([
+					"omp-transient-task-foreground-settlement-v1",
+					"handoff-core",
+					1,
+					preReturnIdentity,
+					pendingOverlayBinding,
+					result.core.sourceResult,
+					result.core.sourceResultSnapshot,
+					result.core.wireResult,
+					result.core.resultUtf8,
+					preparedBeforeReturnAt,
+				]),
+			};
+			return handoff;
+		}) as [
+			ConfidentialTransientTaskForegroundResultHandoffV1,
+			...ConfidentialTransientTaskForegroundResultHandoffV1[],
+		];
+		const batchCore = [
+			"omp-transient-task-foreground-settlement-v1",
+			"handoff-batch-core",
+			1,
+			parentSessionId,
+			toolCallId,
+			invocation.serializerKey.serializerKeySha256,
+			invocation.sourceToolCallOrdinal,
+			foregroundAppendBatchKeySha256,
+			toolResultEntryId,
+			pendingOverlayBinding,
+			orderedAppendOperationIds,
+			orderedPreReturnIdentities,
+			orderedPreReturnIdentitySha256s,
+			result.core.resultUtf8Sha256,
+			result.core.resultUtf8ByteLength,
+			result.core.sourceResultSnapshot.sourceSnapshotUtf8Sha256,
+			result.core.sourceResultSnapshot.sourceSnapshotUtf8ByteLength,
+			handoffs,
+		] as const;
+		const batch: ConfidentialTransientTaskForegroundResultHandoffBatchV1 = {
+			schemaVersion: 1,
+			parentSessionId,
+			toolCallId,
+			toolResultSerializerKeySha256: invocation.serializerKey.serializerKeySha256,
+			sourceToolCallOrdinal: invocation.sourceToolCallOrdinal,
+			foregroundAppendBatchKeySha256,
+			toolResultEntryId,
+			pendingOverlayBinding,
+			orderedAppendOperationIds,
+			orderedPreReturnIdentities,
+			orderedPreReturnIdentitySha256s,
+			returnedAgentToolResultUtf8Sha256: result.core.resultUtf8Sha256,
+			returnedAgentToolResultUtf8ByteLength: result.core.resultUtf8ByteLength,
+			returnedSourceResultSnapshotSha256: result.core.sourceResultSnapshot.sourceSnapshotUtf8Sha256,
+			returnedSourceResultSnapshotByteLength: result.core.sourceResultSnapshot.sourceSnapshotUtf8ByteLength,
+			handoffs,
+			handoffBatchSha256: transientTaskForegroundTupleSha256(batchCore),
+		};
+		const prepared = await invocation.authority.settlement.prepareHandoff(batch).catch(() => null);
+		if (prepared === null) {
+			return this.#suspendTaskForegroundBeforeReturn(invocation, record, "handoff_prepare_response_lost");
+		}
+		if (prepared.status !== "prepared" && prepared.status !== "already_prepared") {
+			const reason =
+				prepared.status === "session_generation_replaced"
+					? "session_generation_replaced"
+					: prepared.status === "branch_generation_replaced"
+						? "branch_generation_replaced"
+						: prepared.status === "invalid"
+							? "invalid"
+							: "conflict";
+			return this.#suspendTaskForegroundBeforeReturn(invocation, record, reason);
+		}
+		if (
+			prepared.handoffBatchSha256 !== batch.handoffBatchSha256 ||
+			transientTaskForegroundStringify(prepared.orderedPreReturnIdentitySha256s) !==
+				transientTaskForegroundStringify(orderedPreReturnIdentitySha256s)
+		) {
+			return this.#suspendTaskForegroundBeforeReturn(invocation, record, "conflict");
+		}
+		return batch;
+	}
+
+	async #completeTaskForegroundInvocation(
+		toolCallId: string,
+		invocation: TaskForegroundInvocationV1 | null,
+		classification: TransientTaskForegroundDispatchClassificationV1 | null,
+		preclassificationReason: "preflight_error" | "mode_error",
+		children: readonly TaskForegroundCompletedChildV1[],
+		sourceResult: AgentToolResult<TaskToolDetails>,
+	): Promise<AgentToolResult<TaskToolDetails>> {
+		if (!invocation) return sourceResult;
+		const projectionResult = validateAndProjectTransientTaskForegroundSourceAgentToolResultV1(sourceResult);
+		const returnedResult = (
+			projectionResult.status === "projected"
+				? projectionResult.sourceResult
+				: projectionResult.rejection.core.toolResult
+		) as AgentToolResult<TaskToolDetails>;
+		const resultProjection =
+			projectionResult.status === "projected"
+				? projectionResult.projection
+				: projectionResult.rejection.core.toolResultProjection;
+		const completedBlockingChildCount = children.length;
+		const resultLooksLikeToolError =
+			projectionResult.status === "rejected" ||
+			returnedResult.isError === true ||
+			(Array.isArray(returnedResult.details?.results) && returnedResult.details.results.length === 0);
+		let observationInput: Parameters<
+			AgentSessionTransientTaskSourceObservationProducerV1["reserveAndFreezeTransientTaskSourceObservationDraft"]
+		>[0]["core"]["observationInput"];
+		let executedWithoutHandoff = false;
+
+		if (classification === null) {
+			observationInput = {
+				schemaVersion: 1,
+				eventKind: "task_execute_result_classification",
+				executeEntryObservationReceipt: invocation.executeEntryObservationReceipt,
+				result: resultProjection,
+				dispatchClassification: null,
+				resultDisposition: "executed_without_handoff",
+				noHandoffReason: preclassificationReason,
+				completedBlockingChildCount: 0,
+			};
+			executedWithoutHandoff = true;
+		} else if (!isTaskForegroundPresentDispatchClassification(classification)) {
+			const reason = resultLooksLikeToolError ? "tool_error" : "async_only";
+			observationInput = {
+				schemaVersion: 1,
+				eventKind: "task_execute_result_classification",
+				executeEntryObservationReceipt: invocation.executeEntryObservationReceipt,
+				result: resultProjection,
+				dispatchClassification: classification,
+				resultDisposition: "executed_without_handoff",
+				noHandoffReason: reason,
+				completedBlockingChildCount: 0,
+			};
+			executedWithoutHandoff = true;
+		} else if (completedBlockingChildCount === 0) {
+			const reason = resultLooksLikeToolError ? "tool_error" : "zero_completed_blocking_children";
+			observationInput = {
+				schemaVersion: 1,
+				eventKind: "task_execute_result_classification",
+				executeEntryObservationReceipt: invocation.executeEntryObservationReceipt,
+				result: resultProjection,
+				dispatchClassification: classification,
+				resultDisposition: "executed_without_handoff",
+				noHandoffReason: reason,
+				completedBlockingChildCount: 0,
+			};
+			executedWithoutHandoff = true;
+		} else if (projectionResult.status === "rejected") {
+			observationInput = {
+				schemaVersion: 1,
+				eventKind: "task_execute_result_classification",
+				executeEntryObservationReceipt: invocation.executeEntryObservationReceipt,
+				result: resultProjection,
+				dispatchClassification: classification,
+				resultDisposition: "executed_without_handoff",
+				noHandoffReason: "source_value_unrepresentable",
+				sourceProjectionRejection: projectionResult.rejection,
+				completedBlockingChildCount,
+			};
+			executedWithoutHandoff = true;
+		} else {
+			observationInput = {
+				schemaVersion: 1,
+				eventKind: "task_execute_result_classification",
+				executeEntryObservationReceipt: invocation.executeEntryObservationReceipt,
+				result: resultProjection,
+				dispatchClassification: classification,
+				resultDisposition: "foreground_handoff_present",
+				noHandoffReason: null,
+				completedBlockingChildCount,
+			};
+		}
+		const executeResultObservationReceipt = await this.#recordTaskForegroundObservation(invocation, observationInput);
+		if (executeResultObservationReceipt.core.eventKind !== "task_execute_result_classification") {
+			throw new StructuredSubagentError("execution", "Task execute-result observation receipt changed event kind.");
+		}
+
+		if (executedWithoutHandoff) return returnedResult;
+		if (classification === null || !isTaskForegroundPresentDispatchClassification(classification)) {
+			throw new StructuredSubagentError("execution", "Task foreground handoff classification is unavailable.");
+		}
+
+		await this.#prepareTaskForegroundHandoff(toolCallId, invocation, classification, children, resultProjection);
+		return returnedResult;
+	}
+
 	/**
 	 * Create a TaskTool instance with async agent discovery.
 	 */
@@ -751,6 +1577,24 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			);
 		}
 		const policies = preflights.map(preflight => preflight.policy!);
+		const foregroundInvocation = await this.#beginTaskForegroundInvocation(toolCallId, params);
+		const foregroundChildren: TaskForegroundCompletedChildV1[] = [];
+		let foregroundClassification: TransientTaskForegroundDispatchClassificationV1 | null = null;
+		const completeForeground = (
+			result: AgentToolResult<TaskToolDetails>,
+			preclassificationReason: "preflight_error" | "mode_error" = "mode_error",
+		) =>
+			this.#completeTaskForegroundInvocation(
+				toolCallId,
+				foregroundInvocation,
+				foregroundClassification,
+				preclassificationReason,
+				foregroundChildren,
+				result,
+			);
+		const onForegroundCompletedChild = (child: TaskForegroundCompletedChildV1) => {
+			foregroundChildren.push(child);
+		};
 		const itemBlocking = policies.map(policy => policy.effectiveAgent.blocking === true);
 
 		// Execution mode is per item: an item whose agent type declares
@@ -760,6 +1604,17 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const asyncEnabled = this.session.settings.get("async.enabled");
 		const manager = asyncEnabled ? this.session.asyncJobManager : undefined;
 		const asyncItems = manager ? spawnItems.filter((_, index) => !itemBlocking[index]) : [];
+		if (foregroundInvocation) {
+			const blockingChildCount = manager
+				? itemBlocking.reduce((count, blocking) => count + (blocking ? 1 : 0), 0)
+				: spawnItems.length;
+			const asyncChildCount = manager ? spawnItems.length - blockingChildCount : 0;
+			foregroundClassification = this.#createTaskForegroundDispatchClassification(
+				foregroundInvocation,
+				blockingChildCount,
+				asyncChildCount,
+			);
+		}
 		const depthCapacity = canSpawnAtDepth(
 			this.session.settings.get("task.maxRecursionDepth") ?? 2,
 			this.session.taskDepth ?? 0,
@@ -793,8 +1648,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				defaultAgent,
 				signal,
 				onUpdate,
+				onForegroundCompletedChild,
 			);
-			if (!advisory) return result;
+			if (!advisory) return completeForeground(result);
 			let appended = false;
 			const content = result.content.map(part => {
 				if (!appended && part.type === "text" && typeof part.text === "string") {
@@ -804,7 +1660,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				return part;
 			});
 			if (!appended) content.push({ type: "text", text: advisory });
-			return { ...result, content };
+			return completeForeground({ ...result, content });
 		}
 
 		// Coordination only makes sense for spawns that keep running after this
@@ -840,14 +1696,17 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			return { ...result, content };
 		};
 		if (asyncItems.length === 0) {
-			return withAdvisory(
-				await this.#executeSyncFanout(
-					toolCallId,
-					params,
-					spawnItems.map((item, index) => ({ item, index })),
-					defaultAgent,
-					signal,
-					onUpdate,
+			return completeForeground(
+				withAdvisory(
+					await this.#executeSyncFanout(
+						toolCallId,
+						params,
+						spawnItems.map((item, index) => ({ item, index })),
+						defaultAgent,
+						signal,
+						onUpdate,
+						onForegroundCompletedChild,
+					),
 				),
 			);
 		}
@@ -928,14 +1787,21 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 
 		const started: Array<{ agentId: string; jobId: string }> = [];
 		const failedSchedules: string[] = [];
+		let reusableTransientTaskRuntimeAuthority = foregroundInvocation?.runtimeAuthority;
 		for (const spawn of asyncSpawns) {
+			const transientTaskRuntimeAuthority = policies[spawn.progress.index]!.isIsolated
+				? reusableTransientTaskRuntimeAuthority
+				: undefined;
+			if (transientTaskRuntimeAuthority) reusableTransientTaskRuntimeAuthority = undefined;
 			try {
-				const jobId = this.#registerSpawnJob({
+				const jobId = await this.#registerSpawnJob({
 					manager,
 					toolCallId,
 					spawnParams: spawnParamsFor(params, spawn.item, defaultAgent),
 					agentId: spawn.agentId,
 					progress: spawn.progress,
+					policy: policies[spawn.progress.index]!,
+					transientTaskRuntimeAuthority,
 					ircEnabled,
 					buildDetails: buildAsyncDetails,
 					onUpdate,
@@ -956,7 +1822,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		}
 
 		if (started.length === 0 && syncSpawns.length === 0) {
-			return {
+			return completeForeground({
 				content: [
 					{
 						type: "text",
@@ -964,7 +1830,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					},
 				],
 				details: { projectAgentsDir: null, results: [], totalDurationMs: 0 },
-			};
+			});
 		}
 
 		const scheduleFailureSummary =
@@ -989,30 +1855,34 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					content: [{ type: "text", text: `Spawned agent \`${agentId}\`...` }],
 					details: buildAsyncDetails(),
 				});
-				return withAdvisory({
-					content: [
-						{
-							type: "text",
-							text: `Spawned agent \`${agentId}\` (job \`${jobId}\`). Its result auto-delivers on yield unless a settled \`hub jobs\`/\`wait\` snapshot consumes it first. ${coordinationHint}`,
-						},
-					],
-					details: buildAsyncDetails(),
-				});
+				return completeForeground(
+					withAdvisory({
+						content: [
+							{
+								type: "text",
+								text: `Spawned agent \`${agentId}\` (job \`${jobId}\`). Its result auto-delivers on yield unless a settled \`hub jobs\`/\`wait\` snapshot consumes it first. ${coordinationHint}`,
+							},
+						],
+						details: buildAsyncDetails(),
+					}),
+				);
 			}
 			const startedListing = started.map(({ agentId, jobId }) => `- \`${agentId}\` (job \`${jobId}\`)`).join("\n");
 			onUpdate?.({
 				content: [{ type: "text", text: `Spawned ${started.length} agents...` }],
 				details: buildAsyncDetails(),
 			});
-			return withAdvisory({
-				content: [
-					{
-						type: "text",
-						text: `Spawned ${started.length} background agents using ${agentLabel}.${scheduleFailureSummary} Each result auto-delivers on yield unless a settled \`hub jobs\`/\`wait\` snapshot consumes it first.\n${startedListing}\n${coordinationHint}`,
-					},
-				],
-				details: buildAsyncDetails(),
-			});
+			return completeForeground(
+				withAdvisory({
+					content: [
+						{
+							type: "text",
+							text: `Spawned ${started.length} background agents using ${agentLabel}.${scheduleFailureSummary} Each result auto-delivers on yield unless a settled \`hub jobs\`/\`wait\` snapshot consumes it first.\n${startedListing}\n${coordinationHint}`,
+						},
+					],
+					details: buildAsyncDetails(),
+				}),
+			);
 		}
 
 		// Mixed call: the async jobs above already run detached; the blocking
@@ -1044,6 +1914,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						});
 					}
 				: undefined,
+			onTransientForegroundCompletedChild: onForegroundCompletedChild,
 		});
 		const merged = mergeSyncPayloads(
 			syncSpawns.map(spawn => ({ item: spawn.item, index: spawn.index })),
@@ -1077,10 +1948,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const text = [merged.contentParts.join("\n\n"), spawnedSummary]
 			.filter(section => section.trim().length > 0)
 			.join("\n\n");
-		return withAdvisory({
-			content: [{ type: "text", text: text.length > 0 ? text : "No results." }],
-			details: buildAsyncDetails(),
-		});
+		return completeForeground(
+			withAdvisory({
+				content: [{ type: "text", text: text.length > 0 ? text : "No results." }],
+				details: buildAsyncDetails(),
+			}),
+		);
 	}
 
 	/**
@@ -1089,19 +1962,59 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	 * supplies the (possibly batch-shared) progress snapshot and `onSettled`
 	 * feeds the caller's aggregate counters.
 	 */
-	#registerSpawnJob(options: {
+	async #registerSpawnJob(options: {
 		manager: AsyncJobManager;
 		toolCallId: string;
 		spawnParams: TaskParams;
 		agentId: string;
+		policy: EffectiveSubagentPolicy;
+		transientTaskRuntimeAuthority?: AgentSessionTransientTaskRuntimeAuthorityV1;
 		progress: AgentProgress;
 		ircEnabled: boolean;
 		buildDetails: () => TaskToolDetails;
 		onUpdate?: AgentToolUpdateCallback<TaskToolDetails>;
 		onSettled?: (failed: boolean) => void;
-	}): string {
-		const { manager, toolCallId, spawnParams, agentId, progress, ircEnabled, buildDetails, onUpdate, onSettled } =
-			options;
+	}): Promise<string> {
+		const {
+			manager,
+			toolCallId,
+			spawnParams,
+			agentId,
+			progress,
+			policy,
+			transientTaskRuntimeAuthority,
+			ircEnabled,
+			buildDetails,
+			onUpdate,
+			onSettled,
+		} = options;
+		let transientTaskRuntimeAssembly: StructuredSubagentTransientTaskRuntimeAssemblyV1 | undefined;
+		let transientTaskOwnerSessionIndex: ConfidentialAsyncJobTransientTaskRecoveryOwnerSessionIndexV1 | undefined;
+		if (policy.isIsolated) {
+			const authority =
+				transientTaskRuntimeAuthority ??
+				(await (() => {
+					const acquireAuthority = resolveTransientTaskRuntimeAuthorityAcquirer(this.session);
+					if (!acquireAuthority) {
+						throw new StructuredSubagentError(
+							"preflight",
+							"Isolated task execution requires the session-owned transient-task runtime authority.",
+						);
+					}
+					return acquireAuthority();
+				})());
+			transientTaskOwnerSessionIndex = authority.ownerSessionIndex;
+			transientTaskRuntimeAssembly = await createStructuredSubagentTransientTaskRuntimeV1({
+				authority,
+				parentToolCallId: toolCallId,
+				spawnIndex: progress.index,
+				detachedJobId: agentId,
+				childId: agentId,
+				agentName: policy.agent.name,
+				captureMode: policy.mergeMode,
+				applyChanges: policy.applyChanges,
+			});
+		}
 		const buildFollowUpHint = async (aborted: boolean): Promise<string> => {
 			if (aborted) {
 				const ref = AgentRegistry.global().get(agentId);
@@ -1117,143 +2030,287 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			const followUp = ircEnabled ? "message it via `hub` to follow up; " : "";
 			return `\n\n${agentId} is now idle — ${followUp}transcript at history://${agentId}`;
 		};
-		return manager.register(
-			"task",
-			agentId,
-			async ({ signal: runSignal, reportProgress, markRunning }) => {
-				const startedAt = Date.now();
-				const semaphore = this.#getSpawnSemaphore();
-				let semaphoreHeld = false;
-				// Every release funnels through here: the flag flips before the
-				// release so no path — acquire-time abort, executor failure, or a
-				// future refactor that reorders the branches — can return a permit
-				// twice. Releasing a permit this job never acquired would steal one
-				// from a running job and let a later spawn start past
-				// task.maxConcurrency.
-				const releasePermit = () => {
-					if (!semaphoreHeld) return;
-					semaphoreHeld = false;
-					this.#releaseSpawnSemaphore();
+
+		const runSpawnJob = async (
+			runSignal: AbortSignal,
+			reportProgress: (text: string, details?: Record<string, unknown>) => Promise<void>,
+			markRunning: () => void,
+		): Promise<{
+			readonly deliveryText: string;
+			readonly resultFailed: boolean;
+			readonly terminalEvidence: TransientTaskPostTerminalCleanupEvidenceV1 | undefined;
+			readonly preExecutionCancelled: boolean;
+		}> => {
+			const startedAt = Date.now();
+			const semaphore = this.#getSpawnSemaphore();
+			let semaphoreHeld = false;
+			let settledReported = false;
+			const reportSettled = (failed: boolean) => {
+				if (settledReported) return;
+				settledReported = true;
+				onSettled?.(failed);
+			};
+			const releasePermit = () => {
+				if (!semaphoreHeld) return;
+				semaphoreHeld = false;
+				this.#releaseSpawnSemaphore();
+			};
+			try {
+				await semaphore.acquire(runSignal);
+				semaphoreHeld = true;
+			} catch {
+				// Pass an acquire-time abort through the sealed transient runtime so
+				// it can acknowledge pre-pending state and release the pre-bind claim.
+			}
+			const acquiredAt = Date.now();
+			if (!semaphoreHeld || runSignal.aborted) {
+				releasePermit();
+				progress.status = "aborted";
+				if (!transientTaskRuntimeAssembly) {
+					reportSettled(true);
+					throw new Error(TRANSIENT_TASK_DETACHED_PRE_EXECUTION_ABORT_JOB_ERROR_TEXT_V1);
+				}
+				let preExecutionCancelled = false;
+				await this.#executeSync(
+					toolCallId,
+					spawnParams,
+					runSignal,
+					undefined,
+					agentId,
+					progress.index,
+					true,
+					{ invokedAt: startedAt, acquiredAt },
+					transientTaskRuntimeAssembly,
+					undefined,
+					() => {
+						preExecutionCancelled = true;
+					},
+				);
+				reportSettled(true);
+				if (!preExecutionCancelled) {
+					throw new Error("Transient task aborted before execution without sealed cancellation settlement");
+				}
+				return {
+					deliveryText: TRANSIENT_TASK_DETACHED_PRE_EXECUTION_ABORT_JOB_ERROR_TEXT_V1,
+					resultFailed: true,
+					terminalEvidence: undefined,
+					preExecutionCancelled: true,
 				};
-				try {
-					await semaphore.acquire(runSignal);
-					semaphoreHeld = true;
-				} catch {
-					// Fall through so an acquire-time abort goes through the same
-					// path as the post-acquire race below: progress + onSettled
-					// have to fire even when the spawn never reached the executor,
-					// otherwise the batch aggregate state stays "running" forever.
-				}
-				const acquiredAt = Date.now();
-				if (!semaphoreHeld || runSignal.aborted) {
-					releasePermit();
+			}
+			let terminalEvidence: TransientTaskPostTerminalCleanupEvidenceV1 | undefined;
+			let preExecutionCancelled = false;
+			try {
+				markRunning();
+				progress.status = "running";
+				await reportProgress(
+					`Running background task ${agentId}...`,
+					buildDetails() as unknown as Record<string, unknown>,
+				);
+				const forwardSyncProgress: AgentToolUpdateCallback<TaskToolDetails> = async update => {
+					const nextProgress = update.details?.progress?.[0];
+					if (nextProgress) {
+						progress.resolvedModel = nextProgress.resolvedModel;
+						progress.resolvedModelIsFallback = nextProgress.resolvedModelIsFallback;
+						progress.tokens = nextProgress.tokens;
+						progress.requests = nextProgress.requests;
+						progress.contextTokens = nextProgress.contextTokens;
+						progress.contextWindow = nextProgress.contextWindow;
+						progress.cost = nextProgress.cost;
+						progress.toolCount = nextProgress.toolCount;
+						progress.currentTool = nextProgress.currentTool;
+						progress.lastIntent = nextProgress.lastIntent;
+						progress.recentTools = nextProgress.recentTools.slice();
+						progress.recentOutput = nextProgress.recentOutput.slice();
+						progress.retryState = nextProgress.retryState;
+						progress.retryFailure = nextProgress.retryFailure;
+					}
+					const updateText =
+						update.content.find(part => part.type === "text")?.text ?? `Running background task ${agentId}...`;
+					await reportProgress(updateText, buildDetails() as unknown as Record<string, unknown>);
+				};
+				const result = await this.#executeSync(
+					toolCallId,
+					spawnParams,
+					runSignal,
+					forwardSyncProgress,
+					agentId,
+					progress.index,
+					true,
+					{ invokedAt: startedAt, acquiredAt },
+					transientTaskRuntimeAssembly,
+					evidence => {
+						terminalEvidence = evidence;
+					},
+					() => {
+						preExecutionCancelled = true;
+					},
+				);
+				if (preExecutionCancelled) {
 					progress.status = "aborted";
-					onSettled?.(true);
-					throw new Error("Aborted before execution");
-				}
-				try {
-					markRunning();
-					progress.status = "running";
-					await reportProgress(
-						`Running background task ${agentId}...`,
-						buildDetails() as unknown as Record<string, unknown>,
-					);
-					const forwardSyncProgress: AgentToolUpdateCallback<TaskToolDetails> = async update => {
-						const nextProgress = update.details?.progress?.[0];
-						if (nextProgress) {
-							// The job body owns status and identity (id/index/agent);
-							// copy only the live metrics the subagent streams so the
-							// polling row reflects the resolved model, reasoning level,
-							// and running counters without reverting the "running"
-							// status back to the subagent's initial "pending" snapshot.
-							progress.resolvedModel = nextProgress.resolvedModel;
-							progress.resolvedModelIsFallback = nextProgress.resolvedModelIsFallback;
-							progress.tokens = nextProgress.tokens;
-							progress.requests = nextProgress.requests;
-							progress.contextTokens = nextProgress.contextTokens;
-							progress.contextWindow = nextProgress.contextWindow;
-							progress.cost = nextProgress.cost;
-							progress.toolCount = nextProgress.toolCount;
-							progress.currentTool = nextProgress.currentTool;
-							progress.lastIntent = nextProgress.lastIntent;
-							progress.recentTools = nextProgress.recentTools.slice();
-							progress.recentOutput = nextProgress.recentOutput.slice();
-							progress.retryState = nextProgress.retryState;
-							progress.retryFailure = nextProgress.retryFailure;
-						}
-						const updateText =
-							update.content.find(part => part.type === "text")?.text ?? `Running background task ${agentId}...`;
-						await reportProgress(updateText, buildDetails() as unknown as Record<string, unknown>);
-					};
-					const result = await this.#executeSync(
-						toolCallId,
-						spawnParams,
-						runSignal,
-						forwardSyncProgress,
-						agentId,
-						progress.index,
-						true,
-						{ invokedAt: startedAt, acquiredAt },
-					);
-					const finalText = result.content.find(part => part.type === "text")?.text ?? "(no output)";
-					const singleResult = result.details?.results[0];
-					// A missing result means the sync path failed at the tool level
-					// (results: []) — treat it as a failure, not success.
-					const resultFailed = !singleResult || (singleResult.aborted ?? false) || singleResult.exitCode !== 0;
-					progress.status = singleResult?.aborted ? "aborted" : resultFailed ? "failed" : "completed";
-					progress.durationMs = singleResult?.durationMs ?? Math.max(0, Date.now() - startedAt);
-					progress.tokens = singleResult?.tokens ?? 0;
-					progress.requests = singleResult?.requests ?? 0;
-					progress.contextTokens = singleResult?.contextTokens;
-					progress.contextWindow = singleResult?.contextWindow;
-					progress.cost = singleResult?.usage?.cost.total ?? 0;
-					progress.extractedToolData = singleResult?.extractedToolData;
-					progress.retryFailure = singleResult?.retryFailure;
-					progress.retryState = undefined;
-					if (singleResult?.resolvedModel) {
-						progress.resolvedModel = singleResult.resolvedModel;
-						progress.resolvedModelIsFallback = singleResult.resolvedModelIsFallback;
-					} else {
-						delete progress.resolvedModel;
-						delete progress.resolvedModelIsFallback;
-					}
-					onSettled?.(resultFailed);
-					const statusText = resultFailed
-						? `Background task ${agentId} failed.`
-						: `Background task ${agentId} complete.`;
-					await reportProgress(statusText, buildDetails() as unknown as Record<string, unknown>);
-					const deliveryText = `${finalText}${await buildFollowUpHint(singleResult?.aborted === true)}`;
-					if (resultFailed) {
-						// Mark the job itself failed; the failed agent stays interrogable.
-						throw new TaskJobError(deliveryText);
-					}
-					return deliveryText;
-				} catch (error) {
-					if (error instanceof TaskJobError) {
-						throw error;
-					}
-					progress.status = "failed";
 					progress.durationMs = Math.max(0, Date.now() - startedAt);
-					onSettled?.(true);
-					const statusText = `Background task ${agentId} failed.`;
+					reportSettled(true);
+					return {
+						deliveryText: TRANSIENT_TASK_DETACHED_PRE_EXECUTION_ABORT_JOB_ERROR_TEXT_V1,
+						resultFailed: true,
+						terminalEvidence: undefined,
+						preExecutionCancelled: true,
+					};
+				}
+				const finalText = result.content.find(part => part.type === "text")?.text ?? "(no output)";
+				const singleResult = result.details?.results[0];
+				const resultFailed = !singleResult || (singleResult.aborted ?? false) || singleResult.exitCode !== 0;
+				if (transientTaskRuntimeAssembly && !terminalEvidence) {
+					throw new Error("Isolated background task completed without exact terminal evidence");
+				}
+				progress.status = singleResult?.aborted ? "aborted" : resultFailed ? "failed" : "completed";
+				progress.durationMs = singleResult?.durationMs ?? Math.max(0, Date.now() - startedAt);
+				progress.tokens = singleResult?.tokens ?? 0;
+				progress.requests = singleResult?.requests ?? 0;
+				progress.contextTokens = singleResult?.contextTokens;
+				progress.contextWindow = singleResult?.contextWindow;
+				progress.cost = singleResult?.usage?.cost.total ?? 0;
+				progress.extractedToolData = singleResult?.extractedToolData;
+				progress.retryFailure = singleResult?.retryFailure;
+				progress.retryState = undefined;
+				if (singleResult?.resolvedModel) {
+					progress.resolvedModel = singleResult.resolvedModel;
+					progress.resolvedModelIsFallback = singleResult.resolvedModelIsFallback;
+				} else {
+					delete progress.resolvedModel;
+					delete progress.resolvedModelIsFallback;
+				}
+				reportSettled(resultFailed);
+				const statusText = resultFailed
+					? `Background task ${agentId} failed.`
+					: `Background task ${agentId} complete.`;
+				try {
 					await reportProgress(statusText, buildDetails() as unknown as Record<string, unknown>);
-					const message = error instanceof Error ? error.message : String(error);
-					const hint = AgentRegistry.global().get(agentId) ? await buildFollowUpHint(false) : "";
-					throw new TaskJobError(`${message}${hint}`);
-				} finally {
-					releasePermit();
+				} catch (error) {
+					if (!terminalEvidence) throw error;
+					logger.warn("Terminal task progress observation failed", {
+						agentId,
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
+				let deliveryText = finalText;
+				try {
+					deliveryText += await buildFollowUpHint(singleResult?.aborted === true);
+				} catch (error) {
+					if (!terminalEvidence) throw error;
+					logger.warn("Terminal task follow-up hint failed", {
+						agentId,
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
+				return {
+					deliveryText,
+					resultFailed,
+					terminalEvidence,
+					preExecutionCancelled: false,
+				};
+			} catch (error) {
+				progress.status = "failed";
+				progress.durationMs = Math.max(0, Date.now() - startedAt);
+				reportSettled(true);
+				const message = error instanceof Error ? error.message : String(error);
+				if (transientTaskRuntimeAssembly && terminalEvidence) {
+					return {
+						deliveryText: message,
+						resultFailed: true,
+						terminalEvidence,
+						preExecutionCancelled: false,
+					};
+				}
+				await reportProgress(
+					`Background task ${agentId} failed.`,
+					buildDetails() as unknown as Record<string, unknown>,
+				);
+				if (error instanceof TaskJobError) throw error;
+				const hint = AgentRegistry.global().get(agentId) ? await buildFollowUpHint(false) : "";
+				throw new TaskJobError(`${message}${hint}`);
+			} finally {
+				releasePermit();
+			}
+		};
+		const jobProgress = {
+			id: agentId,
+			agentId,
+			queued: true,
+			onProgress: async (text: string) => {
+				try {
+					await onUpdate?.({ content: [{ type: "text", text }], details: buildDetails() });
+				} catch (error) {
+					logger.warn("Task progress observer failed", {
+						agentId,
+						error: error instanceof Error ? error.message : String(error),
+					});
 				}
 			},
-			{
-				id: agentId,
+		};
+		if (!transientTaskRuntimeAssembly || !transientTaskOwnerSessionIndex) {
+			return manager.register(
+				"task",
 				agentId,
-				queued: true,
-				ownerId: this.session.getAgentId?.() ?? undefined,
-				onProgress: text => {
-					onUpdate?.({ content: [{ type: "text", text }], details: buildDetails() });
+				async context => {
+					const outcome = await runSpawnJob(context.signal, context.reportProgress, context.markRunning);
+					if (outcome.resultFailed) throw new TaskJobError(outcome.deliveryText);
+					return outcome.deliveryText;
 				},
-			},
-		);
+				{
+					...jobProgress,
+					ownerId: this.session.getAgentId?.() ?? undefined,
+				},
+			);
+		}
+
+		const assembly = transientTaskRuntimeAssembly;
+		const ownerSessionIndex = transientTaskOwnerSessionIndex;
+		try {
+			return manager.registerTransientTask(
+				agentId,
+				async (context: AsyncJobTransientTaskRunContextV1) => {
+					const outcome = await runSpawnJob(
+						context.signal,
+						(text, details) => context.reportProgress(text, details),
+						context.markRunning,
+					);
+					if (outcome.preExecutionCancelled) {
+						return assembly.settleDetached({
+							context,
+							terminalStatus: "cancelled",
+							terminalEvidence: null,
+							deliveryText: TRANSIENT_TASK_DETACHED_PRE_EXECUTION_ABORT_JOB_ERROR_TEXT_V1,
+						});
+					}
+					if (!outcome.terminalEvidence) {
+						throw new Error("Isolated background task completed without exact terminal evidence");
+					}
+					return assembly.settleDetached({
+						context,
+						terminalStatus: outcome.resultFailed ? "failed" : "completed",
+						terminalEvidence: outcome.terminalEvidence,
+						deliveryText: outcome.deliveryText,
+					});
+				},
+				{
+					...jobProgress,
+					ownerId: ownerSessionIndex.ownerId,
+					ownerSessionId: ownerSessionIndex.ownerSessionId,
+					ownerSessionGenerationSha256: ownerSessionIndex.ownerSessionGenerationSha256,
+					deliveryEpoch: ownerSessionIndex.deliveryEpoch,
+				},
+			);
+		} catch (registrationError) {
+			const message = registrationError instanceof Error ? registrationError.message : String(registrationError);
+			const reason =
+				message === "Async job manager is disposed"
+					? "async_job_manager_disposed"
+					: message.startsWith("Background job limit reached (")
+						? "async_job_capacity_rejected"
+						: "async_job_registration_failed";
+			await assembly.abortBeforeRegistration(reason);
+			throw registrationError;
+		}
 	}
 
 	/**
@@ -1269,6 +2326,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		defaultAgent: string,
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<TaskToolDetails>,
+		onTransientForegroundCompletedChild?: (child: TaskForegroundCompletedChildV1) => void,
 	): Promise<AgentToolResult<TaskToolDetails>> {
 		if (spawns.length === 1) {
 			const spawn = spawns[0]!;
@@ -1286,6 +2344,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					spawn.index,
 					false,
 					{ invokedAt, acquiredAt },
+					undefined,
+					undefined,
+					undefined,
+					onTransientForegroundCompletedChild,
 				);
 			} finally {
 				this.#releaseSpawnSemaphore();
@@ -1320,6 +2382,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						emitCombined();
 					}
 				: undefined,
+			onTransientForegroundCompletedChild,
 		});
 
 		const merged = mergeSyncPayloads(spawns, payloads);
@@ -1350,8 +2413,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		spawns: SyncSpawnRef[];
 		signal?: AbortSignal;
 		onItemProgress?: (index: number, progress: AgentProgress) => void;
+		onTransientForegroundCompletedChild?: (child: TaskForegroundCompletedChildV1) => void;
 	}): Promise<(AgentToolResult<TaskToolDetails> | undefined)[]> {
-		const { toolCallId, params, defaultAgent, spawns, signal, onItemProgress } = args;
+		const { toolCallId, params, defaultAgent, spawns, signal, onItemProgress, onTransientForegroundCompletedChild } =
+			args;
 		const semaphore = this.#getSpawnSemaphore();
 		const { results } = await mapWithConcurrencyLimitAllSettled(
 			spawns,
@@ -1383,6 +2448,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						spawn.index,
 						false,
 						{ invokedAt, acquiredAt },
+						undefined,
+						undefined,
+						undefined,
+						onTransientForegroundCompletedChild,
 					);
 				} finally {
 					if (semaphoreHeld) this.#releaseSpawnSemaphore();
@@ -1422,8 +2491,25 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		spawnIndex = 0,
 		detached = false,
 		launchTiming?: { invokedAt: number; acquiredAt: number },
+		transientTaskRuntimeAssembly?: StructuredSubagentTransientTaskRuntimeAssemblyV1,
+		onTransientTerminalEvidence?: (evidence: TransientTaskPostTerminalCleanupEvidenceV1) => void,
+		onTransientPreExecutionCancelled?: (projection: TransientTaskResultlessTerminalProjectionV1) => void,
+		onTransientForegroundCompletedChild?: (child: TaskForegroundCompletedChildV1) => void,
 	): Promise<AgentToolResult<TaskToolDetails>> {
-		return this.#runSpawn(toolCallId, params, signal, onUpdate, preAllocatedId, spawnIndex, detached, launchTiming);
+		return this.#runSpawn(
+			toolCallId,
+			params,
+			signal,
+			onUpdate,
+			preAllocatedId,
+			spawnIndex,
+			detached,
+			launchTiming,
+			transientTaskRuntimeAssembly,
+			onTransientTerminalEvidence,
+			onTransientPreExecutionCancelled,
+			onTransientForegroundCompletedChild,
+		);
 	}
 
 	/** Spawn a fresh subagent and run it to completion. */
@@ -1436,13 +2522,18 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		spawnIndex = 0,
 		detached = false,
 		launchTiming?: { invokedAt: number; acquiredAt: number },
+		transientTaskRuntimeAssembly?: StructuredSubagentTransientTaskRuntimeAssemblyV1,
+		onTransientTerminalEvidence?: (evidence: TransientTaskPostTerminalCleanupEvidenceV1) => void,
+		onTransientPreExecutionCancelled?: (projection: TransientTaskResultlessTerminalProjectionV1) => void,
+		onTransientForegroundCompletedChild?: (child: TaskForegroundCompletedChildV1) => void,
 	): Promise<AgentToolResult<TaskToolDetails>> {
 		const startTime = Date.now();
 		const assignment = (params.task ?? "").trim();
 		const context = this.#isBatchEnabled() ? params.context?.trim() || undefined : undefined;
 		let latestProgress: AgentProgress | undefined;
+		let runtimeAssembly = transientTaskRuntimeAssembly;
 		try {
-			const execution = await runStructuredSubagent({
+			const structuredRequest: StructuredSubagentRequest = {
 				session: this.session,
 				invocationKind: "task",
 				assignment,
@@ -1476,7 +2567,46 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						},
 					});
 				},
-			});
+			};
+			if (!runtimeAssembly) {
+				const policy = await resolveEffectiveSubagentPolicy(structuredRequest);
+				if (policy.isIsolated) {
+					const childId = await reserveStructuredSubagentId(this.session, structuredRequest.identity);
+					const acquireAuthority = resolveTransientTaskRuntimeAuthorityAcquirer(this.session);
+					if (!acquireAuthority) {
+						throw new StructuredSubagentError(
+							"preflight",
+							"Isolated task execution requires the session-owned transient-task runtime authority.",
+						);
+					}
+					runtimeAssembly = await createStructuredSubagentTransientTaskRuntimeV1({
+						authority: await acquireAuthority(),
+						parentToolCallId: toolCallId,
+						spawnIndex,
+						detachedJobId: detached ? childId : null,
+						childId,
+						agentName: policy.agent.name,
+						captureMode: policy.mergeMode,
+						applyChanges: policy.applyChanges,
+					});
+					structuredRequest.identity = { id: childId, label: params.name };
+				}
+			}
+			if (runtimeAssembly) structuredRequest.transientTaskRuntime = runtimeAssembly.runtime;
+			const execution = await runStructuredSubagent(structuredRequest);
+			if (runtimeAssembly) {
+				if (!execution.terminalEvidence) {
+					throw new StructuredSubagentError(
+						"execution",
+						"Isolated task execution completed without exact terminal evidence.",
+					);
+				}
+				onTransientTerminalEvidence?.(execution.terminalEvidence);
+				onTransientForegroundCompletedChild?.({
+					spawnIndex,
+					handoffIdentity: runtimeAssembly.foregroundHandoffIdentity,
+				});
+			}
 			return this.#buildResultPayload(
 				execution.result,
 				execution.policy.discovery.projectAgentsDir,
@@ -1484,6 +2614,21 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				execution.mergeSummary,
 			);
 		} catch (error) {
+			if (error instanceof StructuredSubagentLifecycleFailure) {
+				onTransientTerminalEvidence?.(error.terminalEvidence);
+				if (error.terminalProjection?.document.terminalOutcome === "cancelled") {
+					onTransientPreExecutionCancelled?.(error.terminalProjection);
+				}
+				if (runtimeAssembly && error.result !== null) {
+					onTransientForegroundCompletedChild?.({
+						spawnIndex,
+						handoffIdentity: runtimeAssembly.foregroundHandoffIdentity,
+					});
+				}
+				if (error.result !== null) {
+					return this.#buildResultPayload(error.result, null, Date.now() - startTime, error.mergeSummary);
+				}
+			}
 			const message = error instanceof StructuredSubagentError ? error.message : String(error);
 			return {
 				content: [{ type: "text", text: `Task execution failed: ${message}` }],

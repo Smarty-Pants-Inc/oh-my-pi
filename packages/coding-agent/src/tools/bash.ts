@@ -11,7 +11,7 @@ import type { Component } from "@oh-my-pi/pi-tui";
 import { ImageProtocol, TERMINAL } from "@oh-my-pi/pi-tui";
 import { getProjectDir, isEnoent, logger, prompt } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
-import { applyDirenvPreflight, type BashResult, executeBash } from "../exec/bash-executor";
+import { applyDirenvPreflight, type BashResult, executeBash, executePersistentBash } from "../exec/bash-executor";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { InternalUrlRouter } from "../internal-urls";
 import { truncateToVisualLines } from "../modes/components/visual-truncate";
@@ -25,6 +25,11 @@ import type {
 } from "../session/client-bridge";
 import { type ExecutionEnvironmentBinding, mapExecutionEnvironmentPath } from "../session/execution-environment";
 import { DEFAULT_MAX_BYTES, enforceInlineByteCap, streamTailUpdates, TailBuffer } from "../session/streaming-output";
+import type {
+	PersistentModelWorkspacePath,
+	PersistentWorkspacePathMapper,
+	WorkspaceOperationLease,
+} from "../session/workspace-runtime-contracts";
 import { renderStatusLine } from "../tui";
 import { CachedOutputBlock, markFramedBlockComponent, outputBlockContentWidth } from "../tui/output-block";
 import { getSixelLineMask } from "../utils/sixel";
@@ -351,7 +356,17 @@ export interface BashToolDetails {
 	};
 }
 
-export interface BashToolOptions {}
+/** Persistent-only Bash routing supplied by CentralIntegration. */
+export interface PersistentBashRouteV1 {
+	readonly paths: PersistentWorkspacePathMapper;
+	/** Acquires the caller-preallocated operation lease for one complete Bash call. */
+	begin(signal?: AbortSignal): Promise<WorkspaceOperationLease>;
+}
+
+export interface BashToolOptions {
+	/** When present, foreground Bash routes only through the runtime bridge. */
+	readonly persistentRoute?: PersistentBashRouteV1;
+}
 
 type ManagedBashJobCompletion =
 	| {
@@ -937,8 +952,13 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 	readonly #asyncEnabled: boolean;
 	readonly #autoBackgroundEnabled: boolean;
 	readonly #autoBackgroundThresholdMs: number;
+	readonly #persistentRoute: PersistentBashRouteV1 | undefined;
 
-	constructor(private readonly session: ToolSession) {
+	constructor(
+		private readonly session: ToolSession,
+		options: BashToolOptions = {},
+	) {
+		this.#persistentRoute = options.persistentRoute;
 		this.#asyncEnabled = this.session.settings.get("async.enabled");
 		this.#autoBackgroundEnabled = this.session.settings.get("bash.autoBackground.enabled");
 		this.#autoBackgroundThresholdMs = Math.max(
@@ -1271,6 +1291,60 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		return Math.max(0, Math.min(this.#autoBackgroundThresholdMs, timeoutMs - timeoutBufferMs));
 	}
 
+	async #executePersistent(
+		rawCommand: string,
+		rawEnv: Record<string, string> | undefined,
+		rawCwd: string | undefined,
+		rawTimeout: number | undefined,
+		asyncRequested: boolean,
+		pty: boolean,
+		signal?: AbortSignal,
+	): Promise<AgentToolResult<BashToolDetails>> {
+		const route = this.#persistentRoute;
+		if (!route) throw new ToolError("Persistent bash route is unavailable.");
+		if (asyncRequested) throw new ToolError("Persistent bash supports only foreground execution.");
+		if (pty) throw new ToolError("Persistent bash does not support PTY execution.");
+		try {
+			if (rawEnv && Object.keys(rawEnv).length > 0) {
+				throw new ToolError("Persistent bash does not accept model-supplied environment variables.");
+			}
+		} catch (error) {
+			if (error instanceof ToolError) throw error;
+			throw new ToolError("Persistent bash received an invalid environment.");
+		}
+		if (!rawCommand.isWellFormed?.()) throw new ToolError("Persistent bash command must be well-formed Unicode.");
+		const timeoutSeconds = rawTimeout ?? 120;
+		if (
+			!Number.isSafeInteger(timeoutSeconds) ||
+			Object.is(timeoutSeconds, -0) ||
+			timeoutSeconds < 1 ||
+			timeoutSeconds > 120
+		) {
+			throw new ToolError("Persistent bash requires a timeout between 1 and 120 seconds.");
+		}
+		let cwd: PersistentModelWorkspacePath;
+		try {
+			if (route.paths.modelRoot !== "/workspace") throw new Error("unexpected workspace root");
+			cwd = route.paths.parse(rawCwd ?? route.paths.modelRoot).modelPath;
+		} catch {
+			throw new ToolError("Persistent bash cwd must be within /workspace.");
+		}
+		try {
+			const lease = await route.begin(signal);
+			const result = await executePersistentBash({
+				lease,
+				command: rawCommand,
+				cwd,
+				timeoutSeconds,
+				signal,
+			});
+			return this.#buildCompletedResult(result, timeoutSeconds, { requestedTimeoutSec: timeoutSeconds });
+		} catch (error) {
+			if (error instanceof ToolError) throw error;
+			throw new ToolError(error instanceof Error ? error.message : "Persistent bash execution failed.");
+		}
+	}
+
 	async #executeInEnvironment(options: {
 		environment: ExecutionEnvironmentBinding;
 		rawCommand: string;
@@ -1347,7 +1421,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		{
 			command: rawCommand,
 			env: rawEnv,
-			timeout: rawTimeout = 300,
+			timeout: rawTimeout,
 			cwd,
 
 			async: asyncRequested = false,
@@ -1357,6 +1431,10 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		onUpdate?: AgentToolUpdateCallback<BashToolDetails>,
 		ctx?: AgentToolContext,
 	): Promise<AgentToolResult<BashToolDetails>> {
+		if (this.#persistentRoute) {
+			return this.#executePersistent(rawCommand, rawEnv, cwd, rawTimeout, asyncRequested, pty, signal);
+		}
+		rawTimeout ??= 300;
 		const rawCwd = cwd;
 		const executionEnvironment = this.session.getExecutionEnvironment?.();
 		let command = rawCommand;

@@ -56,6 +56,7 @@ import type { CompactMode } from "../../session/compact-modes";
 import type { ExecutionEnvironmentProvider } from "../../session/execution-environment";
 import type { CustomMessage, CustomMessagePayload } from "../../session/messages";
 import type { ReadonlySessionManager, SessionManager } from "../../session/session-manager";
+import type { RuntimeProvider, RuntimeProviderRegistry } from "../../session/workspace-runtime-contracts.js";
 import type {
 	BashToolDetails,
 	BashToolInput,
@@ -1305,13 +1306,6 @@ export interface ExtensionAPI {
 	setSessionName(name: string): Promise<void>;
 
 	// =========================================================================
-	// Execution Environment Registration
-	// =========================================================================
-
-	/** Register this extension's execution environment provider. */
-	registerExecutionEnvironmentProvider(provider: ExecutionEnvironmentProvider): void;
-
-	// =========================================================================
 	// Provider Registration
 	// =========================================================================
 
@@ -1349,6 +1343,12 @@ export interface ExtensionAPI {
 	 * });
 	 */
 	registerProvider(name: string, config: ProviderConfig): void;
+
+	/** Register an adaptive execution provider immediately in the session-shared runtime registry. */
+	registerRuntimeProvider(provider: RuntimeProvider): void;
+
+	/** Register this extension's legacy transient execution-environment provider. */
+	registerExecutionEnvironmentProvider(provider: ExecutionEnvironmentProvider): void;
 
 	/** Shared event bus for extension communication. */
 	events: EventBus;
@@ -1395,6 +1395,8 @@ export interface ProviderConfig {
 	 */
 	fetchDynamicModels?: (apiKey: string | undefined) => Promise<readonly ProviderModelConfig[]>;
 }
+
+export type ModelProviderConfig = ProviderConfig;
 
 /** Configuration for a model within a provider. */
 export interface ProviderModelConfig {
@@ -1491,8 +1493,10 @@ export type SetServiceTierHandler = (family: ServiceTierFamily, tier: ServiceTie
 /** Shared state created by loader, used during registration and runtime. */
 export interface ExtensionRuntimeState {
 	flagValues: Map<string, boolean | string>;
-	/** Provider registrations queued during extension loading, processed during session initialization */
-	pendingProviderRegistrations: Array<{ name: string; config: ProviderConfig; sourceId: string }>;
+	/** Shared adaptive provider registry; runtime providers never enter the model registry. */
+	runtimeProviderRegistry: RuntimeProviderRegistry;
+	/** Model-provider registrations queued during extension loading. */
+	pendingProviderRegistrations: Array<{ name: string; config: ModelProviderConfig; sourceId: string }>;
 }
 
 /** Action implementations for ExtensionAPI methods. */
@@ -1552,6 +1556,7 @@ export interface Extension {
 	path: string;
 	resolvedPath: string;
 	label?: string;
+	/** Exact legacy transient execution-environment provider registered by this extension. */
 	executionEnvironmentProvider?: ExecutionEnvironmentProvider;
 	handlers: Map<string, HandlerFn[]>;
 	tools: Map<string, RegisteredTool<any, any>>;

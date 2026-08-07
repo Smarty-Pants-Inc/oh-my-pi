@@ -1,6 +1,20 @@
 import { Database, type SQLQueryBindings } from "bun:sqlite";
 import { describe, expect, it } from "bun:test";
-import { CLOUD_OMP_REMOTE_ROOT, type CreateWorkspaceRequest, type ExecRequest } from "../src/protocol";
+import type { RuntimeSearchRequest, RuntimeSearchResult } from "@oh-my-pi/pi-coding-agent";
+import {
+	CLOUD_OMP_REMOTE_ROOT,
+	CLOUDFLARE_RUNTIME_SEARCH_BYTE_BUDGET_V1,
+	CLOUDFLARE_RUNTIME_SEARCH_FILE_BUDGET_V1,
+	CLOUDFLARE_RUNTIME_SEARCH_RESULT_BYTE_BUDGET_V1,
+	CLOUDFLARE_RUNTIME_SEARCH_TRAVERSAL_BUDGET_V1,
+	type CloudflareRuntimeEffectTransportEnvelopeV1,
+	type CloudflareRuntimeInspectionTransportEnvelopeV1,
+	type CreateWorkspaceRequest,
+	canonicalRuntimeSha256V1,
+	type ExecRequest,
+	encodeCloudflareRuntimeSearchCursorV1,
+	MAX_SYNC_FILE_BYTES,
+} from "../src/protocol";
 import { SQLiteRetryScheduler, WorkspaceAlarmCoordinator } from "../src/worker/retry-scheduler";
 import {
 	hashWorkspaceId,
@@ -9,7 +23,9 @@ import {
 	WorkspaceAuditSink,
 } from "../src/worker/workspace-audit";
 import {
+	adaptWorkspaceFilesystem,
 	manifestRootSha256,
+	readAll,
 	sha256Hex,
 	type WorkspaceDirentLike,
 	type WorkspaceFilesystemLike,
@@ -40,6 +56,39 @@ const EXEC_REQUEST: ExecRequest = {
 	timeoutMs: 1_000,
 	outputByteLimit: 4_096,
 };
+const RUNTIME_REPLICA = {
+	providerId: "cloudflare",
+	profileId: "standard-2",
+	replicaId: "replica-filesystem-1",
+	workspaceId: "workspace-filesystem-1",
+} as const;
+const RUNTIME_FENCE = { fenceId: "fence-filesystem-1", token: "token-filesystem-1" } as const;
+const RUNTIME_LEASE = {
+	leaseId: "lease-filesystem-1",
+	replica: RUNTIME_REPLICA,
+	fenceId: RUNTIME_FENCE.fenceId,
+	baseGeneration: 3,
+	renewalSequence: 0,
+	acquiredAt: "2030-01-01T00:00:00.000Z",
+	renewBy: "2030-01-01T00:05:00.000Z",
+	expiresAt: "2030-01-01T00:10:00.000Z",
+} as const;
+const RUNTIME_ACCESS = {
+	operationLeaseId: "operation-filesystem-1",
+	workspaceId: RUNTIME_REPLICA.workspaceId,
+	expectedGeneration: RUNTIME_LEASE.baseGeneration,
+	replicaId: RUNTIME_REPLICA.replicaId,
+	leaseId: RUNTIME_LEASE.leaseId,
+	fence: RUNTIME_FENCE,
+} as const;
+const RUNTIME_ACCESS_TUPLE = [
+	RUNTIME_ACCESS.operationLeaseId,
+	RUNTIME_ACCESS.workspaceId,
+	RUNTIME_ACCESS.expectedGeneration,
+	RUNTIME_ACCESS.replicaId,
+	RUNTIME_ACCESS.leaseId,
+	RUNTIME_FENCE.fenceId,
+] as const;
 
 function isBinding(value: unknown): value is SQLQueryBindings {
 	return (
@@ -99,13 +148,33 @@ function missing(path: string): Error & { code: string } {
 class FakeFilesystem implements WorkspaceFilesystemLike {
 	readonly files = new Map<string, Uint8Array>();
 	readonly directories = new Set<string>();
+	readonly symlinks = new Map<string, string>();
+	readonly renameCalls: Array<{ oldPath: string; newPath: string }> = [];
+	readonly rmCalls: string[] = [];
+	readonly readdirCalls: string[] = [];
+	readonly lstatCalls: string[] = [];
+	readonly readCalls: string[] = [];
+	readByteCount = 0;
 	readonly writeStarted = Promise.withResolvers<void>();
+	readonly #inodes = new Map<string, number>();
+	#nextInode = 1;
 	nextWriteGate: Promise<void> | undefined;
+	renameErrorAfterMutation: unknown;
 	lstatError: unknown;
 
+	#inode(path: string): number {
+		const existing = this.#inodes.get(path);
+		if (existing !== undefined) return existing;
+		const inode = this.#nextInode++;
+		this.#inodes.set(path, inode);
+		return inode;
+	}
+
 	async readFile(path: string): Promise<ReadableStream<Uint8Array>> {
+		this.readCalls.push(path);
 		const bytes = this.files.get(path);
-		if (!bytes) throw missing(path);
+		if (bytes === undefined) throw missing(path);
+		this.readByteCount += bytes.byteLength;
 		return new ReadableStream({
 			start(controller) {
 				controller.enqueue(bytes.slice());
@@ -115,13 +184,29 @@ class FakeFilesystem implements WorkspaceFilesystemLike {
 	}
 
 	async lstat(path: string): Promise<WorkspaceStatLike> {
+		this.lstatCalls.push(path);
 		if (this.lstatError !== undefined) throw this.lstatError;
-		if (this.files.has(path)) return { isFile: true, isDirectory: false, isSymbolicLink: false };
-		if (this.directories.has(path)) return { isFile: false, isDirectory: true, isSymbolicLink: false };
+		const bytes = this.files.get(path);
+		if (bytes !== undefined) {
+			return {
+				inode: this.#inode(path),
+				isFile: true,
+				isDirectory: false,
+				isSymbolicLink: false,
+				size: bytes.byteLength,
+			};
+		}
+		if (this.directories.has(path)) {
+			return { inode: this.#inode(path), isFile: false, isDirectory: true, isSymbolicLink: false, size: 0 };
+		}
+		if (this.symlinks.has(path)) {
+			return { inode: this.#inode(path), isFile: false, isDirectory: false, isSymbolicLink: true, size: 0 };
+		}
 		throw missing(path);
 	}
 
 	async readdir(path: string): Promise<WorkspaceDirentLike[]> {
+		this.readdirCalls.push(path);
 		if (!this.directories.has(path)) throw missing(path);
 		const prefix = `${path}/`;
 		const names = new Map<string, WorkspaceDirentLike>();
@@ -136,6 +221,12 @@ class FakeFilesystem implements WorkspaceFilesystemLike {
 			const tail = file.slice(prefix.length);
 			if (!tail || tail.includes("/")) continue;
 			names.set(tail, { name: tail, isFile: true, isDirectory: false, isSymbolicLink: false });
+		}
+		for (const symlink of this.symlinks.keys()) {
+			if (!symlink.startsWith(prefix)) continue;
+			const tail = symlink.slice(prefix.length);
+			if (!tail || tail.includes("/")) continue;
+			names.set(tail, { name: tail, isFile: false, isDirectory: false, isSymbolicLink: true });
 		}
 		return [...names.values()];
 	}
@@ -159,14 +250,56 @@ class FakeFilesystem implements WorkspaceFilesystemLike {
 	}
 
 	async rm(path: string, options?: { recursive?: boolean; force?: boolean }): Promise<void> {
-		if (!this.files.has(path) && !this.directories.has(path) && !options?.force) throw missing(path);
+		this.rmCalls.push(path);
+		if (!this.files.has(path) && !this.directories.has(path) && !this.symlinks.has(path) && !options?.force) {
+			throw missing(path);
+		}
 		for (const file of [...this.files.keys()]) {
 			if (file === path || (options?.recursive && file.startsWith(`${path}/`))) this.files.delete(file);
 		}
 		for (const directory of [...this.directories]) {
-			if (directory === path || (options?.recursive && directory.startsWith(`${path}/`)))
+			if (directory === path || (options?.recursive && directory.startsWith(`${path}/`))) {
 				this.directories.delete(directory);
+			}
 		}
+		for (const symlink of [...this.symlinks.keys()]) {
+			if (symlink === path || (options?.recursive && symlink.startsWith(`${path}/`))) this.symlinks.delete(symlink);
+		}
+		for (const inodePath of [...this.#inodes.keys()]) {
+			if (inodePath === path || (options?.recursive && inodePath.startsWith(`${path}/`)))
+				this.#inodes.delete(inodePath);
+		}
+	}
+
+	async rename(oldPath: string, newPath: string): Promise<void> {
+		this.renameCalls.push({ oldPath, newPath });
+		await this.lstat(oldPath);
+		if (oldPath !== newPath) {
+			await this.rm(newPath, { recursive: true, force: true });
+			for (const [path, value] of [...this.files.entries()]) {
+				if (path !== oldPath && !path.startsWith(`${oldPath}/`)) continue;
+				this.files.delete(path);
+				this.files.set(`${newPath}${path.slice(oldPath.length)}`, value);
+			}
+			for (const [path, value] of [...this.symlinks.entries()]) {
+				if (path !== oldPath && !path.startsWith(`${oldPath}/`)) continue;
+				this.symlinks.delete(path);
+				this.symlinks.set(`${newPath}${path.slice(oldPath.length)}`, value);
+			}
+			for (const path of [...this.directories]) {
+				if (path !== oldPath && !path.startsWith(`${oldPath}/`)) continue;
+				this.directories.delete(path);
+				this.directories.add(`${newPath}${path.slice(oldPath.length)}`);
+			}
+			for (const [path, inode] of [...this.#inodes.entries()]) {
+				if (path !== oldPath && !path.startsWith(`${oldPath}/`)) continue;
+				this.#inodes.delete(path);
+				this.#inodes.set(`${newPath}${path.slice(oldPath.length)}`, inode);
+			}
+		}
+		const error = this.renameErrorAfterMutation;
+		this.renameErrorAfterMutation = undefined;
+		if (error !== undefined) throw error;
 	}
 }
 
@@ -443,6 +576,84 @@ async function createEmptyWorkspace(harness: Harness): Promise<CreateWorkspaceRe
 	};
 	await harness.core.createWorkspace(WORKSPACE_ID, request);
 	return request;
+}
+
+async function enableRuntimeBridge(harness: Harness): Promise<void> {
+	harness.store.saveRuntimeReplica({
+		replica: RUNTIME_REPLICA,
+		lease: RUNTIME_LEASE,
+		fenceVerifierSha256: await canonicalRuntimeSha256V1([
+			"omp-cloudflare-fence-verifier-v1",
+			RUNTIME_FENCE.fenceId,
+			RUNTIME_FENCE.token,
+		]),
+		deletionAuthorityDomain: "persistent",
+		providerPhase: "ready",
+		replicaImage: null,
+		admissionClosed: false,
+		tombstone: null,
+		updatedAtEpochMs: harness.now.value,
+	});
+}
+
+function bridgeInspection(
+	operation: "exists" | "stat" | "list_files" | "search_text",
+	request: Record<string, unknown>,
+): CloudflareRuntimeInspectionTransportEnvelopeV1 {
+	return {
+		schemaVersion: 1,
+		family: "bridge",
+		operation,
+		replica: RUNTIME_REPLICA,
+		request: { ...RUNTIME_ACCESS, ...request },
+	} as unknown as CloudflareRuntimeInspectionTransportEnvelopeV1;
+}
+
+function bridgeEffect(
+	operation: "remove" | "rename",
+	request: Record<string, unknown>,
+): CloudflareRuntimeEffectTransportEnvelopeV1 {
+	return {
+		schemaVersion: 1,
+		family: "bridge",
+		operation,
+		replica: RUNTIME_REPLICA,
+		request: { ...RUNTIME_ACCESS, ...request },
+	} as unknown as CloudflareRuntimeEffectTransportEnvelopeV1;
+}
+
+async function renameEffect(
+	from: string,
+	to: string,
+	requestId: string,
+): Promise<CloudflareRuntimeEffectTransportEnvelopeV1> {
+	return bridgeEffect("rename", {
+		requestId,
+		requestSha256: await canonicalRuntimeSha256V1([
+			"omp-runtime-request-v1",
+			"rename",
+			...RUNTIME_ACCESS_TUPLE,
+			from,
+			to,
+		]),
+		from,
+		to,
+	});
+}
+
+async function removeEffect(path: string, requestId: string): Promise<CloudflareRuntimeEffectTransportEnvelopeV1> {
+	return bridgeEffect("remove", {
+		requestId,
+		requestSha256: await canonicalRuntimeSha256V1([
+			"omp-runtime-request-v1",
+			"remove",
+			...RUNTIME_ACCESS_TUPLE,
+			path,
+			true,
+		]),
+		path,
+		recursive: true,
+	});
 }
 
 function completeResult(status: RuntimeResult["status"] = "completed"): RuntimeResult {
@@ -972,6 +1183,440 @@ describe("CloudOmpWorkspace durable state machine", () => {
 			});
 		} finally {
 			killedHarness.storage.close();
+		}
+	});
+
+	it("adapts the provider-backed filesystem to required atomic rename", async () => {
+		const backing = new FakeFilesystem();
+		const providerCalls: Array<{ oldPath: string; newPath: string }> = [];
+		const filesystem = adaptWorkspaceFilesystem({
+			fs: backing,
+			provider: () => ({
+				rename: async (oldPath, newPath) => {
+					providerCalls.push({ oldPath, newPath });
+					await backing.rename(oldPath, newPath);
+				},
+			}),
+		});
+		const from = `${CLOUD_OMP_REMOTE_ROOT}/adapter-from.txt`;
+		const to = `${CLOUD_OMP_REMOTE_ROOT}/adapter-to.txt`;
+		await filesystem.mkdir(CLOUD_OMP_REMOTE_ROOT, { recursive: true });
+		await filesystem.writeFile(from, new TextEncoder().encode("atomic\n"));
+		await filesystem.rename(from, to);
+		expect(providerCalls).toEqual([{ oldPath: from, newPath: to }]);
+		await expect(filesystem.lstat(from)).rejects.toMatchObject({ code: "ENOENT" });
+		expect(new TextDecoder().decode(await readAll(await filesystem.readFile(to), 1024))).toBe("atomic\n");
+	});
+
+	it("rejects symlink ancestors while preserving leaf symlink stat and remove", async () => {
+		const harness = await createHarness();
+		try {
+			await createEmptyWorkspace(harness);
+			await enableRuntimeBridge(harness);
+			const link = `${CLOUD_OMP_REMOTE_ROOT}/link`;
+			const child = `${link}/outside.txt`;
+			const safe = `${CLOUD_OMP_REMOTE_ROOT}/safe.txt`;
+			harness.filesystem.symlinks.set(link, "/outside");
+			harness.filesystem.files.set(safe, new TextEncoder().encode("safe"));
+			const rmCalls = harness.filesystem.rmCalls.length;
+			const renameCalls = harness.filesystem.renameCalls.length;
+			const readdirCalls = harness.filesystem.readdirCalls.length;
+
+			for (const envelope of [
+				bridgeInspection("exists", { path: child }),
+				bridgeInspection("stat", { path: child }),
+				bridgeInspection("list_files", { directory: link, pattern: "*", limit: 100, cursor: null }),
+				await removeEffect(child, "1".repeat(64)),
+				await renameEffect(child, `${CLOUD_OMP_REMOTE_ROOT}/moved.txt`, "2".repeat(64)),
+				await renameEffect(safe, child, "3".repeat(64)),
+			]) {
+				await expect(harness.core.applyRuntimeBridgeOperation(envelope)).rejects.toMatchObject({
+					status: 400,
+					code: "unsafe_path",
+				});
+			}
+			expect(harness.filesystem.rmCalls).toHaveLength(rmCalls);
+			expect(harness.filesystem.renameCalls).toHaveLength(renameCalls);
+			expect(harness.filesystem.readdirCalls).toHaveLength(readdirCalls);
+
+			await expect(
+				harness.core.applyRuntimeBridgeOperation(bridgeInspection("stat", { path: link })),
+			).resolves.toMatchObject({ result: { path: link, kind: "symlink" } });
+			await expect(
+				harness.core.applyRuntimeBridgeOperation(await removeEffect(link, "4".repeat(64))),
+			).resolves.toMatchObject({ result: { status: "removed" } });
+			expect(harness.filesystem.symlinks.has(link)).toBe(false);
+		} finally {
+			harness.storage.close();
+		}
+	});
+
+	it("does not treat a fresh missing source plus existing destination as renamed", async () => {
+		const harness = await createHarness();
+		try {
+			await createEmptyWorkspace(harness);
+			await enableRuntimeBridge(harness);
+			const from = `${CLOUD_OMP_REMOTE_ROOT}/missing.txt`;
+			const to = `${CLOUD_OMP_REMOTE_ROOT}/unrelated.txt`;
+			const unrelated = new TextEncoder().encode("unrelated");
+			harness.filesystem.files.set(to, unrelated);
+			const requestId = "5".repeat(64);
+			const envelope = await renameEffect(from, to, requestId);
+			await expect(harness.core.applyRuntimeBridgeOperation(envelope)).rejects.toMatchObject({
+				status: 404,
+				code: "file_not_found",
+			});
+			await expect(harness.core.applyRuntimeBridgeOperation(envelope)).rejects.toMatchObject({
+				status: 404,
+				code: "file_not_found",
+			});
+			expect(harness.store.runtimeRequest(requestId)).toMatchObject({ state: "reserved", result: null });
+			expect(harness.filesystem.renameCalls).toHaveLength(0);
+			expect(harness.filesystem.files.get(to)).toEqual(unrelated);
+		} finally {
+			harness.storage.close();
+		}
+	});
+
+	it("reconciles only the exact durably captured rename outcome", async () => {
+		const reconciled = await createHarness();
+		try {
+			await createEmptyWorkspace(reconciled);
+			await enableRuntimeBridge(reconciled);
+			const from = `${CLOUD_OMP_REMOTE_ROOT}/source.txt`;
+			const to = `${CLOUD_OMP_REMOTE_ROOT}/destination.txt`;
+			reconciled.filesystem.files.set(from, new TextEncoder().encode("source"));
+			reconciled.filesystem.files.set(to, new TextEncoder().encode("prior destination"));
+			const requestId = "6".repeat(64);
+			const envelope = await renameEffect(from, to, requestId);
+			const transportLost = new Error("transport lost after atomic rename");
+			reconciled.filesystem.renameErrorAfterMutation = transportLost;
+			await expect(reconciled.core.applyRuntimeBridgeOperation(envelope)).rejects.toBe(transportLost);
+			expect(reconciled.store.runtimeRequest(requestId)).toMatchObject({
+				state: "outcome_unknown",
+				result: {
+					operation: "rename",
+					source: { path: from },
+					destination: { path: to },
+				},
+			});
+			await expect(reconciled.core.applyRuntimeBridgeOperation(envelope)).resolves.toMatchObject({
+				result: { status: "already_renamed" },
+			});
+		} finally {
+			reconciled.storage.close();
+		}
+
+		const mismatched = await createHarness();
+		try {
+			await createEmptyWorkspace(mismatched);
+			await enableRuntimeBridge(mismatched);
+			const from = `${CLOUD_OMP_REMOTE_ROOT}/source.txt`;
+			const to = `${CLOUD_OMP_REMOTE_ROOT}/destination.txt`;
+			mismatched.filesystem.files.set(from, new TextEncoder().encode("source"));
+			mismatched.filesystem.files.set(to, new TextEncoder().encode("prior destination"));
+			const envelope = await renameEffect(from, to, "7".repeat(64));
+			mismatched.filesystem.renameErrorAfterMutation = new Error("transport lost after atomic rename");
+			await expect(mismatched.core.applyRuntimeBridgeOperation(envelope)).rejects.toThrow("transport lost");
+			await mismatched.filesystem.rm(to, { force: true });
+			mismatched.filesystem.files.set(to, new TextEncoder().encode("unrelated replacement"));
+			await expect(mismatched.core.applyRuntimeBridgeOperation(envelope)).rejects.toMatchObject({
+				status: 409,
+				code: "request_conflict",
+			});
+		} finally {
+			mismatched.storage.close();
+		}
+	});
+
+	it("resumes opaque search cursors without rereading completed files or duplicating matches", async () => {
+		const harness = await createHarness();
+		try {
+			await createEmptyWorkspace(harness);
+			await enableRuntimeBridge(harness);
+			await harness.filesystem.mkdir(`${CLOUD_OMP_REMOTE_ROOT}/search`, { recursive: true });
+			await harness.filesystem.mkdir(`${CLOUD_OMP_REMOTE_ROOT}/outside`, { recursive: true });
+			const priorDirectory = `${CLOUD_OMP_REMOTE_ROOT}/search/0000-prior`;
+			const priorNestedDirectory = `${priorDirectory}/nested`;
+			const priorFile = `${priorNestedDirectory}/ignored.txt`;
+			await harness.filesystem.mkdir(priorNestedDirectory, { recursive: true });
+			harness.filesystem.files.set(priorFile, new TextEncoder().encode("no match here\n"));
+			const paths = ["a.txt", "b.txt", "c.txt"].map(name => `${CLOUD_OMP_REMOTE_ROOT}/search/${name}`);
+			for (const [index, path] of paths.entries()) {
+				harness.filesystem.files.set(path, new TextEncoder().encode(`prefix ${index}\nalpha\nbeta ${index}\n`));
+			}
+			harness.filesystem.files.set(
+				`${CLOUD_OMP_REMOTE_ROOT}/outside/ignored.txt`,
+				new TextEncoder().encode("alpha\nbeta outside\n"),
+			);
+			const search = async (path: string, pattern: string, cursor: string | null): Promise<RuntimeSearchResult> => {
+				const response = await harness.core.applyRuntimeBridgeOperation(
+					bridgeInspection("search_text", { path, pattern, flags: "", limit: 1, cursor }),
+				);
+				return response.result as RuntimeSearchResult;
+			};
+
+			const first = await search(`${CLOUD_OMP_REMOTE_ROOT}/search`, "alpha\\nbeta", null);
+			expect(first.matches).toEqual([{ path: paths[0], line: 2, column: 1, text: "alpha" }]);
+			expect(first.nextCursor).toEqual(expect.any(String));
+			const firstCursorTuple = JSON.parse(atob(first.nextCursor!)) as unknown[];
+			expect([firstCursorTuple[0], firstCursorTuple[2], firstCursorTuple[3]]).toEqual([
+				"omp-cloudflare-search-cursor-v1",
+				paths[1],
+				9,
+			]);
+			expect(harness.filesystem.readCalls).toEqual([priorFile, ...paths.slice(0, 2)]);
+
+			harness.filesystem.readCalls.length = 0;
+			harness.filesystem.readdirCalls.length = 0;
+			harness.filesystem.lstatCalls.length = 0;
+			const second = await search(`${CLOUD_OMP_REMOTE_ROOT}/search`, "alpha\\nbeta", first.nextCursor);
+			expect(second.matches).toEqual([{ path: paths[1], line: 2, column: 1, text: "alpha" }]);
+			expect(second.nextCursor).toEqual(expect.any(String));
+			expect(harness.filesystem.readCalls).toEqual(paths.slice(1));
+			expect(harness.filesystem.readdirCalls).not.toContain(priorDirectory);
+			expect(harness.filesystem.readdirCalls).not.toContain(priorNestedDirectory);
+			expect(harness.filesystem.lstatCalls).not.toContain(priorDirectory);
+			expect(harness.filesystem.lstatCalls).not.toContain(paths[0]);
+
+			harness.filesystem.readCalls.length = 0;
+			const third = await search(`${CLOUD_OMP_REMOTE_ROOT}/search`, "alpha\\nbeta", second.nextCursor);
+			expect(third).toEqual({
+				matches: [{ path: paths[2], line: 2, column: 1, text: "alpha" }],
+				nextCursor: null,
+			});
+			expect(harness.filesystem.readCalls).toEqual(paths.slice(2));
+
+			const multiPath = `${CLOUD_OMP_REMOTE_ROOT}/search/multi.txt`;
+			harness.filesystem.files.set(multiPath, new TextEncoder().encode("hit first\nmiddle\nhit second\n"));
+			const multiFirst = await search(multiPath, "hit", null);
+			expect(multiFirst.matches).toEqual([{ path: multiPath, line: 1, column: 1, text: "hit first" }]);
+			const multiCursorTuple = JSON.parse(atob(multiFirst.nextCursor!)) as unknown[];
+			expect([multiCursorTuple[0], multiCursorTuple[2], multiCursorTuple[3]]).toEqual([
+				"omp-cloudflare-search-cursor-v1",
+				multiPath,
+				17,
+			]);
+			const multiSecond = await search(multiPath, "hit", multiFirst.nextCursor);
+			expect(multiSecond).toEqual({
+				matches: [{ path: multiPath, line: 3, column: 1, text: "hit second" }],
+				nextCursor: null,
+			});
+
+			const staleRequest = {
+				...RUNTIME_ACCESS,
+				path: multiPath as RuntimeSearchRequest["path"],
+				pattern: "hit",
+				flags: "",
+				limit: 1,
+				cursor: null,
+			} as RuntimeSearchRequest;
+			const staleCursor = await encodeCloudflareRuntimeSearchCursorV1(staleRequest, {
+				path: staleRequest.path,
+				codeUnitOffset: 100,
+			});
+			await expect(search(multiPath, "hit", staleCursor)).rejects.toMatchObject({
+				status: 409,
+				code: "request_conflict",
+			});
+		} finally {
+			harness.storage.close();
+		}
+	});
+
+	it("bounds no-match search by file, byte, and traversal metadata budgets", async () => {
+		const fileHarness = await createHarness();
+		try {
+			await createEmptyWorkspace(fileHarness);
+			await enableRuntimeBridge(fileHarness);
+			await fileHarness.filesystem.mkdir(`${CLOUD_OMP_REMOTE_ROOT}/search`, { recursive: true });
+			const paths = Array.from(
+				{ length: CLOUDFLARE_RUNTIME_SEARCH_FILE_BUDGET_V1 + 1 },
+				(_, index) => `${CLOUD_OMP_REMOTE_ROOT}/search/${String(index).padStart(4, "0")}.txt`,
+			);
+			for (const path of paths) fileHarness.filesystem.files.set(path, new TextEncoder().encode("x"));
+			const search = async (cursor: string | null): Promise<RuntimeSearchResult> => {
+				const response = await fileHarness.core.applyRuntimeBridgeOperation(
+					bridgeInspection("search_text", {
+						path: `${CLOUD_OMP_REMOTE_ROOT}/search`,
+						pattern: "needle",
+						flags: "",
+						limit: 1,
+						cursor,
+					}),
+				);
+				return response.result as RuntimeSearchResult;
+			};
+			const first = await search(null);
+			expect(first.matches).toEqual([]);
+			expect(first.nextCursor).toEqual(expect.any(String));
+			expect(fileHarness.filesystem.readCalls).toEqual(paths.slice(0, CLOUDFLARE_RUNTIME_SEARCH_FILE_BUDGET_V1));
+			fileHarness.filesystem.readCalls.length = 0;
+			const second = await search(first.nextCursor);
+			expect(second).toEqual({ matches: [], nextCursor: null });
+			expect(fileHarness.filesystem.readCalls).toEqual(paths.slice(CLOUDFLARE_RUNTIME_SEARCH_FILE_BUDGET_V1));
+		} finally {
+			fileHarness.storage.close();
+		}
+
+		const byteHarness = await createHarness();
+		try {
+			await createEmptyWorkspace(byteHarness);
+			await enableRuntimeBridge(byteHarness);
+			await byteHarness.filesystem.mkdir(`${CLOUD_OMP_REMOTE_ROOT}/search`, { recursive: true });
+			const paths = Array.from(
+				{ length: CLOUDFLARE_RUNTIME_SEARCH_BYTE_BUDGET_V1 / MAX_SYNC_FILE_BYTES + 1 },
+				(_, index) => `${CLOUD_OMP_REMOTE_ROOT}/search/${String(index).padStart(4, "0")}.txt`,
+			);
+			for (const path of paths)
+				byteHarness.filesystem.files.set(path, new Uint8Array(MAX_SYNC_FILE_BYTES).fill(120));
+			const search = async (cursor: string | null): Promise<RuntimeSearchResult> => {
+				const response = await byteHarness.core.applyRuntimeBridgeOperation(
+					bridgeInspection("search_text", {
+						path: `${CLOUD_OMP_REMOTE_ROOT}/search`,
+						pattern: "needle",
+						flags: "",
+						limit: 1,
+						cursor,
+					}),
+				);
+				return response.result as RuntimeSearchResult;
+			};
+			const first = await search(null);
+			expect(first.matches).toEqual([]);
+			expect(first.nextCursor).toEqual(expect.any(String));
+			expect(byteHarness.filesystem.readByteCount).toBe(CLOUDFLARE_RUNTIME_SEARCH_BYTE_BUDGET_V1);
+			byteHarness.filesystem.readCalls.length = 0;
+			byteHarness.filesystem.readByteCount = 0;
+			const second = await search(first.nextCursor);
+			expect(second).toEqual({ matches: [], nextCursor: null });
+			expect(byteHarness.filesystem.readCalls).toEqual(paths.slice(-1));
+			expect(byteHarness.filesystem.readByteCount).toBe(MAX_SYNC_FILE_BYTES);
+		} finally {
+			byteHarness.storage.close();
+		}
+
+		const traversalHarness = await createHarness();
+		try {
+			await createEmptyWorkspace(traversalHarness);
+			await enableRuntimeBridge(traversalHarness);
+			const searchRoot = `${CLOUD_OMP_REMOTE_ROOT}/search`;
+			await traversalHarness.filesystem.mkdir(searchRoot, { recursive: true });
+			const bucketCount = 5;
+			const directoryCount =
+				Math.floor((CLOUDFLARE_RUNTIME_SEARCH_TRAVERSAL_BUDGET_V1 - 3 - bucketCount * 2) / 2) + 2;
+			const bucketPaths = Array.from(
+				{ length: bucketCount },
+				(_, index) => `${searchRoot}/bucket-${String(index).padStart(2, "0")}`,
+			);
+			for (const bucket of bucketPaths) traversalHarness.filesystem.directories.add(bucket);
+			const directoryPaths = Array.from({ length: directoryCount }, (_, index) => {
+				const bucket = bucketPaths[Math.floor((index * bucketCount) / directoryCount)]!;
+				return `${bucket}/${String(index).padStart(5, "0")}`;
+			});
+			for (const directory of directoryPaths) traversalHarness.filesystem.directories.add(directory);
+			const search = async (cursor: string | null): Promise<RuntimeSearchResult> => {
+				const response = await traversalHarness.core.applyRuntimeBridgeOperation(
+					bridgeInspection("search_text", {
+						path: searchRoot,
+						pattern: "needle",
+						flags: "",
+						limit: 1,
+						cursor,
+					}),
+				);
+				return response.result as RuntimeSearchResult;
+			};
+			traversalHarness.filesystem.readdirCalls.length = 0;
+			traversalHarness.filesystem.lstatCalls.length = 0;
+			const first = await search(null);
+			expect(first.matches).toEqual([]);
+			expect(first.nextCursor).toEqual(expect.any(String));
+			expect(traversalHarness.filesystem.readdirCalls.length + traversalHarness.filesystem.lstatCalls.length).toBe(
+				CLOUDFLARE_RUNTIME_SEARCH_TRAVERSAL_BUDGET_V1,
+			);
+			const cursorTuple = JSON.parse(atob(first.nextCursor!)) as unknown[];
+			expect(cursorTuple[3]).toBe(0);
+			const resumedDirectory = cursorTuple[2] as string;
+
+			traversalHarness.filesystem.readdirCalls.length = 0;
+			traversalHarness.filesystem.lstatCalls.length = 0;
+			await expect(search(first.nextCursor)).resolves.toEqual({ matches: [], nextCursor: null });
+			expect(
+				traversalHarness.filesystem.readdirCalls.length + traversalHarness.filesystem.lstatCalls.length,
+			).toBeLessThanOrEqual(CLOUDFLARE_RUNTIME_SEARCH_TRAVERSAL_BUDGET_V1);
+			expect(traversalHarness.filesystem.readdirCalls).toContain(resumedDirectory);
+			expect(traversalHarness.filesystem.readdirCalls).not.toContain(directoryPaths[0]);
+			expect(traversalHarness.filesystem.lstatCalls).not.toContain(directoryPaths[0]);
+			expect(traversalHarness.filesystem.readdirCalls).not.toContain(bucketPaths[0]);
+			expect(traversalHarness.filesystem.lstatCalls).not.toContain(bucketPaths[0]);
+
+			const lexicalPriorDirectory = `${searchRoot}/z!`;
+			const exactDirectory = `${searchRoot}/z`;
+			traversalHarness.filesystem.directories.add(lexicalPriorDirectory);
+			traversalHarness.filesystem.directories.add(exactDirectory);
+			const directoryCursorRequest = {
+				...RUNTIME_ACCESS,
+				path: searchRoot as RuntimeSearchRequest["path"],
+				pattern: "needle",
+				flags: "",
+				limit: 1,
+				cursor: null,
+			} as RuntimeSearchRequest;
+			const directoryCursor = await encodeCloudflareRuntimeSearchCursorV1(directoryCursorRequest, {
+				path: exactDirectory as RuntimeSearchRequest["path"],
+				codeUnitOffset: 0,
+			});
+			traversalHarness.filesystem.readdirCalls.length = 0;
+			traversalHarness.filesystem.lstatCalls.length = 0;
+			await expect(search(directoryCursor)).resolves.toEqual({ matches: [], nextCursor: null });
+			expect(traversalHarness.filesystem.readdirCalls).toContain(exactDirectory);
+			expect(traversalHarness.filesystem.readdirCalls).not.toContain(lexicalPriorDirectory);
+			expect(traversalHarness.filesystem.lstatCalls).not.toContain(lexicalPriorDirectory);
+		} finally {
+			traversalHarness.storage.close();
+		}
+	});
+
+	it("paginates before repeated full-line matches exceed the encoded result budget", async () => {
+		const harness = await createHarness();
+		try {
+			await createEmptyWorkspace(harness);
+			await enableRuntimeBridge(harness);
+			const path = `${CLOUD_OMP_REMOTE_ROOT}/escaped-line.txt`;
+			harness.filesystem.files.set(path, new Uint8Array(MAX_SYNC_FILE_BYTES).fill(1));
+			const search = async (cursor: string | null): Promise<RuntimeSearchResult> => {
+				const response = await harness.core.applyRuntimeBridgeOperation(
+					bridgeInspection("search_text", {
+						path,
+						pattern: "\u0001",
+						flags: "",
+						limit: 1_000,
+						cursor,
+					}),
+				);
+				return response.result as RuntimeSearchResult;
+			};
+
+			const first = await search(null);
+			expect(first.matches).toHaveLength(1);
+			expect(first.matches[0]).toMatchObject({ path, line: 1, column: 1 });
+			expect(first.matches[0]!.text.length).toBe(MAX_SYNC_FILE_BYTES);
+			expect(first.nextCursor).toEqual(expect.any(String));
+			expect(new TextEncoder().encode(JSON.stringify(first)).byteLength).toBeLessThanOrEqual(
+				CLOUDFLARE_RUNTIME_SEARCH_RESULT_BYTE_BUDGET_V1,
+			);
+			const cursorTuple = JSON.parse(atob(first.nextCursor!)) as unknown[];
+			expect(cursorTuple[3]).toBe(1);
+
+			const second = await search(first.nextCursor);
+			expect(second.matches).toHaveLength(1);
+			expect(second.matches[0]).toMatchObject({ path, line: 1, column: 2 });
+			expect(new TextEncoder().encode(JSON.stringify(second)).byteLength).toBeLessThanOrEqual(
+				CLOUDFLARE_RUNTIME_SEARCH_RESULT_BYTE_BUDGET_V1,
+			);
+		} finally {
+			harness.storage.close();
 		}
 	});
 });

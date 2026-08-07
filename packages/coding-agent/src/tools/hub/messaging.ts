@@ -66,14 +66,6 @@ export function resolveMessageTimeoutMs(settings: Settings, explicit?: number): 
 	return normalizeIrcTimeoutMs(settings.get("irc.timeoutMs"));
 }
 
-/** Session-buffered inbox drain used before parking a bus waiter. */
-export function drainPendingInbox(registry: AgentRegistry, senderId: string, from?: string): IrcMessage | undefined {
-	const session = registry.get(senderId)?.session;
-	return typeof session?.drainPendingIrcInboxMessages === "function"
-		? session.drainPendingIrcInboxMessages(senderId, { from, limit: 1 })[0]
-		: undefined;
-}
-
 /** `wait` result carrying a consumed message. */
 export function messageResult(senderId: string, waited: IrcMessage): AgentToolResult<CoordinationDetails> {
 	return {
@@ -92,7 +84,11 @@ export async function executeList(
 ): Promise<AgentToolResult<CoordinationDetails>> {
 	let refs = registry.list();
 	if (!refs.some(ref => ref.id !== senderId && ref.status !== "aborted" && ref.kind !== "advisor")) {
-		await registerPersistedSubagents(registry, registry.get(senderId)?.sessionFile);
+		await registerPersistedSubagents(
+			registry,
+			registry.get(senderId)?.sessionFile,
+			registry.requireProcessOwnedPersistentAgentStore(),
+		);
 		refs = registry.list();
 	}
 

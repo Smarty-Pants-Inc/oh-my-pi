@@ -12,13 +12,18 @@
  * test/task/task-schema.test.ts.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
-import { type AsyncJob, AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
+import {
+	type AsyncJob,
+	AsyncJobManager,
+	type AsyncJobTransientTaskRunContextV1,
+} from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
+import * as structuredSubagentModule from "@oh-my-pi/pi-coding-agent/task/structured-subagent";
 import type { AgentDefinition, SingleResult, TaskParams } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 
@@ -441,5 +446,116 @@ describe("task spawn routing", () => {
 
 		gates.get("Fifth")!.resolve();
 		await Promise.all(jobs.map(job => job.promise));
+	});
+
+	it("carries isolated-task authority through child execution and detached settlement", async () => {
+		const outcomeStore = {};
+		const executionEnvironmentProvider = { acquire: async () => ({}) };
+		const terminalEvidence = {};
+		const settleDetached = vi.fn(async (_input: unknown) => ({ jobId: "Detached" }) as never);
+		const lifecycle = {
+			taskId: "task-id",
+			runId: "run-id",
+			createId: "create-id",
+			materializer: {},
+			ensureRequest: {},
+			initializePrePendingRequest: { plan: { resultTargetKey: {} } },
+			finalized: async (_input: unknown) => undefined,
+			cancelled: async (_input: unknown) => undefined,
+			releaseBeforeBind: async (_input: unknown) => undefined,
+			isolationReady: async (_input: unknown) => undefined,
+			releaseExecutionEnvironment: async (_input: unknown) => undefined,
+			finalize: async (_input: unknown) => ({ mergeSummary: "", changesApplied: false, terminalEvidence }),
+			effectIdentityManifest: {},
+			abortBeforeRegistration: async (_reason: unknown) => undefined,
+			fail: async (_input: unknown) => undefined,
+			settleDetached,
+		};
+		const authority = {
+			executionEnvironmentProvider,
+			ownerSessionIndex: {
+				ownerId: "Main",
+				ownerSessionId: "session-a",
+				ownerSessionGenerationSha256: `sha256:${"b".repeat(64)}`,
+				deliveryEpoch: 1,
+				indexSha256: `sha256:${"c".repeat(64)}`,
+			},
+			stores: {
+				ordinaryTransientTaskLifecycle: { create: vi.fn(async () => lifecycle) },
+				transientTaskWorkspaceAuthorityStore: {},
+				transientTaskCanonicalWorkspaceStore: {},
+				transientTaskPublicationTargetBindingStore: {},
+				transientTaskOutcomePayloadStore: outcomeStore,
+				transientTaskResultPublicationTargetStore: {},
+				transientTaskResultPublicationStore: {},
+				transientTaskParentResultDeliveryStore: {},
+			},
+		};
+		const acquireAuthority = vi.fn(async () => authority as never);
+		const asyncContext = {
+			jobId: "detached-job",
+			signal: new AbortController().signal,
+			reportProgress: async (_text: string, _details?: Readonly<Record<string, unknown>>) => {},
+			markRunning: () => {},
+			freezeSettlementRecovery: async (_input: unknown) => ({}) as never,
+		} as AsyncJobTransientTaskRunContextV1;
+		let detachedRun: (() => Promise<unknown>) | undefined;
+		let registrationOptions: { readonly ownerId: string } | undefined;
+		const register = vi.fn(() => {
+			throw new Error("isolated detached task must not use plain registration");
+		});
+		const registerTransientTask = vi.fn(
+			(
+				_label: string,
+				run: (context: AsyncJobTransientTaskRunContextV1) => Promise<unknown>,
+				options: { readonly ownerId: string },
+			) => {
+				registrationOptions = options;
+				detachedRun = () => run(asyncContext);
+				return "detached-job";
+			},
+		);
+		const manager = { register, registerTransientTask } as unknown as AsyncJobManager;
+		let capturedRuntime: unknown;
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+			agents: [{ ...taskAgent, blocking: false }],
+			projectAgentsDir: null,
+		});
+		vi.spyOn(structuredSubagentModule, "runStructuredSubagent").mockImplementation(async request => {
+			capturedRuntime = request.transientTaskRuntime;
+			return {
+				result: makeResult("Detached"),
+				policy: { discovery: { projectAgentsDir: null } },
+				mergeSummary: "",
+				terminalEvidence,
+				terminalSource: { source: makeResult("Detached") },
+			} as never;
+		});
+
+		const tool = await TaskTool.create({
+			...createSession({ manager, settings: { "task.isolation.mode": "worktree" } }),
+			acquireTransientTaskRuntimeAuthority: acquireAuthority,
+		} as unknown as ToolSession);
+		await tool.execute("task-call", { agent: "task", name: "Detached", task: "Work.", isolated: true } as TaskParams);
+		await detachedRun!();
+
+		expect(register).not.toHaveBeenCalled();
+		expect(registrationOptions?.ownerId).toBe("Main");
+		expect(authority.stores.ordinaryTransientTaskLifecycle.create).toHaveBeenCalledWith(
+			expect.objectContaining({ parentToolCallId: "task-call", detachedJobId: "Detached" }),
+		);
+		expect(capturedRuntime).toMatchObject({
+			taskId: lifecycle.taskId,
+			runId: lifecycle.runId,
+			createId: lifecycle.createId,
+			executionEnvironmentProvider,
+		});
+		expect(settleDetached).toHaveBeenCalledWith(
+			expect.objectContaining({
+				context: asyncContext,
+				terminalStatus: "completed",
+				terminalEvidence,
+			}),
+		);
 	});
 });

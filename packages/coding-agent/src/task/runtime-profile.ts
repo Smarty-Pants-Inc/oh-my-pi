@@ -6,6 +6,39 @@
  * resolve and pass a profile before the executor sees the binding.
  */
 
+import type { ExecutionEnvironmentProvider } from "../session/execution-environment";
+
+/** Minimum claimed runtime identity accepted by structured task execution. */
+export interface TransientTaskRuntimeInjectionV1 {
+	readonly taskId: string;
+	readonly runId: string;
+	readonly createId: string;
+	readonly executionEnvironmentProvider: ExecutionEnvironmentProvider;
+}
+
+/** Validate the exact claimed runtime boundary without cloning or widening its authority. */
+export function validateTransientTaskRuntimeInjectionV1<T extends TransientTaskRuntimeInjectionV1>(runtime: T): T {
+	if (
+		runtime === null ||
+		typeof runtime !== "object" ||
+		typeof runtime.taskId !== "string" ||
+		runtime.taskId.length === 0 ||
+		runtime.taskId.includes("\0") ||
+		typeof runtime.runId !== "string" ||
+		runtime.runId.length === 0 ||
+		runtime.runId.includes("\0") ||
+		typeof runtime.createId !== "string" ||
+		runtime.createId.length === 0 ||
+		runtime.createId.includes("\0") ||
+		runtime.executionEnvironmentProvider === null ||
+		typeof runtime.executionEnvironmentProvider !== "object" ||
+		typeof runtime.executionEnvironmentProvider.acquire !== "function"
+	) {
+		throw new TypeError("Transient task runtime injection is invalid");
+	}
+	return runtime;
+}
+
 /** Executor capabilities which may widen a child beyond its base tool set. */
 export const SUBAGENT_RUNTIME_CAPABILITIES = [
 	"spawns",

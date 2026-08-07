@@ -22,6 +22,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 describe("AgentSession owner-routed async delivery", () => {
 	let session: AgentSession;
@@ -61,11 +62,13 @@ describe("AgentSession owner-routed async delivery", () => {
 		const manager = new AsyncJobManager({});
 		AsyncJobManager.setInstance(manager);
 
+		const modelRegistry = new ModelRegistry(authStorage);
 		session = new AgentSession({
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated(),
-			modelRegistry: new ModelRegistry(authStorage),
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			agentId: "SubAgent",
 			asyncJobManager: manager,
 		});
@@ -110,11 +113,13 @@ describe("AgentSession owner-routed async delivery", () => {
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 		const sessionManager = SessionManager.inMemory();
 		const owner = `${sessionManager.getSessionId()}-advisor`;
+		const modelRegistry = new ModelRegistry(authStorage);
 		session = new AgentSession({
 			agent,
 			sessionManager,
 			settings: Settings.isolated(),
-			modelRegistry: new ModelRegistry(authStorage),
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 		const completion = {
 			event: "daemon-completed",
@@ -165,11 +170,13 @@ describe("AgentSession owner-routed async delivery", () => {
 		const manager = new AsyncJobManager({ retentionMs: 60_000 });
 		AsyncJobManager.setInstance(manager);
 
+		const modelRegistry = new ModelRegistry(authStorage);
 		session = new AgentSession({
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated(),
-			modelRegistry: new ModelRegistry(authStorage),
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			agentId: "Main",
 			ownedAsyncJobManager: manager,
 		});
@@ -219,11 +226,13 @@ describe("AgentSession owner-routed async delivery", () => {
 		const manager = new AsyncJobManager({ retentionMs: 60_000 });
 		AsyncJobManager.setInstance(manager);
 
+		const modelRegistry = new ModelRegistry(authStorage);
 		session = new AgentSession({
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated(),
-			modelRegistry: new ModelRegistry(authStorage),
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			agentId: "Main",
 			ownedAsyncJobManager: manager,
 		});
@@ -271,11 +280,13 @@ describe("AgentSession owner-routed async delivery", () => {
 		const manager = new AsyncJobManager({ retentionMs: 60_000 });
 		AsyncJobManager.setInstance(manager);
 
+		const modelRegistry = new ModelRegistry(authStorage);
 		session = new AgentSession({
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated(),
-			modelRegistry: new ModelRegistry(authStorage),
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			agentId: "Main",
 			ownedAsyncJobManager: manager,
 		});
@@ -328,11 +339,13 @@ describe("AgentSession owner-routed async delivery", () => {
 		const manager = new AsyncJobManager({});
 		AsyncJobManager.setInstance(manager);
 
+		const modelRegistry = new ModelRegistry(authStorage);
 		session = new AgentSession({
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated(),
-			modelRegistry: new ModelRegistry(authStorage),
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			agentId: "SubAgent",
 			asyncJobManager: manager,
 		});
@@ -355,5 +368,54 @@ describe("AgentSession owner-routed async delivery", () => {
 		// reaches quiescence.
 		await session.settleAsyncWork();
 		expect(session.hasPendingAsyncWork()).toBe(false);
+	});
+
+	it("never enqueues a managed Task completion through the ordinary delivery sink", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			convertToLlm,
+			streamFn: mock.stream,
+		});
+		const authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
+		authStorages.push(authStorage);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const manager = new AsyncJobManager({});
+		AsyncJobManager.setInstance(manager);
+		const modelRegistry = new ModelRegistry(authStorage);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
+			agentId: "Main",
+			asyncJobManager: manager,
+		});
+
+		const gate = Promise.withResolvers<string>();
+		const jobId = manager.register("task", "managed Task", () => gate.promise, {
+			id: "managed-task-job",
+			ownerId: "Main",
+		});
+		const job = manager.getJob(jobId);
+		if (!job) throw new Error("managed test job was not registered");
+		job.transientTaskSettlementManaged = true;
+		gate.resolve("MUST NOT QUEUE");
+		await manager.waitForOwnerJobs("Main");
+		await manager.drainDeliveries({ filter: { ownerId: "Main" } });
+
+		expect(session.hasPendingAsyncWork()).toBe(false);
+		expect(
+			mock.calls.some(call =>
+				call.context.messages.some(message =>
+					typeof message.content === "string"
+						? message.content.includes("MUST NOT QUEUE")
+						: message.content.some(content => content.type === "text" && content.text.includes("MUST NOT QUEUE")),
+				),
+			),
+		).toBe(false);
 	});
 });

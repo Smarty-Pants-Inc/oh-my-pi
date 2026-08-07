@@ -13,6 +13,7 @@ import { EPHEMERAL_MODEL_CHANGE_ROLE } from "@oh-my-pi/pi-coding-agent/session/s
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { AUTO_THINKING } from "@oh-my-pi/pi-coding-agent/thinking";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 describe("AgentSession model persistence", () => {
 	let tempDir: TempDir;
@@ -130,6 +131,7 @@ describe("AgentSession model persistence", () => {
 				: SessionManager.inMemory(),
 			settings: sessionSettings,
 			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 
 		return { modelRegistry, settings: sessionSettings, session };

@@ -4,6 +4,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ExecutionEnvironmentProvider } from "@oh-my-pi/pi-coding-agent/session/execution-environment";
 import { TaskTool, taskSchema } from "@oh-my-pi/pi-coding-agent/task";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
+import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 
 // Contract: the single-spawn schema (`task.batch: false`; the exported
@@ -12,6 +13,13 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 // `context`) is gated by the `task.batch` setting (default on, covered by
 // test/task/task-batch.test.ts).
 
+const taskAgent: AgentDefinition = {
+	name: "task",
+	description: "General-purpose task agent",
+	systemPrompt: "You are a task agent.",
+	source: "bundled",
+	blocking: true,
+};
 describe("task schema (single-spawn)", () => {
 	it("accepts {agent, task}", () => {
 		const parsed = taskSchema({ agent: "scout", task: "Map the auth module." });
@@ -76,7 +84,7 @@ describe("task spawn validation", () => {
 			taskDepth: options.taskDepth,
 			getSessionFile: () => null,
 			getSessionSpawns: () => "*",
-			getExecutionEnvironmentProvider: () => options.provider,
+			supportsTransientTaskEnvironmentExecution: () => options.provider !== undefined,
 		} as unknown as ToolSession;
 	}
 
@@ -121,8 +129,8 @@ describe("task spawn validation", () => {
 		}
 	});
 
-	it("rejects repaired-away environment intent when no provider is registered", async () => {
-		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [], projectAgentsDir: null });
+	it("rejects environment intent when transient runtime authority is unavailable", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [taskAgent], projectAgentsDir: null });
 		const tool = await TaskTool.create(createSession({ isolationMode: "worktree" }));
 		const result = await tool.execute("tool-call", {
 			agent: "task",
@@ -131,7 +139,7 @@ describe("task spawn validation", () => {
 			execution: "environment",
 		});
 		const text = result.content.find(part => part.type === "text")?.text ?? "";
-		expect(text).toContain("requires a registered execution environment provider");
+		expect(text).toContain("requires the session-owned transient-task runtime authority");
 	});
 
 	it("rejects batch execution selectors before provider acquisition", async () => {

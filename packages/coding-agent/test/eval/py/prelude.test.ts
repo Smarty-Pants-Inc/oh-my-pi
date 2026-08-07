@@ -74,12 +74,14 @@ describe("python prelude", () => {
 				{
 					session: "test-session",
 					run: null,
+					call: 0,
 					name: "read",
 					args: { path: "artifact://21:3-4" },
 				},
 				{
 					session: "test-session",
 					run: null,
+					call: 1,
 					name: "read",
 					args: { path: "mcp://server/resource:10-14" },
 				},

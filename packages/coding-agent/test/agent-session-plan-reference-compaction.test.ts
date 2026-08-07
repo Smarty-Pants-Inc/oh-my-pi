@@ -29,6 +29,7 @@ import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { convertToLlm } from "../src/session/messages";
 import { SessionManager } from "../src/session/session-manager";
+import { createTestRuntimeDependencies } from "./utilities";
 
 const CONTINUE_MARKER = "Resume work on the user's most recent intent";
 
@@ -182,7 +183,13 @@ describe("AgentSession approved-plan reference re-injection after compaction (is
 			},
 		});
 
-		session = new AgentSession({ agent, sessionManager, settings, modelRegistry });
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings,
+			...createTestRuntimeDependencies(modelRegistry),
+			modelRegistry,
+		});
 
 		const waitForCall = (predicate: (call: ObservedPromptCall) => boolean) => {
 			const existing = observedCalls.find(predicate);

@@ -16,6 +16,7 @@ import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 type AutoRetryEndEvent = Extract<AgentSessionEvent, { type: "auto_retry_end" }>;
 type AutoRetryStartEvent = Extract<AgentSessionEvent, { type: "auto_retry_start" }>;
@@ -115,6 +116,7 @@ describe("AgentSession retry delay cap", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 
@@ -188,6 +190,7 @@ describe("AgentSession retry delay cap", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 
@@ -248,6 +251,7 @@ describe("AgentSession retry delay cap", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 
@@ -320,6 +324,7 @@ describe("AgentSession retry delay cap", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 			extensionRunner,
 		});
@@ -407,6 +412,7 @@ describe("AgentSession retry delay cap", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 			providerSessionId,
 		});
@@ -499,6 +505,7 @@ describe("AgentSession retry delay cap", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 
@@ -572,6 +579,7 @@ describe("AgentSession retry delay cap", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 
@@ -638,6 +646,7 @@ describe("AgentSession retry delay cap", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 
@@ -739,6 +748,7 @@ describe("AgentSession retry delay cap", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 
@@ -860,6 +870,7 @@ describe("AgentSession retry delay cap", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 		const retryStartEvents: AutoRetryStartEvent[] = [];
@@ -983,6 +994,7 @@ describe("AgentSession retry delay cap", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 		const retryStartEvents: AutoRetryStartEvent[] = [];
@@ -1098,6 +1110,7 @@ describe("AgentSession retry delay cap", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 		const retryStartEvents: AutoRetryStartEvent[] = [];
@@ -1232,6 +1245,7 @@ describe("AgentSession retry delay cap", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 
@@ -1296,6 +1310,7 @@ describe("AgentSession retry delay cap", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 
@@ -1351,6 +1366,7 @@ describe("AgentSession retry delay cap", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 
@@ -1409,6 +1425,7 @@ describe("AgentSession retry delay cap", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 
@@ -1466,6 +1483,7 @@ describe("AgentSession retry delay cap", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 
@@ -1515,6 +1533,7 @@ describe("AgentSession retry delay cap", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 
@@ -1574,6 +1593,7 @@ describe("AgentSession retry delay cap", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 
@@ -1641,6 +1661,7 @@ describe("AgentSession retry delay cap", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 
@@ -1698,6 +1719,7 @@ describe("AgentSession retry delay cap", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import {
 	Agent,
 	type AgentMessage,
@@ -33,6 +33,7 @@ import { convertToLlm, wrapSteeringForModel } from "@oh-my-pi/pi-coding-agent/se
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
+import { createTestRuntimeDependencies } from "./utilities";
 
 function createAgent(): Agent {
 	return new Agent({
@@ -42,13 +43,6 @@ function createAgent(): Agent {
 			tools: [],
 		},
 	});
-}
-
-function createModelRegistryStub(key = "key") {
-	return {
-		getApiKey: vi.fn(async () => key),
-		resolver: vi.fn(() => async () => key),
-	};
 }
 
 function getConvertedUserText(message: Message | undefined): string {
@@ -81,6 +75,14 @@ async function withNativeDialectEnv<T>(fn: () => Promise<T>): Promise<T> {
 
 describe("AgentSession message pipeline", () => {
 	const sessions: AgentSession[] = [];
+	let authStorage!: AuthStorage;
+	let modelRegistry!: ModelRegistry;
+
+	beforeEach(async () => {
+		authStorage = await AuthStorage.create(":memory:");
+		authStorage.setRuntimeApiKey("test-provider", "key");
+		modelRegistry = new ModelRegistry(authStorage, `/tmp/pi-test-models-${crypto.randomUUID()}.yml`);
+	});
 
 	afterEach(async () => {
 		vi.restoreAllMocks();
@@ -88,6 +90,7 @@ describe("AgentSession message pipeline", () => {
 		for (const session of sessions.splice(0)) {
 			await session.dispose();
 		}
+		authStorage.close();
 	});
 
 	it("applies transformContext before convertToLlm", async () => {
@@ -116,7 +119,8 @@ describe("AgentSession message pipeline", () => {
 			agent: createAgent(),
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: {} as never,
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			transformContext,
 			convertToLlm,
 		});
@@ -134,7 +138,8 @@ describe("AgentSession message pipeline", () => {
 			agent: createAgent(),
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: {} as never,
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 		sessions.push(session);
 		// #queueUserMessage schedules an idle-queue drain that would agent.continue()
@@ -160,7 +165,8 @@ describe("AgentSession message pipeline", () => {
 			agent: createAgent(),
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: {} as never,
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 		sessions.push(session);
 
@@ -186,7 +192,8 @@ describe("AgentSession message pipeline", () => {
 			agent: createAgent(),
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: {} as never,
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			transformContext: wrapSteeringForModel,
 			convertToLlm,
 		});
@@ -211,6 +218,59 @@ describe("AgentSession message pipeline", () => {
 		expect(convertedText).not.toContain("&amp;");
 	});
 
+	it("forwards first semantic assistant content exactly once to the Agent", async () => {
+		using tempDir = TempDir.createSync("@pi-first-assistant-content-");
+		const api = "test-first-assistant-content";
+		registerCustomApi(api, () => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const message = createAssistantMessage("first second");
+				stream.push({ type: "text_delta", contentIndex: 0, delta: "first", partial: message });
+				stream.push({ type: "text_delta", contentIndex: 0, delta: " second", partial: message });
+				stream.push({ type: "done", reason: "stop", message });
+			});
+			return stream;
+		});
+		const model = buildModel({
+			id: "first-assistant-content-model",
+			name: "First Assistant Content Model",
+			api,
+			provider: "test-provider",
+			baseUrl: "",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 4096,
+			maxTokens: 1024,
+		} as ModelSpec<Api>) as Model<Api>;
+		const timestamps: number[] = [];
+		const { session } = await createAgentSession({
+			cwd: tempDir.path(),
+			agentDir: tempDir.path(),
+			sessionManager: SessionManager.inMemory(tempDir.path()),
+			authStorage,
+			modelRegistry,
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			model,
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			skipPythonPreflight: true,
+			onFirstAssistantContent: timestamp => timestamps.push(timestamp),
+		});
+		try {
+			await session.sendUserMessage("observe");
+			expect(timestamps).toHaveLength(1);
+			expect(timestamps[0]).toBeGreaterThan(0);
+		} finally {
+			await session.dispose();
+		}
+	});
+
 	it("composes session payload hooks into direct side-request options", async () => {
 		const sessionOnPayload = vi.fn(async (payload: unknown) => ({
 			...(payload as Record<string, unknown>),
@@ -221,7 +281,8 @@ describe("AgentSession message pipeline", () => {
 			agent: createAgent(),
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: {} as never,
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			onPayload: sessionOnPayload,
 		});
 		sessions.push(session);
@@ -276,7 +337,8 @@ describe("AgentSession message pipeline", () => {
 			}),
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: createModelRegistryStub() as never,
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			preferWebsockets: true,
 		});
 		sessions.push(session);
@@ -329,7 +391,8 @@ describe("AgentSession message pipeline", () => {
 			}),
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: createModelRegistryStub() as never,
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			sideStreamFn,
 		});
 		sessions.push(session);
@@ -381,9 +444,9 @@ describe("AgentSession message pipeline", () => {
 			contextWindow: 4096,
 			maxTokens: 1024,
 		} as ModelSpec<Api>) as Model<Api>;
-		const resolver = vi.fn(
-			() => async (ctx: { error: unknown }) => (ctx.error === undefined ? "old-key" : "next-key"),
-		);
+		const resolver = vi
+			.spyOn(modelRegistry, "resolver")
+			.mockReturnValue(async ctx => (ctx.error === undefined ? "old-key" : "next-key"));
 		const session = new AgentSession({
 			agent: new Agent({
 				initialState: {
@@ -395,10 +458,8 @@ describe("AgentSession message pipeline", () => {
 			}),
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: {
-				getApiKey: vi.fn(async () => "old-key"),
-				resolver,
-			} as never,
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 		sessions.push(session);
 		const cacheSessionId = session.sessionId;
@@ -413,6 +474,7 @@ describe("AgentSession message pipeline", () => {
 	});
 
 	it("applies configured OpenRouter routing variant to ephemeral side-channel options", async () => {
+		authStorage.setRuntimeApiKey("openrouter", "test-openrouter-key");
 		const api = "test-ephemeral-openrouter-variant";
 		let capturedOptions: SimpleStreamOptions | undefined;
 		registerCustomApi(api, (_model, _context, options) => {
@@ -452,7 +514,8 @@ describe("AgentSession message pipeline", () => {
 				"compaction.enabled": false,
 				"providers.openrouterVariant": "nitro",
 			}),
-			modelRegistry: createModelRegistryStub() as never,
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 		sessions.push(session);
 
@@ -500,7 +563,8 @@ describe("AgentSession message pipeline", () => {
 			}),
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: createModelRegistryStub() as never,
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			obfuscator: new SecretObfuscator([{ type: "plain", content: secret }]),
 		});
 		sessions.push(session);
@@ -575,7 +639,8 @@ describe("AgentSession message pipeline", () => {
 				agent,
 				sessionManager: SessionManager.inMemory(),
 				settings: Settings.isolated({ "compaction.enabled": false }),
-				modelRegistry: createModelRegistryStub() as never,
+				modelRegistry,
+				...createTestRuntimeDependencies(modelRegistry),
 				obfuscator,
 			});
 			sessions.push(session);
@@ -598,7 +663,8 @@ describe("AgentSession message pipeline", () => {
 			agent: createAgent(),
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: {} as never,
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			onSseEvent: requestOnSseEvent,
 		});
 		sessions.push(session);
@@ -624,7 +690,8 @@ describe("AgentSession message pipeline", () => {
 			agent: createAgent(),
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: {} as never,
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			extensionRunner: {
 				hasHandlers: () => true,
 				emit: extensionEmit,
@@ -736,7 +803,8 @@ describe("AgentSession message pipeline", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false, "provider.appendOnlyContext": "on" }),
-			modelRegistry: createModelRegistryStub() as never,
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			rebuildSystemPrompt: async () => ({
 				systemPrompt: remembered
 					? ["base", `static memory instructions\n\n${injected}`]
@@ -1123,7 +1191,8 @@ describe("AgentSession message pipeline", () => {
 				"memory.backend": "mnemopi",
 				"provider.appendOnlyContext": "on",
 			}),
-			modelRegistry: createModelRegistryStub() as never,
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			rebuildSystemPrompt: async () => ({
 				systemPrompt: remembered
 					? ["base", `static memory instructions\n\n${injected}`]
@@ -1212,7 +1281,8 @@ describe("AgentSession message pipeline", () => {
 				"memory.backend": "mnemopi",
 				"provider.appendOnlyContext": "on",
 			}),
-			modelRegistry: createModelRegistryStub() as never,
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			rebuildSystemPrompt: async () => ({
 				systemPrompt: remembered
 					? ["base", `static memory instructions\n\n${injected}`]
@@ -1305,7 +1375,8 @@ describe("AgentSession message pipeline", () => {
 				"memory.backend": "mnemopi",
 				"provider.appendOnlyContext": "on",
 			}),
-			modelRegistry: createModelRegistryStub() as never,
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			rebuildSystemPrompt: async () => ({
 				systemPrompt: remembered
 					? ["base", `static memory instructions\n\n${injected}`]
@@ -1382,7 +1453,8 @@ describe("AgentSession message pipeline", () => {
 				}),
 				sessionManager: SessionManager.inMemory(),
 				settings: Settings.isolated({ "compaction.enabled": false }),
-				modelRegistry: createModelRegistryStub() as never,
+				modelRegistry,
+				...createTestRuntimeDependencies(modelRegistry),
 			});
 			sessions.push(session);
 
@@ -1456,7 +1528,8 @@ describe("AgentSession message pipeline", () => {
 			}),
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: createModelRegistryStub() as never,
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 		});
 		sessions.push(session);
 

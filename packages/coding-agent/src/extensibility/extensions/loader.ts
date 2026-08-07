@@ -29,6 +29,8 @@ import { execCommand } from "../../exec/exec";
 import * as PiCodingAgent from "../../index";
 import type { ExecutionEnvironmentProvider } from "../../session/execution-environment";
 import type { CustomMessagePayload } from "../../session/messages";
+import { WorkspaceRuntimeProviderRegistry } from "../../session/workspace-provider-registry.js";
+import type { RuntimeProvider, RuntimeProviderRegistry } from "../../session/workspace-runtime-contracts.js";
 import { EventBus } from "../../utils/event-bus";
 import * as TypeBox from "../legacy-typebox";
 import { installLegacyPiSpecifierShim, loadLegacyPiModule } from "../plugins/legacy-pi-compat";
@@ -44,6 +46,7 @@ import type {
 	ExtensionRuntime as IExtensionRuntime,
 	LoadExtensionsResult,
 	MessageRenderer,
+	ModelProviderConfig,
 	ProviderConfig,
 	RegisteredCommand,
 	ToolDefinition,
@@ -71,8 +74,12 @@ export class ExtensionRuntimeNotInitializedError extends Error {
  */
 export class ExtensionRuntime implements IExtensionRuntime {
 	flagValues = new Map<string, boolean | string>();
-	pendingProviderRegistrations: Array<{ name: string; config: ProviderConfig; sourceId: string }> = [];
+	pendingProviderRegistrations: Array<{ name: string; config: ModelProviderConfig; sourceId: string }> = [];
+	readonly runtimeProviderRegistry: RuntimeProviderRegistry;
 
+	constructor(runtimeProviderRegistry: RuntimeProviderRegistry = new WorkspaceRuntimeProviderRegistry()) {
+		this.runtimeProviderRegistry = runtimeProviderRegistry;
+	}
 	sendMessage(): void {
 		throw new ExtensionRuntimeNotInitializedError();
 	}
@@ -145,11 +152,12 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 	readonly arktype = Type;
 	readonly zod = zodModule;
 	readonly flagValues = new Map<string, boolean | string>();
-	readonly pendingProviderRegistrations: Array<{
-		name: string;
-		config: ProviderConfig;
-		sourceId: string;
-	}> = [];
+	get runtimeProviderRegistry(): RuntimeProviderRegistry {
+		return this.runtime.runtimeProviderRegistry;
+	}
+	get pendingProviderRegistrations(): Array<{ name: string; config: ModelProviderConfig; sourceId: string }> {
+		return this.runtime.pendingProviderRegistrations;
+	}
 
 	constructor(
 		public readonly pi: typeof PiCodingAgent,
@@ -289,15 +297,24 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 		return this.runtime.setSessionName(name);
 	}
 
-	registerExecutionEnvironmentProvider(provider: ExecutionEnvironmentProvider): void {
-		if (this.extension.executionEnvironmentProvider) {
-			throw new Error(`Extension ${this.extension.path} registered more than one execution environment provider`);
+	registerProvider(name: string, config: ProviderConfig): void {
+		if (name.length === 0 || name.trim() !== name) {
+			throw new TypeError("Provider registration name must be a non-empty canonical id");
 		}
-		this.extension.executionEnvironmentProvider = provider;
+		if (Object.keys(config).length > 0) {
+			this.runtime.pendingProviderRegistrations.push({ name, config, sourceId: this.extension.path });
+		}
 	}
 
-	registerProvider(name: string, config: ProviderConfig): void {
-		this.runtime.pendingProviderRegistrations.push({ name, config, sourceId: this.extension.path });
+	registerRuntimeProvider(provider: RuntimeProvider): void {
+		this.runtime.runtimeProviderRegistry.register(provider);
+	}
+
+	registerExecutionEnvironmentProvider(provider: ExecutionEnvironmentProvider): void {
+		if (this.extension.executionEnvironmentProvider !== undefined) {
+			throw new Error("Extension registered more than one execution environment provider");
+		}
+		this.extension.executionEnvironmentProvider = provider;
 	}
 }
 
@@ -368,11 +385,16 @@ export async function loadExtensionFromFactory(
 /**
  * Load extensions from paths.
  */
-export async function loadExtensions(paths: string[], cwd: string, eventBus?: EventBus): Promise<LoadExtensionsResult> {
+export async function loadExtensions(
+	paths: string[],
+	cwd: string,
+	eventBus?: EventBus,
+	runtimeProviderRegistry?: RuntimeProviderRegistry,
+): Promise<LoadExtensionsResult> {
 	const extensions: Extension[] = [];
 	const errors: Array<{ path: string; error: string }> = [];
 	const resolvedEventBus = eventBus ?? new EventBus();
-	const runtime = new ExtensionRuntime();
+	const runtime = new ExtensionRuntime(runtimeProviderRegistry);
 
 	for (const extPath of paths) {
 		const { extension, error } = await loadExtension(extPath, cwd, resolvedEventBus, runtime);
@@ -664,7 +686,8 @@ export async function discoverAndLoadExtensions(
 	eventBus?: EventBus,
 	disabledExtensionIds?: string[],
 	options: DiscoverExtensionPathOptions = {},
+	runtimeProviderRegistry?: RuntimeProviderRegistry,
 ): Promise<LoadExtensionsResult> {
 	const paths = await discoverExtensionPaths(configuredPaths, cwd, disabledExtensionIds, options);
-	return loadExtensions(paths, cwd, eventBus);
+	return loadExtensions(paths, cwd, eventBus, runtimeProviderRegistry);
 }

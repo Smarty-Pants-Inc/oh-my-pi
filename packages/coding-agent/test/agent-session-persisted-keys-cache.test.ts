@@ -13,6 +13,7 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { createTools, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
+import { createTestRuntimeDependencies } from "./utilities";
 
 describe("AgentSession persistence-keys cache", () => {
 	let session: AgentSession;
@@ -49,6 +50,7 @@ describe("AgentSession persistence-keys cache", () => {
 			agent,
 			sessionManager,
 			settings: Settings.isolated(),
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 

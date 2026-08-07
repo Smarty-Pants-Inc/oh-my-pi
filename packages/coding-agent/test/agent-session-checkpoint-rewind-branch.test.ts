@@ -15,6 +15,7 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { RewindTool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 const checkpointSchema = z.object({ goal: z.string() });
 const rewindSchema = z.object({ report: z.string() });
@@ -156,6 +157,7 @@ async function createHarness(
 		sessionManager,
 		settings,
 		modelRegistry,
+		...createTestRuntimeDependencies(modelRegistry),
 		toolRegistry: new Map(tools.map(tool => [tool.name, tool])),
 		extensionRunner,
 	});
@@ -389,14 +391,16 @@ describe("AgentSession checkpoint rewind branch context", () => {
 			convertToLlm,
 			streamFn: reloadedMock.stream,
 		});
+		const reloadedModelRegistry = new ModelRegistry(
+			harness.authStorage,
+			path.join(harness.tempDir.path(), "models-reloaded.yml"),
+		);
 		const reloadedSession = new AgentSession({
 			agent: reloadedAgent,
 			sessionManager: harness.session.sessionManager,
 			settings: reloadedSettings,
-			modelRegistry: new ModelRegistry(
-				harness.authStorage,
-				path.join(harness.tempDir.path(), "models-reloaded.yml"),
-			),
+			modelRegistry: reloadedModelRegistry,
+			...createTestRuntimeDependencies(reloadedModelRegistry),
 			toolRegistry: new Map(reloadedTools.map(tool => [tool.name, tool])),
 		});
 		harness.extraSessions.push(reloadedSession);
@@ -537,14 +541,16 @@ describe("AgentSession checkpoint rewind branch context", () => {
 			convertToLlm,
 			streamFn: reloadedMock.stream,
 		});
+		const reloadedModelRegistry = new ModelRegistry(
+			harness.authStorage,
+			path.join(harness.tempDir.path(), "models-reloaded.yml"),
+		);
 		const reloadedSession = new AgentSession({
 			agent: reloadedAgent,
 			sessionManager: harness.session.sessionManager,
 			settings: reloadedSettings,
-			modelRegistry: new ModelRegistry(
-				harness.authStorage,
-				path.join(harness.tempDir.path(), "models-reloaded.yml"),
-			),
+			modelRegistry: reloadedModelRegistry,
+			...createTestRuntimeDependencies(reloadedModelRegistry),
 			toolRegistry: new Map(reloadedTools.map(tool => [tool.name, tool])),
 		});
 		harness.extraSessions.push(reloadedSession);
@@ -671,14 +677,16 @@ describe("AgentSession checkpoint rewind branch context", () => {
 			convertToLlm,
 			streamFn: reloadedMock.stream,
 		});
+		const reloadedModelRegistry = new ModelRegistry(
+			harness.authStorage,
+			path.join(harness.tempDir.path(), "models-xdev-reloaded.yml"),
+		);
 		const reloadedSession = new AgentSession({
 			agent: reloadedAgent,
 			sessionManager: harness.session.sessionManager,
 			settings: reloadedSettings,
-			modelRegistry: new ModelRegistry(
-				harness.authStorage,
-				path.join(harness.tempDir.path(), "models-xdev-reloaded.yml"),
-			),
+			modelRegistry: reloadedModelRegistry,
+			...createTestRuntimeDependencies(reloadedModelRegistry),
 			toolRegistry: new Map(reloadedTools.map(tool => [tool.name, tool])),
 		});
 		harness.extraSessions.push(reloadedSession);

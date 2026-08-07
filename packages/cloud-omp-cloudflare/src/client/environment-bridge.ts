@@ -1,16 +1,51 @@
 import { Buffer } from "node:buffer";
-import type { ExecutionEnvironmentBridge } from "@oh-my-pi/pi-coding-agent";
 import type {
 	ClientBridgeCreateTerminalParams,
 	ClientBridgeTerminalHandle,
 } from "@oh-my-pi/pi-coding-agent/session/client-bridge";
-import { cloudOmpRoutes, type ExecRequest, type FileReadRequest } from "../protocol";
+import type { ExecutionEnvironmentBridge } from "@oh-my-pi/pi-coding-agent/session/execution-environment";
+import type {
+	PersistentModelWorkspacePath,
+	RuntimeAccessContext,
+	RuntimeCommandInspectResult,
+	RuntimeCommandRequest,
+	RuntimeCommandSnapshot,
+	RuntimeExecutionBridge,
+	RuntimeFileStat,
+	RuntimeLeaseRef,
+	RuntimeListRequest,
+	RuntimeListResult,
+	RuntimeMutationContext,
+	RuntimeReadBinaryRequest,
+	RuntimeReadBinaryResult,
+	RuntimeReadTextRequest,
+	RuntimeReadTextResult,
+	RuntimeSearchRequest,
+	RuntimeSearchResult,
+	RuntimeWriteResult,
+	RuntimeWriteTextRequest,
+} from "@oh-my-pi/pi-coding-agent/session/workspace-runtime-contracts";
+import {
+	type CloudflareRuntimeEffectTransportEnvelopeV1,
+	type CloudflareRuntimeEffectTransportResultEnvelopeV1,
+	type CloudflareRuntimeInspectionTransportEnvelopeV1,
+	type CloudflareRuntimeInspectionTransportResultEnvelopeV1,
+	CloudflareRuntimeProtocolErrorV1,
+	cloudflareRuntimeRoutesV1,
+	cloudOmpRoutes,
+	type ExecRequest,
+	type FileReadRequest,
+} from "../protocol";
 import { auditErrorCode, type CloudOmpAuditWriter } from "./audit";
 import { CloudflareTerminalHandle } from "./environment-terminal";
 import {
 	createFilePayload,
+	decodeCloudflareRuntimeEffectTransportResultWireV1,
+	decodeCloudflareRuntimeInspectionTransportResultWireV1,
 	decodeFilePayload,
 	elapsedMs,
+	encodeCloudflareRuntimeEffectTransportWireV1,
+	encodeCloudflareRuntimeInspectionTransportWireV1,
 	retryTransportOnce,
 	sanitizeEnvironmentError,
 	selectLines,
@@ -20,6 +55,8 @@ import {
 	validateTerminalParams,
 } from "./environment-wire";
 import { type CloudOmpJsonClient, CloudOmpProtocolError } from "./http";
+
+type CommandId = RuntimeCommandRequest["commandId"];
 
 export class CloudflareEnvironmentBridge implements ExecutionEnvironmentBridge {
 	readonly #http: CloudOmpJsonClient;
@@ -137,5 +174,293 @@ export class CloudflareEnvironmentBridge implements ExecutionEnvironmentBridge {
 		await this.#audit
 			.record({ operation, durationMs: elapsedMs(startedAt), outcome: "failed", errorCode: auditErrorCode(error) })
 			.catch(() => {});
+	}
+}
+
+export class CloudflareRuntimeBridge implements RuntimeExecutionBridge {
+	readonly #http: CloudOmpJsonClient;
+	readonly #lease: RuntimeLeaseRef;
+
+	constructor(http: CloudOmpJsonClient, lease: RuntimeLeaseRef) {
+		this.#http = http;
+		this.#lease = lease;
+		Object.freeze(this);
+	}
+
+	async readTextFile(request: RuntimeReadTextRequest): Promise<RuntimeReadTextResult> {
+		this.#assertAuthority(request);
+		const envelope = {
+			schemaVersion: 1,
+			family: "bridge",
+			operation: "read_text_file",
+			replica: this.#lease.replica,
+			request,
+		} as const;
+		const response = await this.#inspection(envelope);
+		if (!("family" in response) || response.family !== "bridge" || response.operation !== "read_text_file") {
+			throw new CloudflareRuntimeProtocolErrorV1("provider_response_invalid");
+		}
+		return response.result;
+	}
+
+	async readBinaryFile(request: RuntimeReadBinaryRequest): Promise<RuntimeReadBinaryResult> {
+		this.#assertAuthority(request);
+		const envelope = {
+			schemaVersion: 1,
+			family: "bridge",
+			operation: "read_binary_file",
+			replica: this.#lease.replica,
+			request,
+		} as const;
+		const response = await this.#inspection(envelope);
+		if (!("family" in response) || response.family !== "bridge" || response.operation !== "read_binary_file") {
+			throw new CloudflareRuntimeProtocolErrorV1("provider_response_invalid");
+		}
+		return response.result;
+	}
+
+	async writeTextFile(request: RuntimeWriteTextRequest): Promise<RuntimeWriteResult> {
+		this.#assertAuthority(request);
+		const envelope = {
+			schemaVersion: 1,
+			family: "bridge",
+			operation: "write_text_file",
+			replica: this.#lease.replica,
+			request,
+		} as const;
+		const response = await this.#effect(envelope);
+		if (!("family" in response) || response.family !== "bridge" || response.operation !== "write_text_file") {
+			throw new CloudflareRuntimeProtocolErrorV1("provider_response_invalid");
+		}
+		return response.result;
+	}
+
+	async exists(request: RuntimeAccessContext & { path: PersistentModelWorkspacePath }): Promise<boolean> {
+		this.#assertAuthority(request);
+		const envelope = {
+			schemaVersion: 1,
+			family: "bridge",
+			operation: "exists",
+			replica: this.#lease.replica,
+			request,
+		} as const;
+		const response = await this.#inspection(envelope);
+		if (!("family" in response) || response.family !== "bridge" || response.operation !== "exists") {
+			throw new CloudflareRuntimeProtocolErrorV1("provider_response_invalid");
+		}
+		return response.result;
+	}
+
+	async stat(request: RuntimeAccessContext & { path: PersistentModelWorkspacePath }): Promise<RuntimeFileStat> {
+		this.#assertAuthority(request);
+		const envelope = {
+			schemaVersion: 1,
+			family: "bridge",
+			operation: "stat",
+			replica: this.#lease.replica,
+			request,
+		} as const;
+		const response = await this.#inspection(envelope);
+		if (!("family" in response) || response.family !== "bridge" || response.operation !== "stat") {
+			throw new CloudflareRuntimeProtocolErrorV1("provider_response_invalid");
+		}
+		return response.result;
+	}
+
+	async mkdir(
+		request: RuntimeMutationContext & { path: PersistentModelWorkspacePath; recursive: boolean },
+	): Promise<{ readonly status: "created" | "already_exists" }> {
+		this.#assertAuthority(request);
+		const envelope = {
+			schemaVersion: 1,
+			family: "bridge",
+			operation: "mkdir",
+			replica: this.#lease.replica,
+			request,
+		} as const;
+		const response = await this.#effect(envelope);
+		if (!("family" in response) || response.family !== "bridge" || response.operation !== "mkdir") {
+			throw new CloudflareRuntimeProtocolErrorV1("provider_response_invalid");
+		}
+		return response.result;
+	}
+
+	async remove(
+		request: RuntimeMutationContext & { path: PersistentModelWorkspacePath; recursive: boolean },
+	): Promise<{ readonly status: "removed" | "already_absent" }> {
+		this.#assertAuthority(request);
+		const envelope = {
+			schemaVersion: 1,
+			family: "bridge",
+			operation: "remove",
+			replica: this.#lease.replica,
+			request,
+		} as const;
+		const response = await this.#effect(envelope);
+		if (!("family" in response) || response.family !== "bridge" || response.operation !== "remove") {
+			throw new CloudflareRuntimeProtocolErrorV1("provider_response_invalid");
+		}
+		return response.result;
+	}
+
+	async rename(
+		request: RuntimeMutationContext & { from: PersistentModelWorkspacePath; to: PersistentModelWorkspacePath },
+	): Promise<{ readonly status: "renamed" | "already_renamed" }> {
+		this.#assertAuthority(request);
+		const envelope = {
+			schemaVersion: 1,
+			family: "bridge",
+			operation: "rename",
+			replica: this.#lease.replica,
+			request,
+		} as const;
+		const response = await this.#effect(envelope);
+		if (!("family" in response) || response.family !== "bridge" || response.operation !== "rename") {
+			throw new CloudflareRuntimeProtocolErrorV1("provider_response_invalid");
+		}
+		return response.result;
+	}
+
+	async listFiles(request: RuntimeListRequest): Promise<RuntimeListResult> {
+		this.#assertAuthority(request);
+		const envelope = {
+			schemaVersion: 1,
+			family: "bridge",
+			operation: "list_files",
+			replica: this.#lease.replica,
+			request,
+		} as const;
+		const response = await this.#inspection(envelope);
+		if (!("family" in response) || response.family !== "bridge" || response.operation !== "list_files") {
+			throw new CloudflareRuntimeProtocolErrorV1("provider_response_invalid");
+		}
+		return response.result;
+	}
+
+	async searchText(request: RuntimeSearchRequest): Promise<RuntimeSearchResult> {
+		this.#assertAuthority(request);
+		const envelope = {
+			schemaVersion: 1,
+			family: "bridge",
+			operation: "search_text",
+			replica: this.#lease.replica,
+			request,
+		} as const;
+		const response = await this.#inspection(envelope);
+		if (!("family" in response) || response.family !== "bridge" || response.operation !== "search_text") {
+			throw new CloudflareRuntimeProtocolErrorV1("provider_response_invalid");
+		}
+		return response.result;
+	}
+
+	async submitCommand(request: RuntimeCommandRequest): Promise<RuntimeCommandSnapshot> {
+		this.#assertAuthority(request);
+		const envelope = {
+			schemaVersion: 1,
+			family: "bridge",
+			operation: "submit_command",
+			replica: this.#lease.replica,
+			request,
+		} as const;
+		const response = await this.#effect(envelope);
+		if (!("family" in response) || response.family !== "bridge" || response.operation !== "submit_command") {
+			throw new CloudflareRuntimeProtocolErrorV1("provider_response_invalid");
+		}
+		return response.result;
+	}
+
+	async inspectCommand(
+		request: RuntimeAccessContext & { commandId: CommandId },
+	): Promise<RuntimeCommandInspectResult> {
+		this.#assertAuthority(request);
+		const envelope = {
+			schemaVersion: 1,
+			family: "bridge",
+			operation: "inspect_command",
+			replica: this.#lease.replica,
+			request,
+		} as const;
+		const response = await this.#inspection(envelope);
+		if (!("family" in response) || response.family !== "bridge" || response.operation !== "inspect_command") {
+			throw new CloudflareRuntimeProtocolErrorV1("provider_response_invalid");
+		}
+		return response.result;
+	}
+
+	async cancelCommand(
+		request: RuntimeMutationContext & {
+			commandId: CommandId;
+			signal: "SIGTERM" | "SIGKILL" | "SIGINT" | "SIGHUP";
+		},
+	): Promise<RuntimeCommandSnapshot> {
+		this.#assertAuthority(request);
+		const envelope = {
+			schemaVersion: 1,
+			family: "bridge",
+			operation: "cancel_command",
+			replica: this.#lease.replica,
+			request,
+		} as const;
+		const response = await this.#effect(envelope);
+		if (!("family" in response) || response.family !== "bridge" || response.operation !== "cancel_command") {
+			throw new CloudflareRuntimeProtocolErrorV1("provider_response_invalid");
+		}
+		return response.result;
+	}
+
+	async disposeCommand(
+		request: RuntimeMutationContext & { commandId: CommandId },
+	): Promise<{ readonly status: "disposed" | "already_disposed"; readonly commandId: CommandId }> {
+		this.#assertAuthority(request);
+		const envelope = {
+			schemaVersion: 1,
+			family: "bridge",
+			operation: "dispose_command",
+			replica: this.#lease.replica,
+			request,
+		} as const;
+		const response = await this.#effect(envelope);
+		if (!("family" in response) || response.family !== "bridge" || response.operation !== "dispose_command") {
+			throw new CloudflareRuntimeProtocolErrorV1("provider_response_invalid");
+		}
+		return response.result;
+	}
+
+	#assertAuthority(request: RuntimeAccessContext): void {
+		const { replica } = this.#lease;
+		if (
+			request.workspaceId !== replica.workspaceId ||
+			request.replicaId !== replica.replicaId ||
+			request.leaseId !== this.#lease.leaseId ||
+			request.expectedGeneration !== this.#lease.baseGeneration ||
+			request.fence.fenceId !== this.#lease.fenceId ||
+			request.fence.token.length === 0
+		) {
+			throw new CloudflareRuntimeProtocolErrorV1("request_identity_mismatch");
+		}
+	}
+
+	async #effect(
+		envelope: CloudflareRuntimeEffectTransportEnvelopeV1,
+	): Promise<CloudflareRuntimeEffectTransportResultEnvelopeV1> {
+		const bodyJson = await encodeCloudflareRuntimeEffectTransportWireV1(envelope);
+		const value = await this.#http.requestJson<unknown>({
+			method: "POST",
+			path: cloudflareRuntimeRoutesV1.effect,
+			bodyJson,
+		});
+		return decodeCloudflareRuntimeEffectTransportResultWireV1(value, envelope);
+	}
+
+	async #inspection(
+		envelope: CloudflareRuntimeInspectionTransportEnvelopeV1,
+	): Promise<CloudflareRuntimeInspectionTransportResultEnvelopeV1> {
+		const bodyJson = await encodeCloudflareRuntimeInspectionTransportWireV1(envelope);
+		const value = await this.#http.requestJson<unknown>({
+			method: "POST",
+			path: cloudflareRuntimeRoutesV1.inspect,
+			bodyJson,
+		});
+		return decodeCloudflareRuntimeInspectionTransportResultWireV1(value, envelope);
 	}
 }

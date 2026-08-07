@@ -1,13 +1,18 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { randomUUID } from "node:crypto";
 import { Agent } from "@oh-my-pi/pi-agent-core";
+import { RegistryModelConnectionResolver } from "@oh-my-pi/pi-coding-agent/config/model-connection-resolver";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { SettingPath } from "@oh-my-pi/pi-coding-agent/config/settings-schema";
 import { IrcBus, type IrcMessage } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import type { CustomMessage } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { WorkspaceRuntimeProviderRegistry } from "@oh-my-pi/pi-coding-agent/session/workspace-provider-registry";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { type CoordinationDetails, HubTool, isIrcEnabled } from "@oh-my-pi/pi-coding-agent/tools/hub";
 
@@ -73,6 +78,7 @@ function makeToolSession(registry: AgentRegistry, agentId: string): ToolSession 
 		getAgentId: () => agentId,
 	};
 }
+let modelRegistry: ModelRegistry;
 
 function createRealSession(overrides: Partial<Record<SettingPath, unknown>> = {}): {
 	session: AgentSession;
@@ -89,7 +95,9 @@ function createRealSession(overrides: Partial<Record<SettingPath, unknown>> = {}
 		}),
 		sessionManager,
 		settings: Settings.isolated({ "compaction.enabled": false, ...overrides }),
-		modelRegistry: {} as never,
+		modelRegistry,
+		runtimeProviderRegistry: new WorkspaceRuntimeProviderRegistry(),
+		modelConnectionResolver: new RegistryModelConnectionResolver(modelRegistry),
 	});
 	return { session, sessionManager };
 }
@@ -97,12 +105,15 @@ function createRealSession(overrides: Partial<Record<SettingPath, unknown>> = {}
 describe("IRC", () => {
 	let registry: AgentRegistry;
 	let bus: IrcBus;
+	let authStorage: AuthStorage;
 
 	const sessions: AgentSession[] = [];
-	beforeEach(() => {
+	beforeEach(async () => {
 		AgentRegistry.resetGlobalForTests();
 		AgentLifecycleManager.resetGlobalForTests();
 		IrcBus.resetGlobalForTests();
+		authStorage = await AuthStorage.create(":memory:");
+		modelRegistry = new ModelRegistry(authStorage, `/tmp/omp-irc-models-${randomUUID()}.yml`);
 		registry = AgentRegistry.global();
 		bus = IrcBus.global();
 	});
@@ -111,6 +122,7 @@ describe("IRC", () => {
 		for (const session of sessions.splice(0)) {
 			await session.dispose();
 		}
+		authStorage.close();
 	});
 
 	describe("IrcBus", () => {

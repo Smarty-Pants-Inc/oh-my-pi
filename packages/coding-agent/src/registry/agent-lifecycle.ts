@@ -29,6 +29,12 @@ import {
 	MAIN_AGENT_ID,
 	type RegistryEvent,
 } from "./agent-registry";
+import type {
+	PersistentAgentOperationalRecordV1,
+	PersistentAgentRecoveryAction,
+	PersistentAgentRecoveryCode,
+	PersistentAgentRecoveryRequiredRecordV1,
+} from "./persistent-agent-contracts";
 
 export type AgentReviver = (expected: AgentRef) => Promise<AgentSession>;
 
@@ -476,5 +482,98 @@ export class AgentLifecycleManager {
 			if (this.#parks.has(event.ref.id)) return;
 			this.#armTimer(event.ref.id, adopted);
 		}
+	}
+}
+
+type RecoverablePersistentAgentRecordV1 = Exclude<PersistentAgentOperationalRecordV1, { readonly phase: "released" }>;
+type InterruptedPersistentAgentRecordV1 = Exclude<RecoverablePersistentAgentRecordV1, { readonly phase: "parked" }>;
+
+/** Closed crash classification for one unowned durable operational phase. */
+export function persistentAgentInterruptedRecoveryCodeV1(
+	record: InterruptedPersistentAgentRecordV1,
+): Extract<PersistentAgentRecoveryCode, `interrupted_${string}`> {
+	switch (record.phase) {
+		case "creating":
+			return "interrupted_create";
+		case "open":
+			return "interrupted_open";
+		case "parking":
+			return "interrupted_park";
+		case "reviving":
+			return "interrupted_revive";
+		case "forking":
+			return "interrupted_fork";
+		case "releasing":
+			return "interrupted_release";
+	}
+}
+
+/**
+ * Freezes the exact failed-phase context into the next durable revision. It
+ * never reconstructs a plan, session, workspace, or effect identity.
+ */
+export function createPersistentAgentRecoveryRequiredRecordV1(
+	record: RecoverablePersistentAgentRecordV1,
+	code: PersistentAgentRecoveryCode,
+	detectedAt: string,
+): PersistentAgentRecoveryRequiredRecordV1 {
+	const common = {
+		schemaVersion: 1 as const,
+		revision: record.revision + 1,
+		controlHostId: record.controlHostId,
+		agentId: record.agentId,
+		displayName: record.displayName,
+		kind: record.kind,
+		parentAgentId: record.parentAgentId,
+		modelProfileId: record.modelProfileId,
+		runtimePolicy: record.runtimePolicy,
+		createdAt: record.createdAt,
+		updatedAt: detectedAt,
+		phase: "recovery_required" as const,
+	};
+	if (record.phase === "creating") {
+		return Object.freeze({
+			...common,
+			recovery: Object.freeze({
+				code,
+				operationId: record.operation.plan.operationId,
+				detectedAt,
+				failedPhase: record.phase,
+				operation: record.operation,
+			}),
+		});
+	}
+	return Object.freeze({
+		...common,
+		recovery: Object.freeze({
+			code,
+			operationId: record.operation?.plan.operationId ?? null,
+			detectedAt,
+			failedPhase: record.phase,
+			operation: record.operation,
+			session: record.session,
+			workspace: record.workspace,
+		}),
+	}) as PersistentAgentRecoveryRequiredRecordV1;
+}
+
+/** Recovery choices are derived only from the frozen failed phase and code. */
+export function persistentAgentRecoveryActionsV1(
+	record: PersistentAgentRecoveryRequiredRecordV1,
+): readonly PersistentAgentRecoveryAction[] {
+	if (record.recovery.code === "runtime_preservation_impossible") return Object.freeze(["discard-runtime-changes"]);
+	switch (record.recovery.failedPhase) {
+		case "creating":
+			return Object.freeze(["retry-create", "discard-creation"]);
+		case "open":
+		case "parked":
+		case "reviving":
+			return Object.freeze(["resume"]);
+		case "parking":
+			return Object.freeze(["finish-park"]);
+		case "forking":
+			return Object.freeze(["finish-fork"]);
+		case "releasing":
+			return Object.freeze(["finish-release"]);
 	}
 }

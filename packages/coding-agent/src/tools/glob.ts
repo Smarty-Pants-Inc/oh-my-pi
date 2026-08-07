@@ -13,6 +13,11 @@ import { splitMemoryGlobPattern } from "../internal-urls/memory-protocol";
 import type { Theme } from "../modes/theme/theme";
 import globDescription from "../prompts/tools/glob.md" with { type: "text" };
 import { type TruncationResult, truncateHead } from "../session/streaming-output";
+import type {
+	PersistentWorkspacePathMapper,
+	RuntimeListResult,
+	WorkspaceOperationLease,
+} from "../session/workspace-runtime-contracts";
 import { isScoutSpawnable } from "../task/spawn-policy";
 import { Ellipsis, fileHyperlink, renderFileList, renderStatusLine, renderTreeList, truncateToWidth } from "../tui";
 import type { ToolSession } from ".";
@@ -89,11 +94,18 @@ export interface GlobOperations {
 	glob: (pattern: string, cwd: string, options: { ignore: string[]; limit: number }) => Promise<string[]> | string[];
 }
 
+export interface PersistentGlobRouteV1 {
+	readonly paths: PersistentWorkspacePathMapper;
+	begin(signal?: AbortSignal): Promise<WorkspaceOperationLease>;
+}
+
 export interface GlobToolOptions {
-	/** Custom operations for find. Default: local filesystem + rg */
+	/** Custom operations for find. Default: local filesystem + native glob. */
 	operations?: GlobOperations;
 	/** Remap slash-only paths to the session cwd before root-search validation. */
 	rootPathAlias?: boolean;
+	/** Persistent-agent route. It never falls back to local filesystem enumeration. */
+	persistentRoute?: PersistentGlobRouteV1;
 }
 
 interface GlobTarget {
@@ -139,6 +151,7 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 
 	readonly #customOps?: GlobOperations;
 	readonly #rootPathAlias: boolean;
+	readonly #persistentRoute?: PersistentGlobRouteV1;
 
 	constructor(
 		private readonly session: ToolSession,
@@ -146,15 +159,266 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 	) {
 		this.#customOps = options?.operations;
 		this.#rootPathAlias = options?.rootPathAlias === true;
+		this.#persistentRoute = options?.persistentRoute;
 	}
 
-	async execute(
-		_toolCallId: string,
+	#persistentGlobEntries(pathInput: string | string[] | undefined): string[] {
+		const entries = toPathList(pathInput);
+		const expanded: string[] = [];
+		for (const entry of entries.length > 0 ? entries : ["."]) {
+			let braceDepth = 0;
+			let start = 0;
+			for (let index = 0; index < entry.length; index++) {
+				const character = entry[index];
+				if (character === "{") braceDepth++;
+				else if (character === "}" && braceDepth > 0) braceDepth--;
+				else if (character === ";" && braceDepth === 0) {
+					expanded.push(entry.slice(start, index));
+					start = index + 1;
+				}
+			}
+			expanded.push(entry.slice(start));
+		}
+		return expanded;
+	}
+
+	#preparePersistentParams(params: typeof findSchema.infer): typeof findSchema.infer {
+		const route = this.#persistentRoute;
+		if (!route) return params;
+		const entries = this.#persistentGlobEntries(params.path);
+		for (const entry of entries) {
+			if (
+				entry.length === 0 ||
+				entry.trim() !== entry ||
+				entry.includes("\\") ||
+				entry.includes("'") ||
+				entry.includes('"') ||
+				entry.startsWith("~") ||
+				/^[a-z][a-z0-9+.-]*:/i.test(entry) ||
+				(path.win32.isAbsolute(entry) &&
+					entry !== route.paths.modelRoot &&
+					!entry.startsWith(`${route.paths.modelRoot}/`))
+			) {
+				throw new ToolError(
+					`Persistent glob paths must be canonical relative paths or rooted at ${route.paths.modelRoot}: ${entry}`,
+				);
+			}
+			const { basePath } = parseFindPattern(entry);
+			try {
+				route.paths.parse(basePath === "." ? route.paths.modelRoot : basePath);
+			} catch {
+				throw new ToolError(
+					`Persistent glob paths must be canonical relative paths or rooted at ${route.paths.modelRoot}: ${entry}`,
+				);
+			}
+		}
+		return { ...params, path: entries as unknown as string };
+	}
+
+	async #executeRuntimeRoute(
+		toolCallId: string,
 		params: typeof findSchema.infer,
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<GlobToolDetails>,
-		_context?: AgentToolContext,
+		context?: AgentToolContext,
 	): Promise<AgentToolResult<GlobToolDetails>> {
+		const route = this.#persistentRoute;
+		if (!route) throw new Error("Persistent glob route is unavailable");
+		const routedParams = this.#preparePersistentParams(params);
+		const timeoutSignal = AbortSignal.timeout(DEFAULT_GLOB_TIMEOUT_MS);
+		const routeSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+		throwIfAborted(routeSignal);
+		const lease = await route.begin(routeSignal);
+		const inFlight = new Set<Promise<unknown>>();
+		const track = <T>(request: Promise<T>): Promise<T> => {
+			let settled!: Promise<T>;
+			settled = request.finally(() => inFlight.delete(settled));
+			inFlight.add(settled);
+			return settled;
+		};
+		const access = {
+			operationLeaseId: lease.operationLeaseId,
+			workspaceId: lease.binding.lease.replica.workspaceId,
+			expectedGeneration: lease.binding.lease.baseGeneration,
+			replicaId: lease.binding.lease.replica.replicaId,
+			leaseId: lease.binding.lease.leaseId,
+			fence: lease.binding.fence,
+		};
+		const toModelPath = (input: string) => route.paths.parse(input).modelPath;
+		const includeHidden = params.hidden ?? true;
+		const useGitignore = params.gitignore ?? true;
+		type IgnoreRule = { readonly pattern: string; readonly negated: boolean; readonly directoryOnly: boolean };
+		const ignoreRules = new Map<string, Promise<readonly IgnoreRule[]>>();
+		const globMatches = (pattern: string, candidate: string): boolean => {
+			let expression = "";
+			for (let index = 0; index < pattern.length; index++) {
+				const character = pattern[index];
+				if (character === "*") {
+					if (pattern[index + 1] === "*") {
+						while (pattern[index + 1] === "*") index++;
+						if (pattern[index + 1] === "/") {
+							index++;
+							expression += "(?:.*/)?";
+						} else expression += ".*";
+					} else expression += "[^/]*";
+				} else if (character === "?") expression += "[^/]";
+				else expression += /[|\\{}()[\]^$+?.]/.test(character) ? `\\${character}` : character;
+			}
+			return new RegExp(`^${expression}$`).test(candidate);
+		};
+		const loadIgnoreRules = (directory: string): Promise<readonly IgnoreRule[]> => {
+			const existing = ignoreRules.get(directory);
+			if (existing) return existing;
+			const loaded = (async () => {
+				const ignorePath = path.posix.join(directory, ".gitignore");
+				const exists = await track(lease.binding.bridge.exists({ ...access, path: toModelPath(ignorePath) }));
+				throwIfAborted(routeSignal);
+				if (!exists) return [];
+				const { content } = await track(
+					lease.binding.bridge.readTextFile({
+						...access,
+						path: toModelPath(ignorePath),
+						line: null,
+						limit: null,
+						byteLimit: 1_048_576,
+					}),
+				);
+				return content.split(/\r?\n/).flatMap(rawLine => {
+					const line = rawLine.endsWith(" ") ? rawLine.replace(/ +$/, "") : rawLine;
+					if (!line || line.startsWith("#")) return [];
+					const negated = line.startsWith("!");
+					const pattern = (negated ? line.slice(1) : line).replace(/^\//, "");
+					if (!pattern) return [];
+					return [{ pattern: pattern.replace(/\/$/, ""), negated, directoryOnly: pattern.endsWith("/") }];
+				});
+			})();
+			ignoreRules.set(directory, loaded);
+			return loaded;
+		};
+		const isGitIgnored = async (modelPath: string): Promise<boolean> => {
+			if (!useGitignore) return false;
+			const segments = path.posix.relative(route.paths.modelRoot, modelPath).split("/").filter(Boolean);
+			let ignored = false;
+			for (let depth = 0; depth < segments.length; depth++) {
+				const directory =
+					depth === 0
+						? route.paths.modelRoot
+						: path.posix.join(route.paths.modelRoot, ...segments.slice(0, depth));
+				const candidate = segments.slice(depth).join("/");
+				for (const rule of await loadIgnoreRules(directory)) {
+					const matched = rule.directoryOnly
+						? candidate.split("/").some(segment => globMatches(rule.pattern, segment))
+						: rule.pattern.includes("/")
+							? globMatches(rule.pattern, candidate)
+							: candidate.split("/").some(segment => globMatches(rule.pattern, segment));
+					if (matched) ignored = !rule.negated;
+				}
+			}
+			return ignored;
+		};
+		const operations: GlobOperations = {
+			exists: async input => {
+				const exists = await track(lease.binding.bridge.exists({ ...access, path: toModelPath(input) }));
+				throwIfAborted(routeSignal);
+				return exists;
+			},
+			stat: async input => {
+				const stat = await track(lease.binding.bridge.stat({ ...access, path: toModelPath(input) }));
+				throwIfAborted(routeSignal);
+				return {
+					isFile: () => stat.kind === "file",
+					isDirectory: () => stat.kind === "directory",
+				};
+			},
+			glob: (pattern, cwd, options) =>
+				track(
+					(async () => {
+						const root = toModelPath(cwd);
+						const entries: Array<{ path: string; kind: "file" | "directory" | "symlink" }> = [];
+						const pendingDirectories = [root];
+						const visitedDirectories = new Set<string>([root]);
+						while (pendingDirectories.length > 0 && entries.length < options.limit) {
+							const directory = pendingDirectories.shift();
+							if (!directory) break;
+							const seenCursors = new Set<string>();
+							let cursor: string | null = null;
+							do {
+								throwIfAborted(routeSignal);
+								const page: RuntimeListResult = await track(
+									lease.binding.bridge.listFiles({
+										...access,
+										directory,
+										pattern: "*",
+										limit: options.limit,
+										cursor,
+									}),
+								);
+								throwIfAborted(routeSignal);
+								if (page.nextCursor !== null && seenCursors.has(page.nextCursor)) {
+									throw new ToolError(`Persistent glob provider repeated cursor for ${directory}`);
+								}
+								if (cursor !== null) seenCursors.add(cursor);
+								cursor = page.nextCursor;
+								for (const entry of page.entries) {
+									throwIfAborted(routeSignal);
+									const returnedPath = route.paths.parseReturnedModelPath(entry.path).modelPath;
+									const relativeToDirectory = path.posix.relative(directory, returnedPath);
+									if (
+										!relativeToDirectory ||
+										relativeToDirectory === ".." ||
+										relativeToDirectory.startsWith("../") ||
+										path.posix.isAbsolute(relativeToDirectory)
+									) {
+										throw new ToolError(
+											`Persistent glob provider returned path outside requested directory: ${returnedPath}`,
+										);
+									}
+									if (entry.kind === "directory" && !visitedDirectories.has(returnedPath)) {
+										visitedDirectories.add(returnedPath);
+										pendingDirectories.push(returnedPath);
+									}
+									const relativeToRoot = path.posix.relative(root, returnedPath);
+									const segments = relativeToRoot.split("/").filter(Boolean);
+									const fixedIgnored =
+										(options.ignore.includes("**/node_modules/**") && segments.includes("node_modules")) ||
+										(options.ignore.includes("**/.git/**") && segments.includes(".git"));
+									if (fixedIgnored || (!includeHidden && segments.some(segment => segment.startsWith("."))))
+										continue;
+									if (await isGitIgnored(returnedPath)) continue;
+									if (entry.kind !== "directory" && !globMatches(pattern, relativeToRoot)) continue;
+									entries.push({ path: returnedPath, kind: entry.kind });
+									if (entries.length >= options.limit) break;
+								}
+							} while (cursor !== null && entries.length < options.limit);
+						}
+						entries.sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0));
+						return entries.map(entry => (entry.kind === "directory" ? `${entry.path}/` : entry.path));
+					})(),
+				),
+		};
+		const routedSession: ToolSession = { ...this.session, cwd: route.paths.modelRoot };
+		try {
+			return await new GlobTool(routedSession, { operations }).execute(
+				toolCallId,
+				routedParams,
+				routeSignal,
+				onUpdate,
+				context,
+			);
+		} finally {
+			await Promise.allSettled([...inFlight]);
+			lease.end();
+		}
+	}
+
+	async execute(
+		toolCallId: string,
+		params: typeof findSchema.infer,
+		signal?: AbortSignal,
+		onUpdate?: AgentToolUpdateCallback<GlobToolDetails>,
+		context?: AgentToolContext,
+	): Promise<AgentToolResult<GlobToolDetails>> {
+		if (this.#persistentRoute) return this.#executeRuntimeRoute(toolCallId, params, signal, onUpdate, context);
 		const { path: pathInput, limit, hidden, gitignore } = params;
 
 		return untilAborted(signal, async () => {

@@ -12,6 +12,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { logger, TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 async function flushMicrotasks(): Promise<void> {
 	await Promise.resolve();
@@ -50,11 +51,13 @@ describe("AgentSession concurrent disposal", () => {
 			initialState: { model, systemPrompt: ["test"], tools: [] },
 			streamFn: mock.stream,
 		});
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
 		session = new AgentSession({
 			agent,
 			sessionManager: SessionManager.inMemory(tempDir.path()),
 			settings: Settings.isolated(),
-			modelRegistry: new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml")),
+			modelRegistry,
+			...createTestRuntimeDependencies(modelRegistry),
 			ownedAsyncJobManager,
 			agentId: "Main",
 		});
@@ -135,7 +138,7 @@ describe("AgentSession concurrent disposal", () => {
 		await flushMicrotasks();
 		vi.advanceTimersByTime(5_000);
 		await flushMicrotasks();
-		await dispose;
+		await expect(dispose).rejects.toThrow("Timed out draining post-prompt tasks during dispose");
 		session = undefined;
 
 		expect(warn).toHaveBeenCalledWith(
@@ -144,17 +147,26 @@ describe("AgentSession concurrent disposal", () => {
 		);
 	});
 
-	it("clears the owned async manager when its dispose rejects", async () => {
+	it("retains process manager ownership and aggregates later cleanup failures when teardown rejects", async () => {
 		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		const owned = new AsyncJobManager({ maxRunningJobs: 1, retentionMs: 1_000, onJobComplete: () => {} });
-		vi.spyOn(owned, "dispose").mockRejectedValue(new Error("async dispose failed"));
+		const asyncFailure = new Error("async dispose failed");
+		const sessionCloseFailure = new Error("session close failed");
+		vi.spyOn(owned, "dispose").mockRejectedValue(asyncFailure);
 		AsyncJobManager.setInstance(owned);
 		const current = createSession(owned);
+		const close = vi.spyOn(current.sessionManager, "close").mockRejectedValue(sessionCloseFailure);
 
-		await current.dispose();
+		const disposalFailure = await current.dispose().then(
+			() => undefined,
+			error => error,
+		);
 		session = undefined;
 
-		expect(AsyncJobManager.instance()).toBeUndefined();
+		expect(disposalFailure).toBeInstanceOf(AggregateError);
+		expect((disposalFailure as AggregateError).errors).toEqual([asyncFailure, sessionCloseFailure]);
+		expect(close).toHaveBeenCalledTimes(1);
+		expect(AsyncJobManager.instance()).toBe(owned);
 		expect(warn).toHaveBeenCalledWith("Session dispose subsystem failed during parallel teardown", {
 			error: "Error: async dispose failed",
 		});

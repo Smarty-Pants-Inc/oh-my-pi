@@ -5,15 +5,17 @@
  * `ClientBridge.requestPermission`, while regular file-editing tools keep the same no-approval
  * behavior they have in the TUI.
  */
-import { afterEach, beforeEach, expect, it, spyOn } from "bun:test";
+import { afterEach, beforeEach, expect, it, spyOn, vi } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import { createMockModel, type MockModelOptions } from "@oh-my-pi/pi-ai/providers/mock";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { type SettingPath, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { EditTool } from "@oh-my-pi/pi-coding-agent/edit";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import type {
 	ClientBridge,
 	ClientBridgePermissionOutcome,
@@ -24,6 +26,7 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { dispatchXdevTool, resolveMountedXdevExecutable, type XdevState } from "@oh-my-pi/pi-coding-agent/tools/xdev";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 // ---------------------------------------------------------------------------
 // Shared setup
@@ -31,6 +34,7 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 
 let tempDir: TempDir;
 let session: AgentSession | undefined;
+const authStorages: AuthStorage[] = [];
 
 const boundaryCases: Array<[decision: "allow_always" | "reject_always", transition: "new" | "switch"]> = [
 	["allow_always", "new"],
@@ -111,11 +115,16 @@ async function createSession(
 
 	const toolRegistry = options?.xdev?.tools ?? new Map<string, AgentTool>();
 	for (const tool of tools) toolRegistry.set(tool.name, tool);
+	const authStorage = await AuthStorage.create(":memory:");
+	authStorages.push(authStorage);
+	const modelRegistry = new ModelRegistry(authStorage);
+
 	const sess = new AgentSession({
 		agent,
 		sessionManager,
 		settings,
-		modelRegistry: {} as never,
+		modelRegistry,
+		...createTestRuntimeDependencies(modelRegistry),
 		toolRegistry,
 		xdev: options?.xdev,
 		builtInToolNames: options?.builtInToolNames,
@@ -145,11 +154,17 @@ async function createSessionWithMockModel(
 		streamFn: mock.stream,
 	});
 
+	const authStorage = await AuthStorage.create(":memory:");
+	authStorages.push(authStorage);
+	const modelRegistry = new ModelRegistry(authStorage);
+	vi.spyOn(modelRegistry, "getApiKey").mockResolvedValue("test-key");
+
 	const sess = new AgentSession({
 		agent,
 		sessionManager,
 		settings,
-		modelRegistry: { getApiKey: () => "test-key" } as never,
+		modelRegistry,
+		...createTestRuntimeDependencies(modelRegistry),
 		toolRegistry: new Map(tools.map(t => [t.name, t])),
 	});
 	sess.setClientBridge(bridge);
@@ -163,6 +178,7 @@ beforeEach(() => {
 afterEach(async () => {
 	await session?.dispose();
 	session = undefined;
+	for (const authStorage of authStorages.splice(0)) authStorage.close();
 	await tempDir.remove();
 });
 

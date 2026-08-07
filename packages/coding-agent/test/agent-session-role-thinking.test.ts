@@ -16,6 +16,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/thinking";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
+import { createTestRuntimeDependencies } from "./utilities";
 
 describe("AgentSession role model thinking behavior", () => {
 	let tempDir: TempDir;
@@ -77,6 +78,7 @@ describe("AgentSession role model thinking behavior", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: sessionSettings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 	}
@@ -230,6 +232,7 @@ describe("AgentSession role model thinking behavior", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: sessionSettings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 
@@ -260,6 +263,7 @@ describe("AgentSession role model thinking behavior", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: sessionSettings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 
@@ -290,6 +294,7 @@ describe("AgentSession role model thinking behavior", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: sessionSettings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 
@@ -340,6 +345,7 @@ describe("AgentSession role model thinking behavior", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: sessionSettings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 
@@ -399,6 +405,7 @@ describe("AgentSession role model thinking behavior", () => {
 			agent,
 			sessionManager,
 			settings: sessionSettings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 			thinkingLevel: AUTO_THINKING,
 		});
@@ -445,6 +452,7 @@ describe("AgentSession role model thinking behavior", () => {
 			agent,
 			sessionManager,
 			settings: sessionSettings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 			thinkingLevel: AUTO_THINKING,
 		});
@@ -491,6 +499,7 @@ describe("AgentSession role model thinking behavior", () => {
 			agent,
 			sessionManager,
 			settings: sessionSettings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 			thinkingLevel: AUTO_THINKING,
 		});
@@ -650,6 +659,7 @@ describe("AgentSession role model thinking behavior", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: sessionSettings,
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 			thinkingLevel: AUTO_THINKING,
 		});

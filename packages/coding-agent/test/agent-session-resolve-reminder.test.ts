@@ -14,6 +14,7 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { dispatchResolutionDevice, queueResolveHandler } from "@oh-my-pi/pi-coding-agent/tools/resolve";
 import { buildNamedToolChoice } from "@oh-my-pi/pi-coding-agent/utils/tool-choice";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
+import { createTestRuntimeDependencies } from "./utilities";
 
 describe("AgentSession resolve reminder", () => {
 	let session: AgentSession;
@@ -57,6 +58,7 @@ describe("AgentSession resolve reminder", () => {
 			agent,
 			sessionManager: SessionManager.create(tempDir, path.join(tempDir, "sessions")),
 			settings: Settings.isolated(),
+			...createTestRuntimeDependencies(modelRegistry),
 			modelRegistry,
 		});
 	});

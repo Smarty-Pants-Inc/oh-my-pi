@@ -23,13 +23,32 @@ import type { MnemopiSessionState } from "../mnemopi/state";
 import type { PlanModeState } from "../plan-mode/state";
 import type { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import type { AgentRegistry } from "../registry/agent-registry";
+import {
+	decodePersistentRuntimePolicyV1,
+	PERSISTENT_TOOL_FINGERPRINT_SHA256_V1,
+	PERSISTENT_TOOL_NAMES,
+	PERSISTENT_TOOL_REGISTRATIONS_V1,
+	type PersistentRuntimePolicy,
+	type PersistentToolSet,
+	type WorkspaceOperationLeaseId,
+} from "../registry/persistent-agent-contracts.js";
+import type {
+	AgentSessionTransientEvalInlineDynamicInvocationV1,
+	AgentSessionTransientTaskRuntimeAuthorityV1,
+} from "../session/agent-session-types";
 import type { ArtifactManager } from "../session/artifacts";
 import type { ClientBridge } from "../session/client-bridge";
-import type { ExecutionEnvironmentBinding, ExecutionEnvironmentProvider } from "../session/execution-environment";
+import type { ExecutionEnvironmentBinding } from "../session/execution-environment";
 import type { CustomMessage } from "../session/messages";
 import type { UsageStatistics } from "../session/session-entries";
 import type { SessionManager } from "../session/session-manager";
 import type { ToolChoiceQueue } from "../session/tool-choice-queue";
+import {
+	PERSISTENT_WORKSPACE_PATH_MAPPER_V1,
+	type RuntimeCapability,
+	type RuntimeController,
+	type RuntimeRequirements,
+} from "../session/workspace-runtime-contracts.js";
 import { TaskTool } from "../task";
 import type { AgentOutputManager } from "../task/output-manager";
 import { canSpawnAtDepth, type StructuredSubagentSchemaMode } from "../task/types";
@@ -71,7 +90,23 @@ import { YieldTool } from "./yield";
 export * from "../edit";
 export * from "../goals";
 export * from "../lsp";
+export type {
+	PersistentModelOnlyToolName,
+	PersistentToolAuthority,
+	PersistentToolName,
+	PersistentToolRegistration,
+	PersistentToolSet,
+	PersistentWorkspaceToolName,
+} from "../registry/persistent-agent-contracts.js";
+export {
+	PERSISTENT_MODEL_ONLY_TOOL_NAMES,
+	PERSISTENT_TOOL_FINGERPRINT_SHA256_V1,
+	PERSISTENT_TOOL_NAMES,
+	PERSISTENT_TOOL_REGISTRATIONS_V1,
+	PERSISTENT_WORKSPACE_TOOL_NAMES,
+} from "../registry/persistent-agent-contracts.js";
 export * from "../session/streaming-output";
+export type { RuntimeBinding, RuntimeController } from "../session/workspace-runtime-contracts.js";
 export * from "../task";
 export * from "../web/search";
 export * from "./ask";
@@ -153,6 +188,8 @@ export interface DeferredDiagnosticsEntry {
 export interface ToolSession {
 	/** Current working directory */
 	cwd: string;
+	/** Non-owning execution-environment binding for workspace-backed tools. */
+	getExecutionEnvironment?: () => ExecutionEnvironmentBinding | undefined;
 	/** Additional workspace directories beyond cwd (multi-root), forwarded to subagents. */
 	additionalDirectories?: string[];
 	/** Whether UI is available */
@@ -240,6 +277,13 @@ export interface ToolSession {
 	assertEvalExecutionAllowed?: () => void;
 	/** Track tool-owned eval work so session disposal can await/abort it like direct session eval runs. */
 	trackEvalExecution?<T>(execution: Promise<T>, abortController: AbortController): Promise<T>;
+	/** @internal Session-owned ordinary lifecycle authority used only by isolated Task/Eval child assembly. */
+	acquireTransientTaskRuntimeAuthority?: () => Promise<AgentSessionTransientTaskRuntimeAuthorityV1>;
+	/** @internal Lazily admits the exact outer Eval foreground invocation before its first isolated child. */
+	beginTransientEvalInlineDynamicInvocation?: (
+		toolCallId: string,
+		effectiveArgs: unknown,
+	) => Promise<AgentSessionTransientEvalInlineDynamicInvocationV1 | null>;
 	/** Get session ID */
 	getSessionId?: () => string | null;
 	/** Get Hindsight runtime state for this agent session. */
@@ -321,10 +365,6 @@ export interface ToolSession {
 	getTurnBudget?: () => { total: number | null; spent: number; hard: boolean };
 	/** Record output tokens consumed by an eval-spawned subagent toward the current turn budget. */
 	recordEvalSubagentUsage?: (output: number) => void;
-	/** Get the authoritative execution environment binding for built-in filesystem and process tools. */
-	getExecutionEnvironment?: () => ExecutionEnvironmentBinding | undefined;
-	/** Get the session's resolved execution environment provider. */
-	getExecutionEnvironmentProvider?: () => ExecutionEnvironmentProvider | undefined;
 	/** Bridge to the connected client (e.g. ACP editor host). Tools should route fs/terminal/permission requests through this when available. */
 	getClientBridge?: () => ClientBridge | undefined;
 	/** Get cached todo phases for this session. */
@@ -408,6 +448,126 @@ export interface ToolSession {
 	getTelemetry?: () => AgentTelemetryConfig | undefined;
 	/** Return image attachments visible to tools for resolving labels such as `Image #1`. */
 	getImageAttachments?: () => ImageAttachmentEntry[];
+}
+
+const PERSISTENT_TOOL_CAPABILITIES_V1 = Object.freeze({
+	bash: Object.freeze(["process.exec"] as const),
+	edit: Object.freeze(["workspace.read", "workspace.write"] as const),
+	glob: Object.freeze(["workspace.list"] as const),
+	grep: Object.freeze(["workspace.search"] as const),
+	read: Object.freeze(["workspace.read"] as const),
+	write: Object.freeze(["workspace.write"] as const),
+});
+
+export interface PersistentToolFactoryOptionsV1 {
+	readonly controller: RuntimeController;
+	/** Package-internal lifecycle supplier; returns one complete durable policy snapshot at admission. */
+	readonly currentRuntimePolicy: () => PersistentRuntimePolicy;
+}
+
+export interface PersistentToolsV1 {
+	readonly tools: readonly Tool[];
+	readonly toolSet: PersistentToolSet;
+}
+
+function persistentToolSetV1(): PersistentToolSet {
+	const registrations = [...PERSISTENT_TOOL_REGISTRATIONS_V1].sort((left, right) =>
+		left.name < right.name ? -1 : left.name > right.name ? 1 : 0,
+	);
+	const rows = registrations.map(registration =>
+		registration.authority.kind === "model_only"
+			? [registration.name, registration.implementationId, "model_only", "omp_core", "current-agent-control-only-v1"]
+			: [
+					registration.name,
+					registration.implementationId,
+					"workspace_operation",
+					"omp_core",
+					"runtime-operation-lease-v1",
+					registration.name,
+				],
+	);
+	const encoded = JSON.stringify(["omp-persistent-tool-set-v1", rows]);
+	const fingerprint = Bun.SHA256.hash(encoded, "hex");
+	if (fingerprint !== PERSISTENT_TOOL_FINGERPRINT_SHA256_V1) {
+		throw new Error("Persistent tool registration fingerprint mismatch");
+	}
+	return Object.freeze({
+		registrations: PERSISTENT_TOOL_REGISTRATIONS_V1,
+		activeNames: PERSISTENT_TOOL_NAMES,
+		fingerprintSha256: PERSISTENT_TOOL_FINGERPRINT_SHA256_V1,
+	});
+}
+
+function persistentRuntimeRequirementsV1(
+	policy: PersistentRuntimePolicy,
+	capabilities: readonly RuntimeCapability[],
+): RuntimeRequirements {
+	return Object.freeze({
+		capabilities,
+		placement: policy.placement,
+		configuredProviderId: policy.providerId,
+		workspaceFormat: "omp-text-v1",
+		os: policy.os,
+		arch: policy.arch,
+		minCpu: policy.minCpu,
+		minMemoryMiB: policy.minMemoryMiB,
+		network: policy.network,
+		maxReadyLatencyMs: policy.maxReadyLatencyMs,
+	});
+}
+
+/**
+ * Constructs the frozen persistent surface directly from its ten OMP-core classes.
+ * This path intentionally does not consult broad registries, extensions, custom tools,
+ * MCP, mounted devices, or any local/provider fallback.
+ */
+export function createPersistentTools(
+	session: ToolSession,
+	options: PersistentToolFactoryOptionsV1,
+): PersistentToolsV1 {
+	const toolSet = persistentToolSetV1();
+	const registry = session.toolRegistry ?? new Map<string, Tool>();
+	if (registry.size !== 0 || session.xdev !== undefined) {
+		throw new Error("Persistent tools require a fresh core-only registry");
+	}
+	session.toolRegistry = registry;
+	session.restrictToolNames = true;
+	session.enableMCP = false;
+	session.enableLsp = false;
+	session.enableIrc = false;
+
+	const route = (capabilities: readonly RuntimeCapability[]) => ({
+		paths: PERSISTENT_WORKSPACE_PATH_MAPPER_V1,
+		begin: (signal?: AbortSignal) => {
+			const policy = decodePersistentRuntimePolicyV1(options.currentRuntimePolicy());
+			return options.controller.beginWorkspaceOperation(
+				persistentRuntimeRequirementsV1(policy, capabilities),
+				Bun.randomUUIDv7() as WorkspaceOperationLeaseId,
+				signal,
+			);
+		},
+	});
+	const tools: Tool[] = [
+		new BashTool(session, { persistentRoute: route(PERSISTENT_TOOL_CAPABILITIES_V1.bash) }),
+		new CheckpointTool(session),
+		new EditTool(session, undefined, route(PERSISTENT_TOOL_CAPABILITIES_V1.edit)),
+		new GlobTool(session, { persistentRoute: route(PERSISTENT_TOOL_CAPABILITIES_V1.glob) }),
+		new GoalTool(session),
+		new GrepTool(session, { persistentRoute: route(PERSISTENT_TOOL_CAPABILITIES_V1.grep) }),
+		new ReadTool(session, route(PERSISTENT_TOOL_CAPABILITIES_V1.read)),
+		new RewindTool(session),
+		new TodoTool(session),
+		new WriteTool(session, { persistentRoute: route(PERSISTENT_TOOL_CAPABILITIES_V1.write) }),
+	];
+	if (tools.some((tool, index) => tool.name !== toolSet.activeNames[index])) {
+		throw new Error("Persistent tool implementation identity mismatch");
+	}
+	for (const tool of tools) registry.set(tool.name, tool);
+	session.setActiveToolNames?.(toolSet.activeNames);
+	if (!session.setActiveToolNames) {
+		session.isToolActive = name => (toolSet.activeNames as readonly string[]).includes(name);
+	}
+	return Object.freeze({ tools: Object.freeze(tools), toolSet });
 }
 
 export type ToolFactory = (session: ToolSession) => Tool | null | Promise<Tool | null>;

@@ -13,6 +13,7 @@ import type {
 import { getWorktreeDir, hashPath, isEnoent, logger, prompt, untilAborted } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
 import githubDescription from "../prompts/tools/github.md" with { type: "text" };
+import { tryAcquireTaskIsolationExclusionLock } from "../task/isolation-ownership";
 import * as git from "../utils/git";
 import type { ToolSession } from ".";
 import { formatShortSha } from "./gh-format";
@@ -3304,80 +3305,95 @@ async function checkoutPullRequest(
 	// races and surface "could not lock config file" / "Another git process
 	// seems to be running" errors. The gh API call above stays outside the
 	// lock so multiple checkouts can fetch PR metadata in parallel.
-	return git.withRepoLock(
-		repoRoot,
-		async () => {
-			const existingWorktrees = await git.worktree.list(repoRoot, signal);
-			const existingWorktree = existingWorktrees.find(entry => entry.branch === toLocalBranchRef(localBranch));
+	let worktreeLock = await tryAcquireTaskIsolationExclusionLock();
+	for (let attempt = 0; !worktreeLock && attempt < 100; attempt += 1) {
+		await scheduler.wait(10, { signal }).catch(() => {});
+		worktreeLock = await tryAcquireTaskIsolationExclusionLock();
+	}
+	if (!worktreeLock) throw new ToolError("Worktree namespace is busy; retry the PR checkout.");
+	try {
+		return await git.withRepoLock(
+			repoRoot,
+			async () => {
+				const existingWorktrees = await git.worktree.list(repoRoot, signal);
+				const existingWorktree = existingWorktrees.find(entry => entry.branch === toLocalBranchRef(localBranch));
 
-			const remote = await ensurePrRemote(repoRoot, data, signal);
-			await git.fetch(
-				repoRoot,
-				remote.name,
-				`refs/heads/${headRefName}`,
-				`refs/remotes/${remote.name}/${headRefName}`,
-				{ signal },
-			);
+				const remote = await ensurePrRemote(repoRoot, data, signal);
+				await git.fetch(
+					repoRoot,
+					remote.name,
+					`refs/heads/${headRefName}`,
+					`refs/remotes/${remote.name}/${headRefName}`,
+					{ signal },
+				);
 
-			if (!existingWorktree) {
-				const localBranchRef = toLocalBranchRef(localBranch);
-				const localBranchExists = await git.ref.exists(repoRoot, localBranchRef, signal);
-				if (localBranchExists) {
-					const existingOid = await git.ref.resolve(repoRoot, localBranchRef, signal);
-					if (existingOid !== headRefOid) {
-						if (!force) {
-							throw new ToolError(
-								`local branch ${localBranch} already exists at ${formatShortSha(existingOid ?? undefined) ?? existingOid ?? "unknown commit"}; pass force=true to reset it`,
+				if (!existingWorktree) {
+					const localBranchRef = toLocalBranchRef(localBranch);
+					const localBranchExists = await git.ref.exists(repoRoot, localBranchRef, signal);
+					if (localBranchExists) {
+						const existingOid = await git.ref.resolve(repoRoot, localBranchRef, signal);
+						if (existingOid !== headRefOid) {
+							if (!force) {
+								throw new ToolError(
+									`local branch ${localBranch} already exists at ${formatShortSha(existingOid ?? undefined) ?? existingOid ?? "unknown commit"}; pass force=true to reset it`,
+								);
+							}
+
+							await git.branch.force(
+								repoRoot,
+								localBranch,
+								`refs/remotes/${remote.name}/${headRefName}`,
+								signal,
 							);
 						}
-
-						await git.branch.force(repoRoot, localBranch, `refs/remotes/${remote.name}/${headRefName}`, signal);
+					} else {
+						await git.branch.create(repoRoot, localBranch, `refs/remotes/${remote.name}/${headRefName}`, signal);
 					}
-				} else {
-					await git.branch.create(repoRoot, localBranch, `refs/remotes/${remote.name}/${headRefName}`, signal);
 				}
-			}
 
-			await git.config.setBranch(repoRoot, localBranch, "remote", remote.name, signal);
-			await git.config.setBranch(repoRoot, localBranch, "merge", `refs/heads/${headRefName}`, signal);
-			await git.config.setBranch(repoRoot, localBranch, "pushRemote", remote.name, signal);
-			await git.config.setBranch(repoRoot, localBranch, "ompPrHeadRef", headRefName, signal);
-			await git.config.setBranch(repoRoot, localBranch, "ompPrUrl", data.url ?? "", signal);
-			await git.config.setBranch(
-				repoRoot,
-				localBranch,
-				"ompPrIsCrossRepository",
-				String(Boolean(data.isCrossRepository)),
-				signal,
-			);
-			await git.config.setBranch(
-				repoRoot,
-				localBranch,
-				"ompPrMaintainerCanModify",
-				String(Boolean(data.maintainerCanModify)),
-				signal,
-			);
+				await git.config.setBranch(repoRoot, localBranch, "remote", remote.name, signal);
+				await git.config.setBranch(repoRoot, localBranch, "merge", `refs/heads/${headRefName}`, signal);
+				await git.config.setBranch(repoRoot, localBranch, "pushRemote", remote.name, signal);
+				await git.config.setBranch(repoRoot, localBranch, "ompPrHeadRef", headRefName, signal);
+				await git.config.setBranch(repoRoot, localBranch, "ompPrUrl", data.url ?? "", signal);
+				await git.config.setBranch(
+					repoRoot,
+					localBranch,
+					"ompPrIsCrossRepository",
+					String(Boolean(data.isCrossRepository)),
+					signal,
+				);
+				await git.config.setBranch(
+					repoRoot,
+					localBranch,
+					"ompPrMaintainerCanModify",
+					String(Boolean(data.maintainerCanModify)),
+					signal,
+				);
 
-			let finalWorktreePath = existingWorktree?.path ?? worktreePath;
-			if (!existingWorktree) {
-				finalWorktreePath = await resolveAvailableWorktreePath(worktreePath, existingWorktrees);
-				await fs.mkdir(path.dirname(finalWorktreePath), { recursive: true });
-				await git.worktree.add(repoRoot, finalWorktreePath, localBranch, { signal });
-			}
-			const resolvedWorktreePath = await fs.realpath(finalWorktreePath);
+				let finalWorktreePath = existingWorktree?.path ?? worktreePath;
+				if (!existingWorktree) {
+					finalWorktreePath = await resolveAvailableWorktreePath(worktreePath, existingWorktrees);
+					await fs.mkdir(path.dirname(finalWorktreePath), { recursive: true });
+					await git.worktree.add(repoRoot, finalWorktreePath, localBranch, { signal });
+				}
+				const resolvedWorktreePath = await fs.realpath(finalWorktreePath);
 
-			return {
-				data,
-				localBranch,
-				worktreePath: resolvedWorktreePath,
-				remoteName: remote.name,
-				remoteUrl: remote.url,
-				headRefName,
-				reused: Boolean(existingWorktree),
-			};
-		},
-		signal,
-	);
+				return {
+					data,
+					localBranch,
+					worktreePath: resolvedWorktreePath,
+					remoteName: remote.name,
+					remoteUrl: remote.url,
+					headRefName,
+					reused: Boolean(existingWorktree),
+				};
+			},
+			signal,
+		);
+	} finally {
+		worktreeLock.release();
+	}
 }
 
 function outcomeToSummary(outcome: PrCheckoutOutcome): GhPrCheckoutSummary {
