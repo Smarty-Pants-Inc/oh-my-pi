@@ -58,6 +58,7 @@ import type {
 	SessionBeforeSwitchResult,
 	SessionBeforeTreeResult,
 	SessionCompactingResult,
+	SystemPromptBuilder,
 	SessionStopEvent,
 	SessionStopEventResult,
 	ToolCallEvent,
@@ -661,6 +662,14 @@ export class ExtensionRunner {
 
 	getExtensionPaths(): string[] {
 		return this.extensions.map(e => e.path);
+	}
+
+	getSystemPromptBuilder(): SystemPromptBuilder | undefined {
+		const owners = this.extensions.filter(extension => extension.systemPromptBuilder);
+		if (owners.length > 1) {
+			throw new Error(`Multiple system prompt builders registered: ${owners.map(owner => owner.path).join(", ")}`);
+		}
+		return owners[0]?.systemPromptBuilder;
 	}
 
 	/** Get all registered tools from all extensions. */

@@ -46,6 +46,7 @@ import type {
 	MessageRenderer,
 	ProviderConfig,
 	RegisteredCommand,
+	SystemPromptBuilder,
 	ToolDefinition,
 	ToolInfo,
 } from "./types";
@@ -304,6 +305,13 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 			throw new Error(`Extension ${this.extension.path} registered more than one execution environment provider`);
 		}
 		this.extension.executionEnvironmentProvider = provider;
+	}
+
+	registerSystemPromptBuilder(builder: SystemPromptBuilder): void {
+		if (this.extension.systemPromptBuilder) {
+			throw new Error(`Extension ${this.extension.path} registered more than one system prompt builder`);
+		}
+		this.extension.systemPromptBuilder = builder;
 	}
 
 	registerProvider(name: string, config: ProviderConfig): void {
