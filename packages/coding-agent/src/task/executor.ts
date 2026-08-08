@@ -3258,7 +3258,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						getModel: () => session.model,
 						isIdle: () => !session.isStreaming,
 						abort: () => session.abort({ reason: USER_INTERRUPT_LABEL }),
-						hasPendingMessages: () => session.queuedMessageCount > 0,
+						hasPendingMessages: () => session.hasPendingMessages(),
 						shutdown: () => {},
 						getContextUsage: () => session.getContextUsage(),
 						getSystemPrompt: () => session.systemPrompt,
