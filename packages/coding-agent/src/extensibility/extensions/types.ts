@@ -440,7 +440,7 @@ export interface ExtensionContext {
 	isIdle(): boolean;
 	/** Abort the current agent operation */
 	abort(): void;
-	/** Whether there are queued messages waiting */
+	/** Whether any visible or hidden message is waiting for this session. */
 	hasPendingMessages(): boolean;
 	/** Gracefully shutdown and exit. */
 	shutdown(): void;
@@ -1284,7 +1284,10 @@ export interface ExtensionAPI {
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): void;
 
-	/** Send a user prompt: idle starts a turn; streaming queues as steer unless deliverAs is set. */
+	/**
+	 * Send a user prompt: idle starts a turn; streaming queues as steer unless `deliverAs` is set.
+	 * A `followUp` matching a registered extension command executes locally after the active turn.
+	 */
 	sendUserMessage(
 		content: string | (TextContent | ImageContent)[],
 		options?: { deliverAs?: "steer" | "followUp" },
