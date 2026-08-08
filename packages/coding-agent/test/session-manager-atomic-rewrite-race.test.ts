@@ -147,6 +147,27 @@ class CloseGatedRewriteStorage extends MemorySessionStorage {
 	}
 }
 
+class RestoreGatedStorage extends MemorySessionStorage {
+	readonly restoreStarted = Promise.withResolvers<void>();
+	readonly allowRestore = Promise.withResolvers<void>();
+	armed = false;
+	guardRejections = 0;
+
+	override async writeTextAtomic(path: string, content: string, options?: WriteTextAtomicOptions): Promise<void> {
+		if (!this.armed) {
+			await super.writeTextAtomic(path, content, options);
+			return;
+		}
+		this.restoreStarted.resolve();
+		await this.allowRestore.promise;
+		if (options?.commitGuard && !options.commitGuard()) {
+			this.guardRejections++;
+			return;
+		}
+		this.writeTextSync(path, content);
+	}
+}
+
 describe("SessionManager atomic rewrite race", () => {
 	it("keeps post-compaction appends on the current JSONL path", async () => {
 		const storage = new DetachingRewriteStorage();
@@ -322,6 +343,54 @@ describe("SessionManager atomic rewrite race", () => {
 		expect(afterRelease).toContain("newer summary");
 		expect(storage.guardRejections).toBeGreaterThanOrEqual(1);
 		expect(storage.detachedLines).toEqual([]);
+	});
+
+	it("does not let a persisted preimage restore overwrite a concurrent append", async () => {
+		const storage = new RestoreGatedStorage();
+		const sessionManager = SessionManager.create("/cwd", "/sessions", storage);
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected built-in anthropic model");
+		sessionManager.appendMessage({
+			role: "assistant",
+			content: [{ type: "text", text: "retained response" }],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		});
+		await sessionManager.flush();
+		const retainedState = sessionManager.captureState();
+		const retainedFile = await sessionManager.capturePersistedSessionFile();
+		if (!retainedFile) throw new Error("Expected persisted snapshot");
+
+		sessionManager.appendMessage({ role: "user", content: "replacement entry", timestamp: Date.now() });
+		await sessionManager.flush();
+		sessionManager.restoreState(retainedState);
+		storage.armed = true;
+		const restoring = sessionManager.restorePersistedSessionFile(retainedFile);
+		await storage.restoreStarted.promise;
+
+		sessionManager.appendMessage({ role: "user", content: "concurrent retained append", timestamp: Date.now() });
+		storage.allowRestore.resolve();
+		await expect(restoring).resolves.toBe(true);
+		await sessionManager.flush();
+
+		const sessionFile = sessionManager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected session file");
+		const content = await storage.readText(sessionFile);
+		expect(content).toContain("retained response");
+		expect(content).toContain("concurrent retained append");
+		expect(content).not.toContain("replacement entry");
+		expect(storage.guardRejections).toBe(1);
 	});
 });
 
@@ -780,7 +849,7 @@ describe("SessionManager atomic entry batches", () => {
 		expect(
 			manager.getEntries().some(entry => entry.type === "custom" && entry.customType === "staged-terminal"),
 		).toBe(false);
-		expect(await storage.readText(sessionFile)).toBe(before);
+		expect(await storage.readText(sessionFile)).toBe(`${before}{"type":"session_leaf","leafId":"${rootId}"}\n`);
 
 		await manager.appendEntriesAtomically(() => manager.appendCustomEntry("committed-terminal"));
 		expect(manager.getBranch().at(-1)).toMatchObject({ type: "custom", customType: "committed-terminal" });

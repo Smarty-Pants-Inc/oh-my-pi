@@ -6,6 +6,7 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import { HindsightSessionState } from "@oh-my-pi/pi-coding-agent/hindsight/state";
 import { MnemopiSessionState, setMnemopiSessionState } from "@oh-my-pi/pi-coding-agent/mnemopi/state";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -41,7 +42,7 @@ describe("AgentSession concurrent disposal", () => {
 		tempDir.removeSync();
 	});
 
-	function createSession(ownedAsyncJobManager?: AsyncJobManager): AgentSession {
+	function createSession(ownedAsyncJobManager?: AsyncJobManager, extensionRunner?: ExtensionRunner): AgentSession {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("expected bundled model");
 		const mock = createMockModel({ handler: () => ({ content: ["ok"] }) });
@@ -56,6 +57,7 @@ describe("AgentSession concurrent disposal", () => {
 			settings: Settings.isolated(),
 			modelRegistry: new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml")),
 			ownedAsyncJobManager,
+			extensionRunner,
 			agentId: "Main",
 		});
 		return session;
@@ -122,6 +124,30 @@ describe("AgentSession concurrent disposal", () => {
 		expect(closeAt).toBeGreaterThan(order.indexOf("async:end"));
 		expect(closeAt).toBeGreaterThan(order.indexOf("hindsight:end"));
 		expect(closeAt).toBeGreaterThan(order.indexOf("mnemopi:end"));
+	});
+
+	it("publishes terminal shutdown only after abort quiescence", async () => {
+		const postPromptGate = Promise.withResolvers<void>();
+		const shutdown = vi.fn();
+		const extensionRunner = {
+			hasHandlers: vi.fn((type: string) => type === "session_shutdown"),
+			emit: vi.fn(async () => {
+				shutdown();
+			}),
+			clearManagedTimers: vi.fn(),
+		} as unknown as ExtensionRunner;
+		const current = createSession(undefined, extensionRunner);
+		current.trackPostPromptTaskForTests(postPromptGate.promise);
+
+		const dispose = current.dispose();
+		await flushMicrotasks();
+		expect(shutdown).not.toHaveBeenCalled();
+
+		postPromptGate.resolve();
+		await dispose;
+		session = undefined;
+		expect(shutdown).toHaveBeenCalledTimes(1);
+		expect(extensionRunner.clearManagedTimers).toHaveBeenCalledTimes(1);
 	});
 
 	it("bounds post-prompt work that ignores abort", async () => {

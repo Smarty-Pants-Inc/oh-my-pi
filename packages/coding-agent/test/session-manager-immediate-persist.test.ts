@@ -132,6 +132,45 @@ describe("SessionManager JSONL software-crash durability", () => {
 		]);
 	});
 
+	it("publishes fork and branch journals only after referenced artifacts are ready", async () => {
+		const cwd = makeTempDir("@pi-journal-publication-cwd-");
+		const sessionDir = path.join(cwd, "sessions");
+		const manager = SessionManager.create(cwd, sessionDir);
+		const leafId = manager.appendMessage(assistantMessage("seed"));
+
+		let forkPath: string | undefined;
+		const forkEntered = Promise.withResolvers<void>();
+		const allowForkArtifacts = Promise.withResolvers<void>();
+		const forking = manager.fork(async newSessionFile => {
+			forkPath = newSessionFile;
+			expect(fs.existsSync(newSessionFile)).toBe(false);
+			forkEntered.resolve();
+			await allowForkArtifacts.promise;
+		});
+		await forkEntered.promise;
+		expect(forkPath).toBeString();
+		expect(fs.existsSync(forkPath!)).toBe(false);
+		allowForkArtifacts.resolve();
+		await expect(forking).resolves.toMatchObject({ newSessionFile: forkPath });
+		expect(fs.existsSync(forkPath!)).toBe(true);
+
+		let branchPath: string | undefined;
+		const branchEntered = Promise.withResolvers<void>();
+		const allowBranchArtifacts = Promise.withResolvers<void>();
+		const branching = manager.createBranchedSession(leafId, async newSessionFile => {
+			branchPath = newSessionFile;
+			expect(fs.existsSync(newSessionFile)).toBe(false);
+			branchEntered.resolve();
+			await allowBranchArtifacts.promise;
+		});
+		await branchEntered.promise;
+		expect(branchPath).toBeString();
+		expect(fs.existsSync(branchPath!)).toBe(false);
+		allowBranchArtifacts.resolve();
+		await expect(branching).resolves.toBe(branchPath);
+		expect(fs.existsSync(branchPath!)).toBe(true);
+	});
+
 	it("reopens post-checkpoint user/assistant/tool events after a crash-equivalent snapshot", async () => {
 		const cwd = makeTempDir("@pi-crash-reopen-cwd-");
 		const sessionDir = path.join(cwd, "sessions");

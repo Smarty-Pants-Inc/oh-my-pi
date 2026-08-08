@@ -1,5 +1,6 @@
 import * as crypto from "node:crypto";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import { getSegmenter } from "@oh-my-pi/pi-tui";
 import { isRecord } from "@oh-my-pi/pi-utils";
 import type { ExtensionAPI } from "../extensibility/extensions/types";
 import type { Goal, GoalStatus } from "../goals/state";
@@ -20,9 +21,9 @@ export const SYNC_BYTES = 16;
 export const SYNC_B64_LENGTH = 22;
 const TAG_BYTES = 32;
 const TAG_B64_LENGTH = 43;
-export const CANCEL_COMMAND_BODY_B64 = "eyJ2ZXJzaW9uIjoxLCJ0eXBlIjoiY2FuY2VsIn0";
-export const REQUEST_SNAPSHOT_COMMAND_BODY_B64 = "eyJ2ZXJzaW9uIjoxLCJ0eXBlIjoicmVxdWVzdF9zbmFwc2hvdCJ9";
-export const MAX_COMMAND_CAPTURE_CHARS = REQUEST_SNAPSHOT_COMMAND_BODY_B64.length + 1 + TAG_B64_LENGTH;
+const MAX_COMMAND_BODY_BYTES = 512;
+const MAX_COMMAND_BODY_B64_CHARS = Math.ceil((MAX_COMMAND_BODY_BYTES * 4) / 3);
+export const MAX_COMMAND_CAPTURE_CHARS = MAX_COMMAND_BODY_B64_CHARS + 1 + TAG_B64_LENGTH;
 export const COMMAND_TIMEOUT_MS = 1_000;
 export const MAX_FRAME_BYTES = 12 * 1024;
 const MAX_BODY_BYTES = 8_192;
@@ -36,6 +37,7 @@ export const MAX_PROCESS_ID = 4_294_967_295;
 const BASE64URL_PATTERN = /^[A-Za-z0-9_-]+$/;
 export const COMMAND_CAPTURE_CHARACTER_PATTERN = /^[A-Za-z0-9_.-]$/;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
 const UUID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const UNICODE_WHITESPACE_PATTERN = /\p{White_Space}/u;
 const THINKING_LEVELS: Record<ThinkingLevel, true> = {
@@ -88,6 +90,7 @@ export interface SemanticSnapshot {
 	version: 1;
 	incarnation: string;
 	sessionGeneration: number;
+	workEpoch: number;
 	ompVersion: string;
 	processId: number;
 	sessionId: string;
@@ -122,6 +125,29 @@ export interface SemanticSnapshot {
 		pendingDelivery: number;
 	};
 }
+
+export interface CompanionCommandTarget {
+	incarnation: string;
+	sessionGeneration: number;
+	sessionId: string;
+	workEpoch: number;
+}
+
+export type ParsedCompanionCommand =
+	| {
+			type: "cancel" | "request_snapshot";
+			commandSequence: number;
+	  }
+	| {
+			type: "snapshot_ack";
+			incarnation: string;
+			sequence: number;
+			sessionGeneration: number;
+			sessionId: string;
+			workEpoch: number;
+			accepted: boolean;
+			commandSequence: number;
+	  };
 
 interface WireSnapshot extends SemanticSnapshot {
 	sequence: number;
@@ -183,18 +209,25 @@ export function normalizeString(value: unknown, maxCodePoints: number, maxBytes:
 }
 
 function truncateString(value: string, maxCodePoints: number, maxBytes: number): string {
+	if (value.length <= maxCodePoints && Buffer.byteLength(value, "utf8") <= maxBytes) {
+		let end = value.length;
+		while (end > 0 && value.charCodeAt(end - 1) === 0x20) end--;
+		return end === value.length ? value : value.slice(0, end);
+	}
 	let result = "";
 	let lastNonSpaceEnd = 0;
 	let codePoints = 0;
 	let bytes = 0;
-	for (const scalar of value) {
-		if (codePoints >= maxCodePoints) break;
-		const scalarBytes = Buffer.byteLength(scalar, "utf8");
-		if (bytes + scalarBytes > maxBytes) break;
-		result += scalar;
-		if (scalar !== " ") lastNonSpaceEnd = result.length;
-		codePoints++;
-		bytes += scalarBytes;
+	for (const { segment } of getSegmenter().segment(value)) {
+		let segmentCodePoints = 0;
+		for (const _scalar of segment) segmentCodePoints++;
+		if (codePoints + segmentCodePoints > maxCodePoints) break;
+		const segmentBytes = Buffer.byteLength(segment, "utf8");
+		if (bytes + segmentBytes > maxBytes) break;
+		result += segment;
+		if (segment !== " ") lastNonSpaceEnd = result.length;
+		codePoints += segmentCodePoints;
+		bytes += segmentBytes;
 	}
 	return lastNonSpaceEnd === result.length ? result : result.slice(0, lastNonSpaceEnd);
 }
@@ -320,50 +353,104 @@ export function hasSettledFailure(messages: readonly AgentMessage[]): boolean {
 	return false;
 }
 
-export function parseCommand(secret: Uint8Array, capture: string): "cancel" | "request_snapshot" | undefined {
+export function parseCommand(
+	secret: Uint8Array,
+	capture: string,
+	expected: CompanionCommandTarget,
+	lastCommandSequence: number,
+): ParsedCompanionCommand | undefined {
 	if (capture.length > MAX_COMMAND_CAPTURE_CHARS) return undefined;
 	const separator = capture.indexOf(".");
 	if (separator <= 0 || separator !== capture.lastIndexOf(".")) return undefined;
 	const bodyText = capture.slice(0, separator);
 	const tagText = capture.slice(separator + 1);
-	if (
-		(bodyText.length !== CANCEL_COMMAND_BODY_B64.length &&
-			bodyText.length !== REQUEST_SNAPSHOT_COMMAND_BODY_B64.length) ||
-		tagText.length !== TAG_B64_LENGTH ||
-		!BASE64URL_PATTERN.test(bodyText)
-	)
-		return undefined;
+	if (bodyText.length > MAX_COMMAND_BODY_B64_CHARS || tagText.length !== TAG_B64_LENGTH) return undefined;
+	const body = canonicalBase64Url(bodyText);
 	const tag = canonicalBase64Url(tagText, TAG_BYTES);
-	if (!tag) return undefined;
+	if (!body || body.byteLength > MAX_COMMAND_BODY_BYTES || !tag) return undefined;
 	const expectedTag = hmac(secret, IN_DOMAIN, bodyText);
 	if (!crypto.timingSafeEqual(tag, expectedTag)) return undefined;
-	if (bodyText === CANCEL_COMMAND_BODY_B64) return "cancel";
-	if (bodyText === REQUEST_SNAPSHOT_COMMAND_BODY_B64) return "request_snapshot";
-	return undefined;
+
+	let json: string;
+	let value: unknown;
+	try {
+		json = UTF8_DECODER.decode(body);
+		value = JSON.parse(json);
+	} catch {
+		return undefined;
+	}
+	if (!isRecord(value)) return undefined;
+	const { version, type, incarnation, sequence, sessionGeneration, sessionId, workEpoch, accepted, commandSequence } =
+		value;
+	if (
+		version !== 1 ||
+		(type !== "cancel" && type !== "request_snapshot" && type !== "snapshot_ack") ||
+		!isCanonicalUuidV4(incarnation) ||
+		!isCanonicalUuid(sessionId) ||
+		typeof sessionGeneration !== "number" ||
+		!Number.isSafeInteger(sessionGeneration) ||
+		sessionGeneration < 1 ||
+		typeof workEpoch !== "number" ||
+		!Number.isSafeInteger(workEpoch) ||
+		workEpoch < 1 ||
+		typeof commandSequence !== "number" ||
+		!Number.isSafeInteger(commandSequence) ||
+		commandSequence < 1 ||
+		commandSequence <= lastCommandSequence ||
+		incarnation !== expected.incarnation ||
+		sessionGeneration !== expected.sessionGeneration ||
+		sessionId !== expected.sessionId ||
+		workEpoch !== expected.workEpoch
+	)
+		return undefined;
+	if (type === "snapshot_ack") {
+		if (
+			typeof sequence !== "number" ||
+			!Number.isSafeInteger(sequence) ||
+			sequence < 1 ||
+			typeof accepted !== "boolean"
+		) {
+			return undefined;
+		}
+		const canonical = JSON.stringify({
+			version,
+			type,
+			incarnation,
+			sequence,
+			sessionGeneration,
+			sessionId,
+			workEpoch,
+			accepted,
+			commandSequence,
+		});
+		if (json !== canonical) return undefined;
+		return {
+			type,
+			incarnation,
+			sequence,
+			sessionGeneration,
+			sessionId,
+			workEpoch,
+			accepted,
+			commandSequence,
+		};
+	}
+	const canonical = JSON.stringify({
+		version,
+		type,
+		incarnation,
+		sessionGeneration,
+		sessionId,
+		workEpoch,
+		commandSequence,
+	});
+	if (json !== canonical) return undefined;
+	return { type, commandSequence };
 }
 
 function semanticFromWire(snapshot: WireSnapshot): SemanticSnapshot {
-	return {
-		version: snapshot.version,
-		incarnation: snapshot.incarnation,
-		sessionGeneration: snapshot.sessionGeneration,
-		ompVersion: snapshot.ompVersion,
-		processId: snapshot.processId,
-		sessionId: snapshot.sessionId,
-		...(snapshot.sessionName === undefined ? {} : { sessionName: snapshot.sessionName }),
-		cwd: snapshot.cwd,
-		state: snapshot.state,
-		...(snapshot.statusText === undefined ? {} : { statusText: snapshot.statusText }),
-		...(snapshot.model === undefined ? {} : { model: snapshot.model }),
-		...(snapshot.thinkingLevel === undefined ? {} : { thinkingLevel: snapshot.thinkingLevel }),
-		runningTools: snapshot.runningTools,
-		...(snapshot.currentTool === undefined ? {} : { currentTool: snapshot.currentTool }),
-		...(snapshot.goal === undefined ? {} : { goal: snapshot.goal }),
-		...(snapshot.todos === undefined ? {} : { todos: snapshot.todos }),
-		...(snapshot.context === undefined ? {} : { context: snapshot.context }),
-		pendingApprovals: snapshot.pendingApprovals,
-		...(snapshot.asyncJobs === undefined ? {} : { asyncJobs: snapshot.asyncJobs }),
-	};
+	const { sequence: _sequence, timestampMs: _timestampMs, ...semantic } = snapshot;
+	return semantic;
 }
 
 function envelopeJson(snapshot: WireSnapshot): string {
@@ -432,29 +519,7 @@ function reduceSnapshotToBody(snapshot: WireSnapshot): { json: string; semantic:
 }
 
 function wireSnapshot(semantic: SemanticSnapshot, sequence: number, timestampMs: number): WireSnapshot {
-	return {
-		version: 1,
-		incarnation: semantic.incarnation,
-		sequence,
-		sessionGeneration: semantic.sessionGeneration,
-		timestampMs,
-		ompVersion: semantic.ompVersion,
-		processId: semantic.processId,
-		sessionId: semantic.sessionId,
-		...(semantic.sessionName === undefined ? {} : { sessionName: semantic.sessionName }),
-		cwd: semantic.cwd,
-		state: semantic.state,
-		...(semantic.statusText === undefined ? {} : { statusText: semantic.statusText }),
-		...(semantic.model === undefined ? {} : { model: semantic.model }),
-		...(semantic.thinkingLevel === undefined ? {} : { thinkingLevel: semantic.thinkingLevel }),
-		runningTools: semantic.runningTools,
-		...(semantic.currentTool === undefined ? {} : { currentTool: semantic.currentTool }),
-		...(semantic.goal === undefined ? {} : { goal: semantic.goal }),
-		...(semantic.todos === undefined ? {} : { todos: semantic.todos }),
-		...(semantic.context === undefined ? {} : { context: semantic.context }),
-		pendingApprovals: semantic.pendingApprovals,
-		...(semantic.asyncJobs === undefined ? {} : { asyncJobs: semantic.asyncJobs }),
-	};
+	return { ...semantic, sequence, timestampMs };
 }
 
 export function encodeFrame(

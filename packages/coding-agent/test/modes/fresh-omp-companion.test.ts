@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as crypto from "node:crypto";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import { VERSION } from "@oh-my-pi/pi-utils/dirs";
+import { isRecord, VERSION } from "@oh-my-pi/pi-utils";
 import type {
 	ExtensionAPI,
 	ExtensionContext,
@@ -14,11 +14,10 @@ import {
 	type FreshOmpCompanionController,
 } from "../../src/modes/fresh-omp-companion";
 import {
-	CANCEL_COMMAND_BODY_B64,
+	type CompanionCommandTarget,
 	encodeFrame,
 	normalizeString,
 	parseCommand,
-	REQUEST_SNAPSHOT_COMMAND_BODY_B64,
 	type SemanticSnapshot,
 } from "../../src/modes/fresh-omp-companion-wire";
 import type { SessionEntry } from "../../src/session/session-entries";
@@ -33,6 +32,13 @@ const IN_DOMAIN = "fresh-omp/in/v1\0";
 const SESSION_A = "018f1d74-7f7b-7d31-8d93-9a21c7b95bb1";
 const SESSION_B = "018f1d74-7f7b-7d31-8d93-9a21c7b95bb2";
 const SECRET = Uint8Array.from({ length: 32 }, (_, index) => index);
+const COMMAND_TARGET: CompanionCommandTarget = {
+	incarnation: "550e8400-e29b-41d4-a716-446655440000",
+	sessionGeneration: 1,
+	sessionId: SESSION_A,
+	workEpoch: 1,
+};
+let nextCommandSequence = 0;
 
 type RegisteredHandler = ExtensionHandler<ExtensionEvent>;
 
@@ -82,18 +88,86 @@ function parseFrame(frame: string, secret: Uint8Array): ParsedFrame {
 	};
 }
 
+function latestSnapshotIdentity(): (CompanionCommandTarget & { sequence: number }) | undefined {
+	// The test harness installs a Bun mock before commands inspect captured writes.
+	const mockedWrite = process.stdout.write as typeof process.stdout.write & { mock?: { calls: unknown[][] } };
+	const calls = mockedWrite.mock?.calls ?? [];
+	for (let index = calls.length - 1; index >= 0; index--) {
+		const frame = calls[index]?.[0];
+		if (typeof frame !== "string" || !frame.startsWith(OSC_PREFIX) || !frame.endsWith(OSC_TERMINATOR)) continue;
+		const content = frame.slice(OSC_PREFIX.length, -OSC_TERMINATOR.length);
+		const authenticated = content.slice(content.indexOf(";") + 1);
+		const bodyText = authenticated.slice(0, authenticated.lastIndexOf("."));
+		try {
+			const envelope: unknown = JSON.parse(Buffer.from(bodyText, "base64url").toString("utf8"));
+			if (!isRecord(envelope) || !isRecord(envelope.snapshot)) continue;
+			const snapshot = envelope.snapshot;
+			if (
+				typeof snapshot.incarnation === "string" &&
+				typeof snapshot.sequence === "number" &&
+				typeof snapshot.sessionGeneration === "number" &&
+				typeof snapshot.sessionId === "string" &&
+				typeof snapshot.workEpoch === "number"
+			) {
+				return {
+					incarnation: snapshot.incarnation,
+					sequence: snapshot.sequence,
+					sessionGeneration: snapshot.sessionGeneration,
+					sessionId: snapshot.sessionId,
+					workEpoch: snapshot.workEpoch,
+				};
+			}
+		} catch {
+			// Ignore non-companion writes and malformed test fixtures.
+		}
+	}
+	return undefined;
+}
+
 function commandFrame(
 	secret: Uint8Array,
-	type: "cancel" | "request_snapshot",
-	options: { json?: string; bodyText?: string; tagText?: string } = {},
+	type: "cancel" | "request_snapshot" | "snapshot_ack",
+	options: {
+		json?: string;
+		bodyText?: string;
+		tagText?: string;
+		target?: CompanionCommandTarget;
+		sequence?: number;
+		accepted?: boolean;
+		commandSequence?: number;
+	} = {},
 ): string {
-	const json = options.json ?? JSON.stringify({ version: 1, type });
+	const latest = latestSnapshotIdentity();
+	const source = options.target ?? latest ?? COMMAND_TARGET;
+	const target: CompanionCommandTarget = {
+		incarnation: source.incarnation,
+		sessionGeneration: source.sessionGeneration,
+		sessionId: source.sessionId,
+		workEpoch: source.workEpoch,
+	};
+	const commandSequence = options.commandSequence ?? ++nextCommandSequence;
+	const json =
+		options.json ??
+		(type === "snapshot_ack"
+			? JSON.stringify({
+					version: 1,
+					type,
+					incarnation: target.incarnation,
+					sequence: options.sequence ?? latest?.sequence ?? 1,
+					sessionGeneration: target.sessionGeneration,
+					sessionId: target.sessionId,
+					workEpoch: target.workEpoch,
+					accepted: options.accepted ?? true,
+					commandSequence,
+				})
+			: JSON.stringify({ version: 1, type, ...target, commandSequence }));
 	const bodyText = options.bodyText ?? Buffer.from(json, "utf8").toString("base64url");
 	const tagText = options.tagText ?? hmac(secret, IN_DOMAIN, bodyText).toString("base64url");
 	return `${COMMAND_PREFIX}${bodyText}.${tagText}${COMMAND_END}`;
 }
 
-function authenticatedCommandCapture(bodyText: string, secret: Uint8Array = SECRET): string {
+function authenticatedCommandCapture(json: string, secret: Uint8Array = SECRET): string {
+	const bodyText = Buffer.from(json, "utf8").toString("base64url");
 	return `${bodyText}.${hmac(secret, IN_DOMAIN, bodyText).toString("base64url")}`;
 }
 
@@ -104,6 +178,15 @@ function event(type: ExtensionEvent["type"], fields: Record<string, unknown> = {
 function advance(ms: number): void {
 	vi.advanceTimersByTime(ms);
 	vi.advanceTimersByTime(0);
+}
+
+async function rejectionMessage(promise: Promise<unknown>): Promise<string | undefined> {
+	try {
+		await promise;
+		return undefined;
+	} catch (error) {
+		return error instanceof Error ? error.message : String(error);
+	}
 }
 
 function modeEntry(mode: string, data?: Record<string, unknown>): SessionEntry {
@@ -137,6 +220,7 @@ class CompanionHarness {
 		if (this.throwOnEnsure) throw new Error("ensure secret payload");
 		await this.ensureOnDiskBarrier;
 	});
+	readonly getBranch = vi.fn((): SessionEntry[] => this.branch);
 	readonly context: ExtensionContext;
 	input?: TerminalInputHandler;
 	inputInstalls = 0;
@@ -164,6 +248,13 @@ class CompanionHarness {
 		recent: [],
 		delivery: { queued: 0, delivering: false, pendingJobIds: [] },
 	};
+	jobCounts: { running: number; recentFailures: number; pendingDelivery: number } | null = {
+		running: 0,
+		recentFailures: 0,
+		pendingDelivery: 0,
+	};
+	readonly getAsyncJobSnapshot = vi.fn(() => this.jobs as never);
+	readonly getAsyncJobCounts = vi.fn(() => this.jobCounts as never);
 	throwOnSample = false;
 	throwOnTimer = false;
 	throwOnClearTimer = false;
@@ -190,13 +281,14 @@ class CompanionHarness {
 				return this.usage;
 			},
 			isCompacting: () => this.compacting,
-			getAsyncJobSnapshot: () => this.jobs as never,
+			getAsyncJobSnapshot: this.getAsyncJobSnapshot,
+			getAsyncJobCounts: this.getAsyncJobCounts,
 			cwd: this.cwd,
 			sessionManager: {
 				getSessionId: () => this.sessionId,
 				getSessionName: () => this.sessionName,
 				getCwd: () => this.cwd,
-				getBranch: () => this.branch,
+				getBranch: this.getBranch,
 				ensureOnDisk: this.ensureOnDisk,
 			},
 			model: { provider: this.modelProvider, id: this.modelId },
@@ -249,12 +341,17 @@ class CompanionHarness {
 		await handler?.(event(type, fields), this.context);
 	}
 
-	beforeSessionMutation(type: "session_branch" | "session_tree"): void {
+	beforeSessionMutation(type: "session_switch" | "session_branch" | "session_tree"): void {
 		void this.controller.beforeSessionMutation({ type }, this.context);
 	}
 
-	afterDispatch(type: "session_ready" | "session_rollback" | "session_branch" | "session_tree"): void {
-		void this.controller.afterDispatch(event(type), this.context);
+	async afterDispatch(
+		type: "session_ready" | "session_rollback" | "session_branch" | "session_tree",
+		autoAcknowledge = true,
+	): Promise<void> {
+		const completion = Promise.resolve(this.controller.afterDispatch(event(type), this.context));
+		if (autoAcknowledge) this.feed(commandFrame(this.secret, "snapshot_ack"));
+		await completion;
 	}
 
 	async start(): Promise<void> {
@@ -283,6 +380,7 @@ let activeHarnesses: CompanionHarness[] = [];
 afterEach(() => {
 	for (const harness of activeHarnesses) harness.shutdown();
 	activeHarnesses = [];
+	nextCommandSequence = 0;
 	vi.restoreAllMocks();
 	vi.useRealTimers();
 });
@@ -294,10 +392,8 @@ describe("Fresh OMP companion wire snapshots", () => {
 		const harness = new CompanionHarness();
 
 		await harness.start();
-		advance(999);
-		expect(write).not.toHaveBeenCalled();
-		advance(1);
-
+		expect(write).toHaveBeenCalledTimes(1);
+		advance(1_000);
 		expect(write).toHaveBeenCalledTimes(1);
 		expect(write.mock.calls[0]).toHaveLength(1);
 		const parsed = parseFrame(write.mock.calls[0]?.[0] as string, SECRET);
@@ -316,6 +412,7 @@ describe("Fresh OMP companion wire snapshots", () => {
 				processId: process.pid,
 				sessionId: SESSION_A,
 				sessionGeneration: 1,
+				workEpoch: 1,
 				state: "idle",
 				runningTools: 0,
 				pendingApprovals: 0,
@@ -373,7 +470,7 @@ describe("Fresh OMP companion wire snapshots", () => {
 		expect(secondSnapshot.sequence).toBe((firstSnapshot.sequence as number) + 1);
 	});
 
-	it("normalizes strict schema fields, domains, goal/todo state, and default-five async failures", async () => {
+	it("normalizes strict schema fields, domains, goal/todo state, and count-only async summaries", async () => {
 		vi.useFakeTimers();
 		const write = vi.spyOn(process.stdout, "write").mockReturnValue(true);
 		const harness = new CompanionHarness();
@@ -383,18 +480,7 @@ describe("Fresh OMP companion wire snapshots", () => {
 		harness.modelId = `model\u2067${"😀".repeat(100)}`;
 		harness.context.model = { provider: harness.modelProvider, id: harness.modelId } as never;
 		harness.usage = { tokens: -20.8, contextWindow: Number.MAX_SAFE_INTEGER + 100, percent: 123.456 };
-		harness.jobs = {
-			running: [{ id: "running-secret", type: "task", status: "running", label: "do not emit", startTime: 0 }],
-			recent: [
-				{ id: "1", type: "task", status: "failed", label: "hidden", startTime: 0 },
-				{ id: "2", type: "task", status: "cancelled", label: "hidden", startTime: 0 },
-				{ id: "3", type: "task", status: "failed", label: "hidden", startTime: 0 },
-				{ id: "4", type: "task", status: "completed", label: "hidden", startTime: 0 },
-				{ id: "5", type: "task", status: "failed", label: "hidden", startTime: 0 },
-				{ id: "6", type: "task", status: "failed", label: "outside-default-five", startTime: 0 },
-			],
-			delivery: { queued: 4, delivering: true, pendingJobIds: ["delivery-secret"] },
-		};
+		harness.jobCounts = { running: 1, recentFailures: 3, pendingDelivery: 4 };
 		harness.branch = [
 			modeEntry("goal", {
 				goal: { objective: "  Ship\n\u202e safely  ", status: "active" },
@@ -453,6 +539,7 @@ describe("Fresh OMP companion wire snapshots", () => {
 				"runningTools",
 				"sequence",
 				"sessionGeneration",
+				"workEpoch",
 				"sessionId",
 				"sessionName",
 				"state",
@@ -483,6 +570,8 @@ describe("Fresh OMP companion wire snapshots", () => {
 		});
 		expect(snapshot.context).toEqual({ tokens: 0, contextWindow: Number.MAX_SAFE_INTEGER, percentBps: 10_000 });
 		expect(snapshot.asyncJobs).toEqual({ running: 1, recentFailures: 3, pendingDelivery: 4 });
+		expect(harness.getAsyncJobSnapshot).not.toHaveBeenCalled();
+		expect(harness.getAsyncJobCounts).toHaveBeenCalled();
 		const serialized = JSON.stringify(parsed.envelope);
 		expect(serialized).not.toContain("must-not-cross");
 		expect(serialized).not.toContain("running-secret");
@@ -512,11 +601,23 @@ describe("Fresh OMP companion wire string bounds", () => {
 		}
 	});
 
+	it("never splits an extended grapheme at code-point or UTF-8 byte bounds", () => {
+		for (const cluster of ["e\u0301", "👩🏽‍💻", "👨‍👩‍👧‍👦", "🇺🇳"]) {
+			const codePoints = Array.from(cluster).length;
+			const bytes = Buffer.byteLength(cluster, "utf8");
+			expect(normalizeString(`${cluster}x`, codePoints, Number.MAX_SAFE_INTEGER)).toBe(cluster);
+			expect(normalizeString(`${cluster}x`, Number.MAX_SAFE_INTEGER, bytes)).toBe(cluster);
+			expect(normalizeString(cluster, codePoints - 1, Number.MAX_SAFE_INTEGER)).toBe("");
+			expect(normalizeString(cluster, Number.MAX_SAFE_INTEGER, bytes - 1)).toBe("");
+		}
+	});
+
 	it("removes a trailing ASCII space exposed by each reduced cwd cap", () => {
 		const snapshot = (cwd: string, ompVersion = "omp"): SemanticSnapshot => ({
 			version: 1,
 			incarnation: "00000000-0000-4000-8000-000000000000",
 			sessionGeneration: 1,
+			workEpoch: 1,
 			ompVersion,
 			processId: 1,
 			sessionId: SESSION_A,
@@ -552,24 +653,165 @@ describe("Fresh OMP companion wire string bounds", () => {
 });
 
 describe("Fresh OMP canonical command parser", () => {
-	it("accepts only the two frozen authenticated body strings", () => {
-		expect(parseCommand(SECRET, authenticatedCommandCapture(CANCEL_COMMAND_BODY_B64))).toBe("cancel");
-		expect(parseCommand(SECRET, authenticatedCommandCapture(REQUEST_SNAPSHOT_COMMAND_BODY_B64))).toBe(
-			"request_snapshot",
-		);
+	const commandJson = (
+		type: "cancel" | "request_snapshot",
+		commandSequence: number,
+		target = COMMAND_TARGET,
+	): string => JSON.stringify({ version: 1, type, ...target, commandSequence });
 
-		const nearCanonicalBodies = [
-			Buffer.from('{"version":1,"type":"cancel" }', "utf8").toString("base64url"),
-			Buffer.from('{"type":"cancel","version":1}', "utf8").toString("base64url"),
-			Buffer.from('{"version":1,"version":1,"type":"cancel"}', "utf8").toString("base64url"),
-		];
-		for (const bodyText of nearCanonicalBodies) {
-			expect(parseCommand(SECRET, authenticatedCommandCapture(bodyText))).toBeUndefined();
+	it("accepts only canonical commands for the exact live work and next sequence", () => {
+		const cancel = authenticatedCommandCapture(commandJson("cancel", 1));
+		expect(parseCommand(SECRET, cancel, COMMAND_TARGET, 0)).toEqual({ type: "cancel", commandSequence: 1 });
+		expect(parseCommand(SECRET, cancel, COMMAND_TARGET, 1)).toBeUndefined();
+
+		const request = authenticatedCommandCapture(commandJson("request_snapshot", 2));
+		expect(parseCommand(SECRET, request, COMMAND_TARGET, 1)).toEqual({
+			type: "request_snapshot",
+			commandSequence: 2,
+		});
+		expect(
+			parseCommand(SECRET, request, { ...COMMAND_TARGET, workEpoch: COMMAND_TARGET.workEpoch + 1 }, 1),
+		).toBeUndefined();
+
+		const acknowledgementJson = JSON.stringify({
+			version: 1,
+			type: "snapshot_ack",
+			incarnation: COMMAND_TARGET.incarnation,
+			sequence: 9,
+			sessionGeneration: COMMAND_TARGET.sessionGeneration,
+			sessionId: COMMAND_TARGET.sessionId,
+			workEpoch: COMMAND_TARGET.workEpoch,
+			accepted: true,
+			commandSequence: 3,
+		});
+		expect(parseCommand(SECRET, authenticatedCommandCapture(acknowledgementJson), COMMAND_TARGET, 2)).toEqual({
+			type: "snapshot_ack",
+			incarnation: COMMAND_TARGET.incarnation,
+			sequence: 9,
+			sessionGeneration: COMMAND_TARGET.sessionGeneration,
+			sessionId: COMMAND_TARGET.sessionId,
+			workEpoch: COMMAND_TARGET.workEpoch,
+			accepted: true,
+			commandSequence: 3,
+		});
+
+		for (const json of [
+			`${commandJson("cancel", 3)} `,
+			`{"type":"cancel","version":1,"incarnation":"${COMMAND_TARGET.incarnation}","sessionGeneration":1,"sessionId":"${SESSION_A}","workEpoch":1,"commandSequence":3}`,
+			commandJson("cancel", 3).replace('"version":1', '"version":1,"version":1'),
+			JSON.stringify({ version: 1, type: "cancel", ...COMMAND_TARGET, commandSequence: 3, extra: true }),
+		]) {
+			expect(parseCommand(SECRET, authenticatedCommandCapture(json), COMMAND_TARGET, 2)).toBeUndefined();
 		}
 	});
 });
 
 describe("Fresh OMP companion lifecycle and generation isolation", () => {
+	it("requires an exact positive snapshot acknowledgement before lifecycle activation", async () => {
+		vi.useFakeTimers();
+		vi.spyOn(process.stdout, "write").mockReturnValue(true);
+		const harness = new CompanionHarness();
+		await harness.start();
+		advance(1_000);
+
+		harness.beforeSessionMutation("session_switch");
+		harness.sessionId = SESSION_B;
+		await harness.invokeAsync("session_ready");
+		const completion = harness.afterDispatch("session_ready", false);
+		const published = latestSnapshotIdentity();
+		if (!published) throw new Error("expected lifecycle snapshot identity");
+		const activated = vi.fn();
+		void completion.then(activated);
+
+		expect(
+			harness.feed(
+				commandFrame(SECRET, "snapshot_ack", {
+					target: published,
+					sequence: published.sequence + 1,
+				}),
+			),
+		).toBe("");
+		await Promise.resolve();
+		expect(activated).not.toHaveBeenCalled();
+
+		expect(
+			harness.feed(commandFrame(SECRET, "snapshot_ack", { target: published, sequence: published.sequence })),
+		).toBe("");
+		await completion;
+		expect(activated).toHaveBeenCalledTimes(1);
+		expect(harness.feed(commandFrame(SECRET, "cancel"))).toBe("");
+		advance(0);
+		expect(harness.abort).toHaveBeenCalledTimes(1);
+
+		harness.beforeSessionMutation("session_switch");
+		harness.sessionId = SESSION_A;
+		harness.invoke("session_rollback");
+		const rejected = harness.afterDispatch("session_rollback", false);
+		const rejectedMessage = rejectionMessage(rejected);
+		expect(harness.feed(commandFrame(SECRET, "snapshot_ack", { accepted: false }))).toBe("");
+		expect(await rejectedMessage).toContain("Fresh rejected the durable snapshot acknowledgement");
+		expect(harness.feed(commandFrame(SECRET, "cancel"))).toBe("");
+		advance(0);
+		expect(harness.abort).toHaveBeenCalledTimes(1);
+	});
+
+	it("times out a missing acknowledgement and cannot reuse a late stale frame", async () => {
+		vi.useFakeTimers();
+		vi.spyOn(process.stdout, "write").mockReturnValue(true);
+		const harness = new CompanionHarness();
+		await harness.start();
+		advance(1_000);
+
+		harness.beforeSessionMutation("session_switch");
+		harness.sessionId = SESSION_B;
+		await harness.invokeAsync("session_ready");
+		const timedOut = harness.afterDispatch("session_ready", false);
+		const stale = latestSnapshotIdentity();
+		if (!stale) throw new Error("expected timed-out lifecycle snapshot identity");
+		const timeoutMessage = rejectionMessage(timedOut);
+		advance(5_000);
+		expect(await timeoutMessage).toContain("timed out");
+
+		harness.beforeSessionMutation("session_switch");
+		harness.sessionId = SESSION_A;
+		harness.invoke("session_rollback");
+		const replacement = harness.afterDispatch("session_rollback", false);
+		const current = latestSnapshotIdentity();
+		if (!current) throw new Error("expected replacement lifecycle snapshot identity");
+		const activated = vi.fn();
+		void replacement.then(activated);
+		expect(harness.feed(commandFrame(SECRET, "snapshot_ack", { target: stale, sequence: stale.sequence }))).toBe("");
+		await Promise.resolve();
+		expect(activated).not.toHaveBeenCalled();
+		expect(harness.feed(commandFrame(SECRET, "snapshot_ack", { target: current, sequence: current.sequence }))).toBe(
+			"",
+		);
+		await replacement;
+		expect(activated).toHaveBeenCalledTimes(1);
+	});
+
+	it("rejects pending acknowledgements on generation replacement and shutdown", async () => {
+		vi.useFakeTimers();
+		vi.spyOn(process.stdout, "write").mockReturnValue(true);
+		const harness = new CompanionHarness();
+		await harness.start();
+		advance(1_000);
+
+		harness.beforeSessionMutation("session_switch");
+		harness.sessionId = SESSION_B;
+		await harness.invokeAsync("session_ready");
+		const replaced = harness.afterDispatch("session_ready", false);
+		const replacedMessage = rejectionMessage(replaced);
+		harness.beforeSessionMutation("session_switch");
+		expect(await replacedMessage).toContain("superseded by a new session generation");
+
+		harness.sessionId = SESSION_A;
+		harness.invoke("session_rollback");
+		const stopped = harness.afterDispatch("session_rollback", false);
+		const stoppedMessage = rejectionMessage(stopped);
+		harness.shutdown();
+		expect(await stoppedMessage).toContain("cancelled during shutdown");
+	});
 	it("materializes each advertised session before enabling or publishing its companion", async () => {
 		vi.useFakeTimers();
 		const write = vi.spyOn(process.stdout, "write").mockReturnValue(true);
@@ -591,34 +833,28 @@ describe("Fresh OMP companion lifecycle and generation isolation", () => {
 		startGate.resolve();
 		await starting;
 		expect(harness.inputInstalls).toBe(1);
-		advance(1_000);
+		expect(write).toHaveBeenCalledTimes(1);
 		expect(parseFrame(write.mock.calls.at(-1)?.[0] as string, SECRET).envelope.snapshot.sessionId).toBe(SESSION_A);
 		expect(harness.feed(cancel.slice(1))).toBe("");
 		advance(0);
 		expect(harness.abort).not.toHaveBeenCalled();
-		expect(harness.feed(cancel)).toBe("");
+		const activeCancel = commandFrame(SECRET, "cancel");
+		expect(harness.feed(activeCancel)).toBe("");
 		advance(0);
 		expect(harness.abort).toHaveBeenCalledTimes(1);
 
-		harness.invoke("session_switch", { reason: "new", previousSessionFile: "/old" });
+		harness.beforeSessionMutation("session_switch");
 		harness.sessionId = SESSION_B;
 		const beforeTargetSample = write.mock.calls.length;
 		advance(1_000);
 		expect(write).toHaveBeenCalledTimes(beforeTargetSample);
-		const readyGate = Promise.withResolvers<void>();
-		harness.ensureOnDiskBarrier = readyGate.promise;
-		const becomingReady = harness.invokeAsync("session_ready");
-		await Promise.resolve();
-		expect(harness.ensureOnDisk).toHaveBeenCalledTimes(2);
-		const beforeReady = write.mock.calls.length;
-		harness.afterDispatch("session_ready");
-		advance(50);
-		expect(write).toHaveBeenCalledTimes(beforeReady);
 
-		readyGate.resolve();
-		await becomingReady;
-		harness.afterDispatch("session_ready");
-		expect(write).toHaveBeenCalledTimes(beforeReady + 1);
+		harness.throwOnEnsure = true;
+		await harness.invokeAsync("session_ready");
+		expect(harness.ensureOnDisk).toHaveBeenCalledTimes(1);
+		expect(harness.warn).not.toHaveBeenCalled();
+		await harness.afterDispatch("session_ready");
+		expect(write).toHaveBeenCalledTimes(beforeTargetSample + 1);
 		expect(parseFrame(write.mock.calls.at(-1)?.[0] as string, SECRET).envelope.snapshot.sessionId).toBe(SESSION_B);
 	});
 
@@ -631,14 +867,14 @@ describe("Fresh OMP companion lifecycle and generation isolation", () => {
 
 		const oldStart = harness.invokeAsync("session_start");
 		await Promise.resolve();
-		harness.invoke("session_switch", { reason: "new", previousSessionFile: "/old" });
+		harness.beforeSessionMutation("session_switch");
 		oldStartGate.resolve();
 		await oldStart;
 		advance(1_000);
 		expect(write).not.toHaveBeenCalled();
 
 		harness.invoke("session_rollback");
-		harness.afterDispatch("session_rollback");
+		await harness.afterDispatch("session_rollback");
 		advance(50);
 		expect(write).toHaveBeenCalledTimes(1);
 		expect(parseFrame(write.mock.calls[0]?.[0] as string, SECRET).envelope.snapshot.sessionGeneration).toBe(2);
@@ -653,18 +889,18 @@ describe("Fresh OMP companion lifecycle and generation isolation", () => {
 
 		const oldStart = harness.invokeAsync("session_start");
 		await Promise.resolve();
-		harness.invoke("session_switch", { reason: "new", previousSessionFile: "/old" });
+		harness.beforeSessionMutation("session_switch");
 		oldStartGate.reject(new Error("stale start materialization failed"));
 		await oldStart;
 		expect(harness.warn).not.toHaveBeenCalled();
 
 		harness.invoke("session_rollback");
-		harness.afterDispatch("session_rollback");
+		await harness.afterDispatch("session_rollback");
 		advance(50);
 		expect(write).toHaveBeenCalledTimes(1);
 	});
 
-	it("does not let a delayed old session_ready activate a newer generation", async () => {
+	it("binds synchronous readiness to the generation that reaches host completion", async () => {
 		vi.useFakeTimers();
 		const write = vi.spyOn(process.stdout, "write").mockReturnValue(true);
 		const harness = new CompanionHarness();
@@ -672,47 +908,23 @@ describe("Fresh OMP companion lifecycle and generation isolation", () => {
 		advance(1_000);
 		const beforeTransition = write.mock.calls.length;
 
-		harness.invoke("session_switch", { reason: "new", previousSessionFile: "/old" });
-		const oldReadyGate = Promise.withResolvers<void>();
-		harness.ensureOnDiskBarrier = oldReadyGate.promise;
-		const oldReady = harness.invokeAsync("session_ready");
-		await Promise.resolve();
-		harness.invoke("session_switch", { reason: "resume", previousSessionFile: "/target" });
-		oldReadyGate.resolve();
-		await oldReady;
-		harness.afterDispatch("session_ready");
+		harness.beforeSessionMutation("session_switch");
+		harness.sessionId = SESSION_B;
+		await harness.invokeAsync("session_ready");
+		harness.beforeSessionMutation("session_switch");
+		await harness.afterDispatch("session_ready");
 		advance(1_000);
 		expect(write).toHaveBeenCalledTimes(beforeTransition);
 
+		harness.sessionId = SESSION_A;
 		harness.invoke("session_rollback");
-		harness.afterDispatch("session_rollback");
+		await harness.afterDispatch("session_rollback");
 		advance(50);
 		expect(write).toHaveBeenCalledTimes(beforeTransition + 1);
-		expect(parseFrame(write.mock.calls.at(-1)?.[0] as string, SECRET).envelope.snapshot.sessionGeneration).toBe(3);
-	});
-
-	it("does not let a rejected old session_ready disable a newer generation", async () => {
-		vi.useFakeTimers();
-		const write = vi.spyOn(process.stdout, "write").mockReturnValue(true);
-		const harness = new CompanionHarness();
-		await harness.start();
-		advance(1_000);
-		const beforeTransition = write.mock.calls.length;
-
-		harness.invoke("session_switch", { reason: "new", previousSessionFile: "/old" });
-		const oldReadyGate = Promise.withResolvers<void>();
-		harness.ensureOnDiskBarrier = oldReadyGate.promise;
-		const oldReady = harness.invokeAsync("session_ready");
-		await Promise.resolve();
-		harness.invoke("session_switch", { reason: "resume", previousSessionFile: "/target" });
-		oldReadyGate.reject(new Error("stale readiness materialization failed"));
-		await oldReady;
-		expect(harness.warn).not.toHaveBeenCalled();
-
-		harness.invoke("session_rollback");
-		harness.afterDispatch("session_rollback");
-		advance(50);
-		expect(write).toHaveBeenCalledTimes(beforeTransition + 1);
+		expect(parseFrame(write.mock.calls.at(-1)?.[0] as string, SECRET).envelope.snapshot).toMatchObject({
+			sessionGeneration: 3,
+			sessionId: SESSION_A,
+		});
 	});
 
 	it("publishes only from post-fan-out continuations and rejects stale-generation scheduled work", async () => {
@@ -724,7 +936,7 @@ describe("Fresh OMP companion lifecycle and generation isolation", () => {
 		const initial = parseFrame(write.mock.calls.at(-1)?.[0] as string, SECRET).envelope.snapshot;
 		expect(initial.sessionGeneration).toBe(1);
 
-		harness.invoke("session_switch", { reason: "resume", previousSessionFile: "/old" });
+		harness.beforeSessionMutation("session_switch");
 		harness.sessionId = SESSION_B;
 		harness.sessionName = "Target before public handlers";
 		const beforeTargetSample = write.mock.calls.length;
@@ -734,7 +946,7 @@ describe("Fresh OMP companion lifecycle and generation isolation", () => {
 		await harness.invokeAsync("session_ready");
 		expect(write).toHaveBeenCalledTimes(beforeReady);
 		harness.sessionName = "Target after public handlers";
-		harness.afterDispatch("session_ready");
+		await harness.afterDispatch("session_ready");
 		const ready = parseFrame(write.mock.calls.at(-1)?.[0] as string, SECRET).envelope.snapshot;
 		expect(ready).toMatchObject({
 			sessionId: SESSION_B,
@@ -747,7 +959,7 @@ describe("Fresh OMP companion lifecycle and generation isolation", () => {
 		const beforeStale = write.mock.calls.length;
 		harness.invoke("agent_start");
 		harness.throwOnClearTimer = true;
-		harness.invoke("session_switch", { reason: "resume", previousSessionFile: "/target" });
+		harness.beforeSessionMutation("session_switch");
 		advance(50);
 		expect(write).toHaveBeenCalledTimes(beforeStale);
 		harness.throwOnClearTimer = false;
@@ -756,7 +968,7 @@ describe("Fresh OMP companion lifecycle and generation isolation", () => {
 		harness.sessionName = "Retained before rollback fan-out";
 		harness.invoke("session_rollback");
 		harness.sessionName = "Retained after rollback fan-out";
-		harness.afterDispatch("session_rollback");
+		await harness.afterDispatch("session_rollback");
 		advance(50);
 		const rollback = parseFrame(write.mock.calls.at(-1)?.[0] as string, SECRET).envelope.snapshot;
 		expect(rollback).toMatchObject({
@@ -772,7 +984,7 @@ describe("Fresh OMP companion lifecycle and generation isolation", () => {
 		advance(1_000);
 		expect(write).toHaveBeenCalledTimes(beforeBranch);
 		harness.branch = [modeEntry("none"), todoEntry([])];
-		harness.afterDispatch("session_branch");
+		await harness.afterDispatch("session_branch");
 		advance(50);
 		const branch = parseFrame(write.mock.calls.at(-1)?.[0] as string, SECRET).envelope.snapshot;
 		expect(branch.sessionGeneration).toBe(4);
@@ -785,7 +997,7 @@ describe("Fresh OMP companion lifecycle and generation isolation", () => {
 		advance(1_000);
 		expect(write).toHaveBeenCalledTimes(beforeTree);
 		harness.sessionName = "Tree after public handlers";
-		harness.afterDispatch("session_tree");
+		await harness.afterDispatch("session_tree");
 		advance(50);
 		const tree = parseFrame(write.mock.calls.at(-1)?.[0] as string, SECRET).envelope.snapshot;
 		expect(tree).toMatchObject({
@@ -814,6 +1026,24 @@ describe("Fresh OMP companion lifecycle and generation isolation", () => {
 		expect(parseFrame(write.mock.calls.at(-1)?.[0] as string, SECRET).envelope.snapshot.state).toBe("idle");
 	});
 
+	it("keeps idle one-second sampling O(1) by reusing cached branch summaries", async () => {
+		vi.useFakeTimers();
+		const write = vi.spyOn(process.stdout, "write").mockReturnValue(true);
+		const harness = new CompanionHarness();
+		harness.branch = [modeEntry("goal", { goal: { objective: "Cached goal", status: "active" } })];
+		await harness.start();
+		expect(harness.getBranch).toHaveBeenCalledTimes(1);
+
+		harness.getBranch.mockClear();
+		advance(5_000);
+		expect(harness.getBranch).not.toHaveBeenCalled();
+
+		harness.controller.setThinkingLevel("auto");
+		advance(50);
+		expect(harness.getBranch).not.toHaveBeenCalled();
+		expect(parseFrame(write.mock.calls.at(-1)?.[0] as string, SECRET).envelope.snapshot.thinkingLevel).toBe("auto");
+	});
+
 	it("keeps one host-owned filter consume-only through fences until shutdown", async () => {
 		vi.useFakeTimers();
 		const write = vi.spyOn(process.stdout, "write").mockReturnValue(true);
@@ -827,51 +1057,48 @@ describe("Fresh OMP companion lifecycle and generation isolation", () => {
 		const firstInput = harness.input;
 
 		expect(harness.feed(`${COMMAND_PREFIX}frozen`)).toBe("");
-		harness.invoke("session_switch", { reason: "new", previousSessionFile: "/old" });
+		harness.beforeSessionMutation("session_switch");
 		expect(harness.input).toBe(firstInput);
 		expect(harness.inputInstalls).toBe(1);
 		expect(harness.inputUnsubscribes).toBe(0);
-		expect(harness.feed("ordinary-during-switch")).toBe("ordinary-during-switch");
+		expect(harness.feed("ordinary-during-switch")).toBe("");
+		expect(harness.feed(`${COMMAND_END}ordinary-after-resync`)).toBe("ordinary-after-resync");
 		expect(harness.feed(`before${cancel}${malformed}${request}after`)).toBe("beforeafter");
 		expect(harness.feed(`${COMMAND_PREFIX}${"A".repeat(2_093)}${COMMAND_END}tail`)).toBe("tail");
 		expect(harness.feed(`${COMMAND_PREFIX}timed-out`)).toBe("");
 		advance(1_000);
-		expect(harness.feed("ordinary-after-timeout")).toBe("ordinary-after-timeout");
+		expect(harness.feed("ordinary-after-timeout")).toBe("");
+		expect(harness.feed(`${COMMAND_END}ordinary-after-timeout-resync`)).toBe("ordinary-after-timeout-resync");
 		advance(0);
 		expect(harness.abort).not.toHaveBeenCalled();
 		expect(write).toHaveBeenCalledTimes(initialWrites);
 
-		const readyGate = Promise.withResolvers<void>();
-		harness.ensureOnDiskBarrier = readyGate.promise;
-		const becomingReady = harness.invokeAsync("session_ready");
-		await Promise.resolve();
+		await harness.invokeAsync("session_ready");
 		expect(harness.feed(`left${cancel}${request}right`)).toBe("leftright");
 		advance(0);
 		expect(harness.abort).not.toHaveBeenCalled();
 		expect(write).toHaveBeenCalledTimes(initialWrites);
-		readyGate.resolve();
-		await becomingReady;
-		harness.afterDispatch("session_ready");
-		harness.afterDispatch("session_ready");
+		await harness.afterDispatch("session_ready");
+		await harness.afterDispatch("session_ready");
 		advance(50);
 		expect(harness.input).toBe(firstInput);
 		expect(harness.inputInstalls).toBe(1);
 		expect(harness.inputUnsubscribes).toBe(0);
-		expect(harness.feed(cancel)).toBe("");
+		expect(harness.feed(commandFrame(SECRET, "cancel"))).toBe("");
 		advance(0);
 		expect(harness.abort).toHaveBeenCalledTimes(1);
 
-		harness.invoke("session_switch", { reason: "resume", previousSessionFile: "/target" });
+		harness.beforeSessionMutation("session_switch");
 		expect(harness.feed(cancel)).toBe("");
 		advance(0);
 		expect(harness.abort).toHaveBeenCalledTimes(1);
 		harness.invoke("session_rollback");
-		harness.afterDispatch("session_rollback");
-		harness.afterDispatch("session_rollback");
+		await harness.afterDispatch("session_rollback");
+		await harness.afterDispatch("session_rollback");
 		advance(50);
 		expect(harness.input).toBe(firstInput);
 		expect(harness.inputInstalls).toBe(1);
-		expect(harness.feed(cancel)).toBe("");
+		expect(harness.feed(commandFrame(SECRET, "cancel"))).toBe("");
 		advance(0);
 		expect(harness.abort).toHaveBeenCalledTimes(2);
 
@@ -882,24 +1109,24 @@ describe("Fresh OMP companion lifecycle and generation isolation", () => {
 		advance(0);
 		expect(harness.abort).toHaveBeenCalledTimes(2);
 		harness.invoke("session_branch", { previousSessionFile: "/retained" });
-		harness.afterDispatch("session_branch");
-		harness.afterDispatch("session_branch");
+		await harness.afterDispatch("session_branch");
+		await harness.afterDispatch("session_branch");
 		advance(50);
 		expect(harness.input).toBe(firstInput);
 		expect(harness.inputInstalls).toBe(1);
-		expect(harness.feed(cancel)).toBe("");
+		expect(harness.feed(commandFrame(SECRET, "cancel"))).toBe("");
 		advance(0);
 		expect(harness.abort).toHaveBeenCalledTimes(3);
 
 		harness.beforeSessionMutation("session_tree");
 		expect(harness.input).toBe(firstInput);
 		harness.invoke("session_tree", { newLeafId: "target", oldLeafId: "retained" });
-		harness.afterDispatch("session_tree");
+		await harness.afterDispatch("session_tree");
 		advance(50);
 		expect(harness.input).toBe(firstInput);
 		expect(harness.inputInstalls).toBe(1);
 		expect(harness.inputUnsubscribes).toBe(0);
-		expect(harness.feed(cancel)).toBe("");
+		expect(harness.feed(commandFrame(SECRET, "cancel"))).toBe("");
 		advance(0);
 		expect(harness.abort).toHaveBeenCalledTimes(4);
 
@@ -914,14 +1141,49 @@ describe("Fresh OMP companion lifecycle and generation isolation", () => {
 		const harness = new CompanionHarness();
 		await harness.start();
 		advance(1_000);
+		harness.invoke("tool_execution_start", {
+			toolCallId: "active-tool",
+			toolName: "bash",
+			intent: "running",
+		});
+		harness.invoke("tool_approval_requested", {
+			sessionId: SESSION_A,
+			toolCallId: "pending-approval",
+			toolName: "bash",
+			approvalMode: "ask",
+		});
+		advance(50);
 		const beforeShutdown = write.mock.calls.length;
 
 		harness.shutdown();
 		expect(write).toHaveBeenCalledTimes(beforeShutdown + 1);
-		expect(parseFrame(write.mock.calls.at(-1)?.[0] as string, SECRET).envelope.snapshot.state).toBe("stopped");
+		const stopped = parseFrame(write.mock.calls.at(-1)?.[0] as string, SECRET).envelope.snapshot;
+		expect(stopped).toMatchObject({ state: "stopped", runningTools: 0, pendingApprovals: 0 });
+		expect(stopped.currentTool).toBeUndefined();
 		expect(harness.input).toBeUndefined();
 		advance(10_000);
 		expect(write).toHaveBeenCalledTimes(beforeShutdown + 1);
+	});
+
+	it("publishes shutdown from the last committed target, never a provisional switch", async () => {
+		vi.useFakeTimers();
+		const write = vi.spyOn(process.stdout, "write").mockReturnValue(true);
+		const harness = new CompanionHarness();
+		await harness.start();
+		advance(1_000);
+
+		harness.beforeSessionMutation("session_switch");
+		harness.sessionId = SESSION_B;
+		harness.sessionName = "Uncommitted target";
+		harness.shutdown();
+
+		const stopped = parseFrame(write.mock.calls.at(-1)?.[0] as string, SECRET).envelope.snapshot;
+		expect(stopped).toMatchObject({
+			state: "stopped",
+			sessionGeneration: 1,
+			sessionId: SESSION_A,
+			sessionName: "Primary",
+		});
 	});
 });
 
@@ -931,14 +1193,21 @@ describe("Fresh OMP companion command parser", () => {
 		const write = vi.spyOn(process.stdout, "write").mockReturnValue(true);
 		const harness = new CompanionHarness();
 		await harness.start();
+		advance(1_000);
+		const writesBeforeRequest = write.mock.calls.length;
 		const request = commandFrame(SECRET, "request_snapshot");
+		const requestTarget = latestSnapshotIdentity();
+		if (!requestTarget) throw new Error("expected an emitted companion snapshot");
+		expect(parseCommand(SECRET, request.slice(COMMAND_PREFIX.length, -COMMAND_END.length), requestTarget, 0)).toEqual(
+			{ type: "request_snapshot", commandSequence: 1 },
+		);
 		let ordinary = harness.feed(`before${request.slice(0, 1)}`);
 		for (let index = 1; index < request.length - 1; index++) ordinary += harness.feed(request[index] ?? "");
 		ordinary += harness.feed(`${request.at(-1)}after`);
 		expect(ordinary).toBe("beforeafter");
-		expect(write).not.toHaveBeenCalled();
-		advance(0);
-		expect(write).toHaveBeenCalledTimes(1);
+		expect(write).toHaveBeenCalledTimes(writesBeforeRequest);
+		advance(50);
+		expect(write).toHaveBeenCalledTimes(writesBeforeRequest + 1);
 
 		const cancel = commandFrame(SECRET, "cancel");
 		const combined = harness.feed(`x${cancel}${cancel}${request}y`);
@@ -975,17 +1244,69 @@ describe("Fresh OMP companion command parser", () => {
 
 		expect(harness.feed(`${COMMAND_PREFIX}abc`)).toBe("");
 		advance(1_000);
-		expect(harness.feed(`late${COMMAND_END}`)).toBe(`late${COMMAND_END}`);
+		expect(harness.feed(`late${COMMAND_PREFIX}not.a.valid.command${COMMAND_END}after`)).toBe("after");
 
 		expect(harness.feed(`${COMMAND_PREFIX}partial`)).toBe("");
 		const oldInput = harness.input;
-		harness.invoke("session_switch", { reason: "new", previousSessionFile: "/old" });
+		harness.beforeSessionMutation("session_switch");
 		expect(harness.input).toBe(oldInput);
 		expect(harness.inputUnsubscribes).toBe(0);
-		expect(harness.feed("ordinary-after-reset")).toBe("ordinary-after-reset");
+		expect(harness.feed("ordinary-after-reset")).toBe("");
+		expect(harness.feed(`${COMMAND_END}ordinary-after-reset-resync`)).toBe("ordinary-after-reset-resync");
 		expect(harness.feed(commandFrame(SECRET, "cancel"))).toBe("");
 		advance(0);
 		expect(harness.abort).toHaveBeenCalledTimes(1);
+	});
+
+	it("cancels only the authenticated work epoch and replaces stale queued timers", async () => {
+		vi.useFakeTimers();
+		vi.spyOn(process.stdout, "write").mockReturnValue(true);
+		const harness = new CompanionHarness();
+		await harness.start();
+
+		expect(harness.feed(commandFrame(SECRET, "cancel"))).toBe("");
+		harness.idle = false;
+		harness.invoke("agent_start");
+		advance(50);
+		expect(harness.abort).not.toHaveBeenCalled();
+		expect(latestSnapshotIdentity()?.workEpoch).toBe(2);
+
+		expect(harness.feed(commandFrame(SECRET, "cancel"))).toBe("");
+		expect(harness.feed(commandFrame(SECRET, "cancel"))).toBe("");
+		advance(0);
+		expect(harness.abort).toHaveBeenCalledTimes(1);
+	});
+
+	it("coalesces cancel until async abort settlement and contains rejection", async () => {
+		vi.useFakeTimers();
+		vi.spyOn(process.stdout, "write").mockReturnValue(true);
+		const harness = new CompanionHarness();
+		await harness.start();
+		advance(1_000);
+		const firstAbort = Promise.withResolvers<void>();
+		harness.abort.mockImplementation(() => firstAbort.promise as never);
+
+		expect(harness.feed(commandFrame(SECRET, "cancel"))).toBe("");
+		advance(0);
+		expect(harness.feed(commandFrame(SECRET, "cancel"))).toBe("");
+		advance(0);
+		expect(harness.abort).toHaveBeenCalledTimes(1);
+
+		firstAbort.resolve();
+		await firstAbort.promise;
+		await Promise.resolve();
+		const rejectedAbort = Promise.withResolvers<void>();
+		harness.abort.mockImplementation(() => rejectedAbort.promise as never);
+		expect(harness.feed(commandFrame(SECRET, "cancel"))).toBe("");
+		advance(0);
+		expect(harness.abort).toHaveBeenCalledTimes(2);
+
+		rejectedAbort.reject(new Error("private abort failure"));
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(harness.warn).toHaveBeenCalledTimes(1);
+		expect(JSON.stringify(harness.warn.mock.calls[0])).toContain("event_fault");
+		expect(JSON.stringify(harness.warn.mock.calls[0])).not.toContain("private abort failure");
 	});
 });
 
@@ -1126,12 +1447,13 @@ describe("Fresh OMP companion fault containment", () => {
 		expect(harness.feed(`${COMMAND_PREFIX}${"A".repeat(2_093)}${COMMAND_END}tail`)).toBe("tail");
 		expect(harness.feed(`${COMMAND_PREFIX}partial`)).toBe("");
 		advance(1_000);
-		expect(harness.feed("after-timeout")).toBe("after-timeout");
+		expect(harness.feed("after-timeout")).toBe("");
+		expect(harness.feed(`${COMMAND_END}ordinary-after-timeout`)).toBe("ordinary-after-timeout");
 		advance(0);
 		expect(harness.abort).not.toHaveBeenCalled();
 		expect(write).toHaveBeenCalledTimes(1);
 
-		harness.invoke("session_switch", { reason: "new", previousSessionFile: "/old" });
+		harness.beforeSessionMutation("session_switch");
 		expect(harness.input).toBeDefined();
 		expect(harness.inputUnsubscribes).toBe(0);
 		expect(harness.feed(`left${cancel}right`)).toBe("leftright");
@@ -1244,10 +1566,10 @@ describe("Fresh OMP companion fault containment", () => {
 		expect(harness.feed(`left${commandFrame(SECRET, "request_snapshot")}right`)).toBe("leftright");
 		advance(0);
 		expect(harness.abort).not.toHaveBeenCalled();
-		expect(write).not.toHaveBeenCalled();
+		expect(write).toHaveBeenCalledTimes(1);
 		verification.mockRestore();
 
-		harness.invoke("session_switch", { reason: "new", previousSessionFile: "/old" });
+		harness.beforeSessionMutation("session_switch");
 		expect(harness.input).toBeDefined();
 		expect(harness.inputUnsubscribes).toBe(0);
 		expect(harness.feed(`left${cancel}right`)).toBe("leftright");
@@ -1274,7 +1596,8 @@ describe("Fresh OMP companion fault containment", () => {
 		expect(harness.feed(`${oversized}tail`)).toBe("tail");
 		expect(harness.feed(`${COMMAND_PREFIX}timed-out`)).toBe("");
 		advance(1_000);
-		expect(harness.feed(`late${COMMAND_END}`)).toBe(`late${COMMAND_END}`);
+		expect(harness.feed(`late${COMMAND_END}`)).toBe("");
+		expect(harness.feed("ordinary-after-timeout")).toBe("ordinary-after-timeout");
 		advance(0);
 
 		expect(harness.abort).not.toHaveBeenCalled();
@@ -1313,10 +1636,37 @@ describe("Fresh OMP companion fault containment", () => {
 		advance(50);
 		expect(parseFrame(write.mock.calls.at(-1)?.[0] as string, SECRET).envelope.snapshot.state).toBe("error");
 
+		harness.idle = false;
+		harness.invoke("agent_end", { messages: [failed], willContinue: true });
 		harness.invoke("auto_retry_start", { attempt: 1, maxAttempts: 2, delayMs: 10, errorMessage: "retry" });
 		advance(50);
 		expect(parseFrame(write.mock.calls.at(-1)?.[0] as string, SECRET).envelope.snapshot.state).toBe("retrying");
+		harness.idle = true;
 		harness.invoke("auto_retry_end", { success: false, attempt: 1, finalError: "Retry cancelled" });
+		advance(50);
+		expect(parseFrame(write.mock.calls.at(-1)?.[0] as string, SECRET).envelope.snapshot.state).toBe("idle");
+
+		harness.idle = false;
+		harness.invoke("agent_end", { messages: [failed], willContinue: true });
+		harness.invoke("auto_retry_start", { attempt: 2, maxAttempts: 2, delayMs: 10, errorMessage: "retry" });
+		advance(50);
+		expect(parseFrame(write.mock.calls.at(-1)?.[0] as string, SECRET).envelope.snapshot.state).toBe("retrying");
+		harness.idle = true;
+		advance(1_000);
+		expect(parseFrame(write.mock.calls.at(-1)?.[0] as string, SECRET).envelope.snapshot.state).toBe("retrying");
+		harness.invoke("auto_retry_end", { success: true, attempt: 2 });
+		advance(50);
+		expect(parseFrame(write.mock.calls.at(-1)?.[0] as string, SECRET).envelope.snapshot.state).toBe("idle");
+
+		harness.idle = false;
+		harness.invoke("agent_end", { messages: [failed], willContinue: true });
+		advance(50);
+		expect(parseFrame(write.mock.calls.at(-1)?.[0] as string, SECRET).envelope.snapshot.state).toBe("working");
+		harness.idle = true;
+		advance(1_000);
+		expect(parseFrame(write.mock.calls.at(-1)?.[0] as string, SECRET).envelope.snapshot.state).toBe("working");
+		harness.invoke("agent_start");
+		harness.invoke("agent_end", { messages: [interrupted], willContinue: false });
 		advance(50);
 		expect(parseFrame(write.mock.calls.at(-1)?.[0] as string, SECRET).envelope.snapshot.state).toBe("idle");
 	});

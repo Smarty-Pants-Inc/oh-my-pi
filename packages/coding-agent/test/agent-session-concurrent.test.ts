@@ -23,7 +23,7 @@ import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensi
 import { GoalRuntime } from "@oh-my-pi/pi-coding-agent/goals/runtime";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { convertToLlm, USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
@@ -143,6 +143,64 @@ describe("AgentSession concurrent prompt guard", () => {
 		// Cleanup
 		await session.abort();
 		await firstPrompt.catch(() => {}); // Ignore abort error
+	});
+
+	it("coalesces concurrent abort callers onto one teardown promise", async () => {
+		await createSession();
+		const prompt = session.prompt("First message");
+		await waitFor(() => session.isStreaming);
+		const agentAbort = vi.spyOn(session.agent, "abort");
+
+		const firstAbort = session.abort();
+		const secondAbort = session.abort();
+		expect(secondAbort).toBe(firstAbort);
+		await expect(firstAbort).resolves.toBeUndefined();
+		await prompt.catch(() => {});
+		expect(agentAbort).toHaveBeenCalledTimes(1);
+	});
+
+	it("upgrades an in-flight internal abort to user-interrupt semantics", async () => {
+		await createSession();
+		const postPromptGate = Promise.withResolvers<void>();
+		session.trackPostPromptTaskForTests(postPromptGate.promise);
+		const agentAbort = vi.spyOn(session.agent, "abort");
+		const taskAborted = vi.spyOn(session.goalRuntime, "onTaskAborted").mockResolvedValue(undefined);
+
+		const internalAbort = session.abort({
+			goalReason: "internal",
+			preserveCompaction: true,
+			preserveToolChoice: true,
+		});
+		const userAbort = session.abort({ reason: USER_INTERRUPT_LABEL });
+		expect(userAbort).toBe(internalAbort);
+		expect(agentAbort).toHaveBeenLastCalledWith(USER_INTERRUPT_LABEL);
+
+		postPromptGate.resolve();
+		await userAbort;
+		expect(taskAborted).toHaveBeenCalledWith({ reason: "interrupted" });
+	});
+
+	it("does not begin a new prompt until abort teardown settles", async () => {
+		await createSession();
+		const promptAgent = vi.spyOn(session.agent, "prompt");
+		const firstPrompt = session.prompt("First message");
+		await waitFor(() => promptAgent.mock.calls.length === 1);
+		const postPromptGate = Promise.withResolvers<void>();
+		session.trackPostPromptTaskForTests(postPromptGate.promise);
+
+		const abort = session.abort();
+		const secondPrompt = session.prompt("Second message");
+		try {
+			await scheduler.yield();
+			expect(promptAgent).toHaveBeenCalledTimes(1);
+		} finally {
+			postPromptGate.resolve();
+		}
+
+		await abort;
+		await waitFor(() => promptAgent.mock.calls.length === 2);
+		await session.abort();
+		await Promise.allSettled([firstPrompt, secondPrompt]);
 	});
 
 	it("should allow steer() while streaming", async () => {

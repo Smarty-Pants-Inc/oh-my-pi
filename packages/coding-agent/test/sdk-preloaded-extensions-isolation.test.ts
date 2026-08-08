@@ -147,7 +147,7 @@ describe("createAgentSession preloadedExtensions isolation (issue #2190)", () =>
 			return {
 				order,
 				eventBus,
-				hostInternalExtensions: [{ extension: host }],
+				hostInternalExtension: { extension: host },
 				preloadedExtensions: { extensions: [publicExtension], errors: [], runtime },
 			};
 		};
@@ -172,7 +172,7 @@ describe("createAgentSession preloadedExtensions isolation (issue #2190)", () =>
 			...createOptions(),
 			eventBus: rootFixture.eventBus,
 			preloadedExtensions: rootFixture.preloadedExtensions,
-			hostInternalExtensions: rootFixture.hostInternalExtensions,
+			hostInternalExtension: rootFixture.hostInternalExtension,
 		});
 		try {
 			await root.session.extensionRunner?.emit({ type: "session_start" });
@@ -189,7 +189,7 @@ describe("createAgentSession preloadedExtensions isolation (issue #2190)", () =>
 			...createOptions(),
 			eventBus: childFixture.eventBus,
 			preloadedExtensions: childFixture.preloadedExtensions,
-			hostInternalExtensions: childFixture.hostInternalExtensions,
+			hostInternalExtension: childFixture.hostInternalExtension,
 			parentTaskPrefix: "task:",
 			taskDepth: 1,
 		});
@@ -219,30 +219,28 @@ describe("createAgentSession preloadedExtensions isolation (issue #2190)", () =>
 				...(input.noExtensions ? { disableExtensionDiscovery: true } : {}),
 			};
 			const preloadedExtensions = await loadSessionExtensions(discoveryOptions, sharedDir, settings, eventBus);
-			const hostInternalExtensions = input.marked
-				? [
-						{
-							extension: await loadExtensionFromFactory(
-								pi => {
-									const { Type } = pi.typebox;
-									pi.registerTool({
-										name: HOST_TOOL_NAME,
-										label: "host companion sentinel",
-										description: "must remain host-internal",
-										parameters: Type.Object({}),
-										execute: async () => ({
-											content: [{ type: "text", text: "host" }],
-											details: {},
-										}),
-									});
-								},
-								sharedDir,
-								eventBus,
-								preloadedExtensions.runtime,
-								`<host:${input.label}>`,
-							),
-						},
-					]
+			const hostInternalExtension = input.marked
+				? {
+						extension: await loadExtensionFromFactory(
+							pi => {
+								const { Type } = pi.typebox;
+								pi.registerTool({
+									name: HOST_TOOL_NAME,
+									label: "host companion sentinel",
+									description: "must remain host-internal",
+									parameters: Type.Object({}),
+									execute: async () => ({
+										content: [{ type: "text", text: "host" }],
+										details: {},
+									}),
+								});
+							},
+							sharedDir,
+							eventBus,
+							preloadedExtensions.runtime,
+							`<host:${input.label}>`,
+						),
+					}
 				: undefined;
 			const { session } = await createAgentSession({
 				cwd: sharedDir,
@@ -255,7 +253,7 @@ describe("createAgentSession preloadedExtensions isolation (issue #2190)", () =>
 				...(input.noTools ? { toolNames: [] } : {}),
 				...(input.noExtensions ? { disableExtensionDiscovery: true } : {}),
 				preloadedExtensions,
-				hostInternalExtensions,
+				hostInternalExtension,
 				enableLsp: false,
 				enableMCP: false,
 				skipPythonPreflight: true,

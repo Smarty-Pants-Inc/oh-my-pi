@@ -119,10 +119,13 @@ export interface AsyncJobRegisterOptions {
 /**
  * Filter applied to job query/cancel APIs. With `ownerId`, results are
  * restricted to jobs registered by that agent (registry id from
- * `AgentRegistry`, e.g. "Main", "AuthLoader").
+ * `AgentRegistry`, e.g. "Main", "AuthLoader"). `jobs` and `excludeJobs` are
+ * internal identity projections used while lifecycle ownership is reversible.
  */
 export interface AsyncJobFilter {
 	ownerId?: string;
+	jobs?: ReadonlySet<AsyncJob>;
+	excludeJobs?: ReadonlySet<AsyncJob>;
 }
 
 export class AsyncJobManager {
@@ -158,12 +161,16 @@ export class AsyncJobManager {
 	#deliveryLoop: Promise<void> | undefined;
 	#disposed = false;
 
+	#matchesFilter(job: AsyncJob, filter?: AsyncJobFilter): boolean {
+		if (filter?.ownerId && job.ownerId !== filter.ownerId) return false;
+		if (filter?.jobs && !filter.jobs.has(job)) return false;
+		return !filter?.excludeJobs?.has(job);
+	}
+
 	#filterJobs(jobs: Iterable<AsyncJob>, filter?: AsyncJobFilter): AsyncJob[] {
-		const ownerId = filter?.ownerId;
 		const out: AsyncJob[] = [];
 		for (const job of jobs) {
-			if (this.#discardedJobs.has(job)) continue;
-			if (!ownerId || job.ownerId === ownerId) out.push(job);
+			if (!this.#discardedJobs.has(job) && this.#matchesFilter(job, filter)) out.push(job);
 		}
 		return out;
 	}
@@ -286,8 +293,7 @@ export class AsyncJobManager {
 	 */
 	cancel(id: string, filter?: AsyncJobFilter): boolean {
 		const job = this.#jobs.get(id);
-		if (!job) return false;
-		if (filter?.ownerId && job.ownerId !== filter.ownerId) return false;
+		if (!job || !this.#matchesFilter(job, filter)) return false;
 		if (job.status !== "running") return false;
 		job.status = "cancelled";
 		job.abortController.abort();
@@ -302,6 +308,44 @@ export class AsyncJobManager {
 
 	getRunningJobs(filter?: AsyncJobFilter): AsyncJob[] {
 		return this.#filterJobs(this.#jobs.values(), filter).filter(job => job.status === "running");
+	}
+
+	countRunningJobs(filter?: AsyncJobFilter): number {
+		let count = 0;
+		for (const job of this.#jobs.values()) {
+			if (!this.#discardedJobs.has(job) && job.status === "running" && this.#matchesFilter(job, filter)) count++;
+		}
+		return count;
+	}
+
+	countRecentFailures(limit = 5, filter?: AsyncJobFilter): number {
+		limit = Math.max(0, Math.floor(limit));
+		if (limit === 0) return 0;
+		const recent: AsyncJob[] = [];
+		for (const job of this.#jobs.values()) {
+			if (this.#discardedJobs.has(job) || job.status === "running" || !this.#matchesFilter(job, filter)) continue;
+			let index = 0;
+			while (index < recent.length && (recent[index]?.startTime ?? 0) >= job.startTime) index++;
+			if (index >= limit) continue;
+			recent.splice(index, 0, job);
+			if (recent.length > limit) recent.pop();
+		}
+		let failures = 0;
+		for (const job of recent) {
+			if (job.status === "failed") failures++;
+		}
+		return failures;
+	}
+
+	countPendingDeliveries(filter?: AsyncJobFilter): number {
+		let count = 0;
+		for (const delivery of this.#deliveries) {
+			if (this.#matchesFilter(delivery.job, filter) && !this.isDeliverySuppressed(delivery.jobId)) count++;
+		}
+		for (const delivery of this.#inFlightDeliveries) {
+			if (this.#matchesFilter(delivery.job, filter) && !this.isDeliverySuppressed(delivery.jobId)) count++;
+		}
+		return count;
 	}
 
 	getRecentJobs(limit = 10, filter?: AsyncJobFilter): AsyncJob[] {
@@ -607,7 +651,7 @@ export class AsyncJobManager {
 		const deadline = hasDeadline ? Date.now() + Math.max(timeoutMs, 0) : Number.POSITIVE_INFINITY;
 
 		while (this.hasPendingDeliveries(filter)) {
-			if (filter?.ownerId) {
+			if (filter?.ownerId || filter?.jobs || filter?.excludeJobs) {
 				const delivered = await this.#deliverNextFiltered(filter, deadline);
 				if (delivered) continue;
 				return false;
@@ -721,18 +765,14 @@ export class AsyncJobManager {
 	}
 
 	#filterDeliveries(filter?: AsyncJobFilter): AsyncJobDelivery[] {
-		const ownerId = filter?.ownerId;
-		if (!ownerId) return this.#deliveries.filter(delivery => !this.isDeliverySuppressed(delivery.jobId));
 		return this.#deliveries.filter(
-			delivery => delivery.ownerId === ownerId && !this.isDeliverySuppressed(delivery.jobId),
+			delivery => this.#matchesFilter(delivery.job, filter) && !this.isDeliverySuppressed(delivery.jobId),
 		);
 	}
 
 	#filterInFlightDeliveries(filter?: AsyncJobFilter): AsyncJobDelivery[] {
-		const ownerId = filter?.ownerId;
-		if (!ownerId) return this.#inFlightDeliveries.filter(delivery => !this.isDeliverySuppressed(delivery.jobId));
 		return this.#inFlightDeliveries.filter(
-			delivery => delivery.ownerId === ownerId && !this.isDeliverySuppressed(delivery.jobId),
+			delivery => this.#matchesFilter(delivery.job, filter) && !this.isDeliverySuppressed(delivery.jobId),
 		);
 	}
 
@@ -740,7 +780,7 @@ export class AsyncJobManager {
 		while (true) {
 			let selected: AsyncJobDelivery | undefined;
 			for (const delivery of this.#deliveries) {
-				if (delivery.ownerId !== filter.ownerId) continue;
+				if (!this.#matchesFilter(delivery.job, filter)) continue;
 				if (this.isDeliverySuppressed(delivery.jobId)) continue;
 				if (!selected || delivery.nextAttemptAt < selected.nextAttemptAt) {
 					selected = delivery;

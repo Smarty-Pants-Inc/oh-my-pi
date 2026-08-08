@@ -1,6 +1,7 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as crypto from "node:crypto";
 import { Container, Spacer, setKeybindings } from "@oh-my-pi/pi-tui";
+import { isRecord } from "@oh-my-pi/pi-utils";
 import { KeybindingsManager } from "../../../src/config/keybindings";
 import type {
 	ExtensionAPI,
@@ -263,17 +264,86 @@ type InputListener = (data: string) => InputResult;
 type RegisteredHandler = (event: ExtensionEvent, context: ExtensionContext) => void | Promise<void>;
 
 const COMPANION_SECRET = Uint8Array.from({ length: 32 }, (_, index) => index);
+const OSC_PREFIX = "\x1b]777;notify;fresh://omp-companion;v1;";
+const OSC_TERMINATOR = "\x1b\\";
 const COMMAND_PREFIX = "\u{10ffff}fresh-omp-command:v1:";
 const COMMAND_END = "\u{10fffe}";
+let nextCommandSequence = 0;
 
-function authenticatedCancelFrame(): string {
-	const body = Buffer.from(JSON.stringify({ version: 1, type: "cancel" }), "utf8").toString("base64url");
+function latestCommandTarget(): {
+	incarnation: string;
+	sequence: number;
+	sessionGeneration: number;
+	sessionId: string;
+	workEpoch: number;
+} {
+	// The test harness installs a Bun mock before commands inspect captured writes.
+	const mockedWrite = process.stdout.write as typeof process.stdout.write & { mock?: { calls: unknown[][] } };
+	const calls = mockedWrite.mock?.calls ?? [];
+	for (let index = calls.length - 1; index >= 0; index--) {
+		const frame = calls[index]?.[0];
+		if (typeof frame !== "string" || !frame.startsWith(OSC_PREFIX) || !frame.endsWith(OSC_TERMINATOR)) continue;
+		const content = frame.slice(OSC_PREFIX.length, -OSC_TERMINATOR.length);
+		const authenticated = content.slice(content.indexOf(";") + 1);
+		const bodyText = authenticated.slice(0, authenticated.lastIndexOf("."));
+		try {
+			const envelope: unknown = JSON.parse(Buffer.from(bodyText, "base64url").toString("utf8"));
+			if (!isRecord(envelope) || !isRecord(envelope.snapshot)) continue;
+			const snapshot = envelope.snapshot;
+			if (
+				typeof snapshot.incarnation === "string" &&
+				typeof snapshot.sequence === "number" &&
+				typeof snapshot.sessionGeneration === "number" &&
+				typeof snapshot.sessionId === "string" &&
+				typeof snapshot.workEpoch === "number"
+			) {
+				return {
+					incarnation: snapshot.incarnation,
+					sequence: snapshot.sequence,
+					sessionGeneration: snapshot.sessionGeneration,
+					sessionId: snapshot.sessionId,
+					workEpoch: snapshot.workEpoch,
+				};
+			}
+		} catch {
+			// Ignore non-companion writes and malformed test fixtures.
+		}
+	}
+	throw new Error("Missing companion snapshot for command target");
+}
+
+function authenticatedCommandFrame(value: Record<string, unknown>): string {
+	const body = Buffer.from(JSON.stringify(value), "utf8").toString("base64url");
 	const tag = crypto
 		.createHmac("sha256", COMPANION_SECRET)
 		.update("fresh-omp/in/v1\0", "utf8")
 		.update(body, "ascii")
 		.digest("base64url");
 	return `${COMMAND_PREFIX}${body}.${tag}${COMMAND_END}`;
+}
+
+function authenticatedCancelFrame(): string {
+	const snapshot = latestCommandTarget();
+	return authenticatedCommandFrame({
+		version: 1,
+		type: "cancel",
+		incarnation: snapshot.incarnation,
+		sessionGeneration: snapshot.sessionGeneration,
+		sessionId: snapshot.sessionId,
+		workEpoch: snapshot.workEpoch,
+		commandSequence: ++nextCommandSequence,
+	});
+}
+
+function authenticatedSnapshotAckFrame(): string {
+	const snapshot = latestCommandTarget();
+	return authenticatedCommandFrame({
+		version: 1,
+		type: "snapshot_ack",
+		...snapshot,
+		accepted: true,
+		commandSequence: ++nextCommandSequence,
+	});
 }
 
 function makeNewSessionInputHarness() {
@@ -378,6 +448,7 @@ function makeNewSessionInputHarness() {
 		},
 		getContextUsage: () => undefined,
 		getAsyncJobSnapshot: () => null,
+		getAsyncJobCounts: () => null,
 		isCompacting: () => false,
 		cwd: "/tmp/companion-test",
 		sessionManager,
@@ -396,8 +467,15 @@ function makeNewSessionInputHarness() {
 		if (!handler) throw new Error(`Missing companion handler for ${type}`);
 		await handler({ type } as ExtensionEvent, companionContext);
 	};
+	const fenceCompanion = async (): Promise<void> => {
+		await companion.beforeSessionMutation({ type: "session_switch" }, companionContext);
+	};
 	const completeCompanion = async (type: "session_ready" | "session_rollback"): Promise<void> => {
-		await companion.afterDispatch({ type } as ExtensionEvent, companionContext);
+		const completion = Promise.resolve(companion.afterDispatch({ type } as ExtensionEvent, companionContext));
+		const hostInput = listeners.values().next().value;
+		if (!hostInput) throw new Error("Missing host-private companion input listener");
+		hostInput(authenticatedSnapshotAckFrame());
+		await completion;
 	};
 	return {
 		abort,
@@ -414,6 +492,7 @@ function makeNewSessionInputHarness() {
 		},
 		dispatchInput,
 		emitCompanion,
+		fenceCompanion,
 		completeCompanion,
 		get listenerCount(): number {
 			return listeners.size;
@@ -437,6 +516,7 @@ describe("ExtensionUiController host-private companion input", () => {
 	beforeEach(() => {
 		vi.useFakeTimers();
 		vi.spyOn(process.stdout, "write").mockReturnValue(true);
+		nextCommandSequence = 0;
 	});
 
 	afterEach(() => {
@@ -449,6 +529,8 @@ describe("ExtensionUiController host-private companion input", () => {
 		await harness.controller.initHooksAndCustomTools();
 		expect(harness.publicUiSymbolCount).toBe(0);
 		await harness.emitCompanion("session_start");
+		vi.advanceTimersByTime(1_000);
+		vi.advanceTimersByTime(0);
 		expect(harness.listenerCount).toBe(1);
 		harness.addPublicListener();
 		expect(harness.listenerCount).toBe(2);
@@ -460,13 +542,13 @@ describe("ExtensionUiController host-private companion input", () => {
 		expect(harness.ordinaryTuiInput).toEqual([]);
 
 		harness.setNewSession(async () => {
-			harness.dispatchInput(frame);
+			harness.dispatchInput(authenticatedCancelFrame());
 			expect(harness.ordinaryTuiInput).toEqual([]);
 			vi.advanceTimersByTime(0);
 			expect(harness.abort).toHaveBeenCalledTimes(2);
 			expect(harness.listenerCount).toBe(1);
-			await harness.emitCompanion("session_switch");
-			harness.dispatchInput(frame);
+			await harness.fenceCompanion();
+			harness.dispatchInput(authenticatedCancelFrame());
 			vi.advanceTimersByTime(0);
 			expect(harness.abort).toHaveBeenCalledTimes(2);
 			await harness.emitCompanion("session_ready");
@@ -476,7 +558,7 @@ describe("ExtensionUiController host-private companion input", () => {
 
 		expect(await harness.commandActions.newSession()).toEqual({ cancelled: false });
 		expect(harness.listenerCount).toBe(1);
-		harness.dispatchInput(frame);
+		harness.dispatchInput(authenticatedCancelFrame());
 		vi.advanceTimersByTime(0);
 		expect(harness.abort).toHaveBeenCalledTimes(3);
 		expect(harness.ordinaryListenerInput).toEqual([""]);
@@ -489,6 +571,8 @@ describe("ExtensionUiController host-private companion input", () => {
 		const harness = makeNewSessionInputHarness();
 		await harness.controller.initHooksAndCustomTools();
 		await harness.emitCompanion("session_start");
+		vi.advanceTimersByTime(1_000);
+		vi.advanceTimersByTime(0);
 		const frame = authenticatedCancelFrame();
 		harness.setNewSession(async () => {
 			harness.dispatchInput(frame);
@@ -499,7 +583,7 @@ describe("ExtensionUiController host-private companion input", () => {
 		});
 
 		expect(await harness.commandActions.newSession()).toEqual({ cancelled: true });
-		harness.dispatchInput(frame);
+		harness.dispatchInput(authenticatedCancelFrame());
 		vi.advanceTimersByTime(0);
 		expect(harness.abort).toHaveBeenCalledTimes(2);
 		expect(harness.ordinaryListenerInput).toEqual([]);
@@ -510,9 +594,11 @@ describe("ExtensionUiController host-private companion input", () => {
 		const harness = makeNewSessionInputHarness();
 		await harness.controller.initHooksAndCustomTools();
 		await harness.emitCompanion("session_start");
+		vi.advanceTimersByTime(1_000);
+		vi.advanceTimersByTime(0);
 		const frame = authenticatedCancelFrame();
 		harness.setNewSession(async () => {
-			await harness.emitCompanion("session_switch");
+			await harness.fenceCompanion();
 			harness.dispatchInput(frame);
 			expect(harness.ordinaryTuiInput).toEqual([]);
 			await harness.emitCompanion("session_rollback");
@@ -521,7 +607,7 @@ describe("ExtensionUiController host-private companion input", () => {
 		});
 
 		await expect(harness.commandActions.newSession()).rejects.toThrow("replacement failed");
-		harness.dispatchInput(frame);
+		harness.dispatchInput(authenticatedCancelFrame());
 		vi.advanceTimersByTime(0);
 		expect(harness.abort).toHaveBeenCalledTimes(1);
 		expect(harness.ordinaryListenerInput).toEqual([]);

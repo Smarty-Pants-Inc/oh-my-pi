@@ -7,7 +7,10 @@ import type {
 
 export type SessionLifecyclePhase =
 	| "fenced"
+	| "checkpointing"
 	| "checkpointed"
+	| "recapturing"
+	| "ownership-acquiring"
 	| "ownership-acquired"
 	| "target-marked"
 	| "commit-preparing"
@@ -47,7 +50,14 @@ export interface SessionLifecycleRollbackOptions {
 	message: string;
 	cleanupReplacement?: boolean;
 	reconcileMode?: boolean;
+	preserveNewerRetainedMutations?: boolean;
 	includeCauseInAggregate?: boolean;
+}
+
+export interface SessionLifecycleResource {
+	commit?: () => void | Promise<void>;
+	rollback?: () => void | Promise<void>;
+	release?: () => void | Promise<void>;
 }
 
 /**
@@ -59,13 +69,13 @@ export class SessionLifecycleTransaction {
 	#checkpoint: RetainedSessionTransitionCheckpoint | undefined;
 	#checkpointIncludesPersistedFile = false;
 	readonly #ownership: SessionLifecycleOwnership;
-	#ownershipAcquired = false;
 	#publicationStarted = false;
 	#released = false;
 	#commitSeals: LifecycleOperation[] = [];
 	#targetCleanups: LifecycleOperation[] = [];
 	#rollbackReleases: LifecycleOperation[] = [];
 	readonly #host: SessionLifecycleTransactionHost;
+	readonly #settlement = Promise.withResolvers<void>();
 
 	constructor(host: SessionLifecycleTransactionHost) {
 		this.#host = host;
@@ -76,32 +86,75 @@ export class SessionLifecycleTransaction {
 		return this.#phase;
 	}
 
+	get settled(): Promise<void> {
+		return this.#settlement.promise;
+	}
+
 	async captureRetained(options: { capturePersistedSessionFile?: boolean } = {}): Promise<void> {
-		await this.#ownership.ready();
-		if (options.capturePersistedSessionFile) await this.#ownership.quarantineBash();
-		const checkpoint = await this.#host.captureRetainedCheckpoint(options);
-		// Publish a capture only after it completes. If a later post-quiescence
-		// capture fails, rollback must retain the earlier durable preimage.
-		this.#checkpoint = checkpoint;
-		this.#checkpointIncludesPersistedFile = options.capturePersistedSessionFile === true;
+		if (this.#phase !== "fenced")
+			throw new Error(`Lifecycle retained capture cannot start from phase ${this.#phase}`);
+		this.#phase = "checkpointing";
+		try {
+			await this.#ownership.ready();
+			if (options.capturePersistedSessionFile) await this.#ownership.quarantineBash();
+			const checkpoint = await this.#host.captureRetainedCheckpoint(options);
+			this.#checkpoint = checkpoint;
+			this.#checkpointIncludesPersistedFile = options.capturePersistedSessionFile === true;
+			this.#phase = "checkpointed";
+		} catch (error) {
+			this.#phase = "fenced";
+			throw error;
+		}
+	}
+
+	/** Refresh the retained checkpoint after quiescence without permitting an accidental duplicate first capture. */
+	async recaptureRetained(options: { capturePersistedSessionFile?: boolean } = {}): Promise<void> {
+		if (this.#phase !== "checkpointed") {
+			throw new Error(`Lifecycle retained recapture cannot start from phase ${this.#phase}`);
+		}
+		this.#phase = "recapturing";
+		try {
+			const checkpoint = await this.#host.captureRetainedCheckpoint(options);
+			this.#checkpoint = checkpoint;
+			this.#checkpointIncludesPersistedFile = options.capturePersistedSessionFile === true;
+		} catch (error) {
+			this.#phase = "checkpointed";
+			throw error;
+		}
 		this.#phase = "checkpointed";
 	}
 
 	async acquireOwnership(): Promise<void> {
-		if (this.#ownershipAcquired) throw new Error("Lifecycle ownership already acquired");
-		await this.#ownership.acquire();
-		this.#ownershipAcquired = true;
+		if (this.#phase !== "checkpointed")
+			throw new Error(`Lifecycle ownership cannot be acquired from phase ${this.#phase}`);
+		this.#phase = "ownership-acquiring";
+		try {
+			await this.#ownership.acquire();
+		} catch (error) {
+			this.#phase = "checkpointed";
+			throw error;
+		}
 		this.#phase = "ownership-acquired";
 	}
 
 	markTarget(): void {
-		if (!this.#ownershipAcquired) throw new Error("Lifecycle target cannot be marked before ownership is acquired");
+		if (this.#phase !== "ownership-acquired")
+			throw new Error(`Lifecycle target cannot be marked from phase ${this.#phase}`);
 		this.#ownership.markTarget();
 		this.#phase = "target-marked";
 	}
 
 	/** Host quiescence has begun; every later failure owns authoritative rollback publication. */
 	markPublicationStarted(): void {
+		if (this.#publicationStarted) throw new Error("Lifecycle publication already started");
+		if (
+			this.#phase !== "fenced" &&
+			this.#phase !== "checkpointed" &&
+			this.#phase !== "ownership-acquired" &&
+			this.#phase !== "target-marked"
+		) {
+			throw new Error(`Lifecycle publication cannot start from phase ${this.#phase}`);
+		}
 		this.#publicationStarted = true;
 	}
 
@@ -117,13 +170,23 @@ export class SessionLifecycleTransaction {
 		this.#rollbackReleases.push({ name, run });
 	}
 
+	/** Register every phase of one resource in a single synchronous operation. */
+	bindResource(name: string, resource: SessionLifecycleResource): void {
+		const commit = resource.commit ? [{ name, run: resource.commit }] : [];
+		const rollback = resource.rollback ? [{ name, run: resource.rollback }] : [];
+		const release = resource.release ? [{ name, run: resource.release }] : [];
+		this.#commitSeals.push(...commit);
+		this.#targetCleanups.push(...rollback);
+		this.#rollbackReleases.push(...release);
+	}
+
 	/**
 	 * Runs after ordinary extension handlers but before host afterDispatch. The
 	 * returned continuation activates delivery and releases the lifecycle fence
 	 * after publication; callers also confirm activation once the host barrier returns.
 	 */
 	async prepareCommit(options?: SessionLifecycleCommitOptions): Promise<SessionLifecyclePostHostContinuation> {
-		if (!this.#ownershipAcquired) throw new Error("Lifecycle commit requires acquired ownership");
+		if (this.#phase !== "target-marked") throw new Error(`Lifecycle commit cannot prepare from phase ${this.#phase}`);
 		const ownership = this.#ownership;
 		this.#phase = "commit-preparing";
 		await ownership.prepareCommit();
@@ -174,6 +237,7 @@ export class SessionLifecycleTransaction {
 				this.#checkpoint!.restore({
 					cleanupReplacement: options.cleanupReplacement,
 					reconcileMode: options.reconcileMode,
+					preserveNewerRetainedMutations: options.preserveNewerRetainedMutations,
 					rewriteRetainedEntries: this.#checkpointIncludesPersistedFile,
 				}),
 			);
@@ -245,6 +309,8 @@ export class SessionLifecycleTransaction {
 			logger.error("Lifecycle fence release failed", {
 				error: error instanceof Error ? error.message : String(error),
 			});
+		} finally {
+			this.#settlement.resolve();
 		}
 	}
 }

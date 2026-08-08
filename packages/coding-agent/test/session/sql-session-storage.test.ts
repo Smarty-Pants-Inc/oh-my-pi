@@ -161,6 +161,20 @@ describe("SqlSessionStorage (SQLite backend)", () => {
 		await client.end();
 	});
 
+	it("deleteSessionWithArtifacts removes sidecars when the JSONL key is absent", async () => {
+		const { client, storage } = await createSqlite();
+		await storage.writeText("/sessions/p/artifact-only/0.bash.log", "tool output");
+		await storage.writeText("/sessions/p/artifact-only/local/state.json", "state");
+
+		await storage.deleteSessionWithArtifacts("/sessions/p/artifact-only.jsonl");
+
+		expect(storage.existsSync("/sessions/p/artifact-only/0.bash.log")).toBe(false);
+		expect(storage.existsSync("/sessions/p/artifact-only/local/state.json")).toBe(false);
+		const remaining = (await client.unsafe(`SELECT path FROM omp_session_files`)) as Array<{ path: string }>;
+		expect(remaining).toEqual([]);
+		await client.end();
+	});
+
 	it("rename moves content and mtime atomically inside the mirror and the DB", async () => {
 		const { client, storage } = await createSqlite();
 		await storage.writeText("/sessions/p/orig.jsonl", "payload\n");

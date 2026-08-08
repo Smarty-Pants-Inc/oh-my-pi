@@ -1671,10 +1671,7 @@ describe("ExtensionRunner", () => {
 	});
 
 	describe("tool approval lifecycle", () => {
-		const initializeRunner = (
-			runner: ExtensionRunner,
-			select: (title: string, options: string[]) => Promise<string | undefined>,
-		) => {
+		const initializeRunner = (runner: ExtensionRunner, select: ExtensionUIContext["select"]) => {
 			runner.initialize(
 				{
 					sendMessage: () => {},
@@ -1789,11 +1786,67 @@ describe("ExtensionRunner", () => {
 				{ type: "ui_select" },
 				{ type: "tool_approval_resolved", approved: true },
 			]);
-			expect(select).toHaveBeenCalledWith(expect.stringContaining("Allow tool: dangerous_tool"), [
-				"Approve",
-				"Deny",
-			]);
+			expect(select).toHaveBeenCalledWith(
+				expect.stringContaining("Allow tool: dangerous_tool"),
+				["Approve", "Deny"],
+				{ signal: undefined },
+			);
 			delete globalState.__approvalEvents;
+		});
+
+		it("does not publish a requested approval when the prompt cannot be constructed", async () => {
+			const events: string[] = [];
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_approval_requested", async () => {
+						globalThis.__unconstructableApprovalEvents.push("requested");
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "unconstructable-approval.ts"), extCode);
+			const globalState = globalThis as typeof globalThis & { __unconstructableApprovalEvents?: string[] };
+			globalState.__unconstructableApprovalEvents = events;
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const select = vi.fn(async () => "Approve");
+			initializeRunner(runner, select);
+			const tool = {
+				...approvalTool,
+				formatApprovalDetails: () => {
+					throw new Error("approval details unavailable");
+				},
+			} as AgentTool;
+
+			await expect(
+				(new ExtensionToolWrapper(tool, runner) as ExtensionToolWrapper<any>).execute(
+					"call-unconstructable",
+					{},
+					undefined,
+					undefined,
+					{
+						sessionManager,
+						modelRegistry,
+						model: undefined,
+						isIdle: () => true,
+						hasQueuedMessages: () => false,
+						abort: () => {},
+						settings: {
+							get: (key: string) => (key === "tools.approvalMode" ? "always-ask" : {}),
+						} as never,
+					},
+				),
+			).rejects.toThrow("approval details unavailable");
+
+			expect(events).toEqual([]);
+			expect(select).not.toHaveBeenCalled();
+			delete globalState.__unconstructableApprovalEvents;
 		});
 
 		it("emits resolved false when approval is denied", async () => {
@@ -1844,6 +1897,223 @@ describe("ExtensionRunner", () => {
 				{ type: "tool_approval_resolved", approved: false, reason: "denied by user" },
 			]);
 			delete globalState.__deniedApprovalEvents;
+		});
+
+		it("dismisses an approval selector and denies tool execution when the active call aborts", async () => {
+			const events: Array<{ approved?: boolean; reason?: string }> = [];
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_approval_resolved", async (event) => {
+						globalThis.__abortedApprovalEvents.push({ approved: event.approved, reason: event.reason });
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "aborted-approval-events.ts"), extCode);
+			const globalState = globalThis as typeof globalThis & { __abortedApprovalEvents?: typeof events };
+			globalState.__abortedApprovalEvents = events;
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const selectorPresented = Promise.withResolvers<void>();
+			const selectorDismissed = Promise.withResolvers<void>();
+			let selectorVisible = false;
+			const select: ExtensionUIContext["select"] = (_title, _options, dialogOptions) => {
+				const selection = Promise.withResolvers<string | undefined>();
+				selectorVisible = true;
+				selectorPresented.resolve();
+				const dismiss = () => {
+					selectorVisible = false;
+					selectorDismissed.resolve();
+					selection.resolve(undefined);
+				};
+				if (dialogOptions?.signal?.aborted) {
+					dismiss();
+				} else {
+					dialogOptions?.signal?.addEventListener("abort", dismiss, { once: true });
+				}
+				return selection.promise;
+			};
+			initializeRunner(runner, select);
+
+			let executed = false;
+			const tool = {
+				...approvalTool,
+				execute: async () => {
+					executed = true;
+					return { content: [{ type: "text" as const, text: "ok" }] };
+				},
+			};
+			const wrapper = new ExtensionToolWrapper(tool, runner);
+			const abortController = new AbortController();
+			const execution = (wrapper as ExtensionToolWrapper<any>).execute(
+				"call-aborted",
+				{},
+				abortController.signal,
+				undefined,
+				{
+					sessionManager,
+					modelRegistry,
+					model: undefined,
+					isIdle: () => true,
+					hasQueuedMessages: () => false,
+					abort: () => {},
+					settings: { get: (key: string) => (key === "tools.approvalMode" ? "always-ask" : {}) } as never,
+				},
+			);
+
+			await selectorPresented.promise;
+			expect(selectorVisible).toBe(true);
+			abortController.abort();
+			await selectorDismissed.promise;
+			await expect(execution).rejects.toMatchObject({ name: "AbortError" });
+
+			expect(selectorVisible).toBe(false);
+			expect(executed).toBe(false);
+			expect(events).toEqual([{ approved: false, reason: "cancelled" }]);
+			delete globalState.__abortedApprovalEvents;
+		});
+
+		it("cancels an uncooperative selector and ignores its late failure", async () => {
+			const events: Array<{ approved?: boolean; reason?: string }> = [];
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_approval_resolved", async (event) => {
+						globalThis.__uncooperativeApprovalEvents.push({ approved: event.approved, reason: event.reason });
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "uncooperative-approval-events.ts"), extCode);
+			const globalState = globalThis as typeof globalThis & { __uncooperativeApprovalEvents?: typeof events };
+			globalState.__uncooperativeApprovalEvents = events;
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const selectorPresented = Promise.withResolvers<void>();
+			const lateSelection = Promise.withResolvers<string | undefined>();
+			initializeRunner(runner, () => {
+				selectorPresented.resolve();
+				return lateSelection.promise;
+			});
+
+			let executed = false;
+			const wrapper = new ExtensionToolWrapper(
+				{
+					...approvalTool,
+					execute: async () => {
+						executed = true;
+						return { content: [{ type: "text" as const, text: "ok" }] };
+					},
+				},
+				runner,
+			);
+			const abortController = new AbortController();
+			const execution = (wrapper as ExtensionToolWrapper<any>).execute(
+				"call-uncooperative-selector",
+				{},
+				abortController.signal,
+				undefined,
+				{
+					sessionManager,
+					modelRegistry,
+					model: undefined,
+					isIdle: () => true,
+					hasQueuedMessages: () => false,
+					abort: () => {},
+					settings: { get: (key: string) => (key === "tools.approvalMode" ? "always-ask" : {}) } as never,
+				},
+			);
+
+			await selectorPresented.promise;
+			abortController.abort(new DOMException("approval stopped", "AbortError"));
+			await expect(execution).rejects.toMatchObject({ name: "AbortError", message: "approval stopped" });
+			lateSelection.reject(new Error("late selector failure"));
+			await Promise.resolve();
+
+			expect(executed).toBe(false);
+			expect(events).toEqual([{ approved: false, reason: "cancelled" }]);
+			delete globalState.__uncooperativeApprovalEvents;
+		});
+
+		it("cancels a non-cooperative approval hook before it can reach the selector", async () => {
+			const events: Array<{ approved?: boolean; reason?: string }> = [];
+			const hookPresented = Promise.withResolvers<void>();
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_approval_requested", async (_event, ctx) => {
+						globalThis.__approvalHookPresented.resolve();
+						await ctx.ui.select("Hook approval", ["Continue"]);
+					});
+					pi.on("tool_approval_resolved", async (event) => {
+						globalThis.__uncooperativeApprovalHookEvents.push({ approved: event.approved, reason: event.reason });
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "uncooperative-approval-hook.ts"), extCode);
+			const globalState = globalThis as typeof globalThis & {
+				__approvalHookPresented?: typeof hookPresented;
+				__uncooperativeApprovalHookEvents?: typeof events;
+			};
+			globalState.__approvalHookPresented = hookPresented;
+			globalState.__uncooperativeApprovalHookEvents = events;
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			initializeRunner(runner, () => Promise.withResolvers<string | undefined>().promise);
+
+			let executed = false;
+			const wrapper = new ExtensionToolWrapper(
+				{
+					...approvalTool,
+					execute: async () => {
+						executed = true;
+						return { content: [{ type: "text" as const, text: "ok" }] };
+					},
+				},
+				runner,
+			);
+			const abortController = new AbortController();
+			const execution = (wrapper as ExtensionToolWrapper<any>).execute(
+				"call-uncooperative-hook",
+				{},
+				abortController.signal,
+				undefined,
+				{
+					sessionManager,
+					modelRegistry,
+					model: undefined,
+					isIdle: () => true,
+					hasQueuedMessages: () => false,
+					abort: () => {},
+					settings: { get: (key: string) => (key === "tools.approvalMode" ? "always-ask" : {}) } as never,
+				},
+			);
+
+			await hookPresented.promise;
+			abortController.abort();
+			await expect(execution).rejects.toMatchObject({ name: "AbortError" });
+
+			expect(executed).toBe(false);
+			expect(events).toEqual([{ approved: false, reason: "cancelled" }]);
+			delete globalState.__approvalHookPresented;
+			delete globalState.__uncooperativeApprovalHookEvents;
 		});
 		it("emits resolved false when the approval prompt throws", async () => {
 			const events: Array<{ type: string; approved?: boolean; reason?: string }> = [];
@@ -3270,7 +3540,7 @@ describe("ExtensionRunner", () => {
 	});
 
 	describe("host-internal bindings", () => {
-		it("runs first, stays off public surfaces, finalizes after fan-out, and contains host faults", async () => {
+		it("runs first, stays private, contains ordinary host faults, and propagates ack failure", async () => {
 			const hostACode = `
 				export default function(pi) {
 					const { Type } = pi.typebox;
@@ -3287,11 +3557,6 @@ describe("ExtensionRunner", () => {
 						globalThis.__hostBindingOrder.push(\`host-a:\${ctx.isCompacting()}\`);
 						globalThis.__ordinaryHostContext = ctx;
 					});
-				}
-			`;
-			const hostBCode = `
-				export default function(pi) {
-					pi.on("session_ready", () => globalThis.__hostBindingOrder.push("host-b"));
 				}
 			`;
 			const publicCode = `
@@ -3315,7 +3580,6 @@ describe("ExtensionRunner", () => {
 				}
 			`;
 			fs.writeFileSync(path.join(extensionsDir, "host-a.ts"), hostACode);
-			fs.writeFileSync(path.join(extensionsDir, "host-b.ts"), hostBCode);
 			fs.writeFileSync(path.join(extensionsDir, "public.ts"), publicCode);
 
 			const order: string[] = [];
@@ -3329,12 +3593,14 @@ describe("ExtensionRunner", () => {
 
 			const result = await loadTestExtensions();
 			const hostA = result.extensions.find(extension => extension.path.endsWith("host-a.ts"));
-			const hostB = result.extensions.find(extension => extension.path.endsWith("host-b.ts"));
 			const publicExtension = result.extensions.find(extension => extension.path.endsWith("public.ts"));
-			if (!hostA || !hostB || !publicExtension) throw new Error("Expected all host binding fixtures to load");
+			if (!hostA || !publicExtension) throw new Error("Expected host and public binding fixtures to load");
 
 			const firstAfterContexts: unknown[] = [];
-			const secondAfterContexts: unknown[] = [];
+			const acknowledgementFailure = new Error("snapshot acknowledgement failed");
+			Object.defineProperty(acknowledgementFailure, Symbol.for("oh-my-pi.fresh-omp.snapshot-ack-failure"), {
+				value: true,
+			});
 			const runner = new ExtensionRunner(
 				[publicExtension],
 				result.runtime,
@@ -3345,23 +3611,15 @@ describe("ExtensionRunner", () => {
 				undefined,
 				undefined,
 				undefined,
-				[
-					{
-						extension: hostA,
-						afterDispatch: (_event, ctx) => {
-							firstAfterContexts.push(ctx);
-							order.push(`after-a:${ctx.isCompacting()}`);
-							throw new Error("first host completion failed");
-						},
+				{
+					extension: hostA,
+					afterDispatch: (event, ctx) => {
+						firstAfterContexts.push(ctx);
+						order.push(`after-a:${ctx.isCompacting()}`);
+						if (event.type === "session_tree") throw acknowledgementFailure;
+						throw new Error("first host completion failed");
 					},
-					{
-						extension: hostB,
-						afterDispatch: (_event, ctx) => {
-							secondAfterContexts.push(ctx);
-							order.push(`after-b:${ctx.isCompacting()}`);
-						},
-					},
-				],
+				},
 			);
 			runner.initialize(
 				{
@@ -3409,26 +3667,33 @@ describe("ExtensionRunner", () => {
 					throw finalizerFailure;
 				}),
 			).rejects.toBe(finalizerFailure);
+			const activateAfterAcknowledgement = vi.fn(() => {
+				order.push("ack:activate");
+			});
+			await expect(
+				runner.emitWithHostCompletion({ type: "session_tree", newLeafId: null, oldLeafId: null }, () => {
+					order.push("ack:prepare");
+					return activateAfterAcknowledgement;
+				}),
+			).rejects.toBe(acknowledgementFailure);
+			expect(activateAfterAcknowledgement).not.toHaveBeenCalled();
 
 			expect(order).toEqual([
 				"host-a:false",
-				"host-b",
 				"public:start",
 				"public:end",
 				"finalizer:start",
 				"finalizer:end",
 				"after-a:true",
-				"after-b:true",
 				"after-a:true",
-				"after-b:true",
 				"finalizer:reject",
+				"ack:prepare",
+				"after-a:true",
 			]);
-			expect(firstAfterContexts).toHaveLength(2);
-			expect(secondAfterContexts).toHaveLength(2);
+			expect(firstAfterContexts).toHaveLength(3);
 			expect(firstAfterContexts[0]).not.toBe(globalState.__ordinaryHostContext);
-			expect(secondAfterContexts[0]).toBe(firstAfterContexts[0]);
-			expect(secondAfterContexts[1]).toBe(firstAfterContexts[1]);
 			expect(firstAfterContexts[1]).not.toBe(firstAfterContexts[0]);
+			expect(firstAfterContexts[2]).not.toBe(firstAfterContexts[1]);
 			expect(errors).toEqual([
 				expect.objectContaining({
 					extensionPath: hostA.path,
@@ -3439,6 +3704,11 @@ describe("ExtensionRunner", () => {
 					extensionPath: hostA.path,
 					event: "session_rollback",
 					error: "first host completion failed",
+				}),
+				expect.objectContaining({
+					extensionPath: hostA.path,
+					event: "session_tree",
+					error: "snapshot acknowledgement failed",
 				}),
 			]);
 			expect(runner.getExtensionPaths()).toEqual([publicExtension.path]);

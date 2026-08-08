@@ -23,17 +23,21 @@ function resolve(
 	overrides: {
 		isInteractive?: boolean;
 		noSession?: boolean;
+		freshProvenance?: boolean;
 		parentTaskPrefix?: string;
 		taskDepth?: number;
+		launchEnv?: Readonly<Record<string, string | undefined>>;
 		env?: Readonly<Record<string, string | undefined>>;
 	} = {},
 ): Uint8Array | undefined {
 	return resolveFreshOmpCompanionSecret({
 		isInteractive: overrides.isInteractive ?? true,
 		noSession: overrides.noSession ?? false,
+		freshProvenance: overrides.freshProvenance ?? true,
 		parentTaskPrefix: overrides.parentTaskPrefix,
 		taskDepth: overrides.taskDepth,
-		env: overrides.env ?? BASE_ENV,
+		launchEnv: Object.hasOwn(overrides, "launchEnv") ? overrides.launchEnv : BASE_ENV,
+		env: overrides.env ?? {},
 	});
 }
 
@@ -41,18 +45,19 @@ describe("Fresh OMP companion host gate", () => {
 	it("accepts only the canonical 32-byte capability in a top-level interactive persistent session", () => {
 		expect(TOKEN).toHaveLength(43);
 		expect(resolve()).toEqual(Buffer.alloc(32, 0x5a));
-		expect(resolve({ env: { ...BASE_ENV, TMUX: "", STY: "" } })).toEqual(Buffer.alloc(32, 0x5a));
+		expect(resolve({ env: { TMUX: "", STY: "" } })).toEqual(Buffer.alloc(32, 0x5a));
 	});
 
 	it("rejects every excluded mode, ownership, persistence, and terminal-multiplexer state", () => {
 		const excluded: Array<[string, Parameters<typeof resolve>[0]]> = [
 			["print/rpc/acp/noninteractive", { isInteractive: false }],
+			["missing Fresh argv provenance", { freshProvenance: false }],
 			["no-session", { noSession: true }],
 			["nested prefix", { parentTaskPrefix: "task:" }],
 			["present empty nested prefix", { parentTaskPrefix: "" }],
 			["nested depth", { taskDepth: 1 }],
-			["tmux", { env: { ...BASE_ENV, TMUX: "/tmp/tmux-1" } }],
-			["screen", { env: { ...BASE_ENV, STY: "123.pts" } }],
+			["tmux", { env: { TMUX: "/tmp/tmux-1" } }],
+			["screen", { env: { STY: "123.pts" } }],
 			["invalid negative depth", { taskDepth: -1 }],
 		];
 
@@ -77,33 +82,47 @@ describe("Fresh OMP companion host gate", () => {
 			["token non-canonical", { ...BASE_ENV, FRESH_OMP_COMPANION_TOKEN: nonCanonical }],
 		];
 
-		for (const [label, env] of rejectedEnvs) {
-			expect(resolve({ env }), label).toBeUndefined();
+		for (const [label, launchEnv] of rejectedEnvs) {
+			expect(resolve({ launchEnv }), label).toBeUndefined();
 		}
 	});
 
-	it("consumes both transport values after resolving the internal secret, including rejected gates", () => {
-		const accepted = { ...BASE_ENV };
+	it("does not authorize from process or project dotenv values after launch authority is unavailable", () => {
+		expect(resolve({ launchEnv: undefined, env: BASE_ENV })).toBeUndefined();
+	});
+
+	it("consumes captured and live transport values after accepted and rejected gates", () => {
+		const acceptedLaunch = { ...BASE_ENV };
+		const acceptedEnv = { ...BASE_ENV };
 		expect(
 			consumeFreshOmpCompanionSecret({
 				isInteractive: true,
 				noSession: false,
-				env: accepted,
+				freshProvenance: true,
+				launchEnv: acceptedLaunch,
+				env: acceptedEnv,
 			}),
 		).toEqual(Buffer.alloc(32, 0x5a));
-		expect(accepted).not.toHaveProperty("FRESH_OMP_COMPANION");
-		expect(accepted).not.toHaveProperty("FRESH_OMP_COMPANION_TOKEN");
+		for (const env of [acceptedLaunch, acceptedEnv]) {
+			expect(env).not.toHaveProperty("FRESH_OMP_COMPANION");
+			expect(env).not.toHaveProperty("FRESH_OMP_COMPANION_TOKEN");
+		}
 
-		const rejected = { ...BASE_ENV };
+		const rejectedLaunch = { ...BASE_ENV };
+		const rejectedEnv = { ...BASE_ENV };
 		expect(
 			consumeFreshOmpCompanionSecret({
 				isInteractive: false,
 				noSession: false,
-				env: rejected,
+				freshProvenance: true,
+				launchEnv: rejectedLaunch,
+				env: rejectedEnv,
 			}),
 		).toBeUndefined();
-		expect(rejected).not.toHaveProperty("FRESH_OMP_COMPANION");
-		expect(rejected).not.toHaveProperty("FRESH_OMP_COMPANION_TOKEN");
+		for (const env of [rejectedLaunch, rejectedEnv]) {
+			expect(env).not.toHaveProperty("FRESH_OMP_COMPANION");
+			expect(env).not.toHaveProperty("FRESH_OMP_COMPANION_TOKEN");
+		}
 	});
 
 	it("keeps the decoded capability private before public extensions load", async () => {
@@ -118,6 +137,7 @@ describe("Fresh OMP companion host gate", () => {
 		const authStorage = await AuthStorage.create(path.join(root, "auth.db"));
 		const settings = Settings.isolated({ "marketplace.autoUpdate": "off" });
 		const parsed = parseArgs([]);
+		parsed.freshOmpCompanion = true;
 		parsed.extensions = [extensionPath];
 		parsed.noExtensions = true;
 		parsed.noSkills = true;
@@ -137,6 +157,7 @@ describe("Fresh OMP companion host gate", () => {
 				runRootCommand(parsed, [], {
 					discoverAuthStorage: async () => authStorage,
 					settings,
+					consumeFreshOmpCompanionLaunchEnv: () => ({ ...BASE_ENV }),
 					createAgentSession: async options => {
 						observedOptions = options;
 						throw stop;
@@ -145,7 +166,7 @@ describe("Fresh OMP companion host gate", () => {
 			).rejects.toBe(stop);
 
 			expect(Reflect.get(globalThis, probeKey)).toEqual({ marker: null, token: null });
-			expect(observedOptions?.hostInternalExtensions).toHaveLength(1);
+			expect(observedOptions?.hostInternalExtension).toBeDefined();
 			expect(Bun.env.FRESH_OMP_COMPANION).toBeUndefined();
 			expect(Bun.env.FRESH_OMP_COMPANION_TOKEN).toBeUndefined();
 		} finally {

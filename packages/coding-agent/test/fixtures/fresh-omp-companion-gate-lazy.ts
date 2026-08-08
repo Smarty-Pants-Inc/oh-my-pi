@@ -13,6 +13,8 @@ const { resolveFreshOmpCompanionSecret } = await import("../../src/main");
 const secret = resolveFreshOmpCompanionSecret({
 	isInteractive: true,
 	noSession: false,
+	freshProvenance: false,
+	launchEnv: undefined,
 	env: {},
 });
 if (secret !== undefined) throw new Error("Companion must remain gated off");

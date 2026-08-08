@@ -443,13 +443,13 @@ export interface CreateAgentSessionOptions {
 	 */
 	preloadedExtensions?: LoadExtensionsResult;
 	/**
-	 * Host-owned extensions installed ahead of public handlers without entering
+	 * Host-owned extension installed ahead of public handlers without entering
 	 * discovery, factory forwarding, public metadata, or the model-callable tool set.
 	 * Ignored for subagent/task sessions even if accidentally forwarded.
 	 *
 	 * @internal
 	 */
-	hostInternalExtensions?: HostInternalExtensionBinding[];
+	hostInternalExtension?: HostInternalExtensionBinding;
 	/**
 	 * Pre-discovered extension source paths. When provided, the filesystem-scan
 	 * inside `discoverExtensionPaths()` is skipped — the session still calls
@@ -2584,10 +2584,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// (The builtin autoresearch extension is unconditionally loaded above, so this scenario
 		// is unreachable; unconditional runner construction keeps that invariant explicit and
 		// prevents future optional extensions from silently re-opening the hole.)
-		const hostInternalExtensions =
+		const hostInternalExtension =
 			options.parentTaskPrefix === undefined && (options.taskDepth ?? 0) === 0
-				? (options.hostInternalExtensions ?? [])
-				: [];
+				? options.hostInternalExtension
+				: undefined;
 		const extensionRunner: ExtensionRunner = new ExtensionRunner(
 			extensionsResult.extensions,
 			extensionsResult.runtime,
@@ -2598,7 +2598,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			settings,
 			localProtocolOptions,
 			() => (hasSession ? session.getAsyncJobSnapshot() : null),
-			hostInternalExtensions,
+			hostInternalExtension,
+			() => (hasSession ? session.getAsyncJobCounts() : null),
 		);
 		const systemPromptBuilder = extensionRunner.getSystemPromptBuilder();
 

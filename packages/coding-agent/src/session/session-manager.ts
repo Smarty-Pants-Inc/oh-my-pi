@@ -95,6 +95,14 @@ import {
 
 const JSONL_SUFFIX_LENGTH = ".jsonl".length;
 const DRAFT_ONLY_SESSION_MARKER = ".draft-only-session";
+const reconciledArtifactRoots = new Set<string>();
+
+/** Deep-copy session state through the same JSON value boundary used by the durable journal. */
+function cloneDurableSessionJson<T>(value: T): T {
+	const serialized = stringifyJson(value);
+	if (serialized === undefined) throw new TypeError("Session state is not JSON-serializable");
+	return JSON.parse(serialized) as T;
+}
 
 function mintSessionId(): string {
 	return Bun.randomUUIDv7();
@@ -370,6 +378,8 @@ export interface SessionManagerStateSnapshot {
 	sessionName: string | undefined;
 	titleSource: SessionTitleSource | undefined;
 	sessionFile: string | undefined;
+	/** Monotonic generation of accepted journal appends for this session file. */
+	journalMutationGeneration: number;
 	titleUpdatedAt: string;
 	hasTitleSlot: boolean;
 	onDisk: boolean;
@@ -396,9 +406,11 @@ export interface PersistedSessionFileSnapshot {
 	sessionFile: string;
 	/** Undefined records a path which did not exist at snapshot time. */
 	content: string | undefined;
+	/** Monotonic generation paired with {@link content}. */
+	mutationGeneration: number;
 }
 
-/** A source-session artifact snapshot published only after a replacement session file exists. */
+/** A source-session artifact snapshot published before its replacement journal becomes visible. */
 export interface SessionArtifactCloneTransaction {
 	publish(destinationSessionFile: string): Promise<void>;
 	commit(): Promise<void>;
@@ -520,6 +532,10 @@ export class SessionManager {
 	#pendingDurabilityNotifications: SessionEntry[] = [];
 	/** Bumped on every sync rewrite / chain reset so stale queued tasks become no-ops. */
 	#diskEpoch = 0;
+	/** Per-file generation advanced by every accepted journal append. */
+	#journalMutationGenerationByFile = new Map<string, number>();
+	/** Latest durable snapshot generation; later appends must materialize even a lazy journal. */
+	#persistedSnapshotGenerationByFile = new Map<string, number>();
 	/**
 	 * Epoch of the in-flight atomic rewrite, or `null` when no rewrite is running.
 	 * The fence in {@link #appendToSessionFile} only applies while this matches
@@ -565,7 +581,18 @@ export class SessionManager {
 		this.#storage = storage;
 		this.#blobs = new BlobStore(getBlobsDir());
 
-		if (persist && sessionDir) this.#storage.ensureDirSync(sessionDir);
+		if (persist && sessionDir) {
+			this.#storage.ensureDirSync(sessionDir);
+			if (storage instanceof FileSessionStorage) {
+				const managedRoot = resolveManagedSessionRoot(sessionDir, cwd);
+				const reconciliationRoot = path.resolve(managedRoot ?? sessionDir);
+				if (!reconciledArtifactRoots.has(reconciliationRoot)) {
+					if (managedRoot) storage.reconcileArtifactOperationsUnderRootSync(reconciliationRoot);
+					else storage.reconcileArtifactOperationsSync(reconciliationRoot);
+					reconciledArtifactRoots.add(reconciliationRoot);
+				}
+			}
+		}
 	}
 
 	#rememberBreadcrumb(cwd: string, sessionFile: string, fresh = false): void {
@@ -948,7 +975,9 @@ export class SessionManager {
 	}
 
 	#appendToSessionFile(entry: FileEntry): void {
-		if (this.#released || !this.#persist || !this.#sessionFile) return;
+		if (this.#released) return;
+		this.#advanceJournalMutation();
+		if (!this.#persist || !this.#sessionFile) return;
 		if (this.#atomicEntryBatch) {
 			this.#fileIsCurrent = false;
 			this.#rewriteRequired = true;
@@ -1140,6 +1169,40 @@ export class SessionManager {
 		this.#index.rebuild(entries, leafId);
 	}
 
+	#journalMutationGeneration(sessionFile: string | undefined = this.#sessionFile): number {
+		return sessionFile ? (this.#journalMutationGenerationByFile.get(path.resolve(sessionFile)) ?? 0) : 0;
+	}
+
+	#advanceJournalMutation(): void {
+		if (!this.#persist || !this.#sessionFile) return;
+		const sessionFile = path.resolve(this.#sessionFile);
+		const nextGeneration = (this.#journalMutationGenerationByFile.get(sessionFile) ?? 0) + 1;
+		this.#journalMutationGenerationByFile.set(sessionFile, nextGeneration);
+		const snapshotGeneration = this.#persistedSnapshotGenerationByFile.get(sessionFile);
+		if (snapshotGeneration !== undefined && nextGeneration > snapshotGeneration) this.#forceFileCreation = true;
+	}
+
+	async #reloadCurrentPersistedJournal(): Promise<boolean> {
+		const sessionFile = this.#sessionFile;
+		if (!sessionFile || !this.#storage.existsSync(sessionFile)) return false;
+		const titleSlot = await readTitleSlotFromFile(sessionFile, this.#storage);
+		const fileEntries = await loadEntriesFromFile(sessionFile, this.#storage);
+		if (fileEntries.length === 0) return false;
+		const migrated = migrateToCurrentVersion(fileEntries);
+		await resolveBlobRefsInEntries(fileEntries, this.#blobs);
+		const header = fileEntries[0] as SessionHeader;
+		const journal = restoreSessionJournal(fileEntries);
+		this.#applyEntries(header, journal.entries, journal.leafId);
+		this.#additionalDirectories = header.additionalDirectories ?? [];
+		this.#titleUpdatedAt = titleSlot?.updatedAt ?? header.timestamp;
+		this.#hasTitleSlot = titleSlot !== undefined;
+		this.#fileIsCurrent = true;
+		this.#rewriteRequired = migrated;
+		this.#forceFileCreation = true;
+		this.sanitizeLoadedOpenAIResponsesReplayMetadata();
+		return true;
+	}
+
 	#freshEntryFields(): { id: string; parentId: string | null; timestamp: string } {
 		return {
 			id: generateId(this.#index),
@@ -1277,13 +1340,14 @@ export class SessionManager {
 			titleUpdatedAt: this.#titleUpdatedAt,
 			hasTitleSlot: this.#hasTitleSlot,
 			sessionFile: this.#sessionFile,
+			journalMutationGeneration: this.#journalMutationGeneration(),
 			onDisk: this.#fileIsCurrent,
 			needsRewrite: this.#rewriteRequired,
 			draftOnlySessionCleanupArmed: this.#draftOnlySessionCleanupArmed,
 			// Header and entries are mutated in place by title, workspace, and
 			// migration paths. A rollback checkpoint must never share those objects.
-			header: structuredClone(this.#header),
-			entries: structuredClone(this.#entries) as SessionEntry[],
+			header: cloneDurableSessionJson(this.#header),
+			entries: cloneDurableSessionJson(this.#entries),
 			leafId: this.#index.leafId(),
 			forceFileCreation: this.#forceFileCreation,
 			turnBudgetTotal: this.#turnBudgetTotal,
@@ -1306,9 +1370,15 @@ export class SessionManager {
 		const sessionFile = this.#sessionFile;
 		if (!this.#persist || !sessionFile) return undefined;
 		await this.flush();
-		return this.#storage.existsSync(sessionFile)
-			? { sessionFile, content: await this.#storage.readText(sessionFile) }
-			: { sessionFile, content: undefined };
+		for (;;) {
+			const mutationGeneration = this.#journalMutationGeneration(sessionFile);
+			const content = this.#storage.existsSync(sessionFile) ? await this.#storage.readText(sessionFile) : undefined;
+			if (this.#journalMutationGeneration(sessionFile) === mutationGeneration) {
+				this.#persistedSnapshotGenerationByFile.set(path.resolve(sessionFile), mutationGeneration);
+				return { sessionFile, content, mutationGeneration };
+			}
+			await this.flush();
+		}
 	}
 
 	/**
@@ -1318,32 +1388,80 @@ export class SessionManager {
 	async capturePersistedSessionFileAt(sessionFile: string): Promise<PersistedSessionFileSnapshot | undefined> {
 		if (!this.#persist) return undefined;
 		const resolvedSessionFile = path.resolve(sessionFile);
-		return this.#storage.existsSync(resolvedSessionFile)
-			? { sessionFile: resolvedSessionFile, content: await this.#storage.readText(resolvedSessionFile) }
-			: { sessionFile: resolvedSessionFile, content: undefined };
+		for (;;) {
+			const mutationGeneration = this.#journalMutationGeneration(resolvedSessionFile);
+			const content = this.#storage.existsSync(resolvedSessionFile)
+				? await this.#storage.readText(resolvedSessionFile)
+				: undefined;
+			if (this.#journalMutationGeneration(resolvedSessionFile) === mutationGeneration) {
+				this.#persistedSnapshotGenerationByFile.set(resolvedSessionFile, mutationGeneration);
+				return { sessionFile: resolvedSessionFile, content, mutationGeneration };
+			}
+		}
 	}
 
-	/** Restore an exact durable JSONL snapshot after an in-place mutation rolls back. */
-	async restorePersistedSessionFile(snapshot: PersistedSessionFileSnapshot | undefined): Promise<boolean> {
+	/** Restore a durable JSONL preimage, optionally retaining newer accepted appends. */
+	async restorePersistedSessionFile(
+		snapshot: PersistedSessionFileSnapshot | undefined,
+		options: { preserveNewerMutations?: boolean } = {},
+	): Promise<boolean> {
 		if (!this.#persist || !snapshot || this.#sessionFile !== snapshot.sessionFile) return false;
-		let restored = false;
-		await this.#scheduleDiskWork(async () => {
-			await this.#closeWriterHandle();
-			if (this.#sessionFile !== snapshot.sessionFile) return;
-			if (snapshot.content === undefined) {
-				try {
-					await this.#storage.unlink(snapshot.sessionFile);
-				} catch (error) {
-					if (!isEnoent(error)) throw error;
-				}
-			} else {
-				await this.#storage.writeTextAtomic(snapshot.sessionFile, snapshot.content);
+		if (
+			options.preserveNewerMutations === true &&
+			this.#journalMutationGeneration(snapshot.sessionFile) > snapshot.mutationGeneration
+		) {
+			if (!(await this.#reloadCurrentPersistedJournal())) {
+				throw new Error("Newer session journal mutations could not be reloaded from durable storage");
 			}
-			this.#fileIsCurrent = snapshot.content !== undefined;
-			this.#rewriteRequired = false;
-			this.#hasTitleSlot = snapshot.content !== undefined;
-			restored = true;
-		});
+			return true;
+		}
+		const epoch = this.#diskEpoch;
+		let restored = false;
+		this.#atomicRewriteFenceEpoch = epoch;
+		try {
+			await this.#scheduleDiskWork(
+				async () => {
+					await this.#closeWriterHandle();
+					if (this.#sessionFile !== snapshot.sessionFile) return;
+					if (this.#diskEpoch !== epoch) {
+						if (this.#diskFailure) throw this.#diskFailure;
+						restored = true;
+						return;
+					}
+
+					if (snapshot.content === undefined) {
+						try {
+							await this.#storage.unlink(snapshot.sessionFile);
+						} catch (error) {
+							if (!isEnoent(error)) throw error;
+						}
+						if (this.#diskEpoch !== epoch) {
+							this.#rewriteSynchronously();
+							if (this.#diskFailure) throw this.#diskFailure;
+							restored = true;
+							return;
+						}
+					} else {
+						await this.#storage.writeTextAtomic(snapshot.sessionFile, snapshot.content, {
+							commitGuard: () => this.#diskEpoch === epoch,
+						});
+						if (this.#diskEpoch !== epoch) {
+							if (this.#diskFailure) throw this.#diskFailure;
+							restored = true;
+							return;
+						}
+					}
+
+					this.#fileIsCurrent = snapshot.content !== undefined;
+					this.#rewriteRequired = false;
+					this.#hasTitleSlot = snapshot.content !== undefined;
+					restored = true;
+				},
+				{ ignoreEpoch: true },
+			);
+		} finally {
+			if (this.#atomicRewriteFenceEpoch === epoch) this.#atomicRewriteFenceEpoch = null;
+		}
 		return restored;
 	}
 
@@ -1358,7 +1476,9 @@ export class SessionManager {
 		const clone = new SessionManager(this.#cwd, this.#sessionDir, persist, this.#storage);
 		clone.#suppressBreadcrumb = true;
 		const snapshot = this.captureState();
+		clone.#journalMutationGenerationByFile = new Map(this.#journalMutationGenerationByFile);
 		clone.restoreState(snapshot);
+		clone.#persistedSnapshotGenerationByFile = new Map(this.#persistedSnapshotGenerationByFile);
 		// A clone owns fresh transient budget/artifact bookkeeping just as it did
 		// before rollback snapshots covered those fields.
 		clone.#forceFileCreation = snapshot.onDisk;
@@ -1381,27 +1501,33 @@ export class SessionManager {
 		return clone;
 	}
 
-	restoreState(snapshot: SessionManagerStateSnapshot): void {
+	restoreState(snapshot: SessionManagerStateSnapshot, options: { preserveCurrentJournal?: boolean } = {}): void {
 		this.#closeWriterEventually();
 		this.#diskTail = Promise.resolve();
 		this.#clearDiskError();
 		// A snapshot may be restored more than once during rollback. Every restore
 		// must own fresh objects so reconciler/title mutations cannot alias the
 		// checkpoint and poison the authoritative second restore.
-		const header = structuredClone(snapshot.header);
-		const entries = structuredClone(snapshot.entries) as SessionEntry[];
+		const preserveCurrentJournal = options.preserveCurrentJournal === true;
+		const header = cloneDurableSessionJson(preserveCurrentJournal ? this.#header : snapshot.header);
+		const entries = cloneDurableSessionJson(preserveCurrentJournal ? this.#entries : snapshot.entries);
+		const leafId = preserveCurrentJournal ? this.#index.leafId() : snapshot.leafId;
+		const sessionName = preserveCurrentJournal ? this.#sessionName : snapshot.sessionName;
+		const titleSource = preserveCurrentJournal ? this.#titleSource : snapshot.titleSource;
+		const titleUpdatedAt = preserveCurrentJournal ? this.#titleUpdatedAt : snapshot.titleUpdatedAt;
+		const hasTitleSlot = preserveCurrentJournal ? this.#hasTitleSlot : snapshot.hasTitleSlot;
 		this.#cwd = snapshot.cwd;
 		this.#sessionDir = snapshot.sessionDir;
 		this.#sessionFile = snapshot.sessionFile;
 		this.#fileIsCurrent = snapshot.onDisk;
 		this.#rewriteRequired = snapshot.needsRewrite;
 		this.#draftOnlySessionCleanupArmed = snapshot.draftOnlySessionCleanupArmed;
-		this.#applyEntries(header, entries, snapshot.leafId);
+		this.#applyEntries(header, entries, leafId);
 		this.#additionalDirectories = [...(header.additionalDirectories ?? [])];
-		this.#sessionName = snapshot.sessionName;
-		this.#titleSource = snapshot.titleSource;
-		this.#titleUpdatedAt = snapshot.titleUpdatedAt;
-		this.#hasTitleSlot = snapshot.hasTitleSlot;
+		this.#sessionName = sessionName;
+		this.#titleSource = titleSource;
+		this.#titleUpdatedAt = titleUpdatedAt;
+		this.#hasTitleSlot = hasTitleSlot;
 		this.#forceFileCreation = snapshot.forceFileCreation;
 		this.#turnBudgetTotal = snapshot.turnBudgetTotal;
 		this.#turnBudgetHard = snapshot.turnBudgetHard;
@@ -1415,6 +1541,13 @@ export class SessionManager {
 		this.#breadcrumbFresh = snapshot.breadcrumbFresh;
 
 		if (this.#sessionFile) this.#rememberBreadcrumb(this.#cwd, this.#sessionFile, snapshot.breadcrumbFresh);
+		if (this.#sessionFile) {
+			const sessionFile = path.resolve(this.#sessionFile);
+			this.#journalMutationGenerationByFile.set(
+				sessionFile,
+				Math.max(this.#journalMutationGeneration(sessionFile), snapshot.journalMutationGeneration),
+			);
+		}
 	}
 
 	/** Switch to a different session file (resume / branch). */
@@ -1468,7 +1601,7 @@ export class SessionManager {
 		this.#artifactManager = null;
 		this.#artifactManagerSessionFile = null;
 
-		if (this.sanitizeLoadedOpenAIResponsesReplayMetadata()) this.#rewriteRequired = true;
+		this.sanitizeLoadedOpenAIResponsesReplayMetadata();
 	}
 
 	/** Start a new session. Drains and closes any existing writer first. */
@@ -1477,35 +1610,48 @@ export class SessionManager {
 		return this.#resetToNewSession(options);
 	}
 
-	/** Delete a session file and its artifact directory. ENOENT is treated as success. */
+	/** Delete a session file and its artifact directory after draining artifact writers. */
 	async dropSession(sessionPath: string): Promise<void> {
 		await this.#drainAndCloseWriter();
+		const resolvedSessionPath = path.resolve(sessionPath);
+		const artifactManager =
+			!this.#adoptedArtifactManager && this.#sessionFile && path.resolve(this.#sessionFile) === resolvedSessionPath
+				? this.#artifactManagerForSession()
+				: new ArtifactManager(resolvedSessionPath.slice(0, -JSONL_SUFFIX_LENGTH));
+		const artifactFence = await artifactManager?.beginTransaction();
 		try {
-			await this.#storage.deleteSessionWithArtifacts(sessionPath);
-		} catch (err) {
-			if (!isEnoent(err)) throw err;
+			await this.#storage.deleteSessionWithArtifacts(resolvedSessionPath);
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+		} finally {
+			await artifactFence?.commit();
 		}
 	}
 
 	/**
 	 * Fork the current session into a new file with the same entries.
+	 * `beforeJournalPublish` lets lifecycle callers atomically publish referenced artifacts first.
 	 * @returns the old and new session file paths, or undefined when not persisting.
 	 */
-	async fork(): Promise<{ oldSessionFile: string; newSessionFile: string } | undefined> {
+	async fork(
+		beforeJournalPublish?: (newSessionFile: string) => void | Promise<void>,
+	): Promise<{ oldSessionFile: string; newSessionFile: string } | undefined> {
 		if (!this.#persist || !this.#sessionFile) return undefined;
 
 		const oldSessionFile = this.#sessionFile;
 		const parentSessionId = this.#sessionId;
+		const retainedState = beforeJournalPublish ? undefined : this.captureState();
 		await this.#drainAndCloseWriter();
 		this.#clearDiskError();
+		const ownedArtifactClone = beforeJournalPublish ? undefined : await this.beginArtifactCloneTransaction();
 
 		const timestamp = nowIso();
-		this.#sessionId = mintSessionId();
-		this.#sessionFile = path.join(this.#sessionDir, `${fileSafeTimestamp(timestamp)}_${this.#sessionId}.jsonl`);
-		this.#header = {
+		const newSessionId = mintSessionId();
+		const newSessionFile = path.join(this.#sessionDir, `${fileSafeTimestamp(timestamp)}_${newSessionId}.jsonl`);
+		const header: SessionHeader = {
 			type: "session",
 			version: CURRENT_SESSION_VERSION,
-			id: this.#sessionId,
+			id: newSessionId,
 			title: this.#header.title ?? this.#sessionName,
 			titleSource: this.#header.titleSource ?? this.#titleSource,
 			timestamp,
@@ -1514,20 +1660,45 @@ export class SessionManager {
 			parentSession: parentSessionId,
 			providerPromptCacheKey: this.#header.providerPromptCacheKey ?? parentSessionId,
 		};
-		this.#sessionName = this.#header.title;
-		this.#titleSource = this.#header.titleSource;
-		this.#titleUpdatedAt = timestamp;
-		this.#hasTitleSlot = true;
-		this.#fileIsCurrent = false;
-		this.#rewriteRequired = false;
-		this.#forceFileCreation = true;
-		this.#draftOnlySessionCleanupArmed = false;
-		this.#artifactManager = null;
-		this.#artifactManagerSessionFile = null;
-		this.#rememberBreadcrumb(this.#cwd, this.#sessionFile);
 
-		await this.#rewriteAtomically();
-		return { oldSessionFile, newSessionFile: this.#sessionFile };
+		try {
+			if (ownedArtifactClone) await ownedArtifactClone.publish(newSessionFile);
+			else await beforeJournalPublish?.(newSessionFile);
+			this.#sessionId = newSessionId;
+			this.#sessionFile = newSessionFile;
+			this.#header = header;
+			this.#sessionName = header.title;
+			this.#titleSource = header.titleSource;
+			this.#titleUpdatedAt = timestamp;
+			this.#hasTitleSlot = true;
+			this.#fileIsCurrent = false;
+			this.#rewriteRequired = false;
+			this.#forceFileCreation = true;
+			this.#draftOnlySessionCleanupArmed = false;
+			this.#artifactManager = null;
+			this.#artifactManagerSessionFile = null;
+
+			await this.#rewriteAtomically();
+			await ownedArtifactClone?.commit();
+			this.#rememberBreadcrumb(this.#cwd, newSessionFile);
+			return { oldSessionFile, newSessionFile };
+		} catch (operationError) {
+			if (!ownedArtifactClone || !retainedState) throw operationError;
+			this.restoreState(retainedState);
+			const failures: unknown[] = [operationError];
+			try {
+				await this.#storage.deleteSessionWithArtifacts(newSessionFile);
+			} catch (cleanupError) {
+				failures.push(cleanupError);
+			}
+			try {
+				await ownedArtifactClone.rollback();
+			} catch (cleanupError) {
+				failures.push(cleanupError);
+			}
+			if (failures.length === 1) throw operationError;
+			throw new AggregateError(failures, "Fork failed and target cleanup was incomplete");
+		}
 	}
 
 	/**
@@ -1550,76 +1721,64 @@ export class SessionManager {
 			(managedRoot
 				? computeDefaultSessionDir(resolvedCwd, this.#storage, managedRoot)
 				: computeDefaultSessionDir(resolvedCwd, this.#storage));
-
 		let sessionFileExisted = false;
-		// Track source+dest for concurrent completed appends during relocation
-		// (see `#sessionFileRelocating`). Existence of either path decides the
-		// live write target — not a `#diskEpoch` bump, which would cancel any
-		// disk task already queued at the current epoch (e.g. a header-only
-		// `ensureOnDisk()` materializing rewrite) before the drain below runs it.
-		if (this.#persist && this.#sessionFile) {
-			const source = this.#sessionFile;
-			const dest = path.join(nextSessionDir, path.basename(source));
-			this.#sessionFileRelocating = { source, dest };
-		}
 
 		try {
 			if (this.#persist && this.#sessionFile) {
 				this.#storage.ensureDirSync(nextSessionDir);
-				await this.#drainAndCloseWriter();
-				this.#clearDiskError();
-
 				const oldSessionFile = this.#sessionFile;
 				const newSessionFile = path.join(nextSessionDir, path.basename(oldSessionFile));
 				const oldArtifactsDir = artifactsDirectoryFor(oldSessionFile)!;
 				const newArtifactsDir = artifactsDirectoryFor(newSessionFile)!;
 				const sessionPathChanged = path.resolve(oldSessionFile) !== path.resolve(newSessionFile);
 				const artifactPathChanged = path.resolve(oldArtifactsDir) !== path.resolve(newArtifactsDir);
+
 				sessionFileExisted = this.#storage.existsSync(oldSessionFile);
-
-				let sessionMoved = false;
-				let artifactsMoved = false;
-
+				let artifactsExisted = false;
 				try {
-					if (sessionFileExisted && sessionPathChanged) {
-						await fs.promises.rename(oldSessionFile, newSessionFile);
-						sessionMoved = true;
-					}
-
-					if (artifactPathChanged) {
-						try {
-							const artifactStat = await fs.promises.stat(oldArtifactsDir);
-							if (artifactStat.isDirectory()) {
-								await fs.promises.rename(oldArtifactsDir, newArtifactsDir);
-								artifactsMoved = true;
-							}
-						} catch (err) {
-							if (!isEnoent(err)) throw err;
-						}
-					}
-				} catch (err) {
-					if (artifactsMoved) {
-						try {
-							await fs.promises.rename(newArtifactsDir, oldArtifactsDir);
-						} catch (rollbackErr) {
-							throw new Error(
-								`Failed to move artifacts and rollback: ${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`,
-							);
-						}
-					}
-
-					if (sessionMoved) {
-						try {
-							await fs.promises.rename(newSessionFile, oldSessionFile);
-						} catch (rollbackErr) {
-							throw new Error(
-								`Failed to move session file and rollback: ${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`,
-							);
-						}
-					}
-
-					throw err;
+					artifactsExisted = (await fs.promises.stat(oldArtifactsDir)).isDirectory();
+				} catch (error) {
+					if (!isEnoent(error)) throw error;
 				}
+				if (artifactsExisted && !sessionFileExisted) {
+					// Artifact references must never move without a journal commit point.
+					// Materialize the lazy source first so recovery can select one side.
+					this.#forceFileCreation = true;
+					await this.#rewriteAtomically();
+					sessionFileExisted = this.#storage.existsSync(oldSessionFile);
+				}
+
+				this.#sessionFileRelocating = { source: oldSessionFile, dest: newSessionFile };
+				await this.#drainAndCloseWriter();
+				sessionFileExisted ||= this.#storage.existsSync(oldSessionFile);
+				this.#clearDiskError();
+
+				const relocationManager = artifactPathChanged
+					? this.#artifactManager && this.#artifactManagerSessionFile === oldSessionFile
+						? this.#artifactManager
+						: new ArtifactManager(oldArtifactsDir)
+					: undefined;
+				const artifactRelocation = relocationManager
+					? await relocationManager.beginRelocation(newArtifactsDir)
+					: undefined;
+				try {
+					// Destination artifacts are already complete here. The journal rename
+					// is the sole commit point observed by startup reconciliation.
+					if (sessionFileExisted && sessionPathChanged) {
+						await this.#storage.rename(oldSessionFile, newSessionFile);
+					}
+				} catch (operationError) {
+					try {
+						await artifactRelocation?.rollback();
+					} catch (rollbackError) {
+						throw new AggregateError(
+							[operationError, rollbackError],
+							"Failed to relocate the session journal and roll back its artifacts",
+						);
+					}
+					throw operationError;
+				}
+				await artifactRelocation?.commit();
 
 				if (sessionFileExisted && sessionPathChanged) {
 					this.#header.previousSessionFiles = [
@@ -1628,26 +1787,22 @@ export class SessionManager {
 				}
 
 				this.#sessionFile = newSessionFile;
-				this.#artifactManager = null;
-				this.#artifactManagerSessionFile = null;
-				// Path is repointed; hot-path appends may use `#sessionFile` again.
+				if (relocationManager) {
+					this.#artifactManager = relocationManager;
+					this.#artifactManagerSessionFile = newSessionFile;
+				}
 				this.#sessionFileRelocating = null;
 			}
 
 			this.#cwd = resolvedCwd;
 			this.#sessionDir = nextSessionDir;
 			this.#header.cwd = resolvedCwd;
-			// Re-filter additional roots: the new cwd may have been an additional root,
-			// or it may now contain/subsume one. Re-normalize to keep the invariant
-			// that cwd is never also listed as an additional directory.
 			if (this.#additionalDirectories.length > 0) {
-				this.#additionalDirectories = this.#additionalDirectories.filter(d => d !== resolvedCwd);
+				this.#additionalDirectories = this.#additionalDirectories.filter(directory => directory !== resolvedCwd);
 				this.#header.additionalDirectories =
 					this.#additionalDirectories.length > 0 ? this.#additionalDirectories : undefined;
 			}
 
-			// Rewrite at the new location when the file already existed (update cwd) or
-			// there is in-memory output worth materializing; otherwise stay lazy.
 			const hasAssistant = this.#historyContainsAssistantMessage();
 			if (this.#persist && this.#sessionFile && (sessionFileExisted || hasAssistant)) {
 				this.#forceFileCreation = true;
@@ -1688,11 +1843,35 @@ export class SessionManager {
 		manager.#additionalDirectories = [...this.#additionalDirectories];
 		manager.#header.additionalDirectories =
 			manager.#additionalDirectories.length > 0 ? [...manager.#additionalDirectories] : undefined;
-		manager.#entries = structuredClone(this.#entries);
+		manager.#entries = cloneDurableSessionJson(this.#entries);
 		manager.#index.rebuild(manager.#entries, this.#index.leafId());
 		manager.#forceFileCreation = true;
-		await manager.#rewriteAtomically();
-		return manager;
+		const targetSessionFile = manager.#sessionFile;
+		const artifactClone = await this.#artifactManagerForSession()?.beginCloneTransaction();
+		try {
+			if (artifactClone && targetSessionFile) {
+				await artifactClone.publish(targetSessionFile.slice(0, -JSONL_SUFFIX_LENGTH));
+			}
+			await manager.#rewriteAtomically();
+			await artifactClone?.commit();
+			return manager;
+		} catch (operationError) {
+			const failures: unknown[] = [operationError];
+			if (targetSessionFile) {
+				try {
+					await storage.deleteSessionWithArtifacts(targetSessionFile);
+				} catch (cleanupError) {
+					failures.push(cleanupError);
+				}
+			}
+			try {
+				await artifactClone?.rollback();
+			} catch (cleanupError) {
+				failures.push(cleanupError);
+			}
+			if (failures.length === 1) throw operationError;
+			throw new AggregateError(failures, "Persisted session copy failed and target cleanup was incomplete");
+		}
 	}
 
 	/**
@@ -2033,11 +2212,11 @@ export class SessionManager {
 
 	/**
 	 * Fence the active session's artifact manager for inheritance by a future
-	 * replacement session. Publication validates that the replacement is the
-	 * manager's active session and maps its JSONL path to the sibling artifact
-	 * directory only after the replacement file has been created. Callers may
-	 * include exact top-level companion files whose lifecycle semantics require
-	 * continuity in addition to numeric artifacts.
+	 * replacement session. Publication accepts either the still-active source
+	 * (while fork/branch artifacts are published before their journal) or the
+	 * already-active replacement, maps the JSONL path to its sibling artifact
+	 * directory, and rejects unrelated destinations. Callers may include exact
+	 * top-level companion files whose lifecycle semantics require continuity.
 	 */
 	async beginArtifactCloneTransaction(
 		additionalFileNames: readonly string[] = [],
@@ -2051,8 +2230,17 @@ export class SessionManager {
 		return {
 			publish: async destinationSessionFile => {
 				const resolvedDestinationSessionFile = path.resolve(destinationSessionFile);
-				if (!this.#sessionFile || path.resolve(this.#sessionFile) !== resolvedDestinationSessionFile) {
-					throw new Error("Artifact clone destination is not the active replacement session");
+				const resolvedSourceSessionFile = path.resolve(sourceSessionFile);
+				const resolvedActiveSessionFile = this.#sessionFile ? path.resolve(this.#sessionFile) : undefined;
+				const publishingBeforeJournal = resolvedActiveSessionFile === resolvedSourceSessionFile;
+				if (
+					resolvedActiveSessionFile !== resolvedDestinationSessionFile &&
+					(!publishingBeforeJournal ||
+						path.dirname(resolvedDestinationSessionFile) !== path.resolve(this.#sessionDir) ||
+						!resolvedDestinationSessionFile.endsWith(".jsonl") ||
+						this.#storage.existsSync(resolvedDestinationSessionFile))
+				) {
+					throw new Error("Artifact clone destination is not the active or pending replacement session");
 				}
 				if (resolvedDestinationSessionFile === path.resolve(sourceSessionFile)) {
 					throw new Error("Artifact clone destination must differ from its source session");
@@ -2234,6 +2422,7 @@ export class SessionManager {
 		this.#entries.push(entry);
 		this.#index.insert(entry);
 		this.#notifyEntryAppended(entry);
+		this.#advanceJournalMutation();
 		await this.#persistTitleChangeEntry(entry, { title, source, updatedAt: timestamp });
 
 		this.#notifySessionNameListeners();
@@ -2254,7 +2443,7 @@ export class SessionManager {
 	 * guests must not share references).
 	 */
 	snapshotForReplication(): { header: SessionHeader; entries: SessionEntry[] } {
-		return { header: structuredClone(this.#header), entries: structuredClone(this.#entries) as SessionEntry[] };
+		return { header: cloneDurableSessionJson(this.#header), entries: cloneDurableSessionJson(this.#entries) };
 	}
 
 	/**
@@ -2575,7 +2764,7 @@ export class SessionManager {
 		return buildSessionContext(this.#entries, this.#index.leafId(), this.#index.entriesById(), options);
 	}
 
-	/** Strip stale OpenAI Responses assistant replay metadata from loaded entries. */
+	/** Strip stale OpenAI Responses replay metadata from the runtime projection without forcing a durable rewrite. */
 	sanitizeLoadedOpenAIResponsesReplayMetadata(): boolean {
 		let changed = false;
 		for (const entry of this.#entries) {
@@ -2643,9 +2832,18 @@ export class SessionManager {
 
 	/**
 	 * Create a new session file containing only the path from root to `leafId`.
+	 * A supplied `beforeJournalPublish` barrier publishes referenced artifacts before the journal.
 	 * Returns the new file path, or undefined when not persisting.
 	 */
-	createBranchedSession(leafId: string): string | undefined {
+	createBranchedSession(leafId: string): string | undefined;
+	createBranchedSession(
+		leafId: string,
+		beforeJournalPublish: (newSessionFile: string) => void | Promise<void>,
+	): Promise<string | undefined>;
+	createBranchedSession(
+		leafId: string,
+		beforeJournalPublish?: (newSessionFile: string) => void | Promise<void>,
+	): string | undefined | Promise<string | undefined> {
 		const sourceSessionFile = this.#sessionFile;
 		const branchPath = this.getBranch(leafId);
 		if (branchPath.length === 0) throw new Error(`Entry ${leafId} not found`);
@@ -2688,29 +2886,33 @@ export class SessionManager {
 			parentId = labelEntry.id;
 		}
 
-		this.#header = header;
-		this.#entries = [...entriesToKeep, ...labels];
-		this.#sessionId = newSessionId;
-		this.#sessionName = header.title;
-		this.#titleSource = header.titleSource;
-		this.#titleUpdatedAt = timestamp;
-		this.#hasTitleSlot = true;
-		this.#index.rebuild(this.#entries);
-		this.#artifactManager = null;
-		this.#artifactManagerSessionFile = null;
-		this.#forceFileCreation = this.#persist;
+		const activateTarget = (): string | undefined => {
+			this.#header = header;
+			this.#entries = [...entriesToKeep, ...labels];
+			this.#sessionId = newSessionId;
+			this.#sessionName = header.title;
+			this.#titleSource = header.titleSource;
+			this.#titleUpdatedAt = timestamp;
+			this.#hasTitleSlot = true;
+			this.#index.rebuild(this.#entries);
+			this.#artifactManager = null;
+			this.#artifactManagerSessionFile = null;
+			this.#forceFileCreation = this.#persist;
 
-		if (!this.#persist) {
-			this.#sessionFile = undefined;
-			this.#fileIsCurrent = false;
-			this.#rewriteRequired = false;
-			return undefined;
-		}
+			if (!this.#persist) {
+				this.#sessionFile = undefined;
+				this.#fileIsCurrent = false;
+				this.#rewriteRequired = false;
+				return undefined;
+			}
 
-		this.#sessionFile = newSessionFile;
-		this.#rewriteSynchronously();
-		this.#rememberBreadcrumb(this.#cwd, newSessionFile);
-		return newSessionFile;
+			this.#sessionFile = newSessionFile;
+			this.#rewriteSynchronously();
+			this.#rememberBreadcrumb(this.#cwd, newSessionFile);
+			return newSessionFile;
+		};
+		if (!this.#persist || !beforeJournalPublish) return activateTarget();
+		return Promise.resolve(beforeJournalPublish(newSessionFile)).then(activateTarget);
 	}
 
 	/** Resolve the canonical default session directory for a cwd. */
@@ -2776,7 +2978,8 @@ export class SessionManager {
 		const manager = new SessionManager(cwd, dir, true, storage);
 		manager.#suppressBreadcrumb = options?.suppressBreadcrumb === true;
 
-		const sourceEntries = structuredClone(await loadEntriesFromFile(sourcePath, storage)) as FileEntry[];
+		const resolvedSourcePath = path.resolve(sourcePath);
+		const sourceEntries = await loadEntriesFromFile(resolvedSourcePath, storage);
 		migrateToCurrentVersion(sourceEntries);
 		await resolveBlobRefsInEntries(sourceEntries, manager.#blobs);
 
@@ -2791,7 +2994,9 @@ export class SessionManager {
 		);
 		manager.#header.title = sourceHeader?.title;
 		manager.#header.titleSource = sourceHeader?.titleSource;
-		manager.#additionalDirectories = (sourceHeader?.additionalDirectories ?? []).filter(d => d !== path.resolve(cwd));
+		manager.#additionalDirectories = (sourceHeader?.additionalDirectories ?? []).filter(
+			directory => directory !== path.resolve(cwd),
+		);
 		manager.#header.additionalDirectories =
 			manager.#additionalDirectories.length > 0 ? manager.#additionalDirectories : undefined;
 		manager.#sessionName = manager.#header.title;
@@ -2802,8 +3007,35 @@ export class SessionManager {
 		manager.#index.rebuild(journal.entries, journal.leafId);
 		manager.sanitizeLoadedOpenAIResponsesReplayMetadata();
 		manager.#forceFileCreation = true;
-		await manager.#rewriteAtomically();
-		return manager;
+
+		const targetSessionFile = manager.#sessionFile;
+		if (!targetSessionFile) throw new Error("Persisted fork did not allocate a target session file");
+		if (path.resolve(targetSessionFile) === resolvedSourcePath) {
+			throw new Error("Fork target session file must differ from its source");
+		}
+		const artifactClone = await new ArtifactManager(
+			resolvedSourcePath.slice(0, -JSONL_SUFFIX_LENGTH),
+		).beginCloneTransaction();
+		try {
+			await artifactClone.publish(targetSessionFile.slice(0, -JSONL_SUFFIX_LENGTH));
+			await manager.#rewriteAtomically();
+			await artifactClone.commit();
+			return manager;
+		} catch (operationError) {
+			const failures: unknown[] = [operationError];
+			try {
+				await storage.deleteSessionWithArtifacts(targetSessionFile);
+			} catch (cleanupError) {
+				failures.push(cleanupError);
+			}
+			try {
+				await artifactClone.rollback();
+			} catch (cleanupError) {
+				failures.push(cleanupError);
+			}
+			if (failures.length === 1) throw operationError;
+			throw new AggregateError(failures, "Fork failed and target cleanup was incomplete");
+		}
 	}
 
 	/**

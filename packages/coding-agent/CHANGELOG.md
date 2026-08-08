@@ -68,6 +68,7 @@
 
 - Added a `--trusted-extension <absolute-path>` CLI flag to load an exact extension-module allowlist, bypassing ambient extension discovery.
 - Added resumable session details to fatal crash outputs, including a suggested `omp --resume <session-id>` command to quickly resume persisted live agent sessions.
+- Added Fresh's opt-in native-TUI companion for direct local interactive sessions: one-shot pre-dotenv capability gating; a singular host-internal extension; authenticated bounded status snapshots; exact work-identity and replay-bound cancel/snapshot commands; phase-checked lifecycle ownership; selected-side async publication; append-safe journals; and transaction-scoped artifact rollback.
 
 ### Changed
 
@@ -100,6 +101,7 @@
 - Fixed parsing of POSIX `$EDITOR` commands that contain quoted arguments or executable paths with spaces.
 - Fixed persisted Agent Hub rows losing the explicit caller model role when a subagent used a model override, preserving role provenance across restarts.
 - Fixed unobserved promise rejections in browser helpers (such as `tab.waitForResponse()`) causing tab workers to hang or crash.
+- Fresh companion snapshots now expose the exact live footer-loader message with grapheme-safe truncation, while sink-free sessions avoid loader traversal; cancellation coalesces across asynchronous abort teardown and shutdown publishes only committed authoritative state.
 
 ## [17.2.9] - 2026-08-05
 
@@ -164,13 +166,6 @@
 ### Changed
 
 - Upgraded the bundled omptype schema engine: intersection and pipe operators, bigint and RegExp literals in the string DSL, Standard Schema V1 interop, JSON Schema import via fromJsonSchema(), and richer union/collection error reporting.
-### Added
-
-- Added Fresh's opt-in native-TUI companion for direct local interactive sessions: authenticated bounded status snapshots; frozen HMAC-authenticated cancel/snapshot commands; one-shot capability consumption before public extensions with child-environment filtering; one lifecycle-stable consume-only host listener; exact pre-publication materialization; a single `SessionLifecycleTransaction` backed by a dedicated typed owner/checkpoint module; an initial durable retained preimage before destructive quiescence plus a later authoritative checkpoint; fail-closed selection of advisor/yield, Bash, concrete async, launch-completion, tool/directive/permission/mount, artifact, and callback ownership; post-host delivery, receipt settlement, provider/advisor finalization, callbacks, reconnection, and fence release; exact retained/target rollback with publication suppression on required cleanup or false journal restoration; exact persisted `/tree` leaf resume; and writer-fenced artifact/advisor continuity for fork, non-root branch, and `/btw`.
-
-### Fixed
-
-- Fresh companion snapshots now expose the exact live OMP footer-loader message, including capitalized `Working…` and streamed intent text, instead of forcing Fresh to infer it from coarse agent state.
 
 ## [17.2.7] - 2026-08-03
 

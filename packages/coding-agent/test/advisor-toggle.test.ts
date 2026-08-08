@@ -570,11 +570,22 @@ describe("AgentSession advisor toggle", () => {
 		const entryId = sessionManager.getLeafId();
 		if (!entryId) throw new Error("Expected a branchable entry");
 		const createBranchedSession = sessionManager.createBranchedSession.bind(sessionManager);
-		vi.spyOn(sessionManager, "createBranchedSession").mockImplementation(parentId => {
-			const result = createBranchedSession(parentId);
+		function createBranchedSessionMock(parentId: string): string | undefined;
+		function createBranchedSessionMock(
+			parentId: string,
+			beforeJournalPublish: (newSessionFile: string) => void | Promise<void>,
+		): Promise<string | undefined>;
+		function createBranchedSessionMock(
+			parentId: string,
+			beforeJournalPublish?: (newSessionFile: string) => void | Promise<void>,
+		): string | undefined | Promise<string | undefined> {
+			const result = beforeJournalPublish
+				? createBranchedSession(parentId, beforeJournalPublish)
+				: createBranchedSession(parentId);
 			queueMicrotask(() => appendAdvisorCost(advisor, 9, 3));
 			return result;
-		});
+		}
+		vi.spyOn(sessionManager, "createBranchedSession").mockImplementation(createBranchedSessionMock);
 
 		await expect(session.branch(entryId)).resolves.toMatchObject({ cancelled: false });
 		const replacementSessionFile = session.sessionFile;
@@ -591,8 +602,8 @@ describe("AgentSession advisor toggle", () => {
 		appendAdvisorCost(advisor, 0.5, 1);
 		const previousSessionFile = sessionManager.getSessionFile();
 		const fork = sessionManager.fork.bind(sessionManager);
-		vi.spyOn(sessionManager, "fork").mockImplementation(async () => {
-			const result = await fork();
+		vi.spyOn(sessionManager, "fork").mockImplementation(async beforeJournalPublish => {
+			const result = await fork(beforeJournalPublish);
 			// Reproduce the outgoing advisor finalizing after the fork selected its file.
 			appendAdvisorCost(advisor, 9, 2);
 			return result;

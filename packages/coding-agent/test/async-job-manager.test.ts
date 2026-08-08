@@ -665,6 +665,53 @@ describe("AsyncJobManager", () => {
 		await expect(reap).resolves.toBe(true);
 		expect(manager.getJob("hung-1")?.status).toBe("cancelled");
 	});
+	test("counts filtered job state without materializing snapshots", async () => {
+		const runningGate = Promise.withResolvers<void>();
+		const deliveryGate = Promise.withResolvers<void>();
+		const manager = new AsyncJobManager({ retentionMs: 60_000 });
+		manager.registerDeliverySink("Main", async () => {
+			await deliveryGate.promise;
+		});
+		const runningId = manager.register(
+			"bash",
+			"still running",
+			async () => {
+				await runningGate.promise;
+				return "done";
+			},
+			{ ownerId: "Main" },
+		);
+		const failedId = manager.register(
+			"task",
+			"failed",
+			async () => {
+				throw new Error("failed");
+			},
+			{ ownerId: "Main" },
+		);
+		manager.register(
+			"task",
+			"other owner",
+			async () => {
+				throw new Error("other failure");
+			},
+			{ ownerId: "Other" },
+		);
+		await manager.getJob(failedId)?.promise;
+
+		const ownerFilter = { ownerId: "Main" };
+		expect(manager.countRunningJobs(ownerFilter)).toBe(1);
+		expect(manager.countRecentFailures(5, ownerFilter)).toBe(1);
+		expect(manager.countPendingDeliveries(ownerFilter)).toBe(1);
+		const runningJob = manager.getJob(runningId);
+		if (!runningJob) throw new Error("expected running job");
+		expect(manager.countRunningJobs({ ...ownerFilter, excludeJobs: new Set([runningJob]) })).toBe(0);
+
+		runningGate.resolve();
+		deliveryGate.resolve();
+		await manager.waitForAll();
+		await manager.drainDeliveries({ timeoutMs: 500 });
+	});
 });
 
 describe("AsyncJobManager smart poll-wait escalation", () => {

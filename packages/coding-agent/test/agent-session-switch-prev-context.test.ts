@@ -15,6 +15,7 @@ import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensi
 import type { Extension } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { DaemonCompletionNotification } from "@oh-my-pi/pi-coding-agent/launch/protocol";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { AsyncJobSnapshot } from "@oh-my-pi/pi-coding-agent/session/agent-session-types";
 import {
 	ASYNC_INLINE_RESULT_MAX_CHARS,
 	type AsyncResultEntry,
@@ -26,6 +27,7 @@ import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { type AdvisorStats, SessionAdvisors } from "@oh-my-pi/pi-coding-agent/session/session-advisors";
 import type { BuildSessionContextOptions, SessionContext } from "@oh-my-pi/pi-coding-agent/session/session-context";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import { SessionLifecycleTransaction } from "@oh-my-pi/pi-coding-agent/session/session-lifecycle-transaction";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { OutputSink } from "@oh-my-pi/pi-coding-agent/session/streaming-output";
 import type { XdevState } from "@oh-my-pi/pi-coding-agent/tools/xdev";
@@ -392,6 +394,94 @@ describe("AgentSession.switchSession previous-context build", () => {
 			{ type: "session_ready", sessionFile: targetSessionFile, messages: 2 },
 		]);
 	});
+	it("rejects duplicate and out-of-order lifecycle capture and publication steps", async () => {
+		const lifecycle = new SessionLifecycleTransaction({
+			captureRetainedCheckpoint: async () => ({ restore: async () => {} }),
+			beginOwnership: () => ({
+				ready: async () => {},
+				quarantineBash: async () => {},
+				acquire: async () => {},
+				markTarget: () => {},
+				prepareCommit: async () => {},
+				selectCommit: async () => {},
+				activateCommit: async () => {},
+				prepareRollback: async () => {},
+				selectRollback: async () => {},
+				activateRollback: async () => {},
+			}),
+			activateFence: () => {},
+		});
+
+		expect(() => lifecycle.markTarget()).toThrow("Lifecycle target cannot be marked from phase fenced");
+		await lifecycle.captureRetained();
+		await expect(lifecycle.captureRetained()).rejects.toThrow(
+			"Lifecycle retained capture cannot start from phase checkpointed",
+		);
+		await lifecycle.recaptureRetained();
+		await lifecycle.acquireOwnership();
+		lifecycle.markTarget();
+		expect(() => lifecycle.markTarget()).toThrow("Lifecycle target cannot be marked from phase target-marked");
+		lifecycle.markPublicationStarted();
+		expect(() => lifecycle.markPublicationStarted()).toThrow("Lifecycle publication already started");
+	});
+
+	for (const transition of ["newSession", "fork", "switchSession"] as const) {
+		it(`runs the host session fence before retained capture${transition === "fork" ? "" : " or abort"} for ${transition}`, async () => {
+			const tempDir = TempDir.createSync(`@pi-${transition}-host-fence-order-`);
+			tempDirs.push(tempDir);
+			const { session, sessionManager, extensionRunner } = buildSession(tempDir);
+			sessionManager.appendMessage({ role: "user", content: "retained", timestamp: 1 });
+			await sessionManager.ensureOnDisk();
+
+			let targetSessionFile: string | undefined;
+			if (transition === "switchSession") {
+				const target = SessionManager.create(tempDir.path(), tempDir.path());
+				target.appendMessage({ role: "user", content: "target", timestamp: 2 });
+				await target.ensureOnDisk();
+				targetSessionFile = target.getSessionFile();
+				await target.close();
+				if (!targetSessionFile) throw new Error("Expected target session file");
+			}
+
+			const order: string[] = [];
+			const hasHandlers = extensionRunner.hasHandlers.bind(extensionRunner);
+			vi.spyOn(extensionRunner, "hasHandlers").mockImplementation(eventType => {
+				if (eventType === "session_before_switch") return true;
+				return hasHandlers(eventType);
+			});
+			const emit = extensionRunner.emit.bind(extensionRunner);
+			vi.spyOn(extensionRunner, "emit").mockImplementation(event => {
+				if (event.type === "session_before_switch") order.push("public");
+				return emit(event);
+			});
+			const beforeMutation = extensionRunner.emitHostInternalBeforeSessionMutation.bind(extensionRunner);
+			vi.spyOn(extensionRunner, "emitHostInternalBeforeSessionMutation").mockImplementation(event => {
+				if (event.type === "session_switch") order.push("host");
+				return beforeMutation(event);
+			});
+			const capture = sessionManager.capturePersistedSessionFile.bind(sessionManager);
+			vi.spyOn(sessionManager, "capturePersistedSessionFile").mockImplementation(() => {
+				order.push("capture");
+				return capture();
+			});
+			const abort = session.abort.bind(session);
+			vi.spyOn(session, "abort").mockImplementation(options => {
+				order.push("abort");
+				return abort(options);
+			});
+
+			const result =
+				transition === "newSession"
+					? session.newSession()
+					: transition === "fork"
+						? session.fork()
+						: session.switchSession(targetSessionFile!);
+			await expect(result).resolves.toBe(true);
+			expect(order.slice(0, transition === "fork" ? 3 : 4)).toEqual(
+				transition === "fork" ? ["public", "host", "capture"] : ["public", "host", "capture", "abort"],
+			);
+		});
+	}
 
 	it("materializes target journal mutations before session_ready publication", async () => {
 		const tempDir = TempDir.createSync("@pi-switch-materialized-ready-");
@@ -615,24 +705,19 @@ describe("AgentSession.switchSession previous-context build", () => {
 			undefined,
 			undefined,
 			undefined,
-			[
-				{
-					extension: hostExtension,
-					afterDispatch: async event => {
-						hostEvents.push(event.type);
-						if (event.type !== "session_ready") return;
-						expect(artifactSealed).toBe(true);
-						expect(advisorSelected).toBe(true);
-						expect(bashSelected).toBe(true);
-						expect(asyncSelected).toBe(true);
-						expect(launchSelected).toBe(true);
-						sessionManager.appendMessage({ role: "user", content: "persisted target host frame", timestamp: 3 });
-						await sessionManager.flush();
-						targetFramePersisted = true;
-						throw hostFault;
-					},
+			{
+				extension: hostExtension,
+				afterDispatch: async event => {
+					hostEvents.push(event.type);
+					if (event.type !== "session_ready") return;
+					sessionManager.appendCustomEntry("test_host_frame", { text: "persisted target host frame" });
+					await sessionManager.flush();
+					targetFramePersisted = (await Bun.file(targetSessionFile).text()).includes(
+						"persisted target host frame",
+					);
+					throw hostFault;
 				},
-			],
+			},
 		);
 		const containedErrors: string[] = [];
 		extensionRunner.onError(error => containedErrors.push(error.error));
@@ -747,14 +832,12 @@ describe("AgentSession.switchSession previous-context build", () => {
 			undefined,
 			undefined,
 			undefined,
-			[
-				{
-					extension: hostExtension,
-					afterDispatch: event => {
-						hostEvents.push(event.type);
-					},
+			{
+				extension: hostExtension,
+				afterDispatch: event => {
+					hostEvents.push(event.type);
 				},
-			],
+			},
 		);
 		const session = new AgentSession({
 			agent: new Agent({
@@ -794,31 +877,40 @@ describe("AgentSession.switchSession previous-context build", () => {
 		expect(await Bun.file(targetSessionFile).text()).toBe(targetRaw);
 	});
 
-	it("restores exact pre-abort state when new-session flush fails before the post-quiescence capture", async () => {
+	it("preserves durable journal mutations when new-session flush fails before the post-quiescence capture", async () => {
 		const tempDir = TempDir.createSync("@pi-new-pre-abort-checkpoint-");
 		tempDirs.push(tempDir);
 		const { session, sessionManager } = buildSession(tempDir);
 		sessionManager.appendMessage({ role: "user", content: "retained before new", timestamp: 1 });
 		const failure = new Error("new-session retained flush failed after mutation");
+		const mutationText = "durable new-session mutation";
 		const fixture = await installDurableMutationBeforePostQuiescenceCapture(
 			session,
 			sessionManager,
-			"durable new-session mutation",
+			mutationText,
 			failure,
 		);
 
 		await expect(session.newSession()).rejects.toBe(failure);
 
-		expect(fixture.flushCalls()).toBe(2);
-		expect(fixture.durableMutationRaw()).toContain("durable new-session mutation");
-		expect(fixture.captureCalls()).toBe(1);
+		const durableMutationRaw = fixture.durableMutationRaw();
+		if (durableMutationRaw === undefined) throw new Error("Expected durable new-session mutation bytes");
+		expect(fixture.flushCalls()).toBe(3);
+		expect(durableMutationRaw).toContain(mutationText);
+		expect(fixture.captureCalls()).toBe(2); // Initial checkpoint plus rollback preservation; recapture was not reached.
 		expect(session.sessionFile).toBe(fixture.retainedSessionFile);
-		expect(sessionManager.getEntries()).toEqual(fixture.retainedEntries);
+		expect(sessionManager.getEntries()).toEqual([
+			...fixture.retainedEntries,
+			expect.objectContaining({
+				type: "message",
+				message: expect.objectContaining({ role: "user", content: mutationText, timestamp: 99 }),
+			}),
+		]);
 		expect(session.messages).toEqual(fixture.retainedMessages);
-		expect(await fs.readFile(fixture.retainedSessionFile, "utf8")).toBe(fixture.retainedRaw);
+		expect(await fs.readFile(fixture.retainedSessionFile, "utf8")).toBe(durableMutationRaw);
 	});
 
-	it("restores exact pre-abort state when switch flush fails before the post-quiescence capture", async () => {
+	it("preserves durable journal mutations when switch flush fails before the post-quiescence capture", async () => {
 		const tempDir = TempDir.createSync("@pi-switch-pre-abort-checkpoint-");
 		tempDirs.push(tempDir);
 		const { session, sessionManager } = buildSession(tempDir);
@@ -833,22 +925,31 @@ describe("AgentSession.switchSession previous-context build", () => {
 		await targetManager.close();
 
 		const failure = new Error("switch retained flush failed after mutation");
+		const mutationText = "durable switch mutation";
 		const fixture = await installDurableMutationBeforePostQuiescenceCapture(
 			session,
 			sessionManager,
-			"durable switch mutation",
+			mutationText,
 			failure,
 		);
 
 		await expect(session.switchSession(targetSessionFile)).rejects.toBe(failure);
 
-		expect(fixture.flushCalls()).toBe(2);
-		expect(fixture.durableMutationRaw()).toContain("durable switch mutation");
-		expect(fixture.captureCalls()).toBe(1);
+		const durableMutationRaw = fixture.durableMutationRaw();
+		if (durableMutationRaw === undefined) throw new Error("Expected durable switch mutation bytes");
+		expect(fixture.flushCalls()).toBe(3);
+		expect(durableMutationRaw).toContain(mutationText);
+		expect(fixture.captureCalls()).toBe(2); // Initial checkpoint plus rollback preservation; recapture was not reached.
 		expect(session.sessionFile).toBe(fixture.retainedSessionFile);
-		expect(sessionManager.getEntries()).toEqual(fixture.retainedEntries);
+		expect(sessionManager.getEntries()).toEqual([
+			...fixture.retainedEntries,
+			expect.objectContaining({
+				type: "message",
+				message: expect.objectContaining({ role: "user", content: mutationText, timestamp: 99 }),
+			}),
+		]);
 		expect(session.messages).toEqual(fixture.retainedMessages);
-		expect(await fs.readFile(fixture.retainedSessionFile, "utf8")).toBe(fixture.retainedRaw);
+		expect(await fs.readFile(fixture.retainedSessionFile, "utf8")).toBe(durableMutationRaw);
 	});
 
 	it("uses the successful post-quiescence capture as the authoritative rollback checkpoint", async () => {
@@ -885,6 +986,55 @@ describe("AgentSession.switchSession previous-context build", () => {
 		expect(sessionManager.getEntries()).toEqual(postQuiescenceEntries);
 		expect(session.messages).toEqual(postQuiescenceMessages);
 		expect(await fs.readFile(fixture.retainedSessionFile, "utf8")).toBe(postQuiescenceRaw);
+	});
+
+	it("preserves a retained append accepted after the rollback checkpoint", async () => {
+		const tempDir = TempDir.createSync("@pi-switch-post-checkpoint-append-");
+		tempDirs.push(tempDir);
+		const { session, sessionManager } = buildSession(tempDir);
+		sessionManager.appendMessage({ role: "user", content: "retained before checkpoint", timestamp: 1 });
+		sessionManager.appendMessage(assistantMsg("retained assistant"));
+		await sessionManager.ensureOnDisk();
+		await sessionManager.flush();
+		const retainedSessionFile = sessionManager.getSessionFile();
+		if (!retainedSessionFile) throw new Error("Expected retained session file");
+
+		const targetManager = SessionManager.create(tempDir.path(), tempDir.path());
+		targetManager.appendMessage({ role: "user", content: "target", timestamp: 2 });
+		targetManager.appendMessage(assistantMsg("target assistant"));
+		await targetManager.ensureOnDisk();
+		await targetManager.flush();
+		const targetSessionFile = targetManager.getSessionFile();
+		if (!targetSessionFile) throw new Error("Expected target session file");
+		await targetManager.close();
+
+		let postCheckpointEntryId: string | undefined;
+		const captureTarget = sessionManager.capturePersistedSessionFileAt.bind(sessionManager);
+		vi.spyOn(sessionManager, "capturePersistedSessionFileAt").mockImplementation(async sessionFile => {
+			const snapshot = await captureTarget(sessionFile);
+			postCheckpointEntryId = sessionManager.appendCustomEntry("post_checkpoint_extension", {
+				text: "must survive retained rollback",
+			});
+			await sessionManager.flush();
+			return snapshot;
+		});
+
+		const targetFailure = new Error("target adoption failed after retained append");
+		const setSessionFile = sessionManager.setSessionFile.bind(sessionManager);
+		vi.spyOn(sessionManager, "setSessionFile").mockImplementation(async sessionFile => {
+			await setSessionFile(sessionFile);
+			throw targetFailure;
+		});
+
+		await expect(session.switchSession(targetSessionFile)).rejects.toBe(targetFailure);
+
+		if (!postCheckpointEntryId) throw new Error("Expected post-checkpoint append");
+		expect(session.sessionFile).toBe(retainedSessionFile);
+		expect(sessionManager.getEntry(postCheckpointEntryId)).toMatchObject({
+			type: "custom",
+			customType: "post_checkpoint_extension",
+		});
+		expect(await fs.readFile(retainedSessionFile, "utf8")).toContain("must survive retained rollback");
 	});
 
 	it("emits new-session ready only after setup completes", async () => {
@@ -1493,8 +1643,8 @@ describe("AgentSession.switchSession previous-context build", () => {
 		let replacementSessionFile: string | undefined;
 		const fork = sessionManager.fork.bind(sessionManager);
 		const failure = new Error("fork failed after replacement identity");
-		vi.spyOn(sessionManager, "fork").mockImplementation(async () => {
-			const result = await fork();
+		vi.spyOn(sessionManager, "fork").mockImplementation(async beforeJournalPublish => {
+			const result = await fork(beforeJournalPublish);
 			replacementSessionFile = result?.newSessionFile;
 			throw failure;
 		});
@@ -2175,15 +2325,21 @@ describe("AgentSession.switchSession previous-context build", () => {
 				id: `${transition}-discarded-running-job`,
 				ownerId: "Main",
 			});
+			let snapshotAtPublication: AsyncJobSnapshot | null | undefined;
 			const emitWithHostCompletion = extensionRunner.emitWithHostCompletion.bind(extensionRunner);
 			vi.spyOn(extensionRunner, "emitWithHostCompletion").mockImplementation(
 				async (event, finalizeBeforeHostCompletion) => {
-					if (event.type === "session_ready") {
-						jobGate.resolve(jobMarker);
-						await asyncManager.waitForOwnerJobs("Main");
-						await asyncManager.drainDeliveries({ filter: { ownerId: "Main" } });
+					if (event.type !== "session_ready") {
+						return emitWithHostCompletion(event, finalizeBeforeHostCompletion);
 					}
-					return emitWithHostCompletion(event, finalizeBeforeHostCompletion);
+					jobGate.resolve(jobMarker);
+					await asyncManager.waitForOwnerJobs("Main");
+					await asyncManager.drainDeliveries({ filter: { ownerId: "Main" } });
+					return emitWithHostCompletion(event, async () => {
+						const continuation = await finalizeBeforeHostCompletion?.();
+						snapshotAtPublication = session.getAsyncJobSnapshot();
+						return continuation;
+					});
 				},
 			);
 
@@ -2194,6 +2350,9 @@ describe("AgentSession.switchSession previous-context build", () => {
 			await expect(queuedReceipt!).rejects.toThrow("Yield queue entry cleared before dispatch");
 			expect(receiptRejections).toBe(1);
 			expect(session.hasPendingAsyncWork()).toBe(false);
+			expect(snapshotAtPublication?.running).toEqual([]);
+			expect(snapshotAtPublication?.recent).toEqual([]);
+			expect(snapshotAtPublication?.delivery).toMatchObject({ queued: 0, pendingJobIds: [] });
 
 			await session.sendUserMessage("fresh target turn");
 			const targetContexts = JSON.stringify(primaryMock.calls.map(call => call.context.messages));
@@ -2202,7 +2361,47 @@ describe("AgentSession.switchSession previous-context build", () => {
 		});
 	}
 
-	it("restores target artifact overwrite/create and reuses the rolled-back allocator id", async () => {
+	it("does not wait for retained async formatting before publishing a new target", async () => {
+		const tempDir = TempDir.createSync("@pi-new-async-format-fence-");
+		tempDirs.push(tempDir);
+		const asyncManager = new AsyncJobManager({ retentionMs: 60_000 });
+		const { session, sessionManager, extensionRunner } = buildSession(tempDir, { asyncJobManager: asyncManager });
+		sessionManager.appendMessage({ role: "user", content: "retained", timestamp: 1 });
+		await sessionManager.ensureOnDisk();
+
+		const formattingStarted = Promise.withResolvers<void>();
+		const allowFormatting = Promise.withResolvers<void>();
+		vi.spyOn(sessionManager, "allocateArtifactPath").mockImplementation(async () => {
+			formattingStarted.resolve();
+			await allowFormatting.promise;
+			return {};
+		});
+		const jobGate = Promise.withResolvers<string>();
+		asyncManager.register("task", "retained formatting job", () => jobGate.promise, {
+			id: "retained-formatting-job",
+			ownerId: "Main",
+		});
+		jobGate.resolve("x".repeat(ASYNC_INLINE_RESULT_MAX_CHARS + 1));
+		await formattingStarted.promise;
+
+		const readyReached = Promise.withResolvers<void>();
+		const emitWithHostCompletion = extensionRunner.emitWithHostCompletion.bind(extensionRunner);
+		vi.spyOn(extensionRunner, "emitWithHostCompletion").mockImplementation((event, finalizeBeforeHostCompletion) => {
+			if (event.type === "session_ready") readyReached.resolve();
+			return emitWithHostCompletion(event, finalizeBeforeHostCompletion);
+		});
+		const transition = session.newSession();
+		try {
+			await readyReached.promise;
+			await expect(transition).resolves.toBe(true);
+		} finally {
+			allowFormatting.resolve();
+			await transition.catch(() => undefined);
+		}
+		await asyncManager.drainDeliveries({ filter: { ownerId: "Main" } });
+	});
+
+	it("preserves an external target overwrite, removes transaction-created artifacts, and reuses their id", async () => {
 		const tempDir = TempDir.createSync("@pi-switch-target-artifact-rollback-");
 		tempDirs.push(tempDir);
 		const { session, sessionManager, extensionRunner } = buildSession(tempDir);
@@ -2254,7 +2453,7 @@ describe("AgentSession.switchSession previous-context build", () => {
 		await expect(session.switchSession(targetSessionFile)).rejects.toBe(failure);
 		expect(session.sessionFile).toBe(retainedSessionFile);
 		expect(await Bun.file(targetSessionFile).text()).toBe(targetRaw);
-		expect(await Bun.file(existingArtifactPath).text()).toBe("target original");
+		expect(await Bun.file(existingArtifactPath).text()).toBe("target overwrite");
 		expect(rolledBackArtifactPath).toBeString();
 		expect(await Bun.file(rolledBackArtifactPath!).exists()).toBe(false);
 
@@ -3107,7 +3306,7 @@ describe("AgentSession.switchSession previous-context build", () => {
 			sessionName: "retained title",
 			workspace: [retainedWorkspace],
 			artifactFiles: retainedArtifactFiles,
-			retainedArtifactContent: "retained artifact",
+			retainedArtifactContent: "rolled back overwrite",
 			rolledBackArtifactExists: false,
 			messages: retainedMessages,
 			raw: retainedRaw,
@@ -3132,7 +3331,7 @@ describe("AgentSession.switchSession previous-context build", () => {
 		expect(partialEntryId).toBeString();
 		expect(sessionManager.getEntry(partialEntryId!)).toBeUndefined();
 		expect((await artifactManager.listFiles()).sort()).toEqual(retainedArtifactFiles);
-		expect(await Bun.file(retainedArtifactPath).text()).toBe("retained artifact");
+		expect(await Bun.file(retainedArtifactPath).text()).toBe("rolled back overwrite");
 		expect(rolledBackArtifactPath).toBeString();
 		expect(await Bun.file(rolledBackArtifactPath!).exists()).toBe(false);
 		const reusedArtifactId = await sessionManager.saveArtifact("committed after rollback", "tree");
@@ -3503,7 +3702,7 @@ describe("AgentSession.switchSession previous-context build", () => {
 			targetEntryPresent: false,
 			targetRawPresent: false,
 			artifactFiles: retainedArtifactFiles,
-			retainedArtifactContent: "retained artifact",
+			retainedArtifactContent: "target overwrite",
 			rolledBackArtifactExists: false,
 			directives: [retainedDirective],
 			retainedPreview: true,
@@ -3515,7 +3714,7 @@ describe("AgentSession.switchSession previous-context build", () => {
 		});
 		expect(sessionManager.getLeafId()).toBe(retainedLeafId);
 		expect(sessionManager.getEntry(partialEntryId!)).toBeUndefined();
-		expect(await Bun.file(retainedArtifactPath).text()).toBe("retained artifact");
+		expect(await Bun.file(retainedArtifactPath).text()).toBe("target overwrite");
 		expect(await Bun.file(rolledBackArtifactPath!).exists()).toBe(false);
 		expect(session.getCheckpointState()).toEqual(checkpoint);
 		expect(asyncManager.getJob(asyncJobId)?.status).toBe("completed");
@@ -3584,7 +3783,7 @@ describe("AgentSession.switchSession previous-context build", () => {
 		expect(advisorReceiptSettled).toBe(true);
 	}, 15_000);
 
-	it("waits out a live streaming artifact writer before a failed tree publication rolls back", async () => {
+	it("waits out a live streaming artifact writer, preserves a later overwrite, and removes created paths", async () => {
 		const tempDir = TempDir.createSync("@pi-tree-streaming-artifact-rollback-");
 		tempDirs.push(tempDir);
 		const { session, sessionManager, extensionRunner } = buildSession(tempDir);
@@ -3603,8 +3802,6 @@ describe("AgentSession.switchSession previous-context build", () => {
 			liveArtifactRelease?.();
 			throw new Error("Expected leased streaming artifact path");
 		}
-		const exactStream = "stream head π\nstream tail β\n";
-		const exactBytes = new TextEncoder().encode(exactStream);
 		const sink = new OutputSink({
 			artifactPath: liveArtifactPath,
 			artifactId: liveArtifactId,
@@ -3658,7 +3855,7 @@ describe("AgentSession.switchSession previous-context build", () => {
 			await expect(navigation).rejects.toBe(failure);
 
 			expect(await sessionManager.getArtifactPath(liveArtifactId)).toBe(liveArtifactPath);
-			expect(new Uint8Array(await Bun.file(liveArtifactPath).arrayBuffer())).toEqual(exactBytes);
+			expect(await Bun.file(liveArtifactPath).text()).toBe("transaction overwrite");
 			expect(rolledBackArtifactPath).toBeString();
 			expect(await Bun.file(rolledBackArtifactPath!).exists()).toBe(false);
 
@@ -4193,7 +4390,7 @@ describe("AgentSession.switchSession previous-context build", () => {
 		expect(sessionManager.getLeafId()).toBe(retainedLeafId);
 		expect(await Bun.file(targetSessionFile).text()).toBe(targetRaw);
 		expect(await Bun.file(retainedArtifactPath).text()).toBe("retained artifact bytes");
-		expect(await Bun.file(targetArtifactPath).text()).toBe("target artifact preimage");
+		expect(await Bun.file(targetArtifactPath).text()).toBe("target artifact provisional overwrite");
 		expect(targetArtifactCreatedPath).toBeString();
 		expect(await Bun.file(targetArtifactCreatedPath!).exists()).toBe(false);
 		expect(
@@ -4546,18 +4743,16 @@ describe("AgentSession.switchSession previous-context build", () => {
 			undefined,
 			undefined,
 			undefined,
-			[
-				{
-					extension: hostExtension,
-					afterDispatch: async event => {
-						if (event.type !== "session_ready") return;
-						expect(ordinaryHandlerRuns).toBe(1);
-						expect(session.sessionFile).toBe(targetSessionFile);
-						hostPublicationStarted.resolve();
-						await releaseHostPublication.promise;
-					},
+			{
+				extension: hostExtension,
+				afterDispatch: async event => {
+					if (event.type !== "session_ready") return;
+					expect(ordinaryHandlerRuns).toBe(1);
+					expect(session.sessionFile).toBe(targetSessionFile);
+					hostPublicationStarted.resolve();
+					await releaseHostPublication.promise;
 				},
-			],
+			},
 		);
 		const asyncManager = new AsyncJobManager({ retentionMs: 60_000 });
 		const session = new AgentSession({

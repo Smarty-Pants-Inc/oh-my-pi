@@ -51,7 +51,7 @@ import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
 import type { MemoryRuntimeContext } from "../../memory-backend";
 import type { CustomEditor } from "../../modes/components/custom-editor";
 import type { Theme } from "../../modes/theme/theme";
-import type { AsyncJobSnapshot } from "../../session/agent-session";
+import type { AsyncJobCounts, AsyncJobSnapshot } from "../../session/agent-session";
 import type { CompactMode } from "../../session/compact-modes";
 import type { ExecutionEnvironmentProvider } from "../../session/execution-environment";
 import type { CustomMessage, CustomMessagePayload } from "../../session/messages";
@@ -425,6 +425,8 @@ export interface ExtensionContext {
 	isCompacting(): boolean;
 	/** Get a read-only snapshot of async jobs owned by this session. */
 	getAsyncJobSnapshot(): AsyncJobSnapshot | null;
+	/** Get count-only async job state owned by this session. */
+	getAsyncJobCounts(): AsyncJobCounts | null;
 	/** Compact the session context (interactive mode shows UI). */
 	compact(instructionsOrOptions?: string | CompactOptions): Promise<void>;
 	/** Whether UI is available (false in print/RPC mode) */
@@ -443,8 +445,8 @@ export interface ExtensionContext {
 	models: ExtensionModelQuery;
 	/** Whether the agent is idle (not streaming) */
 	isIdle(): boolean;
-	/** Abort the current agent operation */
-	abort(): void;
+	/** Abort the current agent operation and wait for its teardown. */
+	abort(): Promise<void>;
 	/** Whether any visible or hidden message is waiting for this session. */
 	hasPendingMessages(): boolean;
 	/** Gracefully shutdown and exit. */
@@ -1034,9 +1036,9 @@ export type ExtensionEvent =
 	| ToolApprovalRequestedEvent
 	| ToolApprovalResolvedEvent;
 
-/** Host-only fence emitted immediately before a committed branch/tree mutation. */
+/** Host-only fence emitted before retained capture for session switches and before branch/tree mutation. */
 export interface HostInternalSessionMutationEvent {
-	type: "session_branch" | "session_tree";
+	type: "session_switch" | "session_branch" | "session_tree";
 }
 
 /** Host-owned extension binding. Never exposed through public discovery or forwarded to child sessions. */
@@ -1611,7 +1613,7 @@ export interface ExtensionContextActions {
 	getModel: () => Model | undefined;
 	isIdle: () => boolean;
 	isCompacting: () => boolean;
-	abort: () => void;
+	abort: () => void | Promise<void>;
 	hasPendingMessages: () => boolean;
 	shutdown: () => void;
 	getContextUsage: () => ContextUsage | undefined;

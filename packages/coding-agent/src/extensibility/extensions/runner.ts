@@ -16,7 +16,7 @@ import type { Settings } from "../../config/settings";
 import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
 import type { MemoryRuntimeContext } from "../../memory-backend";
 import { type Theme, theme } from "../../modes/theme/theme";
-import type { AsyncJobSnapshot } from "../../session/agent-session";
+import type { AsyncJobCounts, AsyncJobSnapshot } from "../../session/agent-session";
 import type { SessionManager } from "../../session/session-manager";
 import type { BranchHandler, NavigateTreeHandler, NewSessionHandler } from "../session-handler-types";
 import { ManagedTimers } from "./managed-timers";
@@ -64,6 +64,8 @@ import type {
 	SessionStopEventResult,
 	SystemPromptBuilder,
 	TerminalInputHandler,
+	ToolApprovalRequestedEvent,
+	ToolApprovalResolvedEvent,
 	ToolCallEvent,
 	ToolCallEventResult,
 	ToolResultEvent,
@@ -84,6 +86,7 @@ export type ExtensionErrorListener = (error: ExtensionError) => void;
 
 export const EXTENSION_HANDLER_TIMEOUT_MS = 30_000;
 let extensionHandlerTimeoutMs = EXTENSION_HANDLER_TIMEOUT_MS;
+const FRESH_SNAPSHOT_ACK_FAILURE = Symbol.for("oh-my-pi.fresh-omp.snapshot-ack-failure");
 
 function throwUnsupportedServiceTierAction(): never {
 	throw new Error("This extension host does not support service-tier actions");
@@ -194,8 +197,9 @@ async function raceHandlerWithTimeout<T>(
 	work: (handlerSignal: AbortSignal) => Promise<T> | T,
 	timeoutMs: number,
 	signal?: AbortSignal,
+	invokeWhenAborted = false,
 ): Promise<T | typeof EXTENSION_HANDLER_TIMEOUT | typeof EXTENSION_HANDLER_ABORTED> {
-	if (signal?.aborted) return EXTENSION_HANDLER_ABORTED;
+	if (signal?.aborted && !invokeWhenAborted) return EXTENSION_HANDLER_ABORTED;
 
 	const timeoutController = new AbortController();
 	const handlerSignal = signal ? AbortSignal.any([signal, timeoutController.signal]) : timeoutController.signal;
@@ -209,8 +213,8 @@ async function raceHandlerWithTimeout<T>(
 		resolveInterrupt(EXTENSION_HANDLER_TIMEOUT);
 	}, timeoutMs);
 	try {
-		if (signal?.aborted) return EXTENSION_HANDLER_ABORTED;
 		const workPromise = Promise.resolve(work(handlerSignal));
+		if (signal?.aborted) resolveInterrupt(EXTENSION_HANDLER_ABORTED);
 		const result = await Promise.race([workPromise, interruptPromise]);
 		if (result === EXTENSION_HANDLER_TIMEOUT) {
 			await Promise.race([
@@ -346,12 +350,13 @@ export class ExtensionRunner {
 	#isIdleFn: () => boolean = () => true;
 	#isCompactingFn: () => boolean = () => false;
 	#waitForIdleFn: () => Promise<void> = async () => {};
-	#abortFn: () => void = () => {};
+	#abortFn: () => void | Promise<void> = () => {};
 	#hasPendingMessagesFn: () => boolean = () => false;
 	#getContextUsageFn: () => ContextUsage | undefined = () => undefined;
 	#compactFn: (instructionsOrOptions?: string | CompactOptions) => Promise<void> = async () => {};
 	#getSystemPromptFn: () => string[] = () => [];
 	#getAsyncJobSnapshotFn: () => AsyncJobSnapshot | null = () => null;
+	#getAsyncJobCountsFn: () => AsyncJobCounts | null = () => null;
 	#newSessionHandler: NewSessionHandler = async () => ({ cancelled: false });
 	#branchHandler: BranchHandler = async () => ({ cancelled: false });
 	#navigateTreeHandler: NavigateTreeHandler = async () => ({ cancelled: false });
@@ -361,7 +366,7 @@ export class ExtensionRunner {
 	#getMemoryFn?: () => MemoryRuntimeContext | undefined;
 	#commandDiagnostics: Array<{ type: string; message: string; path: string }> = [];
 	readonly #publicExtensions: Extension[];
-	readonly #hostInternalExtensions: readonly HostInternalExtensionBinding[];
+	readonly #hostInternalExtension?: HostInternalExtensionBinding;
 	private readonly extensions: Extension[];
 	#initialized = false;
 	/**
@@ -496,17 +501,18 @@ export class ExtensionRunner {
 		private readonly settings?: Settings,
 		private readonly localProtocolOptions?: LocalProtocolOptions,
 		getAsyncJobSnapshot?: () => AsyncJobSnapshot | null,
-		hostInternalExtensions: readonly HostInternalExtensionBinding[] = [],
+		hostInternalExtension?: HostInternalExtensionBinding,
+		getAsyncJobCounts?: () => AsyncJobCounts | null,
 	) {
 		this.#uiContext = noOpUIContext;
 		this.#getMemoryFn = getMemory;
 		this.#getAsyncJobSnapshotFn = getAsyncJobSnapshot ?? (() => null);
-		this.#hostInternalExtensions = hostInternalExtensions;
+		this.#getAsyncJobCountsFn = getAsyncJobCounts ?? (() => null);
+		this.#hostInternalExtension = hostInternalExtension;
 		this.#publicExtensions = publicExtensions;
-		this.extensions =
-			hostInternalExtensions.length === 0
-				? publicExtensions
-				: [...hostInternalExtensions.map(binding => binding.extension), ...publicExtensions];
+		this.extensions = hostInternalExtension
+			? [hostInternalExtension.extension, ...publicExtensions]
+			: publicExtensions;
 	}
 
 	/**
@@ -800,9 +806,7 @@ export class ExtensionRunner {
 
 	/** Supply host-owned bindings with the interactive terminal-input registrar. */
 	setHostTerminalInput(register: (handler: TerminalInputHandler) => () => void): void {
-		for (const binding of this.#hostInternalExtensions) {
-			binding.setHostTerminalInput?.(register);
-		}
+		this.#hostInternalExtension?.setHostTerminalInput?.(register);
 	}
 
 	getMessageRenderer(customType: string): MessageRenderer | undefined {
@@ -882,6 +886,7 @@ export class ExtensionRunner {
 			isCompacting: () => this.#isCompactingFn(),
 			compact: instructionsOrOptions => this.#compactFn(instructionsOrOptions),
 			getAsyncJobSnapshot: () => this.#getAsyncJobSnapshotFn(),
+			getAsyncJobCounts: () => this.#getAsyncJobCountsFn(),
 			hasUI: this.hasUI(),
 			cwd: this.cwd,
 			sessionManager: this.sessionManager,
@@ -891,7 +896,7 @@ export class ExtensionRunner {
 			},
 			models: createExtensionModelQuery(this.modelRegistry, this.settings, getModel),
 			isIdle: () => this.#isIdleFn(),
-			abort: () => this.#abortFn(),
+			abort: async () => await this.#abortFn(),
 			hasPendingMessages: () => this.#hasPendingMessagesFn(),
 			shutdown: () => this.#shutdownHandler(),
 			getSystemPrompt: () => this.#getSystemPromptFn(),
@@ -964,17 +969,23 @@ export class ExtensionRunner {
 		ext: Extension,
 		timeoutMs: number,
 		scopeContextToHandler = true,
+		signal?: AbortSignal,
+		invokeWhenAborted = false,
+		propagateSnapshotAcknowledgementFailure = false,
 	): Promise<TResult | undefined> {
-		const signal =
+		const eventSignal =
 			event.type === "session_stop" && "signal" in event && event.signal instanceof AbortSignal
 				? event.signal
 				: undefined;
-		if (signal?.aborted) return undefined;
+		const handlerSignal = signal ?? eventSignal;
+		if (handlerSignal?.aborted && !invokeWhenAborted) return undefined;
 		try {
 			const handlerResult = await raceHandlerWithTimeout(
-				handlerSignal => handler(event, scopeContextToHandler ? createHandlerContext(ctx, handlerSignal) : ctx),
+				handlerAbortSignal =>
+					handler(event, scopeContextToHandler ? createHandlerContext(ctx, handlerAbortSignal) : ctx),
 				timeoutMs,
-				signal,
+				handlerSignal,
+				invokeWhenAborted,
 			);
 			if (handlerResult === EXTENSION_HANDLER_ABORTED) return undefined;
 			if (handlerResult === EXTENSION_HANDLER_TIMEOUT) {
@@ -993,6 +1004,7 @@ export class ExtensionRunner {
 			}
 			return handlerResult as TResult | undefined;
 		} catch (err) {
+			if (handlerSignal?.aborted) return undefined;
 			const message = err instanceof Error ? err.message : String(err);
 			const stack = err instanceof Error ? err.stack : undefined;
 			this.emitError({
@@ -1001,6 +1013,13 @@ export class ExtensionRunner {
 				error: message,
 				stack,
 			});
+			if (
+				propagateSnapshotAcknowledgementFailure &&
+				typeof err === "object" &&
+				err !== null &&
+				(err as Record<PropertyKey, unknown>)[FRESH_SNAPSHOT_ACK_FAILURE] === true
+			)
+				throw err;
 			return undefined;
 		}
 	}
@@ -1068,22 +1087,19 @@ export class ExtensionRunner {
 		return result as RunnerEmitResult<TEvent>;
 	}
 
-	/** Quiesce host-owned observers immediately before a committed branch/tree mutation. */
+	/** Quiesce the host-owned observer immediately before a committed session mutation. */
 	async emitHostInternalBeforeSessionMutation(event: HostInternalSessionMutationEvent): Promise<void> {
-		if (this.#hostInternalExtensions.every(binding => binding.beforeSessionMutation === undefined)) return;
+		const binding = this.#hostInternalExtension;
+		if (!binding?.beforeSessionMutation) return;
 
-		const ctx = this.createContext();
-		for (const binding of this.#hostInternalExtensions) {
-			if (!binding.beforeSessionMutation) continue;
-			await this.#runHandlerWithTimeout(
-				binding.beforeSessionMutation,
-				event,
-				ctx,
-				binding.extension,
-				handlerTimeoutForEvent(event.type),
-				false,
-			);
-		}
+		await this.#runHandlerWithTimeout(
+			binding.beforeSessionMutation,
+			event,
+			this.createContext(),
+			binding.extension,
+			handlerTimeoutForEvent(event.type),
+			false,
+		);
 	}
 
 	/**
@@ -1091,8 +1107,9 @@ export class ExtensionRunner {
 	 * preparation, then run host-owned post-dispatch publication against a newly
 	 * sampled context. Preparation may return the continuation that activates the
 	 * selected lifecycle owner; that continuation runs only after every
-	 * `afterDispatch` callback has completed. Preparation failures propagate and
-	 * suppress host completion; host callback errors and timeouts remain contained.
+	 * `afterDispatch` callback has completed. Preparation failures and the Fresh
+	 * snapshot-ack publication sentinel propagate and suppress activation; unrelated
+	 * host callback errors and timeouts remain contained.
 	 */
 	async emitWithHostCompletion<TEvent extends RunnerEmitEvent>(
 		event: TEvent,
@@ -1101,22 +1118,49 @@ export class ExtensionRunner {
 		const result = await this.emit(event);
 		const prepared = await prepareHostCompletion?.();
 		const postHostContinuation = typeof prepared === "function" ? prepared : undefined;
-		if (this.#hostInternalExtensions.some(binding => binding.afterDispatch !== undefined)) {
-			const ctx = this.createContext();
-			for (const binding of this.#hostInternalExtensions) {
-				if (!binding.afterDispatch) continue;
-				await this.#runHandlerWithTimeout(
-					binding.afterDispatch,
-					event,
-					ctx,
-					binding.extension,
-					handlerTimeoutForEvent(event.type),
-					false,
-				);
-			}
+		const binding = this.#hostInternalExtension;
+		if (binding?.afterDispatch) {
+			await this.#runHandlerWithTimeout(
+				binding.afterDispatch,
+				event,
+				this.createContext(),
+				binding.extension,
+				handlerTimeoutForEvent(event.type),
+				false,
+				undefined,
+				false,
+				true,
+			);
 		}
 		await postHostContinuation?.();
 		return result;
+	}
+
+	/** Dispatch approval lifecycle handlers with the active tool-call cancellation signal. */
+	async emitApproval(
+		event: ToolApprovalRequestedEvent | ToolApprovalResolvedEvent,
+		signal?: AbortSignal,
+	): Promise<void> {
+		const ctx = this.createContext();
+		const invokeWhenAborted = event.type === "tool_approval_resolved";
+		for (const ext of this.extensions) {
+			const handlers = ext.handlers.get(event.type);
+			if (!handlers || handlers.length === 0) continue;
+
+			for (const handler of handlers) {
+				if (signal?.aborted && !invokeWhenAborted) return;
+				await this.#runHandlerWithTimeout(
+					handler,
+					event,
+					ctx,
+					ext,
+					handlerTimeoutForEvent(event.type),
+					true,
+					signal,
+					invokeWhenAborted,
+				);
+			}
+		}
 	}
 
 	async emitToolResult(event: ToolResultEvent): Promise<ToolResultEventResult | undefined> {

@@ -753,7 +753,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		setTerminalTextSizing(settings.get("tui.textSizing") && TERMINAL.textSizing);
 		this.chatContainer = new TranscriptContainer();
 		this.pendingMessagesContainer = new AnchoredLiveContainer();
-		this.statusContainer = new AnchoredLiveContainer(() => this.#publishCompanionStatusText());
+		this.statusContainer = new AnchoredLiveContainer(
+			companionStatusTextSink ? () => this.#publishCompanionStatusText() : undefined,
+		);
 		this.todoContainer = new AnchoredLiveContainer();
 		this.subagentContainer = new AnchoredLiveContainer();
 		this.btwContainer = new AnchoredLiveContainer();
@@ -2465,13 +2467,19 @@ export class InteractiveMode implements InteractiveModeContext {
 	async #clearTransientModeState(options?: {
 		preserveVibe?: boolean;
 		vibeScopeAlreadySuspended?: boolean;
-	}): Promise<void> {
+	}): Promise<boolean> {
+		let promptRefreshFailed = false;
 		if (this.planModeEnabled || this.planModePaused) {
 			this.session.setPlanModeState(undefined);
 			try {
 				if (this.#planModePreviousTools !== undefined) {
 					await this.session.setActiveToolsByName(this.#planModePreviousTools);
 				}
+			} catch (error) {
+				promptRefreshFailed = true;
+				logger.warn("Failed to restore source plan tools while reconciling target session", {
+					error: String(error),
+				});
 			} finally {
 				this.session.setPlanProposalHandler?.(null);
 				this.planModeEnabled = false;
@@ -2518,10 +2526,13 @@ export class InteractiveMode implements InteractiveModeContext {
 			}
 			this.#updateVibeModeStatus();
 		}
+		return promptRefreshFailed;
 	}
 
 	/** Reconcile mode state from session entries on resume/switch. */
-	async #reconcileModeFromSession(options?: { preserveActiveGoal?: boolean }): Promise<void> {
+	async #reconcileModeFromSession(options?: {
+		preserveActiveGoal?: boolean;
+	}): Promise<"source-presentation-refresh-failed" | undefined> {
 		const vibeScopeAlreadySuspended = this.#vibeScopeSuspendedForSwitch;
 		this.#vibeScopeSuspendedForSwitch = false;
 		const sessionContext = this.sessionManager.buildSessionContext();
@@ -2533,19 +2544,20 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#vibeModeOwnerScope?.ownerId === targetVibeScope.ownerId &&
 			this.#vibeModeOwnerScope.parentSessionId === targetVibeScope.parentSessionId &&
 			this.#vibeModeOwnerScope.parentSessionFile === targetVibeScope.parentSessionFile;
-		await this.#clearTransientModeState({ preserveVibe, vibeScopeAlreadySuspended });
+		const promptRefreshFailed = await this.#clearTransientModeState({ preserveVibe, vibeScopeAlreadySuspended });
+		const result = promptRefreshFailed ? ("source-presentation-refresh-failed" as const) : undefined;
 		await VibeSessionRegistry.global().rehydrate(vibeSession);
 		const goalEnabled = this.session.settings.get("goal.enabled");
 		if (!goalEnabled && (sessionContext.mode === "goal" || sessionContext.mode === "goal_paused")) {
 			this.session.goalRuntime.clearAccounting();
 			this.sessionManager.appendModeChange("none");
-			return;
+			return result;
 		}
 		if (sessionContext.mode === "goal" || sessionContext.mode === "goal_paused") {
 			const goal = this.#goalFromModeData(sessionContext.modeData);
 			if (!goal) {
 				this.sessionManager.appendModeChange("none");
-				return;
+				return result;
 			}
 			this.session.setGoalModeState({
 				enabled: sessionContext.mode === "goal",
@@ -2565,12 +2577,12 @@ export class InteractiveMode implements InteractiveModeContext {
 				await this.session.setActiveToolsByName([...new Set([...previousTools, "goal"])]);
 			}
 			this.#updateGoalModeStatus();
-			return;
+			return result;
 		}
 		this.session.goalRuntime.clearAccounting();
 		if (sessionContext.mode === "vibe") {
 			if (!preserveVibe) await this.#enterVibeMode({ persistModeChange: false });
-			return;
+			return result;
 		}
 		if (!this.session.settings.get("plan.enabled")) {
 			// Clear stale plan/plan_paused mode so re-enabling the setting
@@ -2588,6 +2600,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#planModeHasEntered = true;
 			this.#updatePlanModeStatus();
 		}
+		return result;
 	}
 
 	async #enterPlanMode(options?: {
@@ -4346,6 +4359,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	#publishCompanionStatusText(): void {
+		if (!this.#companionStatusTextSink) return;
 		let message: string | undefined;
 		for (let index = this.statusContainer.children.length - 1; index >= 0; index--) {
 			const child = this.statusContainer.children[index];
@@ -4364,7 +4378,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			message = sanitizeStatusText(message) || undefined;
 		}
 		try {
-			this.#companionStatusTextSink?.(message);
+			this.#companionStatusTextSink(message);
 		} catch {
 			// Companion transport is optional; footer rendering remains authoritative.
 		}

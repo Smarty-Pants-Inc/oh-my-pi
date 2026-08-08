@@ -118,6 +118,16 @@ describe("InteractiveMode working-message session accent cache", () => {
 		expect(statuses.at(-1)).toBeUndefined();
 	});
 
+	it("does not inspect loader status when no companion sink exists", async () => {
+		const { mode } = await createHarness("Ordinary TUI");
+		startStableLoader(mode);
+		const getMessage = vi.spyOn(defined(mode.loadingAnimation), "getMessage");
+
+		mode.setWorkingMessage("Ordinary update");
+
+		expect(getMessage).not.toHaveBeenCalled();
+	});
+
 	it("reuses one computed accent across loader spinner and message colorizers", async () => {
 		const { mode } = await createHarness("Cached session");
 		const getHex = vi.spyOn(sessionColor, "getSessionAccentHex");

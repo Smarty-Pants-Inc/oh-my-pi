@@ -5,6 +5,7 @@ import type {
 	ExtensionContext,
 	ExtensionEvent,
 	ExtensionFactory,
+	HostInternalSessionMutationEvent,
 	TerminalInputHandler,
 } from "../extensibility/extensions/types";
 import { getLatestTodoPhasesFromEntries } from "../tools/todo";
@@ -15,6 +16,7 @@ import {
 	COMMAND_END,
 	COMMAND_PREFIX,
 	COMMAND_TIMEOUT_MS,
+	type CompanionCommandTarget,
 	type CompanionStateName,
 	configuredThinkingLevel,
 	EMIT_COALESCE_MS,
@@ -25,17 +27,16 @@ import {
 	hasSettledFailure,
 	hmac,
 	isCanonicalUuid,
-	isCanonicalUuidV4,
 	MAX_COMMAND_CAPTURE_CHARS,
 	MAX_FRAME_BYTES,
 	MAX_PROCESS_ID,
 	MAX_SAFE_INTEGER,
 	normalizeString,
+	type ParsedCompanionCommand,
 	parseCommand,
 	SAMPLE_INTERVAL_MS,
 	SECRET_BYTES,
 	type SemanticSnapshot,
-	SYNC_B64_LENGTH,
 	SYNC_BYTES,
 	SYNC_DOMAIN,
 	summarizeGoal,
@@ -47,15 +48,23 @@ import {
 
 let processIncarnation: string | undefined;
 let processSequence = 0;
+const SNAPSHOT_ACK_TIMEOUT_MS = 5_000;
+const SNAPSHOT_ACK_FAILURE = Symbol.for("oh-my-pi.fresh-omp.snapshot-ack-failure");
+
+class FreshOmpSnapshotAcknowledgementError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "FreshOmpSnapshotAcknowledgementError";
+		Object.defineProperty(this, SNAPSHOT_ACK_FAILURE, { value: true });
+	}
+}
 
 export interface FreshOmpCompanionController {
 	factory: ExtensionFactory;
-	beforeSessionMutation(
-		event: { type: "session_branch" | "session_tree" },
-		ctx: ExtensionContext,
-	): void | Promise<void>;
+	beforeSessionMutation(event: HostInternalSessionMutationEvent, ctx: ExtensionContext): void | Promise<void>;
 	afterDispatch(event: ExtensionEvent, ctx: ExtensionContext): void | Promise<void>;
 	setHostTerminalInput(register: (handler: TerminalInputHandler) => () => void): void;
+	setThinkingLevel(thinkingLevel: SemanticSnapshot["thinkingLevel"]): void;
 	setStatusText(statusText?: string): void;
 }
 
@@ -67,6 +76,14 @@ type ManagedTimerRef = {
 type PendingLifecycle = {
 	kind: "session_ready" | "session_rollback" | "session_branch" | "session_tree";
 	generation: number;
+};
+
+type PendingSnapshotAcknowledgement = CompanionCommandTarget & {
+	sequence: number;
+	promise: Promise<void>;
+	resolve: (value: void | PromiseLike<void>) => void;
+	reject: (reason?: unknown) => void;
+	timer?: ManagedTimerRef;
 };
 
 type DisableReason =
@@ -84,11 +101,14 @@ interface CompanionRuntime {
 	shutdown: boolean;
 	generation: number;
 	authoritativeSampled: boolean;
+	workEpoch: number;
+	lastCommandSequence: number;
 	agentActive: boolean;
 	continuationActive: boolean;
 	retryActive: boolean;
 	compacting: boolean;
 	lastSettledFailed: boolean;
+	thinkingLevel?: SemanticSnapshot["thinkingLevel"];
 	statusText?: string;
 	toolOrder: number;
 	runningTools: Map<string, ToolSummary>;
@@ -96,6 +116,7 @@ interface CompanionRuntime {
 	goal?: GoalSummary;
 	todos?: TodoSummary;
 	pendingLifecycle?: PendingLifecycle;
+	pendingSnapshotAcknowledgement?: PendingSnapshotAcknowledgement;
 	inputUnsubscribe?: () => void;
 	sampleTimer?: ManagedTimerRef;
 	emitTimer?: ManagedTimerRef;
@@ -103,6 +124,7 @@ interface CompanionRuntime {
 	commandTimer?: ManagedTimerRef;
 	commandDeadline: number;
 	abortTimer?: ManagedTimerRef;
+	abortPromise?: Promise<void>;
 	requestTimer?: ManagedTimerRef;
 	pendingSnapshot?: SemanticSnapshot;
 	pendingForce: boolean;
@@ -111,12 +133,35 @@ interface CompanionRuntime {
 	stdoutBlocked: boolean;
 	drainListener?: () => void;
 	lastEmittedSemantic?: string;
+	lastCommittedSnapshot?: SemanticSnapshot;
 	lastEmissionAt: number;
 	prefixMatch: string;
 	commandMode: "scan" | "capture" | "discard";
 	commandCapture: string;
 	commandEndMatch: string;
 	commandConsumeOnly: boolean;
+}
+
+type CommandControlMatch = {
+	pending: string;
+	invalidated: boolean;
+	complete?: "end" | "prefix";
+};
+
+function advanceCommandControlMatch(current: string, character: string): CommandControlMatch {
+	const candidate = current + character;
+	if (candidate === COMMAND_END) return { pending: "", invalidated: false, complete: "end" };
+	if (candidate === COMMAND_PREFIX) return { pending: "", invalidated: false, complete: "prefix" };
+	if (COMMAND_END.startsWith(candidate) || COMMAND_PREFIX.startsWith(candidate)) {
+		return { pending: candidate, invalidated: false };
+	}
+	for (let start = 1; start < candidate.length; start++) {
+		const suffix = candidate.slice(start);
+		if (COMMAND_END.startsWith(suffix) || COMMAND_PREFIX.startsWith(suffix)) {
+			return { pending: suffix, invalidated: true };
+		}
+	}
+	return { pending: "", invalidated: true };
 }
 export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpCompanionController {
 	if (secret.byteLength !== SECRET_BYTES) {
@@ -125,9 +170,6 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 	const capability = Uint8Array.from(secret);
 	const sync = hmac(capability, SYNC_DOMAIN).subarray(0, SYNC_BYTES).toString("base64url");
 	const incarnation = processIncarnation ?? crypto.randomUUID();
-	if (sync.length !== SYNC_B64_LENGTH || !isCanonicalUuidV4(incarnation)) {
-		throw new Error("Fresh OMP companion initialization failed");
-	}
 	processIncarnation = incarnation;
 
 	const state: CompanionRuntime = {
@@ -135,6 +177,8 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 		quiesced: false,
 		shutdown: false,
 		generation: 0,
+		workEpoch: 0,
+		lastCommandSequence: 0,
 		authoritativeSampled: false,
 		agentActive: false,
 		continuationActive: false,
@@ -168,6 +212,15 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 		}
 	};
 
+	const rejectPendingSnapshotAcknowledgement = (message: string): void => {
+		const pending = state.pendingSnapshotAcknowledgement;
+		if (!pending) return;
+		state.pendingSnapshotAcknowledgement = undefined;
+		clearTimer(pending.timer);
+		pending.timer = undefined;
+		pending.reject(new FreshOmpSnapshotAcknowledgementError(message));
+	};
+
 	const clearDrain = (): void => {
 		const listener = state.drainListener;
 		state.drainListener = undefined;
@@ -191,7 +244,7 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 		}
 	};
 
-	const cancelCommandCapture = (): void => {
+	const resetCommandScanner = (): void => {
 		clearTimer(state.commandTimer);
 		state.commandDeadline = 0;
 		state.commandTimer = undefined;
@@ -200,6 +253,25 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 		state.commandCapture = "";
 		state.commandEndMatch = "";
 		state.commandConsumeOnly = false;
+	};
+
+	const discardCommandCapture = (): void => {
+		const wasScanning = state.commandMode === "scan";
+		const pendingControl = wasScanning ? state.prefixMatch : state.commandEndMatch;
+		clearTimer(state.commandTimer);
+		state.commandDeadline = 0;
+		state.commandTimer = undefined;
+		state.prefixMatch = "";
+		state.commandCapture = "";
+		if (wasScanning && pendingControl === "") {
+			state.commandMode = "scan";
+			state.commandEndMatch = "";
+			state.commandConsumeOnly = false;
+			return;
+		}
+		state.commandMode = "discard";
+		state.commandEndMatch = pendingControl;
+		state.commandConsumeOnly ||= state.quiesced || state.disabled;
 	};
 
 	const cancelOutputScheduling = (): void => {
@@ -223,11 +295,13 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 
 	const cancelScheduling = (): void => {
 		cancelOutputScheduling();
-		cancelCommandCapture();
+		discardCommandCapture();
 	};
 
 	const clearAllScheduling = (): void => {
-		cancelScheduling();
+		cancelOutputScheduling();
+		rejectPendingSnapshotAcknowledgement("Fresh snapshot acknowledgement was cancelled during shutdown");
+		resetCommandScanner();
 		unsubscribeInput();
 	};
 
@@ -248,6 +322,7 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 	const disable = (reason: DisableReason, length: number, ctx?: ExtensionContext): void => {
 		if (state.disabled) return;
 		state.disabled = true;
+		rejectPendingSnapshotAcknowledgement("Fresh snapshot acknowledgement was cancelled after companion failure");
 		cancelOutputScheduling();
 		diagnostic(reason, length, ctx);
 	};
@@ -259,6 +334,7 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 		state.retryActive = false;
 		state.compacting = false;
 		state.lastSettledFailed = false;
+		state.thinkingLevel = undefined;
 		state.statusText = undefined;
 		state.toolOrder = 0;
 		state.runningTools.clear();
@@ -272,7 +348,27 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 			disable("sequence_overflow", 0, ctx);
 			return false;
 		}
+		rejectPendingSnapshotAcknowledgement("Fresh snapshot acknowledgement was superseded by a new session generation");
 		state.generation++;
+		state.workEpoch = 1;
+		return true;
+	};
+
+	const beginWorkEpoch = (ctx: ExtensionContext): boolean => {
+		if (
+			state.agentActive ||
+			state.continuationActive ||
+			state.retryActive ||
+			state.compacting ||
+			state.runningTools.size > 0 ||
+			state.pendingApprovals.size > 0
+		)
+			return true;
+		if (state.workEpoch >= MAX_SAFE_INTEGER) {
+			disable("sequence_overflow", 0, ctx);
+			return false;
+		}
+		state.workEpoch++;
 		return true;
 	};
 
@@ -280,6 +376,7 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 		const branch = ctx.sessionManager.getBranch();
 		state.goal = goalFromBranch(branch);
 		state.todos = summarizeTodos(getLatestTodoPhasesFromEntries(branch));
+		state.thinkingLevel = api ? configuredThinkingLevel(api, branch) : undefined;
 	};
 
 	const derivedState = (ctx: ExtensionContext): CompanionStateName => {
@@ -304,8 +401,7 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 		const sessionName = normalizeString(ctx.sessionManager.getSessionName(), 160, 640);
 		const modelProvider = normalizeString(ctx.model?.provider, 128, 256);
 		const modelId = normalizeString(ctx.model?.id, 128, 256);
-		const branch = ctx.sessionManager.getBranch();
-		const thinkingLevel = api ? configuredThinkingLevel(api, branch) : undefined;
+		const thinkingLevel = state.thinkingLevel;
 		let currentTool: ToolSummary | undefined;
 		for (const tool of state.runningTools.values()) {
 			if (!currentTool || tool.order > currentTool.order) currentTool = tool;
@@ -322,19 +418,13 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 			typeof usage?.percent === "number" ? Math.round(usage.percent * 100) : undefined,
 			10_000,
 		);
-		const jobs = ctx.getAsyncJobSnapshot();
-		let recentFailures = 0;
-		if (jobs) {
-			const recentCount = Math.min(5, jobs.recent.length);
-			for (let index = 0; index < recentCount; index++) {
-				if (jobs.recent[index]?.status === "failed") recentFailures++;
-			}
-		}
+		const jobs = ctx.getAsyncJobCounts();
 
 		return {
 			version: 1,
 			incarnation,
 			sessionGeneration: state.generation,
+			workEpoch: state.workEpoch,
 			ompVersion,
 			processId: process.pid,
 			sessionId,
@@ -378,9 +468,9 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 				? {}
 				: {
 						asyncJobs: {
-							running: boundedLength(jobs.running.length),
-							recentFailures: boundedLength(recentFailures),
-							pendingDelivery: boundedLength(jobs.delivery.queued),
+							running: boundedLength(jobs.running),
+							recentFailures: boundedLength(jobs.recentFailures),
+							pendingDelivery: boundedLength(jobs.pendingDelivery),
 						},
 					}),
 		};
@@ -436,12 +526,14 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 		snapshot: SemanticSnapshot,
 		force: boolean,
 		allowDrain: boolean,
-	): void => {
-		if (state.disabled || (state.quiesced && !state.shutdown) || generation !== state.generation) return;
+		allowQuiesced = false,
+	): number | undefined => {
+		if (state.disabled || (state.quiesced && !state.shutdown && !allowQuiesced) || generation !== state.generation)
+			return undefined;
 		if (state.stdoutBlocked && allowDrain) {
 			state.blockedSnapshot = snapshot;
 			state.blockedForce ||= force;
-			return;
+			return undefined;
 		}
 		try {
 			const encoded = encodeFrame(capability, sync, snapshot, processSequence + 1);
@@ -449,15 +541,15 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 				const reason =
 					processSequence >= MAX_SAFE_INTEGER ? "sequence_overflow" : "snapshot_oversize_after_reduction";
 				disable(reason, 0, ctx);
-				return;
+				return undefined;
 			}
-			if (!force && encoded.semantic === state.lastEmittedSemantic) return;
+			if (!force && encoded.semantic === state.lastEmittedSemantic) return undefined;
 			let writable: boolean;
 			try {
 				writable = process.stdout.write(encoded.frame);
 			} catch {
 				disable("stdout_write_failed", Math.min(MAX_FRAME_BYTES, encoded.frame.length), ctx);
-				return;
+				return undefined;
 			}
 			processSequence = encoded.sequence;
 			state.lastEmittedSemantic = encoded.semantic;
@@ -477,8 +569,10 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 				}
 				attachDrain(ctx, generation);
 			}
+			return encoded.sequence;
 		} catch {
 			disable("encoding_fault", 0, ctx);
+			return undefined;
 		}
 	};
 
@@ -502,6 +596,7 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 			return;
 		}
 		if (!snapshot) return;
+		state.lastCommittedSnapshot = snapshot;
 		if (state.stdoutBlocked) {
 			state.blockedSnapshot = snapshot;
 			state.blockedForce ||= force;
@@ -529,6 +624,7 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 		if (state.disabled || state.quiesced || state.shutdown || generation !== state.generation) return;
 		try {
 			state.compacting = ctx.isCompacting();
+			if (ctx.isIdle()) state.agentActive = false;
 			state.authoritativeSampled = true;
 			queueSnapshot(ctx, generation, force);
 		} catch {
@@ -558,19 +654,46 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 		}
 	};
 
-	const scheduleAbort = (ctx: ExtensionContext, generation: number): void => {
-		if (state.abortTimer || state.disabled || state.quiesced || generation !== state.generation) return;
+	const scheduleAbort = (ctx: ExtensionContext, generation: number, workEpoch: number): void => {
+		if (state.abortPromise || state.disabled || state.quiesced || generation !== state.generation) return;
+		clearTimer(state.abortTimer);
+		state.abortTimer = undefined;
 		try {
 			let ref: ManagedTimerRef | undefined;
 			const timer = ctx.setTimeout(() => {
 				if (state.abortTimer !== ref) return;
 				state.abortTimer = undefined;
-				if (state.disabled || state.quiesced || state.shutdown || generation !== state.generation) return;
+				if (
+					state.disabled ||
+					state.quiesced ||
+					state.shutdown ||
+					generation !== state.generation ||
+					workEpoch !== state.workEpoch
+				)
+					return;
+				let abortResult: void | Promise<void>;
 				try {
-					ctx.abort();
+					abortResult = ctx.abort();
 				} catch {
 					disable("event_fault", 0, ctx);
+					return;
 				}
+				const abortPromise = Promise.resolve(abortResult);
+				state.abortPromise = abortPromise;
+				void abortPromise
+					.catch(() => {
+						if (
+							!state.disabled &&
+							!state.shutdown &&
+							generation === state.generation &&
+							workEpoch === state.workEpoch
+						) {
+							disable("event_fault", 0, ctx);
+						}
+					})
+					.finally(() => {
+						if (state.abortPromise === abortPromise) state.abortPromise = undefined;
+					});
 			}, 0);
 			ref = { ctx, timer };
 			state.abortTimer = ref;
@@ -606,13 +729,43 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 				if (state.commandTimer !== ref) return;
 				state.commandTimer = undefined;
 				if (generation !== state.generation) return;
-				cancelCommandCapture();
+				discardCommandCapture();
 			}, COMMAND_TIMEOUT_MS);
 			ref = { ctx, timer };
 			state.commandTimer = ref;
 		} catch {
 			disable("parser_fault", 0, ctx);
 		}
+	};
+
+	const beginCommandCapture = (ctx: ExtensionContext, generation: number): void => {
+		state.prefixMatch = "";
+		state.commandMode = "capture";
+		state.commandCapture = "";
+		state.commandEndMatch = "";
+		state.commandConsumeOnly ||= state.quiesced || state.disabled;
+		armCommandTimeout(ctx, generation);
+	};
+
+	const settleSnapshotAcknowledgement = (command: Extract<ParsedCompanionCommand, { type: "snapshot_ack" }>): void => {
+		const pending = state.pendingSnapshotAcknowledgement;
+		if (
+			!pending ||
+			command.incarnation !== pending.incarnation ||
+			command.sequence !== pending.sequence ||
+			command.sessionGeneration !== pending.sessionGeneration ||
+			command.sessionId !== pending.sessionId ||
+			command.workEpoch !== pending.workEpoch
+		)
+			return;
+		if (!command.accepted) {
+			rejectPendingSnapshotAcknowledgement("Fresh rejected the durable snapshot acknowledgement");
+			return;
+		}
+		state.pendingSnapshotAcknowledgement = undefined;
+		clearTimer(pending.timer);
+		pending.timer = undefined;
+		pending.resolve(undefined);
 	};
 
 	const completeCommand = (ctx: ExtensionContext, generation: number): void => {
@@ -622,33 +775,36 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 		const capture = state.commandCapture;
 		const discard = state.commandMode === "discard";
 		const consumeOnly = state.commandConsumeOnly;
+		state.prefixMatch = "";
 		state.commandMode = "scan";
 		state.commandConsumeOnly = false;
 		state.commandCapture = "";
 		state.commandEndMatch = "";
-		if (discard || consumeOnly || state.disabled || state.quiesced) return;
-		const command = parseCommand(capability, capture);
-		if (command === "cancel") scheduleAbort(ctx, generation);
-		else if (command === "request_snapshot") scheduleRequestedSnapshot(ctx, generation);
-	};
-
-	const appendCapturedCharacter = (character: string): void => {
-		if (state.commandMode === "discard") return;
-		if (!COMMAND_CAPTURE_CHARACTER_PATTERN.test(character)) {
-			state.commandMode = "discard";
-			state.commandCapture = "";
+		if (discard || state.disabled) return;
+		const command = parseCommand(
+			capability,
+			capture,
+			{
+				incarnation,
+				sessionGeneration: state.generation,
+				sessionId: ctx.sessionManager.getSessionId(),
+				workEpoch: state.workEpoch,
+			},
+			state.lastCommandSequence,
+		);
+		if (!command) return;
+		state.lastCommandSequence = command.commandSequence;
+		if (command.type === "snapshot_ack") {
+			settleSnapshotAcknowledgement(command);
 			return;
 		}
-		if (state.commandCapture.length >= MAX_COMMAND_CAPTURE_CHARS) {
-			state.commandMode = "discard";
-			state.commandCapture = "";
-			return;
-		}
-		state.commandCapture += character;
+		if (consumeOnly || state.quiesced) return;
+		if (command.type === "cancel") scheduleAbort(ctx, generation, state.workEpoch);
+		else scheduleRequestedSnapshot(ctx, generation);
 	};
 
 	const feedTerminalInput = (ctx: ExtensionContext, generation: number, data: string): { data: string } => {
-		if (state.commandMode !== "scan" && Date.now() >= state.commandDeadline) cancelCommandCapture();
+		if (state.commandMode === "capture" && Date.now() >= state.commandDeadline) discardCommandCapture();
 		if (state.commandMode === "scan" && state.prefixMatch === "" && !data.includes(COMMAND_PREFIX[0] ?? "")) {
 			return { data };
 		}
@@ -671,23 +827,31 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 						state.prefixMatch = state.prefixMatch.slice(1);
 					}
 					if (!state.prefixMatch) state.commandConsumeOnly = false;
-					if (state.prefixMatch === COMMAND_PREFIX) {
-						state.prefixMatch = "";
-						state.commandMode = "capture";
-						state.commandConsumeOnly ||= state.quiesced || state.disabled;
-						state.commandCapture = "";
-						state.commandEndMatch = "";
-						armCommandTimeout(ctx, generation);
-					}
+					if (state.prefixMatch === COMMAND_PREFIX) beginCommandCapture(ctx, generation);
 					continue;
 				}
 
-				state.commandEndMatch += character;
-				while (state.commandEndMatch && !COMMAND_END.startsWith(state.commandEndMatch)) {
-					appendCapturedCharacter(state.commandEndMatch[0] ?? "");
-					state.commandEndMatch = state.commandEndMatch.slice(1);
+				if (
+					state.commandMode === "capture" &&
+					state.commandEndMatch === "" &&
+					COMMAND_CAPTURE_CHARACTER_PATTERN.test(character)
+				) {
+					if (state.commandCapture.length >= MAX_COMMAND_CAPTURE_CHARS) discardCommandCapture();
+					else state.commandCapture += character;
+					continue;
 				}
-				if (state.commandEndMatch === COMMAND_END) completeCommand(ctx, generation);
+
+				const control = advanceCommandControlMatch(state.commandEndMatch, character);
+				state.commandEndMatch = control.pending;
+				if (control.complete === "end") {
+					completeCommand(ctx, generation);
+					continue;
+				}
+				if (control.complete === "prefix") {
+					beginCommandCapture(ctx, generation);
+					continue;
+				}
+				if (state.commandMode === "capture" && control.invalidated) discardCommandCapture();
 			}
 			return { data: output };
 		} catch {
@@ -695,7 +859,7 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 				processingPrivateCandidate || state.commandMode !== "scan" || state.prefixMatch !== "";
 			const currentWasEmitted = output.length > outputLengthBeforeCharacter;
 			const untouchedTail = data.slice(currentIsPrivate || currentWasEmitted ? index + 1 : index);
-			cancelCommandCapture();
+			discardCommandCapture();
 			disable("parser_fault", Buffer.byteLength(data, "utf8"), ctx);
 			if (!untouchedTail) return { data: output };
 			return { data: output + feedTerminalInput(ctx, generation, untouchedTail).data };
@@ -704,8 +868,8 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 
 	const installInput = (ctx: ExtensionContext): void => {
 		inputContext = ctx;
-		cancelCommandCapture();
 		if (state.inputUnsubscribe) return;
+		resetCommandScanner();
 		const register = registerHostTerminalInput;
 		if (!register) return;
 		try {
@@ -723,6 +887,7 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 	const beginSession = (ctx: ExtensionContext): boolean => {
 		cancelScheduling();
 		clearTransientFacts();
+		state.lastCommittedSnapshot = undefined;
 		if (!bumpGeneration(ctx)) return false;
 		state.quiesced = true;
 		installInput(ctx);
@@ -733,7 +898,12 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 		if (state.disabled || generation !== state.generation) return;
 		rebuildSessionSummaries(ctx);
 		state.quiesced = false;
+		state.compacting = ctx.isCompacting();
 		startSampling(ctx, generation);
+		sample(ctx, generation, true);
+		clearTimer(state.emitTimer);
+		state.emitTimer = undefined;
+		flushPending(ctx, generation);
 	};
 
 	const beginSwitch = (ctx: ExtensionContext): void => {
@@ -755,28 +925,73 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 		}
 	};
 
-	const publishLifecycleSnapshot = (ctx: ExtensionContext, generation: number): void => {
+	const waitForSnapshotAcknowledgement = (
+		ctx: ExtensionContext,
+		target: CompanionCommandTarget & { sequence: number },
+	): Promise<void> => {
+		rejectPendingSnapshotAcknowledgement("Fresh snapshot acknowledgement was superseded by a newer publication");
+		const deferred = Promise.withResolvers<void>();
+		const pending: PendingSnapshotAcknowledgement = { ...target, ...deferred };
+		state.pendingSnapshotAcknowledgement = pending;
 		try {
-			state.compacting = ctx.isCompacting();
-			state.authoritativeSampled = true;
-			const snapshot = buildSemanticSnapshot(ctx);
-			if (snapshot) writeSnapshot(ctx, generation, snapshot, true, true);
+			const timer = ctx.setTimeout(() => {
+				if (state.pendingSnapshotAcknowledgement !== pending) return;
+				rejectPendingSnapshotAcknowledgement("Fresh snapshot acknowledgement timed out");
+			}, SNAPSHOT_ACK_TIMEOUT_MS);
+			pending.timer = { ctx, timer };
 		} catch {
-			disable("event_fault", 0, ctx);
+			rejectPendingSnapshotAcknowledgement("Fresh snapshot acknowledgement timeout could not be armed");
 		}
+		return pending.promise;
 	};
 
-	const completeLifecycle = (kind: PendingLifecycle["kind"], ctx: ExtensionContext): void => {
+	const publishLifecycleSnapshot = (
+		ctx: ExtensionContext,
+		generation: number,
+	): { snapshot: SemanticSnapshot; sequence: number } => {
+		state.compacting = ctx.isCompacting();
+		const snapshot = buildSemanticSnapshot(ctx);
+		if (!snapshot) throw new FreshOmpSnapshotAcknowledgementError("Fresh lifecycle snapshot could not be built");
+		const sequence = writeSnapshot(ctx, generation, snapshot, true, true, true);
+		if (sequence === undefined) {
+			throw new FreshOmpSnapshotAcknowledgementError("Fresh lifecycle snapshot could not be published");
+		}
+		return { snapshot, sequence };
+	};
+
+	const completeLifecycle = async (kind: PendingLifecycle["kind"], ctx: ExtensionContext): Promise<void> => {
 		const pending = state.pendingLifecycle;
 		if (!pending || pending.kind !== kind || pending.generation !== state.generation || state.disabled) return;
 		state.pendingLifecycle = undefined;
-		cancelScheduling();
-		clearTransientFacts();
-		rebuildSessionSummaries(ctx);
-		state.quiesced = false;
-		installInput(ctx);
-		startSampling(ctx, state.generation);
-		publishLifecycleSnapshot(ctx, state.generation);
+		const generation = state.generation;
+		try {
+			cancelScheduling();
+			clearTransientFacts();
+			rebuildSessionSummaries(ctx);
+			installInput(ctx);
+			const { snapshot, sequence } = publishLifecycleSnapshot(ctx, generation);
+			await waitForSnapshotAcknowledgement(ctx, {
+				incarnation: snapshot.incarnation,
+				sequence,
+				sessionGeneration: snapshot.sessionGeneration,
+				sessionId: snapshot.sessionId,
+				workEpoch: snapshot.workEpoch,
+			});
+			if (state.disabled || state.shutdown || generation !== state.generation) {
+				throw new FreshOmpSnapshotAcknowledgementError(
+					"Fresh snapshot acknowledgement was superseded before lifecycle activation",
+				);
+			}
+			state.lastCommittedSnapshot = snapshot;
+			state.authoritativeSampled = true;
+			state.quiesced = false;
+			startSampling(ctx, generation);
+		} catch (error) {
+			state.quiesced = true;
+			if (error instanceof FreshOmpSnapshotAcknowledgementError) throw error;
+			disable("event_fault", 0, ctx);
+			throw new FreshOmpSnapshotAcknowledgementError("Fresh lifecycle snapshot publication failed");
+		}
 	};
 
 	const guarded = (ctx: ExtensionContext, operation: () => void): void => {
@@ -819,23 +1034,11 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 				},
 			);
 		});
-		pi.on("session_switch", (_event, ctx) => {
-			fenceLifecycle(ctx);
-		});
-		pi.on("session_ready", (_event, ctx) => {
-			const generation = state.generation;
-			return guardedAsync(
-				ctx,
-				() => generation === state.generation,
-				async () => {
-					// Resume/reload readiness is not an owner-created replacement, so keep
-					// this generic materialization guard in addition to owner-side creation.
-					await ctx.sessionManager.ensureOnDisk();
-					if (state.disabled || generation !== state.generation) return;
-					state.pendingLifecycle = { kind: "session_ready", generation };
-				},
-			);
-		});
+		pi.on("session_ready", (_event, ctx) =>
+			guarded(ctx, () => {
+				state.pendingLifecycle = { kind: "session_ready", generation: state.generation };
+			}),
+		);
 		pi.on("session_rollback", (_event, ctx) =>
 			guarded(ctx, () => {
 				state.pendingLifecycle = { kind: "session_rollback", generation: state.generation };
@@ -865,13 +1068,23 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 				clearAllScheduling();
 				state.pendingLifecycle = undefined;
 				state.statusText = undefined;
-				const snapshot = buildSemanticSnapshot(ctx);
-				if (snapshot) writeSnapshot(ctx, state.generation, snapshot, true, false);
+				const committed = state.lastCommittedSnapshot;
+				if (committed) {
+					const { statusText: _statusText, currentTool: _currentTool, ...snapshot } = committed;
+					writeSnapshot(
+						ctx,
+						state.generation,
+						{ ...snapshot, state: "stopped", runningTools: 0, pendingApprovals: 0 },
+						true,
+						false,
+					);
+				}
 				state.disabled = true;
 			});
 		});
 		pi.on("agent_start", (_event, ctx) =>
 			guarded(ctx, () => {
+				if (!beginWorkEpoch(ctx)) return;
 				state.agentActive = true;
 				state.continuationActive = false;
 				state.lastSettledFailed = false;
@@ -888,6 +1101,7 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 		);
 		pi.on("tool_execution_start", (event, ctx) =>
 			guarded(ctx, () => {
+				if (!beginWorkEpoch(ctx)) return;
 				state.toolOrder++;
 				state.runningTools.set(event.toolCallId, {
 					name: event.toolName,
@@ -910,6 +1124,7 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 		);
 		pi.on("tool_approval_requested", (event, ctx) =>
 			guarded(ctx, () => {
+				if (!beginWorkEpoch(ctx)) return;
 				state.pendingApprovals.add(`${event.sessionId}\0${event.toolCallId}`);
 				scheduleChangedSnapshot(ctx);
 			}),
@@ -922,6 +1137,7 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 		);
 		pi.on("auto_retry_start", (_event, ctx) =>
 			guarded(ctx, () => {
+				if (!beginWorkEpoch(ctx)) return;
 				state.retryActive = true;
 				state.lastSettledFailed = false;
 				scheduleChangedSnapshot(ctx);
@@ -930,12 +1146,14 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 		pi.on("auto_retry_end", (event, ctx) =>
 			guarded(ctx, () => {
 				state.retryActive = false;
+				state.continuationActive = false;
 				state.lastSettledFailed = !event.success && event.finalError !== "Retry cancelled";
 				scheduleChangedSnapshot(ctx);
 			}),
 		);
 		pi.on("session.compacting", (_event, ctx) =>
 			guarded(ctx, () => {
+				if (!beginWorkEpoch(ctx)) return;
 				state.compacting = true;
 				scheduleChangedSnapshot(ctx);
 			}),
@@ -948,6 +1166,7 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 		);
 		pi.on("auto_compaction_start", (_event, ctx) =>
 			guarded(ctx, () => {
+				if (!beginWorkEpoch(ctx)) return;
 				state.compacting = true;
 				scheduleChangedSnapshot(ctx);
 			}),
@@ -966,7 +1185,9 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 		);
 		pi.on("todo_reminder", (_event, ctx) =>
 			guarded(ctx, () => {
-				state.todos = summarizeTodos(getLatestTodoPhasesFromEntries(ctx.sessionManager.getBranch()));
+				const branch = ctx.sessionManager.getBranch();
+				state.todos = summarizeTodos(getLatestTodoPhasesFromEntries(branch));
+				state.thinkingLevel = api ? configuredThinkingLevel(api, branch) : undefined;
 				scheduleChangedSnapshot(ctx);
 			}),
 		);
@@ -977,27 +1198,26 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 		beforeSessionMutation(_event, ctx): void {
 			fenceLifecycle(ctx);
 		},
-		afterDispatch(event, ctx): void {
-			guarded(ctx, () => {
-				switch (event.type) {
-					case "session_ready":
-						completeLifecycle("session_ready", ctx);
-						break;
-					case "session_rollback":
-						completeLifecycle("session_rollback", ctx);
-						break;
-					case "session_branch":
-						completeLifecycle("session_branch", ctx);
-						break;
-					case "session_tree":
-						completeLifecycle("session_tree", ctx);
-						break;
-				}
-			});
+		afterDispatch(event, ctx): void | Promise<void> {
+			switch (event.type) {
+				case "session_ready":
+					return completeLifecycle("session_ready", ctx);
+				case "session_rollback":
+					return completeLifecycle("session_rollback", ctx);
+				case "session_branch":
+					return completeLifecycle("session_branch", ctx);
+				case "session_tree":
+					return completeLifecycle("session_tree", ctx);
+			}
 		},
 		setHostTerminalInput(register): void {
 			registerHostTerminalInput = register;
 			if (inputContext && !state.shutdown) installInput(inputContext);
+		},
+		setThinkingLevel(thinkingLevel): void {
+			if (state.disabled || state.shutdown) return;
+			state.thinkingLevel = thinkingLevel;
+			if (inputContext) scheduleChangedSnapshot(inputContext);
 		},
 		setStatusText(statusText): void {
 			if (state.disabled || state.shutdown) return;

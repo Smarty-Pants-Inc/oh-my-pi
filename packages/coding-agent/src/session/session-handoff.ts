@@ -243,15 +243,18 @@ export class SessionHandoff {
 			}
 
 			lifecycle = this.#host.beginLifecycleTransaction();
+			if (this.#host.extensionRunner) {
+				lifecycle.markPublicationStarted();
+				await this.#host.extensionRunner.emitHostInternalBeforeSessionMutation?.({ type: "session_switch" });
+			}
 			await lifecycle.captureRetained({ capturePersistedSessionFile: true });
 			await this.#host.flushPendingBash();
 			await this.#host.sessionManager.flush();
 			await this.#host.drainAndDetachAdvisorRecorders();
-			await lifecycle.captureRetained({ capturePersistedSessionFile: true });
+			await lifecycle.recaptureRetained({ capturePersistedSessionFile: true });
 			await lifecycle.acquireOwnership();
 
 			if (this.#host.extensionRunner) {
-				lifecycle.markPublicationStarted();
 				await this.#host.extensionRunner.emit({ type: "session_switch", reason: "handoff", previousSessionFile });
 			}
 

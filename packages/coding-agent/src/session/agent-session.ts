@@ -103,7 +103,7 @@ import {
 	isAdvisorTranscriptName,
 	loadAdvisorTranscriptCosts,
 } from "../advisor";
-import { type AsyncJob, AsyncJobManager } from "../async";
+import { type AsyncJob, type AsyncJobFilter, AsyncJobManager } from "../async";
 import { shouldEnableAppendOnlyContext } from "../config/append-only-context-mode";
 import type { ModelRegistry } from "../config/model-registry";
 import type { ResolvedModelRoleValue } from "../config/model-resolver";
@@ -219,6 +219,7 @@ import type { AgentSessionEvent, AgentSessionEventListener } from "./agent-sessi
 import type {
 	AgentSessionConfig,
 	AgentSessionDisposeOptions,
+	AsyncJobCounts,
 	AsyncJobSnapshot,
 	CommandMetadataChangedListener,
 	ContextUsageBreakdown,
@@ -413,6 +414,23 @@ type MessageEndPersistenceSlot = {
 
 type PostPromptSkipReason = "aborted" | "stale-generation";
 
+type AgentSessionAbortOptions = {
+	goalReason?: "interrupted" | "internal";
+	reason?: string;
+	preserveCompaction?: boolean;
+	preserveToolChoice?: boolean;
+	postPromptDrainTimeoutMs?: number;
+};
+
+type AbortIntent = {
+	goalReason: "interrupted" | "internal";
+	reason?: string;
+	preserveCompaction: boolean;
+	preserveToolChoice: boolean;
+	postPromptDrainTimeoutMs?: number;
+	strandedAdvisorCards: CustomMessage[];
+};
+
 type AgentContinueSkipReason =
 	| PostPromptSkipReason
 	| "session-unavailable"
@@ -537,6 +555,7 @@ export class AgentSession {
 	readonly #maintenance: SessionMaintenance;
 
 	// Branch summarization state
+	readonly #branchSummarySettlements = new Set<Promise<void>>();
 	#branchSummaryAbortController: AbortController | undefined = undefined;
 
 	readonly #handoff: SessionHandoff;
@@ -580,8 +599,8 @@ export class AgentSession {
 	 * across a `/new` is dropped regardless of job-id reuse.
 	 */
 	#asyncDeliveryEpoch = 0;
-	/** Deliveries already formatting before a transition fence was acquired. */
-	#activeAsyncJobDeliveries = new Set<Promise<void>>();
+	/** Deliveries already formatting before a transition fence was acquired, with their concrete ownership tokens. */
+	#activeAsyncJobDeliveries = new Map<Promise<void>, DeferredAsyncJobDelivery>();
 	/** Quarantines owner deliveries while a fallible session switch owns state. */
 	#asyncSessionTransition: AsyncSessionTransition | undefined;
 	/** Quarantines supervised-process completions while lifecycle ownership is undecided. */
@@ -589,6 +608,8 @@ export class AgentSession {
 	#activeLaunchCompletionReceiptForwards = new Set<Promise<void>>();
 	/** Idle delivery requested while lifecycle ownership is reversible; resumed only after commit or rollback publication. */
 	#lifecycleYieldFlushDeferred = false;
+	/** Lifecycle settlements that must finish before terminal shutdown publication. */
+	readonly #activeLifecycleSettlements = new Set<Promise<void>>();
 	/** Suppresses queued turns from the first retained checkpoint through irreversible lifecycle selection. */
 	#lifecycleTransitionFenceActive = false;
 
@@ -665,6 +686,9 @@ export class AgentSession {
 	readonly #loopGuards: LoopGuards;
 	#promptInFlightCount = 0;
 	#abortInProgress = false;
+	/** Exact shared promise for the one teardown currently in flight. */
+	#abortIntent: AbortIntent | undefined;
+	#abortPromise: Promise<void> | undefined;
 	// Wire-level agent_end emission deferred until #promptInFlightCount drops to 0.
 	// Internal extension hooks and post-emit work (auto-retry, auto-compaction, todo
 	// checks in #handleAgentEvent) still fire on the original schedule — only the
@@ -1778,9 +1802,9 @@ export class AgentSession {
 		this.#sessionBeforeSwitchReconciler = reconciler ?? undefined;
 	}
 
-	#sessionSwitchReconciler: (() => Promise<void>) | undefined;
+	#sessionSwitchReconciler: (() => Promise<"source-presentation-refresh-failed" | void>) | undefined;
 
-	setSessionSwitchReconciler(reconciler: (() => Promise<void>) | null): void {
+	setSessionSwitchReconciler(reconciler: (() => Promise<"source-presentation-refresh-failed" | void>) | null): void {
 		this.#sessionSwitchReconciler = reconciler ?? undefined;
 	}
 
@@ -1846,23 +1870,73 @@ export class AgentSession {
 	getAsyncJobSnapshot(options?: { recentLimit?: number }): AsyncJobSnapshot | null {
 		const manager = this.#asyncJobManager;
 		if (!manager) return null;
-		const ownerFilter = this.#agentId ? { ownerId: this.#agentId } : undefined;
-		const running = manager.getRunningJobs(ownerFilter).map(job => ({
+		let filter: AsyncJobFilter | undefined = this.#agentId ? { ownerId: this.#agentId } : undefined;
+		let deferredDeliveries: DeferredAsyncJobDelivery[] = [];
+		const transition = this.#asyncSessionTransition;
+		if (transition?.manager === manager && transition.selectedOutcome) {
+			const selectedRetained = transition.selectedOutcome === "rollback";
+			filter = selectedRetained
+				? { ownerId: transition.ownerId, jobs: transition.retainedJobs }
+				: { ownerId: transition.ownerId, excludeJobs: transition.retainedJobs };
+			deferredDeliveries = transition.deferredDeliveries.filter(
+				delivery =>
+					transition.retainedJobs.has(delivery.job) === selectedRetained &&
+					!manager.isDeliverySuppressed(delivery.jobId),
+			);
+		}
+		const running = manager.getRunningJobs(filter).map(job => ({
 			id: job.id,
 			type: job.type,
 			status: job.status,
 			label: job.label,
 			startTime: job.startTime,
 		}));
-		const recent = manager.getRecentJobs(options?.recentLimit ?? 5, ownerFilter).map(job => ({
+		const recent = manager.getRecentJobs(options?.recentLimit ?? 5, filter).map(job => ({
 			id: job.id,
 			type: job.type,
 			status: job.status,
 			label: job.label,
 			startTime: job.startTime,
 		}));
-		const delivery = manager.getDeliveryState(ownerFilter);
+		let delivery = manager.getDeliveryState(filter);
+		if (deferredDeliveries.length > 0) {
+			const pendingJobIds = new Set(delivery.pendingJobIds);
+			let added = 0;
+			for (const deferred of deferredDeliveries) {
+				if (pendingJobIds.has(deferred.jobId)) continue;
+				pendingJobIds.add(deferred.jobId);
+				added += 1;
+			}
+			delivery = {
+				...delivery,
+				queued: delivery.queued + added,
+				pendingJobIds: [...pendingJobIds],
+			};
+		}
 		return { running, recent, delivery };
+	}
+
+	getAsyncJobCounts(options?: { recentLimit?: number }): AsyncJobCounts | null {
+		const manager = this.#asyncJobManager;
+		if (!manager) return null;
+		let filter: AsyncJobFilter | undefined = this.#agentId ? { ownerId: this.#agentId } : undefined;
+		let deferredDeliveryCount = 0;
+		const transition = this.#asyncSessionTransition;
+		if (transition?.manager === manager && transition.selectedOutcome) {
+			const selectedRetained = transition.selectedOutcome === "rollback";
+			filter = selectedRetained
+				? { ownerId: transition.ownerId, jobs: transition.retainedJobs }
+				: { ownerId: transition.ownerId, excludeJobs: transition.retainedJobs };
+			for (const delivery of transition.deferredDeliveries) {
+				if (transition.retainedJobs.has(delivery.job) !== selectedRetained) continue;
+				if (!manager.isDeliverySuppressed(delivery.jobId)) deferredDeliveryCount++;
+			}
+		}
+		return {
+			running: manager.countRunningJobs(filter),
+			recentFailures: manager.countRecentFailures(options?.recentLimit ?? 5, filter),
+			pendingDelivery: manager.countPendingDeliveries(filter) + deferredDeliveryCount,
+		};
 	}
 
 	/**
@@ -1887,8 +1961,15 @@ export class AgentSession {
 		this.#asyncSessionTransition = transition;
 		try {
 			transition.yieldQueueTransaction = this.yieldQueue.beginTransaction(ASYNC_RESULT_MESSAGE_TYPE);
-			while (this.#activeAsyncJobDeliveries.size > 0) {
-				await Promise.allSettled([...this.#activeAsyncJobDeliveries]);
+			if (this.#activeAsyncJobDeliveries.size > 0) {
+				for (const delivery of this.#activeAsyncJobDeliveries.values()) {
+					if (delivery.manager !== manager) continue;
+					retainedJobs.add(delivery.job);
+					transition.deferredDeliveries.push(delivery);
+				}
+				// Formatting already in flight observes this epoch change and retires;
+				// the retained raw delivery above is replayed only for the selected side.
+				this.#asyncDeliveryEpoch += 1;
 			}
 		} catch (error) {
 			const failures: unknown[] = [error];
@@ -1991,8 +2072,8 @@ export class AgentSession {
 		transition.manager.discardJobs(jobs, { ownerId: transition.ownerId });
 	}
 
-	/** Replay deferred deliveries only after host publication activates their selected owner. */
-	async #activateAsyncSessionTransition(transition: AsyncSessionTransition, committed: boolean): Promise<void> {
+	/** Activate selected deliveries after host publication without awaiting formatter or artifact I/O. */
+	#activateAsyncSessionTransition(transition: AsyncSessionTransition, committed: boolean): void {
 		if (this.#asyncSessionTransition === transition) this.#asyncSessionTransition = undefined;
 		for (const delivery of transition.deferredDeliveries) {
 			const retained = transition.retainedJobs.has(delivery.job);
@@ -2008,13 +2089,17 @@ export class AgentSession {
 					);
 					continue;
 				}
-				await this.#deliverAsyncJobResult(delivery.manager, delivery.jobId, delivery.text, delivery.job);
+				if (delivery.manager.requeueDelivery(delivery.job, delivery.text)) continue;
+				logger.warn("Deferred async job delivery was dead-lettered after session transition", {
+					jobId: delivery.jobId,
+					outcome: committed ? "commit" : "rollback",
+				});
 			} catch (error) {
 				const requeued = delivery.manager.requeueDelivery(delivery.job, delivery.text);
 				logger.warn(
 					requeued
-						? "Deferred async job delivery failed after session transition; requeued"
-						: "Deferred async job delivery failed after session transition; dead-lettered",
+						? "Deferred async job delivery activation failed after session transition; requeued"
+						: "Deferred async job delivery activation failed after session transition; dead-lettered",
 					{
 						jobId: delivery.jobId,
 						outcome: committed ? "commit" : "rollback",
@@ -2059,6 +2144,7 @@ export class AgentSession {
 
 	/** Acquire the one fence that spans capture, selection, host publication, and activation. */
 	#beginLifecycleTransaction(options: { persistDetachedBash?: boolean } = {}): SessionLifecycleTransaction {
+		if (this.#isDisposed) throw new Error("Cannot start a lifecycle transaction after session disposal");
 		const releaseFence = this.#acquireLifecycleTransitionFence();
 		try {
 			this.#disconnectFromAgent();
@@ -2085,10 +2171,12 @@ export class AgentSession {
 				captureRuntimeFields: () => this.#captureRetainedRuntimeFields(),
 				restoreRuntimeFields: checkpoint => this.#restoreRetainedRuntimeFields(checkpoint),
 				syncAgentSessionId: sessionId => this.#syncAgentSessionId(sessionId, false, false),
-				reconcile: () => this.#sessionSwitchReconciler?.(),
+				reconcile: async () => {
+					await this.#sessionSwitchReconciler?.();
+				},
 				emitModelChanged: () => this.#emit({ type: "model_changed" }),
 			};
-			return new SessionLifecycleTransaction({
+			const lifecycle = new SessionLifecycleTransaction({
 				captureRetainedCheckpoint: captureOptions =>
 					captureRetainedSessionCheckpoint(lifecycleHost, captureOptions),
 				beginOwnership: () => new SessionLifecycleOwner(lifecycleHost, options),
@@ -2103,8 +2191,10 @@ export class AgentSession {
 							});
 						}
 					};
-					await activate("advisor recorder feeds", () => this.#advisors.reattachRecorderFeeds());
-					await activate("agent connection", () => this.#reconnectToAgent());
+					if (!this.#isDisposed) {
+						await activate("advisor recorder feeds", () => this.#advisors.reattachRecorderFeeds());
+						await activate("agent connection", () => this.#reconnectToAgent());
+					}
 					releaseFence();
 				},
 				publishRollback: this.#extensionRunner
@@ -2115,8 +2205,11 @@ export class AgentSession {
 							)
 					: undefined,
 			});
+			this.#activeLifecycleSettlements.add(lifecycle.settled);
+			void lifecycle.settled.then(() => this.#activeLifecycleSettlements.delete(lifecycle.settled));
+			return lifecycle;
 		} catch (error) {
-			this.#reconnectToAgent();
+			if (!this.#isDisposed) this.#reconnectToAgent();
 			releaseFence();
 			throw error;
 		}
@@ -2355,10 +2448,11 @@ export class AgentSession {
 			return Promise.resolve();
 		}
 
+		const deferred = { manager, jobId, text, job };
 		const delivery = this.#deliverAsyncJobResultNow(manager, jobId, text, job);
 		let tracked: Promise<void>;
 		tracked = delivery.finally(() => this.#activeAsyncJobDeliveries.delete(tracked));
-		this.#activeAsyncJobDeliveries.add(tracked);
+		this.#activeAsyncJobDeliveries.set(tracked, deferred);
 		return tracked;
 	}
 
@@ -4112,7 +4206,7 @@ export class AgentSession {
 	 * Preserves all existing listeners.
 	 */
 	#reconnectToAgent(): void {
-		if (this.#unsubscribeAgent) return; // Already connected
+		if (this.#isDisposed || this.#unsubscribeAgent) return;
 		this.#unsubscribeAgent = this.agent.subscribe(this.#handleAgentEvent);
 	}
 
@@ -4258,6 +4352,7 @@ export class AgentSession {
 		this.#memory.cancelLocalMemoryStartup();
 		this.#titleGenerationAbortController.abort();
 		this.#abortAutolearnCapture();
+		this.abortBranchSummary();
 		this.#irc.flushPending();
 		this.yieldQueue.clear();
 		this.agent.setAsideMessageProvider(undefined);
@@ -4365,29 +4460,26 @@ export class AgentSession {
 		this.#cancelExitRecorder = undefined;
 		this.#cancelFatalRecoveryHint?.();
 		this.#cancelFatalRecoveryHint = undefined;
+		// Stop fallback extension timers before aborting deferred work they could enqueue.
+		this.#fallbackExtensionTimers?.clearAll();
+		try {
+			await this.abort({
+				goalReason: "internal",
+				postPromptDrainTimeoutMs: POST_PROMPT_DRAIN_TIMEOUT_MS,
+			});
+		} catch (error) {
+			logger.warn("Session abort failed during dispose", { error: String(error) });
+		}
+		await Promise.all([...this.#branchSummarySettlements, ...this.#activeLifecycleSettlements]);
+		await this.#memory.transition;
+
+		// This is the terminal extension boundary: all abort, pre-fence side work,
+		// and lifecycle ownership has settled, and no later teardown calls extensions.
 		try {
 			await emitSessionShutdownEvent(this.#extensionRunner);
 		} catch (error) {
 			logger.warn("Failed to emit session_shutdown event", { error: String(error) });
 		}
-
-		// Stop fallback extension timers before aborting deferred work they could enqueue.
-		this.#fallbackExtensionTimers?.clearAll();
-		this.abortRetry();
-		this.abortCompaction();
-		const postPromptDrain = this.#cancelPostPromptTasks();
-		this.agent.abort();
-		try {
-			await withTimeout(
-				postPromptDrain,
-				POST_PROMPT_DRAIN_TIMEOUT_MS,
-				"Timed out draining post-prompt tasks during dispose",
-			);
-		} catch (error) {
-			logger.warn("Post-prompt tasks still draining at dispose deadline", { error: String(error) });
-		}
-		await this.#drainAutolearnCapture();
-		await this.#memory.transition;
 
 		const hindsightState = this.getHindsightSessionState();
 		const mnemopiState = setMnemopiSessionState(this, undefined);
@@ -5657,6 +5749,8 @@ export class AgentSession {
 	 * the ACP agent) use this to know whether to expect an `agent_end` event.
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<boolean> {
+		const abort = this.#abortPromise;
+		if (abort) await abort;
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 
 		// Handle extension commands first (execute immediately, even during streaming)
@@ -5780,6 +5874,8 @@ export class AgentSession {
 			queueOnly?: boolean;
 		},
 	): Promise<void> {
+		const abort = this.#abortPromise;
+		if (abort) await abort;
 		const textContent =
 			typeof message.content === "string"
 				? message.content
@@ -5844,6 +5940,8 @@ export class AgentSession {
 			acceptTerminalEmptyStop?: boolean;
 		},
 	): Promise<void> {
+		const abort = this.#abortPromise;
+		if (abort) await abort;
 		this.#beginInFlight();
 		const generation = this.#promptGeneration;
 		try {
@@ -6133,9 +6231,7 @@ export class AgentSession {
 			models: createExtensionModelQuery(this.#modelRegistry, this.settings, () => this.model ?? undefined),
 			isIdle: () => !this.isStreaming,
 			isCompacting: () => this.isCompacting,
-			abort: () => {
-				void this.abort();
-			},
+			abort: () => this.abort(),
 			hasPendingMessages: () => this.hasPendingMessages(),
 			shutdown: () => {
 				// Await the idempotent dispose() before exiting so the browser
@@ -6146,6 +6242,7 @@ export class AgentSession {
 			},
 			getContextUsage: () => this.getContextUsage(),
 			getAsyncJobSnapshot: () => this.getAsyncJobSnapshot(),
+			getAsyncJobCounts: () => this.getAsyncJobCounts(),
 			waitForIdle: () => this.waitForIdle(),
 			newSession: async options => {
 				const success = await this.newSession({ parentSession: options?.parentSession }, options?.setup);
@@ -6932,21 +7029,47 @@ export class AgentSession {
 	 * the transcript can distinguish a deliberate user interrupt from an opaque
 	 * abort. Omit it for internal/lifecycle aborts.
 	 */
-	async abort(options?: {
-		goalReason?: "interrupted" | "internal";
-		reason?: string;
-		/** Internal `/compact` startup keeps the manual-compaction marker alive while aborting the active turn. */
-		preserveCompaction?: boolean;
-		/** Destructive lifecycle transitions preserve this queue until ownership commit or rollback selects it. */
-		preserveToolChoice?: boolean;
-	}): Promise<void> {
-		const userInterrupt = options?.reason === USER_INTERRUPT_LABEL;
+	abort(options: AgentSessionAbortOptions = {}): Promise<void> {
+		if (this.#abortPromise) {
+			const intent = this.#abortIntent;
+			if (options.reason === USER_INTERRUPT_LABEL && intent && intent.reason !== USER_INTERRUPT_LABEL) {
+				intent.reason = USER_INTERRUPT_LABEL;
+				intent.goalReason = "interrupted";
+				intent.preserveCompaction = false;
+				intent.preserveToolChoice = false;
+				this.#pendingAbortErrorId = AIError.create(AIError.Flag.UserInterrupt);
+				this.#advisors.autoResumeSuppressed = true;
+				intent.strandedAdvisorCards.push(...this.#extractQueuedAdvisorCards());
+				this.abortCompaction();
+				this.agent.abort(USER_INTERRUPT_LABEL);
+			}
+			return this.#abortPromise;
+		}
+
+		const userInterrupt = options.reason === USER_INTERRUPT_LABEL;
+		const intent: AbortIntent = {
+			goalReason: userInterrupt ? "interrupted" : (options.goalReason ?? "interrupted"),
+			reason: options.reason,
+			preserveCompaction: options.preserveCompaction === true,
+			preserveToolChoice: options.preserveToolChoice === true,
+			postPromptDrainTimeoutMs: options.postPromptDrainTimeoutMs,
+			strandedAdvisorCards: userInterrupt ? this.#extractQueuedAdvisorCards() : [],
+		};
+		this.#abortIntent = intent;
 		this.#pendingAbortErrorId = userInterrupt ? AIError.create(AIError.Flag.UserInterrupt) : undefined;
 		if (userInterrupt) this.#advisors.autoResumeSuppressed = true;
-		// Pull advisor concerns out of the steer/follow-up queues before any await so
-		// the post-abort stranded-message drain can't auto-resume the run on them.
-		// They are re-recorded as visible advice once the agent settles (below).
-		const strandedAdvisorCards = userInterrupt ? this.#extractQueuedAdvisorCards() : [];
+
+		let operation: Promise<void>;
+		operation = this.#performAbort(intent).finally(() => {
+			if (this.#abortIntent === intent) this.#abortIntent = undefined;
+			if (this.#abortPromise === operation) this.#abortPromise = undefined;
+			this.#drainStrandedQueuedMessages();
+		});
+		this.#abortPromise = operation;
+		return operation;
+	}
+
+	async #performAbort(intent: AbortIntent): Promise<void> {
 		// Session switch/compact paths disconnect first; explicit aborts should
 		// leave any queued steer/follow-up visible for the user rather than
 		// auto-starting a fresh turn during cleanup.
@@ -6959,55 +7082,54 @@ export class AgentSession {
 			this.#scheduledHiddenNextTurnGeneration = undefined;
 			// Abort the handoff first so generic compaction cancellation cannot replace
 			// the harness reason with an unreasoned "Handoff cancelled".
-			this.#handoff.abortHandoff(new Error(options?.reason ?? "Handoff aborted by session"));
-			if (options?.preserveCompaction) {
+			this.#handoff.abortHandoff(new Error(intent.reason ?? "Handoff aborted by session"));
+			if (intent.preserveCompaction) {
 				// Manual `/compact` installed its own #compactionAbortController before
-				// this internal abort and must keep it alive (that marker is what makes
-				// isCompacting report true during startup). Any in-flight
-				// auto-compaction MUST still be cancelled, though: otherwise a
-				// background maintenance pass races the manual run and both
-				// appendCompaction/replaceMessages, double-rewriting session history.
+				// this internal abort and must keep it alive. Automatic compaction must
+				// still be cancelled so it cannot race the manual rewrite.
 				this.#maintenance.abortAutomaticCompaction();
 			} else {
 				this.abortCompaction();
 			}
 			this.abortBash();
-			this.abortEval();
+			// Disposal gives tracked eval work its bounded grace period in
+			// EvalRunner.disposeKernels(); ordinary aborts still cancel it immediately.
+			if (!this.#isDisposed) this.abortEval();
 			const postPromptDrain = this.#cancelPostPromptTasks();
-			this.agent.abort(options?.reason);
-			await postPromptDrain;
+			this.agent.abort(intent.reason);
+			if (intent.postPromptDrainTimeoutMs === undefined) {
+				await postPromptDrain;
+			} else {
+				try {
+					await withTimeout(
+						postPromptDrain,
+						intent.postPromptDrainTimeoutMs,
+						"Timed out draining post-prompt tasks during dispose",
+					);
+				} catch (error) {
+					logger.warn("Post-prompt tasks still draining at dispose deadline", { error: String(error) });
+				}
+			}
 			await this.agent.waitForIdle();
 			await this.#drainAutolearnCapture();
-			await this.#goalRuntime.onTaskAborted({ reason: options?.goalReason ?? "interrupted" });
+			await this.#goalRuntime.onTaskAborted({ reason: intent.goalReason });
 			// Clear prompt-in-flight state: waitForIdle resolves when the agent loop's finally
-			// block runs, but nested prompt setup/finalizers may still be unwinding. Without this,
-			// a subsequent prompt() can incorrectly observe the session as busy after an abort.
+			// block runs, but nested prompt setup/finalizers may still be unwinding.
 			this.#resetInFlight();
 			this.#resetSessionStopContinuationState();
 			this.#clearPendingSessionStopContinuations();
-			// Safety net: if the agent loop aborted without producing an assistant
-			// message (e.g. failed before the first stream), the in-flight yield was
-			// never resolved or rejected by the normal message_end path. Reject it now
-			// so any requeue callback still fires and the queue stays consistent.
-			if (!options?.preserveToolChoice && this.#toolChoiceQueue.hasInFlight) {
+			if (!intent.preserveToolChoice && this.#toolChoiceQueue.hasInFlight) {
 				this.#toolChoiceQueue.reject("aborted");
 			}
-			// Re-record advisor concerns the interrupt would otherwise strand, as
-			// visible/persisted advice without triggering a turn (the agent is idle
-			// now): cards steered into the queue before the user stopped, plus any
-			// that arrived via enqueueAdvice mid-abort and were parked hidden in
-			// #pendingNextTurnMessages while the turn was still tearing down. Other
-			// deferred next-turn context (non-advisor) stays queued, in order.
 			const parkedAdvisorCards = this.#pendingNextTurnMessages.filter(isAdvisorCard);
 			if (parkedAdvisorCards.length > 0) {
 				this.#pendingNextTurnMessages = this.#pendingNextTurnMessages.filter(m => !isAdvisorCard(m));
 			}
-			for (const card of [...strandedAdvisorCards, ...parkedAdvisorCards]) {
+			for (const card of [...intent.strandedAdvisorCards, ...parkedAdvisorCards]) {
 				this.#preserveAdvisorCard(card);
 			}
 		} finally {
 			this.#abortInProgress = false;
-			this.#drainStrandedQueuedMessages();
 		}
 	}
 
@@ -7036,16 +7158,19 @@ export class AgentSession {
 
 		const lifecycle = this.#beginLifecycleTransaction({ persistDetachedBash: options?.drop !== true });
 		try {
+			if (this.#extensionRunner) {
+				lifecycle.markPublicationStarted();
+				await this.#extensionRunner.emitHostInternalBeforeSessionMutation?.({ type: "session_switch" });
+			}
 			await lifecycle.captureRetained({ capturePersistedSessionFile: true });
 			await this.abort({ goalReason: "internal", preserveToolChoice: true });
 			await this.#bash.flushPending();
 			await this.sessionManager.flush();
 			await this.#advisors.drainAndDetachRecorders();
-			await lifecycle.captureRetained({ capturePersistedSessionFile: true });
+			await lifecycle.recaptureRetained({ capturePersistedSessionFile: true });
 			await lifecycle.acquireOwnership();
 
 			if (this.#extensionRunner) {
-				lifecycle.markPublicationStarted();
 				await this.#extensionRunner.emit({ type: "session_switch", reason: "new", previousSessionFile });
 			}
 
@@ -7060,7 +7185,6 @@ export class AgentSession {
 			this.#syncAgentSessionId(undefined, false, false);
 			this.#memory.rekeyForCurrentSessionId();
 			await this.#memory.resetContextForNewTranscript();
-
 
 			this.sessionManager.appendThinkingLevelChange(this.thinkingLevel, this.configuredThinkingLevel());
 			this.sessionManager.appendServiceTierChange(this.#models.serviceTierEntry());
@@ -7141,11 +7265,15 @@ export class AgentSession {
 		const forkCancelled = Symbol("fork cancelled");
 		const lifecycle = this.#beginLifecycleTransaction();
 		try {
+			if (this.#extensionRunner) {
+				lifecycle.markPublicationStarted();
+				await this.#extensionRunner.emitHostInternalBeforeSessionMutation?.({ type: "session_switch" });
+			}
 			await lifecycle.captureRetained({ capturePersistedSessionFile: true });
 			await this.#bash.flushPending();
 			await this.sessionManager.flush();
 			await this.#advisors.drainAndDetachRecorders();
-			await lifecycle.captureRetained({ capturePersistedSessionFile: true });
+			await lifecycle.recaptureRetained({ capturePersistedSessionFile: true });
 			await lifecycle.acquireOwnership();
 
 			const sourceArtifactsDir = this.sessionManager.getArtifactsDir();
@@ -7162,19 +7290,22 @@ export class AgentSession {
 			const artifactCloneTransaction =
 				await this.sessionManager.beginArtifactCloneTransaction(advisorTranscriptFiles);
 			if (artifactCloneTransaction) {
-				lifecycle.addCommitSeal("fork artifact clone", () => artifactCloneTransaction.commit());
-				lifecycle.addTargetCleanup("fork artifact clone", () => artifactCloneTransaction.rollback());
+				lifecycle.bindResource("fork artifact clone", {
+					commit: () => artifactCloneTransaction.commit(),
+					rollback: () => artifactCloneTransaction.rollback(),
+				});
 			}
 
 			if (this.#extensionRunner) {
-				lifecycle.markPublicationStarted();
 				await this.#extensionRunner.emit({ type: "session_switch", reason: "fork", previousSessionFile });
 			}
 
-			const forkResult = await this.sessionManager.fork();
-			if (!forkResult) throw forkCancelled;
+			if (!previousSessionFile) throw forkCancelled;
 			if (!artifactCloneTransaction) throw new Error("Persisted fork did not acquire an artifact clone transaction");
-			await artifactCloneTransaction.publish(forkResult.newSessionFile);
+			const forkResult = await this.sessionManager.fork(newSessionFile =>
+				artifactCloneTransaction.publish(newSessionFile),
+			);
+			if (!forkResult) throw forkCancelled;
 			lifecycle.markTarget();
 
 			this.#freshProviderSessionId = undefined;
@@ -8079,19 +8210,22 @@ export class AgentSession {
 
 		const lifecycle = this.#beginLifecycleTransaction();
 		try {
+			if (this.#extensionRunner) {
+				lifecycle.markPublicationStarted();
+				await this.#extensionRunner.emitHostInternalBeforeSessionMutation?.({ type: "session_switch" });
+			}
 			await lifecycle.captureRetained({ capturePersistedSessionFile: true });
 			await this.abort({ goalReason: "internal", preserveToolChoice: true });
 			await this.#sessionBeforeSwitchReconciler?.();
 			await this.#bash.flushPending();
 			await this.sessionManager.flush();
 			await this.#advisors.drainAndDetachRecorders();
-			await lifecycle.captureRetained({ capturePersistedSessionFile: true });
+			await lifecycle.recaptureRetained({ capturePersistedSessionFile: true });
 			const targetPersistedSessionFile = await this.sessionManager.capturePersistedSessionFileAt(sessionPath);
 			const previousSessionContext = switchingToDifferentSession ? undefined : this.buildDisplaySessionContext();
 			await lifecycle.acquireOwnership();
 
 			if (this.#extensionRunner) {
-				lifecycle.markPublicationStarted();
 				await this.#extensionRunner.emit({
 					type: "session_switch",
 					reason: "resume",
@@ -8109,14 +8243,20 @@ export class AgentSession {
 
 			await this.sessionManager.setSessionFile(sessionPath);
 			const targetArtifactTransaction = await this.sessionManager.beginArtifactTransaction();
-			lifecycle.addCommitSeal("target artifact transaction", () => targetArtifactTransaction.commit());
-			lifecycle.addTargetCleanup("target artifact transaction", () => targetArtifactTransaction.rollback());
+			lifecycle.bindResource("target artifact transaction", {
+				commit: () => targetArtifactTransaction.commit(),
+				rollback: () => targetArtifactTransaction.rollback(),
+				release: () => targetArtifactTransaction.commit(),
+			});
 			lifecycle.addTargetCleanup("target session journal", async () => {
-				if (!(await this.sessionManager.restorePersistedSessionFile(targetPersistedSessionFile))) {
+				if (
+					!(await this.sessionManager.restorePersistedSessionFile(targetPersistedSessionFile, {
+						preserveNewerMutations: false,
+					}))
+				) {
 					throw new Error("Target session journal preimage could not be restored");
 				}
 			});
-			lifecycle.addRollbackRelease("target artifact transaction", () => targetArtifactTransaction.commit());
 			lifecycle.markTarget();
 			if (switchingToDifferentSession) {
 				this.#freshProviderSessionId = undefined;
@@ -8205,8 +8345,15 @@ export class AgentSession {
 
 			if (switchingToDifferentSession) await this.#memory.resetContextForNewTranscript();
 			const discardRetainedSessionToolState = switchingToDifferentSession || didReloadConversationChange;
-			await this.#sessionSwitchReconciler?.();
-			await this.refreshBaseSystemPrompt();
+			const reconciliation = await this.#sessionSwitchReconciler?.();
+			try {
+				await this.refreshBaseSystemPrompt();
+			} catch (error) {
+				if (reconciliation !== "source-presentation-refresh-failed") throw error;
+				logger.warn("Failed to refresh target session prompt after source presentation cleanup failed", {
+					error: String(error),
+				});
+			}
 			if (switchingToDifferentSession) {
 				this.#advisors.restoreCost(await loadAdvisorTranscriptCosts(this.sessionFile));
 			}
@@ -8237,6 +8384,7 @@ export class AgentSession {
 				cause: error,
 				message: "Session switch failed and rollback was incomplete",
 				reconcileMode: true,
+				preserveNewerRetainedMutations: switchingToDifferentSession,
 			});
 			throw error;
 		}
@@ -8275,7 +8423,6 @@ export class AgentSession {
 			skipConversationRestore = result?.skipConversationRestore ?? false;
 		}
 
-
 		await this.#bash.flushPending();
 		await this.sessionManager.flush();
 		this.#abortAutolearnCapture();
@@ -8292,8 +8439,10 @@ export class AgentSession {
 				? await this.sessionManager.beginArtifactCloneTransaction()
 				: undefined;
 			if (artifactCloneTransaction) {
-				lifecycle.addCommitSeal("branch artifact clone", () => artifactCloneTransaction.commit());
-				lifecycle.addTargetCleanup("branch artifact clone", () => artifactCloneTransaction.rollback());
+				lifecycle.bindResource("branch artifact clone", {
+					commit: () => artifactCloneTransaction.commit(),
+					rollback: () => artifactCloneTransaction.rollback(),
+				});
 			}
 
 			this.#pendingNextTurnMessages = [];
@@ -8307,12 +8456,16 @@ export class AgentSession {
 				await this.sessionManager.newSession({ parentSession: previousSessionFile });
 				if (title) await this.sessionManager.setSessionName(title, titleSource);
 			} else {
-				const branchedSessionFile = this.sessionManager.createBranchedSession(selectedEntry.parentId);
-				if (artifactCloneTransaction) {
-					if (!branchedSessionFile) throw new Error("Persisted branch did not create a replacement session file");
-					await artifactCloneTransaction.publish(branchedSessionFile);
-				} else if (branchedSessionFile) {
+				if (previousSessionFile && !artifactCloneTransaction) {
 					throw new Error("Persisted branch did not acquire an artifact clone transaction");
+				}
+				const branchedSessionFile = artifactCloneTransaction
+					? await this.sessionManager.createBranchedSession(selectedEntry.parentId, newSessionFile =>
+							artifactCloneTransaction.publish(newSessionFile),
+						)
+					: this.sessionManager.createBranchedSession(selectedEntry.parentId);
+				if (previousSessionFile && !branchedSessionFile) {
+					throw new Error("Persisted branch did not create a replacement session file");
 				}
 			}
 			lifecycle.markTarget();
@@ -8336,7 +8489,6 @@ export class AgentSession {
 					: () => this.#closeCodexProviderSessionsForHistoryRewrite(),
 			};
 			if (this.#extensionRunner) {
-				lifecycle.markPublicationStarted();
 				await this.#extensionRunner.emitWithHostCompletion({ type: "session_branch", previousSessionFile }, () =>
 					lifecycle.prepareCommit(commitOptions),
 				);
@@ -8424,8 +8576,10 @@ export class AgentSession {
 			if (!artifactCloneTransaction) {
 				throw new Error("Persisted /btw branch did not acquire an artifact clone transaction");
 			}
-			lifecycle.addCommitSeal("/btw artifact clone", () => artifactCloneTransaction.commit());
-			lifecycle.addTargetCleanup("/btw artifact clone", () => artifactCloneTransaction.rollback());
+			lifecycle.bindResource("/btw artifact clone", {
+				commit: () => artifactCloneTransaction.commit(),
+				rollback: () => artifactCloneTransaction.rollback(),
+			});
 
 			this.#pendingNextTurnMessages = [];
 			this.#scheduledHiddenNextTurnGeneration = undefined;
@@ -8433,9 +8587,10 @@ export class AgentSession {
 			this.#queuedMessageDrainBlocked = false;
 			this.#usagePreflightReadyForNextModelCall = false;
 			this.#usagePreflightReadyModel = undefined;
-			const branchedSessionFile = this.sessionManager.createBranchedSession(leafId);
+			const branchedSessionFile = await this.sessionManager.createBranchedSession(leafId, newSessionFile =>
+				artifactCloneTransaction.publish(newSessionFile),
+			);
 			if (!branchedSessionFile) throw new Error("Persisted /btw branch did not create a replacement session file");
-			await artifactCloneTransaction.publish(branchedSessionFile);
 			lifecycle.markTarget();
 
 			this.#rehydrateCheckpointRewindState();
@@ -8457,7 +8612,6 @@ export class AgentSession {
 				finalizeProviderSessions: () => this.#closeCodexProviderSessionsForHistoryRewrite(),
 			};
 			if (this.#extensionRunner) {
-				lifecycle.markPublicationStarted();
 				await this.#extensionRunner.emitWithHostCompletion({ type: "session_branch", previousSessionFile }, () =>
 					lifecycle.prepareCommit(commitOptions),
 				);
@@ -8626,66 +8780,73 @@ export class AgentSession {
 		this.#branchSummaryAbortController = new AbortController();
 		let hookSummary: { summary: string; details?: unknown } | undefined;
 		let fromExtension = false;
-
-		// Emit session_before_tree event
-		if (this.#extensionRunner?.hasHandlers("session_before_tree")) {
-			const result = (await this.#extensionRunner.emit({
-				type: "session_before_tree",
-				preparation,
-				signal: this.#branchSummaryAbortController.signal,
-			})) as SessionBeforeTreeResult | undefined;
-
-			if (result?.cancel) {
-				return { cancelled: true };
-			}
-
-			if (result?.summary && options.summarize) {
-				hookSummary = result.summary;
-				fromExtension = true;
-			}
-		}
-
-		// Run default summarizer if needed
 		let summaryText: string | undefined;
 		let summaryDetails: unknown;
-		if (options.summarize && entriesToSummarize.length > 0 && !hookSummary) {
-			const model = this.model!;
-			const apiKey = await this.#modelRegistry.getApiKey(model, this.sessionId);
-			if (!apiKey) {
-				throw new Error(`No API key for ${model.provider}`);
+		const summarySettlement = Promise.withResolvers<void>();
+		this.#branchSummarySettlements.add(summarySettlement.promise);
+		try {
+			// Emit session_before_tree event
+			if (this.#extensionRunner?.hasHandlers("session_before_tree")) {
+				const result = (await this.#extensionRunner.emit({
+					type: "session_before_tree",
+					preparation,
+					signal: this.#branchSummaryAbortController.signal,
+				})) as SessionBeforeTreeResult | undefined;
+
+				if (result?.cancel) {
+					return { cancelled: true };
+				}
+
+				if (result?.summary && options.summarize) {
+					hookSummary = result.summary;
+					fromExtension = true;
+				}
 			}
-			const branchSummarySettings = this.settings.getGroup("branchSummary");
-			const result = await generateBranchSummary(entriesToSummarize, {
-				model,
-				apiKey: this.#modelRegistry.resolver(model, this.sessionId),
-				signal: this.#branchSummaryAbortController.signal,
-				customInstructions: this.#obfuscateTextForProvider(options.customInstructions),
-				reserveTokens: branchSummarySettings.reserveTokens,
-				metadata: this.agent.metadataForProvider(model.provider),
-				convertToLlm: messages => this.#convertToLlmForSideRequest(messages),
-				telemetry: resolveTelemetry(this.agent.telemetry, this.sessionId),
-				// Same per-provider concurrency cap rationale as the compaction
-				// path above (chatgpt-codex review on #3751).
-				completeImpl: async (requestModel, requestContext, requestOptions) => {
-					const stream = await this.#sideStreamFn(requestModel, requestContext, requestOptions);
-					return stream.result();
-				},
-			});
+
+			// Run default summarizer if needed
+			if (options.summarize && entriesToSummarize.length > 0 && !hookSummary) {
+				const model = this.model!;
+				const apiKey = await this.#modelRegistry.getApiKey(model, this.sessionId);
+				if (!apiKey) {
+					throw new Error(`No API key for ${model.provider}`);
+				}
+				const branchSummarySettings = this.settings.getGroup("branchSummary");
+				const result = await generateBranchSummary(entriesToSummarize, {
+					model,
+					apiKey: this.#modelRegistry.resolver(model, this.sessionId),
+					signal: this.#branchSummaryAbortController.signal,
+					customInstructions: this.#obfuscateTextForProvider(options.customInstructions),
+					reserveTokens: branchSummarySettings.reserveTokens,
+					metadata: this.agent.metadataForProvider(model.provider),
+					convertToLlm: messages => this.#convertToLlmForSideRequest(messages),
+					telemetry: resolveTelemetry(this.agent.telemetry, this.sessionId),
+					// Same per-provider concurrency cap rationale as the compaction
+					// path above (chatgpt-codex review on #3751).
+					completeImpl: async (requestModel, requestContext, requestOptions) => {
+						const stream = await this.#sideStreamFn(requestModel, requestContext, requestOptions);
+						return stream.result();
+					},
+				});
+				this.#branchSummaryAbortController = undefined;
+				if (result.aborted) {
+					return { cancelled: true, aborted: true };
+				}
+				if (result.error) {
+					throw new Error(result.error);
+				}
+				summaryText = result.summary;
+				summaryDetails = {
+					readFiles: result.readFiles || [],
+					modifiedFiles: result.modifiedFiles || [],
+				};
+			} else if (hookSummary) {
+				summaryText = hookSummary.summary;
+				summaryDetails = hookSummary.details;
+			}
+		} finally {
 			this.#branchSummaryAbortController = undefined;
-			if (result.aborted) {
-				return { cancelled: true, aborted: true };
-			}
-			if (result.error) {
-				throw new Error(result.error);
-			}
-			summaryText = result.summary;
-			summaryDetails = {
-				readFiles: result.readFiles || [],
-				modifiedFiles: result.modifiedFiles || [],
-			};
-		} else if (hookSummary) {
-			summaryText = hookSummary.summary;
-			summaryDetails = hookSummary.details;
+			summarySettlement.resolve();
+			this.#branchSummarySettlements.delete(summarySettlement.promise);
 		}
 
 		// Determine the new leaf position based on target type
@@ -8703,9 +8864,11 @@ export class AgentSession {
 				lifecycle.markPublicationStarted();
 				await this.#extensionRunner?.emitHostInternalBeforeSessionMutation?.({ type: "session_tree" });
 				const artifactTransaction = await this.sessionManager.beginArtifactTransaction();
-				lifecycle.addCommitSeal("tree artifact transaction", () => artifactTransaction.commit());
-				lifecycle.addTargetCleanup("tree artifact transaction", () => artifactTransaction.rollback());
-				lifecycle.addRollbackRelease("tree artifact transaction", () => artifactTransaction.commit());
+				lifecycle.bindResource("tree artifact transaction", {
+					commit: () => artifactTransaction.commit(),
+					rollback: () => artifactTransaction.rollback(),
+					release: () => artifactTransaction.commit(),
+				});
 			})();
 			await hostMutationQuiescence;
 		};
@@ -8805,7 +8968,6 @@ export class AgentSession {
 			// Emit session_tree only when ordinary handlers exist, preserving the
 			// existing no-handler fast path and context reuse.
 			if (this.#extensionRunner?.hasHandlers("session_tree")) {
-				lifecycle.markPublicationStarted();
 				await this.#extensionRunner.emitWithHostCompletion(
 					{
 						type: "session_tree",
@@ -8833,10 +8995,9 @@ export class AgentSession {
 			await lifecycle.rollback({
 				cause: error,
 				message: "Tree navigation failed and rollback was incomplete",
+				preserveNewerRetainedMutations: false,
 			});
 			throw error;
-		} finally {
-			this.#branchSummaryAbortController = undefined;
 		}
 	}
 

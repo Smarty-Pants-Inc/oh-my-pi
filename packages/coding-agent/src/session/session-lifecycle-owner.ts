@@ -31,6 +31,7 @@ export interface RetainedSessionTransitionCheckpoint {
 		cleanupReplacement?: boolean;
 		reconcileMode?: boolean;
 		rewriteRetainedEntries?: boolean;
+		preserveNewerRetainedMutations?: boolean;
 	}): Promise<void>;
 }
 
@@ -1023,6 +1024,7 @@ async function restoreRetainedSessionCheckpoint(
 		cleanupReplacement?: boolean;
 		reconcileMode?: boolean;
 		rewriteRetainedEntries?: boolean;
+		preserveNewerRetainedMutations?: boolean;
 	} = {},
 ): Promise<void> {
 	const restorationErrors: unknown[] = [];
@@ -1043,23 +1045,61 @@ async function restoreRetainedSessionCheckpoint(
 		await attemptRestore(() => host.sessionManager.dropSession(replacementSessionFile));
 	}
 
+	let authoritativeSessionManagerState = checkpoint.sessionManagerState;
+	let authoritativePersistedSessionFile = checkpoint.persistedSessionFile;
+	let newerRetainedJournalCaptured = false;
 	const restoreSessionManager = async (): Promise<void> => {
-		await attemptRestore(() => host.sessionManager.restoreState(checkpoint.sessionManagerState));
-		if (options.rewriteRetainedEntries && checkpoint.persistedSessionFile) {
-			let restoredPersistedFile: boolean | undefined;
-			await attemptRestore(async () => {
-				restoredPersistedFile = await host.sessionManager.restorePersistedSessionFile(
-					checkpoint.persistedSessionFile,
-				);
-			});
-			if (restoredPersistedFile === false) {
-				restorationErrors.push(new Error("Retained session journal preimage could not be restored"));
-				await attemptRestore(() => host.sessionManager.rewriteEntries());
-			}
-			// Durable restoration updates writer/title bookkeeping as a side effect;
-			// reapply the deep snapshot so every in-memory field remains exact too.
-			await attemptRestore(() => host.sessionManager.restoreState(checkpoint.sessionManagerState));
+		await attemptRestore(() => host.sessionManager.restoreState(authoritativeSessionManagerState));
+		if (!options.rewriteRetainedEntries || !authoritativePersistedSessionFile) return;
+
+		const preserveNewerMutations = options.preserveNewerRetainedMutations !== false && !newerRetainedJournalCaptured;
+		let restoredPersistedFile: boolean | undefined;
+		await attemptRestore(async () => {
+			restoredPersistedFile = await host.sessionManager.restorePersistedSessionFile(
+				authoritativePersistedSessionFile,
+				{ preserveNewerMutations },
+			);
+		});
+		if (restoredPersistedFile === false) {
+			restorationErrors.push(new Error("Retained session journal preimage could not be restored"));
+			await attemptRestore(() => host.sessionManager.rewriteEntries());
 		}
+
+		if (preserveNewerMutations) {
+			// The first restore may retain durable appends accepted after the
+			// checkpoint. Freeze that merged journal as the rollback authority so
+			// reconciliation mutations from later passes are still removed.
+			await attemptRestore(() =>
+				host.sessionManager.restoreState(checkpoint.sessionManagerState, {
+					preserveCurrentJournal: true,
+				}),
+			);
+			let currentState = host.sessionManager.captureState();
+			if (currentState.journalMutationGeneration > authoritativePersistedSessionFile.mutationGeneration) {
+				let currentPersistedSessionFile: PersistedSessionFileSnapshot | undefined;
+				let currentPersistedSessionFileCaptured = false;
+				await attemptRestore(async () => {
+					do {
+						currentPersistedSessionFile = await host.sessionManager.capturePersistedSessionFile();
+						currentState = host.sessionManager.captureState();
+					} while (
+						currentPersistedSessionFile &&
+						currentPersistedSessionFile.mutationGeneration !== currentState.journalMutationGeneration
+					);
+					currentPersistedSessionFileCaptured = true;
+				});
+				if (currentPersistedSessionFileCaptured && currentPersistedSessionFile) {
+					authoritativeSessionManagerState = currentState;
+					authoritativePersistedSessionFile = currentPersistedSessionFile;
+				}
+			}
+			newerRetainedJournalCaptured = true;
+			return;
+		}
+
+		// Durable restoration updates writer/title bookkeeping as a side effect;
+		// reapply the authoritative in-memory snapshot too.
+		await attemptRestore(() => host.sessionManager.restoreState(authoritativeSessionManagerState));
 	};
 	const modelBeforeRollback = host.model();
 	const restoreRuntime = async (): Promise<void> => {

@@ -690,18 +690,30 @@ describe("AgentSession.branchFromBtw", () => {
 		activeSession.toggleAdvisorEnabled();
 		const advisor = activeSession.getAdvisorAgent();
 		if (!advisor) throw new Error("Expected advisor agent to exist");
+		const activeAdvisor = advisor;
 		activeSession.sessionManager.appendMessage({ role: "user", content: "seed", timestamp: Date.now() });
 		await activeSession.sessionManager.flush();
 		const createBranchedSession = activeSession.sessionManager.createBranchedSession.bind(
 			activeSession.sessionManager,
 		);
-		vi.spyOn(activeSession.sessionManager, "createBranchedSession").mockImplementation(parentId => {
-			const result = createBranchedSession(parentId);
+		function createBranchedSessionMock(parentId: string): string | undefined;
+		function createBranchedSessionMock(
+			parentId: string,
+			beforeJournalPublish: (newSessionFile: string) => void | Promise<void>,
+		): Promise<string | undefined>;
+		function createBranchedSessionMock(
+			parentId: string,
+			beforeJournalPublish?: (newSessionFile: string) => void | Promise<void>,
+		): string | undefined | Promise<string | undefined> {
+			const result = beforeJournalPublish
+				? createBranchedSession(parentId, beforeJournalPublish)
+				: createBranchedSession(parentId);
 			const lateMessage = createBtwAssistant();
 			lateMessage.usage.cost.total = 9;
-			advisor.emitExternalEvent({ type: "message_end", message: lateMessage });
+			activeAdvisor.emitExternalEvent({ type: "message_end", message: lateMessage });
 			return result;
-		});
+		}
+		vi.spyOn(activeSession.sessionManager, "createBranchedSession").mockImplementation(createBranchedSessionMock);
 
 		const result = await activeSession.branchFromBtw(
 			"question",

@@ -71,6 +71,13 @@ export interface AsyncJobSnapshot {
 	delivery: AsyncJobDeliveryState;
 }
 
+/** Allocation-free aggregate used by high-frequency status samplers. */
+export interface AsyncJobCounts {
+	running: number;
+	recentFailures: number;
+	pendingDelivery: number;
+}
+
 export type { ShakeMode, ShakeResult } from "./shake-types";
 
 /**

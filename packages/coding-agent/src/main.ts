@@ -11,6 +11,7 @@ import { EventLoopKeepalive } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import {
 	$env,
+	consumeFreshOmpCompanionLaunchEnv,
 	directoryExists,
 	getLogPath,
 	getProjectDir,
@@ -59,7 +60,7 @@ import type { ExtensionUIContext } from "./extensibility/extensions/types";
 import { scheduleMarketplaceAutoUpdate } from "./extensibility/plugins/marketplace-auto-update";
 import { registerDaemonProjectPresence } from "./launch/presence";
 import type { MCPManager } from "./mcp";
-import { createFreshOmpCompanionController } from "./modes/fresh-omp-companion";
+import { createFreshOmpCompanionController, type FreshOmpCompanionController } from "./modes/fresh-omp-companion";
 import { InteractiveMode } from "./modes/interactive-mode";
 import type { PrintModeOptions } from "./modes/print-mode";
 import { claimRpcInput } from "./modes/rpc/rpc-input";
@@ -114,8 +115,10 @@ export function resolveFreshOmpCompanionSecret(options: {
 	isInteractive: boolean;
 	noSession: boolean;
 	parentTaskPrefix?: string;
+	freshProvenance: boolean;
 	taskDepth?: number;
 	env: Readonly<Record<string, string | undefined>>;
+	launchEnv: Readonly<Record<string, string | undefined>> | undefined;
 }): Uint8Array | undefined {
 	if (
 		!options.isInteractive ||
@@ -125,9 +128,16 @@ export function resolveFreshOmpCompanionSecret(options: {
 	) {
 		return undefined;
 	}
-	if (options.env.FRESH_OMP_COMPANION !== "1" || options.env.TMUX || options.env.STY) return undefined;
+	if (
+		!options.freshProvenance ||
+		options.launchEnv?.FRESH_OMP_COMPANION !== "1" ||
+		options.env.TMUX ||
+		options.env.STY
+	) {
+		return undefined;
+	}
 
-	const token = options.env.FRESH_OMP_COMPANION_TOKEN;
+	const token = options.launchEnv.FRESH_OMP_COMPANION_TOKEN;
 	if (!token || !FRESH_OMP_COMPANION_TOKEN_PATTERN.test(token)) return undefined;
 	const secret = Buffer.from(token, "base64url");
 	if (secret.byteLength !== 32 || secret.toString("base64url") !== token) return undefined;
@@ -135,19 +145,26 @@ export function resolveFreshOmpCompanionSecret(options: {
 }
 
 /**
- * Resolve the private Fresh companion capability, then remove its single-use
- * transport values before public extensions or child-process setup can inherit
- * them. The controller retains the decoded secret, never the environment token.
+ * Resolve the private Fresh companion capability only from captured launch
+ * authority, then erase both captured and live transport values before public
+ * extensions or child-process setup can inherit them.
  */
 export function consumeFreshOmpCompanionSecret(
-	options: Omit<Parameters<typeof resolveFreshOmpCompanionSecret>[0], "env"> & {
+	options: Omit<Parameters<typeof resolveFreshOmpCompanionSecret>[0], "env" | "launchEnv"> & {
 		env: Record<string, string | undefined>;
+		launchEnv: Record<string, string | undefined> | undefined;
 	},
 ): Uint8Array | undefined {
-	const secret = resolveFreshOmpCompanionSecret(options);
-	delete options.env.FRESH_OMP_COMPANION;
-	delete options.env.FRESH_OMP_COMPANION_TOKEN;
-	return secret;
+	try {
+		return resolveFreshOmpCompanionSecret(options);
+	} finally {
+		delete options.env.FRESH_OMP_COMPANION;
+		delete options.env.FRESH_OMP_COMPANION_TOKEN;
+		if (options.launchEnv) {
+			delete options.launchEnv.FRESH_OMP_COMPANION;
+			delete options.launchEnv.FRESH_OMP_COMPANION_TOKEN;
+		}
+	}
 }
 
 export function writeStartupNotice(parsedArgs: Pick<Args, "mode">, text: string): void {
@@ -1236,6 +1253,7 @@ interface RunRootCommandDependencies {
 	createForeignSessionStore?: (source: ForeignSessionSource) => ForeignSessionStore;
 	settings?: Settings;
 	forceSetupWizard?: boolean;
+	consumeFreshOmpCompanionLaunchEnv?: typeof consumeFreshOmpCompanionLaunchEnv;
 }
 const DEFAULT_RUN_ROOT_DEPENDENCIES: RunRootCommandDependencies = {};
 
@@ -1317,14 +1335,17 @@ export async function runRootCommand(
 	// tree; declare it so headless subagent optimizations (e.g. skipping replan
 	// title refresh) can tell a focusable process from a print/RPC/eval one.
 	setInteractiveHost(isInteractive);
+	const companionLaunchEnv = (deps.consumeFreshOmpCompanionLaunchEnv ?? consumeFreshOmpCompanionLaunchEnv)();
 	const companionSecret = consumeFreshOmpCompanionSecret({
 		isInteractive,
 		noSession: parsedArgs.noSession === true,
+		freshProvenance: parsedArgs.freshOmpCompanion === true,
 		parentTaskPrefix: undefined,
 		taskDepth: 0,
+		launchEnv: companionLaunchEnv,
 		env: Bun.env,
 	});
-	let companionController: ReturnType<typeof createFreshOmpCompanionController> | undefined;
+	let companionController: FreshOmpCompanionController | undefined;
 	if (companionSecret) {
 		try {
 			companionController = createFreshOmpCompanionController(companionSecret);
@@ -1686,15 +1707,14 @@ export async function runRootCommand(
 					extensionsResult.runtime,
 					"<host:fresh-omp-companion>",
 				);
-				sessionOptions.hostInternalExtensions = [
-					{
-						extension,
-						beforeSessionMutation: companionController.beforeSessionMutation,
-						afterDispatch: companionController.afterDispatch,
-						setHostTerminalInput: companionController.setHostTerminalInput,
-					},
-				];
+				sessionOptions.hostInternalExtension = {
+					extension,
+					beforeSessionMutation: companionController.beforeSessionMutation,
+					afterDispatch: companionController.afterDispatch,
+					setHostTerminalInput: companionController.setHostTerminalInput,
+				};
 			} catch {
+				companionController = undefined;
 				logger.warn("Fresh OMP companion disabled", { reason: "host_extension_load_failed" });
 			}
 		}
@@ -1769,6 +1789,14 @@ export async function runRootCommand(
 			eventBus,
 			preloadedExtensions: extensionsResult,
 		});
+		const activeCompanionController = companionController;
+		if (activeCompanionController) {
+			session.subscribe(event => {
+				if (event.type !== "thinking_level_changed") return;
+				const thinkingLevel = event.configured ?? event.thinkingLevel;
+				activeCompanionController.setThinkingLevel(thinkingLevel === "inherit" ? undefined : thinkingLevel);
+			});
+		}
 
 		// Cold-revive support: a `parked` subagent ref restored from disk (Agent Hub
 		// scan, collab mirror, resumed process) has a sessionFile but no in-memory
@@ -1862,7 +1890,7 @@ export async function runRootCommand(
 				initialMessage,
 				initialImages,
 				parsedArgs.join,
-				companionController?.setStatusText,
+				activeCompanionController?.setStatusText,
 			);
 		} else {
 			// Branch-only single-shot runner: keep print-mode code out of normal interactive startup.

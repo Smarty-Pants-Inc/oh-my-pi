@@ -333,24 +333,24 @@ describe("AgentSession handoff", () => {
 		expect(completionSpy).toHaveBeenCalledWith({ type: "session_ready" }, expect.any(Function));
 	});
 
-	it("restores exact retained state when handoff flush fails before the post-quiescence capture", async () => {
+	it("preserves durable journal mutations when handoff flush fails before the post-quiescence capture", async () => {
 		await sessionManager.ensureOnDisk();
 		await sessionManager.flush();
 		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
 		const retainedSessionFile = session.sessionFile;
 		if (!retainedSessionFile) throw new Error("Expected retained session file");
-		const retainedRaw = await Bun.file(retainedSessionFile).text();
 		const retainedEntries = structuredClone(sessionManager.getEntries());
 		const retainedMessages = structuredClone(session.messages);
 
 		const failure = new Error("handoff retained flush failed after mutation");
+		const mutationText = "durable handoff mutation";
 		let flushCalls = 0;
 		let durableMutationRaw: string | undefined;
 		const flush = sessionManager.flush.bind(sessionManager);
 		vi.spyOn(sessionManager, "flush").mockImplementation(async () => {
 			const call = ++flushCalls;
 			if (call === 2) {
-				sessionManager.appendMessage({ role: "user", content: "durable handoff mutation", timestamp: 99 });
+				sessionManager.appendMessage({ role: "user", content: mutationText, timestamp: 99 });
 				session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
 			}
 			await flush();
@@ -368,13 +368,20 @@ describe("AgentSession handoff", () => {
 
 		await expect(session.handoff()).rejects.toBe(failure);
 
-		expect(flushCalls).toBe(2);
-		expect(durableMutationRaw).toContain("durable handoff mutation");
-		expect(captureCalls).toBe(1);
+		if (durableMutationRaw === undefined) throw new Error("Expected durable handoff mutation bytes");
+		expect(flushCalls).toBe(3);
+		expect(durableMutationRaw).toContain(mutationText);
+		expect(captureCalls).toBe(2); // Initial checkpoint plus rollback preservation; recapture was not reached.
 		expect(session.sessionFile).toBe(retainedSessionFile);
-		expect(sessionManager.getEntries()).toEqual(retainedEntries);
+		expect(sessionManager.getEntries()).toEqual([
+			...retainedEntries,
+			expect.objectContaining({
+				type: "message",
+				message: expect.objectContaining({ role: "user", content: mutationText, timestamp: 99 }),
+			}),
+		]);
 		expect(session.messages).toEqual(retainedMessages);
-		expect(await Bun.file(retainedSessionFile).text()).toBe(retainedRaw);
+		expect(await Bun.file(retainedSessionFile).text()).toBe(durableMutationRaw);
 	});
 
 	it("restores retained state and removes a failed replacement before handoff rollback", async () => {

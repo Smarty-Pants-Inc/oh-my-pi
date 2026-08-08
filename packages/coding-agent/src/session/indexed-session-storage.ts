@@ -320,15 +320,15 @@ export class IndexedSessionStorage implements SessionStorage {
 
 	async deleteSessionWithArtifacts(sessionPath: string): Promise<void> {
 		await this.#awaitPath(sessionPath);
-		const sessionEntry = this.#index.get(sessionPath);
-		if (!sessionEntry) throw enoent(sessionPath);
 
 		const artifactsDir = sessionPath.slice(0, -6);
 		const prefix = artifactsDir.endsWith("/") ? artifactsDir : `${artifactsDir}/`;
-		const paths = [sessionPath];
+		const paths: string[] = [];
+		if (this.#index.has(sessionPath)) paths.push(sessionPath);
 		for (const key of this.#index.keys()) {
 			if (key.startsWith(prefix)) paths.push(key);
 		}
+		if (paths.length === 0) return;
 
 		for (const path of paths) await this.#awaitPath(path);
 
