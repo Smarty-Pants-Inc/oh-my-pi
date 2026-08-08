@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `pi.registerSystemPromptBuilder()` so one extension can replace the provider-facing base prompt on initial load and rebuilds while reusing OMP's stock renderer with a complete template set.
+
 ## [17.2.11] - 2026-08-07
 
 ### Added

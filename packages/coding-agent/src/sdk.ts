@@ -162,6 +162,8 @@ import {
 	assertExecutionEnvironmentSystemPrompt,
 	type BuildSystemPromptResult,
 	buildSystemPrompt as buildSystemPromptInternal,
+	DEFAULT_SYSTEM_PROMPT_TEMPLATES,
+	type BuildSystemPromptOptions as InternalBuildSystemPromptOptions,
 	loadProjectContextFiles as loadContextFilesInternal,
 	projectSystemPromptToolMetadata,
 } from "./system-prompt";
@@ -2583,6 +2585,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			localProtocolOptions,
 			() => (hasSession ? session.getAsyncJobSnapshot() : null),
 		);
+		const systemPromptBuilder = extensionRunner.getSystemPromptBuilder();
 
 		credentialDisabledTarget = extensionRunner;
 		for (const event of startupCredentialDisabledEvents.splice(0)) {
@@ -2896,7 +2899,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					? `${appendPrompt}\n\n${options.appendSystemPrompt}`
 					: options.appendSystemPrompt;
 			}
-			const defaultPrompt = await buildSystemPromptInternal({
+			const promptOptions: InternalBuildSystemPromptOptions = {
 				cwd: promptCwd,
 				additionalWorkspaceRoots: sessionManager.getAdditionalDirectories(),
 				executionEnvironment,
@@ -2936,7 +2939,14 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				personality: agentKind === "sub" ? "none" : settings.get("personality"),
 				renderMermaid: settings.get("tui.renderMermaid"),
 				activeRepoContext,
-			});
+			};
+			const defaultPrompt = systemPromptBuilder
+				? await systemPromptBuilder({
+						options: promptOptions,
+						templates: DEFAULT_SYSTEM_PROMPT_TEMPLATES,
+						build: templates => buildSystemPromptInternal(promptOptions, templates),
+					})
+				: await buildSystemPromptInternal(promptOptions);
 
 			if (options.systemPrompt === undefined) {
 				return defaultPrompt;

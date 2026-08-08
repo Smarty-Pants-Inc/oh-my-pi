@@ -32,12 +32,28 @@ import { formatLocalCalendarDate } from "./utils/local-date";
 import { normalizePromptPath } from "./utils/prompt-path";
 import { AGENTS_MD_LIMIT, buildWorkspaceTree, type WorkspaceTree } from "./workspace-tree";
 
-/** Bundled personality specs, keyed by the `personality` setting value. */
-const PERSONALITY_SPECS: Record<Exclude<Personality, "none">, string> = {
-	default: defaultPersonality,
-	friendly: friendlyPersonality,
-	pragmatic: pragmaticPersonality,
-};
+export interface SystemPromptTemplates {
+	system: string;
+	customSystem: string;
+	project: string;
+	computerSafety: string;
+	activeRepoContext: string;
+	personalities: Readonly<Record<Exclude<Personality, "none">, string>>;
+}
+
+/** Raw bundled templates used by the default provider-facing prompt builder. */
+export const DEFAULT_SYSTEM_PROMPT_TEMPLATES: Readonly<SystemPromptTemplates> = Object.freeze({
+	system: systemPromptTemplate,
+	customSystem: customSystemPromptTemplate,
+	project: projectPromptTemplate,
+	computerSafety: computerSafetyPrompt,
+	activeRepoContext: activeRepoContextTemplate,
+	personalities: Object.freeze({
+		default: defaultPersonality,
+		friendly: friendlyPersonality,
+		pragmatic: pragmaticPersonality,
+	}),
+});
 
 interface AlwaysApplyRule {
 	name: string;
@@ -97,10 +113,10 @@ function firstNonEmpty(...values: (string | undefined | null)[]): string | null 
 	return null;
 }
 
-function renderActiveRepoContextPrompt(activeRepoContext: ActiveRepoContext | null): string {
+function renderActiveRepoContextPrompt(activeRepoContext: ActiveRepoContext | null, template: string): string {
 	if (!activeRepoContext) return "";
 	return prompt
-		.render(activeRepoContextTemplate, {
+		.render(template, {
 			relativeRepoRoot: normalizePromptPath(activeRepoContext.relativeRepoRoot),
 		})
 		.trim();
@@ -604,10 +620,21 @@ export function assertExecutionEnvironmentSystemPrompt(
 }
 
 /** Build the system prompt with tools, guidelines, and context */
-export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}): Promise<BuildSystemPromptResult> {
+export async function buildSystemPrompt(
+	options: BuildSystemPromptOptions = {},
+	templates: Readonly<SystemPromptTemplates> = DEFAULT_SYSTEM_PROMPT_TEMPLATES,
+): Promise<BuildSystemPromptResult> {
 	if ($env.NULL_PROMPT === "true") {
 		return { systemPrompt: [] };
 	}
+	const {
+		system: resolvedSystemPromptTemplate,
+		customSystem: resolvedCustomSystemPromptTemplate,
+		project: resolvedProjectPromptTemplate,
+		computerSafety: resolvedComputerSafetyPrompt,
+		activeRepoContext: resolvedActiveRepoContextTemplate,
+		personalities,
+	} = templates;
 
 	const {
 		customPrompt,
@@ -852,7 +879,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 				return projected ? [projected] : [];
 			})
 		: localAdditionalWorkspaceRoots;
-	const activeRepoContextPrompt = renderActiveRepoContextPrompt(activeRepoContext);
+	const activeRepoContextPrompt = renderActiveRepoContextPrompt(activeRepoContext, resolvedActiveRepoContextTemplate);
 
 	// Build tool metadata for system prompt rendering.
 	// Priority: explicit list > tools map > conservative SDK fallback.
@@ -941,7 +968,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		additionalWorkspaceRoots: promptAdditionalWorkspaceRoots,
 		model: includeModelInPrompt ? (model ?? "") : "",
 		useCodexTaskPrompt: usesCodexTaskPrompt(model),
-		personality: personality === "none" ? "" : PERSONALITY_SPECS[personality].trim(),
+		personality: personality === "none" ? "" : personalities[personality].trim(),
 		intentTracing: !!intentField,
 		intentField: intentField ?? "",
 		eagerTasks,
@@ -961,15 +988,21 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		xdevDocs,
 		autoQaEnabled,
 	};
-	const rendered = prompt.render(resolvedCustomPrompt ? customSystemPromptTemplate : systemPromptTemplate, data);
+	const rendered = prompt.render(
+		resolvedCustomPrompt ? resolvedCustomSystemPromptTemplate : resolvedSystemPromptTemplate,
+		data,
+	);
 	const systemPrompt = [rendered];
 	if (toolNames.includes("computer")) {
-		systemPrompt.push(computerSafetyPrompt.trim());
+		systemPrompt.push(resolvedComputerSafetyPrompt.trim());
 	}
 	// Custom prompt templates already render context files and append text; the
 	// project footer still carries environment, cwd, workspace, and dir-context.
 	const projectPrompt = prompt
-		.render(projectPromptTemplate, resolvedCustomPrompt ? { ...data, contextFiles: [], appendPrompt: "" } : data)
+		.render(
+			resolvedProjectPromptTemplate,
+			resolvedCustomPrompt ? { ...data, contextFiles: [], appendPrompt: "" } : data,
+		)
 		.trim();
 	if (projectPrompt) {
 		systemPrompt.push(projectPrompt);

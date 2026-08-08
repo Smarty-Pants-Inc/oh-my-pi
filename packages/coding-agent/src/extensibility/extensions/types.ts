@@ -56,6 +56,7 @@ import type { CompactMode } from "../../session/compact-modes";
 import type { ExecutionEnvironmentProvider } from "../../session/execution-environment";
 import type { CustomMessage, CustomMessagePayload } from "../../session/messages";
 import type { ReadonlySessionManager, SessionManager } from "../../session/session-manager";
+import type { BuildSystemPromptOptions, BuildSystemPromptResult, SystemPromptTemplates } from "../../system-prompt";
 import type {
 	BashToolDetails,
 	BashToolInput,
@@ -1129,6 +1130,20 @@ export type ExtensionServiceTier<Family extends ServiceTierFamily> = Family exte
 		? "flex" | "priority"
 		: ServiceTier;
 
+export interface SystemPromptBuilderContext {
+	/** Dynamic inputs collected by the session for this prompt build. */
+	readonly options: Readonly<BuildSystemPromptOptions>;
+	/** Raw templates bundled with the running OMP build. */
+	readonly templates: Readonly<SystemPromptTemplates>;
+	/** Render the stock prompt pipeline with the supplied complete template set. */
+	build(templates?: Readonly<SystemPromptTemplates>): Promise<BuildSystemPromptResult>;
+}
+
+/** Replaces OMP's normal provider-facing base system prompt builder. */
+export type SystemPromptBuilder = (
+	context: SystemPromptBuilderContext,
+) => BuildSystemPromptResult | Promise<BuildSystemPromptResult>;
+
 /**
  * ExtensionAPI passed to extension factory functions.
  */
@@ -1344,6 +1359,13 @@ export interface ExtensionAPI {
 
 	/** Register this extension's execution environment provider. */
 	registerExecutionEnvironmentProvider(provider: ExecutionEnvironmentProvider): void;
+
+	// =========================================================================
+	// System Prompt Builder Registration
+	// =========================================================================
+
+	/** Register this extension as the session's sole base system prompt builder. */
+	registerSystemPromptBuilder(builder: SystemPromptBuilder): void;
 
 	// =========================================================================
 	// Provider Registration
@@ -1599,6 +1621,7 @@ export interface Extension {
 	resolvedPath: string;
 	label?: string;
 	executionEnvironmentProvider?: ExecutionEnvironmentProvider;
+	systemPromptBuilder?: SystemPromptBuilder;
 	handlers: Map<string, HandlerFn[]>;
 	tools: Map<string, RegisteredTool<any, any>>;
 	assistantThinkingRenderers: AssistantThinkingRenderer[];
