@@ -54,9 +54,9 @@ import type { Theme } from "../../modes/theme/theme";
 import type { AsyncJobSnapshot } from "../../session/agent-session";
 import type { CompactMode } from "../../session/compact-modes";
 import type { ExecutionEnvironmentProvider } from "../../session/execution-environment";
-import type { BuildSystemPromptOptions, BuildSystemPromptResult, SystemPromptTemplates } from "../../system-prompt";
 import type { CustomMessage, CustomMessagePayload } from "../../session/messages";
 import type { ReadonlySessionManager, SessionManager } from "../../session/session-manager";
+import type { BuildSystemPromptOptions, BuildSystemPromptResult, SystemPromptTemplates } from "../../system-prompt";
 import type {
 	BashToolDetails,
 	BashToolInput,

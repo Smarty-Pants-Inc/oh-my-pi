@@ -160,10 +160,10 @@ import { closeAllConnections } from "./ssh/connection-manager";
 import { unmountAll } from "./ssh/sshfs-mount";
 import {
 	assertExecutionEnvironmentSystemPrompt,
-	type BuildSystemPromptOptions as InternalBuildSystemPromptOptions,
 	type BuildSystemPromptResult,
 	buildSystemPrompt as buildSystemPromptInternal,
 	DEFAULT_SYSTEM_PROMPT_TEMPLATES,
+	type BuildSystemPromptOptions as InternalBuildSystemPromptOptions,
 	loadProjectContextFiles as loadContextFilesInternal,
 	projectSystemPromptToolMetadata,
 } from "./system-prompt";
