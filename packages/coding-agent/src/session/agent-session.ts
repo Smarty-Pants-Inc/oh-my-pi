@@ -605,6 +605,7 @@ export class AgentSession {
 	// on `agent_end` can fire its next `prompt` before #promptWithMessage's finally
 	#promptGeneration = 0;
 	#pendingAgentEndEmit: AgentSessionEvent | undefined;
+	#inFlightBeforeAgentEndCallbacks: Array<() => void | Promise<void>> = [];
 	#inFlightSettledCallbacks: Array<() => void | Promise<void>> = [];
 	#inFlightSettling = false;
 	#sessionStopContinuationCount = 0;
@@ -686,15 +687,18 @@ export class AgentSession {
 		this.#inFlightSettling = true;
 		void this.#settleInFlight().finally(() => {
 			this.#inFlightSettling = false;
-			if (this.#promptInFlightCount === 0 && this.#inFlightSettledCallbacks.length > 0) {
+			if (
+				this.#promptInFlightCount === 0 &&
+				(this.#inFlightBeforeAgentEndCallbacks.length > 0 || this.#inFlightSettledCallbacks.length > 0)
+			) {
 				this.#scheduleInFlightSettlement();
 			}
 		});
 	}
 
-	async #settleInFlight(): Promise<void> {
+	async #flushInFlightCallbacks(callbacks: Array<() => void | Promise<void>>): Promise<void> {
 		while (this.#promptInFlightCount === 0) {
-			const callback = this.#inFlightSettledCallbacks.shift();
+			const callback = callbacks.shift();
 			if (!callback) break;
 			try {
 				await callback();
@@ -702,13 +706,19 @@ export class AgentSession {
 				logger.warn("In-flight settle callback failed", { error: String(error) });
 			}
 		}
+	}
+
+	async #settleInFlight(): Promise<void> {
+		await this.#flushInFlightCallbacks(this.#inFlightBeforeAgentEndCallbacks);
 		if (this.#promptInFlightCount !== 0) return;
 		this.#flushPendingAgentEnd();
+		await this.#flushInFlightCallbacks(this.#inFlightSettledCallbacks);
+		if (this.#promptInFlightCount !== 0) return;
 		this.#drainStrandedQueuedMessages();
 	}
 
-	#enqueueInFlightSettledCallback(callback: () => void | Promise<void>): void {
-		this.#inFlightSettledCallbacks.push(callback);
+	#enqueueBeforeAgentEnd(callback: () => void | Promise<void>): void {
+		this.#inFlightBeforeAgentEndCallbacks.push(callback);
 		this.#scheduleInFlightSettlement();
 	}
 
@@ -5390,7 +5400,7 @@ export class AgentSession {
 
 	#queueExtensionCommandFollowUp(text: string, generation: number): Promise<void> {
 		return new Promise((resolve, reject) => {
-			this.#enqueueInFlightSettledCallback(async () => {
+			this.#enqueueBeforeAgentEnd(async () => {
 				if (this.#promptGeneration !== generation || this.#isDisposed) {
 					reject(new Error("Extension command follow-up was superseded before execution"));
 					return;
