@@ -81,6 +81,7 @@ function createHarness(): Harness {
 		) => {
 			capturedActions = a;
 		},
+		setHostTerminalInput: () => {},
 		onError: () => {},
 		emit: async () => undefined,
 		getMessageRenderer: () => undefined,

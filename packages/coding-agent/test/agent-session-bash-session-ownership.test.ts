@@ -10,6 +10,7 @@ import * as bashExecutor from "@oh-my-pi/pi-coding-agent/exec/bash-executor";
 import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { BashRunner } from "@oh-my-pi/pi-coding-agent/session/bash-runner";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
@@ -78,6 +79,11 @@ describe("AgentSession bash session ownership", () => {
 			emitUserBash,
 			emit: vi.fn().mockResolvedValue(undefined),
 			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
+			emitWithHostCompletion: vi.fn(
+				async (_event: { type: string }, finalizeBeforeHostCompletion?: () => void | Promise<void>) => {
+					await finalizeBeforeHostCompletion?.();
+				},
+			),
 		} as unknown as ExtensionRunner;
 		return { completion, emitUserBash, extensionRunner };
 	}
@@ -201,6 +207,208 @@ describe("AgentSession bash session ownership", () => {
 				message => message.role === "bashExecution" && message.command === "old-session-command",
 			),
 		).toBe(true);
+	});
+
+	it("restores the first fork checkpoint after a pending Bash append and pre-second-capture failure", async () => {
+		const sessionDir = path.join(tempDir.path(), "sessions");
+		createSession(SessionManager.create(tempDir.path(), sessionDir));
+		const retainedSessionFile = await seedPersistedSession();
+		const rawBeforePendingBash = fs.readFileSync(retainedSessionFile, "utf8");
+
+		let forceStreaming = true;
+		Object.defineProperty(session, "isStreaming", {
+			configurable: true,
+			get: () => forceStreaming,
+		});
+		session.recordBashResult("pending-fork-command", bashResult);
+		expect(session.hasPendingBashMessages).toBe(true);
+		forceStreaming = false;
+
+		const failure = new Error("fork retained flush failed after pending Bash append");
+		let flushCalls = 0;
+		let rawAtFailure: string | undefined;
+		const flush = session.sessionManager.flush.bind(session.sessionManager);
+		vi.spyOn(session.sessionManager, "flush").mockImplementation(async () => {
+			const call = ++flushCalls;
+			await flush();
+			if (call === 2) {
+				rawAtFailure = fs.readFileSync(retainedSessionFile, "utf8");
+				throw failure;
+			}
+		});
+		let captureCalls = 0;
+		let firstCheckpointRaw: string | undefined;
+		const capturePersistedSessionFile = session.sessionManager.capturePersistedSessionFile.bind(
+			session.sessionManager,
+		);
+		vi.spyOn(session.sessionManager, "capturePersistedSessionFile").mockImplementation(async () => {
+			const snapshot = await capturePersistedSessionFile();
+			captureCalls++;
+			if (captureCalls === 1) firstCheckpointRaw = snapshot?.content;
+			return snapshot;
+		});
+
+		await expect(session.fork()).rejects.toBe(failure);
+
+		expect(flushCalls).toBe(2);
+		expect(captureCalls).toBe(1);
+		expect(session.hasPendingBashMessages).toBe(false);
+		expect(firstCheckpointRaw).toBeString();
+		if (firstCheckpointRaw === undefined) throw new Error("Expected persisted checkpoint content");
+		expect(firstCheckpointRaw).not.toBe(rawBeforePendingBash);
+		expect(firstCheckpointRaw).toContain("pending-fork-command");
+		expect(rawAtFailure).toBe(firstCheckpointRaw);
+		expect(session.sessionFile).toBe(retainedSessionFile);
+		expect(fs.readFileSync(retainedSessionFile, "utf8")).toBe(firstCheckpointRaw);
+
+		const reopened = await SessionManager.open(retainedSessionFile, sessionDir, undefined, {
+			initialCwd: tempDir.path(),
+			suppressBreadcrumb: true,
+		});
+		additionalManagers.push(reopened);
+		expect(reopened.getEntries().map(entry => entry.id)).toEqual(
+			session.sessionManager.getEntries().map(entry => entry.id),
+		);
+		expect(
+			reopened
+				.getEntries()
+				.filter(
+					entry =>
+						entry.type === "message" &&
+						entry.message.role === "bashExecution" &&
+						entry.message.command === "pending-fork-command",
+				),
+		).toHaveLength(1);
+	});
+
+	it("settles and discards provisional-target bash before authoritative rollback", async () => {
+		const sessionDir = path.join(tempDir.path(), "sessions");
+		const retainedManager = SessionManager.create(tempDir.path(), sessionDir);
+		createSession(retainedManager);
+		const retainedFile = await seedPersistedSession();
+		const retainedArtifactId = await retainedManager.saveArtifact("retained artifact", "bash");
+		if (!retainedArtifactId) throw new Error("Expected retained artifact id");
+		const retainedArtifactPath = await retainedManager.getArtifactPath(retainedArtifactId);
+		if (!retainedArtifactPath) throw new Error("Expected retained artifact path");
+		await retainedManager.flush();
+		const retainedArtifactsDir = retainedManager.getArtifactsDir();
+		if (!retainedArtifactsDir) throw new Error("Expected retained artifacts directory");
+		const retainedEntries = JSON.stringify(retainedManager.getEntries());
+		const retainedAgentMessages = JSON.stringify(session.messages);
+		const retainedJsonl = await Bun.file(retainedFile).text();
+		const retainedArtifacts = fs.readdirSync(retainedArtifactsDir).sort();
+		const retainedArtifactBytes = await Bun.file(retainedArtifactPath).text();
+
+		const targetManager = SessionManager.create(tempDir.path(), sessionDir);
+		targetManager.appendMessage({ role: "user", content: "target", timestamp: Date.now() });
+		targetManager.appendMessage(createAssistantMessage("target reply"));
+		await targetManager.ensureOnDisk();
+		additionalManagers.push(targetManager);
+		let currentManager = retainedManager;
+		const runner = new BashRunner({
+			agent: session.agent,
+			get sessionManager() {
+				return currentManager;
+			},
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			extensionRunner: () => undefined,
+			isStreaming: () => true,
+		});
+		const retainedBashStarted = Promise.withResolvers<void>();
+		const retainedBashGate = Promise.withResolvers<void>();
+		const targetBashStarted = Promise.withResolvers<void>();
+		let retainedBashAborted = false;
+		let minimizedArtifactId: string | undefined;
+		vi.spyOn(bashExecutor, "executeBash").mockImplementation(async (command, options) => {
+			const signal = options?.signal;
+			if (!signal) throw new Error("Expected bash abort signal");
+			if (command === "retained-side-command") {
+				signal.addEventListener("abort", () => {
+					retainedBashAborted = true;
+				});
+				retainedBashStarted.resolve();
+				await retainedBashGate.promise;
+				return bashResult;
+			}
+			targetBashStarted.resolve();
+			if (!signal.aborted) {
+				await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+			}
+			minimizedArtifactId = await options?.onMinimizedSave?.("discarded target output", {
+				filter: "test",
+				inputBytes: 23,
+				outputBytes: 9,
+			});
+			return {
+				...bashResult,
+				output: minimizedArtifactId ? `[raw output: artifact://${minimizedArtifactId}]` : "cancelled",
+				cancelled: true,
+			};
+		});
+
+		const retainedBashPromise = runner.executeBash("retained-side-command");
+		await retainedBashStarted.promise;
+		const retainedLeafId = retainedManager.getLeafId();
+		if (!retainedLeafId) throw new Error("Expected retained leaf");
+		const transition = runner.beginSessionTransition();
+		currentManager = targetManager;
+		runner.markSessionTransition(transition);
+
+		let commandSettled = false;
+		const bashPromise = runner.executeBash("provisional-target-command").finally(() => {
+			commandSettled = true;
+		});
+		await targetBashStarted.promise;
+		await runner.prepareCommit(transition);
+		await runner.prepareRollback(transition);
+		expect(commandSettled).toBe(true);
+		expect(await bashPromise).toMatchObject({ cancelled: true, output: "cancelled" });
+		expect(minimizedArtifactId).toBeUndefined();
+		expect(retainedBashAborted).toBe(false);
+
+		currentManager = retainedManager;
+		await runner.rollbackSessionTransition(transition);
+		await runner.flushPending();
+
+		expect(JSON.stringify(retainedManager.getEntries())).toBe(retainedEntries);
+		expect(JSON.stringify(session.messages)).toBe(retainedAgentMessages);
+		expect(await Bun.file(retainedFile).text()).toBe(retainedJsonl);
+		expect(fs.readdirSync(retainedArtifactsDir).sort()).toEqual(retainedArtifacts);
+		expect(await Bun.file(retainedArtifactPath).text()).toBe(retainedArtifactBytes);
+		expect(
+			targetManager
+				.getEntries()
+				.some(
+					entry =>
+						entry.type === "message" &&
+						entry.message.role === "bashExecution" &&
+						entry.message.command === "provisional-target-command",
+				),
+		).toBe(false);
+
+		retainedBashGate.resolve();
+		expect(await retainedBashPromise).toEqual(bashResult);
+		const retainedBashEntries = retainedManager
+			.getEntries()
+			.filter(
+				entry =>
+					entry.type === "message" &&
+					entry.message.role === "bashExecution" &&
+					entry.message.command === "retained-side-command",
+			);
+		expect(retainedBashEntries).toHaveLength(1);
+		expect(retainedBashEntries[0]?.parentId).toBe(retainedLeafId);
+		await runner.flushPending();
+		expect(
+			retainedManager
+				.getEntries()
+				.filter(
+					entry =>
+						entry.type === "message" &&
+						entry.message.role === "bashExecution" &&
+						entry.message.command === "retained-side-command",
+				),
+		).toHaveLength(1);
 	});
 
 	it.each(["new", "switch", "branch"] as const)(

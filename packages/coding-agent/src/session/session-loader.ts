@@ -4,6 +4,8 @@ import { BlobStore, isBlobRef, resolveImageData, resolveImageDataUrl } from "./b
 import { buildSessionContext } from "./session-context";
 import {
 	type FileEntry,
+	isSessionEntry,
+	isSessionLeafEntry,
 	type RawFileEntry,
 	SESSION_TITLE_SLOT_BYTES,
 	type SessionEntry,
@@ -67,6 +69,30 @@ export function parseSessionContent(content: string): {
 	const { body, slot } = splitTitleSlot(content);
 	const entries = parseJsonlLenient<RawFileEntry>(body) as FileEntry[];
 	return { entries: foldTitleSlot(entries, slot), titleSlot: slot };
+}
+/**
+ * Fold file-level leaf records into the tree state they select. A later tree
+ * entry supersedes an earlier record, matching append-order semantics. Files
+ * without a leaf record retain the legacy last-entry fallback.
+ */
+export function restoreSessionJournal(entries: readonly FileEntry[]): {
+	entries: SessionEntry[];
+	leafId: string | null | undefined;
+} {
+	const sessionEntries: SessionEntry[] = [];
+	let leafId: string | null | undefined;
+	for (const entry of entries) {
+		if (entry.type === "session") continue;
+		if (isSessionLeafEntry(entry)) {
+			leafId = entry.leafId === null || typeof entry.leafId === "string" ? entry.leafId : undefined;
+			continue;
+		}
+		if (isSessionEntry(entry)) {
+			sessionEntries.push(entry);
+			leafId = undefined;
+		}
+	}
+	return { entries: sessionEntries, leafId };
 }
 
 /** Parse session JSONL and visit each entry without retaining prior entries. */
@@ -344,18 +370,18 @@ export async function resolveBlobRefsInEntries(entries: FileEntry[], blobStore: 
 /**
  * Read-only transcript view of a session file: load entries, migrate to the
  * current version, resolve blob refs, and build the display transcript along
- * the persisted leaf path (last entry). Uses transcript mode (collapsed to the
- * latest compaction) so failed/aborted tail turns stay visible, unlike the
- * provider-context builder which drops them. Does NOT create a writer or take
- * the session lock — safe to call against a file another session is writing.
+ * the persisted active leaf. Uses transcript mode (collapsed to the latest
+ * compaction) so failed/aborted tail turns stay visible, unlike the provider-
+ * context builder. Does NOT create a writer or take the session lock — safe to
+ * call against a file another session is writing.
  */
 export async function loadSessionMessagesReadOnly(filePath: string): Promise<AgentMessage[]> {
 	const entries = await loadEntriesFromFile(filePath);
 	if (entries.length === 0) return [];
 	migrateToCurrentVersion(entries);
 	await resolveBlobRefsInEntries(entries, new BlobStore(getBlobsDir()));
-	const sessionEntries = entries.filter((e): e is SessionEntry => e.type !== "session");
-	return buildSessionContext(sessionEntries, undefined, undefined, {
+	const journal = restoreSessionJournal(entries);
+	return buildSessionContext(journal.entries, journal.leafId, undefined, {
 		transcript: true,
 		collapseCompactedHistory: true,
 	}).messages;

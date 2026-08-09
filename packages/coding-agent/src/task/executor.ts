@@ -3260,6 +3260,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					{
 						getModel: () => session.model,
 						isIdle: () => !session.isStreaming,
+						isCompacting: () => session.isCompacting,
 						abort: () => session.abort({ reason: USER_INTERRUPT_LABEL }),
 						hasPendingMessages: () => session.hasPendingMessages(),
 						shutdown: () => {},

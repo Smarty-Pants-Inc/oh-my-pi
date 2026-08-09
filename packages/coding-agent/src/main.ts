@@ -5,12 +5,14 @@
  * createAgentSession() options. The SDK does the heavy lifting.
  */
 import * as fsSync from "node:fs";
+import * as net from "node:net";
 import * as os from "node:os";
 import { createInterface } from "node:readline/promises";
 import { EventLoopKeepalive } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import {
 	$env,
+	consumeFreshOmpCompanionLaunchEnv,
 	directoryExists,
 	getLogPath,
 	getProjectDir,
@@ -51,6 +53,7 @@ import {
 	resolveActiveProjectRegistryPath,
 } from "./discovery/helpers";
 import { injectOmpExtensionCliRoots } from "./discovery/omp-extension-roots";
+import { loadExtensionFromFactory } from "./extensibility/extensions";
 import { formatExtensionLoadNotifications } from "./extensibility/extensions/load-errors";
 import { loadExtensions } from "./extensibility/extensions/loader";
 import { ExtensionRunner } from "./extensibility/extensions/runner";
@@ -58,6 +61,7 @@ import type { ExtensionUIContext } from "./extensibility/extensions/types";
 import { scheduleMarketplaceAutoUpdate } from "./extensibility/plugins/marketplace-auto-update";
 import { registerDaemonProjectPresence } from "./launch/presence";
 import type { MCPManager } from "./mcp";
+import { createFreshOmpCompanionController, type FreshOmpCompanionController } from "./modes/fresh-omp-companion";
 import { InteractiveMode } from "./modes/interactive-mode";
 import type { PrintModeOptions } from "./modes/print-mode";
 import { claimRpcInput } from "./modes/rpc/rpc-input";
@@ -104,6 +108,112 @@ type RunRpcMode = (
 	eventBus?: EventBus,
 	input?: ReadableStream<Uint8Array>,
 ) => Promise<never>;
+
+const FRESH_OMP_COMPANION_SECRET_BYTES = 32;
+const FRESH_OMP_COMPANION_ENDPOINT_MAX_BYTES = 4096;
+const FRESH_OMP_COMPANION_CONNECT_TIMEOUT_MS = 1_000;
+
+interface FreshOmpCompanionGateOptions {
+	isInteractive: boolean;
+	noSession: boolean;
+	parentTaskPrefix?: string;
+	freshProvenance: boolean;
+	taskDepth?: number;
+	env: Readonly<Record<string, string | undefined>>;
+	launchEnv: Readonly<Record<string, string | undefined>> | undefined;
+}
+
+/** Resolve the one-shot Fresh endpoint only for the canonical top-level interactive host. */
+export function resolveFreshOmpCompanionEndpoint(options: FreshOmpCompanionGateOptions): string | undefined {
+	if (
+		!options.isInteractive ||
+		options.noSession ||
+		options.parentTaskPrefix !== undefined ||
+		(options.taskDepth ?? 0) !== 0
+	) {
+		return undefined;
+	}
+	if (
+		!options.freshProvenance ||
+		options.launchEnv?.FRESH_OMP_COMPANION !== "1" ||
+		options.env.TMUX ||
+		options.env.STY
+	) {
+		return undefined;
+	}
+
+	const endpoint = options.launchEnv.FRESH_OMP_COMPANION_ENDPOINT;
+	if (!endpoint || endpoint.includes("\0") || Buffer.byteLength(endpoint) > FRESH_OMP_COMPANION_ENDPOINT_MAX_BYTES) {
+		return undefined;
+	}
+	return endpoint;
+}
+
+function readFreshOmpCompanionSecret(endpoint: string): Promise<Uint8Array | undefined> {
+	const { promise, resolve } = Promise.withResolvers<Uint8Array | undefined>();
+	const secret = Buffer.alloc(FRESH_OMP_COMPANION_SECRET_BYTES);
+	let offset = 0;
+	let settled = false;
+	const socket = net.createConnection({ path: endpoint });
+	const timer = setTimeout(() => finish(undefined), FRESH_OMP_COMPANION_CONNECT_TIMEOUT_MS);
+	timer.unref();
+
+	function finish(value: Uint8Array | undefined): void {
+		if (settled) return;
+		settled = true;
+		clearTimeout(timer);
+		socket.destroy();
+		if (!value) secret.fill(0);
+		resolve(value);
+	}
+
+	socket.on("data", chunk => {
+		const bytes = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+		if (offset + bytes.byteLength > secret.byteLength) {
+			finish(undefined);
+			return;
+		}
+		bytes.copy(secret, offset);
+		offset += bytes.byteLength;
+	});
+	socket.once("end", () => finish(offset === secret.byteLength ? secret : undefined));
+	socket.once("error", () => finish(undefined));
+	socket.once("close", () => finish(undefined));
+	return promise;
+}
+
+/** Read the private Fresh capability from its inherited one-shot local channel. */
+export async function resolveFreshOmpCompanionSecret(
+	options: FreshOmpCompanionGateOptions,
+): Promise<Uint8Array | undefined> {
+	const endpoint = resolveFreshOmpCompanionEndpoint(options);
+	return endpoint ? await readFreshOmpCompanionSecret(endpoint) : undefined;
+}
+
+/**
+ * Resolve the private Fresh companion capability only from captured launch
+ * authority, then erase both captured and live transport values before public
+ * extensions or child-process setup can inherit them.
+ */
+export async function consumeFreshOmpCompanionSecret(
+	options: Omit<FreshOmpCompanionGateOptions, "env" | "launchEnv"> & {
+		env: Record<string, string | undefined>;
+		launchEnv: Record<string, string | undefined> | undefined;
+	},
+): Promise<Uint8Array | undefined> {
+	try {
+		return await resolveFreshOmpCompanionSecret(options);
+	} finally {
+		delete options.env.FRESH_OMP_COMPANION;
+		delete options.env.FRESH_OMP_COMPANION_ENDPOINT;
+		delete options.env.FRESH_OMP_COMPANION_TOKEN;
+		if (options.launchEnv) {
+			delete options.launchEnv.FRESH_OMP_COMPANION;
+			delete options.launchEnv.FRESH_OMP_COMPANION_ENDPOINT;
+			delete options.launchEnv.FRESH_OMP_COMPANION_TOKEN;
+		}
+	}
+}
 
 export function writeStartupNotice(parsedArgs: Pick<Args, "mode">, text: string): void {
 	(parsedArgs.mode === "json" ? process.stderr : process.stdout).write(text);
@@ -457,6 +567,7 @@ async function runInteractiveMode(
 	initialMessage?: string,
 	initialImages?: ImageContent[],
 	joinLink?: string,
+	companionStatusTextSink?: (statusText?: string) => void,
 ): Promise<void> {
 	const mode = new InteractiveMode(
 		session,
@@ -466,6 +577,7 @@ async function runInteractiveMode(
 		lspServers,
 		mcpManager,
 		eventBus,
+		companionStatusTextSink,
 	);
 
 	// Cold-launch gate: the full setup wizard (every scene + the overlay and
@@ -1189,8 +1301,15 @@ interface RunRootCommandDependencies {
 	createForeignSessionStore?: (source: ForeignSessionSource) => ForeignSessionStore;
 	settings?: Settings;
 	forceSetupWizard?: boolean;
+	consumeFreshOmpCompanionLaunchEnv?: typeof consumeFreshOmpCompanionLaunchEnv;
 }
 const DEFAULT_RUN_ROOT_DEPENDENCIES: RunRootCommandDependencies = {};
+async function disposeSessionAndQuit(session: AgentSession, code: number): Promise<void> {
+	stopStartupWatchdog();
+	await session.dispose();
+	stopThemeWatcher();
+	await postmortem.quit(code);
+}
 
 export async function runRootCommand(
 	parsed: Args,
@@ -1237,16 +1356,10 @@ export async function runRootCommand(
 	// RPC owns stdin. Claim its singleton stream before plugin/extension discovery can load an in-process consumer.
 	const rpcInput = mode === "rpc" || mode === "rpc-ui" ? claimRpcInput() : undefined;
 
-	// Kick off plugin-root preload in parallel with the remaining startup work.
-	// Awaited later (before extension/skill discovery in createAgentSession needs it).
+	// Plugin roots may preload public extension modules. Start that work only
+	// after the one-shot Fresh companion capability is consumed below.
+	let pluginPreloadPromise: Promise<void>;
 	const home = os.homedir();
-	const pluginPreloadPromise =
-		parsedArgs.pluginDirs && parsedArgs.pluginDirs.length > 0
-			? logger.time("injectPluginDirRoots", injectPluginDirRoots, home, parsedArgs.pluginDirs, getProjectDir())
-			: logger.time("preloadPluginRoots", preloadPluginRoots, home, getProjectDir());
-	// Mark the promise as handled so a synchronous failure does not surface as an unhandled-rejection
-	// warning before we reach the await site below.
-	pluginPreloadPromise.catch(() => {});
 
 	// Trusted files load as exact module paths, never as package roots whose
 	// sibling hooks/tools/commands/MCP content could be discovered implicitly.
@@ -1276,6 +1389,37 @@ export async function runRootCommand(
 	// tree; declare it so headless subagent optimizations (e.g. skipping replan
 	// title refresh) can tell a focusable process from a print/RPC/eval one.
 	setInteractiveHost(isInteractive);
+	const companionLaunchEnv = (deps.consumeFreshOmpCompanionLaunchEnv ?? consumeFreshOmpCompanionLaunchEnv)();
+	const companionSecret = await consumeFreshOmpCompanionSecret({
+		isInteractive,
+		noSession: parsedArgs.noSession === true,
+		freshProvenance: parsedArgs.freshOmpCompanion === true,
+		parentTaskPrefix: undefined,
+		taskDepth: 0,
+		launchEnv: companionLaunchEnv,
+		env: Bun.env,
+	});
+	let companionController: FreshOmpCompanionController | undefined;
+	if (companionSecret) {
+		try {
+			companionController = createFreshOmpCompanionController(companionSecret);
+		} catch {
+			logger.warn("Fresh OMP companion disabled", { reason: "host_controller_create_failed" });
+		} finally {
+			// The controller copied its capability during construction; do not retain
+			// another live decoded secret on this long-running startup frame.
+			companionSecret.fill(0);
+		}
+	}
+
+	pluginPreloadPromise =
+		parsedArgs.pluginDirs && parsedArgs.pluginDirs.length > 0
+			? logger.time("injectPluginDirRoots", injectPluginDirRoots, home, parsedArgs.pluginDirs, getProjectDir())
+			: logger.time("preloadPluginRoots", preloadPluginRoots, home, getProjectDir());
+	// Mark the promise as handled so a synchronous failure does not surface as an unhandled-rejection
+	// warning before we reach the await site below.
+	pluginPreloadPromise.catch(() => {});
+
 	// Create AuthStorage and ModelRegistry upfront
 	const authStorage = await logger.time("discoverAuthStorage", deps.discoverAuthStorage ?? discoverAuthStorage);
 	const modelRegistry = logger.time("modelRegistry:init", () => new ModelRegistry(authStorage));
@@ -1608,6 +1752,26 @@ export async function runRootCommand(
 		const extensionsResult = parsedArgs.trustedExtensions?.length
 			? await loadTrustedSessionExtensions(sessionOptions, cwd, eventBus)
 			: await loadSessionExtensions(sessionOptions, cwd, settingsInstance, eventBus);
+		if (companionController) {
+			try {
+				const extension = await loadExtensionFromFactory(
+					companionController.factory,
+					cwd,
+					eventBus,
+					extensionsResult.runtime,
+					"<host:fresh-omp-companion>",
+				);
+				sessionOptions.hostInternalExtension = {
+					extension,
+					beforeSessionMutation: companionController.beforeSessionMutation,
+					afterDispatch: companionController.afterDispatch,
+					setHostTerminalInput: companionController.setHostTerminalInput,
+				};
+			} catch {
+				companionController = undefined;
+				logger.warn("Fresh OMP companion disabled", { reason: "host_extension_load_failed" });
+			}
+		}
 		const extensionFlagSink: ExtensionFlagSink = {
 			getFlags: () => ExtensionRunner.aggregateFlags(extensionsResult.extensions),
 			setFlagValue: (name, value) => {
@@ -1679,6 +1843,14 @@ export async function runRootCommand(
 			eventBus,
 			preloadedExtensions: extensionsResult,
 		});
+		const activeCompanionController = companionController;
+		if (activeCompanionController) {
+			session.subscribe(event => {
+				if (event.type !== "thinking_level_changed") return;
+				const thinkingLevel = event.configured ?? event.thinkingLevel;
+				activeCompanionController.setThinkingLevel(thinkingLevel === "inherit" ? undefined : thinkingLevel);
+			});
+		}
 
 		// Cold-revive support: a `parked` subagent ref restored from disk (Agent Hub
 		// scan, collab mirror, resumed process) has a sessionFile but no in-memory
@@ -1723,7 +1895,8 @@ export async function runRootCommand(
 			process.stderr.write(`${chalk.yellow("\nSet an API key environment variable:")}\n`);
 			process.stderr.write("  ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, etc.\n");
 			process.stderr.write(`${chalk.yellow(`\nOr create ${ModelsConfigFile.path()}`)}\n`);
-			process.exit(1);
+			await disposeSessionAndQuit(session, 1);
+			return;
 		}
 
 		if (mode === "rpc" || mode === "rpc-ui") {
@@ -1749,7 +1922,8 @@ export async function runRootCommand(
 			if ($env.PI_TIMING) {
 				logger.printTimings();
 				if (logger.shouldExitAfterTimings()) {
-					process.exit(0);
+					await disposeSessionAndQuit(session, 0);
+					return;
 				}
 			}
 
@@ -1772,6 +1946,7 @@ export async function runRootCommand(
 				initialMessage,
 				initialImages,
 				parsedArgs.join,
+				activeCompanionController?.setStatusText,
 			);
 		} else {
 			// Branch-only single-shot runner: keep print-mode code out of normal interactive startup.
@@ -1787,9 +1962,7 @@ export async function runRootCommand(
 			if ($env.PI_TIMING) {
 				logger.printTimings();
 			}
-			await session.dispose();
-			stopThemeWatcher();
-			await postmortem.quit(0);
+			await disposeSessionAndQuit(session, 0);
 		}
 	}
 }

@@ -68,6 +68,7 @@
 
 - Added a `--trusted-extension <absolute-path>` CLI flag to load an exact extension-module allowlist, bypassing ambient extension discovery.
 - Added resumable session details to fatal crash outputs, including a suggested `omp --resume <session-id>` command to quickly resume persisted live agent sessions.
+- Added Fresh's opt-in native-TUI companion for direct local interactive sessions: one-shot pre-dotenv capability gating; a singular host-internal extension; authenticated bounded status snapshots; exact work-identity and replay-bound cancel/snapshot commands; phase-checked lifecycle ownership; selected-side async publication; append-safe journals; and transaction-scoped artifact rollback.
 
 ### Changed
 
@@ -100,6 +101,7 @@
 - Fixed parsing of POSIX `$EDITOR` commands that contain quoted arguments or executable paths with spaces.
 - Fixed persisted Agent Hub rows losing the explicit caller model role when a subagent used a model override, preserving role provenance across restarts.
 - Fixed unobserved promise rejections in browser helpers (such as `tab.waitForResponse()`) causing tab workers to hang or crash.
+- Fresh companion snapshots now expose the exact live footer-loader message with grapheme-safe truncation, while sink-free sessions avoid loader traversal; cancellation coalesces across asynchronous abort teardown and shutdown publishes only committed authoritative state.
 
 ## [17.2.9] - 2026-08-05
 

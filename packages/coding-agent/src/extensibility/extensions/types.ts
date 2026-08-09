@@ -51,7 +51,7 @@ import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
 import type { MemoryRuntimeContext } from "../../memory-backend";
 import type { CustomEditor } from "../../modes/components/custom-editor";
 import type { Theme } from "../../modes/theme/theme";
-import type { AsyncJobSnapshot } from "../../session/agent-session";
+import type { AsyncJobCounts, AsyncJobSnapshot } from "../../session/agent-session";
 import type { CompactMode } from "../../session/compact-modes";
 import type { ExecutionEnvironmentProvider } from "../../session/execution-environment";
 import type { CustomMessage, CustomMessagePayload } from "../../session/messages";
@@ -92,6 +92,8 @@ import type {
 	SessionCompactingEvent,
 	SessionCompactingResult,
 	SessionEvent,
+	SessionReadyEvent,
+	SessionRollbackEvent,
 	SessionShutdownEvent,
 	SessionStartEvent,
 	SessionStopEvent,
@@ -419,8 +421,12 @@ export interface ExtensionContext {
 	ui: ExtensionUIContext;
 	/** Get current context usage for the active model. */
 	getContextUsage(): ContextUsage | undefined;
+	/** Whether manual or automatic context compaction is currently active. */
+	isCompacting(): boolean;
 	/** Get a read-only snapshot of async jobs owned by this session. */
 	getAsyncJobSnapshot(): AsyncJobSnapshot | null;
+	/** Get count-only async job state owned by this session. */
+	getAsyncJobCounts(): AsyncJobCounts | null;
 	/** Compact the session context (interactive mode shows UI). */
 	compact(instructionsOrOptions?: string | CompactOptions): Promise<void>;
 	/** Whether UI is available (false in print/RPC mode) */
@@ -439,8 +445,8 @@ export interface ExtensionContext {
 	models: ExtensionModelQuery;
 	/** Whether the agent is idle (not streaming) */
 	isIdle(): boolean;
-	/** Abort the current agent operation */
-	abort(): void;
+	/** Abort the current agent operation and wait for its teardown. */
+	abort(): Promise<void>;
 	/** Whether any visible or hidden message is waiting for this session. */
 	hasPendingMessages(): boolean;
 	/** Gracefully shutdown and exit. */
@@ -647,7 +653,7 @@ export interface ResourcesDiscoverResult {
 }
 
 // ============================================================================
-// Session Events (shared with hooks subsystem)
+// Session Events (payloads shared with hooks except extension-only ready/rollback)
 // ============================================================================
 
 export type {
@@ -659,6 +665,8 @@ export type {
 	SessionCompactEvent,
 	SessionCompactingEvent,
 	SessionEvent,
+	SessionReadyEvent,
+	SessionRollbackEvent,
 	SessionShutdownEvent,
 	SessionStartEvent,
 	SessionSwitchEvent,
@@ -994,6 +1002,8 @@ export function isToolCallEventType(toolName: string, event: ToolCallEvent): boo
 export type ExtensionEvent =
 	| ResourcesDiscoverEvent
 	| SessionEvent
+	| SessionReadyEvent
+	| SessionRollbackEvent
 	| ContextEvent
 	| BeforeProviderRequestEvent
 	| AfterProviderResponseEvent
@@ -1025,6 +1035,20 @@ export type ExtensionEvent =
 	| ToolResultEvent
 	| ToolApprovalRequestedEvent
 	| ToolApprovalResolvedEvent;
+
+/** Host-only fence emitted before retained capture for session switches and before branch/tree mutation. */
+export interface HostInternalSessionMutationEvent {
+	type: "session_switch" | "session_branch" | "session_tree";
+}
+
+/** Host-owned extension binding. Never exposed through public discovery or forwarded to child sessions. */
+export interface HostInternalExtensionBinding {
+	extension: Extension;
+	beforeSessionMutation?: (event: HostInternalSessionMutationEvent, ctx: ExtensionContext) => void | Promise<void>;
+	afterDispatch?: (event: ExtensionEvent, ctx: ExtensionContext) => void | Promise<void>;
+	/** Supplies a host-only terminal-input registrar after the interactive UI exists. */
+	setHostTerminalInput?: (register: (handler: TerminalInputHandler) => () => void) => void;
+}
 
 // ============================================================================
 // Event Results
@@ -1173,6 +1197,8 @@ export interface ExtensionAPI {
 
 	on(event: "resources_discover", handler: ExtensionHandler<ResourcesDiscoverEvent, ResourcesDiscoverResult>): void;
 	on(event: "session_start", handler: ExtensionHandler<SessionStartEvent>): void;
+	on(event: "session_ready", handler: ExtensionHandler<SessionReadyEvent>): void;
+	on(event: "session_rollback", handler: ExtensionHandler<SessionRollbackEvent>): void;
 	on(
 		event: "session_before_switch",
 		handler: ExtensionHandler<SessionBeforeSwitchEvent, SessionBeforeSwitchResult>,
@@ -1586,7 +1612,8 @@ export interface ExtensionActions {
 export interface ExtensionContextActions {
 	getModel: () => Model | undefined;
 	isIdle: () => boolean;
-	abort: () => void;
+	isCompacting: () => boolean;
+	abort: () => void | Promise<void>;
 	hasPendingMessages: () => boolean;
 	shutdown: () => void;
 	getContextUsage: () => ContextUsage | undefined;

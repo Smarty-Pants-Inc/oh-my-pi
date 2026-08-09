@@ -1,5 +1,12 @@
 import { Snowflake } from "@oh-my-pi/pi-utils";
-import { type CompactionEntry, CURRENT_SESSION_VERSION, type FileEntry, type SessionHeader } from "./session-entries";
+import {
+	type CompactionEntry,
+	CURRENT_SESSION_VERSION,
+	type FileEntry,
+	isSessionEntry,
+	isSessionLeafEntry,
+	type SessionHeader,
+} from "./session-entries";
 
 /** Generate a unique short ID (8 hex chars, collision-checked) */
 export function generateId(byId: { has(id: string): boolean }): string {
@@ -20,6 +27,7 @@ function migrateV1ToV2(entries: FileEntry[]): void {
 			entry.version = 2;
 			continue;
 		}
+		if (isSessionLeafEntry(entry)) continue;
 
 		entry.id = generateId(ids);
 		entry.parentId = prevId;
@@ -30,7 +38,7 @@ function migrateV1ToV2(entries: FileEntry[]): void {
 			const comp = entry as CompactionEntry & { firstKeptEntryIndex?: number };
 			if (typeof comp.firstKeptEntryIndex === "number") {
 				const targetEntry = entries[comp.firstKeptEntryIndex];
-				if (targetEntry && targetEntry.type !== "session") {
+				if (targetEntry && isSessionEntry(targetEntry)) {
 					comp.firstKeptEntryId = targetEntry.id;
 				}
 				delete comp.firstKeptEntryIndex;
@@ -46,6 +54,7 @@ function migrateV2ToV3(entries: FileEntry[]): void {
 			entry.version = 3;
 			continue;
 		}
+		if (isSessionLeafEntry(entry)) continue;
 
 		if (entry.type === "message") {
 			const msg = entry.message as { role?: string };

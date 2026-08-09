@@ -221,28 +221,55 @@ describe("SessionManager.moveTo", () => {
 		expect(header?.cwd).toBe(path.resolve(cwdB));
 	});
 
-	it("moves artifact dir independently when session file does not exist", async () => {
+	it("materializes a lazy journal before relocating its artifacts", async () => {
 		const session = SessionManager.create(cwdA);
-		// Allocate an artifact — creates dir via ArtifactManager
-		const { path: artifactPath } = await session.allocateArtifactPath("bash");
-		if (!artifactPath) throw new Error("Expected artifact path");
+		const allocation = await session.allocateArtifactPath("bash");
+		if (!allocation.path || !allocation.release) throw new Error("Expected artifact lease");
+		await fsp.writeFile(allocation.path, "artifact bytes");
+		allocation.release();
 
-		const oldArtifactDir = path.dirname(artifactPath);
-		expect(fs.existsSync(oldArtifactDir)).toBe(true);
-
-		// No messages — session file doesn't exist
+		const oldArtifactDir = path.dirname(allocation.path);
 		const oldFile = session.getSessionFile()!;
+		expect(fs.existsSync(oldArtifactDir)).toBe(true);
 		expect(fs.existsSync(oldFile)).toBe(false);
 
 		await session.moveTo(cwdB);
 
-		expect(session.getCwd()).toBe(path.resolve(cwdB));
-		// Old artifact dir moved
-		expect(fs.existsSync(oldArtifactDir)).toBe(false);
-		// New artifact dir exists
 		const newFile = session.getSessionFile()!;
-		const newArtifactDir = newFile.slice(0, -6); // strip .jsonl
-		expect(fs.existsSync(newArtifactDir)).toBe(true);
+		const newArtifactDir = newFile.slice(0, -6);
+		expect(session.getCwd()).toBe(path.resolve(cwdB));
+		expect(fs.existsSync(oldFile)).toBe(false);
+		expect(fs.existsSync(oldArtifactDir)).toBe(false);
+		expect(fs.existsSync(newFile)).toBe(true);
+		expect(await fsp.readFile(path.join(newArtifactDir, path.basename(allocation.path)), "utf8")).toBe(
+			"artifact bytes",
+		);
+	});
+
+	it("drains active artifact leases and preserves the manager binding across relocation", async () => {
+		const session = SessionManager.create(cwdA);
+		const manager = session.getArtifactManager();
+		const allocation = await session.allocateArtifactPath("stream");
+		if (!manager || !allocation.id || !allocation.path || !allocation.release)
+			throw new Error("Expected artifact lease");
+		await fsp.writeFile(allocation.path, "first");
+
+		let moved = false;
+		const move = session.moveTo(cwdB).then(() => {
+			moved = true;
+		});
+		await Promise.resolve();
+		expect(moved).toBe(false);
+		await fsp.appendFile(allocation.path, "-last");
+		allocation.release();
+		await move;
+
+		const movedArtifactsDir = session.getArtifactsDir();
+		if (!movedArtifactsDir) throw new Error("Expected relocated artifact directory");
+		expect(manager.dir).toBe(movedArtifactsDir);
+		const movedPath = await manager.getPath(allocation.id);
+		expect(movedPath).toBeString();
+		expect(await fsp.readFile(movedPath as string, "utf8")).toBe("first-last");
 	});
 	it("does not orphan appends that race the session file rename", async () => {
 		const session = SessionManager.create(cwdA);

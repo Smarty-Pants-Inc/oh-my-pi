@@ -53,6 +53,8 @@ export interface OutputSummary {
 export interface OutputSinkOptions {
 	artifactPath?: string;
 	artifactId?: string;
+	/** Release ArtifactManager writer ownership after the sink is closed, even when no spill file was opened. */
+	artifactRelease?: () => void;
 	/**
 	 * Total inline body budget (bytes). Default DEFAULT_MAX_BYTES. The head
 	 * window and rolling tail window share this budget, so a composed
@@ -768,6 +770,7 @@ export class OutputSink {
 
 	readonly #artifactPath?: string;
 	readonly #artifactId?: string;
+	#artifactRelease?: () => void;
 	readonly #spillThreshold: number;
 	readonly #headLimit: number;
 	readonly #onChunk?: (chunk: string) => void;
@@ -793,6 +796,7 @@ export class OutputSink {
 		const {
 			artifactPath,
 			artifactId,
+			artifactRelease,
 			spillThreshold = DEFAULT_MAX_BYTES,
 			headBytes = 0,
 			maxColumns = 0,
@@ -803,6 +807,7 @@ export class OutputSink {
 		} = options ?? {};
 		this.#artifactPath = artifactPath;
 		this.#artifactId = artifactId;
+		this.#artifactRelease = artifactRelease;
 		this.#spillThreshold = spillThreshold;
 		this.#headLimit = Math.max(0, Math.min(headBytes, Math.floor(spillThreshold / 2)));
 		this.#maxColumns = Math.max(0, maxColumns);
@@ -1347,25 +1352,31 @@ export class OutputSink {
 	async #finalizeFile(): Promise<void> {
 		if (this.#finalized) return;
 		this.#finalized = true;
-		if (this.#fileCreation) {
-			await this.#fileCreation.catch(() => undefined);
-		}
-		const file = this.#file;
-		if (!file) return;
-		// The tail/notice replay writes to the sink and can throw (e.g. a disk
-		// write error). Closing the descriptor MUST still happen — otherwise the
-		// fd leaks and the replay error masks the original tool error that put us
-		// on this path. Both failures are swallowed so dispose() never throws.
 		try {
-			this.#flushArtifactTailIfCapped();
-		} catch {
-			/* ignore */
-		} finally {
+			if (this.#fileCreation) {
+				await this.#fileCreation.catch(() => undefined);
+			}
+			const file = this.#file;
+			if (!file) return;
+			// The tail/notice replay writes to the sink and can throw (e.g. a disk
+			// write error). Closing the descriptor MUST still happen — otherwise the
+			// fd leaks and the replay error masks the original tool error that put us
+			// on this path. Both failures are swallowed so dispose() never throws.
 			try {
-				await file.sink.end();
+				this.#flushArtifactTailIfCapped();
 			} catch {
 				/* ignore */
+			} finally {
+				try {
+					await file.sink.end();
+				} catch {
+					/* ignore */
+				}
 			}
+		} finally {
+			const release = this.#artifactRelease;
+			this.#artifactRelease = undefined;
+			release?.();
 		}
 	}
 

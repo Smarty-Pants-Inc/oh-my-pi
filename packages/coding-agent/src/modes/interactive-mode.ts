@@ -195,7 +195,7 @@ import {
 } from "./session-observer-registry";
 import { createSessionTeardown, type SessionTeardown } from "./session-teardown";
 import { runProviderSetupWizard } from "./setup-wizard/lazy";
-import { interruptHint } from "./shared";
+import { interruptHint, sanitizeStatusText } from "./shared";
 import { clearMermaidCache } from "./theme/mermaid-cache";
 import { type ShimmerPalette, shimmerEnabled, shimmerSegments, shimmerText } from "./theme/shimmer";
 import type { Theme } from "./theme/theme";
@@ -368,8 +368,36 @@ export interface InteractiveModeOptions {
  * when present, sits higher and wins (topmost-seam merge in TUI.render).
  */
 class AnchoredLiveContainer extends Container implements NativeScrollbackLiveRegion {
+	constructor(private readonly onChildrenChanged?: () => void) {
+		super();
+	}
+
+	override addChild(component: Component): void {
+		super.addChild(component);
+		this.#notifyChildrenChanged();
+	}
+
+	override removeChild(component: Component): void {
+		const previousLength = this.children.length;
+		super.removeChild(component);
+		if (this.children.length !== previousLength) this.#notifyChildrenChanged();
+	}
+
+	override clear(): void {
+		super.clear();
+		this.#notifyChildrenChanged();
+	}
+
 	getNativeScrollbackLiveRegionStart(): number | undefined {
 		return this.children.length > 0 ? 0 : undefined;
+	}
+
+	#notifyChildrenChanged(): void {
+		try {
+			this.onChildrenChanged?.();
+		} catch {
+			// Status observers are auxiliary and must never break TUI ownership.
+		}
 	}
 }
 
@@ -658,6 +686,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	#resizeHandler?: () => void;
 	#observerRegistry: SessionObserverRegistry;
 	#eventBus?: EventBus;
+	#companionStatusTextSink?: (statusText?: string) => void;
 	#eventBusUnsubscribers: Array<() => void> = [];
 	#observerUiSyncTimer?: NodeJS.Timeout;
 	#observerUiSyncNeedsTodoReconcile = false;
@@ -678,6 +707,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		lspServers: LspStartupServerInfo[] | undefined = undefined,
 		mcpManager?: MCPManager,
 		eventBus?: EventBus,
+		companionStatusTextSink?: (statusText?: string) => void,
 	) {
 		this.session = session;
 		this.sessionManager = session.sessionManager;
@@ -693,6 +723,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			new MCPCommandController(this).handleMCPAuthChallenge(serverName, challenge),
 		);
 		this.#eventBus = eventBus;
+		this.#companionStatusTextSink = companionStatusTextSink;
 		if (eventBus) {
 			this.#eventBusUnsubscribers.push(
 				eventBus.on(LSP_STARTUP_EVENT_CHANNEL, data => {
@@ -722,7 +753,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		setTerminalTextSizing(settings.get("tui.textSizing") && TERMINAL.textSizing);
 		this.chatContainer = new TranscriptContainer();
 		this.pendingMessagesContainer = new AnchoredLiveContainer();
-		this.statusContainer = new AnchoredLiveContainer();
+		this.statusContainer = new AnchoredLiveContainer(
+			companionStatusTextSink ? () => this.#publishCompanionStatusText() : undefined,
+		);
 		this.todoContainer = new AnchoredLiveContainer();
 		this.subagentContainer = new AnchoredLiveContainer();
 		this.btwContainer = new AnchoredLiveContainer();
@@ -2434,13 +2467,19 @@ export class InteractiveMode implements InteractiveModeContext {
 	async #clearTransientModeState(options?: {
 		preserveVibe?: boolean;
 		vibeScopeAlreadySuspended?: boolean;
-	}): Promise<void> {
+	}): Promise<boolean> {
+		let promptRefreshFailed = false;
 		if (this.planModeEnabled || this.planModePaused) {
 			this.session.setPlanModeState(undefined);
 			try {
 				if (this.#planModePreviousTools !== undefined) {
 					await this.session.setActiveToolsByName(this.#planModePreviousTools);
 				}
+			} catch (error) {
+				promptRefreshFailed = true;
+				logger.warn("Failed to restore source plan tools while reconciling target session", {
+					error: String(error),
+				});
 			} finally {
 				this.session.setPlanProposalHandler?.(null);
 				this.planModeEnabled = false;
@@ -2487,10 +2526,13 @@ export class InteractiveMode implements InteractiveModeContext {
 			}
 			this.#updateVibeModeStatus();
 		}
+		return promptRefreshFailed;
 	}
 
 	/** Reconcile mode state from session entries on resume/switch. */
-	async #reconcileModeFromSession(options?: { preserveActiveGoal?: boolean }): Promise<void> {
+	async #reconcileModeFromSession(options?: {
+		preserveActiveGoal?: boolean;
+	}): Promise<"source-presentation-refresh-failed" | undefined> {
 		const vibeScopeAlreadySuspended = this.#vibeScopeSuspendedForSwitch;
 		this.#vibeScopeSuspendedForSwitch = false;
 		const sessionContext = this.sessionManager.buildSessionContext();
@@ -2502,19 +2544,20 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#vibeModeOwnerScope?.ownerId === targetVibeScope.ownerId &&
 			this.#vibeModeOwnerScope.parentSessionId === targetVibeScope.parentSessionId &&
 			this.#vibeModeOwnerScope.parentSessionFile === targetVibeScope.parentSessionFile;
-		await this.#clearTransientModeState({ preserveVibe, vibeScopeAlreadySuspended });
+		const promptRefreshFailed = await this.#clearTransientModeState({ preserveVibe, vibeScopeAlreadySuspended });
+		const result = promptRefreshFailed ? ("source-presentation-refresh-failed" as const) : undefined;
 		await VibeSessionRegistry.global().rehydrate(vibeSession);
 		const goalEnabled = this.session.settings.get("goal.enabled");
 		if (!goalEnabled && (sessionContext.mode === "goal" || sessionContext.mode === "goal_paused")) {
 			this.session.goalRuntime.clearAccounting();
 			this.sessionManager.appendModeChange("none");
-			return;
+			return result;
 		}
 		if (sessionContext.mode === "goal" || sessionContext.mode === "goal_paused") {
 			const goal = this.#goalFromModeData(sessionContext.modeData);
 			if (!goal) {
 				this.sessionManager.appendModeChange("none");
-				return;
+				return result;
 			}
 			this.session.setGoalModeState({
 				enabled: sessionContext.mode === "goal",
@@ -2534,12 +2577,12 @@ export class InteractiveMode implements InteractiveModeContext {
 				await this.session.setActiveToolsByName([...new Set([...previousTools, "goal"])]);
 			}
 			this.#updateGoalModeStatus();
-			return;
+			return result;
 		}
 		this.session.goalRuntime.clearAccounting();
 		if (sessionContext.mode === "vibe") {
 			if (!preserveVibe) await this.#enterVibeMode({ persistModeChange: false });
-			return;
+			return result;
 		}
 		if (!this.session.settings.get("plan.enabled")) {
 			// Clear stale plan/plan_paused mode so re-enabling the setting
@@ -2557,6 +2600,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#planModeHasEntered = true;
 			this.#updatePlanModeStatus();
 		}
+		return result;
 	}
 
 	async #enterPlanMode(options?: {
@@ -3983,6 +4027,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#sttController = undefined;
 		}
 		this.#extensionUiController.clearExtensionTerminalInputListeners();
+		this.#extensionUiController.clearHostTerminalInputListeners();
 		this.#extensionUiController.clearHookWidgets();
 		for (const unsubscribe of this.#eventBusUnsubscribers) {
 			unsubscribe();
@@ -4313,6 +4358,32 @@ export class InteractiveMode implements InteractiveModeContext {
 		return this.#cacheWorkingMessageAccent(key, main && dim ? { main, dim } : undefined);
 	}
 
+	#publishCompanionStatusText(): void {
+		if (!this.#companionStatusTextSink) return;
+		let message: string | undefined;
+		for (let index = this.statusContainer.children.length - 1; index >= 0; index--) {
+			const child = this.statusContainer.children[index];
+			if (child instanceof Loader) {
+				message = child.getMessage();
+				break;
+			}
+		}
+		if (message !== undefined) {
+			for (const suffix of [interruptHint(), " (esc to cancel)"]) {
+				if (message.endsWith(suffix)) {
+					message = message.slice(0, -suffix.length);
+					break;
+				}
+			}
+			message = sanitizeStatusText(message) || undefined;
+		}
+		try {
+			this.#companionStatusTextSink(message);
+		} catch {
+			// Companion transport is optional; footer rendering remains authoritative.
+		}
+	}
+
 	ensureLoadingAnimation(): void {
 		if (!this.loadingAnimation) {
 			this.#clearWorkingMessageAccentCache();
@@ -4359,12 +4430,14 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#pendingWorkingMessage = undefined;
 			if (this.loadingAnimation) {
 				this.loadingAnimation.setMessage(this.#defaultWorkingMessage);
+				if (this.#companionStatusTextSink) this.#publishCompanionStatusText();
 			}
 			return;
 		}
 
 		if (this.loadingAnimation) {
 			this.loadingAnimation.setMessage(message);
+			if (this.#companionStatusTextSink) this.#publishCompanionStatusText();
 			return;
 		}
 

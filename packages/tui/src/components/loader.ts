@@ -123,6 +123,10 @@ export class Loader extends Text {
 		this.#requestPaint();
 	}
 
+	getMessage(): string {
+		return this.message;
+	}
+
 	#scheduleTick(intervalMs: number, delayMs: number): void {
 		const timer = setTimeout(() => {
 			if (this.#intervalId !== timer) return;

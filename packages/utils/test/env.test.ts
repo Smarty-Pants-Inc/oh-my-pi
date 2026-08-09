@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
 	$envExact,
+	filterChildShellEnv,
 	filterProcessEnv,
 	getDbBusyTimeoutMs,
 	parseEnvFile,
@@ -51,19 +52,16 @@ async function runRuntimeProbe(
 	probePath = runtimeProbePath,
 ): Promise<boolean> {
 	const cwd = path.dirname(writeTempEnv(""));
-	const proc = Bun.spawn([process.execPath, probePath], {
+	const resultPath = path.join(cwd, "runtime-probe-result.json");
+	const proc = Bun.spawn([process.execPath, probePath, resultPath], {
 		cwd,
 		env: { ...process.env, ...env },
-		stdout: "pipe",
+		stdout: "ignore",
 		stderr: "pipe",
 	});
-	const [stdout, stderr, exitCode] = await Promise.all([
-		new Response(proc.stdout).text(),
-		new Response(proc.stderr).text(),
-		proc.exited,
-	]);
+	const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
 	expect(exitCode, stderr).toBe(0);
-	return JSON.parse(stdout) as boolean;
+	return JSON.parse(fs.readFileSync(resultPath, "utf8")) as boolean;
 }
 
 describe("parseEnvFile", () => {
@@ -85,6 +83,14 @@ describe("parseEnvFile", () => {
 			GOOD: "value",
 			_ALSO_GOOD: "quoted value",
 		});
+	});
+
+	it("never accepts Fresh companion launch authority from dotenv files", () => {
+		const filePath = writeTempEnv(
+			["FRESH_OMP_COMPANION=1", "FRESH_OMP_COMPANION_TOKEN=project-controlled", "GOOD=value"].join("\n"),
+		);
+
+		expect(parseEnvFile(filePath)).toEqual({ GOOD: "value" });
 	});
 
 	it("mirrors valid OMP_ variables to PI_ variables", () => {
@@ -166,6 +172,91 @@ describe("filterProcessEnv", () => {
 			"CommonProgramFiles(x86)": "C:\\Program Files (x86)\\Common Files",
 		});
 	});
+
+	it("does not forward Fresh companion transport values to Bash child environments", () => {
+		expect(
+			filterChildShellEnv({
+				PATH: process.env.PATH ?? "",
+				FRESH_OMP_COMPANION: "1",
+				FRESH_OMP_COMPANION_TOKEN: "private-capability",
+			}),
+		).toEqual({ PATH: process.env.PATH ?? "" });
+	});
+});
+
+describe("Fresh OMP companion launch authority", () => {
+	it("captures launch values once and removes their live environment copies", async () => {
+		const cwd = path.dirname(writeTempEnv(""));
+		const resultPath = path.join(cwd, "fresh-launch-result.json");
+		const envModulePath = path.join(import.meta.dir, "..", "src", "env.ts");
+		// Load env.ts inside the child so module initialization observes only that
+		// process's isolated exec environment.
+		const script = [
+			'import * as fs from "node:fs";',
+			`const { consumeFreshOmpCompanionLaunchEnv } = await import(${JSON.stringify(envModulePath)});`,
+			"const first = consumeFreshOmpCompanionLaunchEnv() ?? null;",
+			"const second = consumeFreshOmpCompanionLaunchEnv() ?? null;",
+			`fs.writeFileSync(${JSON.stringify(resultPath)}, JSON.stringify({ first, second, marker: Bun.env.FRESH_OMP_COMPANION ?? null, token: Bun.env.FRESH_OMP_COMPANION_TOKEN ?? null }));`,
+		].join("\n");
+		const proc = Bun.spawn([process.execPath, "--no-env-file", "--eval", script], {
+			cwd,
+			env: {
+				...process.env,
+				FRESH_OMP_COMPANION: "1",
+				FRESH_OMP_COMPANION_TOKEN: "launch-token",
+			},
+			stdout: "ignore",
+			stderr: "pipe",
+		});
+		const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+
+		expect(exitCode, stderr).toBe(0);
+		expect(JSON.parse(fs.readFileSync(resultPath, "utf8"))).toEqual({
+			first: {
+				FRESH_OMP_COMPANION: "1",
+				FRESH_OMP_COMPANION_TOKEN: "launch-token",
+			},
+			second: null,
+			marker: null,
+			token: null,
+		});
+	});
+
+	it("rejects project dotenv authority even when it spoofs compiled mode", async () => {
+		const cwd = path.dirname(
+			writeTempEnv("PI_COMPILED=true\nFRESH_OMP_COMPANION=1\nFRESH_OMP_COMPANION_TOKEN=project-token\n"),
+		);
+		const resultPath = path.join(cwd, "fresh-dotenv-result.json");
+		const envModulePath = path.join(import.meta.dir, "..", "src", "env.ts");
+		const script = [
+			'import * as fs from "node:fs";',
+			// A child import is required to exercise Bun's pre-module project dotenv load.
+			`const { consumeFreshOmpCompanionLaunchEnv } = await import(${JSON.stringify(envModulePath)});`,
+			"const launch = consumeFreshOmpCompanionLaunchEnv();",
+			'const authorized = launch?.FRESH_OMP_COMPANION === "1" && launch.FRESH_OMP_COMPANION_TOKEN === "project-token";',
+			`fs.writeFileSync(${JSON.stringify(resultPath)}, JSON.stringify({ authorized, spoofedCompiled: Bun.env.PI_COMPILED ?? null, marker: Bun.env.FRESH_OMP_COMPANION ?? null, token: Bun.env.FRESH_OMP_COMPANION_TOKEN ?? null }));`,
+		].join("\n");
+		const proc = Bun.spawn([process.execPath, "--eval", script], {
+			cwd,
+			env: {
+				...process.env,
+				PI_COMPILED: undefined,
+				FRESH_OMP_COMPANION: undefined,
+				FRESH_OMP_COMPANION_TOKEN: undefined,
+			},
+			stdout: "ignore",
+			stderr: "pipe",
+		});
+		const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+
+		expect(exitCode, stderr).toBe(0);
+		expect(JSON.parse(fs.readFileSync(resultPath, "utf8"))).toEqual({
+			authorized: false,
+			spoofedCompiled: "true",
+			marker: null,
+			token: null,
+		});
+	});
 });
 
 describe("isBunTestRuntime", () => {
@@ -184,7 +275,7 @@ describe("isBunTestRuntime", () => {
 		const envModulePath = path.join(import.meta.dir, "..", "src", "env.ts");
 		fs.writeFileSync(
 			underscoreProbePath,
-			`import { isBunTestRuntime } from ${JSON.stringify(envModulePath)};\nprocess.stdout.write(JSON.stringify(isBunTestRuntime()));\n`,
+			`import * as fs from "node:fs";\nimport { isBunTestRuntime } from ${JSON.stringify(envModulePath)};\nfs.writeFileSync(process.argv[2], JSON.stringify(isBunTestRuntime()));\n`,
 		);
 		expect(
 			await runRuntimeProbe(

@@ -16,7 +16,7 @@ import type { Settings } from "../../config/settings";
 import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
 import type { MemoryRuntimeContext } from "../../memory-backend";
 import { type Theme, theme } from "../../modes/theme/theme";
-import type { AsyncJobSnapshot } from "../../session/agent-session";
+import type { AsyncJobCounts, AsyncJobSnapshot } from "../../session/agent-session";
 import type { SessionManager } from "../../session/session-manager";
 import type { BranchHandler, NavigateTreeHandler, NewSessionHandler } from "../session-handler-types";
 import { ManagedTimers } from "./managed-timers";
@@ -45,6 +45,8 @@ import type {
 	ExtensionShortcut,
 	ExtensionUIContext,
 	ExtensionUIDialogOptions,
+	HostInternalExtensionBinding,
+	HostInternalSessionMutationEvent,
 	InputEvent,
 	InputEventResult,
 	McpNotificationEvent,
@@ -61,6 +63,9 @@ import type {
 	SessionStopEvent,
 	SessionStopEventResult,
 	SystemPromptBuilder,
+	TerminalInputHandler,
+	ToolApprovalRequestedEvent,
+	ToolApprovalResolvedEvent,
 	ToolCallEvent,
 	ToolCallEventResult,
 	ToolResultEvent,
@@ -81,6 +86,7 @@ export type ExtensionErrorListener = (error: ExtensionError) => void;
 
 export const EXTENSION_HANDLER_TIMEOUT_MS = 30_000;
 let extensionHandlerTimeoutMs = EXTENSION_HANDLER_TIMEOUT_MS;
+const FRESH_SNAPSHOT_ACK_FAILURE = Symbol.for("oh-my-pi.fresh-omp.snapshot-ack-failure");
 
 function throwUnsupportedServiceTierAction(): never {
 	throw new Error("This extension host does not support service-tier actions");
@@ -191,8 +197,9 @@ async function raceHandlerWithTimeout<T>(
 	work: (handlerSignal: AbortSignal) => Promise<T> | T,
 	timeoutMs: number,
 	signal?: AbortSignal,
+	invokeWhenAborted = false,
 ): Promise<T | typeof EXTENSION_HANDLER_TIMEOUT | typeof EXTENSION_HANDLER_ABORTED> {
-	if (signal?.aborted) return EXTENSION_HANDLER_ABORTED;
+	if (signal?.aborted && !invokeWhenAborted) return EXTENSION_HANDLER_ABORTED;
 
 	const timeoutController = new AbortController();
 	const handlerSignal = signal ? AbortSignal.any([signal, timeoutController.signal]) : timeoutController.signal;
@@ -206,8 +213,8 @@ async function raceHandlerWithTimeout<T>(
 		resolveInterrupt(EXTENSION_HANDLER_TIMEOUT);
 	}, timeoutMs);
 	try {
-		if (signal?.aborted) return EXTENSION_HANDLER_ABORTED;
 		const workPromise = Promise.resolve(work(handlerSignal));
+		if (signal?.aborted) resolveInterrupt(EXTENSION_HANDLER_ABORTED);
 		const result = await Promise.race([workPromise, interruptPromise]);
 		if (result === EXTENSION_HANDLER_TIMEOUT) {
 			await Promise.race([
@@ -277,6 +284,9 @@ type RunnerEmitResult<TEvent extends RunnerEmitEvent> = TEvent extends { type: "
 						? SessionStopEventResult | undefined
 						: undefined;
 
+type HostCompletionContinuation = () => void | Promise<void>;
+type HostCompletionPreparation = () => void | HostCompletionContinuation | Promise<void | HostCompletionContinuation>;
+
 // Session-lifecycle handler types live once in session-handler-types (imported
 // above for local use); re-exported here to keep this module's public API stable.
 export type { BranchHandler, NavigateTreeHandler, NewSessionHandler };
@@ -338,13 +348,15 @@ export class ExtensionRunner {
 	#errorListeners: Set<ExtensionErrorListener> = new Set();
 	#getModel: () => Model | undefined = () => undefined;
 	#isIdleFn: () => boolean = () => true;
+	#isCompactingFn: () => boolean = () => false;
 	#waitForIdleFn: () => Promise<void> = async () => {};
-	#abortFn: () => void = () => {};
+	#abortFn: () => void | Promise<void> = () => {};
 	#hasPendingMessagesFn: () => boolean = () => false;
 	#getContextUsageFn: () => ContextUsage | undefined = () => undefined;
 	#compactFn: (instructionsOrOptions?: string | CompactOptions) => Promise<void> = async () => {};
 	#getSystemPromptFn: () => string[] = () => [];
 	#getAsyncJobSnapshotFn: () => AsyncJobSnapshot | null = () => null;
+	#getAsyncJobCountsFn: () => AsyncJobCounts | null = () => null;
 	#newSessionHandler: NewSessionHandler = async () => ({ cancelled: false });
 	#branchHandler: BranchHandler = async () => ({ cancelled: false });
 	#navigateTreeHandler: NavigateTreeHandler = async () => ({ cancelled: false });
@@ -353,6 +365,9 @@ export class ExtensionRunner {
 	#shutdownHandler: ShutdownHandler = () => {};
 	#getMemoryFn?: () => MemoryRuntimeContext | undefined;
 	#commandDiagnostics: Array<{ type: string; message: string; path: string }> = [];
+	readonly #publicExtensions: Extension[];
+	readonly #hostInternalExtension?: HostInternalExtensionBinding;
+	private readonly extensions: Extension[];
 	#initialized = false;
 	/**
 	 * Buffer for `credential_disabled` events received via {@link emitCredentialDisabled}
@@ -476,7 +491,7 @@ export class ExtensionRunner {
 	}
 
 	constructor(
-		private readonly extensions: Extension[],
+		publicExtensions: Extension[],
 		private readonly runtime: ExtensionRuntime,
 		/** Ignored: `cwd` is always read live via the `cwd` getter below, not cached here. */
 		_initialCwd: string,
@@ -486,10 +501,18 @@ export class ExtensionRunner {
 		private readonly settings?: Settings,
 		private readonly localProtocolOptions?: LocalProtocolOptions,
 		getAsyncJobSnapshot?: () => AsyncJobSnapshot | null,
+		hostInternalExtension?: HostInternalExtensionBinding,
+		getAsyncJobCounts?: () => AsyncJobCounts | null,
 	) {
 		this.#uiContext = noOpUIContext;
 		this.#getMemoryFn = getMemory;
 		this.#getAsyncJobSnapshotFn = getAsyncJobSnapshot ?? (() => null);
+		this.#getAsyncJobCountsFn = getAsyncJobCounts ?? (() => null);
+		this.#hostInternalExtension = hostInternalExtension;
+		this.#publicExtensions = publicExtensions;
+		this.extensions = hostInternalExtension
+			? [hostInternalExtension.extension, ...publicExtensions]
+			: publicExtensions;
 	}
 
 	/**
@@ -541,6 +564,7 @@ export class ExtensionRunner {
 		// Context actions (required)
 		this.#getModel = contextActions.getModel;
 		this.#isIdleFn = contextActions.isIdle;
+		this.#isCompactingFn = contextActions.isCompacting;
 		this.#abortFn = contextActions.abort;
 		this.#hasPendingMessagesFn = contextActions.hasPendingMessages;
 		this.#shutdownHandler = contextActions.shutdown;
@@ -661,7 +685,7 @@ export class ExtensionRunner {
 	}
 
 	getExtensionPaths(): string[] {
-		return this.extensions.map(e => e.path);
+		return this.#publicExtensions.map(e => e.path);
 	}
 
 	getSystemPromptBuilder(): SystemPromptBuilder | undefined {
@@ -675,7 +699,7 @@ export class ExtensionRunner {
 	/** Get all registered tools from all extensions. */
 	getAllRegisteredTools(): RegisteredTool[] {
 		const tools: RegisteredTool[] = [];
-		for (const ext of this.extensions) {
+		for (const ext of this.#publicExtensions) {
 			for (const tool of ext.tools.values()) {
 				tools.push(tool);
 			}
@@ -700,7 +724,7 @@ export class ExtensionRunner {
 	}
 
 	getFlags(): Map<string, ExtensionFlag> {
-		return ExtensionRunner.aggregateFlags(this.extensions);
+		return ExtensionRunner.aggregateFlags(this.#publicExtensions);
 	}
 
 	getFlagValues(): Map<string, boolean | string> {
@@ -733,7 +757,7 @@ export class ExtensionRunner {
 
 	getShortcuts(): Map<KeyId, ExtensionShortcut> {
 		const allShortcuts = new Map<KeyId, ExtensionShortcut>();
-		for (const ext of this.extensions) {
+		for (const ext of this.#publicExtensions) {
 			for (const [key, shortcut] of ext.shortcuts) {
 				const normalizedKey = key.toLowerCase() as KeyId;
 
@@ -780,8 +804,13 @@ export class ExtensionRunner {
 		return false;
 	}
 
+	/** Supply host-owned bindings with the interactive terminal-input registrar. */
+	setHostTerminalInput(register: (handler: TerminalInputHandler) => () => void): void {
+		this.#hostInternalExtension?.setHostTerminalInput?.(register);
+	}
+
 	getMessageRenderer(customType: string): MessageRenderer | undefined {
-		for (const ext of this.extensions) {
+		for (const ext of this.#publicExtensions) {
 			const renderer = ext.messageRenderers.get(customType);
 			if (renderer) {
 				return renderer;
@@ -791,14 +820,14 @@ export class ExtensionRunner {
 	}
 
 	getAssistantThinkingRenderers(): AssistantThinkingRenderer[] {
-		return this.extensions.flatMap(ext => ext.assistantThinkingRenderers);
+		return this.#publicExtensions.flatMap(ext => ext.assistantThinkingRenderers);
 	}
 
 	getRegisteredCommands(reserved?: ReadonlySet<string>): RegisteredCommand[] {
 		this.#commandDiagnostics = [];
 
 		const commands = new Map<string, RegisteredCommand>();
-		for (const ext of this.extensions) {
+		for (const ext of this.#publicExtensions) {
 			for (const command of ext.commands.values()) {
 				if (reserved?.has(command.name)) {
 					const message = `Extension command '${command.name}' from ${ext.path} conflicts with built-in commands. Skipping.`;
@@ -820,8 +849,8 @@ export class ExtensionRunner {
 	}
 
 	getCommand(name: string): RegisteredCommand | undefined {
-		for (let index = this.extensions.length - 1; index >= 0; index -= 1) {
-			const command = this.extensions[index]?.commands.get(name);
+		for (let index = this.#publicExtensions.length - 1; index >= 0; index -= 1) {
+			const command = this.#publicExtensions[index]?.commands.get(name);
 			if (command) {
 				return command;
 			}
@@ -854,8 +883,10 @@ export class ExtensionRunner {
 		return {
 			ui: this.#uiContext,
 			getContextUsage: () => this.#getContextUsageFn(),
+			isCompacting: () => this.#isCompactingFn(),
 			compact: instructionsOrOptions => this.#compactFn(instructionsOrOptions),
 			getAsyncJobSnapshot: () => this.#getAsyncJobSnapshotFn(),
+			getAsyncJobCounts: () => this.#getAsyncJobCountsFn(),
 			hasUI: this.hasUI(),
 			cwd: this.cwd,
 			sessionManager: this.sessionManager,
@@ -865,7 +896,7 @@ export class ExtensionRunner {
 			},
 			models: createExtensionModelQuery(this.modelRegistry, this.settings, getModel),
 			isIdle: () => this.#isIdleFn(),
-			abort: () => this.#abortFn(),
+			abort: async () => await this.#abortFn(),
 			hasPendingMessages: () => this.#hasPendingMessagesFn(),
 			shutdown: () => this.#shutdownHandler(),
 			getSystemPrompt: () => this.#getSystemPromptFn(),
@@ -937,17 +968,24 @@ export class ExtensionRunner {
 		ctx: ExtensionContext,
 		ext: Extension,
 		timeoutMs: number,
+		scopeContextToHandler = true,
+		signal?: AbortSignal,
+		invokeWhenAborted = false,
+		propagateSnapshotAcknowledgementFailure = false,
 	): Promise<TResult | undefined> {
-		const signal =
+		const eventSignal =
 			event.type === "session_stop" && "signal" in event && event.signal instanceof AbortSignal
 				? event.signal
 				: undefined;
-		if (signal?.aborted) return undefined;
+		const handlerSignal = signal ?? eventSignal;
+		if (handlerSignal?.aborted && !invokeWhenAborted) return undefined;
 		try {
 			const handlerResult = await raceHandlerWithTimeout(
-				handlerSignal => handler(event, createHandlerContext(ctx, handlerSignal)),
+				handlerAbortSignal =>
+					handler(event, scopeContextToHandler ? createHandlerContext(ctx, handlerAbortSignal) : ctx),
 				timeoutMs,
-				signal,
+				handlerSignal,
+				invokeWhenAborted,
 			);
 			if (handlerResult === EXTENSION_HANDLER_ABORTED) return undefined;
 			if (handlerResult === EXTENSION_HANDLER_TIMEOUT) {
@@ -966,6 +1004,7 @@ export class ExtensionRunner {
 			}
 			return handlerResult as TResult | undefined;
 		} catch (err) {
+			if (handlerSignal?.aborted) return undefined;
 			const message = err instanceof Error ? err.message : String(err);
 			const stack = err instanceof Error ? err.stack : undefined;
 			this.emitError({
@@ -974,6 +1013,13 @@ export class ExtensionRunner {
 				error: message,
 				stack,
 			});
+			if (
+				propagateSnapshotAcknowledgementFailure &&
+				typeof err === "object" &&
+				err !== null &&
+				(err as Record<PropertyKey, unknown>)[FRESH_SNAPSHOT_ACK_FAILURE] === true
+			)
+				throw err;
 			return undefined;
 		}
 	}
@@ -1039,6 +1085,82 @@ export class ExtensionRunner {
 		}
 
 		return result as RunnerEmitResult<TEvent>;
+	}
+
+	/** Quiesce the host-owned observer immediately before a committed session mutation. */
+	async emitHostInternalBeforeSessionMutation(event: HostInternalSessionMutationEvent): Promise<void> {
+		const binding = this.#hostInternalExtension;
+		if (!binding?.beforeSessionMutation) return;
+
+		await this.#runHandlerWithTimeout(
+			binding.beforeSessionMutation,
+			event,
+			this.createContext(),
+			binding.extension,
+			handlerTimeoutForEvent(event.type),
+			false,
+		);
+	}
+
+	/**
+	 * Emit an ordinary event to every matching handler, await optional lifecycle
+	 * preparation, then run host-owned post-dispatch publication against a newly
+	 * sampled context. Preparation may return the continuation that activates the
+	 * selected lifecycle owner; that continuation runs only after every
+	 * `afterDispatch` callback has completed. Preparation failures and the Fresh
+	 * snapshot-ack publication sentinel propagate and suppress activation; unrelated
+	 * host callback errors and timeouts remain contained.
+	 */
+	async emitWithHostCompletion<TEvent extends RunnerEmitEvent>(
+		event: TEvent,
+		prepareHostCompletion?: HostCompletionPreparation,
+	): Promise<RunnerEmitResult<TEvent>> {
+		const result = await this.emit(event);
+		const prepared = await prepareHostCompletion?.();
+		const postHostContinuation = typeof prepared === "function" ? prepared : undefined;
+		const binding = this.#hostInternalExtension;
+		if (binding?.afterDispatch) {
+			await this.#runHandlerWithTimeout(
+				binding.afterDispatch,
+				event,
+				this.createContext(),
+				binding.extension,
+				handlerTimeoutForEvent(event.type),
+				false,
+				undefined,
+				false,
+				true,
+			);
+		}
+		await postHostContinuation?.();
+		return result;
+	}
+
+	/** Dispatch approval lifecycle handlers with the active tool-call cancellation signal. */
+	async emitApproval(
+		event: ToolApprovalRequestedEvent | ToolApprovalResolvedEvent,
+		signal?: AbortSignal,
+	): Promise<void> {
+		const ctx = this.createContext();
+		const invokeWhenAborted = event.type === "tool_approval_resolved";
+		for (const ext of this.extensions) {
+			const handlers = ext.handlers.get(event.type);
+			if (!handlers || handlers.length === 0) continue;
+
+			for (const handler of handlers) {
+				if (signal?.aborted && !invokeWhenAborted) return;
+				await this.#runHandlerWithTimeout(
+					handler,
+					event,
+					ctx,
+					ext,
+					handlerTimeoutForEvent(event.type),
+					true,
+					signal,
+					invokeWhenAborted,
+				);
+			}
+		}
 	}
 
 	async emitToolResult(event: ToolResultEvent): Promise<ToolResultEventResult | undefined> {

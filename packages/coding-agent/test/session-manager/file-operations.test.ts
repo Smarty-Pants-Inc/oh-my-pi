@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { FileEntry, SessionHeader } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import { type FileEntry, isSessionEntry, type SessionHeader } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { findMostRecentSession, resolveResumableSession } from "@oh-my-pi/pi-coding-agent/session/session-listing";
 import { loadEntriesFromFile } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -333,7 +333,7 @@ describe("SessionManager legacy session migration persistence", () => {
 		expect(fs.statSync(sessionFile).mtimeMs).toBeGreaterThan(initialMtimeMs);
 		expect(header.version).toBe(3);
 		expect(persistedEntries).toHaveLength(4);
-		for (const entry of persistedEntries.filter(entry => entry.type !== "session")) {
+		for (const entry of persistedEntries.filter(isSessionEntry)) {
 			expect(entry.id).toBeDefined();
 		}
 	});

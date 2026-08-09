@@ -2,6 +2,12 @@ import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import { hasFsCode, isEnoent, logger, peekFileEnds, Snowflake, toError } from "@oh-my-pi/pi-utils";
+import {
+	reconcileArtifactOperationsSync,
+	reconcileArtifactOperationsUnderRootSync,
+	removeArtifactOperationIntent,
+	writeArtifactDeletionIntent,
+} from "./artifacts";
 import { overlayTitleSlotContent, type SessionTitleUpdate, serializeTitleSlot } from "./session-title-slot";
 
 const utf8Decoder = new TextDecoder("utf-8");
@@ -79,6 +85,12 @@ export interface SessionStorage {
 	rename(path: string, nextPath: string): Promise<void>;
 	unlink(path: string): Promise<void>;
 	deleteSessionWithArtifacts(sessionPath: string): Promise<void>;
+	/**
+	 * Relocate a session journal and every storage-backed sidecar under its
+	 * artifact prefix. Backends that implement this must replace the destination
+	 * as one rollback-capable operation.
+	 */
+	moveSessionWithArtifacts?(sessionPath: string, nextSessionPath: string): Promise<void>;
 	openWriter(path: string, options?: { flags?: "a" | "w"; onError?: (err: Error) => void }): SessionStorageWriter;
 	/**
 	 * Wait for every backing write scheduled by this storage to become durably
@@ -188,6 +200,14 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 }
 
 export class FileSessionStorage implements SessionStorage {
+	reconcileArtifactOperationsSync(sessionDir: string): void {
+		reconcileArtifactOperationsSync(sessionDir);
+	}
+
+	reconcileArtifactOperationsUnderRootSync(sessionsRoot: string): void {
+		reconcileArtifactOperationsUnderRootSync(sessionsRoot);
+	}
+
 	ensureDirSync(dir: string): void {
 		if (!fs.existsSync(dir)) {
 			fs.mkdirSync(dir, { recursive: true });
@@ -430,28 +450,36 @@ export class FileSessionStorage implements SessionStorage {
 	}
 
 	/**
-	 * Delete a session file and its artifacts directory.
-	 * Artifacts are stored in a sibling directory with the same name minus .jsonl extension.
+	 * Delete a session file and its artifacts independently. The durable intent
+	 * survives a crash or partial failure so startup reconciliation can retry.
 	 */
 	async deleteSessionWithArtifacts(sessionPath: string): Promise<void> {
-		// Delete the session file itself
-		await this.unlink(sessionPath);
+		const resolvedSessionPath = path.resolve(sessionPath);
+		const artifactsDir = resolvedSessionPath.slice(0, -6);
+		if (!fs.existsSync(resolvedSessionPath) && !fs.existsSync(artifactsDir)) return;
+		const intentPath = await writeArtifactDeletionIntent(resolvedSessionPath);
+		const failures: unknown[] = [];
 
-		// Compute artifacts directory: /path/to/session.jsonl -> /path/to/session
-		const artifactsDir = sessionPath.slice(0, -6);
-
-		// Delete artifacts directory if it exists. Missing directories are fine, but
-		// surface real cleanup failures because the session file is already gone.
+		try {
+			await this.unlink(resolvedSessionPath);
+		} catch (error) {
+			if (!isEnoent(error)) failures.push(error);
+		}
 		try {
 			await fsp.rm(artifactsDir, { recursive: true, force: true });
-		} catch (err) {
-			const error = toError(err);
-			throw new Error(
-				`Session file deleted but failed to remove artifacts directory ${artifactsDir}: ${error.message}`,
-				{
-					cause: error,
-				},
-			);
+		} catch (error) {
+			failures.push(error);
+		}
+
+		if (failures.length === 0) {
+			try {
+				await removeArtifactOperationIntent(intentPath);
+			} catch (error) {
+				failures.push(error);
+			}
+		}
+		if (failures.length > 0) {
+			throw new AggregateError(failures, `Failed to delete session and artifacts for ${resolvedSessionPath}`);
 		}
 	}
 }
@@ -756,11 +784,41 @@ export class MemorySessionStorage implements SessionStorage {
 		return Promise.resolve();
 	}
 
-	unlink(path: string): Promise<void> {
-		this.#files.delete(path);
+	moveSessionWithArtifacts(sessionPath: string, nextSessionPath: string): Promise<void> {
+		const sourceArtifactsDir = sessionPath.slice(0, -6);
+		const sourcePrefix = sourceArtifactsDir.endsWith("/") ? sourceArtifactsDir : `${sourceArtifactsDir}/`;
+		const nextArtifactsDir = nextSessionPath.slice(0, -6);
+		const nextPrefix = nextArtifactsDir.endsWith("/") ? nextArtifactsDir : `${nextArtifactsDir}/`;
+		const moves: Array<[string, string, MemoryFileEntry]> = [];
+		for (const [source, entry] of this.#files) {
+			if (source === sessionPath) moves.push([source, nextSessionPath, entry]);
+			else if (source.startsWith(sourcePrefix))
+				moves.push([source, `${nextPrefix}${source.slice(sourcePrefix.length)}`, entry]);
+		}
+		if (!moves.some(([source]) => source === sessionPath))
+			return Promise.reject(new Error(`File not found: ${sessionPath}`));
+
+		this.#files.delete(nextSessionPath);
+		for (const key of this.#files.keys()) {
+			if (key.startsWith(nextPrefix)) this.#files.delete(key);
+		}
+		for (const [source] of moves) this.#files.delete(source);
+		for (const [, destination, entry] of moves) this.#files.set(destination, entry);
 		return Promise.resolve();
 	}
-	deleteSessionWithArtifacts(_sessionPath: string): Promise<void> {
+
+	unlink(path: string): Promise<void> {
+		if (!this.#files.delete(path)) return Promise.reject(new Error(`File not found: ${path}`));
+		return Promise.resolve();
+	}
+
+	deleteSessionWithArtifacts(sessionPath: string): Promise<void> {
+		this.#files.delete(sessionPath);
+		const artifactsDir = sessionPath.slice(0, -6);
+		const prefix = artifactsDir.endsWith("/") ? artifactsDir : `${artifactsDir}/`;
+		for (const key of this.#files.keys()) {
+			if (key.startsWith(prefix)) this.#files.delete(key);
+		}
 		return Promise.resolve();
 	}
 

@@ -6,6 +6,7 @@ import type { AssistantMessage, Model, ToolCall } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
@@ -15,6 +16,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { SecretObfuscator } from "@oh-my-pi/pi-coding-agent/secrets";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { AsyncResultEntry } from "@oh-my-pi/pi-coding-agent/session/async-job-delivery";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
@@ -60,6 +62,69 @@ describe("AgentSession handoff", () => {
 	async function drainMaintenance(): Promise<void> {
 		await Bun.sleep(0);
 		await session.waitForIdle();
+	}
+
+	async function prepareIncompleteHandoffRollback(options?: { asyncRollbackFailure?: Error }): Promise<{
+		targetFailure: Error;
+		eventTypes: string[];
+		participantRollback: { advisor: boolean; async: boolean };
+	}> {
+		await sessionManager.ensureOnDisk();
+		await sessionManager.flush();
+		const retainedSessionFile = session.sessionFile;
+		if (!retainedSessionFile) throw new Error("Expected retained session file");
+		await session.dispose();
+		sessionManager = await SessionManager.open(retainedSessionFile, tempDir.path());
+		const extensionsResult = await loadExtensions([], tempDir.path());
+		const extensionRunner = new ExtensionRunner(
+			extensionsResult.extensions,
+			extensionsResult.runtime,
+			tempDir.path(),
+			sessionManager,
+			modelRegistry,
+		);
+		const asyncManager = new AsyncJobManager({ retentionMs: 60_000 });
+		session = new AgentSession({
+			agent: new Agent({
+				getApiKey: () => "test-key",
+				initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			}),
+			sessionManager,
+			settings: Settings.isolated({ "compaction.enabled": true, "compaction.autoContinue": false }),
+			modelRegistry,
+			extensionRunner,
+			obfuscator,
+			ownedAsyncJobManager: asyncManager,
+			agentId: "Main",
+		});
+		const targetFailure = new Error("handoff target materialization failed");
+		const ensureOnDisk = sessionManager.ensureOnDisk.bind(sessionManager);
+		vi.spyOn(sessionManager, "ensureOnDisk").mockImplementation(async () => {
+			if (session.sessionFile !== retainedSessionFile) throw targetFailure;
+			await ensureOnDisk();
+		});
+		const eventTypes: string[] = [];
+		const emitWithHostCompletion = extensionRunner.emitWithHostCompletion.bind(extensionRunner);
+		vi.spyOn(extensionRunner, "emitWithHostCompletion").mockImplementation((event, finalizeBeforeHostCompletion) => {
+			eventTypes.push(event.type);
+			return emitWithHostCompletion(event, finalizeBeforeHostCompletion);
+		});
+		const participantRollback = { advisor: false, async: false };
+		const beginTransaction = session.yieldQueue.beginTransaction.bind(session.yieldQueue);
+		vi.spyOn(session.yieldQueue, "beginTransaction").mockImplementation(kind => {
+			const transaction = beginTransaction(kind);
+			if (kind === "advisor" || kind === "async-result") {
+				const rollback = transaction.rollback.bind(transaction);
+				vi.spyOn(transaction, "rollback").mockImplementation(() => {
+					participantRollback[kind === "advisor" ? "advisor" : "async"] = true;
+					rollback();
+					if (kind === "async-result" && options?.asyncRollbackFailure) throw options.asyncRollbackFailure;
+				});
+			}
+			return transaction;
+		});
+		vi.spyOn(compactionModule, "generateHandoffFromContext").mockResolvedValue("## Goal\nContinue from here");
+		return { targetFailure, eventTypes, participantRollback };
 	}
 
 	beforeAll(async () => {
@@ -203,6 +268,7 @@ describe("AgentSession handoff", () => {
 		}> = [];
 		vi.spyOn(extensionRunner, "hasHandlers").mockImplementation(eventName => eventName === "session_before_switch");
 		const emit = extensionRunner.emit.bind(extensionRunner);
+		const completionSpy = vi.spyOn(extensionRunner, "emitWithHostCompletion");
 		vi.spyOn(extensionRunner, "emit").mockImplementation(event => {
 			if (event.type === "session_before_switch" || event.type === "session_switch") {
 				observedEvents.push({
@@ -260,13 +326,522 @@ describe("AgentSession handoff", () => {
 				type: "session_switch",
 				reason: "handoff",
 				previousSessionFile,
-				activeSessionFile: nextSessionFile,
-				messageCount: 0,
-				handoffEntryCount: 1,
+				activeSessionFile: previousSessionFile,
+				messageCount: 2,
+				handoffEntryCount: 0,
 			},
 		]);
+		expect(completionSpy).toHaveBeenCalledWith({ type: "session_ready" }, expect.any(Function));
 	});
 
+	it("preserves durable journal mutations when handoff flush fails before the post-quiescence capture", async () => {
+		await sessionManager.ensureOnDisk();
+		await sessionManager.flush();
+		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+		const retainedSessionFile = session.sessionFile;
+		if (!retainedSessionFile) throw new Error("Expected retained session file");
+		const retainedEntries = structuredClone(sessionManager.getEntries());
+		const retainedMessages = structuredClone(session.messages);
+
+		const failure = new Error("handoff retained flush failed after mutation");
+		const mutationText = "durable handoff mutation";
+		let flushCalls = 0;
+		let durableMutationRaw: string | undefined;
+		const flush = sessionManager.flush.bind(sessionManager);
+		vi.spyOn(sessionManager, "flush").mockImplementation(async () => {
+			const call = ++flushCalls;
+			if (call === 2) {
+				sessionManager.appendMessage({ role: "user", content: mutationText, timestamp: 99 });
+				session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+			}
+			await flush();
+			if (call === 2) durableMutationRaw = await Bun.file(retainedSessionFile).text();
+			if (call === 2) throw failure;
+		});
+		let captureCalls = 0;
+		const capturePersistedSessionFile = sessionManager.capturePersistedSessionFile.bind(sessionManager);
+		vi.spyOn(sessionManager, "capturePersistedSessionFile").mockImplementation(async () => {
+			const snapshot = await capturePersistedSessionFile();
+			captureCalls++;
+			return snapshot;
+		});
+		vi.spyOn(compactionModule, "generateHandoffFromContext").mockResolvedValue("## Goal\nContinue from here");
+
+		await expect(session.handoff()).rejects.toBe(failure);
+
+		if (durableMutationRaw === undefined) throw new Error("Expected durable handoff mutation bytes");
+		expect(flushCalls).toBe(3);
+		expect(durableMutationRaw).toContain(mutationText);
+		expect(captureCalls).toBe(2); // Initial checkpoint plus rollback preservation; recapture was not reached.
+		expect(session.sessionFile).toBe(retainedSessionFile);
+		expect(sessionManager.getEntries()).toEqual([
+			...retainedEntries,
+			expect.objectContaining({
+				type: "message",
+				message: expect.objectContaining({ role: "user", content: mutationText, timestamp: 99 }),
+			}),
+		]);
+		expect(session.messages).toEqual(retainedMessages);
+		expect(await Bun.file(retainedSessionFile).text()).toBe(durableMutationRaw);
+	});
+
+	it("restores retained state and removes a failed replacement before handoff rollback", async () => {
+		await sessionManager.ensureOnDisk();
+		await sessionManager.flush();
+		const previousSessionFile = session.sessionFile;
+		if (!previousSessionFile) throw new Error("Expected retained session file");
+		await session.dispose();
+		sessionManager = await SessionManager.open(previousSessionFile, tempDir.path());
+		const extensionsResult = await loadExtensions([], tempDir.path());
+		const extensionRunner = new ExtensionRunner(
+			extensionsResult.extensions,
+			extensionsResult.runtime,
+			tempDir.path(),
+			sessionManager,
+			modelRegistry,
+		);
+		session = new AgentSession({
+			agent: new Agent({
+				initialState: {
+					model,
+					systemPrompt: ["Test"],
+					tools: [],
+					messages: [],
+				},
+			}),
+			sessionManager,
+			settings: Settings.isolated({
+				"compaction.enabled": true,
+				"compaction.autoContinue": false,
+			}),
+			modelRegistry,
+			extensionRunner,
+			obfuscator,
+		});
+		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+
+		const retainedEntries = sessionManager.getEntries().map(entry => entry.id);
+		const retainedMessages = [...session.messages];
+		const retainedSystemPrompt = [...session.agent.state.systemPrompt];
+		const checkpoint = { checkpointMessageCount: 2, checkpointEntryId: "handoff-checkpoint", startedAt: "start" };
+		const retainedSteer: AgentMessage = {
+			role: "user",
+			content: [{ type: "text", text: "retained steer" }],
+			attribution: "user",
+			timestamp: 3,
+		};
+		const retainedFollowUp: AgentMessage = {
+			role: "user",
+			content: [{ type: "text", text: "retained follow-up" }],
+			attribution: "user",
+			timestamp: 4,
+		};
+		session.setCheckpointState(checkpoint);
+		session.setPlanReferencePath("local://HANDOFF-RETAINED.md");
+		session.agent.replaceQueues([retainedSteer], [retainedFollowUp]);
+		const retainedPreview = (input: unknown) => input;
+		session.toolChoiceQueue.registerPendingInvoker("handoff-retained-preview", "ast_edit", retainedPreview);
+
+		vi.spyOn(compactionModule, "generateHandoffFromContext").mockResolvedValue("## Goal\nContinue from here");
+		let replacementSessionFile: string | undefined;
+		const failure = new Error("handoff target materialization failed");
+		const ensureOnDisk = sessionManager.ensureOnDisk.bind(sessionManager);
+		vi.spyOn(sessionManager, "ensureOnDisk").mockImplementation(async () => {
+			if (sessionManager.getSessionFile() !== previousSessionFile) {
+				replacementSessionFile = sessionManager.getSessionFile();
+				session.agent.setSystemPrompt(["replacement prompt"]);
+				throw failure;
+			}
+			await ensureOnDisk();
+		});
+
+		let rollbackAtDispatch:
+			| {
+					sessionFile: string | undefined;
+					entries: string[];
+					messages: AgentMessage[];
+					checkpoint: unknown;
+					steering: AgentMessage[];
+					followUp: AgentMessage[];
+					systemPrompt: string[];
+					planReferencePath: string;
+					preview: ((input: unknown) => unknown) | undefined;
+			  }
+			| undefined;
+		const emitWithHostCompletion = extensionRunner.emitWithHostCompletion.bind(extensionRunner);
+		vi.spyOn(extensionRunner, "emitWithHostCompletion").mockImplementation((event, finalizeBeforeHostCompletion) => {
+			if (event.type === "session_rollback") {
+				rollbackAtDispatch = {
+					sessionFile: session.sessionFile,
+					entries: sessionManager.getEntries().map(entry => entry.id),
+					messages: [...session.messages],
+					checkpoint: session.getCheckpointState(),
+					steering: [...session.agent.peekSteeringQueue()],
+					followUp: [...session.agent.peekFollowUpQueue()],
+					systemPrompt: session.agent.state.systemPrompt,
+					planReferencePath: session.getPlanReferencePath(),
+					preview: session.peekPendingInvoker(),
+				};
+			}
+			return emitWithHostCompletion(event, finalizeBeforeHostCompletion);
+		});
+
+		await expect(session.handoff()).rejects.toBe(failure);
+		expect(rollbackAtDispatch).toEqual({
+			sessionFile: previousSessionFile,
+			entries: retainedEntries,
+			messages: retainedMessages,
+			checkpoint,
+			steering: [retainedSteer],
+			followUp: [retainedFollowUp],
+			systemPrompt: retainedSystemPrompt,
+			planReferencePath: "local://HANDOFF-RETAINED.md",
+			preview: retainedPreview,
+		});
+		expect(await Bun.file(previousSessionFile).exists()).toBe(true);
+		expect(replacementSessionFile).toBeString();
+		expect(await Bun.file(replacementSessionFile!).exists()).toBe(false);
+	});
+
+	it("suppresses handoff rollback publication when replacement cleanup fails but releases advisor and async transitions", async () => {
+		const fixture = await prepareIncompleteHandoffRollback();
+		const cleanupFailure = new Error("replacement cleanup failed");
+		vi.spyOn(sessionManager, "dropSession").mockRejectedValue(cleanupFailure);
+
+		let thrown: unknown;
+		try {
+			await session.handoff();
+		} catch (error) {
+			thrown = error;
+		}
+		expect(thrown).toBeInstanceOf(AggregateError);
+		const rollbackError = thrown as AggregateError;
+		expect(rollbackError.message).toBe("Handoff failed and rollback was incomplete");
+		expect(sessionManager.dropSession).toHaveBeenCalledTimes(1);
+		expect(rollbackError.errors).toContain(fixture.targetFailure);
+		const retainedRestoreError = rollbackError.errors.find(
+			error => error instanceof AggregateError,
+		) as AggregateError;
+		expect(retainedRestoreError.errors).toContain(cleanupFailure);
+		expect(fixture.eventTypes).not.toContain("session_rollback");
+		expect(fixture.participantRollback).toEqual({ advisor: true, async: true });
+	});
+
+	it("suppresses handoff rollback publication when retained JSONL restoration fails but releases advisor and async transitions", async () => {
+		const fixture = await prepareIncompleteHandoffRollback();
+		const durableFailure = new Error("retained journal restore failed");
+		vi.spyOn(sessionManager, "restorePersistedSessionFile").mockRejectedValue(durableFailure);
+
+		let thrown: unknown;
+		try {
+			await session.handoff();
+		} catch (error) {
+			thrown = error;
+		}
+		expect(thrown).toBeInstanceOf(AggregateError);
+		const rollbackError = thrown as AggregateError;
+		expect(rollbackError.message).toBe("Handoff failed and rollback was incomplete");
+		expect(sessionManager.restorePersistedSessionFile).toHaveBeenCalledTimes(1);
+		expect(rollbackError.errors).toContain(fixture.targetFailure);
+		const retainedRestoreError = rollbackError.errors.find(
+			error => error instanceof AggregateError,
+		) as AggregateError;
+		expect(retainedRestoreError.errors).toContain(durableFailure);
+		expect(fixture.eventTypes).not.toContain("session_rollback");
+		expect(fixture.participantRollback).toEqual({ advisor: true, async: true });
+	});
+
+	it("suppresses handoff rollback publication when retained JSONL restoration returns false", async () => {
+		const fixture = await prepareIncompleteHandoffRollback();
+		const rewriteEntries = vi.spyOn(sessionManager, "rewriteEntries");
+		vi.spyOn(sessionManager, "restorePersistedSessionFile").mockResolvedValue(false);
+
+		let thrown: unknown;
+		try {
+			await session.handoff();
+		} catch (error) {
+			thrown = error;
+		}
+		expect(thrown).toBeInstanceOf(AggregateError);
+		const rollbackError = thrown as AggregateError;
+		expect(rollbackError.message).toBe("Handoff failed and rollback was incomplete");
+		expect(sessionManager.restorePersistedSessionFile).toHaveBeenCalledTimes(1);
+		expect(rewriteEntries).toHaveBeenCalledTimes(1);
+		expect(rollbackError.errors).toContain(fixture.targetFailure);
+		const retainedRestoreError = rollbackError.errors.find(
+			error => error instanceof AggregateError,
+		) as AggregateError;
+		expect(retainedRestoreError.errors).toContainEqual(
+			expect.objectContaining({ message: "Retained session journal preimage could not be restored" }),
+		);
+		expect(fixture.eventTypes).not.toContain("session_rollback");
+		expect(fixture.participantRollback).toEqual({ advisor: true, async: true });
+	});
+
+	it("suppresses handoff rollback publication when async release fails after retained restoration", async () => {
+		const asyncRollbackFailure = new Error("retained async release failed");
+		const fixture = await prepareIncompleteHandoffRollback({ asyncRollbackFailure });
+
+		let thrown: unknown;
+		try {
+			await session.handoff();
+		} catch (error) {
+			thrown = error;
+		}
+		expect(thrown).toBeInstanceOf(AggregateError);
+		const rollbackError = thrown as AggregateError;
+		expect(rollbackError.message).toBe("Handoff failed and rollback was incomplete");
+		expect(rollbackError.errors).toEqual(expect.arrayContaining([fixture.targetFailure, asyncRollbackFailure]));
+		expect(fixture.participantRollback).toEqual({ advisor: true, async: true });
+		expect(fixture.eventTypes).not.toContain("session_rollback");
+	});
+
+	it("releases handoff advisor and async receipts before rollback publication", async () => {
+		await sessionManager.ensureOnDisk();
+		await sessionManager.flush();
+		const retainedSessionFile = session.sessionFile;
+		if (!retainedSessionFile) throw new Error("Expected retained session file");
+		await session.dispose();
+		sessionManager = await SessionManager.open(retainedSessionFile, tempDir.path());
+		const extensionsResult = await loadExtensions([], tempDir.path());
+		const extensionRunner = new ExtensionRunner(
+			extensionsResult.extensions,
+			extensionsResult.runtime,
+			tempDir.path(),
+			sessionManager,
+			modelRegistry,
+		);
+		const asyncManager = new AsyncJobManager({ retentionMs: 60_000 });
+		const deliveredContexts: string[] = [];
+		const primaryMock = createMockModel({
+			handler: context => {
+				deliveredContexts.push(JSON.stringify(context.messages));
+				return { content: ["primary reply"] };
+			},
+		});
+		session = new AgentSession({
+			agent: new Agent({
+				getApiKey: () => "test-key",
+				initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+				streamFn: primaryMock.stream,
+			}),
+			sessionManager,
+			settings: Settings.isolated({ "compaction.enabled": true, "compaction.autoContinue": false }),
+			modelRegistry,
+			extensionRunner,
+			obfuscator,
+			ownedAsyncJobManager: asyncManager,
+			agentId: "Main",
+		});
+		session.settings.setModelRole("advisor", `${model.provider}/${model.id}`);
+		expect(session.toggleAdvisorEnabled()).toBe(true);
+		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+		const retainedFollowUpMarker = "retained handoff follow-up";
+		session.agent.replaceQueues(
+			[],
+			[
+				{
+					role: "user",
+					content: [{ type: "text", text: retainedFollowUpMarker }],
+					attribution: "user",
+					timestamp: 2,
+				},
+			],
+		);
+		vi.spyOn(compactionModule, "generateHandoffFromContext").mockResolvedValue("## Goal\nContinue from here");
+
+		let advisorReceiptResolutions = 0;
+		let advisorReceiptRejections = 0;
+		const advisorReceipt = session.yieldQueue.enqueueWithReceipt("advisor", {
+			note: "retained handoff advisor receipt",
+			severity: "nit" as const,
+			advisor: undefined,
+		});
+		void advisorReceipt.then(
+			() => advisorReceiptResolutions++,
+			() => advisorReceiptRejections++,
+		);
+		let asyncReceiptResolutions = 0;
+		let asyncReceiptRejections = 0;
+		let asyncReceipt: Promise<void> | undefined;
+		const beginTransaction = session.yieldQueue.beginTransaction.bind(session.yieldQueue);
+		vi.spyOn(session.yieldQueue, "beginTransaction").mockImplementation(kind => {
+			if (kind === "async-result" && !asyncReceipt) {
+				asyncReceipt = session.yieldQueue.enqueueWithReceipt<AsyncResultEntry>("async-result", {
+					jobId: "retained-handoff-queued-receipt",
+					result: "retained queued async receipt",
+					job: undefined,
+					durationMs: 0,
+					epoch: 0,
+				});
+				void asyncReceipt.then(
+					() => asyncReceiptResolutions++,
+					() => asyncReceiptRejections++,
+				);
+			}
+			return beginTransaction(kind);
+		});
+		const jobGate = Promise.withResolvers<string>();
+		const jobId = asyncManager.register("task", "retained handoff deferred job", () => jobGate.promise, {
+			id: "retained-handoff-deferred-job",
+			ownerId: "Main",
+		});
+		const targetEnsureStarted = Promise.withResolvers<void>();
+		const continueTargetEnsure = Promise.withResolvers<void>();
+		const ensureOnDisk = sessionManager.ensureOnDisk.bind(sessionManager);
+		vi.spyOn(sessionManager, "ensureOnDisk").mockImplementation(async () => {
+			if (session.sessionFile !== retainedSessionFile) {
+				targetEnsureStarted.resolve();
+				await continueTargetEnsure.promise;
+			}
+			await ensureOnDisk();
+		});
+		const failure = new Error("handoff readiness failed");
+		let readyState: { advisor: number; async: number; advisorQueued: boolean; asyncQueued: boolean } | undefined;
+		let rollbackState:
+			| {
+					advisor: number;
+					async: number;
+					advisorQueued: boolean;
+					asyncQueued: boolean;
+					followUpQueued: boolean;
+					providerCalls: number;
+					jobStatus: string | undefined;
+			  }
+			| undefined;
+		const emitWithHostCompletion = extensionRunner.emitWithHostCompletion.bind(extensionRunner);
+		vi.spyOn(extensionRunner, "emitWithHostCompletion").mockImplementation(
+			async (event, finalizeBeforeHostCompletion) => {
+				if (event.type === "session_ready") {
+					readyState = {
+						advisor: advisorReceiptResolutions + advisorReceiptRejections,
+						async: asyncReceiptResolutions + asyncReceiptRejections,
+						advisorQueued: session.yieldQueue.has("advisor"),
+						asyncQueued: session.yieldQueue.has("async-result"),
+					};
+					throw failure;
+				}
+				if (event.type === "session_rollback") {
+					rollbackState = {
+						advisor: advisorReceiptResolutions + advisorReceiptRejections,
+						async: asyncReceiptResolutions + asyncReceiptRejections,
+						advisorQueued: session.yieldQueue.has("advisor"),
+						asyncQueued: session.yieldQueue.has("async-result"),
+						followUpQueued: session.agent
+							.peekFollowUpQueue()
+							.some(message => JSON.stringify(message).includes(retainedFollowUpMarker)),
+						providerCalls: primaryMock.calls.length,
+						jobStatus: asyncManager.getJob(jobId)?.status,
+					};
+				}
+				return emitWithHostCompletion(event, finalizeBeforeHostCompletion);
+			},
+		);
+
+		const handoff = session.handoff();
+		await targetEnsureStarted.promise;
+		jobGate.resolve("retained deferred result");
+		await asyncManager.waitForOwnerJobs("Main");
+		await asyncManager.drainDeliveries({ filter: { ownerId: "Main" } });
+		expect(asyncManager.getJob(jobId)?.status).toBe("completed");
+		expect(asyncReceipt).toBeDefined();
+		expect(advisorReceiptResolutions + advisorReceiptRejections).toBe(0);
+		expect(asyncReceiptResolutions + asyncReceiptRejections).toBe(0);
+		continueTargetEnsure.resolve();
+		await expect(handoff).rejects.toBe(failure);
+
+		expect(readyState).toEqual({ advisor: 0, async: 0, advisorQueued: false, asyncQueued: false });
+		expect(rollbackState).toEqual({
+			advisor: 0,
+			async: 0,
+			advisorQueued: true,
+			asyncQueued: true,
+			followUpQueued: true,
+			providerCalls: 0,
+			jobStatus: "completed",
+		});
+		await expect(advisorReceipt).resolves.toBeUndefined();
+		await expect(asyncReceipt!).resolves.toBeUndefined();
+		expect(advisorReceiptResolutions).toBe(1);
+		expect(advisorReceiptRejections).toBe(0);
+		expect(asyncReceiptResolutions).toBe(1);
+		expect(asyncReceiptRejections).toBe(0);
+		expect(deliveredContexts.some(context => context.includes(retainedFollowUpMarker))).toBe(true);
+		const deliveredMessages = session.messages.map(message => JSON.stringify(message));
+		expect(deliveredMessages.filter(message => message.includes(retainedFollowUpMarker))).toHaveLength(1);
+		expect(asyncManager.getJob(jobId)?.status).toBe("completed");
+	});
+
+	it("commits handoff by discarding retained async work before it can enter the target", async () => {
+		await sessionManager.ensureOnDisk();
+		await sessionManager.flush();
+		const retainedSessionFile = session.sessionFile;
+		if (!retainedSessionFile) throw new Error("Expected retained session file");
+		const asyncManager = new AsyncJobManager({ retentionMs: 60_000 });
+		await session.dispose();
+		sessionManager = await SessionManager.open(retainedSessionFile, tempDir.path());
+		session = new AgentSession({
+			agent: new Agent({
+				getApiKey: () => "test-key",
+				initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			}),
+			sessionManager,
+			settings: Settings.isolated({ "compaction.enabled": true, "compaction.autoContinue": false }),
+			modelRegistry,
+			obfuscator,
+			ownedAsyncJobManager: asyncManager,
+			agentId: "Main",
+		});
+		vi.spyOn(compactionModule, "generateHandoffFromContext").mockResolvedValue("## Goal\nContinue from here");
+
+		let retainedReceipt: Promise<void> | undefined;
+		const beginTransaction = session.yieldQueue.beginTransaction.bind(session.yieldQueue);
+		vi.spyOn(session.yieldQueue, "beginTransaction").mockImplementation(kind => {
+			if (kind === "async-result" && !retainedReceipt) {
+				retainedReceipt = session.yieldQueue.enqueueWithReceipt<AsyncResultEntry>("async-result", {
+					jobId: "retained-handoff-commit-receipt",
+					result: "retained queued async receipt",
+					job: undefined,
+					durationMs: 0,
+					epoch: 0,
+				});
+				void retainedReceipt.catch(() => {});
+			}
+			return beginTransaction(kind);
+		});
+		const jobGate = Promise.withResolvers<string>();
+		const jobId = asyncManager.register("task", "retained handoff commit job", () => jobGate.promise, {
+			id: "retained-handoff-commit-job",
+			ownerId: "Main",
+		});
+		const targetEnsureStarted = Promise.withResolvers<void>();
+		const continueTargetEnsure = Promise.withResolvers<void>();
+		const ensureOnDisk = sessionManager.ensureOnDisk.bind(sessionManager);
+		vi.spyOn(sessionManager, "ensureOnDisk").mockImplementation(async () => {
+			if (session.sessionFile !== retainedSessionFile) {
+				targetEnsureStarted.resolve();
+				await continueTargetEnsure.promise;
+			}
+			await ensureOnDisk();
+		});
+
+		const handoff = session.handoff();
+		await targetEnsureStarted.promise;
+		jobGate.resolve("retained result must not cross handoff");
+		await asyncManager.waitForOwnerJobs("Main");
+		await asyncManager.drainDeliveries({ filter: { ownerId: "Main" } });
+		expect(asyncManager.getJob(jobId)?.status).toBe("completed");
+		expect(retainedReceipt).toBeDefined();
+		continueTargetEnsure.resolve();
+		await expect(handoff).resolves.toEqual({ document: "## Goal\nContinue from here", savedPath: undefined });
+
+		expect(asyncManager.getJob(jobId)).toBeUndefined();
+		await expect(retainedReceipt!).rejects.toThrow("Yield queue entry cleared before dispatch");
+		expect(session.yieldQueue.has("async-result")).toBe(false);
+		expect(session.agent.peekFollowUpQueue()).not.toContainEqual(
+			expect.objectContaining({ customType: "async-result" }),
+		);
+	});
 	it("runs handoff generation through the configured side stream function", async () => {
 		const handoffText = "## Goal\nContinue via side stream";
 		let sideStreamCalls = 0;
@@ -1767,6 +2342,7 @@ describe("AgentSession handoff", () => {
 		const emitSpy = vi.spyOn(extensionRunner, "emit").mockImplementation((async () => ({
 			cancel: true,
 		})) as ExtensionRunner["emit"]);
+		const completionSpy = vi.spyOn(extensionRunner, "emitWithHostCompletion");
 
 		session = new AgentSession({
 			agent: new Agent({
@@ -1815,6 +2391,7 @@ describe("AgentSession handoff", () => {
 		expect(generateHandoffSpy).toHaveBeenCalledTimes(1);
 		expect(emitSpy).toHaveBeenCalledWith({ type: "session_before_switch", reason: "handoff" });
 		expect(emitSpy).not.toHaveBeenCalledWith(expect.objectContaining({ type: "session_switch" }));
+		expect(completionSpy).not.toHaveBeenCalledWith({ type: "session_rollback" });
 		expect(session.sessionFile).toBe(previousSessionFile);
 		expect(sessionManager.getEntries().filter(entry => entry.type === "compaction")).toHaveLength(0);
 		const endEvents = events.filter(event => event.type === "auto_compaction_end");
