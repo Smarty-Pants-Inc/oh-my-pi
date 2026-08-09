@@ -73,6 +73,8 @@ describe("AgentSession handoff", () => {
 		await sessionManager.flush();
 		const retainedSessionFile = session.sessionFile;
 		if (!retainedSessionFile) throw new Error("Expected retained session file");
+		await session.dispose();
+		sessionManager = await SessionManager.open(retainedSessionFile, tempDir.path());
 		const extensionsResult = await loadExtensions([], tempDir.path());
 		const extensionRunner = new ExtensionRunner(
 			extensionsResult.extensions,
@@ -82,7 +84,6 @@ describe("AgentSession handoff", () => {
 			modelRegistry,
 		);
 		const asyncManager = new AsyncJobManager({ retentionMs: 60_000 });
-		await session.dispose();
 		session = new AgentSession({
 			agent: new Agent({
 				getApiKey: () => "test-key",
@@ -387,6 +388,10 @@ describe("AgentSession handoff", () => {
 	it("restores retained state and removes a failed replacement before handoff rollback", async () => {
 		await sessionManager.ensureOnDisk();
 		await sessionManager.flush();
+		const previousSessionFile = session.sessionFile;
+		if (!previousSessionFile) throw new Error("Expected retained session file");
+		await session.dispose();
+		sessionManager = await SessionManager.open(previousSessionFile, tempDir.path());
 		const extensionsResult = await loadExtensions([], tempDir.path());
 		const extensionRunner = new ExtensionRunner(
 			extensionsResult.extensions,
@@ -395,8 +400,6 @@ describe("AgentSession handoff", () => {
 			sessionManager,
 			modelRegistry,
 		);
-
-		await session.dispose();
 		session = new AgentSession({
 			agent: new Agent({
 				initialState: {
@@ -417,8 +420,6 @@ describe("AgentSession handoff", () => {
 		});
 		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
 
-		const previousSessionFile = session.sessionFile;
-		if (!previousSessionFile) throw new Error("Expected retained session file");
 		const retainedEntries = sessionManager.getEntries().map(entry => entry.id);
 		const retainedMessages = [...session.messages];
 		const retainedSystemPrompt = [...session.agent.state.systemPrompt];
@@ -600,6 +601,8 @@ describe("AgentSession handoff", () => {
 		await sessionManager.flush();
 		const retainedSessionFile = session.sessionFile;
 		if (!retainedSessionFile) throw new Error("Expected retained session file");
+		await session.dispose();
+		sessionManager = await SessionManager.open(retainedSessionFile, tempDir.path());
 		const extensionsResult = await loadExtensions([], tempDir.path());
 		const extensionRunner = new ExtensionRunner(
 			extensionsResult.extensions,
@@ -616,7 +619,6 @@ describe("AgentSession handoff", () => {
 				return { content: ["primary reply"] };
 			},
 		});
-		await session.dispose();
 		session = new AgentSession({
 			agent: new Agent({
 				getApiKey: () => "test-key",
@@ -777,6 +779,7 @@ describe("AgentSession handoff", () => {
 		if (!retainedSessionFile) throw new Error("Expected retained session file");
 		const asyncManager = new AsyncJobManager({ retentionMs: 60_000 });
 		await session.dispose();
+		sessionManager = await SessionManager.open(retainedSessionFile, tempDir.path());
 		session = new AgentSession({
 			agent: new Agent({
 				getApiKey: () => "test-key",
