@@ -4463,6 +4463,10 @@ export class AgentSession {
 		this.#cancelFatalRecoveryHint = undefined;
 		// Stop fallback extension timers before aborting deferred work they could enqueue.
 		this.#fallbackExtensionTimers?.clearAll();
+		// abort() waits for the active turn, so detach capture first: late provider
+		// frames must not repopulate the raw-SSE buffer while teardown drains.
+		this.agent.setProviderResponseInterceptor(undefined);
+		this.agent.setRawSseEventInterceptor(undefined);
 		try {
 			await this.abort({
 				goalReason: "internal",
@@ -4525,14 +4529,12 @@ export class AgentSession {
 		// A dispose triggered mid-turn (Ctrl-C / timeout / hard-killed subagent)
 		// only *signals* the agent loop via the earlier abort(); the loop and the
 		// session's fire-and-forget event handlers still unwind asynchronously.
-		// Detach the response/SSE interceptors so a late frame cannot re-record
-		// into rawSseDebugBuffer, then wait (bounded) for both the core run AND
-		// the in-flight event/persistence handlers to settle — the latter can
-		// still append the finished message/entries after agent.waitForIdle()
-		// alone. Without this the release races the unwind and a disposed session
-		// is repopulated with exactly the state we are trying to drop.
-		this.agent.setProviderResponseInterceptor(undefined);
-		this.agent.setRawSseEventInterceptor(undefined);
+		// The response/SSE interceptors were detached before abort(); now wait
+		// (bounded) for both the core run and the in-flight event/persistence
+		// handlers to settle. The latter can still append the finished message or
+		// entries after agent.waitForIdle() alone. Without this the release races
+		// the unwind and a disposed session is repopulated with exactly the state
+		// we are trying to drop.
 		let drained = false;
 		try {
 			await withTimeout(
