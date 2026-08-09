@@ -428,6 +428,7 @@ type AbortIntent = {
 	preserveCompaction: boolean;
 	preserveToolChoice: boolean;
 	postPromptDrainTimeoutMs?: number;
+	postPromptDrainTimeoutSet: PromiseWithResolvers<void>;
 	strandedAdvisorCards: CustomMessage[];
 };
 
@@ -7032,6 +7033,14 @@ export class AgentSession {
 	abort(options: AgentSessionAbortOptions = {}): Promise<void> {
 		if (this.#abortPromise) {
 			const intent = this.#abortIntent;
+			if (
+				options.postPromptDrainTimeoutMs !== undefined &&
+				intent &&
+				intent.postPromptDrainTimeoutMs === undefined
+			) {
+				intent.postPromptDrainTimeoutMs = options.postPromptDrainTimeoutMs;
+				intent.postPromptDrainTimeoutSet.resolve();
+			}
 			if (options.reason === USER_INTERRUPT_LABEL && intent && intent.reason !== USER_INTERRUPT_LABEL) {
 				intent.reason = USER_INTERRUPT_LABEL;
 				intent.goalReason = "interrupted";
@@ -7053,6 +7062,7 @@ export class AgentSession {
 			preserveCompaction: options.preserveCompaction === true,
 			preserveToolChoice: options.preserveToolChoice === true,
 			postPromptDrainTimeoutMs: options.postPromptDrainTimeoutMs,
+			postPromptDrainTimeoutSet: Promise.withResolvers<void>(),
 			strandedAdvisorCards: userInterrupt ? this.#extractQueuedAdvisorCards() : [],
 		};
 		this.#abortIntent = intent;
@@ -7098,8 +7108,11 @@ export class AgentSession {
 			const postPromptDrain = this.#cancelPostPromptTasks();
 			this.agent.abort(intent.reason);
 			if (intent.postPromptDrainTimeoutMs === undefined) {
-				await postPromptDrain;
-			} else {
+				// A later dispose() can join this ordinary abort and supply its mandatory
+				// teardown deadline without starting a second abort operation.
+				await Promise.race([postPromptDrain, intent.postPromptDrainTimeoutSet.promise]);
+			}
+			if (intent.postPromptDrainTimeoutMs !== undefined) {
 				try {
 					await withTimeout(
 						postPromptDrain,
@@ -7291,7 +7304,7 @@ export class AgentSession {
 				await this.sessionManager.beginArtifactCloneTransaction(advisorTranscriptFiles);
 			if (artifactCloneTransaction) {
 				lifecycle.bindResource("fork artifact clone", {
-					commit: () => artifactCloneTransaction.commit(),
+					finalize: () => artifactCloneTransaction.commit(),
 					rollback: () => artifactCloneTransaction.rollback(),
 				});
 			}
@@ -8244,7 +8257,7 @@ export class AgentSession {
 			await this.sessionManager.setSessionFile(sessionPath);
 			const targetArtifactTransaction = await this.sessionManager.beginArtifactTransaction();
 			lifecycle.bindResource("target artifact transaction", {
-				commit: () => targetArtifactTransaction.commit(),
+				finalize: () => targetArtifactTransaction.commit(),
 				rollback: () => targetArtifactTransaction.rollback(),
 				release: () => targetArtifactTransaction.commit(),
 			});
@@ -8440,7 +8453,7 @@ export class AgentSession {
 				: undefined;
 			if (artifactCloneTransaction) {
 				lifecycle.bindResource("branch artifact clone", {
-					commit: () => artifactCloneTransaction.commit(),
+					finalize: () => artifactCloneTransaction.commit(),
 					rollback: () => artifactCloneTransaction.rollback(),
 				});
 			}
@@ -8577,7 +8590,7 @@ export class AgentSession {
 				throw new Error("Persisted /btw branch did not acquire an artifact clone transaction");
 			}
 			lifecycle.bindResource("/btw artifact clone", {
-				commit: () => artifactCloneTransaction.commit(),
+				finalize: () => artifactCloneTransaction.commit(),
 				rollback: () => artifactCloneTransaction.rollback(),
 			});
 
@@ -8865,7 +8878,7 @@ export class AgentSession {
 				await this.#extensionRunner?.emitHostInternalBeforeSessionMutation?.({ type: "session_tree" });
 				const artifactTransaction = await this.sessionManager.beginArtifactTransaction();
 				lifecycle.bindResource("tree artifact transaction", {
-					commit: () => artifactTransaction.commit(),
+					finalize: () => artifactTransaction.commit(),
 					rollback: () => artifactTransaction.rollback(),
 					release: () => artifactTransaction.commit(),
 				});

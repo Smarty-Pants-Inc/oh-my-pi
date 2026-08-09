@@ -209,7 +209,7 @@ describe("ArtifactManager concurrency and transactions", () => {
 		await expect(laterSourceWrite).resolves.toBe(String(Number(liveWriter.id) + 1));
 	});
 
-	it("clones the complete recursive artifact graph with hard links", async () => {
+	it("clones the complete recursive artifact graph without sharing regular files", async () => {
 		const sourceDir = freshDir();
 		const destinationDir = path.join(path.dirname(sourceDir), "recursive-target");
 		await fs.mkdir(path.join(sourceDir, "local", "plans"), { recursive: true });
@@ -225,18 +225,17 @@ describe("ArtifactManager concurrency and transactions", () => {
 
 		const destinationFile = path.join(destinationDir, "local", "plans", "plan.json");
 		expect(await fs.readFile(destinationFile, "utf8")).toBe("DURABLE-PLAN");
-		expect((await fs.stat(destinationFile)).ino).toBe((await fs.stat(sourceFile)).ino);
+		await fs.appendFile(destinationFile, "\nTARGET-ONLY");
+		expect(await fs.readFile(destinationFile, "utf8")).toBe("DURABLE-PLAN\nTARGET-ONLY");
+		expect(await fs.readFile(sourceFile, "utf8")).toBe("DURABLE-PLAN");
 		expect((await fs.readdir(destinationDir)).some(name => /^\d+\..*\.log$/.test(name))).toBe(true);
 	});
 
-	it("falls back to copying when the filesystem rejects hard links", async () => {
+	it("copies regular artifact files", async () => {
 		const sourceDir = freshDir();
-		const destinationDir = path.join(path.dirname(sourceDir), "copy-fallback-target");
+		const destinationDir = path.join(path.dirname(sourceDir), "copy-target");
 		const source = new ArtifactManager(sourceDir);
 		await source.save("HISTORICAL", "bash");
-		const link = vi
-			.spyOn(fs, "link")
-			.mockRejectedValue(Object.assign(new Error("cross-device link"), { code: "EXDEV" }));
 		const copy = vi.spyOn(fs, "copyFile");
 
 		const clone = await source.beginCloneTransaction();
@@ -248,7 +247,6 @@ describe("ArtifactManager concurrency and transactions", () => {
 		expect(await fs.readFile((await new ArtifactManager(destinationDir).getPath("0")) as string, "utf8")).toBe(
 			"HISTORICAL",
 		);
-		link.mockRestore();
 		copy.mockRestore();
 	});
 
@@ -283,13 +281,9 @@ describe("ArtifactManager concurrency and transactions", () => {
 		await source.save("HISTORICAL", "bash");
 		const clone = await source.beginCloneTransaction();
 		const failure = Object.assign(new Error("artifact clone copy failed"), { code: "EIO" });
-		const link = vi
-			.spyOn(fs, "link")
-			.mockRejectedValue(Object.assign(new Error("cross-device link"), { code: "EXDEV" }));
 		const copy = vi.spyOn(fs, "copyFile").mockRejectedValueOnce(failure);
 
 		await expect(clone.publish(destinationDir)).rejects.toBe(failure);
-		link.mockRestore();
 		copy.mockRestore();
 		await clone.rollback();
 		await expect(fs.stat(destinationDir)).rejects.toMatchObject({ code: "ENOENT" });

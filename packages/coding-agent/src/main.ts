@@ -5,6 +5,7 @@
  * createAgentSession() options. The SDK does the heavy lifting.
  */
 import * as fsSync from "node:fs";
+import * as net from "node:net";
 import * as os from "node:os";
 import { createInterface } from "node:readline/promises";
 import { EventLoopKeepalive } from "@oh-my-pi/pi-agent-core";
@@ -108,10 +109,11 @@ type RunRpcMode = (
 	input?: ReadableStream<Uint8Array>,
 ) => Promise<never>;
 
-const FRESH_OMP_COMPANION_TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+const FRESH_OMP_COMPANION_SECRET_BYTES = 32;
+const FRESH_OMP_COMPANION_ENDPOINT_MAX_BYTES = 4096;
+const FRESH_OMP_COMPANION_CONNECT_TIMEOUT_MS = 1_000;
 
-/** Resolve the Fresh companion capability only for the canonical top-level interactive host. */
-export function resolveFreshOmpCompanionSecret(options: {
+interface FreshOmpCompanionGateOptions {
 	isInteractive: boolean;
 	noSession: boolean;
 	parentTaskPrefix?: string;
@@ -119,7 +121,10 @@ export function resolveFreshOmpCompanionSecret(options: {
 	taskDepth?: number;
 	env: Readonly<Record<string, string | undefined>>;
 	launchEnv: Readonly<Record<string, string | undefined>> | undefined;
-}): Uint8Array | undefined {
+}
+
+/** Resolve the one-shot Fresh endpoint only for the canonical top-level interactive host. */
+export function resolveFreshOmpCompanionEndpoint(options: FreshOmpCompanionGateOptions): string | undefined {
 	if (
 		!options.isInteractive ||
 		options.noSession ||
@@ -137,11 +142,52 @@ export function resolveFreshOmpCompanionSecret(options: {
 		return undefined;
 	}
 
-	const token = options.launchEnv.FRESH_OMP_COMPANION_TOKEN;
-	if (!token || !FRESH_OMP_COMPANION_TOKEN_PATTERN.test(token)) return undefined;
-	const secret = Buffer.from(token, "base64url");
-	if (secret.byteLength !== 32 || secret.toString("base64url") !== token) return undefined;
-	return secret;
+	const endpoint = options.launchEnv.FRESH_OMP_COMPANION_ENDPOINT;
+	if (!endpoint || endpoint.includes("\0") || Buffer.byteLength(endpoint) > FRESH_OMP_COMPANION_ENDPOINT_MAX_BYTES) {
+		return undefined;
+	}
+	return endpoint;
+}
+
+function readFreshOmpCompanionSecret(endpoint: string): Promise<Uint8Array | undefined> {
+	const { promise, resolve } = Promise.withResolvers<Uint8Array | undefined>();
+	const secret = Buffer.alloc(FRESH_OMP_COMPANION_SECRET_BYTES);
+	let offset = 0;
+	let settled = false;
+	const socket = net.createConnection({ path: endpoint });
+	const timer = setTimeout(() => finish(undefined), FRESH_OMP_COMPANION_CONNECT_TIMEOUT_MS);
+	timer.unref();
+
+	function finish(value: Uint8Array | undefined): void {
+		if (settled) return;
+		settled = true;
+		clearTimeout(timer);
+		socket.destroy();
+		if (!value) secret.fill(0);
+		resolve(value);
+	}
+
+	socket.on("data", chunk => {
+		const bytes = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+		if (offset + bytes.byteLength > secret.byteLength) {
+			finish(undefined);
+			return;
+		}
+		bytes.copy(secret, offset);
+		offset += bytes.byteLength;
+	});
+	socket.once("end", () => finish(offset === secret.byteLength ? secret : undefined));
+	socket.once("error", () => finish(undefined));
+	socket.once("close", () => finish(undefined));
+	return promise;
+}
+
+/** Read the private Fresh capability from its inherited one-shot local channel. */
+export async function resolveFreshOmpCompanionSecret(
+	options: FreshOmpCompanionGateOptions,
+): Promise<Uint8Array | undefined> {
+	const endpoint = resolveFreshOmpCompanionEndpoint(options);
+	return endpoint ? await readFreshOmpCompanionSecret(endpoint) : undefined;
 }
 
 /**
@@ -149,19 +195,21 @@ export function resolveFreshOmpCompanionSecret(options: {
  * authority, then erase both captured and live transport values before public
  * extensions or child-process setup can inherit them.
  */
-export function consumeFreshOmpCompanionSecret(
-	options: Omit<Parameters<typeof resolveFreshOmpCompanionSecret>[0], "env" | "launchEnv"> & {
+export async function consumeFreshOmpCompanionSecret(
+	options: Omit<FreshOmpCompanionGateOptions, "env" | "launchEnv"> & {
 		env: Record<string, string | undefined>;
 		launchEnv: Record<string, string | undefined> | undefined;
 	},
-): Uint8Array | undefined {
+): Promise<Uint8Array | undefined> {
 	try {
-		return resolveFreshOmpCompanionSecret(options);
+		return await resolveFreshOmpCompanionSecret(options);
 	} finally {
 		delete options.env.FRESH_OMP_COMPANION;
+		delete options.env.FRESH_OMP_COMPANION_ENDPOINT;
 		delete options.env.FRESH_OMP_COMPANION_TOKEN;
 		if (options.launchEnv) {
 			delete options.launchEnv.FRESH_OMP_COMPANION;
+			delete options.launchEnv.FRESH_OMP_COMPANION_ENDPOINT;
 			delete options.launchEnv.FRESH_OMP_COMPANION_TOKEN;
 		}
 	}
@@ -1256,6 +1304,12 @@ interface RunRootCommandDependencies {
 	consumeFreshOmpCompanionLaunchEnv?: typeof consumeFreshOmpCompanionLaunchEnv;
 }
 const DEFAULT_RUN_ROOT_DEPENDENCIES: RunRootCommandDependencies = {};
+async function disposeSessionAndQuit(session: AgentSession, code: number): Promise<void> {
+	stopStartupWatchdog();
+	await session.dispose();
+	stopThemeWatcher();
+	await postmortem.quit(code);
+}
 
 export async function runRootCommand(
 	parsed: Args,
@@ -1336,7 +1390,7 @@ export async function runRootCommand(
 	// title refresh) can tell a focusable process from a print/RPC/eval one.
 	setInteractiveHost(isInteractive);
 	const companionLaunchEnv = (deps.consumeFreshOmpCompanionLaunchEnv ?? consumeFreshOmpCompanionLaunchEnv)();
-	const companionSecret = consumeFreshOmpCompanionSecret({
+	const companionSecret = await consumeFreshOmpCompanionSecret({
 		isInteractive,
 		noSession: parsedArgs.noSession === true,
 		freshProvenance: parsedArgs.freshOmpCompanion === true,
@@ -1841,7 +1895,8 @@ export async function runRootCommand(
 			process.stderr.write(`${chalk.yellow("\nSet an API key environment variable:")}\n`);
 			process.stderr.write("  ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, etc.\n");
 			process.stderr.write(`${chalk.yellow(`\nOr create ${ModelsConfigFile.path()}`)}\n`);
-			process.exit(1);
+			await disposeSessionAndQuit(session, 1);
+			return;
 		}
 
 		if (mode === "rpc" || mode === "rpc-ui") {
@@ -1867,7 +1922,8 @@ export async function runRootCommand(
 			if ($env.PI_TIMING) {
 				logger.printTimings();
 				if (logger.shouldExitAfterTimings()) {
-					process.exit(0);
+					await disposeSessionAndQuit(session, 0);
+					return;
 				}
 			}
 
@@ -1906,9 +1962,7 @@ export async function runRootCommand(
 			if ($env.PI_TIMING) {
 				logger.printTimings();
 			}
-			await session.dispose();
-			stopThemeWatcher();
-			await postmortem.quit(0);
+			await disposeSessionAndQuit(session, 0);
 		}
 	}
 }

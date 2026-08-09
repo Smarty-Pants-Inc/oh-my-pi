@@ -8,7 +8,11 @@
 
 import { describe, expect, it } from "bun:test";
 import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
-import { SqlSessionStorage, type SqlSessionStorageClient } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
+import {
+	SqlSessionStorage,
+	type SqlSessionStorageClient,
+	type SqlSessionStorageExecutor,
+} from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { SQL } from "bun";
 
 async function createSqlite(): Promise<{ client: InstanceType<typeof SQL>; storage: SqlSessionStorage }> {
@@ -201,6 +205,116 @@ describe("SqlSessionStorage (SQLite backend)", () => {
 		await storage.rename("/sessions/p/a.jsonl", "/sessions/p/b.jsonl");
 		expect(storage.existsSync("/sessions/p/a.jsonl")).toBe(false);
 		expect(await storage.readText("/sessions/p/b.jsonl")).toBe("from-a\n");
+		await client.end();
+	});
+
+	it("publishes rename index changes only after the SQL transaction commits", async () => {
+		const client = new SQL("sqlite::memory:");
+		const statementsFinished = Promise.withResolvers<void>();
+		const allowCommit = Promise.withResolvers<void>();
+		const wrapped: SqlSessionStorageClient = {
+			options: { adapter: "sqlite" },
+			unsafe(query, values) {
+				return client.unsafe(query, values);
+			},
+			begin: (operation: (transaction: SqlSessionStorageExecutor) => Promise<void>) =>
+				client.begin(async transaction => {
+					await operation(transaction);
+					statementsFinished.resolve();
+					await allowCommit.promise;
+				}),
+		};
+		const storage = await SqlSessionStorage.create({ client: wrapped });
+		await storage.writeText("/sessions/p/source.jsonl", "source\n");
+
+		const moving = storage.rename("/sessions/p/source.jsonl", "/sessions/p/destination.jsonl");
+		try {
+			await statementsFinished.promise;
+			expect(storage.existsSync("/sessions/p/source.jsonl")).toBe(true);
+			expect(storage.existsSync("/sessions/p/destination.jsonl")).toBe(false);
+		} finally {
+			allowCommit.resolve();
+		}
+		await moving;
+		expect(storage.existsSync("/sessions/p/source.jsonl")).toBe(false);
+		expect(await storage.readText("/sessions/p/destination.jsonl")).toBe("source\n");
+		await client.end();
+	});
+
+	it("moveSessionWithArtifacts replaces the destination and relocates every sidecar", async () => {
+		const { client, storage } = await createSqlite();
+		const source = "/sessions/source/session.jsonl";
+		const destination = "/sessions/destination/session.jsonl";
+		await storage.writeText(source, "source journal\n");
+		await storage.writeText("/sessions/source/session/draft.txt", "source draft");
+		await storage.writeText("/sessions/source/session/.draft-only-session", "");
+		await storage.writeText("/sessions/source/session/plugin/state.json", "source state");
+		await storage.writeText(destination, "destination journal\n");
+		await storage.writeText("/sessions/destination/session/draft.txt", "destination draft");
+		await storage.writeText("/sessions/destination/session/stale.txt", "stale");
+
+		await storage.moveSessionWithArtifacts(source, destination);
+
+		expect(storage.existsSync(source)).toBe(false);
+		expect(storage.existsSync("/sessions/source/session/draft.txt")).toBe(false);
+		expect(await storage.readText(destination)).toBe("source journal\n");
+		expect(await storage.readText("/sessions/destination/session/draft.txt")).toBe("source draft");
+		expect(storage.existsSync("/sessions/destination/session/.draft-only-session")).toBe(true);
+		expect(await storage.readText("/sessions/destination/session/plugin/state.json")).toBe("source state");
+		expect(storage.existsSync("/sessions/destination/session/stale.txt")).toBe(false);
+		await client.end();
+	});
+
+	it("rolls back destination replacement and every source rename when SQL move fails", async () => {
+		const client = new SQL("sqlite::memory:");
+		let injectFailure = false;
+		let renameCount = 0;
+		const wrapped: SqlSessionStorageClient = {
+			options: { adapter: "sqlite" },
+			unsafe(query, values) {
+				return client.unsafe(query, values);
+			},
+			begin: (operation: (transaction: SqlSessionStorageExecutor) => Promise<void>) =>
+				client.begin(async transaction =>
+					operation({
+						unsafe(query, values) {
+							if (
+								injectFailure &&
+								query.startsWith("UPDATE omp_session_files SET path") &&
+								++renameCount === 2
+							) {
+								throw new Error("injected rename failure");
+							}
+							return transaction.unsafe(query, values);
+						},
+					}),
+				),
+		};
+		const storage = await SqlSessionStorage.create({ client: wrapped });
+		const source = "/sessions/source/session.jsonl";
+		const destination = "/sessions/destination/session.jsonl";
+		await storage.writeText(source, "source journal\n");
+		await storage.writeText("/sessions/source/session/draft.txt", "source draft");
+		await storage.writeText(destination, "destination journal\n");
+		await storage.writeText("/sessions/destination/session/draft.txt", "destination draft");
+
+		injectFailure = true;
+		await expect(storage.moveSessionWithArtifacts(source, destination)).rejects.toThrow("injected rename failure");
+
+		expect(await storage.readText(source)).toBe("source journal\n");
+		expect(await storage.readText("/sessions/source/session/draft.txt")).toBe("source draft");
+		expect(await storage.readText(destination)).toBe("destination journal\n");
+		expect(await storage.readText("/sessions/destination/session/draft.txt")).toBe("destination draft");
+		const rows = (await client.unsafe("SELECT path, content FROM omp_session_files ORDER BY path")) as Array<{
+			path: string;
+			content: string;
+		}>;
+		expect(rows).toEqual([
+			{ path: "/sessions/destination/session.jsonl", content: "destination journal\n" },
+			{ path: "/sessions/destination/session/draft.txt", content: "destination draft" },
+			{ path: "/sessions/source/session.jsonl", content: "source journal\n" },
+			{ path: "/sessions/source/session/draft.txt", content: "source draft" },
+		]);
 		await client.end();
 	});
 

@@ -154,7 +154,6 @@ export interface GhRunWatchViewDetails {
 	failedLogs?: GhRunWatchFailedLogDetails[];
 }
 
-
 export class GithubTool implements AgentTool<typeof githubSchema, GhToolDetails> {
 	readonly name = "github";
 	readonly approval = (args: unknown): ToolApprovalDecision => {

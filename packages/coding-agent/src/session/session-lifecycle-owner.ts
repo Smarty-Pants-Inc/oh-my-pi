@@ -33,6 +33,7 @@ export interface RetainedSessionTransitionCheckpoint {
 		rewriteRetainedEntries?: boolean;
 		preserveNewerRetainedMutations?: boolean;
 	}): Promise<void>;
+	recapture?(options?: { capturePersistedSessionFile?: boolean }): Promise<void>;
 }
 
 export interface SessionLifecycleCommitOptions {
@@ -982,38 +983,54 @@ export async function captureRetainedSessionCheckpoint(
 	host: RetainedSessionCheckpointHost,
 	options: { capturePersistedSessionFile?: boolean } = {},
 ): Promise<RetainedSessionTransitionCheckpoint> {
-	const persistedSessionFile = options.capturePersistedSessionFile
+	const captureRuntimeCheckpoint = (
+		persistedSessionFile: PersistedSessionFileSnapshot | undefined,
+	): RetainedSessionRuntimeCheckpoint => {
+		const sessionManagerState = host.sessionManager.captureState({
+			copyJournal: persistedSessionFile?.content === undefined,
+		});
+		const agentMessages = [...host.agent.state.messages];
+		const steeringMessages = [...host.agent.peekSteeringQueue()];
+		const followUpMessages = [...host.agent.peekFollowUpQueue()];
+		const runtimeFields = host.captureRuntimeFields();
+		return {
+			sessionManagerState,
+			persistedSessionFile,
+			agentMessages,
+			steeringMessages,
+			followUpMessages,
+			...runtimeFields,
+			model: host.model(),
+			thinkingLevel: host.models.thinkingLevel,
+			autoThinking: host.models.isAutoThinking,
+			autoResolvedThinkingLevel: host.models.autoResolvedThinkingLevel,
+			serviceTierByFamily: host.models.serviceTierByFamily,
+			tools: [...host.agent.state.tools],
+			activeToolNames: host.tools.getActiveToolNames(),
+			mountedToolNames: host.tools.getMountedXdevToolNames(),
+			baseSystemPrompt: host.tools.baseSystemPrompt,
+			systemPrompt: host.agent.state.systemPrompt,
+			memoryPromotionSnapshot: host.memory.promotionSnapshot,
+			agentPromptCacheKey: host.agent.promptCacheKey,
+			todoPhases: host.todo.phases,
+			advisorCosts: host.advisors.captureCostSnapshot(),
+		};
+	};
+
+	let persistedSessionFile = options.capturePersistedSessionFile
 		? await host.sessionManager.capturePersistedSessionFile()
 		: undefined;
-	const sessionManagerState = host.sessionManager.captureState();
-	const agentMessages = [...host.agent.state.messages];
-	const steeringMessages = [...host.agent.peekSteeringQueue()];
-	const followUpMessages = [...host.agent.peekFollowUpQueue()];
-	const runtimeFields = host.captureRuntimeFields();
-	const checkpoint: RetainedSessionRuntimeCheckpoint = {
-		sessionManagerState,
-		persistedSessionFile,
-		agentMessages,
-		steeringMessages,
-		followUpMessages,
-		...runtimeFields,
-		model: host.model(),
-		thinkingLevel: host.models.thinkingLevel,
-		autoThinking: host.models.isAutoThinking,
-		autoResolvedThinkingLevel: host.models.autoResolvedThinkingLevel,
-		serviceTierByFamily: host.models.serviceTierByFamily,
-		tools: [...host.agent.state.tools],
-		activeToolNames: host.tools.getActiveToolNames(),
-		mountedToolNames: host.tools.getMountedXdevToolNames(),
-		baseSystemPrompt: host.tools.baseSystemPrompt,
-		systemPrompt: host.agent.state.systemPrompt,
-		memoryPromotionSnapshot: host.memory.promotionSnapshot,
-		agentPromptCacheKey: host.agent.promptCacheKey,
-		todoPhases: host.todo.phases,
-		advisorCosts: host.advisors.captureCostSnapshot(),
-	};
+	let checkpoint = captureRuntimeCheckpoint(persistedSessionFile);
 	return {
 		restore: restoreOptions => restoreRetainedSessionCheckpoint(host, checkpoint, restoreOptions),
+		async recapture(recaptureOptions = {}): Promise<void> {
+			if (recaptureOptions.capturePersistedSessionFile && persistedSessionFile?.content === undefined) {
+				persistedSessionFile = await host.sessionManager.capturePersistedSessionFile();
+			}
+			checkpoint = captureRuntimeCheckpoint(
+				recaptureOptions.capturePersistedSessionFile ? persistedSessionFile : undefined,
+			);
+		},
 	};
 }
 
@@ -1057,7 +1074,10 @@ async function restoreRetainedSessionCheckpoint(
 		await attemptRestore(async () => {
 			restoredPersistedFile = await host.sessionManager.restorePersistedSessionFile(
 				authoritativePersistedSessionFile,
-				{ preserveNewerMutations },
+				{
+					preserveNewerMutations,
+					reloadJournal: !authoritativeSessionManagerState.journalCopied,
+				},
 			);
 		});
 		if (restoredPersistedFile === false) {
@@ -1098,8 +1118,12 @@ async function restoreRetainedSessionCheckpoint(
 		}
 
 		// Durable restoration updates writer/title bookkeeping as a side effect;
-		// reapply the authoritative in-memory snapshot too.
-		await attemptRestore(() => host.sessionManager.restoreState(authoritativeSessionManagerState));
+		// reapply scalar checkpoint state without replacing a journal reloaded from its durable preimage.
+		await attemptRestore(() =>
+			host.sessionManager.restoreState(authoritativeSessionManagerState, {
+				preserveCurrentJournal: !authoritativeSessionManagerState.journalCopied,
+			}),
+		);
 	};
 	const modelBeforeRollback = host.model();
 	const restoreRuntime = async (): Promise<void> => {

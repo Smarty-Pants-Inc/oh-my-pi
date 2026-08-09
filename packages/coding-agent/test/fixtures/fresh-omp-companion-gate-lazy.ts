@@ -9,15 +9,15 @@ mock.module("node:crypto", () => ({
 }));
 
 // Deliberately dynamic: the probe must mock entropy before evaluating the main import graph.
-const { resolveFreshOmpCompanionSecret } = await import("../../src/main");
-const secret = resolveFreshOmpCompanionSecret({
+const { resolveFreshOmpCompanionEndpoint } = await import("../../src/main");
+const endpoint = resolveFreshOmpCompanionEndpoint({
 	isInteractive: true,
 	noSession: false,
 	freshProvenance: false,
 	launchEnv: undefined,
 	env: {},
 });
-if (secret !== undefined) throw new Error("Companion must remain gated off");
+if (endpoint !== undefined) throw new Error("Companion must remain gated off");
 
 const { createFreshOmpCompanionController } = await import("../../src/modes/fresh-omp-companion");
 try {

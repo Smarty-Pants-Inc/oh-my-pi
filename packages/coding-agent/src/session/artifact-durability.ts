@@ -7,14 +7,6 @@ import { logger, toError } from "@oh-my-pi/pi-utils";
 const ARTIFACT_OPERATION_PREFIX = ".omp-artifact-operation-";
 const ARTIFACT_OPERATION_SUFFIX = ".json";
 const ARTIFACT_OWNERSHIP_PREFIX = ".omp-artifact-owner-";
-const LINK_COPY_FALLBACK_CODES: Record<string, true> = {
-	EXDEV: true,
-	EPERM: true,
-	EACCES: true,
-	EMLINK: true,
-	ENOTSUP: true,
-	EOPNOTSUPP: true,
-};
 
 interface ArtifactPublicationIntent {
 	version: 1;
@@ -253,13 +245,6 @@ export async function removeArtifactOperationIntent(intentPath: string): Promise
 }
 
 async function copyArtifactFile(source: string, destination: string): Promise<void> {
-	try {
-		await fs.link(source, destination);
-		return;
-	} catch (error) {
-		const code = (error as NodeJS.ErrnoException).code;
-		if (!code || !LINK_COPY_FALLBACK_CODES[code]) throw error;
-	}
 	await fs.copyFile(source, destination);
 }
 

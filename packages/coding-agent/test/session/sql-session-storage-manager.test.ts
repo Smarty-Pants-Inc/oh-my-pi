@@ -123,4 +123,33 @@ describe("SessionManager + SqlSessionStorage (SQLite)", () => {
 		expect(sessionFiles).toContain(bFile as string);
 		await client.end();
 	});
+
+	it("moveTo relocates SQL-backed drafts, markers, and extension sidecars", async () => {
+		const client = new SQL("sqlite::memory:");
+		const storage = await SqlSessionStorage.create({ client });
+		const manager = SessionManager.create("/cwd-a", "/sessions/source", storage);
+		await manager.saveDraft("draft body");
+
+		const sourceSession = manager.getSessionFile();
+		if (!sourceSession) throw new Error("Expected source session path");
+		const sourceSidecars = sourceSession.slice(0, -".jsonl".length);
+		await storage.writeText(`${sourceSidecars}/extension/state.json`, "extension state");
+
+		await manager.moveTo("/cwd-b", "/sessions/destination");
+
+		const destinationSession = manager.getSessionFile();
+		if (!destinationSession) throw new Error("Expected destination session path");
+		const destinationSidecars = destinationSession.slice(0, -".jsonl".length);
+		expect(storage.existsSync(sourceSession)).toBe(false);
+		expect(storage.existsSync(`${sourceSidecars}/draft.txt`)).toBe(false);
+		expect(storage.existsSync(`${sourceSidecars}/.draft-only-session`)).toBe(false);
+		expect(storage.existsSync(`${sourceSidecars}/extension/state.json`)).toBe(false);
+		expect(await storage.readText(`${destinationSidecars}/draft.txt`)).toBe("draft body");
+		expect(storage.existsSync(`${destinationSidecars}/.draft-only-session`)).toBe(true);
+		expect(await storage.readText(`${destinationSidecars}/extension/state.json`)).toBe("extension state");
+		expect(await manager.consumeDraft()).toBe("draft body");
+
+		await manager.close();
+		await client.end();
+	});
 });

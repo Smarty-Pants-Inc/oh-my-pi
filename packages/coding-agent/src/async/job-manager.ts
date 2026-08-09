@@ -249,6 +249,9 @@ export class AsyncJobManager {
 				});
 			}
 		};
+		// The run callback may throw before its first await, so publish this object
+		// before its failure path performs the concrete-identity delivery check.
+		this.#jobs.set(id, job);
 		job.promise = (async () => {
 			try {
 				const text = await run({
@@ -282,7 +285,6 @@ export class AsyncJobManager {
 			}
 		})();
 
-		this.#jobs.set(id, job);
 		return id;
 	}
 

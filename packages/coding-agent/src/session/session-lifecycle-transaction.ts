@@ -17,6 +17,7 @@ export type SessionLifecyclePhase =
 	| "commit-selecting"
 	| "commit-sealing"
 	| "commit-selected"
+	| "commit-finalizing"
 	| "commit-activating"
 	| "committed"
 	| "rollback-preparing"
@@ -55,8 +56,13 @@ export interface SessionLifecycleRollbackOptions {
 }
 
 export interface SessionLifecycleResource {
-	commit?: () => void | Promise<void>;
+	/** Reversible preparation completed before host publication. */
+	seal?: () => void | Promise<void>;
+	/** Irreversible completion attempted once after host acknowledgement. */
+	finalize?: () => void | Promise<void>;
+	/** Remove provisional mutations after rejection. */
 	rollback?: () => void | Promise<void>;
+	/** Release the resource fence after rollback cleanup. */
 	release?: () => void | Promise<void>;
 }
 
@@ -73,9 +79,11 @@ export class SessionLifecycleTransaction {
 	#released = false;
 	#commitSeals: LifecycleOperation[] = [];
 	#targetCleanups: LifecycleOperation[] = [];
+	#commitFinalizers: LifecycleOperation[] = [];
 	#rollbackReleases: LifecycleOperation[] = [];
 	readonly #host: SessionLifecycleTransactionHost;
 	readonly #settlement = Promise.withResolvers<void>();
+	#commitActivation: Promise<void> | undefined;
 
 	constructor(host: SessionLifecycleTransactionHost) {
 		this.#host = host;
@@ -114,8 +122,8 @@ export class SessionLifecycleTransaction {
 		}
 		this.#phase = "recapturing";
 		try {
-			const checkpoint = await this.#host.captureRetainedCheckpoint(options);
-			this.#checkpoint = checkpoint;
+			if (this.#checkpoint?.recapture) await this.#checkpoint.recapture(options);
+			else this.#checkpoint = await this.#host.captureRetainedCheckpoint(options);
 			this.#checkpointIncludesPersistedFile = options.capturePersistedSessionFile === true;
 		} catch (error) {
 			this.#phase = "checkpointed";
@@ -172,18 +180,16 @@ export class SessionLifecycleTransaction {
 
 	/** Register every phase of one resource in a single synchronous operation. */
 	bindResource(name: string, resource: SessionLifecycleResource): void {
-		const commit = resource.commit ? [{ name, run: resource.commit }] : [];
-		const rollback = resource.rollback ? [{ name, run: resource.rollback }] : [];
-		const release = resource.release ? [{ name, run: resource.release }] : [];
-		this.#commitSeals.push(...commit);
-		this.#targetCleanups.push(...rollback);
-		this.#rollbackReleases.push(...release);
+		if (resource.seal) this.#commitSeals.push({ name, run: resource.seal });
+		if (resource.finalize) this.#commitFinalizers.push({ name, run: resource.finalize });
+		if (resource.rollback) this.#targetCleanups.push({ name, run: resource.rollback });
+		if (resource.release) this.#rollbackReleases.push({ name, run: resource.release });
 	}
 
 	/**
 	 * Runs after ordinary extension handlers but before host afterDispatch. The
-	 * returned continuation activates delivery and releases the lifecycle fence
-	 * after publication; callers also confirm activation once the host barrier returns.
+	 * returned continuation irreversibly finalizes resources, activates delivery,
+	 * and releases the lifecycle fence only after publication is acknowledged.
 	 */
 	async prepareCommit(options?: SessionLifecycleCommitOptions): Promise<SessionLifecyclePostHostContinuation> {
 		if (this.#phase !== "target-marked") throw new Error(`Lifecycle commit cannot prepare from phase ${this.#phase}`);
@@ -209,7 +215,11 @@ export class SessionLifecycleTransaction {
 	/** Confirm commit activation after the host publication barrier has returned. */
 	async activateCommitAfterHostPublication(): Promise<void> {
 		if (this.#phase === "committed") return;
-		if (this.#phase !== "commit-selected" && this.#phase !== "commit-activating") {
+		if (
+			this.#phase !== "commit-selected" &&
+			this.#phase !== "commit-finalizing" &&
+			this.#phase !== "commit-activating"
+		) {
 			throw new Error(`Lifecycle commit cannot activate from phase ${this.#phase}`);
 		}
 		await this.#activateCommit();
@@ -273,7 +283,23 @@ export class SessionLifecycleTransaction {
 	}
 
 	async #activateCommit(): Promise<void> {
+		this.#commitActivation ??= this.#activateCommitOnce();
+		await this.#commitActivation;
+	}
+
+	async #activateCommitOnce(): Promise<void> {
 		if (this.#released) return;
+		this.#phase = "commit-finalizing";
+		for (const operation of this.#commitFinalizers) {
+			try {
+				await operation.run();
+			} catch (error) {
+				logger.error("Lifecycle resource finalization failed after host publication", {
+					resource: operation.name,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
 		this.#phase = "commit-activating";
 		try {
 			await this.#ownership.activateCommit();

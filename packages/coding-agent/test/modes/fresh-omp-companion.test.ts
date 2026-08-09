@@ -200,6 +200,17 @@ function modeEntry(mode: string, data?: Record<string, unknown>): SessionEntry {
 	} as never as SessionEntry;
 }
 
+function thinkingEntry(configured: "auto" | "off" | "low" | "high"): SessionEntry {
+	return {
+		type: "thinking_level_change",
+		id: crypto.randomUUID(),
+		parentId: null,
+		timestamp: new Date(0).toISOString(),
+		thinkingLevel: configured === "auto" ? "high" : configured,
+		configured,
+	} as never as SessionEntry;
+}
+
 function todoEntry(phases: unknown[]): SessionEntry {
 	return {
 		type: "custom",
@@ -221,6 +232,7 @@ class CompanionHarness {
 		await this.ensureOnDiskBarrier;
 	});
 	readonly getBranch = vi.fn((): SessionEntry[] => this.branch);
+	readonly getContextUsage = vi.fn(() => this.usage);
 	readonly context: ExtensionContext;
 	input?: TerminalInputHandler;
 	inputInstalls = 0;
@@ -276,11 +288,11 @@ class CompanionHarness {
 					};
 				},
 			},
-			getContextUsage: () => {
+			getContextUsage: this.getContextUsage,
+			isCompacting: () => {
 				if (this.throwOnSample) throw new Error("sample secret payload");
-				return this.usage;
+				return this.compacting;
 			},
-			isCompacting: () => this.compacting,
 			getAsyncJobSnapshot: this.getAsyncJobSnapshot,
 			getAsyncJobCounts: this.getAsyncJobCounts,
 			cwd: this.cwd,
@@ -1026,21 +1038,29 @@ describe("Fresh OMP companion lifecycle and generation isolation", () => {
 		expect(parseFrame(write.mock.calls.at(-1)?.[0] as string, SECRET).envelope.snapshot.state).toBe("idle");
 	});
 
-	it("keeps idle one-second sampling O(1) by reusing cached branch summaries", async () => {
+	it("keeps idle one-second sampling O(1) by reusing cached branch summaries and configured thinking", async () => {
 		vi.useFakeTimers();
 		const write = vi.spyOn(process.stdout, "write").mockReturnValue(true);
 		const harness = new CompanionHarness();
-		harness.branch = [modeEntry("goal", { goal: { objective: "Cached goal", status: "active" } })];
+		harness.branch = [
+			modeEntry("goal", { goal: { objective: "Cached goal", status: "active" } }),
+			thinkingEntry("low"),
+		];
+		harness.controller.setThinkingLevel("auto");
 		await harness.start();
 		expect(harness.getBranch).toHaveBeenCalledTimes(1);
+		expect(harness.getContextUsage).toHaveBeenCalledTimes(1);
+		expect(parseFrame(write.mock.calls.at(-1)?.[0] as string, SECRET).envelope.snapshot.thinkingLevel).toBe("auto");
 
 		harness.getBranch.mockClear();
+		harness.getContextUsage.mockClear();
 		advance(5_000);
 		expect(harness.getBranch).not.toHaveBeenCalled();
+		expect(harness.getContextUsage).not.toHaveBeenCalled();
 
-		harness.controller.setThinkingLevel("auto");
+		harness.branch.push(thinkingEntry("off"));
+		harness.invoke("todo_reminder");
 		advance(50);
-		expect(harness.getBranch).not.toHaveBeenCalled();
 		expect(parseFrame(write.mock.calls.at(-1)?.[0] as string, SECRET).envelope.snapshot.thinkingLevel).toBe("auto");
 	});
 

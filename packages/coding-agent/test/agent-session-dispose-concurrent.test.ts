@@ -11,6 +11,7 @@ import { HindsightSessionState } from "@oh-my-pi/pi-coding-agent/hindsight/state
 import { MnemopiSessionState, setMnemopiSessionState } from "@oh-my-pi/pi-coding-agent/mnemopi/state";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { EvalRunner } from "@oh-my-pi/pi-coding-agent/session/eval-runner";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { logger, TempDir } from "@oh-my-pi/pi-utils";
 
@@ -168,6 +169,41 @@ describe("AgentSession concurrent disposal", () => {
 			"Post-prompt tasks still draining at dispose deadline",
 			expect.objectContaining({ error: "Error: Timed out draining post-prompt tasks during dispose" }),
 		);
+	});
+
+	it("applies the disposal deadline when joining an unbounded ordinary abort", async () => {
+		vi.useFakeTimers();
+		vi.spyOn(logger, "warn").mockImplementation(() => {});
+		const current = createSession();
+		const hangingTask = Promise.withResolvers<void>();
+		current.trackPostPromptTaskForTests(hangingTask.promise);
+		const agentAbort = vi.spyOn(current.agent, "abort");
+		const kernelCleanupStarted = Promise.withResolvers<void>();
+		const disposeKernels = vi.spyOn(EvalRunner.prototype, "disposeKernels").mockImplementation(async () => {
+			kernelCleanupStarted.resolve();
+		});
+
+		const ordinaryAbort = current.abort();
+		await flushMicrotasks();
+		expect(agentAbort).toHaveBeenCalledTimes(1);
+		expect(disposeKernels).not.toHaveBeenCalled();
+
+		const dispose = current.dispose();
+		await flushMicrotasks();
+		expect(agentAbort).toHaveBeenCalledTimes(1);
+		expect(disposeKernels).not.toHaveBeenCalled();
+
+		vi.advanceTimersByTime(4_999);
+		await flushMicrotasks();
+		expect(disposeKernels).not.toHaveBeenCalled();
+
+		vi.advanceTimersByTime(1);
+		await kernelCleanupStarted.promise;
+		expect(disposeKernels).toHaveBeenCalledTimes(1);
+
+		await Promise.all([ordinaryAbort, dispose]);
+		session = undefined;
+		expect(agentAbort).toHaveBeenCalledTimes(1);
 	});
 
 	it("clears the owned async manager when its dispose rejects", async () => {

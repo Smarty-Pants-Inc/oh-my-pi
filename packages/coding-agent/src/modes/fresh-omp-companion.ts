@@ -109,6 +109,9 @@ interface CompanionRuntime {
 	compacting: boolean;
 	lastSettledFailed: boolean;
 	thinkingLevel?: SemanticSnapshot["thinkingLevel"];
+	thinkingLevelInitialized: boolean;
+	context?: SemanticSnapshot["context"];
+	contextInitialized: boolean;
 	statusText?: string;
 	toolOrder: number;
 	runningTools: Map<string, ToolSummary>;
@@ -185,6 +188,8 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 		retryActive: false,
 		compacting: false,
 		lastSettledFailed: false,
+		thinkingLevelInitialized: false,
+		contextInitialized: false,
 		toolOrder: 0,
 		runningTools: new Map(),
 		pendingApprovals: new Set(),
@@ -333,8 +338,8 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 		state.continuationActive = false;
 		state.retryActive = false;
 		state.compacting = false;
-		state.lastSettledFailed = false;
-		state.thinkingLevel = undefined;
+		state.context = undefined;
+		state.contextInitialized = false;
 		state.statusText = undefined;
 		state.toolOrder = 0;
 		state.runningTools.clear();
@@ -376,7 +381,25 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 		const branch = ctx.sessionManager.getBranch();
 		state.goal = goalFromBranch(branch);
 		state.todos = summarizeTodos(getLatestTodoPhasesFromEntries(branch));
-		state.thinkingLevel = api ? configuredThinkingLevel(api, branch) : undefined;
+		if (!state.thinkingLevelInitialized) {
+			state.thinkingLevel = api ? configuredThinkingLevel(api, branch) : undefined;
+			state.thinkingLevelInitialized = true;
+		}
+	};
+
+	const refreshContextUsage = (ctx: ExtensionContext): void => {
+		const usage = ctx.getContextUsage();
+		const tokens = boundedInteger(usage?.tokens, MAX_SAFE_INTEGER);
+		const contextWindow = boundedInteger(usage?.contextWindow, MAX_SAFE_INTEGER);
+		const percentBps = boundedInteger(
+			typeof usage?.percent === "number" ? Math.round(usage.percent * 100) : undefined,
+			10_000,
+		);
+		state.context =
+			tokens === undefined || contextWindow === undefined || percentBps === undefined
+				? undefined
+				: { tokens, contextWindow, percentBps };
+		state.contextInitialized = true;
 	};
 
 	const derivedState = (ctx: ExtensionContext): CompanionStateName => {
@@ -411,13 +434,7 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 		const statusText = normalizeString(state.statusText, 240, 960);
 		const goalObjective = normalizeString(state.goal?.objective, 240, 960);
 		const todoCurrent = normalizeString(state.todos?.current, 240, 960);
-		const usage = ctx.getContextUsage();
-		const tokens = boundedInteger(usage?.tokens, MAX_SAFE_INTEGER);
-		const contextWindow = boundedInteger(usage?.contextWindow, MAX_SAFE_INTEGER);
-		const percentBps = boundedInteger(
-			typeof usage?.percent === "number" ? Math.round(usage.percent * 100) : undefined,
-			10_000,
-		);
+		const context = state.context;
 		const jobs = ctx.getAsyncJobCounts();
 
 		return {
@@ -460,9 +477,7 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 							...(todoCurrent === undefined ? {} : { current: todoCurrent }),
 						},
 					}),
-			...(tokens === undefined || contextWindow === undefined || percentBps === undefined
-				? {}
-				: { context: { tokens, contextWindow, percentBps } }),
+			...(context === undefined ? {} : { context }),
 			pendingApprovals: boundedLength(state.pendingApprovals.size),
 			...(jobs === null
 				? {}
@@ -623,6 +638,7 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 	const sample = (ctx: ExtensionContext, generation: number, force = false): void => {
 		if (state.disabled || state.quiesced || state.shutdown || generation !== state.generation) return;
 		try {
+			if (!state.contextInitialized) refreshContextUsage(ctx);
 			state.compacting = ctx.isCompacting();
 			if (ctx.isIdle()) state.agentActive = false;
 			state.authoritativeSampled = true;
@@ -898,7 +914,6 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 		if (state.disabled || generation !== state.generation) return;
 		rebuildSessionSummaries(ctx);
 		state.quiesced = false;
-		state.compacting = ctx.isCompacting();
 		startSampling(ctx, generation);
 		sample(ctx, generation, true);
 		clearTimer(state.emitTimer);
@@ -968,6 +983,7 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 			cancelScheduling();
 			clearTransientFacts();
 			rebuildSessionSummaries(ctx);
+			refreshContextUsage(ctx);
 			installInput(ctx);
 			const { snapshot, sequence } = publishLifecycleSnapshot(ctx, generation);
 			await waitForSnapshotAcknowledgement(ctx, {
@@ -1099,6 +1115,12 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 				scheduleChangedSnapshot(ctx);
 			}),
 		);
+		pi.on("message_end", (_event, ctx) =>
+			guarded(ctx, () => {
+				refreshContextUsage(ctx);
+				scheduleChangedSnapshot(ctx);
+			}),
+		);
 		pi.on("tool_execution_start", (event, ctx) =>
 			guarded(ctx, () => {
 				if (!beginWorkEpoch(ctx)) return;
@@ -1187,7 +1209,6 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 			guarded(ctx, () => {
 				const branch = ctx.sessionManager.getBranch();
 				state.todos = summarizeTodos(getLatestTodoPhasesFromEntries(branch));
-				state.thinkingLevel = api ? configuredThinkingLevel(api, branch) : undefined;
 				scheduleChangedSnapshot(ctx);
 			}),
 		);
@@ -1217,6 +1238,7 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 		setThinkingLevel(thinkingLevel): void {
 			if (state.disabled || state.shutdown) return;
 			state.thinkingLevel = thinkingLevel;
+			state.thinkingLevelInitialized = true;
 			if (inputContext) scheduleChangedSnapshot(inputContext);
 		},
 		setStatusText(statusText): void {

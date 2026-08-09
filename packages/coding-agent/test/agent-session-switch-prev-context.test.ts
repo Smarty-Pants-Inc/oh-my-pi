@@ -665,7 +665,7 @@ describe("AgentSession.switchSession previous-context build", () => {
 		expect(published).toEqual(["session_rollback", "session_ready"]);
 	});
 
-	it("selects every runtime owner before sealing artifacts and publishing a switched target", async () => {
+	it("selects runtime owners before ACK and finalizes artifacts exactly once after host completion", async () => {
 		const tempDir = TempDir.createSync("@pi-switch-finalized-publication-");
 		tempDirs.push(tempDir);
 		const sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
@@ -681,7 +681,8 @@ describe("AgentSession.switchSession previous-context build", () => {
 		if (!targetSessionFile) throw new Error("Expected target session file");
 		await targetManager.close();
 
-		let artifactSealed = false;
+		let artifactFinalized = false;
+		let artifactFinalizeAttempts = 0;
 		let advisorSelected = false;
 		let bashSelected = false;
 		let asyncSelected = false;
@@ -710,6 +711,7 @@ describe("AgentSession.switchSession previous-context build", () => {
 				afterDispatch: async event => {
 					hostEvents.push(event.type);
 					if (event.type !== "session_ready") return;
+					expect(artifactFinalized).toBe(false);
 					sessionManager.appendCustomEntry("test_host_frame", { text: "persisted target host frame" });
 					await sessionManager.flush();
 					targetFramePersisted = (await Bun.file(targetSessionFile).text()).includes(
@@ -743,12 +745,13 @@ describe("AgentSession.switchSession previous-context build", () => {
 			return {
 				rollback: () => transaction.rollback(),
 				commit: async () => {
+					artifactFinalizeAttempts++;
 					expect(advisorSelected).toBe(true);
 					expect(bashSelected).toBe(true);
 					expect(asyncSelected).toBe(true);
 					expect(launchSelected).toBe(true);
 					await transaction.commit();
-					artifactSealed = true;
+					artifactFinalized = true;
 				},
 			};
 		});
@@ -761,7 +764,7 @@ describe("AgentSession.switchSession previous-context build", () => {
 				commit: () => {
 					transaction.commit();
 					if (kind === "advisor") {
-						expect(artifactSealed).toBe(false);
+						expect(artifactFinalized).toBe(false);
 						advisorSelected = true;
 					} else if (kind === "async-result") {
 						expect(bashSelected).toBe(true);
@@ -787,94 +790,14 @@ describe("AgentSession.switchSession previous-context build", () => {
 		});
 
 		await expect(session.switchSession(targetSessionFile)).resolves.toBe(true);
+		expect(artifactFinalized).toBe(true);
+		expect(artifactFinalizeAttempts).toBe(1);
 		expect(hostEvents).toEqual(["session_ready"]);
 		expect(targetFramePersisted).toBe(true);
 		expect(containedErrors).toContain(hostFault.message);
 		expect(session.sessionFile).toBe(targetSessionFile);
 		expect(await Bun.file(targetSessionFile).exists()).toBe(true);
 		expect(await Bun.file(targetSessionFile).text()).toContain("persisted target host frame");
-	});
-
-	it("suppresses target host publication when artifact sealing fails and restores retained bytes exactly", async () => {
-		const tempDir = TempDir.createSync("@pi-switch-finalizer-rollback-");
-		tempDirs.push(tempDir);
-		const sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
-		sessionManager.appendMessage({ role: "user", content: "retained exact bytes", timestamp: 1 });
-		await sessionManager.ensureOnDisk();
-		await sessionManager.flush();
-		const retainedSessionFile = sessionManager.getSessionFile();
-		if (!retainedSessionFile) throw new Error("Expected retained session file");
-		const retainedRaw = await Bun.file(retainedSessionFile).text();
-
-		const targetManager = SessionManager.create(tempDir.path(), tempDir.path());
-		targetManager.appendMessage({ role: "user", content: "target exact bytes", timestamp: 2 });
-		await targetManager.ensureOnDisk();
-		await targetManager.flush();
-		const targetSessionFile = targetManager.getSessionFile();
-		if (!targetSessionFile) throw new Error("Expected target session file");
-		const targetRaw = await Bun.file(targetSessionFile).text();
-		await targetManager.close();
-
-		const hostEvents: string[] = [];
-		const hostExtension = {
-			path: "test://preseal-failure-host",
-			resolvedPath: "test://preseal-failure-host",
-			handlers: new Map(),
-		} as unknown as Extension;
-		const runtime = new ExtensionRuntime();
-		const extensionRunner = new ExtensionRunner(
-			[],
-			runtime,
-			tempDir.path(),
-			sessionManager,
-			modelRegistry,
-			undefined,
-			undefined,
-			undefined,
-			undefined,
-			{
-				extension: hostExtension,
-				afterDispatch: event => {
-					hostEvents.push(event.type);
-				},
-			},
-		);
-		const session = new AgentSession({
-			agent: new Agent({
-				getApiKey: () => "test-key",
-				initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
-				convertToLlm,
-			}),
-			sessionManager,
-			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry,
-			extensionRunner,
-		});
-		sessions.push(session);
-		const retainedMessages = [...session.messages];
-
-		const sealingFailure = new Error("target artifact preimage seal failed");
-		let commitAttempts = 0;
-		const beginArtifactTransaction = sessionManager.beginArtifactTransaction.bind(sessionManager);
-		vi.spyOn(sessionManager, "beginArtifactTransaction").mockImplementation(async () => {
-			const transaction = await beginArtifactTransaction();
-			return {
-				rollback: () => transaction.rollback(),
-				commit: async () => {
-					commitAttempts++;
-					if (commitAttempts === 1) throw sealingFailure;
-					await transaction.commit();
-				},
-			};
-		});
-
-		await expect(session.switchSession(targetSessionFile)).rejects.toBe(sealingFailure);
-		expect(hostEvents).toEqual(["session_rollback"]);
-		expect(commitAttempts).toBe(2);
-		expect(session.sessionFile).toBe(retainedSessionFile);
-		expect(session.messages).toEqual(retainedMessages);
-		expect(await Bun.file(retainedSessionFile).text()).toBe(retainedRaw);
-		expect(await Bun.file(targetSessionFile).text()).toBe(targetRaw);
 	});
 
 	it("preserves durable journal mutations when new-session flush fails before the post-quiescence capture", async () => {
@@ -2401,7 +2324,7 @@ describe("AgentSession.switchSession previous-context build", () => {
 		await asyncManager.drainDeliveries({ filter: { ownerId: "Main" } });
 	});
 
-	it("preserves an external target overwrite, removes transaction-created artifacts, and reuses their id", async () => {
+	it("rolls back switch artifacts after host ACK rejection and reuses their id", async () => {
 		const tempDir = TempDir.createSync("@pi-switch-target-artifact-rollback-");
 		tempDirs.push(tempDir);
 		const { session, sessionManager, extensionRunner } = buildSession(tempDir);
@@ -2424,7 +2347,7 @@ describe("AgentSession.switchSession previous-context build", () => {
 		const targetRaw = await Bun.file(targetSessionFile).text();
 		await targetManager.close();
 
-		const failure = new Error("target readiness failed after artifact mutation");
+		const failure = new Error("target host ACK failed after artifact mutation");
 		let readyAttempts = 0;
 		let rolledBackArtifactId: string | undefined;
 		let rolledBackArtifactPath: string | undefined;
@@ -2442,6 +2365,7 @@ describe("AgentSession.switchSession previous-context build", () => {
 							: undefined;
 						sessionManager.appendMessage({ role: "user", content: "target partial append", timestamp: 3 });
 						await sessionManager.flush();
+						await finalizeBeforeHostCompletion?.();
 						throw failure;
 					}
 					committedArtifactId = await sessionManager.saveArtifact("target committed after retry", "switch");
@@ -3132,7 +3056,7 @@ describe("AgentSession.switchSession previous-context build", () => {
 		expect(session.messages).toHaveLength(0);
 	});
 
-	it("restores deep session, artifact, and advisor state before tree rollback sampling", async () => {
+	it("restores tree state and artifact allocation after host ACK rejection", async () => {
 		const tempDir = TempDir.createSync("@pi-tree-lifecycle-rollback-");
 		tempDirs.push(tempDir);
 		const primaryMock = createMockModel({ handler: () => ({ content: ["primary reply"] }) });
@@ -3242,7 +3166,7 @@ describe("AgentSession.switchSession previous-context build", () => {
 			if (event.type === "session_tree") phases.push("fence");
 			return beforeMutation(event);
 		});
-		const failure = new Error("tree event fan-out failed");
+		const failure = new Error("tree host ACK failed");
 		const emitWithHostCompletion = extensionRunner.emitWithHostCompletion.bind(extensionRunner);
 		vi.spyOn(extensionRunner, "emitWithHostCompletion").mockImplementation(
 			async (event, finalizeBeforeHostCompletion) => {
@@ -3263,6 +3187,7 @@ describe("AgentSession.switchSession previous-context build", () => {
 						content: "partial tree handler",
 						timestamp: 4,
 					});
+					await finalizeBeforeHostCompletion?.();
 					throw failure;
 				}
 				if (event.type === "session_rollback") {
@@ -3571,7 +3496,7 @@ describe("AgentSession.switchSession previous-context build", () => {
 		});
 
 		const failure = new Error("tree Bash prepare settlement failed");
-		let artifactSealAttempts = 0;
+		let artifactFinalizeAttempts = 0;
 		let artifactRollbackStarted = false;
 		let bashSettlementAttempts = 0;
 		let treePublished = false;
@@ -3586,7 +3511,7 @@ describe("AgentSession.switchSession previous-context build", () => {
 					await transaction.rollback();
 				},
 				commit: async () => {
-					if (!artifactRollbackStarted) artifactSealAttempts++;
+					if (!artifactRollbackStarted) artifactFinalizeAttempts++;
 					await transaction.commit();
 				},
 			};
@@ -3606,7 +3531,7 @@ describe("AgentSession.switchSession previous-context build", () => {
 		let rollbackAtDispatch:
 			| {
 					published: boolean;
-					artifactSealAttempts: number;
+					artifactFinalizeAttempts: number;
 					bashSettlementAttempts: number;
 					sessionFile: string | undefined;
 					raw: string;
@@ -3655,7 +3580,7 @@ describe("AgentSession.switchSession previous-context build", () => {
 					const raw = await Bun.file(retainedSessionFile).text();
 					rollbackAtDispatch = {
 						published: treePublished,
-						artifactSealAttempts,
+						artifactFinalizeAttempts,
 						bashSettlementAttempts,
 						sessionFile: session.sessionFile,
 						raw,
@@ -3691,10 +3616,10 @@ describe("AgentSession.switchSession previous-context build", () => {
 		allowRollbackPublication.resolve();
 		await expect(navigation).rejects.toBe(failure);
 		expect(bashSettlementAttempts).toBe(2);
-		expect(artifactSealAttempts).toBe(0);
+		expect(artifactFinalizeAttempts).toBe(0);
 		expect(rollbackAtDispatch).toEqual({
 			published: false,
-			artifactSealAttempts: 0,
+			artifactFinalizeAttempts: 0,
 			bashSettlementAttempts: 2,
 			sessionFile: retainedSessionFile,
 			raw: retainedRaw,

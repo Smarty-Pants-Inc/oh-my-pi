@@ -7,14 +7,16 @@ export * from "./worker-host";
 
 const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const FRESH_OMP_COMPANION_ENV = "FRESH_OMP_COMPANION";
+const FRESH_OMP_COMPANION_ENDPOINT_ENV = "FRESH_OMP_COMPANION_ENDPOINT";
 const FRESH_OMP_COMPANION_TOKEN_ENV = "FRESH_OMP_COMPANION_TOKEN";
 
 function isFreshOmpCompanionEnvName(name: string): boolean {
-	if (process.platform === "win32") {
-		const upper = name.toUpperCase();
-		return upper === FRESH_OMP_COMPANION_ENV || upper === FRESH_OMP_COMPANION_TOKEN_ENV;
-	}
-	return name === FRESH_OMP_COMPANION_ENV || name === FRESH_OMP_COMPANION_TOKEN_ENV;
+	const canonical = process.platform === "win32" ? name.toUpperCase() : name;
+	return (
+		canonical === FRESH_OMP_COMPANION_ENV ||
+		canonical === FRESH_OMP_COMPANION_ENDPOINT_ENV ||
+		canonical === FRESH_OMP_COMPANION_TOKEN_ENV
+	);
 }
 
 /**

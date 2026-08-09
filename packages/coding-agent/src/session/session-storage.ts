@@ -85,6 +85,12 @@ export interface SessionStorage {
 	rename(path: string, nextPath: string): Promise<void>;
 	unlink(path: string): Promise<void>;
 	deleteSessionWithArtifacts(sessionPath: string): Promise<void>;
+	/**
+	 * Relocate a session journal and every storage-backed sidecar under its
+	 * artifact prefix. Backends that implement this must replace the destination
+	 * as one rollback-capable operation.
+	 */
+	moveSessionWithArtifacts?(sessionPath: string, nextSessionPath: string): Promise<void>;
 	openWriter(path: string, options?: { flags?: "a" | "w"; onError?: (err: Error) => void }): SessionStorageWriter;
 	/**
 	 * Wait for every backing write scheduled by this storage to become durably
@@ -775,6 +781,29 @@ export class MemorySessionStorage implements SessionStorage {
 		if (!entry) return Promise.reject(new Error(`File not found: ${path}`));
 		this.#files.set(nextPath, entry);
 		this.#files.delete(path);
+		return Promise.resolve();
+	}
+
+	moveSessionWithArtifacts(sessionPath: string, nextSessionPath: string): Promise<void> {
+		const sourceArtifactsDir = sessionPath.slice(0, -6);
+		const sourcePrefix = sourceArtifactsDir.endsWith("/") ? sourceArtifactsDir : `${sourceArtifactsDir}/`;
+		const nextArtifactsDir = nextSessionPath.slice(0, -6);
+		const nextPrefix = nextArtifactsDir.endsWith("/") ? nextArtifactsDir : `${nextArtifactsDir}/`;
+		const moves: Array<[string, string, MemoryFileEntry]> = [];
+		for (const [source, entry] of this.#files) {
+			if (source === sessionPath) moves.push([source, nextSessionPath, entry]);
+			else if (source.startsWith(sourcePrefix))
+				moves.push([source, `${nextPrefix}${source.slice(sourcePrefix.length)}`, entry]);
+		}
+		if (!moves.some(([source]) => source === sessionPath))
+			return Promise.reject(new Error(`File not found: ${sessionPath}`));
+
+		this.#files.delete(nextSessionPath);
+		for (const key of this.#files.keys()) {
+			if (key.startsWith(nextPrefix)) this.#files.delete(key);
+		}
+		for (const [source] of moves) this.#files.delete(source);
+		for (const [, destination, entry] of moves) this.#files.set(destination, entry);
 		return Promise.resolve();
 	}
 

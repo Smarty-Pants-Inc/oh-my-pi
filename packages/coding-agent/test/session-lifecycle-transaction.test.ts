@@ -18,8 +18,9 @@ function ownership(): SessionLifecycleOwnership {
 }
 
 describe("SessionLifecycleTransaction resource binding", () => {
-	it("registers the commit side and settles with the lifecycle fence", async () => {
-		const commit = vi.fn();
+	it("seals before host completion and finalizes exactly once after acknowledgement", async () => {
+		const seal = vi.fn();
+		const finalize = vi.fn();
 		const rollback = vi.fn();
 		const release = vi.fn();
 		const activateFence = vi.fn();
@@ -28,20 +29,25 @@ describe("SessionLifecycleTransaction resource binding", () => {
 			beginOwnership: ownership,
 			activateFence,
 		});
-		transaction.bindResource("artifact", { commit, rollback, release });
+		transaction.bindResource("artifact", { seal, finalize, rollback, release });
 		await transaction.captureRetained();
 		await transaction.acquireOwnership();
 		transaction.markTarget();
-		await transaction.commit();
+		const activate = await transaction.prepareCommit();
+
+		expect(seal).toHaveBeenCalledTimes(1);
+		expect(finalize).not.toHaveBeenCalled();
+		expect(activateFence).not.toHaveBeenCalled();
+		await Promise.all([activate(), transaction.activateCommitAfterHostPublication()]);
 
 		await expect(transaction.settled).resolves.toBeUndefined();
-		expect(commit).toHaveBeenCalledTimes(1);
+		expect(finalize).toHaveBeenCalledTimes(1);
 		expect(rollback).not.toHaveBeenCalled();
 		expect(release).not.toHaveBeenCalled();
 		expect(activateFence).toHaveBeenCalledTimes(1);
 	});
 
-	it("keeps rollback cleanup and release paired with the same resource", async () => {
+	it("rolls back sealed resources and releases their fences after host rejection", async () => {
 		const order: string[] = [];
 		const transaction = new SessionLifecycleTransaction({
 			captureRetainedCheckpoint: async () => ({
@@ -55,8 +61,11 @@ describe("SessionLifecycleTransaction resource binding", () => {
 			},
 		});
 		transaction.bindResource("artifact", {
-			commit: () => {
-				order.push("commit");
+			seal: () => {
+				order.push("seal");
+			},
+			finalize: () => {
+				order.push("finalize");
 			},
 			rollback: () => {
 				order.push("rollback");
@@ -68,8 +77,26 @@ describe("SessionLifecycleTransaction resource binding", () => {
 		await transaction.captureRetained();
 		await transaction.acquireOwnership();
 		transaction.markTarget();
+		await transaction.prepareCommit();
 		await transaction.rollback({ cause: new Error("target failed"), message: "rollback failed" });
 
-		expect(order).toEqual(["rollback", "restore", "release", "fence"]);
+		expect(order).toEqual(["seal", "rollback", "restore", "release", "fence"]);
+	});
+
+	it("recaptures quiesced runtime without asking the host for a second full checkpoint", async () => {
+		const recapture = vi.fn(async () => {});
+		const captureRetainedCheckpoint = vi.fn(async () => ({ restore: async () => {}, recapture }));
+		const transaction = new SessionLifecycleTransaction({
+			captureRetainedCheckpoint,
+			beginOwnership: ownership,
+			activateFence: () => {},
+		});
+
+		await transaction.captureRetained({ capturePersistedSessionFile: true });
+		await transaction.recaptureRetained({ capturePersistedSessionFile: true });
+
+		expect(captureRetainedCheckpoint).toHaveBeenCalledTimes(1);
+		expect(recapture).toHaveBeenCalledTimes(1);
+		expect(recapture).toHaveBeenCalledWith({ capturePersistedSessionFile: true });
 	});
 });

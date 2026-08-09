@@ -380,6 +380,8 @@ export interface SessionManagerStateSnapshot {
 	sessionFile: string | undefined;
 	/** Monotonic generation of accepted journal appends for this session file. */
 	journalMutationGeneration: number;
+	/** False when durable preimage bytes own rollback and header/entries are borrowed without copying. */
+	journalCopied: boolean;
 	titleUpdatedAt: string;
 	hasTitleSlot: boolean;
 	onDisk: boolean;
@@ -549,11 +551,11 @@ export class SessionManager {
 	#atomicRewriteDirty = false;
 	/**
 	 * Active {@link moveTo} relocation. Concurrent completed appends write a
-	 * full body to the live path: source while it still exists, destination
-	 * once rename has landed (source gone). Never recreates a vacated source.
-	 * `null` outside an active relocation.
+	 * full body to the live path: source while a filesystem rename is pending,
+	 * or destination immediately for queued external-store transactions. Never
+	 * recreates a vacated source. `null` outside an active relocation.
 	 */
-	#sessionFileRelocating: { source: string; dest: string } | null = null;
+	#sessionFileRelocating: { source: string; dest: string; preferDestination: boolean } | null = null;
 	/** Atomic entry batch currently staged for a full-file commit. */
 	#atomicEntryBatch: AtomicEntryBatch | undefined;
 
@@ -854,14 +856,11 @@ export class SessionManager {
 		return this.#forceFileCreation || this.#fileIsCurrent || this.#historyContainsAssistantMessage();
 	}
 
-	/**
-	 * Live path for concurrent completed appends during {@link moveTo}.
-	 * Prefers destination once rename has landed (source gone); otherwise
-	 * source. Never invents a path that does not already exist.
-	 */
+	/** Live path for concurrent completed appends during {@link moveTo}. */
 	#liveRelocationWritePath(): string | null {
 		const relocating = this.#sessionFileRelocating;
 		if (!relocating) return null;
+		if (relocating.preferDestination) return relocating.dest;
 		if (this.#storage.existsSync(relocating.dest)) return relocating.dest;
 		if (this.#storage.existsSync(relocating.source)) return relocating.source;
 		// Rename in flight with neither path visible (rare cross-device edge):
@@ -1330,7 +1329,7 @@ export class SessionManager {
 		return this.#blobs.putSync(data, options);
 	}
 
-	captureState(): SessionManagerStateSnapshot {
+	captureState(options: { copyJournal?: boolean } = {}): SessionManagerStateSnapshot {
 		return {
 			cwd: this.#cwd,
 			sessionDir: this.#sessionDir,
@@ -1341,13 +1340,15 @@ export class SessionManager {
 			hasTitleSlot: this.#hasTitleSlot,
 			sessionFile: this.#sessionFile,
 			journalMutationGeneration: this.#journalMutationGeneration(),
+			journalCopied: options.copyJournal !== false,
 			onDisk: this.#fileIsCurrent,
 			needsRewrite: this.#rewriteRequired,
 			draftOnlySessionCleanupArmed: this.#draftOnlySessionCleanupArmed,
-			// Header and entries are mutated in place by title, workspace, and
-			// migration paths. A rollback checkpoint must never share those objects.
-			header: cloneDurableSessionJson(this.#header),
-			entries: cloneDurableSessionJson(this.#entries),
+			// Durable lifecycle checkpoints already own exact JSONL bytes. They may
+			// borrow the live journal to avoid a second transcript-sized success-path copy;
+			// rollback reloads the durable preimage before publishing retained state.
+			header: options.copyJournal === false ? this.#header : cloneDurableSessionJson(this.#header),
+			entries: options.copyJournal === false ? this.#entries : cloneDurableSessionJson(this.#entries),
 			leafId: this.#index.leafId(),
 			forceFileCreation: this.#forceFileCreation,
 			turnBudgetTotal: this.#turnBudgetTotal,
@@ -1403,7 +1404,7 @@ export class SessionManager {
 	/** Restore a durable JSONL preimage, optionally retaining newer accepted appends. */
 	async restorePersistedSessionFile(
 		snapshot: PersistedSessionFileSnapshot | undefined,
-		options: { preserveNewerMutations?: boolean } = {},
+		options: { preserveNewerMutations?: boolean; reloadJournal?: boolean } = {},
 	): Promise<boolean> {
 		if (!this.#persist || !snapshot || this.#sessionFile !== snapshot.sessionFile) return false;
 		if (
@@ -1461,6 +1462,9 @@ export class SessionManager {
 			);
 		} finally {
 			if (this.#atomicRewriteFenceEpoch === epoch) this.#atomicRewriteFenceEpoch = null;
+		}
+		if (restored && options.reloadJournal && !(await this.#reloadCurrentPersistedJournal())) {
+			throw new Error("Restored session journal preimage could not be reloaded");
 		}
 		return restored;
 	}
@@ -1748,7 +1752,9 @@ export class SessionManager {
 					sessionFileExisted = this.#storage.existsSync(oldSessionFile);
 				}
 
-				this.#sessionFileRelocating = { source: oldSessionFile, dest: newSessionFile };
+				const moveStoredSession = this.#storage.moveSessionWithArtifacts;
+				const relocation = { source: oldSessionFile, dest: newSessionFile, preferDestination: false };
+				this.#sessionFileRelocating = relocation;
 				await this.#drainAndCloseWriter();
 				sessionFileExisted ||= this.#storage.existsSync(oldSessionFile);
 				this.#clearDiskError();
@@ -1762,10 +1768,17 @@ export class SessionManager {
 					? await relocationManager.beginRelocation(newArtifactsDir)
 					: undefined;
 				try {
-					// Destination artifacts are already complete here. The journal rename
-					// is the sole commit point observed by startup reconciliation.
+					// Filesystem artifacts are staged before the journal/storage
+					// relocation becomes the commit point observed by recovery.
 					if (sessionFileExisted && sessionPathChanged) {
-						await this.#storage.rename(oldSessionFile, newSessionFile);
+						if (moveStoredSession) {
+							// The indexed implementation installs its source/destination
+							// queue synchronously, so later fenced writes can target dest.
+							relocation.preferDestination = true;
+							await moveStoredSession.call(this.#storage, oldSessionFile, newSessionFile);
+						} else {
+							await this.#storage.rename(oldSessionFile, newSessionFile);
+						}
 					}
 				} catch (operationError) {
 					try {

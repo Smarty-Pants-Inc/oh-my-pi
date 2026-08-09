@@ -4430,14 +4430,14 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#pendingWorkingMessage = undefined;
 			if (this.loadingAnimation) {
 				this.loadingAnimation.setMessage(this.#defaultWorkingMessage);
-				this.#publishCompanionStatusText();
+				if (this.#companionStatusTextSink) this.#publishCompanionStatusText();
 			}
 			return;
 		}
 
 		if (this.loadingAnimation) {
 			this.loadingAnimation.setMessage(message);
-			this.#publishCompanionStatusText();
+			if (this.#companionStatusTextSink) this.#publishCompanionStatusText();
 			return;
 		}
 

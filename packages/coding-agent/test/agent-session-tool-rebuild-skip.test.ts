@@ -1091,16 +1091,19 @@ These tools became available:
 
 		const targetPath = await createSwitchTarget("mount-rollback");
 		const failure = new Error("target ownership failed");
-		let commitAttempts = 0;
-		const beginArtifactTransaction = session.sessionManager.beginArtifactTransaction.bind(session.sessionManager);
-		vi.spyOn(session.sessionManager, "beginArtifactTransaction").mockImplementation(async () => {
-			const transaction = await beginArtifactTransaction();
+		let selectionFailed = false;
+		const beginYieldTransaction = session.yieldQueue.beginTransaction.bind(session.yieldQueue);
+		vi.spyOn(session.yieldQueue, "beginTransaction").mockImplementation(kind => {
+			const transaction = beginYieldTransaction(kind);
 			return {
 				rollback: () => transaction.rollback(),
-				commit: async () => {
-					commitAttempts++;
-					if (commitAttempts === 1) throw failure;
-					await transaction.commit();
+				activate: () => transaction.activate(),
+				commit: () => {
+					if (!selectionFailed) {
+						selectionFailed = true;
+						throw failure;
+					}
+					transaction.commit();
 				},
 			};
 		});

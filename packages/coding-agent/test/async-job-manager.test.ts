@@ -87,6 +87,35 @@ describe("AsyncJobManager", () => {
 		expect(manager.getJob(jobId)?.errorText).toBe("command failed");
 	});
 
+	test("delivers a synchronous run failure to its owning session", async () => {
+		const ownerDeliveries: Array<{ jobId: string; text: string }> = [];
+		const defaultDeliveries: Array<{ jobId: string; text: string }> = [];
+		const manager = new AsyncJobManager({
+			onJobComplete: (jobId, text) => {
+				defaultDeliveries.push({ jobId, text });
+			},
+		});
+		manager.registerDeliverySink("owner-session", (jobId, text) => {
+			ownerDeliveries.push({ jobId, text });
+		});
+
+		const jobId = manager.register(
+			"task",
+			"synchronous failure",
+			() => {
+				throw new Error("synchronous failure");
+			},
+			{ ownerId: "owner-session" },
+		);
+
+		await manager.waitForAll();
+		await manager.drainDeliveries({ timeoutMs: 2_000 });
+
+		expect(ownerDeliveries).toEqual([{ jobId, text: "synchronous failure" }]);
+		expect(defaultDeliveries).toEqual([]);
+		expect(manager.getJob(jobId)).toMatchObject({ status: "failed", errorText: "synchronous failure" });
+	});
+
 	test("cancels a running job by id", async () => {
 		const completions: Array<{ jobId: string; text: string }> = [];
 		const manager = new AsyncJobManager({
