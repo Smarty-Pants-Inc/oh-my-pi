@@ -1001,6 +1001,63 @@ describe("AgentSession.switchSession previous-context build", () => {
 		expect(session.sessionManager.getSessionName()).toBe("configured");
 	});
 
+	it("rehydrates setup-seeded goal and todos before new-session readiness", async () => {
+		const tempDir = TempDir.createSync("@pi-new-session-seeded-state-");
+		tempDirs.push(tempDir);
+		const { session, sessionManager, extensionRunner } = buildSession(tempDir);
+		const now = Date.now();
+		const seededGoal = {
+			id: "goal-seeded-by-extension",
+			objective: "Continue the replacement route",
+			status: "active" as const,
+			tokensUsed: 0,
+			timeUsedSeconds: 0,
+			createdAt: now,
+			updatedAt: now,
+		};
+		const seededTodos = [
+			{
+				name: "Replacement route",
+				tasks: [{ content: "Run the next product proof", status: "in_progress" as const }],
+			},
+		];
+		let beforeSwitchCalls = 0;
+		let reconcileCalls = 0;
+		session.setSessionBeforeSwitchReconciler(async () => {
+			beforeSwitchCalls++;
+		});
+		session.setSessionSwitchReconciler(async () => {
+			reconcileCalls++;
+			const context = sessionManager.buildSessionContext();
+			expect(context.mode).toBe("goal");
+			expect(context.modeData?.goal).toMatchObject({ objective: seededGoal.objective });
+			session.setGoalModeState({ enabled: true, mode: "active", goal: seededGoal });
+		});
+
+		const emitWithHostCompletion = extensionRunner.emitWithHostCompletion.bind(extensionRunner);
+		vi.spyOn(extensionRunner, "emitWithHostCompletion").mockImplementation(
+			async (event, finalizeBeforeHostCompletion) => {
+				if (event.type === "session_ready") {
+					expect(session.getTodoPhases()).toEqual(seededTodos);
+					expect(session.getGoalModeState()?.goal.objective).toBe(seededGoal.objective);
+				}
+				return emitWithHostCompletion(event, finalizeBeforeHostCompletion);
+			},
+		);
+
+		await expect(
+			session.newSession(undefined, async manager => {
+				manager.appendModeChange("goal", { goal: seededGoal });
+				manager.appendCustomEntry("user_todo_edit", { phases: seededTodos });
+			}),
+		).resolves.toBe(true);
+
+		expect(beforeSwitchCalls).toBe(1);
+		expect(reconcileCalls).toBe(1);
+		expect(session.getTodoPhases()).toEqual(seededTodos);
+		expect(session.getGoalModeState()?.goal.objective).toBe(seededGoal.objective);
+	});
+
 	it("cleans partially opened lifecycle ownership before publishing a switch frame", async () => {
 		const tempDir = TempDir.createSync("@pi-new-session-ownership-init-");
 		tempDirs.push(tempDir);

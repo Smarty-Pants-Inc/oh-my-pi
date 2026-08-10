@@ -7179,6 +7179,7 @@ export class AgentSession {
 			}
 			await lifecycle.captureRetained({ capturePersistedSessionFile: true });
 			await this.abort({ goalReason: "internal", preserveToolChoice: true });
+			await this.#sessionBeforeSwitchReconciler?.();
 			await this.#bash.flushPending();
 			await this.sessionManager.flush();
 			await this.#advisors.drainAndDetachRecorders();
@@ -7204,13 +7205,12 @@ export class AgentSession {
 			this.sessionManager.appendThinkingLevelChange(this.thinkingLevel, this.configuredThinkingLevel());
 			this.sessionManager.appendServiceTierChange(this.#models.serviceTierEntry());
 			if (setup) await setup(this.sessionManager);
-			await this.refreshBaseSystemPrompt();
 
 			const targetContext = this.buildDisplaySessionContext();
 			this.agent.reset();
 			this.agent.replaceMessages(targetContext.messages);
 			this.#clearCheckpointRuntimeState();
-			this.setTodoPhases([]);
+			this.#todo.syncFromBranch();
 			this.#todo.resetCycle();
 			this.#pendingNextTurnMessages = [];
 			this.#scheduledHiddenNextTurnGeneration = undefined;
@@ -7219,6 +7219,16 @@ export class AgentSession {
 			this.#usagePreflightReadyModel = undefined;
 			this.#planReferenceSent = false;
 			this.#planReferencePath = "local://PLAN.md";
+
+			const reconciliation = await this.#sessionSwitchReconciler?.();
+			try {
+				await this.refreshBaseSystemPrompt();
+			} catch (error) {
+				if (reconciliation !== "source-presentation-refresh-failed") throw error;
+				logger.warn("Failed to refresh new session prompt after source presentation cleanup failed", {
+					error: String(error),
+				});
+			}
 
 			await this.sessionManager.ensureOnDisk();
 			const commitOptions: SessionLifecycleCommitOptions = {
