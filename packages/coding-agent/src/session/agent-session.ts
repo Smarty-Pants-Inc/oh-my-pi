@@ -1105,6 +1105,15 @@ export class AgentSession {
 			agentKind: () => this.#agentKind,
 			emitSessionEvent: event => this.#emitSessionEvent(event),
 			scheduleAgentContinue: options => this.#scheduleAgentContinue(options),
+			queueTodoReconciliation: () => {
+				if (!this.getActiveToolNames().includes("todo")) return undefined;
+				const choice = buildNamedToolChoice("todo", this.model);
+				if (!choice) return undefined;
+				const label = "todo-reconciliation";
+				this.#toolChoiceQueue.removeByLabel(label);
+				this.#toolChoiceQueue.pushOnce(choice, { label });
+				return () => this.#toolChoiceQueue.removeByLabel(label);
+			},
 			promptGeneration: () => this.#promptGeneration,
 			hasPendingAsyncWake: () => this.#hasPendingAsyncWake(),
 			getActiveToolNames: () => this.getActiveToolNames(),
@@ -3013,7 +3022,18 @@ export class AgentSession {
 		// and only successful mutating tools tick — read-only exploration is
 		// not progress an agent could mark done.
 		if (event.type === "message_end" && event.message.role === "toolResult") {
-			this.#todo.onToolResult(event.message.toolName, event.message.isError);
+			const details = isRecord(event.message.details) ? event.message.details : undefined;
+			this.#todo.onToolResult(event.message.toolName, event.message.isError, details);
+		}
+		if (
+			event.type === "message_end" &&
+			event.message.role === "custom" &&
+			event.message.customType === ASYNC_RESULT_MESSAGE_TYPE
+		) {
+			const jobs = isRecord(event.message.details) ? event.message.details.jobs : undefined;
+			if (Array.isArray(jobs) && jobs.some(job => isRecord(job) && stringProperty(job, "type") === "task")) {
+				this.#todo.noteTaskCompletion();
+			}
 		}
 		// Track the settled assistant turn synchronously as well: agent_end
 		// maintenance reads `#lastAssistantMessage`, and when a turn's events all

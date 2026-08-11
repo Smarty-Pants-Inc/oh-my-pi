@@ -23,11 +23,11 @@ Completing tasks out of phase order can move this pointer **back** to an earlier
 - **Phase name**: short noun phrase (e.g. `Foundation`, `Auth`, `Verification`). Unique identifier. NEVER prefix `1.`, `A)`, `Phase 1:`.
 
 ## Rules
-- Mark tasks done immediately after finishing. Complete phases in order.
-- NEVER make a todo call your turn's only tool call — batch it with the real work: `init` with the first reads/edits, each `done`/`start` with the next action. Solo todo turns waste a round trip.
-- Waiting on something you can't act on (a user decision, another agent, an external service)? `block` the task (optional `reason`) — it stays in the tracker but won't trip the stop reminder; `unblock` when it's actionable again. If the blocker is itself agent-actionable, `append` an unblocking task instead.
-- Keep `task`/`phase` strings stable once introduced.
-- Lost the exact task text? `view` echoes the list — NEVER guess from memory.
+- Reconcile the list whenever work or scope changes: `done` finished tasks, `drop` tasks intentionally abandoned or no longer required, `rm` obsolete tracking, and `append` newly discovered required work.
+- Before yielding, every open task MUST reflect reality: actionable work stays open, genuine external waits are `block`ed, and finished or obsolete work is closed or removed.
+- Prefer targeted operations after initialization. `init` replaces the entire list and can erase user edits; use it again only for a deliberate full replan.
+- NEVER make a routine todo call your turn's only tool call — batch it with the real work: `init` with the first reads/edits, each later update with the next action or final verification. A stop-time reconciliation that explicitly forces `todo` is the exception.
+- Keep `task`/`phase` strings stable once introduced. Lost the exact text? `view` echoes the list — NEVER guess from memory.
 
 ## When to create a list
 - Task requires 3+ distinct steps

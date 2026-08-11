@@ -167,7 +167,7 @@ describe("InteractiveMode todo HUD persistence", () => {
 		expect(liveRegion.getNativeScrollbackLiveRegionStart?.()).toBeUndefined();
 	});
 
-	it("marks todos complete when subagent reconciliation reports a finished agent", async () => {
+	it("leaves canonical todos for the parent to reconcile when a subagent completes", async () => {
 		await createMode(-1);
 		vi.spyOn(mode.statusLine, "watchBranch").mockImplementation(() => {});
 		session.setTodoPhases([
@@ -176,8 +176,6 @@ describe("InteractiveMode todo HUD persistence", () => {
 		mode.setTodos(session.getTodoPhases());
 
 		await mode.init();
-		// Subagent lifecycle changes coalesce behind a 100ms observer UI sync
-		// timer before todo reconciliation runs; flush it deterministically.
 		vi.useFakeTimers();
 		eventBus.emit(TASK_SUBAGENT_LIFECYCLE_CHANNEL, {
 			id: "ReviewFixer",
@@ -189,15 +187,12 @@ describe("InteractiveMode todo HUD persistence", () => {
 		});
 		vi.advanceTimersByTime(100);
 
-		expect(session.getTodoPhases()[0]?.tasks[0]?.status).toBe("completed");
+		expect(session.getTodoPhases()[0]?.tasks[0]?.status).toBe("pending");
 	});
 
-	it("completes a blocked todo when the detached subagent it waits on finishes", async () => {
+	it("does not silently complete a blocked todo when its subagent finishes", async () => {
 		await createMode(-1);
 		vi.spyOn(mode.statusLine, "watchBranch").mockImplementation(() => {});
-		// A todo blocked while waiting on a detached subagent. Blocked todos are
-		// excluded from the stop reminder, so if reconciliation skipped them this
-		// would strand silently after the subagent completes.
 		session.setTodoPhases([
 			{
 				name: "Implementation",
@@ -219,9 +214,8 @@ describe("InteractiveMode todo HUD persistence", () => {
 		vi.advanceTimersByTime(100);
 
 		const task = session.getTodoPhases()[0]?.tasks[0];
-		expect(task?.status).toBe("completed");
-		// The blocker note is dropped with the blocked status — the wait is over.
-		expect(task?.blocker).toBeUndefined();
+		expect(task?.status).toBe("blocked");
+		expect(task?.blocker).toBe("waiting on ReviewFixer");
 	});
 });
 

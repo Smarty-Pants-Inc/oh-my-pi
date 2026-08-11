@@ -8,6 +8,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { TodoTool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { TempDir, withTimeout } from "@oh-my-pi/pi-utils";
 
 /**
@@ -93,6 +94,21 @@ describe("AgentSession todo reminder self-continuation suppression", () => {
 		});
 	}
 
+	function emitAsyncTaskResult(): void {
+		session.agent.emitExternalEvent({
+			type: "message_end",
+			message: {
+				role: "custom",
+				customType: "async-result",
+				content: "Background task completed.",
+				display: true,
+				attribution: "agent",
+				details: { jobs: [{ jobId: "task-review", type: "task" }] },
+				timestamp: Date.now(),
+			},
+		});
+	}
+
 	function todoReminderTranscriptEntry() {
 		return sessionManager.getBranch().find(entry => {
 			if (entry.type !== "message" || entry.message.role !== "developer") return false;
@@ -115,26 +131,32 @@ describe("AgentSession todo reminder self-continuation suppression", () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected built-in anthropic model to exist");
 
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"todo.enabled": true,
+			"todo.reminders": true,
+			"todo.remindersMax": 3,
+		});
+		const toolSession: ToolSession = {
+			cwd: tempDir.path(),
+			hasUI: false,
+			getSessionFile: () => sessionManager.getSessionFile() ?? null,
+			getSessionSpawns: () => "*",
+			settings,
+			getTodoPhases: () => session?.getTodoPhases() ?? [],
+			setTodoPhases: phases => session?.setTodoPhases(phases),
+		};
+		const todoTool = new TodoTool(toolSession);
 		const agent = new Agent({
 			initialState: {
 				model,
 				systemPrompt: ["Test"],
-				tools: [],
+				tools: [todoTool],
 				messages: [],
 			},
 		});
 
-		session = new AgentSession({
-			agent,
-			sessionManager,
-			settings: Settings.isolated({
-				"compaction.enabled": false,
-				"todo.enabled": true,
-				"todo.reminders": true,
-				"todo.remindersMax": 3,
-			}),
-			modelRegistry,
-		});
+		session = new AgentSession({ agent, sessionManager, settings, modelRegistry });
 
 		reminderAttempts = [];
 		({ promise: firstReminderPromise, resolve: resolveFirstReminder } = Promise.withResolvers<void>());
@@ -165,11 +187,12 @@ describe("AgentSession todo reminder self-continuation suppression", () => {
 		vi.restoreAllMocks();
 	});
 
-	it("baseline: a single text-only stop fires reminder 1/3 and records it in the transcript", async () => {
+	it("forces todo reconciliation after a text-only stop", async () => {
 		vi.spyOn(session.agent, "continue").mockResolvedValue();
 		emitTextOnlyStop();
 		await withTimeout(firstReminderPromise, 1000, "todo_reminder never fired");
 		expect(reminderAttempts).toEqual([1]);
+		expect(session.toolChoiceQueue.nextToolChoice()).toEqual({ type: "tool", name: "todo" });
 
 		const reminderEntry = todoReminderTranscriptEntry();
 		expect(reminderEntry?.type).toBe("message");
@@ -184,6 +207,75 @@ describe("AgentSession todo reminder self-continuation suppression", () => {
 		expect(reminderAttempts).toEqual([]);
 		expect(todoReminderTranscriptEntry()).toBeUndefined();
 		expect(continueSpy).not.toHaveBeenCalled();
+	});
+
+	it("does not remind or continue when todo is inactive", async () => {
+		await session.setActiveToolsByName([]);
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+
+		emitTextOnlyStop("The requested work is complete.");
+		await session.waitForIdle();
+
+		expect(reminderAttempts).toEqual([]);
+		expect(todoReminderTranscriptEntry()).toBeUndefined();
+		expect(continueSpy).not.toHaveBeenCalled();
+	});
+
+	it("forces reconciliation of blocked todos after an async task completes", async () => {
+		session.setTodoPhases([
+			{
+				name: "Delegation",
+				tasks: [
+					{
+						content: "Review todo lifecycle patch",
+						status: "blocked",
+						blocker: "waiting on ReviewFixer",
+					},
+				],
+			},
+		]);
+		vi.spyOn(session.agent, "continue").mockResolvedValue();
+
+		emitAsyncTaskResult();
+		emitTextOnlyStop("The background review completed.");
+		await withTimeout(firstReminderPromise, 1000, "todo_reminder never fired");
+
+		expect(reminderAttempts).toEqual([1]);
+		expect(session.toolChoiceQueue.nextToolChoice()).toEqual({ type: "tool", name: "todo" });
+	});
+
+	it("reconciles blocked todos when hub consumes a completed task result", async () => {
+		session.setTodoPhases([
+			{
+				name: "Delegation",
+				tasks: [
+					{
+						content: "Review todo lifecycle patch",
+						status: "blocked",
+						blocker: "waiting on ReviewFixer",
+					},
+				],
+			},
+		]);
+		vi.spyOn(session.agent, "continue").mockResolvedValue();
+
+		emitToolResult("hub", {
+			op: "wait",
+			jobs: [
+				{
+					id: "ReviewFixer",
+					type: "task",
+					status: "completed",
+					label: "Review todo lifecycle patch",
+					durationMs: 100,
+				},
+			],
+		});
+		emitTextOnlyStop("The background review completed.");
+		await withTimeout(firstReminderPromise, 1000, "todo_reminder never fired");
+
+		expect(reminderAttempts).toEqual([1]);
+		expect(session.toolChoiceQueue.nextToolChoice()).toEqual({ type: "tool", name: "todo" });
 	});
 
 	it("does not remind or continue when the assistant yields with a non-English (Chinese) question", async () => {
