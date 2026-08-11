@@ -244,6 +244,30 @@ describe("AgentSession todo reminder self-continuation suppression", () => {
 		expect(session.toolChoiceQueue.nextToolChoice()).toEqual({ type: "tool", name: "todo" });
 	});
 
+	it("keeps async completion reconciliation armed across todo phase rehydration", async () => {
+		session.setTodoPhases([
+			{
+				name: "Delegation",
+				tasks: [
+					{
+						content: "Review todo lifecycle patch",
+						status: "blocked",
+						blocker: "waiting on ReviewFixer",
+					},
+				],
+			},
+		]);
+		vi.spyOn(session.agent, "continue").mockResolvedValue();
+
+		emitAsyncTaskResult();
+		session.setTodoPhases(session.getTodoPhases());
+		emitTextOnlyStop("The background review completed.");
+		await withTimeout(firstReminderPromise, 1000, "todo_reminder never fired");
+
+		expect(reminderAttempts).toEqual([1]);
+		expect(session.toolChoiceQueue.nextToolChoice()).toEqual({ type: "tool", name: "todo" });
+	});
+
 	it("reconciles blocked todos when hub consumes a completed task result", async () => {
 		session.setTodoPhases([
 			{

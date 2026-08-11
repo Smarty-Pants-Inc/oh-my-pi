@@ -48,6 +48,7 @@ export interface TodoTrackerHost {
 	sessionManager: SessionManager;
 	settings: Settings;
 	model(): Model | undefined;
+	usesOwnedToolDialect(): boolean;
 	agentKind(): "main" | "sub";
 	emitSessionEvent(event: AgentSessionEvent): Promise<void>;
 	scheduleAgentContinue(options: { generation?: number; onSkip?: () => void; onError?: () => void }): void;
@@ -82,7 +83,6 @@ export class TodoTracker {
 	/** Replaces todo phases with a defensive clone. */
 	setPhases(phases: TodoPhase[]): void {
 		this.#phases = this.#clonePhases(phases);
-		this.#taskCompletionAwaitingTodoReconciliation = false;
 	}
 
 	/** Rehydrates todo phases from the current transcript branch. */
@@ -112,9 +112,15 @@ export class TodoTracker {
 	onToolResult(toolName: string, isError: boolean, details?: Record<string, unknown>): void {
 		if (toolName === "todo") {
 			const op = details ? stringProperty(details, "op") : undefined;
+			const phases = details?.phases;
 			// Legacy/provider-owned todo results may omit `op`; treat a successful
 			// authoritative snapshot as a mutation. A local `view` is explicitly read-only.
-			if (!isError && op !== "view") this.#mutationsSinceLastTouch = 0;
+			if (!isError && op !== "view") {
+				this.#mutationsSinceLastTouch = 0;
+				if (Array.isArray(phases) && phases.every(isTodoPhase)) {
+					this.#taskCompletionAwaitingTodoReconciliation = false;
+				}
+			}
 		} else if (!isError && MUTATING_TOOLS[toolName]) {
 			this.#mutationsSinceLastTouch++;
 		}
@@ -177,7 +183,7 @@ export class TodoTracker {
 		};
 		if (promptText === undefined || mode === "preferred") return { message };
 		const model = this.#host.model();
-		const toolChoice = buildNamedToolChoice("todo", model);
+		const toolChoice = buildNamedToolChoice("todo", model, this.#host.usesOwnedToolDialect());
 		if (!toolChoice) {
 			logger.warn(
 				"Eager todo proceeding with the reminder only because the current model does not support a forced todo tool_choice",

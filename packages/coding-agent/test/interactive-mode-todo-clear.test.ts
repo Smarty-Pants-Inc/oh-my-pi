@@ -203,15 +203,29 @@ describe("InteractiveMode todo HUD persistence", () => {
 
 		await mode.init();
 		vi.useFakeTimers();
+		const noteTaskCompletion = vi.spyOn(session, "noteTodoTaskCompletion");
 		eventBus.emit(TASK_SUBAGENT_LIFECYCLE_CHANNEL, {
 			id: "ReviewFixer",
 			index: 0,
 			agent: "task",
 			description: "Fix review comments",
-			status: "completed",
+			status: "started",
 			detached: true,
 		});
-		vi.advanceTimersByTime(100);
+
+		expect(noteTaskCompletion).not.toHaveBeenCalled();
+		for (const status of ["completed", "failed", "aborted"] as const) {
+			eventBus.emit(TASK_SUBAGENT_LIFECYCLE_CHANNEL, {
+				id: `ReviewFixer-${status}`,
+				index: 0,
+				agent: "task",
+				description: "Fix review comments",
+				status,
+				detached: true,
+			});
+		}
+
+		expect(noteTaskCompletion).toHaveBeenCalledTimes(3);
 
 		const task = session.getTodoPhases()[0]?.tasks[0];
 		expect(task?.status).toBe("blocked");

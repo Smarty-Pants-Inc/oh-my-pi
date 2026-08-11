@@ -37,6 +37,7 @@ import {
 	type AsideMessage,
 	type BeforeToolCallContext,
 	type BeforeToolCallResult,
+	resolveOwnedDialectFromEnv,
 	resolveTelemetry,
 	type StreamFn,
 	TERMINAL_TOOL_RESULT_ABORT_REASON,
@@ -1102,12 +1103,13 @@ export class AgentSession {
 			sessionManager: this.sessionManager,
 			settings: this.settings,
 			model: () => this.model,
+			usesOwnedToolDialect: () => this.#usesOwnedToolDialect(),
 			agentKind: () => this.#agentKind,
 			emitSessionEvent: event => this.#emitSessionEvent(event),
 			scheduleAgentContinue: options => this.#scheduleAgentContinue(options),
 			queueTodoReconciliation: () => {
 				if (!this.getActiveToolNames().includes("todo")) return undefined;
-				const choice = buildNamedToolChoice("todo", this.model);
+				const choice = buildNamedToolChoice("todo", this.model, this.#usesOwnedToolDialect());
 				if (!choice) return undefined;
 				const label = "todo-reconciliation";
 				this.#toolChoiceQueue.removeByLabel(label);
@@ -1766,6 +1768,12 @@ export class AgentSession {
 		this.#toolChoiceQueue.clearPendingInvokers();
 	}
 
+	#usesOwnedToolDialect(): boolean {
+		if (resolveOwnedDialectFromEnv(Bun.env.PI_DIALECT)) return true;
+		const format = this.settings.get("tools.format");
+		return format !== "native" && (format !== "auto" || this.model?.supportsTools === false);
+	}
+
 	/**
 	 * Force the next model call to target a specific active tool, then terminate
 	 * the agent loop. Pushes a two-step sequence [forced, "none"] so the model
@@ -1776,7 +1784,7 @@ export class AgentSession {
 			throw new Error(`Tool "${toolName}" is not currently active.`);
 		}
 
-		const forced = buildNamedToolChoice(toolName, this.model);
+		const forced = buildNamedToolChoice(toolName, this.model, this.#usesOwnedToolDialect());
 		if (!forced || typeof forced === "string") {
 			throw new Error("Current model does not support forcing a specific tool.");
 		}
@@ -6984,6 +6992,11 @@ export class AgentSession {
 
 	setTodoPhases(phases: TodoPhase[]): void {
 		this.#todo.setPhases(phases);
+	}
+
+	/** Arms the next terminal todo check to reconcile work blocked on a subagent. */
+	noteTodoTaskCompletion(): void {
+		this.#todo.noteTaskCompletion();
 	}
 
 	#buildReplanTitleContext(): string {

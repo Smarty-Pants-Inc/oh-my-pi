@@ -116,6 +116,7 @@ import { BUILTIN_SLASH_COMMAND_RESERVED_NAMES, buildTuiBuiltinSlashCommands } fr
 import { formatDuration } from "../slash-commands/helpers/format";
 import { STTController, type SttState } from "../stt";
 import { discoverTitleSystemPromptFile, resolvePromptInput } from "../system-prompt";
+import { type SubagentLifecyclePayload, TASK_SUBAGENT_LIFECYCLE_CHANNEL } from "../task";
 import { formatTaskId } from "../task/render";
 import type { ConfiguredThinkingLevel } from "../thinking";
 import { tinyTitleClient } from "../tiny/title-client";
@@ -791,6 +792,14 @@ export class InteractiveMode implements InteractiveModeContext {
 						return;
 					}
 					this.#handleMcpConnectionStatusEvent(data);
+				}),
+			);
+			this.#eventBusUnsubscribers.push(
+				eventBus.on(TASK_SUBAGENT_LIFECYCLE_CHANNEL, data => {
+					const { status } = data as SubagentLifecyclePayload;
+					if (status === "completed" || status === "failed" || status === "aborted") {
+						this.session.noteTodoTaskCompletion();
+					}
 				}),
 			);
 		}

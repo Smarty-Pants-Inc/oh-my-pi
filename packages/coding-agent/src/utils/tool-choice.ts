@@ -1,8 +1,16 @@
 import type { Api, Model, ToolChoice } from "@oh-my-pi/pi-ai";
 
-/** Build a provider-aware tool choice that targets one specific tool when supported. */
-export function buildNamedToolChoice(toolName: string, model?: Model<Api>): ToolChoice | undefined {
+/**
+ * Build a provider-aware named choice. Owned/in-band dialects enforce the returned
+ * choice locally, so they deliberately bypass native-provider compatibility flags.
+ */
+export function buildNamedToolChoice(
+	toolName: string,
+	model?: Model<Api>,
+	localEnforcement = false,
+): ToolChoice | undefined {
 	if (!model) return undefined;
+	if (localEnforcement) return { type: "function", name: toolName };
 	const compat = model.compat;
 	if (compat && "supportsToolChoice" in compat && compat.supportsToolChoice === false) return undefined;
 	if (compat && "supportsForcedToolChoice" in compat && compat.supportsForcedToolChoice === false) return undefined;
