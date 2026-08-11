@@ -45,7 +45,7 @@ import {
 import { ModelsConfigFile } from "./config/models-config";
 import { serviceTierSettingToTier } from "./config/service-tier";
 import { getDefault, type SettingPath, Settings, type SettingValue, settings } from "./config/settings";
-import { initializeWithSettings } from "./discovery";
+import { initializeWithSettings, isProviderEnabled } from "./discovery";
 import {
 	clearPluginRootsAndCaches,
 	injectPluginDirRoots,
@@ -784,17 +784,18 @@ async function switchToResumedProject(
 		return getProjectDir();
 	}
 
-	// Let the launch-cwd preload settle before clearing and re-warming its caches.
+	// Let the launch-cwd preload settle before clearing its caches.
 	await pluginPreloadPromise.catch(() => {});
 	setProjectDir(resumedCwd);
-	clearPluginRootsAndCaches();
+	clearPluginRootsAndCaches(undefined, { rewarm: false });
 	resetCapabilities();
 	const cwd = getProjectDir();
-	// clearPluginRootsAndCaches only kicks off an unawaited re-warm; await a fresh
-	// destination preload so sync consumers (plugin-provided LSP/DAP config) never
-	// read the launch project's stale/empty roots during session creation.
-	await preloadPluginRoots(os.homedir(), cwd);
 	await activeSettings.reloadForCwd(cwd);
+	initializeWithSettings(activeSettings);
+	const pluginPolicy = { includeClaudeRegistry: isProviderEnabled("claude") };
+	// The explicit destination preload follows cache clearing directly, so sync
+	// consumers cannot observe a re-warm from the launch project.
+	await preloadPluginRoots(os.homedir(), cwd, pluginPolicy);
 	return cwd;
 }
 
@@ -1356,9 +1357,6 @@ export async function runRootCommand(
 	// RPC owns stdin. Claim its singleton stream before plugin/extension discovery can load an in-process consumer.
 	const rpcInput = mode === "rpc" || mode === "rpc-ui" ? claimRpcInput() : undefined;
 
-	// Plugin roots may preload public extension modules. Start that work only
-	// after the one-shot Fresh companion capability is consumed below.
-	let pluginPreloadPromise: Promise<void>;
 	const home = os.homedir();
 
 	// Trusted files load as exact module paths, never as package roots whose
@@ -1412,14 +1410,6 @@ export async function runRootCommand(
 		}
 	}
 
-	pluginPreloadPromise =
-		parsedArgs.pluginDirs && parsedArgs.pluginDirs.length > 0
-			? logger.time("injectPluginDirRoots", injectPluginDirRoots, home, parsedArgs.pluginDirs, getProjectDir())
-			: logger.time("preloadPluginRoots", preloadPluginRoots, home, getProjectDir());
-	// Mark the promise as handled so a synchronous failure does not surface as an unhandled-rejection
-	// warning before we reach the await site below.
-	pluginPreloadPromise.catch(() => {});
-
 	// Create AuthStorage and ModelRegistry upfront
 	const authStorage = await logger.time("discoverAuthStorage", deps.discoverAuthStorage ?? discoverAuthStorage);
 	const modelRegistry = logger.time("modelRegistry:init", () => new ModelRegistry(authStorage));
@@ -1449,6 +1439,23 @@ export async function runRootCommand(
 
 	// Initialize discovery system with settings for provider persistence
 	logger.time("initializeWithSettings", initializeWithSettings, settingsInstance);
+	const pluginPolicy = { includeClaudeRegistry: isProviderEnabled("claude") };
+	// Kick off plugin-root preload after provider policy has been initialized.
+	// Awaited later (before extension/skill discovery in createAgentSession needs it).
+	const pluginPreloadPromise =
+		parsedArgs.pluginDirs && parsedArgs.pluginDirs.length > 0
+			? logger.time(
+					"injectPluginDirRoots",
+					injectPluginDirRoots,
+					home,
+					parsedArgs.pluginDirs,
+					getProjectDir(),
+					pluginPolicy,
+				)
+			: logger.time("preloadPluginRoots", preloadPluginRoots, home, getProjectDir(), pluginPolicy);
+	// Mark the promise as handled so a synchronous failure does not surface as an unhandled-rejection
+	// warning before we reach the await site below.
+	pluginPreloadPromise.catch(() => {});
 
 	// Apply model role overrides from CLI args or env vars (ephemeral, not persisted)
 	const smolModel = parsedArgs.smol ?? $env.PI_SMOL_MODEL;

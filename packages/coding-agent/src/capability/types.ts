@@ -64,6 +64,8 @@ export interface LoadOptions<T = unknown> {
 	providers?: string[];
 	/** Exclude these providers (by ID). Default: none */
 	excludeProviders?: string[];
+	/** Ignore module-global disabled providers. Requires an explicit provider exclusion policy. */
+	ignoreDisabledProviders?: boolean;
 	/** Custom cwd. Default: getProjectDir() */
 	cwd?: string;
 	/** Include items even if they fail validation. Default: false */

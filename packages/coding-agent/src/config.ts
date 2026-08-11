@@ -2,15 +2,16 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { CONFIG_DIR_NAME, getConfigAgentDirName, getProjectDir } from "@oh-my-pi/pi-utils";
+import { isProviderEnabled } from "./capability";
 import { expandTilde } from "./tools/path-utils";
 
 export * from "./config/config-file";
 
 const priorityList = [
 	{ dir: CONFIG_DIR_NAME, globalAgentDir: getConfigAgentDirName },
-	{ dir: ".claude" },
-	{ dir: ".codex" },
-	{ dir: ".gemini" },
+	{ dir: ".claude", providerId: "claude" },
+	{ dir: ".codex", providerId: "codex" },
+	{ dir: ".gemini", providerId: "gemini" },
 ];
 
 // =============================================================================
@@ -80,14 +81,16 @@ export function getChangelogPath(): string | undefined {
  * User-level: ~/.omp/agent, ~/.claude, ~/.codex, ~/.gemini
  * Project-level: .omp, .claude, .codex, .gemini
  */
-const USER_CONFIG_BASES = priorityList.map(({ dir, globalAgentDir }) => ({
+const USER_CONFIG_BASES = priorityList.map(({ dir, globalAgentDir, providerId }) => ({
 	base: () => path.join(os.homedir(), globalAgentDir ? globalAgentDir() : dir),
 	name: dir,
+	providerId,
 }));
 
-const PROJECT_CONFIG_BASES = priorityList.map(({ dir }) => ({
+const PROJECT_CONFIG_BASES = priorityList.map(({ dir, providerId }) => ({
 	base: dir,
 	name: dir,
+	providerId,
 }));
 
 export interface ConfigDirEntry {
@@ -129,7 +132,8 @@ export function getConfigDirs(subpath: string, options: GetConfigDirsOptions = {
 
 	// User-level directories (highest priority)
 	if (user) {
-		for (const { base, name } of USER_CONFIG_BASES) {
+		for (const { base, name, providerId } of USER_CONFIG_BASES) {
+			if (providerId !== undefined && !isProviderEnabled(providerId)) continue;
 			const resolvedPath = path.resolve(base(), subpath);
 			if (!existingOnly || fs.existsSync(resolvedPath)) {
 				results.push({ path: resolvedPath, source: name, level: "user" });
@@ -139,7 +143,8 @@ export function getConfigDirs(subpath: string, options: GetConfigDirsOptions = {
 
 	// Project-level directories
 	if (project) {
-		for (const { base, name } of PROJECT_CONFIG_BASES) {
+		for (const { base, name, providerId } of PROJECT_CONFIG_BASES) {
+			if (providerId !== undefined && !isProviderEnabled(providerId)) continue;
 			const resolvedPath = path.resolve(cwd, base, subpath);
 			if (!existingOnly || fs.existsSync(resolvedPath)) {
 				results.push({ path: resolvedPath, source: name, level: "project" });
@@ -211,13 +216,16 @@ export function findConfigFileWithMeta(
  * Results are in priority order (highest first).
  */
 export function findAllNearestProjectConfigDirs(subpath: string, cwd: string = getProjectDir()): ConfigDirEntry[] {
+	const projectConfigBases = PROJECT_CONFIG_BASES.filter(
+		({ providerId }) => providerId === undefined || isProviderEnabled(providerId),
+	);
 	const results: ConfigDirEntry[] = [];
 	const foundBases = new Set<string>();
 
 	let currentDir = cwd;
 
-	while (foundBases.size < PROJECT_CONFIG_BASES.length) {
-		for (const { base, name } of PROJECT_CONFIG_BASES) {
+	while (foundBases.size < projectConfigBases.length) {
+		for (const { base, name } of projectConfigBases) {
 			if (foundBases.has(name)) continue;
 
 			const candidate = path.join(currentDir, base, subpath);
@@ -235,7 +243,7 @@ export function findAllNearestProjectConfigDirs(subpath: string, cwd: string = g
 	}
 
 	// Sort by priority order
-	const order = PROJECT_CONFIG_BASES.map(b => b.name);
+	const order = projectConfigBases.map(b => b.name);
 	results.sort((a, b) => order.indexOf(a.source) - order.indexOf(b.source));
 
 	return results;

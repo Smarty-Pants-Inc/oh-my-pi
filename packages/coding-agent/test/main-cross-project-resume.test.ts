@@ -126,18 +126,23 @@ describe("runRootCommand — cross-project --resume", () => {
 		await fsp.rm(root, { recursive: true, force: true });
 	});
 
-	it("uses the destination cwd and preloads its plugin roots before session creation", async () => {
+	it("uses the destination provider policy and plugin roots before session creation", async () => {
 		const match = buildGlobalMatch(resumedProject);
 		vi.spyOn(sessionListingModule, "resolveResumableSession").mockResolvedValue(match);
-		const settings = Settings.isolated({ "marketplace.autoUpdate": "off" });
-		const reloadForCwd = vi.spyOn(settings, "reloadForCwd");
-		// The switch must warm the destination roots via the shared preload helper
-		// (clearPluginRootsAndCaches only fires an unawaited re-warm), so record the
-		// cwds it is invoked with.
-		const preloadedCwds: (string | undefined)[] = [];
-		vi.spyOn(pluginHelpers, "preloadPluginRoots").mockImplementation(async (_home, cwd) => {
-			preloadedCwds.push(cwd);
+		const settings = Settings.isolated({
+			disabledProviders: [{ path: launchProject, providers: ["claude"] }],
+			"marketplace.autoUpdate": "off",
 		});
+		const reloadForCwd = vi.spyOn(settings, "reloadForCwd");
+		// The launch project disables Claude, but its path-scoped policy must not
+		// leak into the resumed project. Record each requested preload policy.
+		const preloadedCwds: (string | undefined)[] = [];
+		const preloadedPolicies: Array<{ includeClaudeRegistry?: boolean } | undefined> = [];
+		vi.spyOn(pluginHelpers, "preloadPluginRoots").mockImplementation(async (_home, cwd, policy) => {
+			preloadedCwds.push(cwd);
+			preloadedPolicies.push(policy);
+		});
+		const clearPluginRoots = vi.spyOn(pluginHelpers, "clearPluginRootsAndCaches");
 		const authStorage = await AuthStorage.create(path.join(root, "auth.db"));
 		const rawArgs = ["--cwd", launchProject, "--resume", "019e84ed", "--print"];
 		const parsed = parseArgs(rawArgs);
@@ -158,8 +163,8 @@ describe("runRootCommand — cross-project --resume", () => {
 					if (!options) throw new Error("Expected session options");
 					resumedManager = options.sessionManager;
 					sessionOptionsCwd = options.cwd;
-					// Awaited during the switch, so by session creation the destination
-					// preload has already been requested for the resumed project.
+					// Awaited during the switch, so the destination preload has completed
+					// with destination settings before session creation.
 					preloadedDestinationAtCreation = preloadedCwds.includes(resumedProject);
 					throw new Error("stop after session options");
 				},
@@ -180,6 +185,9 @@ describe("runRootCommand — cross-project --resume", () => {
 		expect(parsed.cwd).toBe(resumedProject);
 		expect(sessionOptionsCwd).toBe(resumedProject);
 		expect(preloadedDestinationAtCreation).toBe(true);
+		expect(preloadedPolicies[0]?.includeClaudeRegistry).toBe(false);
+		expect(preloadedPolicies.at(-1)?.includeClaudeRegistry).toBe(true);
+		expect(clearPluginRoots).toHaveBeenCalledWith(undefined, { rewarm: false });
 	}, 15_000);
 
 	it("re-resolves the model scope from the resumed project's enabledModels after the switch", async () => {

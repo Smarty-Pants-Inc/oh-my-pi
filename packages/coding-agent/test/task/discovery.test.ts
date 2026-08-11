@@ -4,12 +4,13 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { disableProvider, enableProvider } from "@oh-my-pi/pi-coding-agent/capability";
 import { clearCache as clearFsCache } from "@oh-my-pi/pi-coding-agent/capability/fs";
+import { clearClaudePluginRootsCache } from "@oh-my-pi/pi-coding-agent/discovery/helpers";
 import {
 	clearOmpExtensionCliRoots,
 	injectOmpExtensionCliRoots,
 } from "@oh-my-pi/pi-coding-agent/discovery/omp-extension-roots";
 import { discoverAgents } from "@oh-my-pi/pi-coding-agent/task/discovery";
-import { removeWithRetries } from "@oh-my-pi/pi-utils";
+import { getPluginsDir, removeWithRetries } from "@oh-my-pi/pi-utils";
 
 const OMP_AGENT_MD = [
 	"---",
@@ -65,11 +66,16 @@ describe("discoverAgents", () => {
 		tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "omp-task-agent-discovery-"));
 		projectDir = path.join(tempHome, "project");
 		await fs.mkdir(projectDir, { recursive: true });
+		enableProvider("claude-plugins");
+		clearClaudePluginRootsCache();
 	});
 
 	afterEach(async () => {
 		enableProvider("omp-plugins");
+		enableProvider("claude-plugins");
 		clearOmpExtensionCliRoots();
+		enableProvider("claude");
+		clearClaudePluginRootsCache();
 		clearFsCache();
 		await removeWithRetries(tempHome);
 	});
@@ -108,6 +114,51 @@ describe("discoverAgents", () => {
 		const names = agents.map(agent => agent.name);
 
 		expect(names).not.toContain("loom-verify-spec");
+	});
+
+	test("keeps OMP marketplace task agents while excluding Claude registry agents when Claude is disabled", async () => {
+		const claudeRoot = path.join(tempHome, "claude-root");
+		const ompRoot = path.join(tempHome, "omp-root");
+		for (const [root, name] of [
+			[claudeRoot, "claude-market-agent"],
+			[ompRoot, "omp-market-agent"],
+		] as const) {
+			await fs.mkdir(path.join(root, "agents"), { recursive: true });
+			await fs.writeFile(
+				path.join(root, "agents", `${name}.md`),
+				["---", `name: ${name}`, `description: ${name}`, "---", "Agent body"].join("\n"),
+			);
+		}
+		const entry = (installPath: string) => ({
+			scope: "user",
+			installPath,
+			version: "1.0.0",
+			installedAt: "2026-01-01T00:00:00Z",
+			lastUpdated: "2026-01-01T00:00:00Z",
+		});
+		const claudeRegistryPath = path.join(tempHome, ".claude", "plugins", "installed_plugins.json");
+		const ompRegistryPath = path.join(getPluginsDir(tempHome), "installed_plugins.json");
+		await Promise.all([
+			fs.mkdir(path.dirname(claudeRegistryPath), { recursive: true }),
+			fs.mkdir(path.dirname(ompRegistryPath), { recursive: true }),
+		]);
+		await Promise.all([
+			fs.writeFile(
+				claudeRegistryPath,
+				JSON.stringify({ version: 2, plugins: { "claude-plugin@market": [entry(claudeRoot)] } }),
+			),
+			fs.writeFile(
+				ompRegistryPath,
+				JSON.stringify({ version: 2, plugins: { "omp-plugin@market": [entry(ompRoot)] } }),
+			),
+		]);
+
+		disableProvider("claude");
+		const { agents } = await discoverAgents(projectDir, tempHome);
+		const names = agents.map(agent => agent.name);
+
+		expect(names).toContain("omp-market-agent");
+		expect(names).not.toContain("claude-market-agent");
 	});
 
 	test("CLI extension agents win over project `extensions:` settings on dedup", async () => {
