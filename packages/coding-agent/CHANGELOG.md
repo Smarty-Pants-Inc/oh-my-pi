@@ -5,6 +5,11 @@
 ### Added
 
 - Added `pi.registerSystemPromptBuilder()` so one extension can replace the provider-facing base prompt on initial load and rebuilds while reusing OMP's stock renderer with a complete template set.
+
+### Fixed
+
+- Fixed stale todo lifecycle handling: guidance now distinguishes finished, blocked, abandoned, and obsolete tasks; completed subagent results bring blocked parent work into the next stop-time reconciliation; supported native providers, including Google, receive a named `todo` tool choice while owned/in-band dialects enforce it locally; read-only `todo view` calls no longer reset the drift reminder; and the interactive UI no longer writes fuzzy, non-persisted subagent matches into canonical todo state.
+
 ## [17.2.12] - 2026-08-08
 
 ### Fixed

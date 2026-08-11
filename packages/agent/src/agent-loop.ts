@@ -119,6 +119,13 @@ function hardToolChoiceBlocks(choice: ToolChoice | undefined, requiredTool: stri
 	return name !== requiredTool;
 }
 
+/** Return the named tool targeted by a provider-specific hard choice. */
+function namedToolChoice(choice: ToolChoice | undefined): string | undefined {
+	if (!choice || typeof choice === "string") return undefined;
+	if (choice.type === "computer") return "computer";
+	return choice.type === "tool" ? choice.name : "function" in choice ? choice.function.name : choice.name;
+}
+
 /**
  * Cadence (ms) for polling queued steering while an `interruptible` tool is in
  * flight, so a steer cuts the wait short instead of sitting idle until the
@@ -1301,37 +1308,37 @@ async function runLoopBody(
 					hasMoreToolCalls = false;
 				}
 
-				// A turn is compliant ONLY when it calls the required tool and nothing
-				// else — mirroring the forced-tool_choice turn, which can emit only that
-				// tool. A required+detour batch is treated as non-compliant so detour
-				// tools never run side effects while the requirement is still pending.
+				// Owned/in-band dialects cannot send native tool_choice, so emulate a
+				// named hard choice with the same local gate used by soft requirements.
+				// Keep the consumed host directive live across retries until the model
+				// calls only the required tool; detour calls are paired but never run.
+				const ownedHardRequiredTool = preparedProviderCall.ownedDialect
+					? namedToolChoice(hostToolChoice ?? config.toolChoice)
+					: undefined;
+				const requiredTool = ownedHardRequiredTool ?? softRequiredTool;
+				const requiredSatisfies = ownedHardRequiredTool === undefined ? softSatisfies : undefined;
 				const calledOnlyRequiredTool =
-					softRequiredTool !== undefined &&
+					requiredTool !== undefined &&
 					toolCalls.length > 0 &&
-					toolCalls.every(toolCall => softSatisfies?.(toolCall) ?? toolCall.name === softRequiredTool);
-				const softGateActive =
-					softRequiredTool !== undefined && !hardToolChoiceBlocks(config.toolChoice, softRequiredTool);
-				const softNonCompliant = softGateActive && !calledOnlyRequiredTool;
+					toolCalls.every(toolCall => requiredSatisfies?.(toolCall) ?? toolCall.name === requiredTool);
+				const requirementActive =
+					requiredTool !== undefined &&
+					(ownedHardRequiredTool !== undefined || !hardToolChoiceBlocks(config.toolChoice, requiredTool));
+				const requirementNonCompliant = requirementActive && !calledOnlyRequiredTool;
 
 				const toolResults: ToolResultMessage[] = [];
-				if (softNonCompliant && softRequiredTool !== undefined) {
+				if (requirementNonCompliant && requiredTool !== undefined) {
 					if (softRequirementState.escalations >= MAX_SOFT_TOOL_ESCALATIONS) {
 						throw new Error(
-							`Soft tool requirement '${softRequiredTool}' was not satisfied after ${MAX_SOFT_TOOL_ESCALATIONS} forced turns; aborting to avoid an unbounded force loop.`,
+							`Required tool '${requiredTool}' was not satisfied after ${MAX_SOFT_TOOL_ESCALATIONS} retry turns; aborting to avoid an unbounded force loop.`,
 						);
 					}
-					// A soft-required tool is pending but the model called something else
-					// (or yielded). Do NOT execute the detour — pair each call with a
-					// skipped result and force the required tool next turn. This is the
-					// only turn that changes toolChoice; a model that complies with the
-					// reminder pays no message-cache invalidation. Re-engage so the loop
-					// never yields while the requirement is unmet.
 					for (const toolCall of toolCalls) {
 						const result = createAbortedToolResult(
 							toolCall,
 							stream,
 							"skipped",
-							`Not executed: call the \`${softRequiredTool}\` tool to resolve the pending action before using other tools.`,
+							`Not executed: call the \`${requiredTool}\` tool to resolve the pending action before using other tools.`,
 						);
 						currentContext.messages.push(result);
 						newMessages.push(result);
@@ -1342,7 +1349,13 @@ async function runLoopBody(
 							status: "skipped",
 						});
 					}
-					softRequirementState.forcedToolChoice = { type: "tool", name: softRequiredTool };
+					if (ownedHardRequiredTool !== undefined) {
+						// The queue source is consuming. Do not fetch the next directive until
+						// this in-band model has satisfied the current named choice.
+						directiveResolvedForTurn = true;
+					} else {
+						softRequirementState.forcedToolChoice = { type: "tool", name: requiredTool };
+					}
 					softRequirementState.escalations++;
 					hasMoreToolCalls = true;
 				} else if (hasMoreToolCalls) {

@@ -8,7 +8,7 @@
 - Key collaborators:
   - `packages/coding-agent/src/tools/index.ts` — registers tool, exposes session hooks, gates availability.
   - `packages/coding-agent/src/modes/controllers/event-controller.ts` — updates the visible todo UI on tool completion.
-  - `packages/coding-agent/src/session/agent-session.ts` — stores cached phases, strips done/dropped tasks on session resume, emits failure reminders.
+  - `packages/coding-agent/src/session/agent-session.ts` — stores cached phases, restores the latest persisted snapshot, emits reconciliation reminders, and forces `todo` on supported stop-time continuations.
   - `packages/coding-agent/src/modes/controllers/todo-command-controller.ts` — `/todo` command path, custom-entry persistence, transcript reminder injection.
   - `packages/coding-agent/src/tools/render-utils.ts` — collapsed-preview cap for renderer trees.
 
@@ -116,13 +116,14 @@ The same file also exposes non-tool helpers used by `/todo`:
   - Mutates the session todo cache through `setTodoPhases`.
   - `storage` reports whether the session has a backing session file, but the tool does not append a custom session entry itself.
   - Successful tool-result messages carry `details.phases`; `getLatestTodoPhasesFromEntries(...)` can reconstruct state later from those transcript entries.
+  - Successful `task` results and delivered async task completions arm the next stop-time reconciliation so blocked parent items are reviewed; they never mutate canonical todo status directly.
   - Failed `todo` results cause `agent-session` to enqueue a hidden next-turn reminder (`customType: "todo-error-reminder"`).
 - User-visible prompts / interactive UI
   - Transcript block is rendered by `todoToolRenderer` and merged with the call line.
   - `event-controller` updates the visible todo panel from successful results.
   - On error, `event-controller` shows `Todo update failed...`; the visible panel may stay stale until a later successful call.
 - Background work / cancellation
-  - Session-level auto-clear of `completed`/`abandoned` tasks was removed (the timer mutated canonical phases between tool calls); the TUI todo widget still clears closed entries after `tasks.todoClearDelay` (display-only, `packages/coding-agent/src/modes/interactive-mode.ts`).
+  - Canonical todo state changes only through persisted todo/manual-edit paths. The TUI widget still hides closed entries after `tasks.todoClearDelay` (display-only, `packages/coding-agent/src/modes/interactive-mode.ts`).
 
 ## Limits & Caps
 - `init.list`: applies to a single op (`todoSchema`). The params object carries exactly one op.
@@ -163,6 +164,6 @@ The same file also exposes non-tool helpers used by `/todo`:
 - Reload persistence differs by path:
   - plain `todo` calls survive in transcript tool-result details;
   - `/todo` command edits additionally append `customType: "user_todo_edit"` entries and inject a visible-to-model `<system-reminder>` developer message describing the manual edit.
-- On session resume, `AgentSession.#syncTodoPhasesFromBranch()` strips `completed` and `abandoned` tasks before restoring the cached list. The `/todo` command works around that by reading the latest transcript/custom-entry state so historical done/dropped tasks still appear to the user.
+- On session resume, `TodoTracker.syncFromBranch()` restores the latest persisted todo snapshot as-is. Display-only closed-row auto-clear never mutates that canonical state.
 - Tool availability is gated by `todo.enabled`, and the registry excludes it when `includeYield` is enabled unless the session is prewalk-armed (`packages/coding-agent/src/tools/index.ts`).
 - Subagents do not inherit `todo`; `packages/coding-agent/src/task/executor.ts` also filters it from the active set as a parent-owned tool. Exception (both layers): prewalk-armed subagents keep it — the prewalk plan nudge and todo gate require the child to commit its own todo list before the hand-off.

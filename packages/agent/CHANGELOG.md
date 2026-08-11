@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Enforced named hard tool choices locally for owned/in-band tool dialects, which cannot send native `tool_choice`, instead of silently allowing a text-only stop.
+
 ## [17.2.10] - 2026-08-06
 
 ### Fixed

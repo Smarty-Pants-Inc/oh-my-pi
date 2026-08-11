@@ -1,12 +1,11 @@
 import type { Api, Model, ToolChoice } from "@oh-my-pi/pi-ai";
 
-/**
- * Build a provider-aware tool choice that targets one specific tool when supported.
- * Providers that only expose required/any forcing may still honor named choices by
- * narrowing their request tool list before transport.
- */
+/** Build a provider-aware tool choice that targets one specific tool when supported. */
 export function buildNamedToolChoice(toolName: string, model?: Model<Api>): ToolChoice | undefined {
 	if (!model) return undefined;
+	const compat = model.compat;
+	if (compat && "supportsToolChoice" in compat && compat.supportsToolChoice === false) return undefined;
+	if (compat && "supportsForcedToolChoice" in compat && compat.supportsForcedToolChoice === false) return undefined;
 
 	if (model.api === "anthropic-messages" || model.api === "bedrock-converse-stream") {
 		return { type: "tool", name: toolName };
@@ -26,7 +25,7 @@ export function buildNamedToolChoice(toolName: string, model?: Model<Api>): Tool
 	}
 
 	if (model.api === "google-generative-ai" || model.api === "google-gemini-cli" || model.api === "google-vertex") {
-		return "required";
+		return { type: "function", name: toolName };
 	}
 
 	return undefined;

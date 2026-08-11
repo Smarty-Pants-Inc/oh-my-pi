@@ -102,6 +102,105 @@ describe("agentLoop with owned in-band tool calls", () => {
 		expect(wireText(internalResult!)).toBe("echoed:hello world");
 	});
 
+	it("enforces a named hard choice locally for owned dialects", async () => {
+		let todoRuns = 0;
+		let choiceCalls = 0;
+		const todoSchema = type({ op: "string" });
+		const todoTool: AgentTool<typeof todoSchema, { op: string }> = {
+			name: "todo",
+			label: "Todo",
+			description: "Update task state",
+			parameters: todoSchema,
+			async execute(_toolCallId, params) {
+				todoRuns++;
+				return { content: [{ type: "text", text: "updated" }], details: params };
+			},
+		};
+		const mock = createMockModel({
+			responses: [
+				{ content: ["finished without reconciling"] },
+				{
+					content: ["<tool_call>todo\n<arg_key>op</arg_key>\n<arg_value>view</arg_value>\n</tool_call>"],
+				},
+				{ content: ["done"] },
+			],
+		});
+		const context: AgentContext = { systemPrompt: ["BASE PROMPT"], messages: [], tools: [todoTool] };
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			dialect: "glm",
+			getToolChoice: () => (++choiceCalls === 1 ? { type: "tool", name: "todo" } : undefined),
+		};
+
+		await agentLoop([createUserMessage("finish")], context, config, undefined, mock.stream).result();
+
+		expect(todoRuns).toBe(1);
+		expect(choiceCalls).toBe(2);
+		expect(mock.calls).toHaveLength(3);
+		expect(mock.calls.every(call => call.options?.toolChoice === undefined)).toBe(true);
+	});
+
+	it("preserves a conflicting hard choice over a soft requirement in owned dialects", async () => {
+		let todoRuns = 0;
+		let resolveRuns = 0;
+		let resolvePending = true;
+		const schema = type({ op: "string" });
+		let config: AgentLoopConfig;
+		const todoTool: AgentTool<typeof schema, { op: string }> = {
+			name: "todo",
+			label: "Todo",
+			description: "Hard-required tool",
+			parameters: schema,
+			async execute(_toolCallId, params) {
+				todoRuns++;
+				config.toolChoice = undefined;
+				return { content: [{ type: "text", text: "todo updated" }], details: params };
+			},
+		};
+		const resolveTool: AgentTool<typeof schema, { op: string }> = {
+			name: "resolve",
+			label: "Resolve",
+			description: "Soft-required tool",
+			parameters: schema,
+			async execute(_toolCallId, params) {
+				resolveRuns++;
+				resolvePending = false;
+				return { content: [{ type: "text", text: "resolved" }], details: params };
+			},
+		};
+		const mock = createMockModel({
+			responses: [
+				{
+					content: ["<tool_call>todo\n<arg_key>op</arg_key>\n<arg_value>done</arg_value>\n</tool_call>"],
+				},
+				{
+					content: ["<tool_call>resolve\n<arg_key>op</arg_key>\n<arg_value>apply</arg_value>\n</tool_call>"],
+				},
+				{ content: ["done"] },
+			],
+		});
+		const reminder = createUserMessage("<system-reminder>Resolve the pending preview.</system-reminder>");
+		config = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			dialect: "glm",
+			toolChoice: { type: "tool", name: "todo" },
+			getToolChoice: () =>
+				resolvePending
+					? { soft: true as const, id: "preview", toolName: "resolve", reminder: [reminder] }
+					: undefined,
+		};
+		const context: AgentContext = { systemPrompt: ["BASE PROMPT"], messages: [], tools: [todoTool, resolveTool] };
+
+		await agentLoop([createUserMessage("finish")], context, config, undefined, mock.stream).result();
+
+		expect(todoRuns).toBe(1);
+		expect(resolveRuns).toBe(1);
+		expect(mock.calls).toHaveLength(3);
+		expect(mock.calls.every(call => call.options?.toolChoice === undefined)).toBe(true);
+	});
+
 	it("prunes native tool descriptions from the wire when pruneToolDescriptions is set", async () => {
 		const toolSchema = type({ msg: type("string").describe("the message to echo") });
 		const echoTool: AgentTool<typeof toolSchema, { msg: string }> = {
