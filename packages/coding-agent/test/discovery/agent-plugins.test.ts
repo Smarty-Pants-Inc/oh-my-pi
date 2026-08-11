@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { loadCapability } from "@oh-my-pi/pi-coding-agent/capability";
+import { disableProvider, enableProvider, loadCapability } from "@oh-my-pi/pi-coding-agent/capability";
 import { clearCache as clearFsCache } from "@oh-my-pi/pi-coding-agent/capability/fs";
 import {
 	AGENT_PLUGIN_MANIFEST_SCHEMA,
@@ -503,6 +503,27 @@ describe("agent-plugins discovery", () => {
 		expect(skills.warnings.filter(warning => warning.includes("[agent-plugins]"))).toEqual([]);
 		expect(mcps.warnings.filter(warning => warning.includes("[agent-plugins]"))).toEqual([]);
 		expect(mcps.all.filter(server => server.name.startsWith("std-plugin:"))).toEqual([]);
+	});
+
+	test("keeps the Agent Plugin parser usable for an explicit root when Claude is disabled", async () => {
+		await writeManifest();
+		await writeSkill("explicit-skill", "name: explicit-skill\ndescription: Explicit skill");
+
+		try {
+			await injectPluginDirRoots(tempDir, [pluginPath], tempDir, { includeClaudeRegistry: false });
+			expect(
+				(await listClaudePluginRoots(tempDir, tempDir, { includeClaudeRegistry: false })).roots.map(
+					root => root.path,
+				),
+			).toContain(pluginPath);
+			disableProvider("claude");
+			const skills = await loadCapability<Skill>("skills", { cwd: tempDir });
+
+			expect(skills.all.find(skill => skill.name === "explicit-skill")?._source.provider).toBe("agent-plugins");
+		} finally {
+			enableProvider("claude");
+			await injectPluginDirRoots(tempDir, []);
+		}
 	});
 
 	test("loads a plugin from a directory via --plugin-dir with the manifest name", async () => {

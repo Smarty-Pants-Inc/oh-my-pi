@@ -3,6 +3,7 @@
  * Handles TUI rendering and user interaction, delegating business logic to AgentSession.
  */
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import {
 	type Agent,
@@ -53,7 +54,7 @@ import {
 	setProjectDir,
 } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
-import { reset as resetCapabilities } from "../capability";
+import { initializeWithSettings, isProviderEnabled, reset as resetCapabilities } from "../capability";
 import type { CollabGuestLink } from "../collab/guest";
 import type { CollabHost } from "../collab/host";
 import { KeybindingsManager } from "../config/keybindings";
@@ -66,7 +67,7 @@ import {
 	Settings,
 	settings,
 } from "../config/settings";
-import { clearClaudePluginRootsCache } from "../discovery/helpers";
+import { clearClaudePluginRootsCache, preloadPluginRoots } from "../discovery/helpers";
 import type {
 	AutocompleteProviderFactory,
 	ContextUsage,
@@ -1343,6 +1344,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		// up the destination project's configuration.
 		if (isSettingsInitialized()) {
 			await settings.reloadForCwd(newCwd);
+			initializeWithSettings(settings);
 			// Reapply provider preferences from the newly-loaded settings so the
 			// module-level search/image provider state reflects the destination
 			// project's configuration. Without this, the previous project's
@@ -1351,9 +1353,12 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 		// Re-warm plugin roots, capabilities, slash commands, and the ssh tool so
 		// the next prompt sees everything scoped to the new project directory.
-		clearClaudePluginRootsCache();
-		await this.refreshTitleSystemPrompt(newCwd);
+		clearClaudePluginRootsCache({ rewarm: false });
 		resetCapabilities();
+		await preloadPluginRoots(os.homedir(), newCwd, {
+			includeClaudeRegistry: isProviderEnabled("claude"),
+		});
+		await this.refreshTitleSystemPrompt(newCwd);
 		await this.refreshSkillState();
 		await this.refreshSlashCommandState(newCwd);
 		setSessionTerminalTitle(this.sessionManager.getSessionName(), this.sessionManager.getCwd());

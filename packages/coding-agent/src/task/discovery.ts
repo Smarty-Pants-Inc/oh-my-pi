@@ -60,11 +60,9 @@ async function loadAgentsFromDir(dir: string, source: AgentSource): Promise<Agen
 
 /**
  * Discover agents from filesystem and merge with bundled agents.
- * Precedence (highest wins): project `.omp/agents`, user `.omp/agents`,
- * OMP extension-package agents in `listOmpExtensionRoots` source order
- * (CLI roots > project `extensions:` settings > user `extensions:` settings >
- * installed npm/link plugins), Claude marketplace plugin agents (project
- * scope before user), then bundled.
+ * Precedence (highest wins): project `.omp/agents`, user `.omp/agents`, OMP
+ * extension-package agents in source order, shared plugin-registry agents
+ * (project scope before user), then bundled.
  * @param cwd - Current working directory for project agent discovery
  */
 export async function discoverAgents(cwd: string, home: string = os.homedir()): Promise<DiscoveryResult> {
@@ -104,9 +102,9 @@ export async function discoverAgents(cwd: string, home: string = os.homedir()): 
 		orderedDirs.push({ dir: path.join(root.path, "agents"), source: root.level });
 	}
 
-	// Load agents from Claude Code marketplace plugins (respects disabledProviders)
+	// Keep the parser-provider gate separate from the ambient Claude source policy.
 	const { roots: pluginRoots } = isProviderEnabled("claude-plugins")
-		? await listClaudePluginRoots(home, resolvedCwd)
+		? await listClaudePluginRoots(home, resolvedCwd, { includeClaudeRegistry: isProviderEnabled("claude") })
 		: { roots: [] };
 	const sortedPluginRoots = [...pluginRoots].sort((a, b) => {
 		if (a.scope === b.scope) return 0;

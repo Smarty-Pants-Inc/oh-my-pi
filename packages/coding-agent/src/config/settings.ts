@@ -1038,14 +1038,10 @@ export class Settings {
 	// ─────────────────────────────────────────────────────────────────────────
 
 	async #load(): Promise<Settings> {
-		// Project settings discovery is independent of the persist chain, while
-		// the persist steps themselves remain sequential. Wait for both branches
-		// to settle so simultaneous failures produce one catchable error without
-		// abandoning the other rejection.
-		const [globalResult, projectResult] = await Promise.allSettled([
-			this.#persist ? this.#loadGlobalSettings() : Promise.resolve(),
-			this.#loadProjectSettings(),
-		]);
+		// Project capability discovery must honor the global provider policy, so
+		// settle that layer before asking providers for project settings.
+		const [globalResult] = await Promise.allSettled([this.#persist ? this.#loadGlobalSettings() : Promise.resolve()]);
+		const [projectResult] = await Promise.allSettled([this.#loadProjectSettings()]);
 		if (globalResult.status === "rejected") throw globalResult.reason;
 		if (projectResult.status === "rejected") throw projectResult.reason;
 
@@ -1070,15 +1066,14 @@ export class Settings {
 	}
 
 	async #loadReadOnly(): Promise<Settings> {
-		const [globalResult, projectResult] = await Promise.allSettled([
-			this.#loadExistingMainYaml(),
-			this.#loadProjectSettings(),
-		]);
-		if (globalResult.status === "rejected") throw globalResult.reason;
-		if (projectResult.status === "rejected") throw projectResult.reason;
-		if (globalResult.value) {
+		const [globalResult] = await Promise.allSettled([this.#loadExistingMainYaml()]);
+		if (globalResult.status === "fulfilled" && globalResult.value) {
 			this.#global = globalResult.value;
 		}
+
+		const [projectResult] = await Promise.allSettled([this.#loadProjectSettings()]);
+		if (globalResult.status === "rejected") throw globalResult.reason;
+		if (projectResult.status === "rejected") throw projectResult.reason;
 
 		this.#project = projectResult.value;
 		this.#configOverlay = await this.#loadConfigOverlays();
@@ -1232,8 +1227,16 @@ export class Settings {
 	async #loadProjectSettings(): Promise<RawSettings> {
 		this.#projectShellPathSource = undefined;
 		let merged: RawSettings = {};
+		const globalDisabledProviders = getByPath(this.#global, SETTING_PATH_SEGMENTS.disabledProviders);
+		const excludeProviders =
+			resolvePathScopedStringArray("disabledProviders", globalDisabledProviders, this.#cwd) ??
+			stringArrayFromUnknown(globalDisabledProviders);
 		try {
-			const result = await loadCapability(settingsCapability.id, { cwd: this.#cwd });
+			const result = await loadCapability(settingsCapability.id, {
+				cwd: this.#cwd,
+				excludeProviders,
+				ignoreDisabledProviders: true,
+			});
 			for (const item of result.items as SettingsCapabilityItem[]) {
 				if (item.level === "project") {
 					merged = this.#deepMerge(merged, item.data as RawSettings);
