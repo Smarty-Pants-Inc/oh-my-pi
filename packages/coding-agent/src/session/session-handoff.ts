@@ -14,6 +14,7 @@ import { logger, Snowflake } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
 import type { Settings } from "../config/settings";
 import type { ExtensionRunner, SessionBeforeSwitchResult } from "../extensibility/extensions";
+import { copyLocalArtifacts, resolveLocalUrlToPath } from "../internal-urls";
 import { obfuscateProviderContext } from "../secrets/message-transform";
 import type { SecretObfuscator } from "../secrets/obfuscator";
 import type { HandoffResult, SessionHandoffOptions } from "./agent-session-types";
@@ -258,6 +259,13 @@ export class SessionHandoff {
 				await this.#host.extensionRunner.emit({ type: "session_switch", reason: "handoff", previousSessionFile });
 			}
 
+			// Snapshot the outgoing session's local:// root before newSession() changes
+			// the session id and therefore the active local artifact root.
+			const localProtocolOptions = {
+				getArtifactsDir: () => this.#host.sessionManager.getArtifactsDir(),
+				getSessionId: () => this.#host.sessionManager.getSessionId(),
+			};
+			const previousLocalRoot = resolveLocalUrlToPath("local://", localProtocolOptions);
 			await this.#host.sessionManager.newSession(
 				previousSessionFile ? { parentSession: previousSessionFile } : undefined,
 			);
@@ -266,6 +274,17 @@ export class SessionHandoff {
 			this.#host.syncAgentSessionId(false, false);
 			this.#host.rekeyMemoryForCurrentSessionId();
 			await this.#host.resetMemoryContextForNewTranscript();
+
+			// Artifact continuity is best-effort. Any later transition failure still
+			// rolls back through the lifecycle transaction and removes this target.
+			try {
+				const newLocalRoot = resolveLocalUrlToPath("local://", localProtocolOptions);
+				await copyLocalArtifacts(previousLocalRoot, newLocalRoot);
+			} catch (error) {
+				logger.warn("Failed to copy local artifacts into handoff session", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
 
 			const handoffContent = createHandoffContext(handoffText);
 			this.#host.sessionManager.appendCustomMessageEntry("handoff", handoffContent, true, undefined, "agent");
