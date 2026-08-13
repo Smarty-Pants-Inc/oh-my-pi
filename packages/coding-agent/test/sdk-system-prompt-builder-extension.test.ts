@@ -88,6 +88,7 @@ describe("extension system prompt builders", () => {
 			pi.registerSystemPromptBuilder(context =>
 				context.build({
 					...context.templates,
+					system: `${context.templates.system}\n<system-template-marker>builder-system</system-template-marker>`,
 					project: `${context.templates.project}\n<builder-marker>{{cwd}}</builder-marker>`,
 				}),
 			);
@@ -95,7 +96,7 @@ describe("extension system prompt builders", () => {
 		const { session, auth } = await createTestSession(tempDir, [extension]);
 		try {
 			const prompt = session.systemPrompt.join("\n");
-			expect(prompt).toContain("ROLE");
+			expect(prompt).toContain("<system-template-marker>builder-system</system-template-marker>");
 			expect(prompt).toContain(`<builder-marker>${tempDir.path()}</builder-marker>`);
 		} finally {
 			await session.dispose();
