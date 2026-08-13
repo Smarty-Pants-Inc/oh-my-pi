@@ -172,6 +172,7 @@ export const COLLAB_PROMPT_MESSAGE_TYPE = "collab-prompt";
 /** `details` shape of `custom_message` entries with `customType === "collab-prompt"`. */
 export interface CollabPromptDetails {
 	from?: string;
+	displayNameRevision?: number;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -333,7 +334,7 @@ export type GuestFrame =
 			 */
 			writeToken?: string;
 	  }
-	| { t: "prompt"; text: string; images?: ImageContent[] }
+	| { t: "prompt"; text: string; images?: ImageContent[]; displayName?: string }
 	| { t: "ui-response"; reqId: number; value?: CollabUiResponseValue }
 	| { t: "abort" }
 	| { t: "agent-cmd"; cmd: "chat" | "kill" | "revive"; agentId: string; text?: string }
@@ -394,7 +395,7 @@ export type WireFrame = GuestFrame | HostFrame;
  *   grammar would silently drop `ui-request` (asks hang forever on the
  *   host), so they must be rejected at hello.
  */
-export const COLLAB_PROTO = 3;
+export const COLLAB_PROTO = 4;
 
 /** Parameter key used for intent tracing (e.g. prompt explanation/reasoning) */
 export const INTENT_FIELD = "i";

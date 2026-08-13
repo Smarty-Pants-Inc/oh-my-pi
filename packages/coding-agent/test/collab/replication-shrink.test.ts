@@ -291,6 +291,16 @@ describe("shrinkForReplication (#3740 review)", () => {
 		expect(shrunk.content).toContain("chars elided for collab session");
 	});
 
+	it("measures UTF-8 bytes with local bridge wrapper headroom", () => {
+		const value = { content: "é".repeat(600_000) };
+		const shrunk = shrinkForReplication(value);
+		expect(shrunk).not.toBe(value);
+		expect(Buffer.byteLength(JSON.stringify(shrunk))).toBeLessThanOrEqual(MAX_REPLICATED_PAYLOAD_BYTES);
+		expect(
+			Buffer.byteLength(JSON.stringify({ t: "frame", targetPeer: 0, mutation: false, frame: shrunk })),
+		).toBeLessThan(1024 * 1024);
+	});
+
 	it("clamps a payload built of many short strings (no individual oversized) under the cap", () => {
 		// Realistic shape: a tool result content array with thousands of small
 		// text blocks. ~3 MB total; no individual string crosses the 64 B

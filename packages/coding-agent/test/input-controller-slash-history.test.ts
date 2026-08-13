@@ -186,6 +186,24 @@ describe("input controller — slash command history (#3148)", () => {
 		expect(addToHistory).toHaveBeenCalledWith(input);
 		expect(showStatus).toHaveBeenCalledWith("Queued 3 messages for when the agent yields");
 	});
+
+	it("keeps an oversized local collab prompt and images after synchronous send failure", async () => {
+		const { ctx, editor } = makeCtx();
+		const image: ImageContent = { type: "image", data: "image-data", mimeType: "image/png" };
+		const sendPrompt = vi.fn(() => false);
+		ctx.collabGuest = { readOnly: false, sendPrompt } as unknown as typeof ctx.collabGuest;
+		editor.setText("too large for the local bridge");
+		editor.pendingImages = [image];
+		editor.pendingImageLinks = ["file:///draft.png"];
+		controllerFor(ctx);
+
+		await editor.onSubmit?.("too large for the local bridge");
+
+		expect(sendPrompt).toHaveBeenCalledWith("too large for the local bridge", [image]);
+		expect(editor.getText()).toBe("too large for the local bridge");
+		expect(editor.pendingImages).toEqual([image]);
+		expect(editor.pendingImageLinks).toEqual(["file:///draft.png"]);
+	});
 });
 
 describe("yield queue list parsing", () => {
