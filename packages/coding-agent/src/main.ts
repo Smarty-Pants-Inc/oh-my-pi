@@ -25,7 +25,7 @@ import {
 } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { reset as resetCapabilities } from "./capability";
-import { type Args, reportUnrecognizedFlags } from "./cli/args";
+import { type Args, reportUnrecognizedFlags, validateToolNames } from "./cli/args";
 import { applyExtensionFlags, type ExtensionFlagSink } from "./cli/extension-flags";
 import { processFileArguments } from "./cli/file-processor";
 import { buildInitialMessage } from "./cli/initial-message";
@@ -459,7 +459,7 @@ export interface AcpSessionFactoryOptions {
 	sessionDir?: string;
 	authStorage: AuthStorage;
 	modelRegistry: ModelRegistry;
-	parsedArgs: Pick<Args, "apiKey" | "trustedExtensions">;
+	parsedArgs: Pick<Args, "apiKey" | "trustedExtensions" | "tools">;
 	rawArgs: string[];
 	createSession: (options: CreateAgentSessionOptions) => Promise<CreateAgentSessionResult>;
 }
@@ -535,7 +535,27 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 		if (args.parsedArgs.apiKey && !args.baseOptions.model && nextSession.model) {
 			args.authStorage.setRuntimeApiKey(nextSession.model.provider, args.parsedArgs.apiKey);
 		}
-		applyExtensionFlags(nextSession.extensionRunner, args.rawArgs);
+		const runner = nextSession.extensionRunner;
+		const reparsedArgs = applyExtensionFlags(
+			runner
+				? {
+						getFlags: () => runner.getFlags(),
+						setFlagValue: (name, value) => {
+							runner.setFlagValue(name, value);
+						},
+					}
+				: undefined,
+			args.rawArgs,
+		);
+		const requestedTools = reparsedArgs?.tools ?? args.parsedArgs.tools;
+		if (requestedTools) {
+			try {
+				validateToolNames(requestedTools, nextSession.getAllToolNames());
+			} catch (error) {
+				await nextSession.dispose();
+				throw error;
+			}
+		}
 		return nextSession;
 	};
 }
@@ -1862,6 +1882,13 @@ export async function runRootCommand(
 				const thinkingLevel = event.configured ?? event.thinkingLevel;
 				activeCompanionController.setThinkingLevel(thinkingLevel === "inherit" ? undefined : thinkingLevel);
 			});
+		}
+
+		try {
+			validateToolNames(initialArgs.tools, session.getAllToolNames());
+		} catch (error) {
+			await session.dispose();
+			throw error;
 		}
 
 		// Cold-revive support: a `parked` subagent ref restored from disk (Agent Hub

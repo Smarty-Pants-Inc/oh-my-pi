@@ -438,9 +438,14 @@ export interface ExtensionModelQuery {
 	family(model: Model): string;
 }
 
+/** Runtime host mode exposed to Pi-compatible extensions. */
+export type ExtensionMode = "tui" | "rpc" | "json" | "print";
+
 export interface ExtensionContext {
 	/** UI methods for user interaction */
 	ui: ExtensionUIContext;
+	/** Current run mode. Use `"tui"` to guard terminal-only UI such as custom components. */
+	mode: ExtensionMode;
 	/** Get current context usage for the active model. */
 	getContextUsage(): ContextUsage | undefined;
 	/** Whether manual or automatic context compaction is currently active. */

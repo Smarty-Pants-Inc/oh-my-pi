@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import { Agent, AppendOnlyContextManager } from "@oh-my-pi/pi-agent-core";
 import type { ProviderSessionState } from "@oh-my-pi/pi-ai";
@@ -17,6 +17,20 @@ interface FreshHarness {
 }
 
 const cleanup: Array<() => Promise<void>> = [];
+let sharedDir: TempDir;
+let authStorage: AuthStorage;
+let modelRegistry: ModelRegistry;
+
+beforeAll(async () => {
+	sharedDir = TempDir.createSync("@pi-agent-session-fresh-shared-");
+	authStorage = await AuthStorage.create(path.join(sharedDir.path(), "auth.db"));
+	modelRegistry = new ModelRegistry(authStorage, path.join(sharedDir.path(), "models.yml"));
+});
+
+afterAll(() => {
+	authStorage.close();
+	sharedDir.removeSync();
+});
 
 afterEach(async () => {
 	while (cleanup.length > 0) {
@@ -27,8 +41,6 @@ afterEach(async () => {
 
 async function createFreshHarness(extensionRunner?: ExtensionRunner): Promise<FreshHarness> {
 	const tempDir = TempDir.createSync("@pi-agent-session-fresh-");
-	const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
-	const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
 	const sessionManager = SessionManager.create(tempDir.path(), path.join(tempDir.path(), "sessions"));
 	const agent = new Agent({
 		initialState: {
@@ -46,7 +58,6 @@ async function createFreshHarness(extensionRunner?: ExtensionRunner): Promise<Fr
 	});
 	cleanup.push(async () => {
 		await session.dispose();
-		authStorage.close();
 		tempDir.removeSync();
 	});
 	return { agent, session, sessionManager };

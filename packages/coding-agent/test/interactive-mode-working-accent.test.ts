@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterAll, afterEach, describe, expect, it, vi } from "bun:test";
 import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
 import { interruptHint } from "@oh-my-pi/pi-coding-agent/modes/shared";
@@ -15,17 +15,26 @@ type Harness = {
 	tempDir: TempDir;
 };
 
-let harnesses: Harness[] = [];
+const harnesses = new Map<"ordinary" | "companion", Harness>();
 
 function defined<T>(value: T | undefined): T {
-	expect(value).toBeDefined();
-	return value as T;
+	if (value === undefined) throw new Error("Expected value to be defined");
+	return value;
 }
 
 async function createHarness(
 	sessionName: string,
 	companionStatusTextSink?: (statusText?: string) => void,
 ): Promise<Harness> {
+	const key = companionStatusTextSink === undefined ? "ordinary" : "companion";
+	const existing = harnesses.get(key);
+	if (existing) {
+		existing.mode.loadingAnimation?.stop();
+		existing.mode.loadingAnimation = undefined;
+		existing.mode.statusContainer.disposeChildren();
+		await existing.sessionManager.setSessionName(sessionName, "user");
+		return existing;
+	}
 	const tempDir = TempDir.createSync("@pi-working-accent-");
 	await Settings.init({ inMemory: true, cwd: tempDir.path() });
 	await initTheme(false);
@@ -58,7 +67,7 @@ async function createHarness(
 		companionStatusTextSink,
 	);
 	const harness = { mode, sessionManager, tempDir };
-	harnesses.push(harness);
+	harnesses.set(companionStatusTextSink === undefined ? "ordinary" : "companion", harness);
 	return harness;
 }
 
@@ -82,12 +91,15 @@ function shadowAccentSurfaceLuminance(value: number | undefined): () => void {
 }
 
 afterEach(() => {
-	for (const harness of harnesses) {
+	vi.restoreAllMocks();
+});
+
+afterAll(() => {
+	for (const harness of harnesses.values()) {
 		harness.mode.stop();
 		harness.tempDir.removeSync();
 	}
-	harnesses = [];
-	vi.restoreAllMocks();
+	harnesses.clear();
 	resetSettingsForTest();
 });
 

@@ -17,6 +17,7 @@ import { invalidate as invalidateFsCache, readDirEntries, readFile } from "../ca
 import { parseRuleConditionAndScope, type Rule, type RuleFrontmatter } from "../capability/rule";
 import type { Skill, SkillFrontmatter } from "../capability/skill";
 import type { LoadContext, LoadResult, SourceMeta } from "../capability/types";
+import { resolveClaudePaths } from "../config/claude-paths";
 import type { MCPRequestIdFormat } from "../mcp/types";
 import { type ConfiguredThinkingLevel, parseConfiguredThinkingLevel } from "../thinking";
 import { normalizeToolNames } from "../tools/builtin-names";
@@ -91,10 +92,9 @@ export type SourceId = keyof typeof SOURCE_PATHS;
  */
 export function getUserPath(ctx: LoadContext, source: SourceId, subpath: string): string | null {
 	// Native user config is profile-scoped via getAgentDir() (the active profile's
-	// agent dir), matching builtin.ts and getMCPConfigPath("user"). External tools
-	// (~/.claude, ~/.gemini, …) are intentionally not profile-scoped, so they keep
-	// resolving against ctx.home below.
+	// agent dir), matching builtin.ts and getMCPConfigPath("user").
 	if (source === "native") return path.join(getAgentDir(), subpath);
+	if (source === "claude") return path.join(resolveClaudePaths(ctx.home).configDir, subpath);
 	const paths = SOURCE_PATHS[source];
 	if (!paths.userAgent) return null;
 	return path.join(ctx.home, paths.userAgent, subpath);
@@ -913,10 +913,10 @@ export function registerPluginCacheInvalidator(invalidator: () => void): void {
 }
 
 /**
- * List all installed plugin roots from the OMP registry and, by default, the Claude Code registry.
+ * List all installed plugin roots from the OMP registry and, by default, Claude Code's active config registry.
  * Optionally includes the nearest project-scoped OMP registry resolved from `cwd`.
  *
- * Results are cached per home, project registry, canonical active project, and policy.
+ * Results are cached per Claude and OMP config directories, project registry, canonical active project, and policy.
  */
 export async function listClaudePluginRoots(
 	home: string,
@@ -924,11 +924,13 @@ export async function listClaudePluginRoots(
 	policy?: ClaudePluginRootPolicy,
 ): Promise<{ roots: ClaudePluginRoot[]; warnings: string[] }> {
 	const includeClaudeRegistry = policy?.includeClaudeRegistry ?? true;
+	const claudeConfigDir = resolveClaudePaths(home).configDir;
+	const ompRegistryPath = path.join(getPluginsDir(home), "installed_plugins.json");
 	const resolvedProjectPath = cwd ? await resolveActiveProjectRegistryPath(cwd) : null;
 	const projectRoot = resolvedProjectPath ? path.dirname(path.dirname(path.dirname(resolvedProjectPath))) : cwd;
 	const activeClaudeProjectPath =
 		includeClaudeRegistry && projectRoot ? await canonicalClaudeProjectPath(projectRoot) : null;
-	const cacheKey = `${home}:${resolvedProjectPath ?? ""}:${activeClaudeProjectPath ?? ""}:${includeClaudeRegistry}`;
+	const cacheKey = `${claudeConfigDir}:${ompRegistryPath}:${resolvedProjectPath ?? ""}:${activeClaudeProjectPath ?? ""}:${includeClaudeRegistry}`;
 	const cached = pluginRootsCache.get(cacheKey);
 	if (cached) return cached;
 
@@ -937,7 +939,7 @@ export async function listClaudePluginRoots(
 	const projectRoots: ClaudePluginRoot[] = [];
 
 	// ── Claude Code registry ──────────────────────────────────────────────────
-	const registryPath = path.join(home, ".claude", "plugins", "installed_plugins.json");
+	const registryPath = path.join(claudeConfigDir, "plugins", "installed_plugins.json");
 	const content = includeClaudeRegistry ? await readFile(registryPath) : null;
 
 	if (content) {
@@ -995,7 +997,7 @@ export async function listClaudePluginRoots(
 	// In production `home` is `os.homedir()`, so `getPluginsDir(home)` resolves to the
 	// same XDG-aware path the marketplace writer uses (reads and writes always agree).
 	// Tests pass a temp dir, which short-circuits the resolver for deterministic isolation.
-	const ompRegistryPath = path.join(getPluginsDir(home), "installed_plugins.json");
+	// Computed before the cache lookup because isolated SDK homes select distinct OMP registries.
 	const ompContent = await readFile(ompRegistryPath);
 	if (ompContent) {
 		const ompRegistry = parseClaudePluginsRegistry(ompContent);
@@ -1125,7 +1127,7 @@ export function clearPluginRootsAndCaches(
 	extraPaths?: readonly string[],
 	options?: ClearClaudePluginRootsCacheOptions,
 ): void {
-	invalidateFsCache(path.join(os.homedir(), ".claude", "plugins", "installed_plugins.json"));
+	invalidateFsCache(path.join(resolveClaudePaths().configDir, "plugins", "installed_plugins.json"));
 	invalidateFsCache(path.join(getPluginsDir(), "installed_plugins.json"));
 	for (const p of extraPaths ?? []) invalidateFsCache(p);
 	clearClaudePluginRootsCache(options);

@@ -20,10 +20,11 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import type { LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { createAgentSession, loadSessionExtensions } from "@oh-my-pi/pi-coding-agent/sdk";
-import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
+import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
 const EXPLICIT_TOOL_NAME = "public_unique_tool";
 const AMBIENT_TOOL_NAME = "sdk_ambient_extension_parity_tool";
@@ -48,9 +49,9 @@ describe("createAgentSession preloadedExtensions isolation (issue #2190)", () =>
 	let modelRegistry: ModelRegistry;
 	let explicitExtensionPath: string;
 
-	beforeAll(async () => {
+	beforeAll(() => {
 		sharedDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-preloaded-ext-"));
-		authStorage = await AuthStorage.create(path.join(sharedDir, "auth.db"));
+		authStorage = createInMemoryAuthStorage();
 		modelRegistry = new ModelRegistry(authStorage, path.join(sharedDir, "models.yml"));
 		explicitExtensionPath = path.join(sharedDir, "explicit-parity-extension.ts");
 		const ambientExtensionsDir = path.join(sharedDir, ".omp", "extensions");
@@ -97,6 +98,8 @@ describe("createAgentSession preloadedExtensions isolation (issue #2190)", () =>
 			preloadedCustomToolPaths: [],
 			contextFiles: [],
 			promptTemplates: [],
+			slashCommands: [],
+			toolNames: ["read"],
 		});
 
 		try {

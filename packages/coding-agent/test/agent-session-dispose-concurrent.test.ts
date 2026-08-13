@@ -10,10 +10,11 @@ import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/ex
 import { HindsightSessionState } from "@oh-my-pi/pi-coding-agent/hindsight/state";
 import { MnemopiSessionState, setMnemopiSessionState } from "@oh-my-pi/pi-coding-agent/mnemopi/state";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { EvalRunner } from "@oh-my-pi/pi-coding-agent/session/eval-runner";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { logger, TempDir } from "@oh-my-pi/pi-utils";
+import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
 async function flushMicrotasks(): Promise<void> {
 	await Promise.resolve();
@@ -26,9 +27,9 @@ describe("AgentSession concurrent disposal", () => {
 	let authStorage: AuthStorage;
 	let session: AgentSession | undefined;
 
-	beforeEach(async () => {
+	beforeEach(() => {
 		tempDir = TempDir.createSync("@omp-dispose-concurrent-");
-		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		authStorage = createInMemoryAuthStorage();
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 	});
 

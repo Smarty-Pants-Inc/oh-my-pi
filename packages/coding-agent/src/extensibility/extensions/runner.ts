@@ -42,6 +42,7 @@ import type {
 	ExtensionError,
 	ExtensionEvent,
 	ExtensionFlag,
+	ExtensionMode,
 	ExtensionRuntime,
 	ExtensionShortcut,
 	ExtensionUIContext,
@@ -353,6 +354,7 @@ interface ToolRegistrationScope {
 
 export class ExtensionRunner {
 	#uiContext: ExtensionUIContext;
+	#mode: ExtensionMode = "print";
 	#toolApprovalPreviewWaiter?: (toolCallId: string) => Promise<void>;
 	#errorListeners: Set<ExtensionErrorListener> = new Set();
 	#getModel: () => Model | undefined = () => undefined;
@@ -549,6 +551,7 @@ export class ExtensionRunner {
 		contextActions: ExtensionContextActions,
 		commandContextActions?: ExtensionCommandContextActions,
 		uiContext?: ExtensionUIContext,
+		mode: ExtensionMode = "print",
 	): void {
 		// Copy actions into the shared runtime (all extension APIs reference this)
 		this.runtime.sendMessage = actions.sendMessage;
@@ -598,6 +601,7 @@ export class ExtensionRunner {
 		}
 
 		this.#uiContext = uiContext ?? noOpUIContext;
+		this.#mode = mode;
 		this.#initialized = true;
 
 		// Drain events buffered by emitCredentialDisabled() before initialize ran. The
@@ -991,6 +995,7 @@ export class ExtensionRunner {
 		const getModel = model ? () => model : this.#getModel;
 		return {
 			ui: this.#uiContext,
+			mode: this.#mode,
 			getContextUsage: () => this.#getContextUsageFn(),
 			isCompacting: () => this.#isCompactingFn(),
 			compact: instructionsOrOptions => this.#compactFn(instructionsOrOptions),

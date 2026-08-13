@@ -11,6 +11,7 @@ import {
 	getConfigDirPaths,
 	getConfigDirs,
 } from "@oh-my-pi/pi-coding-agent/config";
+import { resolveClaudePaths } from "@oh-my-pi/pi-coding-agent/config/claude-paths";
 import { getUserPath } from "@oh-my-pi/pi-coding-agent/discovery/helpers";
 import { getAgentDir } from "@oh-my-pi/pi-utils";
 
@@ -93,5 +94,43 @@ describe("PI_CONFIG_DIR", () => {
 			setDisabledProviders(savedDisabledProviders);
 			fs.rmSync(cwd, { recursive: true, force: true });
 		}
+	});
+});
+
+describe("CLAUDE_CONFIG_DIR", () => {
+	const original = process.env.CLAUDE_CONFIG_DIR;
+	afterEach(() => {
+		if (original === undefined) {
+			delete process.env.CLAUDE_CONFIG_DIR;
+		} else {
+			process.env.CLAUDE_CONFIG_DIR = original;
+		}
+	});
+
+	test("relocates Claude user discovery and .claude.json together", () => {
+		process.env.CLAUDE_CONFIG_DIR = "./fixtures/claude-home";
+		const expectedRoot = path.resolve("./fixtures/claude-home");
+		const ctx: LoadContext = {
+			cwd: "/work/project",
+			home: "/home/tester",
+			repoRoot: null,
+		};
+
+		expect(resolveClaudePaths(ctx.home)).toEqual({
+			configDir: expectedRoot,
+			configFile: path.join(expectedRoot, ".claude.json"),
+		});
+		expect(getUserPath(ctx, "claude", "commands")).toBe(path.join(expectedRoot, "commands"));
+		expect(
+			getConfigDirs("commands", { user: true, project: false }).find(entry => entry.source === ".claude"),
+		).toEqual({ path: path.join(expectedRoot, "commands"), source: ".claude", level: "user" });
+	});
+
+	test("keeps the legacy split paths when the override is unset", () => {
+		delete process.env.CLAUDE_CONFIG_DIR;
+		expect(resolveClaudePaths("/home/tester")).toEqual({
+			configDir: path.join("/home/tester", ".claude"),
+			configFile: path.join("/home/tester", ".claude.json"),
+		});
 	});
 });
