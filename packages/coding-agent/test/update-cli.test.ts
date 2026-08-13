@@ -26,6 +26,7 @@ import {
 	resolveReleaseDist,
 	resolveReleaseRename,
 	resolveUpdateMethodForTest,
+	resolveUpdateTargetFromPathForTest,
 	shouldForceBinaryUpdate,
 	sweepStaleUpdateArtifacts,
 	updateViaBinaryAt,
@@ -185,6 +186,50 @@ describe("update-cli install target detection", () => {
 		});
 
 		expect(method).toBe("npm");
+	});
+
+	it("updates the resolved standalone binary behind a foreign npm-bin alias", async () => {
+		const dir = await makeTempDir();
+		const npmBinDir = path.join(dir, ".npm-global", "bin");
+		const standalonePath = path.join(dir, ".local", "bin", "omp");
+		const aliasPath = path.join(npmBinDir, "omp");
+		await fs.mkdir(npmBinDir, { recursive: true });
+		await fs.mkdir(path.dirname(standalonePath), { recursive: true });
+		await Bun.write(standalonePath, "binary");
+		await fs.symlink(standalonePath, aliasPath);
+
+		const target = resolveUpdateTargetFromPathForTest(aliasPath, undefined, {
+			allowPackageManagers: true,
+			npmBinDir,
+		});
+
+		expect(target).toEqual({ method: "binary", path: await fs.realpath(standalonePath), replacesSymlink: false });
+		expect(await fs.readlink(aliasPath)).toBe(standalonePath);
+	});
+
+	it("uses npm update when the bin symlink resolves into npm's global install tree", () => {
+		const method = resolveUpdateMethodForTest("/home/u/.npm-global/bin/omp", undefined, {
+			npmBinDir: "/home/u/.npm-global/bin",
+			ompRealpath: "/home/u/.npm-global/lib/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js",
+		});
+
+		expect(method).toBe("npm");
+	});
+
+	it("uses binary update when the bun global bin entry is a foreign alias symlink", () => {
+		const method = resolveUpdateMethodForTest("/home/u/.bun/bin/omp", "/home/u/.bun/bin", {
+			ompRealpath: "/home/u/.local/bin/omp",
+		});
+
+		expect(method).toBe("binary");
+	});
+
+	it("uses bun update when the bin symlink resolves into bun's global install tree", () => {
+		const method = resolveUpdateMethodForTest("/home/u/.bun/bin/omp", "/home/u/.bun/bin", {
+			ompRealpath: "/home/u/.bun/install/global/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js",
+		});
+
+		expect(method).toBe("bun");
 	});
 
 	it("uses binary update when prioritized omp is outside bun global bin", () => {
@@ -988,18 +1033,25 @@ describe("update-cli script-shim takeover", () => {
 		}
 	}
 
+	function verifyBinary(actual: string, expectedPath: string) {
+		return async (binaryPath: string, expectedVersion: string) => {
+			expect(binaryPath).toBe(expectedPath);
+			return { ok: actual === expectedVersion, actual, path: binaryPath };
+		};
+	}
+
 	it("installs omp.exe beside the shims and retires them", async () => {
 		const dir = await makeTempDir();
 		await writeShims(dir);
-		// Real executable, no injected verifier: the takeover must verify the
-		// exe by explicit path — $which cached the shim path before it was
-		// renamed away, so a PATH re-resolution would fail here.
+		// Inject a verifier to assert explicit-path verification while keeping the
+		// Windows `.exe` takeover behavior portable on this POSIX test host.
 		const exe = `#!/bin/sh\necho omp/${version}\n`;
 
 		await updateViaShimTakeover(path.join(dir, "omp.cmd"), version, {
 			binaryName,
 			fetchImpl: makeFetch(exe),
 			githubToken: "test-token",
+			verifyBinary: verifyBinary(version, path.join(dir, "omp.exe")),
 		});
 
 		expect(await Bun.file(path.join(dir, "omp.exe")).text()).toBe(exe);
@@ -1021,6 +1073,7 @@ describe("update-cli script-shim takeover", () => {
 				binaryName,
 				fetchImpl: makeFetch(exe),
 				githubToken: "test-token",
+				verifyBinary: verifyBinary("17.2.12", path.join(dir, "omp.exe")),
 			}),
 		).rejects.toThrow(/still reports 17\.2\.12 \(expected 18\.0\.0\); restored previous omp launcher/);
 
@@ -1052,6 +1105,7 @@ describe("update-cli script-shim takeover", () => {
 				binaryName,
 				fetchImpl: makeFetch(exe),
 				githubToken: "test-token",
+				verifyBinary: verifyBinary(version, path.join(dir, "omp.exe")),
 			});
 		} finally {
 			renameSpy.mockRestore();
@@ -1076,6 +1130,7 @@ describe("update-cli script-shim takeover", () => {
 					binaryName,
 					fetchImpl: makeFetch(exe),
 					githubToken: "test-token",
+					verifyBinary: verifyBinary("17.2.12", path.join(dir, "omp.exe")),
 				}),
 			).rejects.toThrow("restored previous omp launcher");
 		} finally {

@@ -9,12 +9,18 @@
 ### Fixed
 
 - Fixed stale todo lifecycle handling: guidance now distinguishes finished, blocked, abandoned, and obsolete tasks; completed subagent results bring blocked parent work into the next stop-time reconciliation; supported native providers, including Google, receive a named `todo` tool choice while owned/in-band dialects enforce it locally; read-only `todo view` calls no longer reset the drift reminder; and the interactive UI no longer writes fuzzy, non-persisted subagent matches into canonical todo state.
+### Fixed
+
+- Fixed the parent TUI stalling after a subagent submits its result until terminal focus or resize wakes the event loop ([#8462](https://github.com/can1357/oh-my-pi/issues/8462)).
+- Fixed `omp update` routing foreign npm/bun bin-directory alias symlinks through the package manager, causing npm EEXIST instead of updating the aliased standalone binary ([#8468](https://github.com/can1357/oh-my-pi/issues/8468)).
+- Fixed `read` hashline headers collapsing nested in-workspace paths to the bare basename, which let a same-basename file at the session cwd capture a verbatim follow-up `edit` and deterministically reject it with `hash is not from this session`. Headers now retain the workspace-relative path (e.g. `[src/settings.json#0063]`) ([#8482](https://github.com/can1357/oh-my-pi/issues/8482)).
+
 ## [17.3.1] - 2026-08-13
 
 ### Fixed
 
 - Fixed Claude Code user discovery ignoring CLAUDE_CONFIG_DIR for configuration, plugins, MCP servers, and imported sessions.
-- Fixed the status-line git branch display freezing after switching branches. The original directory-watch fix still froze on Linux, where Bun's inotify-backed `fs.watch` permanently stops delivering events after git's atomic HEAD rename ([oven-sh/bun#24875](https://github.com/oven-sh/bun/issues/24875)); branch watching now stat-polls the HEAD path (`git.head.watch`) on every platform, which also fixes the footer's branch display dying after the first switch.
+- Fixed the status-line git branch display freezing after switching branches.
 - Fixed Pi extension contexts omitting the runtime mode, which caused TUI guards to silently disable extension UI.
 - Fixed extension-registered tool names being rejected by the --tools flag before extension discovery, which prevented least-privilege sessions from allowlisting plugin tools.
 - Fixed omp plugin install failing with cloning errors for legacy Pi extensions whose tool schemas use legacy-typebox builders.
