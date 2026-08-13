@@ -86,7 +86,11 @@ function makeState(): CollabSessionState {
 	};
 }
 
-async function makeHarness(opts?: { readOnly?: boolean }): Promise<GuestUiHarness> {
+async function makeHarness(opts?: {
+	readOnly?: boolean;
+	dedicated?: boolean;
+	onNewSession?: () => void;
+}): Promise<GuestUiHarness> {
 	const roomId = "ui-request-room";
 	const roomKey = generateRoomKey();
 	const cryptoKey = await importRoomKey(roomKey);
@@ -198,7 +202,10 @@ async function makeHarness(opts?: { readOnly?: boolean }): Promise<GuestUiHarnes
 		session: {
 			messages: [],
 			switchSession: () => Promise.resolve(),
-			newSession: () => Promise.resolve(),
+			newSession: () => {
+				opts?.onNewSession?.();
+				return Promise.resolve();
+			},
 			agent: {
 				state: { model: undefined },
 				setModel: () => {},
@@ -255,7 +262,14 @@ async function makeHarness(opts?: { readOnly?: boolean }): Promise<GuestUiHarnes
 	} as unknown as InteractiveModeContext;
 
 	const guest = new CollabGuestLink(ctx);
-	await guest.join(link);
+	if (opts?.dedicated) {
+		await guest.joinWithTransport(
+			new CollabSocket({ wsUrl: `ws://localhost:8788/r/${roomId}`, role: "guest", key: cryptoKey }),
+			{ roomId },
+		);
+	} else {
+		await guest.join(link);
+	}
 
 	return {
 		guest,
@@ -290,7 +304,11 @@ afterEach(async () => {
 	uninstallInMemoryRelay();
 });
 
-async function openHarness(opts?: { readOnly?: boolean }): Promise<GuestUiHarness> {
+async function openHarness(opts?: {
+	readOnly?: boolean;
+	dedicated?: boolean;
+	onNewSession?: () => void;
+}): Promise<GuestUiHarness> {
 	const harness = await makeHarness(opts);
 	harnessCleanups.push(harness.cleanup);
 	return harness;
@@ -418,6 +436,34 @@ describe("collab TUI guest ui-request handling (#4049)", () => {
 		expect(h.uiResponses).toEqual([]);
 	});
 
+	it("detaches a dedicated bridge instead of restoring a standalone session on leave", async () => {
+		let restored = 0;
+		const h = await openHarness({
+			dedicated: true,
+			onNewSession: () => {
+				restored++;
+			},
+		});
+
+		await h.guest.leave("user left");
+		await h.guest.ended;
+		expect(restored).toBe(0);
+	});
+
+	it("detaches a dedicated bridge when the host ends the session", async () => {
+		let restored = 0;
+		const h = await openHarness({
+			dedicated: true,
+			onNewSession: () => {
+				restored++;
+			},
+		});
+
+		h.hostSocket.send({ t: "bye", reason: "host stopped" });
+		await h.guest.ended;
+		expect(restored).toBe(0);
+	});
+
 	it("never presents ui-requests on a read-only link", async () => {
 		const h = await openHarness({ readOnly: true });
 		h.hostSocket.send({
@@ -539,7 +585,7 @@ describe("collab proto handshake (#4049)", () => {
 		}
 	});
 
-	it("welcomes a current-proto guest at v3 and round-trips a ui-request", async () => {
+	it("welcomes a current-proto guest at v4 and round-trips a ui-request", async () => {
 		const host = new CollabHost(makeHostContext());
 		await host.start("ws://localhost:8787");
 		const guest = await joinRawGuest(host.link, COLLAB_PROTO);
@@ -547,7 +593,7 @@ describe("collab proto handshake (#4049)", () => {
 			const welcome = await guest.nextFrame();
 			if (welcome.t !== "welcome") throw new Error(`expected welcome, got ${welcome.t}`);
 			expect(welcome.proto).toBe(COLLAB_PROTO);
-			expect(welcome.proto).toBe(3);
+			expect(welcome.proto).toBe(4);
 
 			const pending = host.requestGuestUi({ kind: "select", title: "Continue?", options: ["Yes"] });
 			if (!pending) throw new Error("expected writable guest UI request");

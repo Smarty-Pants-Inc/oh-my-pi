@@ -29,6 +29,9 @@ import { processFileArguments } from "./cli/file-processor";
 import { buildInitialMessage } from "./cli/initial-message";
 import { selectSession } from "./cli/session-picker";
 import { applyStartupCwd } from "./cli/startup-cwd";
+import { CollabGuestLink } from "./collab/guest";
+import { CollabHost } from "./collab/host";
+import { createHostBridgeTransport, LocalCollabTransport } from "./collab/local-transport";
 import { findConfigFile } from "./config";
 import { ModelRegistry } from "./config/model-registry";
 import {
@@ -440,6 +443,10 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 	};
 }
 
+export type CollabBridgeBootstrap =
+	| { role: "host"; address: string; token: string; paneId: string; ompSessionId: string; routeGeneration: number }
+	| { role: "guest"; address: string; roomId: string; token: string };
+
 async function runInteractiveMode(
 	session: AgentSession,
 	version: string,
@@ -457,6 +464,7 @@ async function runInteractiveMode(
 	initialMessage?: string,
 	initialImages?: ImageContent[],
 	joinLink?: string,
+	bridge?: CollabBridgeBootstrap,
 ): Promise<void> {
 	const mode = new InteractiveMode(
 		session,
@@ -487,12 +495,33 @@ async function runInteractiveMode(
 			})
 		: [];
 	const playStartupSplash = showStartupSplash && setupScenes.length === 0;
-
 	await mode.init({
 		suppressWelcomeIntro: resuming || setupScenes.length > 0 || playStartupSplash,
 		clearInitialTerminalHistory: true,
 	});
 
+	if (bridge?.role === "host") {
+		const host = new CollabHost(mode);
+		await host.startWithTransport(
+			createHostBridgeTransport(
+				bridge.address,
+				bridge.token,
+				bridge.paneId,
+				bridge.ompSessionId,
+				bridge.routeGeneration,
+			),
+			{ trustedLocal: true },
+		);
+		mode.collabHost = host;
+	} else if (bridge?.role === "guest") {
+		const guest = new CollabGuestLink(mode);
+		void guest.ended
+			.then(() => mode.shutdown())
+			.catch(error => logger.error("collab guest bridge shutdown failed", error));
+		await guest.joinWithTransport(new LocalCollabTransport(bridge.address, { t: "guest", token: bridge.token }), {
+			roomId: bridge.roomId,
+		});
+	}
 	if (setupWizard && playStartupSplash) {
 		await setupWizard.runStartupSplash(mode);
 	}
@@ -1172,7 +1201,6 @@ export async function buildSessionOptions(
 		if (cliExtensionPaths.length > 0) {
 			options.additionalExtensionPaths = cliExtensionPaths;
 		}
-
 		if (parsed.noExtensions) {
 			options.disableExtensionDiscovery = true;
 		}
@@ -1189,6 +1217,7 @@ interface RunRootCommandDependencies {
 	createForeignSessionStore?: (source: ForeignSessionSource) => ForeignSessionStore;
 	settings?: Settings;
 	forceSetupWizard?: boolean;
+	collabBridge?: CollabBridgeBootstrap;
 }
 const DEFAULT_RUN_ROOT_DEPENDENCIES: RunRootCommandDependencies = {};
 
@@ -1772,6 +1801,7 @@ export async function runRootCommand(
 				initialMessage,
 				initialImages,
 				parsedArgs.join,
+				deps.collabBridge,
 			);
 		} else {
 			// Branch-only single-shot runner: keep print-mode code out of normal interactive startup.

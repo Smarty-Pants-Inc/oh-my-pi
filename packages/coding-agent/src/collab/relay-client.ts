@@ -24,6 +24,30 @@ const MAX_PENDING_SENDS = 256;
 const WS_BACKPRESSURE_THRESHOLD = 64 * 1024;
 const WS_BACKPRESSURE_DRAIN_THRESHOLD = 32 * 1024;
 const WS_BACKPRESSURE_DRAIN_RETRY_MS = 25;
+/** Private transport control used by trusted local embedders; public relays never emit it. */
+export type CollabTransportControl = RelayControlMessage | { t: "peer-authority"; peer: number; canWrite: boolean };
+
+/** Ordered bidirectional CollabFrame transport used by host and guest links. */
+export interface CollabTransport {
+	/** Fires after every successful (re)connect. */
+	onOpen?: () => void;
+	onFrame?: (
+		frame: CollabFrame,
+		fromPeer: number,
+		metadata?: { displayName?: string; displayNameRevision?: number },
+	) => void;
+	onControl?: (msg: CollabTransportControl) => void;
+	/** Fires once per terminal close; `willReconnect` describes transient transports. */
+	onClose?: (reason: string, willReconnect: boolean) => void;
+	readonly isOpen: boolean;
+	/** Local Herdr bridge carries trusted prompt attribution in its private outer record. */
+	readonly requiresHerdrAttribution?: boolean;
+	connect(): void;
+	send(frame: CollabFrame, targetPeer?: number): boolean;
+	/** Request or release controller authority when the embedding transport supports it. */
+	requestAuthority?(action: "request" | "release"): boolean;
+	close(): void;
+}
 
 export interface CollabSocketOptions {
 	/** wss://host[:port]/r/<roomId> — no query string. */
@@ -32,11 +56,15 @@ export interface CollabSocketOptions {
 	key: CryptoKey;
 }
 
-export class CollabSocket {
+export class CollabSocket implements CollabTransport {
 	/** Fires after every successful (re)connect. */
 	onOpen?: () => void;
-	onFrame?: (frame: CollabFrame, fromPeer: number) => void;
-	onControl?: (msg: RelayControlMessage) => void;
+	onFrame?: (
+		frame: CollabFrame,
+		fromPeer: number,
+		metadata?: { displayName?: string; displayNameRevision?: number },
+	) => void;
+	onControl?: (msg: CollabTransportControl) => void;
 	/** Fires once per terminal close (intentional, fatal code, or bad key). willReconnect=true for transient drops that will retry. */
 	onClose?: (reason: string, willReconnect: boolean) => void;
 
@@ -69,7 +97,7 @@ export class CollabSocket {
 		this.#openSocket();
 	}
 
-	send(frame: CollabFrame, targetPeer = 0): void {
+	send(frame: CollabFrame, targetPeer = 0): boolean {
 		this.#sendChain = this.#sendChain
 			.then(async () => {
 				if (this.#closed) {
@@ -104,6 +132,7 @@ export class CollabSocket {
 			.catch((err: unknown) => {
 				logger.debug("collab: send failed", { error: String(err) });
 			});
+		return true;
 	}
 
 	#enqueuePendingSend(envelope: Uint8Array, frameType: CollabFrame["t"]): void {
