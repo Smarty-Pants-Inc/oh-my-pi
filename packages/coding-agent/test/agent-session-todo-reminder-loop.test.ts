@@ -34,6 +34,8 @@ describe("AgentSession todo reminder self-continuation suppression", () => {
 	let session: AgentSession;
 	let sessionManager: SessionManager;
 	let reminderAttempts: number[];
+	let firstReminderPromise: Promise<void>;
+	let resolveFirstReminder: () => void;
 
 	function textOnlyAssistantMessage(text = "paused at your instruction"): AssistantMessage {
 		return {
@@ -164,8 +166,12 @@ describe("AgentSession todo reminder self-continuation suppression", () => {
 		});
 
 		reminderAttempts = [];
+		({ promise: firstReminderPromise, resolve: resolveFirstReminder } = Promise.withResolvers<void>());
 		session.subscribe((event: AgentSessionEvent) => {
-			if (event.type === "todo_reminder") reminderAttempts.push(event.attempt);
+			if (event.type === "todo_reminder") {
+				reminderAttempts.push(event.attempt);
+				if (reminderAttempts.length === 1) resolveFirstReminder();
+			}
 		});
 
 		session.setTodoPhases([

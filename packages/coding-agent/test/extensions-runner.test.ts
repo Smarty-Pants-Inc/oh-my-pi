@@ -137,6 +137,7 @@ describe("ExtensionRunner", () => {
 		const contextActions = {
 			getModel: () => undefined,
 			isIdle: () => true,
+			isCompacting: () => false,
 			abort: () => {},
 			hasPendingMessages: () => false,
 			shutdown: () => {},

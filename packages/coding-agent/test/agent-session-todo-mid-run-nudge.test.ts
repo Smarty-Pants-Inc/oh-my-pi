@@ -117,6 +117,9 @@ describe("AgentSession mid-run todo reconciliation nudge", () => {
 			},
 		});
 	}
+	async function settle(): Promise<void> {
+		await Bun.sleep(0);
+	}
 
 	async function drainNudges(): Promise<CustomMessage[]> {
 		if (!asideProvider) throw new Error("aside provider was never captured");
