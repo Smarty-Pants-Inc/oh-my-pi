@@ -909,7 +909,9 @@ describe("antigravity discovery collapsing", () => {
 		const requestedUrls: string[] = [];
 		const defaultFetcher = Object.assign(
 			(input: string | URL | Request, _init?: RequestInit) => {
-				requestedUrls.push(String(input));
+				const url = input instanceof Request ? input.url : input.toString();
+				if (url.endsWith("/manifest/latest-arm64-mac.yml")) return Promise.resolve(new Response("version: 2.8.0"));
+				requestedUrls.push(url);
 				return Promise.resolve(new Response(JSON.stringify(payload), { status: 200 }));
 			},
 			{ preconnect: fetch.preconnect },

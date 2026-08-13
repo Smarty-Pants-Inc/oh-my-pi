@@ -159,7 +159,7 @@ class ThemeSceneController implements SetupSceneController {
 		} else {
 			this.#listRowStart = lines.length;
 			if (maxLines !== undefined) {
-				this.#selectList.setMaxVisible(Math.max(1, Math.min(10, budget - lines.length - 1)));
+				this.#selectList.setMaxVisible(Math.max(1, Math.min(10, budget - lines.length)));
 			}
 			lines.push(...this.#selectList.render(width));
 		}

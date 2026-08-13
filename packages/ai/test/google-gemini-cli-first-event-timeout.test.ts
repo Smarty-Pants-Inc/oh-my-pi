@@ -42,6 +42,8 @@ test("Antigravity Flash fails over when headers arrive without a first SSE event
 	vi.useFakeTimers();
 
 	const fetchMock: FetchImpl = async input => {
+		const url = input instanceof Request ? input.url : input.toString();
+		if (url.endsWith("/manifest/latest-arm64-mac.yml")) return new Response("version: 2.8.0");
 		const endpoint = endpointFromInput(input);
 		requestedEndpoints.push(endpoint);
 		if (endpoint === ANTIGRAVITY_SANDBOX_ENDPOINT) {

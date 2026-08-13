@@ -1173,7 +1173,7 @@ These tools became available:
 
 		const notices = mountNoticesIn(contexts[1]);
 		expect(notices).toHaveLength(1);
-		expect(notices[0]).toContain("No longer mounted");
+		expect(notices[0]).toContain("Unmounted; writes fail:");
 		expect(notices[0]).toContain("xd://mcp__nucleus_search");
 	});
 

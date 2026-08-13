@@ -43,7 +43,7 @@ describe("execution environment system prompt projection", () => {
 		expect(rendered).toContain("<file>\nUser-level instructions");
 		expect(rendered).toContain("- /workspace/src/AGENTS.md");
 		expect(rendered).toContain("- /workspace/packages/app");
-		expect(rendered).toContain("current working directory is '/workspace'");
+		expect(rendered).toContain("current working directory: '/workspace'.");
 		expect(rendered).not.toContain(sourceRoot);
 		expect(rendered).not.toContain("/Users/example/.omp/AGENTS.md");
 		expect(rendered).not.toContain("/Users/example/shared");
@@ -71,7 +71,7 @@ describe("execution environment system prompt projection", () => {
 		expect(rendered).toContain(`<file path="${sourceRoot}/AGENTS.md">`);
 		expect(rendered).toContain(`- ${sourceRoot}/src/AGENTS.md`);
 		expect(rendered).toContain(`- ${sourceRoot}/packages/app`);
-		expect(rendered).toContain(`current working directory is '${sourceRoot}'`);
+		expect(rendered).toContain(`current working directory: '${sourceRoot}'.`);
 		expect(rendered).not.toContain("<execution-environment>");
 	});
 });

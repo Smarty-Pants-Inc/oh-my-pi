@@ -1454,6 +1454,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 
 			releaseStalledRegistration.resolve();
 			const failure = await detachedFailure.promise;
+			testSetExtensionHandlerTimeoutMs(EXTENSION_HANDLER_TIMEOUT_MS);
 			releaseRecoveredRegistration.resolve();
 			await recoveredActivation.promise;
 

@@ -53,6 +53,14 @@ const validationRequiredBody = JSON.stringify({
 	},
 });
 
+function withAntigravityVersionDiscovery(fetchMock: FetchImpl): FetchImpl {
+	return async (input, init) => {
+		const url = input instanceof Request ? input.url : input.toString();
+		if (url.endsWith("/manifest/latest-arm64-mac.yml")) return new Response("version: 2.8.0");
+		return fetchMock(input, init);
+	};
+}
+
 describe("Google Gemini CLI alignment", () => {
 	it("encodes enriched OAuth JSON while preserving token + projectId", async () => {
 		const expiresAt = Date.now() + 60 * 60 * 1000;
@@ -400,7 +408,7 @@ describe("Google Gemini CLI alignment", () => {
 
 		const result = await streamGoogleGeminiCli(model, createContext(), {
 			apiKey: JSON.stringify({ token: "token", projectId: "proj-123" }),
-			fetch: fetchMock,
+			fetch: withAntigravityVersionDiscovery(fetchMock),
 		}).result();
 
 		expect(result.stopReason).toBe("error");
@@ -419,7 +427,7 @@ describe("Google Gemini CLI alignment", () => {
 		const model = createModel("google-antigravity");
 		await streamGoogleGeminiCli(model, createContext(), {
 			apiKey: JSON.stringify({ token: "token", projectId: "proj-123" }),
-			fetch: fetchMock,
+			fetch: withAntigravityVersionDiscovery(fetchMock),
 		}).result();
 
 		expect(requestHeaders!.get("User-Agent")).toMatch(/^antigravity\/hub\/[0-9.]+ /);
@@ -458,7 +466,7 @@ describe("Google Gemini CLI alignment", () => {
 		const events: AssistantMessageEvent[] = [];
 		const stream = streamGoogleGeminiCli(model, createContext(), {
 			apiKey: JSON.stringify({ token: "token", projectId: "proj-123" }),
-			fetch: fetchMock,
+			fetch: withAntigravityVersionDiscovery(fetchMock),
 		});
 		for await (const event of stream) {
 			events.push(event);
@@ -521,7 +529,7 @@ describe("Google Gemini CLI alignment", () => {
 		const events: AssistantMessageEvent[] = [];
 		const stream = streamGoogleGeminiCli(model, createContext(), {
 			apiKey: JSON.stringify({ token: "token", projectId: "proj-123" }),
-			fetch: fetchMock,
+			fetch: withAntigravityVersionDiscovery(fetchMock),
 		});
 		for await (const event of stream) {
 			events.push(event);
@@ -555,7 +563,7 @@ describe("Google Gemini CLI alignment", () => {
 
 		const stream = streamGoogleGeminiCli(model, createContext(), {
 			apiKey: JSON.stringify({ token: "token", projectId: "proj-123", email: "dev@example.com" }),
-			fetch: fetchMock,
+			fetch: withAntigravityVersionDiscovery(fetchMock),
 		});
 
 		const result = await stream.result();
