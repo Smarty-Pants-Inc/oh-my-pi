@@ -449,6 +449,8 @@ function expectAcpNotifications(updates: SessionNotification[]): void {
 
 const cleanupRoots: string[] = [];
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+const originalHome = process.env.HOME;
+const originalClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR;
 const fallbackAgentDir = path.join(getConfigRootDir(), "agent");
 
 afterEach(async () => {
@@ -458,6 +460,16 @@ afterEach(async () => {
 	} else {
 		setAgentDir(fallbackAgentDir);
 		delete process.env.PI_CODING_AGENT_DIR;
+	}
+	if (originalHome !== undefined) {
+		process.env.HOME = originalHome;
+	} else {
+		delete process.env.HOME;
+	}
+	if (originalClaudeConfigDir !== undefined) {
+		process.env.CLAUDE_CONFIG_DIR = originalClaudeConfigDir;
+	} else {
+		delete process.env.CLAUDE_CONFIG_DIR;
 	}
 	resetSettingsForTest();
 
@@ -471,6 +483,8 @@ async function createHarness(
 ): Promise<AgentHarness> {
 	const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "omp-acp-test-"));
 	cleanupRoots.push(root);
+	process.env.HOME = root;
+	process.env.CLAUDE_CONFIG_DIR = path.join(root, ".claude");
 	const agentDir = path.join(root, "agent");
 	const cwdA = path.join(root, "cwd-a");
 	const cwdB = path.join(root, "cwd-b");

@@ -958,6 +958,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 	});
 
 	it("forwards todo reminder lifecycle signals to extensions", async () => {
+		vi.spyOn(session, "getActiveToolNames").mockReturnValue(["todo"]);
 		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
 
 		session.setTodoPhases([

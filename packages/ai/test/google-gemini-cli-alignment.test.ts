@@ -38,6 +38,8 @@ function createContext(): Context {
 }
 
 const VALIDATION_URL = "https://accounts.google.com/signin/continue?sarp=1&scc=1&plt=AKgnsbtTOKEN";
+const ANTIGRAVITY_VERSION_MANIFEST_URL =
+	"https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-arm64-mac.yml";
 
 const validationRequiredBody = JSON.stringify({
 	error: {
@@ -56,7 +58,7 @@ const validationRequiredBody = JSON.stringify({
 function withAntigravityVersionDiscovery(fetchMock: FetchImpl): FetchImpl {
 	return async (input, init) => {
 		const url = input instanceof Request ? input.url : input.toString();
-		if (url.endsWith("/manifest/latest-arm64-mac.yml")) return new Response("version: 2.8.0");
+		if (url === ANTIGRAVITY_VERSION_MANIFEST_URL) return new Response("version: 2.8.0");
 		return fetchMock(input, init);
 	};
 }

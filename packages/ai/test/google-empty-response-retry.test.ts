@@ -101,6 +101,8 @@ const cliModel: Model<"google-gemini-cli"> = buildModel({
 
 const ANTIGRAVITY_DAILY_ENDPOINT = "https://daily-cloudcode-pa.googleapis.com";
 const ANTIGRAVITY_SANDBOX_ENDPOINT = "https://daily-cloudcode-pa.sandbox.googleapis.com";
+const ANTIGRAVITY_VERSION_MANIFEST_URL =
+	"https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-arm64-mac.yml";
 
 const antigravityModel: Model<"google-gemini-cli"> = buildModel({
 	...cliModel,
@@ -125,7 +127,7 @@ function endpointFromInput(input: Parameters<FetchImpl>[0]): string {
 function withAntigravityVersionDiscovery(fetchMock: FetchImpl): FetchImpl {
 	return async (input, init) => {
 		const url = input instanceof Request ? input.url : input.toString();
-		if (url.endsWith("/manifest/latest-arm64-mac.yml")) return new Response("version: 2.8.0");
+		if (url === ANTIGRAVITY_VERSION_MANIFEST_URL) return new Response("version: 2.8.0");
 		return fetchMock(input, init);
 	};
 }

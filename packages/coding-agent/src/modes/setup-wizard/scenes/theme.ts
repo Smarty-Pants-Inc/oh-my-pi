@@ -93,6 +93,7 @@ class ThemeSceneController implements SetupSceneController {
 	subtitle = "Move through the list to preview; Enter saves the highlighted choice.";
 	#mode: ThemeMode = "curated";
 	#selectList: SelectList;
+	#selectListItemCount = CURATED_ITEMS.length;
 	#loadingAllThemes = false;
 	#message: string | undefined;
 	#previewRequest = 0;
@@ -159,7 +160,10 @@ class ThemeSceneController implements SetupSceneController {
 		} else {
 			this.#listRowStart = lines.length;
 			if (maxLines !== undefined) {
-				this.#selectList.setMaxVisible(Math.max(1, Math.min(10, budget - lines.length)));
+				const availableRows = budget - lines.length;
+				const maxVisible = Math.min(10, Math.max(1, availableRows));
+				const reserveSearchStatus = this.#selectListItemCount > maxVisible;
+				this.#selectList.setMaxVisible(Math.max(1, maxVisible - Number(reserveSearchStatus)));
 			}
 			lines.push(...this.#selectList.render(width));
 		}
@@ -170,6 +174,7 @@ class ThemeSceneController implements SetupSceneController {
 	}
 
 	#createSelectList(items: readonly SelectItem[], selectedIndex: number): SelectList {
+		this.#selectListItemCount = items.length;
 		const list = new SelectList(items, Math.min(10, Math.max(1, items.length)), getSelectListTheme());
 		list.setSelectedIndex(selectedIndex);
 		list.onSelectionChange = item => {

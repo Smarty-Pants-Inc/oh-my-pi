@@ -964,11 +964,11 @@ export class SessionTools {
 			if (typeof message.content !== "string") continue;
 			let section: "added" | "removed" | undefined;
 			for (const line of message.content.split("\n")) {
-				if (line === "These tools became available:") {
+				if (line === "These tools became available:" || line.startsWith("Available tools.")) {
 					section = "added";
 					continue;
 				}
-				if (line.startsWith("No longer mounted")) {
+				if (line.startsWith("No longer mounted") || line === "Unmounted; writes fail:") {
 					section = "removed";
 					continue;
 				}

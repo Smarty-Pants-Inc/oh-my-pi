@@ -26,6 +26,9 @@ import {
 	resolveVariantAlias,
 } from "@oh-my-pi/pi-catalog/variant-collapse";
 
+const ANTIGRAVITY_VERSION_MANIFEST_URL =
+	"https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-arm64-mac.yml";
+
 function memberSpec(
 	id: string,
 	overrides: Partial<ModelSpec<"google-gemini-cli">> = {},
@@ -910,7 +913,7 @@ describe("antigravity discovery collapsing", () => {
 		const defaultFetcher = Object.assign(
 			(input: string | URL | Request, _init?: RequestInit) => {
 				const url = input instanceof Request ? input.url : input.toString();
-				if (url.endsWith("/manifest/latest-arm64-mac.yml")) return Promise.resolve(new Response("version: 2.8.0"));
+				if (url === ANTIGRAVITY_VERSION_MANIFEST_URL) return Promise.resolve(new Response("version: 2.8.0"));
 				requestedUrls.push(url);
 				return Promise.resolve(new Response(JSON.stringify(payload), { status: 200 }));
 			},

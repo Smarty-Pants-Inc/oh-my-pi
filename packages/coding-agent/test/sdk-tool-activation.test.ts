@@ -1394,6 +1394,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		const tempDir = makeTempDir();
 		const releaseStalledRegistration = Promise.withResolvers<void>();
 		const releaseRecoveredRegistration = Promise.withResolvers<void>();
+		const releaseRecoveredPresentation = Promise.withResolvers<void>();
 		const detachedRegistrationExtension: ExtensionFactory = pi => {
 			pi.on("session_start", () => {
 				void releaseStalledRegistration.promise.then(() => {
@@ -1440,22 +1441,36 @@ describe("createAgentSession defaultInactive tool activation", () => {
 					detachedFailure.resolve({ event: error.event, error: error.error });
 				}
 			});
+			const stalledPresentationStarted = Promise.withResolvers<void>();
+			const recoveredPresentationStarted = Promise.withResolvers<AbortSignal>();
 			const recoveredActivation = Promise.withResolvers<void>();
 			const originalSetPresentation = session.setActiveToolPresentation.bind(session);
 			vi.spyOn(session, "setActiveToolPresentation")
-				.mockImplementationOnce((_toolNames, _mountedToolNames, _forcePromptRefresh, signal) =>
-					untilAborted(signal, Promise.withResolvers<void>().promise),
-				)
+				.mockImplementationOnce((_toolNames, _mountedToolNames, _forcePromptRefresh, signal) => {
+					stalledPresentationStarted.resolve();
+					return untilAborted(signal, Promise.withResolvers<void>().promise);
+				})
 				.mockImplementation(async (toolNames, mountedToolNames, forcePromptRefresh, signal) => {
+					if (toolNames.includes("recovered_detached_tool")) {
+						recoveredPresentationStarted.resolve(signal);
+						await releaseRecoveredPresentation.promise;
+					}
 					await originalSetPresentation(toolNames, mountedToolNames, forcePromptRefresh, signal);
 					if (toolNames.includes("recovered_detached_tool")) recoveredActivation.resolve();
 				});
+			vi.useFakeTimers();
 			testSetExtensionHandlerTimeoutMs(10);
 
 			releaseStalledRegistration.resolve();
+			await stalledPresentationStarted.promise;
+			vi.advanceTimersByTime(10);
 			const failure = await detachedFailure.promise;
 			testSetExtensionHandlerTimeoutMs(EXTENSION_HANDLER_TIMEOUT_MS);
 			releaseRecoveredRegistration.resolve();
+			const recoveredSignal = await recoveredPresentationStarted.promise;
+			vi.advanceTimersByTime(11);
+			expect(recoveredSignal.aborted).toBe(false);
+			releaseRecoveredPresentation.resolve();
 			await recoveredActivation.promise;
 
 			expect(failure.event).toBe("tool_registration");
@@ -1463,8 +1478,11 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			expect(session.getToolByName("stalled_detached_tool")).toBeUndefined();
 			expect(session.getToolByName("recovered_detached_tool")?.label).toBe("Recovered Detached Tool");
 		} finally {
+			testSetExtensionHandlerTimeoutMs(EXTENSION_HANDLER_TIMEOUT_MS);
 			releaseStalledRegistration.resolve();
 			releaseRecoveredRegistration.resolve();
+			releaseRecoveredPresentation.resolve();
+			vi.useRealTimers();
 			await session.dispose();
 		}
 	});
