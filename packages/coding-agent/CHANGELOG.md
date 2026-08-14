@@ -9,6 +9,14 @@
 ### Fixed
 
 - Fixed stale todo lifecycle handling: guidance now distinguishes finished, blocked, abandoned, and obsolete tasks; completed subagent results bring blocked parent work into the next stop-time reconciliation; supported native providers, including Google, receive a named `todo` tool choice while owned/in-band dialects enforce it locally; read-only `todo view` calls no longer reset the drift reminder; and the interactive UI no longer writes fuzzy, non-persisted subagent matches into canonical todo state.
+## [17.3.3] - 2026-08-14
+
+### Fixed
+
+- Automatically continued Gemini turns that stopped after thinking without final output, using a bounded final-answer reminder instead of exhausting generic retries.
+- Retried Gemini `MALFORMED_FUNCTION_CALL` failures when every emitted tool call was proven unexecuted, while preserving real tool-result and visible-output replay guards.
+- Kept current terminal retry errors in one pinned banner with attempt context while surfacing local continuation failures instead of stale provider errors.
+
 ## [17.3.2] - 2026-08-13
 
 ### Fixed
