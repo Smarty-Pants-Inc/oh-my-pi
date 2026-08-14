@@ -394,6 +394,8 @@ export type WireFrame = GuestFrame | HostFrame;
  *   answered by the `ui-response` guest frame. Guests that predate the
  *   grammar would silently drop `ui-request` (asks hang forever on the
  *   host), so they must be rejected at hello.
+ * - `4`: guest prompts may carry a display name, and persisted prompt details
+ *   carry the display-name revision used by identity-aware renderers.
  */
 export const COLLAB_PROTO = 4;
 
