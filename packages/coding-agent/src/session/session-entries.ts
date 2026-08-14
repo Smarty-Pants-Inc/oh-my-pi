@@ -1,6 +1,7 @@
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent, MessageAttribution, ServiceTierByFamily, TextContent } from "@oh-my-pi/pi-ai";
 import type { StructuredSubagentSchemaMode } from "../task/types";
+import type { CustomMessage } from "./messages";
 
 export const CURRENT_SESSION_VERSION = 3;
 
@@ -156,6 +157,22 @@ export interface CustomEntry<T = unknown> extends SessionEntryBase {
 	type: "custom";
 	customType: string;
 	data?: T;
+}
+
+export const PENDING_SEMANTIC_DELIVERY_TYPE = "omp:pending-semantic-delivery";
+export const SETTLED_SEMANTIC_DELIVERY_TYPE = "omp:settled-semantic-delivery";
+
+export type PendingSemanticDeliveryKind = "steer" | "followUp" | "explicitPrompt";
+
+export interface PendingSemanticDeliveryData {
+	v: 1;
+	kind: PendingSemanticDeliveryKind;
+	message: CustomMessage;
+}
+
+export interface SettledSemanticDeliveryData {
+	pendingId: string;
+	outcome: "delivered" | "cancelled";
 }
 
 /** Label entry for user-defined bookmarks/markers on entries. */

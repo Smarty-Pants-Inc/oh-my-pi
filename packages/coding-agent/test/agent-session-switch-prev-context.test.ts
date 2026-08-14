@@ -449,8 +449,8 @@ describe("AgentSession.switchSession previous-context build", () => {
 				if (event.type === "session_before_switch") order.push("public");
 				return emit(event);
 			});
-			const beforeMutation = extensionRunner.emitHostInternalBeforeSessionMutation.bind(extensionRunner);
-			vi.spyOn(extensionRunner, "emitHostInternalBeforeSessionMutation").mockImplementation(event => {
+			const beforeMutation = extensionRunner.emitBeforeSessionMutation.bind(extensionRunner);
+			vi.spyOn(extensionRunner, "emitBeforeSessionMutation").mockImplementation(event => {
 				if (event.type === "session_switch") order.push("host");
 				return beforeMutation(event);
 			});
@@ -2661,8 +2661,8 @@ describe("AgentSession.switchSession previous-context build", () => {
 			if (transition === "tree") {
 				vi.spyOn(extensionRunner, "hasHandlers").mockImplementation(eventType => eventType === "session_tree");
 			}
-			const beforeMutation = extensionRunner.emitHostInternalBeforeSessionMutation.bind(extensionRunner);
-			vi.spyOn(extensionRunner, "emitHostInternalBeforeSessionMutation").mockImplementation(async event => {
+			const beforeMutation = extensionRunner.emitBeforeSessionMutation.bind(extensionRunner);
+			vi.spyOn(extensionRunner, "emitBeforeSessionMutation").mockImplementation(async event => {
 				if (event.type === transitionEvent) {
 					jobGate.resolve(jobMarker);
 					await asyncManager.waitForOwnerJobs("Main");
@@ -2745,8 +2745,8 @@ describe("AgentSession.switchSession previous-context build", () => {
 			if (transition === "tree") {
 				vi.spyOn(extensionRunner, "hasHandlers").mockImplementation(eventType => eventType === "session_tree");
 			}
-			const beforeMutation = extensionRunner.emitHostInternalBeforeSessionMutation.bind(extensionRunner);
-			vi.spyOn(extensionRunner, "emitHostInternalBeforeSessionMutation").mockImplementation(async event => {
+			const beforeMutation = extensionRunner.emitBeforeSessionMutation.bind(extensionRunner);
+			vi.spyOn(extensionRunner, "emitBeforeSessionMutation").mockImplementation(async event => {
 				if (event.type === transitionEvent) {
 					jobGate.resolve(jobMarker);
 					await asyncManager.waitForOwnerJobs("Main");
@@ -2787,8 +2787,8 @@ describe("AgentSession.switchSession previous-context build", () => {
 			leafId: string | null;
 			messages: number;
 		}> = [];
-		const beforeMutation = extensionRunner.emitHostInternalBeforeSessionMutation.bind(extensionRunner);
-		vi.spyOn(extensionRunner, "emitHostInternalBeforeSessionMutation").mockImplementation(event => {
+		const beforeMutation = extensionRunner.emitBeforeSessionMutation.bind(extensionRunner);
+		vi.spyOn(extensionRunner, "emitBeforeSessionMutation").mockImplementation(event => {
 			if (event.type === "session_branch") {
 				observed.push({
 					phase: "before",
@@ -2895,8 +2895,8 @@ describe("AgentSession.switchSession previous-context build", () => {
 		const retainedMessages = [...session.messages];
 		const retainedRaw = await Bun.file(retainedSessionFile).text();
 		const phases: string[] = [];
-		const beforeMutation = extensionRunner.emitHostInternalBeforeSessionMutation.bind(extensionRunner);
-		vi.spyOn(extensionRunner, "emitHostInternalBeforeSessionMutation").mockImplementation(async event => {
+		const beforeMutation = extensionRunner.emitBeforeSessionMutation.bind(extensionRunner);
+		vi.spyOn(extensionRunner, "emitBeforeSessionMutation").mockImplementation(async event => {
 			if (event.type === "session_tree") phases.push("fence");
 			return beforeMutation(event);
 		});
@@ -3000,8 +3000,8 @@ describe("AgentSession.switchSession previous-context build", () => {
 					advisorPrompt: unknown;
 			  }
 			| undefined;
-		const beforeMutation = extensionRunner.emitHostInternalBeforeSessionMutation.bind(extensionRunner);
-		vi.spyOn(extensionRunner, "emitHostInternalBeforeSessionMutation").mockImplementation(event => {
+		const beforeMutation = extensionRunner.emitBeforeSessionMutation.bind(extensionRunner);
+		vi.spyOn(extensionRunner, "emitBeforeSessionMutation").mockImplementation(event => {
 			if (event.type === "session_branch") phases.push("fence");
 			return beforeMutation(event);
 		});
@@ -3084,8 +3084,8 @@ describe("AgentSession.switchSession previous-context build", () => {
 
 		vi.spyOn(extensionRunner, "hasHandlers").mockImplementation(eventType => eventType === "session_tree");
 		const observed: Array<{ phase: "before" | "complete"; leafId: string | null; messages: number }> = [];
-		const beforeMutation = extensionRunner.emitHostInternalBeforeSessionMutation.bind(extensionRunner);
-		vi.spyOn(extensionRunner, "emitHostInternalBeforeSessionMutation").mockImplementation(event => {
+		const beforeMutation = extensionRunner.emitBeforeSessionMutation.bind(extensionRunner);
+		vi.spyOn(extensionRunner, "emitBeforeSessionMutation").mockImplementation(event => {
 			if (event.type === "session_tree") {
 				observed.push({ phase: "before", leafId: sessionManager.getLeafId(), messages: session.messages.length });
 			}
@@ -3213,8 +3213,8 @@ describe("AgentSession.switchSession previous-context build", () => {
 					advisorPrompt: unknown;
 			  }
 			| undefined;
-		const beforeMutation = extensionRunner.emitHostInternalBeforeSessionMutation.bind(extensionRunner);
-		vi.spyOn(extensionRunner, "emitHostInternalBeforeSessionMutation").mockImplementation(event => {
+		const beforeMutation = extensionRunner.emitBeforeSessionMutation.bind(extensionRunner);
+		vi.spyOn(extensionRunner, "emitBeforeSessionMutation").mockImplementation(event => {
 			if (event.type === "session_tree") phases.push("fence");
 			return beforeMutation(event);
 		});
@@ -4702,11 +4702,13 @@ describe("AgentSession.switchSession previous-context build", () => {
 			path: "test://host-publication-ordinary-handler",
 			resolvedPath: "test://host-publication-ordinary-handler",
 			handlers: new Map([["session_ready", [() => ordinaryHandlerRuns++]]]),
+			sessionMutationFences: [],
 		} as unknown as Extension;
 		const hostExtension = {
 			path: "test://host-publication-host-handler",
 			resolvedPath: "test://host-publication-host-handler",
 			handlers: new Map(),
+			sessionMutationFences: [],
 		} as unknown as Extension;
 		const hostPublicationStarted = Promise.withResolvers<void>();
 		const releaseHostPublication = Promise.withResolvers<void>();

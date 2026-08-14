@@ -999,6 +999,135 @@ describe("AgentSession handoff", () => {
 		expect(session.agent.peekFollowUpQueue().map(textOf)).toEqual(["keep-followup"]);
 	});
 
+	it("moves durable semantic queue ownership to the handoff target", async () => {
+		vi.spyOn(compactionModule, "generateHandoffFromContext").mockResolvedValue("## Goal\nContinue");
+		session.agent.state.isStreaming = true;
+		await expect(
+			session.sendCustomMessage(
+				{ customType: "handoff-mail", content: "deliver only from target", display: true, attribution: "agent" },
+				{ deliveryMode: "steer" },
+			),
+		).resolves.toEqual({ status: "accepted", delivery: "queued_steer" });
+		const sourceSessionFile = session.sessionFile;
+		if (!sourceSessionFile) throw new Error("Expected durable source session");
+		session.agent.state.isStreaming = false;
+
+		await session.handoff();
+
+		const targetSessionFile = session.sessionFile;
+		if (!targetSessionFile || targetSessionFile === sourceSessionFile)
+			throw new Error("Expected handoff target session");
+		const queued = session.agent.peekSteeringQueue()[0];
+		expect(queued).toMatchObject({ role: "custom", customType: "handoff-mail" });
+		session.agent.emitExternalEvent({ type: "message_start", message: queued! });
+		session.agent.emitExternalEvent({ type: "message_end", message: queued! });
+		await waitFor(() =>
+			sessionManager
+				.getBranch()
+				.some(entry => entry.type === "custom" && entry.customType === "omp:settled-semantic-delivery"),
+		);
+		await sessionManager.flush();
+
+		const sourceManager = await SessionManager.open(sourceSessionFile, tempDir.path(), undefined, {
+			initialCwd: tempDir.path(),
+			suppressBreadcrumb: true,
+		});
+		const sourcePending = sourceManager
+			.getBranch()
+			.filter(entry => entry.type === "custom" && entry.customType === "omp:pending-semantic-delivery");
+		const sourceSettled = new Set(
+			sourceManager
+				.getBranch()
+				.flatMap(entry =>
+					entry.type === "custom" && entry.customType === "omp:settled-semantic-delivery"
+						? [(entry.data as { pendingId?: string }).pendingId]
+						: [],
+				),
+		);
+		expect(sourcePending).toHaveLength(1);
+		expect(sourceSettled.has(sourcePending[0]!.id)).toBe(true);
+		await sourceManager.close();
+		sourceManager.releaseRetainedEntries();
+
+		const targetBranch = sessionManager.getBranch();
+		const targetPending = targetBranch.filter(
+			entry => entry.type === "custom" && entry.customType === "omp:pending-semantic-delivery",
+		);
+		const targetSettled = new Set(
+			targetBranch.flatMap(entry =>
+				entry.type === "custom" && entry.customType === "omp:settled-semantic-delivery"
+					? [(entry.data as { pendingId?: string }).pendingId]
+					: [],
+			),
+		);
+		expect(targetPending).toHaveLength(1);
+		expect(targetSettled.has(targetPending[0]!.id)).toBe(true);
+		expect(
+			targetBranch.filter(entry => entry.type === "custom_message" && entry.customType === "handoff-mail"),
+		).toHaveLength(1);
+	});
+
+	it("keeps durable semantic queue ownership on the source when handoff rolls back", async () => {
+		vi.spyOn(compactionModule, "generateHandoffFromContext").mockResolvedValue("## Goal\nContinue");
+		session.agent.state.isStreaming = true;
+		await session.sendCustomMessage(
+			{ customType: "rollback-mail", content: "survive failed handoff", display: true, attribution: "agent" },
+			{ deliveryMode: "steer" },
+		);
+		const sourceSessionFile = session.sessionFile;
+		if (!sourceSessionFile) throw new Error("Expected durable source session");
+		session.agent.state.isStreaming = false;
+		const failure = new Error("handoff target migration failed");
+		const appendEntriesAtomically = sessionManager.appendEntriesAtomically.bind(sessionManager);
+		vi.spyOn(sessionManager, "appendEntriesAtomically").mockImplementation(append => {
+			if (session.sessionFile !== sourceSessionFile) return Promise.reject(failure);
+			return appendEntriesAtomically(append);
+		});
+
+		await expect(session.handoff()).rejects.toBe(failure);
+		expect(session.sessionFile).toBe(sourceSessionFile);
+		const durableSourceLines = (await Bun.file(sourceSessionFile).text())
+			.split("\n")
+			.filter(line => line.includes("semantic-delivery"));
+		expect(durableSourceLines.some(line => line.includes("omp:pending-semantic-delivery"))).toBe(true);
+		expect(durableSourceLines.some(line => line.includes("omp:settled-semantic-delivery"))).toBe(false);
+		session = undefined as unknown as AgentSession;
+		const reopened = await SessionManager.open(sourceSessionFile, tempDir.path(), undefined, {
+			initialCwd: tempDir.path(),
+			suppressBreadcrumb: true,
+		});
+		const reopenedPending = reopened
+			.getBranch()
+			.filter(entry => entry.type === "custom" && entry.customType === "omp:pending-semantic-delivery");
+		expect(reopenedPending).toHaveLength(1);
+		expect(reopenedPending[0]).toMatchObject({
+			type: "custom",
+			data: { v: 1, kind: "steer", message: { role: "custom", customType: "rollback-mail" } },
+		});
+		const reopenedSettled = reopened
+			.getBranch()
+			.filter(entry => entry.type === "custom" && entry.customType === "omp:settled-semantic-delivery");
+		expect(reopenedSettled).toHaveLength(0);
+		sessionManager = reopened;
+		session = new AgentSession({
+			agent: new Agent({ initialState: { model: undefined, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager,
+			settings: Settings.isolated({ "compaction.enabled": true, "compaction.autoContinue": false }),
+			modelRegistry,
+			obfuscator,
+		});
+		const postConstructPending = sessionManager
+			.getBranch()
+			.filter(entry => entry.type === "custom" && entry.customType === "omp:pending-semantic-delivery");
+		const postConstructSettled = sessionManager
+			.getBranch()
+			.filter(entry => entry.type === "custom" && entry.customType === "omp:settled-semantic-delivery");
+		expect(postConstructPending).toHaveLength(1);
+		expect(postConstructSettled).toHaveLength(0);
+		expect(session.agent.peekSteeringQueue()).toHaveLength(1);
+		expect(JSON.stringify(session.agent.peekSteeringQueue()[0])).toContain("survive failed handoff");
+	});
+
 	it("preserves steering and follow-up messages enqueued while the handoff is in flight", async () => {
 		// Defect 2 in-flight window: the queue snapshot must be captured immediately before
 		// agent.reset() (after generateHandoff resolves), NOT at handoff entry. A steer or

@@ -107,6 +107,7 @@ function createHarness(): Harness {
 		}) => {
 			const parent = entries.length === 0 ? null : entries[entries.length - 1].id;
 			entries.push(makeCustomEntry(entries.length + 1, extractText(msg.content), parent));
+			return { status: "accepted", delivery: "plain_append" } as const;
 		},
 	};
 

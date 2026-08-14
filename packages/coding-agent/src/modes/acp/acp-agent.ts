@@ -2345,9 +2345,11 @@ export class AcpAgent implements Agent {
 		extensionRunner.initialize(
 			{
 				sendMessage: (message, options) => {
-					record.session.sendCustomMessage(message, options).catch((error: unknown) => {
+					const sendTask = record.session.sendCustomMessage(message, options);
+					void sendTask.catch((error: unknown) => {
 						logger.warn("ACP extension sendMessage failed", { error });
 					});
+					return sendTask;
 				},
 				sendUserMessage: (content, options) => {
 					this.#trackExtensionUserMessage(record, record.session.sendUserMessage(content, options));

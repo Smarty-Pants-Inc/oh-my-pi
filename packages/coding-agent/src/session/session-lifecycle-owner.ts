@@ -883,6 +883,9 @@ export class SessionLifecycleOwner implements SessionLifecycleOwnership {
 
 export interface RetainedSessionRuntimeFields {
 	pendingNextTurnMessages: CustomMessage[];
+	pendingExplicitPromptMessages: CustomMessage[];
+	queuedExplicitPromptCompanions: Array<{ owner: AgentMessage; messages: CustomMessage[] }>;
+	pendingSemanticDeliveryIds: Set<string>;
 	scheduledHiddenNextTurnGeneration: number | undefined;
 	queuedMessageDrainBlocked: boolean;
 	usagePreflightReadyForNextModelCall: boolean;
@@ -949,6 +952,7 @@ export interface RetainedSessionCheckpointHost {
 		| "setSystemPrompt"
 		| "replaceMessages"
 		| "replaceQueues"
+		| "restoreQueuedMessageCompanions"
 	>;
 	models: Pick<
 		ModelControls,
@@ -1156,6 +1160,11 @@ async function restoreRetainedSessionCheckpoint(
 		await attemptRestore(() => host.agent.setSystemPrompt(checkpoint.systemPrompt));
 		await attemptRestore(() => host.agent.replaceMessages(checkpoint.agentMessages));
 		await attemptRestore(() => host.agent.replaceQueues(checkpoint.steeringMessages, checkpoint.followUpMessages));
+		await attemptRestore(() =>
+			host.agent.restoreQueuedMessageCompanions(checkpoint.queuedExplicitPromptCompanions, messages => {
+				checkpoint.pendingExplicitPromptMessages.unshift(...(messages as CustomMessage[]));
+			}),
+		);
 		await attemptRestore(() => host.todo.setPhases(checkpoint.todoPhases));
 		await attemptRestore(() => host.advisors.restoreCost(checkpoint.advisorCosts));
 	};

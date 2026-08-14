@@ -79,6 +79,7 @@ describe("AgentSession bash session ownership", () => {
 			emitUserBash,
 			emit: vi.fn().mockResolvedValue(undefined),
 			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
+			emitBeforeSessionMutation: vi.fn().mockResolvedValue(undefined),
 			emitWithHostCompletion: vi.fn(
 				async (_event: { type: string }, finalizeBeforeHostCompletion?: () => void | Promise<void>) => {
 					await finalizeBeforeHostCompletion?.();
@@ -149,7 +150,7 @@ describe("AgentSession bash session ownership", () => {
 			{ deliverAs: "nextTurn", triggerTurn: true, acceptTerminalEmptyStop: true },
 		);
 		unsubscribe();
-		expect(started).toBe(true);
+		expect(started).toEqual({ status: "accepted", delivery: "started_turn" });
 		expect(session.hasPendingBashMessages).toBe(true);
 		const discardedAssistantEntry = sessionManager
 			.getEntries()

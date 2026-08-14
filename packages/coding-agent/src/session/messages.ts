@@ -600,12 +600,19 @@ export function readQueueChipText(details: unknown): string | undefined {
 	return typeof candidate === "string" ? candidate : undefined;
 }
 
+/** Extract the durable pending-delivery journal id from transient custom-message details. */
+export function readPendingSemanticDeliveryId(details: unknown): string | undefined {
+	if (typeof details !== "object" || details === null) return undefined;
+	const candidate = (details as { __pendingSemanticDeliveryId?: unknown }).__pendingSemanticDeliveryId;
+	return typeof candidate === "string" ? candidate : undefined;
+}
+
 /** Explicit allowlist of `details` field names that are AgentSession-internal
  *  transient bookkeeping and MUST be removed before SessionManager persists
  *  the CustomMessageEntry to disk. Scoped intentionally narrow: only fields
  *  declared here are stripped. Adding a new entry is a deliberate, reviewed
  *  change — unrelated future payload fields are never silently dropped. */
-export const INTERNAL_DETAILS_FIELDS = ["__queueChipText"] as const;
+export const INTERNAL_DETAILS_FIELDS = ["__queueChipText", "__pendingSemanticDeliveryId"] as const;
 
 /** Return a `details` copy with every key in `INTERNAL_DETAILS_FIELDS`
  *  removed. Returns the input unchanged when there is nothing to strip

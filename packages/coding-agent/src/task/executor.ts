@@ -3291,12 +3291,14 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				extensionRunner.initialize(
 					{
 						sendMessage: (message, options) => {
-							const sendPromise = session.sendCustomMessage(message, options).catch(e => {
+							const sendTask = session.sendCustomMessage(message, options);
+							const reportTask = sendTask.catch(e => {
 								logger.error("Extension sendMessage failed", {
 									error: e instanceof Error ? e.message : String(e),
 								});
 							});
-							pendingExtensionMessages.push(sendPromise);
+							pendingExtensionMessages.push(reportTask);
+							return sendTask;
 						},
 						sendUserMessage: (content, options) => {
 							const sendPromise = session.sendUserMessage(content, options).catch(e => {

@@ -4,7 +4,7 @@ import {
 	reportLocalOnlyPromptResult,
 	watchAndReportLocalOnlyPromptResult,
 } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
-import type { ExtensionActions } from "../src/extensibility/extensions/types";
+import type { ExtensionActions, SendMessageDisposition } from "../src/extensibility/extensions/types";
 import { initializeExtensions } from "../src/modes/runtime-init";
 import type { AgentSession } from "../src/session/agent-session";
 
@@ -107,10 +107,11 @@ describe("reportLocalOnlyPromptResult", () => {
 		expect(output).toEqual([{ type: "prompt_result", id: "req_1", agentInvoked: false }]);
 	});
 
-	test("marks triggerTurn extension custom messages as agent work", async () => {
+	test("marks extension custom messages that start agent turns as agent work", async () => {
 		let extensionActions: ExtensionActions | undefined;
 		let markCount = 0;
-		let sentOptions: { triggerTurn?: boolean } | undefined;
+		const bothMarked = Promise.withResolvers<void>();
+		const sentOptions: Array<{ triggerTurn?: boolean; deliveryMode?: "auto" }> = [];
 		const session = {
 			extensionRunner: {
 				initialize: (actions: ExtensionActions) => {
@@ -119,8 +120,9 @@ describe("reportLocalOnlyPromptResult", () => {
 				onError: () => {},
 				emit: async () => {},
 			},
-			sendCustomMessage: async (_message: unknown, options?: { triggerTurn?: boolean }) => {
-				sentOptions = options;
+			sendCustomMessage: async (_message: unknown, options?: { triggerTurn?: boolean; deliveryMode?: "auto" }) => {
+				sentOptions.push(options ?? {});
+				return { status: "accepted", delivery: "started_turn" } as const;
 			},
 		} as unknown as AgentSession;
 
@@ -133,21 +135,88 @@ describe("reportLocalOnlyPromptResult", () => {
 			},
 			markAgentInvokingMessage: () => {
 				markCount += 1;
+				if (markCount === 2) bothMarked.resolve();
 			},
 		});
-		extensionActions?.sendMessage(
-			{
-				customType: "test",
-				content: "context",
-				display: true,
-				details: "context",
-				attribution: "user",
-			},
-			{ triggerTurn: true },
-		);
+		const message = {
+			customType: "test",
+			content: "context",
+			display: true,
+			details: "context",
+			attribution: "user" as const,
+		};
+		extensionActions?.sendMessage(message, { triggerTurn: true });
+		extensionActions?.sendMessage(message, { deliveryMode: "auto" });
+		await bothMarked.promise;
 
-		expect(markCount).toBe(1);
-		expect(sentOptions).toEqual({ triggerTurn: true });
+		expect(markCount).toBe(2);
+		expect(sentOptions).toEqual([{ triggerTurn: true }, { deliveryMode: "auto" }]);
+	});
+
+	test("reports rejected custom messages as local-only without rejecting turn tracking", async () => {
+		let extensionActions: ExtensionActions | undefined;
+		let sending: Promise<SendMessageDisposition> | undefined;
+		let trackedTurn: Promise<unknown> | undefined;
+		const output: object[] = [];
+		const reportedErrors: Error[] = [];
+		const thrown = new Error("send failed");
+		const extensionUserMessages = new RpcExtensionUserMessageTracker();
+		const session = {
+			extensionRunner: {
+				initialize: (actions: ExtensionActions) => {
+					extensionActions = actions;
+				},
+				onError: () => {},
+				emit: async () => {},
+			},
+			sendCustomMessage: async () => {
+				throw thrown;
+			},
+		} as unknown as AgentSession;
+
+		await initializeExtensions(session, {
+			reportSendError: (_action, error) => {
+				reportedErrors.push(error);
+			},
+			reportRuntimeError: error => {
+				throw error.error;
+			},
+			trackAgentInvokingMessage: task => {
+				trackedTurn = task;
+				extensionUserMessages.trackAgentMessageTask(task);
+			},
+		});
+
+		const trackedPrompt = extensionUserMessages.watchPrompt(() => {
+			if (!extensionActions) throw new Error("extensions not initialized");
+			sending = extensionActions.sendMessage(
+				{
+					customType: "test",
+					content: "context",
+					display: true,
+					details: "context",
+					attribution: "user",
+				},
+				{ deliveryMode: "auto" },
+			);
+			return Promise.resolve(false);
+		});
+		reportLocalOnlyPromptResult({
+			id: "req_rejected_custom",
+			prompt: trackedPrompt.prompt,
+			output: frame => output.push(frame),
+			onError: error => {
+				throw error;
+			},
+			hasExtensionAgentMessageTask: trackedPrompt.hasAgentMessageTask,
+			waitForExtensionAgentMessageTasks: trackedPrompt.waitForAgentMessageTasks,
+		});
+		if (!sending || !trackedTurn) throw new Error("send was not tracked");
+		await expect(sending).rejects.toBe(thrown);
+		await waitForTrackedPromptHandlers(trackedPrompt);
+		await expect(trackedTurn).resolves.toBe(false);
+		expect(reportedErrors).toEqual([thrown]);
+		expect(output).toEqual([{ type: "prompt_result", id: "req_rejected_custom", agentInvoked: false }]);
 	});
 
 	test("suppresses prompt_result when extension sendUserMessage succeeds", async () => {

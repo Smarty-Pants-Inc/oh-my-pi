@@ -245,7 +245,7 @@ describe("AgentSession.branchFromBtw", () => {
 		const extensionRunner = {
 			hasHandlers: vi.fn(() => false),
 			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
-			emitHostInternalBeforeSessionMutation: vi.fn(async (event: { type: string }) => {
+			emitBeforeSessionMutation: vi.fn(async (event: { type: string }) => {
 				if (event.type === "session_branch") phases.push("fence");
 			}),
 			emitWithHostCompletion: vi.fn(
@@ -301,7 +301,7 @@ describe("AgentSession.branchFromBtw", () => {
 		const extensionRunner = {
 			hasHandlers: vi.fn(() => false),
 			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
-			emitHostInternalBeforeSessionMutation: vi.fn(async (event: { type: string }) => {
+			emitBeforeSessionMutation: vi.fn(async (event: { type: string }) => {
 				if (event.type !== "session_branch") return;
 				jobGate.resolve(jobMarker);
 				await asyncManager.waitForOwnerJobs("Main");
@@ -386,7 +386,7 @@ describe("AgentSession.branchFromBtw", () => {
 		const extensionRunner = {
 			hasHandlers: vi.fn(() => false),
 			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
-			emitHostInternalBeforeSessionMutation: vi.fn(async (event: { type: string }) => {
+			emitBeforeSessionMutation: vi.fn(async (event: { type: string }) => {
 				if (event.type !== "session_branch") return;
 				jobGate.resolve(jobMarker);
 				await asyncManager.waitForOwnerJobs("Main");
@@ -493,7 +493,7 @@ describe("AgentSession.branchFromBtw", () => {
 		const extensionRunner = {
 			hasHandlers: vi.fn(() => false),
 			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
-			emitHostInternalBeforeSessionMutation: vi.fn(async (event: { type: string }) => {
+			emitBeforeSessionMutation: vi.fn(async (event: { type: string }) => {
 				if (event.type === "session_branch") phases.push("fence");
 			}),
 			emitWithHostCompletion: vi.fn(
@@ -806,6 +806,7 @@ describe("AgentSession.branchFromBtw", () => {
 		const extensionRunner = {
 			hasHandlers: vi.fn((eventType: string) => eventType === "session_before_branch"),
 			emit: vi.fn(async () => ({ skipConversationRestore: true })),
+			emitBeforeSessionMutation: vi.fn().mockResolvedValue(undefined),
 			emitWithHostCompletion: vi.fn(
 				async (_event: { type: string }, finalizeBeforeHostCompletion?: () => void | Promise<void>) => {
 					await finalizeBeforeHostCompletion?.();

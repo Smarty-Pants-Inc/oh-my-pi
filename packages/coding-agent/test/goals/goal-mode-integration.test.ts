@@ -425,7 +425,9 @@ describe("InteractiveMode goal mode integration", () => {
 			},
 		];
 		harness.session.setTodoPhases(phases);
-		const sendCustomMessage = vi.spyOn(harness.session, "sendCustomMessage").mockResolvedValue(false);
+		const sendCustomMessage = vi
+			.spyOn(harness.session, "sendCustomMessage")
+			.mockResolvedValue({ status: "accepted", delivery: "plain_append" });
 
 		await harness.session.sendGoalModeContext({ deliverAs: "steer" });
 
@@ -455,7 +457,9 @@ describe("InteractiveMode goal mode integration", () => {
 				],
 			},
 		]);
-		const sendCustomMessage = vi.spyOn(harness.session, "sendCustomMessage").mockResolvedValue(false);
+		const sendCustomMessage = vi
+			.spyOn(harness.session, "sendCustomMessage")
+			.mockResolvedValue({ status: "accepted", delivery: "plain_append" });
 
 		await harness.session.sendGoalModeContext({ deliverAs: "steer" });
 
@@ -479,7 +483,9 @@ describe("InteractiveMode goal mode integration", () => {
 				tasks: [{ content: "Run focused checks", status: "pending" }],
 			},
 		]);
-		const sendCustomMessage = vi.spyOn(harness.session, "sendCustomMessage").mockResolvedValue(false);
+		const sendCustomMessage = vi
+			.spyOn(harness.session, "sendCustomMessage")
+			.mockResolvedValue({ status: "accepted", delivery: "plain_append" });
 
 		await harness.session.sendGoalModeContext({ deliverAs: "steer" });
 
