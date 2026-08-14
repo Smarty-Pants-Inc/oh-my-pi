@@ -767,10 +767,9 @@ export class InputController {
 					return;
 				}
 				const images = inputImages && inputImages.length > 0 ? [...inputImages] : undefined;
-				this.ctx.editor.clearDraft(text);
 				// No local render: the prompt comes back from the host as a
 				// collab-prompt event/entry and renders with the author badge.
-				this.ctx.collabGuest.sendPrompt(text, images);
+				if (this.ctx.collabGuest.sendPrompt(text, images)) this.ctx.editor.clearDraft(text);
 				return;
 			}
 

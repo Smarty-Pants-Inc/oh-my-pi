@@ -12,8 +12,8 @@
  * and reconnects, the next guest hello triggers the same oversized send, and
  * the loop never breaks (issue #3739).
  *
- * This helper bounds any JSON-serializable payload below
- * {@link MAX_REPLICATED_PAYLOAD_BYTES}. Already-small payloads pass through
+ * This helper bounds the UTF-8 JSON serialization of any serializable payload
+ * below {@link MAX_REPLICATED_PAYLOAD_BYTES}. Already-small payloads pass through
  * untouched; oversized ones are returned as a deep-cloned shadow where long
  * strings are head-truncated AND long arrays are head-clipped, with
  * `[…N chars elided for collab session]` / `[…N items elided for collab
@@ -23,12 +23,11 @@
  */
 
 /**
- * Per-payload ceiling for host→guest frames. Bun's default WebSocket
- * `maxPayloadLength` is 16 MB; we leave a generous margin so the AES-GCM
- * envelope (+ IV + tag), the 4-byte peer header, and the outer wire wrapper
- * fit comfortably under that on every reasonable relay.
+ * Per-payload ceiling for host→guest frames. Local NDJSON bridge records are
+ * capped at 1 MiB; reserve 1 KiB for the `{t:"frame",...}` wrapper and newline.
+ * The same margin remains ample for encrypted relay envelopes.
  */
-export const MAX_REPLICATED_PAYLOAD_BYTES = 1 * 1024 * 1024;
+export const MAX_REPLICATED_PAYLOAD_BYTES = 1024 * 1024 - 1024;
 
 /**
  * Progressive shrink passes. Each pass tightens both the per-string cap and
@@ -93,7 +92,7 @@ function shrinkWalk(value: unknown, stringCap: number, arrayLimit: number): unkn
 }
 
 /**
- * Return `value` unchanged when its JSON serialization already fits
+ * Return `value` unchanged when its UTF-8 JSON serialization already fits
  * {@link MAX_REPLICATED_PAYLOAD_BYTES}; otherwise return a deep-cloned
  * shadow shrunk along both string and array axes until the payload fits.
  * The function is generic over `T` because the wire shape is preserved:
@@ -101,11 +100,11 @@ function shrinkWalk(value: unknown, stringCap: number, arrayLimit: number): unkn
  * other small metadata pass through untouched.
  */
 export function shrinkForReplication<T>(value: T): T {
-	if (JSON.stringify(value).length <= MAX_REPLICATED_PAYLOAD_BYTES) return value;
+	if (Buffer.byteLength(JSON.stringify(value)) <= MAX_REPLICATED_PAYLOAD_BYTES) return value;
 	let shrunk: unknown = value;
 	for (const pass of SHRINK_PASSES) {
 		shrunk = shrinkWalk(value, pass.stringCap, pass.arrayLimit);
-		if (JSON.stringify(shrunk).length <= MAX_REPLICATED_PAYLOAD_BYTES) return shrunk as T;
+		if (Buffer.byteLength(JSON.stringify(shrunk)) <= MAX_REPLICATED_PAYLOAD_BYTES) return shrunk as T;
 	}
 	return shrunk as T;
 }
