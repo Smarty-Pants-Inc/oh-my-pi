@@ -37,6 +37,7 @@ import {
 	type AsideMessage,
 	type BeforeToolCallContext,
 	type BeforeToolCallResult,
+	EventLoopKeepalive,
 	resolveOwnedDialectFromEnv,
 	resolveTelemetry,
 	type StreamFn,
@@ -1347,19 +1348,32 @@ export class AgentSession {
 					deferUntilLifecycleSelection();
 					return;
 				}
-				this.#schedulePostPromptTask(
-					async () => {
-						if (this.#lifecycleTransitionFenceActive) {
-							deferUntilLifecycleSelection();
-							return;
-						}
-						await run();
-					},
-					{
-						delayMs: 1,
-						onSkip: () => this.yieldQueue.cancelIdleFlushScheduling(),
-					},
-				);
+				const keepalive = new EventLoopKeepalive();
+				try {
+					this.#schedulePostPromptTask(
+						async () => {
+							try {
+								if (this.#lifecycleTransitionFenceActive) {
+									deferUntilLifecycleSelection();
+									return;
+								}
+								await run();
+							} finally {
+								keepalive[Symbol.dispose]();
+							}
+						},
+						{
+							delayMs: 1,
+							onSkip: () => {
+								keepalive[Symbol.dispose]();
+								this.yieldQueue.cancelIdleFlushScheduling();
+							},
+						},
+					);
+				} catch (error) {
+					keepalive[Symbol.dispose]();
+					throw error;
+				}
 			},
 		});
 		this.yieldQueue.register<LaunchCompletionEntry>(LAUNCH_COMPLETION_MESSAGE_TYPE, {

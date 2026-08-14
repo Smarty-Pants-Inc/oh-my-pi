@@ -37,6 +37,7 @@ async function expectPostCreationExit(options: { args: string[]; timing?: string
 	const events: string[] = [];
 	const session = {
 		model: undefined,
+		getAllToolNames: () => [],
 		dispose: async () => {
 			// AgentSession.dispose() emits session_shutdown; the companion turns that
 			// event into its final stopped snapshot before postmortem may exit.

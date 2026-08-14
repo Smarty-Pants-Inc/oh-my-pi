@@ -6,6 +6,8 @@ import { buildModel } from "@oh-my-pi/pi-catalog/build";
 const ANTIGRAVITY_DAILY_ENDPOINT = "https://daily-cloudcode-pa.googleapis.com";
 const ANTIGRAVITY_SANDBOX_ENDPOINT = "https://daily-cloudcode-pa.sandbox.googleapis.com";
 const FLASH_FIRST_EVENT_TIMEOUT_MS = 60_000;
+const ANTIGRAVITY_VERSION_MANIFEST_URL =
+	"https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-arm64-mac.yml";
 const context: Context = { messages: [{ role: "user", content: "hi", timestamp: 1 }] };
 const antigravityModel: Model<"google-gemini-cli"> = buildModel({
 	id: "gemini-3-flash",
@@ -42,6 +44,8 @@ test("Antigravity Flash fails over when headers arrive without a first SSE event
 	vi.useFakeTimers();
 
 	const fetchMock: FetchImpl = async input => {
+		const url = input instanceof Request ? input.url : input.toString();
+		if (url === ANTIGRAVITY_VERSION_MANIFEST_URL) return new Response("version: 2.8.0");
 		const endpoint = endpointFromInput(input);
 		requestedEndpoints.push(endpoint);
 		if (endpoint === ANTIGRAVITY_SANDBOX_ENDPOINT) {

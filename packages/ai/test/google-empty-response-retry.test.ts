@@ -27,6 +27,24 @@ function ccaChunk(text: string): Record<string, unknown> {
 	return { response: genaiChunk(text) };
 }
 
+/**
+ * `{ response: { candidates } }` envelope carrying only a thinking part with `finishReason: STOP` —
+ * the intentional-silence Advisor case (#8480): no visible text and no tool call.
+ */
+function ccaThinkingOnlyChunk(thinking: string): Record<string, unknown> {
+	return {
+		response: {
+			candidates: [{ content: { parts: [{ text: thinking, thought: true }] }, finishReason: "STOP" }],
+			usageMetadata: {
+				promptTokenCount: 10,
+				candidatesTokenCount: 0,
+				thoughtsTokenCount: 5,
+				totalTokenCount: 15,
+			},
+		},
+	};
+}
+
 async function drain(stream: AsyncIterable<AssistantMessageEvent>) {
 	const events: AssistantMessageEvent[] = [];
 	for await (const event of stream) events.push(event);
@@ -83,6 +101,8 @@ const cliModel: Model<"google-gemini-cli"> = buildModel({
 
 const ANTIGRAVITY_DAILY_ENDPOINT = "https://daily-cloudcode-pa.googleapis.com";
 const ANTIGRAVITY_SANDBOX_ENDPOINT = "https://daily-cloudcode-pa.sandbox.googleapis.com";
+const ANTIGRAVITY_VERSION_MANIFEST_URL =
+	"https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-arm64-mac.yml";
 
 const antigravityModel: Model<"google-gemini-cli"> = buildModel({
 	...cliModel,
@@ -98,6 +118,18 @@ function withResponseUrl(response: Response, endpoint: string): Response {
 function endpointFromInput(input: Parameters<FetchImpl>[0]): string {
 	const url = input instanceof Request ? input.url : input.toString();
 	return url.startsWith(ANTIGRAVITY_SANDBOX_ENDPOINT) ? ANTIGRAVITY_SANDBOX_ENDPOINT : ANTIGRAVITY_DAILY_ENDPOINT;
+}
+
+/**
+ * Dynamic client-version discovery is a separate Antigravity request; handle it
+ * so endpoint assertions observe only streamGenerateContent traffic.
+ */
+function withAntigravityVersionDiscovery(fetchMock: FetchImpl): FetchImpl {
+	return async (input, init) => {
+		const url = input instanceof Request ? input.url : input.toString();
+		if (url === ANTIGRAVITY_VERSION_MANIFEST_URL) return new Response("version: 2.8.0");
+		return fetchMock(input, init);
+	};
 }
 
 describe("Google empty-response retry (public + Vertex path)", () => {
@@ -348,7 +380,7 @@ describe("Google empty-response retry (Cloud Code Assist path)", () => {
 		const stream = streamGoogleGeminiCli(antigravityModel, context, {
 			apiKey: JSON.stringify({ token: "token", projectId: "proj-123" }),
 			antigravityEndpointMode: "auto",
-			fetch: fetchMock,
+			fetch: withAntigravityVersionDiscovery(fetchMock),
 		});
 		const { starts } = await drain(stream);
 		const result = await stream.result();
@@ -376,12 +408,78 @@ describe("Google empty-response retry (Cloud Code Assist path)", () => {
 			apiKey: JSON.stringify({ token: "token", projectId: "proj-123" }),
 			antigravityEndpointMode: "auto",
 			acceptEmptyResponse: true,
-			fetch: fetchMock,
+			fetch: withAntigravityVersionDiscovery(fetchMock),
 		});
 		const result = await stream.result();
 
 		// Daily still burns its empty-response budget and fails over; only the
 		// last (sandbox) endpoint records the empty STOP as valid silence.
+		expect(requestedEndpoints).toEqual([
+			ANTIGRAVITY_DAILY_ENDPOINT,
+			ANTIGRAVITY_DAILY_ENDPOINT,
+			ANTIGRAVITY_DAILY_ENDPOINT,
+			ANTIGRAVITY_SANDBOX_ENDPOINT,
+		]);
+		expect(result.stopReason).toBe("stop");
+		expect(result.errorMessage).toBeUndefined();
+	});
+
+	it("fails over before accepting Advisor silence when daily returns a thinking-only STOP", async () => {
+		const requestedEndpoints: string[] = [];
+		const fetchMock: FetchImpl = async input => {
+			const endpoint = endpointFromInput(input);
+			requestedEndpoints.push(endpoint);
+			const response =
+				endpoint === ANTIGRAVITY_SANDBOX_ENDPOINT
+					? sse(ccaChunk("Recovered."))
+					: sse(ccaThinkingOnlyChunk("No concrete risk. I will stay silent."));
+			return withResponseUrl(response, endpoint);
+		};
+
+		const stream = streamGoogleGeminiCli(antigravityModel, context, {
+			apiKey: JSON.stringify({ token: "token", projectId: "proj-123" }),
+			antigravityEndpointMode: "auto",
+			acceptEmptyResponse: true,
+			fetch: withAntigravityVersionDiscovery(fetchMock),
+		});
+		const result = await stream.result();
+
+		expect({
+			requestedEndpoints,
+			stopReason: result.stopReason,
+			errorMessage: result.errorMessage,
+			text: textOf(result),
+		}).toEqual({
+			requestedEndpoints: [
+				ANTIGRAVITY_DAILY_ENDPOINT,
+				ANTIGRAVITY_DAILY_ENDPOINT,
+				ANTIGRAVITY_DAILY_ENDPOINT,
+				ANTIGRAVITY_SANDBOX_ENDPOINT,
+			],
+			stopReason: "stop",
+			errorMessage: undefined,
+			text: "Recovered.",
+		});
+	});
+
+	it("accepts thinking-only silence on the final endpoint when both endpoints stay silent", async () => {
+		const requestedEndpoints: string[] = [];
+		const fetchMock: FetchImpl = async input => {
+			const endpoint = endpointFromInput(input);
+			requestedEndpoints.push(endpoint);
+			return withResponseUrl(sse(ccaThinkingOnlyChunk("Nothing to add. Staying silent.")), endpoint);
+		};
+
+		const stream = streamGoogleGeminiCli(antigravityModel, context, {
+			apiKey: JSON.stringify({ token: "token", projectId: "proj-123" }),
+			antigravityEndpointMode: "auto",
+			acceptEmptyResponse: true,
+			fetch: withAntigravityVersionDiscovery(fetchMock),
+		});
+		const result = await stream.result();
+
+		// Daily burns its empty budget and fails over; the sandbox (final) endpoint
+		// records the thinking-only STOP as valid Advisor silence.
 		expect(requestedEndpoints).toEqual([
 			ANTIGRAVITY_DAILY_ENDPOINT,
 			ANTIGRAVITY_DAILY_ENDPOINT,
@@ -407,7 +505,7 @@ describe("Google empty-response retry (Cloud Code Assist path)", () => {
 			const stream = streamGoogleGeminiCli(antigravityModel, context, {
 				apiKey: JSON.stringify({ token: "token", projectId: "proj-123" }),
 				antigravityEndpointMode: mode,
-				fetch: fetchMock,
+				fetch: withAntigravityVersionDiscovery(fetchMock),
 			});
 			const result = await stream.result();
 
@@ -452,7 +550,7 @@ describe("Google empty-response retry (Cloud Code Assist path)", () => {
 			const stream = streamGoogleGeminiCli(antigravityModel, context, {
 				apiKey: JSON.stringify({ token: "token", projectId: "proj-123" }),
 				antigravityEndpointMode: "auto",
-				fetch: fetchMock,
+				fetch: withAntigravityVersionDiscovery(fetchMock),
 			});
 			const result = await stream.result();
 
@@ -488,7 +586,7 @@ describe("Google empty-response retry (Cloud Code Assist path)", () => {
 		const stream = streamGoogleGeminiCli(antigravityModel, context, {
 			apiKey: JSON.stringify({ token: "token", projectId: "proj-123" }),
 			antigravityEndpointMode: "auto",
-			fetch: fetchMock,
+			fetch: withAntigravityVersionDiscovery(fetchMock),
 		});
 		const result = await stream.result();
 
@@ -511,7 +609,7 @@ describe("Google empty-response retry (Cloud Code Assist path)", () => {
 		const stream = streamGoogleGeminiCli(antigravityModel, context, {
 			apiKey: JSON.stringify({ token: "token", projectId: "proj-123" }),
 			antigravityEndpointMode: "auto",
-			fetch: fetchMock,
+			fetch: withAntigravityVersionDiscovery(fetchMock),
 		});
 		const { starts } = await drain(stream);
 		const result = await stream.result();

@@ -1,7 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import * as geminiCliProvider from "@oh-my-pi/pi-ai/providers/google-gemini-cli";
 import {
-	ANTIGRAVITY_SYSTEM_INSTRUCTION,
 	buildRequest,
 	parseGeminiCliCredentials,
 	shouldRefreshGeminiCliCredentials,
@@ -39,6 +38,8 @@ function createContext(): Context {
 }
 
 const VALIDATION_URL = "https://accounts.google.com/signin/continue?sarp=1&scc=1&plt=AKgnsbtTOKEN";
+const ANTIGRAVITY_VERSION_MANIFEST_URL =
+	"https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-arm64-mac.yml";
 
 const validationRequiredBody = JSON.stringify({
 	error: {
@@ -53,6 +54,14 @@ const validationRequiredBody = JSON.stringify({
 		],
 	},
 });
+
+function withAntigravityVersionDiscovery(fetchMock: FetchImpl): FetchImpl {
+	return async (input, init) => {
+		const url = input instanceof Request ? input.url : input.toString();
+		if (url === ANTIGRAVITY_VERSION_MANIFEST_URL) return new Response("version: 2.8.0");
+		return fetchMock(input, init);
+	};
+}
 
 describe("Google Gemini CLI alignment", () => {
 	it("encodes enriched OAuth JSON while preserving token + projectId", async () => {
@@ -189,9 +198,70 @@ describe("Google Gemini CLI alignment", () => {
 		expect(payload.request.contents).toEqual([{ role: "user", parts: [{ text: "implement token refresh" }] }]);
 	});
 
+	it("drops only unsigned thinking when replaying Antigravity Claude history", () => {
+		const signedThinking = "signed reasoning";
+		const unsignedThinking = "unsigned reasoning";
+		const signature = "c2lnbmVk";
+		const createThinkingContext = (model: Model<"google-gemini-cli">): Context => ({
+			messages: [
+				{
+					role: "assistant",
+					content: [
+						{ type: "thinking", thinking: signedThinking, thinkingSignature: signature },
+						{ type: "thinking", thinking: unsignedThinking },
+					],
+					api: model.api,
+					provider: model.provider,
+					model: model.id,
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "stop",
+					timestamp: 1,
+				},
+				{ role: "user", content: "continue", timestamp: 2 },
+			],
+		});
+		const claudeModel = buildModel({
+			...createModel("google-antigravity"),
+			id: "claude-sonnet-4-6",
+			name: "Claude Sonnet 4.6",
+			reasoning: true,
+		} as ModelSpec<"google-gemini-cli">);
+		const claudePayload = buildRequest(claudeModel, createThinkingContext(claudeModel), "proj-123", {}, true) as {
+			request: {
+				contents: Array<{
+					role: string;
+					parts: Array<{ text?: string; thought?: boolean; thoughtSignature?: string }>;
+				}>;
+			};
+		};
+		const claudeParts = claudePayload.request.contents.find(content => content.role === "model")?.parts;
+		expect(claudeParts).toEqual([{ thought: true, text: signedThinking, thoughtSignature: signature }]);
+
+		const geminiModel = createModel("google-antigravity");
+		const geminiPayload = buildRequest(geminiModel, createThinkingContext(geminiModel), "proj-123", {}, true) as {
+			request: {
+				contents: Array<{
+					role: string;
+					parts: Array<{ text?: string; thought?: boolean; thoughtSignature?: string }>;
+				}>;
+			};
+		};
+		const geminiParts = geminiPayload.request.contents.find(content => content.role === "model")?.parts ?? [];
+		expect(geminiParts).toContainEqual({ thought: true, text: signedThinking, thoughtSignature: signature });
+		expect(geminiParts.some(part => part.text?.includes(unsignedThinking))).toBe(true);
+	});
+
 	it("keeps antigravity metadata in antigravity request payloads", () => {
 		const model = createModel("google-antigravity");
-		const payload = buildRequest(model, createContext(), "proj-123", {}, true) as {
+		const context: Context = { ...createContext(), systemPrompt: ["be terse"] };
+		const payload = buildRequest(model, context, "proj-123", {}, true) as {
 			request: {
 				sessionId?: string;
 				labels?: Record<string, string>;
@@ -324,30 +394,6 @@ describe("Google Gemini CLI alignment", () => {
 		expect(parameters).toBeDefined();
 		expect(JSON.stringify(parameters)).not.toContain('"patternProperties"');
 	});
-	it("injects ANTIGRAVITY_SYSTEM_INSTRUCTION for gemini-3.1-pro-high and gemini-3.1-pro-low", () => {
-		// Regression test for #1274: shouldInjectAntigravitySystemInstruction checked
-		// "gemini-3-pro-high" (hyphen) but the deployed model IDs use "gemini-3.1-pro-high" (dot),
-		// so the injection was silently skipped and the Cloud Code Assist API returned HTTP 400.
-		for (const modelId of ["gemini-3.1-pro-high", "gemini-3.1-pro-low"] as const) {
-			const model: Model<"google-gemini-cli"> = buildModel({
-				...createModel("google-antigravity"),
-				id: modelId,
-			} as ModelSpec<"google-gemini-cli">);
-			const context: Context = {
-				systemPrompt: ["my instructions"],
-				messages: [{ role: "user", content: "hi", timestamp: Date.now() }],
-			};
-			const payload = buildRequest(model, context, "proj-123", {}, true) as {
-				request: { systemInstruction?: { role?: string; parts: Array<{ text: string }> } };
-			};
-
-			const parts = payload.request.systemInstruction?.parts ?? [];
-			// The antigravity identity header must be injected as the first part.
-			expect(parts[0]?.text).toBe(ANTIGRAVITY_SYSTEM_INSTRUCTION);
-			// The user-supplied system prompt must appear after the single injected part.
-			expect(parts.slice(1).some(p => p.text === "my instructions")).toBe(true);
-		}
-	});
 	it("adds anthropic-beta for Antigravity Claude reasoning models without relying on id suffix", async () => {
 		let requestHeaders: Headers | undefined;
 		const fetchMock: FetchImpl = async (_url, init) => {
@@ -364,7 +410,7 @@ describe("Google Gemini CLI alignment", () => {
 
 		const result = await streamGoogleGeminiCli(model, createContext(), {
 			apiKey: JSON.stringify({ token: "token", projectId: "proj-123" }),
-			fetch: fetchMock,
+			fetch: withAntigravityVersionDiscovery(fetchMock),
 		}).result();
 
 		expect(result.stopReason).toBe("error");
@@ -383,7 +429,7 @@ describe("Google Gemini CLI alignment", () => {
 		const model = createModel("google-antigravity");
 		await streamGoogleGeminiCli(model, createContext(), {
 			apiKey: JSON.stringify({ token: "token", projectId: "proj-123" }),
-			fetch: fetchMock,
+			fetch: withAntigravityVersionDiscovery(fetchMock),
 		}).result();
 
 		expect(requestHeaders!.get("User-Agent")).toMatch(/^antigravity\/hub\/[0-9.]+ /);
@@ -422,7 +468,7 @@ describe("Google Gemini CLI alignment", () => {
 		const events: AssistantMessageEvent[] = [];
 		const stream = streamGoogleGeminiCli(model, createContext(), {
 			apiKey: JSON.stringify({ token: "token", projectId: "proj-123" }),
-			fetch: fetchMock,
+			fetch: withAntigravityVersionDiscovery(fetchMock),
 		});
 		for await (const event of stream) {
 			events.push(event);
@@ -485,7 +531,7 @@ describe("Google Gemini CLI alignment", () => {
 		const events: AssistantMessageEvent[] = [];
 		const stream = streamGoogleGeminiCli(model, createContext(), {
 			apiKey: JSON.stringify({ token: "token", projectId: "proj-123" }),
-			fetch: fetchMock,
+			fetch: withAntigravityVersionDiscovery(fetchMock),
 		});
 		for await (const event of stream) {
 			events.push(event);
@@ -519,7 +565,7 @@ describe("Google Gemini CLI alignment", () => {
 
 		const stream = streamGoogleGeminiCli(model, createContext(), {
 			apiKey: JSON.stringify({ token: "token", projectId: "proj-123", email: "dev@example.com" }),
-			fetch: fetchMock,
+			fetch: withAntigravityVersionDiscovery(fetchMock),
 		});
 
 		const result = await stream.result();
