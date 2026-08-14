@@ -9,10 +9,12 @@
 ### Fixed
 
 - Fixed stale todo lifecycle handling: guidance now distinguishes finished, blocked, abandoned, and obsolete tasks; completed subagent results bring blocked parent work into the next stop-time reconciliation; supported native providers, including Google, receive a named `todo` tool choice while owned/in-band dialects enforce it locally; read-only `todo view` calls no longer reset the drift reminder; and the interactive UI no longer writes fuzzy, non-persisted subagent matches into canonical todo state.
+## [17.3.2] - 2026-08-13
+
 ### Fixed
 
 - Fixed the parent TUI stalling after a subagent submits its result until terminal focus or resize wakes the event loop ([#8462](https://github.com/can1357/oh-my-pi/issues/8462)).
-- Fixed `omp update` routing foreign npm/bun bin-directory alias symlinks through the package manager, causing npm EEXIST instead of updating the aliased standalone binary ([#8468](https://github.com/can1357/oh-my-pi/issues/8468)).
+- Fixed `omp update` misclassifying foreign npm/bun bin aliases while preserving package-manager ownership for globally linked checkouts ([#8468](https://github.com/can1357/oh-my-pi/issues/8468)).
 - Fixed `read` hashline headers collapsing nested in-workspace paths to the bare basename, which let a same-basename file at the session cwd capture a verbatim follow-up `edit` and deterministically reject it with `hash is not from this session`. Headers now retain the workspace-relative path (e.g. `[src/settings.json#0063]`) ([#8482](https://github.com/can1357/oh-my-pi/issues/8482)).
 
 ## [17.3.1] - 2026-08-13
