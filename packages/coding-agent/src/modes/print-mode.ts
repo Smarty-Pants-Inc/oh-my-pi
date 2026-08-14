@@ -170,6 +170,7 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 
 	let primaryError: unknown;
 	let headlessAdvisorDrainPrepared = false;
+	let hardExitStarted = false;
 	try {
 		// Always subscribe to enable session persistence via _handleAgentEvent
 		session.subscribe(event => {
@@ -233,11 +234,11 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 					await flushTelemetryExport();
 					await session.dispose({ mnemopiConsolidateTimeoutMs: SHUTDOWN_CONSOLIDATE_BUDGET_MS });
 					const flushed = process.stderr.write(`${errorLine}\n`);
-					if (flushed) {
-						process.exit(1);
-					} else {
-						process.stderr.once("drain", () => process.exit(1));
+					if (!flushed) {
+						await new Promise<void>(resolve => process.stderr.once("drain", resolve));
 					}
+					hardExitStarted = true;
+					process.exit(1);
 				}
 
 				if (
@@ -260,6 +261,10 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 			session.setTextOutputCommitted(true);
 		}
 	} catch (error) {
+		// `process.exit()` never returns. Tests model that terminal edge by
+		// throwing a sentinel; do not mistake it for an ordinary run failure and
+		// execute the final cleanup path a second time.
+		if (hardExitStarted) throw error;
 		primaryError = error;
 	}
 	try {
