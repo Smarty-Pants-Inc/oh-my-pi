@@ -3,6 +3,7 @@
  */
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, expectTypeOf, it, vi } from "bun:test";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Type } from "@oh-my-pi/omptype/typebox";
@@ -14,6 +15,7 @@ import { ExtensionRuntime, loadExtensions } from "@oh-my-pi/pi-coding-agent/exte
 import {
 	EXTENSION_HANDLER_TIMEOUT_MS,
 	ExtensionRunner,
+	emitSessionShutdownEvent,
 	SESSION_SHUTDOWN_HANDLER_TIMEOUT_MS,
 	testSetExtensionHandlerTimeoutMs,
 	testSetSessionShutdownHandlerTimeoutMs,
@@ -120,7 +122,7 @@ describe("ExtensionRunner", () => {
 			modelRegistry,
 		);
 		const actions = {
-			sendMessage: () => {},
+			sendMessage: () => Promise.resolve({ status: "accepted" as const, delivery: "plain_append" as const }),
 			sendUserMessage: () => {},
 			appendEntry: () => {},
 			setLabel: () => {},
@@ -581,7 +583,7 @@ describe("ExtensionRunner", () => {
 			);
 			runner.initialize(
 				{
-					sendMessage: () => {},
+					sendMessage: () => Promise.resolve({ status: "accepted", delivery: "plain_append" }),
 					sendUserMessage: () => {},
 					appendEntry: () => {},
 					setLabel: () => {},
@@ -944,7 +946,7 @@ describe("ExtensionRunner", () => {
 			const controller = new AbortController();
 			runner.initialize(
 				{
-					sendMessage: () => {},
+					sendMessage: () => Promise.resolve({ status: "accepted", delivery: "plain_append" }),
 					sendUserMessage: () => {},
 					appendEntry: () => {},
 					setLabel: () => {},
@@ -1578,7 +1580,7 @@ describe("ExtensionRunner", () => {
 			const uiContext: ExtensionUIContext = Object.create(uiPrototype);
 			runner.initialize(
 				{
-					sendMessage: () => {},
+					sendMessage: () => Promise.resolve({ status: "accepted", delivery: "plain_append" }),
 					sendUserMessage: () => {},
 					appendEntry: () => {},
 					setLabel: () => {},
@@ -1662,7 +1664,7 @@ describe("ExtensionRunner", () => {
 			);
 			runner.initialize(
 				{
-					sendMessage: () => {},
+					sendMessage: () => Promise.resolve({ status: "accepted", delivery: "plain_append" }),
 					sendUserMessage: () => {},
 					appendEntry: () => {},
 					setLabel: () => {},
@@ -1746,7 +1748,7 @@ describe("ExtensionRunner", () => {
 			});
 			runner.initialize(
 				{
-					sendMessage: () => {},
+					sendMessage: () => Promise.resolve({ status: "accepted", delivery: "plain_append" }),
 					sendUserMessage: () => {},
 					appendEntry: (_customType, data) => {
 						snapshots.push(data);
@@ -1818,7 +1820,7 @@ describe("ExtensionRunner", () => {
 			);
 			runner.initialize(
 				{
-					sendMessage: () => {},
+					sendMessage: () => Promise.resolve({ status: "accepted", delivery: "plain_append" }),
 					sendUserMessage: () => {},
 					appendEntry: () => {},
 					setLabel: () => {},
@@ -1874,7 +1876,7 @@ describe("ExtensionRunner", () => {
 		const initializeRunner = (runner: ExtensionRunner, select: ExtensionUIContext["select"]) => {
 			runner.initialize(
 				{
-					sendMessage: () => {},
+					sendMessage: () => Promise.resolve({ status: "accepted", delivery: "plain_append" }),
 					sendUserMessage: () => {},
 					appendEntry: () => {},
 					setLabel: () => {},
@@ -2759,7 +2761,7 @@ describe("ExtensionRunner", () => {
 		) => {
 			runner.initialize(
 				{
-					sendMessage: () => {},
+					sendMessage: () => Promise.resolve({ status: "accepted", delivery: "plain_append" }),
 					sendUserMessage: () => {},
 					appendEntry: () => {},
 					setLabel: () => {},
@@ -3348,7 +3350,7 @@ describe("ExtensionRunner", () => {
 
 			runner.initialize(
 				{
-					sendMessage: () => {},
+					sendMessage: () => Promise.resolve({ status: "accepted", delivery: "plain_append" }),
 					sendUserMessage: () => {},
 					appendEntry: () => {},
 					setLabel: () => {},
@@ -3421,7 +3423,7 @@ describe("ExtensionRunner", () => {
 			);
 			runner.initialize(
 				{
-					sendMessage: () => {},
+					sendMessage: () => Promise.resolve({ status: "accepted", delivery: "plain_append" }),
 					sendUserMessage: () => {},
 					appendEntry: () => {},
 					setLabel: () => {},
@@ -3512,7 +3514,7 @@ describe("ExtensionRunner", () => {
 
 			runner.initialize(
 				{
-					sendMessage: () => {},
+					sendMessage: () => Promise.resolve({ status: "accepted", delivery: "plain_append" }),
 					sendUserMessage: () => {},
 					appendEntry: () => {},
 					setLabel: () => {},
@@ -3668,6 +3670,48 @@ describe("ExtensionRunner", () => {
 				vi.useRealTimers();
 			}
 		});
+
+		it("retains only timers owned by a failing shutdown extension", async () => {
+			vi.useFakeTimers();
+			try {
+				let retainedTicks = 0;
+				let unrelatedTicks = 0;
+				fs.writeFileSync(
+					path.join(extensionsDir, "failed-shutdown.ts"),
+					`export default function(pi) { pi.on("session_start", (_event, ctx) => { ctx.setInterval(() => globalThis.__retainedTicks__(), 100); }); pi.on("session_shutdown", () => { throw new Error("release failed"); }); }`,
+				);
+				fs.writeFileSync(
+					path.join(extensionsDir, "successful-shutdown.ts"),
+					`export default function(pi) { pi.on("session_start", (_event, ctx) => { ctx.setInterval(() => globalThis.__unrelatedTicks__(), 100); }); pi.on("session_shutdown", () => {}); }`,
+				);
+				Object.assign(globalThis, {
+					__retainedTicks__: () => {
+						retainedTicks++;
+					},
+					__unrelatedTicks__: () => {
+						unrelatedTicks++;
+					},
+				});
+				const result = await loadTestExtensions();
+				const runner = new ExtensionRunner(
+					result.extensions,
+					result.runtime,
+					tempDir.path(),
+					sessionManager,
+					modelRegistry,
+				);
+				await runner.emit({ type: "session_start" });
+
+				await emitSessionShutdownEvent(runner);
+				vi.advanceTimersByTime(100);
+				expect(retainedTicks).toBe(1);
+				expect(unrelatedTicks).toBe(0);
+			} finally {
+				delete (globalThis as Record<string, unknown>).__retainedTicks__;
+				delete (globalThis as Record<string, unknown>).__unrelatedTicks__;
+				vi.useRealTimers();
+			}
+		});
 	});
 
 	describe("invokeTool same-tool delegation", () => {
@@ -3757,6 +3801,101 @@ describe("ExtensionRunner", () => {
 		});
 	});
 
+	describe("public session mutation fences", () => {
+		it("registers fences in extension and registration order before the Fresh host fence", async () => {
+			const orderKey = `__sessionMutationFenceOrder${crypto.randomUUID()}`;
+			const publicA = tempDir.join("public-a.ts");
+			const publicB = tempDir.join("public-b.ts");
+			fs.writeFileSync(
+				publicA,
+				`export default function (pi) {
+					pi.registerSessionMutationFence(() => globalThis[${JSON.stringify(orderKey)}].push("public-a:first"));
+					pi.registerSessionMutationFence(() => globalThis[${JSON.stringify(orderKey)}].push("public-a:second"));
+				}`,
+			);
+			fs.writeFileSync(
+				publicB,
+				`export default function (pi) {
+					pi.registerSessionMutationFence(() => globalThis[${JSON.stringify(orderKey)}].push("public-b"));
+				}`,
+			);
+			const order: string[] = [];
+			Reflect.set(globalThis, orderKey, order);
+			try {
+				const result = await loadTestExtensions([publicA, publicB]);
+				expect(result.errors).toEqual([]);
+				expect(result.extensions.map(extension => extension.sessionMutationFences?.length)).toEqual([2, 1]);
+				const host: Extension = {
+					path: "<host:fresh-omp-companion>",
+					resolvedPath: "<host:fresh-omp-companion>",
+					handlers: new Map(),
+					sessionMutationFences: [],
+					tools: new Map(),
+					assistantThinkingRenderers: [],
+					messageRenderers: new Map(),
+					commands: new Map(),
+					flags: new Map(),
+					shortcuts: new Map(),
+				};
+				const runner = new ExtensionRunner(
+					result.extensions,
+					result.runtime,
+					tempDir.path(),
+					sessionManager,
+					modelRegistry,
+					undefined,
+					undefined,
+					undefined,
+					undefined,
+					{ extension: host, beforeSessionMutation: () => void order.push("fresh") },
+				);
+
+				await runner.emitBeforeSessionMutation({ type: "session_switch" });
+
+				expect(order).toEqual(["public-a:first", "public-a:second", "public-b", "fresh"]);
+			} finally {
+				Reflect.deleteProperty(globalThis, orderKey);
+			}
+		});
+
+		it("propagates public fence errors and timeouts to abort the mutation", async () => {
+			const throwingPath = tempDir.join("throwing-fence.ts");
+			fs.writeFileSync(
+				throwingPath,
+				`export default function (pi) { pi.registerSessionMutationFence(() => { throw new Error("fence rejected"); }); }`,
+			);
+			const throwing = await loadTestExtensions([throwingPath]);
+			const throwingRunner = new ExtensionRunner(
+				throwing.extensions,
+				throwing.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			await expect(throwingRunner.emitBeforeSessionMutation({ type: "session_branch" })).rejects.toThrow(
+				"fence rejected",
+			);
+
+			const timeoutPath = tempDir.join("timeout-fence.ts");
+			fs.writeFileSync(
+				timeoutPath,
+				`export default function (pi) { pi.registerSessionMutationFence(() => new Promise(() => {})); }`,
+			);
+			const timingOut = await loadTestExtensions([timeoutPath]);
+			const timeoutRunner = new ExtensionRunner(
+				timingOut.extensions,
+				timingOut.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			testSetExtensionHandlerTimeoutMs(10);
+			await expect(timeoutRunner.emitBeforeSessionMutation({ type: "session_tree" })).rejects.toThrow(
+				"handler timed out after 10ms",
+			);
+		});
+	});
+
 	describe("host-internal bindings", () => {
 		it("runs first, stays private, contains ordinary host faults, and propagates ack failure", async () => {
 			const hostACode = `
@@ -3841,7 +3980,7 @@ describe("ExtensionRunner", () => {
 			);
 			runner.initialize(
 				{
-					sendMessage: () => {},
+					sendMessage: () => Promise.resolve({ status: "accepted", delivery: "plain_append" }),
 					sendUserMessage: () => {},
 					appendEntry: () => {},
 					setLabel: () => {},
@@ -3947,6 +4086,7 @@ describe("ExtensionRunner", () => {
 				path: extensionPath,
 				resolvedPath: extensionPath,
 				handlers: new Map([["input", [async (...args: unknown[]) => handler(args[0] as InputEvent)]]]),
+				sessionMutationFences: [],
 				tools: new Map(),
 				assistantThinkingRenderers: [],
 				messageRenderers: new Map(),

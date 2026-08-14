@@ -18,6 +18,7 @@ import type {
 	ExtensionUiComponent,
 	ExtensionWidgetContent,
 	ExtensionWidgetOptions,
+	SendMessageDisposition,
 	SendUserMessageHandler,
 	TerminalInputHandler,
 } from "../../extensibility/extensions";
@@ -150,16 +151,16 @@ export class ExtensionUiController {
 
 		const actions: ExtensionActions = {
 			sendMessage: (message, options) => {
-				const wasStreaming = this.ctx.session.isStreaming;
 				const normalized = normalizeCustomMessagePayload(message);
-				this.ctx.session
-					.sendCustomMessage(normalized, options)
-					.then(() => this.#applyCustomMessageDisplay(wasStreaming, normalized.display))
+				const sendTask = this.ctx.session.sendCustomMessage(normalized, options);
+				void sendTask
+					.then(disposition => this.#applyCustomMessageDisplay(disposition, normalized.display))
 					.catch((err: unknown) => {
 						this.ctx.showError(
 							`Extension sendMessage failed: ${err instanceof Error ? err.message : String(err)}`,
 						);
 					});
+				return sendTask;
 			},
 			sendUserMessage: this.#sendExtensionUserMessage,
 			appendEntry: (customType, data) => {
@@ -383,15 +384,15 @@ export class ExtensionUiController {
 
 		const actions: ExtensionActions = {
 			sendMessage: (message, options) => {
-				const wasStreaming = this.ctx.session.isStreaming;
 				const normalized = normalizeCustomMessagePayload(message);
-				this.ctx.session
-					.sendCustomMessage(normalized, options)
-					.then(() => this.#applyCustomMessageDisplay(wasStreaming, normalized.display))
+				const sendTask = this.ctx.session.sendCustomMessage(normalized, options);
+				void sendTask
+					.then(disposition => this.#applyCustomMessageDisplay(disposition, normalized.display))
 					.catch((err: unknown) => {
 						const errorText = `Extension sendMessage failed: ${err instanceof Error ? err.message : String(err)}`;
 						this.ctx.showError(errorText);
 					});
+				return sendTask;
 			},
 			sendUserMessage: this.#sendExtensionUserMessage,
 			appendEntry: (customType, data) => {
@@ -1182,14 +1183,16 @@ export class ExtensionUiController {
 		});
 	};
 
-	#applyCustomMessageDisplay(wasStreaming: boolean, shouldDisplay: boolean | undefined): void {
-		// For non-streaming cases with display=true, update UI
-		// (streaming cases update via message_end event).
-		// Gate on initialChatRendered (#1955): an extension's session_start
-		// sendMessage({display:true}) runs before renderInitialMessages, which would
-		// re-render from session entries AND re-append via preserveExistingChat,
-		// duplicating the message. After the initial render the rebuild must run.
-		if (!wasStreaming && shouldDisplay && this.ctx.initialChatRendered) {
+	#applyCustomMessageDisplay(disposition: SendMessageDisposition, shouldDisplay: boolean | undefined): void {
+		// Queued messages render through message_end. Immediate/appended messages need one transcript rebuild.
+		if (
+			disposition.status === "accepted" &&
+			(disposition.delivery === "started_turn" ||
+				disposition.delivery === "plain_append" ||
+				disposition.delivery === "queued_next_turn") &&
+			shouldDisplay &&
+			this.ctx.initialChatRendered
+		) {
 			this.ctx.rebuildChatFromMessages();
 		}
 	}

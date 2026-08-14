@@ -5,7 +5,9 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import {
 	consumeFreshOmpCompanionSecret,
 	resolveFreshOmpCompanionEndpoint,
@@ -143,21 +145,27 @@ describe("Fresh OMP companion host gate", () => {
 		}
 	});
 
-	it("keeps the capability channel private before public extensions load", async () => {
+	it("keeps the capability channel private while retaining explicitly linked public extensions", async () => {
 		await withSecretChannel(async channelEnv => {
 			const root = fs.mkdtempSync(path.join(os.tmpdir(), "omp-fresh-companion-env-"));
 			const probeKey = `__freshOmpCompanionEnvProbe${crypto.randomUUID()}`;
 			const extensionPath = path.join(root, "public-extension.ts");
+			const messagingPath = path.join(root, "plugin", "messaging-style.ts");
+			fs.mkdirSync(path.dirname(messagingPath), { recursive: true });
 			fs.writeFileSync(
 				extensionPath,
-				`globalThis[${JSON.stringify(probeKey)}] = { marker: Bun.env.FRESH_OMP_COMPANION ?? null, endpoint: Bun.env.FRESH_OMP_COMPANION_ENDPOINT ?? null, token: Bun.env.FRESH_OMP_COMPANION_TOKEN ?? null };\nexport default function () {}\n`,
+				`globalThis[${JSON.stringify(probeKey)}] = { marker: Bun.env.FRESH_OMP_COMPANION ?? null, endpoint: Bun.env.FRESH_OMP_COMPANION_ENDPOINT ?? null, token: Bun.env.FRESH_OMP_COMPANION_TOKEN ?? null }; export default function () {}`,
+			);
+			fs.writeFileSync(
+				messagingPath,
+				`export default function (pi) { pi.registerSessionMutationFence(() => { globalThis[${JSON.stringify(probeKey)}].messaging = (globalThis[${JSON.stringify(probeKey)}].messaging ?? 0) + 1; }); }`,
 			);
 
 			const authStorage = await AuthStorage.create(path.join(root, "auth.db"));
 			const settings = Settings.isolated({ "marketplace.autoUpdate": "off" });
 			const parsed = parseArgs([]);
 			parsed.freshOmpCompanion = true;
-			parsed.extensions = [extensionPath];
+			parsed.extensions = [extensionPath, messagingPath];
 			parsed.noExtensions = true;
 			parsed.noSkills = true;
 			parsed.noRules = true;
@@ -186,7 +194,42 @@ describe("Fresh OMP companion host gate", () => {
 				).rejects.toBe(stop);
 
 				expect(Reflect.get(globalThis, probeKey)).toEqual({ marker: null, endpoint: null, token: null });
-				expect(observedOptions?.hostInternalExtension).toBeDefined();
+				expect(observedOptions?.hostInternalExtension?.extension.path).toBe("<host:fresh-omp-companion>");
+				expect(observedOptions?.hostInternalExtension?.beforeSessionMutation).toBeFunction();
+				const hostBinding = observedOptions?.hostInternalExtension;
+				if (
+					!hostBinding?.beforeSessionMutation ||
+					!observedOptions?.preloadedExtensions ||
+					!observedOptions.sessionManager
+				) {
+					throw new Error("Expected Fresh host and linked public extension bindings");
+				}
+				const messaging = observedOptions.preloadedExtensions.extensions.find(
+					extension => extension.path === messagingPath,
+				);
+				if (!messaging) throw new Error("Expected linked messaging-style extension");
+				expect(messaging.sessionMutationFences).toHaveLength(1);
+				let freshFences = 0;
+				const freshFence = hostBinding.beforeSessionMutation;
+				hostBinding.beforeSessionMutation = async (event, ctx) => {
+					freshFences++;
+					await freshFence(event, ctx);
+				};
+				const runner = new ExtensionRunner(
+					observedOptions.preloadedExtensions.extensions,
+					observedOptions.preloadedExtensions.runtime,
+					root,
+					observedOptions.sessionManager,
+					new ModelRegistry(authStorage, path.join(root, "models.yml")),
+					undefined,
+					undefined,
+					undefined,
+					undefined,
+					hostBinding,
+				);
+				await runner.emitBeforeSessionMutation({ type: "session_switch" });
+				expect(freshFences).toBe(1);
+				expect(Reflect.get(globalThis, probeKey)).toMatchObject({ messaging: 1 });
 				expect(Bun.env.FRESH_OMP_COMPANION).toBeUndefined();
 				expect(Bun.env.FRESH_OMP_COMPANION_ENDPOINT).toBeUndefined();
 			} finally {

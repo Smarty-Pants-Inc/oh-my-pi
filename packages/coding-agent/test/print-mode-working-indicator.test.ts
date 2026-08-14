@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import type { ExtensionActions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import {
 	PRINT_MODE_ADVISOR_DRAIN_TIMEOUT_MS,
 	PRINT_MODE_ERROR_ADVISOR_DRAIN_TIMEOUT_MS,
@@ -320,6 +321,88 @@ describe("print mode working indicator", () => {
 		expect(catchupTimeoutMs).toBe(PRINT_MODE_ADVISOR_DRAIN_TIMEOUT_MS);
 		expect(stdoutOutput.join("")).toContain("late advisor review");
 		expect(stdoutEvents.at(-1)).toBe("flush");
+	});
+
+	it("settles sibling and recursively queued continuations before rethrowing and disposing", async () => {
+		const messages: AssistantMessage[] = [];
+		const siblingStarted = Promise.withResolvers<void>();
+		const siblingReleased = Promise.withResolvers<void>();
+		const recursiveStarted = Promise.withResolvers<void>();
+		const recursiveReleased = Promise.withResolvers<void>();
+		let extensionActions: ExtensionActions | undefined;
+		let sendCalls = 0;
+		let preparedForDrain = false;
+		let disposed = false;
+
+		const session = {
+			state: { messages },
+			getLastAssistantMessage: () => messages.findLast(message => message.role === "assistant"),
+			sessionManager: {
+				getHeader: () => undefined,
+				buildSessionContext: () => ({ messages: [] }),
+				getEntries: () => [],
+			},
+			settings: { get: () => false },
+			model: undefined,
+			isStreaming: false,
+			isCompacting: false,
+			extensionRunner: {
+				initialize: (actions: ExtensionActions) => {
+					extensionActions = actions;
+				},
+				onError: () => {},
+				emit: async () => undefined,
+			},
+			subscribe: () => () => {},
+			prompt: async () => {
+				extensionActions?.sendMessage(
+					{ customType: "rejecting-continuation", content: "fail", display: false },
+					{ deliverAs: "nextTurn", triggerTurn: true },
+				);
+				extensionActions?.sendMessage(
+					{ customType: "sibling-continuation", content: "wait", display: false },
+					{ deliverAs: "nextTurn", triggerTurn: true },
+				);
+				return true;
+			},
+			sendCustomMessage: async () => {
+				sendCalls++;
+				if (sendCalls === 1) throw new Error("continuation failed");
+				if (sendCalls === 2) {
+					siblingStarted.resolve();
+					await siblingReleased.promise;
+					extensionActions?.sendMessage(
+						{ customType: "recursive-continuation", content: "wait again", display: false },
+						{ deliverAs: "nextTurn", triggerTurn: true },
+					);
+					return true;
+				}
+				recursiveStarted.resolve();
+				await recursiveReleased.promise;
+				return true;
+			},
+			setTextOutputCommitted: () => {},
+			prepareForHeadlessAdvisorDrain: () => {
+				preparedForDrain = true;
+			},
+			waitForAdvisorCatchup: async () => {},
+			dispose: async () => {
+				disposed = true;
+			},
+		} as unknown as AgentSession;
+
+		const run = runPrintMode(session, { mode: "text", initialMessage: "hello" });
+		await siblingStarted.promise;
+		siblingReleased.resolve();
+		await recursiveStarted.promise;
+		expect(disposed).toBe(false);
+		recursiveReleased.resolve();
+
+		await expect(run).rejects.toThrow("continuation failed");
+		expect(sendCalls).toBe(3);
+		expect(preparedForDrain).toBe(true);
+		expect(disposed).toBe(true);
+		expect(stdoutOutput.join("")).toBe("");
 	});
 
 	it("waits for advisor catch-up before hard-exit disposal", async () => {

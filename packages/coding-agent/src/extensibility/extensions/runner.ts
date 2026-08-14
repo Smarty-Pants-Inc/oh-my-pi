@@ -48,7 +48,6 @@ import type {
 	ExtensionUIContext,
 	ExtensionUIDialogOptions,
 	HostInternalExtensionBinding,
-	HostInternalSessionMutationEvent,
 	InputEvent,
 	InputEventResult,
 	McpNotificationEvent,
@@ -62,6 +61,7 @@ import type {
 	SessionBeforeSwitchResult,
 	SessionBeforeTreeResult,
 	SessionCompactingResult,
+	SessionMutationEvent,
 	SessionStopEvent,
 	SessionStopEventResult,
 	SystemPromptBuilder,
@@ -298,23 +298,16 @@ export type SwitchSessionHandler = (sessionPath: string) => Promise<{ cancelled:
 
 export type ShutdownHandler = () => void;
 
-/**
- * Emit `session_shutdown` and clear timers owned by an extension runner.
- *
- * Returns whether any shutdown handlers were present. Timer cleanup runs even
- * when a handler fails so extension background work cannot outlive its host.
- */
+/** Emit `session_shutdown`, retaining timers only for extensions whose cleanup failed. */
 export async function emitSessionShutdownEvent(extensionRunner: ExtensionRunner | undefined): Promise<boolean> {
 	if (!extensionRunner) return false;
-	try {
-		if (!extensionRunner.hasHandlers("session_shutdown")) return false;
-		await extensionRunner.emit({
-			type: "session_shutdown",
-		});
-		return true;
-	} finally {
+	if (!extensionRunner.hasHandlers("session_shutdown")) {
 		extensionRunner.clearManagedTimers();
+		return false;
 	}
+	const failedExtensions = await extensionRunner.emitSessionShutdown();
+	extensionRunner.clearManagedTimers(failedExtensions);
+	return true;
 }
 
 const noOpUIContext: ExtensionUIContext = {
@@ -357,6 +350,7 @@ export class ExtensionRunner {
 	#mode: ExtensionMode = "print";
 	#toolApprovalPreviewWaiter?: (toolCallId: string) => Promise<void>;
 	#errorListeners: Set<ExtensionErrorListener> = new Set();
+	#shutdownFailedExtensions = new Set<string>();
 	#getModel: () => Model | undefined = () => undefined;
 	#isIdleFn: () => boolean = () => true;
 	#isCompactingFn: () => boolean = () => false;
@@ -382,6 +376,7 @@ export class ExtensionRunner {
 	#toolRegistrationScope = new AsyncLocalStorage<ToolRegistrationScope>();
 	#toolRegistrationBarrier: Promise<void> | undefined;
 	#initialized = false;
+	#extensionTimerOwner = new AsyncLocalStorage<string>();
 	/**
 	 * Buffer for `credential_disabled` events received via {@link emitCredentialDisabled}
 	 * before {@link initialize} has run. Drained through {@link emit} once initialize sets
@@ -991,6 +986,7 @@ export class ExtensionRunner {
 			signal?: AbortSignal;
 			onUpdate?: AgentToolUpdateCallback;
 		},
+		extensionPath?: string,
 	): ExtensionContext {
 		const getModel = model ? () => model : this.#getModel;
 		return {
@@ -1016,8 +1012,20 @@ export class ExtensionRunner {
 			getSystemPrompt: () => this.#getSystemPromptFn(),
 			localProtocolOptions: this.localProtocolOptions,
 			memory: this.#getMemoryFn?.(),
-			setInterval: (callback, ms, ...args) => this.#managedTimers.setInterval(callback, ms, ...args),
-			setTimeout: (callback, ms, ...args) => this.#managedTimers.setTimeout(callback, ms, ...args),
+			setInterval: (callback, ms, ...args) =>
+				this.#managedTimers.setInterval(
+					extensionPath ?? this.#extensionTimerOwner.getStore(),
+					callback,
+					ms,
+					...args,
+				),
+			setTimeout: (callback, ms, ...args) =>
+				this.#managedTimers.setTimeout(
+					extensionPath ?? this.#extensionTimerOwner.getStore(),
+					callback,
+					ms,
+					...args,
+				),
 			clearTimer: timer => this.#managedTimers.clear(timer),
 			invokeTool:
 				delegation !== undefined && this.hasNativeTool(delegation.toolName)
@@ -1047,8 +1055,15 @@ export class ExtensionRunner {
 	 * outlive the session (a self-scheduling interval would otherwise keep
 	 * firing against a disposed session).
 	 */
-	clearManagedTimers(): void {
-		this.#managedTimers.clearAll();
+	clearManagedTimers(retainedOwners: ReadonlySet<string> = new Set()): void {
+		this.#managedTimers.clearAll(retainedOwners);
+	}
+
+	/** Emit shutdown handlers and retain timers only for extensions whose cleanup failed. */
+	async emitSessionShutdown(): Promise<ReadonlySet<string>> {
+		this.#shutdownFailedExtensions.clear();
+		await this.emit({ type: "session_shutdown" });
+		return this.#shutdownFailedExtensions;
 	}
 
 	createCommandContext(): ExtensionCommandContext {
@@ -1103,8 +1118,10 @@ export class ExtensionRunner {
 					registrationScope.signal = handlerAbortSignal;
 					let result: TResult | undefined;
 					try {
-						result = await this.#toolRegistrationScope.run(registrationScope, () =>
-							handler(event, scopeContextToHandler ? createHandlerContext(ctx, handlerAbortSignal) : ctx),
+						result = await this.#extensionTimerOwner.run(ext.path, () =>
+							this.#toolRegistrationScope.run(registrationScope, () =>
+								handler(event, scopeContextToHandler ? createHandlerContext(ctx, handlerAbortSignal) : ctx),
+							),
 						);
 					} catch (error) {
 						handlerFailure = { error };
@@ -1141,6 +1158,9 @@ export class ExtensionRunner {
 				event: event.type,
 				error,
 			});
+			if (event.type === "session_shutdown") {
+				this.#shutdownFailedExtensions.add(ext.path);
+			}
 			return onFailure?.("timeout", error);
 		}
 		if (handlerFailure) {
@@ -1153,6 +1173,9 @@ export class ExtensionRunner {
 				error: message,
 				stack,
 			});
+			if (event.type === "session_shutdown") {
+				this.#shutdownFailedExtensions.add(ext.path);
+			}
 			if (
 				propagateSnapshotAcknowledgementFailure &&
 				typeof handlerFailure.error === "object" &&
@@ -1179,9 +1202,9 @@ export class ExtensionRunner {
 			for (const ext of this.extensions) {
 				const handlers = ext.handlers.get(event.type);
 				if (!handlers || handlers.length === 0) continue;
-				ctx ??= this.createContext();
+				const extensionContext = this.createContext(undefined, undefined, ext.path);
 				for (const handler of handlers) {
-					promises.push(this.#runHandlerWithTimeout(handler, event, ctx, ext, timeoutMs));
+					promises.push(this.#runHandlerWithTimeout(handler, event, extensionContext, ext, timeoutMs));
 				}
 			}
 			if (promises.length > 0) await Promise.all(promises);
@@ -1228,15 +1251,34 @@ export class ExtensionRunner {
 		return result as RunnerEmitResult<TEvent>;
 	}
 
-	/** Quiesce the host-owned observer immediately before a committed session mutation. */
-	async emitHostInternalBeforeSessionMutation(event: HostInternalSessionMutationEvent): Promise<void> {
+	/** Run public fences, then the host-owned observer, before a committed session mutation. */
+	async emitBeforeSessionMutation(event: SessionMutationEvent): Promise<void> {
+		const ctx = this.createContext();
+		for (const ext of this.#publicExtensions) {
+			for (const handler of ext.sessionMutationFences) {
+				await this.#runHandlerWithTimeout(
+					handler,
+					event,
+					ctx,
+					ext,
+					handlerTimeoutForEvent(event.type),
+					true,
+					undefined,
+					false,
+					false,
+					(_kind, message) => {
+						throw new Error(`Session mutation fence failed: ${message}`);
+					},
+				);
+			}
+		}
+
 		const binding = this.#hostInternalExtension;
 		if (!binding?.beforeSessionMutation) return;
-
 		await this.#runHandlerWithTimeout(
 			binding.beforeSessionMutation,
 			event,
-			this.createContext(),
+			ctx,
 			binding.extension,
 			handlerTimeoutForEvent(event.type),
 			false,

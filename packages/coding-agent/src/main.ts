@@ -58,7 +58,7 @@ import { loadExtensionFromFactory } from "./extensibility/extensions";
 import { formatExtensionLoadNotifications } from "./extensibility/extensions/load-errors";
 import { loadExtensions } from "./extensibility/extensions/loader";
 import { ExtensionRunner } from "./extensibility/extensions/runner";
-import type { ExtensionUIContext } from "./extensibility/extensions/types";
+import type { ExtensionUIContext, HostInternalExtensionBinding } from "./extensibility/extensions/types";
 import { scheduleMarketplaceAutoUpdate } from "./extensibility/plugins/marketplace-auto-update";
 import { registerDaemonProjectPresence } from "./launch/presence";
 import type { MCPManager } from "./mcp";
@@ -1784,6 +1784,7 @@ export async function runRootCommand(
 		const extensionsResult = parsedArgs.trustedExtensions?.length
 			? await loadTrustedSessionExtensions(sessionOptions, cwd, eventBus)
 			: await loadSessionExtensions(sessionOptions, cwd, settingsInstance, eventBus);
+		let hostInternalExtension: HostInternalExtensionBinding | undefined;
 		if (companionController) {
 			try {
 				const extension = await loadExtensionFromFactory(
@@ -1793,7 +1794,7 @@ export async function runRootCommand(
 					extensionsResult.runtime,
 					"<host:fresh-omp-companion>",
 				);
-				sessionOptions.hostInternalExtension = {
+				hostInternalExtension = {
 					extension,
 					beforeSessionMutation: companionController.beforeSessionMutation,
 					afterDispatch: companionController.afterDispatch,
@@ -1804,6 +1805,7 @@ export async function runRootCommand(
 				logger.warn("Fresh OMP companion disabled", { reason: "host_extension_load_failed" });
 			}
 		}
+		sessionOptions.hostInternalExtension = hostInternalExtension;
 		const extensionFlagSink: ExtensionFlagSink = {
 			getFlags: () => ExtensionRunner.aggregateFlags(extensionsResult.extensions),
 			setFlagValue: (name, value) => {

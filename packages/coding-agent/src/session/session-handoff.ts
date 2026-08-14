@@ -42,6 +42,17 @@ function throwIfHandoffAborted(signal: AbortSignal): void {
 	throw new Error("Handoff aborted by session");
 }
 
+export interface PendingSemanticDeliveryHandoffQueues {
+	steering: AgentMessage[];
+	followUp: AgentMessage[];
+	companions: Array<{ owner: AgentMessage; messages: AgentMessage[] }>;
+}
+
+export interface PendingSemanticDeliveryHandoff {
+	migrate(): Promise<PendingSemanticDeliveryHandoffQueues>;
+	release(): Promise<void>;
+}
+
 /** Capabilities borrowed from the owning AgentSession. */
 export interface SessionHandoffHost {
 	agent: Agent;
@@ -72,6 +83,12 @@ export interface SessionHandoffHost {
 	rekeyMemoryForCurrentSessionId(): void;
 	resetMemoryContextForNewTranscript(): Promise<void>;
 	clearPendingNextTurnMessages(): void;
+	preparePendingSemanticDeliveryHandoff(
+		steering: AgentMessage[],
+		followUp: AgentMessage[],
+		companions: Array<{ owner: AgentMessage; messages: AgentMessage[] }>,
+	): Promise<PendingSemanticDeliveryHandoff>;
+	restoreExplicitPromptMessages(messages: AgentMessage[]): void;
 	resetTodoCycle(): void;
 	buildDisplaySessionContext(): SessionContext;
 	drainAndDetachAdvisorRecorders(): Promise<void>;
@@ -135,6 +152,7 @@ export class SessionHandoff {
 		}
 
 		let lifecycle: SessionLifecycleTransaction | undefined;
+		let pendingSemanticDeliveryHandoff: PendingSemanticDeliveryHandoff | undefined;
 		try {
 			throwIfHandoffAborted(handoffSignal);
 
@@ -246,7 +264,7 @@ export class SessionHandoff {
 			lifecycle = this.#host.beginLifecycleTransaction();
 			if (this.#host.extensionRunner) {
 				lifecycle.markPublicationStarted();
-				await this.#host.extensionRunner.emitHostInternalBeforeSessionMutation?.({ type: "session_switch" });
+				await this.#host.extensionRunner.emitBeforeSessionMutation({ type: "session_switch" });
 			}
 			await lifecycle.captureRetained({ capturePersistedSessionFile: true });
 			await this.#host.flushPendingBash();
@@ -260,12 +278,19 @@ export class SessionHandoff {
 			}
 
 			// Snapshot the outgoing session's local:// root before newSession() changes
-			// the session id and therefore the active local artifact root.
 			const localProtocolOptions = {
 				getArtifactsDir: () => this.#host.sessionManager.getArtifactsDir(),
 				getSessionId: () => this.#host.sessionManager.getSessionId(),
 			};
 			const previousLocalRoot = resolveLocalUrlToPath("local://", localProtocolOptions);
+			const preservedSteering = this.#host.agent.peekSteeringQueue().slice();
+			const preservedFollowUp = this.#host.agent.peekFollowUpQueue().slice();
+			const preservedCompanions = this.#host.agent.captureQueuedMessageCompanions();
+			pendingSemanticDeliveryHandoff = await this.#host.preparePendingSemanticDeliveryHandoff(
+				preservedSteering,
+				preservedFollowUp,
+				preservedCompanions,
+			);
 			await this.#host.sessionManager.newSession(
 				previousSessionFile ? { parentSession: previousSessionFile } : undefined,
 			);
@@ -309,13 +334,15 @@ export class SessionHandoff {
 			}
 
 			const sessionContext = this.#host.buildDisplaySessionContext();
-			const preservedSteering = this.#host.agent.peekSteeringQueue().slice();
-			const preservedFollowUp = this.#host.agent.peekFollowUpQueue().slice();
 			this.#host.agent.reset();
-			this.#host.agent.replaceQueues(preservedSteering, preservedFollowUp);
-			this.#host.agent.replaceMessages(sessionContext.messages);
 			this.#host.clearCheckpointRuntimeState();
 			this.#host.clearPendingNextTurnMessages();
+			const migratedQueues = await pendingSemanticDeliveryHandoff.migrate();
+			this.#host.agent.replaceQueues(migratedQueues.steering, migratedQueues.followUp);
+			this.#host.agent.restoreQueuedMessageCompanions(migratedQueues.companions, messages =>
+				this.#host.restoreExplicitPromptMessages(messages),
+			);
+			this.#host.agent.replaceMessages(sessionContext.messages);
 			this.#host.resetTodoCycle();
 			this.#host.syncTodoPhasesFromBranch();
 
@@ -351,6 +378,13 @@ export class SessionHandoff {
 		} finally {
 			sourceSignal?.removeEventListener("abort", onSourceAbort);
 			this.#handoffAbortController = undefined;
+			try {
+				await pendingSemanticDeliveryHandoff?.release();
+			} catch (error) {
+				logger.warn("Failed to release pending semantic handoff state", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
 		}
 	}
 }

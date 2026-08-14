@@ -491,15 +491,15 @@ export interface ExtensionContext {
 	 * cleared automatically on `session_shutdown`. Prefer this over raw
 	 * `setInterval` for any extension background work.
 	 */
-	setInterval(callback: (...args: unknown[]) => void, ms?: number, ...args: unknown[]): Timer;
+	setInterval(callback: (...args: unknown[]) => void, ms?: number, ...args: unknown[]): ExtensionTimer;
 	/**
 	 * Schedule a one-shot callback whose throws are contained, mirroring
 	 * {@link setInterval}. Cleared automatically on `session_shutdown` if it has
 	 * not yet fired.
 	 */
-	setTimeout(callback: (...args: unknown[]) => void, ms?: number, ...args: unknown[]): Timer;
+	setTimeout(callback: (...args: unknown[]) => void, ms?: number, ...args: unknown[]): ExtensionTimer;
 	/** Clear a timer scheduled via {@link setInterval} or {@link setTimeout}. */
-	clearTimer(timer: Timer): void;
+	clearTimer(timer: ExtensionTimer): void;
 	/**
 	 * Run the NATIVE built-in implementation of the tool this handler re-registered, with `params`,
 	 * and return its result. Lets a tool that re-registers a built-in (e.g. wrapping `write` to add
@@ -590,6 +590,10 @@ export interface ToolDefinition<TParams extends TSchema = TSchema, TDetails = un
 	parameters: TParams;
 	/** If true, tool is excluded unless explicitly listed in --tools or agent's tools field */
 	hidden?: boolean;
+	/** Stop the current agent run after this tool returns a successful result. */
+	terminalAfterSuccess?: boolean;
+	/** Tool-call scheduling mode. `"exclusive"` forms a barrier around this call. */
+	concurrency?: "shared" | "exclusive";
 	/** If true, tool is registered but not auto-included in the initial active set.
 	 *  The registering extension is responsible for activating/deactivating it via setActiveTools(). */
 	defaultInactive?: boolean;
@@ -1070,10 +1074,13 @@ export type ExtensionEvent =
 	| ToolApprovalRequestedEvent
 	| ToolApprovalResolvedEvent;
 
-/** Host-only fence emitted before retained capture for session switches and before branch/tree mutation. */
-export interface HostInternalSessionMutationEvent {
+/** Emitted immediately before a committed session mutation. */
+export interface SessionMutationEvent {
 	type: "session_switch" | "session_branch" | "session_tree";
 }
+
+/** Host-only fence emitted before retained capture for session switches and before branch/tree mutation. */
+export interface HostInternalSessionMutationEvent extends SessionMutationEvent {}
 
 /** Host-owned extension binding. Never exposed through public discovery or forwarded to child sessions. */
 export interface HostInternalExtensionBinding {
@@ -1202,6 +1209,31 @@ export type SystemPromptBuilder = (
 	context: SystemPromptBuilderContext,
 ) => BuildSystemPromptResult | Promise<BuildSystemPromptResult>;
 
+/** Opaque handle returned by managed extension timers. */
+export type ExtensionTimer = Timer;
+
+/** Receiver-state decision made atomically with the custom-message queue mutation. */
+export type SendMessageDeliveryMode = "auto" | "interrupt" | "steer" | "afterCurrent" | "explicitPrompt";
+
+export type SendMessageAcceptedDelivery =
+	| "started_turn"
+	| "queued_steer"
+	| "queued_follow_up"
+	| "queued_next_turn"
+	| "plain_append";
+
+export type SendMessageDisposition =
+	| { status: "accepted"; delivery: SendMessageAcceptedDelivery }
+	| { status: "downgraded"; delivery: "queued_next_turn"; reason: "client_deferred_turn" }
+	| { status: "unavailable"; reason: "client_deferred_turn" | "session_transition" | "prompt_preflight_cancelled" };
+
+export interface SendMessageOptions {
+	/** Host-owned semantic delivery. The host either accepts this exact mode or performs no mutation. */
+	deliveryMode?: SendMessageDeliveryMode;
+	/** Legacy delivery controls. Do not combine with `deliveryMode`. */
+	triggerTurn?: boolean;
+	deliverAs?: "steer" | "followUp" | "nextTurn";
+}
 /**
  * ExtensionAPI passed to extension factory functions.
  */
@@ -1289,6 +1321,9 @@ export interface ExtensionAPI {
 	on(event: "user_python", handler: ExtensionHandler<UserPythonEvent, UserPythonEventResult>): void;
 	on(event: "mcp_notification", handler: ExtensionHandler<McpNotificationEvent>): void;
 
+	/** Register a fence that runs before a committed session mutation. */
+	registerSessionMutationFence(handler: ExtensionHandler<SessionMutationEvent>): void;
+
 	// =========================================================================
 	// Tool Registration
 	// =========================================================================
@@ -1350,16 +1385,16 @@ export interface ExtensionAPI {
 	// =========================================================================
 
 	/**
-	 * Send a custom message to the session.
+	 * Send a custom message to the session and report the exact host disposition.
 	 *
-	 * `deliverAs: "nextTurn"` keeps the message hidden from the editable pending-message UI.
-	 * If `triggerTurn` is also true while the current turn is still unwinding, the session schedules
-	 * an internal continuation that consumes the message on the next turn.
+	 * `deliveryMode` is selected against receiver state atomically with the queue mutation. A semantic
+	 * request that cannot be honored returns `unavailable` without enqueueing. Legacy `triggerTurn`
+	 * requests may report a client-deferred `downgraded` next-turn enqueue.
 	 */
 	sendMessage<T = unknown>(
 		message: CustomMessagePayload<T>,
-		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
-	): void;
+		options?: SendMessageOptions,
+	): Promise<SendMessageDisposition>;
 
 	/**
 	 * Send a user prompt: idle starts a turn; streaming queues as steer unless `deliverAs` is set.
@@ -1584,13 +1619,8 @@ type HandlerFn = (...args: unknown[]) => Promise<unknown>;
 
 export type SendMessageHandler = <T = unknown>(
 	message: CustomMessagePayload<T>,
-	/**
-	 * `deliverAs: "nextTurn"` queues hidden custom context for the next turn.
-	 * When paired with `triggerTurn: true` during prompt teardown, the session schedules
-	 * an internal continuation without surfacing the message in the editable pending queue.
-	 */
-	options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
-) => void;
+	options?: SendMessageOptions,
+) => Promise<SendMessageDisposition>;
 
 export type SendUserMessageHandler = (
 	content: string | (TextContent | ImageContent)[],
@@ -1689,6 +1719,7 @@ export interface Extension {
 	executionEnvironmentProvider?: ExecutionEnvironmentProvider;
 	systemPromptBuilder?: SystemPromptBuilder;
 	handlers: Map<string, HandlerFn[]>;
+	sessionMutationFences: ExtensionHandler<SessionMutationEvent>[];
 	tools: Map<string, RegisteredTool<any, any>>;
 	toolRegistrationListeners?: Set<ToolRegistrationListener>;
 	assistantThinkingRenderers: AssistantThinkingRenderer[];

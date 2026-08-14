@@ -20,7 +20,9 @@ import { type SettingPath, Settings } from "@oh-my-pi/pi-coding-agent/config/set
 import { TtsrManager } from "@oh-my-pi/pi-coding-agent/export/ttsr";
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
+import { wrapRegisteredTools } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/wrapper";
 import { GoalRuntime } from "@oh-my-pi/pi-coding-agent/goals/runtime";
+import { initializeExtensions } from "@oh-my-pi/pi-coding-agent/modes/runtime-init";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm, USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
@@ -137,6 +139,569 @@ describe("AgentSession concurrent prompt guard", () => {
 
 		throw new Error("Timed out waiting for condition");
 	}
+
+	it("chooses semantic delivery against the state used for the queue mutation", async () => {
+		await createSession();
+		session.setCustomMessageAcceptanceHookForTests(() => {
+			session.agent.state.isStreaming = true;
+		});
+		await expect(
+			session.sendCustomMessage(
+				{ customType: "idle-to-busy", content: "after current", display: false, attribution: "agent" },
+				{ deliveryMode: "afterCurrent" },
+			),
+		).resolves.toEqual({ status: "accepted", delivery: "queued_follow_up" });
+		expect(session.agent.peekFollowUpQueue()).toHaveLength(1);
+		expect(session.agent.peekSteeringQueue()).toHaveLength(0);
+
+		session.agent.clearAllQueues();
+		session.setCustomMessageAcceptanceHookForTests(() => {
+			session.agent.state.isStreaming = false;
+		});
+		await expect(
+			session.sendCustomMessage(
+				{ customType: "busy-to-idle", content: "idle steer", display: false, attribution: "agent" },
+				{ deliveryMode: "steer" },
+			),
+		).resolves.toEqual({ status: "accepted", delivery: "plain_append" });
+		expect(session.agent.peekSteeringQueue()).toHaveLength(0);
+		expect(session.agent.state.messages.at(-1)).toMatchObject({ customType: "busy-to-idle" });
+		session.setCustomMessageAcceptanceHookForTests(undefined);
+	});
+	it("reserves explicitPrompt delivery for the next explicit user prompt", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: mock.stream,
+			convertToLlm,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			modelRegistry: sharedModelRegistry,
+		});
+
+		await expect(
+			session.sendCustomMessage(
+				{ customType: "mail-status", content: "durable status", display: true, attribution: "agent" },
+				{ deliveryMode: "explicitPrompt" },
+			),
+		).resolves.toEqual({ status: "accepted", delivery: "queued_next_turn" });
+		expect(mock.calls).toHaveLength(0);
+		expect(session.agent.state.messages).toHaveLength(0);
+
+		await session.sendCustomMessage(
+			{ customType: "urgent-blocker", content: "urgent blocker", display: true, attribution: "agent" },
+			{ deliveryMode: "interrupt" },
+		);
+		expect(mock.calls).toHaveLength(1);
+		expect(JSON.stringify(mock.calls[0]?.context.messages)).toContain("urgent blocker");
+		expect(JSON.stringify(mock.calls[0]?.context.messages)).not.toContain("durable status");
+
+		await session.prompt("next explicit user prompt");
+		expect(mock.calls).toHaveLength(2);
+		expect(JSON.stringify(mock.calls[1]?.context.messages)).toContain("durable status");
+	});
+
+	it("attaches busy explicitPrompt delivery to the queued user follow-up", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		let firstStream: AssistantMessageEventStream | undefined;
+		const callMessages: Message[][] = [];
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			convertToLlm,
+			streamFn: (_model, context) => {
+				callMessages.push([...context.messages]);
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: createAssistantMessage("") });
+					if (callMessages.length > 1)
+						stream.push({ type: "done", reason: "stop", message: createAssistantMessage("Done") });
+				});
+				if (callMessages.length === 1) firstStream = stream;
+				return stream;
+			},
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			modelRegistry: sharedModelRegistry,
+		});
+		const firstPrompt = session.prompt("active turn");
+		await waitFor(() => session.isStreaming && firstStream !== undefined && callMessages.length === 1);
+
+		await expect(
+			session.sendCustomMessage(
+				{ customType: "mail-status", content: "busy durable status", display: true, attribution: "agent" },
+				{ deliveryMode: "explicitPrompt" },
+			),
+		).resolves.toEqual({ status: "accepted", delivery: "queued_next_turn" });
+		await session.prompt("normal after_current composition", { streamingBehavior: "followUp" });
+		expect(callMessages).toHaveLength(1);
+
+		firstStream?.push({ type: "done", reason: "stop", message: createAssistantMessage("First done") });
+		await firstPrompt;
+		await session.waitForIdle();
+
+		expect(callMessages).toHaveLength(2);
+		const providerTurn = JSON.stringify(callMessages[1]);
+		expect(providerTurn).toContain("normal after_current composition");
+		expect(providerTurn).toContain("busy durable status");
+	});
+	it("keeps explicitPrompt companions with one-at-a-time steering", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		let firstStream: AssistantMessageEventStream | undefined;
+		const callMessages: Message[][] = [];
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			convertToLlm,
+			streamFn: (_model, context) => {
+				callMessages.push([...context.messages]);
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: createAssistantMessage("") });
+					if (callMessages.length > 1)
+						stream.push({ type: "done", reason: "stop", message: createAssistantMessage("Done") });
+				});
+				if (callMessages.length === 1) firstStream = stream;
+				return stream;
+			},
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			modelRegistry: sharedModelRegistry,
+		});
+		const active = session.prompt("active turn");
+		await waitFor(() => session.isStreaming && firstStream !== undefined);
+		await session.sendCustomMessage(
+			{ customType: "mail-status", content: "steer durable status", display: true, attribution: "agent" },
+			{ deliveryMode: "explicitPrompt" },
+		);
+		await session.prompt("deliberate steering prompt", { streamingBehavior: "steer" });
+		firstStream?.push({ type: "done", reason: "stop", message: createAssistantMessage("First done") });
+		await active;
+		await session.waitForIdle();
+		const providerTurn = JSON.stringify(callMessages[1]);
+		expect(providerTurn).toContain("deliberate steering prompt");
+		expect(providerTurn).toContain("steer durable status");
+	});
+
+	it("restores explicitPrompt companions when their queued user prompt is cleared", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		let firstStream: AssistantMessageEventStream | undefined;
+		const callMessages: Message[][] = [];
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			convertToLlm,
+			streamFn: (_model, context) => {
+				callMessages.push([...context.messages]);
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: createAssistantMessage("") });
+					if (callMessages.length > 1)
+						stream.push({ type: "done", reason: "stop", message: createAssistantMessage("Done") });
+				});
+				if (callMessages.length === 1) firstStream = stream;
+				return stream;
+			},
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			modelRegistry: sharedModelRegistry,
+		});
+		const active = session.prompt("active turn");
+		await waitFor(() => session.isStreaming && firstStream !== undefined);
+		await session.sendCustomMessage(
+			{ customType: "mail-status", content: "restorable durable status", display: true, attribution: "agent" },
+			{ deliveryMode: "explicitPrompt" },
+		);
+		await session.prompt("discarded queued prompt", { streamingBehavior: "followUp" });
+		session.clearQueue({ forInterrupt: true });
+		expect(session.agent.peekFollowUpQueue()).toHaveLength(0);
+		firstStream?.push({ type: "done", reason: "stop", message: createAssistantMessage("First done") });
+		await active;
+		await session.prompt("replacement explicit prompt");
+		const providerTurn = JSON.stringify(callMessages[1]);
+		expect(providerTurn).toContain("replacement explicit prompt");
+		expect(providerTurn).toContain("restorable durable status");
+		expect(providerTurn).not.toContain("discarded queued prompt");
+	});
+	it("rejects semantic delivery during and after a lifecycle ownership change", async () => {
+		await createSession();
+		const before = session.agent.state.messages.length;
+		for (const releaseFenceBeforeAcceptance of [false, true]) {
+			session.setCustomMessageAcceptanceHookForTests(() => {
+				session.setLifecycleTransitionFenceForTests(true);
+				if (releaseFenceBeforeAcceptance) session.setLifecycleTransitionFenceForTests(false);
+			});
+
+			await expect(
+				session.sendCustomMessage(
+					{ customType: "retired-delivery", content: "must not land", display: false, attribution: "agent" },
+					{ deliveryMode: "steer" },
+				),
+			).resolves.toEqual({ status: "unavailable", reason: "session_transition" });
+			session.setLifecycleTransitionFenceForTests(false);
+		}
+		expect(session.agent.state.messages).toHaveLength(before);
+		expect(session.agent.peekSteeringQueue()).toHaveLength(0);
+		expect(session.agent.peekFollowUpQueue()).toHaveLength(0);
+		expect(session.hasPendingMessages()).toBe(false);
+		session.setCustomMessageAcceptanceHookForTests(undefined);
+	});
+	it("reports a cancelled semantic prompt preflight without accepting or mutating", async () => {
+		await createSession({ "retry.usageAwareFallback": true });
+		const before = session.agent.state.messages.length;
+		const probeStarted = Promise.withResolvers<void>();
+		vi.spyOn(sharedAuthStorage, "getModelUsageHealth").mockImplementation(async (_provider, options) => {
+			probeStarted.resolve();
+			const aborted = Promise.withResolvers<never>();
+			options.signal?.addEventListener(
+				"abort",
+				() => aborted.reject(options.signal?.reason ?? new DOMException("Aborted", "AbortError")),
+				{ once: true },
+			);
+			return aborted.promise;
+		});
+
+		const sending = session.sendCustomMessage(
+			{ customType: "cancelled-preflight", content: "must not land", display: false, attribution: "agent" },
+			{ deliveryMode: "interrupt" },
+		);
+		await probeStarted.promise;
+		await session.abort();
+
+		await expect(sending).resolves.toEqual({ status: "unavailable", reason: "prompt_preflight_cancelled" });
+		expect(session.agent.state.messages).toHaveLength(before);
+		expect(session.agent.peekSteeringQueue()).toHaveLength(0);
+		expect(session.agent.peekFollowUpQueue()).toHaveLength(0);
+		expect(session.hasPendingMessages()).toBe(false);
+	});
+	it("reports cancelled legacy trigger preflights without accepting or mutating", async () => {
+		const assertCancelled = async (options: { deliverAs?: "nextTurn"; triggerTurn: true }) => {
+			await createSession({ "retry.usageAwareFallback": true });
+			const before = session.agent.state.messages.length;
+			const probeStarted = Promise.withResolvers<void>();
+			const usageSpy = vi
+				.spyOn(sharedAuthStorage, "getModelUsageHealth")
+				.mockImplementation(async (_provider, probe) => {
+					probeStarted.resolve();
+					const aborted = Promise.withResolvers<never>();
+					probe.signal?.addEventListener(
+						"abort",
+						() => aborted.reject(probe.signal?.reason ?? new DOMException("Aborted", "AbortError")),
+						{ once: true },
+					);
+					return aborted.promise;
+				});
+
+			const sending = session.sendCustomMessage(
+				{
+					customType: "cancelled-legacy-preflight",
+					content: "must not land",
+					display: false,
+					attribution: "agent",
+				},
+				options,
+			);
+			await probeStarted.promise;
+			await session.abort();
+
+			await expect(sending).resolves.toEqual({ status: "unavailable", reason: "prompt_preflight_cancelled" });
+			expect(session.agent.state.messages).toHaveLength(before);
+			expect(session.agent.peekSteeringQueue()).toHaveLength(0);
+			expect(session.agent.peekFollowUpQueue()).toHaveLength(0);
+			expect(session.hasPendingMessages()).toBe(false);
+			usageSpy.mockRestore();
+		};
+
+		await assertCancelled({ triggerTurn: true });
+		await assertCancelled({ deliverAs: "nextTurn", triggerTurn: true });
+	});
+	it("does not enqueue a semantic wake when the client defers agent-initiated turns", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: mock.stream,
+			convertToLlm,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			modelRegistry: sharedModelRegistry,
+		});
+		session.setClientBridge({ capabilities: {}, deferAgentInitiatedTurns: true });
+		const before = session.agent.state.messages.length;
+
+		await expect(
+			session.sendCustomMessage(
+				{ customType: "exact-interrupt", content: "must not queue", display: false, attribution: "agent" },
+				{ deliveryMode: "interrupt" },
+			),
+		).resolves.toEqual({ status: "unavailable", reason: "client_deferred_turn" });
+		expect(session.agent.state.messages).toHaveLength(before);
+		expect(session.agent.peekSteeringQueue()).toHaveLength(0);
+		expect(session.agent.peekFollowUpQueue()).toHaveLength(0);
+		expect(session.hasPendingMessages()).toBe(false);
+	});
+
+	describe("durable semantic delivery recovery", () => {
+		const pendingType = "omp:pending-semantic-delivery";
+		const settledType = "omp:settled-semantic-delivery";
+
+		function createPersistentSession(sessionManager: SessionManager, calls: Message[][] = []): AgentSession {
+			const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+			const agent = new Agent({
+				getApiKey: () => "test-key",
+				initialState: { model, systemPrompt: ["Test"], tools: [] },
+				convertToLlm,
+				streamFn: (_model, context) => {
+					calls.push([...context.messages]);
+					const stream = new AssistantMessageEventStream();
+					queueMicrotask(() => {
+						stream.push({ type: "start", partial: createAssistantMessage("") });
+						stream.push({ type: "done", reason: "stop", message: createAssistantMessage("Done") });
+					});
+					return stream;
+				},
+			});
+			return new AgentSession({
+				agent,
+				sessionManager,
+				settings: Settings.isolated(),
+				modelRegistry: sharedModelRegistry,
+			});
+		}
+
+		async function acceptBeforeCrash(
+			mode: "interrupt" | "afterCurrent" | "steer" | "explicitPrompt",
+			content: string,
+		): Promise<{ sessionFile: string; sessionDir: string }> {
+			const sessionDir = path.join(tempDir, "sessions");
+			const manager = SessionManager.create(tempDir, sessionDir);
+			session = createPersistentSession(manager);
+			session.agent.state.isStreaming = true;
+			await session.sendCustomMessage(
+				{ customType: `mail-${mode}`, content, display: true, attribution: "agent" },
+				{ deliveryMode: mode },
+			);
+			const sessionFile = manager.getSessionFile();
+			if (!sessionFile) throw new Error("Semantic acceptance did not materialize a session file");
+			// Process-death simulation: reopen the flushed journal without disposing the old AgentSession.
+			session = undefined as unknown as AgentSession;
+			return { sessionFile, sessionDir };
+		}
+
+		async function reopen(sessionFile: string, sessionDir: string, calls: Message[][] = []): Promise<AgentSession> {
+			const reopened = await SessionManager.open(sessionFile, sessionDir, undefined, {
+				initialCwd: tempDir,
+				suppressBreadcrumb: true,
+			});
+			session = createPersistentSession(reopened, calls);
+			return session;
+		}
+
+		it.each([
+			["interrupt", "steer recovered after crash", "steer"],
+			["steer", "explicit steer recovered after crash", "steer"],
+			["afterCurrent", "follow-up recovered after crash", "followUp"],
+		] as const)("rehydrates busy %s delivery after a process boundary", async (mode, content, queue) => {
+			const { sessionFile, sessionDir } = await acceptBeforeCrash(mode, content);
+			const resumed = await reopen(sessionFile, sessionDir);
+			const recovered = queue === "steer" ? resumed.agent.peekSteeringQueue() : resumed.agent.peekFollowUpQueue();
+			expect(recovered).toHaveLength(1);
+			expect(JSON.stringify(recovered[0])).toContain(content);
+		});
+
+		it("keeps idle explicitPrompt recovery out of automatic turns until the next deliberate prompt", async () => {
+			const { sessionFile, sessionDir } = await acceptBeforeCrash("explicitPrompt", "idle status after crash");
+			const calls: Message[][] = [];
+			const resumed = await reopen(sessionFile, sessionDir, calls);
+
+			resumed.agent.state.isStreaming = false;
+			await resumed.sendCustomMessage(
+				{ customType: "urgent", content: "automatic urgent turn", display: true, attribution: "agent" },
+				{ deliveryMode: "interrupt" },
+			);
+			expect(JSON.stringify(calls[0])).toContain("automatic urgent turn");
+			expect(JSON.stringify(calls[0])).not.toContain("idle status after crash");
+
+			await resumed.prompt("deliberate owner prompt");
+			expect(JSON.stringify(calls[1])).toContain("idle status after crash");
+		});
+
+		it("reattaches busy explicitPrompt recovery to the next queued user prompt", async () => {
+			const { sessionFile, sessionDir } = await acceptBeforeCrash("explicitPrompt", "paired status after crash");
+			const calls: Message[][] = [];
+			const resumed = await reopen(sessionFile, sessionDir, calls);
+
+			await resumed.prompt("paired deliberate prompt");
+			const providerTurn = JSON.stringify(calls[0]);
+			expect(providerTurn).toContain("paired deliberate prompt");
+			expect(providerTurn).toContain("paired status after crash");
+		});
+
+		it("cancels pending semantic deliveries before an in-place context reset", async () => {
+			const sessionDir = path.join(tempDir, "sessions");
+			const manager = SessionManager.create(tempDir, sessionDir);
+			session = createPersistentSession(manager);
+			session.agent.state.isStreaming = true;
+			await session.sendCustomMessage(
+				{ customType: "reset-cancelled", content: "must stay before reset", display: false, attribution: "agent" },
+				{ deliveryMode: "steer" },
+			);
+			session.agent.state.isStreaming = false;
+			await expect(session.resetSessionContext()).resolves.toEqual({ droppedCount: 0 });
+
+			const sessionFile = manager.getSessionFile();
+			if (!sessionFile) throw new Error("Expected a materialized session");
+			const resumed = await reopen(sessionFile, sessionDir);
+			expect(resumed.agent.peekSteeringQueue()).toHaveLength(0);
+			expect(resumed.agent.peekFollowUpQueue()).toHaveLength(0);
+			expect(resumed.hasPendingMessages()).toBe(false);
+		});
+
+		it("keeps queued acceptance on the retained session when a lifecycle fence begins during persistence", async () => {
+			const sessionDir = path.join(tempDir, "sessions");
+			const manager = SessionManager.create(tempDir, sessionDir);
+			session = createPersistentSession(manager);
+			session.agent.state.isStreaming = true;
+			const rewriteStarted = Promise.withResolvers<void>();
+			const continueRewrite = Promise.withResolvers<void>();
+			const ensureOnDisk = manager.ensureOnDisk.bind(manager);
+			vi.spyOn(manager, "ensureOnDisk").mockImplementation(async () => {
+				rewriteStarted.resolve();
+				await continueRewrite.promise;
+				await ensureOnDisk();
+			});
+
+			const sending = session.sendCustomMessage(
+				{ customType: "acceptance-race", content: "must stay retained", display: false, attribution: "agent" },
+				{ deliveryMode: "steer" },
+			);
+			await rewriteStarted.promise;
+			session.setLifecycleTransitionFenceForTests(true);
+			continueRewrite.resolve();
+
+			await expect(sending).resolves.toEqual({ status: "accepted", delivery: "queued_steer" });
+			expect(session.agent.peekSteeringQueue()).toHaveLength(1);
+			session.setLifecycleTransitionFenceForTests(false);
+		});
+
+		it("settles a concurrent queued acceptance before resetting its delivery", async () => {
+			const sessionDir = path.join(tempDir, "sessions");
+			const manager = SessionManager.create(tempDir, sessionDir);
+			session = createPersistentSession(manager);
+			session.agent.state.isStreaming = true;
+			const rewriteStarted = Promise.withResolvers<void>();
+			const continueRewrite = Promise.withResolvers<void>();
+			const ensureOnDisk = manager.ensureOnDisk.bind(manager);
+			vi.spyOn(manager, "ensureOnDisk").mockImplementation(async () => {
+				rewriteStarted.resolve();
+				await continueRewrite.promise;
+				await ensureOnDisk();
+			});
+
+			const sending = session.sendCustomMessage(
+				{ customType: "reset-race", content: "cancel before reset", display: false, attribution: "agent" },
+				{ deliveryMode: "explicitPrompt" },
+			);
+			await rewriteStarted.promise;
+			session.agent.state.isStreaming = false;
+			const resetting = session.resetSessionContext();
+			continueRewrite.resolve();
+
+			await expect(sending).resolves.toEqual({ status: "accepted", delivery: "queued_next_turn" });
+			await expect(resetting).resolves.toEqual({ droppedCount: 0 });
+			const sessionFile = manager.getSessionFile();
+			if (!sessionFile) throw new Error("Expected a materialized session");
+			const resumed = await reopen(sessionFile, sessionDir);
+			expect(resumed.agent.peekSteeringQueue()).toHaveLength(0);
+			expect(resumed.hasPendingMessages()).toBe(false);
+		});
+		it("persists the conversation message before its semantic-delivery settlement", async () => {
+			const sessionDir = path.join(tempDir, "sessions");
+
+			const manager = SessionManager.create(tempDir, sessionDir);
+			session = createPersistentSession(manager);
+			session.agent.state.isStreaming = true;
+			await session.sendCustomMessage(
+				{ customType: "ordered", content: "ordered delivery", display: false, attribution: "agent" },
+				{ deliveryMode: "steer" },
+			);
+
+			const queued = session.agent.peekSteeringQueue()[0];
+			if (!queued) throw new Error("Expected a queued semantic steer");
+			session.agent.state.isStreaming = false;
+			session.agent.emitExternalEvent({ type: "message_start", message: queued });
+			session.agent.emitExternalEvent({ type: "message_end", message: queued });
+			await waitFor(() =>
+				manager.getBranch().some(entry => entry.type === "custom" && entry.customType === settledType),
+			);
+
+			const branch = manager.getBranch();
+			const pendingIndex = branch.findIndex(entry => entry.type === "custom" && entry.customType === pendingType);
+			const messageIndex = branch.findIndex(
+				entry => entry.type === "custom_message" && entry.customType === "ordered",
+			);
+			const settledIndex = branch.findIndex(entry => entry.type === "custom" && entry.customType === settledType);
+			expect(pendingIndex).toBeGreaterThanOrEqual(0);
+			expect(messageIndex).toBeGreaterThan(pendingIndex);
+			expect(settledIndex).toBeGreaterThan(messageIndex);
+		});
+
+		it("recovers one pending delivery when conversation settlement persistence fails", async () => {
+			const sessionDir = path.join(tempDir, "sessions");
+			const manager = SessionManager.create(tempDir, sessionDir);
+			session = createPersistentSession(manager);
+			session.agent.state.isStreaming = true;
+			await session.sendCustomMessage(
+				{ customType: "failed-settlement", content: "recover exactly once", display: false, attribution: "agent" },
+				{ deliveryMode: "steer" },
+			);
+
+			const queued = session.agent.peekSteeringQueue()[0];
+			if (!queued) throw new Error("Expected a queued semantic steer");
+			const atomicBatch = vi
+				.spyOn(manager, "appendEntriesAtomically")
+				.mockRejectedValueOnce(new Error("conversation settlement publish failed"));
+			session.agent.state.isStreaming = false;
+			session.agent.emitExternalEvent({ type: "message_start", message: queued });
+			session.agent.emitExternalEvent({ type: "message_end", message: queued });
+			await waitFor(() => atomicBatch.mock.calls.length === 1);
+
+			const sessionFile = manager.getSessionFile();
+			if (!sessionFile) throw new Error("Expected a materialized session");
+			session = undefined as unknown as AgentSession;
+			const resumed = await reopen(sessionFile, sessionDir);
+			expect(resumed.agent.peekSteeringQueue()).toHaveLength(1);
+			expect(JSON.stringify(resumed.agent.peekSteeringQueue()[0])).toContain("recover exactly once");
+			expect(
+				resumed.sessionManager
+					.getBranch()
+					.some(entry => entry.type === "custom_message" && entry.customType === "failed-settlement"),
+			).toBe(false);
+			expect(
+				resumed.sessionManager
+					.getBranch()
+					.some(entry => entry.type === "custom" && entry.customType === settledType),
+			).toBe(false);
+		});
+	});
 
 	it("should throw when prompt() called while streaming", async () => {
 		await createSession();
@@ -423,6 +988,181 @@ describe("AgentSession concurrent prompt guard", () => {
 		expect(commandStreamingStates).toEqual([false, false]);
 		expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
 		expect(JSON.stringify(sessionManager.getEntries())).not.toContain("/after-turn");
+	});
+
+	it("terminates an exclusive handoff tool before sibling work and continues only in the child session", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const extensionRuntime = new ExtensionRuntime();
+		let mutatorCalls = 0;
+		let commandCalls = 0;
+		let sourceFile: string | undefined;
+		let childFile: string | undefined;
+		let childTurn: Promise<unknown> | undefined;
+		const childGoal = {
+			id: "child-handoff-goal",
+			objective: "Continue only in the child session",
+			status: "active" as const,
+			tokensUsed: 0,
+			timeUsedSeconds: 0,
+			createdAt: Date.now(),
+			updatedAt: Date.now(),
+		};
+		const extension = await loadExtensionFromFactory(
+			pi => {
+				pi.registerTool({
+					name: "commit_handoff",
+					label: "Commit handoff",
+					description: "Commit a terminal child handoff",
+					parameters: pi.arktype({}),
+					concurrency: "exclusive",
+					terminalAfterSuccess: true,
+					async execute() {
+						pi.sendUserMessage("/commit-handoff child", { deliverAs: "followUp" });
+						return { content: [{ type: "text", text: "handoff committed" }], details: {} };
+					},
+				});
+				pi.registerTool({
+					name: "later_mutator",
+					label: "Later mutator",
+					description: "Must not run after the terminal handoff",
+					parameters: pi.arktype({}),
+					async execute() {
+						mutatorCalls++;
+						return { content: [{ type: "text", text: "mutated" }], details: {} };
+					},
+				});
+				pi.registerTool({
+					name: "child_complete",
+					label: "Child complete",
+					description: "Settle the child proof without another provider call",
+					parameters: pi.arktype({}),
+					concurrency: "exclusive",
+					terminalAfterSuccess: true,
+					async execute() {
+						return { content: [{ type: "text", text: "child settled" }], details: {} };
+					},
+				});
+				pi.registerCommand("commit-handoff", {
+					handler: async (_args, ctx) => {
+						commandCalls++;
+						if (!sourceFile) throw new Error("Expected source session file");
+						const result = await ctx.newSession({
+							parentSession: sourceFile,
+							setup: async manager => {
+								manager.appendCustomEntry("smarty-stack.handoff", { phase: "child_committed" });
+								manager.appendModeChange("goal", { goal: childGoal });
+							},
+						});
+						if (result.cancelled) throw new Error("Child handoff was cancelled");
+						childFile = session.sessionFile;
+						childTurn = pi.sendMessage(
+							{
+								customType: "smarty-stack.handoff-next-turn",
+								content: "Continue in the child session.",
+								display: false,
+								attribution: "agent",
+							},
+							{ deliverAs: "nextTurn", triggerTurn: true },
+						);
+					},
+				});
+			},
+			tempDir,
+			new EventBus(),
+			extensionRuntime,
+			"terminal-handoff",
+		);
+		const sessionManager = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+		const extensionRunner = new ExtensionRunner(
+			[extension],
+			extensionRuntime,
+			tempDir,
+			sessionManager,
+			sharedModelRegistry,
+		);
+		const tools = wrapRegisteredTools(extensionRunner.getAllRegisteredTools(), extensionRunner);
+		const requestSessionFiles: string[] = [];
+		let providerCalls = 0;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools },
+			convertToLlm,
+			streamFn: () => {
+				providerCalls++;
+				requestSessionFiles.push(session.sessionFile ?? "missing");
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: createAssistantMessage("") });
+					if (providerCalls === 1) {
+						const message = createAssistantMessage("");
+						message.stopReason = "toolUse";
+						message.content = [
+							{ type: "toolCall", id: "handoff-call", name: "commit_handoff", arguments: {} },
+							{ type: "toolCall", id: "mutator-call", name: "later_mutator", arguments: {} },
+						] as ToolCall[];
+						stream.push({ type: "done", reason: "toolUse", message });
+						return;
+					}
+					const message = createAssistantMessage("");
+					message.stopReason = "toolUse";
+					message.content = [
+						{ type: "text", text: "HANDOFF_CHILD_OK" },
+						{ type: "toolCall", id: "child-complete-call", name: "child_complete", arguments: {} },
+					] as AssistantMessage["content"];
+					stream.push({ type: "done", reason: "toolUse", message });
+				});
+				return stream;
+			},
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: sharedModelRegistry,
+			extensionRunner,
+			toolRegistry: new Map(tools.map(tool => [tool.name, tool])),
+		});
+		sourceFile = session.sessionFile;
+		if (!sourceFile) throw new Error("Expected persisted source session");
+		await initializeExtensions(session, {
+			reportSendError: (_action, error) => {
+				throw error;
+			},
+			reportRuntimeError: error => {
+				throw new Error(error.error);
+			},
+		});
+
+		await session.prompt("Commit the handoff");
+		await waitFor(() => childTurn !== undefined);
+		if (!childTurn) throw new Error("Expected child continuation task");
+		await childTurn;
+		await session.sessionManager.flush();
+		if (!childFile) throw new Error("Expected persisted child session");
+
+		const assistantTexts = async (file: string): Promise<string[]> =>
+			(await Bun.file(file).text())
+				.split("\n")
+				.filter(Boolean)
+				.flatMap(line => {
+					const entry = JSON.parse(line) as { type?: string; message?: AgentMessage };
+					if (entry.type !== "message" || entry.message?.role !== "assistant") return [];
+					return entry.message.content.flatMap(block => (block.type === "text" ? [block.text] : []));
+				});
+		const sourceAssistantTexts = await assistantTexts(sourceFile);
+		const childAssistantTexts = await assistantTexts(childFile);
+
+		expect(mutatorCalls).toBe(0);
+		expect(commandCalls).toBe(1);
+		expect(providerCalls).toBe(2);
+		expect(requestSessionFiles).toEqual([sourceFile, childFile]);
+		expect(sourceAssistantTexts).not.toContain("HANDOFF_CHILD_OK");
+		expect(childAssistantTexts).toContain("HANDOFF_CHILD_OK");
+		expect(session.getGoalModeState()).toMatchObject({
+			enabled: true,
+			mode: "active",
+			goal: { id: childGoal.id, objective: childGoal.objective, status: "active" },
+		});
 	});
 
 	it("delivers hidden nextTurn stop reactions through the next LLM call without exposing them in the visible queue", async () => {
@@ -1089,7 +1829,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		expect(session.isStreaming).toBe(false);
 		const callsAfterFirstPrompt = mock.calls.length;
 
-		await session.sendCustomMessage(
+		const disposition = await session.sendCustomMessage(
 			{
 				customType: "async-result",
 				content: "Background result",
@@ -1098,7 +1838,11 @@ describe("AgentSession concurrent prompt guard", () => {
 			},
 			{ deliverAs: "followUp", triggerTurn: true },
 		);
-
+		expect(disposition).toEqual({
+			status: "downgraded",
+			delivery: "queued_next_turn",
+			reason: "client_deferred_turn",
+		});
 		expect(mock.calls).toHaveLength(callsAfterFirstPrompt);
 		expect(session.isStreaming).toBe(false);
 
