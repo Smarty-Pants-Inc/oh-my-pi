@@ -211,8 +211,9 @@ describe("AgentSession concurrent disposal", () => {
 		const shutdown = vi.fn();
 		const extensionRunner = {
 			hasHandlers: vi.fn((type: string) => type === "session_shutdown"),
-			emit: vi.fn(async () => {
+			emitSessionShutdown: vi.fn(async () => {
 				shutdown();
+				return new Set<string>();
 			}),
 			clearManagedTimers: vi.fn(),
 		} as unknown as ExtensionRunner;
