@@ -153,7 +153,7 @@ describe("reportLocalOnlyPromptResult", () => {
 		expect(sentOptions).toEqual([{ triggerTurn: true }, { deliveryMode: "auto" }]);
 	});
 
-	test("reports rejected custom messages as local-only without rejecting turn tracking", async () => {
+	test("reports rejected custom messages as local-only without rejecting prompt tracking", async () => {
 		let extensionActions: ExtensionActions | undefined;
 		let sending: Promise<SendMessageDisposition> | undefined;
 		let trackedTurn: Promise<unknown> | undefined;
@@ -214,7 +214,7 @@ describe("reportLocalOnlyPromptResult", () => {
 		if (!sending || !trackedTurn) throw new Error("send was not tracked");
 		await expect(sending).rejects.toBe(thrown);
 		await waitForTrackedPromptHandlers(trackedPrompt);
-		await expect(trackedTurn).resolves.toBe(false);
+		await expect(trackedTurn).rejects.toBe(thrown);
 		expect(reportedErrors).toEqual([thrown]);
 		expect(output).toEqual([{ type: "prompt_result", id: "req_rejected_custom", agentInvoked: false }]);
 	});

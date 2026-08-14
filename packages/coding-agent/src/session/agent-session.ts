@@ -153,7 +153,7 @@ import type { Skill, SkillWarning } from "../extensibility/skills";
 import { expandSlashCommand, type FileSlashCommand } from "../extensibility/slash-commands";
 import { normalizeToolEventInput, resolveToolEventInput } from "../extensibility/tool-event-input";
 import { GoalRuntime } from "../goals/runtime";
-import type { GoalModeState } from "../goals/state";
+import { type GoalModeState, parseGoalModeState } from "../goals/state";
 import type { HindsightSessionState } from "../hindsight/state";
 import { type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
 import type { IrcMessage } from "../irc/bus";
@@ -774,7 +774,7 @@ export class AgentSession {
 	 * Cleared before every new prompt turn so the next turn evaluates cleanly.
 	 */
 	#yieldTerminationPending = false;
-	#synchronouslyTerminatedYieldToolCallIds = new Set<string>();
+	#synchronouslyTerminatedToolCallIds = new Set<string>();
 	#providerSessionState = new Map<string, ProviderSessionState>();
 	#hindsightSessionState: HindsightSessionState | undefined = undefined;
 	readonly #memory: SessionMemory;
@@ -1587,6 +1587,8 @@ export class AgentSession {
 				);
 			},
 		});
+		const initialSessionContext = this.buildDisplaySessionContext();
+		this.#rehydrateGoalModeState(initialSessionContext.mode, initialSessionContext.modeData);
 		this.#cancelExitRecorder = postmortem.register(`agent-session:${this.sessionManager.getSessionId()}`, reason => {
 			this.#recordSessionExit(reason);
 		});
@@ -2837,10 +2839,10 @@ export class AgentSession {
 	 * the recovery wait always sees the in-flight handler and blocks until it — and
 	 * everything it schedules — settles. */
 	#dispatchAgentEvent = async (event: AgentEvent): Promise<void> => {
-		if (event.type === "tool_execution_end" && this.#isTerminalYieldToolResult(event)) {
-			const alreadyTerminated = this.#synchronouslyTerminatedYieldToolCallIds.delete(event.toolCallId);
+		if (event.type === "tool_execution_end" && this.#isTerminalToolResult(event)) {
+			const alreadyTerminated = this.#synchronouslyTerminatedToolCallIds.delete(event.toolCallId);
 			if (!alreadyTerminated) {
-				this.#markTerminalYieldToolCall(event.toolCallId);
+				if (this.#isTerminalYieldToolResult(event)) this.#markTerminalYieldToolCall(event.toolCallId);
 				this.agent.abort(TERMINAL_TOOL_RESULT_ABORT_REASON);
 			}
 		}
@@ -3974,15 +3976,14 @@ export class AgentSession {
 	}
 
 	#afterToolCall(ctx: AfterToolCallContext): AfterToolCallResult | undefined {
-		if (
-			this.#isTerminalYieldToolResult({
-				toolName: ctx.toolCall.name,
-				isError: ctx.isError,
-				result: ctx.result,
-			})
-		) {
-			this.#markTerminalYieldToolCall(ctx.toolCall.id);
-			this.#synchronouslyTerminatedYieldToolCallIds.add(ctx.toolCall.id);
+		const event = {
+			toolName: ctx.toolCall.name,
+			isError: ctx.isError,
+			result: ctx.result,
+		};
+		if (this.#isTerminalToolResult(event)) {
+			if (this.#isTerminalYieldToolResult(event)) this.#markTerminalYieldToolCall(ctx.toolCall.id);
+			this.#synchronouslyTerminatedToolCallIds.add(ctx.toolCall.id);
 			this.agent.abort(TERMINAL_TOOL_RESULT_ABORT_REASON);
 		}
 		return this.#ttsr.afterToolCall(ctx);
@@ -5358,6 +5359,11 @@ export class AgentSession {
 
 	buildDisplaySessionContext(): SessionContext {
 		return this.#providerBoundary.buildDisplaySessionContext();
+	}
+
+	#rehydrateGoalModeState(mode: unknown, modeData: unknown): void {
+		this.#goalRuntime.clearAccounting();
+		this.#goalModeState = this.settings.get("goal.enabled") ? parseGoalModeState(mode, modeData) : undefined;
 	}
 
 	/**
@@ -7833,6 +7839,7 @@ export class AgentSession {
 			if (setup) await setup(this.sessionManager);
 
 			const targetContext = this.buildDisplaySessionContext();
+			this.#rehydrateGoalModeState(targetContext.mode, targetContext.modeData);
 			this.agent.reset();
 			this.agent.replaceMessages(targetContext.messages);
 			this.#clearCheckpointRuntimeState();
@@ -8165,6 +8172,15 @@ export class AgentSession {
 	 */
 	handoff(customInstructions?: string, options?: SessionHandoffOptions): Promise<HandoffResult | undefined> {
 		return this.#handoff.handoff(customInstructions, options);
+	}
+
+	#isTerminalToolResult(event: { toolName: string; isError?: boolean; result?: { details?: unknown } }): boolean {
+		if (event.isError) return false;
+		if (this.#isTerminalYieldToolResult(event)) return true;
+		const tool = this.agent.state.tools.find(
+			candidate => candidate.name === event.toolName || candidate.customWireName === event.toolName,
+		);
+		return tool?.terminalAfterSuccess === true;
 	}
 
 	#isTerminalYieldToolResult(event: { toolName: string; isError?: boolean; result?: { details?: unknown } }): boolean {
@@ -8929,6 +8945,7 @@ export class AgentSession {
 			this.#memory.rekeyForCurrentSessionId();
 
 			let sessionContext = this.buildDisplaySessionContext();
+			this.#rehydrateGoalModeState(sessionContext.mode, sessionContext.modeData);
 			const didReloadConversationChange =
 				previousSessionContext !== undefined &&
 				didSessionMessagesChange(previousSessionContext.messages, sessionContext.messages);

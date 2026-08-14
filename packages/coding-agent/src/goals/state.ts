@@ -20,6 +20,57 @@ export interface GoalModeState {
 	goal: Goal;
 }
 
+const goalStatuses = new Set<GoalStatus>(["active", "paused", "budget-limited", "complete", "dropped"]);
+
+/** Parse persisted goal mode data at every session identity boundary. */
+export function parseGoalModeState(mode: unknown, modeData: unknown): GoalModeState | undefined {
+	if (mode !== "goal" && mode !== "goal_paused") return undefined;
+	if (typeof modeData !== "object" || modeData === null || !("goal" in modeData)) return undefined;
+	const goal = modeData.goal;
+	if (typeof goal !== "object" || goal === null) return undefined;
+	const value = goal as Record<string, unknown>;
+	if (
+		typeof value.id !== "string" ||
+		value.id.length === 0 ||
+		typeof value.objective !== "string" ||
+		value.objective.length === 0 ||
+		typeof value.status !== "string" ||
+		!goalStatuses.has(value.status as GoalStatus) ||
+		typeof value.tokensUsed !== "number" ||
+		!Number.isFinite(value.tokensUsed) ||
+		value.tokensUsed < 0 ||
+		typeof value.timeUsedSeconds !== "number" ||
+		!Number.isFinite(value.timeUsedSeconds) ||
+		value.timeUsedSeconds < 0 ||
+		typeof value.createdAt !== "number" ||
+		!Number.isFinite(value.createdAt) ||
+		value.createdAt < 0 ||
+		typeof value.updatedAt !== "number" ||
+		!Number.isFinite(value.updatedAt) ||
+		value.updatedAt < 0 ||
+		(value.tokenBudget !== undefined &&
+			(typeof value.tokenBudget !== "number" || !Number.isInteger(value.tokenBudget) || value.tokenBudget <= 0))
+	) {
+		return undefined;
+	}
+	const status = value.status as GoalStatus;
+	if (mode === "goal" ? status !== "active" && status !== "budget-limited" : status !== "paused") return undefined;
+	return {
+		enabled: mode === "goal",
+		mode: "active",
+		goal: {
+			id: value.id,
+			objective: value.objective,
+			status,
+			tokenBudget: value.tokenBudget as number | undefined,
+			tokensUsed: value.tokensUsed,
+			timeUsedSeconds: value.timeUsedSeconds,
+			createdAt: value.createdAt,
+			updatedAt: value.updatedAt,
+		},
+	};
+}
+
 export interface GoalToolDetails {
 	op: "create" | "get" | "complete" | "resume" | "drop";
 	goal?: Goal | null;

@@ -1026,7 +1026,7 @@ describe("AgentSession.switchSession previous-context build", () => {
 			const context = sessionManager.buildSessionContext();
 			expect(context.mode).toBe("goal");
 			expect(context.modeData?.goal).toMatchObject({ objective: seededGoal.objective });
-			session.setGoalModeState({ enabled: true, mode: "active", goal: seededGoal });
+			expect(session.getGoalModeState()).toMatchObject({ enabled: true, goal: seededGoal });
 		});
 
 		const emitWithHostCompletion = extensionRunner.emitWithHostCompletion.bind(extensionRunner);
@@ -1051,6 +1051,107 @@ describe("AgentSession.switchSession previous-context build", () => {
 		expect(reconcileCalls).toBe(1);
 		expect(session.getTodoPhases()).toEqual(seededTodos);
 		expect(session.getGoalModeState()?.goal.objective).toBe(seededGoal.objective);
+	});
+
+	it("hydrates a persisted goal during AgentSession construction", async () => {
+		const tempDir = TempDir.createSync("@pi-resume-goal-hydration-");
+		tempDirs.push(tempDir);
+		const now = Date.now();
+		const persistedGoal = {
+			id: "persisted-resume-goal",
+			objective: "Resume this exact objective",
+			status: "active" as const,
+			tokensUsed: 12,
+			timeUsedSeconds: 3,
+			createdAt: now - 1_000,
+			updatedAt: now,
+		};
+		const seedManager = SessionManager.create(tempDir.path(), tempDir.path());
+		seedManager.appendModeChange("goal", { goal: persistedGoal });
+		await seedManager.ensureOnDisk();
+		await seedManager.flush();
+		const sessionFile = seedManager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected persisted goal session file");
+		await seedManager.close();
+
+		const sessionManager = await SessionManager.open(sessionFile, tempDir.path());
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			convertToLlm,
+		});
+		const extensionRunner = new ExtensionRunner(
+			[],
+			new ExtensionRuntime(),
+			tempDir.path(),
+			sessionManager,
+			modelRegistry,
+		);
+		const session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry,
+			extensionRunner,
+		});
+		sessions.push(session);
+
+		expect(session.getGoalModeState()).toEqual({ enabled: true, mode: "active", goal: persistedGoal });
+	});
+
+	it("clears stale goal state when switching to a session without a goal", async () => {
+		const tempDir = TempDir.createSync("@pi-switch-goal-clear-");
+		tempDirs.push(tempDir);
+		const { session } = buildSession(tempDir);
+		const now = Date.now();
+		session.setGoalModeState({
+			enabled: true,
+			mode: "active",
+			goal: {
+				id: "stale-goal",
+				objective: "Must not cross the session boundary",
+				status: "active",
+				tokensUsed: 0,
+				timeUsedSeconds: 0,
+				createdAt: now,
+				updatedAt: now,
+			},
+		});
+		const targetManager = SessionManager.create(tempDir.path(), tempDir.path());
+		targetManager.appendMessage({ role: "user", content: "target", timestamp: now });
+		await targetManager.ensureOnDisk();
+		await targetManager.flush();
+		const targetSessionFile = targetManager.getSessionFile();
+		if (!targetSessionFile) throw new Error("Expected target session file");
+		await targetManager.close();
+
+		await expect(session.switchSession(targetSessionFile)).resolves.toBe(true);
+		expect(session.getGoalModeState()).toBeUndefined();
+	});
+
+	it("refuses an invalid persisted goal status during new-session setup", async () => {
+		const tempDir = TempDir.createSync("@pi-new-session-invalid-goal-");
+		tempDirs.push(tempDir);
+		const { session } = buildSession(tempDir);
+		const now = Date.now();
+
+		await expect(
+			session.newSession(undefined, async manager => {
+				manager.appendModeChange("goal", {
+					goal: {
+						id: "invalid-goal",
+						objective: "Invalid state must not hydrate",
+						status: "invented",
+						tokensUsed: 0,
+						timeUsedSeconds: 0,
+						createdAt: now,
+						updatedAt: now,
+					},
+				});
+			}),
+		).resolves.toBe(true);
+
+		expect(session.getGoalModeState()).toBeUndefined();
 	});
 
 	it("cleans partially opened lifecycle ownership before publishing a switch frame", async () => {

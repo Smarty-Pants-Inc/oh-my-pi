@@ -690,6 +690,7 @@ describe("AgentSession advisor toggle", () => {
 		const extensionRunner = {
 			hasHandlers: (eventType: string) => eventType === "session_before_branch",
 			emit: async () => ({ skipConversationRestore: true }),
+			emitBeforeSessionMutation: async () => undefined,
 			emitWithHostCompletion: async (
 				_event: { type: string },
 				finalizeBeforeHostCompletion?: () => void | Promise<void>,
@@ -736,6 +737,7 @@ describe("AgentSession advisor toggle", () => {
 		const extensionRunner = {
 			hasHandlers: () => false,
 			emit: async () => undefined,
+			emitBeforeSessionMutation: async () => undefined,
 			emitWithHostCompletion: async (
 				event: { type: string },
 				finalizeBeforeHostCompletion?: () => void | Promise<void>,

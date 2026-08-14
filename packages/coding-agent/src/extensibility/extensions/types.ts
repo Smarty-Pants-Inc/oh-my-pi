@@ -590,6 +590,10 @@ export interface ToolDefinition<TParams extends TSchema = TSchema, TDetails = un
 	parameters: TParams;
 	/** If true, tool is excluded unless explicitly listed in --tools or agent's tools field */
 	hidden?: boolean;
+	/** Stop the current agent run after this tool returns a successful result. */
+	terminalAfterSuccess?: boolean;
+	/** Tool-call scheduling mode. `"exclusive"` forms a barrier around this call. */
+	concurrency?: "shared" | "exclusive";
 	/** If true, tool is registered but not auto-included in the initial active set.
 	 *  The registering extension is responsible for activating/deactivating it via setActiveTools(). */
 	defaultInactive?: boolean;

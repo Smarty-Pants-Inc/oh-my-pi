@@ -20,7 +20,9 @@ import { type SettingPath, Settings } from "@oh-my-pi/pi-coding-agent/config/set
 import { TtsrManager } from "@oh-my-pi/pi-coding-agent/export/ttsr";
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
+import { wrapRegisteredTools } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/wrapper";
 import { GoalRuntime } from "@oh-my-pi/pi-coding-agent/goals/runtime";
+import { initializeExtensions } from "@oh-my-pi/pi-coding-agent/modes/runtime-init";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm, USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
@@ -986,6 +988,181 @@ describe("AgentSession concurrent prompt guard", () => {
 		expect(commandStreamingStates).toEqual([false, false]);
 		expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
 		expect(JSON.stringify(sessionManager.getEntries())).not.toContain("/after-turn");
+	});
+
+	it("terminates an exclusive handoff tool before sibling work and continues only in the child session", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const extensionRuntime = new ExtensionRuntime();
+		let mutatorCalls = 0;
+		let commandCalls = 0;
+		let sourceFile: string | undefined;
+		let childFile: string | undefined;
+		let childTurn: Promise<unknown> | undefined;
+		const childGoal = {
+			id: "child-handoff-goal",
+			objective: "Continue only in the child session",
+			status: "active" as const,
+			tokensUsed: 0,
+			timeUsedSeconds: 0,
+			createdAt: Date.now(),
+			updatedAt: Date.now(),
+		};
+		const extension = await loadExtensionFromFactory(
+			pi => {
+				pi.registerTool({
+					name: "commit_handoff",
+					label: "Commit handoff",
+					description: "Commit a terminal child handoff",
+					parameters: pi.arktype({}),
+					concurrency: "exclusive",
+					terminalAfterSuccess: true,
+					async execute() {
+						pi.sendUserMessage("/commit-handoff child", { deliverAs: "followUp" });
+						return { content: [{ type: "text", text: "handoff committed" }], details: {} };
+					},
+				});
+				pi.registerTool({
+					name: "later_mutator",
+					label: "Later mutator",
+					description: "Must not run after the terminal handoff",
+					parameters: pi.arktype({}),
+					async execute() {
+						mutatorCalls++;
+						return { content: [{ type: "text", text: "mutated" }], details: {} };
+					},
+				});
+				pi.registerTool({
+					name: "child_complete",
+					label: "Child complete",
+					description: "Settle the child proof without another provider call",
+					parameters: pi.arktype({}),
+					concurrency: "exclusive",
+					terminalAfterSuccess: true,
+					async execute() {
+						return { content: [{ type: "text", text: "child settled" }], details: {} };
+					},
+				});
+				pi.registerCommand("commit-handoff", {
+					handler: async (_args, ctx) => {
+						commandCalls++;
+						if (!sourceFile) throw new Error("Expected source session file");
+						const result = await ctx.newSession({
+							parentSession: sourceFile,
+							setup: async manager => {
+								manager.appendCustomEntry("smarty-stack.handoff", { phase: "child_committed" });
+								manager.appendModeChange("goal", { goal: childGoal });
+							},
+						});
+						if (result.cancelled) throw new Error("Child handoff was cancelled");
+						childFile = session.sessionFile;
+						childTurn = pi.sendMessage(
+							{
+								customType: "smarty-stack.handoff-next-turn",
+								content: "Continue in the child session.",
+								display: false,
+								attribution: "agent",
+							},
+							{ deliverAs: "nextTurn", triggerTurn: true },
+						);
+					},
+				});
+			},
+			tempDir,
+			new EventBus(),
+			extensionRuntime,
+			"terminal-handoff",
+		);
+		const sessionManager = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+		const extensionRunner = new ExtensionRunner(
+			[extension],
+			extensionRuntime,
+			tempDir,
+			sessionManager,
+			sharedModelRegistry,
+		);
+		const tools = wrapRegisteredTools(extensionRunner.getAllRegisteredTools(), extensionRunner);
+		const requestSessionFiles: string[] = [];
+		let providerCalls = 0;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools },
+			convertToLlm,
+			streamFn: () => {
+				providerCalls++;
+				requestSessionFiles.push(session.sessionFile ?? "missing");
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: createAssistantMessage("") });
+					if (providerCalls === 1) {
+						const message = createAssistantMessage("");
+						message.stopReason = "toolUse";
+						message.content = [
+							{ type: "toolCall", id: "handoff-call", name: "commit_handoff", arguments: {} },
+							{ type: "toolCall", id: "mutator-call", name: "later_mutator", arguments: {} },
+						] as ToolCall[];
+						stream.push({ type: "done", reason: "toolUse", message });
+						return;
+					}
+					const message = createAssistantMessage("");
+					message.stopReason = "toolUse";
+					message.content = [
+						{ type: "text", text: "HANDOFF_CHILD_OK" },
+						{ type: "toolCall", id: "child-complete-call", name: "child_complete", arguments: {} },
+					] as AssistantMessage["content"];
+					stream.push({ type: "done", reason: "toolUse", message });
+				});
+				return stream;
+			},
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: sharedModelRegistry,
+			extensionRunner,
+			toolRegistry: new Map(tools.map(tool => [tool.name, tool])),
+		});
+		sourceFile = session.sessionFile;
+		if (!sourceFile) throw new Error("Expected persisted source session");
+		await initializeExtensions(session, {
+			reportSendError: (_action, error) => {
+				throw error;
+			},
+			reportRuntimeError: error => {
+				throw new Error(error.error);
+			},
+		});
+
+		await session.prompt("Commit the handoff");
+		await waitFor(() => childTurn !== undefined);
+		if (!childTurn) throw new Error("Expected child continuation task");
+		await childTurn;
+		await session.sessionManager.flush();
+		if (!childFile) throw new Error("Expected persisted child session");
+
+		const assistantTexts = async (file: string): Promise<string[]> =>
+			(await Bun.file(file).text())
+				.split("\n")
+				.filter(Boolean)
+				.flatMap(line => {
+					const entry = JSON.parse(line) as { type?: string; message?: AgentMessage };
+					if (entry.type !== "message" || entry.message?.role !== "assistant") return [];
+					return entry.message.content.flatMap(block => (block.type === "text" ? [block.text] : []));
+				});
+		const sourceAssistantTexts = await assistantTexts(sourceFile);
+		const childAssistantTexts = await assistantTexts(childFile);
+
+		expect(mutatorCalls).toBe(0);
+		expect(commandCalls).toBe(1);
+		expect(providerCalls).toBe(2);
+		expect(requestSessionFiles).toEqual([sourceFile, childFile]);
+		expect(sourceAssistantTexts).not.toContain("HANDOFF_CHILD_OK");
+		expect(childAssistantTexts).toContain("HANDOFF_CHILD_OK");
+		expect(session.getGoalModeState()).toMatchObject({
+			enabled: true,
+			mode: "active",
+			goal: { id: childGoal.id, objective: childGoal.objective, status: "active" },
+		});
 	});
 
 	it("delivers hidden nextTurn stop reactions through the next LLM call without exposing them in the visible queue", async () => {

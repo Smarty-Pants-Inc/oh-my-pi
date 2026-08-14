@@ -60,14 +60,16 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 				const sendTask = session.sendCustomMessage(message, sendOptions);
 				const turnTask = sendTask.then(
 					disposition => disposition.status === "accepted" && disposition.delivery === "started_turn",
-					() => false,
 				);
 				if (trackAgentInvokingMessage) {
 					trackAgentInvokingMessage(turnTask);
 				} else {
-					void turnTask.then(started => {
-						if (started) markAgentInvokingMessage?.();
-					});
+					void turnTask.then(
+						started => {
+							if (started) markAgentInvokingMessage?.();
+						},
+						() => {},
+					);
 				}
 				void sendTask.catch(e => {
 					reportSendError("extension_send", e instanceof Error ? e : new Error(String(e)));
