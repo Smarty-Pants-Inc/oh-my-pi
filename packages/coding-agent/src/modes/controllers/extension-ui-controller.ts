@@ -18,6 +18,7 @@ import type {
 	ExtensionUiComponent,
 	ExtensionWidgetContent,
 	ExtensionWidgetOptions,
+	SendMessageDisposition,
 	SendUserMessageHandler,
 	TerminalInputHandler,
 } from "../../extensibility/extensions";
@@ -64,6 +65,7 @@ function toWireSelectOptions(options: ExtensionUISelectItem[]): CollabUiSelectIt
 
 export class ExtensionUiController {
 	#extensionTerminalInputUnsubscribers = new Set<() => void>();
+	#hostTerminalInputUnsubscribers = new Set<() => void>();
 	#hookWidgetsAbove = new Map<string, ExtensionUiComponent>();
 	#hookWidgetsBelow = new Map<string, ExtensionUiComponent>();
 	// Single-file dialog surface (`editorContainer` + focus) is shared by the
@@ -145,19 +147,20 @@ export class ExtensionUiController {
 		if (!extensionRunner) {
 			return; // No hooks loaded
 		}
+		extensionRunner.setHostTerminalInput(handler => this.addHostTerminalInputListener(handler));
 
 		const actions: ExtensionActions = {
 			sendMessage: (message, options) => {
-				const wasStreaming = this.ctx.session.isStreaming;
 				const normalized = normalizeCustomMessagePayload(message);
-				this.ctx.session
-					.sendCustomMessage(normalized, options)
-					.then(() => this.#applyCustomMessageDisplay(wasStreaming, normalized.display))
+				const sendTask = this.ctx.session.sendCustomMessage(normalized, options);
+				void sendTask
+					.then(disposition => this.#applyCustomMessageDisplay(disposition, normalized.display))
 					.catch((err: unknown) => {
 						this.ctx.showError(
 							`Extension sendMessage failed: ${err instanceof Error ? err.message : String(err)}`,
 						);
 					});
+				return sendTask;
 			},
 			sendUserMessage: this.#sendExtensionUserMessage,
 			appendEntry: (customType, data) => {
@@ -186,8 +189,9 @@ export class ExtensionUiController {
 		const contextActions: ExtensionContextActions = {
 			getModel: () => this.ctx.session.model,
 			isIdle: () => !this.ctx.session.isStreaming,
+			isCompacting: () => this.ctx.session.isCompacting,
 			abort: () => this.ctx.session.abort({ reason: USER_INTERRUPT_LABEL }),
-			hasPendingMessages: () => this.ctx.session.queuedMessageCount > 0,
+			hasPendingMessages: () => this.ctx.session.hasPendingMessages(),
 			shutdown: () => {
 				// Defer the actual teardown to the main loop, which calls
 				// `checkShutdownRequested()` at idle boundaries so any queued
@@ -213,16 +217,14 @@ export class ExtensionUiController {
 				// Create new session
 				this.clearExtensionTerminalInputListeners();
 				this.clearHookWidgets();
-				const success = await this.ctx.session.newSession({ parentSession: options?.parentSession });
+				const success = await this.ctx.session.newSession(
+					{ parentSession: options?.parentSession },
+					options?.setup,
+				);
 				if (!success) {
 					return { cancelled: true };
 				}
 				setSessionTerminalTitle(this.ctx.sessionManager.getSessionName(), this.ctx.sessionManager.getCwd());
-
-				// Call setup callback if provided
-				if (options?.setup) {
-					await options.setup(this.ctx.sessionManager);
-				}
 
 				// Reset and update status line
 				this.ctx.statusLine.invalidate();
@@ -382,15 +384,15 @@ export class ExtensionUiController {
 
 		const actions: ExtensionActions = {
 			sendMessage: (message, options) => {
-				const wasStreaming = this.ctx.session.isStreaming;
 				const normalized = normalizeCustomMessagePayload(message);
-				this.ctx.session
-					.sendCustomMessage(normalized, options)
-					.then(() => this.#applyCustomMessageDisplay(wasStreaming, normalized.display))
+				const sendTask = this.ctx.session.sendCustomMessage(normalized, options);
+				void sendTask
+					.then(disposition => this.#applyCustomMessageDisplay(disposition, normalized.display))
 					.catch((err: unknown) => {
 						const errorText = `Extension sendMessage failed: ${err instanceof Error ? err.message : String(err)}`;
 						this.ctx.showError(errorText);
 					});
+				return sendTask;
 			},
 			sendUserMessage: this.#sendExtensionUserMessage,
 			appendEntry: (customType, data) => {
@@ -419,8 +421,9 @@ export class ExtensionUiController {
 		const contextActions: ExtensionContextActions = {
 			getModel: () => this.ctx.session.model,
 			isIdle: () => !this.ctx.session.isStreaming,
+			isCompacting: () => this.ctx.session.isCompacting,
 			abort: () => this.ctx.session.abort({ reason: USER_INTERRUPT_LABEL }),
-			hasPendingMessages: () => this.ctx.session.queuedMessageCount > 0,
+			hasPendingMessages: () => this.ctx.session.hasPendingMessages(),
 			shutdown: () => {
 				// Defer the actual teardown to the main loop, which calls
 				// `checkShutdownRequested()` at idle boundaries so any queued
@@ -446,14 +449,12 @@ export class ExtensionUiController {
 				// Create new session
 				this.clearExtensionTerminalInputListeners();
 				this.clearHookWidgets();
-				const success = await this.ctx.session.newSession({ parentSession: options?.parentSession });
+				const success = await this.ctx.session.newSession(
+					{ parentSession: options?.parentSession },
+					options?.setup,
+				);
 				if (!success) {
 					return { cancelled: true };
-				}
-
-				// Call setup callback if provided
-				if (options?.setup) {
-					await options.setup(this.ctx.sessionManager);
 				}
 
 				// Clear UI state
@@ -1135,6 +1136,20 @@ export class ExtensionUiController {
 		};
 	}
 
+	/** Register a host-owned filter outside the public extension listener lifecycle. */
+	addHostTerminalInputListener(handler: TerminalInputHandler): () => void {
+		const unsubscribe = this.ctx.ui.addInputListener(handler);
+		let active = true;
+		const remove = () => {
+			if (!active) return;
+			active = false;
+			unsubscribe();
+			this.#hostTerminalInputUnsubscribers.delete(remove);
+		};
+		this.#hostTerminalInputUnsubscribers.add(remove);
+		return remove;
+	}
+
 	clearHookWidgets(): void {
 		for (const widget of this.#hookWidgetsAbove.values()) {
 			widget.dispose?.();
@@ -1152,6 +1167,13 @@ export class ExtensionUiController {
 			unsubscribe();
 		}
 		this.#extensionTerminalInputUnsubscribers.clear();
+	}
+
+	clearHostTerminalInputListeners(): void {
+		for (const unsubscribe of this.#hostTerminalInputUnsubscribers) {
+			unsubscribe();
+		}
+		this.#hostTerminalInputUnsubscribers.clear();
 	}
 
 	showExtensionError(extensionPath: string, error: string): void {
@@ -1181,14 +1203,16 @@ export class ExtensionUiController {
 		});
 	};
 
-	#applyCustomMessageDisplay(wasStreaming: boolean, shouldDisplay: boolean | undefined): void {
-		// For non-streaming cases with display=true, update UI
-		// (streaming cases update via message_end event).
-		// Gate on initialChatRendered (#1955): an extension's session_start
-		// sendMessage({display:true}) runs before renderInitialMessages, which would
-		// re-render from session entries AND re-append via preserveExistingChat,
-		// duplicating the message. After the initial render the rebuild must run.
-		if (!wasStreaming && shouldDisplay && this.ctx.initialChatRendered) {
+	#applyCustomMessageDisplay(disposition: SendMessageDisposition, shouldDisplay: boolean | undefined): void {
+		// Queued messages render through message_end. Immediate/appended messages need one transcript rebuild.
+		if (
+			disposition.status === "accepted" &&
+			(disposition.delivery === "started_turn" ||
+				disposition.delivery === "plain_append" ||
+				disposition.delivery === "queued_next_turn") &&
+			shouldDisplay &&
+			this.ctx.initialChatRendered
+		) {
 			this.ctx.rebuildChatFromMessages();
 		}
 	}

@@ -1,7 +1,7 @@
 /**
  * Extension loader - loads TypeScript extension modules using native Bun import.
  */
-import type * as fs1 from "node:fs";
+import * as fs1 from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
@@ -27,6 +27,7 @@ import type { ExecOptions } from "../../exec/exec";
 import { execCommand } from "../../exec/exec";
 // Runtime self-reference: dereference this namespace only inside loader functions to keep the index.ts cycle safe.
 import * as PiCodingAgent from "../../index";
+import type { ExecutionEnvironmentProvider } from "../../session/execution-environment";
 import type { CustomMessagePayload } from "../../session/messages";
 import { EventBus } from "../../utils/event-bus";
 import * as TypeBox from "../legacy-typebox";
@@ -45,6 +46,9 @@ import type {
 	MessageRenderer,
 	ProviderConfig,
 	RegisteredCommand,
+	SendMessageDisposition,
+	SendMessageOptions,
+	SystemPromptBuilder,
 	ToolDefinition,
 	ToolInfo,
 } from "./types";
@@ -82,7 +86,7 @@ export class ExtensionRuntime implements IExtensionRuntime {
 		this.pendingProviderRegistrations.splice(0, this.pendingProviderRegistrations.length, ...remaining);
 	}
 
-	sendMessage(): void {
+	sendMessage(): Promise<SendMessageDisposition> {
 		throw new ExtensionRuntimeNotInitializedError();
 	}
 
@@ -174,6 +178,10 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 		this.extension.handlers.set(event, list);
 	}
 
+	registerSessionMutationFence(handler: Extension["sessionMutationFences"][number]): void {
+		this.extension.sessionMutationFences.push(handler);
+	}
+
 	registerTool<TParams extends TSchema = TSchema, TDetails = unknown>(tool: ToolDefinition<TParams, TDetails>): void {
 		const registered = {
 			definition: tool,
@@ -233,9 +241,9 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 
 	sendMessage<T = unknown>(
 		message: CustomMessagePayload<T>,
-		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
-	): void {
-		this.runtime.sendMessage(message, options);
+		options?: SendMessageOptions,
+	): Promise<SendMessageDisposition> {
+		return this.runtime.sendMessage(message, options);
 	}
 
 	sendUserMessage(
@@ -300,6 +308,20 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 		return this.runtime.setSessionName(name);
 	}
 
+	registerExecutionEnvironmentProvider(provider: ExecutionEnvironmentProvider): void {
+		if (this.extension.executionEnvironmentProvider) {
+			throw new Error(`Extension ${this.extension.path} registered more than one execution environment provider`);
+		}
+		this.extension.executionEnvironmentProvider = provider;
+	}
+
+	registerSystemPromptBuilder(builder: SystemPromptBuilder): void {
+		if (this.extension.systemPromptBuilder) {
+			throw new Error(`Extension ${this.extension.path} registered more than one system prompt builder`);
+		}
+		this.extension.systemPromptBuilder = builder;
+	}
+
 	registerProvider(name: string, config: ProviderConfig): void {
 		this.runtime.registerProvider(name, config, this.extension.path);
 	}
@@ -317,6 +339,7 @@ function createExtension(extensionPath: string, resolvedPath: string): Extension
 		path: extensionPath,
 		resolvedPath,
 		handlers: new Map(),
+		sessionMutationFences: [],
 		tools: new Map(),
 		toolRegistrationListeners: new Set(),
 		assistantThinkingRenderers: [],
@@ -431,10 +454,22 @@ export async function loadExtensions(paths: string[], cwd: string, eventBus?: Ev
 	const resolvedEventBus = eventBus ?? new EventBus();
 	const runtime = new ExtensionRuntime();
 
-	const imported = await Promise.all(paths.map(extPath => importExtensionModule(extPath, cwd)));
+	const uniquePaths: string[] = [];
+	const seen = new Set<string>();
+	for (const extPath of paths) {
+		const resolvedPath = resolvePath(extPath, cwd);
+		let canonicalPath = resolvedPath;
+		try {
+			canonicalPath = await fs.realpath(resolvedPath);
+		} catch {}
+		if (seen.has(canonicalPath)) continue;
+		seen.add(canonicalPath);
+		uniquePaths.push(extPath);
+	}
+	const imported = await Promise.all(uniquePaths.map(extPath => importExtensionModule(extPath, cwd)));
 
-	for (let i = 0; i < paths.length; i++) {
-		const extPath = paths[i]!;
+	for (let i = 0; i < uniquePaths.length; i++) {
+		const extPath = uniquePaths[i]!;
 		const { extension, error } = await bindExtension(extPath, imported[i]!, cwd, resolvedEventBus, runtime);
 
 		if (error) {
@@ -632,8 +667,12 @@ export async function discoverExtensionPaths(
 
 	const addPath = (extPath: string): void => {
 		const resolved = path.resolve(extPath);
-		if (!seen.has(resolved)) {
-			seen.add(resolved);
+		let canonical = resolved;
+		try {
+			canonical = fs1.realpathSync.native(resolved);
+		} catch {}
+		if (!seen.has(canonical)) {
+			seen.add(canonical);
 			allPaths.push(extPath);
 		}
 	};

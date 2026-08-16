@@ -56,10 +56,12 @@ function recordFullHashlineContext(
 	absolutePath: string | undefined,
 	displayPath: string,
 	fullText: string,
+	canonicalizePath = true,
 ): HashlineHeaderContext | undefined {
 	if (!absolutePath || !path.isAbsolute(absolutePath)) return undefined;
 	const normalized = normalizeToLF(fullText);
-	const tag = getFileSnapshotStore(session).record(canonicalSnapshotKey(absolutePath), normalized);
+	const snapshotPath = canonicalizePath ? canonicalSnapshotKey(absolutePath) : absolutePath;
+	const tag = getFileSnapshotStore(session).record(snapshotPath, normalized);
 	return {
 		header: formatReadHashlineHeader(displayPath, tag),
 		tag,
@@ -197,9 +199,11 @@ function recordInMemorySeenLines(
 	absolutePath: string | undefined,
 	fullText: string,
 	seenLines: readonly number[] | undefined,
+	canonicalizePath = true,
 ): void {
 	if (!absolutePath || !path.isAbsolute(absolutePath) || !seenLines || seenLines.length === 0) return;
-	getFileSnapshotStore(session).record(canonicalSnapshotKey(absolutePath), normalizeToLF(fullText), seenLines);
+	const snapshotPath = canonicalizePath ? canonicalSnapshotKey(absolutePath) : absolutePath;
+	getFileSnapshotStore(session).record(snapshotPath, normalizeToLF(fullText), seenLines);
 }
 
 function lineNumbersFromEntries(entries: readonly LineEntry[]): number[] {
@@ -292,6 +296,7 @@ export function buildInMemoryTextResult(
 		ignoreResultLimits?: boolean;
 		raw?: boolean;
 		immutable?: boolean;
+		environment?: boolean;
 	},
 ): AgentToolResult<ReadToolDetails> {
 	const displayMode = resolveFileDisplayMode(session, { raw: options.raw, immutable: options.immutable });
@@ -358,6 +363,7 @@ export function buildInMemoryTextResult(
 					options.sourcePath,
 					formatPathRelativeToCwd(options.sourcePath, session.cwd),
 					text,
+					options.environment !== true,
 				)
 			: undefined;
 	let emittedHashlineHeader = false;
@@ -458,10 +464,14 @@ export function buildInMemoryTextResult(
 	}
 
 	if (hashContext?.tag && options.sourcePath && seenLines) {
-		recordSeenLines(session, options.sourcePath, hashContext.tag, seenLines);
+		if (options.environment) {
+			getFileSnapshotStore(session).recordSeenLines(options.sourcePath, hashContext.tag, seenLines);
+		} else {
+			recordSeenLines(session, options.sourcePath, hashContext.tag, seenLines);
+		}
 	}
 	if (options.raw === true && options.sourcePath && options.immutable !== true && rawSeenLines) {
-		recordInMemorySeenLines(session, options.sourcePath, text, rawSeenLines);
+		recordInMemorySeenLines(session, options.sourcePath, text, rawSeenLines, options.environment !== true);
 	}
 	resultBuilder.text(outputText);
 	if (truncationInfo) {
@@ -489,6 +499,7 @@ export function buildInMemoryMultiRangeResult(
 		entityLabel: string;
 		raw?: boolean;
 		immutable?: boolean;
+		environment?: boolean;
 	},
 ): AgentToolResult<ReadToolDetails> {
 	const displayMode = resolveFileDisplayMode(session, { raw: options.raw, immutable: options.immutable });
@@ -505,6 +516,7 @@ export function buildInMemoryMultiRangeResult(
 					options.sourcePath,
 					formatPathRelativeToCwd(options.sourcePath, session.cwd),
 					text,
+					options.environment !== true,
 				)
 			: undefined;
 	let emittedHashlineHeader = false;
@@ -556,10 +568,20 @@ export function buildInMemoryMultiRangeResult(
 	const finalText =
 		notices.length > 0 ? (outputText ? `${outputText}\n${notices.join("\n")}` : notices.join("\n")) : outputText;
 	if (hashContext?.tag && options.sourcePath && seenLines) {
-		recordSeenLines(session, options.sourcePath, hashContext.tag, seenLines);
+		if (options.environment) {
+			getFileSnapshotStore(session).recordSeenLines(options.sourcePath, hashContext.tag, seenLines);
+		} else {
+			recordSeenLines(session, options.sourcePath, hashContext.tag, seenLines);
+		}
 	}
 	if (options.raw === true && options.sourcePath && options.immutable !== true && visibleSpans.length > 0) {
-		recordInMemorySeenLines(session, options.sourcePath, text, lineNumbersFromSpans(visibleSpans));
+		recordInMemorySeenLines(
+			session,
+			options.sourcePath,
+			text,
+			lineNumbersFromSpans(visibleSpans),
+			options.environment !== true,
+		);
 	}
 	resultBuilder.text(finalText);
 	return resultBuilder.done();

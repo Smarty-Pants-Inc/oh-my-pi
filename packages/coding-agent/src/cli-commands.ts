@@ -66,6 +66,16 @@ export const commands: CommandEntry[] = [
 		help: commandHelp.completeHelp,
 	},
 	{
+		name: "__collab-host-bridge",
+		load: () => import("./commands/collab-bridge").then(m => m.CollabHostBridge),
+		help: { hidden: true },
+	},
+	{
+		name: "__collab-guest-bridge",
+		load: () => import("./commands/collab-bridge").then(m => m.CollabGuestBridge),
+		help: { hidden: true },
+	},
+	{
 		name: "compress",
 		load: () => import("./commands/compress").then(m => m.default),
 		help: commandHelp.compressHelp,

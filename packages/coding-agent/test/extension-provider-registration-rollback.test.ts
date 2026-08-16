@@ -195,7 +195,7 @@ describe("extension provider registration rollback", () => {
 			);
 			runner.initialize(
 				{
-					sendMessage: () => {},
+					sendMessage: () => Promise.resolve({ status: "accepted", delivery: "plain_append" }),
 					sendUserMessage: () => {},
 					appendEntry: () => {},
 					setLabel: () => {},
@@ -212,6 +212,7 @@ describe("extension provider registration rollback", () => {
 				{
 					getModel: () => undefined,
 					isIdle: () => true,
+					isCompacting: () => false,
 					abort: () => {},
 					hasPendingMessages: () => false,
 					shutdown: () => {},

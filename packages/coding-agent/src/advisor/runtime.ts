@@ -581,6 +581,8 @@ export class AdvisorRuntime {
 	 * and rewinds the cursor to 0 so the NEXT turn replays the full current —
 	 * post-compaction — transcript, giving the advisor fresh context instead of
 	 * leaving it blind to everything before the rewrite.
+	 * Destructive boundary operation: callers inside a fallible session transition
+	 * must defer it until commit because pending deltas and cursor/context are lost.
 	 */
 	reset(reason = "external"): void {
 		// Step-1 observability (issue #7226): every re-prime logs its trigger so

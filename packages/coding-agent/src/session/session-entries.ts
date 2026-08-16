@@ -1,6 +1,7 @@
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent, MessageAttribution, ServiceTierByFamily, TextContent } from "@oh-my-pi/pi-ai";
 import type { StructuredSubagentSchemaMode } from "../task/types";
+import type { CustomMessage } from "./messages";
 
 export const CURRENT_SESSION_VERSION = 3;
 
@@ -9,6 +10,13 @@ export const SESSION_TITLE_SLOT_BYTES = 256;
 export const SESSION_TITLE_SLOT_ENTRY_TYPE = "title";
 
 export const TITLE_CHANGE_ENTRY_TYPE = "title_change";
+export const SESSION_LEAF_ENTRY_TYPE = "session_leaf";
+
+/** Journal control record that durably selects the active tree leaf without changing transcript history. */
+export interface SessionLeafEntry {
+	type: typeof SESSION_LEAF_ENTRY_TYPE;
+	leafId: string | null;
+}
 
 export type SessionTitleSource = "auto" | "user";
 
@@ -151,6 +159,22 @@ export interface CustomEntry<T = unknown> extends SessionEntryBase {
 	data?: T;
 }
 
+export const PENDING_SEMANTIC_DELIVERY_TYPE = "omp:pending-semantic-delivery";
+export const SETTLED_SEMANTIC_DELIVERY_TYPE = "omp:settled-semantic-delivery";
+
+export type PendingSemanticDeliveryKind = "steer" | "followUp" | "explicitPrompt";
+
+export interface PendingSemanticDeliveryData {
+	v: 1;
+	kind: PendingSemanticDeliveryKind;
+	message: CustomMessage;
+}
+
+export interface SettledSemanticDeliveryData {
+	pendingId: string;
+	outcome: "delivered" | "cancelled";
+}
+
 /** Label entry for user-defined bookmarks/markers on entries. */
 export interface LabelEntry extends SessionEntryBase {
 	type: "label";
@@ -281,7 +305,17 @@ export type SessionEntry =
 	| ResetBoundaryEntry;
 
 /** Raw logical file entry after loaders strip any fixed-width title slot. */
-export type FileEntry = SessionHeader | SessionEntry;
+export type FileEntry = SessionHeader | SessionEntry | SessionLeafEntry;
+
+/** True for transcript/tree entries, excluding header and file-level leaf control records. */
+export function isSessionEntry(entry: FileEntry): entry is SessionEntry {
+	return entry.type !== "session" && entry.type !== SESSION_LEAF_ENTRY_TYPE;
+}
+
+/** True for the file-level active-leaf control record. */
+export function isSessionLeafEntry(entry: FileEntry): entry is SessionLeafEntry {
+	return entry.type === SESSION_LEAF_ENTRY_TYPE;
+}
 
 /** Physical JSONL entry before slot-aware loaders fold the title slot. */
 export type RawFileEntry = SessionTitleSlotEntry | FileEntry;

@@ -2,7 +2,16 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { getBlobsDir, isEnoent, parseJsonlLenient } from "@oh-my-pi/pi-utils";
 import { BlobStore, isBlobRef, resolveImageData, resolveImageDataUrl } from "./blob-store";
 import { buildSessionContext } from "./session-context";
-import type { FileEntry, RawFileEntry, SessionEntry, SessionHeader } from "./session-entries";
+import {
+	type FileEntry,
+	isSessionEntry,
+	isSessionLeafEntry,
+	type RawFileEntry,
+	SESSION_TITLE_SLOT_BYTES,
+	type SessionEntry,
+	type SessionHeader,
+	type SessionTitleSlotEntry,
+} from "./session-entries";
 import { migrateToCurrentVersion } from "./session-migrations";
 import { isImageBlock, isImageDataPayload } from "./session-persistence";
 import { FileSessionStorage, type SessionStorage } from "./session-storage";
@@ -73,6 +82,30 @@ export function parseSessionContent(content: string): SessionLoadResult {
 	}) as FileEntry[];
 	applyTitleSlot(entries[0], slot);
 	return { entries, titleSlot: slot, malformedRecords };
+}
+/**
+ * Fold file-level leaf records into the tree state they select. A later tree
+ * entry supersedes an earlier record, matching append-order semantics. Files
+ * without a leaf record retain the legacy last-entry fallback.
+ */
+export function restoreSessionJournal(entries: readonly FileEntry[]): {
+	entries: SessionEntry[];
+	leafId: string | null | undefined;
+} {
+	const sessionEntries: SessionEntry[] = [];
+	let leafId: string | null | undefined;
+	for (const entry of entries) {
+		if (entry.type === "session") continue;
+		if (isSessionLeafEntry(entry)) {
+			leafId = entry.leafId === null || typeof entry.leafId === "string" ? entry.leafId : undefined;
+			continue;
+		}
+		if (isSessionEntry(entry)) {
+			sessionEntries.push(entry);
+			leafId = undefined;
+		}
+	}
+	return { entries: sessionEntries, leafId };
 }
 
 /** Parse session JSONL and visit each entry without retaining prior entries. */
@@ -241,6 +274,23 @@ export async function loadEntriesFromFileStream(filePath: string): Promise<Sessi
 	return { entries, titleSlot, malformedRecords };
 }
 
+/** Read only the fixed-size head window to detect a physical title slot. */
+export async function readTitleSlotFromFile(
+	filePath: string,
+	storage: SessionStorage = new FileSessionStorage(),
+): Promise<SessionTitleSlotEntry | undefined> {
+	let head: string;
+	try {
+		[head] = await storage.readTextSlices(filePath, SESSION_TITLE_SLOT_BYTES, 0);
+	} catch (err) {
+		if (isEnoent(err)) return undefined;
+		throw err;
+	}
+	const newlineIndex = head.indexOf("\n");
+	if (newlineIndex < 0) return undefined;
+	return parseTitleSlotLine(head.slice(0, newlineIndex));
+}
+
 /** Exported for compaction.test.ts */
 export function parseSessionEntries(content: string): FileEntry[] {
 	return parseSessionContent(content).entries;
@@ -386,18 +436,18 @@ export async function resolveBlobRefsInEntries(entries: FileEntry[], blobStore: 
 /**
  * Read-only transcript view of a session file: load entries, migrate to the
  * current version, resolve blob refs, and build the display transcript along
- * the persisted leaf path (last entry). Uses transcript mode (collapsed to the
- * latest compaction) so failed/aborted tail turns stay visible, unlike the
- * provider-context builder which drops them. Does NOT create a writer or take
- * the session lock — safe to call against a file another session is writing.
+ * the persisted active leaf. Uses transcript mode (collapsed to the latest
+ * compaction) so failed/aborted tail turns stay visible, unlike the provider-
+ * context builder. Does NOT create a writer or take the session lock — safe to
+ * call against a file another session is writing.
  */
 export async function loadSessionMessagesReadOnly(filePath: string): Promise<AgentMessage[]> {
 	const entries = await loadEntriesFromFile(filePath);
 	if (entries.length === 0) return [];
 	migrateToCurrentVersion(entries);
 	await resolveBlobRefsInEntries(entries, new BlobStore(getBlobsDir()));
-	const sessionEntries = entries.filter((e): e is SessionEntry => e.type !== "session");
-	return buildSessionContext(sessionEntries, undefined, undefined, {
+	const journal = restoreSessionJournal(entries);
+	return buildSessionContext(journal.entries, journal.leafId, undefined, {
 		transcript: true,
 		collapseCompactedHistory: true,
 	}).messages;

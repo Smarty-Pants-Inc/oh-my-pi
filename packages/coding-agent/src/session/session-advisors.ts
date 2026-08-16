@@ -97,7 +97,7 @@ import type { CompactionEntry, SessionEntry } from "./session-entries";
 import { formatSessionHistoryMarkdown } from "./session-history-format";
 import type { SessionManager } from "./session-manager";
 import { buildSessionMetadata } from "./session-metadata";
-import type { YieldQueue } from "./yield-queue";
+import type { YieldQueue, YieldQueueTransaction } from "./yield-queue";
 
 const ADVISOR_CODEX_SSE_MAX_ATTEMPTS = 1;
 /** Advisor statistics for the advisor status command. */
@@ -386,6 +386,25 @@ export class SessionAdvisors {
 		await Promise.all(closes);
 	}
 
+	/**
+	 * Quarantine retained-session advisor deliveries while target-side lifecycle
+	 * handlers run. Runtime work stays paused and intact; agent queues are already
+	 * covered by the owning session checkpoint, while yield receipts need this
+	 * explicit transaction to avoid premature rejection.
+	 */
+	beginSessionTransitionDelivery(): YieldQueueTransaction {
+		const transaction = this.#host.yieldQueue.beginTransaction("advisor");
+		try {
+			this.#host.extractQueuedAdvisorCards();
+			this.#host.dropPendingAdvisorCards();
+			return transaction;
+		} catch (error) {
+			transaction.rollback();
+			transaction.activate();
+			throw error;
+		}
+	}
+
 	/** Reattach recorder feeds and resume work after a rolled-back or preserving transition. */
 	reattachRecorderFeeds(): void {
 		for (const advisor of this.#advisors) {
@@ -394,9 +413,20 @@ export class SessionAdvisors {
 		}
 	}
 
-	/** Re-primes advisor transcript views across a conversation boundary. */
-	resetSessionState(options: { preserveCost?: boolean } = {}): void {
-		this.#resetAdvisorSessionState(options.preserveCost === true);
+	/**
+	 * Re-primes advisor transcript views across a committed conversation boundary.
+	 * This is destructive: it drops runtime backlog and normally clears queued
+	 * deliveries, so fallible session transitions must defer it until host completion.
+	 * A transition that quarantined retained deliveries may preserve entries created
+	 * by target-side handlers while committing the old-delivery transaction.
+	 */
+	resetSessionState(options: { preserveCost?: boolean; preserveDeliveries?: boolean } = {}): void {
+		this.#resetAdvisorSessionState(options.preserveCost === true, options.preserveDeliveries === true);
+	}
+
+	/** Snapshot the exact in-memory spend ledger for transactional session rollback. */
+	captureCostSnapshot(): ReadonlyMap<string, number> {
+		return new Map(this.#advisorCosts);
 	}
 
 	/** Drop the recorded spend once a conversation boundary has committed. */
@@ -530,7 +560,7 @@ export class SessionAdvisors {
 	 * agent steer/follow-up queues, and preserved cards deferred to the next turn —
 	 * so none of them inject into the new conversation.
 	 */
-	#resetAdvisorSessionState(preserveCost: boolean): void {
+	#resetAdvisorSessionState(preserveCost: boolean, preserveDeliveries: boolean): void {
 		if (!preserveCost) this.#advisorCosts.clear();
 		// Mute the recorder across the re-prime: AdvisorRuntime.reset() aborts the advisor
 		// loop, and that abort can emit an `aborted` message_end we must not attribute to
@@ -546,9 +576,11 @@ export class SessionAdvisors {
 		this.#advisorPrimaryTurnsCompleted = 0;
 		this.#advisorInterruptImmuneTurnStart = undefined;
 		this.#advisorAutoResumeSuppressed = false;
-		this.#host.yieldQueue.clear("advisor");
-		this.#host.extractQueuedAdvisorCards();
-		this.#host.dropPendingAdvisorCards();
+		if (!preserveDeliveries) {
+			this.#host.yieldQueue.clear("advisor");
+			this.#host.extractQueuedAdvisorCards();
+			this.#host.dropPendingAdvisorCards();
+		}
 	}
 
 	#resolveAdvisorRuntimeDescriptors(emitWarnings: boolean): AdvisorRuntimeDescriptor[] {

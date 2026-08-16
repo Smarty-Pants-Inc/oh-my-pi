@@ -2,8 +2,8 @@ import type { TUI } from "../tui";
 import { getPaddingX, sliceByColumn, visibleWidth } from "../utils";
 import { Text } from "./text";
 
-const RENDER_INTERVAL_MS = 1000 / 30;
-const SPINNER_ADVANCE_MS = 80;
+const RENDER_INTERVAL_MS = 1000 / 60;
+const SPINNER_ADVANCE_MS = RENDER_INTERVAL_MS * 5;
 const RENDER_BACKPRESSURE_MULTIPLIER = 9;
 
 type ColorFn = (str: string) => string;
@@ -121,6 +121,10 @@ export class Loader extends Text {
 		this.message = message;
 		this.#syncText();
 		this.#requestPaint();
+	}
+
+	getMessage(): string {
+		return this.message;
 	}
 
 	#scheduleTick(intervalMs: number, delayMs: number): void {

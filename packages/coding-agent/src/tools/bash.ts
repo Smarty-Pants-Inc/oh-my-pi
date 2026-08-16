@@ -18,10 +18,12 @@ import { truncateToVisualLines } from "../modes/components/visual-truncate";
 import { highlightCode, type Theme } from "../modes/theme/theme";
 import bashDescription from "../prompts/tools/bash.md" with { type: "text" };
 import type {
+	ClientBridgeCreateTerminalParams,
 	ClientBridgeTerminalExitStatus,
 	ClientBridgeTerminalHandle,
 	ClientBridgeTerminalOutput,
 } from "../session/client-bridge";
+import { type ExecutionEnvironmentBinding, mapExecutionEnvironmentPath } from "../session/execution-environment";
 import { DEFAULT_MAX_BYTES, enforceInlineByteCap, streamTailUpdates, TailBuffer } from "../session/streaming-output";
 import { renderStatusLine } from "../tui";
 import { CachedOutputBlock, markFramedBlockComponent, outputBlockContentWidth } from "../tui/output-block";
@@ -292,9 +294,16 @@ function findBashApprovalPatternRule(
 async function saveBashOriginalArtifact(session: ToolSession, originalText: string): Promise<string | undefined> {
 	try {
 		const alloc = await session.allocateOutputArtifact?.("bash-original");
-		if (!alloc?.path || !alloc.id) return undefined;
-		await Bun.write(alloc.path, originalText);
-		return alloc.id;
+		if (!alloc?.path || !alloc.id) {
+			alloc?.release?.();
+			return undefined;
+		}
+		try {
+			await Bun.write(alloc.path, originalText);
+			return alloc.id;
+		} finally {
+			alloc.release?.();
+		}
 	} catch {
 		return undefined;
 	}
@@ -534,6 +543,333 @@ function stripExitCodeNotice(text: string, exitCode: number | undefined): string
 function stripBackgroundNotice(text: string, async: BashToolDetails["async"] | undefined): string {
 	if (async?.state !== "running") return text;
 	return stripTrailingNotice(text, formatBackgroundNotice(async.jobId));
+}
+
+type BridgeTerminalFailurePolicy = "best-effort" | "terminal";
+
+interface BridgeTerminalCompletion {
+	terminalId: string;
+	exitStatus: ClientBridgeTerminalExitStatus;
+	output: ClientBridgeTerminalOutput;
+	wallTimeMs: number;
+}
+type BridgeTerminalRaceResult =
+	| { kind: "exit"; status: ClientBridgeTerminalExitStatus }
+	| { kind: "poll" }
+	| { kind: "timeout" }
+	| { kind: "aborted" };
+
+interface BridgeTerminalLifecycleOptions<T> {
+	createTerminal: (params: ClientBridgeCreateTerminalParams) => Promise<ClientBridgeTerminalHandle>;
+	createParams: ClientBridgeCreateTerminalParams;
+	timeoutMs: number | undefined;
+	timeoutSec: number | undefined;
+	signal?: AbortSignal;
+	failurePolicy: BridgeTerminalFailurePolicy;
+	readOutputAfterAbort?: boolean;
+	onCreated?: (terminalId: string) => void;
+	onOutput?: (terminalId: string, output: ClientBridgeTerminalOutput) => void;
+	onCompleted: (completion: BridgeTerminalCompletion) => Promise<T>;
+}
+
+const BRIDGE_TERMINAL_KILL_GRACE_MS = 1_000;
+const BRIDGE_TERMINAL_OUTPUT_GRACE_MS = 2_000;
+
+function bridgeTerminalFailure(operation: string, error: unknown): ToolError {
+	const message = error instanceof Error ? error.message : String(error);
+	return new ToolError(`Execution environment terminal ${operation} failed: ${message}`);
+}
+
+async function runBridgeTerminal<T>(options: BridgeTerminalLifecycleOptions<T>): Promise<T> {
+	if (options.signal?.aborted) {
+		throw new ToolAbortError("Command aborted");
+	}
+
+	const wallTimeStart = performance.now();
+	const { promise: timeoutPromise, resolve: resolveTimeout } = Promise.withResolvers<{ kind: "timeout" }>();
+	const timeoutTimer = options.timeoutMs
+		? setTimeout(() => resolveTimeout({ kind: "timeout" }), options.timeoutMs)
+		: undefined;
+	const { promise: abortedPromise, resolve: resolveAborted } = Promise.withResolvers<void>();
+	let handle: ClientBridgeTerminalHandle | undefined;
+	let killPromise: Promise<void> | undefined;
+	let outcome: { kind: "completed"; value: T } | { kind: "failed"; error: unknown } | undefined;
+	let terminalReleaseFailure: ToolError | undefined;
+
+	const handleOperationError = (operation: string, error: unknown): never => {
+		if (options.failurePolicy === "terminal") throw bridgeTerminalFailure(operation, error);
+		throw error;
+	};
+
+	const fireKill = (): Promise<void> => {
+		if (killPromise) return killPromise;
+		const currentHandle = handle;
+		if (!currentHandle) return Promise.resolve();
+		killPromise = Promise.resolve()
+			.then(() => currentHandle.kill())
+			.catch((error: unknown) => {
+				if (options.failurePolicy === "terminal") throw bridgeTerminalFailure("kill", error);
+				logger.warn("ACP terminal kill failed", { terminalId: currentHandle.terminalId, error });
+			});
+		return killPromise;
+	};
+
+	const awaitKill = async (): Promise<void> => {
+		const result = await Promise.race([
+			fireKill().then(
+				() => ({ kind: "completed" as const }),
+				error => ({ kind: "failed" as const, error }),
+			),
+			Bun.sleep(BRIDGE_TERMINAL_KILL_GRACE_MS).then(() => ({ kind: "timed-out" as const })),
+		]);
+		if (result.kind === "failed") throw result.error;
+		if (result.kind === "timed-out" && options.failurePolicy === "terminal") {
+			throw bridgeTerminalFailure("kill", new Error("operation did not complete within 1 second"));
+		}
+	};
+
+	const readFinalOutput = async (
+		currentHandle: ClientBridgeTerminalHandle,
+		fallback: ClientBridgeTerminalOutput,
+	): Promise<ClientBridgeTerminalOutput> => {
+		const result = await Promise.race([
+			Promise.resolve()
+				.then(() => currentHandle.currentOutput())
+				.then(
+					output => ({ kind: "output" as const, output }),
+					error => ({ kind: "failed" as const, error }),
+				),
+			Bun.sleep(BRIDGE_TERMINAL_OUTPUT_GRACE_MS).then(() => ({ kind: "timed-out" as const })),
+		]);
+		if (result.kind === "output") return result.output;
+		if (options.failurePolicy === "terminal") {
+			const error =
+				result.kind === "failed" ? result.error : new Error("operation did not complete within 2 seconds");
+			throw bridgeTerminalFailure("output", error);
+		}
+		if (result.kind === "failed") {
+			logger.warn("ACP terminal final output read failed", {
+				terminalId: currentHandle.terminalId,
+				error: result.error,
+			});
+		}
+		return fallback;
+	};
+
+	const cleanupLateCreate = (createPromise: Promise<ClientBridgeTerminalHandle>): void => {
+		const logPrefix = options.failurePolicy === "terminal" ? "Execution environment terminal" : "ACP terminal";
+		void createPromise
+			.then(async lateHandle => {
+				try {
+					await lateHandle.kill();
+				} catch (error) {
+					logger.warn(`${logPrefix} kill failed`, { terminalId: lateHandle.terminalId, error });
+				}
+				try {
+					await lateHandle.release();
+				} catch (error) {
+					logger.warn(`${logPrefix} release failed`, { terminalId: lateHandle.terminalId, error });
+				}
+			})
+			.catch((error: unknown) => {
+				logger.warn(`${logPrefix} create failed after cancellation`, { error });
+			});
+	};
+
+	const onAbort = () => {
+		resolveAborted();
+		// Start cancellation immediately. The loop awaits this same promise before
+		// any final output read; observe the rejection here to avoid an unhandled
+		// promise while preserving it for the ordered await.
+		void fireKill().catch(() => {});
+	};
+	options.signal?.addEventListener("abort", onAbort, { once: true });
+
+	try {
+		const createPromise = (() => {
+			try {
+				return options.createTerminal(options.createParams);
+			} catch (error) {
+				return handleOperationError("create", error);
+			}
+		})();
+		const createRaced = await Promise.race([
+			createPromise.then(
+				createdHandle => ({ kind: "created" as const, handle: createdHandle }),
+				error => handleOperationError("create", error),
+			),
+			timeoutPromise,
+			abortedPromise.then(() => ({ kind: "aborted" as const })),
+		]);
+		if (createRaced.kind === "aborted" || options.signal?.aborted) {
+			cleanupLateCreate(createPromise);
+			throw new ToolAbortError("Command aborted");
+		}
+		if (createRaced.kind === "timeout") {
+			cleanupLateCreate(createPromise);
+			const message =
+				options.timeoutSec === undefined
+					? "Command timed out"
+					: `Command timed out after ${options.timeoutSec} seconds`;
+			throw new ToolError(message);
+		}
+
+		handle = createRaced.handle;
+		options.onCreated?.(handle.terminalId);
+
+		const exitPromise = (() => {
+			try {
+				return handle.waitForExit();
+			} catch (error) {
+				return handleOperationError("wait for exit", error);
+			}
+		})();
+		const exitRacer = exitPromise.then(
+			status => ({ kind: "exit" as const, status }),
+			error => handleOperationError("wait for exit", error),
+		);
+		const abortRacer = abortedPromise.then(() => ({ kind: "aborted" as const }));
+		const abortPollRacer = abortedPromise.then(() => undefined as ClientBridgeTerminalOutput | undefined);
+		const timeoutPollRacer = timeoutPromise.then(() => undefined as ClientBridgeTerminalOutput | undefined);
+		let lastPolledOutput: ClientBridgeTerminalOutput = { output: "", truncated: false };
+		let exitStatus!: ClientBridgeTerminalExitStatus;
+
+		for (;;) {
+			const racers: Array<Promise<BridgeTerminalRaceResult>> = [
+				exitRacer,
+				timeoutPromise,
+				Bun.sleep(250).then(() => ({ kind: "poll" as const })),
+			];
+			if (options.signal) racers.push(abortRacer);
+			const raced = await Promise.race(racers);
+
+			if (raced.kind === "aborted" || options.signal?.aborted) {
+				await awaitKill();
+				if (options.readOutputAfterAbort) {
+					const current = await readFinalOutput(handle, lastPolledOutput);
+					throw new ToolAbortError(current.output ? `${current.output}\n\n[Command aborted]` : "Command aborted");
+				}
+				throw new ToolAbortError("Command aborted");
+			}
+
+			if (raced.kind === "timeout") {
+				await awaitKill();
+				const current = await readFinalOutput(handle, lastPolledOutput);
+				const message =
+					options.timeoutSec === undefined
+						? "Command timed out"
+						: `Command timed out after ${options.timeoutSec} seconds`;
+				throw new ToolError(current.output ? `${current.output}\n\n[${message}]` : message);
+			}
+
+			if (raced.kind === "exit") {
+				exitStatus = raced.status;
+				break;
+			}
+
+			const pollPromise = (() => {
+				try {
+					return handle.currentOutput();
+				} catch (error) {
+					return handleOperationError("output polling", error);
+				}
+			})();
+			const pollOutput = await Promise.race([
+				pollPromise.catch(error => handleOperationError("output polling", error)),
+				abortPollRacer,
+				timeoutPollRacer,
+			]);
+			if (pollOutput === undefined) continue;
+			lastPolledOutput = pollOutput;
+			options.onOutput?.(handle.terminalId, pollOutput);
+		}
+
+		const finalOutput = await readFinalOutput(handle, lastPolledOutput);
+		outcome = {
+			kind: "completed",
+			value: await options.onCompleted({
+				terminalId: handle.terminalId,
+				exitStatus,
+				output: finalOutput,
+				wallTimeMs: performance.now() - wallTimeStart,
+			}),
+		};
+	} catch (error) {
+		outcome = { kind: "failed", error };
+	} finally {
+		clearTimeout(timeoutTimer);
+		options.signal?.removeEventListener("abort", onAbort);
+		if (handle) {
+			const releaseHandle = handle;
+			const releaseResult = await Promise.race([
+				Promise.resolve()
+					.then(() => releaseHandle.release())
+					.then(
+						() => ({ kind: "completed" as const }),
+						error => ({ kind: "failed" as const, error }),
+					),
+				Bun.sleep(BRIDGE_TERMINAL_KILL_GRACE_MS).then(() => ({ kind: "timed-out" as const })),
+			]);
+			if (releaseResult.kind !== "completed") {
+				const error =
+					releaseResult.kind === "failed"
+						? releaseResult.error
+						: new Error("operation did not complete within 1 second");
+				if (options.failurePolicy === "terminal") {
+					terminalReleaseFailure = bridgeTerminalFailure("release", error);
+				}
+				if (releaseResult.kind === "failed") {
+					logger.warn("ACP terminal release failed", { terminalId: releaseHandle.terminalId, error });
+				}
+			}
+		}
+	}
+	if (!outcome) throw new ToolError("Bridge terminal did not produce a result.");
+	if (terminalReleaseFailure) {
+		if (outcome.kind === "completed") throw terminalReleaseFailure;
+		const primaryMessage = outcome.error instanceof Error ? outcome.error.message : String(outcome.error);
+		throw new ToolError(`${primaryMessage}\n\n${terminalReleaseFailure.message}`);
+	}
+	if (outcome.kind === "failed") throw outcome.error;
+	return outcome.value;
+}
+
+const EXECUTION_ENVIRONMENT_INTERNAL_REFERENCE_RE =
+	/(?:agent|artifact|history|issue|local|mcp|memory|omp|plan|pr|rule|security|skill|ssh|vault|xd):\/{1,2}/iu;
+
+function assertNoExecutionEnvironmentInternalReference(value: string | undefined, field: string): void {
+	if (value && EXECUTION_ENVIRONMENT_INTERNAL_REFERENCE_RE.test(value)) {
+		throw new ToolError(`Execution environment bash does not accept internal protocol references in ${field}.`);
+	}
+}
+
+function assertNoExecutionEnvironmentSourceRoot(
+	value: string | undefined,
+	field: string,
+	environment: ExecutionEnvironmentBinding,
+): void {
+	if (value?.includes(environment.sourceRoot)) {
+		throw new ToolError(`Execution environment bash does not accept the local sourceRoot in ${field}.`);
+	}
+}
+
+function bridgeCompletionToBashResult(completion: BridgeTerminalCompletion): BashResult {
+	const rawExitCode = completion.exitStatus.exitCode;
+	const exitCode: number | undefined =
+		rawExitCode != null ? rawExitCode : completion.exitStatus.signal ? 137 : undefined;
+	const outputText = completion.output.output;
+	const outputByteLength = outputText.length;
+	const outputLineCount = outputText.length > 0 ? outputText.split("\n").length : 0;
+	return {
+		output: outputText,
+		exitCode,
+		cancelled: false,
+		truncated: completion.output.truncated,
+		totalLines: outputLineCount,
+		totalBytes: outputByteLength,
+		outputLines: outputLineCount,
+		outputBytes: outputByteLength,
+	};
 }
 
 /**
@@ -818,10 +1154,11 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			"bash",
 			label,
 			async ({ jobId, signal: runSignal, reportProgress }) => {
-				const { path: artifactPath, id: artifactId } = (await this.session.allocateOutputArtifact?.("bash")) ?? {};
-				const tailBuffer = new TailBuffer(DEFAULT_MAX_BYTES);
-				const wallTimeStart = performance.now();
+				const artifact = (await this.session.allocateOutputArtifact?.("bash")) ?? {};
+				const { path: artifactPath, id: artifactId } = artifact;
 				try {
+					const tailBuffer = new TailBuffer(DEFAULT_MAX_BYTES);
+					const wallTimeStart = performance.now();
 					const result = await executeBash(options.command, {
 						cwd: options.commandCwd,
 						sessionKey: `${this.session.getSessionId?.() ?? ""}:async:${jobId}`,
@@ -863,6 +1200,8 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 					completion.resolve({ kind: "failed", error });
 					await reportProgress(message, { async: { state: "failed", jobId, type: "bash" } });
 					throw error;
+				} finally {
+					artifact.release?.();
 				}
 			},
 			{
@@ -942,6 +1281,77 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		return Math.max(0, Math.min(this.#autoBackgroundThresholdMs, timeoutMs - timeoutBufferMs));
 	}
 
+	async #executeInEnvironment(options: {
+		environment: ExecutionEnvironmentBinding;
+		rawCommand: string;
+		rawEnv: Record<string, string> | undefined;
+		rawCwd: string | undefined;
+		rawTimeout: number;
+		asyncRequested: boolean;
+		pty: boolean;
+		signal?: AbortSignal;
+		onUpdate?: AgentToolUpdateCallback<BashToolDetails>;
+	}): Promise<AgentToolResult<BashToolDetails>> {
+		const { environment, rawCommand, rawEnv, rawCwd, rawTimeout, asyncRequested, pty, signal, onUpdate } = options;
+		if (asyncRequested) {
+			throw new ToolError("Execution environment bash supports only foreground execution.");
+		}
+		if (pty) {
+			throw new ToolError("Execution environment bash does not support PTY execution.");
+		}
+		if (!Number.isFinite(rawTimeout) || rawTimeout < 1 || rawTimeout > 120) {
+			throw new ToolError("Execution environment bash requires a timeout between 1 and 120 seconds.");
+		}
+
+		assertNoExecutionEnvironmentInternalReference(rawCommand, "command");
+		assertNoExecutionEnvironmentInternalReference(rawCwd, "cwd");
+		assertNoExecutionEnvironmentSourceRoot(rawCommand, "command", environment);
+		for (const value of Object.values(rawEnv ?? {})) {
+			assertNoExecutionEnvironmentInternalReference(value, "env");
+			assertNoExecutionEnvironmentSourceRoot(value, "env", environment);
+		}
+		if (rawEnv && Object.keys(rawEnv).length > 0) {
+			throw new ToolError("Execution environment bash does not accept model-supplied environment variables.");
+		}
+
+		let remoteCwd: string;
+		try {
+			remoteCwd = mapExecutionEnvironmentPath(environment, rawCwd ?? ".");
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			throw new ToolError(`Invalid execution environment bash cwd: ${message}`);
+		}
+
+		return runBridgeTerminal({
+			createTerminal: params => environment.bridge.createTerminal(params),
+			createParams: {
+				command: "/bin/bash",
+				args: ["--noprofile", "--norc", "-c", rawCommand],
+				cwd: remoteCwd,
+				env: undefined,
+				timeoutMs: rawTimeout * 1_000,
+				outputByteLimit: DEFAULT_MAX_BYTES,
+			},
+			timeoutMs: rawTimeout * 1_000,
+			timeoutSec: rawTimeout,
+			signal,
+			failurePolicy: "terminal",
+			readOutputAfterAbort: true,
+			onOutput: (_terminalId, output) => {
+				onUpdate?.({ content: [{ type: "text", text: output.output }], details: {} });
+			},
+			onCompleted: async completion => {
+				const result = bridgeCompletionToBashResult(completion);
+				const notices = completion.output.truncated ? ["(output truncated)"] : [];
+				return this.#buildCompletedResult(result, rawTimeout, {
+					requestedTimeoutSec: rawTimeout,
+					notices,
+					wallTimeMs: completion.wallTimeMs,
+				});
+			},
+		});
+	}
+
 	async execute(
 		_toolCallId: string,
 		{
@@ -957,6 +1367,8 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		onUpdate?: AgentToolUpdateCallback<BashToolDetails>,
 		ctx?: AgentToolContext,
 	): Promise<AgentToolResult<BashToolDetails>> {
+		const rawCwd = cwd;
+		const executionEnvironment = this.session.getExecutionEnvironment?.();
 		let command = rawCommand;
 		const env = normalizeBashEnv(rawEnv);
 
@@ -972,7 +1384,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 				command = cd.rest;
 			}
 		}
-		if (asyncRequested && !this.#asyncEnabled) {
+		if (asyncRequested && !this.#asyncEnabled && !executionEnvironment) {
 			throw new ToolError("Async bash execution is disabled. Enable async.enabled to use async mode.");
 		}
 
@@ -988,6 +1400,20 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 					throw new ToolError(interception.message ?? "Command blocked");
 				}
 			}
+		}
+
+		if (executionEnvironment) {
+			return this.#executeInEnvironment({
+				environment: executionEnvironment,
+				rawCommand,
+				rawEnv,
+				rawCwd,
+				rawTimeout,
+				asyncRequested,
+				pty,
+				signal,
+				onUpdate,
+			});
 		}
 
 		const internalUrlOptions: InternalUrlExpansionOptions = {
@@ -1170,72 +1596,16 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 				: undefined;
 
 		// Route through the client terminal when the client advertises the terminal capability.
-		// Skip when pty=true (PTY needs the local terminal UI).
+		// Skip when pty=true (PTY needs the local terminal UI). ACP keeps its shell
+		// wrapping, direnv preflight, live terminal details, and best-effort cleanup.
 		if (clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty) {
-			// Invariant (ACP terminal bridge): createTerminal has no signal in its
-			// contract; allocation cannot be cancelled retroactively. Guard before
-			// allocation. Shared timeout helper / pure AbortSignal fusion rejected:
-			// we need explicit kill-before-read ordering and distinct abort vs
-			// timeout result shapes. Per-route race retained for testability.
-			if (signal?.aborted) {
-				throw new ToolAbortError("Command aborted");
-			}
-
-			const bridgeWallTimeStart = performance.now();
-			const killGraceMs = 1000;
-			const outputSnapshotGraceMs = 2000;
-			// Cancellable timeout: a bare Bun.sleep(timeoutMs) would leave a live,
-			// ref'd timer for the full command timeout after fast completions —
-			// accumulating timers and delaying process shutdown in SDK/headless use.
-			// `timeoutMs` is optional (#4642): without one, no timer is armed and
-			// the promise simply never resolves.
-			const { promise: timeoutPromise, resolve: resolveTimeout } = Promise.withResolvers<{
-				kind: "timeout";
-			}>();
-			const timeoutTimer = timeoutMs ? setTimeout(() => resolveTimeout({ kind: "timeout" }), timeoutMs) : undefined;
-			const { promise: abortedP, resolve: resolveAborted } = Promise.withResolvers<void>();
-			let handle: ClientBridgeTerminalHandle | undefined;
-			let killStarted = false;
-			const fireKill = (): Promise<void> => {
-				if (killStarted) return Promise.resolve();
-				const currentHandle = handle;
-				if (!currentHandle) return Promise.resolve();
-				killStarted = true;
-				return currentHandle.kill().catch((error: unknown) => {
-					logger.warn("ACP terminal kill failed", { terminalId: currentHandle.terminalId, error });
-				});
-			};
-			const cleanupLateCreate = (createP: Promise<ClientBridgeTerminalHandle>): void => {
-				void createP
-					.then(async lateHandle => {
-						try {
-							await lateHandle.kill();
-						} catch (error) {
-							logger.warn("ACP terminal kill failed", { terminalId: lateHandle.terminalId, error });
-						}
-						try {
-							await lateHandle.release();
-						} catch (error) {
-							logger.warn("ACP terminal release failed", { terminalId: lateHandle.terminalId, error });
-						}
-					})
-					.catch((error: unknown) => {
-						logger.warn("ACP terminal create failed after cancellation", { error });
-					});
-			};
-			const onAbortSignal = () => {
-				resolveAborted();
-				void fireKill();
-			};
-			signal?.addEventListener("abort", onAbortSignal, { once: true });
-
-			try {
-				// direnv-transformed command (carries any `unset -v` prefix) + merged
-				// env; falls back to the raw command/env when direnv is off/absent.
-				const bridgeCommand = backendPreflight?.command ?? command;
-				const bridgeEnv = backendPreflight?.env ?? resolvedEnv;
-				const shellSpawn = wrapShellLineForClientTerminal(bridgeCommand, this.session.settings.getShellConfig());
-				const createP = clientBridge.createTerminal({
+			const bridgeCommand = backendPreflight?.command ?? command;
+			const bridgeEnv = backendPreflight?.env ?? resolvedEnv;
+			const shellSpawn = wrapShellLineForClientTerminal(bridgeCommand, this.session.settings.getShellConfig());
+			const createTerminal = clientBridge.createTerminal.bind(clientBridge);
+			return runBridgeTerminal({
+				createTerminal,
+				createParams: {
 					command: shellSpawn.command,
 					args: shellSpawn.args,
 					cwd: commandCwd,
@@ -1243,223 +1613,79 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 						? Object.entries(bridgeEnv).map(([name, value]) => ({ name, value: value as string }))
 						: undefined,
 					outputByteLimit: DEFAULT_MAX_BYTES,
-				});
-				const createRaced = await Promise.race([
-					createP.then(createdHandle => ({ kind: "created" as const, handle: createdHandle })),
-					timeoutPromise,
-					abortedP.then(() => ({ kind: "aborted" as const })),
-				]);
-				if (createRaced.kind === "aborted" || signal?.aborted) {
-					cleanupLateCreate(createP);
-					throw new ToolAbortError("Command aborted");
-				}
-				if (createRaced.kind === "timeout") {
-					cleanupLateCreate(createP);
-					const timedOutResult: BashInteractiveResult = {
-						output: "",
-						exitCode: undefined,
-						cancelled: false,
-						timedOut: true,
-						truncated: false,
-						totalLines: 0,
-						totalBytes: 0,
-						outputLines: 0,
-						outputBytes: 0,
-					};
-					this.#throwIfUnfinished(timedOutResult, timeoutSec, this.#formatResultOutput(timedOutResult));
-					throw new ToolError("Command timed out");
-				}
-
-				handle = createRaced.handle;
-
-				// Emit partial update so the editor can embed the live terminal card.
-				onUpdate?.({ content: [], details: { terminalId: handle.terminalId } });
-
-				const exitPromise = handle.waitForExit();
-				let exitStatus!: ClientBridgeTerminalExitStatus;
-
-				type BridgeRaceResult =
-					| { kind: "exit"; status: ClientBridgeTerminalExitStatus }
-					| { kind: "poll" }
-					| { kind: "timeout" }
-					| { kind: "aborted" };
-
-				const exitRacer = exitPromise.then(status => ({ kind: "exit" as const, status }));
-				const abortRacer = abortedP.then(() => ({ kind: "aborted" as const }));
-				const abortPollRacer = abortedP.then(() => undefined as ClientBridgeTerminalOutput | undefined);
-				const timeoutPollRacer = timeoutPromise.then(() => undefined as ClientBridgeTerminalOutput | undefined);
-				let lastPolledOutput: ClientBridgeTerminalOutput = { output: "", truncated: false };
-
-				// Poll until the process exits, times out, or the caller aborts.
-				for (;;) {
-					const racers: Array<Promise<BridgeRaceResult>> = [
-						exitRacer,
-						timeoutPromise,
-						Bun.sleep(250).then(() => ({ kind: "poll" as const })),
-					];
-					if (signal) {
-						racers.push(abortRacer);
-					}
-					const raced = await Promise.race(racers);
-
-					if (raced.kind === "aborted" || signal?.aborted) {
-						await Promise.race([fireKill(), Bun.sleep(killGraceMs)]);
-						throw new ToolAbortError("Command aborted");
-					}
-
-					if (raced.kind === "timeout") {
-						// Kill before reading final output so a slow `terminal/output`
-						// RPC cannot let a timed-out command keep running past the
-						// enforced timeout. The handle stays valid post-kill so the
-						// buffered output is still readable.
-						await Promise.race([fireKill(), Bun.sleep(killGraceMs)]);
-						let current = lastPolledOutput;
-						try {
-							current = await Promise.race([
-								handle.currentOutput(),
-								Bun.sleep(outputSnapshotGraceMs).then(() => lastPolledOutput),
-							]);
-						} catch (error) {
-							logger.warn("ACP terminal final output read failed", {
-								terminalId: handle.terminalId,
-								error,
-							});
-						}
-						const timedOutResult: BashInteractiveResult = {
-							output: current.output,
-							exitCode: undefined,
-							cancelled: false,
-							timedOut: true,
-							truncated: current.truncated,
-							totalLines: current.output.length > 0 ? current.output.split("\n").length : 0,
-							totalBytes: current.output.length,
-							outputLines: current.output.length > 0 ? current.output.split("\n").length : 0,
-							outputBytes: current.output.length,
-						};
-						this.#throwIfUnfinished(timedOutResult, timeoutSec, this.#formatResultOutput(timedOutResult));
-						throw new ToolError("Command timed out");
-					}
-
-					if (raced.kind === "exit") {
-						exitStatus = raced.status;
-						break;
-					}
-
-					// Poll tick: push current output so agent-loop transcript stays consistent.
-					// Race the read against abort/timeout so a stuck `terminal/output` RPC does
-					// not delay cancellation or let the command outlive its deadline.
-					const pollOutput = await Promise.race([handle.currentOutput(), abortPollRacer, timeoutPollRacer]);
-					if (pollOutput === undefined) {
-						// Abort or timeout fired during the poll-tick read; let the next loop
-						// iteration exit via the matching abort/timeout branch.
-						continue;
-					}
-					lastPolledOutput = pollOutput;
+				},
+				timeoutMs,
+				timeoutSec,
+				signal,
+				failurePolicy: "best-effort",
+				onCreated: terminalId => {
+					onUpdate?.({ content: [], details: { terminalId } });
+				},
+				onOutput: (terminalId, output) => {
 					onUpdate?.({
-						content: [{ type: "text", text: pollOutput.output }],
-						details: { terminalId: handle.terminalId },
+						content: [{ type: "text", text: output.output }],
+						details: { terminalId },
 					});
-				}
-
-				// Fetch final output; the terminal is released in the outer finally.
-				let finalOutput = lastPolledOutput;
-				try {
-					finalOutput = await Promise.race([
-						handle.currentOutput(),
-						Bun.sleep(outputSnapshotGraceMs).then(() => lastPolledOutput),
-					]);
-				} catch (error) {
-					logger.warn("ACP terminal final output read failed", {
-						terminalId: handle.terminalId,
-						error,
+				},
+				onCompleted: async completion => {
+					const bridgeResult = bridgeCompletionToBashResult(completion);
+					const bridgeNotices: string[] = [];
+					if (completion.output.truncated) bridgeNotices.push("(output truncated)");
+					for (const notice of pendingNotices) bridgeNotices.push(notice);
+					return this.#buildCompletedResult(bridgeResult, timeoutSec, {
+						requestedTimeoutSec,
+						notices: bridgeNotices,
+						terminalId: completion.terminalId,
+						wallTimeMs: completion.wallTimeMs,
 					});
-				}
-
-				// Map exit status: null exitCode with a signal → treat as signal kill (137).
-				const rawExitCode = exitStatus.exitCode;
-				const exitCode: number | undefined =
-					rawExitCode != null ? rawExitCode : exitStatus.signal ? 137 : undefined;
-
-				const outputText = finalOutput.output;
-				const outputByteLen = outputText.length;
-				const outputLineCount = outputText.length > 0 ? outputText.split("\n").length : 0;
-
-				const bridgeResult: BashResult = {
-					output: outputText,
-					exitCode,
-					cancelled: false,
-					truncated: finalOutput.truncated,
-					totalLines: outputLineCount,
-					totalBytes: outputByteLen,
-					outputLines: outputLineCount,
-					outputBytes: outputByteLen,
-				};
-
-				const bridgeNotices: string[] = [];
-				if (finalOutput.truncated) bridgeNotices.push("(output truncated)");
-				for (const notice of pendingNotices) bridgeNotices.push(notice);
-
-				return this.#buildCompletedResult(bridgeResult, timeoutSec, {
-					requestedTimeoutSec,
-					notices: bridgeNotices,
-					terminalId: handle.terminalId,
-					wallTimeMs: performance.now() - bridgeWallTimeStart,
-				});
-			} finally {
-				clearTimeout(timeoutTimer);
-				signal?.removeEventListener("abort", onAbortSignal);
-				if (handle) {
-					const releaseHandle = handle;
-					// Bound release like kill/output: a hung `terminal/release` RPC must not
-					// keep the tool pending after the result is already decided.
-					await Promise.race([
-						releaseHandle.release().catch((error: unknown) => {
-							logger.warn("ACP terminal release failed", { terminalId: releaseHandle.terminalId, error });
-						}),
-						Bun.sleep(killGraceMs),
-					]);
-				}
-			}
+				},
+			});
 		}
 
 		// Track output for streaming updates (tail only)
 		const tailBuffer = new TailBuffer(DEFAULT_MAX_BYTES);
 
 		// Allocate artifact for truncated output storage
-		const { path: artifactPath, id: artifactId } = (await this.session.allocateOutputArtifact?.("bash")) ?? {};
+		const artifact = (await this.session.allocateOutputArtifact?.("bash")) ?? {};
+		const { path: artifactPath, id: artifactId } = artifact;
 
 		const interactiveUi = canUseInteractiveBashPty(pty, ctx) ? ctx?.ui : undefined;
 		if (pty && !interactiveUi) {
 			pendingNotices.push("pty requested but unavailable in this environment; ran without a terminal");
 		}
 		const wallTimeStart = performance.now();
-		const result: BashResult | BashInteractiveResult = interactiveUi
-			? await runInteractiveBashPty(interactiveUi, {
-					// PTY bypasses executeBash, so feed it the direnv-transformed
-					// command + merged env (backendPreflight is defined whenever this
-					// branch runs, since both gate on canUseInteractiveBashPty).
-					command: backendPreflight?.command ?? command,
-					cwd: commandCwd,
-					timeoutMs,
-					signal,
-					env: backendPreflight?.env ?? resolvedEnv,
-					artifactPath,
-					artifactId,
-				})
-			: // executeBash runs its OWN direnv preflight internally — pass the RAW
-				// command + resolvedEnv here so the unset prefix / env merge is not
-				// applied twice.
-				await executeBash(command, {
-					cwd: commandCwd,
-					sessionKey: this.session.getSessionId?.() ?? undefined,
-					timeout: timeoutMs ?? 0,
-					signal,
-					env: resolvedEnv,
-					artifactPath,
-					artifactId,
-					onChunk: streamTailUpdates(tailBuffer, onUpdate),
-					onMinimizedSave: originalText => saveBashOriginalArtifact(this.session, originalText),
-				});
+		let result: BashResult | BashInteractiveResult;
+		try {
+			result = interactiveUi
+				? await runInteractiveBashPty(interactiveUi, {
+						// PTY bypasses executeBash, so feed it the direnv-transformed
+						// command + merged env (backendPreflight is defined whenever this
+						// branch runs, since both gate on canUseInteractiveBashPty).
+						command: backendPreflight?.command ?? command,
+						cwd: commandCwd,
+						timeoutMs,
+						signal,
+						env: backendPreflight?.env ?? resolvedEnv,
+						artifactPath,
+						artifactId,
+					})
+				: // executeBash runs its OWN direnv preflight internally — pass the RAW
+					// command + resolvedEnv here so the unset prefix / env merge is not
+					// applied twice.
+					await executeBash(command, {
+						cwd: commandCwd,
+						sessionKey: this.session.getSessionId?.() ?? undefined,
+						timeout: timeoutMs ?? 0,
+						signal,
+						env: resolvedEnv,
+						artifactPath,
+						artifactId,
+						onChunk: streamTailUpdates(tailBuffer, onUpdate),
+						onMinimizedSave: originalText => saveBashOriginalArtifact(this.session, originalText),
+					});
+		} finally {
+			artifact.release?.();
+		}
 		const wallTimeMs = performance.now() - wallTimeStart;
 		if (result.cancelled) {
 			// A cancelled result is either a timeout (the command's deadline fired)

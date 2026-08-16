@@ -375,6 +375,13 @@ describe("AgentSession tree navigation onto an ask toolResult", () => {
 				}
 				return undefined;
 			}),
+			emitBeforeSessionMutation: vi.fn().mockResolvedValue(undefined),
+			emitWithHostCompletion: vi.fn(
+				async (_event: { type: string }, prepareHostCompletion?: () => unknown | Promise<unknown>) => {
+					const continuation = await prepareHostCompletion?.();
+					if (typeof continuation === "function") await continuation();
+				},
+			),
 		} as unknown as ExtensionRunner;
 
 		const ctx = await createTestSession({ inMemory: true, extensionRunner });

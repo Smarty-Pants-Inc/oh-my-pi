@@ -763,6 +763,8 @@ export interface AgentTool<TParameters extends TSchema = TSchema, TDetails = any
 	extends Tool<TParameters> {
 	// A human-readable label for the tool to be displayed in UI
 	label: string;
+	/** Stop the current provider loop after this tool returns a successful result. */
+	terminalAfterSuccess?: boolean;
 	/** If true, tool is excluded unless explicitly listed in --tools or agent's tools field */
 	hidden?: boolean;
 	/** If true, tool can stage a pending action that requires explicit resolution via the resolve tool. */

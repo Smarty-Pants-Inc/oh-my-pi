@@ -100,7 +100,7 @@ describe("AgentSession mid-run todo reconciliation nudge", () => {
 	}
 
 	/** Production-shaped tool round trip: assistant toolCall turn + toolResult. */
-	function emitToolResult(toolName: string, opts?: { isError?: boolean }): void {
+	function emitToolResult(toolName: string, opts?: { isError?: boolean; details?: Record<string, unknown> }): void {
 		const toolCallId = `call_${toolName}_${Date.now()}_${Math.random()}`;
 		session.agent.emitExternalEvent({ type: "message_end", message: toolUseAssistant(toolName) });
 		const content: TextContent[] = [{ type: "text", text: "ok" }];
@@ -112,9 +112,13 @@ describe("AgentSession mid-run todo reconciliation nudge", () => {
 				toolName,
 				content,
 				isError: opts?.isError ?? false,
+				details: opts?.details,
 				timestamp: Date.now(),
 			},
 		});
+	}
+	async function settle(): Promise<void> {
+		await Bun.sleep(0);
 	}
 
 	async function drainNudges(): Promise<CustomMessage[]> {
@@ -249,13 +253,31 @@ describe("AgentSession mid-run todo reconciliation nudge", () => {
 		expect(await drainNudges()).toEqual([]);
 	});
 
-	it("does not nudge when a `todo` call has reset the counter mid-window", async () => {
+	it("does not nudge when a mutating `todo` call resets the counter mid-window", async () => {
 		for (let i = 0; i < THRESHOLD - 1; i++) emitToolResult("write");
-		emitToolResult("todo");
+		emitToolResult("todo", { details: { op: "done" } });
 		for (let i = 0; i < THRESHOLD - 1; i++) emitToolResult("write");
 
 		expect(await drainNudges()).toEqual([]);
 		expect(reminderEvents).toEqual([]);
+	});
+
+	it("does not let read-only `todo view` postpone reconciliation", async () => {
+		for (let i = 0; i < THRESHOLD - 1; i++) emitToolResult("edit");
+		emitToolResult("todo", { details: { op: "view" } });
+		emitToolResult("edit");
+
+		await settle();
+		expect(await drainNudges()).toHaveLength(1);
+	});
+
+	it("does not let a failed todo mutation postpone reconciliation", async () => {
+		for (let i = 0; i < THRESHOLD - 1; i++) emitToolResult("edit");
+		emitToolResult("todo", { isError: true, details: { op: "done" } });
+		emitToolResult("edit");
+
+		await settle();
+		expect(await drainNudges()).toHaveLength(1);
 	});
 
 	it("caps nudges per prompt cycle", async () => {

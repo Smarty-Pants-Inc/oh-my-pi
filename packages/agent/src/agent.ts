@@ -52,7 +52,12 @@ import type {
 	ToolCallContext,
 	ToolChoiceDirective,
 } from "./types";
-import { isSoftToolRequirement } from "./types";
+import {
+	ASIDE_MESSAGE_COMMIT,
+	ASIDE_MESSAGE_DISCARD,
+	type CommittableAsideMessage,
+	isSoftToolRequirement,
+} from "./types";
 import { EventLoopKeepalive } from "./utils/yield";
 
 /**
@@ -338,6 +343,12 @@ export interface AgentPromptOptions {
 	toolChoice?: ToolChoice;
 }
 
+/** Transactional ownership of Agent session-scoped tool-directive state. */
+export interface AgentToolDirectiveSessionTransition {
+	commit(): void;
+	rollback(): void;
+}
+
 /** Buffered Cursor exec-channel tool result waiting to be emitted after the assistant message. */
 interface CursorToolResultEntry {
 	toolResult: ToolResultMessage;
@@ -348,6 +359,15 @@ interface CursorToolResultEntry {
 	 * `message_end` lands in the same chunk as the tool result.
 	 */
 	pending?: Promise<void>;
+}
+
+interface InFlightQueuedMessageCompanions {
+	owner: AgentMessage;
+	messages: AgentMessage[];
+	restore: (messages: AgentMessage[]) => void;
+	output: AgentMessage[];
+	commit: () => void;
+	discard: () => void;
 }
 
 export class Agent {
@@ -371,6 +391,11 @@ export class Agent {
 	#transformProviderContext?: (context: Context, model: Model) => Context | Promise<Context>;
 	#steeringQueue: AgentMessage[] = [];
 	#followUpQueue: AgentMessage[] = [];
+	#queuedMessageCompanions = new Map<
+		AgentMessage,
+		{ messages: AgentMessage[]; restore: (messages: AgentMessage[]) => void }
+	>();
+	#inFlightQueuedMessageCompanions: InFlightQueuedMessageCompanions[] = [];
 	#steeringWaiters = new Set<() => void>();
 
 	#steeringMode: "all" | "one-at-a-time";
@@ -948,10 +973,123 @@ export class Agent {
 		this.#state.messages = ms.slice();
 	}
 
-	replaceQueues(steering: AgentMessage[], followUp: AgentMessage[]) {
+	replaceQueues(steering: AgentMessage[], followUp: AgentMessage[], preserveCompanions = false) {
 		this.#steeringQueue = steering.slice();
 		this.#followUpQueue = followUp.slice();
+		if (!preserveCompanions) this.releaseOrphanedQueuedMessageCompanions();
 		this.#notifySteeringWaiters();
+	}
+
+	attachQueuedMessageCompanions(
+		owner: AgentMessage,
+		messages: AgentMessage[],
+		restore: (messages: AgentMessage[]) => void,
+	): boolean {
+		const inFlight = this.#inFlightQueuedMessageCompanions.find(claim => claim.owner === owner);
+		if (inFlight) return this.#attachToInFlightQueuedMessageCompanions(inFlight, messages);
+		if (!this.#steeringQueue.includes(owner) && !this.#followUpQueue.includes(owner)) return false;
+		const existing = this.#queuedMessageCompanions.get(owner);
+		if (existing) existing.messages.push(...messages);
+		else this.#queuedMessageCompanions.set(owner, { messages: messages.slice(), restore });
+		return true;
+	}
+
+	attachInFlightQueuedMessageCompanions(
+		messages: AgentMessage[],
+		restore?: (messages: AgentMessage[]) => void,
+	): boolean {
+		const inFlight = this.#inFlightQueuedMessageCompanions[0];
+		if (!inFlight) return false;
+		if (restore && inFlight.messages.length === 0) inFlight.restore = restore;
+		return this.#attachToInFlightQueuedMessageCompanions(inFlight, messages);
+	}
+
+	#attachToInFlightQueuedMessageCompanions(
+		inFlight: InFlightQueuedMessageCompanions,
+		messages: AgentMessage[],
+	): boolean {
+		for (const message of messages) {
+			Object.defineProperties(message as CommittableAsideMessage, {
+				[ASIDE_MESSAGE_COMMIT]: { configurable: true, value: inFlight.commit },
+				[ASIDE_MESSAGE_DISCARD]: { configurable: true, value: inFlight.discard },
+			});
+			inFlight.messages.push(message);
+			inFlight.output.push(message);
+		}
+		return true;
+	}
+
+	captureQueuedMessageCompanions(): Array<{ owner: AgentMessage; messages: AgentMessage[] }> {
+		return [...this.#queuedMessageCompanions].map(([owner, companions]) => ({
+			owner,
+			messages: companions.messages.slice(),
+		}));
+	}
+
+	restoreQueuedMessageCompanions(
+		entries: Array<{ owner: AgentMessage; messages: AgentMessage[] }>,
+		restore: (messages: AgentMessage[]) => void,
+	): void {
+		this.#queuedMessageCompanions.clear();
+		for (const { owner, messages } of entries) {
+			if (this.#steeringQueue.includes(owner) || this.#followUpQueue.includes(owner)) {
+				this.#queuedMessageCompanions.set(owner, { messages: messages.slice(), restore });
+			} else {
+				restore(messages);
+			}
+		}
+	}
+
+	#takeQueuedMessages(messages: AgentMessage[]): AgentMessage[] {
+		const expanded: AgentMessage[] = [];
+		for (const message of messages) {
+			expanded.push(message);
+			const companions = this.#queuedMessageCompanions.get(message);
+			if (!companions && message.role !== "user") continue;
+			if (companions) this.#queuedMessageCompanions.delete(message);
+			let settled = false;
+			const restore = companions?.restore ?? (() => {});
+			let claim: InFlightQueuedMessageCompanions;
+			const commit = () => {
+				if (settled) return;
+				settled = true;
+				this.#inFlightQueuedMessageCompanions = this.#inFlightQueuedMessageCompanions.filter(
+					entry => entry !== claim,
+				);
+			};
+			const discard = () => {
+				if (settled) return;
+				settled = true;
+				this.#inFlightQueuedMessageCompanions = this.#inFlightQueuedMessageCompanions.filter(
+					entry => entry !== claim,
+				);
+				claim.restore(claim.messages);
+			};
+			claim = {
+				owner: message,
+				messages: [],
+				restore,
+				output: expanded,
+				commit,
+				discard,
+			};
+			this.#inFlightQueuedMessageCompanions.push(claim);
+			Object.defineProperties(message as CommittableAsideMessage, {
+				[ASIDE_MESSAGE_COMMIT]: { configurable: true, value: commit },
+				[ASIDE_MESSAGE_DISCARD]: { configurable: true, value: discard },
+			});
+			this.#attachToInFlightQueuedMessageCompanions(claim, companions?.messages ?? []);
+		}
+		return expanded;
+	}
+
+	releaseOrphanedQueuedMessageCompanions(): void {
+		const owners = new Set([...this.#steeringQueue, ...this.#followUpQueue]);
+		for (const [owner, companions] of this.#queuedMessageCompanions) {
+			if (owners.has(owner)) continue;
+			this.#queuedMessageCompanions.delete(owner);
+			companions.restore(companions.messages);
+		}
 	}
 
 	appendMessage(m: AgentMessage) {
@@ -985,11 +1123,13 @@ export class Agent {
 
 	clearSteeringQueue() {
 		this.#steeringQueue = [];
+		this.releaseOrphanedQueuedMessageCompanions();
 		this.#notifySteeringWaiters();
 	}
 
 	clearFollowUpQueue() {
 		this.#followUpQueue = [];
+		this.releaseOrphanedQueuedMessageCompanions();
 	}
 
 	/**
@@ -1001,9 +1141,32 @@ export class Agent {
 		this.#softToolRequirementState = { escalations: 0 };
 	}
 
+	/**
+	 * Install empty session-scoped tool-directive state while retaining the current
+	 * state for an enclosing session transition. Commit selects the target without
+	 * discarding the retained snapshot until the owner transaction closes, so a
+	 * later pre-publication failure can still roll back exactly.
+	 */
+	beginToolDirectiveSessionTransition(): AgentToolDirectiveSessionTransition {
+		const retainedDeferredToolChoice = this.#deferredToolChoice;
+		const retainedSoftToolRequirementState = this.#softToolRequirementState;
+		this.clearDeferredToolDirectives();
+		let restored = false;
+		return {
+			commit: () => {},
+			rollback: () => {
+				if (restored) return;
+				restored = true;
+				this.#deferredToolChoice = retainedDeferredToolChoice;
+				this.#softToolRequirementState = retainedSoftToolRequirementState;
+			},
+		};
+	}
+
 	clearAllQueues() {
 		this.#steeringQueue = [];
 		this.#followUpQueue = [];
+		this.releaseOrphanedQueuedMessageCompanions();
 		this.#notifySteeringWaiters();
 		this.clearDeferredToolDirectives();
 	}
@@ -1035,13 +1198,13 @@ export class Agent {
 			if (this.#steeringQueue.length > 0) {
 				const first = this.#steeringQueue[0];
 				this.#steeringQueue = this.#steeringQueue.slice(1);
-				return [first];
+				return this.#takeQueuedMessages([first]);
 			}
 			return [];
 		}
 		const steering = this.#steeringQueue.slice();
 		this.#steeringQueue = [];
-		return steering;
+		return this.#takeQueuedMessages(steering);
 	}
 
 	#dequeueFollowUpMessages(): AgentMessage[] {
@@ -1049,13 +1212,13 @@ export class Agent {
 			if (this.#followUpQueue.length > 0) {
 				const first = this.#followUpQueue[0];
 				this.#followUpQueue = this.#followUpQueue.slice(1);
-				return [first];
+				return this.#takeQueuedMessages([first]);
 			}
 			return [];
 		}
 		const followUp = this.#followUpQueue.slice();
 		this.#followUpQueue = [];
-		return followUp;
+		return this.#takeQueuedMessages(followUp);
 	}
 
 	/**
@@ -1063,7 +1226,9 @@ export class Agent {
 	 * Used by dequeue keybinding.
 	 */
 	popLastSteer(): AgentMessage | undefined {
-		return this.#steeringQueue.pop();
+		const message = this.#steeringQueue.pop();
+		this.releaseOrphanedQueuedMessageCompanions();
+		return message;
 	}
 
 	/**
@@ -1071,7 +1236,9 @@ export class Agent {
 	 * Used by dequeue keybinding.
 	 */
 	popLastFollowUp(): AgentMessage | undefined {
-		return this.#followUpQueue.pop();
+		const message = this.#followUpQueue.pop();
+		this.releaseOrphanedQueuedMessageCompanions();
+		return message;
 	}
 
 	clearMessages() {
@@ -1117,6 +1284,7 @@ export class Agent {
 		this.#state.error = undefined;
 		this.#steeringQueue = [];
 		this.#followUpQueue = [];
+		this.releaseOrphanedQueuedMessageCompanions();
 		this.#notifySteeringWaiters();
 		this.clearDeferredToolDirectives();
 	}

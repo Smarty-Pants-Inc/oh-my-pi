@@ -233,6 +233,32 @@ For the bash tool specifically:
 - Never use `tsc`/`npx tsc` — always `bun check`.
 - Merge commits (maintainer merges of PRs) follow: `Merge PR #<number>: <conventional PR subject> (@<author>)` — e.g. `Merge PR #6386: feat(catalog): add native Meta Model API provider (@eggpeat)`.
 
+## Smarty App Managed Fork
+
+When this checkout is managed from Smarty App's `omp-fork-agent-goals` lane,
+export OMP changes as patches under Smarty App's
+`docs/smarty/omp-fork-agent-goals/patches/`, then let
+`config/scripts/omp-fork-manager.mjs` clone, sync, apply, build, and link them.
+The manager keeps `origin` and `upstream` push URLs disabled to prevent
+accidental pushes and installs only a reversible host shim ahead of Homebrew.
+When Paul asks for an OMP update, the update lands end to end: push the
+verified revision to fork `main` with an explicit URL and a lease pinned to
+the last verified fork SHA, then deploy dev1. Never push to `upstream`.
+
+Agent-started goals are intentional fork behavior: `goal` must be available
+when `goal.enabled` is true and the session has a `GoalRuntime`, even before the
+user starts `/goal`. Keep it hidden while goal mode is exiting so the completion
+cleanup path cannot re-enter the tool. Cover this with:
+
+```sh
+bun test packages/coding-agent/test/tools/index.test.ts \
+  packages/coding-agent/test/goals/goal-tool.test.ts \
+  packages/coding-agent/test/goals/goal-mode-integration.test.ts
+```
+
+Fresh source checkouts need Bun `>=1.3.14`, `bun install --frozen-lockfile`, and
+`bun --cwd=packages/natives run build` before those tests or source `omp` runs.
+
 ## Testing Guidance
 
 Test the contract the system exposes — not the easiest internal detail to assert.

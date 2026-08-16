@@ -4,6 +4,7 @@ import { Agent, AppendOnlyContextManager } from "@oh-my-pi/pi-agent-core";
 import type { ProviderSessionState } from "@oh-my-pi/pi-ai";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -38,7 +39,7 @@ afterEach(async () => {
 	}
 });
 
-async function createFreshHarness(): Promise<FreshHarness> {
+async function createFreshHarness(extensionRunner?: ExtensionRunner): Promise<FreshHarness> {
 	const tempDir = TempDir.createSync("@pi-agent-session-fresh-");
 	const sessionManager = SessionManager.create(tempDir.path(), path.join(tempDir.path(), "sessions"));
 	const agent = new Agent({
@@ -53,6 +54,7 @@ async function createFreshHarness(): Promise<FreshHarness> {
 		sessionManager,
 		settings: Settings.isolated(),
 		modelRegistry,
+		extensionRunner,
 	});
 	cleanup.push(async () => {
 		await session.dispose();

@@ -5,7 +5,7 @@ import type { Settings } from "../config/settings";
 import eagerTaskPrompt from "../prompts/system/eager-task.md" with { type: "text" };
 import eagerTodoPrompt from "../prompts/system/eager-todo.md" with { type: "text" };
 import midRunTodoNudgePrompt from "../prompts/system/mid-run-todo-nudge.md" with { type: "text" };
-import { getLatestTodoPhasesFromEntries, isTodoPhase, type TodoItem, type TodoPhase } from "../tools/todo";
+import { getLatestTodoPhasesFromEntries, isTodoPhase, type TodoPhase } from "../tools/todo";
 import { buildNamedToolChoice } from "../utils/tool-choice";
 import type { AgentSessionEvent } from "./agent-session-events";
 import type { SessionManager } from "./session-manager";
@@ -48,9 +48,11 @@ export interface TodoTrackerHost {
 	sessionManager: SessionManager;
 	settings: Settings;
 	model(): Model | undefined;
+	usesOwnedToolDialect(): boolean;
 	agentKind(): "main" | "sub";
 	emitSessionEvent(event: AgentSessionEvent): Promise<void>;
-	scheduleAgentContinue(options: { generation?: number }): void;
+	scheduleAgentContinue(options: { generation?: number; onSkip?: () => void; onError?: () => void }): void;
+	queueTodoReconciliation(): (() => void) | undefined;
 	promptGeneration(): number;
 	hasPendingAsyncWake(): boolean;
 	getActiveToolNames(): string[];
@@ -67,6 +69,7 @@ export class TodoTracker {
 	#reminderAwaitingProgress = false;
 	#mutationsSinceLastTouch = 0;
 	#midRunNudgeCount = 0;
+	#taskCompletionAwaitingTodoReconciliation = false;
 
 	constructor(host: TodoTrackerHost) {
 		this.#host = host;
@@ -100,12 +103,39 @@ export class TodoTracker {
 		this.#midRunNudgeCount = 0;
 	}
 
+	/** Records a completed subagent result that may make blocked parent work actionable. */
+	noteTaskCompletion(): void {
+		this.#taskCompletionAwaitingTodoReconciliation = true;
+	}
+
 	/** Records a completed tool result before asynchronous event processing begins. */
-	onToolResult(toolName: string, isError: boolean): void {
+	onToolResult(toolName: string, isError: boolean, details?: Record<string, unknown>): void {
 		if (toolName === "todo") {
-			this.#mutationsSinceLastTouch = 0;
+			const op = details ? stringProperty(details, "op") : undefined;
+			const phases = details?.phases;
+			// Legacy/provider-owned todo results may omit `op`; treat a successful
+			// authoritative snapshot as a mutation. A local `view` is explicitly read-only.
+			if (!isError && op !== "view") {
+				this.#mutationsSinceLastTouch = 0;
+				if (Array.isArray(phases) && phases.every(isTodoPhase)) {
+					this.#taskCompletionAwaitingTodoReconciliation = false;
+				}
+			}
 		} else if (!isError && MUTATING_TOOLS[toolName]) {
 			this.#mutationsSinceLastTouch++;
+		}
+		if (toolName === "task" && !isError) this.noteTaskCompletion();
+		const hubJobs = toolName === "hub" && details ? details.jobs : undefined;
+		if (
+			!isError &&
+			Array.isArray(hubJobs) &&
+			hubJobs.some(job => {
+				if (!isRecord(job) || stringProperty(job, "type") !== "task") return false;
+				const status = stringProperty(job, "status");
+				return status === "completed" || status === "failed" || status === "cancelled";
+			})
+		) {
+			this.noteTaskCompletion();
 		}
 		this.#reminderAwaitingProgress = false;
 	}
@@ -153,7 +183,7 @@ export class TodoTracker {
 		};
 		if (promptText === undefined || mode === "preferred") return { message };
 		const model = this.#host.model();
-		const toolChoice = buildNamedToolChoice("todo", model);
+		const toolChoice = buildNamedToolChoice("todo", model, this.#host.usesOwnedToolDialect());
 		if (!toolChoice) {
 			logger.warn(
 				"Eager todo proceeding with the reminder only because the current model does not support a forced todo tool_choice",
@@ -209,6 +239,7 @@ export class TodoTracker {
 			this.#reminderAwaitingProgress = false;
 			return false;
 		}
+		if (!this.#host.getActiveToolNames().includes("todo")) return false;
 		const remindersMax = this.#host.settings.get("todo.remindersMax");
 		if (this.#reminderCount >= remindersMax) {
 			logger.debug("Todo completion: max reminders reached", { count: this.#reminderCount });
@@ -218,23 +249,28 @@ export class TodoTracker {
 		if (phases.length === 0) {
 			this.#reminderCount = 0;
 			this.#reminderAwaitingProgress = false;
+			this.#taskCompletionAwaitingTodoReconciliation = false;
 			return false;
 		}
+		const includeBlocked = this.#taskCompletionAwaitingTodoReconciliation;
 		const incompleteByPhase = phases
 			.map(phase => ({
 				name: phase.name,
 				tasks: phase.tasks
 					.filter(
-						(task): task is TodoItem & { status: "pending" | "in_progress" } =>
-							task.status === "pending" || task.status === "in_progress",
+						task =>
+							task.status === "pending" ||
+							task.status === "in_progress" ||
+							(includeBlocked && task.status === "blocked"),
 					)
-					.map(task => ({ content: task.content, status: task.status })),
+					.map(task => ({ content: task.content, status: task.status, blocker: task.blocker })),
 			}))
 			.filter(phase => phase.tasks.length > 0);
 		const incomplete = incompleteByPhase.flatMap(phase => phase.tasks);
 		if (incomplete.length === 0) {
 			this.#reminderCount = 0;
 			this.#reminderAwaitingProgress = false;
+			this.#taskCompletionAwaitingTodoReconciliation = false;
 			return false;
 		}
 		if (isAwaitingUserAnswer(message)) {
@@ -251,12 +287,28 @@ export class TodoTracker {
 		}
 		this.#reminderCount++;
 		const todoList = incompleteByPhase
-			.map(phase => `- ${phase.name}\n${phase.tasks.map(task => `  - ${task.content}`).join("\n")}`)
+			.map(
+				phase =>
+					`- ${phase.name}\n${phase.tasks
+						.map(task =>
+							task.status === "blocked"
+								? `  - ${task.content} (blocked${task.blocker ? `: ${task.blocker}` : ""})`
+								: `  - ${task.content}`,
+						)
+						.join("\n")}`,
+			)
 			.join("\n");
+		const clearForcedChoice = this.#host.queueTodoReconciliation();
+		const reconciliationScope = includeBlocked
+			? " A completed subagent may have resolved blocked work; reconcile those items too."
+			: "";
+		const action = clearForcedChoice
+			? `Your next action MUST be a todo call. Reconcile each item: continue valid work, block a genuine external dependency, mark finished work done, drop work no longer required, or remove obsolete tracking.${reconciliationScope}`
+			: `Reconcile each item before yielding: continue valid work, block a genuine external dependency, mark finished work done, drop work no longer required, or remove obsolete tracking.${reconciliationScope}`;
 		const reminder =
 			`<system-reminder>\n` +
 			`You stopped with ${incomplete.length} incomplete todo item(s):\n${todoList}\n\n` +
-			`Please continue working on these tasks or mark them complete if finished.\n` +
+			`${action}\n` +
 			`(Reminder ${this.#reminderCount}/${remindersMax})\n` +
 			`</system-reminder>`;
 		logger.debug("Todo completion: sending reminder", {
@@ -279,7 +331,11 @@ export class TodoTracker {
 		this.#reminderAwaitingProgress = true;
 		this.#host.agent.appendMessage(reminderMessage);
 		this.#host.sessionManager.appendMessage(reminderMessage);
-		this.#host.scheduleAgentContinue({ generation: this.#host.promptGeneration() });
+		this.#host.scheduleAgentContinue({
+			generation: this.#host.promptGeneration(),
+			onSkip: clearForcedChoice,
+			onError: clearForcedChoice,
+		});
 		return true;
 	}
 

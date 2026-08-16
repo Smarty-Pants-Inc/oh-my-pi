@@ -1,0 +1,6 @@
+{
+  "seeded-file.txt": "seeded fixture bytes\n",
+  "remote-only.txt": "remote sentinel from cloud-omp fixture\n",
+  "written-by-tool.txt": "written through built-in write\n",
+  "created-by-bash.txt": "created through remote bash\n"
+}

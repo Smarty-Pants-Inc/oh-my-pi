@@ -73,6 +73,7 @@ import {
 	splitPathAndSelPreferringLiteral,
 } from "./path-utils";
 import { readArchive, resolveArchiveReadPath } from "./read-archive";
+import { readEnvironmentFile } from "./read-environment";
 import {
 	BRACKET_CONTEXT_ELLIPSIS,
 	buildInMemoryMultiRangeResult,
@@ -894,6 +895,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 
 		// Peel malformed selectors through the internal-URL-aware parser before routing.
 		let promotedSelector: string | undefined;
+		let resolvedLocalProtocolFile = false;
 		if (internalRouter.canResolve(readPath)) {
 			const internalTarget = splitInternalUrlSel(readPath);
 			const parsed = parseSel(internalTarget.sel);
@@ -908,12 +910,14 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				const localFile = await resolveLocalUrlToFile(urlMeta, {
 					cwd: this.session.cwd,
 					settings: this.session.settings,
+
 					signal,
 					localProtocolOptions: this.session.localProtocolOptions,
 					skills: this.session.skills,
 				});
 				if (localFile) {
 					readPath = localFile.path;
+					resolvedLocalProtocolFile = true;
 					// Preserve a local:// selector separately so a sibling literal file
 					// cannot shadow the URL's selector semantics during filesystem routing.
 					promotedSelector = internalTarget.sel;
@@ -923,6 +927,11 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			} else {
 				return this.#handleInternalUrl(internalTarget.path, parsed, signal);
 			}
+		}
+
+		const environment = this.session.getExecutionEnvironment?.();
+		if (environment && !resolvedLocalProtocolFile) {
+			return readEnvironmentFile(this.session, readPath, environment, signal);
 		}
 
 		// One suffix-glob memo per read call — archive, sqlite, and plain-path

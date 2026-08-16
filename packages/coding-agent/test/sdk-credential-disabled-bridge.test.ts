@@ -49,7 +49,7 @@ const initializeRunnerForTest = (runner: ExtensionRunner | undefined): void => {
 	if (!runner) return;
 	runner.initialize(
 		{
-			sendMessage: () => {},
+			sendMessage: () => Promise.resolve({ status: "accepted", delivery: "plain_append" }),
 			sendUserMessage: () => {},
 			appendEntry: () => {},
 			setLabel: () => {},
@@ -66,6 +66,7 @@ const initializeRunnerForTest = (runner: ExtensionRunner | undefined): void => {
 		{
 			getModel: () => undefined,
 			isIdle: () => true,
+			isCompacting: () => false,
 			abort: () => {},
 			hasPendingMessages: () => false,
 			shutdown: () => {},
@@ -504,6 +505,7 @@ describe("createAgentSession credential_disabled subscription", () => {
 						],
 					],
 				]),
+				sessionMutationFences: [],
 				tools: new Map(),
 				assistantThinkingRenderers: [],
 				messageRenderers: new Map(),
@@ -521,7 +523,7 @@ describe("createAgentSession credential_disabled subscription", () => {
 			// 2. initialize(); the flush is queued as a microtask.
 			runner.initialize(
 				{
-					sendMessage: () => {},
+					sendMessage: () => Promise.resolve({ status: "accepted", delivery: "plain_append" }),
 					sendUserMessage: () => {},
 					appendEntry: () => {},
 					setLabel: () => {},
@@ -538,6 +540,7 @@ describe("createAgentSession credential_disabled subscription", () => {
 				{
 					getModel: () => undefined,
 					isIdle: () => true,
+					isCompacting: () => false,
 					abort: () => {},
 					hasPendingMessages: () => false,
 					shutdown: () => {},

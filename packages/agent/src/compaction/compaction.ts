@@ -887,55 +887,82 @@ function createSnapcompactArchiveMigrationMessage(archiveText: string): Message 
 	};
 }
 
-export async function generateSummary(
-	currentMessages: AgentMessage[],
-	model: Model,
-	reserveTokens: number,
-	apiKey: ApiKey,
-	signal?: AbortSignal,
-	customInstructions?: string,
-	previousSummary?: string,
-	options?: SummaryOptions,
-): Promise<string> {
-	const maxTokens = Math.min(Math.floor(0.8 * reserveTokens), MAX_SUMMARY_TOKENS);
+const DEFAULT_SUMMARY_CONTEXT_WINDOW = 200_000;
+const SUMMARY_CONTEXT_HEADROOM_TOKENS = 4_096;
+const SUMMARY_INITIAL_BYTES_PER_TOKEN = 2;
+const SUMMARY_CONTEXT_OVERFLOW_PATTERN =
+	/prompt is too long|input is too long|exceeds the context window|maximum context length|too many tokens|token limit exceeded|context[_ ]length[_ ]exceeded|request_too_large/i;
 
-	// Use update prompt if we have a previous summary, otherwise initial prompt
-	let basePrompt = previousSummary ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT;
-	if (options?.promptOverride) {
-		basePrompt = options.promptOverride;
-	}
-	if (customInstructions) {
-		basePrompt = `${basePrompt}\n\nAdditional focus: ${customInstructions}`;
-	}
-
-	// Serialize conversation to text so model doesn't try to continue it
-	// Convert to LLM messages first (handles custom app messages when caller provides a transformer).
-	const llmMessages = (options?.convertToLlm ?? defaultConvertToLlm)(currentMessages);
-	const conversationText = serializeConversationForSummary(llmMessages, preferredDialect(model.id));
-
-	// Build the prompt with conversation wrapped in tags
+function buildSummaryPrompt(
+	conversationText: string,
+	previousSummary: string | undefined,
+	basePrompt: string,
+	extraContext: SummaryOptions["extraContext"],
+): string {
 	let promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
 	if (previousSummary) {
 		promptText += `<previous-summary>\n${previousSummary}\n</previous-summary>\n\n`;
 	}
-	promptText += formatAdditionalContext(options?.extraContext);
+	promptText += formatAdditionalContext(extraContext);
 	promptText += basePrompt;
+	return promptText;
+}
 
-	const summarizationMessages = [
-		{
-			role: "user" as const,
-			content: [{ type: "text" as const, text: promptText }],
-			timestamp: Date.now(),
-		},
-	];
+function resolveSummaryPrompt(
+	previousSummary: string | undefined,
+	customInstructions: string | undefined,
+	options: SummaryOptions | undefined,
+): string {
+	let basePrompt = options?.promptOverride ?? (previousSummary ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT);
+	if (customInstructions) {
+		basePrompt = `${basePrompt}\n\nAdditional focus: ${customInstructions}`;
+	}
+	return basePrompt;
+}
 
-	if (options?.remoteEndpoint) {
-		const endpoint = options.remoteEndpoint;
+function findUtf8ChunkEnd(text: string, start: number, maxBytes: number): number {
+	let low = start + 1;
+	let high = Math.min(text.length, start + maxBytes);
+	let best = start;
+
+	while (low <= high) {
+		const middle = low + ((high - low) >> 1);
+		if (Buffer.byteLength(text.slice(start, middle), "utf8") <= maxBytes) {
+			best = middle;
+			low = middle + 1;
+		} else {
+			high = middle - 1;
+		}
+	}
+
+	// Never split a UTF-16 surrogate pair.
+	if (best < text.length && best > start) {
+		const nextCodeUnit = text.charCodeAt(best);
+		if (nextCodeUnit >= 0xdc00 && nextCodeUnit <= 0xdfff) best--;
+	}
+	if (best === text.length) return best;
+
+	// Prefer a transcript boundary when one is reasonably close to the byte limit.
+	const boundary = text.lastIndexOf("\n\n", best - 2);
+	if (boundary >= start + Math.floor((best - start) / 2)) return boundary + 2;
+	return best;
+}
+
+async function requestSummary(
+	promptText: string,
+	model: Model,
+	maxTokens: number,
+	apiKey: ApiKey,
+	signal: AbortSignal | undefined,
+	options: SummaryOptions | undefined,
+): Promise<string> {
+	const remoteEndpoint = options?.remoteEndpoint;
+	if (remoteEndpoint) {
 		const remote = await withAuth(
 			apiKey,
 			key =>
 				requestRemoteCompaction(
-					endpoint,
+					remoteEndpoint,
 					{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, prompt: promptText, maxTokens },
 					signal,
 					{ fetch: options.fetch, model, apiKey: key },
@@ -947,7 +974,10 @@ export async function generateSummary(
 
 	const response = await instrumentedCompleteSimple(
 		model,
-		{ systemPrompt: [SUMMARIZATION_SYSTEM_PROMPT], messages: summarizationMessages },
+		{
+			systemPrompt: [SUMMARIZATION_SYSTEM_PROMPT],
+			messages: [{ role: "user", content: [{ type: "text", text: promptText }], timestamp: Date.now() }],
+		},
 		{
 			maxTokens,
 			signal,
@@ -973,12 +1003,77 @@ export async function generateSummary(
 		throw createSummarizationError("Summarization failed", response);
 	}
 
-	const textContent = response.content
+	return response.content
 		.filter((c): c is { type: "text"; text: string } => c.type === "text")
 		.map(c => c.text)
 		.join("\n");
+}
 
-	return textContent;
+export async function generateSummary(
+	currentMessages: AgentMessage[],
+	model: Model,
+	reserveTokens: number,
+	apiKey: ApiKey,
+	signal?: AbortSignal,
+	customInstructions?: string,
+	previousSummary?: string,
+	options?: SummaryOptions,
+): Promise<string> {
+	const maxTokens = Math.min(Math.floor(0.8 * reserveTokens), MAX_SUMMARY_TOKENS);
+	const contextWindow = model.contextWindow ?? DEFAULT_SUMMARY_CONTEXT_WINDOW;
+	const headroom = Math.min(SUMMARY_CONTEXT_HEADROOM_TOKENS, Math.floor(contextWindow * 0.05));
+	const inputBudgetTokens = contextWindow - maxTokens - headroom;
+	const systemPromptBytes = Buffer.byteLength(SUMMARIZATION_SYSTEM_PROMPT, "utf8");
+
+	const llmMessages = (options?.convertToLlm ?? defaultConvertToLlm)(currentMessages);
+	const conversationText = serializeConversationForSummary(llmMessages, preferredDialect(model.id));
+	let summary = previousSummary;
+	let offset = 0;
+	let bytesPerToken = SUMMARY_INITIAL_BYTES_PER_TOKEN;
+
+	do {
+		let end = offset;
+		for (;;) {
+			const basePrompt = resolveSummaryPrompt(summary, customInstructions, options);
+			const emptyPrompt = buildSummaryPrompt("", summary, basePrompt, options?.extraContext);
+			const promptBudgetBytes = inputBudgetTokens * bytesPerToken - systemPromptBytes;
+			const availableConversationBytes = promptBudgetBytes - Buffer.byteLength(emptyPrompt, "utf8");
+			if (availableConversationBytes <= 0) {
+				throw new Error(`Compaction summary prompt leaves no input room in ${contextWindow}-token model context`);
+			}
+
+			end =
+				conversationText.length === 0 ? 0 : findUtf8ChunkEnd(conversationText, offset, availableConversationBytes);
+			if (conversationText.length > 0 && end <= offset) {
+				throw new Error(`Compaction summary could not fit one character in ${contextWindow}-token model context`);
+			}
+
+			const promptText = buildSummaryPrompt(
+				conversationText.slice(offset, end),
+				summary,
+				basePrompt,
+				options?.extraContext,
+			);
+			try {
+				summary = await requestSummary(promptText, model, maxTokens, apiKey, signal, options);
+				break;
+			} catch (error) {
+				if (bytesPerToken > 1 && error instanceof Error && SUMMARY_CONTEXT_OVERFLOW_PATTERN.test(error.message)) {
+					// Most code/transcript text averages at least two UTF-8 bytes per token.
+					// If a denser provider tokenizer rejects that estimate, retry this and
+					// every remaining chunk at the hard-safe one-byte-per-token bound.
+					bytesPerToken = 1;
+					continue;
+				}
+				throw error;
+			}
+		}
+
+		if (conversationText.length === 0) break;
+		offset = end;
+	} while (offset < conversationText.length);
+
+	return summary ?? "";
 }
 
 // ============================================================================

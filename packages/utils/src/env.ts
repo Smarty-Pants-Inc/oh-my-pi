@@ -6,6 +6,18 @@ import { getAgentDir, getConfigRootDir, refreshDirsFromEnv } from "./dirs";
 export * from "./worker-host";
 
 const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const FRESH_OMP_COMPANION_ENV = "FRESH_OMP_COMPANION";
+const FRESH_OMP_COMPANION_ENDPOINT_ENV = "FRESH_OMP_COMPANION_ENDPOINT";
+const FRESH_OMP_COMPANION_TOKEN_ENV = "FRESH_OMP_COMPANION_TOKEN";
+
+function isFreshOmpCompanionEnvName(name: string): boolean {
+	const canonical = process.platform === "win32" ? name.toUpperCase() : name;
+	return (
+		canonical === FRESH_OMP_COMPANION_ENV ||
+		canonical === FRESH_OMP_COMPANION_ENDPOINT_ENV ||
+		canonical === FRESH_OMP_COMPANION_TOKEN_ENV
+	);
+}
 
 /**
  * Strict shell-identifier shape. Used for dotenv keys we accept into
@@ -43,6 +55,7 @@ export function filterProcessEnv(env: Record<string, string | undefined>): Recor
 		if (
 			!isSafeEnvName(key) ||
 			isMacosMallocStackLoggingEnvName(key) ||
+			isFreshOmpCompanionEnvName(key) ||
 			value === undefined ||
 			!isSafeEnvValue(value)
 		) {
@@ -52,11 +65,10 @@ export function filterProcessEnv(env: Record<string, string | undefined>): Recor
 	}
 	return result;
 }
-// Bun autoloads the project's dotenv files into `process.env` before user code
-// runs — including inside `bun build --compile` binaries — so a snapshot of
-// `Bun.env` is only pre-dotenv when autoloading was explicitly disabled. Linux
-// keeps the original exec environment in procfs, which is authoritative.
-function readLaunchEnv(): ReadonlyMap<string, string> | undefined {
+// Linux exposes the original exec environment through procfs. Embedded release
+// binaries disable Bun's dotenv autoload, so their startup snapshot is also
+// authoritative; source and test entrypoints must opt out with `--no-env-file`.
+function readLaunchEnv(): Map<string, string> | undefined {
 	if (process.platform === "linux") {
 		try {
 			const values = new Map<string, string>();
@@ -67,7 +79,9 @@ function readLaunchEnv(): ReadonlyMap<string, string> | undefined {
 			return values;
 		} catch {}
 	}
-	if (!process.execArgv.includes("--no-env-file")) return undefined;
+	const embedded =
+		import.meta.url.includes("$bunfs") || import.meta.url.includes("~BUN") || import.meta.url.includes("%7EBUN");
+	if (!embedded && !process.execArgv.includes("--no-env-file")) return undefined;
 	const values = new Map<string, string>();
 	for (const key in Bun.env) {
 		const value = Bun.env[key];
@@ -77,7 +91,23 @@ function readLaunchEnv(): ReadonlyMap<string, string> | undefined {
 }
 
 const launchEnvValues = readLaunchEnv();
+let freshOmpCompanionLaunchEnv: Record<string, string | undefined> | undefined = launchEnvValues ? {} : undefined;
+if (launchEnvValues && freshOmpCompanionLaunchEnv) {
+	for (const [name, value] of launchEnvValues) {
+		if (!isFreshOmpCompanionEnvName(name)) continue;
+		const canonicalName = name.toUpperCase();
+		freshOmpCompanionLaunchEnv[canonicalName] = value;
+		launchEnvValues.delete(name);
+	}
+}
 const projectEnvNamesLoadedByOmp = new Set<string>();
+
+/** Consume the mutable one-shot Fresh launch authority; the caller must erase it after decoding. */
+export function consumeFreshOmpCompanionLaunchEnv(): Record<string, string | undefined> | undefined {
+	const env = freshOmpCompanionLaunchEnv;
+	freshOmpCompanionLaunchEnv = undefined;
+	return env;
+}
 
 function expandDotenvValues(values: Record<string, string>, env: Record<string, string>): Record<string, string> {
 	const expanded: Record<string, string> = {};
@@ -154,7 +184,7 @@ function parseEnvLine(line: string): { key: string; value: string } | undefined 
 	let key = trimmed.slice(0, eqIndex).trim();
 	const exported = key.match(/^export[ \t]+(.*)$/);
 	if (exported) key = exported[1].trim();
-	if (!isValidEnvName(key)) return undefined;
+	if (!isValidEnvName(key) || isFreshOmpCompanionEnvName(key)) return undefined;
 	const raw = trimmed.slice(eqIndex + 1).replace(/^[ \t]+/, "");
 	const quote = raw[0];
 	if (quote === '"' || quote === "'" || quote === "`") {
@@ -201,7 +231,13 @@ const projectEnv = parseEnvFile(path.join(process.cwd(), ".env"));
 
 for (const key of Object.keys(Bun.env)) {
 	const value = Bun.env[key];
-	if (!isSafeEnvName(key) || isMacosMallocStackLoggingEnvName(key) || value === undefined || !isSafeEnvValue(value)) {
+	if (
+		!isSafeEnvName(key) ||
+		isMacosMallocStackLoggingEnvName(key) ||
+		isFreshOmpCompanionEnvName(key) ||
+		value === undefined ||
+		!isSafeEnvValue(value)
+	) {
 		delete Bun.env[key];
 	}
 }

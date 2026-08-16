@@ -523,6 +523,24 @@ describe("extensions discovery", () => {
 		expect(result.extensions[0].path).toContain("my-ext.ts");
 	});
 
+	it("deduplicates canonical symlink and explicit paths while retaining the first path", async () => {
+		const sourcePath = path.join(tempDir.path(), "external", "shared.ts");
+		const linkedPath = path.join(extensionsDir, "linked.ts");
+		fs.mkdirSync(path.dirname(sourcePath), { recursive: true });
+		fs.writeFileSync(sourcePath, extensionCodeWithTool("shared-tool"));
+		fs.symlinkSync(sourcePath, linkedPath, "file");
+
+		const paths = await discoverExtensionPaths([linkedPath, sourcePath], tempDir.path(), undefined, {
+			ambient: false,
+		});
+		expect(paths).toEqual([linkedPath]);
+
+		const result = await loadExtensions(paths, tempDir.path());
+		expect(result.errors).toEqual([]);
+		expect(result.extensions).toHaveLength(1);
+		expect(result.extensions[0]?.path).toBe(linkedPath);
+	});
+
 	it("resolves 3rd party npm dependencies (chalk)", async () => {
 		// Load the real chalk-logger extension from examples
 		const chalkLoggerPath = path.resolve(import.meta.dirname, "..", "examples", "extensions", "chalk-logger.ts");

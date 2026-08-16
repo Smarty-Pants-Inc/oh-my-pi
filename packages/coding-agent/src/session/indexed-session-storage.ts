@@ -22,6 +22,12 @@ export interface SessionStorageIndexEntry {
 	titleUpdatedAt?: string;
 }
 
+export interface SessionStorageMove {
+	sourcePath: string;
+	destinationPath: string;
+	mtimeMs: number;
+}
+
 export interface SessionStorageBackend {
 	init(): Promise<void>;
 	loadIndex(): Promise<Iterable<SessionStorageIndexEntry>>;
@@ -33,6 +39,8 @@ export interface SessionStorageBackend {
 	truncate(path: string, mtimeMs: number): Promise<void>;
 	remove(paths: string[]): Promise<void>;
 	move(src: string, dst: string, mtimeMs: number): Promise<void>;
+	/** Atomically replace destination paths and move every source when supported. */
+	moveMany?(moves: readonly SessionStorageMove[], replacedPaths: readonly string[]): Promise<void>;
 }
 
 interface IndexEntry {
@@ -292,17 +300,108 @@ export class IndexedSessionStorage implements SessionStorage {
 		await this.#awaitPath(dst);
 		const entry = this.#index.get(src);
 		if (!entry) throw enoent(src);
+		if (src === dst) return;
 		const dstPrevious = this.#index.get(dst);
-		this.#index.delete(src);
-		this.#index.set(dst, { ...entry });
-		try {
-			await this.#enqueuePaths([src, dst], () => this.#backend.move(src, dst, entry.mtimeMs), { trackDrain: false });
-		} catch (err) {
-			this.#index.delete(dst);
-			this.#restoreIndex(dst, dstPrevious);
-			this.#index.set(src, entry);
-			throw toError(err);
+		await this.#enqueuePaths(
+			[src, dst],
+			async () => {
+				await this.#backend.move(src, dst, entry.mtimeMs);
+				if (this.#index.get(src) === entry) this.#index.delete(src);
+				if (this.#index.get(dst) === dstPrevious) this.#index.set(dst, { ...entry });
+			},
+			{ trackDrain: false },
+		);
+	}
+
+	async moveSessionWithArtifacts(sessionPath: string, nextSessionPath: string): Promise<void> {
+		if (sessionPath === nextSessionPath) return;
+		const sourceArtifactsDir = sessionPath.slice(0, -6);
+		const sourcePrefix = sourceArtifactsDir.endsWith("/") ? sourceArtifactsDir : `${sourceArtifactsDir}/`;
+		const nextArtifactsDir = nextSessionPath.slice(0, -6);
+		const nextPrefix = nextArtifactsDir.endsWith("/") ? nextArtifactsDir : `${nextArtifactsDir}/`;
+
+		const sourceEntries = new Map<string, IndexEntry>();
+		const destinationEntries = new Map<string, IndexEntry>();
+		for (const [path, entry] of this.#index) {
+			if (path === sessionPath || path.startsWith(sourcePrefix)) sourceEntries.set(path, entry);
+			if (path === nextSessionPath || path.startsWith(nextPrefix)) destinationEntries.set(path, entry);
 		}
+		if (!sourceEntries.has(sessionPath)) throw enoent(sessionPath);
+
+		const moves: SessionStorageMove[] = Array.from(sourceEntries, ([sourcePath, entry]) => ({
+			sourcePath,
+			destinationPath:
+				sourcePath === sessionPath ? nextSessionPath : `${nextPrefix}${sourcePath.slice(sourcePrefix.length)}`,
+			mtimeMs: entry.mtimeMs,
+		}));
+		const replacedPaths = Array.from(destinationEntries.keys());
+		const affectedPaths = [...sourceEntries.keys(), ...replacedPaths, ...moves.map(move => move.destinationPath)];
+
+		await this.#enqueuePaths(
+			affectedPaths,
+			async () => {
+				if (this.#backend.moveMany) {
+					await this.#backend.moveMany(moves, replacedPaths);
+				} else {
+					const snapshots = await Promise.all(
+						Array.from(destinationEntries, async ([path, entry]) => {
+							const content = await this.#backend.readFull(path);
+							if (content === null) throw enoent(path);
+							return { path, entry, content };
+						}),
+					);
+					const completed: SessionStorageMove[] = [];
+					try {
+						await this.#backend.remove(replacedPaths);
+						for (const move of moves) {
+							await this.#backend.move(move.sourcePath, move.destinationPath, move.mtimeMs);
+							completed.push(move);
+						}
+					} catch (operationError) {
+						const failures: unknown[] = [operationError];
+						for (const move of completed.reverse()) {
+							try {
+								await this.#backend.move(move.destinationPath, move.sourcePath, move.mtimeMs);
+							} catch (rollbackError) {
+								failures.push(rollbackError);
+							}
+						}
+						for (const snapshot of snapshots) {
+							try {
+								await this.#backend.writeFull(
+									snapshot.path,
+									snapshot.content,
+									snapshot.entry.mtimeMs,
+									titleUpdateForIndex(snapshot.entry),
+								);
+							} catch (rollbackError) {
+								failures.push(rollbackError);
+							}
+						}
+						if (failures.length === 1) throw toError(operationError);
+						throw new AggregateError(failures, "Failed to move session storage and roll back");
+					}
+				}
+
+				const replaceDestinations = new Set<string>();
+				for (const move of moves) {
+					const previous = destinationEntries.get(move.destinationPath);
+					if (this.#index.get(move.destinationPath) === previous) replaceDestinations.add(move.destinationPath);
+				}
+				for (const [path, entry] of destinationEntries) {
+					if (this.#index.get(path) === entry) this.#index.delete(path);
+				}
+				for (const [path, entry] of sourceEntries) {
+					if (this.#index.get(path) === entry) this.#index.delete(path);
+				}
+				for (const move of moves) {
+					if (!replaceDestinations.has(move.destinationPath)) continue;
+					const entry = sourceEntries.get(move.sourcePath);
+					if (entry) this.#index.set(move.destinationPath, { ...entry });
+				}
+			},
+			{ trackDrain: false },
+		);
 	}
 
 	async unlink(path: string): Promise<void> {
@@ -320,15 +419,15 @@ export class IndexedSessionStorage implements SessionStorage {
 
 	async deleteSessionWithArtifacts(sessionPath: string): Promise<void> {
 		await this.#awaitPath(sessionPath);
-		const sessionEntry = this.#index.get(sessionPath);
-		if (!sessionEntry) throw enoent(sessionPath);
 
 		const artifactsDir = sessionPath.slice(0, -6);
 		const prefix = artifactsDir.endsWith("/") ? artifactsDir : `${artifactsDir}/`;
-		const paths = [sessionPath];
+		const paths: string[] = [];
+		if (this.#index.has(sessionPath)) paths.push(sessionPath);
 		for (const key of this.#index.keys()) {
 			if (key.startsWith(prefix)) paths.push(key);
 		}
+		if (paths.length === 0) return;
 
 		for (const path of paths) await this.#awaitPath(path);
 

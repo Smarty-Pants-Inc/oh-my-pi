@@ -89,6 +89,7 @@ import {
 	ExtensionRunner,
 	ExtensionToolWrapper,
 	type ExtensionUIContext,
+	type HostInternalExtensionBinding,
 	type LoadExtensionsResult,
 	loadExtensionFromFactory,
 	loadExtensions,
@@ -137,6 +138,7 @@ import { AgentSession, type InitialRetryFallbackState, type PlanYolo, type Prewa
 import { discoverAuthStorage as discoverAuthStorageFromConfig } from "./session/auth-broker-config";
 import type { AuthStorage } from "./session/auth-storage";
 import { withDateCwdReminder } from "./session/date-cwd-reminder";
+import type { ExecutionEnvironmentBinding, ExecutionEnvironmentProvider } from "./session/execution-environment";
 import { createInterruptedTurnAbortMessage } from "./session/exit-diagnostics";
 import {
 	type CustomMessage,
@@ -162,8 +164,11 @@ import { createSnapcompactSavingsRecorder } from "./session/snapcompact-savings-
 import { closeAllConnections } from "./ssh/connection-manager";
 import { unmountAll } from "./ssh/sshfs-mount";
 import {
+	assertExecutionEnvironmentSystemPrompt,
 	type BuildSystemPromptResult,
 	buildSystemPrompt as buildSystemPromptInternal,
+	DEFAULT_SYSTEM_PROMPT_TEMPLATES,
+	type BuildSystemPromptOptions as InternalBuildSystemPromptOptions,
 	loadProjectContextFiles as loadContextFilesInternal,
 	projectSystemPromptToolMetadata,
 } from "./system-prompt";
@@ -417,6 +422,10 @@ export interface CreateAgentSessionOptions {
 	providerPromptCacheKeySource?: "explicit" | "fork";
 	/** Absolute wall-clock deadline in Unix epoch milliseconds. */
 	deadline?: number;
+	/** Immutable execution environment binding used by authoritative built-in tool routing. */
+	executionEnvironment?: ExecutionEnvironmentBinding;
+	/** Provider resolved after extensions load; mutually exclusive with an explicit binding. */
+	executionEnvironmentProvider?: ExecutionEnvironmentProvider;
 
 	/** Custom tools to register (in addition to built-in tools). Accepts both CustomTool and ToolDefinition. */
 	customTools?: (CustomTool | ToolDefinition)[];
@@ -441,6 +450,14 @@ export interface CreateAgentSessionOptions {
 	 * @internal
 	 */
 	preloadedExtensions?: LoadExtensionsResult;
+	/**
+	 * Host-owned extension installed ahead of public handlers without entering
+	 * discovery, factory forwarding, public metadata, or the model-callable tool set.
+	 * Ignored for subagent/task sessions even if accidentally forwarded.
+	 *
+	 * @internal
+	 */
+	hostInternalExtension?: HostInternalExtensionBinding;
 	/**
 	 * Pre-discovered extension source paths. When provided, the filesystem-scan
 	 * inside `discoverExtensionPaths()` is skipped — the session still calls
@@ -640,6 +657,13 @@ export type { MCPManager, MCPServerConfig, MCPServerConnection, MCPToolsLoadResu
 // embedding several concurrent top-level sessions in one process (the default
 // global registry admits only one "Main" per process generation).
 export { type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "./registry/agent-registry";
+export type {
+	ExecutionEnvironmentBinding,
+	ExecutionEnvironmentBridge,
+	ExecutionEnvironmentLease,
+	ExecutionEnvironmentProvider,
+	ExecutionEnvironmentRequest,
+} from "./session/execution-environment";
 export type { Tool } from "./tools";
 export { buildDirectoryTree, buildWorkspaceTree, type DirectoryTree, type WorkspaceTree } from "./workspace-tree";
 
@@ -1593,6 +1617,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	let session!: AgentSession;
 	let hasSession = false;
 	let hasRegistered = false;
+	const resolvedExecutionEnvironment = options.executionEnvironment;
+	let resolvedExecutionEnvironmentProvider: ExecutionEnvironmentProvider | undefined;
 	const restrictToolNames = options.restrictToolNames === true;
 	const enableLsp = options.enableLsp ?? !restrictToolNames;
 	const lspReadOnly = options.lspReadOnly ?? restrictToolNames;
@@ -1669,6 +1695,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			toolRegistry,
 			hasUI: options.hasUI ?? false,
 			getApiKey: options.getApiKey,
+			getExecutionEnvironment: () => resolvedExecutionEnvironment,
+			getExecutionEnvironmentProvider: () => resolvedExecutionEnvironmentProvider,
 			get additionalDirectories() {
 				return sessionManager.getAdditionalDirectories();
 			},
@@ -1739,7 +1767,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				disposeCallbacks.add(callback);
 				return () => disposeCallbacks.delete(callback);
 			},
-			registerSessionChangeCallback: callback => session?.registerSessionChangeCallback(callback),
+			registerSessionChangeCallback: (callback, callbackOptions) =>
+				session?.registerSessionChangeCallback(callback, callbackOptions),
 			bumpFileMutationVersion: path => {
 				const next = (fileMutationVersions.get(path) ?? 0) + 1;
 				fileMutationVersions.set(path, next);
@@ -2034,6 +2063,19 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				);
 				extensionsResult.extensions.push(loaded);
 			}
+		}
+
+		resolvedExecutionEnvironmentProvider = options.executionEnvironmentProvider;
+		for (const extension of extensionsResult.extensions) {
+			const extensionProvider = extension.executionEnvironmentProvider;
+			if (!extensionProvider) continue;
+			if (resolvedExecutionEnvironmentProvider) {
+				throw new Error("Multiple execution environment providers were registered for one session");
+			}
+			resolvedExecutionEnvironmentProvider = extensionProvider;
+		}
+		if (resolvedExecutionEnvironment && resolvedExecutionEnvironmentProvider) {
+			throw new Error("A session cannot contain both an execution environment binding and provider");
 		}
 
 		// Process provider registrations queued during extension loading.
@@ -2552,6 +2594,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// (The builtin autoresearch extension is unconditionally loaded above, so this scenario
 		// is unreachable; unconditional runner construction keeps that invariant explicit and
 		// prevents future optional extensions from silently re-opening the hole.)
+		const hostInternalExtension =
+			options.parentTaskPrefix === undefined && (options.taskDepth ?? 0) === 0
+				? options.hostInternalExtension
+				: undefined;
 		const extensionRunner: ExtensionRunner = new ExtensionRunner(
 			extensionsResult.extensions,
 			extensionsResult.runtime,
@@ -2562,7 +2608,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			settings,
 			localProtocolOptions,
 			() => (hasSession ? session.getAsyncJobSnapshot() : null),
+			hostInternalExtension,
+			() => (hasSession ? session.getAsyncJobCounts() : null),
 		);
+		const systemPromptBuilder = extensionRunner.getSystemPromptBuilder();
 
 		credentialDisabledTarget = extensionRunner;
 		for (const event of startupCredentialDisabledEvents.splice(0)) {
@@ -2575,7 +2624,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			modelRegistry,
 			model: agent.state.model,
 			isIdle: () => !session.isStreaming,
-			hasQueuedMessages: () => session.queuedMessageCount > 0,
+			hasQueuedMessages: () => session.hasPendingMessages(),
 			abort: () => {
 				session.abort({ reason: USER_INTERRUPT_LABEL });
 			},
@@ -2813,6 +2862,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			toolNames: string[],
 			tools: Map<string, AgentTool>,
 		): Promise<BuildSystemPromptResult> => {
+			toolContextStore.setToolNames(toolNames);
+			const executionEnvironment = toolSession.getExecutionEnvironment?.();
 			const promptCwd = sessionManager.getCwd();
 			const activeRepoContext = hasSession
 				? await logger.time("resolveActiveRepoContext", resolveRepoContext, promptCwd)
@@ -2892,9 +2943,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					? `${appendPrompt}\n\n${options.appendSystemPrompt}`
 					: options.appendSystemPrompt;
 			}
-			const defaultPrompt = await buildSystemPromptInternal({
+			const promptOptions: InternalBuildSystemPromptOptions = {
 				cwd: promptCwd,
 				additionalWorkspaceRoots: sessionManager.getAdditionalDirectories(),
+				executionEnvironment,
 				xdevTools: toolSession.xdev ? xdevEntries(toolSession.xdev) : [],
 				xdevDocs: toolSession.xdev
 					? xdevDocsAll(toolSession.xdev, settings.get("tools.xdevDocs"), settings.get("tools.xdevInlineDevices"))
@@ -2931,7 +2983,14 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				personality: agentKind === "sub" ? "none" : settings.get("personality"),
 				renderMermaid: settings.get("tui.renderMermaid"),
 				activeRepoContext,
-			});
+			};
+			const defaultPrompt = systemPromptBuilder
+				? await systemPromptBuilder({
+						options: promptOptions,
+						templates: DEFAULT_SYSTEM_PROMPT_TEMPLATES,
+						build: templates => buildSystemPromptInternal(promptOptions, templates),
+					})
+				: await buildSystemPromptInternal(promptOptions);
 
 			if (options.systemPrompt === undefined) {
 				return defaultPrompt;
@@ -2940,9 +2999,13 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				typeof options.systemPrompt === "function"
 					? options.systemPrompt(defaultPrompt.systemPrompt)
 					: options.systemPrompt;
-			return {
+			const result = {
 				systemPrompt: typeof customPrompt === "string" ? [customPrompt] : customPrompt,
 			};
+			if (executionEnvironment) {
+				assertExecutionEnvironmentSystemPrompt(executionEnvironment, result.systemPrompt);
+			}
+			return result;
 		};
 
 		const toolNamesFromRegistry = Array.from(toolRegistry.keys());
@@ -2991,7 +3054,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		const defaultInactiveToolNames = new Set(
 			registeredTools.filter(tool => tool.definition.defaultInactive).map(tool => tool.definition.name),
 		);
-		const requestedActiveToolNames = normalizedRequested.filter(name => name !== "goal");
+		const requestedActiveToolNames = normalizedRequested;
 		const explicitlyRequestedToolNameSet = explicitlyRequestedToolNames
 			? new Set(explicitlyRequestedToolNames)
 			: undefined;
@@ -3144,6 +3207,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					)
 				: undefined;
 		const transformProviderContext = async (context: Context, transformModel: Model): Promise<Context> => {
+			const executionEnvironment = toolSession.getExecutionEnvironment?.();
+			if (executionEnvironment && context.systemPrompt) {
+				assertExecutionEnvironmentSystemPrompt(executionEnvironment, context.systemPrompt);
+			}
 			let transformed = obfuscator ? obfuscateProviderContext(obfuscator, context) : context;
 			if (snapcompactInline) transformed = await snapcompactInline.transform(transformed, transformModel);
 			transformed = clampProviderContextImages(transformed, transformModel);

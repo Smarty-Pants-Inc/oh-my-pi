@@ -173,7 +173,7 @@ describe("InteractiveMode goal mode integration", () => {
 	});
 
 	it("toggles goal tool exposure when goal mode enters and pauses", async () => {
-		expect(await toolNamesFor(harness)).not.toContain("goal");
+		expect(await toolNamesFor(harness)).toContain("goal");
 
 		await harness.mode.handleGoalModeCommand("Ship the release");
 
@@ -187,7 +187,31 @@ describe("InteractiveMode goal mode integration", () => {
 		expect(harness.mode.goalModeEnabled).toBe(false);
 		expect(harness.mode.goalModePaused).toBe(true);
 		expect(harness.session.getGoalModeState()?.goal.status).toBe("paused");
-		expect(await toolNamesFor(harness)).not.toContain("goal");
+		expect(await toolNamesFor(harness)).toContain("goal");
+	});
+
+	it("lets a headless agent create an unbounded goal before user-started goal mode", async () => {
+		expect(harness.session.getGoalModeState()).toBeUndefined();
+		const goalTool = (await createTools(harness.toolSession, harness.session.getActiveToolNames())).find(
+			tool => tool.name === "goal",
+		);
+		if (!goalTool) {
+			throw new Error("Expected goal tool to be active");
+		}
+
+		const result = await goalTool.execute("call-create", {
+			op: "create",
+			objective: "Agent-started goal",
+			token_budget: undefined,
+		});
+
+		expect(result.details?.op).toBe("create");
+		expect(result.details?.goal?.objective).toBe("Agent-started goal");
+		expect(result.details?.goal?.status).toBe("active");
+		expect(result.details?.remainingTokens).toBeNull();
+		expect(harness.session.getGoalModeState()?.enabled).toBe(true);
+		expect(harness.session.getGoalModeState()?.goal.objective).toBe("Agent-started goal");
+		expect(harness.session.getGoalModeState()?.goal.tokenBudget).toBeUndefined();
 	});
 
 	it("replaces the active goal via /goal set", async () => {
@@ -401,7 +425,9 @@ describe("InteractiveMode goal mode integration", () => {
 			},
 		];
 		harness.session.setTodoPhases(phases);
-		const sendCustomMessage = vi.spyOn(harness.session, "sendCustomMessage").mockResolvedValue(false);
+		const sendCustomMessage = vi
+			.spyOn(harness.session, "sendCustomMessage")
+			.mockResolvedValue({ status: "accepted", delivery: "plain_append" });
 
 		await harness.session.sendGoalModeContext({ deliverAs: "steer" });
 
@@ -431,7 +457,9 @@ describe("InteractiveMode goal mode integration", () => {
 				],
 			},
 		]);
-		const sendCustomMessage = vi.spyOn(harness.session, "sendCustomMessage").mockResolvedValue(false);
+		const sendCustomMessage = vi
+			.spyOn(harness.session, "sendCustomMessage")
+			.mockResolvedValue({ status: "accepted", delivery: "plain_append" });
 
 		await harness.session.sendGoalModeContext({ deliverAs: "steer" });
 
@@ -455,7 +483,9 @@ describe("InteractiveMode goal mode integration", () => {
 				tasks: [{ content: "Run focused checks", status: "pending" }],
 			},
 		]);
-		const sendCustomMessage = vi.spyOn(harness.session, "sendCustomMessage").mockResolvedValue(false);
+		const sendCustomMessage = vi
+			.spyOn(harness.session, "sendCustomMessage")
+			.mockResolvedValue({ status: "accepted", delivery: "plain_append" });
 
 		await harness.session.sendGoalModeContext({ deliverAs: "steer" });
 
@@ -549,7 +579,7 @@ describe("InteractiveMode goal mode integration", () => {
 		expect(await toolNamesFor(harness)).toContain("goal");
 	});
 
-	it("mutates the goal token budget via /goal budget without resetting accumulated usage", async () => {
+	it("keeps owner-applied caps enforced and resumes when the owner clears them", async () => {
 		await harness.mode.handleGoalModeCommand("Ship the release");
 		// Seed accumulated usage by driving the runtime directly — equivalent to a turn's flush.
 		const goal = harness.session.getGoalModeState()?.goal;
@@ -559,14 +589,20 @@ describe("InteractiveMode goal mode integration", () => {
 
 		await harness.mode.handleGoalModeCommand("budget 123");
 
-		const after = harness.session.getGoalModeState();
-		expect(after?.goal.tokenBudget).toBe(123);
+		const capped = harness.session.getGoalModeState();
+		expect(capped?.goal.tokenBudget).toBe(123);
+		expect(capped?.goal.status).toBe("active");
 		// Accumulated counters are preserved across the mutation.
-		expect(after?.goal.tokensUsed).toBe(42);
-		expect(after?.goal.timeUsedSeconds).toBe(5);
+		expect(capped?.goal.tokensUsed).toBe(42);
+		expect(capped?.goal.timeUsedSeconds).toBe(5);
+
+		await harness.mode.handleGoalModeCommand("budget 40");
+		expect(harness.session.getGoalModeState()?.goal.status).toBe("budget-limited");
 
 		await harness.mode.handleGoalModeCommand("budget off");
 		expect(harness.session.getGoalModeState()?.goal.tokenBudget).toBeUndefined();
+		expect(harness.session.getGoalModeState()?.goal.status).toBe("active");
+		expect(harness.session.getGoalModeState()?.enabled).toBe(true);
 		expect(harness.session.getGoalModeState()?.goal.tokensUsed).toBe(42);
 	});
 
@@ -619,7 +655,7 @@ describe("InteractiveMode goal mode integration", () => {
 		expect(harness.mode.goalModeEnabled).toBe(false);
 		expect(harness.mode.goalModePaused).toBe(false);
 		expect(harness.session.getGoalModeState()).toBeUndefined();
-		expect(await toolNamesFor(harness)).not.toContain("goal");
+		expect(await toolNamesFor(harness)).toContain("goal");
 		expect(appendCustomEntry).toHaveBeenCalledWith(
 			"goal-completed",
 			expect.objectContaining({

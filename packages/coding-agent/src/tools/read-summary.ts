@@ -52,6 +52,43 @@ export function routeReadThroughBridge(
 	if (!bridge?.capabilities.readTextFile || !bridge.readTextFile) return undefined;
 	return bridge.readTextFile({ path: absolutePath, ...options });
 }
+export function trySummarizeText(
+	session: ToolSession,
+	code: string,
+	codePath: string,
+	signal?: AbortSignal,
+): SummaryResult | null {
+	if (Buffer.byteLength(code, "utf-8") > MAX_SUMMARY_BYTES) return null;
+	try {
+		throwIfAborted(signal);
+		const lineCount = countTextLines(code);
+		if (lineCount > MAX_SUMMARY_LINES) return null;
+		if (lineCount < session.settings.get("read.summarize.minTotalLines")) return null;
+
+		const minBodyLines = session.settings.get("read.summarize.minBodyLines");
+		const minCommentLines = session.settings.get("read.summarize.minCommentLines");
+		const unfoldUntilLines = session.settings.get("read.summarize.unfoldUntil");
+		const unfoldLimitLines = session.settings.get("read.summarize.unfoldLimit");
+		const cache = getSummaryParseCache(session);
+		const cacheKey = `${codePath}\0${Bun.hash(code)}\0${minBodyLines},${minCommentLines},${unfoldUntilLines},${unfoldLimitLines}`;
+		const memoized = cache.get(cacheKey);
+		if (memoized !== undefined) return memoized || null;
+		const result = summarizeCode({
+			code,
+			path: codePath,
+			minBodyLines,
+			minCommentLines,
+			unfoldUntilLines,
+			unfoldLimitLines,
+		});
+		const usable = result.parsed && result.elided ? result : false;
+		cache.set(cacheKey, usable);
+		return usable || null;
+	} catch {
+		return null;
+	}
+}
+
 export async function trySummarize(
 	session: ToolSession,
 	absolutePath: string,
@@ -67,30 +104,7 @@ export async function trySummarize(
 			bridgePromise !== undefined
 				? await bridgePromise.catch(() => Bun.file(absolutePath).text())
 				: await Bun.file(absolutePath).text();
-		throwIfAborted(signal);
-		const lineCount = countTextLines(code);
-		if (lineCount > MAX_SUMMARY_LINES) return null;
-		if (lineCount < session.settings.get("read.summarize.minTotalLines")) return null;
-
-		const minBodyLines = session.settings.get("read.summarize.minBodyLines");
-		const minCommentLines = session.settings.get("read.summarize.minCommentLines");
-		const unfoldUntilLines = session.settings.get("read.summarize.unfoldUntil");
-		const unfoldLimitLines = session.settings.get("read.summarize.unfoldLimit");
-		const cache = getSummaryParseCache(session);
-		const cacheKey = `${absolutePath}\0${Bun.hash(code)}\0${minBodyLines},${minCommentLines},${unfoldUntilLines},${unfoldLimitLines}`;
-		const memoized = cache.get(cacheKey);
-		if (memoized !== undefined) return memoized || null;
-		const result = summarizeCode({
-			code,
-			path: absolutePath,
-			minBodyLines,
-			minCommentLines,
-			unfoldUntilLines,
-			unfoldLimitLines,
-		});
-		const usable = result.parsed && result.elided ? result : false;
-		cache.set(cacheKey, usable);
-		return usable || null;
+		return trySummarizeText(session, code, absolutePath, signal);
 	} catch {
 		return null;
 	}
