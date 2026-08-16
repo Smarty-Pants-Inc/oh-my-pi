@@ -202,6 +202,11 @@ describe("BashTool session capabilities", () => {
 					command: "bun test --test-name-pattern 'focused case' --help",
 				}),
 			).toBeDefined();
+			expect(
+				await tool.execute("routine-test-inline-filter", {
+					command: "bun test --test-name-pattern=focused --help",
+				}),
+			).toBeDefined();
 			expect(await tool.execute("routine-run", { command: "bun run test" })).toBeDefined();
 			expect(
 				await tool.execute("routine-git-diff", {
@@ -305,8 +310,16 @@ describe("BashTool session capabilities", () => {
 				"git --work-tree ../outside push",
 				"git --exec-path=/tmp push",
 				"git --namespace=other push",
+				"git push --exec=./payload local-repo",
+				"git push --exec ./payload local-repo",
+				"git push --receive-pack=./payload local-repo",
+				"git push --receive-pack ./payload local-repo",
+				"git push --exec=./payload local-repo && echo never",
 				`PATH=${attacker} git push`,
 				`PATH=${attacker} gh pr create`,
+				`HOME=${attacker} git push`,
+				`XDG_CONFIG_HOME=${attacker} gh pr create`,
+				`EDITOR=${path.join(attacker, "editor")} gh pr create --editor`,
 				`BASH_ENV=${path.join(attacker, "startup")} gh pr create`,
 				`LD_PRELOAD=${path.join(attacker, "loader")} git push`,
 				`env PATH=${attacker} gh pr create`,
@@ -323,6 +336,12 @@ describe("BashTool session capabilities", () => {
 			const effectEnvironments: Array<Record<string, string>> = [
 				{ BASH_ENV: path.join(attacker, "startup") },
 				{ LD_PRELOAD: path.join(attacker, "loader") },
+				{ HOME: attacker },
+				{ XDG_CONFIG_HOME: attacker },
+				{ EDITOR: path.join(attacker, "editor") },
+				{ VISUAL: path.join(attacker, "editor") },
+				{ BROWSER: path.join(attacker, "browser") },
+				{ SSH_ASKPASS: path.join(attacker, "askpass") },
 			];
 			for (const env of effectEnvironments) {
 				await expect(tool.execute("effect-env-override", { command: "gh pr create", env })).rejects.toThrow(
@@ -375,6 +394,9 @@ describe("BashTool session capabilities", () => {
 				"bun test test/*.test.ts",
 				"bun test 'test/*.test.ts'",
 				"bun test test/{one,two}.test.ts",
+				"bun test --test-name-pattern {safe,../outside/escape.test.ts}",
+				"bun test --test-name-pattern={safe,../outside/escape.test.ts}",
+				"bun test --test-name-pattern {safe,../outside/escape.test.ts} && echo never",
 				`bun test --bail ${path.relative(workspace, outsideTest)}`,
 				`bun test --parallel ${path.relative(workspace, outsideTest)}`,
 				`bun test --timeout ${path.relative(workspace, outsideTest)}`,

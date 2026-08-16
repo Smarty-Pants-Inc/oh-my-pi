@@ -381,11 +381,21 @@ function executableEnvironmentOverrideName(name: string): boolean {
 	const normalized = name.toUpperCase();
 	return (
 		normalized === "PATH" ||
+		normalized === "HOME" ||
+		normalized === "XDG_CONFIG_HOME" ||
+		normalized === "XDG_CONFIG_DIRS" ||
 		normalized === "ENV" ||
 		normalized === "BASH_ENV" ||
 		normalized === "ZDOTDIR" ||
+		normalized === "SHELL" ||
 		normalized === "SHELLOPTS" ||
 		normalized === "BASHOPTS" ||
+		normalized === "EDITOR" ||
+		normalized === "VISUAL" ||
+		normalized === "BROWSER" ||
+		normalized === "PAGER" ||
+		normalized === "SSH_ASKPASS" ||
+		normalized === "SSH_ASKPASS_REQUIRE" ||
 		normalized === "NODE_OPTIONS" ||
 		normalized === "BUN_OPTIONS" ||
 		normalized === "LD_PRELOAD" ||
@@ -416,7 +426,16 @@ function commandHasGitPush(tokens: readonly string[], env?: Record<string, strin
 	if (gitIndex === undefined || tokens[gitIndex] !== "git") return false;
 	// A named push grant authorizes the push subcommand, not Git's global
 	// config, repository, cwd, helper, or execution-path overrides.
-	return tokens[gitIndex + 1] === "push";
+	if (tokens[gitIndex + 1] !== "push") return false;
+	return !tokens
+		.slice(gitIndex + 2)
+		.some(
+			arg =>
+				arg === "--exec" ||
+				arg.startsWith("--exec=") ||
+				arg === "--receive-pack" ||
+				arg.startsWith("--receive-pack="),
+		);
 }
 
 function commandHasGithubPrEffect(tokens: readonly string[], env?: Record<string, string>): boolean {
@@ -439,6 +458,10 @@ function isPathContained(root: string, target: string, base = root): boolean {
 	}
 }
 
+function hasUnsafeShellExpansion(value: string): boolean {
+	return /[~*?[\]{}$`]/u.test(value);
+}
+
 function bunTestIsKnownSafe(args: readonly string[], cwd: string): boolean {
 	if (args[0] !== "test") return false;
 	for (let index = 1; index < args.length; index++) {
@@ -454,6 +477,7 @@ function bunTestIsKnownSafe(args: readonly string[], cwd: string): boolean {
 		}
 		if (BASH_SAFE_BUN_TEST_STRING_VALUE_FLAGS.has(arg)) {
 			if (index + 1 >= args.length) return false;
+			if (hasUnsafeShellExpansion(args[index + 1]!)) return false;
 			index++;
 			continue;
 		}
@@ -462,7 +486,7 @@ function bunTestIsKnownSafe(args: readonly string[], cwd: string): boolean {
 			const flag = arg.slice(0, equalsIndex);
 			const value = arg.slice(equalsIndex + 1);
 			if (BASH_SAFE_BUN_TEST_NUMERIC_VALUE_FLAGS.has(flag) && /^\d+$/u.test(value)) continue;
-			if (BASH_SAFE_BUN_TEST_STRING_VALUE_FLAGS.has(flag)) continue;
+			if (BASH_SAFE_BUN_TEST_STRING_VALUE_FLAGS.has(flag) && !hasUnsafeShellExpansion(value)) continue;
 			if (BASH_SAFE_BUN_TEST_ENUM_VALUE_FLAGS.get(flag)?.has(value)) continue;
 		}
 		const enumValues = BASH_SAFE_BUN_TEST_ENUM_VALUE_FLAGS.get(arg);
@@ -473,7 +497,7 @@ function bunTestIsKnownSafe(args: readonly string[], cwd: string): boolean {
 		}
 		if (
 			arg.startsWith("-") ||
-			/[~*?[\]{}$`]/u.test(arg) ||
+			hasUnsafeShellExpansion(arg) ||
 			path.isAbsolute(arg) ||
 			/^(?:[A-Za-z]:[\\/]|\\\\)/u.test(arg) ||
 			/(?:^|[\\/])\.\.(?:[\\/]|$)/u.test(arg) ||
