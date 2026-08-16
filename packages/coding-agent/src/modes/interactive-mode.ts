@@ -668,9 +668,6 @@ export class InteractiveMode implements InteractiveModeContext {
 	#vibeModeOwnerScope: VibeOwnerScope | undefined;
 	#vibeScopeSuspendedForSwitch = false;
 	#goalContinuationTimer: NodeJS.Timeout | undefined;
-	#goalTurnHadToolCalls = false;
-	#goalContinuationTurnInFlight = false;
-	#goalSuppressNextContinuation = false;
 	#planModePreviousModelState: { model: Model; thinkingLevel?: ConfiguredThinkingLevel } | undefined;
 	#pendingModelSwitch: { model: Model; thinkingLevel?: ConfiguredThinkingLevel } | undefined;
 	/** Whether #pendingModelSwitch was queued by the live plan-role reconciler. */
@@ -1491,7 +1488,6 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (!this.session.settings.get("goal.continuationModes").includes("interactive")) return;
 		if (this.planModeEnabled || this.planModePaused) return;
 		if (!this.goalModeEnabled || this.goalModePaused) return;
-		if (this.#goalSuppressNextContinuation) return;
 		if (this.#pendingSubmittedInput) return;
 		const queued = this.session.getQueuedMessages();
 		if (queued.steering.length > 0 || queued.followUp.length > 0) return;
@@ -1502,11 +1498,6 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (!this.session.getActiveToolNames().includes("goal")) return;
 		const prompt = this.session.goalRuntime.buildContinuationPrompt();
 		if (!prompt) return;
-		this.session.recordAutomaticTurnOutcome(
-			"active_goal_continuation",
-			"accepted",
-			"one continuation queued for the idle transition",
-		);
 		this.#goalContinuationTimer = setTimeout(() => {
 			this.#goalContinuationTimer = undefined;
 			const reject = (reason: string): void =>
@@ -1532,13 +1523,6 @@ export class InteractiveMode implements InteractiveModeContext {
 			if (!latestState?.enabled || latestState.goal.status !== "active")
 				return reject("persisted goal is not active");
 			if (!this.session.getActiveToolNames().includes("goal")) return reject("goal tool is not available");
-			if (!this.session.authorizeAutomaticTurn("active_goal_continuation")) return;
-			this.#goalContinuationTurnInFlight = true;
-			this.session.recordAutomaticTurnOutcome(
-				"active_goal_continuation",
-				"started",
-				"typed goal.continuation committed to interactive submission",
-			);
 			this.onInputCallback(
 				this.startPendingSubmission({
 					text: prompt,
@@ -1707,7 +1691,6 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#pendingSubmittedInput = submission;
 		this.#pendingSubmissionPreservesDraft = options?.preserveDraft === true;
 		if (!submission.customType) {
-			this.#resetGoalContinuationSuppression();
 			const imageCount = submission.images?.length ?? 0;
 			this.optimisticUserMessageSignature = `${submission.text}\u0000${imageCount}`;
 			this.#pendingSubmissionDispose = this.recordLocalSubmission(submission.text, imageCount);
@@ -1746,9 +1729,6 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#pendingSubmissionPreservesDraft = false;
 		this.clearOptimisticUserMessage();
 		this.#pendingWorkingMessage = undefined;
-		if (submission.customType === "goal-continuation") {
-			this.#goalContinuationTurnInFlight = false;
-		}
 		if (this.loadingAnimation) {
 			this.#stopLoadingAnimation(true);
 		}
@@ -1786,10 +1766,6 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#pendingSubmissionDispose = undefined;
 			this.#pendingSubmissionPreservesDraft = false;
 		}
-		if (input.customType === "goal-continuation") {
-			this.#goalContinuationTurnInFlight = false;
-		}
-
 		if (wasPendingSubmission && !this.session.isStreaming && !this.streamingComponent) {
 			this.optimisticUserMessageSignature = undefined;
 			pendingSubmissionDispose?.();
@@ -2322,10 +2298,6 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.ui.requestRender();
 	}
 
-	#resetGoalContinuationSuppression(): void {
-		this.#goalSuppressNextContinuation = false;
-	}
-
 	#getPausedGoalState(): GoalModeState | undefined {
 		const state = this.session.getGoalModeState();
 		if (!state?.goal || state.enabled || state.goal.status !== "paused") {
@@ -2336,19 +2308,7 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	async #handleGoalSessionEvent(event: AgentSessionEvent): Promise<void> {
 		if (event.type === "agent_start") {
-			this.#goalTurnHadToolCalls = false;
 			this.#cancelGoalContinuation();
-			return;
-		}
-		if (event.type === "tool_execution_start") {
-			this.#goalTurnHadToolCalls = true;
-			if (!this.#goalContinuationTurnInFlight) {
-				this.#resetGoalContinuationSuppression();
-			}
-			return;
-		}
-		if (event.type === "message_start" && event.message.role === "user" && !event.message.synthetic) {
-			this.#resetGoalContinuationSuppression();
 			return;
 		}
 		if (event.type === "goal_updated") {
@@ -2368,10 +2328,6 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 		if (event.type !== "agent_end") {
 			return;
-		}
-		if (this.#goalContinuationTurnInFlight) {
-			this.#goalSuppressNextContinuation = !this.#goalTurnHadToolCalls;
-			this.#goalContinuationTurnInFlight = false;
 		}
 		if (this.session.getGoalModeState()?.mode === "exiting") {
 			await this.#exitGoalMode({ reason: "completed", silent: true });
@@ -2507,9 +2463,6 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.goalModeEnabled = false;
 			this.goalModePaused = false;
 			this.#goalModePreviousTools = undefined;
-			this.#goalTurnHadToolCalls = false;
-			this.#goalContinuationTurnInFlight = false;
-			this.#goalSuppressNextContinuation = false;
 			this.#cancelGoalContinuation();
 			this.#updateGoalModeStatus();
 		}
@@ -2581,7 +2534,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.goalModePaused = restored?.enabled !== true && restored?.goal.status === "paused";
 			// sdk.ts excludes "goal" from the initial active tool set unconditionally.
 			// Re-add it now so the agent can call resume, complete, or drop on this goal.
-			if (restored?.goal) {
+			if (restored?.goal && (restored.enabled || restored.goal.status === "paused")) {
 				const previousTools = this.session.getEnabledToolNames().filter(name => name !== "goal");
 				this.#goalModePreviousTools = previousTools;
 				await this.session.setActiveToolsByName([...new Set([...previousTools, "goal"])]);
@@ -2806,7 +2759,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.showWarning("Exit vibe mode first.");
 			return;
 		}
-		const previousTools = this.session.getEnabledToolNames().filter(name => name !== "goal");
+		const previousTools = this.session.getEnabledToolNames();
 		const goalTools = [...new Set([...previousTools, "goal"])];
 		this.#goalModePreviousTools = previousTools;
 		this.goalModePaused = false;
@@ -2816,7 +2769,6 @@ export class InteractiveMode implements InteractiveModeContext {
 		await this.session.setActiveToolsByName(goalTools);
 		this.session.setGoalModeState(state);
 		this.goalModeEnabled = true;
-		this.#resetGoalContinuationSuppression();
 		this.#updateGoalModeStatus();
 		if (this.session.isStreaming) {
 			await this.session.sendGoalModeContext({ deliverAs: "steer" });
@@ -2836,10 +2788,17 @@ export class InteractiveMode implements InteractiveModeContext {
 			await this.session.setActiveToolsByName(previousTools);
 		}
 		const currentState = this.session.getGoalModeState();
-		if (options?.reason === "completed") {
-			this.session.setGoalModeState(undefined);
-			this.sessionManager.appendModeChange("none");
+		if (options?.reason === "completed" && currentState) {
+			const terminalState: GoalModeState = {
+				enabled: false,
+				mode: "active",
+				goal: { ...currentState.goal, status: "complete" },
+			};
+			this.session.setGoalModeState(terminalState);
+			this.sessionManager.appendModeChange("goal", { goal: terminalState.goal });
 			this.sessionManager.appendCustomEntry("goal-completed", {
+				id: terminalState.goal.id,
+				status: terminalState.goal.status,
 				objective: currentState?.goal?.objective,
 				tokensUsed: currentState?.goal?.tokensUsed,
 				tokenBudget: currentState?.goal?.tokenBudget,
@@ -2849,7 +2808,6 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.goalModeEnabled = false;
 		this.goalModePaused = options?.paused ?? false;
 		this.#goalModePreviousTools = undefined;
-		this.#goalContinuationTurnInFlight = false;
 		this.#cancelGoalContinuation();
 		this.#updateGoalModeStatus();
 		if (!options?.silent) {
@@ -3511,7 +3469,6 @@ export class InteractiveMode implements InteractiveModeContext {
 			nextBudget = parsed;
 		}
 		await this.session.goalRuntime.onBudgetMutated(nextBudget);
-		this.#resetGoalContinuationSuppression();
 		this.#scheduleGoalContinuation();
 		this.showStatus(nextBudget === undefined ? "Goal budget cleared." : `Goal budget set to ${nextBudget}.`);
 	}
@@ -3754,7 +3711,6 @@ export class InteractiveMode implements InteractiveModeContext {
 		input?: Pick<SubmittedUserInput, "images" | "imageLinks">,
 	): Promise<boolean> {
 		await this.#enterGoalMode({ objective, silent: true });
-		this.#resetGoalContinuationSuppression();
 		if (this.session.isStreaming) {
 			const images = input?.images?.length ? input.images : undefined;
 			await this.withLocalSubmission(
@@ -3779,7 +3735,6 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.session.setGoalModeState(state);
 		this.goalModeEnabled = true;
 		this.goalModePaused = false;
-		this.#resetGoalContinuationSuppression();
 		this.#updateGoalModeStatus();
 		if (this.session.isStreaming) {
 			await this.session.sendGoalModeContext({ deliverAs: "steer" });

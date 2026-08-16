@@ -1,3 +1,5 @@
+import { agentBehavior } from "../context/registry";
+
 export type AutomaticTurnSource =
 	| "direct_user_input"
 	| "loop_mode_autonomous_wake"
@@ -15,12 +17,7 @@ export interface AutomaticTurnOutcome {
 	originTurnId?: string;
 }
 
-const allowedSources = new Set<AutomaticTurnSource>([
-	"direct_user_input",
-	"active_goal_continuation",
-	"active_async_result_wake",
-	"bounded_transport_or_protocol_retry",
-]);
+const allowedSources = new Set<AutomaticTurnSource>(["direct_user_input", ...agentBehavior.automaticTurns.allowed]);
 
 /** Central, inspectable authority ledger for every host-created model turn. */
 export class AutomaticTurnAuthority {

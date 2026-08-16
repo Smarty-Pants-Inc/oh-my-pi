@@ -563,55 +563,120 @@ describe("AgentSession automatic turn authority", () => {
 		]);
 	});
 
-	it("keeps the exact async origin open through recovery while denying its hostile grant", async () => {
+	it("persists async completion after the terminal final without starting semantic work", async () => {
 		const firstResponse = Promise.withResolvers<void>();
 		const { session, capabilities, manager, grantAttempts, grantDenials, modelCalls } = await createHarness(
 			[done("initial done"), grantCall("hostile.async", "grant-async"), done()],
 			{ async: true, gatedFirstResponse: firstResponse.promise },
 		);
 		if (!manager) throw new Error("Expected async manager");
-		const agentEnded = Promise.withResolvers<void>();
-		session.agent.subscribe(event => {
-			if (event.type === "agent_end") agentEnded.resolve();
-		});
-		let originTurnId: string | undefined;
-		const recoveryDelivery = (async () => {
-			await agentEnded.promise;
-			await session.agent.waitForIdle();
-			manager.register("task", "authority probe", async () => "ASYNC AUTHORITY RESULT", {
-				id: "authority-job",
-				ownerId: "AuthorityProbe",
-				originTurnId,
-			});
-			await manager.waitForOwnerJobs("AuthorityProbe");
-			await manager.drainDeliveries({ filter: { ownerId: "AuthorityProbe" } });
-			expect(session.yieldQueue.has("async-result")).toBe(true);
-			await session.yieldQueue.flush("idle");
-		})();
-		session.trackPostPromptTaskForTests(recoveryDelivery);
 		const prompt = session.prompt("open an async origin");
 		while (modelCalls() === 0) await Bun.sleep(1);
-		originTurnId = session.getCurrentTurnId();
+		const originTurnId = session.getCurrentTurnId();
 		expect(originTurnId).toMatch(/^turn-/);
 		firstResponse.resolve();
 
 		await prompt;
-		await recoveryDelivery;
+		expect(session.getCurrentTurnId()).toBeUndefined();
+		manager.register("task", "authority probe", async () => "ASYNC AUTHORITY RESULT", {
+			id: "authority-job",
+			ownerId: "AuthorityProbe",
+			originTurnId,
+		});
+		await manager.waitForOwnerJobs("AuthorityProbe");
+		await manager.drainDeliveries({ filter: { ownerId: "AuthorityProbe" } });
+		await session.waitForIdle();
 
-		expect(grantAttempts).toEqual(["hostile.async"]);
-		expect(grantDenials).toEqual(["hostile.async"]);
+		expect(modelCalls()).toBe(1);
+		expect(grantAttempts).toEqual([]);
+		expect(grantDenials).toEqual([]);
 		expect(capabilities.grantProvenance).toEqual([]);
-		expect(session.getAutomaticTurnOutcomes()).toEqual([
-			expect.objectContaining({
-				source: "active_async_result_wake",
-				status: "accepted",
-				originTurnId,
-			}),
-			expect.objectContaining({
-				source: "active_async_result_wake",
-				status: "started",
-				originTurnId,
-			}),
-		]);
+		expect(session.getAutomaticTurnOutcomes()).toEqual([]);
+		expect(session.messages.some(message => JSON.stringify(message).includes("ASYNC AUTHORITY RESULT"))).toBe(true);
+	});
+
+	it("records a pre-dispatch goal continuation failure without a false start", async () => {
+		const { session } = await createHarness([]);
+		session.setGoalModeState({
+			enabled: true,
+			mode: "active",
+			goal: {
+				id: "goal-pre-dispatch",
+				objective: "Prove accurate dispatch accounting",
+				status: "active",
+				tokensUsed: 0,
+				timeUsedSeconds: 0,
+				createdAt: Date.now(),
+				updatedAt: Date.now(),
+			},
+		});
+		const failure = new Error("pre-dispatch failure");
+		const prompt = session.agent.prompt.bind(session.agent);
+		session.agent.prompt = async () => {
+			throw failure;
+		};
+		try {
+			await expect(
+				session.promptCustomMessage({
+					customType: "goal-continuation",
+					content: "Continue the active goal.",
+					display: false,
+					attribution: "agent",
+				}),
+			).rejects.toThrow("pre-dispatch failure");
+		} finally {
+			session.agent.prompt = prompt;
+		}
+
+		const outcomes = session
+			.getAutomaticTurnOutcomes()
+			.filter(outcome => outcome.source === "active_goal_continuation");
+		expect(outcomes.map(outcome => outcome.status)).toEqual(["accepted", "failed"]);
+	});
+
+	it("defers goal continuation when direct user input is queued at provider dispatch", async () => {
+		const { session, modelCalls } = await createHarness([done()]);
+		session.setGoalModeState({
+			enabled: true,
+			mode: "active",
+			goal: {
+				id: "goal-user-precedence",
+				objective: "Preserve direct user precedence",
+				status: "active",
+				tokensUsed: 0,
+				timeUsedSeconds: 0,
+				createdAt: Date.now(),
+				updatedAt: Date.now(),
+			},
+		});
+		session.agent.followUp({
+			role: "user",
+			content: "direct user input wins",
+			attribution: "user",
+			timestamp: Date.now(),
+		});
+
+		await session.promptCustomMessage({
+			customType: "goal-continuation",
+			content: "Continue the active goal.",
+			display: false,
+			attribution: "agent",
+		});
+		await session.waitForIdle();
+
+		expect(modelCalls()).toBe(1);
+		expect(session.agent.peekFollowUpQueue()).toEqual([]);
+		expect(
+			session
+				.getAutomaticTurnOutcomes()
+				.filter(outcome => outcome.source === "active_goal_continuation")
+				.map(outcome => outcome.status),
+		).toEqual(["deferred"]);
+		expect(
+			session
+				.getAutomaticTurnOutcomes()
+				.filter(outcome => outcome.source === "direct_user_input")
+				.map(outcome => outcome.status),
+		).toEqual(["accepted", "started"]);
 	});
 });

@@ -1463,7 +1463,7 @@ export class SessionTools {
 	 * after side-effecting changes; see the memory hooks and {@link syncAfterModelChange}.
 	 *
 	 * The calendar date is deliberately NOT part of the signature: the date/cwd
-	 * reminder rides on the first user turn at request time (`date-cwd-reminder`),
+	 * reminder is added as typed internal context at request time (`date-cwd-reminder`),
 	 * so a session spanning midnight must NOT rebuild a prompt that no longer
 	 * embeds the date — the reminder picks up the new day on its own.
 	 */

@@ -40,8 +40,8 @@ describe("SYSTEM.md prompt assembly", () => {
 	afterEach(cleanupTempHome(() => ({ tempDir, tempHomeDir, originalHome })));
 
 	it("keeps per-request date/cwd out of the system prompt footer", async () => {
-		// The date/cwd line was moved out of the system prompt and onto the first
-		// user turn (#7404): any byte that changes per request at the tail of the
+		// The date/cwd line was moved out of the system prompt into typed per-request
+		// internal context: any byte that changes per request at the tail of the
 		// system block invalidates the tool-schema prefix cache on open-weight
 		// providers. The footer must not interpolate the cwd or the date.
 		const projectDir = path.join(os.homedir(), "project");

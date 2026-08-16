@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import type { Api, Context, Message, Model, ModelSpec } from "@oh-my-pi/pi-ai";
+import type { Api, Context, Model, ModelSpec } from "@oh-my-pi/pi-ai";
 import { clearCustomApis, registerCustomApi } from "@oh-my-pi/pi-ai";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
@@ -7,11 +7,7 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import {
-	injectDateCwdReminder,
-	renderDateCwdReminder,
-	withDateCwdReminder,
-} from "@oh-my-pi/pi-coding-agent/session/date-cwd-reminder";
+import { renderDateCwdReminder } from "@oh-my-pi/pi-coding-agent/session/date-cwd-reminder";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { formatLocalCalendarDate } from "@oh-my-pi/pi-coding-agent/utils/local-date";
 import { normalizePromptPath } from "@oh-my-pi/pi-coding-agent/utils/prompt-path";
@@ -34,98 +30,6 @@ describe("date-cwd-reminder", () => {
 			expect(reminder).toContain("Do not repeat");
 		});
 	});
-
-	describe("injectDateCwdReminder", () => {
-		it("prepends the reminder to the first user message with string content without mutating the input", () => {
-			const messages: Message[] = [{ role: "user", content: "hello", timestamp: 1 }, createAssistantMessage("hi")];
-			const original = [...messages];
-
-			const out = injectDateCwdReminder(messages, "<system-reminder>x</system-reminder>");
-
-			expect(out).not.toBe(messages);
-			expect(out[0]).toEqual({
-				role: "user",
-				content: "<system-reminder>x</system-reminder>\n\nhello",
-				timestamp: 1,
-			});
-			expect(out[1]).toBe(messages[1]);
-			expect(messages).toEqual(original);
-		});
-
-		it("prepends a text part before image parts when the first user message has array content", () => {
-			const messages: Message[] = [
-				{
-					role: "user",
-					content: [{ type: "image", data: "img", mimeType: "image/png" }],
-					timestamp: 1,
-				},
-			];
-
-			const out = injectDateCwdReminder(messages, "<system-reminder>x</system-reminder>");
-
-			expect(out[0]?.content).toEqual([
-				{ type: "text", text: "<system-reminder>x</system-reminder>" },
-				{ type: "image", data: "img", mimeType: "image/png" },
-			]);
-		});
-
-		it("returns the input unchanged when there is no user message", () => {
-			const messages: Message[] = [createAssistantMessage("hi")];
-
-			expect(injectDateCwdReminder(messages, "<system-reminder>x</system-reminder>")).toBe(messages);
-			expect(injectDateCwdReminder([], "<system-reminder>x</system-reminder>")).toEqual([]);
-		});
-
-		it("reuses the same injected message object for the same pristine first user message and reminder", () => {
-			// The append-only context path hands back fresh array copies every turn
-			// but reuses the same message objects; the injected first-turn message
-			// must keep its identity so the stable prefix is preserved (and the
-			// provider prompt cache is not churned by fresh clones).
-			const pristine: Message = { role: "user", content: "first", timestamp: 1 };
-			const reminder = "<system-reminder>x</system-reminder>";
-
-			const first = injectDateCwdReminder([pristine], reminder)[0]!;
-			const second = injectDateCwdReminder([pristine], reminder)[0]!;
-			expect(second).toBe(first);
-
-			// A changed reminder (e.g. midnight rollover) must re-inject fresh.
-			const refreshed = injectDateCwdReminder([pristine], "<system-reminder>y</system-reminder>")[0]!;
-			expect(refreshed).not.toBe(first);
-			expect(refreshed.content).toContain("y");
-		});
-
-		it("does not double-wrap when the first user message already carries the reminder", () => {
-			const reminder = "<system-reminder>x</system-reminder>";
-			const messages: Message[] = [{ role: "user", content: `${reminder}\n\nfirst`, timestamp: 1 }];
-
-			expect(injectDateCwdReminder(messages, reminder)).toBe(messages);
-		});
-	});
-
-	describe("withDateCwdReminder", () => {
-		it("leaves NULL_PROMPT-style contexts (empty system prompt) untouched", () => {
-			const context: Context = { systemPrompt: [], messages: [{ role: "user", content: "hi", timestamp: 1 }] };
-			expect(withDateCwdReminder(context, "2026-08-14", "/cwd")).toBe(context);
-		});
-
-		it("injects the reminder into the first user message and keeps the system prompt bytes", () => {
-			const systemPrompt = ["PROJECT\n<critical>\n- Must act.\n</critical>"];
-			const context: Context = {
-				systemPrompt,
-				messages: [{ role: "user", content: "do the thing", timestamp: 1 }],
-			};
-
-			const out = withDateCwdReminder(context, "2026-08-14", "/work/omp");
-
-			expect(out).not.toBe(context);
-			expect(out.systemPrompt).toBe(systemPrompt);
-			expect(out.messages[0]).toEqual({
-				role: "user",
-				content: `${renderDateCwdReminder("2026-08-14", "/work/omp")}\n\ndo the thing`,
-				timestamp: 1,
-			});
-		});
-	});
 });
 
 describe("date-cwd reminder on the provider wire", () => {
@@ -138,7 +42,7 @@ describe("date-cwd reminder on the provider wire", () => {
 		}
 	});
 
-	it("keeps the date/cwd out of the system prompt and pins the reminder to the first user turn across requests", async () => {
+	it("keeps direct-user authority distinct and emits a registered internal-context instruction", async () => {
 		using tempDir = TempDir.createSync("@pi-date-cwd-reminder-");
 		const api = "test-date-cwd-reminder";
 		const contexts: Context[] = [];
@@ -202,20 +106,34 @@ describe("date-cwd reminder on the provider wire", () => {
 
 			const firstUser = contexts[0]!.messages[0]!;
 			expect(firstUser.role).toBe("user");
-			const firstText =
-				typeof firstUser.content === "string" ? firstUser.content : JSON.stringify(firstUser.content);
-			expect(firstText).toContain("<system-reminder>");
-			expect(firstText).toContain(formatLocalCalendarDate());
-			expect(firstText).toContain(normalizePromptPath(tempDir.path()));
+			const firstUserText =
+				typeof firstUser.content === "string"
+					? firstUser.content
+					: firstUser.content
+							.map(part => (part.type === "text" && "text" in part ? part.text : ""))
+							.filter(Boolean)
+							.join("\n");
+			expect(firstUserText).toBe("first");
+			const firstReminder = contexts[0]!.instructions?.find(
+				instruction => instruction.id === "system.date-cwd-reminder",
+			);
+			expect(firstReminder?.role).toBe("internal_context");
+			expect(firstReminder?.trigger).toBe("provider_request");
+			expect(firstReminder?.renderedText).toContain("<system-reminder>");
+			expect(firstReminder?.renderedText).toContain(formatLocalCalendarDate());
+			expect(firstReminder?.renderedText).toContain(normalizePromptPath(tempDir.path()));
 
-			// A second request must re-emit byte-identical reminder bytes so the
-			// conversation prefix (system + tools + first turn) stays cached.
+			// A second request re-renders the same transient instruction without
+			// rewriting the direct-user transcript.
 			await session.sendUserMessage("second");
 			expect(contexts).toHaveLength(2);
 			const secondFirst = contexts[1]!.messages[0]!;
 			expect(secondFirst.role).toBe("user");
-			expect(typeof secondFirst.content).toBe(typeof firstUser.content);
 			expect(secondFirst.content).toEqual(firstUser.content);
+			const secondReminder = contexts[1]!.instructions?.find(
+				instruction => instruction.id === "system.date-cwd-reminder",
+			);
+			expect(secondReminder?.renderedText).toBe(firstReminder?.renderedText);
 		} finally {
 			authStorage.close();
 		}

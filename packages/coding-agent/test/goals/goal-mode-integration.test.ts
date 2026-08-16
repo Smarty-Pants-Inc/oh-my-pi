@@ -4,6 +4,7 @@ import { Agent } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { parseGoalModeState } from "@oh-my-pi/pi-coding-agent/goals/state";
 import { GoalTool } from "@oh-my-pi/pi-coding-agent/goals/tools/goal-tool";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
@@ -479,6 +480,35 @@ describe("InteractiveMode goal mode integration", () => {
 		expect(content).toContain("Run focused checks");
 	});
 
+	it("continues an active goal after text-only settles with empty or fully closed todos", async () => {
+		await harness.mode.handleGoalModeCommand("Ship the release");
+
+		for (const phases of [
+			[],
+			[{ name: "Done", tasks: [{ content: "Closed task", status: "completed" as const }] }],
+		] satisfies TodoPhase[][]) {
+			harness.session.setTodoPhases(phases);
+			const waiter = await armInputWaiter(harness.mode);
+			// Cancel the initially armed idle timer, then reproduce a tool-less run
+			// boundary. The terminal event must arm a fresh continuation from persisted
+			// goal state, independent of todo contents or prior tool calls.
+			harness.session.agent.emitExternalEvent({ type: "agent_start" });
+			const ended = Promise.withResolvers<void>();
+			const unsubscribe = harness.session.subscribe(event => {
+				if (event.type === "agent_end" && event.isTerminal === true) ended.resolve();
+			});
+			harness.session.agent.emitExternalEvent({ type: "agent_end", messages: [] });
+			await ended.promise;
+			unsubscribe();
+			await waiter.inputPromise;
+			const input = waiter.getResolvedInput();
+			expect(input).toMatchObject({ customType: "goal-continuation" });
+			if (!input) throw new Error("Expected goal continuation input");
+			expect(harness.mode.markPendingSubmissionStarted(input)).toBe(true);
+			harness.mode.finishPendingSubmission(input);
+		}
+	});
+
 	it("drops a goal continuation tick while the agent is streaming", async () => {
 		// Repro for the race the streaming guard on /goal set X exposed: the
 		// 800ms continuation timer armed by getUserInput() can outlive the idle
@@ -606,7 +636,9 @@ describe("InteractiveMode goal mode integration", () => {
 	it("returns the completion report from the goal tool and exits goal mode before the next turn rebuild", async () => {
 		await harness.mode.handleGoalModeCommand("Ship the release");
 		await harness.mode.handleGoalModeCommand("budget 50");
+		const goalId = harness.session.getGoalModeState()?.goal.id;
 		const appendCustomEntry = vi.spyOn(harness.session.sessionManager, "appendCustomEntry");
+		const appendModeChange = vi.spyOn(harness.session.sessionManager, "appendModeChange");
 		const goalTool = (await createTools(harness.toolSession, harness.session.getActiveToolNames())).find(
 			tool => tool.name === "goal",
 		);
@@ -622,31 +654,49 @@ describe("InteractiveMode goal mode integration", () => {
 		);
 		expect(completionText).toContain("Goal achieved. Report final budget usage to the user: tokens used: 0 of 50.");
 		expect(harness.session.getGoalModeState()?.mode).toBe("exiting");
-		// Per fix #1: completeGoalFromTool clears state.enabled so subsequent createTools
-		// calls (e.g. mid-turn refreshes) no longer advertise the goal tool. The model's
-		// existing toolset for the in-flight turn is unaffected — what we care about here
-		// is that the next createTools observation reflects the deactivation.
+		// The in-flight tool result first marks the state as exiting. The interactive
+		// boundary then persists one inert terminal state for restart/history fidelity.
 		expect(harness.session.getGoalModeState()?.enabled).toBe(false);
 		expect(await toolNamesFor(harness)).not.toContain("goal");
 
 		const nextTurn = harness.mode.getUserInput();
-		// getUserInput observes mode === "exiting" and awaits #exitGoalMode before
-		// arming onInputCallback. Drain microtasks until that side-effect lands.
-		for (let i = 0; i < 100 && harness.session.getGoalModeState() !== undefined; i++) {
+		for (let i = 0; i < 100 && harness.session.getGoalModeState()?.mode === "exiting"; i++) {
 			await Bun.sleep(0);
 		}
 		expect(harness.mode.goalModeEnabled).toBe(false);
 		expect(harness.mode.goalModePaused).toBe(false);
-		expect(harness.session.getGoalModeState()).toBeUndefined();
+		expect(harness.session.getGoalModeState()).toMatchObject({
+			enabled: false,
+			mode: "active",
+			goal: { id: goalId, objective: "Ship the release", status: "complete", tokenBudget: 50 },
+		});
 		expect(await toolNamesFor(harness)).toContain("goal");
+		expect(appendModeChange).toHaveBeenCalledWith(
+			"goal",
+			expect.objectContaining({ goal: expect.objectContaining({ id: goalId, status: "complete" }) }),
+		);
 		expect(appendCustomEntry).toHaveBeenCalledWith(
 			"goal-completed",
 			expect.objectContaining({
+				id: goalId,
+				status: "complete",
 				objective: "Ship the release",
 				tokenBudget: 50,
 				tokensUsed: 0,
 			}),
 		);
+
+		await harness.session.sessionManager.ensureOnDisk();
+		await harness.session.sessionManager.flush();
+		const sessionFile = harness.session.sessionManager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected persisted goal session");
+		const reopened = await SessionManager.open(sessionFile, harness.tempDir.path());
+		try {
+			const context = reopened.buildSessionContext();
+			expect(parseGoalModeState(context.mode, context.modeData)).toEqual(harness.session.getGoalModeState());
+		} finally {
+			await reopened.close();
+		}
 
 		harness.mode.onInputCallback?.(harness.mode.startPendingSubmission({ text: "next turn" }));
 		await nextTurn;

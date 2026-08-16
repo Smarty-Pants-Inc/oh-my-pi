@@ -51,11 +51,11 @@ describe("persisted goal state", () => {
 		expect(parseGoalModeState("goal_paused", { goal: persistedGoal("active") })).toBeUndefined();
 	});
 
-	it("restores completed state as exiting so it cannot continue", () => {
+	it("restores completed state as inert without erasing its terminal record", () => {
 		expect(parseGoalModeState("goal", { goal: persistedGoal("complete") })).toMatchObject({
 			enabled: false,
-			mode: "exiting",
-			reason: "completed",
+			mode: "active",
+			reason: undefined,
 			goal: { status: "complete" },
 		});
 	});

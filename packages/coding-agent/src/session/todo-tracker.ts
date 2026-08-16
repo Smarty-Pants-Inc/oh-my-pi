@@ -2,6 +2,7 @@ import type { Agent, AgentMessage, AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Model, ToolChoice } from "@oh-my-pi/pi-ai";
 import { isRecord, logger, prompt, stringProperty } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
+import { agentBehavior } from "../context/registry";
 import eagerTaskPrompt from "../prompts/system/eager-task.md" with { type: "text" };
 import eagerTodoPrompt from "../prompts/system/eager-todo.md" with { type: "text" };
 import passiveTodoSnapshotPrompt from "../prompts/todos/current.md" with { type: "text" };
@@ -9,6 +10,8 @@ import { getLatestTodoPhasesFromEntries, isTodoPhase, type TodoPhase } from "../
 import { buildNamedToolChoice } from "../utils/tool-choice";
 import type { AgentSessionEvent } from "./agent-session-events";
 import type { SessionManager } from "./session-manager";
+
+const PASSIVE_TODO_STATUSES = new Set<string>(agentBehavior.todo.contextItems);
 
 export interface PassiveTodoSnapshot {
 	semanticRole: "internal_context";
@@ -38,7 +41,7 @@ export function renderPassiveTodoSnapshot(phases: TodoPhase[]): PassiveTodoSnaps
 		.map(phase => ({
 			name: snapshotText(phase.name),
 			tasks: phase.tasks
-				.filter(task => task.status === "pending" || task.status === "in_progress" || task.status === "blocked")
+				.filter(task => PASSIVE_TODO_STATUSES.has(task.status))
 				.map(task =>
 					task.blocker === undefined
 						? { content: snapshotText(task.content), status: task.status }

@@ -180,7 +180,6 @@ import { type PlanApprovalDetails, resolveApprovedPlan } from "../plan-mode/appr
 import { listPlanFiles, readPlanFile } from "../plan-mode/plan-files";
 import type { PlanModeState } from "../plan-mode/state";
 import autoContinuePrompt from "../prompts/system/auto-continue.md" with { type: "text" };
-import checkpointActiveNoticeTemplate from "../prompts/system/checkpoint-active-notice.md" with { type: "text" };
 import interruptedThinkingTemplate from "../prompts/system/interrupted-thinking.md" with { type: "text" };
 import planModeActivePrompt from "../prompts/system/plan-mode-active.md" with { type: "text" };
 import planModeReferencePrompt from "../prompts/system/plan-mode-reference.md" with { type: "text" };
@@ -312,7 +311,6 @@ import {
 import {
 	type BashExecutionMessage,
 	buildReplanTitleContext,
-	CHECKPOINT_ACTIVE_REMINDER_TYPE,
 	type CustomMessage,
 	type CustomMessagePayload,
 	convertToLlm,
@@ -769,13 +767,14 @@ export class AgentSession {
 	// Cursor exec, TUI listeners) is held back. Without this, a client that resumes
 	// on `agent_end` can fire its next `prompt` before #promptWithMessage's finally
 	#promptGeneration = 0;
-	#pendingAgentEndEmit: AgentSessionEvent | undefined;
+	#pendingAgentEndEmit: { event: AgentSessionEvent; closeTurnId?: string } | undefined;
 	#inFlightBeforeAgentEndCallbacks: Array<() => void | Promise<void>> = [];
 	#inFlightSettledCallbacks: Array<() => void | Promise<void>> = [];
 	#inFlightSettling = false;
 	#ircWakeTasks = new Set<Promise<void>>();
 	#sessionStopHookActive = false;
 	readonly #automaticTurns = new AutomaticTurnAuthority();
+	#pendingAutomaticTurnStart: { source: AutomaticTurnSource; originTurnId?: string } | undefined;
 	readonly #capabilities: SessionCapabilities | undefined;
 	#currentTurnId: string | undefined;
 	#pendingAskReanswerOwner: ToolResultMessage | undefined;
@@ -1025,7 +1024,8 @@ export class AgentSession {
 		const pending = this.#pendingAgentEndEmit;
 		if (!pending) return;
 		this.#pendingAgentEndEmit = undefined;
-		this.#emit(pending);
+		this.#closeTurn(pending.closeTurnId);
+		this.#emit(pending.event);
 	}
 
 	/**
@@ -2823,7 +2823,10 @@ export class AgentSession {
 	 */
 	#subscriberEmitGate: Promise<void> = Promise.resolve();
 
-	async #emitSessionEvent(event: AgentSessionEvent, options: { detachExtensions?: boolean } = {}): Promise<void> {
+	async #emitSessionEvent(
+		event: AgentSessionEvent,
+		options: { detachExtensions?: boolean; closeTurnId?: string } = {},
+	): Promise<void> {
 		if (event.type === "message_update") {
 			this.#emit(event);
 			void this.#queueExtensionEvent(event);
@@ -2857,9 +2860,10 @@ export class AgentSession {
 			// supersedes the pending one, which is what subscribers want — they only
 			// care about the final settle.
 			if (event.type === "agent_end" && this.#promptInFlightCount > 0) {
-				this.#pendingAgentEndEmit = event;
+				this.#pendingAgentEndEmit = { event, closeTurnId: options.closeTurnId };
 				return;
 			}
+			if (event.type === "agent_end") this.#closeTurn(options.closeTurnId);
 			this.#emit(event);
 		} finally {
 			releaseGate();
@@ -3111,32 +3115,21 @@ export class AgentSession {
 		}
 	}
 
-	/**
-	 * Builds the transient checkpoint-active reminder for a successful
-	 * checkpoint tool result, or undefined otherwise. The reminder is queued as
-	 * steering synchronously in the message_end handler (before any await), so
-	 * the agent loop folds it into the next provider call and persists it through
-	 * its normal custom-message event. Because the entry sits after the checkpoint
-	 * entry, the rewind branch cut drops it from the active path.
-	 */
-	#checkpointActiveReminderFor(
-		message: AgentMessage,
-	): CustomMessage<{ goal?: string; startedAt?: string }> | undefined {
-		if (message.role !== "toolResult" || message.isError) return undefined;
+	/** Activate checkpoint state before the next provider request. */
+	#activateCheckpointFor(message: AgentMessage): boolean {
+		if (message.role !== "toolResult" || message.isError) return false;
 		const semanticResult = semanticToolResult(message.toolName, message);
-		if (semanticResult?.toolName !== "checkpoint") return undefined;
+		if (semanticResult?.toolName !== "checkpoint") return false;
 		const details = isRecord(semanticResult.details) ? semanticResult.details : undefined;
-		const goal = details ? stringProperty(details, "goal") : undefined;
 		const startedAt = details ? stringProperty(details, "startedAt") : undefined;
-		return {
-			role: "custom",
-			customType: CHECKPOINT_ACTIVE_REMINDER_TYPE,
-			content: prompt.render(checkpointActiveNoticeTemplate),
-			display: false,
-			details: { goal, startedAt },
-			attribution: "agent",
-			timestamp: Date.now(),
+		this.#checkpointState = {
+			checkpointMessageCount: this.agent.state.messages.length,
+			checkpointEntryId: null,
+			startedAt: startedAt ?? new Date().toISOString(),
 		};
+		this.#pendingRewindReport = undefined;
+		this.#lastCompletedRewind = undefined;
+		return true;
 	}
 
 	async #persistMessageEnd(message: AgentMessage): Promise<void> {
@@ -3250,6 +3243,7 @@ export class AgentSession {
 		// A fresh run supersedes the previously settled (and pruned) refusal
 		// turn: state-based lookups take over again.
 		if (event.type === "agent_start") {
+			this.#recordAutomaticTurnStarted();
 			this.#prunedTerminalRefusal = undefined;
 			this.#emitRunState("running");
 		}
@@ -3331,33 +3325,8 @@ export class AgentSession {
 			this.agent.appendMessage(interruptedThinkingMessage);
 		}
 
-		// message_end listeners are fire-and-forget, and the agent loop runs against
-		// a context cloned at prompt start. Appending only to agent.state would not
-		// reach the next provider call in this tool loop. Queue the reminder as
-		// steering before any await so the loop drains it at the next step boundary;
-		// its normal custom-message event persists it after the checkpoint entry,
-		// allowing the rewind branch cut to drop it from the active path.
-		const checkpointReminder =
-			event.type === "message_end" && event.message.role === "toolResult"
-				? this.#checkpointActiveReminderFor(event.message)
-				: undefined;
-		if (checkpointReminder) {
-			// Set #checkpointState synchronously too: the reminder is now visible to
-			// the very next provider call, so a model that immediately calls `rewind`
-			// must find an active checkpoint in RewindTool.execute(). The entry id is
-			// backfilled post-await (see the toolResult handler) once the checkpoint
-			// toolResult entry is persisted; #applyRewind runs on a later rewind turn,
-			// never before that backfill.
-			this.#checkpointState = {
-				checkpointMessageCount: this.agent.state.messages.length,
-				checkpointEntryId: null,
-				startedAt:
-					(checkpointReminder.details && stringProperty(checkpointReminder.details, "startedAt")) ??
-					new Date().toISOString(),
-			};
-			this.#pendingRewindReport = undefined;
-			this.#lastCompletedRewind = undefined;
-			this.agent.steer(checkpointReminder);
+		if (event.type === "message_end" && event.message.role === "toolResult") {
+			this.#activateCheckpointFor(event.message);
 		}
 
 		const messageEndPersistence =
@@ -3569,9 +3538,8 @@ export class AgentSession {
 					// Backfill the checkpoint entry id now that the toolResult entry is
 					// persisted. #checkpointState was set synchronously pre-await (with a
 					// null entry id) so an immediate `rewind` still finds an active
-					// checkpoint; locate the toolResult's own entry by identity since the
-					// transient reminder entry follows it (last-entry would branch-cut the
-					// reminder instead of leaving it on the active path).
+					// checkpoint; locate the toolResult's own entry by identity rather
+					// than assuming it remains the transcript tail.
 					const entries = this.sessionManager.getEntries();
 					let checkpointEntryId: string | null = null;
 					for (let i = entries.length - 1; i >= 0; i--) {
@@ -3598,6 +3566,7 @@ export class AgentSession {
 
 		// Check auto-retry and auto-compaction after agent completes
 		if (event.type === "agent_end") {
+			const settledTurnId = this.#currentTurnId;
 			this.#capabilities?.endTurn(this.#currentTurnId);
 			const settledMessages = event.messages;
 			const activeMessages = this.agent.state.messages;
@@ -3609,7 +3578,10 @@ export class AgentSession {
 				// Public agent_end is held out of the eager display pass and emitted
 				// here after maintenance routing, tagged isTerminal so subscribers can
 				// tell final settles from scheduled continuations.
-				await this.#emitSessionEvent({ ...event, isTerminal: !options?.willContinue });
+				await this.#emitSessionEvent(
+					{ ...event, isTerminal: !options?.willContinue },
+					options?.willContinue === true ? undefined : { closeTurnId: settledTurnId },
+				);
 				void this.#emitAgentEndNotification([...activeMessages], options).catch(err => {
 					logger.error("Agent end extension notification failed", { err });
 				});
@@ -3882,10 +3854,6 @@ export class AgentSession {
 				return;
 			}
 			if (msg.stopReason !== "error") {
-				if (this.#enforceRewindBeforeYield()) {
-					await emitAgentEndNotification({ willContinue: true });
-					return;
-				}
 				const planModeContinuationScheduled = await this.#enforcePlanModeDecisionAtSettle();
 				if (planModeContinuationScheduled) {
 					await emitAgentEndNotification({ willContinue: true });
@@ -4004,7 +3972,7 @@ export class AgentSession {
 			);
 			throw new Error("Automatic turn denied because its asynchronous origin closed");
 		}
-		this.#automaticTurns.record(options.authority, "started", "provider dispatch committed", options.originTurnId);
+		this.#armAutomaticTurnStart(options.authority, options.originTurnId);
 		try {
 			if (this.#capabilities) {
 				await this.#capabilities.withContinuationAuthority(options.authority, options.originTurnId, () =>
@@ -4014,12 +3982,7 @@ export class AgentSession {
 				await this.agent.prompt(messages);
 			}
 		} catch (error) {
-			this.#automaticTurns.record(
-				options.authority,
-				"failed",
-				error instanceof Error ? error.message : String(error),
-				options.originTurnId,
-			);
+			this.#recordAutomaticTurnFailed(options.authority, error, options.originTurnId);
 			throw error;
 		}
 	}
@@ -4113,6 +4076,7 @@ export class AgentSession {
 		this.#schedulePostPromptTask(
 			async signal => {
 				let directTurnId: string | undefined;
+				let continuationTurnId: string | undefined;
 				let directUserOwner: AgentMessage | undefined;
 				let restoreDirectUserQueues: (() => void) | undefined;
 				let inFlight = false;
@@ -4153,7 +4117,7 @@ export class AgentSession {
 						if (!directUserOwner) throw new Error("Direct-user continuation owner missing after isolation");
 						this.#capabilities?.beginDirectUserTurn(directTurnId, queueChipText(directUserOwner));
 					}
-					const continuationTurnId = directTurnId ?? options.originTurnId ?? this.#currentTurnId;
+					continuationTurnId = directTurnId ?? options.originTurnId ?? this.#currentTurnId;
 					this.#beginInFlight();
 					inFlight = true;
 					const reverted = await this.#recovery.maybeRestoreRetryFallbackPrimary();
@@ -4179,12 +4143,7 @@ export class AgentSession {
 							return;
 						}
 					}
-					this.#automaticTurns.record(
-						options.authority,
-						"started",
-						"provider dispatch committed",
-						continuationTurnId,
-					);
+					this.#armAutomaticTurnStart(options.authority, continuationTurnId);
 					if (this.#capabilities) {
 						await this.#capabilities.withContinuationAuthority(options.authority, continuationTurnId, () =>
 							this.agent.continue(signal),
@@ -4192,12 +4151,10 @@ export class AgentSession {
 					} else {
 						await this.agent.continue(signal);
 					}
+					await this.#drainInFlightEventHandlers();
 				} catch (error) {
-					this.#automaticTurns.record(
-						options.authority,
-						"failed",
-						error instanceof Error ? error.message : String(error),
-					);
+					this.#recordAutomaticTurnFailed(options.authority, error, continuationTurnId);
+					if (directTurnId) this.#closeTurn(directTurnId);
 					logger.warn("agent.continue failed after scheduling", {
 						error: error instanceof Error ? error.message : String(error),
 						stack: error instanceof Error ? error.stack : undefined,
@@ -4208,7 +4165,6 @@ export class AgentSession {
 					try {
 						restoreDirectUserQueues?.();
 					} finally {
-						if (directTurnId && this.#currentTurnId === directTurnId) this.#closeCurrentTurn();
 						if (inFlight) this.#endInFlight();
 					}
 				}
@@ -4235,6 +4191,35 @@ export class AgentSession {
 
 	getAutomaticTurnOutcomes(): readonly AutomaticTurnOutcome[] {
 		return this.#automaticTurns.outcomes();
+	}
+
+	#armAutomaticTurnStart(source: AutomaticTurnSource, originTurnId?: string): void {
+		if (this.#pendingAutomaticTurnStart) {
+			throw new Error(`Automatic turn start already pending for ${this.#pendingAutomaticTurnStart.source}`);
+		}
+		this.#pendingAutomaticTurnStart = { source, ...(originTurnId ? { originTurnId } : {}) };
+	}
+
+	#recordAutomaticTurnStarted(): void {
+		const pending = this.#pendingAutomaticTurnStart;
+		if (!pending) return;
+		this.#pendingAutomaticTurnStart = undefined;
+		this.#automaticTurns.record(
+			pending.source,
+			"started",
+			"agent_start confirmed provider dispatch",
+			pending.originTurnId,
+		);
+	}
+
+	#recordAutomaticTurnFailed(source: AutomaticTurnSource, error: unknown, originTurnId?: string): void {
+		if (this.#pendingAutomaticTurnStart?.source === source) this.#pendingAutomaticTurnStart = undefined;
+		this.#automaticTurns.record(
+			source,
+			"failed",
+			error instanceof Error ? error.message : String(error),
+			originTurnId,
+		);
 	}
 
 	getCurrentTurnId(): string | undefined {
@@ -4296,15 +4281,18 @@ export class AgentSession {
 		});
 	}
 
-	#closeCurrentTurn(): void {
-		const turnId = this.#currentTurnId;
-		this.#capabilities?.endTurn(this.#currentTurnId);
-		this.#automaticTurns.closeTurn(this.#currentTurnId);
-		this.#currentTurnId = undefined;
+	#closeTurn(turnId: string | undefined): void {
 		if (!turnId) return;
+		this.#capabilities?.endTurn(turnId);
+		this.#automaticTurns.closeTurn(turnId);
+		if (this.#currentTurnId === turnId) this.#currentTurnId = undefined;
 		for (const entry of this.#queuedAsyncResults.values()) {
 			if (entry.originTurnId === turnId) void this.#persistPassiveAsyncResult(entry);
 		}
+	}
+
+	#closeCurrentTurn(): void {
+		this.#closeTurn(this.#currentTurnId);
 	}
 
 	#scheduleCompactionContinuation(options: {
@@ -4349,6 +4337,7 @@ export class AgentSession {
 				{
 					skipPostPromptRecoveryWait: true,
 					prependMessages: eagerNudges.length > 0 ? eagerNudges : undefined,
+					automaticTurn: { source: "active_goal_continuation" },
 				},
 			);
 		};
@@ -4366,23 +4355,15 @@ export class AgentSession {
 					});
 					return;
 				}
-				const authority = "active_goal_continuation" as const;
 				if (this.#goalModeState?.enabled !== true || this.#goalModeState.goal.status !== "active") {
-					this.#automaticTurns.record(authority, "rejected", "active goal ended before compaction continuation");
+					this.#automaticTurns.record(
+						"active_goal_continuation",
+						"rejected",
+						"active goal ended before compaction continuation",
+					);
 					return;
 				}
-				if (!this.#automaticTurns.authorize(authority)) return;
-				this.#automaticTurns.record(authority, "started", "compaction continuation committed");
-				try {
-					if (this.#capabilities) {
-						await this.#capabilities.withContinuationAuthority(authority, undefined, continuePrompt);
-					} else {
-						await continuePrompt();
-					}
-				} catch (error) {
-					this.#automaticTurns.record(authority, "failed", error instanceof Error ? error.message : String(error));
-					throw error;
-				}
+				await continuePrompt();
 			},
 			{ generation },
 		);
@@ -5973,6 +5954,20 @@ export class AgentSession {
 			this.#agentKind === "sub" ? "subagent" : "main",
 		);
 		if (skillPolicy) instructions.push(skillPolicy);
+		if (this.#checkpointState) {
+			const checkpoint = renderInstruction(
+				"system.checkpoint-active-notice",
+				{},
+				this.#agentKind === "sub" ? "subagent" : "main",
+			);
+			instructions.push(
+				bindRenderedInstruction(
+					checkpoint.id,
+					checkpoint.renderedText,
+					this.#agentKind === "sub" ? "subagent" : "main",
+				),
+			);
+		}
 		return instructions.sort(
 			(left, right) => (left.order ?? 0) - (right.order ?? 0) || left.id.localeCompare(right.id),
 		);
@@ -6561,6 +6556,15 @@ export class AgentSession {
 			}
 			keywordNotices = this.#createMagicKeywordNotices(skillArgs);
 		}
+		const isGoalContinuation = message.customType === "goal-continuation";
+		if (isGoalContinuation && (options?.queueOnly || this.isStreaming)) {
+			this.#automaticTurns.record(
+				"active_goal_continuation",
+				"deferred",
+				"another model turn won before goal continuation dispatch",
+			);
+			return;
+		}
 
 		if (options?.queueOnly) {
 			const streamingBehavior = options?.streamingBehavior;
@@ -6593,16 +6597,10 @@ export class AgentSession {
 			timestamp: Date.now(),
 		};
 
-		const isGoalContinuation = message.customType === "goal-continuation";
-		if (isGoalContinuation) this.#goalContinuationContext = true;
-		try {
-			await this.#promptWithMessage(customMessage, textContent, {
-				...options,
-				prependMessages: keywordNotices.length > 0 ? keywordNotices : undefined,
-			});
-		} finally {
-			if (isGoalContinuation) this.#goalContinuationContext = false;
-		}
+		await this.#promptWithMessage(customMessage, textContent, {
+			...options,
+			prependMessages: keywordNotices.length > 0 ? keywordNotices : undefined,
+		});
 	}
 
 	async #promptWithMessage(
@@ -6613,10 +6611,18 @@ export class AgentSession {
 			skipPostPromptRecoveryWait?: boolean;
 			acceptTerminalEmptyStop?: boolean;
 			consumeExplicitPromptMessages?: boolean;
+			automaticTurn?: { source: AutomaticTurnSource; originTurnId?: string };
 		},
 	): Promise<void> {
 		const abort = this.#abortPromise;
 		if (abort) await abort;
+		const automaticTurn =
+			options?.automaticTurn ??
+			(message.role === "custom" && message.customType === "goal-continuation"
+				? { source: "active_goal_continuation" as const }
+				: undefined);
+		const previousGoalContinuationContext = this.#goalContinuationContext;
+		if (automaticTurn?.source === "active_goal_continuation") this.#goalContinuationContext = true;
 		this.#closeCurrentTurn();
 		const turnId = this.#automaticTurns.openTurn();
 		this.#currentTurnId = turnId;
@@ -6852,8 +6858,50 @@ export class AgentSession {
 				this.#planReferenceSent = true;
 			}
 			try {
+				if (automaticTurn?.source === "active_goal_continuation") {
+					if (this.#goalModeState?.enabled !== true || this.#goalModeState.goal.status !== "active") {
+						this.#automaticTurns.record(
+							automaticTurn.source,
+							"rejected",
+							"persisted goal is not active at provider dispatch",
+						);
+						return;
+					}
+					const queuedDirectUserInput = [
+						...this.agent.peekSteeringQueue(),
+						...this.agent.peekFollowUpQueue(),
+					].some(isUserQueuedMessage);
+					if (queuedDirectUserInput) {
+						this.#automaticTurns.record(
+							automaticTurn.source,
+							"deferred",
+							"queued direct user input wins at provider dispatch",
+						);
+						return;
+					}
+				}
+				if (automaticTurn && !this.#automaticTurns.authorize(automaticTurn.source, automaticTurn.originTurnId)) {
+					return;
+				}
 				promptMessagesCommitted = true;
-				await this.#recovery.promptAgentWithIdleRetry(messages, agentPromptOptions);
+				if (automaticTurn) this.#armAutomaticTurnStart(automaticTurn.source, automaticTurn.originTurnId);
+				try {
+					const dispatch = () => this.#recovery.promptAgentWithIdleRetry(messages, agentPromptOptions);
+					if (automaticTurn && this.#capabilities) {
+						await this.#capabilities.withContinuationAuthority(
+							automaticTurn.source,
+							automaticTurn.originTurnId,
+							dispatch,
+						);
+					} else {
+						await dispatch();
+					}
+				} catch (error) {
+					if (automaticTurn) {
+						this.#recordAutomaticTurnFailed(automaticTurn.source, error, automaticTurn.originTurnId);
+					}
+					throw error;
+				}
 			} finally {
 				this.#stats.setPendingSnapshot(undefined);
 				// Direct-user grant authority ends with this provider turn. The
@@ -6868,7 +6916,8 @@ export class AgentSession {
 			// The per-turn before_agent_start override lives only for this turn.
 			this.#tools.clearTurnSystemPromptOverride();
 			this.#turnExtensionInstructions = [];
-			if (this.#currentTurnId === turnId) this.#closeCurrentTurn();
+			this.#goalContinuationContext = previousGoalContinuationContext;
+			if (this.#pendingAgentEndEmit?.closeTurnId !== turnId) this.#closeTurn(turnId);
 			this.#usagePreflightReadyForNextModelCall = false;
 			this.#endInFlight();
 		}
@@ -8627,24 +8676,6 @@ export class AgentSession {
 			if (this.#assistantMessageHasSuccessfulYieldToolCall(message, toolCallId)) return message;
 		}
 		return undefined;
-	}
-
-	#enforceRewindBeforeYield(): boolean {
-		if (!this.#checkpointState || this.#pendingRewindReport) {
-			return false;
-		}
-		const reminder = [
-			"<system-warning>",
-			"You are in an active checkpoint. You MUST call rewind with your investigation findings before yielding. Do NOT yield without completing the checkpoint.",
-			"</system-warning>",
-		].join("\n");
-		this.agent.appendMessage({
-			role: "developer",
-			content: [{ type: "text", text: reminder }],
-			attribution: "agent",
-			timestamp: Date.now(),
-		});
-		return false;
 	}
 
 	#extractRewindReport(messages: AgentMessage[]): string | undefined {

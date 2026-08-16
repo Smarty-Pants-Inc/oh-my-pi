@@ -122,117 +122,119 @@ import source118 from "../prompts/system/autolearn-guidance.md" with { type: "te
 import source119 from "../prompts/system/autolearn-nudge-autocontinue.md" with { type: "text" };
 import source120 from "../prompts/system/background-tan-dispatch.md" with { type: "text" };
 import source121 from "../prompts/system/btw-user.md" with { type: "text" };
-import source122 from "../prompts/system/commit-message-system.md" with { type: "text" };
-import source123 from "../prompts/system/computer-safety.md" with { type: "text" };
-import source124 from "../prompts/system/custom-system-prompt.md" with { type: "text" };
-import source125 from "../prompts/system/eager-task.md" with { type: "text" };
-import source126 from "../prompts/system/eager-todo.md" with { type: "text" };
-import source127 from "../prompts/system/empty-stop-retry.md" with { type: "text" };
-import source128 from "../prompts/system/gemini-tool-call-reminder.md" with { type: "text" };
-import source129 from "../prompts/system/interrupted-thinking.md" with { type: "text" };
-import source130 from "../prompts/system/irc-autoreply.md" with { type: "text" };
-import source131 from "../prompts/system/irc-incoming.md" with { type: "text" };
-import source132 from "../prompts/system/manual-continue.md" with { type: "text" };
-import source133 from "../prompts/system/mcp-xdev-guidance.md" with { type: "text" };
-import source134 from "../prompts/system/memory-consolidation-system.md" with { type: "text" };
-import source135 from "../prompts/system/memory-extraction-system.md" with { type: "text" };
-import source136 from "../prompts/system/mid-run-todo-nudge.md" with { type: "text" };
-import source137 from "../prompts/system/omfg-user.md" with { type: "text" };
-import source138 from "../prompts/system/orchestrate-notice.md" with { type: "text" };
-import source139 from "../prompts/system/personalities/default.md" with { type: "text" };
-import source140 from "../prompts/system/personalities/friendly.md" with { type: "text" };
-import source141 from "../prompts/system/personalities/pragmatic.md" with { type: "text" };
-import source142 from "../prompts/system/plan-mode-active.md" with { type: "text" };
-import source143 from "../prompts/system/plan-mode-approved.md" with { type: "text" };
-import source144 from "../prompts/system/plan-mode-compact-instructions.md" with { type: "text" };
-import source145 from "../prompts/system/plan-mode-reference.md" with { type: "text" };
-import source146 from "../prompts/system/plan-mode-subagent.md" with { type: "text" };
-import source147 from "../prompts/system/plan-mode-tool-decision-reminder.md" with { type: "text" };
-import source148 from "../prompts/system/plan-yolo-handoff.md" with { type: "text" };
-import source149 from "../prompts/system/prewalk-checklist.md" with { type: "text" };
-import source150 from "../prompts/system/prewalk-continue.md" with { type: "text" };
-import source151 from "../prompts/system/prewalk-plan.md" with { type: "text" };
-import source152 from "../prompts/system/project-prompt.md" with { type: "text" };
-import source153 from "../prompts/system/recap-user.md" with { type: "text" };
-import source154 from "../prompts/system/resolve-device-reminder.md" with { type: "text" };
-import source155 from "../prompts/system/rewind-report.md" with { type: "text" };
-import source156 from "../prompts/system/side-channel-no-tools.md" with { type: "text" };
-import source157 from "../prompts/system/snapcompact-context-frames-note.md" with { type: "text" };
-import source158 from "../prompts/system/snapcompact-context-stub.md" with { type: "text" };
-import source159 from "../prompts/system/snapcompact-system-frames-note.md" with { type: "text" };
-import source160 from "../prompts/system/snapcompact-system-stub.md" with { type: "text" };
-import source161 from "../prompts/system/snapcompact-toolresult-note.md" with { type: "text" };
-import source162 from "../prompts/system/speech-rewrite.md" with { type: "text" };
-import source163 from "../prompts/system/subagent-async-pending.md" with { type: "text" };
-import source164 from "../prompts/system/subagent-system-prompt.md" with { type: "text" };
-import source165 from "../prompts/system/subagent-user-prompt.md" with { type: "text" };
-import source166 from "../prompts/system/system-prompt.md" with { type: "text" };
-import source167 from "../prompts/system/tan-context-switch.md" with { type: "text" };
-import source168 from "../prompts/system/task-label.md" with { type: "text" };
-import source169 from "../prompts/system/thinking-loop-redirect.md" with { type: "text" };
-import source170 from "../prompts/system/title-marker-instruction.md" with { type: "text" };
-import source171 from "../prompts/system/title-system.md" with { type: "text" };
-import source172 from "../prompts/system/tool-call-loop-redirect.md" with { type: "text" };
-import source173 from "../prompts/system/ttsr-interrupt.md" with { type: "text" };
-import source174 from "../prompts/system/ttsr-tool-reminder.md" with { type: "text" };
-import source175 from "../prompts/system/ultrathink-notice.md" with { type: "text" };
-import source176 from "../prompts/system/unexpected-stop-classifier.md" with { type: "text" };
-import source177 from "../prompts/system/unexpected-stop-retry.md" with { type: "text" };
-import source178 from "../prompts/system/vibe-mode-active.md" with { type: "text" };
-import source179 from "../prompts/system/web-search.md" with { type: "text" };
-import source180 from "../prompts/system/workflow-notice.md" with { type: "text" };
-import source181 from "../prompts/system/xdev-mount-notice.md" with { type: "text" };
-import source182 from "../prompts/todos/current.md" with { type: "text" };
-import source183 from "../prompts/tools/apply-patch.md" with { type: "text" };
-import source184 from "../prompts/tools/approve.md" with { type: "text" };
-import source185 from "../prompts/tools/ask.md" with { type: "text" };
-import source186 from "../prompts/tools/ast-edit.md" with { type: "text" };
-import source187 from "../prompts/tools/ast-grep.md" with { type: "text" };
-import source188 from "../prompts/tools/async-result.md" with { type: "text" };
-import source189 from "../prompts/tools/bash.md" with { type: "text" };
-import source190 from "../prompts/tools/browser.md" with { type: "text" };
-import source191 from "../prompts/tools/capability-grant.md" with { type: "text" };
-import source192 from "../prompts/tools/checkpoint.md" with { type: "text" };
-import source193 from "../prompts/tools/computer.md" with { type: "text" };
-import source194 from "../prompts/tools/debug.md" with { type: "text" };
-import source195 from "../prompts/tools/eval.md" with { type: "text" };
-import source196 from "../prompts/tools/github.md" with { type: "text" };
-import source197 from "../prompts/tools/glob.md" with { type: "text" };
-import source198 from "../prompts/tools/goal.md" with { type: "text" };
-import source199 from "../prompts/tools/grep.md" with { type: "text" };
-import source200 from "../prompts/tools/hub.md" with { type: "text" };
-import source201 from "../prompts/tools/image-attachment-describe-system.md" with { type: "text" };
-import source202 from "../prompts/tools/image-attachment-describe.md" with { type: "text" };
-import source203 from "../prompts/tools/image-gen.md" with { type: "text" };
-import source204 from "../prompts/tools/inspect-image-system.md" with { type: "text" };
-import source205 from "../prompts/tools/inspect-image.md" with { type: "text" };
-import source206 from "../prompts/tools/learn.md" with { type: "text" };
-import source207 from "../prompts/tools/lsp-late-diagnostic.md" with { type: "text" };
-import source208 from "../prompts/tools/lsp.md" with { type: "text" };
-import source209 from "../prompts/tools/manage-skill.md" with { type: "text" };
-import source210 from "../prompts/tools/memory-edit.md" with { type: "text" };
-import source211 from "../prompts/tools/patch.md" with { type: "text" };
-import source212 from "../prompts/tools/read.md" with { type: "text" };
-import source213 from "../prompts/tools/recall.md" with { type: "text" };
-import source214 from "../prompts/tools/reflect.md" with { type: "text" };
-import source215 from "../prompts/tools/replace.md" with { type: "text" };
-import source216 from "../prompts/tools/retain.md" with { type: "text" };
-import source217 from "../prompts/tools/rewind.md" with { type: "text" };
-import source218 from "../prompts/tools/rewrite.md" with { type: "text" };
-import source219 from "../prompts/tools/security-publish.md" with { type: "text" };
-import source220 from "../prompts/tools/security-scan.md" with { type: "text" };
-import source221 from "../prompts/tools/task-async-contract.md" with { type: "text" };
-import source222 from "../prompts/tools/task-summary.md" with { type: "text" };
-import source223 from "../prompts/tools/task.md" with { type: "text" };
-import source224 from "../prompts/tools/todo.md" with { type: "text" };
-import source225 from "../prompts/tools/vibe-kill.md" with { type: "text" };
-import source226 from "../prompts/tools/vibe-list.md" with { type: "text" };
-import source227 from "../prompts/tools/vibe-send.md" with { type: "text" };
-import source228 from "../prompts/tools/vibe-spawn.md" with { type: "text" };
-import source229 from "../prompts/tools/vibe-turn-result.md" with { type: "text" };
-import source230 from "../prompts/tools/vibe-wait.md" with { type: "text" };
-import source231 from "../prompts/tools/web-search.md" with { type: "text" };
-import source232 from "../prompts/tools/write.md" with { type: "text" };
+import source122 from "../prompts/system/checkpoint-active-notice.md" with { type: "text" };
+import source123 from "../prompts/system/commit-message-system.md" with { type: "text" };
+import source124 from "../prompts/system/computer-safety.md" with { type: "text" };
+import source125 from "../prompts/system/custom-system-prompt.md" with { type: "text" };
+import source126 from "../prompts/system/date-cwd-reminder.md" with { type: "text" };
+import source127 from "../prompts/system/eager-task.md" with { type: "text" };
+import source128 from "../prompts/system/eager-todo.md" with { type: "text" };
+import source129 from "../prompts/system/empty-stop-retry.md" with { type: "text" };
+import source130 from "../prompts/system/gemini-tool-call-reminder.md" with { type: "text" };
+import source131 from "../prompts/system/interrupted-thinking.md" with { type: "text" };
+import source132 from "../prompts/system/irc-autoreply.md" with { type: "text" };
+import source133 from "../prompts/system/irc-incoming.md" with { type: "text" };
+import source134 from "../prompts/system/manual-continue.md" with { type: "text" };
+import source135 from "../prompts/system/mcp-xdev-guidance.md" with { type: "text" };
+import source136 from "../prompts/system/memory-consolidation-system.md" with { type: "text" };
+import source137 from "../prompts/system/memory-extraction-system.md" with { type: "text" };
+import source138 from "../prompts/system/mid-run-todo-nudge.md" with { type: "text" };
+import source139 from "../prompts/system/omfg-user.md" with { type: "text" };
+import source140 from "../prompts/system/orchestrate-notice.md" with { type: "text" };
+import source141 from "../prompts/system/personalities/default.md" with { type: "text" };
+import source142 from "../prompts/system/personalities/friendly.md" with { type: "text" };
+import source143 from "../prompts/system/personalities/pragmatic.md" with { type: "text" };
+import source144 from "../prompts/system/plan-mode-active.md" with { type: "text" };
+import source145 from "../prompts/system/plan-mode-approved.md" with { type: "text" };
+import source146 from "../prompts/system/plan-mode-compact-instructions.md" with { type: "text" };
+import source147 from "../prompts/system/plan-mode-reference.md" with { type: "text" };
+import source148 from "../prompts/system/plan-mode-subagent.md" with { type: "text" };
+import source149 from "../prompts/system/plan-mode-tool-decision-reminder.md" with { type: "text" };
+import source150 from "../prompts/system/plan-yolo-handoff.md" with { type: "text" };
+import source151 from "../prompts/system/prewalk-checklist.md" with { type: "text" };
+import source152 from "../prompts/system/prewalk-continue.md" with { type: "text" };
+import source153 from "../prompts/system/prewalk-plan.md" with { type: "text" };
+import source154 from "../prompts/system/project-prompt.md" with { type: "text" };
+import source155 from "../prompts/system/recap-user.md" with { type: "text" };
+import source156 from "../prompts/system/resolve-device-reminder.md" with { type: "text" };
+import source157 from "../prompts/system/rewind-report.md" with { type: "text" };
+import source158 from "../prompts/system/side-channel-no-tools.md" with { type: "text" };
+import source159 from "../prompts/system/snapcompact-context-frames-note.md" with { type: "text" };
+import source160 from "../prompts/system/snapcompact-context-stub.md" with { type: "text" };
+import source161 from "../prompts/system/snapcompact-system-frames-note.md" with { type: "text" };
+import source162 from "../prompts/system/snapcompact-system-stub.md" with { type: "text" };
+import source163 from "../prompts/system/snapcompact-toolresult-note.md" with { type: "text" };
+import source164 from "../prompts/system/speech-rewrite.md" with { type: "text" };
+import source165 from "../prompts/system/subagent-async-pending.md" with { type: "text" };
+import source166 from "../prompts/system/subagent-system-prompt.md" with { type: "text" };
+import source167 from "../prompts/system/subagent-user-prompt.md" with { type: "text" };
+import source168 from "../prompts/system/system-prompt.md" with { type: "text" };
+import source169 from "../prompts/system/tan-context-switch.md" with { type: "text" };
+import source170 from "../prompts/system/task-label.md" with { type: "text" };
+import source171 from "../prompts/system/thinking-loop-redirect.md" with { type: "text" };
+import source172 from "../prompts/system/title-marker-instruction.md" with { type: "text" };
+import source173 from "../prompts/system/title-system.md" with { type: "text" };
+import source174 from "../prompts/system/tool-call-loop-redirect.md" with { type: "text" };
+import source175 from "../prompts/system/ttsr-interrupt.md" with { type: "text" };
+import source176 from "../prompts/system/ttsr-tool-reminder.md" with { type: "text" };
+import source177 from "../prompts/system/ultrathink-notice.md" with { type: "text" };
+import source178 from "../prompts/system/unexpected-stop-classifier.md" with { type: "text" };
+import source179 from "../prompts/system/unexpected-stop-retry.md" with { type: "text" };
+import source180 from "../prompts/system/vibe-mode-active.md" with { type: "text" };
+import source181 from "../prompts/system/web-search.md" with { type: "text" };
+import source182 from "../prompts/system/workflow-notice.md" with { type: "text" };
+import source183 from "../prompts/system/xdev-mount-notice.md" with { type: "text" };
+import source184 from "../prompts/todos/current.md" with { type: "text" };
+import source185 from "../prompts/tools/apply-patch.md" with { type: "text" };
+import source186 from "../prompts/tools/approve.md" with { type: "text" };
+import source187 from "../prompts/tools/ask.md" with { type: "text" };
+import source188 from "../prompts/tools/ast-edit.md" with { type: "text" };
+import source189 from "../prompts/tools/ast-grep.md" with { type: "text" };
+import source190 from "../prompts/tools/async-result.md" with { type: "text" };
+import source191 from "../prompts/tools/bash.md" with { type: "text" };
+import source192 from "../prompts/tools/browser.md" with { type: "text" };
+import source193 from "../prompts/tools/capability-grant.md" with { type: "text" };
+import source194 from "../prompts/tools/checkpoint.md" with { type: "text" };
+import source195 from "../prompts/tools/computer.md" with { type: "text" };
+import source196 from "../prompts/tools/debug.md" with { type: "text" };
+import source197 from "../prompts/tools/eval.md" with { type: "text" };
+import source198 from "../prompts/tools/github.md" with { type: "text" };
+import source199 from "../prompts/tools/glob.md" with { type: "text" };
+import source200 from "../prompts/tools/goal.md" with { type: "text" };
+import source201 from "../prompts/tools/grep.md" with { type: "text" };
+import source202 from "../prompts/tools/hub.md" with { type: "text" };
+import source203 from "../prompts/tools/image-attachment-describe-system.md" with { type: "text" };
+import source204 from "../prompts/tools/image-attachment-describe.md" with { type: "text" };
+import source205 from "../prompts/tools/image-gen.md" with { type: "text" };
+import source206 from "../prompts/tools/inspect-image-system.md" with { type: "text" };
+import source207 from "../prompts/tools/inspect-image.md" with { type: "text" };
+import source208 from "../prompts/tools/learn.md" with { type: "text" };
+import source209 from "../prompts/tools/lsp-late-diagnostic.md" with { type: "text" };
+import source210 from "../prompts/tools/lsp.md" with { type: "text" };
+import source211 from "../prompts/tools/manage-skill.md" with { type: "text" };
+import source212 from "../prompts/tools/memory-edit.md" with { type: "text" };
+import source213 from "../prompts/tools/patch.md" with { type: "text" };
+import source214 from "../prompts/tools/read.md" with { type: "text" };
+import source215 from "../prompts/tools/recall.md" with { type: "text" };
+import source216 from "../prompts/tools/reflect.md" with { type: "text" };
+import source217 from "../prompts/tools/replace.md" with { type: "text" };
+import source218 from "../prompts/tools/retain.md" with { type: "text" };
+import source219 from "../prompts/tools/rewind.md" with { type: "text" };
+import source220 from "../prompts/tools/rewrite.md" with { type: "text" };
+import source221 from "../prompts/tools/security-publish.md" with { type: "text" };
+import source222 from "../prompts/tools/security-scan.md" with { type: "text" };
+import source223 from "../prompts/tools/task-async-contract.md" with { type: "text" };
+import source224 from "../prompts/tools/task-summary.md" with { type: "text" };
+import source225 from "../prompts/tools/task.md" with { type: "text" };
+import source226 from "../prompts/tools/todo.md" with { type: "text" };
+import source227 from "../prompts/tools/vibe-kill.md" with { type: "text" };
+import source228 from "../prompts/tools/vibe-list.md" with { type: "text" };
+import source229 from "../prompts/tools/vibe-send.md" with { type: "text" };
+import source230 from "../prompts/tools/vibe-spawn.md" with { type: "text" };
+import source231 from "../prompts/tools/vibe-turn-result.md" with { type: "text" };
+import source232 from "../prompts/tools/vibe-wait.md" with { type: "text" };
+import source233 from "../prompts/tools/web-search.md" with { type: "text" };
+import source234 from "../prompts/tools/write.md" with { type: "text" };
 
 export const PROMPT_SOURCES: Readonly<Record<string, string>> = Object.freeze({
 	"_agent/compaction/prompts/auto-handoff-threshold-focus.md": source0,
@@ -357,115 +359,117 @@ export const PROMPT_SOURCES: Readonly<Record<string, string>> = Object.freeze({
 	"prompts/system/autolearn-nudge-autocontinue.md": source119,
 	"prompts/system/background-tan-dispatch.md": source120,
 	"prompts/system/btw-user.md": source121,
-	"prompts/system/commit-message-system.md": source122,
-	"prompts/system/computer-safety.md": source123,
-	"prompts/system/custom-system-prompt.md": source124,
-	"prompts/system/eager-task.md": source125,
-	"prompts/system/eager-todo.md": source126,
-	"prompts/system/empty-stop-retry.md": source127,
-	"prompts/system/gemini-tool-call-reminder.md": source128,
-	"prompts/system/interrupted-thinking.md": source129,
-	"prompts/system/irc-autoreply.md": source130,
-	"prompts/system/irc-incoming.md": source131,
-	"prompts/system/manual-continue.md": source132,
-	"prompts/system/mcp-xdev-guidance.md": source133,
-	"prompts/system/memory-consolidation-system.md": source134,
-	"prompts/system/memory-extraction-system.md": source135,
-	"prompts/system/mid-run-todo-nudge.md": source136,
-	"prompts/system/omfg-user.md": source137,
-	"prompts/system/orchestrate-notice.md": source138,
-	"prompts/system/personalities/default.md": source139,
-	"prompts/system/personalities/friendly.md": source140,
-	"prompts/system/personalities/pragmatic.md": source141,
-	"prompts/system/plan-mode-active.md": source142,
-	"prompts/system/plan-mode-approved.md": source143,
-	"prompts/system/plan-mode-compact-instructions.md": source144,
-	"prompts/system/plan-mode-reference.md": source145,
-	"prompts/system/plan-mode-subagent.md": source146,
-	"prompts/system/plan-mode-tool-decision-reminder.md": source147,
-	"prompts/system/plan-yolo-handoff.md": source148,
-	"prompts/system/prewalk-checklist.md": source149,
-	"prompts/system/prewalk-continue.md": source150,
-	"prompts/system/prewalk-plan.md": source151,
-	"prompts/system/project-prompt.md": source152,
-	"prompts/system/recap-user.md": source153,
-	"prompts/system/resolve-device-reminder.md": source154,
-	"prompts/system/rewind-report.md": source155,
-	"prompts/system/side-channel-no-tools.md": source156,
-	"prompts/system/snapcompact-context-frames-note.md": source157,
-	"prompts/system/snapcompact-context-stub.md": source158,
-	"prompts/system/snapcompact-system-frames-note.md": source159,
-	"prompts/system/snapcompact-system-stub.md": source160,
-	"prompts/system/snapcompact-toolresult-note.md": source161,
-	"prompts/system/speech-rewrite.md": source162,
-	"prompts/system/subagent-async-pending.md": source163,
-	"prompts/system/subagent-system-prompt.md": source164,
-	"prompts/system/subagent-user-prompt.md": source165,
-	"prompts/system/system-prompt.md": source166,
-	"prompts/system/tan-context-switch.md": source167,
-	"prompts/system/task-label.md": source168,
-	"prompts/system/thinking-loop-redirect.md": source169,
-	"prompts/system/title-marker-instruction.md": source170,
-	"prompts/system/title-system.md": source171,
-	"prompts/system/tool-call-loop-redirect.md": source172,
-	"prompts/system/ttsr-interrupt.md": source173,
-	"prompts/system/ttsr-tool-reminder.md": source174,
-	"prompts/system/ultrathink-notice.md": source175,
-	"prompts/system/unexpected-stop-classifier.md": source176,
-	"prompts/system/unexpected-stop-retry.md": source177,
-	"prompts/system/vibe-mode-active.md": source178,
-	"prompts/system/web-search.md": source179,
-	"prompts/system/workflow-notice.md": source180,
-	"prompts/system/xdev-mount-notice.md": source181,
-	"prompts/todos/current.md": source182,
-	"prompts/tools/apply-patch.md": source183,
-	"prompts/tools/approve.md": source184,
-	"prompts/tools/ask.md": source185,
-	"prompts/tools/ast-edit.md": source186,
-	"prompts/tools/ast-grep.md": source187,
-	"prompts/tools/async-result.md": source188,
-	"prompts/tools/bash.md": source189,
-	"prompts/tools/browser.md": source190,
-	"prompts/tools/capability-grant.md": source191,
-	"prompts/tools/checkpoint.md": source192,
-	"prompts/tools/computer.md": source193,
-	"prompts/tools/debug.md": source194,
-	"prompts/tools/eval.md": source195,
-	"prompts/tools/github.md": source196,
-	"prompts/tools/glob.md": source197,
-	"prompts/tools/goal.md": source198,
-	"prompts/tools/grep.md": source199,
-	"prompts/tools/hub.md": source200,
-	"prompts/tools/image-attachment-describe-system.md": source201,
-	"prompts/tools/image-attachment-describe.md": source202,
-	"prompts/tools/image-gen.md": source203,
-	"prompts/tools/inspect-image-system.md": source204,
-	"prompts/tools/inspect-image.md": source205,
-	"prompts/tools/learn.md": source206,
-	"prompts/tools/lsp-late-diagnostic.md": source207,
-	"prompts/tools/lsp.md": source208,
-	"prompts/tools/manage-skill.md": source209,
-	"prompts/tools/memory-edit.md": source210,
-	"prompts/tools/patch.md": source211,
-	"prompts/tools/read.md": source212,
-	"prompts/tools/recall.md": source213,
-	"prompts/tools/reflect.md": source214,
-	"prompts/tools/replace.md": source215,
-	"prompts/tools/retain.md": source216,
-	"prompts/tools/rewind.md": source217,
-	"prompts/tools/rewrite.md": source218,
-	"prompts/tools/security-publish.md": source219,
-	"prompts/tools/security-scan.md": source220,
-	"prompts/tools/task-async-contract.md": source221,
-	"prompts/tools/task-summary.md": source222,
-	"prompts/tools/task.md": source223,
-	"prompts/tools/todo.md": source224,
-	"prompts/tools/vibe-kill.md": source225,
-	"prompts/tools/vibe-list.md": source226,
-	"prompts/tools/vibe-send.md": source227,
-	"prompts/tools/vibe-spawn.md": source228,
-	"prompts/tools/vibe-turn-result.md": source229,
-	"prompts/tools/vibe-wait.md": source230,
-	"prompts/tools/web-search.md": source231,
-	"prompts/tools/write.md": source232,
+	"prompts/system/checkpoint-active-notice.md": source122,
+	"prompts/system/commit-message-system.md": source123,
+	"prompts/system/computer-safety.md": source124,
+	"prompts/system/custom-system-prompt.md": source125,
+	"prompts/system/date-cwd-reminder.md": source126,
+	"prompts/system/eager-task.md": source127,
+	"prompts/system/eager-todo.md": source128,
+	"prompts/system/empty-stop-retry.md": source129,
+	"prompts/system/gemini-tool-call-reminder.md": source130,
+	"prompts/system/interrupted-thinking.md": source131,
+	"prompts/system/irc-autoreply.md": source132,
+	"prompts/system/irc-incoming.md": source133,
+	"prompts/system/manual-continue.md": source134,
+	"prompts/system/mcp-xdev-guidance.md": source135,
+	"prompts/system/memory-consolidation-system.md": source136,
+	"prompts/system/memory-extraction-system.md": source137,
+	"prompts/system/mid-run-todo-nudge.md": source138,
+	"prompts/system/omfg-user.md": source139,
+	"prompts/system/orchestrate-notice.md": source140,
+	"prompts/system/personalities/default.md": source141,
+	"prompts/system/personalities/friendly.md": source142,
+	"prompts/system/personalities/pragmatic.md": source143,
+	"prompts/system/plan-mode-active.md": source144,
+	"prompts/system/plan-mode-approved.md": source145,
+	"prompts/system/plan-mode-compact-instructions.md": source146,
+	"prompts/system/plan-mode-reference.md": source147,
+	"prompts/system/plan-mode-subagent.md": source148,
+	"prompts/system/plan-mode-tool-decision-reminder.md": source149,
+	"prompts/system/plan-yolo-handoff.md": source150,
+	"prompts/system/prewalk-checklist.md": source151,
+	"prompts/system/prewalk-continue.md": source152,
+	"prompts/system/prewalk-plan.md": source153,
+	"prompts/system/project-prompt.md": source154,
+	"prompts/system/recap-user.md": source155,
+	"prompts/system/resolve-device-reminder.md": source156,
+	"prompts/system/rewind-report.md": source157,
+	"prompts/system/side-channel-no-tools.md": source158,
+	"prompts/system/snapcompact-context-frames-note.md": source159,
+	"prompts/system/snapcompact-context-stub.md": source160,
+	"prompts/system/snapcompact-system-frames-note.md": source161,
+	"prompts/system/snapcompact-system-stub.md": source162,
+	"prompts/system/snapcompact-toolresult-note.md": source163,
+	"prompts/system/speech-rewrite.md": source164,
+	"prompts/system/subagent-async-pending.md": source165,
+	"prompts/system/subagent-system-prompt.md": source166,
+	"prompts/system/subagent-user-prompt.md": source167,
+	"prompts/system/system-prompt.md": source168,
+	"prompts/system/tan-context-switch.md": source169,
+	"prompts/system/task-label.md": source170,
+	"prompts/system/thinking-loop-redirect.md": source171,
+	"prompts/system/title-marker-instruction.md": source172,
+	"prompts/system/title-system.md": source173,
+	"prompts/system/tool-call-loop-redirect.md": source174,
+	"prompts/system/ttsr-interrupt.md": source175,
+	"prompts/system/ttsr-tool-reminder.md": source176,
+	"prompts/system/ultrathink-notice.md": source177,
+	"prompts/system/unexpected-stop-classifier.md": source178,
+	"prompts/system/unexpected-stop-retry.md": source179,
+	"prompts/system/vibe-mode-active.md": source180,
+	"prompts/system/web-search.md": source181,
+	"prompts/system/workflow-notice.md": source182,
+	"prompts/system/xdev-mount-notice.md": source183,
+	"prompts/todos/current.md": source184,
+	"prompts/tools/apply-patch.md": source185,
+	"prompts/tools/approve.md": source186,
+	"prompts/tools/ask.md": source187,
+	"prompts/tools/ast-edit.md": source188,
+	"prompts/tools/ast-grep.md": source189,
+	"prompts/tools/async-result.md": source190,
+	"prompts/tools/bash.md": source191,
+	"prompts/tools/browser.md": source192,
+	"prompts/tools/capability-grant.md": source193,
+	"prompts/tools/checkpoint.md": source194,
+	"prompts/tools/computer.md": source195,
+	"prompts/tools/debug.md": source196,
+	"prompts/tools/eval.md": source197,
+	"prompts/tools/github.md": source198,
+	"prompts/tools/glob.md": source199,
+	"prompts/tools/goal.md": source200,
+	"prompts/tools/grep.md": source201,
+	"prompts/tools/hub.md": source202,
+	"prompts/tools/image-attachment-describe-system.md": source203,
+	"prompts/tools/image-attachment-describe.md": source204,
+	"prompts/tools/image-gen.md": source205,
+	"prompts/tools/inspect-image-system.md": source206,
+	"prompts/tools/inspect-image.md": source207,
+	"prompts/tools/learn.md": source208,
+	"prompts/tools/lsp-late-diagnostic.md": source209,
+	"prompts/tools/lsp.md": source210,
+	"prompts/tools/manage-skill.md": source211,
+	"prompts/tools/memory-edit.md": source212,
+	"prompts/tools/patch.md": source213,
+	"prompts/tools/read.md": source214,
+	"prompts/tools/recall.md": source215,
+	"prompts/tools/reflect.md": source216,
+	"prompts/tools/replace.md": source217,
+	"prompts/tools/retain.md": source218,
+	"prompts/tools/rewind.md": source219,
+	"prompts/tools/rewrite.md": source220,
+	"prompts/tools/security-publish.md": source221,
+	"prompts/tools/security-scan.md": source222,
+	"prompts/tools/task-async-contract.md": source223,
+	"prompts/tools/task-summary.md": source224,
+	"prompts/tools/task.md": source225,
+	"prompts/tools/todo.md": source226,
+	"prompts/tools/vibe-kill.md": source227,
+	"prompts/tools/vibe-list.md": source228,
+	"prompts/tools/vibe-send.md": source229,
+	"prompts/tools/vibe-spawn.md": source230,
+	"prompts/tools/vibe-turn-result.md": source231,
+	"prompts/tools/vibe-wait.md": source232,
+	"prompts/tools/web-search.md": source233,
+	"prompts/tools/write.md": source234,
 });

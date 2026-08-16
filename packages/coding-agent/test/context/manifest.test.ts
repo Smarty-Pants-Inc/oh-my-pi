@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { getDefault } from "../../src/config/settings-schema";
 import { canonicalJson, type JsonValue, sha256 } from "../../src/context/canonical";
 import {
 	computeImplementationSources,
@@ -16,10 +17,39 @@ import {
 	parseContextReleaseManifest,
 	trackedContentManifest,
 } from "../../src/context/manifest";
+import { agentBehavior, parseAgentBehavior } from "../../src/context/registry";
 import { exportRenderedToolContracts, parseGeneratedToolContracts } from "../../src/context/tool-contracts";
 import { classifyProtectedPath } from "../../src/policy/protected-surface";
 
 describe("tracked context manifest", () => {
+	it("uses the fail-closed behavior manifest as the governed runtime default source", () => {
+		expect(getDefault("tools.approvalMode")).toBe(agentBehavior.toolExecution.approvalMode);
+		expect(getDefault("todo.enabled")).toBe(agentBehavior.todo.enabled);
+		expect(getDefault("todo.reminders")).toBe(agentBehavior.todo.stopReminders);
+		expect(getDefault("todo.eager")).toBe(agentBehavior.todo.eager);
+		expect(getDefault("goal.enabled")).toBe(agentBehavior.goal.enabled);
+		expect(getDefault("goal.continuationModes")).toEqual(agentBehavior.goal.continuationModes);
+		expect(getDefault("task.eager")).toBe(agentBehavior.task.eager);
+		expect(getDefault("task.maxRecursionDepth")).toBe(agentBehavior.task.maxRecursionDepth);
+
+		const source = Bun.file(path.resolve(import.meta.dir, "../../src/agent-behavior.yml")).text();
+		return source.then(text => {
+			expect(parseAgentBehavior(text)).toEqual(agentBehavior);
+			expect(() => parseAgentBehavior(`${text}\nunknownProtectedDefault: true\n`)).toThrow(
+				"unknown or missing fields",
+			);
+			expect(() => parseAgentBehavior(text.replace("maxRecursionDepth: 2", "maxRecursionDepth: nope"))).toThrow(
+				"task.maxRecursionDepth",
+			);
+			expect(() => parseAgentBehavior(text.replace("midRunNudges: false", "midRunNudges: true"))).toThrow(
+				"must match the shared reminder default",
+			);
+			expect(() => parseAgentBehavior(text.replace("forcedFanout: false", "forcedFanout: true"))).toThrow(
+				"task.forcedFanout must be false",
+			);
+		});
+	});
+
 	it("uses the canonical activation state path and ignores environment decoys", () => {
 		Bun.env.SMARTY_POLICY_STATE_PATH = "/tmp/decoy-state.json";
 		try {

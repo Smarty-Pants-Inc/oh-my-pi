@@ -79,6 +79,7 @@ import { Settings, type SkillsSettings } from "./config/settings";
 import { ensureApprovedStartup } from "./context/approved-policy";
 import { captureRuntimeContextEvidence, isRuntimeContextEvidencePayload } from "./context/explain";
 import { type ContextReleaseManifest, canonicalAgentDirPath } from "./context/manifest";
+import { bindRenderedInstruction } from "./context/registry";
 import { exportRenderedToolContracts } from "./context/tool-contracts";
 import { CursorExecHandlers, type CursorMcpResourceAdapter } from "./cursor";
 import { createBridgeEditTool, createBridgeGrepFactory } from "./cursor-bridge-tools";
@@ -154,8 +155,12 @@ import {
 import { AgentSession, type InitialRetryFallbackState, type PlanYolo, type Prewalk } from "./session/agent-session";
 import { discoverAuthStorage as discoverAuthStorageFromConfig } from "./session/auth-broker-config";
 import type { AuthStorage } from "./session/auth-storage";
-import { withDateCwdReminder } from "./session/date-cwd-reminder";
-import type { ExecutionEnvironmentBinding, ExecutionEnvironmentProvider } from "./session/execution-environment";
+import { renderDateCwdReminder } from "./session/date-cwd-reminder";
+import {
+	type ExecutionEnvironmentBinding,
+	type ExecutionEnvironmentProvider,
+	mapExecutionEnvironmentPath,
+} from "./session/execution-environment";
 import { createInterruptedTurnAbortMessage } from "./session/exit-diagnostics";
 import {
 	type CustomMessage,
@@ -3280,6 +3285,21 @@ async function createAgentSessionScoped(
 				assertExecutionEnvironmentSystemPrompt(executionEnvironment, context.systemPrompt);
 			}
 			const registeredInstructions = session?.buildProviderContextInstructions() ?? [];
+			if (context.systemPrompt?.length) {
+				const promptCwd = normalizePromptPath(
+					executionEnvironment ? mapExecutionEnvironmentPath(executionEnvironment, ".") : sessionManager.getCwd(),
+				);
+				registeredInstructions.push(
+					bindRenderedInstruction(
+						"system.date-cwd-reminder",
+						renderDateCwdReminder(formatLocalCalendarDate(), promptCwd),
+						agentKind === "sub" ? "subagent" : "main",
+					),
+				);
+				registeredInstructions.sort(
+					(left, right) => (left.order ?? 0) - (right.order ?? 0) || left.id.localeCompare(right.id),
+				);
+			}
 			let transformed: Context = registeredInstructions.length
 				? { ...context, instructions: [...(context.instructions ?? []), ...registeredInstructions] }
 				: context;
@@ -3960,14 +3980,26 @@ async function createAgentSessionScoped(
 					convertToLlm: convertToLlmFinal,
 					transformContext: async messages => wrapSteeringForModel(messages),
 					transformProviderContext: async (context, transformModel) => {
-						let transformed = obfuscator ? obfuscateProviderContext(obfuscator, context) : context;
+						const executionEnvironment = toolSession.getExecutionEnvironment?.();
+						const promptCwd = normalizePromptPath(
+							executionEnvironment
+								? mapExecutionEnvironmentPath(executionEnvironment, ".")
+								: sessionManager.getCwd(),
+						);
+						const instruction = context.systemPrompt?.length
+							? bindRenderedInstruction(
+									"system.date-cwd-reminder",
+									renderDateCwdReminder(formatLocalCalendarDate(), promptCwd),
+									"side_model",
+								)
+							: undefined;
+						let transformed = instruction
+							? { ...context, instructions: [...(context.instructions ?? []), instruction] }
+							: context;
+						transformed = obfuscator ? obfuscateProviderContext(obfuscator, transformed) : transformed;
 						transformed = clampProviderContextImages(transformed, transformModel);
 						transformed = await normalizeProviderContextImagesForModel(transformed, transformModel);
-						return withDateCwdReminder(
-							transformed,
-							formatLocalCalendarDate(),
-							normalizePromptPath(sessionManager.getCwd()),
-						);
+						return transformed;
 					},
 					thinkingBudgets: agent.thinkingBudgets,
 					temperature: agent.temperature,

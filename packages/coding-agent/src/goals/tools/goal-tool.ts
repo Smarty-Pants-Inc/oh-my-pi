@@ -11,7 +11,7 @@ import type { ToolSession } from "../../tools";
 import { formatErrorDetail, TRUNCATE_LENGTHS } from "../../tools/render-utils";
 import { ToolError } from "../../tools/tool-errors";
 import { framedBlock, renderStatusLine, truncateToWidth } from "../../tui";
-import { completionBudgetReport, remainingTokens } from "../runtime";
+import { completionBudgetReport, remainingTokens, sameRouteFailureLimitLabel } from "../runtime";
 import type { Goal, GoalStatus, GoalToolDetails } from "../state";
 
 const goalSchema = type({
@@ -59,7 +59,9 @@ function validateCreateParams(params: GoalToolInput): { objective: string; token
 export class GoalTool implements AgentTool<typeof goalSchema, GoalToolDetails> {
 	readonly name = "goal";
 	readonly label = "Goal";
-	readonly description = prompt.render(goalDescription);
+	readonly description = prompt.render(goalDescription, {
+		sameRouteFailureLimit: sameRouteFailureLimitLabel(),
+	});
 	readonly parameters = goalSchema;
 	readonly strict = true;
 	readonly intent = "omit" as const;

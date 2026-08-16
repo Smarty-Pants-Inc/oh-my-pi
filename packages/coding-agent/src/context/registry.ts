@@ -31,6 +31,56 @@ export interface PromptRegistry {
 	nonModelDocumentation: string[];
 }
 
+export type AutomaticTurnBehaviorSource =
+	| "active_goal_continuation"
+	| "active_async_result_wake"
+	| "bounded_transport_or_protocol_retry";
+
+export interface AgentBehavior {
+	version: 1;
+	automaticTurns: {
+		allowed: AutomaticTurnBehaviorSource[];
+		forbidden: string[];
+	};
+	goal: {
+		enabled: boolean;
+		create: "clear_user_or_system_request_only";
+		autoContinue: "active_only";
+		continuationModes: string[];
+		continuationRole: "internal_context";
+		modelOperations: string[];
+		ownerOrSystemOperations: string[];
+		sameRouteFailureLimit: number;
+	};
+	todo: {
+		enabled: boolean;
+		context: "every_turn_when_present";
+		contextItems: Array<"pending" | "in_progress" | "blocked">;
+		autoContinue: false;
+		stopReminders: boolean;
+		midRunNudges: boolean;
+		eager: "default" | "preferred" | "always";
+	};
+	task: {
+		enabled: boolean;
+		eager: "default" | "preferred" | "always";
+		forcedFanout: false;
+		maxRecursionDepth: number;
+	};
+	subagent: {
+		forceToolCallBeforeYield: false;
+		semanticAutoRetry: false;
+		boundedTransportRetry: true;
+	};
+	roles: { internalInstructionMayUseUserRole: false };
+	toolExecution: {
+		approvalMode: "always-ask" | "write" | "yolo";
+		workspaceWrites: "allow";
+		outsideWorkspaceWrites: "explicit_capability";
+		externalEffects: "explicit_capability";
+	};
+}
+
 export interface RegisteredContextComponent {
 	id: string;
 	sourcePath: string;
@@ -46,6 +96,178 @@ export interface RegisteredContextComponent {
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
+
+function requireRecord(value: unknown, field: string, keys: readonly string[]): Record<string, unknown> {
+	if (!isRecord(value)) throw new Error(`agent behavior ${field} must be an object`);
+	const actual = Object.keys(value).sort();
+	const expected = [...keys].sort();
+	if (actual.length !== expected.length || actual.some((key, index) => key !== expected[index])) {
+		throw new Error(`agent behavior ${field} has unknown or missing fields`);
+	}
+	return value;
+}
+
+function requireBoolean(value: unknown, field: string): boolean {
+	if (typeof value !== "boolean") throw new Error(`agent behavior ${field} must be a boolean`);
+	return value;
+}
+
+function requireInteger(value: unknown, field: string, minimum = 0): number {
+	if (!Number.isSafeInteger(value) || (value as number) < minimum) {
+		throw new Error(`agent behavior ${field} must be an integer >= ${minimum}`);
+	}
+	return value as number;
+}
+
+function requireLiteral<T extends string>(value: unknown, field: string, allowed: readonly T[]): T {
+	if (typeof value !== "string" || !allowed.includes(value as T)) {
+		throw new Error(`agent behavior ${field} has an invalid value`);
+	}
+	return value as T;
+}
+
+function requireFalse(value: unknown, field: string): false {
+	if (value !== false) throw new Error(`agent behavior ${field} must be false`);
+	return false;
+}
+
+function requireTrue(value: unknown, field: string): true {
+	if (value !== true) throw new Error(`agent behavior ${field} must be true`);
+	return true;
+}
+
+function requireUniqueStrings(value: unknown, field: string): string[] {
+	const items = parseStringArray(value, `agent behavior ${field}`);
+	if (new Set(items).size !== items.length) throw new Error(`agent behavior ${field} must be unique`);
+	return items;
+}
+
+export function parseAgentBehavior(source = behaviorSource): AgentBehavior {
+	const root = requireRecord(YAML.parse(source), "root", [
+		"version",
+		"automaticTurns",
+		"goal",
+		"todo",
+		"task",
+		"subagent",
+		"roles",
+		"toolExecution",
+	]);
+	if (root.version !== 1) throw new Error("agent behavior version must be 1");
+
+	const automaticTurns = requireRecord(root.automaticTurns, "automaticTurns", ["allowed", "forbidden"]);
+	const allowedValues = [
+		"active_goal_continuation",
+		"active_async_result_wake",
+		"bounded_transport_or_protocol_retry",
+	] as const;
+	const allowed: AutomaticTurnBehaviorSource[] = requireUniqueStrings(
+		automaticTurns.allowed,
+		"automaticTurns.allowed",
+	).map(value => requireLiteral(value, "automaticTurns.allowed", allowedValues));
+	const goal = requireRecord(root.goal, "goal", [
+		"enabled",
+		"create",
+		"autoContinue",
+		"continuationModes",
+		"continuationRole",
+		"modelOperations",
+		"ownerOrSystemOperations",
+		"sameRouteFailureLimit",
+	]);
+	const todo = requireRecord(root.todo, "todo", [
+		"enabled",
+		"context",
+		"contextItems",
+		"autoContinue",
+		"stopReminders",
+		"midRunNudges",
+		"eager",
+	]);
+	const task = requireRecord(root.task, "task", ["enabled", "eager", "forcedFanout", "maxRecursionDepth"]);
+	const subagent = requireRecord(root.subagent, "subagent", [
+		"forceToolCallBeforeYield",
+		"semanticAutoRetry",
+		"boundedTransportRetry",
+	]);
+	const roles = requireRecord(root.roles, "roles", ["internalInstructionMayUseUserRole"]);
+	const toolExecution = requireRecord(root.toolExecution, "toolExecution", [
+		"approvalMode",
+		"workspaceWrites",
+		"outsideWorkspaceWrites",
+		"externalEffects",
+	]);
+
+	const stopReminders = requireBoolean(todo.stopReminders, "todo.stopReminders");
+	const midRunNudges = requireBoolean(todo.midRunNudges, "todo.midRunNudges");
+	if (stopReminders !== midRunNudges) {
+		throw new Error("agent behavior todo.stopReminders and todo.midRunNudges must match the shared reminder default");
+	}
+
+	return {
+		version: 1,
+		automaticTurns: {
+			allowed,
+			forbidden: requireUniqueStrings(automaticTurns.forbidden, "automaticTurns.forbidden"),
+		},
+		goal: {
+			enabled: requireBoolean(goal.enabled, "goal.enabled"),
+			create: requireLiteral(goal.create, "goal.create", ["clear_user_or_system_request_only"]),
+			autoContinue: requireLiteral(goal.autoContinue, "goal.autoContinue", ["active_only"]),
+			continuationModes: requireUniqueStrings(goal.continuationModes, "goal.continuationModes"),
+			continuationRole: requireLiteral(goal.continuationRole, "goal.continuationRole", ["internal_context"]),
+			modelOperations: requireUniqueStrings(goal.modelOperations, "goal.modelOperations"),
+			ownerOrSystemOperations: requireUniqueStrings(goal.ownerOrSystemOperations, "goal.ownerOrSystemOperations"),
+			sameRouteFailureLimit: requireInteger(goal.sameRouteFailureLimit, "goal.sameRouteFailureLimit", 1),
+		},
+		todo: {
+			enabled: requireBoolean(todo.enabled, "todo.enabled"),
+			context: requireLiteral(todo.context, "todo.context", ["every_turn_when_present"]),
+			contextItems: requireUniqueStrings(todo.contextItems, "todo.contextItems").map(value =>
+				requireLiteral(value, "todo.contextItems", ["pending", "in_progress", "blocked"]),
+			),
+			autoContinue: requireFalse(todo.autoContinue, "todo.autoContinue"),
+			stopReminders,
+			midRunNudges,
+			eager: requireLiteral(todo.eager, "todo.eager", ["default", "preferred", "always"]),
+		},
+		task: {
+			enabled: requireBoolean(task.enabled, "task.enabled"),
+			eager: requireLiteral(task.eager, "task.eager", ["default", "preferred", "always"]),
+			forcedFanout: requireFalse(task.forcedFanout, "task.forcedFanout"),
+			maxRecursionDepth: requireInteger(task.maxRecursionDepth, "task.maxRecursionDepth"),
+		},
+		subagent: {
+			forceToolCallBeforeYield: requireFalse(subagent.forceToolCallBeforeYield, "subagent.forceToolCallBeforeYield"),
+			semanticAutoRetry: requireFalse(subagent.semanticAutoRetry, "subagent.semanticAutoRetry"),
+			boundedTransportRetry: requireTrue(subagent.boundedTransportRetry, "subagent.boundedTransportRetry"),
+		},
+		roles: {
+			internalInstructionMayUseUserRole: requireFalse(
+				roles.internalInstructionMayUseUserRole,
+				"roles.internalInstructionMayUseUserRole",
+			),
+		},
+		toolExecution: {
+			approvalMode: requireLiteral(toolExecution.approvalMode, "toolExecution.approvalMode", [
+				"always-ask",
+				"write",
+				"yolo",
+			]),
+			workspaceWrites: requireLiteral(toolExecution.workspaceWrites, "toolExecution.workspaceWrites", ["allow"]),
+			outsideWorkspaceWrites: requireLiteral(
+				toolExecution.outsideWorkspaceWrites,
+				"toolExecution.outsideWorkspaceWrites",
+				["explicit_capability"],
+			),
+			externalEffects: requireLiteral(toolExecution.externalEffects, "toolExecution.externalEffects", [
+				"explicit_capability",
+			]),
+		},
+	};
+}
+
+export const agentBehavior = parseAgentBehavior();
 
 function parseStringArray(value: unknown, field: string): string[] {
 	if (!Array.isArray(value) || value.some(item => typeof item !== "string")) {

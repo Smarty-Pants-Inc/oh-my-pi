@@ -1,4 +1,5 @@
 import { escapeXmlText, prompt, Snowflake } from "@oh-my-pi/pi-utils";
+import { agentBehavior } from "../context/registry";
 import goalBudgetLimitPrompt from "../prompts/goals/goal-budget-limit.md" with { type: "text" };
 import goalContinuationPrompt from "../prompts/goals/goal-continuation.md" with { type: "text" };
 import goalModeActivePrompt from "../prompts/goals/goal-mode-active.md" with { type: "text" };
@@ -54,6 +55,10 @@ function remainingValue(goal: Goal): string {
 	return goal.tokenBudget === undefined ? "unbounded" : String(Math.max(0, goal.tokenBudget - goal.tokensUsed));
 }
 
+export function sameRouteFailureLimitLabel(): string {
+	return agentBehavior.goal.sameRouteFailureLimit === 2 ? "two" : String(agentBehavior.goal.sameRouteFailureLimit);
+}
+
 export function remainingTokens(goal: Goal | null | undefined): number | null {
 	if (!goal || goal.tokenBudget === undefined) return null;
 	return Math.max(0, goal.tokenBudget - goal.tokensUsed);
@@ -93,6 +98,7 @@ export function renderGoalPrompt(kind: GoalPromptKind, goal: Goal): string {
 		tokenBudget: budgetValue(goal),
 		remainingTokens: remainingValue(goal),
 		timeUsedSeconds: String(goal.timeUsedSeconds),
+		sameRouteFailureLimit: sameRouteFailureLimitLabel(),
 	});
 }
 

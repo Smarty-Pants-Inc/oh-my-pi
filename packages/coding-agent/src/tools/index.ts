@@ -7,6 +7,7 @@ import type { Rule } from "../capability/rule";
 import type { SessionCapabilities } from "../capability/session-capabilities";
 import type { PromptTemplate } from "../config/prompt-templates";
 import type { Settings } from "../config/settings";
+import { agentBehavior } from "../context/registry";
 import { EditTool } from "../edit";
 import { checkJuliaKernelAvailability } from "../eval/jl/kernel";
 import { checkPythonKernelAvailability } from "../eval/py/kernel";
@@ -652,7 +653,10 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 			);
 		}
 		if (name === "task") {
-			return canSpawnAtDepth(session.settings.get("task.maxRecursionDepth") ?? 2, session.taskDepth ?? 0);
+			return (
+				agentBehavior.task.enabled &&
+				canSpawnAtDepth(session.settings.get("task.maxRecursionDepth"), session.taskDepth ?? 0)
+			);
 		}
 		return true;
 	};

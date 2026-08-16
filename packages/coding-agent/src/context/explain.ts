@@ -13,7 +13,7 @@ import { approvalStatus } from "./approved-policy";
 import { canonicalJson, type JsonValue, sha256 } from "./canonical";
 import { buildContextReleaseManifest, type ContextReleaseManifest, canonicalGithubRepository } from "./manifest";
 import {
-	behaviorRegistrySource,
+	agentBehavior,
 	type ContextRole,
 	type ContextTarget,
 	promptRegistry,
@@ -39,6 +39,7 @@ export interface RuntimeContextEvidence {
 }
 
 type ProviderInstructionBlock = { actualRole: "system" | "developer"; renderedText: string };
+const PROVIDER_PAYLOAD_EVIDENCE = Symbol.for("oh-my-pi.provider-payload-evidence");
 
 function record(value: unknown): Record<string, unknown> | undefined {
 	return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -64,9 +65,72 @@ function roleBlocks(value: unknown): ProviderInstructionBlock[] {
 	});
 }
 
-function finalProviderInstructionBlocks(payload: unknown, model: Pick<Model, "api">): ProviderInstructionBlock[] {
+function cursorInstructionBlocks(payload: Record<string, unknown>): ProviderInstructionBlock[] {
+	const evidence = record((payload as Record<PropertyKey, unknown>)[PROVIDER_PAYLOAD_EVIDENCE]);
+	if (evidence?.kind !== "cursor-root-prompt") {
+		throw new Error("Cursor final provider payload is missing exact root-prompt evidence");
+	}
+	const ids = evidence.rootPromptMessageIds;
+	const jsonBlocks = evidence.rootPromptMessagesJson;
+	const state = record(payload.conversationState);
+	const roots = state?.rootPromptMessagesJson;
+	if (!Array.isArray(ids) || !Array.isArray(jsonBlocks) || !Array.isArray(roots) || ids.length !== jsonBlocks.length) {
+		throw new Error("Cursor final provider payload has invalid root-prompt evidence");
+	}
+	for (let index = 0; index < ids.length; index++) {
+		const root = roots[index];
+		if (!(root instanceof Uint8Array) || typeof ids[index] !== "string") {
+			throw new Error("Cursor final provider payload has invalid root-prompt ids");
+		}
+		if (Buffer.from(root).toString("base64") !== ids[index]) {
+			throw new Error("Cursor payload guard changed the protected root-prompt topology");
+		}
+	}
+	return jsonBlocks.map((value, index) => {
+		if (typeof value !== "string") throw new Error(`Cursor root-prompt evidence ${index} is not JSON text`);
+		const message = record(JSON.parse(value));
+		if (message?.role !== "system" || typeof message.content !== "string") {
+			throw new Error(`Cursor root-prompt evidence ${index} is not a system instruction`);
+		}
+		return { actualRole: "system" as const, renderedText: message.content };
+	});
+}
+
+function devinInstructionBlocks(
+	payload: Record<string, unknown>,
+	candidates: readonly ContextInstruction[],
+): ProviderInstructionBlock[] {
+	if (typeof payload.prompt !== "string") throw new Error("Devin final provider payload is missing prompt text");
+	let prefixEnd = payload.prompt.length;
+	const instructions: ProviderInstructionBlock[] = [];
+	for (let index = candidates.length - 1; index >= 0; index--) {
+		const renderedText = candidates[index]!.renderedText.toWellFormed();
+		const start = prefixEnd - renderedText.length;
+		if (start < 0 || payload.prompt.slice(start, prefixEnd) !== renderedText) {
+			throw new Error(`Devin final provider payload is missing instruction ${candidates[index]!.id}`);
+		}
+		instructions.unshift({ actualRole: "system", renderedText });
+		prefixEnd = start;
+		if (prefixEnd > 0) {
+			if (payload.prompt.slice(prefixEnd - 2, prefixEnd) !== "\n\n") {
+				throw new Error("Devin final provider payload has ambiguous instruction boundaries");
+			}
+			prefixEnd -= 2;
+		}
+	}
+	const prefix = payload.prompt.slice(0, prefixEnd);
+	return prefix.length > 0 ? [{ actualRole: "system", renderedText: prefix }, ...instructions] : instructions;
+}
+
+function finalProviderInstructionBlocks(
+	payload: unknown,
+	model: Pick<Model, "api">,
+	candidates: readonly ContextInstruction[],
+): ProviderInstructionBlock[] {
 	const body = record(payload);
 	if (!body) return [];
+	if (model.api === "cursor-agent") return cursorInstructionBlocks(body);
+	if (model.api === "devin-agent") return devinInstructionBlocks(body, candidates);
 	if (model.api === "anthropic-messages" || model.api === "bedrock-converse-stream") {
 		const system = Array.isArray(body.system) ? body.system : [];
 		return system.flatMap(block => {
@@ -129,8 +193,8 @@ export function captureRuntimeContextEvidence(
 	candidates: readonly ContextInstruction[],
 	renderedToolContracts?: RenderedToolContractExport,
 ): RuntimeContextEvidence {
-	const blocks = finalProviderInstructionBlocks(payload, model);
 	const candidateList = candidates.filter(candidate => candidate.renderedText.trim().length > 0);
+	const blocks = finalProviderInstructionBlocks(payload, model, candidateList);
 	const matched = new Map<number, ContextInstruction>();
 	const matchedCandidates = new Set<ContextInstruction>();
 	const supportsDeveloperRole = supportsDeveloperRoleForContext(model);
@@ -826,8 +890,7 @@ export async function explainContext(options: {
 
 	components.sort((left, right) => left.precedence - right.precedence || left.id.localeCompare(right.id));
 
-	const behavior = YAML.parse(behaviorRegistrySource()) as Record<string, unknown>;
-	const automaticTurns = behavior.automaticTurns as { allowed?: string[] } | undefined;
+	const behavior = agentBehavior;
 	return {
 		schema: "omp.context_explain.v1",
 		target: options.target,
@@ -838,7 +901,7 @@ export async function explainContext(options: {
 		components,
 		behavior,
 		behaviorSource: "agent-behavior.yml",
-		automaticTurnSources: [...(automaticTurns?.allowed ?? [])].sort(),
+		automaticTurnSources: [...behavior.automaticTurns.allowed].sort(),
 		toolContracts: selectedRenderedToolContracts
 			? { status: "effective", export: selectedRenderedToolContracts }
 			: {

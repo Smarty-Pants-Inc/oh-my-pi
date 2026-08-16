@@ -301,6 +301,7 @@ const NOT_IMPLEMENTED = `Not implemented by this client`;
 const conversationStateCache = new Map<string, ConversationStateStructure>();
 const conversationBlobStores = new Map<string, Map<string, Uint8Array>>();
 const warnedCursorKimiK3ReplayMessages = new Set<string>();
+const PROVIDER_PAYLOAD_EVIDENCE = Symbol.for("oh-my-pi.provider-payload-evidence");
 /**
  * Base conversation id → rotated wire id (#8345). Cursor's backend can pin a
  * per-conversation rejection (bare `resource_exhausted`, zero tokens) to one
@@ -4680,9 +4681,8 @@ async function buildGrpcRequest(
 }> {
 	const blobStore = state.blobStore;
 
-	const systemPromptIds = buildCursorSystemPromptJsons(context.systemPrompt, context.instructions, model).map(json =>
-		storeCursorBlob(blobStore, new TextEncoder().encode(json)),
-	);
+	const systemPromptJsons = buildCursorSystemPromptJsons(context.systemPrompt, context.instructions, model);
+	const systemPromptIds = systemPromptJsons.map(json => storeCursorBlob(blobStore, new TextEncoder().encode(json)));
 
 	const activeUserMessageIndex = context.messages.length - 1;
 	const activeMessage = context.messages[activeUserMessageIndex];
@@ -4794,6 +4794,14 @@ async function buildGrpcRequest(
 	if (options?.customSystemPrompt) {
 		runRequest.customSystemPrompt = options.customSystemPrompt;
 	}
+	Object.defineProperty(runRequest, PROVIDER_PAYLOAD_EVIDENCE, {
+		value: {
+			kind: "cursor-root-prompt",
+			rootPromptMessageIds: systemPromptIds.map(id => Buffer.from(id).toString("base64")),
+			rootPromptMessagesJson: systemPromptJsons,
+		},
+		enumerable: false,
+	});
 
 	const replacementPayload = await options?.onPayload?.(runRequest, model);
 	if (replacementPayload !== undefined) runRequest = replacementPayload as typeof runRequest;

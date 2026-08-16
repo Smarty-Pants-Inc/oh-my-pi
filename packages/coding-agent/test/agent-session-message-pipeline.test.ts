@@ -333,13 +333,15 @@ describe("AgentSession message pipeline", () => {
 
 			expect(contexts).toHaveLength(1);
 			const userMessage = contexts[0]!.messages.find(message => message.role === "user");
-			// The date/cwd reminder rides on the first user turn (#7404); the contract
-			// here is that the undecodable WebP is replaced by the placeholder text.
+			// OMP-authored date/cwd context uses the typed instruction channel; the
+			// user message retains only user content plus the image placeholder.
 			expect(userMessage?.content).toEqual([
-				{ type: "text", text: expect.stringContaining("<system-reminder>") },
 				{ type: "text", text: "inspect this" },
 				{ type: "text", text: "[image omitted: WebP could not be decoded for this model]" },
 			]);
+			expect(contexts[0]!.instructions).toContainEqual(
+				expect.objectContaining({ id: "system.date-cwd-reminder", role: "internal_context" }),
+			);
 		} finally {
 			await session.dispose();
 			authStorage.close();

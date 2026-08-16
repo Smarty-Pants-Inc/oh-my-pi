@@ -78,11 +78,10 @@ export function parseGoalModeState(mode: unknown, modeData: unknown): GoalModeSt
 	const status = normalizeGoalStatus(value.status);
 	if (!status) return undefined;
 	if (mode === "goal_paused" ? status !== "paused" : status === "paused") return undefined;
-	const complete = status === "complete";
 	return {
-		enabled: status === "active" || status === "budget_limited",
-		mode: complete ? "exiting" : "active",
-		reason: complete ? "completed" : undefined,
+		enabled: status === "active",
+		mode: "active",
+		reason: undefined,
 		goal: {
 			id: value.id,
 			objective: value.objective,
