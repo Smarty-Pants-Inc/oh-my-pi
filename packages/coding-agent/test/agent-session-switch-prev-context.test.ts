@@ -3276,17 +3276,6 @@ describe("AgentSession.switchSession previous-context build", () => {
 		};
 		session.agent.replaceQueues([retainedAdvisorCard], []);
 		let receiptSettled = false;
-		const receipt = session.yieldQueue.enqueueWithReceipt("advisor", {
-			note: "retained tree yield",
-			severity: "nit" as const,
-			advisor: undefined,
-		});
-		void receipt.then(
-			() => {
-				receiptSettled = true;
-			},
-			() => {},
-		);
 		const advisorReset = vi.spyOn(SessionAdvisors.prototype, "resetSessionState");
 		const retainedAdvisorResetCalls = advisorReset.mock.calls.length;
 		const retainedEntries = sessionManager.getEntries().map(entry => entry.id);
@@ -3386,6 +3375,20 @@ describe("AgentSession.switchSession previous-context build", () => {
 			},
 		);
 
+		// Queue at the transition boundary. The normal 1 ms idle dispatcher may
+		// consume an earlier entry before navigation starts under a loaded runner;
+		// this case exercises lifecycle quarantine after the fence is acquired.
+		const receipt = session.yieldQueue.enqueueWithReceipt("advisor", {
+			note: "retained tree yield",
+			severity: "nit" as const,
+			advisor: undefined,
+		});
+		void receipt.then(
+			() => {
+				receiptSettled = true;
+			},
+			() => {},
+		);
 		await expect(session.navigateTree(rootEntryId)).rejects.toBe(failure);
 
 		expect(phases).toEqual(["fence", "tree", "rollback"]);
