@@ -284,7 +284,7 @@ describe("AgentSession auto-compaction progress guard", () => {
 		expect(noProgress.length).toBe(1);
 	});
 
-	it("drains queued messages when no-headroom compaction pauses auto-continue", async () => {
+	it("does not drain an unscoped queued message when no-headroom compaction pauses", async () => {
 		session.agent.followUp({
 			role: "custom",
 			customType: "test",
@@ -293,9 +293,7 @@ describe("AgentSession auto-compaction progress guard", () => {
 			timestamp: Date.now(),
 		});
 
-		const continueSpy = vi.spyOn(session.agent, "continue").mockImplementation(async () => {
-			session.agent.clearAllQueues();
-		});
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue(undefined);
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined as never);
 		vi.spyOn(session, "getContextUsage").mockReturnValue({ tokens: 190000, contextWindow: 200000, percent: 95 });
 
@@ -314,9 +312,11 @@ describe("AgentSession auto-compaction progress guard", () => {
 		await session.waitForIdle();
 
 		expect(promptSpy).not.toHaveBeenCalled();
-		expect(continueSpy).toHaveBeenCalledTimes(1);
+		expect(continueSpy).not.toHaveBeenCalled();
+		expect(session.agent.hasQueuedMessages()).toBe(true);
 		const noProgress = notices.filter(n => n.source === NOTICE_SOURCE && n.message.includes(NO_PROGRESS_FRAGMENT));
 		expect(noProgress.length).toBe(1);
+		session.agent.clearAllQueues();
 	});
 
 	it("blocks automatic maintenance when threshold compaction has nothing to summarize", async () => {
@@ -350,7 +350,7 @@ describe("AgentSession auto-compaction progress guard", () => {
 		expect(noProgress.length).toBe(1);
 	});
 
-	it("drains queued messages when no-op threshold compaction pauses automatic maintenance", async () => {
+	it("does not drain an unscoped queued message when no-op compaction pauses", async () => {
 		session.agent.followUp({
 			role: "custom",
 			customType: "test",
@@ -359,9 +359,7 @@ describe("AgentSession auto-compaction progress guard", () => {
 			timestamp: Date.now(),
 		});
 
-		const continueSpy = vi.spyOn(session.agent, "continue").mockImplementation(async () => {
-			session.agent.clearAllQueues();
-		});
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue(undefined);
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined as never);
 		vi.spyOn(compactionModule, "prepareCompaction").mockReturnValue(undefined);
 
@@ -380,9 +378,11 @@ describe("AgentSession auto-compaction progress guard", () => {
 		await session.waitForIdle();
 
 		expect(promptSpy).not.toHaveBeenCalled();
-		expect(continueSpy).toHaveBeenCalledTimes(1);
+		expect(continueSpy).not.toHaveBeenCalled();
+		expect(session.agent.hasQueuedMessages()).toBe(true);
 		const noProgress = notices.filter(n => n.source === NOTICE_SOURCE && n.message.includes(NO_PROGRESS_FRAGMENT));
 		expect(noProgress.length).toBe(1);
+		session.agent.clearAllQueues();
 	});
 
 	it("does not auto-continue after compaction of a terminal text answer with no queued work", async () => {
@@ -735,10 +735,8 @@ describe("AgentSession auto-compaction progress guard", () => {
 		// written a compaction summary. Restore the failed assistant before the queue
 		// drains so the transcript keeps the reason recovery stopped.
 		session.agent.followUp({
-			role: "custom",
-			customType: "test",
+			role: "user",
 			content: [{ type: "text", text: "Queued while recovering" }],
-			display: false,
 			timestamp: Date.now(),
 		});
 		vi.spyOn(compactionModule, "prepareCompaction").mockReturnValue(undefined);

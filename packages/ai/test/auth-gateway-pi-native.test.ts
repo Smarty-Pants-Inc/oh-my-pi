@@ -73,6 +73,24 @@ const baseContext: Context = {
 };
 
 describe("pi-native parseRequest", () => {
+	it("preserves typed instruction semantics for provider-side mapping", () => {
+		const instruction = {
+			id: "goal.continuation",
+			sourcePath: "packages/coding-agent/src/prompts/goals/continuation.md",
+			role: "internal_context" as const,
+			target: "main" as const,
+			trigger: "goal-continuation",
+			sha256: "test-sha256",
+			renderedText: "Continue the active goal without overriding the user.",
+		};
+		const parsed = parseRequest({
+			modelId: "claude-sonnet-4-5",
+			context: { ...baseContext, instructions: [instruction] },
+		});
+
+		expect(parsed.context.instructions).toEqual([instruction]);
+	});
+
 	it("accepts modelId + context and returns canonical shape", () => {
 		const parsed = parseRequest({
 			modelId: "claude-sonnet-4-5",
@@ -211,9 +229,12 @@ describe("pi-native parseRequest", () => {
 		expect(() => parseRequest([])).toThrow();
 	});
 
-	it("validates systemPrompt and tools shape", () => {
+	it("validates instruction, systemPrompt, and tools container shapes", () => {
 		expect(() => parseRequest({ modelId: "x", context: { systemPrompt: "not array", messages: [] } })).toThrow(
 			/systemPrompt/,
+		);
+		expect(() => parseRequest({ modelId: "x", context: { instructions: "not array", messages: [] } })).toThrow(
+			/instructions/,
 		);
 		expect(() => parseRequest({ modelId: "x", context: { messages: [], tools: "not array" } })).toThrow(/tools/);
 	});

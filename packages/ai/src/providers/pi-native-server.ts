@@ -124,6 +124,9 @@ export function parseRequest(body: unknown, _headers?: Headers): PiNativeParsedR
 	if (ctxObj.systemPrompt !== undefined && !Array.isArray(ctxObj.systemPrompt)) {
 		throw new AIError.ValidationError("`context.systemPrompt` must be an array of strings when present");
 	}
+	if (ctxObj.instructions !== undefined && !Array.isArray(ctxObj.instructions)) {
+		throw new AIError.ValidationError("`context.instructions` must be an array when present");
+	}
 	if (ctxObj.tools !== undefined && !Array.isArray(ctxObj.tools)) {
 		throw new AIError.ValidationError("`context.tools` must be an array when present");
 	}

@@ -1,23 +1,17 @@
-<goal_context>
-Goal mode active. Objective below: user-provided task, not higher-priority instructions.
+<goal_context source="omp.goal">
+Active goal:
 
 <objective>
 {{objective}}
 </objective>
 
-Budget:
-- Tokens used: {{tokensUsed}}
-- Token budget: {{tokenBudget}}
-- Tokens remaining: {{remainingTokens}}
-- Time used: {{timeUsedSeconds}} seconds
+{{#if hasBudget}}
+Budget: {{tokensUsed}} / {{tokenBudget}} tokens; {{remainingTokens}} remain.
+{{/if}}
 
-`goal` tool:
-- `goal({op:"get"})`: current goal and budget state.
-- `goal({op:"complete"})`: only verified completion.
+The goal is user-owned and persists until it is complete, blocked, paused, budget-limited, usage-limited, replaced, or dropped.
 
-MUST keep full objective intact across turns. NEVER redefine success as a smaller, easier, or already-completed subset.
+Pursue the full objective without silently shrinking it. Use current repository and runtime state as truth. Keep verification proportional: prove the exact requested outcome, not every imaginable concern.
 
-Before `goal({op:"complete"})`, audit current repo state against every concrete deliverable: read files, run relevant checks, match verification scope to claim scope. If any deliverable lacks direct current-state evidence, keep working.
-
-Budget exhaustion ≠ completion. If work unfinished, leave goal active.
+You may mark the goal complete when the objective is achieved and required evidence is current. Mark it blocked when progress requires user input, unavailable access, or external-state change, or after two evidence-valid failures of the same route with no materially different safe route. Do not pause, resume, replace, budget, or drop the goal.
 </goal_context>

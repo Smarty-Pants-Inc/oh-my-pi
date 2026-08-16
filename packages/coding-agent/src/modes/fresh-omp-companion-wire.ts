@@ -53,9 +53,12 @@ const THINKING_LEVELS: Record<ThinkingLevel, true> = {
 const GOAL_STATUSES: Record<GoalStatus, true> = {
 	active: true,
 	paused: true,
-	"budget-limited": true,
+	blocked: true,
+	budget_limited: true,
+	usage_limited: true,
 	complete: true,
 	dropped: true,
+	superseded: true,
 };
 
 export type CompanionStateName =

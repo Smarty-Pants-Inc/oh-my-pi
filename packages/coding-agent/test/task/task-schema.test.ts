@@ -13,9 +13,10 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 // test/task/task-batch.test.ts).
 
 describe("task schema (single-spawn)", () => {
-	it("accepts {agent, task}", () => {
-		const parsed = taskSchema({ agent: "scout", task: "Map the auth module." });
+	it("accepts a direct model selector", () => {
+		const parsed = taskSchema({ agent: "scout", task: "Map the auth module.", model: "openai/gpt-5.6" });
 		expect(parsed instanceof type.errors).toBe(false);
+		if (!(parsed instanceof type.errors)) expect(parsed.model).toBe("openai/gpt-5.6");
 	});
 
 	it("defaults agent to `task` when omitted", () => {

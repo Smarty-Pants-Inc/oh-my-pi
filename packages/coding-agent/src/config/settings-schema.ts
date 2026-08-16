@@ -3721,7 +3721,7 @@ export const SETTINGS_SCHEMA = {
 
 	"todo.reminders": {
 		type: "boolean",
-		default: true,
+		default: false,
 		ui: {
 			tab: "tools",
 			group: "Todos",
@@ -4463,7 +4463,7 @@ export const SETTINGS_SCHEMA = {
 			"block-clone",
 			"rcopy",
 		] as const,
-		default: "none",
+		default: "auto",
 		ui: {
 			tab: "tasks",
 			group: "Isolation",
@@ -4584,7 +4584,7 @@ export const SETTINGS_SCHEMA = {
 
 	"task.enableEffort": {
 		type: "boolean",
-		default: false,
+		default: true,
 		ui: {
 			tab: "tasks",
 			group: "Subagents",

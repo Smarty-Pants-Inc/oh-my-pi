@@ -1,3 +1,4 @@
+import * as path from "node:path";
 import {
 	Agent,
 	type AgentEvent,
@@ -28,7 +29,17 @@ import {
 } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import { FALLBACK_DIALECT, preferredDialect } from "@oh-my-pi/pi-catalog/identity";
 import type { Component } from "@oh-my-pi/pi-tui";
-import { $env, $flag, getAgentDir, getProjectDir, logger, postmortem, prompt, Snowflake } from "@oh-my-pi/pi-utils";
+import {
+	$env,
+	$flag,
+	getAgentDir,
+	getProjectDir,
+	isBunTestRuntime,
+	logger,
+	postmortem,
+	prompt,
+	Snowflake,
+} from "@oh-my-pi/pi-utils";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import {
 	discoverAdvisorConfigs,
@@ -43,6 +54,7 @@ import { createAutoresearchExtension } from "./autoresearch";
 import { loadCapability } from "./capability";
 import { type Rule, ruleCapability, setActiveRules } from "./capability/rule";
 import { bucketRules } from "./capability/rule-buckets";
+import { SessionCapabilities, type TaskOwnedResource } from "./capability/session-capabilities";
 import { shouldEnableAppendOnlyContext } from "./config/append-only-context-mode";
 import { shouldInlineToolDescriptors } from "./config/inline-tool-descriptors-mode";
 import { isAuthenticated, kNoAuth, ModelRegistry } from "./config/model-registry";
@@ -63,6 +75,8 @@ import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate
 import { applyProviderGlobalsFromSettings } from "./config/provider-globals";
 import { buildServiceTierByFamily } from "./config/service-tier";
 import { Settings, type SkillsSettings } from "./config/settings";
+import { ensureApprovedStartup } from "./context/approved-policy";
+import { type ContextReleaseManifest, canonicalAgentDirPath } from "./context/manifest";
 import { CursorExecHandlers, type CursorMcpResourceAdapter } from "./cursor";
 import { createBridgeEditTool, createBridgeGrepFactory } from "./cursor-bridge-tools";
 import "./discovery";
@@ -607,6 +621,12 @@ export interface CreateAgentSessionOptions {
 
 	/** Whether to auto-approve all tool calls (--auto-approve CLI flag). Default: false */
 	autoApprove?: boolean;
+	/** Exact additional filesystem paths granted for writes in this session. */
+	writeAllowlist?: readonly string[];
+	/** Exact named consequential effects granted for this session. */
+	externalCapabilities?: readonly string[];
+	/** Resources created by this task and eligible for guarded cleanup. */
+	taskOwnedResources?: readonly TaskOwnedResource[];
 }
 
 /** Result from createAgentSession */
@@ -1251,13 +1271,20 @@ export function createAutoLearnCaptureRunner(
  * ```
  */
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
+	const releaseManifest = isBunTestRuntime() ? undefined : await ensureApprovedStartup();
+	if (releaseManifest && path.resolve(options.agentDir ?? getAgentDir()) !== canonicalAgentDirPath()) {
+		throw new Error(`PROMPT_POLICY_REVIEW_REQUIRED: runtime agent directory must be ${canonicalAgentDirPath()}`);
+	}
 	const rootMode = options.disableExtensionDiscovery ? "explicit-only" : "merge";
 	return await withOmpExtensionRootScope(options.additionalExtensionPaths ?? [], rootMode, () =>
-		createAgentSessionScoped(options),
+		createAgentSessionScoped(options, releaseManifest),
 	);
 }
 
-async function createAgentSessionScoped(options: CreateAgentSessionOptions): Promise<CreateAgentSessionResult> {
+async function createAgentSessionScoped(
+	options: CreateAgentSessionOptions,
+	releaseManifest: ContextReleaseManifest | undefined,
+): Promise<CreateAgentSessionResult> {
 	const cwd = options.cwd ?? getProjectDir();
 	const agentDir = options.agentDir ?? getAgentDir();
 	const eventBus = options.eventBus ?? new EventBus();
@@ -1371,6 +1398,13 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		const merged = [...new Set([...existing, ...configuredDirs])];
 		await sessionManager.setAdditionalDirectories(merged);
 	}
+	const sessionCapabilities = new SessionCapabilities({
+		workspace: cwd,
+		workspaceRoots: options.taskDepth && options.taskDepth > 0 ? [] : configuredDirs,
+		writeAllowlist: options.writeAllowlist,
+		externalCapabilities: options.externalCapabilities,
+		taskOwnedResources: options.taskOwnedResources,
+	});
 	const providerSessionId = options.providerSessionId ?? sessionManager.getSessionId();
 	const forkCacheShapeChanged =
 		options.model !== undefined ||
@@ -1693,6 +1727,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			isToolActive: name => activeToolNames.has(name),
 			setActiveToolNames,
 			toolRegistry,
+			capabilities: sessionCapabilities,
 			hasUI: options.hasUI ?? false,
 			getApiKey: options.getApiKey,
 			getExecutionEnvironment: () => resolvedExecutionEnvironment,
@@ -2984,13 +3019,27 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				renderMermaid: settings.get("tui.renderMermaid"),
 				activeRepoContext,
 			};
+			const stockPrompt = await buildSystemPromptInternal(promptOptions);
 			const defaultPrompt = systemPromptBuilder
 				? await systemPromptBuilder({
 						options: promptOptions,
 						templates: DEFAULT_SYSTEM_PROMPT_TEMPLATES,
-						build: templates => buildSystemPromptInternal(promptOptions, templates),
+						build: templates =>
+							templates ? buildSystemPromptInternal(promptOptions, templates) : Promise.resolve(stockPrompt),
+						releaseManifest,
 					})
-				: await buildSystemPromptInternal(promptOptions);
+				: stockPrompt;
+			if (
+				releaseManifest &&
+				systemPromptBuilder !== undefined &&
+				(JSON.stringify(defaultPrompt.systemPrompt) !== JSON.stringify(stockPrompt.systemPrompt) ||
+					JSON.stringify(defaultPrompt.xdevCatalogNames ?? []) !==
+						JSON.stringify(stockPrompt.xdevCatalogNames ?? []))
+			) {
+				throw new Error(
+					"PROMPT_POLICY_REVIEW_REQUIRED: provider-facing system prompt differs from the approved stock prompt",
+				);
+			}
 
 			if (options.systemPrompt === undefined) {
 				return defaultPrompt;
@@ -3002,6 +3051,11 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			const result = {
 				systemPrompt: typeof customPrompt === "string" ? [customPrompt] : customPrompt,
 			};
+			if (releaseManifest && JSON.stringify(result.systemPrompt) !== JSON.stringify(stockPrompt.systemPrompt)) {
+				throw new Error(
+					"PROMPT_POLICY_REVIEW_REQUIRED: provider-facing system prompt differs from the approved stock prompt",
+				);
+			}
 			if (executionEnvironment) {
 				assertExecutionEnvironmentSystemPrompt(executionEnvironment, result.systemPrompt);
 			}
@@ -3179,7 +3233,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// Final convertToLlm: live provider replay drops API-level refusal errors,
 		// then applies secret obfuscation to the remaining outbound context.
 		const convertToLlmFinal = (messages: AgentMessage[]): Message[] => {
-			const converted = filterProviderReplayMessages(convertToLlmWithBlockImages(messages));
+			const providerMessages = messages.filter(
+				message =>
+					message.role !== "custom" ||
+					(message.customType !== "goal-continuation" && message.customType !== "goal-mode-context"),
+			);
+			const converted = filterProviderReplayMessages(convertToLlmWithBlockImages(providerMessages));
 			if (!obfuscator?.hasSecrets()) return converted;
 			return obfuscateMessages(obfuscator, converted);
 		};
@@ -3211,7 +3270,11 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			if (executionEnvironment && context.systemPrompt) {
 				assertExecutionEnvironmentSystemPrompt(executionEnvironment, context.systemPrompt);
 			}
-			let transformed = obfuscator ? obfuscateProviderContext(obfuscator, context) : context;
+			const registeredInstructions = session?.buildProviderContextInstructions() ?? [];
+			let transformed: Context = registeredInstructions.length
+				? { ...context, instructions: [...(context.instructions ?? []), ...registeredInstructions] }
+				: context;
+			transformed = obfuscator ? obfuscateProviderContext(obfuscator, transformed) : transformed;
 			if (snapcompactInline) transformed = await snapcompactInline.transform(transformed, transformModel);
 			transformed = clampProviderContextImages(transformed, transformModel);
 			transformed = await normalizeProviderContextImagesForModel(transformed, transformModel);

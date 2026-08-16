@@ -176,27 +176,19 @@ function mockCreateAgentSession(session: AgentSession) {
 	} as CreateAgentSessionResult);
 }
 
-describe("runSubprocess async quiescence fresh-yield contract", () => {
+describe("runSubprocess async quiescence", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
 		AsyncJobManager.resetForTests();
 	});
 
-	it("parks a pending yield, injects the result, and completes on the fresh yield", async () => {
+	it("fails a stale yield without restarting the assignment", async () => {
 		const harness = createAsyncSession(({ promptIndex, harness: h }) => {
 			if (promptIndex === 1) {
 				// Terminal yield while the background job is still running.
 				h.emitTerminalYield({ report: "STALE: build passing (job still running)" });
 				return;
 			}
-			if (promptIndex === 2) {
-				// Async-pending notice: the model stands by. The job then
-				// finishes during the barrier's settle.
-				return;
-			}
-			// Reminder ladder after the async-result invalidated the yield:
-			// submit the fresh yield that accounts for the job outcome.
-			h.emitTerminalYield({ report: "FRESH: build failed, see job-1" });
 		});
 		mockCreateAgentSession(harness.session);
 
@@ -208,24 +200,20 @@ describe("runSubprocess async quiescence fresh-yield contract", () => {
 			id: "quiescence-fresh-yield",
 		});
 
-		// Run did not terminate on the parked yield: the barrier noticed, the
-		// job settled, and the ladder demanded exactly one more prompt.
-		expect(harness.prompts).toHaveLength(3);
+		expect(harness.prompts).toHaveLength(1);
 		expect(harness.settleCalls()).toBe(1);
 		// The parked yield stopped the turn without killing the run.
 		expect(harness.abortCalls()).toBeGreaterThanOrEqual(1);
-		// The fresh yield — not the stale one — is the result of record.
-		expect(result.exitCode).toBe(0);
-		expect(result.output).toContain("FRESH: build failed");
-		expect(result.output).not.toContain("STALE");
+		expect(result.exitCode).toBe(1);
+		expect(result.error).toContain("no refreshed terminal result");
+		expect(result.output).toContain("STALE: build passing");
 	});
 
-	it("fails the run when the model never refreshes the superseded yield", async () => {
+	it("does not prompt for a refreshed yield after background work settles", async () => {
 		const harness = createAsyncSession(({ promptIndex, harness: h }) => {
 			if (promptIndex === 1) {
 				h.emitTerminalYield({ report: "STALE: build passing (job still running)" });
 			}
-			// Notice and every reminder: the model never yields again.
 		});
 		mockCreateAgentSession(harness.session);
 
@@ -237,12 +225,9 @@ describe("runSubprocess async quiescence fresh-yield contract", () => {
 			id: "quiescence-stale-refusal",
 		});
 
-		// task + notice + full reminder ladder (3).
-		expect(harness.prompts).toHaveLength(5);
-		// Stale payload must not read as success; it ships only as failed-run
-		// salvage with an explicit reason.
+		expect(harness.prompts).toHaveLength(1);
 		expect(result.exitCode).toBe(1);
-		expect(result.error).toContain("refreshed yield");
+		expect(result.error).toContain("no refreshed terminal result");
 		expect(result.output).toContain("STALE: build passing");
 	});
 

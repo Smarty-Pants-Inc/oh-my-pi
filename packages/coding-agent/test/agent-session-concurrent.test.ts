@@ -193,17 +193,18 @@ describe("AgentSession concurrent prompt guard", () => {
 		expect(mock.calls).toHaveLength(0);
 		expect(session.agent.state.messages).toHaveLength(0);
 
-		await session.sendCustomMessage(
-			{ customType: "urgent-blocker", content: "urgent blocker", display: true, attribution: "agent" },
-			{ deliveryMode: "interrupt" },
-		);
-		expect(mock.calls).toHaveLength(1);
-		expect(JSON.stringify(mock.calls[0]?.context.messages)).toContain("urgent blocker");
-		expect(JSON.stringify(mock.calls[0]?.context.messages)).not.toContain("durable status");
+		await expect(
+			session.sendCustomMessage(
+				{ customType: "urgent-blocker", content: "urgent blocker", display: true, attribution: "agent" },
+				{ deliveryMode: "interrupt" },
+			),
+		).resolves.toEqual({ status: "downgraded", delivery: "plain_append", reason: "unscoped_automatic_turn" });
+		expect(mock.calls).toHaveLength(0);
 
 		await session.prompt("next explicit user prompt");
-		expect(mock.calls).toHaveLength(2);
-		expect(JSON.stringify(mock.calls[1]?.context.messages)).toContain("durable status");
+		expect(mock.calls).toHaveLength(1);
+		expect(JSON.stringify(mock.calls[0]?.context.messages)).toContain("urgent blocker");
+		expect(JSON.stringify(mock.calls[0]?.context.messages)).toContain("durable status");
 	});
 
 	it("attaches busy explicitPrompt delivery to the queued user follow-up", async () => {
@@ -360,51 +361,27 @@ describe("AgentSession concurrent prompt guard", () => {
 		expect(session.hasPendingMessages()).toBe(false);
 		session.setCustomMessageAcceptanceHookForTests(undefined);
 	});
-	it("reports a cancelled semantic prompt preflight without accepting or mutating", async () => {
+	it("does not run a prompt preflight for an unscoped semantic delivery", async () => {
 		await createSession({ "retry.usageAwareFallback": true });
 		const before = session.agent.state.messages.length;
-		const probeStarted = Promise.withResolvers<void>();
-		vi.spyOn(sharedAuthStorage, "getModelUsageHealth").mockImplementation(async (_provider, options) => {
-			probeStarted.resolve();
-			const aborted = Promise.withResolvers<never>();
-			options.signal?.addEventListener(
-				"abort",
-				() => aborted.reject(options.signal?.reason ?? new DOMException("Aborted", "AbortError")),
-				{ once: true },
-			);
-			return aborted.promise;
-		});
+		const usageSpy = vi.spyOn(sharedAuthStorage, "getModelUsageHealth");
 
-		const sending = session.sendCustomMessage(
-			{ customType: "cancelled-preflight", content: "must not land", display: false, attribution: "agent" },
-			{ deliveryMode: "interrupt" },
-		);
-		await probeStarted.promise;
-		await session.abort();
-
-		await expect(sending).resolves.toEqual({ status: "unavailable", reason: "prompt_preflight_cancelled" });
-		expect(session.agent.state.messages).toHaveLength(before);
+		await expect(
+			session.sendCustomMessage(
+				{ customType: "cancelled-preflight", content: "must land passively", display: false, attribution: "agent" },
+				{ deliveryMode: "interrupt" },
+			),
+		).resolves.toEqual({ status: "downgraded", delivery: "plain_append", reason: "unscoped_automatic_turn" });
+		expect(usageSpy).not.toHaveBeenCalled();
+		expect(session.agent.state.messages).toHaveLength(before + 1);
 		expect(session.agent.peekSteeringQueue()).toHaveLength(0);
 		expect(session.agent.peekFollowUpQueue()).toHaveLength(0);
 		expect(session.hasPendingMessages()).toBe(false);
 	});
-	it("reports cancelled legacy trigger preflights without accepting or mutating", async () => {
-		const assertCancelled = async (options: { deliverAs?: "nextTurn"; triggerTurn: true }) => {
+	it("downgrades legacy trigger requests without running a prompt preflight", async () => {
+		const assertDowngraded = async (options: { deliverAs?: "nextTurn"; triggerTurn: true }) => {
 			await createSession({ "retry.usageAwareFallback": true });
-			const before = session.agent.state.messages.length;
-			const probeStarted = Promise.withResolvers<void>();
-			const usageSpy = vi
-				.spyOn(sharedAuthStorage, "getModelUsageHealth")
-				.mockImplementation(async (_provider, probe) => {
-					probeStarted.resolve();
-					const aborted = Promise.withResolvers<never>();
-					probe.signal?.addEventListener(
-						"abort",
-						() => aborted.reject(probe.signal?.reason ?? new DOMException("Aborted", "AbortError")),
-						{ once: true },
-					);
-					return aborted.promise;
-				});
+			const usageSpy = vi.spyOn(sharedAuthStorage, "getModelUsageHealth");
 
 			const sending = session.sendCustomMessage(
 				{
@@ -415,21 +392,22 @@ describe("AgentSession concurrent prompt guard", () => {
 				},
 				options,
 			);
-			await probeStarted.promise;
-			await session.abort();
-
-			await expect(sending).resolves.toEqual({ status: "unavailable", reason: "prompt_preflight_cancelled" });
-			expect(session.agent.state.messages).toHaveLength(before);
+			await expect(sending).resolves.toEqual({
+				status: "downgraded",
+				delivery: "queued_next_turn",
+				reason: "unscoped_automatic_turn",
+			});
+			expect(usageSpy).not.toHaveBeenCalled();
 			expect(session.agent.peekSteeringQueue()).toHaveLength(0);
 			expect(session.agent.peekFollowUpQueue()).toHaveLength(0);
-			expect(session.hasPendingMessages()).toBe(false);
+			expect(session.hasPendingMessages()).toBe(true);
 			usageSpy.mockRestore();
 		};
 
-		await assertCancelled({ triggerTurn: true });
-		await assertCancelled({ deliverAs: "nextTurn", triggerTurn: true });
+		await assertDowngraded({ triggerTurn: true });
+		await assertDowngraded({ deliverAs: "nextTurn", triggerTurn: true });
 	});
-	it("does not enqueue a semantic wake when the client defers agent-initiated turns", async () => {
+	it("retains an unscoped semantic delivery passively when the client defers turns", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
 		const agent = new Agent({
@@ -452,8 +430,8 @@ describe("AgentSession concurrent prompt guard", () => {
 				{ customType: "exact-interrupt", content: "must not queue", display: false, attribution: "agent" },
 				{ deliveryMode: "interrupt" },
 			),
-		).resolves.toEqual({ status: "unavailable", reason: "client_deferred_turn" });
-		expect(session.agent.state.messages).toHaveLength(before);
+		).resolves.toEqual({ status: "downgraded", delivery: "plain_append", reason: "unscoped_automatic_turn" });
+		expect(session.agent.state.messages).toHaveLength(before + 1);
 		expect(session.agent.peekSteeringQueue()).toHaveLength(0);
 		expect(session.agent.peekFollowUpQueue()).toHaveLength(0);
 		expect(session.hasPendingMessages()).toBe(false);
@@ -533,15 +511,17 @@ describe("AgentSession concurrent prompt guard", () => {
 			const resumed = await reopen(sessionFile, sessionDir, calls);
 
 			resumed.agent.state.isStreaming = false;
-			await resumed.sendCustomMessage(
-				{ customType: "urgent", content: "automatic urgent turn", display: true, attribution: "agent" },
-				{ deliveryMode: "interrupt" },
-			);
-			expect(JSON.stringify(calls[0])).toContain("automatic urgent turn");
-			expect(JSON.stringify(calls[0])).not.toContain("idle status after crash");
+			await expect(
+				resumed.sendCustomMessage(
+					{ customType: "urgent", content: "automatic urgent turn", display: true, attribution: "agent" },
+					{ deliveryMode: "interrupt" },
+				),
+			).resolves.toEqual({ status: "downgraded", delivery: "plain_append", reason: "unscoped_automatic_turn" });
+			expect(calls).toHaveLength(0);
 
 			await resumed.prompt("deliberate owner prompt");
-			expect(JSON.stringify(calls[1])).toContain("idle status after crash");
+			expect(JSON.stringify(calls[0])).toContain("automatic urgent turn");
+			expect(JSON.stringify(calls[0])).toContain("idle status after crash");
 		});
 
 		it("reattaches busy explicitPrompt recovery to the next queued user prompt", async () => {
@@ -990,7 +970,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		expect(JSON.stringify(sessionManager.getEntries())).not.toContain("/after-turn");
 	});
 
-	it("terminates an exclusive handoff tool before sibling work and continues only in the child session", async () => {
+	it("terminates an exclusive handoff without waking the child until direct user input", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const extensionRuntime = new ExtensionRuntime();
 		let mutatorCalls = 0;
@@ -1137,6 +1117,8 @@ describe("AgentSession concurrent prompt guard", () => {
 		await waitFor(() => childTurn !== undefined);
 		if (!childTurn) throw new Error("Expected child continuation task");
 		await childTurn;
+		expect(providerCalls).toBe(1);
+		await session.prompt("Continue in the child session");
 		await session.sessionManager.flush();
 		if (!childFile) throw new Error("Expected persisted child session");
 
@@ -1165,7 +1147,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		});
 	});
 
-	it("delivers hidden nextTurn stop reactions through the next LLM call without exposing them in the visible queue", async () => {
+	it("defers hidden nextTurn stop reactions until the next direct user prompt", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		let firstStream: AssistantMessageEventStream | undefined;
 		const callMessages: Message[][] = [];
@@ -1222,6 +1204,9 @@ describe("AgentSession concurrent prompt guard", () => {
 		firstStream?.push({ type: "done", reason: "stop", message: createAssistantMessage("Done") });
 		await firstPrompt;
 		await session.waitForIdle();
+		expect(callMessages).toHaveLength(1);
+
+		await session.prompt("Continue deliberately");
 
 		expect(callMessages).toHaveLength(2);
 		expect(
@@ -1237,7 +1222,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		).toBe(true);
 	});
 
-	it("continues a main session from session_stop feedback before settling", async () => {
+	it("records session_stop feedback without starting an unscoped turn", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const mock = createMockModel({
 			handler: () => ({ content: ["Done"] }),
@@ -1281,37 +1266,28 @@ describe("AgentSession concurrent prompt guard", () => {
 		await session.waitForIdle();
 
 		const callMessages = mock.calls.map(call => call.context.messages);
-		expect(callMessages).toHaveLength(2);
+		expect(callMessages).toHaveLength(1);
 		expect(
-			callMessages[1]?.some(message =>
+			callMessages[0]?.some(message =>
 				typeof message.content === "string"
 					? message.content.includes("Mission incomplete; continue.")
 					: message.content.some(
 							content => content.type === "text" && content.text.includes("Mission incomplete; continue."),
 						),
 			),
-		).toBe(true);
+		).toBe(false);
 		expect(eventOrder.filter(type => type === "session_stop" || type === "agent_end")).toEqual([
 			"session_stop",
 			"agent_end",
-			"session_stop",
-			"agent_end",
 		]);
-		expect(stopEvents.map(event => event.stop_hook_active)).toEqual([false, true]);
-		expect(stopEvents.map(event => event.turn_id)).toEqual([0, 0]);
+		expect(stopEvents.map(event => event.stop_hook_active)).toEqual([false]);
+		expect(stopEvents.map(event => event.turn_id)).toEqual([0]);
 		expect(stopEvents[0]?.session_id).toBe(session.sessionId);
 		expect(stopEvents[0]?.last_assistant_message?.role).toBe("assistant");
-		expect(
-			stopEvents[1]?.messages.some(
-				message =>
-					message.role === "user" &&
-					Array.isArray(message.content) &&
-					message.content.some(block => block.type === "text" && block.text === "First message"),
-			),
-		).toBe(true);
+		expect(stopEvents[0]?.messages.some(message => message.role === "user")).toBe(true);
 	});
 
-	it("uses non-empty session_stop reason when additional context is empty", async () => {
+	it("does not use a session_stop reason to create a hidden turn", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const mock = createMockModel({
 			handler: () => ({ content: ["Done"] }),
@@ -1347,16 +1323,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		await session.prompt("First message");
 		await session.waitForIdle();
 
-		expect(mock.calls).toHaveLength(2);
-		expect(
-			mock.calls[1]?.context.messages.some(message =>
-				typeof message.content === "string"
-					? message.content.includes("Continue from fallback reason.")
-					: message.content.some(
-							content => content.type === "text" && content.text.includes("Continue from fallback reason."),
-						),
-			),
-		).toBe(true);
+		expect(mock.calls).toHaveLength(1);
 	});
 
 	it("does not emit session_stop when abort starts before the settle pass", async () => {
@@ -1482,7 +1449,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		).toBe(false);
 	});
 
-	it("caps consecutive session_stop continuations at eight", async () => {
+	it("does not start any session_stop continuation", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const mock = createMockModel({
 			handler: () => ({ content: ["Pass"] }),
@@ -1507,8 +1474,8 @@ describe("AgentSession concurrent prompt guard", () => {
 		await session.prompt("First message");
 		await session.waitForIdle();
 
-		expect(mock.calls).toHaveLength(9);
-		expect(extensionRunner.emitSessionStop).toHaveBeenCalledTimes(9);
+		expect(mock.calls).toHaveLength(1);
+		expect(extensionRunner.emitSessionStop).toHaveBeenCalledTimes(1);
 	});
 
 	it("emits session_stop only after empty-stop recovery reaches a final stop", async () => {
@@ -1569,7 +1536,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		expect(extensionRunner.emitSessionStop).toHaveBeenCalledTimes(1);
 	});
 
-	it("continues session_stop feedback in ACP sessions with deferred client turns", async () => {
+	it("does not continue session_stop feedback in ACP sessions", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const mock = createMockModel({
 			handler: () => ({ content: ["Done"] }),
@@ -1605,16 +1572,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		await session.prompt("First message");
 		await session.waitForIdle();
 
-		expect(mock.calls).toHaveLength(2);
-		expect(
-			mock.calls[1]?.context.messages.some(message =>
-				typeof message.content === "string"
-					? message.content.includes("ACP stop continuation.")
-					: message.content.some(
-							content => content.type === "text" && content.text.includes("ACP stop continuation."),
-						),
-			),
-		).toBe(true);
+		expect(mock.calls).toHaveLength(1);
 	});
 
 	it("does not emit session_stop for subagent sessions", async () => {
@@ -1846,7 +1804,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		expect(disposition).toEqual({
 			status: "downgraded",
 			delivery: "queued_next_turn",
-			reason: "client_deferred_turn",
+			reason: "unscoped_automatic_turn",
 		});
 		expect(mock.calls).toHaveLength(callsAfterFirstPrompt);
 		expect(session.isStreaming).toBe(false);
@@ -1868,7 +1826,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		).toBe(true);
 	});
 
-	it("runs drained ACP async completions as owned follow-up turns despite deferred client turns", async () => {
+	it("runs owned ACP async completions despite deferred client turns", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
 		const agent = new Agent({
@@ -1886,8 +1844,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		const settings = Settings.isolated();
 		const modelRegistry = sharedModelRegistry;
 		const ownerId = "acp-session-a";
-		const deliveryGate = Promise.withResolvers<void>();
-		let deliveryStarted = false;
+		const jobGate = Promise.withResolvers<void>();
 		const asyncJobManager = new AsyncJobManager({
 			maxRunningJobs: 2,
 			retentionMs: 1_000,
@@ -1906,38 +1863,26 @@ describe("AgentSession concurrent prompt guard", () => {
 			capabilities: {},
 			deferAgentInitiatedTurns: true,
 		});
-		// Override the session's self-registered sink: the test gates delivery
-		// and reproduces the ACP follow-up injection explicitly.
-		asyncJobManager.registerDeliverySink(ownerId, async () => {
-			deliveryStarted = true;
-			await deliveryGate.promise;
-			await session.sendCustomMessage(
-				{
-					customType: "async-result",
-					content: "Background result",
-					display: true,
-					attribution: "agent",
-				},
-				{ deliverAs: "followUp", triggerTurn: true },
-			);
-		});
-
 		await session.prompt("First message");
 		expect(session.isStreaming).toBe(false);
 		const callsAfterFirstPrompt = mock.calls.length;
 
 		try {
-			asyncJobManager.register("bash", "owned job", async () => "Background result", {
-				id: "owned-job",
-				ownerId,
-			});
-			await waitFor(() => deliveryStarted);
-
-			const drainedPromise = session.drainAsyncJobDeliveriesForAcp({ timeoutMs: 1_000 });
-			await waitFor(() => asyncJobManager.getDeliveryState({ ownerId }).delivering);
-			deliveryGate.resolve();
-
-			await expect(drainedPromise).resolves.toBe(true);
+			asyncJobManager.register(
+				"bash",
+				"owned job",
+				async () => {
+					await jobGate.promise;
+					return "Background result";
+				},
+				{
+					id: "owned-job",
+					ownerId,
+				},
+			);
+			jobGate.resolve();
+			await asyncJobManager.waitForOwnerJobs(ownerId);
+			await asyncJobManager.drainDeliveries({ timeoutMs: 1_000, filter: { ownerId } });
 			await session.waitForIdle();
 
 			expect(mock.calls).toHaveLength(callsAfterFirstPrompt + 1);
@@ -1953,7 +1898,7 @@ describe("AgentSession concurrent prompt guard", () => {
 				}),
 			).toBe(true);
 		} finally {
-			deliveryGate.resolve();
+			jobGate.resolve();
 		}
 	});
 

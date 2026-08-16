@@ -963,6 +963,34 @@ export interface ToolResultMessage<TDetails = unknown> {
 
 export type Message = UserMessage | DeveloperMessage | AssistantMessage | ToolResultMessage;
 
+/** Provider-independent authority assigned to a fresh instruction component. */
+export type ContextRole = "system" | "developer" | "internal_context";
+
+/** Runtime receiving the instruction component. */
+export type ContextTarget = "main" | "subagent" | "side_model";
+
+/**
+ * A rendered, provenance-bound instruction supplied for the current request.
+ *
+ * These components are intentionally separate from persisted conversation
+ * messages. In particular, `internal_context` must reach a provider's
+ * instruction channel and must never be replayed as a user turn.
+ */
+export interface ContextInstruction {
+	id: string;
+	sourcePath: string;
+	role: ContextRole;
+	target: ContextTarget;
+	trigger: string;
+	sha256: string;
+	renderedText: string;
+	/** Stable manifest order. Array order remains the provider emission order. */
+	order?: number;
+}
+
+/** Spec-compatible name used by context renderers. */
+export type ContextComponent = ContextInstruction;
+
 export type CursorExecHandlerResult<T> = { result: T; toolResult?: ToolResultMessage } | T | ToolResultMessage;
 
 /**
@@ -1237,6 +1265,8 @@ export interface Tool<TParameters extends TSchema = TSchema> {
 
 export interface Context {
 	systemPrompt?: string[];
+	/** Fresh typed instructions for this request; never persist these as messages. */
+	instructions?: ContextInstruction[];
 	messages: Message[];
 	tools?: Tool[];
 }

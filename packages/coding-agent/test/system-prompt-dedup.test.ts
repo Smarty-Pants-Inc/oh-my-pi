@@ -103,7 +103,7 @@ describe("SYSTEM.md prompt assembly", () => {
 		const promptText = renderedPrompt.join("\n\n");
 		const matches = promptText.match(new RegExp(escapeRegExp(systemPrompt), "g")) ?? [];
 		expect(matches).toHaveLength(1);
-		expect(promptText).toContain('<skill name="focused-work">');
+		expect(promptText).toContain("- focused-work: Focused work instructions");
 	});
 
 	it("does not resolve already-loaded prompt text as a path", async () => {
@@ -165,9 +165,9 @@ describe("SYSTEM.md prompt assembly", () => {
 		expect(systemPrompt).toHaveLength(2);
 		expect(promptText).toContain("CLI custom prompt");
 		expect(promptText).toContain("<workspace-tree>");
-		expect(promptText).toContain("<dir-context>");
-		// The project/environment footer survives even though the date/cwd line was
-		// relocated out of it; <workstation> is rendered only by that footer.
+		expect(promptText).toContain("Additional directory instruction files");
+		// The project/environment footer survives even though volatile date/cwd data
+		// is delivered separately; <workstation> is rendered only by that footer.
 		expect(promptText).toContain("<workstation>");
 		expect(appendMatches).toHaveLength(1);
 		expect(promptText).not.toContain("Discovered project SYSTEM prompt");
@@ -227,8 +227,8 @@ describe("SYSTEM.md prompt assembly", () => {
 		const promptText = systemPrompt.join("\n\n");
 		const matches = promptText.match(new RegExp(escapeRegExp(sharedContent), "g")) ?? [];
 		expect(matches).toHaveLength(1);
-		expect(promptText).not.toContain(`<file path="${farPath}">`);
-		expect(promptText).toContain(`<file path="${nearPath}">`);
+		expect(promptText).not.toContain(`<external_instruction path="${farPath}">`);
+		expect(promptText).toContain(`<external_instruction path="${nearPath}">`);
 	});
 
 	it("drops identical discovered context entries and keeps the closest copy", async () => {

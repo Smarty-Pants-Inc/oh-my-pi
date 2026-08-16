@@ -2459,13 +2459,13 @@ export class SessionMaintenance {
 							terminalTextAnswer,
 							suppressContinuation,
 						});
-					} else if (!suppressContinuation && this.#host.agent.hasQueuedMessages()) {
-						this.#host.scheduleAgentContinue({
-							delayMs: 100,
+					} else {
+						continuationScheduled = this.#host.scheduleCompactionContinuation({
 							generation,
-							shouldContinue: () => this.#host.agent.hasQueuedMessages(),
+							autoContinue: false,
+							terminalTextAnswer,
+							suppressContinuation,
 						});
-						continuationScheduled = true;
 					}
 					if (deadEndWarning) {
 						this.#host.emitNotice("warning", deadEndWarning, "compaction");

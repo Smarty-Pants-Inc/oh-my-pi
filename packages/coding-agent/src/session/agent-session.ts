@@ -57,6 +57,7 @@ import {
 import type {
 	AssistantMessage,
 	CodexCompactionContext,
+	ContextInstruction,
 	ImageContent,
 	Message,
 	Model,
@@ -85,7 +86,6 @@ import { MacOSPowerAssertion } from "@oh-my-pi/pi-natives";
 import {
 	$env,
 	APP_NAME,
-	escapeXmlText,
 	formatDuration,
 	getAgentDbPath,
 	isBunTestRuntime,
@@ -113,6 +113,8 @@ import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-temp
 import { buildServiceTierByFamily } from "../config/service-tier";
 import type { Settings, SkillsSettings } from "../config/settings";
 import { onAppendOnlyModeChanged, onModelRolesChanged } from "../config/settings";
+import { bindRenderedInstruction } from "../context/registry";
+import { smartyMergifySkillInstruction } from "../context/smarty-skills";
 import { RawSseDebugBuffer } from "../debug/raw-sse-buffer";
 import { getFileSnapshotStore } from "../edit/file-snapshot-store";
 import type { PythonResult } from "../eval/py/executor";
@@ -169,8 +171,6 @@ import { containsWorkflow, renderWorkflowNotice } from "../modes/workflow";
 import { type PlanApprovalDetails, resolveApprovedPlan } from "../plan-mode/approved-plan";
 import { listPlanFiles, readPlanFile } from "../plan-mode/plan-files";
 import type { PlanModeState } from "../plan-mode/state";
-import goalModeContextPrompt from "../prompts/goals/goal-mode-context.md" with { type: "text" };
-import goalTodoContextPrompt from "../prompts/goals/goal-todo-context.md" with { type: "text" };
 import autoContinuePrompt from "../prompts/system/auto-continue.md" with { type: "text" };
 import checkpointActiveNoticeTemplate from "../prompts/system/checkpoint-active-notice.md" with { type: "text" };
 import interruptedThinkingTemplate from "../prompts/system/interrupted-thinking.md" with { type: "text" };
@@ -255,6 +255,12 @@ import {
 	type AsyncResultEntry,
 	buildAsyncResultBatchMessage,
 } from "./async-job-delivery";
+import {
+	AutomaticTurnAuthority,
+	type AutomaticTurnOutcome,
+	type AutomaticTurnOutcomeStatus,
+	type AutomaticTurnSource,
+} from "./automatic-turn-authority";
 import { BashRunner, type BashRunnerHost } from "./bash-runner";
 import {
 	checkpointStartedAtFromEntry,
@@ -380,8 +386,6 @@ export * from "./agent-session-events";
 export * from "./agent-session-types";
 export type { AdvisorStats, PerAdvisorStat } from "./session-advisors";
 
-const SESSION_STOP_CONTINUATION_CAP = 8;
-
 import { LoopGuards, type StreamGuardsHost, StreamingEditGuard } from "./stream-guards";
 import { TodoTracker, type TodoTrackerHost } from "./todo-tracker";
 import { TtsrCoordinator, type TtsrCoordinatorHost } from "./ttsr-coordinator";
@@ -460,6 +464,7 @@ type AgentContinueSkipReason =
 	| "post-restore-unavailable";
 
 type ScheduledAgentContinueOptions = {
+	authority: AutomaticTurnSource;
 	delayMs?: number;
 	generation?: number;
 	shouldContinue?: () => boolean;
@@ -586,7 +591,7 @@ export class AgentSession {
 	#sessionChangeCallbacks = new Set<SessionChangeRegistration>();
 	#observedSessionId: string | undefined;
 
-	/** Legacy hidden messages eligible for an automatic continuation or the next ordinary prompt. */
+	/** Host messages retained only for the next deliberate prompt. */
 	#pendingNextTurnMessages: CustomMessage[] = [];
 	/** Messages owned exclusively by the next deliberate user-authored prompt. */
 	#pendingExplicitPromptMessages: CustomMessage[] = [];
@@ -595,7 +600,6 @@ export class AgentSession {
 	#semanticDeliveryAcceptanceCount = 0;
 	#semanticDeliveryAcceptancesSettled: Promise<void> = Promise.resolve();
 	#resolveSemanticDeliveryAcceptances: (() => void) | undefined;
-	#scheduledHiddenNextTurnGeneration: number | undefined = undefined;
 	#queuedMessageDrainScheduled = false;
 	#planModeState: PlanModeState | undefined;
 	/** Session-scoped `/vision` override; undefined = follow persisted `inspect_image.mode`. */
@@ -603,6 +607,7 @@ export class AgentSession {
 	#vibeModeState: VibeModeState | undefined;
 	#goalModeState: GoalModeState | undefined;
 	#goalRuntime: GoalRuntime;
+	#goalContinuationContext = false;
 	readonly #advisors: SessionAdvisors;
 	#goalTurnCounter = 0;
 	#planReferenceSent = false;
@@ -762,8 +767,8 @@ export class AgentSession {
 	#inFlightBeforeAgentEndCallbacks: Array<() => void | Promise<void>> = [];
 	#inFlightSettledCallbacks: Array<() => void | Promise<void>> = [];
 	#inFlightSettling = false;
-	#sessionStopContinuationCount = 0;
 	#sessionStopHookActive = false;
+	readonly #automaticTurns = new AutomaticTurnAuthority();
 	#obfuscator: SecretObfuscator | undefined;
 	/** Session-start value of `inlineToolDescriptors`; drives handoff tool pruning. */
 	#pruneToolDescriptions = false;
@@ -1172,7 +1177,6 @@ export class AgentSession {
 			usesOwnedToolDialect: () => this.#usesOwnedToolDialect(),
 			agentKind: () => this.#agentKind,
 			emitSessionEvent: event => this.#emitSessionEvent(event),
-			scheduleAgentContinue: options => this.#scheduleAgentContinue(options),
 			queueTodoReconciliation: () => {
 				if (!this.getActiveToolNames().includes("todo")) return undefined;
 				const choice = buildNamedToolChoice("todo", this.model, this.#usesOwnedToolDialect());
@@ -1243,7 +1247,8 @@ export class AgentSession {
 			promptGeneration: () => this.#promptGeneration,
 			sessionId: () => this.sessionId,
 			emitSessionEvent: event => this.#emitSessionEvent(event),
-			scheduleAgentContinue: options => this.#scheduleAgentContinue(options),
+			scheduleAgentContinue: options =>
+				this.#scheduleAgentContinue({ authority: "bounded_transport_or_protocol_retry", ...options }),
 			waitForSessionMessagePersistence: message => this.#waitForSessionMessagePersistence(message),
 			appendSessionMessage: message => this.#appendSessionMessage(message),
 			persistedAssistantEntryId: message => (message as PersistedAssistantMessage)[kPersistedSessionEntryId],
@@ -1483,7 +1488,8 @@ export class AgentSession {
 			settings: this.settings,
 			emitSessionEvent: event => this.#emitSessionEvent(event),
 			schedulePostPromptTask: (task, options) => this.#schedulePostPromptTask(task, options),
-			scheduleAgentContinue: options => this.#scheduleAgentContinue(options),
+			scheduleAgentContinue: options =>
+				this.#scheduleAgentContinue({ authority: "bounded_transport_or_protocol_retry", ...options }),
 			promptGeneration: () => this.#promptGeneration,
 		};
 		this.#ttsr = new TtsrCoordinator(ttsrHost, config.ttsrManager);
@@ -1515,6 +1521,8 @@ export class AgentSession {
 			localProtocolOptions: () => this.#localProtocolOptions(),
 			emitNotice: (level, message, source) => this.emitNotice(level, message, source),
 			schedulePostPromptTask: task => this.#schedulePostPromptTask(task),
+			scheduleAgentContinue: options =>
+				this.#scheduleAgentContinue({ authority: "bounded_transport_or_protocol_retry", ...options }),
 			discardAssistantTurn: message => this.#recovery.discardAssistantTurn(message),
 		};
 		this.#streamingEditGuard = new StreamingEditGuard(streamGuardsHost);
@@ -1697,7 +1705,8 @@ export class AgentSession {
 			emitSessionEvent: (event, options) => this.#emitSessionEvent(event, options),
 			emitNotice: (level, message, source) => this.emitNotice(level, message, source),
 			schedulePostPromptTask: (task, options) => this.#schedulePostPromptTask(task, options),
-			scheduleAgentContinue: options => this.#scheduleAgentContinue(options),
+			scheduleAgentContinue: options =>
+				this.#scheduleAgentContinue({ authority: "bounded_transport_or_protocol_retry", ...(options ?? {}) }),
 			scheduleCompactionContinuation: options => this.#scheduleCompactionContinuation(options),
 			persistTurnMessagesForMidRunCompaction: context => this.#persistTurnMessagesForMidRunCompaction(context),
 			findLastAssistantMessage: () => this.#findLastAssistantMessage(),
@@ -1772,7 +1781,6 @@ export class AgentSession {
 			clearPendingNextTurnMessages: () => {
 				this.#pendingNextTurnMessages = [];
 				this.#pendingExplicitPromptMessages = [];
-				this.#scheduledHiddenNextTurnGeneration = undefined;
 			},
 			preparePendingSemanticDeliveryHandoff: (steering, followUp, companions) =>
 				this.#preparePendingSemanticDeliveryHandoff(steering, followUp, companions),
@@ -2508,7 +2516,10 @@ export class AgentSession {
 			// longer reports it. Without this leg a terminal yield in the
 			// (idle-flush delay / step-boundary) handoff window would read as
 			// quiescent and the run driver would drop the queued result.
-			this.yieldQueue.has(ASYNC_RESULT_MESSAGE_TYPE)
+			this.yieldQueue.has(ASYNC_RESULT_MESSAGE_TYPE) ||
+			[...this.agent.peekSteeringQueue(), ...this.agent.peekFollowUpQueue()].some(
+				message => message.role === "custom" && message.customType === ASYNC_RESULT_MESSAGE_TYPE,
+			)
 		);
 	}
 
@@ -3904,10 +3915,19 @@ export class AgentSession {
 
 	#skipAgentContinue(reason: AgentContinueSkipReason, options: ScheduledAgentContinueOptions | undefined): void {
 		logger.debug("agent.continue skipped after scheduling", { reason });
+		if (options) this.#automaticTurns.record(options.authority, "deferred", reason);
 		options?.onSkip?.(reason);
 	}
 
 	#scheduleAgentContinue(options?: ScheduledAgentContinueOptions): void {
+		if (
+			!options ||
+			!this.#automaticTurns.authorize(
+				options.authority,
+				options.authority !== "active_async_result_wake" || this.#hasPendingAsyncWake(),
+			)
+		)
+			return;
 		this.#schedulePostPromptTask(
 			async signal => {
 				// Defense in depth: if compaction/handoff slipped onto the post-prompt queue
@@ -3921,6 +3941,10 @@ export class AgentSession {
 				}
 				if (options?.shouldContinue && !options.shouldContinue()) {
 					this.#skipAgentContinue("should-continue-false", options);
+					return;
+				}
+				if (options.authority === "active_async_result_wake" && !this.#hasPendingAsyncWake()) {
+					this.#automaticTurns.record(options.authority, "rejected", "originating asynchronous turn closed");
 					return;
 				}
 				this.#beginInFlight();
@@ -3948,8 +3972,14 @@ export class AgentSession {
 							return;
 						}
 					}
+					this.#automaticTurns.record(options.authority, "started", "provider dispatch committed");
 					await this.agent.continue(signal);
 				} catch (error) {
+					this.#automaticTurns.record(
+						options.authority,
+						"failed",
+						error instanceof Error ? error.message : String(error),
+					);
 					logger.warn("agent.continue failed after scheduling", {
 						error: error instanceof Error ? error.message : String(error),
 						stack: error instanceof Error ? error.stack : undefined,
@@ -3968,6 +3998,18 @@ export class AgentSession {
 		);
 	}
 
+	recordAutomaticTurnOutcome(source: AutomaticTurnSource, status: AutomaticTurnOutcomeStatus, reason: string): void {
+		this.#automaticTurns.record(source, status, reason);
+	}
+
+	authorizeAutomaticTurn(source: AutomaticTurnSource, stillOpen: boolean = true): boolean {
+		return this.#automaticTurns.authorize(source, stillOpen);
+	}
+
+	getAutomaticTurnOutcomes(): readonly AutomaticTurnOutcome[] {
+		return this.#automaticTurns.outcomes();
+	}
+
 	#scheduleCompactionContinuation(options: {
 		generation: number;
 		autoContinue: boolean;
@@ -3976,7 +4018,10 @@ export class AgentSession {
 	}): boolean {
 		if (options.suppressContinuation) return false;
 		if (this.agent.hasQueuedMessages()) {
+			const authority = this.#queuedTurnAuthority();
+			if (!authority) return false;
 			this.#scheduleAgentContinue({
+				authority,
 				delayMs: 100,
 				generation: options.generation,
 				shouldContinue: () => this.agent.hasQueuedMessages(),
@@ -4015,13 +4060,24 @@ export class AgentSession {
 				await Promise.resolve();
 				if (signal.aborted) return;
 				if (this.agent.hasQueuedMessages()) {
+					const authority = this.#queuedTurnAuthority();
+					if (!authority) return;
 					this.#scheduleAgentContinue({
+						authority,
 						generation,
 						shouldContinue: () => this.agent.hasQueuedMessages(),
 					});
 					return;
 				}
-				await continuePrompt();
+				const authority = "bounded_transport_or_protocol_retry" as const;
+				if (!this.#automaticTurns.authorize(authority)) return;
+				this.#automaticTurns.record(authority, "started", "compaction continuation committed");
+				try {
+					await continuePrompt();
+				} catch (error) {
+					this.#automaticTurns.record(authority, "failed", error instanceof Error ? error.message : String(error));
+					throw error;
+				}
 			},
 			{ generation },
 		);
@@ -4163,7 +4219,6 @@ export class AgentSession {
 	}
 
 	#resetSessionStopContinuationState(): void {
-		this.#sessionStopContinuationCount = 0;
 		this.#sessionStopHookActive = false;
 	}
 
@@ -4226,33 +4281,12 @@ export class AgentSession {
 			this.#resetSessionStopContinuationState();
 			return false;
 		}
-		const additionalContext = this.#sessionStopContinuationContext(result);
-		if (!additionalContext) {
-			this.#resetSessionStopContinuationState();
-			return false;
+		const ignoredContinuation = this.#sessionStopContinuationContext(result);
+		if (ignoredContinuation) {
+			logger.debug("session_stop requested an unscoped continuation; request retained as notification only");
 		}
-		if (this.#sessionStopContinuationCount >= SESSION_STOP_CONTINUATION_CAP) {
-			logger.warn("session_stop continuation cap reached", {
-				sessionId: this.sessionId,
-				cap: SESSION_STOP_CONTINUATION_CAP,
-			});
-			this.#resetSessionStopContinuationState();
-			return false;
-		}
-		this.#sessionStopContinuationCount++;
-		this.#sessionStopHookActive = true;
-		this.#queueHiddenNextTurnMessage(
-			{
-				role: "custom",
-				customType: "session-stop-continuation",
-				content: additionalContext,
-				display: false,
-				attribution: "agent",
-				timestamp: Date.now(),
-			},
-			true,
-		);
-		return true;
+		this.#resetSessionStopContinuationState();
+		return false;
 	}
 
 	/** Emit extension events based on session events */
@@ -4959,12 +4993,7 @@ export class AgentSession {
 			this.agent.reset();
 			this.#pendingNextTurnMessages = [];
 			this.#pendingExplicitPromptMessages = [];
-			this.#scheduledHiddenNextTurnGeneration = undefined;
-			// Reset the session_stop continuation chain: the queued continuation
-			// message is gone with the conversation, but the counters would otherwise
-			// carry over, so the next post-reset turn is reported to hooks as part of
-			// the old chain and can hit SESSION_STOP_CONTINUATION_CAP early (mirrors
-			// abort()/newSession()).
+			// Reset session_stop notification state with the conversation.
 			this.#resetSessionStopContinuationState();
 
 			// Drop checkpoint/rewind runtime state and deferred tool directives
@@ -5619,6 +5648,29 @@ export class AgentSession {
 		return this.#goalRuntime;
 	}
 
+	/** Fresh registered components injected at the provider boundary, never persisted as messages. */
+	buildProviderContextInstructions(): ContextInstruction[] {
+		const instructions: ContextInstruction[] = [];
+		if (this.#agentKind === "main") {
+			const activeGoal = this.#goalRuntime.buildActivePrompt();
+			if (activeGoal) instructions.push(bindRenderedInstruction("goal.active", activeGoal));
+			if (this.#goalContinuationContext) {
+				const continuation = this.#goalRuntime.buildContinuationPrompt();
+				if (continuation) instructions.push(bindRenderedInstruction("goal.continuation", continuation));
+			}
+			const todo = this.#todo.buildPassiveSnapshot();
+			if (todo) instructions.push(bindRenderedInstruction("todo.snapshot", todo.content));
+		}
+		const skillPolicy = smartyMergifySkillInstruction(
+			this.agent.state.messages,
+			this.#agentKind === "sub" ? "subagent" : "main",
+		);
+		if (skillPolicy) instructions.push(skillPolicy);
+		return instructions.sort(
+			(left, right) => (left.order ?? 0) - (right.order ?? 0) || left.id.localeCompare(right.id),
+		);
+	}
+
 	markPlanReferenceSent(): void {
 		this.#planReferenceSent = true;
 	}
@@ -5648,7 +5700,6 @@ export class AgentSession {
 				owner: AgentMessage;
 				messages: CustomMessage[];
 			}>,
-			scheduledHiddenNextTurnGeneration: this.#scheduledHiddenNextTurnGeneration,
 			pendingSemanticDeliveryIds: new Set(this.#pendingSemanticDeliveryIds),
 			queuedMessageDrainBlocked: this.#queuedMessageDrainBlocked,
 			usagePreflightReadyForNextModelCall: this.#usagePreflightReadyForNextModelCall,
@@ -5696,7 +5747,6 @@ export class AgentSession {
 		this.#rewoundToolResultIds = new Set(checkpoint.rewoundToolResultIds);
 		this.#pendingNextTurnMessages = checkpoint.pendingNextTurnMessages;
 		this.#pendingExplicitPromptMessages = checkpoint.pendingExplicitPromptMessages;
-		this.#scheduledHiddenNextTurnGeneration = checkpoint.scheduledHiddenNextTurnGeneration;
 		this.#queuedMessageDrainBlocked = checkpoint.queuedMessageDrainBlocked;
 		this.#usagePreflightReadyForNextModelCall = checkpoint.usagePreflightReadyForNextModelCall;
 		this.#usagePreflightReadyModel = checkpoint.usagePreflightReadyModel;
@@ -5797,18 +5847,7 @@ export class AgentSession {
 	}
 
 	async sendGoalModeContext(options?: { deliverAs?: "steer" | "followUp" | "nextTurn" }): Promise<void> {
-		const message = this.#buildGoalModeMessage();
-		if (!message) return;
-		await this.sendCustomMessage(
-			{
-				customType: message.customType,
-				content: message.content,
-				display: message.display,
-				details: message.details,
-				attribution: message.attribution,
-			},
-			options ? { deliverAs: options.deliverAs } : undefined,
-		);
+		void options;
 	}
 
 	async sendVibeModeContext(options?: { deliverAs?: "steer" | "followUp" | "nextTurn" }): Promise<void> {
@@ -5955,20 +5994,6 @@ export class AgentSession {
 		};
 	}
 
-	#buildGoalModeMessage(): CustomMessage | null {
-		const content = this.#goalRuntime.buildActivePrompt();
-		if (!content) return null;
-		const todoContext = this.#buildGoalTodoContext();
-		return {
-			role: "custom",
-			customType: "goal-mode-context",
-			content: prompt.render(goalModeContextPrompt, { goalContext: content, todoContext }),
-			display: false,
-			attribution: "agent",
-			timestamp: Date.now(),
-		};
-	}
-
 	#buildVibeModeMessage(): CustomMessage | null {
 		if (!this.#vibeModeState?.enabled) return null;
 		return {
@@ -5981,47 +6006,6 @@ export class AgentSession {
 			attribution: "agent",
 			timestamp: Date.now(),
 		};
-	}
-
-	#sanitizeGoalTodoText(text: string): string {
-		return escapeXmlText(text)
-			.replace(/\r\n/g, "\\n")
-			.replace(/\r/g, "\\r")
-			.replace(/\n/g, "\\n")
-			.replace(/\t/g, "\\t")
-			.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u2028\u2029]/g, " ");
-	}
-
-	#buildGoalTodoContext(): string | undefined {
-		if (!this.settings.get("todo.enabled")) return undefined;
-		const canCallTodoTool = this.getActiveToolNames().includes("todo");
-		if (!canCallTodoTool) return undefined;
-		const phases = this.getTodoPhases().filter(phase => phase.tasks.length > 0);
-		if (phases.length === 0) return undefined;
-
-		let total = 0;
-		let closed = 0;
-		let open = 0;
-		const promptPhases = phases.map(phase => ({
-			name: this.#sanitizeGoalTodoText(phase.name),
-			tasks: phase.tasks.map(task => {
-				total++;
-				if (task.status === "completed" || task.status === "abandoned") {
-					closed++;
-				} else {
-					open++;
-				}
-				return { content: this.#sanitizeGoalTodoText(task.content), status: task.status };
-			}),
-		}));
-
-		return prompt.render(goalTodoContextPrompt, {
-			canCallTodoTool,
-			closed: String(closed),
-			open: String(open),
-			phases: promptPhases,
-			total: String(total),
-		});
 	}
 
 	#normalizeImagesForModel(images: ImageContent[] | undefined): Promise<ImageContent[] | undefined> {
@@ -6302,10 +6286,16 @@ export class AgentSession {
 			timestamp: Date.now(),
 		};
 
-		await this.#promptWithMessage(customMessage, textContent, {
-			...options,
-			prependMessages: keywordNotices.length > 0 ? keywordNotices : undefined,
-		});
+		const isGoalContinuation = message.customType === "goal-continuation";
+		if (isGoalContinuation) this.#goalContinuationContext = true;
+		try {
+			await this.#promptWithMessage(customMessage, textContent, {
+				...options,
+				prependMessages: keywordNotices.length > 0 ? keywordNotices : undefined,
+			});
+		} finally {
+			if (isGoalContinuation) this.#goalContinuationContext = false;
+		}
 	}
 
 	async #promptWithMessage(
@@ -6378,10 +6368,6 @@ export class AgentSession {
 			const planModeMessage = await this.#buildPlanModeMessage();
 			if (planModeMessage) {
 				messages.push(planModeMessage);
-			}
-			const goalModeMessage = this.#buildGoalModeMessage();
-			if (goalModeMessage) {
-				messages.push(goalModeMessage);
 			}
 			const vibeModeMessage = this.#buildVibeModeMessage();
 			if (vibeModeMessage) {
@@ -6860,14 +6846,18 @@ export class AgentSession {
 			!this.#canAutoContinueForFollowUp()
 		)
 			return false;
+		const authority = this.#queuedTurnAuthority();
+		if (!authority) return false;
 		this.#queuedMessageDrainScheduled = true;
 		this.#scheduleAgentContinue({
+			authority,
 			shouldContinue: () => {
 				this.#queuedMessageDrainScheduled = false;
 				return (
 					this.#modeExitDrainSuppressionDepth === 0 &&
 					this.#canAutoContinueForFollowUp() &&
-					this.agent.hasQueuedMessages()
+					this.agent.hasQueuedMessages() &&
+					this.#queuedTurnAuthority() === authority
 				);
 			},
 			onSkip: () => {
@@ -6879,6 +6869,15 @@ export class AgentSession {
 			},
 		});
 		return true;
+	}
+
+	#queuedTurnAuthority(): AutomaticTurnSource | undefined {
+		const queued = [...this.agent.peekSteeringQueue(), ...this.agent.peekFollowUpQueue()];
+		if (queued.some(isUserQueuedMessage)) return "direct_user_input";
+		if (queued.some(message => message.role === "custom" && message.customType === ASYNC_RESULT_MESSAGE_TYPE)) {
+			return "active_async_result_wake";
+		}
+		return undefined;
 	}
 
 	/**
@@ -6910,7 +6909,7 @@ export class AgentSession {
 	}
 
 	queueDeferredMessage(message: CustomMessage): void {
-		this.#queueHiddenNextTurnMessage(message, true);
+		this.#queueNextTurnMessage(message);
 	}
 
 	queueLaunchCompletion(notification: DaemonCompletionNotification): Promise<void> {
@@ -7191,72 +7190,8 @@ export class AgentSession {
 		this.#pendingExplicitPromptMessages.push(message);
 	}
 
-	#queueHiddenNextTurnMessage(message: CustomMessage, triggerTurn: boolean): void {
+	#queueNextTurnMessage(message: CustomMessage): void {
 		this.#pendingNextTurnMessages.push(message);
-		if (!triggerTurn) return;
-		const generation = this.#promptGeneration;
-		if (this.#scheduledHiddenNextTurnGeneration === generation) {
-			return;
-		}
-		this.#scheduledHiddenNextTurnGeneration = generation;
-		this.#schedulePostPromptTask(
-			async () => {
-				if (this.#scheduledHiddenNextTurnGeneration === generation) {
-					this.#scheduledHiddenNextTurnGeneration = undefined;
-				}
-				if (this.#pendingNextTurnMessages.length === 0) {
-					return;
-				}
-				try {
-					await this.#promptQueuedHiddenNextTurnMessages();
-				} catch {
-					// Leave the hidden next-turn messages queued for the next explicit prompt.
-				}
-			},
-			{
-				generation,
-				onSkip: () => {
-					if (this.#scheduledHiddenNextTurnGeneration === generation) {
-						this.#scheduledHiddenNextTurnGeneration = undefined;
-					}
-				},
-			},
-		);
-	}
-
-	async #promptQueuedHiddenNextTurnMessages(): Promise<void> {
-		if (this.#pendingNextTurnMessages.length === 0) {
-			return;
-		}
-
-		const queuedMessages = [...this.#pendingNextTurnMessages];
-		this.#pendingNextTurnMessages = [];
-		const message = queuedMessages[queuedMessages.length - 1];
-		if (!message) {
-			return;
-		}
-
-		const prependMessages = queuedMessages.slice(0, -1);
-		const textContent = this.#getCustomMessageTextContent(message);
-		try {
-			await this.#promptWithMessage(message, textContent, {
-				prependMessages,
-				skipPostPromptRecoveryWait: true,
-			});
-		} catch (error) {
-			this.#pendingNextTurnMessages = [...queuedMessages, ...this.#pendingNextTurnMessages];
-			throw error;
-		}
-	}
-
-	#getCustomMessageTextContent(message: Pick<CustomMessage, "content">): string {
-		if (typeof message.content === "string") {
-			return message.content;
-		}
-		return message.content
-			.filter((content): content is TextContent => content.type === "text")
-			.map(content => content.text)
-			.join("");
 	}
 
 	/**
@@ -7273,40 +7208,6 @@ export class AgentSession {
 			throw new Error(
 				`Extension command "/${commandName}" cannot be queued. Use prompt() or execute the command when not streaming.`,
 			);
-		}
-	}
-
-	async #promptAgentInitiatedMessage(
-		message: CustomMessage,
-		options?: {
-			acceptTerminalEmptyStop?: boolean;
-			rejectDuringLifecycleTransition?: boolean;
-			lifecycleGeneration?: number;
-		},
-	): Promise<"started" | "skipped" | "session_transition"> {
-		this.#beginInFlight();
-		try {
-			if (!(await this.#runUsageAwarePreflightForNextModelCall())) return "skipped";
-			if (
-				options?.rejectDuringLifecycleTransition &&
-				(this.#isDisposed ||
-					this.#lifecycleTransitionFenceActive ||
-					options.lifecycleGeneration !== this.#lifecycleTransitionGeneration)
-			) {
-				return "session_transition";
-			}
-			const acceptTerminalEmptyStop = options?.acceptTerminalEmptyStop === true;
-			if (acceptTerminalEmptyStop) {
-				this.#resetPromptMaintenanceState();
-			}
-			this.#recovery.setAcceptTerminalEmptyStop(acceptTerminalEmptyStop);
-			await this.agent.prompt(message);
-			await this.#waitForPostPromptRecovery();
-			return "started";
-		} finally {
-			this.#usagePreflightReadyForNextModelCall = false;
-			this.#recovery.setAcceptTerminalEmptyStop(false);
-			this.#endInFlight();
 		}
 	}
 
@@ -7419,18 +7320,15 @@ export class AgentSession {
 						this.#scheduleIdleQueueDrain();
 						return { status: "accepted", delivery: "queued_steer" };
 					}
-					if (this.#clientBridge?.deferAgentInitiatedTurns && !this.#allowAcpAgentInitiatedTurns) {
-						return { status: "unavailable", reason: "client_deferred_turn" };
-					}
-					releaseAcceptance();
-					const promptResult = await this.#promptAgentInitiatedMessage(normalizedAppMessage, {
-						rejectDuringLifecycleTransition: true,
-						lifecycleGeneration,
-					});
-					if (promptResult === "session_transition")
-						return { status: "unavailable", reason: "session_transition" };
-					if (promptResult === "skipped") return { status: "unavailable", reason: "prompt_preflight_cancelled" };
-					return { status: "accepted", delivery: "started_turn" };
+					this.agent.appendMessage(normalizedAppMessage);
+					this.sessionManager.appendCustomMessageEntry(
+						normalizedAppMessage.customType,
+						normalizedAppMessage.content,
+						normalizedAppMessage.display,
+						normalizedAppMessage.details,
+						normalizedAppMessage.attribution,
+					);
+					return { status: "downgraded", delivery: "plain_append", reason: "unscoped_automatic_turn" };
 				}
 				if (semanticMode === "steer") {
 					if (this.isStreaming) {
@@ -7461,8 +7359,10 @@ export class AgentSession {
 		this.onBeforeCustomMessageAcceptance?.();
 		if (this.isStreaming) {
 			if (options?.deliverAs === "nextTurn") {
-				this.#queueHiddenNextTurnMessage(normalizedAppMessage, options?.triggerTurn ?? false);
-				return { status: "accepted", delivery: "queued_next_turn" };
+				this.#queueNextTurnMessage(normalizedAppMessage);
+				return options?.triggerTurn
+					? { status: "downgraded", delivery: "queued_next_turn", reason: "unscoped_automatic_turn" }
+					: { status: "accepted", delivery: "queued_next_turn" };
 			}
 			this.#allowQueuedMessageDrainRetry();
 			if (options?.deliverAs === "followUp") {
@@ -7477,20 +7377,8 @@ export class AgentSession {
 
 		if (options?.deliverAs === "nextTurn") {
 			if (options?.triggerTurn) {
-				if (this.#clientBridge?.deferAgentInitiatedTurns && !this.#allowAcpAgentInitiatedTurns) {
-					this.#queueHiddenNextTurnMessage(normalizedAppMessage, false);
-					return { status: "downgraded", delivery: "queued_next_turn", reason: "client_deferred_turn" };
-				}
-				const promptResult = await this.#promptAgentInitiatedMessage(normalizedAppMessage, {
-					acceptTerminalEmptyStop: options.acceptTerminalEmptyStop === true,
-				});
-				if (promptResult !== "started") {
-					return {
-						status: "unavailable",
-						reason: promptResult === "session_transition" ? "session_transition" : "prompt_preflight_cancelled",
-					};
-				}
-				return { status: "accepted", delivery: "started_turn" };
+				this.#queueNextTurnMessage(normalizedAppMessage);
+				return { status: "downgraded", delivery: "queued_next_turn", reason: "unscoped_automatic_turn" };
 			}
 			this.agent.appendMessage(normalizedAppMessage);
 			this.sessionManager.appendCustomMessageEntry(
@@ -7504,18 +7392,8 @@ export class AgentSession {
 		}
 
 		if (options?.triggerTurn) {
-			if (this.#clientBridge?.deferAgentInitiatedTurns && !this.#allowAcpAgentInitiatedTurns) {
-				this.#queueHiddenNextTurnMessage(normalizedAppMessage, false);
-				return { status: "downgraded", delivery: "queued_next_turn", reason: "client_deferred_turn" };
-			}
-			const promptResult = await this.#promptAgentInitiatedMessage(normalizedAppMessage);
-			if (promptResult !== "started") {
-				return {
-					status: "unavailable",
-					reason: promptResult === "session_transition" ? "session_transition" : "prompt_preflight_cancelled",
-				};
-			}
-			return { status: "accepted", delivery: "started_turn" };
+			this.#queueNextTurnMessage(normalizedAppMessage);
+			return { status: "downgraded", delivery: "queued_next_turn", reason: "unscoped_automatic_turn" };
 		}
 
 		this.agent.appendMessage(normalizedAppMessage);
@@ -7627,7 +7505,7 @@ export class AgentSession {
 		return (
 			this.agent.peekSteeringQueue().filter(isDisplayableQueuedMessage).length +
 			this.agent.peekFollowUpQueue().filter(isDisplayableQueuedMessage).length +
-			this.#pendingNextTurnMessages.length
+			this.#pendingNextTurnMessages.filter(isDisplayableQueuedMessage).length
 		);
 	}
 
@@ -7883,7 +7761,6 @@ export class AgentSession {
 			for (const controller of this.#usagePreflightAbortControllers) controller.abort();
 			this.abortRetry();
 			this.#promptGeneration++;
-			this.#scheduledHiddenNextTurnGeneration = undefined;
 			// Abort the handoff first so generic compaction cancellation cannot replace
 			// the harness reason with an unreasoned "Handoff cancelled".
 			this.#handoff.abortHandoff(new Error(intent.reason ?? "Handoff aborted by session"));
@@ -8008,7 +7885,6 @@ export class AgentSession {
 			this.#pendingNextTurnMessages = [];
 			this.#pendingExplicitPromptMessages = [];
 			this.#pendingSemanticDeliveryIds.clear();
-			this.#scheduledHiddenNextTurnGeneration = undefined;
 			this.#queuedMessageDrainBlocked = false;
 			this.#usagePreflightReadyForNextModelCall = false;
 			this.#usagePreflightReadyModel = undefined;
@@ -8400,8 +8276,7 @@ export class AgentSession {
 			attribution: "agent",
 			timestamp: Date.now(),
 		});
-		this.#scheduleAgentContinue({ generation: this.#promptGeneration });
-		return true;
+		return false;
 	}
 
 	#extractRewindReport(messages: AgentMessage[]): string | undefined {
@@ -8519,7 +8394,6 @@ export class AgentSession {
 
 		this.#planModeReminderCount++;
 		this.#planModeReminderAwaitingProgress = true;
-		this.#toolChoiceQueue.pushOnce("required", { label: "plan-mode-decision" });
 		const reminder = prompt.render(planModeToolDecisionReminderPrompt, {
 			askToolName: "ask",
 		});
@@ -8532,13 +8406,7 @@ export class AgentSession {
 
 		this.agent.appendMessage(reminderMessage);
 		this.sessionManager.appendMessage(reminderMessage);
-		this.#scheduleAgentContinue({
-			generation: this.#promptGeneration,
-			// If the continuation never runs (new prompt, dispose, compaction,
-			// handoff), the forced choice must not leak onto an unrelated turn.
-			onSkip: () => this.#toolChoiceQueue.removeByLabel("plan-mode-decision"),
-		});
-		return true;
+		return false;
 	}
 
 	async #setModelWithProviderSessionReset(
@@ -9074,7 +8942,6 @@ export class AgentSession {
 			this.#pendingNextTurnMessages = [];
 			this.#pendingExplicitPromptMessages = [];
 			this.#pendingSemanticDeliveryIds.clear();
-			this.#scheduledHiddenNextTurnGeneration = undefined;
 			this.#queuedMessageDrainBlocked = false;
 			this.#usagePreflightReadyForNextModelCall = false;
 			this.#usagePreflightReadyModel = undefined;
@@ -9288,7 +9155,6 @@ export class AgentSession {
 			this.#pendingNextTurnMessages = [];
 			this.#pendingExplicitPromptMessages = [];
 			this.#pendingSemanticDeliveryIds.clear();
-			this.#scheduledHiddenNextTurnGeneration = undefined;
 			this.#queuedMessageDrainBlocked = false;
 			this.#usagePreflightReadyForNextModelCall = false;
 			this.#usagePreflightReadyModel = undefined;
@@ -9426,7 +9292,6 @@ export class AgentSession {
 			this.#pendingNextTurnMessages = [];
 			this.#pendingExplicitPromptMessages = [];
 			this.#pendingSemanticDeliveryIds.clear();
-			this.#scheduledHiddenNextTurnGeneration = undefined;
 			this.agent.replaceQueues([], []);
 			this.#queuedMessageDrainBlocked = false;
 			this.#usagePreflightReadyForNextModelCall = false;
@@ -9855,7 +9720,7 @@ export class AgentSession {
 	 * guards as every other post-prompt continuation.
 	 */
 	resumeAfterAskReanswer(): void {
-		this.#scheduleAgentContinue();
+		this.#scheduleAgentContinue({ authority: "direct_user_input" });
 	}
 
 	/**

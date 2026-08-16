@@ -4,6 +4,7 @@ import type { FetchImpl, ImageContent, Model, ServiceTierByFamily, ToolChoice } 
 import { logger } from "@oh-my-pi/pi-utils";
 import type { AsyncJobManager } from "../async/job-manager";
 import type { Rule } from "../capability/rule";
+import type { SessionCapabilities } from "../capability/session-capabilities";
 import type { PromptTemplate } from "../config/prompt-templates";
 import type { Settings } from "../config/settings";
 import { EditTool } from "../edit";
@@ -157,6 +158,8 @@ export interface ToolSession {
 	cwd: string;
 	/** Additional workspace directories beyond cwd (multi-root), forwarded to subagents. */
 	additionalDirectories?: string[];
+	/** Structured authority boundary applied even when approval mode is yolo. */
+	capabilities?: SessionCapabilities;
 	/** Whether UI is available */
 	hasUI: boolean;
 	/** Whether this session has begun disposal. */

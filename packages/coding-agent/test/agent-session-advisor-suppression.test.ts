@@ -349,7 +349,7 @@ describe("AgentSession advisor auto-resume suppression", () => {
 		expect(mock.calls).toHaveLength(1);
 	});
 
-	it("steers a late advisor blocker after a terminal answer so the primary corrects it", async () => {
+	it("preserves a late advisor blocker without waking a hidden primary turn", async () => {
 		const { session, mock } = await createCompletedAdvisorSession("blocker");
 
 		await session.prompt("read five fixture files and answer with exactly one line");
@@ -363,7 +363,9 @@ describe("AgentSession advisor auto-resume suppression", () => {
 		await advisor.prompt("inspect the completed turn");
 		await session.waitForIdle();
 
-		expect(mock.calls.length).toBe(2);
+		expect(session.agent.state.messages.filter(isAdvisorCard)).toHaveLength(1);
+		expect(session.hasPendingMessages()).toBe(false);
+		expect(mock.calls.length).toBe(1);
 	});
 
 	it("preserves another late advisor concern after an existing advisor card", async () => {

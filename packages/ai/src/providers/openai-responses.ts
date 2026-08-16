@@ -2,6 +2,7 @@ import { scheduler } from "node:timers/promises";
 import { hostMatchesUrl } from "@oh-my-pi/pi-catalog/hosts";
 import { bareModelId, parseOpenAIModel, semverGte } from "@oh-my-pi/pi-catalog/identity";
 import { $flag, logger, structuredCloneJSON } from "@oh-my-pi/pi-utils";
+import { mapContextInstructions } from "../context-instructions";
 import * as AIError from "../error";
 import { getEnvApiKey } from "../stream";
 import type {
@@ -1171,22 +1172,30 @@ export function buildParams(
 	});
 
 	const systemPrompts = normalizeSystemPrompts(context.systemPrompt);
-	let systemInstructions: string | undefined;
-	if (systemPrompts.length > 0) {
-		const needsDeveloperRole = policy.messages.systemRole === "developer";
-		if (needsDeveloperRole) {
-			// Reasoning models on known OpenAI-compatible endpoints require the
-			// `developer` role. Send all system prompts inline in `input`.
-			messages.unshift(
-				...systemPrompts.map(systemPrompt => ({ role: "developer" as const, content: systemPrompt })),
-			);
-		} else {
-			// All other endpoints (including third-party /v1/responses proxies) use
-			// the canonical top-level `instructions` field so that proxies that
-			// reject `input[{role:"system"}]` work out of the box.
-			systemInstructions = systemPrompts.join("\n\n");
-		}
+	const mappedInstructions = mapContextInstructions(context.instructions, policy.messages.supportsDeveloperRole);
+	const systemInstructionTexts: string[] = [];
+	const inlineInstructions: Array<{ role: "system" | "developer"; content: string }> = [];
+	if (policy.messages.systemRole === "developer") {
+		inlineInstructions.push(...systemPrompts.map(content => ({ role: "developer" as const, content })));
+	} else {
+		systemInstructionTexts.push(...systemPrompts);
 	}
+	if (policy.messages.supportsDeveloperRole) {
+		inlineInstructions.push(
+			...mappedInstructions.map(instruction => ({
+				role: instruction.actualRole,
+				content: instruction.renderedText.toWellFormed(),
+			})),
+		);
+	} else {
+		systemInstructionTexts.push(...mappedInstructions.map(instruction => instruction.renderedText.toWellFormed()));
+	}
+	if (inlineInstructions.length > 0) {
+		messages.unshift(...inlineInstructions);
+	}
+	// The top-level field is the Responses system channel and avoids proxy
+	// failures on endpoints that reject `input[{role:"system"}]`.
+	const systemInstructions = systemInstructionTexts.length > 0 ? systemInstructionTexts.join("\n\n") : undefined;
 
 	const cacheRetention = resolveCacheRetention(options?.cacheRetention);
 	const promptCacheKey = getOpenAIPromptCacheKey(options);

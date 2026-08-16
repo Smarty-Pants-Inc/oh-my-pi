@@ -5,6 +5,7 @@
 import { scheduler } from "node:timers/promises";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import { readSseJson } from "@oh-my-pi/pi-utils";
+import { mapContextInstructions } from "../context-instructions";
 import { renderDemotedThinking } from "../dialect/demotion";
 import * as AIError from "../error";
 import type {
@@ -812,7 +813,12 @@ export function buildGoogleGenerateContentParams<T extends "google-generative-ai
 	context: Context,
 	options: GoogleSharedStreamOptions,
 ): GenerateContentParameters {
-	const systemPrompts = normalizeSystemPrompts(context.systemPrompt);
+	const systemPrompts = [
+		...normalizeSystemPrompts(context.systemPrompt),
+		...mapContextInstructions(context.instructions, false).map(instruction =>
+			instruction.renderedText.toWellFormed(),
+		),
+	];
 	const contents = convertMessages(model, context);
 
 	const generationConfig: GoogleGenerationConfig = {};

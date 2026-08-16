@@ -26,7 +26,7 @@ Objective ready only when all 5 pinned down; probe missing/weak fields:
 
 Re-ask until fixed: vague “done” without checkable signal; uncapped iteration (“until CI is green”, “keep going until it works”); self-graded success without verification command.
 
-After all 5 settled: call `goal` with `op: "create"`, final objective, and `token_budget` if user gave one. Objective MUST use this exact ordered markdown structure:
+After all 5 settled: call `goal` with `op: "create"` and the final objective. Do not set `token_budget`; only an owner/system operation may set a cap. Objective MUST use this exact ordered markdown structure:
 
 ## Objective
 ## Success criteria

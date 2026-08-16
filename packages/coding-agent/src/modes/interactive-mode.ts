@@ -1484,7 +1484,14 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (!this.loopModeEnabled || !this.loopPrompt) return;
 		const prompt = this.loopPrompt;
 		const loopAction = settings.get("loop.mode");
+		this.session.recordAutomaticTurnOutcome("direct_user_input", "accepted", "owner-enabled loop iteration queued");
 		this.#deferLoopAutoSubmit(() => {
+			if (!this.session.authorizeAutomaticTurn("direct_user_input")) return;
+			this.session.recordAutomaticTurnOutcome(
+				"direct_user_input",
+				"started",
+				"owner-enabled loop iteration started",
+			);
 			void this.#runLoopIteration(loopAction, prompt);
 		});
 	}
@@ -1502,6 +1509,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (this.#loopAutoSubmitTimer) {
 			clearTimeout(this.#loopAutoSubmitTimer);
 			this.#loopAutoSubmitTimer = undefined;
+			this.session.recordAutomaticTurnOutcome("direct_user_input", "deferred", "loop iteration cancelled");
 		}
 	}
 
@@ -1514,16 +1522,26 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (!this.goalModeEnabled || this.goalModePaused) return;
 		if (this.#goalSuppressNextContinuation) return;
 		if (this.#pendingSubmittedInput) return;
+		const queued = this.session.getQueuedMessages();
+		if (queued.steering.length > 0 || queued.followUp.length > 0) return;
 		if (this.editor.getText().trim().length > 0) return;
 		if ((this.editor.pendingImages?.length ?? 0) > 0) return;
 		const state = this.session.getGoalModeState();
 		if (!state?.enabled || state.goal.status !== "active") return;
+		if (!this.session.getActiveToolNames().includes("goal")) return;
 		const prompt = this.session.goalRuntime.buildContinuationPrompt();
 		if (!prompt) return;
+		this.session.recordAutomaticTurnOutcome(
+			"active_goal_continuation",
+			"accepted",
+			"one continuation queued for the idle transition",
+		);
 		this.#goalContinuationTimer = setTimeout(() => {
 			this.#goalContinuationTimer = undefined;
-			if (!this.onInputCallback) return;
-			if (!this.goalModeEnabled || this.goalModePaused) return;
+			const reject = (reason: string): void =>
+				this.session.recordAutomaticTurnOutcome("active_goal_continuation", "rejected", reason);
+			if (!this.onInputCallback) return reject("interactive input window closed");
+			if (!this.goalModeEnabled || this.goalModePaused) return reject("goal mode is not active");
 			// The 800ms timer can outlive the idle window that scheduled it: a
 			// `/goal set` taken via the streaming branch (or any extension/hook
 			// path that starts a turn while we wait) leaves the agent busy. Firing
@@ -1531,13 +1549,25 @@ export class InteractiveMode implements InteractiveModeContext {
 			// `promptCustomMessage` with no `streamingBehavior` and resurface
 			// `AgentBusyError`. Drop this tick; `#handleGoalSessionEvent` reschedules
 			// on the next `agent_end`.
-			if (this.#isAutoSubmitBlocked()) return;
-			if (this.#pendingSubmittedInput) return;
-			if (this.editor.getText().trim().length > 0) return;
-			if ((this.editor.pendingImages?.length ?? 0) > 0) return;
+			if (this.#isAutoSubmitBlocked()) return reject("another model or maintenance turn is active");
+			if (this.#pendingSubmittedInput) return reject("direct user submission is pending");
+			const latestQueued = this.session.getQueuedMessages();
+			if (latestQueued.steering.length > 0 || latestQueued.followUp.length > 0) {
+				return reject("queued direct user input wins");
+			}
+			if (this.editor.getText().trim().length > 0) return reject("user editor input wins");
+			if ((this.editor.pendingImages?.length ?? 0) > 0) return reject("user image input wins");
 			const latestState = this.session.getGoalModeState();
-			if (!latestState?.enabled || latestState.goal.status !== "active") return;
+			if (!latestState?.enabled || latestState.goal.status !== "active")
+				return reject("persisted goal is not active");
+			if (!this.session.getActiveToolNames().includes("goal")) return reject("goal tool is not available");
+			if (!this.session.authorizeAutomaticTurn("active_goal_continuation")) return;
 			this.#goalContinuationTurnInFlight = true;
+			this.session.recordAutomaticTurnOutcome(
+				"active_goal_continuation",
+				"started",
+				"typed goal.continuation committed to interactive submission",
+			);
 			this.onInputCallback(
 				this.startPendingSubmission({
 					text: prompt,
@@ -1552,6 +1582,11 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (this.#goalContinuationTimer) {
 			clearTimeout(this.#goalContinuationTimer);
 			this.#goalContinuationTimer = undefined;
+			this.session.recordAutomaticTurnOutcome(
+				"active_goal_continuation",
+				"deferred",
+				"idle continuation was superseded before commit",
+			);
 		}
 	}
 

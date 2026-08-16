@@ -4,6 +4,7 @@ import type {
 	AssistantMessage,
 	AssistantMessageEvent,
 	Context,
+	ContextInstruction,
 	FetchImpl,
 	Model,
 	ModelSpec,
@@ -137,6 +138,16 @@ const baseContext: Context = {
 	messages: [{ role: "user", content: "hi", timestamp: 0 }],
 };
 
+const internalInstruction: ContextInstruction = {
+	id: "goal.continuation",
+	sourcePath: "packages/coding-agent/src/prompts/goals/continuation.md",
+	role: "internal_context",
+	target: "main",
+	trigger: "goal-continuation",
+	sha256: "test-sha256",
+	renderedText: "Continue the active goal without overriding the user.",
+};
+
 async function collectEvents(stream: AsyncIterable<AssistantMessageEvent>): Promise<AssistantMessageEvent[]> {
 	const out: AssistantMessageEvent[] = [];
 	for await (const event of stream) out.push(event);
@@ -148,6 +159,20 @@ afterEach(() => {
 });
 
 describe("streamPiNative request shape", () => {
+	it("preserves typed instruction semantics and provenance for server-side mapping", async () => {
+		let body: { context?: Context } = {};
+		const context: Context = { ...baseContext, instructions: [internalInstruction] };
+		const fetchImpl: FetchImpl = (async (_input, init) => {
+			body = JSON.parse(init?.body as string) as { context?: Context };
+			return fakeResponse([{ type: "done", reason: "stop", message: baseAssistant() }]);
+		}) as FetchImpl;
+
+		await streamPiNative(fakeModel(), context, { apiKey: "gw-bearer", fetch: fetchImpl }).result();
+
+		expect(body.context?.instructions).toEqual([internalInstruction]);
+		expect(body.context?.messages).toEqual(baseContext.messages);
+	});
+
 	it("POSTs `{modelId, context, options, stream:true}` to `<baseUrl>/v1/pi/stream`", async () => {
 		const final = baseAssistant();
 		const captured: { url?: string; init?: RequestInit } = {};

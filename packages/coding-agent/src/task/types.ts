@@ -108,6 +108,7 @@ export const LABEL_MAX = 80;
 
 // Keep this explicit: ArkType serializes `unknown` as a boolean subschema, which llama.cpp grammars reject.
 const outputSchemaInputSchema = type("object | boolean | string | null");
+const modelRule = "string | string[]" as const;
 // Coarse per-spawn thinking effort; must stay in sync with TASK_EFFORTS in ../thinking.
 const effortRule = '"lo" | "med" | "hi"' as const;
 const selectableExecutionField = { "execution?": '"local" | "environment"' } as const;
@@ -126,6 +127,7 @@ export const taskItemSchema = rejectExecutionField(
 		"name?": "string",
 		agent: "string = 'task'",
 		task: "string",
+		"model?": modelRule,
 		"outputSchema?": outputSchemaInputSchema,
 		"schemaMode?": '"permissive" | "strict"',
 		"+": "delete",
@@ -136,6 +138,7 @@ const taskItemSchemaIsolated = rejectExecutionField(
 		"name?": "string",
 		agent: "string = 'task'",
 		task: "string",
+		"model?": modelRule,
 		"outputSchema?": outputSchemaInputSchema,
 		"schemaMode?": '"permissive" | "strict"',
 		"isolated?": "boolean",
@@ -151,6 +154,8 @@ export interface TaskItem {
 	agent?: string;
 	/** The work; required by the schema. */
 	task?: string;
+	/** Direct per-task model selector. Overrides the selected agent's default model. */
+	model?: string | string[];
 	/** Per-spawn thinking effort: lowest/middle/highest level the resolved model supports. Overrides the agent's default selector (e.g. `auto`). */
 	effort?: TaskEffort;
 	/** Caller-provided output schema; its presence overrides the selected agent's schema. */
@@ -165,6 +170,7 @@ export const taskSchema = type({
 	"name?": "string",
 	agent: "string = 'task'",
 	task: "string",
+	"model?": modelRule,
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
 	...selectableExecutionField,
@@ -176,6 +182,7 @@ const taskSchemaIsolated = rejectExecutionField(
 		"name?": "string",
 		agent: "string = 'task'",
 		task: "string",
+		"model?": modelRule,
 		"outputSchema?": outputSchemaInputSchema,
 		"schemaMode?": '"permissive" | "strict"',
 		"isolated?": "boolean",
@@ -187,6 +194,7 @@ const taskSchemaNoIsolation = rejectExecutionField(
 		"name?": "string",
 		agent: "string = 'task'",
 		task: "string",
+		"model?": modelRule,
 		"outputSchema?": outputSchemaInputSchema,
 		"schemaMode?": '"permissive" | "strict"',
 		"+": "delete",
@@ -245,6 +253,7 @@ function createTaskSchema(options: {
 				"name?": "string",
 				agent,
 				task: "string",
+				"model?": modelRule,
 				...effortField,
 				"outputSchema?": outputSchemaInputSchema,
 				"schemaMode?": '"permissive" | "strict"',
@@ -264,6 +273,7 @@ function createTaskSchema(options: {
 		"name?": "string",
 		agent,
 		task: "string",
+		"model?": modelRule,
 		...effortField,
 		"outputSchema?": outputSchemaInputSchema,
 		"schemaMode?": '"permissive" | "strict"',
@@ -311,6 +321,8 @@ export interface TaskParams {
 	agent?: string;
 	/** The work (flat form). */
 	task?: string;
+	/** Direct per-task model selector. Overrides the selected agent's default model. */
+	model?: string | string[];
 	/** Per-spawn thinking effort (flat form): lowest/middle/highest level the resolved model supports. */
 	effort?: TaskEffort;
 	/** Caller-provided output schema; its presence overrides the selected agent's schema. */

@@ -265,6 +265,19 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 		_context?: AgentToolContext,
 	): Promise<AgentToolResult<AstEditToolDetails>> {
 		return untilAborted(signal, async () => {
+			const assertWriteCapabilities = (searchPath: string, changes: readonly AstReplaceFileChange[]): void => {
+				for (const change of changes) {
+					const decision = this.session.capabilities?.decideWrite(path.resolve(searchPath, change.path));
+					if (decision?.outcome === "request") {
+						throw new ToolError(
+							`AST edit target '${decision.target}' requires an explicit session writePath capability outside '${this.session.capabilities?.workspace}'.`,
+						);
+					}
+					if (decision?.outcome === "deny") {
+						throw new ToolError(`AST edit target '${decision.target}' cannot be canonicalized safely.`);
+					}
+				}
+			};
 			const ops = params.ops.map((entry, index) => {
 				if (entry.pat.length === 0) {
 					throw new ToolError(`\`ops[${index}].pat\` must be a non-empty pattern`);
@@ -308,6 +321,7 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 				failOnParseError: false,
 				signal,
 			});
+			assertWriteCapabilities(resolvedSearchPath, result.fileChanges);
 
 			const { errors: cappedParseErrors, total: parseErrorsTotal } = capParseErrors(result.parseErrors);
 			const formatPath = (filePath: string): string =>
@@ -444,6 +458,13 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 					label: `AST Edit: ${result.totalReplacements} replacement${previewReplacementPlural} in ${result.filesTouched} file${previewFilePlural}`,
 					sourceToolName: this.name,
 					apply: async (_reason: string) => {
+						const currentPreview = await runAstEditOnce(multiTargets, resolvedSearchPath, globFilter, {
+							rewrites: normalizedRewrites,
+							dryRun: true,
+							maxFiles,
+							failOnParseError: false,
+						});
+						assertWriteCapabilities(resolvedSearchPath, currentPreview.fileChanges);
 						const applyResult = await runAstEditOnce(multiTargets, resolvedSearchPath, globFilter, {
 							rewrites: normalizedRewrites,
 							dryRun: false,

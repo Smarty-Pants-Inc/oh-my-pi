@@ -1,6 +1,14 @@
 import type { UsageStatistics } from "../session/session-entries";
 
-export type GoalStatus = "active" | "paused" | "budget-limited" | "complete" | "dropped";
+export type GoalStatus =
+	| "active"
+	| "paused"
+	| "blocked"
+	| "budget_limited"
+	| "usage_limited"
+	| "complete"
+	| "dropped"
+	| "superseded";
 
 export interface Goal {
 	id: string;
@@ -20,7 +28,22 @@ export interface GoalModeState {
 	goal: Goal;
 }
 
-const goalStatuses = new Set<GoalStatus>(["active", "paused", "budget-limited", "complete", "dropped"]);
+const goalStatuses = new Set<GoalStatus>([
+	"active",
+	"paused",
+	"blocked",
+	"budget_limited",
+	"usage_limited",
+	"complete",
+	"dropped",
+	"superseded",
+]);
+
+function normalizeGoalStatus(value: string): GoalStatus | undefined {
+	if (value === "budget-limited") return "budget_limited";
+	if (value === "usage-limited") return "usage_limited";
+	return goalStatuses.has(value as GoalStatus) ? (value as GoalStatus) : undefined;
+}
 
 /** Parse persisted goal mode data at every session identity boundary. */
 export function parseGoalModeState(mode: unknown, modeData: unknown): GoalModeState | undefined {
@@ -35,7 +58,6 @@ export function parseGoalModeState(mode: unknown, modeData: unknown): GoalModeSt
 		typeof value.objective !== "string" ||
 		value.objective.length === 0 ||
 		typeof value.status !== "string" ||
-		!goalStatuses.has(value.status as GoalStatus) ||
 		typeof value.tokensUsed !== "number" ||
 		!Number.isFinite(value.tokensUsed) ||
 		value.tokensUsed < 0 ||
@@ -53,11 +75,14 @@ export function parseGoalModeState(mode: unknown, modeData: unknown): GoalModeSt
 	) {
 		return undefined;
 	}
-	const status = value.status as GoalStatus;
-	if (mode === "goal" ? status !== "active" && status !== "budget-limited" : status !== "paused") return undefined;
+	const status = normalizeGoalStatus(value.status);
+	if (!status) return undefined;
+	if (mode === "goal_paused" ? status !== "paused" : status === "paused") return undefined;
+	const complete = status === "complete";
 	return {
-		enabled: mode === "goal",
-		mode: "active",
+		enabled: status === "active" || status === "budget_limited",
+		mode: complete ? "exiting" : "active",
+		reason: complete ? "completed" : undefined,
 		goal: {
 			id: value.id,
 			objective: value.objective,
@@ -72,7 +97,7 @@ export function parseGoalModeState(mode: unknown, modeData: unknown): GoalModeSt
 }
 
 export interface GoalToolDetails {
-	op: "create" | "get" | "complete" | "resume" | "drop";
+	op: "create" | "get" | "complete" | "block";
 	goal?: Goal | null;
 	remainingTokens?: number | null;
 	completionBudgetReport?: string | null;

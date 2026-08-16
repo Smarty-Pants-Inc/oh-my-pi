@@ -1079,9 +1079,8 @@ export class SessionAdvisors {
 		//  - ACP bridges with `deferAgentInitiatedTurns`: the client cannot show an
 		//    agent-initiated turn as busy, so idle triggers are refused (#5628 review).
 		const cannotAutoTrigger =
-			!this.#host.agent.state.isStreaming &&
-			this.#host.clientBridge()?.deferAgentInitiatedTurns === true &&
-			!this.#host.allowAgentInitiatedTurns();
+			!this.#host.agent.state.isStreaming ||
+			(this.#host.clientBridge()?.deferAgentInitiatedTurns === true && !this.#host.allowAgentInitiatedTurns());
 		if (this.#host.planModeState()?.enabled || cannotAutoTrigger) {
 			this.#host.preserveAdvisorCard({
 				role: "custom",

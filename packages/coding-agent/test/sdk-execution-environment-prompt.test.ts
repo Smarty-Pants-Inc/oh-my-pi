@@ -75,8 +75,8 @@ describe("execution environment session prompts", () => {
 				const rendered = session.systemPrompt.join("\n\n");
 				expect(session.sessionManager.getCwd()).toBe(sourceRoot);
 				expect(rendered).toContain("locally-discovered-environment-context");
-				expect(rendered).toContain('<file path="/workspace/AGENTS.md">');
-				expect(rendered).toContain("current working directory: '/workspace'.");
+				expect(rendered).toContain('<external_instruction path="/workspace/AGENTS.md">');
+				expect(rendered).toContain("Working directory: `/workspace`");
 				expect(rendered).not.toContain(sourceRoot);
 			} finally {
 				await session.dispose();

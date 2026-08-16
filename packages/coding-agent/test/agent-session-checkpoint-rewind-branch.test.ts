@@ -703,7 +703,7 @@ describe("AgentSession checkpoint rewind branch context", () => {
 			true,
 		);
 	});
-	it("marks extension agent_end willContinue when enforceRewindBeforeYield continues", async () => {
+	it("leaves an open checkpoint inert when the model stops without rewind", async () => {
 		const agentEnds: Array<boolean | undefined> = [];
 
 		const report = "findings: enforced rewind before yield";
@@ -730,16 +730,14 @@ describe("AgentSession checkpoint rewind branch context", () => {
 		await session.prompt("investigate with a checkpoint then yield early");
 		await session.waitForIdle();
 
-		// Intermediate enforceRewindBeforeYield settle, then terminal post-rewind settle.
-		expect(agentEnds.length).toBeGreaterThanOrEqual(2);
-		const continuing = agentEnds.filter(willContinue => willContinue === true);
-		expect(continuing).toHaveLength(1);
-		const intermediateIndex = agentEnds.indexOf(true);
-		expect(intermediateIndex).toBeGreaterThanOrEqual(0);
-		expect(intermediateIndex).toBeLessThan(agentEnds.length - 1);
+		expect(agentEnds).toHaveLength(1);
+		expect(agentEnds).not.toContain(true);
 		expect(agentEnds.at(-1)).toBeFalsy();
-		expect(mock.calls.length).toBeGreaterThanOrEqual(3);
-		expect(expectLastAssistant(session.messages).stopReason).toBe("stop");
+		expect(mock.calls).toHaveLength(2);
+		const lastAssistant = session.messages.findLast(message => message.role === "assistant");
+		expect(lastAssistant?.role).toBe("assistant");
+		if (lastAssistant?.role === "assistant") expect(lastAssistant.stopReason).toBe("stop");
+		expect(session.messages.at(-1)?.role).toBe("developer");
 	});
 
 	it("rehydrates an active checkpoint from an xdev write after branching and resume", async () => {

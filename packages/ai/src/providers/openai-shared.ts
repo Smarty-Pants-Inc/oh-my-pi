@@ -32,6 +32,7 @@ import {
 	stringifyJson,
 	structuredCloneJSON,
 } from "@oh-my-pi/pi-utils";
+import { mapContextInstructions } from "../context-instructions";
 import * as AIError from "../error";
 import {
 	type Api,
@@ -1629,6 +1630,8 @@ export interface BuildResponsesInputOptions<TApi extends Api> {
 	strictResponsesPairing: boolean;
 	supportsImageDetailOriginal: boolean;
 	systemRole?: "system" | "developer";
+	/** When set, append fresh typed instructions after the legacy system prefix. */
+	supportsDeveloperRole?: boolean;
 	nativeHistory?: {
 		replay: boolean;
 		filterReasoning: boolean;
@@ -1724,6 +1727,11 @@ export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInp
 	const systemPrompts = options.systemRole ? normalizeSystemPrompts(options.context.systemPrompt) : [];
 	for (const systemPrompt of systemPrompts) {
 		messages.push({ role: options.systemRole as "system" | "developer", content: systemPrompt });
+	}
+	if (options.supportsDeveloperRole !== undefined) {
+		for (const instruction of mapContextInstructions(options.context.instructions, options.supportsDeveloperRole)) {
+			messages.push({ role: instruction.actualRole, content: instruction.renderedText.toWellFormed() });
+		}
 	}
 
 	// Compat is resolved by the catalog (e.g. Copilot / xai-oauth reject

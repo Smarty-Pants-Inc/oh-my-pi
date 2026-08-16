@@ -930,19 +930,10 @@ describe("AgentSession.branchFromBtw", () => {
 		).rejects.toThrow("Cannot branch /btw while session maintenance or user work is still running");
 	});
 
-	it("refuses when post-prompt work starts a turn while a branch hook is pending", async () => {
-		const hookRelease = Promise.withResolvers<void>();
-		const extensionRunner = {
-			hasHandlers: vi.fn((eventType: string) => eventType === "session_before_branch"),
-			emit: vi.fn(async () => {
-				await hookRelease.promise;
-				return undefined;
-			}),
-		} as unknown as ExtensionRunner;
-		const activeSession = await createSession({ extensionRunner });
+	it("does not treat a passive deferred message as post-prompt turn work", async () => {
+		const activeSession = await createSession();
 		activeSession.sessionManager.appendMessage({ role: "user", content: "seed", timestamp: Date.now() });
 		await activeSession.sessionManager.flush();
-		const originalFile = activeSession.sessionFile;
 		activeSession.queueDeferredMessage({
 			role: "custom",
 			customType: "test-hidden-message",
@@ -950,21 +941,7 @@ describe("AgentSession.branchFromBtw", () => {
 			display: false,
 			timestamp: Date.now(),
 		});
-		expect(activeSession.hasPostPromptWork).toBe(true);
-
-		const branchPromise = activeSession.branchFromBtw(
-			"question",
-			createBtwAssistant(),
-			requiredLeafId(activeSession),
-			activeSession.sessionManager.getSessionId(),
-		);
-		await Promise.resolve();
-		hookRelease.resolve();
-
-		await expect(branchPromise).rejects.toThrow(
-			"Cannot branch /btw while session maintenance or user work is still running",
-		);
-		expect(activeSession.sessionFile).toBe(originalFile);
+		expect(activeSession.hasPostPromptWork).toBe(false);
 	});
 
 	it("throws for in-memory sessions", async () => {

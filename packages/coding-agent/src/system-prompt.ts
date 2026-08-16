@@ -992,7 +992,7 @@ export async function buildSystemPrompt(
 		systemPrompt.push(resolvedComputerSafetyPrompt.trim());
 	}
 	// Custom prompt templates already render context files and append text; the
-	// project footer still carries environment, cwd, workspace, and dir-context.
+	// project footer still carries environment, workspace, and directory context.
 	const projectPrompt = prompt
 		.render(
 			resolvedProjectPromptTemplate,

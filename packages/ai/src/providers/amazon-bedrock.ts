@@ -11,6 +11,7 @@ import type { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { mapEffortToAnthropicAdaptiveEffort, requireSupportedEffort } from "@oh-my-pi/pi-catalog/model-thinking";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import { $flag, fetchWithRetry, parseStreamingJson, parseStreamingJsonThrottled } from "@oh-my-pi/pi-utils";
+import { mapContextInstructions } from "../context-instructions";
 import { renderDemotedThinking } from "../dialect/demotion";
 import * as AIError from "../error";
 import { resolveAwsBearerToken } from "../registry/aws";
@@ -344,7 +345,7 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 
 			const commandInput: ConverseStreamRequest = {
 				messages: convertedMessages,
-				system: buildSystemPrompt(context.systemPrompt, promptCachePolicy),
+				system: buildSystemPrompt(context, promptCachePolicy),
 				inferenceConfig: {
 					maxTokens: options.maxTokens,
 					temperature: options.temperature,
@@ -790,10 +791,15 @@ function supportsThinkingSignature(model: Model<"bedrock-converse-stream">): boo
 }
 
 function buildSystemPrompt(
-	systemPrompt: readonly string[] | string | undefined,
+	context: Pick<Context, "systemPrompt" | "instructions">,
 	promptCachePolicy: BedrockPromptCachePolicy,
 ): SystemContent[] | undefined {
-	const prompts = normalizeSystemPrompts(systemPrompt);
+	const prompts = [
+		...normalizeSystemPrompts(context.systemPrompt),
+		...mapContextInstructions(context.instructions, false).map(instruction =>
+			instruction.renderedText.toWellFormed(),
+		),
+	];
 	if (prompts.length === 0) return undefined;
 
 	const blocks: SystemContent[] = prompts.map(prompt => ({ text: prompt }));

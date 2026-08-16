@@ -6,9 +6,8 @@
  *      wakes an autonomous primary turn.
  *  T2. An idle IRC message in plan mode is folded into context ("injected"),
  *      not woken.
- *  T3. A plan-mode turn that stops without a decision tool call is reminded at the
- *      terminal settle, bounded by PLAN_MODE_REMINDER_MAX (then yields to the
- *      user), and either decision tool resets the counter.
+ *  T3. A plan-mode turn that stops without a decision tool call records one
+ *      passive reminder, then yields to the user without a hidden turn.
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
@@ -245,7 +244,7 @@ describe("AgentSession plan-mode convergence", () => {
 		}
 	});
 
-	it("T3a: convergence reminders are bounded by the cap, then yield to the user", async () => {
+	it("T3a: records one passive reminder, then yields to the user", async () => {
 		const harness = await createPlanSession([
 			{ content: ["planning A"] },
 			{ content: [{ type: "toolCall", name: "read", arguments: { path: "a" } }] },
@@ -261,12 +260,12 @@ describe("AgentSession plan-mode convergence", () => {
 		await harness.session.prompt("make a plan");
 		await harness.session.waitForIdle();
 
-		expect(countReminders(harness.session.agent.state.messages)).toBe(3);
-		expect(harness.mock.calls.length).toBe(7);
+		expect(countReminders(harness.session.agent.state.messages)).toBe(1);
+		expect(harness.mock.calls.length).toBe(1);
 		expect(harness.session.getPlanModeState()?.enabled).toBe(true);
 	});
 
-	it("T3b: a propose write resets the convergence counter", async () => {
+	it("T3b: does not run a hidden turn to reach a propose write", async () => {
 		const harness = await createPlanSession([
 			{ content: ["planning A"] },
 			{
@@ -288,11 +287,11 @@ describe("AgentSession plan-mode convergence", () => {
 		await harness.session.prompt("make a plan");
 		await harness.session.waitForIdle();
 
-		expect(countReminders(harness.session.agent.state.messages)).toBe(2);
-		expect(harness.mock.calls.length).toBe(4);
+		expect(countReminders(harness.session.agent.state.messages)).toBe(1);
+		expect(harness.mock.calls.length).toBe(1);
 	});
 
-	it("T3c: an ask call resets the convergence counter", async () => {
+	it("T3c: does not run a hidden turn to reach an ask call", async () => {
 		const harness = await createPlanSession([
 			{ content: ["planning A"] },
 			{
@@ -315,8 +314,8 @@ describe("AgentSession plan-mode convergence", () => {
 		await harness.session.prompt("make a plan");
 		await harness.session.waitForIdle();
 
-		expect(countReminders(harness.session.agent.state.messages)).toBe(2);
-		expect(harness.mock.calls.length).toBe(4);
+		expect(countReminders(harness.session.agent.state.messages)).toBe(1);
+		expect(harness.mock.calls.length).toBe(1);
 	});
 
 	it("restores the pre-plan tool set after PlanYolo approval", async () => {

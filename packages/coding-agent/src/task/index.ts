@@ -233,6 +233,19 @@ function validateEffort(effort: TaskEffort | undefined, label: string): string |
 	return `${label} has an invalid \`effort\` value ${JSON.stringify(effort)}. Use "lo", "med", or "hi".`;
 }
 
+function validateModel(model: string | string[] | undefined, label: string): string | undefined {
+	if (model === undefined) return undefined;
+	if (typeof model === "string" && model.trim()) return undefined;
+	if (
+		Array.isArray(model) &&
+		model.length > 0 &&
+		model.every(selector => typeof selector === "string" && selector.trim())
+	) {
+		return undefined;
+	}
+	return `${label} has an invalid \`model\` selector. Use a non-empty model string or list of model strings.`;
+}
+
 function validateSpawnParams(params: TaskParams, batchEnabled: boolean): string | undefined {
 	const hasTask = typeof params.task === "string" && params.task.trim() !== "";
 	const tasks = params.tasks;
@@ -250,6 +263,8 @@ function validateSpawnParams(params: TaskParams, batchEnabled: boolean): string 
 			}
 			const effortError = validateEffort(item.effort, `Task ${i + 1}${item.name ? ` (\`${item.name}\`)` : ""}`);
 			if (effortError) return effortError;
+			const modelError = validateModel(item.model, `Task ${i + 1}${item.name ? ` (\`${item.name}\`)` : ""}`);
+			if (modelError) return modelError;
 		}
 		const seen = new Map<string, string>();
 		for (const item of tasks) {
@@ -274,6 +289,8 @@ function validateSpawnParams(params: TaskParams, batchEnabled: boolean): string 
 	}
 	const effortError = validateEffort(params.effort, "The call");
 	if (effortError) return effortError;
+	const modelError = validateModel(params.model, "The call");
+	if (modelError) return modelError;
 	if (params.execution === undefined || params.execution === "local" || params.execution === "environment") {
 		return undefined;
 	}
@@ -291,6 +308,7 @@ function resolveSpawnItems(params: TaskParams): TaskItem[] {
 		return params.tasks;
 	}
 	const item: TaskItem = { name: params.name, agent: params.agent, task: params.task };
+	if ("model" in params) item.model = params.model;
 	if ("outputSchema" in params) item.outputSchema = params.outputSchema;
 	if ("schemaMode" in params) item.schemaMode = params.schemaMode;
 	if ("effort" in params) item.effort = params.effort;
@@ -311,6 +329,7 @@ function spawnParamsFor(params: TaskParams, item: TaskItem, defaultAgent: string
 	const spawn: TaskParams = { agent: item.agent?.trim() || defaultAgent };
 	if (item.name !== undefined) spawn.name = item.name;
 	if (item.task !== undefined) spawn.task = item.task;
+	if ("model" in item) spawn.model = item.model;
 	if (params.context !== undefined) spawn.context = params.context;
 	if ("outputSchema" in item) spawn.outputSchema = item.outputSchema;
 	if ("schemaMode" in item) spawn.schemaMode = item.schemaMode;
@@ -1444,6 +1463,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				assignment,
 				context,
 				agent: params.agent,
+				...(params.model !== undefined ? { model: params.model } : {}),
 				...(Object.hasOwn(params, "outputSchema") ? { outputSchema: params.outputSchema } : {}),
 				...(Object.hasOwn(params, "schemaMode") ? { schemaMode: params.schemaMode } : {}),
 				...(params.effort !== undefined ? { effort: params.effort } : {}),
