@@ -20,8 +20,6 @@ const OMP_SCOPE_BASE = {
 	tree: "a20c0452f99155e7adeaecfad28e4afd0223c684",
 } as const;
 const OMP_SCOPE_BASE_URL = "https://github.com/can1357/oh-my-pi.git";
-const OMP_SCOPE_REQUIREMENT =
-	"SMARTY_AGENT_CONTEXT_AND_AUTONOMY_RECALIBRATION_SPEC_V1.md §2.15 final OMP fork reconstruction";
 
 export function canonicalGithubRepository(url: string | undefined): string | undefined {
 	if (!url) return undefined;
@@ -149,18 +147,23 @@ function assertGitObject(value: unknown, label: string): asserts value is string
 export function parseScopeCoverage(value: unknown, label: string): ScopeCoverageEntry[] {
 	if (!Array.isArray(value)) throw new Error(`${label} must be an array`);
 	let previousPath: string | undefined;
-	return value.map((entry, index) => {
+	const entries = value.map((entry, index) => {
 		if (!isRecord(entry)) throw new Error(`${label} ${index} must be an object`);
 		const entryLabel = `${label} ${index}`;
 		if ("requirement" in entry) {
 			assertExactKeys(entry, ["path", "requirement"], entryLabel);
 			assertRepositoryPath(entry.path, `${entryLabel} path`);
 			assertString(entry.requirement, `${entryLabel} requirement`);
+			if (!/§\d+\.\d+(?:\.\d+)?(?:\b|\s)/u.test(entry.requirement)) {
+				throw new Error(`${entryLabel} requirement must name an exact specification section or item`);
+			}
 		} else {
 			assertExactKeys(entry, ["path", "dependencyOf", "necessity"], entryLabel);
 			assertRepositoryPath(entry.path, `${entryLabel} path`);
-			assertString(entry.dependencyOf, `${entryLabel} dependencyOf`);
-			assertString(entry.necessity, `${entryLabel} necessity`);
+			assertRepositoryPath(entry.dependencyOf, `${entryLabel} dependencyOf`);
+			if (typeof entry.necessity !== "string" || entry.necessity.trim().length === 0) {
+				throw new Error(`${entryLabel} necessity must be a non-empty reason`);
+			}
 		}
 		if (previousPath !== undefined && compareUnicodeCodePoints(previousPath, entry.path) >= 0) {
 			throw new Error(`${label} must be sorted and unique by path`);
@@ -168,6 +171,17 @@ export function parseScopeCoverage(value: unknown, label: string): ScopeCoverage
 		previousPath = entry.path;
 		return entry as ScopeCoverageEntry;
 	});
+	const directPaths = new Set(entries.filter(entry => "requirement" in entry).map(entry => entry.path));
+	for (const [index, entry] of entries.entries()) {
+		if (!("dependencyOf" in entry)) continue;
+		if (entry.dependencyOf === entry.path) {
+			throw new Error(`${label} ${index} dependencyOf must not reference itself`);
+		}
+		if (!directPaths.has(entry.dependencyOf)) {
+			throw new Error(`${label} ${index} dependencyOf must reference a directly mapped path in the same set`);
+		}
+	}
+	return entries;
 }
 
 export function parseCandidateIdentities(value: unknown, label: string): CandidateIdentity[] {
@@ -516,6 +530,7 @@ async function ensureOmpScopeBase(repositoryRoot: string): Promise<void> {
 async function buildCurrentCandidate(
 	repositoryRoot: string,
 	identity: Pick<CandidateIdentity, "commit" | "tree">,
+	scopeCoverageInput: unknown,
 ): Promise<CandidateIdentity> {
 	await ensureOmpScopeBase(repositoryRoot);
 	const changedPaths = (
@@ -529,10 +544,7 @@ async function buildCurrentCandidate(
 		.split("\0")
 		.filter(Boolean)
 		.sort(compareUnicodeCodePoints);
-	const scopeCoverage = validateScopeCoverage(
-		changedPaths,
-		changedPaths.map(changedPath => ({ path: changedPath, requirement: OMP_SCOPE_REQUIREMENT })),
-	);
+	const scopeCoverage = validateScopeCoverage(changedPaths, scopeCoverageInput);
 	return {
 		repository: OMP_REPOSITORY,
 		baseCommit: OMP_SCOPE_BASE.commit,
@@ -555,11 +567,11 @@ function validateCandidateSet(
 	return sorted;
 }
 
-async function loadActivationCandidates(current: CandidateIdentity): Promise<CandidateIdentity[]> {
+async function loadActivationCandidates(): Promise<CandidateIdentity[] | undefined> {
 	const statePath = activationStatePath();
-	if (!(await Bun.file(statePath).exists())) return [current];
+	if (!(await Bun.file(statePath).exists())) return undefined;
 	const state = parseContextReleaseManifest(await Bun.file(statePath).text());
-	return validateCandidateSet(current, state.candidates);
+	return state.candidates;
 }
 
 export function activationStatePath(explicitPath?: string): string {
@@ -619,7 +631,7 @@ export async function isApprovedCandidateSource(filePath: string, release: Conte
 export async function buildContextReleaseManifest(
 	_projectCwd: string = process.cwd(),
 	candidateOverride?: readonly CandidateIdentity[],
-	options?: { requireCleanCanonicalCheckout?: boolean },
+	options?: { requireCleanCanonicalCheckout?: boolean; scopeCoverage?: unknown },
 ): Promise<ContextReleaseManifest> {
 	const packageRoot = path.resolve(import.meta.dir, "../..");
 	const repositoryRoot = await repo.root(packageRoot);
@@ -640,10 +652,14 @@ export async function buildContextReleaseManifest(
 		}
 	}
 	const content = await assertTrackedManifestCurrent();
-	const currentCandidate = await buildCurrentCandidate(repositoryRoot, { commit, tree });
-	const candidates = candidateOverride
-		? validateCandidateSet(currentCandidate, candidateOverride)
-		: await loadActivationCandidates(currentCandidate);
+	const candidateInput = candidateOverride ?? (await loadActivationCandidates());
+	const suppliedOmp = candidateInput?.find(candidate => candidate.repository === OMP_REPOSITORY);
+	const scopeCoverageInput = options?.scopeCoverage ?? suppliedOmp?.scopeCoverage;
+	if (!scopeCoverageInput) {
+		throw new Error("PROMPT_POLICY_REVIEW_REQUIRED: missing reviewed OMP scopeCoverage input");
+	}
+	const currentCandidate = await buildCurrentCandidate(repositoryRoot, { commit, tree }, scopeCoverageInput);
+	const candidates = candidateInput ? validateCandidateSet(currentCandidate, candidateInput) : [currentCandidate];
 	const agentDir = canonicalAgentDirPath();
 	const globalAgentsPath = path.join(agentDir, "AGENTS.md");
 	const configurationPath = path.join(agentDir, "config.yml");

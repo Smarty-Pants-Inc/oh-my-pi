@@ -114,7 +114,11 @@ describe("tracked context manifest", () => {
 					tree: "b".repeat(40),
 					scopeCoverage: [
 						{ path: "packages/a.ts", requirement: "§2.15" },
-						{ path: "packages/b.test.ts", dependencyOf: "§23", necessity: "Runnable contract proof." },
+						{
+							path: "packages/b.test.ts",
+							dependencyOf: "packages/a.ts",
+							necessity: "Runnable contract proof.",
+						},
 					],
 				},
 			],
@@ -169,6 +173,30 @@ describe("tracked context manifest", () => {
 				[candidate.scopeCoverage[0], { path: "packages/extra.ts", requirement: "§2.15" }],
 			),
 		).toThrow("extra=packages/extra.ts");
+		expect(() => validateScopeCoverage(["packages/a.ts"], [{ path: "packages/a.ts", requirement: "§23" }])).toThrow(
+			"exact specification section or item",
+		);
+		expect(() =>
+			validateScopeCoverage(
+				["packages/a.ts"],
+				[{ path: "packages/a.ts", dependencyOf: "packages/missing.ts", necessity: "Circular convenience." }],
+			),
+		).toThrow("directly mapped path in the same set");
+		expect(() =>
+			validateScopeCoverage(
+				["packages/a.ts"],
+				[{ path: "packages/a.ts", dependencyOf: "packages/a.ts", necessity: "Self dependency." }],
+			),
+		).toThrow("must not reference itself");
+		expect(() =>
+			validateScopeCoverage(
+				["packages/a.ts", "packages/b.ts"],
+				[
+					{ path: "packages/a.ts", dependencyOf: "packages/b.ts", necessity: "Cycle half one." },
+					{ path: "packages/b.ts", dependencyOf: "packages/a.ts", necessity: "Cycle half two." },
+				],
+			),
+		).toThrow("directly mapped path in the same set");
 	});
 
 	it("is deterministic and matches live prompt, behavior, and tool contracts", async () => {
