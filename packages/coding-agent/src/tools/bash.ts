@@ -940,11 +940,16 @@ function assertBashCapabilities(
 ): NamedBashEffect | undefined {
 	if (!session.capabilities) return undefined;
 	const namedEffect = allowNamedEffects ? parseNamedBashEffect(command, env) : undefined;
+	const segments = tokenizeShellSegments(command);
 	for (const target of bashCommandWriteTargets(command)) {
 		assertBashWriteCapability(session, target, cwd, env);
 	}
+	if (segments.length === 0 && command.trim().length > 0) {
+		assertBashCommandCapability(session, command);
+		return undefined;
+	}
 	if (namedEffect) assertBashExternalCapability(session, namedEffect.capability);
-	for (const tokens of tokenizeShellSegments(command)) {
+	for (const tokens of segments) {
 		const cwdIsWorkspace = isCurrentWorkspacePath(session, cwd);
 		if (!cwdIsWorkspace || (!namedEffect && commandNeedsGenericExternalCapability(command, tokens, cwd, env))) {
 			assertBashCommandCapability(session, command);

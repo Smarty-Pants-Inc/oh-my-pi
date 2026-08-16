@@ -66,7 +66,8 @@ export function tokenizeShellSegments(command: string): string[][] {
 			inDouble = true;
 			continue;
 		}
-		if (ch === "\\" && i + 1 < command.length) {
+		if (ch === "\\") {
+			if (i + 1 >= command.length) return [];
 			wordStarted = true;
 			buffer += command[i + 1];
 			i++;
@@ -84,6 +85,7 @@ export function tokenizeShellSegments(command: string): string[][] {
 		wordStarted = true;
 		buffer += ch;
 	}
+	if (inSingle || inDouble) return [];
 	pushSegment();
 	return segments;
 }
