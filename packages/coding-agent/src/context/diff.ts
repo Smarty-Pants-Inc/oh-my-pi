@@ -102,7 +102,7 @@ export async function diffProtectedRepository(options: {
 	}
 	inputs.sort((left, right) => left.path!.localeCompare(right.path!));
 	if (baseManifest && targetManifest) {
-		inputs.unshift({ path: MANIFEST_PATH, before: baseManifest, after: targetManifest });
+		inputs.unshift({ before: baseManifest, after: targetManifest });
 	}
 	const classification = diffProtectedSurfaces(inputs);
 	return buildProtectedDeltaEvidence({

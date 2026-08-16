@@ -1,6 +1,9 @@
 import { describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { canonicalJson, type JsonValue, sha256 } from "../../src/context/canonical";
-import { buildProtectedDeltaEvidence, diffManifestRoots } from "../../src/context/diff";
+import { buildProtectedDeltaEvidence, diffManifestRoots, diffProtectedRepository } from "../../src/context/diff";
 
 const identity = {
 	repository: "Smarty-Pants-Inc/oh-my-pi",
@@ -11,6 +14,38 @@ const identity = {
 };
 
 describe("protected delta evidence", () => {
+	it("does not classify an unchanged manifest across identical trees", async () => {
+		const repository = await fs.mkdtemp(path.join(os.tmpdir(), "omp-protected-delta-"));
+		const runGit = (...args: string[]): string => {
+			const result = Bun.spawnSync(["git", ...args], { cwd: repository, stdout: "pipe", stderr: "pipe" });
+			if (result.exitCode !== 0) throw new Error(result.stderr.toString());
+			return result.stdout.toString().trim();
+		};
+		try {
+			runGit("init", "--quiet");
+			runGit("config", "user.name", "OMP Test");
+			runGit("config", "user.email", "omp-test@example.invalid");
+			runGit("remote", "add", "origin", "https://github.com/Smarty-Pants-Inc/oh-my-pi.git");
+			const manifestDirectory = path.join(repository, "packages/coding-agent/generated");
+			await fs.mkdir(manifestDirectory, { recursive: true });
+			await fs.copyFile(
+				path.resolve(import.meta.dir, "../../generated/prompt-manifest.json"),
+				path.join(manifestDirectory, "prompt-manifest.json"),
+			);
+			runGit("add", ".");
+			runGit("commit", "--quiet", "-m", "base");
+			const base = runGit("rev-parse", "HEAD");
+			runGit("commit", "--quiet", "--allow-empty", "-m", "same tree");
+
+			const evidence = await diffProtectedRepository({ repository, base, target: "HEAD" });
+			expect(evidence.baseTree).toBe(evidence.headTree);
+			expect(evidence.protectedDelta).toBe(false);
+			expect(evidence.classifications).toEqual([]);
+		} finally {
+			await fs.rm(repository, { recursive: true, force: true });
+		}
+	});
+
 	it("reports a missing pre-registry manifest as an explicit null root", () => {
 		expect(diffManifestRoots(undefined, { rootSha256: "a".repeat(64) })).toEqual({
 			baseRootSha256: null,
