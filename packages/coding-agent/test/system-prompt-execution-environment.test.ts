@@ -43,7 +43,7 @@ describe("execution environment system prompt projection", () => {
 		expect(rendered).toContain("<external_instruction>\nUser-level instructions");
 		expect(rendered).toContain("- /workspace/src/AGENTS.md");
 		expect(rendered).toContain("- `/workspace/packages/app`");
-		expect(rendered).toContain("Working directory: `/workspace`");
+		expect(rendered).not.toContain("Working directory:");
 		expect(rendered).not.toContain(sourceRoot);
 		expect(rendered).not.toContain("/Users/example/.omp/AGENTS.md");
 		expect(rendered).not.toContain("/Users/example/shared");
@@ -71,7 +71,7 @@ describe("execution environment system prompt projection", () => {
 		expect(rendered).toContain(`<external_instruction path="${sourceRoot}/AGENTS.md">`);
 		expect(rendered).toContain(`- ${sourceRoot}/src/AGENTS.md`);
 		expect(rendered).toContain(`- \`${sourceRoot}/packages/app\``);
-		expect(rendered).toContain(`Working directory: \`${sourceRoot}\``);
+		expect(rendered).not.toContain("Working directory:");
 		expect(rendered).not.toContain("<execution-environment>");
 	});
 });
