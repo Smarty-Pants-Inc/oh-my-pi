@@ -267,10 +267,13 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 		return untilAborted(signal, async () => {
 			const assertWriteCapabilities = (searchPath: string, changes: readonly AstReplaceFileChange[]): void => {
 				for (const change of changes) {
-					const decision = this.session.capabilities?.decideWrite(path.resolve(searchPath, change.path));
+					const decision = this.session.capabilities?.decideWrite(
+						path.resolve(searchPath, change.path),
+						this.session.cwd,
+					);
 					if (decision?.outcome === "request") {
 						throw new ToolError(
-							`AST edit target '${decision.target}' requires an explicit session writePath capability outside '${this.session.capabilities?.workspace}'.`,
+							`AST edit target '${decision.target}' requires an explicit session writePath capability outside '${this.session.cwd}'.`,
 						);
 					}
 					if (decision?.outcome === "deny") {

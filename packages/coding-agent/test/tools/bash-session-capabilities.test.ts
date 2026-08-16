@@ -188,6 +188,16 @@ describe("BashTool session capabilities", () => {
 			).toBeDefined();
 			expect(await tool.execute("routine-test", { command: "bun test --help" })).toBeDefined();
 			expect(
+				await tool.execute("routine-test-boolean-flags", {
+					command: "bun test --bail --parallel --help",
+				}),
+			).toBeDefined();
+			expect(
+				await tool.execute("routine-test-inline-counts", {
+					command: "bun test --bail=1 --parallel=1 --help",
+				}),
+			).toBeDefined();
+			expect(
 				await tool.execute("routine-test-filter", {
 					command: "bun test --test-name-pattern 'focused case' --help",
 				}),
@@ -270,24 +280,58 @@ describe("BashTool session capabilities", () => {
 
 	it("does not let effect grants authorize wrapper executables", async () => {
 		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "bash-cap-wrapper-"));
+		const attacker = await fs.mkdtemp(path.join(os.tmpdir(), "bash-cap-wrapper-attacker-"));
 		try {
+			const sentinel = path.join(attacker, "executed");
 			await Promise.all([
 				fs.writeFile(path.join(workspace, "git"), "touch wrapped-git-executed\n"),
 				fs.writeFile(path.join(workspace, "gh"), "touch wrapped-gh-executed\n"),
+				fs.writeFile(path.join(attacker, "git"), `#!/bin/sh\ntouch ${JSON.stringify(sentinel)}\n`),
+				fs.writeFile(path.join(attacker, "gh"), `#!/bin/sh\ntouch ${JSON.stringify(sentinel)}\n`),
 			]);
+			await Promise.all([fs.chmod(path.join(attacker, "git"), 0o755), fs.chmod(path.join(attacker, "gh"), 0o755)]);
 			const tool = new BashTool(
 				session(workspace, new SessionCapabilities({ workspace, externalCapabilities: ["git.push", "github.pr"] })),
 			);
 
-			for (const command of ["sh git push", "sh gh pr create"]) {
+			for (const command of [
+				"sh git push",
+				"sh gh pr create",
+				`PATH=${attacker} git push`,
+				`PATH=${attacker} gh pr create`,
+				`BASH_ENV=${path.join(attacker, "startup")} gh pr create`,
+				`LD_PRELOAD=${path.join(attacker, "loader")} git push`,
+				`env PATH=${attacker} gh pr create`,
+			]) {
 				await expect(tool.execute(`wrapper-${command}`, { command })).rejects.toThrow(
 					`requires explicit session capability 'bash.command:${command}'`,
 				);
 			}
+			for (const command of ["git push", "gh pr create"]) {
+				await expect(tool.execute(`env-${command}`, { command, env: { PATH: attacker } })).rejects.toThrow(
+					`requires explicit session capability 'bash.command:${command}'`,
+				);
+			}
+			const effectEnvironments: Array<Record<string, string>> = [
+				{ BASH_ENV: path.join(attacker, "startup") },
+				{ LD_PRELOAD: path.join(attacker, "loader") },
+			];
+			for (const env of effectEnvironments) {
+				await expect(tool.execute("effect-env-override", { command: "gh pr create", env })).rejects.toThrow(
+					"requires explicit session capability 'bash.command:gh pr create'",
+				);
+			}
+			await expect(
+				tool.execute("gh-config-override", { command: "gh pr create", env: { GH_CONFIG_DIR: attacker } }),
+			).rejects.toThrow("requires explicit session capability 'bash.command:gh pr create'");
+			await expect(
+				tool.execute("git-config-override", { command: "git push", env: { GIT_CONFIG_GLOBAL: "/dev/null" } }),
+			).rejects.toThrow("requires explicit session capability 'bash.command:git push'");
 			expect(await Bun.file(path.join(workspace, "wrapped-git-executed")).exists()).toBe(false);
 			expect(await Bun.file(path.join(workspace, "wrapped-gh-executed")).exists()).toBe(false);
+			expect(await Bun.file(sentinel).exists()).toBe(false);
 		} finally {
-			await removeWithRetries(workspace);
+			await Promise.all([removeWithRetries(workspace), removeWithRetries(attacker)]);
 		}
 	});
 
@@ -319,6 +363,11 @@ describe("BashTool session capabilities", () => {
 			for (const command of [
 				"bun run test",
 				"bun test escape.test.ts",
+				`bun test --bail ${path.relative(workspace, outsideTest)}`,
+				`bun test --parallel ${path.relative(workspace, outsideTest)}`,
+				`bun test --timeout ${path.relative(workspace, outsideTest)}`,
+				"bun test --bail=outside",
+				"bun test --parallel=outside",
 				"bun test C:/outside/test.ts",
 				"bun test '\\\\server\\share\\test.ts'",
 			]) {

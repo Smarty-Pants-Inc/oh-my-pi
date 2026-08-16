@@ -506,10 +506,13 @@ export class EditTool implements AgentTool<TInput> {
 	): Promise<AgentToolResult<EditToolDetails, TInput>> {
 		for (const target of this.matcherPaths(params) ?? []) {
 			if (isInternalUrlPath(target)) continue;
-			const decision = this.session.capabilities?.decideWrite(resolvePlanPath(this.session, target));
+			const decision = this.session.capabilities?.decideWrite(
+				resolvePlanPath(this.session, target),
+				this.session.cwd,
+			);
 			if (decision?.outcome === "request") {
 				throw new Error(
-					`Edit target '${decision.target}' requires an explicit session writePath capability outside '${this.session.capabilities?.workspace}'.`,
+					`Edit target '${decision.target}' requires an explicit session writePath capability outside '${this.session.cwd}'.`,
 				);
 			}
 			if (decision?.outcome === "deny") {

@@ -114,6 +114,25 @@ describe("SessionCapabilities", () => {
 		});
 	});
 
+	it("uses the live session root after a move without broadening the creation root", async () => {
+		const initialWorkspace = await tempDir("omp-session-initial-");
+		const currentWorkspace = await tempDir("omp-session-current-");
+		const capabilities = new SessionCapabilities({ workspace: initialWorkspace });
+
+		expect(capabilities.workspace).toBe(fs.realpathSync.native(initialWorkspace));
+		expect(capabilities.decideWrite("live.txt", currentWorkspace)).toMatchObject({
+			outcome: "allow",
+			authority: "workspace",
+			target: path.join(fs.realpathSync.native(currentWorkspace), "live.txt"),
+		});
+		expect(capabilities.decideWrite(path.join(initialWorkspace, "stale.txt"), currentWorkspace)).toMatchObject({
+			outcome: "request",
+			reason: "outsideWorkspaceAndAllowlist",
+		});
+		expect(capabilities.isWorkspacePath(currentWorkspace, currentWorkspace)).toBe(true);
+		expect(capabilities.isWorkspacePath(initialWorkspace, currentWorkspace)).toBe(false);
+	});
+
 	it("requires exact named external capabilities and reuses explicit grants", async () => {
 		const workspace = await tempDir("omp-session-workspace-");
 		const capabilities = new SessionCapabilities({ workspace, externalCapabilities: ["git.push"] });

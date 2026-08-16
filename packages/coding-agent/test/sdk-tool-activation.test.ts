@@ -95,7 +95,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		cwd: tempDir,
 		agentDir: tempDir,
 		modelRegistry,
-		sessionManager: SessionManager.inMemory(),
+		sessionManager: SessionManager.inMemory(tempDir),
 		settings: Settings.isolated(),
 		model: getBundledModel("openai", "gpt-4o-mini"),
 		disableExtensionDiscovery: true,

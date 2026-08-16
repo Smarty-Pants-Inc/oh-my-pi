@@ -191,6 +191,20 @@ export class SessionCapabilities {
 		return this.#grantProvenance.map(record => ({ ...record }));
 	}
 
+	/** Test a path against the live session root plus explicitly configured extra roots. */
+	isWorkspacePath(filePath: string, currentWorkspace = this.#workspace): boolean {
+		try {
+			const workspace = canonicalPath(currentWorkspace, this.#workspace);
+			const target = canonicalPath(filePath, workspace);
+			if (isCanonicalPathContained(workspace, target)) return true;
+			return [...this.#workspaceRoots].some(
+				root => root !== this.#workspace && isCanonicalPathContained(root, target),
+			);
+		} catch {
+			return false;
+		}
+	}
+
 	beginDirectUserTurn(turnId: string, userPrompt: string): void {
 		this.#directUserTurn = {
 			turnId,
@@ -269,19 +283,24 @@ export class SessionCapabilities {
 		return normalized;
 	}
 
-	decideWrite(filePath: string): WriteDecision {
+	decideWrite(filePath: string, currentWorkspace = this.#workspace): WriteDecision {
+		let workspace: string;
 		let target: string;
 		try {
-			target = canonicalPath(filePath, this.workspace);
+			workspace = canonicalPath(currentWorkspace, this.#workspace);
+			target = canonicalPath(filePath, workspace);
 		} catch {
 			return {
 				kind: "write",
 				outcome: "deny",
-				target: path.resolve(this.workspace, filePath),
+				target: path.resolve(currentWorkspace, filePath),
 				reason: "pathCannotBeCanonicalized",
 			};
 		}
-		if ([...this.#workspaceRoots].some(root => isCanonicalPathContained(root, target))) {
+		if (
+			isCanonicalPathContained(workspace, target) ||
+			[...this.#workspaceRoots].some(root => root !== this.#workspace && isCanonicalPathContained(root, target))
+		) {
 			return { kind: "write", outcome: "allow", target, authority: "workspace" };
 		}
 		if (this.#writeAllowlist.has(target)) {

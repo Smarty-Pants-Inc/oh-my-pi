@@ -132,11 +132,11 @@ function assertWriteTargetAddressable(target: string, router: InternalUrlRouter)
 }
 
 function assertWriteCapability(session: ToolSession, target: string): void {
-	const decision = session.capabilities?.decideWrite(target);
+	const decision = session.capabilities?.decideWrite(target, session.cwd);
 	if (!decision || decision.outcome === "allow") return;
 	if (decision.outcome === "request") {
 		throw new ToolError(
-			`Write target '${decision.target}' requires an explicit session writePath capability outside '${session.capabilities?.workspace}'.`,
+			`Write target '${decision.target}' requires an explicit session writePath capability outside '${session.cwd}'.`,
 		);
 	}
 	throw new ToolError(`Write target '${decision.target}' cannot be canonicalized safely.`);

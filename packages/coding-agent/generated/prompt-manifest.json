@@ -6310,7 +6310,7 @@
     },
     {
       "path": "packages/coding-agent/src/capability/session-capabilities.ts",
-      "sha256": "8c4914f50442c8412373d892c9fe420890607b42b101809bba83f1ec526960bf"
+      "sha256": "ef43f4c3e5789af6f49ed7e230ea99733d79085ffb299b294179c59454664d15"
     },
     {
       "path": "packages/coding-agent/src/capability/settings.ts",
@@ -7046,7 +7046,7 @@
     },
     {
       "path": "packages/coding-agent/src/edit/index.ts",
-      "sha256": "f5b71c4d8a5a13ad3006841c0d6b17d0386481f71122e47eb835b580f032b00f"
+      "sha256": "31333c16b8f04e8a8cbe6ee8b385628002283f4b56792b94978674681a03dc25"
     },
     {
       "path": "packages/coding-agent/src/edit/modes/apply-patch.lark",
@@ -9010,7 +9010,7 @@
     },
     {
       "path": "packages/coding-agent/src/tools/ast-edit.ts",
-      "sha256": "e25db052c1eacdbbcbcdfa240628474ea5e29871df50d72d96a8aac14de57858"
+      "sha256": "7af2ba7929a6be1b81c03c798659735c9f703675d1edbba293eb613fdb8f4874"
     },
     {
       "path": "packages/coding-agent/src/tools/ast-grep.ts",
@@ -9038,7 +9038,7 @@
     },
     {
       "path": "packages/coding-agent/src/tools/bash.ts",
-      "sha256": "e39e1d7ff78f749fe8dc5f518f984cf813cc04a32601f653bc4bddd183147099"
+      "sha256": "7db7f8fa337d735494b837fb89d0d4f24ebbac9fc3f3f46f3a088b979b9d8895"
     },
     {
       "path": "packages/coding-agent/src/tools/browser.ts",
@@ -9494,7 +9494,7 @@
     },
     {
       "path": "packages/coding-agent/src/tools/write.ts",
-      "sha256": "68242349c430c56c85e44461a2e276bb85fbd820a44538771e2f8e3dd160eda1"
+      "sha256": "db14ebe4fa3e89f6002e83aba3d971e2841ce47da86b98672db9f1abd4a2bd47"
     },
     {
       "path": "packages/coding-agent/src/tools/xdev.ts",
@@ -10702,5 +10702,5 @@
     }
   ],
   "behaviorSha256": "0feede855f6d4a90131d3a02399acbc91464a432f9189e39082fd75f502a1194",
-  "rootSha256": "be8b23867f0f9f0dcddaaf4075ab55a862ae716b68f24c8ac98e4105e8ee80cd"
+  "rootSha256": "f96f8e98e1593411d353dead5d1fa7f4c85bf11de2a2a02478723eda22f673f5"
 }

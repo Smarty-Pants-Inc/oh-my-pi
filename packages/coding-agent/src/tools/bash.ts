@@ -139,10 +139,12 @@ const BASH_SAFE_BUN_RUN_SCRIPTS = new Set(
 	].map(([name, body]) => `${name}\0${body}`),
 );
 const BASH_SAFE_BUN_TEST_BOOLEAN_FLAGS = new Set([
+	"--bail",
 	"--concurrent",
 	"--coverage",
 	"--help",
 	"--only-failures",
+	"--parallel",
 	"--pass-with-no-tests",
 	"--randomize",
 	"--todo",
@@ -150,17 +152,12 @@ const BASH_SAFE_BUN_TEST_BOOLEAN_FLAGS = new Set([
 	"-h",
 	"-u",
 ]);
-const BASH_SAFE_BUN_TEST_VALUE_FLAGS = new Set([
-	"--bail",
-	"--coverage-reporter",
-	"--max-concurrency",
-	"--parallel",
-	"--reporter",
-	"--rerun-each",
-	"--seed",
-	"--test-name-pattern",
-	"--timeout",
+const BASH_SAFE_BUN_TEST_NUMERIC_VALUE_FLAGS = new Set(["--max-concurrency", "--rerun-each", "--seed", "--timeout"]);
+const BASH_SAFE_BUN_TEST_ENUM_VALUE_FLAGS = new Map<string, ReadonlySet<string>>([
+	["--coverage-reporter", new Set(["lcov", "text"])],
+	["--reporter", new Set(["dots", "junit"])],
 ]);
+const BASH_SAFE_BUN_TEST_STRING_VALUE_FLAGS = new Set(["--test-name-pattern"]);
 const BASH_GITHUB_PR_EFFECTS = new Set([
 	"close",
 	"comment",
@@ -380,8 +377,42 @@ function bashCommandWriteTargets(command: string): string[] {
 	return [...tokenizeShellSegments(command).flatMap(bashWriteTargets), ...shellRedirectWriteTargets(command)];
 }
 
-function commandHasGitPush(tokens: readonly string[]): boolean {
+function executableEnvironmentOverrideName(name: string): boolean {
+	const normalized = name.toUpperCase();
+	return (
+		normalized === "PATH" ||
+		normalized === "ENV" ||
+		normalized === "BASH_ENV" ||
+		normalized === "ZDOTDIR" ||
+		normalized === "SHELLOPTS" ||
+		normalized === "BASHOPTS" ||
+		normalized === "NODE_OPTIONS" ||
+		normalized === "BUN_OPTIONS" ||
+		normalized === "LD_PRELOAD" ||
+		normalized === "LD_LIBRARY_PATH" ||
+		normalized === "DYLD_INSERT_LIBRARIES" ||
+		normalized === "DYLD_LIBRARY_PATH" ||
+		normalized.startsWith("GIT_") ||
+		normalized.startsWith("GH_")
+	);
+}
+
+function hasExecutableEnvironmentOverride(env: Record<string, string> | undefined): boolean {
+	return Boolean(env && Object.keys(env).some(executableEnvironmentOverrideName));
+}
+
+function effectCommandIndex(tokens: readonly string[], env: Record<string, string> | undefined): number | undefined {
 	const gitIndex = shellCommandIndex(tokens);
+	if (gitIndex === undefined || hasExecutableEnvironmentOverride(env)) return undefined;
+	for (const token of tokens.slice(0, gitIndex)) {
+		const name = token.slice(0, token.indexOf("="));
+		if (executableEnvironmentOverrideName(name)) return undefined;
+	}
+	return gitIndex;
+}
+
+function commandHasGitPush(tokens: readonly string[], env?: Record<string, string>): boolean {
+	const gitIndex = effectCommandIndex(tokens, env);
 	if (gitIndex === undefined || tokens[gitIndex] !== "git") return false;
 	const args = tokens.slice(gitIndex + 1);
 	for (let index = 0; index < args.length; index++) {
@@ -402,8 +433,8 @@ function commandHasGitPush(tokens: readonly string[]): boolean {
 	return false;
 }
 
-function commandHasGithubPrEffect(tokens: readonly string[]): boolean {
-	const ghIndex = shellCommandIndex(tokens);
+function commandHasGithubPrEffect(tokens: readonly string[], env?: Record<string, string>): boolean {
+	const ghIndex = effectCommandIndex(tokens, env);
 	if (ghIndex === undefined || tokens[ghIndex] !== "gh") return false;
 	const args = tokens.slice(ghIndex + 1).filter(arg => !arg.startsWith("-"));
 	return args[0] === "pr" && BASH_GITHUB_PR_EFFECTS.has(args[1] ?? "");
@@ -428,16 +459,30 @@ function bunTestIsKnownSafe(args: readonly string[], cwd: string): boolean {
 		const arg = args[index]!;
 		if (arg === "--") return false;
 		if (BASH_SAFE_BUN_TEST_BOOLEAN_FLAGS.has(arg)) continue;
-		if (BASH_SAFE_BUN_TEST_VALUE_FLAGS.has(arg)) {
+		if (/^--(?:bail|parallel)=\d+$/u.test(arg)) continue;
+		if (BASH_SAFE_BUN_TEST_NUMERIC_VALUE_FLAGS.has(arg)) {
+			if (index + 1 >= args.length) return false;
+			if (!/^\d+$/u.test(args[index + 1]!)) return false;
+			index++;
+			continue;
+		}
+		if (BASH_SAFE_BUN_TEST_STRING_VALUE_FLAGS.has(arg)) {
 			if (index + 1 >= args.length) return false;
 			index++;
 			continue;
 		}
-		if (
-			arg.startsWith("--") &&
-			BASH_SAFE_BUN_TEST_VALUE_FLAGS.has(arg.slice(0, arg.indexOf("="))) &&
-			arg.includes("=")
-		) {
+		const equalsIndex = arg.indexOf("=");
+		if (equalsIndex > 0) {
+			const flag = arg.slice(0, equalsIndex);
+			const value = arg.slice(equalsIndex + 1);
+			if (BASH_SAFE_BUN_TEST_NUMERIC_VALUE_FLAGS.has(flag) && /^\d+$/u.test(value)) continue;
+			if (BASH_SAFE_BUN_TEST_STRING_VALUE_FLAGS.has(flag)) continue;
+			if (BASH_SAFE_BUN_TEST_ENUM_VALUE_FLAGS.get(flag)?.has(value)) continue;
+		}
+		const enumValues = BASH_SAFE_BUN_TEST_ENUM_VALUE_FLAGS.get(arg);
+		if (enumValues) {
+			if (index + 1 >= args.length || !enumValues.has(args[index + 1]!)) return false;
+			index++;
 			continue;
 		}
 		if (
@@ -451,18 +496,6 @@ function bunTestIsKnownSafe(args: readonly string[], cwd: string): boolean {
 		}
 	}
 	return true;
-}
-
-function hasExecutableEnvironmentOverride(env: Record<string, string> | undefined): boolean {
-	if (!env) return false;
-	return Object.keys(env).some(
-		name =>
-			name === "PATH" ||
-			name === "NODE_OPTIONS" ||
-			name === "BUN_OPTIONS" ||
-			name === "LD_PRELOAD" ||
-			name === "DYLD_INSERT_LIBRARIES",
-	);
 }
 
 function bunCommandIsKnownSafe(
@@ -573,8 +606,8 @@ function commandIsKnownSafe(tokens: readonly string[], cwd: string, env: Record<
 		return tokens.slice(commandIndex + 1).some(arg => arg === "-i" || arg.startsWith("-i"));
 	}
 	if (command === "bun") return bunCommandIsKnownSafe(tokens, commandIndex, cwd, env);
-	if (command === "git") return gitCommandIsKnownSafe(tokens, commandIndex, env);
-	return commandHasGitPush(tokens) || commandHasGithubPrEffect(tokens);
+	if (command === "git") return gitCommandIsKnownSafe(tokens, commandIndex, env) || commandHasGitPush(tokens, env);
+	return commandHasGitPush(tokens, env) || commandHasGithubPrEffect(tokens, env);
 }
 
 function commandNeedsGenericExternalCapability(
@@ -620,15 +653,9 @@ function assertBashWriteCapability(
 	}
 	const normalizedTarget = target === "~" || target.startsWith("~/") ? `${home}${target.slice(1)}` : target;
 	const resolvedTarget = resolveToCwd(normalizedTarget, cwd);
-	if (isCurrentWorkspacePath(session, resolvedTarget)) return;
-	const decision = session.capabilities?.decideWrite(resolvedTarget);
+	const decision = session.capabilities?.decideWrite(resolvedTarget, session.cwd);
 	if (!decision) return;
-	if (decision.outcome === "allow") {
-		if (session.capabilities?.writeAllowlist.includes(decision.target)) return;
-		throw new ToolError(
-			`Bash write target '${decision.target}' requires an explicit session writePath capability outside '${session.cwd}'.`,
-		);
-	}
+	if (decision.outcome === "allow") return;
 	if (decision.outcome === "request") {
 		throw new ToolError(
 			`Bash write target '${decision.target}' requires an explicit session writePath capability outside '${session.cwd}'.`,
@@ -638,10 +665,7 @@ function assertBashWriteCapability(
 }
 
 function isCurrentWorkspacePath(session: ToolSession, target: string): boolean {
-	if (isPathContained(session.cwd, target)) return true;
-	const capabilities = session.capabilities;
-	if (!capabilities) return false;
-	return capabilities.workspaceRoots.some(root => root !== capabilities.workspace && isPathContained(root, target));
+	return session.capabilities?.isWorkspacePath(target, session.cwd) ?? isPathContained(session.cwd, target);
 }
 
 /**
@@ -661,10 +685,10 @@ function assertBashCapabilities(
 		assertBashWriteCapability(session, target, cwd, env);
 	}
 	for (const tokens of tokenizeShellSegments(command)) {
-		if (commandHasGitPush(tokens)) {
+		if (commandHasGitPush(tokens, env)) {
 			assertBashExternalCapability(session, "git.push");
 		}
-		if (commandHasGithubPrEffect(tokens)) {
+		if (commandHasGithubPrEffect(tokens, env)) {
 			assertBashExternalCapability(session, "github.pr");
 		}
 		const cwdIsWorkspace = isCurrentWorkspacePath(session, cwd);
