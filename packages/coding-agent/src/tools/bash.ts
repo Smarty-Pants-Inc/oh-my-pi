@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
 import type {
 	AgentTool,
@@ -10,6 +11,7 @@ import type {
 import type { Component } from "@oh-my-pi/pi-tui";
 import { ImageProtocol, TERMINAL } from "@oh-my-pi/pi-tui";
 import { getProjectDir, isEnoent, logger, prompt } from "@oh-my-pi/pi-utils";
+import { canonicalPath } from "../capability/session-capabilities";
 import type { Settings } from "../config/settings";
 import { applyDirenvPreflight, type BashResult, executeBash } from "../exec/bash-executor";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
@@ -379,8 +381,8 @@ function bashCommandWriteTargets(command: string): string[] {
 }
 
 function commandHasGitPush(tokens: readonly string[]): boolean {
-	const gitIndex = tokens.indexOf("git");
-	if (gitIndex === -1) return false;
+	const gitIndex = shellCommandIndex(tokens);
+	if (gitIndex === undefined || tokens[gitIndex] !== "git") return false;
 	const args = tokens.slice(gitIndex + 1);
 	for (let index = 0; index < args.length; index++) {
 		const arg = args[index]!;
@@ -401,36 +403,52 @@ function commandHasGitPush(tokens: readonly string[]): boolean {
 }
 
 function commandHasGithubPrEffect(tokens: readonly string[]): boolean {
-	const ghIndex = tokens.indexOf("gh");
-	if (ghIndex === -1) return false;
+	const ghIndex = shellCommandIndex(tokens);
+	if (ghIndex === undefined || tokens[ghIndex] !== "gh") return false;
 	const args = tokens.slice(ghIndex + 1).filter(arg => !arg.startsWith("-"));
 	return args[0] === "pr" && BASH_GITHUB_PR_EFFECTS.has(args[1] ?? "");
 }
 
-function bunTestIsKnownSafe(args: readonly string[]): boolean {
+function isCanonicalPathContained(root: string, target: string): boolean {
+	const relative = path.relative(root, target);
+	return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+function isPathContained(root: string, target: string, base = root): boolean {
+	try {
+		return isCanonicalPathContained(canonicalPath(root), canonicalPath(target, base));
+	} catch {
+		return false;
+	}
+}
+
+function bunTestIsKnownSafe(args: readonly string[], cwd: string): boolean {
 	if (args[0] !== "test") return false;
-	let optionsEnded = false;
 	for (let index = 1; index < args.length; index++) {
 		const arg = args[index]!;
-		if (!optionsEnded && arg === "--") {
-			optionsEnded = true;
-			continue;
-		}
-		if (!optionsEnded && BASH_SAFE_BUN_TEST_BOOLEAN_FLAGS.has(arg)) continue;
-		if (!optionsEnded && BASH_SAFE_BUN_TEST_VALUE_FLAGS.has(arg)) {
+		if (arg === "--") return false;
+		if (BASH_SAFE_BUN_TEST_BOOLEAN_FLAGS.has(arg)) continue;
+		if (BASH_SAFE_BUN_TEST_VALUE_FLAGS.has(arg)) {
 			if (index + 1 >= args.length) return false;
 			index++;
 			continue;
 		}
 		if (
-			!optionsEnded &&
 			arg.startsWith("--") &&
 			BASH_SAFE_BUN_TEST_VALUE_FLAGS.has(arg.slice(0, arg.indexOf("="))) &&
 			arg.includes("=")
 		) {
 			continue;
 		}
-		if (arg.startsWith("-") || arg.startsWith("/") || /(?:^|[\\/])\.\.(?:[\\/]|$)/u.test(arg)) return false;
+		if (
+			arg.startsWith("-") ||
+			path.isAbsolute(arg) ||
+			/^(?:[A-Za-z]:[\\/]|\\\\)/u.test(arg) ||
+			/(?:^|[\\/])\.\.(?:[\\/]|$)/u.test(arg) ||
+			!isPathContained(cwd, arg)
+		) {
+			return false;
+		}
 	}
 	return true;
 }
@@ -462,13 +480,16 @@ function bunCommandIsKnownSafe(
 		try {
 			if (fs.lstatSync(manifestPath).isSymbolicLink()) return false;
 			const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as { scripts?: Record<string, unknown> };
-			const body = manifest.scripts?.[args[1]!];
-			return typeof body === "string" && BASH_SAFE_BUN_RUN_SCRIPTS.has(`${args[1]}\0${body}`);
+			const name = args[1]!;
+			const scripts = manifest.scripts;
+			const body = scripts?.[name];
+			if (scripts && (Object.hasOwn(scripts, `pre${name}`) || Object.hasOwn(scripts, `post${name}`))) return false;
+			return typeof body === "string" && BASH_SAFE_BUN_RUN_SCRIPTS.has(`${name}\0${body}`);
 		} catch {
 			return false;
 		}
 	}
-	return bunTestIsKnownSafe(args);
+	return bunTestIsKnownSafe(args, cwd);
 }
 
 function rgCommandIsKnownSafe(
@@ -598,14 +619,29 @@ function assertBashWriteCapability(
 		);
 	}
 	const normalizedTarget = target === "~" || target.startsWith("~/") ? `${home}${target.slice(1)}` : target;
-	const decision = session.capabilities?.decideWrite(resolveToCwd(normalizedTarget, cwd));
-	if (!decision || decision.outcome === "allow") return;
+	const resolvedTarget = resolveToCwd(normalizedTarget, cwd);
+	if (isCurrentWorkspacePath(session, resolvedTarget)) return;
+	const decision = session.capabilities?.decideWrite(resolvedTarget);
+	if (!decision) return;
+	if (decision.outcome === "allow") {
+		if (session.capabilities?.writeAllowlist.includes(decision.target)) return;
+		throw new ToolError(
+			`Bash write target '${decision.target}' requires an explicit session writePath capability outside '${session.cwd}'.`,
+		);
+	}
 	if (decision.outcome === "request") {
 		throw new ToolError(
-			`Bash write target '${decision.target}' requires an explicit session writePath capability outside '${session.capabilities?.workspace}'.`,
+			`Bash write target '${decision.target}' requires an explicit session writePath capability outside '${session.cwd}'.`,
 		);
 	}
 	throw new ToolError(`Bash write target '${decision.target}' cannot be canonicalized safely.`);
+}
+
+function isCurrentWorkspacePath(session: ToolSession, target: string): boolean {
+	if (isPathContained(session.cwd, target)) return true;
+	const capabilities = session.capabilities;
+	if (!capabilities) return false;
+	return capabilities.workspaceRoots.some(root => root !== capabilities.workspace && isPathContained(root, target));
 }
 
 /**
@@ -631,9 +667,7 @@ function assertBashCapabilities(
 		if (commandHasGithubPrEffect(tokens)) {
 			assertBashExternalCapability(session, "github.pr");
 		}
-		const cwdDecision = session.capabilities.decideWrite(cwd);
-		const cwdIsWorkspace =
-			cwd === session.cwd || (cwdDecision.outcome === "allow" && cwdDecision.authority === "workspace");
+		const cwdIsWorkspace = isCurrentWorkspacePath(session, cwd);
 		if (!cwdIsWorkspace || commandNeedsGenericExternalCapability(command, tokens, cwd, env)) {
 			assertBashCommandCapability(session, command);
 		}

@@ -50,6 +50,29 @@ async function runJson(args: string[], blockNative = true, cwd = repository): Pr
 	return JSON.parse(result.stdout) as Record<string, unknown>;
 }
 
+async function runPrintedLedgerCommand(line: string): Promise<Record<string, unknown>> {
+	const [executable, ...args] = line.trim().split(/\s+/u);
+	expect(executable).toBe("bun");
+	const index = processIndex++;
+	const stdoutPath = path.join(home, `stdout-${index}`);
+	const stderrPath = path.join(home, `stderr-${index}`);
+	const child = Bun.spawnSync(["/usr/bin/env", Bun.which("bun") ?? process.execPath, ...args], {
+		cwd: repository,
+		env: {
+			...Bun.env,
+			HOME: home,
+			USERPROFILE: home,
+			PI_CODING_AGENT_DIR: path.join(home, ".omp/agent"),
+			NO_COLOR: "1",
+		},
+		stdout: Bun.file(stdoutPath),
+		stderr: Bun.file(stderrPath),
+	});
+	const [stdout, stderr] = await Promise.all([Bun.file(stdoutPath).text(), Bun.file(stderrPath).text()]);
+	expect(child.exitCode, stderr).toBe(0);
+	return JSON.parse(stdout) as Record<string, unknown>;
+}
+
 beforeAll(async () => {
 	home = await fs.mkdtemp(path.join(os.tmpdir(), "omp-native-free-context-"));
 	const agentDir = path.join(home, ".omp/agent");
@@ -71,6 +94,25 @@ afterAll(async () => {
 });
 
 describe("native-free context CLI", () => {
+	it("executes the context-delta commands printed in the patch ledger", async () => {
+		const ledger = await fs.readFile(path.join(repository, "PATCH-LEDGER.md"), "utf8");
+		const commands = ledger
+			.split("\n")
+			.filter(line => line.startsWith("bun packages/coding-agent/src/cli.ts context ") && line.includes("-delta"));
+		expect(commands).toHaveLength(1);
+		const diffCommand = ledger
+			.split("\n")
+			.find(line => line.startsWith("bun packages/coding-agent/src/cli.ts context diff "));
+		expect(diffCommand).toBeDefined();
+
+		const [diff, protectedDelta] = await Promise.all([
+			runPrintedLedgerCommand(diffCommand!),
+			runPrintedLedgerCommand(commands[0]!),
+		]);
+		expect(diff.schema).toBe("omp.context_diff.v1");
+		expect(protectedDelta.schema).toBe("smarty.protected_delta.v1");
+	}, 30_000);
+
 	it("runs every offline context command without resolving the native package", async () => {
 		const manifest = await runJson(["context", "manifest", "--json"]);
 		const diff = await runJson(["context", "diff", "--base", "HEAD^", "--target", "HEAD", "--json"]);

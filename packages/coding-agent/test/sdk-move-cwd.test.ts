@@ -72,8 +72,14 @@ describe("createAgentSession cwd after /move", () => {
 			const bashTool = session.getToolByName("bash");
 			if (!bashTool) throw new Error("Expected bash tool");
 			const result = await bashTool.execute("pwd-after-move", { command: "pwd" });
+			await bashTool.execute("write-after-move", { command: "printf moved > result.txt" });
 
 			expect(textContent(result)).toContain(cwdB);
+			expect(fs.readFileSync(path.join(cwdB, "result.txt"), "utf8")).toBe("moved");
+			await expect(
+				bashTool.execute("write-before-move-root", { command: "printf stale > stale.txt", cwd: cwdA }),
+			).rejects.toThrow("requires an explicit session writePath capability");
+			expect(fs.existsSync(path.join(cwdA, "stale.txt"))).toBe(false);
 		} finally {
 			try {
 				await session.dispose();

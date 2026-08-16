@@ -187,6 +187,11 @@ describe("BashTool session capabilities", () => {
 				}),
 			).toBeDefined();
 			expect(await tool.execute("routine-test", { command: "bun test --help" })).toBeDefined();
+			expect(
+				await tool.execute("routine-test-filter", {
+					command: "bun test --test-name-pattern 'focused case' --help",
+				}),
+			).toBeDefined();
 			expect(await tool.execute("routine-run", { command: "bun run test" })).toBeDefined();
 			expect(
 				await tool.execute("routine-git-diff", {
@@ -258,6 +263,72 @@ describe("BashTool session capabilities", () => {
 			);
 			expect(await Bun.file(path.join(workspace, "escaped.txt")).exists()).toBe(false);
 			expect(await Bun.file(path.join(outside, "escaped.txt")).exists()).toBe(false);
+		} finally {
+			await Promise.all([removeWithRetries(workspace), removeWithRetries(outside)]);
+		}
+	});
+
+	it("does not let effect grants authorize wrapper executables", async () => {
+		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "bash-cap-wrapper-"));
+		try {
+			await Promise.all([
+				fs.writeFile(path.join(workspace, "git"), "touch wrapped-git-executed\n"),
+				fs.writeFile(path.join(workspace, "gh"), "touch wrapped-gh-executed\n"),
+			]);
+			const tool = new BashTool(
+				session(workspace, new SessionCapabilities({ workspace, externalCapabilities: ["git.push", "github.pr"] })),
+			);
+
+			for (const command of ["sh git push", "sh gh pr create"]) {
+				await expect(tool.execute(`wrapper-${command}`, { command })).rejects.toThrow(
+					`requires explicit session capability 'bash.command:${command}'`,
+				);
+			}
+			expect(await Bun.file(path.join(workspace, "wrapped-git-executed")).exists()).toBe(false);
+			expect(await Bun.file(path.join(workspace, "wrapped-gh-executed")).exists()).toBe(false);
+		} finally {
+			await removeWithRetries(workspace);
+		}
+	});
+
+	it("rejects Bun lifecycle hooks and test-path escapes", async () => {
+		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "bash-cap-bun-boundary-"));
+		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "bash-cap-bun-boundary-outside-"));
+		try {
+			const packageJson = path.join(workspace, "package.json");
+			const outsideTest = path.join(outside, "escape.test.ts");
+			const outsideSentinel = path.join(outside, "executed.txt");
+			await fs.writeFile(
+				outsideTest,
+				`import { test } from "bun:test"; test("escape", async () => Bun.write(${JSON.stringify(outsideSentinel)}, "executed"));\n`,
+			);
+			await fs.symlink(outsideTest, path.join(workspace, "escape.test.ts"));
+			const tool = new BashTool(session(workspace, new SessionCapabilities({ workspace })));
+
+			await fs.writeFile(
+				packageJson,
+				JSON.stringify({ scripts: { pretest: "touch pretest-executed", test: "bun test" } }),
+			);
+			await expect(tool.execute("bun-pretest", { command: "bun run test" })).rejects.toThrow(
+				"requires explicit session capability 'bash.command:bun run test'",
+			);
+			await fs.writeFile(
+				packageJson,
+				JSON.stringify({ scripts: { test: "bun test", posttest: "touch posttest-executed" } }),
+			);
+			for (const command of [
+				"bun run test",
+				"bun test escape.test.ts",
+				"bun test C:/outside/test.ts",
+				"bun test '\\\\server\\share\\test.ts'",
+			]) {
+				await expect(tool.execute(`bun-boundary-${command}`, { command })).rejects.toThrow(
+					`requires explicit session capability 'bash.command:${command}'`,
+				);
+			}
+			expect(await Bun.file(path.join(workspace, "pretest-executed")).exists()).toBe(false);
+			expect(await Bun.file(path.join(workspace, "posttest-executed")).exists()).toBe(false);
+			expect(await Bun.file(outsideSentinel).exists()).toBe(false);
 		} finally {
 			await Promise.all([removeWithRetries(workspace), removeWithRetries(outside)]);
 		}
