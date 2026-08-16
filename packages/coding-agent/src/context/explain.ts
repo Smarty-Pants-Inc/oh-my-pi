@@ -1,3 +1,4 @@
+import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { mapContextRole } from "@oh-my-pi/pi-ai/context-instructions";
@@ -12,6 +13,7 @@ import {
 	type ContextRole,
 	type ContextTarget,
 	promptRegistry,
+	registeredPromptRepositoryPath,
 	registeredPromptSource,
 } from "./registry";
 import { SMARTY_MERGIFY_SKILLS } from "./smarty-skills";
@@ -108,9 +110,87 @@ async function loadExplainContextFiles(cwd: string): Promise<Array<{ path: strin
 	try {
 		const { loadProjectContextFiles } = await import("../system-prompt");
 		return await loadProjectContextFiles({ cwd });
-	} catch {
+	} catch (error) {
+		if (!(error instanceof Error) || !/pi_natives|native addon/i.test(error.message)) throw error;
 		return await loadOfflineContextFiles(cwd);
 	}
+}
+
+async function loadOfflineDynamicSources(
+	cwd: string,
+): Promise<
+	Array<{ id: string; source: string; trigger: string; content: string; kind: "skill" | "extension" | "mcp" }>
+> {
+	const configPath = path.join(os.homedir(), ".omp/agent/config.yml");
+	const config = YAML.parse(await Bun.file(configPath).text()) as Record<string, unknown>;
+	const sources: Array<{
+		id: string;
+		source: string;
+		trigger: string;
+		content: string;
+		kind: "skill" | "extension" | "mcp";
+	}> = [];
+	const skillDirectories = new Map([[path.join(os.homedir(), ".agents/skills"), false]]);
+	const skills = config.skills;
+	if (skills && typeof skills === "object" && !Array.isArray(skills)) {
+		const customDirectories = (skills as Record<string, unknown>).customDirectories;
+		if (Array.isArray(customDirectories)) {
+			for (const directory of customDirectories) {
+				if (typeof directory === "string") skillDirectories.set(path.resolve(directory), true);
+			}
+		}
+	}
+	for (const [directory, required] of [...skillDirectories].sort(([left], [right]) => left.localeCompare(right))) {
+		try {
+			if (!(await fs.stat(directory)).isDirectory()) throw new Error(`skill path is not a directory: ${directory}`);
+		} catch (error) {
+			if (!required && error instanceof Error && "code" in error && error.code === "ENOENT") continue;
+			throw new Error(`configured skill directory is unavailable: ${directory}`, { cause: error });
+		}
+		for await (const filePath of new Bun.Glob("*/SKILL.md").scan({
+			cwd: directory,
+			absolute: true,
+			onlyFiles: true,
+		})) {
+			const name = path.basename(path.dirname(filePath));
+			sources.push({
+				id: `external.skill.${name}`,
+				source: filePath,
+				trigger: "user_selected_skill",
+				content: await Bun.file(filePath).text(),
+				kind: "skill",
+			});
+		}
+	}
+	const extensions = config.extensions;
+	if (Array.isArray(extensions)) {
+		for (const extension of extensions) {
+			if (typeof extension !== "string") throw new Error("configured extension path must be a string");
+			const filePath = path.resolve(extension);
+			if (!(await Bun.file(filePath).exists())) throw new Error(`configured extension is missing: ${filePath}`);
+			sources.push({
+				id: `external.extension.${sha256(filePath).slice(0, 12)}`,
+				source: filePath,
+				trigger: "extension_event",
+				content: await Bun.file(filePath).text(),
+				kind: "extension",
+			});
+		}
+	}
+	for (const filePath of [path.join(cwd, ".mcp.json"), path.join(os.homedir(), ".omp/agent/mcp.json")]) {
+		const file = Bun.file(filePath);
+		if (!(await file.exists())) continue;
+		const content = await file.text();
+		JSON.parse(content);
+		sources.push({
+			id: `external.mcp.${sha256(filePath).slice(0, 12)}`,
+			source: filePath,
+			trigger: "startup",
+			content,
+			kind: "mcp",
+		});
+	}
+	return sources.sort((left, right) => left.source.localeCompare(right.source));
 }
 
 async function externalApproval(
@@ -158,7 +238,7 @@ export async function explainContext(options: {
 	const provider = options.provider ?? "provider-unspecified";
 	const model = options.model ?? "model-unspecified";
 	const developerRole = supportsDeveloperRole(provider);
-	const release = await buildContextReleaseManifest(cwd, undefined, { validateToolContracts: false });
+	const release = await buildContextReleaseManifest(cwd);
 	const approval = await approvalStatus(release);
 	const registry = promptRegistry();
 	const components: ExplainedComponent[] = [];
@@ -169,7 +249,7 @@ export async function explainContext(options: {
 		const enabled = entry.defaultEnabled;
 		components.push({
 			id: entry.id,
-			source: `packages/coding-agent/src/${entry.path}`,
+			source: registeredPromptRepositoryPath(entry.path),
 			kind: "instruction",
 			semanticRole: entry.role,
 			actualRole: mapContextRole(entry.role, developerRole),
@@ -191,7 +271,7 @@ export async function explainContext(options: {
 	}
 
 	if (options.target === "main") {
-		const contextFiles = await loadExplainContextFiles(cwd).catch(() => []);
+		const contextFiles = await loadExplainContextFiles(cwd);
 		for (const file of contextFiles) {
 			const contentSha256 = sha256(file.content);
 			components.push({
@@ -219,34 +299,65 @@ export async function explainContext(options: {
 	}
 
 	if (options.target === "main" || options.target === "subagent") {
-		for (const skillName of SMARTY_MERGIFY_SKILLS) {
-			const filePath = path.join(os.homedir(), ".agents/skills", skillName, "SKILL.md");
-			const file = Bun.file(filePath);
-			if (!(await file.exists())) continue;
-			const content = await file.text();
+		for (const source of await loadOfflineDynamicSources(cwd)) {
+			const contentSha256 = sha256(source.content);
+			const isSkill = source.kind === "skill";
+			const hasSmartyWrapper =
+				isSkill && SMARTY_MERGIFY_SKILLS.includes(source.id.slice("external.skill.".length) as never);
 			components.push({
-				id: `external.skill.${skillName}`,
-				source: filePath,
+				id: source.id,
+				source: source.source,
 				kind: "instruction",
 				semanticRole: "external_instruction",
-				actualRole: "user",
+				actualRole: "system",
 				target: options.target,
-				trigger: "user_selected_skill",
+				trigger: source.trigger,
 				visibility: "external",
 				enabled: false,
-				enabledReason: "available external source; injected only when selected",
-				approvalStatus: "unapproved",
-				sha256: sha256(content),
+				enabledReason: `available ${source.kind} source; dynamic session trigger is unavailable offline`,
+				approvalStatus: await externalApproval(source.source, contentSha256, release, approval),
+				sha256: contentSha256,
 				provider,
 				model,
-				renderedWrapper: "external skill body followed by skill.smarty_mergify_policy",
+				renderedWrapper: hasSmartyWrapper
+					? "external skill body followed by skill.smarty_mergify_policy"
+					: `external ${source.kind} provenance; not triggered offline`,
 				precedence: 10_000,
 				providerOrder: components.length,
-				...counts(content),
-				...(options.includeContent ? { content } : {}),
+				...counts(source.content),
+				...(options.includeContent ? { content: source.content } : {}),
 			});
 		}
 	}
+
+	for (const implementation of release.contentManifest.implementationSources) {
+		if (!implementation.path.startsWith("packages/agent/src/compaction/")) continue;
+		components.push({
+			id: `implementation.${implementation.path}`,
+			source: implementation.path,
+			kind: "data",
+			semanticRole: "data",
+			actualRole: "data",
+			target: options.target,
+			trigger: "compaction",
+			visibility: "offline_only",
+			enabled: false,
+			enabledReason: "protected compaction transform or dispatch implementation",
+			approvalStatus: approval.status,
+			sha256: implementation.sha256,
+			provider,
+			model,
+			renderedWrapper: "implementation provenance; no direct model content",
+			precedence: 50_000,
+			providerOrder: components.length,
+			...counts(""),
+		});
+	}
+
+	components.sort((left, right) => left.precedence - right.precedence || left.id.localeCompare(right.id));
+	components.forEach((component, index) => {
+		component.providerOrder = index;
+	});
 
 	const behavior = YAML.parse(behaviorRegistrySource()) as Record<string, unknown>;
 	const automaticTurns = behavior.automaticTurns as { allowed?: string[] } | undefined;

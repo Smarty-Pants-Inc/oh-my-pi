@@ -4,9 +4,12 @@ import { AutomaticTurnAuthority } from "../../src/session/automatic-turn-authori
 describe("automatic turn authority", () => {
 	it("allows only a still-open asynchronous origin", () => {
 		const authority = new AutomaticTurnAuthority();
-		expect(authority.authorize("active_async_result_wake", false)).toBe(false);
-		expect(authority.authorize("active_async_result_wake", true)).toBe(true);
-		expect(authority.outcomes().map(outcome => outcome.status)).toEqual(["rejected", "accepted"]);
+		expect(authority.authorize("active_async_result_wake", "missing")).toBe(false);
+		const origin = authority.openTurn();
+		expect(authority.authorize("active_async_result_wake", origin)).toBe(true);
+		authority.closeTurn(origin);
+		expect(authority.authorize("active_async_result_wake", origin)).toBe(false);
+		expect(authority.outcomes().map(outcome => outcome.status)).toEqual(["rejected", "accepted", "rejected"]);
 	});
 
 	it("records queue, start, defer, and failure outcomes without conflating them", () => {

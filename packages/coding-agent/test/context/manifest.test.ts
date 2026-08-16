@@ -3,11 +3,14 @@ import * as path from "node:path";
 import { canonicalJson, type JsonValue, sha256 } from "../../src/context/canonical";
 import {
 	activationStatePath,
+	approvedCandidateSourceMatches,
 	assertTrackedManifestCurrent,
 	canonicalGithubRepository,
+	parseContentManifest,
 	parseContextReleaseManifest,
 	trackedContentManifest,
 } from "../../src/context/manifest";
+import { parseGeneratedToolContracts } from "../../src/context/tool-contracts";
 
 describe("tracked context manifest", () => {
 	it("uses the canonical activation state path and ignores environment decoys", () => {
@@ -28,6 +31,20 @@ describe("tracked context manifest", () => {
 			"Smarty-Pants-Inc/oh-my-pi",
 		);
 		expect(canonicalGithubRepository("https://example.com/Smarty-Pants-Inc/oh-my-pi.git")).toBeUndefined();
+	});
+
+	it("binds extension additions to exact candidate identity and bytes", () => {
+		const identity = { repository: "Smarty-Pants-Inc/oh-my-pi", commit: "a".repeat(40), tree: "b".repeat(40) };
+		const release = { candidates: [identity] };
+		expect(
+			approvedCandidateSourceMatches(identity.repository, identity, "c".repeat(64), "c".repeat(64), release),
+		).toBe(true);
+		expect(
+			approvedCandidateSourceMatches(identity.repository, identity, "c".repeat(64), "d".repeat(64), release),
+		).toBe(false);
+		expect(
+			approvedCandidateSourceMatches("other/repository", identity, "c".repeat(64), "c".repeat(64), release),
+		).toBe(false);
 	});
 
 	it("parses an exact self-bound release record and rejects protected drift", () => {
@@ -87,6 +104,59 @@ describe("tracked context manifest", () => {
 		});
 		expect(result.exitCode, result.stderr.toString()).toBe(0);
 		expect((await assertTrackedManifestCurrent()).rootSha256).toBe(trackedContentManifest().rootSha256);
+		const manifest = trackedContentManifest();
+		expect(manifest.toolSchemas.map(tool => tool.id)).toContain("tool.ask");
+		expect(manifest.toolSchemas.map(tool => tool.id)).toContain("tool.capability_grant");
+		expect(manifest.prompts.map(prompt => prompt.path)).toContain(
+			"packages/agent/src/compaction/prompts/summarization-system.md",
+		);
+		expect(manifest.implementationSources.some(entry => entry.path === "packages/agent/src/agent-loop.ts")).toBe(
+			true,
+		);
+	});
+
+	it("requires normalized localeCompare-sorted implementation paths", () => {
+		const manifest = trackedContentManifest();
+		const nonAscii = [
+			{ path: "packages/agent/src/compaction/é.ts", sha256: "a".repeat(64) },
+			{ path: "packages/agent/src/compaction/z.ts", sha256: "b".repeat(64) },
+		].sort((left, right) => left.path.localeCompare(right.path));
+		const invalidPaths = [
+			[],
+			[...manifest.implementationSources, ...nonAscii]
+				.sort((left, right) => left.path.localeCompare(right.path))
+				.reverse(),
+			[{ path: "packages/agent/./src/compaction/x.ts", sha256: "c".repeat(64) }],
+			[{ path: "packages/agent/src/compaction/x.ts", sha256: "C".repeat(64) }],
+			[
+				{ path: "packages/agent/src/compaction/x.ts", sha256: "c".repeat(64) },
+				{ path: "packages/agent/src/compaction/x.ts", sha256: "d".repeat(64) },
+			],
+		];
+		for (const implementationSources of invalidPaths) {
+			const payload = { ...manifest, implementationSources };
+			const { rootSha256: _root, ...withoutRoot } = payload;
+			expect(() =>
+				parseContentManifest(
+					JSON.stringify({
+						...withoutRoot,
+						rootSha256: sha256(canonicalJson(withoutRoot as unknown as JsonValue)),
+					}),
+				),
+			).toThrow();
+		}
+	});
+
+	it("rejects mutated generated tool contract structure and values", async () => {
+		const source = await Bun.file(new URL("../../generated/tool-contracts.json", import.meta.url)).text();
+		const contracts = JSON.parse(source) as Record<string, unknown>;
+		expect(() => parseGeneratedToolContracts(JSON.stringify({ ...contracts, extra: true }))).toThrow();
+		const tools = contracts.tools as Array<Record<string, unknown>>;
+		expect(() =>
+			parseGeneratedToolContracts(
+				JSON.stringify({ ...contracts, tools: [{ ...tools[0], description: "mutated" }, ...tools.slice(1)] }),
+			),
+		).toThrow("root does not match");
 	});
 
 	it("uses a self-excluding canonical root", () => {

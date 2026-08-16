@@ -83,6 +83,12 @@ const PATH_RULES: readonly PathRule[] = [
 		surface: "guard",
 	},
 	{ pattern: /(?:^|\/)generated\/prompt-manifest\.json$/i, surface: "prompt-entry" },
+	{ pattern: /(?:^|\/)generated\/tool-contracts\.json$/i, surface: "tool-schema" },
+	{ pattern: /(?:^|\/)packages\/agent\/src\/compaction\/prompts\//i, surface: "prompt-content" },
+	{
+		pattern: /(?:^|\/)packages\/agent\/src\/(?:agent-loop|compaction\/.*)\.[cm]?[jt]s$/i,
+		surface: "provider-wrapper",
+	},
 	{ pattern: /(?:^|\/)src\/context\/(?:registry|prompt-sources\.generated)\.[cm]?[jt]s$/i, surface: "prompt-entry" },
 	{ pattern: /(?:^|\/)src\/context\/tool-contracts\.[cm]?[jt]s$/i, surface: "tool-schema" },
 	{ pattern: /(?:^|\/)src\/context\/smarty-skills\.[cm]?[jt]s$/i, surface: "provider-wrapper" },
@@ -213,6 +219,8 @@ function surfacesForField(key: string, scope: ManifestScope): readonly Protected
 	const surfaces: ProtectedSurface[] = [];
 	const behaviorSurface = behaviorSurfaces[normalized];
 	if (behaviorSurface) surfaces.push(behaviorSurface);
+	if (normalized === "implementationsources") surfaces.push("provider-wrapper", "tool-schema");
+	if (normalized === "toolschemas") surfaces.push("tool-description", "tool-schema");
 
 	if (scope === "prompt") {
 		if (normalized === "entries" || normalized === "prompts" || normalized === "promptentries") {

@@ -1,5 +1,6 @@
 export type AutomaticTurnSource =
 	| "direct_user_input"
+	| "loop_mode_autonomous_wake"
 	| "active_goal_continuation"
 	| "active_async_result_wake"
 	| "bounded_transport_or_protocol_retry";
@@ -11,6 +12,7 @@ export interface AutomaticTurnOutcome {
 	source: AutomaticTurnSource;
 	status: AutomaticTurnOutcomeStatus;
 	reason: string;
+	originTurnId?: string;
 }
 
 const allowedSources = new Set<AutomaticTurnSource>([
@@ -24,22 +26,49 @@ const allowedSources = new Set<AutomaticTurnSource>([
 export class AutomaticTurnAuthority {
 	#sequence = 0;
 	readonly #outcomes: AutomaticTurnOutcome[] = [];
+	readonly #openTurns = new Set<string>();
+	#turnSequence = 0;
 
-	record(source: AutomaticTurnSource, status: AutomaticTurnOutcomeStatus, reason: string): void {
-		this.#outcomes.push({ sequence: ++this.#sequence, source, status, reason });
+	record(
+		source: AutomaticTurnSource,
+		status: AutomaticTurnOutcomeStatus,
+		reason: string,
+		originTurnId?: string,
+	): void {
+		this.#outcomes.push({
+			sequence: ++this.#sequence,
+			source,
+			status,
+			reason,
+			...(originTurnId ? { originTurnId } : {}),
+		});
 		if (this.#outcomes.length > 100) this.#outcomes.shift();
 	}
 
-	authorize(source: AutomaticTurnSource, stillOpen: boolean = true): boolean {
+	openTurn(): string {
+		const id = `turn-${++this.#turnSequence}`;
+		this.#openTurns.add(id);
+		return id;
+	}
+
+	closeTurn(turnId: string | undefined): void {
+		if (turnId) this.#openTurns.delete(turnId);
+	}
+
+	isTurnOpen(turnId: string | undefined): boolean {
+		return turnId !== undefined && this.#openTurns.has(turnId);
+	}
+
+	authorize(source: AutomaticTurnSource, originTurnId?: string): boolean {
 		if (!allowedSources.has(source)) {
 			this.record(source, "rejected", "source is not registered");
 			return false;
 		}
-		if (source === "active_async_result_wake" && !stillOpen) {
-			this.record(source, "rejected", "originating asynchronous turn is closed");
+		if (source === "active_async_result_wake" && !this.isTurnOpen(originTurnId)) {
+			this.record(source, "rejected", "originating asynchronous turn is closed", originTurnId);
 			return false;
 		}
-		this.record(source, "accepted", "authority and origin checks passed");
+		this.record(source, "accepted", "authority and origin checks passed", originTurnId);
 		return true;
 	}
 

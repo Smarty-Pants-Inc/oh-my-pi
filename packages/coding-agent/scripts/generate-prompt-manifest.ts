@@ -10,6 +10,8 @@ const registryPath = path.join(sourceRoot, "prompt-registry.yml");
 const behaviorPath = path.join(sourceRoot, "agent-behavior.yml");
 const generatedSourcesPath = path.join(sourceRoot, "context/prompt-sources.generated.ts");
 const manifestPath = path.join(packageRoot, "generated/prompt-manifest.json");
+const toolContractsPath = path.join(packageRoot, "generated/tool-contracts.json");
+const repositoryRoot = path.resolve(packageRoot, "../..");
 
 async function writeOrCheck(filePath: string, content: string, check: boolean): Promise<void> {
 	if (!check) {
@@ -68,6 +70,7 @@ const SPECIAL_ORDERS: Readonly<Record<string, number>> = {
 };
 
 function promptId(sourcePath: string): string {
+	if (sourcePath.startsWith("_agent/")) return sourcePath.slice(1).replace(/\.md$/, "").replaceAll("/", ".");
 	const special = SPECIAL_IDS[sourcePath];
 	if (special) return special;
 	const withoutExtension = sourcePath.replace(/\.md$/, "");
@@ -77,6 +80,7 @@ function promptId(sourcePath: string): string {
 }
 
 function targetFor(sourcePath: string): ContextTarget[] {
+	if (sourcePath.startsWith("_agent/compaction/")) return ["main", "subagent"];
 	if (sourcePath === "prompts/skills/smarty-mergify-policy.md") return ["main", "subagent"];
 	if (sourcePath === "prompts/providers/internal-context.md") return ["main", "subagent", "side_model"];
 	if (sourcePath.includes("subagent") || sourcePath.startsWith("prompts/agents/") || sourcePath.startsWith("task/")) {
@@ -96,6 +100,9 @@ function targetFor(sourcePath: string): ContextTarget[] {
 }
 
 function roleFor(sourcePath: string): ContextRole {
+	if (sourcePath.startsWith("_agent/compaction/")) {
+		return sourcePath.endsWith("summarization-system.md") ? "system" : "internal_context";
+	}
 	if (
 		sourcePath === "prompts/providers/internal-context.md" ||
 		sourcePath === "prompts/skills/smarty-mergify-policy.md" ||
@@ -114,6 +121,7 @@ function roleFor(sourcePath: string): ContextRole {
 }
 
 function triggerFor(sourcePath: string): (typeof TRIGGERS)[number] {
+	if (sourcePath.startsWith("_agent/compaction/")) return "compaction";
 	if (sourcePath === "prompts/skills/smarty-mergify-policy.md") return "user_selected_skill";
 	if (sourcePath.includes("goal-continuation")) return "active_goal_idle";
 	if (sourcePath.includes("goal-objective-updated")) return "goal_updated";
@@ -137,6 +145,7 @@ function triggerFor(sourcePath: string): (typeof TRIGGERS)[number] {
 }
 
 function visibilityFor(sourcePath: string): ContextVisibility {
+	if (sourcePath.startsWith("_agent/compaction/")) return "conditional";
 	return sourcePath.includes("optional") ? "conditional" : "model";
 }
 
@@ -157,7 +166,26 @@ async function markdownPaths(): Promise<string[]> {
 	})) {
 		paths.push(path.relative(sourceRoot, absolutePath).replaceAll(path.sep, "/"));
 	}
-	return paths.sort();
+	for await (const absolutePath of new Bun.Glob("compaction/prompts/**/*.md").scan({
+		cwd: path.join(repositoryRoot, "packages/agent/src"),
+		absolute: true,
+		onlyFiles: true,
+	})) {
+		paths.push(
+			`_agent/${path.relative(path.join(repositoryRoot, "packages/agent/src"), absolutePath).replaceAll(path.sep, "/")}`,
+		);
+	}
+	return paths.sort((left, right) => left.localeCompare(right));
+}
+
+function repositoryPathForPrompt(sourcePath: string): string {
+	return sourcePath.startsWith("_agent/")
+		? `packages/agent/src/${sourcePath.slice("_agent/".length)}`
+		: `packages/coding-agent/src/${sourcePath}`;
+}
+
+function absolutePromptPath(sourcePath: string): string {
+	return path.join(repositoryRoot, repositoryPathForPrompt(sourcePath));
 }
 
 function registryEntries(paths: readonly string[]): PromptRegistryEntry[] {
@@ -199,8 +227,10 @@ function formatRegistry(entries: readonly PromptRegistryEntry[], documentation: 
 }
 
 function formatSourceModule(entries: readonly PromptRegistryEntry[]): string {
-	const imports = entries.map(
-		(entry, index) => `import source${index} from "../${entry.path}" with { type: "text" };`,
+	const imports = entries.map((entry, index) =>
+		entry.path.startsWith("_agent/")
+			? `import source${index} from "../../../agent/src/${entry.path.slice("_agent/".length)}" with { type: "text" };`
+			: `import source${index} from "../${entry.path}" with { type: "text" };`,
 	);
 	const mappings = entries.map((entry, index) => `\t${JSON.stringify(entry.path)}: source${index},`);
 	return [
@@ -213,6 +243,38 @@ function formatSourceModule(entries: readonly PromptRegistryEntry[]): string {
 		"});",
 		"",
 	].join("\n");
+}
+
+const IMPLEMENTATION_GLOBS = [
+	"packages/agent/src/agent-loop.ts",
+	"packages/agent/src/compaction/**/*.ts",
+	"packages/coding-agent/src/context/tool-contracts.ts",
+	"packages/coding-agent/src/edit/index.ts",
+	"packages/coding-agent/src/goals/tools/**/*.ts",
+	"packages/coding-agent/src/lsp/tool.ts",
+	"packages/coding-agent/src/task/index.ts",
+	"packages/coding-agent/src/tools/**/*.ts",
+] as const;
+
+async function implementationSources(): Promise<Array<{ path: string; sha256: string }>> {
+	const paths = new Set<string>();
+	for (const pattern of IMPLEMENTATION_GLOBS) {
+		for await (const absolutePath of new Bun.Glob(pattern).scan({
+			cwd: repositoryRoot,
+			absolute: true,
+			onlyFiles: true,
+		})) {
+			paths.add(path.relative(repositoryRoot, absolutePath).replaceAll(path.sep, "/"));
+		}
+	}
+	return await Promise.all(
+		[...paths]
+			.sort((left, right) => left.localeCompare(right))
+			.map(async sourcePath => ({
+				path: sourcePath,
+				sha256: sha256(await Bun.file(path.join(repositoryRoot, sourcePath)).text()),
+			})),
+	);
 }
 
 async function main(): Promise<void> {
@@ -245,15 +307,29 @@ async function main(): Promise<void> {
 		if (!paths.includes(sourcePath)) throw new Error(`registered Markdown path is missing: ${sourcePath}`);
 	}
 	await writeOrCheck(generatedSourcesPath, formatSourceModule(registeredEntries), check);
-	// Load tool factories only after the generated prompt module is current: tool
-	// imports reach the registry and must not observe a deleted prompt import.
-	const { buildToolContractManifest } = await import("../src/context/tool-contracts");
+	// Live generation captures exact contracts once. Check/offline paths verify
+	// the canonical sidecar without importing native-backed tool modules.
+	const { buildGeneratedToolContractManifest, buildToolContractSnapshot } = await import(
+		"../src/context/tool-contracts"
+	);
+	let toolSchemas: Array<{ id: string; descriptionSha256: string; schemaSha256: string }>;
+	if (!check) {
+		const snapshot = await buildToolContractSnapshot();
+		await writeOrCheck(toolContractsPath, `${JSON.stringify(snapshot, null, 2)}\n`, false);
+		toolSchemas = snapshot.tools.map(tool => ({
+			id: tool.id,
+			descriptionSha256: sha256(tool.description),
+			schemaSha256: sha256(canonicalJson(tool.schema as never)),
+		}));
+	} else {
+		toolSchemas = buildGeneratedToolContractManifest();
+	}
 
 	const prompts = await Promise.all(
 		registeredEntries.map(async entry => ({
 			...entry,
-			path: `packages/coding-agent/src/${entry.path}`,
-			sha256: sha256(await Bun.file(path.join(sourceRoot, entry.path)).text()),
+			path: repositoryPathForPrompt(entry.path),
+			sha256: sha256(await Bun.file(absolutePromptPath(entry.path)).text()),
 		})),
 	);
 	prompts.sort((a, b) => a.id.localeCompare(b.id));
@@ -261,7 +337,7 @@ async function main(): Promise<void> {
 	const payload = {
 		schema: "omp.prompt_manifest.v1",
 		prompts,
-		toolSchemas: await buildToolContractManifest(),
+		toolSchemas,
 		providerMappings: [
 			{
 				id: "internal_context.developer",
@@ -278,6 +354,7 @@ async function main(): Promise<void> {
 				wrapperPromptId: "provider.internal_context",
 			},
 		],
+		implementationSources: await implementationSources(),
 		behaviorSha256: sha256(behaviorSource),
 	};
 	const manifest = { ...payload, rootSha256: sha256(canonicalJson(payload as never)) };

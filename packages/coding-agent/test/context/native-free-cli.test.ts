@@ -24,7 +24,13 @@ async function runCli(args: string[], blockNative: boolean): Promise<CliResult> 
 	const stderrPath = path.join(home, `stderr-${index}`);
 	const child = Bun.spawnSync(command, {
 		cwd: repository,
-		env: { ...Bun.env, HOME: home, USERPROFILE: home, NO_COLOR: "1" },
+		env: {
+			...Bun.env,
+			HOME: home,
+			USERPROFILE: home,
+			PI_CODING_AGENT_DIR: path.join(home, ".omp/agent"),
+			NO_COLOR: "1",
+		},
 		stdout: Bun.file(stdoutPath),
 		stderr: Bun.file(stderrPath),
 	});
@@ -116,6 +122,9 @@ describe("native-free context CLI", () => {
 		expect(componentIds).toContain("mcp-xdev-guidance");
 		expect(componentIds).toContain("skill.smarty_mergify_policy");
 		expect(componentIds.filter(id => String(id).startsWith("external.skill."))).toHaveLength(3);
+		expect(componentIds.some(id => String(id).startsWith("implementation.packages/agent/src/compaction/"))).toBe(
+			true,
+		);
 		expect(
 			normalComponents.map(component => ({
 				id: component.id,
@@ -137,5 +146,20 @@ describe("native-free context CLI", () => {
 				providerOrder: component.providerOrder,
 			})),
 		);
+	}, 30_000);
+
+	it("fails closed for a configured dynamic source that cannot be discovered", async () => {
+		const configPath = path.join(home, ".omp/agent/config.yml");
+		await fs.writeFile(configPath, `extensions:\n  - ${path.join(home, "missing-extension.ts")}\n`);
+		try {
+			const result = await runCli(
+				["context", "explain", "--target", "main", "--provider", "openai-responses", "--json"],
+				true,
+			);
+			expect(result.exitCode).not.toBe(0);
+			expect(result.stderr).toContain("configured extension is missing");
+		} finally {
+			await fs.writeFile(configPath, "{}\n");
+		}
 	}, 30_000);
 });

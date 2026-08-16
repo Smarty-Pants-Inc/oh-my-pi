@@ -2,9 +2,14 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { YAML } from "bun";
 import trackedManifestSource from "../../generated/prompt-manifest.json" with { type: "text" };
-import { ref, remote, repo, status } from "../utils/git";
+import { ref, remote, repo, show, status } from "../utils/git";
 import { canonicalJson, type JsonValue, sha256 } from "./canonical";
-import { behaviorRegistrySource, promptRegistry, registeredPromptSource } from "./registry";
+import {
+	behaviorRegistrySource,
+	promptRegistry,
+	registeredPromptRepositoryPath,
+	registeredPromptSource,
+} from "./registry";
 
 export const CONTENT_MANIFEST_SCHEMA = "omp.prompt_manifest.v1" as const;
 export const RELEASE_MANIFEST_SCHEMA = "omp.context_release_manifest.v1" as const;
@@ -56,6 +61,7 @@ export interface ContentManifest {
 	prompts: PromptManifestEntry[];
 	toolSchemas: ToolManifestEntry[];
 	providerMappings: ProviderMappingEntry[];
+	implementationSources: Array<{ path: string; sha256: string }>;
 	behaviorSha256: string;
 	rootSha256: string;
 }
@@ -124,10 +130,16 @@ export function parseContentManifest(source: string): ContentManifest {
 	}
 	assertExactKeys(
 		value,
-		["schema", "prompts", "toolSchemas", "providerMappings", "behaviorSha256", "rootSha256"],
+		["schema", "prompts", "toolSchemas", "providerMappings", "implementationSources", "behaviorSha256", "rootSha256"],
 		"content manifest",
 	);
-	if (!Array.isArray(value.prompts) || !Array.isArray(value.toolSchemas) || !Array.isArray(value.providerMappings)) {
+	if (
+		!Array.isArray(value.prompts) ||
+		!Array.isArray(value.toolSchemas) ||
+		!Array.isArray(value.providerMappings) ||
+		!Array.isArray(value.implementationSources) ||
+		value.implementationSources.length === 0
+	) {
 		throw new Error("content manifest entries must be arrays");
 	}
 	assertSortedUniqueIds(value.prompts, "content manifest prompts");
@@ -181,6 +193,26 @@ export function parseContentManifest(source: string): ContentManifest {
 		}
 		assertString(entry.when, `content manifest provider mapping ${index} when`);
 		assertString(entry.wrapperPromptId, `content manifest provider mapping ${index} wrapperPromptId`);
+	}
+	let previousImplementationPath: string | undefined;
+	for (const [index, entry] of value.implementationSources.entries()) {
+		if (!isRecord(entry)) throw new Error(`content manifest implementation ${index} must be an object`);
+		assertExactKeys(entry, ["path", "sha256"], `content manifest implementation ${index}`);
+		assertString(entry.path, `content manifest implementation ${index} path`);
+		if (
+			entry.path.startsWith("/") ||
+			entry.path.startsWith("./") ||
+			entry.path.endsWith("/") ||
+			entry.path.includes("\\") ||
+			entry.path.split("/").some(segment => segment.length === 0 || segment === "." || segment === "..")
+		) {
+			throw new Error(`content manifest implementation ${index} has invalid path`);
+		}
+		if (previousImplementationPath !== undefined && previousImplementationPath.localeCompare(entry.path) >= 0) {
+			throw new Error("content manifest implementations must be sorted and unique by path");
+		}
+		previousImplementationPath = entry.path;
+		assertSha256(entry.sha256, `content manifest implementation ${index} sha256`);
 	}
 	assertSha256(value.behaviorSha256, "content manifest behaviorSha256");
 	assertSha256(value.rootSha256, "content manifest rootSha256");
@@ -300,21 +332,32 @@ export function trackedContentManifest(): ContentManifest {
 }
 
 /** Recompute source-backed fields while retaining exact generated tool-schema entries. */
-export function currentContentManifest(): ContentManifest {
+export async function currentContentManifest(): Promise<ContentManifest> {
 	const tracked = trackedContentManifest();
 	const registry = promptRegistry();
 	const prompts = registry.prompts
 		.map(entry => ({
 			...entry,
-			path: `packages/coding-agent/src/${entry.path}`,
+			path: registeredPromptRepositoryPath(entry.path),
 			sha256: sha256(registeredPromptSource(entry.id)),
 		}))
 		.sort((left, right) => left.id.localeCompare(right.id));
+	const repositoryRoot = path.resolve(import.meta.dir, "../../../..");
+	const implementationSources = await Promise.all(
+		tracked.implementationSources.map(async entry => ({
+			path: entry.path,
+			sha256: sha256(
+				await readRequiredSource(path.join(repositoryRoot, entry.path), `implementation ${entry.path}`),
+			),
+		})),
+	);
+	const { buildGeneratedToolContractManifest } = await import("./tool-contracts");
 	const payload = {
 		schema: CONTENT_MANIFEST_SCHEMA,
 		prompts,
-		toolSchemas: tracked.toolSchemas,
+		toolSchemas: buildGeneratedToolContractManifest(),
 		providerMappings: tracked.providerMappings,
+		implementationSources,
 		behaviorSha256: sha256(behaviorRegistrySource()),
 	};
 	return {
@@ -323,13 +366,9 @@ export function currentContentManifest(): ContentManifest {
 	};
 }
 
-export async function assertTrackedManifestCurrent(validateToolContracts = true): Promise<ContentManifest> {
+export async function assertTrackedManifestCurrent(): Promise<ContentManifest> {
 	const tracked = trackedContentManifest();
-	const current = currentContentManifest();
-	if (validateToolContracts) {
-		const { buildToolContractManifest } = await import("./tool-contracts");
-		current.toolSchemas = await buildToolContractManifest();
-	}
+	const current = await currentContentManifest();
 	const { rootSha256: _rootSha256, ...payload } = current;
 	current.rootSha256 = sha256(canonicalJson(payload as unknown as JsonValue));
 	if (tracked.rootSha256 !== current.rootSha256) {
@@ -390,10 +429,56 @@ export function canonicalAgentDirPath(): string {
 	return path.join(os.homedir(), ".omp/agent");
 }
 
+export function approvedCandidateSourceMatches(
+	repository: string | undefined,
+	identity: Pick<CandidateIdentity, "commit" | "tree"> | undefined,
+	workingSha256: string,
+	committedSha256: string,
+	release: Pick<ContextReleaseManifest, "candidates">,
+): boolean {
+	if (!repository || !identity) return false;
+	const candidate = release.candidates.find(item => item.repository === repository);
+	return (
+		candidate?.commit === identity.commit && candidate.tree === identity.tree && workingSha256 === committedSha256
+	);
+}
+
+/** Bind an external runtime source to exact bytes in one approved candidate. */
+export async function isApprovedCandidateSource(filePath: string, release: ContextReleaseManifest): Promise<boolean> {
+	try {
+		const resolved = path.resolve(filePath);
+		const repositoryRoot = await repo.root(path.dirname(resolved));
+		if (!repositoryRoot) return false;
+		const relative = path.relative(repositoryRoot, resolved).replaceAll(path.sep, "/");
+		if (relative.startsWith("../") || path.isAbsolute(relative)) return false;
+		const identity = await ref.commitIdentity(repositoryRoot, "HEAD");
+		if (!identity) return false;
+		const remoteNames = await remote.list(repositoryRoot);
+		let repository: string | undefined;
+		for (const name of ["origin", ...remoteNames.filter(name => name !== "origin")]) {
+			repository = canonicalGithubRepository(await remote.url(repositoryRoot, name));
+			if (repository) break;
+		}
+		const [workingSource, committedSource] = await Promise.all([
+			readRequiredSource(resolved, `candidate source ${resolved}`),
+			show(repositoryRoot, `HEAD:${relative}`),
+		]);
+		return approvedCandidateSourceMatches(
+			repository,
+			identity,
+			sha256(workingSource),
+			sha256(committedSource),
+			release,
+		);
+	} catch {
+		return false;
+	}
+}
+
 export async function buildContextReleaseManifest(
 	_projectCwd: string = process.cwd(),
 	candidateOverride?: readonly CandidateIdentity[],
-	options?: { requireCleanCanonicalCheckout?: boolean; validateToolContracts?: boolean },
+	options?: { requireCleanCanonicalCheckout?: boolean },
 ): Promise<ContextReleaseManifest> {
 	const packageRoot = path.resolve(import.meta.dir, "../..");
 	const repositoryRoot = await repo.root(packageRoot);
@@ -413,7 +498,7 @@ export async function buildContextReleaseManifest(
 			throw new Error("PROMPT_POLICY_REVIEW_REQUIRED: OMP checkout must be clean");
 		}
 	}
-	const content = await assertTrackedManifestCurrent(options?.validateToolContracts ?? true);
+	const content = await assertTrackedManifestCurrent();
 	const currentCandidate = { repository: OMP_REPOSITORY, commit, tree };
 	const candidates = candidateOverride
 		? validateCandidateSet(currentCandidate, candidateOverride)

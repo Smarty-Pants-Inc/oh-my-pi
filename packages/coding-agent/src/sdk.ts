@@ -1772,6 +1772,7 @@ async function createAgentSessionScoped(
 			getHindsightSessionState: () => session?.getHindsightSessionState(),
 			getMnemopiSessionState: () => session?.getMnemopiSessionState(),
 			getAgentId: () => resolvedAgentId,
+			getCurrentTurnId: () => session?.getCurrentTurnId(),
 			getToolByName: name => session?.getToolByName(name),
 			agentRegistry,
 			// The global lifecycle releases through AgentRegistry.global(); wiring it
@@ -2645,6 +2646,7 @@ async function createAgentSessionScoped(
 			() => (hasSession ? session.getAsyncJobSnapshot() : null),
 			hostInternalExtension,
 			() => (hasSession ? session.getAsyncJobCounts() : null),
+			releaseManifest,
 		);
 		const systemPromptBuilder = extensionRunner.getSystemPromptBuilder();
 
@@ -3527,6 +3529,7 @@ async function createAgentSessionScoped(
 			sessionManager,
 			initialAdvisorCosts,
 			settings,
+			capabilities: sessionCapabilities,
 			autoApprove: options.autoApprove,
 			scoutAllowedBySpawnPolicy: isScoutSpawnable(undefined, options.spawns ?? "*"),
 			evalKernelOwnerId,

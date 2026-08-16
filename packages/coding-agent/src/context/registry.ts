@@ -60,7 +60,13 @@ function parseEntry(value: unknown, index: number, triggers: ReadonlySet<string>
 	if (typeof id !== "string" || !/^[a-z0-9][a-z0-9._-]*$/.test(id)) {
 		throw new Error(`prompt registry entry ${index} has invalid id`);
 	}
-	if (typeof path !== "string" || !path.endsWith(".md") || path.startsWith("/") || path.includes("..")) {
+	if (
+		typeof path !== "string" ||
+		!path.endsWith(".md") ||
+		path.startsWith("/") ||
+		path.includes("..") ||
+		path.startsWith("@")
+	) {
 		throw new Error(`prompt registry ${id} has invalid path`);
 	}
 	if (typeof role !== "string" || !(CONTEXT_ROLES as readonly string[]).includes(role)) {
@@ -129,6 +135,12 @@ export function promptEntry(id: string): PromptRegistryEntry {
 	return entry;
 }
 
+export function registeredPromptRepositoryPath(sourcePath: string): string {
+	return sourcePath.startsWith("_agent/")
+		? `packages/agent/src/${sourcePath.slice("_agent/".length)}`
+		: `packages/coding-agent/src/${sourcePath}`;
+}
+
 export function renderInstruction(
 	id: string,
 	variables: Record<string, unknown> = {},
@@ -144,7 +156,7 @@ export function renderInstruction(
 	const renderedText = prompt.render(source, variables);
 	return {
 		id,
-		sourcePath: `packages/coding-agent/src/${entry.path}`,
+		sourcePath: registeredPromptRepositoryPath(entry.path),
 		role: entry.role,
 		target: selectedTarget,
 		trigger: entry.trigger,
@@ -166,15 +178,20 @@ export function bindRenderedInstruction(
 	if (!selectedTarget || !entry.target.includes(selectedTarget)) {
 		throw new Error(`prompt ${id} does not target ${selectedTarget ?? "<none>"}`);
 	}
+	const rendered =
+		entry.role === "internal_context" && id !== "provider.internal_context"
+			? renderInstruction("provider.internal_context", { source: id, content: renderedText }, selectedTarget)
+					.renderedText
+			: renderedText;
 	return {
 		id,
-		sourcePath: `packages/coding-agent/src/${entry.path}`,
+		sourcePath: registeredPromptRepositoryPath(entry.path),
 		role: entry.role,
 		target: selectedTarget,
 		trigger: entry.trigger,
 		visibility: entry.visibility,
-		sha256: sha256(renderedText),
-		renderedText,
+		sha256: sha256(rendered),
+		renderedText: rendered,
 		order: entry.order,
 	};
 }

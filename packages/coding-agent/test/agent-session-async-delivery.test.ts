@@ -34,7 +34,7 @@ describe("AgentSession owner-routed async delivery", () => {
 		AsyncJobManager.resetForTests();
 	});
 
-	it("injects an owned completion as a follow-up turn and reaches quiescence", async () => {
+	it("persists an unscoped completion without creating a follow-up turn", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
 		const agent = new Agent({
@@ -49,9 +49,10 @@ describe("AgentSession owner-routed async delivery", () => {
 		const manager = new AsyncJobManager({});
 		AsyncJobManager.setInstance(manager);
 
+		const sessionManager = SessionManager.inMemory();
 		session = new AgentSession({
 			agent,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager,
 			settings: Settings.isolated(),
 			modelRegistry: new ModelRegistry(authStorage),
 			agentId: "SubAgent",
@@ -61,14 +62,13 @@ describe("AgentSession owner-routed async delivery", () => {
 		const gate = Promise.withResolvers<string>();
 		manager.register("bash", "gated job", () => gate.promise, { id: "sub-job", ownerId: "SubAgent" });
 
-		// A running owned job holds the session out of quiescence.
-		expect(session.hasPendingAsyncWork()).toBe(true);
+		// A job without a still-open origin cannot hold or re-wake the model loop.
+		expect(session.hasPendingAsyncWork()).toBe(false);
 
 		gate.resolve("job finished: ALL GREEN");
 		await session.settleAsyncWork();
 
-		// The completion routed to THIS session (not a global default sink) and
-		// ran as a follow-up turn whose context carries the job result.
+		// The completion is durable and visible, but it did not enter provider context.
 		expect(session.hasPendingAsyncWork()).toBe(false);
 		const sawResult = mock.calls.some(call =>
 			call.context.messages.some(message => {
@@ -81,7 +81,65 @@ describe("AgentSession owner-routed async delivery", () => {
 				);
 			}),
 		);
-		expect(sawResult).toBe(true);
+		expect(sawResult).toBe(false);
+		expect(agent.state.messages.some(message => JSON.stringify(message).includes("ALL GREEN"))).toBe(true);
+	});
+
+	it("keeps only the exact open origin eligible and closes it at assistant final", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const providerGate = Promise.withResolvers<void>();
+		const mock = createMockModel({
+			handler: async () => {
+				await providerGate.promise;
+				return { content: ["Done"] };
+			},
+		});
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			convertToLlm,
+			streamFn: mock.stream,
+		});
+		const authStorage = await AuthStorage.create(":memory:");
+		authStorages.push(authStorage);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const manager = new AsyncJobManager({});
+		AsyncJobManager.setInstance(manager);
+
+		const sessionManager = SessionManager.inMemory();
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated(),
+			modelRegistry: new ModelRegistry(authStorage),
+			agentId: "SubAgent",
+			asyncJobManager: manager,
+		});
+		const prompt = session.sendUserMessage("start exact-origin turn");
+		while (mock.calls.length === 0) await Bun.sleep(1);
+		const originTurnId = session.getCurrentTurnId();
+		expect(originTurnId).toMatch(/^turn-/);
+
+		manager.register("bash", "origin job", async () => "EXACT ORIGIN RESULT", {
+			id: "origin-job",
+			ownerId: "SubAgent",
+			originTurnId,
+		});
+		expect(session.hasPendingAsyncWork()).toBe(true);
+		await manager.waitForOwnerJobs("SubAgent");
+		await manager.drainDeliveries({ filter: { ownerId: "SubAgent" } });
+		expect(session.hasPendingAsyncWork()).toBe(true);
+
+		providerGate.resolve();
+		await prompt;
+		await session.settleAsyncWork();
+		expect(session.hasPendingAsyncWork()).toBe(false);
+		expect(mock.calls).toHaveLength(1);
+		expect(
+			[...agent.state.messages, ...sessionManager.getEntries()].some(message =>
+				JSON.stringify(message).includes("EXACT ORIGIN RESULT"),
+			),
+		).toBe(true);
 	});
 
 	it("routes an advisor-owned launch completion through the session", async () => {
@@ -216,15 +274,14 @@ describe("AgentSession owner-routed async delivery", () => {
 			ownedAsyncJobManager: manager,
 		});
 
-		// Complete a job and push its result all the way onto the yield queue, so a
-		// follow-up turn is pending injection into the (soon-to-be-replaced) session.
+		// Complete an unscoped job. Its result is passive, not a queued follow-up.
 		manager.register("task", "prior session", async () => "STALE ASYNC RESULT", {
 			id: "prior-session-job",
 			ownerId: "Main",
 		});
 		await manager.waitForOwnerJobs("Main");
 		await manager.drainDeliveries({ filter: { ownerId: "Main" } });
-		expect(session.hasPendingAsyncWork()).toBe(true);
+		expect(session.hasPendingAsyncWork()).toBe(false);
 
 		expect(await session.newSession()).toBe(true);
 		expect(session.hasPendingAsyncWork()).toBe(false);
@@ -301,7 +358,7 @@ describe("AgentSession owner-routed async delivery", () => {
 		expect(session.hasPendingAsyncWork()).toBe(false);
 	});
 
-	it("still reports pending async work while a delivered result awaits injection", async () => {
+	it("does not report an unscoped delivered result as pending semantic work", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
 		const agent = new Agent({
@@ -331,18 +388,12 @@ describe("AgentSession owner-routed async delivery", () => {
 		await manager.waitForOwnerJobs("SubAgent");
 		await manager.drainDeliveries({ filter: { ownerId: "SubAgent" } });
 
-		// The manager has fully handed off — no running jobs, no queued or
-		// in-flight deliveries — but the async-result follow-up still sits on
-		// the session's yield queue awaiting the (delayed) idle flush / next
-		// step boundary. A terminal yield observed in this window MUST still
-		// count as pending async work, or the run driver terminates and the
-		// delivered result is silently dropped from the final report.
-		expect(session.hasPendingAsyncWork()).toBe(true);
-
-		// Settling drains the queued follow-up into a real turn and only then
-		// reaches quiescence.
+		// The result is already passively persisted and never becomes wake authority.
+		expect(session.hasPendingAsyncWork()).toBe(false);
 		await session.settleAsyncWork();
 		expect(session.hasPendingAsyncWork()).toBe(false);
+		expect(mock.calls.some(call => JSON.stringify(call.context.messages).includes("QUEUED RESULT"))).toBe(false);
+		expect(agent.state.messages.some(message => JSON.stringify(message).includes("QUEUED RESULT"))).toBe(true);
 	});
 
 	it("keeps the event loop live until a delayed idle flush runs", async () => {

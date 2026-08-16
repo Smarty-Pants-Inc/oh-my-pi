@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
@@ -20,6 +21,19 @@ export interface SessionCapabilityInit {
 	writeAllowlist?: readonly string[];
 	externalCapabilities?: readonly ExternalCapability[];
 	taskOwnedResources?: readonly TaskOwnedResource[];
+}
+
+export type CapabilityGrantRequest =
+	| { kind: "writePath"; value: string }
+	| { kind: "externalCapability"; value: string };
+
+export interface CapabilityGrantProvenance {
+	turnId: string;
+	source: "direct_user_turn";
+	userPromptSha256: string;
+	grantedAt: string;
+	kind: CapabilityGrantRequest["kind"];
+	value: string;
 }
 
 export type WriteDecision =
@@ -137,6 +151,8 @@ export class SessionCapabilities {
 	#writeAllowlist = new Set<string>();
 	#externalCapabilities = new Set<ExternalCapability>();
 	#taskOwnedResources = new Map<string, TaskOwnedResource>();
+	#directUserTurn: { turnId: string; userPromptSha256: string } | undefined;
+	readonly #grantProvenance: CapabilityGrantProvenance[] = [];
 
 	constructor(init: SessionCapabilityInit) {
 		this.#workspace = canonicalPath(init.workspace);
@@ -167,6 +183,40 @@ export class SessionCapabilities {
 
 	get taskOwnedResources(): readonly TaskOwnedResource[] {
 		return [...this.#taskOwnedResources.values()];
+	}
+
+	get grantProvenance(): readonly CapabilityGrantProvenance[] {
+		return this.#grantProvenance.map(record => ({ ...record }));
+	}
+
+	beginDirectUserTurn(turnId: string, userPrompt: string): void {
+		this.#directUserTurn = {
+			turnId,
+			userPromptSha256: createHash("sha256").update(userPrompt).digest("hex"),
+		};
+	}
+
+	endTurn(turnId: string | undefined): void {
+		if (turnId && this.#directUserTurn?.turnId === turnId) this.#directUserTurn = undefined;
+	}
+
+	/** The structured model call is the authorization act; only a live direct-user turn may make it. */
+	grantFromCurrentDirectUserTurn(request: CapabilityGrantRequest): CapabilityGrantProvenance {
+		const turn = this.#directUserTurn;
+		if (!turn) throw new Error("capability grants require the current direct-user turn");
+		const value =
+			request.kind === "writePath"
+				? this.grantWritePath(request.value)
+				: this.grantExternalCapability(request.value);
+		const record: CapabilityGrantProvenance = {
+			...turn,
+			source: "direct_user_turn",
+			grantedAt: new Date().toISOString(),
+			kind: request.kind,
+			value,
+		};
+		this.#grantProvenance.push(record);
+		return { ...record };
 	}
 
 	/** Install a narrow path grant once; later decisions reuse it without another prompt. */

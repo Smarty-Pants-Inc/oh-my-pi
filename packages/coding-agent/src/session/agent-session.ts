@@ -106,6 +106,7 @@ import {
 	loadAdvisorTranscriptCosts,
 } from "../advisor";
 import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, type AsyncJob, type AsyncJobFilter, AsyncJobManager } from "../async";
+import type { SessionCapabilities } from "../capability/session-capabilities";
 import { shouldEnableAppendOnlyContext } from "../config/append-only-context-mode";
 import type { ModelRegistry } from "../config/model-registry";
 import type { ResolvedModelRoleValue } from "../config/model-resolver";
@@ -113,7 +114,7 @@ import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-temp
 import { buildServiceTierByFamily } from "../config/service-tier";
 import type { Settings, SkillsSettings } from "../config/settings";
 import { onAppendOnlyModeChanged, onModelRolesChanged } from "../config/settings";
-import { bindRenderedInstruction } from "../context/registry";
+import { bindRenderedInstruction, renderInstruction } from "../context/registry";
 import { smartyMergifySkillInstruction } from "../context/smarty-skills";
 import { RawSseDebugBuffer } from "../debug/raw-sse-buffer";
 import { getFileSnapshotStore } from "../edit/file-snapshot-store";
@@ -465,6 +466,7 @@ type AgentContinueSkipReason =
 
 type ScheduledAgentContinueOptions = {
 	authority: AutomaticTurnSource;
+	originTurnId?: string;
 	delayMs?: number;
 	generation?: number;
 	shouldContinue?: () => boolean;
@@ -769,6 +771,10 @@ export class AgentSession {
 	#inFlightSettling = false;
 	#sessionStopHookActive = false;
 	readonly #automaticTurns = new AutomaticTurnAuthority();
+	readonly #capabilities: SessionCapabilities | undefined;
+	#currentTurnId: string | undefined;
+	readonly #queuedAsyncResults = new Map<string, AsyncResultEntry>();
+	#turnExtensionInstructions: ContextInstruction[] = [];
 	#obfuscator: SecretObfuscator | undefined;
 	/** Session-start value of `inlineToolDescriptors`; drives handoff tool pruning. */
 	#pruneToolDescriptions = false;
@@ -1109,6 +1115,7 @@ export class AgentSession {
 		this.agent = config.agent;
 		this.sessionManager = config.sessionManager;
 		this.settings = config.settings;
+		this.#capabilities = config.capabilities;
 		this.#modelRegistry = config.modelRegistry;
 		this.#codexResetCoordinator = config.codexResetCoordinator ?? defaultCodexAutoRedeemCoordinator;
 		const bashHost: BashRunnerHost = {
@@ -1544,7 +1551,34 @@ export class AgentSession {
 				this.#deliverAsyncJobResult(manager, jobId, text, job),
 			);
 			this.yieldQueue.register<AsyncResultEntry>("async-result", {
-				isStale: entry => entry.epoch !== this.#asyncDeliveryEpoch || manager.isDeliverySuppressed(entry.jobId),
+				isStale: entry =>
+					entry.epoch !== this.#asyncDeliveryEpoch ||
+					manager.isDeliverySuppressed(entry.jobId) ||
+					this.#queuedAsyncResults.get(entry.jobId) !== entry ||
+					!this.#automaticTurns.isTurnOpen(entry.originTurnId),
+				onStale: entry => {
+					if (this.#queuedAsyncResults.get(entry.jobId) !== entry) return;
+					if (entry.epoch !== this.#asyncDeliveryEpoch) {
+						this.#queuedAsyncResults.delete(entry.jobId);
+						return;
+					}
+					if (entry.originTurnId !== undefined && !this.#automaticTurns.isTurnOpen(entry.originTurnId)) {
+						this.#schedulePostPromptTask(() => this.#persistPassiveAsyncResult(entry));
+					}
+				},
+				onDiscard: entries => {
+					for (const entry of entries) {
+						if (this.#queuedAsyncResults.get(entry.jobId) !== entry) continue;
+						if (
+							entry.epoch !== this.#asyncDeliveryEpoch ||
+							entry.originTurnId === undefined ||
+							this.#automaticTurns.isTurnOpen(entry.originTurnId)
+						) {
+							continue;
+						}
+						this.#schedulePostPromptTask(() => this.#persistPassiveAsyncResult(entry));
+					}
+				},
 				build: buildAsyncResultBatchMessage,
 			});
 		}
@@ -2190,15 +2224,15 @@ export class AgentSession {
 		transition.manager.discardJobs(jobs, { ownerId: transition.ownerId });
 	}
 
-	/** Activate selected deliveries after host publication without awaiting formatter or artifact I/O. */
-	#activateAsyncSessionTransition(transition: AsyncSessionTransition, committed: boolean): void {
+	/** Activate selected deliveries after host publication. */
+	async #activateAsyncSessionTransition(transition: AsyncSessionTransition, committed: boolean): Promise<void> {
 		if (this.#asyncSessionTransition === transition) this.#asyncSessionTransition = undefined;
 		for (const delivery of transition.deferredDeliveries) {
 			const retained = transition.retainedJobs.has(delivery.job);
 			if (retained !== !committed) continue;
 			try {
 				if (delivery.formatted !== undefined) {
-					this.#enqueueFormattedAsyncJobResult(
+					await this.#enqueueFormattedAsyncJobResult(
 						delivery.manager,
 						delivery.jobId,
 						delivery.formatted,
@@ -2491,6 +2525,7 @@ export class AgentSession {
 		// prior session's background result cannot inject into the next transcript.
 		this.#asyncDeliveryEpoch += 1;
 		this.yieldQueue.clear("async-result");
+		this.#queuedAsyncResults.clear();
 	}
 
 	/**
@@ -2508,18 +2543,34 @@ export class AgentSession {
 		const manager = this.#asyncJobManager;
 		if (!manager) return false;
 		const ownerFilter = this.#agentId ? { ownerId: this.#agentId } : undefined;
+		const jobs = manager.getAllJobs(ownerFilter);
+		const pendingDeliveryIds = new Set(manager.getDeliveryState(ownerFilter).pendingJobIds);
 		return (
-			manager.getRunningJobs(ownerFilter).some(job => !manager.isDeliverySuppressed(job.id)) ||
-			manager.hasPendingDeliveries(ownerFilter) ||
+			jobs.some(
+				job =>
+					(job.status === "running" || pendingDeliveryIds.has(job.id)) &&
+					!manager.isDeliverySuppressed(job.id) &&
+					this.#automaticTurns.isTurnOpen(job.originTurnId),
+			) ||
 			// Delivered but not yet injected: the sink has enqueued the
 			// async-result follow-up on the yield queue, and the manager no
 			// longer reports it. Without this leg a terminal yield in the
 			// (idle-flush delay / step-boundary) handoff window would read as
 			// quiescent and the run driver would drop the queued result.
-			this.yieldQueue.has(ASYNC_RESULT_MESSAGE_TYPE) ||
-			[...this.agent.peekSteeringQueue(), ...this.agent.peekFollowUpQueue()].some(
-				message => message.role === "custom" && message.customType === ASYNC_RESULT_MESSAGE_TYPE,
-			)
+			[...this.#queuedAsyncResults.values()].some(entry => this.#automaticTurns.isTurnOpen(entry.originTurnId)) ||
+			[...this.agent.peekSteeringQueue(), ...this.agent.peekFollowUpQueue()].some(message => {
+				if (message.role !== "custom" || message.customType !== ASYNC_RESULT_MESSAGE_TYPE) return false;
+				const jobs = isRecord(message.details) ? message.details.jobs : undefined;
+				return (
+					Array.isArray(jobs) &&
+					jobs.some(
+						job =>
+							isRecord(job) &&
+							typeof job.originTurnId === "string" &&
+							this.#automaticTurns.isTurnOpen(job.originTurnId),
+					)
+				);
+			})
 		);
 	}
 
@@ -2548,12 +2599,14 @@ export class AgentSession {
 		await manager.waitForOwnerJobs(this.#agentId, { excludeSuppressed: true });
 		await manager.drainDeliveries({ filter: { ownerId: this.#agentId } });
 		await this.waitForIdle();
+		await this.#waitForPostPromptRecovery();
 		// A transition can restore queued results after the manager already drained.
 		// If its scheduled idle flush lost the race with quiescence, drive that
 		// existing queue now so settleAsyncWork fulfills its delivery contract.
 		if (this.yieldQueue.has(ASYNC_RESULT_MESSAGE_TYPE)) {
 			await this.yieldQueue.flush("idle");
 			await this.waitForIdle();
+			await this.#waitForPostPromptRecovery();
 		}
 	}
 
@@ -2600,24 +2653,51 @@ export class AgentSession {
 			transition.deferredDeliveries.push({ manager, jobId, text, job, formatted });
 			return;
 		}
-		this.#enqueueFormattedAsyncJobResult(manager, jobId, formatted, job, epoch);
+		await this.#enqueueFormattedAsyncJobResult(manager, jobId, formatted, job, epoch);
 	}
 
-	#enqueueFormattedAsyncJobResult(
+	async #enqueueFormattedAsyncJobResult(
 		manager: AsyncJobManager,
 		jobId: string,
 		formatted: string,
 		job: AsyncJob,
 		epoch: number,
-	): void {
+	): Promise<void> {
 		if (this.#isDisposed || epoch !== this.#asyncDeliveryEpoch || manager.isDeliverySuppressed(jobId)) return;
 		const durationMs = Math.max(0, Date.now() - job.startTime);
-		this.yieldQueue.enqueue<AsyncResultEntry>(ASYNC_RESULT_MESSAGE_TYPE, {
+		const entry: AsyncResultEntry = {
 			jobId,
 			result: formatted,
 			job,
 			durationMs,
 			epoch,
+			originTurnId: job.originTurnId,
+		};
+		if (!this.#automaticTurns.isTurnOpen(job.originTurnId)) {
+			await this.#persistPassiveAsyncResult(entry);
+			return;
+		}
+		this.#queuedAsyncResults.set(jobId, entry);
+		this.yieldQueue.enqueue<AsyncResultEntry>(ASYNC_RESULT_MESSAGE_TYPE, entry);
+	}
+
+	async #persistPassiveAsyncResult(entry: AsyncResultEntry): Promise<void> {
+		this.#queuedAsyncResults.delete(entry.jobId);
+		const message = buildAsyncResultBatchMessage([entry]);
+		if (!message) return;
+		if (this.isStreaming) {
+			this.agent.appendMessage(message);
+			this.sessionManager.appendCustomMessageEntry(
+				message.customType,
+				message.content,
+				message.display,
+				message.details,
+				message.attribution ?? "agent",
+			);
+			return;
+		}
+		await this.sendCustomMessage(message).catch(error => {
+			logger.warn("Failed to persist passive async result", { error: String(error), jobId: entry.jobId });
 		});
 	}
 
@@ -3230,6 +3310,11 @@ export class AgentSession {
 			event.message.customType === ASYNC_RESULT_MESSAGE_TYPE
 		) {
 			const jobs = isRecord(event.message.details) ? event.message.details.jobs : undefined;
+			if (Array.isArray(jobs)) {
+				for (const job of jobs) {
+					if (isRecord(job) && typeof job.jobId === "string") this.#queuedAsyncResults.delete(job.jobId);
+				}
+			}
 			if (Array.isArray(jobs) && jobs.some(job => isRecord(job) && stringProperty(job, "type") === "task")) {
 				this.#todo.noteTaskCompletion();
 			}
@@ -3241,6 +3326,9 @@ export class AgentSession {
 		// toolUse) assistant message and skipping settle-only work.
 		if (event.type === "message_end" && event.message.role === "assistant") {
 			this.#lastAssistantMessage = event.message;
+			if (!event.message.content.some(part => part.type === "toolCall")) {
+				this.#closeCurrentTurn();
+			}
 		}
 		// Plan-mode internal transition: stamp `SILENT_ABORT_MARKER` on the
 		// persisted message BEFORE the obfuscator's display-side copy below.
@@ -3546,6 +3634,7 @@ export class AgentSession {
 
 		// Check auto-retry and auto-compaction after agent completes
 		if (event.type === "agent_end") {
+			this.#closeCurrentTurn();
 			const settledMessages = event.messages;
 			const activeMessages = this.agent.state.messages;
 			// TTSR retry work runs concurrently and clears the live flag before
@@ -3920,14 +4009,7 @@ export class AgentSession {
 	}
 
 	#scheduleAgentContinue(options?: ScheduledAgentContinueOptions): void {
-		if (
-			!options ||
-			!this.#automaticTurns.authorize(
-				options.authority,
-				options.authority !== "active_async_result_wake" || this.#hasPendingAsyncWake(),
-			)
-		)
-			return;
+		if (!options || !this.#automaticTurns.authorize(options.authority, options.originTurnId)) return;
 		this.#schedulePostPromptTask(
 			async signal => {
 				// Defense in depth: if compaction/handoff slipped onto the post-prompt queue
@@ -3943,7 +4025,10 @@ export class AgentSession {
 					this.#skipAgentContinue("should-continue-false", options);
 					return;
 				}
-				if (options.authority === "active_async_result_wake" && !this.#hasPendingAsyncWake()) {
+				if (
+					options.authority === "active_async_result_wake" &&
+					!this.#automaticTurns.isTurnOpen(options.originTurnId)
+				) {
 					this.#automaticTurns.record(options.authority, "rejected", "originating asynchronous turn closed");
 					return;
 				}
@@ -4002,12 +4087,27 @@ export class AgentSession {
 		this.#automaticTurns.record(source, status, reason);
 	}
 
-	authorizeAutomaticTurn(source: AutomaticTurnSource, stillOpen: boolean = true): boolean {
-		return this.#automaticTurns.authorize(source, stillOpen);
+	authorizeAutomaticTurn(source: AutomaticTurnSource, originTurnId?: string): boolean {
+		return this.#automaticTurns.authorize(source, originTurnId);
 	}
 
 	getAutomaticTurnOutcomes(): readonly AutomaticTurnOutcome[] {
 		return this.#automaticTurns.outcomes();
+	}
+
+	getCurrentTurnId(): string | undefined {
+		return this.#currentTurnId;
+	}
+
+	#closeCurrentTurn(): void {
+		const turnId = this.#currentTurnId;
+		this.#capabilities?.endTurn(this.#currentTurnId);
+		this.#automaticTurns.closeTurn(this.#currentTurnId);
+		this.#currentTurnId = undefined;
+		if (!turnId) return;
+		for (const entry of this.#queuedAsyncResults.values()) {
+			if (entry.originTurnId === turnId) void this.#persistPassiveAsyncResult(entry);
+		}
 	}
 
 	#scheduleCompactionContinuation(options: {
@@ -4018,10 +4118,10 @@ export class AgentSession {
 	}): boolean {
 		if (options.suppressContinuation) return false;
 		if (this.agent.hasQueuedMessages()) {
-			const authority = this.#queuedTurnAuthority();
-			if (!authority) return false;
+			const queuedAuthority = this.#queuedTurnAuthority();
+			if (!queuedAuthority) return false;
 			this.#scheduleAgentContinue({
-				authority,
+				...queuedAuthority,
 				delayMs: 100,
 				generation: options.generation,
 				shouldContinue: () => this.agent.hasQueuedMessages(),
@@ -4060,10 +4160,10 @@ export class AgentSession {
 				await Promise.resolve();
 				if (signal.aborted) return;
 				if (this.agent.hasQueuedMessages()) {
-					const authority = this.#queuedTurnAuthority();
-					if (!authority) return;
+					const queuedAuthority = this.#queuedTurnAuthority();
+					if (!queuedAuthority) return;
 					this.#scheduleAgentContinue({
-						authority,
+						...queuedAuthority,
 						generation,
 						shouldContinue: () => this.agent.hasQueuedMessages(),
 					});
@@ -5650,7 +5750,7 @@ export class AgentSession {
 
 	/** Fresh registered components injected at the provider boundary, never persisted as messages. */
 	buildProviderContextInstructions(): ContextInstruction[] {
-		const instructions: ContextInstruction[] = [];
+		const instructions: ContextInstruction[] = [...this.#turnExtensionInstructions];
 		if (this.#agentKind === "main") {
 			const activeGoal = this.#goalRuntime.buildActivePrompt();
 			if (activeGoal) instructions.push(bindRenderedInstruction("goal.active", activeGoal));
@@ -6310,6 +6410,15 @@ export class AgentSession {
 	): Promise<void> {
 		const abort = this.#abortPromise;
 		if (abort) await abort;
+		this.#closeCurrentTurn();
+		const turnId = this.#automaticTurns.openTurn();
+		this.#currentTurnId = turnId;
+		if (
+			message.role === "user" &&
+			(!("attribution" in message) || message.attribution === undefined || message.attribution === "user")
+		) {
+			this.#capabilities?.beginDirectUserTurn(turnId, expandedText);
+		}
 		this.#beginInFlight();
 		const generation = this.#promptGeneration;
 		let restorePromptMessages: (() => void) | undefined;
@@ -6438,29 +6547,33 @@ export class AgentSession {
 					beforeAgentStartSystemPrompt,
 				);
 				if (result?.messages) {
-					const promptAttribution: "user" | "agent" | undefined =
-						"attribution" in message ? message.attribution : undefined;
-					for (const msg of result.messages) {
-						const normalized = normalizeCustomMessagePayload(msg);
-						const hasExplicitAttribution =
-							msg !== null &&
-							typeof msg === "object" &&
-							!Array.isArray(msg) &&
-							(msg.attribution === "user" || msg.attribution === "agent");
-						messages.push(
-							await this.#normalizeAgentMessageImages({
-								role: "custom",
-								customType: normalized.customType,
-								content: normalized.content,
-								display: normalized.display,
-								details: normalized.details,
-								attribution: hasExplicitAttribution
-									? normalized.attribution
-									: (promptAttribution ?? (message.role === "user" ? "user" : "agent")),
-								timestamp: Date.now(),
-							}),
-						);
-					}
+					this.#turnExtensionInstructions = result.messages.map(
+						({ message: extensionMessage, extensionPath }, index) => {
+							const normalized = normalizeCustomMessagePayload(extensionMessage);
+							const content =
+								typeof normalized.content === "string"
+									? normalized.content
+									: normalized.content
+											.filter((part): part is TextContent => part.type === "text")
+											.map(part => part.text)
+											.join("\n");
+							const wrapped = renderInstruction(
+								"provider.internal_context",
+								{
+									source: `extension:${extensionPath}`,
+									content,
+								},
+								this.#agentKind === "sub" ? "subagent" : "main",
+							);
+							return {
+								...wrapped,
+								id: `extension.before_agent_start.${index}`,
+								sourcePath: extensionPath,
+								trigger: "extension_event",
+								order: 530 + index,
+							};
+						},
+					);
 				}
 
 				if (result?.systemPrompt !== undefined) {
@@ -6544,6 +6657,8 @@ export class AgentSession {
 			if (!promptMessagesCommitted) restorePromptMessages?.();
 			// The per-turn before_agent_start override lives only for this turn.
 			this.#tools.clearTurnSystemPromptOverride();
+			this.#turnExtensionInstructions = [];
+			if (this.#currentTurnId === turnId) this.#closeCurrentTurn();
 			this.#usagePreflightReadyForNextModelCall = false;
 			this.#endInFlight();
 		}
@@ -6846,18 +6961,19 @@ export class AgentSession {
 			!this.#canAutoContinueForFollowUp()
 		)
 			return false;
-		const authority = this.#queuedTurnAuthority();
-		if (!authority) return false;
+		const queuedAuthority = this.#queuedTurnAuthority();
+		if (!queuedAuthority) return false;
 		this.#queuedMessageDrainScheduled = true;
 		this.#scheduleAgentContinue({
-			authority,
+			...queuedAuthority,
 			shouldContinue: () => {
 				this.#queuedMessageDrainScheduled = false;
 				return (
 					this.#modeExitDrainSuppressionDepth === 0 &&
 					this.#canAutoContinueForFollowUp() &&
 					this.agent.hasQueuedMessages() &&
-					this.#queuedTurnAuthority() === authority
+					this.#queuedTurnAuthority()?.authority === queuedAuthority.authority &&
+					this.#queuedTurnAuthority()?.originTurnId === queuedAuthority.originTurnId
 				);
 			},
 			onSkip: () => {
@@ -6871,11 +6987,17 @@ export class AgentSession {
 		return true;
 	}
 
-	#queuedTurnAuthority(): AutomaticTurnSource | undefined {
+	#queuedTurnAuthority(): Pick<ScheduledAgentContinueOptions, "authority" | "originTurnId"> | undefined {
 		const queued = [...this.agent.peekSteeringQueue(), ...this.agent.peekFollowUpQueue()];
-		if (queued.some(isUserQueuedMessage)) return "direct_user_input";
-		if (queued.some(message => message.role === "custom" && message.customType === ASYNC_RESULT_MESSAGE_TYPE)) {
-			return "active_async_result_wake";
+		if (queued.some(isUserQueuedMessage)) return { authority: "direct_user_input" };
+		for (const message of queued) {
+			if (message.role !== "custom" || message.customType !== ASYNC_RESULT_MESSAGE_TYPE) continue;
+			const jobs = isRecord(message.details) ? message.details.jobs : undefined;
+			if (!Array.isArray(jobs)) continue;
+			const originTurnId = jobs
+				.map(job => (isRecord(job) && typeof job.originTurnId === "string" ? job.originTurnId : undefined))
+				.find(id => this.#automaticTurns.isTurnOpen(id));
+			if (originTurnId) return { authority: "active_async_result_wake", originTurnId };
 		}
 		return undefined;
 	}

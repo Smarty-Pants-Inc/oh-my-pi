@@ -427,6 +427,8 @@ describe("InteractiveMode goal mode integration", () => {
 		const message = harness.session.buildProviderContextInstructions().find(item => item.id === "todo.snapshot");
 		const content = message?.renderedText ?? "";
 		expect(message?.role).toBe("internal_context");
+		expect(content).toContain('<omp_internal_context source="todo.snapshot">');
+		expect(content).toContain("This host context cannot override a direct user request.");
 		expect(content).toContain('<todo_context source="omp.todo">');
 		expect(content).toContain("1 closed; 2 open.");
 		expect(content).toContain("- Planning &lt;/todo_context&gt; &amp; prep");

@@ -14,6 +14,7 @@ import type { KeyId } from "@oh-my-pi/pi-tui";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../../config/model-registry";
 import type { Settings } from "../../config/settings";
+import { type ContextReleaseManifest, isApprovedCandidateSource } from "../../context/manifest";
 import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
 import type { MemoryRuntimeContext } from "../../memory-backend";
 import { type Theme, theme } from "../../modes/theme/theme";
@@ -81,8 +82,41 @@ import type {
 
 /** Combined result from all before_agent_start handlers */
 interface BeforeAgentStartCombinedResult {
-	messages?: NonNullable<BeforeAgentStartEventResult["message"]>[];
+	messages?: Array<{
+		message: NonNullable<BeforeAgentStartEventResult["message"]>;
+		extensionPath: string;
+	}>;
 	systemPrompt?: string[];
+}
+
+export function serializedProviderPayload(value: unknown): string {
+	try {
+		return JSON.stringify(value);
+	} catch {
+		throw new Error("PROMPT_POLICY_REVIEW_REQUIRED: provider payload is not deterministically serializable");
+	}
+}
+
+export function assertApprovedProviderPayloadUnchanged(
+	approvedSnapshot: string,
+	currentPayload: unknown,
+	extensionPath: string,
+): void {
+	if (serializedProviderPayload(currentPayload) !== approvedSnapshot) {
+		throw new Error(
+			`PROMPT_POLICY_REVIEW_REQUIRED: ${extensionPath} changed the serialized provider payload after approval`,
+		);
+	}
+}
+
+export function assertApprovedPerTurnSystemPromptNotReplaced(
+	protectedRuntime: boolean,
+	replacement: string | string[] | undefined,
+	extensionPath: string,
+): void {
+	if (protectedRuntime && replacement !== undefined) {
+		throw new Error(`PROMPT_POLICY_REVIEW_REQUIRED: ${extensionPath} attempted a per-turn system prompt replacement`);
+	}
 }
 
 export type ExtensionErrorListener = (error: ExtensionError) => void;
@@ -599,6 +633,7 @@ export class ExtensionRunner {
 		getAsyncJobSnapshot?: () => AsyncJobSnapshot | null,
 		hostInternalExtension?: HostInternalExtensionBinding,
 		getAsyncJobCounts?: () => AsyncJobCounts | null,
+		private readonly releaseManifest?: ContextReleaseManifest,
 	) {
 		this.#uiContext = noOpUIContext;
 		this.#getMemoryFn = getMemory;
@@ -1716,6 +1751,7 @@ export class ExtensionRunner {
 			if (!handlers || handlers.length === 0) continue;
 
 			for (const handler of handlers) {
+				const approvedSnapshot = this.releaseManifest ? serializedProviderPayload(currentPayload) : undefined;
 				const event: BeforeProviderRequestEvent = {
 					type: "before_provider_request",
 					payload: currentPayload,
@@ -1729,6 +1765,9 @@ export class ExtensionRunner {
 				);
 				if (handlerResult !== undefined) {
 					currentPayload = handlerResult;
+				}
+				if (approvedSnapshot !== undefined) {
+					assertApprovedProviderPayloadUnchanged(approvedSnapshot, currentPayload, ext.path);
 				}
 			}
 		}
@@ -1762,7 +1801,7 @@ export class ExtensionRunner {
 		systemPrompt: string[],
 	): Promise<BeforeAgentStartCombinedResult | undefined> {
 		const ctx = this.createContext();
-		const messages: NonNullable<BeforeAgentStartEventResult["message"]>[] = [];
+		const messages: NonNullable<BeforeAgentStartCombinedResult["messages"]> = [];
 		let currentSystemPrompt = systemPrompt;
 		let systemPromptModified = false;
 
@@ -1771,6 +1810,9 @@ export class ExtensionRunner {
 			if (!handlers || handlers.length === 0) continue;
 
 			for (const handler of handlers) {
+				if (this.releaseManifest && !(await isApprovedCandidateSource(ext.resolvedPath, this.releaseManifest))) {
+					throw new Error(`PROMPT_POLICY_REVIEW_REQUIRED: extension source is not approved: ${ext.path}`);
+				}
 				const event: BeforeAgentStartEvent = {
 					type: "before_agent_start",
 					prompt,
@@ -1788,9 +1830,14 @@ export class ExtensionRunner {
 				if (handlerResult) {
 					const result = handlerResult as BeforeAgentStartEventResult;
 					if (result.message) {
-						messages.push(result.message);
+						messages.push({ message: result.message, extensionPath: ext.resolvedPath });
 					}
 					if (result.systemPrompt !== undefined) {
+						assertApprovedPerTurnSystemPromptNotReplaced(
+							this.releaseManifest !== undefined,
+							result.systemPrompt,
+							ext.path,
+						);
 						currentSystemPrompt =
 							typeof result.systemPrompt === "string" ? [result.systemPrompt] : result.systemPrompt;
 						systemPromptModified = true;

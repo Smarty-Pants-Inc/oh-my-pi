@@ -34,6 +34,16 @@ describe("protected surface path classification", () => {
 			{ path: "packages/coding-agent/src/tools/bash-description.ts", surface: "tool-schema", kind: "changed" },
 		]);
 	});
+
+	it("classifies every nested compaction implementation path", () => {
+		expect(classifyProtectedPath("packages/agent/src/compaction/pipeline/dispatch.ts")).toEqual([
+			{
+				path: "packages/agent/src/compaction/pipeline/dispatch.ts",
+				surface: "provider-wrapper",
+				kind: "changed",
+			},
+		]);
+	});
 });
 
 describe("protected semantic manifest deltas", () => {
@@ -103,6 +113,20 @@ describe("protected semantic manifest deltas", () => {
 			"tool-description",
 			"tool-schema",
 		]);
+	});
+
+	it("protects implementation source and generated tool contract manifest fields", () => {
+		const result = diffProtectedSurface({
+			before: { implementationSources: [], toolSchemas: [] },
+			after: {
+				implementationSources: [{ path: "packages/agent/src/agent-loop.ts", sha256: "a" }],
+				toolSchemas: [{ id: "tool.ask", descriptionSha256: "b", schemaSha256: "c" }],
+			},
+		});
+
+		expect(new Set(result.classifications.map(change => change.surface))).toEqual(
+			new Set(["provider-wrapper", "tool-description", "tool-schema"]),
+		);
 	});
 
 	it("detects behavioral authority fields and does not block unrelated manifest metadata", () => {

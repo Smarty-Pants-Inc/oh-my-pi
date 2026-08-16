@@ -17,6 +17,32 @@ afterEach(async () => {
 });
 
 describe("SessionCapabilities", () => {
+	it("accepts a typed grant only during the current direct-user turn and records provenance", async () => {
+		const workspace = await tempDir("omp-session-workspace-");
+		const outside = await tempDir("omp-session-outside-");
+		const target = path.join(outside, "release.json");
+		const capabilities = new SessionCapabilities({ workspace });
+
+		expect(() => capabilities.grantFromCurrentDirectUserTurn({ kind: "writePath", value: target })).toThrow(
+			"current direct-user turn",
+		);
+		capabilities.beginDirectUserTurn("turn-1", "Write the approved release record");
+		const grant = capabilities.grantFromCurrentDirectUserTurn({ kind: "writePath", value: target });
+		expect(grant).toMatchObject({
+			turnId: "turn-1",
+			source: "direct_user_turn",
+			kind: "writePath",
+			value: `${fs.realpathSync.native(outside)}/release.json`,
+		});
+		expect(grant.userPromptSha256).toMatch(/^[a-f0-9]{64}$/);
+		expect(capabilities.decideWrite(target).outcome).toBe("allow");
+		capabilities.endTurn("turn-1");
+		expect(() =>
+			capabilities.grantFromCurrentDirectUserTurn({ kind: "externalCapability", value: "git.push" }),
+		).toThrow("current direct-user turn");
+		expect(capabilities.grantProvenance).toEqual([grant]);
+	});
+
 	it("allows workspace writes but requests a narrow grant for sibling and symlink escapes", async () => {
 		const parent = await tempDir("omp-session-capability-");
 		const workspace = path.join(parent, "work");
