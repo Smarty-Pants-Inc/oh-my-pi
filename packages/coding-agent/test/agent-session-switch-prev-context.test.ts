@@ -3069,17 +3069,24 @@ describe("AgentSession.switchSession previous-context build", () => {
 		};
 		session.agent.replaceQueues([retainedAdvisorCard], []);
 		let receiptSettled = false;
-		const receipt = session.yieldQueue.enqueueWithReceipt("advisor", {
-			note: "retained branch yield",
-			severity: "nit" as const,
-			advisor: undefined,
+		let receipt: Promise<void> | undefined;
+		const beginTransaction = session.yieldQueue.beginTransaction.bind(session.yieldQueue);
+		vi.spyOn(session.yieldQueue, "beginTransaction").mockImplementation(kind => {
+			if (kind === "advisor" && !receipt) {
+				receipt = session.yieldQueue.enqueueWithReceipt("advisor", {
+					note: "retained branch yield",
+					severity: "nit" as const,
+					advisor: undefined,
+				});
+				void receipt.then(
+					() => {
+						receiptSettled = true;
+					},
+					() => {},
+				);
+			}
+			return beginTransaction(kind);
 		});
-		void receipt.then(
-			() => {
-				receiptSettled = true;
-			},
-			() => {},
-		);
 		const advisorReset = vi.spyOn(SessionAdvisors.prototype, "resetSessionState");
 		const retainedAdvisorResetCalls = advisorReset.mock.calls.length;
 		const retainedEntries = sessionManager.getEntries().map(entry => entry.id);
@@ -3176,7 +3183,7 @@ describe("AgentSession.switchSession previous-context build", () => {
 
 		pendingAdvisor.release.resolve();
 		await pendingAdvisor.resumed;
-		await expect(receipt).resolves.toBeUndefined();
+		await expect(receipt!).resolves.toBeUndefined();
 		expect(receiptSettled).toBe(true);
 	});
 

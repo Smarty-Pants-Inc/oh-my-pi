@@ -4469,6 +4469,10 @@
       "sha256": "a6479d51c7fd2cd4674fc3dd447d217d04eed912b79b2163470ed307177654ab"
     },
     {
+      "path": "docs/tools/capability_grant.md",
+      "sha256": "820df164009745690e7b4b8d58d8a5ec645694c8949b753618bce2e1c9c6c577"
+    },
+    {
       "path": "docs/tools/checkpoint.md",
       "sha256": "4fc13f5681cbdc79eeac97151ee56e4f7a916051e81a82e3fde08bf5a64c299b"
     },
@@ -8446,7 +8450,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/agent-session.ts",
-      "sha256": "44ee5f3f729a5969360b127427cf58a5e1b6c10a88a58f0a9e5e7700713bf66b"
+      "sha256": "e834dcdc5e2fdc25c478b56fe4880f703151bbe09a04a3d699d7f6112e36586f"
     },
     {
       "path": "packages/coding-agent/src/session/agent-storage.ts",
@@ -10698,5 +10702,5 @@
     }
   ],
   "behaviorSha256": "0feede855f6d4a90131d3a02399acbc91464a432f9189e39082fd75f502a1194",
-  "rootSha256": "8465f0ce8f0d7dec4dbbb34c0098c4f48bdd0b034ef3d7dae3d8fc44fe4e12e4"
+  "rootSha256": "5b621c24daa8036cba7c9ed6ba11795e7fdef8d409ab3940325b028591b602ed"
 }

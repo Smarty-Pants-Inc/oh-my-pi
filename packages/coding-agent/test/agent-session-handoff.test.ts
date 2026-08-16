@@ -796,11 +796,11 @@ describe("AgentSession handoff", () => {
 			jobStatus: "completed",
 		});
 		await expect(advisorReceipt).resolves.toBeUndefined();
-		await expect(asyncReceipt!).rejects.toThrow("Yield queue entry became stale: async-result");
+		await expect(asyncReceipt!).resolves.toBeUndefined();
 		expect(advisorReceiptResolutions).toBe(1);
 		expect(advisorReceiptRejections).toBe(0);
-		expect(asyncReceiptResolutions).toBe(0);
-		expect(asyncReceiptRejections).toBe(1);
+		expect(asyncReceiptResolutions).toBe(1);
+		expect(asyncReceiptRejections).toBe(0);
 		await waitFor(() => deliveredContexts.some(context => context.includes(retainedFollowUpMarker)));
 		expect(deliveredContexts.some(context => context.includes(retainedFollowUpMarker))).toBe(true);
 		expect(session.getAutomaticTurnOutcomes()).toEqual(

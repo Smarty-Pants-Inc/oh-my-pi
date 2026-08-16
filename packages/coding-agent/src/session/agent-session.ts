@@ -6567,9 +6567,9 @@ export class AgentSession {
 			if (!streamingBehavior) throw new AgentBusyError();
 
 			for (const notice of keywordNotices) {
-				await this.#queueCustomMessage(notice, streamingBehavior);
+				await this.#queueCustomMessage(notice, streamingBehavior, undefined, false);
 			}
-			await this.#queueCustomMessage(message, streamingBehavior, options.queueChipText);
+			await this.#queueCustomMessage(message, streamingBehavior, options.queueChipText, false);
 			return;
 		}
 		if (this.isStreaming) {
@@ -7626,6 +7626,7 @@ export class AgentSession {
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "attribution">,
 		deliverAs: "steer" | "followUp",
 		queueChipText?: string,
+		scheduleIdleDrain = true,
 	): Promise<void> {
 		const details =
 			queueChipText !== undefined
@@ -7653,7 +7654,7 @@ export class AgentSession {
 		} else {
 			this.agent.steer(normalizedAppMessage);
 		}
-		this.#scheduleIdleQueueDrain();
+		if (scheduleIdleDrain) this.#scheduleIdleQueueDrain();
 	}
 	/** Override the receiver-state acceptance boundary in focused tests. */
 	setCustomMessageAcceptanceHookForTests(hook: (() => void) | undefined): void {
@@ -8256,9 +8257,9 @@ export class AgentSession {
 				lifecycle.markPublicationStarted();
 				await this.#extensionRunner.emitBeforeSessionMutation({ type: "session_switch" });
 			}
+			await this.#sessionBeforeSwitchReconciler?.();
 			await lifecycle.captureRetained({ capturePersistedSessionFile: true });
 			await this.abort({ goalReason: "internal", preserveToolChoice: true });
-			await this.#sessionBeforeSwitchReconciler?.();
 			await this.#bash.flushPending();
 			await this.sessionManager.flush();
 			await this.#advisors.drainAndDetachRecorders();
@@ -9313,9 +9314,9 @@ export class AgentSession {
 				lifecycle.markPublicationStarted();
 				await this.#extensionRunner.emitBeforeSessionMutation({ type: "session_switch" });
 			}
+			await this.#sessionBeforeSwitchReconciler?.();
 			await lifecycle.captureRetained({ capturePersistedSessionFile: true });
 			await this.abort({ goalReason: "internal", preserveToolChoice: true });
-			await this.#sessionBeforeSwitchReconciler?.();
 			await this.#bash.flushPending();
 			await this.sessionManager.flush();
 			await this.#advisors.drainAndDetachRecorders();

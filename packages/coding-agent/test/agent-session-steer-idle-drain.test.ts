@@ -101,6 +101,7 @@ describe("AgentSession steer idle drain", () => {
 	it("delivers a steer queued on an idle resumable session via continue()", async () => {
 		await createSession([{ role: "user", content: "hello", timestamp: Date.now() }, createAssistantMessage()]);
 		const continueSpy = vi.spyOn(session.agent, "continue").mockImplementation(async () => {
+			session.agent.emitExternalEvent({ type: "agent_start" });
 			session.agent.clearAllQueues();
 		});
 
@@ -115,6 +116,7 @@ describe("AgentSession steer idle drain", () => {
 	it("delivers successive idle steers after each successful drain", async () => {
 		await createSession([{ role: "user", content: "hello", timestamp: Date.now() }, createAssistantMessage()]);
 		const continueSpy = vi.spyOn(session.agent, "continue").mockImplementation(async () => {
+			session.agent.emitExternalEvent({ type: "agent_start" });
 			session.agent.clearAllQueues();
 		});
 
@@ -136,6 +138,7 @@ describe("AgentSession steer idle drain", () => {
 			createToolResultMessage(),
 		]);
 		const continueSpy = vi.spyOn(session.agent, "continue").mockImplementation(async () => {
+			session.agent.emitExternalEvent({ type: "agent_start" });
 			session.agent.clearAllQueues();
 		});
 
