@@ -33,7 +33,8 @@ metadata.
 
 | Source patch | Disposition | Reconstruction and proof |
 | --- | --- | --- |
-| `06e8550b3` fork foundation | Reimplemented | Compaction input budget, goal budget/exit rules, Mach-O repair, tests, and retained fork metadata in `701d41cc1`. Focused compaction, goal, and native-script tests pass. |
+| `06e8550b3` fork foundation | Reimplemented | Compaction input budget, goal budget/exit rules, Mach-O repair, tests, and retained fork instruction metadata in `701d41cc1`. Focused compaction, goal, and native-script tests pass. |
+| Fork-only `.gitignore` and package changelog edits | `DROP_OBSOLETE` | Scope admission found no Phase 1 requirement for these metadata deltas. `.gitignore`, `packages/agent/CHANGELOG.md`, and `packages/coding-agent/CHANGELOG.md` are restored byte-for-byte to upstream blobs `c4cea6ff0e9f3dc3e48b42bdd8856d2fb9c87160`, `f47be5dbb6f6a4fc505a5cfd2b87ed8a9a37f2c2`, and `4901d84f73388c60160c3cab32841414c7c1b7b2`. Runtime changes remain accounted for by their source-patch rows. |
 | `17a9926b6`, `5410c7d40` extension settlement | Reimplemented as one causal unit | In-flight follow-up ownership, before-`agent_end` settlement, stale-generation rejection, UI/runtime callers, and tests in `701d41cc1`. Extension runner/session tests pass. |
 | `ead22a62e`, `2d42042fc` stabilizer tests | Reapplied where the contract remains live | Native vector timeout and abort/deadline queue ownership assertions retained against current source. |
 | `5a50f0ee4` provider-neutral execution environments and Cloudflare adapter | Reimplemented | New Cloudflare package and current execution-environment seam in `701d41cc1`. Package check passes; 81 tests pass and the two opt-in real-service tests skip by contract. |

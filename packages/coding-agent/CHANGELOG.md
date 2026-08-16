@@ -70,13 +70,6 @@
 - Fixed external thinking being offered on xAI reasoning-only Responses models (grok-4 family) that reject `reasoning.effort`, where the private scratchpad ran alongside native reasoning instead of replacing it.
 - Fixed the extension tool-call handler timeout rendering outside a titled section in `/settings` by registering its Extensions group on the Tools tab.
 
-### Added
-
-- Added `pi.registerSystemPromptBuilder()` so one extension can replace the provider-facing base prompt on initial load and rebuilds while reusing OMP's stock renderer with a complete template set.
-
-### Fixed
-
-- Fixed stale todo lifecycle handling: guidance now distinguishes finished, blocked, abandoned, and obsolete tasks; completed subagent results bring blocked parent work into the next stop-time reconciliation; supported native providers, including Google, receive a named `todo` tool choice while owned/in-band dialects enforce it locally; read-only `todo view` calls no longer reset the drift reminder; and the interactive UI no longer writes fuzzy, non-persisted subagent matches into canonical todo state.
 ## [17.3.4] - 2026-08-14
 
 ### Changed
@@ -247,7 +240,6 @@
 - Removed the `resolveAgentModelSource` model-resolver export, whose only use was being fed to `resolveExplicitModelRole`. Replaced by `resolveAgentModelSelection`, which returns the expanded `patterns` and the pre-expansion `role` together so a spawn path cannot derive one without the other ([#7910](https://github.com/can1357/oh-my-pi/pull/7910) by [@enieuwy](https://github.com/enieuwy)).
 - A run is now attributed to the model that actually produced its output, not whichever model the session was last pointed at. A retry fallback that errored on its first request — an exhausted quota, a hard provider error — was credited with the whole run in the Agent Hub row and the settled task result, even when the previous model did every turn. Sessions expose the serving model directly, holding the last model that produced output while a candidate is armed but unproven, and transcript-derived history stops at the newest turn that produced output.
 
-
 ## [17.2.12] - 2026-08-08
 
 ### Fixed
@@ -311,7 +303,6 @@
 
 - Added a `--trusted-extension <absolute-path>` CLI flag to load an exact extension-module allowlist, bypassing ambient extension discovery.
 - Added resumable session details to fatal crash outputs, including a suggested `omp --resume <session-id>` command to quickly resume persisted live agent sessions.
-- Added Fresh's opt-in native-TUI companion for direct local interactive sessions: one-shot pre-dotenv capability gating; a singular host-internal extension; authenticated bounded status snapshots; exact work-identity and replay-bound cancel/snapshot commands; phase-checked lifecycle ownership; selected-side async publication; append-safe journals; and transaction-scoped artifact rollback.
 
 ### Changed
 
@@ -344,7 +335,6 @@
 - Fixed parsing of POSIX `$EDITOR` commands that contain quoted arguments or executable paths with spaces.
 - Fixed persisted Agent Hub rows losing the explicit caller model role when a subagent used a model override, preserving role provenance across restarts.
 - Fixed unobserved promise rejections in browser helpers (such as `tab.waitForResponse()`) causing tab workers to hang or crash.
-- Fresh companion snapshots now expose the exact live footer-loader message with grapheme-safe truncation, while sink-free sessions avoid loader traversal; cancellation coalesces across asynchronous abort teardown and shutdown publishes only committed authoritative state.
 
 ## [17.2.9] - 2026-08-05
 
@@ -363,7 +353,6 @@
 
 ### Fixed
 
-- Fixed extension commands queued as follow-up messages running before the active turn fully settled; they now execute serially after settlement, retain hidden next-turn work in pending-state checks, and reject stale commands after session replacement.
 - Retried concurrent-request caps with a short backoff without deleting valid Copilot credentials or rotating through sibling accounts.
 - Fixed the default `textVerbosity` setting being forwarded to OpenAI Codex requests unless the user explicitly configures it, preserving Codex's native response-control defaults. ([#4949](https://github.com/can1357/oh-my-pi/issues/4949))
 - Reduced streaming CPU usage by coalescing the cumulative `message_update` deltas of a turn at the event-controller dispatch boundary: at most one streaming-state rebuild runs per ~33ms window instead of one per token, cutting the per-token handler work that dominated the CPU profile of streaming sessions (especially at high token rates) while preserving per-delta speech output. Subscriber dispatch is serialized so a rapid stream tail (`message_update` → `message_end` → `agent_end`) cannot overtake the coalesced flush. ([#7443](https://github.com/can1357/oh-my-pi/issues/7443))
@@ -396,13 +385,6 @@
 - Fixed `omp setup python` to validate the same configured or discovered interpreter used by the Python eval runtime.
 - Fixed self-update misclassifying glibc Linux hosts with an installed musl loader as musl hosts, which could download an unusable musl binary instead of the glibc release.
 - Fixed a crash where opening the Agent Hub after a resume and moving the selection triggered an unbounded `ExtensionExitError` unhandled-rejection storm and exit 129. The postmortem module bound the native hard-exit at first evaluation; when the bundler deferred that evaluation into a `withHostGuard` window it froze the guard's throwing replacement, poisoning every later signal/fatal exit. The native exit is now resolved per call, and the guard stamps its replacement with the native primitive it shadows so mid-guard signals still exit ([#7393](https://github.com/can1357/oh-my-pi/issues/7393)).
-### Added
-
-- Added provider-neutral execution environments for explicit top-level isolated tasks, allowing extension-supplied workspaces to serve unchanged built-in `read`, `write`, and foreground non-PTY `bash` tools. The experimental `@oh-my-pi/cloud-omp-cloudflare` package supplies the first adapter.
-
-### Changed
-
-- Environment-backed isolation now synchronizes and releases the remote lease before existing capture/merge, blocks merge on sync or release failure, and never falls back to local file or process execution after a remote error.
 
 ## [17.2.8] - 2026-08-04
 
@@ -1088,10 +1070,6 @@
 - Fixed in-progress aborts awaiting `session_stop` extension handlers whose results would be discarded.
 - Fixed `/retry` reporting "Nothing to retry" after a stream stalled or aborted mid-tool-call.
 - Fixed locally consumed extension commands triggering automatic title generation and exposing their command text to the title model.
-
-### Changed
-
-- OMP goals now default to no token budget. `token_budget` is an opt-in cost/continuation ceiling, not a quality or performance setting; omit it or pass `null` when strict tool schemas require the field, and supply a positive integer only for a user-requested or task-defined stopping bound.
 
 ## [17.0.7] - 2026-07-21
 
