@@ -19,6 +19,48 @@ interface CliResult {
 	stderr: string;
 }
 
+function fixtureScopeCoverage(cwd: string): Array<{ path: string; requirement: string }> {
+	const result = Bun.spawnSync(["git", "diff", "--name-only", "-z", frozenUpstream, "HEAD"], {
+		cwd,
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	if (result.exitCode !== 0) throw new Error(result.stderr.toString());
+	return result.stdout
+		.toString()
+		.split("\0")
+		.filter(Boolean)
+		.sort()
+		.map(changedPath => ({
+			path: changedPath,
+			requirement: "§8.6 test fixture for the required expanded candidate schema.",
+		}));
+}
+
+async function writePolicyState(repositoryRoot: string, manifestModule: string): Promise<void> {
+	const policyStatePath = path.join(home, ".omp/policy-state.json");
+	const script = `
+		import { buildContextReleaseManifest } from ${JSON.stringify(manifestModule)};
+		const release = await buildContextReleaseManifest(${JSON.stringify(repositoryRoot)}, undefined, {
+			scopeCoverage: ${JSON.stringify(fixtureScopeCoverage(repositoryRoot))},
+		});
+		process.stdout.write(JSON.stringify(release));
+	`;
+	const child = Bun.spawnSync(["/usr/bin/env", Bun.which("bun") ?? process.execPath, "-e", script], {
+		cwd: repositoryRoot,
+		env: {
+			...Bun.env,
+			HOME: home,
+			USERPROFILE: home,
+			PI_CODING_AGENT_DIR: path.join(home, ".omp/agent"),
+		},
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	if (child.exitCode !== 0) throw new Error(child.stderr.toString());
+	await fs.writeFile(policyStatePath, child.stdout);
+}
+
 async function runCli(args: string[], blockNative: boolean, cwd = repository): Promise<CliResult> {
 	const command = ["/usr/bin/env", Bun.which("bun") ?? process.execPath];
 	if (blockNative) command.push("--preload", blockNativeImport);
@@ -125,6 +167,7 @@ beforeAll(async () => {
 			await fs.writeFile(path.join(skillDir, "SKILL.md"), `# ${name}\n`);
 		}),
 	]);
+	await writePolicyState(repository, path.join(repository, "packages/coding-agent/src/context/manifest.ts"));
 }, 30_000);
 
 afterAll(async () => {

@@ -14,7 +14,12 @@ import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { canonicalJson, type JsonValue, sha256 } from "@oh-my-pi/pi-coding-agent/context/canonical";
+import {
+	canonicalJson,
+	compareUnicodeCodePoints,
+	type JsonValue,
+	sha256,
+} from "@oh-my-pi/pi-coding-agent/context/canonical";
 import {
 	captureRuntimeContextEvidence,
 	isRuntimeContextEvidencePayload,
@@ -26,7 +31,10 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { ref } from "@oh-my-pi/pi-coding-agent/utils/git";
+import { diff } from "@oh-my-pi/pi-coding-agent/utils/git";
+
+const repository = path.resolve(import.meta.dir, "../../..");
+const scopeBase = "37eee71978951fccf66b21f7e3e2b74596ac9d74";
 
 describe("AgentSession before_agent_start typed provider context", () => {
 	let session: AgentSession;
@@ -147,9 +155,24 @@ describe("AgentSession before_agent_start typed provider context", () => {
 			return message.content.some(block => block.type === "text" && block.text === text);
 		});
 	}
+
+	async function writeReviewedPolicyState() {
+		const changedPaths = (await diff(repository, { base: scopeBase, head: "HEAD", nameOnly: true, z: true }))
+			.split("\0")
+			.filter(Boolean)
+			.sort(compareUnicodeCodePoints);
+		const release = await buildContextReleaseManifest(repository, undefined, {
+			scopeCoverage: changedPaths.map(changedPath => ({
+				path: changedPath,
+				requirement: "§8.6 test fixture for the required expanded candidate schema.",
+			})),
+		});
+		await fs.writeFile(path.join(fixtureHome, ".omp/policy-state.json"), `${JSON.stringify(release)}\n`);
+		return release;
+	}
+
 	it("binds release evidence to isolated global sources without ambient home files", async () => {
-		vi.spyOn(ref, "commitIdentity").mockResolvedValue({ commit: "0".repeat(40), tree: "1".repeat(40) });
-		const release = await buildContextReleaseManifest();
+		const release = await writeReviewedPolicyState();
 
 		expect(release.globalAgentsPath).toBe(path.join(fixtureHome, ".omp/agent/AGENTS.md"));
 		expect(release.globalAgentsPath).not.toBe(path.join(ambientHome, ".omp/agent/AGENTS.md"));
@@ -200,8 +223,7 @@ describe("AgentSession before_agent_start typed provider context", () => {
 	});
 
 	it("matches live explain order and rendered contracts to the same final guarded payload", async () => {
-		vi.spyOn(ref, "commitIdentity").mockResolvedValue({ commit: "0".repeat(40), tree: "1".repeat(40) });
-		const release = await buildContextReleaseManifest();
+		const release = await writeReviewedPolicyState();
 		const probeSchema = type({ query: "string" });
 		const probeTool: AgentTool<typeof probeSchema, undefined> = {
 			name: "context_probe",
@@ -363,8 +385,7 @@ describe("AgentSession before_agent_start typed provider context", () => {
 	});
 
 	it("retains guarded GitLab flow instructions and replaces start evidence with late contracts", async () => {
-		vi.spyOn(ref, "commitIdentity").mockResolvedValue({ commit: "0".repeat(40), tree: "1".repeat(40) });
-		const release = await buildContextReleaseManifest();
+		const release = await writeReviewedPolicyState();
 		createSession();
 		const gitlabModel: Model<"gitlab-duo-agent"> = buildModel({
 			id: "gitlab-explain-fixture",
@@ -469,7 +490,7 @@ describe("AgentSession before_agent_start typed provider context", () => {
 	});
 
 	it("does not reconstruct unsent compaction context before a provider request", async () => {
-		vi.spyOn(ref, "commitIdentity").mockResolvedValue({ commit: "0".repeat(40), tree: "1".repeat(40) });
+		await writeReviewedPolicyState();
 		createSession();
 		session.agent.replaceMessages([
 			{

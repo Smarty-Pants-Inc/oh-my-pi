@@ -12,6 +12,7 @@ interface CommandResult {
 
 const sourceRepository = path.resolve(import.meta.dir, "../../../..");
 const bun = Bun.which("bun") ?? process.execPath;
+const frozenUpstream = "37eee71978951fccf66b21f7e3e2b74596ac9d74";
 
 async function run(command: string[], cwd: string, env?: Record<string, string | undefined>): Promise<CommandResult> {
 	const outputDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-context-command-"));
@@ -41,6 +42,34 @@ async function requireSuccess(
 		throw new Error(`command failed (${result.exitCode}): ${command.join(" ")}\n${result.stderr}`);
 	}
 	return result.stdout;
+}
+
+async function writePolicyState(checkout: string, home: string): Promise<void> {
+	const paths = (await requireSuccess(["git", "diff", "--name-only", "-z", frozenUpstream, "HEAD"], checkout))
+		.split("\0")
+		.filter(Boolean)
+		.sort();
+	const manifestModule = path.join(checkout, "packages/coding-agent/src/context/manifest.ts");
+	const script = `
+		import { buildContextReleaseManifest } from ${JSON.stringify(manifestModule)};
+		const release = await buildContextReleaseManifest(${JSON.stringify(checkout)}, undefined, {
+			scopeCoverage: ${JSON.stringify(
+				paths.map(changedPath => ({
+					path: changedPath,
+					requirement: "§8.6 test fixture for the required expanded candidate schema.",
+				})),
+			)},
+		});
+		process.stdout.write(JSON.stringify(release));
+	`;
+	const result = await run([bun, "-e", script], checkout, {
+		...Bun.env,
+		HOME: home,
+		USERPROFILE: home,
+		PI_CODING_AGENT_DIR: path.join(home, ".omp/agent"),
+	});
+	if (result.exitCode !== 0) throw new Error(result.stderr);
+	await fs.writeFile(path.join(home, ".omp/policy-state.json"), result.stdout);
 }
 
 describe("clean-checkout native-free context CLI", () => {
@@ -78,6 +107,7 @@ describe("clean-checkout native-free context CLI", () => {
 					await fs.writeFile(path.join(skillDir, "SKILL.md"), `# ${name}\n`);
 				}),
 			]);
+			await writePolicyState(checkout, home);
 			const env = { ...Bun.env, HOME: home, USERPROFILE: home, NO_COLOR: "1" };
 			const cli = path.join(checkout, "packages/coding-agent/src/cli.ts");
 			const cliJson = async (args: string[]): Promise<Record<string, unknown>> =>
