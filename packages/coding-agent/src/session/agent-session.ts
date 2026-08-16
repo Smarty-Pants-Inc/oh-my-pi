@@ -776,6 +776,7 @@ export class AgentSession {
 	#inFlightBeforeAgentEndCallbacks: Array<() => void | Promise<void>> = [];
 	#inFlightSettledCallbacks: Array<() => void | Promise<void>> = [];
 	#inFlightSettling = false;
+	#ircWakeTasks = new Set<Promise<void>>();
 	#sessionStopHookActive = false;
 	readonly #automaticTurns = new AutomaticTurnAuthority();
 	readonly #capabilities: SessionCapabilities | undefined;
@@ -1003,7 +1004,7 @@ export class AgentSession {
 		const generation = this.#promptGeneration;
 		this.#beginInFlight();
 		let turnError: unknown;
-		void this.agent
+		const wakeTask = this.agent
 			.prompt(records)
 			.catch(error => {
 				turnError = error;
@@ -1032,6 +1033,14 @@ export class AgentSession {
 					}
 				});
 			});
+		this.#ircWakeTasks.add(wakeTask);
+		void wakeTask.finally(() => this.#ircWakeTasks.delete(wakeTask)).catch(() => {});
+	}
+
+	async #waitForIrcWakeTasks(): Promise<void> {
+		while (this.#ircWakeTasks.size > 0) {
+			await Promise.allSettled([...this.#ircWakeTasks]);
+		}
 	}
 
 	/** Remove advisor concern/blocker cards from the agent-core steer/follow-up
@@ -5351,8 +5360,10 @@ export class AgentSession {
 	/** Wait until streaming, event persistence, and deferred recovery work are fully settled. */
 	async waitForIdle(): Promise<void> {
 		await this.agent.waitForIdle();
+		await this.#waitForIrcWakeTasks();
 		await this.#advisors.waitForPendingCardEvents();
 		await this.#waitForPostPromptRecovery();
+		await this.#waitForIrcWakeTasks();
 	}
 	/**
 	 * Prevent advisor notes from starting hidden primary turns while a headless
@@ -7044,6 +7055,7 @@ export class AgentSession {
 		if (this.#queuedMessageDrainScheduled) return true;
 		if (this.#modeExitDrainSuppressionDepth > 0) return false;
 		if (
+			!this.isStreaming &&
 			this.agent.peekSteeringQueue().length === 0 &&
 			!this.#advisors.autoResumeSuppressed &&
 			!this.#canAutoContinueForFollowUp()

@@ -236,22 +236,20 @@ describe("AgentSession checkpoint rewind branch context", () => {
 		expect(mock.calls.length).toBe(3);
 		const finalCall = mock.calls[2];
 		if (!finalCall) throw new Error("Expected final post-rewind provider call");
-		const summaryIndex = finalCall.context.messages.findIndex(message => {
-			if (message.role !== "user") return false;
-			const text = messageText(message);
-			const openIndex = text.indexOf("<summary>");
-			const closeIndex = text.indexOf("</summary>", openIndex + "<summary>".length);
-			return (
-				openIndex >= 0 &&
-				closeIndex > openIndex + "<summary>".length &&
-				text.slice(openIndex + "<summary>".length, closeIndex).trim().length > 0
-			);
-		});
+		const summaryInstruction = finalCall.context.instructions?.find(
+			instruction => instruction.id === "agent.compaction.prompts.branch-summary-context",
+		);
+		expect(summaryInstruction?.role).toBe("internal_context");
+		const summaryText = summaryInstruction?.renderedText ?? "";
+		const openIndex = summaryText.indexOf("<summary>");
+		const closeIndex = summaryText.indexOf("</summary>", openIndex + "<summary>".length);
+		expect(openIndex).toBeGreaterThanOrEqual(0);
+		expect(closeIndex).toBeGreaterThan(openIndex + "<summary>".length);
+		expect(summaryText.slice(openIndex + "<summary>".length, closeIndex).trim().length).toBeGreaterThan(0);
 		const reportIndex = finalCall.context.messages.findIndex(
 			message => message.role === "developer" && messageText(message).includes(report),
 		);
-		expect(summaryIndex).toBeGreaterThan(-1);
-		expect(reportIndex).toBeGreaterThan(summaryIndex);
+		expect(reportIndex).toBeGreaterThan(-1);
 		const reportMessage = finalCall.context.messages[reportIndex];
 		if (!reportMessage) throw new Error("Expected rewind report context");
 		const reportText = messageText(reportMessage);

@@ -7,6 +7,24 @@ describe("protected surface path classification", () => {
 			{ path: "packages/coding-agent/src/prompts/system.md", surface: "prompt-content", kind: "changed" },
 		]);
 		expect(classifyProtectedPath("packages/coding-agent/src/utils/format.ts")).toEqual([]);
+		for (const unprotected of [
+			"packages/ai/src/providers/google-types.ts",
+			"packages/ai/src/dialect/types.ts",
+			"packages/hashline/src/types.ts",
+			"packages/coding-agent/src/capability/types.ts",
+			"packages/coding-agent/src/stt/asr-protocol.ts",
+			"packages/coding-agent/src/tiny/title-protocol.ts",
+			"packages/coding-agent/src/slash-commands/helpers/format.ts",
+			"packages/coding-agent/src/tools/renderers.ts",
+			"packages/coding-agent/src/tools/gh-types.ts",
+			"packages/coding-agent/src/utils/changelog.ts",
+			"packages/mnemopi/src/diagnose.ts",
+			"packages/utils/src/stderr-guard.ts",
+		]) {
+			expect(classifyProtectedPath(unprotected), `overclassified ordinary implementation: ${unprotected}`).toEqual(
+				[],
+			);
+		}
 	});
 
 	it("normalizes separators before classifying paths", () => {
@@ -53,6 +71,38 @@ describe("protected surface path classification", () => {
 			"provider-mapping",
 		]);
 		expect(classifyProtectedPath("packages/ai/src/utils.ts").map(item => item.surface)).toEqual(["provider-wrapper"]);
+		expect(classifyProtectedPath("packages/ai/src/auth-storage.ts").map(item => item.surface)).toEqual([
+			"provider-mapping",
+			"provider-wrapper",
+		]);
+		expect(classifyProtectedPath("packages/mnemopi/src/core/memory.ts").map(item => item.surface)).toEqual([
+			"provider-wrapper",
+		]);
+		expect(classifyProtectedPath("crates/pi-shell/src/minimizer/engine.rs").map(item => item.surface)).toEqual([
+			"provider-wrapper",
+			"tool-schema",
+		]);
+		expect(classifyProtectedPath("packages/utils/src/acp/connection.ts").map(item => item.surface)).toEqual([
+			"capability",
+			"provider-wrapper",
+			"tool-schema",
+		]);
+		expect(classifyProtectedPath("packages/coding-agent/src/export/ttsr.ts").map(item => item.surface)).toEqual([
+			"automatic-turn",
+			"behavior",
+			"capability",
+			"provider-wrapper",
+		]);
+		expect(
+			classifyProtectedPath("packages/coding-agent/src/modes/components/agent-transcript-viewer.ts").map(
+				item => item.surface,
+			),
+		).toEqual(["capability", "provider-wrapper", "subagent"]);
+		expect(
+			classifyProtectedPath("packages/coding-agent/src/modes/components/plan-review-overlay.ts").map(
+				item => item.surface,
+			),
+		).toEqual(["behavior", "prompt-content", "prompt-entry", "provider-wrapper"]);
 		expect(classifyProtectedPath("packages/agent/src/replay-policy.ts").map(item => item.surface)).toEqual([
 			"provider-wrapper",
 		]);
@@ -63,6 +113,7 @@ describe("protected surface path classification", () => {
 			"provider-wrapper",
 		]);
 		expect(classifyProtectedPath("packages/coding-agent/src/mcp/manager.ts").map(item => item.surface)).toEqual([
+			"provider-wrapper",
 			"tool-schema",
 		]);
 		expect(
@@ -79,6 +130,82 @@ describe("protected surface path classification", () => {
 		expect(
 			classifyProtectedPath("packages/coding-agent/src/context/implementation-sources.ts").map(item => item.surface),
 		).toEqual(["guard"]);
+		expect(
+			classifyProtectedPath("packages/coding-agent/src/session/todo-tracker.ts").map(item => item.surface),
+		).toEqual(["task", "todo"]);
+		expect(
+			classifyProtectedPath("packages/coding-agent/src/extensibility/extensions/wrapper.ts").map(
+				item => item.surface,
+			),
+		).toEqual(["tool-schema"]);
+		expect(
+			classifyProtectedPath("packages/coding-agent/src/extensibility/extensions/runner.ts").map(
+				item => item.surface,
+			),
+		).toEqual(["guard", "provider-wrapper"]);
+		expect(
+			classifyProtectedPath("packages/coding-agent/src/modes/skill-command.ts").map(item => item.surface),
+		).toEqual(["provider-wrapper", "skill"]);
+		expect(
+			classifyProtectedPath("packages/coding-agent/src/modes/acp/acp-agent.ts").map(item => item.surface),
+		).toEqual(["provider-wrapper", "skill"]);
+		expect(
+			classifyProtectedPath("packages/coding-agent/src/modes/rpc/host-tools.ts").map(item => item.surface),
+		).toEqual(["provider-wrapper", "tool-schema"]);
+		expect(
+			classifyProtectedPath("packages/coding-agent/src/slash-commands/builtin-modes.ts").map(item => item.surface),
+		).toEqual(["automatic-turn", "provider-wrapper"]);
+		expect(
+			classifyProtectedPath("packages/coding-agent/src/session/acp-permission-gate.ts").map(item => item.surface),
+		).toEqual(["approval"]);
+		expect(
+			classifyProtectedPath("packages/coding-agent/src/session/retry-fallback-chains.ts").map(item => item.surface),
+		).toEqual(["provider-mapping", "provider-wrapper"]);
+		expect(
+			classifyProtectedPath("packages/coding-agent/src/modes/controllers/todo-command-controller.ts").map(
+				item => item.surface,
+			),
+		).toEqual(["provider-wrapper", "todo"]);
+		expect(
+			classifyProtectedPath("packages/coding-agent/src/modes/components/custom-editor.ts").map(item => item.surface),
+		).toEqual(["capability", "provider-wrapper"]);
+		expect(
+			classifyProtectedPath("packages/coding-agent/src/slash-commands/helpers/todo.ts").map(item => item.surface),
+		).toEqual(["provider-wrapper", "task", "todo"]);
+		expect(classifyProtectedPath("packages/coding-agent/src/cli/plugin-cli.ts").map(item => item.surface)).toEqual([
+			"capability",
+			"configuration",
+			"provider-mapping",
+			"provider-wrapper",
+			"skill",
+			"tool-schema",
+		]);
+		expect(
+			classifyProtectedPath("packages/coding-agent/src/modes/components/hook-input.ts").map(item => item.surface),
+		).toEqual(["approval", "automatic-turn", "goal", "prompt-entry", "prompt-trigger", "provider-wrapper"]);
+		expect(
+			classifyProtectedPath("packages/coding-agent/src/slash-commands/helpers/mcp.ts").map(item => item.surface),
+		).toEqual(["capability", "configuration", "provider-wrapper", "tool-schema"]);
+		expect(
+			classifyProtectedPath("packages/coding-agent/src/modes/components/session-selector.ts").map(
+				item => item.surface,
+			),
+		).toEqual(["automatic-turn", "behavior", "prompt-target", "provider-wrapper"]);
+		expect(classifyProtectedPath("packages/agent/src/pause.ts").map(item => item.surface)).toEqual([
+			"automatic-turn",
+			"capability",
+		]);
+		expect(
+			classifyProtectedPath("packages/coding-agent/src/collab/local-transport.ts").map(item => item.surface),
+		).toEqual(["approval", "automatic-turn", "prompt-entry", "prompt-target", "provider-wrapper", "subagent"]);
+		expect(
+			classifyProtectedPath("packages/coding-agent/src/modes/fresh-omp-companion-wire.ts").map(item => item.surface),
+		).toEqual(["approval", "automatic-turn", "capability", "goal", "task", "todo"]);
+		expect(classifyProtectedPath("packages/natives/native/loader-state.js").map(item => item.surface)).toEqual([
+			"capability",
+			"provider-wrapper",
+			"tool-schema",
+		]);
 	});
 });
 
@@ -244,8 +371,8 @@ describe("protected semantic manifest deltas", () => {
 			["guard"],
 			["tool-schema"],
 			["automatic-turn"],
-			["automatic-turn"],
-			["capability"],
+			["automatic-turn", "provider-wrapper"],
+			["capability", "tool-schema"],
 			["guard"],
 		]);
 	});

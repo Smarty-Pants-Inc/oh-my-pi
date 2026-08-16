@@ -1826,7 +1826,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		).toBe(true);
 	});
 
-	it("runs owned ACP async completions despite deferred client turns", async () => {
+	it("persists owner-scoped ACP async completions without an open origin turn", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
 		const agent = new Agent({
@@ -1885,18 +1885,8 @@ describe("AgentSession concurrent prompt guard", () => {
 			await asyncJobManager.drainDeliveries({ timeoutMs: 1_000, filter: { ownerId } });
 			await session.waitForIdle();
 
-			expect(mock.calls).toHaveLength(callsAfterFirstPrompt + 1);
-			expect(
-				mock.calls.at(-1)?.context.messages.some(message => {
-					if (typeof message.content === "string") {
-						return message.content.includes("Background result");
-					}
-
-					return message.content.some(
-						content => content.type === "text" && content.text.includes("Background result"),
-					);
-				}),
-			).toBe(true);
+			expect(mock.calls).toHaveLength(callsAfterFirstPrompt);
+			expect(agent.state.messages.some(message => JSON.stringify(message).includes("Background result"))).toBe(true);
 		} finally {
 			jobGate.resolve();
 		}

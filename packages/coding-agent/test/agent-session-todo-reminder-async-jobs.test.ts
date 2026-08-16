@@ -154,7 +154,7 @@ describe("AgentSession todo reminder async-job deferral", () => {
 		vi.restoreAllMocks();
 	});
 
-	it("defers the reminder while an owned async job is running", async () => {
+	it("does not defer a terminal stop for an owned job without an open origin turn", async () => {
 		setIncompleteTodos();
 		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
 		registerGatedJob("Main");
@@ -164,7 +164,7 @@ describe("AgentSession todo reminder async-job deferral", () => {
 
 		expect(reminderAttempts).toEqual([]);
 		expect(continueSpy).not.toHaveBeenCalled();
-		expect(agentEndTerminalStates).toEqual([false]);
+		expect(agentEndTerminalStates).toEqual([true]);
 	});
 
 	it("never creates a todo reminder for a job owned by a different agent", async () => {
@@ -200,26 +200,26 @@ describe("AgentSession todo reminder async-job deferral", () => {
 		expect(reminderAttempts).toEqual([]);
 	});
 
-	it("defers the session_stop hook pass while an owned async job is running", async () => {
-		// No todo phases: the stop reaches the session_stop pass directly, and
-		// only the async-wake gate can defer it.
+	it("runs the session_stop hook for an owned job without an open origin turn", async () => {
+		// No todo phases: the stop reaches the session_stop pass directly. An
+		// unscoped job cannot defer or re-wake the model loop.
 		vi.spyOn(session.agent, "continue").mockResolvedValue();
 		registerGatedJob("Main");
 
 		emitTextOnlyStop();
 		await session.waitForIdle();
 
-		expect(extensionRunner.emitSessionStop).not.toHaveBeenCalled();
+		expect(extensionRunner.emitSessionStop).toHaveBeenCalledTimes(1);
 	});
 
-	it("invokes session_stop exactly once on the next stop after the owned job drains", async () => {
+	it("invokes session_stop on each stop around an unscoped owned job", async () => {
 		vi.spyOn(session.agent, "continue").mockResolvedValue();
 		const job = registerGatedJob("Main");
 
-		// Deferred while the job is in flight.
+		// The unscoped job does not defer the first stop.
 		emitTextOnlyStop();
 		await session.waitForIdle();
-		expect(extensionRunner.emitSessionStop).not.toHaveBeenCalled();
+		expect(extensionRunner.emitSessionStop).toHaveBeenCalledTimes(1);
 
 		job.resolve();
 		await manager.waitForAll();
@@ -228,6 +228,6 @@ describe("AgentSession todo reminder async-job deferral", () => {
 		emitTextOnlyStop();
 		await session.waitForIdle();
 
-		expect(extensionRunner.emitSessionStop).toHaveBeenCalledTimes(1);
+		expect(extensionRunner.emitSessionStop).toHaveBeenCalledTimes(2);
 	});
 });

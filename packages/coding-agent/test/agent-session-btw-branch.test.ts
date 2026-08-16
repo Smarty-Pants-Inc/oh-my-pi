@@ -287,10 +287,9 @@ describe("AgentSession.branchFromBtw", () => {
 		expect(fs.readFileSync(retainedSessionFile, "utf8")).toBe(retainedRaw);
 	});
 
-	it("rolls back a /btw branch before replaying retained running work and its queued receipt once", async () => {
+	it("rolls back a /btw branch before restoring retained running work once", async () => {
 		const asyncManager = new AsyncJobManager({ retentionMs: 60_000 });
 		const observedContexts: string[] = [];
-		let activeSession: AgentSession;
 		const failure = new Error("/btw async lifecycle fan-out failed");
 		const jobGate = Promise.withResolvers<string>();
 		const jobMarker = "/btw retained deferred owner job";
@@ -314,7 +313,7 @@ describe("AgentSession.branchFromBtw", () => {
 				},
 			),
 		} as unknown as ExtensionRunner;
-		activeSession = await createSession({
+		const activeSession = await createSession({
 			extensionRunner,
 			asyncJobManager: asyncManager,
 			handler: context => {
@@ -328,28 +327,6 @@ describe("AgentSession.branchFromBtw", () => {
 		await activeSession.sessionManager.flush();
 		const retainedLeafId = requiredLeafId(activeSession);
 
-		let receiptResolutions = 0;
-		let receiptRejections = 0;
-		let queuedReceipt: Promise<void> | undefined;
-		const queuedMarker = "/btw retained queued receipt";
-		const beginYieldTransaction = activeSession.yieldQueue.beginTransaction.bind(activeSession.yieldQueue);
-		vi.spyOn(activeSession.yieldQueue, "beginTransaction").mockImplementation(kind => {
-			if (kind === "async-result" && !queuedReceipt) {
-				queuedReceipt = activeSession.yieldQueue.enqueueWithReceipt<AsyncResultEntry>("async-result", {
-					jobId: "btw-retained-queued-receipt",
-					result: queuedMarker,
-					job: undefined,
-					durationMs: 0,
-					epoch: 0,
-				});
-				void queuedReceipt.then(
-					() => receiptResolutions++,
-					() => receiptRejections++,
-				);
-			}
-			return beginYieldTransaction(kind);
-		});
-
 		await expect(
 			activeSession.branchFromBtw(
 				"question",
@@ -360,17 +337,12 @@ describe("AgentSession.branchFromBtw", () => {
 		).rejects.toBe(failure);
 		expect(asyncManager.getJob(jobId)?.status).toBe("completed");
 		await activeSession.settleAsyncWork();
-		expect(queuedReceipt).toBeDefined();
-		await expect(queuedReceipt!).resolves.toBeUndefined();
-		expect(receiptResolutions).toBe(1);
-		expect(receiptRejections).toBe(0);
-		expect(observedContexts.filter(context => context.includes(jobMarker))).toHaveLength(1);
-		expect(observedContexts.filter(context => context.includes(queuedMarker))).toHaveLength(1);
+		expect(observedContexts.filter(context => context.includes(jobMarker))).toHaveLength(0);
+		expect(JSON.stringify(activeSession.agent.state.messages).split(jobMarker)).toHaveLength(2);
 		const callsAfterDelivery = observedContexts.length;
 		await activeSession.settleAsyncWork();
 		expect(observedContexts).toHaveLength(callsAfterDelivery);
-		expect(observedContexts.filter(context => context.includes(jobMarker))).toHaveLength(1);
-		expect(observedContexts.filter(context => context.includes(queuedMarker))).toHaveLength(1);
+		expect(JSON.stringify(activeSession.agent.state.messages).split(jobMarker)).toHaveLength(2);
 	});
 
 	it("commits a /btw branch by discarding retained running work and its queued receipt", async () => {

@@ -1,6 +1,12 @@
 import { describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { canonicalJson, type JsonValue, sha256 } from "../../src/context/canonical";
+import {
+	computeImplementationSources,
+	runtimeImportSpecifiersForImplementationSource,
+} from "../../src/context/implementation-sources";
 import {
 	activationStatePath,
 	approvedCandidateSourceMatches,
@@ -11,6 +17,7 @@ import {
 	trackedContentManifest,
 } from "../../src/context/manifest";
 import { exportRenderedToolContracts, parseGeneratedToolContracts } from "../../src/context/tool-contracts";
+import { classifyProtectedPath } from "../../src/policy/protected-surface";
 
 describe("tracked context manifest", () => {
 	it("uses the canonical activation state path and ignores environment decoys", () => {
@@ -157,6 +164,256 @@ describe("tracked context manifest", () => {
 		expect(
 			manifest.prompts.find(entry => entry.id === "agent.compaction.prompts.compaction-summary")?.target,
 		).toEqual(["side_model"]);
+	});
+
+	it("binds and classifies every checked model-visible transformer", async () => {
+		const repositoryRoot = path.resolve(import.meta.dir, "../../../..");
+		const sources = await computeImplementationSources(repositoryRoot);
+		const paths = new Set(sources.map(source => source.path));
+		const promptPaths = new Set(trackedContentManifest().prompts.map(prompt => prompt.path));
+		for (const required of [
+			"docs/approval-mode.md",
+			"crates/pi-natives/src/shell.rs",
+			"crates/pi-natives/src/fonts/Silver.ttf",
+			"crates/pi-shell/src/minimizer/engine.rs",
+			"crates/pi-shell/src/minimizer/defs/biome.toml",
+			"packages/agent/src/compaction.ts",
+			"packages/agent/src/proxy.ts",
+			"packages/agent/src/telemetry.ts",
+			"packages/ai/src/auth-storage.ts",
+			"packages/ai/src/dialect/anthropic.md",
+			"packages/ai/src/providers/google-antigravity-forced-tool.md",
+			"packages/ai/src/utils/tool-call-loop-guard.ts",
+			"packages/ai/src/usage/openai-codex-reset.ts",
+			"packages/catalog/src/discovery/cursor-gen/agent_pb.ts",
+			"packages/catalog/src/provider-models/descriptors.ts",
+			"packages/catalog/src/wire/codex.ts",
+			"packages/hashline/src/prompt.md",
+			"packages/mnemopi/src/core/beam/recall.ts",
+			"packages/mnemopi/src/core/memory.ts",
+			"packages/natives/native/desktop.js",
+			"packages/snapcompact/src/prompts/snapcompact-summary.md",
+			"packages/utils/src/acp/connection.ts",
+			"packages/utils/src/cli.ts",
+			"packages/utils/src/fetch-retry.ts",
+			"packages/utils/src/runtime-install.ts",
+			"packages/utils/src/tls-fetch.ts",
+			"packages/utils/src/turndown/service.ts",
+			"packages/coding-agent/src/discovery/agents-md.ts",
+			"packages/coding-agent/src/eval/completion-bridge.ts",
+			"packages/coding-agent/src/export/ttsr.ts",
+			"packages/coding-agent/src/extensibility/plugins/loader.ts",
+			"packages/coding-agent/src/extensibility/extensions/runner.ts",
+			"packages/coding-agent/src/extensibility/extensions/wrapper.ts",
+			"packages/coding-agent/src/extensibility/skills.ts",
+			"packages/coding-agent/src/goals/runtime.ts",
+			"packages/coding-agent/src/mcp/client.ts",
+			"packages/coding-agent/src/mcp/tool-cache.ts",
+			"packages/coding-agent/src/live/protocol.ts",
+			"packages/coding-agent/src/modes/acp/acp-agent.ts",
+			"packages/coding-agent/src/modes/components/agent-transcript-viewer.ts",
+			"packages/coding-agent/src/modes/components/extensions/types.ts",
+			"packages/coding-agent/src/modes/components/settings-defs.ts",
+			"packages/coding-agent/src/modes/components/hook-input.ts",
+			"packages/coding-agent/src/modes/components/session-selector.ts",
+			"packages/coding-agent/src/modes/components/extensions/state-manager.ts",
+			"packages/coding-agent/src/modes/components/plan-review-overlay.ts",
+			"packages/coding-agent/src/modes/components/settings-selector.ts",
+			"packages/coding-agent/src/modes/controllers/live-command-controller.ts",
+			"packages/coding-agent/src/modes/fresh-omp-companion-wire.ts",
+			"packages/coding-agent/src/modes/rpc/rpc-mode.ts",
+			"packages/coding-agent/src/modes/utils/context-usage.ts",
+			"packages/coding-agent/src/modes/utils/ui-helpers.ts",
+			"packages/coding-agent/src/modes/skill-command.ts",
+			"packages/coding-agent/src/secrets/obfuscator.ts",
+			"packages/coding-agent/src/session/async-job-delivery.ts",
+			"packages/coding-agent/src/session/provider-image-budget.ts",
+			"packages/coding-agent/src/session/session-context.ts",
+			"packages/coding-agent/src/session/session-stats.ts",
+			"packages/coding-agent/src/session/settings-stream-fn.ts",
+			"packages/coding-agent/src/session/todo-tracker.ts",
+			"packages/coding-agent/src/stt/asr-worker.ts",
+			"packages/coding-agent/src/stt/stt-controller.ts",
+			"packages/coding-agent/src/tiny/worker.ts",
+			"packages/coding-agent/src/tts/speech-enhancer.ts",
+			"packages/coding-agent/src/utils/image-loading.ts",
+			"packages/coding-agent/src/utils/mac-file-urls.applescript",
+			"packages/coding-agent/src/utils/shell-snapshot-fn-env.sh",
+			"packages/coding-agent/src/cli.ts",
+			"packages/coding-agent/src/cli/flag-tables.ts",
+			"packages/coding-agent/src/cli/plugin-cli.ts",
+			"packages/coding-agent/src/cli/session-picker.ts",
+			"packages/coding-agent/src/commands/setup.ts",
+			"packages/coding-agent/src/commands/launch.ts",
+			"packages/coding-agent/src/slash-commands/helpers/mcp.ts",
+			"packages/natives/native/loader-state.js",
+			"packages/utils/src/version.ts",
+			"crates/pi-natives/src/power.rs",
+		]) {
+			expect(paths.has(required), `missing model-visible implementation source: ${required}`).toBe(true);
+		}
+		for (const source of sources) {
+			expect(
+				classifyProtectedPath(source.path).length,
+				`unclassified model-visible implementation source: ${source.path}`,
+			).toBeGreaterThan(0);
+			if (!source.path.endsWith(".ts")) continue;
+			const sourceText = await Bun.file(path.join(repositoryRoot, source.path)).text();
+			for (const match of sourceText.matchAll(
+				/from\s+["']([^"']+\.(?:lark|md))["']\s+with\s*\{\s*type:\s*["']text["']\s*\}/g,
+			)) {
+				const importedPath = match[1];
+				if (!importedPath?.startsWith(".")) continue;
+				const resolved = path
+					.relative(repositoryRoot, path.resolve(repositoryRoot, path.dirname(source.path), importedPath))
+					.replaceAll(path.sep, "/");
+				expect(
+					paths.has(resolved) || promptPaths.has(resolved),
+					`unbound Markdown imported by model-visible source ${source.path}: ${resolved}`,
+				).toBe(true);
+			}
+			for (const match of sourceText.matchAll(
+				/from\s+["']([^"']+\.json)["']\s+with\s*\{\s*type:\s*["']json["']\s*\}/g,
+			)) {
+				const importedPath = match[1];
+				if (!importedPath?.startsWith(".")) continue;
+				const resolved = path
+					.relative(repositoryRoot, path.resolve(repositoryRoot, path.dirname(source.path), importedPath))
+					.replaceAll(path.sep, "/");
+				expect(
+					paths.has(resolved),
+					`unbound JSON imported by model-visible source ${source.path}: ${resolved}`,
+				).toBe(true);
+			}
+		}
+
+		for (const excluded of [
+			"packages/coding-agent/src/capability/types.ts",
+			"packages/coding-agent/src/cleanse/types.ts",
+			"packages/coding-agent/src/config/keybindings.ts",
+			"packages/coding-agent/src/dap/types.ts",
+			"packages/coding-agent/src/eval/types.ts",
+			"packages/coding-agent/src/extensibility/custom-tools/types.ts",
+			"packages/coding-agent/src/internal-urls/types.ts",
+			"packages/coding-agent/src/markit/types.ts",
+			"packages/coding-agent/src/plan-mode/state.ts",
+			"packages/coding-agent/src/stt/asr-protocol.ts",
+			"packages/coding-agent/src/tools/renderers.ts",
+			"packages/coding-agent/src/utils/changelog.ts",
+		]) {
+			expect(paths.has(excluded), `type-only source entered protected implementation inventory: ${excluded}`).toBe(
+				false,
+			);
+			expect(classifyProtectedPath(excluded)).toEqual([]);
+		}
+
+		for (const sourceRoot of ["packages/agent/src", "packages/ai/src", "packages/coding-agent/src"]) {
+			for await (const relativePath of new Bun.Glob("**/*.ts").scan({
+				cwd: path.join(repositoryRoot, sourceRoot),
+			})) {
+				const sourcePath = `${sourceRoot}/${relativePath}`;
+				const sourceText = await Bun.file(path.join(repositoryRoot, sourcePath)).text();
+				const importsModelCaller = [
+					...sourceText.matchAll(/import\s*\{([\s\S]*?)\}\s*from\s*["'][^"']+["']/g),
+				].some(match =>
+					/\b(?:Agent|completeSimple|instrumentedCompleteSimple|streamSimple)\b/.test(match[1] ?? ""),
+				);
+				const callsModel = /\b(?:new\s+Agent|completeSimple|instrumentedCompleteSimple|streamSimple)\s*\(/.test(
+					sourceText,
+				);
+				if (importsModelCaller && callsModel) {
+					expect(
+						paths.has(sourcePath),
+						`model request producer is absent from implementation inventory: ${sourcePath}`,
+					).toBe(true);
+				}
+			}
+		}
+	});
+
+	it("follows executable imports but not type-only or barrel-only edges", async () => {
+		expect(
+			runtimeImportSpecifiersForImplementationSource(`
+				import type { TypeOnly } from "./type-only";
+				import { type MixedType, runtimeValue } from "./runtime";
+				export { redirected } from "./barrel-only";
+				export type { ExportedType } from "./exported-type";
+				const deferred = import("./dynamic");
+				void runtimeValue;
+				void deferred;
+			`),
+		).toEqual(["./runtime", "./dynamic"]);
+
+		const repositoryRoot = path.resolve(import.meta.dir, "../../../..");
+		const paths = new Set((await computeImplementationSources(repositoryRoot)).map(source => source.path));
+		expect(paths.has("packages/coding-agent/src/cleanse/checkers.ts")).toBe(true);
+		expect(paths.has("packages/coding-agent/src/config/model-roles.ts")).toBe(true);
+		expect(paths.has("packages/coding-agent/src/extensibility/custom-tools/types.ts")).toBe(false);
+		expect(paths.has("packages/ai/src/usage.ts")).toBe(true);
+		expect(paths.has("packages/ai/src/usage/cursor.ts")).toBe(true);
+		expect(paths.has("packages/mnemopi/src/core/beam/types.ts")).toBe(false);
+		expect(paths.has("packages/mnemopi/src/diagnose.ts")).toBe(false);
+		expect(paths.has("packages/ai/src/providers/google-types.ts")).toBe(false);
+		expect(paths.has("packages/coding-agent/src/tiny/title-protocol.ts")).toBe(false);
+		expect(paths.has("packages/ai/src/dialect/types.ts")).toBe(false);
+		expect(paths.has("packages/hashline/src/types.ts")).toBe(false);
+		expect(paths.has("packages/coding-agent/generated/prompt-manifest.json")).toBe(false);
+		expect(paths.has("packages/coding-agent/generated/tool-contracts.json")).toBe(true);
+		expect(paths.has("packages/coding-agent/scripts/generate-prompt-manifest.ts")).toBe(false);
+		expect(classifyProtectedPath("packages/coding-agent/scripts/generate-prompt-manifest.ts")).toEqual([
+			{
+				path: "packages/coding-agent/scripts/generate-prompt-manifest.ts",
+				surface: "guard",
+				kind: "changed",
+			},
+		]);
+		expect(paths.has("packages/coding-agent/src/context/implementation-sources.ts")).toBe(true);
+		expect(paths.has("packages/coding-agent/src/context/manifest.ts")).toBe(true);
+		expect(paths.has("packages/utils/src/stderr-guard.ts")).toBe(false);
+		expect(paths.has("packages/utils/src/process-name.ts")).toBe(false);
+		expect(paths.has("packages/utils/src/color.ts")).toBe(false);
+	});
+
+	it("fails closed over new executable relative imports while bounding type and barrel edges", async () => {
+		const repositoryRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-implementation-sources-"));
+		const sourceRoot = path.join(repositoryRoot, "packages/agent/src");
+		const runtimeRoot = path.join(repositoryRoot, "packages/runtime");
+		await Promise.all([
+			fs.mkdir(sourceRoot, { recursive: true }),
+			fs.mkdir(path.join(runtimeRoot, "src"), { recursive: true }),
+		]);
+		try {
+			await Promise.all([
+				Bun.write(
+					path.join(sourceRoot, "agent.ts"),
+					'import type { TypeOnly } from "./type-only";\nimport { runtime } from "./runtime";\nimport { native } from "./native.js";\nimport { engine } from "@test/runtime/engine";\nexport { barrelOnly } from "./barrel-only";\nvoid runtime;\nvoid native;\nvoid engine;\n',
+				),
+				Bun.write(path.join(sourceRoot, "runtime.ts"), 'export const runtime = import("./dynamic");\n'),
+				Bun.write(path.join(sourceRoot, "dynamic.ts"), "export const dynamic = true;\n"),
+				Bun.write(path.join(sourceRoot, "native.js"), 'export const native = import("./nested-js");\n'),
+				Bun.write(path.join(sourceRoot, "nested-js.js"), "export const nested = true;\n"),
+				Bun.write(path.join(sourceRoot, "type-only.ts"), "export interface TypeOnly { value: string }\n"),
+				Bun.write(path.join(sourceRoot, "barrel-only.ts"), "export const barrelOnly = true;\n"),
+				Bun.write(
+					path.join(runtimeRoot, "package.json"),
+					JSON.stringify({ name: "@test/runtime", exports: { "./*": { import: "./src/*.ts" } } }),
+				),
+				Bun.write(path.join(runtimeRoot, "src/engine.ts"), 'export const engine = import("./nested");\n'),
+				Bun.write(path.join(runtimeRoot, "src/nested.ts"), "export const nested = true;\n"),
+			]);
+			const paths = (await computeImplementationSources(repositoryRoot)).map(source => source.path);
+			expect(paths).toEqual([
+				"packages/agent/src/agent.ts",
+				"packages/agent/src/dynamic.ts",
+				"packages/agent/src/native.js",
+				"packages/agent/src/nested-js.js",
+				"packages/agent/src/runtime.ts",
+				"packages/runtime/src/engine.ts",
+				"packages/runtime/src/nested.ts",
+			]);
+		} finally {
+			await fs.rm(repositoryRoot, { recursive: true, force: true });
+		}
 	});
 
 	it("requires normalized localeCompare-sorted implementation paths", () => {
