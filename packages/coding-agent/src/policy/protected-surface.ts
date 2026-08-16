@@ -91,10 +91,18 @@ const PATH_RULES: readonly PathRule[] = [
 		surface: "provider-wrapper",
 	},
 	{
-		pattern: /(?:^|\/)packages\/agent\/src\/(?:agent|append-only-context)\.[cm]?[jt]s$/i,
+		pattern: /(?:^|\/)packages\/agent\/src\/(?:agent|append-only-context|replay-policy)\.[cm]?[jt]s$/i,
 		surface: "provider-wrapper",
 	},
-	{ pattern: /(?:^|\/)packages\/catalog\/src\/identity\//i, surface: "provider-mapping" },
+	{
+		pattern: /(?:^|\/)packages\/catalog\/src\/(?:build|models)\.[cm]?[jt]s$/i,
+		surface: "provider-mapping",
+	},
+	{
+		pattern: /(?:^|\/)packages\/catalog\/src\/(?:compat|identity)\//i,
+		surface: "provider-mapping",
+	},
+	{ pattern: /(?:^|\/)packages\/catalog\/src\/models\.json$/i, surface: "provider-mapping" },
 	{ pattern: /(?:^|\/)src\/context\/(?:registry|prompt-sources\.generated)\.[cm]?[jt]s$/i, surface: "prompt-entry" },
 	{ pattern: /(?:^|\/)src\/context\/tool-contracts\.[cm]?[jt]s$/i, surface: "tool-schema" },
 	{ pattern: /(?:^|\/)src\/context\/smarty-skills\.[cm]?[jt]s$/i, surface: "provider-wrapper" },
@@ -102,6 +110,7 @@ const PATH_RULES: readonly PathRule[] = [
 		pattern: /(?:^|\/)packages\/ai\/src\/(?:context-instructions|types|index)\.[cm]?[jt]s$/i,
 		surface: "provider-mapping",
 	},
+	{ pattern: /(?:^|\/)packages\/ai\/src\/utils\.[cm]?[jt]s$/i, surface: "provider-wrapper" },
 	{
 		pattern: /(?:^|\/)packages\/ai\/src\/(?:dialect\/.*|stream|utils\/(?:schema\/.*|validation))\.[cm]?[jt]s$/i,
 		surface: "tool-schema",
@@ -113,7 +122,7 @@ const PATH_RULES: readonly PathRule[] = [
 	},
 	{
 		pattern:
-			/(?:^|\/)packages\/coding-agent\/src\/(?:secrets\/message-transform|session\/(?:session-handoff|snapcompact-inline))\.[cm]?[jt]s$/i,
+			/(?:^|\/)packages\/coding-agent\/src\/(?:secrets\/message-transform|session\/(?:messages|session-handoff|snapcompact-inline))\.[cm]?[jt]s$/i,
 		surface: "provider-wrapper",
 	},
 	{

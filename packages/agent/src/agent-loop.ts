@@ -1688,6 +1688,14 @@ async function streamAssistantResponse(
 
 	try {
 		return await runInActiveSpan(chatSpan, async () => {
+			const onPayload: AgentLoopConfig["onPayload"] =
+				promptToolWireTools && ownedDialect && config.onToolContracts
+					? async (payload, payloadModel) => {
+							const replacement = await config.onPayload?.(payload, payloadModel);
+							await config.onToolContracts?.({ tools: promptToolWireTools }, payloadModel ?? model);
+							return replacement;
+						}
+					: config.onPayload;
 			let response = await streamFunction(model, llmContext, {
 				...config,
 				apiKey,
@@ -1699,6 +1707,8 @@ async function streamAssistantResponse(
 				serviceTier: effectiveServiceTier,
 				cwd: effectiveCwd,
 				signal: finalRequestSignal,
+				onPayload,
+				onToolContracts: ownedDialect ? undefined : config.onToolContracts,
 				onResponse: captureOnResponse,
 			});
 			if (promptToolWireTools && ownedDialect) {

@@ -3293,17 +3293,24 @@ async function createAgentSessionScoped(
 				normalizePromptPath(sessionManager.getCwd()),
 			);
 		};
+		const captureRenderedToolContracts: NonNullable<SimpleStreamOptions["onToolContracts"]> = (payload, model) => {
+			if (!releaseManifest) return;
+			session?.setRenderedToolContracts(
+				exportRenderedToolContracts(payload, model, {
+					contentManifestRootSha256: releaseManifest.contentManifestRootSha256,
+					configurationSemanticSha256: releaseManifest.configurationSemanticSha256,
+				}),
+			);
+		};
+		const guardProviderPayload = async (payload: unknown, model?: Model) =>
+			await extensionRunner.emitBeforeProviderRequest(payload, model);
 		const onPayload = async (payload: unknown, model?: Model) => {
-			const finalPayload = await extensionRunner.emitBeforeProviderRequest(payload, model);
-			if (releaseManifest) {
-				session?.setRenderedToolContracts(
-					exportRenderedToolContracts(finalPayload, model, {
-						contentManifestRootSha256: releaseManifest.contentManifestRootSha256,
-						configurationSemanticSha256: releaseManifest.configurationSemanticSha256,
-					}),
-				);
-			}
+			const finalPayload = await guardProviderPayload(payload, model);
+			captureRenderedToolContracts(finalPayload, model);
 			return finalPayload;
+		};
+		const onToolContracts: SimpleStreamOptions["onToolContracts"] = async (payload, model) => {
+			captureRenderedToolContracts(payload, model);
 		};
 		const onResponse: SimpleStreamOptions["onResponse"] = async (response, model) => {
 			await extensionRunner.emitAfterProviderResponse(response, model);
@@ -3379,6 +3386,7 @@ async function createAgentSessionScoped(
 			cwdResolver: () => sessionManager.getCwd(),
 			convertToLlm: convertToLlmFinal,
 			onPayload,
+			onToolContracts,
 			onResponse,
 			sessionId: providerSessionId,
 			promptCacheKey: providerPromptCacheKey,
@@ -3589,7 +3597,7 @@ async function createAgentSessionScoped(
 			mcpManagerToolNames: initialMcpManagerToolNames,
 			transformContext,
 			transformProviderContext,
-			onPayload,
+			onPayload: guardProviderPayload,
 			onResponse,
 			sideStreamFn: settingsAwareStreamFn,
 			advisorStreamFn: settingsAwareStreamFn,
@@ -3932,7 +3940,7 @@ async function createAgentSessionScoped(
 		const runAutoLearnCapture = createAutoLearnCaptureRunner({
 			sourceAgent: agent,
 			captureTools: autoLearnCaptureTools,
-			onPayload,
+			onPayload: guardProviderPayload,
 			onResponse,
 			createAgent: captureOptions => {
 				const captureModel = captureOptions.initialState?.model;

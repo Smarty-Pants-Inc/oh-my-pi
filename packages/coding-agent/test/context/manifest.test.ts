@@ -105,8 +105,20 @@ describe("tracked context manifest", () => {
 		expect(result.exitCode, result.stderr.toString()).toBe(0);
 		expect((await assertTrackedManifestCurrent()).rootSha256).toBe(trackedContentManifest().rootSha256);
 		const manifest = trackedContentManifest();
-		expect(manifest.toolSchemas.map(tool => tool.id)).toContain("tool.ask");
-		expect(manifest.toolSchemas.map(tool => tool.id)).toContain("tool.capability_grant");
+		const toolIds = manifest.toolSchemas.map(tool => tool.id);
+		expect(toolIds).toContain("tool.ask");
+		expect(toolIds).toContain("tool.capability_grant");
+		for (const fixedRuntimeTool of [
+			"tool.generate_image",
+			"tool.tts",
+			"tool.vibe_kill",
+			"tool.vibe_list",
+			"tool.vibe_send",
+			"tool.vibe_spawn",
+			"tool.vibe_wait",
+		]) {
+			expect(toolIds).toContain(fixedRuntimeTool);
+		}
 		expect(manifest.prompts.map(prompt => prompt.path)).toContain(
 			"packages/agent/src/compaction/prompts/summarization-system.md",
 		);
@@ -116,6 +128,14 @@ describe("tracked context manifest", () => {
 		expect(manifest.implementationSources.some(entry => entry.path === "packages/ai/src/utils/schema/wire.ts")).toBe(
 			true,
 		);
+		expect(manifest.implementationSources.some(entry => entry.path === "packages/ai/src/utils.ts")).toBe(true);
+		for (const liveProviderInput of [
+			"packages/agent/src/replay-policy.ts",
+			"packages/catalog/src/compat/openai.ts",
+			"packages/coding-agent/src/session/messages.ts",
+		]) {
+			expect(manifest.implementationSources.some(entry => entry.path === liveProviderInput)).toBe(true);
+		}
 		expect(
 			manifest.implementationSources.some(entry => entry.path === "packages/ai/src/providers/openai-responses.ts"),
 		).toBe(true);

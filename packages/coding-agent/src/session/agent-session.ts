@@ -49,6 +49,7 @@ import {
 	type CompactionPreparation,
 	type CompactionResult,
 	calculatePromptTokens,
+	collectCompactionContextInstructions,
 	collectEntriesForBranchSummary,
 	estimateTokens,
 	generateBranchSummary,
@@ -4150,6 +4151,7 @@ export class AgentSession {
 
 	/** Explain exact runtime context when available and label all other dynamic sources as potential. */
 	async explainContext(options: { includeContent?: boolean } = {}): Promise<ContextExplanation> {
+		const target = this.#agentKind === "sub" ? "subagent" : "main";
 		const selectedSkills = this.agent.state.messages.flatMap((message, order) => {
 			if (message.role !== "custom" || message.customType !== "skill-prompt") return [];
 			const details = message.details;
@@ -4167,12 +4169,16 @@ export class AgentSession {
 		});
 		return await buildContextExplanation({
 			cwd: this.sessionManager.getCwd(),
-			target: this.#agentKind === "sub" ? "subagent" : "main",
+			target,
 			includeContent: options.includeContent,
 			provider: this.model?.provider,
 			model: this.model?.id,
+			wireModel: this.model,
 			runtime: {
-				instructions: this.buildProviderContextInstructions(),
+				instructions: [
+					...collectCompactionContextInstructions(this.agent.state.messages, target),
+					...this.buildProviderContextInstructions(),
+				],
 				selectedSkills,
 				mcpInstructions: this.#getMcpServerInstructionSources?.(),
 				renderedToolContracts: this.getRenderedToolContracts(),

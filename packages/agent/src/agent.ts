@@ -181,6 +181,8 @@ export interface AgentOptions {
 	 * Inspect or replace provider payloads before they are sent.
 	 */
 	onPayload?: SimpleStreamOptions["onPayload"];
+	/** Observe final tool definitions delivered outside the primary provider payload. */
+	onToolContracts?: SimpleStreamOptions["onToolContracts"];
 	/**
 	 * Inspect provider response metadata after headers arrive and before streaming body consumption.
 	 */
@@ -445,6 +447,7 @@ export class Agent {
 	#softToolRequirementState: NonNullable<AgentLoopConfig["softToolRequirementState"]> = { escalations: 0 };
 	#deferredToolChoice?: ToolChoice;
 	#onPayload?: SimpleStreamOptions["onPayload"];
+	#onToolContracts?: SimpleStreamOptions["onToolContracts"];
 	#onResponse?: SimpleStreamOptions["onResponse"];
 	#onSseEvent?: SimpleStreamOptions["onSseEvent"];
 	#onAssistantMessageEvent?: (message: AssistantMessage, event: AssistantMessageEvent) => void;
@@ -513,6 +516,7 @@ export class Agent {
 		this.#maxRetryDelayMs = opts.maxRetryDelayMs;
 		this.getApiKey = opts.getApiKey;
 		this.#onPayload = opts.onPayload;
+		this.#onToolContracts = opts.onToolContracts;
 		this.#onResponse = opts.onResponse;
 		this.#onSseEvent = opts.onSseEvent;
 		this.#getToolContext = opts.getToolContext;
@@ -1580,6 +1584,7 @@ export class Agent {
 			transformProviderContext: this.#transformProviderContext,
 			transformContext: this.#transformContext,
 			onPayload: this.#onPayload,
+			onToolContracts: this.#onToolContracts,
 			onResponse: this.#onResponse,
 			onSseEvent: this.#onSseEvent,
 			getApiKey: this.getApiKey,

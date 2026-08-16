@@ -227,11 +227,12 @@ async function manifestSession() {
 	};
 }
 
-/** Builds the tool-description and input-schema portion of the protected content manifest. */
-export async function buildToolContractManifest(): Promise<ToolContractManifestEntry[]> {
-	const [{ toolWireSchema }, { BUILTIN_TOOLS, HIDDEN_TOOLS }] = await Promise.all([
-		import("@oh-my-pi/pi-ai"),
+async function buildFixedToolRegistry(): Promise<Tool[]> {
+	const [{ BUILTIN_TOOLS, HIDDEN_TOOLS }, { imageGenTool }, { ttsTool }, { createVibeTools }] = await Promise.all([
 		import("../tools"),
+		import("../tools/image-gen"),
+		import("../tools/tts"),
+		import("../tools/vibe"),
 	]);
 	const session = await manifestSession();
 	const tools: Tool[] = [];
@@ -243,6 +244,16 @@ export async function buildToolContractManifest(): Promise<ToolContractManifestE
 		if (tool.name !== name) throw new Error(`tool factory ${name} produced ${tool.name}`);
 		tools.push(tool as Tool);
 	}
+	tools.push(imageGenTool as Tool, ttsTool as Tool, ...createVibeTools(session));
+	const names = tools.map(tool => tool.name);
+	if (new Set(names).size !== names.length) throw new Error("fixed tool registry contains duplicate names");
+	return tools;
+}
+
+/** Builds the tool-description and input-schema portion of the protected content manifest. */
+export async function buildToolContractManifest(): Promise<ToolContractManifestEntry[]> {
+	const { toolWireSchema } = await import("@oh-my-pi/pi-ai");
+	const tools = await buildFixedToolRegistry();
 	return tools
 		.map(tool => ({
 			id: `tool.${tool.name}`,
@@ -254,20 +265,8 @@ export async function buildToolContractManifest(): Promise<ToolContractManifestE
 
 /** Full canonical values used only by the generator to produce the native-free sidecar. */
 export async function buildToolContractSnapshot(): Promise<GeneratedToolContracts> {
-	const [{ toolWireSchema }, { BUILTIN_TOOLS, HIDDEN_TOOLS }] = await Promise.all([
-		import("@oh-my-pi/pi-ai"),
-		import("../tools"),
-	]);
-	const session = await manifestSession();
-	const tools: Tool[] = [];
-	for (const [name, factory] of Object.entries({ ...BUILTIN_TOOLS, ...HIDDEN_TOOLS }).sort(([left], [right]) =>
-		left.localeCompare(right),
-	)) {
-		const tool = await factory(session);
-		if (!tool) continue;
-		if (tool.name !== name) throw new Error(`tool factory ${name} produced ${tool.name}`);
-		tools.push(tool as Tool);
-	}
+	const { toolWireSchema } = await import("@oh-my-pi/pi-ai");
+	const tools = await buildFixedToolRegistry();
 	const contracts = tools
 		.map(tool => ({ id: `tool.${tool.name}`, description: tool.description, schema: toolWireSchema(tool) }))
 		.sort((left, right) => left.id.localeCompare(right.id));

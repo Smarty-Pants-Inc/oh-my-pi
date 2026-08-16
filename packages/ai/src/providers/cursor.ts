@@ -150,6 +150,7 @@ import {
 	parseStreamingJsonThrottled,
 	sanitizeText,
 } from "@oh-my-pi/pi-utils";
+import { mapContextInstructionsForModel } from "../context-instructions";
 import * as AIError from "../error";
 import type {
 	Api,
@@ -615,13 +616,23 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			const blobStore = conversationBlobStores.get(conversationId) ?? new Map<string, Uint8Array>();
 			conversationBlobStores.set(conversationId, blobStore);
 			const cachedState = conversationStateCache.get(conversationId);
-			const { requestBytes, conversationState } = buildGrpcRequest(model, context, options, {
+			const { requestBytes, conversationState } = await buildGrpcRequest(model, context, options, {
 				conversationId,
 				blobStore,
 				conversationState: cachedState,
 			});
 			conversationStateCache.set(conversationId, conversationState);
 			const requestContextTools = buildMcpToolDefinitions(context.tools);
+			await options?.onToolContracts?.(
+				{
+					tools: requestContextTools.map(definition => ({
+						name: definition.name,
+						description: definition.description,
+						parametersJsonSchema: toJson(ValueSchema, fromBinary(ValueSchema, definition.inputSchema)),
+					})),
+				},
+				model,
+			);
 
 			const baseUrl = model.baseUrl || CURSOR_API_URL;
 			const requestPath = "/agent.v1.AgentService/Run";
@@ -4316,8 +4327,19 @@ function findLastUserMessageIndex(messages: Message[]): number {
  * When no system prompts are provided, returns a single default greeting so we never emit
  * an empty `rootPromptMessagesJson` head.
  */
-export function buildCursorSystemPromptJsons(systemPrompt: readonly string[] | undefined): string[] {
-	const systemPrompts = normalizeSystemPrompts(systemPrompt);
+export function buildCursorSystemPromptJsons(
+	systemPrompt: readonly string[] | undefined,
+	instructions?: Context["instructions"],
+	model?: Model<"cursor-agent">,
+): string[] {
+	const systemPrompts = [
+		...normalizeSystemPrompts(systemPrompt),
+		...(model
+			? mapContextInstructionsForModel(instructions, model).map(instruction =>
+					instruction.renderedText.toWellFormed(),
+				)
+			: []),
+	];
 	if (systemPrompts.length === 0) {
 		return [JSON.stringify({ role: "system", content: "You are a helpful assistant." })];
 	}
@@ -4642,7 +4664,7 @@ function extractImages(content: (TextContent | ImageContent)[]) {
 		);
 }
 
-function buildGrpcRequest(
+async function buildGrpcRequest(
 	model: Model<"cursor-agent">,
 	context: Context,
 	options: CursorOptions | undefined,
@@ -4651,14 +4673,14 @@ function buildGrpcRequest(
 		blobStore: Map<string, Uint8Array>;
 		conversationState?: ConversationStateStructure;
 	},
-): {
+): Promise<{
 	requestBytes: Uint8Array;
 	blobStore: Map<string, Uint8Array>;
 	conversationState: ConversationStateStructure;
-} {
+}> {
 	const blobStore = state.blobStore;
 
-	const systemPromptIds = buildCursorSystemPromptJsons(context.systemPrompt).map(json =>
+	const systemPromptIds = buildCursorSystemPromptJsons(context.systemPrompt, context.instructions, model).map(json =>
 		storeCursorBlob(blobStore, new TextEncoder().encode(json)),
 	);
 
@@ -4761,7 +4783,7 @@ function buildGrpcRequest(
 		maxMode: cursorMaxMode,
 	});
 
-	const runRequest = create(AgentRunRequestSchema, {
+	let runRequest = create(AgentRunRequestSchema, {
 		conversationState,
 		action,
 		modelDetails,
@@ -4769,13 +4791,14 @@ function buildGrpcRequest(
 		conversationId: state.conversationId,
 	});
 
-	options?.onPayload?.(runRequest, model);
-
-	// Tools are sent later via requestContext (exec handshake)
-
 	if (options?.customSystemPrompt) {
 		runRequest.customSystemPrompt = options.customSystemPrompt;
 	}
+
+	const replacementPayload = await options?.onPayload?.(runRequest, model);
+	if (replacementPayload !== undefined) runRequest = replacementPayload as typeof runRequest;
+
+	// Tools are sent later via requestContext (exec handshake)
 
 	const clientMessage = create(AgentClientMessageSchema, {
 		message: { case: "runRequest", value: runRequest },

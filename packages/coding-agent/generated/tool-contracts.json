@@ -602,6 +602,111 @@
       }
     },
     {
+      "id": "tool.generate_image",
+      "description": "Generates/edits images.\n\n<instructions>\n- One detailed `subject` prompt: generation or editing.\n- Multiple `input`: describe each image's role in `subject` (e.g. `Image 1` for composition, `Image 2` for lighting).\n- Text: add \"sharp, legible, correctly spelled\"; keep short.\n</instructions>",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "subject": {
+            "type": "string",
+            "description": "main subject"
+          },
+          "action": {
+            "type": "string",
+            "description": "what subject is doing"
+          },
+          "scene": {
+            "type": "string",
+            "description": "location or environment"
+          },
+          "composition": {
+            "type": "string",
+            "description": "camera angle and framing"
+          },
+          "lighting": {
+            "type": "string",
+            "description": "lighting setup"
+          },
+          "style": {
+            "type": "string",
+            "description": "artistic style"
+          },
+          "text": {
+            "type": "string",
+            "description": "text to render"
+          },
+          "changes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "edits to make"
+          },
+          "aspect_ratio": {
+            "enum": [
+              "1:1",
+              "3:4",
+              "4:3",
+              "9:16",
+              "16:9",
+              "3:2",
+              "2:3"
+            ],
+            "type": "string",
+            "description": "aspect ratio"
+          },
+          "image_size": {
+            "enum": [
+              "1024x1024",
+              "1536x1024",
+              "1024x1536"
+            ],
+            "type": "string",
+            "description": "image size"
+          },
+          "input": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "input image path"
+                },
+                "data": {
+                  "type": "string",
+                  "description": "base64 image data"
+                },
+                "mime_type": {
+                  "type": "string",
+                  "description": "mime type"
+                }
+              },
+              "additionalProperties": false
+            },
+            "description": "input images"
+          },
+          "provider": {
+            "enum": [
+              "auto",
+              "openai",
+              "openai-codex",
+              "antigravity",
+              "xai",
+              "openrouter",
+              "gemini"
+            ],
+            "type": "string",
+            "description": "image provider for this request; overrides the providers.imageOrder setting (default: use the setting)"
+          }
+        },
+        "required": [
+          "subject"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
       "id": "tool.github",
       "description": "`gh` op wrapper: repos/files, PRs, search, checkout, push, Actions watch. Read issue/PR: `issue://<N>`/`pr://<N>`. PR diffs: `pr://<N>/diff` (files); `pr://<N>/diff/<i>` (file slice, 1-indexed); `pr://<N>/diff/all` (full).\n\n<instruction>\nSelect via `op`.\n- `repo_view`: omit `repo` → current checkout.\n- `file_read`: read `path` from `repo`; omit `repo` → current checkout, `branch` → default branch.\n- `pr_create`: `head` defaults current branch.\n- `pr_checkout`: PR(s) → dedicated git worktrees, never working tree; array `pr` batches multiple in one call.\n- `pr_push`: requires prior `op: pr_checkout`.\n- `search_issues`/`search_prs`/`search_commits`/`search_repos`: `query` optional with `since`/`until`; omit for date-only filter. `search_code`: `query` required; rejects `since`/`until`.\n- `search_*`: `repo` defaults current checkout's `owner/repo`; search elsewhere with `repo:`/`org:`/`user:` in `query`. `search_repos`: ignores `repo`; scope via `org:`/`language:` in `query`.\n- `since`/`until`: relative `<n>` + `m`/`h`/`d`/`w`/`mo`/`y` (e.g. `3d`, `2w`), ISO date `YYYY-MM-DD`, or ISO datetime. `dateField: \"updated\"`: update time (issues/PRs), push time (repos), never creation.\n- `run_watch`: omit `run` → every run for current HEAD; `branch` defaults current. Fast-fails first job failure.\n</instruction>\n\n<output>\nConcise summary per op. `run_watch` failures save full logs to a session artifact.\n</output>\n\n<critical>\nGitHub-hosted repository file: MUST use `file_read`; NEVER `curl`/`wget`.\n</critical>",
       "schema": {
@@ -1681,6 +1786,147 @@
       }
     },
     {
+      "id": "tool.tts",
+      "description": "Generate a speech audio file from text and write it to output_path. Two backends, selected by the providers.tts setting (auto|local|xai): local = on-device neural TTS (Kokoro-82M via the bundled ONNX runtime, no network, output is always WAV/PCM16; voice set by the tts.localVoice setting — af_heart (default), af_bella, af_nicole, af_aoede, af_kore, af_sarah, am_michael, am_fenrir, am_puck, bf_emma, bm_george, bm_fable); xai = xAI Grok Voice cloud (built-in voices: ara, eve (default), leo, rex, sal; custom voice IDs accepted; MP3 or WAV). auto prefers local, but routes an .mp3 request to xAI when credentials exist (only the cloud path emits MP3); otherwise an .mp3 path is written as a sibling .wav. xAI codec is inferred from the output_path suffix. Max 15,000 characters.",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 15000
+          },
+          "output_path": {
+            "type": "string"
+          },
+          "voice_id": {
+            "type": "string",
+            "default": "eve"
+          },
+          "language": {
+            "type": "string",
+            "default": "en"
+          },
+          "sample_rate": {
+            "type": "integer"
+          },
+          "bit_rate": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "text",
+          "output_path"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "id": "tool.vibe_kill",
+      "description": "Terminates worker session: aborts in-flight turn, if any; discards session. Conversation cannot continue; transcript remains readable at `history://<id>`.\n\nKill stuck, looping, or completed-workstream sessions. Free dead weight → legible roster.",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "session": {
+            "type": "string",
+            "minLength": 1,
+            "description": "session id to terminate"
+          }
+        },
+        "required": [
+          "session"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "id": "tool.vibe_list",
+      "description": "Worker-session roster: id, CLI flavor (`fast`/`good`), state (`starting`/`running`/`idle`/`dead`), model, turn count, queued messages, one-line gist of latest activity.\n\nUse to reorient: existing sessions, busy workers, idle workers ready for next instruction.",
+      "schema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    },
+    {
+      "id": "tool.vibe_send",
+      "description": "Send a worker session message by id from `vibe_spawn`/`vibe_list`. Session retains full conversation history; refer naturally (\"now do the same for the other module\").\n\nReturns immediately with an ack:\n- `turn`: worker idle → new turn; result self-delivers when done.\n- `steered`: worker mid-turn → message injected into the running turn as live steering.\n- `queued`: worker mid-turn and not currently steerable → message runs automatically as next turn.\n\nUse for follow-ups, corrections, scope changes, review requests. NEVER re-explain prior context; session already has it.",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "session": {
+            "type": "string",
+            "minLength": 1,
+            "description": "session id from vibe_spawn / vibe_list"
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1,
+            "description": "message for the session; steers mid-turn, else runs as its next turn"
+          }
+        },
+        "required": [
+          "session",
+          "message"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "id": "tool.vibe_spawn",
+      "description": "Starts persistent conversational coding-agent worker session (edit, bash, grep, everything).\n\nCLI flavor by task:\n- `fast`: low-latency model; mechanical, well-specified work (renames, boilerplate, running tests, data collection).\n- `good`: strong model; hard work (design, debugging, multi-file changes, judgment calls).\n\n`prompt`: first session instruction. Worker starts with NO context beyond it; include files, constraints, acceptance criteria.\n`name`: optional session label; otherwise generated.\n\nReturns session id immediately. On worker completion, turn result—activity trace + worker response—delivered automatically. Do not wait unless blocked; direct other sessions.\n\nSession persists after turn; remembers whole conversation. Same-workstream follow-up: `vibe_send`; NEVER spawn second session.",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "cli": {
+            "enum": [
+              "fast",
+              "good"
+            ],
+            "type": "string",
+            "description": "worker flavor: fast = low-latency model for mechanical work; good = strong model for hard work"
+          },
+          "prompt": {
+            "type": "string",
+            "minLength": 1,
+            "description": "first instruction; the worker starts with no other context"
+          },
+          "name": {
+            "type": "string",
+            "maxLength": 48,
+            "description": "optional session name; generated when omitted"
+          }
+        },
+        "required": [
+          "cli",
+          "prompt"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "id": "tool.vibe_wait",
+      "description": "Blocks until ONE watched session finishes its current turn, the timeout elapses, or you are interrupted — not until all finish. Re-issue to keep waiting.\n\nTurn results normally deliver themselves; you NEVER need this to receive output. Use it only when you are completely blocked and cannot direct any other session.\n\n- `sessions` — ids to watch. Omit to watch every session with a turn in flight.\n- `timeout` — seconds to wait (default 30).\n\nA finished turn's full result (activity trace + response) is returned here and will not be re-delivered separately.",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "sessions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "session ids to watch; omit to watch every session with a turn in flight"
+          },
+          "timeout": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "description": "max seconds to wait (default 30)"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    {
       "id": "tool.web_search",
       "description": "Web search: current information beyond knowledge cutoff.\n\n<instruction>\n- SHOULD prefer primary sources (papers, official docs); corroborate key claims with multiple sources.\n- MUST link cited sources in final response.\n- NEVER use for programmatically accessible content or known URLs (GitHub repos/issues, known arXiv papers, Wikipedia pages, official docs) — `read` URL directly.\n- `query`: every provider supports Google-style `site:`/`-site:`, `after:`/`before:` (`YYYY-MM-DD`), `inurl:`, `intitle:`, `filetype:`, `\"exact phrase\"`, `-term`, `OR`. Map constraints to native filters when available; otherwise filter results leniently. If a constraint matches nothing, relax and report it; do not return zero results.\n</instruction>",
       "schema": {
@@ -1808,5 +2054,5 @@
       }
     }
   ],
-  "rootSha256": "10b6cd352945fdd4dbfe0f62c32e3c49dc6b78a57d67530920d03a5492657aab"
+  "rootSha256": "466a5e129551ff1ea63b7b8998e60a40c3277a7ace63e7a6d3a2ca0cdf17afeb"
 }

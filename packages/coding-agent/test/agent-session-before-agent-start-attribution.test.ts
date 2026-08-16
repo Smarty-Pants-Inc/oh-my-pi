@@ -11,6 +11,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { ref } from "@oh-my-pi/pi-coding-agent/utils/git";
 
 describe("AgentSession before_agent_start typed provider context", () => {
 	let session: AgentSession;
@@ -143,5 +144,50 @@ describe("AgentSession before_agent_start typed provider context", () => {
 		expectTypedExtensionInstruction();
 		const llmMessages = convertToLlm(session.messages.filter(message => message.role !== "assistant"));
 		expect(inferCopilotInitiator(llmMessages)).toBe("agent");
+	});
+
+	it("includes active compaction context in the runtime explanation", async () => {
+		vi.spyOn(ref, "commitIdentity").mockResolvedValue({ commit: "0".repeat(40), tree: "1".repeat(40) });
+		createSession();
+		session.agent.replaceMessages([
+			{
+				role: "branchSummary",
+				summary: "exact branch summary evidence",
+				fromId: "branch-root",
+				timestamp: 1,
+			},
+			{
+				role: "compactionSummary",
+				summary: "exact compaction summary evidence",
+				tokensBefore: 42,
+				timestamp: 2,
+			},
+		]);
+
+		const explanation = await session.explainContext({ includeContent: true });
+		const branch = explanation.components.find(
+			component => component.id === "agent.compaction.prompts.branch-summary-context",
+		);
+		const compaction = explanation.components.find(
+			component => component.id === "agent.compaction.prompts.compaction-summary-context",
+		);
+
+		expect(branch).toMatchObject({
+			trigger: "compaction",
+			triggered: true,
+			effective: true,
+			availability: "effective",
+			actualRole: "system",
+		});
+		expect(branch?.content).toContain("exact branch summary evidence");
+		expect(compaction).toMatchObject({
+			trigger: "compaction",
+			triggered: true,
+			effective: true,
+			availability: "effective",
+			actualRole: "system",
+		});
+		expect(compaction?.content).toContain("exact compaction summary evidence");
+		expect(branch?.providerOrder).toBeLessThan(compaction?.providerOrder ?? -1);
 	});
 });

@@ -34,6 +34,7 @@ import type {
 	ResolvedOpenRouterCompat,
 } from "../types";
 import { applyCompatOverrides } from "./apply";
+import { resolveDeveloperRoleSupport } from "./developer-role";
 
 /** GLM coding-plan SKUs idle for minutes mid-reasoning; see `streamIdleTimeoutMs`. */
 const GLM_CODING_PLAN_MODEL_PATTERN = /(^|\/)glm-5(?:[.-]|$)/i;
@@ -480,7 +481,7 @@ export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): Resolv
 		// failed", Groq/Cerebras/etc. error or silently misroute. Default to `system` and require
 		// callers to opt in via `compat.supportsDeveloperRole: true` for hosts known to mirror
 		// OpenAI's reasoning-API surface.
-		supportsDeveloperRole: isOpenAIHost || isAzureHost,
+		supportsDeveloperRole: resolveDeveloperRoleSupport("openai-completions", spec),
 		supportsMultipleSystemMessages: supportsMultipleSystemMessagesDefault,
 		supportsReasoningEffort: !isGrok && !isXiaomiMimo && (!(isZai || isZhipu) || supportsZaiReasoningEffort),
 		// GitHub Copilot's chat-completions endpoint rejects reasoning params wholesale.
@@ -706,7 +707,7 @@ export function buildOpenAIResponsesCompat(spec: OpenAIResponsesSpecLike): Resol
 	const isXaiHost = modelMatchesHost({ provider: spec.provider, baseUrl }, "xai");
 
 	const compat: ResolvedOpenAIResponsesCompat = {
-		supportsDeveloperRole: isAzure || isOpenAIUrl || hostMatchesUrl(baseUrl, "githubCopilot"),
+		supportsDeveloperRole: resolveDeveloperRoleSupport("openai-responses", spec),
 		supportsStrictMode: isAzure || detectStrictModeSupport(spec.provider, baseUrl),
 		// Paid `xai` and SuperGrok `xai-oauth` share api.x.ai `/v1/responses`.
 		// Only the Grok effort-capable allowlist accepts `reasoning.effort`;

@@ -114,7 +114,7 @@ describe("clean-checkout native-free context CLI", () => {
 					"HEAD",
 					"--json",
 				]),
-				cliJson(["context", "explain", "--target", "main", "--provider", "openai-responses", "--json"]),
+				cliJson(["context", "explain", "--target", "main", "--provider", "openai", "--model", "gpt-5.6", "--json"]),
 			]);
 
 			expect(approvedManifest.rootSha256).toBe(manifest.rootSha256);
@@ -127,6 +127,11 @@ describe("clean-checkout native-free context CLI", () => {
 			expect(protectedDelta.classificationSha256).toMatch(/^[a-f0-9]{64}$/);
 			expect(Array.isArray(contentManifest.implementationSources)).toBe(true);
 			const components = explain.components as Array<Record<string, unknown>>;
+			expect(
+				components.some(
+					component => component.semanticRole === "internal_context" && component.actualRole === "developer",
+				),
+			).toBe(true);
 			expect(components.filter(component => String(component.id).startsWith("external.skill."))).toHaveLength(3);
 			expect(components.some(component => String(component.id).startsWith("external.mcp."))).toBe(true);
 			expect(

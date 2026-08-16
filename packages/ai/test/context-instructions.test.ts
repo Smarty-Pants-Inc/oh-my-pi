@@ -1,6 +1,11 @@
 import { describe, expect, it } from "bun:test";
-import { mapContextInstructions } from "@oh-my-pi/pi-ai/context-instructions";
-import type { ContextInstruction, ContextRole } from "@oh-my-pi/pi-ai/types";
+import {
+	mapContextInstructions,
+	mapContextInstructionsForModel,
+	supportsDeveloperRoleForContext,
+} from "@oh-my-pi/pi-ai/context-instructions";
+import type { ContextInstruction, ContextRole, ModelSpec } from "@oh-my-pi/pi-ai/types";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
 
 function instruction(role: ContextRole, renderedText: string): ContextInstruction {
 	return {
@@ -32,5 +37,26 @@ describe("context instruction mapping", () => {
 			"system",
 			"system",
 		]);
+	});
+
+	it("uses resolved model compatibility instead of provider-name inference", () => {
+		const model = buildModel({
+			id: "custom-openai-model",
+			name: "Custom OpenAI Model",
+			api: "openai-completions",
+			provider: "openai-compatible-without-developer-role",
+			baseUrl: "https://example.test/v1",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 8192,
+			compat: { supportsDeveloperRole: false },
+		} satisfies ModelSpec<"openai-completions">);
+
+		expect(supportsDeveloperRoleForContext(model)).toBe(false);
+		expect(
+			mapContextInstructionsForModel([instruction("internal_context", "internal text")], model)[0]?.actualRole,
+		).toBe("system");
 	});
 });

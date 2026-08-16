@@ -1,4 +1,4 @@
-import type { ContextInstruction, ContextRole } from "./types";
+import type { Api, ContextInstruction, ContextRole, Model } from "./types";
 
 export type ContextWireRole = "system" | "developer";
 
@@ -6,6 +6,30 @@ export type ContextWireRole = "system" | "developer";
 export interface MappedContextInstruction extends ContextInstruction {
 	actualRole: ContextWireRole;
 	providerOrder: number;
+}
+
+/** Exact provider compatibility used when selecting an instruction wire role. */
+export function supportsDeveloperRoleForContext<TApi extends Api>(
+	model: Pick<Model<TApi>, "api" | "compat">,
+	resolvedSupportsDeveloperRole?: boolean,
+): boolean {
+	if (model.api === "openai-codex-responses") return true;
+	if (
+		model.api !== "openai-completions" &&
+		model.api !== "openai-responses" &&
+		model.api !== "azure-openai-responses" &&
+		model.api !== "openrouter"
+	) {
+		return false;
+	}
+	if (resolvedSupportsDeveloperRole !== undefined) return resolvedSupportsDeveloperRole;
+	const compat: unknown = model.compat;
+	return (
+		typeof compat === "object" &&
+		compat !== null &&
+		"supportsDeveloperRole" in compat &&
+		compat.supportsDeveloperRole === true
+	);
 }
 
 /** Map semantic authority to a provider instruction channel, never a user channel. */
@@ -34,4 +58,12 @@ export function mapContextInstructions(
 		});
 	}
 	return mapped;
+}
+
+/** Map typed instructions with the same resolved policy used by the live provider. */
+export function mapContextInstructionsForModel<TApi extends Api>(
+	instructions: readonly ContextInstruction[] | undefined,
+	model: Pick<Model<TApi>, "api" | "compat">,
+): MappedContextInstruction[] {
+	return mapContextInstructions(instructions, supportsDeveloperRoleForContext(model));
 }

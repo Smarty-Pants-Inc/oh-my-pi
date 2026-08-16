@@ -4,7 +4,7 @@ import { resolveWireModelId } from "@oh-my-pi/pi-catalog/model-thinking";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import type { ResolvedOpenAICompat } from "@oh-my-pi/pi-catalog/types";
 import { $env, logger, parseStreamingJson, parseStreamingJsonThrottled } from "@oh-my-pi/pi-utils";
-import { mapContextInstructions } from "../context-instructions";
+import { mapContextInstructions, supportsDeveloperRoleForContext } from "../context-instructions";
 import { renderDemotedThinking } from "../dialect/demotion";
 import * as AIError from "../error";
 import { getKimiCommonHeaders } from "../registry/oauth/kimi";
@@ -664,12 +664,9 @@ const streamOpenAICompletionsOnce = (
 				: `${trimmedBaseUrl}/chat/completions`;
 			const createCompletionsStream = async (toolStrictModeOverride?: ToolStrictModeOverride) => {
 				const effectiveToolStrictModeOverride = disableStrictTools ? "none" : toolStrictModeOverride;
-				const { params, strictToolsApplied } = buildParams(
-					model,
-					context,
-					options,
-					effectiveToolStrictModeOverride,
-				);
+				const builtParams = buildParams(model, context, options, effectiveToolStrictModeOverride);
+				let params = builtParams.params;
+				const strictToolsApplied = builtParams.strictToolsApplied;
 				appliedStrictTools = strictToolsApplied;
 				const reasoningEffortFallbackKey = createOpenAIReasoningEffortFallbackKey(
 					"chat-completions",
@@ -683,8 +680,9 @@ const streamOpenAICompletionsOnce = (
 					applyOpenAIReasoningEffortFallback(params, requestReasoningEffortFallback);
 				}
 				activeReasoningEffortFallbackKey = reasoningEffortFallbackKey;
+				const replacementPayload = await options?.onPayload?.(params, model);
+				if (replacementPayload !== undefined) params = replacementPayload as OpenAICompletionsParams;
 				activeRequestParams = params;
-				options?.onPayload?.(params, model);
 				rawRequestDump = {
 					provider: model.provider,
 					api: output.api,
@@ -1891,9 +1889,10 @@ export function convertMessages(
 	const systemPrompts = normalizeSystemPrompts(context.systemPrompt);
 	const useDeveloperRole = model.reasoning && compat.supportsDeveloperRole;
 	const legacyRole: "developer" | "system" = useDeveloperRole ? "developer" : "system";
+	const supportsDeveloperContextRole = supportsDeveloperRoleForContext(model, compat.supportsDeveloperRole);
 	const instructionMessages: Array<{ role: "system" | "developer"; content: string }> = [
 		...systemPrompts.map(content => ({ role: legacyRole, content })),
-		...mapContextInstructions(context.instructions, compat.supportsDeveloperRole).map(instruction => ({
+		...mapContextInstructions(context.instructions, supportsDeveloperContextRole).map(instruction => ({
 			role: instruction.actualRole,
 			content: instruction.renderedText.toWellFormed(),
 		})),

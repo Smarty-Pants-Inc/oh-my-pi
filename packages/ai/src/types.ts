@@ -515,6 +515,12 @@ export interface StreamOptions {
 	 */
 	onPayload?: (payload: unknown, model?: Model<Api>) => unknown | undefined | Promise<unknown | undefined>;
 	/**
+	 * Observe the exact final tool definitions when they are delivered outside the
+	 * provider's primary request payload (for example, an owned prompt dialect or
+	 * Cursor's late request-context handshake).
+	 */
+	onToolContracts?: (payload: unknown, model?: Model<Api>) => void | Promise<void>;
+	/**
 	 * Optional callback for provider response metadata after headers are received.
 	 */
 	onResponse?: (response: ProviderResponseMetadata, model?: Model<Api>) => void | Promise<void>;

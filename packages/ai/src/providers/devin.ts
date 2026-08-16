@@ -29,6 +29,7 @@ import {
 } from "@oh-my-pi/pi-catalog/discovery/devin-gen/exa/codeium_common_pb/codeium_common_pb";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import { logger, parseStreamingJson, parseStreamingJsonThrottled } from "@oh-my-pi/pi-utils";
+import { mapContextInstructionsForModel } from "../context-instructions";
 import * as AIError from "../error";
 import type {
 	Api,
@@ -166,7 +167,10 @@ export const streamDevin: StreamFunction<"devin-agent"> = (
 			const apiKey = normalizeDevinSessionToken(options?.apiKey);
 			const auth = await fetchDevinAuthMetadata(apiKey, baseUrl, fetchImpl, options?.signal);
 			const chatBaseUrl = auth.baseUrl ?? baseUrl;
-			const request = buildDevinChatRequest(model, context, options, apiKey, auth.userJwt);
+			let request = buildDevinChatRequest(model, context, options, apiKey, auth.userJwt);
+			const replacementPayload = await options?.onPayload?.(request, model);
+			if (replacementPayload !== undefined) request = replacementPayload as typeof request;
+			await options?.onToolContracts?.({ tools: request.tools }, model);
 			const reqBytes = toBinary(GetChatMessageRequestSchema, request);
 			const gz = gzipSync(reqBytes);
 			logger.debug("devin: sending chat request", {
@@ -519,7 +523,12 @@ function buildDevinChatRequest(
 			extensionVersion: DEVIN_EXTENSION_VERSION,
 			locale: "en",
 		}),
-		prompt: normalizeSystemPrompts(context.systemPrompt).join("\n\n"),
+		prompt: [
+			...normalizeSystemPrompts(context.systemPrompt),
+			...mapContextInstructionsForModel(context.instructions, model).map(instruction =>
+				instruction.renderedText.toWellFormed(),
+			),
+		].join("\n\n"),
 		chatMessagePrompts: buildChatMessagePrompts(messages, cascadeId, model),
 		chatModelUid: options?.chatModelUid ?? model.requestModelId ?? model.id,
 		requestType: ChatMessageRequestType.CASCADE,

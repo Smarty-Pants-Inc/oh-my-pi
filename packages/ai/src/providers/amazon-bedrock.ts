@@ -11,7 +11,7 @@ import type { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { mapEffortToAnthropicAdaptiveEffort, requireSupportedEffort } from "@oh-my-pi/pi-catalog/model-thinking";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import { $flag, fetchWithRetry, parseStreamingJson, parseStreamingJsonThrottled } from "@oh-my-pi/pi-utils";
-import { mapContextInstructions } from "../context-instructions";
+import { mapContextInstructionsForModel } from "../context-instructions";
 import { renderDemotedThinking } from "../dialect/demotion";
 import * as AIError from "../error";
 import { resolveAwsBearerToken } from "../registry/aws";
@@ -343,9 +343,9 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 				if (tc.any || tc.tool) additionalModelRequestFields = undefined;
 			}
 
-			const commandInput: ConverseStreamRequest = {
+			let commandInput: ConverseStreamRequest = {
 				messages: convertedMessages,
-				system: buildSystemPrompt(context, promptCachePolicy),
+				system: buildSystemPrompt(context, promptCachePolicy, model),
 				inferenceConfig: {
 					maxTokens: options.maxTokens,
 					temperature: options.temperature,
@@ -354,7 +354,8 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 				toolConfig,
 				additionalModelRequestFields,
 			};
-			options?.onPayload?.(commandInput, model);
+			const replacementPayload = await options?.onPayload?.(commandInput, model);
+			if (replacementPayload !== undefined) commandInput = replacementPayload as ConverseStreamRequest;
 
 			const host = `bedrock-runtime.${region}.amazonaws.com`;
 			const url = `https://${host}/model/${encodeURIComponent(model.id)}/converse-stream`;
@@ -793,10 +794,11 @@ function supportsThinkingSignature(model: Model<"bedrock-converse-stream">): boo
 function buildSystemPrompt(
 	context: Pick<Context, "systemPrompt" | "instructions">,
 	promptCachePolicy: BedrockPromptCachePolicy,
+	model: Model<"bedrock-converse-stream">,
 ): SystemContent[] | undefined {
 	const prompts = [
 		...normalizeSystemPrompts(context.systemPrompt),
-		...mapContextInstructions(context.instructions, false).map(instruction =>
+		...mapContextInstructionsForModel(context.instructions, model).map(instruction =>
 			instruction.renderedText.toWellFormed(),
 		),
 	];

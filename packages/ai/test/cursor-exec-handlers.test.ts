@@ -455,6 +455,78 @@ describe("Cursor system prompt encoding", () => {
 		expect(jsons).toHaveLength(1);
 		expect(JSON.parse(jsons[0])).toEqual({ role: "system", content: "You are a helpful assistant." });
 	});
+
+	it("encodes typed internal context as a system blob and never a user blob", () => {
+		const jsons = buildCursorSystemPromptJsons(
+			["Primary instructions."],
+			[
+				{
+					id: "compaction.summary",
+					sourcePath: "packages/agent/src/compaction/prompt.md",
+					role: "internal_context",
+					target: "main",
+					trigger: "compaction",
+					sha256: "test-sha256",
+					renderedText: "Preserve this compacted history.",
+				},
+			],
+			cursorModel,
+		);
+
+		expect(jsons.map(json => JSON.parse(json))).toEqual([
+			{ role: "system", content: "Primary instructions." },
+			{ role: "system", content: "Preserve this compacted history." },
+		]);
+	});
+});
+
+describe("Cursor late tool contract evidence", () => {
+	it("awaits the exact request-context tool definitions before transport setup", async () => {
+		const { promise, resolve } = Promise.withResolvers<unknown>();
+		const stream = streamCursor(
+			cursorModel,
+			{
+				messages: [{ role: "user", content: "Use probe.", timestamp: 0 }],
+				tools: [
+					{
+						name: "probe",
+						description: "Probe a value",
+						parameters: {
+							type: "object",
+							properties: { value: { type: "string" } },
+							required: ["value"],
+						},
+					},
+				],
+			},
+			{
+				apiKey: "test-token",
+				onToolContracts: async payload => {
+					await Promise.resolve();
+					resolve(payload);
+					throw new Error("captured Cursor tool contracts");
+				},
+			},
+		);
+
+		const payload = (await promise) as {
+			tools?: Array<{ name?: unknown; description?: unknown; parametersJsonSchema?: unknown }>;
+		};
+		const result = await stream.result();
+		expect(payload.tools).toEqual([
+			{
+				name: "probe",
+				description: "Probe a value",
+				parametersJsonSchema: {
+					type: "object",
+					properties: { value: { type: "string" } },
+					required: ["value"],
+				},
+			},
+		]);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("captured Cursor tool contracts");
+	});
 });
 
 describe("Cursor request action encoding", () => {

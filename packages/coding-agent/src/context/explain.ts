@@ -1,8 +1,10 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ContextInstruction } from "@oh-my-pi/pi-ai";
-import { mapContextRole } from "@oh-my-pi/pi-ai/context-instructions";
+import type { Api, ContextInstruction, Model } from "@oh-my-pi/pi-ai";
+import { mapContextRole, supportsDeveloperRoleForContext } from "@oh-my-pi/pi-ai/context-instructions";
+import { resolveDeveloperRoleSupport } from "@oh-my-pi/pi-catalog/compat/developer-role";
+import bundledModels from "@oh-my-pi/pi-catalog/models.json" with { type: "json" };
 import { YAML } from "bun";
 import type { MCPServer } from "../capability/mcp";
 import { expandAtImports } from "../discovery/at-imports";
@@ -82,8 +84,53 @@ function counts(content: string): Pick<ExplainedComponent, "bytes" | "words" | "
 	return { bytes: Buffer.byteLength(content), words, estimatedTokens: Math.ceil(content.length / 4) };
 }
 
-function supportsDeveloperRole(provider: string): boolean {
-	return /(?:openai|azure|responses)/i.test(provider);
+type ExplainWireModel = Pick<Model<Api>, "provider" | "id" | "api" | "compat">;
+
+function resolveExplainWireModel(options: {
+	provider?: string;
+	model?: string;
+	wireModel?: Model;
+}): ExplainWireModel | undefined {
+	if (options.wireModel) {
+		if (options.provider !== undefined && options.provider !== options.wireModel.provider) {
+			throw new Error("context explain provider does not match the live wire model");
+		}
+		if (options.model !== undefined && options.model !== options.wireModel.id) {
+			throw new Error("context explain model does not match the live wire model");
+		}
+		return options.wireModel;
+	}
+	if (options.provider === undefined && options.model === undefined) return undefined;
+	if (options.provider === undefined || options.model === undefined) {
+		throw new Error("context explain requires --provider and --model together for exact wire-role mapping");
+	}
+	const providers = bundledModels as unknown as Record<string, Record<string, Record<string, unknown>>>;
+	const providerModels = providers[options.provider];
+	if (!providerModels) {
+		throw new Error(`context explain cannot resolve provider ${options.provider} from the bundled catalog`);
+	}
+	const spec = providerModels[options.model];
+	if (!spec || spec.provider !== options.provider || spec.id !== options.model || typeof spec.api !== "string") {
+		throw new Error(
+			`context explain cannot resolve model ${options.provider}/${options.model} from the bundled catalog`,
+		);
+	}
+	const api = spec.api as Api;
+	return {
+		provider: options.provider,
+		id: options.model,
+		api,
+		compat: {
+			supportsDeveloperRole: resolveDeveloperRoleSupport(api, {
+				provider: options.provider,
+				baseUrl: typeof spec.baseUrl === "string" ? spec.baseUrl : undefined,
+				compat:
+					typeof spec.compat === "object" && spec.compat !== null
+						? (spec.compat as { supportsDeveloperRole?: boolean })
+						: undefined,
+			}),
+		} as never,
+	};
 }
 
 function isWithin(parent: string, child: string): boolean {
@@ -324,12 +371,14 @@ export async function explainContext(options: {
 	includeContent?: boolean;
 	provider?: string;
 	model?: string;
+	wireModel?: Model;
 	runtime?: RuntimeContextEvidence;
 }): Promise<ContextExplanation> {
 	const cwd = options.cwd ?? process.cwd();
-	const provider = options.provider ?? "provider-unspecified";
-	const model = options.model ?? "model-unspecified";
-	const developerRole = supportsDeveloperRole(provider);
+	const wireModel = resolveExplainWireModel(options);
+	const provider = wireModel?.provider ?? "provider-unspecified";
+	const model = wireModel?.id ?? "model-unspecified";
+	const developerRole = wireModel ? supportsDeveloperRoleForContext(wireModel) : false;
 	const release = await buildContextReleaseManifest(cwd);
 	const approval = await approvalStatus(release);
 	const renderedToolContracts = options.runtime?.renderedToolContracts;

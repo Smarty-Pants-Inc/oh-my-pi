@@ -52,6 +52,16 @@ describe("protected surface path classification", () => {
 		expect(classifyProtectedPath("packages/ai/src/context-instructions.ts").map(item => item.surface)).toEqual([
 			"provider-mapping",
 		]);
+		expect(classifyProtectedPath("packages/ai/src/utils.ts").map(item => item.surface)).toEqual(["provider-wrapper"]);
+		expect(classifyProtectedPath("packages/agent/src/replay-policy.ts").map(item => item.surface)).toEqual([
+			"provider-wrapper",
+		]);
+		expect(classifyProtectedPath("packages/catalog/src/compat/openai.ts").map(item => item.surface)).toEqual([
+			"provider-mapping",
+		]);
+		expect(classifyProtectedPath("packages/coding-agent/src/session/messages.ts").map(item => item.surface)).toEqual([
+			"provider-wrapper",
+		]);
 		expect(classifyProtectedPath("packages/coding-agent/src/mcp/manager.ts").map(item => item.surface)).toEqual([
 			"tool-schema",
 		]);
