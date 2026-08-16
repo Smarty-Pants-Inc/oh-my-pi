@@ -632,7 +632,8 @@ function assertBashCapabilities(
 			assertBashExternalCapability(session, "github.pr");
 		}
 		const cwdDecision = session.capabilities.decideWrite(cwd);
-		const cwdIsWorkspace = cwdDecision.outcome === "allow" && cwdDecision.authority === "workspace";
+		const cwdIsWorkspace =
+			cwd === session.cwd || (cwdDecision.outcome === "allow" && cwdDecision.authority === "workspace");
 		if (!cwdIsWorkspace || commandNeedsGenericExternalCapability(command, tokens, cwd, env)) {
 			assertBashCommandCapability(session, command);
 		}
