@@ -347,6 +347,14 @@ describe("BashTool session capabilities", () => {
 				"gh pr merge -d",
 				"gh pr merge -ds",
 				"gh pr merge -sd",
+				"gh pr merge 123",
+				"gh pr merge 123 --squash",
+				"gh pr merge 123 -s",
+				"gh pr merge 123 --admin",
+				"gh pr merge 123 --auto",
+				"gh pr merge 123 --match-head-commit deadbeef",
+				"gh pr merge 123 --admin --squash",
+				"gh pr merge 123 && echo bypass",
 				"gh pr create --dry-run --head owner:branch --title title --body body",
 				"gh pr create --dry-run=true --head owner:branch --title title --body body",
 				"gh pr create --title title --body body",
@@ -429,7 +437,6 @@ describe("BashTool session capabilities", () => {
 				"gh pr create --head=owner:branch --title=title --body=body",
 				"gh pr create -H owner:branch -t title -b body",
 				"gh pr comment 123 --body body",
-				"gh pr merge 123 --squash --match-head-commit deadbeef",
 				"gh pr edit 123 --title title",
 			]) {
 				expect(await tool.execute(`allowed-${command}`, { command })).toBeDefined();

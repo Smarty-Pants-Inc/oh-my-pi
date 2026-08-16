@@ -231,23 +231,6 @@ const BASH_GITHUB_PR_OPTION_GRAMMARS = new Map<string, GithubPrOptionGrammar>([
 		},
 	],
 	["lock", { boolean: new Set(), value: new Set(["--reason", "-r"]) }],
-	[
-		"merge",
-		{
-			boolean: new Set(["--admin", "--auto", "--disable-auto", "--merge", "--rebase", "--squash", "-m", "-r", "-s"]),
-			value: new Set([
-				"--author-email",
-				"--body",
-				"--body-file",
-				"--match-head-commit",
-				"--subject",
-				"-A",
-				"-b",
-				"-F",
-				"-t",
-			]),
-		},
-	],
 	["ready", { boolean: new Set(["--undo"]), value: new Set() }],
 	["reopen", { boolean: new Set(), value: new Set(["--comment", "-c"]) }],
 	[

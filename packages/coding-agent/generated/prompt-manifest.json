@@ -9038,7 +9038,7 @@
     },
     {
       "path": "packages/coding-agent/src/tools/bash.ts",
-      "sha256": "422a00921aa3ec1fae1b71b6b1cc6acda38d55c392cedec0423193e58ee997d3"
+      "sha256": "b33d5e6cf77072fd7447cd244e17aaba6085e7385f5f60b036b25b80d3dc68a5"
     },
     {
       "path": "packages/coding-agent/src/tools/browser.ts",
@@ -10702,5 +10702,5 @@
     }
   ],
   "behaviorSha256": "0feede855f6d4a90131d3a02399acbc91464a432f9189e39082fd75f502a1194",
-  "rootSha256": "d1463ab6350bf142734b0ee827b058523f0f14e421c5e13a2564c979da2a3cbe"
+  "rootSha256": "f52a3aadeff0fa72669c5289b3dbc568932e2b978e69ef5845dbbe22a700c0ff"
 }
