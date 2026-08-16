@@ -234,7 +234,6 @@ const BASH_GITHUB_PR_OPTION_GRAMMARS = new Map<string, GithubPrOptionGrammar>([
 		},
 	],
 	["unlock", { boolean: new Set(), value: new Set() }],
-	["update-branch", { boolean: new Set(["--rebase"]), value: new Set() }],
 ]);
 const BASH_NAMED_EFFECT_ENV = new Set([
 	"GH_ENTERPRISE_TOKEN",
@@ -555,6 +554,7 @@ function githubPrArgsAreAllowed(args: readonly string[]): boolean {
 
 	let optionsEnded = false;
 	let explicitCreateHead = false;
+	let explicitReviewAction = false;
 	for (let index = 2; index < args.length; index++) {
 		const arg = args[index]!;
 		if (optionsEnded || !arg.startsWith("-")) continue;
@@ -562,7 +562,16 @@ function githubPrArgsAreAllowed(args: readonly string[]): boolean {
 			optionsEnded = true;
 			continue;
 		}
-		if (grammar.boolean.has(arg)) continue;
+		if (grammar.boolean.has(arg)) {
+			if (
+				args[1] === "review" &&
+				(arg === "--approve" || arg === "--request-changes" || arg === "-a" || arg === "-r")
+			) {
+				if (explicitReviewAction) return false;
+				explicitReviewAction = true;
+			}
+			continue;
+		}
 		if (grammar.value.has(arg) || arg === "-R" || arg === "--repo") {
 			if (index + 1 >= args.length) return false;
 			if ((arg === "-H" || arg === "--head") && args[index + 1]!.length > 0) explicitCreateHead = true;
@@ -581,7 +590,9 @@ function githubPrArgsAreAllowed(args: readonly string[]): boolean {
 		return false;
 	}
 	// GitHub documents that an explicit head skips gh's branch push/fork path.
-	return args[1] !== "create" || explicitCreateHead;
+	if (args[1] === "create") return explicitCreateHead;
+	if (args[1] === "review") return explicitReviewAction;
+	return true;
 }
 
 function resolveNamedEffectExecutable(name: "env" | "git" | "gh"): string | undefined {

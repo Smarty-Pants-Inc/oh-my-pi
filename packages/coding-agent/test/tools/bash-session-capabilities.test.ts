@@ -347,6 +347,13 @@ describe("BashTool session capabilities", () => {
 				"gh pr reopen 123 -c '@mergifyio dequeue'",
 				"gh pr review 123 --comment --body '@mergifyio queue default'",
 				"gh pr review 123 -c -b '@mergifyio dequeue'",
+				"gh pr review 123",
+				"gh pr review 123 --body body",
+				"gh pr review 123 --approve --request-changes",
+				"gh pr update-branch",
+				"gh pr update-branch --rebase",
+				"gh pr update-branch --rebase=true",
+				"gh pr update-branch --rebase && echo bypass",
 				"gh pr create --execute payload",
 				"gh pr create -x",
 				"gh pr create --draft=true",
@@ -450,6 +457,8 @@ describe("BashTool session capabilities", () => {
 				"gh pr create --head=owner:branch --title=title --body=body",
 				"gh pr create -H owner:branch -t title -b body",
 				"gh pr edit 123 --title title",
+				"gh pr review 123 --approve",
+				"gh pr review 123 --request-changes --body body",
 			]) {
 				expect(await tool.execute(`allowed-${command}`, { command })).toBeDefined();
 			}
