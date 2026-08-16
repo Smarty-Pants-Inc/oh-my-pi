@@ -29,7 +29,7 @@ export class CapabilityGrantTool implements AgentTool<typeof capabilityGrantSche
 		params: CapabilityGrantInput,
 	): Promise<AgentToolResult<CapabilityGrantProvenance>> {
 		try {
-			const details = this.session.capabilities?.grantFromCurrentDirectUserTurn(params);
+			const details = this.session.capabilities?.grantFromCurrentDirectUserTurn(params, this.session.cwd);
 			if (!details) throw new Error("session capability boundary is unavailable");
 			return { content: [{ type: "text", text: `Granted ${details.kind}: ${details.value}` }], details };
 		} catch (error) {

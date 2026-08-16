@@ -6310,7 +6310,7 @@
     },
     {
       "path": "packages/coding-agent/src/capability/session-capabilities.ts",
-      "sha256": "ef43f4c3e5789af6f49ed7e230ea99733d79085ffb299b294179c59454664d15"
+      "sha256": "5367d0b9a503694b6c2846e89134f7dc4a4491d604bedbbce92dee5dbd426d41"
     },
     {
       "path": "packages/coding-agent/src/capability/settings.ts",
@@ -9038,7 +9038,7 @@
     },
     {
       "path": "packages/coding-agent/src/tools/bash.ts",
-      "sha256": "7db7f8fa337d735494b837fb89d0d4f24ebbac9fc3f3f46f3a088b979b9d8895"
+      "sha256": "0964fc9405dd4ae5d58bf8d2efa69c97110ad0b5316b9f8934127080ce41aded"
     },
     {
       "path": "packages/coding-agent/src/tools/browser.ts",
@@ -9122,7 +9122,7 @@
     },
     {
       "path": "packages/coding-agent/src/tools/capability-grant.ts",
-      "sha256": "aa53d8da1e4be0d5eeacb69229110dcef6d4024b86e3467b52c97465adda519b"
+      "sha256": "ec8802a1e8e1f9ba0f75b6cf8a0eb9a059b89d5e1713772af2f7b065cae23e88"
     },
     {
       "path": "packages/coding-agent/src/tools/checkpoint.ts",
@@ -10702,5 +10702,5 @@
     }
   ],
   "behaviorSha256": "0feede855f6d4a90131d3a02399acbc91464a432f9189e39082fd75f502a1194",
-  "rootSha256": "f96f8e98e1593411d353dead5d1fa7f4c85bf11de2a2a02478723eda22f673f5"
+  "rootSha256": "d268f4ba054ff478590819dc0d0e2ea784531a752ba3d48eb32fc31bac8b8ea5"
 }

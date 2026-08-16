@@ -3,6 +3,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { SessionCapabilities } from "@oh-my-pi/pi-coding-agent/capability/session-capabilities";
+import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { CapabilityGrantTool } from "@oh-my-pi/pi-coding-agent/tools/capability-grant";
 
 const tempDirs: string[] = [];
 
@@ -131,6 +133,37 @@ describe("SessionCapabilities", () => {
 		});
 		expect(capabilities.isWorkspacePath(currentWorkspace, currentWorkspace)).toBe(true);
 		expect(capabilities.isWorkspacePath(initialWorkspace, currentWorkspace)).toBe(false);
+	});
+
+	it("resolves a capability_grant write path against the moved tool-session root", async () => {
+		const parent = await tempDir("omp-session-grant-move-");
+		const initialWorkspace = path.join(parent, "initial");
+		const currentWorkspace = path.join(parent, "moved", "current");
+		const outside = path.join(parent, "moved", "outside");
+		await Promise.all([
+			fs.promises.mkdir(initialWorkspace, { recursive: true }),
+			fs.promises.mkdir(currentWorkspace, { recursive: true }),
+			fs.promises.mkdir(outside, { recursive: true }),
+		]);
+		const relativeGrant = path.relative(currentWorkspace, path.join(outside, "release.json"));
+		const capabilities = new SessionCapabilities({ workspace: initialWorkspace });
+		capabilities.beginDirectUserTurn("turn-moved", "Grant the moved session output path");
+		const tool = new CapabilityGrantTool({ cwd: currentWorkspace, capabilities } as ToolSession);
+
+		const result = await tool.execute("grant-moved", { kind: "writePath", value: relativeGrant });
+		expect(result.details).toMatchObject({
+			turnId: "turn-moved",
+			kind: "writePath",
+			value: path.join(fs.realpathSync.native(outside), "release.json"),
+		});
+		expect(capabilities.decideWrite(relativeGrant, currentWorkspace)).toMatchObject({
+			outcome: "allow",
+			authority: "writeAllowlist",
+		});
+		expect(capabilities.decideWrite(path.resolve(initialWorkspace, relativeGrant), currentWorkspace)).toMatchObject({
+			outcome: "request",
+			reason: "outsideWorkspaceAndAllowlist",
+		});
 	});
 
 	it("requires exact named external capabilities and reuses explicit grants", async () => {

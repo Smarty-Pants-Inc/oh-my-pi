@@ -293,10 +293,18 @@ describe("BashTool session capabilities", () => {
 			const tool = new BashTool(
 				session(workspace, new SessionCapabilities({ workspace, externalCapabilities: ["git.push", "github.pr"] })),
 			);
+			expect(await tool.execute("direct-git-push", { command: "git push --dry-run" })).toBeDefined();
 
 			for (const command of [
 				"sh git push",
 				"sh gh pr create",
+				"git -c credential.helper=/tmp/payload push",
+				"git --config-env=credential.helper=PAYLOAD push",
+				"git -C .. push",
+				"git --git-dir ../outside/.git push",
+				"git --work-tree ../outside push",
+				"git --exec-path=/tmp push",
+				"git --namespace=other push",
 				`PATH=${attacker} git push`,
 				`PATH=${attacker} gh pr create`,
 				`BASH_ENV=${path.join(attacker, "startup")} gh pr create`,
@@ -363,6 +371,10 @@ describe("BashTool session capabilities", () => {
 			for (const command of [
 				"bun run test",
 				"bun test escape.test.ts",
+				"bun test ~/outside/escape.test.ts",
+				"bun test test/*.test.ts",
+				"bun test 'test/*.test.ts'",
+				"bun test test/{one,two}.test.ts",
 				`bun test --bail ${path.relative(workspace, outsideTest)}`,
 				`bun test --parallel ${path.relative(workspace, outsideTest)}`,
 				`bun test --timeout ${path.relative(workspace, outsideTest)}`,

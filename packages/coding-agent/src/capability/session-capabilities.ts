@@ -233,7 +233,10 @@ export class SessionCapabilities {
 	}
 
 	/** The structured model call is the authorization act; only a live direct-user turn may make it. */
-	grantFromCurrentDirectUserTurn(request: CapabilityGrantRequest): CapabilityGrantProvenance {
+	grantFromCurrentDirectUserTurn(
+		request: CapabilityGrantRequest,
+		currentWorkspace = this.#workspace,
+	): CapabilityGrantProvenance {
 		const turn = this.#directUserTurn;
 		if (
 			!turn ||
@@ -246,7 +249,7 @@ export class SessionCapabilities {
 		}
 		const value =
 			request.kind === "writePath"
-				? this.grantWritePath(request.value)
+				? this.grantWritePath(request.value, currentWorkspace)
 				: this.grantExternalCapability(request.value);
 		const record: CapabilityGrantProvenance = {
 			...turn,
@@ -260,8 +263,8 @@ export class SessionCapabilities {
 	}
 
 	/** Install a narrow path grant once; later decisions reuse it without another prompt. */
-	grantWritePath(filePath: string): string {
-		const grantedPath = canonicalPath(filePath, this.workspace);
+	grantWritePath(filePath: string, currentWorkspace = this.#workspace): string {
+		const grantedPath = canonicalPath(filePath, currentWorkspace);
 		this.#writeAllowlist.add(grantedPath);
 		return grantedPath;
 	}

@@ -414,23 +414,9 @@ function effectCommandIndex(tokens: readonly string[], env: Record<string, strin
 function commandHasGitPush(tokens: readonly string[], env?: Record<string, string>): boolean {
 	const gitIndex = effectCommandIndex(tokens, env);
 	if (gitIndex === undefined || tokens[gitIndex] !== "git") return false;
-	const args = tokens.slice(gitIndex + 1);
-	for (let index = 0; index < args.length; index++) {
-		const arg = args[index]!;
-		if (arg === "--") return args[index + 1] === "push";
-		if (!arg.startsWith("-")) return arg === "push";
-		if (
-			arg === "-C" ||
-			arg === "-c" ||
-			arg === "--git-dir" ||
-			arg === "--work-tree" ||
-			arg === "--namespace" ||
-			arg === "--config-env"
-		) {
-			index++;
-		}
-	}
-	return false;
+	// A named push grant authorizes the push subcommand, not Git's global
+	// config, repository, cwd, helper, or execution-path overrides.
+	return tokens[gitIndex + 1] === "push";
 }
 
 function commandHasGithubPrEffect(tokens: readonly string[], env?: Record<string, string>): boolean {
@@ -487,6 +473,7 @@ function bunTestIsKnownSafe(args: readonly string[], cwd: string): boolean {
 		}
 		if (
 			arg.startsWith("-") ||
+			/[~*?[\]{}$`]/u.test(arg) ||
 			path.isAbsolute(arg) ||
 			/^(?:[A-Za-z]:[\\/]|\\\\)/u.test(arg) ||
 			/(?:^|[\\/])\.\.(?:[\\/]|$)/u.test(arg) ||
