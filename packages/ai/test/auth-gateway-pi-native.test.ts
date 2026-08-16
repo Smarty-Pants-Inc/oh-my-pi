@@ -2,16 +2,20 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { type } from "@oh-my-pi/omptype";
 import { clearCustomApis } from "@oh-my-pi/pi-ai/api-registry";
 import { startAuthGateway } from "@oh-my-pi/pi-ai/auth-gateway";
 import { AuthStorage } from "@oh-my-pi/pi-ai/auth-storage";
 import { createMockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
+import { streamPiNative } from "@oh-my-pi/pi-ai/providers/pi-native-client";
 import { encodeStream, formatError, parseRequest } from "@oh-my-pi/pi-ai/providers/pi-native-server";
 import type {
+	Api,
 	AssistantMessage,
 	AssistantMessageEvent,
 	AssistantMessageEventStream,
 	Context,
+	Model,
 	Usage,
 } from "@oh-my-pi/pi-ai/types";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
@@ -252,6 +256,77 @@ describe("pi-native parseRequest", () => {
 });
 
 describe("pi-native gateway cache controls", () => {
+	it("delivers the guarded replacement context and options to server-side streamSimple", async () => {
+		registerMockApi();
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gw-pi-native-guard-"));
+		const storage = await AuthStorage.create(path.join(dir, "auth.db"));
+		storage.setRuntimeApiKey("openrouter", "provider-key");
+		const mock = createMockModel({ provider: "openrouter", id: "pi-native-guard" });
+		const handle = startAuthGateway({
+			bind: "127.0.0.1:0",
+			bearerTokens: ["gateway-token"],
+			storage,
+			resolveModel: () => mock,
+			version: "test",
+		});
+
+		try {
+			mock.push({ content: ["ok"] });
+			const clientModel = {
+				id: mock.id,
+				name: mock.name,
+				api: mock.api,
+				provider: mock.provider,
+				baseUrl: handle.url,
+				reasoning: mock.reasoning,
+				input: mock.input,
+				cost: mock.cost,
+				contextWindow: mock.contextWindow,
+				maxTokens: mock.maxTokens,
+				compat: mock.compat,
+				transport: "pi-native" as const,
+			} satisfies Model<Api>;
+			const replacementContext: Context = {
+				systemPrompt: ["replacement system"],
+				messages: [{ role: "user", content: "replacement user", timestamp: 1 }],
+				tools: [
+					{
+						name: "replacement_tool",
+						description: "Replacement tool.",
+						parameters: type({ value: type("string") }),
+					},
+				],
+			};
+			let observedContracts: unknown;
+
+			await streamPiNative(clientModel, baseContext, {
+				apiKey: "gateway-token",
+				onPayload: async payload => {
+					await Promise.resolve();
+					return {
+						...(payload as Record<string, unknown>),
+						context: replacementContext,
+						options: { maxTokens: 37, statefulResponses: false },
+					};
+				},
+				onToolContracts: async payload => {
+					await Promise.resolve();
+					observedContracts = payload;
+				},
+			}).result();
+
+			expect(mock.calls).toHaveLength(1);
+			expect(mock.calls[0]?.context).toEqual(JSON.parse(JSON.stringify(replacementContext)));
+			expect(mock.calls[0]?.options).toMatchObject({ maxTokens: 37, statefulResponses: false });
+			expect(observedContracts).toEqual({ tools: replacementContext.tools });
+		} finally {
+			await handle.close();
+			storage.close();
+			await fs.rm(dir, { recursive: true, force: true });
+			clearCustomApis();
+		}
+	});
+
 	it("delivers statefulResponses false to the provider stream", async () => {
 		registerMockApi();
 		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gw-pi-native-cache-"));

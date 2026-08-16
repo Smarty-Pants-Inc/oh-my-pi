@@ -416,6 +416,38 @@ describe("tracked context manifest", () => {
 		}
 	});
 
+	it("hashes implementation sources as exact bytes", async () => {
+		const repositoryRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-implementation-source-bytes-"));
+		const fontPath = path.join(repositoryRoot, "crates/pi-natives/src/fonts/Silver.ttf");
+		const firstBytes = new Uint8Array([0x80]);
+		const secondBytes = new Uint8Array([0x81]);
+		try {
+			await Promise.all([
+				fs.mkdir(path.join(repositoryRoot, "packages/agent/src"), { recursive: true }),
+				fs.mkdir(path.dirname(fontPath), { recursive: true }),
+			]);
+			await Promise.all([
+				Bun.write(path.join(repositoryRoot, "packages/agent/src/agent.ts"), "export {};\n"),
+				Bun.write(fontPath, firstBytes),
+			]);
+			expect(new TextDecoder().decode(firstBytes)).toBe(new TextDecoder().decode(secondBytes));
+			const firstHash = (await computeImplementationSources(repositoryRoot)).find(
+				source => source.path === "crates/pi-natives/src/fonts/Silver.ttf",
+			)?.sha256;
+
+			await Bun.write(fontPath, secondBytes);
+			const secondHash = (await computeImplementationSources(repositoryRoot)).find(
+				source => source.path === "crates/pi-natives/src/fonts/Silver.ttf",
+			)?.sha256;
+
+			expect(firstHash).toBe(sha256(firstBytes));
+			expect(secondHash).toBe(sha256(secondBytes));
+			expect(secondHash).not.toBe(firstHash);
+		} finally {
+			await fs.rm(repositoryRoot, { recursive: true, force: true });
+		}
+	});
+
 	it("requires normalized localeCompare-sorted implementation paths", () => {
 		const manifest = trackedContentManifest();
 		const nonAscii = [

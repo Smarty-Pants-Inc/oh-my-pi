@@ -85,7 +85,7 @@ describe("AgentSession owner-routed async delivery", () => {
 		expect(agent.state.messages.some(message => JSON.stringify(message).includes("ALL GREEN"))).toBe(true);
 	});
 
-	it("keeps only the exact open origin eligible and closes it at assistant final", async () => {
+	it("keeps the exact origin eligible through recovery and closes it before prompt return", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const providerGate = Promise.withResolvers<void>();
 		const mock = createMockModel({
@@ -134,7 +134,10 @@ describe("AgentSession owner-routed async delivery", () => {
 		await prompt;
 		await session.settleAsyncWork();
 		expect(session.hasPendingAsyncWork()).toBe(false);
-		expect(mock.calls).toHaveLength(1);
+		expect(mock.calls).toHaveLength(2);
+		expect(
+			mock.calls[1]?.context.messages.some(message => JSON.stringify(message).includes("EXACT ORIGIN RESULT")),
+		).toBe(true);
 		expect(
 			[...agent.state.messages, ...sessionManager.getEntries()].some(message =>
 				JSON.stringify(message).includes("EXACT ORIGIN RESULT"),

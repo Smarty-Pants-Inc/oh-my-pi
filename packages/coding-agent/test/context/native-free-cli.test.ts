@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { registeredPromptSource } from "../../src/context/registry";
 
 const repository = path.resolve(import.meta.dir, "../../../..");
 const cliEntry = path.join(repository, "packages/coding-agent/src/cli.ts");
@@ -136,6 +137,14 @@ describe("native-free context CLI", () => {
 			availability: "unavailable",
 			providerOrder: null,
 		});
+		expect(normalComponents.find(component => component.id === "system.base")).toMatchObject({
+			enabled: true,
+			triggered: false,
+			effective: false,
+			availability: "available",
+			providerOrder: null,
+		});
+		expect(normalComponents.every(component => component.providerOrder === null)).toBe(true);
 		expect(
 			normalComponents.map(component => ({
 				id: component.id,
@@ -192,10 +201,19 @@ describe("native-free context CLI", () => {
 					provider: "openai",
 					id: "runtime-evidence",
 					api: "openai-responses",
-					compat: { supportsDeveloperRole: false },
+					reasoning: true,
+					compat: { supportsDeveloperRole: true },
 				},
 				runtime: {
-					instructions: [bindRenderedInstruction("goal.active", "exact active goal evidence")],
+					systemPromptBlocks: [
+						"exact rendered base block\\nexact returned instructions",
+						"project wrapper\\nproject omp instructions\\n",
+						"   ",
+					],
+					instructions: [
+						bindRenderedInstruction("todo.snapshot", "exact todo evidence"),
+						bindRenderedInstruction("goal.active", "exact active goal evidence"),
+					],
 					selectedSkills: [{ name: "mergify-config", renderedText: "exact selected skill prompt", order: 7 }],
 					mcpInstructions: [{ name: "fixture", source: "mcp://fixture", content: "exact returned instructions" }],
 				},
@@ -223,25 +241,69 @@ describe("native-free context CLI", () => {
 		expect(child.exitCode, stderr).toBe(0);
 		const explanation = JSON.parse(stdout) as Record<string, unknown>;
 		const components = explanation.components as Array<Record<string, unknown>>;
+		const systemBlocks = components.filter(component => String(component.id).startsWith("runtime.system_prompt."));
+		expect(systemBlocks).toEqual([
+			expect.objectContaining({
+				id: "runtime.system_prompt.0",
+				content: "exact rendered base block\nexact returned instructions",
+				actualRole: "developer",
+				providerOrder: 0,
+				effective: true,
+			}),
+			expect.objectContaining({
+				id: "runtime.system_prompt.1",
+				content: "project wrapper\nproject omp instructions\n",
+				actualRole: "developer",
+				providerOrder: 1,
+				effective: true,
+			}),
+		]);
+		const staticBase = components.find(component => component.id === "system.base");
+		expect(staticBase).toMatchObject({
+			content: registeredPromptSource("system.base"),
+			triggered: false,
+			effective: false,
+			availability: "available",
+			providerOrder: null,
+		});
 		const projectComponent = components.find(component => component.source === path.join(projectOmp, "AGENTS.md"));
-		expect(projectComponent).toMatchObject({ triggered: true, effective: true, availability: "effective" });
+		expect(projectComponent).toMatchObject({
+			content: "project omp instructions\n",
+			triggered: true,
+			effective: false,
+			availability: "available",
+			providerOrder: null,
+		});
+		const globalComponent = components.find(
+			component => component.source === path.join(home, ".omp/agent/AGENTS.md"),
+		);
+		expect(globalComponent).toMatchObject({
+			content: "native-free global instructions\n",
+			triggered: false,
+			effective: false,
+			availability: "available",
+			providerOrder: null,
+		});
 		const activeGoal = components.find(component => component.id === "goal.active");
 		expect(activeGoal).toMatchObject({
-			actualRole: "system",
+			actualRole: "developer",
 			content: expect.stringContaining("exact active goal evidence"),
 			triggered: true,
 			effective: true,
 			availability: "effective",
+			providerOrder: 3,
 		});
+		const todo = components.find(component => component.id === "todo.snapshot");
+		expect(todo).toMatchObject({ content: expect.stringContaining("exact todo evidence"), providerOrder: 2 });
 		const runtimeMcp = components.find(component => component.id === "external.mcp.fixture");
 		expect(runtimeMcp).toMatchObject({
 			source: "mcp://fixture",
 			content: "exact returned instructions",
 			triggered: true,
-			effective: true,
-			availability: "effective",
+			effective: false,
+			availability: "available",
+			providerOrder: null,
 		});
-		expect(typeof runtimeMcp?.providerOrder).toBe("number");
 		const selectedSkill = components.find(component => component.id === "external.skill.mergify-config");
 		expect(selectedSkill).toMatchObject({
 			actualRole: "user",
@@ -249,8 +311,8 @@ describe("native-free context CLI", () => {
 			triggered: true,
 			effective: true,
 			availability: "effective",
+			providerOrder: null,
 		});
-		expect(typeof selectedSkill?.providerOrder).toBe("number");
 		const potentialMcp = components.find(component =>
 			String(component.id).startsWith("external.mcp.config.fixture."),
 		);

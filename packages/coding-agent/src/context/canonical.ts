@@ -14,7 +14,7 @@ export function canonicalJson(value: JsonValue): string {
 	return JSON.stringify(sortValue(value));
 }
 
-export function sha256(value: string): string {
+export function sha256(value: string | Uint8Array): string {
 	return new Bun.CryptoHasher("sha256").update(value).digest("hex");
 }
 

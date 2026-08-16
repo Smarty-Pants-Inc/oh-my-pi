@@ -4,6 +4,7 @@ import {
 	discoverGitLabDuoWorkflowRuntimeNamespace,
 	type GitLabDuoWorkflowNamespaceSelection,
 } from "@oh-my-pi/pi-catalog/discovery/gitlab-duo-workflow";
+import { mapContextInstructionsForModel } from "../context-instructions";
 import * as AIError from "../error";
 import type {
 	Api,
@@ -550,7 +551,7 @@ export function buildGitLabDuoWorkflowStartRequest(
 		mcpTools,
 		preapproved_tools: mcpTools.map(tool => tool.name),
 		flowConfigSchemaVersion: "v1" as const,
-		flowConfig: buildGitLabDuoWorkflowInlineFlowConfig(buildGitLabDuoWorkflowSystemPrompt(context)),
+		flowConfig: buildGitLabDuoWorkflowInlineFlowConfig(buildGitLabDuoWorkflowSystemPrompt(model, context)),
 	};
 }
 
@@ -613,6 +614,34 @@ export function buildGitLabDuoWorkflowClientAdditionalContext(): GitLabDuoWorkfl
 
 export function buildGitLabDuoWorkflowMcpTools(tools: Tool[] | undefined): GitLabMcpToolDefinition[] {
 	return tools?.map(buildGitLabMcpToolDefinition) ?? [];
+}
+
+async function applyGitLabDuoWorkflowPayloadGuard(
+	startPayload: GitLabDuoWorkflowStartRequest,
+	model: Model<"gitlab-duo-agent">,
+	options: GitLabDuoWorkflowOptions,
+): Promise<GitLabDuoWorkflowStartRequest> {
+	const replacement = await options.onPayload?.(startPayload, model);
+	return (replacement ?? startPayload) as GitLabDuoWorkflowStartRequest;
+}
+
+async function notifyGitLabDuoWorkflowToolContracts(
+	startPayload: GitLabDuoWorkflowStartRequest,
+	model: Model<"gitlab-duo-agent">,
+	options: GitLabDuoWorkflowOptions,
+): Promise<void> {
+	// Extract after onPayload replacement: these names, descriptions, and schema
+	// strings are the definitions the WebSocket start request will send.
+	await options.onToolContracts?.(
+		{
+			tools: startPayload.mcpTools.map(tool => ({
+				name: tool.name,
+				description: tool.description,
+				jsonSchemaString: tool.inputSchema,
+			})),
+		},
+		model,
+	);
 }
 
 export function selectGitLabDuoWorkflowModelRef(
@@ -1253,7 +1282,13 @@ async function runGitLabDuoWorkflow(
 	const workflowConnection = setup.workflowConnection;
 	const selectedModelIdentifier = setup.selectedModelIdentifier;
 	let workflowId = setup.workflowId;
-	let startPayload = setup.startPayload;
+	let startPayload: GitLabDuoWorkflowStartRequest;
+	try {
+		startPayload = await applyGitLabDuoWorkflowPayloadGuard(setup.startPayload, model, options);
+	} catch (error) {
+		await stopGitLabDuoWorkflow(fetchImpl, baseUrl, apiKey, workflowId);
+		throw error;
+	}
 	// Three byte zones (see GITLAB_DUO_WORKFLOW_GOAL_*_OVERFLOW_BYTES):
 	//  - [HARD, ∞): necessary-fail. Do NOT spend the request — emit the overflow error
 	//    now so the session compacts immediately. The fresh-workflow already created in
@@ -1298,6 +1333,7 @@ async function runGitLabDuoWorkflow(
 	let settledNormally = false;
 	try {
 		for (let attempt = 0; attempt < 12; attempt++) {
+			await notifyGitLabDuoWorkflowToolContracts(startPayload, model, options);
 			const ws = openGitLabDuoWorkflowSocket(workflowConnection.baseUrl ?? baseUrl, {
 				token: workflowConnection.token,
 				projectId: webSocketProjectId,
@@ -1330,7 +1366,11 @@ async function runGitLabDuoWorkflow(
 			}
 			lastSocketResult = await runGitLabDuoWorkflowSocket(ws, startPayload, state, options);
 			if (lastSocketResult === "approval") {
-				startPayload = buildGitLabDuoWorkflowApprovalStartRequest(startPayload);
+				startPayload = await applyGitLabDuoWorkflowPayloadGuard(
+					buildGitLabDuoWorkflowApprovalStartRequest(startPayload),
+					model,
+					options,
+				);
 				state.lastApprovalStatus = undefined;
 				continue;
 			}
@@ -1357,7 +1397,11 @@ async function runGitLabDuoWorkflow(
 					workflowDefinition,
 					options.signal,
 				);
-				startPayload = { ...startPayload, workflowID: workflowId };
+				startPayload = await applyGitLabDuoWorkflowPayloadGuard(
+					{ ...startPayload, workflowID: workflowId },
+					model,
+					options,
+				);
 				continue;
 			}
 			// The server caps each workflow at a fixed step (graph-recursion) limit.
@@ -1385,7 +1429,11 @@ async function runGitLabDuoWorkflow(
 					workflowDefinition,
 					options.signal,
 				);
-				startPayload = { ...startPayload, workflowID: workflowId };
+				startPayload = await applyGitLabDuoWorkflowPayloadGuard(
+					{ ...startPayload, workflowID: workflowId },
+					model,
+					options,
+				);
 				continue;
 			}
 			// The server emitted a fresh tool-call boundary whose `ui_chat_log` total did
@@ -1412,7 +1460,11 @@ async function runGitLabDuoWorkflow(
 					workflowDefinition,
 					options.signal,
 				);
-				startPayload = { ...startPayload, workflowID: workflowId };
+				startPayload = await applyGitLabDuoWorkflowPayloadGuard(
+					{ ...startPayload, workflowID: workflowId },
+					model,
+					options,
+				);
 				continue;
 			}
 			// The server returned its de-identified catch-all FAILED — a wrapper over a
@@ -1440,7 +1492,11 @@ async function runGitLabDuoWorkflow(
 					workflowDefinition,
 					options.signal,
 				);
-				startPayload = { ...startPayload, workflowID: workflowId };
+				startPayload = await applyGitLabDuoWorkflowPayloadGuard(
+					{ ...startPayload, workflowID: workflowId },
+					model,
+					options,
+				);
 				continue;
 			}
 			// A retryable error that exhausted its retries must surface as a real error;
@@ -2559,8 +2615,13 @@ const GITLAB_DUO_WORKFLOW_CHATML_HISTORY_NOTE = chatmlHistoryNote.trim();
 // transcript (not a lone bare-text prompt), append the history-note so the model does
 // not mimic the transcript's `<|im_start|>`/`<ran …>` markers as its own tool-call
 // output — markers it kept copying even after they were reframed to past tense.
-function buildGitLabDuoWorkflowSystemPrompt(context: Context): string {
-	const base = normalizeSystemPrompts(context.systemPrompt).join("\n\n");
+function buildGitLabDuoWorkflowSystemPrompt(model: Model<"gitlab-duo-agent">, context: Context): string {
+	const base = [
+		...normalizeSystemPrompts(context.systemPrompt),
+		...mapContextInstructionsForModel(context.instructions, model).map(instruction =>
+			instruction.renderedText.toWellFormed(),
+		),
+	].join("\n\n");
 	if (!isGitLabDuoWorkflowChatMlGoal(context)) return base;
 	return base ? `${base}\n\n${GITLAB_DUO_WORKFLOW_CHATML_HISTORY_NOTE}` : GITLAB_DUO_WORKFLOW_CHATML_HISTORY_NOTE;
 }

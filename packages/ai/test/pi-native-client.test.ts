@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, type Mock, mock, spyOn } from "bun:test";
+import { type } from "@oh-my-pi/omptype";
 import { streamPiNative } from "@oh-my-pi/pi-ai/providers/pi-native-client";
 import type {
 	AssistantMessage,
@@ -205,12 +206,14 @@ describe("streamPiNative request shape", () => {
 		expect(body.options.temperature).toBe(0.7);
 	});
 
-	it("strips non-wire fields (signal, apiKey, fetch, callbacks) from `options`", async () => {
+	it("applies payload callbacks locally and strips their function values from wire options", async () => {
 		// `apiKey` must ride in the Authorization header, never the body — sending
 		// it twice would let a logged request leak the gateway bearer. The other
 		// fields are non-serializable function/runtime handles.
 		const captured: { init?: RequestInit } = {};
 		let responseMetadata: ProviderResponseMetadata | undefined;
+		let observedPayload: unknown;
+		let observedContracts: unknown;
 		const fetchImpl: FetchImpl = (async (_input, init) => {
 			captured.init = init;
 			return fakeResponse([{ type: "done", reason: "stop", message: baseAssistant() }], {
@@ -227,8 +230,13 @@ describe("streamPiNative request shape", () => {
 			apiKey: "gw-bearer",
 			fetch: fetchImpl,
 			signal: controller.signal,
-			onPayload: () => {
-				throw new Error("the gateway payload is unavailable to the client");
+			onPayload: async payload => {
+				await Promise.resolve();
+				observedPayload = payload;
+			},
+			onToolContracts: async payload => {
+				await Promise.resolve();
+				observedContracts = payload;
 			},
 			onResponse: response => {
 				responseMetadata = response;
@@ -244,11 +252,14 @@ describe("streamPiNative request shape", () => {
 		expect("signal" in body.options).toBe(false);
 		expect("fetch" in body.options).toBe(false);
 		expect("onPayload" in body.options).toBe(false);
+		expect("onToolContracts" in body.options).toBe(false);
 		expect("onResponse" in body.options).toBe(false);
 		expect("onSseEvent" in body.options).toBe(false);
 		expect("providerSessionState" in body.options).toBe(false);
 		// And the legitimate options survive
 		expect(body.options.maxTokens).toBe(1024);
+		expect(observedPayload).toEqual(body);
+		expect(observedContracts).toEqual({ tools: [] });
 		expect(responseMetadata).toMatchObject({
 			status: 200,
 			requestId: "gateway-request-id",
@@ -257,6 +268,73 @@ describe("streamPiNative request shape", () => {
 				"cf-aig-cache-status": "HIT",
 			},
 		});
+	});
+
+	it("awaits a replacement envelope and extracts tool contracts from that final payload", async () => {
+		let body: { context?: Context; options?: Record<string, unknown> } = {};
+		let contracts: unknown;
+		const order: string[] = [];
+		const replacementContext: Context = {
+			systemPrompt: ["replacement system"],
+			messages: [{ role: "user", content: "replacement request", timestamp: 1 }],
+			tools: [
+				{
+					name: "replacement_tool",
+					description: "Replacement tool contract.",
+					parameters: type({ value: type("string") }),
+				},
+			],
+		};
+		const fetchImpl: FetchImpl = (async (_input, init) => {
+			order.push("fetch");
+			body = JSON.parse(init?.body as string) as typeof body;
+			return fakeResponse([{ type: "done", reason: "stop", message: baseAssistant() }]);
+		}) as FetchImpl;
+
+		await streamPiNative(fakeModel(), baseContext, {
+			apiKey: "gw-bearer",
+			fetch: fetchImpl,
+			maxTokens: 1024,
+			onPayload: async payload => {
+				order.push("payload-start");
+				await Promise.resolve();
+				order.push("payload-end");
+				return {
+					...(payload as Record<string, unknown>),
+					context: replacementContext,
+					options: { maxTokens: 17 },
+				};
+			},
+			onToolContracts: async payload => {
+				order.push("contracts-start");
+				await Promise.resolve();
+				contracts = payload;
+				order.push("contracts-end");
+			},
+		}).result();
+
+		expect(order).toEqual(["payload-start", "payload-end", "contracts-start", "contracts-end", "fetch"]);
+		expect(body.context).toEqual(JSON.parse(JSON.stringify(replacementContext)));
+		expect(body.options).toEqual({ maxTokens: 17 });
+		expect(contracts).toEqual({ tools: replacementContext.tools });
+	});
+
+	it("fails closed before fetch when the async payload guard rejects", async () => {
+		let fetched = false;
+		const stream = streamPiNative(fakeModel(), baseContext, {
+			apiKey: "gw-bearer",
+			fetch: (async () => {
+				fetched = true;
+				return fakeResponse([]);
+			}) as FetchImpl,
+			onPayload: async () => {
+				await Promise.resolve();
+				throw new Error("pi-native payload denied");
+			},
+		});
+
+		await expect(stream.result()).rejects.toThrow("pi-native payload denied");
+		expect(fetched).toBe(false);
 	});
 
 	it("normalizes trailing slashes on `baseUrl` so the endpoint never double-slashes", async () => {

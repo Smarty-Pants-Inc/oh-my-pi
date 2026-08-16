@@ -1004,8 +1004,9 @@ export class AgentSession {
 		const generation = this.#promptGeneration;
 		this.#beginInFlight();
 		let turnError: unknown;
-		const wakeTask = this.agent
-			.prompt(records)
+		const wakeTask = this.#promptAutomaticTurn(records, {
+			authority: "bounded_transport_or_protocol_retry",
+		})
 			.catch(error => {
 				turnError = error;
 				logger.warn("IRC wake turn failed", { error: String(error) });
@@ -1397,9 +1398,10 @@ export class AgentSession {
 			injectIdle: async messages => {
 				const first = messages[0];
 				if (!first) return;
+				const authority = this.#yieldTurnAuthority(messages);
 				this.#beginInFlight();
 				try {
-					await this.agent.prompt(messages.length === 1 ? first : messages);
+					await this.#promptAutomaticTurn(messages.length === 1 ? first : messages, authority);
 				} finally {
 					this.#endInFlight();
 				}
@@ -3346,7 +3348,7 @@ export class AgentSession {
 		if (event.type === "message_end" && event.message.role === "assistant") {
 			this.#lastAssistantMessage = event.message;
 			if (!event.message.content.some(part => part.type === "toolCall")) {
-				this.#closeCurrentTurn();
+				this.#capabilities?.endTurn(this.#currentTurnId);
 			}
 		}
 		// Plan-mode internal transition: stamp `SILENT_ABORT_MARKER` on the
@@ -3653,7 +3655,7 @@ export class AgentSession {
 
 		// Check auto-retry and auto-compaction after agent completes
 		if (event.type === "agent_end") {
-			this.#closeCurrentTurn();
+			this.#capabilities?.endTurn(this.#currentTurnId);
 			const settledMessages = event.messages;
 			const activeMessages = this.agent.state.messages;
 			// TTSR retry work runs concurrently and clears the live flag before
@@ -4027,6 +4029,42 @@ export class AgentSession {
 		options?.onSkip?.(reason);
 	}
 
+	async #promptAutomaticTurn(
+		messages: AgentMessage | AgentMessage[],
+		options: Pick<ScheduledAgentContinueOptions, "authority" | "originTurnId">,
+	): Promise<void> {
+		if (!this.#automaticTurns.authorize(options.authority, options.originTurnId)) {
+			throw new Error(`Automatic turn denied for ${options.authority}`);
+		}
+		if (options.authority === "active_async_result_wake" && !this.#automaticTurns.isTurnOpen(options.originTurnId)) {
+			this.#automaticTurns.record(
+				options.authority,
+				"rejected",
+				"originating asynchronous turn closed",
+				options.originTurnId,
+			);
+			throw new Error("Automatic turn denied because its asynchronous origin closed");
+		}
+		this.#automaticTurns.record(options.authority, "started", "provider dispatch committed", options.originTurnId);
+		try {
+			if (this.#capabilities) {
+				await this.#capabilities.withContinuationAuthority(options.authority, options.originTurnId, () =>
+					this.agent.prompt(messages),
+				);
+			} else {
+				await this.agent.prompt(messages);
+			}
+		} catch (error) {
+			this.#automaticTurns.record(
+				options.authority,
+				"failed",
+				error instanceof Error ? error.message : String(error),
+				options.originTurnId,
+			);
+			throw error;
+		}
+	}
+
 	#scheduleAgentContinue(options?: ScheduledAgentContinueOptions): void {
 		if (!options || !this.#automaticTurns.authorize(options.authority, options.originTurnId)) return;
 		this.#schedulePostPromptTask(
@@ -4184,6 +4222,7 @@ export class AgentSession {
 			model: this.model?.id,
 			wireModel: this.model,
 			runtime: {
+				systemPromptBlocks: this.systemPrompt,
 				instructions: [
 					...collectCompactionContextInstructions(this.agent.state.messages, target),
 					...this.buildProviderContextInstructions(),
@@ -6747,6 +6786,9 @@ export class AgentSession {
 				await this.#recovery.promptAgentWithIdleRetry(messages, agentPromptOptions);
 			} finally {
 				this.#stats.setPendingSnapshot(undefined);
+				// Direct-user grant authority ends with this provider turn. The
+				// automatic origin stays open through recovery for owned async results.
+				this.#capabilities?.endTurn(turnId);
 			}
 			if (!options?.skipPostPromptRecoveryWait) {
 				await this.#waitForPostPromptRecovery(generation);
@@ -7101,9 +7143,20 @@ export class AgentSession {
 	}
 
 	#queuedTurnAuthority(): Pick<ScheduledAgentContinueOptions, "authority" | "originTurnId"> | undefined {
-		const queued = [...this.agent.peekSteeringQueue(), ...this.agent.peekFollowUpQueue()];
-		if (queued.some(isUserQueuedMessage)) return { authority: "direct_user_input" };
-		for (const message of queued) {
+		return this.#messageTurnAuthority([...this.agent.peekSteeringQueue(), ...this.agent.peekFollowUpQueue()]);
+	}
+
+	#yieldTurnAuthority(
+		messages: readonly AgentMessage[],
+	): Pick<ScheduledAgentContinueOptions, "authority" | "originTurnId"> {
+		return this.#messageTurnAuthority(messages) ?? { authority: "bounded_transport_or_protocol_retry" };
+	}
+
+	#messageTurnAuthority(
+		messages: readonly AgentMessage[],
+	): Pick<ScheduledAgentContinueOptions, "authority" | "originTurnId"> | undefined {
+		if (messages.some(isUserQueuedMessage)) return { authority: "direct_user_input" };
+		for (const message of messages) {
 			if (message.role !== "custom" || message.customType !== ASYNC_RESULT_MESSAGE_TYPE) continue;
 			const jobs = isRecord(message.details) ? message.details.jobs : undefined;
 			if (!Array.isArray(jobs)) continue;

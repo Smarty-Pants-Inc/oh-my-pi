@@ -30,6 +30,8 @@ export interface RuntimeMcpInstruction {
 }
 
 export interface RuntimeContextEvidence {
+	/** Exact rendered blocks before provider normalization; array order is the wire prefix order. */
+	systemPromptBlocks?: readonly string[];
 	instructions?: readonly ContextInstruction[];
 	selectedSkills?: readonly { name: string; renderedText: string; order: number }[];
 	mcpInstructions?: readonly RuntimeMcpInstruction[];
@@ -56,6 +58,7 @@ export interface ExplainedComponent {
 	model: string;
 	renderedWrapper: string;
 	precedence: number;
+	/** Zero-based order for exact runtime system-prompt blocks and typed instructions; otherwise null. */
 	providerOrder: number | null;
 	bytes: number;
 	words: number;
@@ -84,7 +87,23 @@ function counts(content: string): Pick<ExplainedComponent, "bytes" | "words" | "
 	return { bytes: Buffer.byteLength(content), words, estimatedTokens: Math.ceil(content.length / 4) };
 }
 
-type ExplainWireModel = Pick<Model<Api>, "provider" | "id" | "api" | "compat">;
+type ExplainWireModel = Pick<Model<Api>, "provider" | "id" | "api" | "compat" | "reasoning">;
+
+function systemPromptRole(
+	model: ExplainWireModel | undefined,
+	blockIndex: number,
+	supportsDeveloperRole: boolean,
+): "system" | "developer" {
+	if (model?.api === "openai-codex-responses") return blockIndex === 0 ? "system" : "developer";
+	if (
+		model?.reasoning &&
+		supportsDeveloperRole &&
+		["openai-completions", "openai-responses", "azure-openai-responses", "openrouter"].includes(model.api)
+	) {
+		return "developer";
+	}
+	return "system";
+}
 
 function resolveExplainWireModel(options: {
 	provider?: string;
@@ -120,6 +139,7 @@ function resolveExplainWireModel(options: {
 		provider: options.provider,
 		id: options.model,
 		api,
+		reasoning: spec.reasoning === true,
 		compat: {
 			supportsDeveloperRole: resolveDeveloperRoleSupport(api, {
 				provider: options.provider,
@@ -400,11 +420,45 @@ export async function explainContext(options: {
 			: undefined;
 	const registry = promptRegistry();
 	const components: ExplainedComponent[] = [];
-	const runtimeInstructions = new Map(
-		(options.runtime?.instructions ?? [])
-			.filter(instruction => instruction.target === options.target)
-			.map(instruction => [instruction.id, instruction]),
+	const runtimeSystemPromptBlocks = (options.runtime?.systemPromptBlocks ?? [])
+		.map((content, sourceIndex) => ({ content, sourceIndex }))
+		.filter(block => block.content.trim().length > 0);
+	for (const [providerOrder, block] of runtimeSystemPromptBlocks.entries()) {
+		components.push({
+			id: `runtime.system_prompt.${block.sourceIndex}`,
+			source: `runtime.systemPrompt[${block.sourceIndex}]`,
+			kind: "instruction",
+			semanticRole: "system",
+			actualRole: systemPromptRole(wireModel, providerOrder, developerRole),
+			target: options.target,
+			trigger: "startup",
+			visibility: "model",
+			enabled: true,
+			enabledReason: "runtime supplied this exact rendered system-prompt block",
+			triggered: true,
+			effective: true,
+			availability: "effective",
+			approvalStatus: approval.status,
+			sha256: sha256(block.content),
+			provider,
+			model,
+			renderedWrapper: "exact runtime rendered system-prompt block",
+			precedence: -10_000 + providerOrder,
+			providerOrder,
+			...counts(block.content),
+			...(options.includeContent ? { content: block.content } : {}),
+		});
+	}
+	const runtimeInstructionList = (options.runtime?.instructions ?? []).filter(
+		instruction => instruction.target === options.target,
 	);
+	const runtimeInstructions = new Map(runtimeInstructionList.map(instruction => [instruction.id, instruction]));
+	const runtimeInstructionProviderOrders = new Map<string, number>();
+	let nextProviderOrder = runtimeSystemPromptBlocks.length;
+	for (const instruction of runtimeInstructionList) {
+		if (instruction.renderedText.trim().length === 0) continue;
+		runtimeInstructionProviderOrders.set(instruction.id, nextProviderOrder++);
+	}
 	const registeredIds = new Set(registry.prompts.map(entry => entry.id));
 	for (const entry of registry.prompts
 		.filter(prompt => prompt.target.includes(options.target))
@@ -412,9 +466,7 @@ export async function explainContext(options: {
 		const sourceContent = registeredPromptSource(entry.id);
 		const runtimeInstruction = runtimeInstructions.get(entry.id);
 		const content = runtimeInstruction?.renderedText ?? sourceContent;
-		const effective =
-			runtimeInstruction !== undefined ||
-			(entry.defaultEnabled && entry.visibility === "model" && entry.trigger === "startup");
+		const effective = runtimeInstruction !== undefined && runtimeInstruction.renderedText.trim().length > 0;
 		components.push({
 			id: entry.id,
 			source: registeredPromptRepositoryPath(entry.path),
@@ -424,13 +476,15 @@ export async function explainContext(options: {
 			target: options.target,
 			trigger: entry.trigger,
 			visibility: entry.visibility,
-			enabled: effective,
+			enabled: runtimeInstruction !== undefined || entry.defaultEnabled,
 			enabledReason: runtimeInstruction
-				? "runtime trigger supplied an exact rendered instruction"
-				: effective
-					? "agent-behavior default"
+				? effective
+					? "runtime trigger supplied an exact rendered instruction"
+					: "runtime trigger supplied an empty instruction omitted by the provider"
+				: entry.defaultEnabled
+					? "registered default template; exact runtime rendering was not supplied"
 					: "registered potential component; runtime trigger was not observed",
-			triggered: runtimeInstruction !== undefined || effective,
+			triggered: runtimeInstruction !== undefined,
 			effective,
 			availability: effective ? "effective" : entry.trigger === "tool_available" ? "unavailable" : "available",
 			approvalStatus: approval.status,
@@ -438,15 +492,18 @@ export async function explainContext(options: {
 			provider,
 			model,
 			renderedWrapper: runtimeInstruction
-				? "exact runtime rendered instruction"
-				: "registered Markdown template; dynamic values require a runtime trigger",
+				? effective
+					? "exact runtime rendered instruction"
+					: "empty runtime instruction omitted from provider serialization"
+				: "registered Markdown source template; not a rendered wire component",
 			precedence: entry.order,
-			providerOrder: null,
+			providerOrder: effective ? (runtimeInstructionProviderOrders.get(entry.id) ?? null) : null,
 			...counts(content),
 			...(options.includeContent ? { content } : {}),
 		});
 	}
 	for (const instruction of [...runtimeInstructions.values()].filter(item => !registeredIds.has(item.id))) {
+		const effective = instruction.renderedText.trim().length > 0;
 		components.push({
 			id: instruction.id,
 			source: instruction.sourcePath,
@@ -456,18 +513,22 @@ export async function explainContext(options: {
 			target: instruction.target,
 			trigger: instruction.trigger,
 			visibility: "external",
-			enabled: true,
-			enabledReason: "runtime supplied an exact provenance-bound instruction",
+			enabled: effective,
+			enabledReason: effective
+				? "runtime supplied an exact provenance-bound instruction"
+				: "runtime supplied an empty instruction omitted by the provider",
 			triggered: true,
-			effective: true,
-			availability: "effective",
+			effective,
+			availability: effective ? "effective" : "available",
 			approvalStatus: await externalApproval(instruction.sourcePath, instruction.sha256, release, approval),
 			sha256: instruction.sha256,
 			provider,
 			model,
-			renderedWrapper: "exact runtime rendered instruction",
+			renderedWrapper: effective
+				? "exact runtime rendered instruction"
+				: "empty runtime instruction omitted from provider serialization",
 			precedence: instruction.order ?? 10_000,
-			providerOrder: null,
+			providerOrder: effective ? (runtimeInstructionProviderOrders.get(instruction.id) ?? null) : null,
 			...counts(instruction.renderedText),
 			...(options.includeContent ? { content: instruction.renderedText } : {}),
 		});
@@ -477,6 +538,10 @@ export async function explainContext(options: {
 		const contextFiles = await loadExplainContextFiles(cwd);
 		for (const file of contextFiles) {
 			const contentSha256 = sha256(file.content);
+			const embeddedBlock =
+				file.content.length > 0
+					? runtimeSystemPromptBlocks.find(block => block.content.includes(file.content))
+					: undefined;
 			components.push({
 				id: `external.agents.${contentSha256.slice(0, 12)}`,
 				source: file.path,
@@ -487,15 +552,19 @@ export async function explainContext(options: {
 				trigger: "startup",
 				visibility: "external",
 				enabled: true,
-				enabledReason: "discovered external context file",
-				triggered: true,
-				effective: true,
-				availability: "effective",
+				enabledReason: embeddedBlock
+					? `source text is embedded in runtime system-prompt block ${embeddedBlock.sourceIndex}`
+					: "discovered external context source; exact runtime embedding was not observed",
+				triggered: embeddedBlock !== undefined,
+				effective: false,
+				availability: "available",
 				approvalStatus: await externalApproval(file.path, contentSha256, release, approval),
 				sha256: contentSha256,
 				provider,
 				model,
-				renderedWrapper: "external_instruction",
+				renderedWrapper: embeddedBlock
+					? "external_instruction source embedded in a runtime system-prompt block"
+					: "external_instruction source provenance; not a separate wire component",
 				precedence: 10_000 + (file.depth ?? 0),
 				providerOrder: null,
 				...counts(file.content),
@@ -553,6 +622,10 @@ export async function explainContext(options: {
 		}
 		for (const [index, source] of (options.runtime?.mcpInstructions ?? []).entries()) {
 			const contentSha256 = sha256(source.content);
+			const embeddedBlock =
+				source.content.length > 0
+					? runtimeSystemPromptBlocks.find(block => block.content.includes(source.content))
+					: undefined;
 			components.push({
 				id: `external.mcp.${source.name}`,
 				source: source.source,
@@ -563,15 +636,19 @@ export async function explainContext(options: {
 				trigger: "startup",
 				visibility: "external",
 				enabled: true,
-				enabledReason: "connected MCP server returned this exact instruction text",
+				enabledReason: embeddedBlock
+					? `connected MCP text is embedded in runtime system-prompt block ${embeddedBlock.sourceIndex}`
+					: "connected MCP server returned exact text; runtime system-prompt embedding was not observed",
 				triggered: true,
-				effective: true,
-				availability: "effective",
+				effective: false,
+				availability: "available",
 				approvalStatus: "unapproved",
 				sha256: contentSha256,
 				provider,
 				model,
-				renderedWrapper: "exact connected-server instructions with MCP provenance",
+				renderedWrapper: embeddedBlock
+					? "connected-server source embedded in a runtime system-prompt block"
+					: "exact connected-server instruction provenance; not observed on the wire",
 				precedence: 20_000 + index,
 				providerOrder: null,
 				...counts(source.content),
@@ -610,10 +687,6 @@ export async function explainContext(options: {
 	}
 
 	components.sort((left, right) => left.precedence - right.precedence || left.id.localeCompare(right.id));
-	let providerOrder = 0;
-	for (const component of components) {
-		component.providerOrder = component.effective && component.kind === "instruction" ? providerOrder++ : null;
-	}
 
 	const behavior = YAML.parse(behaviorRegistrySource()) as Record<string, unknown>;
 	const automaticTurns = behavior.automaticTurns as { allowed?: string[] } | undefined;

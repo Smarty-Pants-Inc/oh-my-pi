@@ -95,6 +95,15 @@ describe("tools.approvalMode setting", () => {
 		expect(textOf(result)).toContain("ok");
 	});
 
+	it("yolo mode cannot bypass Bash session capabilities", async () => {
+		const settings = approvalSettings({ "tools.approvalMode": "yolo" });
+		await expect(
+			bashTool().execute("yolo-capability", { command: "git push origin HEAD" }, undefined, undefined, {
+				settings,
+			} as AgentToolContext),
+		).rejects.toThrow("requires explicit session capability 'git.push'");
+	});
+
 	it("always-ask mode rejects exec tools when no UI is available", async () => {
 		const settings = approvalSettings({ "tools.approvalMode": "always-ask" });
 		await expect(
@@ -139,21 +148,16 @@ describe("tools.approvalMode setting", () => {
 		).rejects.toThrow(/requires approval but no interactive UI available/);
 	});
 
-	it("critical bash patterns do not prompt in yolo mode with bash allowed", async () => {
+	it("critical Bash writes still require session authority in yolo mode", async () => {
 		const settings = approvalSettings({
 			"tools.approvalMode": "yolo",
 			"tools.approval": { bash: "allow" },
 		});
-		const result = await bashTool().execute(
-			"critical",
-			{ command: "rm -f /tmp/bun-fake-timer-probe.test.ts" },
-			undefined,
-			undefined,
-			{
+		await expect(
+			bashTool().execute("critical", { command: "rm -f /tmp/bun-fake-timer-probe.test.ts" }, undefined, undefined, {
 				settings,
-			} as AgentToolContext,
-		);
-		expect(textOf(result)).toContain("(no output)");
+			} as AgentToolContext),
+		).rejects.toThrow("requires an explicit session writePath capability");
 	});
 
 	it("CLI --auto-approve forces yolo mode for non-overriding tool calls", async () => {
@@ -165,19 +169,17 @@ describe("tools.approvalMode setting", () => {
 		expect(textOf(result)).toContain("override");
 	});
 
-	it("CLI --auto-approve also bypasses safety-override patterns", async () => {
+	it("CLI --auto-approve cannot bypass session write capabilities", async () => {
 		const settings = approvalSettings({ "tools.approvalMode": "always-ask" });
-		const result = await bashTool().execute(
-			"cli-critical",
-			{ command: "rm -f /tmp/bun-fake-timer-probe.test.ts" },
-			undefined,
-			undefined,
-			{
-				settings,
-				autoApprove: true,
-			} as AgentToolContext,
-		);
-		expect(textOf(result)).toContain("(no output)");
+		await expect(
+			bashTool().execute(
+				"cli-critical",
+				{ command: "rm -f /tmp/bun-fake-timer-probe.test.ts" },
+				undefined,
+				undefined,
+				{ settings, autoApprove: true } as AgentToolContext,
+			),
+		).rejects.toThrow("requires an explicit session writePath capability");
 	});
 
 	it("xd:// dispatch approval (xdevApproved) suppresses the tier-only re-prompt", async () => {

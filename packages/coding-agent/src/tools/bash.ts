@@ -74,6 +74,40 @@ const BASH_APPROVAL_SHELL_CONTROL_CHARS: Record<string, true> = {
 	")": true,
 };
 const BASH_APPROVAL_REINTERPRETED_ARGUMENT_RE = /(?:^|[ \t])(?:-[^-]*[ce]|--(?:command|eval))(?:[= \t]|$)/u;
+const BASH_WRITE_COMMANDS_ALL_TARGETS = new Set(["chmod", "chown", "mkdir", "rm", "rmdir", "tee", "touch", "truncate"]);
+const BASH_WRITE_COMMANDS_LAST_TARGET = new Set(["cp", "install", "ln", "mv"]);
+const BASH_SAFE_READONLY_COMMANDS = new Set([
+	"[",
+	"cat",
+	"dirname",
+	"echo",
+	"false",
+	"head",
+	"ls",
+	"pwd",
+	"printf",
+	"readlink",
+	"realpath",
+	"stat",
+	"tail",
+	"test",
+	"true",
+	"wc",
+]);
+const BASH_GITHUB_PR_EFFECTS = new Set([
+	"close",
+	"comment",
+	"create",
+	"delete",
+	"edit",
+	"lock",
+	"merge",
+	"ready",
+	"reopen",
+	"review",
+	"unlock",
+	"update-branch",
+]);
 
 function hasBashApprovalShellControl(command: string): boolean {
 	let quote: "'" | '"' | undefined;
@@ -117,6 +151,196 @@ function hasBashApprovalShellControl(command: string): boolean {
 	// Options such as `git -c alias.x='!...'` and `sh -c "..."` reinterpret
 	// otherwise literal quoted or escaped arguments as executable code.
 	return hasReinterpretableShellControl && BASH_APPROVAL_REINTERPRETED_ARGUMENT_RE.test(command);
+}
+
+function isShellAssignment(token: string): boolean {
+	const equalsIndex = token.indexOf("=");
+	return equalsIndex > 0 && BASH_ENV_NAME_PATTERN.test(token.slice(0, equalsIndex));
+}
+
+function shellCommandIndex(tokens: readonly string[]): number | undefined {
+	for (let index = 0; index < tokens.length; index++) {
+		if (!isShellAssignment(tokens[index]!)) return index;
+	}
+	return undefined;
+}
+
+function shellPositionals(tokens: readonly string[]): string[] {
+	const positionals: string[] = [];
+	let optionsEnded = false;
+	for (const token of tokens) {
+		if (!optionsEnded && token === "--") {
+			optionsEnded = true;
+			continue;
+		}
+		if (!optionsEnded && token.startsWith("-")) continue;
+		positionals.push(token);
+	}
+	return positionals;
+}
+
+function bashWriteTargets(tokens: readonly string[]): string[] {
+	const commandIndex = shellCommandIndex(tokens);
+	if (commandIndex === undefined) return [];
+	const command = tokens[commandIndex]!;
+	const args = tokens.slice(commandIndex + 1);
+	const positionals = shellPositionals(args);
+	const targets: string[] = [];
+
+	if (BASH_WRITE_COMMANDS_ALL_TARGETS.has(command)) {
+		targets.push(...positionals);
+	} else if (BASH_WRITE_COMMANDS_LAST_TARGET.has(command) && positionals.length > 0) {
+		targets.push(positionals.at(-1)!);
+		for (let index = 0; index < args.length; index++) {
+			const arg = args[index]!;
+			if (arg === "-t" || arg === "--target-directory") {
+				const target = args[index + 1];
+				if (target) targets.push(target);
+				index++;
+			} else if (arg.startsWith("--target-directory=")) {
+				targets.push(arg.slice("--target-directory=".length));
+			}
+		}
+	} else if ((command === "sed" || command === "perl") && args.some(arg => arg === "-i" || arg.startsWith("-i"))) {
+		// The in-place form writes every input path after its program expression.
+		// It is intentionally conservative: validating an extra literal token only
+		// denies a request that cannot prove all of its write destinations.
+		targets.push(...positionals.slice(1));
+	} else if (command === "dd") {
+		for (const arg of args) {
+			if (arg.startsWith("of=")) targets.push(arg.slice("of=".length));
+		}
+	} else if (command === "git") {
+		for (let index = 0; index < args.length; index++) {
+			const arg = args[index]!;
+			if (arg === "--output") {
+				const target = args[index + 1];
+				if (target) targets.push(target);
+				index++;
+			} else if (arg.startsWith("--output=")) {
+				targets.push(arg.slice("--output=".length));
+			}
+		}
+	}
+
+	for (let index = 0; index < tokens.length; index++) {
+		const redirect = /^(?:\d+)?(?:>>?|>\|)(.*)$/u.exec(tokens[index]!);
+		if (!redirect) continue;
+		const target = redirect[1] || tokens[index + 1];
+		// File-descriptor duplication (`2>&1`) and a missing redirect target do
+		// not name a filesystem write target.
+		if (target && !target.startsWith("&")) targets.push(target);
+	}
+	return targets;
+}
+
+function commandHasGitPush(tokens: readonly string[]): boolean {
+	const gitIndex = tokens.indexOf("git");
+	if (gitIndex === -1) return false;
+	const args = tokens.slice(gitIndex + 1);
+	for (let index = 0; index < args.length; index++) {
+		const arg = args[index]!;
+		if (arg === "--") return args[index + 1] === "push";
+		if (!arg.startsWith("-")) return arg === "push";
+		if (
+			arg === "-C" ||
+			arg === "-c" ||
+			arg === "--git-dir" ||
+			arg === "--work-tree" ||
+			arg === "--namespace" ||
+			arg === "--config-env"
+		) {
+			index++;
+		}
+	}
+	return false;
+}
+
+function commandHasGithubPrEffect(tokens: readonly string[]): boolean {
+	const ghIndex = tokens.indexOf("gh");
+	if (ghIndex === -1) return false;
+	const args = tokens.slice(ghIndex + 1).filter(arg => !arg.startsWith("-"));
+	return args[0] === "pr" && BASH_GITHUB_PR_EFFECTS.has(args[1] ?? "");
+}
+
+function commandIsKnownSafe(tokens: readonly string[]): boolean {
+	const commandIndex = shellCommandIndex(tokens);
+	if (commandIndex === undefined) return true;
+	const command = tokens[commandIndex]!;
+	if (BASH_SAFE_READONLY_COMMANDS.has(command)) return true;
+	if (BASH_WRITE_COMMANDS_ALL_TARGETS.has(command) || BASH_WRITE_COMMANDS_LAST_TARGET.has(command)) {
+		// Flags alter many mutators' target semantics (`cp -t`, in-place
+		// editors, archive extraction). Their complete grammar is not an
+		// authority parser, so a generic capability is required as well.
+		return !tokens.slice(commandIndex + 1).some(arg => arg.startsWith("-") && arg !== "--");
+	}
+	if (command === "dd") return tokens.slice(commandIndex + 1).some(arg => arg.startsWith("of="));
+	if (command === "sed" || command === "perl") {
+		return tokens.slice(commandIndex + 1).some(arg => arg === "-i" || arg.startsWith("-i"));
+	}
+	if (command === "git") {
+		const subcommand = tokens.slice(commandIndex + 1).find(arg => !arg.startsWith("-"));
+		// `diff`, `log`, and `show` accept `--output=<path>` and can invoke
+		// repository-configured textconv processes, so they are not provably read-only.
+		return subcommand !== undefined && new Set(["ls-files", "rev-parse", "status"]).has(subcommand);
+	}
+	return commandHasGitPush(tokens) || commandHasGithubPrEffect(tokens);
+}
+
+function commandNeedsGenericExternalCapability(command: string, tokens: readonly string[]): boolean {
+	// Reinterpreted shell code, compound control flow, and substitutions cannot
+	// prove which executable or paths the shell will ultimately select.
+	if (/[`$]|[;&|()\n\r]/u.test(command)) return true;
+	return !commandIsKnownSafe(tokens);
+}
+
+function assertBashExternalCapability(session: ToolSession, capability: string): void {
+	const decision = session.capabilities?.decideExternalEffect(capability);
+	if (!decision || decision.outcome === "allow") return;
+	throw new ToolError(`Bash command requires explicit session capability '${capability}'.`);
+}
+
+function assertBashCommandCapability(session: ToolSession, command: string): void {
+	if (session.capabilities?.decideExternalEffect("bash.external").outcome === "allow") return;
+	assertBashExternalCapability(session, `bash.command:${command.trim()}`);
+}
+
+function assertBashWriteCapability(session: ToolSession, target: string, cwd: string): void {
+	if (target.includes("$") || target.includes("`") || target.includes("*") || target.includes("?")) {
+		throw new ToolError(`Bash write target '${target}' cannot be validated safely.`);
+	}
+	const decision = session.capabilities?.decideWrite(resolveToCwd(target, cwd));
+	if (!decision || decision.outcome === "allow") return;
+	if (decision.outcome === "request") {
+		throw new ToolError(
+			`Bash write target '${decision.target}' requires an explicit session writePath capability outside '${session.capabilities?.workspace}'.`,
+		);
+	}
+	throw new ToolError(`Bash write target '${decision.target}' cannot be canonicalized safely.`);
+}
+
+/**
+ * Apply session authority before choosing any Bash backend. This is deliberately
+ * a small syntax-based gate, not a claim to understand arbitrary shell code:
+ * known write destinations and the capabilities exposed by the GitHub tool are
+ * checked; dynamic write destinations fail closed rather than bypassing policy.
+ */
+function assertBashCapabilities(session: ToolSession, command: string, cwd: string): void {
+	if (!session.capabilities) return;
+	for (const tokens of tokenizeShellSegments(command)) {
+		if (commandHasGitPush(tokens)) {
+			assertBashExternalCapability(session, "git.push");
+		}
+		if (commandHasGithubPrEffect(tokens)) {
+			assertBashExternalCapability(session, "github.pr");
+		}
+		for (const target of bashWriteTargets(tokens)) {
+			assertBashWriteCapability(session, target, cwd);
+		}
+		if (commandNeedsGenericExternalCapability(command, tokens)) {
+			assertBashCommandCapability(session, command);
+		}
+	}
 }
 
 const BASH_PATTERN_APPROVAL_VALUES = new Set(["allow", "deny", "prompt"]);
@@ -1403,6 +1627,10 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			}
 		}
 
+		// This sits inside the tool, rather than the approval wrapper, so yolo
+		// and every execution backend retain the same session authority boundary.
+		assertBashCapabilities(this.session, rawCommand, this.session.cwd);
+
 		if (executionEnvironment) {
 			return this.#executeInEnvironment({
 				environment: executionEnvironment,
@@ -1454,6 +1682,9 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		invalidateGithubCacheForBashCommand(command);
 
 		const commandCwd = cwd ? resolveToCwd(cwd, this.session.cwd) : this.session.cwd;
+		// Internal URL expansion can replace a literal path, so validate the
+		// command that the local, PTY, and ACP backends will actually receive.
+		assertBashCapabilities(this.session, command, commandCwd);
 		let cwdStat: fs.Stats;
 		try {
 			cwdStat = await fs.promises.stat(commandCwd);

@@ -882,7 +882,7 @@ export async function computeImplementationSources(
 			.sort((left, right) => left.localeCompare(right))
 			.map(async sourcePath => ({
 				path: sourcePath,
-				sha256: sha256(await Bun.file(path.join(repositoryRoot, sourcePath)).text()),
+				sha256: sha256(new Uint8Array(await Bun.file(path.join(repositoryRoot, sourcePath)).arrayBuffer())),
 			})),
 	);
 }

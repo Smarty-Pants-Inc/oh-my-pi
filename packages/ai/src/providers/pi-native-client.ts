@@ -36,13 +36,16 @@ import { notifyProviderResponse } from "../utils/provider-response";
  * `AbortSignal`, the provider-session `Map`) or server-controlled
  * (`apiKey`, which the gateway injects from its own credential store; the
  * client's `apiKey` is the gateway *bearer*, sent in the `Authorization`
- * header rather than the request body).
+ * header rather than the request body). Payload/tool callbacks run locally
+ * against the final canonical gateway envelope before their closures are
+ * removed from its options bag.
  */
 const NON_WIRE_KEYS = new Set<keyof SimpleStreamOptions>([
 	"signal",
 	"apiKey",
 	"fetch",
 	"onPayload",
+	"onToolContracts",
 	"onResponse",
 	"onSseEvent",
 	"execHandlers",
@@ -52,6 +55,13 @@ const NON_WIRE_KEYS = new Set<keyof SimpleStreamOptions>([
 ]);
 const PI_NATIVE_STREAM_IDLE_TIMEOUT_ERROR = "pi-native stream stalled while waiting for the next event";
 const PI_NATIVE_STREAM_FIRST_EVENT_TIMEOUT_ERROR = "pi-native stream timed out while waiting for the first event";
+
+interface PiNativeStreamRequest {
+	modelId: string;
+	context: Context;
+	options: Record<string, unknown>;
+	stream: true;
+}
 
 function isPiNativeProgressEvent(event: unknown): boolean {
 	if (typeof event !== "object" || event === null || !("type" in event)) return true;
@@ -173,12 +183,16 @@ export function streamPiNative<TApi extends Api>(
 				model as Model<Api>,
 				typeof options?.apiKey === "string" ? options.apiKey : undefined,
 			);
-			const body = JSON.stringify({
+			let request: PiNativeStreamRequest = {
 				modelId: `${model.provider}/${model.id}`,
 				context,
 				options: buildWireOptions(options),
 				stream: true,
-			});
+			};
+			const replacement = await options?.onPayload?.(request, model);
+			if (replacement !== undefined) request = replacement as PiNativeStreamRequest;
+			await options?.onToolContracts?.({ tools: request.context.tools ?? [] }, model);
+			const body = JSON.stringify(request);
 
 			response = await fetchImpl(url, { method: "POST", headers, body, signal: abortTracker.requestSignal });
 			if (!response.ok) {
