@@ -6826,7 +6826,7 @@
     },
     {
       "path": "packages/coding-agent/src/context/approved-policy.ts",
-      "sha256": "58538e7fe7e3ee253ca37ac26664f626908f46f0e32b63f6c6d96fba8efc2c64"
+      "sha256": "aff78f86339b2e2d8d8eb69e77cb1122fd468f6d7e67652027a0e12503066faf"
     },
     {
       "path": "packages/coding-agent/src/context/canonical.ts",
@@ -6842,7 +6842,7 @@
     },
     {
       "path": "packages/coding-agent/src/context/manifest.ts",
-      "sha256": "df7aa16cd78a45aab7fb6f973c4fb8ce21b3014037fcbfedc265e4eb938e70fc"
+      "sha256": "bc81cac73fecfcc6e4fde00d1749267edebd17a0a1955b11ec811b569b15a46a"
     },
     {
       "path": "packages/coding-agent/src/context/prompt-sources.generated.ts",
@@ -10702,5 +10702,5 @@
     }
   ],
   "behaviorSha256": "0feede855f6d4a90131d3a02399acbc91464a432f9189e39082fd75f502a1194",
-  "rootSha256": "569e81f45e5cdfd77872c56d88da7dc1dbf97d5447c3622b3c5e7d4663fa4443"
+  "rootSha256": "cc5db7a8ad6fce707ee742478286642aa10bf13de0f7168094e00c568a4d4bbe"
 }

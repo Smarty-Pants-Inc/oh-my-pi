@@ -7,6 +7,7 @@ import {
 	buildContextReleaseManifest,
 	type CandidateIdentity,
 	type ContextReleaseManifest,
+	parseCandidateIdentities,
 	parseContextReleaseManifest,
 } from "./manifest";
 
@@ -45,24 +46,9 @@ function policyPayload(policy: ApprovedPolicy): Omit<ApprovedPolicy, "rootSha256
 	return payload;
 }
 
-function sortedCandidates(candidates: readonly CandidateIdentity[]): CandidateIdentity[] {
-	return [...candidates].sort(
-		(left, right) =>
-			left.repository.localeCompare(right.repository) ||
-			left.commit.localeCompare(right.commit) ||
-			left.tree.localeCompare(right.tree),
-	);
-}
-
 function assertSha256(value: unknown, field: string): asserts value is string {
 	if (typeof value !== "string" || !/^[a-f0-9]{64}$/.test(value)) {
 		throw new Error(`approved policy ${field} must be a lowercase SHA-256`);
-	}
-}
-
-function assertGitObject(value: unknown, field: string): asserts value is string {
-	if (typeof value !== "string" || !/^[a-f0-9]{40}$/.test(value)) {
-		throw new Error(`approved policy ${field} must be a Git SHA-1 object id`);
 	}
 }
 
@@ -103,34 +89,13 @@ export function parseApprovedPolicy(source: string): ApprovedPolicy {
 		throw new Error("approved policy has invalid approval or candidates");
 	}
 	assertExactKeys(policy.approval, ["reference", "approvedBy", "approvedAt"], "approval");
-	const repositories = new Set<string>();
-	for (const [index, candidate] of policy.candidates.entries()) {
-		if (
-			!isRecord(candidate) ||
-			typeof candidate.repository !== "string" ||
-			!/^[^/\s]+\/[^/\s]+$/.test(candidate.repository) ||
-			repositories.has(candidate.repository)
-		) {
-			throw new Error(`approved policy candidate ${index} is invalid or duplicated`);
-		}
-		assertExactKeys(candidate, ["repository", "commit", "tree"], `candidate ${index}`);
-		assertGitObject(candidate.commit, `candidates[${index}].commit`);
-		assertGitObject(candidate.tree, `candidates[${index}].tree`);
-		repositories.add(candidate.repository);
-	}
+	policy.candidates = parseCandidateIdentities(policy.candidates, "approved policy candidates");
 	assertSha256(policy.contentManifestRootSha256, "contentManifestRootSha256");
 	assertSha256(policy.behaviorSha256, "behaviorSha256");
 	assertSha256(policy.globalAgentsSha256, "globalAgentsSha256");
 	assertSha256(policy.configurationSemanticSha256, "configurationSemanticSha256");
 	assertSha256(policy.combinedPromptBehaviorSha256, "combinedPromptBehaviorSha256");
 	assertSha256(policy.rootSha256, "rootSha256");
-	const canonicalCandidates = sortedCandidates(policy.candidates);
-	if (
-		canonicalJson(policy.candidates as unknown as JsonValue) !==
-		canonicalJson(canonicalCandidates as unknown as JsonValue)
-	) {
-		throw new Error("approved policy candidates must be sorted by repository, commit, and tree");
-	}
 	const expectedRoot = sha256(canonicalJson(policyPayload(policy) as unknown as JsonValue));
 	if (policy.rootSha256 !== expectedRoot) throw new Error("approved policy rootSha256 does not match its payload");
 	return policy;

@@ -2,7 +2,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { YAML } from "bun";
 import trackedManifestSource from "../../generated/prompt-manifest.json" with { type: "text" };
-import { ref, remote, repo, show, status } from "../utils/git";
+import { diff, fetch as gitFetch, ref, remote, repo, show, status } from "../utils/git";
 import { canonicalJson, compareUnicodeCodePoints, type JsonValue, sha256 } from "./canonical";
 import { computeImplementationSources } from "./implementation-sources";
 import {
@@ -15,6 +15,13 @@ import {
 export const CONTENT_MANIFEST_SCHEMA = "omp.prompt_manifest.v1" as const;
 export const RELEASE_MANIFEST_SCHEMA = "omp.context_release_manifest.v1" as const;
 export const OMP_REPOSITORY = "Smarty-Pants-Inc/oh-my-pi";
+const OMP_SCOPE_BASE = {
+	commit: "37eee71978951fccf66b21f7e3e2b74596ac9d74",
+	tree: "a20c0452f99155e7adeaecfad28e4afd0223c684",
+} as const;
+const OMP_SCOPE_BASE_URL = "https://github.com/can1357/oh-my-pi.git";
+const OMP_SCOPE_REQUIREMENT =
+	"SMARTY_AGENT_CONTEXT_AND_AUTONOMY_RECALIBRATION_SPEC_V1.md §2.15 final OMP fork reconstruction";
 
 export function canonicalGithubRepository(url: string | undefined): string | undefined {
 	if (!url) return undefined;
@@ -27,9 +34,16 @@ export function canonicalGithubRepository(url: string | undefined): string | und
 
 export interface CandidateIdentity {
 	repository: string;
+	baseCommit: string;
+	baseTree: string;
 	commit: string;
 	tree: string;
+	scopeCoverage: ScopeCoverageEntry[];
 }
+
+export type ScopeCoverageEntry =
+	| { path: string; requirement: string }
+	| { path: string; dependencyOf: string; necessity: string };
 
 export interface PromptManifestEntry {
 	id: string;
@@ -107,10 +121,90 @@ function assertString(value: unknown, label: string): asserts value is string {
 	if (typeof value !== "string" || value.length === 0) throw new Error(`${label} must be a non-empty string`);
 }
 
+function assertRepositoryPath(value: unknown, label: string): asserts value is string {
+	assertString(value, label);
+	if (
+		value.startsWith("/") ||
+		value.startsWith("./") ||
+		value.endsWith("/") ||
+		value.includes("\\") ||
+		value.split("/").some(segment => segment.length === 0 || segment === "." || segment === "..")
+	) {
+		throw new Error(`${label} must be a normalized repository-relative path`);
+	}
+}
+
 function assertSha256(value: unknown, label: string): asserts value is string {
 	if (typeof value !== "string" || !/^[a-f0-9]{64}$/.test(value)) {
 		throw new Error(`${label} must be a lowercase SHA-256`);
 	}
+}
+
+function assertGitObject(value: unknown, label: string): asserts value is string {
+	if (typeof value !== "string" || !/^[a-f0-9]{40}$/.test(value)) {
+		throw new Error(`${label} must be a Git SHA-1 object id`);
+	}
+}
+
+export function parseScopeCoverage(value: unknown, label: string): ScopeCoverageEntry[] {
+	if (!Array.isArray(value)) throw new Error(`${label} must be an array`);
+	let previousPath: string | undefined;
+	return value.map((entry, index) => {
+		if (!isRecord(entry)) throw new Error(`${label} ${index} must be an object`);
+		const entryLabel = `${label} ${index}`;
+		if ("requirement" in entry) {
+			assertExactKeys(entry, ["path", "requirement"], entryLabel);
+			assertRepositoryPath(entry.path, `${entryLabel} path`);
+			assertString(entry.requirement, `${entryLabel} requirement`);
+		} else {
+			assertExactKeys(entry, ["path", "dependencyOf", "necessity"], entryLabel);
+			assertRepositoryPath(entry.path, `${entryLabel} path`);
+			assertString(entry.dependencyOf, `${entryLabel} dependencyOf`);
+			assertString(entry.necessity, `${entryLabel} necessity`);
+		}
+		if (previousPath !== undefined && compareUnicodeCodePoints(previousPath, entry.path) >= 0) {
+			throw new Error(`${label} must be sorted and unique by path`);
+		}
+		previousPath = entry.path;
+		return entry as ScopeCoverageEntry;
+	});
+}
+
+export function parseCandidateIdentities(value: unknown, label: string): CandidateIdentity[] {
+	if (!Array.isArray(value) || value.length === 0) throw new Error(`${label} must be a non-empty array`);
+	const candidates = value.map((candidate, index) => {
+		if (!isRecord(candidate)) throw new Error(`${label} ${index} must be an object`);
+		assertExactKeys(
+			candidate,
+			["repository", "baseCommit", "baseTree", "commit", "tree", "scopeCoverage"],
+			`${label} ${index}`,
+		);
+		if (typeof candidate.repository !== "string" || !/^[^/\s]+\/[^/\s]+$/.test(candidate.repository)) {
+			throw new Error(`${label} ${index} repository must be owner/name`);
+		}
+		assertGitObject(candidate.baseCommit, `${label} ${index} baseCommit`);
+		assertGitObject(candidate.baseTree, `${label} ${index} baseTree`);
+		assertGitObject(candidate.commit, `${label} ${index} commit`);
+		assertGitObject(candidate.tree, `${label} ${index} tree`);
+		return {
+			repository: candidate.repository,
+			baseCommit: candidate.baseCommit,
+			baseTree: candidate.baseTree,
+			commit: candidate.commit,
+			tree: candidate.tree,
+			scopeCoverage: parseScopeCoverage(candidate.scopeCoverage, `${label} ${index} scopeCoverage`),
+		};
+	});
+	if (new Set(candidates.map(candidate => candidate.repository)).size !== candidates.length) {
+		throw new Error(`${label} repositories must be unique`);
+	}
+	if (
+		canonicalJson(candidates as unknown as JsonValue) !==
+		canonicalJson(sortCandidates(candidates) as unknown as JsonValue)
+	) {
+		throw new Error(`${label} must be sorted by repository and identity`);
+	}
+	return candidates;
 }
 
 function assertSortedUniqueIds(entries: readonly unknown[], label: string): void {
@@ -259,34 +353,7 @@ export function parseContextReleaseManifest(source: string): ContextReleaseManif
 	if (!/^[a-f0-9]{40}$/.test(String(value.commit)) || !/^[a-f0-9]{40}$/.test(String(value.tree))) {
 		throw new Error("release manifest commit/tree must be Git SHA-1 object ids");
 	}
-	if (!Array.isArray(value.candidates) || value.candidates.length === 0) {
-		throw new Error("release manifest candidates must be a non-empty array");
-	}
-	const candidates: CandidateIdentity[] = value.candidates.map((candidate, index) => {
-		if (!isRecord(candidate)) throw new Error(`release manifest candidate ${index} must be an object`);
-		assertExactKeys(candidate, ["repository", "commit", "tree"], `release manifest candidate ${index}`);
-		if (
-			typeof candidate.repository !== "string" ||
-			!/^[^/\s]+\/[^/\s]+$/.test(candidate.repository) ||
-			!(/^[a-f0-9]{40}$/.test(String(candidate.commit)) && /^[a-f0-9]{40}$/.test(String(candidate.tree)))
-		) {
-			throw new Error(`release manifest candidate ${index} is invalid`);
-		}
-		return {
-			repository: candidate.repository,
-			commit: String(candidate.commit),
-			tree: String(candidate.tree),
-		};
-	});
-	if (
-		canonicalJson(candidates as unknown as JsonValue) !==
-		canonicalJson(sortCandidates(candidates) as unknown as JsonValue)
-	) {
-		throw new Error("release manifest candidates must be sorted");
-	}
-	if (new Set(candidates.map(candidate => candidate.repository)).size !== candidates.length) {
-		throw new Error("release manifest candidates must have unique repositories");
-	}
+	const candidates = parseCandidateIdentities(value.candidates, "release manifest candidates");
 	const ownCandidate = candidates.find(candidate => candidate.repository === value.repository);
 	if (!ownCandidate || ownCandidate.commit !== value.commit || ownCandidate.tree !== value.tree) {
 		throw new Error("release manifest repository identity must match its candidate");
@@ -390,23 +457,100 @@ function semanticConfigurationHash(source: string): string {
 function sortCandidates(candidates: readonly CandidateIdentity[]): CandidateIdentity[] {
 	return [...candidates].sort(
 		(left, right) =>
-			left.repository.localeCompare(right.repository) ||
-			left.commit.localeCompare(right.commit) ||
-			left.tree.localeCompare(right.tree),
+			compareUnicodeCodePoints(left.repository, right.repository) ||
+			compareUnicodeCodePoints(left.baseCommit, right.baseCommit) ||
+			compareUnicodeCodePoints(left.baseTree, right.baseTree) ||
+			compareUnicodeCodePoints(left.commit, right.commit) ||
+			compareUnicodeCodePoints(left.tree, right.tree),
 	);
+}
+
+export function validateScopeCoverage(changedPaths: readonly string[], coverage: unknown): ScopeCoverageEntry[] {
+	const expectedPaths = [...changedPaths].sort(compareUnicodeCodePoints);
+	for (const [index, changedPath] of expectedPaths.entries()) {
+		assertRepositoryPath(changedPath, `changed path ${index}`);
+		if (index > 0 && expectedPaths[index - 1] === changedPath) {
+			throw new Error("PROMPT_POLICY_REVIEW_REQUIRED: actual diff contains a duplicate changed path");
+		}
+	}
+	const parsed = parseScopeCoverage(coverage, "scopeCoverage");
+	const coveredPaths = parsed.map(entry => entry.path);
+	if (
+		expectedPaths.length !== coveredPaths.length ||
+		expectedPaths.some((changedPath, index) => changedPath !== coveredPaths[index])
+	) {
+		const expected = new Set(expectedPaths);
+		const covered = new Set(coveredPaths);
+		const missing = expectedPaths.filter(changedPath => !covered.has(changedPath));
+		const extra = coveredPaths.filter(coveredPath => !expected.has(coveredPath));
+		throw new Error(
+			`PROMPT_POLICY_REVIEW_REQUIRED: scopeCoverage does not equal the actual diff` +
+				` (missing=${missing.join(",") || "none"}; extra=${extra.join(",") || "none"})`,
+		);
+	}
+	return parsed;
+}
+
+async function ensureOmpScopeBase(repositoryRoot: string): Promise<void> {
+	let identity = await ref.commitIdentity(repositoryRoot, OMP_SCOPE_BASE.commit);
+	if (!identity) {
+		try {
+			await gitFetch(
+				repositoryRoot,
+				OMP_SCOPE_BASE_URL,
+				OMP_SCOPE_BASE.commit,
+				`refs/omp/scope-base/${OMP_SCOPE_BASE.commit}`,
+			);
+		} catch {
+			throw new Error(`PROMPT_POLICY_REVIEW_REQUIRED: missing exact OMP scope base ${OMP_SCOPE_BASE.commit}`);
+		}
+		identity = await ref.commitIdentity(repositoryRoot, OMP_SCOPE_BASE.commit);
+	}
+	if (identity?.commit !== OMP_SCOPE_BASE.commit || identity.tree !== OMP_SCOPE_BASE.tree) {
+		throw new Error(
+			`PROMPT_POLICY_REVIEW_REQUIRED: OMP scope base identity does not match ${OMP_SCOPE_BASE.commit}/${OMP_SCOPE_BASE.tree}`,
+		);
+	}
+}
+
+async function buildCurrentCandidate(
+	repositoryRoot: string,
+	identity: Pick<CandidateIdentity, "commit" | "tree">,
+): Promise<CandidateIdentity> {
+	await ensureOmpScopeBase(repositoryRoot);
+	const changedPaths = (
+		await diff(repositoryRoot, {
+			base: OMP_SCOPE_BASE.commit,
+			head: identity.commit,
+			nameOnly: true,
+			z: true,
+		})
+	)
+		.split("\0")
+		.filter(Boolean)
+		.sort(compareUnicodeCodePoints);
+	const scopeCoverage = validateScopeCoverage(
+		changedPaths,
+		changedPaths.map(changedPath => ({ path: changedPath, requirement: OMP_SCOPE_REQUIREMENT })),
+	);
+	return {
+		repository: OMP_REPOSITORY,
+		baseCommit: OMP_SCOPE_BASE.commit,
+		baseTree: OMP_SCOPE_BASE.tree,
+		commit: identity.commit,
+		tree: identity.tree,
+		scopeCoverage,
+	};
 }
 
 function validateCandidateSet(
 	current: CandidateIdentity,
 	candidates: readonly CandidateIdentity[],
 ): CandidateIdentity[] {
-	const sorted = sortCandidates(candidates);
-	if (new Set(sorted.map(candidate => candidate.repository)).size !== sorted.length) {
-		throw new Error("PROMPT_POLICY_REVIEW_REQUIRED: candidate repositories must be unique");
-	}
+	const sorted = parseCandidateIdentities(sortCandidates(candidates), "candidate set");
 	const omp = sorted.find(candidate => candidate.repository === OMP_REPOSITORY);
-	if (!omp || omp.commit !== current.commit || omp.tree !== current.tree) {
-		throw new Error("PROMPT_POLICY_REVIEW_REQUIRED: candidates do not match current OMP identity");
+	if (!omp || canonicalJson(omp as unknown as JsonValue) !== canonicalJson(current as unknown as JsonValue)) {
+		throw new Error("PROMPT_POLICY_REVIEW_REQUIRED: candidates do not match current OMP identity and scope");
 	}
 	return sorted;
 }
@@ -496,7 +640,7 @@ export async function buildContextReleaseManifest(
 		}
 	}
 	const content = await assertTrackedManifestCurrent();
-	const currentCandidate = { repository: OMP_REPOSITORY, commit, tree };
+	const currentCandidate = await buildCurrentCandidate(repositoryRoot, { commit, tree });
 	const candidates = candidateOverride
 		? validateCandidateSet(currentCandidate, candidateOverride)
 		: await loadActivationCandidates(currentCandidate);

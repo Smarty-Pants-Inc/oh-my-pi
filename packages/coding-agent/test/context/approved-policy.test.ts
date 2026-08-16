@@ -6,13 +6,24 @@ import {
 	releaseProjectionMismatches,
 } from "../../src/context/approved-policy";
 import { canonicalJson, type JsonValue, sha256 } from "../../src/context/canonical";
-import type { ContextReleaseManifest } from "../../src/context/manifest";
+import type { CandidateIdentity, ContextReleaseManifest } from "../../src/context/manifest";
+
+function candidateIdentity(): CandidateIdentity {
+	return {
+		repository: "Smarty-Pants-Inc/oh-my-pi",
+		baseCommit: "9".repeat(40),
+		baseTree: "8".repeat(40),
+		commit: "a".repeat(40),
+		tree: "b".repeat(40),
+		scopeCoverage: [{ path: "packages/coding-agent/src/context/manifest.ts", requirement: "§8.6" }],
+	};
+}
 
 function validPolicy(): Record<string, unknown> {
 	const payload = {
 		schema: "smarty.approved_policy.v1",
 		approval: { reference: "owner-review-1", approvedBy: "paulbettner", approvedAt: "2026-08-15T12:00:00Z" },
-		candidates: [{ repository: "Smarty-Pants-Inc/oh-my-pi", commit: "a".repeat(40), tree: "b".repeat(40) }],
+		candidates: [candidateIdentity()],
 		contentManifestRootSha256: "c".repeat(64),
 		behaviorSha256: "d".repeat(64),
 		globalAgentsSha256: "e".repeat(64),
@@ -36,7 +47,9 @@ describe("approved policy", () => {
 
 	it("accepts only exact self-bound approval data", () => {
 		const policy = validPolicy();
-		expect(parseApprovedPolicy(JSON.stringify(policy)).rootSha256).toBe(String(policy.rootSha256));
+		const parsed = parseApprovedPolicy(JSON.stringify(policy));
+		expect(parsed.rootSha256).toBe(String(policy.rootSha256));
+		expect(parsed.candidates).toEqual(policy.candidates as CandidateIdentity[]);
 		const offsetPolicy: Record<string, unknown> = {
 			...policy,
 			approval: { ...(policy.approval as Record<string, unknown>), approvedAt: "2026-08-15T08:00:00-04:00" },
@@ -63,7 +76,7 @@ describe("approved policy", () => {
 			repository: "Smarty-Pants-Inc/oh-my-pi",
 			commit: "a".repeat(40),
 			tree: "b".repeat(40),
-			candidates: [{ repository: "Smarty-Pants-Inc/oh-my-pi", commit: "a".repeat(40), tree: "b".repeat(40) }],
+			candidates: [candidateIdentity()],
 			contentManifestRootSha256: "c".repeat(64),
 			behaviorSha256: "d".repeat(64),
 			globalAgentsSha256: "e".repeat(64),
@@ -76,6 +89,18 @@ describe("approved policy", () => {
 		);
 		expect(releaseProjectionMismatches({ ...current, behaviorSha256: "4".repeat(64) }, current)).toEqual([
 			`behaviorSha256: activated=${"4".repeat(64)} current=${"d".repeat(64)}`,
+		]);
+		const changedCoverage = {
+			...current,
+			candidates: [
+				{
+					...current.candidates[0]!,
+					scopeCoverage: [{ path: "packages/coding-agent/src/context/approved-policy.ts", requirement: "§17.1" }],
+				},
+			],
+		};
+		expect(releaseProjectionMismatches(changedCoverage, current)).toEqual([
+			"candidates: activated candidate set differs from current release",
 		]);
 	});
 });

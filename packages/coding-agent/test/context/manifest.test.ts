@@ -16,6 +16,7 @@ import {
 	parseContentManifest,
 	parseContextReleaseManifest,
 	trackedContentManifest,
+	validateScopeCoverage,
 } from "../../src/context/manifest";
 import { agentBehavior, parseAgentBehavior } from "../../src/context/registry";
 import { exportRenderedToolContracts, parseGeneratedToolContracts } from "../../src/context/tool-contracts";
@@ -71,7 +72,14 @@ describe("tracked context manifest", () => {
 	});
 
 	it("binds extension additions to exact candidate identity and bytes", () => {
-		const identity = { repository: "Smarty-Pants-Inc/oh-my-pi", commit: "a".repeat(40), tree: "b".repeat(40) };
+		const identity = {
+			repository: "Smarty-Pants-Inc/oh-my-pi",
+			baseCommit: "c".repeat(40),
+			baseTree: "d".repeat(40),
+			commit: "a".repeat(40),
+			tree: "b".repeat(40),
+			scopeCoverage: [{ path: "packages/coding-agent/src/context/manifest.ts", requirement: "§8.6" }],
+		};
 		const release = { candidates: [identity] };
 		expect(
 			approvedCandidateSourceMatches(identity.repository, identity, "c".repeat(64), "c".repeat(64), release),
@@ -97,7 +105,19 @@ describe("tracked context manifest", () => {
 			repository: "Smarty-Pants-Inc/oh-my-pi",
 			commit: "a".repeat(40),
 			tree: "b".repeat(40),
-			candidates: [{ repository: "Smarty-Pants-Inc/oh-my-pi", commit: "a".repeat(40), tree: "b".repeat(40) }],
+			candidates: [
+				{
+					repository: "Smarty-Pants-Inc/oh-my-pi",
+					baseCommit: "c".repeat(40),
+					baseTree: "d".repeat(40),
+					commit: "a".repeat(40),
+					tree: "b".repeat(40),
+					scopeCoverage: [
+						{ path: "packages/a.ts", requirement: "§2.15" },
+						{ path: "packages/b.test.ts", dependencyOf: "§23", necessity: "Runnable contract proof." },
+					],
+				},
+			],
 			contentManifest,
 			contentManifestRootSha256: contentManifest.rootSha256,
 			behaviorSha256: contentManifest.behaviorSha256,
@@ -130,6 +150,25 @@ describe("tracked context manifest", () => {
 				}),
 			),
 		).toThrow();
+		const candidate = release.candidates[0]!;
+		for (const scopeCoverage of [
+			[candidate.scopeCoverage[0], candidate.scopeCoverage[0]],
+			[...candidate.scopeCoverage].reverse(),
+			[{ ...candidate.scopeCoverage[0], unknown: true }],
+		]) {
+			expect(() =>
+				parseContextReleaseManifest(JSON.stringify({ ...release, candidates: [{ ...candidate, scopeCoverage }] })),
+			).toThrow();
+		}
+		expect(() => validateScopeCoverage(["packages/a.ts", "packages/b.ts"], [candidate.scopeCoverage[0]])).toThrow(
+			"missing=packages/b.ts",
+		);
+		expect(() =>
+			validateScopeCoverage(
+				["packages/a.ts"],
+				[candidate.scopeCoverage[0], { path: "packages/extra.ts", requirement: "§2.15" }],
+			),
+		).toThrow("extra=packages/extra.ts");
 	});
 
 	it("is deterministic and matches live prompt, behavior, and tool contracts", async () => {
