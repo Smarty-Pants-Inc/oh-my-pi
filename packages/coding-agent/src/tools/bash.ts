@@ -165,14 +165,7 @@ interface GithubPrOptionGrammar {
 }
 
 const BASH_GITHUB_PR_OPTION_GRAMMARS = new Map<string, GithubPrOptionGrammar>([
-	["close", { boolean: new Set(), value: new Set(["--comment", "-c"]) }],
-	[
-		"comment",
-		{
-			boolean: new Set(["--create-if-none", "--delete-last", "--edit-last", "--yes"]),
-			value: new Set(["--body", "--body-file", "-b", "-F"]),
-		},
-	],
+	["close", { boolean: new Set(), value: new Set() }],
 	[
 		"create",
 		{
@@ -232,11 +225,11 @@ const BASH_GITHUB_PR_OPTION_GRAMMARS = new Map<string, GithubPrOptionGrammar>([
 	],
 	["lock", { boolean: new Set(), value: new Set(["--reason", "-r"]) }],
 	["ready", { boolean: new Set(["--undo"]), value: new Set() }],
-	["reopen", { boolean: new Set(), value: new Set(["--comment", "-c"]) }],
+	["reopen", { boolean: new Set(), value: new Set() }],
 	[
 		"review",
 		{
-			boolean: new Set(["--approve", "--comment", "--request-changes", "-a", "-c", "-r"]),
+			boolean: new Set(["--approve", "--request-changes", "-a", "-r"]),
 			value: new Set(["--body", "--body-file", "-b", "-F"]),
 		},
 	],
