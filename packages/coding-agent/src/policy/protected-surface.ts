@@ -1409,6 +1409,19 @@ function collectSemanticChanges(
 	}
 }
 
+function compareUnicodeCodePoints(left: string, right: string): number {
+	let leftIndex = 0;
+	let rightIndex = 0;
+	while (leftIndex < left.length && rightIndex < right.length) {
+		const leftPoint = left.codePointAt(leftIndex)!;
+		const rightPoint = right.codePointAt(rightIndex)!;
+		if (leftPoint !== rightPoint) return leftPoint < rightPoint ? -1 : 1;
+		leftIndex += leftPoint > 0xffff ? 2 : 1;
+		rightIndex += rightPoint > 0xffff ? 2 : 1;
+	}
+	return leftIndex < left.length ? 1 : rightIndex < right.length ? -1 : 0;
+}
+
 function sortedUnique(changes: readonly ProtectedSurfaceChange[]): ProtectedSurfaceChange[] {
 	const entries = new Map<string, ProtectedSurfaceChange>();
 	for (const change of changes) {
@@ -1416,9 +1429,9 @@ function sortedUnique(changes: readonly ProtectedSurfaceChange[]): ProtectedSurf
 	}
 	return [...entries.values()].sort(
 		(left, right) =>
-			left.path.localeCompare(right.path) ||
-			left.surface.localeCompare(right.surface) ||
-			left.kind.localeCompare(right.kind),
+			compareUnicodeCodePoints(left.path, right.path) ||
+			compareUnicodeCodePoints(left.surface, right.surface) ||
+			compareUnicodeCodePoints(left.kind, right.kind),
 	);
 }
 

@@ -351,6 +351,30 @@ describe("protected semantic manifest deltas", () => {
 		]);
 	});
 
+	it("uses Unicode code-point order for cross-language evidence", () => {
+		const expectedPaths = [
+			"dot_agents/skills/omp-upstream-merge/SKILL.md",
+			"dot_agents/skills/omp-upstream-merge/references/upstream-SKILL.md",
+			"skills/A/SKILL.md",
+			"skills/a/SKILL.md",
+			"skills/\u{e000}/SKILL.md",
+			"skills/\u{1f600}/SKILL.md",
+		] as const;
+		const result = diffProtectedSurfaces(
+			[
+				expectedPaths[5],
+				expectedPaths[3],
+				expectedPaths[1],
+				expectedPaths[0],
+				expectedPaths[4],
+				expectedPaths[2],
+				expectedPaths[0],
+			].map(path => ({ path })),
+		);
+
+		expect(result.classifications).toEqual(expectedPaths.map(path => ({ path, surface: "skill", kind: "changed" })));
+	});
+
 	it("covers shared instructions, configuration, skills, guards, tools, automatic turns, and capability seams", () => {
 		expect(
 			[
