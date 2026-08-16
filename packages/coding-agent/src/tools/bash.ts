@@ -165,7 +165,7 @@ interface GithubPrOptionGrammar {
 }
 
 const BASH_GITHUB_PR_OPTION_GRAMMARS = new Map<string, GithubPrOptionGrammar>([
-	["close", { boolean: new Set(["--delete-branch", "-d"]), value: new Set(["--comment", "-c"]) }],
+	["close", { boolean: new Set(), value: new Set(["--comment", "-c"]) }],
 	[
 		"comment",
 		{
@@ -176,16 +176,7 @@ const BASH_GITHUB_PR_OPTION_GRAMMARS = new Map<string, GithubPrOptionGrammar>([
 	[
 		"create",
 		{
-			boolean: new Set([
-				"--draft",
-				"--dry-run",
-				"--fill",
-				"--fill-first",
-				"--fill-verbose",
-				"--no-maintainer-edit",
-				"-d",
-				"-f",
-			]),
+			boolean: new Set(["--draft", "--fill", "--fill-first", "--fill-verbose", "--no-maintainer-edit", "-d", "-f"]),
 			value: new Set([
 				"--assignee",
 				"--base",
@@ -243,19 +234,7 @@ const BASH_GITHUB_PR_OPTION_GRAMMARS = new Map<string, GithubPrOptionGrammar>([
 	[
 		"merge",
 		{
-			boolean: new Set([
-				"--admin",
-				"--auto",
-				"--delete-branch",
-				"--disable-auto",
-				"--merge",
-				"--rebase",
-				"--squash",
-				"-d",
-				"-m",
-				"-r",
-				"-s",
-			]),
+			boolean: new Set(["--admin", "--auto", "--disable-auto", "--merge", "--rebase", "--squash", "-m", "-r", "-s"]),
 			value: new Set([
 				"--author-email",
 				"--body",
@@ -599,6 +578,7 @@ function githubPrArgsAreAllowed(args: readonly string[]): boolean {
 	if (!grammar) return false;
 
 	let optionsEnded = false;
+	let explicitCreateHead = false;
 	for (let index = 2; index < args.length; index++) {
 		const arg = args[index]!;
 		if (optionsEnded || !arg.startsWith("-")) continue;
@@ -609,6 +589,7 @@ function githubPrArgsAreAllowed(args: readonly string[]): boolean {
 		if (grammar.boolean.has(arg)) continue;
 		if (grammar.value.has(arg) || arg === "-R" || arg === "--repo") {
 			if (index + 1 >= args.length) return false;
+			if ((arg === "-H" || arg === "--head") && args[index + 1]!.length > 0) explicitCreateHead = true;
 			index++;
 			continue;
 		}
@@ -616,11 +597,15 @@ function githubPrArgsAreAllowed(args: readonly string[]): boolean {
 		const equalsIndex = arg.indexOf("=");
 		if (equalsIndex > 2) {
 			const option = arg.slice(0, equalsIndex);
-			if (grammar.value.has(option) || option === "--repo") continue;
+			if (grammar.value.has(option) || option === "--repo") {
+				if (option === "--head" && arg.slice(equalsIndex + 1).length > 0) explicitCreateHead = true;
+				continue;
+			}
 		}
 		return false;
 	}
-	return true;
+	// GitHub documents that an explicit head skips gh's branch push/fork path.
+	return args[1] !== "create" || explicitCreateHead;
 }
 
 function resolveNamedEffectExecutable(name: "env" | "git" | "gh"): string | undefined {
