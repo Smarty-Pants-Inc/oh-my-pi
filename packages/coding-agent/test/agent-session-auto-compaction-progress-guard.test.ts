@@ -436,6 +436,73 @@ describe("AgentSession auto-compaction progress guard", () => {
 		expect(noProgress.length).toBe(0);
 	});
 
+	it("parks agent-attributed IRC when a user turn arrives after compaction selects goal continuation", async () => {
+		activateOngoingGoal("late-user-owner");
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined as never);
+		const continueSpy = vi.spyOn(session.agent, "continue").mockImplementation(async () => {
+			expect([...session.agent.peekSteeringQueue(), ...session.agent.peekFollowUpQueue()]).toEqual([
+				expect.objectContaining({
+					role: "user",
+					content: "late attributed user",
+					attribution: "user",
+				}),
+			]);
+			session.agent.clearAllQueues();
+		});
+		vi.spyOn(session, "getContextUsage").mockReturnValue({ tokens: 1000, contextWindow: 200000, percent: 0.5 });
+
+		const realHasQueuedMessages = session.agent.hasQueuedMessages.bind(session.agent);
+		let injectOnNextEmptyQueueCheck = false;
+		const queueChecks: boolean[] = [];
+		vi.spyOn(session.agent, "hasQueuedMessages").mockImplementation(() => {
+			const queued = realHasQueuedMessages();
+			queueChecks.push(queued);
+			if (injectOnNextEmptyQueueCheck && !queued) {
+				injectOnNextEmptyQueueCheck = false;
+				session.agent.steer({
+					role: "user",
+					content: "late parent IRC",
+					attribution: "agent",
+					steering: true,
+					timestamp: Date.now(),
+				});
+				session.agent.followUp({
+					role: "user",
+					content: "late attributed user",
+					attribution: "user",
+					timestamp: Date.now(),
+				});
+			}
+			return queued;
+		});
+
+		const { promise: compactionDone, resolve: onCompactionDone } = Promise.withResolvers<void>();
+		session.subscribe(event => {
+			if (event.type === "auto_compaction_end") {
+				injectOnNextEmptyQueueCheck = true;
+				onCompactionDone();
+			}
+		});
+
+		const assistantMsg = highUsageAssistant();
+		session.agent.emitExternalEvent({ type: "message_end", message: assistantMsg });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
+
+		await compactionDone;
+		await session.waitForIdle();
+
+		// The first post-event queue check selected goal continuation with an empty
+		// queue. Its microtask then observed the newly arrived mixed queue.
+		expect(queueChecks).toContain(false);
+		expect(promptSpy).not.toHaveBeenCalled();
+		expect(continueSpy).toHaveBeenCalledTimes(1);
+		expect(session.agent.peekSteeringQueue()).toEqual([
+			expect.objectContaining({ content: "late parent IRC", attribution: "agent" }),
+		]);
+		expect(session.agent.peekFollowUpQueue()).toEqual([]);
+		session.agent.clearAllQueues();
+	});
+
 	it("rebases the in-flight prompt snapshot so mid-run compaction is not misread as a dead-end", async () => {
 		activateOngoingGoal("in-flight-snapshot");
 		// Regression: the pending context snapshot is set once per prompt and
@@ -737,6 +804,7 @@ describe("AgentSession auto-compaction progress guard", () => {
 		session.agent.followUp({
 			role: "user",
 			content: [{ type: "text", text: "Queued while recovering" }],
+			attribution: "user",
 			timestamp: Date.now(),
 		});
 		vi.spyOn(compactionModule, "prepareCompaction").mockReturnValue(undefined);
@@ -786,7 +854,7 @@ describe("AgentSession auto-compaction progress guard", () => {
 		);
 	});
 
-	it("does not restore a length stop after handoff recovery commits", async () => {
+	it("does not restore a length stop after unscoped handoff recovery commits", async () => {
 		session.settings.set("compaction.strategy", "handoff");
 		session.settings.set("contextPromotion.enabled", false);
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined as never);
@@ -821,7 +889,7 @@ describe("AgentSession auto-compaction progress guard", () => {
 		await compactionDone;
 		await session.waitForIdle();
 
-		expect(promptSpy).toHaveBeenCalledTimes(1);
+		expect(promptSpy).not.toHaveBeenCalled();
 		expect(handoffSpy).toHaveBeenCalledTimes(1);
 		expect(continueSpy).not.toHaveBeenCalled();
 		expect(sessionManager.getBranch()).not.toContainEqual(

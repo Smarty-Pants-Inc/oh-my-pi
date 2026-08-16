@@ -278,6 +278,13 @@ describe("AgentSession auto-compaction queue resume", () => {
 		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
 
 		const continueSpy = vi.spyOn(session.agent, "continue").mockImplementation(async () => {
+			expect([...session.agent.peekSteeringQueue(), ...session.agent.peekFollowUpQueue()]).toEqual([
+				expect.objectContaining({
+					role: "user",
+					content: "please respond after compaction",
+					attribution: "user",
+				}),
+			]);
 			session.agent.clearAllQueues();
 		});
 
@@ -292,10 +299,19 @@ describe("AgentSession auto-compaction queue resume", () => {
 			await Promise.resolve();
 		}
 
-		// A message arrives DURING compaction (post-abort, still disconnected).
+		// An agent-attributed IRC record arrives before the user's message. It must
+		// stay parked while the attributed user owns the resumed direct turn.
+		session.agent.steer({
+			role: "user",
+			content: "parent IRC must stay passive",
+			attribution: "agent",
+			steering: true,
+			timestamp: Date.now(),
+		});
 		session.agent.followUp({
 			role: "user",
 			content: "please respond after compaction",
+			attribution: "user",
 			timestamp: Date.now(),
 		});
 		expect(session.agent.hasQueuedMessages()).toBe(true);
@@ -306,6 +322,11 @@ describe("AgentSession auto-compaction queue resume", () => {
 
 		// compact()'s finally re-drained the stranded queue after reconnecting.
 		expect(continueSpy).toHaveBeenCalledTimes(1);
+		expect(session.agent.peekSteeringQueue()).toEqual([
+			expect.objectContaining({ content: "parent IRC must stay passive", attribution: "agent" }),
+		]);
+		expect(session.agent.peekFollowUpQueue()).toEqual([]);
+		session.agent.clearAllQueues();
 	});
 
 	it("cancels an in-flight auto-compaction when manual compact startup aborts", async () => {

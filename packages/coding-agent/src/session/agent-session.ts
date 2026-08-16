@@ -49,7 +49,6 @@ import {
 	type CompactionPreparation,
 	type CompactionResult,
 	calculatePromptTokens,
-	collectCompactionContextInstructions,
 	collectEntriesForBranchSummary,
 	estimateTokens,
 	generateBranchSummary,
@@ -118,6 +117,7 @@ import { onAppendOnlyModeChanged, onModelRolesChanged } from "../config/settings
 import {
 	explainContext as buildContextExplanation,
 	type ContextExplanation,
+	type RuntimeContextEvidence,
 	type RuntimeMcpInstruction,
 } from "../context/explain";
 import { bindRenderedInstruction, renderInstruction } from "../context/registry";
@@ -689,9 +689,6 @@ export class AgentSession {
 	#lifecycleTransitionGeneration = 0;
 
 	readonly #irc: IrcBridge;
-	#ircWakeTurnObserver:
-		| ((records: CustomMessage[]) => ((error?: unknown) => void | Promise<void>) | undefined)
-		| undefined;
 	// Agent identity (registry id) used for IRC routing and job ownership.
 	#agentId: string | undefined;
 	#agentKind: "main" | "sub" = "main";
@@ -781,7 +778,14 @@ export class AgentSession {
 	readonly #automaticTurns = new AutomaticTurnAuthority();
 	readonly #capabilities: SessionCapabilities | undefined;
 	#currentTurnId: string | undefined;
+	#pendingAskReanswerOwner: ToolResultMessage | undefined;
+	#activeDirectUserContinuationOwner: AgentMessage | undefined;
+	#desiredSteeringMode: "all" | "one-at-a-time";
+	#desiredFollowUpMode: "all" | "one-at-a-time";
+	#desiredInterruptMode: "immediate" | "wait";
 	#renderedToolContracts: RenderedToolContractExport | undefined;
+	#runtimeContextEvidence: RuntimeContextEvidence | undefined;
+	#runtimeContextModel: Model | undefined;
 	readonly #getMcpServerInstructionSources: (() => RuntimeMcpInstruction[]) | undefined;
 	readonly #queuedAsyncResults = new Map<string, AsyncResultEntry>();
 	#turnExtensionInstructions: ContextInstruction[] = [];
@@ -933,11 +937,8 @@ export class AgentSession {
 		return queuedDrainScheduled || ircWakeScheduled;
 	}
 
-	/** IRC records that arrive after the loop's final aside poll — or while an abort skipped that
-	 *  poll — land in pending IRC queues with no loop left to drain them; the queued-message drain's
-	 *  gate (agent.hasQueuedMessages()) does not count peer IRC interrupts. Once idle, wake a turn so
-	 *  the agent responds to the peer. Skip only when a queued steer/follow-up will itself drive a
-	 *  resume turn whose aside poll already consumes these (no double-wake). */
+	/** Persist IRC records that missed the loop's final aside poll. A queued
+	 * authorized turn may consume them, but IRC alone cannot mint turn authority. */
 	#resumeStrandedIrcAsides(): boolean {
 		if (this.#modeExitDrainSuppressionDepth > 0 || this.#isDisposed || this.isStreaming || !this.#irc.hasPending()) {
 			return false;
@@ -960,82 +961,17 @@ export class AgentSession {
 			return false;
 		}
 		this.#wakeForIrc(records);
-		return true;
+		return false;
 	}
 
-	/** Fire-and-forget wake turn for incoming IRC — idle delivery and stranded-aside resume both
-	 *  route here. Wrapped in #beginInFlight/#endInFlight so the turn is tracked and its settle
-	 *  re-drains anything that stranded during it. A user interrupt may have intentionally left a
-	 *  follow-up queued behind an invalid tail (seam #5); the wake turn's loop would otherwise drain
-	 *  it, so park the follow-up queue across the wake and restore it after. It stays queued post-wake
-	 *  because #canAutoContinueForFollowUp suppresses follow-up auto-resume while a user interrupt is
-	 *  in effect, even though the wake left a provider-valid tail. */
+	/** Persist peer input without creating a semantic turn. IRC has no registered
+	 * automatic-turn authority; a later authorized turn can consume the record. */
 	#wakeForIrc(records: CustomMessage[]): void {
 		if (this.#modeExitDrainSuppressionDepth > 0) {
 			this.#irc.deferWake(records);
 			return;
 		}
-		// Park only a *blocked* follow-up (one a user interrupt is intentionally holding); an
-		// already-resumable follow-up can ride the wake turn normally without reordering.
-		const parkedFollowUps =
-			this.agent.peekSteeringQueue().length === 0 &&
-			this.agent.peekFollowUpQueue().length > 0 &&
-			!this.#canAutoContinueForFollowUp()
-				? [...this.agent.peekFollowUpQueue()]
-				: [];
-		const parkedQueueDrainBlocked = parkedFollowUps.length > 0 && this.#queuedMessageDrainBlocked;
-		if (parkedFollowUps.length > 0) {
-			this.agent.replaceQueues([...this.agent.peekSteeringQueue()], [], true);
-			if (parkedQueueDrainBlocked) this.#queuedMessageDrainBlocked = false;
-		}
-		let finishObservation: ((error?: unknown) => void | Promise<void>) | undefined;
-		try {
-			finishObservation = this.#ircWakeTurnObserver?.(records);
-		} catch (error) {
-			logger.warn("IRC wake turn observer failed to start", { error: String(error) });
-		}
-		this.#resetPromptMaintenanceState();
-		// Capture the generation before the wake so its post-prompt recovery wait
-		// bails the instant an abort (which bumps #promptGeneration) supersedes
-		// this wake — otherwise the wait would follow a successor turn (a queued
-		// follow-up or another stranded IRC wake started by abort cleanup),
-		// delaying finishObservation and mis-attributing the successor's RPC
-		// progress to this now-dead wake monitor.
-		const generation = this.#promptGeneration;
-		this.#beginInFlight();
-		let turnError: unknown;
-		const wakeTask = this.#promptAutomaticTurn(records, {
-			authority: "bounded_transport_or_protocol_retry",
-		})
-			.catch(error => {
-				turnError = error;
-				logger.warn("IRC wake turn failed", { error: String(error) });
-			})
-			.finally(async () => {
-				try {
-					await this.#waitForPostPromptRecovery(generation);
-				} catch (error) {
-					turnError ??= error;
-					logger.warn("IRC wake turn recovery failed", { error: String(error) });
-				}
-				if (parkedFollowUps.length > 0) {
-					this.agent.replaceQueues(
-						[...this.agent.peekSteeringQueue()],
-						[...parkedFollowUps, ...this.agent.peekFollowUpQueue()],
-						true,
-					);
-					this.#queuedMessageDrainBlocked ||= parkedQueueDrainBlocked;
-				}
-				this.#endInFlight(async () => {
-					try {
-						await finishObservation?.(turnError);
-					} catch (error) {
-						logger.warn("IRC wake turn observer failed to finish", { error: String(error) });
-					}
-				});
-			});
-		this.#ircWakeTasks.add(wakeTask);
-		void wakeTask.finally(() => this.#ircWakeTasks.delete(wakeTask)).catch(() => {});
+		this.#persistPassiveCustomMessages(records);
 	}
 
 	async #waitForIrcWakeTasks(): Promise<void> {
@@ -1132,6 +1068,9 @@ export class AgentSession {
 
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
+		this.#desiredSteeringMode = this.agent.getSteeringMode();
+		this.#desiredFollowUpMode = this.agent.getFollowUpMode();
+		this.#desiredInterruptMode = this.agent.getInterruptMode();
 		this.sessionManager = config.sessionManager;
 		this.settings = config.settings;
 		this.#capabilities = config.capabilities;
@@ -1275,7 +1214,7 @@ export class AgentSession {
 			sessionId: () => this.sessionId,
 			emitSessionEvent: event => this.#emitSessionEvent(event),
 			scheduleAgentContinue: options =>
-				this.#scheduleAgentContinue({ authority: "bounded_transport_or_protocol_retry", ...options }),
+				this.#scheduleAgentContinue({ ...options, authority: "bounded_transport_or_protocol_retry" }),
 			waitForSessionMessagePersistence: message => this.#waitForSessionMessagePersistence(message),
 			appendSessionMessage: message => this.#appendSessionMessage(message),
 			persistedAssistantEntryId: message => (message as PersistedAssistantMessage)[kPersistedSessionEntryId],
@@ -1399,6 +1338,10 @@ export class AgentSession {
 				const first = messages[0];
 				if (!first) return;
 				const authority = this.#yieldTurnAuthority(messages);
+				if (!authority) {
+					this.#persistPassiveCustomMessages(messages);
+					return;
+				}
 				this.#beginInFlight();
 				try {
 					await this.#promptAutomaticTurn(messages.length === 1 ? first : messages, authority);
@@ -1517,7 +1460,7 @@ export class AgentSession {
 			emitSessionEvent: event => this.#emitSessionEvent(event),
 			schedulePostPromptTask: (task, options) => this.#schedulePostPromptTask(task, options),
 			scheduleAgentContinue: options =>
-				this.#scheduleAgentContinue({ authority: "bounded_transport_or_protocol_retry", ...options }),
+				this.#scheduleAgentContinue({ ...options, authority: "bounded_transport_or_protocol_retry" }),
 			promptGeneration: () => this.#promptGeneration,
 		};
 		this.#ttsr = new TtsrCoordinator(ttsrHost, config.ttsrManager);
@@ -1550,7 +1493,7 @@ export class AgentSession {
 			emitNotice: (level, message, source) => this.emitNotice(level, message, source),
 			schedulePostPromptTask: task => this.#schedulePostPromptTask(task),
 			scheduleAgentContinue: options =>
-				this.#scheduleAgentContinue({ authority: "bounded_transport_or_protocol_retry", ...options }),
+				this.#scheduleAgentContinue({ ...options, authority: "bounded_transport_or_protocol_retry" }),
 			discardAssistantTurn: message => this.#recovery.discardAssistantTurn(message),
 		};
 		this.#streamingEditGuard = new StreamingEditGuard(streamGuardsHost);
@@ -1761,7 +1704,7 @@ export class AgentSession {
 			emitNotice: (level, message, source) => this.emitNotice(level, message, source),
 			schedulePostPromptTask: (task, options) => this.#schedulePostPromptTask(task, options),
 			scheduleAgentContinue: options =>
-				this.#scheduleAgentContinue({ authority: "bounded_transport_or_protocol_retry", ...(options ?? {}) }),
+				this.#scheduleAgentContinue({ ...(options ?? {}), authority: "bounded_transport_or_protocol_retry" }),
 			scheduleCompactionContinuation: options => this.#scheduleCompactionContinuation(options),
 			persistTurnMessagesForMidRunCompaction: context => this.#persistTurnMessagesForMidRunCompaction(context),
 			findLastAssistantMessage: () => this.#findLastAssistantMessage(),
@@ -4029,6 +3972,22 @@ export class AgentSession {
 		options?.onSkip?.(reason);
 	}
 
+	#persistPassiveCustomMessages(messages: readonly AgentMessage[]): void {
+		for (const message of messages) {
+			if (message.role !== "custom") {
+				throw new Error(`Passive automatic delivery requires a custom message, received ${message.role}`);
+			}
+			this.agent.appendMessage(message);
+			this.sessionManager.appendCustomMessageEntry(
+				message.customType,
+				message.content,
+				message.display,
+				message.details,
+				message.attribution ?? "agent",
+			);
+		}
+	}
+
 	async #promptAutomaticTurn(
 		messages: AgentMessage | AgentMessage[],
 		options: Pick<ScheduledAgentContinueOptions, "authority" | "originTurnId">,
@@ -4065,11 +4024,98 @@ export class AgentSession {
 		}
 	}
 
+	#syncAgentQueueModes(): void {
+		const directUserActive = this.#activeDirectUserContinuationOwner !== undefined;
+		this.agent.setSteeringMode(directUserActive ? "one-at-a-time" : this.#desiredSteeringMode);
+		this.agent.setFollowUpMode(directUserActive ? "one-at-a-time" : this.#desiredFollowUpMode);
+		this.agent.setInterruptMode(directUserActive ? "wait" : this.#desiredInterruptMode);
+	}
+
+	#isolateDirectUserContinuationOwner(): { owner: AgentMessage; restore: () => void } | undefined {
+		if (this.#activeDirectUserContinuationOwner) return undefined;
+		const steering = [...this.agent.peekSteeringQueue()];
+		const followUp = [...this.agent.peekFollowUpQueue()];
+		const pendingAskReanswerOwner = this.#pendingAskReanswerOwner;
+		const transcriptTail = this.agent.state.messages.at(-1);
+		const transcriptOwner =
+			pendingAskReanswerOwner && transcriptTail === pendingAskReanswerOwner ? pendingAskReanswerOwner : undefined;
+		const queuedOwner = transcriptOwner ? undefined : [...steering, ...followUp].find(isUserQueuedMessage);
+		const owner = transcriptOwner ?? queuedOwner;
+		if (!owner) {
+			this.#pendingAskReanswerOwner = undefined;
+			return undefined;
+		}
+		this.#activeDirectUserContinuationOwner = owner;
+		this.#pendingAskReanswerOwner = undefined;
+		this.#syncAgentQueueModes();
+		let restored = false;
+		let queuesIsolated = false;
+		const parkedArrivalSteering: AgentMessage[] = [];
+		const parkedArrivalFollowUp: AgentMessage[] = [];
+		const detachQueueGuard = this.agent.addBeforeQueuedMessageDequeueHook(() => {
+			if (this.#activeDirectUserContinuationOwner !== owner) return;
+			const currentSteering = [...this.agent.peekSteeringQueue()];
+			const currentFollowUp = [...this.agent.peekFollowUpQueue()];
+			const extraSteering = currentSteering.filter(message => message !== owner);
+			const extraFollowUp = currentFollowUp.filter(message => message !== owner);
+			if (extraSteering.length === 0 && extraFollowUp.length === 0) return;
+			parkedArrivalSteering.push(...extraSteering);
+			parkedArrivalFollowUp.push(...extraFollowUp);
+			this.agent.replaceQueues(
+				currentSteering.filter(message => message === owner),
+				currentFollowUp.filter(message => message === owner),
+				true,
+			);
+		});
+		const restore = () => {
+			if (restored) return;
+			restored = true;
+			try {
+				detachQueueGuard();
+				if (!queuesIsolated) return;
+				const currentSteering = [...this.agent.peekSteeringQueue()].filter(message => message !== owner);
+				const currentFollowUp = [...this.agent.peekFollowUpQueue()].filter(message => message !== owner);
+				const ownerPending =
+					queuedOwner !== undefined &&
+					(this.agent.peekSteeringQueue().includes(owner) || this.agent.peekFollowUpQueue().includes(owner));
+				this.agent.replaceQueues(
+					[
+						...(ownerPending ? steering : steering.filter(message => message !== owner)),
+						...parkedArrivalSteering,
+						...currentSteering,
+					],
+					[
+						...(ownerPending ? followUp : followUp.filter(message => message !== owner)),
+						...parkedArrivalFollowUp,
+						...currentFollowUp,
+					],
+					true,
+				);
+			} finally {
+				if (this.#activeDirectUserContinuationOwner === owner) {
+					this.#activeDirectUserContinuationOwner = undefined;
+					this.#syncAgentQueueModes();
+				}
+			}
+		};
+		try {
+			this.agent.replaceQueues(queuedOwner ? [owner] : [], [], true);
+			queuesIsolated = true;
+		} catch (error) {
+			restore();
+			throw error;
+		}
+		return { owner, restore };
+	}
+
 	#scheduleAgentContinue(options?: ScheduledAgentContinueOptions): void {
 		if (!options || !this.#automaticTurns.authorize(options.authority, options.originTurnId)) return;
 		this.#schedulePostPromptTask(
 			async signal => {
 				let directTurnId: string | undefined;
+				let directUserOwner: AgentMessage | undefined;
+				let restoreDirectUserQueues: (() => void) | undefined;
+				let inFlight = false;
 				// Defense in depth: if compaction/handoff slipped onto the post-prompt queue
 				// alongside us (e.g. via a scheduler we don't own), refuse to start a fresh
 				// streaming turn — agent.continue() here would race the handoff's session
@@ -4091,26 +4137,25 @@ export class AgentSession {
 					return;
 				}
 				if (options.authority === "direct_user_input") {
-					this.#closeCurrentTurn();
-					directTurnId = this.#automaticTurns.openTurn();
-					this.#currentTurnId = directTurnId;
-					const queuedUser = [...this.agent.peekSteeringQueue(), ...this.agent.peekFollowUpQueue()].find(
-						message => message.role === "user",
-					);
-					if (queuedUser) {
-						const promptText =
-							typeof queuedUser.content === "string"
-								? queuedUser.content
-								: queuedUser.content
-										.filter((part): part is TextContent => part.type === "text")
-										.map(part => part.text)
-										.join("\n");
-						this.#capabilities?.beginDirectUserTurn(directTurnId, promptText);
+					const directUser = this.#isolateDirectUserContinuationOwner();
+					if (!directUser) {
+						this.#skipAgentContinue("should-continue-false", options);
+						return;
 					}
+					directUserOwner = directUser.owner;
+					restoreDirectUserQueues = directUser.restore;
 				}
-				const continuationTurnId = directTurnId ?? options.originTurnId ?? this.#currentTurnId;
-				this.#beginInFlight();
 				try {
+					if (options.authority === "direct_user_input") {
+						this.#closeCurrentTurn();
+						directTurnId = this.#automaticTurns.openTurn();
+						this.#currentTurnId = directTurnId;
+						if (!directUserOwner) throw new Error("Direct-user continuation owner missing after isolation");
+						this.#capabilities?.beginDirectUserTurn(directTurnId, queueChipText(directUserOwner));
+					}
+					const continuationTurnId = directTurnId ?? options.originTurnId ?? this.#currentTurnId;
+					this.#beginInFlight();
+					inFlight = true;
 					const reverted = await this.#recovery.maybeRestoreRetryFallbackPrimary();
 					if (signal.aborted || this.#isDisposed) {
 						this.#skipAgentContinue("post-restore-unavailable", options);
@@ -4160,8 +4205,12 @@ export class AgentSession {
 					options?.onError?.(error);
 				} finally {
 					this.#usagePreflightReadyForNextModelCall = false;
-					if (directTurnId && this.#currentTurnId === directTurnId) this.#closeCurrentTurn();
-					this.#endInFlight();
+					try {
+						restoreDirectUserQueues?.();
+					} finally {
+						if (directTurnId && this.#currentTurnId === directTurnId) this.#closeCurrentTurn();
+						if (inFlight) this.#endInFlight();
+					}
 				}
 			},
 			{
@@ -4177,6 +4226,10 @@ export class AgentSession {
 	}
 
 	authorizeAutomaticTurn(source: AutomaticTurnSource, originTurnId?: string): boolean {
+		if (source === "bounded_transport_or_protocol_retry") {
+			this.#automaticTurns.record(source, "rejected", "retry authority is internal to recovery transports");
+			return false;
+		}
 		return this.#automaticTurns.authorize(source, originTurnId);
 	}
 
@@ -4189,16 +4242,22 @@ export class AgentSession {
 	}
 
 	setRenderedToolContracts(contracts: RenderedToolContractExport): void {
-		this.#renderedToolContracts = structuredClone(contracts);
+		const snapshot = structuredClone(contracts);
+		this.#renderedToolContracts = snapshot;
+		if (
+			this.#runtimeContextEvidence &&
+			this.#runtimeContextModel?.provider === contracts.provider &&
+			this.#runtimeContextModel.id === contracts.model
+		) {
+			this.#runtimeContextEvidence = { ...this.#runtimeContextEvidence, renderedToolContracts: snapshot };
+		}
 	}
 
 	getRenderedToolContracts(): RenderedToolContractExport | undefined {
 		return this.#renderedToolContracts ? structuredClone(this.#renderedToolContracts) : undefined;
 	}
 
-	/** Explain exact runtime context when available and label all other dynamic sources as potential. */
-	async explainContext(options: { includeContent?: boolean } = {}): Promise<ContextExplanation> {
-		const target = this.#agentKind === "sub" ? "subagent" : "main";
+	setRuntimeContextEvidence(evidence: RuntimeContextEvidence, model: Model): void {
 		const selectedSkills = this.agent.state.messages.flatMap((message, order) => {
 			if (message.role !== "custom" || message.customType !== "skill-prompt") return [];
 			const details = message.details;
@@ -4214,23 +4273,26 @@ export class AgentSession {
 							.join("\n");
 			return [{ name: details.name, renderedText, order }];
 		});
+		this.#runtimeContextEvidence = structuredClone({
+			...evidence,
+			selectedSkills,
+			mcpInstructions: this.#getMcpServerInstructionSources?.(),
+		});
+		this.#runtimeContextModel = structuredClone(model);
+	}
+
+	/** Explain the latest exact main-request snapshot; before the first request, all dynamic sources stay potential. */
+	async explainContext(options: { includeContent?: boolean } = {}): Promise<ContextExplanation> {
+		const target = this.#agentKind === "sub" ? "subagent" : "main";
+		const wireModel = this.#runtimeContextModel ?? this.model;
 		return await buildContextExplanation({
 			cwd: this.sessionManager.getCwd(),
 			target,
 			includeContent: options.includeContent,
-			provider: this.model?.provider,
-			model: this.model?.id,
-			wireModel: this.model,
-			runtime: {
-				systemPromptBlocks: this.systemPrompt,
-				instructions: [
-					...collectCompactionContextInstructions(this.agent.state.messages, target),
-					...this.buildProviderContextInstructions(),
-				],
-				selectedSkills,
-				mcpInstructions: this.#getMcpServerInstructionSources?.(),
-				renderedToolContracts: this.getRenderedToolContracts(),
-			},
+			provider: wireModel?.provider,
+			model: wireModel?.id,
+			wireModel,
+			runtime: this.#runtimeContextEvidence ? structuredClone(this.#runtimeContextEvidence) : undefined,
 		});
 	}
 
@@ -4265,7 +4327,7 @@ export class AgentSession {
 		}
 		if (!options.autoContinue) return false;
 		const activeGoal = this.#goalModeState?.enabled === true && this.#goalModeState.goal.status === "active";
-		if (options.terminalTextAnswer && !activeGoal) return false;
+		if (!activeGoal) return false;
 		return this.#scheduleAutoContinuePrompt(options.generation);
 	}
 
@@ -4304,11 +4366,19 @@ export class AgentSession {
 					});
 					return;
 				}
-				const authority = "bounded_transport_or_protocol_retry" as const;
+				const authority = "active_goal_continuation" as const;
+				if (this.#goalModeState?.enabled !== true || this.#goalModeState.goal.status !== "active") {
+					this.#automaticTurns.record(authority, "rejected", "active goal ended before compaction continuation");
+					return;
+				}
 				if (!this.#automaticTurns.authorize(authority)) return;
 				this.#automaticTurns.record(authority, "started", "compaction continuation committed");
 				try {
-					await continuePrompt();
+					if (this.#capabilities) {
+						await this.#capabilities.withContinuationAuthority(authority, undefined, continuePrompt);
+					} else {
+						await continuePrompt();
+					}
 				} catch (error) {
 					this.#automaticTurns.record(authority, "failed", error instanceof Error ? error.message : String(error));
 					throw error;
@@ -5796,17 +5866,17 @@ export class AgentSession {
 
 	/** Current steering mode */
 	get steeringMode(): "all" | "one-at-a-time" {
-		return this.agent.getSteeringMode();
+		return this.#desiredSteeringMode;
 	}
 
 	/** Current follow-up mode */
 	get followUpMode(): "all" | "one-at-a-time" {
-		return this.agent.getFollowUpMode();
+		return this.#desiredFollowUpMode;
 	}
 
 	/** Current interrupt mode */
 	get interruptMode(): "immediate" | "wait" {
-		return this.agent.getInterruptMode();
+		return this.#desiredInterruptMode;
 	}
 
 	/** Current session file path, or undefined if sessions are disabled */
@@ -7148,8 +7218,17 @@ export class AgentSession {
 
 	#yieldTurnAuthority(
 		messages: readonly AgentMessage[],
-	): Pick<ScheduledAgentContinueOptions, "authority" | "originTurnId"> {
-		return this.#messageTurnAuthority(messages) ?? { authority: "bounded_transport_or_protocol_retry" };
+	): Pick<ScheduledAgentContinueOptions, "authority" | "originTurnId"> | undefined {
+		for (const message of messages) {
+			if (message.role !== "custom" || message.customType !== ASYNC_RESULT_MESSAGE_TYPE) continue;
+			const jobs = isRecord(message.details) ? message.details.jobs : undefined;
+			if (!Array.isArray(jobs)) continue;
+			const originTurnId = jobs
+				.map(job => (isRecord(job) && typeof job.originTurnId === "string" ? job.originTurnId : undefined))
+				.find(id => this.#automaticTurns.isTurnOpen(id));
+			if (originTurnId) return { authority: "active_async_result_wake", originTurnId };
+		}
+		return undefined;
 	}
 
 	#messageTurnAuthority(
@@ -7211,13 +7290,11 @@ export class AgentSession {
 		return this.#enqueueLaunchCompletion(notification);
 	}
 
-	#enqueueLaunchCompletion(notification: DaemonCompletionNotification): Promise<void> {
-		const delivered = this.yieldQueue.enqueueWithReceipt<LaunchCompletionEntry>(
-			LAUNCH_COMPLETION_MESSAGE_TYPE,
-			notification,
-		);
-		this.yieldQueue.requestIdleFlush();
-		return delivered;
+	async #enqueueLaunchCompletion(notification: DaemonCompletionNotification): Promise<void> {
+		if (!isLaunchCompletionOwner(notification.owner, this.sessionManager.getSessionId())) {
+			throw new Error("Launch completion belongs to another session");
+		}
+		this.#persistPassiveCustomMessages([buildLaunchCompletionBatchMessage([notification])]);
 	}
 	restoreExplicitPromptMessages(messages: AgentMessage[]): void {
 		this.#pendingExplicitPromptMessages = [...(messages as CustomMessage[]), ...this.#pendingExplicitPromptMessages];
@@ -8444,7 +8521,8 @@ export class AgentSession {
 	 * Saves to settings.
 	 */
 	setSteeringMode(mode: "all" | "one-at-a-time"): void {
-		this.agent.setSteeringMode(mode);
+		this.#desiredSteeringMode = mode;
+		this.#syncAgentQueueModes();
 		this.settings.set("steeringMode", mode);
 	}
 
@@ -8453,7 +8531,8 @@ export class AgentSession {
 	 * Saves to settings.
 	 */
 	setFollowUpMode(mode: "all" | "one-at-a-time"): void {
-		this.agent.setFollowUpMode(mode);
+		this.#desiredFollowUpMode = mode;
+		this.#syncAgentQueueModes();
 		this.settings.set("followUpMode", mode);
 	}
 
@@ -8462,7 +8541,8 @@ export class AgentSession {
 	 * Saves to settings.
 	 */
 	setInterruptMode(mode: "immediate" | "wait"): void {
-		this.agent.setInterruptMode(mode);
+		this.#desiredInterruptMode = mode;
+		this.#syncAgentQueueModes();
 		this.settings.set("interruptMode", mode);
 	}
 
@@ -8998,11 +9078,11 @@ export class AgentSession {
 		return this.#irc.deliver(msg, opts);
 	}
 
-	/** Installs task-executor monitoring around autonomous IRC wake turns. */
+	/** Retained compatibility hook; passive IRC delivery creates no turn to monitor. */
 	setIrcWakeTurnObserver(
-		observer: ((records: CustomMessage[]) => ((error?: unknown) => void | Promise<void>) | undefined) | undefined,
+		_observer: ((records: CustomMessage[]) => ((error?: unknown) => void | Promise<void>) | undefined) | undefined,
 	): void {
-		this.#ircWakeTurnObserver = observer;
+		// No-op: IRC cannot mint automatic-turn authority.
 	}
 
 	/** Emits an IRC relay observation for UI rendering without persisting it. */
@@ -9908,6 +9988,7 @@ export class AgentSession {
 					content: reanswer.content,
 					details: reanswer.details,
 					isError: reanswer.isError === true,
+					attribution: "user",
 					timestamp: Date.now(),
 				};
 				await quiesceHostMutation();
@@ -9979,6 +10060,15 @@ export class AgentSession {
 				sessionContext = this.sessionManager.buildSessionContext();
 			} else {
 				await lifecycle.commit(commitOptions);
+			}
+			if (isAskReanswerCompletion) {
+				const transcriptTail = this.agent.state.messages.at(-1);
+				this.#pendingAskReanswerOwner =
+					transcriptTail?.role === "toolResult" &&
+					transcriptTail.toolName === "ask" &&
+					transcriptTail.attribution === "user"
+						? transcriptTail
+						: undefined;
 			}
 			return {
 				editorText,

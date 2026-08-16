@@ -256,8 +256,9 @@ describe("GitLab Duo Workflow provider protocol", () => {
 		expect(payload.preapproved_tools).toEqual(payload.mcpTools.map(tool => tool.name));
 	});
 
-	it("awaits a replacement start payload and reports contracts extracted from the replacement", async () => {
+	it("guards the non-inline create goal and final start frame before reporting replacement contracts", async () => {
 		const order: string[] = [];
+		let sentCreateBody: Record<string, unknown> | undefined;
 		let sentStartRequest: GitLabDuoWorkflowStartRequest | undefined;
 		let observedContracts: unknown;
 		const socketReady = Promise.withResolvers<GitLabDuoWorkflowWebSocketLike>();
@@ -279,6 +280,7 @@ describe("GitLab Duo Workflow provider protocol", () => {
 				return new Response(JSON.stringify({ gitlab_rails: { token: "workflow-token" } }), { status: 200 });
 			}
 			if (url.endsWith("/api/v4/ai/duo_workflows/workflows") && init?.method === "POST") {
+				sentCreateBody = JSON.parse(String(init.body)) as Record<string, unknown>;
 				return new Response(JSON.stringify({ id: "workflow-1" }), { status: 200 });
 			}
 			if (url.endsWith("/api/graphql")) {
@@ -302,6 +304,7 @@ describe("GitLab Duo Workflow provider protocol", () => {
 				rootNamespaceId: "gid://gitlab/Group/1",
 				projectId: "123",
 				projectPath: "group/project",
+				workflowDefinition: "chat",
 				fetch: fetchImpl,
 				webSocketFactory: (_url, _options) => {
 					order.push("socket");
@@ -309,14 +312,23 @@ describe("GitLab Duo Workflow provider protocol", () => {
 					return socket;
 				},
 				onPayload: async payload => {
-					order.push("payload-start");
+					if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+						throw new Error("Expected GitLab object payload");
+					}
+					const frame = payload as Record<string, unknown>;
+					const kind = "startRequest" in frame ? "start" : "create";
+					order.push(`${kind}-payload-start`);
 					await Promise.resolve();
-					order.push("payload-end");
+					order.push(`${kind}-payload-end`);
+					if (!("startRequest" in frame)) return { ...frame, goal: "replacement create goal" };
+					const original = frame.startRequest as GitLabDuoWorkflowStartRequest;
 					return {
-						...(payload as GitLabDuoWorkflowStartRequest),
-						goal: "replacement goal",
-						mcpTools: [replacementTool],
-						preapproved_tools: [replacementTool.name],
+						startRequest: {
+							...original,
+							goal: "replacement start goal",
+							mcpTools: [replacementTool],
+							preapproved_tools: [replacementTool.name],
+						},
 					};
 				},
 				onToolContracts: async payload => {
@@ -329,10 +341,19 @@ describe("GitLab Duo Workflow provider protocol", () => {
 		);
 
 		await socketReady.promise;
-		expect(order).toEqual(["payload-start", "payload-end", "contracts-start", "contracts-end", "socket"]);
+		expect(order).toEqual([
+			"create-payload-start",
+			"create-payload-end",
+			"start-payload-start",
+			"start-payload-end",
+			"contracts-start",
+			"contracts-end",
+			"socket",
+		]);
 		socket.onopen?.(new Event("open"));
-		expect(order).toEqual(["payload-start", "payload-end", "contracts-start", "contracts-end", "socket", "send"]);
-		expect(sentStartRequest?.goal).toBe("replacement goal");
+		expect(order.at(-1)).toBe("send");
+		expect(sentCreateBody?.goal).toBe("replacement create goal");
+		expect(sentStartRequest?.goal).toBe("replacement start goal");
 		expect(sentStartRequest?.mcpTools).toEqual([replacementTool]);
 		expect(observedContracts).toEqual({
 			tools: [
@@ -3926,6 +3947,19 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 				rootNamespaceId: "gid://gitlab/Group/root",
 				providerSessionState,
 				webSocketFactory,
+				onPayload: async payload => {
+					await Promise.resolve();
+					if (typeof payload !== "object" || payload === null || !("actionResponse" in payload)) {
+						throw new Error("Expected actionResponse frame");
+					}
+					const frame = payload as { actionResponse: { requestID: string } };
+					return {
+						actionResponse: {
+							requestID: frame.actionResponse.requestID,
+							plainTextResponse: { response: "guarded README file text" },
+						},
+					};
+				},
 			},
 		);
 		for (let attempt = 0; attempt < 10 && sent.length < 2; attempt++) {
@@ -3933,7 +3967,7 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 		}
 		expect(socketCount).toBe(1);
 		expect(JSON.parse(sent[1] ?? "{}")).toEqual({
-			actionResponse: { requestID: "req-read-1", plainTextResponse: { response: "README file text" } },
+			actionResponse: { requestID: "req-read-1", plainTextResponse: { response: "guarded README file text" } },
 		});
 		const continuation = JSON.stringify({
 			channel_values: {
@@ -3952,6 +3986,61 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 		const secondMessage = await secondStream.result();
 		expect(secondMessage.role).toBe("assistant");
 		expect(secondMessage.content).toEqual([{ type: "text", text: "POST_TOOL" }]);
+	});
+
+	it("rejects an actionResponse replacement that changes the pending request binding", async () => {
+		const sent: string[] = [];
+		const socket: GitLabDuoWorkflowWebSocketLike = {
+			onopen: null,
+			onmessage: null,
+			onerror: null,
+			onclose: null,
+			send(data) {
+				sent.push(data);
+			},
+			close() {},
+		};
+		const output: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api: "gitlab-duo-agent",
+			provider: "gitlab-duo-agent",
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		};
+		const run = runGitLabDuoWorkflowSocket(
+			socket,
+			buildGitLabDuoWorkflowStartRequest("workflow-1", model, context),
+			{ stream: new AssistantMessageEventStream(), output, model, started: true },
+			{
+				apiKey: "redacted",
+				onPayload: async payload => {
+					await Promise.resolve();
+					const frame = payload as { actionResponse: { plainTextResponse?: unknown } };
+					return {
+						actionResponse: {
+							requestID: "attacker-selected-request",
+							plainTextResponse: frame.actionResponse.plainTextResponse,
+						},
+					};
+				},
+			},
+			{ actionResponse: { requestID: "req-read-1", plainTextResponse: { response: "README file text" } } },
+		);
+
+		await expect(run).rejects.toThrow(
+			"GitLab Duo Workflow onPayload replacement cannot change actionResponse.requestID",
+		);
+		expect(sent).toEqual([]);
 	});
 
 	it("settles stalled when consecutive tool-call boundaries carry byte-identical checkpoints", async () => {

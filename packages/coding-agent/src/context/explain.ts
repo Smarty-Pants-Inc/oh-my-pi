@@ -30,12 +30,146 @@ export interface RuntimeMcpInstruction {
 }
 
 export interface RuntimeContextEvidence {
-	/** Exact rendered blocks before provider normalization; array order is the wire prefix order. */
+	/** Exact rendered blocks from standalone callers that do not have a final provider payload. */
 	systemPromptBlocks?: readonly string[];
 	instructions?: readonly ContextInstruction[];
 	selectedSkills?: readonly { name: string; renderedText: string; order: number }[];
 	mcpInstructions?: readonly RuntimeMcpInstruction[];
 	renderedToolContracts?: RenderedToolContractExport;
+}
+
+type ProviderInstructionBlock = { actualRole: "system" | "developer"; renderedText: string };
+
+function record(value: unknown): Record<string, unknown> | undefined {
+	return value !== null && typeof value === "object" && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: undefined;
+}
+
+function textBlock(value: unknown): string | undefined {
+	if (typeof value === "string") return value;
+	const item = record(value);
+	return item && typeof item.text === "string" ? item.text : undefined;
+}
+
+function roleBlocks(value: unknown): ProviderInstructionBlock[] {
+	if (!Array.isArray(value)) return [];
+	return value.flatMap(item => {
+		const message = record(item);
+		if (!message || (message.role !== "system" && message.role !== "developer")) return [];
+		if (typeof message.content === "string") {
+			return [{ actualRole: message.role, renderedText: message.content }];
+		}
+		return [];
+	});
+}
+
+function finalProviderInstructionBlocks(payload: unknown, model: Pick<Model, "api">): ProviderInstructionBlock[] {
+	const body = record(payload);
+	if (!body) return [];
+	if (model.api === "anthropic-messages" || model.api === "bedrock-converse-stream") {
+		const system = Array.isArray(body.system) ? body.system : [];
+		return system.flatMap(block => {
+			const renderedText = textBlock(block);
+			return renderedText === undefined ? [] : [{ actualRole: "system" as const, renderedText }];
+		});
+	}
+	if (model.api === "google-generative-ai" || model.api === "google-vertex" || model.api === "google-gemini-cli") {
+		const request = record(body.request) ?? body;
+		const config = record(request.config) ?? request;
+		const instruction = record(config.systemInstruction ?? config.system_instruction);
+		const parts = instruction && Array.isArray(instruction.parts) ? instruction.parts : [];
+		return parts.flatMap(part => {
+			const renderedText = textBlock(part);
+			return renderedText === undefined ? [] : [{ actualRole: "system" as const, renderedText }];
+		});
+	}
+	if (model.api === "openai-completions" || model.api === "ollama-chat") {
+		return roleBlocks(body.messages);
+	}
+	if (model.api === "gitlab-duo-agent") {
+		const startRequest = record(body.startRequest);
+		const flowConfig = record(startRequest?.flowConfig);
+		const prompts = flowConfig && Array.isArray(flowConfig.prompts) ? flowConfig.prompts : [];
+		return prompts.flatMap(prompt => {
+			const template = record(record(prompt)?.prompt_template);
+			return typeof template?.system === "string"
+				? [{ actualRole: "system" as const, renderedText: template.system }]
+				: [];
+		});
+	}
+	if (
+		model.api === "openai-responses" ||
+		model.api === "azure-openai-responses" ||
+		model.api === "openai-codex-responses" ||
+		model.api === "openrouter"
+	) {
+		const request = record(body.response) ?? body;
+		const blocks: ProviderInstructionBlock[] = [];
+		if (typeof request.instructions === "string") {
+			blocks.push({ actualRole: "system", renderedText: request.instructions });
+		}
+		blocks.push(...roleBlocks(request.input), ...roleBlocks(request.messages));
+		return blocks;
+	}
+	return [];
+}
+
+/** Whether an onPayload callback is the provider request whose instruction evidence should be retained. */
+export function isRuntimeContextEvidencePayload(payload: unknown, model: Pick<Model, "api">): boolean {
+	if (model.api !== "gitlab-duo-agent") return true;
+	return record(record(payload)?.startRequest) !== undefined;
+}
+
+/** Capture only exact instruction-channel strings from the final guarded provider payload. */
+export function captureRuntimeContextEvidence(
+	payload: unknown,
+	model: Model,
+	target: ContextTarget,
+	candidates: readonly ContextInstruction[],
+	renderedToolContracts?: RenderedToolContractExport,
+): RuntimeContextEvidence {
+	const blocks = finalProviderInstructionBlocks(payload, model);
+	const candidateList = candidates.filter(candidate => candidate.renderedText.trim().length > 0);
+	const matched = new Map<number, ContextInstruction>();
+	const matchedCandidates = new Set<ContextInstruction>();
+	const supportsDeveloperRole = supportsDeveloperRoleForContext(model);
+	let beforeBlock = blocks.length;
+	for (let candidateIndex = candidateList.length - 1; candidateIndex >= 0; candidateIndex--) {
+		const candidate = candidateList[candidateIndex]!;
+		for (let blockIndex = beforeBlock - 1; blockIndex >= 0; blockIndex--) {
+			const block = blocks[blockIndex]!;
+			if (
+				candidate.renderedText.toWellFormed() !== block.renderedText ||
+				mapContextRole(candidate.role, supportsDeveloperRole) !== block.actualRole
+			) {
+				continue;
+			}
+			matched.set(blockIndex, candidate);
+			matchedCandidates.add(candidate);
+			beforeBlock = blockIndex;
+			break;
+		}
+	}
+	const instructions: ContextInstruction[] = blocks.map((block, providerOrder): ContextInstruction => {
+		const candidate = matched.get(providerOrder);
+		if (candidate) return { ...candidate, renderedText: block.renderedText, sha256: sha256(block.renderedText) };
+		return {
+			id: `runtime.system_prompt.${providerOrder}`,
+			sourcePath: `provider://${model.provider}/${model.id}/request`,
+			role: block.actualRole,
+			target,
+			trigger: "provider_request",
+			sha256: sha256(block.renderedText),
+			renderedText: block.renderedText,
+			order: providerOrder,
+		};
+	});
+	for (const candidate of candidateList) {
+		if (matchedCandidates.has(candidate)) continue;
+		instructions.push({ ...candidate, sha256: sha256(""), renderedText: "" });
+	}
+	return { instructions, renderedToolContracts };
 }
 
 export interface ExplainedComponent {
@@ -480,7 +614,7 @@ export async function explainContext(options: {
 			enabledReason: runtimeInstruction
 				? effective
 					? "runtime trigger supplied an exact rendered instruction"
-					: "runtime trigger supplied an empty instruction omitted by the provider"
+					: "runtime evidence did not contain an exact emitted instruction"
 				: entry.defaultEnabled
 					? "registered default template; exact runtime rendering was not supplied"
 					: "registered potential component; runtime trigger was not observed",
@@ -494,7 +628,7 @@ export async function explainContext(options: {
 			renderedWrapper: runtimeInstruction
 				? effective
 					? "exact runtime rendered instruction"
-					: "empty runtime instruction omitted from provider serialization"
+					: "runtime evidence contains no exact emitted instruction bytes"
 				: "registered Markdown source template; not a rendered wire component",
 			precedence: entry.order,
 			providerOrder: effective ? (runtimeInstructionProviderOrders.get(entry.id) ?? null) : null,
@@ -504,6 +638,8 @@ export async function explainContext(options: {
 	}
 	for (const instruction of [...runtimeInstructions.values()].filter(item => !registeredIds.has(item.id))) {
 		const effective = instruction.renderedText.trim().length > 0;
+		const exactProviderBlock =
+			instruction.id.startsWith("runtime.system_prompt.") && instruction.sourcePath.startsWith("provider://");
 		components.push({
 			id: instruction.id,
 			source: instruction.sourcePath,
@@ -512,21 +648,23 @@ export async function explainContext(options: {
 			actualRole: mapContextRole(instruction.role, developerRole),
 			target: instruction.target,
 			trigger: instruction.trigger,
-			visibility: "external",
+			visibility: exactProviderBlock ? "model" : "external",
 			enabled: effective,
 			enabledReason: effective
 				? "runtime supplied an exact provenance-bound instruction"
-				: "runtime supplied an empty instruction omitted by the provider",
+				: "runtime evidence did not contain an exact emitted instruction",
 			triggered: true,
 			effective,
 			availability: effective ? "effective" : "available",
-			approvalStatus: await externalApproval(instruction.sourcePath, instruction.sha256, release, approval),
+			approvalStatus: exactProviderBlock
+				? approval.status
+				: await externalApproval(instruction.sourcePath, instruction.sha256, release, approval),
 			sha256: instruction.sha256,
 			provider,
 			model,
 			renderedWrapper: effective
 				? "exact runtime rendered instruction"
-				: "empty runtime instruction omitted from provider serialization",
+				: "runtime evidence contains no exact emitted instruction bytes",
 			precedence: instruction.order ?? 10_000,
 			providerOrder: effective ? (runtimeInstructionProviderOrders.get(instruction.id) ?? null) : null,
 			...counts(instruction.renderedText),

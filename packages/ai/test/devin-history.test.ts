@@ -142,6 +142,7 @@ describe("streamDevin history handoff", () => {
 	it("guards the final request then exports exact Devin tool definitions", async () => {
 		const events: string[] = [];
 		let observedContracts: unknown;
+		let observedPayload: unknown;
 		const request = await captureRequest(
 			{
 				messages: [{ role: "user", content: "use probe", timestamp: 0 }],
@@ -161,6 +162,7 @@ describe("streamDevin history handoff", () => {
 				onPayload: async payload => {
 					await Promise.resolve();
 					events.push("payload");
+					observedPayload = payload;
 					return { ...(payload as object), prompt: "replacement Devin prompt" };
 				},
 				onToolContracts: async payload => {
@@ -172,7 +174,12 @@ describe("streamDevin history handoff", () => {
 		);
 
 		expect(events).toEqual(["payload", "contracts"]);
+		expect(observedPayload).toMatchObject({ metadata: { apiKey: "", userJwt: "" } });
+		expect(JSON.stringify(observedPayload)).not.toContain("devin-session-token$token");
+		expect(JSON.stringify(observedPayload)).not.toContain("jwt");
 		expect(request.prompt).toBe("replacement Devin prompt");
+		expect(request.metadata?.apiKey).toBe("devin-session-token$token");
+		expect(request.metadata?.userJwt).toBe("jwt");
 		expect(observedContracts).toMatchObject({
 			tools: [
 				{
@@ -182,5 +189,40 @@ describe("streamDevin history handoff", () => {
 				},
 			],
 		});
+	});
+
+	it("rejects callback attempts to inject auth before the chat request is sent", async () => {
+		const authPayload = toBinary(
+			GetUserJwtResponseSchema,
+			create(GetUserJwtResponseSchema, { userJwt: "original-jwt" }),
+		);
+		let chatRequests = 0;
+		for (const injected of [
+			{ apiKey: "attacker-key", userJwt: "attacker-jwt" },
+			{ apiKey: "", userJwt: "", api_key: "alias-key", user_jwt: "alias-jwt" },
+		]) {
+			const result = await streamDevin(
+				devinModel,
+				{ messages: [{ role: "user", content: "hello", timestamp: 0 }] },
+				{
+					apiKey: "original-token",
+					fetch: (async input => {
+						if (String(input).includes("GetUserJwt")) return new Response(authPayload);
+						chatRequests++;
+						return new Response(new Uint8Array());
+					}) as typeof fetch,
+					onPayload: payload => ({
+						...(payload as Record<string, unknown>),
+						metadata: {
+							...((payload as { metadata: Record<string, unknown> }).metadata ?? {}),
+							...injected,
+						},
+					}),
+				},
+			).result();
+			expect(result.stopReason).toBe("error");
+			expect(result.errorMessage).toContain("cannot inject or rebind provider credentials");
+		}
+		expect(chatRequests).toBe(0);
 	});
 });

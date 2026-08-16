@@ -4721,7 +4721,7 @@
     },
     {
       "path": "packages/ai/src/auth-gateway/server.ts",
-      "sha256": "cd24b17f8febc1ae9a11816d8b80a0fd6c1703b6e28b085dce7af75f1b5e1457"
+      "sha256": "8c1562aa9e8a75d92a8b00891fefab2e64db89db6ac3053d59e126eab8a477f1"
     },
     {
       "path": "packages/ai/src/auth-gateway/types.ts",
@@ -5013,7 +5013,7 @@
     },
     {
       "path": "packages/ai/src/providers/devin.ts",
-      "sha256": "9d3ad469be58f558c7bae83739e7b1f0f9a24283d27413f39653d89e9d617e9d"
+      "sha256": "9d1674584ed4a0fba38b7b45de93485271ab7f19171dfde9fcc1e011aa080ea5"
     },
     {
       "path": "packages/ai/src/providers/error-message.ts",
@@ -5029,7 +5029,7 @@
     },
     {
       "path": "packages/ai/src/providers/gitlab-duo-workflow.ts",
-      "sha256": "2104a3d22bf5159e32429f22657efb2727ed58c7c3dfe27fd82d060529ababd1"
+      "sha256": "2dc9ea8ae604d364c42ee353e49bbd7c740579679864303a59e24ce00624b94d"
     },
     {
       "path": "packages/ai/src/providers/gitlab-duo.ts",
@@ -5133,11 +5133,11 @@
     },
     {
       "path": "packages/ai/src/providers/pi-native-client.ts",
-      "sha256": "01f5dc585e00dcd6fac47c54c624dd2d918ed47fd8d0751b833dcc23153c4ddd"
+      "sha256": "bfe10ae15a0f52b683d93f24a88760083a43b6315ce60d260bb713e3a6a21d54"
     },
     {
       "path": "packages/ai/src/providers/pi-native-server.ts",
-      "sha256": "4107a7677fa8badd6dcfad968987d0102b0ecd23564e4de32fdd3f7236cf711f"
+      "sha256": "2ec1acfb0ace13d9ac15ec42777429de3a2333a2f6ddc946dac3b12d35c9f5ae"
     },
     {
       "path": "packages/ai/src/providers/register-builtins.ts",
@@ -6793,7 +6793,7 @@
     },
     {
       "path": "packages/coding-agent/src/context/explain.ts",
-      "sha256": "bf8f547b687462853c8c070c9e5cd4e1d4393f8dff86da4ccbd0efde16d96321"
+      "sha256": "4797df0d6094dc7984c6aa2829999375a3aa1f734c59fab4470b934f36c2efd3"
     },
     {
       "path": "packages/coding-agent/src/context/implementation-sources.ts",
@@ -8305,7 +8305,7 @@
     },
     {
       "path": "packages/coding-agent/src/sdk.ts",
-      "sha256": "35919c5b37420f7b444d98b5d5dca265b3f01ae3e0c04da26592e55a47a1bf96"
+      "sha256": "ba238d32a3fe952fecde19185f3903244e88c04fb302d349e386df80fd33c4b7"
     },
     {
       "path": "packages/coding-agent/src/secrets/index.ts",
@@ -8409,7 +8409,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/agent-session.ts",
-      "sha256": "fec69450526cc5623e5c8cc371496e14f6d4967bbcde432474351387ce786bfd"
+      "sha256": "f0a4cbb55d78e9424a5eca7d28a1523efc33cb189d29371a74c9e64d4b1a52f7"
     },
     {
       "path": "packages/coding-agent/src/session/agent-storage.ts",
@@ -8521,7 +8521,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/queued-messages.ts",
-      "sha256": "8137361db48900889dc9907c37ed855c18443fd9c85d4bacdc846b2ac342d030"
+      "sha256": "e27e11c6379bcc89ac58daf8925a94ea035b4cd30366202fc38004727ed6daa8"
     },
     {
       "path": "packages/coding-agent/src/session/retry-fallback-chains.ts",
@@ -8993,7 +8993,7 @@
     },
     {
       "path": "packages/coding-agent/src/tools/bash.ts",
-      "sha256": "8c2c78ec0224b28d4fe6bd100ffa84618b87d2b8056405a22c27015645946eb6"
+      "sha256": "5ae7ace32fcb7e75aaa38050af3c023113bcd70621aeed3777381f647b6ce188"
     },
     {
       "path": "packages/coding-agent/src/tools/browser.ts",
@@ -10657,5 +10657,5 @@
     }
   ],
   "behaviorSha256": "0feede855f6d4a90131d3a02399acbc91464a432f9189e39082fd75f502a1194",
-  "rootSha256": "cfcdc4a84d30f63b40f9d6ad4bcc698e44821f1544037663f988ae99136a8cf1"
+  "rootSha256": "f23a015bc5077292b822f4149b8b3695ce08150bb71c69c44fdd6a9a4c498871"
 }

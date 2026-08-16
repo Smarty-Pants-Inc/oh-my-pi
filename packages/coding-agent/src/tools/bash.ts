@@ -223,15 +223,94 @@ function bashWriteTargets(tokens: readonly string[]): string[] {
 		}
 	}
 
-	for (let index = 0; index < tokens.length; index++) {
-		const redirect = /^(?:\d+)?(?:>>?|>\|)(.*)$/u.exec(tokens[index]!);
-		if (!redirect) continue;
-		const target = redirect[1] || tokens[index + 1];
-		// File-descriptor duplication (`2>&1`) and a missing redirect target do
-		// not name a filesystem write target.
-		if (target && !target.startsWith("&")) targets.push(target);
+	return targets;
+}
+
+function readShellRedirectTarget(command: string, start: number): { target: string; end: number } | undefined {
+	let index = start;
+	while (command[index] === " " || command[index] === "\t") index++;
+	if (index >= command.length || /[\n\r;&|()<>]/u.test(command[index]!)) return undefined;
+
+	let target = "";
+	let quote: "'" | '"' | undefined;
+	for (; index < command.length; index++) {
+		const ch = command[index]!;
+		if (quote === "'") {
+			if (ch === "'") quote = undefined;
+			else target += ch;
+			continue;
+		}
+		if (quote === '"') {
+			if (ch === '"') {
+				quote = undefined;
+			} else if (ch === "\\" && index + 1 < command.length) {
+				target += command[++index]!;
+			} else {
+				target += ch;
+			}
+			continue;
+		}
+		if (ch === "'" || ch === '"') {
+			quote = ch;
+			continue;
+		}
+		if (ch === "\\" && index + 1 < command.length) {
+			target += command[++index]!;
+			continue;
+		}
+		if (/[ \t\n\r;&|()<>]/u.test(ch)) break;
+		target += ch;
+	}
+	return target.length > 0 ? { target, end: index } : undefined;
+}
+
+/**
+ * Extract literal write destinations from raw shell syntax, including attached
+ * redirects (`x>file`, `2>>file`, `1<>file`) that the word tokenizer keeps in
+ * one token. Input-only redirects are intentionally ignored; `<>` may create
+ * or modify its target and therefore requires write authority.
+ */
+function shellRedirectWriteTargets(command: string): string[] {
+	const targets: string[] = [];
+	let quote: "'" | '"' | undefined;
+	for (let index = 0; index < command.length; index++) {
+		const ch = command[index]!;
+		if (quote === "'") {
+			if (ch === "'") quote = undefined;
+			continue;
+		}
+		if (quote === '"') {
+			if (ch === "\\") index++;
+			else if (ch === '"') quote = undefined;
+			continue;
+		}
+		if (ch === "'" || ch === '"') {
+			quote = ch;
+			continue;
+		}
+		if (ch === "\\") {
+			index++;
+			continue;
+		}
+
+		const inputOutput = ch === "<" && command[index + 1] === ">";
+		if (ch !== ">" && !inputOutput) continue;
+		let targetStart = index + (inputOutput || command[index + 1] === ">" ? 2 : 1);
+		if (!inputOutput && command[targetStart] === "|") targetStart++;
+		const ampersandTarget = command[targetStart] === "&";
+		if (ampersandTarget) targetStart++;
+		const target = readShellRedirectTarget(command, targetStart);
+		if (!target) continue;
+		// `2>&1` / `>&-` duplicate or close a descriptor. `>&path` redirects to
+		// a path and must remain subject to the same capability check.
+		if (!ampersandTarget || !/^(?:\d+|-)$/.test(target.target)) targets.push(target.target);
+		index = target.end - 1;
 	}
 	return targets;
+}
+
+function bashCommandWriteTargets(command: string): string[] {
+	return [...tokenizeShellSegments(command).flatMap(bashWriteTargets), ...shellRedirectWriteTargets(command)];
 }
 
 function commandHasGitPush(tokens: readonly string[]): boolean {
@@ -305,11 +384,26 @@ function assertBashCommandCapability(session: ToolSession, command: string): voi
 	assertBashExternalCapability(session, `bash.command:${command.trim()}`);
 }
 
-function assertBashWriteCapability(session: ToolSession, target: string, cwd: string): void {
-	if (target.includes("$") || target.includes("`") || target.includes("*") || target.includes("?")) {
+function assertBashWriteCapability(
+	session: ToolSession,
+	target: string,
+	cwd: string,
+	env: Record<string, string> | undefined,
+): void {
+	if (target.includes("$") || target.includes("`") || /[*?[\]{}]/u.test(target)) {
 		throw new ToolError(`Bash write target '${target}' cannot be validated safely.`);
 	}
-	const decision = session.capabilities?.decideWrite(resolveToCwd(target, cwd));
+	if (target.startsWith("~") && target !== "~" && !target.startsWith("~/")) {
+		throw new ToolError(`Bash write target '${target}' cannot be validated safely.`);
+	}
+	const home = env?.HOME;
+	if ((target === "~" || target.startsWith("~/")) && !home?.startsWith("/")) {
+		throw new ToolError(
+			`Bash write target '${target}' cannot be validated safely without an explicit absolute HOME.`,
+		);
+	}
+	const normalizedTarget = target === "~" || target.startsWith("~/") ? `${home}${target.slice(1)}` : target;
+	const decision = session.capabilities?.decideWrite(resolveToCwd(normalizedTarget, cwd));
 	if (!decision || decision.outcome === "allow") return;
 	if (decision.outcome === "request") {
 		throw new ToolError(
@@ -325,17 +419,22 @@ function assertBashWriteCapability(session: ToolSession, target: string, cwd: st
  * known write destinations and the capabilities exposed by the GitHub tool are
  * checked; dynamic write destinations fail closed rather than bypassing policy.
  */
-function assertBashCapabilities(session: ToolSession, command: string, cwd: string): void {
+function assertBashCapabilities(
+	session: ToolSession,
+	command: string,
+	cwd: string,
+	env: Record<string, string> | undefined,
+): void {
 	if (!session.capabilities) return;
+	for (const target of bashCommandWriteTargets(command)) {
+		assertBashWriteCapability(session, target, cwd, env);
+	}
 	for (const tokens of tokenizeShellSegments(command)) {
 		if (commandHasGitPush(tokens)) {
 			assertBashExternalCapability(session, "git.push");
 		}
 		if (commandHasGithubPrEffect(tokens)) {
 			assertBashExternalCapability(session, "github.pr");
-		}
-		for (const target of bashWriteTargets(tokens)) {
-			assertBashWriteCapability(session, target, cwd);
 		}
 		if (commandNeedsGenericExternalCapability(command, tokens)) {
 			assertBashCommandCapability(session, command);
@@ -1629,7 +1728,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 
 		// This sits inside the tool, rather than the approval wrapper, so yolo
 		// and every execution backend retain the same session authority boundary.
-		assertBashCapabilities(this.session, rawCommand, this.session.cwd);
+		assertBashCapabilities(this.session, rawCommand, this.session.cwd, env);
 
 		if (executionEnvironment) {
 			return this.#executeInEnvironment({
@@ -1684,7 +1783,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		const commandCwd = cwd ? resolveToCwd(cwd, this.session.cwd) : this.session.cwd;
 		// Internal URL expansion can replace a literal path, so validate the
 		// command that the local, PTY, and ACP backends will actually receive.
-		assertBashCapabilities(this.session, command, commandCwd);
+		assertBashCapabilities(this.session, command, commandCwd, resolvedEnv);
 		let cwdStat: fs.Stats;
 		try {
 			cwdStat = await fs.promises.stat(commandCwd);

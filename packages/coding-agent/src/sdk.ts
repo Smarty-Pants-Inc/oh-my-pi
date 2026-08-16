@@ -12,6 +12,7 @@ import {
 } from "@oh-my-pi/pi-agent-core";
 import type {
 	Context,
+	ContextInstruction,
 	CredentialDisabledEvent,
 	Effort,
 	Message,
@@ -76,6 +77,7 @@ import { applyProviderGlobalsFromSettings } from "./config/provider-globals";
 import { buildServiceTierByFamily } from "./config/service-tier";
 import { Settings, type SkillsSettings } from "./config/settings";
 import { ensureApprovedStartup } from "./context/approved-policy";
+import { captureRuntimeContextEvidence, isRuntimeContextEvidencePayload } from "./context/explain";
 import { type ContextReleaseManifest, canonicalAgentDirPath } from "./context/manifest";
 import { exportRenderedToolContracts } from "./context/tool-contracts";
 import { CursorExecHandlers, type CursorMcpResourceAdapter } from "./cursor";
@@ -3271,6 +3273,7 @@ async function createAgentSessionScoped(
 						createSnapcompactSavingsRecorder(() => sessionManager.getSessionFile() ?? null),
 					)
 				: undefined;
+		let pendingProviderInstructions: readonly ContextInstruction[] = [];
 		const transformProviderContext = async (context: Context, transformModel: Model): Promise<Context> => {
 			const executionEnvironment = toolSession.getExecutionEnvironment?.();
 			if (executionEnvironment && context.systemPrompt) {
@@ -3284,33 +3287,37 @@ async function createAgentSessionScoped(
 			if (snapcompactInline) transformed = await snapcompactInline.transform(transformed, transformModel);
 			transformed = clampProviderContextImages(transformed, transformModel);
 			transformed = await normalizeProviderContextImagesForModel(transformed, transformModel);
-			// Keep per-request volatility out of the system prompt: the date/cwd
-			// reminder rides on the first user turn so open-weight providers keep
-			// their tool-schema prefix cache (#7404).
-			return withDateCwdReminder(
-				transformed,
-				formatLocalCalendarDate(),
-				normalizePromptPath(sessionManager.getCwd()),
-			);
+			pendingProviderInstructions = structuredClone(transformed.instructions ?? []);
+			return transformed;
 		};
-		const captureRenderedToolContracts: NonNullable<SimpleStreamOptions["onToolContracts"]> = (payload, model) => {
+		const captureRenderedToolContracts = (payload: unknown, model?: Model) => {
 			if (!releaseManifest) return;
-			session?.setRenderedToolContracts(
-				exportRenderedToolContracts(payload, model, {
-					contentManifestRootSha256: releaseManifest.contentManifestRootSha256,
-					configurationSemanticSha256: releaseManifest.configurationSemanticSha256,
-				}),
-			);
+			return exportRenderedToolContracts(payload, model, {
+				contentManifestRootSha256: releaseManifest.contentManifestRootSha256,
+				configurationSemanticSha256: releaseManifest.configurationSemanticSha256,
+			});
 		};
 		const guardProviderPayload = async (payload: unknown, model?: Model) =>
 			await extensionRunner.emitBeforeProviderRequest(payload, model);
 		const onPayload = async (payload: unknown, model?: Model) => {
 			const finalPayload = await guardProviderPayload(payload, model);
-			captureRenderedToolContracts(finalPayload, model);
+			const renderedToolContracts = captureRenderedToolContracts(finalPayload, model);
+			if (session && model && isRuntimeContextEvidencePayload(finalPayload, model)) {
+				const evidence = captureRuntimeContextEvidence(
+					finalPayload,
+					model,
+					agentKind === "sub" ? "subagent" : "main",
+					pendingProviderInstructions,
+					renderedToolContracts,
+				);
+				session.setRuntimeContextEvidence(evidence, model);
+				if (renderedToolContracts) session.setRenderedToolContracts(renderedToolContracts);
+			}
 			return finalPayload;
 		};
 		const onToolContracts: SimpleStreamOptions["onToolContracts"] = async (payload, model) => {
-			captureRenderedToolContracts(payload, model);
+			const contracts = captureRenderedToolContracts(payload, model);
+			if (contracts) session?.setRenderedToolContracts(contracts);
 		};
 		const onResponse: SimpleStreamOptions["onResponse"] = async (response, model) => {
 			await extensionRunner.emitAfterProviderResponse(response, model);

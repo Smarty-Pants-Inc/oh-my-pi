@@ -1,5 +1,5 @@
 import { gunzipSync, gzipSync } from "node:zlib";
-import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
+import { create, fromBinary, fromJson, type JsonValue, toBinary, toJson } from "@bufbuild/protobuf";
 import {
 	ChatMessageRequestType,
 	GetChatMessageRequestSchema,
@@ -168,10 +168,13 @@ export const streamDevin: StreamFunction<"devin-agent"> = (
 			const auth = await fetchDevinAuthMetadata(apiKey, baseUrl, fetchImpl, options?.signal);
 			const chatBaseUrl = auth.baseUrl ?? baseUrl;
 			let request = buildDevinChatRequest(model, context, options, apiKey, auth.userJwt);
-			const replacementPayload = await options?.onPayload?.(request, model);
-			if (replacementPayload !== undefined) request = replacementPayload as typeof request;
-			await options?.onToolContracts?.({ tools: request.tools }, model);
+			if (options?.onPayload) {
+				request = await applyDevinPayloadGuard(request, model, options, apiKey, auth.userJwt);
+			}
 			const reqBytes = toBinary(GetChatMessageRequestSchema, request);
+			// Serialize before observation so a local callback cannot mutate the
+			// already-approved contracts between evidence capture and transport.
+			await options?.onToolContracts?.({ tools: request.tools }, model);
 			const gz = gzipSync(reqBytes);
 			logger.debug("devin: sending chat request", {
 				model: model.id,
@@ -558,6 +561,68 @@ function buildDevinChatRequest(
 			}),
 		),
 	});
+}
+
+async function applyDevinPayloadGuard(
+	request: ReturnType<typeof buildDevinChatRequest>,
+	model: Model<"devin-agent">,
+	options: DevinOptions,
+	apiKey: string,
+	userJwt: string,
+): Promise<ReturnType<typeof buildDevinChatRequest>> {
+	const payload = toJson(GetChatMessageRequestSchema, request) as Record<string, JsonValue>;
+	const metadata = payload.metadata;
+	if (typeof metadata !== "object" || metadata === null || Array.isArray(metadata)) {
+		throw new AIError.ValidationError("Devin request metadata is missing before onPayload");
+	}
+	const credentialFreePayload: Record<string, JsonValue> = {
+		...payload,
+		metadata: { ...metadata, apiKey: "", userJwt: "" },
+	};
+	const replacement = await options.onPayload?.(credentialFreePayload, model);
+	const candidate = replacement ?? credentialFreePayload;
+	let normalized: Record<string, JsonValue>;
+	try {
+		const json = JSON.stringify(candidate);
+		if (json === undefined) throw new TypeError("replacement is not JSON");
+		normalized = JSON.parse(json) as Record<string, JsonValue>;
+	} catch (error) {
+		throw new AIError.ValidationError(
+			`Devin onPayload replacement must be JSON-safe: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	if (typeof normalized !== "object" || normalized === null || Array.isArray(normalized)) {
+		throw new AIError.ValidationError("Devin onPayload replacement must preserve the request object");
+	}
+	const finalMetadata = normalized.metadata;
+	const authFields =
+		typeof finalMetadata === "object" && finalMetadata !== null && !Array.isArray(finalMetadata)
+			? Object.entries(finalMetadata).filter(([key]) => {
+					const normalizedKey = key.replaceAll("_", "").replaceAll("-", "").toLowerCase();
+					return normalizedKey === "apikey" || normalizedKey === "userjwt";
+				})
+			: [];
+	if (
+		typeof finalMetadata !== "object" ||
+		finalMetadata === null ||
+		Array.isArray(finalMetadata) ||
+		authFields.length !== 2 ||
+		authFields.some(([key, value]) => (key !== "apiKey" && key !== "userJwt") || value !== "") ||
+		finalMetadata.apiKey !== "" ||
+		finalMetadata.userJwt !== ""
+	) {
+		throw new AIError.ValidationError("Devin onPayload replacement cannot inject or rebind provider credentials");
+	}
+	try {
+		return fromJson(GetChatMessageRequestSchema, {
+			...normalized,
+			metadata: { ...finalMetadata, apiKey, userJwt },
+		});
+	} catch (error) {
+		throw new AIError.ValidationError(
+			`Devin onPayload replacement is not a valid request: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
 }
 
 /** Map omp `Message` history onto Cascade `ChatMessagePrompt`s (USER / SYSTEM / TOOL channels). */

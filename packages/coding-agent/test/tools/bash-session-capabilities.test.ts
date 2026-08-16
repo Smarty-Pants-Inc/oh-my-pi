@@ -48,9 +48,73 @@ describe("BashTool session capabilities", () => {
 			await expect(tool.execute("option-target", { command: `cp -t ${outside} source.txt` })).rejects.toThrow(
 				"requires an explicit session writePath capability",
 			);
+			for (const command of [
+				`echo blocked>${outsideFile}`,
+				`echo blocked>>${outsideFile}`,
+				`echo blocked 2>${outsideFile}`,
+				`echo blocked 2>>${outsideFile}`,
+				`echo blocked<>${outsideFile}`,
+				`cat 3<>${outsideFile}`,
+				`echo blocked>&${outsideFile}`,
+			]) {
+				await expect(tool.execute(`attached-${command}`, { command })).rejects.toThrow(
+					"requires an explicit session writePath capability",
+				);
+			}
 			expect(await Bun.file(outsideFile).exists()).toBe(false);
 		} finally {
 			await Promise.all([removeWithRetries(workspace), removeWithRetries(outside)]);
+		}
+	});
+
+	it("fails closed for tilde, glob, and brace-expanded write targets", async () => {
+		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "bash-cap-expansion-workspace-"));
+		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "bash-cap-expansion-outside-"));
+		const suffix = `.omp-bash-capability-${crypto.randomUUID()}`;
+		const tildeTarget = `~/${suffix}`;
+		const tildePath = path.join(os.homedir(), suffix);
+		const overriddenHomeTarget = path.join(outside, "home-override.txt");
+		const dynamicTildeTarget = ["touch ~", "$", "{USER}/blocked"].join("");
+		try {
+			const tool = new BashTool(session(workspace, new SessionCapabilities({ workspace })));
+			for (const { command, message } of [
+				{
+					command: `touch ${tildeTarget}`,
+					message: "cannot be validated safely without an explicit absolute HOME",
+				},
+				{
+					command: `echo blocked>${tildeTarget}`,
+					message: "cannot be validated safely without an explicit absolute HOME",
+				},
+				{ command: "touch ~root/blocked", message: "cannot be validated safely" },
+				{ command: dynamicTildeTarget, message: "cannot be validated safely" },
+				{ command: `touch ${outside}/[a-z]`, message: "cannot be validated safely" },
+				{ command: `echo blocked>${outside}/{one,two}`, message: "cannot be validated safely" },
+			]) {
+				await expect(tool.execute(`expansion-${command}`, { command })).rejects.toThrow(message);
+			}
+			for (const command of ["touch ~/home-override.txt", "echo blocked>~/home-override.txt"]) {
+				await expect(tool.execute(`home-override-${command}`, { command, env: { HOME: outside } })).rejects.toThrow(
+					"requires an explicit session writePath capability",
+				);
+			}
+			expect(await Bun.file(overriddenHomeTarget).exists()).toBe(false);
+			expect(await Bun.file(tildePath).exists()).toBe(false);
+
+			const granted = new BashTool(
+				session(workspace, new SessionCapabilities({ workspace, writeAllowlist: [tildePath] })),
+			);
+			await granted.execute("tilde-grant", {
+				command: `printf granted>${tildeTarget}`,
+				env: { HOME: os.homedir() },
+			});
+			expect(await Bun.file(tildePath).text()).toBe("granted");
+		} finally {
+			await Promise.all([
+				fs.rm(tildePath, { force: true }),
+				removeWithRetries(workspace),
+				removeWithRetries(outside),
+			]);
 		}
 	});
 
@@ -99,7 +163,9 @@ describe("BashTool session capabilities", () => {
 		try {
 			const tool = new BashTool(session(workspace, new SessionCapabilities({ workspace })));
 			await tool.execute("workspace-write", { command: "printf safe > result.txt" });
+			await tool.execute("workspace-attached-write", { command: "printf attached>attached.txt" });
 			expect(await Bun.file(path.join(workspace, "result.txt")).text()).toBe("safe");
+			expect(await Bun.file(path.join(workspace, "attached.txt")).text()).toBe("attached");
 		} finally {
 			await removeWithRetries(workspace);
 		}

@@ -145,7 +145,7 @@ describe("AgentSession owner-routed async delivery", () => {
 		).toBe(true);
 	});
 
-	it("routes an advisor-owned launch completion through the session", async () => {
+	it("persists an advisor-owned launch completion without starting a turn", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
 		const agent = new Agent({
@@ -188,14 +188,17 @@ describe("AgentSession owner-routed async delivery", () => {
 		await session.queueLaunchCompletion(completion);
 		await session.waitForIdle();
 
+		expect(mock.calls).toHaveLength(0);
+		expect(agent.state.messages.some(message => JSON.stringify(message).includes("advisor-worker"))).toBe(true);
 		expect(
-			mock.calls.some(call =>
-				call.context.messages.some(message =>
-					typeof message.content === "string"
-						? message.content.includes("advisor-worker")
-						: message.content.some(content => content.type === "text" && content.text.includes("advisor-worker")),
+			sessionManager
+				.getEntries()
+				.some(
+					entry =>
+						entry.type === "custom_message" &&
+						entry.customType === "launch-completion" &&
+						JSON.stringify(entry).includes("advisor-worker"),
 				),
-			),
 		).toBe(true);
 	});
 
