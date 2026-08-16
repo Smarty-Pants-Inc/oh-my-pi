@@ -221,6 +221,29 @@ const BASH_GITHUB_PR_OPTION_GRAMMARS = new Map<string, GithubPrOptionGrammar>([
 	],
 	["unlock", { boolean: new Set(), value: new Set() }],
 ]);
+
+function githubPrSingletonValueKey(subcommand: string, option: string): string | undefined {
+	if (option === "-R" || option === "--repo") return "repo";
+	if (subcommand === "create") {
+		if (option === "-B" || option === "--base") return "base";
+		if (option === "-b" || option === "--body") return "body";
+		if (option === "-H" || option === "--head") return "head";
+		if (option === "-m" || option === "--milestone") return "milestone";
+		if (option === "-t" || option === "--title") return "title";
+	}
+	if (subcommand === "edit") {
+		if (option === "-m" || option === "--milestone") return "milestone";
+		if (option === "-t" || option === "--title") return "title";
+	}
+	if (subcommand === "lock" && (option === "-r" || option === "--reason")) return "reason";
+	if (
+		subcommand === "review" &&
+		(option === "-b" || option === "--body" || option === "-F" || option === "--body-file")
+	) {
+		return "review-body";
+	}
+	return undefined;
+}
 const BASH_NAMED_EFFECT_ENV = new Set([
 	"GH_ENTERPRISE_TOKEN",
 	"GH_HOST",
@@ -544,6 +567,32 @@ function githubPrArgsAreAllowed(args: readonly string[]): boolean {
 	let explicitCreateEmptyBody = false;
 	let explicitCreateTitle = false;
 	let explicitReviewAction = false;
+	const singletonValues = new Set<string>();
+	const acceptValue = (option: string, value: string): boolean => {
+		const singletonKey = githubPrSingletonValueKey(args[1]!, option);
+		if (singletonKey) {
+			if (singletonValues.has(singletonKey)) return false;
+			singletonValues.add(singletonKey);
+		}
+		if ((option === "-R" || option === "--repo") && value.length === 0) return false;
+		if (args[1] === "create" && (option === "-b" || option === "--body")) {
+			if (value !== "") return false;
+			explicitCreateEmptyBody = true;
+		}
+		if (args[1] === "create" && (option === "-H" || option === "--head")) {
+			if (value.length === 0) return false;
+			explicitCreateHead = true;
+		}
+		if (args[1] === "create" && (option === "-t" || option === "--title")) {
+			if (value.length === 0) return false;
+			explicitCreateTitle = true;
+		}
+		if (args[1] === "create" && (option === "-B" || option === "--base")) {
+			if (value !== "main") return false;
+			explicitCreateBase = true;
+		}
+		return true;
+	};
 	for (let index = 2; index < args.length; index++) {
 		const arg = args[index]!;
 		if (optionsEnded || !arg.startsWith("-")) continue;
@@ -564,18 +613,7 @@ function githubPrArgsAreAllowed(args: readonly string[]): boolean {
 		if (grammar.value.has(arg) || arg === "-R" || arg === "--repo") {
 			if (index + 1 >= args.length) return false;
 			const value = args[index + 1]!;
-			if (args[1] === "create" && (arg === "-b" || arg === "--body")) {
-				if (value !== "" || explicitCreateEmptyBody) return false;
-				explicitCreateEmptyBody = true;
-			}
-			if ((arg === "-H" || arg === "--head") && value.length > 0) explicitCreateHead = true;
-			if (args[1] === "create" && (arg === "-t" || arg === "--title") && value.length > 0) {
-				explicitCreateTitle = true;
-			}
-			if (args[1] === "create" && (arg === "-B" || arg === "--base")) {
-				if (value !== "main") return false;
-				explicitCreateBase = true;
-			}
+			if (!acceptValue(arg, value)) return false;
 			index++;
 			continue;
 		}
@@ -584,18 +622,7 @@ function githubPrArgsAreAllowed(args: readonly string[]): boolean {
 		if (equalsIndex > 2) {
 			const option = arg.slice(0, equalsIndex);
 			if (grammar.value.has(option) || option === "--repo") {
-				if (args[1] === "create" && option === "--body") {
-					if (arg.slice(equalsIndex + 1) !== "" || explicitCreateEmptyBody) return false;
-					explicitCreateEmptyBody = true;
-				}
-				if (option === "--head" && arg.slice(equalsIndex + 1).length > 0) explicitCreateHead = true;
-				if (args[1] === "create" && option === "--title" && arg.slice(equalsIndex + 1).length > 0) {
-					explicitCreateTitle = true;
-				}
-				if (args[1] === "create" && option === "--base") {
-					if (arg.slice(equalsIndex + 1) !== "main") return false;
-					explicitCreateBase = true;
-				}
+				if (!acceptValue(option, arg.slice(equalsIndex + 1))) return false;
 				continue;
 			}
 		}
