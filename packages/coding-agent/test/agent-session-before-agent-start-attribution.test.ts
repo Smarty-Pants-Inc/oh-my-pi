@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentMessage, type AgentOptions, type AgentTool, type StreamFn } from "@oh-my-pi/pi-agent-core";
 import type { ContextInstruction, Model } from "@oh-my-pi/pi-ai";
@@ -30,11 +33,24 @@ describe("AgentSession before_agent_start typed provider context", () => {
 	let modelRegistry: ModelRegistry;
 	let authStorage: AuthStorage | undefined;
 	let capturedInstructions: ContextInstruction[] = [];
+	let fixtureHome = "";
+	let ambientHome = "";
 
 	const injectedText = "before-agent-start injected message";
+	const globalAgentsSource = "isolated before-agent-start test instructions\n";
+	const configurationSource = "{}\n";
 
 	beforeEach(async () => {
 		capturedInstructions = [];
+		ambientHome = os.homedir();
+		fixtureHome = await fs.mkdtemp(path.join(os.tmpdir(), "omp-before-agent-start-home-"));
+		const agentDir = path.join(fixtureHome, ".omp/agent");
+		await fs.mkdir(agentDir, { recursive: true });
+		await Promise.all([
+			fs.writeFile(path.join(agentDir, "AGENTS.md"), globalAgentsSource),
+			fs.writeFile(path.join(agentDir, "config.yml"), configurationSource),
+		]);
+		vi.spyOn(os, "homedir").mockReturnValue(fixtureHome);
 		authStorage = await AuthStorage.create(":memory:");
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 		modelRegistry = new ModelRegistry(authStorage);
@@ -47,6 +63,8 @@ describe("AgentSession before_agent_start typed provider context", () => {
 		}
 		authStorage?.close();
 		authStorage = undefined;
+		await fs.rm(fixtureHome, { recursive: true, force: true });
+		fixtureHome = "";
 	});
 
 	function createSession(
@@ -129,6 +147,16 @@ describe("AgentSession before_agent_start typed provider context", () => {
 			return message.content.some(block => block.type === "text" && block.text === text);
 		});
 	}
+	it("binds release evidence to isolated global sources without ambient home files", async () => {
+		vi.spyOn(ref, "commitIdentity").mockResolvedValue({ commit: "0".repeat(40), tree: "1".repeat(40) });
+		const release = await buildContextReleaseManifest();
+
+		expect(release.globalAgentsPath).toBe(path.join(fixtureHome, ".omp/agent/AGENTS.md"));
+		expect(release.globalAgentsPath).not.toBe(path.join(ambientHome, ".omp/agent/AGENTS.md"));
+		expect(release.globalAgentsSha256).toBe(sha256(globalAgentsSource));
+		expect(release.configurationSourceSha256).toBe(sha256(configurationSource));
+	});
+
 	it("keeps direct-user authority while serializing before_agent_start as internal context", async () => {
 		const { emitBeforeAgentStart } = createSession();
 

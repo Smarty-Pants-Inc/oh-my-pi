@@ -7,7 +7,10 @@ import { registeredPromptSource } from "../../src/context/registry";
 const repository = path.resolve(import.meta.dir, "../../../..");
 const cliEntry = path.join(repository, "packages/coding-agent/src/cli.ts");
 const blockNativeImport = path.join(import.meta.dir, "../fixtures/block-native-import.ts");
+const frozenUpstream = "37eee71978951fccf66b21f7e3e2b74596ac9d74";
+const frozenUpstreamUrl = "https://github.com/can1357/oh-my-pi.git";
 let home = "";
+let historyRepository = "";
 let processIndex = 0;
 
 interface CliResult {
@@ -53,11 +56,14 @@ async function runJson(args: string[], blockNative = true, cwd = repository): Pr
 async function runPrintedLedgerCommand(line: string): Promise<Record<string, unknown>> {
 	const [executable, ...args] = line.trim().split(/\s+/u);
 	expect(executable).toBe("bun");
+	expect(args[0]).toBe("packages/coding-agent/src/cli.ts");
+	const baseIndex = args.indexOf("--base");
+	expect(args[baseIndex + 1]).toBe(frozenUpstream);
 	const index = processIndex++;
 	const stdoutPath = path.join(home, `stdout-${index}`);
 	const stderrPath = path.join(home, `stderr-${index}`);
 	const child = Bun.spawnSync(["/usr/bin/env", Bun.which("bun") ?? process.execPath, ...args], {
-		cwd: repository,
+		cwd: historyRepository,
 		env: {
 			...Bun.env,
 			HOME: home,
@@ -75,6 +81,38 @@ async function runPrintedLedgerCommand(line: string): Promise<Record<string, unk
 
 beforeAll(async () => {
 	home = await fs.mkdtemp(path.join(os.tmpdir(), "omp-native-free-context-"));
+	historyRepository = path.join(home, "history-repository");
+	const clone = Bun.spawnSync(["git", "clone", "--quiet", "--no-local", repository, historyRepository], {
+		stdout: "ignore",
+		stderr: "pipe",
+	});
+	if (clone.exitCode !== 0) throw new Error(clone.stderr.toString());
+	await fs.symlink(path.join(repository, "node_modules"), path.join(historyRepository, "node_modules"));
+	const hasUpstream = Bun.spawnSync(["git", "cat-file", "-e", `${frozenUpstream}^{commit}`], {
+		cwd: historyRepository,
+		stdout: "ignore",
+		stderr: "ignore",
+	});
+	if (hasUpstream.exitCode !== 0) {
+		const fetch = Bun.spawnSync(
+			["git", "fetch", "--quiet", "--no-tags", "--depth=1", frozenUpstreamUrl, frozenUpstream],
+			{
+				cwd: historyRepository,
+				stdout: "ignore",
+				stderr: "pipe",
+			},
+		);
+		if (fetch.exitCode !== 0) throw new Error(fetch.stderr.toString());
+	}
+	for (const args of [
+		["remote", "set-url", "origin", "https://github.com/Smarty-Pants-Inc/oh-my-pi.git"],
+		["config", "user.name", "OMP Test"],
+		["config", "user.email", "omp-test@example.invalid"],
+		["commit", "--quiet", "--allow-empty", "-m", "materialize parent for context diff"],
+	]) {
+		const result = Bun.spawnSync(["git", ...args], { cwd: historyRepository, stdout: "ignore", stderr: "pipe" });
+		if (result.exitCode !== 0) throw new Error(result.stderr.toString());
+	}
 	const agentDir = path.join(home, ".omp/agent");
 	await fs.mkdir(agentDir, { recursive: true });
 	await Promise.all([
@@ -87,7 +125,7 @@ beforeAll(async () => {
 			await fs.writeFile(path.join(skillDir, "SKILL.md"), `# ${name}\n`);
 		}),
 	]);
-});
+}, 30_000);
 
 afterAll(async () => {
 	await fs.rm(home, { recursive: true, force: true });
@@ -115,12 +153,16 @@ describe("native-free context CLI", () => {
 
 	it("runs every offline context command without resolving the native package", async () => {
 		const manifest = await runJson(["context", "manifest", "--json"]);
-		const diff = await runJson(["context", "diff", "--base", "HEAD^", "--target", "HEAD", "--json"]);
+		const diff = await runJson(
+			["context", "diff", "--base", "HEAD^", "--target", "HEAD", "--json"],
+			true,
+			historyRepository,
+		);
 		const protectedDelta = await runJson([
 			"context",
 			"protected-delta",
 			"--repository",
-			repository,
+			historyRepository,
 			"--base",
 			"HEAD^",
 			"--target",
@@ -141,7 +183,9 @@ describe("native-free context CLI", () => {
 
 		expect(manifest.schema).toBe("omp.context_release_manifest.v1");
 		expect(diff.schema).toBe("omp.context_diff.v1");
+		expect(diff.changed).toBe(false);
 		expect(protectedDelta.schema).toBe("smarty.protected_delta.v1");
+		expect(protectedDelta.protectedDelta).toBe(false);
 		expect(explain.schema).toBe("omp.context_explain.v1");
 		const internalContext = (explain.components as Array<Record<string, unknown>>).find(
 			component => component.semanticRole === "internal_context",

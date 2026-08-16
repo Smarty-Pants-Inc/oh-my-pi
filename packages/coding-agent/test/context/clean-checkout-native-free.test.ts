@@ -51,6 +51,12 @@ describe("clean-checkout native-free context CLI", () => {
 		try {
 			await requireSuccess(["git", "clone", "--no-local", sourceRepository, checkout], sourceRepository);
 			await requireSuccess(["git", "checkout", "--detach", "HEAD"], checkout);
+			await requireSuccess(["git", "config", "user.name", "OMP Test"], checkout);
+			await requireSuccess(["git", "config", "user.email", "omp-test@example.invalid"], checkout);
+			await requireSuccess(
+				["git", "commit", "--quiet", "--allow-empty", "-m", "materialize parent for context diff"],
+				checkout,
+			);
 			await requireSuccess(
 				["git", "remote", "set-url", "origin", "https://github.com/Smarty-Pants-Inc/oh-my-pi.git"],
 				checkout,
