@@ -2,52 +2,13 @@ name: CI
 
 on:
    push:
-      branches: [main]
-      paths:
-         - "packages/**"
-         - "crates/**"
-         - "scripts/**"
-         - "bazel/**"
-         - "MODULE.bazel"
-         - "MODULE.bazel.lock"
-         - "BUILD.bazel"
-         - ".bazelrc"
-         - ".bazelignore"
-         - ".bazelversion"
-         - "Cargo.toml"
-         - "Cargo.lock"
-         - "rust-toolchain.toml"
-         - "rustfmt.toml"
-         # A root dependency change (lockfile/catalog/patches) affects every
-         # job; without these a lockfile-only push shipped untested — and a
-         # release retagged onto such a commit never triggered its run.
-         - "bun.lock"
-         - "bunfig.toml"
-         - "package.json"
-         - "patches/**"
-         - ".github/**"
+      branches:
+         - main
+         - "mergify/merge-queue/**"
+         - "tmp-mergify/merge-queue/**"
    pull_request:
+      types: [opened, synchronize, reopened, ready_for_review]
       branches: [main]
-      paths:
-         - "packages/**"
-         - "crates/**"
-         - "scripts/**"
-         - "bazel/**"
-         - "MODULE.bazel"
-         - "MODULE.bazel.lock"
-         - "BUILD.bazel"
-         - ".bazelrc"
-         - ".bazelignore"
-         - ".bazelversion"
-         - "Cargo.toml"
-         - "Cargo.lock"
-         - "rust-toolchain.toml"
-         - "rustfmt.toml"
-         - "bun.lock"
-         - "bunfig.toml"
-         - "package.json"
-         - "patches/**"
-         - ".github/**"
    workflow_dispatch:
       inputs:
          skip_npm:
@@ -445,6 +406,38 @@ jobs:
            env:
               OMP_INSTALL_TEST_SKIP_NATIVE_BUILD: "1"
            run: bun run ci:test:install-methods
+
+   smarty_ci:
+      name: smarty-ci
+      if: ${{ always() }}
+      needs: [check, rust_validate, native_addons, test_workspace, test_coding_agent_singleton, test_ts_native, test_coding_agent_ui, test_coding_agent_runtime, test_coding_agent_native, test_smoke, install_methods]
+      runs-on: ubuntu-22.04
+      steps:
+         - name: Require successful validation
+           env:
+              EVENT_NAME: ${{ github.event_name }}
+              CHECK: ${{ needs.check.result }}
+              RUST_VALIDATE: ${{ needs.rust_validate.result }}
+              NATIVE_ADDONS: ${{ needs.native_addons.result }}
+              TEST_WORKSPACE: ${{ needs.test_workspace.result }}
+              TEST_CODING_AGENT_SINGLETON: ${{ needs.test_coding_agent_singleton.result }}
+              TEST_TS_NATIVE: ${{ needs.test_ts_native.result }}
+              TEST_CODING_AGENT_UI: ${{ needs.test_coding_agent_ui.result }}
+              TEST_CODING_AGENT_RUNTIME: ${{ needs.test_coding_agent_runtime.result }}
+              TEST_CODING_AGENT_NATIVE: ${{ needs.test_coding_agent_native.result }}
+              TEST_SMOKE: ${{ needs.test_smoke.result }}
+              INSTALL_METHODS: ${{ needs.install_methods.result }}
+           run: |
+              set -euo pipefail
+              for result in "$CHECK" "$NATIVE_ADDONS" "$TEST_WORKSPACE" \
+                 "$TEST_CODING_AGENT_SINGLETON" "$TEST_TS_NATIVE" \
+                 "$TEST_CODING_AGENT_UI" "$TEST_CODING_AGENT_RUNTIME" \
+                 "$TEST_CODING_AGENT_NATIVE" "$TEST_SMOKE" "$INSTALL_METHODS"; do
+                 test "$result" = success
+              done
+              if [ "$EVENT_NAME" != pull_request ]; then
+                 test "$RUST_VALIDATE" = success
+              fi
 
    # Aggregates every validation job so publish-side release jobs gate on one
    # result. Binary BUILDS deliberately do not wait for this gate — they run
