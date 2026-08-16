@@ -1518,16 +1518,11 @@ export class AgentSession {
 				isStale: entry =>
 					entry.epoch !== this.#asyncDeliveryEpoch ||
 					manager.isDeliverySuppressed(entry.jobId) ||
-					this.#queuedAsyncResults.get(entry.jobId) !== entry ||
-					!this.#automaticTurns.isTurnOpen(entry.originTurnId),
+					(entry.job !== undefined && this.#queuedAsyncResults.get(entry.jobId) !== entry),
 				onStale: entry => {
 					if (this.#queuedAsyncResults.get(entry.jobId) !== entry) return;
 					if (entry.epoch !== this.#asyncDeliveryEpoch) {
 						this.#queuedAsyncResults.delete(entry.jobId);
-						return;
-					}
-					if (entry.originTurnId !== undefined && !this.#automaticTurns.isTurnOpen(entry.originTurnId)) {
-						this.#schedulePostPromptTask(() => this.#persistPassiveAsyncResult(entry));
 					}
 				},
 				onDiscard: entries => {
@@ -2386,19 +2381,12 @@ export class AgentSession {
 			failures.push(error);
 		}
 		if (!committed) {
-			const deferredAtSelection = transition.deferredDeliveries;
-			transition.deferredDeliveries = [];
-			for (const delivery of deferredAtSelection) {
-				try {
-					if (!isLaunchCompletionOwner(delivery.notification.owner, selectedSessionId)) {
-						delivery.reject(new Error("Launch completion belongs to the discarded lifecycle owner"));
-						continue;
-					}
-					this.#forwardLaunchCompletionReceipt(delivery);
-				} catch (error) {
-					failures.push(error);
-				}
+			const retained: DeferredLaunchCompletionDelivery[] = [];
+			for (const delivery of transition.deferredDeliveries) {
+				if (isLaunchCompletionOwner(delivery.notification.owner, selectedSessionId)) retained.push(delivery);
+				else delivery.reject(new Error("Launch completion belongs to the discarded lifecycle owner"));
 			}
+			transition.deferredDeliveries = retained;
 		}
 		if (failures.length === 1) throw failures[0];
 		if (failures.length > 1) {
@@ -3953,6 +3941,14 @@ export class AgentSession {
 				message.details,
 				message.attribution ?? "agent",
 			);
+			if (message.customType === ASYNC_RESULT_MESSAGE_TYPE && isRecord(message.details)) {
+				const jobs = message.details.jobs;
+				if (Array.isArray(jobs)) {
+					for (const job of jobs) {
+						if (isRecord(job) && typeof job.jobId === "string") this.#queuedAsyncResults.delete(job.jobId);
+					}
+				}
+			}
 		}
 	}
 
@@ -4286,8 +4282,8 @@ export class AgentSession {
 		this.#capabilities?.endTurn(turnId);
 		this.#automaticTurns.closeTurn(turnId);
 		if (this.#currentTurnId === turnId) this.#currentTurnId = undefined;
-		for (const entry of this.#queuedAsyncResults.values()) {
-			if (entry.originTurnId === turnId) void this.#persistPassiveAsyncResult(entry);
+		if ([...this.#queuedAsyncResults.values()].some(entry => entry.originTurnId === turnId)) {
+			this.yieldQueue.requestIdleFlush();
 		}
 	}
 

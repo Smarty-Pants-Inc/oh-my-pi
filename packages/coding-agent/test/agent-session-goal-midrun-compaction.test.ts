@@ -99,9 +99,11 @@ describe("AgentSession mid-run threshold compaction", () => {
 	): Promise<{
 		session: AgentSession;
 		observedContexts: string[][];
+		observedInstructions: string[][];
 		sessionManager: SessionManager;
 	}> {
 		const observedContexts: string[][] = [];
+		const observedInstructions: string[][] = [];
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");
 
@@ -140,6 +142,7 @@ describe("AgentSession mid-run threshold compaction", () => {
 				const index = call++;
 				options.onProviderCall?.(index);
 				observedContexts.push(context.messages.map(message => JSON.stringify(message)));
+				observedInstructions.push((context.instructions ?? []).map(instruction => JSON.stringify(instruction)));
 				const stream = new AssistantMessageEventStream();
 				const isToolTurn = index === 0;
 				const message = isToolTurn
@@ -184,7 +187,7 @@ describe("AgentSession mid-run threshold compaction", () => {
 		});
 
 		cleanups.push(() => session.dispose());
-		return { session, sessionManager, observedContexts };
+		return { session, sessionManager, observedContexts, observedInstructions };
 	}
 
 	function mockCompaction(summary: string) {
@@ -198,18 +201,18 @@ describe("AgentSession mid-run threshold compaction", () => {
 	}
 
 	it("compacts in place between tool-call turns outside goal mode", async () => {
-		const { session, observedContexts } = await createHarness();
+		const { session, observedContexts, observedInstructions } = await createHarness();
 		const compactSpy = mockCompaction("MID-RUN-COMPACTED");
 
 		await session.prompt("work on the release");
 
 		expect(compactSpy).toHaveBeenCalledTimes(1);
 		expect(observedContexts.length).toBeGreaterThanOrEqual(2);
-		expect(observedContexts[1].join("\n")).toContain("MID-RUN-COMPACTED");
+		expect(observedInstructions[1].join("\n")).toContain("MID-RUN-COMPACTED");
 	});
 
 	it("compacts in place between tool-call turns during an active goal run", async () => {
-		const { session, observedContexts } = await createHarness();
+		const { session, observedContexts, observedInstructions } = await createHarness();
 		session.setGoalModeState(activeGoalState());
 		const compactSpy = mockCompaction("ACTIVE-GOAL-MID-RUN-COMPACTED");
 
@@ -217,11 +220,13 @@ describe("AgentSession mid-run threshold compaction", () => {
 
 		expect(compactSpy).toHaveBeenCalledTimes(1);
 		expect(observedContexts.length).toBeGreaterThanOrEqual(2);
-		expect(observedContexts[1].join("\n")).toContain("ACTIVE-GOAL-MID-RUN-COMPACTED");
+		expect(observedInstructions[1].join("\n")).toContain("ACTIVE-GOAL-MID-RUN-COMPACTED");
 	});
 
 	it("falls back to in-place compaction for mid-run handoff strategy", async () => {
-		const { session, observedContexts } = await createHarness({ "compaction.strategy": "handoff" });
+		const { session, observedInstructions } = await createHarness({
+			"compaction.strategy": "handoff",
+		});
 		const handoffSpy = vi.spyOn(session, "handoff").mockImplementation(async () => {
 			throw new Error("mid-run compaction must not reset the session through handoff");
 		});
@@ -231,7 +236,7 @@ describe("AgentSession mid-run threshold compaction", () => {
 
 		expect(handoffSpy).not.toHaveBeenCalled();
 		expect(compactSpy).toHaveBeenCalledTimes(1);
-		expect(observedContexts[1].join("\n")).toContain("HANDOFF-MID-RUN-COMPACTED-IN-PLACE");
+		expect(observedInstructions[1].join("\n")).toContain("HANDOFF-MID-RUN-COMPACTED-IN-PLACE");
 	});
 
 	it("does not wait for message persistence below the mid-run threshold", async () => {
@@ -419,7 +424,10 @@ describe("AgentSession mid-run threshold compaction", () => {
 				}
 			}),
 		} as unknown as ExtensionRunner;
-		const { session, sessionManager, observedContexts } = await createHarness({}, { extensionRunner });
+		const { session, sessionManager, observedContexts, observedInstructions } = await createHarness(
+			{},
+			{ extensionRunner },
+		);
 		const compactSpy = mockCompaction("MID-RUN-COMPACTED-WITH-PENDING-HOOK");
 
 		const prompt = session.prompt("work on the release");
@@ -444,7 +452,7 @@ describe("AgentSession mid-run threshold compaction", () => {
 		expect(toolResultIndex).toBeGreaterThan(toolUseAssistantIndex);
 		expect(nextProviderContext.filter(serialized => serialized.includes('"id":"tc-0"'))).toHaveLength(1);
 		expect(nextProviderContext.filter(serialized => serialized.includes('"toolCallId":"tc-0"'))).toHaveLength(1);
-		expect(nextProviderContext.join("\n")).toContain("MID-RUN-COMPACTED-WITH-PENDING-HOOK");
+		expect(observedInstructions[1].join("\n")).toContain("MID-RUN-COMPACTED-WITH-PENDING-HOOK");
 		expect(nextProviderContext.join("\n")).toContain("tool output");
 
 		const persistedToolTurnRoles = sessionManager
@@ -485,14 +493,14 @@ describe("AgentSession mid-run threshold compaction", () => {
 			SessionManager.inMemory(),
 			sharedModelRegistry,
 		);
-		const { session, observedContexts } = await createHarness({}, { extensionRunner });
+		const { session, observedContexts, observedInstructions } = await createHarness({}, { extensionRunner });
 		const compactSpy = mockCompaction("MID-RUN-COMPACTED-WITH-CONTENT-VARIANT");
 
 		await session.prompt("work on the release");
 
 		expect(compactSpy).toHaveBeenCalledTimes(1);
 		expect(observedContexts.length).toBeGreaterThanOrEqual(2);
-		expect(observedContexts[1].join("\n")).toContain("MID-RUN-COMPACTED-WITH-CONTENT-VARIANT");
+		expect(observedInstructions[1].join("\n")).toContain("MID-RUN-COMPACTED-WITH-CONTENT-VARIANT");
 		expect(JSON.stringify(session.messages)).not.toContain("display-variant");
 	});
 
@@ -515,7 +523,7 @@ describe("AgentSession mid-run threshold compaction", () => {
 				}
 			}),
 		} as unknown as ExtensionRunner;
-		const { session, observedContexts } = await createHarness(
+		const { session, observedInstructions } = await createHarness(
 			{ "compaction.strategy": strategy },
 			{
 				extensionRunner,
@@ -558,7 +566,7 @@ describe("AgentSession mid-run threshold compaction", () => {
 		expect(promptOutcome).toBe("settled");
 		expect(compactSpy).toHaveBeenCalledTimes(1);
 		if (shakeSpy) expect(shakeSpy).toHaveBeenCalledTimes(1);
-		expect(observedContexts[1].join("\n")).toContain("MID-RUN-COMPACTED-WITHOUT-WAITING-ON-LIFECYCLE");
+		expect(observedInstructions[1].join("\n")).toContain("MID-RUN-COMPACTED-WITHOUT-WAITING-ON-LIFECYCLE");
 	});
 
 	it("does not compact mid-run outside goal mode when disabled", async () => {

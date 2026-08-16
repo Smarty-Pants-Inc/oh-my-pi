@@ -555,8 +555,7 @@ export class SessionAdvisors {
 	 * (`#advisorPrimaryTurnsCompleted`, `#advisorInterruptImmuneTurnStart`) and the
 	 * user-interrupt auto-resume suppression flag. It also drops advisor deliveries
 	 * still queued against the prior conversation — pending asides in the yield
-	 * queue (advisor entries use `skipIdleFlush`, so they linger until the next
-	 * `drainLazy` rather than self-flushing), interrupting cards parked in the
+	 * queue, interrupting cards parked in the
 	 * agent steer/follow-up queues, and preserved cards deferred to the next turn —
 	 * so none of them inject into the new conversation.
 	 */
@@ -1002,7 +1001,6 @@ export class SessionAdvisors {
 								content: formatAdvisorBatchContent(entries),
 								details: { notes: entries } satisfies AdvisorMessageDetails,
 							} satisfies CustomMessage),
-				skipIdleFlush: true,
 			});
 		}
 
