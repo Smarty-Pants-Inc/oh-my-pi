@@ -31,10 +31,12 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { diff } from "@oh-my-pi/pi-coding-agent/utils/git";
+import { diff, fetch as gitFetch, ref } from "@oh-my-pi/pi-coding-agent/utils/git";
 
 const repository = path.resolve(import.meta.dir, "../../..");
 const scopeBase = "37eee71978951fccf66b21f7e3e2b74596ac9d74";
+const scopeBaseTree = "a20c0452f99155e7adeaecfad28e4afd0223c684";
+const scopeBaseUrl = "https://github.com/can1357/oh-my-pi.git";
 
 describe("AgentSession before_agent_start typed provider context", () => {
 	let session: AgentSession;
@@ -157,6 +159,14 @@ describe("AgentSession before_agent_start typed provider context", () => {
 	}
 
 	async function writeReviewedPolicyState() {
+		let baseIdentity = await ref.commitIdentity(repository, scopeBase);
+		if (!baseIdentity) {
+			await gitFetch(repository, scopeBaseUrl, scopeBase, `refs/omp/test-scope-base/${scopeBase}`);
+			baseIdentity = await ref.commitIdentity(repository, scopeBase);
+		}
+		if (baseIdentity?.commit !== scopeBase || baseIdentity.tree !== scopeBaseTree) {
+			throw new Error("Expected the exact frozen scope base");
+		}
 		const changedPaths = (await diff(repository, { base: scopeBase, head: "HEAD", nameOnly: true, z: true }))
 			.split("\0")
 			.filter(Boolean)

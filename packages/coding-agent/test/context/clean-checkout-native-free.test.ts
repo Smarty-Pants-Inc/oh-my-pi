@@ -13,6 +13,7 @@ interface CommandResult {
 const sourceRepository = path.resolve(import.meta.dir, "../../../..");
 const bun = Bun.which("bun") ?? process.execPath;
 const frozenUpstream = "37eee71978951fccf66b21f7e3e2b74596ac9d74";
+const frozenUpstreamUrl = "https://github.com/can1357/oh-my-pi.git";
 
 async function run(command: string[], cwd: string, env?: Record<string, string | undefined>): Promise<CommandResult> {
 	const outputDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-context-command-"));
@@ -45,6 +46,13 @@ async function requireSuccess(
 }
 
 async function writePolicyState(checkout: string, home: string): Promise<void> {
+	const hasUpstream = await run(["git", "cat-file", "-e", `${frozenUpstream}^{commit}`], checkout);
+	if (hasUpstream.exitCode !== 0) {
+		await requireSuccess(
+			["git", "fetch", "--quiet", "--no-tags", "--depth=1", frozenUpstreamUrl, frozenUpstream],
+			checkout,
+		);
+	}
 	const paths = (await requireSuccess(["git", "diff", "--name-only", "-z", frozenUpstream, "HEAD"], checkout))
 		.split("\0")
 		.filter(Boolean)

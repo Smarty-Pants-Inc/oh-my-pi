@@ -19,7 +19,26 @@ interface CliResult {
 	stderr: string;
 }
 
+function ensureFrozenUpstream(cwd: string): void {
+	const hasUpstream = Bun.spawnSync(["git", "cat-file", "-e", `${frozenUpstream}^{commit}`], {
+		cwd,
+		stdout: "ignore",
+		stderr: "ignore",
+	});
+	if (hasUpstream.exitCode === 0) return;
+	const fetch = Bun.spawnSync(
+		["git", "fetch", "--quiet", "--no-tags", "--depth=1", frozenUpstreamUrl, frozenUpstream],
+		{
+			cwd,
+			stdout: "ignore",
+			stderr: "pipe",
+		},
+	);
+	if (fetch.exitCode !== 0) throw new Error(fetch.stderr.toString());
+}
+
 function fixtureScopeCoverage(cwd: string): Array<{ path: string; requirement: string }> {
+	ensureFrozenUpstream(cwd);
 	const result = Bun.spawnSync(["git", "diff", "--name-only", "-z", frozenUpstream, "HEAD"], {
 		cwd,
 		stdout: "pipe",
@@ -130,22 +149,7 @@ beforeAll(async () => {
 	});
 	if (clone.exitCode !== 0) throw new Error(clone.stderr.toString());
 	await fs.symlink(path.join(repository, "node_modules"), path.join(historyRepository, "node_modules"));
-	const hasUpstream = Bun.spawnSync(["git", "cat-file", "-e", `${frozenUpstream}^{commit}`], {
-		cwd: historyRepository,
-		stdout: "ignore",
-		stderr: "ignore",
-	});
-	if (hasUpstream.exitCode !== 0) {
-		const fetch = Bun.spawnSync(
-			["git", "fetch", "--quiet", "--no-tags", "--depth=1", frozenUpstreamUrl, frozenUpstream],
-			{
-				cwd: historyRepository,
-				stdout: "ignore",
-				stderr: "pipe",
-			},
-		);
-		if (fetch.exitCode !== 0) throw new Error(fetch.stderr.toString());
-	}
+	ensureFrozenUpstream(historyRepository);
 	for (const args of [
 		["remote", "set-url", "origin", "https://github.com/Smarty-Pants-Inc/oh-my-pi.git"],
 		["config", "user.name", "OMP Test"],
