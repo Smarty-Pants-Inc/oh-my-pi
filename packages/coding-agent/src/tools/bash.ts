@@ -159,19 +159,127 @@ const BASH_SAFE_BUN_TEST_ENUM_VALUE_FLAGS = new Map<string, ReadonlySet<string>>
 	["--reporter", new Set(["dots", "junit"])],
 ]);
 const BASH_SAFE_BUN_TEST_STRING_VALUE_FLAGS = new Set(["--test-name-pattern"]);
-const BASH_GITHUB_PR_EFFECTS = new Set([
-	"close",
-	"comment",
-	"create",
-	"delete",
-	"edit",
-	"lock",
-	"merge",
-	"ready",
-	"reopen",
-	"review",
-	"unlock",
-	"update-branch",
+interface GithubPrOptionGrammar {
+	boolean: ReadonlySet<string>;
+	value: ReadonlySet<string>;
+}
+
+const BASH_GITHUB_PR_OPTION_GRAMMARS = new Map<string, GithubPrOptionGrammar>([
+	["close", { boolean: new Set(["--delete-branch", "-d"]), value: new Set(["--comment", "-c"]) }],
+	[
+		"comment",
+		{
+			boolean: new Set(["--create-if-none", "--delete-last", "--edit-last", "--yes"]),
+			value: new Set(["--body", "--body-file", "-b", "-F"]),
+		},
+	],
+	[
+		"create",
+		{
+			boolean: new Set([
+				"--draft",
+				"--dry-run",
+				"--fill",
+				"--fill-first",
+				"--fill-verbose",
+				"--no-maintainer-edit",
+				"-d",
+				"-f",
+			]),
+			value: new Set([
+				"--assignee",
+				"--base",
+				"--body",
+				"--body-file",
+				"--head",
+				"--label",
+				"--milestone",
+				"--project",
+				"--recover",
+				"--reviewer",
+				"--template",
+				"--title",
+				"-a",
+				"-B",
+				"-b",
+				"-F",
+				"-H",
+				"-l",
+				"-m",
+				"-p",
+				"-r",
+				"-T",
+				"-t",
+			]),
+		},
+	],
+	[
+		"edit",
+		{
+			boolean: new Set(["--remove-milestone"]),
+			value: new Set([
+				"--add-assignee",
+				"--add-label",
+				"--add-project",
+				"--add-reviewer",
+				"--base",
+				"--body",
+				"--body-file",
+				"--milestone",
+				"--remove-assignee",
+				"--remove-label",
+				"--remove-project",
+				"--remove-reviewer",
+				"--title",
+				"-B",
+				"-b",
+				"-F",
+				"-m",
+				"-t",
+			]),
+		},
+	],
+	["lock", { boolean: new Set(), value: new Set(["--reason", "-r"]) }],
+	[
+		"merge",
+		{
+			boolean: new Set([
+				"--admin",
+				"--auto",
+				"--delete-branch",
+				"--disable-auto",
+				"--merge",
+				"--rebase",
+				"--squash",
+				"-d",
+				"-m",
+				"-r",
+				"-s",
+			]),
+			value: new Set([
+				"--author-email",
+				"--body",
+				"--body-file",
+				"--match-head-commit",
+				"--subject",
+				"-A",
+				"-b",
+				"-F",
+				"-t",
+			]),
+		},
+	],
+	["ready", { boolean: new Set(["--undo"]), value: new Set() }],
+	["reopen", { boolean: new Set(), value: new Set(["--comment", "-c"]) }],
+	[
+		"review",
+		{
+			boolean: new Set(["--approve", "--comment", "--request-changes", "-a", "-c", "-r"]),
+			value: new Set(["--body", "--body-file", "-b", "-F"]),
+		},
+	],
+	["unlock", { boolean: new Set(), value: new Set() }],
+	["update-branch", { boolean: new Set(["--rebase"]), value: new Set() }],
 ]);
 const BASH_NAMED_EFFECT_ENV = new Set([
 	"GH_ENTERPRISE_TOKEN",
@@ -485,6 +593,36 @@ function gitPushArgsAreAllowed(args: readonly string[]): boolean {
 	return true;
 }
 
+function githubPrArgsAreAllowed(args: readonly string[]): boolean {
+	if (args[0] !== "pr") return false;
+	const grammar = BASH_GITHUB_PR_OPTION_GRAMMARS.get(args[1] ?? "");
+	if (!grammar) return false;
+
+	let optionsEnded = false;
+	for (let index = 2; index < args.length; index++) {
+		const arg = args[index]!;
+		if (optionsEnded || !arg.startsWith("-")) continue;
+		if (arg === "--") {
+			optionsEnded = true;
+			continue;
+		}
+		if (grammar.boolean.has(arg)) continue;
+		if (grammar.value.has(arg) || arg === "-R" || arg === "--repo") {
+			if (index + 1 >= args.length) return false;
+			index++;
+			continue;
+		}
+
+		const equalsIndex = arg.indexOf("=");
+		if (equalsIndex > 2) {
+			const option = arg.slice(0, equalsIndex);
+			if (grammar.value.has(option) || option === "--repo") continue;
+		}
+		return false;
+	}
+	return true;
+}
+
 function resolveNamedEffectExecutable(name: "env" | "git" | "gh"): string | undefined {
 	const found = $which(name);
 	if (!found || !path.isAbsolute(found)) return undefined;
@@ -534,12 +672,7 @@ function parseNamedBashEffect(command: string, env?: Record<string, string>): Na
 		const executable = resolveNamedEffectExecutable("git");
 		return executable ? { capability: "git.push", executable, args, env: effectEnv } : undefined;
 	}
-	if (
-		commandName === "gh" &&
-		args[0] === "pr" &&
-		BASH_GITHUB_PR_EFFECTS.has(args[1] ?? "") &&
-		!args.some(arg => arg === "--editor" || arg === "--web")
-	) {
+	if (commandName === "gh" && githubPrArgsAreAllowed(args)) {
 		const executable = resolveNamedEffectExecutable("gh");
 		return executable ? { capability: "github.pr", executable, args, env: effectEnv } : undefined;
 	}

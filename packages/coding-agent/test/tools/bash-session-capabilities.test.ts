@@ -317,6 +317,27 @@ describe("BashTool session capabilities", () => {
 				"git push --exe=./payload local-repo",
 				"git push --receive-p=./payload local-repo",
 				"git push --unknown-safe-looking origin main",
+				"gh pr delete",
+				"gh pr create -e",
+				"gh pr create -w",
+				"gh pr create -ew",
+				"gh pr create -we",
+				"gh pr create -eeditor",
+				"gh pr create -wbrowser",
+				"gh pr create --editor",
+				"gh pr create --editor=true",
+				"gh pr create --web",
+				"gh pr create --web=true",
+				"gh pr comment -e",
+				"gh pr comment -w",
+				"gh pr comment -ew",
+				"gh pr comment -we",
+				"gh pr comment --editor",
+				"gh pr comment --web",
+				"gh pr create --execute payload",
+				"gh pr create -x",
+				"gh pr create --draft=true",
+				"gh pr create -tattached",
 				"git push --exec=./payload local-repo && echo never",
 				"git push --dry-run > push.log",
 				"git push --dry-run $(touch substituted)",
@@ -381,6 +402,25 @@ describe("BashTool session capabilities", () => {
 			expect(await Bun.file(sentinel).exists()).toBe(false);
 		} finally {
 			await Promise.all([removeWithRetries(workspace), removeWithRetries(attacker)]);
+		}
+	});
+
+	it("admits only explicit noninteractive GitHub PR options", async () => {
+		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "bash-cap-gh-pr-"));
+		try {
+			const tool = new BashTool(
+				session(workspace, new SessionCapabilities({ workspace, externalCapabilities: ["github.pr"] })),
+			);
+			for (const command of [
+				"gh pr create --dry-run --title title --body body",
+				"gh pr comment 123 --body body",
+				"gh pr merge 123 --squash --match-head-commit deadbeef",
+				"gh pr edit 123 --title title",
+			]) {
+				expect(await tool.execute(`allowed-${command}`, { command })).toBeDefined();
+			}
+		} finally {
+			await removeWithRetries(workspace);
 		}
 	});
 
