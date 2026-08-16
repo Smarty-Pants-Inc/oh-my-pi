@@ -165,7 +165,6 @@ interface GithubPrOptionGrammar {
 }
 
 const BASH_GITHUB_PR_OPTION_GRAMMARS = new Map<string, GithubPrOptionGrammar>([
-	["close", { boolean: new Set(), value: new Set() }],
 	[
 		"create",
 		{
@@ -206,7 +205,6 @@ const BASH_GITHUB_PR_OPTION_GRAMMARS = new Map<string, GithubPrOptionGrammar>([
 				"--add-label",
 				"--add-project",
 				"--add-reviewer",
-				"--base",
 				"--body",
 				"--body-file",
 				"--milestone",
@@ -215,7 +213,6 @@ const BASH_GITHUB_PR_OPTION_GRAMMARS = new Map<string, GithubPrOptionGrammar>([
 				"--remove-project",
 				"--remove-reviewer",
 				"--title",
-				"-B",
 				"-b",
 				"-F",
 				"-m",
@@ -224,8 +221,6 @@ const BASH_GITHUB_PR_OPTION_GRAMMARS = new Map<string, GithubPrOptionGrammar>([
 		},
 	],
 	["lock", { boolean: new Set(), value: new Set(["--reason", "-r"]) }],
-	["ready", { boolean: new Set(["--undo"]), value: new Set() }],
-	["reopen", { boolean: new Set(), value: new Set() }],
 	[
 		"review",
 		{
@@ -554,6 +549,7 @@ function githubPrArgsAreAllowed(args: readonly string[]): boolean {
 
 	let optionsEnded = false;
 	let explicitCreateHead = false;
+	let explicitCreateBase = false;
 	let explicitReviewAction = false;
 	for (let index = 2; index < args.length; index++) {
 		const arg = args[index]!;
@@ -574,7 +570,12 @@ function githubPrArgsAreAllowed(args: readonly string[]): boolean {
 		}
 		if (grammar.value.has(arg) || arg === "-R" || arg === "--repo") {
 			if (index + 1 >= args.length) return false;
-			if ((arg === "-H" || arg === "--head") && args[index + 1]!.length > 0) explicitCreateHead = true;
+			const value = args[index + 1]!;
+			if ((arg === "-H" || arg === "--head") && value.length > 0) explicitCreateHead = true;
+			if (args[1] === "create" && (arg === "-B" || arg === "--base")) {
+				if (value !== "main") return false;
+				explicitCreateBase = true;
+			}
 			index++;
 			continue;
 		}
@@ -584,13 +585,17 @@ function githubPrArgsAreAllowed(args: readonly string[]): boolean {
 			const option = arg.slice(0, equalsIndex);
 			if (grammar.value.has(option) || option === "--repo") {
 				if (option === "--head" && arg.slice(equalsIndex + 1).length > 0) explicitCreateHead = true;
+				if (args[1] === "create" && option === "--base") {
+					if (arg.slice(equalsIndex + 1) !== "main") return false;
+					explicitCreateBase = true;
+				}
 				continue;
 			}
 		}
 		return false;
 	}
 	// GitHub documents that an explicit head skips gh's branch push/fork path.
-	if (args[1] === "create") return explicitCreateHead;
+	if (args[1] === "create") return explicitCreateHead && explicitCreateBase;
 	if (args[1] === "review") return explicitReviewAction;
 	return true;
 }
