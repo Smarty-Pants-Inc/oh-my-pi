@@ -1,8 +1,10 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { ContextInstruction } from "@oh-my-pi/pi-ai";
 import { mapContextRole } from "@oh-my-pi/pi-ai/context-instructions";
 import { YAML } from "bun";
+import type { MCPServer } from "../capability/mcp";
 import { expandAtImports } from "../discovery/at-imports";
 import { ref, remote, repo, show } from "../utils/git";
 import { approvalStatus } from "./approved-policy";
@@ -17,6 +19,20 @@ import {
 	registeredPromptSource,
 } from "./registry";
 import { SMARTY_MERGIFY_SKILLS } from "./smarty-skills";
+import type { RenderedToolContractExport } from "./tool-contracts";
+
+export interface RuntimeMcpInstruction {
+	name: string;
+	source: string;
+	content: string;
+}
+
+export interface RuntimeContextEvidence {
+	instructions?: readonly ContextInstruction[];
+	selectedSkills?: readonly { name: string; renderedText: string; order: number }[];
+	mcpInstructions?: readonly RuntimeMcpInstruction[];
+	renderedToolContracts?: RenderedToolContractExport;
+}
 
 export interface ExplainedComponent {
 	id: string;
@@ -29,13 +45,16 @@ export interface ExplainedComponent {
 	visibility: "model" | "conditional" | "offline_only" | "external";
 	enabled: boolean;
 	enabledReason: string;
+	triggered: boolean;
+	effective: boolean;
+	availability: "effective" | "available" | "unavailable";
 	approvalStatus: "approved" | "unapproved" | "mismatch" | "not_applicable";
 	sha256: string;
 	provider: string;
 	model: string;
 	renderedWrapper: string;
 	precedence: number;
-	providerOrder: number;
+	providerOrder: number | null;
 	bytes: number;
 	words: number;
 	estimatedTokens: number;
@@ -53,6 +72,9 @@ export interface ContextExplanation {
 	behavior: unknown;
 	behaviorSource: "agent-behavior.yml";
 	automaticTurnSources: string[];
+	toolContracts:
+		| { status: "effective"; export: RenderedToolContractExport }
+		| { status: "unavailable"; provider: string; model: string; reason: string };
 }
 
 function counts(content: string): Pick<ExplainedComponent, "bytes" | "words" | "estimatedTokens"> {
@@ -88,10 +110,14 @@ async function loadOfflineContextFiles(cwd: string): Promise<Array<{ path: strin
 	const projectFiles: Array<{ path: string; content: string; depth?: number }> = [];
 	let current = resolvedCwd;
 	let depth = 0;
+	let nearestOmpContext: { path: string; content: string; depth?: number } | undefined;
 	while (true) {
 		if (current !== home && !path.basename(current).startsWith(".")) {
 			const contextFile = await readContextFile(path.join(current, "AGENTS.md"), depth);
 			if (contextFile) projectFiles.push(contextFile);
+		}
+		if (!nearestOmpContext) {
+			nearestOmpContext = await readContextFile(path.join(current, ".omp/AGENTS.md"), depth);
 		}
 		if (current === boundary) break;
 		const parent = path.dirname(current);
@@ -99,6 +125,7 @@ async function loadOfflineContextFiles(cwd: string): Promise<Array<{ path: strin
 		current = parent;
 		depth++;
 	}
+	if (nearestOmpContext) projectFiles.push(nearestOmpContext);
 	projectFiles.sort((left, right) => (right.depth ?? -1) - (left.depth ?? -1));
 	const global = await readContextFile(path.join(home, ".omp/agent/AGENTS.md"));
 	const files = global ? [...projectFiles, global] : projectFiles;
@@ -116,11 +143,51 @@ async function loadExplainContextFiles(cwd: string): Promise<Array<{ path: strin
 	}
 }
 
-async function loadOfflineDynamicSources(
-	cwd: string,
-): Promise<
-	Array<{ id: string; source: string; trigger: string; content: string; kind: "skill" | "extension" | "mcp" }>
-> {
+interface OfflineDynamicSource {
+	id: string;
+	source: string;
+	trigger: string;
+	content: string;
+	kind: "skill" | "extension" | "mcp";
+	modelInstruction: boolean;
+}
+
+async function loadMcpPotentialSources(cwd: string): Promise<OfflineDynamicSource[] | undefined> {
+	try {
+		const [{ mcpCapability }, { loadCapability }] = await Promise.all([
+			import("../capability/mcp"),
+			import("../discovery"),
+		]);
+		const result = await loadCapability<MCPServer>(mcpCapability.id, { cwd, includeDisabled: true });
+		const warnings: string[] = [];
+		for (const warning of result.warnings) {
+			const optionalRead = /^\[[^\]]+\] Failed to read (.+)$/.exec(warning);
+			if (optionalRead && !(await Bun.file(optionalRead[1]!).exists())) continue;
+			warnings.push(warning);
+		}
+		if (warnings.length > 0) {
+			throw new Error(`configured MCP discovery failed: ${warnings.sort().join("; ")}`);
+		}
+		return result.all
+			.map(server => {
+				const { _source, _shadowed: _ignored, ...config } = server;
+				return {
+					id: `external.mcp.config.${server.name}.${_source.provider}.${sha256(_source.path).slice(0, 12)}`,
+					source: _source.path,
+					trigger: "startup",
+					content: canonicalJson(JSON.parse(JSON.stringify(config)) as JsonValue),
+					kind: "mcp" as const,
+					modelInstruction: false,
+				};
+			})
+			.sort((left, right) => left.source.localeCompare(right.source) || left.id.localeCompare(right.id));
+	} catch (error) {
+		if (error instanceof Error && /pi_natives|native addon/i.test(error.message)) return undefined;
+		throw error;
+	}
+}
+
+async function loadOfflineDynamicSources(cwd: string): Promise<OfflineDynamicSource[]> {
 	const configPath = path.join(os.homedir(), ".omp/agent/config.yml");
 	const config = YAML.parse(await Bun.file(configPath).text()) as Record<string, unknown>;
 	const sources: Array<{
@@ -129,6 +196,7 @@ async function loadOfflineDynamicSources(
 		trigger: string;
 		content: string;
 		kind: "skill" | "extension" | "mcp";
+		modelInstruction: boolean;
 	}> = [];
 	const skillDirectories = new Map([[path.join(os.homedir(), ".agents/skills"), false]]);
 	const skills = config.skills;
@@ -159,6 +227,7 @@ async function loadOfflineDynamicSources(
 				trigger: "user_selected_skill",
 				content: await Bun.file(filePath).text(),
 				kind: "skill",
+				modelInstruction: true,
 			});
 		}
 	}
@@ -174,23 +243,45 @@ async function loadOfflineDynamicSources(
 				trigger: "extension_event",
 				content: await Bun.file(filePath).text(),
 				kind: "extension",
+				modelInstruction: false,
 			});
 		}
 	}
-	for (const filePath of [path.join(cwd, ".mcp.json"), path.join(os.homedir(), ".omp/agent/mcp.json")]) {
+	const discoveredMcp = await loadMcpPotentialSources(cwd);
+	if (discoveredMcp) {
+		sources.push(...discoveredMcp);
+		return sources.sort((left, right) => left.source.localeCompare(right.source) || left.id.localeCompare(right.id));
+	}
+	for (const filePath of [
+		path.join(cwd, ".mcp.json"),
+		path.join(cwd, ".omp/mcp.json"),
+		path.join(os.homedir(), ".omp/agent/mcp.json"),
+	]) {
 		const file = Bun.file(filePath);
 		if (!(await file.exists())) continue;
 		const content = await file.text();
-		JSON.parse(content);
-		sources.push({
-			id: `external.mcp.${sha256(filePath).slice(0, 12)}`,
-			source: filePath,
-			trigger: "startup",
-			content,
-			kind: "mcp",
-		});
+		const parsed: unknown = JSON.parse(content);
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+			throw new Error(`MCP configuration must be an object: ${filePath}`);
+		}
+		const mcpServers = (parsed as Record<string, unknown>).mcpServers;
+		if (!mcpServers || typeof mcpServers !== "object" || Array.isArray(mcpServers)) continue;
+		for (const [name, config] of Object.entries(mcpServers).sort(([left], [right]) => left.localeCompare(right))) {
+			if (!config || typeof config !== "object" || Array.isArray(config)) {
+				throw new Error(`MCP server configuration must be an object: ${filePath}#${name}`);
+			}
+			const provider = filePath.includes(`${path.sep}.omp${path.sep}`) ? "native" : "mcp-json";
+			sources.push({
+				id: `external.mcp.config.${name}.${provider}.${sha256(filePath).slice(0, 12)}`,
+				source: filePath,
+				trigger: "startup",
+				content: canonicalJson({ name, ...(config as Record<string, JsonValue>) }),
+				kind: "mcp",
+				modelInstruction: false,
+			});
+		}
 	}
-	return sources.sort((left, right) => left.source.localeCompare(right.source));
+	return sources.sort((left, right) => left.source.localeCompare(right.source) || left.id.localeCompare(right.id));
 }
 
 async function externalApproval(
@@ -233,6 +324,7 @@ export async function explainContext(options: {
 	includeContent?: boolean;
 	provider?: string;
 	model?: string;
+	runtime?: RuntimeContextEvidence;
 }): Promise<ContextExplanation> {
 	const cwd = options.cwd ?? process.cwd();
 	const provider = options.provider ?? "provider-unspecified";
@@ -240,13 +332,40 @@ export async function explainContext(options: {
 	const developerRole = supportsDeveloperRole(provider);
 	const release = await buildContextReleaseManifest(cwd);
 	const approval = await approvalStatus(release);
+	const renderedToolContracts = options.runtime?.renderedToolContracts;
+	if (renderedToolContracts) {
+		const { rootSha256, ...payload } = renderedToolContracts;
+		if (sha256(canonicalJson(payload as unknown as JsonValue)) !== rootSha256) {
+			throw new Error("runtime rendered tool contract root does not match its payload");
+		}
+		if (
+			renderedToolContracts.contentManifestRootSha256 !== release.contentManifestRootSha256 ||
+			renderedToolContracts.configurationSemanticSha256 !== release.configurationSemanticSha256
+		) {
+			throw new Error("runtime rendered tool contracts are not bound to the current release projection");
+		}
+	}
+	const selectedRenderedToolContracts =
+		renderedToolContracts?.provider === provider && renderedToolContracts.model === model
+			? renderedToolContracts
+			: undefined;
 	const registry = promptRegistry();
 	const components: ExplainedComponent[] = [];
+	const runtimeInstructions = new Map(
+		(options.runtime?.instructions ?? [])
+			.filter(instruction => instruction.target === options.target)
+			.map(instruction => [instruction.id, instruction]),
+	);
+	const registeredIds = new Set(registry.prompts.map(entry => entry.id));
 	for (const entry of registry.prompts
 		.filter(prompt => prompt.target.includes(options.target))
 		.sort((left, right) => left.order - right.order || left.id.localeCompare(right.id))) {
-		const content = registeredPromptSource(entry.id);
-		const enabled = entry.defaultEnabled;
+		const sourceContent = registeredPromptSource(entry.id);
+		const runtimeInstruction = runtimeInstructions.get(entry.id);
+		const content = runtimeInstruction?.renderedText ?? sourceContent;
+		const effective =
+			runtimeInstruction !== undefined ||
+			(entry.defaultEnabled && entry.visibility === "model" && entry.trigger === "startup");
 		components.push({
 			id: entry.id,
 			source: registeredPromptRepositoryPath(entry.path),
@@ -256,17 +375,52 @@ export async function explainContext(options: {
 			target: options.target,
 			trigger: entry.trigger,
 			visibility: entry.visibility,
-			enabled,
-			enabledReason: enabled ? "agent-behavior default" : "registered optional component; runtime trigger required",
+			enabled: effective,
+			enabledReason: runtimeInstruction
+				? "runtime trigger supplied an exact rendered instruction"
+				: effective
+					? "agent-behavior default"
+					: "registered potential component; runtime trigger was not observed",
+			triggered: runtimeInstruction !== undefined || effective,
+			effective,
+			availability: effective ? "effective" : entry.trigger === "tool_available" ? "unavailable" : "available",
 			approvalStatus: approval.status,
-			sha256: sha256(content),
+			sha256: runtimeInstruction?.sha256 ?? sha256(content),
 			provider,
 			model,
-			renderedWrapper: "registered Markdown template; dynamic values are resolved at provider dispatch",
+			renderedWrapper: runtimeInstruction
+				? "exact runtime rendered instruction"
+				: "registered Markdown template; dynamic values require a runtime trigger",
 			precedence: entry.order,
-			providerOrder: components.length,
+			providerOrder: null,
 			...counts(content),
 			...(options.includeContent ? { content } : {}),
+		});
+	}
+	for (const instruction of [...runtimeInstructions.values()].filter(item => !registeredIds.has(item.id))) {
+		components.push({
+			id: instruction.id,
+			source: instruction.sourcePath,
+			kind: "instruction",
+			semanticRole: instruction.role,
+			actualRole: mapContextRole(instruction.role, developerRole),
+			target: instruction.target,
+			trigger: instruction.trigger,
+			visibility: "external",
+			enabled: true,
+			enabledReason: "runtime supplied an exact provenance-bound instruction",
+			triggered: true,
+			effective: true,
+			availability: "effective",
+			approvalStatus: await externalApproval(instruction.sourcePath, instruction.sha256, release, approval),
+			sha256: instruction.sha256,
+			provider,
+			model,
+			renderedWrapper: "exact runtime rendered instruction",
+			precedence: instruction.order ?? 10_000,
+			providerOrder: null,
+			...counts(instruction.renderedText),
+			...(options.includeContent ? { content: instruction.renderedText } : {}),
 		});
 	}
 
@@ -285,13 +439,16 @@ export async function explainContext(options: {
 				visibility: "external",
 				enabled: true,
 				enabledReason: "discovered external context file",
+				triggered: true,
+				effective: true,
+				availability: "effective",
 				approvalStatus: await externalApproval(file.path, contentSha256, release, approval),
 				sha256: contentSha256,
 				provider,
 				model,
 				renderedWrapper: "external_instruction",
 				precedence: 10_000 + (file.depth ?? 0),
-				providerOrder: components.length,
+				providerOrder: null,
 				...counts(file.content),
 				...(options.includeContent ? { content: file.content } : {}),
 			});
@@ -299,31 +456,75 @@ export async function explainContext(options: {
 	}
 
 	if (options.target === "main" || options.target === "subagent") {
+		const selectedSkills = new Map((options.runtime?.selectedSkills ?? []).map(skill => [skill.name, skill]));
 		for (const source of await loadOfflineDynamicSources(cwd)) {
-			const contentSha256 = sha256(source.content);
 			const isSkill = source.kind === "skill";
+			const selected = isSkill ? selectedSkills.get(source.id.slice("external.skill.".length)) : undefined;
+			const renderedContent = selected?.renderedText ?? source.content;
+			const contentSha256 = sha256(renderedContent);
 			const hasSmartyWrapper =
 				isSkill && SMARTY_MERGIFY_SKILLS.includes(source.id.slice("external.skill.".length) as never);
 			components.push({
 				id: source.id,
 				source: source.source,
-				kind: "instruction",
-				semanticRole: "external_instruction",
-				actualRole: "system",
+				kind: source.modelInstruction ? "instruction" : "data",
+				semanticRole: source.modelInstruction ? "external_instruction" : "data",
+				actualRole: source.modelInstruction ? "user" : "data",
 				target: options.target,
 				trigger: source.trigger,
 				visibility: "external",
-				enabled: false,
-				enabledReason: `available ${source.kind} source; dynamic session trigger is unavailable offline`,
-				approvalStatus: await externalApproval(source.source, contentSha256, release, approval),
+				enabled: selected !== undefined,
+				enabledReason: selected
+					? "runtime supplied this exact user-selected skill prompt"
+					: source.kind === "mcp"
+						? "configured MCP binding; returned server instructions are unavailable offline"
+						: `available ${source.kind} source; runtime trigger was not observed`,
+				triggered: selected !== undefined,
+				effective: selected !== undefined,
+				availability: selected ? "effective" : source.kind === "mcp" ? "unavailable" : "available",
+				approvalStatus:
+					source.kind === "mcp"
+						? "unapproved"
+						: await externalApproval(source.source, contentSha256, release, approval),
 				sha256: contentSha256,
 				provider,
 				model,
 				renderedWrapper: hasSmartyWrapper
-					? "external skill body followed by skill.smarty_mergify_policy"
-					: `external ${source.kind} provenance; not triggered offline`,
-				precedence: 10_000,
-				providerOrder: components.length,
+					? "exact user-selected skill prompt followed by skill.smarty_mergify_policy"
+					: source.kind === "mcp"
+						? "configuration provenance only; never rendered as server instructions"
+						: selected
+							? "exact runtime user-selected skill prompt"
+							: `external ${source.kind} provenance; not triggered offline`,
+				precedence: selected ? 10_000 + selected.order : 10_000,
+				providerOrder: null,
+				...counts(renderedContent),
+				...(options.includeContent && source.kind !== "mcp" ? { content: renderedContent } : {}),
+			});
+		}
+		for (const [index, source] of (options.runtime?.mcpInstructions ?? []).entries()) {
+			const contentSha256 = sha256(source.content);
+			components.push({
+				id: `external.mcp.${source.name}`,
+				source: source.source,
+				kind: "instruction",
+				semanticRole: "external_instruction",
+				actualRole: "system",
+				target: options.target,
+				trigger: "startup",
+				visibility: "external",
+				enabled: true,
+				enabledReason: "connected MCP server returned this exact instruction text",
+				triggered: true,
+				effective: true,
+				availability: "effective",
+				approvalStatus: "unapproved",
+				sha256: contentSha256,
+				provider,
+				model,
+				renderedWrapper: "exact connected-server instructions with MCP provenance",
+				precedence: 20_000 + index,
+				providerOrder: null,
 				...counts(source.content),
 				...(options.includeContent ? { content: source.content } : {}),
 			});
@@ -331,7 +532,7 @@ export async function explainContext(options: {
 	}
 
 	for (const implementation of release.contentManifest.implementationSources) {
-		if (!implementation.path.startsWith("packages/agent/src/compaction/")) continue;
+		const compaction = implementation.path.startsWith("packages/agent/src/compaction/");
 		components.push({
 			id: `implementation.${implementation.path}`,
 			source: implementation.path,
@@ -339,25 +540,31 @@ export async function explainContext(options: {
 			semanticRole: "data",
 			actualRole: "data",
 			target: options.target,
-			trigger: "compaction",
+			trigger: compaction ? "compaction" : "tool_available",
 			visibility: "offline_only",
 			enabled: false,
-			enabledReason: "protected compaction transform or dispatch implementation",
+			enabledReason: compaction
+				? "protected compaction transform or dispatch implementation"
+				: "protected tool selection or provider wire-transform implementation",
+			triggered: false,
+			effective: false,
+			availability: "available",
 			approvalStatus: approval.status,
 			sha256: implementation.sha256,
 			provider,
 			model,
 			renderedWrapper: "implementation provenance; no direct model content",
 			precedence: 50_000,
-			providerOrder: components.length,
+			providerOrder: null,
 			...counts(""),
 		});
 	}
 
 	components.sort((left, right) => left.precedence - right.precedence || left.id.localeCompare(right.id));
-	components.forEach((component, index) => {
-		component.providerOrder = index;
-	});
+	let providerOrder = 0;
+	for (const component of components) {
+		component.providerOrder = component.effective && component.kind === "instruction" ? providerOrder++ : null;
+	}
 
 	const behavior = YAML.parse(behaviorRegistrySource()) as Record<string, unknown>;
 	const automaticTurns = behavior.automaticTurns as { allowed?: string[] } | undefined;
@@ -372,6 +579,16 @@ export async function explainContext(options: {
 		behavior,
 		behaviorSource: "agent-behavior.yml",
 		automaticTurnSources: [...(automaticTurns?.allowed ?? [])].sort(),
+		toolContracts: selectedRenderedToolContracts
+			? { status: "effective", export: selectedRenderedToolContracts }
+			: {
+					status: "unavailable",
+					provider,
+					model,
+					reason: renderedToolContracts
+						? "last rendered tool contracts belong to a different provider or model"
+						: "exact final tool contracts are available only after provider payload rendering",
+				},
 	};
 }
 
@@ -385,10 +602,11 @@ export function renderContextExplanation(explanation: ContextExplanation): strin
 	];
 	for (const component of explanation.components) {
 		lines.push(
-			`[${component.providerOrder}] ${component.id}`,
+			`[${component.providerOrder ?? "potential"}] ${component.id}`,
 			`  source: ${component.source}`,
 			`  kind: ${component.kind}; role: ${component.semanticRole} -> ${component.actualRole}`,
 			`  target/trigger: ${component.target} / ${component.trigger}`,
+			`  triggered/effective/availability: ${component.triggered}/${component.effective}/${component.availability}`,
 			`  enabled: ${component.enabled} (${component.enabledReason}); approval: ${component.approvalStatus}`,
 			`  sha256: ${component.sha256}`,
 			`  wrapper/precedence/order: ${component.renderedWrapper} / ${component.precedence} / ${component.providerOrder}`,
@@ -398,5 +616,10 @@ export function renderContextExplanation(explanation: ContextExplanation): strin
 	}
 	lines.push("", "Effective behavior:", canonicalJson(explanation.behavior as JsonValue));
 	lines.push(`Automatic turn sources: ${explanation.automaticTurnSources.join(", ") || "none"}`);
+	lines.push(
+		explanation.toolContracts.status === "effective"
+			? `Rendered tool contracts: ${explanation.toolContracts.export.rootSha256}`
+			: `Rendered tool contracts: unavailable (${explanation.toolContracts.reason})`,
+	);
 	return `${lines.join("\n")}\n`;
 }

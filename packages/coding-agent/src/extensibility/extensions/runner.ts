@@ -119,6 +119,30 @@ export function assertApprovedPerTurnSystemPromptNotReplaced(
 	}
 }
 
+export function assertApprovedContextUnchanged(
+	approvedSnapshot: string | undefined,
+	currentMessages: AgentMessage[],
+	extensionPath: string,
+): void {
+	if (approvedSnapshot !== undefined && serializedProviderPayload(currentMessages) !== approvedSnapshot) {
+		throw new Error(`PROMPT_POLICY_REVIEW_REQUIRED: ${extensionPath} changed approved model context`);
+	}
+}
+
+export function assertApprovedInputUnchanged(
+	approvedSnapshot: string | undefined,
+	current: { text: string; images: ImageContent[] | undefined },
+	handled: boolean | undefined,
+	extensionPath: string,
+): void {
+	if (
+		approvedSnapshot !== undefined &&
+		(handled === true || serializedProviderPayload(current) !== approvedSnapshot)
+	) {
+		throw new Error(`PROMPT_POLICY_REVIEW_REQUIRED: ${extensionPath} changed approved direct input`);
+	}
+}
+
 export type ExtensionErrorListener = (error: ExtensionError) => void;
 
 export const EXTENSION_HANDLER_TIMEOUT_MS = 30_000;
@@ -1680,13 +1704,36 @@ export class ExtensionRunner {
 
 		for (const ext of this.extensions) {
 			for (const handler of ext.handlers.get("input") ?? []) {
-				const event: InputEvent = { type: "input", text: currentText, images: currentImages, source };
+				if (this.releaseManifest && !(await isApprovedCandidateSource(ext.resolvedPath, this.releaseManifest))) {
+					throw new Error(`PROMPT_POLICY_REVIEW_REQUIRED: extension source is not approved: ${ext.path}`);
+				}
+				const approvedSnapshot = this.releaseManifest
+					? serializedProviderPayload({ text: currentText, images: currentImages })
+					: undefined;
+				const protectedInput = approvedSnapshot
+					? (JSON.parse(approvedSnapshot) as { text: string; images: ImageContent[] | undefined })
+					: undefined;
+				const event: InputEvent = {
+					type: "input",
+					text: protectedInput?.text ?? currentText,
+					images: protectedInput?.images ?? currentImages,
+					source,
+				};
 				const result = (await this.#runHandlerWithTimeout(handler, event, ctx, ext, extensionHandlerTimeoutMs)) as
 					| InputEventResult
 					| undefined;
-				if (result?.handled) return result;
+				const protectedResult = approvedSnapshot
+					? { text: result?.text ?? event.text, images: result?.images ?? event.images }
+					: undefined;
 				if (result?.text !== undefined) currentText = result.text;
 				if (result?.images !== undefined) currentImages = result.images;
+				assertApprovedInputUnchanged(
+					approvedSnapshot,
+					protectedResult ?? { text: currentText, images: currentImages },
+					result?.handled,
+					ext.path,
+				);
+				if (result?.handled) return result;
 			}
 		}
 		const transformed: InputEventResult = {};
@@ -1709,13 +1756,15 @@ export class ExtensionRunner {
 		if (!hasContextHandlers) return messages;
 
 		let currentMessages: AgentMessage[];
-		try {
-			currentMessages = structuredClone(messages);
-		} catch {
-			// Messages may contain non-cloneable objects (e.g. in ToolResultMessage.details
-			// or ProviderPayload). Fall back to a shallow array clone — extensions should
-			// return new message arrays rather than mutating in place.
-			currentMessages = [...messages];
+		if (this.releaseManifest) {
+			currentMessages = JSON.parse(serializedProviderPayload(messages)) as AgentMessage[];
+		} else {
+			try {
+				currentMessages = structuredClone(messages);
+			} catch {
+				// Preserve legacy extension behavior for non-protected local sessions.
+				currentMessages = [...messages];
+			}
 		}
 
 		for (const ext of this.extensions) {
@@ -1723,6 +1772,10 @@ export class ExtensionRunner {
 			if (!handlers || handlers.length === 0) continue;
 
 			for (const handler of handlers) {
+				if (this.releaseManifest && !(await isApprovedCandidateSource(ext.resolvedPath, this.releaseManifest))) {
+					throw new Error(`PROMPT_POLICY_REVIEW_REQUIRED: extension source is not approved: ${ext.path}`);
+				}
+				const approvedSnapshot = this.releaseManifest ? serializedProviderPayload(currentMessages) : undefined;
 				const event: ContextEvent = { type: "context", messages: currentMessages };
 				const handlerResult = await this.#runHandlerWithTimeout(
 					handler,
@@ -1735,6 +1788,7 @@ export class ExtensionRunner {
 				if (handlerResult && (handlerResult as ContextEventResult).messages) {
 					currentMessages = (handlerResult as ContextEventResult).messages!;
 				}
+				assertApprovedContextUnchanged(approvedSnapshot, currentMessages, ext.path);
 			}
 		}
 
@@ -1751,10 +1805,14 @@ export class ExtensionRunner {
 			if (!handlers || handlers.length === 0) continue;
 
 			for (const handler of handlers) {
+				if (this.releaseManifest && !(await isApprovedCandidateSource(ext.resolvedPath, this.releaseManifest))) {
+					throw new Error(`PROMPT_POLICY_REVIEW_REQUIRED: extension source is not approved: ${ext.path}`);
+				}
 				const approvedSnapshot = this.releaseManifest ? serializedProviderPayload(currentPayload) : undefined;
+				const eventPayload = approvedSnapshot ? JSON.parse(approvedSnapshot) : currentPayload;
 				const event: BeforeProviderRequestEvent = {
 					type: "before_provider_request",
-					payload: currentPayload,
+					payload: eventPayload,
 				};
 				const handlerResult = await this.#runHandlerWithTimeout(
 					handler,
@@ -1763,12 +1821,10 @@ export class ExtensionRunner {
 					ext,
 					extensionHandlerTimeoutMs,
 				);
-				if (handlerResult !== undefined) {
-					currentPayload = handlerResult;
-				}
 				if (approvedSnapshot !== undefined) {
-					assertApprovedProviderPayloadUnchanged(approvedSnapshot, currentPayload, ext.path);
+					assertApprovedProviderPayloadUnchanged(approvedSnapshot, handlerResult ?? eventPayload, ext.path);
 				}
+				if (handlerResult !== undefined) currentPayload = handlerResult;
 			}
 		}
 

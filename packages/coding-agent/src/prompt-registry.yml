@@ -23,7 +23,7 @@ prompts:
   - id: agent.compaction.prompts.auto-handoff-threshold-focus
     path: _agent/compaction/prompts/auto-handoff-threshold-focus.md
     role: internal_context
-    target: [main, subagent]
+    target: [side_model]
     trigger: compaction
     visibility: conditional
     defaultEnabled: false
@@ -39,7 +39,7 @@ prompts:
   - id: agent.compaction.prompts.branch-summary-preamble
     path: _agent/compaction/prompts/branch-summary-preamble.md
     role: internal_context
-    target: [main, subagent]
+    target: [side_model]
     trigger: compaction
     visibility: conditional
     defaultEnabled: false
@@ -47,7 +47,7 @@ prompts:
   - id: agent.compaction.prompts.branch-summary
     path: _agent/compaction/prompts/branch-summary.md
     role: internal_context
-    target: [main, subagent]
+    target: [side_model]
     trigger: compaction
     visibility: conditional
     defaultEnabled: false
@@ -55,7 +55,7 @@ prompts:
   - id: agent.compaction.prompts.compaction-short-summary
     path: _agent/compaction/prompts/compaction-short-summary.md
     role: internal_context
-    target: [main, subagent]
+    target: [side_model]
     trigger: compaction
     visibility: conditional
     defaultEnabled: false
@@ -71,7 +71,7 @@ prompts:
   - id: agent.compaction.prompts.compaction-summary
     path: _agent/compaction/prompts/compaction-summary.md
     role: internal_context
-    target: [main, subagent]
+    target: [side_model]
     trigger: compaction
     visibility: conditional
     defaultEnabled: false
@@ -79,7 +79,7 @@ prompts:
   - id: agent.compaction.prompts.compaction-turn-prefix
     path: _agent/compaction/prompts/compaction-turn-prefix.md
     role: internal_context
-    target: [main, subagent]
+    target: [side_model]
     trigger: compaction
     visibility: conditional
     defaultEnabled: false
@@ -87,7 +87,7 @@ prompts:
   - id: agent.compaction.prompts.compaction-update-summary
     path: _agent/compaction/prompts/compaction-update-summary.md
     role: internal_context
-    target: [main, subagent]
+    target: [side_model]
     trigger: compaction
     visibility: conditional
     defaultEnabled: false
@@ -95,7 +95,7 @@ prompts:
   - id: agent.compaction.prompts.context-window-truncated-output
     path: _agent/compaction/prompts/context-window-truncated-output.md
     role: internal_context
-    target: [main, subagent]
+    target: [side_model]
     trigger: compaction
     visibility: conditional
     defaultEnabled: false
@@ -103,7 +103,7 @@ prompts:
   - id: agent.compaction.prompts.file-operations
     path: _agent/compaction/prompts/file-operations.md
     role: internal_context
-    target: [main, subagent]
+    target: [side_model]
     trigger: compaction
     visibility: conditional
     defaultEnabled: false
@@ -111,7 +111,7 @@ prompts:
   - id: agent.compaction.prompts.handoff-document
     path: _agent/compaction/prompts/handoff-document.md
     role: internal_context
-    target: [main, subagent]
+    target: [side_model]
     trigger: compaction
     visibility: conditional
     defaultEnabled: false
@@ -119,7 +119,7 @@ prompts:
   - id: agent.compaction.prompts.snapcompact-archive-context
     path: _agent/compaction/prompts/snapcompact-archive-context.md
     role: internal_context
-    target: [main, subagent]
+    target: [side_model]
     trigger: compaction
     visibility: conditional
     defaultEnabled: false
@@ -127,7 +127,7 @@ prompts:
   - id: agent.compaction.prompts.summarization-system
     path: _agent/compaction/prompts/summarization-system.md
     role: system
-    target: [main, subagent]
+    target: [side_model]
     trigger: compaction
     visibility: conditional
     defaultEnabled: false
@@ -764,16 +764,16 @@ prompts:
     visibility: model
     defaultEnabled: false
     order: 1020
-  - id: memories.consolidation
-    path: prompts/memories/consolidation.md
+  - id: memories.consolidation-system
+    path: prompts/memories/consolidation_system.md
     role: system
     target: [side_model]
     trigger: side_request
     visibility: model
     defaultEnabled: false
     order: 1030
-  - id: memories.consolidation-system
-    path: prompts/memories/consolidation_system.md
+  - id: memories.consolidation
+    path: prompts/memories/consolidation.md
     role: system
     target: [side_model]
     trigger: side_request

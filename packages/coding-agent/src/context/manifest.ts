@@ -4,6 +4,7 @@ import { YAML } from "bun";
 import trackedManifestSource from "../../generated/prompt-manifest.json" with { type: "text" };
 import { ref, remote, repo, show, status } from "../utils/git";
 import { canonicalJson, type JsonValue, sha256 } from "./canonical";
+import { computeImplementationSources } from "./implementation-sources";
 import {
 	behaviorRegistrySource,
 	promptRegistry,
@@ -343,14 +344,7 @@ export async function currentContentManifest(): Promise<ContentManifest> {
 		}))
 		.sort((left, right) => left.id.localeCompare(right.id));
 	const repositoryRoot = path.resolve(import.meta.dir, "../../../..");
-	const implementationSources = await Promise.all(
-		tracked.implementationSources.map(async entry => ({
-			path: entry.path,
-			sha256: sha256(
-				await readRequiredSource(path.join(repositoryRoot, entry.path), `implementation ${entry.path}`),
-			),
-		})),
-	);
+	const implementationSources = await computeImplementationSources(repositoryRoot);
 	const { buildGeneratedToolContractManifest } = await import("./tool-contracts");
 	const payload = {
 		schema: CONTENT_MANIFEST_SCHEMA,

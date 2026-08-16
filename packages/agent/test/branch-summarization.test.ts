@@ -104,17 +104,10 @@ describe("branch summarization", () => {
 		];
 		let capturedPrompt = "";
 		const completeImpl: GenerateBranchSummaryOptions["completeImpl"] = async (_model, ctx) => {
-			const message = ctx.messages[0];
-			if (message?.role !== "user") {
-				throw new Error("branch summary request did not contain a user prompt");
-			}
-			if (typeof message.content === "string") {
-				capturedPrompt = message.content;
-			} else {
-				for (const block of message.content) {
-					if (block.type === "text") capturedPrompt += block.text;
-				}
-			}
+			expect(ctx.messages).toEqual([]);
+			const instruction = ctx.instructions?.[0];
+			expect(instruction?.role).toBe("internal_context");
+			capturedPrompt = instruction?.renderedText ?? "";
 			const response: AssistantMessage = {
 				role: "assistant",
 				content: [{ type: "text", text: "branch summary text" }],

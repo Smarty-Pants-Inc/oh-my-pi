@@ -44,6 +44,32 @@ describe("protected surface path classification", () => {
 			},
 		]);
 	});
+
+	it("classifies live provider/tool transformation inventory paths", () => {
+		expect(classifyProtectedPath("packages/ai/src/utils/schema/wire.ts").map(item => item.surface)).toEqual([
+			"tool-schema",
+		]);
+		expect(classifyProtectedPath("packages/ai/src/context-instructions.ts").map(item => item.surface)).toEqual([
+			"provider-mapping",
+		]);
+		expect(classifyProtectedPath("packages/coding-agent/src/mcp/manager.ts").map(item => item.surface)).toEqual([
+			"tool-schema",
+		]);
+		expect(
+			classifyProtectedPath("packages/coding-agent/src/config/inline-tool-descriptors-mode.ts").map(
+				item => item.surface,
+			),
+		).toEqual(["tool-schema"]);
+		expect(
+			classifyProtectedPath("packages/coding-agent/src/session/session-handoff.ts").map(item => item.surface),
+		).toEqual(["provider-wrapper"]);
+		expect(classifyProtectedPath("packages/catalog/src/identity/family.ts").map(item => item.surface)).toEqual([
+			"provider-mapping",
+		]);
+		expect(
+			classifyProtectedPath("packages/coding-agent/src/context/implementation-sources.ts").map(item => item.surface),
+		).toEqual(["guard"]);
+	});
 });
 
 describe("protected semantic manifest deltas", () => {

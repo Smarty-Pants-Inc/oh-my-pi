@@ -334,6 +334,12 @@ export interface MCPServerConnection {
 	prompts?: MCPPrompt[];
 }
 
+export interface MCPServerInstructionSource {
+	name: string;
+	source: string;
+	content: string;
+}
+
 /** MCP tool with server context */
 export interface MCPToolWithServer {
 	server: MCPServerConnection;

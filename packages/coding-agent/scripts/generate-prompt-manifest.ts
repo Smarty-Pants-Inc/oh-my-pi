@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { YAML } from "bun";
 import { canonicalJson, sha256 } from "../src/context/canonical";
+import { computeImplementationSources } from "../src/context/implementation-sources";
 import type { ContextRole, ContextTarget, ContextVisibility, PromptRegistryEntry } from "../src/context/registry";
 
 const packageRoot = path.resolve(import.meta.dir, "..");
@@ -80,7 +81,13 @@ function promptId(sourcePath: string): string {
 }
 
 function targetFor(sourcePath: string): ContextTarget[] {
-	if (sourcePath.startsWith("_agent/compaction/")) return ["main", "subagent"];
+	if (
+		sourcePath === "_agent/compaction/prompts/branch-summary-context.md" ||
+		sourcePath === "_agent/compaction/prompts/compaction-summary-context.md"
+	) {
+		return ["main", "subagent"];
+	}
+	if (sourcePath.startsWith("_agent/compaction/")) return ["side_model"];
 	if (sourcePath === "prompts/skills/smarty-mergify-policy.md") return ["main", "subagent"];
 	if (sourcePath === "prompts/providers/internal-context.md") return ["main", "subagent", "side_model"];
 	if (sourcePath.includes("subagent") || sourcePath.startsWith("prompts/agents/") || sourcePath.startsWith("task/")) {
@@ -245,38 +252,6 @@ function formatSourceModule(entries: readonly PromptRegistryEntry[]): string {
 	].join("\n");
 }
 
-const IMPLEMENTATION_GLOBS = [
-	"packages/agent/src/agent-loop.ts",
-	"packages/agent/src/compaction/**/*.ts",
-	"packages/coding-agent/src/context/tool-contracts.ts",
-	"packages/coding-agent/src/edit/index.ts",
-	"packages/coding-agent/src/goals/tools/**/*.ts",
-	"packages/coding-agent/src/lsp/tool.ts",
-	"packages/coding-agent/src/task/index.ts",
-	"packages/coding-agent/src/tools/**/*.ts",
-] as const;
-
-async function implementationSources(): Promise<Array<{ path: string; sha256: string }>> {
-	const paths = new Set<string>();
-	for (const pattern of IMPLEMENTATION_GLOBS) {
-		for await (const absolutePath of new Bun.Glob(pattern).scan({
-			cwd: repositoryRoot,
-			absolute: true,
-			onlyFiles: true,
-		})) {
-			paths.add(path.relative(repositoryRoot, absolutePath).replaceAll(path.sep, "/"));
-		}
-	}
-	return await Promise.all(
-		[...paths]
-			.sort((left, right) => left.localeCompare(right))
-			.map(async sourcePath => ({
-				path: sourcePath,
-				sha256: sha256(await Bun.file(path.join(repositoryRoot, sourcePath)).text()),
-			})),
-	);
-}
-
 async function main(): Promise<void> {
 	const paths = await markdownPaths();
 	const entries = registryEntries(paths);
@@ -354,7 +329,7 @@ async function main(): Promise<void> {
 				wrapperPromptId: "provider.internal_context",
 			},
 		],
-		implementationSources: await implementationSources(),
+		implementationSources: await computeImplementationSources(repositoryRoot),
 		behaviorSha256: sha256(behaviorSource),
 	};
 	const manifest = { ...payload, rootSha256: sha256(canonicalJson(payload as never)) };

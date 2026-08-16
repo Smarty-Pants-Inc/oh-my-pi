@@ -631,7 +631,7 @@ describe("AgentSession handoff", () => {
 		expect(fixture.eventTypes).not.toContain("session_rollback");
 	});
 
-	it("releases handoff advisor and async receipts before rollback publication", async () => {
+	it("keeps direct user delivery authoritative after rollback without an aside-created turn", async () => {
 		await sessionManager.ensureOnDisk();
 		await sessionManager.flush();
 		const retainedSessionFile = session.sessionFile;
@@ -796,12 +796,22 @@ describe("AgentSession handoff", () => {
 			jobStatus: "completed",
 		});
 		await expect(advisorReceipt).resolves.toBeUndefined();
-		await expect(asyncReceipt!).resolves.toBeUndefined();
+		await expect(asyncReceipt!).rejects.toThrow("Yield queue entry became stale: async-result");
 		expect(advisorReceiptResolutions).toBe(1);
 		expect(advisorReceiptRejections).toBe(0);
-		expect(asyncReceiptResolutions).toBe(1);
-		expect(asyncReceiptRejections).toBe(0);
+		expect(asyncReceiptResolutions).toBe(0);
+		expect(asyncReceiptRejections).toBe(1);
+		await waitFor(() => deliveredContexts.some(context => context.includes(retainedFollowUpMarker)));
 		expect(deliveredContexts.some(context => context.includes(retainedFollowUpMarker))).toBe(true);
+		expect(session.getAutomaticTurnOutcomes()).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					source: "direct_user_input",
+					status: "started",
+					originTurnId: expect.any(String),
+				}),
+			]),
+		);
 		const deliveredMessages = session.messages.map(message => JSON.stringify(message));
 		expect(deliveredMessages.filter(message => message.includes(retainedFollowUpMarker))).toHaveLength(1);
 		expect(asyncManager.getJob(jobId)?.status).toBe("completed");

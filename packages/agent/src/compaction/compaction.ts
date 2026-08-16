@@ -47,7 +47,13 @@ import {
 import type { CompactionEntry, SessionEntry } from "./entries";
 import { NativeCompactionError } from "./errors";
 import { isEstimateCacheable, readEstimateCache, writeEstimateCache } from "./message-cache";
-import { type ConvertToLlm, createBranchSummaryMessage, createCustomMessage, defaultConvertToLlm } from "./messages";
+import {
+	type ConvertToLlm,
+	collectCompactionContextInstructions,
+	createBranchSummaryMessage,
+	createCustomMessage,
+	defaultConvertToLlm,
+} from "./messages";
 import {
 	buildOpenAiNativeHistory,
 	getPreservedOpenAiRemoteCompactionData,
@@ -66,6 +72,7 @@ import handoffDocumentPrompt from "./prompts/handoff-document.md" with { type: "
 import snapcompactArchiveContextPrompt from "./prompts/snapcompact-archive-context.md" with { type: "text" };
 
 import {
+	compactionInstructionContext,
 	computeFileLists,
 	createFileOps,
 	extractFileOpsFromMessage,
@@ -950,6 +957,8 @@ function findUtf8ChunkEnd(text: string, start: number, maxBytes: number): number
 
 async function requestSummary(
 	promptText: string,
+	instructionId: string,
+	instructionSourcePath: string,
 	model: Model,
 	maxTokens: number,
 	apiKey: ApiKey,
@@ -974,10 +983,7 @@ async function requestSummary(
 
 	const response = await instrumentedCompleteSimple(
 		model,
-		{
-			systemPrompt: [SUMMARIZATION_SYSTEM_PROMPT],
-			messages: [{ role: "user", content: [{ type: "text", text: promptText }], timestamp: Date.now() }],
-		},
+		compactionInstructionContext(instructionId, instructionSourcePath, promptText),
 		{
 			maxTokens,
 			signal,
@@ -1055,7 +1061,21 @@ export async function generateSummary(
 				options?.extraContext,
 			);
 			try {
-				summary = await requestSummary(promptText, model, maxTokens, apiKey, signal, options);
+				const update = summary !== undefined;
+				summary = await requestSummary(
+					promptText,
+					update
+						? "agent.compaction.prompts.compaction-update-summary"
+						: "agent.compaction.prompts.compaction-summary",
+					update
+						? "packages/agent/src/compaction/prompts/compaction-update-summary.md"
+						: "packages/agent/src/compaction/prompts/compaction-summary.md",
+					model,
+					maxTokens,
+					apiKey,
+					signal,
+					options,
+				);
 				break;
 			} catch (error) {
 				if (bytesPerToken > 1 && error instanceof Error && SUMMARY_CONTEXT_OVERFLOW_PATTERN.test(error.message)) {
@@ -1200,7 +1220,12 @@ export async function generateHandoff(
 	];
 
 	return generateHandoffFromContext(
-		{ systemPrompt: options.systemPrompt, messages: requestMessages, tools: options.tools },
+		{
+			systemPrompt: options.systemPrompt,
+			instructions: collectCompactionContextInstructions(messages, "side_model"),
+			messages: requestMessages,
+			tools: options.tools,
+		},
 		model,
 		{
 			streamOptions: {
@@ -1253,10 +1278,11 @@ async function generateShortSummary(
 
 	const response = await instrumentedCompleteSimple(
 		model,
-		{
-			systemPrompt: [SUMMARIZATION_SYSTEM_PROMPT],
-			messages: [{ role: "user", content: [{ type: "text", text: promptText }], timestamp: Date.now() }],
-		},
+		compactionInstructionContext(
+			"agent.compaction.prompts.compaction-short-summary",
+			"packages/agent/src/compaction/prompts/compaction-short-summary.md",
+			promptText,
+		),
 		{
 			maxTokens,
 			signal,
@@ -1827,17 +1853,13 @@ async function generateTurnPrefixSummary(
 	const llmMessages = (options?.convertToLlm ?? defaultConvertToLlm)(messages);
 	const conversationText = serializeConversationForSummary(llmMessages, preferredDialect(model.id));
 	const promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`;
-	const summarizationMessages = [
-		{
-			role: "user" as const,
-			content: [{ type: "text" as const, text: promptText }],
-			timestamp: Date.now(),
-		},
-	];
-
 	const response = await instrumentedCompleteSimple(
 		model,
-		{ systemPrompt: [SUMMARIZATION_SYSTEM_PROMPT], messages: summarizationMessages },
+		compactionInstructionContext(
+			"agent.compaction.prompts.compaction-turn-prefix",
+			"packages/agent/src/compaction/prompts/compaction-turn-prefix.md",
+			promptText,
+		),
 		{
 			maxTokens,
 			signal,

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import type { AutomaticTurnSource } from "../session/automatic-turn-authority";
 
 export type ExternalCapability = string;
 export type TaskResourceKind = "worktree" | "branch" | "agent" | "resource";
@@ -152,6 +153,7 @@ export class SessionCapabilities {
 	#externalCapabilities = new Set<ExternalCapability>();
 	#taskOwnedResources = new Map<string, TaskOwnedResource>();
 	#directUserTurn: { turnId: string; userPromptSha256: string } | undefined;
+	#continuationAuthority: { source: AutomaticTurnSource; turnId?: string } | undefined;
 	readonly #grantProvenance: CapabilityGrantProvenance[] = [];
 
 	constructor(init: SessionCapabilityInit) {
@@ -194,16 +196,40 @@ export class SessionCapabilities {
 			turnId,
 			userPromptSha256: createHash("sha256").update(userPrompt).digest("hex"),
 		};
+		this.#continuationAuthority = { source: "direct_user_input", turnId };
 	}
 
 	endTurn(turnId: string | undefined): void {
 		if (turnId && this.#directUserTurn?.turnId === turnId) this.#directUserTurn = undefined;
+		if (turnId && this.#continuationAuthority?.turnId === turnId) this.#continuationAuthority = undefined;
+	}
+
+	async withContinuationAuthority<T>(
+		source: AutomaticTurnSource,
+		turnId: string | undefined,
+		action: () => Promise<T>,
+	): Promise<T> {
+		const previous = this.#continuationAuthority;
+		this.#continuationAuthority = { source, ...(turnId ? { turnId } : {}) };
+		try {
+			return await action();
+		} finally {
+			this.#continuationAuthority = previous;
+		}
 	}
 
 	/** The structured model call is the authorization act; only a live direct-user turn may make it. */
 	grantFromCurrentDirectUserTurn(request: CapabilityGrantRequest): CapabilityGrantProvenance {
 		const turn = this.#directUserTurn;
-		if (!turn) throw new Error("capability grants require the current direct-user turn");
+		if (
+			!turn ||
+			this.#continuationAuthority?.source !== "direct_user_input" ||
+			this.#continuationAuthority.turnId !== turn.turnId
+		) {
+			throw new Error(
+				"capability grants require the current direct-user turn with direct_user_input continuation authority",
+			);
+		}
 		const value =
 			request.kind === "writePath"
 				? this.grantWritePath(request.value)

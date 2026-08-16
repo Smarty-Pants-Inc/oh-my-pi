@@ -75,7 +75,7 @@ const PATH_RULES: readonly PathRule[] = [
 	{ pattern: /(?:^|\/)src\/config\/(?:settings|settings-schema)\.[cm]?[jt]s$/i, surface: "configuration" },
 	{
 		pattern:
-			/(?:^|\/)src\/(?:commands\/context|context\/(?:approved-policy|canonical|diff|explain|manifest)|policy\/protected-surface|utils\/git)\.[cm]?[jt]s$/i,
+			/(?:^|\/)src\/(?:commands\/context|context\/(?:approved-policy|canonical|diff|explain|implementation-sources|manifest)|policy\/protected-surface|utils\/git)\.[cm]?[jt]s$/i,
 		surface: "guard",
 	},
 	{
@@ -84,17 +84,37 @@ const PATH_RULES: readonly PathRule[] = [
 	},
 	{ pattern: /(?:^|\/)generated\/prompt-manifest\.json$/i, surface: "prompt-entry" },
 	{ pattern: /(?:^|\/)generated\/tool-contracts\.json$/i, surface: "tool-schema" },
+	{ pattern: /(?:^|\/)packages\/ai\/src\/(?:utils\/schema|dialect)(?:\/|$)/i, surface: "tool-schema" },
 	{ pattern: /(?:^|\/)packages\/agent\/src\/compaction\/prompts\//i, surface: "prompt-content" },
 	{
 		pattern: /(?:^|\/)packages\/agent\/src\/(?:agent-loop|compaction\/.*)\.[cm]?[jt]s$/i,
 		surface: "provider-wrapper",
 	},
+	{
+		pattern: /(?:^|\/)packages\/agent\/src\/(?:agent|append-only-context)\.[cm]?[jt]s$/i,
+		surface: "provider-wrapper",
+	},
+	{ pattern: /(?:^|\/)packages\/catalog\/src\/identity\//i, surface: "provider-mapping" },
 	{ pattern: /(?:^|\/)src\/context\/(?:registry|prompt-sources\.generated)\.[cm]?[jt]s$/i, surface: "prompt-entry" },
 	{ pattern: /(?:^|\/)src\/context\/tool-contracts\.[cm]?[jt]s$/i, surface: "tool-schema" },
 	{ pattern: /(?:^|\/)src\/context\/smarty-skills\.[cm]?[jt]s$/i, surface: "provider-wrapper" },
 	{
 		pattern: /(?:^|\/)packages\/ai\/src\/(?:context-instructions|types|index)\.[cm]?[jt]s$/i,
 		surface: "provider-mapping",
+	},
+	{
+		pattern: /(?:^|\/)packages\/ai\/src\/(?:dialect\/.*|stream|utils\/(?:schema\/.*|validation))\.[cm]?[jt]s$/i,
+		surface: "tool-schema",
+	},
+	{
+		pattern:
+			/(?:^|\/)packages\/coding-agent\/src\/(?:config\/inline-tool-descriptors-mode|extensibility\/tool-proxy|mcp\/(?:manager|tool-bridge)|session\/session-tools|system-prompt)\.[cm]?[jt]s$/i,
+		surface: "tool-schema",
+	},
+	{
+		pattern:
+			/(?:^|\/)packages\/coding-agent\/src\/(?:secrets\/message-transform|session\/(?:session-handoff|snapcompact-inline))\.[cm]?[jt]s$/i,
+		surface: "provider-wrapper",
 	},
 	{
 		pattern:

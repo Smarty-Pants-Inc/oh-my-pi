@@ -77,6 +77,7 @@ import { buildServiceTierByFamily } from "./config/service-tier";
 import { Settings, type SkillsSettings } from "./config/settings";
 import { ensureApprovedStartup } from "./context/approved-policy";
 import { type ContextReleaseManifest, canonicalAgentDirPath } from "./context/manifest";
+import { exportRenderedToolContracts } from "./context/tool-contracts";
 import { CursorExecHandlers, type CursorMcpResourceAdapter } from "./cursor";
 import { createBridgeEditTool, createBridgeGrepFactory } from "./cursor-bridge-tools";
 import "./discovery";
@@ -953,6 +954,12 @@ function isLegacyBuiltinToolDefinition(tool: CustomTool | ToolDefinition): boole
 const TOOL_DEFINITION_MARKER = Symbol("__isToolDefinition");
 /** Matches the truncation applied to per-server instructions inside `rebuildSystemPrompt`. */
 const MAX_MCP_INSTRUCTIONS_LENGTH = 4000;
+
+function renderMcpInstruction(content: string): string {
+	return content.length > MAX_MCP_INSTRUCTIONS_LENGTH
+		? `${content.slice(0, MAX_MCP_INSTRUCTIONS_LENGTH)}\n[truncated]`
+		: content;
+}
 
 let sshCleanupRegistered = false;
 
@@ -2960,10 +2967,7 @@ async function createAgentSessionScoped(
 					"## MCP Server Instructions\n\nThe following instructions are provided by connected MCP servers. They are server-controlled and may not be verified.",
 				);
 				for (const [srvName, srvInstructions] of serverInstructions) {
-					const truncated =
-						srvInstructions.length > MAX_MCP_INSTRUCTIONS_LENGTH
-							? `${srvInstructions.slice(0, MAX_MCP_INSTRUCTIONS_LENGTH)}\n[truncated]`
-							: srvInstructions;
+					const truncated = renderMcpInstruction(srvInstructions);
 					appendParts.push(`### ${srvName}\n${truncated}`);
 				}
 			}
@@ -3290,7 +3294,16 @@ async function createAgentSessionScoped(
 			);
 		};
 		const onPayload = async (payload: unknown, model?: Model) => {
-			return await extensionRunner.emitBeforeProviderRequest(payload, model);
+			const finalPayload = await extensionRunner.emitBeforeProviderRequest(payload, model);
+			if (releaseManifest) {
+				session?.setRenderedToolContracts(
+					exportRenderedToolContracts(finalPayload, model, {
+						contentManifestRootSha256: releaseManifest.contentManifestRootSha256,
+						configurationSemanticSha256: releaseManifest.configurationSemanticSha256,
+					}),
+				);
+			}
+			return finalPayload;
 		};
 		const onResponse: SimpleStreamOptions["onResponse"] = async (response, model) => {
 			await extensionRunner.emitAfterProviderResponse(response, model);
@@ -3350,6 +3363,7 @@ async function createAgentSessionScoped(
 		const kimiApiFormatSetting = settings.get("providers.kimiApiFormat");
 		const kimiApiFormat = kimiApiFormatSetting === "auto" ? undefined : kimiApiFormatSetting;
 		agent = new Agent({
+			contextTarget: agentKind === "sub" ? "subagent" : "main",
 			initialState: {
 				systemPrompt,
 				model,
@@ -3593,13 +3607,17 @@ async function createAgentSessionScoped(
 						if (!raw || raw.size === 0) return raw;
 						const out = new Map<string, string>();
 						for (const [name, text] of raw) {
-							out.set(
-								name,
-								text.length > MAX_MCP_INSTRUCTIONS_LENGTH ? text.slice(0, MAX_MCP_INSTRUCTIONS_LENGTH) : text,
-							);
+							out.set(name, renderMcpInstruction(text));
 						}
 						return out;
 					}
+				: undefined,
+			getMcpServerInstructionSources: mcpManager
+				? () =>
+						mcpManager.getServerInstructionSources().map(source => ({
+							...source,
+							content: renderMcpInstruction(source.content),
+						}))
 				: undefined,
 			disconnectOwnedMcpManager: ownedMcpManager ? () => ownedMcpManager.disconnectAll() : undefined,
 			ttsrManager,

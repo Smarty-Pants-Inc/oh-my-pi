@@ -1,4 +1,4 @@
-import type { Tool } from "@oh-my-pi/pi-ai";
+import type { Model, Tool } from "@oh-my-pi/pi-ai";
 import generatedContractsSource from "../../generated/tool-contracts.json" with { type: "text" };
 import { canonicalJson, sha256 } from "./canonical";
 
@@ -18,6 +18,29 @@ interface GeneratedToolContracts {
 	schema: "omp.tool_contracts.v1";
 	tools: GeneratedToolContract[];
 	rootSha256: string;
+}
+
+export interface RenderedToolContract {
+	id: string;
+	description: string;
+	schema: unknown;
+	descriptionSha256: string;
+	schemaSha256: string;
+}
+
+export interface RenderedToolContractExport {
+	schema: "omp.rendered_tool_contracts.v1";
+	provider: string;
+	model: string;
+	contentManifestRootSha256: string;
+	configurationSemanticSha256: string;
+	tools: RenderedToolContract[];
+	rootSha256: string;
+}
+
+export interface RenderedToolContractBinding {
+	contentManifestRootSha256: string;
+	configurationSemanticSha256: string;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -78,6 +101,104 @@ export function buildGeneratedToolContractManifest(): ToolContractManifestEntry[
 		descriptionSha256: sha256(tool.description),
 		schemaSha256: sha256(canonicalJson(tool.schema as never)),
 	}));
+}
+
+function parseSchema(value: unknown): unknown {
+	if (typeof value !== "string") return value;
+	try {
+		return JSON.parse(value);
+	} catch {
+		return value;
+	}
+}
+
+function renderedContract(value: unknown): { name: string; description: string; schema: unknown } | undefined {
+	if (!isRecord(value)) return undefined;
+	if (isRecord(value.function)) return renderedContract(value.function);
+	if (isRecord(value.toolSpec)) return renderedContract(value.toolSpec);
+	const name = typeof value.name === "string" ? value.name : undefined;
+	if (!name) return undefined;
+	const inputSchema = isRecord(value.inputSchema) && "json" in value.inputSchema ? value.inputSchema.json : undefined;
+	const schema =
+		value.parameters ??
+		value.parametersJsonSchema ??
+		value.input_schema ??
+		inputSchema ??
+		value.schema ??
+		value.jsonSchemaString;
+	if (schema === undefined) return undefined;
+	return {
+		name,
+		description: typeof value.description === "string" ? value.description : "",
+		schema: parseSchema(schema),
+	};
+}
+
+/** Extract the exact tool contracts from a provider-built payload after all wire transforms. */
+export function exportRenderedToolContracts(
+	payload: unknown,
+	model: Pick<Model, "provider" | "id"> | undefined,
+	binding: RenderedToolContractBinding,
+): RenderedToolContractExport {
+	if (
+		!/^[a-f0-9]{64}$/.test(binding.contentManifestRootSha256) ||
+		!/^[a-f0-9]{64}$/.test(binding.configurationSemanticSha256)
+	) {
+		throw new Error("rendered tool contract bindings must be lowercase SHA-256 values");
+	}
+	const found = new Map<string, { name: string; description: string; schema: unknown }>();
+	const add = (candidate: unknown): void => {
+		const contract = renderedContract(candidate);
+		if (!contract) return;
+		const prior = found.get(contract.name);
+		if (prior && canonicalJson(prior as never) !== canonicalJson(contract as never)) {
+			throw new Error(`provider payload contains conflicting contracts for tool ${contract.name}`);
+		}
+		found.set(contract.name, contract);
+	};
+	const visited = new Set<object>();
+	const visit = (value: unknown): void => {
+		if (!isRecord(value) || visited.has(value)) return;
+		visited.add(value);
+		if (Array.isArray(value.tools)) {
+			for (const tool of value.tools) {
+				if (isRecord(tool) && Array.isArray(tool.functionDeclarations)) {
+					for (const declaration of tool.functionDeclarations) add(declaration);
+				} else {
+					add(tool);
+				}
+			}
+		}
+		if (Array.isArray(value.functionDeclarations)) {
+			for (const declaration of value.functionDeclarations) add(declaration);
+		}
+		for (const nested of Object.values(value)) {
+			if (Array.isArray(nested)) {
+				for (const item of nested) visit(item);
+			} else {
+				visit(nested);
+			}
+		}
+	};
+	visit(payload);
+	const tools = [...found.values()]
+		.map(contract => ({
+			id: `tool.${contract.name}`,
+			description: contract.description,
+			schema: contract.schema,
+			descriptionSha256: sha256(contract.description),
+			schemaSha256: sha256(canonicalJson(contract.schema as never)),
+		}))
+		.sort((left, right) => left.id.localeCompare(right.id));
+	const body = {
+		schema: "omp.rendered_tool_contracts.v1" as const,
+		provider: model?.provider ?? "provider-unspecified",
+		model: model?.id ?? "model-unspecified",
+		contentManifestRootSha256: binding.contentManifestRootSha256,
+		configurationSemanticSha256: binding.configurationSemanticSha256,
+		tools,
+	};
+	return { ...body, rootSha256: sha256(canonicalJson(body as never)) };
 }
 
 async function manifestSession() {

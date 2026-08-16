@@ -2,13 +2,33 @@
  * Shared utilities for compaction and branch summarization.
  */
 
-import type { Message, ToolCall } from "@oh-my-pi/pi-ai";
+import { createHash } from "node:crypto";
+import type { Context, Message, ToolCall } from "@oh-my-pi/pi-ai";
 import { type Dialect, getDialectDefinition } from "@oh-my-pi/pi-ai/dialect";
 import { escapeHarmonyControlTokens } from "@oh-my-pi/pi-ai/utils/harmony-leak";
 import { formatGroupedPaths, prompt, stringifyJson } from "@oh-my-pi/pi-utils";
 import type { AgentMessage } from "../types";
 import fileOperationsTemplate from "./prompts/file-operations.md" with { type: "text" };
 import summarizationSystemPrompt from "./prompts/summarization-system.md" with { type: "text" };
+
+/** Keep model-authored compaction work on an instruction channel, never a synthetic user turn. */
+export function compactionInstructionContext(id: string, sourcePath: string, renderedText: string): Context {
+	return {
+		systemPrompt: [SUMMARIZATION_SYSTEM_PROMPT],
+		messages: [],
+		instructions: [
+			{
+				id,
+				sourcePath,
+				role: "internal_context",
+				target: "side_model",
+				trigger: "compaction",
+				sha256: createHash("sha256").update(renderedText).digest("hex"),
+				renderedText,
+			},
+		],
+	};
+}
 
 // ============================================================================
 // File Operation Tracking

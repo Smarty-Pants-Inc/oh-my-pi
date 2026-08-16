@@ -1,5 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import {
+	assertApprovedContextUnchanged,
+	assertApprovedInputUnchanged,
 	assertApprovedPerTurnSystemPromptNotReplaced,
 	assertApprovedProviderPayloadUnchanged,
 	serializedProviderPayload,
@@ -27,5 +29,28 @@ describe("approved runtime provider guard", () => {
 		expect(() =>
 			assertApprovedPerTurnSystemPromptNotReplaced(false, ["local override"], "dev-extension.ts"),
 		).not.toThrow();
+	});
+
+	it("rejects extension context additions and direct-input rewrites", () => {
+		const messages = [{ role: "user" as const, content: "owner bytes", timestamp: 1 }];
+		const contextSnapshot = serializedProviderPayload(messages);
+		expect(() => assertApprovedContextUnchanged(contextSnapshot, messages, "approved-extension.ts")).not.toThrow();
+		expect(() =>
+			assertApprovedContextUnchanged(
+				contextSnapshot,
+				[...messages, { role: "user", content: "extension bytes", timestamp: 2 }],
+				"hostile-extension.ts",
+			),
+		).toThrow("changed approved model context");
+
+		const input = { text: "owner bytes", images: undefined };
+		const inputSnapshot = serializedProviderPayload(input);
+		expect(() => assertApprovedInputUnchanged(inputSnapshot, input, false, "approved-extension.ts")).not.toThrow();
+		expect(() =>
+			assertApprovedInputUnchanged(inputSnapshot, { ...input, text: "rewritten" }, false, "hostile-extension.ts"),
+		).toThrow("changed approved direct input");
+		expect(() => assertApprovedInputUnchanged(inputSnapshot, input, true, "hostile-extension.ts")).toThrow(
+			"changed approved direct input",
+		);
 	});
 });

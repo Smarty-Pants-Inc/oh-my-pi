@@ -43,6 +43,24 @@ describe("SessionCapabilities", () => {
 		expect(capabilities.grantProvenance).toEqual([grant]);
 	});
 
+	it("denies grants during async and retry continuations inside an open direct-user lifecycle", async () => {
+		const workspace = await tempDir("omp-session-workspace-");
+		const capabilities = new SessionCapabilities({ workspace });
+		capabilities.beginDirectUserTurn("turn-1", "You may grant the exact requested capability");
+
+		for (const source of ["active_async_result_wake", "bounded_transport_or_protocol_retry"] as const) {
+			await capabilities.withContinuationAuthority(source, "turn-1", async () => {
+				expect(() =>
+					capabilities.grantFromCurrentDirectUserTurn({ kind: "externalCapability", value: `test.${source}` }),
+				).toThrow("direct_user_input continuation authority");
+			});
+		}
+
+		expect(() =>
+			capabilities.grantFromCurrentDirectUserTurn({ kind: "externalCapability", value: "test.direct" }),
+		).not.toThrow();
+	});
+
 	it("allows workspace writes but requests a narrow grant for sibling and symlink escapes", async () => {
 		const parent = await tempDir("omp-session-capability-");
 		const workspace = path.join(parent, "work");

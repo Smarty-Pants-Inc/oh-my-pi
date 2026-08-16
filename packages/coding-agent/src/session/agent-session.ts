@@ -114,8 +114,14 @@ import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-temp
 import { buildServiceTierByFamily } from "../config/service-tier";
 import type { Settings, SkillsSettings } from "../config/settings";
 import { onAppendOnlyModeChanged, onModelRolesChanged } from "../config/settings";
+import {
+	explainContext as buildContextExplanation,
+	type ContextExplanation,
+	type RuntimeMcpInstruction,
+} from "../context/explain";
 import { bindRenderedInstruction, renderInstruction } from "../context/registry";
 import { smartyMergifySkillInstruction } from "../context/smarty-skills";
+import type { RenderedToolContractExport } from "../context/tool-contracts";
 import { RawSseDebugBuffer } from "../debug/raw-sse-buffer";
 import { getFileSnapshotStore } from "../edit/file-snapshot-store";
 import type { PythonResult } from "../eval/py/executor";
@@ -773,6 +779,8 @@ export class AgentSession {
 	readonly #automaticTurns = new AutomaticTurnAuthority();
 	readonly #capabilities: SessionCapabilities | undefined;
 	#currentTurnId: string | undefined;
+	#renderedToolContracts: RenderedToolContractExport | undefined;
+	readonly #getMcpServerInstructionSources: (() => RuntimeMcpInstruction[]) | undefined;
 	readonly #queuedAsyncResults = new Map<string, AsyncResultEntry>();
 	#turnExtensionInstructions: ContextInstruction[] = [];
 	#obfuscator: SecretObfuscator | undefined;
@@ -1116,6 +1124,7 @@ export class AgentSession {
 		this.sessionManager = config.sessionManager;
 		this.settings = config.settings;
 		this.#capabilities = config.capabilities;
+		this.#getMcpServerInstructionSources = config.getMcpServerInstructionSources;
 		this.#modelRegistry = config.modelRegistry;
 		this.#codexResetCoordinator = config.codexResetCoordinator ?? defaultCodexAutoRedeemCoordinator;
 		const bashHost: BashRunnerHost = {
@@ -4012,6 +4021,7 @@ export class AgentSession {
 		if (!options || !this.#automaticTurns.authorize(options.authority, options.originTurnId)) return;
 		this.#schedulePostPromptTask(
 			async signal => {
+				let directTurnId: string | undefined;
 				// Defense in depth: if compaction/handoff slipped onto the post-prompt queue
 				// alongside us (e.g. via a scheduler we don't own), refuse to start a fresh
 				// streaming turn — agent.continue() here would race the handoff's session
@@ -4032,6 +4042,25 @@ export class AgentSession {
 					this.#automaticTurns.record(options.authority, "rejected", "originating asynchronous turn closed");
 					return;
 				}
+				if (options.authority === "direct_user_input") {
+					this.#closeCurrentTurn();
+					directTurnId = this.#automaticTurns.openTurn();
+					this.#currentTurnId = directTurnId;
+					const queuedUser = [...this.agent.peekSteeringQueue(), ...this.agent.peekFollowUpQueue()].find(
+						message => message.role === "user",
+					);
+					if (queuedUser) {
+						const promptText =
+							typeof queuedUser.content === "string"
+								? queuedUser.content
+								: queuedUser.content
+										.filter((part): part is TextContent => part.type === "text")
+										.map(part => part.text)
+										.join("\n");
+						this.#capabilities?.beginDirectUserTurn(directTurnId, promptText);
+					}
+				}
+				const continuationTurnId = directTurnId ?? options.originTurnId ?? this.#currentTurnId;
 				this.#beginInFlight();
 				try {
 					const reverted = await this.#recovery.maybeRestoreRetryFallbackPrimary();
@@ -4057,8 +4086,19 @@ export class AgentSession {
 							return;
 						}
 					}
-					this.#automaticTurns.record(options.authority, "started", "provider dispatch committed");
-					await this.agent.continue(signal);
+					this.#automaticTurns.record(
+						options.authority,
+						"started",
+						"provider dispatch committed",
+						continuationTurnId,
+					);
+					if (this.#capabilities) {
+						await this.#capabilities.withContinuationAuthority(options.authority, continuationTurnId, () =>
+							this.agent.continue(signal),
+						);
+					} else {
+						await this.agent.continue(signal);
+					}
 				} catch (error) {
 					this.#automaticTurns.record(
 						options.authority,
@@ -4072,6 +4112,7 @@ export class AgentSession {
 					options?.onError?.(error);
 				} finally {
 					this.#usagePreflightReadyForNextModelCall = false;
+					if (directTurnId && this.#currentTurnId === directTurnId) this.#closeCurrentTurn();
 					this.#endInFlight();
 				}
 			},
@@ -4097,6 +4138,46 @@ export class AgentSession {
 
 	getCurrentTurnId(): string | undefined {
 		return this.#currentTurnId;
+	}
+
+	setRenderedToolContracts(contracts: RenderedToolContractExport): void {
+		this.#renderedToolContracts = structuredClone(contracts);
+	}
+
+	getRenderedToolContracts(): RenderedToolContractExport | undefined {
+		return this.#renderedToolContracts ? structuredClone(this.#renderedToolContracts) : undefined;
+	}
+
+	/** Explain exact runtime context when available and label all other dynamic sources as potential. */
+	async explainContext(options: { includeContent?: boolean } = {}): Promise<ContextExplanation> {
+		const selectedSkills = this.agent.state.messages.flatMap((message, order) => {
+			if (message.role !== "custom" || message.customType !== "skill-prompt") return [];
+			const details = message.details;
+			if (!details || typeof details !== "object" || !("name" in details) || typeof details.name !== "string") {
+				return [];
+			}
+			const renderedText =
+				typeof message.content === "string"
+					? message.content
+					: message.content
+							.filter((part): part is TextContent => part.type === "text")
+							.map(part => part.text)
+							.join("\n");
+			return [{ name: details.name, renderedText, order }];
+		});
+		return await buildContextExplanation({
+			cwd: this.sessionManager.getCwd(),
+			target: this.#agentKind === "sub" ? "subagent" : "main",
+			includeContent: options.includeContent,
+			provider: this.model?.provider,
+			model: this.model?.id,
+			runtime: {
+				instructions: this.buildProviderContextInstructions(),
+				selectedSkills,
+				mcpInstructions: this.#getMcpServerInstructionSources?.(),
+				renderedToolContracts: this.getRenderedToolContracts(),
+			},
+		});
 	}
 
 	#closeCurrentTurn(): void {
@@ -6955,12 +7036,26 @@ export class AgentSession {
 	#scheduleQueuedMessageDrain(): boolean {
 		if (!this.agent.hasQueuedMessages()) return false;
 		if (this.#queuedMessageDrainScheduled) return true;
+		if (this.#modeExitDrainSuppressionDepth > 0) return false;
 		if (
-			this.#modeExitDrainSuppressionDepth > 0 ||
-			this.#queuedMessageDrainBlocked ||
+			this.agent.peekSteeringQueue().length === 0 &&
+			!this.#advisors.autoResumeSuppressed &&
 			!this.#canAutoContinueForFollowUp()
-		)
-			return false;
+		) {
+			const followUp = [...this.agent.peekFollowUpQueue()];
+			const directUser = followUp.filter(isUserQueuedMessage);
+			if (directUser.length > 0) {
+				// A lifecycle rollback can restore an internal-context tail after the
+				// user queued a follow-up. Promote that direct input to the initial
+				// steering poll so it wins without giving the internal source a turn.
+				this.agent.replaceQueues(
+					directUser,
+					followUp.filter(message => !isUserQueuedMessage(message)),
+					true,
+				);
+			}
+		}
+		if (this.#queuedMessageDrainBlocked || !this.#canAutoContinueForFollowUp()) return false;
 		const queuedAuthority = this.#queuedTurnAuthority();
 		if (!queuedAuthority) return false;
 		this.#queuedMessageDrainScheduled = true;
@@ -8870,7 +8965,7 @@ export class AgentSession {
 		const cacheSessionId = this.sessionId;
 		const snapshot = this.#buildEphemeralSnapshot(args.promptText);
 		const llmMessages = await this.convertMessagesToLlm(snapshot, args.signal);
-		const context = await this.agent.buildSideRequestContext(llmMessages);
+		const context = await this.agent.buildSideRequestContext(llmMessages, undefined, snapshot);
 		const options = this.prepareSimpleStreamOptions(
 			{
 				apiKey: this.#modelRegistry.resolver(model, cacheSessionId),

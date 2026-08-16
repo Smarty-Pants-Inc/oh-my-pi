@@ -93,8 +93,8 @@ import source89 from "../prompts/goals/goal-mode-context.md" with { type: "text"
 import source90 from "../prompts/goals/goal-objective-updated.md" with { type: "text" };
 import source91 from "../prompts/goals/goal-todo-context.md" with { type: "text" };
 import source92 from "../prompts/goals/guided-goal-interview.md" with { type: "text" };
-import source93 from "../prompts/memories/consolidation.md" with { type: "text" };
-import source94 from "../prompts/memories/consolidation_system.md" with { type: "text" };
+import source93 from "../prompts/memories/consolidation_system.md" with { type: "text" };
+import source94 from "../prompts/memories/consolidation.md" with { type: "text" };
 import source95 from "../prompts/memories/read-path.md" with { type: "text" };
 import source96 from "../prompts/memories/stage_one_input.md" with { type: "text" };
 import source97 from "../prompts/memories/stage_one_system.md" with { type: "text" };
@@ -328,8 +328,8 @@ export const PROMPT_SOURCES: Readonly<Record<string, string>> = Object.freeze({
 	"prompts/goals/goal-objective-updated.md": source90,
 	"prompts/goals/goal-todo-context.md": source91,
 	"prompts/goals/guided-goal-interview.md": source92,
-	"prompts/memories/consolidation.md": source93,
-	"prompts/memories/consolidation_system.md": source94,
+	"prompts/memories/consolidation_system.md": source93,
+	"prompts/memories/consolidation.md": source94,
 	"prompts/memories/read-path.md": source95,
 	"prompts/memories/stage_one_input.md": source96,
 	"prompts/memories/stage_one_system.md": source97,

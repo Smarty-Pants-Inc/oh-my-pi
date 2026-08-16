@@ -10,7 +10,7 @@ import {
 	parseContextReleaseManifest,
 	trackedContentManifest,
 } from "../../src/context/manifest";
-import { parseGeneratedToolContracts } from "../../src/context/tool-contracts";
+import { exportRenderedToolContracts, parseGeneratedToolContracts } from "../../src/context/tool-contracts";
 
 describe("tracked context manifest", () => {
 	it("uses the canonical activation state path and ignores environment decoys", () => {
@@ -113,6 +113,30 @@ describe("tracked context manifest", () => {
 		expect(manifest.implementationSources.some(entry => entry.path === "packages/agent/src/agent-loop.ts")).toBe(
 			true,
 		);
+		expect(manifest.implementationSources.some(entry => entry.path === "packages/ai/src/utils/schema/wire.ts")).toBe(
+			true,
+		);
+		expect(
+			manifest.implementationSources.some(entry => entry.path === "packages/ai/src/providers/openai-responses.ts"),
+		).toBe(true);
+		expect(
+			manifest.implementationSources.some(
+				entry => entry.path === "packages/coding-agent/src/session/agent-session.ts",
+			),
+		).toBe(true);
+		expect(
+			manifest.implementationSources.some(
+				entry => entry.path === "packages/coding-agent/src/config/inline-tool-descriptors-mode.ts",
+			),
+		).toBe(true);
+		expect(
+			manifest.implementationSources.some(
+				entry => entry.path === "packages/coding-agent/src/session/session-handoff.ts",
+			),
+		).toBe(true);
+		expect(
+			manifest.prompts.find(entry => entry.id === "agent.compaction.prompts.compaction-summary")?.target,
+		).toEqual(["side_model"]);
 	});
 
 	it("requires normalized localeCompare-sorted implementation paths", () => {
@@ -157,6 +181,68 @@ describe("tracked context manifest", () => {
 				JSON.stringify({ ...contracts, tools: [{ ...tools[0], description: "mutated" }, ...tools.slice(1)] }),
 			),
 		).toThrow("root does not match");
+	});
+
+	it("exports hashes from exact final provider-rendered tool contracts", () => {
+		const binding = {
+			contentManifestRootSha256: "a".repeat(64),
+			configurationSemanticSha256: "b".repeat(64),
+		};
+		const payload = {
+			tools: [
+				{
+					type: "function",
+					function: {
+						name: "write",
+						description: "",
+						parameters: { type: "object", properties: { i: { type: "string" } }, required: ["i"] },
+					},
+				},
+			],
+		};
+		const exported = exportRenderedToolContracts(payload, { provider: "openai", id: "gpt-test" }, binding);
+		expect(exported).toMatchObject({
+			schema: "omp.rendered_tool_contracts.v1",
+			provider: "openai",
+			model: "gpt-test",
+			...binding,
+			tools: [{ id: "tool.write", description: "" }],
+		});
+		expect(exported.tools[0]?.descriptionSha256).toBe(sha256(""));
+		expect(exported.tools[0]?.schemaSha256).toBe(
+			sha256(canonicalJson({ type: "object", properties: { i: { type: "string" } }, required: ["i"] })),
+		);
+		const { rootSha256, ...rootPayload } = exported;
+		expect(rootSha256).toBe(sha256(canonicalJson(rootPayload as unknown as JsonValue)));
+
+		const transformed = structuredClone(payload);
+		transformed.tools[0]!.function.description = "provider/model transform drift";
+		expect(
+			exportRenderedToolContracts(transformed, { provider: "openai", id: "gpt-test" }, binding).rootSha256,
+		).not.toBe(exported.rootSha256);
+		expect(
+			exportRenderedToolContracts(payload, { provider: "openai", id: "gpt-other" }, binding).rootSha256,
+		).not.toBe(exported.rootSha256);
+		expect(
+			exportRenderedToolContracts(
+				payload,
+				{ provider: "openai", id: "gpt-test" },
+				{
+					...binding,
+					configurationSemanticSha256: "c".repeat(64),
+				},
+			).rootSha256,
+		).not.toBe(exported.rootSha256);
+		expect(() =>
+			exportRenderedToolContracts(
+				payload,
+				{ provider: "openai", id: "gpt-test" },
+				{
+					...binding,
+					contentManifestRootSha256: "not-a-hash",
+				},
+			),
+		).toThrow("lowercase SHA-256");
 	});
 
 	it("uses a self-excluding canonical root", () => {

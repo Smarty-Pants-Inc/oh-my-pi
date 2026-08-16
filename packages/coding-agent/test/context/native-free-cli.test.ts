@@ -15,7 +15,7 @@ interface CliResult {
 	stderr: string;
 }
 
-async function runCli(args: string[], blockNative: boolean): Promise<CliResult> {
+async function runCli(args: string[], blockNative: boolean, cwd = repository): Promise<CliResult> {
 	const command = ["/usr/bin/env", Bun.which("bun") ?? process.execPath];
 	if (blockNative) command.push("--preload", blockNativeImport);
 	command.push(cliEntry, ...args);
@@ -23,7 +23,7 @@ async function runCli(args: string[], blockNative: boolean): Promise<CliResult> 
 	const stdoutPath = path.join(home, `stdout-${index}`);
 	const stderrPath = path.join(home, `stderr-${index}`);
 	const child = Bun.spawnSync(command, {
-		cwd: repository,
+		cwd,
 		env: {
 			...Bun.env,
 			HOME: home,
@@ -42,8 +42,8 @@ async function runCli(args: string[], blockNative: boolean): Promise<CliResult> 
 	};
 }
 
-async function runJson(args: string[], blockNative = true): Promise<Record<string, unknown>> {
-	const result = await runCli(args, blockNative);
+async function runJson(args: string[], blockNative = true, cwd = repository): Promise<Record<string, unknown>> {
+	const result = await runCli(args, blockNative, cwd);
 	expect(result.exitCode, result.stderr).toBe(0);
 	expect(result.stdout.length, JSON.stringify(result)).toBeGreaterThan(0);
 	return JSON.parse(result.stdout) as Record<string, unknown>;
@@ -56,6 +56,7 @@ beforeAll(async () => {
 	await Promise.all([
 		fs.writeFile(path.join(agentDir, "AGENTS.md"), "native-free global instructions\n"),
 		fs.writeFile(path.join(agentDir, "config.yml"), "{}\n"),
+		fs.writeFile(path.join(agentDir, "mcp.json"), '{"mcpServers":{"fixture":{"command":"fixture"}}}\n'),
 		...(["mergify-config", "mergify-merge-queue", "mergify-merge-protections"] as const).map(async name => {
 			const skillDir = path.join(home, ".agents/skills", name);
 			await fs.mkdir(skillDir, { recursive: true });
@@ -122,9 +123,25 @@ describe("native-free context CLI", () => {
 		expect(componentIds).toContain("mcp-xdev-guidance");
 		expect(componentIds).toContain("skill.smarty_mergify_policy");
 		expect(componentIds.filter(id => String(id).startsWith("external.skill."))).toHaveLength(3);
+		const mcpPotential = normalComponents.find(component => String(component.id).startsWith("external.mcp.config."));
+		expect(mcpPotential).toMatchObject({
+			kind: "data",
+			triggered: false,
+			effective: false,
+			availability: "unavailable",
+			providerOrder: null,
+		});
+		expect(normal.toolContracts).toMatchObject({ status: "unavailable" });
 		expect(componentIds.some(id => String(id).startsWith("implementation.packages/agent/src/compaction/"))).toBe(
 			true,
 		);
+		expect(componentIds).toContain("implementation.packages/ai/src/utils/schema/wire.ts");
+		expect(normalComponents.find(component => component.id === "tool.ask")).toMatchObject({
+			triggered: false,
+			effective: false,
+			availability: "unavailable",
+			providerOrder: null,
+		});
 		expect(
 			normalComponents.map(component => ({
 				id: component.id,
@@ -146,6 +163,75 @@ describe("native-free context CLI", () => {
 				providerOrder: component.providerOrder,
 			})),
 		);
+	}, 30_000);
+
+	it("separates runtime MCP text from configured potential and includes project .omp instructions", async () => {
+		const project = path.join(home, "workspace/project");
+		const projectOmp = path.join(project, ".omp");
+		await fs.mkdir(projectOmp, { recursive: true });
+		await fs.writeFile(path.join(projectOmp, "AGENTS.md"), "project omp instructions\n");
+		const explainModule = path.join(repository, "packages/coding-agent/src/context/explain.ts");
+		const script = `
+			import { explainContext } from ${JSON.stringify(explainModule)};
+			const explanation = await explainContext({
+				cwd: ${JSON.stringify(project)},
+				target: "main",
+				includeContent: true,
+				provider: "openai-responses",
+				model: "runtime-evidence",
+				runtime: {
+					selectedSkills: [{ name: "mergify-config", renderedText: "exact selected skill prompt", order: 7 }],
+					mcpInstructions: [{ name: "fixture", source: "mcp://fixture", content: "exact returned instructions" }],
+				},
+			});
+			process.stdout.write(JSON.stringify(explanation));
+		`;
+		const command = [
+			"/usr/bin/env",
+			Bun.which("bun") ?? process.execPath,
+			"--preload",
+			blockNativeImport,
+			"-e",
+			script,
+		];
+		const index = processIndex++;
+		const stdoutPath = path.join(home, `stdout-${index}`);
+		const stderrPath = path.join(home, `stderr-${index}`);
+		const child = Bun.spawnSync(command, {
+			cwd: project,
+			env: { ...Bun.env, HOME: home, USERPROFILE: home, PI_CODING_AGENT_DIR: path.join(home, ".omp/agent") },
+			stdout: Bun.file(stdoutPath),
+			stderr: Bun.file(stderrPath),
+		});
+		const [stdout, stderr] = await Promise.all([Bun.file(stdoutPath).text(), Bun.file(stderrPath).text()]);
+		expect(child.exitCode, stderr).toBe(0);
+		const explanation = JSON.parse(stdout) as Record<string, unknown>;
+		const components = explanation.components as Array<Record<string, unknown>>;
+		const projectComponent = components.find(component => component.source === path.join(projectOmp, "AGENTS.md"));
+		expect(projectComponent).toMatchObject({ triggered: true, effective: true, availability: "effective" });
+		const runtimeMcp = components.find(component => component.id === "external.mcp.fixture");
+		expect(runtimeMcp).toMatchObject({
+			source: "mcp://fixture",
+			content: "exact returned instructions",
+			triggered: true,
+			effective: true,
+			availability: "effective",
+		});
+		expect(typeof runtimeMcp?.providerOrder).toBe("number");
+		const selectedSkill = components.find(component => component.id === "external.skill.mergify-config");
+		expect(selectedSkill).toMatchObject({
+			actualRole: "user",
+			content: "exact selected skill prompt",
+			triggered: true,
+			effective: true,
+			availability: "effective",
+		});
+		expect(typeof selectedSkill?.providerOrder).toBe("number");
+		const potentialMcp = components.find(component =>
+			String(component.id).startsWith("external.mcp.config.fixture."),
+		);
+		expect(potentialMcp).toMatchObject({ kind: "data", effective: false, providerOrder: null });
+		expect(potentialMcp).not.toHaveProperty("content");
 	}, 30_000);
 
 	it("fails closed for a configured dynamic source that cannot be discovered", async () => {
