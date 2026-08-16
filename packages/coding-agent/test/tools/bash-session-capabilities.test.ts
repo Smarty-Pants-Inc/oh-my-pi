@@ -174,14 +174,30 @@ describe("BashTool session capabilities", () => {
 	it("allows routine workspace reads, tests, and compound checks under yolo", async () => {
 		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "bash-cap-routine-"));
 		try {
+			await fs.writeFile(path.join(workspace, "package.json"), JSON.stringify({ scripts: { test: "bun test" } }));
 			const init = Bun.spawnSync(["git", "init", "--quiet"], { cwd: workspace, stderr: "pipe" });
 			expect(init.exitCode, init.stderr.toString()).toBe(0);
 			const tool = new BashTool(session(workspace, new SessionCapabilities({ workspace })));
 
 			expect(await tool.execute("routine-rg", { command: "rg --version" })).toBeDefined();
+			expect(
+				await tool.execute("routine-rg-no-config", {
+					command: "rg --no-config --version",
+					env: { RIPGREP_CONFIG_PATH: "ignored-by-no-config" },
+				}),
+			).toBeDefined();
 			expect(await tool.execute("routine-test", { command: "bun test --help" })).toBeDefined();
-			expect(await tool.execute("routine-git-diff", { command: "git diff --check" })).toBeDefined();
-			expect(await tool.execute("routine-git-log", { command: "git log --oneline -1" })).toBeDefined();
+			expect(await tool.execute("routine-run", { command: "bun run test" })).toBeDefined();
+			expect(
+				await tool.execute("routine-git-diff", {
+					command: "git --no-pager diff --no-ext-diff --no-textconv --check",
+				}),
+			).toBeDefined();
+			expect(
+				await tool.execute("routine-git-log", {
+					command: "git --no-pager log --no-ext-diff --no-textconv --oneline -1",
+				}),
+			).toBeDefined();
 			expect(
 				await tool.execute("routine-compound", {
 					command: "bun test --help >.bun-test-help && rg --version | head -n 1",
@@ -189,6 +205,61 @@ describe("BashTool session capabilities", () => {
 			).toBeDefined();
 		} finally {
 			await removeWithRetries(workspace);
+		}
+	});
+
+	it("keeps Bun scripts, process hooks, and out-of-root routines capability-gated", async () => {
+		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "bash-cap-hostile-"));
+		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "bash-cap-hostile-outside-"));
+		try {
+			await fs.writeFile(
+				path.join(workspace, "package.json"),
+				JSON.stringify({ scripts: { check: "touch escaped.txt", publish: "touch escaped.txt" } }),
+			);
+			const init = Bun.spawnSync(["git", "init", "--quiet"], { cwd: workspace, stderr: "pipe" });
+			expect(init.exitCode, init.stderr.toString()).toBe(0);
+			const tool = new BashTool(session(workspace, new SessionCapabilities({ workspace })));
+			const commands = [
+				"bun run check",
+				"bun run publish",
+				"bun run robomp:reset",
+				"bun --cwd=packages/cloud-omp-cloudflare run deploy",
+				"rg --pre 'touch escaped.txt' needle .",
+				"rg --pre='touch escaped.txt' needle .",
+				"RIPGREP_CONFIG_PATH=rg.conf rg needle .",
+				"PATH=/tmp rg --version",
+				"BUN_OPTIONS=--preload=escaped.ts bun test --help",
+				"git diff --ext-diff --no-textconv",
+				"git log --textconv --no-ext-diff -1",
+				"git -c diff.external='touch escaped.txt' diff --no-ext-diff --no-textconv",
+				"GIT_EXTERNAL_DIFF='touch escaped.txt' git diff --no-ext-diff --no-textconv",
+			];
+			for (const command of commands) {
+				await expect(tool.execute(`hostile-${command}`, { command })).rejects.toThrow(
+					`requires explicit session capability 'bash.command:${command}'`,
+				);
+			}
+			await expect(tool.execute("hostile-cwd", { command: "bun test --help", cwd: outside })).rejects.toThrow(
+				"requires explicit session capability 'bash.command:bun test --help'",
+			);
+			await expect(
+				tool.execute("hostile-bun-env", {
+					command: "bun test --help",
+					env: { BUN_OPTIONS: "--preload=escaped.ts" },
+				}),
+			).rejects.toThrow("requires explicit session capability 'bash.command:bun test --help'");
+			await expect(
+				tool.execute("hostile-git-env", {
+					command: "git --no-pager diff --no-ext-diff --no-textconv",
+					env: { GIT_EXTERNAL_DIFF: "touch escaped.txt" },
+				}),
+			).rejects.toThrow(
+				"requires explicit session capability 'bash.command:git --no-pager diff --no-ext-diff --no-textconv'",
+			);
+			expect(await Bun.file(path.join(workspace, "escaped.txt")).exists()).toBe(false);
+			expect(await Bun.file(path.join(outside, "escaped.txt")).exists()).toBe(false);
+		} finally {
+			await Promise.all([removeWithRetries(workspace), removeWithRetries(outside)]);
 		}
 	});
 

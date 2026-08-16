@@ -88,7 +88,6 @@ const BASH_SAFE_READONLY_COMMANDS = new Set([
 	"printf",
 	"readlink",
 	"realpath",
-	"rg",
 	"stat",
 	"tail",
 	"test",
@@ -96,6 +95,70 @@ const BASH_SAFE_READONLY_COMMANDS = new Set([
 	"wc",
 ]);
 const BASH_SAFE_GIT_READ_SUBCOMMANDS = new Set(["diff", "log", "ls-files", "rev-parse", "show", "status"]);
+const BASH_SAFE_BUN_RUN_SCRIPTS = new Set(
+	[
+		["build", "bun run --workspaces --if-present build"],
+		["build", "bun ../../scripts/bazel-natives.ts host --dest native"],
+		["build", "bun scripts/build-binary.ts"],
+		["build", "bun scripts/build-extension.ts"],
+		["build", "bun run build.ts"],
+		["build", "vite build"],
+		["build:native", "bun --cwd=packages/natives run build"],
+		["check", "biome check . && bun run check:types"],
+		["check", "biome check . && tsgo -p tsconfig.json --noEmit"],
+		["check", "bun run --parallel check:ts check:rs"],
+		["check:rs", "bun scripts/run-rs-task.ts check:rs"],
+		["check:tools", "biome check . --no-errors-on-unmatched"],
+		["check:ts", "bun run check:tools && bun run --workspaces --if-present check"],
+		["check:types", "tsc --noEmit"],
+		["check:types", "tsgo -p tsconfig.json --noEmit"],
+		["check:types", "tsgo -p tsconfig.json --noEmit && tsgo -p tsconfig.client.json --noEmit"],
+		["check:types", "tsgo -p tsconfig.json --noEmit && tsgo -p tsconfig.worker.json --noEmit"],
+		["ci:check:full", "bun run check:ts"],
+		["ci:test:full", "bun run ci:test:ts && bun run test:rs"],
+		[
+			"ci:test:smoke",
+			"bun packages/coding-agent/src/cli.ts --version && bun packages/coding-agent/src/cli.ts --help && bun packages/coding-agent/src/cli.ts stats --help && bun packages/coding-agent/src/cli.ts --smoke-test",
+		],
+		["ci:test:ts", "bun scripts/ci-test-ts.ts all"],
+		["collab:web:build", "bun --cwd=packages/collab-web run build"],
+		["test", "bun ../../scripts/ci-test-ts.ts coding-agent-heavy --full"],
+		["test", "bun scripts/ci-test-ts.ts local"],
+		["test", "bun test"],
+		["test", "bun test --parallel"],
+		["test", "bun test --parallel test/*.test.ts"],
+		["test", "bun test --timeout 30000 test"],
+		["test:rs", "bun scripts/run-rs-task.ts test:rs"],
+		[
+			"test:scripts",
+			"bun test scripts/ci-test-ts.test.ts scripts/ci-release-build-binaries.test.ts scripts/musl-release.test.ts scripts/ci-release-publish.test.ts scripts/release.test.ts",
+		],
+		["test:ts", "bun scripts/ci-test-ts.ts local-ts"],
+	].map(([name, body]) => `${name}\0${body}`),
+);
+const BASH_SAFE_BUN_TEST_BOOLEAN_FLAGS = new Set([
+	"--concurrent",
+	"--coverage",
+	"--help",
+	"--only-failures",
+	"--pass-with-no-tests",
+	"--randomize",
+	"--todo",
+	"--update-snapshots",
+	"-h",
+	"-u",
+]);
+const BASH_SAFE_BUN_TEST_VALUE_FLAGS = new Set([
+	"--bail",
+	"--coverage-reporter",
+	"--max-concurrency",
+	"--parallel",
+	"--reporter",
+	"--rerun-each",
+	"--seed",
+	"--test-name-pattern",
+	"--timeout",
+]);
 const BASH_GITHUB_PR_EFFECTS = new Set([
 	"close",
 	"comment",
@@ -344,11 +407,140 @@ function commandHasGithubPrEffect(tokens: readonly string[]): boolean {
 	return args[0] === "pr" && BASH_GITHUB_PR_EFFECTS.has(args[1] ?? "");
 }
 
-function commandIsKnownSafe(tokens: readonly string[]): boolean {
+function bunTestIsKnownSafe(args: readonly string[]): boolean {
+	if (args[0] !== "test") return false;
+	let optionsEnded = false;
+	for (let index = 1; index < args.length; index++) {
+		const arg = args[index]!;
+		if (!optionsEnded && arg === "--") {
+			optionsEnded = true;
+			continue;
+		}
+		if (!optionsEnded && BASH_SAFE_BUN_TEST_BOOLEAN_FLAGS.has(arg)) continue;
+		if (!optionsEnded && BASH_SAFE_BUN_TEST_VALUE_FLAGS.has(arg)) {
+			if (index + 1 >= args.length) return false;
+			index++;
+			continue;
+		}
+		if (
+			!optionsEnded &&
+			arg.startsWith("--") &&
+			BASH_SAFE_BUN_TEST_VALUE_FLAGS.has(arg.slice(0, arg.indexOf("="))) &&
+			arg.includes("=")
+		) {
+			continue;
+		}
+		if (arg.startsWith("-") || arg.startsWith("/") || /(?:^|[\\/])\.\.(?:[\\/]|$)/u.test(arg)) return false;
+	}
+	return true;
+}
+
+function hasExecutableEnvironmentOverride(env: Record<string, string> | undefined): boolean {
+	if (!env) return false;
+	return Object.keys(env).some(
+		name =>
+			name === "PATH" ||
+			name === "NODE_OPTIONS" ||
+			name === "BUN_OPTIONS" ||
+			name === "LD_PRELOAD" ||
+			name === "DYLD_INSERT_LIBRARIES",
+	);
+}
+
+function bunCommandIsKnownSafe(
+	tokens: readonly string[],
+	commandIndex: number,
+	cwd: string,
+	env: Record<string, string> | undefined,
+): boolean {
+	if (commandIndex !== 0) return false;
+	if (hasExecutableEnvironmentOverride(env)) return false;
+	const args = tokens.slice(commandIndex + 1);
+	if (args[0] === "run") {
+		if (args.length !== 2) return false;
+		const manifestPath = resolveToCwd("package.json", cwd);
+		try {
+			if (fs.lstatSync(manifestPath).isSymbolicLink()) return false;
+			const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as { scripts?: Record<string, unknown> };
+			const body = manifest.scripts?.[args[1]!];
+			return typeof body === "string" && BASH_SAFE_BUN_RUN_SCRIPTS.has(`${args[1]}\0${body}`);
+		} catch {
+			return false;
+		}
+	}
+	return bunTestIsKnownSafe(args);
+}
+
+function rgCommandIsKnownSafe(
+	tokens: readonly string[],
+	commandIndex: number,
+	env: Record<string, string> | undefined,
+): boolean {
+	if (commandIndex !== 0 || hasExecutableEnvironmentOverride(env)) return false;
+	const args = tokens.slice(commandIndex + 1);
+	if (
+		args.some(
+			arg => arg === "--pre" || arg.startsWith("--pre=") || arg === "--pre-glob" || arg.startsWith("--pre-glob="),
+		)
+	) {
+		return false;
+	}
+	const noConfig = args.includes("--no-config");
+	if (!noConfig && (env?.RIPGREP_CONFIG_PATH || process.env.RIPGREP_CONFIG_PATH)) return false;
+	return true;
+}
+
+function gitCommandIsKnownSafe(
+	tokens: readonly string[],
+	commandIndex: number,
+	env: Record<string, string> | undefined,
+): boolean {
+	if (commandIndex !== 0 || hasExecutableEnvironmentOverride(env)) return false;
+	const helperEnvironment = (name: string): boolean =>
+		name === "GIT_EXTERNAL_DIFF" || name === "GIT_PAGER" || name === "PAGER" || name.startsWith("GIT_CONFIG_");
+	if (env && Object.keys(env).some(helperEnvironment)) return false;
+	if (
+		Object.entries(process.env).some(
+			([name, value]) => Boolean(value) && (name === "GIT_EXTERNAL_DIFF" || name.startsWith("GIT_CONFIG_")),
+		)
+	) {
+		return false;
+	}
+
+	const args = tokens.slice(commandIndex + 1);
+	let subcommandIndex = 0;
+	while (args[subcommandIndex] === "--no-pager") subcommandIndex++;
+	const subcommand = args[subcommandIndex];
+	if (!subcommand || !BASH_SAFE_GIT_READ_SUBCOMMANDS.has(subcommand)) return false;
+	if (args.slice(0, subcommandIndex).some(arg => arg !== "--no-pager")) return false;
+	if (
+		args.some(
+			arg =>
+				arg === "-c" ||
+				(arg.startsWith("-c") && arg.length > 2) ||
+				arg === "--config-env" ||
+				arg.startsWith("--config-env=") ||
+				arg === "--ext-diff" ||
+				arg.startsWith("--ext-diff=") ||
+				arg === "--textconv" ||
+				arg.startsWith("--textconv="),
+		)
+	) {
+		return false;
+	}
+	if (subcommand === "diff" || subcommand === "log" || subcommand === "show") {
+		const subcommandArgs = args.slice(subcommandIndex + 1);
+		return subcommandArgs.includes("--no-ext-diff") && subcommandArgs.includes("--no-textconv");
+	}
+	return true;
+}
+
+function commandIsKnownSafe(tokens: readonly string[], cwd: string, env: Record<string, string> | undefined): boolean {
 	const commandIndex = shellCommandIndex(tokens);
 	if (commandIndex === undefined) return true;
 	const command = tokens[commandIndex]!;
 	if (BASH_SAFE_READONLY_COMMANDS.has(command)) return true;
+	if (command === "rg") return rgCommandIsKnownSafe(tokens, commandIndex, env);
 	if (BASH_WRITE_COMMANDS_ALL_TARGETS.has(command) || BASH_WRITE_COMMANDS_LAST_TARGET.has(command)) {
 		// Flags alter many mutators' target semantics (`cp -t`, in-place
 		// editors, archive extraction). Their complete grammar is not an
@@ -359,21 +551,21 @@ function commandIsKnownSafe(tokens: readonly string[]): boolean {
 	if (command === "sed" || command === "perl") {
 		return tokens.slice(commandIndex + 1).some(arg => arg === "-i" || arg.startsWith("-i"));
 	}
-	if (command === "bun") {
-		return tokens.slice(commandIndex + 1).some(arg => arg === "run" || arg === "test");
-	}
-	if (command === "git") {
-		const subcommand = tokens.slice(commandIndex + 1).find(arg => !arg.startsWith("-"));
-		return subcommand !== undefined && BASH_SAFE_GIT_READ_SUBCOMMANDS.has(subcommand);
-	}
+	if (command === "bun") return bunCommandIsKnownSafe(tokens, commandIndex, cwd, env);
+	if (command === "git") return gitCommandIsKnownSafe(tokens, commandIndex, env);
 	return commandHasGitPush(tokens) || commandHasGithubPrEffect(tokens);
 }
 
-function commandNeedsGenericExternalCapability(command: string, tokens: readonly string[]): boolean {
+function commandNeedsGenericExternalCapability(
+	command: string,
+	tokens: readonly string[],
+	cwd: string,
+	env: Record<string, string> | undefined,
+): boolean {
 	// Substitutions and nested shell expressions cannot prove which executable or
 	// paths the shell will select. Simple compound segments are checked one by one.
 	if (/[`$()]/u.test(command)) return true;
-	return !commandIsKnownSafe(tokens);
+	return !commandIsKnownSafe(tokens, cwd, env);
 }
 
 function assertBashExternalCapability(session: ToolSession, capability: string): void {
@@ -439,7 +631,9 @@ function assertBashCapabilities(
 		if (commandHasGithubPrEffect(tokens)) {
 			assertBashExternalCapability(session, "github.pr");
 		}
-		if (commandNeedsGenericExternalCapability(command, tokens)) {
+		const cwdDecision = session.capabilities.decideWrite(cwd);
+		const cwdIsWorkspace = cwdDecision.outcome === "allow" && cwdDecision.authority === "workspace";
+		if (!cwdIsWorkspace || commandNeedsGenericExternalCapability(command, tokens, cwd, env)) {
 			assertBashCommandCapability(session, command);
 		}
 	}
