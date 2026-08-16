@@ -399,8 +399,11 @@ describe("BashTool session capabilities", () => {
 				"gh pr create --base= --head owner:branch --title title --body body",
 				"gh pr create --base main --head owner:branch",
 				"gh pr create --base main --head owner:branch --title=",
+				"gh pr create --base main --head owner:branch --title title",
 				"gh pr create --base main --head owner:branch --title title --body 'Depends-On: #123'",
 				"gh pr create --base main --head owner:branch --title title -b 'Merge-After: 2099-01-01'",
+				"gh pr create --base main --head owner:branch --title title --body ' '",
+				"gh pr create --base main --head owner:branch --title title --body '' --body ''",
 				"gh pr create --base main --head owner:branch --title title --body-file body.md",
 				"gh pr create --base main --head owner:branch --title title -F body.md",
 				"gh pr create --base main --head owner:branch --title title --template pull_request.md",
@@ -489,14 +492,19 @@ describe("BashTool session capabilities", () => {
 				session(workspace, new SessionCapabilities({ workspace, externalCapabilities: ["github.pr"] })),
 			);
 			for (const command of [
-				"gh pr create --base main --head owner:branch --title title",
-				"gh pr create --base=main --head=owner:branch --title=title",
-				"gh pr create -B main -H owner:branch -t title",
+				"gh pr create --base main --head owner:branch --title title --body ''",
+				"gh pr create --base=main --head=owner:branch --title=title --body=",
+				'gh pr create -B main -H owner:branch -t title -b ""',
 				"gh pr edit 123 --title title",
 				"gh pr review 123 --approve",
 				"gh pr review 123 --request-changes --body body",
 			]) {
-				expect(await tool.execute(`allowed-${command}`, { command })).toBeDefined();
+				const result = await tool.execute(`allowed-${command}`, { command });
+				expect(result).toBeDefined();
+				if (command.includes("pr create")) {
+					const output = result.content.map(item => (item.type === "text" ? item.text : "")).join("\n");
+					expect(output).not.toContain("must provide --title and --body");
+				}
 			}
 		} finally {
 			await removeWithRetries(workspace);

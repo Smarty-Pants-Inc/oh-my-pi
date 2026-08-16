@@ -1,5 +1,14 @@
 import { describe, expect, it } from "bun:test";
-import { extractLeadingCdTarget } from "@oh-my-pi/pi-coding-agent/tools/shell-tokenize";
+import { extractLeadingCdTarget, tokenizeShellSegments } from "@oh-my-pi/pi-coding-agent/tools/shell-tokenize";
+
+describe("tokenizeShellSegments", () => {
+	it("preserves empty quoted arguments", () => {
+		expect(tokenizeShellSegments("gh pr create --body '' --title x")).toEqual([
+			["gh", "pr", "create", "--body", "", "--title", "x"],
+		]);
+		expect(tokenizeShellSegments('gh pr create -b "" -t x')).toEqual([["gh", "pr", "create", "-b", "", "-t", "x"]]);
+	});
+});
 
 describe("extractLeadingCdTarget", () => {
 	it("extracts a bare cd target and returns the remainder", () => {

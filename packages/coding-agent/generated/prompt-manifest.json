@@ -9038,7 +9038,7 @@
     },
     {
       "path": "packages/coding-agent/src/tools/bash.ts",
-      "sha256": "1a21955aff8a2b624ec6e03f76ef1336ef01fc15ba85860073b6c65b977b2761"
+      "sha256": "571046daaa3c82645ae57c38810f5944b893fefa0f22e1dcc00a1e5139f5b258"
     },
     {
       "path": "packages/coding-agent/src/tools/browser.ts",
@@ -9454,7 +9454,7 @@
     },
     {
       "path": "packages/coding-agent/src/tools/shell-tokenize.ts",
-      "sha256": "e004f437c85cc2c76db3b892f76189252c0d426494d12a817a45f4e8ef91a8f4"
+      "sha256": "b566a8a0e22d4ee07c3fa651bd83acaa271f1055cfef068a58aef6778f8c4a3d"
     },
     {
       "path": "packages/coding-agent/src/tools/sqlite-reader.ts",
@@ -10702,5 +10702,5 @@
     }
   ],
   "behaviorSha256": "0feede855f6d4a90131d3a02399acbc91464a432f9189e39082fd75f502a1194",
-  "rootSha256": "15e5d2096ec5f0785664bf06c59c1399f6a033c1820ff3a0797ab11266f49593"
+  "rootSha256": "2643eb9e690a81be9db9ed71a544d3754fa527b07354ae5d7f9a737030b81bec"
 }

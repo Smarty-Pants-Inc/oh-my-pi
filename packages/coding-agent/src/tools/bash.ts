@@ -172,6 +172,7 @@ const BASH_GITHUB_PR_OPTION_GRAMMARS = new Map<string, GithubPrOptionGrammar>([
 			value: new Set([
 				"--assignee",
 				"--base",
+				"--body",
 				"--head",
 				"--label",
 				"--milestone",
@@ -180,6 +181,7 @@ const BASH_GITHUB_PR_OPTION_GRAMMARS = new Map<string, GithubPrOptionGrammar>([
 				"--title",
 				"-a",
 				"-B",
+				"-b",
 				"-H",
 				"-l",
 				"-m",
@@ -539,6 +541,7 @@ function githubPrArgsAreAllowed(args: readonly string[]): boolean {
 	let optionsEnded = false;
 	let explicitCreateHead = false;
 	let explicitCreateBase = false;
+	let explicitCreateEmptyBody = false;
 	let explicitCreateTitle = false;
 	let explicitReviewAction = false;
 	for (let index = 2; index < args.length; index++) {
@@ -561,6 +564,10 @@ function githubPrArgsAreAllowed(args: readonly string[]): boolean {
 		if (grammar.value.has(arg) || arg === "-R" || arg === "--repo") {
 			if (index + 1 >= args.length) return false;
 			const value = args[index + 1]!;
+			if (args[1] === "create" && (arg === "-b" || arg === "--body")) {
+				if (value !== "" || explicitCreateEmptyBody) return false;
+				explicitCreateEmptyBody = true;
+			}
 			if ((arg === "-H" || arg === "--head") && value.length > 0) explicitCreateHead = true;
 			if (args[1] === "create" && (arg === "-t" || arg === "--title") && value.length > 0) {
 				explicitCreateTitle = true;
@@ -577,6 +584,10 @@ function githubPrArgsAreAllowed(args: readonly string[]): boolean {
 		if (equalsIndex > 2) {
 			const option = arg.slice(0, equalsIndex);
 			if (grammar.value.has(option) || option === "--repo") {
+				if (args[1] === "create" && option === "--body") {
+					if (arg.slice(equalsIndex + 1) !== "" || explicitCreateEmptyBody) return false;
+					explicitCreateEmptyBody = true;
+				}
 				if (option === "--head" && arg.slice(equalsIndex + 1).length > 0) explicitCreateHead = true;
 				if (args[1] === "create" && option === "--title" && arg.slice(equalsIndex + 1).length > 0) {
 					explicitCreateTitle = true;
@@ -591,7 +602,9 @@ function githubPrArgsAreAllowed(args: readonly string[]): boolean {
 		return false;
 	}
 	// GitHub documents that an explicit head skips gh's branch push/fork path.
-	if (args[1] === "create") return explicitCreateHead && explicitCreateBase && explicitCreateTitle;
+	if (args[1] === "create") {
+		return explicitCreateHead && explicitCreateBase && explicitCreateTitle && explicitCreateEmptyBody;
+	}
 	if (args[1] === "review") return explicitReviewAction;
 	return true;
 }
