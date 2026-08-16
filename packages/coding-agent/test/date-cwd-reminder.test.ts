@@ -5,6 +5,7 @@ import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream"
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { renderInstruction } from "@oh-my-pi/pi-coding-agent/context/registry";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { renderDateCwdReminder } from "@oh-my-pi/pi-coding-agent/session/date-cwd-reminder";
@@ -71,6 +72,25 @@ describe("date-cwd reminder on the provider wire", () => {
 		const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
 		authStorage.setRuntimeApiKey(model.provider, "test-key");
 		const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
+		const subagentInstructions = [
+			renderInstruction(
+				"subagent.base",
+				{
+					agent: "Complete the exact delegated slice.",
+					context: "",
+					planReference: "",
+					planReferencePath: "",
+					operationalRoot: tempDir.path(),
+					worktree: "",
+					outputSchema: undefined,
+					outputSchemaOverridesAgent: false,
+					ircPeers: "",
+					ircSelfId: "",
+				},
+				"subagent",
+			),
+			renderInstruction("subagent-user-prompt", {}, "subagent"),
+		];
 		const { session } = await createAgentSession({
 			cwd: tempDir.path(),
 			agentDir: tempDir.path(),
@@ -82,6 +102,7 @@ describe("date-cwd reminder on the provider wire", () => {
 			disableExtensionDiscovery: true,
 			skills: [],
 			contextFiles: [],
+			contextInstructions: subagentInstructions,
 			promptTemplates: [],
 			slashCommands: [],
 			enableMCP: false,
@@ -122,6 +143,13 @@ describe("date-cwd reminder on the provider wire", () => {
 			expect(firstReminder?.renderedText).toContain("<system-reminder>");
 			expect(firstReminder?.renderedText).toContain(formatLocalCalendarDate());
 			expect(firstReminder?.renderedText).toContain(normalizePromptPath(tempDir.path()));
+			const deliveredSubagentInstructions = contexts[0]!.instructions?.filter(instruction =>
+				instruction.id.startsWith("subagent"),
+			);
+			expect(deliveredSubagentInstructions).toEqual(subagentInstructions);
+			expect(deliveredSubagentInstructions?.every(instruction => instruction.role === "internal_context")).toBe(
+				true,
+			);
 
 			// A second request re-renders the same transient instruction without
 			// rewriting the direct-user transcript.

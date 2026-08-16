@@ -3,6 +3,8 @@
  * during an upstream merge. Callers pass the paths and, when available, the
  * parsed manifests from their own diff reader.
  */
+import { compareUnicodeCodePoints } from "../context/canonical";
+
 export const PROTECTED_SURFACE_DELTA_SCHEMA = "smarty.protected_delta.v1" as const;
 
 export type ProtectedSurface =
@@ -1413,19 +1415,6 @@ function collectSemanticChanges(
 			collectSemanticChanges(previous[index], next[index], appendPath(path, index), scope, changes);
 		}
 	}
-}
-
-function compareUnicodeCodePoints(left: string, right: string): number {
-	let leftIndex = 0;
-	let rightIndex = 0;
-	while (leftIndex < left.length && rightIndex < right.length) {
-		const leftPoint = left.codePointAt(leftIndex)!;
-		const rightPoint = right.codePointAt(rightIndex)!;
-		if (leftPoint !== rightPoint) return leftPoint < rightPoint ? -1 : 1;
-		leftIndex += leftPoint > 0xffff ? 2 : 1;
-		rightIndex += rightPoint > 0xffff ? 2 : 1;
-	}
-	return leftIndex < left.length ? 1 : rightIndex < right.length ? -1 : 0;
 }
 
 function sortedUnique(changes: readonly ProtectedSurfaceChange[]): ProtectedSurfaceChange[] {

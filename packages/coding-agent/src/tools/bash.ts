@@ -88,12 +88,14 @@ const BASH_SAFE_READONLY_COMMANDS = new Set([
 	"printf",
 	"readlink",
 	"realpath",
+	"rg",
 	"stat",
 	"tail",
 	"test",
 	"true",
 	"wc",
 ]);
+const BASH_SAFE_GIT_READ_SUBCOMMANDS = new Set(["diff", "log", "ls-files", "rev-parse", "show", "status"]);
 const BASH_GITHUB_PR_EFFECTS = new Set([
 	"close",
 	"comment",
@@ -357,19 +359,20 @@ function commandIsKnownSafe(tokens: readonly string[]): boolean {
 	if (command === "sed" || command === "perl") {
 		return tokens.slice(commandIndex + 1).some(arg => arg === "-i" || arg.startsWith("-i"));
 	}
+	if (command === "bun") {
+		return tokens.slice(commandIndex + 1).some(arg => arg === "run" || arg === "test");
+	}
 	if (command === "git") {
 		const subcommand = tokens.slice(commandIndex + 1).find(arg => !arg.startsWith("-"));
-		// `diff`, `log`, and `show` accept `--output=<path>` and can invoke
-		// repository-configured textconv processes, so they are not provably read-only.
-		return subcommand !== undefined && new Set(["ls-files", "rev-parse", "status"]).has(subcommand);
+		return subcommand !== undefined && BASH_SAFE_GIT_READ_SUBCOMMANDS.has(subcommand);
 	}
 	return commandHasGitPush(tokens) || commandHasGithubPrEffect(tokens);
 }
 
 function commandNeedsGenericExternalCapability(command: string, tokens: readonly string[]): boolean {
-	// Reinterpreted shell code, compound control flow, and substitutions cannot
-	// prove which executable or paths the shell will ultimately select.
-	if (/[`$]|[;&|()\n\r]/u.test(command)) return true;
+	// Substitutions and nested shell expressions cannot prove which executable or
+	// paths the shell will select. Simple compound segments are checked one by one.
+	if (/[`$()]/u.test(command)) return true;
 	return !commandIsKnownSafe(tokens);
 }
 

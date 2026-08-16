@@ -3,7 +3,7 @@ import * as path from "node:path";
 import { YAML } from "bun";
 import trackedManifestSource from "../../generated/prompt-manifest.json" with { type: "text" };
 import { ref, remote, repo, show, status } from "../utils/git";
-import { canonicalJson, type JsonValue, sha256 } from "./canonical";
+import { canonicalJson, compareUnicodeCodePoints, type JsonValue, sha256 } from "./canonical";
 import { computeImplementationSources } from "./implementation-sources";
 import {
 	behaviorRegistrySource,
@@ -209,7 +209,10 @@ export function parseContentManifest(source: string): ContentManifest {
 		) {
 			throw new Error(`content manifest implementation ${index} has invalid path`);
 		}
-		if (previousImplementationPath !== undefined && previousImplementationPath.localeCompare(entry.path) >= 0) {
+		if (
+			previousImplementationPath !== undefined &&
+			compareUnicodeCodePoints(previousImplementationPath, entry.path) >= 0
+		) {
 			throw new Error("content manifest implementations must be sorted and unique by path");
 		}
 		previousImplementationPath = entry.path;

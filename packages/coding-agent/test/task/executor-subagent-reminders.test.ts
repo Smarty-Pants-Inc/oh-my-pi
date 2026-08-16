@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { AgentBusyError, type AgentTelemetryConfig, type Tracer } from "@oh-my-pi/pi-agent-core";
-import { type AssistantMessage, Effort } from "@oh-my-pi/pi-ai";
+import { type AssistantMessage, Effort, mapContextInstructions } from "@oh-my-pi/pi-ai";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ExtensionActions, LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
@@ -204,7 +204,7 @@ describe("runSubprocess terminal results", () => {
 		expect(createAgentSessionSpy).toHaveBeenCalledTimes(1);
 	});
 
-	it("splices the subagent role prompt before the trailing system section", async () => {
+	it("keeps the delegated objective as user content and sends OMP wrappers as registered internal context", async () => {
 		let userPrompt = "";
 		const session = createMockSession(({ text, emit }) => {
 			userPrompt = text;
@@ -224,22 +224,31 @@ describe("runSubprocess terminal results", () => {
 		await runSubprocess({
 			...baseOptions,
 			id: "subagent-context-system",
-			task: "Your assignment is below.\nBe thorough and complete fully before yielding.\n\nDo the task.",
+			task: "Do the task.",
 		});
 
-		const systemPromptBuilder = createAgentSessionSpy.mock.calls[0]?.[0]?.systemPrompt;
-		expect(systemPromptBuilder).toBeFunction();
-		if (typeof systemPromptBuilder !== "function") throw new Error("Expected system prompt builder");
-		const systemPrompt = systemPromptBuilder(["system", "project", "now"]);
-
-		expect(systemPrompt).toHaveLength(4);
-		expect(systemPrompt?.[0]).toBe("system");
-		expect(systemPrompt?.[1]).toBe("project");
-		expect(systemPrompt?.[2]).toContain(baseAgent.systemPrompt);
+		const options = createAgentSessionSpy.mock.calls[0]?.[0];
+		expect(options?.systemPrompt).toBeUndefined();
+		const instructions = options?.contextInstructions ?? [];
+		expect(instructions.map(instruction => instruction.id)).toEqual(["subagent.base", "subagent-user-prompt"]);
+		expect(instructions.every(instruction => instruction.role === "internal_context")).toBe(true);
+		expect(instructions.every(instruction => instruction.target === "subagent")).toBe(true);
+		expect(instructions.every(instruction => instruction.trigger === "subagent_start")).toBe(true);
+		expect(instructions[0]?.renderedText).toContain(baseAgent.systemPrompt);
+		expect(instructions[1]?.renderedText).toBe(
+			"The user message is the delegated objective. Complete it thoroughly.",
+		);
+		expect(
+			mapContextInstructions(instructions, true).every(instruction => instruction.actualRole === "developer"),
+		).toBe(true);
+		expect(
+			mapContextInstructions(instructions, false).every(instruction => instruction.actualRole === "system"),
+		).toBe(true);
 		// The parent-conversation CONTEXT section is gone: subagents get their
 		// background inside the assignment (or a local:// file), never a dump.
-		expect(systemPrompt?.[2]).not.toMatch(/CONTEXT\n=+/);
-		expect(systemPrompt?.[3]).toBe("now");
+		expect(instructions[0]?.renderedText).not.toMatch(/CONTEXT\n=+/);
+		expect(userPrompt).toBe("Do the task.");
+		expect(userPrompt).not.toContain("The user message is the delegated objective");
 		expect(userPrompt).not.toMatch(/CONTEXT\n=+/);
 	});
 

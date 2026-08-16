@@ -1352,7 +1352,7 @@ prompts:
     order: 1750
   - id: subagent.base
     path: prompts/system/subagent-system-prompt.md
-    role: system
+    role: internal_context
     target: [subagent]
     trigger: subagent_start
     visibility: model
@@ -1360,9 +1360,9 @@ prompts:
     order: 100
   - id: subagent-user-prompt
     path: prompts/system/subagent-user-prompt.md
-    role: system
+    role: internal_context
     target: [subagent]
-    trigger: optional_mode
+    trigger: subagent_start
     visibility: model
     defaultEnabled: false
     order: 1770

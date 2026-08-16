@@ -17,7 +17,7 @@ reported outside this tracked file to avoid a self-referential commit identity.
 | Upstream version | `17.3.5` |
 | Shared merge base | `ffd53ff92a6f575d499730475a73460dd7cc2eea` |
 | Smarty bootstrap main | `f2aa92fc6567df1965295ff68ae592a2ccfd7b88` |
-| Bootstrap tree | `73c050c217d2136db2c49ceeadb916cd05e82b94` |
+| Bootstrap tree | `73c050c2cc8abea755cf63ff85f0e3bc5271f54b` |
 | Accepted donor | `f477ba48dbfb0b24b2f7cdb4f41eea9dc8bc6e63` |
 | Donor tree | `ce82d88b24390f5b39a6850f345bbc81321e6772` |
 
@@ -81,6 +81,10 @@ These patches form a strict dependency chain. Each was reapplied against the
 | User-visible final boundary | Donor could start semantic work for a late async result after the final boundary and could record `started` before dispatch. | Late results persist passively; no post-final provider turn starts; `started` follows successful dispatch. | Automatic-turn authority, async delivery, and lifecycle tests. |
 | Queue-only and mode-exit ownership | Initial reconstruction could wake an idle model and capture a persisted session before mode-exit reconciliation. | Queue-only delivery remains passive; reconciler runs before the first persisted session-file capture while preserving upstream transactional checkpoints. | `4fba4d0ce` focused lifecycle/async suite. |
 | Stable prompt test projection | One donor test rebuilt a model-dependent default prompt and failed against upstream stable prompt behavior. | Test now verifies the stable default path through the shared prompt projection. | `1dabfb254`, 7 focused prompt tests pass. |
+| Loaded-runner lifecycle proof race | The advisor-yield test could enqueue its navigation yield before the loaded extension runner had installed the matching handler, causing a full-fanout-only timeout. | The fixture now enqueues immediately before navigation, after runner installation, without changing production lifecycle behavior. | `cae737ed9`, 650 repeated focused runs and the full runtime chunk pass. |
+| Subagent prompt provenance | The delegated objective was wrapped in OMP text and sent as a normal `role:user` message; the subagent base bypassed registered rendering. | The objective remains direct user content. Both OMP-authored subagent surfaces are registered `internal_context` instructions with exact component provenance and provider-selected developer/system roles. | Hostile executor and final-payload provenance tests. |
+| YOLO workspace commands | The capability classifier treated routine `bun test`, `rg`, `git diff`, and compound checks as external effects. | The existing classifier permits those in-workspace commands while retaining explicit network, destructive-option, external-effect, and out-of-root gates. | Bash session-capability hostile tests. |
+| Implementation-source ordering | Generation and validation used ambient `localeCompare`, so the content root could change or reject across locales. | Generation and validation share the protected-delta Unicode code-point comparator. | Prefix/case/BMP-private-use/astral/duplicate manifest test. |
 
 Upstream prompt changes to rewind reporting and browser close/kill ownership are
 preserved. New date/cwd and checkpoint sources are registered and generated,

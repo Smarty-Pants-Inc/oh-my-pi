@@ -1,5 +1,5 @@
 import * as path from "node:path";
-import { sha256 } from "./canonical";
+import { compareUnicodeCodePoints, sha256 } from "./canonical";
 
 /** Model-visible transforms whose bytes must be present in the protected content root. */
 export const IMPLEMENTATION_SOURCE_GLOBS = [
@@ -881,11 +881,9 @@ export async function computeImplementationSources(
 		}
 	}
 	return await Promise.all(
-		[...paths]
-			.sort((left, right) => left.localeCompare(right))
-			.map(async sourcePath => ({
-				path: sourcePath,
-				sha256: sha256(new Uint8Array(await Bun.file(path.join(repositoryRoot, sourcePath)).arrayBuffer())),
-			})),
+		[...paths].sort(compareUnicodeCodePoints).map(async sourcePath => ({
+			path: sourcePath,
+			sha256: sha256(new Uint8Array(await Bun.file(path.join(repositoryRoot, sourcePath)).arrayBuffer())),
+		})),
 	);
 }

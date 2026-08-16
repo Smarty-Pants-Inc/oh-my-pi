@@ -2115,20 +2115,20 @@
     {
       "id": "subagent-user-prompt",
       "path": "packages/coding-agent/src/prompts/system/subagent-user-prompt.md",
-      "role": "system",
+      "role": "internal_context",
       "target": [
         "subagent"
       ],
-      "trigger": "optional_mode",
+      "trigger": "subagent_start",
       "visibility": "model",
       "defaultEnabled": false,
       "order": 1770,
-      "sha256": "3e2a179deac12ccb533db20984f8483a57f969608ad9dc6ed8267c140a677129"
+      "sha256": "7a00977eda8c35bf05e5f6792f459eb56647bd7a8a2d81f00a520e98e30a3972"
     },
     {
       "id": "subagent.base",
       "path": "packages/coding-agent/src/prompts/system/subagent-system-prompt.md",
-      "role": "system",
+      "role": "internal_context",
       "target": [
         "subagent"
       ],
@@ -3557,12 +3557,12 @@
       "sha256": "491e040ddab699f0ef8756a67b1ab62d6793951854a56c86c890b72d66091924"
     },
     {
-      "path": "crates/pi-natives/src/glob_util.rs",
-      "sha256": "0275454b6d2b033cb2d774ee64310694af5a5f379fb6007287e05c9d7aeaf743"
-    },
-    {
       "path": "crates/pi-natives/src/glob.rs",
       "sha256": "df7796089e26b51390367acae6e6d4883d926ccfd9a28224d606911354d930c5"
+    },
+    {
+      "path": "crates/pi-natives/src/glob_util.rs",
+      "sha256": "0275454b6d2b033cb2d774ee64310694af5a5f379fb6007287e05c9d7aeaf743"
     },
     {
       "path": "crates/pi-natives/src/grep.rs",
@@ -4093,6 +4093,10 @@
       "sha256": "7a2734b775a52b63fa8a311a0a9eae10c3f8856d855094f20ff5fa4e6d666f49"
     },
     {
+      "path": "docs/ERRATA-GPT5-HARMONY.md",
+      "sha256": "7d54e2245b850844433a97177e4aa66e9bff3112b13933ccc376b270985184fa"
+    },
+    {
       "path": "docs/adding-a-provider.md",
       "sha256": "b627fb189f72ca9f89b622e28f6da08b5d0526086b2616afd1bd1e58e50f027b"
     },
@@ -4151,10 +4155,6 @@
     {
       "path": "docs/environment-variables.md",
       "sha256": "86aa140a3cfd63e8b0790e5db5c8ea91c71a9cbc4b2cf37696b189b923a945c3"
-    },
-    {
-      "path": "docs/ERRATA-GPT5-HARMONY.md",
-      "sha256": "7d54e2245b850844433a97177e4aa66e9bff3112b13933ccc376b270985184fa"
     },
     {
       "path": "docs/extension-loading.md",
@@ -6830,7 +6830,7 @@
     },
     {
       "path": "packages/coding-agent/src/context/canonical.ts",
-      "sha256": "efcab14d7671a72a3ec2ac2d7b371b0d7e0eb1690982eb4cf427008b99db57a5"
+      "sha256": "c3a3db346754c99f92f858f53a2888d669ef47b6b6a4550da5798e82fd8ff5dd"
     },
     {
       "path": "packages/coding-agent/src/context/explain.ts",
@@ -6838,11 +6838,11 @@
     },
     {
       "path": "packages/coding-agent/src/context/implementation-sources.ts",
-      "sha256": "d17d25c9e2d10e68baec653a68a78ab0559bb3f1942aff2b4c1efef62c59b0c5"
+      "sha256": "be84060c81c6ce50c9cc48748a2ef4b7c683f13a1415f916f73433628c318f87"
     },
     {
       "path": "packages/coding-agent/src/context/manifest.ts",
-      "sha256": "191337f58f20989a5afb395e4d9081bc89c5d8191ec66ee71b67c99987bb0104"
+      "sha256": "df7aa16cd78a45aab7fb6f973c4fb8ce21b3014037fcbfedc265e4eb938e70fc"
     },
     {
       "path": "packages/coding-agent/src/context/prompt-sources.generated.ts",
@@ -8330,7 +8330,7 @@
     },
     {
       "path": "packages/coding-agent/src/prompt-registry.yml",
-      "sha256": "a0bc462b367956dc90004d78973fd10d0ba39b7f2b67326a193be0311986a6cc"
+      "sha256": "fb2f35dad39ba73719cc3897e3b6c4a40354065c74a4d88873eaf194b756e522"
     },
     {
       "path": "packages/coding-agent/src/registry/agent-lifecycle.ts",
@@ -8346,7 +8346,7 @@
     },
     {
       "path": "packages/coding-agent/src/sdk.ts",
-      "sha256": "289f68ea7c0bba1dc77161e1df4e2c8ea146cf288050521bee01fe108efd201f"
+      "sha256": "297e63a0fca86ec8674c28fae59fb293df9e2e10e61fe1ffa4bfb2bf142a9c14"
     },
     {
       "path": "packages/coding-agent/src/secrets/index.ts",
@@ -8878,11 +8878,11 @@
     },
     {
       "path": "packages/coding-agent/src/task/executor.ts",
-      "sha256": "5099f44be1e65387c10c66a9d147049981049c0863ac99d93b3073d70ec74e9b"
+      "sha256": "0efa0f2306f5cedde93816c0bcda7f608389ef5f75113ba29d85ea65768fa145"
     },
     {
       "path": "packages/coding-agent/src/task/index.ts",
-      "sha256": "d4934593144f98caee4d470ad778e426e2b80b7e60ea4bd9fd4844f2d3f1a246"
+      "sha256": "b9c5f0655d3ef319abfc7000dcf6c20239ad2f11892261e71bf8ac43b70d27af"
     },
     {
       "path": "packages/coding-agent/src/task/isolation-ownership.ts",
@@ -8946,7 +8946,7 @@
     },
     {
       "path": "packages/coding-agent/src/task/structured-subagent.ts",
-      "sha256": "cc8c6b47c7d95eaaaab816b925be1892a9b2bd614c9b414a435364dd33823abf"
+      "sha256": "cf01156ae03d469fcc8fafc4e3f6da6d46bdff3259721e74c1450aaaf23fabea"
     },
     {
       "path": "packages/coding-agent/src/task/subprocess-tool-registry.ts",
@@ -9038,7 +9038,7 @@
     },
     {
       "path": "packages/coding-agent/src/tools/bash.ts",
-      "sha256": "5ae7ace32fcb7e75aaa38050af3c023113bcd70621aeed3777381f647b6ce188"
+      "sha256": "1d1d31be72bccb25e52803270aad96c959a0321cc254e704eacb324094cb0454"
     },
     {
       "path": "packages/coding-agent/src/tools/browser.ts",
@@ -10702,5 +10702,5 @@
     }
   ],
   "behaviorSha256": "0feede855f6d4a90131d3a02399acbc91464a432f9189e39082fd75f502a1194",
-  "rootSha256": "5b621c24daa8036cba7c9ed6ba11795e7fdef8d409ab3940325b028591b602ed"
+  "rootSha256": "60cef3b20f4a6b33525f4adf67be13da9591f7c5a861cdc4118ce13cbfa814fb"
 }

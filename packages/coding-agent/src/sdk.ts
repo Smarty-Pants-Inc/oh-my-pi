@@ -511,6 +511,8 @@ export interface CreateAgentSessionOptions {
 	rules?: Rule[];
 	/** Context files (AGENTS.md content). Default: discovered walking up from cwd */
 	contextFiles?: Array<{ path: string; content: string }>;
+	/** Fresh registered instructions delivered outside persisted user messages. */
+	contextInstructions?: readonly ContextInstruction[];
 	/** Pre-built workspace tree (skips re-scanning; passed by parents to subagents). */
 	workspaceTree?: WorkspaceTree;
 	/** Prompt templates. Default: discovered from cwd/.omp/prompts/ + agentDir/prompts/ */
@@ -3284,7 +3286,10 @@ async function createAgentSessionScoped(
 			if (executionEnvironment && context.systemPrompt) {
 				assertExecutionEnvironmentSystemPrompt(executionEnvironment, context.systemPrompt);
 			}
-			const registeredInstructions = session?.buildProviderContextInstructions() ?? [];
+			const registeredInstructions = [
+				...(options.contextInstructions ?? []),
+				...(session?.buildProviderContextInstructions() ?? []),
+			];
 			if (context.systemPrompt?.length) {
 				const promptCwd = normalizePromptPath(
 					executionEnvironment ? mapExecutionEnvironmentPath(executionEnvironment, ".") : sessionManager.getCwd(),

@@ -284,10 +284,10 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		expect(forwarded?.parentEvalSessionId).toBeUndefined();
 		expect(getTools).not.toHaveBeenCalled();
 
-		const systemPrompt = forwarded?.systemPrompt;
-		if (typeof systemPrompt !== "function") throw new Error("Expected a subagent system prompt renderer");
-		const rendered = systemPrompt(["default prompt"]);
-		const promptText = typeof rendered === "string" ? rendered : rendered.join("\n\n");
+		const promptText = forwarded?.contextInstructions?.find(
+			instruction => instruction.id === "subagent.base",
+		)?.renderedText;
+		if (!promptText) throw new Error("Expected a registered subagent base instruction");
 		expect(promptText).toContain("/workspace");
 		expect(promptText).toContain("/workspace/PLAN.md");
 		expect(forwarded?.settings?.get("bash.enabled")).toBe(true);

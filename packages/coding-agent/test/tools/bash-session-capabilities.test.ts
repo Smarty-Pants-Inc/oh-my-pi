@@ -171,6 +171,27 @@ describe("BashTool session capabilities", () => {
 		}
 	});
 
+	it("allows routine workspace reads, tests, and compound checks under yolo", async () => {
+		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "bash-cap-routine-"));
+		try {
+			const init = Bun.spawnSync(["git", "init", "--quiet"], { cwd: workspace, stderr: "pipe" });
+			expect(init.exitCode, init.stderr.toString()).toBe(0);
+			const tool = new BashTool(session(workspace, new SessionCapabilities({ workspace })));
+
+			expect(await tool.execute("routine-rg", { command: "rg --version" })).toBeDefined();
+			expect(await tool.execute("routine-test", { command: "bun test --help" })).toBeDefined();
+			expect(await tool.execute("routine-git-diff", { command: "git diff --check" })).toBeDefined();
+			expect(await tool.execute("routine-git-log", { command: "git log --oneline -1" })).toBeDefined();
+			expect(
+				await tool.execute("routine-compound", {
+					command: "bun test --help >.bun-test-help && rg --version | head -n 1",
+				}),
+			).toBeDefined();
+		} finally {
+			await removeWithRetries(workspace);
+		}
+	});
+
 	it("enforces capability checks before the execution-environment backend", async () => {
 		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "bash-cap-environment-"));
 		try {

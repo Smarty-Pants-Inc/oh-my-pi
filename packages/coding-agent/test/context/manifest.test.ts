@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getDefault } from "../../src/config/settings-schema";
-import { canonicalJson, type JsonValue, sha256 } from "../../src/context/canonical";
+import { canonicalJson, compareUnicodeCodePoints, type JsonValue, sha256 } from "../../src/context/canonical";
 import {
 	computeImplementationSources,
 	runtimeImportSpecifiersForImplementationSource,
@@ -478,17 +478,31 @@ describe("tracked context manifest", () => {
 		}
 	});
 
-	it("requires normalized localeCompare-sorted implementation paths", () => {
+	it("requires normalized Unicode code-point-sorted implementation paths", () => {
 		const manifest = trackedContentManifest();
-		const nonAscii = [
-			{ path: "packages/agent/src/compaction/é.ts", sha256: "a".repeat(64) },
-			{ path: "packages/agent/src/compaction/z.ts", sha256: "b".repeat(64) },
-		].sort((left, right) => left.path.localeCompare(right.path));
+		const hostile = [
+			"packages/agent/src/compaction/prefix.ts",
+			"packages/agent/src/compaction/prefix/a.ts",
+			"packages/agent/src/compaction/A.ts",
+			"packages/agent/src/compaction/a.ts",
+			"packages/agent/src/compaction/\u{e000}.ts",
+			"packages/agent/src/compaction/\u{1f600}.ts",
+		]
+			.sort(compareUnicodeCodePoints)
+			.map((sourcePath, index) => ({ path: sourcePath, sha256: index.toString(16).padStart(64, "0") }));
+		const validPayload = { ...manifest, implementationSources: hostile };
+		const { rootSha256: _validRoot, ...validWithoutRoot } = validPayload;
+		expect(
+			parseContentManifest(
+				JSON.stringify({
+					...validWithoutRoot,
+					rootSha256: sha256(canonicalJson(validWithoutRoot as unknown as JsonValue)),
+				}),
+			).implementationSources,
+		).toEqual(hostile);
 		const invalidPaths = [
 			[],
-			[...manifest.implementationSources, ...nonAscii]
-				.sort((left, right) => left.path.localeCompare(right.path))
-				.reverse(),
+			[...hostile].reverse(),
 			[{ path: "packages/agent/./src/compaction/x.ts", sha256: "c".repeat(64) }],
 			[{ path: "packages/agent/src/compaction/x.ts", sha256: "C".repeat(64) }],
 			[
