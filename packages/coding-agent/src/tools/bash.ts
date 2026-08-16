@@ -11,6 +11,7 @@ import type {
 import type { Component } from "@oh-my-pi/pi-tui";
 import { ImageProtocol, TERMINAL } from "@oh-my-pi/pi-tui";
 import { getProjectDir, isEnoent, logger, prompt } from "@oh-my-pi/pi-utils";
+import { $which } from "@oh-my-pi/pi-utils/which";
 import { canonicalPath } from "../capability/session-capabilities";
 import type { Settings } from "../config/settings";
 import { applyDirenvPreflight, type BashResult, executeBash } from "../exec/bash-executor";
@@ -172,6 +173,55 @@ const BASH_GITHUB_PR_EFFECTS = new Set([
 	"unlock",
 	"update-branch",
 ]);
+const BASH_NAMED_EFFECT_ENV = new Set([
+	"GH_ENTERPRISE_TOKEN",
+	"GH_HOST",
+	"GH_TOKEN",
+	"GITHUB_ENTERPRISE_TOKEN",
+	"GITHUB_TOKEN",
+	"LANG",
+	"LC_ALL",
+	"LC_CTYPE",
+	"NO_COLOR",
+	"SSH_AUTH_SOCK",
+	"TERM",
+	"TMPDIR",
+]);
+const BASH_GIT_PUSH_BOOLEAN_OPTIONS = new Set([
+	"--all",
+	"--atomic",
+	"--delete",
+	"--dry-run",
+	"--follow-tags",
+	"--force",
+	"--force-if-includes",
+	"--force-with-lease",
+	"--ipv4",
+	"--ipv6",
+	"--mirror",
+	"--no-verify",
+	"--porcelain",
+	"--prune",
+	"--quiet",
+	"--set-upstream",
+	"--tags",
+	"--thin",
+	"--verbose",
+	"-d",
+	"-f",
+	"-n",
+	"-q",
+	"-u",
+	"-v",
+]);
+const BASH_GIT_PUSH_VALUE_OPTIONS = new Set(["--push-option", "-o"]);
+
+interface NamedBashEffect {
+	capability: "git.push" | "github.pr";
+	executable: string;
+	args: string[];
+	env: Record<string, string>;
+}
 
 function hasBashApprovalShellControl(command: string): boolean {
 	let quote: "'" | '"' | undefined;
@@ -411,38 +461,115 @@ function hasExecutableEnvironmentOverride(env: Record<string, string> | undefine
 	return Boolean(env && Object.keys(env).some(executableEnvironmentOverrideName));
 }
 
-function effectCommandIndex(tokens: readonly string[], env: Record<string, string> | undefined): number | undefined {
-	const gitIndex = shellCommandIndex(tokens);
-	if (gitIndex === undefined || hasExecutableEnvironmentOverride(env)) return undefined;
-	for (const token of tokens.slice(0, gitIndex)) {
-		const name = token.slice(0, token.indexOf("="));
-		if (executableEnvironmentOverrideName(name)) return undefined;
+function gitPushArgsAreAllowed(args: readonly string[]): boolean {
+	if (args[0] !== "push") return false;
+	let optionsEnded = false;
+	for (let index = 1; index < args.length; index++) {
+		const arg = args[index]!;
+		if (optionsEnded || !arg.startsWith("-")) continue;
+		if (arg === "--") {
+			optionsEnded = true;
+			continue;
+		}
+		if (BASH_GIT_PUSH_BOOLEAN_OPTIONS.has(arg)) continue;
+		if (BASH_GIT_PUSH_VALUE_OPTIONS.has(arg)) {
+			if (index + 1 >= args.length) return false;
+			index++;
+			continue;
+		}
+		if (arg.startsWith("--push-option=")) continue;
+		if (arg.startsWith("--force-with-lease=")) continue;
+		if (/^--recurse-submodules=(?:check|no|on-demand|only)$/u.test(arg)) continue;
+		return false;
 	}
-	return gitIndex;
+	return true;
 }
 
-function commandHasGitPush(tokens: readonly string[], env?: Record<string, string>): boolean {
-	const gitIndex = effectCommandIndex(tokens, env);
-	if (gitIndex === undefined || tokens[gitIndex] !== "git") return false;
-	// A named push grant authorizes the push subcommand, not Git's global
-	// config, repository, cwd, helper, or execution-path overrides.
-	if (tokens[gitIndex + 1] !== "push") return false;
-	return !tokens
-		.slice(gitIndex + 2)
-		.some(
-			arg =>
-				arg === "--exec" ||
-				arg.startsWith("--exec=") ||
-				arg === "--receive-pack" ||
-				arg.startsWith("--receive-pack="),
-		);
+function resolveNamedEffectExecutable(name: "env" | "git" | "gh"): string | undefined {
+	const found = $which(name);
+	if (!found || !path.isAbsolute(found)) return undefined;
+	try {
+		const resolved = fs.realpathSync(found);
+		const stat = fs.statSync(resolved);
+		return stat.isFile() && (stat.mode & 0o111) !== 0 ? resolved : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
-function commandHasGithubPrEffect(tokens: readonly string[], env?: Record<string, string>): boolean {
-	const ghIndex = effectCommandIndex(tokens, env);
-	if (ghIndex === undefined || tokens[ghIndex] !== "gh") return false;
-	const args = tokens.slice(ghIndex + 1).filter(arg => !arg.startsWith("-"));
-	return args[0] === "pr" && BASH_GITHUB_PR_EFFECTS.has(args[1] ?? "");
+function namedEffectEnvironment(
+	tokens: readonly string[],
+	commandIndex: number,
+	env: Record<string, string> | undefined,
+): Record<string, string> | undefined {
+	if (env && Object.keys(env).some(name => !BASH_NAMED_EFFECT_ENV.has(name))) return undefined;
+	const result: Record<string, string> = {};
+	for (const name of BASH_NAMED_EFFECT_ENV) {
+		const value = process.env[name];
+		if (value !== undefined) result[name] = value;
+	}
+	if (env) Object.assign(result, env);
+	for (const token of tokens.slice(0, commandIndex)) {
+		const equalsIndex = token.indexOf("=");
+		const name = token.slice(0, equalsIndex);
+		if (!BASH_NAMED_EFFECT_ENV.has(name)) return undefined;
+		result[name] = token.slice(equalsIndex + 1);
+	}
+	return result;
+}
+
+function parseNamedBashEffect(command: string, env?: Record<string, string>): NamedBashEffect | undefined {
+	if (hasBashApprovalShellControl(command)) return undefined;
+	const segments = tokenizeShellSegments(command);
+	if (segments.length !== 1) return undefined;
+	const tokens = segments[0]!;
+	const commandIndex = shellCommandIndex(tokens);
+	if (commandIndex === undefined) return undefined;
+	const effectEnv = namedEffectEnvironment(tokens, commandIndex, env);
+	if (!effectEnv) return undefined;
+
+	const commandName = tokens[commandIndex];
+	const args = tokens.slice(commandIndex + 1);
+	if (commandName === "git" && gitPushArgsAreAllowed(args)) {
+		const executable = resolveNamedEffectExecutable("git");
+		return executable ? { capability: "git.push", executable, args, env: effectEnv } : undefined;
+	}
+	if (
+		commandName === "gh" &&
+		args[0] === "pr" &&
+		BASH_GITHUB_PR_EFFECTS.has(args[1] ?? "") &&
+		!args.some(arg => arg === "--editor" || arg === "--web")
+	) {
+		const executable = resolveNamedEffectExecutable("gh");
+		return executable ? { capability: "github.pr", executable, args, env: effectEnv } : undefined;
+	}
+	return undefined;
+}
+
+function shellQuoteLiteral(value: string): string {
+	return `'${value.replace(/'/gu, `'\\''`)}'`;
+}
+
+function buildSterileNamedEffectCommand(effect: NamedBashEffect): string | undefined {
+	const envExecutable = resolveNamedEffectExecutable("env");
+	if (!envExecutable) return undefined;
+	const trustedPath = Array.from(
+		new Set([path.dirname(effect.executable), "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]),
+	).join(path.delimiter);
+	const forwardedEnv = Object.keys(effect.env)
+		.sort()
+		.map(name => `${name}="$${name}"`);
+	return [
+		shellQuoteLiteral(envExecutable),
+		"-i",
+		shellQuoteLiteral(`PATH=${trustedPath}`),
+		shellQuoteLiteral("GIT_CONFIG_NOSYSTEM=1"),
+		shellQuoteLiteral("GIT_TERMINAL_PROMPT=0"),
+		shellQuoteLiteral("GH_PROMPT_DISABLED=1"),
+		...forwardedEnv,
+		shellQuoteLiteral(effect.executable),
+		...effect.args.map(shellQuoteLiteral),
+	].join(" ");
 }
 
 function isCanonicalPathContained(root: string, target: string): boolean {
@@ -617,8 +744,8 @@ function commandIsKnownSafe(tokens: readonly string[], cwd: string, env: Record<
 		return tokens.slice(commandIndex + 1).some(arg => arg === "-i" || arg.startsWith("-i"));
 	}
 	if (command === "bun") return bunCommandIsKnownSafe(tokens, commandIndex, cwd, env);
-	if (command === "git") return gitCommandIsKnownSafe(tokens, commandIndex, env) || commandHasGitPush(tokens, env);
-	return commandHasGitPush(tokens, env) || commandHasGithubPrEffect(tokens, env);
+	if (command === "git") return gitCommandIsKnownSafe(tokens, commandIndex, env);
+	return false;
 }
 
 function commandNeedsGenericExternalCapability(
@@ -690,23 +817,21 @@ function assertBashCapabilities(
 	command: string,
 	cwd: string,
 	env: Record<string, string> | undefined,
-): void {
-	if (!session.capabilities) return;
+	allowNamedEffects = true,
+): NamedBashEffect | undefined {
+	if (!session.capabilities) return undefined;
+	const namedEffect = allowNamedEffects ? parseNamedBashEffect(command, env) : undefined;
 	for (const target of bashCommandWriteTargets(command)) {
 		assertBashWriteCapability(session, target, cwd, env);
 	}
+	if (namedEffect) assertBashExternalCapability(session, namedEffect.capability);
 	for (const tokens of tokenizeShellSegments(command)) {
-		if (commandHasGitPush(tokens, env)) {
-			assertBashExternalCapability(session, "git.push");
-		}
-		if (commandHasGithubPrEffect(tokens, env)) {
-			assertBashExternalCapability(session, "github.pr");
-		}
 		const cwdIsWorkspace = isCurrentWorkspacePath(session, cwd);
-		if (!cwdIsWorkspace || commandNeedsGenericExternalCapability(command, tokens, cwd, env)) {
+		if (!cwdIsWorkspace || (!namedEffect && commandNeedsGenericExternalCapability(command, tokens, cwd, env))) {
 			assertBashCommandCapability(session, command);
 		}
 	}
+	return namedEffect;
 }
 
 const BASH_PATTERN_APPROVAL_VALUES = new Set(["allow", "deny", "prompt"]);
@@ -1721,6 +1846,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 	#startManagedBashJob(options: {
 		command: string;
 		commandCwd: string;
+		sterile?: boolean;
 		timeoutMs: number | undefined;
 		timeoutSec: number | undefined;
 		requestedTimeoutSec?: number;
@@ -1751,10 +1877,11 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 					const wallTimeStart = performance.now();
 					const result = await executeBash(options.command, {
 						cwd: options.commandCwd,
-						sessionKey: `${this.session.getSessionId?.() ?? ""}:async:${jobId}`,
+						sessionKey: `${this.session.getSessionId?.() ?? ""}:async:${jobId}${options.sterile ? ":sterile" : ""}`,
 						timeout: options.timeoutMs ?? 0,
 						signal: runSignal,
 						env: options.resolvedEnv,
+						sterile: options.sterile,
 						artifactPath,
 						artifactId,
 						onChunk: chunk => {
@@ -1995,7 +2122,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 
 		// This sits inside the tool, rather than the approval wrapper, so yolo
 		// and every execution backend retain the same session authority boundary.
-		assertBashCapabilities(this.session, rawCommand, this.session.cwd, env);
+		assertBashCapabilities(this.session, rawCommand, this.session.cwd, env, !executionEnvironment);
 
 		if (executionEnvironment) {
 			return this.#executeInEnvironment({
@@ -2021,7 +2148,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			},
 		};
 		command = await expandInternalUrls(command, { ...internalUrlOptions, ensureLocalParentDirs: true });
-		const resolvedEnv = env
+		let resolvedEnv = env
 			? Object.fromEntries(
 					await Promise.all(
 						Object.entries(env).map(async ([key, value]) => [
@@ -2050,7 +2177,17 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		const commandCwd = cwd ? resolveToCwd(cwd, this.session.cwd) : this.session.cwd;
 		// Internal URL expansion can replace a literal path, so validate the
 		// command that the local, PTY, and ACP backends will actually receive.
-		assertBashCapabilities(this.session, command, commandCwd, resolvedEnv);
+		const namedEffect = assertBashCapabilities(this.session, command, commandCwd, resolvedEnv);
+		let sterileNamedEffect = false;
+		if (namedEffect) {
+			const sterileCommand = buildSterileNamedEffectCommand(namedEffect);
+			if (!sterileCommand) assertBashCommandCapability(this.session, command);
+			else {
+				command = sterileCommand;
+				resolvedEnv = namedEffect.env;
+				sterileNamedEffect = true;
+			}
+		}
 		let cwdStat: fs.Stats;
 		try {
 			cwdStat = await fs.promises.stat(commandCwd);
@@ -2084,6 +2221,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			const job = this.#startManagedBashJob({
 				command,
 				commandCwd,
+				sterile: sterileNamedEffect,
 				timeoutMs,
 				timeoutSec,
 				requestedTimeoutSec,
@@ -2104,7 +2242,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		// auto-background would otherwise silently disable the terminal route).
 		const clientBridge = this.session.getClientBridge?.();
 		const bridgeTerminalAvailable = Boolean(
-			clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty,
+			clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty && !sterileNamedEffect,
 		);
 
 		const autoBgManager = this.session.asyncJobManager;
@@ -2122,6 +2260,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			const job = this.#startManagedBashJob({
 				command,
 				commandCwd,
+				sterile: sterileNamedEffect,
 				timeoutMs,
 				timeoutSec,
 				requestedTimeoutSec,
@@ -2182,8 +2321,8 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		// (the backend's own timeout is installed only after this await), matching
 		// the executeBash branch so a cold `.envrc` can't outlast a short call.
 		const backendPreflight =
-			(clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty) ||
-			canUseInteractiveBashPty(pty, ctx)
+			(clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty && !sterileNamedEffect) ||
+			(!sterileNamedEffect && canUseInteractiveBashPty(pty, ctx))
 				? await applyDirenvPreflight(command, commandCwd, {
 						callerEnv: resolvedEnv,
 						signal,
@@ -2196,7 +2335,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		// Route through the client terminal when the client advertises the terminal capability.
 		// Skip when pty=true (PTY needs the local terminal UI). ACP keeps its shell
 		// wrapping, direnv preflight, live terminal details, and best-effort cleanup.
-		if (clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty) {
+		if (clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty && !sterileNamedEffect) {
 			const bridgeCommand = backendPreflight?.command ?? command;
 			const bridgeEnv = backendPreflight?.env ?? resolvedEnv;
 			const shellSpawn = wrapShellLineForClientTerminal(bridgeCommand, this.session.settings.getShellConfig());
@@ -2247,7 +2386,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		const artifact = (await this.session.allocateOutputArtifact?.("bash")) ?? {};
 		const { path: artifactPath, id: artifactId } = artifact;
 
-		const interactiveUi = canUseInteractiveBashPty(pty, ctx) ? ctx?.ui : undefined;
+		const interactiveUi = !sterileNamedEffect && canUseInteractiveBashPty(pty, ctx) ? ctx?.ui : undefined;
 		if (pty && !interactiveUi) {
 			pendingNotices.push("pty requested but unavailable in this environment; ran without a terminal");
 		}
@@ -2272,10 +2411,11 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 					// applied twice.
 					await executeBash(command, {
 						cwd: commandCwd,
-						sessionKey: this.session.getSessionId?.() ?? undefined,
+						sessionKey: `${this.session.getSessionId?.() ?? ""}${sterileNamedEffect ? ":sterile" : ""}`,
 						timeout: timeoutMs ?? 0,
 						signal,
 						env: resolvedEnv,
+						sterile: sterileNamedEffect,
 						artifactPath,
 						artifactId,
 						onChunk: streamTailUpdates(tailBuffer, onUpdate),

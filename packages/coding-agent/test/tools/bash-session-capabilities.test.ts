@@ -314,7 +314,13 @@ describe("BashTool session capabilities", () => {
 				"git push --exec ./payload local-repo",
 				"git push --receive-pack=./payload local-repo",
 				"git push --receive-pack ./payload local-repo",
+				"git push --exe=./payload local-repo",
+				"git push --receive-p=./payload local-repo",
+				"git push --unknown-safe-looking origin main",
 				"git push --exec=./payload local-repo && echo never",
+				"git push --dry-run > push.log",
+				"git push --dry-run $(touch substituted)",
+				"git push --dry-run `touch substituted`",
 				`PATH=${attacker} git push`,
 				`PATH=${attacker} gh pr create`,
 				`HOME=${attacker} git push`,
@@ -322,6 +328,14 @@ describe("BashTool session capabilities", () => {
 				`EDITOR=${path.join(attacker, "editor")} gh pr create --editor`,
 				`BASH_ENV=${path.join(attacker, "startup")} gh pr create`,
 				`LD_PRELOAD=${path.join(attacker, "loader")} git push`,
+				`LD_AUDIT=${path.join(attacker, "audit")} git push`,
+				`LD_FUTURE_LOADER=${path.join(attacker, "future")} git push`,
+				`DYLD_FRAMEWORK_PATH=${attacker} git push`,
+				`DYLD_FALLBACK_LIBRARY_PATH=${attacker} git push`,
+				`DYLD_INSERT_LIBRARIES=${path.join(attacker, "loader")} git push`,
+				`DYLD_LIBRARY_PATH=${attacker} git push`,
+				`DYLD_ROOT_PATH=${attacker} git push`,
+				`DYLD_FUTURE_LOADER=${attacker} git push`,
 				`env PATH=${attacker} gh pr create`,
 			]) {
 				await expect(tool.execute(`wrapper-${command}`, { command })).rejects.toThrow(
@@ -336,6 +350,14 @@ describe("BashTool session capabilities", () => {
 			const effectEnvironments: Array<Record<string, string>> = [
 				{ BASH_ENV: path.join(attacker, "startup") },
 				{ LD_PRELOAD: path.join(attacker, "loader") },
+				{ LD_AUDIT: path.join(attacker, "audit") },
+				{ LD_FUTURE_LOADER: path.join(attacker, "future") },
+				{ DYLD_FRAMEWORK_PATH: attacker },
+				{ DYLD_FALLBACK_LIBRARY_PATH: attacker },
+				{ DYLD_INSERT_LIBRARIES: path.join(attacker, "loader") },
+				{ DYLD_LIBRARY_PATH: attacker },
+				{ DYLD_ROOT_PATH: attacker },
+				{ DYLD_FUTURE_LOADER: attacker },
 				{ HOME: attacker },
 				{ XDG_CONFIG_HOME: attacker },
 				{ EDITOR: path.join(attacker, "editor") },
@@ -359,6 +381,58 @@ describe("BashTool session capabilities", () => {
 			expect(await Bun.file(sentinel).exists()).toBe(false);
 		} finally {
 			await Promise.all([removeWithRetries(workspace), removeWithRetries(attacker)]);
+		}
+	});
+
+	it("runs admitted Git pushes through the sterile exact executable lane", async () => {
+		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "bash-cap-push-workspace-"));
+		const remote = await fs.mkdtemp(path.join(os.tmpdir(), "bash-cap-push-remote-"));
+		try {
+			for (const result of [
+				Bun.spawnSync(["git", "init", "--quiet"], { cwd: workspace, stderr: "pipe" }),
+				Bun.spawnSync(["git", "init", "--quiet", "--bare"], { cwd: remote, stderr: "pipe" }),
+			]) {
+				expect(result.exitCode, result.stderr.toString()).toBe(0);
+			}
+			await fs.writeFile(path.join(workspace, "tracked.txt"), "tracked\n");
+			for (const args of [
+				["git", "add", "tracked.txt"],
+				[
+					"git",
+					"-c",
+					"user.name=OMP Test",
+					"-c",
+					"user.email=omp@example.invalid",
+					"commit",
+					"--quiet",
+					"-m",
+					"test",
+				],
+			]) {
+				const result = Bun.spawnSync(args, { cwd: workspace, stderr: "pipe" });
+				expect(result.exitCode, result.stderr.toString()).toBe(0);
+			}
+
+			const tool = new BashTool(
+				session(workspace, new SessionCapabilities({ workspace, externalCapabilities: ["git.push"] })),
+			);
+			const dryRun = await tool.execute("sterile-push-dry-run", {
+				command: `LANG=C git push --dry-run ${JSON.stringify(remote)} HEAD:refs/heads/main`,
+			});
+			expect(dryRun.isError).not.toBe(true);
+			expect(
+				Bun.spawnSync(["git", "--git-dir", remote, "show-ref", "--verify", "refs/heads/main"]).exitCode,
+			).not.toBe(0);
+
+			const push = await tool.execute("sterile-push", {
+				command: `git push --porcelain ${JSON.stringify(remote)} HEAD:refs/heads/main`,
+			});
+			expect(push.isError).not.toBe(true);
+			expect(Bun.spawnSync(["git", "--git-dir", remote, "show-ref", "--verify", "refs/heads/main"]).exitCode).toBe(
+				0,
+			);
+		} finally {
+			await Promise.all([removeWithRetries(workspace), removeWithRetries(remote)]);
 		}
 	});
 
@@ -421,31 +495,40 @@ describe("BashTool session capabilities", () => {
 		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "bash-cap-environment-"));
 		try {
 			let terminalCalls = 0;
+			const getExecutionEnvironment = () =>
+				({
+					id: "remote",
+					sourceRoot: workspace,
+					remoteRoot: "/workspace",
+					bridge: {
+						readTextFile: async () => {
+							throw new Error("not reached");
+						},
+						writeTextFile: async () => {
+							throw new Error("not reached");
+						},
+						createTerminal: async () => {
+							terminalCalls++;
+							throw new Error("not reached");
+						},
+					},
+				}) as ExecutionEnvironmentBinding;
 			const tool = new BashTool(
 				session(workspace, new SessionCapabilities({ workspace }), {
-					getExecutionEnvironment: () =>
-						({
-							id: "remote",
-							sourceRoot: workspace,
-							remoteRoot: "/workspace",
-							bridge: {
-								readTextFile: async () => {
-									throw new Error("not reached");
-								},
-								writeTextFile: async () => {
-									throw new Error("not reached");
-								},
-								createTerminal: async () => {
-									terminalCalls++;
-									throw new Error("not reached");
-								},
-							},
-						}) as ExecutionEnvironmentBinding,
+					getExecutionEnvironment,
 				}),
 			);
 
 			await expect(tool.execute("environment-generic", { command: "curl https://example.test" })).rejects.toThrow(
 				"requires explicit session capability 'bash.command:curl https://example.test'",
+			);
+			const namedOnly = new BashTool(
+				session(workspace, new SessionCapabilities({ workspace, externalCapabilities: ["git.push"] }), {
+					getExecutionEnvironment,
+				}),
+			);
+			await expect(namedOnly.execute("environment-named", { command: "git push --dry-run" })).rejects.toThrow(
+				"requires explicit session capability 'bash.command:git push --dry-run'",
 			);
 			expect(terminalCalls).toBe(0);
 		} finally {
@@ -457,22 +540,29 @@ describe("BashTool session capabilities", () => {
 		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "bash-cap-acp-"));
 		try {
 			let terminalCalls = 0;
+			const getClientBridge = () =>
+				({
+					capabilities: { terminal: true },
+					createTerminal: async () => {
+						terminalCalls++;
+						throw new Error("not reached");
+					},
+				}) as ClientBridge;
 			const tool = new BashTool(
 				session(workspace, new SessionCapabilities({ workspace }), {
-					getClientBridge: () =>
-						({
-							capabilities: { terminal: true },
-							createTerminal: async () => {
-								terminalCalls++;
-								throw new Error("not reached");
-							},
-						}) as ClientBridge,
+					getClientBridge,
 				}),
 			);
 
 			await expect(tool.execute("acp-generic", { command: "python -c 'print(1)'" })).rejects.toThrow(
 				"requires explicit session capability 'bash.command:python -c 'print(1)''",
 			);
+			const namedOnly = new BashTool(
+				session(workspace, new SessionCapabilities({ workspace, externalCapabilities: ["git.push"] }), {
+					getClientBridge,
+				}),
+			);
+			expect(await namedOnly.execute("acp-named", { command: "git push --dry-run" })).toBeDefined();
 			expect(terminalCalls).toBe(0);
 		} finally {
 			await removeWithRetries(workspace);

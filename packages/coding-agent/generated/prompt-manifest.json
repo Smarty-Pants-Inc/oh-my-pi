@@ -7306,7 +7306,7 @@
     },
     {
       "path": "packages/coding-agent/src/exec/bash-executor.ts",
-      "sha256": "ecc707af417431f43ed53b7554ead9e82d823f5ea64e1b07adeb75b356c82550"
+      "sha256": "9f7034d79e53544e7577fe31b73ec3c87d535ffd8763f570eecd4b32814b3d79"
     },
     {
       "path": "packages/coding-agent/src/exec/direnv.ts",
@@ -9038,7 +9038,7 @@
     },
     {
       "path": "packages/coding-agent/src/tools/bash.ts",
-      "sha256": "d0f562ed55663a8ee0c0f55461d05a57cf70cbe58b016da03edf35930b48d7a2"
+      "sha256": "add2c21210fcf67dd35bad5f2631920768d3764deb1975fcb305aa17be7d46d5"
     },
     {
       "path": "packages/coding-agent/src/tools/browser.ts",
@@ -9646,7 +9646,7 @@
     },
     {
       "path": "packages/coding-agent/src/utils/shell-snapshot.ts",
-      "sha256": "9d9a1da0d781496a3121fceda08d6c620d138d04d8a95fe71015511b7cbb2502"
+      "sha256": "c3b164a32acd65357ca0438eb9399b1db5bd2f32f4f2b0d463955920e40aa1c0"
     },
     {
       "path": "packages/coding-agent/src/utils/title-generator.ts",
@@ -10702,5 +10702,5 @@
     }
   ],
   "behaviorSha256": "0feede855f6d4a90131d3a02399acbc91464a432f9189e39082fd75f502a1194",
-  "rootSha256": "1db07a019a5f7b6e668284f7ef82209c6661f9141dd04c1335dcdae99d419496"
+  "rootSha256": "c7a995998b1868715b2d4ac67e74c05dfce2ed11ae5665656a38fdd667eeb2b1"
 }
