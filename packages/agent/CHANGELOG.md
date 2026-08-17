@@ -2,9 +2,16 @@
 
 ## [Unreleased]
 
+## [17.3.5] - 2026-08-16
+
+### Added
+
+- Added automatic retry support for transient provider failures during one-shot completions, allowing callers such as compaction to opt in to resilient request handling.
+
 ### Fixed
 
-- Enforced named hard tool choices locally for owned/in-band tool dialects, which cannot send native `tool_choice`, instead of silently allowing a text-only stop.
+- Fixed /handoff, branch summarization, and manual /compact failing outright on transient provider errors (e.g. Anthropic overloaded/429/529 responses); these operations now retry automatically instead of leaving the user's context full.
+
 ## [17.3.4] - 2026-08-14
 
 ### Fixed
@@ -95,9 +102,6 @@
 ### Fixed
 
 - Fixed proxy-stream clients dropping finalized provider-only content blocks, including Anthropic native web-search history, by allowing `done` and `error` events to carry terminal assistant content while retaining delta-reconstructed content from older proxy servers that omit it ([#6703](https://github.com/can1357/oh-my-pi/issues/6703)).
-### Fixed
-
-- Fixed local summary compaction sending an entire re-expanded history as one request after a provider switch. Oversized histories are now summarized in ordered, context-bounded chunks, carrying each intermediate summary into the next request without dropping transcript content.
 
 ## [17.1.4] - 2026-07-26
 

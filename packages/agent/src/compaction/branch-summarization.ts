@@ -22,11 +22,11 @@ import {
 import branchSummaryPrompt from "./prompts/branch-summary.md" with { type: "text" };
 import branchSummaryPreamble from "./prompts/branch-summary-preamble.md" with { type: "text" };
 import {
+	compactionInstructionContext,
 	computeFileLists,
 	createFileOps,
 	extractFileOpsFromMessage,
 	type FileOperations,
-	SUMMARIZATION_SYSTEM_PROMPT,
 	serializeConversationForSummary,
 	stripReadSelector,
 	truncateToolResultForSummary,
@@ -325,21 +325,23 @@ export async function generateBranchSummary(
 	const instructions = customInstructions || BRANCH_SUMMARY_PROMPT;
 	const promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${instructions}`;
 
-	const summarizationMessages = [
-		{
-			role: "user" as const,
-			content: [{ type: "text" as const, text: promptText }],
-			timestamp: Date.now(),
-		},
-	];
-
 	// Call LLM for summarization
-	const response = await instrumentedCompleteSimple(
-		model,
-		{ systemPrompt: [SUMMARIZATION_SYSTEM_PROMPT], messages: summarizationMessages },
-		{ apiKey, signal, maxTokens: 2048, metadata },
-		{ telemetry: options.telemetry, oneshotKind: "branch_summary", completeImpl: options.completeImpl },
-	);
+	let response: AssistantMessage;
+	try {
+		response = await instrumentedCompleteSimple(
+			model,
+			compactionInstructionContext(
+				"agent.compaction.prompts.branch-summary",
+				"packages/agent/src/compaction/prompts/branch-summary.md",
+				promptText,
+			),
+			{ apiKey, signal, maxTokens: 2048, metadata },
+			{ telemetry: options.telemetry, oneshotKind: "branch_summary", completeImpl: options.completeImpl, retry: {} },
+		);
+	} catch (error) {
+		if (signal.aborted) return { aborted: true };
+		throw error;
+	}
 
 	// Check if aborted or errored
 	if (response.stopReason === "aborted") {

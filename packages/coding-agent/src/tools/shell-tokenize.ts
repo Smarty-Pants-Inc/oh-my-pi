@@ -15,12 +15,14 @@ export function tokenizeShellSegments(command: string): string[][] {
 	const segments: string[][] = [];
 	let current: string[] = [];
 	let buffer = "";
+	let wordStarted = false;
 	let inSingle = false;
 	let inDouble = false;
 	const pushBuffer = () => {
-		if (buffer.length > 0) {
+		if (wordStarted) {
 			current.push(buffer);
 			buffer = "";
+			wordStarted = false;
 		}
 	};
 	const pushSegment = () => {
@@ -55,14 +57,18 @@ export function tokenizeShellSegments(command: string): string[][] {
 			continue;
 		}
 		if (ch === "'") {
+			wordStarted = true;
 			inSingle = true;
 			continue;
 		}
 		if (ch === '"') {
+			wordStarted = true;
 			inDouble = true;
 			continue;
 		}
-		if (ch === "\\" && i + 1 < command.length) {
+		if (ch === "\\") {
+			if (i + 1 >= command.length) return [];
+			wordStarted = true;
 			buffer += command[i + 1];
 			i++;
 			continue;
@@ -76,8 +82,10 @@ export function tokenizeShellSegments(command: string): string[][] {
 			// `&&`, `||` already collapsed by the segment break above.
 			continue;
 		}
+		wordStarted = true;
 		buffer += ch;
 	}
+	if (inSingle || inDouble) return [];
 	pushSegment();
 	return segments;
 }

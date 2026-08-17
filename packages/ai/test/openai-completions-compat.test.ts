@@ -9,6 +9,7 @@ import {
 import type {
 	AssistantMessage,
 	Context,
+	ContextInstruction,
 	FetchImpl,
 	Model,
 	ModelSpec,
@@ -29,6 +30,16 @@ const gpt4oMiniSpec: ModelSpec<"openai-completions"> = (() => {
 	} = getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">;
 	return { ...rest, compat: compatConfig };
 })();
+
+const internalInstruction: ContextInstruction = {
+	id: "goal.continuation",
+	sourcePath: "packages/coding-agent/src/prompts/goals/continuation.md",
+	role: "internal_context",
+	target: "main",
+	trigger: "goal-continuation",
+	sha256: "test-sha256",
+	renderedText: "Continue the active goal without overriding the user.",
+};
 
 function createAbortedSignal(): AbortSignal {
 	const controller = new AbortController();
@@ -210,6 +221,7 @@ describe("openai-completions compatibility", () => {
 			toolStrictMode: "none",
 			supportsReasoningParams: true,
 			supportsSamplingParams: true,
+			supportsPenaltyAndStopParams: true,
 			alwaysSendMaxTokens: false,
 			isOpenRouterHost: false,
 			isVercelGatewayHost: false,
@@ -384,6 +396,26 @@ describe("openai-completions compatibility", () => {
 		expect(unsupportedMessages.slice(0, 3)).toEqual([
 			{ role: "system", content: "stable instructions" },
 			{ role: "system", content: "cacheable policy" },
+			{ role: "user", content: "hello" },
+		]);
+	});
+
+	it("maps typed internal context to an instruction role and never to chat user", () => {
+		const model: Model<"openai-completions"> = buildModel({
+			...gpt4oMiniSpec,
+			api: "openai-completions",
+		} as ModelSpec<"openai-completions">);
+		const context: Context = {
+			instructions: [internalInstruction],
+			messages: [{ role: "user", content: "hello", timestamp: Date.now() }],
+		};
+
+		expect(convertMessages(model, context, model.compat).slice(0, 2)).toEqual([
+			{ role: "developer", content: internalInstruction.renderedText },
+			{ role: "user", content: "hello" },
+		]);
+		expect(convertMessages(model, context, { ...model.compat, supportsDeveloperRole: false }).slice(0, 2)).toEqual([
+			{ role: "system", content: internalInstruction.renderedText },
 			{ role: "user", content: "hello" },
 		]);
 	});
@@ -626,6 +658,79 @@ describe("openai-completions compatibility", () => {
 		expect(result.usage.output).toBe(3);
 		expect(result.usage.cacheRead).toBe(2);
 		expect(result.usage.totalTokens).toBe(15);
+	});
+
+	it("preserves opaque tool-call IDs when replaying a custom Chat Completions turn", async () => {
+		const model: Model<"openai-completions"> = buildModel({
+			id: "gateway-model",
+			name: "Gateway Model",
+			api: "openai-completions",
+			provider: "custom-gateway",
+			baseUrl: "https://gateway.example/v1",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 8_192,
+		} satisfies ModelSpec<"openai-completions">);
+		const toolCallId = "call_abc||gateway_state||opaque";
+		const assistant = await streamOpenAICompletions(model, baseContext(), {
+			apiKey: "test-key",
+			fetch: createMockFetch([
+				{
+					id: "chatcmpl-opaque-tool-id",
+					object: "chat.completion.chunk",
+					created: 0,
+					model: model.id,
+					choices: [
+						{
+							index: 0,
+							delta: {
+								tool_calls: [
+									{
+										index: 0,
+										id: toolCallId,
+										type: "function",
+										function: { name: "read", arguments: '{"path":"README.md"}' },
+									},
+								],
+							},
+						},
+					],
+				},
+				{
+					id: "chatcmpl-opaque-tool-id",
+					object: "chat.completion.chunk",
+					created: 0,
+					model: model.id,
+					choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+				},
+				"[DONE]",
+			]),
+		}).result();
+		const streamedToolCall = assistant.content.find(content => content.type === "toolCall");
+		expect(streamedToolCall?.id).toBe(toolCallId);
+
+		const payload = await captureOpenAICompletionsPayload(model, {
+			messages: [
+				{ role: "user", content: "Read README", timestamp: 1 },
+				assistant,
+				{
+					role: "toolResult",
+					toolCallId,
+					toolName: "read",
+					content: [{ type: "text", text: "done" }],
+					isError: false,
+					timestamp: 2,
+				},
+			],
+		});
+		const replayMessages = getPayloadMessages(payload);
+		const assistantPayload = replayMessages.find(message => message.role === "assistant");
+		const toolCalls = assistantPayload?.tool_calls;
+		if (!Array.isArray(toolCalls)) throw new Error("assistant tool_calls missing");
+		expect(toObject(toolCalls[0])?.id).toBe(toolCallId);
+		expect(replayMessages.find(message => message.role === "tool")?.tool_call_id).toBe(toolCallId);
 	});
 
 	it("keeps unindexed batched tool-call arguments isolated", async () => {

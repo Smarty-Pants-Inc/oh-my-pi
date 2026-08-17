@@ -21,6 +21,10 @@
  * Endpoint contract:
  *   POST /v1/pi/stream
  *   body:    { modelId, context, options?, stream? }   // `stream` defaults to true
+ *   POST /v1/pi/boundary-stream/v1
+ *   body:    the streaming shape plus `boundaryApproval` (version 1)
+ *   POST /v1/pi/boundary-approval
+ *   body:    one keep, replace, or reject decision for a suspended boundary
  *   200 SSE: stream of `AssistantMessageEvent` (terminated by `data: [DONE]`)
  *   200 JSON (stream=false): { message: AssistantMessage }
  *   4xx/5xx: { error: { type, message } }
@@ -28,13 +32,67 @@
 
 import type { AuthGatewayStreamControl } from "../auth-gateway/types";
 import * as AIError from "../error";
-import type { AssistantMessageEventStream, Context, SimpleStreamOptions } from "../types";
+import type { Api, AssistantMessageEventStream, Context, Model, SimpleStreamOptions } from "../types";
+
+export interface PiNativeBoundaryApprovalRequest {
+	version: 1;
+	payload: boolean;
+	toolContracts: boolean;
+}
+
+export type PiNativeBoundaryApprovalKind = "payload" | "toolContracts";
+
+export type PiNativeBoundaryModel = Omit<Model<Api>, "baseUrl" | "headers" | "transport"> & {
+	baseUrl: "";
+	headers?: never;
+	transport?: never;
+};
+
+export interface PiNativeBoundaryPreparation {
+	version: 1;
+	requestId: string;
+	streamId: string;
+	sessionId: string;
+	sequence: number;
+	preparationId: string;
+	kind: PiNativeBoundaryApprovalKind;
+	model: PiNativeBoundaryModel;
+	modelSha256: string;
+	payloadJson: string;
+	payloadSha256: string;
+	expiresAt: number;
+}
+
+export interface PiNativeBoundaryPreparationEvent {
+	type: "pi_boundary_approval";
+	boundaryApproval: PiNativeBoundaryPreparation;
+}
+
+export type PiNativeBoundaryApprovalDecisionKind = "keep" | "replace" | "reject";
+
+export interface PiNativeBoundaryApprovalDecision {
+	version: 1;
+	requestId: string;
+	streamId: string;
+	sessionId: string;
+	sequence: number;
+	preparationId: string;
+	kind: PiNativeBoundaryApprovalKind;
+	modelSha256: string;
+	payloadSha256: string;
+	expiresAt: number;
+	decision: PiNativeBoundaryApprovalDecisionKind;
+	replacementJson?: string;
+	replacementSha256?: string;
+	error?: string;
+}
 
 export interface PiNativeParsedRequest {
 	modelId: string;
 	context: Context;
 	options: SimpleStreamOptions;
 	stream: boolean;
+	boundaryApproval?: PiNativeBoundaryApprovalRequest;
 }
 /**
  * Subset of {@link SimpleStreamOptions} accepted from the wire. Function-valued
@@ -124,6 +182,9 @@ export function parseRequest(body: unknown, _headers?: Headers): PiNativeParsedR
 	if (ctxObj.systemPrompt !== undefined && !Array.isArray(ctxObj.systemPrompt)) {
 		throw new AIError.ValidationError("`context.systemPrompt` must be an array of strings when present");
 	}
+	if (ctxObj.instructions !== undefined && !Array.isArray(ctxObj.instructions)) {
+		throw new AIError.ValidationError("`context.instructions` must be an array when present");
+	}
 	if (ctxObj.tools !== undefined && !Array.isArray(ctxObj.tools)) {
 		throw new AIError.ValidationError("`context.tools` must be an array when present");
 	}
@@ -142,13 +203,96 @@ export function parseRequest(body: unknown, _headers?: Headers): PiNativeParsedR
 	// `stream` defaults to true — pi-native clients overwhelmingly stream, and
 	// matching `streamProxy`'s implicit-stream behavior avoids a one-flag papercut.
 	const stream = typeof obj.stream === "boolean" ? obj.stream : true;
+	let boundaryApproval: PiNativeBoundaryApprovalRequest | undefined;
+	if (obj.boundaryApproval !== undefined) {
+		const approval = obj.boundaryApproval;
+		if (typeof approval !== "object" || approval === null || Array.isArray(approval)) {
+			throw new AIError.ValidationError(
+				"`boundaryApproval` must be { version: 1, payload: boolean, toolContracts: boolean }",
+			);
+		}
+		const approvalRecord = approval as Record<string, unknown>;
+		if (
+			approvalRecord.version !== 1 ||
+			typeof approvalRecord.payload !== "boolean" ||
+			typeof approvalRecord.toolContracts !== "boolean"
+		) {
+			throw new AIError.ValidationError(
+				"`boundaryApproval` must be { version: 1, payload: boolean, toolContracts: boolean }",
+			);
+		}
+		if (!stream) throw new AIError.ValidationError("`boundaryApproval` requires streaming pi-native transport");
+		boundaryApproval = {
+			version: 1,
+			payload: approvalRecord.payload,
+			toolContracts: approvalRecord.toolContracts,
+		};
+	}
 
 	return {
 		modelId,
 		context: context as Context,
 		options,
 		stream,
+		...(boundaryApproval ? { boundaryApproval } : undefined),
 	};
+}
+
+function requiredDecisionString(record: Record<string, unknown>, key: string): string {
+	const value = record[key];
+	if (typeof value !== "string" || value.length === 0) {
+		throw new AIError.ValidationError(`Boundary approval \`${key}\` must be a non-empty string`);
+	}
+	return value;
+}
+
+/** Parse the one-shot decision POST without trusting any custody field. */
+export function parseBoundaryApprovalDecision(body: unknown): PiNativeBoundaryApprovalDecision {
+	if (typeof body !== "object" || body === null || Array.isArray(body)) {
+		throw new AIError.ValidationError("Boundary approval decision must be a JSON object");
+	}
+	const record = body as Record<string, unknown>;
+	if (record.version !== 1) throw new AIError.ValidationError("Boundary approval version must be 1");
+	const sequence = record.sequence;
+	const expiresAt = record.expiresAt;
+	if (typeof sequence !== "number" || !Number.isSafeInteger(sequence) || sequence < 1) {
+		throw new AIError.ValidationError("Boundary approval `sequence` must be a positive safe integer");
+	}
+	if (typeof expiresAt !== "number" || !Number.isSafeInteger(expiresAt) || expiresAt <= 0) {
+		throw new AIError.ValidationError("Boundary approval `expiresAt` must be a positive safe integer");
+	}
+	const kind = requiredDecisionString(record, "kind");
+	if (kind !== "payload" && kind !== "toolContracts") {
+		throw new AIError.ValidationError("Boundary approval `kind` is invalid");
+	}
+	const decision = requiredDecisionString(record, "decision");
+	if (decision !== "keep" && decision !== "replace" && decision !== "reject") {
+		throw new AIError.ValidationError("Boundary approval `decision` is invalid");
+	}
+	const parsed: PiNativeBoundaryApprovalDecision = {
+		version: 1,
+		requestId: requiredDecisionString(record, "requestId"),
+		streamId: requiredDecisionString(record, "streamId"),
+		sessionId: requiredDecisionString(record, "sessionId"),
+		sequence,
+		preparationId: requiredDecisionString(record, "preparationId"),
+		kind,
+		modelSha256: requiredDecisionString(record, "modelSha256"),
+		payloadSha256: requiredDecisionString(record, "payloadSha256"),
+		expiresAt,
+		decision,
+	};
+	if (decision === "replace") {
+		if (kind !== "payload") {
+			throw new AIError.ValidationError("Only payload boundary approvals can replace bytes");
+		}
+		parsed.replacementJson = requiredDecisionString(record, "replacementJson");
+		parsed.replacementSha256 = requiredDecisionString(record, "replacementSha256");
+	}
+	if (decision === "reject" && typeof record.error === "string" && record.error.length > 0) {
+		parsed.error = record.error;
+	}
+	return parsed;
 }
 // ---------------------------------------------------------------------------
 // encodeStream (SSE)

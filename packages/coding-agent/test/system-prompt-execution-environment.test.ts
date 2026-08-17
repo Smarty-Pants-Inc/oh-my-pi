@@ -39,11 +39,11 @@ describe("execution environment system prompt projection", () => {
 		const rendered = systemPrompt.join("\n\n");
 		expect(rendered).toContain("Workspace-local instructions");
 		expect(rendered).toContain("User-level instructions");
-		expect(rendered).toContain('<file path="/workspace/AGENTS.md">');
-		expect(rendered).toContain("<file>\nUser-level instructions");
+		expect(rendered).toContain('<external_instruction path="/workspace/AGENTS.md">');
+		expect(rendered).toContain("<external_instruction>\nUser-level instructions");
 		expect(rendered).toContain("- /workspace/src/AGENTS.md");
-		expect(rendered).toContain("- /workspace/packages/app");
-		expect(rendered).toContain("current working directory: '/workspace'.");
+		expect(rendered).toContain("- `/workspace/packages/app`");
+		expect(rendered).not.toContain("Working directory:");
 		expect(rendered).not.toContain(sourceRoot);
 		expect(rendered).not.toContain("/Users/example/.omp/AGENTS.md");
 		expect(rendered).not.toContain("/Users/example/shared");
@@ -68,10 +68,10 @@ describe("execution environment system prompt projection", () => {
 		});
 
 		const rendered = systemPrompt.join("\n\n");
-		expect(rendered).toContain(`<file path="${sourceRoot}/AGENTS.md">`);
+		expect(rendered).toContain(`<external_instruction path="${sourceRoot}/AGENTS.md">`);
 		expect(rendered).toContain(`- ${sourceRoot}/src/AGENTS.md`);
-		expect(rendered).toContain(`- ${sourceRoot}/packages/app`);
-		expect(rendered).toContain(`current working directory: '${sourceRoot}'.`);
+		expect(rendered).toContain(`- \`${sourceRoot}/packages/app\``);
+		expect(rendered).not.toContain("Working directory:");
 		expect(rendered).not.toContain("<execution-environment>");
 	});
 });

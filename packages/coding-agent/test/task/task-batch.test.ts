@@ -132,26 +132,26 @@ describe("task.batch schema gating", () => {
 		expect(itemProperties.schemaMode).toBeDefined();
 	});
 
-	it("hides effort by default and exposes it when task.enableEffort is enabled", async () => {
+	it("exposes effort by default and hides it when task.enableEffort is disabled", async () => {
 		mockDiscovery();
 
 		const flatSession = createSession({ settings: { "task.batch": false } });
 		const flat = await TaskTool.create(flatSession);
-		expect(getSchemaProperties(flat).effort).toBeUndefined();
-		expect(flat.description).not.toContain("`effort`");
-
-		flatSession.settings.override("task.enableEffort", true);
 		expect(getSchemaProperties(flat).effort).toBeDefined();
 		expect(flat.description).toContain("`effort`");
 
+		flatSession.settings.override("task.enableEffort", false);
+		expect(getSchemaProperties(flat).effort).toBeUndefined();
+		expect(flat.description).not.toContain("`effort`");
+
 		const batchSession = createSession({ settings: { "task.batch": true } });
 		const batch = await TaskTool.create(batchSession);
-		expect(getBatchItemProperties(batch).effort).toBeUndefined();
-		expect(batch.description).not.toContain("`effort`");
-
-		batchSession.settings.override("task.enableEffort", true);
 		expect(getBatchItemProperties(batch).effort).toBeDefined();
 		expect(batch.description).toContain("`effort`");
+
+		batchSession.settings.override("task.enableEffort", false);
+		expect(getBatchItemProperties(batch).effort).toBeUndefined();
+		expect(batch.description).not.toContain("`effort`");
 	});
 
 	it("keeps isolation boolean-only in the batch item schema", async () => {

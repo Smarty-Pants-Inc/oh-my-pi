@@ -456,6 +456,7 @@ describe("bigint tool arguments", () => {
 
 		let renderedPrompts = "";
 		for (const call of completeSpy.mock.calls) {
+			for (const instruction of call[1].instructions ?? []) renderedPrompts += instruction.renderedText;
 			for (const message of call[1].messages) {
 				if (typeof message.content === "string") {
 					renderedPrompts += message.content;
@@ -939,8 +940,14 @@ describe("remote compaction setting", () => {
 		const result = await compact(preparation, model, "test-api-key");
 		const promptText = completeSimpleSpy.mock.calls
 			.map(call => {
-				const context = call[1] as { messages?: Array<{ content?: Array<{ text?: string }> }> };
-				return context.messages?.[0]?.content?.[0]?.text ?? "";
+				const context = call[1] as {
+					instructions?: Array<{ renderedText: string }>;
+					messages?: Array<{ content?: Array<{ text?: string }> }>;
+				};
+				return [
+					...(context.instructions?.map(instruction => instruction.renderedText) ?? []),
+					...(context.messages?.flatMap(message => message.content?.map(block => block.text ?? "") ?? []) ?? []),
+				].join("\n");
 			})
 			.join("\n");
 
@@ -993,8 +1000,14 @@ describe("remote compaction setting", () => {
 		const result = await compact(preparation, model, "test-api-key");
 		const promptText = completeSimpleSpy.mock.calls
 			.map(call => {
-				const context = call[1] as { messages?: Array<{ content?: Array<{ text?: string }> }> };
-				return context.messages?.[0]?.content?.[0]?.text ?? "";
+				const context = call[1] as {
+					instructions?: Array<{ renderedText: string }>;
+					messages?: Array<{ content?: Array<{ text?: string }> }>;
+				};
+				return [
+					...(context.instructions?.map(instruction => instruction.renderedText) ?? []),
+					...(context.messages?.flatMap(message => message.content?.map(block => block.text ?? "") ?? []) ?? []),
+				].join("\n");
 			})
 			.join("\n");
 

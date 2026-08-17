@@ -2,6 +2,7 @@ import { THINKING_EFFORTS } from "@oh-my-pi/pi-ai";
 import { DEFAULT_SHARE_URL } from "@oh-my-pi/pi-wire";
 import { SHAPE_VARIANT_NAMES } from "@oh-my-pi/snapcompact";
 import { DEFAULT_RELAY_URL } from "../collab/protocol";
+import { agentBehavior } from "../context/registry";
 import { DEFAULT_LIVE_VOICE, LIVE_VOICE_OPTIONS, LIVE_VOICE_VALUES } from "../live/voices";
 import { DEFAULT_STT_MODEL_KEY, STT_MODEL_OPTIONS, STT_MODEL_VALUES } from "../stt/models";
 import { STT_SUBMIT_TRIGGER_OPTIONS, STT_SUBMIT_TRIGGER_VALUES } from "../stt/submit-trigger";
@@ -152,6 +153,7 @@ export const TAB_GROUPS: Record<SettingTab, readonly string[]> = {
 		"Output Limits",
 		"Execution",
 		"Discovery & MCP",
+		"Extensions",
 		"Developer",
 	],
 	tasks: ["Modes", "Subagents", "Isolation", "Commands & Skills"],
@@ -3677,7 +3679,7 @@ export const SETTINGS_SCHEMA = {
 	"tools.approvalMode": {
 		type: "enum",
 		values: ["always-ask", "write", "yolo"] as const,
-		default: "yolo",
+		default: agentBehavior.toolExecution.approvalMode,
 		ui: {
 			tab: "interaction",
 			group: "Approvals",
@@ -3709,7 +3711,7 @@ export const SETTINGS_SCHEMA = {
 	// Todo tool
 	"todo.enabled": {
 		type: "boolean",
-		default: true,
+		default: agentBehavior.todo.enabled,
 		ui: {
 			tab: "tools",
 			group: "Available Tools",
@@ -3720,7 +3722,7 @@ export const SETTINGS_SCHEMA = {
 
 	"todo.reminders": {
 		type: "boolean",
-		default: true,
+		default: agentBehavior.todo.stopReminders,
 		ui: {
 			tab: "tools",
 			group: "Todos",
@@ -3749,7 +3751,7 @@ export const SETTINGS_SCHEMA = {
 	"todo.eager": {
 		type: "enum",
 		values: ["default", "preferred", "always"] as const,
-		default: "default",
+		default: agentBehavior.todo.eager,
 		ui: {
 			tab: "tools",
 			group: "Todos",
@@ -4405,7 +4407,7 @@ export const SETTINGS_SCHEMA = {
 
 	"goal.enabled": {
 		type: "boolean",
-		default: true,
+		default: agentBehavior.goal.enabled,
 		ui: {
 			tab: "tasks",
 			group: "Modes",
@@ -4427,7 +4429,7 @@ export const SETTINGS_SCHEMA = {
 
 	"goal.continuationModes": {
 		type: "array",
-		default: ["interactive"],
+		default: agentBehavior.goal.continuationModes,
 		ui: {
 			tab: "tasks",
 			group: "Modes",
@@ -4462,7 +4464,7 @@ export const SETTINGS_SCHEMA = {
 			"block-clone",
 			"rcopy",
 		] as const,
-		default: "none",
+		default: "auto",
 		ui: {
 			tab: "tasks",
 			group: "Isolation",
@@ -4555,7 +4557,7 @@ export const SETTINGS_SCHEMA = {
 	"task.eager": {
 		type: "enum",
 		values: ["default", "preferred", "always"] as const,
-		default: "default",
+		default: agentBehavior.task.eager,
 		ui: {
 			tab: "tasks",
 			group: "Subagents",
@@ -4583,7 +4585,7 @@ export const SETTINGS_SCHEMA = {
 
 	"task.enableEffort": {
 		type: "boolean",
-		default: false,
+		default: true,
 		ui: {
 			tab: "tasks",
 			group: "Subagents",
@@ -4628,7 +4630,7 @@ export const SETTINGS_SCHEMA = {
 
 	"task.maxRecursionDepth": {
 		type: "number",
-		default: 2,
+		default: agentBehavior.task.maxRecursionDepth,
 		ui: {
 			tab: "tasks",
 			group: "Subagents",
@@ -5493,6 +5495,18 @@ export const SETTINGS_SCHEMA = {
 	"commit.mapReduceMaxConcurrency": { type: "number", default: 5 },
 
 	"commit.changelogMaxDiffChars": { type: "number", default: 120000 },
+
+	"extensionHandlers.toolCallTimeoutMs": {
+		type: "number",
+		default: 30_000,
+		ui: {
+			tab: "tools",
+			group: "Extensions",
+			label: "Tool Call Handler Timeout (ms)",
+			description:
+				"Positive finite active-work timeout for extension tool_call handlers; invalid values use 30000ms, and time awaiting OMP-owned dialogs does not count",
+		},
+	},
 
 	"dev.autoqa": {
 		type: "boolean",

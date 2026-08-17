@@ -74,106 +74,22 @@ describe("InteractiveMode loop auto-submit", () => {
 		resetSettingsForTest();
 	});
 
-	it("does not resolve the next loop prompt while compaction is running", async () => {
+	it("never manufactures direct user input for an autonomous loop wake", async () => {
 		vi.useFakeTimers();
-		let compacting = true;
-		Object.defineProperty(session, "isCompacting", { configurable: true, get: () => compacting });
-		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => false });
-
 		mode.loopModeEnabled = true;
 		mode.loopPrompt = "repeat this";
 		const resolved: SubmittedUserInput[] = [];
 		pendingInput = mode.getUserInput();
 		void pendingInput.then(input => resolved.push(input));
 
-		vi.advanceTimersByTime(800);
+		vi.advanceTimersByTime(10_000);
 		await flushMicrotasks();
 		expect(resolved).toHaveLength(0);
-
-		compacting = false;
-		vi.advanceTimersByTime(800);
-		await flushMicrotasks();
-
-		expect(resolved).toHaveLength(1);
-		expect(resolved[0].text).toBe("repeat this");
-	});
-
-	it("does not recompact when a compact loop turn starts another prompt before resubmitting", async () => {
-		vi.useFakeTimers();
-		settings.set("loop.mode", "compact");
-		let streaming = false;
-		Object.defineProperty(session, "isCompacting", { configurable: true, get: () => false });
-		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => streaming });
-		const compact = vi.spyOn(mode, "handleCompactCommand").mockImplementation(async () => {
-			streaming = true;
-			return "ok";
+		expect(session.getAutomaticTurnOutcomes().at(-1)).toMatchObject({
+			source: "loop_mode_autonomous_wake",
+			status: "rejected",
+			reason: "loop mode cannot manufacture direct user input",
 		});
-
-		mode.loopModeEnabled = true;
-		mode.loopPrompt = "repeat after compact";
-		const resolved: SubmittedUserInput[] = [];
-		pendingInput = mode.getUserInput();
-		void pendingInput.then(input => resolved.push(input));
-
-		vi.advanceTimersByTime(800);
-		await flushMicrotasks();
-		expect(compact).toHaveBeenCalledTimes(1);
-		expect(resolved).toHaveLength(0);
-
-		streaming = false;
-		vi.advanceTimersByTime(800);
-		await flushMicrotasks();
-
-		expect(compact).toHaveBeenCalledTimes(1);
-		expect(resolved).toHaveLength(1);
-		expect(resolved[0].text).toBe("repeat after compact");
-	});
-
-	it("does not resolve the next loop prompt while post-prompt background work is pending", async () => {
-		vi.useFakeTimers();
-		let hasPendingWork = true;
-		Object.defineProperty(session, "isCompacting", { configurable: true, get: () => false });
-		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => false });
-		Object.defineProperty(session, "hasPostPromptWork", { configurable: true, get: () => hasPendingWork });
-
-		mode.loopModeEnabled = true;
-		mode.loopPrompt = "deliver this";
-		const resolved: SubmittedUserInput[] = [];
-		pendingInput = mode.getUserInput();
-		void pendingInput.then(input => resolved.push(input));
-
-		// Loop timer fires while an idle-flush / delivery turn is still pending.
-		vi.advanceTimersByTime(800);
-		await flushMicrotasks();
-		expect(resolved).toHaveLength(0);
-
-		// Background delivery completes; loop may now fire.
-		hasPendingWork = false;
-		vi.advanceTimersByTime(800);
-		await flushMicrotasks();
-
-		expect(resolved).toHaveLength(1);
-		expect(resolved[0].text).toBe("deliver this");
-	});
-
-	it("disables reset loops when vibe blocks the session transition", async () => {
-		vi.useFakeTimers();
-		settings.set("loop.mode", "reset");
-		mode.vibeModeEnabled = true;
-		mode.loopModeEnabled = true;
-		mode.loopPrompt = "do not resubmit";
-		const showStatus = vi.spyOn(mode, "showStatus");
-		const resolved: SubmittedUserInput[] = [];
-		pendingInput = mode.getUserInput();
-		void pendingInput.then(input => resolved.push(input));
-
-		vi.advanceTimersByTime(800);
-		await flushMicrotasks();
-
-		expect(resolved).toHaveLength(0);
-		expect(mode.loopModeEnabled).toBe(false);
-		expect(mode.loopPrompt).toBeUndefined();
-		expect(showStatus).toHaveBeenCalledWith("Exit vibe mode before using reset loops. Loop mode disabled.");
 	});
 
 	it("reports waiting, running, paused, resumed, and disabled loop states", async () => {

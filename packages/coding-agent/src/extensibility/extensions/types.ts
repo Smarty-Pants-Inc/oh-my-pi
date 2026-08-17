@@ -51,6 +51,7 @@ import type {
 import type { logger as PiLogger } from "@oh-my-pi/pi-utils";
 import type { KeybindingsManager } from "../../config/keybindings";
 import type { ModelRegistry } from "../../config/model-registry";
+import type { ContextReleaseManifest } from "../../context/manifest";
 import type { EditToolDetails } from "../../edit";
 import type { PythonResult } from "../../eval/py/executor";
 import type { BashResult } from "../../exec/bash-executor";
@@ -238,6 +239,8 @@ export interface ExtensionCustomOptions {
 	overlayOptions?: OverlayOptions | (() => OverlayOptions);
 	/** Invoked with the overlay handle once the overlay is created (overlay mode only). */
 	onHandle?: (handle: OverlayHandle) => void;
+	/** Abort the custom UI and reject its promise. */
+	signal?: AbortSignal;
 }
 
 /** Wrap the current autocomplete provider with additional behavior (pi-compatible). */
@@ -1202,6 +1205,8 @@ export interface SystemPromptBuilderContext {
 	readonly templates: Readonly<SystemPromptTemplates>;
 	/** Render the stock prompt pipeline with the supplied complete template set. */
 	build(templates?: Readonly<SystemPromptTemplates>): Promise<BuildSystemPromptResult>;
+	/** Fresh installed-state evidence. Undefined only in the explicit Bun test runtime. */
+	readonly releaseManifest?: Readonly<ContextReleaseManifest>;
 }
 
 /** Replaces OMP's normal provider-facing base system prompt builder. */
@@ -1224,7 +1229,11 @@ export type SendMessageAcceptedDelivery =
 
 export type SendMessageDisposition =
 	| { status: "accepted"; delivery: SendMessageAcceptedDelivery }
-	| { status: "downgraded"; delivery: "queued_next_turn"; reason: "client_deferred_turn" }
+	| {
+			status: "downgraded";
+			delivery: "queued_next_turn" | "plain_append";
+			reason: "client_deferred_turn" | "unscoped_automatic_turn";
+	  }
 	| { status: "unavailable"; reason: "client_deferred_turn" | "session_transition" | "prompt_preflight_cancelled" };
 
 export interface SendMessageOptions {

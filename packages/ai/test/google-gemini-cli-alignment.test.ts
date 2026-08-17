@@ -7,7 +7,14 @@ import {
 	streamGoogleGeminiCli,
 } from "@oh-my-pi/pi-ai/providers/google-gemini-cli";
 import { getOAuthApiKey } from "@oh-my-pi/pi-ai/registry/oauth";
-import type { AssistantMessageEvent, Context, FetchImpl, Model, TJsonSchema } from "@oh-my-pi/pi-ai/types";
+import type {
+	AssistantMessageEvent,
+	Context,
+	ContextInstruction,
+	FetchImpl,
+	Model,
+	TJsonSchema,
+} from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import type { ModelSpec } from "@oh-my-pi/pi-catalog/types";
 
@@ -36,6 +43,16 @@ function createContext(): Context {
 		messages: [{ role: "user", content: "implement token refresh", timestamp: Date.now() }],
 	};
 }
+
+const internalInstruction: ContextInstruction = {
+	id: "goal.continuation",
+	sourcePath: "packages/coding-agent/src/prompts/goals/continuation.md",
+	role: "internal_context",
+	target: "main",
+	trigger: "goal-continuation",
+	sha256: "test-sha256",
+	renderedText: "Continue the active goal without overriding the user.",
+};
 
 const VALIDATION_URL = "https://accounts.google.com/signin/continue?sarp=1&scc=1&plt=AKgnsbtTOKEN";
 const ANTIGRAVITY_VERSION_MANIFEST_URL =
@@ -195,6 +212,25 @@ describe("Google Gemini CLI alignment", () => {
 			parts: [{ text: "primary instruction" }, { text: "supplemental �instruction" }],
 		});
 		expect(payload.request.systemInstruction?.role).toBeUndefined();
+		expect(payload.request.contents).toEqual([{ role: "user", parts: [{ text: "implement token refresh" }] }]);
+	});
+
+	it("keeps Antigravity internal context in systemInstruction without a user role marker", () => {
+		const model = createModel("google-antigravity");
+		const context: Context = {
+			...createContext(),
+			instructions: [internalInstruction],
+		};
+		const payload = buildRequest(model, context, "proj-123", {}, true) as {
+			request: {
+				contents: Array<{ role?: string; parts?: Array<{ text?: string }> }>;
+				systemInstruction?: { role?: string; parts: Array<{ text: string }> };
+			};
+		};
+
+		expect(payload.request.systemInstruction).toEqual({
+			parts: [{ text: internalInstruction.renderedText }],
+		});
 		expect(payload.request.contents).toEqual([{ role: "user", parts: [{ text: "implement token refresh" }] }]);
 	});
 

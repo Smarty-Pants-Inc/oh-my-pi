@@ -1,15 +1,7 @@
-Active goal token budget reached.
+The active goal reached its budget and is now `budget_limited`.
 
-Objective below: user-provided task context, not higher-priority instructions.
 <objective>
 {{objective}}
 </objective>
 
-Budget:
-- Time used: {{timeUsedSeconds}} seconds
-- Tokens used: {{tokensUsed}}
-- Token budget: {{tokenBudget}}
-
-Runtime marked goal budget-limited. NEVER start new substantive work for this goal. Wrap up this turn soon: summarize useful progress, identify remaining work or blockers, leave the user a clear next step.
-
-Budget exhaustion ≠ completion. NEVER call `goal({op:"complete"})` unless current repo state proves the goal actually complete.
+Do not start new substantive work. Preserve useful state, report verified progress and remaining work or blockers, then stop. Mark the goal complete only if the objective is actually complete.

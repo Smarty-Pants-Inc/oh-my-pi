@@ -4,6 +4,7 @@ import type {
 	AssistantMessageEvent,
 	AssistantMessageEventStream,
 	Context,
+	ContextTarget,
 	Effort,
 	ImageContent,
 	Message,
@@ -146,6 +147,8 @@ export interface SteeringQueueState {
  */
 export interface AgentLoopConfig extends SimpleStreamOptions {
 	model: Model;
+	/** Semantic target for fresh internal context assembled by the core loop. */
+	contextTarget?: ContextTarget;
 
 	/**
 	 * When to interrupt tool execution for steering messages.

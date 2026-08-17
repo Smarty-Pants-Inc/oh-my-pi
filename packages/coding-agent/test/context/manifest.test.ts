@@ -1,0 +1,673 @@
+import { describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { getDefault } from "../../src/config/settings-schema";
+import { canonicalJson, compareUnicodeCodePoints, type JsonValue, sha256 } from "../../src/context/canonical";
+import {
+	computeImplementationSources,
+	runtimeImportSpecifiersForImplementationSource,
+} from "../../src/context/implementation-sources";
+import {
+	activationStatePath,
+	approvedCandidateSourceMatches,
+	assertTrackedManifestCurrent,
+	canonicalGithubRepository,
+	parseContentManifest,
+	parseContextReleaseManifest,
+	trackedContentManifest,
+	validateScopeCoverage,
+} from "../../src/context/manifest";
+import { agentBehavior, parseAgentBehavior } from "../../src/context/registry";
+import { exportRenderedToolContracts, parseGeneratedToolContracts } from "../../src/context/tool-contracts";
+import { classifyProtectedPath } from "../../src/policy/protected-surface";
+
+describe("tracked context manifest", () => {
+	it("uses the fail-closed behavior manifest as the governed runtime default source", () => {
+		expect(getDefault("tools.approvalMode")).toBe(agentBehavior.toolExecution.approvalMode);
+		expect(getDefault("todo.enabled")).toBe(agentBehavior.todo.enabled);
+		expect(getDefault("todo.reminders")).toBe(agentBehavior.todo.stopReminders);
+		expect(getDefault("todo.eager")).toBe(agentBehavior.todo.eager);
+		expect(getDefault("goal.enabled")).toBe(agentBehavior.goal.enabled);
+		expect(getDefault("goal.continuationModes")).toEqual(agentBehavior.goal.continuationModes);
+		expect(getDefault("task.eager")).toBe(agentBehavior.task.eager);
+		expect(getDefault("task.maxRecursionDepth")).toBe(agentBehavior.task.maxRecursionDepth);
+
+		const source = Bun.file(path.resolve(import.meta.dir, "../../src/agent-behavior.yml")).text();
+		return source.then(text => {
+			expect(parseAgentBehavior(text)).toEqual(agentBehavior);
+			expect(() => parseAgentBehavior(`${text}\nunknownProtectedDefault: true\n`)).toThrow(
+				"unknown or missing fields",
+			);
+			expect(() => parseAgentBehavior(text.replace("maxRecursionDepth: 2", "maxRecursionDepth: nope"))).toThrow(
+				"task.maxRecursionDepth",
+			);
+			expect(() => parseAgentBehavior(text.replace("midRunNudges: false", "midRunNudges: true"))).toThrow(
+				"must match the shared reminder default",
+			);
+			expect(() => parseAgentBehavior(text.replace("forcedFanout: false", "forcedFanout: true"))).toThrow(
+				"task.forcedFanout must be false",
+			);
+		});
+	});
+
+	it("uses the canonical activation state path and ignores environment decoys", () => {
+		Bun.env.SMARTY_POLICY_STATE_PATH = "/tmp/decoy-state.json";
+		try {
+			expect(activationStatePath()).toEndWith(path.join(".omp", "policy-state.json"));
+			expect(activationStatePath()).not.toBe(Bun.env.SMARTY_POLICY_STATE_PATH);
+		} finally {
+			delete Bun.env.SMARTY_POLICY_STATE_PATH;
+		}
+	});
+
+	it("normalizes only canonical GitHub owner/name origins", () => {
+		expect(canonicalGithubRepository("git@github.com:Smarty-Pants-Inc/oh-my-pi.git")).toBe(
+			"Smarty-Pants-Inc/oh-my-pi",
+		);
+		expect(canonicalGithubRepository("https://github.com/Smarty-Pants-Inc/oh-my-pi")).toBe(
+			"Smarty-Pants-Inc/oh-my-pi",
+		);
+		expect(canonicalGithubRepository("https://example.com/Smarty-Pants-Inc/oh-my-pi.git")).toBeUndefined();
+	});
+
+	it("binds extension additions to exact candidate identity and bytes", () => {
+		const identity = {
+			repository: "Smarty-Pants-Inc/oh-my-pi",
+			baseCommit: "c".repeat(40),
+			baseTree: "d".repeat(40),
+			commit: "a".repeat(40),
+			tree: "b".repeat(40),
+			scopeCoverage: [{ path: "packages/coding-agent/src/context/manifest.ts", requirement: "§8.6" }],
+		};
+		const release = { candidates: [identity] };
+		expect(
+			approvedCandidateSourceMatches(identity.repository, identity, "c".repeat(64), "c".repeat(64), release),
+		).toBe(true);
+		expect(
+			approvedCandidateSourceMatches(identity.repository, identity, "c".repeat(64), "d".repeat(64), release),
+		).toBe(false);
+		expect(
+			approvedCandidateSourceMatches("other/repository", identity, "c".repeat(64), "c".repeat(64), release),
+		).toBe(false);
+	});
+
+	it("parses an exact self-bound release record and rejects protected drift", () => {
+		const contentManifest = trackedContentManifest();
+		const combinedPromptBehaviorSha256 = sha256(
+			canonicalJson({
+				behaviorSha256: contentManifest.behaviorSha256,
+				contentManifestRootSha256: contentManifest.rootSha256,
+			}),
+		);
+		const releasePayload = {
+			schema: "omp.context_release_manifest.v1" as const,
+			repository: "Smarty-Pants-Inc/oh-my-pi",
+			commit: "a".repeat(40),
+			tree: "b".repeat(40),
+			candidates: [
+				{
+					repository: "Smarty-Pants-Inc/oh-my-pi",
+					baseCommit: "c".repeat(40),
+					baseTree: "d".repeat(40),
+					commit: "a".repeat(40),
+					tree: "b".repeat(40),
+					scopeCoverage: [
+						{ path: "packages/a.ts", requirement: "§2.15" },
+						{
+							path: "packages/b.test.ts",
+							dependencyOf: "packages/a.ts",
+							necessity: "Runnable contract proof.",
+						},
+					],
+				},
+			],
+			contentManifest,
+			contentManifestRootSha256: contentManifest.rootSha256,
+			behaviorSha256: contentManifest.behaviorSha256,
+			globalAgentsPath: "/home/test/.omp/agent/AGENTS.md",
+			globalAgentsSha256: "c".repeat(64),
+			globalAgentsSourceSha256: "c".repeat(64),
+			configurationPath: "/home/test/.omp/agent/config.yml",
+			configurationSourceSha256: "d".repeat(64),
+			configurationSemanticSha256: "e".repeat(64),
+			combinedPromptBehaviorSha256,
+		};
+		const release = {
+			...releasePayload,
+			rootSha256: sha256(canonicalJson(releasePayload as unknown as JsonValue)),
+		};
+		const { rootSha256, ...boundPayload } = release;
+		expect(release.repository).toBe("Smarty-Pants-Inc/oh-my-pi");
+		expect(release.contentManifest.rootSha256).toBe(release.contentManifestRootSha256);
+		expect(release.contentManifest.providerMappings).toHaveLength(2);
+		expect(rootSha256).toBe(sha256(canonicalJson(boundPayload as unknown as JsonValue)));
+		expect(parseContextReleaseManifest(JSON.stringify(release))).toEqual(release);
+		expect(() => parseContextReleaseManifest(JSON.stringify({ ...release, unknownProtectedField: "drift" }))).toThrow(
+			"unknown or missing fields",
+		);
+		expect(() =>
+			parseContextReleaseManifest(
+				JSON.stringify({
+					...release,
+					contentManifest: { ...release.contentManifest, providerMappings: [] },
+				}),
+			),
+		).toThrow();
+		const candidate = release.candidates[0]!;
+		for (const scopeCoverage of [
+			[candidate.scopeCoverage[0], candidate.scopeCoverage[0]],
+			[...candidate.scopeCoverage].reverse(),
+			[{ ...candidate.scopeCoverage[0], unknown: true }],
+		]) {
+			expect(() =>
+				parseContextReleaseManifest(JSON.stringify({ ...release, candidates: [{ ...candidate, scopeCoverage }] })),
+			).toThrow();
+		}
+		expect(() => validateScopeCoverage(["packages/a.ts", "packages/b.ts"], [candidate.scopeCoverage[0]])).toThrow(
+			"missing=packages/b.ts",
+		);
+		expect(() =>
+			validateScopeCoverage(
+				["packages/a.ts"],
+				[candidate.scopeCoverage[0], { path: "packages/extra.ts", requirement: "§2.15" }],
+			),
+		).toThrow("extra=packages/extra.ts");
+		expect(() => validateScopeCoverage(["packages/a.ts"], [{ path: "packages/a.ts", requirement: "§23" }])).toThrow(
+			"exact specification section or item",
+		);
+		expect(() =>
+			validateScopeCoverage(
+				["packages/a.ts"],
+				[{ path: "packages/a.ts", dependencyOf: "packages/missing.ts", necessity: "Circular convenience." }],
+			),
+		).toThrow("directly mapped path in the same set");
+		expect(() =>
+			validateScopeCoverage(
+				["packages/a.ts"],
+				[{ path: "packages/a.ts", dependencyOf: "packages/a.ts", necessity: "Self dependency." }],
+			),
+		).toThrow("must not reference itself");
+		expect(() =>
+			validateScopeCoverage(
+				["packages/a.ts", "packages/b.ts"],
+				[
+					{ path: "packages/a.ts", dependencyOf: "packages/b.ts", necessity: "Cycle half one." },
+					{ path: "packages/b.ts", dependencyOf: "packages/a.ts", necessity: "Cycle half two." },
+				],
+			),
+		).toThrow("directly mapped path in the same set");
+	});
+
+	it("is deterministic and matches live prompt, behavior, and tool contracts", async () => {
+		const packageRoot = path.resolve(import.meta.dir, "../..");
+		const result = Bun.spawnSync(["bun", "scripts/generate-prompt-manifest.ts", "--check"], {
+			cwd: packageRoot,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(result.exitCode, result.stderr.toString()).toBe(0);
+		expect((await assertTrackedManifestCurrent()).rootSha256).toBe(trackedContentManifest().rootSha256);
+		const manifest = trackedContentManifest();
+		const toolIds = manifest.toolSchemas.map(tool => tool.id);
+		expect(toolIds).toContain("tool.ask");
+		expect(toolIds).toContain("tool.capability_grant");
+		for (const fixedRuntimeTool of [
+			"tool.generate_image",
+			"tool.tts",
+			"tool.vibe_kill",
+			"tool.vibe_list",
+			"tool.vibe_send",
+			"tool.vibe_spawn",
+			"tool.vibe_wait",
+		]) {
+			expect(toolIds).toContain(fixedRuntimeTool);
+		}
+		expect(manifest.prompts.map(prompt => prompt.path)).toContain(
+			"packages/agent/src/compaction/prompts/summarization-system.md",
+		);
+		expect(manifest.implementationSources.some(entry => entry.path === "packages/agent/src/agent-loop.ts")).toBe(
+			true,
+		);
+		expect(manifest.implementationSources.some(entry => entry.path === "packages/ai/src/utils/schema/wire.ts")).toBe(
+			true,
+		);
+		expect(manifest.implementationSources.some(entry => entry.path === "packages/ai/src/utils.ts")).toBe(true);
+		for (const liveProviderInput of [
+			"packages/agent/src/replay-policy.ts",
+			"packages/catalog/src/compat/openai.ts",
+			"packages/coding-agent/src/session/messages.ts",
+		]) {
+			expect(manifest.implementationSources.some(entry => entry.path === liveProviderInput)).toBe(true);
+		}
+		expect(
+			manifest.implementationSources.some(entry => entry.path === "packages/ai/src/providers/openai-responses.ts"),
+		).toBe(true);
+		expect(
+			manifest.implementationSources.some(
+				entry => entry.path === "packages/coding-agent/src/session/agent-session.ts",
+			),
+		).toBe(true);
+		expect(
+			manifest.implementationSources.some(
+				entry => entry.path === "packages/coding-agent/src/config/inline-tool-descriptors-mode.ts",
+			),
+		).toBe(true);
+		expect(
+			manifest.implementationSources.some(
+				entry => entry.path === "packages/coding-agent/src/session/session-handoff.ts",
+			),
+		).toBe(true);
+		expect(
+			manifest.prompts.find(entry => entry.id === "agent.compaction.prompts.compaction-summary")?.target,
+		).toEqual(["side_model"]);
+	});
+
+	it("binds and classifies every checked model-visible transformer", async () => {
+		const repositoryRoot = path.resolve(import.meta.dir, "../../../..");
+		const sources = await computeImplementationSources(repositoryRoot);
+		const paths = new Set(sources.map(source => source.path));
+		const promptPaths = new Set(trackedContentManifest().prompts.map(prompt => prompt.path));
+		for (const required of [
+			"docs/approval-mode.md",
+			"crates/pi-natives/src/shell.rs",
+			"crates/pi-natives/src/fonts/Silver.ttf",
+			"crates/pi-shell/src/minimizer/engine.rs",
+			"crates/pi-shell/src/minimizer/defs/biome.toml",
+			"packages/agent/src/compaction.ts",
+			"packages/agent/src/proxy.ts",
+			"packages/agent/src/telemetry.ts",
+			"packages/ai/src/auth-storage.ts",
+			"packages/ai/src/dialect/anthropic.md",
+			"packages/ai/src/providers/google-antigravity-forced-tool.md",
+			"packages/ai/src/utils/tool-call-loop-guard.ts",
+			"packages/ai/src/usage/openai-codex-reset.ts",
+			"packages/catalog/src/discovery/cursor-gen/agent_pb.ts",
+			"packages/catalog/src/provider-models/descriptors.ts",
+			"packages/catalog/src/wire/codex.ts",
+			"packages/hashline/src/prompt.md",
+			"packages/mnemopi/src/core/beam/recall.ts",
+			"packages/mnemopi/src/core/memory.ts",
+			"packages/natives/native/desktop.js",
+			"packages/snapcompact/src/prompts/snapcompact-summary.md",
+			"packages/utils/src/acp/connection.ts",
+			"packages/utils/src/cli.ts",
+			"packages/utils/src/fetch-retry.ts",
+			"packages/utils/src/runtime-install.ts",
+			"packages/utils/src/tls-fetch.ts",
+			"packages/utils/src/turndown/service.ts",
+			"packages/coding-agent/src/discovery/agents-md.ts",
+			"packages/coding-agent/src/eval/completion-bridge.ts",
+			"packages/coding-agent/src/export/ttsr.ts",
+			"packages/coding-agent/src/extensibility/plugins/loader.ts",
+			"packages/coding-agent/src/extensibility/extensions/runner.ts",
+			"packages/coding-agent/src/extensibility/extensions/wrapper.ts",
+			"packages/coding-agent/src/extensibility/skills.ts",
+			"packages/coding-agent/src/goals/runtime.ts",
+			"packages/coding-agent/src/mcp/client.ts",
+			"packages/coding-agent/src/mcp/tool-cache.ts",
+			"packages/coding-agent/src/live/protocol.ts",
+			"packages/coding-agent/src/modes/acp/acp-agent.ts",
+			"packages/coding-agent/src/modes/components/agent-transcript-viewer.ts",
+			"packages/coding-agent/src/modes/components/extensions/types.ts",
+			"packages/coding-agent/src/modes/components/settings-defs.ts",
+			"packages/coding-agent/src/modes/components/hook-input.ts",
+			"packages/coding-agent/src/modes/components/session-selector.ts",
+			"packages/coding-agent/src/modes/components/extensions/state-manager.ts",
+			"packages/coding-agent/src/modes/components/plan-review-overlay.ts",
+			"packages/coding-agent/src/modes/components/settings-selector.ts",
+			"packages/coding-agent/src/modes/controllers/live-command-controller.ts",
+			"packages/coding-agent/src/modes/fresh-omp-companion-wire.ts",
+			"packages/coding-agent/src/modes/rpc/rpc-mode.ts",
+			"packages/coding-agent/src/modes/utils/context-usage.ts",
+			"packages/coding-agent/src/modes/utils/ui-helpers.ts",
+			"packages/coding-agent/src/modes/skill-command.ts",
+			"packages/coding-agent/src/secrets/obfuscator.ts",
+			"packages/coding-agent/src/session/async-job-delivery.ts",
+			"packages/coding-agent/src/session/provider-image-budget.ts",
+			"packages/coding-agent/src/session/session-context.ts",
+			"packages/coding-agent/src/session/session-stats.ts",
+			"packages/coding-agent/src/session/settings-stream-fn.ts",
+			"packages/coding-agent/src/session/todo-tracker.ts",
+			"packages/coding-agent/src/stt/asr-worker.ts",
+			"packages/coding-agent/src/stt/stt-controller.ts",
+			"packages/coding-agent/src/tiny/worker.ts",
+			"packages/coding-agent/src/tts/speech-enhancer.ts",
+			"packages/coding-agent/src/utils/image-loading.ts",
+			"packages/coding-agent/src/utils/mac-file-urls.applescript",
+			"packages/coding-agent/src/utils/shell-snapshot-fn-env.sh",
+			"packages/coding-agent/src/cli.ts",
+			"packages/coding-agent/src/cli/flag-tables.ts",
+			"packages/coding-agent/src/cli/plugin-cli.ts",
+			"packages/coding-agent/src/cli/session-picker.ts",
+			"packages/coding-agent/src/commands/setup.ts",
+			"packages/coding-agent/src/commands/launch.ts",
+			"packages/coding-agent/src/slash-commands/helpers/mcp.ts",
+			"packages/natives/native/loader-state.js",
+			"packages/utils/src/version.ts",
+			"crates/pi-natives/src/power.rs",
+		]) {
+			expect(paths.has(required), `missing model-visible implementation source: ${required}`).toBe(true);
+		}
+		for (const source of sources) {
+			expect(
+				classifyProtectedPath(source.path).length,
+				`unclassified model-visible implementation source: ${source.path}`,
+			).toBeGreaterThan(0);
+			if (!source.path.endsWith(".ts")) continue;
+			const sourceText = await Bun.file(path.join(repositoryRoot, source.path)).text();
+			for (const match of sourceText.matchAll(
+				/from\s+["']([^"']+\.(?:lark|md))["']\s+with\s*\{\s*type:\s*["']text["']\s*\}/g,
+			)) {
+				const importedPath = match[1];
+				if (!importedPath?.startsWith(".")) continue;
+				const resolved = path
+					.relative(repositoryRoot, path.resolve(repositoryRoot, path.dirname(source.path), importedPath))
+					.replaceAll(path.sep, "/");
+				expect(
+					paths.has(resolved) || promptPaths.has(resolved),
+					`unbound Markdown imported by model-visible source ${source.path}: ${resolved}`,
+				).toBe(true);
+			}
+			for (const match of sourceText.matchAll(
+				/from\s+["']([^"']+\.json)["']\s+with\s*\{\s*type:\s*["']json["']\s*\}/g,
+			)) {
+				const importedPath = match[1];
+				if (!importedPath?.startsWith(".")) continue;
+				const resolved = path
+					.relative(repositoryRoot, path.resolve(repositoryRoot, path.dirname(source.path), importedPath))
+					.replaceAll(path.sep, "/");
+				expect(
+					paths.has(resolved),
+					`unbound JSON imported by model-visible source ${source.path}: ${resolved}`,
+				).toBe(true);
+			}
+		}
+
+		for (const excluded of [
+			"packages/coding-agent/src/capability/types.ts",
+			"packages/coding-agent/src/cleanse/types.ts",
+			"packages/coding-agent/src/config/keybindings.ts",
+			"packages/coding-agent/src/dap/types.ts",
+			"packages/coding-agent/src/eval/types.ts",
+			"packages/coding-agent/src/extensibility/custom-tools/types.ts",
+			"packages/coding-agent/src/internal-urls/types.ts",
+			"packages/coding-agent/src/markit/types.ts",
+			"packages/coding-agent/src/plan-mode/state.ts",
+			"packages/coding-agent/src/stt/asr-protocol.ts",
+			"packages/coding-agent/src/tools/renderers.ts",
+			"packages/coding-agent/src/utils/changelog.ts",
+		]) {
+			expect(paths.has(excluded), `type-only source entered protected implementation inventory: ${excluded}`).toBe(
+				false,
+			);
+			expect(classifyProtectedPath(excluded)).toEqual([]);
+		}
+
+		for (const sourceRoot of ["packages/agent/src", "packages/ai/src", "packages/coding-agent/src"]) {
+			for await (const relativePath of new Bun.Glob("**/*.ts").scan({
+				cwd: path.join(repositoryRoot, sourceRoot),
+			})) {
+				const sourcePath = `${sourceRoot}/${relativePath}`;
+				const sourceText = await Bun.file(path.join(repositoryRoot, sourcePath)).text();
+				const importsModelCaller = [
+					...sourceText.matchAll(/import\s*\{([\s\S]*?)\}\s*from\s*["'][^"']+["']/g),
+				].some(match =>
+					/\b(?:Agent|completeSimple|instrumentedCompleteSimple|streamSimple)\b/.test(match[1] ?? ""),
+				);
+				const callsModel = /\b(?:new\s+Agent|completeSimple|instrumentedCompleteSimple|streamSimple)\s*\(/.test(
+					sourceText,
+				);
+				if (importsModelCaller && callsModel) {
+					expect(
+						paths.has(sourcePath),
+						`model request producer is absent from implementation inventory: ${sourcePath}`,
+					).toBe(true);
+				}
+			}
+		}
+	});
+
+	it("follows executable imports but not type-only or barrel-only edges", async () => {
+		expect(
+			runtimeImportSpecifiersForImplementationSource(`
+				import type { TypeOnly } from "./type-only";
+				import { type MixedType, runtimeValue } from "./runtime";
+				export { redirected } from "./barrel-only";
+				export type { ExportedType } from "./exported-type";
+				const deferred = import("./dynamic");
+				void runtimeValue;
+				void deferred;
+			`),
+		).toEqual(["./runtime", "./dynamic"]);
+
+		const repositoryRoot = path.resolve(import.meta.dir, "../../../..");
+		const paths = new Set((await computeImplementationSources(repositoryRoot)).map(source => source.path));
+		expect(paths.has("packages/coding-agent/src/cleanse/checkers.ts")).toBe(true);
+		expect(paths.has("packages/coding-agent/src/config/model-roles.ts")).toBe(true);
+		expect(paths.has("packages/coding-agent/src/extensibility/custom-tools/types.ts")).toBe(false);
+		expect(paths.has("packages/ai/src/usage.ts")).toBe(true);
+		expect(paths.has("packages/ai/src/usage/cursor.ts")).toBe(true);
+		expect(paths.has("packages/mnemopi/src/core/beam/types.ts")).toBe(false);
+		expect(paths.has("packages/mnemopi/src/diagnose.ts")).toBe(false);
+		expect(paths.has("packages/ai/src/providers/google-types.ts")).toBe(false);
+		expect(paths.has("packages/coding-agent/src/tiny/title-protocol.ts")).toBe(false);
+		expect(paths.has("packages/ai/src/dialect/types.ts")).toBe(false);
+		expect(paths.has("packages/hashline/src/types.ts")).toBe(false);
+		expect(paths.has("packages/coding-agent/generated/prompt-manifest.json")).toBe(false);
+		expect(paths.has("packages/coding-agent/generated/tool-contracts.json")).toBe(true);
+		expect(paths.has("packages/coding-agent/scripts/generate-prompt-manifest.ts")).toBe(false);
+		expect(classifyProtectedPath("packages/coding-agent/scripts/generate-prompt-manifest.ts")).toEqual([
+			{
+				path: "packages/coding-agent/scripts/generate-prompt-manifest.ts",
+				surface: "guard",
+				kind: "changed",
+			},
+		]);
+		expect(paths.has("packages/coding-agent/src/context/implementation-sources.ts")).toBe(true);
+		expect(paths.has("packages/coding-agent/src/context/manifest.ts")).toBe(true);
+		expect(paths.has("packages/utils/src/stderr-guard.ts")).toBe(false);
+		expect(paths.has("packages/utils/src/process-name.ts")).toBe(false);
+		expect(paths.has("packages/utils/src/color.ts")).toBe(false);
+	});
+
+	it("fails closed over new executable relative imports while bounding type and barrel edges", async () => {
+		const repositoryRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-implementation-sources-"));
+		const sourceRoot = path.join(repositoryRoot, "packages/agent/src");
+		const runtimeRoot = path.join(repositoryRoot, "packages/runtime");
+		await Promise.all([
+			fs.mkdir(sourceRoot, { recursive: true }),
+			fs.mkdir(path.join(runtimeRoot, "src"), { recursive: true }),
+		]);
+		try {
+			await Promise.all([
+				Bun.write(
+					path.join(sourceRoot, "agent.ts"),
+					'import type { TypeOnly } from "./type-only";\nimport { runtime } from "./runtime";\nimport { native } from "./native.js";\nimport { engine } from "@test/runtime/engine";\nexport { barrelOnly } from "./barrel-only";\nvoid runtime;\nvoid native;\nvoid engine;\n',
+				),
+				Bun.write(path.join(sourceRoot, "runtime.ts"), 'export const runtime = import("./dynamic");\n'),
+				Bun.write(path.join(sourceRoot, "dynamic.ts"), "export const dynamic = true;\n"),
+				Bun.write(path.join(sourceRoot, "native.js"), 'export const native = import("./nested-js");\n'),
+				Bun.write(path.join(sourceRoot, "nested-js.js"), "export const nested = true;\n"),
+				Bun.write(path.join(sourceRoot, "type-only.ts"), "export interface TypeOnly { value: string }\n"),
+				Bun.write(path.join(sourceRoot, "barrel-only.ts"), "export const barrelOnly = true;\n"),
+				Bun.write(
+					path.join(runtimeRoot, "package.json"),
+					JSON.stringify({ name: "@test/runtime", exports: { "./*": { import: "./src/*.ts" } } }),
+				),
+				Bun.write(path.join(runtimeRoot, "src/engine.ts"), 'export const engine = import("./nested");\n'),
+				Bun.write(path.join(runtimeRoot, "src/nested.ts"), "export const nested = true;\n"),
+			]);
+			const paths = (await computeImplementationSources(repositoryRoot)).map(source => source.path);
+			expect(paths).toEqual([
+				"packages/agent/src/agent.ts",
+				"packages/agent/src/dynamic.ts",
+				"packages/agent/src/native.js",
+				"packages/agent/src/nested-js.js",
+				"packages/agent/src/runtime.ts",
+				"packages/runtime/src/engine.ts",
+				"packages/runtime/src/nested.ts",
+			]);
+		} finally {
+			await fs.rm(repositoryRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("hashes implementation sources as exact bytes", async () => {
+		const repositoryRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-implementation-source-bytes-"));
+		const fontPath = path.join(repositoryRoot, "crates/pi-natives/src/fonts/Silver.ttf");
+		const firstBytes = new Uint8Array([0x80]);
+		const secondBytes = new Uint8Array([0x81]);
+		try {
+			await Promise.all([
+				fs.mkdir(path.join(repositoryRoot, "packages/agent/src"), { recursive: true }),
+				fs.mkdir(path.dirname(fontPath), { recursive: true }),
+			]);
+			await Promise.all([
+				Bun.write(path.join(repositoryRoot, "packages/agent/src/agent.ts"), "export {};\n"),
+				Bun.write(fontPath, firstBytes),
+			]);
+			expect(new TextDecoder().decode(firstBytes)).toBe(new TextDecoder().decode(secondBytes));
+			const firstHash = (await computeImplementationSources(repositoryRoot)).find(
+				source => source.path === "crates/pi-natives/src/fonts/Silver.ttf",
+			)?.sha256;
+
+			await Bun.write(fontPath, secondBytes);
+			const secondHash = (await computeImplementationSources(repositoryRoot)).find(
+				source => source.path === "crates/pi-natives/src/fonts/Silver.ttf",
+			)?.sha256;
+
+			expect(firstHash).toBe(sha256(firstBytes));
+			expect(secondHash).toBe(sha256(secondBytes));
+			expect(secondHash).not.toBe(firstHash);
+		} finally {
+			await fs.rm(repositoryRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("requires normalized Unicode code-point-sorted implementation paths", () => {
+		const manifest = trackedContentManifest();
+		const hostile = [
+			"packages/agent/src/compaction/prefix.ts",
+			"packages/agent/src/compaction/prefix/a.ts",
+			"packages/agent/src/compaction/A.ts",
+			"packages/agent/src/compaction/a.ts",
+			"packages/agent/src/compaction/\u{e000}.ts",
+			"packages/agent/src/compaction/\u{1f600}.ts",
+		]
+			.sort(compareUnicodeCodePoints)
+			.map((sourcePath, index) => ({ path: sourcePath, sha256: index.toString(16).padStart(64, "0") }));
+		const validPayload = { ...manifest, implementationSources: hostile };
+		const { rootSha256: _validRoot, ...validWithoutRoot } = validPayload;
+		expect(
+			parseContentManifest(
+				JSON.stringify({
+					...validWithoutRoot,
+					rootSha256: sha256(canonicalJson(validWithoutRoot as unknown as JsonValue)),
+				}),
+			).implementationSources,
+		).toEqual(hostile);
+		const invalidPaths = [
+			[],
+			[...hostile].reverse(),
+			[{ path: "packages/agent/./src/compaction/x.ts", sha256: "c".repeat(64) }],
+			[{ path: "packages/agent/src/compaction/x.ts", sha256: "C".repeat(64) }],
+			[
+				{ path: "packages/agent/src/compaction/x.ts", sha256: "c".repeat(64) },
+				{ path: "packages/agent/src/compaction/x.ts", sha256: "d".repeat(64) },
+			],
+		];
+		for (const implementationSources of invalidPaths) {
+			const payload = { ...manifest, implementationSources };
+			const { rootSha256: _root, ...withoutRoot } = payload;
+			expect(() =>
+				parseContentManifest(
+					JSON.stringify({
+						...withoutRoot,
+						rootSha256: sha256(canonicalJson(withoutRoot as unknown as JsonValue)),
+					}),
+				),
+			).toThrow();
+		}
+	});
+
+	it("rejects mutated generated tool contract structure and values", async () => {
+		const source = await Bun.file(new URL("../../generated/tool-contracts.json", import.meta.url)).text();
+		const contracts = JSON.parse(source) as Record<string, unknown>;
+		expect(() => parseGeneratedToolContracts(JSON.stringify({ ...contracts, extra: true }))).toThrow();
+		const tools = contracts.tools as Array<Record<string, unknown>>;
+		expect(() =>
+			parseGeneratedToolContracts(
+				JSON.stringify({ ...contracts, tools: [{ ...tools[0], description: "mutated" }, ...tools.slice(1)] }),
+			),
+		).toThrow("root does not match");
+	});
+
+	it("exports hashes from exact final provider-rendered tool contracts", () => {
+		const binding = {
+			contentManifestRootSha256: "a".repeat(64),
+			configurationSemanticSha256: "b".repeat(64),
+		};
+		const payload = {
+			tools: [
+				{
+					type: "function",
+					function: {
+						name: "write",
+						description: "",
+						parameters: { type: "object", properties: { i: { type: "string" } }, required: ["i"] },
+					},
+				},
+			],
+		};
+		const exported = exportRenderedToolContracts(payload, { provider: "openai", id: "gpt-test" }, binding);
+		expect(exported).toMatchObject({
+			schema: "omp.rendered_tool_contracts.v1",
+			provider: "openai",
+			model: "gpt-test",
+			...binding,
+			tools: [{ id: "tool.write", description: "" }],
+		});
+		expect(exported.tools[0]?.descriptionSha256).toBe(sha256(""));
+		expect(exported.tools[0]?.schemaSha256).toBe(
+			sha256(canonicalJson({ type: "object", properties: { i: { type: "string" } }, required: ["i"] })),
+		);
+		const { rootSha256, ...rootPayload } = exported;
+		expect(rootSha256).toBe(sha256(canonicalJson(rootPayload as unknown as JsonValue)));
+
+		const transformed = structuredClone(payload);
+		transformed.tools[0]!.function.description = "provider/model transform drift";
+		expect(
+			exportRenderedToolContracts(transformed, { provider: "openai", id: "gpt-test" }, binding).rootSha256,
+		).not.toBe(exported.rootSha256);
+		expect(
+			exportRenderedToolContracts(payload, { provider: "openai", id: "gpt-other" }, binding).rootSha256,
+		).not.toBe(exported.rootSha256);
+		expect(
+			exportRenderedToolContracts(
+				payload,
+				{ provider: "openai", id: "gpt-test" },
+				{
+					...binding,
+					configurationSemanticSha256: "c".repeat(64),
+				},
+			).rootSha256,
+		).not.toBe(exported.rootSha256);
+		expect(() =>
+			exportRenderedToolContracts(
+				payload,
+				{ provider: "openai", id: "gpt-test" },
+				{
+					...binding,
+					contentManifestRootSha256: "not-a-hash",
+				},
+			),
+		).toThrow("lowercase SHA-256");
+	});
+
+	it("uses a self-excluding canonical root", () => {
+		const manifest = trackedContentManifest();
+		const { rootSha256, ...payload } = manifest;
+		expect(rootSha256).toBe(sha256(canonicalJson(payload as unknown as JsonValue)));
+	});
+});

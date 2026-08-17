@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import { streamOpenAIResponses } from "@oh-my-pi/pi-ai/providers/openai-responses";
 import { configureCredentialRedaction } from "@oh-my-pi/pi-ai/providers/transform-messages";
-import type { Context, FetchImpl, Model, ModelSpec } from "@oh-my-pi/pi-ai/types";
+import type { Context, ContextInstruction, FetchImpl, Model, ModelSpec } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 
@@ -12,6 +12,16 @@ afterAll(() => configureCredentialRedaction(false));
 const gpt4oMiniModel = getBundledModel("openai", "gpt-4o-mini") as Model<"openai-responses">;
 // Reasoning model on api.openai.com (developer-role path)
 const o4MiniModel = getBundledModel("openai", "o4-mini") as Model<"openai-responses">;
+
+const internalInstruction: ContextInstruction = {
+	id: "goal.continuation",
+	sourcePath: "packages/coding-agent/src/prompts/goals/continuation.md",
+	role: "internal_context",
+	target: "main",
+	trigger: "goal-continuation",
+	sha256: "test-sha256",
+	renderedText: "Continue the active goal without overriding the user.",
+};
 
 function createSseResponse(): Response {
 	const events = [
@@ -66,6 +76,19 @@ afterEach(() => {
 
 describe("openai-responses system prompt routing", () => {
 	describe("non-reasoning model (canonical instructions field)", () => {
+		it("maps typed internal context to developer on an official OpenAI endpoint", async () => {
+			const body = await captureRequestBody(gpt4oMiniModel, {
+				systemPrompt: ["Primary system instruction."],
+				instructions: [internalInstruction],
+				messages: [{ role: "user", content: "hi", timestamp: Date.now() }],
+			});
+
+			expect(body.instructions).toBe("Primary system instruction.");
+			const input = body.input as Array<{ role: string; content: unknown }>;
+			expect(input[0]).toEqual({ role: "developer", content: internalInstruction.renderedText });
+			expect(input.filter(item => item.role === "user")).toHaveLength(1);
+		});
+
 		it("sends single system prompt as top-level instructions", async () => {
 			const context: Context = {
 				systemPrompt: ["You are a helpful assistant."],
@@ -161,6 +184,24 @@ describe("openai-responses system prompt routing", () => {
 	});
 
 	describe("reasoning model on custom proxy (instructions path)", () => {
+		it("maps typed internal context to the proxy system channel, never a user turn", async () => {
+			const proxyModel: Model<"openai-responses"> = buildModel({
+				...o4MiniModel,
+				api: "openai-responses",
+				baseUrl: "https://proxy.example.com/v1",
+				compat: o4MiniModel.compatConfig,
+			} as ModelSpec<"openai-responses">);
+			const body = await captureRequestBody(proxyModel, {
+				instructions: [internalInstruction],
+				messages: [{ role: "user", content: "hi", timestamp: Date.now() }],
+			});
+
+			expect(body.instructions).toBe(internalInstruction.renderedText);
+			const input = body.input as Array<{ role: string }>;
+			expect(input.filter(item => item.role === "user")).toHaveLength(1);
+			expect(input.some(item => item.role === "developer" || item.role === "system")).toBe(false);
+		});
+
 		it("uses instructions for reasoning model on non-official endpoint", async () => {
 			const proxyModel: Model<"openai-responses"> = buildModel({
 				...o4MiniModel,

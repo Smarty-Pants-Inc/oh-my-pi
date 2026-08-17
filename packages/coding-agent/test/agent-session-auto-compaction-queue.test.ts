@@ -27,8 +27,7 @@ function getRuntimeSignals(): string[] {
 }
 
 /**
- * Regression test: auto-compaction completion should resume the agent loop when
- * there are queued agent-level messages (follow-up/steering/custom).
+ * Regression tests for authority-scoped queue handling after compaction.
  */
 describe("AgentSession auto-compaction queue resume", () => {
 	let tempDir: TempDir;
@@ -145,7 +144,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 		tempDir.removeSync();
 	});
 
-	it("resumes after threshold compaction when only agent-level queued messages exist", async () => {
+	it("does not resume after threshold compaction for an unscoped custom message", async () => {
 		session.agent.followUp({
 			role: "custom",
 			customType: "test",
@@ -156,16 +155,8 @@ describe("AgentSession auto-compaction queue resume", () => {
 
 		expect(session.agent.hasQueuedMessages()).toBe(true);
 
-		const continueSpy = vi.spyOn(session.agent, "continue").mockImplementation(async () => {
-			// Real continue() polls and consumes the queued steering/follow-up
-			// messages. Mirror that here so the stranded-queue drain settles after
-			// one resume instead of rescheduling itself forever (a no-op mock
-			// leaves the queue populated, spinning the drain into an OOM loop).
-			session.agent.clearAllQueues();
-		});
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue(undefined);
 
-		// The continuation is already scheduled when the public agent_end arrives,
-		// so consumers must see it as a non-terminal scheduling pause.
 		const agentEndTerminalStates: Array<boolean | undefined> = [];
 		const { promise: compactionDone, resolve: onCompactionDone } = Promise.withResolvers<void>();
 		session.subscribe((event: AgentSessionEvent) => {
@@ -202,24 +193,18 @@ describe("AgentSession auto-compaction queue resume", () => {
 		session.agent.emitExternalEvent({ type: "message_end", message: assistantMsg });
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
 
-		// Wait for compaction completion, then verify waitForIdle blocks on queued continuation.
+		// The custom message remains queued for the next explicit user turn.
 		await compactionDone;
 		await Promise.resolve();
-		const idlePromise = session.waitForIdle();
-		let idleResolved = false;
-		void idlePromise.then(() => {
-			idleResolved = true;
-		});
-		await Promise.resolve();
-		expect(idleResolved).toBe(false);
-		vi.advanceTimersByTime(200);
-		await idlePromise;
+		await session.waitForIdle();
 
-		expect(continueSpy).toHaveBeenCalledTimes(1);
+		expect(continueSpy).not.toHaveBeenCalled();
+		expect(session.agent.hasQueuedMessages()).toBe(true);
 		const runtimeSignals = getRuntimeSignals();
 		expect(runtimeSignals).toContain("compaction:start:threshold");
 		expect(runtimeSignals.some(signal => signal.startsWith("compaction:end:"))).toBe(true);
-		expect(agentEndTerminalStates).toEqual([false]);
+		expect(agentEndTerminalStates).toEqual([true]);
+		session.agent.clearAllQueues();
 	});
 
 	it("marks manual compaction active before abort teardown can yield", async () => {
@@ -293,6 +278,13 @@ describe("AgentSession auto-compaction queue resume", () => {
 		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
 
 		const continueSpy = vi.spyOn(session.agent, "continue").mockImplementation(async () => {
+			expect([...session.agent.peekSteeringQueue(), ...session.agent.peekFollowUpQueue()]).toEqual([
+				expect.objectContaining({
+					role: "user",
+					content: "please respond after compaction",
+					attribution: "user",
+				}),
+			]);
 			session.agent.clearAllQueues();
 		});
 
@@ -307,10 +299,19 @@ describe("AgentSession auto-compaction queue resume", () => {
 			await Promise.resolve();
 		}
 
-		// A message arrives DURING compaction (post-abort, still disconnected).
+		// An agent-attributed IRC record arrives before the user's message. It must
+		// stay parked while the attributed user owns the resumed direct turn.
+		session.agent.steer({
+			role: "user",
+			content: "parent IRC must stay passive",
+			attribution: "agent",
+			steering: true,
+			timestamp: Date.now(),
+		});
 		session.agent.followUp({
 			role: "user",
 			content: "please respond after compaction",
+			attribution: "user",
 			timestamp: Date.now(),
 		});
 		expect(session.agent.hasQueuedMessages()).toBe(true);
@@ -321,6 +322,11 @@ describe("AgentSession auto-compaction queue resume", () => {
 
 		// compact()'s finally re-drained the stranded queue after reconnecting.
 		expect(continueSpy).toHaveBeenCalledTimes(1);
+		expect(session.agent.peekSteeringQueue()).toEqual([
+			expect.objectContaining({ content: "parent IRC must stay passive", attribution: "agent" }),
+		]);
+		expect(session.agent.peekFollowUpQueue()).toEqual([]);
+		session.agent.clearAllQueues();
 	});
 
 	it("cancels an in-flight auto-compaction when manual compact startup aborts", async () => {
@@ -957,7 +963,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 		expect(capturedIsCompacting).toBe(true);
 	});
 
-	it("forwards todo reminder lifecycle signals to extensions", async () => {
+	it("does not emit todo reminder lifecycle signals or continue automatically", async () => {
 		vi.spyOn(session, "getActiveToolNames").mockReturnValue(["todo"]);
 		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
 
@@ -968,9 +974,9 @@ describe("AgentSession auto-compaction queue resume", () => {
 			},
 		]);
 
-		const { promise: reminderDone, resolve: onReminderDone } = Promise.withResolvers<void>();
+		const { promise: agentEnd, resolve: onAgentEnd } = Promise.withResolvers<void>();
 		session.subscribe(event => {
-			if (event.type === "todo_reminder") onReminderDone();
+			if (event.type === "agent_end") onAgentEnd();
 		});
 
 		const assistantMsg = {
@@ -995,11 +1001,11 @@ describe("AgentSession auto-compaction queue resume", () => {
 		session.agent.emitExternalEvent({ type: "message_end", message: assistantMsg });
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
 
-		await withTimeout(reminderDone, 1000, "Todo reminder timed out");
+		await withTimeout(agentEnd, 1000, "Agent end timed out");
 		await Promise.resolve();
 
-		expect(getRuntimeSignals()).toContain("todo:1/3");
-		expect(continueSpy).toHaveBeenCalledTimes(1);
+		expect(getRuntimeSignals().some(signal => signal.startsWith("todo:"))).toBe(false);
+		expect(continueSpy).not.toHaveBeenCalled();
 		await session.waitForIdle();
 	});
 });

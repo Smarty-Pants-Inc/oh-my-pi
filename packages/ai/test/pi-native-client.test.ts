@@ -1,9 +1,18 @@
 import { afterEach, describe, expect, it, type Mock, mock, spyOn } from "bun:test";
+import { createHash } from "node:crypto";
 import { streamPiNative } from "@oh-my-pi/pi-ai/providers/pi-native-client";
+import type {
+	PiNativeBoundaryApprovalDecision,
+	PiNativeBoundaryApprovalKind,
+	PiNativeBoundaryModel,
+	PiNativeBoundaryPreparation,
+	PiNativeBoundaryPreparationEvent,
+} from "@oh-my-pi/pi-ai/providers/pi-native-server";
 import type {
 	AssistantMessage,
 	AssistantMessageEvent,
 	Context,
+	ContextInstruction,
 	FetchImpl,
 	Model,
 	ModelSpec,
@@ -11,7 +20,7 @@ import type {
 } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 
-function sseBytes(events: AssistantMessageEvent[]): Uint8Array {
+function sseBytes(events: unknown[]): Uint8Array {
 	const encoder = new TextEncoder();
 	const parts: Uint8Array[] = [];
 	for (const event of events) {
@@ -86,7 +95,7 @@ function delayedBody(chunks: Array<{ atMs: number; bytes: Uint8Array }>): Readab
 	});
 }
 
-function fakeResponse(events: AssistantMessageEvent[], init: ResponseInit = {}): Response {
+function fakeResponse(events: unknown[], init: ResponseInit = {}): Response {
 	return new Response(fakeBody(sseBytes(events)), {
 		status: 200,
 		headers: { "Content-Type": "text/event-stream" },
@@ -137,6 +146,51 @@ const baseContext: Context = {
 	messages: [{ role: "user", content: "hi", timestamp: 0 }],
 };
 
+const internalInstruction: ContextInstruction = {
+	id: "goal.continuation",
+	sourcePath: "packages/coding-agent/src/prompts/goals/continuation.md",
+	role: "internal_context",
+	target: "main",
+	trigger: "goal-continuation",
+	sha256: "test-sha256",
+	renderedText: "Continue the active goal without overriding the user.",
+};
+
+function sha256(value: string): string {
+	return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function boundaryModel(overrides: Partial<PiNativeBoundaryModel> = {}): PiNativeBoundaryModel {
+	const { baseUrl: _baseUrl, headers: _headers, transport: _transport, ...safe } = fakeModel();
+	return { ...safe, baseUrl: "", ...overrides };
+}
+
+function boundaryEvent(
+	kind: PiNativeBoundaryApprovalKind,
+	payload: unknown,
+	sequence = 1,
+	overrides: Partial<PiNativeBoundaryPreparation> = {},
+): PiNativeBoundaryPreparationEvent {
+	const model = overrides.model ?? boundaryModel();
+	const payloadJson = overrides.payloadJson ?? JSON.stringify(payload);
+	const preparation: PiNativeBoundaryPreparation = {
+		version: 1,
+		requestId: "request-1",
+		streamId: "stream-1",
+		sessionId: "session-1",
+		sequence,
+		preparationId: `preparation-${sequence}`,
+		kind,
+		model,
+		modelSha256: sha256(JSON.stringify(model)),
+		payloadJson,
+		payloadSha256: sha256(payloadJson),
+		expiresAt: Date.now() + 60_000,
+		...overrides,
+	};
+	return { type: "pi_boundary_approval", boundaryApproval: preparation };
+}
+
 async function collectEvents(stream: AsyncIterable<AssistantMessageEvent>): Promise<AssistantMessageEvent[]> {
 	const out: AssistantMessageEvent[] = [];
 	for await (const event of stream) out.push(event);
@@ -148,6 +202,26 @@ afterEach(() => {
 });
 
 describe("streamPiNative request shape", () => {
+	it("preserves typed instruction semantics and provenance for server-side mapping", async () => {
+		let body: { context?: Context } = {};
+		const context: Context = {
+			...baseContext,
+			instructions: [internalInstruction],
+		};
+		const fetchImpl: FetchImpl = (async (_input, init) => {
+			body = JSON.parse(init?.body as string) as { context?: Context };
+			return fakeResponse([{ type: "done", reason: "stop", message: baseAssistant() }]);
+		}) as FetchImpl;
+
+		await streamPiNative(fakeModel(), context, {
+			apiKey: "gw-bearer",
+			fetch: fetchImpl,
+		}).result();
+
+		expect(body.context?.instructions).toEqual([internalInstruction]);
+		expect(body.context?.messages).toEqual(baseContext.messages);
+	});
+
 	it("POSTs `{modelId, context, options, stream:true}` to `<baseUrl>/v1/pi/stream`", async () => {
 		const final = baseAssistant();
 		const captured: { url?: string; init?: RequestInit } = {};
@@ -180,21 +254,45 @@ describe("streamPiNative request shape", () => {
 		expect(body.options.temperature).toBe(0.7);
 	});
 
-	it("strips non-wire fields (signal, apiKey, fetch, callbacks) from `options`", async () => {
+	it("approves provider payload and tool-contract boundaries while stripping callback closures", async () => {
 		// `apiKey` must ride in the Authorization header, never the body — sending
 		// it twice would let a logged request leak the gateway bearer. The other
 		// fields are non-serializable function/runtime handles.
-		const captured: { init?: RequestInit } = {};
+		const captured: {
+			init?: RequestInit;
+			decisions: PiNativeBoundaryApprovalDecision[];
+		} = { decisions: [] };
 		let responseMetadata: ProviderResponseMetadata | undefined;
-		const fetchImpl: FetchImpl = (async (_input, init) => {
+		let observedPayload: unknown;
+		let observedContracts: unknown;
+		let observedModel: Model | undefined;
+		const providerPayload = {
+			model: "wire-model",
+			messages: [{ role: "developer", content: "provider prompt" }],
+		};
+		const toolContracts = {
+			tools: [{ name: "read", description: "Read", input_schema: { type: "object" } }],
+		};
+		const fetchImpl: FetchImpl = (async (input, init) => {
+			if (String(input).endsWith("/v1/pi/boundary-approval")) {
+				captured.decisions.push(JSON.parse(String(init?.body)) as PiNativeBoundaryApprovalDecision);
+				return new Response(JSON.stringify({ ok: true }), { status: 200 });
+			}
 			captured.init = init;
-			return fakeResponse([{ type: "done", reason: "stop", message: baseAssistant() }], {
-				headers: {
-					"Content-Type": "text/event-stream",
-					"X-Request-Id": "gateway-request-id",
-					"CF-AIG-Cache-Status": "HIT",
+			return fakeResponse(
+				[
+					boundaryEvent("payload", providerPayload),
+					boundaryEvent("toolContracts", toolContracts, 2),
+					{ type: "done", reason: "stop", message: baseAssistant() },
+				],
+				{
+					headers: {
+						"Content-Type": "text/event-stream",
+						"X-Request-Id": "request-1",
+						"CF-AIG-Cache-Status": "HIT",
+					},
 				},
-			});
+			);
 		}) as FetchImpl;
 
 		const controller = new AbortController();
@@ -202,8 +300,14 @@ describe("streamPiNative request shape", () => {
 			apiKey: "gw-bearer",
 			fetch: fetchImpl,
 			signal: controller.signal,
-			onPayload: () => {
-				throw new Error("the gateway payload is unavailable to the client");
+			onPayload: async (payload, payloadModel) => {
+				await Promise.resolve();
+				observedPayload = payload;
+				observedModel = payloadModel;
+			},
+			onToolContracts: async payload => {
+				await Promise.resolve();
+				observedContracts = payload;
 			},
 			onResponse: response => {
 				responseMetadata = response;
@@ -219,18 +323,230 @@ describe("streamPiNative request shape", () => {
 		expect("signal" in body.options).toBe(false);
 		expect("fetch" in body.options).toBe(false);
 		expect("onPayload" in body.options).toBe(false);
+		expect("onToolContracts" in body.options).toBe(false);
 		expect("onResponse" in body.options).toBe(false);
 		expect("onSseEvent" in body.options).toBe(false);
 		expect("providerSessionState" in body.options).toBe(false);
 		// And the legitimate options survive
 		expect(body.options.maxTokens).toBe(1024);
+		expect(body.boundaryApproval).toEqual({
+			version: 1,
+			payload: true,
+			toolContracts: true,
+		});
+		expect(observedPayload).toEqual(providerPayload);
+		expect(observedContracts).toEqual(toolContracts);
+		expect(observedModel).toEqual(boundaryModel());
+		expect(captured.decisions.map(decision => [decision.kind, decision.decision])).toEqual([
+			["payload", "keep"],
+			["toolContracts", "keep"],
+		]);
 		expect(responseMetadata).toMatchObject({
 			status: 200,
-			requestId: "gateway-request-id",
+			requestId: "request-1",
 			headers: {
-				"x-request-id": "gateway-request-id",
+				"x-request-id": "request-1",
 				"cf-aig-cache-status": "HIT",
 			},
+		});
+	});
+
+	it("uses a protected-only route so an old gateway cannot ignore approval fields and dispatch", async () => {
+		let legacyDispatches = 0;
+		let requestedUrl = "";
+		let callbackCalls = 0;
+		const oldGatewayFetch: FetchImpl = (async input => {
+			requestedUrl = String(input);
+			if (requestedUrl.endsWith("/v1/pi/stream")) {
+				legacyDispatches++;
+				return fakeResponse([{ type: "done", reason: "stop", message: baseAssistant() }]);
+			}
+			return new Response(JSON.stringify({ error: "No route" }), {
+				status: 404,
+				headers: { "Content-Type": "application/json" },
+			});
+		}) as FetchImpl;
+
+		await expect(
+			streamPiNative(fakeModel(), baseContext, {
+				apiKey: "gw-bearer",
+				fetch: oldGatewayFetch,
+				onPayload: () => {
+					callbackCalls++;
+				},
+			}).result(),
+		).rejects.toThrow("No route");
+
+		expect(requestedUrl).toBe("http://llm-gateway.internal:4000/v1/pi/boundary-stream/v1");
+		expect(legacyDispatches).toBe(0);
+		expect(callbackCalls).toBe(0);
+	});
+
+	it("returns replacement bytes and separately approves final rendered tool contracts", async () => {
+		const decisions: PiNativeBoundaryApprovalDecision[] = [];
+		let contracts: unknown;
+		const order: string[] = [];
+		const providerPayload = {
+			model: "original-wire-model",
+			messages: [{ role: "user", content: "request" }],
+		};
+		const replacementPayload = {
+			...providerPayload,
+			model: "replacement-wire-model",
+		};
+		const renderedContracts = {
+			tools: [{ name: "replacement_tool", input_schema: { type: "object" } }],
+		};
+		const fetchImpl: FetchImpl = (async (input, init) => {
+			if (String(input).endsWith("/v1/pi/boundary-approval")) {
+				order.push("approval");
+				decisions.push(JSON.parse(String(init?.body)) as PiNativeBoundaryApprovalDecision);
+				return new Response(JSON.stringify({ ok: true }), { status: 200 });
+			}
+			order.push("stream-fetch");
+			return fakeResponse([
+				boundaryEvent("payload", providerPayload),
+				boundaryEvent("toolContracts", renderedContracts, 2),
+				{ type: "done", reason: "stop", message: baseAssistant() },
+			]);
+		}) as FetchImpl;
+
+		await streamPiNative(fakeModel(), baseContext, {
+			apiKey: "gw-bearer",
+			fetch: fetchImpl,
+			maxTokens: 1024,
+			onPayload: async payload => {
+				order.push("payload-start");
+				await Promise.resolve();
+				order.push("payload-end");
+				expect(payload).toEqual(providerPayload);
+				return replacementPayload;
+			},
+			onToolContracts: async payload => {
+				order.push("contracts-start");
+				await Promise.resolve();
+				contracts = payload;
+				order.push("contracts-end");
+			},
+		}).result();
+
+		expect(order).toEqual([
+			"stream-fetch",
+			"payload-start",
+			"payload-end",
+			"approval",
+			"contracts-start",
+			"contracts-end",
+			"approval",
+		]);
+		expect(JSON.parse(decisions[0]?.replacementJson ?? "null")).toEqual(replacementPayload);
+		expect(decisions[0]?.decision).toBe("replace");
+		expect(decisions[1]?.decision).toBe("keep");
+		expect(contracts).toEqual(renderedContracts);
+	});
+
+	it("approves every changed provider retry as a new monotonic preparation", async () => {
+		const seen: unknown[] = [];
+		const decisions: PiNativeBoundaryApprovalDecision[] = [];
+		const first = {
+			model: "wire-model",
+			tools: [{ function: { strict: true } }],
+		};
+		const retry = {
+			model: "wire-model",
+			tools: [{ function: { strict: false } }],
+		};
+		const fetchImpl: FetchImpl = (async (input, init) => {
+			if (String(input).endsWith("/v1/pi/boundary-approval")) {
+				decisions.push(JSON.parse(String(init?.body)) as PiNativeBoundaryApprovalDecision);
+				return new Response(JSON.stringify({ ok: true }), { status: 200 });
+			}
+			return fakeResponse([
+				boundaryEvent("payload", first, 1),
+				boundaryEvent("payload", retry, 2),
+				{ type: "done", reason: "stop", message: baseAssistant() },
+			]);
+		}) as FetchImpl;
+
+		await streamPiNative(fakeModel(), baseContext, {
+			apiKey: "gw-bearer",
+			fetch: fetchImpl,
+			onPayload: payload => {
+				seen.push(payload);
+			},
+		}).result();
+
+		expect(seen).toEqual([first, retry]);
+		expect(decisions.map(decision => decision.sequence)).toEqual([1, 2]);
+		expect(decisions.map(decision => decision.payloadSha256)).toEqual([
+			sha256(JSON.stringify(first)),
+			sha256(JSON.stringify(retry)),
+		]);
+	});
+
+	it("rejects tampered payload hashes and replayed sequence numbers before callback dispatch", async () => {
+		let callbackCalls = 0;
+		let approvalCalls = 0;
+		const tamperedHash = boundaryEvent("payload", { model: "wire-model" }, 1, {
+			payloadSha256: "0".repeat(64),
+		});
+		await expect(
+			streamPiNative(fakeModel(), baseContext, {
+				apiKey: "gw-bearer",
+				fetch: (async () => fakeResponse([tamperedHash])) as FetchImpl,
+				onPayload: () => {
+					callbackCalls++;
+				},
+			}).result(),
+		).rejects.toThrow("custody check failed");
+
+		const first = boundaryEvent("payload", { attempt: 1 }, 1);
+		const replay = boundaryEvent("payload", { attempt: 2 }, 1, {
+			preparationId: "preparation-replay",
+		});
+		await expect(
+			streamPiNative(fakeModel(), baseContext, {
+				apiKey: "gw-bearer",
+				fetch: (async input => {
+					if (String(input).endsWith("/v1/pi/boundary-approval")) {
+						approvalCalls++;
+						return new Response(JSON.stringify({ ok: true }), { status: 200 });
+					}
+					return fakeResponse([first, replay]);
+				}) as FetchImpl,
+				onPayload: () => {
+					callbackCalls++;
+				},
+			}).result(),
+		).rejects.toThrow("sequence binding mismatch");
+
+		expect(callbackCalls).toBe(1);
+		expect(approvalCalls).toBe(1);
+	});
+
+	it("rejects the suspended provider boundary when the async payload guard rejects", async () => {
+		const decisions: PiNativeBoundaryApprovalDecision[] = [];
+		const stream = streamPiNative(fakeModel(), baseContext, {
+			apiKey: "gw-bearer",
+			fetch: (async (input, init) => {
+				if (String(input).endsWith("/v1/pi/boundary-approval")) {
+					decisions.push(JSON.parse(String(init?.body)) as PiNativeBoundaryApprovalDecision);
+					return new Response(JSON.stringify({ ok: true }), { status: 200 });
+				}
+				return fakeResponse([boundaryEvent("payload", { model: "wire-model", messages: [] })]);
+			}) as FetchImpl,
+			onPayload: async () => {
+				await Promise.resolve();
+				throw new Error("pi-native payload denied");
+			},
+		});
+
+		await expect(stream.result()).rejects.toThrow("pi-native payload denied");
+		expect(decisions).toHaveLength(1);
+		expect(decisions[0]).toMatchObject({
+			kind: "payload",
+			decision: "reject",
+			error: "pi-native payload denied",
 		});
 	});
 
@@ -256,7 +572,12 @@ describe("streamPiNative request shape", () => {
 		}) as FetchImpl;
 
 		await streamPiNative(
-			fakeModel({ headers: { "x-omp-slot": "robomp-1", Authorization: "Bearer model-wins" } }),
+			fakeModel({
+				headers: {
+					"x-omp-slot": "robomp-1",
+					Authorization: "Bearer model-wins",
+				},
+			}),
 			baseContext,
 			{ apiKey: "options-loses", fetch: fetchImpl },
 		).result();
@@ -295,7 +616,10 @@ describe("streamPiNative event flow", () => {
 		];
 		const fetchImpl: FetchImpl = (async () => fakeResponse(events)) as FetchImpl;
 
-		const stream = streamPiNative(fakeModel(), baseContext, { apiKey: "k", fetch: fetchImpl });
+		const stream = streamPiNative(fakeModel(), baseContext, {
+			apiKey: "k",
+			fetch: fetchImpl,
+		});
 		const seen = await collectEvents(stream);
 		const result = await stream.result();
 
@@ -305,24 +629,38 @@ describe("streamPiNative event flow", () => {
 
 	it("classifies non-2xx responses into Errors with status + type tags", async () => {
 		const fetchImpl: FetchImpl = (async () =>
-			new Response(JSON.stringify({ error: { type: "authentication_error", message: "no credential" } }), {
-				status: 401,
-				headers: { "Content-Type": "application/json" },
-			})) as FetchImpl;
+			new Response(
+				JSON.stringify({
+					error: { type: "authentication_error", message: "no credential" },
+				}),
+				{
+					status: 401,
+					headers: { "Content-Type": "application/json" },
+				},
+			)) as FetchImpl;
 
-		const stream = streamPiNative(fakeModel(), baseContext, { apiKey: "k", fetch: fetchImpl });
+		const stream = streamPiNative(fakeModel(), baseContext, {
+			apiKey: "k",
+			fetch: fetchImpl,
+		});
 		await expect(stream.result()).rejects.toThrow(/no credential/);
 	});
 
 	it("falls back to plain text on a non-JSON error body", async () => {
 		const fetchImpl: FetchImpl = (async () => new Response("bad gateway", { status: 502 })) as FetchImpl;
-		const stream = streamPiNative(fakeModel(), baseContext, { apiKey: "k", fetch: fetchImpl });
+		const stream = streamPiNative(fakeModel(), baseContext, {
+			apiKey: "k",
+			fetch: fetchImpl,
+		});
 		await expect(stream.result()).rejects.toThrow(/502/);
 	});
 
 	it("rejects when the gateway sends headers but no first event before the timeout", async () => {
 		const fetchImpl: FetchImpl = (async () =>
-			new Response(stalledBody(), { status: 200, headers: { "Content-Type": "text/event-stream" } })) as FetchImpl;
+			new Response(stalledBody(), {
+				status: 200,
+				headers: { "Content-Type": "text/event-stream" },
+			})) as FetchImpl;
 
 		const stream = streamPiNative(fakeModel(), baseContext, {
 			apiKey: "k",
@@ -344,7 +682,10 @@ describe("streamPiNative event flow", () => {
 					headers: { "Content-Type": "text/event-stream" },
 				})) as FetchImpl;
 
-			const stream = streamPiNative(fakeModel(), baseContext, { apiKey: "k", fetch: fetchImpl });
+			const stream = streamPiNative(fakeModel(), baseContext, {
+				apiKey: "k",
+				fetch: fetchImpl,
+			});
 
 			await expect(stream.result()).rejects.toThrow(/first event/);
 		} finally {
@@ -360,7 +701,12 @@ describe("streamPiNative event flow", () => {
 		const partial = baseAssistant({ content: [{ type: "text", text: "hi" }] });
 		const chunks = [
 			sseEventBytes({ type: "start", partial: baseAssistant() }),
-			sseEventBytes({ type: "text_delta", contentIndex: 0, delta: "hi", partial }),
+			sseEventBytes({
+				type: "text_delta",
+				contentIndex: 0,
+				delta: "hi",
+				partial,
+			}),
 		];
 		const fetchImpl: FetchImpl = (async () =>
 			new Response(stalledBody(chunks), {
@@ -379,12 +725,36 @@ describe("streamPiNative event flow", () => {
 	});
 
 	it("does not time out a healthy pi-native stream that keeps making semantic progress", async () => {
-		const final = baseAssistant({ content: [{ type: "text", text: "hello world" }] });
+		const final = baseAssistant({
+			content: [{ type: "text", text: "hello world" }],
+		});
 		const chunks = [
-			{ atMs: 0, bytes: sseEventBytes({ type: "start", partial: baseAssistant() }) },
-			{ atMs: 15, bytes: sseEventBytes({ type: "text_delta", contentIndex: 0, delta: "hello", partial: final }) },
-			{ atMs: 35, bytes: sseEventBytes({ type: "text_delta", contentIndex: 0, delta: " world", partial: final }) },
-			{ atMs: 55, bytes: sseEventBytes({ type: "done", reason: "stop", message: final }) },
+			{
+				atMs: 0,
+				bytes: sseEventBytes({ type: "start", partial: baseAssistant() }),
+			},
+			{
+				atMs: 15,
+				bytes: sseEventBytes({
+					type: "text_delta",
+					contentIndex: 0,
+					delta: "hello",
+					partial: final,
+				}),
+			},
+			{
+				atMs: 35,
+				bytes: sseEventBytes({
+					type: "text_delta",
+					contentIndex: 0,
+					delta: " world",
+					partial: final,
+				}),
+			},
+			{
+				atMs: 55,
+				bytes: sseEventBytes({ type: "done", reason: "stop", message: final }),
+			},
 		];
 		const fetchImpl: FetchImpl = (async () =>
 			new Response(delayedBody(chunks), {
@@ -416,9 +786,15 @@ describe("streamPiNative event flow", () => {
 			},
 		});
 		const fetchImpl: FetchImpl = (async () =>
-			new Response(body, { status: 200, headers: { "Content-Type": "text/event-stream" } })) as FetchImpl;
+			new Response(body, {
+				status: 200,
+				headers: { "Content-Type": "text/event-stream" },
+			})) as FetchImpl;
 
-		const stream = streamPiNative(fakeModel(), baseContext, { apiKey: "k", fetch: fetchImpl });
+		const stream = streamPiNative(fakeModel(), baseContext, {
+			apiKey: "k",
+			fetch: fetchImpl,
+		});
 		const seen = await collectEvents(stream);
 		expect(seen.length).toBeGreaterThanOrEqual(2);
 		expect(seen[seen.length - 1].type).toBe("done");
@@ -448,7 +824,10 @@ describe("streamPiNative event flow", () => {
 		const captured: { signal?: AbortSignal } = {};
 		const fetchImpl: FetchImpl = (async (_input, init) => {
 			captured.signal = init?.signal ?? undefined;
-			return new Response(stalledBody(), { status: 200, headers: { "Content-Type": "text/event-stream" } });
+			return new Response(stalledBody(), {
+				status: 200,
+				headers: { "Content-Type": "text/event-stream" },
+			});
 		}) as FetchImpl;
 		const controller = new AbortController();
 		const stream = streamPiNative(fakeModel(), baseContext, {

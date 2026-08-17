@@ -26,14 +26,11 @@ const ZERO_USAGE: Usage = {
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 };
 
-function userPrompt(ctx: Context): string {
-	const message = ctx.messages[0];
-	if (message?.role !== "user") throw new Error("summary request did not contain a user prompt");
-	if (typeof message.content === "string") return message.content;
-	return message.content
-		.filter((block): block is { type: "text"; text: string } => block.type === "text")
-		.map(block => block.text)
-		.join("");
+function internalContextPrompt(ctx: Context): string {
+	expect(ctx.messages).toEqual([]);
+	const instruction = ctx.instructions?.[0];
+	if (instruction?.role !== "internal_context") throw new Error("summary request lacked internal context");
+	return instruction.renderedText;
 }
 
 function assistantResponse(text: string): AssistantMessage {
@@ -73,7 +70,7 @@ describe("compaction summary input budgeting", () => {
 		const attempts: string[] = [];
 		const prompts: string[] = [];
 		const completeImpl: NonNullable<SummaryOptions["completeImpl"]> = async (_model, ctx) => {
-			const prompt = userPrompt(ctx);
+			const prompt = internalContextPrompt(ctx);
 			attempts.push(prompt);
 			if (Buffer.byteLength(prompt, "utf8") >= MODEL.contextWindow!) return oversizedResponse();
 			prompts.push(prompt);

@@ -1153,7 +1153,7 @@ describe("Settings", () => {
 			expect(settings.get("dev.autoqa")).toBe(true);
 			expect(settings.isConfigured("dev.autoqa")).toBe(false);
 			expect(settings.get("todo.remindersMax")).toBe(5);
-			expect(settings.get("todo.reminders")).toBe(true);
+			expect(settings.get("todo.reminders")).toBe(false);
 			expect(settings.isConfigured("todo.reminders")).toBe(false);
 		});
 
@@ -1165,7 +1165,7 @@ describe("Settings", () => {
 			expect(settings.get("dev.autoqaConsent")).toBe("denied");
 			expect(settings.isConfigured("dev.autoqa")).toBe(false);
 			expect(settings.get("todo.remindersMax")).toBe(2);
-			expect(settings.get("todo.reminders")).toBe(true);
+			expect(settings.get("todo.reminders")).toBe(false);
 		});
 
 		it("lets explicit new keys win over legacy nested consent/max values", async () => {
@@ -1179,7 +1179,7 @@ describe("Settings", () => {
 			expect(settings.get("dev.autoqaConsent")).toBe("granted");
 			expect(settings.isConfigured("dev.autoqa")).toBe(false);
 			expect(settings.get("todo.remindersMax")).toBe(9);
-			expect(settings.get("todo.reminders")).toBe(true);
+			expect(settings.get("todo.reminders")).toBe(false);
 		});
 
 		it("preserves recoverable parent booleans alongside legacy leaf keys", async () => {
@@ -1234,7 +1234,7 @@ describe("Settings", () => {
 			expect(reloaded.get("dev.autoqaConsent")).toBe("denied");
 			expect(reloaded.isConfigured("dev.autoqa")).toBe(false);
 			expect(reloaded.get("todo.remindersMax")).toBe(1);
-			expect(reloaded.get("todo.reminders")).toBe(true);
+			expect(reloaded.get("todo.reminders")).toBe(false);
 		});
 
 		it("drops dead BM25-discovery keys and leaves tools.xdev at its default", async () => {

@@ -14,6 +14,7 @@ import type { KeyId } from "@oh-my-pi/pi-tui";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../../config/model-registry";
 import type { Settings } from "../../config/settings";
+import { type ContextReleaseManifest, isApprovedCandidateSource } from "../../context/manifest";
 import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
 import type { MemoryRuntimeContext } from "../../memory-backend";
 import { type Theme, theme } from "../../modes/theme/theme";
@@ -81,8 +82,65 @@ import type {
 
 /** Combined result from all before_agent_start handlers */
 interface BeforeAgentStartCombinedResult {
-	messages?: NonNullable<BeforeAgentStartEventResult["message"]>[];
+	messages?: Array<{
+		message: NonNullable<BeforeAgentStartEventResult["message"]>;
+		extensionPath: string;
+	}>;
 	systemPrompt?: string[];
+}
+
+export function serializedProviderPayload(value: unknown): string {
+	try {
+		return JSON.stringify(value);
+	} catch {
+		throw new Error("PROMPT_POLICY_REVIEW_REQUIRED: provider payload is not deterministically serializable");
+	}
+}
+
+export function assertApprovedProviderPayloadUnchanged(
+	approvedSnapshot: string,
+	currentPayload: unknown,
+	extensionPath: string,
+): void {
+	if (serializedProviderPayload(currentPayload) !== approvedSnapshot) {
+		throw new Error(
+			`PROMPT_POLICY_REVIEW_REQUIRED: ${extensionPath} changed the serialized provider payload after approval`,
+		);
+	}
+}
+
+export function assertApprovedPerTurnSystemPromptNotReplaced(
+	protectedRuntime: boolean,
+	replacement: string | string[] | undefined,
+	extensionPath: string,
+): void {
+	if (protectedRuntime && replacement !== undefined) {
+		throw new Error(`PROMPT_POLICY_REVIEW_REQUIRED: ${extensionPath} attempted a per-turn system prompt replacement`);
+	}
+}
+
+export function assertApprovedContextUnchanged(
+	approvedSnapshot: string | undefined,
+	currentMessages: AgentMessage[],
+	extensionPath: string,
+): void {
+	if (approvedSnapshot !== undefined && serializedProviderPayload(currentMessages) !== approvedSnapshot) {
+		throw new Error(`PROMPT_POLICY_REVIEW_REQUIRED: ${extensionPath} changed approved model context`);
+	}
+}
+
+export function assertApprovedInputUnchanged(
+	approvedSnapshot: string | undefined,
+	current: { text: string; images: ImageContent[] | undefined },
+	handled: boolean | undefined,
+	extensionPath: string,
+): void {
+	if (
+		approvedSnapshot !== undefined &&
+		(handled === true || serializedProviderPayload(current) !== approvedSnapshot)
+	) {
+		throw new Error(`PROMPT_POLICY_REVIEW_REQUIRED: ${extensionPath} changed approved direct input`);
+	}
 }
 
 export type ExtensionErrorListener = (error: ExtensionError) => void;
@@ -97,6 +155,10 @@ function throwUnsupportedServiceTierAction(): never {
 
 export function testSetExtensionHandlerTimeoutMs(timeoutMs: number): void {
 	extensionHandlerTimeoutMs = timeoutMs;
+}
+
+function normalizeHandlerTimeout(timeoutMs: number): number {
+	return Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : EXTENSION_HANDLER_TIMEOUT_MS;
 }
 
 /**
@@ -124,6 +186,11 @@ function handlerTimeoutForEvent(eventType: string): number {
 const EXTENSION_HANDLER_TIMEOUT = Symbol("extensionHandlerTimeout");
 const EXTENSION_HANDLER_ABORTED = Symbol("extensionHandlerAborted");
 
+interface HandlerTimeoutBudget {
+	pause(): void;
+	resume(): void;
+}
+
 function attachHandlerSignal(
 	dialogOptions: ExtensionUIDialogOptions | undefined,
 	handlerSignal: AbortSignal,
@@ -134,22 +201,57 @@ function attachHandlerSignal(
 	return { ...dialogOptions, signal: AbortSignal.any([dialogOptions.signal, handlerSignal]) };
 }
 
-function createHandlerUIContext(ui: ExtensionUIContext, handlerSignal: AbortSignal): ExtensionUIContext {
+function createHandlerUIContext(
+	ui: ExtensionUIContext,
+	handlerSignal: AbortSignal,
+	timeoutBudget?: HandlerTimeoutBudget,
+): ExtensionUIContext {
 	const askDialog = ui.askDialog;
+	const runDialog = async <T>(dialog: () => Promise<T>): Promise<T> => {
+		timeoutBudget?.pause();
+		try {
+			return await dialog();
+		} finally {
+			timeoutBudget?.resume();
+		}
+	};
 	const dialogMethods = {
 		select: (title, options, dialogOptions) =>
-			ui.select(title, options, attachHandlerSignal(dialogOptions, handlerSignal)),
+			runDialog(() => ui.select(title, options, attachHandlerSignal(dialogOptions, handlerSignal))),
 		confirm: (title, message, dialogOptions) =>
-			ui.confirm(title, message, attachHandlerSignal(dialogOptions, handlerSignal)),
+			runDialog(() => ui.confirm(title, message, attachHandlerSignal(dialogOptions, handlerSignal))),
 		input: (title, placeholder, dialogOptions) =>
-			ui.input(title, placeholder, attachHandlerSignal(dialogOptions, handlerSignal)),
+			runDialog(() => ui.input(title, placeholder, attachHandlerSignal(dialogOptions, handlerSignal))),
 		askDialog: askDialog
 			? (questions, dialogOptions) =>
-					askDialog.call(ui, questions, attachHandlerSignal(dialogOptions, handlerSignal))
+					runDialog(() => askDialog.call(ui, questions, attachHandlerSignal(dialogOptions, handlerSignal)))
 			: undefined,
+		custom: async (factory, options) => {
+			let customSettled = false;
+			let componentReady = false;
+			try {
+				return await ui.custom(
+					async (...args) => {
+						const component = await factory(...args);
+						if (!customSettled) {
+							timeoutBudget?.pause();
+							componentReady = true;
+						}
+						return component;
+					},
+					{
+						...options,
+						signal: options?.signal ? AbortSignal.any([options.signal, handlerSignal]) : handlerSignal,
+					},
+				);
+			} finally {
+				customSettled = true;
+				if (componentReady) timeoutBudget?.resume();
+			}
+		},
 		editor: (title, prefill, dialogOptions, editorOptions) =>
-			ui.editor(title, prefill, attachHandlerSignal(dialogOptions, handlerSignal), editorOptions),
-	} satisfies Pick<ExtensionUIContext, "select" | "confirm" | "input" | "askDialog" | "editor">;
+			runDialog(() => ui.editor(title, prefill, attachHandlerSignal(dialogOptions, handlerSignal), editorOptions)),
+	} satisfies Pick<ExtensionUIContext, "select" | "confirm" | "input" | "askDialog" | "custom" | "editor">;
 	const delegatedMethods = new Map<PropertyKey, unknown>();
 
 	return new Proxy(ui, {
@@ -174,10 +276,14 @@ function createHandlerUIContext(ui: ExtensionUIContext, handlerSignal: AbortSign
  * `pi.setModel()` and then reading `ctx.model` would see a stale model.
  * Prototype delegation keeps every getter live while overriding `ui`.
  */
-function createHandlerContext(ctx: ExtensionContext, handlerSignal: AbortSignal): ExtensionContext {
+function createHandlerContext(
+	ctx: ExtensionContext,
+	handlerSignal: AbortSignal,
+	timeoutBudget?: HandlerTimeoutBudget,
+): ExtensionContext {
 	const scoped: ExtensionContext = Object.create(ctx);
 	Object.defineProperty(scoped, "ui", {
-		value: createHandlerUIContext(ctx.ui, handlerSignal),
+		value: createHandlerUIContext(ctx.ui, handlerSignal, timeoutBudget),
 		enumerable: true,
 		configurable: true,
 	});
@@ -197,7 +303,7 @@ function createHandlerContext(ctx: ExtensionContext, handlerSignal: AbortSignal)
  * can `clearTimeout` on the winning branch.
  */
 async function raceHandlerWithTimeout<T>(
-	work: (handlerSignal: AbortSignal) => Promise<T> | T,
+	work: (handlerSignal: AbortSignal, timeoutBudget: HandlerTimeoutBudget) => Promise<T> | T,
 	timeoutMs: number,
 	signal?: AbortSignal,
 	invokeWhenAborted = false,
@@ -211,13 +317,53 @@ async function raceHandlerWithTimeout<T>(
 	>();
 	const onAbort = () => resolveInterrupt(EXTENSION_HANDLER_ABORTED);
 	signal?.addEventListener("abort", onAbort, { once: true });
-	const timer = setTimeout(() => {
+	let timer: Timer | undefined;
+	let remainingMs = timeoutMs;
+	let activeSince = performance.now();
+	let pauseDepth = 0;
+	let settled = false;
+	const clearTimer = () => {
+		if (timer === undefined) return;
+		clearTimeout(timer);
+		timer = undefined;
+	};
+	const expire = () => {
+		if (settled) return;
+		settled = true;
+		clearTimer();
 		timeoutController.abort(new DOMException(`Handler timed out after ${timeoutMs}ms`, "TimeoutError"));
 		resolveInterrupt(EXTENSION_HANDLER_TIMEOUT);
-	}, timeoutMs);
+	};
+	const armTimer = () => {
+		if (settled || pauseDepth > 0) return;
+		activeSince = performance.now();
+		timer = setTimeout(expire, Math.max(0, remainingMs));
+	};
+	const settle = () => {
+		if (settled) return;
+		settled = true;
+		clearTimer();
+	};
+	const timeoutBudget: HandlerTimeoutBudget = {
+		pause: () => {
+			if (settled) return;
+			pauseDepth++;
+			if (pauseDepth !== 1) return;
+			remainingMs = Math.max(0, remainingMs - (performance.now() - activeSince));
+			clearTimer();
+			if (remainingMs <= 0) expire();
+		},
+		resume: () => {
+			if (settled || pauseDepth === 0) return;
+			pauseDepth--;
+			if (pauseDepth === 0) armTimer();
+		},
+	};
+	armTimer();
 	try {
-		const workPromise = Promise.resolve(work(handlerSignal));
-		if (signal?.aborted) resolveInterrupt(EXTENSION_HANDLER_ABORTED);
+		if (signal?.aborted && !invokeWhenAborted) return EXTENSION_HANDLER_ABORTED;
+		const workPromise = Promise.resolve(work(handlerSignal, timeoutBudget));
+		if (signal?.aborted && !invokeWhenAborted) resolveInterrupt(EXTENSION_HANDLER_ABORTED);
 		const result = await Promise.race([workPromise, interruptPromise]);
 		if (result === EXTENSION_HANDLER_TIMEOUT) {
 			await Promise.race([
@@ -230,7 +376,7 @@ async function raceHandlerWithTimeout<T>(
 		}
 		return result;
 	} finally {
-		clearTimeout(timer);
+		settle();
 		signal?.removeEventListener("abort", onAbort);
 	}
 }
@@ -511,6 +657,7 @@ export class ExtensionRunner {
 		getAsyncJobSnapshot?: () => AsyncJobSnapshot | null,
 		hostInternalExtension?: HostInternalExtensionBinding,
 		getAsyncJobCounts?: () => AsyncJobCounts | null,
+		private readonly releaseManifest?: ContextReleaseManifest,
 	) {
 		this.#uiContext = noOpUIContext;
 		this.#getMemoryFn = getMemory;
@@ -1102,25 +1249,41 @@ export class ExtensionRunner {
 		invokeWhenAborted = false,
 		propagateSnapshotAcknowledgementFailure = false,
 		onFailure?: (kind: "timeout" | "error", message: string) => TResult,
+		outerSignal?: AbortSignal,
 	): Promise<TResult | undefined> {
+		// `session_stop` carries its own signal on the event; `tool_call` receives
+		// the outer dispatch signal (loop request or wrapper execute) so an abort
+		// while a handler awaits a human dialog cancels the dialog and settles the
+		// gate without executing the underlying tool. Compose whichever apply.
 		const eventSignal =
 			event.type === "session_stop" && "signal" in event && event.signal instanceof AbortSignal
 				? event.signal
 				: undefined;
-		const handlerSignal = signal ?? eventSignal;
-		if (handlerSignal?.aborted && !invokeWhenAborted) return undefined;
+		const signals = [signal, outerSignal, eventSignal].filter((item): item is AbortSignal => item !== undefined);
+		const dispatchSignal =
+			signals.length === 0 ? undefined : signals.length === 1 ? signals[0] : AbortSignal.any(signals);
+		if (dispatchSignal?.aborted && !invokeWhenAborted) return undefined;
 		const registrationScope: ToolRegistrationScope = { pending: new Set(), closed: false };
 		let handlerResult: TResult | typeof EXTENSION_HANDLER_TIMEOUT | typeof EXTENSION_HANDLER_ABORTED | undefined;
 		let handlerFailure: { error: unknown } | undefined;
 		try {
 			handlerResult = await raceHandlerWithTimeout(
-				async handlerAbortSignal => {
-					registrationScope.signal = handlerAbortSignal;
+				async (handlerSignal, budget) => {
+					registrationScope.signal = handlerSignal;
 					let result: TResult | undefined;
 					try {
 						result = await this.#extensionTimerOwner.run(ext.path, () =>
 							this.#toolRegistrationScope.run(registrationScope, () =>
-								handler(event, scopeContextToHandler ? createHandlerContext(ctx, handlerAbortSignal) : ctx),
+								handler(
+									event,
+									scopeContextToHandler
+										? createHandlerContext(
+												ctx,
+												handlerSignal,
+												event.type === "tool_call" ? budget : undefined,
+											)
+										: ctx,
+								),
 							),
 						);
 					} catch (error) {
@@ -1136,11 +1299,11 @@ export class ExtensionRunner {
 					return result;
 				},
 				timeoutMs,
-				handlerSignal,
+				dispatchSignal,
 				invokeWhenAborted,
 			);
 		} catch (error) {
-			if (handlerSignal?.aborted) return undefined;
+			if (dispatchSignal?.aborted) return undefined;
 			handlerFailure = { error };
 		} finally {
 			registrationScope.closed = true;
@@ -1392,8 +1555,8 @@ export class ExtensionRunner {
 	/**
 	 * Emit a `tool_call` event to every subscribed extension before the tool executes.
 	 *
-	 * Each handler is bounded by `extensionHandlerTimeoutMs` (default 30s). This
-	 * matches the timeout policy already applied to `emitToolResult` and every
+	 * Each handler is bounded by `extensionHandlers.toolCallTimeoutMs` (default
+	 * 30s). This matches the timeout policy already applied to `emitToolResult` and every
 	 * other handler routed through `#runHandlerWithTimeout`; without it a single
 	 * hung extension (unresolved `await`, network call with no timeout) would
 	 * park `ExtensionToolWrapper.execute` indefinitely and freeze tool
@@ -1404,9 +1567,11 @@ export class ExtensionRunner {
 	 * pre-execution gate — an unresponsive extension MUST NOT be treated as
 	 * silent consent to run the tool.
 	 */
-	async emitToolCall(event: ToolCallEvent): Promise<ToolCallEventResult | undefined> {
+	async emitToolCall(event: ToolCallEvent, signal?: AbortSignal): Promise<ToolCallEventResult | undefined> {
 		const ctx = this.createContext();
-		const timeoutMs = extensionHandlerTimeoutMs;
+		const timeoutMs = normalizeHandlerTimeout(
+			this.settings?.get("extensionHandlers.toolCallTimeoutMs") ?? extensionHandlerTimeoutMs,
+		);
 		let result: ToolCallEventResult | undefined;
 
 		for (const ext of this.extensions) {
@@ -1431,6 +1596,7 @@ export class ExtensionRunner {
 								? `Extension ${ext.path} timed out after ${timeoutMs}ms`
 								: `Extension ${ext.path} failed: ${message}`,
 					}),
+					signal,
 				);
 
 				if (handlerResult) {
@@ -1442,6 +1608,9 @@ export class ExtensionRunner {
 			}
 		}
 
+		if (signal?.aborted) {
+			return { block: true, reason: `Tool execution was cancelled while an extension handler was pending` };
+		}
 		return result;
 	}
 
@@ -1535,13 +1704,36 @@ export class ExtensionRunner {
 
 		for (const ext of this.extensions) {
 			for (const handler of ext.handlers.get("input") ?? []) {
-				const event: InputEvent = { type: "input", text: currentText, images: currentImages, source };
+				if (this.releaseManifest && !(await isApprovedCandidateSource(ext.resolvedPath, this.releaseManifest))) {
+					throw new Error(`PROMPT_POLICY_REVIEW_REQUIRED: extension source is not approved: ${ext.path}`);
+				}
+				const approvedSnapshot = this.releaseManifest
+					? serializedProviderPayload({ text: currentText, images: currentImages })
+					: undefined;
+				const protectedInput = approvedSnapshot
+					? (JSON.parse(approvedSnapshot) as { text: string; images: ImageContent[] | undefined })
+					: undefined;
+				const event: InputEvent = {
+					type: "input",
+					text: protectedInput?.text ?? currentText,
+					images: protectedInput?.images ?? currentImages,
+					source,
+				};
 				const result = (await this.#runHandlerWithTimeout(handler, event, ctx, ext, extensionHandlerTimeoutMs)) as
 					| InputEventResult
 					| undefined;
-				if (result?.handled) return result;
+				const protectedResult = approvedSnapshot
+					? { text: result?.text ?? event.text, images: result?.images ?? event.images }
+					: undefined;
 				if (result?.text !== undefined) currentText = result.text;
 				if (result?.images !== undefined) currentImages = result.images;
+				assertApprovedInputUnchanged(
+					approvedSnapshot,
+					protectedResult ?? { text: currentText, images: currentImages },
+					result?.handled,
+					ext.path,
+				);
+				if (result?.handled) return result;
 			}
 		}
 		const transformed: InputEventResult = {};
@@ -1564,13 +1756,15 @@ export class ExtensionRunner {
 		if (!hasContextHandlers) return messages;
 
 		let currentMessages: AgentMessage[];
-		try {
-			currentMessages = structuredClone(messages);
-		} catch {
-			// Messages may contain non-cloneable objects (e.g. in ToolResultMessage.details
-			// or ProviderPayload). Fall back to a shallow array clone — extensions should
-			// return new message arrays rather than mutating in place.
-			currentMessages = [...messages];
+		if (this.releaseManifest) {
+			currentMessages = JSON.parse(serializedProviderPayload(messages)) as AgentMessage[];
+		} else {
+			try {
+				currentMessages = structuredClone(messages);
+			} catch {
+				// Preserve legacy extension behavior for non-protected local sessions.
+				currentMessages = [...messages];
+			}
 		}
 
 		for (const ext of this.extensions) {
@@ -1578,6 +1772,10 @@ export class ExtensionRunner {
 			if (!handlers || handlers.length === 0) continue;
 
 			for (const handler of handlers) {
+				if (this.releaseManifest && !(await isApprovedCandidateSource(ext.resolvedPath, this.releaseManifest))) {
+					throw new Error(`PROMPT_POLICY_REVIEW_REQUIRED: extension source is not approved: ${ext.path}`);
+				}
+				const approvedSnapshot = this.releaseManifest ? serializedProviderPayload(currentMessages) : undefined;
 				const event: ContextEvent = { type: "context", messages: currentMessages };
 				const handlerResult = await this.#runHandlerWithTimeout(
 					handler,
@@ -1590,6 +1788,7 @@ export class ExtensionRunner {
 				if (handlerResult && (handlerResult as ContextEventResult).messages) {
 					currentMessages = (handlerResult as ContextEventResult).messages!;
 				}
+				assertApprovedContextUnchanged(approvedSnapshot, currentMessages, ext.path);
 			}
 		}
 
@@ -1606,9 +1805,14 @@ export class ExtensionRunner {
 			if (!handlers || handlers.length === 0) continue;
 
 			for (const handler of handlers) {
+				if (this.releaseManifest && !(await isApprovedCandidateSource(ext.resolvedPath, this.releaseManifest))) {
+					throw new Error(`PROMPT_POLICY_REVIEW_REQUIRED: extension source is not approved: ${ext.path}`);
+				}
+				const approvedSnapshot = this.releaseManifest ? serializedProviderPayload(currentPayload) : undefined;
+				const eventPayload = approvedSnapshot ? JSON.parse(approvedSnapshot) : currentPayload;
 				const event: BeforeProviderRequestEvent = {
 					type: "before_provider_request",
-					payload: currentPayload,
+					payload: eventPayload,
 				};
 				const handlerResult = await this.#runHandlerWithTimeout(
 					handler,
@@ -1617,9 +1821,10 @@ export class ExtensionRunner {
 					ext,
 					extensionHandlerTimeoutMs,
 				);
-				if (handlerResult !== undefined) {
-					currentPayload = handlerResult;
+				if (approvedSnapshot !== undefined) {
+					assertApprovedProviderPayloadUnchanged(approvedSnapshot, handlerResult ?? eventPayload, ext.path);
 				}
+				if (handlerResult !== undefined) currentPayload = handlerResult;
 			}
 		}
 
@@ -1652,7 +1857,7 @@ export class ExtensionRunner {
 		systemPrompt: string[],
 	): Promise<BeforeAgentStartCombinedResult | undefined> {
 		const ctx = this.createContext();
-		const messages: NonNullable<BeforeAgentStartEventResult["message"]>[] = [];
+		const messages: NonNullable<BeforeAgentStartCombinedResult["messages"]> = [];
 		let currentSystemPrompt = systemPrompt;
 		let systemPromptModified = false;
 
@@ -1661,6 +1866,9 @@ export class ExtensionRunner {
 			if (!handlers || handlers.length === 0) continue;
 
 			for (const handler of handlers) {
+				if (this.releaseManifest && !(await isApprovedCandidateSource(ext.resolvedPath, this.releaseManifest))) {
+					throw new Error(`PROMPT_POLICY_REVIEW_REQUIRED: extension source is not approved: ${ext.path}`);
+				}
 				const event: BeforeAgentStartEvent = {
 					type: "before_agent_start",
 					prompt,
@@ -1678,9 +1886,14 @@ export class ExtensionRunner {
 				if (handlerResult) {
 					const result = handlerResult as BeforeAgentStartEventResult;
 					if (result.message) {
-						messages.push(result.message);
+						messages.push({ message: result.message, extensionPath: ext.resolvedPath });
 					}
 					if (result.systemPrompt !== undefined) {
+						assertApprovedPerTurnSystemPromptNotReplaced(
+							this.releaseManifest !== undefined,
+							result.systemPrompt,
+							ext.path,
+						);
 						currentSystemPrompt =
 							typeof result.systemPrompt === "string" ? [result.systemPrompt] : result.systemPrompt;
 						systemPromptModified = true;

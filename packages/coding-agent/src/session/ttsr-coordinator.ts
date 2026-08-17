@@ -451,11 +451,10 @@ export class TtsrCoordinator {
 					);
 					this.#markInjected(details.rules);
 				}
-				try {
-					await this.#host.agent.continue();
-				} catch {
-					this.resolveResume();
-				}
+				this.#host.scheduleAgentContinue({
+					generation,
+					onError: () => this.resolveResume(),
+				});
 			},
 			{ delayMs: 50 },
 		);

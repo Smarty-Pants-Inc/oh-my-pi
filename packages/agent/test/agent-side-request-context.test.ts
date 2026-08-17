@@ -5,6 +5,7 @@ import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Agent } from "../src/agent";
+import { createCompactionSummaryMessage } from "../src/compaction/messages";
 import type { AgentTool } from "../src/types";
 
 async function withNativeDialectEnv<T>(fn: () => T | Promise<T>): Promise<T> {
@@ -202,5 +203,23 @@ describe("Agent — buildSideRequestContext", () => {
 
 		expect(transformSpy).toHaveBeenCalledTimes(1);
 		expect(context.systemPrompt).toEqual(["transformed-system"]);
+	});
+
+	it("keeps persisted compaction text on the instruction seam", async () => {
+		const agent = new Agent({
+			contextTarget: "subagent",
+			initialState: { model, systemPrompt: ["system"], tools: [] },
+		});
+		const source = [createCompactionSummaryMessage("persisted compacted facts", 1_000, new Date().toISOString())];
+		const context = await agent.buildSideRequestContext([], undefined, source);
+
+		expect(context.messages).toEqual([]);
+		expect(context.instructions).toHaveLength(1);
+		expect(context.instructions?.[0]).toMatchObject({
+			role: "internal_context",
+			target: "subagent",
+			trigger: "compaction",
+		});
+		expect(context.instructions?.[0]?.renderedText).toContain("persisted compacted facts");
 	});
 });

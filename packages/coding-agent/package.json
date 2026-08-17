@@ -1,7 +1,7 @@
 {
   "type": "module",
   "name": "@oh-my-pi/pi-coding-agent",
-  "version": "17.3.4",
+  "version": "17.3.5",
   "description": "Coding agent CLI with read, bash, edit, write tools and session management",
   "homepage": "https://omp.sh",
   "author": "Can Boluk",
@@ -43,6 +43,8 @@
     "gen:bundle": "bun scripts/bundle-dist.ts",
     "gen:native": "bun --cwd=../natives run gen:native",
     "gen:native:reset": "bun --cwd=../natives run gen:native:reset",
+		"gen:prompt-manifest": "bun scripts/generate-prompt-manifest.ts",
+		"gen:prompt-manifest:check": "bun scripts/generate-prompt-manifest.ts --check",
     "prepack": "bun run gen:tool-views && bun run gen:bundle",
     "bench:guard": "bun scripts/bench-guard.ts"
   },
@@ -83,8 +85,9 @@
   "engines": {
     "bun": ">=1.3.14"
   },
-  "files": [
-    "src",
+	"files": [
+		"src",
+		"generated",
     "dist/cli.js",
     "dist/docs-index.generated.txt",
     "dist/CHANGELOG-*.md",

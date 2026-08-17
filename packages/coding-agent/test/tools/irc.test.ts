@@ -32,6 +32,7 @@ function makeFakeSession(): FakeSession {
 	const delivered: IrcMessage[] = [];
 	const relayed: CustomMessage[] = [];
 	const session = {
+		isStreaming: true,
 		deliverIrcMessage: async (msg: IrcMessage) => {
 			if (nextError) {
 				const err = nextError;
@@ -962,7 +963,7 @@ describe("IRC", () => {
 	});
 
 	describe("AgentSession.deliverIrcMessage", () => {
-		it("wakes an idle session with a real turn and emits the irc_message event", async () => {
+		it("persists idle IRC passively and emits the irc_message event", async () => {
 			const { session } = createRealSession();
 			sessions.push(session);
 			const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
@@ -980,12 +981,16 @@ describe("IRC", () => {
 				ts: Date.now(),
 			});
 			expect(outcome).toBe("woken");
-			expect(promptSpy).toHaveBeenCalledTimes(1);
-			// The idle wake routes through #wakeForIrc, which batches records into one prompt —
-			// even a lone incoming message is delivered as a one-element array.
-			const prompted = (promptSpy.mock.calls[0]![0] as unknown as CustomMessage[])[0];
-			expect(prompted).toMatchObject({ role: "custom", customType: "irc:incoming" });
-			expect(prompted.details).toMatchObject({ id: "msg-1", from: "0-Peer", message: "wake up" });
+			expect(promptSpy).not.toHaveBeenCalled();
+			const persisted = session.messages.filter(
+				message => message.role === "custom" && message.customType === "irc:incoming",
+			);
+			expect(persisted).toHaveLength(1);
+			expect(persisted[0]).toMatchObject({
+				role: "custom",
+				customType: "irc:incoming",
+				details: { id: "msg-1", from: "0-Peer", message: "wake up" },
+			});
 
 			const event = await ircEvent;
 			expect(event.type).toBe("irc_message");

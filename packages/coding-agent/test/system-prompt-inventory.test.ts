@@ -630,7 +630,7 @@ describe("system prompt tool inventory", () => {
 		expect(text).not.toContain("hidden-workflow");
 	});
 
-	it("tells the agent to read matching skills before work", async () => {
+	it("lists visible skills without adding mandatory workflow doctrine", async () => {
 		const { systemPrompt } = await buildSystemPrompt({
 			cwd: tempDir,
 			contextFiles: [],
@@ -650,11 +650,12 @@ describe("system prompt tool inventory", () => {
 		});
 		const text = systemPrompt.join("\n\n");
 
-		expect(text).toContain("<skills>");
+		expect(text).toContain("<available_skills>");
 		expect(text).toContain("- frontend-design: Frontend UI workflow");
+		expect(text).not.toContain("MUST read");
 	});
 
-	it("omits the read-only scout delegation gate when scout is unavailable", async () => {
+	it("omits the read-only scout delegation gate in normal context", async () => {
 		const opts = { toolNames: ["read", "bash", "task"], tools: TOOLS };
 		const withScout = (
 			await buildSystemPrompt({
@@ -679,11 +680,11 @@ describe("system prompt tool inventory", () => {
 			})
 		).systemPrompt.join("\n\n");
 
-		expect(withScout).toContain("one read-only scout while working is allowed");
+		expect(withScout).not.toContain("read-only scout");
 		expect(withoutScout).not.toContain("read-only scout");
 	});
 
-	it("does not require browser verification when the browser tool is absent (issue #8139)", async () => {
+	it("leaves browser verification policy to visible external instructions", async () => {
 		const opts = {
 			cwd: tempDir,
 			contextFiles: [],
@@ -704,8 +705,7 @@ describe("system prompt tool inventory", () => {
 
 		expect(withoutBrowser).not.toContain("browser-drive with `browser`");
 		expect(withoutBrowser).not.toContain("browser-drive with browser");
-		expect(withoutBrowser).toContain("TUI/CLI");
-		expect(withoutBrowser).toContain("behavioral test or smoke test");
+		expect(withoutBrowser).not.toContain("behavioral test or smoke test");
 
 		tools.set("browser", {
 			label: "Browser",
@@ -722,13 +722,11 @@ describe("system prompt tool inventory", () => {
 			})
 		).systemPrompt.join("\n\n");
 
-		expect(withBrowser).toContain("browser-drive with `browser`");
-		// A browser-only session still needs the smoke-test fallback for
-		// native-desktop surfaces (no computer tool).
-		expect(withBrowser).toContain("behavioral test or smoke test");
+		expect(withBrowser).not.toContain("browser-drive with `browser`");
+		expect(withBrowser).not.toContain("behavioral test or smoke test");
 	});
 
-	it("omits todo workflow guidance when the todo tool is absent", async () => {
+	it("omits todo workflow doctrine regardless of tool availability", async () => {
 		const opts = {
 			cwd: tempDir,
 			contextFiles: [],
@@ -746,6 +744,6 @@ describe("system prompt tool inventory", () => {
 		const withTodo = (await buildSystemPrompt({ ...opts, toolNames: ["read", "bash", "todo"] })).systemPrompt.join(
 			"\n\n",
 		);
-		expect(withTodo).toContain("Todo calls NEVER alone");
+		expect(withTodo).not.toContain("Todo calls NEVER alone");
 	});
 });
