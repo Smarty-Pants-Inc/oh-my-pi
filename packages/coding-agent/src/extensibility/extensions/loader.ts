@@ -433,8 +433,9 @@ export async function loadExtensionFromFactory(
 	eventBus: EventBus,
 	runtime: IExtensionRuntime,
 	name = "<inline>",
+	resolvedPath = name,
 ): Promise<Extension> {
-	const extension = createExtension(name, name);
+	const extension = createExtension(name, resolvedPath);
 	const api = new ConcreteExtensionAPI(PiCodingAgent, extension, runtime, cwd, eventBus);
 	await runExtensionFactory(factory, api, runtime);
 	return extension;

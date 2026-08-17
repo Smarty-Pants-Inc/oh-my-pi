@@ -236,6 +236,22 @@ describe("extension provider registration rollback", () => {
 		}
 	});
 
+	test("preserves an explicit source path for a built-in factory", async () => {
+		const runtime = new ExtensionRuntime();
+		const sourcePath = import.meta.path;
+		const extension = await loadExtensionFromFactory(
+			() => {},
+			process.cwd(),
+			new EventBus(),
+			runtime,
+			"<inline-0>",
+			sourcePath,
+		);
+
+		expect(extension.path).toBe("<inline-0>");
+		expect(extension.resolvedPath).toBe(sourcePath);
+	});
+
 	test("rolls back every provider added by the failed extension", async () => {
 		const runtime = new ExtensionRuntime();
 		const events = new EventBus();

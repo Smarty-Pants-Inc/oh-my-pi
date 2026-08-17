@@ -2106,12 +2106,14 @@ async function createAgentSessionScoped(
 		if (inlineExtensions.length > 0) {
 			for (let i = 0; i < inlineExtensions.length; i++) {
 				const factory = inlineExtensions[i];
+				const name = `<inline-${i}>`;
 				const loaded = await loadExtensionFromFactory(
 					factory,
 					cwd,
 					eventBus,
 					extensionsResult.runtime,
-					`<inline-${i}>`,
+					name,
+					factory === createAutoresearchExtension ? path.join(import.meta.dir, "autoresearch/index.ts") : name,
 				);
 				extensionsResult.extensions.push(loaded);
 			}

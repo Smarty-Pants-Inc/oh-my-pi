@@ -7366,7 +7366,7 @@
     },
     {
       "path": "packages/coding-agent/src/extensibility/extensions/loader.ts",
-      "sha256": "f14120513c9cbbd403d027869f927669a6fed81ae7fde9fc0b07c341d849de21"
+      "sha256": "548bf8dd2266da5f695adda4b3901812673fa705812fcc4adbebe06bf3521c88"
     },
     {
       "path": "packages/coding-agent/src/extensibility/extensions/managed-timers.ts",
@@ -8346,7 +8346,7 @@
     },
     {
       "path": "packages/coding-agent/src/sdk.ts",
-      "sha256": "297e63a0fca86ec8674c28fae59fb293df9e2e10e61fe1ffa4bfb2bf142a9c14"
+      "sha256": "a44079eb1069a17c0dcdf1047d67a08017a94d8faeae32b1b9c6b5c9488ff0bc"
     },
     {
       "path": "packages/coding-agent/src/secrets/index.ts",
@@ -10702,5 +10702,5 @@
     }
   ],
   "behaviorSha256": "0feede855f6d4a90131d3a02399acbc91464a432f9189e39082fd75f502a1194",
-  "rootSha256": "01bd9c02d33a9647d0d82650c60812ff897b3980eff292b094f7ca6da128efa3"
+  "rootSha256": "3364ce5eeda04a1ea5ef6b28fa1b67854dda89ad37208bd16aec9a9447c697a8"
 }
