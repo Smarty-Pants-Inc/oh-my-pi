@@ -2421,7 +2421,7 @@
       "visibility": "model",
       "defaultEnabled": true,
       "order": 2030,
-      "sha256": "443b155fede21dcb2084b074a1f9f810c16ae2431490e0b2c6719b6819a08c4c"
+      "sha256": "61e4b751fd0f8d09e1c2dba0f82b8c267b9a56bb9b0bdf343fc125de6212eb54"
     },
     {
       "id": "tool.checkpoint",
@@ -3141,7 +3141,7 @@
     },
     {
       "id": "tool.capability_grant",
-      "descriptionSha256": "e788ac0f2c9c09b381b90632b52484c5bb3630a8ebca6cf49347ecef97d1f5a2",
+      "descriptionSha256": "6648a049743034413fedf112b2b61905e018606ac070a7d746b4fda8cfbe41e2",
       "schemaSha256": "4ca4bd2363c6bba0b0912935f5cd010cedc40299bf0c827ebb9e1b45273d35c6"
     },
     {
@@ -4470,7 +4470,7 @@
     },
     {
       "path": "docs/tools/capability_grant.md",
-      "sha256": "820df164009745690e7b4b8d58d8a5ec645694c8949b753618bce2e1c9c6c577"
+      "sha256": "61198ea196015906a1d24b5a045196f1eb10e715ff47279243db982ea53b4a4f"
     },
     {
       "path": "docs/tools/checkpoint.md",
@@ -6154,7 +6154,7 @@
     },
     {
       "path": "packages/coding-agent/generated/tool-contracts.json",
-      "sha256": "f5d3fad709aa5b92c0775b0364d5713abfb04bc6ded1a6b282a76c9464a8e27c"
+      "sha256": "7a944019066a883cfd68f789934a7ef3bcf776652f3d51edd5a62cec75639d2d"
     },
     {
       "path": "packages/coding-agent/package.json",
@@ -6538,7 +6538,7 @@
     },
     {
       "path": "packages/coding-agent/src/commands/launch.ts",
-      "sha256": "be8a308ece6a860dfcc4ed82e12bc1cedea075d0a30c3d87c98ff9018fd7f9bf"
+      "sha256": "993680798f8574a6f32fedbf8e9645e0931a494a1c21906ddce4f56167a4334e"
     },
     {
       "path": "packages/coding-agent/src/commands/models.ts",
@@ -6826,7 +6826,7 @@
     },
     {
       "path": "packages/coding-agent/src/context/approved-policy.ts",
-      "sha256": "aff78f86339b2e2d8d8eb69e77cb1122fd468f6d7e67652027a0e12503066faf"
+      "sha256": "4ea4240cc0a8bd0ade0cd027ca45a2ec3df351aa44bd72d4022c775708f641e3"
     },
     {
       "path": "packages/coding-agent/src/context/canonical.ts",
@@ -7046,7 +7046,7 @@
     },
     {
       "path": "packages/coding-agent/src/edit/index.ts",
-      "sha256": "31333c16b8f04e8a8cbe6ee8b385628002283f4b56792b94978674681a03dc25"
+      "sha256": "45497e32288d86e3907dc08ea600dd5b5e0544676c3db7049a06b08ead6e756b"
     },
     {
       "path": "packages/coding-agent/src/edit/modes/apply-patch.lark",
@@ -7382,7 +7382,7 @@
     },
     {
       "path": "packages/coding-agent/src/extensibility/extensions/types.ts",
-      "sha256": "3a47b89e2c7a948bb63854105a8d698d9543db65be4d06953bb7bde2684a2d13"
+      "sha256": "c208cd9666bff9ca93316fe0171b25e92e8e7d0864b8c331c5f3dec65d6e4f38"
     },
     {
       "path": "packages/coding-agent/src/extensibility/extensions/wrapper.ts",
@@ -7798,7 +7798,7 @@
     },
     {
       "path": "packages/coding-agent/src/main.ts",
-      "sha256": "91e0bf35c17b71a7fc483ed45e7b1ceec58e4054880d2a143ef1805a7d053ab3"
+      "sha256": "038f464e7a88e71ba62d95c561e09c4b2ba898c799a2c31f4242955e40720939"
     },
     {
       "path": "packages/coding-agent/src/markit/converters/docx.ts",
@@ -8346,7 +8346,7 @@
     },
     {
       "path": "packages/coding-agent/src/sdk.ts",
-      "sha256": "a44079eb1069a17c0dcdf1047d67a08017a94d8faeae32b1b9c6b5c9488ff0bc"
+      "sha256": "86d1ec509c28524fbed1c5d2da58083b9b80b22aefb6bca9671c899e5c31c645"
     },
     {
       "path": "packages/coding-agent/src/secrets/index.ts",
@@ -9010,7 +9010,7 @@
     },
     {
       "path": "packages/coding-agent/src/tools/ast-edit.ts",
-      "sha256": "7af2ba7929a6be1b81c03c798659735c9f703675d1edbba293eb613fdb8f4874"
+      "sha256": "2d73395beb849cf7db8a677240c9f365df61b236de49b0b88ca8c158622654b2"
     },
     {
       "path": "packages/coding-agent/src/tools/ast-grep.ts",
@@ -9038,7 +9038,7 @@
     },
     {
       "path": "packages/coding-agent/src/tools/bash.ts",
-      "sha256": "d7463ed659f880cfb5b23791d0f4b6be8c34e259b3f7fe57b89d3602f77dec1d"
+      "sha256": "22b9c933ed49657fb0c557832f96dd0b953b510d18f227a874644a86bf169ccd"
     },
     {
       "path": "packages/coding-agent/src/tools/browser.ts",
@@ -9122,7 +9122,7 @@
     },
     {
       "path": "packages/coding-agent/src/tools/capability-grant.ts",
-      "sha256": "ec8802a1e8e1f9ba0f75b6cf8a0eb9a059b89d5e1713772af2f7b065cae23e88"
+      "sha256": "621ccb959e6154a47ea40ac9915dd2c2b255a6cc91538fc29df13eb57285e381"
     },
     {
       "path": "packages/coding-agent/src/tools/checkpoint.ts",
@@ -9166,7 +9166,7 @@
     },
     {
       "path": "packages/coding-agent/src/tools/essential-tools.ts",
-      "sha256": "5c4435aa914366b7af14ece0e0dd7c43cbdc98b031a5ce0766550cd72a50324f"
+      "sha256": "1d24ff1f2a18d381090954dc682d395c691cf8a4193e6798832f6fc915d25cb7"
     },
     {
       "path": "packages/coding-agent/src/tools/eval-backends.ts",
@@ -9222,7 +9222,7 @@
     },
     {
       "path": "packages/coding-agent/src/tools/gh.ts",
-      "sha256": "b86040d481c2090bb7f1baa3dcc02736118f8f26b0d586fd84d8ceeb3bddf0af"
+      "sha256": "e5c1d281bc9328f948be5770353eedf5eec3b7590b34346e8d29e85f409831d2"
     },
     {
       "path": "packages/coding-agent/src/tools/github-cache.ts",
@@ -9494,7 +9494,7 @@
     },
     {
       "path": "packages/coding-agent/src/tools/write.ts",
-      "sha256": "db14ebe4fa3e89f6002e83aba3d971e2841ce47da86b98672db9f1abd4a2bd47"
+      "sha256": "81e5addfc79e7ed95dfd4e6b23523572817a533555d748271e99d067f2cd9215"
     },
     {
       "path": "packages/coding-agent/src/tools/xdev.ts",
@@ -10702,5 +10702,5 @@
     }
   ],
   "behaviorSha256": "0feede855f6d4a90131d3a02399acbc91464a432f9189e39082fd75f502a1194",
-  "rootSha256": "fc1772fac6286f8b5c1554c2b3c90a4bf2fcb79b82cdee12b17794cb7f0518d1"
+  "rootSha256": "5f4e29fe40df23f5aeabe407c4a41fa4143258f6f19d1ed244ab0524eebc3350"
 }

@@ -136,7 +136,7 @@ function assertWriteCapability(session: ToolSession, target: string): void {
 	if (!decision || decision.outcome === "allow") return;
 	if (decision.outcome === "request") {
 		throw new ToolError(
-			`Write target '${decision.target}' requires an explicit session writePath capability outside '${session.cwd}'.`,
+			`Write target '${decision.target}' requires an explicit session writePath capability outside '${session.cwd}'. Use the discoverable capability_grant tool when the current direct-user turn authorizes it.`,
 		);
 	}
 	throw new ToolError(`Write target '${decision.target}' cannot be canonicalized safely.`);

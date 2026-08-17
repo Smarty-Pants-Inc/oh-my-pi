@@ -16,7 +16,7 @@ type CapabilityGrantInput = typeof capabilityGrantSchema.infer;
 export class CapabilityGrantTool implements AgentTool<typeof capabilityGrantSchema, CapabilityGrantProvenance> {
 	readonly name = "capability_grant";
 	readonly label = "Capability Grant";
-	readonly loadMode = "essential" as const;
+	readonly loadMode = "discoverable" as const;
 	readonly approval = "read" as const;
 	readonly description = capabilityGrantDescription.trim();
 	readonly parameters = capabilityGrantSchema;

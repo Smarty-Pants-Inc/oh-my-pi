@@ -3039,6 +3039,7 @@ async function createAgentSessionScoped(
 			const stockPrompt = await buildSystemPromptInternal(promptOptions);
 			const defaultPrompt = systemPromptBuilder
 				? await systemPromptBuilder({
+						hasUI: options.hasUI === true,
 						options: promptOptions,
 						templates: DEFAULT_SYSTEM_PROMPT_TEMPLATES,
 						build: templates =>

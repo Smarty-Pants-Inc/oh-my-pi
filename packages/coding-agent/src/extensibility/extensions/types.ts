@@ -1199,6 +1199,8 @@ export type ExtensionServiceTier<Family extends ServiceTierFamily> = Family exte
 		: ServiceTier;
 
 export interface SystemPromptBuilderContext {
+	/** True only when this session has a user-visible UI that can persist policy warnings. */
+	readonly hasUI: boolean;
 	/** Dynamic inputs collected by the session for this prompt build. */
 	readonly options: Readonly<BuildSystemPromptOptions>;
 	/** Raw templates bundled with the running OMP build. */
