@@ -529,6 +529,8 @@ interface LaunchCompletionSessionTransition {
 		selectedSessionId: string;
 	};
 }
+
+type RuntimeContextModel = Pick<Model, "provider" | "id" | "api" | "compat" | "reasoning">;
 /**
  * Clone one top-level notification field without ever returning an object owned
  * by the live session. Most values take the lossless structured-clone path. If
@@ -784,7 +786,7 @@ export class AgentSession {
 	#desiredInterruptMode: "immediate" | "wait";
 	#renderedToolContracts: RenderedToolContractExport | undefined;
 	#runtimeContextEvidence: RuntimeContextEvidence | undefined;
-	#runtimeContextModel: Model | undefined;
+	#runtimeContextModel: RuntimeContextModel | undefined;
 	readonly #getMcpServerInstructionSources: (() => RuntimeMcpInstruction[]) | undefined;
 	readonly #queuedAsyncResults = new Map<string, AsyncResultEntry>();
 	#turnExtensionInstructions: ContextInstruction[] = [];
@@ -4259,7 +4261,13 @@ export class AgentSession {
 			selectedSkills,
 			mcpInstructions: this.#getMcpServerInstructionSources?.(),
 		});
-		this.#runtimeContextModel = structuredClone(model);
+		this.#runtimeContextModel = structuredClone({
+			provider: model.provider,
+			id: model.id,
+			api: model.api,
+			compat: model.compat,
+			reasoning: model.reasoning,
+		});
 	}
 
 	/** Explain the latest exact main-request snapshot; before the first request, all dynamic sources stay potential. */

@@ -306,7 +306,7 @@ function systemPromptRole(
 function resolveExplainWireModel(options: {
 	provider?: string;
 	model?: string;
-	wireModel?: Model;
+	wireModel?: ExplainWireModel;
 }): ExplainWireModel | undefined {
 	if (options.wireModel) {
 		if (options.provider !== undefined && options.provider !== options.wireModel.provider) {
@@ -589,7 +589,7 @@ export async function explainContext(options: {
 	includeContent?: boolean;
 	provider?: string;
 	model?: string;
-	wireModel?: Model;
+	wireModel?: ExplainWireModel;
 	runtime?: RuntimeContextEvidence;
 }): Promise<ContextExplanation> {
 	const cwd = options.cwd ?? process.cwd();
