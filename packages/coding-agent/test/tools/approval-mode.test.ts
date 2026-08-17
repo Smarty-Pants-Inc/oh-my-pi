@@ -101,7 +101,7 @@ describe("tools.approvalMode setting", () => {
 			bashTool().execute("yolo-capability", { command: "git push origin HEAD" }, undefined, undefined, {
 				settings,
 			} as AgentToolContext),
-		).rejects.toThrow("requires explicit session capability 'git.push'");
+		).rejects.toThrow(/requires explicit session capability 'git.push'.*discoverable capability_grant/);
 	});
 
 	it("always-ask mode rejects exec tools when no UI is available", async () => {

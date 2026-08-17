@@ -1343,6 +1343,7 @@ interface RunRootCommandDependencies {
 	forceSetupWizard?: boolean;
 	consumeFreshOmpCompanionLaunchEnv?: typeof consumeFreshOmpCompanionLaunchEnv;
 	collabBridge?: CollabBridgeBootstrap;
+	verifyApprovedStartup?: (isInteractive: boolean) => Promise<void>;
 }
 const DEFAULT_RUN_ROOT_DEPENDENCIES: RunRootCommandDependencies = {};
 async function disposeSessionAndQuit(session: AgentSession, code: number): Promise<void> {
@@ -1427,6 +1428,7 @@ export async function runRootCommand(
 	// tree; declare it so headless subagent optimizations (e.g. skipping replan
 	// title refresh) can tell a focusable process from a print/RPC/eval one.
 	setInteractiveHost(isInteractive);
+	await deps.verifyApprovedStartup?.(isInteractive);
 	const companionLaunchEnv = (deps.consumeFreshOmpCompanionLaunchEnv ?? consumeFreshOmpCompanionLaunchEnv)();
 	const companionSecret = await consumeFreshOmpCompanionSecret({
 		isInteractive,

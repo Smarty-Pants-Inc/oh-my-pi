@@ -909,7 +909,9 @@ function commandNeedsGenericExternalCapability(
 function assertBashExternalCapability(session: ToolSession, capability: string): void {
 	const decision = session.capabilities?.decideExternalEffect(capability);
 	if (!decision || decision.outcome === "allow") return;
-	throw new ToolError(`Bash command requires explicit session capability '${capability}'.`);
+	throw new ToolError(
+		`Bash command requires explicit session capability '${capability}'. Use the discoverable capability_grant tool when the current direct-user turn authorizes it.`,
+	);
 }
 
 function assertBashCommandCapability(session: ToolSession, command: string): void {
@@ -942,7 +944,7 @@ function assertBashWriteCapability(
 	if (decision.outcome === "allow") return;
 	if (decision.outcome === "request") {
 		throw new ToolError(
-			`Bash write target '${decision.target}' requires an explicit session writePath capability outside '${session.cwd}'.`,
+			`Bash write target '${decision.target}' requires an explicit session writePath capability outside '${session.cwd}'. Use the discoverable capability_grant tool when the current direct-user turn authorizes it.`,
 		);
 	}
 	throw new ToolError(`Bash write target '${decision.target}' cannot be canonicalized safely.`);

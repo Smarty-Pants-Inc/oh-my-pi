@@ -57,9 +57,11 @@ describe("extension system prompt builders", () => {
 		const laterDir = tempDir.join("later");
 		fs.mkdirSync(laterDir);
 		let builds = 0;
+		let hasUI: boolean | undefined;
 		const extension: ExtensionFactory = pi => {
-			pi.registerSystemPromptBuilder(({ options }) => {
+			pi.registerSystemPromptBuilder(({ hasUI: builderHasUI, options }) => {
 				builds += 1;
+				hasUI = builderHasUI;
 				return {
 					systemPrompt: [`builder:${options.cwd};roots:${options.additionalWorkspaceRoots?.join(",") ?? ""}`],
 				};
@@ -72,6 +74,7 @@ describe("extension system prompt builders", () => {
 			await session.refreshBaseSystemPrompt();
 			expect(session.systemPrompt).toEqual([`builder:${tempDir.path()};roots:${laterDir}`]);
 			expect(builds).toBe(2);
+			expect(hasUI).toBe(false);
 
 			await session.prompt("noop");
 			const providerPrompt = model.calls?.at(-1)?.context?.systemPrompt;

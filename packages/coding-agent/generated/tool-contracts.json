@@ -297,7 +297,7 @@
     },
     {
       "id": "tool.capability_grant",
-      "description": "Grant one narrow session capability that the direct user explicitly authorized in the current turn.\n\nUse this structured operation only when the current direct-user request clearly authorizes the exact path or named external effect. The tool call is the authorization record; do not ask for a second confirmation. Hidden, goal-continuation, async-result, and retry turns cannot grant capabilities.",
+      "description": "Grant an exact path or named external effect authorized by the current direct-user turn. Automatic turns cannot grant authority.",
       "schema": {
         "type": "object",
         "properties": {
@@ -2054,5 +2054,5 @@
       }
     }
   ],
-  "rootSha256": "8eba371a70f98e940767336b6c8eb15935a78acaaf3dc8dfce79ff4580a138af"
+  "rootSha256": "2e9ad063073be6c25fa1a9aa2e15642ac7c494e548732d3c986711c10735eb6a"
 }
