@@ -406,6 +406,17 @@ describe("AgentSession before_agent_start typed provider context", () => {
 		expect(rootSha256).toBe(sha256(canonicalJson(rootPayload as unknown as JsonValue)));
 	});
 
+	it("captures only context-relevant model fields when runtime headers are not cloneable", async () => {
+		const { model } = createSession();
+		const runtimeModel: Model = {
+			...model,
+			headers: new Proxy({ Authorization: "Bearer test" }, {}),
+		};
+		expect(() => structuredClone(runtimeModel)).toThrow();
+
+		expect(() => session.setRuntimeContextEvidence({ instructions: [] }, runtimeModel)).not.toThrow();
+	});
+
 	it("retains guarded GitLab flow instructions and replaces start evidence with late contracts", async () => {
 		const release = await writeReviewedPolicyState();
 		createSession();
