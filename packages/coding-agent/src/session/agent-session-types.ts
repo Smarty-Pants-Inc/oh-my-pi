@@ -21,6 +21,7 @@ import type {
 import type { postmortem } from "@oh-my-pi/pi-utils";
 import type { AdvisorConfig } from "../advisor";
 import type { AsyncJob, AsyncJobDeliveryState, AsyncJobManager } from "../async";
+import type { SessionCapabilities } from "../capability/session-capabilities";
 import type { ModelRegistry } from "../config/model-registry";
 import type { PromptTemplate } from "../config/prompt-templates";
 import type { Settings, SkillsSettings } from "../config/settings";
@@ -32,6 +33,7 @@ import type { ExtensionRunner } from "../extensibility/extensions";
 import type { ContextUsage } from "../extensibility/extensions/types";
 import type { Skill, SkillWarning } from "../extensibility/skills";
 import type { FileSlashCommand } from "../extensibility/slash-commands";
+import type { MCPServerInstructionSource } from "../mcp/types";
 import type { SecretObfuscator } from "../secrets/obfuscator";
 import type { ConfiguredThinkingLevel } from "../thinking";
 import type { XdevState } from "../tools/xdev";
@@ -130,6 +132,7 @@ export interface AgentSessionConfig {
 	agent: Agent;
 	sessionManager: SessionManager;
 	settings: Settings;
+	capabilities?: SessionCapabilities;
 	/** Whether the session spawn policy permits the read-only `scout` subagent. Defaults to true. */
 	scoutAllowedBySpawnPolicy?: boolean;
 	/** Whether the caller explicitly requested yolo/auto-approve behavior for this session. */
@@ -218,8 +221,6 @@ export interface AgentSessionConfig {
 		toolNames: string[],
 		tools: Map<string, AgentTool>,
 	) => Promise<{ systemPrompt: string[]; xdevCatalogNames?: readonly string[] }>;
-	/** Local calendar date provider used by prompt-cache invalidation. */
-	getLocalCalendarDate?: () => string;
 	/** Tools mounted under `xd://`, for `/tools` display. */
 	getXdevToolEntries?: () => Array<{ name: string; summary: string }>;
 	/** `xd://` presentation state backed by the canonical tool map. */
@@ -228,6 +229,8 @@ export interface AgentSessionConfig {
 	presentationPinnedToolNames?: ReadonlySet<string>;
 	/** Accessor for live MCP server instructions. */
 	getMcpServerInstructions?: () => Map<string, string> | undefined;
+	/** Exact connected-server instruction text and provenance for runtime context explanation. */
+	getMcpServerInstructionSources?: () => MCPServerInstructionSource[];
 	/** Time-traveling stream-rule manager. */
 	ttsrManager?: TtsrManager;
 	/** Secret obfuscator for provider and edit content. */

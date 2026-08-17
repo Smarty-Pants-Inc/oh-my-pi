@@ -131,6 +131,17 @@ function assertWriteTargetAddressable(target: string, router: InternalUrlRouter)
 	);
 }
 
+function assertWriteCapability(session: ToolSession, target: string): void {
+	const decision = session.capabilities?.decideWrite(target, session.cwd);
+	if (!decision || decision.outcome === "allow") return;
+	if (decision.outcome === "request") {
+		throw new ToolError(
+			`Write target '${decision.target}' requires an explicit session writePath capability outside '${session.cwd}'.`,
+		);
+	}
+	throw new ToolError(`Write target '${decision.target}' cannot be canonicalized safely.`);
+}
+
 /**
  * Fail closed when a local write target looks like a mis-dispatched read.
  *
@@ -1177,6 +1188,9 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			const { text: cleanContent, stripped } = stripWriteContent(this.session, content);
 			const internalRouter = InternalUrlRouter.instance();
 			assertWriteTargetAddressable(path, internalRouter);
+			if (!internalRouter.canHandle(path) && !parseConflictUri(path)) {
+				assertWriteCapability(this.session, path);
+			}
 			if (internalRouter.canHandle(path)) {
 				const parsed = parseInternalUrl(path);
 				const scheme = parsed.protocol.replace(/:$/, "").toLowerCase();

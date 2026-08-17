@@ -399,15 +399,14 @@ describe("renderYieldSchema", () => {
 			worktree: "/local/isolation/worktree",
 			operationalRoot: "/workspace",
 		});
-		expect(rendered).toContain("# Execution Environment");
-		expect(rendered).toContain("rooted at `/workspace`");
+		expect(rendered).toContain("§ Workspace");
+		expect(rendered).toContain("Work only inside `/workspace`");
 		expect(rendered).not.toContain("/local/isolation/worktree");
 	});
 
 	test("preserves the ordinary local worktree guidance without an environment", async () => {
 		const rendered = await renderSubagentPrompt(undefined, { worktree: "/local/isolation/worktree" });
-		expect(rendered).toContain("# Working Tree");
-		expect(rendered).toContain("at `/local/isolation/worktree`");
-		expect(rendered).not.toContain("# Execution Environment");
+		expect(rendered).toContain("§ Workspace");
+		expect(rendered).toContain("Work only inside `/local/isolation/worktree`");
 	});
 });

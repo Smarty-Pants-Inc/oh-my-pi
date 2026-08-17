@@ -48,6 +48,7 @@ import {
 } from "@oh-my-pi/pi-ai/utils/harmony-leak";
 import { logger, sanitizeText, structuredCloneJSON } from "@oh-my-pi/pi-utils";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
+import { collectCompactionContextInstructions } from "./compaction/messages";
 import { agentPauseGate } from "./pause";
 import { type AgentRunCoverage, type AgentRunSummary, ToolCallBlockedError } from "./run-collector";
 import {
@@ -1536,6 +1537,7 @@ async function prepareProviderCall(
 	}
 
 	const llmMessages = await config.convertToLlm(messages);
+	const compactionInstructions = collectCompactionContextInstructions(messages, config.contextTarget ?? "main");
 	const normalizedMessages = normalizeMessagesForProvider(llmMessages, model);
 	const ownedDialect: Dialect | undefined = config.dialect ?? resolveOwnedDialectFromEnv(Bun.env.PI_DIALECT);
 	const pruneToolDescriptions = !!config.pruneToolDescriptions && !ownedDialect;
@@ -1549,12 +1551,16 @@ async function prepareProviderCall(
 	} else {
 		llmContext = {
 			systemPrompt: context.systemPrompt,
+			instructions: compactionInstructions,
 			messages: normalizedMessages,
 			tools: normalizeTools(context.tools, {
 				injectIntent: !!config.intentTracing,
 				pruneDescriptions: pruneToolDescriptions,
 			}),
 		};
+	}
+	if (config.appendOnlyContext && compactionInstructions.length > 0) {
+		llmContext = { ...llmContext, instructions: compactionInstructions };
 	}
 	if (config.transformProviderContext) {
 		llmContext = await config.transformProviderContext(llmContext, model);
@@ -1682,6 +1688,14 @@ async function streamAssistantResponse(
 
 	try {
 		return await runInActiveSpan(chatSpan, async () => {
+			const onPayload: AgentLoopConfig["onPayload"] =
+				promptToolWireTools && ownedDialect && config.onToolContracts
+					? async (payload, payloadModel) => {
+							const replacement = await config.onPayload?.(payload, payloadModel);
+							await config.onToolContracts?.({ tools: promptToolWireTools }, payloadModel ?? model);
+							return replacement;
+						}
+					: config.onPayload;
 			let response = await streamFunction(model, llmContext, {
 				...config,
 				apiKey,
@@ -1693,6 +1707,8 @@ async function streamAssistantResponse(
 				serviceTier: effectiveServiceTier,
 				cwd: effectiveCwd,
 				signal: finalRequestSignal,
+				onPayload,
+				onToolContracts: ownedDialect ? undefined : config.onToolContracts,
 				onResponse: captureOnResponse,
 			});
 			if (promptToolWireTools && ownedDialect) {

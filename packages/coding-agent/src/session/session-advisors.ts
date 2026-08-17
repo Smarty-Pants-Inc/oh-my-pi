@@ -555,8 +555,7 @@ export class SessionAdvisors {
 	 * (`#advisorPrimaryTurnsCompleted`, `#advisorInterruptImmuneTurnStart`) and the
 	 * user-interrupt auto-resume suppression flag. It also drops advisor deliveries
 	 * still queued against the prior conversation — pending asides in the yield
-	 * queue (advisor entries use `skipIdleFlush`, so they linger until the next
-	 * `drainLazy` rather than self-flushing), interrupting cards parked in the
+	 * queue, interrupting cards parked in the
 	 * agent steer/follow-up queues, and preserved cards deferred to the next turn —
 	 * so none of them inject into the new conversation.
 	 */
@@ -1002,7 +1001,6 @@ export class SessionAdvisors {
 								content: formatAdvisorBatchContent(entries),
 								details: { notes: entries } satisfies AdvisorMessageDetails,
 							} satisfies CustomMessage),
-				skipIdleFlush: true,
 			});
 		}
 
@@ -1079,9 +1077,8 @@ export class SessionAdvisors {
 		//  - ACP bridges with `deferAgentInitiatedTurns`: the client cannot show an
 		//    agent-initiated turn as busy, so idle triggers are refused (#5628 review).
 		const cannotAutoTrigger =
-			!this.#host.agent.state.isStreaming &&
-			this.#host.clientBridge()?.deferAgentInitiatedTurns === true &&
-			!this.#host.allowAgentInitiatedTurns();
+			!this.#host.agent.state.isStreaming ||
+			(this.#host.clientBridge()?.deferAgentInitiatedTurns === true && !this.#host.allowAgentInitiatedTurns());
 		if (this.#host.planModeState()?.enabled || cannotAutoTrigger) {
 			this.#host.preserveAdvisorCard({
 				role: "custom",

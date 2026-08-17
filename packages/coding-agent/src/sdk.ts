@@ -1,3 +1,4 @@
+import * as path from "node:path";
 import {
 	Agent,
 	type AgentEvent,
@@ -11,6 +12,7 @@ import {
 } from "@oh-my-pi/pi-agent-core";
 import type {
 	Context,
+	ContextInstruction,
 	CredentialDisabledEvent,
 	Effort,
 	Message,
@@ -28,7 +30,17 @@ import {
 } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import { FALLBACK_DIALECT, preferredDialect } from "@oh-my-pi/pi-catalog/identity";
 import type { Component } from "@oh-my-pi/pi-tui";
-import { $env, $flag, getAgentDir, getProjectDir, logger, postmortem, prompt, Snowflake } from "@oh-my-pi/pi-utils";
+import {
+	$env,
+	$flag,
+	getAgentDir,
+	getProjectDir,
+	isBunTestRuntime,
+	logger,
+	postmortem,
+	prompt,
+	Snowflake,
+} from "@oh-my-pi/pi-utils";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import {
 	discoverAdvisorConfigs,
@@ -43,6 +55,7 @@ import { createAutoresearchExtension } from "./autoresearch";
 import { loadCapability } from "./capability";
 import { type Rule, ruleCapability, setActiveRules } from "./capability/rule";
 import { bucketRules } from "./capability/rule-buckets";
+import { SessionCapabilities, type TaskOwnedResource } from "./capability/session-capabilities";
 import { shouldEnableAppendOnlyContext } from "./config/append-only-context-mode";
 import { shouldInlineToolDescriptors } from "./config/inline-tool-descriptors-mode";
 import { isAuthenticated, kNoAuth, ModelRegistry } from "./config/model-registry";
@@ -63,6 +76,11 @@ import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate
 import { applyProviderGlobalsFromSettings } from "./config/provider-globals";
 import { buildServiceTierByFamily } from "./config/service-tier";
 import { Settings, type SkillsSettings } from "./config/settings";
+import { ensureApprovedStartup } from "./context/approved-policy";
+import { captureRuntimeContextEvidence, isRuntimeContextEvidencePayload } from "./context/explain";
+import { type ContextReleaseManifest, canonicalAgentDirPath } from "./context/manifest";
+import { bindRenderedInstruction } from "./context/registry";
+import { exportRenderedToolContracts } from "./context/tool-contracts";
 import { CursorExecHandlers, type CursorMcpResourceAdapter } from "./cursor";
 import { createBridgeEditTool, createBridgeGrepFactory } from "./cursor-bridge-tools";
 import "./discovery";
@@ -137,7 +155,12 @@ import {
 import { AgentSession, type InitialRetryFallbackState, type PlanYolo, type Prewalk } from "./session/agent-session";
 import { discoverAuthStorage as discoverAuthStorageFromConfig } from "./session/auth-broker-config";
 import type { AuthStorage } from "./session/auth-storage";
-import type { ExecutionEnvironmentBinding, ExecutionEnvironmentProvider } from "./session/execution-environment";
+import { renderDateCwdReminder } from "./session/date-cwd-reminder";
+import {
+	type ExecutionEnvironmentBinding,
+	type ExecutionEnvironmentProvider,
+	mapExecutionEnvironmentPath,
+} from "./session/execution-environment";
 import { createInterruptedTurnAbortMessage } from "./session/exit-diagnostics";
 import {
 	type CustomMessage,
@@ -227,6 +250,8 @@ import { ttsTool } from "./tools/tts";
 import { resolveActiveRepoContext } from "./utils/active-repo-context";
 import { EventBus } from "./utils/event-bus";
 import { normalizeProviderContextImagesForModel } from "./utils/image-loading";
+import { formatLocalCalendarDate } from "./utils/local-date";
+import { normalizePromptPath } from "./utils/prompt-path";
 import { buildNamedToolChoice } from "./utils/tool-choice";
 import { VibeSessionRegistry } from "./vibe/runtime";
 import { buildWorkspaceTree, type WorkspaceTree } from "./workspace-tree";
@@ -486,6 +511,8 @@ export interface CreateAgentSessionOptions {
 	rules?: Rule[];
 	/** Context files (AGENTS.md content). Default: discovered walking up from cwd */
 	contextFiles?: Array<{ path: string; content: string }>;
+	/** Fresh registered instructions delivered outside persisted user messages. */
+	contextInstructions?: readonly ContextInstruction[];
 	/** Pre-built workspace tree (skips re-scanning; passed by parents to subagents). */
 	workspaceTree?: WorkspaceTree;
 	/** Prompt templates. Default: discovered from cwd/.omp/prompts/ + agentDir/prompts/ */
@@ -604,6 +631,12 @@ export interface CreateAgentSessionOptions {
 
 	/** Whether to auto-approve all tool calls (--auto-approve CLI flag). Default: false */
 	autoApprove?: boolean;
+	/** Exact additional filesystem paths granted for writes in this session. */
+	writeAllowlist?: readonly string[];
+	/** Exact named consequential effects granted for this session. */
+	externalCapabilities?: readonly string[];
+	/** Resources created by this task and eligible for guarded cleanup. */
+	taskOwnedResources?: readonly TaskOwnedResource[];
 }
 
 /** Result from createAgentSession */
@@ -931,6 +964,12 @@ const TOOL_DEFINITION_MARKER = Symbol("__isToolDefinition");
 /** Matches the truncation applied to per-server instructions inside `rebuildSystemPrompt`. */
 const MAX_MCP_INSTRUCTIONS_LENGTH = 4000;
 
+function renderMcpInstruction(content: string): string {
+	return content.length > MAX_MCP_INSTRUCTIONS_LENGTH
+		? `${content.slice(0, MAX_MCP_INSTRUCTIONS_LENGTH)}\n[truncated]`
+		: content;
+}
+
 let sshCleanupRegistered = false;
 
 async function cleanupSshResources(): Promise<void> {
@@ -1248,13 +1287,20 @@ export function createAutoLearnCaptureRunner(
  * ```
  */
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
+	const releaseManifest = isBunTestRuntime() ? undefined : await ensureApprovedStartup();
+	if (releaseManifest && path.resolve(options.agentDir ?? getAgentDir()) !== canonicalAgentDirPath()) {
+		throw new Error(`PROMPT_POLICY_REVIEW_REQUIRED: runtime agent directory must be ${canonicalAgentDirPath()}`);
+	}
 	const rootMode = options.disableExtensionDiscovery ? "explicit-only" : "merge";
 	return await withOmpExtensionRootScope(options.additionalExtensionPaths ?? [], rootMode, () =>
-		createAgentSessionScoped(options),
+		createAgentSessionScoped(options, releaseManifest),
 	);
 }
 
-async function createAgentSessionScoped(options: CreateAgentSessionOptions): Promise<CreateAgentSessionResult> {
+async function createAgentSessionScoped(
+	options: CreateAgentSessionOptions,
+	releaseManifest: ContextReleaseManifest | undefined,
+): Promise<CreateAgentSessionResult> {
 	const cwd = options.cwd ?? getProjectDir();
 	const agentDir = options.agentDir ?? getAgentDir();
 	const eventBus = options.eventBus ?? new EventBus();
@@ -1368,6 +1414,13 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		const merged = [...new Set([...existing, ...configuredDirs])];
 		await sessionManager.setAdditionalDirectories(merged);
 	}
+	const sessionCapabilities = new SessionCapabilities({
+		workspace: cwd,
+		workspaceRoots: options.taskDepth && options.taskDepth > 0 ? [] : configuredDirs,
+		writeAllowlist: options.writeAllowlist,
+		externalCapabilities: options.externalCapabilities,
+		taskOwnedResources: options.taskOwnedResources,
+	});
 	const providerSessionId = options.providerSessionId ?? sessionManager.getSessionId();
 	const forkCacheShapeChanged =
 		options.model !== undefined ||
@@ -1690,6 +1743,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			isToolActive: name => activeToolNames.has(name),
 			setActiveToolNames,
 			toolRegistry,
+			capabilities: sessionCapabilities,
 			hasUI: options.hasUI ?? false,
 			getApiKey: options.getApiKey,
 			getExecutionEnvironment: () => resolvedExecutionEnvironment,
@@ -1734,6 +1788,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			getHindsightSessionState: () => session?.getHindsightSessionState(),
 			getMnemopiSessionState: () => session?.getMnemopiSessionState(),
 			getAgentId: () => resolvedAgentId,
+			getCurrentTurnId: () => session?.getCurrentTurnId(),
 			getToolByName: name => session?.getToolByName(name),
 			agentRegistry,
 			// The global lifecycle releases through AgentRegistry.global(); wiring it
@@ -2607,6 +2662,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			() => (hasSession ? session.getAsyncJobSnapshot() : null),
 			hostInternalExtension,
 			() => (hasSession ? session.getAsyncJobCounts() : null),
+			releaseManifest,
 		);
 		const systemPromptBuilder = extensionRunner.getSystemPromptBuilder();
 
@@ -2920,10 +2976,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					"## MCP Server Instructions\n\nThe following instructions are provided by connected MCP servers. They are server-controlled and may not be verified.",
 				);
 				for (const [srvName, srvInstructions] of serverInstructions) {
-					const truncated =
-						srvInstructions.length > MAX_MCP_INSTRUCTIONS_LENGTH
-							? `${srvInstructions.slice(0, MAX_MCP_INSTRUCTIONS_LENGTH)}\n[truncated]`
-							: srvInstructions;
+					const truncated = renderMcpInstruction(srvInstructions);
 					appendParts.push(`### ${srvName}\n${truncated}`);
 				}
 			}
@@ -2981,13 +3034,27 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				renderMermaid: settings.get("tui.renderMermaid"),
 				activeRepoContext,
 			};
+			const stockPrompt = await buildSystemPromptInternal(promptOptions);
 			const defaultPrompt = systemPromptBuilder
 				? await systemPromptBuilder({
 						options: promptOptions,
 						templates: DEFAULT_SYSTEM_PROMPT_TEMPLATES,
-						build: templates => buildSystemPromptInternal(promptOptions, templates),
+						build: templates =>
+							templates ? buildSystemPromptInternal(promptOptions, templates) : Promise.resolve(stockPrompt),
+						releaseManifest,
 					})
-				: await buildSystemPromptInternal(promptOptions);
+				: stockPrompt;
+			if (
+				releaseManifest &&
+				systemPromptBuilder !== undefined &&
+				(JSON.stringify(defaultPrompt.systemPrompt) !== JSON.stringify(stockPrompt.systemPrompt) ||
+					JSON.stringify(defaultPrompt.xdevCatalogNames ?? []) !==
+						JSON.stringify(stockPrompt.xdevCatalogNames ?? []))
+			) {
+				throw new Error(
+					"PROMPT_POLICY_REVIEW_REQUIRED: provider-facing system prompt differs from the approved stock prompt",
+				);
+			}
 
 			if (options.systemPrompt === undefined) {
 				return defaultPrompt;
@@ -2999,6 +3066,11 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			const result = {
 				systemPrompt: typeof customPrompt === "string" ? [customPrompt] : customPrompt,
 			};
+			if (releaseManifest && JSON.stringify(result.systemPrompt) !== JSON.stringify(stockPrompt.systemPrompt)) {
+				throw new Error(
+					"PROMPT_POLICY_REVIEW_REQUIRED: provider-facing system prompt differs from the approved stock prompt",
+				);
+			}
 			if (executionEnvironment) {
 				assertExecutionEnvironmentSystemPrompt(executionEnvironment, result.systemPrompt);
 			}
@@ -3097,6 +3169,20 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			options.expectedAgentRef === undefined
 				? agentRegistry.register(registrationInput)
 				: agentRegistry.registerIfAvailable(registrationInput, options.expectedAgentRef);
+		if (!registeredAgentRef && options.expectedAgentRef === null) {
+			// A fresh spawn collided with an existing id. If that id is held by a
+			// provably-dead parked corpse — no live session, no reviver — reclaim it
+			// so this new generation can take the id instead of failing forever at
+			// construction. Without this, one such corpse (isolated-run park,
+			// interrupted construction) poisons the id for the whole process (#8490).
+			// The reclaim is gated by the lifecycle owner and only touches the
+			// registry it manages; the corpse's transcript stays at history://.
+			const stale = agentRegistry.get(resolvedAgentId);
+			const lifecycle = AgentLifecycleManager.global();
+			if (stale && lifecycle.manages(agentRegistry) && (await lifecycle.reclaimDeadCorpse(resolvedAgentId, stale))) {
+				registeredAgentRef = agentRegistry.registerIfAvailable(registrationInput, null);
+			}
+		}
 		if (!registeredAgentRef) {
 			throw new Error(`Agent "${resolvedAgentId}" is already owned by another session generation.`);
 		}
@@ -3162,7 +3248,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// Final convertToLlm: live provider replay drops API-level refusal errors,
 		// then applies secret obfuscation to the remaining outbound context.
 		const convertToLlmFinal = (messages: AgentMessage[]): Message[] => {
-			const converted = filterProviderReplayMessages(convertToLlmWithBlockImages(messages));
+			const providerMessages = messages.filter(
+				message =>
+					message.role !== "custom" ||
+					(message.customType !== "goal-continuation" && message.customType !== "goal-mode-context"),
+			);
+			const converted = filterProviderReplayMessages(convertToLlmWithBlockImages(providerMessages));
 			if (!obfuscator?.hasSecrets()) return converted;
 			return obfuscateMessages(obfuscator, converted);
 		};
@@ -3189,18 +3280,69 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						createSnapcompactSavingsRecorder(() => sessionManager.getSessionFile() ?? null),
 					)
 				: undefined;
+		let pendingProviderInstructions: readonly ContextInstruction[] = [];
 		const transformProviderContext = async (context: Context, transformModel: Model): Promise<Context> => {
 			const executionEnvironment = toolSession.getExecutionEnvironment?.();
 			if (executionEnvironment && context.systemPrompt) {
 				assertExecutionEnvironmentSystemPrompt(executionEnvironment, context.systemPrompt);
 			}
-			let transformed = obfuscator ? obfuscateProviderContext(obfuscator, context) : context;
+			const registeredInstructions = [
+				...(options.contextInstructions ?? []),
+				...(session?.buildProviderContextInstructions() ?? []),
+			];
+			if (context.systemPrompt?.length) {
+				const promptCwd = normalizePromptPath(
+					executionEnvironment ? mapExecutionEnvironmentPath(executionEnvironment, ".") : sessionManager.getCwd(),
+				);
+				registeredInstructions.push(
+					bindRenderedInstruction(
+						"system.date-cwd-reminder",
+						renderDateCwdReminder(formatLocalCalendarDate(), promptCwd),
+						agentKind === "sub" ? "subagent" : "main",
+					),
+				);
+				registeredInstructions.sort(
+					(left, right) => (left.order ?? 0) - (right.order ?? 0) || left.id.localeCompare(right.id),
+				);
+			}
+			let transformed: Context = registeredInstructions.length
+				? { ...context, instructions: [...(context.instructions ?? []), ...registeredInstructions] }
+				: context;
+			transformed = obfuscator ? obfuscateProviderContext(obfuscator, transformed) : transformed;
 			if (snapcompactInline) transformed = await snapcompactInline.transform(transformed, transformModel);
 			transformed = clampProviderContextImages(transformed, transformModel);
-			return await normalizeProviderContextImagesForModel(transformed, transformModel);
+			transformed = await normalizeProviderContextImagesForModel(transformed, transformModel);
+			pendingProviderInstructions = structuredClone(transformed.instructions ?? []);
+			return transformed;
 		};
+		const captureRenderedToolContracts = (payload: unknown, model?: Model) => {
+			if (!releaseManifest) return;
+			return exportRenderedToolContracts(payload, model, {
+				contentManifestRootSha256: releaseManifest.contentManifestRootSha256,
+				configurationSemanticSha256: releaseManifest.configurationSemanticSha256,
+			});
+		};
+		const guardProviderPayload = async (payload: unknown, model?: Model) =>
+			await extensionRunner.emitBeforeProviderRequest(payload, model);
 		const onPayload = async (payload: unknown, model?: Model) => {
-			return await extensionRunner.emitBeforeProviderRequest(payload, model);
+			const finalPayload = await guardProviderPayload(payload, model);
+			const renderedToolContracts = captureRenderedToolContracts(finalPayload, model);
+			if (session && model && isRuntimeContextEvidencePayload(finalPayload, model)) {
+				const evidence = captureRuntimeContextEvidence(
+					finalPayload,
+					model,
+					agentKind === "sub" ? "subagent" : "main",
+					pendingProviderInstructions,
+					renderedToolContracts,
+				);
+				session.setRuntimeContextEvidence(evidence, model);
+				if (renderedToolContracts) session.setRenderedToolContracts(renderedToolContracts);
+			}
+			return finalPayload;
+		};
+		const onToolContracts: SimpleStreamOptions["onToolContracts"] = async (payload, model) => {
+			const contracts = captureRenderedToolContracts(payload, model);
+			if (contracts) session?.setRenderedToolContracts(contracts);
 		};
 		const onResponse: SimpleStreamOptions["onResponse"] = async (response, model) => {
 			await extensionRunner.emitAfterProviderResponse(response, model);
@@ -3260,6 +3402,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		const kimiApiFormatSetting = settings.get("providers.kimiApiFormat");
 		const kimiApiFormat = kimiApiFormatSetting === "auto" ? undefined : kimiApiFormatSetting;
 		agent = new Agent({
+			contextTarget: agentKind === "sub" ? "subagent" : "main",
 			initialState: {
 				systemPrompt,
 				model,
@@ -3275,6 +3418,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			cwdResolver: () => sessionManager.getCwd(),
 			convertToLlm: convertToLlmFinal,
 			onPayload,
+			onToolContracts,
 			onResponse,
 			sessionId: providerSessionId,
 			promptCacheKey: providerPromptCacheKey,
@@ -3439,6 +3583,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			sessionManager,
 			initialAdvisorCosts,
 			settings,
+			capabilities: sessionCapabilities,
 			autoApprove: options.autoApprove,
 			scoutAllowedBySpawnPolicy: isScoutSpawnable(undefined, options.spawns ?? "*"),
 			evalKernelOwnerId,
@@ -3484,7 +3629,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			mcpManagerToolNames: initialMcpManagerToolNames,
 			transformContext,
 			transformProviderContext,
-			onPayload,
+			onPayload: guardProviderPayload,
 			onResponse,
 			sideStreamFn: settingsAwareStreamFn,
 			advisorStreamFn: settingsAwareStreamFn,
@@ -3502,13 +3647,17 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						if (!raw || raw.size === 0) return raw;
 						const out = new Map<string, string>();
 						for (const [name, text] of raw) {
-							out.set(
-								name,
-								text.length > MAX_MCP_INSTRUCTIONS_LENGTH ? text.slice(0, MAX_MCP_INSTRUCTIONS_LENGTH) : text,
-							);
+							out.set(name, renderMcpInstruction(text));
 						}
 						return out;
 					}
+				: undefined,
+			getMcpServerInstructionSources: mcpManager
+				? () =>
+						mcpManager.getServerInstructionSources().map(source => ({
+							...source,
+							content: renderMcpInstruction(source.content),
+						}))
 				: undefined,
 			disconnectOwnedMcpManager: ownedMcpManager ? () => ownedMcpManager.disconnectAll() : undefined,
 			ttsrManager,
@@ -3823,7 +3972,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		const runAutoLearnCapture = createAutoLearnCaptureRunner({
 			sourceAgent: agent,
 			captureTools: autoLearnCaptureTools,
-			onPayload,
+			onPayload: guardProviderPayload,
 			onResponse,
 			createAgent: captureOptions => {
 				const captureModel = captureOptions.initialState?.model;
@@ -3836,9 +3985,26 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					convertToLlm: convertToLlmFinal,
 					transformContext: async messages => wrapSteeringForModel(messages),
 					transformProviderContext: async (context, transformModel) => {
-						let transformed = obfuscator ? obfuscateProviderContext(obfuscator, context) : context;
+						const executionEnvironment = toolSession.getExecutionEnvironment?.();
+						const promptCwd = normalizePromptPath(
+							executionEnvironment
+								? mapExecutionEnvironmentPath(executionEnvironment, ".")
+								: sessionManager.getCwd(),
+						);
+						const instruction = context.systemPrompt?.length
+							? bindRenderedInstruction(
+									"system.date-cwd-reminder",
+									renderDateCwdReminder(formatLocalCalendarDate(), promptCwd),
+									"side_model",
+								)
+							: undefined;
+						let transformed = instruction
+							? { ...context, instructions: [...(context.instructions ?? []), instruction] }
+							: context;
+						transformed = obfuscator ? obfuscateProviderContext(obfuscator, transformed) : transformed;
 						transformed = clampProviderContextImages(transformed, transformModel);
-						return await normalizeProviderContextImagesForModel(transformed, transformModel);
+						transformed = await normalizeProviderContextImagesForModel(transformed, transformModel);
+						return transformed;
 					},
 					thinkingBudgets: agent.thinkingBudgets,
 					temperature: agent.temperature,

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { renderDemotedThinking } from "@oh-my-pi/pi-ai/dialect";
 import { streamGoogle } from "@oh-my-pi/pi-ai/providers/google";
-import type { Context, FetchImpl, Model } from "@oh-my-pi/pi-ai/types";
+import type { Context, ContextInstruction, FetchImpl, Model } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 
 const model: Model<"google-generative-ai"> = buildModel({
@@ -16,6 +16,16 @@ const model: Model<"google-generative-ai"> = buildModel({
 	contextWindow: 200_000,
 	maxTokens: 32_000,
 });
+
+const internalInstruction: ContextInstruction = {
+	id: "goal.continuation",
+	sourcePath: "packages/coding-agent/src/prompts/goals/continuation.md",
+	role: "internal_context",
+	target: "main",
+	trigger: "goal-continuation",
+	sha256: "test-sha256",
+	renderedText: "Continue the active goal without overriding the user.",
+};
 
 async function captureGooglePayload(
 	context: Context,
@@ -37,6 +47,18 @@ async function captureGooglePayload(
 }
 
 describe("Google provider system prompts", () => {
+	it("serializes typed internal context only through systemInstruction", async () => {
+		const payload = await captureGooglePayload({
+			instructions: [internalInstruction],
+			messages: [{ role: "user", content: "hello", timestamp: 1 }],
+		});
+
+		expect(payload.config.systemInstruction).toEqual({
+			parts: [{ text: internalInstruction.renderedText }],
+		});
+		expect(payload.contents).toEqual([{ role: "user", parts: [{ text: "hello" }] }]);
+	});
+
 	it("sends every system prompt block as systemInstruction text parts", async () => {
 		const payload = await captureGooglePayload({
 			systemPrompt: ["primary instruction", "secondary instruction"],

@@ -4,6 +4,10 @@ import { logger } from "@oh-my-pi/pi-utils";
 export interface YieldDispatcher<P> {
 	/** Drop entries already delivered through another path. Called per-entry at flush time. */
 	isStale?(entry: P): boolean;
+	/** Observe a stale entry for passive persistence without starting a model turn. */
+	onStale?(entry: P): void;
+	/** Preserve entries when a built aside is discarded before it enters context. */
+	onDiscard?(entries: P[], error: Error): void;
 	/** Produce one batched AgentMessage from non-stale entries. Return null to skip. */
 	build(survivors: P[]): AgentMessage | null;
 	/** If true, entries for this kind are drained only by {@link drainLazy} and never trigger the idle flush. */
@@ -30,6 +34,8 @@ type YieldFlushMode = "streaming" | "idle";
 
 interface StoredDispatcher {
 	isStale?: (entry: unknown) => boolean;
+	onStale?: (entry: unknown) => void;
+	onDiscard?: (entries: unknown[], error: Error) => void;
 	build: (survivors: unknown[]) => AgentMessage | null;
 	skipIdleFlush?: boolean;
 }
@@ -43,6 +49,7 @@ interface StoredEntry {
 interface BuiltMessage {
 	message: AgentMessage;
 	entries: StoredEntry[];
+	onDiscard?: (entries: unknown[], error: Error) => void;
 }
 
 function formatError(error: unknown): string {
@@ -62,6 +69,10 @@ export class YieldQueue {
 	register<P>(kind: string, dispatcher: YieldDispatcher<P>): () => void {
 		const stored: StoredDispatcher = {
 			...(dispatcher.isStale ? { isStale: entry => dispatcher.isStale?.(entry as P) ?? false } : {}),
+			...(dispatcher.onStale ? { onStale: entry => dispatcher.onStale?.(entry as P) } : {}),
+			...(dispatcher.onDiscard
+				? { onDiscard: (entries, error) => dispatcher.onDiscard?.(entries as P[], error) }
+				: {}),
 			build: survivors => dispatcher.build(survivors as P[]),
 			...(dispatcher.skipIdleFlush ? { skipIdleFlush: true } : {}),
 		};
@@ -288,6 +299,7 @@ export class YieldQueue {
 					continue;
 				}
 				if (stale) {
+					dispatcher.onStale?.(entry.value);
 					entry.reject?.(new Error(`Yield queue entry became stale: ${kind}`));
 					continue;
 				}
@@ -301,7 +313,7 @@ export class YieldQueue {
 				this.#rejectEntries(survivors, new Error(`Yield queue dispatcher skipped entry: ${kind}`));
 				return null;
 			}
-			return { message, entries: survivors };
+			return { message, entries: survivors, ...(dispatcher.onDiscard ? { onDiscard: dispatcher.onDiscard } : {}) };
 		} catch (error) {
 			const buildError = error instanceof Error ? error : new Error(String(error));
 			this.#rejectEntries(survivors, buildError);
@@ -326,6 +338,10 @@ export class YieldQueue {
 				value: (error: Error) => {
 					if (settled) return;
 					settled = true;
+					built.onDiscard?.(
+						built.entries.map(entry => entry.value),
+						error,
+					);
 					this.#rejectEntries(built.entries, error);
 				},
 			},

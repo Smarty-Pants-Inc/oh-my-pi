@@ -192,11 +192,14 @@ function renderGoalMode(ctx: SegmentContext, mode: { enabled: boolean; paused: b
 			icon = theme.symbol("status.success");
 			color = "success";
 			break;
-		case "budget-limited":
+		case "budget_limited":
+		case "usage_limited":
+		case "blocked":
 			icon = theme.symbol("status.warning");
 			color = "warning";
 			break;
 		case "dropped":
+		case "superseded":
 			icon = theme.symbol("status.aborted");
 			color = "dim";
 			break;

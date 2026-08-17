@@ -17,6 +17,7 @@ import {
 	extractGitLabWorkflowToken,
 	GITLAB_DUO_WORKFLOW_CLIENT_CAPABILITIES,
 	type GitLabDuoWorkflowProviderSessionState,
+	type GitLabDuoWorkflowStartRequest,
 	type GitLabDuoWorkflowStreamState,
 	type GitLabDuoWorkflowWebSocketFactory,
 	type GitLabDuoWorkflowWebSocketLike,
@@ -255,6 +256,118 @@ describe("GitLab Duo Workflow provider protocol", () => {
 		expect(payload.preapproved_tools).toEqual(payload.mcpTools.map(tool => tool.name));
 	});
 
+	it("guards the non-inline create goal and final start frame before reporting replacement contracts", async () => {
+		const order: string[] = [];
+		let sentCreateBody: Record<string, unknown> | undefined;
+		let sentStartRequest: GitLabDuoWorkflowStartRequest | undefined;
+		let observedContracts: unknown;
+		const socketReady = Promise.withResolvers<GitLabDuoWorkflowWebSocketLike>();
+		const socket: GitLabDuoWorkflowWebSocketLike = {
+			onopen: null,
+			onmessage: null,
+			onerror: null,
+			onclose: null,
+			send(data) {
+				order.push("send");
+				const payload = JSON.parse(data) as { startRequest?: GitLabDuoWorkflowStartRequest };
+				sentStartRequest = payload.startRequest;
+			},
+			close() {},
+		};
+		const fetchImpl: FetchImpl = async (input: string | URL | Request, init?: RequestInit) => {
+			const url = String(input);
+			if (url.endsWith("/api/v4/ai/duo_workflows/direct_access")) {
+				return new Response(JSON.stringify({ gitlab_rails: { token: "workflow-token" } }), { status: 200 });
+			}
+			if (url.endsWith("/api/v4/ai/duo_workflows/workflows") && init?.method === "POST") {
+				sentCreateBody = JSON.parse(String(init.body)) as Record<string, unknown>;
+				return new Response(JSON.stringify({ id: "workflow-1" }), { status: 200 });
+			}
+			if (url.endsWith("/api/graphql")) {
+				return new Response(JSON.stringify({ data: { aiChatAvailableModels: {} } }), { status: 200 });
+			}
+			return new Response("{}", { status: 200 });
+		};
+		const replacementTool = {
+			name: "replacement",
+			originalToolName: "replacement",
+			serverName: "omp",
+			description: "Replacement wire tool.",
+			inputSchema: JSON.stringify({ type: "object", properties: { value: { type: "string" } } }),
+			isApproved: true,
+		};
+		const stream = streamGitLabDuoWorkflow(
+			{ ...model, baseUrl: "https://gitlab-payload-guard.example.com" },
+			{ ...context, tools: [editTool] },
+			{
+				apiKey: "payload-guard-token",
+				rootNamespaceId: "gid://gitlab/Group/1",
+				projectId: "123",
+				projectPath: "group/project",
+				workflowDefinition: "chat",
+				fetch: fetchImpl,
+				webSocketFactory: (_url, _options) => {
+					order.push("socket");
+					socketReady.resolve(socket);
+					return socket;
+				},
+				onPayload: async payload => {
+					if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+						throw new Error("Expected GitLab object payload");
+					}
+					const frame = payload as Record<string, unknown>;
+					const kind = "startRequest" in frame ? "start" : "create";
+					order.push(`${kind}-payload-start`);
+					await Promise.resolve();
+					order.push(`${kind}-payload-end`);
+					if (!("startRequest" in frame)) return { ...frame, goal: "replacement create goal" };
+					const original = frame.startRequest as GitLabDuoWorkflowStartRequest;
+					return {
+						startRequest: {
+							...original,
+							goal: "replacement start goal",
+							mcpTools: [replacementTool],
+							preapproved_tools: [replacementTool.name],
+						},
+					};
+				},
+				onToolContracts: async payload => {
+					order.push("contracts-start");
+					await Promise.resolve();
+					observedContracts = payload;
+					order.push("contracts-end");
+				},
+			},
+		);
+
+		await socketReady.promise;
+		expect(order).toEqual([
+			"create-payload-start",
+			"create-payload-end",
+			"start-payload-start",
+			"start-payload-end",
+			"contracts-start",
+			"contracts-end",
+			"socket",
+		]);
+		socket.onopen?.(new Event("open"));
+		expect(order.at(-1)).toBe("send");
+		expect(sentCreateBody?.goal).toBe("replacement create goal");
+		expect(sentStartRequest?.goal).toBe("replacement start goal");
+		expect(sentStartRequest?.mcpTools).toEqual([replacementTool]);
+		expect(observedContracts).toEqual({
+			tools: [
+				{
+					name: replacementTool.name,
+					description: replacementTool.description,
+					jsonSchemaString: replacementTool.inputSchema,
+				},
+			],
+		});
+		socket.onmessage?.(new MessageEvent("message", { data: JSON.stringify({ status: "INPUT_REQUIRED" }) }));
+		await stream.result();
+	});
+
 	it("puts the OMP system prompt in the inline flow system slot with reasoning events", () => {
 		const systemContext: Context = {
 			systemPrompt: ["OMP authoritative operating rules. Bridge the local tools."],
@@ -281,6 +394,40 @@ describe("GitLab Duo Workflow provider protocol", () => {
 		// A single-turn goal is bare text (no ChatML markers), so the history-note that
 		// warns against mimicking transcript markers must NOT be appended.
 		expect(prompt?.prompt_template.system).not.toContain("written as a plain-text log");
+	});
+
+	it("maps typed instructions into the system slot in provider order, never the user goal", () => {
+		const payload = buildGitLabDuoWorkflowStartRequest("workflow-1", model, {
+			systemPrompt: ["Base system block."],
+			instructions: [
+				{
+					id: "goal.continuation",
+					sourcePath: "goal.md",
+					role: "internal_context",
+					target: "main",
+					trigger: "goal",
+					sha256: "goal-sha",
+					renderedText: "Internal continuation block.",
+					order: 20,
+				},
+				{
+					id: "extension.policy",
+					sourcePath: "extension.md",
+					role: "developer",
+					target: "main",
+					trigger: "extension",
+					sha256: "extension-sha",
+					renderedText: "Developer policy block.",
+					order: 10,
+				},
+			],
+			messages: [{ role: "user", content: "User request only.", timestamp: 1 }],
+		});
+
+		expect(payload.flowConfig?.prompts[0]?.prompt_template.system).toBe(
+			"Base system block.\n\nInternal continuation block.\n\nDeveloper policy block.",
+		);
+		expect(payload.goal).toBe("User request only.");
 	});
 
 	it("always emits the inline flowConfig (no server-side registry path)", () => {
@@ -3800,6 +3947,19 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 				rootNamespaceId: "gid://gitlab/Group/root",
 				providerSessionState,
 				webSocketFactory,
+				onPayload: async payload => {
+					await Promise.resolve();
+					if (typeof payload !== "object" || payload === null || !("actionResponse" in payload)) {
+						throw new Error("Expected actionResponse frame");
+					}
+					const frame = payload as { actionResponse: { requestID: string } };
+					return {
+						actionResponse: {
+							requestID: frame.actionResponse.requestID,
+							plainTextResponse: { response: "guarded README file text" },
+						},
+					};
+				},
 			},
 		);
 		for (let attempt = 0; attempt < 10 && sent.length < 2; attempt++) {
@@ -3807,7 +3967,7 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 		}
 		expect(socketCount).toBe(1);
 		expect(JSON.parse(sent[1] ?? "{}")).toEqual({
-			actionResponse: { requestID: "req-read-1", plainTextResponse: { response: "README file text" } },
+			actionResponse: { requestID: "req-read-1", plainTextResponse: { response: "guarded README file text" } },
 		});
 		const continuation = JSON.stringify({
 			channel_values: {
@@ -3826,6 +3986,61 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 		const secondMessage = await secondStream.result();
 		expect(secondMessage.role).toBe("assistant");
 		expect(secondMessage.content).toEqual([{ type: "text", text: "POST_TOOL" }]);
+	});
+
+	it("rejects an actionResponse replacement that changes the pending request binding", async () => {
+		const sent: string[] = [];
+		const socket: GitLabDuoWorkflowWebSocketLike = {
+			onopen: null,
+			onmessage: null,
+			onerror: null,
+			onclose: null,
+			send(data) {
+				sent.push(data);
+			},
+			close() {},
+		};
+		const output: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api: "gitlab-duo-agent",
+			provider: "gitlab-duo-agent",
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		};
+		const run = runGitLabDuoWorkflowSocket(
+			socket,
+			buildGitLabDuoWorkflowStartRequest("workflow-1", model, context),
+			{ stream: new AssistantMessageEventStream(), output, model, started: true },
+			{
+				apiKey: "redacted",
+				onPayload: async payload => {
+					await Promise.resolve();
+					const frame = payload as { actionResponse: { plainTextResponse?: unknown } };
+					return {
+						actionResponse: {
+							requestID: "attacker-selected-request",
+							plainTextResponse: frame.actionResponse.plainTextResponse,
+						},
+					};
+				},
+			},
+			{ actionResponse: { requestID: "req-read-1", plainTextResponse: { response: "README file text" } } },
+		);
+
+		await expect(run).rejects.toThrow(
+			"GitLab Duo Workflow onPayload replacement cannot change actionResponse.requestID",
+		);
+		expect(sent).toEqual([]);
 	});
 
 	it("settles stalled when consecutive tool-call boundaries carry byte-identical checkpoints", async () => {

@@ -28,7 +28,6 @@ import { type ExecutionEnvironmentBinding, mapExecutionEnvironmentPath } from ".
 import { normalizeConcurrencyLimit } from "./task/parallel";
 import { usesCodexTaskPrompt } from "./task/prompt-policy";
 import { type ActiveRepoContext, resolveActiveRepoContext } from "./utils/active-repo-context";
-import { formatLocalCalendarDate } from "./utils/local-date";
 import { normalizePromptPath } from "./utils/prompt-path";
 import { AGENTS_MD_LIMIT, buildWorkspaceTree, type WorkspaceTree } from "./workspace-tree";
 
@@ -842,8 +841,6 @@ export async function buildSystemPrompt(
 		}
 	}
 
-	const date = formatLocalCalendarDate();
-	const dateTime = date;
 	// Model-visible workspace path metadata is centralized below: project cwd,
 	// context-file labels, dir-context paths, workspace-tree root metadata, and
 	// additional roots. The rendered tree and active-repo context are relative;
@@ -962,8 +959,6 @@ export async function buildSystemPrompt(
 		skills: filteredSkills,
 		rules: rules ?? [],
 		alwaysApplyRules: injectedAlwaysApplyRules,
-		date,
-		dateTime,
 		cwd: promptCwd,
 		additionalWorkspaceRoots: promptAdditionalWorkspaceRoots,
 		model: includeModelInPrompt ? (model ?? "") : "",
@@ -997,7 +992,7 @@ export async function buildSystemPrompt(
 		systemPrompt.push(resolvedComputerSafetyPrompt.trim());
 	}
 	// Custom prompt templates already render context files and append text; the
-	// project footer still carries environment, cwd, workspace, and dir-context.
+	// project footer still carries environment, workspace, and directory context.
 	const projectPrompt = prompt
 		.render(
 			resolvedProjectPromptTemplate,

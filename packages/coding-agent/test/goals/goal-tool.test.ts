@@ -234,7 +234,7 @@ describe("GoalTool", () => {
 		expect(after?.goal.status).toBe("complete");
 	});
 
-	it("completes a paused goal (enabled=false) — was broken before fix", async () => {
+	it("rejects complete for a paused goal", async () => {
 		const harness = createRuntimeHarness({
 			enabled: false,
 			mode: "active",
@@ -247,13 +247,14 @@ describe("GoalTool", () => {
 			}),
 		);
 
-		const result = await tool.execute("call-complete", {
-			op: "complete",
-			objective: undefined,
-			token_budget: undefined,
-		});
-		expect(result.details?.goal?.status).toBe("complete");
-		expect(harness.getState()?.goal.status).toBe("complete");
+		await expect(
+			tool.execute("call-complete", {
+				op: "complete",
+				objective: undefined,
+				token_budget: undefined,
+			}),
+		).rejects.toThrow("cannot complete goal because no goal is active");
+		expect(harness.getState()?.goal.status).toBe("paused");
 	});
 
 	it("allows create after previous goal is complete", async () => {
@@ -297,30 +298,11 @@ describe("GoalTool", () => {
 		expect(result.details?.goal?.objective).toBe("Ship it");
 	});
 
-	it("op=resume re-activates a paused goal", async () => {
-		const harness = createRuntimeHarness({
-			enabled: false,
-			mode: "active",
-			goal: createGoal({ status: "paused" }),
-		});
-		const tool = new GoalTool(
-			createToolSession({
-				getGoalRuntime: () => harness.runtime,
-				getGoalModeState: () => harness.getState(),
-			}),
-		);
-
-		const result = await tool.execute("call-resume", { op: "resume", objective: undefined, token_budget: undefined });
-		expect(result.details?.op).toBe("resume");
-		expect(result.details?.goal?.status).toBe("active");
-		expect(harness.getState()?.enabled).toBe(true);
-	});
-
-	it("op=drop clears goal state", async () => {
+	it("op=block makes an active goal inert", async () => {
 		const harness = createRuntimeHarness({
 			enabled: true,
 			mode: "active",
-			goal: createGoal({ objective: "Drop me" }),
+			goal: createGoal(),
 		});
 		const tool = new GoalTool(
 			createToolSession({
@@ -329,9 +311,32 @@ describe("GoalTool", () => {
 			}),
 		);
 
-		const result = await tool.execute("call-drop", { op: "drop", objective: undefined, token_budget: undefined });
-		expect(result.details?.op).toBe("drop");
-		expect(result.details?.goal?.status).toBe("dropped");
-		expect(harness.getState()).toBeUndefined();
+		const result = await tool.execute("call-block", { op: "block", objective: undefined, token_budget: undefined });
+		expect(result.details?.op).toBe("block");
+		expect(result.details?.goal?.status).toBe("blocked");
+		expect(harness.getState()?.enabled).toBe(false);
+	});
+
+	it("exposes only get, create, complete, and block to the model", () => {
+		const tool = new GoalTool(createToolSession({}));
+
+		for (const op of ["get", "create", "complete", "block"]) {
+			expect(tool.parameters.allows({ op })).toBe(true);
+		}
+		for (const op of ["pause", "resume", "edit", "replace", "budget", "drop", "clear"]) {
+			expect(tool.parameters.allows({ op })).toBe(false);
+		}
+	});
+
+	it("publishes the required model-operation guidance", () => {
+		const tool = new GoalTool(createToolSession({}));
+		expect(tool.description).toBe(`The goal is persistent mission state.
+
+- \`get\`: read the current goal and accounting.
+- \`create\`: start a goal only when the user or system clearly requested persistent goal mode and no unfinished goal exists. Ordinary clear user prose is sufficient; do not parse prose into authorization rules.
+- \`complete\`: use only when the full objective is achieved and the required current evidence supports that claim.
+- \`block\`: use when meaningful progress requires user input, unavailable access, or external-state change, or after two evidence-valid failures of the same route with no materially different safe route.
+
+Do not infer a goal from an ordinary task. Do not use completion or blocking to escape difficult work. Pause, resume, edit, replace, budget, drop, and clear are typed owner/system operations. The two-failure rule is concise model guidance backed by tests; do not build a natural-language route-failure classifier.`);
 	});
 });

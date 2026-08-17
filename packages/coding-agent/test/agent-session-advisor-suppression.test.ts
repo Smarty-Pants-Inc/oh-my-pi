@@ -18,9 +18,7 @@
  *     follow-up stays queued for the next explicit resume rather than auto-running.
  */
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
-import { type } from "@oh-my-pi/omptype";
-import { Agent, type AgentMessage, type AgentTool } from "@oh-my-pi/pi-agent-core";
-import type { ToolCall } from "@oh-my-pi/pi-ai";
+import { Agent, type AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { createMockModel, type MockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -30,18 +28,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { Snowflake, TempDir } from "@oh-my-pi/pi-utils";
-
-interface MockYieldDetails {
-	status: "success";
-	data?: unknown;
-	type?: string | string[];
-}
-
-const mockYieldParameters = type({
-	result: "unknown",
-	"type?": "unknown",
-});
+import { TempDir } from "@oh-my-pi/pi-utils";
 
 const ADVISOR_TYPE = "advisor";
 
@@ -120,56 +107,6 @@ describe("AgentSession advisor auto-resume suppression", () => {
 		const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
 		session = new AgentSession({ agent, sessionManager, settings, modelRegistry });
 		return { session, sessionManager, mock, streamStarted: started.promise };
-	}
-
-	function readYieldResultData(result: unknown): unknown {
-		if (!result || typeof result !== "object" || !("data" in result)) return undefined;
-		return result.data;
-	}
-
-	function isYieldType(value: unknown): value is string | string[] {
-		return (
-			typeof value === "string" ||
-			(Array.isArray(value) && value.length > 0 && value.every(item => typeof item === "string"))
-		);
-	}
-
-	function createMockYieldTool(): AgentTool<typeof mockYieldParameters, MockYieldDetails> {
-		return {
-			name: "yield",
-			label: "Yield",
-			description: "Mock yield tool",
-			parameters: mockYieldParameters,
-			execute: async (_toolCallId, params) => {
-				const details: MockYieldDetails = { status: "success", data: readYieldResultData(params.result) };
-				if (isYieldType(params.type)) details.type = params.type;
-				return {
-					content: [{ type: "text", text: "Result submitted." }],
-					details,
-				};
-			},
-		};
-	}
-
-	function createYieldMockResponse(args: { result: { data: unknown }; type?: string | string[] }): MockResponse {
-		const toolCall: ToolCall = {
-			type: "toolCall",
-			id: `call_yield_${Snowflake.next()}`,
-			name: "yield",
-			arguments: args,
-		};
-		return {
-			content: [toolCall],
-			stopReason: "toolUse",
-			usage: {
-				input: 1,
-				output: 1,
-				cacheRead: 0,
-				cacheWrite: 0,
-				totalTokens: 2,
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-			},
-		};
 	}
 
 	async function createCompletedAdvisorSession(
@@ -257,6 +194,17 @@ describe("AgentSession advisor auto-resume suppression", () => {
 			}
 		};
 		return persisted;
+	}
+
+	function hasPersistedIrc(sessionManager: SessionManager, text: string): boolean {
+		return sessionManager
+			.getEntries()
+			.some(
+				entry =>
+					entry.type === "custom_message" &&
+					entry.customType === "irc:incoming" &&
+					JSON.stringify(entry).includes(text),
+			);
 	}
 
 	it("preserves a late advisor concern after a terminal answer without waking the primary", async () => {
@@ -349,7 +297,7 @@ describe("AgentSession advisor auto-resume suppression", () => {
 		expect(mock.calls).toHaveLength(1);
 	});
 
-	it("steers a late advisor blocker after a terminal answer so the primary corrects it", async () => {
+	it("preserves a late advisor blocker without waking a hidden primary turn", async () => {
 		const { session, mock } = await createCompletedAdvisorSession("blocker");
 
 		await session.prompt("read five fixture files and answer with exactly one line");
@@ -363,7 +311,9 @@ describe("AgentSession advisor auto-resume suppression", () => {
 		await advisor.prompt("inspect the completed turn");
 		await session.waitForIdle();
 
-		expect(mock.calls.length).toBe(2);
+		expect(session.agent.state.messages.filter(isAdvisorCard)).toHaveLength(1);
+		expect(session.hasPendingMessages()).toBe(false);
+		expect(mock.calls.length).toBe(1);
 	});
 
 	it("preserves another late advisor concern after an existing advisor card", async () => {
@@ -583,14 +533,14 @@ describe("AgentSession advisor auto-resume suppression", () => {
 		expect(mock.calls.length).toBe(1);
 	});
 
-	it("wakes a turn for an IRC aside stranded across a user interrupt", async () => {
-		const { session, mock, streamStarted } = await createParkedSession([{ content: ["replying to peer"] }]);
+	it("persists an IRC aside stranded across a user interrupt without waking a turn", async () => {
+		const { session, sessionManager, mock, streamStarted } = await createParkedSession();
 		const running = session.prompt("do the thing");
 		await streamStarted;
 		// IRC arrives mid-turn → queued as a non-interrupting aside.
 		await session.deliverIrcMessage({ id: "m1", from: "peer", to: "me", body: "ping", ts: Date.now() } as IrcMessage);
-		// The user interrupt skips the loop's final aside poll, stranding the aside with no loop to
-		// drain it. The settle drain must wake a turn so the peer still gets a response.
+		// The user interrupt skips the loop's final aside poll. Settlement persists the
+		// stranded aside, but the aside cannot mint automatic-turn authority.
 		await session.abort({ reason: USER_INTERRUPT_LABEL });
 		await session.waitForIdle();
 		await running.catch(() => {});
@@ -599,25 +549,17 @@ describe("AgentSession advisor auto-resume suppression", () => {
 			m => m.role === "custom" && (m as { customType?: string }).customType === "irc:incoming",
 		);
 		expect(sawIrc).toBe(true);
-		expect(mock.calls.length).toBe(2);
+		expect(hasPersistedIrc(sessionManager, "ping")).toBe(true);
+		expect(mock.calls.length).toBe(1);
 	});
 
-	it("stops an idle IRC wake after a terminal yield", async () => {
+	it("persists idle IRC without starting a provider turn", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");
-		let providerCalls = 0;
-		const mock = createMockModel({
-			handler: () => {
-				providerCalls++;
-				if (providerCalls > 1) {
-					throw new Error("terminal yield must not start a second provider call");
-				}
-				return createYieldMockResponse({ result: { data: { ok: true } } });
-			},
-		});
+		const mock = createMockModel({ handler: () => ({ content: ["must not run"] }) });
 		const agent = new Agent({
 			getApiKey: () => "test-key",
-			initialState: { model, systemPrompt: ["Test"], tools: [createMockYieldTool()] },
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
 			streamFn: mock.stream,
 		});
 		const sessionManager = SessionManager.inMemory();
@@ -633,8 +575,16 @@ describe("AgentSession advisor auto-resume suppression", () => {
 		await session.waitForIdle();
 
 		expect(outcome).toBe("woken");
-		expect(providerCalls).toBe(1);
-		expect(mock.calls.length).toBe(1);
+		expect(mock.calls.length).toBe(0);
+		expect(
+			agent.state.messages.some(
+				message =>
+					message.role === "custom" &&
+					message.customType === "irc:incoming" &&
+					JSON.stringify(message).includes("status?"),
+			),
+		).toBe(true);
+		expect(hasPersistedIrc(sessionManager, "status?")).toBe(true);
 	});
 
 	it("flushes an accepted IRC aside on dispose instead of dropping it", async () => {
@@ -651,15 +601,15 @@ describe("AgentSession advisor auto-resume suppression", () => {
 		running.catch(() => {});
 	});
 
-	it("responds to a stranded IRC aside while keeping a blocked follow-up queued", async () => {
-		const { session, mock, streamStarted } = await createParkedSession([{ content: ["replying to peer"] }]);
+	it("persists a stranded IRC aside while keeping a blocked follow-up queued", async () => {
+		const { session, sessionManager, mock, streamStarted } = await createParkedSession();
 		const running = session.prompt("do the thing");
 		await streamStarted;
 		// The user queues a follow-up (Ctrl+Enter) and an IRC ping lands as an aside...
 		await session.prompt("then add the test", { streamingBehavior: "followUp" });
 		await session.deliverIrcMessage({ id: "m2", from: "peer", to: "me", body: "ping", ts: Date.now() } as IrcMessage);
-		// ...then the user interrupts. The IRC must still get a response, but the user's queued
-		// follow-up must NOT auto-run (seam #5) even though the IRC wake turn leaves a valid tail.
+		// ...then the user interrupts. The IRC is persisted without a wake turn, and the
+		// user's queued follow-up must not auto-run (seam #5).
 		await session.abort({ reason: USER_INTERRUPT_LABEL });
 		await session.waitForIdle();
 		await running.catch(() => {});
@@ -668,8 +618,9 @@ describe("AgentSession advisor auto-resume suppression", () => {
 			m => m.role === "custom" && (m as { customType?: string }).customType === "irc:incoming",
 		);
 		expect(sawIrc).toBe(true);
+		expect(hasPersistedIrc(sessionManager, "ping")).toBe(true);
 		expect(userMessageText([...session.agent.peekFollowUpQueue()])).toContain("then add the test");
 		expect(userMessageText(session.agent.state.messages)).not.toContain("then add the test");
-		expect(mock.calls.length).toBe(2);
+		expect(mock.calls.length).toBe(1);
 	});
 });

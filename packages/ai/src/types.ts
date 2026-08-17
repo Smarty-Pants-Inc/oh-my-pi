@@ -515,6 +515,12 @@ export interface StreamOptions {
 	 */
 	onPayload?: (payload: unknown, model?: Model<Api>) => unknown | undefined | Promise<unknown | undefined>;
 	/**
+	 * Observe the exact final tool definitions when they are delivered outside the
+	 * provider's primary request payload (for example, an owned prompt dialect or
+	 * Cursor's late request-context handshake).
+	 */
+	onToolContracts?: (payload: unknown, model?: Model<Api>) => void | Promise<void>;
+	/**
 	 * Optional callback for provider response metadata after headers are received.
 	 */
 	onResponse?: (response: ProviderResponseMetadata, model?: Model<Api>) => void | Promise<void>;
@@ -716,8 +722,9 @@ export interface AnthropicFallbackContent {
 }
 
 /**
- * Verbatim Anthropic web-search call/result retained for same-provider
- * history replay. Other providers discard it in `transformMessages`.
+ * Verbatim Anthropic web-search or tool-search call/result retained for
+ * same-provider history replay. Other providers discard it in
+ * `transformMessages`.
  */
 export interface AnthropicServerToolContent {
 	type: "anthropicServerTool";
@@ -725,12 +732,12 @@ export interface AnthropicServerToolContent {
 		| {
 				type: "server_tool_use";
 				id: string;
-				name: "web_search";
+				name: "web_search" | "tool_search_tool_regex" | "tool_search_tool_bm25";
 				input?: Record<string, unknown> | null;
 				[key: string]: unknown;
 		  }
 		| {
-				type: "web_search_tool_result";
+				type: "web_search_tool_result" | "tool_search_tool_result";
 				tool_use_id: string;
 				content: unknown;
 				[key: string]: unknown;
@@ -961,6 +968,34 @@ export interface ToolResultMessage<TDetails = unknown> {
 }
 
 export type Message = UserMessage | DeveloperMessage | AssistantMessage | ToolResultMessage;
+
+/** Provider-independent authority assigned to a fresh instruction component. */
+export type ContextRole = "system" | "developer" | "internal_context";
+
+/** Runtime receiving the instruction component. */
+export type ContextTarget = "main" | "subagent" | "side_model";
+
+/**
+ * A rendered, provenance-bound instruction supplied for the current request.
+ *
+ * These components are intentionally separate from persisted conversation
+ * messages. In particular, `internal_context` must reach a provider's
+ * instruction channel and must never be replayed as a user turn.
+ */
+export interface ContextInstruction {
+	id: string;
+	sourcePath: string;
+	role: ContextRole;
+	target: ContextTarget;
+	trigger: string;
+	sha256: string;
+	renderedText: string;
+	/** Stable manifest order. Array order remains the provider emission order. */
+	order?: number;
+}
+
+/** Spec-compatible name used by context renderers. */
+export type ContextComponent = ContextInstruction;
 
 export type CursorExecHandlerResult<T> = { result: T; toolResult?: ToolResultMessage } | T | ToolResultMessage;
 
@@ -1236,6 +1271,8 @@ export interface Tool<TParameters extends TSchema = TSchema> {
 
 export interface Context {
 	systemPrompt?: string[];
+	/** Fresh typed instructions for this request; never persist these as messages. */
+	instructions?: ContextInstruction[];
 	messages: Message[];
 	tools?: Tool[];
 }

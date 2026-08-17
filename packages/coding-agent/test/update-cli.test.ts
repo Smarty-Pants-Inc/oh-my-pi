@@ -202,7 +202,7 @@ describe("update-cli install target detection", () => {
 			npmBinDir,
 		});
 
-		expect(target).toEqual({ method: "binary", path: await fs.realpath(standalonePath), replacesSymlink: false });
+		expect(target).toEqual({ method: "binary", path: standalonePath, replacesSymlink: false });
 		expect(await fs.readlink(aliasPath)).toBe(standalonePath);
 	});
 
@@ -1082,25 +1082,18 @@ describe("update-cli script-shim takeover", () => {
 		}
 	}
 
-	function verifyBinary(actual: string, expectedPath: string) {
-		return async (binaryPath: string, expectedVersion: string) => {
-			expect(binaryPath).toBe(expectedPath);
-			return { ok: actual === expectedVersion, actual, path: binaryPath };
-		};
-	}
-
 	it("installs omp.exe beside the shims and retires them", async () => {
 		const dir = await makeTempDir();
 		await writeShims(dir);
-		// Inject a verifier to assert explicit-path verification while keeping the
-		// Windows `.exe` takeover behavior portable on this POSIX test host.
+		// Real executable, no injected verifier: the takeover must verify the
+		// exe by explicit path — $which cached the shim path before it was
+		// renamed away, so a PATH re-resolution would fail here.
 		const exe = `#!/bin/sh\necho omp/${version}\n`;
 
 		await updateViaShimTakeover(path.join(dir, "omp.cmd"), version, {
 			binaryName,
 			fetchImpl: makeFetch(exe),
 			githubToken: "test-token",
-			verifyBinary: verifyBinary(version, path.join(dir, "omp.exe")),
 		});
 
 		expect(await Bun.file(path.join(dir, "omp.exe")).text()).toBe(exe);
@@ -1122,7 +1115,6 @@ describe("update-cli script-shim takeover", () => {
 				binaryName,
 				fetchImpl: makeFetch(exe),
 				githubToken: "test-token",
-				verifyBinary: verifyBinary("17.2.12", path.join(dir, "omp.exe")),
 			}),
 		).rejects.toThrow(/still reports 17\.2\.12 \(expected 18\.0\.0\); restored previous omp launcher/);
 
@@ -1154,7 +1146,6 @@ describe("update-cli script-shim takeover", () => {
 				binaryName,
 				fetchImpl: makeFetch(exe),
 				githubToken: "test-token",
-				verifyBinary: verifyBinary(version, path.join(dir, "omp.exe")),
 			});
 		} finally {
 			renameSpy.mockRestore();
@@ -1179,7 +1170,6 @@ describe("update-cli script-shim takeover", () => {
 					binaryName,
 					fetchImpl: makeFetch(exe),
 					githubToken: "test-token",
-					verifyBinary: verifyBinary("17.2.12", path.join(dir, "omp.exe")),
 				}),
 			).rejects.toThrow("restored previous omp launcher");
 		} finally {

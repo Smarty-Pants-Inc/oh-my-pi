@@ -16,6 +16,7 @@ import {
 	type Message,
 	type MessageAttribution,
 	type Model,
+	type OneshotRetryOptions,
 	type ProviderSessionState,
 	type SimpleStreamOptions,
 	type Tool,
@@ -46,7 +47,13 @@ import {
 import type { CompactionEntry, SessionEntry } from "./entries";
 import { NativeCompactionError } from "./errors";
 import { isEstimateCacheable, readEstimateCache, writeEstimateCache } from "./message-cache";
-import { type ConvertToLlm, createBranchSummaryMessage, createCustomMessage, defaultConvertToLlm } from "./messages";
+import {
+	type ConvertToLlm,
+	collectCompactionContextInstructions,
+	createBranchSummaryMessage,
+	createCustomMessage,
+	defaultConvertToLlm,
+} from "./messages";
 import {
 	buildOpenAiNativeHistory,
 	getPreservedOpenAiRemoteCompactionData,
@@ -65,6 +72,7 @@ import handoffDocumentPrompt from "./prompts/handoff-document.md" with { type: "
 import snapcompactArchiveContextPrompt from "./prompts/snapcompact-archive-context.md" with { type: "text" };
 
 import {
+	compactionInstructionContext,
 	computeFileLists,
 	createFileOps,
 	extractFileOpsFromMessage,
@@ -470,8 +478,8 @@ function computeMessageTokens(message: AgentMessage, options?: { excludeEncrypte
 					if (!options?.excludeEncryptedReasoning) fragments.push(block.data);
 				} else if (block.type === "anthropicServerTool") {
 					// Native Anthropic server-tool call/result replayed verbatim on the
-					// wire (server_tool_use input, web_search_tool_result
-					// encrypted_content). Opaque provider-replay state the provider still
+					// wire (server_tool_use input and opaque result content). This opaque
+					// provider-replay state the provider still
 					// bills for on same-provider replay; excluded from the compaction
 					// floor like other encrypted reasoning because its local byte size
 					// diverges from provider billing.
@@ -831,6 +839,31 @@ export interface SummaryOptions {
 		ctx: Context,
 		options: SimpleStreamOptions,
 	) => Promise<AssistantMessage>;
+	/**
+	 * Transient-failure retry for the summarization oneshots (`generateSummary`,
+	 * `generateShortSummary`, `generateTurnPrefixSummary`).
+	 *
+	 * Defaults to enabled, which is what a one-shot caller such as manual
+	 * `/compact` needs: a single Anthropic `overloaded_error` / 429 / 529 should
+	 * not abort compaction and leave the context full.
+	 *
+	 * Pass `false` when the CALLER already owns a retry loop around the whole
+	 * compaction attempt — auto-compaction does — otherwise the two budgets
+	 * multiply (10 outer attempts x 3 inner = 30 requests) and each outer wait
+	 * stacks on top of the inner backoff.
+	 */
+	oneshotRetry?: OneshotRetryOptions | false;
+}
+
+/**
+ * Resolve the oneshot retry policy for a summarization call. Enabled by default
+ * so a lone transient blip cannot abort compaction; `false` opts out for callers
+ * that already retry the whole attempt (see `SummaryOptions.oneshotRetry`).
+ */
+function summaryOneshotRetry(options: SummaryOptions | undefined): OneshotRetryOptions | undefined {
+	const configured = options?.oneshotRetry;
+	if (configured === false) return undefined;
+	return configured ?? {};
 }
 
 function localCodexCompaction(options: SummaryOptions | undefined) {
@@ -924,6 +957,8 @@ function findUtf8ChunkEnd(text: string, start: number, maxBytes: number): number
 
 async function requestSummary(
 	promptText: string,
+	instructionId: string,
+	instructionSourcePath: string,
 	model: Model,
 	maxTokens: number,
 	apiKey: ApiKey,
@@ -948,10 +983,7 @@ async function requestSummary(
 
 	const response = await instrumentedCompleteSimple(
 		model,
-		{
-			systemPrompt: [SUMMARIZATION_SYSTEM_PROMPT],
-			messages: [{ role: "user", content: [{ type: "text", text: promptText }], timestamp: Date.now() }],
-		},
+		compactionInstructionContext(instructionId, instructionSourcePath, promptText),
 		{
 			maxTokens,
 			signal,
@@ -965,7 +997,12 @@ async function requestSummary(
 			providerSessionState: options?.providerSessionState,
 			codexCompaction: localCodexCompaction(options),
 		},
-		{ telemetry: options?.telemetry, oneshotKind: "compaction_summary", completeImpl: options?.completeImpl },
+		{
+			telemetry: options?.telemetry,
+			oneshotKind: "compaction_summary",
+			completeImpl: options?.completeImpl,
+			retry: summaryOneshotRetry(options),
+		},
 	);
 
 	if (response.stopReason === "error") {
@@ -1024,7 +1061,21 @@ export async function generateSummary(
 				options?.extraContext,
 			);
 			try {
-				summary = await requestSummary(promptText, model, maxTokens, apiKey, signal, options);
+				const update = summary !== undefined;
+				summary = await requestSummary(
+					promptText,
+					update
+						? "agent.compaction.prompts.compaction-update-summary"
+						: "agent.compaction.prompts.compaction-summary",
+					update
+						? "packages/agent/src/compaction/prompts/compaction-update-summary.md"
+						: "packages/agent/src/compaction/prompts/compaction-summary.md",
+					model,
+					maxTokens,
+					apiKey,
+					signal,
+					options,
+				);
 				break;
 			} catch (error) {
 				if (bytesPerToken > 1 && error instanceof Error && SUMMARY_CONTEXT_OVERFLOW_PATTERN.test(error.message)) {
@@ -1129,13 +1180,14 @@ export async function generateHandoffFromContext(
 		telemetry: options.telemetry,
 		oneshotKind: "handoff",
 		completeImpl: options.completeImpl,
+		retry: {},
 	});
 	if (response.stopReason === "error" && shouldRetryHandoffWithAutoToolChoice(response)) {
 		response = await instrumentedCompleteSimple(
 			model,
 			context,
 			{ ...requestOptions, toolChoice: "auto" },
-			{ telemetry: options.telemetry, oneshotKind: "handoff", completeImpl: options.completeImpl },
+			{ telemetry: options.telemetry, oneshotKind: "handoff", completeImpl: options.completeImpl, retry: {} },
 		);
 	}
 
@@ -1168,7 +1220,12 @@ export async function generateHandoff(
 	];
 
 	return generateHandoffFromContext(
-		{ systemPrompt: options.systemPrompt, messages: requestMessages, tools: options.tools },
+		{
+			systemPrompt: options.systemPrompt,
+			instructions: collectCompactionContextInstructions(messages, "side_model"),
+			messages: requestMessages,
+			tools: options.tools,
+		},
 		model,
 		{
 			streamOptions: {
@@ -1221,10 +1278,11 @@ async function generateShortSummary(
 
 	const response = await instrumentedCompleteSimple(
 		model,
-		{
-			systemPrompt: [SUMMARIZATION_SYSTEM_PROMPT],
-			messages: [{ role: "user", content: [{ type: "text", text: promptText }], timestamp: Date.now() }],
-		},
+		compactionInstructionContext(
+			"agent.compaction.prompts.compaction-short-summary",
+			"packages/agent/src/compaction/prompts/compaction-short-summary.md",
+			promptText,
+		),
 		{
 			maxTokens,
 			signal,
@@ -1238,7 +1296,12 @@ async function generateShortSummary(
 			providerSessionState: options?.providerSessionState,
 			codexCompaction: localCodexCompaction(options),
 		},
-		{ telemetry: options?.telemetry, oneshotKind: "compaction_short_summary", completeImpl: options?.completeImpl },
+		{
+			telemetry: options?.telemetry,
+			oneshotKind: "compaction_short_summary",
+			completeImpl: options?.completeImpl,
+			retry: summaryOneshotRetry(options),
+		},
 	);
 
 	if (response.stopReason === "error") {
@@ -1790,17 +1853,13 @@ async function generateTurnPrefixSummary(
 	const llmMessages = (options?.convertToLlm ?? defaultConvertToLlm)(messages);
 	const conversationText = serializeConversationForSummary(llmMessages, preferredDialect(model.id));
 	const promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`;
-	const summarizationMessages = [
-		{
-			role: "user" as const,
-			content: [{ type: "text" as const, text: promptText }],
-			timestamp: Date.now(),
-		},
-	];
-
 	const response = await instrumentedCompleteSimple(
 		model,
-		{ systemPrompt: [SUMMARIZATION_SYSTEM_PROMPT], messages: summarizationMessages },
+		compactionInstructionContext(
+			"agent.compaction.prompts.compaction-turn-prefix",
+			"packages/agent/src/compaction/prompts/compaction-turn-prefix.md",
+			promptText,
+		),
 		{
 			maxTokens,
 			signal,
@@ -1814,7 +1873,12 @@ async function generateTurnPrefixSummary(
 			providerSessionState: options?.providerSessionState,
 			codexCompaction: localCodexCompaction(options),
 		},
-		{ telemetry: options?.telemetry, oneshotKind: "compaction_turn_prefix", completeImpl: options?.completeImpl },
+		{
+			telemetry: options?.telemetry,
+			oneshotKind: "compaction_turn_prefix",
+			completeImpl: options?.completeImpl,
+			retry: summaryOneshotRetry(options),
+		},
 	);
 
 	if (response.stopReason === "error") {

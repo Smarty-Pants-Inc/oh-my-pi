@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { adaptSchemaForStrict, toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
+import { SessionCapabilities } from "@oh-my-pi/pi-coding-agent/capability/session-capabilities";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ToolChoiceQueue } from "@oh-my-pi/pi-coding-agent/session/tool-choice-queue";
 import { createTools, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
@@ -134,6 +135,30 @@ describe("ast_edit tool schema", () => {
 			expect(updated).toContain("modernWrap(x, value)");
 		} finally {
 			await removeWithRetries(tempDir);
+		}
+	});
+
+	it("requires a capability grant for every resolved file outside the workspace", async () => {
+		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "ast-edit-workspace-"));
+		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "ast-edit-outside-"));
+		try {
+			const filePath = path.join(outside, "legacy.ts");
+			await Bun.write(filePath, "legacyWrap(x, value)\n");
+			const tools = await createTools(
+				createTestSession(workspace, { capabilities: new SessionCapabilities({ workspace }) }),
+				["ast_edit"],
+			);
+			const tool = tools.find(entry => entry.name === "ast_edit");
+
+			await expect(
+				tool!.execute("ast-edit-capability", {
+					ops: [{ pat: "legacyWrap($A, $B)", out: "modernWrap($A, $B)" }],
+					paths: [filePath],
+				}),
+			).rejects.toThrow("requires an explicit session writePath capability");
+			expect(await Bun.file(filePath).text()).toBe("legacyWrap(x, value)\n");
+		} finally {
+			await Promise.all([removeWithRetries(workspace), removeWithRetries(outside)]);
 		}
 	});
 

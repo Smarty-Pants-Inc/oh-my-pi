@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
 import type {
 	AgentTool,
@@ -10,6 +11,8 @@ import type {
 import type { Component } from "@oh-my-pi/pi-tui";
 import { ImageProtocol, TERMINAL } from "@oh-my-pi/pi-tui";
 import { getProjectDir, isEnoent, logger, prompt } from "@oh-my-pi/pi-utils";
+import { $which } from "@oh-my-pi/pi-utils/which";
+import { canonicalPath } from "../capability/session-capabilities";
 import type { Settings } from "../config/settings";
 import { applyDirenvPreflight, type BashResult, executeBash } from "../exec/bash-executor";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
@@ -74,6 +77,222 @@ const BASH_APPROVAL_SHELL_CONTROL_CHARS: Record<string, true> = {
 	")": true,
 };
 const BASH_APPROVAL_REINTERPRETED_ARGUMENT_RE = /(?:^|[ \t])(?:-[^-]*[ce]|--(?:command|eval))(?:[= \t]|$)/u;
+const BASH_WRITE_COMMANDS_ALL_TARGETS = new Set(["chmod", "chown", "mkdir", "rm", "rmdir", "tee", "touch", "truncate"]);
+const BASH_WRITE_COMMANDS_LAST_TARGET = new Set(["cp", "install", "ln", "mv"]);
+const BASH_SAFE_READONLY_COMMANDS = new Set([
+	"[",
+	"cat",
+	"dirname",
+	"echo",
+	"false",
+	"head",
+	"ls",
+	"pwd",
+	"printf",
+	"readlink",
+	"realpath",
+	"stat",
+	"tail",
+	"test",
+	"true",
+	"wc",
+]);
+const BASH_SAFE_GIT_READ_SUBCOMMANDS = new Set(["diff", "log", "ls-files", "rev-parse", "show", "status"]);
+const BASH_SAFE_BUN_RUN_SCRIPTS = new Set(
+	[
+		["build", "bun run --workspaces --if-present build"],
+		["build", "bun ../../scripts/bazel-natives.ts host --dest native"],
+		["build", "bun scripts/build-binary.ts"],
+		["build", "bun scripts/build-extension.ts"],
+		["build", "bun run build.ts"],
+		["build", "vite build"],
+		["build:native", "bun --cwd=packages/natives run build"],
+		["check", "biome check . && bun run check:types"],
+		["check", "biome check . && tsgo -p tsconfig.json --noEmit"],
+		["check", "bun run --parallel check:ts check:rs"],
+		["check:rs", "bun scripts/run-rs-task.ts check:rs"],
+		["check:tools", "biome check . --no-errors-on-unmatched"],
+		["check:ts", "bun run check:tools && bun run --workspaces --if-present check"],
+		["check:types", "tsc --noEmit"],
+		["check:types", "tsgo -p tsconfig.json --noEmit"],
+		["check:types", "tsgo -p tsconfig.json --noEmit && tsgo -p tsconfig.client.json --noEmit"],
+		["check:types", "tsgo -p tsconfig.json --noEmit && tsgo -p tsconfig.worker.json --noEmit"],
+		["ci:check:full", "bun run check:ts"],
+		["ci:test:full", "bun run ci:test:ts && bun run test:rs"],
+		[
+			"ci:test:smoke",
+			"bun packages/coding-agent/src/cli.ts --version && bun packages/coding-agent/src/cli.ts --help && bun packages/coding-agent/src/cli.ts stats --help && bun packages/coding-agent/src/cli.ts --smoke-test",
+		],
+		["ci:test:ts", "bun scripts/ci-test-ts.ts all"],
+		["collab:web:build", "bun --cwd=packages/collab-web run build"],
+		["test", "bun ../../scripts/ci-test-ts.ts coding-agent-heavy --full"],
+		["test", "bun scripts/ci-test-ts.ts local"],
+		["test", "bun test"],
+		["test", "bun test --parallel"],
+		["test", "bun test --parallel test/*.test.ts"],
+		["test", "bun test --timeout 30000 test"],
+		["test:rs", "bun scripts/run-rs-task.ts test:rs"],
+		[
+			"test:scripts",
+			"bun test scripts/ci-test-ts.test.ts scripts/ci-release-build-binaries.test.ts scripts/musl-release.test.ts scripts/ci-release-publish.test.ts scripts/release.test.ts",
+		],
+		["test:ts", "bun scripts/ci-test-ts.ts local-ts"],
+	].map(([name, body]) => `${name}\0${body}`),
+);
+const BASH_SAFE_BUN_TEST_BOOLEAN_FLAGS = new Set([
+	"--bail",
+	"--concurrent",
+	"--coverage",
+	"--help",
+	"--only-failures",
+	"--parallel",
+	"--pass-with-no-tests",
+	"--randomize",
+	"--todo",
+	"--update-snapshots",
+	"-h",
+	"-u",
+]);
+const BASH_SAFE_BUN_TEST_NUMERIC_VALUE_FLAGS = new Set(["--max-concurrency", "--rerun-each", "--seed", "--timeout"]);
+const BASH_SAFE_BUN_TEST_ENUM_VALUE_FLAGS = new Map<string, ReadonlySet<string>>([
+	["--coverage-reporter", new Set(["lcov", "text"])],
+	["--reporter", new Set(["dots", "junit"])],
+]);
+const BASH_SAFE_BUN_TEST_STRING_VALUE_FLAGS = new Set(["--test-name-pattern"]);
+interface GithubPrOptionGrammar {
+	boolean: ReadonlySet<string>;
+	value: ReadonlySet<string>;
+}
+
+const BASH_GITHUB_PR_OPTION_GRAMMARS = new Map<string, GithubPrOptionGrammar>([
+	[
+		"create",
+		{
+			boolean: new Set(["--draft", "--no-maintainer-edit", "-d"]),
+			value: new Set([
+				"--assignee",
+				"--base",
+				"--body",
+				"--head",
+				"--label",
+				"--milestone",
+				"--project",
+				"--reviewer",
+				"--title",
+				"-a",
+				"-B",
+				"-b",
+				"-H",
+				"-l",
+				"-m",
+				"-p",
+				"-r",
+				"-t",
+			]),
+		},
+	],
+	[
+		"edit",
+		{
+			boolean: new Set(["--remove-milestone"]),
+			value: new Set([
+				"--add-assignee",
+				"--add-label",
+				"--add-project",
+				"--add-reviewer",
+				"--milestone",
+				"--remove-assignee",
+				"--remove-label",
+				"--remove-project",
+				"--remove-reviewer",
+				"--title",
+				"-m",
+				"-t",
+			]),
+		},
+	],
+	["lock", { boolean: new Set(), value: new Set(["--reason", "-r"]) }],
+	[
+		"review",
+		{
+			boolean: new Set(["--approve", "--request-changes", "-a", "-r"]),
+			value: new Set(["--body", "--body-file", "-b", "-F"]),
+		},
+	],
+	["unlock", { boolean: new Set(), value: new Set() }],
+]);
+
+function githubPrSingletonValueKey(subcommand: string, option: string): string | undefined {
+	if (option === "-R" || option === "--repo") return "repo";
+	if (subcommand === "create") {
+		if (option === "-B" || option === "--base") return "base";
+		if (option === "-b" || option === "--body") return "body";
+		if (option === "-H" || option === "--head") return "head";
+		if (option === "-m" || option === "--milestone") return "milestone";
+		if (option === "-t" || option === "--title") return "title";
+	}
+	if (subcommand === "edit") {
+		if (option === "-m" || option === "--milestone") return "milestone";
+		if (option === "-t" || option === "--title") return "title";
+	}
+	if (subcommand === "lock" && (option === "-r" || option === "--reason")) return "reason";
+	if (
+		subcommand === "review" &&
+		(option === "-b" || option === "--body" || option === "-F" || option === "--body-file")
+	) {
+		return "review-body";
+	}
+	return undefined;
+}
+const BASH_NAMED_EFFECT_ENV = new Set([
+	"GH_ENTERPRISE_TOKEN",
+	"GH_HOST",
+	"GH_TOKEN",
+	"GITHUB_ENTERPRISE_TOKEN",
+	"GITHUB_TOKEN",
+	"LANG",
+	"LC_ALL",
+	"LC_CTYPE",
+	"NO_COLOR",
+	"SSH_AUTH_SOCK",
+	"TERM",
+	"TMPDIR",
+]);
+const BASH_GIT_PUSH_BOOLEAN_OPTIONS = new Set([
+	"--all",
+	"--atomic",
+	"--delete",
+	"--dry-run",
+	"--follow-tags",
+	"--force",
+	"--force-if-includes",
+	"--force-with-lease",
+	"--ipv4",
+	"--ipv6",
+	"--mirror",
+	"--no-verify",
+	"--porcelain",
+	"--prune",
+	"--quiet",
+	"--set-upstream",
+	"--tags",
+	"--thin",
+	"--verbose",
+	"-d",
+	"-f",
+	"-n",
+	"-q",
+	"-u",
+	"-v",
+]);
+const BASH_GIT_PUSH_VALUE_OPTIONS = new Set(["--push-option", "-o"]);
+
+interface NamedBashEffect {
+	capability: "git.push" | "github.pr";
+	executable: string;
+	args: string[];
+	env: Record<string, string>;
+}
 
 function hasBashApprovalShellControl(command: string): boolean {
 	let quote: "'" | '"' | undefined;
@@ -117,6 +336,653 @@ function hasBashApprovalShellControl(command: string): boolean {
 	// Options such as `git -c alias.x='!...'` and `sh -c "..."` reinterpret
 	// otherwise literal quoted or escaped arguments as executable code.
 	return hasReinterpretableShellControl && BASH_APPROVAL_REINTERPRETED_ARGUMENT_RE.test(command);
+}
+
+function isShellAssignment(token: string): boolean {
+	const equalsIndex = token.indexOf("=");
+	return equalsIndex > 0 && BASH_ENV_NAME_PATTERN.test(token.slice(0, equalsIndex));
+}
+
+function shellCommandIndex(tokens: readonly string[]): number | undefined {
+	for (let index = 0; index < tokens.length; index++) {
+		if (!isShellAssignment(tokens[index]!)) return index;
+	}
+	return undefined;
+}
+
+function shellPositionals(tokens: readonly string[]): string[] {
+	const positionals: string[] = [];
+	let optionsEnded = false;
+	for (const token of tokens) {
+		if (!optionsEnded && token === "--") {
+			optionsEnded = true;
+			continue;
+		}
+		if (!optionsEnded && token.startsWith("-")) continue;
+		positionals.push(token);
+	}
+	return positionals;
+}
+
+function bashWriteTargets(tokens: readonly string[]): string[] {
+	const commandIndex = shellCommandIndex(tokens);
+	if (commandIndex === undefined) return [];
+	const command = tokens[commandIndex]!;
+	const args = tokens.slice(commandIndex + 1);
+	const positionals = shellPositionals(args);
+	const targets: string[] = [];
+
+	if (BASH_WRITE_COMMANDS_ALL_TARGETS.has(command)) {
+		targets.push(...positionals);
+	} else if (BASH_WRITE_COMMANDS_LAST_TARGET.has(command) && positionals.length > 0) {
+		targets.push(positionals.at(-1)!);
+		for (let index = 0; index < args.length; index++) {
+			const arg = args[index]!;
+			if (arg === "-t" || arg === "--target-directory") {
+				const target = args[index + 1];
+				if (target) targets.push(target);
+				index++;
+			} else if (arg.startsWith("--target-directory=")) {
+				targets.push(arg.slice("--target-directory=".length));
+			}
+		}
+	} else if ((command === "sed" || command === "perl") && args.some(arg => arg === "-i" || arg.startsWith("-i"))) {
+		// The in-place form writes every input path after its program expression.
+		// It is intentionally conservative: validating an extra literal token only
+		// denies a request that cannot prove all of its write destinations.
+		targets.push(...positionals.slice(1));
+	} else if (command === "dd") {
+		for (const arg of args) {
+			if (arg.startsWith("of=")) targets.push(arg.slice("of=".length));
+		}
+	} else if (command === "git") {
+		for (let index = 0; index < args.length; index++) {
+			const arg = args[index]!;
+			if (arg === "--output") {
+				const target = args[index + 1];
+				if (target) targets.push(target);
+				index++;
+			} else if (arg.startsWith("--output=")) {
+				targets.push(arg.slice("--output=".length));
+			}
+		}
+	}
+
+	return targets;
+}
+
+function readShellRedirectTarget(command: string, start: number): { target: string; end: number } | undefined {
+	let index = start;
+	while (command[index] === " " || command[index] === "\t") index++;
+	if (index >= command.length || /[\n\r;&|()<>]/u.test(command[index]!)) return undefined;
+
+	let target = "";
+	let quote: "'" | '"' | undefined;
+	for (; index < command.length; index++) {
+		const ch = command[index]!;
+		if (quote === "'") {
+			if (ch === "'") quote = undefined;
+			else target += ch;
+			continue;
+		}
+		if (quote === '"') {
+			if (ch === '"') {
+				quote = undefined;
+			} else if (ch === "\\" && index + 1 < command.length) {
+				target += command[++index]!;
+			} else {
+				target += ch;
+			}
+			continue;
+		}
+		if (ch === "'" || ch === '"') {
+			quote = ch;
+			continue;
+		}
+		if (ch === "\\" && index + 1 < command.length) {
+			target += command[++index]!;
+			continue;
+		}
+		if (/[ \t\n\r;&|()<>]/u.test(ch)) break;
+		target += ch;
+	}
+	return target.length > 0 ? { target, end: index } : undefined;
+}
+
+/**
+ * Extract literal write destinations from raw shell syntax, including attached
+ * redirects (`x>file`, `2>>file`, `1<>file`) that the word tokenizer keeps in
+ * one token. Input-only redirects are intentionally ignored; `<>` may create
+ * or modify its target and therefore requires write authority.
+ */
+function shellRedirectWriteTargets(command: string): string[] {
+	const targets: string[] = [];
+	let quote: "'" | '"' | undefined;
+	for (let index = 0; index < command.length; index++) {
+		const ch = command[index]!;
+		if (quote === "'") {
+			if (ch === "'") quote = undefined;
+			continue;
+		}
+		if (quote === '"') {
+			if (ch === "\\") index++;
+			else if (ch === '"') quote = undefined;
+			continue;
+		}
+		if (ch === "'" || ch === '"') {
+			quote = ch;
+			continue;
+		}
+		if (ch === "\\") {
+			index++;
+			continue;
+		}
+
+		const inputOutput = ch === "<" && command[index + 1] === ">";
+		if (ch !== ">" && !inputOutput) continue;
+		let targetStart = index + (inputOutput || command[index + 1] === ">" ? 2 : 1);
+		if (!inputOutput && command[targetStart] === "|") targetStart++;
+		const ampersandTarget = command[targetStart] === "&";
+		if (ampersandTarget) targetStart++;
+		const target = readShellRedirectTarget(command, targetStart);
+		if (!target) continue;
+		// `2>&1` / `>&-` duplicate or close a descriptor. `>&path` redirects to
+		// a path and must remain subject to the same capability check.
+		if (!ampersandTarget || !/^(?:\d+|-)$/.test(target.target)) targets.push(target.target);
+		index = target.end - 1;
+	}
+	return targets;
+}
+
+function bashCommandWriteTargets(command: string): string[] {
+	return [...tokenizeShellSegments(command).flatMap(bashWriteTargets), ...shellRedirectWriteTargets(command)];
+}
+
+function executableEnvironmentOverrideName(name: string): boolean {
+	const normalized = name.toUpperCase();
+	return (
+		normalized === "PATH" ||
+		normalized === "HOME" ||
+		normalized === "XDG_CONFIG_HOME" ||
+		normalized === "XDG_CONFIG_DIRS" ||
+		normalized === "ENV" ||
+		normalized === "BASH_ENV" ||
+		normalized === "ZDOTDIR" ||
+		normalized === "SHELL" ||
+		normalized === "SHELLOPTS" ||
+		normalized === "BASHOPTS" ||
+		normalized === "EDITOR" ||
+		normalized === "VISUAL" ||
+		normalized === "BROWSER" ||
+		normalized === "PAGER" ||
+		normalized === "SSH_ASKPASS" ||
+		normalized === "SSH_ASKPASS_REQUIRE" ||
+		normalized === "NODE_OPTIONS" ||
+		normalized === "BUN_OPTIONS" ||
+		normalized === "LD_PRELOAD" ||
+		normalized === "LD_LIBRARY_PATH" ||
+		normalized === "DYLD_INSERT_LIBRARIES" ||
+		normalized === "DYLD_LIBRARY_PATH" ||
+		normalized.startsWith("GIT_") ||
+		normalized.startsWith("GH_")
+	);
+}
+
+function hasExecutableEnvironmentOverride(env: Record<string, string> | undefined): boolean {
+	return Boolean(env && Object.keys(env).some(executableEnvironmentOverrideName));
+}
+
+function gitPushArgsAreAllowed(args: readonly string[]): boolean {
+	if (args[0] !== "push") return false;
+	let optionsEnded = false;
+	for (let index = 1; index < args.length; index++) {
+		const arg = args[index]!;
+		if (optionsEnded || !arg.startsWith("-")) continue;
+		if (arg === "--") {
+			optionsEnded = true;
+			continue;
+		}
+		if (BASH_GIT_PUSH_BOOLEAN_OPTIONS.has(arg)) continue;
+		if (BASH_GIT_PUSH_VALUE_OPTIONS.has(arg)) {
+			if (index + 1 >= args.length) return false;
+			index++;
+			continue;
+		}
+		if (arg.startsWith("--push-option=")) continue;
+		if (arg.startsWith("--force-with-lease=")) continue;
+		if (/^--recurse-submodules=(?:check|no|on-demand|only)$/u.test(arg)) continue;
+		return false;
+	}
+	return true;
+}
+
+function githubPrArgsAreAllowed(args: readonly string[]): boolean {
+	if (args[0] !== "pr") return false;
+	const grammar = BASH_GITHUB_PR_OPTION_GRAMMARS.get(args[1] ?? "");
+	if (!grammar) return false;
+
+	let optionsEnded = false;
+	let explicitCreateHead = false;
+	let explicitCreateBase = false;
+	let explicitCreateEmptyBody = false;
+	let explicitCreateTitle = false;
+	let explicitReviewAction = false;
+	const singletonValues = new Set<string>();
+	const acceptValue = (option: string, value: string): boolean => {
+		const singletonKey = githubPrSingletonValueKey(args[1]!, option);
+		if (singletonKey) {
+			if (singletonValues.has(singletonKey)) return false;
+			singletonValues.add(singletonKey);
+		}
+		if ((option === "-R" || option === "--repo") && value.length === 0) return false;
+		if (args[1] === "create" && (option === "-b" || option === "--body")) {
+			if (value !== "") return false;
+			explicitCreateEmptyBody = true;
+		}
+		if (args[1] === "create" && (option === "-H" || option === "--head")) {
+			if (value.length === 0) return false;
+			explicitCreateHead = true;
+		}
+		if (args[1] === "create" && (option === "-t" || option === "--title")) {
+			if (value.length === 0) return false;
+			explicitCreateTitle = true;
+		}
+		if (args[1] === "create" && (option === "-B" || option === "--base")) {
+			if (value !== "main") return false;
+			explicitCreateBase = true;
+		}
+		return true;
+	};
+	for (let index = 2; index < args.length; index++) {
+		const arg = args[index]!;
+		if (optionsEnded || !arg.startsWith("-")) continue;
+		if (arg === "--") {
+			optionsEnded = true;
+			continue;
+		}
+		if (grammar.boolean.has(arg)) {
+			if (
+				args[1] === "review" &&
+				(arg === "--approve" || arg === "--request-changes" || arg === "-a" || arg === "-r")
+			) {
+				if (explicitReviewAction) return false;
+				explicitReviewAction = true;
+			}
+			continue;
+		}
+		if (grammar.value.has(arg) || arg === "-R" || arg === "--repo") {
+			if (index + 1 >= args.length) return false;
+			const value = args[index + 1]!;
+			if (!acceptValue(arg, value)) return false;
+			index++;
+			continue;
+		}
+
+		const equalsIndex = arg.indexOf("=");
+		if (equalsIndex > 2) {
+			const option = arg.slice(0, equalsIndex);
+			if (grammar.value.has(option) || option === "--repo") {
+				if (!acceptValue(option, arg.slice(equalsIndex + 1))) return false;
+				continue;
+			}
+		}
+		return false;
+	}
+	// GitHub documents that an explicit head skips gh's branch push/fork path.
+	if (args[1] === "create") {
+		return explicitCreateHead && explicitCreateBase && explicitCreateTitle && explicitCreateEmptyBody;
+	}
+	if (args[1] === "review") return explicitReviewAction;
+	return true;
+}
+
+function resolveNamedEffectExecutable(name: "env" | "git" | "gh"): string | undefined {
+	const found = $which(name);
+	if (!found || !path.isAbsolute(found)) return undefined;
+	try {
+		const resolved = fs.realpathSync(found);
+		const stat = fs.statSync(resolved);
+		return stat.isFile() && (stat.mode & 0o111) !== 0 ? resolved : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function namedEffectEnvironment(
+	tokens: readonly string[],
+	commandIndex: number,
+	env: Record<string, string> | undefined,
+): Record<string, string> | undefined {
+	if (env && Object.keys(env).some(name => !BASH_NAMED_EFFECT_ENV.has(name))) return undefined;
+	const result: Record<string, string> = {};
+	for (const name of BASH_NAMED_EFFECT_ENV) {
+		const value = process.env[name];
+		if (value !== undefined) result[name] = value;
+	}
+	if (env) Object.assign(result, env);
+	for (const token of tokens.slice(0, commandIndex)) {
+		const equalsIndex = token.indexOf("=");
+		const name = token.slice(0, equalsIndex);
+		if (!BASH_NAMED_EFFECT_ENV.has(name)) return undefined;
+		result[name] = token.slice(equalsIndex + 1);
+	}
+	return result;
+}
+
+function parseNamedBashEffect(command: string, env?: Record<string, string>): NamedBashEffect | undefined {
+	if (hasBashApprovalShellControl(command)) return undefined;
+	const segments = tokenizeShellSegments(command);
+	if (segments.length !== 1) return undefined;
+	const tokens = segments[0]!;
+	const commandIndex = shellCommandIndex(tokens);
+	if (commandIndex === undefined) return undefined;
+	const effectEnv = namedEffectEnvironment(tokens, commandIndex, env);
+	if (!effectEnv) return undefined;
+
+	const commandName = tokens[commandIndex];
+	const args = tokens.slice(commandIndex + 1);
+	if (commandName === "git" && gitPushArgsAreAllowed(args)) {
+		const executable = resolveNamedEffectExecutable("git");
+		return executable ? { capability: "git.push", executable, args, env: effectEnv } : undefined;
+	}
+	if (commandName === "gh" && githubPrArgsAreAllowed(args)) {
+		const executable = resolveNamedEffectExecutable("gh");
+		return executable ? { capability: "github.pr", executable, args, env: effectEnv } : undefined;
+	}
+	return undefined;
+}
+
+function shellQuoteLiteral(value: string): string {
+	return `'${value.replace(/'/gu, `'\\''`)}'`;
+}
+
+function buildSterileNamedEffectCommand(effect: NamedBashEffect): string | undefined {
+	const envExecutable = resolveNamedEffectExecutable("env");
+	if (!envExecutable) return undefined;
+	const trustedPath = Array.from(
+		new Set([path.dirname(effect.executable), "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]),
+	).join(path.delimiter);
+	const forwardedEnv = Object.keys(effect.env)
+		.sort()
+		.map(name => `${name}="$${name}"`);
+	return [
+		shellQuoteLiteral(envExecutable),
+		"-i",
+		shellQuoteLiteral(`PATH=${trustedPath}`),
+		shellQuoteLiteral("GIT_CONFIG_NOSYSTEM=1"),
+		shellQuoteLiteral("GIT_TERMINAL_PROMPT=0"),
+		shellQuoteLiteral("GH_PROMPT_DISABLED=1"),
+		...forwardedEnv,
+		shellQuoteLiteral(effect.executable),
+		...effect.args.map(shellQuoteLiteral),
+	].join(" ");
+}
+
+function isCanonicalPathContained(root: string, target: string): boolean {
+	const relative = path.relative(root, target);
+	return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+function isPathContained(root: string, target: string, base = root): boolean {
+	try {
+		return isCanonicalPathContained(canonicalPath(root), canonicalPath(target, base));
+	} catch {
+		return false;
+	}
+}
+
+function hasUnsafeShellExpansion(value: string): boolean {
+	return /[~*?[\]{}$`]/u.test(value);
+}
+
+function bunTestIsKnownSafe(args: readonly string[], cwd: string): boolean {
+	if (args[0] !== "test") return false;
+	for (let index = 1; index < args.length; index++) {
+		const arg = args[index]!;
+		if (arg === "--") return false;
+		if (BASH_SAFE_BUN_TEST_BOOLEAN_FLAGS.has(arg)) continue;
+		if (/^--(?:bail|parallel)=\d+$/u.test(arg)) continue;
+		if (BASH_SAFE_BUN_TEST_NUMERIC_VALUE_FLAGS.has(arg)) {
+			if (index + 1 >= args.length) return false;
+			if (!/^\d+$/u.test(args[index + 1]!)) return false;
+			index++;
+			continue;
+		}
+		if (BASH_SAFE_BUN_TEST_STRING_VALUE_FLAGS.has(arg)) {
+			if (index + 1 >= args.length) return false;
+			if (hasUnsafeShellExpansion(args[index + 1]!)) return false;
+			index++;
+			continue;
+		}
+		const equalsIndex = arg.indexOf("=");
+		if (equalsIndex > 0) {
+			const flag = arg.slice(0, equalsIndex);
+			const value = arg.slice(equalsIndex + 1);
+			if (BASH_SAFE_BUN_TEST_NUMERIC_VALUE_FLAGS.has(flag) && /^\d+$/u.test(value)) continue;
+			if (BASH_SAFE_BUN_TEST_STRING_VALUE_FLAGS.has(flag) && !hasUnsafeShellExpansion(value)) continue;
+			if (BASH_SAFE_BUN_TEST_ENUM_VALUE_FLAGS.get(flag)?.has(value)) continue;
+		}
+		const enumValues = BASH_SAFE_BUN_TEST_ENUM_VALUE_FLAGS.get(arg);
+		if (enumValues) {
+			if (index + 1 >= args.length || !enumValues.has(args[index + 1]!)) return false;
+			index++;
+			continue;
+		}
+		if (
+			arg.startsWith("-") ||
+			hasUnsafeShellExpansion(arg) ||
+			path.isAbsolute(arg) ||
+			/^(?:[A-Za-z]:[\\/]|\\\\)/u.test(arg) ||
+			/(?:^|[\\/])\.\.(?:[\\/]|$)/u.test(arg) ||
+			!isPathContained(cwd, arg)
+		) {
+			return false;
+		}
+	}
+	return true;
+}
+
+function bunCommandIsKnownSafe(
+	tokens: readonly string[],
+	commandIndex: number,
+	cwd: string,
+	env: Record<string, string> | undefined,
+): boolean {
+	if (commandIndex !== 0) return false;
+	if (hasExecutableEnvironmentOverride(env)) return false;
+	const args = tokens.slice(commandIndex + 1);
+	if (args[0] === "run") {
+		if (args.length !== 2) return false;
+		const manifestPath = resolveToCwd("package.json", cwd);
+		try {
+			if (fs.lstatSync(manifestPath).isSymbolicLink()) return false;
+			const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as { scripts?: Record<string, unknown> };
+			const name = args[1]!;
+			const scripts = manifest.scripts;
+			const body = scripts?.[name];
+			if (scripts && (Object.hasOwn(scripts, `pre${name}`) || Object.hasOwn(scripts, `post${name}`))) return false;
+			return typeof body === "string" && BASH_SAFE_BUN_RUN_SCRIPTS.has(`${name}\0${body}`);
+		} catch {
+			return false;
+		}
+	}
+	return bunTestIsKnownSafe(args, cwd);
+}
+
+function rgCommandIsKnownSafe(
+	tokens: readonly string[],
+	commandIndex: number,
+	env: Record<string, string> | undefined,
+): boolean {
+	if (commandIndex !== 0 || hasExecutableEnvironmentOverride(env)) return false;
+	const args = tokens.slice(commandIndex + 1);
+	if (
+		args.some(
+			arg => arg === "--pre" || arg.startsWith("--pre=") || arg === "--pre-glob" || arg.startsWith("--pre-glob="),
+		)
+	) {
+		return false;
+	}
+	const noConfig = args.includes("--no-config");
+	if (!noConfig && (env?.RIPGREP_CONFIG_PATH || process.env.RIPGREP_CONFIG_PATH)) return false;
+	return true;
+}
+
+function gitCommandIsKnownSafe(
+	tokens: readonly string[],
+	commandIndex: number,
+	env: Record<string, string> | undefined,
+): boolean {
+	if (commandIndex !== 0 || hasExecutableEnvironmentOverride(env)) return false;
+	const helperEnvironment = (name: string): boolean =>
+		name === "GIT_EXTERNAL_DIFF" || name === "GIT_PAGER" || name === "PAGER" || name.startsWith("GIT_CONFIG_");
+	if (env && Object.keys(env).some(helperEnvironment)) return false;
+	if (
+		Object.entries(process.env).some(
+			([name, value]) => Boolean(value) && (name === "GIT_EXTERNAL_DIFF" || name.startsWith("GIT_CONFIG_")),
+		)
+	) {
+		return false;
+	}
+
+	const args = tokens.slice(commandIndex + 1);
+	let subcommandIndex = 0;
+	while (args[subcommandIndex] === "--no-pager") subcommandIndex++;
+	const subcommand = args[subcommandIndex];
+	if (!subcommand || !BASH_SAFE_GIT_READ_SUBCOMMANDS.has(subcommand)) return false;
+	if (args.slice(0, subcommandIndex).some(arg => arg !== "--no-pager")) return false;
+	if (
+		args.some(
+			arg =>
+				arg === "-c" ||
+				(arg.startsWith("-c") && arg.length > 2) ||
+				arg === "--config-env" ||
+				arg.startsWith("--config-env=") ||
+				arg === "--ext-diff" ||
+				arg.startsWith("--ext-diff=") ||
+				arg === "--textconv" ||
+				arg.startsWith("--textconv="),
+		)
+	) {
+		return false;
+	}
+	if (subcommand === "diff" || subcommand === "log" || subcommand === "show") {
+		const subcommandArgs = args.slice(subcommandIndex + 1);
+		return subcommandArgs.includes("--no-ext-diff") && subcommandArgs.includes("--no-textconv");
+	}
+	return true;
+}
+
+function commandIsKnownSafe(tokens: readonly string[], cwd: string, env: Record<string, string> | undefined): boolean {
+	const commandIndex = shellCommandIndex(tokens);
+	if (commandIndex === undefined) return true;
+	const command = tokens[commandIndex]!;
+	if (BASH_SAFE_READONLY_COMMANDS.has(command)) return true;
+	if (command === "rg") return rgCommandIsKnownSafe(tokens, commandIndex, env);
+	if (BASH_WRITE_COMMANDS_ALL_TARGETS.has(command) || BASH_WRITE_COMMANDS_LAST_TARGET.has(command)) {
+		// Flags alter many mutators' target semantics (`cp -t`, in-place
+		// editors, archive extraction). Their complete grammar is not an
+		// authority parser, so a generic capability is required as well.
+		return !tokens.slice(commandIndex + 1).some(arg => arg.startsWith("-") && arg !== "--");
+	}
+	if (command === "dd") return tokens.slice(commandIndex + 1).some(arg => arg.startsWith("of="));
+	if (command === "sed" || command === "perl") {
+		return tokens.slice(commandIndex + 1).some(arg => arg === "-i" || arg.startsWith("-i"));
+	}
+	if (command === "bun") return bunCommandIsKnownSafe(tokens, commandIndex, cwd, env);
+	if (command === "git") return gitCommandIsKnownSafe(tokens, commandIndex, env);
+	return false;
+}
+
+function commandNeedsGenericExternalCapability(
+	command: string,
+	tokens: readonly string[],
+	cwd: string,
+	env: Record<string, string> | undefined,
+): boolean {
+	// Substitutions and nested shell expressions cannot prove which executable or
+	// paths the shell will select. Simple compound segments are checked one by one.
+	if (/[`$()]/u.test(command)) return true;
+	return !commandIsKnownSafe(tokens, cwd, env);
+}
+
+function assertBashExternalCapability(session: ToolSession, capability: string): void {
+	const decision = session.capabilities?.decideExternalEffect(capability);
+	if (!decision || decision.outcome === "allow") return;
+	throw new ToolError(`Bash command requires explicit session capability '${capability}'.`);
+}
+
+function assertBashCommandCapability(session: ToolSession, command: string): void {
+	if (session.capabilities?.decideExternalEffect("bash.external").outcome === "allow") return;
+	assertBashExternalCapability(session, `bash.command:${command.trim()}`);
+}
+
+function assertBashWriteCapability(
+	session: ToolSession,
+	target: string,
+	cwd: string,
+	env: Record<string, string> | undefined,
+): void {
+	if (target.includes("$") || target.includes("`") || /[*?[\]{}]/u.test(target)) {
+		throw new ToolError(`Bash write target '${target}' cannot be validated safely.`);
+	}
+	if (target.startsWith("~") && target !== "~" && !target.startsWith("~/")) {
+		throw new ToolError(`Bash write target '${target}' cannot be validated safely.`);
+	}
+	const home = env?.HOME;
+	if ((target === "~" || target.startsWith("~/")) && !home?.startsWith("/")) {
+		throw new ToolError(
+			`Bash write target '${target}' cannot be validated safely without an explicit absolute HOME.`,
+		);
+	}
+	const normalizedTarget = target === "~" || target.startsWith("~/") ? `${home}${target.slice(1)}` : target;
+	const resolvedTarget = resolveToCwd(normalizedTarget, cwd);
+	const decision = session.capabilities?.decideWrite(resolvedTarget, session.cwd);
+	if (!decision) return;
+	if (decision.outcome === "allow") return;
+	if (decision.outcome === "request") {
+		throw new ToolError(
+			`Bash write target '${decision.target}' requires an explicit session writePath capability outside '${session.cwd}'.`,
+		);
+	}
+	throw new ToolError(`Bash write target '${decision.target}' cannot be canonicalized safely.`);
+}
+
+function isCurrentWorkspacePath(session: ToolSession, target: string): boolean {
+	return session.capabilities?.isWorkspacePath(target, session.cwd) ?? isPathContained(session.cwd, target);
+}
+
+/**
+ * Apply session authority before choosing any Bash backend. This is deliberately
+ * a small syntax-based gate, not a claim to understand arbitrary shell code:
+ * known write destinations and the capabilities exposed by the GitHub tool are
+ * checked; dynamic write destinations fail closed rather than bypassing policy.
+ */
+function assertBashCapabilities(
+	session: ToolSession,
+	command: string,
+	cwd: string,
+	env: Record<string, string> | undefined,
+	allowNamedEffects = true,
+): NamedBashEffect | undefined {
+	if (!session.capabilities) return undefined;
+	const namedEffect = allowNamedEffects ? parseNamedBashEffect(command, env) : undefined;
+	const segments = tokenizeShellSegments(command);
+	for (const target of bashCommandWriteTargets(command)) {
+		assertBashWriteCapability(session, target, cwd, env);
+	}
+	if (segments.length === 0 && command.trim().length > 0) {
+		assertBashCommandCapability(session, command);
+		return undefined;
+	}
+	if (namedEffect) assertBashExternalCapability(session, namedEffect.capability);
+	for (const tokens of segments) {
+		const cwdIsWorkspace = isCurrentWorkspacePath(session, cwd);
+		if (!cwdIsWorkspace || (!namedEffect && commandNeedsGenericExternalCapability(command, tokens, cwd, env))) {
+			assertBashCommandCapability(session, command);
+		}
+	}
+	return namedEffect;
 }
 
 const BASH_PATTERN_APPROVAL_VALUES = new Set(["allow", "deny", "prompt"]);
@@ -1131,6 +1997,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 	#startManagedBashJob(options: {
 		command: string;
 		commandCwd: string;
+		sterile?: boolean;
 		timeoutMs: number | undefined;
 		timeoutSec: number | undefined;
 		requestedTimeoutSec?: number;
@@ -1161,10 +2028,11 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 					const wallTimeStart = performance.now();
 					const result = await executeBash(options.command, {
 						cwd: options.commandCwd,
-						sessionKey: `${this.session.getSessionId?.() ?? ""}:async:${jobId}`,
+						sessionKey: `${this.session.getSessionId?.() ?? ""}:async:${jobId}${options.sterile ? ":sterile" : ""}`,
 						timeout: options.timeoutMs ?? 0,
 						signal: runSignal,
 						env: options.resolvedEnv,
+						sterile: options.sterile,
 						artifactPath,
 						artifactId,
 						onChunk: chunk => {
@@ -1206,6 +2074,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			},
 			{
 				ownerId: this.session.getAgentId?.() ?? undefined,
+				originTurnId: this.session.getCurrentTurnId?.(),
 				onProgress: async text => {
 					latestText = text;
 					if (!forwardUpdates) return;
@@ -1402,6 +2271,10 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			}
 		}
 
+		// This sits inside the tool, rather than the approval wrapper, so yolo
+		// and every execution backend retain the same session authority boundary.
+		assertBashCapabilities(this.session, rawCommand, this.session.cwd, env, !executionEnvironment);
+
 		if (executionEnvironment) {
 			return this.#executeInEnvironment({
 				environment: executionEnvironment,
@@ -1426,7 +2299,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			},
 		};
 		command = await expandInternalUrls(command, { ...internalUrlOptions, ensureLocalParentDirs: true });
-		const resolvedEnv = env
+		let resolvedEnv = env
 			? Object.fromEntries(
 					await Promise.all(
 						Object.entries(env).map(async ([key, value]) => [
@@ -1453,6 +2326,19 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		invalidateGithubCacheForBashCommand(command);
 
 		const commandCwd = cwd ? resolveToCwd(cwd, this.session.cwd) : this.session.cwd;
+		// Internal URL expansion can replace a literal path, so validate the
+		// command that the local, PTY, and ACP backends will actually receive.
+		const namedEffect = assertBashCapabilities(this.session, command, commandCwd, resolvedEnv);
+		let sterileNamedEffect = false;
+		if (namedEffect) {
+			const sterileCommand = buildSterileNamedEffectCommand(namedEffect);
+			if (!sterileCommand) assertBashCommandCapability(this.session, command);
+			else {
+				command = sterileCommand;
+				resolvedEnv = namedEffect.env;
+				sterileNamedEffect = true;
+			}
+		}
 		let cwdStat: fs.Stats;
 		try {
 			cwdStat = await fs.promises.stat(commandCwd);
@@ -1486,6 +2372,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			const job = this.#startManagedBashJob({
 				command,
 				commandCwd,
+				sterile: sterileNamedEffect,
 				timeoutMs,
 				timeoutSec,
 				requestedTimeoutSec,
@@ -1506,7 +2393,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		// auto-background would otherwise silently disable the terminal route).
 		const clientBridge = this.session.getClientBridge?.();
 		const bridgeTerminalAvailable = Boolean(
-			clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty,
+			clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty && !sterileNamedEffect,
 		);
 
 		const autoBgManager = this.session.asyncJobManager;
@@ -1524,6 +2411,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			const job = this.#startManagedBashJob({
 				command,
 				commandCwd,
+				sterile: sterileNamedEffect,
 				timeoutMs,
 				timeoutSec,
 				requestedTimeoutSec,
@@ -1584,8 +2472,8 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		// (the backend's own timeout is installed only after this await), matching
 		// the executeBash branch so a cold `.envrc` can't outlast a short call.
 		const backendPreflight =
-			(clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty) ||
-			canUseInteractiveBashPty(pty, ctx)
+			(clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty && !sterileNamedEffect) ||
+			(!sterileNamedEffect && canUseInteractiveBashPty(pty, ctx))
 				? await applyDirenvPreflight(command, commandCwd, {
 						callerEnv: resolvedEnv,
 						signal,
@@ -1598,7 +2486,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		// Route through the client terminal when the client advertises the terminal capability.
 		// Skip when pty=true (PTY needs the local terminal UI). ACP keeps its shell
 		// wrapping, direnv preflight, live terminal details, and best-effort cleanup.
-		if (clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty) {
+		if (clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty && !sterileNamedEffect) {
 			const bridgeCommand = backendPreflight?.command ?? command;
 			const bridgeEnv = backendPreflight?.env ?? resolvedEnv;
 			const shellSpawn = wrapShellLineForClientTerminal(bridgeCommand, this.session.settings.getShellConfig());
@@ -1649,7 +2537,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		const artifact = (await this.session.allocateOutputArtifact?.("bash")) ?? {};
 		const { path: artifactPath, id: artifactId } = artifact;
 
-		const interactiveUi = canUseInteractiveBashPty(pty, ctx) ? ctx?.ui : undefined;
+		const interactiveUi = !sterileNamedEffect && canUseInteractiveBashPty(pty, ctx) ? ctx?.ui : undefined;
 		if (pty && !interactiveUi) {
 			pendingNotices.push("pty requested but unavailable in this environment; ran without a terminal");
 		}
@@ -1674,10 +2562,11 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 					// applied twice.
 					await executeBash(command, {
 						cwd: commandCwd,
-						sessionKey: this.session.getSessionId?.() ?? undefined,
+						sessionKey: `${this.session.getSessionId?.() ?? ""}${sterileNamedEffect ? ":sterile" : ""}`,
 						timeout: timeoutMs ?? 0,
 						signal,
 						env: resolvedEnv,
+						sterile: sterileNamedEffect,
 						artifactPath,
 						artifactId,
 						onChunk: streamTailUpdates(tailBuffer, onUpdate),
