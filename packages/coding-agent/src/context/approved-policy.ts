@@ -188,6 +188,11 @@ export async function assertApprovedStartup(cwd: string = process.cwd()): Promis
 	return release;
 }
 
+export function promptPolicyReviewWarning(error: unknown): string | undefined {
+	if (!(error instanceof Error) || !error.message.startsWith("PROMPT_POLICY_REVIEW_REQUIRED:")) return undefined;
+	return error.message;
+}
+
 /** Fresh runtime gate for every new session. Offline context commands deliberately do not call it. */
 export function ensureApprovedStartup(): Promise<ContextReleaseManifest> {
 	return assertApprovedStartup();

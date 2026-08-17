@@ -10,7 +10,7 @@
 
 ## Registration
 
-The tool is essential, strict-schema, and read-tier. It is available only when the session has a `SessionCapabilities` boundary. A successful call changes session authority; it does not perform the authorized write or external effect.
+The tool is discoverable, strict-schema, and read-tier. It is available only when the session has a `SessionCapabilities` boundary. A successful call changes session authority; it does not perform the authorized write or external effect.
 
 ## Inputs
 

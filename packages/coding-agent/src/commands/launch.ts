@@ -5,7 +5,7 @@
 import { isBunTestRuntime } from "@oh-my-pi/pi-utils";
 import { Command } from "@oh-my-pi/pi-utils/cli";
 import { type Args as ParsedArgs, parseArgs, reportCliUsageError } from "../cli/args";
-import { ensureApprovedStartup } from "../context/approved-policy";
+import { ensureApprovedStartup, promptPolicyReviewWarning } from "../context/approved-policy";
 import { runRootCommand } from "../main";
 import { prepareAcpTerminalAuthArgs } from "../modes/acp/terminal-auth";
 import { launchHelp } from "./launch-help";
@@ -31,7 +31,20 @@ export default class Index extends Command {
 			}
 			throw error;
 		}
-		if (!isBunTestRuntime()) await ensureApprovedStartup();
+		if (!isBunTestRuntime()) {
+			await runRootCommand(parsed, args, {
+				verifyApprovedStartup: async isInteractive => {
+					try {
+						await ensureApprovedStartup();
+					} catch (error) {
+						const warning = isInteractive ? promptPolicyReviewWarning(error) : undefined;
+						if (!warning) throw error;
+						process.stderr.write(`Warning: ${warning}\n`);
+					}
+				},
+			});
+			return;
+		}
 		await runRootCommand(parsed, args);
 	}
 }

@@ -3,6 +3,7 @@ import * as path from "node:path";
 import {
 	approvedPolicyPath,
 	parseApprovedPolicy,
+	promptPolicyReviewWarning,
 	releaseProjectionMismatches,
 } from "../../src/context/approved-policy";
 import { canonicalJson, type JsonValue, sha256 } from "../../src/context/canonical";
@@ -34,6 +35,14 @@ function validPolicy(): Record<string, unknown> {
 }
 
 describe("approved policy", () => {
+	it("classifies only prompt-policy startup failures as nonfatal warnings", () => {
+		expect(promptPolicyReviewWarning(new Error("PROMPT_POLICY_REVIEW_REQUIRED: drift"))).toBe(
+			"PROMPT_POLICY_REVIEW_REQUIRED: drift",
+		);
+		expect(promptPolicyReviewWarning(new Error("unrelated startup failure"))).toBeUndefined();
+		expect(promptPolicyReviewWarning("PROMPT_POLICY_REVIEW_REQUIRED: not an Error")).toBeUndefined();
+	});
+
 	it("uses the shared Smarty Stack policy path by default", () => {
 		expect(approvedPolicyPath()).toEndWith(path.join(".smarty-stack", "policy", "approved-policy.json"));
 		expect(approvedPolicyPath("/tmp/diagnostic-policy.json")).toBe("/tmp/diagnostic-policy.json");

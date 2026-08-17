@@ -273,7 +273,7 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 					);
 					if (decision?.outcome === "request") {
 						throw new ToolError(
-							`AST edit target '${decision.target}' requires an explicit session writePath capability outside '${this.session.cwd}'.`,
+							`AST edit target '${decision.target}' requires an explicit session writePath capability outside '${this.session.cwd}'. Use the discoverable capability_grant tool when the current direct-user turn authorizes it.`,
 						);
 					}
 					if (decision?.outcome === "deny") {

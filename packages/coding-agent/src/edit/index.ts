@@ -512,7 +512,7 @@ export class EditTool implements AgentTool<TInput> {
 			);
 			if (decision?.outcome === "request") {
 				throw new Error(
-					`Edit target '${decision.target}' requires an explicit session writePath capability outside '${this.session.cwd}'.`,
+					`Edit target '${decision.target}' requires an explicit session writePath capability outside '${this.session.cwd}'. Use the discoverable capability_grant tool when the current direct-user turn authorizes it.`,
 				);
 			}
 			if (decision?.outcome === "deny") {

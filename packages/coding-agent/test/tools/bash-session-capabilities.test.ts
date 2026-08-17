@@ -40,7 +40,7 @@ describe("BashTool session capabilities", () => {
 			const tool = new BashTool(session(workspace, new SessionCapabilities({ workspace })));
 
 			await expect(tool.execute("outside-redirect", { command: `printf blocked > ${outsideFile}` })).rejects.toThrow(
-				"requires an explicit session writePath capability",
+				/requires an explicit session writePath capability.*discoverable capability_grant/,
 			);
 			await expect(
 				tool.execute("symlink-redirect", { command: "printf blocked > escape/escaped.txt" }),
