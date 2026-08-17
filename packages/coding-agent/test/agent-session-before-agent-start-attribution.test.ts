@@ -31,7 +31,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { diff, fetch as gitFetch, ref } from "@oh-my-pi/pi-coding-agent/utils/git";
+import { diff, ref } from "@oh-my-pi/pi-coding-agent/utils/git";
 
 const repository = path.resolve(import.meta.dir, "../../..");
 const scopeBase = "37eee71978951fccf66b21f7e3e2b74596ac9d74";
@@ -161,7 +161,19 @@ describe("AgentSession before_agent_start typed provider context", () => {
 	async function writeReviewedPolicyState() {
 		let baseIdentity = await ref.commitIdentity(repository, scopeBase);
 		if (!baseIdentity) {
-			await gitFetch(repository, scopeBaseUrl, scopeBase, `refs/omp/test-scope-base/${scopeBase}`);
+			const fetch = Bun.spawnSync(
+				[
+					"git",
+					"fetch",
+					"--quiet",
+					"--no-tags",
+					"--depth=1",
+					scopeBaseUrl,
+					`+${scopeBase}:refs/omp/test-scope-base/${scopeBase}`,
+				],
+				{ cwd: repository, stdout: "ignore", stderr: "pipe" },
+			);
+			if (fetch.exitCode !== 0) throw new Error(fetch.stderr.toString());
 			baseIdentity = await ref.commitIdentity(repository, scopeBase);
 		}
 		if (baseIdentity?.commit !== scopeBase || baseIdentity.tree !== scopeBaseTree) {
