@@ -22,7 +22,7 @@ describe("subagent warning injection", () => {
 		expect(result.hasYield).toBe(true);
 	});
 
-	it("injects missing-submit warning when subagent exits cleanly without yield", () => {
+	it("fails structured completion directly when the subagent exits without output", () => {
 		const result = finalizeSubprocessOutput({
 			rawOutput: "",
 			exitCode: 0,
@@ -33,7 +33,9 @@ describe("subagent warning injection", () => {
 			outputSchema: { properties: { ok: { type: "boolean" } } },
 		});
 
-		expect(result.rawOutput).toBe(SUBAGENT_WARNING_MISSING_YIELD);
+		expect(result.rawOutput).toBe("");
+		expect(result.stderr).toBe(SUBAGENT_WARNING_MISSING_YIELD);
+		expect(result.exitCode).toBe(1);
 		expect(result.hasYield).toBe(false);
 	});
 
@@ -52,7 +54,7 @@ describe("subagent warning injection", () => {
 		expect(result.rawOutput.includes("SYSTEM WARNING")).toBe(false);
 	});
 
-	it("prefixes missing-submit warning on stop outputs", () => {
+	it("fails invalid structured text directly without rewriting it", () => {
 		const result = finalizeSubprocessOutput({
 			rawOutput: "agent stopped after writing analysis",
 			exitCode: 0,
@@ -63,7 +65,9 @@ describe("subagent warning injection", () => {
 			outputSchema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] },
 		});
 
-		expect(result.rawOutput).toBe(`${SUBAGENT_WARNING_MISSING_YIELD}\n\nagent stopped after writing analysis`);
+		expect(result.rawOutput).toBe("agent stopped after writing analysis");
+		expect(result.stderr).toBe(SUBAGENT_WARNING_MISSING_YIELD);
+		expect(result.exitCode).toBe(1);
 	});
 
 	it("does not inject missing-submit warning when execution exits non-zero", () => {

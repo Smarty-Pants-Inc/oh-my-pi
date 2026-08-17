@@ -114,6 +114,7 @@ describe("InteractiveMode working-message session accent cache", () => {
 		// the animating loader out of immutable native scrollback.
 		startStableLoader(mode);
 		expect(statusContainer.getNativeScrollbackLiveRegionStart()).toBe(0);
+		expect(statusContainer.isNativeScrollbackLiveRegionPinned?.()).toBe(true);
 	});
 
 	it("publishes the canonical loader message without the keyboard hint", async () => {

@@ -150,6 +150,7 @@ import {
 	parseStreamingJsonThrottled,
 	sanitizeText,
 } from "@oh-my-pi/pi-utils";
+import { mapContextInstructionsForModel } from "../context-instructions";
 import * as AIError from "../error";
 import type {
 	Api,
@@ -293,11 +294,24 @@ const CURSOR_PROXY_TUNNEL_TIMEOUT_MS = 30_000;
  * model reads it and should route around the capability, not retry the call.
  */
 const NOT_IMPLEMENTED_SUFFIX = "not implemented by this client";
+/** Bare gRPC `resource_exhausted` end-streams (also inside a Connect error message). */
+const RESOURCE_EXHAUSTED_PATTERN = /resource.?exhausted/i;
 const NOT_IMPLEMENTED = `Not implemented by this client`;
 
 const conversationStateCache = new Map<string, ConversationStateStructure>();
 const conversationBlobStores = new Map<string, Map<string, Uint8Array>>();
 const warnedCursorKimiK3ReplayMessages = new Set<string>();
+const PROVIDER_PAYLOAD_EVIDENCE = Symbol.for("oh-my-pi.provider-payload-evidence");
+/**
+ * Base conversation id → rotated wire id (#8345). Cursor's backend can pin a
+ * per-conversation rejection (bare `resource_exhausted`, zero tokens) to one
+ * conversationId forever; the session is then unusable until /fork mints a
+ * new id. On the first such failure the id is rotated once and the cached
+ * state migrates, so the retry loop's next attempt starts a fresh
+ * conversation — the same recovery /fork performs. Keyed by the base id the
+ * caller derived, so a failed rotation is never repeated.
+ */
+const rotatedConversationIds = new Map<string, string>();
 
 export interface CursorOptions extends StreamOptions {
 	customSystemPrompt?: string;
@@ -587,23 +601,39 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			h2Completion.resolve();
 		};
 
+		// Hoisted out of the try block: the #8345 rotation in the catch path
+		// needs both ids, and the catch block cannot see try-scoped consts.
+		let baseConversationId: string | undefined;
+		let conversationId: string | undefined;
+		let usageState: UsageState | undefined;
 		try {
 			const apiKey = options?.apiKey;
 			if (!apiKey) {
 				throw new AIError.MissingApiKeyError(undefined, "Cursor API key (access token) is required");
 			}
 
-			const conversationId = options?.conversationId ?? options?.sessionId ?? crypto.randomUUID();
+			baseConversationId = options?.conversationId ?? options?.sessionId ?? crypto.randomUUID();
+			conversationId = rotatedConversationIds.get(baseConversationId) ?? baseConversationId;
 			const blobStore = conversationBlobStores.get(conversationId) ?? new Map<string, Uint8Array>();
 			conversationBlobStores.set(conversationId, blobStore);
 			const cachedState = conversationStateCache.get(conversationId);
-			const { requestBytes, conversationState } = buildGrpcRequest(model, context, options, {
+			const { requestBytes, conversationState } = await buildGrpcRequest(model, context, options, {
 				conversationId,
 				blobStore,
 				conversationState: cachedState,
 			});
 			conversationStateCache.set(conversationId, conversationState);
 			const requestContextTools = buildMcpToolDefinitions(context.tools);
+			await options?.onToolContracts?.(
+				{
+					tools: requestContextTools.map(definition => ({
+						name: definition.name,
+						description: definition.description,
+						parametersJsonSchema: toJson(ValueSchema, fromBinary(ValueSchema, definition.inputSchema)),
+					})),
+				},
+				model,
+			);
 
 			const baseUrl = model.baseUrl || CURSOR_API_URL;
 			const requestPath = "/agent.v1.AgentService/Run";
@@ -667,7 +697,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			let currentThinkingBlock: (ThinkingContent & { [kStreamingBlockIndex]: number }) | null = null;
 			let currentToolCall: ToolCallState | null = null;
 			const resolvedMcpToolCallIds = new Set<string>();
-			const usageState: UsageState = { sawTokenDelta: false };
+			usageState = { sawTokenDelta: false };
 
 			const state: BlockState = {
 				get currentTextBlock() {
@@ -702,7 +732,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			openBlockState = state;
 
 			const onConversationCheckpoint = (checkpoint: ConversationStateStructure) => {
-				conversationStateCache.set(conversationId, checkpoint);
+				conversationStateCache.set(conversationId!, checkpoint);
 			};
 
 			h2Request.on("response", headers => {
@@ -759,7 +789,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 							h2Request!,
 							options?.execHandlers,
 							options?.onToolResult,
-							usageState,
+							usageState!,
 							requestContextTools,
 							onConversationCheckpoint,
 						).catch(error => {
@@ -873,6 +903,28 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				flushOpenToolCalls(output, stream, openBlockState);
 			}
 			const result = await AIError.finalize(error, { api: model.api, signal: options?.signal });
+			// #8345: a server-side per-conversation rejection surfaces as a bare
+			// resource_exhausted with zero tokens — the conversation is poisoned,
+			// not the account (sibling conversations keep working). Rotate the
+			// wire id once and migrate the cached state so the next attempt (the
+			// caller's retry loop) starts a fresh conversation, exactly like
+			// /fork. Only the first failure rotates; repeated failures keep the
+			// rotated id so a genuine account-level exhaustion is not hidden.
+			if (
+				conversationId !== undefined &&
+				baseConversationId !== undefined &&
+				usageState !== undefined &&
+				!usageState.sawTokenDelta &&
+				RESOURCE_EXHAUSTED_PATTERN.test(result.message) &&
+				!rotatedConversationIds.has(baseConversationId)
+			) {
+				const rotated = crypto.randomUUID();
+				rotatedConversationIds.set(baseConversationId, rotated);
+				const state = conversationStateCache.get(conversationId);
+				if (state) conversationStateCache.set(rotated, state);
+				const blobs = conversationBlobStores.get(conversationId);
+				if (blobs) conversationBlobStores.set(rotated, blobs);
+			}
 			output.stopReason = result.stopReason;
 			output.errorStatus = result.status;
 			output.errorId = result.id;
@@ -4276,8 +4328,19 @@ function findLastUserMessageIndex(messages: Message[]): number {
  * When no system prompts are provided, returns a single default greeting so we never emit
  * an empty `rootPromptMessagesJson` head.
  */
-export function buildCursorSystemPromptJsons(systemPrompt: readonly string[] | undefined): string[] {
-	const systemPrompts = normalizeSystemPrompts(systemPrompt);
+export function buildCursorSystemPromptJsons(
+	systemPrompt: readonly string[] | undefined,
+	instructions?: Context["instructions"],
+	model?: Model<"cursor-agent">,
+): string[] {
+	const systemPrompts = [
+		...normalizeSystemPrompts(systemPrompt),
+		...(model
+			? mapContextInstructionsForModel(instructions, model).map(instruction =>
+					instruction.renderedText.toWellFormed(),
+				)
+			: []),
+	];
 	if (systemPrompts.length === 0) {
 		return [JSON.stringify({ role: "system", content: "You are a helpful assistant." })];
 	}
@@ -4602,7 +4665,7 @@ function extractImages(content: (TextContent | ImageContent)[]) {
 		);
 }
 
-function buildGrpcRequest(
+async function buildGrpcRequest(
 	model: Model<"cursor-agent">,
 	context: Context,
 	options: CursorOptions | undefined,
@@ -4611,16 +4674,15 @@ function buildGrpcRequest(
 		blobStore: Map<string, Uint8Array>;
 		conversationState?: ConversationStateStructure;
 	},
-): {
+): Promise<{
 	requestBytes: Uint8Array;
 	blobStore: Map<string, Uint8Array>;
 	conversationState: ConversationStateStructure;
-} {
+}> {
 	const blobStore = state.blobStore;
 
-	const systemPromptIds = buildCursorSystemPromptJsons(context.systemPrompt).map(json =>
-		storeCursorBlob(blobStore, new TextEncoder().encode(json)),
-	);
+	const systemPromptJsons = buildCursorSystemPromptJsons(context.systemPrompt, context.instructions, model);
+	const systemPromptIds = systemPromptJsons.map(json => storeCursorBlob(blobStore, new TextEncoder().encode(json)));
 
 	const activeUserMessageIndex = context.messages.length - 1;
 	const activeMessage = context.messages[activeUserMessageIndex];
@@ -4721,7 +4783,7 @@ function buildGrpcRequest(
 		maxMode: cursorMaxMode,
 	});
 
-	const runRequest = create(AgentRunRequestSchema, {
+	let runRequest = create(AgentRunRequestSchema, {
 		conversationState,
 		action,
 		modelDetails,
@@ -4729,13 +4791,22 @@ function buildGrpcRequest(
 		conversationId: state.conversationId,
 	});
 
-	options?.onPayload?.(runRequest, model);
-
-	// Tools are sent later via requestContext (exec handshake)
-
 	if (options?.customSystemPrompt) {
 		runRequest.customSystemPrompt = options.customSystemPrompt;
 	}
+	Object.defineProperty(runRequest, PROVIDER_PAYLOAD_EVIDENCE, {
+		value: {
+			kind: "cursor-root-prompt",
+			rootPromptMessageIds: systemPromptIds.map(id => Buffer.from(id).toString("base64")),
+			rootPromptMessagesJson: systemPromptJsons,
+		},
+		enumerable: false,
+	});
+
+	const replacementPayload = await options?.onPayload?.(runRequest, model);
+	if (replacementPayload !== undefined) runRequest = replacementPayload as typeof runRequest;
+
+	// Tools are sent later via requestContext (exec handshake)
 
 	const clientMessage = create(AgentClientMessageSchema, {
 		message: { case: "runRequest", value: runRequest },

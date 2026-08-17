@@ -120,20 +120,17 @@ describe("AgentSession bash session ownership", () => {
 		expect(session.messages.some(message => message.role === "bashExecution")).toBe(false);
 	});
 
-	it("keeps a queued bash result on the branch discarded by an empty stop", async () => {
+	it("does not run an unscoped empty turn that could acquire Bash ownership", async () => {
 		const sessionManager = SessionManager.inMemory(tempDir.path());
-		let returnEmptyStop = true;
-		createSession(sessionManager, undefined, () => (returnEmptyStop ? [] : ["Done"]));
+		createSession(sessionManager, undefined, () => []);
 		let forceStreaming = false;
 		Object.defineProperty(session, "isStreaming", {
 			configurable: true,
 			get: () => forceStreaming,
 		});
-		let discardedAssistantTimestamp: number | undefined;
 		const unsubscribe = session.agent.subscribe(event => {
-			if (event.type === "message_end" && event.message.role === "assistant" && returnEmptyStop) {
+			if (event.type === "message_end" && event.message.role === "assistant") {
 				forceStreaming = true;
-				discardedAssistantTimestamp = event.message.timestamp;
 				session.recordBashResult("discarded-turn-command", bashResult);
 			} else if (event.type === "agent_end") {
 				forceStreaming = false;
@@ -149,42 +146,14 @@ describe("AgentSession bash session ownership", () => {
 			},
 			{ deliverAs: "nextTurn", triggerTurn: true, acceptTerminalEmptyStop: true },
 		);
+		expect(started).toEqual({
+			status: "downgraded",
+			delivery: "queued_next_turn",
+			reason: "unscoped_automatic_turn",
+		});
 		unsubscribe();
-		expect(started).toEqual({ status: "accepted", delivery: "started_turn" });
-		expect(session.hasPendingBashMessages).toBe(true);
-		const discardedAssistantEntry = sessionManager
-			.getEntries()
-			.find(
-				entry =>
-					entry.type === "message" &&
-					entry.message.role === "assistant" &&
-					entry.message.timestamp === discardedAssistantTimestamp,
-			);
-		if (!discardedAssistantEntry) throw new Error("Expected discarded assistant entry");
-
-		returnEmptyStop = false;
-		await session.prompt("flush queued bash result");
-		await session.waitForIdle();
-
-		const bashEntry = sessionManager
-			.getEntries()
-			.find(
-				entry =>
-					entry.type === "message" &&
-					entry.message.role === "bashExecution" &&
-					entry.message.command === "discarded-turn-command",
-			);
-		expect(bashEntry?.parentId).toBe(discardedAssistantEntry.id);
-		expect(
-			sessionManager
-				.getBranch()
-				.some(
-					entry =>
-						entry.type === "message" &&
-						entry.message.role === "bashExecution" &&
-						entry.message.command === "discarded-turn-command",
-				),
-		).toBe(false);
+		expect(session.hasPendingBashMessages).toBe(false);
+		expect(session.messages.some(message => message.role === "assistant")).toBe(false);
 	});
 
 	it("releases the bash owner when session transition preparation fails", async () => {

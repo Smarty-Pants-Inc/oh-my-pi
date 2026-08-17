@@ -16,6 +16,20 @@ async function waitForJobEviction(manager: AsyncJobManager, jobId: string): Prom
 }
 
 describe("AsyncJobManager", () => {
+	test("carries the exact originating turn identity into delivery", async () => {
+		let deliveredOrigin: string | undefined;
+		const manager = new AsyncJobManager({
+			onJobComplete: (_id, _text, job) => {
+				deliveredOrigin = job.originTurnId;
+			},
+		});
+		manager.register("bash", "origin-bound", async () => "done", { originTurnId: "turn-17" });
+		await manager.waitForAll();
+		await manager.drainDeliveries();
+		expect(deliveredOrigin).toBe("turn-17");
+		manager.dispose();
+	});
+
 	test("forwards progress updates and delivers completion", async () => {
 		const progressEvents: Array<{ text: string; details?: Record<string, unknown> }> = [];
 		const completions: Array<{ jobId: string; text: string }> = [];

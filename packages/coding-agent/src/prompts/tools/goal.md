@@ -1,11 +1,8 @@
-Manage the active goal-mode objective.
+The goal is persistent mission state.
 
-Use a single `op` field:
-- `create` starts a goal and enables goal mode. Requires `objective`. Omit `token_budget`: agent-created goals are always unbounded. A strict tool schema may require `token_budget: null`; numeric values are rejected. Only the interactive owner command may add, change, or remove a cap. Use `create` only when no goal exists and no goal is paused.
-- `get` returns the current goal (active or paused) and remaining token budget.
-- `resume` re-activates a paused goal so work can continue.
-- `complete` marks the goal complete after you have verified every deliverable against current evidence.
-- `drop` discards the current goal without completing it.
+- `get`: read the current goal and accounting.
+- `create`: start a goal only when the user or system clearly requested persistent goal mode and no unfinished goal exists. Ordinary clear user prose is sufficient; do not parse prose into authorization rules.
+- `complete`: use only when the full objective is achieved and the required current evidence supports that claim.
+- `block`: use when meaningful progress requires user input, unavailable access, or external-state change, or after {{sameRouteFailureLimit}} evidence-valid failures of the same route with no materially different safe route.
 
-NEVER call `complete` because a budget is low or a turn is ending. Call it only when the goal is actually done and verified.
-If `get` shows a paused goal, call `resume` before continuing work on it.
+Do not infer a goal from an ordinary task. Do not use completion or blocking to escape difficult work. Pause, resume, edit, replace, budget, drop, and clear are typed owner/system operations. The {{sameRouteFailureLimit}}-failure rule is concise model guidance backed by tests; do not build a natural-language route-failure classifier.

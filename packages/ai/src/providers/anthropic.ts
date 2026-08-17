@@ -17,6 +17,7 @@ import {
 	parseStreamingJsonThrottled,
 	readSseEvents,
 } from "@oh-my-pi/pi-utils";
+import { mapContextInstructions } from "../context-instructions";
 import { renderDemotedThinking } from "../dialect/demotion";
 import * as AIError from "../error";
 import { getEnvApiKey, OUTPUT_FALLBACK_BUFFER } from "../stream";
@@ -79,7 +80,7 @@ import {
 	type Usage as AnthropicWireUsage,
 	type ContentBlockParam,
 	type FallbackParam,
-	isAnthropicWebSearchHistoryBlock,
+	isAnthropicServerToolHistoryBlock,
 	type MessageCreateParams,
 	type MessageCreateParamsStreaming,
 	type MessageParam,
@@ -2404,7 +2405,7 @@ const streamAnthropicOnce = (
 								streamedReplayUnsafeContent = true;
 								const block: Block = {
 									type: "thinking",
-									thinking: "",
+									thinking: event.content_block.thinking ?? "",
 									thinkingSignature: "",
 									[kStreamingBlockIndex]: event.index,
 								};
@@ -2416,6 +2417,14 @@ const streamAnthropicOnce = (
 									contentIndex,
 									partial: output,
 								});
+								if (block.thinking) {
+									stream.push({
+										type: "thinking_delta",
+										contentIndex,
+										delta: block.thinking,
+										partial: output,
+									});
+								}
 							} else if (event.content_block.type === "redacted_thinking") {
 								streamedReplayUnsafeContent = true;
 								const block: Block = {
@@ -2429,8 +2438,11 @@ const streamAnthropicOnce = (
 									kind: "redactedThinking",
 								});
 							} else if (
-								isAnthropicWebSearchHistoryBlock(event.content_block) &&
-								umansGatewayWebSearchHeader === undefined
+								isAnthropicServerToolHistoryBlock(event.content_block) &&
+								(umansGatewayWebSearchHeader === undefined ||
+									(event.content_block.type === "server_tool_use"
+										? event.content_block.name !== "web_search"
+										: event.content_block.type !== "web_search_tool_result"))
 							) {
 								streamedReplayUnsafeContent = true;
 								const block: Block = {
@@ -2921,6 +2933,18 @@ export function buildAnthropicSystemBlocks(
 	return blocks.length > 0 ? blocks : undefined;
 }
 
+/** Build the Anthropic system field from legacy and typed instruction inputs. */
+export function buildAnthropicContextSystemBlocks(
+	context: Pick<Context, "systemPrompt" | "instructions">,
+	options: SystemBlockOptions = {},
+): AnthropicSystemBlock[] | undefined {
+	const blocks = buildAnthropicSystemBlocks(context.systemPrompt, options) ?? [];
+	for (const instruction of mapContextInstructions(context.instructions, false)) {
+		blocks.push({ type: "text", text: instruction.renderedText });
+	}
+	return blocks.length > 0 ? blocks : undefined;
+}
+
 export function normalizeExtraBetas(betas?: string[] | string): string[] {
 	if (!betas) return [];
 	const raw = Array.isArray(betas) ? betas : betas.split(",");
@@ -3302,7 +3326,7 @@ function buildParams(
 	const firstUserMessageText = shouldInjectClaudeCodeInstruction
 		? extractClaudeCodeFirstUserMessageText(context.messages)
 		: "";
-	const systemBlocks = buildAnthropicSystemBlocks(context.systemPrompt, {
+	const systemBlocks = buildAnthropicContextSystemBlocks(context, {
 		includeClaudeCodeInstruction: shouldInjectClaudeCodeInstruction,
 		firstUserMessageText,
 	});

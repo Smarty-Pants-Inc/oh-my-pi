@@ -1,4 +1,5 @@
 import { fetchWithRetry, parseStreamingJson, readJsonl } from "@oh-my-pi/pi-utils";
+import { mapContextInstructionsForModel } from "../context-instructions";
 import * as AIError from "../error";
 import { getEnvApiKey } from "../stream";
 import type {
@@ -190,18 +191,14 @@ function toPlainContent(
 	};
 }
 
-function convertMessage(
-	message: Message,
-	supportsImages: boolean,
-	developerRole: "system" | "user" = "user",
-): OllamaMessage {
+function convertMessage(message: Message, supportsImages: boolean): OllamaMessage {
 	if (message.role === "user") {
 		const converted = toPlainContent(message.content, supportsImages);
 		return { role: "user", ...converted };
 	}
 	if (message.role === "developer") {
 		const converted = toPlainContent(message.content, supportsImages);
-		return { role: developerRole, ...converted };
+		return { role: "system", ...converted };
 	}
 	if (message.role === "toolResult") {
 		const converted = toPlainContent(message.content, supportsImages);
@@ -242,7 +239,12 @@ function convertMessage(
 }
 
 function convertMessages(model: Model<"ollama-chat">, context: Context): OllamaMessage[] {
-	const systemPrompts = normalizeSystemPrompts(context.systemPrompt);
+	const systemPrompts = [
+		...normalizeSystemPrompts(context.systemPrompt),
+		...mapContextInstructionsForModel(context.instructions, model).map(instruction =>
+			instruction.renderedText.toWellFormed(),
+		),
+	];
 	const systemMessages: Message[] = systemPrompts.map(systemPrompt => ({
 		role: "developer",
 		content: systemPrompt,
@@ -251,18 +253,8 @@ function convertMessages(model: Model<"ollama-chat">, context: Context): OllamaM
 	const messages: Message[] = [...systemMessages, ...context.messages];
 	const isCloud = model.provider === "ollama-cloud";
 	const supportsImages = model.input.includes("image");
-	const converted = transformMessages(messages, model).map((msg, index) => {
-		// Real `systemPrompt` entries (always emitted first) stay on Ollama's
-		// `system` role. After the static prefix, a developer turn keeps `system`
-		// when it's an agent-owned control instruction (empty/unexpected-stop
-		// retries, checkpoint rewind warning, todo reminders — all carry
-		// `attribution: "agent"`), but a user-attributed developer turn (auto-learn
-		// capture nudge, advisor cards, file-mention companions) drops to `user`.
-		// That keeps the in-conversation byte prefix stable for prefix caches
-		// (llama.cpp, #3456) without demoting mandatory agent reminders.
-		const developerRole =
-			msg.role === "developer" && (index < systemPrompts.length || msg.attribution !== "user") ? "system" : "user";
-		const converted = convertMessage(msg, supportsImages, developerRole);
+	const converted = transformMessages(messages, model).map(msg => {
+		const converted = convertMessage(msg, supportsImages);
 		// Ollama cloud rejects requests when assistant history messages contain the `thinking`
 		// field — it's valid in model responses but not accepted as a history input. Strip it
 		// to prevent HTTP 400 errors. Local Ollama instances are unaffected.
@@ -272,20 +264,6 @@ function convertMessages(model: Model<"ollama-chat">, context: Context): OllamaM
 		}
 		return converted;
 	});
-	// Ollama returns `done_reason: "load"` and generates nothing when a request
-	// carries no `user`-role message (e.g. a plan-approval handoff into a fresh
-	// session whose only non-system turn is an agent-attributed developer message
-	// mapped to `system`). Demote the last non-prefix system turn to `user` so the
-	// request can actually produce output; the static system-prompt prefix stays
-	// on `system` for prefix caching. (#7465)
-	if (!converted.some(m => m.role === "user")) {
-		for (let i = converted.length - 1; i >= systemPrompts.length; i--) {
-			if (converted[i].role === "system") {
-				converted[i].role = "user";
-				break;
-			}
-		}
-	}
 	return converted;
 }
 

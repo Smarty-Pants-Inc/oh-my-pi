@@ -201,7 +201,7 @@ describe("Ollama chat thinking controls", () => {
 		expect(properties.union?.anyOf).toEqual([widenedOpen, { type: "string" }]);
 		expect(Object.hasOwn(properties.nested, "additionalProperties")).toBe(false);
 	});
-	it("sends mid-conversation developer messages as user turns for llama.cpp cache reuse", async () => {
+	it("keeps user-attributed developer messages on the system role", async () => {
 		let payload: OllamaChatRequestPayload | undefined;
 		const fetchMock = async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
 			const parsed: unknown = JSON.parse(String(init?.body));
@@ -242,7 +242,7 @@ describe("Ollama chat thinking controls", () => {
 			fetch: fetchMock,
 		}).result();
 
-		expect(payload?.messages?.map(message => message.role)).toEqual(["system", "user", "assistant", "user"]);
+		expect(payload?.messages?.map(message => message.role)).toEqual(["system", "user", "assistant", "system"]);
 		expect(payload?.messages?.at(-1)?.content).toBe("Capture reusable lessons.");
 	});
 

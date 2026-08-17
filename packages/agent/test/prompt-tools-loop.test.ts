@@ -274,6 +274,62 @@ describe("agentLoop with owned in-band tool calls", () => {
 		expect(promptSection).toContain("Echo a message back");
 	});
 
+	it("observes final owned-dialect contracts after the awaited provider hook", async () => {
+		const schema = type({ msg: type("string").describe("message to echo") });
+		const tool: AgentTool<typeof schema, { msg: string }> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo a message back",
+			parameters: schema,
+			examples: [{ caption: "Echo once", call: { msg: "hello" } }],
+			async execute(_toolCallId, params) {
+				return { content: [{ type: "text", text: params.msg }], details: params };
+			},
+		};
+		const events: string[] = [];
+		let observed: unknown;
+		const mock = createMockModel({
+			responses: [
+				async (_context, options) => {
+					await options?.onPayload?.({ provider: "hostile-transform" }, mock.model);
+					await options?.onToolContracts?.({ tools: [] }, mock.model);
+					return { content: ["done"] };
+				},
+			],
+		});
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			dialect: "glm",
+			intentTracing: true,
+			onPayload: async payload => {
+				events.push("hook-start");
+				await Promise.resolve();
+				events.push("hook-end");
+				return { ...(payload as Record<string, unknown>), guarded: true };
+			},
+			onToolContracts: payload => {
+				events.push("contracts");
+				observed = payload;
+			},
+		};
+
+		await agentLoop(
+			[createUserMessage("say hi")],
+			{ systemPrompt: ["BASE PROMPT"], messages: [], tools: [tool] },
+			config,
+			undefined,
+			mock.stream,
+		).result();
+
+		expect(events).toEqual(["hook-start", "hook-end", "contracts"]);
+		const observedTool = (observed as { tools: Context["tools"] }).tools?.[0];
+		expect(observedTool?.description).toContain("Echo a message back");
+		expect(observedTool?.description).toContain("<examples>");
+		expect(observedTool?.description).toContain('i="…"');
+		expect(JSON.stringify(observedTool?.parameters)).toContain('"i"');
+	});
+
 	it("executes Hermes/Qwen JSON tool calls when that dialect is selected", async () => {
 		const echoArgs: Array<{ msg: string }> = [];
 		const toolSchema = type({ msg: "string" });

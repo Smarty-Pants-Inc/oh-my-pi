@@ -7,6 +7,7 @@ import {
 	type AssistantMessage,
 	type AssistantMessageEvent,
 	type Context,
+	type ContextTarget,
 	type CursorExecHandlers,
 	type CursorToolResultHandler,
 	type Effort,
@@ -36,6 +37,7 @@ import {
 	resolveOwnedDialectFromEnv,
 } from "./agent-loop";
 import type { AppendOnlyContextManager } from "./append-only-context";
+import { collectCompactionContextInstructions } from "./compaction/messages";
 import { isProviderRefusalMessage } from "./replay-policy";
 import type {
 	AgentBeforeModelCall,
@@ -101,6 +103,8 @@ export class AgentBusyError extends Error {
 }
 export interface AgentOptions {
 	initialState?: Partial<AgentState>;
+	/** Semantic target for fresh internal context assembled by this agent. */
+	contextTarget?: ContextTarget;
 
 	/**
 	 * Converts AgentMessage[] to LLM-compatible Message[] before each LLM call.
@@ -177,6 +181,8 @@ export interface AgentOptions {
 	 * Inspect or replace provider payloads before they are sent.
 	 */
 	onPayload?: SimpleStreamOptions["onPayload"];
+	/** Observe final tool definitions delivered outside the primary provider payload. */
+	onToolContracts?: SimpleStreamOptions["onToolContracts"];
 	/**
 	 * Inspect provider response metadata after headers arrive and before streaming body consumption.
 	 */
@@ -389,6 +395,7 @@ export class Agent {
 	#convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	#transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
 	#transformProviderContext?: (context: Context, model: Model) => Context | Promise<Context>;
+	#contextTarget: ContextTarget;
 	#steeringQueue: AgentMessage[] = [];
 	#followUpQueue: AgentMessage[] = [];
 	#queuedMessageCompanions = new Map<
@@ -440,6 +447,7 @@ export class Agent {
 	#softToolRequirementState: NonNullable<AgentLoopConfig["softToolRequirementState"]> = { escalations: 0 };
 	#deferredToolChoice?: ToolChoice;
 	#onPayload?: SimpleStreamOptions["onPayload"];
+	#onToolContracts?: SimpleStreamOptions["onToolContracts"];
 	#onResponse?: SimpleStreamOptions["onResponse"];
 	#onSseEvent?: SimpleStreamOptions["onSseEvent"];
 	#onAssistantMessageEvent?: (message: AssistantMessage, event: AssistantMessageEvent) => void;
@@ -485,6 +493,7 @@ export class Agent {
 		if (opts.initialState?.pendingToolCalls)
 			this.#state.pendingToolCalls = new Set(opts.initialState.pendingToolCalls);
 		this.#convertToLlm = opts.convertToLlm || defaultConvertToLlm;
+		this.#contextTarget = opts.contextTarget ?? "main";
 		this.#transformContext = opts.transformContext;
 		this.#steeringMode = opts.steeringMode || "one-at-a-time";
 		this.#followUpMode = opts.followUpMode || "one-at-a-time";
@@ -507,6 +516,7 @@ export class Agent {
 		this.#maxRetryDelayMs = opts.maxRetryDelayMs;
 		this.getApiKey = opts.getApiKey;
 		this.#onPayload = opts.onPayload;
+		this.#onToolContracts = opts.onToolContracts;
 		this.#onResponse = opts.onResponse;
 		this.#onSseEvent = opts.onSseEvent;
 		this.#getToolContext = opts.getToolContext;
@@ -790,6 +800,7 @@ export class Agent {
 	async buildSideRequestContext(
 		llmMessages: Message[],
 		systemPrompt: string[] = this.#state.systemPrompt,
+		sourceMessages?: readonly AgentMessage[],
 	): Promise<Context> {
 		const model = this.#state.model;
 		if (!model) throw new Error("No active model on agent");
@@ -801,7 +812,10 @@ export class Agent {
 					injectIntent: this.#intentTracing,
 					pruneDescriptions: this.#pruneToolDescriptions,
 				}) ?? []);
-		let context: Context = { systemPrompt, messages, tools };
+		const instructions = sourceMessages
+			? collectCompactionContextInstructions(sourceMessages, this.#contextTarget)
+			: undefined;
+		let context: Context = { systemPrompt, instructions, messages, tools };
 		if (this.#transformProviderContext) context = await this.#transformProviderContext(context, model);
 		return context;
 	}
@@ -1566,9 +1580,11 @@ export class Agent {
 			kimiApiFormat: this.#kimiApiFormat,
 			preferWebsockets: this.#preferWebsockets,
 			convertToLlm: this.#convertToLlm,
+			contextTarget: this.#contextTarget,
 			transformProviderContext: this.#transformProviderContext,
 			transformContext: this.#transformContext,
 			onPayload: this.#onPayload,
+			onToolContracts: this.#onToolContracts,
 			onResponse: this.#onResponse,
 			onSseEvent: this.#onSseEvent,
 			getApiKey: this.getApiKey,

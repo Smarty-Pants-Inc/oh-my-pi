@@ -20,6 +20,7 @@ import {
 	structuredCloneJSON,
 	USER_AGENT,
 } from "@oh-my-pi/pi-utils";
+import { mapContextInstructions } from "../context-instructions";
 import * as AIError from "../error";
 import { getEnvApiKey, isOfficialCodexApiUrl } from "../stream";
 import type {
@@ -1520,10 +1521,18 @@ export async function buildTransformedCodexRequestBody(
 	}
 
 	const systemPrompts = normalizeSystemPrompts(context.systemPrompt);
-	if (systemPrompts.length > 0) {
-		params.instructions = systemPrompts[0];
-	}
-	const developerMessages = systemPrompts.slice(1);
+	const mappedInstructions = mapContextInstructions(context.instructions, true);
+	const systemInstructions = mappedInstructions
+		.filter(instruction => instruction.actualRole === "system")
+		.map(instruction => instruction.renderedText);
+	const primaryInstructions = [...systemPrompts.slice(0, 1), ...systemInstructions];
+	if (primaryInstructions.length > 0) params.instructions = primaryInstructions.join("\n\n");
+	const developerMessages = [
+		...systemPrompts.slice(1),
+		...mappedInstructions
+			.filter(instruction => instruction.actualRole === "developer")
+			.map(instruction => instruction.renderedText),
+	];
 	if (options?.clientMetadata && Object.keys(options.clientMetadata).length > 0) {
 		params.client_metadata = { ...options.clientMetadata };
 	}

@@ -886,7 +886,6 @@ export interface RetainedSessionRuntimeFields {
 	pendingExplicitPromptMessages: CustomMessage[];
 	queuedExplicitPromptCompanions: Array<{ owner: AgentMessage; messages: CustomMessage[] }>;
 	pendingSemanticDeliveryIds: Set<string>;
-	scheduledHiddenNextTurnGeneration: number | undefined;
 	queuedMessageDrainBlocked: boolean;
 	usagePreflightReadyForNextModelCall: boolean;
 	usagePreflightReadyModel: Model | undefined;

@@ -504,6 +504,21 @@ export class EditTool implements AgentTool<TInput> {
 		onUpdate?: AgentToolUpdateCallback<EditToolDetails, TInput>,
 		context?: AgentToolContext,
 	): Promise<AgentToolResult<EditToolDetails, TInput>> {
+		for (const target of this.matcherPaths(params) ?? []) {
+			if (isInternalUrlPath(target)) continue;
+			const decision = this.session.capabilities?.decideWrite(
+				resolvePlanPath(this.session, target),
+				this.session.cwd,
+			);
+			if (decision?.outcome === "request") {
+				throw new Error(
+					`Edit target '${decision.target}' requires an explicit session writePath capability outside '${this.session.cwd}'.`,
+				);
+			}
+			if (decision?.outcome === "deny") {
+				throw new Error(`Edit target '${decision.target}' cannot be canonicalized safely.`);
+			}
+		}
 		const modeDefinition = this.#getModeDefinition();
 		return modeDefinition.execute(this, params, signal, getLspBatchRequest(context?.toolCall), onUpdate);
 	}

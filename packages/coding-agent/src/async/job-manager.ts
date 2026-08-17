@@ -48,6 +48,8 @@ export interface AsyncJob {
 	 * supply an id (e.g. legacy tests, SDK consumers without an agent context).
 	 */
 	ownerId?: string;
+	/** Direct model turn that created the job; only this still-open turn may wake again. */
+	originTurnId?: string;
 	/**
 	 * Registry id of the subagent this job runs (task/tan/vibe jobs). Lets
 	 * job-view code link a job row to its AgentRegistry ref even when the job
@@ -111,6 +113,7 @@ export interface AsyncJobRegisterOptions {
 	id?: string;
 	/** Registry id of the agent that owns this job; used to scope cancelAll. */
 	ownerId?: string;
+	originTurnId?: string;
 	/** Registry id of the subagent this job runs; see {@link AsyncJob.agentId}. */
 	agentId?: string;
 	onProgress?: (text: string, details?: Record<string, unknown>) => void | Promise<void>;
@@ -236,6 +239,7 @@ export class AsyncJobManager {
 			abortController,
 			promise: Promise.resolve(),
 			ownerId: options?.ownerId,
+			originTurnId: options?.originTurnId,
 			agentId: options?.agentId,
 			queued: options?.queued === true,
 		};

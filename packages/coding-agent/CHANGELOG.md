@@ -2,13 +2,74 @@
 
 ## [Unreleased]
 
+## [17.3.5] - 2026-08-16
+
 ### Added
 
-- Added `pi.registerSystemPromptBuilder()` so one extension can replace the provider-facing base prompt on initial load and rebuilds while reusing OMP's stock renderer with a complete template set.
+- Added Extensions tab group to settings schema
+
+### Changed
+
+- Routed paid xAI models (XAI_API_KEY / xai/…) through the Responses API used by SuperGrok OAuth instead of Chat Completions, including reliable replay of encrypted reasoning content on follow-up turns.
+- Updated the default model for XAI_API_KEY (xai) to grok-4.5, and the default SuperGrok OAuth (xai-oauth) model to grok-4.5. Automatic model selection continues to prefer paid xai/grok-4.5 when only XAI_API_KEY is set, with xai-oauth/grok-4.5 still available explicitly.
+- Stopped sending presence/frequency penalties and stop sequences to xAI reasoning models such as grok-4.5, which reject them.
 
 ### Fixed
 
-- Fixed stale todo lifecycle handling: guidance now distinguishes finished, blocked, abandoned, and obsolete tasks; completed subagent results bring blocked parent work into the next stop-time reconciliation; supported native providers, including Google, receive a named `todo` tool choice while owned/in-band dialects enforce it locally; read-only `todo view` calls no longer reset the drift reminder; and the interactive UI no longer writes fuzzy, non-persisted subagent matches into canonical todo state.
+- Fixed `hub` job and wait lists hiding stale running subagent registrations that have no turn in flight, ensuring they remain visible so operators can cancel them
+- Fixed external thinking scratchpads running alongside native reasoning on xAI Grok 4 and other reasoning-only Responses models that reject `reasoning.effort`
+- Fixed llama.cpp model discovery producing a baseUrl without the /v1 prefix for non-Qwen models, causing 404 errors on OpenAI-compatible endpoints.
+- Fixed prompt caching on open-weight providers (DeepSeek, Qwen, GLM, …) so tool schemas stay cached across directory changes and midnight rollovers.
+- Fixed omp --fork omitting the source session's artifact directory, so CLI-created forks now preserve artifact:// references like interactive /fork.
+- Fixed long ask option labels being hard-truncated at the terminal width; labels now wrap onto indented continuation lines.
+- Fixed toggling display.showTokenUsage from /settings leaving existing token-usage rows stale until the transcript was rebuilt.
+- Fixed mid-run auto-compaction blocking the live loop while waiting on extension handlers, which could hang after a snapcompact or context-full pass.
+- Reduced peak memory for persisted subagent revival probes by streaming large file-backed session journals instead of loading them fully.
+- Improved responsiveness of streaming edit previews for large diffs by rendering only the visible tail.
+- Fixed repeated /btw panels committing transient frames to native scrollback and replaying conversation history after dismissal.
+- Clarified that closing browser tool sessions releases managed handles without closing pages in spawned, CDP-connected, or relay browsers.
+- Fixed interrupted vibe_wait calls being reported as elapsed timeout windows.
+- Improved checkpoint/rewind prompt rendering to stay accurate after a rewind and be more concise.
+- Fixed Cursor turns dying with HTTP/2 stream errors (NGHTTP2_INTERNAL_ERROR / NGHTTP2_REFUSED_STREAM) after tool calls already had results, instead of leaving the agent idle until the user typed "continue".
+- Fixed mixed-case plugin tool names being lowercased during tool-set refresh, which unmounted them from xd:// whenever MCP tools connected.
+- Fixed Exa MCP servers being unmounted when their config explicitly requests tools the native Exa integration does not provide, breaking /mcp reconnect exa.
+- Fixed Claude Code custom tool discovery attempting to import non-module files from .claude/tools.
+- Fixed Agent Hub parking a mid-spawn child session so subsequent task calls failed with an ownership error and the row could never be revived.
+- Fixed the welcome banner displaying a stale model name when the session's active model changes after startup (e.g. after a delayed config load or an explicit /model switch).
+- Fixed Nix standalone binaries retaining Bun's build-time package in their runtime closure.
+- Fixed birch user/custom message card contrast on dark terminals, where chat bubbles could render light-on-light.
+- Fixed hidden tool snapshots preventing long streamed assistant responses from entering terminal scrollback.
+- Prevented omp models from loading ambient hook factories while preserving extension-contributed providers.
+- Fixed the ask dialog's multi-select mode dead-ending on Enter; Space now toggles options and Enter submits the current selection.
+- Fixed workspace diagnostics reporting a clean workspace when its checker crashed without producing output.
+- Fixed manual /compact failing outright when a summarization request hit a transient provider overload.
+- Fixed transient Anthropic failures (overloaded_error, rate_limit_error, 429/500/502/503/529) aborting or silently degrading side-effect-free background LLM calls such as session title generation, TTS speech enhancement, commit-message generation, thinking/stop classifiers, memory extraction/consolidation, and commit analysis/summary/changelog passes; these now retry with backoff honoring retry-after instead of failing or returning an indistinguishable empty result.
+- Fixed the shared headless browser daemon launching from the macOS system Google Chrome bundle, which could cause macOS to route the user's link clicks to the automation daemon and silently swallow them; the daemon now prefers an isolated Chrome for Testing binary on macOS.
+- Reclaimed abandoned daemon runtime directories under ~/.omp/run/daemons/, preventing unbounded growth of leftover Chromium profiles and broker state.
+- Kept the welcome screen's Tips, LSP Servers, and Recent sessions visible when a long model name still leaves enough terminal width for both columns.
+- Fixed focused shimmer animation frames (ultrathink, orchestrate, workflowz) repainting the full TUI too frequently, causing high CPU usage while composing prompts on WSL2.
+- Fixed the /debug report bundle including unrelated historic sessions, leaking other sessions' files and bloating archives.
+- Fixed adopted keep-alive agents remaining stuck in a running state in the registry after deferred turn settlement, and prevented stale refs from sustaining bare hub wait calls indefinitely.
+- Fixed home-relative marketplace catalog paths not being expanded before cache access, preventing updates from writing into a literal ~ directory.
+- Fixed broker-owned headless Chromium opening and retaining an unowned blank foreground window on Windows.
+- Fixed the auto thinking classifier failing every turn on Anthropic models served through LiteLLM/Vertex due to a thinking-budget mismatch.
+- Fixed always-ask approval prompts bypassing edit preview readiness when a built-in tool executes under its wire-level alias, such as edit running as apply_patch.
+- Fixed lsp reload crashing non-rust-analyzer language servers by sending them a rust-analyzer-specific request; that request is now gated to rust-analyzer only.
+- Fixed browser open failing with "Shared browser daemon unavailable" when HTTP_PROXY/HTTPS_PROXY is set, because liveness probes were incorrectly routed through the proxy.
+- Fixed defaultThinkingLevel: auto skipping classification for user-invoked /skill:<name> turns, leaving the effort stuck on pending auto.
+- Fixed custom-tool directory discovery recursing into subtrees despite a non-recursive default, which could crash startup when scanning large dependency directories such as Python venvs.
+- Repaired torn session JSONL appends after disk-write failures, rewrote malformed resumed files before their next append, retried transient persistence failures, and surfaced failures in the TUI.
+- Prevented Anthropic model fallback from replaying model-bound thinking blocks across models, and surfaced immutable-thinking errors without retrying the unchanged invalid turn.
+- Fixed empty-stop failure messages always suggesting a context problem even when the provider billed output tokens; the message now reports the billed token count and points at a provider-side filter/translation issue when appropriate.
+- Fixed a parked, session-less agent-registry entry with no reviver permanently poisoning its agent id, preventing fresh subagent spawns from reusing that id.
+- Made extension tool-call timeouts configurable and paused them during user dialogs.
+- Fixed /vibe cancellation leaving an in-flight model turn unaware that Vibe mode and its tools were removed.
+- Fixed empty local-model stops lingering on the persisted active branch after retries, preventing them from resurfacing after reload or a mid-retry process kill.
+- Fixed the Biome linter client silently dropping every diagnostic due to an outdated JSON output schema; it now supports Biome 2.x's diagnostic format.
+- Fixed `hub jobs` and empty `hub wait` snapshots hiding running subagents that have no live turn, which removed the only way to discover and `hub cancel` a stale registration; such agents are listed again and flagged as having no turn in flight.
+- Fixed external thinking being offered on xAI reasoning-only Responses models (grok-4 family) that reject `reasoning.effort`, where the private scratchpad ran alongside native reasoning instead of replacing it.
+- Fixed the extension tool-call handler timeout rendering outside a titled section in `/settings` by registering its Extensions group on the Tools tab.
+
 ## [17.3.4] - 2026-08-14
 
 ### Changed
@@ -179,7 +240,6 @@
 - Removed the `resolveAgentModelSource` model-resolver export, whose only use was being fed to `resolveExplicitModelRole`. Replaced by `resolveAgentModelSelection`, which returns the expanded `patterns` and the pre-expansion `role` together so a spawn path cannot derive one without the other ([#7910](https://github.com/can1357/oh-my-pi/pull/7910) by [@enieuwy](https://github.com/enieuwy)).
 - A run is now attributed to the model that actually produced its output, not whichever model the session was last pointed at. A retry fallback that errored on its first request — an exhausted quota, a hard provider error — was credited with the whole run in the Agent Hub row and the settled task result, even when the previous model did every turn. Sessions expose the serving model directly, holding the last model that produced output while a candidate is armed but unproven, and transcript-derived history stops at the newest turn that produced output.
 
-
 ## [17.2.12] - 2026-08-08
 
 ### Fixed
@@ -243,7 +303,6 @@
 
 - Added a `--trusted-extension <absolute-path>` CLI flag to load an exact extension-module allowlist, bypassing ambient extension discovery.
 - Added resumable session details to fatal crash outputs, including a suggested `omp --resume <session-id>` command to quickly resume persisted live agent sessions.
-- Added Fresh's opt-in native-TUI companion for direct local interactive sessions: one-shot pre-dotenv capability gating; a singular host-internal extension; authenticated bounded status snapshots; exact work-identity and replay-bound cancel/snapshot commands; phase-checked lifecycle ownership; selected-side async publication; append-safe journals; and transaction-scoped artifact rollback.
 
 ### Changed
 
@@ -276,7 +335,6 @@
 - Fixed parsing of POSIX `$EDITOR` commands that contain quoted arguments or executable paths with spaces.
 - Fixed persisted Agent Hub rows losing the explicit caller model role when a subagent used a model override, preserving role provenance across restarts.
 - Fixed unobserved promise rejections in browser helpers (such as `tab.waitForResponse()`) causing tab workers to hang or crash.
-- Fresh companion snapshots now expose the exact live footer-loader message with grapheme-safe truncation, while sink-free sessions avoid loader traversal; cancellation coalesces across asynchronous abort teardown and shutdown publishes only committed authoritative state.
 
 ## [17.2.9] - 2026-08-05
 
@@ -295,7 +353,6 @@
 
 ### Fixed
 
-- Fixed extension commands queued as follow-up messages running before the active turn fully settled; they now execute serially after settlement, retain hidden next-turn work in pending-state checks, and reject stale commands after session replacement.
 - Retried concurrent-request caps with a short backoff without deleting valid Copilot credentials or rotating through sibling accounts.
 - Fixed the default `textVerbosity` setting being forwarded to OpenAI Codex requests unless the user explicitly configures it, preserving Codex's native response-control defaults. ([#4949](https://github.com/can1357/oh-my-pi/issues/4949))
 - Reduced streaming CPU usage by coalescing the cumulative `message_update` deltas of a turn at the event-controller dispatch boundary: at most one streaming-state rebuild runs per ~33ms window instead of one per token, cutting the per-token handler work that dominated the CPU profile of streaming sessions (especially at high token rates) while preserving per-delta speech output. Subscriber dispatch is serialized so a rapid stream tail (`message_update` → `message_end` → `agent_end`) cannot overtake the coalesced flush. ([#7443](https://github.com/can1357/oh-my-pi/issues/7443))
@@ -328,13 +385,6 @@
 - Fixed `omp setup python` to validate the same configured or discovered interpreter used by the Python eval runtime.
 - Fixed self-update misclassifying glibc Linux hosts with an installed musl loader as musl hosts, which could download an unusable musl binary instead of the glibc release.
 - Fixed a crash where opening the Agent Hub after a resume and moving the selection triggered an unbounded `ExtensionExitError` unhandled-rejection storm and exit 129. The postmortem module bound the native hard-exit at first evaluation; when the bundler deferred that evaluation into a `withHostGuard` window it froze the guard's throwing replacement, poisoning every later signal/fatal exit. The native exit is now resolved per call, and the guard stamps its replacement with the native primitive it shadows so mid-guard signals still exit ([#7393](https://github.com/can1357/oh-my-pi/issues/7393)).
-### Added
-
-- Added provider-neutral execution environments for explicit top-level isolated tasks, allowing extension-supplied workspaces to serve unchanged built-in `read`, `write`, and foreground non-PTY `bash` tools. The experimental `@oh-my-pi/cloud-omp-cloudflare` package supplies the first adapter.
-
-### Changed
-
-- Environment-backed isolation now synchronizes and releases the remote lease before existing capture/merge, blocks merge on sync or release failure, and never falls back to local file or process execution after a remote error.
 
 ## [17.2.8] - 2026-08-04
 
@@ -1020,10 +1070,6 @@
 - Fixed in-progress aborts awaiting `session_stop` extension handlers whose results would be discarded.
 - Fixed `/retry` reporting "Nothing to retry" after a stream stalled or aborted mid-tool-call.
 - Fixed locally consumed extension commands triggering automatic title generation and exposing their command text to the title model.
-
-### Changed
-
-- OMP goals now default to no token budget. `token_budget` is an opt-in cost/continuation ceiling, not a quality or performance setting; omit it or pass `null` when strict tool schemas require the field, and supply a positive integer only for a user-requested or task-defined stopping bound.
 
 ## [17.0.7] - 2026-07-21
 

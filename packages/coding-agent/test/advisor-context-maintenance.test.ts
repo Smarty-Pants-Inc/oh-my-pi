@@ -320,7 +320,7 @@ describe("AgentSession advisor context maintenance", () => {
 			provider: "anthropic",
 			contextWindow: CONTEXT_WINDOW,
 			handler: async (context, options) => {
-				if (!JSON.stringify(context.messages).includes("<conversation>")) {
+				if (!JSON.stringify([context.messages, context.instructions]).includes("<conversation>")) {
 					return { content: ["advisor reviewed current update"] };
 				}
 				compactionStarted.resolve();
@@ -401,7 +401,7 @@ describe("AgentSession advisor context maintenance", () => {
 		// A summarization compaction one-shot actually ran (its prompt wraps the
 		// conversation in <conversation> tags).
 		const compactionCalls = advisorMock.calls.filter(call =>
-			JSON.stringify(call.context.messages).includes("<conversation>"),
+			JSON.stringify([call.context.messages, call.context.instructions]).includes("<conversation>"),
 		);
 		expect(compactionCalls.length).toBeGreaterThan(0);
 		expect(compactionCalls.every(call => call.options?.signal instanceof AbortSignal)).toBe(true);

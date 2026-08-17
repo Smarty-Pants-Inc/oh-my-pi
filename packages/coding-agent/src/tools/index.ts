@@ -4,8 +4,10 @@ import type { FetchImpl, ImageContent, Model, ServiceTierByFamily, ToolChoice } 
 import { logger } from "@oh-my-pi/pi-utils";
 import type { AsyncJobManager } from "../async/job-manager";
 import type { Rule } from "../capability/rule";
+import type { SessionCapabilities } from "../capability/session-capabilities";
 import type { PromptTemplate } from "../config/prompt-templates";
 import type { Settings } from "../config/settings";
+import { agentBehavior } from "../context/registry";
 import { EditTool } from "../edit";
 import { checkJuliaKernelAvailability } from "../eval/jl/kernel";
 import { checkPythonKernelAvailability } from "../eval/py/kernel";
@@ -43,6 +45,7 @@ import { AstGrepTool } from "./ast-grep";
 import { BashTool } from "./bash";
 import { BrowserTool } from "./browser";
 import { type BuiltinToolName, type HiddenToolName, normalizeToolNames } from "./builtin-names";
+import { CapabilityGrantTool } from "./capability-grant";
 import { type CheckpointState, CheckpointTool, type CompletedRewindState, RewindTool } from "./checkpoint";
 import { ComputerTool } from "./computer";
 import { DebugTool } from "./debug";
@@ -157,6 +160,8 @@ export interface ToolSession {
 	cwd: string;
 	/** Additional workspace directories beyond cwd (multi-root), forwarded to subagents. */
 	additionalDirectories?: string[];
+	/** Structured authority boundary applied even when approval mode is yolo. */
+	capabilities?: SessionCapabilities;
 	/** Whether UI is available */
 	hasUI: boolean;
 	/** Whether this session has begun disposal. */
@@ -250,6 +255,8 @@ export interface ToolSession {
 	getMnemopiSessionState?: () => MnemopiSessionState | undefined;
 	/** Agent identity used for IRC routing. Returns the registry id (e.g. "Main", "AuthLoader"). */
 	getAgentId?: () => string | null;
+	/** Identity of the currently open model turn, used to bind async wake authority. */
+	getCurrentTurnId?: () => string | undefined;
 	/** Look up a registered tool by name (used by the eval js backend's tool bridge). */
 	getToolByName?: (name: string) => AgentTool | undefined;
 	/** Return whether a built-in tool is active in this turn's tool set. */
@@ -426,6 +433,7 @@ export const BUILTIN_TOOLS: Record<BuiltinToolName, ToolFactory> = {
 	ast_grep: s => new AstGrepTool(s),
 	ast_edit: s => new AstEditTool(s),
 	ask: AskTool.createIf,
+	capability_grant: s => (s.capabilities ? new CapabilityGrantTool(s) : null),
 	debug: DebugTool.createIf,
 	eval: s => new EvalTool(s),
 	github: GithubTool.createIf,
@@ -645,7 +653,10 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 			);
 		}
 		if (name === "task") {
-			return canSpawnAtDepth(session.settings.get("task.maxRecursionDepth") ?? 2, session.taskDepth ?? 0);
+			return (
+				agentBehavior.task.enabled &&
+				canSpawnAtDepth(session.settings.get("task.maxRecursionDepth"), session.taskDepth ?? 0)
+			);
 		}
 		return true;
 	};

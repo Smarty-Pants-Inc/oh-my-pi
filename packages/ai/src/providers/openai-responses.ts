@@ -2,6 +2,7 @@ import { scheduler } from "node:timers/promises";
 import { hostMatchesUrl } from "@oh-my-pi/pi-catalog/hosts";
 import { bareModelId, parseOpenAIModel, semverGte } from "@oh-my-pi/pi-catalog/identity";
 import { $flag, logger, structuredCloneJSON } from "@oh-my-pi/pi-utils";
+import { mapContextInstructions } from "../context-instructions";
 import * as AIError from "../error";
 import { getEnvApiKey } from "../stream";
 import type {
@@ -39,6 +40,7 @@ import { callWithCopilotModelRetry } from "../utils/retry";
 import {
 	adaptSchemaForStrict,
 	findStrictToolSchemaViolation,
+	flattenExclusiveRequiredRootUnion,
 	NO_STRICT,
 	normalizeSchemaForMoonshot,
 	sanitizeSchemaForOpenAIResponses,
@@ -1170,22 +1172,30 @@ export function buildParams(
 	});
 
 	const systemPrompts = normalizeSystemPrompts(context.systemPrompt);
-	let systemInstructions: string | undefined;
-	if (systemPrompts.length > 0) {
-		const needsDeveloperRole = policy.messages.systemRole === "developer";
-		if (needsDeveloperRole) {
-			// Reasoning models on known OpenAI-compatible endpoints require the
-			// `developer` role. Send all system prompts inline in `input`.
-			messages.unshift(
-				...systemPrompts.map(systemPrompt => ({ role: "developer" as const, content: systemPrompt })),
-			);
-		} else {
-			// All other endpoints (including third-party /v1/responses proxies) use
-			// the canonical top-level `instructions` field so that proxies that
-			// reject `input[{role:"system"}]` work out of the box.
-			systemInstructions = systemPrompts.join("\n\n");
-		}
+	const mappedInstructions = mapContextInstructions(context.instructions, policy.messages.supportsDeveloperRole);
+	const systemInstructionTexts: string[] = [];
+	const inlineInstructions: Array<{ role: "system" | "developer"; content: string }> = [];
+	if (policy.messages.systemRole === "developer") {
+		inlineInstructions.push(...systemPrompts.map(content => ({ role: "developer" as const, content })));
+	} else {
+		systemInstructionTexts.push(...systemPrompts);
 	}
+	if (policy.messages.supportsDeveloperRole) {
+		inlineInstructions.push(
+			...mappedInstructions.map(instruction => ({
+				role: instruction.actualRole,
+				content: instruction.renderedText.toWellFormed(),
+			})),
+		);
+	} else {
+		systemInstructionTexts.push(...mappedInstructions.map(instruction => instruction.renderedText.toWellFormed()));
+	}
+	if (inlineInstructions.length > 0) {
+		messages.unshift(...inlineInstructions);
+	}
+	// The top-level field is the Responses system channel and avoids proxy
+	// failures on endpoints that reject `input[{role:"system"}]`.
+	const systemInstructions = systemInstructionTexts.length > 0 ? systemInstructionTexts.join("\n\n") : undefined;
 
 	const cacheRetention = resolveCacheRetention(options?.cacheRetention);
 	const promptCacheKey = getOpenAIPromptCacheKey(options);
@@ -1285,12 +1295,11 @@ export function buildParams(
 		filterReasoningHistory: options?.filterReasoningHistory,
 		omitReasoningEffort: options?.omitReasoningEffort,
 	});
-	const reasoningSummary =
-		model.provider === "xai-oauth"
-			? options?.reasoning === undefined
-				? undefined
-				: null
-			: options?.reasoningSummary;
+	const reasoningSummary = model.compat.supportsReasoningSummary
+		? options?.reasoningSummary
+		: options?.reasoning === undefined
+			? undefined
+			: null;
 	applyResponsesCompatPolicy(params, reasoningPolicy, {
 		reasoningSummary,
 		forceReasoningOff: options?.forceReasoningOff,
@@ -1388,6 +1397,7 @@ export function convertTools(
 		),
 ): OpenAITool[] {
 	const allowFreeform = supportsFreeformApplyPatch(model);
+	const rejectXaiRootObjectUnion = model.provider === "xai" || model.provider === "xai-oauth";
 	const out: OpenAITool[] = [];
 	for (const tool of tools) {
 		if (tool.native?.type === "computer" && model.supportsComputerUse === true) {
@@ -1420,16 +1430,18 @@ export function convertTools(
 		// subschemas ("property schema … must be an object"), so the Moonshot
 		// pass re-coerces them last.
 		const sanitized = sanitizeSchemaForOpenAIResponses(baseParameters);
+		const providerParameters = rejectXaiRootObjectUnion ? flattenExclusiveRequiredRootUnion(sanitized) : sanitized;
 		const responseParameters =
 			model.compat.toolSchemaFlavor === "moonshot-mfjs"
-				? (normalizeSchemaForMoonshot(sanitized) as Record<string, unknown>)
-				: sanitized;
+				? (normalizeSchemaForMoonshot(providerParameters) as Record<string, unknown>)
+				: providerParameters;
 		const { schema: parameters, strict: effectiveStrict } = adaptSchemaForStrict(responseParameters, strict);
 		// Quarantine a tool whose emitted schema carries a provider-rejecting
 		// enum/const-vs-type contradiction: dropping just that tool keeps the rest
 		// of the request valid instead of letting one bad MCP schema 400 the whole
-		// turn (#2652). Other tools and built-ins are unaffected.
-		const violation = findStrictToolSchemaViolation(parameters);
+		// turn (#2652). Other tools and built-ins are unaffected. Leftover
+		// object-root unions are an xAI-only 400; OpenAI/Azure/Codex keep them.
+		const violation = findStrictToolSchemaViolation(parameters, "#", { rejectXaiRootObjectUnion });
 		if (violation) {
 			onQuarantine(tool.name, violation);
 			continue;

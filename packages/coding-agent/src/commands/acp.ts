@@ -5,9 +5,11 @@
  * ACP terminal-auth flag asks the same command to open the interactive TUI.
  */
 
+import { isBunTestRuntime } from "@oh-my-pi/pi-utils";
 import { Command } from "@oh-my-pi/pi-utils/cli";
 import { type Args as ParsedArgs, parseArgs, reportCliUsageError } from "../cli/args";
 import { acpHelp as commandHelp } from "../cli/command-help";
+import { ensureApprovedStartup } from "../context/approved-policy";
 import { runRootCommand } from "../main";
 import { prepareAcpTerminalAuthArgs } from "../modes/acp/terminal-auth";
 
@@ -30,6 +32,7 @@ export default class Acp extends Command {
 		if (!terminalAuth) {
 			parsed.mode = "acp";
 		}
+		if (!isBunTestRuntime()) await ensureApprovedStartup();
 		await runRootCommand(parsed, args);
 	}
 }

@@ -1159,12 +1159,8 @@ describe("AgentSession.switchSession previous-context build", () => {
 		tempDirs.push(tempDir);
 		const asyncManager = new AsyncJobManager({ retentionMs: 60_000 });
 		const recoveryMarker = "post-failure lifecycle fence recovery";
-		const recoveryDeliveryObserved = Promise.withResolvers<void>();
 		const primaryMock = createMockModel({
-			handler: context => {
-				if (JSON.stringify(context.messages).includes(recoveryMarker)) recoveryDeliveryObserved.resolve();
-				return { content: ["recovery reply"] };
-			},
+			handler: () => ({ content: ["recovery reply"] }),
 		});
 		const { session, extensionRunner } = buildSession(tempDir, {
 			streamFn: primaryMock.stream,
@@ -1208,9 +1204,8 @@ describe("AgentSession.switchSession previous-context build", () => {
 			},
 		} satisfies DaemonCompletionNotification);
 		await expect(recoveryReceipt).resolves.toBeUndefined();
-		await recoveryDeliveryObserved.promise;
-		expect(primaryMock.calls).toHaveLength(1);
-		expect(primaryMock.calls.some(call => JSON.stringify(call.context.messages).includes(recoveryMarker))).toBe(true);
+		expect(primaryMock.calls).toHaveLength(0);
+		expect(session.messages.filter(message => JSON.stringify(message).includes(recoveryMarker))).toHaveLength(1);
 		await expect(session.newSession()).resolves.toBe(true);
 	});
 
@@ -2354,13 +2349,19 @@ describe("AgentSession.switchSession previous-context build", () => {
 					(count, call) => count + JSON.stringify(call.context.messages).split(marker).length - 1,
 					0,
 				);
-			expect(countDelivered(jobMarker)).toBe(1);
-			expect(countDelivered(queuedMarker)).toBe(1);
+			expect(countDelivered(jobMarker)).toBe(0);
+			expect(countDelivered(queuedMarker)).toBe(0);
+			const countPersisted = (marker: string): number =>
+				session.messages.filter(message => JSON.stringify(message).includes(marker)).length;
+			expect(countPersisted(jobMarker)).toBe(1);
+			expect(countPersisted(queuedMarker)).toBe(1);
 			const callsAfterDelivery = primaryMock.calls.length;
 			await session.settleAsyncWork();
 			expect(primaryMock.calls).toHaveLength(callsAfterDelivery);
-			expect(countDelivered(jobMarker)).toBe(1);
-			expect(countDelivered(queuedMarker)).toBe(1);
+			expect(countDelivered(jobMarker)).toBe(0);
+			expect(countDelivered(queuedMarker)).toBe(0);
+			expect(countPersisted(jobMarker)).toBe(1);
+			expect(countPersisted(queuedMarker)).toBe(1);
 		});
 
 		it(`commits ${transition} by discarding retained owner work instead of injecting it into the target`, async () => {
@@ -2793,13 +2794,19 @@ describe("AgentSession.switchSession previous-context build", () => {
 					(count, call) => count + JSON.stringify(call.context.messages).split(marker).length - 1,
 					0,
 				);
-			expect(countDelivered(jobMarker)).toBe(1);
-			expect(countDelivered(queuedMarker)).toBe(1);
+			expect(countDelivered(jobMarker)).toBe(0);
+			expect(countDelivered(queuedMarker)).toBe(0);
+			const countPersisted = (marker: string): number =>
+				session.messages.filter(message => JSON.stringify(message).includes(marker)).length;
+			expect(countPersisted(jobMarker)).toBe(1);
+			expect(countPersisted(queuedMarker)).toBe(1);
 			const callsAfterDelivery = primaryMock.calls.length;
 			await session.settleAsyncWork();
 			expect(primaryMock.calls).toHaveLength(callsAfterDelivery);
-			expect(countDelivered(jobMarker)).toBe(1);
-			expect(countDelivered(queuedMarker)).toBe(1);
+			expect(countDelivered(jobMarker)).toBe(0);
+			expect(countDelivered(queuedMarker)).toBe(0);
+			expect(countPersisted(jobMarker)).toBe(1);
+			expect(countPersisted(queuedMarker)).toBe(1);
 		});
 
 		it(`commits ${transition} by discarding retained running work and its queued receipt`, async () => {
@@ -3062,17 +3069,24 @@ describe("AgentSession.switchSession previous-context build", () => {
 		};
 		session.agent.replaceQueues([retainedAdvisorCard], []);
 		let receiptSettled = false;
-		const receipt = session.yieldQueue.enqueueWithReceipt("advisor", {
-			note: "retained branch yield",
-			severity: "nit" as const,
-			advisor: undefined,
+		let receipt: Promise<void> | undefined;
+		const beginTransaction = session.yieldQueue.beginTransaction.bind(session.yieldQueue);
+		vi.spyOn(session.yieldQueue, "beginTransaction").mockImplementation(kind => {
+			if (kind === "advisor" && !receipt) {
+				receipt = session.yieldQueue.enqueueWithReceipt("advisor", {
+					note: "retained branch yield",
+					severity: "nit" as const,
+					advisor: undefined,
+				});
+				void receipt.then(
+					() => {
+						receiptSettled = true;
+					},
+					() => {},
+				);
+			}
+			return beginTransaction(kind);
 		});
-		void receipt.then(
-			() => {
-				receiptSettled = true;
-			},
-			() => {},
-		);
 		const advisorReset = vi.spyOn(SessionAdvisors.prototype, "resetSessionState");
 		const retainedAdvisorResetCalls = advisorReset.mock.calls.length;
 		const retainedEntries = sessionManager.getEntries().map(entry => entry.id);
@@ -3169,7 +3183,7 @@ describe("AgentSession.switchSession previous-context build", () => {
 
 		pendingAdvisor.release.resolve();
 		await pendingAdvisor.resumed;
-		await expect(receipt).resolves.toBeUndefined();
+		await expect(receipt!).resolves.toBeUndefined();
 		expect(receiptSettled).toBe(true);
 	});
 
@@ -3262,17 +3276,6 @@ describe("AgentSession.switchSession previous-context build", () => {
 		};
 		session.agent.replaceQueues([retainedAdvisorCard], []);
 		let receiptSettled = false;
-		const receipt = session.yieldQueue.enqueueWithReceipt("advisor", {
-			note: "retained tree yield",
-			severity: "nit" as const,
-			advisor: undefined,
-		});
-		void receipt.then(
-			() => {
-				receiptSettled = true;
-			},
-			() => {},
-		);
 		const advisorReset = vi.spyOn(SessionAdvisors.prototype, "resetSessionState");
 		const retainedAdvisorResetCalls = advisorReset.mock.calls.length;
 		const retainedEntries = sessionManager.getEntries().map(entry => entry.id);
@@ -3372,6 +3375,20 @@ describe("AgentSession.switchSession previous-context build", () => {
 			},
 		);
 
+		// Queue at the transition boundary. The normal 1 ms idle dispatcher may
+		// consume an earlier entry before navigation starts under a loaded runner;
+		// this case exercises lifecycle quarantine after the fence is acquired.
+		const receipt = session.yieldQueue.enqueueWithReceipt("advisor", {
+			note: "retained tree yield",
+			severity: "nit" as const,
+			advisor: undefined,
+		});
+		void receipt.then(
+			() => {
+				receiptSettled = true;
+			},
+			() => {},
+		);
 		await expect(session.navigateTree(rootEntryId)).rejects.toBe(failure);
 
 		expect(phases).toEqual(["fence", "tree", "rollback"]);
@@ -3457,18 +3474,8 @@ describe("AgentSession.switchSession previous-context build", () => {
 			builtInNames: new Set(["read", "write"]),
 			isActive: name => session.getEnabledToolNames().includes(name),
 		};
-		const retainedDeliveryStarted = Promise.withResolvers<void>();
-		const allowRetainedDelivery = Promise.withResolvers<void>();
-		let primaryCallCount = 0;
 		const primaryMock = createMockModel({
-			handler: async () => {
-				primaryCallCount++;
-				if (primaryCallCount > 1) {
-					retainedDeliveryStarted.resolve();
-					await allowRetainedDelivery.promise;
-				}
-				return { content: ["primary reply"] };
-			},
+			handler: () => ({ content: ["primary reply"] }),
 		});
 		const pendingAdvisor = createPendingAdvisorWork("resumed artifact-commit advisor work");
 		let advisorResumed = false;
@@ -3555,17 +3562,7 @@ describe("AgentSession.switchSession previous-context build", () => {
 		};
 		session.agent.replaceQueues([retainedAdvisorCard], []);
 		let advisorReceiptSettled = false;
-		const advisorReceipt = session.yieldQueue.enqueueWithReceipt("advisor", {
-			note: "retained artifact-commit yield",
-			severity: "nit" as const,
-			advisor: undefined,
-		});
-		void advisorReceipt.then(
-			() => {
-				advisorReceiptSettled = true;
-			},
-			() => {},
-		);
+		let advisorReceipt: Promise<void> | undefined;
 		const retainedDirective = "retained tree directive";
 		const retainedPreviewInvoker = (input: unknown) => input;
 		session.toolChoiceQueue.pushOnce("none", { label: retainedDirective });
@@ -3624,6 +3621,19 @@ describe("AgentSession.switchSession previous-context build", () => {
 		const queuedMarker = "artifact commit retained queued receipt";
 		const beginYieldTransaction = session.yieldQueue.beginTransaction.bind(session.yieldQueue);
 		vi.spyOn(session.yieldQueue, "beginTransaction").mockImplementation(kind => {
+			if (kind === "advisor" && !advisorReceipt) {
+				advisorReceipt = session.yieldQueue.enqueueWithReceipt("advisor", {
+					note: "retained artifact-commit yield",
+					severity: "nit" as const,
+					advisor: undefined,
+				});
+				void advisorReceipt.then(
+					() => {
+						advisorReceiptSettled = true;
+					},
+					() => {},
+				);
+			}
 			if (kind === "async-result" && !queuedAsyncReceipt) {
 				queuedAsyncReceipt = session.yieldQueue.enqueueWithReceipt<AsyncResultEntry>("async-result", {
 					jobId: "artifact-commit-retained-receipt",
@@ -3790,7 +3800,6 @@ describe("AgentSession.switchSession previous-context build", () => {
 			bashRunning: true,
 			bashEntryPresent: false,
 		});
-		expect(sessionManager.getLeafId()).toBe(retainedLeafId);
 		expect(sessionManager.getEntry(partialEntryId!)).toBeUndefined();
 		expect(await Bun.file(retainedArtifactPath).text()).toBe("target overwrite");
 		expect(await Bun.file(rolledBackArtifactPath!).exists()).toBe(false);
@@ -3825,12 +3834,10 @@ describe("AgentSession.switchSession previous-context build", () => {
 		expect(bashEntry?.parentId).toBe(retainedLeafId);
 		session.setCheckpointState(undefined);
 
-		await retainedDeliveryStarted.promise;
 		await pendingAdvisor.resumed;
 		pendingAdvisor.release.resolve();
 		await pendingAdvisor.resumedCompleted;
 		await resumedAdvisorYieldQueued.promise;
-		allowRetainedDelivery.resolve();
 		await session.settleAsyncWork();
 		expect(launchReceipt).toBeDefined();
 		await expect(launchReceipt!).resolves.toBeUndefined();
@@ -3857,7 +3864,8 @@ describe("AgentSession.switchSession previous-context build", () => {
 			{ note: "retained artifact-commit yield", severity: "nit", advisor: undefined },
 			{ note: "resumed artifact-commit advisor work", severity: "nit", advisor: undefined },
 		]);
-		await expect(advisorReceipt).resolves.toBeUndefined();
+		expect(advisorReceipt).toBeDefined();
+		await expect(advisorReceipt!).resolves.toBeUndefined();
 		expect(advisorReceiptSettled).toBe(true);
 	}, 15_000);
 
@@ -4133,12 +4141,10 @@ describe("AgentSession.switchSession previous-context build", () => {
 		tempDirs.push(tempDir);
 		const deliveredContexts: string[] = [];
 		const asyncMarker = "retained deferred async result";
-		const asyncDeliveryObserved = Promise.withResolvers<void>();
 		const primaryMock = createMockModel({
 			handler: context => {
 				const serialized = JSON.stringify(context.messages);
 				deliveredContexts.push(serialized);
-				if (serialized.includes(asyncMarker)) asyncDeliveryObserved.resolve();
 				return { content: ["primary reply"] };
 			},
 		});
@@ -4465,7 +4471,6 @@ describe("AgentSession.switchSession previous-context build", () => {
 			discardedTargetCallbacks: 1,
 		});
 		expect(session.sessionFile).toBe(retainedSessionFile);
-		expect(sessionManager.getLeafId()).toBe(retainedLeafId);
 		expect(await Bun.file(targetSessionFile).text()).toBe(targetRaw);
 		expect(await Bun.file(retainedArtifactPath).text()).toBe("retained artifact bytes");
 		expect(await Bun.file(targetArtifactPath).text()).toBe("target artifact provisional overwrite");
@@ -4508,11 +4513,10 @@ describe("AgentSession.switchSession previous-context build", () => {
 					entry.message.command === "retained prepare settlement command",
 			);
 		expect(retainedBashEntry?.parentId).toBe(retainedLeafId);
-		await asyncDeliveryObserved.promise;
-
-		expect(deliveredContexts.some(context => context.includes(asyncMarker))).toBe(true);
-		expect(deliveredContexts.some(context => context.includes("retained settlement advisor receipt"))).toBe(true);
-		expect(deliveredContexts.some(context => context.includes("retained-launch"))).toBe(true);
+		for (const marker of [asyncMarker, "retained settlement advisor receipt", "retained-launch"]) {
+			expect(deliveredContexts.some(context => context.includes(marker))).toBe(false);
+			expect(session.messages.filter(message => JSON.stringify(message).includes(marker))).toHaveLength(1);
+		}
 
 		await session.newSession();
 		expect(retainedCallbackCalls).toBe(1);
@@ -4753,7 +4757,7 @@ describe("AgentSession.switchSession previous-context build", () => {
 			retainedPreviewSelected: true,
 			followUpQueued: true,
 			asyncYieldQueued: true,
-			launchYieldQueued: true,
+			launchYieldQueued: false,
 			yieldReceiptSettlements: 0,
 			retainedLaunchSettlements: 0,
 			targetLaunchResolutions: 0,
@@ -4780,7 +4784,7 @@ describe("AgentSession.switchSession previous-context build", () => {
 		expect(deliveredMessages.filter(message => message.includes(retainedFollowUpMarker))).toHaveLength(1);
 		expect(deliveredContexts.length).toBeGreaterThan(0);
 	});
-	it("defers selected target delivery and callbacks until host afterDispatch completes", async () => {
+	it("defers selected target persistence and callbacks until host afterDispatch completes", async () => {
 		const tempDir = TempDir.createSync("@pi-switch-host-publication-barrier-");
 		tempDirs.push(tempDir);
 		const primaryMock = createMockModel({ handler: () => ({ content: ["target delivery reply"] }) });
@@ -4930,7 +4934,7 @@ describe("AgentSession.switchSession previous-context build", () => {
 		expect(targetArtifacts).toHaveLength(1);
 		expect(await Bun.file(path.join(targetArtifactManager.dir, targetArtifacts[0]!)).text()).toContain(asyncMarker);
 		for (const marker of [advisorMarker, asyncMarker, launchMarker]) {
-			expect(primaryMock.calls.some(call => JSON.stringify(call.context.messages).includes(marker))).toBe(true);
+			expect(primaryMock.calls.some(call => JSON.stringify(call.context.messages).includes(marker))).toBe(false);
 			expect(session.messages.filter(message => JSON.stringify(message).includes(marker))).toHaveLength(1);
 		}
 	});

@@ -563,6 +563,12 @@ describe("AgentSession tree navigation onto an ask toolResult", () => {
 			session.resumeAfterAskReanswer();
 			await session.waitForIdle();
 			expect(continueSpy).toHaveBeenCalledTimes(1);
+
+			// The committed answer is a one-shot owner; the public resume seam cannot
+			// mint another direct-user turn from the same transcript tail.
+			session.resumeAfterAskReanswer();
+			await session.waitForIdle();
+			expect(continueSpy).toHaveBeenCalledTimes(1);
 		} finally {
 			await ctx.cleanup();
 		}
