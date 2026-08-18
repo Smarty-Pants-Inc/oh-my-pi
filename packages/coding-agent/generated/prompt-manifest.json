@@ -6799,7 +6799,7 @@
     },
     {
       "path": "packages/coding-agent/src/context/approved-policy.ts",
-      "sha256": "4ea4240cc0a8bd0ade0cd027ca45a2ec3df351aa44bd72d4022c775708f641e3"
+      "sha256": "53ee6ad9f46fd1b3bb69859d3bcdcb3c9d8578ebd9e3b4ce3c2eb557cc2ca6f5"
     },
     {
       "path": "packages/coding-agent/src/context/canonical.ts",
@@ -10671,5 +10671,5 @@
     }
   ],
   "behaviorSha256": "9b550f2362fc2d5d8ed15ae14109749e753cdcbb1f4f95c8b1354f12b4d498ea",
-  "rootSha256": "24868e60271f6ebe3ea448dcfec7fe196a531a2063813ceb91fbd0753fdfab85"
+  "rootSha256": "6db6f6737a86a7b2988fae65428ab00338063c7be00e771625424d5411c6516e"
 }

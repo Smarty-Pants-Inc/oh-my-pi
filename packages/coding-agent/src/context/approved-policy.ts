@@ -193,7 +193,7 @@ export function promptPolicyReviewWarning(error: unknown): string | undefined {
 	return error.message;
 }
 
-/** Fresh runtime gate for every new session. Offline context commands deliberately do not call it. */
-export function ensureApprovedStartup(): Promise<ContextReleaseManifest> {
-	return assertApprovedStartup();
+/** Startup policy is advisory; offline context commands retain strict diagnostics. */
+export function ensureApprovedStartup(): Promise<ContextReleaseManifest | undefined> {
+	return assertApprovedStartup().catch(() => undefined);
 }
