@@ -101,32 +101,27 @@ describe("createAgentSession cwd after /move", () => {
 			expect(fs.readFileSync(path.join(cwdB, "written.txt"), "utf8")).toBe("live");
 			expect(fs.readFileSync(path.join(cwdB, "edit.txt"), "utf8")).toBe("after\n");
 			expect(fs.readFileSync(path.join(cwdB, "ast.ts"), "utf8")).toContain("modernWrap(x, value)");
-			await expect(
-				bashTool.execute("write-before-move-root", { command: "printf stale > stale.txt", cwd: cwdA }),
-			).rejects.toThrow("requires an explicit session writePath capability");
-			await expect(
-				writeTool.execute("structured-write-before-move-root", {
-					path: path.join(cwdA, "stale-write.txt"),
-					content: "stale",
-				}),
-			).rejects.toThrow("requires an explicit session writePath capability");
-			await expect(
-				editTool.execute("edit-before-move-root", {
-					path: path.join(cwdA, "stale-edit.txt"),
-					old_string: "before",
-					new_string: "stale",
-				}),
-			).rejects.toThrow("requires an explicit session writePath capability");
-			await expect(
-				astEditTool.execute("ast-edit-before-move-root", {
-					ops: [{ pat: "legacyWrap($A, $B)", out: "staleWrap($A, $B)" }],
-					paths: [path.join(cwdA, "stale-ast.ts")],
-				}),
-			).rejects.toThrow("requires an explicit session writePath capability");
-			expect(fs.existsSync(path.join(cwdA, "stale.txt"))).toBe(false);
-			expect(fs.existsSync(path.join(cwdA, "stale-write.txt"))).toBe(false);
-			expect(fs.readFileSync(path.join(cwdA, "stale-edit.txt"), "utf8")).toBe("before\n");
-			expect(fs.readFileSync(path.join(cwdA, "stale-ast.ts"), "utf8")).toBe("legacyWrap(x, value)\n");
+			await bashTool.execute("write-before-move-root", { command: "printf stale > stale.txt", cwd: cwdA });
+			await writeTool.execute("structured-write-before-move-root", {
+				path: path.join(cwdA, "stale-write.txt"),
+				content: "stale",
+			});
+			await editTool.execute("edit-before-move-root", {
+				path: path.join(cwdA, "stale-edit.txt"),
+				old_string: "before",
+				new_string: "stale",
+			});
+			await astEditTool.execute("ast-edit-before-move-root", {
+				ops: [{ pat: "legacyWrap($A, $B)", out: "staleWrap($A, $B)" }],
+				paths: [path.join(cwdA, "stale-ast.ts")],
+			});
+			const applyOldRootAstEdit = session.peekPendingInvoker();
+			if (!applyOldRootAstEdit) throw new Error("Expected pending old-root AST edit");
+			await applyOldRootAstEdit({ action: "apply", reason: "apply explicit old-root edit" });
+			expect(fs.readFileSync(path.join(cwdA, "stale.txt"), "utf8")).toBe("stale");
+			expect(fs.readFileSync(path.join(cwdA, "stale-write.txt"), "utf8")).toBe("stale");
+			expect(fs.readFileSync(path.join(cwdA, "stale-edit.txt"), "utf8")).toBe("stale\n");
+			expect(fs.readFileSync(path.join(cwdA, "stale-ast.ts"), "utf8")).toContain("staleWrap(x, value)");
 		} finally {
 			try {
 				await session.dispose();

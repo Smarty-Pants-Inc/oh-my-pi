@@ -55,7 +55,6 @@ import { createAutoresearchExtension } from "./autoresearch";
 import { loadCapability } from "./capability";
 import { type Rule, ruleCapability, setActiveRules } from "./capability/rule";
 import { bucketRules } from "./capability/rule-buckets";
-import { SessionCapabilities, type TaskOwnedResource } from "./capability/session-capabilities";
 import { shouldEnableAppendOnlyContext } from "./config/append-only-context-mode";
 import { shouldInlineToolDescriptors } from "./config/inline-tool-descriptors-mode";
 import { isAuthenticated, kNoAuth, ModelRegistry } from "./config/model-registry";
@@ -631,12 +630,6 @@ export interface CreateAgentSessionOptions {
 
 	/** Whether to auto-approve all tool calls (--auto-approve CLI flag). Default: false */
 	autoApprove?: boolean;
-	/** Exact additional filesystem paths granted for writes in this session. */
-	writeAllowlist?: readonly string[];
-	/** Exact named consequential effects granted for this session. */
-	externalCapabilities?: readonly string[];
-	/** Resources created by this task and eligible for guarded cleanup. */
-	taskOwnedResources?: readonly TaskOwnedResource[];
 }
 
 /** Result from createAgentSession */
@@ -1414,13 +1407,6 @@ async function createAgentSessionScoped(
 		const merged = [...new Set([...existing, ...configuredDirs])];
 		await sessionManager.setAdditionalDirectories(merged);
 	}
-	const sessionCapabilities = new SessionCapabilities({
-		workspace: cwd,
-		workspaceRoots: options.taskDepth && options.taskDepth > 0 ? [] : configuredDirs,
-		writeAllowlist: options.writeAllowlist,
-		externalCapabilities: options.externalCapabilities,
-		taskOwnedResources: options.taskOwnedResources,
-	});
 	const providerSessionId = options.providerSessionId ?? sessionManager.getSessionId();
 	const forkCacheShapeChanged =
 		options.model !== undefined ||
@@ -1743,7 +1729,6 @@ async function createAgentSessionScoped(
 			isToolActive: name => activeToolNames.has(name),
 			setActiveToolNames,
 			toolRegistry,
-			capabilities: sessionCapabilities,
 			hasUI: options.hasUI ?? false,
 			getApiKey: options.getApiKey,
 			getExecutionEnvironment: () => resolvedExecutionEnvironment,
@@ -3586,7 +3571,6 @@ async function createAgentSessionScoped(
 			sessionManager,
 			initialAdvisorCosts,
 			settings,
-			capabilities: sessionCapabilities,
 			autoApprove: options.autoApprove,
 			scoutAllowedBySpawnPolicy: isScoutSpawnable(undefined, options.spawns ?? "*"),
 			evalKernelOwnerId,

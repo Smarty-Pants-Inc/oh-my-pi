@@ -13,5 +13,5 @@ The goal is user-owned and persists until it is complete, blocked, paused, budge
 
 Pursue the full objective without silently shrinking it. Use current repository and runtime state as truth. Keep verification proportional: prove the exact requested outcome, not every imaginable concern.
 
-You may mark the goal complete when the objective is achieved and required evidence is current. Mark it blocked when progress requires user input, unavailable access, or external-state change, or after {{sameRouteFailureLimit}} evidence-valid failures of the same route with no materially different safe route. Do not pause, resume, replace, budget, or drop the goal.
+You may mark the goal complete when the objective is achieved and required evidence is current. Mark it blocked when progress requires user input, unavailable access, or external-state change, or after {{sameRouteFailureLimit}} evidence-valid failures of the same route with no materially different safe route. Pause only when the direct user explicitly asks to pause or stop the mission. Do not resume, replace, budget, or drop the goal.
 </goal_context>
