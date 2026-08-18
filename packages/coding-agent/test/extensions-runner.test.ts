@@ -127,6 +127,39 @@ describe("ExtensionRunner", () => {
 		expect(errors[0]?.error).toContain("PROMPT_POLICY_REVIEW_REQUIRED: extension source is not approved");
 	});
 
+	it("skips multiple unapproved system prompt builders without blocking startup", async () => {
+		for (const name of ["builder-a.ts", "builder-b.ts"]) {
+			fs.writeFileSync(
+				path.join(extensionsDir, name),
+				`export default function(pi) {
+					pi.registerSystemPromptBuilder(() => ({ systemPrompt: ["replacement"] }));
+				}`,
+			);
+		}
+		const result = await loadTestExtensions();
+		const runner = new ExtensionRunner(
+			result.extensions,
+			result.runtime,
+			tempDir.path(),
+			sessionManager,
+			modelRegistry,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			{ candidates: [] } as unknown as ContextReleaseManifest,
+		);
+		const errors: ExtensionError[] = [];
+		runner.onError(error => errors.push(error));
+
+		expect(await runner.getSystemPromptBuilder()).toBeUndefined();
+		expect(errors).toHaveLength(2);
+		expect(errors.every(error => error.event === "system_prompt_builder")).toBe(true);
+		expect(errors.every(error => error.error.includes("PROMPT_POLICY_REVIEW_REQUIRED"))).toBe(true);
+	});
+
 	it("reflects SessionManager.moveTo() changes instead of the constructor-time snapshot (/move)", async () => {
 		const dirA = tempDir.join("dirA");
 		const dirB = tempDir.join("dirB");
