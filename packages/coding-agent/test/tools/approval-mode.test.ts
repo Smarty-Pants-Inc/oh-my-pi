@@ -87,21 +87,12 @@ describe("tools.approvalMode setting", () => {
 		return bash;
 	}
 
-	it("yolo mode (default) bypasses approval for non-overriding tool calls", async () => {
+	it("yolo mode (default) executes arbitrary local commands without a second permission layer", async () => {
 		const settings = approvalSettings();
-		const result = await bashTool().execute("yolo", { command: "echo ok" }, undefined, undefined, {
+		const result = await bashTool().execute("yolo", { command: "printenv PATH" }, undefined, undefined, {
 			settings,
 		} as AgentToolContext);
-		expect(textOf(result)).toContain("ok");
-	});
-
-	it("yolo mode cannot bypass Bash session capabilities", async () => {
-		const settings = approvalSettings({ "tools.approvalMode": "yolo" });
-		await expect(
-			bashTool().execute("yolo-capability", { command: "git push origin HEAD" }, undefined, undefined, {
-				settings,
-			} as AgentToolContext),
-		).rejects.toThrow(/requires explicit session capability 'git.push'.*discoverable capability_grant/);
+		expect(textOf(result).trim()).not.toBe("");
 	});
 
 	it("always-ask mode rejects exec tools when no UI is available", async () => {
@@ -148,16 +139,22 @@ describe("tools.approvalMode setting", () => {
 		).rejects.toThrow(/requires approval but no interactive UI available/);
 	});
 
-	it("critical Bash writes still require session authority in yolo mode", async () => {
+	it("yolo mode allows Bash writes outside the workspace without a second authority layer", async () => {
 		const settings = approvalSettings({
 			"tools.approvalMode": "yolo",
 			"tools.approval": { bash: "allow" },
 		});
-		await expect(
-			bashTool().execute("critical", { command: "rm -f /tmp/bun-fake-timer-probe.test.ts" }, undefined, undefined, {
+		const target = path.join(tempDir, "outside-yolo.txt");
+		await bashTool().execute(
+			"critical",
+			{ command: `printf yolo > ${JSON.stringify(target)}` },
+			undefined,
+			undefined,
+			{
 				settings,
-			} as AgentToolContext),
-		).rejects.toThrow("requires an explicit session writePath capability");
+			} as AgentToolContext,
+		);
+		expect(fs.readFileSync(target, "utf8")).toBe("yolo");
 	});
 
 	it("CLI --auto-approve forces yolo mode for non-overriding tool calls", async () => {
@@ -169,17 +166,17 @@ describe("tools.approvalMode setting", () => {
 		expect(textOf(result)).toContain("override");
 	});
 
-	it("CLI --auto-approve cannot bypass session write capabilities", async () => {
+	it("CLI --auto-approve allows Bash writes outside the workspace", async () => {
 		const settings = approvalSettings({ "tools.approvalMode": "always-ask" });
-		await expect(
-			bashTool().execute(
-				"cli-critical",
-				{ command: "rm -f /tmp/bun-fake-timer-probe.test.ts" },
-				undefined,
-				undefined,
-				{ settings, autoApprove: true } as AgentToolContext,
-			),
-		).rejects.toThrow("requires an explicit session writePath capability");
+		const target = path.join(tempDir, "outside-auto-approve.txt");
+		await bashTool().execute(
+			"cli-critical",
+			{ command: `printf override > ${JSON.stringify(target)}` },
+			undefined,
+			undefined,
+			{ settings, autoApprove: true } as AgentToolContext,
+		);
+		expect(fs.readFileSync(target, "utf8")).toBe("override");
 	});
 
 	it("xd:// dispatch approval (xdevApproved) suppresses the tier-only re-prompt", async () => {

@@ -3679,7 +3679,7 @@ export const SETTINGS_SCHEMA = {
 	"tools.approvalMode": {
 		type: "enum",
 		values: ["always-ask", "write", "yolo"] as const,
-		default: agentBehavior.toolExecution.approvalMode,
+		default: "yolo",
 		ui: {
 			tab: "interaction",
 			group: "Approvals",

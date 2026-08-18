@@ -1,11 +1,9 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { createHash } from "node:crypto";
 import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import { createMockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
-import { SessionCapabilities } from "@oh-my-pi/pi-coding-agent/capability/session-capabilities";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { IrcMessage } from "@oh-my-pi/pi-coding-agent/irc/bus";
@@ -17,33 +15,21 @@ import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
-const grantParameters = type({
-	kind: "'writePath' | 'externalCapability'",
-	value: "string",
-});
+const recordParameters = type({ value: "string" });
 
 type Harness = {
 	session: AgentSession;
-	capabilities: SessionCapabilities;
 	manager?: AsyncJobManager;
 	authStorage: AuthStorage;
 	tempDir: TempDir;
-	grantAttempts: string[];
-	grantDenials: string[];
+	recorded: string[];
 };
 
 const harnesses: Harness[] = [];
 
-function grantCall(value: string, id: string): MockResponse {
+function recordCall(value: string, id: string): MockResponse {
 	return {
-		content: [
-			{
-				type: "toolCall",
-				id,
-				name: "capability_grant",
-				arguments: { kind: "externalCapability", value },
-			},
-		],
+		content: [{ type: "toolCall", id, name: "record", arguments: { value } }],
 		stopReason: "toolUse",
 	};
 }
@@ -54,32 +40,27 @@ function done(text = "done"): MockResponse {
 
 async function createHarness(
 	responses: MockResponse[],
-	options: { async?: boolean; gatedFirstResponse?: Promise<void> } = {},
+	options: { async?: boolean; gatedFirstResponse?: Promise<void>; onFirstProviderCall?: () => void } = {},
 ): Promise<Harness & { modelCalls: () => number; modelContextText: (index: number) => string }> {
 	const tempDir = TempDir.createSync("@pi-turn-authority-");
-	const capabilities = new SessionCapabilities({ workspace: tempDir.path() });
-	const grantAttempts: string[] = [];
-	const grantDenials: string[] = [];
-	const capabilityGrant: AgentTool<typeof grantParameters, { value: string }> = {
-		name: "capability_grant",
-		label: "Capability Grant",
-		description: "Test capability grant",
-		parameters: grantParameters,
+	const recorded: string[] = [];
+	const recordTool: AgentTool<typeof recordParameters, { value: string }> = {
+		name: "record",
+		label: "Record",
+		description: "Record a test value",
+		parameters: recordParameters,
 		execute: async (_toolCallId, params) => {
-			grantAttempts.push(params.value);
-			try {
-				const grant = capabilities.grantFromCurrentDirectUserTurn(params);
-				return { content: [{ type: "text", text: `granted:${grant.value}` }], details: { value: grant.value } };
-			} catch (error) {
-				grantDenials.push(params.value);
-				throw error;
-			}
+			recorded.push(params.value);
+			return { content: [{ type: "text", text: `recorded:${params.value}` }], details: params };
 		},
 	};
 	let responseIndex = 0;
 	const mock = createMockModel({
 		handler: async () => {
-			if (responseIndex === 0) await options.gatedFirstResponse;
+			if (responseIndex === 0) {
+				options.onFirstProviderCall?.();
+				await options.gatedFirstResponse;
+			}
 			const response = responses[responseIndex++];
 			if (!response) throw new Error(`Unexpected provider call ${responseIndex}`);
 			return response;
@@ -91,7 +72,7 @@ async function createHarness(
 	authStorage.setRuntimeApiKey("anthropic", "test-key");
 	const agent = new Agent({
 		getApiKey: () => "test-key",
-		initialState: { model, systemPrompt: ["Test"], tools: [capabilityGrant] },
+		initialState: { model, systemPrompt: ["Test"], tools: [recordTool] },
 		convertToLlm,
 		streamFn: mock.stream,
 	});
@@ -106,11 +87,10 @@ async function createHarness(
 			"todo.reminders": false,
 		}),
 		modelRegistry: new ModelRegistry(authStorage),
-		toolRegistry: new Map([[capabilityGrant.name, capabilityGrant]]),
-		capabilities,
+		toolRegistry: new Map([[recordTool.name, recordTool]]),
 		...(manager ? { agentId: "AuthorityProbe", asyncJobManager: manager } : {}),
 	});
-	const harness = { session, capabilities, manager, authStorage, tempDir, grantAttempts, grantDenials };
+	const harness = { session, manager, authStorage, tempDir, recorded };
 	harnesses.push(harness);
 	return {
 		...harness,
@@ -129,36 +109,8 @@ afterEach(async () => {
 });
 
 describe("AgentSession automatic turn authority", () => {
-	it("closes direct-user capability state before tracked post-prompt recovery", async () => {
-		const { session, capabilities } = await createHarness([done()]);
-		const agentEnded = Promise.withResolvers<void>();
-		session.agent.subscribe(event => {
-			if (event.type === "agent_end") agentEnded.resolve();
-		});
-		let denied = false;
-		session.trackPostPromptTaskForTests(
-			(async () => {
-				await agentEnded.promise;
-				await Bun.sleep(0);
-				try {
-					capabilities.grantFromCurrentDirectUserTurn({
-						kind: "externalCapability",
-						value: "hostile.recovery",
-					});
-				} catch {
-					denied = true;
-				}
-			})(),
-		);
-
-		await session.prompt("direct user turn");
-
-		expect(denied).toBe(true);
-		expect(capabilities.grantProvenance).toEqual([]);
-	});
-
 	it("persists an unscoped launch completion without granting it a semantic turn", async () => {
-		const { session, capabilities, grantAttempts, grantDenials, modelCalls } = await createHarness([]);
+		const { session, recorded, modelCalls } = await createHarness([]);
 		const owner = session.sessionManager.getSessionId();
 		const completion = {
 			event: "daemon-completed",
@@ -184,15 +136,13 @@ describe("AgentSession automatic turn authority", () => {
 		await session.waitForIdle();
 
 		expect(modelCalls()).toBe(0);
-		expect(grantAttempts).toEqual([]);
-		expect(grantDenials).toEqual([]);
-		expect(capabilities.grantProvenance).toEqual([]);
+		expect(recorded).toEqual([]);
 		expect(session.messages.some(message => JSON.stringify(message).includes("authority-daemon"))).toBe(true);
 		expect(session.getAutomaticTurnOutcomes()).toEqual([]);
 	});
 
 	it("persists unscoped IRC input without granting it a semantic turn", async () => {
-		const { session, capabilities, grantAttempts, grantDenials, modelCalls } = await createHarness([]);
+		const { session, recorded, modelCalls } = await createHarness([]);
 		const message: IrcMessage = {
 			id: "authority-irc",
 			from: "peer",
@@ -205,21 +155,19 @@ describe("AgentSession automatic turn authority", () => {
 		await session.waitForIdle();
 
 		expect(modelCalls()).toBe(0);
-		expect(grantAttempts).toEqual([]);
-		expect(grantDenials).toEqual([]);
-		expect(capabilities.grantProvenance).toEqual([]);
+		expect(recorded).toEqual([]);
 		expect(session.messages.some(message => JSON.stringify(message).includes("wake"))).toBe(true);
 		expect(session.getAutomaticTurnOutcomes()).toEqual([]);
 	});
 
 	it("keeps a parent IRC tail passive when a genuine user arrives behind it", async () => {
-		const { session, capabilities, grantAttempts, grantDenials, modelCalls, modelContextText } = await createHarness([
+		const { session, recorded, modelCalls, modelContextText } = await createHarness([
 			done("initial done"),
-			grantCall("legitimate.user.one", "grant-user-one"),
+			recordCall("legitimate.user.one", "record-user-one"),
 			done("first user turn done"),
-			grantCall("legitimate.user.two", "grant-user-two"),
+			recordCall("legitimate.user.two", "record-user-two"),
 			done("second user turn done"),
-			grantCall("hostile.parent-irc", "grant-parent-irc"),
+			recordCall("hostile.parent-irc", "record-parent-irc"),
 			done(),
 		]);
 		AgentRegistry.global().register({
@@ -284,20 +232,7 @@ describe("AgentSession automatic turn authority", () => {
 				.peekSteeringQueue()
 				.some(message => message.role === "user" && message.attribution === "agent" && message.steering === true),
 		).toBe(true);
-		expect(grantAttempts).toEqual(["legitimate.user.one", "legitimate.user.two"]);
-		expect(grantDenials).toEqual([]);
-		expect(capabilities.grantProvenance).toEqual([
-			expect.objectContaining({
-				source: "direct_user_turn",
-				value: "legitimate.user.one",
-				userPromptSha256: createHash("sha256").update("genuine user owner one").digest("hex"),
-			}),
-			expect.objectContaining({
-				source: "direct_user_turn",
-				value: "legitimate.user.two",
-				userPromptSha256: createHash("sha256").update("genuine user owner two").digest("hex"),
-			}),
-		]);
+		expect(recorded).toEqual(["legitimate.user.one", "legitimate.user.two"]);
 		expect(session.getAutomaticTurnOutcomes()).toEqual([
 			expect.objectContaining({ source: "direct_user_input", status: "accepted" }),
 			expect.objectContaining({ source: "direct_user_input", status: "started" }),
@@ -308,8 +243,8 @@ describe("AgentSession automatic turn authority", () => {
 
 	it("parks queued IRC and defers repeated resume while an attributed ask re-answer owns the direct turn", async () => {
 		const gate = Promise.withResolvers<void>();
-		const { session, capabilities, grantAttempts, grantDenials, modelCalls, modelContextText } = await createHarness(
-			[grantCall("legitimate.ask-reanswer", "grant-ask-reanswer"), done("ask re-answer done")],
+		const { session, recorded, modelCalls, modelContextText } = await createHarness(
+			[recordCall("legitimate.ask-reanswer", "record-ask-reanswer"), done("ask re-answer done")],
 			{ gatedFirstResponse: gate.promise },
 		);
 		const usage = {
@@ -390,15 +325,7 @@ describe("AgentSession automatic turn authority", () => {
 		expect(session.agent.peekSteeringQueue()).toEqual([
 			expect.objectContaining({ content: "queued IRC must not ride the ask answer", attribution: "agent" }),
 		]);
-		expect(grantAttempts).toEqual(["legitimate.ask-reanswer"]);
-		expect(grantDenials).toEqual([]);
-		expect(capabilities.grantProvenance).toEqual([
-			expect.objectContaining({
-				source: "direct_user_turn",
-				value: "legitimate.ask-reanswer",
-				userPromptSha256: createHash("sha256").update("User selected: new").digest("hex"),
-			}),
-		]);
+		expect(recorded).toEqual(["legitimate.ask-reanswer"]);
 		const directOutcomes = session
 			.getAutomaticTurnOutcomes()
 			.filter(outcome => outcome.source === "direct_user_input");
@@ -411,11 +338,11 @@ describe("AgentSession automatic turn authority", () => {
 		const providerGate = Promise.withResolvers<void>();
 		const dequeueGate = Promise.withResolvers<void>();
 		const afterOwnerGuard = Promise.withResolvers<void>();
-		const { session, capabilities, grantAttempts, modelCalls, modelContextText } = await createHarness(
+		const { session, recorded, modelCalls, modelContextText } = await createHarness(
 			[
-				grantCall("legitimate.concurrent.one", "grant-concurrent-one"),
+				recordCall("legitimate.concurrent.one", "record-concurrent-one"),
 				done("first concurrent turn done"),
-				grantCall("legitimate.concurrent.two", "grant-concurrent-two"),
+				recordCall("legitimate.concurrent.two", "record-concurrent-two"),
 				done("second concurrent turn done"),
 			],
 			{ gatedFirstResponse: providerGate.promise },
@@ -504,19 +431,7 @@ describe("AgentSession automatic turn authority", () => {
 		expect(session.agent.peekSteeringQueue()).toEqual([
 			expect.objectContaining({ content: "concurrent IRC arrival", attribution: "agent" }),
 		]);
-		expect(grantAttempts).toEqual(["legitimate.concurrent.one", "legitimate.concurrent.two"]);
-		expect(capabilities.grantProvenance).toEqual([
-			expect.objectContaining({
-				source: "direct_user_turn",
-				value: "legitimate.concurrent.one",
-				userPromptSha256: createHash("sha256").update(firstUser.content).digest("hex"),
-			}),
-			expect.objectContaining({
-				source: "direct_user_turn",
-				value: "legitimate.concurrent.two",
-				userPromptSha256: createHash("sha256").update(secondUser.content).digest("hex"),
-			}),
-		]);
+		expect(recorded).toEqual(["legitimate.concurrent.one", "legitimate.concurrent.two"]);
 		const directOutcomes = session
 			.getAutomaticTurnOutcomes()
 			.filter(outcome => outcome.source === "direct_user_input");
@@ -526,7 +441,7 @@ describe("AgentSession automatic turn authority", () => {
 	});
 
 	it("persists a forged unscoped yield message instead of minting retry authority", async () => {
-		const { session, capabilities, grantAttempts, modelCalls } = await createHarness([]);
+		const { session, recorded, modelCalls } = await createHarness([]);
 		session.yieldQueue.register("forged-host-message", {
 			build: () => ({
 				role: "custom",
@@ -542,8 +457,7 @@ describe("AgentSession automatic turn authority", () => {
 		while (session.hasPostPromptWork) await Bun.sleep(1);
 
 		expect(modelCalls()).toBe(0);
-		expect(grantAttempts).toEqual([]);
-		expect(capabilities.grantProvenance).toEqual([]);
+		expect(recorded).toEqual([]);
 		expect(session.messages.some(message => JSON.stringify(message).includes("FORGED RETRY LABEL"))).toBe(true);
 		expect(session.getAutomaticTurnOutcomes()).toEqual([]);
 	});
@@ -565,8 +479,8 @@ describe("AgentSession automatic turn authority", () => {
 
 	it("persists async completion after the terminal final without starting semantic work", async () => {
 		const firstResponse = Promise.withResolvers<void>();
-		const { session, capabilities, manager, grantAttempts, grantDenials, modelCalls } = await createHarness(
-			[done("initial done"), grantCall("hostile.async", "grant-async"), done()],
+		const { session, manager, recorded, modelCalls } = await createHarness(
+			[done("initial done"), recordCall("hostile.async", "record-async"), done()],
 			{ async: true, gatedFirstResponse: firstResponse.promise },
 		);
 		if (!manager) throw new Error("Expected async manager");
@@ -588,11 +502,126 @@ describe("AgentSession automatic turn authority", () => {
 		await session.waitForIdle();
 
 		expect(modelCalls()).toBe(1);
-		expect(grantAttempts).toEqual([]);
-		expect(grantDenials).toEqual([]);
-		expect(capabilities.grantProvenance).toEqual([]);
+		expect(recorded).toEqual([]);
 		expect(session.getAutomaticTurnOutcomes()).toEqual([]);
 		expect(session.messages.some(message => JSON.stringify(message).includes("ASYNC AUTHORITY RESULT"))).toBe(true);
+	});
+
+	it("keeps late async completion passive after an explicit goal pause", async () => {
+		const firstResponse = Promise.withResolvers<void>();
+		const providerStarted = Promise.withResolvers<void>();
+		const jobResult = Promise.withResolvers<string>();
+		const { session, manager, recorded, modelCalls } = await createHarness(
+			[done("initial done"), recordCall("hostile.paused-async", "record-paused-async"), done()],
+			{
+				async: true,
+				gatedFirstResponse: firstResponse.promise,
+				onFirstProviderCall: () => providerStarted.resolve(),
+			},
+		);
+		if (!manager) throw new Error("Expected async manager");
+		session.setGoalModeState({
+			enabled: true,
+			mode: "active",
+			goal: {
+				id: "goal-pause-async",
+				objective: "Pause without a late wake",
+				status: "active",
+				tokensUsed: 0,
+				timeUsedSeconds: 0,
+				createdAt: Date.now(),
+				updatedAt: Date.now(),
+			},
+		});
+
+		const prompt = session.prompt("start an async origin");
+		await providerStarted.promise;
+		const originTurnId = session.getCurrentTurnId();
+		expect(originTurnId).toMatch(/^turn-/);
+		manager.register("task", "paused authority probe", async () => await jobResult.promise, {
+			id: "paused-authority-job",
+			ownerId: "AuthorityProbe",
+			originTurnId,
+		});
+
+		await session.goalRuntime.pauseGoal();
+		expect(session.getGoalModeState()).toMatchObject({ enabled: false, goal: { status: "paused" } });
+		expect(session.getCurrentTurnId()).toBeUndefined();
+		firstResponse.resolve();
+		await prompt;
+		jobResult.resolve("PAUSED ASYNC AUTHORITY RESULT");
+		await manager.waitForOwnerJobs("AuthorityProbe");
+		await manager.drainDeliveries({ filter: { ownerId: "AuthorityProbe" } });
+		await session.waitForIdle();
+
+		expect(modelCalls()).toBe(1);
+		expect(recorded).toEqual([]);
+		expect(
+			session
+				.getAutomaticTurnOutcomes()
+				.some(outcome => outcome.source === "active_async_result_wake" && outcome.status === "started"),
+		).toBe(false);
+		expect(session.messages.some(message => JSON.stringify(message).includes("PAUSED ASYNC AUTHORITY RESULT"))).toBe(
+			true,
+		);
+	});
+
+	it("keeps a queued async completion passive when the goal pauses before injection", async () => {
+		const firstResponse = Promise.withResolvers<void>();
+		const providerStarted = Promise.withResolvers<void>();
+		const { session, manager, recorded, modelCalls } = await createHarness(
+			[done("initial done"), recordCall("hostile.queued-paused-async", "record-queued-paused-async"), done()],
+			{
+				async: true,
+				gatedFirstResponse: firstResponse.promise,
+				onFirstProviderCall: () => providerStarted.resolve(),
+			},
+		);
+		if (!manager) throw new Error("Expected async manager");
+		session.setGoalModeState({
+			enabled: true,
+			mode: "active",
+			goal: {
+				id: "goal-pause-queued-async",
+				objective: "Pause before queued async injection",
+				status: "active",
+				tokensUsed: 0,
+				timeUsedSeconds: 0,
+				createdAt: Date.now(),
+				updatedAt: Date.now(),
+			},
+		});
+
+		const prompt = session.prompt("start an async origin");
+		await providerStarted.promise;
+		const originTurnId = session.getCurrentTurnId();
+		expect(originTurnId).toMatch(/^turn-/);
+		manager.register("task", "queued paused authority probe", async () => "QUEUED PAUSED ASYNC RESULT", {
+			id: "queued-paused-authority-job",
+			ownerId: "AuthorityProbe",
+			originTurnId,
+		});
+		await manager.waitForOwnerJobs("AuthorityProbe");
+		await manager.drainDeliveries({ filter: { ownerId: "AuthorityProbe" } });
+		expect(session.hasPendingAsyncWork()).toBe(true);
+
+		await session.goalRuntime.pauseGoal();
+		expect(session.getCurrentTurnId()).toBeUndefined();
+		expect(session.hasPendingAsyncWork()).toBe(false);
+		firstResponse.resolve();
+		await prompt;
+		await session.waitForIdle();
+
+		expect(modelCalls()).toBe(1);
+		expect(recorded).toEqual([]);
+		expect(
+			session
+				.getAutomaticTurnOutcomes()
+				.some(outcome => outcome.source === "active_async_result_wake" && outcome.status === "started"),
+		).toBe(false);
+		expect(session.messages.some(message => JSON.stringify(message).includes("QUEUED PAUSED ASYNC RESULT"))).toBe(
+			true,
+		);
 	});
 
 	it("records a pre-dispatch goal continuation failure without a false start", async () => {
