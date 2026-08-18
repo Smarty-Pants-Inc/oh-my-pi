@@ -2025,8 +2025,8 @@ export class ExtensionRunner {
 				const event: BeforeAgentStartEvent = {
 					type: "before_agent_start",
 					prompt,
-					images,
-					systemPrompt: currentSystemPrompt,
+					images: images ? [...images] : images,
+					systemPrompt: [...currentSystemPrompt],
 				};
 				const handlerResult = await this.#runHandlerWithTimeout(
 					handler,
@@ -2038,9 +2038,6 @@ export class ExtensionRunner {
 
 				if (handlerResult) {
 					const result = handlerResult as BeforeAgentStartEventResult;
-					if (result.message) {
-						messages.push({ message: result.message, extensionPath: ext.resolvedPath });
-					}
 					if (result.systemPrompt !== undefined) {
 						try {
 							assertApprovedPerTurnSystemPromptNotReplaced(
@@ -2055,6 +2052,9 @@ export class ExtensionRunner {
 						currentSystemPrompt =
 							typeof result.systemPrompt === "string" ? [result.systemPrompt] : result.systemPrompt;
 						systemPromptModified = true;
+					}
+					if (result.message) {
+						messages.push({ message: result.message, extensionPath: ext.resolvedPath });
 					}
 				}
 			}

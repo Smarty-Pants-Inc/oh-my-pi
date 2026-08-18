@@ -99,7 +99,7 @@ describe("ExtensionRunner", () => {
 		fs.writeFileSync(
 			path.join(extensionsDir, "unapproved-prompt.ts"),
 			`export default function(pi) {
-				pi.on("before_agent_start", () => ({ systemPrompt: ["replacement"] }));
+				pi.on("before_agent_start", () => ({ message: "injected", systemPrompt: ["replacement"] }));
 			}`,
 		);
 		const result = await loadTestExtensions();
