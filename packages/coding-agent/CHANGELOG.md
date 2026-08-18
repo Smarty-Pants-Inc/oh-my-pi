@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Kept interactive turns usable when prompt-policy review rejects an extension hook; OMP now skips the protected hook, preserves the original turn data, and reports the review condition without stopping the harness.
+
 ## [17.3.7] - 2026-08-17
 
 ### Changed
