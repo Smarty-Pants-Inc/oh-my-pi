@@ -3030,6 +3030,17 @@ async function createAgentSessionScoped(
 				systemPrompt: [...prompt.systemPrompt],
 				xdevCatalogNames: prompt.xdevCatalogNames ? [...prompt.xdevCatalogNames] : undefined,
 			});
+			const matchesStockPrompt = (candidate: BuildSystemPromptResult): boolean => {
+				try {
+					return (
+						JSON.stringify(candidate.systemPrompt) === JSON.stringify(stockPrompt.systemPrompt) &&
+						JSON.stringify(candidate.xdevCatalogNames ?? []) ===
+							JSON.stringify(stockPrompt.xdevCatalogNames ?? [])
+					);
+				} catch {
+					return false;
+				}
+			};
 			let defaultPrompt = stockPrompt;
 			if (systemPromptBuilder) {
 				try {
@@ -3051,13 +3062,7 @@ async function createAgentSessionScoped(
 					});
 				}
 			}
-			if (
-				releaseManifest &&
-				systemPromptBuilder !== undefined &&
-				(JSON.stringify(defaultPrompt.systemPrompt) !== JSON.stringify(stockPrompt.systemPrompt) ||
-					JSON.stringify(defaultPrompt.xdevCatalogNames ?? []) !==
-						JSON.stringify(stockPrompt.xdevCatalogNames ?? []))
-			) {
+			if (releaseManifest && systemPromptBuilder !== undefined && !matchesStockPrompt(defaultPrompt)) {
 				logger.warn("Prompt policy requires review; continuing with the stock system prompt", {
 					error: "PROMPT_POLICY_REVIEW_REQUIRED: provider-facing system prompt differs from the approved stock prompt",
 				});
@@ -3074,7 +3079,7 @@ async function createAgentSessionScoped(
 			const result = {
 				systemPrompt: typeof customPrompt === "string" ? [customPrompt] : customPrompt,
 			};
-			if (releaseManifest && JSON.stringify(result.systemPrompt) !== JSON.stringify(stockPrompt.systemPrompt)) {
+			if (releaseManifest && !matchesStockPrompt(result)) {
 				logger.warn("Prompt policy requires review; continuing with the stock system prompt", {
 					error: "PROMPT_POLICY_REVIEW_REQUIRED: provider-facing system prompt differs from the approved stock prompt",
 				});
