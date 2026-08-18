@@ -508,6 +508,8 @@ describe("createAgentSession credential_disabled subscription", () => {
 				sessionMutationFences: [],
 				tools: new Map(),
 				assistantThinkingRenderers: [],
+				fileWriteFallbackHandlers: [],
+				fileDeleteFallbackHandlers: [],
 				messageRenderers: new Map(),
 				commands: new Map(),
 				flags: new Map(),
