@@ -106,7 +106,6 @@ import {
 	loadAdvisorTranscriptCosts,
 } from "../advisor";
 import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, type AsyncJob, type AsyncJobFilter, AsyncJobManager } from "../async";
-import type { SessionCapabilities } from "../capability/session-capabilities";
 import { shouldEnableAppendOnlyContext } from "../config/append-only-context-mode";
 import type { ModelRegistry } from "../config/model-registry";
 import type { ResolvedModelRoleValue } from "../config/model-resolver";
@@ -777,7 +776,6 @@ export class AgentSession {
 	#sessionStopHookActive = false;
 	readonly #automaticTurns = new AutomaticTurnAuthority();
 	#pendingAutomaticTurnStart: { source: AutomaticTurnSource; originTurnId?: string } | undefined;
-	readonly #capabilities: SessionCapabilities | undefined;
 	#currentTurnId: string | undefined;
 	#pendingAskReanswerOwner: ToolResultMessage | undefined;
 	#activeDirectUserContinuationOwner: AgentMessage | undefined;
@@ -1075,7 +1073,6 @@ export class AgentSession {
 		this.#desiredInterruptMode = this.agent.getInterruptMode();
 		this.sessionManager = config.sessionManager;
 		this.settings = config.settings;
-		this.#capabilities = config.capabilities;
 		this.#getMcpServerInstructionSources = config.getMcpServerInstructionSources;
 		this.#modelRegistry = config.modelRegistry;
 		this.#codexResetCoordinator = config.codexResetCoordinator ?? defaultCodexAutoRedeemCoordinator;
@@ -1520,11 +1517,18 @@ export class AgentSession {
 				isStale: entry =>
 					entry.epoch !== this.#asyncDeliveryEpoch ||
 					manager.isDeliverySuppressed(entry.jobId) ||
+					(entry.originTurnId !== undefined && !this.#automaticTurns.isTurnOpen(entry.originTurnId)) ||
 					(entry.job !== undefined && this.#queuedAsyncResults.get(entry.jobId) !== entry),
 				onStale: entry => {
 					if (this.#queuedAsyncResults.get(entry.jobId) !== entry) return;
 					if (entry.epoch !== this.#asyncDeliveryEpoch) {
 						this.#queuedAsyncResults.delete(entry.jobId);
+					} else if (
+						entry.originTurnId !== undefined &&
+						!manager.isDeliverySuppressed(entry.jobId) &&
+						!this.#automaticTurns.isTurnOpen(entry.originTurnId)
+					) {
+						this.#schedulePostPromptTask(() => this.#persistPassiveAsyncResult(entry));
 					}
 				},
 				onDiscard: entries => {
@@ -1578,6 +1582,8 @@ export class AgentSession {
 			},
 			emit: event => {
 				if (event.type === "goal_updated") {
+					// A persisted pause closes the current origin so late async results remain passive.
+					if (event.state?.goal.status === "paused") this.#closeCurrentTurn();
 					return this.#emitSessionEvent({ type: "goal_updated", goal: event.goal, state: event.state });
 				}
 			},
@@ -3274,9 +3280,6 @@ export class AgentSession {
 		// toolUse) assistant message and skipping settle-only work.
 		if (event.type === "message_end" && event.message.role === "assistant") {
 			this.#lastAssistantMessage = event.message;
-			if (!event.message.content.some(part => part.type === "toolCall")) {
-				this.#capabilities?.endTurn(this.#currentTurnId);
-			}
 		}
 		// Plan-mode internal transition: stamp `SILENT_ABORT_MARKER` on the
 		// persisted message BEFORE the obfuscator's display-side copy below.
@@ -3557,7 +3560,6 @@ export class AgentSession {
 		// Check auto-retry and auto-compaction after agent completes
 		if (event.type === "agent_end") {
 			const settledTurnId = this.#currentTurnId;
-			this.#capabilities?.endTurn(this.#currentTurnId);
 			const settledMessages = event.messages;
 			const activeMessages = this.agent.state.messages;
 			// TTSR retry work runs concurrently and clears the live flag before
@@ -3972,13 +3974,7 @@ export class AgentSession {
 		}
 		this.#armAutomaticTurnStart(options.authority, options.originTurnId);
 		try {
-			if (this.#capabilities) {
-				await this.#capabilities.withContinuationAuthority(options.authority, options.originTurnId, () =>
-					this.agent.prompt(messages),
-				);
-			} else {
-				await this.agent.prompt(messages);
-			}
+			await this.agent.prompt(messages);
 		} catch (error) {
 			this.#recordAutomaticTurnFailed(options.authority, error, options.originTurnId);
 			throw error;
@@ -4113,7 +4109,6 @@ export class AgentSession {
 						directTurnId = this.#automaticTurns.openTurn();
 						this.#currentTurnId = directTurnId;
 						if (!directUserOwner) throw new Error("Direct-user continuation owner missing after isolation");
-						this.#capabilities?.beginDirectUserTurn(directTurnId, queueChipText(directUserOwner));
 					}
 					continuationTurnId = directTurnId ?? options.originTurnId ?? this.#currentTurnId;
 					this.#beginInFlight();
@@ -4142,13 +4137,7 @@ export class AgentSession {
 						}
 					}
 					this.#armAutomaticTurnStart(options.authority, continuationTurnId);
-					if (this.#capabilities) {
-						await this.#capabilities.withContinuationAuthority(options.authority, continuationTurnId, () =>
-							this.agent.continue(signal),
-						);
-					} else {
-						await this.agent.continue(signal);
-					}
+					await this.agent.continue(signal);
 					await this.#drainInFlightEventHandlers();
 				} catch (error) {
 					this.#recordAutomaticTurnFailed(options.authority, error, continuationTurnId);
@@ -4287,7 +4276,6 @@ export class AgentSession {
 
 	#closeTurn(turnId: string | undefined): void {
 		if (!turnId) return;
-		this.#capabilities?.endTurn(turnId);
 		this.#automaticTurns.closeTurn(turnId);
 		if (this.#currentTurnId === turnId) this.#currentTurnId = undefined;
 		if ([...this.#queuedAsyncResults.values()].some(entry => entry.originTurnId === turnId)) {
@@ -6630,12 +6618,6 @@ export class AgentSession {
 		this.#closeCurrentTurn();
 		const turnId = this.#automaticTurns.openTurn();
 		this.#currentTurnId = turnId;
-		if (
-			message.role === "user" &&
-			(!("attribution" in message) || message.attribution === undefined || message.attribution === "user")
-		) {
-			this.#capabilities?.beginDirectUserTurn(turnId, expandedText);
-		}
 		this.#beginInFlight();
 		const generation = this.#promptGeneration;
 		let restorePromptMessages: (() => void) | undefined;
@@ -6890,16 +6872,7 @@ export class AgentSession {
 				promptMessagesCommitted = true;
 				if (automaticTurn) this.#armAutomaticTurnStart(automaticTurn.source, automaticTurn.originTurnId);
 				try {
-					const dispatch = () => this.#recovery.promptAgentWithIdleRetry(messages, agentPromptOptions);
-					if (automaticTurn && this.#capabilities) {
-						await this.#capabilities.withContinuationAuthority(
-							automaticTurn.source,
-							automaticTurn.originTurnId,
-							dispatch,
-						);
-					} else {
-						await dispatch();
-					}
+					await this.#recovery.promptAgentWithIdleRetry(messages, agentPromptOptions);
 				} catch (error) {
 					if (automaticTurn) {
 						this.#recordAutomaticTurnFailed(automaticTurn.source, error, automaticTurn.originTurnId);
@@ -6908,9 +6881,6 @@ export class AgentSession {
 				}
 			} finally {
 				this.#stats.setPendingSnapshot(undefined);
-				// Direct-user grant authority ends with this provider turn. The
-				// automatic origin stays open through recovery for owned async results.
-				this.#capabilities?.endTurn(turnId);
 			}
 			if (!options?.skipPostPromptRecoveryWait) {
 				await this.#waitForPostPromptRecovery(generation);

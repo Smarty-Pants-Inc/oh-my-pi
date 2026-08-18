@@ -38,6 +38,7 @@ function createToolSession(overrides: Partial<ToolSession>): ToolSession {
 
 function createRuntimeHarness(initialState?: GoalModeState) {
 	let state = cloneState(initialState);
+	const persists: Array<{ mode: "goal" | "goal_paused" | "none"; state?: GoalModeState }> = [];
 	const runtime = new GoalRuntime({
 		getState: () => cloneState(state),
 		setState: next => {
@@ -45,13 +46,16 @@ function createRuntimeHarness(initialState?: GoalModeState) {
 		},
 		getCurrentUsage: () => createUsage(),
 		emit: async () => {},
-		persist: (_mode, _state) => {},
+		persist: (mode, next) => {
+			persists.push({ mode, state: cloneState(next) });
+		},
 		sendHiddenMessage: async _message => {},
 		now: () => 0,
 	});
 	return {
 		runtime,
 		getState: () => cloneState(state),
+		getPersists: () => persists.map(entry => ({ ...entry, state: cloneState(entry.state) })),
 	};
 }
 
@@ -317,13 +321,62 @@ describe("GoalTool", () => {
 		expect(harness.getState()?.enabled).toBe(false);
 	});
 
-	it("exposes only get, create, complete, and block to the model", () => {
+	it("persists an explicit pause and resumes only through a separate operation", async () => {
+		const harness = createRuntimeHarness({
+			enabled: true,
+			mode: "active",
+			goal: createGoal(),
+		});
+		const tool = new GoalTool(
+			createToolSession({
+				getGoalRuntime: () => harness.runtime,
+				getGoalModeState: () => harness.getState(),
+			}),
+		);
+
+		const paused = await tool.execute("call-pause", { op: "pause" });
+		expect(paused.details?.goal?.status).toBe("paused");
+		expect(harness.getState()?.enabled).toBe(false);
+		expect(harness.getPersists().at(-1)).toMatchObject({
+			mode: "goal_paused",
+			state: { enabled: false, goal: { status: "paused" } },
+		});
+
+		const resumed = await tool.execute("call-resume", { op: "resume" });
+		expect(resumed.details?.goal?.status).toBe("active");
+		expect(harness.getState()?.enabled).toBe(true);
+		expect(harness.getPersists().at(-1)).toMatchObject({
+			mode: "goal",
+			state: { enabled: true, goal: { status: "active" } },
+		});
+	});
+
+	it("does not let the model resume owner-stopped goals", async () => {
+		for (const status of ["blocked", "budget_limited", "usage_limited"] as const) {
+			const harness = createRuntimeHarness({
+				enabled: false,
+				mode: "active",
+				goal: createGoal({ status }),
+			});
+			const tool = new GoalTool(
+				createToolSession({
+					getGoalRuntime: () => harness.runtime,
+					getGoalModeState: () => harness.getState(),
+				}),
+			);
+
+			await expect(tool.execute("call-resume", { op: "resume" })).rejects.toThrow("Goal is not paused.");
+			expect(harness.getState()).toMatchObject({ enabled: false, goal: { status } });
+		}
+	});
+
+	it("exposes explicit pause and resume alongside the existing model operations", () => {
 		const tool = new GoalTool(createToolSession({}));
 
-		for (const op of ["get", "create", "complete", "block"]) {
+		for (const op of ["get", "create", "complete", "block", "pause", "resume"]) {
 			expect(tool.parameters.allows({ op })).toBe(true);
 		}
-		for (const op of ["pause", "resume", "edit", "replace", "budget", "drop", "clear"]) {
+		for (const op of ["edit", "replace", "budget", "drop", "clear"]) {
 			expect(tool.parameters.allows({ op })).toBe(false);
 		}
 	});
@@ -336,7 +389,9 @@ describe("GoalTool", () => {
 - \`create\`: start a goal only when the user or system clearly requested persistent goal mode and no unfinished goal exists. Ordinary clear user prose is sufficient; do not parse prose into authorization rules.
 - \`complete\`: use only when the full objective is achieved and the required current evidence supports that claim.
 - \`block\`: use when meaningful progress requires user input, unavailable access, or external-state change, or after two evidence-valid failures of the same route with no materially different safe route.
+- \`pause\`: use only when the direct user explicitly asks to pause or stop the current mission. Persist the paused state, stop autonomous work, and do not resume it on your own.
+- \`resume\`: use only when the direct user explicitly asks to resume the paused mission.
 
-Do not infer a goal from an ordinary task. Do not use completion or blocking to escape difficult work. Pause, resume, edit, replace, budget, drop, and clear are typed owner/system operations. The two-failure rule is concise model guidance backed by tests; do not build a natural-language route-failure classifier.`);
+Do not infer a goal from an ordinary task. Do not infer pause or resume from indirect wording. Do not use completion or blocking to escape difficult work. Edit, replace, budget, drop, and clear remain typed owner/system operations. The two-failure rule is concise model guidance backed by tests; do not build a natural-language route-failure classifier.`);
 	});
 });

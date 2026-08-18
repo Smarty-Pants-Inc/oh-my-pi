@@ -202,14 +202,10 @@ export function exportRenderedToolContracts(
 }
 
 async function manifestSession() {
-	const [{ Settings }, { SessionCapabilities }] = await Promise.all([
-		import("../config/settings"),
-		import("../capability/session-capabilities"),
-	]);
+	const { Settings } = await import("../config/settings");
 	return {
 		cwd: "/workspace",
 		hasUI: true,
-		capabilities: new SessionCapabilities({ workspace: "/workspace" }),
 		settings: Settings.isolated({
 			"tools.xdev": false,
 			"task.isolation.mode": "auto",

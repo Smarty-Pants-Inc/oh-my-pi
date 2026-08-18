@@ -233,17 +233,20 @@ For the bash tool specifically:
 - Never use `tsc`/`npx tsc` — always `bun check`.
 - Merge commits (maintainer merges of PRs) follow: `Merge PR #<number>: <conventional PR subject> (@<author>)` — e.g. `Merge PR #6386: feat(catalog): add native Meta Model API provider (@eggpeat)`.
 
-## Smarty App Managed Fork
+## Smarty-managed fork
 
-When this checkout is managed from Smarty App's `omp-fork-agent-goals` lane,
-export OMP changes as patches under Smarty App's
-`docs/smarty/omp-fork-agent-goals/patches/`, then let
-`config/scripts/omp-fork-manager.mjs` clone, sync, apply, build, and link them.
-The manager keeps `origin` and `upstream` push URLs disabled to prevent
-accidental pushes and installs only a reversible host shim ahead of Homebrew.
-When Paul asks for an OMP update, the update lands end to end: push the
-verified revision to fork `main` with an explicit URL and a lease pinned to
-the last verified fork SHA, then deploy dev1. Never push to `upstream`.
+`smarty-dev` is the sole OMP promotion authority. The old Smarty App patch
+replay and `omp-fork-manager.mjs` routes are archival; do not use them.
+
+Land OMP changes through the current fetched `smarty-dev/bin/smarty-review`
+and `smarty-dev/bin/smarty-land` transactions. Never merge, queue, requeue, or
+push protected branches directly. After the exact OMP commit lands, land a
+Smarty Dev parent update that pins the matching `repos/omp` gitlink and
+`integrations/omp/release.json`. Build, install, select, verify, and roll back
+only through that landed parent's `bin/omp-fork` and `bin/smarty-dev-sync`
+commands.
+
+A direct user request to land or activate authorizes that routine transaction. Keep hashes, receipts, policy records, and exact-tree proofs as internal evidence. Ask again only when purpose or scope materially changes, or when a real external blocker requires user input. Do not turn normal landing into a user-facing approval ceremony.
 
 Agent-started goals are intentional fork behavior: `goal` must be available
 when `goal.enabled` is true and the session has a `GoalRuntime`, even before the

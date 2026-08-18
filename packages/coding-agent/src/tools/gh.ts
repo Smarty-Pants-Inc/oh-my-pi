@@ -183,15 +183,6 @@ export class GithubTool implements AgentTool<typeof githubSchema, GhToolDetails>
 		_context?: AgentToolContext,
 	): Promise<AgentToolResult<GhToolDetails>> {
 		return untilAborted(signal, async () => {
-			const capability = params.op === "pr_create" ? "github.pr" : params.op === "pr_push" ? "git.push" : undefined;
-			if (capability) {
-				const decision = this.session.capabilities?.decideExternalEffect(capability);
-				if (decision?.outcome === "request") {
-					throw new ToolError(
-						`GitHub operation '${params.op}' requires explicit session capability '${capability}'. Use the discoverable capability_grant tool when the current direct-user turn authorizes it.`,
-					);
-				}
-			}
 			switch (params.op) {
 				case "repo_view":
 					return executeRepoView(this.session, params, signal);

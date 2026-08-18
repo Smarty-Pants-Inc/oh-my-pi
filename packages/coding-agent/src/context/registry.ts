@@ -73,12 +73,6 @@ export interface AgentBehavior {
 		boundedTransportRetry: true;
 	};
 	roles: { internalInstructionMayUseUserRole: false };
-	toolExecution: {
-		approvalMode: "always-ask" | "write" | "yolo";
-		workspaceWrites: "allow";
-		outsideWorkspaceWrites: "explicit_capability";
-		externalEffects: "explicit_capability";
-	};
 }
 
 export interface RegisteredContextComponent {
@@ -151,7 +145,6 @@ export function parseAgentBehavior(source = behaviorSource): AgentBehavior {
 		"task",
 		"subagent",
 		"roles",
-		"toolExecution",
 	]);
 	if (root.version !== 1) throw new Error("agent behavior version must be 1");
 
@@ -191,12 +184,6 @@ export function parseAgentBehavior(source = behaviorSource): AgentBehavior {
 		"boundedTransportRetry",
 	]);
 	const roles = requireRecord(root.roles, "roles", ["internalInstructionMayUseUserRole"]);
-	const toolExecution = requireRecord(root.toolExecution, "toolExecution", [
-		"approvalMode",
-		"workspaceWrites",
-		"outsideWorkspaceWrites",
-		"externalEffects",
-	]);
 
 	const stopReminders = requireBoolean(todo.stopReminders, "todo.stopReminders");
 	const midRunNudges = requireBoolean(todo.midRunNudges, "todo.midRunNudges");
@@ -247,22 +234,6 @@ export function parseAgentBehavior(source = behaviorSource): AgentBehavior {
 				roles.internalInstructionMayUseUserRole,
 				"roles.internalInstructionMayUseUserRole",
 			),
-		},
-		toolExecution: {
-			approvalMode: requireLiteral(toolExecution.approvalMode, "toolExecution.approvalMode", [
-				"always-ask",
-				"write",
-				"yolo",
-			]),
-			workspaceWrites: requireLiteral(toolExecution.workspaceWrites, "toolExecution.workspaceWrites", ["allow"]),
-			outsideWorkspaceWrites: requireLiteral(
-				toolExecution.outsideWorkspaceWrites,
-				"toolExecution.outsideWorkspaceWrites",
-				["explicit_capability"],
-			),
-			externalEffects: requireLiteral(toolExecution.externalEffects, "toolExecution.externalEffects", [
-				"explicit_capability",
-			]),
 		},
 	};
 }

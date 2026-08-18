@@ -1566,14 +1566,6 @@ prompts:
     visibility: model
     defaultEnabled: true
     order: 2020
-  - id: tool.capability-grant
-    path: prompts/tools/capability-grant.md
-    role: system
-    target: [main, subagent]
-    trigger: tool_available
-    visibility: model
-    defaultEnabled: true
-    order: 2030
   - id: tool.checkpoint
     path: prompts/tools/checkpoint.md
     role: system

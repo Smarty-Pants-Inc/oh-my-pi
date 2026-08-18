@@ -296,32 +296,6 @@
       }
     },
     {
-      "id": "tool.capability_grant",
-      "description": "Grant an exact path or named external effect authorized by the current direct-user turn. Automatic turns cannot grant authority.",
-      "schema": {
-        "type": "object",
-        "properties": {
-          "kind": {
-            "enum": [
-              "writePath",
-              "externalCapability"
-            ],
-            "type": "string"
-          },
-          "value": {
-            "type": "string",
-            "minLength": 1,
-            "description": "exact path or exact named external capability"
-          }
-        },
-        "required": [
-          "kind",
-          "value"
-        ],
-        "additionalProperties": false
-      }
-    },
-    {
       "id": "tool.checkpoint",
       "description": "Context checkpoint: before exploratory work; later `rewind`, retaining only concise report.\n\nUse for investigations with many intermediate tool calls (`read`/`grep`/`glob`/`lsp`/etc.) to minimize subsequent context cost.\n\nRules:\n- MUST `rewind` before yielding after starting a checkpoint.\n- NEVER `checkpoint` while another checkpoint active.\n- Subagents: disabled by default. Enable: agent-definition `tools:` frontmatter lists `checkpoint` or `rewind`; sister tool auto-included; requires `checkpoint.enabled` setting.\n\nTypical flow:\n1. `checkpoint(goal: …)`\n2. Exploratory work\n3. `rewind(report: …)` with concise findings\n\nAfter `rewind`: intermediate checkpoint messages removed from active context; replaced by report.",
       "schema": {
@@ -875,7 +849,7 @@
     },
     {
       "id": "tool.goal",
-      "description": "The goal is persistent mission state.\n\n- `get`: read the current goal and accounting.\n- `create`: start a goal only when the user or system clearly requested persistent goal mode and no unfinished goal exists. Ordinary clear user prose is sufficient; do not parse prose into authorization rules.\n- `complete`: use only when the full objective is achieved and the required current evidence supports that claim.\n- `block`: use when meaningful progress requires user input, unavailable access, or external-state change, or after two evidence-valid failures of the same route with no materially different safe route.\n\nDo not infer a goal from an ordinary task. Do not use completion or blocking to escape difficult work. Pause, resume, edit, replace, budget, drop, and clear are typed owner/system operations. The two-failure rule is concise model guidance backed by tests; do not build a natural-language route-failure classifier.",
+      "description": "The goal is persistent mission state.\n\n- `get`: read the current goal and accounting.\n- `create`: start a goal only when the user or system clearly requested persistent goal mode and no unfinished goal exists. Ordinary clear user prose is sufficient; do not parse prose into authorization rules.\n- `complete`: use only when the full objective is achieved and the required current evidence supports that claim.\n- `block`: use when meaningful progress requires user input, unavailable access, or external-state change, or after two evidence-valid failures of the same route with no materially different safe route.\n- `pause`: use only when the direct user explicitly asks to pause or stop the current mission. Persist the paused state, stop autonomous work, and do not resume it on your own.\n- `resume`: use only when the direct user explicitly asks to resume the paused mission.\n\nDo not infer a goal from an ordinary task. Do not infer pause or resume from indirect wording. Do not use completion or blocking to escape difficult work. Edit, replace, budget, drop, and clear remain typed owner/system operations. The two-failure rule is concise model guidance backed by tests; do not build a natural-language route-failure classifier.",
       "schema": {
         "type": "object",
         "properties": {
@@ -884,7 +858,9 @@
               "create",
               "get",
               "complete",
-              "block"
+              "block",
+              "pause",
+              "resume"
             ],
             "type": "string",
             "description": "goal operation"
@@ -2054,5 +2030,5 @@
       }
     }
   ],
-  "rootSha256": "2e9ad063073be6c25fa1a9aa2e15642ac7c494e548732d3c986711c10735eb6a"
+  "rootSha256": "1accffad815f62df405bb1ab6ee1db3a1c1ffa042e77ddcae69a77d534a6f4cc"
 }
