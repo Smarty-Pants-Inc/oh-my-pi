@@ -215,6 +215,7 @@ describe("AgentSession concurrent disposal", () => {
 				shutdown();
 				return new Set<string>();
 			}),
+			disposeFileFallbacks: vi.fn(),
 			clearManagedTimers: vi.fn(),
 		} as unknown as ExtensionRunner;
 		const current = createSession(undefined, { extensionRunner });
