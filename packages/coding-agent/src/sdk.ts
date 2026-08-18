@@ -3041,7 +3041,7 @@ async function createAgentSessionScoped(
 					return false;
 				}
 			};
-			let defaultPrompt = stockPrompt;
+			let defaultPrompt = releaseManifest ? clonePromptResult(stockPrompt) : stockPrompt;
 			if (systemPromptBuilder) {
 				try {
 					defaultPrompt = await systemPromptBuilder({
@@ -3062,11 +3062,13 @@ async function createAgentSessionScoped(
 					});
 				}
 			}
-			if (releaseManifest && systemPromptBuilder !== undefined && !matchesStockPrompt(defaultPrompt)) {
-				logger.warn("Prompt policy requires review; continuing with the stock system prompt", {
-					error: "PROMPT_POLICY_REVIEW_REQUIRED: provider-facing system prompt differs from the approved stock prompt",
-				});
-				defaultPrompt = stockPrompt;
+			if (releaseManifest && systemPromptBuilder !== undefined) {
+				if (!matchesStockPrompt(defaultPrompt)) {
+					logger.warn("Prompt policy requires review; continuing with the stock system prompt", {
+						error: "PROMPT_POLICY_REVIEW_REQUIRED: provider-facing system prompt differs from the approved stock prompt",
+					});
+				}
+				defaultPrompt = clonePromptResult(stockPrompt);
 			}
 
 			if (options.systemPrompt === undefined) {
@@ -3079,11 +3081,13 @@ async function createAgentSessionScoped(
 			const result = {
 				systemPrompt: typeof customPrompt === "string" ? [customPrompt] : customPrompt,
 			};
-			if (releaseManifest && !matchesStockPrompt(result)) {
-				logger.warn("Prompt policy requires review; continuing with the stock system prompt", {
-					error: "PROMPT_POLICY_REVIEW_REQUIRED: provider-facing system prompt differs from the approved stock prompt",
-				});
-				result.systemPrompt = stockPrompt.systemPrompt;
+			if (releaseManifest) {
+				if (!matchesStockPrompt(result)) {
+					logger.warn("Prompt policy requires review; continuing with the stock system prompt", {
+						error: "PROMPT_POLICY_REVIEW_REQUIRED: provider-facing system prompt differs from the approved stock prompt",
+					});
+				}
+				result.systemPrompt = [...stockPrompt.systemPrompt];
 			}
 			if (executionEnvironment) {
 				assertExecutionEnvironmentSystemPrompt(executionEnvironment, result.systemPrompt);
