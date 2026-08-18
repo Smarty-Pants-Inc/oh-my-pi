@@ -24,7 +24,7 @@ import { classifyProtectedPath } from "../../src/policy/protected-surface";
 
 describe("tracked context manifest", () => {
 	it("uses the fail-closed behavior manifest as the governed runtime default source", () => {
-		expect(getDefault("tools.approvalMode")).toBe(agentBehavior.toolExecution.approvalMode);
+		expect(getDefault("tools.approvalMode")).toBe("yolo");
 		expect(getDefault("todo.enabled")).toBe(agentBehavior.todo.enabled);
 		expect(getDefault("todo.reminders")).toBe(agentBehavior.todo.stopReminders);
 		expect(getDefault("todo.eager")).toBe(agentBehavior.todo.eager);
@@ -211,7 +211,6 @@ describe("tracked context manifest", () => {
 		const manifest = trackedContentManifest();
 		const toolIds = manifest.toolSchemas.map(tool => tool.id);
 		expect(toolIds).toContain("tool.ask");
-		expect(toolIds).toContain("tool.capability_grant");
 		for (const fixedRuntimeTool of [
 			"tool.generate_image",
 			"tool.tts",

@@ -120,10 +120,4 @@ describe("issue #5764: registerTool loadMode default", () => {
 			expect(tool.loadMode, `${name} must declare loadMode "essential"`).toBe("essential");
 		}
 	});
-
-	it("keeps capability grants available through discovery without permanent schema cost", async () => {
-		const tool = await BUILTIN_TOOLS.capability_grant({ ...makeSession(), capabilities: {} as never });
-		expect(tool?.loadMode).toBe("discoverable");
-		expect(ESSENTIAL_BUILTIN_TOOL_NAMES).not.toHaveProperty("capability_grant");
-	});
 });

@@ -193,48 +193,47 @@ import source189 from "../prompts/tools/ast-grep.md" with { type: "text" };
 import source190 from "../prompts/tools/async-result.md" with { type: "text" };
 import source191 from "../prompts/tools/bash.md" with { type: "text" };
 import source192 from "../prompts/tools/browser.md" with { type: "text" };
-import source193 from "../prompts/tools/capability-grant.md" with { type: "text" };
-import source194 from "../prompts/tools/checkpoint.md" with { type: "text" };
-import source195 from "../prompts/tools/computer.md" with { type: "text" };
-import source196 from "../prompts/tools/debug.md" with { type: "text" };
-import source197 from "../prompts/tools/eval.md" with { type: "text" };
-import source198 from "../prompts/tools/github.md" with { type: "text" };
-import source199 from "../prompts/tools/glob.md" with { type: "text" };
-import source200 from "../prompts/tools/goal.md" with { type: "text" };
-import source201 from "../prompts/tools/grep.md" with { type: "text" };
-import source202 from "../prompts/tools/hub.md" with { type: "text" };
-import source203 from "../prompts/tools/image-attachment-describe-system.md" with { type: "text" };
-import source204 from "../prompts/tools/image-attachment-describe.md" with { type: "text" };
-import source205 from "../prompts/tools/image-gen.md" with { type: "text" };
-import source206 from "../prompts/tools/inspect-image-system.md" with { type: "text" };
-import source207 from "../prompts/tools/inspect-image.md" with { type: "text" };
-import source208 from "../prompts/tools/learn.md" with { type: "text" };
-import source209 from "../prompts/tools/lsp-late-diagnostic.md" with { type: "text" };
-import source210 from "../prompts/tools/lsp.md" with { type: "text" };
-import source211 from "../prompts/tools/manage-skill.md" with { type: "text" };
-import source212 from "../prompts/tools/memory-edit.md" with { type: "text" };
-import source213 from "../prompts/tools/patch.md" with { type: "text" };
-import source214 from "../prompts/tools/read.md" with { type: "text" };
-import source215 from "../prompts/tools/recall.md" with { type: "text" };
-import source216 from "../prompts/tools/reflect.md" with { type: "text" };
-import source217 from "../prompts/tools/replace.md" with { type: "text" };
-import source218 from "../prompts/tools/retain.md" with { type: "text" };
-import source219 from "../prompts/tools/rewind.md" with { type: "text" };
-import source220 from "../prompts/tools/rewrite.md" with { type: "text" };
-import source221 from "../prompts/tools/security-publish.md" with { type: "text" };
-import source222 from "../prompts/tools/security-scan.md" with { type: "text" };
-import source223 from "../prompts/tools/task-async-contract.md" with { type: "text" };
-import source224 from "../prompts/tools/task-summary.md" with { type: "text" };
-import source225 from "../prompts/tools/task.md" with { type: "text" };
-import source226 from "../prompts/tools/todo.md" with { type: "text" };
-import source227 from "../prompts/tools/vibe-kill.md" with { type: "text" };
-import source228 from "../prompts/tools/vibe-list.md" with { type: "text" };
-import source229 from "../prompts/tools/vibe-send.md" with { type: "text" };
-import source230 from "../prompts/tools/vibe-spawn.md" with { type: "text" };
-import source231 from "../prompts/tools/vibe-turn-result.md" with { type: "text" };
-import source232 from "../prompts/tools/vibe-wait.md" with { type: "text" };
-import source233 from "../prompts/tools/web-search.md" with { type: "text" };
-import source234 from "../prompts/tools/write.md" with { type: "text" };
+import source193 from "../prompts/tools/checkpoint.md" with { type: "text" };
+import source194 from "../prompts/tools/computer.md" with { type: "text" };
+import source195 from "../prompts/tools/debug.md" with { type: "text" };
+import source196 from "../prompts/tools/eval.md" with { type: "text" };
+import source197 from "../prompts/tools/github.md" with { type: "text" };
+import source198 from "../prompts/tools/glob.md" with { type: "text" };
+import source199 from "../prompts/tools/goal.md" with { type: "text" };
+import source200 from "../prompts/tools/grep.md" with { type: "text" };
+import source201 from "../prompts/tools/hub.md" with { type: "text" };
+import source202 from "../prompts/tools/image-attachment-describe-system.md" with { type: "text" };
+import source203 from "../prompts/tools/image-attachment-describe.md" with { type: "text" };
+import source204 from "../prompts/tools/image-gen.md" with { type: "text" };
+import source205 from "../prompts/tools/inspect-image-system.md" with { type: "text" };
+import source206 from "../prompts/tools/inspect-image.md" with { type: "text" };
+import source207 from "../prompts/tools/learn.md" with { type: "text" };
+import source208 from "../prompts/tools/lsp-late-diagnostic.md" with { type: "text" };
+import source209 from "../prompts/tools/lsp.md" with { type: "text" };
+import source210 from "../prompts/tools/manage-skill.md" with { type: "text" };
+import source211 from "../prompts/tools/memory-edit.md" with { type: "text" };
+import source212 from "../prompts/tools/patch.md" with { type: "text" };
+import source213 from "../prompts/tools/read.md" with { type: "text" };
+import source214 from "../prompts/tools/recall.md" with { type: "text" };
+import source215 from "../prompts/tools/reflect.md" with { type: "text" };
+import source216 from "../prompts/tools/replace.md" with { type: "text" };
+import source217 from "../prompts/tools/retain.md" with { type: "text" };
+import source218 from "../prompts/tools/rewind.md" with { type: "text" };
+import source219 from "../prompts/tools/rewrite.md" with { type: "text" };
+import source220 from "../prompts/tools/security-publish.md" with { type: "text" };
+import source221 from "../prompts/tools/security-scan.md" with { type: "text" };
+import source222 from "../prompts/tools/task-async-contract.md" with { type: "text" };
+import source223 from "../prompts/tools/task-summary.md" with { type: "text" };
+import source224 from "../prompts/tools/task.md" with { type: "text" };
+import source225 from "../prompts/tools/todo.md" with { type: "text" };
+import source226 from "../prompts/tools/vibe-kill.md" with { type: "text" };
+import source227 from "../prompts/tools/vibe-list.md" with { type: "text" };
+import source228 from "../prompts/tools/vibe-send.md" with { type: "text" };
+import source229 from "../prompts/tools/vibe-spawn.md" with { type: "text" };
+import source230 from "../prompts/tools/vibe-turn-result.md" with { type: "text" };
+import source231 from "../prompts/tools/vibe-wait.md" with { type: "text" };
+import source232 from "../prompts/tools/web-search.md" with { type: "text" };
+import source233 from "../prompts/tools/write.md" with { type: "text" };
 
 export const PROMPT_SOURCES: Readonly<Record<string, string>> = Object.freeze({
 	"_agent/compaction/prompts/auto-handoff-threshold-focus.md": source0,
@@ -430,46 +429,45 @@ export const PROMPT_SOURCES: Readonly<Record<string, string>> = Object.freeze({
 	"prompts/tools/async-result.md": source190,
 	"prompts/tools/bash.md": source191,
 	"prompts/tools/browser.md": source192,
-	"prompts/tools/capability-grant.md": source193,
-	"prompts/tools/checkpoint.md": source194,
-	"prompts/tools/computer.md": source195,
-	"prompts/tools/debug.md": source196,
-	"prompts/tools/eval.md": source197,
-	"prompts/tools/github.md": source198,
-	"prompts/tools/glob.md": source199,
-	"prompts/tools/goal.md": source200,
-	"prompts/tools/grep.md": source201,
-	"prompts/tools/hub.md": source202,
-	"prompts/tools/image-attachment-describe-system.md": source203,
-	"prompts/tools/image-attachment-describe.md": source204,
-	"prompts/tools/image-gen.md": source205,
-	"prompts/tools/inspect-image-system.md": source206,
-	"prompts/tools/inspect-image.md": source207,
-	"prompts/tools/learn.md": source208,
-	"prompts/tools/lsp-late-diagnostic.md": source209,
-	"prompts/tools/lsp.md": source210,
-	"prompts/tools/manage-skill.md": source211,
-	"prompts/tools/memory-edit.md": source212,
-	"prompts/tools/patch.md": source213,
-	"prompts/tools/read.md": source214,
-	"prompts/tools/recall.md": source215,
-	"prompts/tools/reflect.md": source216,
-	"prompts/tools/replace.md": source217,
-	"prompts/tools/retain.md": source218,
-	"prompts/tools/rewind.md": source219,
-	"prompts/tools/rewrite.md": source220,
-	"prompts/tools/security-publish.md": source221,
-	"prompts/tools/security-scan.md": source222,
-	"prompts/tools/task-async-contract.md": source223,
-	"prompts/tools/task-summary.md": source224,
-	"prompts/tools/task.md": source225,
-	"prompts/tools/todo.md": source226,
-	"prompts/tools/vibe-kill.md": source227,
-	"prompts/tools/vibe-list.md": source228,
-	"prompts/tools/vibe-send.md": source229,
-	"prompts/tools/vibe-spawn.md": source230,
-	"prompts/tools/vibe-turn-result.md": source231,
-	"prompts/tools/vibe-wait.md": source232,
-	"prompts/tools/web-search.md": source233,
-	"prompts/tools/write.md": source234,
+	"prompts/tools/checkpoint.md": source193,
+	"prompts/tools/computer.md": source194,
+	"prompts/tools/debug.md": source195,
+	"prompts/tools/eval.md": source196,
+	"prompts/tools/github.md": source197,
+	"prompts/tools/glob.md": source198,
+	"prompts/tools/goal.md": source199,
+	"prompts/tools/grep.md": source200,
+	"prompts/tools/hub.md": source201,
+	"prompts/tools/image-attachment-describe-system.md": source202,
+	"prompts/tools/image-attachment-describe.md": source203,
+	"prompts/tools/image-gen.md": source204,
+	"prompts/tools/inspect-image-system.md": source205,
+	"prompts/tools/inspect-image.md": source206,
+	"prompts/tools/learn.md": source207,
+	"prompts/tools/lsp-late-diagnostic.md": source208,
+	"prompts/tools/lsp.md": source209,
+	"prompts/tools/manage-skill.md": source210,
+	"prompts/tools/memory-edit.md": source211,
+	"prompts/tools/patch.md": source212,
+	"prompts/tools/read.md": source213,
+	"prompts/tools/recall.md": source214,
+	"prompts/tools/reflect.md": source215,
+	"prompts/tools/replace.md": source216,
+	"prompts/tools/retain.md": source217,
+	"prompts/tools/rewind.md": source218,
+	"prompts/tools/rewrite.md": source219,
+	"prompts/tools/security-publish.md": source220,
+	"prompts/tools/security-scan.md": source221,
+	"prompts/tools/task-async-contract.md": source222,
+	"prompts/tools/task-summary.md": source223,
+	"prompts/tools/task.md": source224,
+	"prompts/tools/todo.md": source225,
+	"prompts/tools/vibe-kill.md": source226,
+	"prompts/tools/vibe-list.md": source227,
+	"prompts/tools/vibe-send.md": source228,
+	"prompts/tools/vibe-spawn.md": source229,
+	"prompts/tools/vibe-turn-result.md": source230,
+	"prompts/tools/vibe-wait.md": source231,
+	"prompts/tools/web-search.md": source232,
+	"prompts/tools/write.md": source233,
 });
