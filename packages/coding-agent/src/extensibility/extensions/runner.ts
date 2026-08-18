@@ -1186,6 +1186,20 @@ export class ExtensionRunner {
 		return false;
 	}
 
+	#captureProtectedSnapshot(
+		ext: Extension,
+		event: string,
+		value: unknown,
+	): { snapshot: string | undefined; failed: boolean } {
+		if (!this.releaseManifest) return { snapshot: undefined, failed: false };
+		try {
+			return { snapshot: serializedProviderPayload(value), failed: false };
+		} catch (error) {
+			this.#reportPromptPolicyReview(ext, event, error);
+			return { snapshot: undefined, failed: true };
+		}
+	}
+
 	hasHandlers(eventType: string): boolean {
 		for (const ext of this.extensions) {
 			const handlers = ext.handlers.get(eventType);
@@ -1852,9 +1866,9 @@ export class ExtensionRunner {
 		for (const ext of this.extensions) {
 			for (const handler of ext.handlers.get("input") ?? []) {
 				if (!(await this.#canRunProtectedHandler(ext, "input"))) continue;
-				const approvedSnapshot = this.releaseManifest
-					? serializedProviderPayload({ text: currentText, images: currentImages })
-					: undefined;
+				const snapshot = this.#captureProtectedSnapshot(ext, "input", { text: currentText, images: currentImages });
+				if (snapshot.failed) continue;
+				const approvedSnapshot = snapshot.snapshot;
 				const protectedInput = approvedSnapshot
 					? (JSON.parse(approvedSnapshot) as { text: string; images: ImageContent[] | undefined })
 					: undefined;
@@ -1906,15 +1920,11 @@ export class ExtensionRunner {
 		if (!hasContextHandlers) return messages;
 
 		let currentMessages: AgentMessage[];
-		if (this.releaseManifest) {
-			currentMessages = JSON.parse(serializedProviderPayload(messages)) as AgentMessage[];
-		} else {
-			try {
-				currentMessages = structuredClone(messages);
-			} catch {
-				// Preserve legacy extension behavior for non-protected local sessions.
-				currentMessages = [...messages];
-			}
+		try {
+			currentMessages = structuredClone(messages);
+		} catch {
+			// Preserve legacy extension behavior for non-protected local sessions.
+			currentMessages = [...messages];
 		}
 
 		for (const ext of this.extensions) {
@@ -1923,7 +1933,9 @@ export class ExtensionRunner {
 
 			for (const handler of handlers) {
 				if (!(await this.#canRunProtectedHandler(ext, "context"))) continue;
-				const approvedSnapshot = this.releaseManifest ? serializedProviderPayload(currentMessages) : undefined;
+				const snapshot = this.#captureProtectedSnapshot(ext, "context", currentMessages);
+				if (snapshot.failed) continue;
+				const approvedSnapshot = snapshot.snapshot;
 				const event: ContextEvent = { type: "context", messages: currentMessages };
 				const handlerResult = await this.#runHandlerWithTimeout(
 					handler,
@@ -1964,7 +1976,9 @@ export class ExtensionRunner {
 
 			for (const handler of handlers) {
 				if (!(await this.#canRunProtectedHandler(ext, "before_provider_request"))) continue;
-				const approvedSnapshot = this.releaseManifest ? serializedProviderPayload(currentPayload) : undefined;
+				const snapshot = this.#captureProtectedSnapshot(ext, "before_provider_request", currentPayload);
+				if (snapshot.failed) continue;
+				const approvedSnapshot = snapshot.snapshot;
 				const eventPayload = approvedSnapshot ? JSON.parse(approvedSnapshot) : currentPayload;
 				const event: BeforeProviderRequestEvent = {
 					type: "before_provider_request",

@@ -7351,7 +7351,7 @@
     },
     {
       "path": "packages/coding-agent/src/extensibility/extensions/runner.ts",
-      "sha256": "c7557beabd632d8c8e1a8d2da121583af361ec33e236e60fe0e87361cbd8b947"
+      "sha256": "0f6cb3aa9c2ba25175d8d844bdd77b2e95430e4ceefbb6cee94ea109b1fcaee6"
     },
     {
       "path": "packages/coding-agent/src/extensibility/extensions/types.ts",
@@ -10675,5 +10675,5 @@
     }
   ],
   "behaviorSha256": "9b550f2362fc2d5d8ed15ae14109749e753cdcbb1f4f95c8b1354f12b4d498ea",
-  "rootSha256": "31406477eab05375541cfadaf23e5275926eddd97d901db482d94164fafa1311"
+  "rootSha256": "8869f58184422883a1e7051ae0a6a7311ad6e92d804f13e412e089eeeeb5c303"
 }
