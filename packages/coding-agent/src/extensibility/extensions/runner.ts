@@ -2025,7 +2025,7 @@ export class ExtensionRunner {
 				const event: BeforeAgentStartEvent = {
 					type: "before_agent_start",
 					prompt,
-					images: images ? [...images] : images,
+					images: images?.map(image => ({ ...image })),
 					systemPrompt: [...currentSystemPrompt],
 				};
 				const handlerResult = await this.#runHandlerWithTimeout(
