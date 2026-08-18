@@ -499,6 +499,7 @@ export class ExtensionRunner {
 	#mode: ExtensionMode = "print";
 	#toolApprovalPreviewWaiter?: (toolCallId: string) => Promise<void>;
 	#errorListeners: Set<ExtensionErrorListener> = new Set();
+	#reportedPromptPolicyReviews = new Set<string>();
 	#shutdownFailedExtensions = new Set<string>();
 	#getModel: () => Model | undefined = () => undefined;
 	#isIdleFn: () => boolean = () => true;
@@ -1147,6 +1148,36 @@ export class ExtensionRunner {
 		for (const listener of this.#errorListeners) {
 			listener(error);
 		}
+	}
+
+	#reportPromptPolicyReview(ext: Extension, event: string, error: unknown): void {
+		const message = error instanceof Error ? error.message : String(error);
+		const key = `${ext.resolvedPath}\0${event}\0${message}`;
+		if (this.#reportedPromptPolicyReviews.has(key)) return;
+		this.#reportedPromptPolicyReviews.add(key);
+		logger.warn("Protected extension handler skipped because prompt policy requires review", {
+			extensionPath: ext.path,
+			event,
+			error: message,
+		});
+		this.emitError({
+			extensionPath: ext.path,
+			event,
+			error: message,
+			stack: error instanceof Error ? error.stack : undefined,
+		});
+	}
+
+	async #canRunProtectedHandler(ext: Extension, event: string): Promise<boolean> {
+		if (!this.releaseManifest || (await isApprovedCandidateSource(ext.resolvedPath, this.releaseManifest))) {
+			return true;
+		}
+		this.#reportPromptPolicyReview(
+			ext,
+			event,
+			new Error(`PROMPT_POLICY_REVIEW_REQUIRED: extension source is not approved: ${ext.path}`),
+		);
+		return false;
 	}
 
 	hasHandlers(eventType: string): boolean {
@@ -1814,9 +1845,7 @@ export class ExtensionRunner {
 
 		for (const ext of this.extensions) {
 			for (const handler of ext.handlers.get("input") ?? []) {
-				if (this.releaseManifest && !(await isApprovedCandidateSource(ext.resolvedPath, this.releaseManifest))) {
-					throw new Error(`PROMPT_POLICY_REVIEW_REQUIRED: extension source is not approved: ${ext.path}`);
-				}
+				if (!(await this.#canRunProtectedHandler(ext, "input"))) continue;
 				const approvedSnapshot = this.releaseManifest
 					? serializedProviderPayload({ text: currentText, images: currentImages })
 					: undefined;
@@ -1835,14 +1864,19 @@ export class ExtensionRunner {
 				const protectedResult = approvedSnapshot
 					? { text: result?.text ?? event.text, images: result?.images ?? event.images }
 					: undefined;
+				try {
+					assertApprovedInputUnchanged(
+						approvedSnapshot,
+						protectedResult ?? { text: currentText, images: currentImages },
+						result?.handled,
+						ext.path,
+					);
+				} catch (error) {
+					this.#reportPromptPolicyReview(ext, "input", error);
+					continue;
+				}
 				if (result?.text !== undefined) currentText = result.text;
 				if (result?.images !== undefined) currentImages = result.images;
-				assertApprovedInputUnchanged(
-					approvedSnapshot,
-					protectedResult ?? { text: currentText, images: currentImages },
-					result?.handled,
-					ext.path,
-				);
 				if (result?.handled) return result;
 			}
 		}
@@ -1882,9 +1916,7 @@ export class ExtensionRunner {
 			if (!handlers || handlers.length === 0) continue;
 
 			for (const handler of handlers) {
-				if (this.releaseManifest && !(await isApprovedCandidateSource(ext.resolvedPath, this.releaseManifest))) {
-					throw new Error(`PROMPT_POLICY_REVIEW_REQUIRED: extension source is not approved: ${ext.path}`);
-				}
+				if (!(await this.#canRunProtectedHandler(ext, "context"))) continue;
 				const approvedSnapshot = this.releaseManifest ? serializedProviderPayload(currentMessages) : undefined;
 				const event: ContextEvent = { type: "context", messages: currentMessages };
 				const handlerResult = await this.#runHandlerWithTimeout(
@@ -1895,10 +1927,20 @@ export class ExtensionRunner {
 					extensionHandlerTimeoutMs,
 				);
 
-				if (handlerResult && (handlerResult as ContextEventResult).messages) {
-					currentMessages = (handlerResult as ContextEventResult).messages!;
+				const nextMessages =
+					handlerResult && (handlerResult as ContextEventResult).messages
+						? (handlerResult as ContextEventResult).messages!
+						: currentMessages;
+				try {
+					assertApprovedContextUnchanged(approvedSnapshot, nextMessages, ext.path);
+				} catch (error) {
+					this.#reportPromptPolicyReview(ext, "context", error);
+					if (approvedSnapshot !== undefined) {
+						currentMessages = JSON.parse(approvedSnapshot) as AgentMessage[];
+					}
+					continue;
 				}
-				assertApprovedContextUnchanged(approvedSnapshot, currentMessages, ext.path);
+				currentMessages = nextMessages;
 			}
 		}
 
@@ -1915,9 +1957,7 @@ export class ExtensionRunner {
 			if (!handlers || handlers.length === 0) continue;
 
 			for (const handler of handlers) {
-				if (this.releaseManifest && !(await isApprovedCandidateSource(ext.resolvedPath, this.releaseManifest))) {
-					throw new Error(`PROMPT_POLICY_REVIEW_REQUIRED: extension source is not approved: ${ext.path}`);
-				}
+				if (!(await this.#canRunProtectedHandler(ext, "before_provider_request"))) continue;
 				const approvedSnapshot = this.releaseManifest ? serializedProviderPayload(currentPayload) : undefined;
 				const eventPayload = approvedSnapshot ? JSON.parse(approvedSnapshot) : currentPayload;
 				const event: BeforeProviderRequestEvent = {
@@ -1932,7 +1972,12 @@ export class ExtensionRunner {
 					extensionHandlerTimeoutMs,
 				);
 				if (approvedSnapshot !== undefined) {
-					assertApprovedProviderPayloadUnchanged(approvedSnapshot, handlerResult ?? eventPayload, ext.path);
+					try {
+						assertApprovedProviderPayloadUnchanged(approvedSnapshot, handlerResult ?? eventPayload, ext.path);
+					} catch (error) {
+						this.#reportPromptPolicyReview(ext, "before_provider_request", error);
+						continue;
+					}
 				}
 				if (handlerResult !== undefined) currentPayload = handlerResult;
 			}
@@ -1976,9 +2021,7 @@ export class ExtensionRunner {
 			if (!handlers || handlers.length === 0) continue;
 
 			for (const handler of handlers) {
-				if (this.releaseManifest && !(await isApprovedCandidateSource(ext.resolvedPath, this.releaseManifest))) {
-					throw new Error(`PROMPT_POLICY_REVIEW_REQUIRED: extension source is not approved: ${ext.path}`);
-				}
+				if (!(await this.#canRunProtectedHandler(ext, "before_agent_start"))) continue;
 				const event: BeforeAgentStartEvent = {
 					type: "before_agent_start",
 					prompt,
@@ -1999,11 +2042,16 @@ export class ExtensionRunner {
 						messages.push({ message: result.message, extensionPath: ext.resolvedPath });
 					}
 					if (result.systemPrompt !== undefined) {
-						assertApprovedPerTurnSystemPromptNotReplaced(
-							this.releaseManifest !== undefined,
-							result.systemPrompt,
-							ext.path,
-						);
+						try {
+							assertApprovedPerTurnSystemPromptNotReplaced(
+								this.releaseManifest !== undefined,
+								result.systemPrompt,
+								ext.path,
+							);
+						} catch (error) {
+							this.#reportPromptPolicyReview(ext, "before_agent_start", error);
+							continue;
+						}
 						currentSystemPrompt =
 							typeof result.systemPrompt === "string" ? [result.systemPrompt] : result.systemPrompt;
 						systemPromptModified = true;

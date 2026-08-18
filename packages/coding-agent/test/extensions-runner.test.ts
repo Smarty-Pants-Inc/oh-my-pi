@@ -12,6 +12,7 @@ import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { ContextReleaseManifest } from "@oh-my-pi/pi-coding-agent/context/manifest";
 import { ExtensionRuntime, loadExtensions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import {
 	EXTENSION_HANDLER_TIMEOUT_MS,
@@ -93,6 +94,38 @@ describe("ExtensionRunner", () => {
 			errors: result.errors.filter(error => isTestScoped(error.path)),
 		};
 	};
+
+	it("reports an unapproved prompt extension without blocking the turn", async () => {
+		fs.writeFileSync(
+			path.join(extensionsDir, "unapproved-prompt.ts"),
+			`export default function(pi) {
+				pi.on("before_agent_start", () => ({ systemPrompt: ["replacement"] }));
+			}`,
+		);
+		const result = await loadTestExtensions();
+		const runner = new ExtensionRunner(
+			result.extensions,
+			result.runtime,
+			tempDir.path(),
+			sessionManager,
+			modelRegistry,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			{ candidates: [] } as unknown as ContextReleaseManifest,
+		);
+		const errors: ExtensionError[] = [];
+		runner.onError(error => errors.push(error));
+
+		expect(await runner.emitBeforeAgentStart("ship", undefined, ["approved"])).toBeUndefined();
+		expect(await runner.emitBeforeAgentStart("ship again", undefined, ["approved"])).toBeUndefined();
+		expect(errors).toHaveLength(1);
+		expect(errors[0]?.event).toBe("before_agent_start");
+		expect(errors[0]?.error).toContain("PROMPT_POLICY_REVIEW_REQUIRED: extension source is not approved");
+	});
 
 	it("reflects SessionManager.moveTo() changes instead of the constructor-time snapshot (/move)", async () => {
 		const dirA = tempDir.join("dirA");

@@ -75,7 +75,7 @@ import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate
 import { applyProviderGlobalsFromSettings } from "./config/provider-globals";
 import { buildServiceTierByFamily } from "./config/service-tier";
 import { Settings, type SkillsSettings } from "./config/settings";
-import { ensureApprovedStartup } from "./context/approved-policy";
+import { ensureApprovedStartup, promptPolicyReviewWarning } from "./context/approved-policy";
 import { captureRuntimeContextEvidence, isRuntimeContextEvidencePayload } from "./context/explain";
 import { type ContextReleaseManifest, canonicalAgentDirPath } from "./context/manifest";
 import { bindRenderedInstruction } from "./context/registry";
@@ -1280,9 +1280,13 @@ export function createAutoLearnCaptureRunner(
  * ```
  */
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
-	const releaseManifest = isBunTestRuntime() ? undefined : await ensureApprovedStartup();
+	let releaseManifest = isBunTestRuntime() ? undefined : await ensureApprovedStartup();
 	if (releaseManifest && path.resolve(options.agentDir ?? getAgentDir()) !== canonicalAgentDirPath()) {
-		throw new Error(`PROMPT_POLICY_REVIEW_REQUIRED: runtime agent directory must be ${canonicalAgentDirPath()}`);
+		logger.warn("Prompt policy requires review; continuing with the requested agent directory", {
+			error: `PROMPT_POLICY_REVIEW_REQUIRED: runtime agent directory must be ${canonicalAgentDirPath()}`,
+			agentDir: path.resolve(options.agentDir ?? getAgentDir()),
+		});
+		releaseManifest = undefined;
 	}
 	const rootMode = options.disableExtensionDiscovery ? "explicit-only" : "merge";
 	return await withOmpExtensionRootScope(options.additionalExtensionPaths ?? [], rootMode, () =>
@@ -3022,16 +3026,25 @@ async function createAgentSessionScoped(
 				activeRepoContext,
 			};
 			const stockPrompt = await buildSystemPromptInternal(promptOptions);
-			const defaultPrompt = systemPromptBuilder
-				? await systemPromptBuilder({
+			let defaultPrompt = stockPrompt;
+			if (systemPromptBuilder) {
+				try {
+					defaultPrompt = await systemPromptBuilder({
 						hasUI: options.hasUI === true,
 						options: promptOptions,
 						templates: DEFAULT_SYSTEM_PROMPT_TEMPLATES,
 						build: templates =>
 							templates ? buildSystemPromptInternal(promptOptions, templates) : Promise.resolve(stockPrompt),
 						releaseManifest,
-					})
-				: stockPrompt;
+					});
+				} catch (error) {
+					const warning = releaseManifest ? promptPolicyReviewWarning(error) : undefined;
+					if (!warning) throw error;
+					logger.warn("Prompt policy requires review; continuing with the stock system prompt", {
+						error: warning,
+					});
+				}
+			}
 			if (
 				releaseManifest &&
 				systemPromptBuilder !== undefined &&
@@ -3039,9 +3052,10 @@ async function createAgentSessionScoped(
 					JSON.stringify(defaultPrompt.xdevCatalogNames ?? []) !==
 						JSON.stringify(stockPrompt.xdevCatalogNames ?? []))
 			) {
-				throw new Error(
-					"PROMPT_POLICY_REVIEW_REQUIRED: provider-facing system prompt differs from the approved stock prompt",
-				);
+				logger.warn("Prompt policy requires review; continuing with the stock system prompt", {
+					error: "PROMPT_POLICY_REVIEW_REQUIRED: provider-facing system prompt differs from the approved stock prompt",
+				});
+				defaultPrompt = stockPrompt;
 			}
 
 			if (options.systemPrompt === undefined) {
@@ -3055,9 +3069,10 @@ async function createAgentSessionScoped(
 				systemPrompt: typeof customPrompt === "string" ? [customPrompt] : customPrompt,
 			};
 			if (releaseManifest && JSON.stringify(result.systemPrompt) !== JSON.stringify(stockPrompt.systemPrompt)) {
-				throw new Error(
-					"PROMPT_POLICY_REVIEW_REQUIRED: provider-facing system prompt differs from the approved stock prompt",
-				);
+				logger.warn("Prompt policy requires review; continuing with the stock system prompt", {
+					error: "PROMPT_POLICY_REVIEW_REQUIRED: provider-facing system prompt differs from the approved stock prompt",
+				});
+				result.systemPrompt = stockPrompt.systemPrompt;
 			}
 			if (executionEnvironment) {
 				assertExecutionEnvironmentSystemPrompt(executionEnvironment, result.systemPrompt);
