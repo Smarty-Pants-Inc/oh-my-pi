@@ -277,25 +277,40 @@ describe("Agent", () => {
 		await expect(agent.continue(controller.signal)).rejects.toThrow("Cannot continue from message role: assistant");
 		expect(agent.peekFollowUpQueue()).toHaveLength(1);
 	});
-	it("keeps follow-up ownership when the active loop aborts during a dequeue hook", async () => {
+	it("keeps follow-up ownership when the deadline expires during a dequeue hook", async () => {
 		const mock = createMockModel({ responses: [{ content: ["done"] }] });
-		const agent = new Agent({ streamFn: mock.stream });
+		// Generous budget: the loop checks the deadline before invoking dequeue
+		// hooks, so the mock roundtrip must beat it even on starved CI runners.
+		// The hook itself parks until the deadline timer aborts the loop signal,
+		// so the expiry-during-hook branch stays exercised.
+		const agent = new Agent({ streamFn: mock.stream, deadline: Date.now() + 1_000 });
 		let hookSignal: AbortSignal | undefined;
-		agent.addBeforeQueuedMessageDequeueHook(signal => {
+		agent.addBeforeQueuedMessageDequeueHook(async signal => {
 			if (!signal) throw new Error("Expected the active loop signal");
 			hookSignal = signal;
-			agent.abort();
+			if (signal.aborted) return;
+			const { promise, resolve } = Promise.withResolvers<void>();
+			signal.addEventListener("abort", () => resolve(), { once: true });
+			await promise;
 		});
-		agent.followUp({ role: "user", content: "stay queued after abort", timestamp: Date.now() });
+		agent.followUp({ role: "user", content: "stay queued after deadline", timestamp: Date.now() });
 
 		await agent.prompt("start");
 
 		expect(hookSignal?.aborted).toBe(true);
 		expect(agent.peekFollowUpQueue()).toHaveLength(1);
 	});
-	it("continue() leaves queued work when its deadline is already expired", async () => {
-		const agent = new Agent({ deadline: Date.now() - 1 });
+	it("keeps queued work when continue() reaches its deadline inside a dequeue hook", async () => {
+		// Same starvation guard as above: hook entry must precede expiry.
+		const agent = new Agent({ deadline: Date.now() + 1_000 });
 		agent.replaceMessages([createAssistantMessage([{ type: "text", text: "ready" }])]);
+		agent.addBeforeQueuedMessageDequeueHook(async signal => {
+			if (!signal) throw new Error("Expected the deadline-aware dequeue signal");
+			if (signal.aborted) return;
+			const { promise, resolve } = Promise.withResolvers<void>();
+			signal.addEventListener("abort", () => resolve(), { once: true });
+			await promise;
+		});
 		agent.followUp({ role: "user", content: "stay queued before run loop", timestamp: Date.now() });
 
 		await expect(agent.continue()).rejects.toThrow("Cannot continue from message role: assistant");

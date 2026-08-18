@@ -1420,6 +1420,7 @@ describe("AgentSession handoff", () => {
 						}
 					: undefined,
 			),
+			disposeFileFallbacks: vi.fn(),
 			clearManagedTimers: vi.fn(),
 		} as unknown as ExtensionRunner;
 		vi.spyOn(compactionModule, "prepareCompaction").mockReturnValue(fixedPreparation);
@@ -1491,6 +1492,7 @@ describe("AgentSession handoff", () => {
 						}
 					: undefined,
 			),
+			disposeFileFallbacks: vi.fn(),
 			clearManagedTimers: vi.fn(),
 		} as unknown as ExtensionRunner;
 		vi.spyOn(compactionModule, "prepareCompaction").mockReturnValue(fixedPreparation);
