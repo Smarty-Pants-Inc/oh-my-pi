@@ -3926,6 +3926,15 @@ describe("ExtensionRunner", () => {
 			}
 		});
 
+		it("disposes file fallbacks even without shutdown handlers", async () => {
+			const runner = new ExtensionRunner([], new ExtensionRuntime(), tempDir.path(), sessionManager, modelRegistry);
+			const disposeFileFallbacks = vi.spyOn(runner, "disposeFileFallbacks");
+
+			await expect(emitSessionShutdownEvent(runner)).resolves.toBe(false);
+
+			expect(disposeFileFallbacks).toHaveBeenCalledTimes(1);
+		});
+
 		it("retains only timers owned by a failing shutdown extension", async () => {
 			vi.useFakeTimers();
 			try {
@@ -4087,6 +4096,8 @@ describe("ExtensionRunner", () => {
 					sessionMutationFences: [],
 					tools: new Map(),
 					assistantThinkingRenderers: [],
+					fileWriteFallbackHandlers: [],
+					fileDeleteFallbackHandlers: [],
 					messageRenderers: new Map(),
 					commands: new Map(),
 					flags: new Map(),
@@ -4344,6 +4355,8 @@ describe("ExtensionRunner", () => {
 				sessionMutationFences: [],
 				tools: new Map(),
 				assistantThinkingRenderers: [],
+				fileWriteFallbackHandlers: [],
+				fileDeleteFallbackHandlers: [],
 				messageRenderers: new Map(),
 				commands: new Map(),
 				flags: new Map(),
