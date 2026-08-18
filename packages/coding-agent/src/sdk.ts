@@ -3026,6 +3026,10 @@ async function createAgentSessionScoped(
 				activeRepoContext,
 			};
 			const stockPrompt = await buildSystemPromptInternal(promptOptions);
+			const clonePromptResult = (prompt: BuildSystemPromptResult): BuildSystemPromptResult => ({
+				systemPrompt: [...prompt.systemPrompt],
+				xdevCatalogNames: prompt.xdevCatalogNames ? [...prompt.xdevCatalogNames] : undefined,
+			});
 			let defaultPrompt = stockPrompt;
 			if (systemPromptBuilder) {
 				try {
@@ -3034,7 +3038,9 @@ async function createAgentSessionScoped(
 						options: promptOptions,
 						templates: DEFAULT_SYSTEM_PROMPT_TEMPLATES,
 						build: templates =>
-							templates ? buildSystemPromptInternal(promptOptions, templates) : Promise.resolve(stockPrompt),
+							templates
+								? buildSystemPromptInternal(promptOptions, templates)
+								: Promise.resolve(clonePromptResult(stockPrompt)),
 						releaseManifest,
 					});
 				} catch (error) {

@@ -468,6 +468,9 @@ describe("ExtensionRunner", () => {
 			);
 
 			const errors: Array<{ extensionPath: string; event: string; error: string }> = [];
+			runner.onError(() => {
+				throw new Error("error listener boom");
+			});
 			runner.onError(err => {
 				errors.push(err);
 			});

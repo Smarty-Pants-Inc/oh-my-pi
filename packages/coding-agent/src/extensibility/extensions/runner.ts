@@ -1146,7 +1146,13 @@ export class ExtensionRunner {
 
 	emitError(error: ExtensionError): void {
 		for (const listener of this.#errorListeners) {
-			listener(error);
+			try {
+				listener(error);
+			} catch (listenerError) {
+				logger.warn("Extension error listener failed", {
+					error: listenerError instanceof Error ? listenerError.message : String(listenerError),
+				});
+			}
 		}
 	}
 
