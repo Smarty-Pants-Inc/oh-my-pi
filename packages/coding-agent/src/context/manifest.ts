@@ -1,3 +1,4 @@
+import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { YAML } from "bun";
@@ -599,7 +600,7 @@ export function approvedCandidateSourceMatches(
 /** Bind an external runtime source to exact bytes in one approved candidate. */
 export async function isApprovedCandidateSource(filePath: string, release: ContextReleaseManifest): Promise<boolean> {
 	try {
-		const resolved = path.resolve(filePath);
+		const resolved = await fs.realpath(path.resolve(filePath));
 		const repositoryRoot = await repo.root(path.dirname(resolved));
 		if (!repositoryRoot) return false;
 		const relative = path.relative(repositoryRoot, resolved).replaceAll(path.sep, "/");

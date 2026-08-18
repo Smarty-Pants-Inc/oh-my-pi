@@ -499,6 +499,7 @@ export class ExtensionRunner {
 	#mode: ExtensionMode = "print";
 	#toolApprovalPreviewWaiter?: (toolCallId: string) => Promise<void>;
 	#errorListeners: Set<ExtensionErrorListener> = new Set();
+	#reportedPromptPolicyReviews = new Set<string>();
 	#shutdownFailedExtensions = new Set<string>();
 	#getModel: () => Model | undefined = () => undefined;
 	#isIdleFn: () => boolean = () => true;
@@ -961,12 +962,27 @@ export class ExtensionRunner {
 		return this.#publicExtensions.map(e => e.path);
 	}
 
-	getSystemPromptBuilder(): SystemPromptBuilder | undefined {
+	async getSystemPromptBuilder(): Promise<SystemPromptBuilder | undefined> {
 		const owners = this.extensions.filter(extension => extension.systemPromptBuilder);
-		if (owners.length > 1) {
+		if (!this.releaseManifest && owners.length > 1) {
 			throw new Error(`Multiple system prompt builders registered: ${owners.map(owner => owner.path).join(", ")}`);
 		}
-		return owners[0]?.systemPromptBuilder;
+		const approvedOwners: Extension[] = [];
+		for (const owner of owners) {
+			if (await this.#canRunProtectedHandler(owner, "system_prompt_builder")) approvedOwners.push(owner);
+		}
+		if (approvedOwners.length > 1) {
+			const owner = approvedOwners[0]!;
+			this.#reportPromptPolicyReview(
+				owner,
+				"system_prompt_builder",
+				new Error(
+					`PROMPT_POLICY_REVIEW_REQUIRED: multiple approved system prompt builders registered: ${approvedOwners.map(candidate => candidate.path).join(", ")}`,
+				),
+			);
+			return undefined;
+		}
+		return approvedOwners[0]?.systemPromptBuilder;
 	}
 
 	/** Get all registered tools from all extensions. */
@@ -1145,7 +1161,57 @@ export class ExtensionRunner {
 
 	emitError(error: ExtensionError): void {
 		for (const listener of this.#errorListeners) {
-			listener(error);
+			try {
+				listener(error);
+			} catch (listenerError) {
+				logger.warn("Extension error listener failed", {
+					error: listenerError instanceof Error ? listenerError.message : String(listenerError),
+				});
+			}
+		}
+	}
+
+	#reportPromptPolicyReview(ext: Extension, event: string, error: unknown): void {
+		const message = error instanceof Error ? error.message : String(error);
+		const key = `${ext.resolvedPath}\0${event}\0${message}`;
+		if (this.#reportedPromptPolicyReviews.has(key)) return;
+		this.#reportedPromptPolicyReviews.add(key);
+		logger.warn("Protected extension handler skipped because prompt policy requires review", {
+			extensionPath: ext.path,
+			event,
+			error: message,
+		});
+		this.emitError({
+			extensionPath: ext.path,
+			event,
+			error: message,
+			stack: error instanceof Error ? error.stack : undefined,
+		});
+	}
+
+	async #canRunProtectedHandler(ext: Extension, event: string): Promise<boolean> {
+		if (!this.releaseManifest || (await isApprovedCandidateSource(ext.resolvedPath, this.releaseManifest))) {
+			return true;
+		}
+		this.#reportPromptPolicyReview(
+			ext,
+			event,
+			new Error(`PROMPT_POLICY_REVIEW_REQUIRED: extension source is not approved: ${ext.path}`),
+		);
+		return false;
+	}
+
+	#captureProtectedSnapshot(
+		ext: Extension,
+		event: string,
+		value: unknown,
+	): { snapshot: string | undefined; failed: boolean } {
+		if (!this.releaseManifest) return { snapshot: undefined, failed: false };
+		try {
+			return { snapshot: serializedProviderPayload(value), failed: false };
+		} catch (error) {
+			this.#reportPromptPolicyReview(ext, event, error);
+			return { snapshot: undefined, failed: true };
 		}
 	}
 
@@ -1814,12 +1880,10 @@ export class ExtensionRunner {
 
 		for (const ext of this.extensions) {
 			for (const handler of ext.handlers.get("input") ?? []) {
-				if (this.releaseManifest && !(await isApprovedCandidateSource(ext.resolvedPath, this.releaseManifest))) {
-					throw new Error(`PROMPT_POLICY_REVIEW_REQUIRED: extension source is not approved: ${ext.path}`);
-				}
-				const approvedSnapshot = this.releaseManifest
-					? serializedProviderPayload({ text: currentText, images: currentImages })
-					: undefined;
+				if (!(await this.#canRunProtectedHandler(ext, "input"))) continue;
+				const snapshot = this.#captureProtectedSnapshot(ext, "input", { text: currentText, images: currentImages });
+				if (snapshot.failed) continue;
+				const approvedSnapshot = snapshot.snapshot;
 				const protectedInput = approvedSnapshot
 					? (JSON.parse(approvedSnapshot) as { text: string; images: ImageContent[] | undefined })
 					: undefined;
@@ -1835,14 +1899,19 @@ export class ExtensionRunner {
 				const protectedResult = approvedSnapshot
 					? { text: result?.text ?? event.text, images: result?.images ?? event.images }
 					: undefined;
+				try {
+					assertApprovedInputUnchanged(
+						approvedSnapshot,
+						protectedResult ?? { text: currentText, images: currentImages },
+						result?.handled,
+						ext.path,
+					);
+				} catch (error) {
+					this.#reportPromptPolicyReview(ext, "input", error);
+					continue;
+				}
 				if (result?.text !== undefined) currentText = result.text;
 				if (result?.images !== undefined) currentImages = result.images;
-				assertApprovedInputUnchanged(
-					approvedSnapshot,
-					protectedResult ?? { text: currentText, images: currentImages },
-					result?.handled,
-					ext.path,
-				);
 				if (result?.handled) return result;
 			}
 		}
@@ -1866,15 +1935,11 @@ export class ExtensionRunner {
 		if (!hasContextHandlers) return messages;
 
 		let currentMessages: AgentMessage[];
-		if (this.releaseManifest) {
-			currentMessages = JSON.parse(serializedProviderPayload(messages)) as AgentMessage[];
-		} else {
-			try {
-				currentMessages = structuredClone(messages);
-			} catch {
-				// Preserve legacy extension behavior for non-protected local sessions.
-				currentMessages = [...messages];
-			}
+		try {
+			currentMessages = structuredClone(messages);
+		} catch {
+			// Preserve legacy extension behavior for non-protected local sessions.
+			currentMessages = [...messages];
 		}
 
 		for (const ext of this.extensions) {
@@ -1882,10 +1947,10 @@ export class ExtensionRunner {
 			if (!handlers || handlers.length === 0) continue;
 
 			for (const handler of handlers) {
-				if (this.releaseManifest && !(await isApprovedCandidateSource(ext.resolvedPath, this.releaseManifest))) {
-					throw new Error(`PROMPT_POLICY_REVIEW_REQUIRED: extension source is not approved: ${ext.path}`);
-				}
-				const approvedSnapshot = this.releaseManifest ? serializedProviderPayload(currentMessages) : undefined;
+				if (!(await this.#canRunProtectedHandler(ext, "context"))) continue;
+				const snapshot = this.#captureProtectedSnapshot(ext, "context", currentMessages);
+				if (snapshot.failed) continue;
+				const approvedSnapshot = snapshot.snapshot;
 				const event: ContextEvent = { type: "context", messages: currentMessages };
 				const handlerResult = await this.#runHandlerWithTimeout(
 					handler,
@@ -1895,10 +1960,20 @@ export class ExtensionRunner {
 					extensionHandlerTimeoutMs,
 				);
 
-				if (handlerResult && (handlerResult as ContextEventResult).messages) {
-					currentMessages = (handlerResult as ContextEventResult).messages!;
+				const nextMessages =
+					handlerResult && (handlerResult as ContextEventResult).messages
+						? (handlerResult as ContextEventResult).messages!
+						: currentMessages;
+				try {
+					assertApprovedContextUnchanged(approvedSnapshot, nextMessages, ext.path);
+				} catch (error) {
+					this.#reportPromptPolicyReview(ext, "context", error);
+					if (approvedSnapshot !== undefined) {
+						currentMessages = JSON.parse(approvedSnapshot) as AgentMessage[];
+					}
+					continue;
 				}
-				assertApprovedContextUnchanged(approvedSnapshot, currentMessages, ext.path);
+				currentMessages = nextMessages;
 			}
 		}
 
@@ -1915,10 +1990,10 @@ export class ExtensionRunner {
 			if (!handlers || handlers.length === 0) continue;
 
 			for (const handler of handlers) {
-				if (this.releaseManifest && !(await isApprovedCandidateSource(ext.resolvedPath, this.releaseManifest))) {
-					throw new Error(`PROMPT_POLICY_REVIEW_REQUIRED: extension source is not approved: ${ext.path}`);
-				}
-				const approvedSnapshot = this.releaseManifest ? serializedProviderPayload(currentPayload) : undefined;
+				if (!(await this.#canRunProtectedHandler(ext, "before_provider_request"))) continue;
+				const snapshot = this.#captureProtectedSnapshot(ext, "before_provider_request", currentPayload);
+				if (snapshot.failed) continue;
+				const approvedSnapshot = snapshot.snapshot;
 				const eventPayload = approvedSnapshot ? JSON.parse(approvedSnapshot) : currentPayload;
 				const event: BeforeProviderRequestEvent = {
 					type: "before_provider_request",
@@ -1932,7 +2007,12 @@ export class ExtensionRunner {
 					extensionHandlerTimeoutMs,
 				);
 				if (approvedSnapshot !== undefined) {
-					assertApprovedProviderPayloadUnchanged(approvedSnapshot, handlerResult ?? eventPayload, ext.path);
+					try {
+						assertApprovedProviderPayloadUnchanged(approvedSnapshot, handlerResult ?? eventPayload, ext.path);
+					} catch (error) {
+						this.#reportPromptPolicyReview(ext, "before_provider_request", error);
+						continue;
+					}
 				}
 				if (handlerResult !== undefined) currentPayload = handlerResult;
 			}
@@ -1976,14 +2056,12 @@ export class ExtensionRunner {
 			if (!handlers || handlers.length === 0) continue;
 
 			for (const handler of handlers) {
-				if (this.releaseManifest && !(await isApprovedCandidateSource(ext.resolvedPath, this.releaseManifest))) {
-					throw new Error(`PROMPT_POLICY_REVIEW_REQUIRED: extension source is not approved: ${ext.path}`);
-				}
+				if (!(await this.#canRunProtectedHandler(ext, "before_agent_start"))) continue;
 				const event: BeforeAgentStartEvent = {
 					type: "before_agent_start",
 					prompt,
-					images,
-					systemPrompt: currentSystemPrompt,
+					images: images?.map(image => ({ ...image })),
+					systemPrompt: [...currentSystemPrompt],
 				};
 				const handlerResult = await this.#runHandlerWithTimeout(
 					handler,
@@ -1995,18 +2073,23 @@ export class ExtensionRunner {
 
 				if (handlerResult) {
 					const result = handlerResult as BeforeAgentStartEventResult;
-					if (result.message) {
-						messages.push({ message: result.message, extensionPath: ext.resolvedPath });
-					}
 					if (result.systemPrompt !== undefined) {
-						assertApprovedPerTurnSystemPromptNotReplaced(
-							this.releaseManifest !== undefined,
-							result.systemPrompt,
-							ext.path,
-						);
+						try {
+							assertApprovedPerTurnSystemPromptNotReplaced(
+								this.releaseManifest !== undefined,
+								result.systemPrompt,
+								ext.path,
+							);
+						} catch (error) {
+							this.#reportPromptPolicyReview(ext, "before_agent_start", error);
+							continue;
+						}
 						currentSystemPrompt =
 							typeof result.systemPrompt === "string" ? [result.systemPrompt] : result.systemPrompt;
 						systemPromptModified = true;
+					}
+					if (result.message) {
+						messages.push({ message: result.message, extensionPath: ext.resolvedPath });
 					}
 				}
 			}
