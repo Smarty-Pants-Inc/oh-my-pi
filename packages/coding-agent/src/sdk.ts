@@ -2655,7 +2655,7 @@ async function createAgentSessionScoped(
 			() => (hasSession ? session.getAsyncJobCounts() : null),
 			releaseManifest,
 		);
-		const systemPromptBuilder = extensionRunner.getSystemPromptBuilder();
+		const systemPromptBuilder = await extensionRunner.getSystemPromptBuilder();
 
 		credentialDisabledTarget = extensionRunner;
 		for (const event of startupCredentialDisabledEvents.splice(0)) {
@@ -3042,7 +3042,7 @@ async function createAgentSessionScoped(
 				}
 			};
 			let defaultPrompt = releaseManifest ? clonePromptResult(stockPrompt) : stockPrompt;
-			if (systemPromptBuilder) {
+			if (systemPromptBuilder && !releaseManifest) {
 				try {
 					defaultPrompt = await systemPromptBuilder({
 						hasUI: options.hasUI === true,
@@ -3078,7 +3078,7 @@ async function createAgentSessionScoped(
 				typeof options.systemPrompt === "function"
 					? options.systemPrompt(defaultPrompt.systemPrompt)
 					: options.systemPrompt;
-			const result = {
+			let result: BuildSystemPromptResult = {
 				systemPrompt: typeof customPrompt === "string" ? [customPrompt] : customPrompt,
 			};
 			if (releaseManifest) {
@@ -3087,7 +3087,7 @@ async function createAgentSessionScoped(
 						error: "PROMPT_POLICY_REVIEW_REQUIRED: provider-facing system prompt differs from the approved stock prompt",
 					});
 				}
-				result.systemPrompt = [...stockPrompt.systemPrompt];
+				result = clonePromptResult(stockPrompt);
 			}
 			if (executionEnvironment) {
 				assertExecutionEnvironmentSystemPrompt(executionEnvironment, result.systemPrompt);

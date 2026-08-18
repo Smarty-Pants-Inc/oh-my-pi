@@ -962,12 +962,14 @@ export class ExtensionRunner {
 		return this.#publicExtensions.map(e => e.path);
 	}
 
-	getSystemPromptBuilder(): SystemPromptBuilder | undefined {
+	async getSystemPromptBuilder(): Promise<SystemPromptBuilder | undefined> {
 		const owners = this.extensions.filter(extension => extension.systemPromptBuilder);
 		if (owners.length > 1) {
 			throw new Error(`Multiple system prompt builders registered: ${owners.map(owner => owner.path).join(", ")}`);
 		}
-		return owners[0]?.systemPromptBuilder;
+		const owner = owners[0];
+		if (!owner || !(await this.#canRunProtectedHandler(owner, "system_prompt_builder"))) return undefined;
+		return owner.systemPromptBuilder;
 	}
 
 	/** Get all registered tools from all extensions. */
