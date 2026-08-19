@@ -952,6 +952,31 @@ describe("AgentSession concurrent prompt guard", () => {
 		expect(session.hasPendingMessages()).toBe(false);
 		session.setCustomMessageAcceptanceHookForTests(undefined);
 	});
+	it("rejects queued prompts when lifecycle ownership changes during normalization", async () => {
+		await createSession();
+		session.agent.state.isStreaming = true;
+		session.setQueuedPromptAcceptanceHookForTests(() => {
+			session.setLifecycleTransitionFenceForTests(true);
+			session.setLifecycleTransitionFenceForTests(false);
+		});
+
+		try {
+			await expect(session.prompt("queued across handoff", { streamingBehavior: "steer" })).rejects.toThrow(
+				"Session transition in progress",
+			);
+			await expect(
+				session.promptCustomMessage(
+					{ customType: "queued-race", content: "custom across handoff", display: false },
+					{ queueOnly: true, streamingBehavior: "steer" },
+				),
+			).rejects.toThrow("Session transition in progress");
+			expect(session.agent.peekSteeringQueue()).toHaveLength(0);
+			expect(session.agent.peekFollowUpQueue()).toHaveLength(0);
+		} finally {
+			session.setQueuedPromptAcceptanceHookForTests(undefined);
+			session.setLifecycleTransitionFenceForTests(false);
+		}
+	});
 	it("does not run a prompt preflight for an unscoped semantic delivery", async () => {
 		await createSession({ "retry.usageAwareFallback": true });
 		const before = session.agent.state.messages.length;

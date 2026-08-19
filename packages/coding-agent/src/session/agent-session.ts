@@ -6474,8 +6474,8 @@ export class AgentSession {
 		return keywordNotices;
 	}
 
-	#assertPromptCanStart(): void {
-		if (this.#lifecycleTransitionFenceActive) {
+	#assertPromptCanStart(lifecycleGeneration = this.#lifecycleTransitionGeneration): void {
+		if (this.#lifecycleTransitionFenceActive || lifecycleGeneration !== this.#lifecycleTransitionGeneration) {
 			throw new AgentBusyError("Session transition in progress. Wait for completion before sending another prompt.");
 		}
 	}
@@ -7244,6 +7244,8 @@ export class AgentSession {
 	 * flipping advisor auto-resume.
 	 */
 	async followUp(text: string, images?: ImageContent[], options?: FollowUpOptions): Promise<void> {
+		const lifecycleGeneration = this.#lifecycleTransitionGeneration;
+		this.#assertPromptCanStart(lifecycleGeneration);
 		if (text.startsWith("/")) {
 			this.#throwIfExtensionCommand(text);
 		}
@@ -7266,6 +7268,8 @@ export class AgentSession {
 		const imageDescriptionNotice = normalizedImages?.length
 			? await this.#buildImageDescriptionNotice(normalizedImages)
 			: undefined;
+		this.onBeforeQueuedPromptAcceptance?.();
+		this.#assertPromptCanStart(lifecycleGeneration);
 		this.#allowQueuedMessageDrainRetry();
 		if (imageDescriptionNotice) this.agent.followUp(imageDescriptionNotice);
 		this.agent.followUp({
@@ -7309,6 +7313,8 @@ export class AgentSession {
 		images: ImageContent[] | undefined,
 		mode: "steer" | "followUp",
 	): Promise<void> {
+		const lifecycleGeneration = this.#lifecycleTransitionGeneration;
+		this.#assertPromptCanStart(lifecycleGeneration);
 		// A queued user message (RPC/SDK/collab steer or follow-up, or a typed message
 		// while streaming) is a deliberate resume; re-enable advisor auto-resume that
 		// a user interrupt suppressed.
@@ -7323,6 +7329,8 @@ export class AgentSession {
 		const imageDescriptionNotice = normalizedImages?.length
 			? await this.#buildImageDescriptionNotice(normalizedImages)
 			: undefined;
+		this.onBeforeQueuedPromptAcceptance?.();
+		this.#assertPromptCanStart(lifecycleGeneration);
 		this.#allowQueuedMessageDrainRetry();
 		const userMessage: UserMessage = {
 			role: "user",
@@ -7776,6 +7784,8 @@ export class AgentSession {
 		queueChipText?: string,
 		scheduleIdleDrain = true,
 	): Promise<void> {
+		const lifecycleGeneration = this.#lifecycleTransitionGeneration;
+		this.#assertPromptCanStart(lifecycleGeneration);
 		const details =
 			queueChipText !== undefined
 				? ({
@@ -7796,6 +7806,8 @@ export class AgentSession {
 			timestamp: Date.now(),
 		};
 		const normalizedAppMessage = await this.#normalizeAgentMessageImages(appMessage);
+		this.onBeforeQueuedPromptAcceptance?.();
+		this.#assertPromptCanStart(lifecycleGeneration);
 		this.#allowQueuedMessageDrainRetry();
 		if (deliverAs === "followUp") {
 			this.agent.followUp(normalizedAppMessage);
@@ -7804,6 +7816,13 @@ export class AgentSession {
 		}
 		if (scheduleIdleDrain) this.#scheduleIdleQueueDrain();
 	}
+	/** Override queued prompt acceptance after async normalization in focused tests. */
+	setQueuedPromptAcceptanceHookForTests(hook: (() => void) | undefined): void {
+		this.onBeforeQueuedPromptAcceptance = hook;
+	}
+
+	private onBeforeQueuedPromptAcceptance?: () => void;
+
 	/** Override the receiver-state acceptance boundary in focused tests. */
 	setCustomMessageAcceptanceHookForTests(hook: (() => void) | undefined): void {
 		this.onBeforeCustomMessageAcceptance = hook;
