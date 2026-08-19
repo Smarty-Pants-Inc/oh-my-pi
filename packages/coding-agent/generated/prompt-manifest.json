@@ -4583,11 +4583,11 @@
     },
     {
       "path": "packages/agent/src/agent-loop.ts",
-      "sha256": "c6bc4c99304e0adad5e29f9ab88ac23c5a8d3095d6b8b9372fdd49656988310f"
+      "sha256": "30f3a802b531328b02e5204b4f10dac48fbf89b0ec862ffd4878499b96aec9a4"
     },
     {
       "path": "packages/agent/src/agent.ts",
-      "sha256": "c928e9f9afa7428a8fb29ae4fe2789f615b97fab931fa6bdad073a20508085b5"
+      "sha256": "570cd083d1c189a9d86714362f44c9f37df126b45455673dbfeb5e939a32589c"
     },
     {
       "path": "packages/agent/src/append-only-context.ts",
@@ -4683,7 +4683,7 @@
     },
     {
       "path": "packages/agent/src/types.ts",
-      "sha256": "83fdc97a7534b0228f4d6f3bf509889bad47a24a9e1bbd5a96f86794f04624fd"
+      "sha256": "c4b041088e61b0b9067be289182520ca3de477c852ebc5fee9f8f8c3d313c3bc"
     },
     {
       "path": "packages/ai/package.json",
@@ -7351,11 +7351,11 @@
     },
     {
       "path": "packages/coding-agent/src/extensibility/extensions/runner.ts",
-      "sha256": "18d8ea82fc90f20425c8f05a15ece09eafd07f1ce05c0cb9781b8ae034359997"
+      "sha256": "5b2a2b6f0469e22aabf9c13bfc947f7d3933e4f1e7ebb300ec322e3ecf75b2c8"
     },
     {
       "path": "packages/coding-agent/src/extensibility/extensions/types.ts",
-      "sha256": "22b4afa1c0d7fe66a0d9d9d0bb625c489cd5c92757792080eab60b5c1e529d5b"
+      "sha256": "97cc9fd04ae55fa1e7628a5dbee8a9140dccce92815b724282df0d8be5e24d8e"
     },
     {
       "path": "packages/coding-agent/src/extensibility/extensions/wrapper.ts",
@@ -8423,7 +8423,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/agent-session.ts",
-      "sha256": "bf118c0713bf27869df6d85b9e8246949cf1ee79026392a34442bc097a65332e"
+      "sha256": "261352eccd8df28ec5bcd8f69a1bdad95e9b816938a3979a53b067292229b180"
     },
     {
       "path": "packages/coding-agent/src/session/agent-storage.ts",
@@ -10675,5 +10675,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "3f52252c46e47f482729e77a36842fc277bc8eb120a45323a98be04a7694de5c"
+  "rootSha256": "8335e8bfa66b528336995e8f033e0d70f12082b8e97cd344982f76315325abd5"
 }
