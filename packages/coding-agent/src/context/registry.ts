@@ -34,7 +34,8 @@ export interface PromptRegistry {
 export type AutomaticTurnBehaviorSource =
 	| "active_goal_continuation"
 	| "active_async_result_wake"
-	| "bounded_transport_or_protocol_retry";
+	| "bounded_transport_or_protocol_retry"
+	| "peer_message_wake";
 
 export interface AgentBehavior {
 	version: 1;
@@ -153,6 +154,7 @@ export function parseAgentBehavior(source = behaviorSource): AgentBehavior {
 		"active_goal_continuation",
 		"active_async_result_wake",
 		"bounded_transport_or_protocol_retry",
+		"peer_message_wake",
 	] as const;
 	const allowed: AutomaticTurnBehaviorSource[] = requireUniqueStrings(
 		automaticTurns.allowed,

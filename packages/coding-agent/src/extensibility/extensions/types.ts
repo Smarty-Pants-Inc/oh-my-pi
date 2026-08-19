@@ -1242,6 +1242,10 @@ export type SendMessageDisposition =
 export interface SendMessageOptions {
 	/** Host-owned semantic delivery. The host either accepts this exact mode or performs no mutation. */
 	deliveryMode?: SendMessageDeliveryMode;
+	/** Registered scope that lets idle wake-capable semantic delivery start one peer-message turn. */
+	automaticTurnSource?: "peer_message_wake";
+	/** Runs synchronously at idle provider-start acceptance before session lifecycle handoff. */
+	onStartedTurnAccepted?: () => void;
 	/** Legacy delivery controls. Do not combine with `deliveryMode`. */
 	triggerTurn?: boolean;
 	deliverAs?: "steer" | "followUp" | "nextTurn";

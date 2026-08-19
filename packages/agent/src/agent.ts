@@ -57,6 +57,7 @@ import type {
 import {
 	ASIDE_MESSAGE_COMMIT,
 	ASIDE_MESSAGE_DISCARD,
+	ASIDE_MESSAGE_SEAL,
 	type CommittableAsideMessage,
 	isSoftToolRequirement,
 } from "./types";
@@ -347,6 +348,12 @@ export interface AgentOptions {
 
 export interface AgentPromptOptions {
 	toolChoice?: ToolChoice;
+	/**
+	 * Called after the first provider stream is created successfully for this prompt.
+	 * Input events stay provisional until the callback returns; throwing leaves the
+	 * prompt uncommitted and suppresses a synthetic pre-dispatch error turn.
+	 */
+	onProviderCallStarted?: () => void;
 }
 
 /** Transactional ownership of Agent session-scoped tool-directive state. */
@@ -372,6 +379,7 @@ interface InFlightQueuedMessageCompanions {
 	messages: AgentMessage[];
 	restore: (messages: AgentMessage[]) => void;
 	output: AgentMessage[];
+	seal: () => void;
 	commit: () => void;
 	discard: () => void;
 }
@@ -1024,6 +1032,7 @@ export class Agent {
 	): boolean {
 		for (const message of messages) {
 			Object.defineProperties(message as CommittableAsideMessage, {
+				[ASIDE_MESSAGE_SEAL]: { configurable: true, value: inFlight.seal },
 				[ASIDE_MESSAGE_COMMIT]: { configurable: true, value: inFlight.commit },
 				[ASIDE_MESSAGE_DISCARD]: { configurable: true, value: inFlight.discard },
 			});
@@ -1054,16 +1063,41 @@ export class Agent {
 		}
 	}
 
-	#takeQueuedMessages(messages: AgentMessage[]): AgentMessage[] {
+	#queuedMessageRestorer(
+		queue: "steering" | "followUp",
+		batch: readonly AgentMessage[],
+	): (message: AgentMessage) => void {
+		const discarded = new Set<AgentMessage>();
+		return message => {
+			discarded.add(message);
+			const current = queue === "steering" ? this.#steeringQueue : this.#followUpQueue;
+			const restored = batch.filter(item => discarded.has(item));
+			const remaining = current.filter(item => !discarded.has(item));
+			if (queue === "steering") {
+				this.#steeringQueue = [...restored, ...remaining];
+				this.#notifySteeringWaiters();
+			} else {
+				this.#followUpQueue = [...restored, ...remaining];
+			}
+		};
+	}
+
+	#takeQueuedMessages(messages: AgentMessage[], restoreOwner?: (message: AgentMessage) => void): AgentMessage[] {
 		const expanded: AgentMessage[] = [];
 		for (const message of messages) {
 			expanded.push(message);
 			const companions = this.#queuedMessageCompanions.get(message);
-			if (!companions && message.role !== "user") continue;
+			if (!companions && message.role !== "user" && !restoreOwner) continue;
 			if (companions) this.#queuedMessageCompanions.delete(message);
 			let settled = false;
 			const restore = companions?.restore ?? (() => {});
 			let claim: InFlightQueuedMessageCompanions;
+			const seal = () => {
+				if (settled) return;
+				this.#inFlightQueuedMessageCompanions = this.#inFlightQueuedMessageCompanions.filter(
+					entry => entry !== claim,
+				);
+			};
 			const commit = () => {
 				if (settled) return;
 				settled = true;
@@ -1077,18 +1111,30 @@ export class Agent {
 				this.#inFlightQueuedMessageCompanions = this.#inFlightQueuedMessageCompanions.filter(
 					entry => entry !== claim,
 				);
-				claim.restore(claim.messages);
+				if (restoreOwner) {
+					restoreOwner(message);
+					if (claim.messages.length > 0) {
+						this.#queuedMessageCompanions.set(message, {
+							messages: claim.messages.slice(),
+							restore: claim.restore,
+						});
+					}
+				} else {
+					claim.restore(claim.messages);
+				}
 			};
 			claim = {
 				owner: message,
 				messages: [],
 				restore,
 				output: expanded,
+				seal,
 				commit,
 				discard,
 			};
 			this.#inFlightQueuedMessageCompanions.push(claim);
 			Object.defineProperties(message as CommittableAsideMessage, {
+				[ASIDE_MESSAGE_SEAL]: { configurable: true, value: seal },
 				[ASIDE_MESSAGE_COMMIT]: { configurable: true, value: commit },
 				[ASIDE_MESSAGE_DISCARD]: { configurable: true, value: discard },
 			});
@@ -1208,31 +1254,19 @@ export class Agent {
 	}
 
 	#dequeueSteeringMessages(): AgentMessage[] {
-		if (this.#steeringMode === "one-at-a-time") {
-			if (this.#steeringQueue.length > 0) {
-				const first = this.#steeringQueue[0];
-				this.#steeringQueue = this.#steeringQueue.slice(1);
-				return this.#takeQueuedMessages([first]);
-			}
-			return [];
-		}
-		const steering = this.#steeringQueue.slice();
-		this.#steeringQueue = [];
-		return this.#takeQueuedMessages(steering);
+		const steering =
+			this.#steeringMode === "one-at-a-time" ? this.#steeringQueue.slice(0, 1) : this.#steeringQueue.slice();
+		if (steering.length === 0) return [];
+		this.#steeringQueue = this.#steeringQueue.slice(steering.length);
+		return this.#takeQueuedMessages(steering, this.#queuedMessageRestorer("steering", steering));
 	}
 
 	#dequeueFollowUpMessages(): AgentMessage[] {
-		if (this.#followUpMode === "one-at-a-time") {
-			if (this.#followUpQueue.length > 0) {
-				const first = this.#followUpQueue[0];
-				this.#followUpQueue = this.#followUpQueue.slice(1);
-				return this.#takeQueuedMessages([first]);
-			}
-			return [];
-		}
-		const followUp = this.#followUpQueue.slice();
-		this.#followUpQueue = [];
-		return this.#takeQueuedMessages(followUp);
+		const followUp =
+			this.#followUpMode === "one-at-a-time" ? this.#followUpQueue.slice(0, 1) : this.#followUpQueue.slice();
+		if (followUp.length === 0) return [];
+		this.#followUpQueue = this.#followUpQueue.slice(followUp.length);
+		return this.#takeQueuedMessages(followUp, this.#queuedMessageRestorer("followUp", followUp));
 	}
 
 	/**
@@ -1555,6 +1589,7 @@ export class Agent {
 			}
 			return refreshToolChoiceForActiveTools(options?.toolChoice, this.#state.tools);
 		};
+		let providerCallStarted = false;
 
 		const config: AgentLoopConfig = {
 			model,
@@ -1609,6 +1644,13 @@ export class Agent {
 							return undefined;
 						}
 					: undefined,
+			onProviderCallStarted: options?.onProviderCallStarted
+				? () => {
+						if (providerCallStarted) return;
+						options.onProviderCallStarted?.();
+						providerCallStarted = true;
+					}
+				: undefined,
 			cursorExecHandlers: this.#cursorExecHandlers,
 			cursorOnToolResult,
 			cwd: this.#cwd,
@@ -1753,6 +1795,15 @@ export class Agent {
 				}
 			}
 		} catch (err) {
+			if (options?.onProviderCallStarted && !providerCallStarted) {
+				// The provider stream was never accepted. Its prompt input stayed provisional
+				// in agent-loop, so keep the retry path free of a synthetic error turn too.
+				this.#state.error = undefined;
+				this.#state.isStreaming = false;
+				this.#state.streamMessage = null;
+				this.#emit({ type: "agent_end", messages: [] });
+				return;
+			}
 			const stoppedForAbort = loopSignal.aborted;
 			const errorMessage = stoppedForAbort
 				? abortReasonText(loopSignal)

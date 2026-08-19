@@ -425,6 +425,42 @@ describe("Agent", () => {
 		expect(agent.state.isStreaming).toBe(false);
 	});
 
+	it("publishes idle before agent_end after a pre-provider failure", async () => {
+		const secondStarted = Promise.withResolvers<void>();
+		const releaseSecond = Promise.withResolvers<void>();
+		const mock = createMockModel({
+			responses: [
+				async () => {
+					secondStarted.resolve();
+					await releaseSecond.promise;
+					return { content: ["successor"] };
+				},
+			],
+		});
+		let first = true;
+		const agent = new Agent({
+			streamFn: (...args) => {
+				if (first) {
+					first = false;
+					throw new Error("stream construction failed");
+				}
+				return mock.stream(...args);
+			},
+		});
+		let successor: Promise<void> | undefined;
+		agent.subscribe(event => {
+			if (event.type === "agent_end" && !successor) successor = agent.prompt("successor");
+		});
+
+		await agent.prompt("predecessor", { onProviderCallStarted: () => {} });
+		await secondStarted.promise;
+		expect(agent.state.isStreaming).toBe(true);
+
+		releaseSecond.resolve();
+		await successor;
+		expect(agent.state.isStreaming).toBe(false);
+	});
+
 	it("classifies an in-flight continuation cancellation as aborted", async () => {
 		const providerStarted = Promise.withResolvers<AbortSignal>();
 		const agent = new Agent({

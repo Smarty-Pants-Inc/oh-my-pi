@@ -3387,6 +3387,20 @@ describe("agentLoop pre-model-call gate", () => {
 		expect(mock.calls[0]?.options?.toolChoice).toBe("none");
 	});
 
+	it("restores queued steering when a provisional prompt stops before provider dispatch", async () => {
+		const mock = createMockModel({ responses: [{ content: ["should not be reached"] }] });
+		const agent = new Agent({ streamFn: mock.stream });
+		const queued = createUserMessage("queued steer");
+		agent.steer(queued);
+		agent.setBeforeModelCall(() => ({ stop: true, reason: "over budget" }));
+
+		await agent.prompt(createUserMessage("peer wake"), { onProviderCallStarted: () => {} });
+
+		expect(mock.calls).toHaveLength(0);
+		expect(agent.state.messages).toHaveLength(0);
+		expect(agent.peekSteeringQueue()).toEqual([queued]);
+	});
+
 	it("discards a deferred tool choice when its tool is no longer active", async () => {
 		const mock = createMockModel({ responses: [{ content: ["done"] }] });
 		let toolChoiceCalls = 0;

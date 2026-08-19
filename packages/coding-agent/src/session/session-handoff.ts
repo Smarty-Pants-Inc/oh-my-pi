@@ -61,7 +61,7 @@ export interface SessionHandoffHost {
 	modelRegistry: ModelRegistry;
 	extensionRunner: ExtensionRunner | undefined;
 	sideStreamFn: StreamFn;
-	beginLifecycleTransaction(): SessionLifecycleTransaction;
+	beginLifecycleTransaction(): Promise<SessionLifecycleTransaction>;
 	obfuscator: SecretObfuscator | undefined;
 	model(): Model | undefined;
 	thinkingLevel(): ThinkingLevel | undefined;
@@ -262,7 +262,7 @@ export class SessionHandoff {
 				}
 			}
 
-			lifecycle = this.#host.beginLifecycleTransaction();
+			lifecycle = await this.#host.beginLifecycleTransaction();
 			if (this.#host.extensionRunner) {
 				lifecycle.markPublicationStarted();
 				await this.#host.extensionRunner.emitBeforeSessionMutation({ type: "session_switch" });

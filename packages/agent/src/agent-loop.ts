@@ -5,6 +5,7 @@
 import {
 	type AssistantMessage,
 	type AssistantMessageEvent,
+	type AssistantMessageEventStream,
 	type ComputerAction,
 	type ComputerSafetyCheck,
 	type Context,
@@ -85,7 +86,7 @@ import type {
 	SteeringQueueState,
 	StreamFn,
 } from "./types";
-import { ASIDE_MESSAGE_COMMIT, ASIDE_MESSAGE_DISCARD, isSoftToolRequirement } from "./types";
+import { ASIDE_MESSAGE_COMMIT, ASIDE_MESSAGE_DISCARD, ASIDE_MESSAGE_SEAL, isSoftToolRequirement } from "./types";
 import { yieldIfDue } from "./utils/yield";
 
 /** Stop-details marker for a provider error after assistant content/tool args already streamed. */
@@ -991,6 +992,16 @@ function discardAsides(messages: readonly AgentMessage[], error: Error): void {
 		(message as CommittableAsideMessage)[ASIDE_MESSAGE_DISCARD]?.(error);
 	}
 }
+function commitAsides(messages: readonly AgentMessage[]): void {
+	for (const message of messages) {
+		(message as CommittableAsideMessage)[ASIDE_MESSAGE_COMMIT]?.();
+	}
+}
+function sealAsides(messages: readonly AgentMessage[]): void {
+	for (const message of messages) {
+		(message as CommittableAsideMessage)[ASIDE_MESSAGE_SEAL]?.();
+	}
+}
 
 async function runLoopBody(
 	currentContext: AgentContext,
@@ -1021,13 +1032,17 @@ async function runLoopBody(
 
 	const softRequirementState = config.softToolRequirementState ?? { escalations: 0 };
 	let preserveSoftRequirementState = false;
+	let provisionalMessages: AgentMessage[] = [];
+	let providerCallAccepted = config.onProviderCallStarted === undefined;
+	const finishAgentStream = () =>
+		endAgentStream(stream, providerCallAccepted ? newMessages : [], telemetry, stepCounter.count);
 
 	let pendingMessages: AgentMessage[] = [];
 	try {
 		let messagesToEmit = [...initialMessages];
 		if (isDeadlineExceeded(config.deadline)) {
-			emitInputMessages(stream, messagesToEmit);
-			endAgentStream(stream, newMessages, telemetry, stepCounter.count);
+			if (providerCallAccepted) emitInputMessages(stream, messagesToEmit);
+			finishAgentStream();
 			return;
 		}
 		// Check for steering messages at start (user may have typed while waiting).
@@ -1036,8 +1051,10 @@ async function runLoopBody(
 		try {
 			pendingMessages = signal?.aborted ? [] : (await config.getSteeringMessages?.(signal)) || [];
 		} catch (error) {
-			stream.push({ type: "turn_start" });
-			emitInputMessages(stream, messagesToEmit);
+			if (providerCallAccepted) {
+				stream.push({ type: "turn_start" });
+				emitInputMessages(stream, messagesToEmit);
+			}
 			throw error;
 		}
 		let harmonyRetryAttempt = 0;
@@ -1062,8 +1079,8 @@ async function runLoopBody(
 			// Inner loop: process tool calls and steering messages
 			while (hasMoreToolCalls || pendingMessages.length > 0) {
 				if (isDeadlineExceeded(config.deadline)) {
-					emitInputMessages(stream, messagesToEmit);
-					endAgentStream(stream, newMessages, telemetry, stepCounter.count);
+					if (providerCallAccepted) emitInputMessages(stream, messagesToEmit);
+					finishAgentStream();
 					return;
 				}
 				// Yield at the top of each iteration to prevent busy-wait when
@@ -1084,8 +1101,13 @@ async function runLoopBody(
 						currentContext.messages.push(message);
 						newMessages.push(message);
 						turnMessages.push(message);
-						(message as CommittableAsideMessage)[ASIDE_MESSAGE_COMMIT]?.();
+						if (providerCallAccepted) {
+							(message as CommittableAsideMessage)[ASIDE_MESSAGE_COMMIT]?.();
+						} else {
+							provisionalMessages.push(message);
+						}
 					}
+					sealAsides(pendingMessages);
 					pendingMessages = [];
 				}
 
@@ -1125,7 +1147,7 @@ async function runLoopBody(
 					preparedProviderCall = await prepareProviderCall(currentContext, config, signal);
 					gateResult = (await config.beforeModelCall?.(preparedProviderCall.context, signal)) || undefined;
 				} catch (error) {
-					if (!turnOpen) {
+					if (!turnOpen && providerCallAccepted) {
 						stream.push({ type: "turn_start" });
 						emitInputMessages(stream, turnMessages);
 						turnOpen = true;
@@ -1143,13 +1165,15 @@ async function runLoopBody(
 						try {
 							config.onToolChoiceRejected?.();
 						} catch (error) {
-							stream.push({ type: "turn_start" });
-							emitInputMessages(stream, turnMessages);
-							turnOpen = true;
+							if (providerCallAccepted) {
+								stream.push({ type: "turn_start" });
+								emitInputMessages(stream, turnMessages);
+								turnOpen = true;
+							}
 							throw error;
 						}
 					}
-					emitInputMessages(stream, turnMessages);
+					if (providerCallAccepted) emitInputMessages(stream, turnMessages);
 					if (turnOpen) {
 						const stopMessage = createGateStopMessage(preparedProviderCall.model, gateResult.reason);
 						currentContext.messages.push(stopMessage);
@@ -1169,15 +1193,32 @@ async function runLoopBody(
 						turnOpen = false;
 					}
 					preserveSoftRequirementState = !signal?.aborted;
-					endAgentStream(stream, newMessages, telemetry, stepCounter.count);
+					finishAgentStream();
 					return;
 				}
 
-				if (!turnOpen) {
+				const deferTurnStart = !turnOpen && !providerCallAccepted;
+				if (!turnOpen && !deferTurnStart) {
 					stream.push({ type: "turn_start" });
 					emitInputMessages(stream, turnMessages);
 					turnOpen = true;
 				}
+				const providerConfig = deferTurnStart
+					? {
+							...config,
+							onProviderCallStarted: () => {
+								config.onProviderCallStarted?.();
+								commitAsides(provisionalMessages);
+								provisionalMessages = [];
+								providerCallAccepted = true;
+								if (!turnOpen) {
+									stream.push({ type: "turn_start" });
+									emitInputMessages(stream, turnMessages);
+									turnOpen = true;
+								}
+							},
+						}
+					: config;
 
 				// Stream assistant response
 				let recovered: HarmonyRecoveredToolCall | undefined;
@@ -1185,7 +1226,7 @@ async function runLoopBody(
 				try {
 					message = await streamAssistantResponse(
 						currentContext,
-						config,
+						providerConfig,
 						signal,
 						stream,
 						telemetry,
@@ -1283,8 +1324,7 @@ async function runLoopBody(
 					await emitTurnEnd(stream, currentContext, message, toolResults, config, signal, { willContinue: false });
 					turnOpen = false;
 
-					stream.push(buildAgentEndEvent(newMessages, telemetry, stepCounter.count));
-					stream.end(newMessages);
+					finishAgentStream();
 					return;
 				}
 
@@ -1436,7 +1476,7 @@ async function runLoopBody(
 				turnOpen = false;
 
 				if (isDeadlineExceeded(config.deadline)) {
-					endAgentStream(stream, newMessages, telemetry, stepCounter.count);
+					finishAgentStream();
 					return;
 				}
 				// On external abort (user interrupt), leave the steering queue intact: the
@@ -1459,7 +1499,7 @@ async function runLoopBody(
 			}
 
 			if (isDeadlineExceeded(config.deadline)) {
-				endAgentStream(stream, newMessages, telemetry, stepCounter.count);
+				finishAgentStream();
 				return;
 			}
 
@@ -1467,7 +1507,7 @@ async function runLoopBody(
 			await config.onBeforeYield?.();
 
 			if (isDeadlineExceeded(config.deadline)) {
-				endAgentStream(stream, newMessages, telemetry, stepCounter.count);
+				finishAgentStream();
 				return;
 			}
 			// Skip queue drains when externally aborted (same stranding hazard as above).
@@ -1487,8 +1527,9 @@ async function runLoopBody(
 			break;
 		}
 
-		endAgentStream(stream, newMessages, telemetry, stepCounter.count);
+		finishAgentStream();
 	} finally {
+		discardAsides(provisionalMessages, new Error("Queued message was not committed before provider dispatch"));
 		discardAsides(pendingMessages, new Error("Aside message was not committed before the agent loop ended"));
 		if (!preserveSoftRequirementState) {
 			softRequirementState.id = undefined;
@@ -1621,9 +1662,11 @@ async function streamAssistantResponse(
 	// `requestSignal`), so it cancels the request without tripping the loop's
 	// external-abort handling (`abortRacePromise` / `requestSignal.aborted`).
 	const promptToolAbortController = ownedDialect ? new AbortController() : undefined;
+	const providerAcceptanceAbortController = config.onProviderCallStarted ? new AbortController() : undefined;
 	const providerAbortSignals: AbortSignal[] = [];
 	if (requestSignal) providerAbortSignals.push(requestSignal);
 	if (promptToolAbortController) providerAbortSignals.push(promptToolAbortController.signal);
+	if (providerAcceptanceAbortController) providerAbortSignals.push(providerAcceptanceAbortController.signal);
 	const finalRequestSignal =
 		providerAbortSignals.length === 0
 			? undefined
@@ -1696,21 +1739,28 @@ async function streamAssistantResponse(
 							return replacement;
 						}
 					: config.onPayload;
-			let response = await streamFunction(model, llmContext, {
-				...config,
-				apiKey,
-				metadata: resolvedMetadata,
-				toolChoice: effectiveToolChoice,
-				reasoning: effectiveReasoning,
-				disableReasoning: effectiveDisableReasoning,
-				temperature: effectiveTemperature,
-				serviceTier: effectiveServiceTier,
-				cwd: effectiveCwd,
-				signal: finalRequestSignal,
-				onPayload,
-				onToolContracts: ownedDialect ? undefined : config.onToolContracts,
-				onResponse: captureOnResponse,
-			});
+			let response: AssistantMessageEventStream;
+			try {
+				response = await streamFunction(model, llmContext, {
+					...config,
+					apiKey,
+					metadata: resolvedMetadata,
+					toolChoice: effectiveToolChoice,
+					reasoning: effectiveReasoning,
+					disableReasoning: effectiveDisableReasoning,
+					temperature: effectiveTemperature,
+					serviceTier: effectiveServiceTier,
+					cwd: effectiveCwd,
+					signal: finalRequestSignal,
+					onPayload,
+					onToolContracts: ownedDialect ? undefined : config.onToolContracts,
+					onResponse: captureOnResponse,
+				});
+				config.onProviderCallStarted?.();
+			} catch (error) {
+				providerAcceptanceAbortController?.abort(error);
+				throw error;
+			}
 			if (promptToolWireTools && ownedDialect) {
 				// Re-materialize in-band tool-call text as native toolCall content blocks
 				// so the rest of the loop executes them unchanged. When the model starts

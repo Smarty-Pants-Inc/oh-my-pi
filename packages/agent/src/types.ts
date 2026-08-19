@@ -32,12 +32,15 @@ export type StreamFn = (
 	...args: Parameters<typeof streamSimple>
 ) => AssistantMessageEventStream | Promise<AssistantMessageEventStream>;
 
-/** Called once an aside has been inserted into the agent's live context. */
+/** Called after an aside joins the live turn and can no longer accept late companions. */
+export const ASIDE_MESSAGE_SEAL = Symbol("aside-message-seal");
+/** Called once the provider accepts the live turn containing this aside. */
 export const ASIDE_MESSAGE_COMMIT = Symbol("aside-message-commit");
-/** Called when an aside was drained but the agent loop ended before inserting it. */
+/** Called when an aside was drained but the agent loop ended before provider acceptance. */
 export const ASIDE_MESSAGE_DISCARD = Symbol("aside-message-discard");
 
 export type CommittableAsideMessage = AgentMessage & {
+	[ASIDE_MESSAGE_SEAL]?: () => void;
 	[ASIDE_MESSAGE_COMMIT]?: () => void;
 	[ASIDE_MESSAGE_DISCARD]?: (error: Error) => void;
 };
@@ -333,6 +336,12 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * the run is canceled or its deadline expires.
 	 */
 	beforeModelCall?: AgentBeforeModelCall;
+
+	/**
+	 * Called after the provider stream is created successfully, before response
+	 * events are consumed. Initial input events stay provisional until this returns.
+	 */
+	onProviderCallStarted?: () => void;
 
 	/**
 	 * Optional transform applied to tool call arguments before execution.

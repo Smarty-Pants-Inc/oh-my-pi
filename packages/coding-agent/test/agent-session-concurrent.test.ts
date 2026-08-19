@@ -206,6 +206,372 @@ describe("AgentSession concurrent prompt guard", () => {
 		expect(JSON.stringify(mock.calls[0]?.context.messages)).toContain("urgent blocker");
 		expect(JSON.stringify(mock.calls[0]?.context.messages)).toContain("durable status");
 	});
+	it("starts one idle provider turn for scoped peer semantic delivery", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: mock.stream,
+			convertToLlm,
+		});
+		const sessionManager = SessionManager.inMemory();
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated(),
+			modelRegistry: sharedModelRegistry,
+		});
+
+		await expect(
+			session.sendCustomMessage(
+				{ customType: "peer-message", content: "wake once", display: true, attribution: "agent" },
+				{
+					deliveryMode: "auto",
+					automaticTurnSource: "peer_message_wake",
+					onStartedTurnAccepted: () => {
+						expect(agent.state.messages).toHaveLength(0);
+						expect(sessionManager.getBranch()).toHaveLength(0);
+					},
+				},
+			),
+		).resolves.toEqual({ status: "accepted", delivery: "started_turn" });
+		await waitFor(() => mock.calls.length === 1);
+		expect(mock.calls).toHaveLength(1);
+		expect(JSON.stringify(mock.calls[0]?.context.messages)).toContain("wake once");
+		expect(session.getAutomaticTurnOutcomes()).toEqual([
+			expect.objectContaining({ source: "peer_message_wake", status: "accepted" }),
+			expect.objectContaining({ source: "peer_message_wake", status: "started" }),
+		]);
+	});
+
+	it("rejects scoped peer wake when the persistence listener disconnects before agent_start", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: mock.stream,
+			convertToLlm,
+		});
+		const sessionManager = SessionManager.inMemory();
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated(),
+			modelRegistry: sharedModelRegistry,
+		});
+		let committed = false;
+		session.setCustomMessageAcceptanceHookForTests(() => session.setAgentEventConnectionForTests(false));
+
+		await expect(
+			session.sendCustomMessage(
+				{ customType: "peer-message", content: "wake through disconnect", display: true, attribution: "agent" },
+				{
+					deliveryMode: "auto",
+					automaticTurnSource: "peer_message_wake",
+					onStartedTurnAccepted: () => {
+						committed = true;
+					},
+				},
+			),
+		).rejects.toThrow("Scoped automatic turn lost its session persistence listener");
+		expect(committed).toBe(false);
+		expect(JSON.stringify(sessionManager.getBranch())).not.toContain("wake through disconnect");
+		expect(JSON.stringify(agent.state.messages)).not.toContain("wake through disconnect");
+		expect(session.getAutomaticTurnOutcomes()).toEqual([
+			expect.objectContaining({ source: "peer_message_wake", status: "accepted" }),
+			expect.objectContaining({ source: "peer_message_wake", status: "failed" }),
+		]);
+		session.setCustomMessageAcceptanceHookForTests(undefined);
+		session.setAgentEventConnectionForTests(true);
+	});
+
+	it("settles scoped peer wake acceptance before a session mutation fence retires extensions", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const beforeStartEntered = Promise.withResolvers<void>();
+		const releaseBeforeStart = Promise.withResolvers<void>();
+		const order: string[] = [];
+		const sessionManager = SessionManager.inMemory();
+		const extensionRunner = {
+			hasHandlers: vi.fn(() => false),
+			emitBeforeAgentStart: vi.fn(async () => {
+				beforeStartEntered.resolve();
+				await releaseBeforeStart.promise;
+				return undefined;
+			}),
+			emitBeforeSessionMutation: vi.fn(async () => {
+				expect(JSON.stringify(sessionManager.getBranch())).toContain("commit before mutation");
+				order.push("fence");
+			}),
+			emit: vi.fn().mockResolvedValue(undefined),
+			emitWithHostCompletion: vi.fn(async (_event: { type: string }, completion?: () => void | Promise<void>) =>
+				completion?.(),
+			),
+		} as unknown as ExtensionRunner;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: createMockModel({ handler: () => ({ content: ["Done"] }) }).stream,
+			convertToLlm,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated(),
+			modelRegistry: sharedModelRegistry,
+			extensionRunner,
+		});
+
+		const sending = session.sendCustomMessage(
+			{ customType: "peer-message", content: "commit before mutation", display: true, attribution: "agent" },
+			{
+				deliveryMode: "auto",
+				automaticTurnSource: "peer_message_wake",
+				onStartedTurnAccepted: () => order.push("commit"),
+			},
+		);
+		await beforeStartEntered.promise;
+		const switching = session.newSession();
+		await Promise.resolve();
+		expect(extensionRunner.emitBeforeSessionMutation).not.toHaveBeenCalled();
+
+		releaseBeforeStart.resolve();
+		await expect(sending).resolves.toEqual({ status: "accepted", delivery: "started_turn" });
+		await expect(switching).resolves.toBe(true);
+		expect(order).toEqual(["commit", "fence"]);
+	});
+
+	it("does not accept a scoped peer wake when agent prompt fails before agent_start", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: createMockModel({ handler: () => ({ content: ["Done"] }) }).stream,
+			convertToLlm,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			modelRegistry: sharedModelRegistry,
+		});
+		const failure = new Error("provider start failed");
+		vi.spyOn(agent, "prompt").mockRejectedValueOnce(failure);
+		let committed = false;
+
+		await expect(
+			session.sendCustomMessage(
+				{ customType: "peer-message", content: "must stay retryable", display: true, attribution: "agent" },
+				{
+					deliveryMode: "auto",
+					automaticTurnSource: "peer_message_wake",
+					onStartedTurnAccepted: () => {
+						committed = true;
+					},
+				},
+			),
+		).rejects.toThrow(failure);
+		expect(committed).toBe(false);
+		expect(session.getAutomaticTurnOutcomes()).toEqual([
+			expect.objectContaining({ source: "peer_message_wake", status: "accepted" }),
+			expect.objectContaining({ source: "peer_message_wake", status: "failed" }),
+		]);
+	});
+
+	it("keeps a scoped peer wake retryable when the pre-model gate stops before provider dispatch", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: mock.stream,
+			convertToLlm,
+		});
+		agent.setBeforeModelCall(() => ({ stop: true, reason: "test gate" }));
+		const sessionManager = SessionManager.inMemory();
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated(),
+			modelRegistry: sharedModelRegistry,
+		});
+		let committed = false;
+		const queuedSteer = {
+			role: "user" as const,
+			content: [{ type: "text" as const, text: "queued steer must survive" }],
+			steering: true,
+			attribution: "user" as const,
+			timestamp: Date.now(),
+		};
+		agent.steer(queuedSteer);
+
+		await expect(
+			session.sendCustomMessage(
+				{ customType: "peer-message", content: "must remain new", display: true, attribution: "agent" },
+				{
+					deliveryMode: "auto",
+					automaticTurnSource: "peer_message_wake",
+					onStartedTurnAccepted: () => {
+						committed = true;
+					},
+				},
+			),
+		).resolves.toEqual({ status: "unavailable", reason: "prompt_preflight_cancelled" });
+		await session.waitForIdle();
+		expect(committed).toBe(false);
+		expect(mock.calls).toHaveLength(0);
+		expect(agent.state.messages).toEqual([queuedSteer]);
+		expect(JSON.stringify(sessionManager.getBranch())).toContain("queued steer must survive");
+		expect(JSON.stringify(sessionManager.getBranch())).not.toContain("must remain new");
+		expect(agent.peekSteeringQueue()).toHaveLength(0);
+		expect(session.getAutomaticTurnOutcomes()).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ source: "peer_message_wake", status: "accepted" }),
+				expect.objectContaining({ source: "peer_message_wake", status: "failed" }),
+			]),
+		);
+	});
+
+	it("defers a late explicit-prompt message after the provisional queue batch is folded", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({ responses: [{ content: ["first"] }, { content: ["second"] }] });
+		const gateEntered = Promise.withResolvers<void>();
+		const releaseGate = Promise.withResolvers<void>();
+		let gateCalls = 0;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: mock.stream,
+			convertToLlm,
+		});
+		agent.setBeforeModelCall(async () => {
+			if (gateCalls++ !== 0) return;
+			gateEntered.resolve();
+			await releaseGate.promise;
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			modelRegistry: sharedModelRegistry,
+		});
+		agent.steer({
+			role: "user",
+			content: "direct user steer",
+			steering: true,
+			attribution: "user",
+			timestamp: Date.now(),
+		});
+
+		const wake = session.sendCustomMessage(
+			{ customType: "peer-message", content: "wake first", display: true, attribution: "agent" },
+			{ deliveryMode: "auto", automaticTurnSource: "peer_message_wake", onStartedTurnAccepted: () => {} },
+		);
+		await gateEntered.promise;
+		await expect(
+			session.sendCustomMessage(
+				{ customType: "peer-message", content: "late explicit", display: true, attribution: "agent" },
+				{ deliveryMode: "explicitPrompt" },
+			),
+		).resolves.toEqual({ status: "accepted", delivery: "queued_next_turn" });
+
+		releaseGate.resolve();
+		await expect(wake).resolves.toEqual({ status: "accepted", delivery: "started_turn" });
+		await session.waitForIdle();
+		const firstContext = JSON.stringify(mock.calls[0]?.context.messages);
+		expect(firstContext).toContain("direct user steer");
+		expect(firstContext).not.toContain("late explicit");
+
+		await session.prompt("next explicit user prompt");
+		const secondContext = JSON.stringify(mock.calls[1]?.context.messages);
+		expect(secondContext).toContain("next explicit user prompt");
+		expect(secondContext.match(/late explicit/g) ?? []).toHaveLength(1);
+	});
+
+	it("keeps a scoped peer wake retryable when provider stream creation fails", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const failure = new Error("stream init failed");
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: async () => {
+				await Promise.resolve();
+				throw failure;
+			},
+			convertToLlm,
+		});
+		const sessionManager = SessionManager.inMemory();
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated(),
+			modelRegistry: sharedModelRegistry,
+		});
+		let committed = false;
+
+		await expect(
+			session.sendCustomMessage(
+				{ customType: "peer-message", content: "retry after stream failure", display: true, attribution: "agent" },
+				{
+					deliveryMode: "auto",
+					automaticTurnSource: "peer_message_wake",
+					onStartedTurnAccepted: () => {
+						committed = true;
+					},
+				},
+			),
+		).resolves.toEqual({ status: "unavailable", reason: "prompt_preflight_cancelled" });
+		expect(committed).toBe(false);
+		expect(agent.state.messages).toHaveLength(0);
+		expect(sessionManager.getBranch()).toHaveLength(0);
+		expect(session.getAutomaticTurnOutcomes()).toEqual([
+			expect.objectContaining({ source: "peer_message_wake", status: "accepted" }),
+			expect.objectContaining({ source: "peer_message_wake", status: "failed" }),
+		]);
+	});
+
+	it("keeps a scoped peer wake retryable when acceptance commit fails", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		let requestSignal: AbortSignal | undefined;
+		const failure = new Error("mailbox commit failed");
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: (_model, _context, options) => {
+				requestSignal = options?.signal;
+				return new AssistantMessageEventStream();
+			},
+			convertToLlm,
+		});
+		const sessionManager = SessionManager.inMemory();
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated(),
+			modelRegistry: sharedModelRegistry,
+		});
+
+		await expect(
+			session.sendCustomMessage(
+				{ customType: "peer-message", content: "retry after commit failure", display: true, attribution: "agent" },
+				{
+					deliveryMode: "auto",
+					automaticTurnSource: "peer_message_wake",
+					onStartedTurnAccepted: () => {
+						throw failure;
+					},
+				},
+			),
+		).rejects.toThrow(failure);
+		expect(requestSignal?.aborted).toBe(true);
+		expect(agent.state.messages).toHaveLength(0);
+		expect(sessionManager.getBranch()).toHaveLength(0);
+		expect(session.getAutomaticTurnOutcomes()).toEqual([
+			expect.objectContaining({ source: "peer_message_wake", status: "accepted" }),
+			expect.objectContaining({ source: "peer_message_wake", status: "failed" }),
+		]);
+	});
 
 	it("attaches busy explicitPrompt delivery to the queued user follow-up", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
@@ -407,7 +773,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		await assertDowngraded({ triggerTurn: true });
 		await assertDowngraded({ deliverAs: "nextTurn", triggerTurn: true });
 	});
-	it("retains an unscoped semantic delivery passively when the client defers turns", async () => {
+	it("does not mutate a scoped semantic delivery when the client defers turns", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
 		const agent = new Agent({
@@ -428,13 +794,14 @@ describe("AgentSession concurrent prompt guard", () => {
 		await expect(
 			session.sendCustomMessage(
 				{ customType: "exact-interrupt", content: "must not queue", display: false, attribution: "agent" },
-				{ deliveryMode: "interrupt" },
+				{ deliveryMode: "interrupt", automaticTurnSource: "peer_message_wake" },
 			),
-		).resolves.toEqual({ status: "downgraded", delivery: "plain_append", reason: "unscoped_automatic_turn" });
-		expect(session.agent.state.messages).toHaveLength(before + 1);
+		).resolves.toEqual({ status: "unavailable", reason: "client_deferred_turn" });
+		expect(session.agent.state.messages).toHaveLength(before);
 		expect(session.agent.peekSteeringQueue()).toHaveLength(0);
 		expect(session.agent.peekFollowUpQueue()).toHaveLength(0);
 		expect(session.hasPendingMessages()).toBe(false);
+		expect(mock.calls).toHaveLength(0);
 	});
 
 	describe("durable semantic delivery recovery", () => {

@@ -224,9 +224,9 @@ export interface SessionMaintenanceHost {
 	}): boolean;
 	persistTurnMessagesForMidRunCompaction(context: AgentTurnEndContext | undefined): Promise<boolean>;
 	findLastAssistantMessage(): AssistantMessage | undefined;
+	beginSemanticDeliveryMaintenance(): Promise<() => void>;
 	disconnectFromAgent(): void;
 	reconnectToAgent(): void;
-	drainStrandedQueuedMessages(): void;
 	buildDisplaySessionContext(): SessionContext;
 	convertToLlmForSideRequest(messages: AgentMessage[]): Message[];
 	obfuscateTextForProvider(text: string | undefined): string | undefined;
@@ -599,8 +599,10 @@ export class SessionMaintenance {
 		}
 		const compactionAbortController = new AbortController();
 		this.#compactionAbortController = compactionAbortController;
+		let releaseSemanticDeliveryMaintenance: (() => void) | undefined;
 
 		try {
+			releaseSemanticDeliveryMaintenance = await this.#host.beginSemanticDeliveryMaintenance();
 			this.#host.disconnectFromAgent();
 			await this.#host.abort({ goalReason: "internal", preserveCompaction: true });
 			if (!this.#model) {
@@ -927,15 +929,15 @@ export class SessionMaintenance {
 			if (this.#compactionAbortController === compactionAbortController) {
 				this.#compactionAbortController = undefined;
 			}
-			this.#host.reconnectToAgent();
-			// Compaction disconnected before `await abort()`, so abort's finally drain
-
-			// (and any steer/follow-up that arrived mid-compaction — async IRC, an
-			// `xd://` mount notice, an SDK/RPC steer) was suppressed while disconnected
-			// (issue #5800). Unlike `/new`/switchSession, compaction preserves the agent
-			// queues, so nothing else resumes them: re-drain now that the listener is back
-			// and `isCompacting` is false, or the queued turn hangs until the next prompt.
-			this.#host.drainStrandedQueuedMessages();
+			if (releaseSemanticDeliveryMaintenance) {
+				try {
+					this.#host.reconnectToAgent();
+				} finally {
+					// Keep semantic delivery fenced until the listener is back and isCompacting is false.
+					// Releasing the fence re-drains preserved queues after the detached abort path.
+					releaseSemanticDeliveryMaintenance();
+				}
+			}
 		}
 	}
 

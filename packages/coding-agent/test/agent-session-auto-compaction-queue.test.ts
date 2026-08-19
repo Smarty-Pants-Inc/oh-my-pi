@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import { scheduler } from "node:timers/promises";
 import { Agent } from "@oh-my-pi/pi-agent-core";
+import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -247,6 +248,173 @@ describe("AgentSession auto-compaction queue resume", () => {
 		await compactPromise;
 
 		expect(compactingDuringAbort).toBe(true);
+	});
+
+	it("persists a scoped wake before manual compaction disconnects", async () => {
+		vi.useRealTimers();
+		session.settings.set("compaction.keepRecentTokens", 1);
+		sessionManager.appendMessage({
+			role: "assistant",
+			content: [{ type: "text", text: "previous answer" }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			stopReason: "stop",
+			usage: {
+				input: 1_000,
+				output: 100,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 1_100,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		});
+		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+		session.agent.streamFn = createMockModel({ handler: () => ({ content: ["Done"] }) }).stream;
+
+		const countWakeEntries = () =>
+			sessionManager
+				.getBranch()
+				.filter(
+					entry =>
+						entry.type === "custom_message" &&
+						entry.customType === "peer-message" &&
+						JSON.stringify(entry.content).includes("accepted before manual compaction"),
+				).length;
+		const gate = Promise.withResolvers<void>();
+		(globalThis as typeof globalThis & { __ompManualCompactGate?: Promise<void> }).__ompManualCompactGate =
+			gate.promise;
+		let callbackWakeEntries = -1;
+		let compactPromise: Promise<unknown> | undefined;
+
+		const sending = session.sendCustomMessage(
+			{
+				customType: "peer-message",
+				content: "accepted before manual compaction",
+				display: true,
+				attribution: "agent",
+			},
+			{
+				deliveryMode: "auto",
+				automaticTurnSource: "peer_message_wake",
+				onStartedTurnAccepted: () => {
+					callbackWakeEntries = countWakeEntries();
+					compactPromise = session.compact();
+				},
+			},
+		);
+
+		try {
+			await expect(withTimeout(sending, 1000, "Scoped wake acceptance timed out")).resolves.toEqual({
+				status: "accepted",
+				delivery: "started_turn",
+			});
+			expect(callbackWakeEntries).toBe(0);
+			while (!getRuntimeSignals().includes("before_compact:enter")) {
+				await Promise.resolve();
+			}
+			expect(countWakeEntries()).toBe(1);
+		} finally {
+			gate.resolve();
+			await compactPromise;
+		}
+	});
+
+	it("rejects scoped peer wake while manual compaction owns the semantic-delivery fence", async () => {
+		session.settings.set("compaction.keepRecentTokens", 1);
+		vi.useRealTimers();
+		sessionManager.appendMessage({
+			role: "assistant",
+			content: [{ type: "text", text: "previous answer" }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			stopReason: "stop",
+			usage: {
+				input: 1_000,
+				output: 100,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 1_100,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		});
+		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
+		session.agent.streamFn = mock.stream;
+		const countWakeEntries = () =>
+			sessionManager
+				.getBranch()
+				.filter(
+					entry =>
+						entry.type === "custom_message" &&
+						entry.customType === "peer-message" &&
+						JSON.stringify(entry.content).includes("must remain retryable during compaction"),
+				).length;
+
+		const gate = Promise.withResolvers<void>();
+		(globalThis as typeof globalThis & { __ompManualCompactGate?: Promise<void> }).__ompManualCompactGate =
+			gate.promise;
+		const compactPromise = session.compact();
+		while (!getRuntimeSignals().includes("before_compact:enter")) {
+			await Promise.resolve();
+		}
+
+		let committed = false;
+		try {
+			await expect(
+				session.sendCustomMessage(
+					{
+						customType: "peer-message",
+						content: "must remain retryable during compaction",
+						display: true,
+						attribution: "agent",
+					},
+					{
+						deliveryMode: "auto",
+						automaticTurnSource: "peer_message_wake",
+						onStartedTurnAccepted: () => {
+							committed = true;
+						},
+					},
+				),
+			).resolves.toEqual({ status: "unavailable", reason: "session_transition" });
+			expect(committed).toBe(false);
+			expect(mock.calls).toHaveLength(0);
+			expect(countWakeEntries()).toBe(0);
+		} finally {
+			gate.resolve();
+			await compactPromise;
+		}
+
+		expect(countWakeEntries()).toBe(0);
+		await expect(
+			session.sendCustomMessage(
+				{
+					customType: "peer-message",
+					content: "must remain retryable during compaction",
+					display: true,
+					attribution: "agent",
+				},
+				{
+					deliveryMode: "auto",
+					automaticTurnSource: "peer_message_wake",
+					onStartedTurnAccepted: () => {
+						expect(JSON.stringify(session.agent.state.messages)).not.toContain(
+							"must remain retryable during compaction",
+						);
+						expect(countWakeEntries()).toBe(0);
+						committed = true;
+					},
+				},
+			),
+		).resolves.toEqual({ status: "accepted", delivery: "started_turn" });
+		await session.waitForIdle();
+		expect(committed).toBe(true);
+		expect(countWakeEntries()).toBe(1);
+		expect(mock.calls).toHaveLength(1);
 	});
 
 	it("resumes a message queued during manual compaction once it completes (#5800)", async () => {
