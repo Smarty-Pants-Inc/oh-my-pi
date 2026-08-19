@@ -7407,7 +7407,7 @@
     },
     {
       "path": "packages/coding-agent/src/extensibility/plugins/legacy-pi-compat.ts",
-      "sha256": "ae4e1e9ee9932174373bb48b1f429bcbd5befc3c59970b8ef5e60d6c55d95627"
+      "sha256": "a745adf28013a3a6304b8bc372b320a74934383e754dc63a2b2e5aa9eed5f413"
     },
     {
       "path": "packages/coding-agent/src/extensibility/plugins/loader.ts",
@@ -10683,5 +10683,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "9a775190d6bfa1135938adc1a857eabf432b06de540686ab0b854fbcb61d1c20"
+  "rootSha256": "89b466359c6d13d2c473b0072eff98dececdc6c395b340e0c3180d280367bd10"
 }

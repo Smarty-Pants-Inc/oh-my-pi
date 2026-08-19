@@ -272,7 +272,7 @@ function registerOuterDeclaration(node: StructuralAstNode, scope: BindingScope |
 	}
 }
 
-function registerScopeBindings(node: StructuralAstNode, scope: BindingScope): void {
+function registerScopeBindings(node: StructuralAstNode, scope: BindingScope, runtimeBindingsOnly = false): void {
 	if (isFunctionScopeNode(node)) {
 		addPatternBindings(scope, node.id);
 		const parameters = nodeArray(node, "params");
@@ -288,12 +288,14 @@ function registerScopeBindings(node: StructuralAstNode, scope: BindingScope): vo
 		if (specifiers) {
 			for (const value of specifiers) {
 				const specifier = asAstNode(value);
-				if (specifier && !isTypeOnlyImportBinding(node, specifier)) addPatternBindings(scope, specifier.local);
+				if (specifier && (!runtimeBindingsOnly || !isTypeOnlyImportBinding(node, specifier))) {
+					addPatternBindings(scope, specifier.local);
+				}
 			}
 		}
 	} else if (node.type === "TSImportEqualsDeclaration") {
-		if (!isTypeOnlyImportBinding(node)) addPatternBindings(scope, node.id);
-	} else if (node.type === "VariableDeclaration" && node.declare !== true) {
+		if (!runtimeBindingsOnly || !isTypeOnlyImportBinding(node)) addPatternBindings(scope, node.id);
+	} else if (node.type === "VariableDeclaration" && (!runtimeBindingsOnly || node.declare !== true)) {
 		const target = node.kind === "var" ? nearestVarScope(scope) : scope;
 		const declarations = nodeArray(node, "declarations");
 		if (declarations) {
@@ -349,7 +351,11 @@ function scopeForChild(
  * Scope frames are fully populated before selected nodes are returned, so
  * hoisted and TDZ bindings behave independently of textual declaration order.
  */
-function collectScopedAstNodes(root: unknown, select: (node: StructuralAstNode) => boolean): ScopedAstNode[] {
+function collectScopedAstNodes(
+	root: unknown,
+	select: (node: StructuralAstNode) => boolean,
+	runtimeBindingsOnly = false,
+): ScopedAstNode[] {
 	const rootNode = asAstNode(root);
 	if (!rootNode) return [];
 
@@ -373,7 +379,7 @@ function collectScopedAstNodes(root: unknown, select: (node: StructuralAstNode) 
 						bindings: 0,
 					};
 		if (activeScope) {
-			registerScopeBindings(item.node, activeScope);
+			registerScopeBindings(item.node, activeScope, runtimeBindingsOnly);
 			if (select(item.node)) {
 				selected.push({
 					node: item.node,
@@ -558,9 +564,14 @@ function collectExtensionSpecifierReferences(
 	const moduleNamespaceBindings = new Set<string>();
 	const commonJsModuleNamespaceBindings = new Set<string>();
 	const createRequireBindingNodes = new WeakSet<object>();
+	const runtimeBindingsOnly = graphProof !== undefined;
 	const moduleNamespaceBindingNodes = new WeakSet<object>();
 	const nonRuntimeBindingNodes = new WeakSet<object>();
-	for (const { node } of collectScopedAstNodes(ast, candidate => candidate.type === "ImportDeclaration")) {
+	for (const { node } of collectScopedAstNodes(
+		ast,
+		candidate => candidate.type === "ImportDeclaration",
+		runtimeBindingsOnly,
+	)) {
 		const source = asAstNode(node.source);
 		const isNodeModuleSource =
 			source?.type === "StringLiteral" && (source.value === "node:module" || source.value === "module");
@@ -592,7 +603,11 @@ function collectExtensionSpecifierReferences(
 			}
 		}
 	}
-	for (const { node } of collectScopedAstNodes(ast, candidate => candidate.type === "TSImportEqualsDeclaration")) {
+	for (const { node } of collectScopedAstNodes(
+		ast,
+		candidate => candidate.type === "TSImportEqualsDeclaration",
+		runtimeBindingsOnly,
+	)) {
 		const binding = asAstNode(node.id);
 		if (binding?.type !== "Identifier" || typeof binding.name !== "string") continue;
 		if (isTypeOnlyImportBinding(node)) {
@@ -613,7 +628,11 @@ function collectExtensionSpecifierReferences(
 		moduleNamespaceBindingNodes.add(binding);
 	}
 
-	const variableDeclarations = collectScopedAstNodes(ast, candidate => candidate.type === "VariableDeclarator");
+	const variableDeclarations = collectScopedAstNodes(
+		ast,
+		candidate => candidate.type === "VariableDeclarator",
+		runtimeBindingsOnly,
+	);
 	for (const { node, scope, parent } of variableDeclarations) {
 		const binding = asAstNode(node.id);
 		if (parent?.type === "VariableDeclaration" && parent.declare === true && binding?.type === "Identifier") {
@@ -698,7 +717,11 @@ function collectExtensionSpecifierReferences(
 		}
 	}
 
-	for (const { node, scope, parent, parentKey } of collectScopedAstNodes(ast, isSpecifierReferenceNode)) {
+	for (const { node, scope, parent, parentKey } of collectScopedAstNodes(
+		ast,
+		isSpecifierReferenceNode,
+		runtimeBindingsOnly,
+	)) {
 		if (
 			node.type === "CallExpression" &&
 			isCreateRequireInvocation(node, createRequireBindings, moduleNamespaceBindings, scope)
@@ -847,6 +870,7 @@ function collectExtensionSpecifierReferences(
 		for (const { node, scope, parent, parentKey } of collectScopedAstNodes(
 			ast,
 			candidate => candidate.type === "Identifier",
+			runtimeBindingsOnly,
 		)) {
 			if (typeof node.name !== "string") continue;
 			const nonReferenceProperty =
@@ -931,6 +955,7 @@ function collectExtensionSpecifierReferences(
 		for (const { node, scope, parent, parentKey } of collectScopedAstNodes(
 			ast,
 			candidate => candidate.type === "MemberExpression",
+			runtimeBindingsOnly,
 		)) {
 			const object = asAstNode(node.object);
 			const memberName = staticMemberPropertyName(node);
