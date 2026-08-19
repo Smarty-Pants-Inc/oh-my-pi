@@ -51,7 +51,7 @@ export class NdjsonRecordParser {
 	}
 }
 
-function parseAddress(address: string): { hostname: string; port: number } {
+export function parseAddress(address: string): { hostname: string; port: number } {
 	const match = /^([^:]+):(\d+)$/.exec(address);
 	if (!match) throw new Error(`invalid collab bridge address: ${address}`);
 	const hostname = match[1];

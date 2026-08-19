@@ -1,5 +1,15 @@
-import { afterEach, describe, expect, it } from "bun:test";
-import { HerdrCollabHostLifecycle } from "@oh-my-pi/pi-coding-agent/collab/herdr-host-lifecycle";
+import { afterEach, describe, expect, it, spyOn, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import type {
+	HerdrBridgeDiscovery,
+	HerdrHostBridgeCredentials,
+} from "@oh-my-pi/pi-coding-agent/collab/herdr-bridge-bootstrap";
+import * as herdrBridgeBootstrapModule from "@oh-my-pi/pi-coding-agent/collab/herdr-bridge-bootstrap";
+import {
+	HerdrCollabHostLifecycle,
+	type ManagedHerdrHostBridge,
+} from "@oh-my-pi/pi-coding-agent/collab/herdr-host-lifecycle";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -38,7 +48,30 @@ function makeContext(sessionManager: {
 	} as unknown as InteractiveModeContext;
 }
 
-afterEach(() => AgentRegistry.resetGlobalForTests());
+afterEach(() => {
+	vi.restoreAllMocks();
+	AgentRegistry.resetGlobalForTests();
+});
+
+const TEST_DISCOVERY: HerdrBridgeDiscovery = { socketPath: "/synthetic/herdr.sock", paneId: "pane-1" };
+
+function createLifecycle(
+	ctx: InteractiveModeContext,
+	session: Pick<AgentSession, "registerSessionChangeCallback" | "sessionManager">,
+	credentials: HerdrHostBridgeCredentials,
+	discoverHostBridge: (discovery: HerdrBridgeDiscovery) => Promise<HerdrHostBridgeCredentials> = async () =>
+		credentials,
+): HerdrCollabHostLifecycle {
+	vi.spyOn(herdrBridgeBootstrapModule, "discoverHerdrHostBridge").mockImplementation(discoverHostBridge);
+	const bridge: ManagedHerdrHostBridge = {
+		role: "host",
+		managed: true,
+		current: credentials,
+		discovery: TEST_DISCOVERY,
+		routeGeneration: 1,
+	};
+	return new HerdrCollabHostLifecycle(ctx, session, bridge);
+}
 
 describe("managed Herdr collab host lifecycle", () => {
 	it("defers an initially suspended private route until the public guest session ends", async () => {
@@ -100,20 +133,25 @@ describe("managed Herdr collab host lifecycle", () => {
 				};
 			},
 		} as unknown as Pick<AgentSession, "registerSessionChangeCallback" | "sessionManager">;
-		const lifecycle = new HerdrCollabHostLifecycle(ctx, session, {
-			role: "host",
-			managed: true,
+		const credentials = {
 			address: `127.0.0.1:${server.port}`,
 			token: "bridge-token",
 			paneId: "pane-1",
-			routeGeneration: 1,
+		};
+		let discoveryRequests = 0;
+		const lifecycle = createLifecycle(ctx, session, credentials, async discovery => {
+			discoveryRequests += 1;
+			expect(discovery).toEqual(TEST_DISCOVERY);
+			return credentials;
 		});
 
 		try {
 			await lifecycle.start(true);
+			expect(discoveryRequests).toBe(0);
 			expect(records).toHaveLength(0);
 			await lifecycle.resume();
 			const first = await waitForRecord(0);
+			expect(discoveryRequests).toBe(1);
 			const firstHost = ctx.herdrCollabHost;
 			expect(first).toMatchObject({
 				t: "host",
@@ -140,6 +178,7 @@ describe("managed Herdr collab host lifecycle", () => {
 			ctx.collabGuest = undefined;
 			await lifecycle.resume();
 			const second = await waitForRecord(1);
+			expect(discoveryRequests).toBe(2);
 			expect(second).toMatchObject({
 				t: "host",
 				ompSessionId: "session-two",
@@ -156,6 +195,41 @@ describe("managed Herdr collab host lifecycle", () => {
 		expect(ctx.collabHost).toBe(publicHost);
 	});
 
+	it("rejects initial activation when Herdr sends ready and terminal close in one read", async () => {
+		const sessionManager = {
+			getSessionId: () => "session-one",
+			snapshotForReplication: () => ({
+				header: { type: "session", id: "session-one", timestamp: "2026-01-01T00:00:00Z", cwd: "/host" },
+				entries: [],
+			}),
+		};
+		const ctx = makeContext(sessionManager);
+		const socket = { write: () => 0, end: () => {} } as unknown as Bun.Socket<undefined>;
+		const connectSpy = spyOn(Bun, "connect").mockImplementation(((
+			options: Bun.TCPSocketConnectOptions<undefined>,
+		) => {
+			options.socket.open?.(socket);
+			options.socket.data?.(socket, Buffer.from('{"t":"ready"}\n{"t":"close","reason":"bridge dropped"}\n'));
+			return Promise.resolve(socket);
+		}) as typeof Bun.connect);
+		const session = {
+			sessionManager,
+			registerSessionChangeCallback: () => () => {},
+		} as unknown as Pick<AgentSession, "registerSessionChangeCallback" | "sessionManager">;
+		const lifecycle = createLifecycle(ctx, session, {
+			address: "127.0.0.1:1",
+			token: "bridge-token",
+			paneId: "pane-1",
+		});
+
+		try {
+			await expect(lifecycle.start()).rejects.toThrow("bridge dropped");
+			expect(ctx.herdrCollabHost).toBeUndefined();
+		} finally {
+			connectSpy.mockRestore();
+			await lifecycle.stop("test cleanup");
+		}
+	});
 	it("waits through a delayed route release and rearms one terminal private-route close", async () => {
 		const sessionManager = {
 			getSessionId: () => "session-one",
@@ -220,13 +294,15 @@ describe("managed Herdr collab host lifecycle", () => {
 			sessionManager,
 			registerSessionChangeCallback: () => () => {},
 		} as unknown as Pick<AgentSession, "registerSessionChangeCallback" | "sessionManager">;
-		const lifecycle = new HerdrCollabHostLifecycle(ctx, session, {
-			role: "host",
-			managed: true,
+		const credentials = {
 			address: `127.0.0.1:${server.port}`,
 			token: "bridge-token",
 			paneId: "pane-1",
-			routeGeneration: 1,
+		};
+		let discoveryRequests = 0;
+		const lifecycle = createLifecycle(ctx, session, credentials, async () => {
+			discoveryRequests += 1;
+			return credentials;
 		});
 
 		try {
@@ -239,6 +315,7 @@ describe("managed Herdr collab host lifecycle", () => {
 			await lifecycle.resume();
 			const resumedRecord = await waitForRecord(4);
 			await lifecycle.whenIdle();
+			expect(discoveryRequests).toBe(5);
 			const resumedHost = ctx.herdrCollabHost;
 			expect(resumedRecord).toMatchObject({ t: "host", ompSessionId: "session-one" });
 			expect(records).toHaveLength(5);
@@ -250,6 +327,7 @@ describe("managed Herdr collab host lifecycle", () => {
 			closeResumedHost();
 			await waitForRecord(5);
 			await lifecycle.whenIdle();
+			expect(discoveryRequests).toBe(6);
 			const rearmedHost = ctx.herdrCollabHost;
 			expect(rearmedHost).toBeDefined();
 			expect(rearmedHost).not.toBe(resumedHost);
@@ -313,13 +391,10 @@ describe("managed Herdr collab host lifecycle", () => {
 			sessionManager,
 			registerSessionChangeCallback: () => () => {},
 		} as unknown as Pick<AgentSession, "registerSessionChangeCallback" | "sessionManager">;
-		const lifecycle = new HerdrCollabHostLifecycle(ctx, session, {
-			role: "host",
-			managed: true,
+		const lifecycle = createLifecycle(ctx, session, {
 			address: `127.0.0.1:${server.port}`,
 			token: "bridge-token",
 			paneId: "pane-1",
-			routeGeneration: 1,
 		});
 
 		try {
@@ -406,13 +481,10 @@ describe("managed Herdr collab host lifecycle", () => {
 				};
 			},
 		} as unknown as Pick<AgentSession, "registerSessionChangeCallback" | "sessionManager">;
-		const lifecycle = new HerdrCollabHostLifecycle(ctx, session, {
-			role: "host",
-			managed: true,
+		const lifecycle = createLifecycle(ctx, session, {
 			address: `127.0.0.1:${server.port}`,
 			token: "bridge-token",
 			paneId: "pane-1",
-			routeGeneration: 1,
 		});
 
 		try {
@@ -439,4 +511,127 @@ describe("managed Herdr collab host lifecycle", () => {
 			server.stop(true);
 		}
 	});
+
+	it.skipIf(process.platform === "win32")(
+		"uses discovery credentials before attempting the inherited address",
+		async () => {
+			const root = await fs.mkdtemp(path.join("/tmp", "omp-herdr-stale-"));
+			const socketPath = path.join(root, "herdr.sock");
+			const staleAnnouncements: Record<string, unknown>[] = [];
+			const freshAnnouncements: Record<string, unknown>[] = [];
+			const discoveryRequests: Record<string, unknown>[] = [];
+			let stalePending = "";
+			let freshPending = "";
+			let discoveryPending = "";
+			const staleServer = Bun.listen({
+				hostname: "127.0.0.1",
+				port: 0,
+				socket: {
+					open() {},
+					data(socket, data) {
+						stalePending += data.toString();
+						const newline = stalePending.indexOf("\n");
+						if (newline < 0) return;
+						const record = JSON.parse(stalePending.slice(0, newline)) as Record<string, unknown>;
+						stalePending = stalePending.slice(newline + 1);
+						if (record.t !== "host") return;
+						staleAnnouncements.push(record);
+						socket.write(
+							'{"t":"error","code":"host-authentication-failed","message":"OMP host bridge token was rejected"}\n',
+						);
+					},
+				},
+			});
+			const freshServer = Bun.listen({
+				hostname: "127.0.0.1",
+				port: 0,
+				socket: {
+					open() {},
+					data(socket, data) {
+						freshPending += data.toString();
+						const newline = freshPending.indexOf("\n");
+						if (newline < 0) return;
+						const record = JSON.parse(freshPending.slice(0, newline)) as Record<string, unknown>;
+						freshPending = freshPending.slice(newline + 1);
+						if (record.t !== "host") return;
+						freshAnnouncements.push(record);
+						socket.write('{"t":"ready"}\n');
+					},
+				},
+			});
+			const discoveryServer = Bun.listen({
+				unix: socketPath,
+				socket: {
+					open() {},
+					data(socket, data) {
+						discoveryPending += data.toString();
+						const newline = discoveryPending.indexOf("\n");
+						if (newline < 0) return;
+						const request = JSON.parse(discoveryPending.slice(0, newline)) as Record<string, unknown>;
+						discoveryPending = discoveryPending.slice(newline + 1);
+						discoveryRequests.push(request);
+						socket.write(
+							`${JSON.stringify({
+								id: request.id,
+								result: {
+									type: "pane_omp_bridge",
+									pane_id: "pane-current",
+									address: `127.0.0.1:${freshServer.port}`,
+									token: "fresh-token",
+								},
+							})}\n`,
+						);
+					},
+					close() {},
+					error() {},
+				},
+			});
+			const sessionManager = {
+				getSessionId: () => "session-one",
+				snapshotForReplication: () => ({
+					header: { type: "session", id: "session-one", timestamp: "2026-01-01T00:00:00Z", cwd: "/host" },
+					entries: [],
+				}),
+			};
+			const ctx = makeContext(sessionManager);
+			const errors: string[] = [];
+			ctx.showError = message => errors.push(message);
+			const session = {
+				sessionManager,
+				registerSessionChangeCallback: () => () => {},
+			} as unknown as Pick<AgentSession, "registerSessionChangeCallback" | "sessionManager">;
+			const lifecycle = new HerdrCollabHostLifecycle(ctx, session, {
+				role: "host",
+				managed: true,
+				current: {
+					address: `127.0.0.1:${staleServer.port}`,
+					token: "stale-token",
+					paneId: "pane-1",
+				},
+				discovery: { socketPath, paneId: "pane-1" },
+				routeGeneration: 1,
+			});
+
+			try {
+				await lifecycle.start();
+				expect(staleAnnouncements).toHaveLength(0);
+				expect(discoveryRequests).toHaveLength(1);
+				expect(discoveryRequests[0]).toMatchObject({
+					method: "pane.omp_bridge",
+					params: { pane_id: "pane-1" },
+				});
+				expect(freshAnnouncements).toHaveLength(1);
+				expect(freshAnnouncements[0]?.token).toBe("fresh-token");
+				expect(freshAnnouncements[0]?.paneId).toBe("pane-current");
+				expect(ctx.herdrCollabHost).toBeDefined();
+				expect(errors).toEqual([]);
+			} finally {
+				await lifecycle.stop("test cleanup");
+				discoveryServer.stop(true);
+				staleServer.stop(true);
+				freshServer.stop(true);
+				await fs.rm(root, { recursive: true, force: true });
+			}
+		},
+	);
 });
