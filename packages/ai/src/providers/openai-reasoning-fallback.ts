@@ -63,6 +63,21 @@ export function rememberOpenAIReasoningEffortFallback(
 }
 
 /** @internal */
+export function mergeOpenAIReasoningEffortFallback(
+	current: OpenAIReasoningEffortFallback | undefined,
+	delta: OpenAIReasoningEffortFallback,
+): OpenAIReasoningEffortFallback {
+	const merged = new Map(current);
+	for (const [rejectedEffort, replacement] of delta) {
+		for (const [knownRejectedEffort, knownReplacement] of merged) {
+			if (knownReplacement === rejectedEffort) merged.set(knownRejectedEffort, replacement);
+		}
+		merged.set(rejectedEffort, replacement);
+	}
+	return [...merged];
+}
+
+/** @internal */
 export function createOpenAIReasoningEffortFallbackKey(
 	endpoint: "chat-completions" | "responses" | "azure-responses",
 	baseUrl: string | undefined,

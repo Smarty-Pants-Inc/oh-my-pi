@@ -11,6 +11,7 @@ test("lightweight cache resolver matches every descriptor default", () => {
 test("lightweight cache resolver matches scoped descriptor inputs", () => {
 	const cases = [
 		{ providerId: "litellm", baseUrl: "http://litellm.example:4100/v1" },
+		{ providerId: "lm-studio", baseUrl: "http://lm-studio.example:1234/v1" },
 		{ providerId: "ollama", baseUrl: "http://ollama.example:11434/v1/" },
 		{ providerId: "opencode-go", baseUrl: "https://opencode.example/go" },
 		{ providerId: "opencode-zen", baseUrl: "https://opencode.example/zen/v1/" },

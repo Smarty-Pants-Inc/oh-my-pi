@@ -70,16 +70,34 @@ function createResponsesSseResponse(id = "resp_reasoning_fallback"): Response {
 	});
 }
 
-function invalidReasoningResponse(param: string, value: string): Response {
+function invalidReasoningResponse(
+	param: string,
+	value: string,
+	allowed: readonly string[] = ["high", "medium", "low", "max", "none"],
+): Response {
 	return new Response(
 		JSON.stringify({
 			error: {
-				message: `invalid reasoning value: '${value}' (must be "high", "medium", "low", "max", or "none")`,
+				message: `invalid reasoning value: '${value}' (must be ${allowed.map(item => `"${item}"`).join(", ")})`,
 				type: "invalid_request_error",
 				param,
 			},
 		}),
 		{ status: 400, headers: { "content-type": "application/json" } },
+	);
+}
+
+function stalePreviousResponse(): Response {
+	return new Response(
+		JSON.stringify({
+			error: {
+				message: "Previous response with id 'resp_reasoning_baseline' not found.",
+				type: "invalid_request_error",
+				param: "previous_response_id",
+				code: "previous_response_not_found",
+			},
+		}),
+		{ status: 404, headers: { "content-type": "application/json" } },
 	);
 }
 
@@ -413,6 +431,74 @@ describe("OpenAI reasoning effort fallback retry", () => {
 		};
 		const chain = [...state.chains.values()][0]!;
 		expect(chain.lastParams?.reasoning?.effort).toBe("max");
+	});
+
+	it("accumulates multi-step Responses fallbacks across request rebuilds and persists each rejected tier", async () => {
+		const bodies: Record<string, unknown>[] = [];
+		const fetchMock: FetchImpl = Object.assign(
+			async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+				const body = parseJsonBody(init);
+				bodies.push(body);
+				if (bodies.length === 1) return createResponsesSseResponse("resp_reasoning_baseline");
+				if (bodies.length === 2) {
+					return invalidReasoningResponse("reasoning.effort", "xhigh", ["high", "low"]);
+				}
+				if (bodies.length === 3) return invalidReasoningResponse("reasoning.effort", "high", ["low"]);
+				if (bodies.length === 4) return stalePreviousResponse();
+				return createResponsesSseResponse(`resp_reasoning_${bodies.length}`);
+			},
+			{ preconnect: fetch.preconnect },
+		);
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const model = createResponsesModel();
+		const statefulOptions = {
+			apiKey: "test-key",
+			fetch: fetchMock,
+			providerSessionState,
+			reasoning: "xhigh" as const,
+			statefulResponses: true,
+			sessionId: "reasoning-fallback-rebuild-session",
+		};
+
+		const baseline = await streamOpenAIResponses(model, testContext, statefulOptions).result();
+		expect(baseline.stopReason).toBe("stop");
+		const recovered = await streamOpenAIResponses(
+			model,
+			{
+				messages: [...testContext.messages, baseline, { role: "user", content: "continue", timestamp: 1 }],
+			},
+			statefulOptions,
+		).result();
+		expect(recovered.stopReason).toBe("stop");
+
+		for (const reasoning of ["xhigh", "high", "low", "medium"] as const) {
+			const result = await streamOpenAIResponses(model, testContext, {
+				apiKey: "test-key",
+				fetch: fetchMock,
+				providerSessionState,
+				reasoning,
+				statefulResponses: false,
+			}).result();
+			expect(result.stopReason).toBe("stop");
+		}
+
+		expect(bodies.map(body => (body.reasoning as { effort?: string } | undefined)?.effort)).toEqual([
+			"xhigh",
+			"xhigh",
+			"high",
+			"low",
+			"low",
+			"low",
+			"low",
+			"low",
+			"medium",
+		]);
+		expect(bodies.slice(1, 4).map(body => body.previous_response_id)).toEqual([
+			"resp_reasoning_baseline",
+			"resp_reasoning_baseline",
+			"resp_reasoning_baseline",
+		]);
+		expect(bodies[4]?.previous_response_id).toBeUndefined();
 	});
 
 	it("retries pipe-delimited reasoning.effort errors with the nearest supported tier", async () => {

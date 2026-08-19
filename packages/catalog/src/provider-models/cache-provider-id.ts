@@ -50,6 +50,10 @@ export function resolveModelCacheProviderId(providerId: string, options: ModelCa
 			const baseUrl = options.baseUrl ?? getDefaultModelDiscoveryBaseUrl(providerId)!;
 			return `litellm:rich-v5:${Bun.hash(baseUrl).toString(36)}`;
 		}
+		case "lm-studio":
+			// v2: Qwen 3.8+ rows cached before the reasoning/template-effort upgrade
+			// carry `reasoning: false` and must be refetched.
+			return "lm-studio:models-v2";
 		case "opencode-go":
 		case "opencode-zen": {
 			const configuredBaseUrl = options.baseUrl ?? getDefaultModelDiscoveryBaseUrl(providerId)!;

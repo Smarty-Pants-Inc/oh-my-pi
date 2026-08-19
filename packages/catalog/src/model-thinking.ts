@@ -184,9 +184,7 @@ function fillThinkingWireDefaults<TApi extends Api>(
 		thinking.supportsDisplay === undefined &&
 		(spec.api === "anthropic-messages" || spec.api === "bedrock-converse-stream") &&
 		supportsAdaptiveThinkingDisplay(spec.id);
-	const needsRequiresEffort =
-		thinking.requiresEffort === undefined &&
-		(impliesMandatoryReasoning(parsed, spec.id) || isQwenTemplateReasoningEffortCompat(compat));
+	const needsRequiresEffort = thinking.requiresEffort === undefined && impliesMandatoryReasoning(parsed, spec.id);
 	const needsDefaultLevel =
 		thinking.defaultLevel === undefined && (isKimiK3ModelId(spec.id) || isGlm53ReasoningEffortModelId(spec.id));
 	if (!effortsChanged && !shouldReplaceEffortMap && !needsDisplay && !needsRequiresEffort && !needsDefaultLevel) {
@@ -239,7 +237,7 @@ export function deriveThinking<TApi extends Api>(spec: ModelSpec<TApi>, compat: 
 	) {
 		config.supportsDisplay = true;
 	}
-	if (impliesMandatoryReasoning(parsed, spec.id) || isQwenTemplateReasoningEffortCompat(compat)) {
+	if (impliesMandatoryReasoning(parsed, spec.id)) {
 		config.requiresEffort = true;
 	}
 	return config;
@@ -385,8 +383,8 @@ function getModelDefinedEfforts<TApi extends Api>(
 	}
 	// Qwen 3.8+ served through a local llama.cpp-style backend: the chat
 	// template's prompt-steered `reasoning_effort` kwarg accepts exactly
-	// low/medium/xhigh (and thinking cannot be turned off — the official 3.8
-	// template raises on `enable_thinking: false`, hence requiresEffort).
+	// low/medium/xhigh while the independent thinking toggle retains its
+	// normal off/default semantics.
 	if (isOpenAICompatReasoningApi(spec.api) && isQwenTemplateReasoningEffortCompat(compat)) {
 		return QWEN38_TEMPLATE_REASONING_EFFORTS;
 	}

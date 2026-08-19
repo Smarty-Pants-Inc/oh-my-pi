@@ -3397,9 +3397,7 @@ export function lmStudioModelManagerOptions(
 	const references = createBundledReferenceMap<"openai-completions">("lm-studio" as any);
 	return {
 		providerId: "lm-studio",
-		// v2: Qwen 3.8+ rows cached before the reasoning/template-effort upgrade
-		// carry `reasoning: false` and must be refetched.
-		cacheProviderId: "lm-studio:models-v2",
+		cacheProviderId: resolveModelCacheProviderId("lm-studio", { apiKey, baseUrl }),
 		fetchDynamicModels: async () => {
 			const nativeMetadataPromise = fetchLmStudioNativeModelMetadata(baseUrl, config?.fetch, {
 				headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : undefined,
@@ -5000,9 +4998,9 @@ export function vllmModelManagerOptions(config?: VllmModelManagerConfig): ModelM
 						...model,
 						contextWindow: toPositiveNumber(entry.max_model_len, model.contextWindow),
 						// vLLM's /v1/models reports no reasoning capability. Qwen 3.8+
-						// open weights always think (the template cannot disable it), so
-						// light up the effort dial; buildModel derives the template
-						// ladder from the id + local-backend compat.
+						// open weights expose the template effort dial, so mark the
+						// capability; buildModel derives its ladder without changing the
+						// independent thinking-off/default behavior.
 						reasoning: model.reasoning || isQwen38PlusTemplateEffortModelId(model.id),
 					};
 				},

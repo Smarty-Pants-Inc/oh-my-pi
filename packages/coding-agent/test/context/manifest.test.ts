@@ -168,13 +168,14 @@ describe("tracked context manifest", () => {
 		}
 	});
 
-	it("rejects tracked byte drift hidden by Git worktree flags", async () => {
+	it("rejects tracked byte, mode, and type drift hidden by Git worktree flags", async () => {
 		const repositoryRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-hidden-extension-drift-"));
 		const packageRoot = path.join(repositoryRoot, "packages/plugin");
 		const indexPath = path.join(packageRoot, "src/index.ts");
 		const storePath = path.join(packageRoot, "src/store.ts");
+		const targetPath = path.join(packageRoot, "src/target.ts");
 		const relativeStorePath = "packages/plugin/src/store.ts";
-		const originalStore = "export const value = 1;\n";
+		const originalStore = "target.ts";
 		const runGit = (...args: string[]): string => {
 			const result = Bun.spawnSync(["git", ...args], { cwd: repositoryRoot, stdout: "pipe", stderr: "pipe" });
 			if (result.exitCode !== 0) throw new Error(result.stderr.toString());
@@ -186,6 +187,7 @@ describe("tracked context manifest", () => {
 				Bun.write(path.join(packageRoot, "package.json"), '{"name":"hidden-drift-plugin","type":"module"}\n'),
 				Bun.write(indexPath, 'import "./store.js";\nexport default function plugin() {}\n'),
 				Bun.write(storePath, originalStore),
+				Bun.write(targetPath, "export const target = true;\n"),
 			]);
 			runGit("init", "-q");
 			runGit("config", "user.name", "OMP Test");
@@ -212,6 +214,60 @@ describe("tracked context manifest", () => {
 				runGit("update-index", showFlag, relativeStorePath);
 				expect(await isApprovedCandidateSource(indexPath, release)).toBe(true);
 			}
+			if (process.platform !== "win32") {
+				runGit("update-index", "--assume-unchanged", relativeStorePath);
+				await fs.chmod(storePath, 0o755);
+				expect(runGit("status", "--porcelain=v1", "--", relativeStorePath)).toBe("");
+				expect(await isApprovedCandidateSource(indexPath, release)).toBe(false);
+				await fs.chmod(storePath, 0o644);
+				expect(await isApprovedCandidateSource(indexPath, release)).toBe(true);
+
+				await fs.rm(storePath);
+				await fs.symlink("target.ts", storePath);
+				expect(runGit("status", "--porcelain=v1", "--", relativeStorePath)).toBe("");
+				expect(await isApprovedCandidateSource(indexPath, release)).toBe(false);
+				await fs.rm(storePath);
+				await Bun.write(storePath, originalStore);
+				runGit("update-index", "--no-assume-unchanged", relativeStorePath);
+				expect(await isApprovedCandidateSource(indexPath, release)).toBe(true);
+			}
+		} finally {
+			await fs.rm(repositoryRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("treats package directories as literal Git pathspecs", async () => {
+		const repositoryRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-literal-package-pathspec-"));
+		const packageRoot = path.join(repositoryRoot, "packages/plugin[1]");
+		const indexPath = path.join(packageRoot, "src/index.ts");
+		const storePath = path.join(packageRoot, "src/store.ts");
+		const runGit = (...args: string[]): string => {
+			const result = Bun.spawnSync(["git", ...args], { cwd: repositoryRoot, stdout: "pipe", stderr: "pipe" });
+			if (result.exitCode !== 0) throw new Error(result.stderr.toString());
+			return result.stdout.toString().trim();
+		};
+		try {
+			await fs.mkdir(path.dirname(indexPath), { recursive: true });
+			await Promise.all([
+				Bun.write(path.join(packageRoot, "package.json"), '{"name":"literal-pathspec-plugin","type":"module"}\n'),
+				Bun.write(indexPath, 'import "./store.js";\nexport default function plugin() {}\n'),
+				Bun.write(storePath, "export const value = 1;\n"),
+			]);
+			runGit("init", "-q");
+			runGit("config", "user.name", "OMP Test");
+			runGit("config", "user.email", "omp-test@example.com");
+			runGit("remote", "add", "origin", "https://github.com/Smarty-Pants-Inc/smarty-dev.git");
+			runGit("add", ".");
+			runGit("commit", "-qm", "approved literal-pathspec package");
+			const commit = runGit("rev-parse", "HEAD");
+			const tree = runGit("rev-parse", "HEAD^{tree}");
+			const release = {
+				candidates: [{ repository: "Smarty-Pants-Inc/smarty-dev", commit, tree }],
+			} as unknown as Parameters<typeof isApprovedCandidateSource>[1];
+
+			expect(await isApprovedCandidateSource(indexPath, release)).toBe(true);
+			await Bun.write(storePath, "export const value = 2;\n");
+			expect(await isApprovedCandidateSource(indexPath, release)).toBe(false);
 		} finally {
 			await fs.rm(repositoryRoot, { recursive: true, force: true });
 		}

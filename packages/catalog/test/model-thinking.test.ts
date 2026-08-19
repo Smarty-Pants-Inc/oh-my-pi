@@ -986,19 +986,18 @@ describe("model thinking runtime helpers", () => {
 });
 
 describe("Qwen 3.8 local template effort ladder", () => {
-	it("derives the low/medium/xhigh ladder with mandatory effort on local llama.cpp-style backends", () => {
+	it("derives the low/medium/xhigh ladder without making reasoning mandatory", () => {
 		const llamaCpp = createModel({
 			id: "qwen3.8-27b",
 			api: "openai-completions",
 			provider: "llama.cpp",
 			baseUrl: "http://127.0.0.1:8080/v1",
 		});
-		// Official 3.8 template: reasoning_effort accepts exactly low/medium/xhigh
-		// and raises on `enable_thinking: false` — off must clamp, never disable.
+		// Template effort routing is independent from whether thinking is enabled
+		// and from the caller's default effort selection.
 		expect(llamaCpp.thinking).toEqual({
 			mode: "effort",
 			efforts: [Effort.Low, Effort.Medium, Effort.XHigh],
-			requiresEffort: true,
 		});
 		expect(llamaCpp.compat.qwenTemplateReasoningEffort).toBe(true);
 		// Unsupported tiers clamp onto real wire tiers: high floors to medium
@@ -1008,18 +1007,24 @@ describe("Qwen 3.8 local template effort ladder", () => {
 		expect(minimumSupportedEffort(llamaCpp)).toBe(Effort.Low);
 	});
 
-	it("normalizes a stale cached generic ladder to the template ladder", () => {
+	it("normalizes a stale cached ladder without overriding explicit off/default semantics", () => {
 		const cached = createModel({
 			id: "qwen3.8-27b",
 			api: "openai-completions",
 			provider: "vllm",
 			baseUrl: "http://127.0.0.1:8000/v1",
-			thinking: { mode: "effort", efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High] },
+			thinking: {
+				mode: "effort",
+				efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High],
+				defaultLevel: Effort.Medium,
+				requiresEffort: false,
+			},
 		});
 		expect(cached.thinking).toEqual({
 			mode: "effort",
 			efforts: [Effort.Low, Effort.Medium, Effort.XHigh],
-			requiresEffort: true,
+			defaultLevel: Effort.Medium,
+			requiresEffort: false,
 		});
 	});
 

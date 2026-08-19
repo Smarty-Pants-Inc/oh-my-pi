@@ -601,7 +601,13 @@ export function approvedCandidateSourceMatches(
 	);
 }
 
-function gitBlobObjectId(bytes: Uint8Array, expectedLength: number): string | undefined {
+type WorkingTreeEntry =
+	| { readonly kind: "file"; readonly mode: "100644" | "100755" | "120000"; readonly objectId: string }
+	| { readonly kind: "tree"; readonly entries: Map<string, WorkingTreeEntry> };
+
+const UTF8_ENCODER = new TextEncoder();
+
+function gitObjectId(type: "blob" | "tree", bytes: Uint8Array, expectedLength: number): string | undefined {
 	const hasher =
 		expectedLength === 40
 			? new Bun.CryptoHasher("sha1")
@@ -609,35 +615,133 @@ function gitBlobObjectId(bytes: Uint8Array, expectedLength: number): string | un
 				? new Bun.CryptoHasher("sha256")
 				: undefined;
 	if (!hasher) return undefined;
-	hasher.update(`blob ${bytes.byteLength}\0`);
+	hasher.update(`${type} ${bytes.byteLength}\0`);
 	hasher.update(bytes);
 	return hasher.digest("hex");
 }
 
-async function workingPackageBytesMatchHead(repositoryRoot: string, packagePathspec: string): Promise<boolean> {
-	const trackedPaths = await ls.tree(repositoryRoot, "HEAD", [packagePathspec]);
+function objectIdBytes(objectId: string): Uint8Array | undefined {
+	if (objectId.length % 2 !== 0 || !/^[a-f0-9]+$/.test(objectId)) return undefined;
+	const bytes = new Uint8Array(objectId.length / 2);
+	for (let index = 0; index < bytes.length; index++) {
+		bytes[index] = Number.parseInt(objectId.slice(index * 2, index * 2 + 2), 16);
+	}
+	return bytes;
+}
+
+function concatenateBytes(chunks: readonly Uint8Array[]): Uint8Array {
+	const bytes = new Uint8Array(chunks.reduce((total, chunk) => total + chunk.byteLength, 0));
+	let offset = 0;
+	for (const chunk of chunks) {
+		bytes.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	return bytes;
+}
+
+function compareGitTreeEntries(
+	[leftName, left]: readonly [string, WorkingTreeEntry],
+	[rightName, right]: readonly [string, WorkingTreeEntry],
+): number {
+	const leftBytes = UTF8_ENCODER.encode(leftName);
+	const rightBytes = UTF8_ENCODER.encode(rightName);
+	const commonLength = Math.min(leftBytes.length, rightBytes.length);
+	for (let index = 0; index < commonLength; index++) {
+		const difference = (leftBytes[index] ?? 0) - (rightBytes[index] ?? 0);
+		if (difference !== 0) return difference;
+	}
+	const leftTerminator =
+		leftBytes.length === commonLength ? (left.kind === "tree" ? 0x2f : 0) : leftBytes[commonLength];
+	const rightTerminator =
+		rightBytes.length === commonLength ? (right.kind === "tree" ? 0x2f : 0) : rightBytes[commonLength];
+	return (leftTerminator ?? 0) - (rightTerminator ?? 0);
+}
+
+function workingTreeObjectId(
+	tree: Extract<WorkingTreeEntry, { kind: "tree" }>,
+	expectedLength: number,
+): string | undefined {
+	const chunks: Uint8Array[] = [];
+	for (const [name, entry] of [...tree.entries].sort(compareGitTreeEntries)) {
+		const objectId = entry.kind === "tree" ? workingTreeObjectId(entry, expectedLength) : entry.objectId;
+		if (!objectId) return undefined;
+		const idBytes = objectIdBytes(objectId);
+		if (!idBytes) return undefined;
+		const mode = entry.kind === "tree" ? "40000" : entry.mode;
+		chunks.push(UTF8_ENCODER.encode(`${mode} ${name}\0`), idBytes);
+	}
+	return gitObjectId("tree", concatenateBytes(chunks), expectedLength);
+}
+
+async function workingPackageTreeObjectId(
+	repositoryRoot: string,
+	relativeSourceRoot: string,
+	expectedLength: number,
+): Promise<string | undefined> {
+	const trackedPaths = await ls.tree(repositoryRoot, "HEAD", [`:(literal)${relativeSourceRoot || "."}`]);
+	const root: Extract<WorkingTreeEntry, { kind: "tree" }> = { kind: "tree", entries: new Map() };
+	const verifiedDirectories = new Set<string>();
 	for (const trackedPath of trackedPaths) {
+		const relative = relativeSourceRoot ? path.posix.relative(relativeSourceRoot, trackedPath) : trackedPath;
+		if (!relative || relative === ".." || relative.startsWith("../") || path.posix.isAbsolute(relative))
+			return undefined;
+		const parts = relative.split("/");
+		let tree = root;
+		for (let index = 0; index < parts.length - 1; index++) {
+			const directoryPath = path.resolve(repositoryRoot, relativeSourceRoot, ...parts.slice(0, index + 1));
+			if (!verifiedDirectories.has(directoryPath)) {
+				try {
+					if (!(await fs.lstat(directoryPath)).isDirectory()) return undefined;
+				} catch {
+					return undefined;
+				}
+				verifiedDirectories.add(directoryPath);
+			}
+			const name = parts[index];
+			if (!name) return undefined;
+			const existing = tree.entries.get(name);
+			if (existing?.kind === "file") return undefined;
+			if (existing) {
+				tree = existing;
+			} else {
+				const child: Extract<WorkingTreeEntry, { kind: "tree" }> = { kind: "tree", entries: new Map() };
+				tree.entries.set(name, child);
+				tree = child;
+			}
+		}
+
+		const name = parts.at(-1);
+		if (!name || tree.entries.has(name)) return undefined;
 		const absolutePath = path.resolve(repositoryRoot, trackedPath);
-		const relative = path.relative(repositoryRoot, absolutePath);
-		if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return false;
-		const expectedObject = await ref.resolve(repositoryRoot, `HEAD:${trackedPath}`);
-		if (!expectedObject) return false;
+		const repositoryRelative = path.relative(repositoryRoot, absolutePath);
+		if (
+			repositoryRelative === ".." ||
+			repositoryRelative.startsWith(`..${path.sep}`) ||
+			path.isAbsolute(repositoryRelative)
+		) {
+			return undefined;
+		}
 		let bytes: Uint8Array;
+		let mode: "100644" | "100755" | "120000";
 		try {
 			const stats = await fs.lstat(absolutePath);
 			if (stats.isSymbolicLink()) {
-				bytes = new TextEncoder().encode(await fs.readlink(absolutePath));
+				mode = "120000";
+				bytes = UTF8_ENCODER.encode(await fs.readlink(absolutePath));
 			} else if (stats.isFile()) {
+				mode = (stats.mode & 0o100) === 0 ? "100644" : "100755";
 				bytes = await Bun.file(absolutePath).bytes();
 			} else {
-				return false;
+				return undefined;
 			}
 		} catch {
-			return false;
+			return undefined;
 		}
-		if (gitBlobObjectId(bytes, expectedObject.length) !== expectedObject) return false;
+		const objectId = gitObjectId("blob", bytes, expectedLength);
+		if (!objectId) return undefined;
+		tree.entries.set(name, { kind: "file", mode, objectId });
 	}
-	return true;
+	return trackedPaths.length > 0 ? workingTreeObjectId(root, expectedLength) : undefined;
 }
 
 async function approvedCandidateSourceRoot(
@@ -682,10 +786,10 @@ export async function isApprovedCandidateSource(filePath: string, release: Conte
 		const sourceRoot = await approvedCandidateSourceRoot(repositoryRoot, resolved, candidate.commit);
 		if (!sourceRoot) return false;
 		const relativeSourceRoot = path.relative(repositoryRoot, sourceRoot).replaceAll(path.sep, "/");
-		const packagePathspec = relativeSourceRoot || ".";
+		const packagePathspec = `:(literal)${relativeSourceRoot || "."}`;
 		// Keep runtime plugin graph loading outside native-free offline context commands.
 		const { isExtensionSourceGraphContained } = await import("../extensibility/plugins/legacy-pi-compat");
-		const [approvedPackageTree, headPackageTree, workingSourceStatus, workingBytesMatch, sourceGraphContained] =
+		const [approvedPackageTree, headPackageTree, workingSourceStatus, workingPackageTree, sourceGraphContained] =
 			await Promise.all([
 				ref.resolve(repositoryRoot, `${candidate.commit}:${relativeSourceRoot}`),
 				ref.resolve(repositoryRoot, `HEAD:${relativeSourceRoot}`),
@@ -696,10 +800,10 @@ export async function isApprovedCandidateSource(filePath: string, release: Conte
 					z: true,
 					pathspecs: [packagePathspec],
 				}),
-				workingPackageBytesMatchHead(repositoryRoot, packagePathspec),
+				workingPackageTreeObjectId(repositoryRoot, relativeSourceRoot, candidate.tree.length),
 				isExtensionSourceGraphContained(resolved, sourceRoot),
 			]);
-		if (!workingBytesMatch || !sourceGraphContained) return false;
+		if (!headPackageTree || workingPackageTree !== headPackageTree || !sourceGraphContained) return false;
 		return approvedCandidateSourceMatches(
 			repository,
 			approvedIdentity ?? undefined,

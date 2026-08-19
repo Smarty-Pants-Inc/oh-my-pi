@@ -5123,7 +5123,7 @@
     },
     {
       "path": "packages/ai/src/providers/openai-reasoning-fallback.ts",
-      "sha256": "0599ef151960613592fdc89ece1a22e8801301995048052fde87de59ae5c6d30"
+      "sha256": "0809e0b1d57e450b62ee2c44b1e18d79d3e15ad1e58b828e327b87b694f85dd6"
     },
     {
       "path": "packages/ai/src/providers/openai-responses-server-schema.ts",
@@ -5139,7 +5139,7 @@
     },
     {
       "path": "packages/ai/src/providers/openai-responses.ts",
-      "sha256": "b5771683ce1a206d048cec60977d0a5eecbdbdfa2d6d58755b15cc14912545b5"
+      "sha256": "063ad35bb17772c90a76d502ee2721652ab4fe1359b789299652085eb1f833ad"
     },
     {
       "path": "packages/ai/src/providers/openai-shared.ts",
@@ -6051,7 +6051,7 @@
     },
     {
       "path": "packages/catalog/src/model-thinking.ts",
-      "sha256": "16bc086adac44f6faf738ea37e68c6948d8b2778aa3325d130c56e946a458cb5"
+      "sha256": "3431f35b0642527d14755a01556074f10220620041ae117e0ef8b07a5dee4a90"
     },
     {
       "path": "packages/catalog/src/models.json",
@@ -6071,7 +6071,7 @@
     },
     {
       "path": "packages/catalog/src/provider-models/cache-provider-id.ts",
-      "sha256": "d6e65e2ea6ff857e45e8c68d705b9c81dfee4f37522593cab4e2ecad2c6e6200"
+      "sha256": "f303ef29b65fdab6f5b8e31e47b6207daeb33df21ba5b97fd90f4860a3d99779"
     },
     {
       "path": "packages/catalog/src/provider-models/descriptor-types.ts",
@@ -6095,7 +6095,7 @@
     },
     {
       "path": "packages/catalog/src/provider-models/openai-compat.ts",
-      "sha256": "8d9fdaef4841814787c8cee5299e1fdef43c1f73819e8937860a0b66e84774c1"
+      "sha256": "577118e4cc4ef8d32068e5740bb3048e54b5944f39d218558ef0b69553901347"
     },
     {
       "path": "packages/catalog/src/provider-models/special.ts",
@@ -6823,7 +6823,7 @@
     },
     {
       "path": "packages/coding-agent/src/context/manifest.ts",
-      "sha256": "b6d9edd615a3244bf997aa947b3d2e75d18500d7d160636d072b62d54dda5870"
+      "sha256": "e444e009243b1dc074cbce98d23102107fd34afdb8ab5dddb748178a57a292e7"
     },
     {
       "path": "packages/coding-agent/src/context/prompt-sources.generated.ts",
@@ -7407,7 +7407,7 @@
     },
     {
       "path": "packages/coding-agent/src/extensibility/plugins/legacy-pi-compat.ts",
-      "sha256": "e731effb8ad7c77d6c4421a4ea254649cde12d5731d30fad8f1ac0ce833ce718"
+      "sha256": "e4de9fc508d89d878fb2089b1d3e1548928a22127316505f55b2dd5a51291281"
     },
     {
       "path": "packages/coding-agent/src/extensibility/plugins/loader.ts",
@@ -10683,5 +10683,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "dd8fda5b3d097196131b69ce8429ab6ca8b121385d4d00ca75348a8943c612bd"
+  "rootSha256": "6be2e429c8f63256e52e90444f12f20f7807a89dc850b84cd87c322706f1d3d7"
 }

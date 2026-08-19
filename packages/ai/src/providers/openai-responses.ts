@@ -58,6 +58,7 @@ import {
 	createOpenAIReasoningEffortFallbackKey,
 	createOpenAIReasoningEffortFallbackState,
 	getOpenAIReasoningEffortFallback,
+	mergeOpenAIReasoningEffortFallback,
 	type OpenAIReasoningEffortFallback,
 	type OpenAIReasoningEffortFallbackState,
 	rememberOpenAIReasoningEffortFallback,
@@ -611,13 +612,22 @@ const streamOpenAIResponsesOnce = (
 							const retryMarker = `${activeReasoningEffortFallbackKey}:${String(reasoningEffortFallback)}`;
 							if (attemptedReasoningEffortFallbacks.has(retryMarker)) throw error;
 							attemptedReasoningEffortFallbacks.add(retryMarker);
-							requestReasoningEffortFallbacks.set(activeReasoningEffortFallbackKey, reasoningEffortFallback);
-							applyOpenAIReasoningEffortFallback(chained.params, reasoningEffortFallback);
-							applyOpenAIReasoningEffortFallback(activeParams, reasoningEffortFallback);
+							const accumulatedReasoningEffortFallback = mergeOpenAIReasoningEffortFallback(
+								requestReasoningEffortFallbacks.has(activeReasoningEffortFallbackKey)
+									? requestReasoningEffortFallbacks.get(activeReasoningEffortFallbackKey)
+									: getOpenAIReasoningEffortFallback(providerSessionState, activeReasoningEffortFallbackKey),
+								reasoningEffortFallback,
+							);
+							requestReasoningEffortFallbacks.set(
+								activeReasoningEffortFallbackKey,
+								accumulatedReasoningEffortFallback,
+							);
+							applyOpenAIReasoningEffortFallback(chained.params, accumulatedReasoningEffortFallback);
+							applyOpenAIReasoningEffortFallback(activeParams, accumulatedReasoningEffortFallback);
 							activeRawRequestDump.body = chained.params;
 							pendingReasoningEffortFallback = {
 								key: activeReasoningEffortFallbackKey,
-								fallback: reasoningEffortFallback,
+								fallback: accumulatedReasoningEffortFallback,
 							};
 							continue;
 						}
