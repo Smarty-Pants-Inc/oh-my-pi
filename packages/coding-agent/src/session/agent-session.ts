@@ -6899,12 +6899,9 @@ export class AgentSession {
 							...(automaticTurn?.source === "peer_message_wake"
 								? {
 										onProviderCallStarted: () => {
-											try {
-												this.#recordAutomaticTurnStarted("provider_call");
-												promptMessagesCommitted = true;
-											} finally {
-												releaseProvisionalPeerMessageWake();
-											}
+											releaseProvisionalPeerMessageWake();
+											this.#recordAutomaticTurnStarted("provider_call");
+											promptMessagesCommitted = true;
 										},
 									}
 								: {}),
