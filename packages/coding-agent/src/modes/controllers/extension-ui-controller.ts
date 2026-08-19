@@ -1,6 +1,7 @@
 import type { Component, OverlayHandle, TUI } from "@oh-my-pi/pi-tui";
 import { Container, Spacer, Text } from "@oh-my-pi/pi-tui";
 import type { CollabUiRequestDraft, CollabUiSelectItem } from "@oh-my-pi/pi-wire";
+import type { CollabGuestUiResult, CollabHost } from "../../collab/host";
 import { KeybindingsManager } from "../../config/keybindings";
 import type {
 	CompactOptions,
@@ -80,6 +81,38 @@ export class ExtensionUiController {
 	 */
 	#toolUIContext: ExtensionUIContext | undefined;
 	constructor(private ctx: InteractiveModeContext) {}
+
+	#collabHosts(): CollabHost[] {
+		const privateHost = this.ctx.herdrCollabHost;
+		const publicHost = this.ctx.collabHost;
+		if (privateHost && publicHost && privateHost !== publicHost) return [privateHost, publicHost];
+		const host = privateHost ?? publicHost;
+		return host ? [host] : [];
+	}
+
+	#requestGuestUi(request: CollabUiRequestDraft, signal?: AbortSignal): Promise<CollabGuestUiResult> | null {
+		const requests = this.#collabHosts().flatMap(host => {
+			const abort = new AbortController();
+			const pending = host.requestGuestUi(request, signal ? AbortSignal.any([signal, abort.signal]) : abort.signal);
+			return pending ? [{ abort, pending }] : [];
+		});
+		const first = requests[0];
+		if (!first) return null;
+		if (requests.length === 1) return first.pending;
+		return Promise.any(
+			requests.map(async ({ pending }, winnerIndex) => {
+				const result = await pending;
+				if (result.kind === "unavailable") throw result;
+				for (const [index, loser] of requests.entries()) {
+					if (index !== winnerIndex) loser.abort.abort();
+				}
+				return result;
+			}),
+		).catch((): CollabGuestUiResult => {
+			for (const request of requests) request.abort.abort();
+			return { kind: "unavailable" };
+		});
+	}
 
 	/**
 	 * Initialize the hook system with TUI-based UI context.
@@ -598,8 +631,7 @@ export class ExtensionUiController {
 		questions: ExtensionAskDialogQuestion[],
 		dialogOptions?: ExtensionUIDialogOptions,
 	): Promise<ExtensionAskDialogResult | undefined> {
-		const host = this.ctx.collabHost;
-		if (!host) return this.#showLocalAskDialog(questions, dialogOptions);
+		if (this.#collabHosts().length === 0) return this.#showLocalAskDialog(questions, dialogOptions);
 		const localAbort = new AbortController();
 		const remoteAbort = new AbortController();
 		const parentSignal = dialogOptions?.signal;
@@ -613,7 +645,7 @@ export class ExtensionUiController {
 		);
 		const winner = await Promise.race([localWinner, remoteWinner]);
 		if (winner.source === "remote") localAbort.abort();
-		else remoteAbort.abort();
+		remoteAbort.abort();
 		return winner.value;
 	}
 
@@ -727,11 +759,9 @@ export class ExtensionUiController {
 		signal: AbortSignal | undefined,
 		local: (signal: AbortSignal | undefined) => Promise<string | undefined>,
 	): Promise<string | undefined> {
-		const host = this.ctx.collabHost;
-		if (!host) return local(signal);
 		const localAbort = new AbortController();
 		const remoteAbort = new AbortController();
-		const remote = host.requestGuestUi(
+		const remote = this.#requestGuestUi(
 			request,
 			signal ? AbortSignal.any([signal, remoteAbort.signal]) : remoteAbort.signal,
 		);
@@ -744,7 +774,7 @@ export class ExtensionUiController {
 		);
 		const winner = await Promise.race([localWinner, remoteWinner]);
 		if (winner.source === "remote") localAbort.abort();
-		else remoteAbort.abort();
+		remoteAbort.abort();
 		return winner.value;
 	}
 
@@ -867,9 +897,7 @@ export class ExtensionUiController {
 	}
 
 	async #requestGuestUiString(request: CollabUiRequestDraft, signal: AbortSignal): Promise<GuestUiResult> {
-		const host = this.ctx.collabHost;
-		if (!host) return { kind: "unavailable" };
-		const remote = host.requestGuestUi(request, signal);
+		const remote = this.#requestGuestUi(request, signal);
 		if (!remote) return { kind: "unavailable" };
 		const result = await remote;
 		if (result.kind === "unavailable") return { kind: "unavailable" };

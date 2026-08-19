@@ -1253,9 +1253,11 @@ describe("AgentSession.switchSession previous-context build", () => {
 		const retainedJournal = await Bun.file(retainedSessionFile).text();
 		const retainedMessages = [...session.messages];
 		let retainedCallbacks = 0;
+		let retainedRollbacks = 0;
 		let targetCallbacks = 0;
 		let targetDiscards = 0;
 		const unregisterRetained = session.registerSessionChangeCallback(() => retainedCallbacks++);
+		session.registerSessionChangeCallback(() => {}, { onRollback: () => retainedRollbacks++ });
 		const failure = new Error("new target materialization failed");
 		let replacementSessionFile: string | undefined;
 		const ensureOnDisk = sessionManager.ensureOnDisk.bind(sessionManager);
@@ -1281,6 +1283,7 @@ describe("AgentSession.switchSession previous-context build", () => {
 		expect(retainedCallbacks).toBe(0);
 		expect(targetCallbacks).toBe(0);
 		expect(targetDiscards).toBe(1);
+		expect(retainedRollbacks).toBe(1);
 		expect(session.sessionFile).toBe(retainedSessionFile);
 		expect(session.messages).toEqual(retainedMessages);
 		expect(await Bun.file(retainedSessionFile).text()).toBe(retainedJournal);
@@ -1291,7 +1294,7 @@ describe("AgentSession.switchSession previous-context build", () => {
 		expect(retainedCallbacks).toBe(1);
 	});
 
-	it("runs every discarded session callback and releases rollback ownership when cleanup fails", async () => {
+	it("runs retained rollback callbacks even when discarded cleanup fails", async () => {
 		const tempDir = TempDir.createSync("@pi-new-session-discard-cleanup-");
 		tempDirs.push(tempDir);
 		const asyncManager = new AsyncJobManager({ retentionMs: 60_000 });
@@ -1322,6 +1325,8 @@ describe("AgentSession.switchSession previous-context build", () => {
 		const discardFailure = new Error("discard cleanup failed");
 		const discardOrder: string[] = [];
 		let targetCallbacks = 0;
+		let retainedRollbacks = 0;
+		session.registerSessionChangeCallback(() => {}, { onRollback: () => retainedRollbacks++ });
 		const ensureOnDisk = sessionManager.ensureOnDisk.bind(sessionManager);
 		const ensureOnDiskSpy = vi.spyOn(sessionManager, "ensureOnDisk").mockImplementation(async () => {
 			if (session.sessionFile !== retainedSessionFile) throw materializationFailure;
@@ -1352,6 +1357,7 @@ describe("AgentSession.switchSession previous-context build", () => {
 		expect(thrown).toBeInstanceOf(AggregateError);
 		expect((thrown as AggregateError).errors).toEqual([materializationFailure, discardFailure]);
 		expect(discardOrder).toEqual(["first", "throwing", "last"]);
+		expect(retainedRollbacks).toBe(1);
 		expect(targetCallbacks).toBe(0);
 		expect(completion.mock.calls.map(([event]) => event.type)).not.toContain("session_rollback");
 		expect(activatedYieldKinds.sort()).toEqual(["advisor", "async-result", "launch-completion"]);

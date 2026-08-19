@@ -512,6 +512,7 @@ interface SessionChangeRegistration {
 	callback: () => void;
 	ownerSessionId: string;
 	onDiscard?: () => void;
+	onRollback?: () => void;
 }
 
 interface DeferredLaunchCompletionDelivery {
@@ -2292,7 +2293,21 @@ export class AgentSession {
 		return {
 			selectRollback: () => {
 				const discarded = this.#selectRollbackSessionChangeRegistrations(retained);
-				this.#activateDiscardedSessionChangeRegistrations(discarded);
+				const failures: unknown[] = [];
+				try {
+					this.#activateDiscardedSessionChangeRegistrations(discarded);
+				} catch (error) {
+					failures.push(error);
+				}
+				try {
+					this.#activateRetainedSessionRollbackRegistrations(retained);
+				} catch (error) {
+					failures.push(error);
+				}
+				if (failures.length === 1) throw failures[0];
+				if (failures.length > 1) {
+					throw new AggregateError(failures, "Session change rollback callback cleanup was incomplete");
+				}
 			},
 			activateCommit: () => this.#notifySessionChangeCallbacks(),
 		};
@@ -2526,6 +2541,21 @@ export class AgentSession {
 		if (failures.length === 1) throw failures[0];
 		if (failures.length > 1) {
 			throw new AggregateError(failures, "Discarded session callback cleanup was incomplete");
+		}
+	}
+
+	#activateRetainedSessionRollbackRegistrations(registrations: ReadonlySet<SessionChangeRegistration>): void {
+		const failures: unknown[] = [];
+		for (const registration of registrations) {
+			try {
+				registration.onRollback?.();
+			} catch (error) {
+				failures.push(error);
+			}
+		}
+		if (failures.length === 1) throw failures[0];
+		if (failures.length > 1) {
+			throw new AggregateError(failures, "Retained session rollback callback cleanup was incomplete");
 		}
 	}
 
@@ -4849,11 +4879,15 @@ export class AgentSession {
 	}
 
 	/** Register cleanup owned by the logical session active at registration time. */
-	registerSessionChangeCallback(callback: () => void, options?: { onDiscard?: () => void }): () => void {
+	registerSessionChangeCallback(
+		callback: () => void,
+		options?: { onDiscard?: () => void; onRollback?: () => void },
+	): () => void {
 		const registration: SessionChangeRegistration = {
 			callback,
 			ownerSessionId: this.sessionManager.getSessionId(),
 			onDiscard: options?.onDiscard,
+			onRollback: options?.onRollback,
 		};
 		this.#sessionChangeCallbacks.add(registration);
 		return () => this.#sessionChangeCallbacks.delete(registration);

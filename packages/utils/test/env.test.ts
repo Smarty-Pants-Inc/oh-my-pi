@@ -85,9 +85,15 @@ describe("parseEnvFile", () => {
 		});
 	});
 
-	it("never accepts Fresh companion launch authority from dotenv files", () => {
+	it("never accepts bridge or Fresh companion launch authority from dotenv files", () => {
 		const filePath = writeTempEnv(
-			["FRESH_OMP_COMPANION=1", "FRESH_OMP_COMPANION_TOKEN=project-controlled", "GOOD=value"].join("\n"),
+			[
+				"FRESH_OMP_COMPANION=1",
+				"FRESH_OMP_COMPANION_TOKEN=project-controlled",
+				"HERDR_OMP_BRIDGE_TOKEN=project-controlled",
+				"HERDR_OMP_GUEST_BRIDGE_TOKEN=project-controlled",
+				"GOOD=value",
+			].join("\n"),
 		);
 
 		expect(parseEnvFile(filePath)).toEqual({ GOOD: "value" });
@@ -139,6 +145,8 @@ describe("filterProcessEnv", () => {
 				"BAD=NAME": "value",
 				BAD_VALUE: "before\0after",
 				MISSING: undefined,
+				HERDR_OMP_BRIDGE_TOKEN: "private-capability",
+				HERDR_OMP_GUEST_BRIDGE_TOKEN: "private-guest-capability",
 			}),
 		).toEqual({
 			GOOD: "value",
@@ -173,12 +181,14 @@ describe("filterProcessEnv", () => {
 		});
 	});
 
-	it("does not forward Fresh companion transport values to Bash child environments", () => {
+	it("does not forward bridge or Fresh companion capabilities to Bash child environments", () => {
 		expect(
 			filterChildShellEnv({
 				PATH: process.env.PATH ?? "",
 				FRESH_OMP_COMPANION: "1",
 				FRESH_OMP_COMPANION_TOKEN: "private-capability",
+				HERDR_OMP_BRIDGE_TOKEN: "bridge-capability",
+				HERDR_OMP_GUEST_BRIDGE_TOKEN: "guest-bridge-capability",
 			}),
 		).toEqual({ PATH: process.env.PATH ?? "" });
 	});
@@ -255,6 +265,42 @@ describe("Fresh OMP companion launch authority", () => {
 			spoofedCompiled: "true",
 			marker: null,
 			token: null,
+		});
+	});
+});
+
+describe.skipIf(process.platform !== "linux")("Herdr bridge launch environment", () => {
+	it("does not revive bridge tokens from procfs or a project dotenv", async () => {
+		const cwd = path.dirname(
+			writeTempEnv("HERDR_OMP_BRIDGE_TOKEN=dotenv-token\nHERDR_OMP_GUEST_BRIDGE_TOKEN=dotenv-guest-token\n"),
+		);
+		const resultPath = path.join(cwd, "herdr-launch-result.json");
+		const envModulePath = path.join(import.meta.dir, "..", "src", "env.ts");
+		const script = [
+			'import * as fs from "node:fs";',
+			"// Dynamic import initializes env.ts against this child's own procfs snapshot.",
+			`const { filterChildShellEnv } = await import(${JSON.stringify(envModulePath)});`,
+			`const child = filterChildShellEnv(Bun.env, ${JSON.stringify(cwd)});`,
+			`fs.writeFileSync(${JSON.stringify(resultPath)}, JSON.stringify({ hostLive: Bun.env.HERDR_OMP_BRIDGE_TOKEN ?? null, guestLive: Bun.env.HERDR_OMP_GUEST_BRIDGE_TOKEN ?? null, hostChild: child.HERDR_OMP_BRIDGE_TOKEN ?? null, guestChild: child.HERDR_OMP_GUEST_BRIDGE_TOKEN ?? null }));`,
+		].join("\n");
+		const proc = Bun.spawn([process.execPath, "--no-env-file", "--eval", script], {
+			cwd,
+			env: {
+				...process.env,
+				HERDR_OMP_BRIDGE_TOKEN: "launch-token",
+				HERDR_OMP_GUEST_BRIDGE_TOKEN: "launch-guest-token",
+			},
+			stdout: "ignore",
+			stderr: "pipe",
+		});
+		const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+
+		expect(exitCode, stderr).toBe(0);
+		expect(JSON.parse(fs.readFileSync(resultPath, "utf8"))).toEqual({
+			hostLive: null,
+			guestLive: null,
+			hostChild: null,
+			guestChild: null,
 		});
 	});
 });

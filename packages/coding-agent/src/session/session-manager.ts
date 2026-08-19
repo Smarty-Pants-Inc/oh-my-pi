@@ -542,6 +542,13 @@ export class SessionManager {
 	 * in-memory (pre-blob-externalization) entry, so inline images survive.
 	 */
 	onEntryAppended?: (entry: SessionEntry) => void;
+	readonly #entryAppendedSubscribers = new Set<(entry: SessionEntry) => void>();
+
+	/** Subscribe without replacing another collaboration host's replication tap. */
+	subscribeEntryAppended(callback: (entry: SessionEntry) => void): () => void {
+		this.#entryAppendedSubscribers.add(callback);
+		return () => this.#entryAppendedSubscribers.delete(callback);
+	}
 
 	#turnBudgetTotal: number | null = null;
 	#turnBudgetHard = false;
@@ -1148,14 +1155,16 @@ export class SessionManager {
 	}
 
 	#notifyEntryAppended(entry: SessionEntry): void {
-		const callback = this.onEntryAppended;
-		if (callback) {
+		const notify = (callback: ((entry: SessionEntry) => void) | undefined): void => {
+			if (!callback) return;
 			try {
 				callback(entry);
 			} catch (err) {
-				logger.warn("collab entry hook failed", { error: String(err) });
+				logger.warn("session entry hook failed", { error: String(err) });
 			}
-		}
+		};
+		notify(this.onEntryAppended);
+		for (const callback of this.#entryAppendedSubscribers) notify(callback);
 	}
 
 	#resetToNewSession(options?: NewSessionOptions, forcedSessionFile?: string): string | undefined {
