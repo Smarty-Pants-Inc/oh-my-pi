@@ -73,7 +73,11 @@ export function readOpenAIReasoningEffort(params: unknown): string | undefined {
 	if (!isRecord(params)) return undefined;
 	if (typeof params.reasoning_effort === "string") return params.reasoning_effort;
 	const reasoning = params.reasoning;
-	return isRecord(reasoning) && typeof reasoning.effort === "string" ? reasoning.effort : undefined;
+	if (isRecord(reasoning) && typeof reasoning.effort === "string") return reasoning.effort;
+	const chatTemplateKwargs = params.chat_template_kwargs;
+	return isRecord(chatTemplateKwargs) && typeof chatTemplateKwargs.reasoning_effort === "string"
+		? chatTemplateKwargs.reasoning_effort
+		: undefined;
 }
 
 function deleteReasoningEffort(reasoning: Record<string, unknown>, parent: Record<string, unknown>): boolean {
@@ -106,6 +110,15 @@ export function applyOpenAIReasoningEffortFallback(params: unknown, fallback: Op
 			reasoning.effort = fallback;
 			changed = true;
 		}
+	}
+	const chatTemplateKwargs = params.chat_template_kwargs;
+	if (isRecord(chatTemplateKwargs) && typeof chatTemplateKwargs.reasoning_effort === "string") {
+		if (fallback === null) {
+			delete chatTemplateKwargs.reasoning_effort;
+		} else {
+			chatTemplateKwargs.reasoning_effort = fallback;
+		}
+		changed = true;
 	}
 	return changed;
 }

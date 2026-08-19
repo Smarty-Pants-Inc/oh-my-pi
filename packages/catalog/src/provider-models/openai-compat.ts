@@ -3408,7 +3408,8 @@ export function lmStudioModelManagerOptions(
 				apiKey,
 				mapModel: (entry, defaults) => {
 					const reference = references.get(defaults.id);
-					return mapWithBundledReference(entry, defaults, reference);
+					const model = mapWithBundledReference(entry, defaults, reference);
+					return { ...model, reasoning: model.reasoning || isQwen38PlusTemplateEffortModelId(model.id) };
 				},
 				fetch: config?.fetch,
 			});

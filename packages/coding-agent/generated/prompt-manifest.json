@@ -5119,11 +5119,11 @@
     },
     {
       "path": "packages/ai/src/providers/openai-completions.ts",
-      "sha256": "e5544b5ae181f4bacd3cc9330dd2d5b92257389bf5af64b31cd852c7bcb4fca4"
+      "sha256": "3c304060a3944b136a3e8d9fa26a0d4a1ab86d0d789c1c439d71d8713b9176a0"
     },
     {
       "path": "packages/ai/src/providers/openai-reasoning-fallback.ts",
-      "sha256": "0876126bd6c778fb0ad9b65b82af6b8faed9178c1569048c610b584bdd9c5635"
+      "sha256": "5374589bc5fb413d9ebf29249a850262bb894ed75cee467a80763b6b38eec466"
     },
     {
       "path": "packages/ai/src/providers/openai-responses-server-schema.ts",
@@ -6095,7 +6095,7 @@
     },
     {
       "path": "packages/catalog/src/provider-models/openai-compat.ts",
-      "sha256": "04bb7e1645e78994c49ea79e9af108aea20fac46cfd19f052e0f6306428f1794"
+      "sha256": "10bf8ba5b9caa6f152159df5ee7c099469f2878cfa2b983c3251fdf9e03af85b"
     },
     {
       "path": "packages/catalog/src/provider-models/special.ts",
@@ -6743,7 +6743,7 @@
     },
     {
       "path": "packages/coding-agent/src/config/model-discovery.ts",
-      "sha256": "b6a3dd3d5dd24db69022e371b9f5b552297a547f0f92aa9e378b208a356a1487"
+      "sha256": "fb7be16f8455f5683790ba31e7e506ce45aab1ca127eee4cc10775400b8f46e8"
     },
     {
       "path": "packages/coding-agent/src/config/model-patch.ts",
@@ -6755,7 +6755,7 @@
     },
     {
       "path": "packages/coding-agent/src/config/model-registry.ts",
-      "sha256": "a2d8e77ab7a71bab4a0b54ec0453a0d543f66aed94d1d188fe08c9a93a471345"
+      "sha256": "224f0a61ab6c86b6abf22035f059ae6fd69bf7e0999a9a51936c2bcf423d0728"
     },
     {
       "path": "packages/coding-agent/src/config/model-resolver.ts",
@@ -10675,5 +10675,5 @@
     }
   ],
   "behaviorSha256": "16a17592ffb7e5cd090ebb1534b43e2f67a134c329bc7bb048ba42981bc864cc",
-  "rootSha256": "c8c0c916a0818f99729fe86b540c3f9f386280d170253923858277a3f3bc06cb"
+  "rootSha256": "21136e274a89e8b46b5b44b5634183dcdd40f310d98f9199bc43d758bb57b1c9"
 }

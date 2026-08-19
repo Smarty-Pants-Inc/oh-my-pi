@@ -126,7 +126,11 @@ function kimiZaiModel(): Model<"openai-completions"> {
 async function captureOpenAICompletionsPayload(
 	model: Model<"openai-completions">,
 	context: Context = baseContext(),
-	options?: { reasoning?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max"; temperature?: number },
+	options?: {
+		reasoning?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+		temperature?: number;
+		cacheRetention?: "short" | "long" | "none";
+	},
 ): Promise<unknown> {
 	const { promise, resolve } = Promise.withResolvers<unknown>();
 	const fetchMock = createMockFetch(["[DONE]"]);
@@ -2401,6 +2405,25 @@ describe("anthropic cache control for OpenAI-compatible chat completions", () =>
 
 		expect(textPart?.text).toBe("cache me");
 		expect(textPart?.cache_control).toEqual({ type: "ephemeral" });
+	});
+
+	it("honors none and long retention for Anthropic cache markers", async () => {
+		const nonePayload = await captureOpenAICompletionsPayload(
+			claudeProxyModel({ cacheControlFormat: "anthropic" }),
+			cacheContext(),
+			{ cacheRetention: "none" },
+		);
+		expect(getLastTextPart(getLastPayloadContent(nonePayload))?.cache_control).toBeUndefined();
+
+		const longPayload = await captureOpenAICompletionsPayload(
+			claudeProxyModel({ cacheControlFormat: "anthropic" }),
+			cacheContext(),
+			{ cacheRetention: "long" },
+		);
+		expect(getLastTextPart(getLastPayloadContent(longPayload))?.cache_control).toEqual({
+			type: "ephemeral",
+			ttl: "1h",
+		});
 	});
 
 	it("preserves OpenRouter Anthropic cache_control detection", async () => {
