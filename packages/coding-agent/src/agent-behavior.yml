@@ -20,8 +20,8 @@ goal:
   autoContinue: active_only
   continuationModes: [interactive]
   continuationRole: internal_context
-  modelOperations: [get, create, complete, block, pause, resume]
-  ownerOrSystemOperations: [set, edit, replace, budget, drop, clear]
+  modelOperations: [get, create, complete, block]
+  ownerOrSystemOperations: [set, edit, replace, pause, resume, budget, drop, clear]
   sameRouteFailureLimit: 2
 
 todo:
