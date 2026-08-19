@@ -143,8 +143,8 @@ describe("issue #970 custom provider discovery", () => {
 		expect(qwen38?.thinking).toMatchObject({
 			mode: "effort",
 			efforts: ["low", "medium", "xhigh"],
-			requiresEffort: true,
 		});
+		expect(qwen38?.thinking?.requiresEffort).toBeUndefined();
 		expect(qwen38?.compat).toMatchObject({
 			thinkingFormat: "qwen-chat-template",
 			reasoningDisableMode: "qwen-template-false",
