@@ -6,6 +6,7 @@ import {
 	ImageProtocol,
 	NotifyProtocol,
 	resolveWarpImageProtocol,
+	shouldEnableHyperlinks,
 	shouldEnableHyperlinksByDefault,
 	shouldEnableSynchronizedOutputByDefault,
 	synchronizedOutputUserOverride,
@@ -251,6 +252,11 @@ describe("shouldEnableHyperlinksByDefault", () => {
 		expect(shouldEnableHyperlinksByDefault({}, "trueColor")).toBe(false);
 	});
 
+	it("enables hyperlinks for direct Herdr terminals without relying on the outer terminal profile", () => {
+		expect(shouldEnableHyperlinksByDefault({ HERDR_ENV: "1", TERM: "dumb" }, "base")).toBe(true);
+		expect(shouldEnableHyperlinksByDefault({ HERDR_ENV: "1", TERM: "xterm-256color" }, "trueColor")).toBe(true);
+	});
+
 	it("keeps GNU screen always off, even when the inner terminal supports OSC 8", () => {
 		expect(shouldEnableHyperlinksByDefault({ STY: "1234.pts-0.host" }, "wezterm")).toBe(false);
 		expect(shouldEnableHyperlinksByDefault({ TERM: "screen-256color" }, "kitty")).toBe(false);
@@ -374,5 +380,28 @@ describe("shouldEnableHyperlinksByDefault", () => {
 		expect(shouldEnableHyperlinksByDefault({ PI_FORCE_HYPERLINKS: "1" }, "base")).toBe(true);
 		expect(shouldEnableHyperlinksByDefault({ PI_FORCE_HYPERLINKS: "1", TMUX: "1" }, "wezterm")).toBe(true);
 		expect(shouldEnableHyperlinksByDefault({ PI_FORCE_HYPERLINKS: "1", STY: "1.pts-0" }, "kitty")).toBe(true);
+	});
+});
+
+describe("shouldEnableHyperlinks", () => {
+	it("keeps direct Herdr hyperlinks enabled in auto mode without a TTY", () => {
+		expect(shouldEnableHyperlinks("auto", { HERDR_ENV: "1", TERM: "dumb" }, "base", false)).toBe(true);
+	});
+
+	it("lets the setting and kill switch disable every positive heuristic", () => {
+		const herdr = { HERDR_ENV: "1", TERM: "dumb" };
+		expect(shouldEnableHyperlinks("off", herdr, "base", false)).toBe(false);
+		expect(shouldEnableHyperlinks("auto", { ...herdr, PI_NO_HYPERLINKS: "1" }, "base", false)).toBe(false);
+		expect(shouldEnableHyperlinks("always", { ...herdr, PI_NO_HYPERLINKS: "1" }, "base", false)).toBe(false);
+	});
+
+	it("keeps always and force-on independent of terminal auto-detection", () => {
+		expect(shouldEnableHyperlinks("always", { NO_COLOR: "1" }, "base", false)).toBe(true);
+		expect(shouldEnableHyperlinks("auto", { PI_FORCE_HYPERLINKS: "1", NO_COLOR: "1" }, "base", false)).toBe(true);
+	});
+
+	it("requires a TTY and color outside Herdr in auto mode", () => {
+		expect(shouldEnableHyperlinks("auto", {}, "ghostty", false)).toBe(false);
+		expect(shouldEnableHyperlinks("auto", { NO_COLOR: "1" }, "ghostty", true)).toBe(false);
 	});
 });
