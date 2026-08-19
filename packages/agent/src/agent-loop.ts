@@ -1002,6 +1002,13 @@ function sealAsides(messages: readonly AgentMessage[]): void {
 		(message as CommittableAsideMessage)[ASIDE_MESSAGE_SEAL]?.();
 	}
 }
+function removeMessagesByIdentity(target: AgentMessage[], removed: readonly AgentMessage[]): void {
+	if (removed.length === 0) return;
+	const removedSet = new Set(removed);
+	for (let index = target.length - 1; index >= 0; index--) {
+		if (removedSet.has(target[index]!)) target.splice(index, 1);
+	}
+}
 
 async function runLoopBody(
 	currentContext: AgentContext,
@@ -1038,7 +1045,9 @@ async function runLoopBody(
 	};
 	let preserveSoftRequirementState = false;
 	let provisionalMessages: AgentMessage[] = [];
+	let provisionalTurnMessages: AgentMessage[] | undefined;
 	let providerCallAccepted = config.onProviderCallStarted === undefined;
+	let provisionalSoftRequirementState: typeof initialSoftRequirementState | undefined;
 	let pendingHardToolChoiceRollback = false;
 	const rollbackPendingHardToolChoice = (): void => {
 		if (!pendingHardToolChoiceRollback) return;
@@ -1048,6 +1057,22 @@ async function runLoopBody(
 	const finishAgentStream = () =>
 		endAgentStream(stream, providerCallAccepted ? newMessages : [], telemetry, stepCounter.count);
 
+	const rollbackProvisionalMessages = (error: Error): void => {
+		if (provisionalMessages.length === 0 && !provisionalSoftRequirementState) return;
+		const messages = provisionalMessages;
+		provisionalMessages = [];
+		removeMessagesByIdentity(currentContext.messages, messages);
+		removeMessagesByIdentity(newMessages, messages);
+		if (provisionalTurnMessages) removeMessagesByIdentity(provisionalTurnMessages, messages);
+		provisionalTurnMessages = undefined;
+		discardAsides(messages, error);
+		if (provisionalSoftRequirementState) {
+			softRequirementState.id = provisionalSoftRequirementState.id;
+			softRequirementState.forcedToolChoice = provisionalSoftRequirementState.forcedToolChoice;
+			softRequirementState.escalations = provisionalSoftRequirementState.escalations;
+			provisionalSoftRequirementState = undefined;
+		}
+	};
 	let pendingMessages: AgentMessage[] = [];
 	try {
 		let messagesToEmit = [...initialMessages];
@@ -1089,6 +1114,14 @@ async function runLoopBody(
 
 			// Inner loop: process tool calls and steering messages
 			while (hasMoreToolCalls || pendingMessages.length > 0) {
+				let providerRequestAccepted = config.onProviderCallStarted === undefined;
+				if (!providerRequestAccepted) {
+					provisionalSoftRequirementState = {
+						id: softRequirementState.id,
+						forcedToolChoice: softRequirementState.forcedToolChoice,
+						escalations: softRequirementState.escalations,
+					};
+				}
 				if (isDeadlineExceeded(config.deadline)) {
 					if (providerCallAccepted) emitInputMessages(stream, messagesToEmit);
 					finishAgentStream();
@@ -1108,11 +1141,12 @@ async function runLoopBody(
 				const turnMessages = messagesToEmit;
 				messagesToEmit = [];
 				if (pendingMessages.length > 0) {
+					if (!providerRequestAccepted) provisionalTurnMessages = turnMessages;
 					for (const message of pendingMessages) {
 						currentContext.messages.push(message);
 						newMessages.push(message);
 						turnMessages.push(message);
-						if (providerCallAccepted) {
+						if (providerRequestAccepted) {
 							(message as CommittableAsideMessage)[ASIDE_MESSAGE_COMMIT]?.();
 						} else {
 							provisionalMessages.push(message);
@@ -1146,6 +1180,10 @@ async function runLoopBody(
 									currentContext.messages.push(reminder);
 									newMessages.push(reminder);
 									turnMessages.push(reminder);
+									if (!providerRequestAccepted) {
+										provisionalTurnMessages = turnMessages;
+										provisionalMessages.push(reminder);
+									}
 								}
 							}
 						} else {
@@ -1159,7 +1197,11 @@ async function runLoopBody(
 					preparedProviderCall = await prepareProviderCall(currentContext, config, signal);
 					gateResult = (await config.beforeModelCall?.(preparedProviderCall.context, signal)) || undefined;
 				} catch (error) {
-					if (!turnOpen && providerCallAccepted) {
+					if (!providerRequestAccepted) {
+						rollbackProvisionalMessages(error instanceof Error ? error : new Error(String(error)));
+						if (!signal?.aborted) rollbackPendingHardToolChoice();
+					}
+					if (!turnOpen && providerRequestAccepted) {
 						stream.push({ type: "turn_start" });
 						emitInputMessages(stream, turnMessages);
 						turnOpen = true;
@@ -1170,6 +1212,9 @@ async function runLoopBody(
 					gateResult = { stop: true };
 				}
 				if (gateResult?.stop) {
+					if (!providerRequestAccepted) {
+						rollbackProvisionalMessages(new Error("Queued message was not committed before provider dispatch"));
+					}
 					if (gateResult.reason) {
 						logger.debug("Agent loop stopped before the model call", { reason: gateResult.reason });
 					}
@@ -1178,7 +1223,7 @@ async function runLoopBody(
 							pendingHardToolChoiceRollback = false;
 							config.onToolChoiceRejected?.();
 						} catch (error) {
-							if (providerCallAccepted) {
+							if (providerRequestAccepted) {
 								stream.push({ type: "turn_start" });
 								emitInputMessages(stream, turnMessages);
 								turnOpen = true;
@@ -1186,7 +1231,7 @@ async function runLoopBody(
 							throw error;
 						}
 					}
-					if (providerCallAccepted) emitInputMessages(stream, turnMessages);
+					if (providerRequestAccepted) emitInputMessages(stream, turnMessages);
 					if (turnOpen) {
 						const stopMessage = createGateStopMessage(preparedProviderCall.model, gateResult.reason);
 						currentContext.messages.push(stopMessage);
@@ -1210,20 +1255,23 @@ async function runLoopBody(
 					return;
 				}
 
-				const deferTurnStart = !turnOpen && !providerCallAccepted;
+				const deferTurnStart = !turnOpen && !providerRequestAccepted;
 				if (!turnOpen && !deferTurnStart) {
 					stream.push({ type: "turn_start" });
 					emitInputMessages(stream, turnMessages);
 					turnOpen = true;
 				}
-				const providerConfig = deferTurnStart
+				const providerConfig = !providerRequestAccepted
 					? {
 							...config,
 							onProviderCallStarted: () => {
 								config.onProviderCallStarted?.();
 								pendingHardToolChoiceRollback = false;
+								provisionalSoftRequirementState = undefined;
 								commitAsides(provisionalMessages);
 								provisionalMessages = [];
+								provisionalTurnMessages = undefined;
+								providerRequestAccepted = true;
 								providerCallAccepted = true;
 								if (!turnOpen) {
 									stream.push({ type: "turn_start" });
@@ -1237,7 +1285,7 @@ async function runLoopBody(
 				// Stream assistant response
 				let recovered: HarmonyRecoveredToolCall | undefined;
 				let message: AssistantMessage;
-				if (providerCallAccepted) pendingHardToolChoiceRollback = false;
+				if (providerRequestAccepted) pendingHardToolChoiceRollback = false;
 				try {
 					message = await streamAssistantResponse(
 						currentContext,
@@ -1256,6 +1304,11 @@ async function runLoopBody(
 					harmonyRetryAttempt = 0;
 					harmonyTruncateResumeCount = 0;
 				} catch (err) {
+					if (!providerRequestAccepted) {
+						rollbackProvisionalMessages(err instanceof Error ? err : new Error(String(err)));
+						if (!signal?.aborted) rollbackPendingHardToolChoice();
+						throw err;
+					}
 					if (!(err instanceof HarmonyLeakInterruption)) throw err;
 					if (err.recovered) {
 						if (harmonyTruncateResumeCount >= 2) {
@@ -1544,7 +1597,7 @@ async function runLoopBody(
 
 		finishAgentStream();
 	} finally {
-		discardAsides(provisionalMessages, new Error("Queued message was not committed before provider dispatch"));
+		rollbackProvisionalMessages(new Error("Queued message was not committed before provider dispatch"));
 		discardAsides(pendingMessages, new Error("Aside message was not committed before the agent loop ended"));
 		if (!providerCallAccepted) {
 			softRequirementState.id = initialSoftRequirementState.id;
@@ -1555,13 +1608,10 @@ async function runLoopBody(
 			softRequirementState.forcedToolChoice = undefined;
 			softRequirementState.escalations = 0;
 		}
-		if (deadlineTimer) {
-			clearTimeout(deadlineTimer);
-		}
+		if (deadlineTimer) clearTimeout(deadlineTimer);
 		if (!providerCallAccepted) rollbackPendingHardToolChoice();
 	}
 }
-
 async function emitHarmonyAudit(
 	config: AgentLoopConfig,
 	interruption: HarmonyLeakInterruption,

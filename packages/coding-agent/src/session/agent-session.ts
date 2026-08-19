@@ -97,6 +97,7 @@ import {
 	prompt,
 	Snowflake,
 	stringProperty,
+	untilAborted,
 	withTimeout,
 } from "@oh-my-pi/pi-utils";
 import {
@@ -775,6 +776,7 @@ export class AgentSession {
 	#inFlightBeforeAgentEndCallbacks: Array<() => void | Promise<void>> = [];
 	#inFlightSettledCallbacks: Array<() => void | Promise<void>> = [];
 	#inFlightSettling = false;
+	#inFlightQuiescenceWaiters = new Set<() => void>();
 	#ircWakeTasks = new Set<Promise<void>>();
 	#sessionStopHookActive = false;
 	readonly #automaticTurns = new AutomaticTurnAuthority();
@@ -875,7 +877,12 @@ export class AgentSession {
 				(this.#inFlightBeforeAgentEndCallbacks.length > 0 || this.#inFlightSettledCallbacks.length > 0)
 			) {
 				this.#scheduleInFlightSettlement();
+				return;
 			}
+			if (this.#promptInFlightCount !== 0) return;
+			const waiters = [...this.#inFlightQuiescenceWaiters];
+			this.#inFlightQuiescenceWaiters.clear();
+			for (const resolve of waiters) resolve();
 		});
 	}
 
@@ -898,6 +905,25 @@ export class AgentSession {
 		await this.#flushInFlightCallbacks(this.#inFlightSettledCallbacks);
 		if (this.#promptInFlightCount !== 0) return;
 		this.#drainStrandedQueuedMessages();
+	}
+
+	async #waitForInFlightQuiescence(signal?: AbortSignal): Promise<void> {
+		if (
+			this.#promptInFlightCount === 0 &&
+			!this.#inFlightSettling &&
+			this.#inFlightBeforeAgentEndCallbacks.length === 0 &&
+			this.#inFlightSettledCallbacks.length === 0
+		) {
+			return;
+		}
+		const { promise, resolve } = Promise.withResolvers<void>();
+		this.#inFlightQuiescenceWaiters.add(resolve);
+		this.#scheduleInFlightSettlement();
+		try {
+			await untilAborted(signal, promise);
+		} finally {
+			this.#inFlightQuiescenceWaiters.delete(resolve);
+		}
 	}
 
 	#enqueueBeforeAgentEnd(callback: () => void | Promise<void>): void {
@@ -1716,7 +1742,7 @@ export class AgentSession {
 			scheduleCompactionContinuation: options => this.#scheduleCompactionContinuation(options),
 			persistTurnMessagesForMidRunCompaction: context => this.#persistTurnMessagesForMidRunCompaction(context),
 			findLastAssistantMessage: () => this.#findLastAssistantMessage(),
-			beginSemanticDeliveryMaintenance: () => this.#beginSemanticDeliveryMaintenance(),
+			beginSemanticDeliveryMaintenance: signal => this.#beginSemanticDeliveryMaintenance(signal),
 			disconnectFromAgent: () => this.#disconnectFromAgent(),
 			reconnectToAgent: () => this.#reconnectToAgent(),
 			buildDisplaySessionContext: () => this.buildDisplaySessionContext(),
@@ -1759,8 +1785,8 @@ export class AgentSession {
 			modelRegistry: this.#modelRegistry,
 			extensionRunner: this.#extensionRunner,
 			sideStreamFn: this.#sideStreamFn,
-			beginLifecycleTransaction: semanticDeliveryAcceptance =>
-				this.#beginLifecycleTransaction({}, semanticDeliveryAcceptance),
+			beginLifecycleTransaction: (semanticDeliveryAcceptance, signal, quiesceAgent) =>
+				this.#beginLifecycleTransaction({ quiesceAgent, signal }, semanticDeliveryAcceptance),
 			obfuscator: this.#obfuscator,
 			model: () => this.model,
 			thinkingLevel: () => this.thinkingLevel,
@@ -2272,13 +2298,14 @@ export class AgentSession {
 
 	/** Acquire the one fence that spans acceptance settlement, capture, selection, host publication, and activation. */
 	async #beginLifecycleTransaction(
-		options: { persistDetachedBash?: boolean } = {},
+		options: { persistDetachedBash?: boolean; quiesceAgent?: boolean; signal?: AbortSignal } = {},
 		exemptSemanticDeliveryAcceptance?: Promise<void>,
 	): Promise<SessionLifecycleTransaction> {
 		if (this.#isDisposed) throw new Error("Cannot start a lifecycle transaction after session disposal");
 		const releaseFence = this.#acquireLifecycleTransitionFence();
 		try {
-			await this.#waitForSemanticDeliveryAcceptances(exemptSemanticDeliveryAcceptance);
+			await this.#waitForSemanticDeliveryAcceptances(exemptSemanticDeliveryAcceptance, options.signal);
+			if (options.quiesceAgent) await this.#waitForSessionQuiescence(options.signal);
 			this.#disconnectFromAgent();
 		} catch (error) {
 			releaseFence();
@@ -2310,7 +2337,7 @@ export class AgentSession {
 			};
 			const lifecycle = new SessionLifecycleTransaction({
 				captureRetainedCheckpoint: async captureOptions => {
-					await this.#waitForSemanticDeliveryAcceptances(exemptSemanticDeliveryAcceptance);
+					await this.#waitForSemanticDeliveryAcceptances(exemptSemanticDeliveryAcceptance, options.signal);
 					return captureRetainedSessionCheckpoint(lifecycleHost, captureOptions);
 				},
 				beginOwnership: () => new SessionLifecycleOwner(lifecycleHost, options),
@@ -2348,10 +2375,10 @@ export class AgentSession {
 			throw error;
 		}
 	}
-	async #beginSemanticDeliveryMaintenance(): Promise<() => void> {
+	async #beginSemanticDeliveryMaintenance(signal?: AbortSignal): Promise<() => void> {
 		const releaseFence = this.#acquireLifecycleTransitionFence();
 		try {
-			await this.#waitForSemanticDeliveryAcceptances();
+			await this.#waitForSemanticDeliveryAcceptances(undefined, signal);
 			return releaseFence;
 		} catch (error) {
 			releaseFence();
@@ -2359,6 +2386,15 @@ export class AgentSession {
 		}
 	}
 
+	async #waitForSessionQuiescence(signal?: AbortSignal): Promise<void> {
+		await untilAborted(signal, () => this.agent.waitForIdle());
+		await untilAborted(signal, () => this.#drainInFlightEventHandlers());
+		await this.#waitForInFlightQuiescence(signal);
+		await untilAborted(signal, () => this.#waitForIrcWakeTasks());
+		await untilAborted(signal, () => this.#advisors.waitForPendingCardEvents());
+		await untilAborted(signal, () => this.#waitForPostPromptRecovery());
+		await untilAborted(signal, () => this.#waitForIrcWakeTasks());
+	}
 	#acquireLifecycleTransitionFence(): () => void {
 		if (this.#lifecycleTransitionFenceActive) throw new Error("Lifecycle transition fence already active");
 		this.#lifecycleTransitionFenceActive = true;
@@ -7474,8 +7510,13 @@ export class AgentSession {
 		};
 	}
 
-	async #waitForSemanticDeliveryAcceptances(exempt?: Promise<void>): Promise<void> {
-		await Promise.all([...this.#semanticDeliveryAcceptances].filter(acceptance => acceptance !== exempt));
+	async #waitForSemanticDeliveryAcceptances(exempt?: Promise<void>, signal?: AbortSignal): Promise<void> {
+		await untilAborted(
+			signal,
+			Promise.all([...this.#semanticDeliveryAcceptances].filter(acceptance => acceptance !== exempt)).then(
+				() => undefined,
+			),
+		);
 	}
 
 	async #persistPendingSemanticDelivery(

@@ -224,7 +224,7 @@ export interface SessionMaintenanceHost {
 	}): boolean;
 	persistTurnMessagesForMidRunCompaction(context: AgentTurnEndContext | undefined): Promise<boolean>;
 	findLastAssistantMessage(): AssistantMessage | undefined;
-	beginSemanticDeliveryMaintenance(): Promise<() => void>;
+	beginSemanticDeliveryMaintenance(signal?: AbortSignal): Promise<() => void>;
 	disconnectFromAgent(): void;
 	reconnectToAgent(): void;
 	buildDisplaySessionContext(): SessionContext;
@@ -606,7 +606,9 @@ export class SessionMaintenance {
 		let releaseSemanticDeliveryMaintenance: (() => void) | undefined;
 
 		try {
-			releaseSemanticDeliveryMaintenance = await this.#host.beginSemanticDeliveryMaintenance();
+			releaseSemanticDeliveryMaintenance = await this.#host.beginSemanticDeliveryMaintenance(
+				compactionAbortController.signal,
+			);
 			this.#host.disconnectFromAgent();
 			await this.#host.abort({ goalReason: "internal", preserveCompaction: true });
 			if (!this.#model) {
@@ -926,9 +928,14 @@ export class SessionMaintenance {
 			options?.onComplete?.(compactionResult);
 			return compactionResult;
 		} catch (error) {
-			const err = error instanceof Error ? error : new Error(String(error));
+			const err =
+				compactionAbortController.signal.aborted && error instanceof Error && error.name === "AbortError"
+					? new CompactionCancelledError()
+					: error instanceof Error
+						? error
+						: new Error(String(error));
 			options?.onError?.(err);
-			throw error;
+			throw err;
 		} finally {
 			if (this.#compactionAbortController === compactionAbortController) {
 				this.#compactionAbortController = undefined;

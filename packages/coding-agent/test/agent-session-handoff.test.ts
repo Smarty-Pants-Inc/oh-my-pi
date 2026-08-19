@@ -247,9 +247,11 @@ describe("AgentSession handoff", () => {
 		expect(branchDuringHandoff).toHaveLength(2);
 	});
 
-	it("waits for an accepted peer wake before capturing the handoff snapshot", async () => {
+	it("waits for an accepted peer wake to finish before capturing the handoff snapshot", async () => {
 		const beforeStartEntered = Promise.withResolvers<void>();
 		const releaseBeforeStart = Promise.withResolvers<void>();
+		const responseAccepted = Promise.withResolvers<void>();
+		const releaseResponse = Promise.withResolvers<void>();
 		await session.dispose();
 		sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
 		const initialUser = {
@@ -290,12 +292,42 @@ describe("AgentSession handoff", () => {
 				await completion?.();
 			}),
 		} as unknown as ExtensionRunner;
-		const mock = createMockModel({ handler: () => ({ content: ["wake response"] }) });
+		const wakeResponse = "slow wake response";
+		const wakeStream: StreamFn = (requestModel, _context, options) => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(async () => {
+				await options?.onResponse?.({ status: 200, headers: { "x-test": "accepted" } }, requestModel);
+				responseAccepted.resolve();
+				await releaseResponse.promise;
+				stream.push({
+					type: "done",
+					reason: "stop",
+					message: {
+						role: "assistant",
+						content: [{ type: "text", text: wakeResponse }],
+						api: requestModel.api,
+						provider: requestModel.provider,
+						model: requestModel.id,
+						stopReason: "stop",
+						usage: {
+							input: 1,
+							output: 1,
+							cacheRead: 0,
+							cacheWrite: 0,
+							totalTokens: 2,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						},
+						timestamp: Date.now(),
+					},
+				});
+			});
+			return stream;
+		};
 		session = new AgentSession({
 			agent: new Agent({
 				getApiKey: () => "test-key",
 				initialState: { model, systemPrompt: ["Test"], tools: [], messages: initialMessages },
-				streamFn: mock.stream,
+				streamFn: wakeStream,
 			}),
 			sessionManager,
 			settings: Settings.isolated({ "compaction.enabled": true, "compaction.autoContinue": false }),
@@ -321,13 +353,113 @@ describe("AgentSession handoff", () => {
 		await beforeStartEntered.promise;
 
 		const handingOff = session.handoff();
-		await Promise.race([generationStarted.promise, Bun.sleep(50)]);
-		expect(generateHandoffSpy).not.toHaveBeenCalled();
+		try {
+			await Promise.race([generationStarted.promise, Bun.sleep(50)]);
+			expect(generateHandoffSpy).not.toHaveBeenCalled();
+
+			releaseBeforeStart.resolve();
+			await responseAccepted.promise;
+			await expect(sending).resolves.toEqual({ status: "accepted", delivery: "started_turn" });
+			await Promise.race([generationStarted.promise, Bun.sleep(50)]);
+			expect(generateHandoffSpy).not.toHaveBeenCalled();
+
+			releaseResponse.resolve();
+			await expect(handingOff).resolves.toMatchObject({ document: "## Goal\nContinue from here" });
+			expect(capturedMessages).toContain(wakeText);
+			expect(capturedMessages).toContain(wakeResponse);
+			expect(JSON.stringify(session.agent.state.messages)).not.toContain(wakeResponse);
+		} finally {
+			releaseBeforeStart.resolve();
+			releaseResponse.resolve();
+			await Promise.allSettled([sending, handingOff]);
+		}
+	});
+
+	it("cancels while semantic acceptance is pending and releases the handoff fence", async () => {
+		const beforeStartEntered = Promise.withResolvers<void>();
+		const releaseBeforeStart = Promise.withResolvers<void>();
+		const beforeSwitch = Promise.withResolvers<void>();
+		await session.dispose();
+		sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
+		const initialUser = { role: "user" as const, content: "seed", timestamp: Date.now() - 2 };
+		const initialAssistant: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "seed response" }],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			stopReason: "stop",
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now() - 1,
+		};
+		sessionManager.appendMessage(initialUser);
+		sessionManager.appendMessage(initialAssistant);
+		const extensionRunner = {
+			hasHandlers: vi.fn((eventType: string) => eventType === "session_before_switch"),
+			emitBeforeAgentStart: vi.fn(async () => {
+				beforeStartEntered.resolve();
+				await releaseBeforeStart.promise;
+				return undefined;
+			}),
+			emit: vi.fn(async (event: { type: string }) => {
+				if (event.type === "session_before_switch") beforeSwitch.resolve();
+			}),
+			emitBeforeSessionMutation: vi.fn().mockResolvedValue(undefined),
+			emitWithHostCompletion: vi.fn(async (_event: { type: string }, completion?: () => void | Promise<void>) => {
+				await completion?.();
+			}),
+		} as unknown as ExtensionRunner;
+		const mock = createMockModel({ handler: () => ({ content: ["done"] }) });
+		session = new AgentSession({
+			agent: new Agent({
+				getApiKey: () => "test-key",
+				initialState: { model, systemPrompt: ["Test"], tools: [], messages: [initialUser, initialAssistant] },
+				streamFn: mock.stream,
+			}),
+			sessionManager,
+			settings: Settings.isolated({ "compaction.enabled": true, "compaction.autoContinue": false }),
+			modelRegistry,
+			extensionRunner,
+			obfuscator,
+		});
+
+		const sending = session.sendCustomMessage(
+			{ customType: "peer-message", content: "pending wake", display: true, attribution: "agent" },
+			{ deliveryMode: "auto", automaticTurnSource: "peer_message_wake" },
+		);
+		await beforeStartEntered.promise;
+		const controller = new AbortController();
+		const handingOff = session.handoff(undefined, { signal: controller.signal });
+		await beforeSwitch.promise;
+		await Bun.sleep(0);
+
+		await expect(
+			session.sendCustomMessage(
+				{ customType: "probe", content: "fenced", display: false, attribution: "agent" },
+				{ deliveryMode: "steer" },
+			),
+		).resolves.toEqual({ status: "unavailable", reason: "session_transition" });
+		controller.abort();
+		await expect(withTimeout(handingOff, 1_000, "Handoff cancellation timed out")).rejects.toThrow(
+			"Handoff cancelled",
+		);
+		await expect(
+			session.sendCustomMessage(
+				{ customType: "probe", content: "after cancel", display: false, attribution: "agent" },
+				{ deliveryMode: "steer" },
+			),
+		).resolves.toMatchObject({ status: "accepted" });
 
 		releaseBeforeStart.resolve();
 		await expect(sending).resolves.toEqual({ status: "accepted", delivery: "started_turn" });
-		await expect(handingOff).resolves.toMatchObject({ document: "## Goal\nContinue from here" });
-		expect(capturedMessages).toContain(wakeText);
+		await session.waitForIdle();
 	});
 
 	it("does not run auto-compaction after handoff turn completes", async () => {

@@ -4583,7 +4583,7 @@
     },
     {
       "path": "packages/agent/src/agent-loop.ts",
-      "sha256": "30f3a802b531328b02e5204b4f10dac48fbf89b0ec862ffd4878499b96aec9a4"
+      "sha256": "056e77df767b8fd849d68595ae9baa6630c671428d4d17a6a3d6c3545546e782"
     },
     {
       "path": "packages/agent/src/agent.ts",
@@ -5027,7 +5027,7 @@
     },
     {
       "path": "packages/ai/src/providers/devin.ts",
-      "sha256": "9d1674584ed4a0fba38b7b45de93485271ab7f19171dfde9fcc1e011aa080ea5"
+      "sha256": "b859031ab8ec63c3562c997db3ccb2c5c49eeafe5e54846ad3a289412b0e6a3c"
     },
     {
       "path": "packages/ai/src/providers/error-message.ts",
@@ -5087,7 +5087,7 @@
     },
     {
       "path": "packages/ai/src/providers/ollama.ts",
-      "sha256": "16ef4ff8be8fd3c6e4274aca563cc989154d8224555032c0ecdc69d2390b15bd"
+      "sha256": "64709b04e75c2c2769367b16171c913ac8988974c4be650931e8c4c4af695a92"
     },
     {
       "path": "packages/ai/src/providers/openai-anthropic-shim.ts",
@@ -8423,7 +8423,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/agent-session.ts",
-      "sha256": "43d879147add285698423148c25d93bd71fad89e52fece23da2d70f551e7b9f2"
+      "sha256": "069e94e49883406c5ca2804c32af1c2b8466078e924320e79a6afcb8da69824a"
     },
     {
       "path": "packages/coding-agent/src/session/agent-storage.ts",
@@ -8567,7 +8567,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/session-handoff.ts",
-      "sha256": "d5f07980129aa74725f444ee3a114aa475bea3ee875fee6b4479db86e2b99e30"
+      "sha256": "fad5b4697a662d36b8882705112f6a8ccc5f62dbb584daf280811d772a0c6a55"
     },
     {
       "path": "packages/coding-agent/src/session/session-history-format.ts",
@@ -8591,7 +8591,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/session-maintenance.ts",
-      "sha256": "2ee7fed6b7a028b9ec3a5993e14d8e3258b215be48e1ca835734a771f6d15183"
+      "sha256": "8ca7002abc2fd846c8bf3774a988885f13ce9e10ff2161a48403541e48efd402"
     },
     {
       "path": "packages/coding-agent/src/session/session-manager.ts",
@@ -10675,5 +10675,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "0e0d38b625a7dd072ca1622c58f1ecc66cc366d3f915c4e31acc20259116d2ed"
+  "rootSha256": "6a20528339da7a7d8a9111e0dacf18bd595a695fcb639de7cf99558323b54f51"
 }

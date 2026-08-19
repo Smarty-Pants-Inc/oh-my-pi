@@ -3425,6 +3425,73 @@ describe("agentLoop pre-model-call gate", () => {
 		expect(agent.peekSteeringQueue()).toEqual([queued]);
 	});
 
+	it("restores queued steering when a later provider request stops before dispatch", async () => {
+		const queued = createUserMessage("queued after tool");
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id: "tool-1", name: "echo", arguments: { value: "first" } }] },
+				{ content: ["should not be reached"] },
+			],
+		});
+		let agent: Agent;
+		const tool: AgentTool<typeof echoToolSchema> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: echoToolSchema,
+			concurrency: "exclusive",
+			async execute(_toolCallId, params) {
+				agent.steer(queued);
+				return { content: [{ type: "text", text: `ok:${params.value}` }], details: { value: params.value } };
+			},
+		};
+		agent = new Agent({ streamFn: mock.stream });
+		agent.setTools([tool]);
+		let gateCalls = 0;
+		agent.setBeforeModelCall(() => (++gateCalls === 2 ? { stop: true, reason: "over budget" } : undefined));
+
+		await agent.prompt("start", { onProviderCallStarted: () => {} });
+
+		expect(mock.calls).toHaveLength(1);
+		expect(agent.peekSteeringQueue()).toEqual([queued]);
+		expect(agent.state.messages).not.toContain(queued);
+		expect(agent.state.messages.map(message => message.role)).toEqual(["user", "assistant", "toolResult"]);
+	});
+
+	it("re-injects a soft reminder after a later provider request stops before dispatch", async () => {
+		const reminder = createUserMessage("resolve the later preview");
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id: "tool-1", name: "echo", arguments: { value: "first" } }] },
+				{ content: ["done"], stopReason: "aborted" },
+			],
+		});
+		let toolChoiceCalls = 0;
+		let gateCalls = 0;
+		const agent = new Agent({
+			streamFn: mock.stream,
+			getToolChoice: () =>
+				++toolChoiceCalls === 1
+					? undefined
+					: {
+							soft: true,
+							id: "preview-later",
+							toolName: "echo",
+							reminder: [reminder],
+						},
+		});
+		agent.setTools([echoTool([])]);
+		agent.setBeforeModelCall(() => (++gateCalls === 2 ? { stop: true, reason: "over budget" } : undefined));
+
+		await agent.prompt("start", { onProviderCallStarted: () => {} });
+		expect(agent.state.messages).not.toContain(reminder);
+		await agent.prompt("retry");
+
+		expect(mock.calls).toHaveLength(2);
+		expect(mock.calls[1]?.context.messages.filter(message => message === reminder)).toHaveLength(1);
+		expect(agent.state.messages.filter(message => message === reminder)).toHaveLength(1);
+	});
+
 	it("discards a deferred tool choice when its tool is no longer active", async () => {
 		const mock = createMockModel({ responses: [{ content: ["done"] }] });
 		let toolChoiceCalls = 0;

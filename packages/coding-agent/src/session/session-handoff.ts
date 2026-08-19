@@ -63,7 +63,11 @@ export interface SessionHandoffHost {
 	modelRegistry: ModelRegistry;
 	extensionRunner: ExtensionRunner | undefined;
 	sideStreamFn: StreamFn;
-	beginLifecycleTransaction(semanticDeliveryAcceptance?: Promise<void>): Promise<SessionLifecycleTransaction>;
+	beginLifecycleTransaction(
+		semanticDeliveryAcceptance: Promise<void> | undefined,
+		signal: AbortSignal,
+		quiesceAgent: boolean,
+	): Promise<SessionLifecycleTransaction>;
 	obfuscator: SecretObfuscator | undefined;
 	model(): Model | undefined;
 	thinkingLevel(): ThinkingLevel | undefined;
@@ -183,9 +187,13 @@ export class SessionHandoff {
 				}
 			}
 
-			// Fence and settle accepted deliveries before capturing the request snapshot.
-			// Pre-prompt auto-handoff exempts only the wake whose prompt resumes in the target.
-			lifecycle = await this.#host.beginLifecycleTransaction(semanticDeliveryAcceptance);
+			// External handoffs settle the active prompt before capture. Auto-handoffs
+			// already run inside prompt maintenance and must not wait on themselves.
+			lifecycle = await this.#host.beginLifecycleTransaction(
+				semanticDeliveryAcceptance,
+				handoffSignal,
+				options?.autoTriggered !== true && semanticDeliveryAcceptance === undefined,
+			);
 
 			// Build the handoff request through the SAME pipeline a live turn uses
 			// (`runEphemeralTurn` / `/btw` share it) so the oneshot reads the

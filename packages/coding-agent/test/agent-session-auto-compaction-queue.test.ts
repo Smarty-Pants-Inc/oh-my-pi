@@ -66,6 +66,12 @@ describe("AgentSession auto-compaction queue resume", () => {
 						},
 					};
 				});
+				pi.on("message_end", async event => {
+					if (event.message.role !== "custom" || event.message.customType !== "peer-message") return;
+					const gate = (globalThis as typeof globalThis & { __ompSemanticPersistenceGate?: Promise<void> })
+						.__ompSemanticPersistenceGate;
+					if (gate) await gate;
+				});
 				pi.on("auto_compaction_start", event => {
 					getRuntimeSignals().push(`compaction:start:${event.reason}`);
 				});
@@ -136,6 +142,9 @@ describe("AgentSession auto-compaction queue resume", () => {
 				getRuntimeSignals().length = 0;
 				(globalThis as typeof globalThis & { __ompManualCompactGate?: Promise<void> }).__ompManualCompactGate =
 					undefined;
+				(
+					globalThis as typeof globalThis & { __ompSemanticPersistenceGate?: Promise<void> }
+				).__ompSemanticPersistenceGate = undefined;
 				vi.restoreAllMocks();
 			}
 		}
@@ -318,6 +327,51 @@ describe("AgentSession auto-compaction queue resume", () => {
 		} finally {
 			gate.resolve();
 			await compactPromise;
+		}
+	});
+
+	it("abortCompaction cancels startup while semantic acceptance is pending", async () => {
+		vi.useRealTimers();
+		session.agent.streamFn = createMockModel({ handler: () => ({ content: ["Done"] }) }).stream;
+		const persistenceGate = Promise.withResolvers<void>();
+		(
+			globalThis as typeof globalThis & { __ompSemanticPersistenceGate?: Promise<void> }
+		).__ompSemanticPersistenceGate = persistenceGate.promise;
+		let compactPromise: Promise<unknown> | undefined;
+		const sending = session.sendCustomMessage(
+			{
+				customType: "peer-message",
+				content: "hold acceptance during compact cancellation",
+				display: true,
+				attribution: "agent",
+			},
+			{
+				deliveryMode: "auto",
+				automaticTurnSource: "peer_message_wake",
+				onStartedTurnAccepted: () => {
+					compactPromise = session.compact();
+					void compactPromise.catch(() => {});
+					session.abortCompaction();
+				},
+			},
+		);
+
+		try {
+			while (!compactPromise) await Bun.sleep(1);
+			await expect(withTimeout(compactPromise, 1_000, "Compaction cancellation timed out")).rejects.toThrow(
+				"Compaction cancelled",
+			);
+			expect(session.isCompacting).toBe(false);
+			await expect(
+				session.sendCustomMessage(
+					{ customType: "probe", content: "after compact cancel", display: false, attribution: "agent" },
+					{ deliveryMode: "steer" },
+				),
+			).resolves.toMatchObject({ status: "accepted" });
+		} finally {
+			persistenceGate.resolve();
+			await sending;
+			await session.waitForIdle();
 		}
 	});
 
