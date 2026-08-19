@@ -71,6 +71,22 @@ describe("SelectorController.handleResumeSession preflight flush", () => {
 		expect(ctx.showStatus).not.toHaveBeenCalled();
 	});
 
+	it("returns false without restoring UI when the session switch is cancelled", async () => {
+		const { ctx, switchSession, applyCwdChange } = createResumeContext();
+		switchSession.mockResolvedValue(false);
+		const controller = new SelectorController(ctx);
+
+		const result = await controller.handleResumeSession("/tmp/cancelled-session.jsonl");
+
+		expect(result).toBe(false);
+		expect(ctx.clearTransientSessionUi).not.toHaveBeenCalled();
+		expect(applyCwdChange).not.toHaveBeenCalled();
+		expect(ctx.updateEditorBorderColor).not.toHaveBeenCalled();
+		expect(ctx.renderInitialMessages).not.toHaveBeenCalled();
+		expect(ctx.reloadTodos).not.toHaveBeenCalled();
+		expect(ctx.showStatus).not.toHaveBeenCalled();
+	});
+
 	it("proceeds and returns true when flush succeeds", async () => {
 		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-resume-preflight-"));
 		try {

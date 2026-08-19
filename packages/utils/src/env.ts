@@ -9,6 +9,8 @@ const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const FRESH_OMP_COMPANION_ENV = "FRESH_OMP_COMPANION";
 const FRESH_OMP_COMPANION_ENDPOINT_ENV = "FRESH_OMP_COMPANION_ENDPOINT";
 const FRESH_OMP_COMPANION_TOKEN_ENV = "FRESH_OMP_COMPANION_TOKEN";
+const HERDR_OMP_BRIDGE_TOKEN_ENV = "HERDR_OMP_BRIDGE_TOKEN";
+const HERDR_OMP_GUEST_BRIDGE_TOKEN_ENV = "HERDR_OMP_GUEST_BRIDGE_TOKEN";
 
 function isFreshOmpCompanionEnvName(name: string): boolean {
 	const canonical = process.platform === "win32" ? name.toUpperCase() : name;
@@ -17,6 +19,11 @@ function isFreshOmpCompanionEnvName(name: string): boolean {
 		canonical === FRESH_OMP_COMPANION_ENDPOINT_ENV ||
 		canonical === FRESH_OMP_COMPANION_TOKEN_ENV
 	);
+}
+
+function isHerdrOmpBridgeTokenEnvName(name: string): boolean {
+	const canonical = process.platform === "win32" ? name.toUpperCase() : name;
+	return canonical === HERDR_OMP_BRIDGE_TOKEN_ENV || canonical === HERDR_OMP_GUEST_BRIDGE_TOKEN_ENV;
 }
 
 /**
@@ -56,6 +63,7 @@ export function filterProcessEnv(env: Record<string, string | undefined>): Recor
 			!isSafeEnvName(key) ||
 			isMacosMallocStackLoggingEnvName(key) ||
 			isFreshOmpCompanionEnvName(key) ||
+			isHerdrOmpBridgeTokenEnvName(key) ||
 			value === undefined ||
 			!isSafeEnvValue(value)
 		) {
@@ -94,6 +102,10 @@ const launchEnvValues = readLaunchEnv();
 let freshOmpCompanionLaunchEnv: Record<string, string | undefined> | undefined = launchEnvValues ? {} : undefined;
 if (launchEnvValues && freshOmpCompanionLaunchEnv) {
 	for (const [name, value] of launchEnvValues) {
+		if (isHerdrOmpBridgeTokenEnvName(name)) {
+			launchEnvValues.delete(name);
+			continue;
+		}
 		if (!isFreshOmpCompanionEnvName(name)) continue;
 		const canonicalName = name.toUpperCase();
 		freshOmpCompanionLaunchEnv[canonicalName] = value;
@@ -166,6 +178,9 @@ export function filterChildShellEnv(
 			delete result[key];
 		}
 	}
+	for (const key of Object.keys(result)) {
+		if (isHerdrOmpBridgeTokenEnvName(key)) delete result[key];
+	}
 	return result;
 }
 
@@ -184,7 +199,7 @@ function parseEnvLine(line: string): { key: string; value: string } | undefined 
 	let key = trimmed.slice(0, eqIndex).trim();
 	const exported = key.match(/^export[ \t]+(.*)$/);
 	if (exported) key = exported[1].trim();
-	if (!isValidEnvName(key) || isFreshOmpCompanionEnvName(key)) return undefined;
+	if (!isValidEnvName(key) || isFreshOmpCompanionEnvName(key) || isHerdrOmpBridgeTokenEnvName(key)) return undefined;
 	const raw = trimmed.slice(eqIndex + 1).replace(/^[ \t]+/, "");
 	const quote = raw[0];
 	if (quote === '"' || quote === "'" || quote === "`") {
@@ -235,6 +250,7 @@ for (const key of Object.keys(Bun.env)) {
 		!isSafeEnvName(key) ||
 		isMacosMallocStackLoggingEnvName(key) ||
 		isFreshOmpCompanionEnvName(key) ||
+		isHerdrOmpBridgeTokenEnvName(key) ||
 		value === undefined ||
 		!isSafeEnvValue(value)
 	) {

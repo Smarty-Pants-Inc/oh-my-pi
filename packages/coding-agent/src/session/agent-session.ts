@@ -97,6 +97,7 @@ import {
 	prompt,
 	Snowflake,
 	stringProperty,
+	untilAborted,
 	withTimeout,
 } from "@oh-my-pi/pi-utils";
 import {
@@ -511,6 +512,7 @@ interface SessionChangeRegistration {
 	callback: () => void;
 	ownerSessionId: string;
 	onDiscard?: () => void;
+	onRollback?: () => void;
 }
 
 interface DeferredLaunchCompletionDelivery {
@@ -605,9 +607,7 @@ export class AgentSession {
 	#pendingExplicitPromptMessages: CustomMessage[] = [];
 	/** Durable queued semantic deliveries not yet persisted into conversation history. */
 	#pendingSemanticDeliveryIds = new Set<string>();
-	#semanticDeliveryAcceptanceCount = 0;
-	#semanticDeliveryAcceptancesSettled: Promise<void> = Promise.resolve();
-	#resolveSemanticDeliveryAcceptances: (() => void) | undefined;
+	#semanticDeliveryAcceptances = new Set<Promise<void>>();
 	#queuedMessageDrainScheduled = false;
 	#planModeState: PlanModeState | undefined;
 	/** Session-scoped `/vision` override; undefined = follow persisted `inspect_image.mode`. */
@@ -685,6 +685,8 @@ export class AgentSession {
 	readonly #activeLifecycleSettlements = new Set<Promise<void>>();
 	/** Suppresses queued turns from the first retained checkpoint through irreversible lifecycle selection. */
 	#lifecycleTransitionFenceActive = false;
+	/** The active lifecycle fence belongs to queue-preserving semantic maintenance. */
+	#semanticDeliveryMaintenanceFenceActive = false;
 	#lifecycleTransitionGeneration = 0;
 
 	readonly #irc: IrcBridge;
@@ -711,7 +713,12 @@ export class AgentSession {
 	#turnIndex = 0;
 	#messageEndPersistenceTail: Promise<void> = Promise.resolve();
 	#pendingMessageEndPersistence = new Map<string, Promise<void>>();
+	#messageEndPersistenceWaiters = new WeakMap<
+		AgentMessage,
+		{ resolve: () => void; reject: (reason?: unknown) => void }
+	>();
 	#persistedMessageKeys: { anchor: string; keys: Set<string> } | undefined;
+	#provisionalPeerMessageWake: symbol | undefined;
 
 	// Custom commands (TypeScript slash commands)
 	#customCommands: LoadedCustomCommand[] = [];
@@ -772,10 +779,13 @@ export class AgentSession {
 	#inFlightBeforeAgentEndCallbacks: Array<() => void | Promise<void>> = [];
 	#inFlightSettledCallbacks: Array<() => void | Promise<void>> = [];
 	#inFlightSettling = false;
+	#inFlightQuiescenceWaiters = new Set<() => void>();
 	#ircWakeTasks = new Set<Promise<void>>();
 	#sessionStopHookActive = false;
 	readonly #automaticTurns = new AutomaticTurnAuthority();
-	#pendingAutomaticTurnStart: { source: AutomaticTurnSource; originTurnId?: string } | undefined;
+	#pendingAutomaticTurnStart:
+		| { source: AutomaticTurnSource; originTurnId?: string; onStartSettled?: () => void }
+		| undefined;
 	#currentTurnId: string | undefined;
 	#pendingAskReanswerOwner: ToolResultMessage | undefined;
 	#activeDirectUserContinuationOwner: AgentMessage | undefined;
@@ -870,7 +880,12 @@ export class AgentSession {
 				(this.#inFlightBeforeAgentEndCallbacks.length > 0 || this.#inFlightSettledCallbacks.length > 0)
 			) {
 				this.#scheduleInFlightSettlement();
+				return;
 			}
+			if (this.#promptInFlightCount !== 0) return;
+			const waiters = [...this.#inFlightQuiescenceWaiters];
+			this.#inFlightQuiescenceWaiters.clear();
+			for (const resolve of waiters) resolve();
 		});
 	}
 
@@ -893,6 +908,25 @@ export class AgentSession {
 		await this.#flushInFlightCallbacks(this.#inFlightSettledCallbacks);
 		if (this.#promptInFlightCount !== 0) return;
 		this.#drainStrandedQueuedMessages();
+	}
+
+	async #waitForInFlightQuiescence(signal?: AbortSignal): Promise<void> {
+		if (
+			this.#promptInFlightCount === 0 &&
+			!this.#inFlightSettling &&
+			this.#inFlightBeforeAgentEndCallbacks.length === 0 &&
+			this.#inFlightSettledCallbacks.length === 0
+		) {
+			return;
+		}
+		const { promise, resolve } = Promise.withResolvers<void>();
+		this.#inFlightQuiescenceWaiters.add(resolve);
+		this.#scheduleInFlightSettlement();
+		try {
+			await untilAborted(signal, promise);
+		} finally {
+			this.#inFlightQuiescenceWaiters.delete(resolve);
+		}
 	}
 
 	#enqueueBeforeAgentEnd(callback: () => void | Promise<void>): void {
@@ -1711,9 +1745,9 @@ export class AgentSession {
 			scheduleCompactionContinuation: options => this.#scheduleCompactionContinuation(options),
 			persistTurnMessagesForMidRunCompaction: context => this.#persistTurnMessagesForMidRunCompaction(context),
 			findLastAssistantMessage: () => this.#findLastAssistantMessage(),
+			beginSemanticDeliveryMaintenance: signal => this.#beginSemanticDeliveryMaintenance(signal),
 			disconnectFromAgent: () => this.#disconnectFromAgent(),
 			reconnectToAgent: () => this.#reconnectToAgent(),
-			drainStrandedQueuedMessages: () => this.#drainStrandedQueuedMessages(),
 			buildDisplaySessionContext: () => this.buildDisplaySessionContext(),
 			convertToLlmForSideRequest: messages => this.#convertToLlmForSideRequest(messages),
 			obfuscateTextForProvider: text => this.#obfuscateTextForProvider(text),
@@ -1731,7 +1765,10 @@ export class AgentSession {
 			getContextUsage: options => this.getContextUsage(options),
 			shake: (mode, options) => this.shake(mode, options),
 			dropImages: () => this.dropImages(),
-			runHandoff: (customInstructions, options) => this.handoff(customInstructions, options),
+			runHandoff: (customInstructions, options, semanticDeliveryAcceptance) =>
+				semanticDeliveryAcceptance === undefined
+					? this.handoff(customInstructions, options)
+					: this.handoff(customInstructions, options, semanticDeliveryAcceptance),
 			removeAssistantMessageFromActiveContext: message =>
 				this.#recovery.removeAssistantMessageFromActiveContext(message),
 			dropPersistedAssistantTurn: message => this.#recovery.dropPersistedAssistantTurn(message),
@@ -1751,7 +1788,8 @@ export class AgentSession {
 			modelRegistry: this.#modelRegistry,
 			extensionRunner: this.#extensionRunner,
 			sideStreamFn: this.#sideStreamFn,
-			beginLifecycleTransaction: () => this.#beginLifecycleTransaction(),
+			beginLifecycleTransaction: (semanticDeliveryAcceptance, signal, quiesceAgent) =>
+				this.#beginLifecycleTransaction({ quiesceAgent, signal }, semanticDeliveryAcceptance),
 			obfuscator: this.#obfuscator,
 			model: () => this.model,
 			thinkingLevel: () => this.thinkingLevel,
@@ -2255,17 +2293,36 @@ export class AgentSession {
 		return {
 			selectRollback: () => {
 				const discarded = this.#selectRollbackSessionChangeRegistrations(retained);
-				this.#activateDiscardedSessionChangeRegistrations(discarded);
+				const failures: unknown[] = [];
+				try {
+					this.#activateDiscardedSessionChangeRegistrations(discarded);
+				} catch (error) {
+					failures.push(error);
+				}
+				try {
+					this.#activateRetainedSessionRollbackRegistrations(retained);
+				} catch (error) {
+					failures.push(error);
+				}
+				if (failures.length === 1) throw failures[0];
+				if (failures.length > 1) {
+					throw new AggregateError(failures, "Session change rollback callback cleanup was incomplete");
+				}
 			},
 			activateCommit: () => this.#notifySessionChangeCallbacks(),
 		};
 	}
 
-	/** Acquire the one fence that spans capture, selection, host publication, and activation. */
-	#beginLifecycleTransaction(options: { persistDetachedBash?: boolean } = {}): SessionLifecycleTransaction {
+	/** Acquire the one fence that spans acceptance settlement, capture, selection, host publication, and activation. */
+	async #beginLifecycleTransaction(
+		options: { persistDetachedBash?: boolean; quiesceAgent?: boolean; signal?: AbortSignal } = {},
+		exemptSemanticDeliveryAcceptance?: Promise<void>,
+	): Promise<SessionLifecycleTransaction> {
 		if (this.#isDisposed) throw new Error("Cannot start a lifecycle transaction after session disposal");
 		const releaseFence = this.#acquireLifecycleTransitionFence();
 		try {
+			await this.#waitForSemanticDeliveryAcceptances(exemptSemanticDeliveryAcceptance, options.signal);
+			if (options.quiesceAgent) await this.#waitForSessionQuiescence(options.signal);
 			this.#disconnectFromAgent();
 		} catch (error) {
 			releaseFence();
@@ -2297,7 +2354,7 @@ export class AgentSession {
 			};
 			const lifecycle = new SessionLifecycleTransaction({
 				captureRetainedCheckpoint: async captureOptions => {
-					await this.#semanticDeliveryAcceptancesSettled;
+					await this.#waitForSemanticDeliveryAcceptances(exemptSemanticDeliveryAcceptance, options.signal);
 					return captureRetainedSessionCheckpoint(lifecycleHost, captureOptions);
 				},
 				beginOwnership: () => new SessionLifecycleOwner(lifecycleHost, options),
@@ -2334,6 +2391,34 @@ export class AgentSession {
 			releaseFence();
 			throw error;
 		}
+	}
+	async #beginSemanticDeliveryMaintenance(signal?: AbortSignal): Promise<() => void> {
+		const releaseLifecycleFence = this.#acquireLifecycleTransitionFence();
+		this.#semanticDeliveryMaintenanceFenceActive = true;
+		let released = false;
+		const releaseFence = () => {
+			if (released) return;
+			released = true;
+			this.#semanticDeliveryMaintenanceFenceActive = false;
+			releaseLifecycleFence();
+		};
+		try {
+			await this.#waitForSemanticDeliveryAcceptances(undefined, signal);
+			return releaseFence;
+		} catch (error) {
+			releaseFence();
+			throw error;
+		}
+	}
+
+	async #waitForSessionQuiescence(signal?: AbortSignal): Promise<void> {
+		await untilAborted(signal, () => this.agent.waitForIdle());
+		await untilAborted(signal, () => this.#drainInFlightEventHandlers());
+		await this.#waitForInFlightQuiescence(signal);
+		await untilAborted(signal, () => this.#waitForIrcWakeTasks());
+		await untilAborted(signal, () => this.#advisors.waitForPendingCardEvents());
+		await untilAborted(signal, () => this.#waitForPostPromptRecovery());
+		await untilAborted(signal, () => this.#waitForIrcWakeTasks());
 	}
 	#acquireLifecycleTransitionFence(): () => void {
 		if (this.#lifecycleTransitionFenceActive) throw new Error("Lifecycle transition fence already active");
@@ -2456,6 +2541,21 @@ export class AgentSession {
 		if (failures.length === 1) throw failures[0];
 		if (failures.length > 1) {
 			throw new AggregateError(failures, "Discarded session callback cleanup was incomplete");
+		}
+	}
+
+	#activateRetainedSessionRollbackRegistrations(registrations: ReadonlySet<SessionChangeRegistration>): void {
+		const failures: unknown[] = [];
+		for (const registration of registrations) {
+			try {
+				registration.onRollback?.();
+			} catch (error) {
+				failures.push(error);
+			}
+		}
+		if (failures.length === 1) throw failures[0];
+		if (failures.length > 1) {
+			throw new AggregateError(failures, "Retained session rollback callback cleanup was incomplete");
 		}
 	}
 
@@ -2985,6 +3085,20 @@ export class AgentSession {
 		await this.#pendingMessageEndPersistence.get(key);
 	}
 
+	#waitForMessageEndPersistence(message: AgentMessage): Promise<void> {
+		const { promise, resolve, reject } = Promise.withResolvers<void>();
+		this.#messageEndPersistenceWaiters.set(message, { resolve, reject });
+		return promise;
+	}
+
+	#settleMessageEndPersistenceWaiter(message: AgentMessage, error?: unknown): void {
+		const waiter = this.#messageEndPersistenceWaiters.get(message);
+		if (!waiter) return;
+		this.#messageEndPersistenceWaiters.delete(message);
+		if (error === undefined) waiter.resolve();
+		else waiter.reject(error);
+	}
+
 	/**
 	 * Index every message entry on the current branch by persistence key, so
 	 * the mid-run-compaction planner can ask "is this turn message already on
@@ -3129,13 +3243,27 @@ export class AgentSession {
 	}
 
 	async #persistMessageEnd(message: AgentMessage): Promise<void> {
-		if (message.role === "hookMessage" || message.role === "custom") {
-			// Prewalk's plan nudge is a one-run steering instruction. Persisting it would
-			// resurrect the consumed prompt on resume, fork, or any context rebuild.
-			if (!isPrewalkPlanNudge(message)) {
-				const pendingSemanticDeliveryId = readPendingSemanticDeliveryId(message.details);
-				if (pendingSemanticDeliveryId && this.#pendingSemanticDeliveryIds.has(pendingSemanticDeliveryId)) {
-					await this.sessionManager.appendEntriesAtomically(() => {
+		const requireDurablePersistence = this.#messageEndPersistenceWaiters.has(message);
+		let failure: unknown;
+		try {
+			if (message.role === "hookMessage" || message.role === "custom") {
+				// Prewalk's plan nudge is a one-run steering instruction. Persisting it would
+				// resurrect the consumed prompt on resume, fork, or any context rebuild.
+				if (!isPrewalkPlanNudge(message)) {
+					const pendingSemanticDeliveryId = readPendingSemanticDeliveryId(message.details);
+					if (pendingSemanticDeliveryId && this.#pendingSemanticDeliveryIds.has(pendingSemanticDeliveryId)) {
+						await this.sessionManager.appendEntriesAtomically(() => {
+							this.sessionManager.appendCustomMessageEntry(
+								message.customType,
+								message.content,
+								message.display,
+								message.details,
+								message.attribution ?? "agent",
+							);
+							this.#appendPendingSemanticDeliverySettlement(pendingSemanticDeliveryId, "delivered");
+						});
+						this.#pendingSemanticDeliveryIds.delete(pendingSemanticDeliveryId);
+					} else {
 						this.sessionManager.appendCustomMessageEntry(
 							message.customType,
 							message.content,
@@ -3143,25 +3271,24 @@ export class AgentSession {
 							message.details,
 							message.attribution ?? "agent",
 						);
-						this.#appendPendingSemanticDeliverySettlement(pendingSemanticDeliveryId, "delivered");
-					});
-					this.#pendingSemanticDeliveryIds.delete(pendingSemanticDeliveryId);
-				} else {
-					this.sessionManager.appendCustomMessageEntry(
-						message.customType,
-						message.content,
-						message.display,
-						message.details,
-						message.attribution ?? "agent",
-					);
+					}
 				}
+				if (message.role === "custom" && message.customType === "ttsr-injection") {
+					this.#ttsr.markInjectedFromDetails(message.details);
+				}
+			} else {
+				this.#persistSessionMessageIfMissing(message);
 			}
-			if (message.role === "custom" && message.customType === "ttsr-injection") {
-				this.#ttsr.markInjectedFromDetails(message.details);
+			if (requireDurablePersistence) {
+				await this.sessionManager.ensureOnDisk();
+				await this.sessionManager.flush();
 			}
-			return;
+		} catch (error) {
+			failure = error;
+			throw error;
+		} finally {
+			this.#settleMessageEndPersistenceWaiter(message, failure);
 		}
-		this.#persistSessionMessageIfMissing(message);
 	}
 
 	/**
@@ -3239,7 +3366,7 @@ export class AgentSession {
 		// A fresh run supersedes the previously settled (and pruned) refusal
 		// turn: state-based lookups take over again.
 		if (event.type === "agent_start") {
-			this.#recordAutomaticTurnStarted();
+			this.#recordAutomaticTurnStarted("agent_start");
 			this.#prunedTerminalRefusal = undefined;
 			this.#emitRunState("running");
 		}
@@ -4180,27 +4307,38 @@ export class AgentSession {
 		return this.#automaticTurns.outcomes();
 	}
 
-	#armAutomaticTurnStart(source: AutomaticTurnSource, originTurnId?: string): void {
+	#armAutomaticTurnStart(source: AutomaticTurnSource, originTurnId?: string, onStartSettled?: () => void): void {
 		if (this.#pendingAutomaticTurnStart) {
 			throw new Error(`Automatic turn start already pending for ${this.#pendingAutomaticTurnStart.source}`);
 		}
-		this.#pendingAutomaticTurnStart = { source, ...(originTurnId ? { originTurnId } : {}) };
+		this.#pendingAutomaticTurnStart = {
+			source,
+			...(originTurnId ? { originTurnId } : {}),
+			...(onStartSettled ? { onStartSettled } : {}),
+		};
 	}
 
-	#recordAutomaticTurnStarted(): void {
+	#recordAutomaticTurnStarted(boundary: "agent_start" | "provider_call"): void {
 		const pending = this.#pendingAutomaticTurnStart;
 		if (!pending) return;
+		if (pending.source === "peer_message_wake" ? boundary !== "provider_call" : boundary !== "agent_start") return;
+		pending.onStartSettled?.();
 		this.#pendingAutomaticTurnStart = undefined;
 		this.#automaticTurns.record(
 			pending.source,
 			"started",
-			"agent_start confirmed provider dispatch",
+			boundary === "provider_call"
+				? "provider stream creation confirmed dispatch"
+				: "agent_start confirmed turn start",
 			pending.originTurnId,
 		);
 	}
 
 	#recordAutomaticTurnFailed(source: AutomaticTurnSource, error: unknown, originTurnId?: string): void {
-		if (this.#pendingAutomaticTurnStart?.source === source) this.#pendingAutomaticTurnStart = undefined;
+		const pending = this.#pendingAutomaticTurnStart;
+		if (pending?.source === source) {
+			this.#pendingAutomaticTurnStart = undefined;
+		}
 		this.#automaticTurns.record(
 			source,
 			"failed",
@@ -4741,11 +4879,15 @@ export class AgentSession {
 	}
 
 	/** Register cleanup owned by the logical session active at registration time. */
-	registerSessionChangeCallback(callback: () => void, options?: { onDiscard?: () => void }): () => void {
+	registerSessionChangeCallback(
+		callback: () => void,
+		options?: { onDiscard?: () => void; onRollback?: () => void },
+	): () => void {
 		const registration: SessionChangeRegistration = {
 			callback,
 			ownerSessionId: this.sessionManager.getSessionId(),
 			onDiscard: options?.onDiscard,
+			onRollback: options?.onRollback,
 		};
 		this.#sessionChangeCallbacks.add(registration);
 		return () => this.#sessionChangeCallbacks.delete(registration);
@@ -5247,7 +5389,7 @@ export class AgentSession {
 		}
 		const releaseSemanticFence = this.#acquireLifecycleTransitionFence();
 		try {
-			await this.#semanticDeliveryAcceptancesSettled;
+			await this.#waitForSemanticDeliveryAcceptances();
 			if (this.isStreaming || this.isBashRunning || this.isEvalRunning) return undefined;
 			const droppedCount = this.agent.state.messages.length;
 
@@ -5735,6 +5877,12 @@ export class AgentSession {
 
 	/** Compact the active session history. */
 	compact(customInstructions?: string, options?: CompactOptions): Promise<CompactionResult> {
+		if (this.#provisionalPeerMessageWake !== undefined) {
+			throw new Error("Compaction is unavailable while a peer-message wake awaits provider response acceptance");
+		}
+		if (this.#semanticDeliveryAcceptances.size > 0 && this.#extensionRunner?.isHandlingEvent?.()) {
+			throw new Error("Compaction is unavailable while semantic message delivery is being accepted");
+		}
 		return this.#maintenance.compact(customInstructions, options);
 	}
 
@@ -6370,6 +6518,25 @@ export class AgentSession {
 		return keywordNotices;
 	}
 
+	#assertPromptCanStart(lifecycleGeneration = this.#lifecycleTransitionGeneration): void {
+		if (
+			this.#handoff.isGeneratingHandoff ||
+			this.#lifecycleTransitionFenceActive ||
+			lifecycleGeneration !== this.#lifecycleTransitionGeneration
+		) {
+			throw new AgentBusyError("Session transition in progress. Wait for completion before sending another prompt.");
+		}
+	}
+	#assertQueuedUserMessageCanStart(lifecycleGeneration = this.#lifecycleTransitionGeneration): void {
+		if (
+			this.#handoff.isGeneratingHandoff ||
+			lifecycleGeneration !== this.#lifecycleTransitionGeneration ||
+			(this.#lifecycleTransitionFenceActive && !this.#semanticDeliveryMaintenanceFenceActive)
+		) {
+			throw new AgentBusyError("Session transition in progress. Wait for completion before sending another prompt.");
+		}
+	}
+
 	/**
 	 * Send a prompt to the agent.
 	 * - Handles extension commands (registered via pi.registerCommand) immediately, even during streaming
@@ -6386,10 +6553,19 @@ export class AgentSession {
 	 * steer/follow-up. Callers that render a UI or manage turn lifecycle (e.g.
 	 * the ACP agent) use this to know whether to expect an `agent_end` event.
 	 */
+
 	async prompt(text: string, options?: PromptOptions): Promise<boolean> {
 		const abort = this.#abortPromise;
 		if (abort) await abort;
+		const lifecycleGeneration = this.#lifecycleTransitionGeneration;
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
+		const queueDuringSemanticMaintenance =
+			this.#semanticDeliveryMaintenanceFenceActive &&
+			options?.streamingBehavior !== undefined &&
+			!options.synthetic &&
+			!(expandPromptTemplates && text.startsWith("/"));
+		if (queueDuringSemanticMaintenance) this.#assertQueuedUserMessageCanStart(lifecycleGeneration);
+		else this.#assertPromptCanStart(lifecycleGeneration);
 
 		// Handle extension commands first (execute immediately, even during streaming)
 		if (expandPromptTemplates && text.startsWith("/")) {
@@ -6434,21 +6610,20 @@ export class AgentSession {
 			this.#toolChoiceQueue.removeByLabel("plan-mode-decision");
 		}
 
-		// If streaming, queue via steer() or followUp() based on option
-		if (this.isStreaming) {
+		// While streaming or queue-preserving maintenance is active, queue via steer/follow-up.
+		if (this.isStreaming || queueDuringSemanticMaintenance) {
 			const streamingBehavior = options?.streamingBehavior;
 			if (!streamingBehavior) throw new AgentBusyError();
 
-			// Steer/follow-up the keyword notices BEFORE the queued user message so the
-			// model reads the steering notice ahead of the prompt it modifies.
-			for (const notice of keywordNotices) {
-				await this.#queueCustomMessage(notice, streamingBehavior);
-			}
-			if (streamingBehavior === "followUp") {
-				await this.#queueUserMessage(expandedText, options?.images, "followUp");
-			} else {
-				await this.#queueUserMessage(expandedText, options?.images, "steer");
-			}
+			// Queue keyword notices and their owning user message as one accepted batch so
+			// a lifecycle handoff cannot strand a notice without the prompt it modifies.
+			await this.#queueUserMessage(
+				expandedText,
+				options?.images,
+				streamingBehavior === "followUp" ? "followUp" : "steer",
+				lifecycleGeneration,
+				keywordNotices,
+			);
 			return true;
 		}
 
@@ -6508,6 +6683,7 @@ export class AgentSession {
 				...options,
 				images: normalizedImages,
 				consumeExplicitPromptMessages: message.role === "user",
+				lifecycleGeneration,
 				prependMessages:
 					preludeMessages.length > 0 || keywordNotices.length > 0 || imageDescriptionNotice
 						? [...preludeMessages, ...keywordNotices, ...(imageDescriptionNotice ? [imageDescriptionNotice] : [])]
@@ -6531,6 +6707,8 @@ export class AgentSession {
 	): Promise<void> {
 		const abort = this.#abortPromise;
 		if (abort) await abort;
+		const lifecycleGeneration = this.#lifecycleTransitionGeneration;
+		this.#assertPromptCanStart(lifecycleGeneration);
 		const textContent =
 			typeof message.content === "string"
 				? message.content
@@ -6562,20 +6740,28 @@ export class AgentSession {
 			const streamingBehavior = options?.streamingBehavior;
 			if (!streamingBehavior) throw new AgentBusyError();
 
-			for (const notice of keywordNotices) {
-				await this.#queueCustomMessage(notice, streamingBehavior, undefined, false);
-			}
-			await this.#queueCustomMessage(message, streamingBehavior, options.queueChipText, false);
+			await this.#queueCustomMessage(
+				message,
+				streamingBehavior,
+				options.queueChipText,
+				false,
+				lifecycleGeneration,
+				keywordNotices,
+			);
 			return;
 		}
 		if (this.isStreaming) {
 			const streamingBehavior = options?.streamingBehavior;
 			if (!streamingBehavior) throw new AgentBusyError();
 
-			for (const notice of keywordNotices) {
-				await this.#queueCustomMessage(notice, streamingBehavior);
-			}
-			await this.#queueCustomMessage(message, streamingBehavior, options?.queueChipText);
+			await this.#queueCustomMessage(
+				message,
+				streamingBehavior,
+				options?.queueChipText,
+				true,
+				lifecycleGeneration,
+				keywordNotices,
+			);
 			return;
 		}
 
@@ -6591,6 +6777,7 @@ export class AgentSession {
 
 		await this.#promptWithMessage(customMessage, textContent, {
 			...options,
+			lifecycleGeneration,
 			prependMessages: keywordNotices.length > 0 ? keywordNotices : undefined,
 		});
 	}
@@ -6603,16 +6790,31 @@ export class AgentSession {
 			skipPostPromptRecoveryWait?: boolean;
 			acceptTerminalEmptyStop?: boolean;
 			consumeExplicitPromptMessages?: boolean;
-			automaticTurn?: { source: AutomaticTurnSource; originTurnId?: string };
+			lifecycleGeneration?: number;
+			automaticTurn?: {
+				source: AutomaticTurnSource;
+				originTurnId?: string;
+				onStartSettled?: () => void;
+				semanticDeliveryAcceptance?: Promise<void>;
+			};
 		},
-	): Promise<void> {
+	): Promise<boolean> {
 		const abort = this.#abortPromise;
 		if (abort) await abort;
+		this.onBeforePromptAcceptance?.();
+		this.#assertPromptCanStart(options?.lifecycleGeneration);
 		const automaticTurn =
 			options?.automaticTurn ??
 			(message.role === "custom" && message.customType === "goal-continuation"
 				? { source: "active_goal_continuation" as const }
 				: undefined);
+		const provisionalPeerMessageWake =
+			automaticTurn?.source === "peer_message_wake" ? Symbol("provisional-peer-message-wake") : undefined;
+		const releaseProvisionalPeerMessageWake = () => {
+			if (this.#provisionalPeerMessageWake === provisionalPeerMessageWake) {
+				this.#provisionalPeerMessageWake = undefined;
+			}
+		};
 		const previousGoalContinuationContext = this.#goalContinuationContext;
 		if (automaticTurn?.source === "active_goal_continuation") this.#goalContinuationContext = true;
 		this.#closeCurrentTurn();
@@ -6622,9 +6824,11 @@ export class AgentSession {
 		const generation = this.#promptGeneration;
 		let restorePromptMessages: (() => void) | undefined;
 		let promptMessagesCommitted = false;
+		const previousPlanReferenceSent = this.#planReferenceSent;
 		try {
+			if (provisionalPeerMessageWake) this.#provisionalPeerMessageWake = provisionalPeerMessageWake;
 			await this.#recovery.maybeRestoreRetryFallbackPrimary();
-			if (!(await this.#runUsageAwarePreflightForNextModelCall())) return;
+			if (!(await this.#runUsageAwarePreflightForNextModelCall())) return false;
 			// Flush any pending bash messages before the new prompt
 			await this.#bash.flushPending();
 			this.#eval.flushPending();
@@ -6688,7 +6892,7 @@ export class AgentSession {
 			// Early bail-out: if a newer abort/prompt cycle started during setup,
 			// return before mutating shared state (nextTurn messages, system prompt).
 			if (this.#promptGeneration !== generation) {
-				return;
+				return false;
 			}
 
 			// A pending xd:// delta accompanies the next user-authored prompt,
@@ -6734,7 +6938,7 @@ export class AgentSession {
 			// resuming would start a turn on a torn-down session.
 			const disposingBeforeTransition = this.#isDisposed;
 			await this.#memory.transition;
-			if ((this.#isDisposed && !disposingBeforeTransition) || this.#promptGeneration !== generation) return;
+			if ((this.#isDisposed && !disposingBeforeTransition) || this.#promptGeneration !== generation) return false;
 			const beforeAgentStartSystemPrompt = await this.#buildSystemPromptForAgentStart(expandedText);
 
 			let baseXdevCatalogDelivered = true;
@@ -6789,7 +6993,7 @@ export class AgentSession {
 
 			// Bail out if a newer abort/prompt cycle has started since we began setup
 			if (this.#promptGeneration !== generation) {
-				return;
+				return false;
 			}
 
 			// Auto thinking: classify this real user turn and set the effective level
@@ -6803,7 +7007,7 @@ export class AgentSession {
 			if (this.isAutoThinking && isUserTurn) {
 				await this.#models.applyAutoThinkingLevel(expandedText, generation);
 				if (this.#promptGeneration !== generation) {
-					return;
+					return false;
 				}
 			}
 			const xdevMountNotice = isUserQueuedMessage(message)
@@ -6813,12 +7017,26 @@ export class AgentSession {
 				messages.splice(xdevMountNoticeIndex, 0, xdevMountNotice);
 			}
 
-			await this.#maintenance.runPrePromptCompactionIfNeeded(messages);
+			await this.#maintenance.runPrePromptCompactionIfNeeded(messages, automaticTurn?.semanticDeliveryAcceptance);
 			if (this.#promptGeneration !== generation) {
-				return;
+				return false;
 			}
 
-			const agentPromptOptions = options?.toolChoice ? { toolChoice: options.toolChoice } : undefined;
+			const agentPromptOptions =
+				options?.toolChoice || automaticTurn?.source === "peer_message_wake"
+					? {
+							...(options?.toolChoice ? { toolChoice: options.toolChoice } : {}),
+							...(automaticTurn?.source === "peer_message_wake"
+								? {
+										onProviderCallStarted: () => {
+											releaseProvisionalPeerMessageWake();
+											this.#recordAutomaticTurnStarted("provider_call");
+											promptMessagesCommitted = true;
+										},
+									}
+								: {}),
+						}
+					: undefined;
 			const nonMessageTokens = computeNonMessageTokens(this);
 			const contextWindow = this.model?.contextWindow ?? 0;
 			const breakdown = this.getContextBreakdown({ contextWindow, pendingMessages: messages });
@@ -6851,7 +7069,7 @@ export class AgentSession {
 							"rejected",
 							"persisted goal is not active at provider dispatch",
 						);
-						return;
+						return false;
 					}
 					const queuedDirectUserInput = [
 						...this.agent.peekSteeringQueue(),
@@ -6863,14 +7081,20 @@ export class AgentSession {
 							"deferred",
 							"queued direct user input wins at provider dispatch",
 						);
-						return;
+						return false;
 					}
 				}
 				if (automaticTurn && !this.#automaticTurns.authorize(automaticTurn.source, automaticTurn.originTurnId)) {
-					return;
+					return false;
 				}
-				promptMessagesCommitted = true;
-				if (automaticTurn) this.#armAutomaticTurnStart(automaticTurn.source, automaticTurn.originTurnId);
+				promptMessagesCommitted = automaticTurn?.source !== "peer_message_wake";
+				if (automaticTurn) {
+					this.#armAutomaticTurnStart(
+						automaticTurn.source,
+						automaticTurn.originTurnId,
+						automaticTurn.onStartSettled,
+					);
+				}
 				try {
 					await this.#recovery.promptAgentWithIdleRetry(messages, agentPromptOptions);
 				} catch (error) {
@@ -6879,14 +7103,27 @@ export class AgentSession {
 					}
 					throw error;
 				}
+				if (automaticTurn && this.#pendingAutomaticTurnStart?.source === automaticTurn.source) {
+					this.#recordAutomaticTurnFailed(
+						automaticTurn.source,
+						new Error("Provider call did not start"),
+						automaticTurn.originTurnId,
+					);
+					return false;
+				}
 			} finally {
 				this.#stats.setPendingSnapshot(undefined);
 			}
 			if (!options?.skipPostPromptRecoveryWait) {
 				await this.#waitForPostPromptRecovery(generation);
 			}
+			return true;
 		} finally {
-			if (!promptMessagesCommitted) restorePromptMessages?.();
+			releaseProvisionalPeerMessageWake();
+			if (!promptMessagesCommitted) {
+				restorePromptMessages?.();
+				if (automaticTurn?.source === "peer_message_wake") this.#planReferenceSent = previousPlanReferenceSent;
+			}
 			// The per-turn before_agent_start override lives only for this turn.
 			this.#tools.clearTurnSystemPromptOverride();
 			this.#turnExtensionInstructions = [];
@@ -7083,6 +7320,9 @@ export class AgentSession {
 	 * flipping advisor auto-resume.
 	 */
 	async followUp(text: string, images?: ImageContent[], options?: FollowUpOptions): Promise<void> {
+		const lifecycleGeneration = this.#lifecycleTransitionGeneration;
+		if (options?.synthetic) this.#assertPromptCanStart(lifecycleGeneration);
+		else this.#assertQueuedUserMessageCanStart(lifecycleGeneration);
 		if (text.startsWith("/")) {
 			this.#throwIfExtensionCommand(text);
 		}
@@ -7090,7 +7330,7 @@ export class AgentSession {
 		const expandedText =
 			options?.expandPromptTemplates === false ? text : expandPromptTemplate(text, [...this.#promptTemplates]);
 		if (!options?.synthetic) {
-			await this.#queueUserMessage(expandedText, images, "followUp");
+			await this.#queueUserMessage(expandedText, images, "followUp", lifecycleGeneration);
 			return;
 		}
 		// Synthetic branch: agent-initiated hidden developer message. Bypass
@@ -7105,6 +7345,8 @@ export class AgentSession {
 		const imageDescriptionNotice = normalizedImages?.length
 			? await this.#buildImageDescriptionNotice(normalizedImages)
 			: undefined;
+		this.onBeforePromptAcceptance?.();
+		this.#assertPromptCanStart(lifecycleGeneration);
 		this.#allowQueuedMessageDrainRetry();
 		if (imageDescriptionNotice) this.agent.followUp(imageDescriptionNotice);
 		this.agent.followUp({
@@ -7147,7 +7389,17 @@ export class AgentSession {
 		text: string,
 		images: ImageContent[] | undefined,
 		mode: "steer" | "followUp",
+		lifecycleGeneration?: number,
+		prependMessages: CustomMessage[] = [],
 	): Promise<void> {
+		const acceptedLifecycleGeneration = lifecycleGeneration ?? this.#lifecycleTransitionGeneration;
+		this.#assertQueuedUserMessageCanStart(acceptedLifecycleGeneration);
+		const normalizedPrependMessages: CustomMessage[] = [];
+		for (const message of prependMessages) {
+			normalizedPrependMessages.push(
+				await this.#prepareQueuedCustomMessage(message, undefined, acceptedLifecycleGeneration, true),
+			);
+		}
 		// A queued user message (RPC/SDK/collab steer or follow-up, or a typed message
 		// while streaming) is a deliberate resume; re-enable advisor auto-resume that
 		// a user interrupt suppressed.
@@ -7162,6 +7414,8 @@ export class AgentSession {
 		const imageDescriptionNotice = normalizedImages?.length
 			? await this.#buildImageDescriptionNotice(normalizedImages)
 			: undefined;
+		this.onBeforePromptAcceptance?.();
+		this.#assertQueuedUserMessageCanStart(acceptedLifecycleGeneration);
 		this.#allowQueuedMessageDrainRetry();
 		const userMessage: UserMessage = {
 			role: "user",
@@ -7171,9 +7425,11 @@ export class AgentSession {
 			...(mode === "steer" ? { steering: true } : {}),
 		};
 		if (mode === "followUp") {
+			for (const prependMessage of normalizedPrependMessages) this.agent.followUp(prependMessage);
 			if (imageDescriptionNotice) this.agent.followUp(imageDescriptionNotice);
 			this.agent.followUp(userMessage);
 		} else {
+			for (const prependMessage of normalizedPrependMessages) this.agent.steer(prependMessage);
 			if (imageDescriptionNotice) this.agent.steer(imageDescriptionNotice);
 			this.agent.steer(userMessage);
 		}
@@ -7338,25 +7594,34 @@ export class AgentSession {
 		return (
 			this.#isDisposed ||
 			this.#lifecycleTransitionFenceActive ||
+			this.isCompacting ||
+			this.isGeneratingHandoff ||
 			lifecycleGeneration !== this.#lifecycleTransitionGeneration
 		);
 	}
 
-	#beginSemanticDeliveryAcceptance(): () => void {
-		if (this.#semanticDeliveryAcceptanceCount++ === 0) {
-			const settled = Promise.withResolvers<void>();
-			this.#semanticDeliveryAcceptancesSettled = settled.promise;
-			this.#resolveSemanticDeliveryAcceptances = settled.resolve;
-		}
+	#beginSemanticDeliveryAcceptance(): { settled: Promise<void>; release: () => void } {
+		const settled = Promise.withResolvers<void>();
+		this.#semanticDeliveryAcceptances.add(settled.promise);
 		let released = false;
-		return () => {
-			if (released) return;
-			released = true;
-			this.#semanticDeliveryAcceptanceCount--;
-			if (this.#semanticDeliveryAcceptanceCount !== 0) return;
-			this.#resolveSemanticDeliveryAcceptances?.();
-			this.#resolveSemanticDeliveryAcceptances = undefined;
+		return {
+			settled: settled.promise,
+			release: () => {
+				if (released) return;
+				released = true;
+				this.#semanticDeliveryAcceptances.delete(settled.promise);
+				settled.resolve();
+			},
 		};
+	}
+
+	async #waitForSemanticDeliveryAcceptances(exempt?: Promise<void>, signal?: AbortSignal): Promise<void> {
+		await untilAborted(
+			signal,
+			Promise.all([...this.#semanticDeliveryAcceptances].filter(acceptance => acceptance !== exempt)).then(
+				() => undefined,
+			),
+		);
 	}
 
 	async #persistPendingSemanticDelivery(
@@ -7599,13 +7864,14 @@ export class AgentSession {
 		}
 	}
 
-	/** Queue a custom message without starting a turn, matching steer/follow-up delivery. */
-	async #queueCustomMessage<T = unknown>(
+	async #prepareQueuedCustomMessage<T = unknown>(
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "attribution">,
-		deliverAs: "steer" | "followUp",
-		queueChipText?: string,
-		scheduleIdleDrain = true,
-	): Promise<void> {
+		queueChipText: string | undefined,
+		lifecycleGeneration: number,
+		allowSemanticMaintenance = false,
+	): Promise<CustomMessage<T>> {
+		if (allowSemanticMaintenance) this.#assertQueuedUserMessageCanStart(lifecycleGeneration);
+		else this.#assertPromptCanStart(lifecycleGeneration);
 		const details =
 			queueChipText !== undefined
 				? ({
@@ -7626,14 +7892,52 @@ export class AgentSession {
 			timestamp: Date.now(),
 		};
 		const normalizedAppMessage = await this.#normalizeAgentMessageImages(appMessage);
+		this.onBeforePromptAcceptance?.();
+		if (allowSemanticMaintenance) this.#assertQueuedUserMessageCanStart(lifecycleGeneration);
+		else this.#assertPromptCanStart(lifecycleGeneration);
+		return normalizedAppMessage;
+	}
+
+	/** Queue a custom message without starting a turn, matching steer/follow-up delivery. */
+	async #queueCustomMessage<T = unknown>(
+		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "attribution">,
+		deliverAs: "steer" | "followUp",
+		queueChipText?: string,
+		scheduleIdleDrain = true,
+		lifecycleGeneration?: number,
+		prependMessages: CustomMessage[] = [],
+	): Promise<void> {
+		const acceptedLifecycleGeneration = lifecycleGeneration ?? this.#lifecycleTransitionGeneration;
+		this.#assertPromptCanStart(acceptedLifecycleGeneration);
+		const normalizedPrependMessages: CustomMessage[] = [];
+		for (const prependMessage of prependMessages) {
+			normalizedPrependMessages.push(
+				await this.#prepareQueuedCustomMessage(prependMessage, undefined, acceptedLifecycleGeneration),
+			);
+		}
+		const normalizedAppMessage = await this.#prepareQueuedCustomMessage(
+			message,
+			queueChipText,
+			acceptedLifecycleGeneration,
+		);
+		this.#assertPromptCanStart(acceptedLifecycleGeneration);
 		this.#allowQueuedMessageDrainRetry();
 		if (deliverAs === "followUp") {
+			for (const prependMessage of normalizedPrependMessages) this.agent.followUp(prependMessage);
 			this.agent.followUp(normalizedAppMessage);
 		} else {
+			for (const prependMessage of normalizedPrependMessages) this.agent.steer(prependMessage);
 			this.agent.steer(normalizedAppMessage);
 		}
 		if (scheduleIdleDrain) this.#scheduleIdleQueueDrain();
 	}
+	/** Override prompt acceptance after asynchronous preparation in focused tests. */
+	setPromptAcceptanceHookForTests(hook: (() => void) | undefined): void {
+		this.onBeforePromptAcceptance = hook;
+	}
+
+	private onBeforePromptAcceptance?: () => void;
+
 	/** Override the receiver-state acceptance boundary in focused tests. */
 	setCustomMessageAcceptanceHookForTests(hook: (() => void) | undefined): void {
 		this.onBeforeCustomMessageAcceptance = hook;
@@ -7643,6 +7947,12 @@ export class AgentSession {
 	setLifecycleTransitionFenceForTests(active: boolean): void {
 		if (active && !this.#lifecycleTransitionFenceActive) this.#lifecycleTransitionGeneration++;
 		this.#lifecycleTransitionFenceActive = active;
+	}
+
+	/** Override the internal agent event connection in focused tests. */
+	setAgentEventConnectionForTests(connected: boolean): void {
+		if (connected) this.#reconnectToAgent();
+		else this.#disconnectFromAgent();
 	}
 
 	/** Test-only hook after async normalization and immediately before receiver-state acceptance. */
@@ -7662,8 +7972,25 @@ export class AgentSession {
 		if (options?.deliveryMode && this.#isDisposed) return { status: "unavailable", reason: "session_transition" };
 		const lifecycleGeneration = this.#lifecycleTransitionGeneration;
 		const semanticMode = options?.deliveryMode;
+		if (options?.automaticTurnSource !== undefined && options.automaticTurnSource !== "peer_message_wake") {
+			throw new Error('automaticTurnSource must be "peer_message_wake"');
+		}
 		if (semanticMode && (options?.deliverAs !== undefined || options?.triggerTurn !== undefined)) {
 			throw new Error("deliveryMode cannot be combined with legacy delivery controls");
+		}
+		if (options?.automaticTurnSource && !semanticMode) {
+			throw new Error("automaticTurnSource requires deliveryMode");
+		}
+		if (options?.onStartedTurnAccepted && !options.automaticTurnSource) {
+			throw new Error("onStartedTurnAccepted requires automaticTurnSource");
+		}
+		if (
+			options?.automaticTurnSource &&
+			semanticMode !== "auto" &&
+			semanticMode !== "interrupt" &&
+			semanticMode !== "afterCurrent"
+		) {
+			throw new Error("automaticTurnSource requires a wake-capable deliveryMode");
 		}
 		const normalizedPayload = normalizeCustomMessagePayload<T>(message);
 		const details =
@@ -7686,7 +8013,7 @@ export class AgentSession {
 		};
 		const normalizedAppMessage = await this.#normalizeAgentMessageImages(appMessage);
 		if (semanticMode) {
-			const releaseAcceptance = this.#beginSemanticDeliveryAcceptance();
+			const acceptance = this.#beginSemanticDeliveryAcceptance();
 			try {
 				this.onBeforeCustomMessageAcceptance?.();
 				if (this.#semanticDeliveryUnavailable(lifecycleGeneration)) {
@@ -7709,15 +8036,90 @@ export class AgentSession {
 						this.#scheduleIdleQueueDrain();
 						return { status: "accepted", delivery: "queued_steer" };
 					}
-					this.agent.appendMessage(normalizedAppMessage);
-					this.sessionManager.appendCustomMessageEntry(
-						normalizedAppMessage.customType,
-						normalizedAppMessage.content,
-						normalizedAppMessage.display,
-						normalizedAppMessage.details,
-						normalizedAppMessage.attribution,
+					if (!options?.automaticTurnSource) {
+						this.agent.appendMessage(normalizedAppMessage);
+						this.sessionManager.appendCustomMessageEntry(
+							normalizedAppMessage.customType,
+							normalizedAppMessage.content,
+							normalizedAppMessage.display,
+							normalizedAppMessage.details,
+							normalizedAppMessage.attribution,
+						);
+						return { status: "downgraded", delivery: "plain_append", reason: "unscoped_automatic_turn" };
+					}
+					if (this.#extensionRunner?.isHandlingEvent?.()) {
+						return { status: "unavailable", reason: "reentrant_extension_handler" };
+					}
+					if (this.#clientBridge?.deferAgentInitiatedTurns && !this.#allowAcpAgentInitiatedTurns) {
+						return { status: "unavailable", reason: "client_deferred_turn" };
+					}
+
+					const textContent =
+						typeof normalizedAppMessage.content === "string"
+							? normalizedAppMessage.content
+							: normalizedAppMessage.content
+									.filter((content): content is TextContent => content.type === "text")
+									.map(content => content.text)
+									.join("");
+					const start = Promise.withResolvers<boolean>();
+					let providerStarted = false;
+					let startSettled = false;
+					const prompt = this.#promptWithMessage(normalizedAppMessage, textContent, {
+						automaticTurn: {
+							source: options.automaticTurnSource,
+							semanticDeliveryAcceptance: acceptance.settled,
+							onStartSettled: () => {
+								// Commit the mailbox receipt before agent-loop can mutate context, then
+								// hold lifecycle acceptance until this exact input reaches session storage.
+								try {
+									if (this.#unsubscribeAgent === undefined) {
+										throw new Error("Scoped automatic turn lost its session persistence listener");
+									}
+									options.onStartedTurnAccepted?.();
+								} catch (error) {
+									startSettled = true;
+									start.reject(error);
+									throw error;
+								}
+								providerStarted = true;
+								void this.#waitForMessageEndPersistence(normalizedAppMessage).then(
+									() => {
+										if (startSettled) return;
+										startSettled = true;
+										start.resolve(true);
+									},
+									error => {
+										if (startSettled) return;
+										startSettled = true;
+										start.reject(error);
+									},
+								);
+							},
+						},
+						acceptTerminalEmptyStop: options.acceptTerminalEmptyStop,
+					});
+					void prompt.then(
+						started => {
+							if (providerStarted || startSettled) return;
+							startSettled = true;
+							start.resolve(started);
+						},
+						error => {
+							if (!providerStarted) {
+								if (!startSettled) {
+									startSettled = true;
+									start.reject(error);
+								}
+								return;
+							}
+							logger.warn("Scoped automatic turn failed after provider response acceptance", {
+								error: String(error),
+							});
+						},
 					);
-					return { status: "downgraded", delivery: "plain_append", reason: "unscoped_automatic_turn" };
+					return (await start.promise)
+						? { status: "accepted", delivery: "started_turn" }
+						: { status: "unavailable", reason: "prompt_preflight_cancelled" };
 				}
 				if (semanticMode === "steer") {
 					if (this.isStreaming) {
@@ -7742,7 +8144,7 @@ export class AgentSession {
 				else this.#pendingExplicitPromptMessages.push(queuedMessage);
 				return { status: "accepted", delivery: "queued_next_turn" };
 			} finally {
-				releaseAcceptance();
+				acceptance.release();
 			}
 		}
 		this.onBeforeCustomMessageAcceptance?.();
@@ -8229,7 +8631,7 @@ export class AgentSession {
 			if (result?.cancel) return false;
 		}
 
-		const lifecycle = this.#beginLifecycleTransaction({ persistDetachedBash: options?.drop !== true });
+		const lifecycle = await this.#beginLifecycleTransaction({ persistDetachedBash: options?.drop !== true });
 		try {
 			if (this.#extensionRunner) {
 				lifecycle.markPublicationStarted();
@@ -8349,7 +8751,7 @@ export class AgentSession {
 		}
 
 		const forkCancelled = Symbol("fork cancelled");
-		const lifecycle = this.#beginLifecycleTransaction();
+		const lifecycle = await this.#beginLifecycleTransaction();
 		try {
 			if (this.#extensionRunner) {
 				lifecycle.markPublicationStarted();
@@ -8598,8 +9000,12 @@ export class AgentSession {
 	 * @param options Handoff execution options
 	 * @returns The handoff document text, or undefined if cancelled/failed
 	 */
-	handoff(customInstructions?: string, options?: SessionHandoffOptions): Promise<HandoffResult | undefined> {
-		return this.#handoff.handoff(customInstructions, options);
+	handoff(
+		customInstructions?: string,
+		options?: SessionHandoffOptions,
+		semanticDeliveryAcceptance?: Promise<void>,
+	): Promise<HandoffResult | undefined> {
+		return this.#handoff.handoff(customInstructions, options, semanticDeliveryAcceptance);
 	}
 
 	#isTerminalToolResult(event: { toolName: string; isError?: boolean; result?: { details?: unknown } }): boolean {
@@ -9286,7 +9692,7 @@ export class AgentSession {
 			if (result?.cancel) return false;
 		}
 
-		const lifecycle = this.#beginLifecycleTransaction();
+		const lifecycle = await this.#beginLifecycleTransaction();
 		try {
 			if (this.#extensionRunner) {
 				lifecycle.markPublicationStarted();
@@ -9509,7 +9915,7 @@ export class AgentSession {
 		this.#abortAutolearnCapture();
 		await this.#drainAutolearnCapture();
 
-		const lifecycle = this.#beginLifecycleTransaction();
+		const lifecycle = await this.#beginLifecycleTransaction();
 		try {
 			await this.#advisors.drainAndDetachRecorders();
 			await lifecycle.captureRetained({ capturePersistedSessionFile: true });
@@ -9644,7 +10050,7 @@ export class AgentSession {
 		this.#abortAutolearnCapture();
 		await this.#drainAutolearnCapture();
 
-		const lifecycle = this.#beginLifecycleTransaction();
+		const lifecycle = await this.#beginLifecycleTransaction();
 		try {
 			await this.#advisors.drainAndDetachRecorders();
 			await lifecycle.captureRetained({ capturePersistedSessionFile: true });
@@ -9940,7 +10346,7 @@ export class AgentSession {
 		// new sibling answer — the trigger for resuming the agent afterwards so the
 		// model consumes it, mirroring a live `ask` completion (issue #6483).
 		let isAskReanswerCompletion = false;
-		const lifecycle = this.#beginLifecycleTransaction();
+		const lifecycle = await this.#beginLifecycleTransaction();
 		let hostMutationQuiescence: Promise<void> | undefined;
 		const quiesceHostMutation = async (): Promise<void> => {
 			hostMutationQuiescence ??= (async () => {

@@ -647,6 +647,12 @@ export class InteractiveMode implements InteractiveModeContext {
 	skillCommands: Map<string, Skill> = new Map();
 	oauthManualInput: OAuthManualInputManager = new OAuthManualInputManager();
 	collabHost?: CollabHost;
+	herdrCollabHost?: CollabHost;
+	herdrCollabHostLifecycle?: {
+		stop(reason: string): Promise<void>;
+		suspend(reason: string): Promise<void>;
+		resume(): Promise<void>;
+	};
 	collabGuest?: CollabGuestLink;
 
 	#pendingCommandOutput: Component[] = [];
@@ -1007,8 +1013,12 @@ export class InteractiveMode implements InteractiveModeContext {
 			getDraftText: () => this.editor.getText(),
 			beginDispose: () => this.session.beginDispose(),
 			saveDraft: text => this.sessionManager.saveDraft(text),
-			disposeSession: reason =>
-				this.session.dispose({ mnemopiConsolidateTimeoutMs: SHUTDOWN_CONSOLIDATE_BUDGET_MS, reason }),
+			disposeSession: async reason => {
+				await this.herdrCollabHostLifecycle?.stop("session stopped");
+				this.herdrCollabHostLifecycle = undefined;
+				this.herdrCollabHost = undefined;
+				await this.session.dispose({ mnemopiConsolidateTimeoutMs: SHUTDOWN_CONSOLIDATE_BUDGET_MS, reason });
+			},
 		});
 		// Forward the postmortem reason (SIGTERM/SIGHUP/uncaughtException/…) so the
 		// persisted `session_exit` diagnostic carries the real trigger. Postmortem
@@ -4902,7 +4912,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		void this.#selectorController.showSessionSelector(source);
 	}
 
-	async handleResumeSession(sessionPath: string): Promise<void> {
+	async handleResumeSession(sessionPath: string): Promise<boolean> {
 		// Flush pending settings writes *before* disposing controllers or resetting
 		// observers: a save failure must leave the session, process project dir,
 		// and Settings in the source scope with all UI intact.
@@ -4910,12 +4920,12 @@ export class InteractiveMode implements InteractiveModeContext {
 			await this.settings.flush();
 		} catch (err) {
 			this.showError(`Failed to save pending settings: ${err instanceof Error ? err.message : String(err)}`);
-			return;
+			return false;
 		}
 		this.#btwController.dispose();
 		this.#omfgController.dispose();
 		this.resetObserverRegistry();
-		await this.#selectorController.handleResumeSession(sessionPath, { settingsFlushed: true });
+		return this.#selectorController.handleResumeSession(sessionPath, { settingsFlushed: true });
 	}
 
 	handleSessionDeleteCommand(): Promise<void> {

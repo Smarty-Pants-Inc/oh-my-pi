@@ -145,6 +145,12 @@ export interface InteractiveModeContext {
 	mcpManager?: MCPManager;
 	lspServers?: LspStartupServerInfo[];
 	collabHost?: CollabHost;
+	herdrCollabHost?: CollabHost;
+	herdrCollabHostLifecycle?: {
+		stop(reason: string): Promise<void>;
+		suspend(reason: string): Promise<void>;
+		resume(): Promise<void>;
+	};
 	collabGuest?: CollabGuestLink;
 	eventController: EventController;
 	eventBus?: EventBus;
@@ -400,7 +406,7 @@ export interface InteractiveModeContext {
 	showCopySelector(): void;
 	showTreeSelector(): void;
 	showSessionSelector(source?: ForeignSessionSource): void;
-	handleResumeSession(sessionPath: string): Promise<void>;
+	handleResumeSession(sessionPath: string): Promise<boolean>;
 	handleSessionDeleteCommand(): Promise<void>;
 	showOAuthSelector(mode: "login" | "logout", providerId?: string): Promise<void>;
 	showSessionPinSelector(): Promise<void>;

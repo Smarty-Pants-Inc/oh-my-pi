@@ -224,9 +224,9 @@ export interface SessionMaintenanceHost {
 	}): boolean;
 	persistTurnMessagesForMidRunCompaction(context: AgentTurnEndContext | undefined): Promise<boolean>;
 	findLastAssistantMessage(): AssistantMessage | undefined;
+	beginSemanticDeliveryMaintenance(signal?: AbortSignal): Promise<() => void>;
 	disconnectFromAgent(): void;
 	reconnectToAgent(): void;
-	drainStrandedQueuedMessages(): void;
 	buildDisplaySessionContext(): SessionContext;
 	convertToLlmForSideRequest(messages: AgentMessage[]): Message[];
 	obfuscateTextForProvider(text: string | undefined): string | undefined;
@@ -245,7 +245,11 @@ export interface SessionMaintenanceHost {
 	getContextUsage(options?: { contextWindow?: number }): ContextUsage | undefined;
 	shake(mode: ShakeMode, options?: { config?: ShakeConfig; signal?: AbortSignal }): Promise<ShakeResult>;
 	dropImages(): Promise<{ removed: number }>;
-	runHandoff(customInstructions?: string, options?: SessionHandoffOptions): Promise<HandoffResult | undefined>;
+	runHandoff(
+		customInstructions?: string,
+		options?: SessionHandoffOptions,
+		semanticDeliveryAcceptance?: Promise<void>,
+	): Promise<HandoffResult | undefined>;
 	removeAssistantMessageFromActiveContext(message: AssistantMessage): void;
 	dropPersistedAssistantTurn(message: AssistantMessage): Promise<string | undefined>;
 	runRecoveryCompactionWithRollback(
@@ -599,8 +603,12 @@ export class SessionMaintenance {
 		}
 		const compactionAbortController = new AbortController();
 		this.#compactionAbortController = compactionAbortController;
+		let releaseSemanticDeliveryMaintenance: (() => void) | undefined;
 
 		try {
+			releaseSemanticDeliveryMaintenance = await this.#host.beginSemanticDeliveryMaintenance(
+				compactionAbortController.signal,
+			);
 			this.#host.disconnectFromAgent();
 			await this.#host.abort({ goalReason: "internal", preserveCompaction: true });
 			if (!this.#model) {
@@ -920,22 +928,27 @@ export class SessionMaintenance {
 			options?.onComplete?.(compactionResult);
 			return compactionResult;
 		} catch (error) {
-			const err = error instanceof Error ? error : new Error(String(error));
+			const err =
+				compactionAbortController.signal.aborted && error instanceof Error && error.name === "AbortError"
+					? new CompactionCancelledError()
+					: error instanceof Error
+						? error
+						: new Error(String(error));
 			options?.onError?.(err);
-			throw error;
+			throw err;
 		} finally {
 			if (this.#compactionAbortController === compactionAbortController) {
 				this.#compactionAbortController = undefined;
 			}
-			this.#host.reconnectToAgent();
-			// Compaction disconnected before `await abort()`, so abort's finally drain
-
-			// (and any steer/follow-up that arrived mid-compaction — async IRC, an
-			// `xd://` mount notice, an SDK/RPC steer) was suppressed while disconnected
-			// (issue #5800). Unlike `/new`/switchSession, compaction preserves the agent
-			// queues, so nothing else resumes them: re-drain now that the listener is back
-			// and `isCompacting` is false, or the queued turn hangs until the next prompt.
-			this.#host.drainStrandedQueuedMessages();
+			if (releaseSemanticDeliveryMaintenance) {
+				try {
+					this.#host.reconnectToAgent();
+				} finally {
+					// Keep semantic delivery fenced until the listener is back and isCompacting is false.
+					// Releasing the fence re-drains preserved queues after the detached abort path.
+					releaseSemanticDeliveryMaintenance();
+				}
+			}
 		}
 	}
 
@@ -1018,7 +1031,10 @@ export class SessionMaintenance {
 		return compactionContextTokens(breakdown?.usedTokens ?? 0, localEstimate);
 	}
 
-	async runPrePromptCompactionIfNeeded(messages: AgentMessage[]): Promise<void> {
+	async runPrePromptCompactionIfNeeded(
+		messages: AgentMessage[],
+		semanticDeliveryAcceptance?: Promise<void>,
+	): Promise<void> {
 		const model = this.#model;
 		if (!model) return;
 		const contextWindow = model.contextWindow ?? 0;
@@ -1060,6 +1076,7 @@ export class SessionMaintenance {
 			autoContinue: false,
 			triggerContextTokens: contextTokens,
 			phase: "pre_turn",
+			semanticDeliveryAcceptance,
 		});
 	}
 
@@ -2178,6 +2195,7 @@ export class SessionMaintenance {
 			terminalTextAnswer?: boolean;
 			/** Mid-turn: splice history then return; do not await UI/extension fan-out. */
 			detachPostCommit?: boolean;
+			semanticDeliveryAcceptance?: Promise<void>;
 		} = {},
 	): Promise<CompactionCheckResult> {
 		const compactionSettings = this.#host.settings.getGroup("compaction");
@@ -2270,13 +2288,17 @@ export class SessionMaintenance {
 			if (action === "handoff") {
 				let handoffSwitchCancelled = false;
 				const handoffFocus = AUTO_HANDOFF_THRESHOLD_FOCUS;
-				const handoffResult = await this.#host.runHandoff(handoffFocus, {
+				const handoffOptions: SessionHandoffOptions = {
 					autoTriggered: true,
 					signal: autoCompactionSignal,
 					onSwitchCancelled: () => {
 						handoffSwitchCancelled = true;
 					},
-				});
+				};
+				const handoffResult =
+					options.semanticDeliveryAcceptance === undefined
+						? await this.#host.runHandoff(handoffFocus, handoffOptions)
+						: await this.#host.runHandoff(handoffFocus, handoffOptions, options.semanticDeliveryAcceptance);
 				if (!handoffResult) {
 					const aborted = autoCompactionSignal.aborted || handoffSwitchCancelled;
 					if (aborted) {

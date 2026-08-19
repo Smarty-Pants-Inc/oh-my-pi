@@ -4583,11 +4583,11 @@
     },
     {
       "path": "packages/agent/src/agent-loop.ts",
-      "sha256": "19d21ed29076c8c39f5c3b146b2a51f9bb70531e560d5421949dafa34869ec92"
+      "sha256": "a14cee248d98ce560421a407742081ebca69d3ab797af073062ab6e83e0c0568"
     },
     {
       "path": "packages/agent/src/agent.ts",
-      "sha256": "e37203a4d6c51035c10c1d709bc6f07171d9276eea22ba5ea368e070cad5bbd6"
+      "sha256": "570cd083d1c189a9d86714362f44c9f37df126b45455673dbfeb5e939a32589c"
     },
     {
       "path": "packages/agent/src/append-only-context.ts",
@@ -4683,7 +4683,7 @@
     },
     {
       "path": "packages/agent/src/types.ts",
-      "sha256": "74d3e617766d05311016fad677bdf9954fd9a29ed62c770ed8bf9a2a3d46b292"
+      "sha256": "c4b041088e61b0b9067be289182520ca3de477c852ebc5fee9f8f8c3d313c3bc"
     },
     {
       "path": "packages/ai/package.json",
@@ -5027,7 +5027,7 @@
     },
     {
       "path": "packages/ai/src/providers/devin.ts",
-      "sha256": "9d1674584ed4a0fba38b7b45de93485271ab7f19171dfde9fcc1e011aa080ea5"
+      "sha256": "b859031ab8ec63c3562c997db3ccb2c5c49eeafe5e54846ad3a289412b0e6a3c"
     },
     {
       "path": "packages/ai/src/providers/error-message.ts",
@@ -5087,7 +5087,7 @@
     },
     {
       "path": "packages/ai/src/providers/ollama.ts",
-      "sha256": "16ef4ff8be8fd3c6e4274aca563cc989154d8224555032c0ecdc69d2390b15bd"
+      "sha256": "64709b04e75c2c2769367b16171c913ac8988974c4be650931e8c4c4af695a92"
     },
     {
       "path": "packages/ai/src/providers/openai-anthropic-shim.ts",
@@ -6143,7 +6143,7 @@
     },
     {
       "path": "packages/coding-agent/scripts/compile-binary.ts",
-      "sha256": "6700310061aa5008c6028b2d5b136d331985e3b11b8408bef19abdf3d00df01a"
+      "sha256": "c08fa1e74931333b2fa13a1322be3dffa57b7e165f389430a82ee6891baf4404"
     },
     {
       "path": "packages/coding-agent/scripts/generate-docs-index.ts",
@@ -6183,7 +6183,7 @@
     },
     {
       "path": "packages/coding-agent/src/agent-behavior.yml",
-      "sha256": "16a17592ffb7e5cd090ebb1534b43e2f67a134c329bc7bb048ba42981bc864cc"
+      "sha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a"
     },
     {
       "path": "packages/coding-agent/src/async/index.ts",
@@ -6240,6 +6240,10 @@
     {
       "path": "packages/coding-agent/src/autoresearch/tools/update-notes.ts",
       "sha256": "dd0a397661a350201b60a41c1596aba8fd9f81dad465d6c0d2723ee00418102d"
+    },
+    {
+      "path": "packages/coding-agent/src/build-identity.ts",
+      "sha256": "5d659c2b56358cef7669e2891b927a07609e1fdb7ec2cbd915ee3a487f415c21"
     },
     {
       "path": "packages/coding-agent/src/capability/context-file.ts",
@@ -6339,7 +6343,7 @@
     },
     {
       "path": "packages/coding-agent/src/cli.ts",
-      "sha256": "e4d3ba05a7d5149b38104469b777d347cf7c249640076e0e738fb9b395cfd4a4"
+      "sha256": "e66dd04fd341d16934f1e5f5f8e17cbf8883246e6673de27a196822082b9dc26"
     },
     {
       "path": "packages/coding-agent/src/cli/agents-cli.ts",
@@ -6435,15 +6439,19 @@
     },
     {
       "path": "packages/coding-agent/src/collab/guest.ts",
-      "sha256": "a42596409c493c3b63294050a3177511c1bcf5f9bc5b1896c2f0c467e57bff62"
+      "sha256": "5529f5dd97a7226c8e64b33fbf51fc2d49494d9ce0a7457d12c5d79565cd992d"
+    },
+    {
+      "path": "packages/coding-agent/src/collab/herdr-bridge-bootstrap.ts",
+      "sha256": "95bc2b7222d40c8a2f9dec9fb855909bf23ea917095e2d89832d970fa4a75f53"
     },
     {
       "path": "packages/coding-agent/src/collab/host.ts",
-      "sha256": "338b119120b67f3d6d76e24b9a6035e6485205db6843db1e87bb0588667a9fe2"
+      "sha256": "86e89a27c1b712243a5f48775a963d81222263f645d27dd0d6a91bf347fc7acd"
     },
     {
       "path": "packages/coding-agent/src/collab/local-transport.ts",
-      "sha256": "48bd8fcf28ec36e8145c36e6116beb742e99fe71650c1ef717c305a875a44f07"
+      "sha256": "40b80655549c507740aabb815967aa66e3ece90f5670803ad9862d466b70c9a0"
     },
     {
       "path": "packages/coding-agent/src/collab/protocol.ts",
@@ -6483,7 +6491,7 @@
     },
     {
       "path": "packages/coding-agent/src/commands/collab-bridge.ts",
-      "sha256": "9acff6a1ec468af4d4e5152c419c88601bdcfc188714d9465208304207ee4c26"
+      "sha256": "9af84a682c88c5c08d268ab05437f1356204ca3995b13fb2ae2d9d4e93ccd0a5"
     },
     {
       "path": "packages/coding-agent/src/commands/commit.ts",
@@ -6507,11 +6515,11 @@
     },
     {
       "path": "packages/coding-agent/src/commands/join.ts",
-      "sha256": "503aac112de9276c3d1939af7eed0557c2f297ba97c8371352bb42eec90e289d"
+      "sha256": "8aa9e8f501d55b2da38ef6d8ff462af223a82c3ee9e3c0f61e3c8817317b325f"
     },
     {
       "path": "packages/coding-agent/src/commands/launch.ts",
-      "sha256": "993680798f8574a6f32fedbf8e9645e0931a494a1c21906ddce4f56167a4334e"
+      "sha256": "c7bdbd53af602540b4fd640b9ac7663f5872054ce4825c0190937978867c6dd9"
     },
     {
       "path": "packages/coding-agent/src/commands/models.ts",
@@ -6823,7 +6831,7 @@
     },
     {
       "path": "packages/coding-agent/src/context/registry.ts",
-      "sha256": "5b9e9185f1bd728828966faedcebbee721e7409985914dcfd4d1b9f4682e16d2"
+      "sha256": "a4cdbc4d46c4c11deecb670cb2089e120725cd302ffc9c9627df3d7c4349a871"
     },
     {
       "path": "packages/coding-agent/src/context/smarty-skills.ts",
@@ -7351,11 +7359,11 @@
     },
     {
       "path": "packages/coding-agent/src/extensibility/extensions/runner.ts",
-      "sha256": "18d8ea82fc90f20425c8f05a15ece09eafd07f1ce05c0cb9781b8ae034359997"
+      "sha256": "5b2a2b6f0469e22aabf9c13bfc947f7d3933e4f1e7ebb300ec322e3ecf75b2c8"
     },
     {
       "path": "packages/coding-agent/src/extensibility/extensions/types.ts",
-      "sha256": "125015cf04cd96a40bf0573e9b98990fa1d9081283295e945b1d648049f6f32b"
+      "sha256": "97cc9fd04ae55fa1e7628a5dbee8a9140dccce92815b724282df0d8be5e24d8e"
     },
     {
       "path": "packages/coding-agent/src/extensibility/extensions/wrapper.ts",
@@ -7507,7 +7515,7 @@
     },
     {
       "path": "packages/coding-agent/src/index.ts",
-      "sha256": "a610c46b8cabe469f9a3aeb85eb40d6730d5f68dcd2305d1d8207c62ac0f24cd"
+      "sha256": "f583c37c14ebbea5e3c4f4f5ff466318fa034a18a92f7e2ba1f67ca90fcdb7e4"
     },
     {
       "path": "packages/coding-agent/src/internal-urls/agent-protocol.ts",
@@ -7771,7 +7779,7 @@
     },
     {
       "path": "packages/coding-agent/src/main.ts",
-      "sha256": "038f464e7a88e71ba62d95c561e09c4b2ba898c799a2c31f4242955e40720939"
+      "sha256": "a693276ba28ff726bc1867ad8d1d8d5499a2b57910bc8d9d272ae3f831e627e6"
     },
     {
       "path": "packages/coding-agent/src/markit/converters/docx.ts",
@@ -8115,7 +8123,7 @@
     },
     {
       "path": "packages/coding-agent/src/modes/controllers/extension-ui-controller.ts",
-      "sha256": "f96381261e5d035e2c5779fce922265f3053938a24b2f9c1038280285f5bc063"
+      "sha256": "2d4c8aa17a0b9bf2bed6c85c00b406547a418607e74d98004837b54301e86234"
     },
     {
       "path": "packages/coding-agent/src/modes/controllers/input-controller.ts",
@@ -8139,7 +8147,7 @@
     },
     {
       "path": "packages/coding-agent/src/modes/controllers/selector-controller.ts",
-      "sha256": "5ffcbef341ef3bffdf9ab7483d428d4dc3510fde94b45f9f288b9cfc14129bee"
+      "sha256": "61c165321ad7c41b0a024f702279d09e2ce66ae1f0681672c97fa215c40608b2"
     },
     {
       "path": "packages/coding-agent/src/modes/controllers/session-focus-controller.ts",
@@ -8179,7 +8187,7 @@
     },
     {
       "path": "packages/coding-agent/src/modes/interactive-mode.ts",
-      "sha256": "62b8750772d0b787f5c60217cecd86245dcaa5556eb588e68f87cd4ab91aecee"
+      "sha256": "c4735cf9333aac0ae6c6b12e0b986cd8746e8f041950e15997ca7557412d7ea3"
     },
     {
       "path": "packages/coding-agent/src/modes/loop-limit.ts",
@@ -8423,7 +8431,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/agent-session.ts",
-      "sha256": "256457dca0974023f618135be7585fc98e732313c4155fb8433e99b584d812bf"
+      "sha256": "71a4d2b8060276dbd18fc31733b9d3f302769bf81bd7ba730a2c829de802eb71"
     },
     {
       "path": "packages/coding-agent/src/session/agent-storage.ts",
@@ -8451,7 +8459,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/automatic-turn-authority.ts",
-      "sha256": "c02628c269a268ed940a55c29c3a1ca2fa7eafbe27506d2d516e435bcab83cc4"
+      "sha256": "cac07dd65f31a1f88cf39e9a86253a16da9bb4c5004515ecc30d32041658b717"
     },
     {
       "path": "packages/coding-agent/src/session/bash-runner.ts",
@@ -8567,7 +8575,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/session-handoff.ts",
-      "sha256": "f4767292a39606c3065c8f759271aacdbfff951ea0426430a15a21066f3e7121"
+      "sha256": "fad5b4697a662d36b8882705112f6a8ccc5f62dbb584daf280811d772a0c6a55"
     },
     {
       "path": "packages/coding-agent/src/session/session-history-format.ts",
@@ -8591,11 +8599,11 @@
     },
     {
       "path": "packages/coding-agent/src/session/session-maintenance.ts",
-      "sha256": "44e3ef989cae6d9b8b9d29db69bd34da2e470075010889db0e658e203f6397f6"
+      "sha256": "8ca7002abc2fd846c8bf3774a988885f13ce9e10ff2161a48403541e48efd402"
     },
     {
       "path": "packages/coding-agent/src/session/session-manager.ts",
-      "sha256": "ccff3a2d3cd1861b8081c1d880aa745051f72b7d40254c4fde2889bc4789d07c"
+      "sha256": "8d35ef7005ff5495bda9e4d7dea30676afdace8ea13a87e5ea184a08b7dc7864"
     },
     {
       "path": "packages/coding-agent/src/session/session-memory.ts",
@@ -9243,7 +9251,7 @@
     },
     {
       "path": "packages/coding-agent/src/tools/index.ts",
-      "sha256": "902becf0483e67fca1c743a884eb990fa40828baddbeb0ff58d8808c76804b93"
+      "sha256": "e0784abf760dae6e50043d157557a51d51a28ab930c1b39bf81e9e8e6b7692e4"
     },
     {
       "path": "packages/coding-agent/src/tools/inspect-image.ts",
@@ -10511,7 +10519,7 @@
     },
     {
       "path": "packages/utils/src/env.ts",
-      "sha256": "8cf09ea58046f49ebd792beb0d6f69cc293d84937cd0fa11e8a901a25f3ea2b6"
+      "sha256": "f2500e55ed9fe124c60d17e73bf938b944ff673205c1dd1db2c4f8302240384a"
     },
     {
       "path": "packages/utils/src/fetch-retry.ts",
@@ -10674,6 +10682,6 @@
       "sha256": "d6b15d084687adb4288dec626ffae8e49435a6d3c036ad63df8f48cf22936645"
     }
   ],
-  "behaviorSha256": "16a17592ffb7e5cd090ebb1534b43e2f67a134c329bc7bb048ba42981bc864cc",
-  "rootSha256": "1ea31da823f484e2420ce61aa3a27c215974657975816d58edd3e963e3eacc2b"
+  "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
+  "rootSha256": "576cd0b06cf488f8d0de2912922386e0c6f03ca5574301f05d39c70349e0844f"
 }

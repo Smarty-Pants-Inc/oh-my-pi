@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import { scheduler } from "node:timers/promises";
 import { Agent } from "@oh-my-pi/pi-agent-core";
+import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -64,6 +65,12 @@ describe("AgentSession auto-compaction queue resume", () => {
 							details: {},
 						},
 					};
+				});
+				pi.on("message_end", async event => {
+					if (event.message.role !== "custom" || event.message.customType !== "peer-message") return;
+					const gate = (globalThis as typeof globalThis & { __ompSemanticPersistenceGate?: Promise<void> })
+						.__ompSemanticPersistenceGate;
+					if (gate) await gate;
 				});
 				pi.on("auto_compaction_start", event => {
 					getRuntimeSignals().push(`compaction:start:${event.reason}`);
@@ -135,6 +142,9 @@ describe("AgentSession auto-compaction queue resume", () => {
 				getRuntimeSignals().length = 0;
 				(globalThis as typeof globalThis & { __ompManualCompactGate?: Promise<void> }).__ompManualCompactGate =
 					undefined;
+				(
+					globalThis as typeof globalThis & { __ompSemanticPersistenceGate?: Promise<void> }
+				).__ompSemanticPersistenceGate = undefined;
 				vi.restoreAllMocks();
 			}
 		}
@@ -249,6 +259,218 @@ describe("AgentSession auto-compaction queue resume", () => {
 		expect(compactingDuringAbort).toBe(true);
 	});
 
+	it("persists a scoped wake before manual compaction disconnects", async () => {
+		vi.useRealTimers();
+		session.settings.set("compaction.keepRecentTokens", 1);
+		sessionManager.appendMessage({
+			role: "assistant",
+			content: [{ type: "text", text: "previous answer" }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			stopReason: "stop",
+			usage: {
+				input: 1_000,
+				output: 100,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 1_100,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		});
+		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+		session.agent.streamFn = createMockModel({ handler: () => ({ content: ["Done"] }) }).stream;
+
+		const countWakeEntries = () =>
+			sessionManager
+				.getBranch()
+				.filter(
+					entry =>
+						entry.type === "custom_message" &&
+						entry.customType === "peer-message" &&
+						JSON.stringify(entry.content).includes("accepted before manual compaction"),
+				).length;
+		const gate = Promise.withResolvers<void>();
+		(globalThis as typeof globalThis & { __ompManualCompactGate?: Promise<void> }).__ompManualCompactGate =
+			gate.promise;
+		let callbackWakeEntries = -1;
+		let compactPromise: Promise<unknown> | undefined;
+
+		const sending = session.sendCustomMessage(
+			{
+				customType: "peer-message",
+				content: "accepted before manual compaction",
+				display: true,
+				attribution: "agent",
+			},
+			{
+				deliveryMode: "auto",
+				automaticTurnSource: "peer_message_wake",
+				onStartedTurnAccepted: () => {
+					callbackWakeEntries = countWakeEntries();
+					compactPromise = session.compact();
+				},
+			},
+		);
+
+		try {
+			await expect(withTimeout(sending, 1000, "Scoped wake acceptance timed out")).resolves.toEqual({
+				status: "accepted",
+				delivery: "started_turn",
+			});
+			expect(callbackWakeEntries).toBe(0);
+			while (!getRuntimeSignals().includes("before_compact:enter")) {
+				await Promise.resolve();
+			}
+			expect(countWakeEntries()).toBe(1);
+		} finally {
+			gate.resolve();
+			await compactPromise;
+		}
+	});
+
+	it("abortCompaction cancels startup while semantic acceptance is pending", async () => {
+		vi.useRealTimers();
+		session.agent.streamFn = createMockModel({ handler: () => ({ content: ["Done"] }) }).stream;
+		const persistenceGate = Promise.withResolvers<void>();
+		(
+			globalThis as typeof globalThis & { __ompSemanticPersistenceGate?: Promise<void> }
+		).__ompSemanticPersistenceGate = persistenceGate.promise;
+		let compactPromise: Promise<unknown> | undefined;
+		const sending = session.sendCustomMessage(
+			{
+				customType: "peer-message",
+				content: "hold acceptance during compact cancellation",
+				display: true,
+				attribution: "agent",
+			},
+			{
+				deliveryMode: "auto",
+				automaticTurnSource: "peer_message_wake",
+				onStartedTurnAccepted: () => {
+					compactPromise = session.compact();
+					void compactPromise.catch(() => {});
+					session.abortCompaction();
+				},
+			},
+		);
+
+		try {
+			while (!compactPromise) await Bun.sleep(1);
+			await expect(withTimeout(compactPromise, 1_000, "Compaction cancellation timed out")).rejects.toThrow(
+				"Compaction cancelled",
+			);
+			expect(session.isCompacting).toBe(false);
+			await expect(
+				session.sendCustomMessage(
+					{ customType: "probe", content: "after compact cancel", display: false, attribution: "agent" },
+					{ deliveryMode: "steer" },
+				),
+			).resolves.toMatchObject({ status: "accepted" });
+		} finally {
+			persistenceGate.resolve();
+			await sending;
+			await session.waitForIdle();
+		}
+	});
+
+	it("rejects scoped peer wake while manual compaction owns the semantic-delivery fence", async () => {
+		session.settings.set("compaction.keepRecentTokens", 1);
+		vi.useRealTimers();
+		sessionManager.appendMessage({
+			role: "assistant",
+			content: [{ type: "text", text: "previous answer" }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			stopReason: "stop",
+			usage: {
+				input: 1_000,
+				output: 100,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 1_100,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		});
+		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
+		session.agent.streamFn = mock.stream;
+		const countWakeEntries = () =>
+			sessionManager
+				.getBranch()
+				.filter(
+					entry =>
+						entry.type === "custom_message" &&
+						entry.customType === "peer-message" &&
+						JSON.stringify(entry.content).includes("must remain retryable during compaction"),
+				).length;
+
+		const gate = Promise.withResolvers<void>();
+		(globalThis as typeof globalThis & { __ompManualCompactGate?: Promise<void> }).__ompManualCompactGate =
+			gate.promise;
+		const compactPromise = session.compact();
+		while (!getRuntimeSignals().includes("before_compact:enter")) {
+			await Promise.resolve();
+		}
+
+		let committed = false;
+		try {
+			await expect(
+				session.sendCustomMessage(
+					{
+						customType: "peer-message",
+						content: "must remain retryable during compaction",
+						display: true,
+						attribution: "agent",
+					},
+					{
+						deliveryMode: "auto",
+						automaticTurnSource: "peer_message_wake",
+						onStartedTurnAccepted: () => {
+							committed = true;
+						},
+					},
+				),
+			).resolves.toEqual({ status: "unavailable", reason: "session_transition" });
+			expect(committed).toBe(false);
+			expect(mock.calls).toHaveLength(0);
+			expect(countWakeEntries()).toBe(0);
+		} finally {
+			gate.resolve();
+			await compactPromise;
+		}
+
+		expect(countWakeEntries()).toBe(0);
+		await expect(
+			session.sendCustomMessage(
+				{
+					customType: "peer-message",
+					content: "must remain retryable during compaction",
+					display: true,
+					attribution: "agent",
+				},
+				{
+					deliveryMode: "auto",
+					automaticTurnSource: "peer_message_wake",
+					onStartedTurnAccepted: () => {
+						expect(JSON.stringify(session.agent.state.messages)).not.toContain(
+							"must remain retryable during compaction",
+						);
+						expect(countWakeEntries()).toBe(0);
+						committed = true;
+					},
+				},
+			),
+		).resolves.toEqual({ status: "accepted", delivery: "started_turn" });
+		await session.waitForIdle();
+		expect(committed).toBe(true);
+		expect(countWakeEntries()).toBe(1);
+		expect(mock.calls).toHaveLength(1);
+	});
+
 	it("resumes a message queued during manual compaction once it completes (#5800)", async () => {
 		// Regression for #5800 review: manual /compact disconnects the agent
 		// listener before `await abort()`, so the abort-finally stranded-message
@@ -281,7 +503,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 			expect([...session.agent.peekSteeringQueue(), ...session.agent.peekFollowUpQueue()]).toEqual([
 				expect.objectContaining({
 					role: "user",
-					content: "please respond after compaction",
+					content: [{ type: "text", text: "please respond after compaction" }],
 					attribution: "user",
 				}),
 			]);
@@ -308,12 +530,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 			steering: true,
 			timestamp: Date.now(),
 		});
-		session.agent.followUp({
-			role: "user",
-			content: "please respond after compaction",
-			attribution: "user",
-			timestamp: Date.now(),
-		});
+		await session.sendUserMessage("please respond after compaction");
 		expect(session.agent.hasQueuedMessages()).toBe(true);
 
 		gate.resolve();

@@ -63,6 +63,24 @@ describe("SessionManager collab replication", () => {
 		expect(manager.getEntry(id)?.id).toBe(id);
 	});
 
+	it("notifies independent append subscribers without replacing the legacy hook", () => {
+		const { manager } = makeManager();
+		const legacy: string[] = [];
+		const first: string[] = [];
+		const second: string[] = [];
+		manager.onEntryAppended = entry => legacy.push(entry.id);
+		const unsubscribeFirst = manager.subscribeEntryAppended(entry => first.push(entry.id));
+		manager.subscribeEntryAppended(entry => second.push(entry.id));
+
+		const initial = manager.appendMessage({ role: "user", content: "both", timestamp: Date.now() });
+		unsubscribeFirst();
+		const afterStop = manager.appendMessage({ role: "user", content: "second only", timestamp: Date.now() });
+
+		expect(legacy).toEqual([initial, afterStop]);
+		expect(first).toEqual([initial]);
+		expect(second).toEqual([initial, afterStop]);
+	});
+
 	it("ingestReplicatedEntry preserves foreign ids and advances the leaf", async () => {
 		const { manager } = makeManager();
 		const rootId = manager.appendMessage({ role: "user", content: "root", timestamp: Date.now() });

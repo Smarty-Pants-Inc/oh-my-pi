@@ -10,6 +10,24 @@
  * imports run, so it restores the user's real working directory in time for
  * import-time snapshots (e.g. `getProjectDir()` in `@oh-my-pi/pi-utils/dirs`).
  */
+// Privileged Bash launchers ignore inherited startup hooks, but Bash leaves
+// those entries in the child environment. Remove them before CLI code can
+// spawn another shell while a Herdr bridge capability is still present.
+for (const name of Object.keys(process.env)) {
+	if (
+		name.startsWith("BASH_FUNC_") ||
+		name === "SHELLOPTS" ||
+		name === "PS4" ||
+		name === "BASH_XTRACEFD" ||
+		name === "BASH_ENV" ||
+		name === "ENV" ||
+		name === "BUN_BE_BUN" ||
+		name === "NODE_OPTIONS"
+	) {
+		delete process.env[name];
+	}
+}
+
 const launchCwd = process.env.OMP_LAUNCH_CWD;
 if (launchCwd) {
 	delete process.env.OMP_LAUNCH_CWD;
