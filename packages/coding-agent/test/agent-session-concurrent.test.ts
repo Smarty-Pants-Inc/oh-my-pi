@@ -978,6 +978,61 @@ describe("AgentSession concurrent prompt guard", () => {
 			session.setLifecycleTransitionFenceForTests(false);
 		}
 	});
+	it("does not orphan a keyword notice when a queued user prompt loses lifecycle ownership", async () => {
+		await createSession({ "magicKeywords.enabled": true, "magicKeywords.ultrathink": true });
+		session.agent.state.isStreaming = true;
+		let acceptanceCalls = 0;
+		session.setPromptAcceptanceHookForTests(() => {
+			acceptanceCalls++;
+			if (acceptanceCalls !== 2) return;
+			session.setLifecycleTransitionFenceForTests(true);
+			session.setLifecycleTransitionFenceForTests(false);
+		});
+
+		try {
+			await expect(
+				session.prompt("ultrathink queued across handoff", { streamingBehavior: "steer" }),
+			).rejects.toThrow("Session transition in progress");
+			expect(acceptanceCalls).toBe(2);
+			expect(session.agent.peekSteeringQueue()).toHaveLength(0);
+			expect(session.agent.peekFollowUpQueue()).toHaveLength(0);
+		} finally {
+			session.setPromptAcceptanceHookForTests(undefined);
+			session.setLifecycleTransitionFenceForTests(false);
+		}
+	});
+	it("does not orphan a keyword notice when a queued custom prompt loses lifecycle ownership", async () => {
+		await createSession({ "magicKeywords.enabled": true, "magicKeywords.ultrathink": true });
+		session.agent.state.isStreaming = true;
+		let acceptanceCalls = 0;
+		session.setPromptAcceptanceHookForTests(() => {
+			acceptanceCalls++;
+			if (acceptanceCalls !== 2) return;
+			session.setLifecycleTransitionFenceForTests(true);
+			session.setLifecycleTransitionFenceForTests(false);
+		});
+
+		try {
+			await expect(
+				session.promptCustomMessage(
+					{
+						customType: "skill-prompt",
+						content: "run the skill",
+						display: true,
+						details: { args: "ultrathink queued across handoff" },
+						attribution: "user",
+					},
+					{ queueOnly: true, streamingBehavior: "followUp" },
+				),
+			).rejects.toThrow("Session transition in progress");
+			expect(acceptanceCalls).toBe(2);
+			expect(session.agent.peekSteeringQueue()).toHaveLength(0);
+			expect(session.agent.peekFollowUpQueue()).toHaveLength(0);
+		} finally {
+			session.setPromptAcceptanceHookForTests(undefined);
+			session.setLifecycleTransitionFenceForTests(false);
+		}
+	});
 	it("does not run a prompt preflight for an unscoped semantic delivery", async () => {
 		await createSession({ "retry.usageAwareFallback": true });
 		const before = session.agent.state.messages.length;

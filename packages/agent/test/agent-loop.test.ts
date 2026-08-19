@@ -2525,6 +2525,64 @@ describe("agentLoop with AgentMessage", () => {
 			// Drain the loop.
 		}
 	});
+	it("commits an initial aside only after provider acceptance", async () => {
+		const message = createUserMessage("idle completion");
+		let committed = false;
+		let discarded: Error | undefined;
+		Object.defineProperties(message, {
+			[ASIDE_MESSAGE_COMMIT]: { value: () => (committed = true) },
+			[ASIDE_MESSAGE_DISCARD]: { value: (error: Error) => (discarded = error) },
+		});
+		const mock = createMockModel({ handler: () => ({ content: ["done"] }) });
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [] };
+
+		const stream = agentLoop(
+			[message],
+			context,
+			{
+				model: mock.model,
+				convertToLlm: identityConverter,
+				onProviderCallStarted: () => {},
+			},
+			undefined,
+			mock.stream,
+		);
+
+		expect(committed).toBe(false);
+		expect(await stream.result()).toHaveLength(2);
+		expect(committed).toBe(true);
+		expect(discarded).toBeUndefined();
+	});
+
+	it("discards an initial aside when a gate stops before provider acceptance", async () => {
+		const message = createUserMessage("idle completion");
+		let committed = false;
+		let discarded: Error | undefined;
+		Object.defineProperties(message, {
+			[ASIDE_MESSAGE_COMMIT]: { value: () => (committed = true) },
+			[ASIDE_MESSAGE_DISCARD]: { value: (error: Error) => (discarded = error) },
+		});
+		const mock = createMockModel({ handler: () => ({ content: ["unused"] }) });
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [] };
+
+		const stream = agentLoop(
+			[message],
+			context,
+			{
+				model: mock.model,
+				convertToLlm: identityConverter,
+				onProviderCallStarted: () => {},
+				beforeModelCall: () => ({ stop: true, reason: "over budget" }),
+			},
+			undefined,
+			mock.stream,
+		);
+
+		expect(await stream.result()).toEqual([]);
+		expect(mock.calls).toHaveLength(0);
+		expect(committed).toBe(false);
+		expect(discarded?.message).toContain("not committed before provider dispatch");
+	});
 
 	it("discards a drained aside when the deadline expires before insertion", async () => {
 		let now = 100;

@@ -547,9 +547,8 @@ export function agentLoop(
 			...context,
 			messages: [...context.messages, ...prompts],
 		};
-		for (const prompt of prompts) {
-			(prompt as CommittableAsideMessage)[ASIDE_MESSAGE_COMMIT]?.();
-		}
+		sealAsides(prompts);
+		if (config.onProviderCallStarted === undefined) commitAsides(prompts);
 
 		stream.push({ type: "agent_start" });
 
@@ -1044,9 +1043,9 @@ async function runLoopBody(
 		escalations: softRequirementState.escalations,
 	};
 	let preserveSoftRequirementState = false;
-	let provisionalMessages: AgentMessage[] = [];
-	let provisionalTurnMessages: AgentMessage[] | undefined;
 	let providerCallAccepted = config.onProviderCallStarted === undefined;
+	let provisionalMessages: AgentMessage[] = providerCallAccepted ? [] : [...initialMessages];
+	let provisionalTurnMessages: AgentMessage[] | undefined;
 	let provisionalSoftRequirementState: typeof initialSoftRequirementState | undefined;
 	let pendingHardToolChoiceRollback = false;
 	const rollbackPendingHardToolChoice = (): void => {
@@ -1076,6 +1075,7 @@ async function runLoopBody(
 	let pendingMessages: AgentMessage[] = [];
 	try {
 		let messagesToEmit = [...initialMessages];
+		if (!providerCallAccepted) provisionalTurnMessages = messagesToEmit;
 		if (isDeadlineExceeded(config.deadline)) {
 			if (providerCallAccepted) emitInputMessages(stream, messagesToEmit);
 			finishAgentStream();

@@ -260,12 +260,21 @@ describe("AgentSession handoff", () => {
 		const handoff = session.handoff();
 		await handoffStarted.promise;
 		try {
-			await expect(session.prompt("must not be lost during handoff")).rejects.toThrow(
-				"Session transition in progress",
-			);
+			const blockedPrompts = [
+				() => session.prompt("must not be lost during handoff"),
+				() => session.prompt("must not queue during handoff", { streamingBehavior: "steer" }),
+				() => session.steer("must not steer during handoff"),
+				() => session.followUp("must not follow up during handoff"),
+				() => session.sendUserMessage("must not send during handoff", { deliverAs: "followUp" }),
+			];
+			for (const send of blockedPrompts) {
+				await expect(send()).rejects.toThrow("Session transition in progress");
+			}
 			expect(mock.calls).toHaveLength(0);
-			expect(JSON.stringify(session.agent.state.messages)).not.toContain("must not be lost during handoff");
-			expect(JSON.stringify(sessionManager.getBranch())).not.toContain("must not be lost during handoff");
+			expect(session.agent.peekSteeringQueue()).toHaveLength(0);
+			expect(session.agent.peekFollowUpQueue()).toHaveLength(0);
+			expect(JSON.stringify(session.agent.state.messages)).not.toContain("must not");
+			expect(JSON.stringify(sessionManager.getBranch())).not.toContain("must not");
 		} finally {
 			handoffGenerated.resolve("## Goal\nContinue from here");
 			await handoff;

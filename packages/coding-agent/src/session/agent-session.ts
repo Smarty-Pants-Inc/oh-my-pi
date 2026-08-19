@@ -684,6 +684,8 @@ export class AgentSession {
 	readonly #activeLifecycleSettlements = new Set<Promise<void>>();
 	/** Suppresses queued turns from the first retained checkpoint through irreversible lifecycle selection. */
 	#lifecycleTransitionFenceActive = false;
+	/** The active lifecycle fence belongs to queue-preserving semantic maintenance. */
+	#semanticDeliveryMaintenanceFenceActive = false;
 	#lifecycleTransitionGeneration = 0;
 
 	readonly #irc: IrcBridge;
@@ -2376,7 +2378,15 @@ export class AgentSession {
 		}
 	}
 	async #beginSemanticDeliveryMaintenance(signal?: AbortSignal): Promise<() => void> {
-		const releaseFence = this.#acquireLifecycleTransitionFence();
+		const releaseLifecycleFence = this.#acquireLifecycleTransitionFence();
+		this.#semanticDeliveryMaintenanceFenceActive = true;
+		let released = false;
+		const releaseFence = () => {
+			if (released) return;
+			released = true;
+			this.#semanticDeliveryMaintenanceFenceActive = false;
+			releaseLifecycleFence();
+		};
 		try {
 			await this.#waitForSemanticDeliveryAcceptances(undefined, signal);
 			return releaseFence;
@@ -6483,6 +6493,15 @@ export class AgentSession {
 			throw new AgentBusyError("Session transition in progress. Wait for completion before sending another prompt.");
 		}
 	}
+	#assertQueuedUserMessageCanStart(lifecycleGeneration = this.#lifecycleTransitionGeneration): void {
+		if (
+			this.#handoff.isGeneratingHandoff ||
+			lifecycleGeneration !== this.#lifecycleTransitionGeneration ||
+			(this.#lifecycleTransitionFenceActive && !this.#semanticDeliveryMaintenanceFenceActive)
+		) {
+			throw new AgentBusyError("Session transition in progress. Wait for completion before sending another prompt.");
+		}
+	}
 
 	/**
 	 * Send a prompt to the agent.
@@ -6505,8 +6524,14 @@ export class AgentSession {
 		const abort = this.#abortPromise;
 		if (abort) await abort;
 		const lifecycleGeneration = this.#lifecycleTransitionGeneration;
-		this.#assertPromptCanStart(lifecycleGeneration);
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
+		const queueDuringSemanticMaintenance =
+			this.#semanticDeliveryMaintenanceFenceActive &&
+			options?.streamingBehavior !== undefined &&
+			!options.synthetic &&
+			!(expandPromptTemplates && text.startsWith("/"));
+		if (queueDuringSemanticMaintenance) this.#assertQueuedUserMessageCanStart(lifecycleGeneration);
+		else this.#assertPromptCanStart(lifecycleGeneration);
 
 		// Handle extension commands first (execute immediately, even during streaming)
 		if (expandPromptTemplates && text.startsWith("/")) {
@@ -6551,21 +6576,20 @@ export class AgentSession {
 			this.#toolChoiceQueue.removeByLabel("plan-mode-decision");
 		}
 
-		// If streaming, queue via steer() or followUp() based on option
-		if (this.isStreaming) {
+		// While streaming or queue-preserving maintenance is active, queue via steer/follow-up.
+		if (this.isStreaming || queueDuringSemanticMaintenance) {
 			const streamingBehavior = options?.streamingBehavior;
 			if (!streamingBehavior) throw new AgentBusyError();
 
-			// Steer/follow-up the keyword notices BEFORE the queued user message so the
-			// model reads the steering notice ahead of the prompt it modifies.
-			for (const notice of keywordNotices) {
-				await this.#queueCustomMessage(notice, streamingBehavior, undefined, true, lifecycleGeneration);
-			}
-			if (streamingBehavior === "followUp") {
-				await this.#queueUserMessage(expandedText, options?.images, "followUp", lifecycleGeneration);
-			} else {
-				await this.#queueUserMessage(expandedText, options?.images, "steer", lifecycleGeneration);
-			}
+			// Queue keyword notices and their owning user message as one accepted batch so
+			// a lifecycle handoff cannot strand a notice without the prompt it modifies.
+			await this.#queueUserMessage(
+				expandedText,
+				options?.images,
+				streamingBehavior === "followUp" ? "followUp" : "steer",
+				lifecycleGeneration,
+				keywordNotices,
+			);
 			return true;
 		}
 
@@ -6682,20 +6706,28 @@ export class AgentSession {
 			const streamingBehavior = options?.streamingBehavior;
 			if (!streamingBehavior) throw new AgentBusyError();
 
-			for (const notice of keywordNotices) {
-				await this.#queueCustomMessage(notice, streamingBehavior, undefined, false, lifecycleGeneration);
-			}
-			await this.#queueCustomMessage(message, streamingBehavior, options.queueChipText, false, lifecycleGeneration);
+			await this.#queueCustomMessage(
+				message,
+				streamingBehavior,
+				options.queueChipText,
+				false,
+				lifecycleGeneration,
+				keywordNotices,
+			);
 			return;
 		}
 		if (this.isStreaming) {
 			const streamingBehavior = options?.streamingBehavior;
 			if (!streamingBehavior) throw new AgentBusyError();
 
-			for (const notice of keywordNotices) {
-				await this.#queueCustomMessage(notice, streamingBehavior, undefined, true, lifecycleGeneration);
-			}
-			await this.#queueCustomMessage(message, streamingBehavior, options?.queueChipText, true, lifecycleGeneration);
+			await this.#queueCustomMessage(
+				message,
+				streamingBehavior,
+				options?.queueChipText,
+				true,
+				lifecycleGeneration,
+				keywordNotices,
+			);
 			return;
 		}
 
@@ -7255,7 +7287,8 @@ export class AgentSession {
 	 */
 	async followUp(text: string, images?: ImageContent[], options?: FollowUpOptions): Promise<void> {
 		const lifecycleGeneration = this.#lifecycleTransitionGeneration;
-		this.#assertPromptCanStart(lifecycleGeneration);
+		if (options?.synthetic) this.#assertPromptCanStart(lifecycleGeneration);
+		else this.#assertQueuedUserMessageCanStart(lifecycleGeneration);
 		if (text.startsWith("/")) {
 			this.#throwIfExtensionCommand(text);
 		}
@@ -7263,7 +7296,7 @@ export class AgentSession {
 		const expandedText =
 			options?.expandPromptTemplates === false ? text : expandPromptTemplate(text, [...this.#promptTemplates]);
 		if (!options?.synthetic) {
-			await this.#queueUserMessage(expandedText, images, "followUp");
+			await this.#queueUserMessage(expandedText, images, "followUp", lifecycleGeneration);
 			return;
 		}
 		// Synthetic branch: agent-initiated hidden developer message. Bypass
@@ -7323,9 +7356,16 @@ export class AgentSession {
 		images: ImageContent[] | undefined,
 		mode: "steer" | "followUp",
 		lifecycleGeneration?: number,
+		prependMessages: CustomMessage[] = [],
 	): Promise<void> {
 		const acceptedLifecycleGeneration = lifecycleGeneration ?? this.#lifecycleTransitionGeneration;
-		this.#assertPromptCanStart(acceptedLifecycleGeneration);
+		this.#assertQueuedUserMessageCanStart(acceptedLifecycleGeneration);
+		const normalizedPrependMessages: CustomMessage[] = [];
+		for (const message of prependMessages) {
+			normalizedPrependMessages.push(
+				await this.#prepareQueuedCustomMessage(message, undefined, acceptedLifecycleGeneration, true),
+			);
+		}
 		// A queued user message (RPC/SDK/collab steer or follow-up, or a typed message
 		// while streaming) is a deliberate resume; re-enable advisor auto-resume that
 		// a user interrupt suppressed.
@@ -7341,7 +7381,7 @@ export class AgentSession {
 			? await this.#buildImageDescriptionNotice(normalizedImages)
 			: undefined;
 		this.onBeforePromptAcceptance?.();
-		this.#assertPromptCanStart(acceptedLifecycleGeneration);
+		this.#assertQueuedUserMessageCanStart(acceptedLifecycleGeneration);
 		this.#allowQueuedMessageDrainRetry();
 		const userMessage: UserMessage = {
 			role: "user",
@@ -7351,9 +7391,11 @@ export class AgentSession {
 			...(mode === "steer" ? { steering: true } : {}),
 		};
 		if (mode === "followUp") {
+			for (const prependMessage of normalizedPrependMessages) this.agent.followUp(prependMessage);
 			if (imageDescriptionNotice) this.agent.followUp(imageDescriptionNotice);
 			this.agent.followUp(userMessage);
 		} else {
+			for (const prependMessage of normalizedPrependMessages) this.agent.steer(prependMessage);
 			if (imageDescriptionNotice) this.agent.steer(imageDescriptionNotice);
 			this.agent.steer(userMessage);
 		}
@@ -7788,16 +7830,14 @@ export class AgentSession {
 		}
 	}
 
-	/** Queue a custom message without starting a turn, matching steer/follow-up delivery. */
-	async #queueCustomMessage<T = unknown>(
+	async #prepareQueuedCustomMessage<T = unknown>(
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "attribution">,
-		deliverAs: "steer" | "followUp",
-		queueChipText?: string,
-		scheduleIdleDrain = true,
-		lifecycleGeneration?: number,
-	): Promise<void> {
-		const acceptedLifecycleGeneration = lifecycleGeneration ?? this.#lifecycleTransitionGeneration;
-		this.#assertPromptCanStart(acceptedLifecycleGeneration);
+		queueChipText: string | undefined,
+		lifecycleGeneration: number,
+		allowSemanticMaintenance = false,
+	): Promise<CustomMessage<T>> {
+		if (allowSemanticMaintenance) this.#assertQueuedUserMessageCanStart(lifecycleGeneration);
+		else this.#assertPromptCanStart(lifecycleGeneration);
 		const details =
 			queueChipText !== undefined
 				? ({
@@ -7819,11 +7859,40 @@ export class AgentSession {
 		};
 		const normalizedAppMessage = await this.#normalizeAgentMessageImages(appMessage);
 		this.onBeforePromptAcceptance?.();
+		if (allowSemanticMaintenance) this.#assertQueuedUserMessageCanStart(lifecycleGeneration);
+		else this.#assertPromptCanStart(lifecycleGeneration);
+		return normalizedAppMessage;
+	}
+
+	/** Queue a custom message without starting a turn, matching steer/follow-up delivery. */
+	async #queueCustomMessage<T = unknown>(
+		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "attribution">,
+		deliverAs: "steer" | "followUp",
+		queueChipText?: string,
+		scheduleIdleDrain = true,
+		lifecycleGeneration?: number,
+		prependMessages: CustomMessage[] = [],
+	): Promise<void> {
+		const acceptedLifecycleGeneration = lifecycleGeneration ?? this.#lifecycleTransitionGeneration;
+		this.#assertPromptCanStart(acceptedLifecycleGeneration);
+		const normalizedPrependMessages: CustomMessage[] = [];
+		for (const prependMessage of prependMessages) {
+			normalizedPrependMessages.push(
+				await this.#prepareQueuedCustomMessage(prependMessage, undefined, acceptedLifecycleGeneration),
+			);
+		}
+		const normalizedAppMessage = await this.#prepareQueuedCustomMessage(
+			message,
+			queueChipText,
+			acceptedLifecycleGeneration,
+		);
 		this.#assertPromptCanStart(acceptedLifecycleGeneration);
 		this.#allowQueuedMessageDrainRetry();
 		if (deliverAs === "followUp") {
+			for (const prependMessage of normalizedPrependMessages) this.agent.followUp(prependMessage);
 			this.agent.followUp(normalizedAppMessage);
 		} else {
+			for (const prependMessage of normalizedPrependMessages) this.agent.steer(prependMessage);
 			this.agent.steer(normalizedAppMessage);
 		}
 		if (scheduleIdleDrain) this.#scheduleIdleQueueDrain();

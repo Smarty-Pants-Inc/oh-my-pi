@@ -503,7 +503,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 			expect([...session.agent.peekSteeringQueue(), ...session.agent.peekFollowUpQueue()]).toEqual([
 				expect.objectContaining({
 					role: "user",
-					content: "please respond after compaction",
+					content: [{ type: "text", text: "please respond after compaction" }],
 					attribution: "user",
 				}),
 			]);
@@ -530,12 +530,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 			steering: true,
 			timestamp: Date.now(),
 		});
-		session.agent.followUp({
-			role: "user",
-			content: "please respond after compaction",
-			attribution: "user",
-			timestamp: Date.now(),
-		});
+		await session.sendUserMessage("please respond after compaction");
 		expect(session.agent.hasQueuedMessages()).toBe(true);
 
 		gate.resolve();
