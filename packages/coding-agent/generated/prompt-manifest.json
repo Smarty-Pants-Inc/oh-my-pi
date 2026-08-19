@@ -6815,7 +6815,7 @@
     },
     {
       "path": "packages/coding-agent/src/context/manifest.ts",
-      "sha256": "0105cf3528fb8f6abda45a5f6924216f5574113f1cabca6fbf96abecc2ec3c3e"
+      "sha256": "4c214cd434a8d97e93173367f463cf08078b4a50ea1a8ee8dd794deef5bb7dcd"
     },
     {
       "path": "packages/coding-agent/src/context/prompt-sources.generated.ts",
@@ -7399,7 +7399,7 @@
     },
     {
       "path": "packages/coding-agent/src/extensibility/plugins/legacy-pi-compat.ts",
-      "sha256": "c580fe7eeda4ea45c408b150c38975b851578df3715c5c927bce4c63f74b38a8"
+      "sha256": "676025997c2624d87fddcbf12653b555485eb16a6a7a8813fd010c7920d83143"
     },
     {
       "path": "packages/coding-agent/src/extensibility/plugins/loader.ts",
@@ -9555,7 +9555,7 @@
     },
     {
       "path": "packages/coding-agent/src/utils/git.ts",
-      "sha256": "1b7516f9a0ddbd054e29faf3b39e014a50db06aa6c2613f8e332db45e5be786d"
+      "sha256": "70f9c764c0c2521c4b164a0d227a42bbc4b2a0e2dffb03a613b476feae1b33ff"
     },
     {
       "path": "packages/coding-agent/src/utils/image-loading.ts",
@@ -10675,5 +10675,5 @@
     }
   ],
   "behaviorSha256": "16a17592ffb7e5cd090ebb1534b43e2f67a134c329bc7bb048ba42981bc864cc",
-  "rootSha256": "14e1b2c589daa3e8202bee76c18f06e9bc7b55cb0917a51bd18df9552bbdaa17"
+  "rootSha256": "c8c0c916a0818f99729fe86b540c3f9f386280d170253923858277a3f3bc06cb"
 }

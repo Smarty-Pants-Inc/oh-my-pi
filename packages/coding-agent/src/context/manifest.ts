@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { YAML } from "bun";
 import trackedManifestSource from "../../generated/prompt-manifest.json" with { type: "text" };
+import { isExtensionSourceGraphContained } from "../extensibility/plugins/legacy-pi-compat";
 import { diff, fetch as gitFetch, ref, remote, repo, show, status } from "../utils/git";
 import { canonicalJson, compareUnicodeCodePoints, type JsonValue, sha256 } from "./canonical";
 import { computeImplementationSources } from "./implementation-sources";
@@ -585,19 +586,45 @@ export function canonicalAgentDirPath(): string {
 
 export function approvedCandidateSourceMatches(
 	repository: string | undefined,
-	identity: Pick<CandidateIdentity, "commit" | "tree"> | undefined,
-	workingSha256: string,
-	committedSha256: string,
+	approvedIdentity: Pick<CandidateIdentity, "commit" | "tree"> | undefined,
+	approvedPackageTree: string | undefined,
+	headPackageTree: string | undefined,
+	workingSourceStatus: string,
 	release: Pick<ContextReleaseManifest, "candidates">,
 ): boolean {
-	if (!repository || !identity) return false;
+	if (!repository || !approvedIdentity || !approvedPackageTree || !headPackageTree) return false;
 	const candidate = release.candidates.find(item => item.repository === repository);
 	return (
-		candidate?.commit === identity.commit && candidate.tree === identity.tree && workingSha256 === committedSha256
+		candidate?.commit === approvedIdentity.commit &&
+		candidate.tree === approvedIdentity.tree &&
+		approvedPackageTree === headPackageTree &&
+		workingSourceStatus === ""
 	);
 }
 
-/** Bind an external runtime source to exact bytes in one approved candidate. */
+async function approvedCandidateSourceRoot(
+	repositoryRoot: string,
+	resolvedSource: string,
+	candidateCommit: string,
+): Promise<string | undefined> {
+	let current = path.dirname(resolvedSource);
+	while (true) {
+		const relativeManifest = path
+			.relative(repositoryRoot, path.join(current, "package.json"))
+			.replaceAll(path.sep, "/");
+		try {
+			await show(repositoryRoot, `${candidateCommit}:${relativeManifest}`);
+			return current;
+		} catch {
+			if (current === repositoryRoot) return undefined;
+			const parent = path.dirname(current);
+			if (parent === current) return undefined;
+			current = parent;
+		}
+	}
+}
+
+/** Bind an external runtime source to an unchanged, clean package in one approved candidate. */
 export async function isApprovedCandidateSource(filePath: string, release: ContextReleaseManifest): Promise<boolean> {
 	try {
 		const resolved = await fs.realpath(path.resolve(filePath));
@@ -605,23 +632,37 @@ export async function isApprovedCandidateSource(filePath: string, release: Conte
 		if (!repositoryRoot) return false;
 		const relative = path.relative(repositoryRoot, resolved).replaceAll(path.sep, "/");
 		if (relative.startsWith("../") || path.isAbsolute(relative)) return false;
-		const identity = await ref.commitIdentity(repositoryRoot, "HEAD");
-		if (!identity) return false;
 		const remoteNames = await remote.list(repositoryRoot);
 		let repository: string | undefined;
 		for (const name of ["origin", ...remoteNames.filter(name => name !== "origin")]) {
 			repository = canonicalGithubRepository(await remote.url(repositoryRoot, name));
 			if (repository) break;
 		}
-		const [workingSource, committedSource] = await Promise.all([
-			readRequiredSource(resolved, `candidate source ${resolved}`),
-			show(repositoryRoot, `HEAD:${relative}`),
+		const candidate = release.candidates.find(item => item.repository === repository);
+		if (!candidate) return false;
+		const approvedIdentity = await ref.commitIdentity(repositoryRoot, candidate.commit);
+		const sourceRoot = await approvedCandidateSourceRoot(repositoryRoot, resolved, candidate.commit);
+		if (!sourceRoot) return false;
+		const relativeSourceRoot = path.relative(repositoryRoot, sourceRoot).replaceAll(path.sep, "/");
+		const [approvedPackageTree, headPackageTree, workingSourceStatus, sourceGraphContained] = await Promise.all([
+			ref.resolve(repositoryRoot, `${candidate.commit}:${relativeSourceRoot}`),
+			ref.resolve(repositoryRoot, `HEAD:${relativeSourceRoot}`),
+			status(repositoryRoot, {
+				porcelainV1: true,
+				untrackedFiles: "all",
+				includeIgnored: true,
+				z: true,
+				pathspecs: [relativeSourceRoot],
+			}),
+			isExtensionSourceGraphContained(resolved, sourceRoot),
 		]);
+		if (!sourceGraphContained) return false;
 		return approvedCandidateSourceMatches(
 			repository,
-			identity,
-			sha256(workingSource),
-			sha256(committedSource),
+			approvedIdentity ?? undefined,
+			approvedPackageTree ?? undefined,
+			headPackageTree ?? undefined,
+			workingSourceStatus,
 			release,
 		);
 	} catch {

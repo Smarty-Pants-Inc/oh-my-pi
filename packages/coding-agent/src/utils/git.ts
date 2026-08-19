@@ -78,6 +78,7 @@ export interface StatusOptions {
 	readonly porcelainV1?: boolean;
 	readonly signal?: AbortSignal;
 	readonly untrackedFiles?: "all" | "no" | "normal";
+	readonly includeIgnored?: boolean;
 	readonly z?: boolean;
 }
 
@@ -1320,6 +1321,7 @@ export const status = Object.assign(
 		args.push(options.porcelainV1 ? "--porcelain=v1" : "--porcelain");
 		if (options.z) args.push("-z");
 		if (options.untrackedFiles) args.push(`--untracked-files=${options.untrackedFiles}`);
+		if (options.includeIgnored) args.push("--ignored=matching");
 		if (options.pathspecs?.length) args.push("--", ...options.pathspecs);
 		return runText(cwd, args, { readOnly: true, signal: options.signal });
 	},
