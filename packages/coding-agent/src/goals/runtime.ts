@@ -425,13 +425,11 @@ export class GoalRuntime {
 		});
 	}
 
-	async resumeGoal(options?: { pausedOnly?: boolean }): Promise<GoalModeState> {
+	async resumeGoal(): Promise<GoalModeState> {
 		return await this.#withAccounting(async () => {
 			const state = this.#getStateClone();
 			if (!state?.goal) throw new Error("No resumable goal.");
-			if (options?.pausedOnly) {
-				if (state.goal.status !== "paused") throw new Error("Goal is not paused.");
-			} else if (
+			if (
 				state.goal.status !== "paused" &&
 				state.goal.status !== "blocked" &&
 				state.goal.status !== "budget_limited" &&

@@ -96,7 +96,7 @@ export function parseGoalModeState(mode: unknown, modeData: unknown): GoalModeSt
 }
 
 export interface GoalToolDetails {
-	op: "create" | "get" | "complete" | "block" | "pause" | "resume";
+	op: "create" | "get" | "complete" | "block";
 	goal?: Goal | null;
 	remainingTokens?: number | null;
 	completionBudgetReport?: string | null;

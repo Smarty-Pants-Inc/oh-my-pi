@@ -849,7 +849,7 @@
     },
     {
       "id": "tool.goal",
-      "description": "The goal is persistent mission state.\n\n- `get`: read the current goal and accounting.\n- `create`: start a goal only when the user or system clearly requested persistent goal mode and no unfinished goal exists. Ordinary clear user prose is sufficient; do not parse prose into authorization rules.\n- `complete`: use only when the full objective is achieved and the required current evidence supports that claim.\n- `block`: use when meaningful progress requires user input, unavailable access, or external-state change, or after two evidence-valid failures of the same route with no materially different safe route.\n- `pause`: use only when the direct user explicitly asks to pause or stop the current mission. Persist the paused state, stop autonomous work, and do not resume it on your own.\n- `resume`: use only when the direct user explicitly asks to resume the paused mission.\n\nDo not infer a goal from an ordinary task. Do not infer pause or resume from indirect wording. Do not use completion or blocking to escape difficult work. Edit, replace, budget, drop, and clear remain typed owner/system operations. The two-failure rule is concise model guidance backed by tests; do not build a natural-language route-failure classifier.",
+      "description": "The goal is persistent mission state.\n\n- `get`: read the current goal and accounting.\n- `create`: start a goal only when the user or system clearly requested persistent goal mode and no unfinished goal exists. Ordinary clear user prose is sufficient; do not parse prose into authorization rules.\n- `complete`: use only when the full objective is achieved and the required current evidence supports that claim.\n- `block`: use when meaningful progress requires user input, unavailable access, or external-state change, or after two evidence-valid failures of the same route with no materially different safe route.\n\nDo not infer a goal from an ordinary task. Do not use completion or blocking to escape difficult work. Pause, resume, edit, replace, budget, drop, and clear are typed owner/system operations. The two-failure rule is concise model guidance backed by tests; do not build a natural-language route-failure classifier.",
       "schema": {
         "type": "object",
         "properties": {
@@ -858,9 +858,7 @@
               "create",
               "get",
               "complete",
-              "block",
-              "pause",
-              "resume"
+              "block"
             ],
             "type": "string",
             "description": "goal operation"
@@ -2030,5 +2028,5 @@
       }
     }
   ],
-  "rootSha256": "1accffad815f62df405bb1ab6ee1db3a1c1ffa042e77ddcae69a77d534a6f4cc"
+  "rootSha256": "a8ff7bbae3f93bdc3b5c6adadfd49567b95ccb39b6287626556b24f67e6e55a4"
 }
