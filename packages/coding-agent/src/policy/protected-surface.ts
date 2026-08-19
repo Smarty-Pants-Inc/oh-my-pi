@@ -1140,6 +1140,10 @@ const PATH_RULES: readonly PathRule[] = [
 		surface: "provider-mapping",
 	},
 	{
+		pattern: /(?:^|\/)packages\/coding-agent\/src\/build-identity\.[cm]?[jt]s$/i,
+		surface: "capability",
+	},
+	{
 		pattern: /(?:^|\/)packages\/coding-agent\/src\/commands\/(?:collab-bridge|join)\.[cm]?[jt]s$/i,
 		surface: "prompt-target",
 	},

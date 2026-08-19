@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash -p
 # Dev launcher for the omp CLI, installed by `bun run setup`.
 #
 # Problem it solves: Bun reads `bunfig.toml` from the *current working
@@ -10,42 +10,144 @@
 #   error: Cannot find module '@v12sh/utils/frontmatter' from '.../loader.ts'
 #
 # Bun only reads the *exact* cwd (it does not walk parents) and ignores
-# `--config`/`BUN_BE_BUN` for this, so the fix is to launch Bun from an empty,
-# bunfig-free directory and restore the real cwd inside the process via the
+# `--config`/`BUN_BE_BUN` for this, so the fix is to launch Bun from a known,
+# config-free directory and restore the real cwd inside the process via the
 # preload shim alongside this file.
 set -e
+unset herdr_host_bridge_token_set herdr_host_bridge_token
+unset herdr_guest_bridge_token_set herdr_guest_bridge_token
+unset herdr_bridge_token_set herdr_bridge_token herdr_bridge_bun
+unset herdr_legacy_bridge_command herdr_legacy_bridge_address
+unset herdr_legacy_bridge_room herdr_legacy_bridge_token
+unset PS4 BASH_ENV ENV NODE_OPTIONS OMP_MANAGED_BUILD_ID
 
-# Resolve this script's real location even when invoked through a symlink
-# (`$HOME/.bun/bin/omp` -> this file).
-self=$0
-while [ -L "$self" ]; do
-	link=$(readlink "$self")
-	case $link in
-	/*) self=$link ;;
-	*) self=$(dirname "$self")/$link ;;
+managed_source_build_id=
+if [ "${1-}" = "__managed-source-build-id" ] && [ "$#" -ge 2 ]; then
+	managed_source_build_id=$2
+	shift 2
+fi
+
+# Keep bridge capabilities out of every launcher helper and ambient Bun
+# preload. They are restored only on the final trusted Bun exec below.
+herdr_host_bridge_token_set=
+herdr_host_bridge_token=
+if [ "${HERDR_OMP_BRIDGE_TOKEN+x}" = x ]; then
+	herdr_host_bridge_token_set=1
+	herdr_host_bridge_token=$HERDR_OMP_BRIDGE_TOKEN
+	unset HERDR_OMP_BRIDGE_TOKEN
+fi
+herdr_guest_bridge_token_set=
+herdr_guest_bridge_token=
+if [ "${HERDR_OMP_GUEST_BRIDGE_TOKEN+x}" = x ]; then
+	herdr_guest_bridge_token_set=1
+	herdr_guest_bridge_token=$HERDR_OMP_GUEST_BRIDGE_TOKEN
+	unset HERDR_OMP_GUEST_BRIDGE_TOKEN
+fi
+herdr_bridge_bun=${OMP_BRIDGE_BUN-}
+unset OMP_BRIDGE_BUN
+
+# Older Herdr callers supplied the guest token positionally. Move it into the
+# capability handoff before any helper or Bun starts, and remove it from argv.
+if [ "${1-}" = "__collab-guest-bridge" ] && [ "$#" -ge 4 ] && [ "${4-}" != "--token-env" ]; then
+	herdr_legacy_bridge_command=$1
+	herdr_legacy_bridge_address=$2
+	herdr_legacy_bridge_room=$3
+	herdr_legacy_bridge_token=$4
+	shift 4
+	herdr_guest_bridge_token_set=1
+	herdr_guest_bridge_token=$herdr_legacy_bridge_token
+	set -- "$herdr_legacy_bridge_command" "$herdr_legacy_bridge_address" "$herdr_legacy_bridge_room" --token-env "$@"
+	unset herdr_legacy_bridge_command herdr_legacy_bridge_address herdr_legacy_bridge_room herdr_legacy_bridge_token
+fi
+
+herdr_bridge_token_set=
+if [ -n "$herdr_host_bridge_token_set" ] || [ -n "$herdr_guest_bridge_token_set" ]; then
+	herdr_bridge_token_set=1
+fi
+unset BUN_INSPECT_PRELOAD BUN_BE_BUN
+if [ -n "$herdr_bridge_token_set" ] || [ -n "$herdr_bridge_bun" ]; then
+	unset BUN_OPTIONS
+fi
+
+if [ -n "$herdr_bridge_token_set" ] && [ -z "$herdr_bridge_bun" ]; then
+	echo "omp: managed bridge launch did not provide an absolute trusted Bun executable" >&2
+	exit 1
+fi
+if [ -n "$herdr_bridge_bun" ]; then
+	case $herdr_bridge_bun in
+	/*) ;;
+	*) echo "omp: managed bridge launch did not provide an absolute trusted Bun executable" >&2; exit 1 ;;
 	esac
-done
-scripts_dir=$(CDPATH= cd -- "$(dirname -- "$self")" && pwd -P)
+	if [ ! -f "$herdr_bridge_bun" ] || [ -L "$herdr_bridge_bun" ] || [ ! -x "$herdr_bridge_bun" ]; then
+		echo "omp: managed bridge launch provided an invalid trusted Bun executable" >&2
+		exit 1
+	fi
+	case $0 in
+	/*/*) self=$0; scripts_dir=${0%/*} ;;
+	/*) self=$0; scripts_dir=/ ;;
+	*) echo "omp: managed bridge launch requires an absolute source runner" >&2; exit 1 ;;
+	esac
+	if [ ! -f "$self" ] || [ -L "$self" ]; then
+		echo "omp: managed bridge launch requires a regular source runner" >&2
+		exit 1
+	fi
+	scripts_dir=$(CDPATH= cd -- "$scripts_dir" && pwd -P)
+	self=$scripts_dir/${self##*/}
+	if [ ! -f "$self" ] || [ -L "$self" ]; then
+		echo "omp: managed bridge source runner changed during validation" >&2
+		exit 1
+	fi
+	launch_dir=$scripts_dir
+	bun_executable=$herdr_bridge_bun
+else
+	# Resolve this script's real location when the ordinary dev launcher is a symlink.
+	self=$0
+	while [ -L "$self" ]; do
+		link=$(readlink "$self")
+		case $link in
+		/*) self=$link ;;
+		*) self=$(dirname "$self")/$link ;;
+		esac
+	done
+	scripts_dir=$(CDPATH= cd -- "$(dirname -- "$self")" && pwd -P)
+	launch_dir=${OMP_DEV_LAUNCH_DIR:-${HOME}/.omp/.dev-cwd}
+	bun_executable=bun
+	mkdir -p "$launch_dir"
+fi
 cli=$scripts_dir/../src/cli.ts
 preload=$scripts_dir/omp.ts
 timing_preload=$scripts_dir/../../utils/src/module-timer.ts
-
-launch_dir=${OMP_DEV_LAUNCH_DIR:-${HOME}/.omp/.dev-cwd}
-mkdir -p "$launch_dir"
 
 OMP_LAUNCH_CWD=$PWD
 export OMP_LAUNCH_CWD
 cd "$launch_dir"
 # Herdr 0.7.5 validates the foreground process name. The macOS shell can
 # preserve OMP's identity while still running the development CLI through Bun.
-run_bun() {
-	if [ "${HERDR_ENV:-}" = 1 ] && [ "$(uname -s)" = Darwin ]; then
-		exec -a omp bun "$@"
+restore_herdr_bridge_tokens() {
+	if [ -n "$herdr_host_bridge_token_set" ]; then
+		HERDR_OMP_BRIDGE_TOKEN=$herdr_host_bridge_token
+		export HERDR_OMP_BRIDGE_TOKEN
 	fi
-	exec bun "$@"
+	if [ -n "$herdr_guest_bridge_token_set" ]; then
+		HERDR_OMP_GUEST_BRIDGE_TOKEN=$herdr_guest_bridge_token
+		export HERDR_OMP_GUEST_BRIDGE_TOKEN
+	fi
 }
 
-if [ -n "${PI_TIMING:-}" ]; then
-	run_bun --preload "$preload" --preload "$timing_preload" "$cli" "$@"
+run_bun() {
+	if [ "${HERDR_ENV:-}" = 1 ] && [ "$(uname -s)" = Darwin ]; then
+		restore_herdr_bridge_tokens
+		exec -a omp "$bun_executable" "$@"
+	fi
+	restore_herdr_bridge_tokens
+	exec "$bun_executable" "$@"
+}
+
+if [ -n "$managed_source_build_id" ]; then
+	set -- __managed-source-build-id "$managed_source_build_id" "$@"
 fi
-run_bun --preload "$preload" "$cli" "$@"
+
+if [ -n "${PI_TIMING:-}" ]; then
+	run_bun --no-env-file --preload "$preload" --preload "$timing_preload" "$cli" "$@"
+fi
+run_bun --no-env-file --preload "$preload" "$cli" "$@"

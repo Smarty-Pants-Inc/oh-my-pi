@@ -399,7 +399,10 @@ export interface ToolSession {
 	/** Register cleanup that runs when this session is disposed; returns a handle that removes the cleanup. */
 	registerDisposeCallback?(callback: () => void): (() => void) | void;
 	/** Register cleanup that runs when this ToolSession adopts a different session ID. */
-	registerSessionChangeCallback?(callback: () => void, options?: { onDiscard?: () => void }): (() => void) | void;
+	registerSessionChangeCallback?(
+		callback: () => void,
+		options?: { onDiscard?: () => void; onRollback?: () => void },
+	): (() => void) | void;
 	/** Queue late LSP diagnostics (arrived after an edit/write returned) to be shown
 	 *  in the transcript and delivered to the model at the next yield, like background
 	 *  job results. */

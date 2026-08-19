@@ -7,6 +7,7 @@ import { APP_NAME } from "@oh-my-pi/pi-utils";
 import { Args, Command } from "@oh-my-pi/pi-utils/cli";
 import { parseArgs } from "../cli/args";
 import { joinHelp as commandHelp } from "../cli/command-help";
+import { takeHerdrHostBridge } from "../collab/herdr-bridge-bootstrap";
 import { runRootCommand } from "../main";
 
 export default class Join extends Command {
@@ -35,6 +36,6 @@ export default class Join extends Command {
 		}
 		const parsed = parseArgs([]);
 		parsed.join = link;
-		await runRootCommand(parsed, []);
+		await runRootCommand(parsed, [], { herdrHostBridge: takeHerdrHostBridge() });
 	}
 }

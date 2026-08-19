@@ -216,9 +216,12 @@ export class CollabHost {
 	#busUnsubscribers: (() => void)[] = [];
 	#registryUnsubscribe?: () => void;
 	#stopped = false;
+	#entryAppendedUnsubscribe?: () => void;
 
 	#trustedLocalTransport = false;
+	#privateHost = false;
 	#requiresHerdrAttribution = false;
+	#onTerminated?: (reason: string) => void;
 	constructor(ctx: InteractiveModeContext) {
 		this.#ctx = ctx;
 	}
@@ -251,7 +254,12 @@ export class CollabHost {
 	}
 
 	requestGuestUi(request: CollabUiRequestDraft, signal?: AbortSignal): Promise<CollabGuestUiResult> | null {
-		if (!this.#socket || !this.#hasWritablePeers()) return null;
+		if (
+			(this.#privateHost && this.#ctx.sessionManager.getSessionId() !== this.#sessionId) ||
+			!this.#socket ||
+			!this.#hasWritablePeers()
+		)
+			return null;
 		const reqId = ++this.#uiReqSeq;
 		const fullRequest: CollabUiRequest = { ...request, reqId };
 		const { promise, resolve } = Promise.withResolvers<CollabGuestUiResult>();
@@ -302,9 +310,14 @@ export class CollabHost {
 		await this.startWithTransport(new CollabSocket({ wsUrl: parsed.wsUrl, role: "host", key }));
 	}
 
-	/** Start over a local trusted transport instead of a relay link. */
-	async startWithTransport(transport: CollabTransport, opts: { trustedLocal?: boolean } = {}): Promise<void> {
+	/** Start over an injected transport instead of a relay link. */
+	async startWithTransport(
+		transport: CollabTransport,
+		opts: { trustedLocal?: boolean; privateHost?: boolean; onTerminated?: (reason: string) => void } = {},
+	): Promise<void> {
 		this.#trustedLocalTransport = opts.trustedLocal === true;
+		this.#privateHost = opts.privateHost === true;
+		this.#onTerminated = opts.onTerminated;
 		this.#requiresHerdrAttribution = this.#trustedLocalTransport && transport.requiresHerdrAttribution === true;
 		this.#socket = transport;
 		this.#sessionId = this.#ctx.sessionManager.getSessionId();
@@ -337,8 +350,9 @@ export class CollabHost {
 			if (willReconnect) {
 				this.#ctx.showStatus(`Collab relay connection lost (${reason}), reconnecting…`, { dim: true });
 			} else {
+				this.#notifyTerminated(reason);
 				void this.#teardown();
-				this.#ctx.session.emitNotice("warning", `Collab ended: ${reason}`, "collab");
+				this.#emitCollabNotice("warning", `Collab ended: ${reason}`);
 			}
 		};
 		transport.connect();
@@ -369,11 +383,27 @@ export class CollabHost {
 			}
 		}
 		this.#registryUnsubscribe = AgentRegistry.global().onChange(() => this.#scheduleAgentsBroadcast());
-		this.#ctx.sessionManager.onEntryAppended = entry => {
+		const entryListener = (entry: StoredSessionEntry): void => {
 			if (isWireSessionEntry(entry)) this.#broadcast({ t: "entry", entry: shrinkForReplication(entry) });
 			this.#scheduleStateBroadcast();
 		};
-		this.#updateStatusSegment();
+		const subscribeEntryAppended = this.#ctx.sessionManager.subscribeEntryAppended;
+		if (typeof subscribeEntryAppended === "function") {
+			this.#entryAppendedUnsubscribe = subscribeEntryAppended.call(this.#ctx.sessionManager, entryListener);
+		} else {
+			const previous = this.#ctx.sessionManager.onEntryAppended;
+			const handler = (entry: StoredSessionEntry): void => {
+				previous?.(entry);
+				entryListener(entry);
+			};
+			this.#ctx.sessionManager.onEntryAppended = handler;
+			this.#entryAppendedUnsubscribe = () => {
+				if (this.#ctx.sessionManager.onEntryAppended === handler) {
+					this.#ctx.sessionManager.onEntryAppended = previous;
+				}
+			};
+		}
+		if (!this.#privateHost) this.#updateStatusSegment();
 	}
 
 	/** Broadcast a goodbye, detach all taps, and close the socket. */
@@ -386,7 +416,8 @@ export class CollabHost {
 	async #teardown(): Promise<void> {
 		if (this.#stopped) return;
 		this.#stopped = true;
-		this.#ctx.sessionManager.onEntryAppended = undefined;
+		this.#entryAppendedUnsubscribe?.();
+		this.#entryAppendedUnsubscribe = undefined;
 		this.#unsubscribe?.();
 		this.#unsubscribe = undefined;
 		for (const unsubscribe of this.#busUnsubscribers) unsubscribe();
@@ -405,25 +436,51 @@ export class CollabHost {
 		this.#localPeerAuthority.clear();
 		this.#socket?.close();
 		this.#socket = null;
-		this.#ctx.collabHost = undefined;
-		this.#ctx.statusLine.setCollabStatus(null);
-		this.#ctx.ui.requestRender();
+		if (this.#privateHost) {
+			if (this.#ctx.herdrCollabHost === this) this.#ctx.herdrCollabHost = undefined;
+		} else {
+			if (this.#ctx.collabHost === this) this.#ctx.collabHost = undefined;
+			this.#ctx.statusLine.setCollabStatus(null);
+			this.#ctx.ui.requestRender();
+		}
 	}
 
 	#broadcast(frame: CollabFrame): void {
 		if (this.#stopped || !this.#socket) return;
 		if (this.#ctx.sessionManager.getSessionId() !== this.#sessionId) {
+			if (this.#privateHost) return;
 			void this.stop("session switched");
-			this.#ctx.session.emitNotice("warning", "Collab ended: session switched", "collab");
+			this.#emitCollabNotice("warning", "Collab ended: session switched");
 			return;
 		}
 		this.#socket.send(frame);
+	}
+
+	#emitCollabNotice(level: "info" | "warning", message: string): void {
+		if (this.#privateHost) {
+			logger.debug("private Herdr collab notice", { level, message });
+			return;
+		}
+		this.#ctx.session.emitNotice(level, message, "collab");
+	}
+
+	#notifyTerminated(reason: string): void {
+		try {
+			this.#onTerminated?.(reason);
+		} catch (error) {
+			logger.warn("collab host termination observer failed", { error: String(error) });
+		}
 	}
 	#handleFrame(
 		frame: InboundGuestFrame,
 		fromPeer: number,
 		metadata?: { displayName?: string; displayNameRevision?: number },
 	): void {
+		if (this.#privateHost && this.#ctx.sessionManager.getSessionId() !== this.#sessionId) {
+			if (frame.t === "ui-response") this.#pendingUi.get(frame.reqId)?.settle({ kind: "unavailable" });
+			this.#socket?.send({ t: "error", message: "private collab route is rearming for a session switch" }, fromPeer);
+			return;
+		}
 		switch (frame.t) {
 			case "hello":
 				this.#handleHello(frame.name, frame.proto, frame.writeToken, fromPeer);
@@ -512,11 +569,7 @@ export class CollabHost {
 				socket.send({ t: "ui-request", request: pending.request }, fromPeer);
 			}
 		}
-		this.#ctx.session.emitNotice(
-			"info",
-			`${cleanName} joined the collab session${canWrite ? "" : " (read-only)"}`,
-			"collab",
-		);
+		this.#emitCollabNotice("info", `${cleanName} joined the collab session${canWrite ? "" : " (read-only)"}`);
 		this.#updateStatusSegment();
 		this.#scheduleStateBroadcast();
 	}
@@ -627,7 +680,7 @@ export class CollabHost {
 		const name = peer.name;
 		void this.#ctx.session
 			.abort({ reason: USER_INTERRUPT_LABEL })
-			.then(() => this.#ctx.session.emitNotice("info", `${name} interrupted`, "collab"))
+			.then(() => this.#emitCollabNotice("info", `${name} interrupted`))
 			.catch(err => logger.warn("collab guest abort failed", { error: String(err) }));
 	}
 
@@ -635,10 +688,10 @@ export class CollabHost {
 		const name = this.#peers.get(peer)?.name;
 		this.#peers.delete(peer);
 		this.#localPeerAuthority.delete(peer);
-		if (!this.#hasWritablePeers()) {
+		if (!this.#privateHost && !this.#hasWritablePeers()) {
 			for (const pending of [...this.#pendingUi.values()]) pending.settle({ kind: "unavailable" });
 		}
-		if (name) this.#ctx.session.emitNotice("info", `${name} left the collab session`, "collab");
+		if (name) this.#emitCollabNotice("info", `${name} left the collab session`);
 		this.#updateStatusSegment();
 		this.#scheduleStateBroadcast();
 	}
@@ -655,7 +708,7 @@ export class CollabHost {
 				this.#socket?.send({ t: "ui-request", request: pending.request }, peer);
 			}
 		} else {
-			if (!this.#hasWritablePeers()) {
+			if (!this.#privateHost && !this.#hasWritablePeers()) {
 				for (const pending of [...this.#pendingUi.values()]) pending.settle({ kind: "unavailable" });
 			} else {
 				for (const reqId of this.#pendingUi.keys()) this.#socket?.send({ t: "ui-request-end", reqId }, peer);
@@ -831,6 +884,7 @@ export class CollabHost {
 	}
 
 	#updateStatusSegment(): void {
+		if (this.#privateHost) return;
 		this.#ctx.statusLine.setCollabStatus({ role: "host", participantCount: this.#peers.size + 1 });
 		this.#ctx.statusLine.invalidate();
 		this.#ctx.ui.requestRender();

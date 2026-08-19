@@ -6143,7 +6143,7 @@
     },
     {
       "path": "packages/coding-agent/scripts/compile-binary.ts",
-      "sha256": "6700310061aa5008c6028b2d5b136d331985e3b11b8408bef19abdf3d00df01a"
+      "sha256": "c08fa1e74931333b2fa13a1322be3dffa57b7e165f389430a82ee6891baf4404"
     },
     {
       "path": "packages/coding-agent/scripts/generate-docs-index.ts",
@@ -6240,6 +6240,10 @@
     {
       "path": "packages/coding-agent/src/autoresearch/tools/update-notes.ts",
       "sha256": "dd0a397661a350201b60a41c1596aba8fd9f81dad465d6c0d2723ee00418102d"
+    },
+    {
+      "path": "packages/coding-agent/src/build-identity.ts",
+      "sha256": "5d659c2b56358cef7669e2891b927a07609e1fdb7ec2cbd915ee3a487f415c21"
     },
     {
       "path": "packages/coding-agent/src/capability/context-file.ts",
@@ -6339,7 +6343,7 @@
     },
     {
       "path": "packages/coding-agent/src/cli.ts",
-      "sha256": "e4d3ba05a7d5149b38104469b777d347cf7c249640076e0e738fb9b395cfd4a4"
+      "sha256": "e66dd04fd341d16934f1e5f5f8e17cbf8883246e6673de27a196822082b9dc26"
     },
     {
       "path": "packages/coding-agent/src/cli/agents-cli.ts",
@@ -6435,15 +6439,19 @@
     },
     {
       "path": "packages/coding-agent/src/collab/guest.ts",
-      "sha256": "a42596409c493c3b63294050a3177511c1bcf5f9bc5b1896c2f0c467e57bff62"
+      "sha256": "5529f5dd97a7226c8e64b33fbf51fc2d49494d9ce0a7457d12c5d79565cd992d"
+    },
+    {
+      "path": "packages/coding-agent/src/collab/herdr-bridge-bootstrap.ts",
+      "sha256": "95bc2b7222d40c8a2f9dec9fb855909bf23ea917095e2d89832d970fa4a75f53"
     },
     {
       "path": "packages/coding-agent/src/collab/host.ts",
-      "sha256": "338b119120b67f3d6d76e24b9a6035e6485205db6843db1e87bb0588667a9fe2"
+      "sha256": "86e89a27c1b712243a5f48775a963d81222263f645d27dd0d6a91bf347fc7acd"
     },
     {
       "path": "packages/coding-agent/src/collab/local-transport.ts",
-      "sha256": "48bd8fcf28ec36e8145c36e6116beb742e99fe71650c1ef717c305a875a44f07"
+      "sha256": "40b80655549c507740aabb815967aa66e3ece90f5670803ad9862d466b70c9a0"
     },
     {
       "path": "packages/coding-agent/src/collab/protocol.ts",
@@ -6483,7 +6491,7 @@
     },
     {
       "path": "packages/coding-agent/src/commands/collab-bridge.ts",
-      "sha256": "9acff6a1ec468af4d4e5152c419c88601bdcfc188714d9465208304207ee4c26"
+      "sha256": "9af84a682c88c5c08d268ab05437f1356204ca3995b13fb2ae2d9d4e93ccd0a5"
     },
     {
       "path": "packages/coding-agent/src/commands/commit.ts",
@@ -6507,11 +6515,11 @@
     },
     {
       "path": "packages/coding-agent/src/commands/join.ts",
-      "sha256": "503aac112de9276c3d1939af7eed0557c2f297ba97c8371352bb42eec90e289d"
+      "sha256": "8aa9e8f501d55b2da38ef6d8ff462af223a82c3ee9e3c0f61e3c8817317b325f"
     },
     {
       "path": "packages/coding-agent/src/commands/launch.ts",
-      "sha256": "993680798f8574a6f32fedbf8e9645e0931a494a1c21906ddce4f56167a4334e"
+      "sha256": "c7bdbd53af602540b4fd640b9ac7663f5872054ce4825c0190937978867c6dd9"
     },
     {
       "path": "packages/coding-agent/src/commands/models.ts",
@@ -7507,7 +7515,7 @@
     },
     {
       "path": "packages/coding-agent/src/index.ts",
-      "sha256": "a610c46b8cabe469f9a3aeb85eb40d6730d5f68dcd2305d1d8207c62ac0f24cd"
+      "sha256": "f583c37c14ebbea5e3c4f4f5ff466318fa034a18a92f7e2ba1f67ca90fcdb7e4"
     },
     {
       "path": "packages/coding-agent/src/internal-urls/agent-protocol.ts",
@@ -7771,7 +7779,7 @@
     },
     {
       "path": "packages/coding-agent/src/main.ts",
-      "sha256": "038f464e7a88e71ba62d95c561e09c4b2ba898c799a2c31f4242955e40720939"
+      "sha256": "a693276ba28ff726bc1867ad8d1d8d5499a2b57910bc8d9d272ae3f831e627e6"
     },
     {
       "path": "packages/coding-agent/src/markit/converters/docx.ts",
@@ -8115,7 +8123,7 @@
     },
     {
       "path": "packages/coding-agent/src/modes/controllers/extension-ui-controller.ts",
-      "sha256": "f96381261e5d035e2c5779fce922265f3053938a24b2f9c1038280285f5bc063"
+      "sha256": "2d4c8aa17a0b9bf2bed6c85c00b406547a418607e74d98004837b54301e86234"
     },
     {
       "path": "packages/coding-agent/src/modes/controllers/input-controller.ts",
@@ -8139,7 +8147,7 @@
     },
     {
       "path": "packages/coding-agent/src/modes/controllers/selector-controller.ts",
-      "sha256": "5ffcbef341ef3bffdf9ab7483d428d4dc3510fde94b45f9f288b9cfc14129bee"
+      "sha256": "61c165321ad7c41b0a024f702279d09e2ce66ae1f0681672c97fa215c40608b2"
     },
     {
       "path": "packages/coding-agent/src/modes/controllers/session-focus-controller.ts",
@@ -8179,7 +8187,7 @@
     },
     {
       "path": "packages/coding-agent/src/modes/interactive-mode.ts",
-      "sha256": "62b8750772d0b787f5c60217cecd86245dcaa5556eb588e68f87cd4ab91aecee"
+      "sha256": "c4735cf9333aac0ae6c6b12e0b986cd8746e8f041950e15997ca7557412d7ea3"
     },
     {
       "path": "packages/coding-agent/src/modes/loop-limit.ts",
@@ -8423,7 +8431,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/agent-session.ts",
-      "sha256": "a576495e02060ee235ae652f32fd735110816fe1b0f0f313a34b187d393b15ce"
+      "sha256": "71a4d2b8060276dbd18fc31733b9d3f302769bf81bd7ba730a2c829de802eb71"
     },
     {
       "path": "packages/coding-agent/src/session/agent-storage.ts",
@@ -8595,7 +8603,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/session-manager.ts",
-      "sha256": "ccff3a2d3cd1861b8081c1d880aa745051f72b7d40254c4fde2889bc4789d07c"
+      "sha256": "8d35ef7005ff5495bda9e4d7dea30676afdace8ea13a87e5ea184a08b7dc7864"
     },
     {
       "path": "packages/coding-agent/src/session/session-memory.ts",
@@ -9243,7 +9251,7 @@
     },
     {
       "path": "packages/coding-agent/src/tools/index.ts",
-      "sha256": "902becf0483e67fca1c743a884eb990fa40828baddbeb0ff58d8808c76804b93"
+      "sha256": "e0784abf760dae6e50043d157557a51d51a28ab930c1b39bf81e9e8e6b7692e4"
     },
     {
       "path": "packages/coding-agent/src/tools/inspect-image.ts",
@@ -10511,7 +10519,7 @@
     },
     {
       "path": "packages/utils/src/env.ts",
-      "sha256": "8cf09ea58046f49ebd792beb0d6f69cc293d84937cd0fa11e8a901a25f3ea2b6"
+      "sha256": "f2500e55ed9fe124c60d17e73bf938b944ff673205c1dd1db2c4f8302240384a"
     },
     {
       "path": "packages/utils/src/fetch-retry.ts",
@@ -10675,5 +10683,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "ecf9ae3335bfb7993513b1fa2a214a95ceb0fea3e7efc77b7f469ed11fd45b2e"
+  "rootSha256": "3de92a99af2d4ef76622917e04ae1fd54934505782173e48f5b72ce82cb5964f"
 }

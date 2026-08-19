@@ -1,5 +1,10 @@
 import { Command } from "@oh-my-pi/pi-utils/cli";
 import { type Args as ParsedArgs, parseArgs, reportCliUsageError } from "../cli/args";
+import {
+	handoffHerdrGuestBridgeToken,
+	takeHerdrGuestBridgeToken,
+	takeHerdrHostBridge,
+} from "../collab/herdr-bridge-bootstrap";
 import { runRootCommand } from "../main";
 
 function parseNormalArgs(args: string[]): ParsedArgs | null {
@@ -19,19 +24,10 @@ export class CollabHostBridge extends Command {
 	static strict = false;
 
 	async run(): Promise<void> {
+		const bridge = takeHerdrHostBridge();
 		const [ompSessionId, generation, ...args] = this.argv;
-		const address = process.env.HERDR_OMP_BRIDGE;
-		const token = process.env.HERDR_OMP_BRIDGE_TOKEN;
-		const paneId = process.env.HERDR_PANE_ID;
 		const routeGeneration = Number(generation);
-		if (
-			!ompSessionId ||
-			!address ||
-			!token ||
-			!paneId ||
-			!Number.isSafeInteger(routeGeneration) ||
-			routeGeneration < 1
-		) {
+		if (!ompSessionId || !bridge || !Number.isSafeInteger(routeGeneration) || routeGeneration < 1) {
 			throw new Error(
 				"__collab-host-bridge requires <omp-session-id> <route-generation>, HERDR_OMP_BRIDGE, HERDR_OMP_BRIDGE_TOKEN, and HERDR_PANE_ID",
 			);
@@ -39,7 +35,7 @@ export class CollabHostBridge extends Command {
 		const parsed = parseNormalArgs(args);
 		if (!parsed) return;
 		await runRootCommand(parsed, args, {
-			collabBridge: { role: "host", address, token, paneId, ompSessionId, routeGeneration },
+			collabBridge: { role: "host", ...bridge, ompSessionId, routeGeneration },
 		});
 	}
 }
@@ -49,8 +45,20 @@ export class CollabGuestBridge extends Command {
 	static strict = false;
 
 	async run(): Promise<void> {
-		const [address, roomId, token, ...args] = this.argv;
-		if (!address || !roomId || !token) throw new Error("__collab-guest-bridge requires <address> <room-id> <token>");
+		let [address, roomId, tokenArg, ...args] = this.argv;
+		if (tokenArg && tokenArg !== "--token-env") {
+			handoffHerdrGuestBridgeToken(tokenArg);
+			tokenArg = "--token-env";
+		}
+		if (tokenArg !== "--token-env") {
+			throw new Error("__collab-guest-bridge requires <address> <room-id> --token-env");
+		}
+		const token = takeHerdrGuestBridgeToken();
+		if (!address || !roomId || !token) {
+			throw new Error(
+				"__collab-guest-bridge requires <address> <room-id> --token-env with HERDR_OMP_GUEST_BRIDGE_TOKEN",
+			);
+		}
 		const parsed = parseNormalArgs(args);
 		if (!parsed) return;
 		await runRootCommand(parsed, args, { collabBridge: { role: "guest", address, roomId, token } });
