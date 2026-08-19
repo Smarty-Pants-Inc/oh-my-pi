@@ -17,6 +17,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { configureCredentialRedaction } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import { configureProviderMaxInFlightRequests } from "@oh-my-pi/pi-ai/stream";
+import { shouldEnableHyperlinks, TERMINAL } from "@oh-my-pi/pi-tui";
 import {
 	getAgentDbPath,
 	getAgentDir,
@@ -51,6 +52,10 @@ import {
 	type SettingPath,
 	type SettingValue,
 } from "./settings-schema";
+
+function applyHyperlinkSetting(mode: SettingValue<"tui.hyperlinks">): void {
+	TERMINAL.hyperlinks = shouldEnableHyperlinks(mode, Bun.env, TERMINAL.id, process.stdout.isTTY === true);
+}
 
 // Re-export types that callers need
 export type * from "./settings-schema";
@@ -552,6 +557,9 @@ export class Settings {
 
 	#fireEffectiveSettingChanged(path: SettingPath, value: unknown, prev: unknown): void {
 		if (Object.is(value, prev)) return;
+		if (path === "tui.hyperlinks") {
+			applyHyperlinkSetting(value as SettingValue<"tui.hyperlinks">);
+		}
 		if (path === "statusLine.sessionAccent") {
 			statusLineSessionAccentSignal.fire();
 		}
@@ -2222,6 +2230,7 @@ export class Settings {
 	}
 
 	#fireAllHooks(): void {
+		applyHyperlinkSetting(this.get("tui.hyperlinks"));
 		for (const key of Object.keys(SETTING_HOOKS) as SettingPath[]) {
 			const hook = SETTING_HOOKS[key];
 			if (hook) {

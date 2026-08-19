@@ -20,6 +20,9 @@ const ST = "\x1b\\";
 const BEL = "\x07";
 const LINK_END = `${OSC}8;;${ST}`;
 const ORIGINAL_NO_COLOR = Bun.env.NO_COLOR;
+const ORIGINAL_HERDR_ENV = Bun.env.HERDR_ENV;
+const ORIGINAL_PI_NO_HYPERLINKS = Bun.env.PI_NO_HYPERLINKS;
+const ORIGINAL_PI_FORCE_HYPERLINKS = Bun.env.PI_FORCE_HYPERLINKS;
 
 /** Extract the hyperlink URI from a wrapped string. Returns undefined if not wrapped. */
 function extractLinkUri(text: string): string | undefined {
@@ -51,12 +54,27 @@ afterAll(() => {
 });
 
 afterEach(() => {
-	settings.clearOverride("tui.hyperlinks");
 	if (ORIGINAL_NO_COLOR === undefined) {
 		delete Bun.env.NO_COLOR;
 	} else {
 		Bun.env.NO_COLOR = ORIGINAL_NO_COLOR;
 	}
+	if (ORIGINAL_HERDR_ENV === undefined) {
+		delete Bun.env.HERDR_ENV;
+	} else {
+		Bun.env.HERDR_ENV = ORIGINAL_HERDR_ENV;
+	}
+	if (ORIGINAL_PI_NO_HYPERLINKS === undefined) {
+		delete Bun.env.PI_NO_HYPERLINKS;
+	} else {
+		Bun.env.PI_NO_HYPERLINKS = ORIGINAL_PI_NO_HYPERLINKS;
+	}
+	if (ORIGINAL_PI_FORCE_HYPERLINKS === undefined) {
+		delete Bun.env.PI_FORCE_HYPERLINKS;
+	} else {
+		Bun.env.PI_FORCE_HYPERLINKS = ORIGINAL_PI_FORCE_HYPERLINKS;
+	}
+	settings.clearOverride("tui.hyperlinks");
 });
 
 describe("isHyperlinkEnabled", () => {
@@ -84,11 +102,13 @@ describe("isHyperlinkEnabled", () => {
 	it("returns false in auto mode when NO_COLOR is set", () => {
 		setHyperlinkMode("auto");
 		Bun.env.NO_COLOR = "1";
+		delete Bun.env.HERDR_ENV;
 		expect(isHyperlinkEnabled()).toBe(false);
 	});
 
 	it("returns false in auto mode when stdout is not a TTY", () => {
 		setHyperlinkMode("auto");
+		delete Bun.env.HERDR_ENV;
 		const origTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
 		try {
 			Object.defineProperty(process.stdout, "isTTY", { value: false, configurable: true });
@@ -102,23 +122,43 @@ describe("isHyperlinkEnabled", () => {
 		}
 	});
 
-	it("returns TERMINAL.hyperlinks value in auto mode when conditions are met", () => {
+	it("keeps OSC 8 hyperlinks enabled in Herdr's headless guest", () => {
 		setHyperlinkMode("auto");
-		delete Bun.env.NO_COLOR;
+		Bun.env.NO_COLOR = "1";
+		Bun.env.HERDR_ENV = "1";
 		const origTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+		const terminalState = terminalCaps.TERMINAL as unknown as { hyperlinks: boolean };
+		const origHyperlinks = terminalState.hyperlinks;
 		try {
-			Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
-			// TERMINAL.hyperlinks may be true or false depending on the test runner env;
-			// what matters is that isHyperlinkEnabled mirrors it.
-			const expected = terminalCaps.TERMINAL.hyperlinks;
-			expect(isHyperlinkEnabled()).toBe(expected);
+			Object.defineProperty(process.stdout, "isTTY", { value: false, configurable: true });
+			terminalState.hyperlinks = false;
+			expect(isHyperlinkEnabled()).toBe(true);
 		} finally {
+			terminalState.hyperlinks = origHyperlinks;
 			if (origTTY) {
 				Object.defineProperty(process.stdout, "isTTY", origTTY);
 			} else {
 				Reflect.deleteProperty(process.stdout, "isTTY");
 			}
 		}
+	});
+
+	it("lets PI_NO_HYPERLINKS disable Herdr and always mode", () => {
+		Bun.env.HERDR_ENV = "1";
+		Bun.env.PI_NO_HYPERLINKS = "1";
+		setHyperlinkMode("off");
+		setHyperlinkMode("always");
+		expect(isHyperlinkEnabled()).toBe(false);
+		expect(terminalCaps.TERMINAL.hyperlinks).toBe(false);
+		expect(urlHyperlinkAlways("https://example.com/path", "example")).toBe("example");
+	});
+
+	it("synchronizes tui.hyperlinks with global Markdown and status emitters", () => {
+		Bun.env.HERDR_ENV = "1";
+		setHyperlinkMode("off");
+		expect(terminalCaps.TERMINAL.hyperlinks).toBe(false);
+		setHyperlinkMode("auto");
+		expect(terminalCaps.TERMINAL.hyperlinks).toBe(true);
 	});
 });
 
@@ -254,6 +294,7 @@ describe("urlHyperlinkAlways", () => {
 	it("wraps HTTP URLs in auto mode even when capability detection would suppress", () => {
 		setHyperlinkMode("auto");
 		Bun.env.NO_COLOR = "1"; // forces isHyperlinkEnabled() to false in auto mode
+		delete Bun.env.HERDR_ENV;
 		const result = urlHyperlinkAlways("www.example.com/path", "example");
 
 		expect(isHyperlinkEnabled()).toBe(false);

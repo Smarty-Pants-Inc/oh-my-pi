@@ -6,7 +6,7 @@
  * permits it. Falls back to plain text when disabled.
  */
 import * as url from "node:url";
-import { TERMINAL } from "@oh-my-pi/pi-tui";
+import { hyperlinksUserOverride, shouldEnableHyperlinks, TERMINAL } from "@oh-my-pi/pi-tui";
 import { isSettingsInitialized, settings } from "../config/settings";
 import {
 	LocalProtocolHandler,
@@ -43,19 +43,13 @@ function buildFileUri(filePath: string, opts?: { line?: number; col?: number }):
  *
  * Respects `tui.hyperlinks` setting:
  * - `"off"`: never
- * - `"auto"`: when `process.stdout.isTTY`, `NO_COLOR` is unset, and the detected terminal reports hyperlink support
+ * - `"auto"`: always in Herdr (which consumes OSC 8 as metadata); otherwise when stdout is a TTY and `NO_COLOR` is unset
  * - `"always"`: unconditionally (useful for viewers that support OSC 8 without advertising it)
  * Before settings initialization, returns false so early render paths stay plain text.
  */
 export function isHyperlinkEnabled(): boolean {
 	if (!isSettingsInitialized()) return false;
-	const mode = settings.get("tui.hyperlinks");
-	if (mode === "off") return false;
-	if (mode === "always") return true;
-	// auto: respect terminal capabilities and NO_COLOR
-	if (Bun.env.NO_COLOR) return false;
-	if (!process.stdout.isTTY) return false;
-	return TERMINAL.hyperlinks;
+	return shouldEnableHyperlinks(settings.get("tui.hyperlinks"), Bun.env, TERMINAL.id, process.stdout.isTTY === true);
 }
 
 function safeHyperlinkUri(uri: string): string | undefined {
@@ -111,7 +105,7 @@ export function urlHyperlink(url: string, displayText: string): string {
  */
 export function urlHyperlinkAlways(url: string, displayText: string): string {
 	if (!isSettingsInitialized()) return displayText;
-	if (settings.get("tui.hyperlinks") === "off") return displayText;
+	if (settings.get("tui.hyperlinks") === "off" || hyperlinksUserOverride(Bun.env) === false) return displayText;
 	const normalized = url.match(/^www\./i) ? `https://${url}` : url;
 	try {
 		const parsed = new URL(normalized);

@@ -364,6 +364,8 @@ export function hyperlinksUserOverride(env: NodeJS.ProcessEnv = Bun.env): boolea
 	return null;
 }
 
+export type HyperlinkMode = "off" | "auto" | "always";
+
 /**
  * Parse tmux's self-reported version from `TERM_PROGRAM_VERSION`. tmux sets
  * `TERM_PROGRAM=tmux` and `TERM_PROGRAM_VERSION=<version>` automatically since
@@ -381,11 +383,14 @@ function parseTmuxVersionFromEnv(env: NodeJS.ProcessEnv): { major: number; minor
  * Policy (highest precedence first):
  *   1. Explicit user override (`PI_NO_HYPERLINKS=1` off, `PI_FORCE_HYPERLINKS=1`
  *      on). Opt-out wins ties.
- *   2. Static terminal capability — terminals whose {@link TerminalInfo} marks
- *      `hyperlinks: false` (e.g. `base`) stay off unless the user forced on.
- *   3. GNU screen's explicit session marker (`STY`) always off, even if tmux is
+ *   2. A direct Herdr pane enables hyperlinks because Herdr parses and activates
+ *      OSC 8 itself. Nested tmux/screen/zellij layers still use the conservative
+ *      multiplexer policy below.
+ *   3. Static terminal capability — terminals whose {@link TerminalInfo} marks
+ *      `hyperlinks: false` (e.g. `base`) stay off unless Herdr or the user forced on.
+ *   4. GNU screen's explicit session marker (`STY`) always off, even if tmux is
  *      also present: a screen layer anywhere in the path cannot forward OSC 8.
- *   4. tmux session (`TMUX` set): enabled when tmux self-reports >= 3.4 via
+ *   5. tmux session (`TMUX` set): enabled when tmux self-reports >= 3.4 via
  *      `TERM_PROGRAM_VERSION` (tmux 3.4 stores OSC 8 as a cell attribute and
  *      forwards it to outer terminals whose `terminal-features` include
  *      `hyperlinks`). Older or unknown versions stay off; on outer terminals
@@ -393,11 +398,11 @@ function parseTmuxVersionFromEnv(env: NodeJS.ProcessEnv): { major: number; minor
  *      identical to today. Checked before the screen-family TERM heuristic
  *      because tmux's historical `default-terminal` is `screen-256color`, so
  *      `TERM=screen*` inside a tmux session must NOT short-circuit to off.
- *   5. screen-family TERM without `TMUX` always off: screen never gained OSC 8
+ *   6. screen-family TERM without `TMUX` always off: screen never gained OSC 8
  *      support.
- *   6. tmux-family TERM without `TMUX` env — unusual (e.g. inspection scripts);
+ *   7. tmux-family TERM without `TMUX` env — unusual (e.g. inspection scripts);
  *      no version available, so off.
- *   7. Otherwise honor the static terminal capability.
+ *   8. Otherwise honor the static terminal capability.
  */
 export function shouldEnableHyperlinksByDefault(
 	env: NodeJS.ProcessEnv = Bun.env,
@@ -405,6 +410,18 @@ export function shouldEnableHyperlinksByDefault(
 ): boolean {
 	const override = hyperlinksUserOverride(env);
 	if (override !== null) return override;
+
+	const term = env.TERM?.toLowerCase() ?? "";
+	if (
+		env.HERDR_ENV === "1" &&
+		!env.TMUX &&
+		!env.STY &&
+		!env.ZELLIJ &&
+		!term.startsWith("screen") &&
+		!term.startsWith("tmux")
+	) {
+		return true;
+	}
 
 	if (!getTerminalInfo(terminalId).hyperlinks) return false;
 
@@ -422,11 +439,26 @@ export function shouldEnableHyperlinksByDefault(
 		return version.major > 3 || (version.major === 3 && version.minor >= 4);
 	}
 
-	const term = env.TERM?.toLowerCase() ?? "";
 	if (term.startsWith("screen")) return false;
 	if (term.startsWith("tmux")) return false;
 
 	return true;
+}
+
+/** Resolve terminal capability, environment overrides, and the user-facing hyperlink mode. */
+export function shouldEnableHyperlinks(
+	mode: HyperlinkMode,
+	env: NodeJS.ProcessEnv = Bun.env,
+	terminalId: TerminalId = TERMINAL_ID,
+	stdoutIsTty: boolean = process.stdout.isTTY === true,
+): boolean {
+	const override = hyperlinksUserOverride(env);
+	if (override === false || mode === "off") return false;
+	if (mode === "always" || override === true) return true;
+	const supported = shouldEnableHyperlinksByDefault(env, terminalId);
+	if (env.HERDR_ENV === "1") return supported;
+	if (env.NO_COLOR || !stdoutIsTty) return false;
+	return supported;
 }
 
 function getFallbackImageProtocol(terminalId: TerminalId): ImageProtocol | null {
@@ -559,8 +591,8 @@ export const TERMINAL: RuntimeTerminal = (() => {
 	}
 	// Hyperlink (OSC 8) capability. The static per-terminal flag lives on
 	// KNOWN_TERMINALS; shouldEnableHyperlinksByDefault folds in runtime context —
-	// PI_FORCE_HYPERLINKS / PI_NO_HYPERLINKS overrides plus a tmux>=3.4 gate so
-	// modern tmux forwards OSC 8 to outer terminals that opt in via
+	// user overrides, direct Herdr panes, and a tmux>=3.4 gate so modern tmux
+	// forwards OSC 8 to outer terminals that opt in via
 	// `terminal-features "*:hyperlinks"`.
 	resolved.hyperlinks = shouldEnableHyperlinksByDefault(Bun.env, resolved.id);
 	// DECCARA rectangular-SGR background fills. The static per-terminal capability
