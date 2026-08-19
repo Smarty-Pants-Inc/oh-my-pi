@@ -1,4 +1,8 @@
 import { describe, expect, test, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { resolveProviderModels } from "@oh-my-pi/pi-catalog/model-manager";
 import { lmStudioModelManagerOptions } from "@oh-my-pi/pi-catalog/provider-models/openai-compat";
 import type { FetchImpl } from "@oh-my-pi/pi-catalog/types";
 
@@ -50,6 +54,52 @@ describe("lm studio local provider discovery", () => {
 		expect(vision?.contextWindow).toBe(262144);
 		expect(text?.input).toEqual(["text"]);
 		expect(qwen38?.reasoning).toBe(true);
+	});
+
+	test("refetches stale cached Qwen 3.8+ rows with reasoning disabled", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-catalog-lm-studio-qwen-cache-"));
+		const dbPath = path.join(tempDir, "models.db");
+		const baseUrl = "http://127.0.0.1:1234/v1";
+		const modelId = "Qwen3.8-27B-UD-Q6_K_XL";
+		const requestedUrls: string[] = [];
+		const fetchMock: FetchImpl = vi.fn(async input => {
+			requestedUrls.push(String(input));
+			return new Response(JSON.stringify({ data: [{ id: modelId }] }), {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			});
+		});
+
+		try {
+			const discovered = await lmStudioModelManagerOptions({ baseUrl, fetch: fetchMock }).fetchDynamicModels?.();
+			const model = discovered?.find(candidate => candidate.id === modelId);
+			if (!model) throw new Error("LM Studio Qwen fixture was not discovered");
+
+			await resolveProviderModels(
+				{
+					providerId: "lm-studio",
+					staticModels: [],
+					cacheDbPath: dbPath,
+					fetchDynamicModels: async () => [{ ...model, reasoning: false }],
+				},
+				"online",
+			);
+			requestedUrls.length = 0;
+
+			const refreshed = await resolveProviderModels(
+				{
+					...lmStudioModelManagerOptions({ baseUrl, fetch: fetchMock }),
+					staticModels: [],
+					cacheDbPath: dbPath,
+				},
+				"online-if-uncached",
+			);
+
+			expect(requestedUrls).toContain("http://127.0.0.1:1234/v1/models");
+			expect(refreshed.models.find(candidate => candidate.id === modelId)?.reasoning).toBe(true);
+		} finally {
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
 	});
 
 	test("prefers the loaded context window over the architectural maximum", async () => {

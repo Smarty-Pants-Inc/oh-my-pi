@@ -5123,7 +5123,7 @@
     },
     {
       "path": "packages/ai/src/providers/openai-reasoning-fallback.ts",
-      "sha256": "5374589bc5fb413d9ebf29249a850262bb894ed75cee467a80763b6b38eec466"
+      "sha256": "0599ef151960613592fdc89ece1a22e8801301995048052fde87de59ae5c6d30"
     },
     {
       "path": "packages/ai/src/providers/openai-responses-server-schema.ts",
@@ -6095,7 +6095,7 @@
     },
     {
       "path": "packages/catalog/src/provider-models/openai-compat.ts",
-      "sha256": "10bf8ba5b9caa6f152159df5ee7c099469f2878cfa2b983c3251fdf9e03af85b"
+      "sha256": "8d9fdaef4841814787c8cee5299e1fdef43c1f73819e8937860a0b66e84774c1"
     },
     {
       "path": "packages/catalog/src/provider-models/special.ts",
@@ -6823,7 +6823,7 @@
     },
     {
       "path": "packages/coding-agent/src/context/manifest.ts",
-      "sha256": "db221c785504a871380e302f0b5ccfb6e727d8543776665f8d8115644dcc97a4"
+      "sha256": "b6d9edd615a3244bf997aa947b3d2e75d18500d7d160636d072b62d54dda5870"
     },
     {
       "path": "packages/coding-agent/src/context/prompt-sources.generated.ts",
@@ -7407,7 +7407,7 @@
     },
     {
       "path": "packages/coding-agent/src/extensibility/plugins/legacy-pi-compat.ts",
-      "sha256": "676025997c2624d87fddcbf12653b555485eb16a6a7a8813fd010c7920d83143"
+      "sha256": "e731effb8ad7c77d6c4421a4ea254649cde12d5731d30fad8f1ac0ce833ce718"
     },
     {
       "path": "packages/coding-agent/src/extensibility/plugins/loader.ts",
@@ -10683,5 +10683,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "576cd0b06cf488f8d0de2912922386e0c6f03ca5574301f05d39c70349e0844f"
+  "rootSha256": "dd8fda5b3d097196131b69ce8429ab6ca8b121385d4d00ca75348a8943c612bd"
 }

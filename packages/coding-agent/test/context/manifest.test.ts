@@ -168,6 +168,87 @@ describe("tracked context manifest", () => {
 		}
 	});
 
+	it("rejects tracked byte drift hidden by Git worktree flags", async () => {
+		const repositoryRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-hidden-extension-drift-"));
+		const packageRoot = path.join(repositoryRoot, "packages/plugin");
+		const indexPath = path.join(packageRoot, "src/index.ts");
+		const storePath = path.join(packageRoot, "src/store.ts");
+		const relativeStorePath = "packages/plugin/src/store.ts";
+		const originalStore = "export const value = 1;\n";
+		const runGit = (...args: string[]): string => {
+			const result = Bun.spawnSync(["git", ...args], { cwd: repositoryRoot, stdout: "pipe", stderr: "pipe" });
+			if (result.exitCode !== 0) throw new Error(result.stderr.toString());
+			return result.stdout.toString().trim();
+		};
+		try {
+			await fs.mkdir(path.dirname(indexPath), { recursive: true });
+			await Promise.all([
+				Bun.write(path.join(packageRoot, "package.json"), '{"name":"hidden-drift-plugin","type":"module"}\n'),
+				Bun.write(indexPath, 'import "./store.js";\nexport default function plugin() {}\n'),
+				Bun.write(storePath, originalStore),
+			]);
+			runGit("init", "-q");
+			runGit("config", "user.name", "OMP Test");
+			runGit("config", "user.email", "omp-test@example.com");
+			runGit("remote", "add", "origin", "https://github.com/Smarty-Pants-Inc/smarty-dev.git");
+			runGit("add", ".");
+			runGit("commit", "-qm", "approved hidden-drift package");
+			const commit = runGit("rev-parse", "HEAD");
+			const tree = runGit("rev-parse", "HEAD^{tree}");
+			const release = {
+				candidates: [{ repository: "Smarty-Pants-Inc/smarty-dev", commit, tree }],
+			} as unknown as Parameters<typeof isApprovedCandidateSource>[1];
+
+			expect(await isApprovedCandidateSource(indexPath, release)).toBe(true);
+			for (const [hideFlag, showFlag] of [
+				["--assume-unchanged", "--no-assume-unchanged"],
+				["--skip-worktree", "--no-skip-worktree"],
+			] as const) {
+				runGit("update-index", hideFlag, relativeStorePath);
+				await Bun.write(storePath, `export const value = ${JSON.stringify(hideFlag)};\n`);
+				expect(runGit("status", "--porcelain=v1", "--", relativeStorePath)).toBe("");
+				expect(await isApprovedCandidateSource(indexPath, release)).toBe(false);
+				await Bun.write(storePath, originalStore);
+				runGit("update-index", showFlag, relativeStorePath);
+				expect(await isApprovedCandidateSource(indexPath, release)).toBe(true);
+			}
+		} finally {
+			await fs.rm(repositoryRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("approves an unchanged repository-root extension package", async () => {
+		const repositoryRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-root-extension-"));
+		const indexPath = path.join(repositoryRoot, "src/index.ts");
+		const runGit = (...args: string[]): string => {
+			const result = Bun.spawnSync(["git", ...args], { cwd: repositoryRoot, stdout: "pipe", stderr: "pipe" });
+			if (result.exitCode !== 0) throw new Error(result.stderr.toString());
+			return result.stdout.toString().trim();
+		};
+		try {
+			await fs.mkdir(path.dirname(indexPath), { recursive: true });
+			await Promise.all([
+				Bun.write(path.join(repositoryRoot, "package.json"), '{"name":"root-plugin","type":"module"}\n'),
+				Bun.write(indexPath, "export default function plugin() {}\n"),
+			]);
+			runGit("init", "-q");
+			runGit("config", "user.name", "OMP Test");
+			runGit("config", "user.email", "omp-test@example.com");
+			runGit("remote", "add", "origin", "https://github.com/Smarty-Pants-Inc/smarty-dev.git");
+			runGit("add", ".");
+			runGit("commit", "-qm", "approved root package");
+			const commit = runGit("rev-parse", "HEAD");
+			const tree = runGit("rev-parse", "HEAD^{tree}");
+			const release = {
+				candidates: [{ repository: "Smarty-Pants-Inc/smarty-dev", commit, tree }],
+			} as unknown as Parameters<typeof isApprovedCandidateSource>[1];
+
+			expect(await isApprovedCandidateSource(indexPath, release)).toBe(true);
+		} finally {
+			await fs.rm(repositoryRoot, { recursive: true, force: true });
+		}
+	});
+
 	it("rejects extension graphs that escape their approved package or lack a candidate package root", async () => {
 		const repositoryRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-contained-extension-"));
 		const directRoot = path.join(repositoryRoot, "packages/direct");

@@ -2,11 +2,11 @@ import { extractHttpStatusFromError } from "@oh-my-pi/pi-utils";
 import type { CapturedHttpErrorResponse } from "../utils/http-inspector";
 
 /** @internal */
-export type OpenAIReasoningEffortFallback = string | null;
+export type OpenAIReasoningEffortFallback = readonly (readonly [rejectedEffort: string, fallback: string | null])[];
 
 /** @internal */
 export interface OpenAIReasoningEffortFallbackState {
-	reasoningEffortFallbacks: Map<string, OpenAIReasoningEffortFallback>;
+	reasoningEffortFallbacks: Map<string, Map<string, string | null>>;
 }
 
 const ENABLED_REASONING_VALUES = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
@@ -43,7 +43,8 @@ export function getOpenAIReasoningEffortFallback(
 	state: OpenAIReasoningEffortFallbackState | undefined,
 	key: string,
 ): OpenAIReasoningEffortFallback | undefined {
-	return state?.reasoningEffortFallbacks.get(key);
+	const remembered = state?.reasoningEffortFallbacks.get(key);
+	return remembered ? [...remembered] : undefined;
 }
 
 /** @internal */
@@ -52,7 +53,13 @@ export function rememberOpenAIReasoningEffortFallback(
 	key: string,
 	fallback: OpenAIReasoningEffortFallback,
 ): void {
-	state?.reasoningEffortFallbacks.set(key, fallback);
+	if (!state) return;
+	let remembered = state.reasoningEffortFallbacks.get(key);
+	if (!remembered) {
+		remembered = new Map();
+		state.reasoningEffortFallbacks.set(key, remembered);
+	}
+	for (const [rejectedEffort, replacement] of fallback) remembered.set(rejectedEffort, replacement);
 }
 
 /** @internal */
@@ -93,30 +100,35 @@ function deleteReasoningEffort(reasoning: Record<string, unknown>, parent: Recor
 /** @internal */
 export function applyOpenAIReasoningEffortFallback(params: unknown, fallback: OpenAIReasoningEffortFallback): boolean {
 	if (!isRecord(params)) return false;
+	const currentEffort = readOpenAIReasoningEffort(params)?.toLowerCase();
+	if (!currentEffort) return false;
+	const scopedFallback = fallback.find(([rejectedEffort]) => rejectedEffort === currentEffort);
+	if (!scopedFallback) return false;
+	const replacement = scopedFallback[1];
 	let changed = false;
 	if (typeof params.reasoning_effort === "string") {
-		if (fallback === null) {
+		if (replacement === null) {
 			delete params.reasoning_effort;
 		} else {
-			params.reasoning_effort = fallback;
+			params.reasoning_effort = replacement;
 		}
 		changed = true;
 	}
 	const reasoning = params.reasoning;
 	if (isRecord(reasoning) && typeof reasoning.effort === "string") {
-		if (fallback === null) {
+		if (replacement === null) {
 			changed = deleteReasoningEffort(reasoning, params) || changed;
 		} else {
-			reasoning.effort = fallback;
+			reasoning.effort = replacement;
 			changed = true;
 		}
 	}
 	const chatTemplateKwargs = params.chat_template_kwargs;
 	if (isRecord(chatTemplateKwargs) && typeof chatTemplateKwargs.reasoning_effort === "string") {
-		if (fallback === null) {
+		if (replacement === null) {
 			delete chatTemplateKwargs.reasoning_effort;
 		} else {
-			chatTemplateKwargs.reasoning_effort = fallback;
+			chatTemplateKwargs.reasoning_effort = replacement;
 		}
 		changed = true;
 	}
@@ -271,6 +283,10 @@ function nearestEnabledReasoningFallback(currentEffort: string, allowed: Set<str
 	return best;
 }
 
+function scopedReasoningEffortFallback(rejectedEffort: string, fallback: string | null): OpenAIReasoningEffortFallback {
+	return [[rejectedEffort, fallback]];
+}
+
 /** @internal */
 export function resolveOpenAIReasoningEffortFallback(
 	error: unknown,
@@ -284,12 +300,20 @@ export function resolveOpenAIReasoningEffortFallback(
 	const message = collectMessageParts(error, captured);
 	const allowed = parseAllowedReasoningValues(message, currentEffort);
 	const normalizedCurrent = currentEffort.toLowerCase();
-	if (allowed === undefined) return null;
+	if (allowed === undefined) return scopedReasoningEffortFallback(normalizedCurrent, null);
 	if (options?.explicitDisable) {
-		if (normalizedCurrent !== "none" && allowed.has("none")) return "none";
+		if (normalizedCurrent !== "none" && allowed.has("none")) {
+			return scopedReasoningEffortFallback(normalizedCurrent, "none");
+		}
 		const fallback = lowestEnabledAllowedValue(allowed);
-		return fallback && fallback !== normalizedCurrent ? fallback : null;
+		return scopedReasoningEffortFallback(
+			normalizedCurrent,
+			fallback && fallback !== normalizedCurrent ? fallback : null,
+		);
 	}
-	if (normalizedCurrent === "none") return null;
-	return nearestEnabledReasoningFallback(normalizedCurrent, allowed) ?? null;
+	if (normalizedCurrent === "none") return scopedReasoningEffortFallback(normalizedCurrent, null);
+	return scopedReasoningEffortFallback(
+		normalizedCurrent,
+		nearestEnabledReasoningFallback(normalizedCurrent, allowed) ?? null,
+	);
 }

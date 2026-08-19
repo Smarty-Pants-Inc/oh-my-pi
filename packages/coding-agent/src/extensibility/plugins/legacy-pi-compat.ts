@@ -101,6 +101,8 @@ interface BindingScope {
 interface ScopedAstNode {
 	readonly node: StructuralAstNode;
 	readonly scope: BindingScope;
+	readonly parent: StructuralAstNode | null;
+	readonly parentKey: string | null;
 	readonly order: number;
 }
 
@@ -352,7 +354,15 @@ function collectScopedAstNodes(root: unknown, select: (node: StructuralAstNode) 
 					};
 		if (activeScope) {
 			registerScopeBindings(item.node, activeScope);
-			if (select(item.node)) selected.push({ node: item.node, scope: activeScope, order });
+			if (select(item.node)) {
+				selected.push({
+					node: item.node,
+					scope: activeScope,
+					parent: item.parent,
+					parentKey: item.parentKey,
+					order,
+				});
+			}
 		}
 		order++;
 
@@ -460,10 +470,36 @@ function staticObjectPropertyName(node: StructuralAstNode): string | null {
 	return key?.type === "StringLiteral" && typeof key.value === "string" ? key.value : null;
 }
 
+interface ExtensionGraphProof {
+	provable: boolean;
+}
+
+function isImportMetaUrl(node: StructuralAstNode | null): boolean {
+	if (node?.type !== "MemberExpression" || staticMemberPropertyName(node) !== "url") return false;
+	const object = asAstNode(node.object);
+	return (
+		object?.type === "MetaProperty" &&
+		isIdentifier(asAstNode(object.meta), "import") &&
+		isIdentifier(asAstNode(object.property), "meta")
+	);
+}
+
+function isGraphResolvableSpecifier(specifier: string): boolean {
+	return (
+		specifier.startsWith(".") ||
+		specifier.startsWith("#") ||
+		specifier.startsWith("node:") ||
+		specifier.startsWith("bun:") ||
+		isBuiltin(specifier) ||
+		isBareExtensionDependencySpecifier(specifier)
+	);
+}
+
 function collectExtensionSpecifierReferences(
 	source: string,
 	importerPath: string,
 	ast: ParseResult = parseExtensionSource(source, importerPath),
+	graphProof?: ExtensionGraphProof,
 ): ExtensionSpecifierReference[] {
 	const references: ExtensionSpecifierReference[] = [];
 	const record = (kind: ExtensionSpecifierReference["kind"], literal: unknown): void => {
@@ -479,6 +515,8 @@ function collectExtensionSpecifierReferences(
 	};
 	const createRequireBindings = new Set<string>();
 	const moduleNamespaceBindings = new Set<string>();
+	const createRequireBindingNodes = new WeakSet<object>();
+	const moduleNamespaceBindingNodes = new WeakSet<object>();
 	for (const { node } of collectScopedAstNodes(ast, candidate => candidate.type === "ImportDeclaration")) {
 		const source = asAstNode(node.source);
 		if (source?.type !== "StringLiteral" || (source.value !== "node:module" && source.value !== "module")) continue;
@@ -486,20 +524,54 @@ function collectExtensionSpecifierReferences(
 			const specifier = asAstNode(value);
 			const local = asAstNode(specifier?.local);
 			if (local?.type !== "Identifier" || typeof local.name !== "string") continue;
-			if (specifier?.type === "ImportNamespaceSpecifier") {
+			const imported = asAstNode(specifier?.imported);
+			const importedName =
+				imported?.type === "Identifier" || imported?.type === "StringLiteral"
+					? (imported.name ?? imported.value)
+					: undefined;
+			if (
+				specifier?.type === "ImportNamespaceSpecifier" ||
+				specifier?.type === "ImportDefaultSpecifier" ||
+				importedName === "default"
+			) {
 				moduleNamespaceBindings.add(local.name);
-			} else if (specifier?.type === "ImportSpecifier") {
-				const imported = asAstNode(specifier.imported);
-				if (
-					(imported?.type === "Identifier" && imported.name === "createRequire") ||
-					(imported?.type === "StringLiteral" && imported.value === "createRequire")
-				) {
-					createRequireBindings.add(local.name);
-				}
+				moduleNamespaceBindingNodes.add(local);
+			} else if (specifier?.type === "ImportSpecifier" && importedName === "createRequire") {
+				createRequireBindings.add(local.name);
+				createRequireBindingNodes.add(local);
 			}
 		}
 	}
-	for (const { node, scope } of collectScopedAstNodes(ast, isSpecifierReferenceNode)) {
+
+	const localRequireBindings = new Set<string>();
+	const unprovableRequireBindings = new Set<string>();
+	const requireBindingNodes = new WeakSet<object>();
+	for (const { node } of collectScopedAstNodes(ast, candidate => candidate.type === "VariableDeclarator")) {
+		const initializer = asAstNode(node.init);
+		if (!isCreateRequireInvocation(initializer, createRequireBindings, moduleNamespaceBindings)) continue;
+		const binding = asAstNode(node.id);
+		if (binding?.type !== "Identifier" || typeof binding.name !== "string") {
+			if (graphProof) graphProof.provable = false;
+			continue;
+		}
+		requireBindingNodes.add(binding);
+		if (isImportMetaUrl(nodeArgument(initializer, 0))) {
+			localRequireBindings.add(binding.name);
+		} else {
+			unprovableRequireBindings.add(binding.name);
+			if (graphProof) graphProof.provable = false;
+		}
+	}
+
+	for (const { node, scope, parent, parentKey } of collectScopedAstNodes(ast, isSpecifierReferenceNode)) {
+		if (
+			node.type === "CallExpression" &&
+			isCreateRequireInvocation(node, createRequireBindings, moduleNamespaceBindings)
+		) {
+			const isBoundFactory = parent?.type === "VariableDeclarator" && parent.init === node;
+			const isImmediatelyInvoked = parent?.type === "CallExpression" && parentKey === "callee";
+			if (!isBoundFactory && !isImmediatelyInvoked && graphProof) graphProof.provable = false;
+		}
 		if (
 			node.type === "ImportDeclaration" ||
 			node.type === "ExportNamedDeclaration" ||
@@ -515,23 +587,95 @@ function collectExtensionSpecifierReferences(
 			}
 		} else if (node.type === "CallExpression") {
 			const callee = asAstNode(node.callee);
+			const calleeName = callee?.type === "Identifier" && typeof callee.name === "string" ? callee.name : undefined;
 			if (callee?.type === "Import") {
 				record("import", nodeArgument(node, 0));
 			} else if (isIdentifier(callee, "require") && !scopeHasBinding(scope, REQUIRE_BINDING)) {
 				record("require", nodeArgument(node, 0));
-			} else if (isCreateRequireInvocation(callee, createRequireBindings, moduleNamespaceBindings)) {
-				// `createRequire(base)(spec)` — pin the invoked bare dependency so it
-				// loads without a runtime `node_modules` lookup. Relative specifiers
-				// resolve against `base`, which is not rewritten, so restrict to bare.
+			} else if (graphProof && calleeName && localRequireBindings.has(calleeName)) {
 				const argument = nodeArgument(node, 0);
 				if (
 					argument?.type === "StringLiteral" &&
 					typeof argument.value === "string" &&
-					isBareExtensionDependencySpecifier(argument.value)
+					isGraphResolvableSpecifier(argument.value)
 				) {
 					record("require", argument);
+				} else {
+					graphProof.provable = false;
+				}
+			} else if (graphProof && calleeName && unprovableRequireBindings.has(calleeName)) {
+				graphProof.provable = false;
+			} else if (isCreateRequireInvocation(callee, createRequireBindings, moduleNamespaceBindings)) {
+				const argument = nodeArgument(node, 0);
+				const localBase = isImportMetaUrl(nodeArgument(callee, 0));
+				if (
+					graphProof &&
+					argument?.type === "StringLiteral" &&
+					typeof argument.value === "string" &&
+					localBase &&
+					isGraphResolvableSpecifier(argument.value)
+				) {
+					record("require", argument);
+				} else {
+					if (
+						argument?.type === "StringLiteral" &&
+						typeof argument.value === "string" &&
+						isBareExtensionDependencySpecifier(argument.value)
+					) {
+						record("require", argument);
+					}
+					if (graphProof) graphProof.provable = false;
 				}
 			}
+		}
+	}
+
+	if (graphProof) {
+		for (const { node, parent, parentKey } of collectScopedAstNodes(
+			ast,
+			candidate => candidate.type === "Identifier",
+		)) {
+			if (typeof node.name !== "string") continue;
+			const nonReferenceProperty =
+				(parent?.type === "MemberExpression" && parentKey === "property" && parent.computed !== true) ||
+				(parentKey === "key" && parent?.computed !== true && parent?.shorthand !== true) ||
+				(parent?.type === "ImportSpecifier" && parentKey === "imported");
+			if (localRequireBindings.has(node.name)) {
+				if (requireBindingNodes.has(node)) continue;
+				if (parent?.type === "CallExpression" && parentKey === "callee") continue;
+				if (nonReferenceProperty) continue;
+				graphProof.provable = false;
+				continue;
+			}
+			if (createRequireBindings.has(node.name)) {
+				if (createRequireBindingNodes.has(node)) continue;
+				if (parent?.type === "CallExpression" && parentKey === "callee") continue;
+				if (nonReferenceProperty) continue;
+				graphProof.provable = false;
+				continue;
+			}
+			if (moduleNamespaceBindings.has(node.name)) {
+				if (moduleNamespaceBindingNodes.has(node)) continue;
+				if (parent?.type === "MemberExpression" && parentKey === "object") continue;
+				if (nonReferenceProperty) continue;
+				graphProof.provable = false;
+			}
+		}
+		for (const { node, parent, parentKey } of collectScopedAstNodes(
+			ast,
+			candidate => candidate.type === "MemberExpression",
+		)) {
+			const object = asAstNode(node.object);
+			if (
+				staticMemberPropertyName(node) !== "createRequire" ||
+				object?.type !== "Identifier" ||
+				typeof object.name !== "string" ||
+				!moduleNamespaceBindings.has(object.name)
+			) {
+				continue;
+			}
+			if (parent?.type === "CallExpression" && parentKey === "callee") continue;
+			graphProof.provable = false;
 		}
 	}
 	return references;
@@ -2171,6 +2315,58 @@ async function collectExtensionModules(entryRealPath: string): Promise<Extension
 	};
 }
 
+async function collectExtensionSourceGraph(entryRealPath: string): Promise<Set<string> | null> {
+	const sourcePaths = new Set<string>();
+	const queue = [entryRealPath];
+	while (queue.length > 0) {
+		const file = queue.pop();
+		if (!file || sourcePaths.has(file)) continue;
+		let source: string;
+		try {
+			source = await Bun.file(file).text();
+		} catch {
+			return null;
+		}
+		sourcePaths.add(file);
+		const ast = parseExtensionSource(source, file);
+		const proof: ExtensionGraphProof = { provable: true };
+		const references = collectExtensionSpecifierReferences(source, file, ast, proof);
+		if (!proof.provable) return null;
+		for (const reference of references) {
+			const specifier = reference.specifier;
+			if (!isGraphResolvableSpecifier(specifier)) return null;
+			let resolved: string | null = null;
+			try {
+				if (specifier.startsWith(".")) {
+					const candidate =
+						reference.kind === "require"
+							? await resolveRelativeCommonJsRequire(specifier, file)
+							: Bun.resolveSync(specifier, path.dirname(file));
+					if (candidate && hasSourceModuleExtension(candidate)) resolved = await realpathOrSelfUncached(candidate);
+				} else if (specifier.startsWith("#")) {
+					const candidate = await resolvePackageImportSpecifier(specifier, file);
+					if (candidate && hasSourceModuleExtension(candidate)) resolved = await realpathOrSelfUncached(candidate);
+				} else if (
+					isBareExtensionDependencySpecifier(specifier) &&
+					!remapLegacyPiSpecifier(specifier) &&
+					specifier !== "typebox" &&
+					specifier !== "@sinclair/typebox"
+				) {
+					const candidate =
+						reference.kind === "require"
+							? await resolveExtensionBareRequire(specifier, file)
+							: await resolveExtensionBareDependency(specifier, file);
+					if (candidate && hasSourceModuleExtension(candidate)) resolved = await realpathOrSelfUncached(candidate);
+				}
+			} catch {
+				// A literal that cannot resolve cannot extend the runtime graph.
+			}
+			if (resolved && !sourcePaths.has(resolved)) queue.push(resolved);
+		}
+	}
+	return sourcePaths;
+}
+
 /** Test seam for compiled-binary dependency graph discovery and rewriting. */
 export async function __collectLegacyPiExtensionSourcesForTests(
 	entryPath: string,
@@ -2186,9 +2382,9 @@ export async function isExtensionSourceGraphContained(entryPath: string, package
 		realpathOrSelfUncached(path.resolve(entryPath)),
 		fs.promises.realpath(path.resolve(packageRoot)),
 	]);
-	const graph = await collectExtensionModules(entryRealPath);
-	if (!graph.modules.has(entryRealPath)) return false;
-	for (const modulePath of graph.modules.keys()) {
+	const sourcePaths = await collectExtensionSourceGraph(entryRealPath);
+	if (!sourcePaths?.has(entryRealPath)) return false;
+	for (const modulePath of sourcePaths) {
 		const resolvedModulePath = await realpathOrSelfUncached(modulePath);
 		const relative = path.relative(packageRealPath, resolvedModulePath);
 		if (relative.startsWith(`..${path.sep}`) || relative === ".." || path.isAbsolute(relative)) return false;

@@ -95,6 +95,19 @@ function invalidQwenTemplateEffortResponse(): Response {
 		{ status: 400, headers: { "content-type": "application/json" } },
 	);
 }
+function invalidQwenTemplateEffortWithoutAlternativesResponse(): Response {
+	return new Response(
+		JSON.stringify({
+			error: {
+				message: "invalid reasoning_effort 'xhigh'",
+				type: "invalid_request_error",
+				param: "chat_template_kwargs.reasoning_effort",
+			},
+		}),
+		{ status: 400, headers: { "content-type": "application/json" } },
+	);
+}
+
 function invalidMediumReasoningResponse(): Response {
 	return new Response(
 		JSON.stringify({
@@ -281,7 +294,7 @@ describe("OpenAI reasoning effort fallback retry", () => {
 		expect(bodies.map(body => body.reasoning_effort)).toEqual(["xhigh", "max"]);
 	});
 
-	it("retries vLLM nested Qwen template effort with the nearest supported tier", async () => {
+	it("remembers the vLLM Qwen xhigh fallback without overriding later efforts", async () => {
 		const bodies: Record<string, unknown>[] = [];
 		const fetchMock: FetchImpl = Object.assign(
 			async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
@@ -290,19 +303,58 @@ describe("OpenAI reasoning effort fallback retry", () => {
 			},
 			{ preconnect: fetch.preconnect },
 		);
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const model = createLocalQwenModel("vllm", "http://127.0.0.1:8000/v1");
 
-		const result = await streamOpenAICompletions(
-			createLocalQwenModel("vllm", "http://127.0.0.1:8000/v1"),
-			testContext,
-			{ apiKey: "test-key", fetch: fetchMock, reasoning: "xhigh" },
-		).result();
+		for (const reasoning of ["xhigh", "xhigh", "low", "medium"] as const) {
+			const result = await streamOpenAICompletions(model, testContext, {
+				apiKey: "test-key",
+				fetch: fetchMock,
+				providerSessionState,
+				reasoning,
+			}).result();
+			expect(result.stopReason).toBe("stop");
+		}
 
-		expect(result.stopReason).toBe("stop");
-		expect(bodies.map(body => body.reasoning_effort)).toEqual([undefined, undefined]);
-		expect(bodies.map(body => body.chat_template_kwargs)).toEqual([
-			{ preserve_thinking: true, enable_thinking: true, reasoning_effort: "xhigh" },
-			{ preserve_thinking: true, enable_thinking: true, reasoning_effort: "high" },
+		expect(bodies.map(body => body.reasoning_effort)).toEqual([
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
 		]);
+		expect(
+			bodies.map(body => (body.chat_template_kwargs as { reasoning_effort?: string } | undefined)?.reasoning_effort),
+		).toEqual(["xhigh", "high", "high", "low", "medium"]);
+	});
+
+	it("keeps later low effort instead of letting remembered null restore Qwen's xhigh default", async () => {
+		const bodies: Record<string, unknown>[] = [];
+		const fetchMock: FetchImpl = Object.assign(
+			async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+				bodies.push(parseJsonBody(init));
+				return bodies.length === 1
+					? invalidQwenTemplateEffortWithoutAlternativesResponse()
+					: createChatSseResponse();
+			},
+			{ preconnect: fetch.preconnect },
+		);
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const model = createLocalQwenModel("vllm", "http://127.0.0.1:8000/v1");
+
+		for (const reasoning of ["xhigh", "xhigh", "low"] as const) {
+			const result = await streamOpenAICompletions(model, testContext, {
+				apiKey: "test-key",
+				fetch: fetchMock,
+				providerSessionState,
+				reasoning,
+			}).result();
+			expect(result.stopReason).toBe("stop");
+		}
+
+		expect(
+			bodies.map(body => (body.chat_template_kwargs as { reasoning_effort?: string } | undefined)?.reasoning_effort),
+		).toEqual(["xhigh", undefined, undefined, "low"]);
 	});
 
 	it("synchronizes both llama.cpp Qwen effort copies on fallback retry", async () => {

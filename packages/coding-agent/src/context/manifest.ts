@@ -3,7 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { YAML } from "bun";
 import trackedManifestSource from "../../generated/prompt-manifest.json" with { type: "text" };
-import { diff, fetch as gitFetch, ref, remote, repo, show, status } from "../utils/git";
+import { diff, fetch as gitFetch, ls, ref, remote, repo, show, status } from "../utils/git";
 import { canonicalJson, compareUnicodeCodePoints, type JsonValue, sha256 } from "./canonical";
 import { computeImplementationSources } from "./implementation-sources";
 import {
@@ -601,6 +601,45 @@ export function approvedCandidateSourceMatches(
 	);
 }
 
+function gitBlobObjectId(bytes: Uint8Array, expectedLength: number): string | undefined {
+	const hasher =
+		expectedLength === 40
+			? new Bun.CryptoHasher("sha1")
+			: expectedLength === 64
+				? new Bun.CryptoHasher("sha256")
+				: undefined;
+	if (!hasher) return undefined;
+	hasher.update(`blob ${bytes.byteLength}\0`);
+	hasher.update(bytes);
+	return hasher.digest("hex");
+}
+
+async function workingPackageBytesMatchHead(repositoryRoot: string, packagePathspec: string): Promise<boolean> {
+	const trackedPaths = await ls.tree(repositoryRoot, "HEAD", [packagePathspec]);
+	for (const trackedPath of trackedPaths) {
+		const absolutePath = path.resolve(repositoryRoot, trackedPath);
+		const relative = path.relative(repositoryRoot, absolutePath);
+		if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return false;
+		const expectedObject = await ref.resolve(repositoryRoot, `HEAD:${trackedPath}`);
+		if (!expectedObject) return false;
+		let bytes: Uint8Array;
+		try {
+			const stats = await fs.lstat(absolutePath);
+			if (stats.isSymbolicLink()) {
+				bytes = new TextEncoder().encode(await fs.readlink(absolutePath));
+			} else if (stats.isFile()) {
+				bytes = await Bun.file(absolutePath).bytes();
+			} else {
+				return false;
+			}
+		} catch {
+			return false;
+		}
+		if (gitBlobObjectId(bytes, expectedObject.length) !== expectedObject) return false;
+	}
+	return true;
+}
+
 async function approvedCandidateSourceRoot(
 	repositoryRoot: string,
 	resolvedSource: string,
@@ -643,21 +682,24 @@ export async function isApprovedCandidateSource(filePath: string, release: Conte
 		const sourceRoot = await approvedCandidateSourceRoot(repositoryRoot, resolved, candidate.commit);
 		if (!sourceRoot) return false;
 		const relativeSourceRoot = path.relative(repositoryRoot, sourceRoot).replaceAll(path.sep, "/");
+		const packagePathspec = relativeSourceRoot || ".";
 		// Keep runtime plugin graph loading outside native-free offline context commands.
 		const { isExtensionSourceGraphContained } = await import("../extensibility/plugins/legacy-pi-compat");
-		const [approvedPackageTree, headPackageTree, workingSourceStatus, sourceGraphContained] = await Promise.all([
-			ref.resolve(repositoryRoot, `${candidate.commit}:${relativeSourceRoot}`),
-			ref.resolve(repositoryRoot, `HEAD:${relativeSourceRoot}`),
-			status(repositoryRoot, {
-				porcelainV1: true,
-				untrackedFiles: "all",
-				includeIgnored: true,
-				z: true,
-				pathspecs: [relativeSourceRoot],
-			}),
-			isExtensionSourceGraphContained(resolved, sourceRoot),
-		]);
-		if (!sourceGraphContained) return false;
+		const [approvedPackageTree, headPackageTree, workingSourceStatus, workingBytesMatch, sourceGraphContained] =
+			await Promise.all([
+				ref.resolve(repositoryRoot, `${candidate.commit}:${relativeSourceRoot}`),
+				ref.resolve(repositoryRoot, `HEAD:${relativeSourceRoot}`),
+				status(repositoryRoot, {
+					porcelainV1: true,
+					untrackedFiles: "all",
+					includeIgnored: true,
+					z: true,
+					pathspecs: [packagePathspec],
+				}),
+				workingPackageBytesMatchHead(repositoryRoot, packagePathspec),
+				isExtensionSourceGraphContained(resolved, sourceRoot),
+			]);
+		if (!workingBytesMatch || !sourceGraphContained) return false;
 		return approvedCandidateSourceMatches(
 			repository,
 			approvedIdentity ?? undefined,

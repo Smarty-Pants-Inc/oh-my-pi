@@ -6,6 +6,7 @@ import * as url from "node:url";
 import {
 	__collectLegacyPiExtensionSourcesForTests,
 	__rewriteLegacyExtensionSourceForTests,
+	isExtensionSourceGraphContained,
 	loadLegacyPiModule,
 } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/legacy-pi-compat";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
@@ -79,6 +80,52 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 		expect(mod.requiredValue).toBe("required-cjs-ok");
 		expect(mod.defaultValue).toBe(42);
 		expect(mod.namedValue).toBe("named-cjs-ok");
+	});
+
+	it("contains literal local createRequire edges and rejects unprovable ones", async () => {
+		const dir = await writePackage({
+			"outside.js": "export const outside = true;\n",
+			"package/package.json": JSON.stringify({ name: "create-require-graph-ext", version: "1.0.0", type: "module" }),
+			"package/local.js": "export const local = true;\n",
+			"package/index.js": [
+				'import { createRequire } from "node:module";',
+				"const localRequire = createRequire(import.meta.url);",
+				'localRequire("./local.js");',
+			].join("\n"),
+		});
+		const packageRoot = path.join(dir, "package");
+		const entry = path.join(packageRoot, "index.js");
+
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+		await fs.writeFile(
+			entry,
+			[
+				'import { createRequire } from "node:module";',
+				"const localRequire = createRequire(import.meta.url);",
+				'localRequire("../outside.js");',
+			].join("\n"),
+		);
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(false);
+		await fs.writeFile(
+			entry,
+			[
+				'import { createRequire } from "node:module";',
+				"const localRequire = createRequire(import.meta.url);",
+				'const target = "./local.js";',
+				"localRequire(target);",
+			].join("\n"),
+		);
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(false);
+		await fs.writeFile(
+			entry,
+			[
+				'import { createRequire } from "node:module";',
+				"const factory = createRequire;",
+				"const localRequire = factory(import.meta.url);",
+				'localRequire("../outside.js");',
+			].join("\n"),
+		);
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(false);
 	});
 
 	it("remaps legacy Pi requires in graph-owned CommonJS packages to the host shim", async () => {
