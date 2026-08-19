@@ -247,6 +247,31 @@ describe("AgentSession handoff", () => {
 		expect(branchDuringHandoff).toHaveLength(2);
 	});
 
+	it("rejects a normal prompt while handoff generation owns the session", async () => {
+		const handoffStarted = Promise.withResolvers<void>();
+		const handoffGenerated = Promise.withResolvers<string>();
+		vi.spyOn(compactionModule, "generateHandoffFromContext").mockImplementation(async () => {
+			handoffStarted.resolve();
+			return await handoffGenerated.promise;
+		});
+		const mock = createMockModel({ handler: () => ({ content: ["must not run"] }) });
+		session.agent.streamFn = mock.stream;
+
+		const handoff = session.handoff();
+		await handoffStarted.promise;
+		try {
+			await expect(session.prompt("must not be lost during handoff")).rejects.toThrow(
+				"Session transition in progress",
+			);
+			expect(mock.calls).toHaveLength(0);
+			expect(JSON.stringify(session.agent.state.messages)).not.toContain("must not be lost during handoff");
+			expect(JSON.stringify(sessionManager.getBranch())).not.toContain("must not be lost during handoff");
+		} finally {
+			handoffGenerated.resolve("## Goal\nContinue from here");
+			await handoff;
+		}
+	});
+
 	it("waits for an accepted peer wake to finish before capturing the handoff snapshot", async () => {
 		const beforeStartEntered = Promise.withResolvers<void>();
 		const releaseBeforeStart = Promise.withResolvers<void>();

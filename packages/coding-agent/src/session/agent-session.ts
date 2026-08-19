@@ -6474,6 +6474,12 @@ export class AgentSession {
 		return keywordNotices;
 	}
 
+	#assertPromptCanStart(): void {
+		if (this.#lifecycleTransitionFenceActive) {
+			throw new AgentBusyError("Session transition in progress. Wait for completion before sending another prompt.");
+		}
+	}
+
 	/**
 	 * Send a prompt to the agent.
 	 * - Handles extension commands (registered via pi.registerCommand) immediately, even during streaming
@@ -6490,9 +6496,11 @@ export class AgentSession {
 	 * steer/follow-up. Callers that render a UI or manage turn lifecycle (e.g.
 	 * the ACP agent) use this to know whether to expect an `agent_end` event.
 	 */
+
 	async prompt(text: string, options?: PromptOptions): Promise<boolean> {
 		const abort = this.#abortPromise;
 		if (abort) await abort;
+		this.#assertPromptCanStart();
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 
 		// Handle extension commands first (execute immediately, even during streaming)
@@ -6635,6 +6643,7 @@ export class AgentSession {
 	): Promise<void> {
 		const abort = this.#abortPromise;
 		if (abort) await abort;
+		this.#assertPromptCanStart();
 		const textContent =
 			typeof message.content === "string"
 				? message.content
@@ -6717,6 +6726,7 @@ export class AgentSession {
 	): Promise<boolean> {
 		const abort = this.#abortPromise;
 		if (abort) await abort;
+		this.#assertPromptCanStart();
 		const automaticTurn =
 			options?.automaticTurn ??
 			(message.role === "custom" && message.customType === "goal-continuation"
