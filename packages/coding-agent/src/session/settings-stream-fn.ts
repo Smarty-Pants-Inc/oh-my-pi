@@ -21,6 +21,12 @@ function timeoutSecondsToMs(value: number): number | undefined {
 	return Math.max(1, Math.trunc(value * 1000));
 }
 
+/** Resolve the explicit per-request cache setting while preserving provider defaults for `auto`. */
+export function resolveSettingsCacheRetention(settings: Settings): SimpleStreamOptions["cacheRetention"] {
+	const setting = settings.get("providers.cacheRetention");
+	return setting === "auto" ? undefined : setting;
+}
+
 /**
  * Build a {@link StreamFn} that reads provider routing/guard settings from
  * `settings` per call and forwards to `base` (defaults to `streamSimple`).
@@ -43,10 +49,9 @@ export function createSettingsAwareStreamFn(settings: Settings, base: StreamFn =
 					: undefined;
 		// "auto" leaves the option unset so provider defaults and the
 		// PI_CACHE_RETENTION env override keep working; anything else is an
-		// explicit per-request retention (long restores 1h Anthropic TTLs and
-		// implicitly disables the short-entry keep-alive refresh loop).
-		const cacheRetentionSetting = settings.get("providers.cacheRetention");
-		const cacheRetention = cacheRetentionSetting === "auto" ? undefined : cacheRetentionSetting;
+		// explicit per-request retention (long requests each provider's extended
+		// retention and implicitly disables the Anthropic keep-alive refresh loop).
+		const cacheRetention = resolveSettingsCacheRetention(settings);
 		const streamFirstEventTimeoutMs = timeoutSecondsToMs(settings.get("providers.streamFirstEventTimeoutSeconds"));
 		const streamIdleTimeoutMs = timeoutSecondsToMs(settings.get("providers.streamIdleTimeoutSeconds"));
 		// Server-side fallback (opt-in): when the user enables it AND the

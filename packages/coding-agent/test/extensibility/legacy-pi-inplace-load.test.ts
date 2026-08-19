@@ -82,6 +82,40 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 		expect(mod.namedValue).toBe("named-cjs-ok");
 	});
 
+	it("rejects package imports whose selected target is outside the approved package", async () => {
+		const dir = await writePackage({
+			"node_modules/outside-dep/package.json": JSON.stringify({
+				name: "outside-dep",
+				version: "1.0.0",
+				type: "module",
+				exports: "./index.js",
+			}),
+			"node_modules/outside-dep/index.js": "export const outside = true;\n",
+			"package/package.json": JSON.stringify({
+				name: "package-import-graph-ext",
+				version: "1.0.0",
+				type: "module",
+				imports: {
+					"#local": "./local.js",
+					"#outside": "outside-dep",
+					"#conditional": { import: "./local.js", require: "outside-dep" },
+				},
+			}),
+			"package/local.js": "export const local = true;\n",
+			"package/index.js": 'import "#local";\n',
+		});
+		const packageRoot = path.join(dir, "package");
+		const entry = path.join(packageRoot, "index.js");
+
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+		await fs.writeFile(entry, 'import "#outside";\n');
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(false);
+		await fs.writeFile(entry, 'import "#conditional";\n');
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+		await fs.writeFile(entry, 'require("#conditional");\n');
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(false);
+	});
+
 	it("contains literal local createRequire edges and rejects unprovable ones", async () => {
 		const dir = await writePackage({
 			"outside.js": "export const outside = true;\n",
@@ -136,6 +170,7 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 		});
 		const packageRoot = path.join(dir, "package");
 		const entry = path.join(packageRoot, "index.cjs");
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
 		const cases = [
 			{ name: "dynamic bare require", source: 'const target = "../outside.js"; require(target);' },
 			{ name: "dynamic bare import", source: 'const target = "../outside.js"; import(target);' },
@@ -143,8 +178,18 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 			{ name: "sequence-wrapped require", source: '(0, require)("../outside.js");' },
 			{ name: "module.require", source: 'module.require("../outside.js");' },
 			{ name: "aliased module.require", source: 'const load = module.require; load("../outside.js");' },
+			{ name: "aliased module object", source: 'const m = module; m.require("../outside.js");' },
+			{
+				name: "escaped module value",
+				source: 'const escaped = { value: module }; escaped.value.require("../outside.js");',
+			},
 			{ name: "eval-hidden require", source: "eval('require(\"../outside.js\")');" },
 			{ name: "Function-hidden require", source: "new Function('return require(\"../outside.js\")')();" },
+			{ name: "aliased eval", source: "const run = eval; run('require(\"../outside.js\")');" },
+			{
+				name: "aliased Function",
+				source: "const Build = Function; new Build('return require(\"../outside.js\")')();",
+			},
 			{ name: "global eval-hidden require", source: "globalThis.eval('require(\"../outside.js\")');" },
 			{
 				name: "global Function-hidden require",
@@ -158,7 +203,7 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 		}
 	});
 
-	it("tracks or rejects createRequire imported through CommonJS", async () => {
+	it("tracks createRequire imported through ESM and CommonJS Module variants", async () => {
 		const dir = await writePackage({
 			"outside.js": "export const outside = true;\n",
 			"package/package.json": JSON.stringify({
@@ -181,6 +226,21 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 				name: "namespace",
 				source: 'const Module = require("module");\nconst localRequire = Module.createRequire(import.meta.url);',
 			},
+			{
+				name: "ESM named Module export",
+				source:
+					'import { Module as NodeModule } from "node:module";\nconst localRequire = NodeModule.createRequire(import.meta.url);',
+			},
+			{
+				name: "CommonJS named Module export",
+				source:
+					'const { Module: NodeModule } = require("node:module");\nconst localRequire = NodeModule.createRequire(import.meta.url);',
+			},
+			{
+				name: "CommonJS Module member",
+				source:
+					'const NodeModule = require("node:module").Module;\nconst localRequire = NodeModule.createRequire(import.meta.url);',
+			},
 		] as const;
 
 		for (const factory of factories) {
@@ -189,6 +249,72 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 			await fs.writeFile(entry, `${factory.source}\nlocalRequire("../outside.js");`);
 			expect(await isExtensionSourceGraphContained(entry, packageRoot), factory.name).toBe(false);
 		}
+	});
+
+	it("does not treat TypeScript ambient or type-only declarations as runtime eval/Function shadows", async () => {
+		const dir = await writePackage({
+			"outside.js": "export const outside = true;\n",
+			"package/package.json": JSON.stringify({ name: "typescript-shadow-ext", version: "1.0.0", type: "module" }),
+			"package/types.ts": "export type DynamicFunction = (source: string) => unknown;\n",
+			"package/index.ts": [
+				'import type { DynamicFunction as Function } from "./types.ts";',
+				"export const safe = true;",
+			].join("\n"),
+		});
+		const packageRoot = path.join(dir, "package");
+		const entry = path.join(packageRoot, "index.ts");
+
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+		await fs.writeFile(
+			entry,
+			[
+				'import type { DynamicFunction as Function } from "./types.ts";',
+				"const Build = Function;",
+				"new Build('return require(\"../outside.js\")')();",
+			].join("\n"),
+		);
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(false);
+
+		await fs.writeFile(entry, "declare const eval: (source: string) => unknown;\nexport const safe = true;\n");
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+		await fs.writeFile(
+			entry,
+			[
+				"declare const eval: (source: string) => unknown;",
+				"const run = eval;",
+				"run('require(\"../outside.js\")');",
+			].join("\n"),
+		);
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(false);
+
+		await fs.writeFile(
+			entry,
+			["const eval = {};", "const Function = {};", "void eval;", "void Function;"].join("\n"),
+		);
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+	});
+
+	it("contains static process.dlopen targets and rejects outside or dynamic targets", async () => {
+		const dir = await writePackage({
+			"outside.node": "outside-native-addon",
+			"package/package.json": JSON.stringify({ name: "dlopen-graph-ext", version: "1.0.0" }),
+			"package/addon.node": "contained-native-addon",
+			"package/index.cjs": "module.exports = {};\n",
+		});
+		const packageRoot = path.join(dir, "package");
+		const entry = path.join(packageRoot, "index.cjs");
+		const insideTarget = await fs.realpath(path.join(packageRoot, "addon.node"));
+		const outsideTarget = await fs.realpath(path.join(dir, "outside.node"));
+
+		await fs.writeFile(entry, `process.dlopen(module, ${JSON.stringify(insideTarget)});\nmodule.exports = {};\n`);
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+		await fs.writeFile(entry, `process.dlopen(module, ${JSON.stringify(outsideTarget)});\nmodule.exports = {};\n`);
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(false);
+		await fs.writeFile(
+			entry,
+			`const target = ${JSON.stringify(insideTarget)};\nprocess.dlopen(module, target);\nmodule.exports = {};\n`,
+		);
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(false);
 	});
 
 	it("contains runtime-loadable non-source targets", async () => {

@@ -4339,7 +4339,7 @@
     },
     {
       "path": "docs/settings.md",
-      "sha256": "d5af13f506f9dce2f41ae087885f4bd1746594ed7e3654d75b644769cdde5ff9"
+      "sha256": "cb050b22afdcfc2528a5d9ae51a8d7aa00ef5bf14a55649f5ccec471a65306fa"
     },
     {
       "path": "docs/skills.md",
@@ -5119,7 +5119,7 @@
     },
     {
       "path": "packages/ai/src/providers/openai-completions.ts",
-      "sha256": "3c304060a3944b136a3e8d9fa26a0d4a1ab86d0d789c1c439d71d8713b9176a0"
+      "sha256": "60e33d6ba1bb087222624d4598f6cc083585f804486e8fc737be01bf0e14e391"
     },
     {
       "path": "packages/ai/src/providers/openai-reasoning-fallback.ts",
@@ -5871,7 +5871,7 @@
     },
     {
       "path": "packages/catalog/src/compat/openai.ts",
-      "sha256": "2c6b8fcdcaca5cfdea088280d8670be4508643e07f480c62d0985d3fb0ce6b01"
+      "sha256": "d70ca6bb3faa5a0ccfb9c66a4c6e6629a071ac7b3430771922e13c56837c1cb8"
     },
     {
       "path": "packages/catalog/src/discovery/antigravity.ts",
@@ -6195,7 +6195,7 @@
     },
     {
       "path": "packages/coding-agent/src/auto-thinking/classifier.ts",
-      "sha256": "0881578cfa6b0968162b9ecc866d6903c6f3071cad2c89b97cd52d3a55839d20"
+      "sha256": "91c378983bf25fb13b6fe4b07c27bec57825271ae2554f9aea4aa61d5fe3fd00"
     },
     {
       "path": "packages/coding-agent/src/autolearn/controller.ts",
@@ -6799,7 +6799,7 @@
     },
     {
       "path": "packages/coding-agent/src/config/settings-schema.ts",
-      "sha256": "8d093778553ea9058384d9b1642c8cb8c30eb05175d00571e6303aa3b756f711"
+      "sha256": "c1b96fbdcd81b2d8c44d19ec46df02afcf539fdf625eb84c21cb3f7c763967ea"
     },
     {
       "path": "packages/coding-agent/src/config/settings.ts",
@@ -7407,7 +7407,7 @@
     },
     {
       "path": "packages/coding-agent/src/extensibility/plugins/legacy-pi-compat.ts",
-      "sha256": "e4de9fc508d89d878fb2089b1d3e1548928a22127316505f55b2dd5a51291281"
+      "sha256": "ae4e1e9ee9932174373bb48b1f429bcbd5befc3c59970b8ef5e60d6c55d95627"
     },
     {
       "path": "packages/coding-agent/src/extensibility/plugins/loader.ts",
@@ -8647,7 +8647,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/settings-stream-fn.ts",
-      "sha256": "c60893b4e9cecd09e08f8e9b90b8543302adc1a292e6ba79779247b44b80b45e"
+      "sha256": "d799ea65f4e826c983ab293b610aa64c0d94079e1338e7325230eccd1436ac42"
     },
     {
       "path": "packages/coding-agent/src/session/shake-types.ts",
@@ -8687,7 +8687,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/unexpected-stop-classifier.ts",
-      "sha256": "ebab0357d2aa4dc85555845fbec6972ad0b11462face1ff3d4cfb3e519e72dfa"
+      "sha256": "b4987972f9c1cac8c823de1b4339afb12c455ea7262b8dfb665a8a21124d2406"
     },
     {
       "path": "packages/coding-agent/src/session/yield-queue.ts",
@@ -9631,7 +9631,7 @@
     },
     {
       "path": "packages/coding-agent/src/utils/title-generator.ts",
-      "sha256": "45113d7de28bb4fe7e6b7ef6a77d7977057169191b7c4bfb1712ec9806526199"
+      "sha256": "ef72d2054a8341c1012597bba66af8702a99a1e30fbcfb0e6d3aec76bac67823"
     },
     {
       "path": "packages/coding-agent/src/utils/tool-choice.ts",
@@ -10683,5 +10683,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "6be2e429c8f63256e52e90444f12f20f7807a89dc850b84cd87c322706f1d3d7"
+  "rootSha256": "9a775190d6bfa1135938adc1a857eabf432b06de540686ab0b854fbcb61d1c20"
 }

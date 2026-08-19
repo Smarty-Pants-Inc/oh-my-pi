@@ -312,6 +312,36 @@ describe("OpenAI reasoning effort fallback retry", () => {
 		expect(bodies.map(body => body.reasoning_effort)).toEqual(["xhigh", "max"]);
 	});
 
+	it("compresses a remembered Chat Completions xhigh fallback after high is also rejected", async () => {
+		const bodies: Record<string, unknown>[] = [];
+		const fetchMock: FetchImpl = Object.assign(
+			async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+				const body = parseJsonBody(init);
+				bodies.push(body);
+				if (bodies.length === 1) {
+					return invalidReasoningResponse("reasoning_effort", "xhigh", ["high", "low"]);
+				}
+				if (bodies.length === 3) return invalidReasoningResponse("reasoning_effort", "high", ["low"]);
+				return createChatSseResponse();
+			},
+			{ preconnect: fetch.preconnect },
+		);
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const model = createCompletionsModel();
+
+		for (let request = 0; request < 3; request++) {
+			const result = await streamOpenAICompletions(model, testContext, {
+				apiKey: "test-key",
+				fetch: fetchMock,
+				providerSessionState,
+				reasoning: "xhigh",
+			}).result();
+			expect(result.stopReason).toBe("stop");
+		}
+
+		expect(bodies.map(body => body.reasoning_effort)).toEqual(["xhigh", "high", "high", "low", "low"]);
+	});
+
 	it("remembers the vLLM Qwen xhigh fallback without overriding later efforts", async () => {
 		const bodies: Record<string, unknown>[] = [];
 		const fetchMock: FetchImpl = Object.assign(

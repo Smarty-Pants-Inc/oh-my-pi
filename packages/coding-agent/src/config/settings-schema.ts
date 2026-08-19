@@ -5280,8 +5280,9 @@ export const SETTINGS_SCHEMA = {
 				},
 				{
 					value: "long",
-					label: "Long (1h)",
-					description: "1h TTL where the provider supports it; pricier writes, no keep-alive refresh requests",
+					label: "Long",
+					description:
+						"Extended retention where supported (Anthropic, Bedrock, and compatible gateways: 1h; OpenAI Responses: 24h); pricier writes, no Anthropic keep-alive refresh requests",
 				},
 				{ value: "none", label: "Off", description: "Disable prompt caching and cache-affinity routing" },
 			],

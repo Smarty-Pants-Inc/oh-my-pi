@@ -88,6 +88,7 @@ const EXPORTS_BINDING = 1 << 2;
 const MODULE_BINDING = 1 << 3;
 const EVAL_BINDING = 1 << 4;
 const FUNCTION_BINDING = 1 << 5;
+const PROCESS_BINDING = 1 << 6;
 
 interface StructuralAstNode {
 	readonly type: string;
@@ -150,9 +151,22 @@ function trackedBinding(name: unknown): number {
 			return EVAL_BINDING;
 		case "Function":
 			return FUNCTION_BINDING;
+		case "process":
+			return PROCESS_BINDING;
 		default:
 			return 0;
 	}
+}
+
+function isTypeOnlyImportBinding(declaration: StructuralAstNode, specifier?: StructuralAstNode | null): boolean {
+	const declarationKind = declaration.importKind;
+	const specifierKind = specifier?.importKind;
+	return (
+		declarationKind === "type" ||
+		declarationKind === "typeof" ||
+		specifierKind === "type" ||
+		specifierKind === "typeof"
+	);
 }
 
 function addPatternBindings(scope: BindingScope, pattern: unknown): void {
@@ -274,12 +288,12 @@ function registerScopeBindings(node: StructuralAstNode, scope: BindingScope): vo
 		if (specifiers) {
 			for (const value of specifiers) {
 				const specifier = asAstNode(value);
-				if (specifier) addPatternBindings(scope, specifier.local);
+				if (specifier && !isTypeOnlyImportBinding(node, specifier)) addPatternBindings(scope, specifier.local);
 			}
 		}
 	} else if (node.type === "TSImportEqualsDeclaration") {
-		addPatternBindings(scope, node.id);
-	} else if (node.type === "VariableDeclaration") {
+		if (!isTypeOnlyImportBinding(node)) addPatternBindings(scope, node.id);
+	} else if (node.type === "VariableDeclaration" && node.declare !== true) {
 		const target = node.kind === "var" ? nearestVarScope(scope) : scope;
 		const declarations = nodeArray(node, "declarations");
 		if (declarations) {
@@ -446,6 +460,13 @@ function isNodeModuleRequireCall(node: StructuralAstNode | null, scope: BindingS
 	return specifier?.type === "StringLiteral" && (specifier.value === "node:module" || specifier.value === "module");
 }
 
+function isProcessDlopenCall(node: StructuralAstNode | null, scope: BindingScope): boolean {
+	if (node?.type !== "CallExpression" && node?.type !== "OptionalCallExpression") return false;
+	const callee = asAstNode(node.callee);
+	if (callee?.type !== "MemberExpression" || staticMemberPropertyName(callee) !== "dlopen") return false;
+	return isIdentifier(asAstNode(callee.object), "process") && !scopeHasBinding(scope, PROCESS_BINDING);
+}
+
 /**
  * Whether `node` is a `createRequire(...)` factory call imported from
  * `node:module` (or its `module` alias).
@@ -489,6 +510,7 @@ function staticObjectPropertyName(node: StructuralAstNode): string | null {
 
 interface ExtensionGraphProof {
 	provable: boolean;
+	readonly fileTargets: Set<string>;
 }
 
 function isImportMetaUrl(node: StructuralAstNode | null): boolean {
@@ -537,13 +559,20 @@ function collectExtensionSpecifierReferences(
 	const commonJsModuleNamespaceBindings = new Set<string>();
 	const createRequireBindingNodes = new WeakSet<object>();
 	const moduleNamespaceBindingNodes = new WeakSet<object>();
+	const nonRuntimeBindingNodes = new WeakSet<object>();
 	for (const { node } of collectScopedAstNodes(ast, candidate => candidate.type === "ImportDeclaration")) {
 		const source = asAstNode(node.source);
-		if (source?.type !== "StringLiteral" || (source.value !== "node:module" && source.value !== "module")) continue;
+		const isNodeModuleSource =
+			source?.type === "StringLiteral" && (source.value === "node:module" || source.value === "module");
 		for (const value of Array.isArray(node.specifiers) ? node.specifiers : []) {
 			const specifier = asAstNode(value);
 			const local = asAstNode(specifier?.local);
 			if (local?.type !== "Identifier" || typeof local.name !== "string") continue;
+			if (specifier && isTypeOnlyImportBinding(node, specifier)) {
+				nonRuntimeBindingNodes.add(local);
+				continue;
+			}
+			if (!isNodeModuleSource) continue;
 			const imported = asAstNode(specifier?.imported);
 			const importedName =
 				imported?.type === "Identifier" || imported?.type === "StringLiteral"
@@ -552,7 +581,8 @@ function collectExtensionSpecifierReferences(
 			if (
 				specifier?.type === "ImportNamespaceSpecifier" ||
 				specifier?.type === "ImportDefaultSpecifier" ||
-				importedName === "default"
+				importedName === "default" ||
+				(specifier?.type === "ImportSpecifier" && importedName === "Module")
 			) {
 				moduleNamespaceBindings.add(local.name);
 				moduleNamespaceBindingNodes.add(local);
@@ -562,12 +592,35 @@ function collectExtensionSpecifierReferences(
 			}
 		}
 	}
+	for (const { node } of collectScopedAstNodes(ast, candidate => candidate.type === "TSImportEqualsDeclaration")) {
+		const binding = asAstNode(node.id);
+		if (binding?.type !== "Identifier" || typeof binding.name !== "string") continue;
+		if (isTypeOnlyImportBinding(node)) {
+			nonRuntimeBindingNodes.add(binding);
+			continue;
+		}
+		const moduleReference = asAstNode(node.moduleReference);
+		const expression =
+			moduleReference?.type === "TSExternalModuleReference" ? asAstNode(moduleReference.expression) : null;
+		if (
+			expression?.type !== "StringLiteral" ||
+			(expression.value !== "node:module" && expression.value !== "module")
+		) {
+			continue;
+		}
+		moduleNamespaceBindings.add(binding.name);
+		commonJsModuleNamespaceBindings.add(binding.name);
+		moduleNamespaceBindingNodes.add(binding);
+	}
 
 	const variableDeclarations = collectScopedAstNodes(ast, candidate => candidate.type === "VariableDeclarator");
-	for (const { node, scope } of variableDeclarations) {
+	for (const { node, scope, parent } of variableDeclarations) {
+		const binding = asAstNode(node.id);
+		if (parent?.type === "VariableDeclaration" && parent.declare === true && binding?.type === "Identifier") {
+			nonRuntimeBindingNodes.add(binding);
+		}
 		const initializer = asAstNode(node.init);
 		if (isNodeModuleRequireCall(initializer, scope)) {
-			const binding = asAstNode(node.id);
 			if (binding?.type === "Identifier" && typeof binding.name === "string") {
 				moduleNamespaceBindings.add(binding.name);
 				commonJsModuleNamespaceBindings.add(binding.name);
@@ -584,32 +637,44 @@ function collectExtensionSpecifierReferences(
 					if (graphProof) graphProof.provable = false;
 					continue;
 				}
-				if (staticObjectPropertyName(property) !== "createRequire") continue;
+				const propertyName = staticObjectPropertyName(property);
+				if (propertyName !== "createRequire" && propertyName !== "Module") continue;
 				const propertyValue = asAstNode(property.value);
 				const propertyKey = asAstNode(property.key);
-				if (propertyKey) createRequireBindingNodes.add(propertyKey);
 				const local = propertyValue?.type === "AssignmentPattern" ? asAstNode(propertyValue.left) : propertyValue;
 				if (local?.type !== "Identifier" || typeof local.name !== "string") {
 					if (graphProof) graphProof.provable = false;
 					continue;
 				}
-				createRequireBindings.add(local.name);
-				createRequireBindingNodes.add(local);
+				if (propertyName === "createRequire") {
+					if (propertyKey) createRequireBindingNodes.add(propertyKey);
+					createRequireBindings.add(local.name);
+					createRequireBindingNodes.add(local);
+				} else {
+					if (propertyKey) moduleNamespaceBindingNodes.add(propertyKey);
+					moduleNamespaceBindings.add(local.name);
+					commonJsModuleNamespaceBindings.add(local.name);
+					moduleNamespaceBindingNodes.add(local);
+				}
 			}
 			continue;
 		}
-		if (
-			initializer?.type === "MemberExpression" &&
-			staticMemberPropertyName(initializer) === "createRequire" &&
-			isNodeModuleRequireCall(asAstNode(initializer.object), scope)
-		) {
-			const binding = asAstNode(node.id);
-			if (binding?.type === "Identifier" && typeof binding.name === "string") {
-				createRequireBindings.add(binding.name);
-				createRequireBindingNodes.add(binding);
-			} else if (graphProof) {
-				graphProof.provable = false;
-			}
+		if (initializer?.type !== "MemberExpression" || !isNodeModuleRequireCall(asAstNode(initializer.object), scope)) {
+			continue;
+		}
+		const memberName = staticMemberPropertyName(initializer);
+		if (memberName !== "createRequire" && memberName !== "Module") continue;
+		if (binding?.type !== "Identifier" || typeof binding.name !== "string") {
+			if (graphProof) graphProof.provable = false;
+			continue;
+		}
+		if (memberName === "createRequire") {
+			createRequireBindings.add(binding.name);
+			createRequireBindingNodes.add(binding);
+		} else {
+			moduleNamespaceBindings.add(binding.name);
+			commonJsModuleNamespaceBindings.add(binding.name);
+			moduleNamespaceBindingNodes.add(binding);
 		}
 	}
 
@@ -643,6 +708,19 @@ function collectExtensionSpecifierReferences(
 			if (!isBoundFactory && !isImmediatelyInvoked && graphProof) graphProof.provable = false;
 		}
 		if (node.type === "CallExpression" || node.type === "OptionalCallExpression") {
+			if (graphProof && isProcessDlopenCall(node, scope)) {
+				const target = nodeArgument(node, 1);
+				if (
+					node.type === "CallExpression" &&
+					target?.type === "StringLiteral" &&
+					typeof target.value === "string" &&
+					path.isAbsolute(target.value)
+				) {
+					graphProof.fileTargets.add(target.value);
+				} else {
+					graphProof.provable = false;
+				}
+			}
 			const callee = asAstNode(node.callee);
 			const memberName = callee?.type === "MemberExpression" ? staticMemberPropertyName(callee) : null;
 			const memberObject = callee?.type === "MemberExpression" ? asAstNode(callee.object) : null;
@@ -775,6 +853,32 @@ function collectExtensionSpecifierReferences(
 				(parent?.type === "MemberExpression" && parentKey === "property" && parent.computed !== true) ||
 				(parentKey === "key" && parent?.computed !== true && parent?.shorthand !== true) ||
 				(parent?.type === "ImportSpecifier" && parentKey === "imported");
+			if (nonRuntimeBindingNodes.has(node)) continue;
+			const typeofOperand =
+				parent?.type === "UnaryExpression" && parent.operator === "typeof" && parentKey === "argument";
+			if (node.name === "module" && !scopeHasBinding(scope, MODULE_BINDING) && !nonReferenceProperty) {
+				const directExportsTarget =
+					parent?.type === "MemberExpression" &&
+					parentKey === "object" &&
+					staticMemberPropertyName(parent) === "exports";
+				const processDlopenModuleArgument =
+					(parent?.type === "CallExpression" || parent?.type === "OptionalCallExpression") &&
+					parentKey === "arguments" &&
+					nodeArgument(parent, 0) === node &&
+					isProcessDlopenCall(parent, scope);
+				if (directExportsTarget || typeofOperand || processDlopenModuleArgument) continue;
+				graphProof.provable = false;
+				continue;
+			}
+			if (node.name === "process" && !scopeHasBinding(scope, PROCESS_BINDING) && !nonReferenceProperty) {
+				const staticMemberObject =
+					parent?.type === "MemberExpression" &&
+					parentKey === "object" &&
+					staticMemberPropertyName(parent) !== null;
+				if (staticMemberObject || typeofOperand) continue;
+				graphProof.provable = false;
+				continue;
+			}
 			const dynamicCodeIdentifier =
 				(node.name === "eval" && !scopeHasBinding(scope, EVAL_BINDING)) ||
 				(node.name === "Function" && !scopeHasBinding(scope, FUNCTION_BINDING));
@@ -838,6 +942,19 @@ function collectExtensionSpecifierReferences(
 				graphProof.provable = false;
 				continue;
 			}
+			const processDlopenMember =
+				memberName === "dlopen" && isIdentifier(object, "process") && !scopeHasBinding(scope, PROCESS_BINDING);
+			if (processDlopenMember) {
+				if (
+					(parent?.type === "CallExpression" || parent?.type === "OptionalCallExpression") &&
+					parentKey === "callee" &&
+					isProcessDlopenCall(parent, scope)
+				) {
+					continue;
+				}
+				graphProof.provable = false;
+				continue;
+			}
 			const disguisedRequireMember =
 				memberName === "require" &&
 				((isIdentifier(object, "module") && !scopeHasBinding(scope, MODULE_BINDING)) ||
@@ -867,6 +984,8 @@ function collectExtensionSpecifierReferences(
 				isNodeModuleRequireCall(object, scope) &&
 				(memberName === null || memberName === "Module" || memberName === "default")
 			) {
+				const binding = parent?.type === "VariableDeclarator" && parent.init === node ? asAstNode(parent.id) : null;
+				if (memberName === "Module" && binding && moduleNamespaceBindingNodes.has(binding)) continue;
 				graphProof.provable = false;
 			}
 		}
@@ -1624,6 +1743,7 @@ async function resolvePackageImportSpecifier(
 	specifier: string,
 	importerPath: string,
 	includeNonSource = false,
+	conditions: ReadonlySet<string> = SUPPORTED_PACKAGE_IMPORT_CONDITIONS,
 ): Promise<string | null> {
 	if (!specifier.startsWith("#")) {
 		return null;
@@ -1639,7 +1759,7 @@ async function resolvePackageImportSpecifier(
 		return null;
 	}
 
-	const exactTarget = selectPackageImportTarget(imports[specifier]);
+	const exactTarget = selectPackageImportTarget(imports[specifier], conditions);
 	if (exactTarget === PACKAGE_IMPORT_EXCLUDED) {
 		return null;
 	}
@@ -1658,7 +1778,7 @@ async function resolvePackageImportSpecifier(
 			continue;
 		}
 
-		const target = selectPackageImportTarget(entry);
+		const target = selectPackageImportTarget(entry, conditions);
 		if (target === null) {
 			continue;
 		}
@@ -2418,7 +2538,12 @@ async function collectExtensionModules(entryRealPath: string): Promise<Extension
 						}
 					}
 				} else if (specifier.startsWith("#")) {
-					const candidate = await resolvePackageImportSpecifier(specifier, file);
+					const candidate = await resolvePackageImportSpecifier(
+						specifier,
+						file,
+						false,
+						isRequired ? SUPPORTED_PACKAGE_REQUIRE_CONDITIONS : SUPPORTED_PACKAGE_IMPORT_CONDITIONS,
+					);
 					if (candidate) {
 						const inheritedTargetKind = isRequired
 							? sourceIsCommonJs
@@ -2564,9 +2689,14 @@ async function collectExtensionSourceGraph(entryRealPath: string): Promise<Set<s
 			return null;
 		}
 		const ast = parseExtensionSource(source, file);
-		const proof: ExtensionGraphProof = { provable: true };
+		const proof: ExtensionGraphProof = { provable: true, fileTargets: new Set<string>() };
 		const references = collectExtensionSpecifierReferences(source, file, ast, proof);
 		if (!proof.provable) return null;
+		for (const target of proof.fileTargets) {
+			const resolved = await resolveRuntimeFileTarget(target);
+			if (!resolved) return null;
+			if (!graphPaths.has(resolved)) queue.push(resolved);
+		}
 		for (const reference of references) {
 			const specifier = reference.specifier;
 			if (!isGraphResolvableSpecifier(specifier)) return null;
@@ -2575,7 +2705,15 @@ async function collectExtensionSourceGraph(entryRealPath: string): Promise<Set<s
 				if (specifier.startsWith(".")) {
 					resolved = await resolveRelativeGraphTarget(specifier, file, reference.kind);
 				} else if (specifier.startsWith("#")) {
-					resolved = await resolvePackageImportSpecifier(specifier, file, true);
+					resolved = await resolvePackageImportSpecifier(
+						specifier,
+						file,
+						true,
+						reference.kind === "require"
+							? SUPPORTED_PACKAGE_REQUIRE_CONDITIONS
+							: SUPPORTED_PACKAGE_IMPORT_CONDITIONS,
+					);
+					if (!resolved) return null;
 				} else if (
 					isBareExtensionDependencySpecifier(specifier) &&
 					!remapLegacyPiSpecifier(specifier) &&
@@ -2589,7 +2727,8 @@ async function collectExtensionSourceGraph(entryRealPath: string): Promise<Set<s
 					if (candidate) resolved = await resolveRuntimeFileTarget(candidate);
 				}
 			} catch {
-				// A literal that cannot resolve cannot extend the runtime graph.
+				if (specifier.startsWith("#")) return null;
+				// Other unresolved literals cannot extend the runtime graph.
 			}
 			if (resolved && !graphPaths.has(resolved)) queue.push(resolved);
 		}

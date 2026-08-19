@@ -1042,6 +1042,29 @@ describe("Qwen 3.8 local template effort ladder", () => {
 		expect(vllm.compat.qwenTemplateReasoningEffort).toBe(true);
 	});
 
+	it("routes named vLLM providers through chat_template_kwargs without matching unrelated names", () => {
+		const namedVllm = createModel({
+			id: "qwen3.8-27b",
+			api: "openai-completions",
+			provider: "vllm-fast",
+			baseUrl: "http://192.168.5.3:8085/v1",
+		});
+		expect(namedVllm.compat).toMatchObject({
+			thinkingFormat: "qwen-chat-template",
+			reasoningDisableMode: "qwen-template-false",
+			qwenTemplateReasoningEffort: true,
+		});
+
+		const unrelated = createModel({
+			id: "qwen3.8-27b",
+			api: "openai-completions",
+			provider: "vllmish",
+			baseUrl: "http://192.168.5.3:8085/v1",
+		});
+		expect(unrelated.compat.thinkingFormat).toBe("qwen");
+		expect(unrelated.compat.reasoningDisableMode).toBe("qwen-enable-thinking-false");
+	});
+
 	it("keeps hosted, pre-3.8, and local-Ollama Qwen off the template ladder", () => {
 		const hosted = createModel({
 			id: "qwen3.8-27b",
