@@ -5,6 +5,7 @@ automaticTurns:
     - active_goal_continuation
     - active_async_result_wake
     - bounded_transport_or_protocol_retry
+    - peer_message_wake
   forbidden:
     - incomplete_todo
     - stale_plan

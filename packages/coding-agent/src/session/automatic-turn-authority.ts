@@ -5,7 +5,8 @@ export type AutomaticTurnSource =
 	| "loop_mode_autonomous_wake"
 	| "active_goal_continuation"
 	| "active_async_result_wake"
-	| "bounded_transport_or_protocol_retry";
+	| "bounded_transport_or_protocol_retry"
+	| "peer_message_wake";
 
 export type AutomaticTurnOutcomeStatus = "accepted" | "started" | "deferred" | "rejected" | "failed";
 

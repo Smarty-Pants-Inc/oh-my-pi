@@ -12,6 +12,14 @@ describe("automatic turn authority", () => {
 		expect(authority.outcomes().map(outcome => outcome.status)).toEqual(["rejected", "accepted", "rejected"]);
 	});
 
+	it("allows registered peer-message wakes without an asynchronous origin", () => {
+		const authority = new AutomaticTurnAuthority();
+		expect(authority.authorize("peer_message_wake")).toBe(true);
+		expect(authority.outcomes()).toEqual([
+			expect.objectContaining({ source: "peer_message_wake", status: "accepted" }),
+		]);
+	});
+
 	it("records queue, start, defer, and failure outcomes without conflating them", () => {
 		const authority = new AutomaticTurnAuthority();
 		authority.record("active_goal_continuation", "accepted", "queued");
