@@ -247,6 +247,89 @@ describe("AgentSession handoff", () => {
 		expect(branchDuringHandoff).toHaveLength(2);
 	});
 
+	it("waits for an accepted peer wake before capturing the handoff snapshot", async () => {
+		const beforeStartEntered = Promise.withResolvers<void>();
+		const releaseBeforeStart = Promise.withResolvers<void>();
+		await session.dispose();
+		sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
+		const initialUser = {
+			role: "user" as const,
+			content: [{ type: "text" as const, text: "seed" }],
+			timestamp: Date.now() - 2,
+		};
+		const initialAssistant: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "seed response" }],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			stopReason: "stop",
+			usage: {
+				input: 16,
+				output: 8,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 24,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now() - 1,
+		};
+		const initialMessages: AgentMessage[] = [initialUser, initialAssistant];
+		sessionManager.appendMessage(initialUser);
+		sessionManager.appendMessage(initialAssistant);
+		const extensionRunner = {
+			hasHandlers: vi.fn(() => false),
+			emitBeforeAgentStart: vi.fn(async () => {
+				beforeStartEntered.resolve();
+				await releaseBeforeStart.promise;
+				return undefined;
+			}),
+			emitBeforeSessionMutation: vi.fn().mockResolvedValue(undefined),
+			emit: vi.fn().mockResolvedValue(undefined),
+			emitWithHostCompletion: vi.fn(async (_event: { type: string }, completion?: () => void | Promise<void>) => {
+				await completion?.();
+			}),
+		} as unknown as ExtensionRunner;
+		const mock = createMockModel({ handler: () => ({ content: ["wake response"] }) });
+		session = new AgentSession({
+			agent: new Agent({
+				getApiKey: () => "test-key",
+				initialState: { model, systemPrompt: ["Test"], tools: [], messages: initialMessages },
+				streamFn: mock.stream,
+			}),
+			sessionManager,
+			settings: Settings.isolated({ "compaction.enabled": true, "compaction.autoContinue": false }),
+			modelRegistry,
+			extensionRunner,
+			obfuscator,
+		});
+
+		let capturedMessages = "";
+		const generationStarted = Promise.withResolvers<void>();
+		const generateHandoffSpy = vi
+			.spyOn(compactionModule, "generateHandoffFromContext")
+			.mockImplementation(async context => {
+				capturedMessages = JSON.stringify(context.messages);
+				generationStarted.resolve();
+				return "## Goal\nContinue from here";
+			});
+		const wakeText = "include this accepted wake in the handoff snapshot";
+		const sending = session.sendCustomMessage(
+			{ customType: "peer-message", content: wakeText, display: true, attribution: "agent" },
+			{ deliveryMode: "auto", automaticTurnSource: "peer_message_wake" },
+		);
+		await beforeStartEntered.promise;
+
+		const handingOff = session.handoff();
+		await Promise.race([generationStarted.promise, Bun.sleep(50)]);
+		expect(generateHandoffSpy).not.toHaveBeenCalled();
+
+		releaseBeforeStart.resolve();
+		await expect(sending).resolves.toEqual({ status: "accepted", delivery: "started_turn" });
+		await expect(handingOff).resolves.toMatchObject({ document: "## Goal\nContinue from here" });
+		expect(capturedMessages).toContain(wakeText);
+	});
+
 	it("does not run auto-compaction after handoff turn completes", async () => {
 		const handoffText = "## Goal\nContinue from here";
 		const generateHandoffSpy = vi
@@ -2360,6 +2443,87 @@ describe("AgentSession handoff", () => {
 		expect(sessionManager.getEntries().filter(entry => entry.type === "compaction")).toHaveLength(0);
 	});
 
+	it("completes pre-prompt auto-handoff for a scoped peer wake without waiting on itself", async () => {
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected built-in anthropic model to exist");
+
+		await session.dispose();
+		sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
+		const seedUser = {
+			role: "user" as const,
+			content: [{ type: "text" as const, text: "seed" }],
+			timestamp: Date.now() - 2,
+		};
+		const seedAssistant: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "seed response" }],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			stopReason: "stop",
+			usage: {
+				input: 16,
+				output: 8,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 24,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now() - 1,
+		};
+		sessionManager.appendMessage(seedUser);
+		sessionManager.appendMessage(seedAssistant);
+
+		const mock = createMockModel({ handler: () => ({ content: ["wake response"] }) });
+		session = new AgentSession({
+			agent: new Agent({
+				getApiKey: () => "test-key",
+				initialState: { model, systemPrompt: ["Test"], tools: [], messages: [seedUser, seedAssistant] },
+				streamFn: mock.stream,
+			}),
+			sessionManager,
+			settings: Settings.isolated({
+				"compaction.enabled": true,
+				"compaction.autoContinue": false,
+				"compaction.strategy": "handoff",
+				"compaction.thresholdTokens": 1,
+				"contextPromotion.enabled": false,
+			}),
+			modelRegistry,
+			obfuscator,
+		});
+		const generateHandoffSpy = vi
+			.spyOn(compactionModule, "generateHandoffFromContext")
+			.mockResolvedValue("## Goal\nContinue from here");
+		const marker = "wake after pre-prompt handoff";
+		let committed = 0;
+
+		const disposition = await withTimeout(
+			session.sendCustomMessage(
+				{
+					customType: "peer-message",
+					content: marker,
+					display: true,
+					attribution: "agent",
+				},
+				{
+					deliveryMode: "auto",
+					automaticTurnSource: "peer_message_wake",
+					onStartedTurnAccepted: () => committed++,
+				},
+			),
+			2_000,
+			"Timed out waiting for scoped peer wake auto-handoff",
+		);
+
+		expect(disposition).toEqual({ status: "accepted", delivery: "started_turn" });
+		expect(committed).toBe(1);
+		expect(generateHandoffSpy).toHaveBeenCalledTimes(1);
+		expect(mock.calls).toHaveLength(1);
+		expect(JSON.stringify(sessionManager.getBranch())).toContain(marker);
+	});
+
 	it("does not start agent.continue when threshold-handoff defers and todos are incomplete", async () => {
 		// Reproduces the user-reported race: at agent_end, threshold + handoff strategy
 		// schedules a deferred handoff and returns. The handler used to fall through to
@@ -2599,7 +2763,7 @@ describe("AgentSession handoff", () => {
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMessage] });
 		await waitFor(() => events.filter(event => event.type === "auto_compaction_end").length === 1);
 
-		expect(generateHandoffSpy).toHaveBeenCalledTimes(1);
+		expect(generateHandoffSpy).not.toHaveBeenCalled();
 		expect(emitSpy).toHaveBeenCalledWith({ type: "session_before_switch", reason: "handoff" });
 		expect(emitSpy).not.toHaveBeenCalledWith(expect.objectContaining({ type: "session_switch" }));
 		expect(completionSpy).not.toHaveBeenCalledWith({ type: "session_rollback" });

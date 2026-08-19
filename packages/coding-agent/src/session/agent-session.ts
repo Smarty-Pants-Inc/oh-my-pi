@@ -605,9 +605,7 @@ export class AgentSession {
 	#pendingExplicitPromptMessages: CustomMessage[] = [];
 	/** Durable queued semantic deliveries not yet persisted into conversation history. */
 	#pendingSemanticDeliveryIds = new Set<string>();
-	#semanticDeliveryAcceptanceCount = 0;
-	#semanticDeliveryAcceptancesSettled: Promise<void> = Promise.resolve();
-	#resolveSemanticDeliveryAcceptances: (() => void) | undefined;
+	#semanticDeliveryAcceptances = new Set<Promise<void>>();
 	#queuedMessageDrainScheduled = false;
 	#planModeState: PlanModeState | undefined;
 	/** Session-scoped `/vision` override; undefined = follow persisted `inspect_image.mode`. */
@@ -1738,7 +1736,10 @@ export class AgentSession {
 			getContextUsage: options => this.getContextUsage(options),
 			shake: (mode, options) => this.shake(mode, options),
 			dropImages: () => this.dropImages(),
-			runHandoff: (customInstructions, options) => this.handoff(customInstructions, options),
+			runHandoff: (customInstructions, options, semanticDeliveryAcceptance) =>
+				semanticDeliveryAcceptance === undefined
+					? this.handoff(customInstructions, options)
+					: this.handoff(customInstructions, options, semanticDeliveryAcceptance),
 			removeAssistantMessageFromActiveContext: message =>
 				this.#recovery.removeAssistantMessageFromActiveContext(message),
 			dropPersistedAssistantTurn: message => this.#recovery.dropPersistedAssistantTurn(message),
@@ -1758,7 +1759,8 @@ export class AgentSession {
 			modelRegistry: this.#modelRegistry,
 			extensionRunner: this.#extensionRunner,
 			sideStreamFn: this.#sideStreamFn,
-			beginLifecycleTransaction: () => this.#beginLifecycleTransaction(),
+			beginLifecycleTransaction: semanticDeliveryAcceptance =>
+				this.#beginLifecycleTransaction({}, semanticDeliveryAcceptance),
 			obfuscator: this.#obfuscator,
 			model: () => this.model,
 			thinkingLevel: () => this.thinkingLevel,
@@ -2271,11 +2273,12 @@ export class AgentSession {
 	/** Acquire the one fence that spans acceptance settlement, capture, selection, host publication, and activation. */
 	async #beginLifecycleTransaction(
 		options: { persistDetachedBash?: boolean } = {},
+		exemptSemanticDeliveryAcceptance?: Promise<void>,
 	): Promise<SessionLifecycleTransaction> {
 		if (this.#isDisposed) throw new Error("Cannot start a lifecycle transaction after session disposal");
 		const releaseFence = this.#acquireLifecycleTransitionFence();
 		try {
-			await this.#semanticDeliveryAcceptancesSettled;
+			await this.#waitForSemanticDeliveryAcceptances(exemptSemanticDeliveryAcceptance);
 			this.#disconnectFromAgent();
 		} catch (error) {
 			releaseFence();
@@ -2307,7 +2310,7 @@ export class AgentSession {
 			};
 			const lifecycle = new SessionLifecycleTransaction({
 				captureRetainedCheckpoint: async captureOptions => {
-					await this.#semanticDeliveryAcceptancesSettled;
+					await this.#waitForSemanticDeliveryAcceptances(exemptSemanticDeliveryAcceptance);
 					return captureRetainedSessionCheckpoint(lifecycleHost, captureOptions);
 				},
 				beginOwnership: () => new SessionLifecycleOwner(lifecycleHost, options),
@@ -2348,7 +2351,7 @@ export class AgentSession {
 	async #beginSemanticDeliveryMaintenance(): Promise<() => void> {
 		const releaseFence = this.#acquireLifecycleTransitionFence();
 		try {
-			await this.#semanticDeliveryAcceptancesSettled;
+			await this.#waitForSemanticDeliveryAcceptances();
 			return releaseFence;
 		} catch (error) {
 			releaseFence();
@@ -5306,7 +5309,7 @@ export class AgentSession {
 		}
 		const releaseSemanticFence = this.#acquireLifecycleTransitionFence();
 		try {
-			await this.#semanticDeliveryAcceptancesSettled;
+			await this.#waitForSemanticDeliveryAcceptances();
 			if (this.isStreaming || this.isBashRunning || this.isEvalRunning) return undefined;
 			const droppedCount = this.agent.state.messages.length;
 
@@ -5797,7 +5800,7 @@ export class AgentSession {
 		if (this.#provisionalPeerMessageWake !== undefined) {
 			throw new Error("Compaction is unavailable while a peer-message wake awaits provider response acceptance");
 		}
-		if (this.#semanticDeliveryAcceptanceCount > 0 && this.#extensionRunner?.isHandlingEvent?.()) {
+		if (this.#semanticDeliveryAcceptances.size > 0 && this.#extensionRunner?.isHandlingEvent?.()) {
 			throw new Error("Compaction is unavailable while semantic message delivery is being accepted");
 		}
 		return this.#maintenance.compact(customInstructions, options);
@@ -6668,7 +6671,12 @@ export class AgentSession {
 			skipPostPromptRecoveryWait?: boolean;
 			acceptTerminalEmptyStop?: boolean;
 			consumeExplicitPromptMessages?: boolean;
-			automaticTurn?: { source: AutomaticTurnSource; originTurnId?: string; onStartSettled?: () => void };
+			automaticTurn?: {
+				source: AutomaticTurnSource;
+				originTurnId?: string;
+				onStartSettled?: () => void;
+				semanticDeliveryAcceptance?: Promise<void>;
+			};
 		},
 	): Promise<boolean> {
 		const abort = this.#abortPromise;
@@ -6887,7 +6895,7 @@ export class AgentSession {
 				messages.splice(xdevMountNoticeIndex, 0, xdevMountNotice);
 			}
 
-			await this.#maintenance.runPrePromptCompactionIfNeeded(messages);
+			await this.#maintenance.runPrePromptCompactionIfNeeded(messages, automaticTurn?.semanticDeliveryAcceptance);
 			if (this.#promptGeneration !== generation) {
 				return false;
 			}
@@ -7451,21 +7459,23 @@ export class AgentSession {
 		);
 	}
 
-	#beginSemanticDeliveryAcceptance(): () => void {
-		if (this.#semanticDeliveryAcceptanceCount++ === 0) {
-			const settled = Promise.withResolvers<void>();
-			this.#semanticDeliveryAcceptancesSettled = settled.promise;
-			this.#resolveSemanticDeliveryAcceptances = settled.resolve;
-		}
+	#beginSemanticDeliveryAcceptance(): { settled: Promise<void>; release: () => void } {
+		const settled = Promise.withResolvers<void>();
+		this.#semanticDeliveryAcceptances.add(settled.promise);
 		let released = false;
-		return () => {
-			if (released) return;
-			released = true;
-			this.#semanticDeliveryAcceptanceCount--;
-			if (this.#semanticDeliveryAcceptanceCount !== 0) return;
-			this.#resolveSemanticDeliveryAcceptances?.();
-			this.#resolveSemanticDeliveryAcceptances = undefined;
+		return {
+			settled: settled.promise,
+			release: () => {
+				if (released) return;
+				released = true;
+				this.#semanticDeliveryAcceptances.delete(settled.promise);
+				settled.resolve();
+			},
 		};
+	}
+
+	async #waitForSemanticDeliveryAcceptances(exempt?: Promise<void>): Promise<void> {
+		await Promise.all([...this.#semanticDeliveryAcceptances].filter(acceptance => acceptance !== exempt));
 	}
 
 	async #persistPendingSemanticDelivery(
@@ -7818,7 +7828,7 @@ export class AgentSession {
 		};
 		const normalizedAppMessage = await this.#normalizeAgentMessageImages(appMessage);
 		if (semanticMode) {
-			const releaseAcceptance = this.#beginSemanticDeliveryAcceptance();
+			const acceptance = this.#beginSemanticDeliveryAcceptance();
 			try {
 				this.onBeforeCustomMessageAcceptance?.();
 				if (this.#semanticDeliveryUnavailable(lifecycleGeneration)) {
@@ -7872,6 +7882,7 @@ export class AgentSession {
 					const prompt = this.#promptWithMessage(normalizedAppMessage, textContent, {
 						automaticTurn: {
 							source: options.automaticTurnSource,
+							semanticDeliveryAcceptance: acceptance.settled,
 							onStartSettled: () => {
 								// Commit the mailbox receipt before agent-loop can mutate context, then
 								// hold lifecycle acceptance until this exact input reaches session storage.
@@ -7948,7 +7959,7 @@ export class AgentSession {
 				else this.#pendingExplicitPromptMessages.push(queuedMessage);
 				return { status: "accepted", delivery: "queued_next_turn" };
 			} finally {
-				releaseAcceptance();
+				acceptance.release();
 			}
 		}
 		this.onBeforeCustomMessageAcceptance?.();
@@ -8804,8 +8815,12 @@ export class AgentSession {
 	 * @param options Handoff execution options
 	 * @returns The handoff document text, or undefined if cancelled/failed
 	 */
-	handoff(customInstructions?: string, options?: SessionHandoffOptions): Promise<HandoffResult | undefined> {
-		return this.#handoff.handoff(customInstructions, options);
+	handoff(
+		customInstructions?: string,
+		options?: SessionHandoffOptions,
+		semanticDeliveryAcceptance?: Promise<void>,
+	): Promise<HandoffResult | undefined> {
+		return this.#handoff.handoff(customInstructions, options, semanticDeliveryAcceptance);
 	}
 
 	#isTerminalToolResult(event: { toolName: string; isError?: boolean; result?: { details?: unknown } }): boolean {

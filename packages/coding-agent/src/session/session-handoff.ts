@@ -42,6 +42,8 @@ function throwIfHandoffAborted(signal: AbortSignal): void {
 	throw new Error("Handoff aborted by session");
 }
 
+const EMPTY_AUTO_HANDOFF = Symbol("empty auto-handoff");
+
 export interface PendingSemanticDeliveryHandoffQueues {
 	steering: AgentMessage[];
 	followUp: AgentMessage[];
@@ -61,7 +63,7 @@ export interface SessionHandoffHost {
 	modelRegistry: ModelRegistry;
 	extensionRunner: ExtensionRunner | undefined;
 	sideStreamFn: StreamFn;
-	beginLifecycleTransaction(): Promise<SessionLifecycleTransaction>;
+	beginLifecycleTransaction(semanticDeliveryAcceptance?: Promise<void>): Promise<SessionLifecycleTransaction>;
 	obfuscator: SecretObfuscator | undefined;
 	model(): Model | undefined;
 	thinkingLevel(): ThinkingLevel | undefined;
@@ -124,7 +126,11 @@ export class SessionHandoff {
 	 * @param options Handoff execution options
 	 * @returns The handoff document text, or undefined if cancelled/failed
 	 */
-	async handoff(customInstructions?: string, options?: SessionHandoffOptions): Promise<HandoffResult | undefined> {
+	async handoff(
+		customInstructions?: string,
+		options?: SessionHandoffOptions,
+		semanticDeliveryAcceptance?: Promise<void>,
+	): Promise<HandoffResult | undefined> {
 		this.#host.assertVibeSessionTransitionAllowed("handoff to a new session");
 		const entries = this.#host.sessionManager.getBranch();
 		const messageCount = entries.filter(e => e.type === "message").length;
@@ -164,6 +170,22 @@ export class SessionHandoff {
 			if (!apiKey) {
 				throw new Error(`No API key for ${model.provider}`);
 			}
+
+			const previousSessionFile = this.#host.sessionFile();
+			if (this.#host.extensionRunner?.hasHandlers("session_before_switch")) {
+				const result = (await this.#host.extensionRunner.emit({
+					type: "session_before_switch",
+					reason: "handoff",
+				})) as SessionBeforeSwitchResult | undefined;
+				if (result?.cancel) {
+					options?.onSwitchCancelled?.();
+					return undefined;
+				}
+			}
+
+			// Fence and settle accepted deliveries before capturing the request snapshot.
+			// Pre-prompt auto-handoff exempts only the wake whose prompt resumes in the target.
+			lifecycle = await this.#host.beginLifecycleTransaction(semanticDeliveryAcceptance);
 
 			// Build the handoff request through the SAME pipeline a live turn uses
 			// (`runEphemeralTurn` / `/btw` share it) so the oneshot reads the
@@ -243,26 +265,11 @@ export class SessionHandoff {
 				// Auto-handoff is best-effort: returning undefined lets maintenance fall
 				// back to context-full compaction. A user-initiated handoff must surface
 				// the failure instead of a silent, misleading "cancelled".
-				if (options?.autoTriggered) {
-					return undefined;
-				}
+				if (options?.autoTriggered) throw EMPTY_AUTO_HANDOFF;
 				throw new Error("Handoff generation produced no content");
 			}
 
-			// Start a new session only after every retained owner is rollback-capable.
-			const previousSessionFile = this.#host.sessionFile();
-			if (this.#host.extensionRunner?.hasHandlers("session_before_switch")) {
-				const result = (await this.#host.extensionRunner.emit({
-					type: "session_before_switch",
-					reason: "handoff",
-				})) as SessionBeforeSwitchResult | undefined;
-				if (result?.cancel) {
-					options?.onSwitchCancelled?.();
-					return undefined;
-				}
-			}
-
-			lifecycle = await this.#host.beginLifecycleTransaction();
+			// Every retained owner is now fenced before generation and remains rollback-capable.
 			if (this.#host.extensionRunner) {
 				lifecycle.markPublicationStarted();
 				await this.#host.extensionRunner.emitBeforeSessionMutation({ type: "session_switch" });
@@ -371,6 +378,7 @@ export class SessionHandoff {
 					cleanupReplacement: true,
 				});
 			}
+			if (error === EMPTY_AUTO_HANDOFF) return undefined;
 			// Only a genuine cancellation (user Esc or an unreasoned source-signal
 			// abort) maps to "Handoff cancelled". A harness-provided abort reason and
 			// provider failures surface verbatim.

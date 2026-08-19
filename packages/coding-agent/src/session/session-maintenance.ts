@@ -245,7 +245,11 @@ export interface SessionMaintenanceHost {
 	getContextUsage(options?: { contextWindow?: number }): ContextUsage | undefined;
 	shake(mode: ShakeMode, options?: { config?: ShakeConfig; signal?: AbortSignal }): Promise<ShakeResult>;
 	dropImages(): Promise<{ removed: number }>;
-	runHandoff(customInstructions?: string, options?: SessionHandoffOptions): Promise<HandoffResult | undefined>;
+	runHandoff(
+		customInstructions?: string,
+		options?: SessionHandoffOptions,
+		semanticDeliveryAcceptance?: Promise<void>,
+	): Promise<HandoffResult | undefined>;
 	removeAssistantMessageFromActiveContext(message: AssistantMessage): void;
 	dropPersistedAssistantTurn(message: AssistantMessage): Promise<string | undefined>;
 	runRecoveryCompactionWithRollback(
@@ -1020,7 +1024,10 @@ export class SessionMaintenance {
 		return compactionContextTokens(breakdown?.usedTokens ?? 0, localEstimate);
 	}
 
-	async runPrePromptCompactionIfNeeded(messages: AgentMessage[]): Promise<void> {
+	async runPrePromptCompactionIfNeeded(
+		messages: AgentMessage[],
+		semanticDeliveryAcceptance?: Promise<void>,
+	): Promise<void> {
 		const model = this.#model;
 		if (!model) return;
 		const contextWindow = model.contextWindow ?? 0;
@@ -1062,6 +1069,7 @@ export class SessionMaintenance {
 			autoContinue: false,
 			triggerContextTokens: contextTokens,
 			phase: "pre_turn",
+			semanticDeliveryAcceptance,
 		});
 	}
 
@@ -2180,6 +2188,7 @@ export class SessionMaintenance {
 			terminalTextAnswer?: boolean;
 			/** Mid-turn: splice history then return; do not await UI/extension fan-out. */
 			detachPostCommit?: boolean;
+			semanticDeliveryAcceptance?: Promise<void>;
 		} = {},
 	): Promise<CompactionCheckResult> {
 		const compactionSettings = this.#host.settings.getGroup("compaction");
@@ -2272,13 +2281,17 @@ export class SessionMaintenance {
 			if (action === "handoff") {
 				let handoffSwitchCancelled = false;
 				const handoffFocus = AUTO_HANDOFF_THRESHOLD_FOCUS;
-				const handoffResult = await this.#host.runHandoff(handoffFocus, {
+				const handoffOptions: SessionHandoffOptions = {
 					autoTriggered: true,
 					signal: autoCompactionSignal,
 					onSwitchCancelled: () => {
 						handoffSwitchCancelled = true;
 					},
-				});
+				};
+				const handoffResult =
+					options.semanticDeliveryAcceptance === undefined
+						? await this.#host.runHandoff(handoffFocus, handoffOptions)
+						: await this.#host.runHandoff(handoffFocus, handoffOptions, options.semanticDeliveryAcceptance);
 				if (!handoffResult) {
 					const aborted = autoCompactionSignal.aborted || handoffSwitchCancelled;
 					if (aborted) {
