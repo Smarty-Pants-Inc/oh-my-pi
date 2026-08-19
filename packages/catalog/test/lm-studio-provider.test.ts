@@ -19,6 +19,7 @@ describe("lm studio local provider discovery", () => {
 								max_context_length: 262144,
 							},
 							{ id: "plain-llm", type: "llm" },
+							{ id: "Qwen3.8-27B-UD-Q6_K_XL", type: "llm" },
 						],
 					}),
 					{ status: 200, headers: { "Content-Type": "application/json" } },
@@ -30,6 +31,7 @@ describe("lm studio local provider discovery", () => {
 						data: [
 							{ id: "qwen/qwen3.6-27b", object: "model" },
 							{ id: "plain-llm", object: "model" },
+							{ id: "Qwen3.8-27B-UD-Q6_K_XL", object: "model" },
 						],
 					}),
 					{ status: 200, headers: { "Content-Type": "application/json" } },
@@ -41,11 +43,13 @@ describe("lm studio local provider discovery", () => {
 		const models = await lmStudioModelManagerOptions({ fetch: fetchMock }).fetchDynamicModels?.();
 		const vision = models?.find(model => model.id === "qwen/qwen3.6-27b");
 		const text = models?.find(model => model.id === "plain-llm");
+		const qwen38 = models?.find(model => model.id === "Qwen3.8-27B-UD-Q6_K_XL");
 
 		expect(requestedUrls).toContain("http://127.0.0.1:1234/api/v0/models");
 		expect(vision?.input).toEqual(["text", "image"]);
 		expect(vision?.contextWindow).toBe(262144);
 		expect(text?.input).toEqual(["text"]);
+		expect(qwen38?.reasoning).toBe(true);
 	});
 
 	test("prefers the loaded context window over the architectural maximum", async () => {

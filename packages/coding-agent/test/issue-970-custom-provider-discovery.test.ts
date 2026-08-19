@@ -4,7 +4,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
+import { normalizeQwenTemplateReasoning } from "@oh-my-pi/pi-coding-agent/config/model-discovery";
 import type { ModelRegistry, ProviderDiscoveryState } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { ModelRegistry as ModelRegistryImpl } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -110,17 +112,23 @@ describe("issue #970 custom provider discovery", () => {
 			const headers = init?.headers as Headers | Record<string, string> | undefined;
 			const authHeader = headers instanceof Headers ? headers.get("Authorization") : headers?.Authorization;
 			expect(authHeader).toBe("Bearer sk-1234");
-			return new Response(JSON.stringify({ data: [{ id: "qwen3.6" }, { id: "vllm-lab-fork-b2" }] }), {
-				status: 200,
-				headers: { "Content-Type": "application/json" },
-			});
+			return new Response(
+				JSON.stringify({
+					data: [{ id: "qwen3.6" }, { id: "Qwen3.8-27B-UD-Q6_K_XL" }, { id: "vllm-lab-fork-b2" }],
+				}),
+				{ status: 200, headers: { "Content-Type": "application/json" } },
+			);
 		};
 
 		const registry = new ModelRegistryImpl(authStorage, modelsPath, { fetch: fetchMock });
 		await registry.refreshProvider("vllm");
 
 		const providerModels = registry.getAll().filter(model => model.provider === "vllm");
-		expect(providerModels.map(model => model.id).sort()).toEqual(["qwen3.6", "vllm-lab-fork-b2"]);
+		expect(providerModels.map(model => model.id).sort()).toEqual([
+			"Qwen3.8-27B-UD-Q6_K_XL",
+			"qwen3.6",
+			"vllm-lab-fork-b2",
+		]);
 		expect(registry.getProviderDiscoveryState("vllm")?.status).toBe("ok");
 
 		const qwen = registry.find("vllm", "qwen3.6");
@@ -130,6 +138,19 @@ describe("issue #970 custom provider discovery", () => {
 		expect(qwen?.contextWindow).toBe(128000);
 		expect(qwen?.maxTokens).toBe(8192);
 
+		const qwen38 = registry.find("vllm", "Qwen3.8-27B-UD-Q6_K_XL");
+		expect(qwen38?.reasoning).toBe(true);
+		expect(qwen38?.thinking).toMatchObject({
+			mode: "effort",
+			efforts: ["low", "medium", "xhigh"],
+			requiresEffort: true,
+		});
+		expect(qwen38?.compat).toMatchObject({
+			thinkingFormat: "qwen-chat-template",
+			reasoningDisableMode: "qwen-template-false",
+			qwenTemplateReasoningEffort: true,
+		});
+
 		const deepseek = registry.find("vllm", "vllm-lab-fork-b2");
 		expect(deepseek?.api).toBe("openai-completions");
 		expect(deepseek?.provider).toBe("vllm");
@@ -138,6 +159,24 @@ describe("issue #970 custom provider discovery", () => {
 		expect(deepseek?.maxTokens).toBe(32_768);
 	});
 
+	test("upgrades warm local Qwen cache rows when compat proves template effort support", () => {
+		const cached = buildModel({
+			id: "Qwen3.8-27B-UD-Q6_K_XL",
+			name: "Qwen3.8-27B-UD-Q6_K_XL",
+			provider: "vllm",
+			api: "openai-completions",
+			baseUrl: "http://192.168.5.3:8085/v1",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 32_768,
+		});
+		expect(cached.compat.qwenTemplateReasoningEffort).toBe(true);
+		const normalized = normalizeQwenTemplateReasoning(cached);
+		expect(normalized.reasoning).toBe(true);
+		expect(normalized.thinking?.efforts).toEqual([Effort.Low, Effort.Medium, Effort.XHigh]);
+	});
 	test("shows a provider-tab hint when discovery succeeds but returns zero models", async () => {
 		installTestTheme();
 		const hub = await createHub({

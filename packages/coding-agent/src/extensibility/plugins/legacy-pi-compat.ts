@@ -2180,6 +2180,22 @@ export async function __collectLegacyPiExtensionSourcesForTests(
 	return graph.modules;
 }
 
+/** Prove every extension-owned source module resolves inside one approved package root. */
+export async function isExtensionSourceGraphContained(entryPath: string, packageRoot: string): Promise<boolean> {
+	const [entryRealPath, packageRealPath] = await Promise.all([
+		realpathOrSelfUncached(path.resolve(entryPath)),
+		fs.promises.realpath(path.resolve(packageRoot)),
+	]);
+	const graph = await collectExtensionModules(entryRealPath);
+	if (!graph.modules.has(entryRealPath)) return false;
+	for (const modulePath of graph.modules.keys()) {
+		const resolvedModulePath = await realpathOrSelfUncached(modulePath);
+		const relative = path.relative(packageRealPath, resolvedModulePath);
+		if (relative.startsWith(`..${path.sep}`) || relative === ".." || path.isAbsolute(relative)) return false;
+	}
+	return true;
+}
+
 /**
  * Discovers CommonJS export names Bun normally exposes to ESM importers. The
  * bridge must declare them statically because its default export is synthetic.

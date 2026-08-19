@@ -13,6 +13,7 @@ import {
 	approvedCandidateSourceMatches,
 	assertTrackedManifestCurrent,
 	canonicalGithubRepository,
+	isApprovedCandidateSource,
 	parseContentManifest,
 	parseContextReleaseManifest,
 	trackedContentManifest,
@@ -71,7 +72,7 @@ describe("tracked context manifest", () => {
 		expect(canonicalGithubRepository("https://example.com/Smarty-Pants-Inc/oh-my-pi.git")).toBeUndefined();
 	});
 
-	it("binds extension additions to exact candidate identity and bytes", () => {
+	it("binds extension packages to approved identity, tree, and clean source", () => {
 		const identity = {
 			repository: "Smarty-Pants-Inc/oh-my-pi",
 			baseCommit: "c".repeat(40),
@@ -81,15 +82,138 @@ describe("tracked context manifest", () => {
 			scopeCoverage: [{ path: "packages/coding-agent/src/context/manifest.ts", requirement: "§8.6" }],
 		};
 		const release = { candidates: [identity] };
+		const packageTree = "e".repeat(40);
+		expect(approvedCandidateSourceMatches(identity.repository, identity, packageTree, packageTree, "", release)).toBe(
+			true,
+		);
 		expect(
-			approvedCandidateSourceMatches(identity.repository, identity, "c".repeat(64), "c".repeat(64), release),
-		).toBe(true);
-		expect(
-			approvedCandidateSourceMatches(identity.repository, identity, "c".repeat(64), "d".repeat(64), release),
+			approvedCandidateSourceMatches(identity.repository, identity, packageTree, "f".repeat(40), "", release),
 		).toBe(false);
 		expect(
-			approvedCandidateSourceMatches("other/repository", identity, "c".repeat(64), "c".repeat(64), release),
+			approvedCandidateSourceMatches(
+				identity.repository,
+				identity,
+				packageTree,
+				packageTree,
+				" M source.ts",
+				release,
+			),
 		).toBe(false);
+		expect(approvedCandidateSourceMatches("other/repository", identity, packageTree, packageTree, "", release)).toBe(
+			false,
+		);
+	});
+
+	it("keeps an approved symlinked package active after unrelated commits and rejects package drift", async () => {
+		const repositoryRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-approved-extension-"));
+		const packageRoot = path.join(repositoryRoot, "packages/plugin");
+		const linkedRoot = path.join(repositoryRoot, "linked-plugin");
+		const indexPath = path.join(packageRoot, "src/index.ts");
+		const linkedIndexPath = path.join(linkedRoot, "src/index.ts");
+		const storePath = path.join(packageRoot, "src/store.ts");
+		const runGit = (...args: string[]): string => {
+			const result = Bun.spawnSync(["git", ...args], { cwd: repositoryRoot, stdout: "pipe", stderr: "pipe" });
+			if (result.exitCode !== 0) throw new Error(result.stderr.toString());
+			return result.stdout.toString().trim();
+		};
+		try {
+			await fs.mkdir(path.dirname(indexPath), { recursive: true });
+			await Promise.all([
+				Bun.write(path.join(packageRoot, "package.json"), '{"name":"test-plugin"}\n'),
+				Bun.write(indexPath, 'import "./store.js";\nexport default function plugin() {}\n'),
+				Bun.write(storePath, "export const value = 1;\n"),
+				Bun.write(path.join(repositoryRoot, ".gitignore"), "packages/plugin/src/store.js\n"),
+			]);
+			await fs.symlink(packageRoot, linkedRoot);
+			runGit("init", "-q");
+			runGit("config", "user.name", "OMP Test");
+			runGit("config", "user.email", "omp-test@example.com");
+			runGit("remote", "add", "origin", "https://github.com/Smarty-Pants-Inc/smarty-dev.git");
+			runGit("add", ".");
+			runGit("commit", "-qm", "approved package");
+			const commit = runGit("rev-parse", "HEAD");
+			const tree = runGit("rev-parse", "HEAD^{tree}");
+			const release = {
+				candidates: [{ repository: "Smarty-Pants-Inc/smarty-dev", commit, tree }],
+			} as unknown as Parameters<typeof isApprovedCandidateSource>[1];
+
+			await Bun.write(path.join(repositoryRoot, "unrelated.txt"), "later commit\n");
+			runGit("add", "unrelated.txt");
+			runGit("commit", "-qm", "unrelated change");
+			const unrelatedCommit = runGit("rev-parse", "HEAD");
+			expect(await isApprovedCandidateSource(linkedIndexPath, release)).toBe(true);
+
+			await Bun.write(storePath, "export const value = 2;\n");
+			expect(await isApprovedCandidateSource(linkedIndexPath, release)).toBe(false);
+			runGit("checkout", "--", "packages/plugin/src/store.ts");
+
+			const untrackedPath = path.join(packageRoot, "src/untracked.ts");
+			await Bun.write(untrackedPath, "export {};\n");
+			expect(await isApprovedCandidateSource(linkedIndexPath, release)).toBe(false);
+			await fs.rm(untrackedPath);
+
+			const ignoredShadowPath = path.join(packageRoot, "src/store.js");
+			await Bun.write(ignoredShadowPath, "export const value = 3;\n");
+			expect(await isApprovedCandidateSource(linkedIndexPath, release)).toBe(false);
+			await fs.rm(ignoredShadowPath);
+
+			await Bun.write(path.join(packageRoot, "package.json"), '{"name":"changed-plugin"}\n');
+			runGit("add", "packages/plugin/package.json");
+			runGit("commit", "-qm", "change package");
+			expect(await isApprovedCandidateSource(linkedIndexPath, release)).toBe(false);
+			runGit("reset", "--hard", unrelatedCommit);
+			expect(await isApprovedCandidateSource(linkedIndexPath, release)).toBe(true);
+		} finally {
+			await fs.rm(repositoryRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects extension graphs that escape their approved package or lack a candidate package root", async () => {
+		const repositoryRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-contained-extension-"));
+		const directRoot = path.join(repositoryRoot, "packages/direct");
+		const symlinkRoot = path.join(repositoryRoot, "packages/symlink");
+		const noManifestRoot = path.join(repositoryRoot, "loose");
+		const runGit = (...args: string[]): string => {
+			const result = Bun.spawnSync(["git", ...args], { cwd: repositoryRoot, stdout: "pipe", stderr: "pipe" });
+			if (result.exitCode !== 0) throw new Error(result.stderr.toString());
+			return result.stdout.toString().trim();
+		};
+		try {
+			await Promise.all([
+				fs.mkdir(path.join(directRoot, "src"), { recursive: true }),
+				fs.mkdir(path.join(symlinkRoot, "src"), { recursive: true }),
+				fs.mkdir(noManifestRoot, { recursive: true }),
+			]);
+			await Promise.all([
+				Bun.write(path.join(repositoryRoot, "shared.ts"), "export const shared = true;\n"),
+				Bun.write(path.join(directRoot, "package.json"), '{"name":"direct-plugin"}\n'),
+				Bun.write(
+					path.join(directRoot, "src/index.ts"),
+					'import "../../../shared.ts";\nexport default () => {};\n',
+				),
+				Bun.write(path.join(symlinkRoot, "package.json"), '{"name":"symlink-plugin"}\n'),
+				Bun.write(path.join(symlinkRoot, "src/index.ts"), 'import "./external.js";\nexport default () => {};\n'),
+				Bun.write(path.join(noManifestRoot, "index.ts"), "export default () => {};\n"),
+			]);
+			await fs.symlink("../../../shared.ts", path.join(symlinkRoot, "src/external.ts"));
+			runGit("init", "-q");
+			runGit("config", "user.name", "OMP Test");
+			runGit("config", "user.email", "omp-test@example.com");
+			runGit("remote", "add", "origin", "https://github.com/Smarty-Pants-Inc/smarty-dev.git");
+			runGit("add", ".");
+			runGit("commit", "-qm", "approved package graphs");
+			const commit = runGit("rev-parse", "HEAD");
+			const tree = runGit("rev-parse", "HEAD^{tree}");
+			const release = {
+				candidates: [{ repository: "Smarty-Pants-Inc/smarty-dev", commit, tree }],
+			} as unknown as Parameters<typeof isApprovedCandidateSource>[1];
+
+			expect(await isApprovedCandidateSource(path.join(directRoot, "src/index.ts"), release)).toBe(false);
+			expect(await isApprovedCandidateSource(path.join(symlinkRoot, "src/index.ts"), release)).toBe(false);
+			expect(await isApprovedCandidateSource(path.join(noManifestRoot, "index.ts"), release)).toBe(false);
+		} finally {
+			await fs.rm(repositoryRoot, { recursive: true, force: true });
+		}
 	});
 
 	it("parses an exact self-bound release record and rejects protected drift", () => {
