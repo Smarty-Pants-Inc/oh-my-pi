@@ -349,9 +349,9 @@ export interface AgentOptions {
 export interface AgentPromptOptions {
 	toolChoice?: ToolChoice;
 	/**
-	 * Called after the first provider stream is created successfully for this prompt.
-	 * Input events stay provisional until the callback returns; throwing leaves the
-	 * prompt uncommitted and suppresses a synthetic pre-dispatch error turn.
+	 * Called after the provider accepts the request and exposes response metadata or
+	 * the first non-error response event. Input events stay provisional until the
+	 * callback returns; throwing leaves the prompt uncommitted.
 	 */
 	onProviderCallStarted?: () => void;
 }

@@ -711,8 +711,12 @@ export class AgentSession {
 	#turnIndex = 0;
 	#messageEndPersistenceTail: Promise<void> = Promise.resolve();
 	#pendingMessageEndPersistence = new Map<string, Promise<void>>();
-	#messageEndPersistenceWaiters = new WeakMap<AgentMessage, () => void>();
+	#messageEndPersistenceWaiters = new WeakMap<
+		AgentMessage,
+		{ resolve: () => void; reject: (reason?: unknown) => void }
+	>();
 	#persistedMessageKeys: { anchor: string; keys: Set<string> } | undefined;
+	#provisionalPeerMessageWake: symbol | undefined;
 
 	// Custom commands (TypeScript slash commands)
 	#customCommands: LoadedCustomCommand[] = [];
@@ -3003,16 +3007,17 @@ export class AgentSession {
 	}
 
 	#waitForMessageEndPersistence(message: AgentMessage): Promise<void> {
-		const { promise, resolve } = Promise.withResolvers<void>();
-		this.#messageEndPersistenceWaiters.set(message, resolve);
+		const { promise, resolve, reject } = Promise.withResolvers<void>();
+		this.#messageEndPersistenceWaiters.set(message, { resolve, reject });
 		return promise;
 	}
 
-	#resolveMessageEndPersistenceWaiters(message: AgentMessage): void {
-		const resolve = this.#messageEndPersistenceWaiters.get(message);
-		if (!resolve) return;
+	#settleMessageEndPersistenceWaiter(message: AgentMessage, error?: unknown): void {
+		const waiter = this.#messageEndPersistenceWaiters.get(message);
+		if (!waiter) return;
 		this.#messageEndPersistenceWaiters.delete(message);
-		resolve();
+		if (error === undefined) waiter.resolve();
+		else waiter.reject(error);
 	}
 
 	/**
@@ -3159,6 +3164,8 @@ export class AgentSession {
 	}
 
 	async #persistMessageEnd(message: AgentMessage): Promise<void> {
+		const requireDurablePersistence = this.#messageEndPersistenceWaiters.has(message);
+		let failure: unknown;
 		try {
 			if (message.role === "hookMessage" || message.role === "custom") {
 				// Prewalk's plan nudge is a one-run steering instruction. Persisting it would
@@ -3190,11 +3197,18 @@ export class AgentSession {
 				if (message.role === "custom" && message.customType === "ttsr-injection") {
 					this.#ttsr.markInjectedFromDetails(message.details);
 				}
-				return;
+			} else {
+				this.#persistSessionMessageIfMissing(message);
 			}
-			this.#persistSessionMessageIfMissing(message);
+			if (requireDurablePersistence) {
+				await this.sessionManager.ensureOnDisk();
+				await this.sessionManager.flush();
+			}
+		} catch (error) {
+			failure = error;
+			throw error;
 		} finally {
-			this.#resolveMessageEndPersistenceWaiters(message);
+			this.#settleMessageEndPersistenceWaiter(message, failure);
 		}
 	}
 
@@ -5780,6 +5794,12 @@ export class AgentSession {
 
 	/** Compact the active session history. */
 	compact(customInstructions?: string, options?: CompactOptions): Promise<CompactionResult> {
+		if (this.#provisionalPeerMessageWake !== undefined) {
+			throw new Error("Compaction is unavailable while a peer-message wake awaits provider response acceptance");
+		}
+		if (this.#semanticDeliveryAcceptanceCount > 0 && this.#extensionRunner?.isHandlingEvent?.()) {
+			throw new Error("Compaction is unavailable while semantic message delivery is being accepted");
+		}
 		return this.#maintenance.compact(customInstructions, options);
 	}
 
@@ -6658,6 +6678,13 @@ export class AgentSession {
 			(message.role === "custom" && message.customType === "goal-continuation"
 				? { source: "active_goal_continuation" as const }
 				: undefined);
+		const provisionalPeerMessageWake =
+			automaticTurn?.source === "peer_message_wake" ? Symbol("provisional-peer-message-wake") : undefined;
+		const releaseProvisionalPeerMessageWake = () => {
+			if (this.#provisionalPeerMessageWake === provisionalPeerMessageWake) {
+				this.#provisionalPeerMessageWake = undefined;
+			}
+		};
 		const previousGoalContinuationContext = this.#goalContinuationContext;
 		if (automaticTurn?.source === "active_goal_continuation") this.#goalContinuationContext = true;
 		this.#closeCurrentTurn();
@@ -6669,6 +6696,7 @@ export class AgentSession {
 		let promptMessagesCommitted = false;
 		const previousPlanReferenceSent = this.#planReferenceSent;
 		try {
+			if (provisionalPeerMessageWake) this.#provisionalPeerMessageWake = provisionalPeerMessageWake;
 			await this.#recovery.maybeRestoreRetryFallbackPrimary();
 			if (!(await this.#runUsageAwarePreflightForNextModelCall())) return false;
 			// Flush any pending bash messages before the new prompt
@@ -6871,8 +6899,12 @@ export class AgentSession {
 							...(automaticTurn?.source === "peer_message_wake"
 								? {
 										onProviderCallStarted: () => {
-											this.#recordAutomaticTurnStarted("provider_call");
-											promptMessagesCommitted = true;
+											try {
+												this.#recordAutomaticTurnStarted("provider_call");
+												promptMessagesCommitted = true;
+											} finally {
+												releaseProvisionalPeerMessageWake();
+											}
 										},
 									}
 								: {}),
@@ -6960,6 +6992,7 @@ export class AgentSession {
 			}
 			return true;
 		} finally {
+			releaseProvisionalPeerMessageWake();
 			if (!promptMessagesCommitted) {
 				restorePromptMessages?.();
 				if (automaticTurn?.source === "peer_message_wake") this.#planReferenceSent = previousPlanReferenceSent;
@@ -7415,6 +7448,8 @@ export class AgentSession {
 		return (
 			this.#isDisposed ||
 			this.#lifecycleTransitionFenceActive ||
+			this.isCompacting ||
+			this.isGeneratingHandoff ||
 			lifecycleGeneration !== this.#lifecycleTransitionGeneration
 		);
 	}
@@ -7745,6 +7780,9 @@ export class AgentSession {
 		if (options?.deliveryMode && this.#isDisposed) return { status: "unavailable", reason: "session_transition" };
 		const lifecycleGeneration = this.#lifecycleTransitionGeneration;
 		const semanticMode = options?.deliveryMode;
+		if (options?.automaticTurnSource !== undefined && options.automaticTurnSource !== "peer_message_wake") {
+			throw new Error('automaticTurnSource must be "peer_message_wake"');
+		}
 		if (semanticMode && (options?.deliverAs !== undefined || options?.triggerTurn !== undefined)) {
 			throw new Error("deliveryMode cannot be combined with legacy delivery controls");
 		}
@@ -7817,6 +7855,9 @@ export class AgentSession {
 						);
 						return { status: "downgraded", delivery: "plain_append", reason: "unscoped_automatic_turn" };
 					}
+					if (this.#extensionRunner?.isHandlingEvent?.()) {
+						return { status: "unavailable", reason: "reentrant_extension_handler" };
+					}
 					if (this.#clientBridge?.deferAgentInitiatedTurns && !this.#allowAcpAgentInitiatedTurns) {
 						return { status: "unavailable", reason: "client_deferred_turn" };
 					}
@@ -7848,11 +7889,18 @@ export class AgentSession {
 									throw error;
 								}
 								providerStarted = true;
-								void this.#waitForMessageEndPersistence(normalizedAppMessage).then(() => {
-									if (startSettled) return;
-									startSettled = true;
-									start.resolve(true);
-								});
+								void this.#waitForMessageEndPersistence(normalizedAppMessage).then(
+									() => {
+										if (startSettled) return;
+										startSettled = true;
+										start.resolve(true);
+									},
+									error => {
+										if (startSettled) return;
+										startSettled = true;
+										start.reject(error);
+									},
+								);
 							},
 						},
 						acceptTerminalEmptyStop: options.acceptTerminalEmptyStop,
@@ -7871,7 +7919,9 @@ export class AgentSession {
 								}
 								return;
 							}
-							logger.warn("Scoped automatic turn failed after provider start", { error: String(error) });
+							logger.warn("Scoped automatic turn failed after provider response acceptance", {
+								error: String(error),
+							});
 						},
 					);
 					return (await start.promise)

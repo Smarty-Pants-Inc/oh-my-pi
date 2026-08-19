@@ -1031,9 +1031,20 @@ async function runLoopBody(
 	}
 
 	const softRequirementState = config.softToolRequirementState ?? { escalations: 0 };
+	const initialSoftRequirementState = {
+		id: softRequirementState.id,
+		forcedToolChoice: softRequirementState.forcedToolChoice,
+		escalations: softRequirementState.escalations,
+	};
 	let preserveSoftRequirementState = false;
 	let provisionalMessages: AgentMessage[] = [];
 	let providerCallAccepted = config.onProviderCallStarted === undefined;
+	let pendingHardToolChoiceRollback = false;
+	const rollbackPendingHardToolChoice = (): void => {
+		if (!pendingHardToolChoiceRollback) return;
+		pendingHardToolChoiceRollback = false;
+		config.onToolChoiceRejected?.();
+	};
 	const finishAgentStream = () =>
 		endAgentStream(stream, providerCallAccepted ? newMessages : [], telemetry, stepCounter.count);
 
@@ -1122,6 +1133,7 @@ async function runLoopBody(
 						const directive = signal?.aborted ? undefined : config.getToolChoice?.();
 						const softReq = isSoftToolRequirement(directive) ? directive : undefined;
 						hostToolChoice = directive === undefined || isSoftToolRequirement(directive) ? undefined : directive;
+						pendingHardToolChoiceRollback = hostToolChoice !== undefined;
 						softRequiredTool = softReq?.toolName;
 						softSatisfies = softReq?.satisfies;
 						const softRequirementId = softRequirementState.id;
@@ -1163,6 +1175,7 @@ async function runLoopBody(
 					}
 					if (!turnOpen && !signal?.aborted) {
 						try {
+							pendingHardToolChoiceRollback = false;
 							config.onToolChoiceRejected?.();
 						} catch (error) {
 							if (providerCallAccepted) {
@@ -1208,6 +1221,7 @@ async function runLoopBody(
 							...config,
 							onProviderCallStarted: () => {
 								config.onProviderCallStarted?.();
+								pendingHardToolChoiceRollback = false;
 								commitAsides(provisionalMessages);
 								provisionalMessages = [];
 								providerCallAccepted = true;
@@ -1223,6 +1237,7 @@ async function runLoopBody(
 				// Stream assistant response
 				let recovered: HarmonyRecoveredToolCall | undefined;
 				let message: AssistantMessage;
+				if (providerCallAccepted) pendingHardToolChoiceRollback = false;
 				try {
 					message = await streamAssistantResponse(
 						currentContext,
@@ -1531,7 +1546,11 @@ async function runLoopBody(
 	} finally {
 		discardAsides(provisionalMessages, new Error("Queued message was not committed before provider dispatch"));
 		discardAsides(pendingMessages, new Error("Aside message was not committed before the agent loop ended"));
-		if (!preserveSoftRequirementState) {
+		if (!providerCallAccepted) {
+			softRequirementState.id = initialSoftRequirementState.id;
+			softRequirementState.forcedToolChoice = initialSoftRequirementState.forcedToolChoice;
+			softRequirementState.escalations = initialSoftRequirementState.escalations;
+		} else if (!preserveSoftRequirementState) {
 			softRequirementState.id = undefined;
 			softRequirementState.forcedToolChoice = undefined;
 			softRequirementState.escalations = 0;
@@ -1539,6 +1558,7 @@ async function runLoopBody(
 		if (deadlineTimer) {
 			clearTimeout(deadlineTimer);
 		}
+		if (!providerCallAccepted) rollbackPendingHardToolChoice();
 	}
 }
 
@@ -1673,6 +1693,17 @@ async function streamAssistantResponse(
 			: providerAbortSignals.length === 1
 				? providerAbortSignals[0]!
 				: AbortSignal.any(providerAbortSignals);
+	let providerResponseAccepted = config.onProviderCallStarted === undefined;
+	const acceptProviderResponse = (): void => {
+		if (providerResponseAccepted) return;
+		try {
+			config.onProviderCallStarted?.();
+			providerResponseAccepted = true;
+		} catch (error) {
+			providerAcceptanceAbortController?.abort(error);
+			throw error;
+		}
+	};
 	const requestApiKey = (config.getApiKey ? await config.getApiKey(model) : undefined) ?? config.apiKey;
 	const resolvedApiKey = await resolveApiKeyOnce(requestApiKey, finalRequestSignal);
 	const apiKey = isApiKeyResolver(requestApiKey) ? seedApiKeyResolver(resolvedApiKey, requestApiKey) : requestApiKey;
@@ -1717,6 +1748,7 @@ async function streamAssistantResponse(
 	const userOnResponse = config.onResponse;
 	const captureOnResponse: AgentLoopConfig["onResponse"] = (response, modelInfo) => {
 		capturedHeaders = response.headers;
+		acceptProviderResponse();
 		return userOnResponse?.(response, modelInfo);
 	};
 
@@ -1756,7 +1788,6 @@ async function streamAssistantResponse(
 					onToolContracts: ownedDialect ? undefined : config.onToolContracts,
 					onResponse: captureOnResponse,
 				});
-				config.onProviderCallStarted?.();
 			} catch (error) {
 				providerAcceptanceAbortController?.abort(error);
 				throw error;
@@ -1779,6 +1810,24 @@ async function streamAssistantResponse(
 			let partialMessage: AssistantMessage | null = null;
 			let addedPartial = false;
 			const completedToolCallIds = new Set<string>();
+			let provisionalStartEvent: Extract<AssistantMessageEvent, { type: "start" }> | undefined;
+			const applyStartEvent = (event: Extract<AssistantMessageEvent, { type: "start" }>): void => {
+				partialMessage = event.partial;
+				if (addedPartial) {
+					context.messages[context.messages.length - 1] = partialMessage;
+					completedToolCallIds.clear();
+					const messageSnapshot = snapshotAssistantMessage(partialMessage);
+					stream.push({
+						type: "message_update",
+						assistantMessageEvent: snapshotAssistantMessageEvent(event, messageSnapshot),
+						message: messageSnapshot,
+					});
+				} else {
+					context.messages.push(partialMessage);
+					addedPartial = true;
+					stream.push({ type: "message_start", message: snapshotAssistantMessage(partialMessage) });
+				}
+			};
 
 			const responseIterator = response[Symbol.asyncIterator]();
 			const finishAbortedStream = async (): Promise<AssistantMessage> => {
@@ -1787,6 +1836,12 @@ async function streamAssistantResponse(
 					if (cleanup) void cleanup.catch(() => {});
 				} catch {
 					// Provider cancellation failures cannot change the committed aborted message.
+				}
+				if (!providerResponseAccepted) {
+					const reason = requestSignal?.reason;
+					throw reason instanceof Error
+						? reason
+						: new Error("Provider request aborted before response acceptance");
 				}
 				const aborted = emitAbortedAssistantMessage(
 					partialMessage,
@@ -1832,6 +1887,21 @@ async function streamAssistantResponse(
 					if (next.done) break;
 
 					const event = next.value;
+					if (event.type === "start" && !providerResponseAccepted) {
+						provisionalStartEvent = event;
+						continue;
+					}
+					if (event.type === "error" && !providerResponseAccepted) {
+						const failure = await response.result();
+						throw new Error(failure.errorMessage ?? "Provider request failed before response acceptance");
+					}
+					if (event.type !== "start" && event.type !== "error") {
+						acceptProviderResponse();
+						if (provisionalStartEvent) {
+							applyStartEvent(provisionalStartEvent);
+							provisionalStartEvent = undefined;
+						}
+					}
 					if (event.type === "done" || event.type === "error") {
 						let finalMessage = recoverTransientErrorToolTurn(
 							retainCompletedToolCalls(await response.result(), completedToolCallIds),
@@ -1894,25 +1964,7 @@ async function streamAssistantResponse(
 
 					switch (event.type) {
 						case "start":
-							partialMessage = event.partial;
-							if (addedPartial) {
-								context.messages[context.messages.length - 1] = partialMessage;
-								completedToolCallIds.clear();
-								// `message` and `assistantMessageEvent.partial` intentionally share one
-								// immutable snapshot of the streaming partial: every message_update
-								// consumer treats both as read-only, so cloning the identical partial
-								// twice per delta was pure waste.
-								const messageSnapshot = snapshotAssistantMessage(partialMessage);
-								stream.push({
-									type: "message_update",
-									assistantMessageEvent: snapshotAssistantMessageEvent(event, messageSnapshot),
-									message: messageSnapshot,
-								});
-							} else {
-								context.messages.push(partialMessage);
-								addedPartial = true;
-								stream.push({ type: "message_start", message: snapshotAssistantMessage(partialMessage) });
-							}
+							applyStartEvent(event);
 							break;
 
 						case "text_start":
@@ -1950,6 +2002,10 @@ async function streamAssistantResponse(
 				detachAbortListener?.();
 			}
 
+			if (!providerResponseAccepted) {
+				throw new Error("Provider stream ended before response acceptance");
+			}
+
 			let trailing = await response.result();
 			if (harmonyMitigationEnabled) {
 				const detection = detectHarmonyLeakInAssistantMessage(trailing);
@@ -1977,12 +2033,13 @@ async function streamAssistantResponse(
 			return trailing;
 		});
 	} catch (err) {
+		const finalError = err;
 		failChatSpan(telemetry, chatSpan, {
-			errorObject: err,
+			errorObject: finalError,
 			responseHeaders: capturedHeaders,
 			baseUrl: model.baseUrl,
 		});
-		throw err;
+		throw finalError;
 	}
 }
 

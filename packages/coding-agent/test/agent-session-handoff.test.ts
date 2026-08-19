@@ -213,6 +213,40 @@ describe("AgentSession handoff", () => {
 		vi.restoreAllMocks();
 	});
 
+	it("rejects a scoped peer wake while handoff generation owns the session", async () => {
+		const handoffStarted = Promise.withResolvers<void>();
+		const handoffGenerated = Promise.withResolvers<string>();
+		vi.spyOn(compactionModule, "generateHandoffFromContext").mockImplementation(async () => {
+			handoffStarted.resolve();
+			return await handoffGenerated.promise;
+		});
+		let committed = false;
+
+		const handoff = session.handoff();
+		await handoffStarted.promise;
+		expect(session.isGeneratingHandoff).toBe(true);
+		const disposition = await session.sendCustomMessage(
+			{ customType: "peer-message", content: "wait for handoff", display: true, attribution: "agent" },
+			{
+				deliveryMode: "auto",
+				automaticTurnSource: "peer_message_wake",
+				onStartedTurnAccepted: () => {
+					committed = true;
+				},
+			},
+		);
+		const agentMessagesDuringHandoff = [...session.agent.state.messages];
+		const branchDuringHandoff = sessionManager.getBranch();
+
+		handoffGenerated.resolve("## Goal\nContinue from here");
+		await handoff;
+
+		expect(disposition).toEqual({ status: "unavailable", reason: "session_transition" });
+		expect(committed).toBe(false);
+		expect(agentMessagesDuringHandoff).toHaveLength(0);
+		expect(branchDuringHandoff).toHaveLength(2);
+	});
+
 	it("does not run auto-compaction after handoff turn completes", async () => {
 		const handoffText = "## Goal\nContinue from here";
 		const generateHandoffSpy = vi

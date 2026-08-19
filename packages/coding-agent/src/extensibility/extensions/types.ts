@@ -1237,14 +1237,21 @@ export type SendMessageDisposition =
 			delivery: "queued_next_turn" | "plain_append";
 			reason: "client_deferred_turn" | "unscoped_automatic_turn";
 	  }
-	| { status: "unavailable"; reason: "client_deferred_turn" | "session_transition" | "prompt_preflight_cancelled" };
+	| {
+			status: "unavailable";
+			reason:
+				| "client_deferred_turn"
+				| "session_transition"
+				| "prompt_preflight_cancelled"
+				| "reentrant_extension_handler";
+	  };
 
 export interface SendMessageOptions {
 	/** Host-owned semantic delivery. The host either accepts this exact mode or performs no mutation. */
 	deliveryMode?: SendMessageDeliveryMode;
 	/** Registered scope that lets idle wake-capable semantic delivery start one peer-message turn. */
 	automaticTurnSource?: "peer_message_wake";
-	/** Runs synchronously at idle provider-start acceptance before session lifecycle handoff. */
+	/** Runs synchronously at idle provider-response acceptance before session lifecycle handoff. */
 	onStartedTurnAccepted?: () => void;
 	/** Legacy delivery controls. Do not combine with `deliveryMode`. */
 	triggerTurn?: boolean;

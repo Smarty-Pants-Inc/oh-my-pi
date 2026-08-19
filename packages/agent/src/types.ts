@@ -338,8 +338,9 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	beforeModelCall?: AgentBeforeModelCall;
 
 	/**
-	 * Called after the provider stream is created successfully, before response
-	 * events are consumed. Initial input events stay provisional until this returns.
+	 * Called after the provider accepts the request and exposes response metadata or
+	 * the first non-error response event. Initial input events stay provisional until
+	 * this returns.
 	 */
 	onProviderCallStarted?: () => void;
 

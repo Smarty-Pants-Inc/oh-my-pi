@@ -1403,6 +1403,12 @@ export class ExtensionRunner {
 		};
 	}
 
+	/** True only while an extension event handler is actively on the current async call chain. */
+	isHandlingEvent(): boolean {
+		const scope = this.#toolRegistrationScope.getStore();
+		return scope !== undefined && !scope.closed;
+	}
+
 	#isSessionBeforeEvent(event: RunnerEmitEvent): event is SessionBeforeEvent {
 		return (
 			event.type === "session_before_switch" ||

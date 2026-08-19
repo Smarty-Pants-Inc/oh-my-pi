@@ -3387,6 +3387,30 @@ describe("agentLoop pre-model-call gate", () => {
 		expect(mock.calls[0]?.options?.toolChoice).toBe("none");
 	});
 
+	it("returns a hard tool choice when provider preparation fails before response acceptance", async () => {
+		const mock = createMockModel({ responses: [{ content: ["done"] }] });
+		let toolChoiceCalls = 0;
+		let gateCalls = 0;
+		const agent = new Agent({
+			streamFn: mock.stream,
+			getToolChoice: () => {
+				toolChoiceCalls++;
+				return toolChoiceCalls === 1 ? "none" : "auto";
+			},
+		});
+		agent.setBeforeModelCall(() => {
+			if (gateCalls++ === 0) throw new Error("provider preparation failed");
+			return undefined;
+		});
+
+		await agent.prompt("first", { onProviderCallStarted: () => {} });
+		await agent.prompt("retry");
+
+		expect(toolChoiceCalls).toBe(1);
+		expect(mock.calls).toHaveLength(1);
+		expect(mock.calls[0]?.options?.toolChoice).toBe("none");
+	});
+
 	it("restores queued steering when a provisional prompt stops before provider dispatch", async () => {
 		const mock = createMockModel({ responses: [{ content: ["should not be reached"] }] });
 		const agent = new Agent({ streamFn: mock.stream });
@@ -3649,6 +3673,29 @@ describe("agentLoop pre-model-call gate", () => {
 		expect(gateCalls).toBe(1);
 		expect(gatedContext?.messages).toContain(reminder);
 		expect(mock.calls).toHaveLength(1);
+	});
+
+	it("re-injects a soft reminder after a provisional gate stop", async () => {
+		const reminder = createUserMessage("resolve the pending preview");
+		const mock = createMockModel({ responses: [{ content: ["done"], stopReason: "aborted" }] });
+		let gateCalls = 0;
+		const agent = new Agent({
+			streamFn: mock.stream,
+			getToolChoice: () => ({
+				soft: true,
+				id: "preview-1",
+				toolName: "echo",
+				reminder: [reminder],
+			}),
+		});
+		agent.setTools([echoTool([])]);
+		agent.setBeforeModelCall(() => (++gateCalls === 1 ? { stop: true, reason: "over budget" } : undefined));
+
+		await agent.prompt("first", { onProviderCallStarted: () => {} });
+		await agent.prompt("retry");
+
+		expect(mock.calls).toHaveLength(1);
+		expect(mock.calls[0]?.context.messages.filter(message => message === reminder)).toHaveLength(1);
 	});
 
 	it("retains a soft reminder escalation when a gate stops the forced call", async () => {
