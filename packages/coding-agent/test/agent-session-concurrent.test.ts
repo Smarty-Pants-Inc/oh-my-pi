@@ -952,15 +952,16 @@ describe("AgentSession concurrent prompt guard", () => {
 		expect(session.hasPendingMessages()).toBe(false);
 		session.setCustomMessageAcceptanceHookForTests(undefined);
 	});
-	it("rejects queued prompts when lifecycle ownership changes during normalization", async () => {
+	it("rejects prompts when lifecycle ownership changes during asynchronous preparation", async () => {
 		await createSession();
-		session.agent.state.isStreaming = true;
-		session.setQueuedPromptAcceptanceHookForTests(() => {
+		session.setPromptAcceptanceHookForTests(() => {
 			session.setLifecycleTransitionFenceForTests(true);
 			session.setLifecycleTransitionFenceForTests(false);
 		});
 
 		try {
+			await expect(session.prompt("idle across handoff")).rejects.toThrow("Session transition in progress");
+			session.agent.state.isStreaming = true;
 			await expect(session.prompt("queued across handoff", { streamingBehavior: "steer" })).rejects.toThrow(
 				"Session transition in progress",
 			);
@@ -973,7 +974,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			expect(session.agent.peekSteeringQueue()).toHaveLength(0);
 			expect(session.agent.peekFollowUpQueue()).toHaveLength(0);
 		} finally {
-			session.setQueuedPromptAcceptanceHookForTests(undefined);
+			session.setPromptAcceptanceHookForTests(undefined);
 			session.setLifecycleTransitionFenceForTests(false);
 		}
 	});

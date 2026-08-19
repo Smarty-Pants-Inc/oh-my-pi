@@ -272,6 +272,32 @@ describe("AgentSession handoff", () => {
 		}
 	});
 
+	it("rejects a prompt before handoff acquires the lifecycle fence", async () => {
+		const apiKeyStarted = Promise.withResolvers<void>();
+		const releaseApiKey = Promise.withResolvers<void>();
+		vi.spyOn(modelRegistry, "getApiKey").mockImplementationOnce(async () => {
+			apiKeyStarted.resolve();
+			await releaseApiKey.promise;
+			return "test-key";
+		});
+		vi.spyOn(compactionModule, "generateHandoffFromContext").mockResolvedValue("## Goal\nContinue from here");
+		const mock = createMockModel({ handler: () => ({ content: ["must not run"] }) });
+		session.agent.streamFn = mock.stream;
+
+		const handoff = session.handoff();
+		await apiKeyStarted.promise;
+		try {
+			expect(session.isGeneratingHandoff).toBe(true);
+			await expect(session.prompt("must not start before handoff fence")).rejects.toThrow(
+				"Session transition in progress",
+			);
+			expect(mock.calls).toHaveLength(0);
+		} finally {
+			releaseApiKey.resolve();
+			await handoff;
+		}
+	});
+
 	it("waits for an accepted peer wake to finish before capturing the handoff snapshot", async () => {
 		const beforeStartEntered = Promise.withResolvers<void>();
 		const releaseBeforeStart = Promise.withResolvers<void>();
