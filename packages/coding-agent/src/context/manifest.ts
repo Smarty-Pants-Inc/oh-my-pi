@@ -3,7 +3,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { YAML } from "bun";
 import trackedManifestSource from "../../generated/prompt-manifest.json" with { type: "text" };
-import { isExtensionSourceGraphContained } from "../extensibility/plugins/legacy-pi-compat";
 import { diff, fetch as gitFetch, ref, remote, repo, show, status } from "../utils/git";
 import { canonicalJson, compareUnicodeCodePoints, type JsonValue, sha256 } from "./canonical";
 import { computeImplementationSources } from "./implementation-sources";
@@ -644,6 +643,8 @@ export async function isApprovedCandidateSource(filePath: string, release: Conte
 		const sourceRoot = await approvedCandidateSourceRoot(repositoryRoot, resolved, candidate.commit);
 		if (!sourceRoot) return false;
 		const relativeSourceRoot = path.relative(repositoryRoot, sourceRoot).replaceAll(path.sep, "/");
+		// Keep runtime plugin graph loading outside native-free offline context commands.
+		const { isExtensionSourceGraphContained } = await import("../extensibility/plugins/legacy-pi-compat");
 		const [approvedPackageTree, headPackageTree, workingSourceStatus, sourceGraphContained] = await Promise.all([
 			ref.resolve(repositoryRoot, `${candidate.commit}:${relativeSourceRoot}`),
 			ref.resolve(repositoryRoot, `HEAD:${relativeSourceRoot}`),

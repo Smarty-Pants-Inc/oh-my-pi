@@ -6815,7 +6815,7 @@
     },
     {
       "path": "packages/coding-agent/src/context/manifest.ts",
-      "sha256": "4c214cd434a8d97e93173367f463cf08078b4a50ea1a8ee8dd794deef5bb7dcd"
+      "sha256": "db221c785504a871380e302f0b5ccfb6e727d8543776665f8d8115644dcc97a4"
     },
     {
       "path": "packages/coding-agent/src/context/prompt-sources.generated.ts",
@@ -10675,5 +10675,5 @@
     }
   ],
   "behaviorSha256": "16a17592ffb7e5cd090ebb1534b43e2f67a134c329bc7bb048ba42981bc864cc",
-  "rootSha256": "21136e274a89e8b46b5b44b5634183dcdd40f310d98f9199bc43d758bb57b1c9"
+  "rootSha256": "1ea31da823f484e2420ce61aa3a27c215974657975816d58edd3e963e3eacc2b"
 }
