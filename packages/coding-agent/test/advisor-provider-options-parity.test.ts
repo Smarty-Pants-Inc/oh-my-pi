@@ -10,18 +10,24 @@
  * fell back to a different cache shard), its shared `providerSessionState`,
  * and its explicit websocket preference.
  */
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import { Agent, type StreamFn } from "@oh-my-pi/pi-agent-core";
-import type { FetchImpl, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
+import * as compactionModule from "@oh-my-pi/pi-agent-core/compaction";
+import type { Context, ContextTarget, FetchImpl, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
 import { streamSimple } from "@oh-my-pi/pi-ai";
+import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { bindRenderedInstruction } from "@oh-my-pi/pi-coding-agent/context/registry";
+import type { GoalModeState } from "@oh-my-pi/pi-coding-agent/goals/state";
+import { createAgentSession, type ExtensionFactory } from "@oh-my-pi/pi-coding-agent/sdk";
+import { SecretObfuscator } from "@oh-my-pi/pi-coding-agent/secrets/obfuscator";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
+import { createAssistantMessage, createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
 /** Provider-facing advisor session ids must be UUIDv7 (issue #5040): Codex writes
  *  them verbatim onto `conversation_id`/`session_id` headers, so `-advisor`
@@ -78,6 +84,7 @@ describe("AgentSession advisor provider-options parity", () => {
 		try {
 			await tempDir.remove();
 		} catch {}
+		vi.restoreAllMocks();
 	});
 
 	it("wraps the inherited streamFn and preserves promptCacheKey and providerSessionState", () => {
@@ -180,6 +187,375 @@ describe("AgentSession advisor provider-options parity", () => {
 		expect(opts.promptCacheKey).toBe(advisor.sessionId);
 		expect(opts.providerSessionState).toBe(session.providerSessionState);
 		expect(opts.preferWebsockets).toBe(true);
+	});
+
+	it("projects fresh obfuscated goal state across active and terminal advisor requests", async () => {
+		const capturedContexts: Context[] = [];
+		const captureStreamFn: StreamFn = (_m, context) => {
+			capturedContexts.push(context);
+			throw new Error("capture-stop");
+		};
+		const secret = "ceo<&>-demo-secret-token";
+		const obfuscator = new SecretObfuscator([{ type: "plain", content: secret }], "test-key");
+		const transformTargets: Array<ContextTarget | undefined> = [];
+		const transformProviderContext = async (
+			context: Context,
+			_model: Model,
+			target?: ContextTarget,
+		): Promise<Context> => {
+			transformTargets.push(target);
+			return {
+				...context,
+				instructions: [
+					...(context.instructions ?? []),
+					bindRenderedInstruction("goal.active", "volatile main goal projection", "main"),
+				],
+			};
+		};
+		const mainAgent = new Agent({
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+		});
+		session = new AgentSession({
+			agent: mainAgent,
+			sessionManager,
+			settings: settings(),
+			modelRegistry,
+			advisorTools: [],
+			advisorStreamFn: captureStreamFn,
+			obfuscator,
+			transformProviderContext,
+		});
+		const activeGoalState: GoalModeState = {
+			enabled: true,
+			mode: "active",
+			goal: {
+				id: "goal-1",
+				objective: `Return usable output from the paid <CEO> demo with ${secret}`,
+				status: "active",
+				tokenBudget: 100,
+				tokensUsed: 55,
+				timeUsedSeconds: 9,
+				createdAt: 1,
+				updatedAt: 1,
+			},
+		};
+		session.setGoalModeState(activeGoalState);
+		session.settings.setModelRole("advisor", "anthropic/claude-sonnet-4-5");
+		expect(session.setAdvisorEnabled(true)).toBe(true);
+
+		const advisor = session.getAdvisorAgent();
+		if (!advisor) throw new Error("Expected advisor agent to be live");
+		await advisor.prompt("Review the active mission").catch(() => {});
+		advisor.reset();
+		session.setGoalModeState({
+			...activeGoalState,
+			enabled: false,
+			mode: "exiting",
+			reason: "completed",
+			goal: { ...activeGoalState.goal, status: "complete", updatedAt: 2 },
+		});
+		await advisor.prompt("Review the completion claim").catch(() => {});
+
+		expect(capturedContexts).toHaveLength(2);
+		expect(transformTargets).toEqual(["side_model", "side_model"]);
+		const missions = capturedContexts.map(
+			context => context.instructions?.filter(instruction => instruction.id === "goal.advisor_mission") ?? [],
+		);
+		expect(missions[0]).toHaveLength(1);
+		expect(missions[1]).toHaveLength(1);
+		expect(capturedContexts.every(context => context.instructions?.every(item => item.target === "side_model"))).toBe(
+			true,
+		);
+		expect(capturedContexts.every(context => context.instructions?.every(item => item.id !== "goal.active"))).toBe(
+			true,
+		);
+		expect(missions[0]?.[0]?.target).toBe("side_model");
+		expect(missions[0]?.[0]?.renderedText).toContain('status="active"');
+		expect(missions[1]?.[0]?.renderedText).toContain('status="complete"');
+		for (const [mission] of missions) {
+			expect(mission?.renderedText).toMatch(
+				/Return usable output from the paid &lt;CEO&gt; demo with \$\$[A-Z0-9]+:L\$\$/,
+			);
+			expect(mission?.renderedText).not.toContain("tokenBudget");
+			expect(mission?.renderedText).not.toContain("tokensUsed");
+			expect(mission?.renderedText).not.toContain("timeUsedSeconds");
+			expect(mission?.renderedText).not.toContain(secret);
+			expect(mission?.renderedText).not.toContain("ceo&lt;&amp;&gt;-demo-secret-token");
+		}
+	});
+
+	it("drops an abandoned terminal mission after tree navigation rewrites history", async () => {
+		const capturedContexts: Context[] = [];
+		const captureStreamFn: StreamFn = (_m, context) => {
+			capturedContexts.push(context);
+			throw new Error("capture-stop");
+		};
+		const rootEntryId = sessionManager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "Keep this branch point" }],
+			timestamp: Date.now(),
+		});
+		const abandonedObjective = "Ship the abandoned terminal objective";
+		sessionManager.appendModeChange("goal", {
+			goal: {
+				id: "abandoned-goal",
+				objective: abandonedObjective,
+				status: "complete",
+				tokenBudget: 100,
+				tokensUsed: 100,
+				timeUsedSeconds: 10,
+				createdAt: 1,
+				updatedAt: 2,
+			},
+		});
+		const mainAgent = new Agent({
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: sessionManager.buildSessionContext().messages,
+			},
+		});
+		session = new AgentSession({
+			agent: mainAgent,
+			sessionManager,
+			settings: settings(),
+			modelRegistry,
+			advisorTools: [],
+			advisorStreamFn: captureStreamFn,
+		});
+		session.settings.setModelRole("advisor", "anthropic/claude-sonnet-4-5");
+		expect(session.setAdvisorEnabled(true)).toBe(true);
+
+		const abandonedAdvisor = session.getAdvisorAgent();
+		if (!abandonedAdvisor) throw new Error("Expected advisor agent to be live");
+		await abandonedAdvisor.prompt("Review the terminal mission").catch(() => {});
+
+		const navigation = await session.navigateTree(rootEntryId);
+		expect(navigation.cancelled).toBe(false);
+		const currentAdvisor = session.getAdvisorAgent();
+		if (!currentAdvisor) throw new Error("Expected advisor agent after history rewrite");
+		await currentAdvisor.prompt("Review the current mission").catch(() => {});
+
+		expect(capturedContexts).toHaveLength(2);
+		const missions = capturedContexts.map(context =>
+			context.instructions?.find(instruction => instruction.id === "goal.advisor_mission"),
+		);
+		expect(missions[0]?.renderedText).toContain(abandonedObjective);
+		expect(missions[0]?.renderedText).toContain('status="complete"');
+		expect(missions[1]).toBeUndefined();
+	});
+
+	it("omits a completed outgoing goal from the first advisor request after handoff", async () => {
+		const capturedContexts: Context[] = [];
+		const completedObjective = "Do not carry this completed objective into the handoff session";
+		sessionManager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "Finish the outgoing work" }],
+			timestamp: 1,
+		});
+		sessionManager.appendMessage(createAssistantMessage("The outgoing work is complete"));
+		sessionManager.appendModeChange("goal", {
+			goal: {
+				id: "completed-handoff-goal",
+				objective: completedObjective,
+				status: "complete",
+				tokenBudget: 100,
+				tokensUsed: 100,
+				timeUsedSeconds: 10,
+				createdAt: 1,
+				updatedAt: 2,
+			},
+		});
+		const mainAgent = new Agent({
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: sessionManager.buildSessionContext().messages,
+			},
+		});
+		const handoffSettings = settings();
+		handoffSettings.set("goal.enabled", true);
+		session = new AgentSession({
+			agent: mainAgent,
+			sessionManager,
+			settings: handoffSettings,
+			modelRegistry,
+			advisorTools: [],
+			advisorStreamFn: (_requestModel, context) => {
+				capturedContexts.push(context);
+				throw new Error("capture-stop");
+			},
+		});
+		session.settings.setModelRole("advisor", "anthropic/claude-sonnet-4-5");
+		expect(session.setAdvisorEnabled(true)).toBe(true);
+		vi.spyOn(compactionModule, "generateHandoffFromContext").mockResolvedValue("## Goal\nContinue from here");
+
+		await session.handoff();
+		const replacementAdvisor = session.getAdvisorAgent();
+		if (!replacementAdvisor) throw new Error("Expected advisor agent after handoff");
+		await replacementAdvisor.prompt("Review the replacement session").catch(() => {});
+
+		expect(capturedContexts).toHaveLength(1);
+		const firstRequest = capturedContexts[0];
+		expect(
+			firstRequest?.instructions?.find(instruction => instruction.id === "goal.advisor_mission"),
+		).toBeUndefined();
+		expect(JSON.stringify(firstRequest)).not.toContain(completedObjective);
+	});
+
+	it("chooses collision-safe placeholders across advisor messages and the mission instruction", async () => {
+		const capturedContexts: Context[] = [];
+		const captureStreamFn: StreamFn = (_m, context) => {
+			capturedContexts.push(context);
+			throw new Error("capture-stop");
+		};
+		const plainSecret = "OTHERSECRET";
+		const regexSecret = "tok_abc123";
+		const derivedPrefix = "TOKABC123";
+		const obfuscator = new SecretObfuscator(
+			[
+				{ type: "plain", content: plainSecret, friendlyName: derivedPrefix },
+				{ type: "regex", content: "tok_[a-z0-9]+", mode: "replace" },
+			],
+			"test-key",
+		);
+		const mainAgent = new Agent({
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+		});
+		session = new AgentSession({
+			agent: mainAgent,
+			sessionManager,
+			settings: settings(),
+			modelRegistry,
+			advisorTools: [],
+			advisorStreamFn: captureStreamFn,
+			obfuscator,
+			transformProviderContext: async context => context,
+		});
+		session.setGoalModeState({
+			enabled: false,
+			mode: "exiting",
+			reason: "completed",
+			goal: {
+				id: "goal-collision",
+				objective: `Finish <mission> & preserve ${regexSecret}`,
+				status: "complete",
+				tokenBudget: 100,
+				tokensUsed: 10,
+				timeUsedSeconds: 2,
+				createdAt: 1,
+				updatedAt: 2,
+			},
+		});
+		session.settings.setModelRole("advisor", "anthropic/claude-sonnet-4-5");
+		expect(session.setAdvisorEnabled(true)).toBe(true);
+		const advisor = session.getAdvisorAgent();
+		if (!advisor) throw new Error("Expected advisor agent to be live");
+		await advisor.prompt(`Review the result containing ${plainSecret}`).catch(() => {});
+
+		expect(capturedContexts).toHaveLength(1);
+		const serialized = JSON.stringify(capturedContexts[0]);
+		expect(serialized).not.toContain(plainSecret);
+		expect(serialized).not.toContain(regexSecret);
+		expect(serialized).not.toContain(derivedPrefix);
+		const mission = capturedContexts[0]?.instructions?.find(instruction => instruction.id === "goal.advisor_mission");
+		expect(mission?.renderedText).toContain("Finish &lt;mission&gt; &amp; preserve");
+	});
+
+	it("projects the mission through createAgentSession onto the provider wire", async () => {
+		const provider = "mission-wire-provider";
+		const api = "mission-wire-api";
+		const modelId = "mission-wire-model";
+		const sourceId = "<inline-0>";
+		const sdkAuthStorage = createInMemoryAuthStorage();
+		const sdkModelRegistry = new ModelRegistry(sdkAuthStorage, tempDir.join("mission-models.yml"));
+		const capturedContexts: Context[] = [];
+		const providerExtension: ExtensionFactory = pi => {
+			pi.registerProvider(provider, {
+				baseUrl: "http://127.0.0.1:8080/v1",
+				apiKey: "test-key",
+				api,
+				streamSimple: (_requestModel, context) => {
+					capturedContexts.push(context);
+					const stream = new AssistantMessageEventStream();
+					queueMicrotask(() => {
+						const message = createAssistantMessage("ok");
+						stream.push({ type: "text_delta", contentIndex: 0, delta: "ok", partial: message });
+						stream.push({ type: "done", reason: "stop", message });
+					});
+					return stream;
+				},
+				models: [
+					{
+						id: modelId,
+						name: "Mission wire model",
+						reasoning: false,
+						input: ["text"],
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+						contextWindow: 4096,
+						maxTokens: 1024,
+					},
+				],
+			});
+		};
+		const sdkSettings = Settings.isolated({ "compaction.enabled": false });
+		sdkSettings.setModelRole("default", `${provider}/${modelId}`);
+		sdkSettings.setModelRole("advisor", `${provider}/${modelId}`);
+
+		try {
+			const created = await createAgentSession({
+				cwd: tempDir.path(),
+				agentDir: tempDir.path(),
+				sessionManager: SessionManager.inMemory(tempDir.path()),
+				authStorage: sdkAuthStorage,
+				modelRegistry: sdkModelRegistry,
+				settings: sdkSettings,
+				disableExtensionDiscovery: true,
+				extensions: [providerExtension],
+				skills: [],
+				rules: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableMCP: false,
+				enableLsp: false,
+				skipPythonPreflight: true,
+			});
+			session = created.session;
+			session.setGoalModeState({
+				enabled: true,
+				mode: "active",
+				goal: {
+					id: "sdk-goal",
+					objective: "Deliver the SDK mission through the real provider transform",
+					status: "active",
+					tokenBudget: 100,
+					tokensUsed: 20,
+					timeUsedSeconds: 3,
+					createdAt: 1,
+					updatedAt: 1,
+				},
+			});
+			expect(session.setAdvisorEnabled(true)).toBe(true);
+			const advisor = session.getAdvisorAgent();
+			if (!advisor) throw new Error("Expected SDK-created advisor agent");
+			await advisor.prompt("Inspect the mission");
+
+			expect(capturedContexts).toHaveLength(1);
+			const delivered = capturedContexts[0]?.instructions ?? [];
+			const missions = delivered.filter(instruction => instruction.id === "goal.advisor_mission");
+			expect(missions).toHaveLength(1);
+			expect(delivered.every(instruction => instruction.target === "side_model")).toBe(true);
+			expect(delivered.some(instruction => instruction.id === "goal.active")).toBe(false);
+			expect(missions[0]?.renderedText).toContain("Deliver the SDK mission through the real provider transform");
+			expect(missions[0]?.renderedText).not.toContain("tokensUsed");
+		} finally {
+			await session?.dispose();
+			sdkModelRegistry.clearSourceRegistrations(sourceId);
+			sdkAuthStorage.close();
+		}
 	});
 
 	it("caps Codex SSE attempts inside each advisor-level retry", async () => {

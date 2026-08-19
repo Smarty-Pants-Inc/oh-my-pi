@@ -13,6 +13,7 @@ import {
 import type {
 	Context,
 	ContextInstruction,
+	ContextTarget,
 	CredentialDisabledEvent,
 	Effort,
 	Message,
@@ -3299,7 +3300,12 @@ async function createAgentSessionScoped(
 					)
 				: undefined;
 		let pendingProviderInstructions: readonly ContextInstruction[] = [];
-		const transformProviderContext = async (context: Context, transformModel: Model): Promise<Context> => {
+		const defaultContextTarget: ContextTarget = agentKind === "sub" ? "subagent" : "main";
+		const transformProviderContext = async (
+			context: Context,
+			transformModel: Model,
+			contextTarget: ContextTarget = defaultContextTarget,
+		): Promise<Context> => {
 			const executionEnvironment = toolSession.getExecutionEnvironment?.();
 			if (executionEnvironment && context.systemPrompt) {
 				assertExecutionEnvironmentSystemPrompt(executionEnvironment, context.systemPrompt);
@@ -3307,8 +3313,8 @@ async function createAgentSessionScoped(
 			const registeredInstructions = [
 				...(options.contextInstructions ?? []),
 				...(session?.buildProviderContextInstructions() ?? []),
-			];
-			if (context.systemPrompt?.length) {
+			].filter(instruction => instruction.target === contextTarget);
+			if (contextTarget !== "side_model" && context.systemPrompt?.length) {
 				const promptCwd = normalizePromptPath(
 					executionEnvironment ? mapExecutionEnvironmentPath(executionEnvironment, ".") : sessionManager.getCwd(),
 				);
@@ -3316,21 +3322,25 @@ async function createAgentSessionScoped(
 					bindRenderedInstruction(
 						"system.date-cwd-reminder",
 						renderDateCwdReminder(formatLocalCalendarDate(), promptCwd),
-						agentKind === "sub" ? "subagent" : "main",
+						contextTarget,
 					),
 				);
 				registeredInstructions.sort(
 					(left, right) => (left.order ?? 0) - (right.order ?? 0) || left.id.localeCompare(right.id),
 				);
 			}
-			let transformed: Context = registeredInstructions.length
-				? { ...context, instructions: [...(context.instructions ?? []), ...registeredInstructions] }
-				: context;
+			const existingInstructions = context.instructions?.filter(instruction => instruction.target === contextTarget);
+			let transformed: Context =
+				registeredInstructions.length > 0 || existingInstructions?.length !== context.instructions?.length
+					? { ...context, instructions: [...(existingInstructions ?? []), ...registeredInstructions] }
+					: context;
 			transformed = obfuscator ? obfuscateProviderContext(obfuscator, transformed) : transformed;
 			if (snapcompactInline) transformed = await snapcompactInline.transform(transformed, transformModel);
 			transformed = clampProviderContextImages(transformed, transformModel);
 			transformed = await normalizeProviderContextImagesForModel(transformed, transformModel);
-			pendingProviderInstructions = structuredClone(transformed.instructions ?? []);
+			if (contextTarget === defaultContextTarget) {
+				pendingProviderInstructions = structuredClone(transformed.instructions ?? []);
+			}
 			return transformed;
 		};
 		const captureRenderedToolContracts = (payload: unknown, model?: Model) => {

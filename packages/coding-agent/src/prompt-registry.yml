@@ -1894,6 +1894,14 @@ prompts:
     visibility: model
     defaultEnabled: true
     order: 2440
+  - id: goal.advisor_mission
+    path: prompts/advisor/mission-context.md
+    role: internal_context
+    target: [side_model]
+    trigger: goal_updated
+    visibility: model
+    defaultEnabled: false
+    order: 995
 
 nonModelDocumentation:
   - modes/components/snapcompact-shape-preview-doc.md

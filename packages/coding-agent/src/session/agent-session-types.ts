@@ -8,6 +8,7 @@ import type {
 } from "@oh-my-pi/pi-agent-core";
 import type {
 	Context,
+	ContextTarget,
 	Effort,
 	ImageContent,
 	Message,
@@ -192,8 +193,8 @@ export interface AgentSessionConfig {
 	ensureWriteRegistered?: () => Promise<boolean>;
 	/** Current session pre-LLM message transform pipeline. */
 	transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => AgentMessage[] | Promise<AgentMessage[]>;
-	/** Provider request transform applied after message conversion. */
-	transformProviderContext?: (context: Context, model: Model) => Context | Promise<Context>;
+	/** Provider request transform applied after message conversion. Side models pass their target explicitly. */
+	transformProviderContext?: (context: Context, model: Model, target?: ContextTarget) => Context | Promise<Context>;
 	/** Stream wrapper for side-channel requests. */
 	sideStreamFn?: StreamFn;
 	/** Stream wrapper for advisor requests. */

@@ -1670,6 +1670,19 @@ export class AgentSession {
 			abortInProgress: () => this.#abortInProgress,
 			allowAgentInitiatedTurns: () => this.#allowAcpAgentInitiatedTurns,
 			planModeState: () => this.#planModeState,
+			advisorMissionContext: sharedRegexSecretValues => {
+				const missionPrompt = this.#goalRuntime.buildAdvisorMissionPrompt(objective => {
+					const obfuscator = this.#obfuscator;
+					if (!obfuscator?.hasSecrets()) return objective;
+					for (const value of obfuscator.collectRegexSecretValuesForObfuscation(objective)) {
+						sharedRegexSecretValues.add(value);
+					}
+					return obfuscator.obfuscate(objective, sharedRegexSecretValues);
+				});
+				return missionPrompt
+					? bindRenderedInstruction("goal.advisor_mission", missionPrompt, "side_model")
+					: undefined;
+			},
 			clientBridge: () => this.#clientBridge,
 			emitSessionEvent: event => this.#emitSessionEvent(event),
 			emitNotice: (level, message, source) => this.emitNotice(level, message, source),
@@ -1826,6 +1839,7 @@ export class AgentSession {
 			restoreExplicitPromptMessages: messages => this.restoreExplicitPromptMessages(messages),
 			resetTodoCycle: () => this.#todo.resetCycle(),
 			buildDisplaySessionContext: () => this.buildDisplaySessionContext(),
+			replaceMessagesFromSessionContext: context => this.#replaceMessagesFromSessionContext(context),
 			drainAndDetachAdvisorRecorders: () => this.#advisors.drainAndDetachRecorders(),
 			syncTodoPhasesFromBranch: () => this.#todo.syncFromBranch(),
 		};
@@ -5943,6 +5957,11 @@ export class AgentSession {
 		this.#goalModeState = this.settings.get("goal.enabled") ? parseGoalModeState(mode, modeData) : undefined;
 	}
 
+	#replaceMessagesFromSessionContext(context: SessionContext, messages = context.messages): void {
+		this.#rehydrateGoalModeState(context.mode, context.modeData);
+		this.agent.replaceMessages(messages);
+	}
+
 	/**
 	 * Transcript for TUI display. Full history is kept for export/resume-style
 	 * callers; live chat can collapse compacted history to keep the hot render
@@ -9120,7 +9139,7 @@ export class AgentSession {
 		if (activeMessages) {
 			activeMessages.splice(0, activeMessages.length, ...sessionContext.messages);
 		}
-		this.agent.replaceMessages(activeMessages ?? sessionContext.messages);
+		this.#replaceMessagesFromSessionContext(sessionContext, activeMessages ?? sessionContext.messages);
 		this.#advisors.resetSessionState({ preserveCost: true });
 		this.#todo.syncFromBranch();
 		this.#closeCodexProviderSessionsForHistoryRewrite();
@@ -9967,7 +9986,11 @@ export class AgentSession {
 			await this.#memory.resetContextForNewTranscript();
 
 			const sessionContext = this.buildDisplaySessionContext();
-			if (!skipConversationRestore) this.agent.replaceMessages(sessionContext.messages);
+			if (skipConversationRestore) {
+				this.#rehydrateGoalModeState(sessionContext.mode, sessionContext.modeData);
+			} else {
+				this.#replaceMessagesFromSessionContext(sessionContext);
+			}
 
 			await this.sessionManager.ensureOnDisk();
 			const commitOptions: SessionLifecycleCommitOptions = {
@@ -10094,7 +10117,8 @@ export class AgentSession {
 			this.#syncAgentSessionId(undefined, false, false);
 			this.#memory.rekeyForCurrentSessionId();
 			await this.#memory.resetContextForNewTranscript();
-			this.agent.replaceMessages(this.buildDisplaySessionContext().messages);
+			const sessionContext = this.buildDisplaySessionContext();
+			this.#replaceMessagesFromSessionContext(sessionContext);
 
 			await this.sessionManager.ensureOnDisk();
 			const commitOptions: SessionLifecycleCommitOptions = {
@@ -10438,7 +10462,7 @@ export class AgentSession {
 			// Update agent state — build display context to populate agent messages.
 			const stateContext = this.sessionManager.buildSessionContext();
 			const displayContext = deobfuscateSessionContext(stateContext, this.#obfuscator);
-			this.agent.replaceMessages(displayContext.messages);
+			this.#replaceMessagesFromSessionContext(displayContext);
 			this.#rehydrateCheckpointRewindState();
 			this.#todo.syncFromBranch();
 

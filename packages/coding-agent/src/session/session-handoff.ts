@@ -97,6 +97,7 @@ export interface SessionHandoffHost {
 	restoreExplicitPromptMessages(messages: AgentMessage[]): void;
 	resetTodoCycle(): void;
 	buildDisplaySessionContext(): SessionContext;
+	replaceMessagesFromSessionContext(context: SessionContext): void;
 	drainAndDetachAdvisorRecorders(): Promise<void>;
 	syncTodoPhasesFromBranch(): void;
 }
@@ -358,7 +359,7 @@ export class SessionHandoff {
 			this.#host.agent.restoreQueuedMessageCompanions(migratedQueues.companions, messages =>
 				this.#host.restoreExplicitPromptMessages(messages),
 			);
-			this.#host.agent.replaceMessages(sessionContext.messages);
+			this.#host.replaceMessagesFromSessionContext(sessionContext);
 			this.#host.resetTodoCycle();
 			this.#host.syncTodoPhasesFromBranch();
 

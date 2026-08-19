@@ -28,6 +28,8 @@ import type {
 	AssistantMessage,
 	CodexCompactionContext,
 	Context,
+	ContextInstruction,
+	ContextTarget,
 	Message,
 	Model,
 	ProviderSessionState,
@@ -76,7 +78,7 @@ import { bridgeToolMap } from "../cursor-bridge-tools";
 import { estimateToolSchemaTokens } from "../modes/utils/context-usage";
 import type { PlanModeState } from "../plan-mode/state";
 import advisorSystemPrompt from "../prompts/advisor/system.md" with { type: "text" };
-import type { SecretObfuscator } from "../secrets/obfuscator";
+import { collectProviderContextRegexSecretValues, obfuscateProviderContext, type SecretObfuscator } from "../secrets";
 import {
 	concreteThinkingLevel,
 	resolveThinkingLevelForModel,
@@ -218,7 +220,7 @@ export interface SessionAdvisorsOptions {
 	contextPrompt?: string;
 	configs?: AdvisorConfig[];
 	streamFn?: StreamFn;
-	transformProviderContext?: (context: Context, model: Model) => Context | Promise<Context>;
+	transformProviderContext?: (context: Context, model: Model, target?: ContextTarget) => Context | Promise<Context>;
 	/** Advisor spend already persisted for this session, restored on resume. */
 	initialCosts?: ReadonlyMap<string, number>;
 }
@@ -248,6 +250,7 @@ export interface SessionAdvisorsHost {
 	abortInProgress(): boolean;
 	allowAgentInitiatedTurns(): boolean;
 	planModeState(): PlanModeState | undefined;
+	advisorMissionContext(sharedRegexSecretValues: Set<string>): ContextInstruction | undefined;
 	clientBridge(): ClientBridge | undefined;
 	emitSessionEvent(event: AgentSessionEvent): Promise<void>;
 	emitNotice(level: "info" | "warning" | "error", message: string, source?: string): void;
@@ -298,7 +301,9 @@ export class SessionAdvisors {
 	#advisorContextPrompt: string | undefined;
 	#advisorStreamFn: StreamFn | undefined;
 	readonly #completeWithAdvisorStream: NonNullable<SummaryOptions["completeImpl"]>;
-	#transformProviderContext: ((context: Context, model: Model) => Context | Promise<Context>) | undefined;
+	#transformProviderContext:
+		| ((context: Context, model: Model, target?: ContextTarget) => Context | Promise<Context>)
+		| undefined;
 	#advisors: ActiveAdvisor[] = [];
 	#advisorConfigs: AdvisorConfig[] | undefined;
 	#advisorStatuses = new Map<string, { name: string; status: AdvisorRuntimeStatus }>();
@@ -329,6 +334,34 @@ export class SessionAdvisors {
 		this.#transformProviderContext = options.transformProviderContext;
 		if (options.initialCosts) this.#advisorCosts = new Map(options.initialCosts);
 		if (this.#advisorEnabled) this.#buildAdvisorRuntime();
+	}
+
+	async #transformAdvisorProviderContext(context: Context, model: Model): Promise<Context> {
+		const missionId = "goal.advisor_mission";
+		const sharedRegexSecretValues = collectProviderContextRegexSecretValues(this.#host.obfuscator, context);
+		const mission = this.#host.advisorMissionContext(sharedRegexSecretValues);
+		const preparedInstructions = (context.instructions ?? []).filter(
+			instruction => instruction.target === "side_model" && instruction.id !== missionId,
+		);
+		if (mission) preparedInstructions.push(mission);
+		const prepared =
+			preparedInstructions.length > 0 || context.instructions
+				? { ...context, instructions: preparedInstructions }
+				: context;
+		const transformed = this.#transformProviderContext
+			? await this.#transformProviderContext(prepared, model, "side_model")
+			: prepared;
+		const obfuscated = obfuscateProviderContext(this.#host.obfuscator, transformed, sharedRegexSecretValues);
+		if (!obfuscated.instructions) return obfuscated;
+		let keptMission = false;
+		const instructions = obfuscated.instructions.filter(instruction => {
+			if (instruction.target !== "side_model") return false;
+			if (instruction.id !== missionId) return true;
+			if (!mission || keptMission) return false;
+			keptMission = true;
+			return true;
+		});
+		return { ...obfuscated, instructions };
 	}
 
 	/** Delivers one completed primary turn to every live advisor. */
@@ -839,6 +872,7 @@ export class SessionAdvisors {
 				return baseAdvisorStreamFn(requestModel, context, options);
 			};
 			const advisorAgent = new Agent({
+				contextTarget: "side_model",
 				initialState: {
 					systemPrompt,
 					model: advisorModel,
@@ -857,7 +891,7 @@ export class SessionAdvisors {
 				onPayload: this.#host.onPayload,
 				onResponse: this.#host.onResponse,
 				onSseEvent: this.#host.onSseEvent,
-				transformProviderContext: this.#transformProviderContext,
+				transformProviderContext: (context, model) => this.#transformAdvisorProviderContext(context, model),
 				intentTracing: false,
 				transformAssistantMessage: message => {
 					quarantinedAdvisorOutput = quarantineAdvisorUnsafeOutput(
