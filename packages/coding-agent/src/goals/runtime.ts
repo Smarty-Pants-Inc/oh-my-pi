@@ -220,6 +220,16 @@ export class GoalRuntime {
 		this.#budgetReportedFor = undefined;
 	}
 
+	async clearFinalGoalAtHistoryBoundary(): Promise<boolean> {
+		return await this.#withAccounting(async () => {
+			const state = this.#getStateClone();
+			if (!state?.goal || !isFinalStatus(state.goal)) return false;
+			this.clearAccounting();
+			await this.#commitState(undefined, { persist: "none" });
+			return true;
+		});
+	}
+
 	onTurnStart(turnId: string, baselineUsage: GoalTokenUsage): void {
 		this.#turnSnapshot = { turnId, baselineUsage: { ...baselineUsage } };
 		const state = this.#host.getState();

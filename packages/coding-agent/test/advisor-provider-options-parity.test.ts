@@ -346,6 +346,63 @@ describe("AgentSession advisor provider-options parity", () => {
 		expect(missions[1]).toBeUndefined();
 	});
 
+	it("drops a persisted terminal mission at a reset boundary", async () => {
+		const capturedContexts: Context[] = [];
+		const terminalObjective = "Do not revive this completed objective after clear";
+		sessionManager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "Finish the terminal work" }],
+			timestamp: 1,
+		});
+		sessionManager.appendModeChange("goal", {
+			goal: {
+				id: "terminal-reset-goal",
+				objective: terminalObjective,
+				status: "complete",
+				tokenBudget: 100,
+				tokensUsed: 100,
+				timeUsedSeconds: 10,
+				createdAt: 1,
+				updatedAt: 2,
+			},
+		});
+		const mainAgent = new Agent({
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: sessionManager.buildSessionContext().messages,
+			},
+		});
+		session = new AgentSession({
+			agent: mainAgent,
+			sessionManager,
+			settings: settings(),
+			modelRegistry,
+			advisorTools: [],
+			advisorStreamFn: (_requestModel, context) => {
+				capturedContexts.push(context);
+				throw new Error("capture-stop");
+			},
+		});
+		session.settings.setModelRole("advisor", "anthropic/claude-sonnet-4-5");
+		expect(session.setAdvisorEnabled(true)).toBe(true);
+
+		await expect(session.resetSessionContext()).resolves.toEqual({ droppedCount: 1 });
+		expect(session.getGoalModeState()).toBeUndefined();
+		expect(sessionManager.buildSessionContext().mode).toBe("none");
+		const advisor = session.getAdvisorAgent();
+		if (!advisor) throw new Error("Expected advisor agent after reset");
+		await advisor.prompt("Review the reset session").catch(() => {});
+
+		expect(capturedContexts).toHaveLength(1);
+		const firstRequest = capturedContexts[0];
+		expect(
+			firstRequest?.instructions?.find(instruction => instruction.id === "goal.advisor_mission"),
+		).toBeUndefined();
+		expect(JSON.stringify(firstRequest)).not.toContain(terminalObjective);
+	});
+
 	it("omits a completed outgoing goal from the first advisor request after handoff", async () => {
 		const capturedContexts: Context[] = [];
 		const completedObjective = "Do not carry this completed objective into the handoff session";
@@ -462,6 +519,71 @@ describe("AgentSession advisor provider-options parity", () => {
 		expect(serialized).not.toContain(derivedPrefix);
 		const mission = capturedContexts[0]?.instructions?.find(instruction => instruction.id === "goal.advisor_mission");
 		expect(mission?.renderedText).toContain("Finish &lt;mission&gt; &amp; preserve");
+	});
+
+	it("uses retained primary regex secrets when redacting the mission instruction", async () => {
+		const capturedContexts: Context[] = [];
+		const plainSecret = "OTHERSECRET";
+		const regexSecret = "tok_abc123";
+		const derivedPrefix = "TOKABC123";
+		const obfuscator = new SecretObfuscator(
+			[
+				{ type: "plain", content: plainSecret, friendlyName: derivedPrefix },
+				{ type: "regex", content: "tok_[a-z0-9]+", mode: "replace" },
+			],
+			"test-key",
+		);
+		const mainStreamFn: StreamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const message = createAssistantMessage("ok");
+				stream.push({ type: "text_delta", contentIndex: 0, delta: "ok", partial: message });
+				stream.push({ type: "done", reason: "stop", message });
+			});
+			return stream;
+		};
+		const mainAgent = new Agent({
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: mainStreamFn,
+		});
+		const advisorSettings = settings();
+		advisorSettings.set("advisor.syncBacklog", "1");
+		session = new AgentSession({
+			agent: mainAgent,
+			sessionManager,
+			settings: advisorSettings,
+			modelRegistry,
+			advisorTools: [],
+			advisorStreamFn: (_requestModel, context) => {
+				capturedContexts.push(context);
+				throw new Error("capture-stop");
+			},
+			obfuscator,
+		});
+		session.setGoalModeState({
+			enabled: true,
+			mode: "active",
+			goal: {
+				id: "goal-retained-regex-collision",
+				objective: `Finish using ${plainSecret}`,
+				status: "active",
+				tokenBudget: 100,
+				tokensUsed: 10,
+				timeUsedSeconds: 2,
+				createdAt: 1,
+				updatedAt: 2,
+			},
+		});
+		session.settings.setModelRole("advisor", "anthropic/claude-sonnet-4-5");
+		expect(session.setAdvisorEnabled(true)).toBe(true);
+
+		await mainAgent.prompt(`Primary delta contains ${regexSecret}`);
+
+		expect(capturedContexts).toHaveLength(1);
+		const serialized = JSON.stringify(capturedContexts[0]);
+		expect(serialized).not.toContain(plainSecret);
+		expect(serialized).not.toContain(regexSecret);
+		expect(serialized).not.toContain(derivedPrefix);
 	});
 
 	it("projects the mission through createAgentSession onto the provider wire", async () => {

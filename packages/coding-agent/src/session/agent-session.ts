@@ -5466,6 +5466,7 @@ export class AgentSession {
 			// conversation. The on-disk record and the plain `transcript:true` export
 			// path keep the full pre-reset history.
 			this.sessionManager.appendResetBoundary();
+			await this.#goalRuntime.clearFinalGoalAtHistoryBoundary();
 			return { droppedCount };
 		} finally {
 			releaseSemanticFence();

@@ -336,9 +336,10 @@ export class SessionAdvisors {
 		if (this.#advisorEnabled) this.#buildAdvisorRuntime();
 	}
 
-	async #transformAdvisorProviderContext(context: Context, model: Model): Promise<Context> {
+	async #transformAdvisorProviderContext(context: Context, model: Model, runtime: AdvisorRuntime): Promise<Context> {
 		const missionId = "goal.advisor_mission";
 		const sharedRegexSecretValues = collectProviderContextRegexSecretValues(this.#host.obfuscator, context);
+		runtime.copyRetainedRegexSecretValuesTo(sharedRegexSecretValues);
 		const mission = this.#host.advisorMissionContext(sharedRegexSecretValues);
 		const preparedInstructions = (context.instructions ?? []).filter(
 			instruction => instruction.target === "side_model" && instruction.id !== missionId,
@@ -871,6 +872,7 @@ export class SessionAdvisors {
 				}
 				return baseAdvisorStreamFn(requestModel, context, options);
 			};
+			let runtime: AdvisorRuntime;
 			const advisorAgent = new Agent({
 				contextTarget: "side_model",
 				initialState: {
@@ -891,7 +893,8 @@ export class SessionAdvisors {
 				onPayload: this.#host.onPayload,
 				onResponse: this.#host.onResponse,
 				onSseEvent: this.#host.onSseEvent,
-				transformProviderContext: (context, model) => this.#transformAdvisorProviderContext(context, model),
+				transformProviderContext: (context, model) =>
+					this.#transformAdvisorProviderContext(context, model, runtime),
 				intentTracing: false,
 				transformAssistantMessage: message => {
 					quarantinedAdvisorOutput = quarantineAdvisorUnsafeOutput(
@@ -958,7 +961,7 @@ export class SessionAdvisors {
 				// so two SessionManagers never hold the same file at once.
 				this.#advisorRecorderClosed,
 			);
-			const runtime = new AdvisorRuntime(advisorAgentFacade, {
+			runtime = new AdvisorRuntime(advisorAgentFacade, {
 				snapshotMessages: () => this.#host.agent.state.messages,
 				enqueueAdvice: (note, severity) => this.#routeAdvice(advisorRef, note, severity),
 				maintainContext: (incomingTokens, signal) =>

@@ -390,6 +390,10 @@ export class AdvisorRuntime {
 		return this.#halted;
 	}
 
+	copyRetainedRegexSecretValuesTo(target: Set<string>): void {
+		for (const value of this.#advisorRegexSecretValues) target.add(value);
+	}
+
 	/**
 	 * Called after each primary turn ends. Renders the incremental delta and
 	 * queues it for the advisor model.
