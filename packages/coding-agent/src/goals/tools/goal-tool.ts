@@ -15,7 +15,7 @@ import { completionBudgetReport, remainingTokens, sameRouteFailureLimitLabel } f
 import type { Goal, GoalStatus, GoalToolDetails } from "../state";
 
 const goalSchema = type({
-	op: type("'create' | 'get' | 'complete' | 'block' | 'pause' | 'resume'").describe("goal operation"),
+	op: type("'create' | 'get' | 'complete' | 'block'").describe("goal operation"),
 	"objective?": type("string").describe("goal objective"),
 	"token_budget?": type("number.integer | null").describe(
 		"must be omitted for agent-created goals; null is accepted only for strict tool schemas",
@@ -93,15 +93,9 @@ export class GoalTool implements AgentTool<typeof goalSchema, GoalToolDetails> {
 		} else if (params.op === "complete") {
 			const completed = await runtime.completeGoalFromTool();
 			response = buildGoalToolResponse(completed, { includeCompletionReport: true });
-		} else if (params.op === "block") {
+		} else {
 			const blocked = await runtime.blockGoalFromTool();
 			response = buildGoalToolResponse(blocked);
-		} else if (params.op === "pause") {
-			const paused = await runtime.pauseGoal();
-			response = buildGoalToolResponse(paused?.goal ?? null);
-		} else {
-			const resumed = await runtime.resumeGoal({ pausedOnly: true });
-			response = buildGoalToolResponse(resumed.goal);
 		}
 		let text: string;
 		if (response.goal) {
@@ -140,10 +134,6 @@ function describeOp(op: string | undefined): string {
 			return "check";
 		case "block":
 			return "block";
-		case "pause":
-			return "pause";
-		case "resume":
-			return "resume";
 		default:
 			return op ?? "?";
 	}
