@@ -5,6 +5,7 @@
 import { isBunTestRuntime } from "@oh-my-pi/pi-utils";
 import { Command } from "@oh-my-pi/pi-utils/cli";
 import { type Args as ParsedArgs, parseArgs, reportCliUsageError } from "../cli/args";
+import { takeHerdrHostBridge } from "../collab/herdr-bridge-bootstrap";
 import { ensureApprovedStartup, promptPolicyReviewWarning } from "../context/approved-policy";
 import { runRootCommand } from "../main";
 import { prepareAcpTerminalAuthArgs } from "../modes/acp/terminal-auth";
@@ -20,6 +21,7 @@ export default class Index extends Command {
 	static strict = false;
 
 	async run(): Promise<void> {
+		const herdrHostBridge = takeHerdrHostBridge();
 		const { args } = prepareAcpTerminalAuthArgs(this.argv);
 		let parsed: ParsedArgs;
 		try {
@@ -42,9 +44,10 @@ export default class Index extends Command {
 						process.stderr.write(`Warning: ${warning}\n`);
 					}
 				},
+				herdrHostBridge,
 			});
 			return;
 		}
-		await runRootCommand(parsed, args);
+		await runRootCommand(parsed, args, { herdrHostBridge });
 	}
 }

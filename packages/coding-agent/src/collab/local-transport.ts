@@ -1,3 +1,4 @@
+import { OMP_BUILD_ID } from "../build-identity";
 import {
 	type CollabFrame,
 	MAX_LOCAL_BRIDGE_INBOUND_RECORD_BYTES,
@@ -88,13 +89,21 @@ export class LocalCollabTransport implements CollabTransport {
 	#socket: Bun.Socket<undefined> | undefined;
 	#closed = false;
 	#opened = false;
+	#connecting = false;
 	readonly #address: string;
 	readonly #announce?: Record<string, unknown>;
+	readonly #waitForHerdrReady: boolean;
 
-	constructor(address: string, announce?: Record<string, unknown>, requiresHerdrAttribution = false) {
+	constructor(
+		address: string,
+		announce?: Record<string, unknown>,
+		requiresHerdrAttribution = false,
+		waitForHerdrReady = false,
+	) {
 		this.#address = address;
 		this.#announce = announce;
 		this.requiresHerdrAttribution = requiresHerdrAttribution;
+		this.#waitForHerdrReady = waitForHerdrReady;
 	}
 
 	get isOpen(): boolean {
@@ -102,21 +111,22 @@ export class LocalCollabTransport implements CollabTransport {
 	}
 
 	connect(): void {
-		if (this.#opened || this.#closed) return;
+		if (this.#socket || this.#connecting || this.#closed) return;
+		this.#connecting = true;
 		const { hostname, port } = parseAddress(this.#address);
 		void Bun.connect({
 			hostname,
 			port,
 			socket: {
 				open: socket => {
+					this.#connecting = false;
 					if (this.#closed) {
 						socket.end();
 						return;
 					}
 					this.#socket = socket;
-					this.#opened = true;
 					if (this.#announce) socket.write(`${JSON.stringify(this.#announce)}\n`);
-					this.onOpen?.();
+					if (!this.#waitForHerdrReady) this.#open();
 				},
 				data: (_socket, data) => this.#receive(data),
 				close: () => this.#finish("bridge closed"),
@@ -126,13 +136,13 @@ export class LocalCollabTransport implements CollabTransport {
 	}
 
 	send(frame: CollabFrame, targetPeer = 0): boolean {
-		if (!this.#socket || this.#closed) return false;
+		if (!this.isOpen || !this.#socket) return false;
 		this.#socket.write(serializeBridgeFrameRecord(frame, targetPeer));
 		return true;
 	}
 
 	requestAuthority(action: "request" | "release"): boolean {
-		if (!this.#socket || this.#closed) return false;
+		if (!this.isOpen || !this.#socket) return false;
 		this.#socket.write(`${JSON.stringify({ t: "control", action: `${action}-controller` })}\n`);
 		return true;
 	}
@@ -173,7 +183,14 @@ export class LocalCollabTransport implements CollabTransport {
 		}
 		if (!record || typeof record !== "object") return;
 		const value = record as Record<string, unknown>;
-		if (value.t === "peer-left" && typeof value.peer === "number") {
+		if (value.t === "ready" && this.#waitForHerdrReady) {
+			this.#open();
+		} else if (value.t === "error" && typeof value.message === "string") {
+			const reason =
+				typeof value.code === "string" && value.code.length > 0 ? `${value.code}: ${value.message}` : value.message;
+			this.#finish(reason);
+			this.#socket?.end();
+		} else if (value.t === "peer-left" && typeof value.peer === "number") {
 			this.onControl?.({ t: "peer-left", peer: value.peer });
 		} else if (
 			value.t === "peer-authority" &&
@@ -187,9 +204,21 @@ export class LocalCollabTransport implements CollabTransport {
 		}
 	}
 
+	#open(): void {
+		if (this.#opened || this.#closed) return;
+		this.#opened = true;
+		try {
+			this.onOpen?.();
+		} catch (error) {
+			this.#finish(error instanceof Error ? error.message : String(error));
+			this.#socket?.end();
+		}
+	}
+
 	#finish(reason: string): void {
 		if (this.#closed) return;
 		this.#closed = true;
+		this.#connecting = false;
 		this.#opened = false;
 		this.onClose?.(reason, false);
 	}
@@ -202,5 +231,10 @@ export function createHostBridgeTransport(
 	ompSessionId: string,
 	routeGeneration: number,
 ): LocalCollabTransport {
-	return new LocalCollabTransport(address, { t: "host", token, paneId, ompSessionId, routeGeneration }, true);
+	return new LocalCollabTransport(
+		address,
+		{ t: "host", token, paneId, ompSessionId, routeGeneration, ompBuildId: OMP_BUILD_ID },
+		true,
+		true,
+	);
 }

@@ -77,7 +77,8 @@ describe("InteractiveMode.handleResumeSession outer preflight flush", () => {
 			const switchSpy = vi.spyOn(mode.session, "switchSession").mockResolvedValue(true);
 			const showErrorSpy = vi.spyOn(mode, "showError");
 
-			await mode.handleResumeSession("/tmp/some-session.jsonl");
+			const restored = await mode.handleResumeSession("/tmp/some-session.jsonl");
+			expect(restored).toBe(false);
 
 			expect(mode.settings.flush).toHaveBeenCalled();
 			expect(showErrorSpy).toHaveBeenCalledWith(expect.stringContaining("disk full"));
@@ -94,7 +95,8 @@ describe("InteractiveMode.handleResumeSession outer preflight flush", () => {
 			const resetSpy = vi.spyOn(mode, "resetObserverRegistry");
 			const switchSpy = vi.spyOn(session, "switchSession").mockResolvedValue(true);
 
-			await mode.handleResumeSession("/tmp/some-session.jsonl");
+			const restored = await mode.handleResumeSession("/tmp/some-session.jsonl");
+			expect(restored).toBe(true);
 
 			expect(mode.settings.flush).toHaveBeenCalled();
 			expect(resetSpy).toHaveBeenCalled();

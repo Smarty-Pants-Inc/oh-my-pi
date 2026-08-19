@@ -11,10 +11,10 @@
  * drives a real CollabGuestLink over the in-memory relay so every guest→host
  * frame is observable.
  */
-import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
 import { generateRoomKey, importRoomKey } from "@oh-my-pi/pi-coding-agent/collab/crypto";
 import { CollabGuestLink } from "@oh-my-pi/pi-coding-agent/collab/guest";
-import { CollabHost } from "@oh-my-pi/pi-coding-agent/collab/host";
+import { type CollabGuestUiResult, CollabHost } from "@oh-my-pi/pi-coding-agent/collab/host";
 import {
 	COLLAB_PROTO,
 	type CollabFrame,
@@ -28,9 +28,10 @@ import type {
 	ExtensionUIDialogOptions,
 	ExtensionUISelectItem,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import { reconcilePrivateHerdrAfterStartupJoin } from "@oh-my-pi/pi-coding-agent/main";
 import { ExtensionUiController } from "@oh-my-pi/pi-coding-agent/modes/controllers/extension-ui-controller";
 import type { InteractiveModeContext, InteractiveSelectorDialogOptions } from "@oh-my-pi/pi-coding-agent/modes/types";
-import { installInMemoryRelay, uninstallInMemoryRelay } from "./helpers/in-memory-relay";
+import { FakeWebSocket, installInMemoryRelay, uninstallInMemoryRelay } from "./helpers/in-memory-relay";
 
 // In-memory transport: shared FakeWebSocket + InMemoryRelay harness (see
 // ./helpers/in-memory-relay), same contract as the other collab tests.
@@ -58,11 +59,16 @@ interface UiResponseRecord {
 
 interface GuestUiHarness {
 	guest: CollabGuestLink;
+	ctx: InteractiveModeContext;
 	hostSocket: CollabSocket;
 	/** Every presentation the guest ever made, in order. */
 	dialogLog: DialogStub[];
 	/** Every ui-response the scripted host ever received, in order. */
 	uiResponses: UiResponseRecord[];
+	/** Errors surfaced locally by the guest. */
+	errors: string[];
+	/** Join failure retained for tests that simulate a partial replica switch. */
+	joinError: unknown;
 	nextDialog(): Promise<DialogStub>;
 	nextUiResponse(): Promise<UiResponseRecord>;
 	/**
@@ -75,6 +81,20 @@ interface GuestUiHarness {
 	sendWelcome(): void;
 	cleanup(): Promise<void>;
 }
+interface GuestUiHarnessOptions {
+	readOnly?: boolean;
+	dedicated?: boolean;
+	returnSessionFile?: string | null;
+	onNewSession?: () => void;
+	onSwitchSession?: () => void;
+	switchSessionError?: Error;
+	onResumeSession?: () => unknown;
+	resumeSessionResult?: boolean;
+	resumeSessionError?: Error;
+	allowJoinFailure?: boolean;
+	onError?: (message: string) => void;
+	herdrCollabHostLifecycle?: InteractiveModeContext["herdrCollabHostLifecycle"];
+}
 
 function makeState(): CollabSessionState {
 	return {
@@ -86,16 +106,13 @@ function makeState(): CollabSessionState {
 	};
 }
 
-async function makeHarness(opts?: {
-	readOnly?: boolean;
-	dedicated?: boolean;
-	onNewSession?: () => void;
-}): Promise<GuestUiHarness> {
+async function makeHarness(opts?: GuestUiHarnessOptions): Promise<GuestUiHarness> {
 	const roomId = "ui-request-room";
 	const roomKey = generateRoomKey();
 	const cryptoKey = await importRoomKey(roomKey);
 	const link = formatCollabLink("ws://localhost:8788", roomId, roomKey);
 
+	const errors: string[] = [];
 	const dialogLog: DialogStub[] = [];
 	const dialogQueue: DialogStub[] = [];
 	const dialogWaiters: ((stub: DialogStub) => void)[] = [];
@@ -193,18 +210,22 @@ async function makeHarness(opts?: {
 
 	const ctx = {
 		collabGuest: undefined as CollabGuestLink | undefined,
+		herdrCollabHostLifecycle: opts?.herdrCollabHostLifecycle,
 		settings: { get: () => "" },
 		sessionManager: {
-			getSessionFile: () => null,
+			getSessionFile: () => opts?.returnSessionFile ?? null,
 			getSessionName: () => "local session",
 			getCwd: () => "/local",
 		},
 		session: {
 			messages: [],
-			switchSession: () => Promise.resolve(),
-			newSession: () => {
+			switchSession: async () => {
+				opts?.onSwitchSession?.();
+				if (opts?.switchSessionError) throw opts.switchSessionError;
+			},
+			newSession: async () => {
 				opts?.onNewSession?.();
-				return Promise.resolve();
+				return true;
 			},
 			agent: {
 				state: { model: undefined },
@@ -212,6 +233,11 @@ async function makeHarness(opts?: {
 				setThinkingLevel: () => {},
 				setDisableReasoning: () => {},
 			},
+		},
+		handleResumeSession: async () => {
+			await opts?.onResumeSession?.();
+			if (opts?.resumeSessionError) throw opts.resumeSessionError;
+			return opts?.resumeSessionResult ?? true;
 		},
 		statusContainer: { clear: () => {} },
 		pendingMessagesContainer: { clear: () => {} },
@@ -244,6 +270,8 @@ async function makeHarness(opts?: {
 					return;
 				}
 			}
+			errors.push(message);
+			opts?.onError?.(message);
 		},
 		updateEditorTopBorder: () => {},
 		updateEditorBorderColor: () => {},
@@ -262,20 +290,29 @@ async function makeHarness(opts?: {
 	} as unknown as InteractiveModeContext;
 
 	const guest = new CollabGuestLink(ctx);
+	let joinError: unknown;
 	if (opts?.dedicated) {
 		await guest.joinWithTransport(
 			new CollabSocket({ wsUrl: `ws://localhost:8788/r/${roomId}`, role: "guest", key: cryptoKey }),
 			{ roomId },
 		);
 	} else {
-		await guest.join(link);
+		try {
+			await guest.join(link);
+		} catch (error) {
+			if (!opts?.allowJoinFailure) throw error;
+			joinError = error;
+		}
 	}
 
 	return {
+		ctx,
 		guest,
 		hostSocket,
 		dialogLog,
 		uiResponses,
+		errors,
+		joinError,
 		nextDialog,
 		nextUiResponse,
 		barrier,
@@ -298,23 +335,267 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+	vi.useRealTimers();
 	for (const cleanup of harnessCleanups.splice(0).reverse()) await cleanup();
 	writeSpy?.mockRestore();
 	writeSpy = null;
 	uninstallInMemoryRelay();
 });
 
-async function openHarness(opts?: {
-	readOnly?: boolean;
-	dedicated?: boolean;
-	onNewSession?: () => void;
-}): Promise<GuestUiHarness> {
+async function openHarness(opts?: GuestUiHarnessOptions): Promise<GuestUiHarness> {
 	const harness = await makeHarness(opts);
 	harnessCleanups.push(harness.cleanup);
 	return harness;
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
+
+it("suspends the private route before replica switch and resumes only after local restore", async () => {
+	const order: string[] = [];
+	const h = await openHarness({
+		returnSessionFile: "/local/session.jsonl",
+		onSwitchSession: () => order.push("remote-switch"),
+		onResumeSession: () => order.push("local-restore"),
+		herdrCollabHostLifecycle: {
+			stop: async () => {},
+			suspend: async () => {
+				order.push("suspend");
+			},
+			resume: async () => {
+				order.push("resume");
+			},
+		},
+	});
+	expect(order).toEqual(["suspend", "remote-switch"]);
+	await h.guest.leave("return to local session");
+	expect(order).toEqual(["suspend", "remote-switch", "local-restore", "resume"]);
+});
+
+it("clears the active public guest when a reconnect ends before welcome so the private route resumes", async () => {
+	const guestSockets: FakeWebSocket[] = [];
+	class CapturingWebSocket extends FakeWebSocket {
+		constructor(url: string) {
+			super(url);
+			if (this.role === "guest") guestSockets.push(this);
+		}
+	}
+	globalThis.WebSocket = CapturingWebSocket as unknown as typeof WebSocket;
+
+	const order: string[] = [];
+	let ctx: InteractiveModeContext | undefined;
+	let collabGuestAtResume: InteractiveModeContext["collabGuest"] | "not called" = "not called";
+	const h = await openHarness({
+		returnSessionFile: "/local/session.jsonl",
+		onResumeSession: () => order.push("local-restore"),
+		herdrCollabHostLifecycle: {
+			stop: async () => {},
+			suspend: async () => {
+				order.push("suspend");
+			},
+			resume: async () => {
+				collabGuestAtResume = ctx?.collabGuest;
+				order.push("resume");
+			},
+		},
+	});
+	ctx = h.ctx;
+	expect(guestSockets).toHaveLength(1);
+	expect(h.ctx.collabGuest).toBe(h.guest);
+
+	// The reconnect reaches onOpen (which resets the welcome latch), but the
+	// host never answers its new hello before the relay closes terminally.
+	h.hostSocket.onFrame = () => {};
+	vi.useFakeTimers();
+	const firstSocket = guestSockets[0];
+	if (!firstSocket) throw new Error("Expected initial guest relay socket");
+	firstSocket.readyState = FakeWebSocket.CLOSED;
+	firstSocket.onclose?.({ code: 1006, reason: "temporary relay drop" });
+	vi.advanceTimersByTime(2_000);
+	await Promise.resolve();
+
+	const reconnectSocket = guestSockets[1];
+	if (!reconnectSocket) throw new Error("Expected reconnect guest relay socket");
+	expect(reconnectSocket.readyState).toBe(FakeWebSocket.OPEN);
+	reconnectSocket.readyState = FakeWebSocket.CLOSED;
+	reconnectSocket.onclose?.({ code: 4004, reason: "room closed" });
+	await h.guest.leave("wait for automatic teardown");
+
+	expect(h.ctx.collabGuest).toBeUndefined();
+	expect(collabGuestAtResume).toBeUndefined();
+	expect(order).toEqual(["suspend", "local-restore", "resume"]);
+});
+
+it("keeps the private route suspended when local restoration returns false", async () => {
+	const order: string[] = [];
+	const h = await openHarness({
+		returnSessionFile: "/local/session.jsonl",
+		onResumeSession: () => order.push("local-restore"),
+		resumeSessionResult: false,
+		herdrCollabHostLifecycle: {
+			stop: async () => {},
+			suspend: async () => {
+				order.push("suspend");
+			},
+			resume: async () => {
+				order.push("resume");
+			},
+		},
+	});
+	await h.guest.leave("return to local session");
+	expect(order).toEqual(["suspend", "local-restore"]);
+	expect(h.errors).toContain("Failed to restore local session; private Herdr host remains suspended");
+});
+
+it("surfaces a private-route rearm failure after an automatic bye", async () => {
+	const failureMessage = "Failed to resume private Herdr host after collab ended: rearm failed";
+	const surfacedFailure = Promise.withResolvers<void>();
+	const h = await openHarness({
+		returnSessionFile: "/local/session.jsonl",
+		onError: message => {
+			if (message === failureMessage) surfacedFailure.resolve();
+		},
+		herdrCollabHostLifecycle: {
+			stop: async () => {},
+			suspend: async () => {},
+			resume: async () => {
+				throw new Error("rearm failed");
+			},
+		},
+	});
+
+	h.hostSocket.send({ t: "bye", reason: "host stopped" });
+	await surfacedFailure.promise;
+
+	expect(h.errors).toContain(failureMessage);
+});
+
+it("keeps the private route suspended when local restoration throws", async () => {
+	const order: string[] = [];
+	const h = await openHarness({
+		returnSessionFile: "/local/session.jsonl",
+		onResumeSession: () => order.push("local-restore"),
+		resumeSessionError: new Error("local session unavailable"),
+		herdrCollabHostLifecycle: {
+			stop: async () => {},
+			suspend: async () => {
+				order.push("suspend");
+			},
+			resume: async () => {
+				order.push("resume");
+			},
+		},
+	});
+	await h.guest.leave("return to local session");
+	expect(order).toEqual(["suspend", "local-restore"]);
+	expect(h.errors).toContain(
+		"Failed to restore local session; private Herdr host remains suspended: local session unavailable",
+	);
+});
+
+it("restores the local session after a replica switch fails before welcome", async () => {
+	const order: string[] = [];
+	const h = await openHarness({
+		returnSessionFile: "/local/session.jsonl",
+		onSwitchSession: () => order.push("remote-switch"),
+		switchSessionError: new Error("replica switch failed"),
+		onResumeSession: () => order.push("local-restore"),
+		allowJoinFailure: true,
+		herdrCollabHostLifecycle: {
+			stop: async () => {},
+			suspend: async () => {
+				order.push("suspend");
+			},
+			resume: async () => {
+				order.push("resume");
+			},
+		},
+	});
+	expect(h.joinError).toBeInstanceOf(Error);
+	expect((h.joinError as Error).message).toBe("replica switch failed");
+	expect(order).toEqual(["suspend", "remote-switch", "local-restore", "resume"]);
+});
+
+it("cancels replica finalization when the relay closes during the snapshot write", async () => {
+	const writeStarted = Promise.withResolvers<void>();
+	const finishWrite = Promise.withResolvers<number>();
+	writeSpy?.mockRestore();
+	writeSpy = spyOn(Bun, "write").mockImplementation(async () => {
+		writeStarted.resolve();
+		return finishWrite.promise;
+	});
+
+	let guestSocket: FakeWebSocket | undefined;
+	class CapturingWebSocket extends FakeWebSocket {
+		constructor(url: string) {
+			super(url);
+			if (this.role === "guest") guestSocket = this;
+		}
+	}
+	globalThis.WebSocket = CapturingWebSocket as unknown as typeof WebSocket;
+
+	const order: string[] = [];
+	const harnessPromise = makeHarness({
+		allowJoinFailure: true,
+		returnSessionFile: "/local/session.jsonl",
+		onSwitchSession: () => order.push("remote-switch"),
+		onResumeSession: () => order.push("local-restore"),
+		herdrCollabHostLifecycle: {
+			stop: async () => {},
+			suspend: async () => {
+				order.push("suspend");
+			},
+			resume: async () => {
+				order.push("resume");
+			},
+		},
+	});
+	await writeStarted.promise;
+	if (!guestSocket) throw new Error("Expected captured guest relay socket");
+	guestSocket.onclose?.({ code: 4004, reason: "room closed" });
+	await Promise.resolve();
+	await Promise.resolve();
+	expect(order).toEqual(["suspend"]);
+
+	finishWrite.resolve(0);
+	const h = await harnessPromise;
+	harnessCleanups.push(h.cleanup);
+	expect(h.joinError).toBeInstanceOf(Error);
+	expect(order).toEqual(["suspend", "resume"]);
+});
+
+it("waits for startup guest restoration instead of resuming from collabGuest absence", async () => {
+	const restorationStarted = Promise.withResolvers<void>();
+	const finishRestoration = Promise.withResolvers<void>();
+	const order: string[] = [];
+	const h = await openHarness({
+		returnSessionFile: "/local/session.jsonl",
+		onResumeSession: async () => {
+			order.push("local-restore");
+			restorationStarted.resolve();
+			await finishRestoration.promise;
+		},
+		herdrCollabHostLifecycle: {
+			stop: async () => {},
+			suspend: async () => {
+				order.push("suspend");
+			},
+			resume: async () => {
+				order.push("resume");
+			},
+		},
+	});
+
+	h.hostSocket.send({ t: "bye", reason: "host stopped" });
+	await restorationStarted.promise;
+	expect(h.ctx.collabGuest).toBeUndefined();
+	const reconciliation = reconcilePrivateHerdrAfterStartupJoin(h.ctx);
+	await Promise.resolve();
+	expect(order).toEqual(["suspend", "local-restore"]);
+
+	finishRestoration.resolve();
+	await reconciliation;
+	expect(order).toEqual(["suspend", "local-restore", "resume"]);
+});
 
 describe("collab TUI guest ui-request handling (#4049)", () => {
 	it("presents a select ui-request through the hook selector and round-trips the answer", async () => {
@@ -684,6 +965,32 @@ class StubDialogController extends ExtensionUiController {
 	}
 }
 
+it("races private Herdr and public collab guests without hiding either host", async () => {
+	const ctx = makeHostContext();
+	const privateResult = Promise.withResolvers<CollabGuestUiResult>();
+	const publicResult = Promise.withResolvers<CollabGuestUiResult>();
+	const requested: string[] = [];
+	ctx.herdrCollabHost = {
+		requestGuestUi: () => {
+			requested.push("herdr");
+			return privateResult.promise;
+		},
+	} as unknown as CollabHost;
+	ctx.collabHost = {
+		requestGuestUi: () => {
+			requested.push("public");
+			return publicResult.promise;
+		},
+	} as unknown as CollabHost;
+	const controller = new StubDialogController(ctx);
+	const result = controller.showCollabAwareSelector("Deploy?", ["Yes", "No"]);
+	expect(requested).toEqual(["herdr", "public"]);
+	privateResult.resolve({ kind: "unavailable" });
+	publicResult.resolve({ kind: "answered", value: "No" });
+	expect(await result).toBe("No");
+	expect(controller.localDialogs[0]?.signal?.aborted).toBe(true);
+});
+
 describe("collab host dialog vs teardown (#4049 follow-up)", () => {
 	async function openRace(): Promise<{
 		host: CollabHost;
@@ -837,6 +1144,72 @@ function makeAskHostContext(): InteractiveModeContext {
 	};
 	return stub as unknown as InteractiveModeContext;
 }
+
+it("fans two ask questions to both hosts and cancels each losing host", async () => {
+	type RequestRecord = {
+		host: "private" | "public";
+		title: string;
+		signal: AbortSignal | undefined;
+		whenAborted: Promise<void>;
+		resolve(result: CollabGuestUiResult): void;
+	};
+	const requests: RequestRecord[] = [];
+	const firstPair = Promise.withResolvers<void>();
+	const secondPair = Promise.withResolvers<void>();
+	const makeRemoteHost = (host: RequestRecord["host"]): CollabHost =>
+		({
+			requestGuestUi: (request: { title: string }, signal?: AbortSignal): Promise<CollabGuestUiResult> => {
+				const result = Promise.withResolvers<CollabGuestUiResult>();
+				const aborted = Promise.withResolvers<void>();
+				if (signal?.aborted) aborted.resolve();
+				else signal?.addEventListener("abort", () => aborted.resolve(), { once: true });
+				requests.push({
+					host,
+					title: request.title,
+					signal,
+					whenAborted: aborted.promise,
+					resolve: result.resolve,
+				});
+				if (requests.length === 2) firstPair.resolve();
+				if (requests.length === 4) secondPair.resolve();
+				return result.promise;
+			},
+		}) as unknown as CollabHost;
+	const requestAt = (index: number): RequestRecord => {
+		const request = requests[index];
+		if (!request) throw new Error(`missing request ${index}`);
+		return request;
+	};
+
+	const ctx = makeAskHostContext();
+	ctx.herdrCollabHost = makeRemoteHost("private");
+	ctx.collabHost = makeRemoteHost("public");
+	const controller = new ExtensionUiController(ctx);
+	const result = controller.showAskDialog([
+		{ id: "q1", question: "First?", options: [{ label: "A" }, { label: "B" }] },
+		{ id: "q2", question: "Second?", options: [{ label: "C" }, { label: "D" }] },
+	]);
+
+	await firstPair.promise;
+	requestAt(0).resolve({ kind: "answered", value: "A" });
+	await requestAt(1).whenAborted;
+	await secondPair.promise;
+	expect(requests.map(({ host, title }) => [host, title])).toEqual([
+		["private", "First?"],
+		["public", "First?"],
+		["private", "Second?"],
+		["public", "Second?"],
+	]);
+	expect(requestAt(0).signal?.aborted).toBe(false);
+	expect(requestAt(1).signal?.aborted).toBe(true);
+
+	requestAt(3).resolve({ kind: "answered", value: "D" });
+	await requestAt(2).whenAborted;
+	expect(requestAt(2).signal?.aborted).toBe(true);
+	const settled = await result;
+	if (settled?.kind !== "submit") throw new Error("expected submitted ask result");
+	expect(settled.results.map(item => item.selectedOptions)).toEqual([["A"], ["D"]]);
+});
 
 describe("guest ask multi-select Next gating (#4375 PRRT_kwDOQxs0bc6OFbDW)", () => {
 	/** Skip ui-request-end dismissal frames, wait for the next ui-request. */
