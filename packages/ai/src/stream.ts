@@ -25,7 +25,7 @@ import { isConcurrencyCapExclusion, isUsageLimitOutcome } from "./error/rate-lim
 import type { BedrockOptions } from "./providers/amazon-bedrock";
 import type { AnthropicOptions } from "./providers/anthropic";
 import type { MessageCreateParamsStreaming } from "./providers/anthropic-wire";
-import { COWORK_PROVIDER_DISPATCH_GUARD, coworkFetch } from "./providers/cowork-fetch";
+import { BYPASS_PROVIDER_DISPATCH_GUARD, COWORK_PROVIDER_DISPATCH_GUARD, coworkFetch } from "./providers/cowork-fetch";
 import type { CursorOptions } from "./providers/cursor";
 import type { DevinOptions } from "./providers/devin";
 import { isGitLabDuoModel, streamGitLabDuo } from "./providers/gitlab-duo";
@@ -94,8 +94,17 @@ const providerDispatchGuardedFetches = new WeakMap<FetchImpl, NonNullable<Stream
 function withProviderDispatchGuard(fetchImpl: FetchImpl, guard: StreamOptions["providerDispatchGuard"]): FetchImpl {
 	if (!guard || providerDispatchGuardedFetches.get(fetchImpl) === guard) return fetchImpl;
 	const guardedFetch: FetchImpl = (input, init) => {
-		guard();
-		return fetchImpl(input, { ...(init ?? {}), [COWORK_PROVIDER_DISPATCH_GUARD]: guard } as RequestInit);
+		const requestInit = { ...(init ?? {}) } as RequestInit & {
+			[BYPASS_PROVIDER_DISPATCH_GUARD]?: boolean;
+			[COWORK_PROVIDER_DISPATCH_GUARD]?: () => void;
+		};
+		const bypass = requestInit[BYPASS_PROVIDER_DISPATCH_GUARD] === true;
+		delete requestInit[BYPASS_PROVIDER_DISPATCH_GUARD];
+		if (!bypass) {
+			guard();
+			requestInit[COWORK_PROVIDER_DISPATCH_GUARD] = guard;
+		}
+		return fetchImpl(input, requestInit);
 	};
 	if (fetchImpl.preconnect) guardedFetch.preconnect = fetchImpl.preconnect;
 	providerDispatchGuardedFetches.set(guardedFetch, guard);

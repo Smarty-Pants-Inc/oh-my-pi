@@ -14,6 +14,8 @@ import { logger, Snowflake } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
 import type { Settings } from "../config/settings";
 import type { ExtensionRunner, SessionBeforeSwitchResult } from "../extensibility/extensions";
+import { isFinalStatus } from "../goals/runtime";
+import type { GoalModeState } from "../goals/state";
 import { copyLocalArtifacts, resolveLocalUrlToPath } from "../internal-urls";
 import { obfuscateProviderContext } from "../secrets/message-transform";
 import type { SecretObfuscator } from "../secrets/obfuscator";
@@ -73,6 +75,7 @@ export interface SessionHandoffHost {
 	thinkingLevel(): ThinkingLevel | undefined;
 	sessionId(): string;
 	sessionFile(): string | undefined;
+	goalModeState(): GoalModeState | undefined;
 	baseSystemPrompt(): string[];
 	assertVibeSessionTransitionAllowed(action: string): void;
 	setSkipPostTurnMaintenance(timestamp: number | undefined): void;
@@ -303,6 +306,9 @@ export class SessionHandoff {
 			const preservedSteering = this.#host.agent.peekSteeringQueue().slice();
 			const preservedFollowUp = this.#host.agent.peekFollowUpQueue().slice();
 			const preservedCompanions = this.#host.agent.captureQueuedMessageCompanions();
+			const goalModeState = this.#host.goalModeState();
+			const preservedGoal =
+				goalModeState && !isFinalStatus(goalModeState.goal) ? structuredClone(goalModeState.goal) : undefined;
 			pendingSemanticDeliveryHandoff = await this.#host.preparePendingSemanticDeliveryHandoff(
 				preservedSteering,
 				preservedFollowUp,
@@ -311,6 +317,11 @@ export class SessionHandoff {
 			await this.#host.sessionManager.newSession(
 				previousSessionFile ? { parentSession: previousSessionFile } : undefined,
 			);
+			if (preservedGoal) {
+				this.#host.sessionManager.appendModeChange(preservedGoal.status === "paused" ? "goal_paused" : "goal", {
+					goal: preservedGoal,
+				});
+			}
 			lifecycle.markTarget();
 			this.#host.clearFreshProviderSessionId();
 			this.#host.syncAgentSessionId(false, false);

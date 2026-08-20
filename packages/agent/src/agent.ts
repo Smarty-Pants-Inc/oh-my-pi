@@ -848,7 +848,7 @@ export class Agent {
 		return () => this.#beforeModelCallHooks.delete(registration);
 	}
 
-	/** Register a synchronous hook that runs before provider-visible context is accepted. */
+	/** Register a synchronous hook that runs before messages enter accepted input state. */
 	addBeforeInputHook(hook: (messages: readonly AgentMessage[]) => void): () => void {
 		this.#beforeInputHooks.add(hook);
 		return () => this.#beforeInputHooks.delete(hook);
@@ -1001,9 +1001,10 @@ export class Agent {
 	}
 
 	replaceMessages(ms: AgentMessage[]) {
-		// New array assignment is intentional: caller-owned `ms` may be mutated
-		// after handoff; snapshot it so external mutations cannot leak in.
-		this.#state.messages = ms.slice();
+		// Snapshot first so hooks inspect the exact list that will be accepted.
+		const next = ms.slice();
+		this.#runBeforeInputHooks(next);
+		this.#state.messages = next;
 	}
 
 	replaceQueues(steering: AgentMessage[], followUp: AgentMessage[], preserveCompanions = false) {
@@ -1164,14 +1165,7 @@ export class Agent {
 	}
 
 	appendMessage(m: AgentMessage) {
-		if (
-			m.role === "user" ||
-			m.role === "assistant" ||
-			m.role === "toolResult" ||
-			("attribution" in m && m.attribution === "user")
-		) {
-			this.#runBeforeInputHooks([m]);
-		}
+		this.#runBeforeInputHooks([m]);
 		this.#state.messages.push(m);
 	}
 

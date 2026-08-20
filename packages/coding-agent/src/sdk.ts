@@ -148,7 +148,6 @@ import {
 	buildSecretObfuscator,
 	deobfuscateSessionContext,
 	deobfuscateToolArguments,
-	obfuscateMessages,
 	obfuscateProviderContext,
 	type SecretObfuscator,
 } from "./secrets";
@@ -3264,17 +3263,16 @@ async function createAgentSessionScoped(
 			return converted;
 		};
 
-		// Final convertToLlm: live provider replay drops API-level refusal errors,
-		// then applies secret obfuscation to the remaining outbound context.
+		// Final convertToLlm: live provider replay drops API-level refusal errors.
+		// Secret obfuscation runs once in transformProviderContext, after registered
+		// instructions are present, so regex collisions are resolved across the full request.
 		const convertToLlmFinal = (messages: AgentMessage[]): Message[] => {
 			const providerMessages = messages.filter(
 				message =>
 					message.role !== "custom" ||
 					(message.customType !== "goal-continuation" && message.customType !== "goal-mode-context"),
 			);
-			const converted = filterProviderReplayMessages(convertToLlmWithBlockImages(providerMessages));
-			if (!obfuscator?.hasSecrets()) return converted;
-			return obfuscateMessages(obfuscator, converted);
+			return filterProviderReplayMessages(convertToLlmWithBlockImages(providerMessages));
 		};
 
 		const transformContext = async (messages: AgentMessage[], _signal?: AbortSignal) => {
@@ -3334,9 +3332,7 @@ async function createAgentSessionScoped(
 				registeredInstructions.length > 0 || existingInstructions?.length !== context.instructions?.length
 					? { ...context, instructions: [...(existingInstructions ?? []), ...registeredInstructions] }
 					: context;
-			if (contextTarget === defaultContextTarget && transformed.instructions?.length) {
-				session?.retainPrimaryProviderInstructions(transformed.instructions);
-			}
+			if (contextTarget === defaultContextTarget) session?.retainPrimaryProviderContext(transformed);
 			transformed = obfuscator ? obfuscateProviderContext(obfuscator, transformed) : transformed;
 			if (snapcompactInline) transformed = await snapcompactInline.transform(transformed, transformModel);
 			transformed = clampProviderContextImages(transformed, transformModel);

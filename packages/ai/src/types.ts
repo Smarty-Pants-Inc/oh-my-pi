@@ -1151,6 +1151,7 @@ export interface CursorExecHandlers {
 	shellStream?: (
 		args: ShellArgs,
 		callbacks: CursorShellStreamCallbacks,
+		signal?: AbortSignal,
 	) => Promise<CursorExecHandlerResult<ShellResult>>;
 	diagnostics?: (args: DiagnosticsArgs) => Promise<CursorExecHandlerResult<DiagnosticsResult>>;
 	mcp?: (call: CursorMcpCall) => Promise<CursorExecHandlerResult<McpResult>>;

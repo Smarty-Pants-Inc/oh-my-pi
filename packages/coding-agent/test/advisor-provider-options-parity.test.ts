@@ -10,8 +10,8 @@
  * fell back to a different cache shard), its shared `providerSessionState`,
  * and its explicit websocket preference.
  */
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
-import { Agent, type StreamFn } from "@oh-my-pi/pi-agent-core";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
+import { Agent, type AgentMessage, type StreamFn } from "@oh-my-pi/pi-agent-core";
 import * as compactionModule from "@oh-my-pi/pi-agent-core/compaction";
 import type { Context, ContextTarget, FetchImpl, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
 import { streamSimple } from "@oh-my-pi/pi-ai";
@@ -53,16 +53,9 @@ describe("AgentSession advisor provider-options parity", () => {
 	let model: Model;
 
 	beforeAll(() => {
-		authStorage = createInMemoryAuthStorage();
-		authStorage.setRuntimeApiKey("anthropic", "test-key");
-		modelRegistry = new ModelRegistry(authStorage);
 		const bundled = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!bundled) throw new Error("Expected built-in anthropic model to exist");
 		model = bundled;
-	});
-
-	afterAll(() => {
-		authStorage.close();
 	});
 
 	let tempDir: TempDir;
@@ -74,8 +67,61 @@ describe("AgentSession advisor provider-options parity", () => {
 			"providers.openrouterVariant": "floor",
 			"model.loopGuard.enabled": true,
 		});
+	type LateInputDelivery = (session: AgentSession, agent: Agent, secret: string) => Promise<void> | void;
+	const lateInputCases: [string, LateInputDelivery][] = [
+		[
+			"an idle user-attributed custom message is appended",
+			async (targetSession, _agent, secret) => {
+				await targetSession.sendCustomMessage(
+					{
+						customType: "background-tan-dispatch",
+						content: `Background task contains ${secret}`,
+						display: false,
+						attribution: "user",
+					},
+					{ deliverAs: "nextTurn", triggerTurn: false },
+				);
+			},
+		],
+		[
+			"a bash execution is appended",
+			(_session, agent, secret) => {
+				agent.appendMessage({
+					role: "bashExecution",
+					command: "printf late-output",
+					output: `Command output contains ${secret}`,
+					exitCode: 0,
+					timestamp: Date.now(),
+				} as unknown as AgentMessage);
+			},
+		],
+		[
+			"a Python execution is appended",
+			(_session, agent, secret) => {
+				agent.appendMessage({
+					role: "pythonExecution",
+					code: "print('late-output')",
+					output: `Python output contains ${secret}`,
+					exitCode: 0,
+					timestamp: Date.now(),
+				} as unknown as AgentMessage);
+			},
+		],
+		[
+			"provider-visible history is replaced",
+			(_session, agent, secret) => {
+				agent.replaceMessages([
+					...agent.state.messages,
+					{ role: "user", content: `Replacement contains ${secret}`, timestamp: Date.now() },
+				]);
+			},
+		],
+	];
 
 	beforeEach(() => {
+		authStorage = createInMemoryAuthStorage();
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		modelRegistry = new ModelRegistry(authStorage);
 		tempDir = TempDir.createSync("@pi-advisor-parity-");
 		sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
 	});
@@ -86,6 +132,7 @@ describe("AgentSession advisor provider-options parity", () => {
 			await tempDir.remove();
 		} catch {}
 		vi.restoreAllMocks();
+		authStorage.close();
 	});
 
 	it("wraps the inherited streamFn and preserves promptCacheKey and providerSessionState", () => {
@@ -705,7 +752,7 @@ describe("AgentSession advisor provider-options parity", () => {
 		expect(capturedContexts).toHaveLength(0);
 	});
 
-	it("discards a mission before an idle user-attributed custom message is appended", async () => {
+	it.each(lateInputCases)("discards a mission before %s", async (_case, deliverLateInput) => {
 		const capturedContexts: Context[] = [];
 		const credentialStarted = Promise.withResolvers<void>();
 		const releaseCredential = Promise.withResolvers<void>();
@@ -758,7 +805,7 @@ describe("AgentSession advisor provider-options parity", () => {
 			enabled: true,
 			mode: "active",
 			goal: {
-				id: "custom-secret-race-goal",
+				id: "late-input-secret-race-goal",
 				objective: `Finish using ${plainSecret}`,
 				status: "active",
 				tokenBudget: 100,
@@ -775,15 +822,7 @@ describe("AgentSession advisor provider-options parity", () => {
 
 		const stalePrompt = advisor.prompt("Start credential resolution").catch(() => {});
 		await credentialStarted.promise;
-		await session.sendCustomMessage(
-			{
-				customType: "background-tan-dispatch",
-				content: `Background task contains ${regexSecret}`,
-				display: false,
-				attribution: "user",
-			},
-			{ deliverAs: "nextTurn", triggerTurn: false },
-		);
+		await deliverLateInput(session, mainAgent, regexSecret);
 		releaseCredential.resolve();
 		await stalePrompt;
 
@@ -1068,6 +1107,72 @@ describe("AgentSession advisor provider-options parity", () => {
 		expect(JSON.stringify(firstRequest)).not.toContain(completedObjective);
 	});
 
+	it("retains regex secrets from deliveries preserved across handoff", async () => {
+		const capturedContexts: Context[] = [];
+		const plainSecret = "OTHERSECRET";
+		const regexSecret = "ABC12345";
+		const obfuscator = new SecretObfuscator(
+			[
+				{ type: "plain", content: plainSecret, friendlyName: regexSecret },
+				{ type: "regex", content: "(?<=token=)[A-Z0-9]{8}", mode: "replace" },
+			],
+			"test-key",
+		);
+		sessionManager.appendMessage({ role: "user", content: "Prepare the handoff", timestamp: 1 });
+		sessionManager.appendMessage(createAssistantMessage("Ready to hand off"));
+		const mainAgent = new Agent({
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: sessionManager.buildSessionContext().messages,
+			},
+		});
+		const handoffSettings = settings();
+		handoffSettings.set("goal.enabled", true);
+		session = new AgentSession({
+			agent: mainAgent,
+			sessionManager,
+			settings: handoffSettings,
+			modelRegistry,
+			advisorTools: [],
+			advisorStreamFn: (_requestModel, context) => {
+				capturedContexts.push(context);
+				throw new Error("capture-stop");
+			},
+			obfuscator,
+			transformProviderContext: context => obfuscateProviderContext(obfuscator, context),
+		});
+		session.setGoalModeState({
+			enabled: true,
+			mode: "active",
+			goal: {
+				id: "preserved-queue-secret-goal",
+				objective: `Finish using ${plainSecret}`,
+				status: "active",
+				tokenBudget: 100,
+				tokensUsed: 10,
+				timeUsedSeconds: 2,
+				createdAt: 1,
+				updatedAt: 2,
+			},
+		});
+		session.settings.setModelRole("advisor", "anthropic/claude-sonnet-4-5");
+		expect(session.setAdvisorEnabled(true)).toBe(true);
+		mainAgent.followUp({ role: "user", content: `queued token=${regexSecret}`, timestamp: 3 });
+		vi.spyOn(compactionModule, "generateHandoffFromContext").mockResolvedValue("## Goal\nContinue from here");
+
+		await session.handoff();
+		const replacementAdvisor = session.getAdvisorAgent();
+		if (!replacementAdvisor) throw new Error("Expected advisor agent after handoff");
+		await replacementAdvisor.prompt("Review the replacement session").catch(() => {});
+
+		expect(capturedContexts).toHaveLength(1);
+		const serialized = JSON.stringify(capturedContexts[0]);
+		expect(serialized).not.toContain(plainSecret);
+		expect(serialized).not.toContain(regexSecret);
+	});
+
 	it("chooses collision-safe placeholders when inherited transforms redact advisor messages first", async () => {
 		const capturedContexts: Context[] = [];
 		const captureStreamFn: StreamFn = (_m, context) => {
@@ -1198,7 +1303,7 @@ describe("AgentSession advisor provider-options parity", () => {
 		expect(serialized).not.toContain(derivedPrefix);
 	});
 
-	it("projects the mission through createAgentSession onto the provider wire", async () => {
+	it("retains extension-injected provider messages for later advisor missions", async () => {
 		const provider = "mission-wire-provider";
 		const api = "mission-wire-api";
 		const modelId = "mission-wire-model";
@@ -1214,6 +1319,21 @@ describe("AgentSession advisor provider-options parity", () => {
 		const sdkModelRegistry = new ModelRegistry(sdkAuthStorage, tempDir.join("mission-models.yml"));
 		const capturedContexts: Context[] = [];
 		const providerExtension: ExtensionFactory = pi => {
+			let injectedPrimaryContext = false;
+			pi.on("context", event => {
+				if (injectedPrimaryContext) return undefined;
+				injectedPrimaryContext = true;
+				return {
+					messages: [
+						...event.messages,
+						{
+							role: "user",
+							content: `Extension-only provider message contains ${regexSecret}`,
+							timestamp: 2,
+						} satisfies AgentMessage,
+					],
+				};
+			});
 			pi.registerProvider(provider, {
 				baseUrl: "http://127.0.0.1:8080/v1",
 				apiKey: "test-key",
@@ -1263,9 +1383,6 @@ describe("AgentSession advisor provider-options parity", () => {
 				enableMCP: false,
 				enableLsp: false,
 				skipPythonPreflight: true,
-				contextInstructions: [
-					bindRenderedInstruction("todo.snapshot", `Primary-only instruction contains ${regexSecret}`, "main"),
-				],
 			});
 			session = created.session;
 			await session.prompt("Prepare the primary context");

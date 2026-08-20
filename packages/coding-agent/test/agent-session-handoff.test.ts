@@ -1319,6 +1319,35 @@ describe("AgentSession handoff", () => {
 		expect(session.agent.peekFollowUpQueue().map(textOf)).toEqual(["keep-followup"]);
 	});
 
+	it.each([
+		["active", true],
+		["paused", false],
+		["blocked", false],
+		["budget_limited", false],
+		["usage_limited", false],
+	] as const)("preserves a non-final %s goal in the handoff target", async (status, autoTriggered) => {
+		vi.spyOn(compactionModule, "generateHandoffFromContext").mockResolvedValue("## Goal\nContinue");
+		session.settings.set("goal.enabled", true);
+		const goal = {
+			id: `handoff-${status}-goal`,
+			objective: `Continue the ${status} goal`,
+			status,
+			tokenBudget: 1_000,
+			tokensUsed: 10,
+			timeUsedSeconds: 2,
+			createdAt: 1,
+			updatedAt: 2,
+		};
+		session.setGoalModeState({ enabled: status === "active", mode: "active", goal });
+
+		await session.handoff(undefined, autoTriggered ? { autoTriggered: true } : undefined);
+
+		const targetContext = sessionManager.buildSessionContext();
+		expect(targetContext.mode).toBe(status === "paused" ? "goal_paused" : "goal");
+		expect(targetContext.modeData?.goal).toEqual(goal);
+		expect(session.getGoalModeState()).toEqual({ enabled: status === "active", mode: "active", goal });
+	});
+
 	it("moves durable semantic queue ownership to the handoff target", async () => {
 		vi.spyOn(compactionModule, "generateHandoffFromContext").mockResolvedValue("## Goal\nContinue");
 		session.agent.state.isStreaming = true;

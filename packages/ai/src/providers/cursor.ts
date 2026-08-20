@@ -1166,92 +1166,125 @@ async function handleShellStreamArgs(
 
 	sendShellStreamEvent(h2Request, execMsg, { case: "start", value: create(ShellStreamStartSchema, {}) });
 
-	// Buffer for incomplete ANSI sequences across chunks
+	// Buffer for incomplete ANSI sequences across chunks.
 	let stdoutBuffer = "";
 	let stderrBuffer = "";
+	let stdoutFlushTimer: NodeJS.Timeout | undefined;
+	let stderrFlushTimer: NodeJS.Timeout | undefined;
+	let outputOpen = !h2Request.closed && !h2Request.destroyed;
+	let outputFailureReason: unknown;
+	let outputFailureReported = false;
+	const outputFailure = Promise.withResolvers<unknown>();
+	const outputAbortController = new AbortController();
+
+	const clearFlushTimers = () => {
+		clearTimeout(stdoutFlushTimer);
+		clearTimeout(stderrFlushTimer);
+		stdoutFlushTimer = undefined;
+		stderrFlushTimer = undefined;
+	};
+	const closeOutput = () => {
+		outputOpen = false;
+		stdoutBuffer = "";
+		stderrBuffer = "";
+		clearFlushTimers();
+	};
+	const onTransportClose = () => closeOutput();
+	if (typeof h2Request.once === "function") h2Request.once("close", onTransportClose);
 
 	const incompleteEscapeRegex = /\x1b(|\[|\[\d*|\[\?|\[\?\d*|\]\d*;?)$/;
 
 	const flushStdout = () => {
-		if (stdoutBuffer) {
-			let safeEnd = stdoutBuffer.length;
-			const match = stdoutBuffer.match(incompleteEscapeRegex);
-			if (match && match[0].length > 0) {
-				safeEnd = stdoutBuffer.length - match[0].length;
-			}
-			const toSend = stdoutBuffer.slice(0, safeEnd);
-			const remaining = stdoutBuffer.slice(safeEnd);
-			if (toSend) {
-				sendShellStreamEvent(h2Request, execMsg, {
-					case: "stdout",
-					value: create(ShellStreamStdoutSchema, { data: sanitizeText(toSend) }),
-				});
-			}
-			stdoutBuffer = remaining;
+		if (!outputOpen || !stdoutBuffer) return;
+		let safeEnd = stdoutBuffer.length;
+		const match = stdoutBuffer.match(incompleteEscapeRegex);
+		if (match && match[0].length > 0) {
+			safeEnd = stdoutBuffer.length - match[0].length;
 		}
+		const toSend = stdoutBuffer.slice(0, safeEnd);
+		const remaining = stdoutBuffer.slice(safeEnd);
+		if (toSend) {
+			sendShellStreamEvent(h2Request, execMsg, {
+				case: "stdout",
+				value: create(ShellStreamStdoutSchema, { data: sanitizeText(toSend) }),
+			});
+		}
+		stdoutBuffer = remaining;
 	};
 
 	const flushStderr = () => {
-		if (stderrBuffer) {
-			let safeEnd = stderrBuffer.length;
-			const match = stderrBuffer.match(incompleteEscapeRegex);
-			if (match && match[0].length > 0) {
-				safeEnd = stderrBuffer.length - match[0].length;
-			}
-			const toSend = stderrBuffer.slice(0, safeEnd);
-			const remaining = stderrBuffer.slice(safeEnd);
-			if (toSend) {
-				sendShellStreamEvent(h2Request, execMsg, {
-					case: "stderr",
-					value: create(ShellStreamStderrSchema, { data: sanitizeText(toSend) }),
-				});
-			}
-			stderrBuffer = remaining;
+		if (!outputOpen || !stderrBuffer) return;
+		let safeEnd = stderrBuffer.length;
+		const match = stderrBuffer.match(incompleteEscapeRegex);
+		if (match && match[0].length > 0) {
+			safeEnd = stderrBuffer.length - match[0].length;
+		}
+		const toSend = stderrBuffer.slice(0, safeEnd);
+		const remaining = stderrBuffer.slice(safeEnd);
+		if (toSend) {
+			sendShellStreamEvent(h2Request, execMsg, {
+				case: "stderr",
+				value: create(ShellStreamStderrSchema, { data: sanitizeText(toSend) }),
+			});
+		}
+		stderrBuffer = remaining;
+	};
+
+	const reportOutputFailure = (error: unknown) => {
+		if (outputFailureReported) return;
+		outputFailureReported = true;
+		outputFailureReason = error;
+		closeOutput();
+		outputFailure.resolve(error);
+		outputAbortController.abort(error);
+	};
+	const flushSafely = (flush: () => void) => {
+		try {
+			flush();
+		} catch (error) {
+			reportOutputFailure(error);
 		}
 	};
 
-	let stdoutFlushTimer: NodeJS.Timeout | null = null;
-	let stderrFlushTimer: NodeJS.Timeout | null = null;
-
 	const scheduleStdoutFlush = () => {
-		if (!stdoutFlushTimer) {
-			stdoutFlushTimer = setTimeout(() => {
-				stdoutFlushTimer = null;
-				flushStdout();
-			}, 100);
-		}
+		if (!outputOpen || stdoutFlushTimer) return;
+		stdoutFlushTimer = setTimeout(() => {
+			stdoutFlushTimer = undefined;
+			flushSafely(flushStdout);
+		}, 100);
 	};
 
 	const scheduleStderrFlush = () => {
-		if (!stderrFlushTimer) {
-			stderrFlushTimer = setTimeout(() => {
-				stderrFlushTimer = null;
-				flushStderr();
-			}, 100);
-		}
+		if (!outputOpen || stderrFlushTimer) return;
+		stderrFlushTimer = setTimeout(() => {
+			stderrFlushTimer = undefined;
+			flushSafely(flushStderr);
+		}, 100);
 	};
 
 	const streamCallbacks: CursorShellStreamCallbacks = {
 		onStdout(data: string) {
+			if (!outputOpen) return;
 			stdoutBuffer += data;
 			if (stdoutBuffer.includes("\n") || stdoutBuffer.length > 4096) {
 				if (stdoutFlushTimer) {
 					clearTimeout(stdoutFlushTimer);
-					stdoutFlushTimer = null;
+					stdoutFlushTimer = undefined;
 				}
-				flushStdout();
+				flushSafely(flushStdout);
 			} else {
 				scheduleStdoutFlush();
 			}
 		},
 		onStderr(data: string) {
+			if (!outputOpen) return;
 			stderrBuffer += data;
 			if (stderrBuffer.includes("\n") || stderrBuffer.length > 4096) {
 				if (stderrFlushTimer) {
 					clearTimeout(stderrFlushTimer);
-					stderrFlushTimer = null;
+					stderrFlushTimer = undefined;
 				}
-				flushStderr();
+				flushSafely(flushStderr);
 			} else {
 				scheduleStderrFlush();
 			}
@@ -1259,41 +1292,67 @@ async function handleShellStreamArgs(
 	};
 
 	// Prefer the streaming handler — it forwards output chunks in real time.
-	// Falls back to the batch shell handler otherwise.
+	// Falls back to the batch shell handler otherwise. A streaming handler gets
+	// a best-effort cancellation signal; custom handlers may ignore it, so late
+	// results are also quarantined from the shared transcript callback.
 	const streamHandler = execHandlers?.shellStream?.bind(execHandlers);
 	const batchHandler = execHandlers?.shell?.bind(execHandlers);
-	const handler = streamHandler ? (shellArgs: ShellArgs) => streamHandler(shellArgs, streamCallbacks) : batchHandler;
+	const handler: ((shellArgs: ShellArgs) => Promise<CursorExecHandlerResult<ShellResult>>) | undefined = streamHandler
+		? async shellArgs => {
+				const result = await streamHandler(shellArgs, streamCallbacks, outputAbortController.signal);
+				clearFlushTimers();
+				flushSafely(flushStdout);
+				flushSafely(flushStderr);
+				if (outputFailureReported) throw outputFailureReason;
+				return result;
+			}
+		: batchHandler;
+	const guardedOnToolResult: CursorToolResultHandler | undefined = onToolResult
+		? toolResult => (outputFailureReported ? undefined : onToolResult(toolResult))
+		: undefined;
 
-	const { execResult } = await resolveExecHandler(
-		args as any,
-		handler as typeof batchHandler,
-		onToolResult,
-		toolResult => buildShellResultFromToolResult(normalizedArgs as any, toolResult),
-		reason =>
-			buildShellRejectedResult((normalizedArgs as any).command, (normalizedArgs as any).workingDirectory, reason),
-		error =>
-			buildShellFailureResult((normalizedArgs as any).command, (normalizedArgs as any).workingDirectory, error),
-		{ toolCallId: args.toolCallId, toolName: "bash" },
-	);
+	try {
+		const handlerResult = resolveExecHandler(
+			args,
+			handler,
+			guardedOnToolResult,
+			toolResult => buildShellResultFromToolResult(normalizedArgs, toolResult),
+			reason => buildShellRejectedResult(normalizedArgs.command, normalizedArgs.workingDirectory, reason),
+			error => buildShellFailureResult(normalizedArgs.command, normalizedArgs.workingDirectory, error),
+			{ toolCallId: args.toolCallId, toolName: "bash" },
+		);
+		const outcome = await Promise.race([
+			handlerResult.then(value => ({ case: "handler" as const, value })),
+			outputFailure.promise.then(error => ({ case: "outputFailure" as const, error })),
+		]);
+		if (outcome.case === "outputFailure") throw outcome.error;
+		const { execResult } = outcome.value;
+		if (outputFailureReported) throw outputFailureReason;
+		if (!outputOpen) return;
 
-	// When using the batch handler (no shellStream), send buffered stdout/stderr
-	// after execution completes. With shellStream these were already sent in real time.
-	const sendBufferedOutput = !streamHandler;
-	const sanitizedExecResult = sanitizeShellExecResult(execResult);
+		// When using the batch handler (no shellStream), send buffered stdout/stderr
+		// after execution completes. With shellStream these were already sent in real time.
+		const sendBufferedOutput = !streamHandler;
+		const sanitizedExecResult = sanitizeShellExecResult(execResult);
 
-	// Flush any remaining buffered output before sending results
-	if (stdoutFlushTimer) clearTimeout(stdoutFlushTimer);
-	if (stderrFlushTimer) clearTimeout(stderrFlushTimer);
-	flushStdout();
-	flushStderr();
+		clearFlushTimers();
+		flushStdout();
+		flushStderr();
+		if (!outputOpen) return;
 
-	sendShellStreamExitFromResult(h2Request, execMsg, sanitizedExecResult, sendBufferedOutput);
-	// Cursor can keep the turn pending when it receives only stream deltas.
-	// Send the final structured shellResult as completion acknowledgement.
-	sendExecClientMessage(h2Request, execMsg, "shellResult", sanitizedExecResult);
-	sendExecClientStreamClose(h2Request, execMsg);
+		sendShellStreamExitFromResult(h2Request, execMsg, sanitizedExecResult, sendBufferedOutput);
+		if (!outputOpen) return;
+		// Cursor can keep the turn pending when it receives only stream deltas.
+		// Send the final structured shellResult as completion acknowledgement.
+		sendExecClientMessage(h2Request, execMsg, "shellResult", sanitizedExecResult);
+		if (!outputOpen) return;
+		sendExecClientStreamClose(h2Request, execMsg);
 
-	log("shellStream", "done", { elapsed: performance.now() - startTs });
+		log("shellStream", "done", { elapsed: performance.now() - startTs });
+	} finally {
+		closeOutput();
+		if (typeof h2Request.off === "function") h2Request.off("close", onTransportClose);
+	}
 }
 
 function sendShellStreamExitFromResult(

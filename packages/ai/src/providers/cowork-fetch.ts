@@ -7,6 +7,7 @@ import type { FetchImpl } from "../types";
 import { connectProxiedSocket } from "../utils/proxy";
 
 export const COWORK_PROVIDER_DISPATCH_GUARD = Symbol("providerDispatchGuard");
+export const BYPASS_PROVIDER_DISPATCH_GUARD = Symbol("bypassProviderDispatchGuard");
 
 type CoworkTlsOptions = {
 	ca?: string | string[];
@@ -21,6 +22,7 @@ type CoworkRequestInit = RequestInit & {
 	proxy?: string;
 	tls?: CoworkTlsOptions;
 	[COWORK_PROVIDER_DISPATCH_GUARD]?: () => void;
+	[BYPASS_PROVIDER_DISPATCH_GUARD]?: boolean;
 };
 
 type RequestBody = string | Uint8Array;

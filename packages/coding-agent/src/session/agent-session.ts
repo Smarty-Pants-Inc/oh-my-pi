@@ -57,6 +57,7 @@ import {
 import type {
 	AssistantMessage,
 	CodexCompactionContext,
+	Context,
 	ContextInstruction,
 	ImageContent,
 	Message,
@@ -1823,6 +1824,7 @@ export class AgentSession {
 			thinkingLevel: () => this.thinkingLevel,
 			sessionId: () => this.sessionId,
 			sessionFile: () => this.sessionFile,
+			goalModeState: () => this.#goalModeState,
 			baseSystemPrompt: () => this.#tools.baseSystemPrompt,
 			assertVibeSessionTransitionAllowed: action => this.#assertVibeSessionTransitionAllowed(action),
 			setSkipPostTurnMaintenance: timestamp => {
@@ -6149,8 +6151,8 @@ export class AgentSession {
 		return this.#goalRuntime;
 	}
 
-	retainPrimaryProviderInstructions(instructions: readonly ContextInstruction[]): void {
-		this.#advisors.retainPrimaryInstructions(instructions);
+	retainPrimaryProviderContext(context: Context): void {
+		this.#advisors.retainPrimaryContext(context);
 	}
 
 	/** Fresh registered components injected at the provider boundary, never persisted as messages. */

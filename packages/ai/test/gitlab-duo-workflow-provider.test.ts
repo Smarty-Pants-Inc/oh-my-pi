@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
+import { streamSimple } from "@oh-my-pi/pi-ai";
 import { isContextOverflow } from "@oh-my-pi/pi-ai/error";
 import {
 	buildGitLabDuoWorkflowApprovalStartRequest,
@@ -16,6 +17,7 @@ import {
 	describeGitLabDuoWorkflowSocketEvent,
 	extractGitLabWorkflowToken,
 	GITLAB_DUO_WORKFLOW_CLIENT_CAPABILITIES,
+	type GitLabDuoWorkflowOptions,
 	type GitLabDuoWorkflowProviderSessionState,
 	type GitLabDuoWorkflowStartRequest,
 	type GitLabDuoWorkflowStreamState,
@@ -2695,6 +2697,65 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 		await expect(resumeRun).rejects.toThrow("GitLab request became stale before socket send");
 		expect(resume.sent).toEqual([]);
 		expect(resume.isClosed()).toBe(true);
+	});
+
+	it("stops a workflow when the dispatch guard becomes stale before the start frame", async () => {
+		const stopPatches: string[] = [];
+		const fetchImpl: FetchImpl = async (input, init) => {
+			const url = String(input);
+			if (url.includes("/api/graphql")) {
+				return new Response(JSON.stringify({ data: { aiChatAvailableModels: {} } }), { status: 200 });
+			}
+			if (url.includes("/api/v4/ai/duo_workflows/direct_access")) {
+				return new Response(JSON.stringify({ gitlab_rails: { token: "rails-token" } }), { status: 200 });
+			}
+			if (url.includes("/api/v4/ai/duo_workflows/workflows/") && init?.method === "PATCH") {
+				stopPatches.push(url);
+				return new Response("{}", { status: 200 });
+			}
+			if (url.includes("/api/v4/ai/duo_workflows/workflows") && init?.method === "POST") {
+				return new Response(JSON.stringify({ id: "workflow-guard-cleanup" }), { status: 200 });
+			}
+			return new Response("{}", { status: 200 });
+		};
+		const sent: string[] = [];
+		let closed = false;
+		let valid = true;
+		const socket: GitLabDuoWorkflowWebSocketLike = {
+			onopen: null,
+			onmessage: null,
+			onerror: null,
+			onclose: null,
+			send(data) {
+				sent.push(data);
+			},
+			close() {
+				closed = true;
+			},
+		};
+		const options = {
+			apiKey: "redacted",
+			rootNamespaceId: "gid://gitlab/Group/1",
+			fetch: fetchImpl,
+			webSocketFactory: () => {
+				valid = false;
+				queueMicrotask(() => socket.onopen?.(new Event("open")));
+				return socket;
+			},
+			providerDispatchGuard: () => {
+				if (!valid) throw new Error("GitLab request became stale before socket send");
+			},
+		} satisfies GitLabDuoWorkflowOptions;
+		const stream = streamSimple(model, context, options);
+
+		const result = await stream.result();
+
+		expect(sent).toEqual([]);
+		expect(closed).toBe(true);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("GitLab request became stale before socket send");
+		expect(stopPatches).toHaveLength(1);
+		expect(stopPatches[0]).toContain("/workflows/workflow-guard-cleanup");
 	});
 
 	it("renders procedural agent checkpoints as text, matching the official chat client", async () => {

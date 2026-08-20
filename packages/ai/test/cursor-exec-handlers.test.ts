@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import { EventEmitter } from "node:events";
 import { create } from "@bufbuild/protobuf";
 import {
 	type BlockState,
@@ -31,6 +32,7 @@ import {
 	ReadRejectedSchema,
 	ReadResultSchema,
 	ReadSuccessSchema,
+	ShellArgsSchema,
 } from "@oh-my-pi/pi-catalog/discovery/cursor-gen/agent_pb";
 import { logger } from "@oh-my-pi/pi-utils";
 
@@ -1361,6 +1363,100 @@ describe("Cursor exec local-work tracking (issue #4593)", () => {
 
 		await expect(dispatch).rejects.toThrow("Cursor request became stale during local exec");
 		expect(written).toEqual([]);
+	});
+
+	it("rejects stale streamed output immediately and quarantines a late handler result", async () => {
+		vi.useFakeTimers();
+		const output = cursorAssistantMessage();
+		const stream = new AssistantMessageEventStream();
+		const state = newBlockState();
+		const written: unknown[] = [];
+		const h2Request = Object.assign(new EventEmitter(), {
+			closed: false,
+			destroyed: false,
+			write(chunk: unknown) {
+				written.push(chunk);
+				return true;
+			},
+		}) as unknown as Parameters<typeof handleServerMessage>[5];
+		const handlerStarted = Promise.withResolvers<void>();
+		const handlerSettled = Promise.withResolvers<void>();
+		const releaseHandler = Promise.withResolvers<void>();
+		let handlerSignal: AbortSignal | undefined;
+		const onToolResult = vi.fn((result: ToolResultMessage) => result);
+		const execHandlers: CursorExecHandlers = {
+			async shellStream(args, callbacks, signal) {
+				handlerSignal = signal;
+				callbacks.onStdout("delayed output");
+				handlerStarted.resolve();
+				await releaseHandler.promise;
+				handlerSettled.resolve();
+				return {
+					role: "toolResult",
+					toolCallId: args.toolCallId,
+					toolName: "bash",
+					content: [{ type: "text", text: "done" }],
+					isError: false,
+					timestamp: 1,
+				} satisfies ToolResultMessage;
+			},
+		};
+		const serverMsg = create(AgentServerMessageSchema, {
+			message: {
+				case: "execServerMessage",
+				value: create(ExecServerMessageSchema, {
+					id: 1,
+					execId: "exec-guarded-shell-stream",
+					message: {
+						case: "shellStreamArgs",
+						value: create(ShellArgsSchema, {
+							command: "printf delayed",
+							workingDirectory: "/tmp",
+							toolCallId: "call-guarded-shell-stream",
+						}),
+					},
+				}),
+			},
+		});
+		let valid = true;
+		const dispatch = handleServerMessage(
+			serverMsg,
+			output,
+			stream,
+			state,
+			new Map(),
+			h2Request,
+			execHandlers,
+			onToolResult,
+			{ sawTokenDelta: false },
+			[],
+			undefined,
+			() => {
+				if (!valid) throw new Error("Cursor request became stale before output flush");
+			},
+		);
+
+		try {
+			await handlerStarted.promise;
+			expect(written).toHaveLength(1); // shellStream start frame
+			valid = false;
+			vi.advanceTimersByTime(100);
+			expect(written).toHaveLength(1);
+			await expect(dispatch).rejects.toThrow("Cursor request became stale before output flush");
+			expect(stream.hasPendingLocalWork).toBe(false);
+			expect(handlerSignal?.aborted).toBe(true);
+
+			// This fake intentionally ignores abort. Its eventual result must not enter
+			// the Agent buffer after the provider dispatch has already failed.
+			releaseHandler.resolve();
+			await handlerSettled.promise;
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(onToolResult).not.toHaveBeenCalled();
+		} finally {
+			releaseHandler.resolve();
+			vi.useRealTimers();
+		}
 	});
 	it("synthesizes an MCP call when the exec frame precedes its streamed block", async () => {
 		const output = cursorAssistantMessage();

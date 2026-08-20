@@ -2047,6 +2047,7 @@ const streamAnthropicOnce = (
 					...createSdkStreamRequestOptions(requestSignal, requestTimeoutMs),
 					maxRetries: 0,
 				};
+				options?.providerDispatchGuard?.();
 				const request: unknown =
 					isOAuthToken && client.beta
 						? client.beta.messages.create(refreshParams, requestOptions)
@@ -2193,6 +2194,7 @@ const streamAnthropicOnce = (
 					maxRetries: 0,
 					...(perRequestHeaders ? { headers: perRequestHeaders } : {}),
 				};
+				options?.providerDispatchGuard?.();
 				const anthropicRequest: unknown =
 					isOAuthToken && client.beta
 						? client.beta.messages.create({ ...params, stream: true }, requestOptions)

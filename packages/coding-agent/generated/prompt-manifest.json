@@ -4600,7 +4600,7 @@
     },
     {
       "path": "packages/agent/src/agent.ts",
-      "sha256": "e26e53f7d05ad3aba66fddb2c5f39b9b1d9e7e633c567711db5bfd079b3f92d5"
+      "sha256": "65b81a173e1b350cb3bb8c137578221a3fb5d103ba4f1ca0e0109e540ab112fe"
     },
     {
       "path": "packages/agent/src/append-only-context.ts",
@@ -4996,7 +4996,7 @@
     },
     {
       "path": "packages/ai/src/providers/anthropic.ts",
-      "sha256": "eadef83a03f27fa6777f6618e1937b75bfebf828a01f95368cd1246f9d2f1ecb"
+      "sha256": "2858f127ebfa41e88bf99d7d113d2daec81d2f05dfc7e91fbfc56df823df8ab3"
     },
     {
       "path": "packages/ai/src/providers/aws-credentials.ts",
@@ -5024,7 +5024,7 @@
     },
     {
       "path": "packages/ai/src/providers/cowork-fetch.ts",
-      "sha256": "818c47b8812fd8c8c2eb2c811e113473b6f280eb01a24d6d08d95802937a7a10"
+      "sha256": "e552b6021b3de80c22f9b95363197164fe11e946caf9f3afa9ae99dc32e86beb"
     },
     {
       "path": "packages/ai/src/providers/cursor-pi-args.ts",
@@ -5032,7 +5032,7 @@
     },
     {
       "path": "packages/ai/src/providers/cursor.ts",
-      "sha256": "fea6125e9d0439f4d58c6ea79d9108ff41de9e295ed095f2c37bf6c8b411a77e"
+      "sha256": "7c36b2a0367c182620a29e17d37b6f289ec4c347b99cce883c18f4f1bc238619"
     },
     {
       "path": "packages/ai/src/providers/cursor/exec-modern.ts",
@@ -5056,7 +5056,7 @@
     },
     {
       "path": "packages/ai/src/providers/gitlab-duo-workflow.ts",
-      "sha256": "8349d942c6ba4e01d8d44e61802467a29984e9fadaac2d876b58e9dd35f4e1b7"
+      "sha256": "a6b49dc843056f7ee4bdce5d75552a24e02eb590da639608f26acde55bf9b3c0"
     },
     {
       "path": "packages/ai/src/providers/gitlab-duo.ts",
@@ -5604,11 +5604,11 @@
     },
     {
       "path": "packages/ai/src/stream.ts",
-      "sha256": "ce768446556a88add201fbe66e93c120af1fc916bf9cc2f66a96b1e63e3f834e"
+      "sha256": "2597caa105273d02fe712538acaf37f8084049a6c9f7f7e7b58c4fd2b43901ee"
     },
     {
       "path": "packages/ai/src/types.ts",
-      "sha256": "b098c862433c3be177793300f179ad808571b6481f1d4265affebe606bbf45cb"
+      "sha256": "c4168d8c34283e44cab63cb6f46cfc6c1a1b1a3dfa4c1eeab770a1d29893c418"
     },
     {
       "path": "packages/ai/src/usage.ts",
@@ -6860,7 +6860,7 @@
     },
     {
       "path": "packages/coding-agent/src/cursor.ts",
-      "sha256": "79fc5e8574bb8d641c019dfb48c16b84735e48a4bf9ee0cbbb40df63ca14baea"
+      "sha256": "447038028f0e68e653672ca64613afbd367868de909aa8d52b23d75434fcd962"
     },
     {
       "path": "packages/coding-agent/src/dap/client.ts",
@@ -8340,7 +8340,7 @@
     },
     {
       "path": "packages/coding-agent/src/sdk.ts",
-      "sha256": "e88c332e3d0559a545c7b34978360978ac954403f0dc6f9bb9a0af1de9d91989"
+      "sha256": "dda2b4a577a97b24f11f7af21dcef6c608b6a18cfa180a736bd6cebd29aa9ef5"
     },
     {
       "path": "packages/coding-agent/src/secrets/index.ts",
@@ -8444,7 +8444,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/agent-session.ts",
-      "sha256": "93977b82a841efb8a59e9e16cb909a763aa2c1a78a0ac553709a3b44bc4c8538"
+      "sha256": "6385058c1a6452f58c232f24eb90e2b9c7a88afbf196329f56d0af11e94445a2"
     },
     {
       "path": "packages/coding-agent/src/session/agent-storage.ts",
@@ -8572,7 +8572,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/session-advisors.ts",
-      "sha256": "3c5fe738c552e9556ef52209f5384eda613d34253d1b65acacd57a23ea25c01f"
+      "sha256": "38650d443b762012be95babd01f34e1a195208446bb81ded83725b4bd5d363bd"
     },
     {
       "path": "packages/coding-agent/src/session/session-context.ts",
@@ -8588,7 +8588,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/session-handoff.ts",
-      "sha256": "f11e45f1c39eea74ed437cb3504f0da03c963610974dec3a519dd42ca51865b9"
+      "sha256": "34a535d3a795e3fdf4e2683dcc2e0894b2bec0041ef1a9678719e0a63d68ba46"
     },
     {
       "path": "packages/coding-agent/src/session/session-history-format.ts",
@@ -8596,7 +8596,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/session-lifecycle-owner.ts",
-      "sha256": "9bcdec6ed0913167e567e173069d41f17429e66117f87e5f8346a2c05573c52b"
+      "sha256": "1dafc47647bd7196b215d326c5db7f234c71196778323a975c1892eb30e83beb"
     },
     {
       "path": "packages/coding-agent/src/session/session-lifecycle-transaction.ts",
@@ -10696,5 +10696,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "2e2bd95bf718a7398bb97a81f6feabebea1f8c11adcf3b809b2363f2e56f5eab"
+  "rootSha256": "8d396fd0b4735aaa23f0c2631905c3e137308db2398d573db784e5b81266e9ec"
 }
