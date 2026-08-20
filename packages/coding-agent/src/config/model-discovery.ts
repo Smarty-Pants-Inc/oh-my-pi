@@ -829,45 +829,40 @@ export async function discoverOpenAIModelsList(
 			reference?.contextWindow ??
 			DISCOVERY_DEFAULT_CONTEXT_WINDOW;
 		discovered.push(
-			normalizeQwenTemplateReasoning(
-				buildModel({
-					id,
-					name: reference?.name ?? id,
-					api: providerConfig.api,
-					provider: providerConfig.provider,
-					baseUrl,
-					reasoning: reference?.reasoning ?? false,
-					thinking: inheritReferenceThinking(undefined, reference, providerConfig.provider),
-					input: nativeMetadataForModel?.input ??
-						extractOpenAIModelsListInputCapabilities(item) ??
-						reference?.input ?? ["text"],
-					...(providerConfig.discovery.type === "lm-studio" ? { imageInputDecoder: "stb" as const } : {}),
-					// Proxy/gateway pricing is provider-specific and rarely matches
-					// upstream bundled catalogs, so keep costs local-unknown even
-					// when we successfully recover the upstream model identity.
-					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-					contextWindow,
-					// Cap the reference's output limit at the discovered context
-					// window so an ID collision with a larger bundled model can
-					// never request more tokens than the local runtime advertises.
-					maxTokens: Math.min(
-						reference?.maxTokens ?? discoveryDefaultMaxTokens(providerConfig.api),
-						contextWindow,
-					),
-					headers,
-					compat: {
-						supportsStore: false,
-						supportsDeveloperRole: false,
-						supportsReasoningEffort: referenceCompat?.supportsReasoningEffort ?? false,
-						...(referenceCompat?.reasoningEffortMap
-							? { reasoningEffortMap: referenceCompat.reasoningEffortMap }
-							: {}),
-						...(referenceCompat?.omitReasoningEffort !== undefined
-							? { omitReasoningEffort: referenceCompat.omitReasoningEffort }
-							: {}),
-					},
-				} as ModelSpec<Api>),
-			),
+			buildModel({
+				id,
+				name: reference?.name ?? id,
+				api: providerConfig.api,
+				provider: providerConfig.provider,
+				baseUrl,
+				reasoning: reference?.reasoning ?? false,
+				thinking: inheritReferenceThinking(undefined, reference, providerConfig.provider),
+				input: nativeMetadataForModel?.input ??
+					extractOpenAIModelsListInputCapabilities(item) ??
+					reference?.input ?? ["text"],
+				...(providerConfig.discovery.type === "lm-studio" ? { imageInputDecoder: "stb" as const } : {}),
+				// Proxy/gateway pricing is provider-specific and rarely matches
+				// upstream bundled catalogs, so keep costs local-unknown even
+				// when we successfully recover the upstream model identity.
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow,
+				// Cap the reference's output limit at the discovered context
+				// window so an ID collision with a larger bundled model can
+				// never request more tokens than the local runtime advertises.
+				maxTokens: Math.min(reference?.maxTokens ?? discoveryDefaultMaxTokens(providerConfig.api), contextWindow),
+				headers,
+				compat: {
+					supportsStore: false,
+					supportsDeveloperRole: false,
+					supportsReasoningEffort: referenceCompat?.supportsReasoningEffort ?? false,
+					...(referenceCompat?.reasoningEffortMap
+						? { reasoningEffortMap: referenceCompat.reasoningEffortMap }
+						: {}),
+					...(referenceCompat?.omitReasoningEffort !== undefined
+						? { omitReasoningEffort: referenceCompat.omitReasoningEffort }
+						: {}),
+				},
+			} as ModelSpec<Api>),
 		);
 	}
 	return discovered;

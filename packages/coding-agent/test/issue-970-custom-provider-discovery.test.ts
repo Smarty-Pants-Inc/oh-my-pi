@@ -159,6 +159,39 @@ describe("issue #970 custom provider discovery", () => {
 		expect(deepseek?.maxTokens).toBe(32_768);
 	});
 
+	test("does not advertise Qwen template efforts when provider compat disables them", async () => {
+		fs.writeFileSync(
+			modelsPath,
+			[
+				"providers:",
+				"  vllm:",
+				"    baseUrl: http://192.168.5.3:8085/v1",
+				"    api: openai-completions",
+				"    auth: none",
+				"    compat:",
+				"      qwenTemplateReasoningEffort: false",
+				"    discovery:",
+				"      type: openai-models-list",
+			].join("\n"),
+		);
+
+		const fetchMock: (input: string | URL | Request) => Promise<Response> = async input => {
+			expect(String(input)).toBe("http://192.168.5.3:8085/v1/models");
+			return new Response(JSON.stringify({ data: [{ id: "Qwen3.8-27B-UD-Q6_K_XL" }] }), {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			});
+		};
+
+		const registry = new ModelRegistryImpl(authStorage, modelsPath, { fetch: fetchMock });
+		await registry.refreshProvider("vllm");
+
+		const qwen38 = registry.find("vllm", "Qwen3.8-27B-UD-Q6_K_XL");
+		expect(qwen38?.compat.qwenTemplateReasoningEffort).toBe(false);
+		expect(qwen38?.reasoning).toBe(false);
+		expect(qwen38?.thinking).toBeUndefined();
+	});
+
 	test("upgrades warm local Qwen cache rows when compat proves template effort support", () => {
 		const cached = buildModel({
 			id: "Qwen3.8-27B-UD-Q6_K_XL",
