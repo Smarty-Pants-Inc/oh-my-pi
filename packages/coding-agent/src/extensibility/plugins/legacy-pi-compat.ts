@@ -623,9 +623,8 @@ function staticMemberPropertyName(node: StructuralAstNode): string | null {
 }
 
 function staticObjectPropertyName(node: StructuralAstNode): string | null {
-	if (node.computed === true) return null;
 	const key = asAstNode(node.key);
-	if (key?.type === "Identifier" && typeof key.name === "string") return key.name;
+	if (node.computed !== true && key?.type === "Identifier" && typeof key.name === "string") return key.name;
 	return key?.type === "StringLiteral" && typeof key.value === "string" ? key.value : null;
 }
 

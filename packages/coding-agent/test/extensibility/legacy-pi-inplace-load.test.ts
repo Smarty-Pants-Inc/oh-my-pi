@@ -343,6 +343,11 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 					"const get = Object.getOwnPropertyDescriptor; get(async () => {}, 'constructor').value('return require(\"../outside.js\")')();",
 			},
 			{
+				name: "computed destructured descriptor helper",
+				source:
+					"const { ['getOwnPropertyDescriptor']: get } = Object; get(async () => {}, 'constructor').value('return require(\"../outside.js\")')();",
+			},
+			{
 				name: "escaped constructor value",
 				source: "module.exports = (async () => {}).constructor;",
 			},
