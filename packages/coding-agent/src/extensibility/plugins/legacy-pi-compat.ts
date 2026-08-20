@@ -477,6 +477,9 @@ function isProcessDlopenCall(
 	scope: BindingScope,
 	processNamespaceBindings: ReadonlySet<string>,
 	processDlopenBindings: ReadonlySet<string>,
+	localRequireBindings: ReadonlySet<string>,
+	createRequireBindings: ReadonlySet<string>,
+	moduleNamespaceBindings: ReadonlySet<string>,
 ): boolean {
 	if (node?.type !== "CallExpression" && node?.type !== "OptionalCallExpression") return false;
 	const callee = asAstNode(node.callee);
@@ -488,7 +491,7 @@ function isProcessDlopenCall(
 	return (
 		(isIdentifier(object, "process") && !scopeHasBinding(scope, PROCESS_BINDING)) ||
 		(object?.type === "Identifier" && typeof object.name === "string" && processNamespaceBindings.has(object.name)) ||
-		isNodeProcessRequireCall(object, scope)
+		isNodeProcessLoaderCall(object, scope, localRequireBindings, createRequireBindings, moduleNamespaceBindings)
 	);
 }
 
@@ -512,6 +515,26 @@ function isCreateRequireInvocation(
 	return (
 		(object?.type === "Identifier" && typeof object.name === "string" && moduleNamespaceBindings.has(object.name)) ||
 		isNodeModuleRequireCall(object, scope)
+	);
+}
+
+function isNodeProcessLoaderCall(
+	node: StructuralAstNode | null,
+	scope: BindingScope,
+	localRequireBindings: ReadonlySet<string>,
+	createRequireBindings: ReadonlySet<string>,
+	moduleNamespaceBindings: ReadonlySet<string>,
+): boolean {
+	if (isNodeProcessRequireCall(node, scope)) return true;
+	if (node?.type !== "CallExpression") return false;
+	const specifier = nodeArgument(node, 0);
+	if (specifier?.type !== "StringLiteral" || (specifier.value !== "node:process" && specifier.value !== "process")) {
+		return false;
+	}
+	const callee = asAstNode(node.callee);
+	return (
+		(callee?.type === "Identifier" && typeof callee.name === "string" && localRequireBindings.has(callee.name)) ||
+		isCreateRequireInvocation(callee, createRequireBindings, moduleNamespaceBindings, scope)
 	);
 }
 
@@ -814,6 +837,69 @@ function collectExtensionSpecifierReferences(
 		}
 	}
 
+	for (const { node, scope } of variableDeclarations) {
+		const initializer = asAstNode(node.init);
+		if (isNodeProcessRequireCall(initializer, scope)) continue;
+		const binding = asAstNode(node.id);
+		if (
+			isNodeProcessLoaderCall(
+				initializer,
+				scope,
+				localRequireBindings,
+				createRequireBindings,
+				moduleNamespaceBindings,
+			)
+		) {
+			if (binding?.type === "Identifier" && typeof binding.name === "string") {
+				processNamespaceBindings.add(binding.name);
+				processNamespaceBindingNodes.add(binding);
+			} else if (graphProof) {
+				graphProof.provable = false;
+			}
+			continue;
+		}
+		if (
+			initializer?.type !== "MemberExpression" ||
+			!isNodeProcessLoaderCall(
+				asAstNode(initializer.object),
+				scope,
+				localRequireBindings,
+				createRequireBindings,
+				moduleNamespaceBindings,
+			)
+		) {
+			continue;
+		}
+		const memberName = staticMemberPropertyName(initializer);
+		if (memberName === null) {
+			if (graphProof) graphProof.provable = false;
+			continue;
+		}
+		if (memberName !== "default" && memberName !== "dlopen") continue;
+		if (binding?.type !== "Identifier" || typeof binding.name !== "string") {
+			if (graphProof) graphProof.provable = false;
+			continue;
+		}
+		if (memberName === "dlopen") {
+			processDlopenBindings.add(binding.name);
+			processDlopenBindingNodes.add(binding);
+		} else {
+			processNamespaceBindings.add(binding.name);
+			processNamespaceBindingNodes.add(binding);
+		}
+	}
+	const isKnownProcessLoaderCall = (node: StructuralAstNode | null, scope: BindingScope): boolean =>
+		isNodeProcessLoaderCall(node, scope, localRequireBindings, createRequireBindings, moduleNamespaceBindings);
+	const isKnownProcessDlopenCall = (node: StructuralAstNode | null, scope: BindingScope): boolean =>
+		isProcessDlopenCall(
+			node,
+			scope,
+			processNamespaceBindings,
+			processDlopenBindings,
+			localRequireBindings,
+			createRequireBindings,
+			moduleNamespaceBindings,
+		);
 	for (const { node, scope, parent, parentKey } of collectScopedAstNodes(
 		ast,
 		isSpecifierReferenceNode,
@@ -828,7 +914,14 @@ function collectExtensionSpecifierReferences(
 			if (!isBoundFactory && !isImmediatelyInvoked && graphProof) graphProof.provable = false;
 		}
 		if (node.type === "CallExpression" || node.type === "OptionalCallExpression") {
-			if (graphProof && isProcessDlopenCall(node, scope, processNamespaceBindings, processDlopenBindings)) {
+			if (graphProof && isKnownProcessLoaderCall(node, scope)) {
+				const supportedUse =
+					(parent?.type === "VariableDeclarator" && parent.init === node) ||
+					(parent?.type === "MemberExpression" && parentKey === "object") ||
+					parent?.type === "ExpressionStatement";
+				if (!supportedUse) graphProof.provable = false;
+			}
+			if (graphProof && isKnownProcessDlopenCall(node, scope)) {
 				const target = nodeArgument(node, 1);
 				if (
 					node.type === "CallExpression" &&
@@ -995,7 +1088,7 @@ function collectExtensionSpecifierReferences(
 					(parent?.type === "CallExpression" || parent?.type === "OptionalCallExpression") &&
 					parentKey === "arguments" &&
 					nodeArgument(parent, 0) === node &&
-					isProcessDlopenCall(parent, scope, processNamespaceBindings, processDlopenBindings);
+					isKnownProcessDlopenCall(parent, scope);
 				if (directExportsTarget || typeofOperand || processDlopenModuleArgument) continue;
 				graphProof.provable = false;
 				continue;
@@ -1021,7 +1114,7 @@ function collectExtensionSpecifierReferences(
 				if (
 					(parent?.type === "CallExpression" || parent?.type === "OptionalCallExpression") &&
 					parentKey === "callee" &&
-					isProcessDlopenCall(parent, scope, processNamespaceBindings, processDlopenBindings)
+					isKnownProcessDlopenCall(parent, scope)
 				) {
 					continue;
 				}
@@ -1107,7 +1200,7 @@ function collectExtensionSpecifierReferences(
 				if (
 					(parent?.type === "CallExpression" || parent?.type === "OptionalCallExpression") &&
 					parentKey === "callee" &&
-					isProcessDlopenCall(parent, scope, processNamespaceBindings, processDlopenBindings)
+					isKnownProcessDlopenCall(parent, scope)
 				) {
 					continue;
 				}

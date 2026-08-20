@@ -339,6 +339,16 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 				source: (target: string) =>
 					`import { dlopen as open } from "node:process";\nopen(module, ${JSON.stringify(target)});\n`,
 			},
+			{
+				entry: esmEntry,
+				source: (target: string) =>
+					`import { createRequire } from "node:module";\nconst localRequire = createRequire(import.meta.url);\nconst processModule = localRequire("node:process");\nprocessModule.dlopen(module, ${JSON.stringify(target)});\n`,
+			},
+			{
+				entry: esmEntry,
+				source: (target: string) =>
+					`import { createRequire } from "node:module";\ncreateRequire(import.meta.url)("node:process").dlopen(module, ${JSON.stringify(target)});\n`,
+			},
 		];
 		for (const { entry, source } of aliasCases) {
 			await fs.writeFile(entry, source(insideTarget));
@@ -361,6 +371,11 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 			`let open;\n({ dlopen: open } = require("node:process"));\nopen(module, ${JSON.stringify(outsideTarget)});\n`,
 		);
 		expect(await isExtensionSourceGraphContained(cjsEntry, packageRoot)).toBe(false);
+		await fs.writeFile(
+			esmEntry,
+			`import { createRequire } from "node:module";\nconst localRequire = createRequire(import.meta.url);\nlet processModule;\nprocessModule = localRequire("node:process");\nprocessModule.dlopen(module, ${JSON.stringify(outsideTarget)});\n`,
+		);
+		expect(await isExtensionSourceGraphContained(esmEntry, packageRoot)).toBe(false);
 		await fs.writeFile(
 			esmEntry,
 			`const processModule = await import("node:process");\nprocessModule.dlopen(module, ${JSON.stringify(outsideTarget)});\n`,
