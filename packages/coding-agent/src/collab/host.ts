@@ -324,6 +324,7 @@ export class CollabHost {
 
 		const firstOpen = Promise.withResolvers<void>();
 		let opened = false;
+		let terminalReason: string | undefined;
 		transport.onOpen = () => {
 			if (!opened) {
 				opened = true;
@@ -350,6 +351,7 @@ export class CollabHost {
 			if (willReconnect) {
 				this.#ctx.showStatus(`Collab relay connection lost (${reason}), reconnecting…`, { dim: true });
 			} else {
+				terminalReason = reason;
 				this.#notifyTerminated(reason);
 				void this.#teardown();
 				this.#emitCollabNotice("warning", `Collab ended: ${reason}`);
@@ -371,6 +373,8 @@ export class CollabHost {
 		} finally {
 			clearTimeout(timeout);
 		}
+		if (terminalReason !== undefined) throw new Error(terminalReason);
+		if (this.#stopped) throw new Error("collab transport closed during startup");
 
 		this.#unsubscribe = this.#ctx.session.subscribe(event => {
 			if (isWireAgentEvent(event)) this.#broadcast({ t: "event", event: shrinkForReplication(event) });
