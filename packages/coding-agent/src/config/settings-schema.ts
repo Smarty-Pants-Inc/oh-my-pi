@@ -5284,7 +5284,11 @@ export const SETTINGS_SCHEMA = {
 					description:
 						"Extended retention where supported (Anthropic, Bedrock, and compatible gateways: 1h; OpenAI Responses: 24h); pricier writes, no Anthropic keep-alive refresh requests",
 				},
-				{ value: "none", label: "Off", description: "Disable prompt caching and cache-affinity routing" },
+				{
+					value: "none",
+					label: "Off",
+					description: "Disable cache-affinity routing and opt out of prompt caching where supported",
+				},
 			],
 		},
 	},

@@ -199,6 +199,18 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 				name: "destructured global require",
 				source: 'const { require: r } = globalThis; r("node:process").dlopen(r.main, "/absolute/outside.node");',
 			},
+			{
+				name: "aliased require.main",
+				source: 'const main = require.main; main.require("/absolute/outside.js");',
+			},
+			{
+				name: "aliased node:module _load",
+				source: 'const Module = require("node:module"); const load = Module._load; load("/absolute/outside.js");',
+			},
+			{
+				name: "destructured node:module _load",
+				source: 'const { _load: load } = require("node:module"); load("/absolute/outside.js");',
+			},
 		] as const;
 
 		for (const testCase of cases) {
@@ -294,6 +306,20 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 		await fs.writeFile(
 			entry,
 			["const eval = {};", "const Function = {};", "void eval;", "void Function;"].join("\n"),
+		);
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+
+		await fs.writeFile(entry, "export type Callback = Function;\n");
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+
+		await fs.writeFile(
+			entry,
+			[
+				"export type LocalRequire = typeof require;",
+				"export type LocalProcess = typeof process;",
+				"export type LocalGlobal = typeof globalThis;",
+				"export default () => {};",
+			].join("\n"),
 		);
 		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
 	});

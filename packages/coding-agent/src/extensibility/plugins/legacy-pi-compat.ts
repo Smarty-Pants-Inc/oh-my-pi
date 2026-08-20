@@ -380,6 +380,7 @@ function collectScopedAstNodes(
 		const item = stack.pop();
 		if (!item || seen.has(item.node)) continue;
 		seen.add(item.node);
+		if (runtimeBindingsOnly && (item.node.type === "TSTypeReference" || item.node.type === "TSTypeQuery")) continue;
 
 		registerOuterDeclaration(item.node, item.scope);
 		const kind = scopeKind(item.node, item.parent, item.parentKey);
@@ -671,6 +672,8 @@ function collectExtensionSpecifierReferences(
 			} else if (specifier?.type === "ImportSpecifier" && importedName === "createRequire") {
 				createRequireBindings.add(local.name);
 				createRequireBindingNodes.add(local);
+			} else if (specifier?.type === "ImportSpecifier" && importedName === "_load") {
+				if (graphProof) graphProof.provable = false;
 			}
 		}
 	}
@@ -766,6 +769,10 @@ function collectExtensionSpecifierReferences(
 					continue;
 				}
 				const propertyName = staticObjectPropertyName(property);
+				if (propertyName === "_load") {
+					if (graphProof) graphProof.provable = false;
+					continue;
+				}
 				if (propertyName !== "createRequire" && propertyName !== "Module") continue;
 				const propertyValue = asAstNode(property.value);
 				const propertyKey = asAstNode(property.key);
@@ -1264,6 +1271,26 @@ function collectExtensionSpecifierReferences(
 				}
 				const binding = parent?.type === "VariableDeclarator" && parent.init === node ? asAstNode(parent.id) : null;
 				if (binding && processDlopenBindingNodes.has(binding)) continue;
+				graphProof.provable = false;
+				continue;
+			}
+			const requireMainAlias =
+				memberName === "main" &&
+				isIdentifier(object, "require") &&
+				!scopeHasBinding(scope, REQUIRE_BINDING) &&
+				parent?.type === "VariableDeclarator" &&
+				parent.init === node;
+			if (requireMainAlias) {
+				graphProof.provable = false;
+				continue;
+			}
+			const moduleLoadMember =
+				memberName === "_load" &&
+				((object?.type === "Identifier" &&
+					typeof object.name === "string" &&
+					moduleNamespaceBindings.has(object.name)) ||
+					isNodeModuleRequireCall(object, scope));
+			if (moduleLoadMember) {
 				graphProof.provable = false;
 				continue;
 			}

@@ -727,48 +727,59 @@ const streamOpenAICompletionsOnce = (
 				}
 			};
 			let openaiStream: AsyncIterable<ChatCompletionChunk>;
-			try {
-				openaiStream = await callWithCopilotModelRetry(() => createCompletionsStream(), {
-					provider: model.provider,
-					signal: requestSignal,
-				});
-			} catch (error) {
-				const capturedErrorResponse = error instanceof OpenAIHttpError ? error.captured : undefined;
-				const reasoningEffortFallback =
-					activeReasoningEffortFallbackKey && activeRequestParams && !requestSignal.aborted
-						? resolveOpenAIReasoningEffortFallback(error, capturedErrorResponse, activeRequestParams, {
-								explicitDisable: options?.disableReasoning === true && options.reasoning === undefined,
-							})
-						: undefined;
-				if (reasoningEffortFallback !== undefined && activeReasoningEffortFallbackKey) {
-					const retryMarker = `${activeReasoningEffortFallbackKey}:${String(reasoningEffortFallback)}`;
-					if (attemptedReasoningEffortFallbacks.has(retryMarker)) throw error;
-					attemptedReasoningEffortFallbacks.add(retryMarker);
-					const accumulatedReasoningEffortFallback = mergeOpenAIReasoningEffortFallback(
-						requestReasoningEffortFallbacks.has(activeReasoningEffortFallbackKey)
-							? requestReasoningEffortFallbacks.get(activeReasoningEffortFallbackKey)
-							: getOpenAIReasoningEffortFallback(providerSessionState, activeReasoningEffortFallbackKey),
-						reasoningEffortFallback,
-					);
-					requestReasoningEffortFallbacks.set(
-						activeReasoningEffortFallbackKey,
-						accumulatedReasoningEffortFallback,
-					);
-					openaiStream = await createCompletionsStream();
-					rememberOpenAIReasoningEffortFallback(
-						providerSessionState,
-						activeReasoningEffortFallbackKey,
-						accumulatedReasoningEffortFallback,
-					);
-				} else if (
-					isOpenRouterAnthropicModel(model) &&
-					!disableStrictTools &&
-					isCompiledGrammarTooLargeStrictError(error, capturedErrorResponse)
-				) {
-					disableStrictToolsForScope(providerSessionState, strictToolsScope);
-					disableStrictTools = true;
-					openaiStream = await createCompletionsStream("none");
-				} else {
+			let pendingReasoningEffortFallback: { key: string; fallback: OpenAIReasoningEffortFallback } | undefined;
+			while (true) {
+				try {
+					openaiStream = await callWithCopilotModelRetry(() => createCompletionsStream(), {
+						provider: model.provider,
+						signal: requestSignal,
+					});
+					if (pendingReasoningEffortFallback) {
+						rememberOpenAIReasoningEffortFallback(
+							providerSessionState,
+							pendingReasoningEffortFallback.key,
+							pendingReasoningEffortFallback.fallback,
+						);
+						pendingReasoningEffortFallback = undefined;
+					}
+					break;
+				} catch (error) {
+					const capturedErrorResponse = error instanceof OpenAIHttpError ? error.captured : undefined;
+					const reasoningEffortFallback =
+						activeReasoningEffortFallbackKey && activeRequestParams && !requestSignal.aborted
+							? resolveOpenAIReasoningEffortFallback(error, capturedErrorResponse, activeRequestParams, {
+									explicitDisable: options?.disableReasoning === true && options.reasoning === undefined,
+								})
+							: undefined;
+					if (reasoningEffortFallback !== undefined && activeReasoningEffortFallbackKey) {
+						const retryMarker = `${activeReasoningEffortFallbackKey}:${String(reasoningEffortFallback)}`;
+						if (attemptedReasoningEffortFallbacks.has(retryMarker)) throw error;
+						attemptedReasoningEffortFallbacks.add(retryMarker);
+						const accumulatedReasoningEffortFallback = mergeOpenAIReasoningEffortFallback(
+							requestReasoningEffortFallbacks.has(activeReasoningEffortFallbackKey)
+								? requestReasoningEffortFallbacks.get(activeReasoningEffortFallbackKey)
+								: getOpenAIReasoningEffortFallback(providerSessionState, activeReasoningEffortFallbackKey),
+							reasoningEffortFallback,
+						);
+						requestReasoningEffortFallbacks.set(
+							activeReasoningEffortFallbackKey,
+							accumulatedReasoningEffortFallback,
+						);
+						pendingReasoningEffortFallback = {
+							key: activeReasoningEffortFallbackKey,
+							fallback: accumulatedReasoningEffortFallback,
+						};
+						continue;
+					}
+					if (
+						isOpenRouterAnthropicModel(model) &&
+						!disableStrictTools &&
+						isCompiledGrammarTooLargeStrictError(error, capturedErrorResponse)
+					) {
+						disableStrictToolsForScope(providerSessionState, strictToolsScope);
+						disableStrictTools = true;
+						continue;
+					}
 					if (
 						!shouldRetryWithoutStrictTools(error, capturedErrorResponse, {
 							model,
@@ -782,7 +793,6 @@ const streamOpenAICompletionsOnce = (
 					// subsequent request doesn't pay a strict-400 + retry round-trip.
 					disableStrictToolsForScope(providerSessionState, strictToolsScope);
 					disableStrictTools = true;
-					openaiStream = await createCompletionsStream("none");
 				}
 			}
 			if (premiumRequestsTotal !== undefined) {
@@ -1531,8 +1541,15 @@ function applyOpenAIChatCompletionsPromptCachePolicy(
 		params.prompt_cache_key = promptCacheKey;
 	}
 
+	const cacheRetention = resolveCacheRetention(options?.cacheRetention);
+	if (cacheRetention === "none") {
+		if (model.compat.supportsPromptCacheBreakpoints) {
+			params.prompt_cache_options = { mode: "explicit" };
+		}
+		return;
+	}
 	const promptCache = options?.promptCache;
-	if (!promptCache || resolveCacheRetention(options?.cacheRetention) === "none") return;
+	if (!promptCache) return;
 	if (!model.compat.supportsPromptCacheBreakpoints) {
 		if (promptCache.mode === "explicit") {
 			throw new AIError.ConfigurationError(

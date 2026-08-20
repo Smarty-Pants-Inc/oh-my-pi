@@ -77,11 +77,11 @@ export const isQwenModelId = memo((modelId: string): boolean => {
  * Open-weight Qwen 3.8+ releases (`qwen3.8-27b`, `qwen3.8-2.4t-a95b`, GGUF
  * names like `Qwen3.8-27B-UD-Q6_K_XL`) whose chat template steers thinking
  * depth through a `reasoning_effort` template kwarg (`low`/`medium`/`xhigh`,
- * template default `xhigh`; thinking itself cannot be disabled). Compared
- * component-wise so `qwen3.10` sorts after `qwen3.8`. API-only `-max` SKUs are
- * excluded — Dashscope drives them through OpenAI-style `reasoning_effort`
- * with curated compat. The trailing guard rejects parameter-count lookalikes
- * (`qwen-3.8b`) without breaking `qwen3.8-27b`.
+ * template default `xhigh`). Thinking-off support is checkpoint-specific.
+ * Compared component-wise so `qwen3.10` sorts after `qwen3.8`. API-only
+ * `-max` SKUs are excluded — Dashscope drives them through OpenAI-style
+ * `reasoning_effort` with curated compat. The trailing guard rejects
+ * parameter-count lookalikes (`qwen-3.8b`) without breaking `qwen3.8-27b`.
  */
 export const isQwen38PlusTemplateEffortModelId = memo((modelId: string): boolean => {
 	const match = /qwen[-_ ]?(\d+)\.(\d+)(?![\dbB])/i.exec(modelId);
@@ -90,6 +90,11 @@ export const isQwen38PlusTemplateEffortModelId = memo((modelId: string): boolean
 	const minor = Number.parseInt(match[2], 10);
 	if (major < 3 || (major === 3 && minor < 8)) return false;
 	return !/^-max(?:$|[-.:])/i.test(modelId.slice(match.index + match[0].length));
+});
+
+/** Qwen3.8-2.4T-A95B's local chat template has no thinking-off path. */
+export const isQwen38_24TA95BModelId = memo((modelId: string): boolean => {
+	return /^qwen[-_ ]?3\.8-2\.4t-a95b(?:$|[-.:_])/i.test(bareModelId(modelId));
 });
 
 /** Gemma open-weights family (`gemma-3-27b-it`, `google/gemma-4-E2B-it`, `gemma2-9b`). */

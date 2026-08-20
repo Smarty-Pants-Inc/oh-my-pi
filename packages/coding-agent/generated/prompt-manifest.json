@@ -4339,7 +4339,7 @@
     },
     {
       "path": "docs/settings.md",
-      "sha256": "cb050b22afdcfc2528a5d9ae51a8d7aa00ef5bf14a55649f5ccec471a65306fa"
+      "sha256": "e81cb0a78db7c5806296e6cf9e817f3a09181ba49d9d0cb2a961dd281ac94b84"
     },
     {
       "path": "docs/skills.md",
@@ -5119,7 +5119,7 @@
     },
     {
       "path": "packages/ai/src/providers/openai-completions.ts",
-      "sha256": "60e33d6ba1bb087222624d4598f6cc083585f804486e8fc737be01bf0e14e391"
+      "sha256": "289df84a6f7872b323715d99145260bef9ab86318e635ffcb233f62a82fd89eb"
     },
     {
       "path": "packages/ai/src/providers/openai-reasoning-fallback.ts",
@@ -5139,7 +5139,7 @@
     },
     {
       "path": "packages/ai/src/providers/openai-responses.ts",
-      "sha256": "063ad35bb17772c90a76d502ee2721652ab4fe1359b789299652085eb1f833ad"
+      "sha256": "ba24f7a95bf4ebcc98c1c2131965438490f07ed7deeee6a7bc59a064fa5f3fed"
     },
     {
       "path": "packages/ai/src/providers/openai-shared.ts",
@@ -6015,7 +6015,7 @@
     },
     {
       "path": "packages/catalog/src/identity/family.ts",
-      "sha256": "2e6fee1f8c1c615aa1758a2746288f24c3e5b75e2659f55c071f9c3dab59d444"
+      "sha256": "acdc83d0cab302e904b6d1051d991fa59b2193f47ae58311b2c34c221e7caf01"
     },
     {
       "path": "packages/catalog/src/identity/id.ts",
@@ -6051,7 +6051,7 @@
     },
     {
       "path": "packages/catalog/src/model-thinking.ts",
-      "sha256": "3431f35b0642527d14755a01556074f10220620041ae117e0ef8b07a5dee4a90"
+      "sha256": "47ef29bcd0ae3955a002130a4c7e9a7164bbdb4975bac29248e990b743b7af93"
     },
     {
       "path": "packages/catalog/src/models.json",
@@ -6611,7 +6611,7 @@
     },
     {
       "path": "packages/coding-agent/src/commit/analysis/conventional.ts",
-      "sha256": "9bfe356095462a8f272f66b96a1889ae64fcc8076ebd33da2f348da00e55e2df"
+      "sha256": "3912e62ff5d98870b1c33bed443a9dfade4d548b234b1d979ab89c2f7fd56bd8"
     },
     {
       "path": "packages/coding-agent/src/commit/analysis/index.ts",
@@ -6623,7 +6623,7 @@
     },
     {
       "path": "packages/coding-agent/src/commit/analysis/summary.ts",
-      "sha256": "68e50c56dfd069fabe16f786cdd6ca0d180d3ede00abfb0792a4528a02df85ed"
+      "sha256": "be3bf1e4ea77b0bd9b0354975bd0ae98fd3c33dd9c95d24abafdc47f86410f6b"
     },
     {
       "path": "packages/coding-agent/src/commit/analysis/validation.ts",
@@ -6635,11 +6635,11 @@
     },
     {
       "path": "packages/coding-agent/src/commit/changelog/generate.ts",
-      "sha256": "c4e9f71ff4bf7296a8c95ae6b0d53300a5693ff58b3492d2a8f56d87332d6f09"
+      "sha256": "efd9919abe4a0067f7c08841760defbeca96cb92227b9d822a78b6011bbdff86"
     },
     {
       "path": "packages/coding-agent/src/commit/changelog/index.ts",
-      "sha256": "ca29946402a63f15a77379a07619d1813aad526db75944230dc886f199c74a06"
+      "sha256": "c1ce497ab151d65c907d2fe04283251b6d39cc74c4d4ca6aadb2f1737067563e"
     },
     {
       "path": "packages/coding-agent/src/commit/changelog/parse.ts",
@@ -6663,15 +6663,15 @@
     },
     {
       "path": "packages/coding-agent/src/commit/map-reduce/index.ts",
-      "sha256": "69911e60fd51019673a003d289a428c1a85b3a0b38114d176ccaf90310c5474d"
+      "sha256": "b051eea1bba5f626d2292b598b4aa8ea64a9f38b525e964c977e1e2ea5701a2c"
     },
     {
       "path": "packages/coding-agent/src/commit/map-reduce/map-phase.ts",
-      "sha256": "8cb421872424219f48a09c2e3574c073445d83d1659ee1655a841592dfeb1008"
+      "sha256": "827b343c1b63cfc34fcd057c6768be2889cfcb2d93c4019f8ea3c546f9739531"
     },
     {
       "path": "packages/coding-agent/src/commit/map-reduce/reduce-phase.ts",
-      "sha256": "df995cf3d7c5bd7e9721e5f33a0c057872ec1f0c0d0637fb7b56cf5d16d39188"
+      "sha256": "9639d114ac5cf78a572baa275d7d9e59aab0dda29728d698def3483796777051"
     },
     {
       "path": "packages/coding-agent/src/commit/map-reduce/utils.ts",
@@ -6687,7 +6687,7 @@
     },
     {
       "path": "packages/coding-agent/src/commit/pipeline.ts",
-      "sha256": "64efceac7809d1ffd24b45079388cadbc6ec1c4050a12f8b14f04954bd697e74"
+      "sha256": "8e490377a5a8cf947250f94dc265afe9837592a8b105821fac69fbf7e7af51d6"
     },
     {
       "path": "packages/coding-agent/src/commit/shared-llm.ts",
@@ -6799,7 +6799,7 @@
     },
     {
       "path": "packages/coding-agent/src/config/settings-schema.ts",
-      "sha256": "c1b96fbdcd81b2d8c44d19ec46df02afcf539fdf625eb84c21cb3f7c763967ea"
+      "sha256": "b70708adfde8f9ac5072524c85e8d6f7a78bab2c8b47d167fd83ace3071c9100"
     },
     {
       "path": "packages/coding-agent/src/config/settings.ts",
@@ -7407,7 +7407,7 @@
     },
     {
       "path": "packages/coding-agent/src/extensibility/plugins/legacy-pi-compat.ts",
-      "sha256": "1046ad0a9413e18082ba8ec3d881dbbdbfdad48cad8b0af36273bcc95a214251"
+      "sha256": "98d0378c68e70f6b2724c089d16ece74786c7e193f2404d11a070315460381f1"
     },
     {
       "path": "packages/coding-agent/src/extensibility/plugins/loader.ts",
@@ -10683,5 +10683,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "c0ad69ffd2d039c1054a45511d18e24809bcc12095165423f94db35ab54d4e8c"
+  "rootSha256": "5e8d06bb71ebe3c5e28ec9eb8d1b01984a00b193646c3ba1d037f70dc30bbf12"
 }

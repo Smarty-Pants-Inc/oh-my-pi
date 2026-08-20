@@ -319,6 +319,20 @@ describe("OpenAI Responses explicit prompt cache policy", () => {
 		expect(firstMessage.content[0]).not.toHaveProperty("prompt_cache_breakpoint");
 	});
 
+	it("uses explicit no-breakpoint mode to opt direct GPT-5.6 Responses out of implicit caching", async () => {
+		const body = await captureSimpleOpenAIResponseBody(
+			{ cacheRetention: "none", sessionId: "routing-key", promptCacheKey: "cache-key" },
+			openAI56ResponsesModel,
+			historicalContext,
+		);
+
+		if (body === null) throw new Error("Expected a serialized Responses request");
+		expect(body.prompt_cache_options).toEqual({ mode: "explicit" });
+		expect(body).not.toHaveProperty("prompt_cache_key");
+		expect(body).not.toHaveProperty("prompt_cache_retention");
+		expect(JSON.stringify(body.input)).not.toContain("prompt_cache_breakpoint");
+	});
+
 	it("marks one existing stable history block and leaves the current prompt unmodified", () => {
 		const params = buildParams(
 			openAI56ResponsesModel,

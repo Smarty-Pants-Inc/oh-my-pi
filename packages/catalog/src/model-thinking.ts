@@ -33,6 +33,7 @@ import {
 	isMinimaxM2FamilyModelId,
 	isMinimaxM3FamilyModelId,
 	isOpenAIGptOssModelId,
+	isQwen38_24TA95BModelId,
 	supportsAdaptiveThinkingDisplay,
 } from "./identity/family";
 import type {
@@ -184,7 +185,7 @@ function fillThinkingWireDefaults<TApi extends Api>(
 		thinking.supportsDisplay === undefined &&
 		(spec.api === "anthropic-messages" || spec.api === "bedrock-converse-stream") &&
 		supportsAdaptiveThinkingDisplay(spec.id);
-	const needsRequiresEffort = thinking.requiresEffort === undefined && impliesMandatoryReasoning(parsed, spec.id);
+	const needsRequiresEffort = thinking.requiresEffort === undefined && impliesMandatoryReasoning(parsed, spec, compat);
 	const needsDefaultLevel =
 		thinking.defaultLevel === undefined && (isKimiK3ModelId(spec.id) || isGlm53ReasoningEffortModelId(spec.id));
 	if (!effortsChanged && !shouldReplaceEffortMap && !needsDisplay && !needsRequiresEffort && !needsDefaultLevel) {
@@ -237,7 +238,7 @@ export function deriveThinking<TApi extends Api>(spec: ModelSpec<TApi>, compat: 
 	) {
 		config.supportsDisplay = true;
 	}
-	if (impliesMandatoryReasoning(parsed, spec.id)) {
+	if (impliesMandatoryReasoning(parsed, spec, compat)) {
 		config.requiresEffort = true;
 	}
 	return config;
@@ -383,8 +384,7 @@ function getModelDefinedEfforts<TApi extends Api>(
 	}
 	// Qwen 3.8+ served through a local llama.cpp-style backend: the chat
 	// template's prompt-steered `reasoning_effort` kwarg accepts exactly
-	// low/medium/xhigh while the independent thinking toggle retains its
-	// normal off/default semantics.
+	// low/medium/xhigh while the thinking-off path is checkpoint-specific.
 	if (isOpenAICompatReasoningApi(spec.api) && isQwenTemplateReasoningEffortCompat(compat)) {
 		return QWEN38_TEMPLATE_REASONING_EFFORTS;
 	}
@@ -601,12 +601,20 @@ const OPENAI_O_SERIES_RE = /^o[134](?:$|[-:.])/i;
  * - Gemini 3.x exposes levels only; Gemini 2.5 Pro floors thinkingBudget at
  *   128 and rejects 0 (2.5 Flash/Flash-Lite keep the off switch).
  * - OpenAI o-series and MiniMax M2 are reasoning-first architectures.
+ * - Qwen3.8-2.4T-A95B's local/vLLM template rejects `enable_thinking: false`;
+ *   Qwen3.8-27B remains switchable.
  * - Thinking-variant SKUs (`*-thinking`, `*-reasoner`, `*-reasoning`) ARE the
  *   thinking checkpoint; live bare twins pair-collapse away
  *   (variant-collapse) and the collapsed entry owns off — this floor protects
  *   the orphans.
  */
-function impliesMandatoryReasoning(parsed: ParsedModel, modelId: string): boolean {
+function impliesMandatoryReasoning<TApi extends Api>(
+	parsed: ParsedModel,
+	spec: ModelSpec<TApi>,
+	compat: CompatOf<TApi>,
+): boolean {
+	const modelId = spec.id;
+	if (isQwen38_24TA95BModelId(modelId) && isQwenTemplateReasoningEffortCompat(compat)) return true;
 	if (parsed.family === "gemini") {
 		if (semverGte(parsed.version, "3.0")) return true;
 		if (parsed.kind === "pro" && semverGte(parsed.version, "2.5")) return true;

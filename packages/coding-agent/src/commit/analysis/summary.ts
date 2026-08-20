@@ -1,6 +1,6 @@
 import { type } from "@oh-my-pi/omptype";
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
-import type { Api, ApiKey, AssistantMessage, Model } from "@oh-my-pi/pi-ai";
+import type { Api, ApiKey, AssistantMessage, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
 import { completeSimple, retryTransientCompletion, validateToolCall } from "@oh-my-pi/pi-ai";
 import { prompt } from "@oh-my-pi/pi-utils";
 import summarySystemPrompt from "../../commit/prompts/summary-system.md" with { type: "text" };
@@ -23,6 +23,7 @@ export interface SummaryInput {
 	model: Model<Api>;
 	apiKey: ApiKey;
 	thinkingLevel?: ThinkingLevel;
+	cacheRetention?: SimpleStreamOptions["cacheRetention"];
 	commitType: string;
 	scope: string | null;
 	details: string[];
@@ -38,6 +39,7 @@ export async function generateSummary({
 	model,
 	apiKey,
 	thinkingLevel,
+	cacheRetention,
 	commitType,
 	scope,
 	details,
@@ -60,7 +62,12 @@ export async function generateSummary({
 				messages: [{ role: "user", content: userPrompt, timestamp: Date.now() }],
 				tools: [SummaryTool],
 			},
-			{ apiKey, maxTokens: 200, reasoning: toReasoningEffort(thinkingLevel) },
+			{
+				apiKey,
+				maxTokens: 200,
+				reasoning: toReasoningEffort(thinkingLevel),
+				cacheRetention,
+			},
 		),
 	);
 

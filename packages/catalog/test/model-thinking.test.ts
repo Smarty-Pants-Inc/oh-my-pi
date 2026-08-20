@@ -986,25 +986,37 @@ describe("model thinking runtime helpers", () => {
 });
 
 describe("Qwen 3.8 local template effort ladder", () => {
-	it("derives the low/medium/xhigh ladder without making reasoning mandatory", () => {
-		const llamaCpp = createModel({
+	it("marks Qwen3.8-2.4T-A95B mandatory while keeping 27B switchable", () => {
+		const qwen27b = createModel({
 			id: "qwen3.8-27b",
 			api: "openai-completions",
-			provider: "llama.cpp",
-			baseUrl: "http://127.0.0.1:8080/v1",
+			provider: "vllm",
+			baseUrl: "http://127.0.0.1:8000/v1",
 		});
-		// Template effort routing is independent from whether thinking is enabled
-		// and from the caller's default effort selection.
-		expect(llamaCpp.thinking).toEqual({
+		const qwen24t = createModel({
+			id: "Qwen3.8-2.4T-A95B",
+			api: "openai-completions",
+			provider: "vllm",
+			baseUrl: "http://127.0.0.1:8000/v1",
+		});
+
+		// Both expose the template's wire-exact effort ladder, but only 2.4T
+		// has no thinking-off path.
+		expect(qwen27b.thinking).toEqual({
 			mode: "effort",
 			efforts: [Effort.Low, Effort.Medium, Effort.XHigh],
 		});
-		expect(llamaCpp.compat.qwenTemplateReasoningEffort).toBe(true);
+		expect(qwen24t.thinking).toEqual({
+			mode: "effort",
+			efforts: [Effort.Low, Effort.Medium, Effort.XHigh],
+			requiresEffort: true,
+		});
+		expect(qwen27b.compat.qwenTemplateReasoningEffort).toBe(true);
 		// Unsupported tiers clamp onto real wire tiers: high floors to medium
 		// (xhigh is a deliberate opt-in), minimal floors to low.
-		expect(clampThinkingLevelForModel(llamaCpp, Effort.High)).toBe(Effort.Medium);
-		expect(clampThinkingLevelForModel(llamaCpp, Effort.Minimal)).toBe(Effort.Low);
-		expect(minimumSupportedEffort(llamaCpp)).toBe(Effort.Low);
+		expect(clampThinkingLevelForModel(qwen27b, Effort.High)).toBe(Effort.Medium);
+		expect(clampThinkingLevelForModel(qwen27b, Effort.Minimal)).toBe(Effort.Low);
+		expect(minimumSupportedEffort(qwen27b)).toBe(Effort.Low);
 	});
 
 	it("normalizes a stale cached ladder without overriding explicit off/default semantics", () => {

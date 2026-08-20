@@ -1,5 +1,5 @@
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
-import type { Api, ApiKey, Model } from "@oh-my-pi/pi-ai";
+import type { Api, ApiKey, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
 import { completeSimple, retryTransientCompletion } from "@oh-my-pi/pi-ai";
 import { prompt } from "@oh-my-pi/pi-utils";
 import analysisSystemPrompt from "../../commit/prompts/analysis-system.md" with { type: "text" };
@@ -16,6 +16,7 @@ export interface ConventionalAnalysisInput {
 	model: Model<Api>;
 	apiKey: ApiKey;
 	thinkingLevel?: ThinkingLevel;
+	cacheRetention?: SimpleStreamOptions["cacheRetention"];
 	contextFiles?: Array<{ path: string; content: string }>;
 	userContext?: string;
 	typesDescription?: string;
@@ -32,6 +33,7 @@ export async function generateConventionalAnalysis({
 	model,
 	apiKey,
 	thinkingLevel,
+	cacheRetention,
 	contextFiles,
 	userContext,
 	typesDescription,
@@ -58,7 +60,12 @@ export async function generateConventionalAnalysis({
 				messages: [{ role: "user", content: userContent, timestamp: Date.now() }],
 				tools: [ConventionalAnalysisTool],
 			},
-			{ apiKey, maxTokens: 2400, reasoning: toReasoningEffort(thinkingLevel) },
+			{
+				apiKey,
+				maxTokens: 2400,
+				reasoning: toReasoningEffort(thinkingLevel),
+				cacheRetention,
+			},
 		),
 	);
 

@@ -1124,8 +1124,15 @@ function applyOpenAIResponsesPromptCachePolicy(
 	options: OpenAIResponsesOptions | undefined,
 	statefulCacheBaseline?: ResponseInput,
 ): void {
+	const cacheRetention = resolveCacheRetention(options?.cacheRetention);
+	if (cacheRetention === "none") {
+		if (model.compat.supportsPromptCacheBreakpoints) {
+			params.prompt_cache_options = { mode: "explicit" };
+		}
+		return;
+	}
 	const promptCache = options?.promptCache;
-	if (!promptCache || resolveCacheRetention(options?.cacheRetention) === "none") return;
+	if (!promptCache) return;
 	if (!model.compat.supportsPromptCacheBreakpoints) {
 		if (promptCache.mode === "explicit") {
 			throw new AIError.ConfigurationError(

@@ -116,6 +116,35 @@ describe("OpenAI Chat Completions explicit prompt cache policy", () => {
 		expect(body).not.toHaveProperty("prompt_cache_key");
 	});
 
+	it("uses explicit no-breakpoint mode to opt direct GPT-5.6 Chat Completions out of implicit caching", async () => {
+		const { body } = await captureSimpleRequest(
+			{ cacheRetention: "none", sessionId: "routing-key", promptCacheKey: "cache-key" },
+			openAI56CompletionsModel,
+			historicalContext,
+		);
+
+		expect(body.prompt_cache_options).toEqual({ mode: "explicit" });
+		expect(body).not.toHaveProperty("prompt_cache_key");
+		expect(JSON.stringify(body.messages)).not.toContain("prompt_cache_breakpoint");
+	});
+
+	it("does not send unsupported opt-out controls to earlier Chat Completions models", async () => {
+		const earlierModel: Model<"openai-completions"> = {
+			...openAI56CompletionsSpec,
+			id: "gpt-5.5",
+			api: "openai-completions",
+			compat: buildOpenAICompat({
+				...openAI56CompletionsSpec,
+				id: "gpt-5.5",
+				api: "openai-completions",
+			}),
+		};
+		const { body } = await captureSimpleRequest({ cacheRetention: "none" }, earlierModel, historicalContext);
+
+		expect(body).not.toHaveProperty("prompt_cache_options");
+		expect(body).not.toHaveProperty("prompt_cache_key");
+	});
+
 	it("routes explicit policy through streamSimple and marks existing text-only history", async () => {
 		const previousAssistant: AssistantMessage = {
 			role: "assistant",
