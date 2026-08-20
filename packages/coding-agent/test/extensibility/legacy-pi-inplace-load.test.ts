@@ -211,6 +211,10 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 				name: "destructured node:module _load",
 				source: 'const { _load: load } = require("node:module"); load("/absolute/outside.js");',
 			},
+			{
+				name: "nested node:module namespace _load",
+				source: 'import * as nodeModule from "node:module"; nodeModule.Module._load("/absolute/outside.js");',
+			},
 		] as const;
 
 		for (const testCase of cases) {

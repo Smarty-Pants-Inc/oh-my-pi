@@ -878,6 +878,18 @@ function collectExtensionSpecifierReferences(
 		if (callee?.type !== "MemberExpression" && callee?.type !== "OptionalMemberExpression") return false;
 		return staticMemberPropertyName(callee) === "valueOf" && isKnownProcessObject(asAstNode(callee.object), scope);
 	}
+	function isKnownModuleLoaderObject(node: StructuralAstNode | null, scope: BindingScope): boolean {
+		if (node?.type === "Identifier" && typeof node.name === "string" && moduleNamespaceBindings.has(node.name)) {
+			return true;
+		}
+		if (isNodeModuleRequireCall(node, scope)) return true;
+		if (node?.type !== "MemberExpression" && node?.type !== "OptionalMemberExpression") return false;
+		const memberName = staticMemberPropertyName(node);
+		return (
+			(memberName === "Module" || memberName === "default") &&
+			isKnownModuleLoaderObject(asAstNode(node.object), scope)
+		);
+	}
 
 	let processBindingsChanged = true;
 	while (processBindingsChanged) {
@@ -1000,14 +1012,11 @@ function collectExtensionSpecifierReferences(
 				staticMemberPropertyName(memberObject) === "main" &&
 				isIdentifier(asAstNode(memberObject.object), "require") &&
 				!scopeHasBinding(scope, REQUIRE_BINDING);
-			const moduleLoaderObject =
-				memberObject?.type === "Identifier" &&
-				typeof memberObject.name === "string" &&
-				moduleNamespaceBindings.has(memberObject.name);
+			const moduleLoaderObject = isKnownModuleLoaderObject(memberObject, scope);
 			if (
 				graphProof &&
 				((memberName === "require" && (moduleRequireObject || globalRequireObject || requireMainObject)) ||
-					(memberName === "_load" && (moduleLoaderObject || isNodeModuleRequireCall(memberObject, scope))))
+					(memberName === "_load" && moduleLoaderObject))
 			) {
 				graphProof.provable = false;
 			}
@@ -1284,12 +1293,7 @@ function collectExtensionSpecifierReferences(
 				graphProof.provable = false;
 				continue;
 			}
-			const moduleLoadMember =
-				memberName === "_load" &&
-				((object?.type === "Identifier" &&
-					typeof object.name === "string" &&
-					moduleNamespaceBindings.has(object.name)) ||
-					isNodeModuleRequireCall(object, scope));
+			const moduleLoadMember = memberName === "_load" && isKnownModuleLoaderObject(object, scope);
 			if (moduleLoadMember) {
 				graphProof.provable = false;
 				continue;
