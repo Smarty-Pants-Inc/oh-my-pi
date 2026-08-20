@@ -11,6 +11,7 @@
  * and OpenRouter response-cache hits across advisor calls.
  */
 import type { StreamFn } from "@oh-my-pi/pi-agent-core";
+import type { SummaryOptions } from "@oh-my-pi/pi-agent-core/compaction";
 import { type SimpleStreamOptions, streamSimple } from "@oh-my-pi/pi-ai";
 import { isAnthropicFableOrMythosModel } from "@oh-my-pi/pi-catalog/identity";
 import { type Settings, validateProviderMaxInFlightRequests } from "../config/settings";
@@ -25,6 +26,14 @@ function timeoutSecondsToMs(value: number): number | undefined {
 export function resolveSettingsCacheRetention(settings: Settings): SimpleStreamOptions["cacheRetention"] {
 	const setting = settings.get("providers.cacheRetention");
 	return setting === "auto" ? undefined : setting;
+}
+
+/** Reuse a wrapped stream transport for one-shot completions without bypassing its request policies. */
+export function createCompleteFnFromStreamFn(streamFn: StreamFn): NonNullable<SummaryOptions["completeImpl"]> {
+	return async (model, context, options) => {
+		const stream = await streamFn(model, context, options);
+		return stream.result();
+	};
 }
 
 /**
