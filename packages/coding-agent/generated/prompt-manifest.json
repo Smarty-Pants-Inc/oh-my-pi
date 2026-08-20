@@ -8187,7 +8187,7 @@
     },
     {
       "path": "packages/coding-agent/src/modes/interactive-mode.ts",
-      "sha256": "c4735cf9333aac0ae6c6b12e0b986cd8746e8f041950e15997ca7557412d7ea3"
+      "sha256": "856ba63dcffb6e9cbda7061c0b1dd547a075150b5a9f9edeb7cf020021882d3c"
     },
     {
       "path": "packages/coding-agent/src/modes/loop-limit.ts",
@@ -10683,5 +10683,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "805b4c968ac56c7372cacc11ce95f0ac0bc9c2a1b6b2b4468f279aad72788476"
+  "rootSha256": "ea3c60862151eb531a03bd5d179658cb7613fd5f1c838d5f6fe72d1bfd338c63"
 }
