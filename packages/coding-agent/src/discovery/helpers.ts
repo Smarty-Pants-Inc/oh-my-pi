@@ -11,6 +11,7 @@ import {
 	parseFrontmatter,
 	tryParseJson,
 } from "@oh-my-pi/pi-utils";
+import { isProviderEnabled } from "../capability";
 import type { ExtensionModule } from "../capability/extension-module";
 import { invalidate as invalidateFsCache, readDirEntries, readFile } from "../capability/fs";
 import { parseRuleConditionAndScope, type Rule, type RuleFrontmatter } from "../capability/rule";
@@ -932,6 +933,15 @@ async function readClaudeEnabledPlugins(
 	return { enabled, sources };
 }
 
+export interface ClaudePluginRootPolicy {
+	includeClaudeRegistry?: boolean;
+}
+
+export interface ClearClaudePluginRootsCacheOptions {
+	/** Suppress the automatic asynchronous re-warm when an explicit preload follows. */
+	rewarm?: boolean;
+}
+
 const pluginRootsCache = new Map<string, { roots: ClaudePluginRoot[]; warnings: string[] }>();
 
 const pluginCacheInvalidators = new Set<() => void>();
@@ -942,41 +952,46 @@ export function registerPluginCacheInvalidator(invalidator: () => void): void {
 }
 
 /**
- * List all installed Claude Code plugin roots from its active plugin cache and
- * ~/.omp/plugins/installed_plugins.json, plus the nearest project registry when present.
+ * List all installed plugin roots from the OMP registry and, by default, Claude Code's active config registry.
+ * Optionally includes the nearest project-scoped OMP registry resolved from `cwd`.
  *
- * Results are cached per Claude and OMP config directories, project registry, and canonical active project.
+ * Results are cached per Claude and OMP config directories, project registry, canonical active project, and policy.
  */
 export async function listClaudePluginRoots(
 	home: string,
 	cwd?: string,
+	policy?: ClaudePluginRootPolicy,
 ): Promise<{ roots: ClaudePluginRoot[]; warnings: string[] }> {
+	const includeClaudeRegistry = policy?.includeClaudeRegistry ?? true;
 	const claudeConfigDir = resolveClaudePaths(home).configDir;
 	const ompRegistryPath = path.join(getPluginsDir(home), "installed_plugins.json");
 	const resolvedProjectPath = cwd ? await resolveActiveProjectRegistryPath(cwd) : null;
 	const projectRoot = resolvedProjectPath ? path.dirname(path.dirname(path.dirname(resolvedProjectPath))) : cwd;
-	const activeClaudeProjectPath = projectRoot ? await canonicalClaudeProjectPath(projectRoot) : null;
-	const canonicalCwd = cwd ? await canonicalClaudeProjectPath(cwd) : null;
+	const activeClaudeProjectPath =
+		includeClaudeRegistry && projectRoot ? await canonicalClaudeProjectPath(projectRoot) : null;
+	const canonicalCwd = includeClaudeRegistry && cwd ? await canonicalClaudeProjectPath(cwd) : null;
 	const settingsDirs = [...new Set([activeClaudeProjectPath, canonicalCwd].filter((d): d is string => !!d))];
-	const enabledOverrides = await readClaudeEnabledPlugins(claudeConfigDir, settingsDirs);
-	const cacheKey = `${claudeConfigDir}:${ompRegistryPath}:${resolvedProjectPath ?? ""}:${activeClaudeProjectPath ?? ""}:${canonicalCwd ?? ""}:${enabledOverrides.sources.join("|")}`;
+	const enabledOverrides = includeClaudeRegistry
+		? await readClaudeEnabledPlugins(claudeConfigDir, settingsDirs)
+		: { enabled: new Map<string, boolean>(), sources: [] };
+	const cacheKey = `${claudeConfigDir}:${ompRegistryPath}:${resolvedProjectPath ?? ""}:${activeClaudeProjectPath ?? ""}:${canonicalCwd ?? ""}:${includeClaudeRegistry}:${enabledOverrides.sources.join("|")}`;
 	const cached = pluginRootsCache.get(cacheKey);
 	if (cached) return cached;
 
 	const roots: ClaudePluginRoot[] = [];
 	const warnings: string[] = [];
 	const projectRoots: ClaudePluginRoot[] = [];
-	const canonicalClaudeProjectPaths = new Map<string, string | null>();
 
 	// ── Claude Code registry ──────────────────────────────────────────────────
 	const registryPath = path.join(claudeConfigDir, "plugins", "installed_plugins.json");
-	const content = await readFile(registryPath);
+	const content = includeClaudeRegistry ? await readFile(registryPath) : null;
 
 	if (content) {
 		const registry = parseClaudePluginsRegistry(content);
 		if (!registry) {
 			warnings.push(`Failed to parse Claude Code plugin registry: ${registryPath}`);
 		} else {
+			const canonicalClaudeProjectPaths = new Map<string, string | null>();
 			for (const [pluginId, entries] of Object.entries(registry.plugins)) {
 				if (!Array.isArray(entries) || entries.length === 0) continue;
 
@@ -1140,13 +1155,16 @@ export async function listClaudePluginRoots(
 /**
  * Clear the plugin roots cache (useful for testing or when plugins change).
  */
-export function clearClaudePluginRootsCache(): void {
+export function clearClaudePluginRootsCache(options: ClearClaudePluginRootsCacheOptions = {}): void {
 	pluginRootsCache.clear();
 	for (const invalidate of pluginCacheInvalidators) invalidate();
 	preloadedPluginRoots = [...injectedPluginDirRoots];
-	// Re-warm preloaded roots asynchronously so sync LSP config reads stay valid
-	if (lastPreloadHome) {
-		void preloadPluginRoots(lastPreloadHome, getProjectDir());
+	// Re-warm with the current provider policy so cwd/settings changes cannot
+	// retain the previous project's ambient Claude source decision.
+	if (options.rewarm !== false && lastPreloadHome) {
+		void preloadPluginRoots(lastPreloadHome, getProjectDir(), {
+			includeClaudeRegistry: isProviderEnabled("claude"),
+		});
 	}
 }
 
@@ -1155,11 +1173,14 @@ export function clearClaudePluginRootsCache(): void {
  * in-memory plugin roots cache. Used by MarketplaceManager clients after
  * installing/uninstalling/enabling/disabling plugins.
  */
-export function clearPluginRootsAndCaches(extraPaths?: readonly string[]): void {
+export function clearPluginRootsAndCaches(
+	extraPaths?: readonly string[],
+	options?: ClearClaudePluginRootsCacheOptions,
+): void {
 	invalidateFsCache(path.join(resolveClaudePaths().configDir, "plugins", "installed_plugins.json"));
 	invalidateFsCache(path.join(getPluginsDir(), "installed_plugins.json"));
 	for (const p of extraPaths ?? []) invalidateFsCache(p);
-	clearClaudePluginRootsCache();
+	clearClaudePluginRootsCache(options);
 }
 
 // ── Preloaded plugin roots (for sync consumers like LSP config) ─────────────
@@ -1175,9 +1196,9 @@ let lastPreloadHome: string | undefined;
  * Call during session initialization, after dir resolution completes
  * but before any LSP config is read.
  */
-export async function preloadPluginRoots(home: string, cwd?: string): Promise<void> {
+export async function preloadPluginRoots(home: string, cwd?: string, policy?: ClaudePluginRootPolicy): Promise<void> {
 	lastPreloadHome = home;
-	const { roots } = await listClaudePluginRoots(home, cwd);
+	const { roots } = await listClaudePluginRoots(home, cwd, policy);
 	preloadedPluginRoots = roots;
 }
 
@@ -1196,7 +1217,12 @@ export function getPreloadedPluginRoots(): readonly ClaudePluginRoot[] {
  * These are prepended to the cache with highest precedence (before OMP/Claude entries).
  * Must be called before any listClaudePluginRoots() access.
  */
-export async function injectPluginDirRoots(home: string, dirs: string[], cwd?: string): Promise<void> {
+export async function injectPluginDirRoots(
+	home: string,
+	dirs: string[],
+	cwd?: string,
+	policy?: ClaudePluginRootPolicy,
+): Promise<void> {
 	const injected: ClaudePluginRoot[] = [];
 	for (const dir of dirs) {
 		const resolved = path.resolve(dir);
@@ -1236,6 +1262,6 @@ export async function injectPluginDirRoots(home: string, dirs: string[], cwd?: s
 	pluginRootsCache.clear();
 	// Rebuild — cache miss triggers fresh load that includes both user+project registries
 	// and prepends injectedPluginDirRoots at highest precedence.
-	const { roots } = await listClaudePluginRoots(home, cwd);
+	const { roots } = await listClaudePluginRoots(home, cwd, policy);
 	preloadedPluginRoots = roots;
 }

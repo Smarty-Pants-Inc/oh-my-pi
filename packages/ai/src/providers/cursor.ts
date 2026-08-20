@@ -150,6 +150,7 @@ import {
 	parseStreamingJsonThrottled,
 	sanitizeText,
 } from "@oh-my-pi/pi-utils";
+import { mapContextInstructionsForModel } from "../context-instructions";
 import * as AIError from "../error";
 import type {
 	Api,
@@ -301,6 +302,7 @@ const NOT_IMPLEMENTED = `Not implemented by this client`;
 const conversationStateCache = new Map<string, ConversationStateStructure>();
 const conversationBlobStores = new Map<string, Map<string, Uint8Array>>();
 const warnedCursorKimiK3ReplayMessages = new Set<string>();
+const PROVIDER_PAYLOAD_EVIDENCE = Symbol.for("oh-my-pi.provider-payload-evidence");
 /**
  * Base conversation id → rotated wire id (#8345). Cursor's backend can pin a
  * per-conversation rejection (bare `resource_exhausted`, zero tokens) to one
@@ -623,6 +625,16 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			});
 			conversationStateCache.set(conversationId, conversationState);
 			const requestContextTools = buildMcpToolDefinitions(context.tools);
+			await options?.onToolContracts?.(
+				{
+					tools: requestContextTools.map(definition => ({
+						name: definition.name,
+						description: definition.description,
+						parametersJsonSchema: toJson(ValueSchema, fromBinary(ValueSchema, definition.inputSchema)),
+					})),
+				},
+				model,
+			);
 
 			const baseUrl = model.baseUrl || CURSOR_API_URL;
 			const requestPath = "/agent.v1.AgentService/Run";
@@ -4408,8 +4420,19 @@ function findLastUserMessageIndex(messages: Message[]): number {
  * When no system prompts are provided, returns a single default greeting so we never emit
  * an empty `rootPromptMessagesJson` head.
  */
-export function buildCursorSystemPromptJsons(systemPrompt: readonly string[] | undefined): string[] {
-	const systemPrompts = normalizeSystemPrompts(systemPrompt);
+export function buildCursorSystemPromptJsons(
+	systemPrompt: readonly string[] | undefined,
+	instructions?: Context["instructions"],
+	model?: Model<"cursor-agent">,
+): string[] {
+	const systemPrompts = [
+		...normalizeSystemPrompts(systemPrompt),
+		...(model
+			? mapContextInstructionsForModel(instructions, model).map(instruction =>
+					instruction.renderedText.toWellFormed(),
+				)
+			: []),
+	];
 	if (systemPrompts.length === 0) {
 		return [JSON.stringify({ role: "system", content: "You are a helpful assistant." })];
 	}
@@ -4750,9 +4773,8 @@ export async function buildGrpcRequest(
 }> {
 	const blobStore = state.blobStore;
 
-	const systemPromptIds = buildCursorSystemPromptJsons(context.systemPrompt).map(json =>
-		storeCursorBlob(blobStore, new TextEncoder().encode(json)),
-	);
+	const systemPromptJsons = buildCursorSystemPromptJsons(context.systemPrompt, context.instructions, model);
+	const systemPromptIds = systemPromptJsons.map(json => storeCursorBlob(blobStore, new TextEncoder().encode(json)));
 
 	const activeUserMessageIndex = context.messages.length - 1;
 	const activeMessage = context.messages[activeUserMessageIndex];
@@ -4868,10 +4890,17 @@ export async function buildGrpcRequest(
 	if (options?.customSystemPrompt) {
 		runRequest.customSystemPrompt = options.customSystemPrompt;
 	}
+	Object.defineProperty(runRequest, PROVIDER_PAYLOAD_EVIDENCE, {
+		value: {
+			kind: "cursor-root-prompt",
+			rootPromptMessageIds: systemPromptIds.map(id => Buffer.from(id).toString("base64")),
+			rootPromptMessagesJson: systemPromptJsons,
+		},
+		enumerable: false,
+	});
 
-	// Tools are sent later via requestContext (exec handshake)
-	const replacementRequest = await options?.onPayload?.(runRequest, model);
-	if (replacementRequest !== undefined) runRequest = replacementRequest as typeof runRequest;
+	const replacementPayload = await options?.onPayload?.(runRequest, model);
+	if (replacementPayload !== undefined) runRequest = replacementPayload as typeof runRequest;
 
 	const clientMessage = create(AgentClientMessageSchema, {
 		message: { case: "runRequest", value: runRequest },

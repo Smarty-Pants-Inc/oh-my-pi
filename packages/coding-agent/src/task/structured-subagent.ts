@@ -7,15 +7,15 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
-import { $env, prompt, Snowflake } from "@oh-my-pi/pi-utils";
+import { $env, Snowflake } from "@oh-my-pi/pi-utils";
 import { resolveAgentModelSelection } from "../config/model-resolver";
 import type { LocalProtocolOptions } from "../internal-urls";
 import { registerArtifactsDir } from "../internal-urls/registry-helpers";
 import { MCPManager } from "../mcp/manager";
 import { loadOverallPlanReference } from "../plan-mode/plan-handoff";
 import planModeSubagentPrompt from "../prompts/system/plan-mode-subagent.md" with { type: "text" };
-import subagentUserPromptTemplate from "../prompts/system/subagent-user-prompt.md" with { type: "text" };
 import { MAIN_AGENT_ID } from "../registry/agent-registry";
+import type { ExecutionEnvironmentProvider } from "../session/execution-environment";
 import type { TaskEffort } from "../thinking";
 import type { ToolSession } from "../tools";
 import { isIrcEnabled } from "../tools/hub";
@@ -33,6 +33,13 @@ import {
 } from "./isolation-runner";
 import { generateTaskName } from "./name-generator";
 import { AgentOutputManager } from "./output-manager";
+import {
+	createLocalSubagentRuntimeProfile,
+	ENVIRONMENT_SUBAGENT_RUNTIME_PROFILE,
+	resolveSubagentRuntimeToolNames,
+	type SubagentRuntimeProfile,
+	subagentRuntimeAllows,
+} from "./runtime-profile";
 import { resolveSpawnPolicy } from "./spawn-policy";
 import {
 	type AgentDefinition,
@@ -85,6 +92,8 @@ export interface StructuredSubagentRequest {
 	assignment: string;
 	context?: string;
 	agent?: string;
+	/** Select the execution substrate. Only explicit environment-backed task requests are restricted below. */
+	execution?: "local" | "environment";
 	model?: string | string[];
 	/** Presence, rather than truthiness, makes this the highest-priority schema. */
 	outputSchema?: unknown;
@@ -122,6 +131,8 @@ export interface EffectiveSubagentPolicy {
 	agentName: string;
 	agent: AgentDefinition;
 	effectiveAgent: AgentDefinition;
+	execution: "local" | "environment";
+	executionEnvironmentProvider?: ExecutionEnvironmentProvider;
 	modelOverride?: string | string[];
 	/** Explicit pre-expansion model role alias selected for this run. */
 	modelRole?: string;
@@ -131,8 +142,7 @@ export interface EffectiveSubagentPolicy {
 	isIsolated: boolean;
 	mergeMode: "patch" | "branch";
 	applyChanges: boolean;
-	enableLsp: boolean;
-	enableIrc: boolean;
+	runtimeProfile: SubagentRuntimeProfile;
 }
 
 /** Settled child execution plus data needed by the frontends' own rendering. */
@@ -157,10 +167,6 @@ export class StructuredSubagentError extends Error {
 }
 
 const PLAN_MODE_TOOLS = ["read", "grep", "glob", "web_search"] as const;
-
-function renderSubagentPrompt(assignment: string): string {
-	return prompt.render(subagentUserPromptTemplate, { assignment: assignment.trim() });
-}
 
 function trimToUndefined(value: string | undefined): string | undefined {
 	const trimmed = value?.trim();
@@ -195,6 +201,16 @@ function createPlanModeAgent(agent: AgentDefinition): AgentDefinition {
 		tools,
 		spawns: undefined,
 		prewalk: undefined,
+	};
+}
+
+function createEnvironmentAgent(agent: AgentDefinition): AgentDefinition {
+	const profile = ENVIRONMENT_SUBAGENT_RUNTIME_PROFILE;
+	return {
+		...agent,
+		tools: resolveSubagentRuntimeToolNames(profile, agent.tools) ?? [],
+		spawns: subagentRuntimeAllows(profile, "spawns") ? agent.spawns : undefined,
+		prewalk: subagentRuntimeAllows(profile, "prewalk") ? agent.prewalk : undefined,
 	};
 }
 
@@ -249,6 +265,45 @@ export async function resolveEffectiveSubagentPolicy(
 	const spawnPolicy = resolveSpawnPolicy(request.session.getSessionSpawns());
 	const agentName = request.agent?.trim() || spawnPolicy.defaultAgent;
 	const planMode = request.session.getPlanModeState?.()?.enabled === true;
+	const execution = request.execution ?? "local";
+	if (execution !== "local" && execution !== "environment") {
+		throw new StructuredSubagentError(
+			"preflight",
+			`Unsupported subagent execution selection ${JSON.stringify(execution)}. Use "local" or "environment".`,
+		);
+	}
+	let executionEnvironmentProvider: ExecutionEnvironmentProvider | undefined;
+	if (execution === "environment") {
+		if (request.invocationKind !== "task") {
+			throw new StructuredSubagentError("preflight", "Environment execution is only available to task invocations.");
+		}
+		if (planMode) {
+			throw new StructuredSubagentError("preflight", "Environment execution is unavailable in plan mode.");
+		}
+		if (request.isolation?.requested !== true) {
+			throw new StructuredSubagentError(
+				"preflight",
+				"Environment execution requires explicit `isolated: true` on the task request.",
+			);
+		}
+		const taskDepth = request.session.taskDepth ?? 0;
+		if (taskDepth !== 0) {
+			throw new StructuredSubagentError(
+				"preflight",
+				`Environment execution is only available at task depth 0; current depth is ${taskDepth}.`,
+			);
+		}
+		if (request.detached === true) {
+			throw new StructuredSubagentError("preflight", "Environment execution must be blocking, not detached.");
+		}
+		executionEnvironmentProvider = request.session.getExecutionEnvironmentProvider?.();
+		if (!executionEnvironmentProvider) {
+			throw new StructuredSubagentError(
+				"preflight",
+				"Environment execution requires a registered execution environment provider.",
+			);
+		}
+	}
 	assertPlanControlsAllowed(request, planMode);
 	assertDepthAndSpawnAllowed(request, agentName);
 
@@ -269,7 +324,16 @@ export async function resolveEffectiveSubagentPolicy(
 		);
 	}
 
-	const effectiveAgent = planMode ? createPlanModeAgent(agent) : agent;
+	let effectiveAgent = planMode ? createPlanModeAgent(agent) : agent;
+	if (execution === "environment") {
+		if (effectiveAgent.blocking !== true) {
+			throw new StructuredSubagentError(
+				"preflight",
+				`Environment execution requires a blocking agent; "${agentName}" is nonblocking.`,
+			);
+		}
+		effectiveAgent = createEnvironmentAgent(effectiveAgent);
+	}
 	const schema = resolveSchema(request, effectiveAgent);
 	if (schema.source === "caller" || (schema.source !== "none" && schema.mode === "strict")) {
 		const { error } = buildOutputValidator(schema.schema);
@@ -301,6 +365,27 @@ export async function resolveEffectiveSubagentPolicy(
 			`Subagent isolated execution requires task.isolation.mode to be set; current mode is "none".`,
 		);
 	}
+	const enableLsp =
+		!planMode &&
+		(request.enableLsp ?? ((request.session.enableLsp ?? true) && request.session.settings.get("task.enableLsp")));
+	const enableIrc =
+		!planMode &&
+		(request.enableIrc ??
+			(request.session.enableIrc !== false &&
+				isIrcEnabled(request.session.settings, request.session.taskDepth ?? 0)));
+	const runtimeProfile =
+		execution === "environment"
+			? ENVIRONMENT_SUBAGENT_RUNTIME_PROFILE
+			: createLocalSubagentRuntimeProfile({
+					restrictToolNames: planMode || request.session.restrictToolNames === true,
+					enableSpawns: !planMode,
+					enableLsp,
+					enableIrc,
+					enableMCP: request.session.enableMCP ?? true,
+					shareEvalState: request.shareEvalSession !== false,
+					keepAlive: request.keepAlive !== false,
+					enableRevival: !isIsolated,
+				});
 	return {
 		discovery,
 		agentName,
@@ -310,20 +395,15 @@ export async function resolveEffectiveSubagentPolicy(
 		modelRole,
 		parentActiveModelPattern,
 		schema,
+		execution,
+		...(executionEnvironmentProvider ? { executionEnvironmentProvider } : {}),
 		planMode,
 		isIsolated,
 		mergeMode: request.isolation?.merge ?? request.session.settings.get("task.isolation.merge"),
 		applyChanges:
 			request.isolation?.apply ??
 			(request.invocationKind === "task" ? request.session.settings.get("task.isolation.apply") : true),
-		enableLsp:
-			!planMode &&
-			(request.enableLsp ?? ((request.session.enableLsp ?? true) && request.session.settings.get("task.enableLsp"))),
-		enableIrc:
-			!planMode &&
-			(request.enableIrc ??
-				(request.session.enableIrc !== false &&
-					isIrcEnabled(request.session.settings, request.session.taskDepth ?? 0))),
+		runtimeProfile,
 	};
 }
 
@@ -378,19 +458,19 @@ function buildExecutorOptions(
 	id: string,
 ): ExecutorOptions {
 	const { session } = request;
-	const { skills, autoloadSkills } = resolveAutoloadSkills(session, policy.agent);
+	const { skills, autoloadSkills } = resolveAutoloadSkills(session, policy.effectiveAgent);
 	const localProtocolOptions: LocalProtocolOptions = session.localProtocolOptions ?? {
 		getArtifactsDir: session.getArtifactsDir ?? (() => null),
 		getSessionId: session.getSessionId ?? (() => null),
 	};
-	const restrictToolNames = policy.planMode || session.restrictToolNames === true;
-	const enableMCP = !restrictToolNames && (session.enableMCP ?? true);
+	const runtimeProfile = policy.runtimeProfile;
+	const enableMCP = subagentRuntimeAllows(runtimeProfile, "mcp");
 	return {
 		cwd: session.cwd,
 		additionalDirectories: session.additionalDirectories,
 		getApiKey: session.getApiKey,
 		agent: policy.effectiveAgent,
-		task: renderSubagentPrompt(request.assignment),
+		task: request.assignment.trim(),
 		assignment: request.assignment.trim(),
 		context: request.context?.trim() || undefined,
 		planReference: undefined,
@@ -420,11 +500,8 @@ function buildExecutorOptions(
 		sessionFile: lease.sessionFile,
 		persistArtifacts: !lease.temporary,
 		artifactsDir: lease.artifactsDir,
-		enableLsp: policy.enableLsp,
-		enableIrc: policy.enableIrc,
+		runtimeProfile,
 		maxRuntimeMs: request.maxRuntimeMs,
-		restrictToolNames,
-		keepAlive: request.keepAlive,
 		signal: request.signal,
 		eventBus: session.eventBus,
 		onProgress: request.onProgress,
@@ -432,21 +509,22 @@ function buildExecutorOptions(
 		modelRegistry: session.modelRegistry,
 		settings: session.settings,
 		mcpManager: enableMCP ? (session.mcpManager ?? MCPManager.instance()) : undefined,
-		enableMCP,
 		contextFiles: session.contextFiles?.filter(file => path.basename(file.path).toLowerCase() !== "agents.md"),
 		skills,
 		autoloadSkills,
 		workspaceTree: session.workspaceTree,
 		promptTemplates: session.promptTemplates,
 		rules: session.rules,
-		preloadedExtensionPaths: restrictToolNames ? [] : session.extensionPaths,
-		preloadedCustomToolPaths: restrictToolNames ? [] : session.customToolPaths,
+		preloadedExtensionPaths: subagentRuntimeAllows(runtimeProfile, "extensions") ? session.extensionPaths : [],
+		preloadedCustomToolPaths: subagentRuntimeAllows(runtimeProfile, "customTools") ? session.customToolPaths : [],
 		localProtocolOptions,
 		parentArtifactManager: session.getArtifactManager?.() ?? undefined,
 		parentHindsightSessionState: session.getHindsightSessionState?.(),
 		parentMnemopiSessionState: session.getMnemopiSessionState?.(),
 		parentTelemetry: session.getTelemetry?.(),
-		parentEvalSessionId: request.shareEvalSession === false ? undefined : (session.getEvalSessionId?.() ?? undefined),
+		parentEvalSessionId: subagentRuntimeAllows(runtimeProfile, "sharedEvalState")
+			? (session.getEvalSessionId?.() ?? undefined)
+			: undefined,
 		parentAgentId: session.getAgentId?.() ?? MAIN_AGENT_ID,
 		parentServiceTier: session.getServiceTierByFamily ? (session.getServiceTierByFamily() ?? null) : undefined,
 	};
@@ -477,7 +555,7 @@ function buildFailureResult(
 			id,
 			agent: policy.agent.name,
 			agentSource: policy.agent.source,
-			task: renderSubagentPrompt(request.assignment),
+			task: request.assignment.trim(),
 			assignment: request.assignment.trim(),
 			description: request.invocationKind === "eval" ? trimToUndefined(request.identity?.label) : undefined,
 			exitCode: 1,
@@ -586,6 +664,9 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 					preferredBackend: parseIsolationMode(request.session.settings.get("task.isolation.mode")),
 					agentId: id,
 					mergeMode: policy.mergeMode,
+					...(policy.executionEnvironmentProvider
+						? { executionEnvironmentProvider: policy.executionEnvironmentProvider }
+						: {}),
 					artifactsDir: lease.artifactsDir,
 					description: trimToUndefined(request.identity?.label),
 					buildCommitMessage: makeIsolationCommitMessage(request.session),

@@ -45,10 +45,13 @@ function statusTone(status: string): Tone | undefined {
 	switch (status) {
 		case "complete":
 			return "ok";
-		case "budget-limited":
+		case "budget_limited":
+		case "usage_limited":
+		case "blocked":
 			return "warn";
 		case "paused":
 		case "dropped":
+		case "superseded":
 			return undefined;
 		default:
 			return "accent";

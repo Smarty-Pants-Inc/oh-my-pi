@@ -108,6 +108,24 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 			return promise;
 		});
 	};
+	const pendingExtensionAgentTasks: Promise<unknown>[] = [];
+	const trackExtensionAgentTask = (task: Promise<unknown>): void => {
+		pendingExtensionAgentTasks.push(task);
+	};
+	const drainExtensionAgentTasks = async (): Promise<void> => {
+		let rejected = false;
+		let firstError: unknown;
+		while (pendingExtensionAgentTasks.length > 0) {
+			const results = await Promise.allSettled(pendingExtensionAgentTasks.splice(0));
+			for (const result of results) {
+				if (result.status === "rejected" && !rejected) {
+					rejected = true;
+					firstError = result.reason;
+				}
+			}
+		}
+		if (rejected) throw firstError;
+	};
 
 	// Emit session header for JSON mode
 	if (mode === "json") {
@@ -127,6 +145,7 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 		reportRuntimeError: err => {
 			process.stderr.write(`Extension error (${err.extensionPath}): ${err.error}\n`);
 		},
+		trackAgentInvokingMessage: trackExtensionAgentTask,
 	});
 
 	// `plan.defaultOnStartup` opens fresh *interactive* sessions in plan mode so a
@@ -149,97 +168,129 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 		);
 	}
 
-	// Always subscribe to enable session persistence via _handleAgentEvent
-	session.subscribe(event => {
-		// In JSON mode, output all events
-		if (mode === "json") {
-			writeStdoutLine(`${JSON.stringify(printableEvent(event))}\n`);
+	let primaryError: unknown;
+	let headlessAdvisorDrainPrepared = false;
+	let hardExitStarted = false;
+	try {
+		// Always subscribe to enable session persistence via _handleAgentEvent
+		session.subscribe(event => {
+			// In JSON mode, output all events
+			if (mode === "json") {
+				writeStdoutLine(`${JSON.stringify(printableEvent(event))}\n`);
+			}
+		});
+
+		let wroteTextWorkingIndicator = false;
+		const writeTextWorkingIndicator = (): void => {
+			if (mode !== "text" || wroteTextWorkingIndicator) return;
+			process.stderr.write("Working...\n");
+			wroteTextWorkingIndicator = true;
+		};
+
+		// Send initial message with attachments
+		if (initialMessage !== undefined) {
+			writeTextWorkingIndicator();
+			if (mode === "text") session.setTextOutputCommitted(false);
+			await logger.time("print:prompt:initial", () => session.prompt(initialMessage, { images: initialImages }));
+			await drainExtensionAgentTasks();
 		}
-	});
 
-	let wroteTextWorkingIndicator = false;
-	const writeTextWorkingIndicator = (): void => {
-		if (mode !== "text" || wroteTextWorkingIndicator) return;
-		process.stderr.write("Working...\n");
-		wroteTextWorkingIndicator = true;
-	};
+		// Send remaining messages
+		for (const message of messages) {
+			writeTextWorkingIndicator();
+			if (mode === "text") session.setTextOutputCommitted(false);
+			await logger.time("print:prompt:next", () => session.prompt(message));
+			await drainExtensionAgentTasks();
+		}
 
-	// Send initial message with attachments
-	if (initialMessage !== undefined) {
-		writeTextWorkingIndicator();
-		if (mode === "text") session.setTextOutputCommitted(false);
-		await logger.time("print:prompt:initial", () => session.prompt(initialMessage, { images: initialImages }));
-	}
+		// From this point onward a late blocker must be recorded without starting a
+		// primary turn whose response print mode would never emit.
+		session.prepareForHeadlessAdvisorDrain();
+		headlessAdvisorDrainPrepared = true;
 
-	// Send remaining messages
-	for (const message of messages) {
-		writeTextWorkingIndicator();
-		if (mode === "text") session.setTextOutputCommitted(false);
-		await logger.time("print:prompt:next", () => session.prompt(message));
-	}
+		// In text mode, output final response
+		if (mode === "text") {
+			// Read via the session accessor, not the raw state tail: a classifier
+			// refusal is pruned from active context at settle, and an aborted turn
+			// can trail synthetic tool results — both would hide the terminal
+			// assistant message (and its error) from a last-element read.
+			const assistantMsg = session.getLastAssistantMessage();
 
-	// From this point onward a late blocker must be recorded without starting a
-	// primary turn whose response print mode would never emit.
-	session.prepareForHeadlessAdvisorDrain();
-
-	// In text mode, output final response
-	if (mode === "text") {
-		// Read via the session accessor, not the raw state tail: a classifier
-		// refusal is pruned from active context at settle, and an aborted turn
-		// can trail synthetic tool results — both would hide the terminal
-		// assistant message (and its error) from a last-element read.
-		const assistantMsg = session.getLastAssistantMessage();
-
-		if (assistantMsg) {
-			// Check for error/aborted — skip silent-abort (plan-mode compaction transition)
-			if (
-				(assistantMsg.stopReason === "error" || assistantMsg.stopReason === "aborted") &&
-				!isSilentAbort(assistantMsg)
-			) {
-				const errorLine = sanitizeText(assistantMsg.errorMessage || `Request ${assistantMsg.stopReason}`);
-				// This branch hard-exits, bypassing the `await session.dispose()` at
-				// the end of runPrintMode. Flush telemetry and dispose the session
-				// HERE so error spans reach the exporter (the postmortem `exit`
-				// handler can't await) and the browser reaper installed in
-				// `dispose()` (releaseTabsForOwner) actually runs — otherwise an
-				// OMP-owned Chromium survives this exit (issue #5643). `dispose()`
-				// is idempotent, so the unreachable call below is a harmless no-op.
-				await session.waitForAdvisorCatchup(PRINT_MODE_ERROR_ADVISOR_DRAIN_TIMEOUT_MS);
-				await flushTelemetryExport();
-				await session.dispose({ mnemopiConsolidateTimeoutMs: SHUTDOWN_CONSOLIDATE_BUDGET_MS });
-				const flushed = process.stderr.write(`${errorLine}\n`);
-				if (flushed) {
+			if (assistantMsg) {
+				// Check for error/aborted — skip silent-abort (plan-mode compaction transition)
+				if (
+					(assistantMsg.stopReason === "error" || assistantMsg.stopReason === "aborted") &&
+					!isSilentAbort(assistantMsg)
+				) {
+					const errorLine = sanitizeText(assistantMsg.errorMessage || `Request ${assistantMsg.stopReason}`);
+					// This branch hard-exits, bypassing the `await session.dispose()` at
+					// the end of runPrintMode. Flush telemetry and dispose the session
+					// HERE so error spans reach the exporter (the postmortem `exit`
+					// handler can't await) and the browser reaper installed in
+					// `dispose()` (releaseTabsForOwner) actually runs — otherwise an
+					// OMP-owned Chromium survives this exit (issue #5643). `dispose()`
+					// is idempotent, so the unreachable call below is a harmless no-op.
+					await session.waitForAdvisorCatchup(PRINT_MODE_ERROR_ADVISOR_DRAIN_TIMEOUT_MS);
+					await flushTelemetryExport();
+					await session.dispose({ mnemopiConsolidateTimeoutMs: SHUTDOWN_CONSOLIDATE_BUDGET_MS });
+					const flushed = process.stderr.write(`${errorLine}\n`);
+					if (!flushed) {
+						await new Promise<void>(resolve => process.stderr.once("drain", resolve));
+					}
+					hardExitStarted = true;
 					process.exit(1);
-				} else {
-					process.stderr.once("drain", () => process.exit(1));
+				}
+
+				if (
+					assistantMsg.errorMessage &&
+					assistantMsg.stopReason !== "error" &&
+					assistantMsg.stopReason !== "aborted"
+				) {
+					process.stderr.write(`${sanitizeText(assistantMsg.errorMessage)}\n`);
+				}
+
+				// Output text content
+				for (const content of assistantMsg.content) {
+					if (content.type === "text") {
+						writeStdoutLine(`${sanitizeText(content.text)}\n`);
+					} else if (printThoughts && content.type === "thinking" && content.thinking.trim().length > 0) {
+						writeStdoutLine(`${sanitizeText(content.thinking)}\n`);
+					}
 				}
 			}
-
-			if (
-				assistantMsg.errorMessage &&
-				assistantMsg.stopReason !== "error" &&
-				assistantMsg.stopReason !== "aborted"
-			) {
-				process.stderr.write(`${sanitizeText(assistantMsg.errorMessage)}\n`);
-			}
-
-			// Output text content
-			for (const content of assistantMsg.content) {
-				if (content.type === "text") {
-					writeStdoutLine(`${sanitizeText(content.text)}\n`);
-				} else if (printThoughts && content.type === "thinking" && content.thinking.trim().length > 0) {
-					writeStdoutLine(`${sanitizeText(content.thinking)}\n`);
-				}
-			}
+			session.setTextOutputCommitted(true);
 		}
-		session.setTextOutputCommitted(true);
+	} catch (error) {
+		// `process.exit()` never returns. Tests model that terminal edge by
+		// throwing a sentinel; do not mistake it for an ordinary run failure and
+		// execute the final cleanup path a second time.
+		if (hardExitStarted) throw error;
+		primaryError = error;
 	}
-
-	await session.waitForAdvisorCatchup(PRINT_MODE_ADVISOR_DRAIN_TIMEOUT_MS);
-
-	// Block shutdown until every serialized stdout write (including the final
-	// agent_end and late JSON advisor events) has drained; process.exit would
-	// otherwise discard the buffered tail and truncate the last record.
-	await stdoutTail;
-	await session.dispose({ mnemopiConsolidateTimeoutMs: SHUTDOWN_CONSOLIDATE_BUDGET_MS });
+	try {
+		await drainExtensionAgentTasks();
+	} catch (error) {
+		primaryError ??= error;
+	}
+	if (!headlessAdvisorDrainPrepared) session.prepareForHeadlessAdvisorDrain();
+	try {
+		await session.waitForAdvisorCatchup(
+			primaryError === undefined ? PRINT_MODE_ADVISOR_DRAIN_TIMEOUT_MS : PRINT_MODE_ERROR_ADVISOR_DRAIN_TIMEOUT_MS,
+		);
+	} catch (error) {
+		primaryError ??= error;
+	}
+	try {
+		// Block shutdown until every serialized stdout write (including the final
+		// agent_end and late JSON advisor events) has drained.
+		await stdoutTail;
+	} catch (error) {
+		primaryError ??= error;
+	}
+	try {
+		await session.dispose({ mnemopiConsolidateTimeoutMs: SHUTDOWN_CONSOLIDATE_BUDGET_MS });
+	} catch (error) {
+		primaryError ??= error;
+	}
+	if (primaryError !== undefined) throw primaryError;
 }

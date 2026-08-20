@@ -428,9 +428,16 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 async function saveBrowserOutputArtifact(session: ToolSession, fullText: string): Promise<string | undefined> {
 	try {
 		const alloc = await session.allocateOutputArtifact?.("browser-original");
-		if (!alloc?.path || !alloc.id) return undefined;
-		await Bun.write(alloc.path, fullText);
-		return alloc.id;
+		if (!alloc?.path || !alloc.id) {
+			alloc?.release?.();
+			return undefined;
+		}
+		try {
+			await Bun.write(alloc.path, fullText);
+			return alloc.id;
+		} finally {
+			alloc.release?.();
+		}
 	} catch {
 		return undefined;
 	}

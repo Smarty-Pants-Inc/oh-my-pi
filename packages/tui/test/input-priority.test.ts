@@ -84,7 +84,7 @@ function fakeTimerScheduler(): RenderScheduler {
 	};
 }
 
-describe("TUI input priority", () => {
+describe("TUI input dispatch", () => {
 	afterEach(() => {
 		vi.useRealTimers();
 	});
@@ -113,6 +113,31 @@ describe("TUI input priority", () => {
 		expect(component.slowRenderBeforeSecond).toBe(false);
 		expect(component.interruptsHandled).toBe(2);
 		expect(component.exitRequests).toBe(1);
+	});
+
+	it("applies one insertion-ordered listener set before focused input", () => {
+		const terminal = new VirtualTerminal(40, 8);
+		const tui = new TUI(terminal);
+		const component = new NavigationProbe();
+		const received: string[] = [];
+		tui.addChild(component);
+		tui.setFocus(component);
+		tui.addInputListener(data => {
+			received.push(`host:${data}`);
+			return { data: "" };
+		});
+		tui.addInputListener(data => {
+			received.push(`public:${data}`);
+			return undefined;
+		});
+
+		try {
+			tui.start();
+			terminal.sendInput("private-frame");
+			expect(received).toEqual(["host:private-frame", "public:"]);
+		} finally {
+			tui.stop();
+		}
 	});
 
 	it("renders ordinary navigation without an interrupt-grace delay", async () => {

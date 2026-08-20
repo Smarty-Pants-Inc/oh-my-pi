@@ -71,3 +71,46 @@ test("buildSessionOptions rejects trusted extension directories", async () => {
 		/module file, not a directory/,
 	);
 });
+
+test("--no-extensions excludes ambient messaging while preserving an explicit extension", async () => {
+	const ambientPath = tempDir.join(".omp", "extensions", "ambient-messaging.ts");
+	const explicitPath = tempDir.join("explicit.ts");
+	await Bun.write(
+		ambientPath,
+		"export default function (pi) { pi.registerCommand('ambient-messaging', { handler: async () => {} }); }",
+	);
+	await Bun.write(
+		explicitPath,
+		"export default function (pi) { pi.registerCommand('explicit-marker', { handler: async () => {} }); }",
+	);
+	const parsed = parseArgs(["--no-extensions", "--extension", explicitPath]);
+	const settings = Settings.isolated();
+	const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
+	const options = await buildSessionOptions(parsed, [], SessionManager.inMemory(), modelRegistry, settings);
+	const result = await loadSessionExtensions(options, tempDir.path(), settings, new EventBus());
+
+	expect(result.errors).toEqual([]);
+	expect(result.extensions.flatMap(extension => [...extension.commands.keys()])).toEqual(["explicit-marker"]);
+});
+
+test("an unrelated trusted extension excludes ambient messaging and loads only its own marker", async () => {
+	const ambientPath = tempDir.join(".omp", "extensions", "ambient-messaging.ts");
+	const trustedPath = tempDir.join("alternate-checkout", "marker.ts");
+	await Bun.write(
+		ambientPath,
+		"export default function (pi) { pi.registerCommand('ambient-messaging', { handler: async () => {} }); }",
+	);
+	await Bun.write(
+		trustedPath,
+		"export default function (pi) { pi.registerCommand('alternate-marker', { handler: async () => {} }); }",
+	);
+	const parsed = parseArgs(["--trusted-extension", trustedPath]);
+	const settings = Settings.isolated();
+	const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
+	const options = await buildSessionOptions(parsed, [], SessionManager.inMemory(), modelRegistry, settings);
+	const result = await loadSessionExtensions(options, tempDir.path(), settings, new EventBus());
+
+	expect(result.errors).toEqual([]);
+	expect(result.extensions.map(extension => extension.resolvedPath)).toEqual([realpathSync.native(trustedPath)]);
+	expect(result.extensions.flatMap(extension => [...extension.commands.keys()])).toEqual(["alternate-marker"]);
+});

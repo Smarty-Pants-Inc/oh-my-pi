@@ -4,6 +4,7 @@ import { resolveWireModelId } from "@oh-my-pi/pi-catalog/model-thinking";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import type { ResolvedOpenAICompat } from "@oh-my-pi/pi-catalog/types";
 import { $env, logger, parseStreamingJson, parseStreamingJsonThrottled } from "@oh-my-pi/pi-utils";
+import { mapContextInstructions, supportsDeveloperRoleForContext } from "../context-instructions";
 import { renderDemotedThinking } from "../dialect/demotion";
 import * as AIError from "../error";
 import { getKimiCommonHeaders } from "../registry/oauth/kimi";
@@ -663,7 +664,9 @@ const streamOpenAICompletionsOnce = (
 				: `${trimmedBaseUrl}/chat/completions`;
 			const createCompletionsStream = async (toolStrictModeOverride?: ToolStrictModeOverride) => {
 				const effectiveToolStrictModeOverride = disableStrictTools ? "none" : toolStrictModeOverride;
-				let { params, strictToolsApplied } = buildParams(model, context, options, effectiveToolStrictModeOverride);
+				const builtParams = buildParams(model, context, options, effectiveToolStrictModeOverride);
+				let params = builtParams.params;
+				const strictToolsApplied = builtParams.strictToolsApplied;
 				appliedStrictTools = strictToolsApplied;
 				const reasoningEffortFallbackKey = createOpenAIReasoningEffortFallbackKey(
 					"chat-completions",
@@ -677,8 +680,8 @@ const streamOpenAICompletionsOnce = (
 					applyOpenAIReasoningEffortFallback(params, requestReasoningEffortFallback);
 				}
 				activeReasoningEffortFallbackKey = reasoningEffortFallbackKey;
-				const replacedParams = await options?.onPayload?.(params, model);
-				if (replacedParams !== undefined) params = replacedParams as typeof params;
+				const replacementPayload = await options?.onPayload?.(params, model);
+				if (replacementPayload !== undefined) params = replacementPayload as OpenAICompletionsParams;
 				activeRequestParams = params;
 				rawRequestDump = {
 					provider: model.provider,
@@ -1884,21 +1887,41 @@ export function convertMessages(
 	};
 
 	const systemPrompts = normalizeSystemPrompts(context.systemPrompt);
-	if (systemPrompts.length > 0) {
-		const useDeveloperRole = model.reasoning && compat.supportsDeveloperRole;
-		const role = useDeveloperRole ? "developer" : "system";
+	const useDeveloperRole = model.reasoning && compat.supportsDeveloperRole;
+	const legacyRole: "developer" | "system" = useDeveloperRole ? "developer" : "system";
+	const supportsDeveloperContextRole = supportsDeveloperRoleForContext(model, compat.supportsDeveloperRole);
+	const instructionMessages: Array<{ role: "system" | "developer"; content: string }> = [
+		...systemPrompts.map(content => ({ role: legacyRole, content })),
+		...mapContextInstructions(context.instructions, supportsDeveloperContextRole).map(instruction => ({
+			role: instruction.actualRole,
+			content: instruction.renderedText.toWellFormed(),
+		})),
+	];
+	if (instructionMessages.length > 0) {
 		// Default to one block per ordered system prompt so the leading prefix
 		// stays byte-identical between turns and the provider's KV cache can
 		// reuse it. Hosts whose chat templates reject follow-up system messages
 		// (Qwen via vLLM, MiniMax, Alibaba Dashscope, Qwen Portal, …) opt out
 		// via `compat.supportsMultipleSystemMessages = false`; in that mode we
-		// coalesce into a single message joined by `\n\n`.
+		// coalesce consecutive messages with the same actual role. A role change
+		// remains explicit so semantic system and developer authority are not
+		// flattened together.
 		if (compat.supportsMultipleSystemMessages) {
-			for (const systemPrompt of systemPrompts) {
-				params.push({ role, content: systemPrompt });
-			}
+			params.push(...instructionMessages);
 		} else {
-			params.push({ role, content: systemPrompts.join("\n\n") });
+			for (const message of instructionMessages) {
+				const previous = params.at(-1);
+				if (
+					previous &&
+					(previous.role === "system" || previous.role === "developer") &&
+					previous.role === message.role &&
+					typeof previous.content === "string"
+				) {
+					previous.content = `${previous.content}\n\n${message.content}`;
+				} else {
+					params.push(message);
+				}
+			}
 		}
 	}
 

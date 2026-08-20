@@ -36,7 +36,7 @@ import {
 	type CollabUiRequest,
 	parseCollabLink,
 } from "./protocol";
-import { CollabSocket } from "./relay-client";
+import { CollabSocket, type CollabTransport } from "./relay-client";
 
 /** Commands a guest may run locally; everything else is host-only. */
 export const COLLAB_GUEST_ALLOWED_COMMANDS: Record<string, true> = {
@@ -155,9 +155,16 @@ export function reconcileGuestSnapshotHostState(ctx: GuestSnapshotActivityReconc
 	reconcileGuestIdleHostState(ctx, false);
 }
 
+const guestRestorationCompletions = new WeakMap<object, Promise<void>>();
+
+/** Completion owned by the latest public relay guest after it detaches and restores the local session. */
+export function getCollabGuestRestorationCompletion(ctx: object): Promise<void> | undefined {
+	return guestRestorationCompletions.get(ctx);
+}
+
 export class CollabGuestLink {
 	#ctx: InteractiveModeContext;
-	#socket: CollabSocket | null = null;
+	#socket: CollabTransport | null = null;
 	#roomId = "";
 	/** Previous session file to restore on leave; null = previous session was unsaved. */
 	#returnSessionFile: string | null = null;
@@ -165,6 +172,8 @@ export class CollabGuestLink {
 	#applyChain: Promise<void> = Promise.resolve();
 	/** True after the initial snapshot has been written to disk and resumed. */
 	#welcomed = false;
+	/** Set before the replica switch so a partially applied join is restored even without a welcome. */
+	#replicaSessionMayBeActive = false;
 	#left = false;
 	/**
 	 * Buffer for the in-flight chunked welcome. Set by the small `welcome`
@@ -183,6 +192,10 @@ export class CollabGuestLink {
 	#snapshotProgressTimer: Timer | null = null;
 	/** base64url write token from a full link; absent when joined via a view link. */
 	#writeToken: string | undefined;
+	/** Resolves once this link has fully detached from its transport and UI context. */
+	readonly #ended = Promise.withResolvers<void>();
+	/** Public relay joins extend detach with restoration of their captured local session. */
+	#afterEnd: Promise<void> = this.#ended.promise;
 	/** True when the host marked this peer read-only (view link). */
 	#readOnly = false;
 	/** False until the first assistant message_start (real or synthesized) since (re)sync. */
@@ -239,6 +252,11 @@ export class CollabGuestLink {
 		return this.#readOnly;
 	}
 
+	/** Settles after transport and link-owned UI state have been detached. */
+	get ended(): Promise<void> {
+		return this.#ended.promise;
+	}
+
 	/** Shows the read-only status hint when applicable; true when the action must be dropped. */
 	#rejectReadOnly(): boolean {
 		if (!this.#readOnly) return false;
@@ -253,13 +271,44 @@ export class CollabGuestLink {
 	async join(link: string): Promise<void> {
 		const parsed = parseCollabLink(link);
 		if ("error" in parsed) throw new Error(parsed.error);
-		this.#roomId = parsed.roomId;
-		this.#writeToken = parsed.writeToken ? Buffer.from(parsed.writeToken).toString("base64url") : undefined;
 		const key = await importRoomKey(parsed.key);
+		const lifecycle = this.#ctx.herdrCollabHostLifecycle;
+		await lifecycle?.suspend("public collab guest active");
+		this.#afterEnd = this.#ended.promise.then(async () => {
+			if (this.#replicaSessionMayBeActive) {
+				let restored: boolean;
+				try {
+					restored = await this.#restoreLocalSession();
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					this.#ctx.showError(`Failed to restore local session; private Herdr host remains suspended: ${message}`);
+					return;
+				}
+				if (!restored) {
+					this.#ctx.showError("Failed to restore local session; private Herdr host remains suspended");
+					return;
+				}
+			}
+			await lifecycle?.resume();
+		});
+		guestRestorationCompletions.set(this.#ctx, this.#afterEnd);
+		try {
+			await this.joinWithTransport(new CollabSocket({ wsUrl: parsed.wsUrl, role: "guest", key }), {
+				roomId: parsed.roomId,
+				writeToken: parsed.writeToken ? Buffer.from(parsed.writeToken).toString("base64url") : undefined,
+			});
+		} catch (error) {
+			await this.#afterEnd;
+			throw error;
+		}
+	}
 
+	/** Join a local Collab host without parsing or exposing a relay link. */
+	async joinWithTransport(transport: CollabTransport, opts: { roomId: string; writeToken?: string }): Promise<void> {
+		this.#roomId = opts.roomId;
+		this.#writeToken = opts.writeToken;
 		this.#returnSessionFile = this.#ctx.sessionManager.getSessionFile() ?? null;
-
-		const socket = new CollabSocket({ wsUrl: parsed.wsUrl, role: "guest", key });
+		const socket = transport;
 		this.#socket = socket;
 
 		const firstWelcome = Promise.withResolvers<void>();
@@ -273,10 +322,6 @@ export class CollabGuestLink {
 		};
 
 		socket.onOpen = () => {
-			// (Re)connect: re-introduce ourselves; the host answers with a fresh
-			// welcome which (re)syncs the replica. Discard any partially-streamed
-			// snapshot from a prior connection: the host will resend the full
-			// chunk train.
 			this.#welcomed = false;
 			this.#pendingSnapshot = null;
 			this.#clearSnapshotProgressTimer();
@@ -309,10 +354,6 @@ export class CollabGuestLink {
 						return;
 					}
 					if (frame.t === "error" && !this.#welcomed && !this.#left) {
-						// Pre-welcome errors are the host's targeted reply to our
-						// hello (e.g. protocol mismatch): no welcome will follow.
-						// Fail the join with the host's message instead of hanging
-						// until the welcome timeout.
 						this.#clearWelcomeTimer();
 						if (joined) this.#ctx.showError(`Collab host: ${frame.message}`);
 						else firstWelcome.reject(new Error(frame.message));
@@ -342,21 +383,15 @@ export class CollabGuestLink {
 				return;
 			}
 			this.#ctx.showStatus(`Collab session ended (${reason})`);
-			void this.#restoreLocalSession();
+			this.#finishSessionAfterTransportEnd();
 		};
 		socket.connect();
-		// Cover the connect phase too: if the relay blackholes the WebSocket
-		// handshake (no onOpen, no onClose), onOpen never arms the welcome timer,
-		// so without this the join would hang forever. onOpen re-arms (resetting
-		// the budget) once the socket actually opens.
 		this.#armWelcomeTimer();
 
 		try {
 			await firstWelcome.promise;
 		} catch (err) {
-			this.#left = true;
-			socket.close();
-			this.#socket = null;
+			await this.#finishSession();
 			throw err;
 		} finally {
 			this.#joinReject = null;
@@ -368,21 +403,42 @@ export class CollabGuestLink {
 		this.#ctx.syncRunningSubagentBadge();
 	}
 
-	/** User-initiated leave (or post-disconnect cleanup): restore the previous session. */
+	/** User-initiated leave (or post-disconnect cleanup). */
 	async leave(_reason: string): Promise<void> {
-		if (this.#left) return;
-		this.#socket?.close();
-		await this.#restoreLocalSession();
+		await this.#finishSession();
+		await this.#afterEnd;
 	}
 
-	sendPrompt(text: string, images?: ImageContent[]): void {
-		if (this.#rejectReadOnly()) return;
-		this.#socket?.send({ t: "prompt", text, images: images && images.length > 0 ? images : undefined });
+	sendPrompt(text: string, images?: ImageContent[]): boolean {
+		if (this.#rejectReadOnly()) return false;
+		try {
+			if (!this.#socket) return false;
+			return this.#socket.send({ t: "prompt", text, images: images && images.length > 0 ? images : undefined });
+		} catch (error) {
+			this.#ctx.showError(error instanceof Error ? error.message : String(error));
+			return false;
+		}
 	}
 
 	sendAbort(): void {
 		if (this.#rejectReadOnly()) return;
 		this.#socket?.send({ t: "abort" });
+	}
+
+	requestControl(): void {
+		if (this.#socket?.requestAuthority?.("request")) {
+			this.#ctx.showStatus("Requested collab control");
+			return;
+		}
+		this.#ctx.showError("This collab transport cannot change controller authority");
+	}
+
+	releaseControl(): void {
+		if (this.#socket?.requestAuthority?.("release")) {
+			this.#ctx.showStatus("Released collab control");
+			return;
+		}
+		this.#ctx.showError("This collab transport cannot change controller authority");
 	}
 
 	/**
@@ -436,12 +492,14 @@ export class CollabGuestLink {
 		const replicaPath = path.join(getConfigRootDir(), "collab", `${this.#roomId}.jsonl`);
 		const lines = [pending.header, ...pending.entries].map(entry => JSON.stringify(entry)).join("\n");
 		await Bun.write(replicaPath, `${lines}\n`);
+		if (this.#left) return;
 
 		// Resume sequence (selector-controller.handleResumeSession) minus
 		// applyCwdChange: the guest process never chdirs to a host path. The
 		// SessionManager still adopts the header cwd for display/relativization.
 		this.#clearTransientUi();
 		this.#clearAgentMirror();
+		this.#replicaSessionMayBeActive = true;
 		await this.#ctx.session.switchSession(replicaPath);
 		this.state = pending.state;
 		reconcileGuestSnapshotHostState(this.#ctx, pending.state.isStreaming);
@@ -543,10 +601,19 @@ export class CollabGuestLink {
 				}
 				break;
 			}
+			case "authority": {
+				this.#readOnly = !frame.canWrite;
+				if (this.#readOnly) this.#clearUiRequests();
+				this.#updateStatusSegment();
+				this.#ctx.showStatus(
+					frame.canWrite ? "You now control this collab session" : "Collab control released (read-only)",
+				);
+				this.#ctx.ui.requestRender();
+				break;
+			}
 			case "bye": {
 				this.#ctx.showStatus(`Collab session ended (${frame.reason})`);
-				this.#socket?.close();
-				void this.#restoreLocalSession();
+				this.#finishSessionAfterTransportEnd();
 				break;
 			}
 			case "error":
@@ -726,24 +793,42 @@ export class CollabGuestLink {
 		}
 	}
 
-	async #restoreLocalSession(): Promise<void> {
+	#finishSessionAfterTransportEnd(): void {
+		if (this.#left) return;
+		void this.#finishSession()
+			.then(() => this.#afterEnd)
+			.catch(error => {
+				const message = error instanceof Error ? error.message : String(error);
+				this.#ctx.showError(`Failed to resume private Herdr host after collab ended: ${message}`);
+			});
+	}
+
+	async #finishSession(): Promise<void> {
 		if (this.#left) return;
 		this.#left = true;
+		const socket = this.#socket;
 		this.#socket = null;
-		this.#ctx.collabGuest = undefined;
-		this.#ctx.statusLine.setCollabStatus(null);
+		socket?.close();
+		this.#clearWelcomeTimer();
+		this.#clearSnapshotProgressTimer();
 		this.#flushPendingTranscripts();
-		this.#clearAgentMirror();
-		this.#ctx.syncRunningSubagentBadge();
-		this.#ctx.resetObserverRegistry();
-		this.#clearTransientUi();
+		await this.#applyChain;
+		if (this.#ctx.collabGuest === this) {
+			this.#ctx.collabGuest = undefined;
+			this.#ctx.statusLine.setCollabStatus(null);
+			this.#clearAgentMirror();
+			this.#ctx.syncRunningSubagentBadge();
+			this.#ctx.resetObserverRegistry();
+			this.#clearTransientUi();
+		}
+		this.#ended.resolve();
+	}
+
+	async #restoreLocalSession(): Promise<boolean> {
 		// Replica file stays on disk: it is a valid session file outside the
 		// sessions dir, so it never shows up in /resume but remains readable.
-		if (this.#returnSessionFile) {
-			await this.#ctx.handleResumeSession(this.#returnSessionFile);
-			return;
-		}
-		await this.#ctx.session.newSession();
+		if (this.#returnSessionFile) return this.#ctx.handleResumeSession(this.#returnSessionFile);
+		if (!(await this.#ctx.session.newSession())) return false;
 		setSessionTerminalTitle(this.#ctx.sessionManager.getSessionName(), this.#ctx.sessionManager.getCwd());
 		this.#ctx.statusLine.invalidate();
 		this.#ctx.statusLine.resetActiveTime();
@@ -752,6 +837,7 @@ export class CollabGuestLink {
 		await this.#ctx.renderInitialMessages({ clearTerminalHistory: true });
 		await this.#ctx.reloadTodos();
 		this.#ctx.ui.requestRender(true, { clearScrollback: true });
+		return true;
 	}
 
 	#updateStatusSegment(): void {

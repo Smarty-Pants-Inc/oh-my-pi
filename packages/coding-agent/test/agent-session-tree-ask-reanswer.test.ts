@@ -375,6 +375,13 @@ describe("AgentSession tree navigation onto an ask toolResult", () => {
 				}
 				return undefined;
 			}),
+			emitBeforeSessionMutation: vi.fn().mockResolvedValue(undefined),
+			emitWithHostCompletion: vi.fn(
+				async (_event: { type: string }, prepareHostCompletion?: () => unknown | Promise<unknown>) => {
+					const continuation = await prepareHostCompletion?.();
+					if (typeof continuation === "function") await continuation();
+				},
+			),
 		} as unknown as ExtensionRunner;
 
 		const ctx = await createTestSession({ inMemory: true, extensionRunner });
@@ -553,6 +560,12 @@ describe("AgentSession tree navigation onto an ask toolResult", () => {
 			expect(messages[messages.length - 1]?.role).toBe("toolResult");
 
 			// The caller resumes explicitly after rebuilding its UI.
+			session.resumeAfterAskReanswer();
+			await session.waitForIdle();
+			expect(continueSpy).toHaveBeenCalledTimes(1);
+
+			// The committed answer is a one-shot owner; the public resume seam cannot
+			// mint another direct-user turn from the same transcript tail.
 			session.resumeAfterAskReanswer();
 			await session.waitForIdle();
 			expect(continueSpy).toHaveBeenCalledTimes(1);

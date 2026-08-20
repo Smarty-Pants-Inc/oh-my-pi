@@ -1,3 +1,4 @@
+import * as path from "node:path";
 import {
 	Agent,
 	type AgentEvent,
@@ -11,6 +12,7 @@ import {
 } from "@oh-my-pi/pi-agent-core";
 import type {
 	Context,
+	ContextInstruction,
 	CredentialDisabledEvent,
 	Effort,
 	Message,
@@ -28,7 +30,17 @@ import {
 } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import { FALLBACK_DIALECT, preferredDialect } from "@oh-my-pi/pi-catalog/identity";
 import type { Component } from "@oh-my-pi/pi-tui";
-import { $env, $flag, getAgentDir, getProjectDir, logger, postmortem, prompt, Snowflake } from "@oh-my-pi/pi-utils";
+import {
+	$env,
+	$flag,
+	getAgentDir,
+	getProjectDir,
+	isBunTestRuntime,
+	logger,
+	postmortem,
+	prompt,
+	Snowflake,
+} from "@oh-my-pi/pi-utils";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import {
 	discoverAdvisorConfigs,
@@ -63,6 +75,11 @@ import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate
 import { applyProviderGlobalsFromSettings } from "./config/provider-globals";
 import { buildServiceTierByFamily } from "./config/service-tier";
 import { Settings, type SkillsSettings } from "./config/settings";
+import { ensureApprovedStartup, promptPolicyReviewWarning } from "./context/approved-policy";
+import { captureRuntimeContextEvidence, isRuntimeContextEvidencePayload } from "./context/explain";
+import { type ContextReleaseManifest, canonicalAgentDirPath } from "./context/manifest";
+import { bindRenderedInstruction } from "./context/registry";
+import { exportRenderedToolContracts } from "./context/tool-contracts";
 import { CursorExecHandlers, type CursorMcpResourceAdapter } from "./cursor";
 import { createBridgeEditTool, createBridgeGrepFactory } from "./cursor-bridge-tools";
 import "./discovery";
@@ -89,6 +106,7 @@ import {
 	ExtensionRunner,
 	ExtensionToolWrapper,
 	type ExtensionUIContext,
+	type HostInternalExtensionBinding,
 	type LoadExtensionsResult,
 	loadExtensionFromFactory,
 	loadExtensions,
@@ -136,7 +154,12 @@ import {
 import { AgentSession, type InitialRetryFallbackState, type PlanYolo, type Prewalk } from "./session/agent-session";
 import { discoverAuthStorage as discoverAuthStorageFromConfig } from "./session/auth-broker-config";
 import type { AuthStorage } from "./session/auth-storage";
-import { withDateCwdReminder } from "./session/date-cwd-reminder";
+import { renderDateCwdReminder } from "./session/date-cwd-reminder";
+import {
+	type ExecutionEnvironmentBinding,
+	type ExecutionEnvironmentProvider,
+	mapExecutionEnvironmentPath,
+} from "./session/execution-environment";
 import { createInterruptedTurnAbortMessage } from "./session/exit-diagnostics";
 import {
 	type CustomMessage,
@@ -162,8 +185,11 @@ import { createSnapcompactSavingsRecorder } from "./session/snapcompact-savings-
 import { closeAllConnections } from "./ssh/connection-manager";
 import { unmountAll } from "./ssh/sshfs-mount";
 import {
+	assertExecutionEnvironmentSystemPrompt,
 	type BuildSystemPromptResult,
 	buildSystemPrompt as buildSystemPromptInternal,
+	DEFAULT_SYSTEM_PROMPT_TEMPLATES,
+	type BuildSystemPromptOptions as InternalBuildSystemPromptOptions,
 	loadProjectContextFiles as loadContextFilesInternal,
 	projectSystemPromptToolMetadata,
 } from "./system-prompt";
@@ -417,6 +443,10 @@ export interface CreateAgentSessionOptions {
 	providerPromptCacheKeySource?: "explicit" | "fork";
 	/** Absolute wall-clock deadline in Unix epoch milliseconds. */
 	deadline?: number;
+	/** Immutable execution environment binding used by authoritative built-in tool routing. */
+	executionEnvironment?: ExecutionEnvironmentBinding;
+	/** Provider resolved after extensions load; mutually exclusive with an explicit binding. */
+	executionEnvironmentProvider?: ExecutionEnvironmentProvider;
 
 	/** Custom tools to register (in addition to built-in tools). Accepts both CustomTool and ToolDefinition. */
 	customTools?: (CustomTool | ToolDefinition)[];
@@ -441,6 +471,14 @@ export interface CreateAgentSessionOptions {
 	 * @internal
 	 */
 	preloadedExtensions?: LoadExtensionsResult;
+	/**
+	 * Host-owned extension installed ahead of public handlers without entering
+	 * discovery, factory forwarding, public metadata, or the model-callable tool set.
+	 * Ignored for subagent/task sessions even if accidentally forwarded.
+	 *
+	 * @internal
+	 */
+	hostInternalExtension?: HostInternalExtensionBinding;
 	/**
 	 * Pre-discovered extension source paths. When provided, the filesystem-scan
 	 * inside `discoverExtensionPaths()` is skipped — the session still calls
@@ -472,6 +510,8 @@ export interface CreateAgentSessionOptions {
 	rules?: Rule[];
 	/** Context files (AGENTS.md content). Default: discovered walking up from cwd */
 	contextFiles?: Array<{ path: string; content: string }>;
+	/** Fresh registered instructions delivered outside persisted user messages. */
+	contextInstructions?: readonly ContextInstruction[];
 	/** Pre-built workspace tree (skips re-scanning; passed by parents to subagents). */
 	workspaceTree?: WorkspaceTree;
 	/** Prompt templates. Default: discovered from cwd/.omp/prompts/ + agentDir/prompts/ */
@@ -640,6 +680,13 @@ export type { MCPManager, MCPServerConfig, MCPServerConnection, MCPToolsLoadResu
 // embedding several concurrent top-level sessions in one process (the default
 // global registry admits only one "Main" per process generation).
 export { type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "./registry/agent-registry";
+export type {
+	ExecutionEnvironmentBinding,
+	ExecutionEnvironmentBridge,
+	ExecutionEnvironmentLease,
+	ExecutionEnvironmentProvider,
+	ExecutionEnvironmentRequest,
+} from "./session/execution-environment";
 export type { Tool } from "./tools";
 export { buildDirectoryTree, buildWorkspaceTree, type DirectoryTree, type WorkspaceTree } from "./workspace-tree";
 
@@ -909,6 +956,12 @@ function isLegacyBuiltinToolDefinition(tool: CustomTool | ToolDefinition): boole
 const TOOL_DEFINITION_MARKER = Symbol("__isToolDefinition");
 /** Matches the truncation applied to per-server instructions inside `rebuildSystemPrompt`. */
 const MAX_MCP_INSTRUCTIONS_LENGTH = 4000;
+
+function renderMcpInstruction(content: string): string {
+	return content.length > MAX_MCP_INSTRUCTIONS_LENGTH
+		? `${content.slice(0, MAX_MCP_INSTRUCTIONS_LENGTH)}\n[truncated]`
+		: content;
+}
 
 let sshCleanupRegistered = false;
 
@@ -1227,13 +1280,24 @@ export function createAutoLearnCaptureRunner(
  * ```
  */
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
+	let releaseManifest = isBunTestRuntime() ? undefined : await ensureApprovedStartup();
+	if (releaseManifest && path.resolve(options.agentDir ?? getAgentDir()) !== canonicalAgentDirPath()) {
+		logger.warn("Prompt policy requires review; continuing with the requested agent directory", {
+			error: `PROMPT_POLICY_REVIEW_REQUIRED: runtime agent directory must be ${canonicalAgentDirPath()}`,
+			agentDir: path.resolve(options.agentDir ?? getAgentDir()),
+		});
+		releaseManifest = undefined;
+	}
 	const rootMode = options.disableExtensionDiscovery ? "explicit-only" : "merge";
 	return await withOmpExtensionRootScope(options.additionalExtensionPaths ?? [], rootMode, () =>
-		createAgentSessionScoped(options),
+		createAgentSessionScoped(options, releaseManifest),
 	);
 }
 
-async function createAgentSessionScoped(options: CreateAgentSessionOptions): Promise<CreateAgentSessionResult> {
+async function createAgentSessionScoped(
+	options: CreateAgentSessionOptions,
+	releaseManifest: ContextReleaseManifest | undefined,
+): Promise<CreateAgentSessionResult> {
 	const cwd = options.cwd ?? getProjectDir();
 	const agentDir = options.agentDir ?? getAgentDir();
 	const eventBus = options.eventBus ?? new EventBus();
@@ -1593,6 +1657,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	let session!: AgentSession;
 	let hasSession = false;
 	let hasRegistered = false;
+	const resolvedExecutionEnvironment = options.executionEnvironment;
+	let resolvedExecutionEnvironmentProvider: ExecutionEnvironmentProvider | undefined;
 	const restrictToolNames = options.restrictToolNames === true;
 	const enableLsp = options.enableLsp ?? !restrictToolNames;
 	const lspReadOnly = options.lspReadOnly ?? restrictToolNames;
@@ -1669,6 +1735,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			toolRegistry,
 			hasUI: options.hasUI ?? false,
 			getApiKey: options.getApiKey,
+			getExecutionEnvironment: () => resolvedExecutionEnvironment,
+			getExecutionEnvironmentProvider: () => resolvedExecutionEnvironmentProvider,
 			get additionalDirectories() {
 				return sessionManager.getAdditionalDirectories();
 			},
@@ -1709,6 +1777,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			getHindsightSessionState: () => session?.getHindsightSessionState(),
 			getMnemopiSessionState: () => session?.getMnemopiSessionState(),
 			getAgentId: () => resolvedAgentId,
+			getCurrentTurnId: () => session?.getCurrentTurnId(),
 			getToolByName: name => session?.getToolByName(name),
 			agentRegistry,
 			// The global lifecycle releases through AgentRegistry.global(); wiring it
@@ -1739,7 +1808,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				disposeCallbacks.add(callback);
 				return () => disposeCallbacks.delete(callback);
 			},
-			registerSessionChangeCallback: callback => session?.registerSessionChangeCallback(callback),
+			registerSessionChangeCallback: (callback, callbackOptions) =>
+				session?.registerSessionChangeCallback(callback, callbackOptions),
 			bumpFileMutationVersion: path => {
 				const next = (fileMutationVersions.get(path) ?? 0) + 1;
 				fileMutationVersions.set(path, next);
@@ -2025,15 +2095,30 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		if (inlineExtensions.length > 0) {
 			for (let i = 0; i < inlineExtensions.length; i++) {
 				const factory = inlineExtensions[i];
+				const name = `<inline-${i}>`;
 				const loaded = await loadExtensionFromFactory(
 					factory,
 					cwd,
 					eventBus,
 					extensionsResult.runtime,
-					`<inline-${i}>`,
+					name,
+					factory === createAutoresearchExtension ? path.join(import.meta.dir, "autoresearch/index.ts") : name,
 				);
 				extensionsResult.extensions.push(loaded);
 			}
+		}
+
+		resolvedExecutionEnvironmentProvider = options.executionEnvironmentProvider;
+		for (const extension of extensionsResult.extensions) {
+			const extensionProvider = extension.executionEnvironmentProvider;
+			if (!extensionProvider) continue;
+			if (resolvedExecutionEnvironmentProvider) {
+				throw new Error("Multiple execution environment providers were registered for one session");
+			}
+			resolvedExecutionEnvironmentProvider = extensionProvider;
+		}
+		if (resolvedExecutionEnvironment && resolvedExecutionEnvironmentProvider) {
+			throw new Error("A session cannot contain both an execution environment binding and provider");
 		}
 
 		// Process provider registrations queued during extension loading.
@@ -2552,6 +2637,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// (The builtin autoresearch extension is unconditionally loaded above, so this scenario
 		// is unreachable; unconditional runner construction keeps that invariant explicit and
 		// prevents future optional extensions from silently re-opening the hole.)
+		const hostInternalExtension =
+			options.parentTaskPrefix === undefined && (options.taskDepth ?? 0) === 0
+				? options.hostInternalExtension
+				: undefined;
 		const extensionRunner: ExtensionRunner = new ExtensionRunner(
 			extensionsResult.extensions,
 			extensionsResult.runtime,
@@ -2562,7 +2651,11 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			settings,
 			localProtocolOptions,
 			() => (hasSession ? session.getAsyncJobSnapshot() : null),
+			hostInternalExtension,
+			() => (hasSession ? session.getAsyncJobCounts() : null),
+			releaseManifest,
 		);
+		const systemPromptBuilder = await extensionRunner.getSystemPromptBuilder();
 
 		credentialDisabledTarget = extensionRunner;
 		for (const event of startupCredentialDisabledEvents.splice(0)) {
@@ -2575,7 +2668,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			modelRegistry,
 			model: agent.state.model,
 			isIdle: () => !session.isStreaming,
-			hasQueuedMessages: () => session.queuedMessageCount > 0,
+			hasQueuedMessages: () => session.hasPendingMessages(),
 			abort: () => {
 				session.abort({ reason: USER_INTERRUPT_LABEL });
 			},
@@ -2813,6 +2906,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			toolNames: string[],
 			tools: Map<string, AgentTool>,
 		): Promise<BuildSystemPromptResult> => {
+			toolContextStore.setToolNames(toolNames);
+			const executionEnvironment = toolSession.getExecutionEnvironment?.();
 			const promptCwd = sessionManager.getCwd();
 			const activeRepoContext = hasSession
 				? await logger.time("resolveActiveRepoContext", resolveRepoContext, promptCwd)
@@ -2872,10 +2967,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					"## MCP Server Instructions\n\nThe following instructions are provided by connected MCP servers. They are server-controlled and may not be verified.",
 				);
 				for (const [srvName, srvInstructions] of serverInstructions) {
-					const truncated =
-						srvInstructions.length > MAX_MCP_INSTRUCTIONS_LENGTH
-							? `${srvInstructions.slice(0, MAX_MCP_INSTRUCTIONS_LENGTH)}\n[truncated]`
-							: srvInstructions;
+					const truncated = renderMcpInstruction(srvInstructions);
 					appendParts.push(`### ${srvName}\n${truncated}`);
 				}
 			}
@@ -2892,9 +2984,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					? `${appendPrompt}\n\n${options.appendSystemPrompt}`
 					: options.appendSystemPrompt;
 			}
-			const defaultPrompt = await buildSystemPromptInternal({
+			const promptOptions: InternalBuildSystemPromptOptions = {
 				cwd: promptCwd,
 				additionalWorkspaceRoots: sessionManager.getAdditionalDirectories(),
+				executionEnvironment,
 				xdevTools: toolSession.xdev ? xdevEntries(toolSession.xdev) : [],
 				xdevDocs: toolSession.xdev
 					? xdevDocsAll(toolSession.xdev, settings.get("tools.xdevDocs"), settings.get("tools.xdevInlineDevices"))
@@ -2931,7 +3024,52 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				personality: agentKind === "sub" ? "none" : settings.get("personality"),
 				renderMermaid: settings.get("tui.renderMermaid"),
 				activeRepoContext,
+			};
+			const stockPrompt = await buildSystemPromptInternal(promptOptions);
+			const clonePromptResult = (prompt: BuildSystemPromptResult): BuildSystemPromptResult => ({
+				systemPrompt: [...prompt.systemPrompt],
+				xdevCatalogNames: prompt.xdevCatalogNames ? [...prompt.xdevCatalogNames] : undefined,
 			});
+			const matchesStockPrompt = (candidate: BuildSystemPromptResult): boolean => {
+				try {
+					return (
+						JSON.stringify(candidate.systemPrompt) === JSON.stringify(stockPrompt.systemPrompt) &&
+						JSON.stringify(candidate.xdevCatalogNames ?? []) ===
+							JSON.stringify(stockPrompt.xdevCatalogNames ?? [])
+					);
+				} catch {
+					return false;
+				}
+			};
+			let defaultPrompt = releaseManifest ? clonePromptResult(stockPrompt) : stockPrompt;
+			if (systemPromptBuilder && !releaseManifest) {
+				try {
+					defaultPrompt = await systemPromptBuilder({
+						hasUI: options.hasUI === true,
+						options: promptOptions,
+						templates: DEFAULT_SYSTEM_PROMPT_TEMPLATES,
+						build: templates =>
+							templates
+								? buildSystemPromptInternal(promptOptions, templates)
+								: Promise.resolve(clonePromptResult(stockPrompt)),
+						releaseManifest,
+					});
+				} catch (error) {
+					const warning = releaseManifest ? promptPolicyReviewWarning(error) : undefined;
+					if (!warning) throw error;
+					logger.warn("Prompt policy requires review; continuing with the stock system prompt", {
+						error: warning,
+					});
+				}
+			}
+			if (releaseManifest && systemPromptBuilder !== undefined) {
+				if (!matchesStockPrompt(defaultPrompt)) {
+					logger.warn("Prompt policy requires review; continuing with the stock system prompt", {
+						error: "PROMPT_POLICY_REVIEW_REQUIRED: provider-facing system prompt differs from the approved stock prompt",
+					});
+				}
+				defaultPrompt = clonePromptResult(stockPrompt);
+			}
 
 			if (options.systemPrompt === undefined) {
 				return defaultPrompt;
@@ -2940,9 +3078,21 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				typeof options.systemPrompt === "function"
 					? options.systemPrompt(defaultPrompt.systemPrompt)
 					: options.systemPrompt;
-			return {
+			let result: BuildSystemPromptResult = {
 				systemPrompt: typeof customPrompt === "string" ? [customPrompt] : customPrompt,
 			};
+			if (releaseManifest) {
+				if (!matchesStockPrompt(result)) {
+					logger.warn("Prompt policy requires review; continuing with the stock system prompt", {
+						error: "PROMPT_POLICY_REVIEW_REQUIRED: provider-facing system prompt differs from the approved stock prompt",
+					});
+				}
+				result = clonePromptResult(stockPrompt);
+			}
+			if (executionEnvironment) {
+				assertExecutionEnvironmentSystemPrompt(executionEnvironment, result.systemPrompt);
+			}
+			return result;
 		};
 
 		const toolNamesFromRegistry = Array.from(toolRegistry.keys());
@@ -2991,7 +3141,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		const defaultInactiveToolNames = new Set(
 			registeredTools.filter(tool => tool.definition.defaultInactive).map(tool => tool.definition.name),
 		);
-		const requestedActiveToolNames = normalizedRequested.filter(name => name !== "goal");
+		const requestedActiveToolNames = normalizedRequested;
 		const explicitlyRequestedToolNameSet = explicitlyRequestedToolNames
 			? new Set(explicitlyRequestedToolNames)
 			: undefined;
@@ -3116,7 +3266,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// Final convertToLlm: live provider replay drops API-level refusal errors,
 		// then applies secret obfuscation to the remaining outbound context.
 		const convertToLlmFinal = (messages: AgentMessage[]): Message[] => {
-			const converted = filterProviderReplayMessages(convertToLlmWithBlockImages(messages));
+			const providerMessages = messages.filter(
+				message =>
+					message.role !== "custom" ||
+					(message.customType !== "goal-continuation" && message.customType !== "goal-mode-context"),
+			);
+			const converted = filterProviderReplayMessages(convertToLlmWithBlockImages(providerMessages));
 			if (!obfuscator?.hasSecrets()) return converted;
 			return obfuscateMessages(obfuscator, converted);
 		};
@@ -3143,22 +3298,69 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						createSnapcompactSavingsRecorder(() => sessionManager.getSessionFile() ?? null),
 					)
 				: undefined;
+		let pendingProviderInstructions: readonly ContextInstruction[] = [];
 		const transformProviderContext = async (context: Context, transformModel: Model): Promise<Context> => {
-			let transformed = obfuscator ? obfuscateProviderContext(obfuscator, context) : context;
+			const executionEnvironment = toolSession.getExecutionEnvironment?.();
+			if (executionEnvironment && context.systemPrompt) {
+				assertExecutionEnvironmentSystemPrompt(executionEnvironment, context.systemPrompt);
+			}
+			const registeredInstructions = [
+				...(options.contextInstructions ?? []),
+				...(session?.buildProviderContextInstructions() ?? []),
+			];
+			if (context.systemPrompt?.length) {
+				const promptCwd = normalizePromptPath(
+					executionEnvironment ? mapExecutionEnvironmentPath(executionEnvironment, ".") : sessionManager.getCwd(),
+				);
+				registeredInstructions.push(
+					bindRenderedInstruction(
+						"system.date-cwd-reminder",
+						renderDateCwdReminder(formatLocalCalendarDate(), promptCwd),
+						agentKind === "sub" ? "subagent" : "main",
+					),
+				);
+				registeredInstructions.sort(
+					(left, right) => (left.order ?? 0) - (right.order ?? 0) || left.id.localeCompare(right.id),
+				);
+			}
+			let transformed: Context = registeredInstructions.length
+				? { ...context, instructions: [...(context.instructions ?? []), ...registeredInstructions] }
+				: context;
+			transformed = obfuscator ? obfuscateProviderContext(obfuscator, transformed) : transformed;
 			if (snapcompactInline) transformed = await snapcompactInline.transform(transformed, transformModel);
 			transformed = clampProviderContextImages(transformed, transformModel);
 			transformed = await normalizeProviderContextImagesForModel(transformed, transformModel);
-			// Keep per-request volatility out of the system prompt: the date/cwd
-			// reminder rides on the first user turn so open-weight providers keep
-			// their tool-schema prefix cache (#7404).
-			return withDateCwdReminder(
-				transformed,
-				formatLocalCalendarDate(),
-				normalizePromptPath(sessionManager.getCwd()),
-			);
+			pendingProviderInstructions = structuredClone(transformed.instructions ?? []);
+			return transformed;
 		};
+		const captureRenderedToolContracts = (payload: unknown, model?: Model) => {
+			if (!releaseManifest) return;
+			return exportRenderedToolContracts(payload, model, {
+				contentManifestRootSha256: releaseManifest.contentManifestRootSha256,
+				configurationSemanticSha256: releaseManifest.configurationSemanticSha256,
+			});
+		};
+		const guardProviderPayload = async (payload: unknown, model?: Model) =>
+			await extensionRunner.emitBeforeProviderRequest(payload, model);
 		const onPayload = async (payload: unknown, model?: Model) => {
-			return await extensionRunner.emitBeforeProviderRequest(payload, model);
+			const finalPayload = await guardProviderPayload(payload, model);
+			const renderedToolContracts = captureRenderedToolContracts(finalPayload, model);
+			if (session && model && isRuntimeContextEvidencePayload(finalPayload, model)) {
+				const evidence = captureRuntimeContextEvidence(
+					finalPayload,
+					model,
+					agentKind === "sub" ? "subagent" : "main",
+					pendingProviderInstructions,
+					renderedToolContracts,
+				);
+				session.setRuntimeContextEvidence(evidence, model);
+				if (renderedToolContracts) session.setRenderedToolContracts(renderedToolContracts);
+			}
+			return finalPayload;
+		};
+		const onToolContracts: SimpleStreamOptions["onToolContracts"] = async (payload, model) => {
+			const contracts = captureRenderedToolContracts(payload, model);
+			if (contracts) session?.setRenderedToolContracts(contracts);
 		};
 		const onResponse: SimpleStreamOptions["onResponse"] = async (response, model) => {
 			await extensionRunner.emitAfterProviderResponse(response, model);
@@ -3218,6 +3420,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		const kimiApiFormatSetting = settings.get("providers.kimiApiFormat");
 		const kimiApiFormat = kimiApiFormatSetting === "auto" ? undefined : kimiApiFormatSetting;
 		agent = new Agent({
+			contextTarget: agentKind === "sub" ? "subagent" : "main",
 			initialState: {
 				systemPrompt,
 				model,
@@ -3233,6 +3436,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			cwdResolver: () => sessionManager.getCwd(),
 			convertToLlm: convertToLlmFinal,
 			onPayload,
+			onToolContracts,
 			onResponse,
 			sessionId: providerSessionId,
 			promptCacheKey: providerPromptCacheKey,
@@ -3442,7 +3646,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			mcpManagerToolNames: initialMcpManagerToolNames,
 			transformContext,
 			transformProviderContext,
-			onPayload,
+			onPayload: guardProviderPayload,
 			onResponse,
 			sideStreamFn: settingsAwareStreamFn,
 			advisorStreamFn: settingsAwareStreamFn,
@@ -3460,13 +3664,17 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						if (!raw || raw.size === 0) return raw;
 						const out = new Map<string, string>();
 						for (const [name, text] of raw) {
-							out.set(
-								name,
-								text.length > MAX_MCP_INSTRUCTIONS_LENGTH ? text.slice(0, MAX_MCP_INSTRUCTIONS_LENGTH) : text,
-							);
+							out.set(name, renderMcpInstruction(text));
 						}
 						return out;
 					}
+				: undefined,
+			getMcpServerInstructionSources: mcpManager
+				? () =>
+						mcpManager.getServerInstructionSources().map(source => ({
+							...source,
+							content: renderMcpInstruction(source.content),
+						}))
 				: undefined,
 			disconnectOwnedMcpManager: ownedMcpManager ? () => ownedMcpManager.disconnectAll() : undefined,
 			ttsrManager,
@@ -3781,7 +3989,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		const runAutoLearnCapture = createAutoLearnCaptureRunner({
 			sourceAgent: agent,
 			captureTools: autoLearnCaptureTools,
-			onPayload,
+			onPayload: guardProviderPayload,
 			onResponse,
 			createAgent: captureOptions => {
 				const captureModel = captureOptions.initialState?.model;
@@ -3794,14 +4002,26 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					convertToLlm: convertToLlmFinal,
 					transformContext: async messages => wrapSteeringForModel(messages),
 					transformProviderContext: async (context, transformModel) => {
-						let transformed = obfuscator ? obfuscateProviderContext(obfuscator, context) : context;
+						const executionEnvironment = toolSession.getExecutionEnvironment?.();
+						const promptCwd = normalizePromptPath(
+							executionEnvironment
+								? mapExecutionEnvironmentPath(executionEnvironment, ".")
+								: sessionManager.getCwd(),
+						);
+						const instruction = context.systemPrompt?.length
+							? bindRenderedInstruction(
+									"system.date-cwd-reminder",
+									renderDateCwdReminder(formatLocalCalendarDate(), promptCwd),
+									"side_model",
+								)
+							: undefined;
+						let transformed = instruction
+							? { ...context, instructions: [...(context.instructions ?? []), instruction] }
+							: context;
+						transformed = obfuscator ? obfuscateProviderContext(obfuscator, transformed) : transformed;
 						transformed = clampProviderContextImages(transformed, transformModel);
 						transformed = await normalizeProviderContextImagesForModel(transformed, transformModel);
-						return withDateCwdReminder(
-							transformed,
-							formatLocalCalendarDate(),
-							normalizePromptPath(sessionManager.getCwd()),
-						);
+						return transformed;
 					},
 					thinkingBudgets: agent.thinkingBudgets,
 					temperature: agent.temperature,

@@ -1,5 +1,5 @@
 import { gunzipSync, gzipSync } from "node:zlib";
-import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
+import { create, fromBinary, fromJson, type JsonValue, toBinary, toJson } from "@bufbuild/protobuf";
 import {
 	ChatMessageRequestType,
 	GetChatMessageRequestSchema,
@@ -29,6 +29,7 @@ import {
 } from "@oh-my-pi/pi-catalog/discovery/devin-gen/exa/codeium_common_pb/codeium_common_pb";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import { logger, parseStreamingJson, parseStreamingJsonThrottled } from "@oh-my-pi/pi-utils";
+import { mapContextInstructionsForModel } from "../context-instructions";
 import * as AIError from "../error";
 import type {
 	Api,
@@ -47,6 +48,7 @@ import { normalizeSystemPrompts } from "../utils";
 import { isDemotedThinking } from "../utils/block-symbols";
 import { deterministicUuid } from "../utils/deterministic-id";
 import { AssistantMessageEventStream } from "../utils/event-stream";
+import { notifyProviderResponse } from "../utils/provider-response";
 import { toolWireSchema } from "../utils/schema/wire";
 import { transformMessages } from "./transform-messages";
 
@@ -166,8 +168,14 @@ export const streamDevin: StreamFunction<"devin-agent"> = (
 			const apiKey = normalizeDevinSessionToken(options?.apiKey);
 			const auth = await fetchDevinAuthMetadata(apiKey, baseUrl, fetchImpl, options?.signal);
 			const chatBaseUrl = auth.baseUrl ?? baseUrl;
-			const request = buildDevinChatRequest(model, context, options, apiKey, auth.userJwt);
+			let request = buildDevinChatRequest(model, context, options, apiKey, auth.userJwt);
+			if (options?.onPayload) {
+				request = await applyDevinPayloadGuard(request, model, options, apiKey, auth.userJwt);
+			}
 			const reqBytes = toBinary(GetChatMessageRequestSchema, request);
+			// Serialize before observation so a local callback cannot mutate the
+			// already-approved contracts between evidence capture and transport.
+			await options?.onToolContracts?.({ tools: request.tools }, model);
 			const gz = gzipSync(reqBytes);
 			logger.debug("devin: sending chat request", {
 				model: model.id,
@@ -210,6 +218,12 @@ export const streamDevin: StreamFunction<"devin-agent"> = (
 			}
 			const body = response.body;
 
+			await notifyProviderResponse(
+				options,
+				response,
+				model,
+				response.headers.get("x-request-id") ?? response.headers.get("request-id"),
+			);
 			stream.push({ type: "start", partial: output });
 
 			const reader = body.getReader();
@@ -519,7 +533,12 @@ function buildDevinChatRequest(
 			extensionVersion: DEVIN_EXTENSION_VERSION,
 			locale: "en",
 		}),
-		prompt: normalizeSystemPrompts(context.systemPrompt).join("\n\n"),
+		prompt: [
+			...normalizeSystemPrompts(context.systemPrompt),
+			...mapContextInstructionsForModel(context.instructions, model).map(instruction =>
+				instruction.renderedText.toWellFormed(),
+			),
+		].join("\n\n"),
 		chatMessagePrompts: buildChatMessagePrompts(messages, cascadeId, model),
 		chatModelUid: options?.chatModelUid ?? model.requestModelId ?? model.id,
 		requestType: ChatMessageRequestType.CASCADE,
@@ -549,6 +568,68 @@ function buildDevinChatRequest(
 			}),
 		),
 	});
+}
+
+async function applyDevinPayloadGuard(
+	request: ReturnType<typeof buildDevinChatRequest>,
+	model: Model<"devin-agent">,
+	options: DevinOptions,
+	apiKey: string,
+	userJwt: string,
+): Promise<ReturnType<typeof buildDevinChatRequest>> {
+	const payload = toJson(GetChatMessageRequestSchema, request) as Record<string, JsonValue>;
+	const metadata = payload.metadata;
+	if (typeof metadata !== "object" || metadata === null || Array.isArray(metadata)) {
+		throw new AIError.ValidationError("Devin request metadata is missing before onPayload");
+	}
+	const credentialFreePayload: Record<string, JsonValue> = {
+		...payload,
+		metadata: { ...metadata, apiKey: "", userJwt: "" },
+	};
+	const replacement = await options.onPayload?.(credentialFreePayload, model);
+	const candidate = replacement ?? credentialFreePayload;
+	let normalized: Record<string, JsonValue>;
+	try {
+		const json = JSON.stringify(candidate);
+		if (json === undefined) throw new TypeError("replacement is not JSON");
+		normalized = JSON.parse(json) as Record<string, JsonValue>;
+	} catch (error) {
+		throw new AIError.ValidationError(
+			`Devin onPayload replacement must be JSON-safe: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	if (typeof normalized !== "object" || normalized === null || Array.isArray(normalized)) {
+		throw new AIError.ValidationError("Devin onPayload replacement must preserve the request object");
+	}
+	const finalMetadata = normalized.metadata;
+	const authFields =
+		typeof finalMetadata === "object" && finalMetadata !== null && !Array.isArray(finalMetadata)
+			? Object.entries(finalMetadata).filter(([key]) => {
+					const normalizedKey = key.replaceAll("_", "").replaceAll("-", "").toLowerCase();
+					return normalizedKey === "apikey" || normalizedKey === "userjwt";
+				})
+			: [];
+	if (
+		typeof finalMetadata !== "object" ||
+		finalMetadata === null ||
+		Array.isArray(finalMetadata) ||
+		authFields.length !== 2 ||
+		authFields.some(([key, value]) => (key !== "apiKey" && key !== "userJwt") || value !== "") ||
+		finalMetadata.apiKey !== "" ||
+		finalMetadata.userJwt !== ""
+	) {
+		throw new AIError.ValidationError("Devin onPayload replacement cannot inject or rebind provider credentials");
+	}
+	try {
+		return fromJson(GetChatMessageRequestSchema, {
+			...normalized,
+			metadata: { ...finalMetadata, apiKey, userJwt },
+		});
+	} catch (error) {
+		throw new AIError.ValidationError(
+			`Devin onPayload replacement is not a valid request: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
 }
 
 /** Map omp `Message` history onto Cascade `ChatMessagePrompt`s (USER / SYSTEM / TOOL channels). */

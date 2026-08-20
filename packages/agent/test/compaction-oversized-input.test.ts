@@ -45,8 +45,10 @@ function turn(index: number, tokens: number): AgentMessage[] {
 }
 
 function promptTextOf(call: unknown[]): string {
-	const context = call[1] as { messages: { content: { type: string; text: string }[] }[] };
-	return context.messages[0].content[0].text;
+	const context = call[1] as { instructions?: Array<{ role: string; renderedText: string }> };
+	const instruction = context.instructions?.[0];
+	expect(instruction?.role).toBe("internal_context");
+	return instruction?.renderedText ?? "";
 }
 
 describe("summarization input budget", () => {

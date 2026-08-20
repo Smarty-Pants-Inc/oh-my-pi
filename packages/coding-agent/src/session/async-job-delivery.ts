@@ -37,6 +37,7 @@ export interface AsyncResultEntry {
 	 * the manager's per-id suppression marker.
 	 */
 	epoch: number;
+	originTurnId?: string;
 }
 
 type AsyncResultJobDetails = {
@@ -44,6 +45,7 @@ type AsyncResultJobDetails = {
 	type?: "bash" | "task";
 	label?: string;
 	durationMs?: number;
+	originTurnId?: string;
 };
 
 export type AsyncResultDetails = {
@@ -58,6 +60,7 @@ export function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): Custo
 		type: entry.job?.type,
 		label: entry.job?.label,
 		durationMs: entry.durationMs,
+		originTurnId: entry.originTurnId,
 	}));
 	const details: AsyncResultDetails = {
 		jobs: jobs.map(job => ({
@@ -65,6 +68,7 @@ export function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): Custo
 			type: job.type,
 			label: job.label,
 			durationMs: job.durationMs,
+			originTurnId: job.originTurnId,
 		})),
 	};
 	return {

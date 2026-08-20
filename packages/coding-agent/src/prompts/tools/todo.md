@@ -1,44 +1,5 @@
-**Tasks: verbatim content strings, NEVER auto-generated IDs; no "task-1"/"task-N". Pass content in `task`.**
+Todos are concise working memory, not authority.
 
-Each completion: earliest still-open task (phase order) auto-promotes to `in_progress`. Out-of-order completion may move pointer back to an earlier phase—expected; completed tasks NEVER revert.
+Create a list for genuinely multi-step work or an explicit user checklist. Keep each item short and specific. Use `init` once, then targeted updates. Mark finished items `done`, external waits `block`, and no-longer-required items `drop` or `rm`.
 
-## Operations
-
-|`op`|Fields|Effect|
-|---|---|---|
-|`init`|`list: [{phase, items: string[]}]`|Initialize full list; replaces existing|
-|`init`|`items: string[]`|Flattened single-phase init|
-|`start`|`task`|Mark in progress|
-|`done`|`task` or `phase`|Mark completed|
-|`drop`|`task` or `phase`|Mark abandoned|
-|`block`|`task` or `phase`; optional `reason`|Mark blocked: open, awaiting external input; excluded from stop-time incomplete-todo reminder|
-|`unblock`|`task` or `phase`|Blocked task → `pending`|
-|`rm`|optional `task` or `phase`|Remove task/phase; omit both → clear|
-|`append`|`phase`; `items: string[]`|Append tasks to phase; lazily creates phase|
-|`view`|—|Read-only; echo list|
-
-## Anatomy
-
-- Task content: 5–10 words; what, not how; unique identifier.
-- Phase name: short noun phrase (e.g. `Foundation`, `Auth`, `Verification`); unique identifier. NEVER prefix `1.`, `A)`, `Phase 1:`.
-
-## Rules
-
-- Mark tasks done immediately after finishing; complete phases in order.
-- NEVER make a todo call the turn's only tool call. Batch with real work: `init` with first reads/edits; each `done`/`start` with next action. Solo todo turns waste a round trip.
-- Waiting on something you can't act on—a user decision, another agent, external service: `block` task (optional `reason`); remains tracked but avoids stop reminder. `unblock` when actionable. If blocker agent-actionable, `append` an unblocking task instead.
-- Keep introduced `task`/`phase` strings stable.
-- Lost exact task text: `view` echoes list; NEVER guess from memory.
-
-## Create a list
-
-- Task requires 3+ distinct steps.
-- User explicitly requests one.
-- User provides a set of tasks.
-- New instructions arrive mid-task: capture before proceeding.
-
-<critical>
-User gives multi-step plan—phased todo, numbered/bulleted checklist, or "N bugs/items/tasks":
-- MUST `init` every item as its own task before working.
-- Enumerate all; NEVER summarize into fewer tasks, sample "the important ones", drop items, or track the rest from memory.
-</critical>
+Do not add cleanup, hardening, generalization, migration, review, or follow-up work unless the current request or active goal requires it. A todo call is not product progress. Open todos never start another model turn.

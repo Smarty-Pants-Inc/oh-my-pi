@@ -5,12 +5,14 @@
  * createAgentSession() options. The SDK does the heavy lifting.
  */
 import * as fsSync from "node:fs";
+import * as net from "node:net";
 import * as os from "node:os";
 import { createInterface } from "node:readline/promises";
 import { EventLoopKeepalive } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import {
 	$env,
+	consumeFreshOmpCompanionLaunchEnv,
 	directoryExists,
 	getLogPath,
 	getProjectDir,
@@ -30,6 +32,11 @@ import { buildInitialMessage } from "./cli/initial-message";
 import { selectSession } from "./cli/session-picker";
 import { applyStartupCwd } from "./cli/startup-cwd";
 import { getLatestRelease } from "./cli/update-cli";
+import { CollabGuestLink, getCollabGuestRestorationCompletion } from "./collab/guest";
+import { type HerdrHostBridgeBootstrap, resolveHerdrHostBridge } from "./collab/herdr-bridge-bootstrap";
+import { HerdrCollabHostLifecycle, type ManagedHerdrHostBridge } from "./collab/herdr-host-lifecycle";
+import { CollabHost } from "./collab/host";
+import { createHostBridgeTransport, LocalCollabTransport } from "./collab/local-transport";
 import { findConfigFile } from "./config";
 import { ModelRegistry } from "./config/model-registry";
 import {
@@ -44,7 +51,7 @@ import {
 import { ModelsConfigFile } from "./config/models-config";
 import { serviceTierSettingToTier } from "./config/service-tier";
 import { getDefault, type SettingPath, Settings, type SettingValue, settings } from "./config/settings";
-import { initializeWithSettings } from "./discovery";
+import { initializeWithSettings, isProviderEnabled } from "./discovery";
 import {
 	clearPluginRootsAndCaches,
 	injectPluginDirRoots,
@@ -52,13 +59,15 @@ import {
 	resolveActiveProjectRegistryPath,
 } from "./discovery/helpers";
 import { injectOmpExtensionCliRoots } from "./discovery/omp-extension-roots";
+import { loadExtensionFromFactory } from "./extensibility/extensions";
 import { formatExtensionLoadNotifications } from "./extensibility/extensions/load-errors";
 import { loadExtensions } from "./extensibility/extensions/loader";
 import { ExtensionRunner } from "./extensibility/extensions/runner";
-import type { ExtensionUIContext } from "./extensibility/extensions/types";
+import type { ExtensionUIContext, HostInternalExtensionBinding } from "./extensibility/extensions/types";
 import { scheduleMarketplaceAutoUpdate } from "./extensibility/plugins/marketplace-auto-update";
 import { registerDaemonProjectPresence } from "./launch/presence";
 import type { MCPManager } from "./mcp";
+import { createFreshOmpCompanionController, type FreshOmpCompanionController } from "./modes/fresh-omp-companion";
 import { InteractiveMode } from "./modes/interactive-mode";
 import type { PrintModeOptions } from "./modes/print-mode";
 import { claimRpcInput } from "./modes/rpc/rpc-input";
@@ -105,6 +114,112 @@ type RunRpcMode = (
 	eventBus?: EventBus,
 	input?: ReadableStream<Uint8Array>,
 ) => Promise<never>;
+
+const FRESH_OMP_COMPANION_SECRET_BYTES = 32;
+const FRESH_OMP_COMPANION_ENDPOINT_MAX_BYTES = 4096;
+const FRESH_OMP_COMPANION_CONNECT_TIMEOUT_MS = 1_000;
+
+interface FreshOmpCompanionGateOptions {
+	isInteractive: boolean;
+	noSession: boolean;
+	parentTaskPrefix?: string;
+	freshProvenance: boolean;
+	taskDepth?: number;
+	env: Readonly<Record<string, string | undefined>>;
+	launchEnv: Readonly<Record<string, string | undefined>> | undefined;
+}
+
+/** Resolve the one-shot Fresh endpoint only for the canonical top-level interactive host. */
+export function resolveFreshOmpCompanionEndpoint(options: FreshOmpCompanionGateOptions): string | undefined {
+	if (
+		!options.isInteractive ||
+		options.noSession ||
+		options.parentTaskPrefix !== undefined ||
+		(options.taskDepth ?? 0) !== 0
+	) {
+		return undefined;
+	}
+	if (
+		!options.freshProvenance ||
+		options.launchEnv?.FRESH_OMP_COMPANION !== "1" ||
+		options.env.TMUX ||
+		options.env.STY
+	) {
+		return undefined;
+	}
+
+	const endpoint = options.launchEnv.FRESH_OMP_COMPANION_ENDPOINT;
+	if (!endpoint || endpoint.includes("\0") || Buffer.byteLength(endpoint) > FRESH_OMP_COMPANION_ENDPOINT_MAX_BYTES) {
+		return undefined;
+	}
+	return endpoint;
+}
+
+function readFreshOmpCompanionSecret(endpoint: string): Promise<Uint8Array | undefined> {
+	const { promise, resolve } = Promise.withResolvers<Uint8Array | undefined>();
+	const secret = Buffer.alloc(FRESH_OMP_COMPANION_SECRET_BYTES);
+	let offset = 0;
+	let settled = false;
+	const socket = net.createConnection({ path: endpoint });
+	const timer = setTimeout(() => finish(undefined), FRESH_OMP_COMPANION_CONNECT_TIMEOUT_MS);
+	timer.unref();
+
+	function finish(value: Uint8Array | undefined): void {
+		if (settled) return;
+		settled = true;
+		clearTimeout(timer);
+		socket.destroy();
+		if (!value) secret.fill(0);
+		resolve(value);
+	}
+
+	socket.on("data", chunk => {
+		const bytes = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+		if (offset + bytes.byteLength > secret.byteLength) {
+			finish(undefined);
+			return;
+		}
+		bytes.copy(secret, offset);
+		offset += bytes.byteLength;
+	});
+	socket.once("end", () => finish(offset === secret.byteLength ? secret : undefined));
+	socket.once("error", () => finish(undefined));
+	socket.once("close", () => finish(undefined));
+	return promise;
+}
+
+/** Read the private Fresh capability from its inherited one-shot local channel. */
+export async function resolveFreshOmpCompanionSecret(
+	options: FreshOmpCompanionGateOptions,
+): Promise<Uint8Array | undefined> {
+	const endpoint = resolveFreshOmpCompanionEndpoint(options);
+	return endpoint ? await readFreshOmpCompanionSecret(endpoint) : undefined;
+}
+
+/**
+ * Resolve the private Fresh companion capability only from captured launch
+ * authority, then erase both captured and live transport values before public
+ * extensions or child-process setup can inherit them.
+ */
+export async function consumeFreshOmpCompanionSecret(
+	options: Omit<FreshOmpCompanionGateOptions, "env" | "launchEnv"> & {
+		env: Record<string, string | undefined>;
+		launchEnv: Record<string, string | undefined> | undefined;
+	},
+): Promise<Uint8Array | undefined> {
+	try {
+		return await resolveFreshOmpCompanionSecret(options);
+	} finally {
+		delete options.env.FRESH_OMP_COMPANION;
+		delete options.env.FRESH_OMP_COMPANION_ENDPOINT;
+		delete options.env.FRESH_OMP_COMPANION_TOKEN;
+		if (options.launchEnv) {
+			delete options.launchEnv.FRESH_OMP_COMPANION;
+			delete options.launchEnv.FRESH_OMP_COMPANION_ENDPOINT;
+			delete options.launchEnv.FRESH_OMP_COMPANION_TOKEN;
+		}
+	}
+}
 
 export function writeStartupNotice(parsedArgs: Pick<Args, "mode">, text: string): void {
 	(parsedArgs.mode === "json" ? process.stderr : process.stdout).write(text);
@@ -450,6 +565,59 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 	};
 }
 
+export type CollabBridgeBootstrap =
+	| (HerdrHostBridgeBootstrap & {
+			role: "host";
+			ompSessionId: string;
+			routeGeneration: number;
+	  })
+	| ManagedHerdrHostBridge
+	| { role: "guest"; address: string; roomId: string; token: string };
+async function rethrowAfterInteractiveStartupCleanup(error: unknown, cleanup: () => Promise<void>): Promise<never> {
+	try {
+		await cleanup();
+	} catch (cleanupError) {
+		logger.error("Interactive startup cleanup failed", { error: String(cleanupError) });
+	}
+	throw error;
+}
+
+export async function runInteractiveStartupSequence(
+	runSplash: (() => Promise<void>) | undefined,
+	runSetup: (() => Promise<void>) | undefined,
+	startPrivateHost: (() => Promise<void>) | undefined,
+	cleanupAfterPrivateHostFailure?: () => Promise<void>,
+): Promise<void> {
+	await runSplash?.();
+	await runSetup?.();
+	try {
+		await startPrivateHost?.();
+	} catch (error) {
+		if (cleanupAfterPrivateHostFailure) {
+			await rethrowAfterInteractiveStartupCleanup(error, cleanupAfterPrivateHostFailure);
+		}
+		throw error;
+	}
+}
+
+export async function reconcilePrivateHerdrAfterStartupJoin(mode: {
+	collabGuest?: unknown;
+	herdrCollabHostLifecycle?: Pick<HerdrCollabHostLifecycle, "resume">;
+	shutdown(): Promise<void>;
+}): Promise<void> {
+	if (mode.collabGuest) return;
+	try {
+		const restoration = getCollabGuestRestorationCompletion(mode);
+		if (restoration) {
+			await restoration;
+			return;
+		}
+		await mode.herdrCollabHostLifecycle?.resume();
+	} catch (error) {
+		await rethrowAfterInteractiveStartupCleanup(error, () => mode.shutdown());
+	}
+}
+
 async function runInteractiveMode(
 	session: AgentSession,
 	version: string,
@@ -467,6 +635,8 @@ async function runInteractiveMode(
 	initialMessage?: string,
 	initialImages?: ImageContent[],
 	joinLink?: string,
+	companionStatusTextSink?: (statusText?: string) => void,
+	bridge?: CollabBridgeBootstrap,
 ): Promise<void> {
 	const mode = new InteractiveMode(
 		session,
@@ -476,6 +646,7 @@ async function runInteractiveMode(
 		lspServers,
 		mcpManager,
 		eventBus,
+		companionStatusTextSink,
 	);
 
 	// Cold-launch gate: the full setup wizard (every scene + the overlay and
@@ -497,19 +668,48 @@ async function runInteractiveMode(
 			})
 		: [];
 	const playStartupSplash = showStartupSplash && setupScenes.length === 0;
-
 	await mode.init({
 		suppressWelcomeIntro: resuming || setupScenes.length > 0 || playStartupSplash,
 		clearInitialTerminalHistory: true,
 	});
 
-	if (setupWizard && playStartupSplash) {
-		await setupWizard.runStartupSplash(mode);
+	if (bridge?.role === "host" && !("managed" in bridge)) {
+		const hostBridge = await resolveHerdrHostBridge(bridge);
+		if (!hostBridge) throw new Error("Herdr OMP bridge credentials are unavailable");
+		const host = new CollabHost(mode);
+		await host.startWithTransport(
+			createHostBridgeTransport(
+				hostBridge.address,
+				hostBridge.token,
+				hostBridge.paneId,
+				bridge.ompSessionId,
+				bridge.routeGeneration,
+			),
+			{ trustedLocal: true },
+		);
+		mode.collabHost = host;
+	} else if (bridge?.role === "guest") {
+		const guest = new CollabGuestLink(mode);
+		void guest.ended
+			.then(() => mode.shutdown())
+			.catch(error => logger.error("collab guest bridge shutdown failed", error));
+		await guest.joinWithTransport(new LocalCollabTransport(bridge.address, { t: "guest", token: bridge.token }), {
+			roomId: bridge.roomId,
+		});
 	}
-
-	if (setupWizard && setupScenes.length > 0) {
-		await setupWizard.runSetupWizard(mode, setupScenes);
-	}
+	const managedBridge = bridge?.role === "host" && "managed" in bridge ? bridge : undefined;
+	await runInteractiveStartupSequence(
+		setupWizard && playStartupSplash ? () => setupWizard.runStartupSplash(mode) : undefined,
+		setupWizard && setupScenes.length > 0 ? () => setupWizard.runSetupWizard(mode, setupScenes) : undefined,
+		managedBridge
+			? async () => {
+					const lifecycle = new HerdrCollabHostLifecycle(mode, session, managedBridge);
+					mode.herdrCollabHostLifecycle = lifecycle;
+					await lifecycle.start(joinLink !== undefined);
+				}
+			: undefined,
+		managedBridge ? () => mode.shutdown() : undefined,
+	);
 
 	// Consume failures immediately, but defer any banner until the transcript is stable.
 	const checkedVersionPromise = versionCheckPromise.catch(() => undefined);
@@ -547,6 +747,7 @@ async function runInteractiveMode(
 	// `/join` so collab guards and error rendering stay in one place.
 	if (joinLink !== undefined) {
 		await executeBuiltinSlashCommand(`/join ${joinLink}`, { ctx: mode });
+		await reconcilePrivateHerdrAfterStartupJoin(mode);
 	}
 
 	if (initialMessage !== undefined) {
@@ -683,17 +884,18 @@ async function switchToResumedProject(
 		return getProjectDir();
 	}
 
-	// Let the launch-cwd preload settle before clearing and re-warming its caches.
+	// Let the launch-cwd preload settle before clearing its caches.
 	await pluginPreloadPromise.catch(() => {});
 	setProjectDir(resumedCwd);
-	clearPluginRootsAndCaches();
+	clearPluginRootsAndCaches(undefined, { rewarm: false });
 	resetCapabilities();
 	const cwd = getProjectDir();
-	// clearPluginRootsAndCaches only kicks off an unawaited re-warm; await a fresh
-	// destination preload so sync consumers (plugin-provided LSP/DAP config) never
-	// read the launch project's stale/empty roots during session creation.
-	await preloadPluginRoots(os.homedir(), cwd);
 	await activeSettings.reloadForCwd(cwd);
+	initializeWithSettings(activeSettings);
+	const pluginPolicy = { includeClaudeRegistry: isProviderEnabled("claude") };
+	// The explicit destination preload follows cache clearing directly, so sync
+	// consumers cannot observe a re-warm from the launch project.
+	await preloadPluginRoots(os.homedir(), cwd, pluginPolicy);
 	return cwd;
 }
 
@@ -1183,7 +1385,6 @@ export async function buildSessionOptions(
 		if (cliExtensionPaths.length > 0) {
 			options.additionalExtensionPaths = cliExtensionPaths;
 		}
-
 		if (parsed.noExtensions) {
 			options.disableExtensionDiscovery = true;
 		}
@@ -1200,8 +1401,19 @@ interface RunRootCommandDependencies {
 	createForeignSessionStore?: (source: ForeignSessionSource) => ForeignSessionStore;
 	settings?: Settings;
 	forceSetupWizard?: boolean;
+	consumeFreshOmpCompanionLaunchEnv?: typeof consumeFreshOmpCompanionLaunchEnv;
+	collabBridge?: CollabBridgeBootstrap;
+	verifyApprovedStartup?: (isInteractive: boolean) => Promise<void>;
+	herdrHostBridge?: HerdrHostBridgeBootstrap;
+	runInteractiveMode?: typeof runInteractiveMode;
 }
 const DEFAULT_RUN_ROOT_DEPENDENCIES: RunRootCommandDependencies = {};
+async function disposeSessionAndQuit(session: AgentSession, code: number): Promise<void> {
+	stopStartupWatchdog();
+	await session.dispose();
+	stopThemeWatcher();
+	await postmortem.quit(code);
+}
 
 export async function runRootCommand(
 	parsed: Args,
@@ -1248,16 +1460,7 @@ export async function runRootCommand(
 	// RPC owns stdin. Claim its singleton stream before plugin/extension discovery can load an in-process consumer.
 	const rpcInput = mode === "rpc" || mode === "rpc-ui" ? claimRpcInput() : undefined;
 
-	// Kick off plugin-root preload in parallel with the remaining startup work.
-	// Awaited later (before extension/skill discovery in createAgentSession needs it).
 	const home = os.homedir();
-	const pluginPreloadPromise =
-		parsedArgs.pluginDirs && parsedArgs.pluginDirs.length > 0
-			? logger.time("injectPluginDirRoots", injectPluginDirRoots, home, parsedArgs.pluginDirs, getProjectDir())
-			: logger.time("preloadPluginRoots", preloadPluginRoots, home, getProjectDir());
-	// Mark the promise as handled so a synchronous failure does not surface as an unhandled-rejection
-	// warning before we reach the await site below.
-	pluginPreloadPromise.catch(() => {});
 
 	// Trusted files load as exact module paths, never as package roots whose
 	// sibling hooks/tools/commands/MCP content could be discovered implicitly.
@@ -1287,6 +1490,31 @@ export async function runRootCommand(
 	// tree; declare it so headless subagent optimizations (e.g. skipping replan
 	// title refresh) can tell a focusable process from a print/RPC/eval one.
 	setInteractiveHost(isInteractive);
+	await deps.verifyApprovedStartup?.(isInteractive);
+	const automaticHerdrHostBridge = isInteractive && deps.collabBridge === undefined ? deps.herdrHostBridge : undefined;
+	const companionLaunchEnv = (deps.consumeFreshOmpCompanionLaunchEnv ?? consumeFreshOmpCompanionLaunchEnv)();
+	const companionSecret = await consumeFreshOmpCompanionSecret({
+		isInteractive,
+		noSession: parsedArgs.noSession === true,
+		freshProvenance: parsedArgs.freshOmpCompanion === true,
+		parentTaskPrefix: undefined,
+		taskDepth: 0,
+		launchEnv: companionLaunchEnv,
+		env: Bun.env,
+	});
+	let companionController: FreshOmpCompanionController | undefined;
+	if (companionSecret) {
+		try {
+			companionController = createFreshOmpCompanionController(companionSecret);
+		} catch {
+			logger.warn("Fresh OMP companion disabled", { reason: "host_controller_create_failed" });
+		} finally {
+			// The controller copied its capability during construction; do not retain
+			// another live decoded secret on this long-running startup frame.
+			companionSecret.fill(0);
+		}
+	}
+
 	// Create AuthStorage and ModelRegistry upfront. A configured-but-unreachable
 	// auth broker throws here; convert it to an actionable stderr message + clean
 	// exit instead of a raw uncaught stack trace (issue #8096).
@@ -1326,6 +1554,23 @@ export async function runRootCommand(
 
 	// Initialize discovery system with settings for provider persistence
 	logger.time("initializeWithSettings", initializeWithSettings, settingsInstance);
+	const pluginPolicy = { includeClaudeRegistry: isProviderEnabled("claude") };
+	// Kick off plugin-root preload after provider policy has been initialized.
+	// Awaited later (before extension/skill discovery in createAgentSession needs it).
+	const pluginPreloadPromise =
+		parsedArgs.pluginDirs && parsedArgs.pluginDirs.length > 0
+			? logger.time(
+					"injectPluginDirRoots",
+					injectPluginDirRoots,
+					home,
+					parsedArgs.pluginDirs,
+					getProjectDir(),
+					pluginPolicy,
+				)
+			: logger.time("preloadPluginRoots", preloadPluginRoots, home, getProjectDir(), pluginPolicy);
+	// Mark the promise as handled so a synchronous failure does not surface as an unhandled-rejection
+	// warning before we reach the await site below.
+	pluginPreloadPromise.catch(() => {});
 
 	// Apply model role overrides from CLI args or env vars (ephemeral, not persisted)
 	const smolModel = parsedArgs.smol ?? $env.PI_SMOL_MODEL;
@@ -1633,6 +1878,28 @@ export async function runRootCommand(
 		const extensionsResult = parsedArgs.trustedExtensions?.length
 			? await loadTrustedSessionExtensions(sessionOptions, cwd, eventBus)
 			: await loadSessionExtensions(sessionOptions, cwd, settingsInstance, eventBus);
+		let hostInternalExtension: HostInternalExtensionBinding | undefined;
+		if (companionController) {
+			try {
+				const extension = await loadExtensionFromFactory(
+					companionController.factory,
+					cwd,
+					eventBus,
+					extensionsResult.runtime,
+					"<host:fresh-omp-companion>",
+				);
+				hostInternalExtension = {
+					extension,
+					beforeSessionMutation: companionController.beforeSessionMutation,
+					afterDispatch: companionController.afterDispatch,
+					setHostTerminalInput: companionController.setHostTerminalInput,
+				};
+			} catch {
+				companionController = undefined;
+				logger.warn("Fresh OMP companion disabled", { reason: "host_extension_load_failed" });
+			}
+		}
+		sessionOptions.hostInternalExtension = hostInternalExtension;
 		const extensionFlagSink: ExtensionFlagSink = {
 			getFlags: () => ExtensionRunner.aggregateFlags(extensionsResult.extensions),
 			setFlagValue: (name, value) => {
@@ -1704,6 +1971,24 @@ export async function runRootCommand(
 			eventBus,
 			preloadedExtensions: extensionsResult,
 		});
+		const interactiveCollabBridge: CollabBridgeBootstrap | undefined =
+			deps.collabBridge ??
+			(automaticHerdrHostBridge
+				? {
+						role: "host",
+						managed: true,
+						...automaticHerdrHostBridge,
+						routeGeneration: 1,
+					}
+				: undefined);
+		const activeCompanionController = companionController;
+		if (activeCompanionController) {
+			session.subscribe(event => {
+				if (event.type !== "thinking_level_changed") return;
+				const thinkingLevel = event.configured ?? event.thinkingLevel;
+				activeCompanionController.setThinkingLevel(thinkingLevel === "inherit" ? undefined : thinkingLevel);
+			});
+		}
 
 		try {
 			validateToolNames(initialArgs.tools, session.getAllToolNames());
@@ -1755,7 +2040,8 @@ export async function runRootCommand(
 			process.stderr.write(`${chalk.yellow("\nSet an API key environment variable:")}\n`);
 			process.stderr.write("  ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, etc.\n");
 			process.stderr.write(`${chalk.yellow(`\nOr create ${ModelsConfigFile.path()}`)}\n`);
-			process.exit(1);
+			await disposeSessionAndQuit(session, 1);
+			return;
 		}
 
 		if (mode === "rpc" || mode === "rpc-ui") {
@@ -1781,13 +2067,14 @@ export async function runRootCommand(
 			if ($env.PI_TIMING) {
 				logger.printTimings();
 				if (logger.shouldExitAfterTimings()) {
-					process.exit(0);
+					await disposeSessionAndQuit(session, 0);
+					return;
 				}
 			}
 
 			stopStartupWatchdog();
 			logger.endTiming();
-			await runInteractiveMode(
+			await (deps.runInteractiveMode ?? runInteractiveMode)(
 				session,
 				VERSION,
 				startupChangelog,
@@ -1804,6 +2091,8 @@ export async function runRootCommand(
 				initialMessage,
 				initialImages,
 				parsedArgs.join,
+				activeCompanionController?.setStatusText,
+				interactiveCollabBridge,
 			);
 		} else {
 			// Branch-only single-shot runner: keep print-mode code out of normal interactive startup.
@@ -1820,9 +2109,7 @@ export async function runRootCommand(
 			if ($env.PI_TIMING) {
 				logger.printTimings();
 			}
-			await session.dispose();
-			stopThemeWatcher();
-			await postmortem.quit(0);
+			await disposeSessionAndQuit(session, 0);
 		}
 	}
 }

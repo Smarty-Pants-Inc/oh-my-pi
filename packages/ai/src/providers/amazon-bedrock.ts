@@ -11,6 +11,7 @@ import type { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { mapEffortToAnthropicAdaptiveEffort, requireSupportedEffort } from "@oh-my-pi/pi-catalog/model-thinking";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import { $flag, fetchWithRetry, parseStreamingJson, parseStreamingJsonThrottled } from "@oh-my-pi/pi-utils";
+import { mapContextInstructionsForModel } from "../context-instructions";
 import { renderDemotedThinking } from "../dialect/demotion";
 import * as AIError from "../error";
 import { resolveAwsBearerToken } from "../registry/aws";
@@ -344,7 +345,7 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 
 			let commandInput: ConverseStreamRequest = {
 				messages: convertedMessages,
-				system: buildSystemPrompt(context.systemPrompt, promptCachePolicy),
+				system: buildSystemPrompt(context, promptCachePolicy, model),
 				inferenceConfig: {
 					maxTokens: options.maxTokens,
 					temperature: options.temperature,
@@ -353,8 +354,8 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 				toolConfig,
 				additionalModelRequestFields,
 			};
-			const replacementInput = await options?.onPayload?.(commandInput, model);
-			if (replacementInput !== undefined) commandInput = replacementInput as ConverseStreamRequest;
+			const replacementPayload = await options?.onPayload?.(commandInput, model);
+			if (replacementPayload !== undefined) commandInput = replacementPayload as ConverseStreamRequest;
 
 			const host = `bedrock-runtime.${region}.amazonaws.com`;
 			const url = `https://${host}/model/${encodeURIComponent(model.id)}/converse-stream`;
@@ -791,10 +792,16 @@ function supportsThinkingSignature(model: Model<"bedrock-converse-stream">): boo
 }
 
 function buildSystemPrompt(
-	systemPrompt: readonly string[] | string | undefined,
+	context: Pick<Context, "systemPrompt" | "instructions">,
 	promptCachePolicy: BedrockPromptCachePolicy,
+	model: Model<"bedrock-converse-stream">,
 ): SystemContent[] | undefined {
-	const prompts = normalizeSystemPrompts(systemPrompt);
+	const prompts = [
+		...normalizeSystemPrompts(context.systemPrompt),
+		...mapContextInstructionsForModel(context.instructions, model).map(instruction =>
+			instruction.renderedText.toWellFormed(),
+		),
+	];
 	if (prompts.length === 0) return undefined;
 
 	const blocks: SystemContent[] = prompts.map(prompt => ({ text: prompt }));

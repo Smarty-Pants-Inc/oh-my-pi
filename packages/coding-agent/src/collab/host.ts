@@ -43,7 +43,7 @@ import {
 	generateRoomId,
 	parseCollabLink,
 } from "./protocol";
-import { CollabSocket } from "./relay-client";
+import { CollabSocket, type CollabTransport } from "./relay-client";
 import { shrinkForReplication } from "./replication-shrink";
 
 /** Events that change the footer state guests render. */
@@ -93,6 +93,80 @@ const COLLAB_BUS_CHANNELS = [
 	TASK_SUBAGENT_PROGRESS_CHANNEL,
 ] as const satisfies readonly BusChannel[];
 
+function isValidHerdrDisplayName(name: string): boolean {
+	if (name.trim() !== name || Buffer.byteLength(name) > 64) return false;
+	let scalars = 0;
+	for (const char of name) {
+		const code = char.codePointAt(0) ?? 0;
+		if (++scalars > 64) return false;
+		if (
+			char === "[" ||
+			char === "]" ||
+			(code >= 0xd800 && code <= 0xdfff) ||
+			code <= 0x1f ||
+			(code >= 0x7f && code <= 0x9f) ||
+			code === 0x2028 ||
+			code === 0x2029 ||
+			(code >= 0x202a && code <= 0x202e) ||
+			(code >= 0x2066 && code <= 0x2069) ||
+			code === 0x200e ||
+			code === 0x200f ||
+			code === 0x61c ||
+			code === 0x200b ||
+			code === 0x200c ||
+			code === 0x200d ||
+			code === 0x2060 ||
+			code === 0xfeff
+		)
+			return false;
+	}
+	return scalars > 0 && Bun.stringWidth(name, { countAnsiEscapeCodes: false }) <= 32;
+}
+
+function isValidHerdrDisplayNameRevision(revision: number | undefined): revision is number {
+	return typeof revision === "number" && Number.isSafeInteger(revision) && revision >= 1;
+}
+type InboundGuestFrame = Extract<
+	CollabFrame,
+	{ t: "hello" | "prompt" | "abort" | "agent-cmd" | "ui-response" | "fetch-transcript" }
+>;
+
+/** Runtime boundary for untyped local bridge records before they enter host handlers. */
+function isInboundGuestFrame(frame: unknown): frame is InboundGuestFrame {
+	if (!frame || typeof frame !== "object") return false;
+	const value = frame as Record<string, unknown>;
+	switch (value.t) {
+		case "hello":
+			return (
+				typeof value.proto === "number" &&
+				typeof value.name === "string" &&
+				(value.writeToken === undefined || typeof value.writeToken === "string")
+			);
+		case "prompt":
+			return (
+				typeof value.text === "string" &&
+				(value.displayName === undefined || typeof value.displayName === "string") &&
+				(value.images === undefined || Array.isArray(value.images))
+			);
+		case "abort":
+			return true;
+		case "agent-cmd":
+			return (
+				(value.cmd === "chat" || value.cmd === "kill" || value.cmd === "revive") &&
+				typeof value.agentId === "string" &&
+				(value.text === undefined || typeof value.text === "string")
+			);
+		case "ui-response":
+			return typeof value.reqId === "number";
+		case "fetch-transcript":
+			return (
+				typeof value.reqId === "number" && typeof value.agentId === "string" && typeof value.fromByte === "number"
+			);
+		default:
+			return false;
+	}
+}
+
 function isWireAgentEvent(event: AgentSessionEvent): event is AgentSessionEvent & WireAgentEvent {
 	return event.type in WIRE_AGENT_EVENT_TYPES;
 }
@@ -101,8 +175,10 @@ function isWireSessionEntry(entry: StoredSessionEntry): entry is StoredSessionEn
 	return entry.type in WIRE_SESSION_ENTRY_TYPES;
 }
 const CONNECT_TIMEOUT_MS = 15_000;
-/** Max bytes served per fetch-transcript reply (guest re-requests from `newSize`). */
-export const TRANSCRIPT_READ_CAP = 4 * 1024 * 1024;
+/** Max source bytes served per fetch-transcript reply (guest re-requests from `newSize`).
+ * JSONL quotes/backslashes expand when embedded in bridge NDJSON, so keep this
+ * well below the 2 MiB record cap with room for the frame wrapper. */
+export const TRANSCRIPT_READ_CAP = 384 * 1024;
 const TRANSCRIPT_ENTRY_TOO_LARGE_ERROR = `transcript entry exceeds transcript fetch cap (${TRANSCRIPT_READ_CAP} bytes)`;
 /**
  * Soft byte cap per `snapshot-chunk` frame. The first MB of a snapshot takes
@@ -121,7 +197,7 @@ export type CollabGuestUiResult = { kind: "answered"; value: CollabUiResponseVal
 
 export class CollabHost {
 	#ctx: InteractiveModeContext;
-	#socket: CollabSocket | null = null;
+	#socket: CollabTransport | null = null;
 	#link = "";
 	#webLink = "";
 	#viewLink = "";
@@ -130,6 +206,7 @@ export class CollabHost {
 	#sessionId = "";
 	#unsubscribe?: () => void;
 	#peers = new Map<number, { name: string; canWrite: boolean }>();
+	#localPeerAuthority = new Map<number, boolean>();
 	#uiReqSeq = 0;
 	#pendingUi = new Map<number, { request: CollabUiRequest; settle(result: CollabGuestUiResult): void }>();
 	#lastStateJson = "";
@@ -139,7 +216,12 @@ export class CollabHost {
 	#busUnsubscribers: (() => void)[] = [];
 	#registryUnsubscribe?: () => void;
 	#stopped = false;
+	#entryAppendedUnsubscribe?: () => void;
 
+	#trustedLocalTransport = false;
+	#privateHost = false;
+	#requiresHerdrAttribution = false;
+	#onTerminated?: (reason: string) => void;
 	constructor(ctx: InteractiveModeContext) {
 		this.#ctx = ctx;
 	}
@@ -172,7 +254,12 @@ export class CollabHost {
 	}
 
 	requestGuestUi(request: CollabUiRequestDraft, signal?: AbortSignal): Promise<CollabGuestUiResult> | null {
-		if (!this.#socket || !this.#hasWritablePeers()) return null;
+		if (
+			(this.#privateHost && this.#ctx.sessionManager.getSessionId() !== this.#sessionId) ||
+			!this.#socket ||
+			!this.#hasWritablePeers()
+		)
+			return null;
 		const reqId = ++this.#uiReqSeq;
 		const fullRequest: CollabUiRequest = { ...request, reqId };
 		const { promise, resolve } = Promise.withResolvers<CollabGuestUiResult>();
@@ -220,24 +307,42 @@ export class CollabHost {
 		const parsed = parseCollabLink(this.#link);
 		if ("error" in parsed) throw new Error(parsed.error);
 		const key = await importRoomKey(rawKey);
+		await this.startWithTransport(new CollabSocket({ wsUrl: parsed.wsUrl, role: "host", key }));
+	}
 
-		const socket = new CollabSocket({ wsUrl: parsed.wsUrl, role: "host", key });
-		this.#socket = socket;
+	/** Start over an injected transport instead of a relay link. */
+	async startWithTransport(
+		transport: CollabTransport,
+		opts: { trustedLocal?: boolean; privateHost?: boolean; onTerminated?: (reason: string) => void } = {},
+	): Promise<void> {
+		this.#trustedLocalTransport = opts.trustedLocal === true;
+		this.#privateHost = opts.privateHost === true;
+		this.#onTerminated = opts.onTerminated;
+		this.#requiresHerdrAttribution = this.#trustedLocalTransport && transport.requiresHerdrAttribution === true;
+		this.#socket = transport;
 		this.#sessionId = this.#ctx.sessionManager.getSessionId();
 
 		const firstOpen = Promise.withResolvers<void>();
 		let opened = false;
-		socket.onOpen = () => {
+		let terminalReason: string | undefined;
+		transport.onOpen = () => {
 			if (!opened) {
 				opened = true;
 				firstOpen.resolve();
 			}
 		};
-		socket.onFrame = (frame, fromPeer) => this.#handleFrame(frame, fromPeer);
-		socket.onControl = msg => {
-			if (msg.t === "peer-left") this.#handlePeerLeft(msg.peer);
+		transport.onFrame = (frame, fromPeer, metadata) => {
+			if (!isInboundGuestFrame(frame)) {
+				logger.warn("collab host rejected malformed inbound frame", { fromPeer });
+				return;
+			}
+			this.#handleFrame(frame, fromPeer, metadata);
 		};
-		socket.onClose = (reason, willReconnect) => {
+		transport.onControl = msg => {
+			if (msg.t === "peer-left") this.#handlePeerLeft(msg.peer);
+			else if (msg.t === "peer-authority") this.#setPeerAuthority(msg.peer, msg.canWrite);
+		};
+		transport.onClose = (reason, willReconnect) => {
 			if (this.#stopped) return;
 			if (!opened) {
 				firstOpen.reject(new Error(reason));
@@ -246,11 +351,13 @@ export class CollabHost {
 			if (willReconnect) {
 				this.#ctx.showStatus(`Collab relay connection lost (${reason}), reconnecting…`, { dim: true });
 			} else {
+				terminalReason = reason;
+				this.#notifyTerminated(reason);
 				void this.#teardown();
-				this.#ctx.session.emitNotice("warning", `Collab ended: ${reason}`, "collab");
+				this.#emitCollabNotice("warning", `Collab ended: ${reason}`);
 			}
 		};
-		socket.connect();
+		transport.connect();
 
 		const timeout = setTimeout(
 			() => firstOpen.reject(new Error("timed out connecting to relay")),
@@ -260,12 +367,14 @@ export class CollabHost {
 			await firstOpen.promise;
 		} catch (err) {
 			this.#stopped = true;
-			socket.close();
+			transport.close();
 			this.#socket = null;
 			throw err;
 		} finally {
 			clearTimeout(timeout);
 		}
+		if (terminalReason !== undefined) throw new Error(terminalReason);
+		if (this.#stopped) throw new Error("collab transport closed during startup");
 
 		this.#unsubscribe = this.#ctx.session.subscribe(event => {
 			if (isWireAgentEvent(event)) this.#broadcast({ t: "event", event: shrinkForReplication(event) });
@@ -278,13 +387,27 @@ export class CollabHost {
 			}
 		}
 		this.#registryUnsubscribe = AgentRegistry.global().onChange(() => this.#scheduleAgentsBroadcast());
-		this.#ctx.sessionManager.onEntryAppended = entry => {
+		const entryListener = (entry: StoredSessionEntry): void => {
 			if (isWireSessionEntry(entry)) this.#broadcast({ t: "entry", entry: shrinkForReplication(entry) });
-			// Model/thinking/title changes land as entries while idle; refresh
-			// guest state promptly (debounce + JSON diff dedupe).
 			this.#scheduleStateBroadcast();
 		};
-		this.#updateStatusSegment();
+		const subscribeEntryAppended = this.#ctx.sessionManager.subscribeEntryAppended;
+		if (typeof subscribeEntryAppended === "function") {
+			this.#entryAppendedUnsubscribe = subscribeEntryAppended.call(this.#ctx.sessionManager, entryListener);
+		} else {
+			const previous = this.#ctx.sessionManager.onEntryAppended;
+			const handler = (entry: StoredSessionEntry): void => {
+				previous?.(entry);
+				entryListener(entry);
+			};
+			this.#ctx.sessionManager.onEntryAppended = handler;
+			this.#entryAppendedUnsubscribe = () => {
+				if (this.#ctx.sessionManager.onEntryAppended === handler) {
+					this.#ctx.sessionManager.onEntryAppended = previous;
+				}
+			};
+		}
+		if (!this.#privateHost) this.#updateStatusSegment();
 	}
 
 	/** Broadcast a goodbye, detach all taps, and close the socket. */
@@ -297,7 +420,8 @@ export class CollabHost {
 	async #teardown(): Promise<void> {
 		if (this.#stopped) return;
 		this.#stopped = true;
-		this.#ctx.sessionManager.onEntryAppended = undefined;
+		this.#entryAppendedUnsubscribe?.();
+		this.#entryAppendedUnsubscribe = undefined;
 		this.#unsubscribe?.();
 		this.#unsubscribe = undefined;
 		for (const unsubscribe of this.#busUnsubscribers) unsubscribe();
@@ -313,30 +437,66 @@ export class CollabHost {
 		for (const pending of this.#pendingUi.values()) pending.settle({ kind: "unavailable" });
 		this.#pendingUi.clear();
 		this.#peers.clear();
+		this.#localPeerAuthority.clear();
 		this.#socket?.close();
 		this.#socket = null;
-		this.#ctx.collabHost = undefined;
-		this.#ctx.statusLine.setCollabStatus(null);
-		this.#ctx.ui.requestRender();
+		if (this.#privateHost) {
+			if (this.#ctx.herdrCollabHost === this) this.#ctx.herdrCollabHost = undefined;
+		} else {
+			if (this.#ctx.collabHost === this) this.#ctx.collabHost = undefined;
+			this.#ctx.statusLine.setCollabStatus(null);
+			this.#ctx.ui.requestRender();
+		}
 	}
 
 	#broadcast(frame: CollabFrame): void {
 		if (this.#stopped || !this.#socket) return;
 		if (this.#ctx.sessionManager.getSessionId() !== this.#sessionId) {
+			if (this.#privateHost) return;
 			void this.stop("session switched");
-			this.#ctx.session.emitNotice("warning", "Collab ended: session switched", "collab");
+			this.#emitCollabNotice("warning", "Collab ended: session switched");
 			return;
 		}
 		this.#socket.send(frame);
 	}
 
-	#handleFrame(frame: CollabFrame, fromPeer: number): void {
+	#emitCollabNotice(level: "info" | "warning", message: string): void {
+		if (this.#privateHost) {
+			logger.debug("private Herdr collab notice", { level, message });
+			return;
+		}
+		this.#ctx.session.emitNotice(level, message, "collab");
+	}
+
+	#notifyTerminated(reason: string): void {
+		try {
+			this.#onTerminated?.(reason);
+		} catch (error) {
+			logger.warn("collab host termination observer failed", { error: String(error) });
+		}
+	}
+	#handleFrame(
+		frame: InboundGuestFrame,
+		fromPeer: number,
+		metadata?: { displayName?: string; displayNameRevision?: number },
+	): void {
+		if (this.#privateHost && this.#ctx.sessionManager.getSessionId() !== this.#sessionId) {
+			if (frame.t === "ui-response") this.#pendingUi.get(frame.reqId)?.settle({ kind: "unavailable" });
+			this.#socket?.send({ t: "error", message: "private collab route is rearming for a session switch" }, fromPeer);
+			return;
+		}
 		switch (frame.t) {
 			case "hello":
 				this.#handleHello(frame.name, frame.proto, frame.writeToken, fromPeer);
 				break;
 			case "prompt":
-				this.#handlePrompt(frame.text, frame.images, fromPeer);
+				this.#handlePrompt(
+					frame.text,
+					frame.images,
+					metadata?.displayName,
+					metadata?.displayNameRevision,
+					fromPeer,
+				);
 				break;
 			case "abort":
 				this.#handleAbort(fromPeer);
@@ -350,8 +510,6 @@ export class CollabHost {
 			case "fetch-transcript":
 				void this.#handleFetchTranscript(frame.reqId, frame.agentId, frame.fromByte, fromPeer);
 				break;
-			default:
-				logger.debug("collab host ignoring unexpected frame", { type: frame.t, fromPeer });
 		}
 	}
 
@@ -377,7 +535,9 @@ export class CollabHost {
 			return;
 		}
 		const cleanName = name.trim().slice(0, 64) || `guest-${fromPeer}`;
-		const canWrite = this.#verifyWriteToken(writeToken);
+		const canWrite = this.#trustedLocalTransport
+			? this.#localPeerAuthority.get(fromPeer) === true
+			: this.#verifyWriteToken(writeToken);
 		this.#peers.set(fromPeer, { name: cleanName, canWrite });
 
 		// Snapshot and send synchronously: no awaits between snapshot, welcome,
@@ -413,11 +573,7 @@ export class CollabHost {
 				socket.send({ t: "ui-request", request: pending.request }, fromPeer);
 			}
 		}
-		this.#ctx.session.emitNotice(
-			"info",
-			`${cleanName} joined the collab session${canWrite ? "" : " (read-only)"}`,
-			"collab",
-		);
+		this.#emitCollabNotice("info", `${cleanName} joined the collab session${canWrite ? "" : " (read-only)"}`);
 		this.#updateStatusSegment();
 		this.#scheduleStateBroadcast();
 	}
@@ -432,6 +588,15 @@ export class CollabHost {
 	 * finalize the replica. An empty snapshot still emits one `final` chunk
 	 * so the guest never blocks on a missing terminator.
 	 */
+	#handleUiResponse(reqId: number, value: CollabUiResponseValue, fromPeer: number): void {
+		const peer = this.#peers.get(fromPeer);
+		if (!peer?.canWrite) {
+			this.#rejectReadOnly("responding to ask", fromPeer);
+			return;
+		}
+		this.#pendingUi.get(reqId)?.settle({ kind: "answered", value });
+	}
+
 	#sendSnapshotChunks(entries: (StoredSessionEntry & WireSessionEntry)[], fromPeer: number): void {
 		const socket = this.#socket;
 		if (!socket) return;
@@ -447,7 +612,7 @@ export class CollabHost {
 				const entry = entries[i];
 				if (!entry) break;
 				const shrunk = shrinkForReplication(entry);
-				const entryBytes = JSON.stringify(shrunk).length;
+				const entryBytes = Buffer.byteLength(JSON.stringify(shrunk));
 				if (batch.length > 0 && batchBytes + entryBytes > SNAPSHOT_CHUNK_BYTES) break;
 				batch.push(shrunk);
 				batchBytes += entryBytes;
@@ -457,25 +622,37 @@ export class CollabHost {
 		}
 	}
 
-	#handleUiResponse(reqId: number, value: CollabUiResponseValue, fromPeer: number): void {
-		const peer = this.#peers.get(fromPeer);
-		if (!peer?.canWrite) {
-			this.#rejectReadOnly("responding to ask", fromPeer);
-			return;
-		}
-		this.#pendingUi.get(reqId)?.settle({ kind: "answered", value });
-	}
-
-	#handlePrompt(text: string, images: ImageContent[] | undefined, fromPeer: number): void {
+	#handlePrompt(
+		text: string,
+		images: ImageContent[] | undefined,
+		displayName: string | undefined,
+		displayNameRevision: number | undefined,
+		fromPeer: number,
+	): void {
 		const peer = this.#peers.get(fromPeer);
 		if (!peer?.canWrite) {
 			this.#rejectReadOnly("prompting", fromPeer);
 			return;
 		}
-		const name = peer.name;
+		if (
+			this.#requiresHerdrAttribution &&
+			(typeof displayName !== "string" ||
+				!isValidHerdrDisplayName(displayName) ||
+				!isValidHerdrDisplayNameRevision(displayNameRevision))
+		) {
+			this.#socket?.send(
+				{ t: "error", message: "trusted local prompt is missing valid attribution or display name revision" },
+				fromPeer,
+			);
+			return;
+		}
+		const name = this.#requiresHerdrAttribution ? displayName : peer.name;
+		const attributedText = this.#requiresHerdrAttribution ? `[${name}] says: ${text}` : text;
 		const content: string | (TextContent | ImageContent)[] =
-			images && images.length > 0 ? [{ type: "text", text }, ...images] : text;
-		const details: CollabPromptDetails = { from: name };
+			images && images.length > 0 ? [{ type: "text", text: attributedText }, ...images] : attributedText;
+		const details: CollabPromptDetails = this.#requiresHerdrAttribution
+			? { from: name, displayNameRevision }
+			: { from: name };
 		if (this.#ctx.session.isStreaming) {
 			this.#ctx.updatePendingMessagesDisplay();
 			this.#ctx.ui.requestRender();
@@ -490,7 +667,7 @@ export class CollabHost {
 					details,
 					attribution: "user",
 				},
-				{ streamingBehavior: "steer", queueChipText: text },
+				{ streamingBehavior: "steer", queueChipText: attributedText },
 			)
 			.catch(err => {
 				logger.warn("collab guest prompt failed", { error: String(err) });
@@ -507,14 +684,40 @@ export class CollabHost {
 		const name = peer.name;
 		void this.#ctx.session
 			.abort({ reason: USER_INTERRUPT_LABEL })
-			.then(() => this.#ctx.session.emitNotice("info", `${name} interrupted`, "collab"))
+			.then(() => this.#emitCollabNotice("info", `${name} interrupted`))
 			.catch(err => logger.warn("collab guest abort failed", { error: String(err) }));
 	}
 
 	#handlePeerLeft(peer: number): void {
 		const name = this.#peers.get(peer)?.name;
 		this.#peers.delete(peer);
-		if (name) this.#ctx.session.emitNotice("info", `${name} left the collab session`, "collab");
+		this.#localPeerAuthority.delete(peer);
+		if (!this.#privateHost && !this.#hasWritablePeers()) {
+			for (const pending of [...this.#pendingUi.values()]) pending.settle({ kind: "unavailable" });
+		}
+		if (name) this.#emitCollabNotice("info", `${name} left the collab session`);
+		this.#updateStatusSegment();
+		this.#scheduleStateBroadcast();
+	}
+
+	#setPeerAuthority(peer: number, canWrite: boolean): void {
+		if (!this.#trustedLocalTransport) return;
+		this.#localPeerAuthority.set(peer, canWrite);
+		const participant = this.#peers.get(peer);
+		if (!participant || participant.canWrite === canWrite) return;
+		participant.canWrite = canWrite;
+		this.#socket?.send({ t: "authority", canWrite }, peer);
+		if (canWrite) {
+			for (const pending of this.#pendingUi.values()) {
+				this.#socket?.send({ t: "ui-request", request: pending.request }, peer);
+			}
+		} else {
+			if (!this.#privateHost && !this.#hasWritablePeers()) {
+				for (const pending of [...this.#pendingUi.values()]) pending.settle({ kind: "unavailable" });
+			} else {
+				for (const reqId of this.#pendingUi.keys()) this.#socket?.send({ t: "ui-request-end", reqId }, peer);
+			}
+		}
 		this.#updateStatusSegment();
 		this.#scheduleStateBroadcast();
 	}
@@ -685,6 +888,7 @@ export class CollabHost {
 	}
 
 	#updateStatusSegment(): void {
+		if (this.#privateHost) return;
 		this.#ctx.statusLine.setCollabStatus({ role: "host", participantCount: this.#peers.size + 1 });
 		this.#ctx.statusLine.invalidate();
 		this.#ctx.ui.requestRender();

@@ -1388,12 +1388,25 @@ export class MCPManager {
 	 */
 	getServerInstructions(): Map<string, string> {
 		const instructions = new Map<string, string>();
-		for (const [name, connection] of this.#connections) {
+		for (const [name, connection] of [...this.#connections].sort(([left], [right]) => left.localeCompare(right))) {
 			if (connection.instructions) {
 				instructions.set(name, connection.instructions);
 			}
 		}
 		return instructions;
+	}
+
+	getServerInstructionSources(): import("./types").MCPServerInstructionSource[] {
+		const sources: import("./types").MCPServerInstructionSource[] = [];
+		for (const [name, connection] of this.#connections) {
+			if (!connection.instructions) continue;
+			sources.push({
+				name,
+				source: connection._source?.path ?? `mcp://${name}`,
+				content: connection.instructions,
+			});
+		}
+		return sources.sort((left, right) => left.name.localeCompare(right.name));
 	}
 
 	/**

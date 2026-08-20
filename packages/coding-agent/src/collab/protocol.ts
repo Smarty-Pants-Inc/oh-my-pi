@@ -41,7 +41,11 @@ export type {
 } from "@oh-my-pi/pi-wire";
 export { COLLAB_PROMPT_MESSAGE_TYPE, COLLAB_PROTO } from "@oh-my-pi/pi-wire";
 export { DEFAULT_RELAY_URL, ENVELOPE_HEADER_LENGTH, ROOM_ID_BYTES };
+/** Maximum serialized OMP-to-Herdr NDJSON record, reserving Herdr-added metadata. */
+export const MAX_LOCAL_BRIDGE_OUTBOUND_RECORD_BYTES = 2 * 1024 * 1024 - 1024;
 
+/** Maximum raw Herdr-to-OMP NDJSON record accepted by the local bridge. */
+export const MAX_LOCAL_BRIDGE_INBOUND_RECORD_BYTES = 2 * 1024 * 1024;
 export type CollabParticipant = Participant;
 export type AgentSnapshot = WireAgentSnapshot;
 
@@ -62,7 +66,6 @@ export type CollabSessionState = SessionState & {
  * that serialize into those shapes.
  */
 export type CollabFrame =
-	// guest -> host (hello/abort/agent-cmd/fetch-transcript/ui-response are taken verbatim from the wire grammar)
 	| Exclude<GuestFrame, { t: "prompt" }>
 	| { t: "prompt"; text: string; images?: ImageContent[] }
 	// host -> guest
@@ -102,6 +105,7 @@ export type CollabFrame =
 	| { t: "ui-request-end"; reqId: number }
 	/** Targeted reply to fetch-transcript; `error` marks a terminal read failure that guests must surface without hot retrying. */
 	| { t: "transcript"; reqId: number; text: string; newSize: number; error?: string }
+	| { t: "authority"; canWrite: boolean }
 	| { t: "bye"; reason: string }
 	| { t: "error"; message: string };
 

@@ -3,6 +3,7 @@
  */
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, expectTypeOf, it, vi } from "bun:test";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Type } from "@oh-my-pi/omptype/typebox";
@@ -11,10 +12,12 @@ import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { ContextReleaseManifest } from "@oh-my-pi/pi-coding-agent/context/manifest";
 import { ExtensionRuntime, loadExtensions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import {
 	EXTENSION_HANDLER_TIMEOUT_MS,
 	ExtensionRunner,
+	emitSessionShutdownEvent,
 	SESSION_SHUTDOWN_HANDLER_TIMEOUT_MS,
 	testSetExtensionHandlerTimeoutMs,
 	testSetSessionShutdownHandlerTimeoutMs,
@@ -92,6 +95,71 @@ describe("ExtensionRunner", () => {
 		};
 	};
 
+	it("reports an unapproved prompt extension without blocking the turn", async () => {
+		fs.writeFileSync(
+			path.join(extensionsDir, "unapproved-prompt.ts"),
+			`export default function(pi) {
+				pi.on("before_agent_start", () => ({ message: "injected", systemPrompt: ["replacement"] }));
+			}`,
+		);
+		const result = await loadTestExtensions();
+		const runner = new ExtensionRunner(
+			result.extensions,
+			result.runtime,
+			tempDir.path(),
+			sessionManager,
+			modelRegistry,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			{ candidates: [] } as unknown as ContextReleaseManifest,
+		);
+		const errors: ExtensionError[] = [];
+		runner.onError(error => errors.push(error));
+
+		expect(await runner.emitBeforeAgentStart("ship", undefined, ["approved"])).toBeUndefined();
+		expect(await runner.emitBeforeAgentStart("ship again", undefined, ["approved"])).toBeUndefined();
+		expect(errors).toHaveLength(1);
+		expect(errors[0]?.event).toBe("before_agent_start");
+		expect(errors[0]?.error).toContain("PROMPT_POLICY_REVIEW_REQUIRED: extension source is not approved");
+	});
+
+	it("skips multiple unapproved system prompt builders without blocking startup", async () => {
+		for (const name of ["builder-a.ts", "builder-b.ts"]) {
+			fs.writeFileSync(
+				path.join(extensionsDir, name),
+				`export default function(pi) {
+					pi.registerSystemPromptBuilder(() => ({ systemPrompt: ["replacement"] }));
+				}`,
+			);
+		}
+		const result = await loadTestExtensions();
+		const runner = new ExtensionRunner(
+			result.extensions,
+			result.runtime,
+			tempDir.path(),
+			sessionManager,
+			modelRegistry,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			{ candidates: [] } as unknown as ContextReleaseManifest,
+		);
+		const errors: ExtensionError[] = [];
+		runner.onError(error => errors.push(error));
+
+		expect(await runner.getSystemPromptBuilder()).toBeUndefined();
+		expect(errors).toHaveLength(2);
+		expect(errors.every(error => error.event === "system_prompt_builder")).toBe(true);
+		expect(errors.every(error => error.error.includes("PROMPT_POLICY_REVIEW_REQUIRED"))).toBe(true);
+	});
+
 	it("reflects SessionManager.moveTo() changes instead of the constructor-time snapshot (/move)", async () => {
 		const dirA = tempDir.join("dirA");
 		const dirB = tempDir.join("dirB");
@@ -121,7 +189,7 @@ describe("ExtensionRunner", () => {
 			modelRegistry,
 		);
 		const actions = {
-			sendMessage: () => {},
+			sendMessage: () => Promise.resolve({ status: "accepted" as const, delivery: "plain_append" as const }),
 			sendUserMessage: () => {},
 			appendEntry: () => {},
 			setLabel: () => {},
@@ -138,6 +206,7 @@ describe("ExtensionRunner", () => {
 		const contextActions = {
 			getModel: () => undefined,
 			isIdle: () => true,
+			isCompacting: () => false,
 			abort: () => {},
 			hasPendingMessages: () => false,
 			shutdown: () => {},
@@ -432,6 +501,9 @@ describe("ExtensionRunner", () => {
 			);
 
 			const errors: Array<{ extensionPath: string; event: string; error: string }> = [];
+			runner.onError(() => {
+				throw new Error("error listener boom");
+			});
 			runner.onError(err => {
 				errors.push(err);
 			});
@@ -581,7 +653,7 @@ describe("ExtensionRunner", () => {
 			);
 			runner.initialize(
 				{
-					sendMessage: () => {},
+					sendMessage: () => Promise.resolve({ status: "accepted", delivery: "plain_append" }),
 					sendUserMessage: () => {},
 					appendEntry: () => {},
 					setLabel: () => {},
@@ -598,6 +670,7 @@ describe("ExtensionRunner", () => {
 				{
 					getModel: () => primaryModel,
 					isIdle: () => true,
+					isCompacting: () => false,
 					abort: () => {},
 					hasPendingMessages: () => false,
 					shutdown: () => {},
@@ -796,7 +869,7 @@ describe("ExtensionRunner", () => {
 			);
 			runner.initialize(
 				{
-					sendMessage: () => {},
+					sendMessage: async () => ({ status: "accepted", delivery: "plain_append" }),
 					sendUserMessage: () => {},
 					appendEntry: () => {},
 					setLabel: () => {},
@@ -813,6 +886,7 @@ describe("ExtensionRunner", () => {
 				{
 					getModel: () => primaryModel,
 					isIdle: () => true,
+					isCompacting: () => false,
 					abort: () => {},
 					hasPendingMessages: () => false,
 					shutdown: () => {},
@@ -1017,7 +1091,7 @@ describe("ExtensionRunner", () => {
 			const controller = new AbortController();
 			runner.initialize(
 				{
-					sendMessage: () => {},
+					sendMessage: () => Promise.resolve({ status: "accepted", delivery: "plain_append" }),
 					sendUserMessage: () => {},
 					appendEntry: () => {},
 					setLabel: () => {},
@@ -1034,6 +1108,7 @@ describe("ExtensionRunner", () => {
 				{
 					getModel: () => undefined,
 					isIdle: () => true,
+					isCompacting: () => false,
 					abort: () => controller.abort(),
 					hasPendingMessages: () => false,
 					shutdown: () => {},
@@ -1319,7 +1394,7 @@ describe("ExtensionRunner", () => {
 		const initializeRunner = (runner: ExtensionRunner, uiContext: ExtensionUIContext): void => {
 			runner.initialize(
 				{
-					sendMessage: () => {},
+					sendMessage: async () => ({ status: "accepted", delivery: "plain_append" }),
 					sendUserMessage: () => {},
 					appendEntry: () => {},
 					setLabel: () => {},
@@ -1336,6 +1411,7 @@ describe("ExtensionRunner", () => {
 				{
 					getModel: () => undefined,
 					isIdle: () => true,
+					isCompacting: () => false,
 					abort: () => {},
 					hasPendingMessages: () => false,
 					shutdown: () => {},
@@ -1977,7 +2053,7 @@ describe("ExtensionRunner", () => {
 			);
 			runner.initialize(
 				{
-					sendMessage: () => {},
+					sendMessage: () => Promise.resolve({ status: "accepted", delivery: "plain_append" }),
 					sendUserMessage: () => {},
 					appendEntry: () => {},
 					setLabel: () => {},
@@ -1994,6 +2070,7 @@ describe("ExtensionRunner", () => {
 				{
 					getModel: () => undefined,
 					isIdle: () => true,
+					isCompacting: () => false,
 					abort: () => {},
 					hasPendingMessages: () => false,
 					shutdown: () => {},
@@ -2060,7 +2137,7 @@ describe("ExtensionRunner", () => {
 			});
 			runner.initialize(
 				{
-					sendMessage: () => {},
+					sendMessage: () => Promise.resolve({ status: "accepted", delivery: "plain_append" }),
 					sendUserMessage: () => {},
 					appendEntry: (_customType, data) => {
 						snapshots.push(data);
@@ -2083,6 +2160,7 @@ describe("ExtensionRunner", () => {
 				{
 					getModel: () => undefined,
 					isIdle: () => true,
+					isCompacting: () => false,
 					abort: () => {},
 					hasPendingMessages: () => false,
 					shutdown: () => {},
@@ -2131,7 +2209,7 @@ describe("ExtensionRunner", () => {
 			);
 			runner.initialize(
 				{
-					sendMessage: () => {},
+					sendMessage: () => Promise.resolve({ status: "accepted", delivery: "plain_append" }),
 					sendUserMessage: () => {},
 					appendEntry: () => {},
 					setLabel: () => {},
@@ -2150,6 +2228,7 @@ describe("ExtensionRunner", () => {
 				{
 					getModel: () => undefined,
 					isIdle: () => true,
+					isCompacting: () => false,
 					abort: () => {},
 					hasPendingMessages: () => false,
 					shutdown: () => {},
@@ -2183,13 +2262,10 @@ describe("ExtensionRunner", () => {
 	});
 
 	describe("tool approval lifecycle", () => {
-		const initializeRunner = (
-			runner: ExtensionRunner,
-			select: (title: string, options: string[]) => Promise<string | undefined>,
-		) => {
+		const initializeRunner = (runner: ExtensionRunner, select: ExtensionUIContext["select"]) => {
 			runner.initialize(
 				{
-					sendMessage: () => {},
+					sendMessage: () => Promise.resolve({ status: "accepted", delivery: "plain_append" }),
 					sendUserMessage: () => {},
 					appendEntry: () => {},
 					setLabel: () => {},
@@ -2206,6 +2282,7 @@ describe("ExtensionRunner", () => {
 				{
 					getModel: () => undefined,
 					isIdle: () => true,
+					isCompacting: () => false,
 					abort: () => {},
 					hasPendingMessages: () => false,
 					shutdown: () => {},
@@ -2300,11 +2377,67 @@ describe("ExtensionRunner", () => {
 				{ type: "ui_select" },
 				{ type: "tool_approval_resolved", approved: true },
 			]);
-			expect(select).toHaveBeenCalledWith(expect.stringContaining("Allow tool: dangerous_tool"), [
-				"Approve",
-				"Deny",
-			]);
+			expect(select).toHaveBeenCalledWith(
+				expect.stringContaining("Allow tool: dangerous_tool"),
+				["Approve", "Deny"],
+				{ signal: undefined },
+			);
 			delete globalState.__approvalEvents;
+		});
+
+		it("does not publish a requested approval when the prompt cannot be constructed", async () => {
+			const events: string[] = [];
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_approval_requested", async () => {
+						globalThis.__unconstructableApprovalEvents.push("requested");
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "unconstructable-approval.ts"), extCode);
+			const globalState = globalThis as typeof globalThis & { __unconstructableApprovalEvents?: string[] };
+			globalState.__unconstructableApprovalEvents = events;
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const select = vi.fn(async () => "Approve");
+			initializeRunner(runner, select);
+			const tool = {
+				...approvalTool,
+				formatApprovalDetails: () => {
+					throw new Error("approval details unavailable");
+				},
+			} as AgentTool;
+
+			await expect(
+				(new ExtensionToolWrapper(tool, runner) as ExtensionToolWrapper<any>).execute(
+					"call-unconstructable",
+					{},
+					undefined,
+					undefined,
+					{
+						sessionManager,
+						modelRegistry,
+						model: undefined,
+						isIdle: () => true,
+						hasQueuedMessages: () => false,
+						abort: () => {},
+						settings: {
+							get: (key: string) => (key === "tools.approvalMode" ? "always-ask" : {}),
+						} as never,
+					},
+				),
+			).rejects.toThrow("approval details unavailable");
+
+			expect(events).toEqual([]);
+			expect(select).not.toHaveBeenCalled();
+			delete globalState.__unconstructableApprovalEvents;
 		});
 
 		it("does not present approval before canonical or wire-aliased tool previews are ready", async () => {
@@ -2415,6 +2548,223 @@ describe("ExtensionRunner", () => {
 				{ type: "tool_approval_resolved", approved: false, reason: "denied by user" },
 			]);
 			delete globalState.__deniedApprovalEvents;
+		});
+
+		it("dismisses an approval selector and denies tool execution when the active call aborts", async () => {
+			const events: Array<{ approved?: boolean; reason?: string }> = [];
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_approval_resolved", async (event) => {
+						globalThis.__abortedApprovalEvents.push({ approved: event.approved, reason: event.reason });
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "aborted-approval-events.ts"), extCode);
+			const globalState = globalThis as typeof globalThis & { __abortedApprovalEvents?: typeof events };
+			globalState.__abortedApprovalEvents = events;
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const selectorPresented = Promise.withResolvers<void>();
+			const selectorDismissed = Promise.withResolvers<void>();
+			let selectorVisible = false;
+			const select: ExtensionUIContext["select"] = (_title, _options, dialogOptions) => {
+				const selection = Promise.withResolvers<string | undefined>();
+				selectorVisible = true;
+				selectorPresented.resolve();
+				const dismiss = () => {
+					selectorVisible = false;
+					selectorDismissed.resolve();
+					selection.resolve(undefined);
+				};
+				if (dialogOptions?.signal?.aborted) {
+					dismiss();
+				} else {
+					dialogOptions?.signal?.addEventListener("abort", dismiss, { once: true });
+				}
+				return selection.promise;
+			};
+			initializeRunner(runner, select);
+
+			let executed = false;
+			const tool = {
+				...approvalTool,
+				execute: async () => {
+					executed = true;
+					return { content: [{ type: "text" as const, text: "ok" }] };
+				},
+			};
+			const wrapper = new ExtensionToolWrapper(tool, runner);
+			const abortController = new AbortController();
+			const execution = (wrapper as ExtensionToolWrapper<any>).execute(
+				"call-aborted",
+				{},
+				abortController.signal,
+				undefined,
+				{
+					sessionManager,
+					modelRegistry,
+					model: undefined,
+					isIdle: () => true,
+					hasQueuedMessages: () => false,
+					abort: () => {},
+					settings: { get: (key: string) => (key === "tools.approvalMode" ? "always-ask" : {}) } as never,
+				},
+			);
+
+			await selectorPresented.promise;
+			expect(selectorVisible).toBe(true);
+			abortController.abort();
+			await selectorDismissed.promise;
+			await expect(execution).rejects.toMatchObject({ name: "AbortError" });
+
+			expect(selectorVisible).toBe(false);
+			expect(executed).toBe(false);
+			expect(events).toEqual([{ approved: false, reason: "cancelled" }]);
+			delete globalState.__abortedApprovalEvents;
+		});
+
+		it("cancels an uncooperative selector and ignores its late failure", async () => {
+			const events: Array<{ approved?: boolean; reason?: string }> = [];
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_approval_resolved", async (event) => {
+						globalThis.__uncooperativeApprovalEvents.push({ approved: event.approved, reason: event.reason });
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "uncooperative-approval-events.ts"), extCode);
+			const globalState = globalThis as typeof globalThis & { __uncooperativeApprovalEvents?: typeof events };
+			globalState.__uncooperativeApprovalEvents = events;
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const selectorPresented = Promise.withResolvers<void>();
+			const lateSelection = Promise.withResolvers<string | undefined>();
+			initializeRunner(runner, () => {
+				selectorPresented.resolve();
+				return lateSelection.promise;
+			});
+
+			let executed = false;
+			const wrapper = new ExtensionToolWrapper(
+				{
+					...approvalTool,
+					execute: async () => {
+						executed = true;
+						return { content: [{ type: "text" as const, text: "ok" }] };
+					},
+				},
+				runner,
+			);
+			const abortController = new AbortController();
+			const execution = (wrapper as ExtensionToolWrapper<any>).execute(
+				"call-uncooperative-selector",
+				{},
+				abortController.signal,
+				undefined,
+				{
+					sessionManager,
+					modelRegistry,
+					model: undefined,
+					isIdle: () => true,
+					hasQueuedMessages: () => false,
+					abort: () => {},
+					settings: { get: (key: string) => (key === "tools.approvalMode" ? "always-ask" : {}) } as never,
+				},
+			);
+
+			await selectorPresented.promise;
+			abortController.abort(new DOMException("approval stopped", "AbortError"));
+			await expect(execution).rejects.toMatchObject({ name: "AbortError", message: "approval stopped" });
+			lateSelection.reject(new Error("late selector failure"));
+			await Promise.resolve();
+
+			expect(executed).toBe(false);
+			expect(events).toEqual([{ approved: false, reason: "cancelled" }]);
+			delete globalState.__uncooperativeApprovalEvents;
+		});
+
+		it("cancels a non-cooperative approval hook before it can reach the selector", async () => {
+			const events: Array<{ approved?: boolean; reason?: string }> = [];
+			const hookPresented = Promise.withResolvers<void>();
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_approval_requested", async (_event, ctx) => {
+						globalThis.__approvalHookPresented.resolve();
+						await ctx.ui.select("Hook approval", ["Continue"]);
+					});
+					pi.on("tool_approval_resolved", async (event) => {
+						globalThis.__uncooperativeApprovalHookEvents.push({ approved: event.approved, reason: event.reason });
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "uncooperative-approval-hook.ts"), extCode);
+			const globalState = globalThis as typeof globalThis & {
+				__approvalHookPresented?: typeof hookPresented;
+				__uncooperativeApprovalHookEvents?: typeof events;
+			};
+			globalState.__approvalHookPresented = hookPresented;
+			globalState.__uncooperativeApprovalHookEvents = events;
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			initializeRunner(runner, () => Promise.withResolvers<string | undefined>().promise);
+
+			let executed = false;
+			const wrapper = new ExtensionToolWrapper(
+				{
+					...approvalTool,
+					execute: async () => {
+						executed = true;
+						return { content: [{ type: "text" as const, text: "ok" }] };
+					},
+				},
+				runner,
+			);
+			const abortController = new AbortController();
+			const execution = (wrapper as ExtensionToolWrapper<any>).execute(
+				"call-uncooperative-hook",
+				{},
+				abortController.signal,
+				undefined,
+				{
+					sessionManager,
+					modelRegistry,
+					model: undefined,
+					isIdle: () => true,
+					hasQueuedMessages: () => false,
+					abort: () => {},
+					settings: { get: (key: string) => (key === "tools.approvalMode" ? "always-ask" : {}) } as never,
+				},
+			);
+
+			await hookPresented.promise;
+			abortController.abort();
+			await expect(execution).rejects.toMatchObject({ name: "AbortError" });
+
+			expect(executed).toBe(false);
+			expect(events).toEqual([{ approved: false, reason: "cancelled" }]);
+			delete globalState.__approvalHookPresented;
+			delete globalState.__uncooperativeApprovalHookEvents;
 		});
 		it("emits resolved false when the approval prompt throws", async () => {
 			const events: Array<{ type: string; approved?: boolean; reason?: string }> = [];
@@ -2810,7 +3160,7 @@ describe("ExtensionRunner", () => {
 		) => {
 			runner.initialize(
 				{
-					sendMessage: () => {},
+					sendMessage: () => Promise.resolve({ status: "accepted", delivery: "plain_append" }),
 					sendUserMessage: () => {},
 					appendEntry: () => {},
 					setLabel: () => {},
@@ -2827,6 +3177,7 @@ describe("ExtensionRunner", () => {
 				{
 					getModel: () => undefined,
 					isIdle: () => true,
+					isCompacting: () => false,
 					abort: () => {},
 					hasPendingMessages: () => false,
 					shutdown: () => {},
@@ -3398,7 +3749,7 @@ describe("ExtensionRunner", () => {
 
 			runner.initialize(
 				{
-					sendMessage: () => {},
+					sendMessage: () => Promise.resolve({ status: "accepted", delivery: "plain_append" }),
 					sendUserMessage: () => {},
 					appendEntry: () => {},
 					setLabel: () => {},
@@ -3415,6 +3766,7 @@ describe("ExtensionRunner", () => {
 				{
 					getModel: () => undefined,
 					isIdle: () => true,
+					isCompacting: () => false,
 					abort: () => {},
 					hasPendingMessages: () => false,
 					shutdown: () => {},
@@ -3470,7 +3822,7 @@ describe("ExtensionRunner", () => {
 			);
 			runner.initialize(
 				{
-					sendMessage: () => {},
+					sendMessage: () => Promise.resolve({ status: "accepted", delivery: "plain_append" }),
 					sendUserMessage: () => {},
 					appendEntry: () => {},
 					setLabel: () => {},
@@ -3487,6 +3839,7 @@ describe("ExtensionRunner", () => {
 				{
 					getModel: () => undefined,
 					isIdle: () => true,
+					isCompacting: () => false,
 					abort: () => {},
 					hasPendingMessages: () => false,
 					shutdown: () => {},
@@ -3560,7 +3913,7 @@ describe("ExtensionRunner", () => {
 
 			runner.initialize(
 				{
-					sendMessage: () => {},
+					sendMessage: () => Promise.resolve({ status: "accepted", delivery: "plain_append" }),
 					sendUserMessage: () => {},
 					appendEntry: () => {},
 					setLabel: () => {},
@@ -3577,6 +3930,7 @@ describe("ExtensionRunner", () => {
 				{
 					getModel: () => undefined,
 					isIdle: () => true,
+					isCompacting: () => false,
 					abort: () => {},
 					hasPendingMessages: () => false,
 					shutdown: () => {},
@@ -3715,6 +4069,57 @@ describe("ExtensionRunner", () => {
 				vi.useRealTimers();
 			}
 		});
+
+		it("disposes file fallbacks even without shutdown handlers", async () => {
+			const runner = new ExtensionRunner([], new ExtensionRuntime(), tempDir.path(), sessionManager, modelRegistry);
+			const disposeFileFallbacks = vi.spyOn(runner, "disposeFileFallbacks");
+
+			await expect(emitSessionShutdownEvent(runner)).resolves.toBe(false);
+
+			expect(disposeFileFallbacks).toHaveBeenCalledTimes(1);
+		});
+
+		it("retains only timers owned by a failing shutdown extension", async () => {
+			vi.useFakeTimers();
+			try {
+				let retainedTicks = 0;
+				let unrelatedTicks = 0;
+				fs.writeFileSync(
+					path.join(extensionsDir, "failed-shutdown.ts"),
+					`export default function(pi) { pi.on("session_start", (_event, ctx) => { ctx.setInterval(() => globalThis.__retainedTicks__(), 100); }); pi.on("session_shutdown", () => { throw new Error("release failed"); }); }`,
+				);
+				fs.writeFileSync(
+					path.join(extensionsDir, "successful-shutdown.ts"),
+					`export default function(pi) { pi.on("session_start", (_event, ctx) => { ctx.setInterval(() => globalThis.__unrelatedTicks__(), 100); }); pi.on("session_shutdown", () => {}); }`,
+				);
+				Object.assign(globalThis, {
+					__retainedTicks__: () => {
+						retainedTicks++;
+					},
+					__unrelatedTicks__: () => {
+						unrelatedTicks++;
+					},
+				});
+				const result = await loadTestExtensions();
+				const runner = new ExtensionRunner(
+					result.extensions,
+					result.runtime,
+					tempDir.path(),
+					sessionManager,
+					modelRegistry,
+				);
+				await runner.emit({ type: "session_start" });
+
+				await emitSessionShutdownEvent(runner);
+				vi.advanceTimersByTime(100);
+				expect(retainedTicks).toBe(1);
+				expect(unrelatedTicks).toBe(0);
+			} finally {
+				delete (globalThis as Record<string, unknown>).__retainedTicks__;
+				delete (globalThis as Record<string, unknown>).__unrelatedTicks__;
+				vi.useRealTimers();
+			}
+		});
 	});
 
 	describe("invokeTool same-tool delegation", () => {
@@ -3804,6 +4209,286 @@ describe("ExtensionRunner", () => {
 		});
 	});
 
+	describe("public session mutation fences", () => {
+		it("registers fences in extension and registration order before the Fresh host fence", async () => {
+			const orderKey = `__sessionMutationFenceOrder${crypto.randomUUID()}`;
+			const publicA = tempDir.join("public-a.ts");
+			const publicB = tempDir.join("public-b.ts");
+			fs.writeFileSync(
+				publicA,
+				`export default function (pi) {
+					pi.registerSessionMutationFence(() => globalThis[${JSON.stringify(orderKey)}].push("public-a:first"));
+					pi.registerSessionMutationFence(() => globalThis[${JSON.stringify(orderKey)}].push("public-a:second"));
+				}`,
+			);
+			fs.writeFileSync(
+				publicB,
+				`export default function (pi) {
+					pi.registerSessionMutationFence(() => globalThis[${JSON.stringify(orderKey)}].push("public-b"));
+				}`,
+			);
+			const order: string[] = [];
+			Reflect.set(globalThis, orderKey, order);
+			try {
+				const result = await loadTestExtensions([publicA, publicB]);
+				expect(result.errors).toEqual([]);
+				expect(result.extensions.map(extension => extension.sessionMutationFences?.length)).toEqual([2, 1]);
+				const host: Extension = {
+					path: "<host:fresh-omp-companion>",
+					resolvedPath: "<host:fresh-omp-companion>",
+					handlers: new Map(),
+					sessionMutationFences: [],
+					tools: new Map(),
+					assistantThinkingRenderers: [],
+					fileWriteFallbackHandlers: [],
+					fileDeleteFallbackHandlers: [],
+					messageRenderers: new Map(),
+					commands: new Map(),
+					flags: new Map(),
+					shortcuts: new Map(),
+				};
+				const runner = new ExtensionRunner(
+					result.extensions,
+					result.runtime,
+					tempDir.path(),
+					sessionManager,
+					modelRegistry,
+					undefined,
+					undefined,
+					undefined,
+					undefined,
+					{ extension: host, beforeSessionMutation: () => void order.push("fresh") },
+				);
+
+				await runner.emitBeforeSessionMutation({ type: "session_switch" });
+
+				expect(order).toEqual(["public-a:first", "public-a:second", "public-b", "fresh"]);
+			} finally {
+				Reflect.deleteProperty(globalThis, orderKey);
+			}
+		});
+
+		it("propagates public fence errors and timeouts to abort the mutation", async () => {
+			const throwingPath = tempDir.join("throwing-fence.ts");
+			fs.writeFileSync(
+				throwingPath,
+				`export default function (pi) { pi.registerSessionMutationFence(() => { throw new Error("fence rejected"); }); }`,
+			);
+			const throwing = await loadTestExtensions([throwingPath]);
+			const throwingRunner = new ExtensionRunner(
+				throwing.extensions,
+				throwing.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			await expect(throwingRunner.emitBeforeSessionMutation({ type: "session_branch" })).rejects.toThrow(
+				"fence rejected",
+			);
+
+			const timeoutPath = tempDir.join("timeout-fence.ts");
+			fs.writeFileSync(
+				timeoutPath,
+				`export default function (pi) { pi.registerSessionMutationFence(() => new Promise(() => {})); }`,
+			);
+			const timingOut = await loadTestExtensions([timeoutPath]);
+			const timeoutRunner = new ExtensionRunner(
+				timingOut.extensions,
+				timingOut.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			testSetExtensionHandlerTimeoutMs(10);
+			await expect(timeoutRunner.emitBeforeSessionMutation({ type: "session_tree" })).rejects.toThrow(
+				"handler timed out after 10ms",
+			);
+		});
+	});
+
+	describe("host-internal bindings", () => {
+		it("runs first, stays private, contains ordinary host faults, and propagates ack failure", async () => {
+			const hostACode = `
+				export default function(pi) {
+					const { Type } = pi.typebox;
+					pi.registerTool({
+						name: "host_only_tool",
+						label: "host only",
+						description: "must remain internal",
+						parameters: Type.Object({}),
+						execute: async () => ({ content: [{ type: "text", text: "host" }], details: {} }),
+					});
+					pi.registerFlag("--host-only", { type: "boolean" });
+					pi.registerCommand("host-only", { handler: async () => {} });
+					pi.on("session_ready", (_event, ctx) => {
+						globalThis.__hostBindingOrder.push(\`host-a:\${ctx.isCompacting()}\`);
+						globalThis.__ordinaryHostContext = ctx;
+					});
+				}
+			`;
+			const publicCode = `
+				export default function(pi) {
+					const { Type } = pi.typebox;
+					pi.registerTool({
+						name: "public_tool",
+						label: "public",
+						description: "public tool",
+						parameters: Type.Object({}),
+						execute: async () => ({ content: [{ type: "text", text: "public" }], details: {} }),
+					});
+					pi.registerFlag("--public-only", { type: "boolean" });
+					pi.registerCommand("public-only", { handler: async () => {} });
+					pi.on("session_ready", async () => {
+						globalThis.__hostBindingOrder.push("public:start");
+						globalThis.__hostBindingCompacting = true;
+						await Promise.resolve();
+						globalThis.__hostBindingOrder.push("public:end");
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "host-a.ts"), hostACode);
+			fs.writeFileSync(path.join(extensionsDir, "public.ts"), publicCode);
+
+			const order: string[] = [];
+			const globalState = globalThis as typeof globalThis & {
+				__hostBindingOrder?: string[];
+				__hostBindingCompacting?: boolean;
+				__ordinaryHostContext?: unknown;
+			};
+			globalState.__hostBindingOrder = order;
+			globalState.__hostBindingCompacting = false;
+
+			const result = await loadTestExtensions();
+			const hostA = result.extensions.find(extension => extension.path.endsWith("host-a.ts"));
+			const publicExtension = result.extensions.find(extension => extension.path.endsWith("public.ts"));
+			if (!hostA || !publicExtension) throw new Error("Expected host and public binding fixtures to load");
+
+			const firstAfterContexts: unknown[] = [];
+			const acknowledgementFailure = new Error("snapshot acknowledgement failed");
+			Object.defineProperty(acknowledgementFailure, Symbol.for("oh-my-pi.fresh-omp.snapshot-ack-failure"), {
+				value: true,
+			});
+			const runner = new ExtensionRunner(
+				[publicExtension],
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				{
+					extension: hostA,
+					afterDispatch: (event, ctx) => {
+						firstAfterContexts.push(ctx);
+						order.push(`after-a:${ctx.isCompacting()}`);
+						if (event.type === "session_tree") throw acknowledgementFailure;
+						throw new Error("first host completion failed");
+					},
+				},
+			);
+			runner.initialize(
+				{
+					sendMessage: () => Promise.resolve({ status: "accepted", delivery: "plain_append" }),
+					sendUserMessage: () => {},
+					appendEntry: () => {},
+					setLabel: () => {},
+					getActiveTools: () => [],
+					getAllTools: () => [],
+					setActiveTools: async () => {},
+					getCommands: () => [],
+					setModel: async () => false,
+					getThinkingLevel: () => undefined,
+					setThinkingLevel: () => {},
+					getSessionName: () => undefined,
+					setSessionName: async () => {},
+				},
+				{
+					getModel: () => undefined,
+					isIdle: () => true,
+					isCompacting: () => globalState.__hostBindingCompacting === true,
+					abort: () => {},
+					hasPendingMessages: () => false,
+					shutdown: () => {},
+					getContextUsage: () => undefined,
+					compact: async () => {},
+					getSystemPrompt: () => [],
+				},
+			);
+			const errors: ExtensionError[] = [];
+			runner.onError(error => errors.push(error));
+
+			await expect(
+				runner.emitWithHostCompletion({ type: "session_ready" }, async () => {
+					order.push("finalizer:start");
+					await Promise.resolve();
+					order.push("finalizer:end");
+				}),
+			).resolves.toBeUndefined();
+			await expect(runner.emitWithHostCompletion({ type: "session_rollback" })).resolves.toBeUndefined();
+			const finalizerFailure = new Error("lifecycle finalizer failed");
+			await expect(
+				runner.emitWithHostCompletion({ type: "session_rollback" }, () => {
+					order.push("finalizer:reject");
+					throw finalizerFailure;
+				}),
+			).rejects.toBe(finalizerFailure);
+			const activateAfterAcknowledgement = vi.fn(() => {
+				order.push("ack:activate");
+			});
+			await expect(
+				runner.emitWithHostCompletion({ type: "session_tree", newLeafId: null, oldLeafId: null }, () => {
+					order.push("ack:prepare");
+					return activateAfterAcknowledgement;
+				}),
+			).rejects.toBe(acknowledgementFailure);
+			expect(activateAfterAcknowledgement).not.toHaveBeenCalled();
+
+			expect(order).toEqual([
+				"host-a:false",
+				"public:start",
+				"public:end",
+				"finalizer:start",
+				"finalizer:end",
+				"after-a:true",
+				"after-a:true",
+				"finalizer:reject",
+				"ack:prepare",
+				"after-a:true",
+			]);
+			expect(firstAfterContexts).toHaveLength(3);
+			expect(firstAfterContexts[0]).not.toBe(globalState.__ordinaryHostContext);
+			expect(firstAfterContexts[1]).not.toBe(firstAfterContexts[0]);
+			expect(firstAfterContexts[2]).not.toBe(firstAfterContexts[1]);
+			expect(errors).toEqual([
+				expect.objectContaining({
+					extensionPath: hostA.path,
+					event: "session_ready",
+					error: "first host completion failed",
+				}),
+				expect.objectContaining({
+					extensionPath: hostA.path,
+					event: "session_rollback",
+					error: "first host completion failed",
+				}),
+				expect.objectContaining({
+					extensionPath: hostA.path,
+					event: "session_tree",
+					error: "snapshot acknowledgement failed",
+				}),
+			]);
+			expect(runner.getExtensionPaths()).toEqual([publicExtension.path]);
+			expect(runner.getAllRegisteredTools().map(tool => tool.definition.name)).toEqual(["public_tool"]);
+			expect([...runner.getFlags().keys()]).toEqual(["--public-only"]);
+			expect(runner.getRegisteredCommands().map(command => command.name)).toEqual(["public-only"]);
+
+			delete globalState.__hostBindingOrder;
+			delete globalState.__hostBindingCompacting;
+			delete globalState.__ordinaryHostContext;
+		});
+	});
+
 	describe("input attachment transforms", () => {
 		const inputRunner = (handler: (event: InputEvent) => InputEventResult): ExtensionRunner => {
 			const extensionPath = path.join(extensionsDir, "input-transform.ts");
@@ -3811,6 +4496,7 @@ describe("ExtensionRunner", () => {
 				path: extensionPath,
 				resolvedPath: extensionPath,
 				handlers: new Map([["input", [async (...args: unknown[]) => handler(args[0] as InputEvent)]]]),
+				sessionMutationFences: [],
 				tools: new Map(),
 				assistantThinkingRenderers: [],
 				fileWriteFallbackHandlers: [],

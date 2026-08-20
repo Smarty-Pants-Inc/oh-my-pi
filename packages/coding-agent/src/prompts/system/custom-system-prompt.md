@@ -9,13 +9,11 @@
 <project>
 {{#if contextFiles.length}}
 ## Context
-<instructions>
 {{#list contextFiles join="\n"}}
-<file path="{{path}}">
+{{#if path}}<external_instruction path="{{path}}">{{else}}<external_instruction>{{/if}}
 {{content}}
-</file>
+</external_instruction>
 {{/list}}
-</instructions>
 {{/if}}
 {{#if git.isRepo}}
 ## Version Control
@@ -29,33 +27,24 @@ Main branch: {{git.mainBranch}}
 </project>
 {{/ifAny}}
 {{#if skills.length}}
-Skills are specialized knowledge. Scan descriptions for your task domain.
-If a skill applies, you MUST read `skill://<name>` before proceeding.
-<skills>
+<available_skills>
 {{#list skills join="\n"}}
-<skill name="{{name}}">
-{{description}}
-</skill>
+- {{name}}: {{description}}
 {{/list}}
-</skills>
+</available_skills>
 {{/if}}
 {{#if alwaysApplyRules.length}}
 {{#each alwaysApplyRules}}
+<external_instruction path="{{path}}">
 {{content}}
+</external_instruction>
 {{/each}}
 {{/if}}
 {{#if rules.length}}
-Rules are local constraints. You MUST read `rule://<name>` when working in that domain.
-<rules>
+Available scoped instruction sources:
 {{#list rules join="\n"}}
-<rule name="{{name}}">
-{{description}}
-{{#if globs.length}}
-{{#list globs join="\n"}}<glob>{{this}}</glob>{{/list}}
-{{/if}}
-</rule>
+- {{name}} ({{#list globs join=", "}}{{this}}{{/list}}): {{description}}
 {{/list}}
-</rules>
 {{/if}}
 {{#if secretsEnabled}}
 <redacted-content>

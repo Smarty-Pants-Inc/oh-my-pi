@@ -2,6 +2,7 @@ import {
 	IndexedSessionStorage,
 	type SessionStorageBackend,
 	type SessionStorageIndexEntry,
+	type SessionStorageMove,
 } from "./indexed-session-storage";
 import type { SessionTitleUpdate } from "./session-title-slot";
 
@@ -12,6 +13,11 @@ import type { SessionTitleUpdate } from "./session-title-slot";
  */
 export type SqlSessionStorageAdapter = "postgres" | "mysql" | "sqlite";
 
+/** Minimal query executor shared by the root client and transaction scopes. */
+export interface SqlSessionStorageExecutor {
+	unsafe(query: string, values?: unknown[]): Promise<unknown[]>;
+}
+
 /**
  * Minimal subset of the `Bun.SQL` instance surface used by
  * {@link SqlSessionStorage}. Bun's SQL client exposes a tagged-template API too,
@@ -19,8 +25,7 @@ export type SqlSessionStorageAdapter = "postgres" | "mysql" | "sqlite";
  * the table identifier is validated and then inlined while values remain bound
  * parameters.
  */
-export interface SqlSessionStorageClient {
-	unsafe(query: string, values?: unknown[]): Promise<unknown[]>;
+export interface SqlSessionStorageClient extends SqlSessionStorageExecutor {
 	/**
 	 * `Bun.SQL` exposes the parsed connection options here. We only consult
 	 * `adapter` to pick the dialect; the field is typed as
@@ -28,6 +33,8 @@ export interface SqlSessionStorageClient {
 	 * without casting (it reports `string | undefined` across adapters).
 	 */
 	options: { adapter?: string; [key: string]: unknown };
+	/** Bun.SQL transaction entrypoint, narrowed at runtime before use. */
+	begin?: unknown;
 	end?(): Promise<void>;
 }
 
@@ -66,7 +73,7 @@ interface DialectQueries {
 	updateTitle: string;
 	/** Delete a single row by path. */
 	delete: string;
-	/** Move a row from one path to another (caller deletes any conflicting destination first). */
+	/** Move one or more rows to replacement paths inside a database transaction. */
 	rename: string;
 	/** Warm the synchronous index without transferring full content. */
 	loadIndex: string;
@@ -368,7 +375,24 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	}
 
 	async move(src: string, dst: string, mtimeMs: number): Promise<void> {
-		await this.#client.unsafe(this.#q.delete, [dst]);
-		await this.#client.unsafe(this.#q.rename, [dst, mtimeMs, src]);
+		await this.moveMany([{ sourcePath: src, destinationPath: dst, mtimeMs }], [dst]);
+	}
+
+	async moveMany(moves: readonly SessionStorageMove[], replacedPaths: readonly string[]): Promise<void> {
+		await this.#transaction(async transaction => {
+			for (const path of replacedPaths) await transaction.unsafe(this.#q.delete, [path]);
+			for (const move of moves) {
+				await transaction.unsafe(this.#q.rename, [move.destinationPath, move.mtimeMs, move.sourcePath]);
+			}
+		});
+	}
+
+	async #transaction(operation: (transaction: SqlSessionStorageExecutor) => Promise<void>): Promise<void> {
+		const begin = this.#client.begin;
+		if (typeof begin !== "function") {
+			throw new Error("SqlSessionStorage: client must expose begin() for atomic session moves");
+		}
+		const run = begin as (operation: (transaction: SqlSessionStorageExecutor) => Promise<void>) => Promise<void>;
+		await run.call(this.#client, operation);
 	}
 }

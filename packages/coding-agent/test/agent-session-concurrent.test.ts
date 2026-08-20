@@ -20,10 +20,12 @@ import { type SettingPath, Settings } from "@oh-my-pi/pi-coding-agent/config/set
 import { TtsrManager } from "@oh-my-pi/pi-coding-agent/export/ttsr";
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
+import { wrapRegisteredTools } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/wrapper";
 import { GoalRuntime } from "@oh-my-pi/pi-coding-agent/goals/runtime";
+import { initializeExtensions } from "@oh-my-pi/pi-coding-agent/modes/runtime-init";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { convertToLlm, USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
@@ -138,6 +140,1275 @@ describe("AgentSession concurrent prompt guard", () => {
 		throw new Error("Timed out waiting for condition");
 	}
 
+	it("chooses semantic delivery against the state used for the queue mutation", async () => {
+		await createSession();
+		session.setCustomMessageAcceptanceHookForTests(() => {
+			session.agent.state.isStreaming = true;
+		});
+		await expect(
+			session.sendCustomMessage(
+				{ customType: "idle-to-busy", content: "after current", display: false, attribution: "agent" },
+				{ deliveryMode: "afterCurrent" },
+			),
+		).resolves.toEqual({ status: "accepted", delivery: "queued_follow_up" });
+		expect(session.agent.peekFollowUpQueue()).toHaveLength(1);
+		expect(session.agent.peekSteeringQueue()).toHaveLength(0);
+
+		session.agent.clearAllQueues();
+		session.setCustomMessageAcceptanceHookForTests(() => {
+			session.agent.state.isStreaming = false;
+		});
+		await expect(
+			session.sendCustomMessage(
+				{ customType: "busy-to-idle", content: "idle steer", display: false, attribution: "agent" },
+				{ deliveryMode: "steer" },
+			),
+		).resolves.toEqual({ status: "accepted", delivery: "plain_append" });
+		expect(session.agent.peekSteeringQueue()).toHaveLength(0);
+		expect(session.agent.state.messages.at(-1)).toMatchObject({ customType: "busy-to-idle" });
+		session.setCustomMessageAcceptanceHookForTests(undefined);
+	});
+	it("reserves explicitPrompt delivery for the next explicit user prompt", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: mock.stream,
+			convertToLlm,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			modelRegistry: sharedModelRegistry,
+		});
+
+		await expect(
+			session.sendCustomMessage(
+				{ customType: "mail-status", content: "durable status", display: true, attribution: "agent" },
+				{ deliveryMode: "explicitPrompt" },
+			),
+		).resolves.toEqual({ status: "accepted", delivery: "queued_next_turn" });
+		expect(mock.calls).toHaveLength(0);
+		expect(session.agent.state.messages).toHaveLength(0);
+
+		await expect(
+			session.sendCustomMessage(
+				{ customType: "urgent-blocker", content: "urgent blocker", display: true, attribution: "agent" },
+				{ deliveryMode: "interrupt" },
+			),
+		).resolves.toEqual({ status: "downgraded", delivery: "plain_append", reason: "unscoped_automatic_turn" });
+		expect(mock.calls).toHaveLength(0);
+
+		await session.prompt("next explicit user prompt");
+		expect(mock.calls).toHaveLength(1);
+		expect(JSON.stringify(mock.calls[0]?.context.messages)).toContain("urgent blocker");
+		expect(JSON.stringify(mock.calls[0]?.context.messages)).toContain("durable status");
+	});
+	it("starts one idle provider turn for scoped peer semantic delivery", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: mock.stream,
+			convertToLlm,
+		});
+		const sessionManager = SessionManager.inMemory();
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated(),
+			modelRegistry: sharedModelRegistry,
+		});
+
+		await expect(
+			session.sendCustomMessage(
+				{ customType: "peer-message", content: "wake once", display: true, attribution: "agent" },
+				{
+					deliveryMode: "auto",
+					automaticTurnSource: "peer_message_wake",
+					onStartedTurnAccepted: () => {
+						expect(agent.state.messages).toHaveLength(0);
+						expect(sessionManager.getBranch()).toHaveLength(0);
+					},
+				},
+			),
+		).resolves.toEqual({ status: "accepted", delivery: "started_turn" });
+		await waitFor(() => mock.calls.length === 1);
+		expect(mock.calls).toHaveLength(1);
+		expect(JSON.stringify(mock.calls[0]?.context.messages)).toContain("wake once");
+		expect(session.getAutomaticTurnOutcomes()).toEqual([
+			expect.objectContaining({ source: "peer_message_wake", status: "accepted" }),
+			expect.objectContaining({ source: "peer_message_wake", status: "started" }),
+		]);
+	});
+
+	it("rejects scoped peer wake when the persistence listener disconnects before agent_start", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: mock.stream,
+			convertToLlm,
+		});
+		const sessionManager = SessionManager.inMemory();
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated(),
+			modelRegistry: sharedModelRegistry,
+		});
+		let committed = false;
+		session.setCustomMessageAcceptanceHookForTests(() => session.setAgentEventConnectionForTests(false));
+
+		await expect(
+			session.sendCustomMessage(
+				{ customType: "peer-message", content: "wake through disconnect", display: true, attribution: "agent" },
+				{
+					deliveryMode: "auto",
+					automaticTurnSource: "peer_message_wake",
+					onStartedTurnAccepted: () => {
+						committed = true;
+					},
+				},
+			),
+		).rejects.toThrow("Scoped automatic turn lost its session persistence listener");
+		expect(committed).toBe(false);
+		expect(JSON.stringify(sessionManager.getBranch())).not.toContain("wake through disconnect");
+		expect(JSON.stringify(agent.state.messages)).not.toContain("wake through disconnect");
+		expect(session.getAutomaticTurnOutcomes()).toEqual([
+			expect.objectContaining({ source: "peer_message_wake", status: "accepted" }),
+			expect.objectContaining({ source: "peer_message_wake", status: "failed" }),
+		]);
+		session.setCustomMessageAcceptanceHookForTests(undefined);
+		session.setAgentEventConnectionForTests(true);
+	});
+
+	it("rejects reentrant extension compaction throughout scoped semantic acceptance", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const compactErrors: string[] = [];
+		let current: AgentSession;
+		let handlerActive = false;
+		const extensionRunner = {
+			hasHandlers: vi.fn((eventType: string) => eventType === "message_end"),
+			isHandlingEvent: () => handlerActive,
+			emitBeforeAgentStart: vi.fn(async () => {
+				try {
+					await current.compact();
+				} catch (error) {
+					compactErrors.push(error instanceof Error ? error.message : String(error));
+				}
+				return undefined;
+			}),
+			emit: vi.fn(async (event: { type: string; message?: AgentMessage }) => {
+				if (event.type !== "message_end" || event.message?.role !== "custom") return;
+				handlerActive = true;
+				try {
+					await current.compact();
+				} catch (error) {
+					compactErrors.push(error instanceof Error ? error.message : String(error));
+				} finally {
+					handlerActive = false;
+				}
+			}),
+		} as unknown as ExtensionRunner;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: createMockModel({ handler: () => ({ content: ["Done"] }) }).stream,
+			convertToLlm,
+		});
+		current = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			modelRegistry: sharedModelRegistry,
+			extensionRunner,
+		});
+		session = current;
+
+		await expect(
+			session.sendCustomMessage(
+				{ customType: "peer-message", content: "wake without compaction", display: true, attribution: "agent" },
+				{
+					deliveryMode: "auto",
+					automaticTurnSource: "peer_message_wake",
+					onStartedTurnAccepted: () => {},
+				},
+			),
+		).resolves.toEqual({ status: "accepted", delivery: "started_turn" });
+		expect(compactErrors).toEqual([
+			"Compaction is unavailable while a peer-message wake awaits provider response acceptance",
+			"Compaction is unavailable while semantic message delivery is being accepted",
+		]);
+	});
+
+	it("rejects reentrant scoped idle peer wakes from extension event handlers", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: mock.stream,
+			convertToLlm,
+		});
+		let disposition: unknown;
+		const completed = Promise.withResolvers<void>();
+		const extensionRuntime = new ExtensionRuntime();
+		const extension = await loadExtensionFromFactory(
+			pi => {
+				pi.on("message_end", async event => {
+					if (event.message.role !== "custom" || event.message.customType !== "reentrant-trigger") return;
+					disposition = await pi.sendMessage(
+						{
+							customType: "peer-message",
+							content: "must not start reentrantly",
+							display: true,
+							attribution: "agent",
+						},
+						{ deliveryMode: "auto", automaticTurnSource: "peer_message_wake" },
+					);
+					completed.resolve();
+				});
+			},
+			tempDir,
+			new EventBus(),
+			extensionRuntime,
+			"reentrant-peer-wake",
+		);
+		const sessionManager = SessionManager.inMemory();
+		const extensionRunner = new ExtensionRunner(
+			[extension],
+			extensionRuntime,
+			tempDir,
+			sessionManager,
+			sharedModelRegistry,
+		);
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated(),
+			modelRegistry: sharedModelRegistry,
+			extensionRunner,
+		});
+		const reportSendError = vi.fn();
+		const reportRuntimeError = vi.fn();
+		await initializeExtensions(session, { reportSendError, reportRuntimeError });
+
+		const trigger: AgentMessage = {
+			role: "custom",
+			customType: "reentrant-trigger",
+			content: "trigger",
+			display: false,
+			attribution: "agent",
+			timestamp: Date.now(),
+		};
+		agent.emitExternalEvent({ type: "message_start", message: trigger });
+		agent.emitExternalEvent({ type: "message_end", message: trigger });
+		await Promise.race([
+			completed.promise,
+			Bun.sleep(500).then(() => {
+				throw new Error("Reentrant peer wake did not settle");
+			}),
+		]);
+
+		expect(disposition).toEqual({ status: "unavailable", reason: "reentrant_extension_handler" });
+		expect(mock.calls).toHaveLength(0);
+		expect(JSON.stringify(agent.state.messages)).not.toContain("must not start reentrantly");
+		expect(JSON.stringify(sessionManager.getBranch())).not.toContain("must not start reentrantly");
+		expect(reportSendError).not.toHaveBeenCalled();
+		expect(reportRuntimeError).not.toHaveBeenCalled();
+	});
+
+	it("settles scoped peer wake acceptance before a session mutation fence retires extensions", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const beforeStartEntered = Promise.withResolvers<void>();
+		const releaseBeforeStart = Promise.withResolvers<void>();
+		const order: string[] = [];
+		const sessionManager = SessionManager.inMemory();
+		const extensionRunner = {
+			hasHandlers: vi.fn(() => false),
+			emitBeforeAgentStart: vi.fn(async () => {
+				beforeStartEntered.resolve();
+				await releaseBeforeStart.promise;
+				return undefined;
+			}),
+			emitBeforeSessionMutation: vi.fn(async () => {
+				expect(JSON.stringify(sessionManager.getBranch())).toContain("commit before mutation");
+				order.push("fence");
+			}),
+			emit: vi.fn().mockResolvedValue(undefined),
+			emitWithHostCompletion: vi.fn(async (_event: { type: string }, completion?: () => void | Promise<void>) =>
+				completion?.(),
+			),
+		} as unknown as ExtensionRunner;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: createMockModel({ handler: () => ({ content: ["Done"] }) }).stream,
+			convertToLlm,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated(),
+			modelRegistry: sharedModelRegistry,
+			extensionRunner,
+		});
+
+		const sending = session.sendCustomMessage(
+			{ customType: "peer-message", content: "commit before mutation", display: true, attribution: "agent" },
+			{
+				deliveryMode: "auto",
+				automaticTurnSource: "peer_message_wake",
+				onStartedTurnAccepted: () => order.push("commit"),
+			},
+		);
+		await beforeStartEntered.promise;
+		const switching = session.newSession();
+		await Promise.resolve();
+		expect(extensionRunner.emitBeforeSessionMutation).not.toHaveBeenCalled();
+
+		releaseBeforeStart.resolve();
+		await expect(sending).resolves.toEqual({ status: "accepted", delivery: "started_turn" });
+		await expect(switching).resolves.toBe(true);
+		expect(order).toEqual(["commit", "fence"]);
+	});
+
+	it("does not accept a scoped peer wake when agent prompt fails before agent_start", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: createMockModel({ handler: () => ({ content: ["Done"] }) }).stream,
+			convertToLlm,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			modelRegistry: sharedModelRegistry,
+		});
+		const failure = new Error("provider start failed");
+		vi.spyOn(agent, "prompt").mockRejectedValueOnce(failure);
+		let committed = false;
+
+		await expect(
+			session.sendCustomMessage(
+				{ customType: "peer-message", content: "must stay retryable", display: true, attribution: "agent" },
+				{
+					deliveryMode: "auto",
+					automaticTurnSource: "peer_message_wake",
+					onStartedTurnAccepted: () => {
+						committed = true;
+					},
+				},
+			),
+		).rejects.toThrow(failure);
+		expect(committed).toBe(false);
+		expect(session.getAutomaticTurnOutcomes()).toEqual([
+			expect.objectContaining({ source: "peer_message_wake", status: "accepted" }),
+			expect.objectContaining({ source: "peer_message_wake", status: "failed" }),
+		]);
+	});
+
+	it("keeps a scoped peer wake retryable when the pre-model gate stops before provider dispatch", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: mock.stream,
+			convertToLlm,
+		});
+		agent.setBeforeModelCall(() => ({ stop: true, reason: "test gate" }));
+		const sessionManager = SessionManager.inMemory();
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated(),
+			modelRegistry: sharedModelRegistry,
+		});
+		let committed = false;
+		const queuedSteer = {
+			role: "user" as const,
+			content: [{ type: "text" as const, text: "queued steer must survive" }],
+			steering: true,
+			attribution: "user" as const,
+			timestamp: Date.now(),
+		};
+		agent.steer(queuedSteer);
+
+		await expect(
+			session.sendCustomMessage(
+				{ customType: "peer-message", content: "must remain new", display: true, attribution: "agent" },
+				{
+					deliveryMode: "auto",
+					automaticTurnSource: "peer_message_wake",
+					onStartedTurnAccepted: () => {
+						committed = true;
+					},
+				},
+			),
+		).resolves.toEqual({ status: "unavailable", reason: "prompt_preflight_cancelled" });
+		await session.waitForIdle();
+		expect(committed).toBe(false);
+		expect(mock.calls).toHaveLength(0);
+		expect(agent.state.messages).toEqual([queuedSteer]);
+		expect(JSON.stringify(sessionManager.getBranch())).toContain("queued steer must survive");
+		expect(JSON.stringify(sessionManager.getBranch())).not.toContain("must remain new");
+		expect(agent.peekSteeringQueue()).toHaveLength(0);
+		expect(session.getAutomaticTurnOutcomes()).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ source: "peer_message_wake", status: "accepted" }),
+				expect.objectContaining({ source: "peer_message_wake", status: "failed" }),
+			]),
+		);
+	});
+
+	it("defers a late explicit-prompt message after the provisional queue batch is folded", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({ responses: [{ content: ["first"] }, { content: ["second"] }] });
+		const gateEntered = Promise.withResolvers<void>();
+		const releaseGate = Promise.withResolvers<void>();
+		let gateCalls = 0;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: mock.stream,
+			convertToLlm,
+		});
+		agent.setBeforeModelCall(async () => {
+			if (gateCalls++ !== 0) return;
+			gateEntered.resolve();
+			await releaseGate.promise;
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			modelRegistry: sharedModelRegistry,
+		});
+		agent.steer({
+			role: "user",
+			content: "direct user steer",
+			steering: true,
+			attribution: "user",
+			timestamp: Date.now(),
+		});
+
+		const wake = session.sendCustomMessage(
+			{ customType: "peer-message", content: "wake first", display: true, attribution: "agent" },
+			{ deliveryMode: "auto", automaticTurnSource: "peer_message_wake", onStartedTurnAccepted: () => {} },
+		);
+		await gateEntered.promise;
+		await expect(
+			session.sendCustomMessage(
+				{ customType: "peer-message", content: "late explicit", display: true, attribution: "agent" },
+				{ deliveryMode: "explicitPrompt" },
+			),
+		).resolves.toEqual({ status: "accepted", delivery: "queued_next_turn" });
+
+		releaseGate.resolve();
+		await expect(wake).resolves.toEqual({ status: "accepted", delivery: "started_turn" });
+		await session.waitForIdle();
+		const firstContext = JSON.stringify(mock.calls[0]?.context.messages);
+		expect(firstContext).toContain("direct user steer");
+		expect(firstContext).not.toContain("late explicit");
+
+		await session.prompt("next explicit user prompt");
+		const secondContext = JSON.stringify(mock.calls[1]?.context.messages);
+		expect(secondContext).toContain("next explicit user prompt");
+		expect(secondContext.match(/late explicit/g) ?? []).toHaveLength(1);
+	});
+
+	it("rejects unknown automatic-turn sources before idle or busy routing", async () => {
+		await createSession();
+
+		for (const [busy, source] of [
+			[false, "direct_user_input"],
+			[true, "unknown_source"],
+		] as const) {
+			session.agent.state.isStreaming = busy;
+			await expect(
+				session.sendCustomMessage(
+					{ customType: "peer-message", content: source, display: true, attribution: "agent" },
+					{
+						deliveryMode: "auto",
+						automaticTurnSource: source as "peer_message_wake",
+						onStartedTurnAccepted: () => {},
+					},
+				),
+			).rejects.toThrow('automaticTurnSource must be "peer_message_wake"');
+		}
+
+		expect(session.agent.state.messages).toHaveLength(0);
+		expect(session.agent.peekSteeringQueue()).toHaveLength(0);
+		expect(session.agent.peekFollowUpQueue()).toHaveLength(0);
+	});
+
+	it("keeps a scoped peer wake retryable when provider stream creation fails", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const failure = new Error("stream init failed");
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: async () => {
+				await Promise.resolve();
+				throw failure;
+			},
+			convertToLlm,
+		});
+		const sessionManager = SessionManager.inMemory();
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated(),
+			modelRegistry: sharedModelRegistry,
+		});
+		let committed = false;
+
+		await expect(
+			session.sendCustomMessage(
+				{ customType: "peer-message", content: "retry after stream failure", display: true, attribution: "agent" },
+				{
+					deliveryMode: "auto",
+					automaticTurnSource: "peer_message_wake",
+					onStartedTurnAccepted: () => {
+						committed = true;
+					},
+				},
+			),
+		).resolves.toEqual({ status: "unavailable", reason: "prompt_preflight_cancelled" });
+		expect(committed).toBe(false);
+		expect(agent.state.messages).toHaveLength(0);
+		expect(sessionManager.getBranch()).toHaveLength(0);
+		expect(session.getAutomaticTurnOutcomes()).toEqual([
+			expect.objectContaining({ source: "peer_message_wake", status: "accepted" }),
+			expect.objectContaining({ source: "peer_message_wake", status: "failed" }),
+		]);
+	});
+
+	it("keeps a scoped peer wake retryable when a provider start event precedes wire failure", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: createAssistantMessage("") });
+					const failure = createAssistantMessage("");
+					failure.stopReason = "error";
+					failure.errorMessage = "provider failed before response";
+					stream.push({ type: "error", reason: "error", error: failure });
+				});
+				return stream;
+			},
+			convertToLlm,
+		});
+		const sessionManager = SessionManager.inMemory();
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated(),
+			modelRegistry: sharedModelRegistry,
+		});
+		const lifecycleEvents: string[] = [];
+		session.subscribe(event => {
+			if (
+				event.type === "turn_start" ||
+				event.type === "message_start" ||
+				event.type === "message_end" ||
+				event.type === "turn_end" ||
+				event.type === "agent_end"
+			) {
+				lifecycleEvents.push(event.type);
+			}
+		});
+		let committed = false;
+
+		await expect(
+			session.sendCustomMessage(
+				{ customType: "peer-message", content: "retry after wire failure", display: true, attribution: "agent" },
+				{
+					deliveryMode: "auto",
+					automaticTurnSource: "peer_message_wake",
+					onStartedTurnAccepted: () => {
+						committed = true;
+					},
+				},
+			),
+		).resolves.toEqual({ status: "unavailable", reason: "prompt_preflight_cancelled" });
+		expect(committed).toBe(false);
+		expect(agent.state.messages).toHaveLength(0);
+		expect(sessionManager.getBranch()).toHaveLength(0);
+		await waitFor(() => lifecycleEvents.length === 1);
+		expect(lifecycleEvents).toEqual(["agent_end"]);
+	});
+
+	it("keeps a scoped peer wake retryable when acceptance commit fails", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		let requestSignal: AbortSignal | undefined;
+		const failure = new Error("mailbox commit failed");
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: (_model, _context, options) => {
+				requestSignal = options?.signal;
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					const partial = createAssistantMessage("");
+					stream.push({ type: "start", partial });
+					stream.push({ type: "text_delta", contentIndex: 0, delta: "started", partial });
+				});
+				return stream;
+			},
+			convertToLlm,
+		});
+		const sessionManager = SessionManager.inMemory();
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated(),
+			modelRegistry: sharedModelRegistry,
+		});
+
+		await expect(
+			session.sendCustomMessage(
+				{ customType: "peer-message", content: "retry after commit failure", display: true, attribution: "agent" },
+				{
+					deliveryMode: "auto",
+					automaticTurnSource: "peer_message_wake",
+					onStartedTurnAccepted: () => {
+						throw failure;
+					},
+				},
+			),
+		).rejects.toThrow(failure);
+		expect(requestSignal?.aborted).toBe(true);
+		expect(agent.state.messages).toHaveLength(0);
+		expect(sessionManager.getBranch()).toHaveLength(0);
+		expect(session.getAutomaticTurnOutcomes()).toEqual([
+			expect.objectContaining({ source: "peer_message_wake", status: "accepted" }),
+			expect.objectContaining({ source: "peer_message_wake", status: "failed" }),
+		]);
+	});
+
+	it("attaches busy explicitPrompt delivery to the queued user follow-up", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		let firstStream: AssistantMessageEventStream | undefined;
+		const callMessages: Message[][] = [];
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			convertToLlm,
+			streamFn: (_model, context) => {
+				callMessages.push([...context.messages]);
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: createAssistantMessage("") });
+					if (callMessages.length > 1)
+						stream.push({ type: "done", reason: "stop", message: createAssistantMessage("Done") });
+				});
+				if (callMessages.length === 1) firstStream = stream;
+				return stream;
+			},
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			modelRegistry: sharedModelRegistry,
+		});
+		const firstPrompt = session.prompt("active turn");
+		await waitFor(() => session.isStreaming && firstStream !== undefined && callMessages.length === 1);
+
+		await expect(
+			session.sendCustomMessage(
+				{ customType: "mail-status", content: "busy durable status", display: true, attribution: "agent" },
+				{ deliveryMode: "explicitPrompt" },
+			),
+		).resolves.toEqual({ status: "accepted", delivery: "queued_next_turn" });
+		await session.prompt("normal after_current composition", { streamingBehavior: "followUp" });
+		expect(callMessages).toHaveLength(1);
+
+		firstStream?.push({ type: "done", reason: "stop", message: createAssistantMessage("First done") });
+		await firstPrompt;
+		await session.waitForIdle();
+
+		expect(callMessages).toHaveLength(2);
+		const providerTurn = JSON.stringify(callMessages[1]);
+		expect(providerTurn).toContain("normal after_current composition");
+		expect(providerTurn).toContain("busy durable status");
+	});
+	it("keeps explicitPrompt companions with one-at-a-time steering", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		let firstStream: AssistantMessageEventStream | undefined;
+		const callMessages: Message[][] = [];
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			convertToLlm,
+			streamFn: (_model, context) => {
+				callMessages.push([...context.messages]);
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: createAssistantMessage("") });
+					if (callMessages.length > 1)
+						stream.push({ type: "done", reason: "stop", message: createAssistantMessage("Done") });
+				});
+				if (callMessages.length === 1) firstStream = stream;
+				return stream;
+			},
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			modelRegistry: sharedModelRegistry,
+		});
+		const active = session.prompt("active turn");
+		await waitFor(() => session.isStreaming && firstStream !== undefined);
+		await session.sendCustomMessage(
+			{ customType: "mail-status", content: "steer durable status", display: true, attribution: "agent" },
+			{ deliveryMode: "explicitPrompt" },
+		);
+		await session.prompt("deliberate steering prompt", { streamingBehavior: "steer" });
+		firstStream?.push({ type: "done", reason: "stop", message: createAssistantMessage("First done") });
+		await active;
+		await session.waitForIdle();
+		const providerTurn = JSON.stringify(callMessages[1]);
+		expect(providerTurn).toContain("deliberate steering prompt");
+		expect(providerTurn).toContain("steer durable status");
+	});
+
+	it("restores explicitPrompt companions when their queued user prompt is cleared", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		let firstStream: AssistantMessageEventStream | undefined;
+		const callMessages: Message[][] = [];
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			convertToLlm,
+			streamFn: (_model, context) => {
+				callMessages.push([...context.messages]);
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: createAssistantMessage("") });
+					if (callMessages.length > 1)
+						stream.push({ type: "done", reason: "stop", message: createAssistantMessage("Done") });
+				});
+				if (callMessages.length === 1) firstStream = stream;
+				return stream;
+			},
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			modelRegistry: sharedModelRegistry,
+		});
+		const active = session.prompt("active turn");
+		await waitFor(() => session.isStreaming && firstStream !== undefined);
+		await session.sendCustomMessage(
+			{ customType: "mail-status", content: "restorable durable status", display: true, attribution: "agent" },
+			{ deliveryMode: "explicitPrompt" },
+		);
+		await session.prompt("discarded queued prompt", { streamingBehavior: "followUp" });
+		session.clearQueue({ forInterrupt: true });
+		expect(session.agent.peekFollowUpQueue()).toHaveLength(0);
+		firstStream?.push({ type: "done", reason: "stop", message: createAssistantMessage("First done") });
+		await active;
+		await session.prompt("replacement explicit prompt");
+		const providerTurn = JSON.stringify(callMessages[1]);
+		expect(providerTurn).toContain("replacement explicit prompt");
+		expect(providerTurn).toContain("restorable durable status");
+		expect(providerTurn).not.toContain("discarded queued prompt");
+	});
+	it("rejects semantic delivery during and after a lifecycle ownership change", async () => {
+		await createSession();
+		const before = session.agent.state.messages.length;
+		for (const releaseFenceBeforeAcceptance of [false, true]) {
+			session.setCustomMessageAcceptanceHookForTests(() => {
+				session.setLifecycleTransitionFenceForTests(true);
+				if (releaseFenceBeforeAcceptance) session.setLifecycleTransitionFenceForTests(false);
+			});
+
+			await expect(
+				session.sendCustomMessage(
+					{ customType: "retired-delivery", content: "must not land", display: false, attribution: "agent" },
+					{ deliveryMode: "steer" },
+				),
+			).resolves.toEqual({ status: "unavailable", reason: "session_transition" });
+			session.setLifecycleTransitionFenceForTests(false);
+		}
+		expect(session.agent.state.messages).toHaveLength(before);
+		expect(session.agent.peekSteeringQueue()).toHaveLength(0);
+		expect(session.agent.peekFollowUpQueue()).toHaveLength(0);
+		expect(session.hasPendingMessages()).toBe(false);
+		session.setCustomMessageAcceptanceHookForTests(undefined);
+	});
+	it("rejects prompts when lifecycle ownership changes during asynchronous preparation", async () => {
+		await createSession();
+		session.setPromptAcceptanceHookForTests(() => {
+			session.setLifecycleTransitionFenceForTests(true);
+			session.setLifecycleTransitionFenceForTests(false);
+		});
+
+		try {
+			await expect(session.prompt("idle across handoff")).rejects.toThrow("Session transition in progress");
+			session.agent.state.isStreaming = true;
+			await expect(session.prompt("queued across handoff", { streamingBehavior: "steer" })).rejects.toThrow(
+				"Session transition in progress",
+			);
+			await expect(
+				session.promptCustomMessage(
+					{ customType: "queued-race", content: "custom across handoff", display: false },
+					{ queueOnly: true, streamingBehavior: "steer" },
+				),
+			).rejects.toThrow("Session transition in progress");
+			expect(session.agent.peekSteeringQueue()).toHaveLength(0);
+			expect(session.agent.peekFollowUpQueue()).toHaveLength(0);
+		} finally {
+			session.setPromptAcceptanceHookForTests(undefined);
+			session.setLifecycleTransitionFenceForTests(false);
+		}
+	});
+	it("does not orphan a keyword notice when a queued user prompt loses lifecycle ownership", async () => {
+		await createSession({ "magicKeywords.enabled": true, "magicKeywords.ultrathink": true });
+		session.agent.state.isStreaming = true;
+		let acceptanceCalls = 0;
+		session.setPromptAcceptanceHookForTests(() => {
+			acceptanceCalls++;
+			if (acceptanceCalls !== 2) return;
+			session.setLifecycleTransitionFenceForTests(true);
+			session.setLifecycleTransitionFenceForTests(false);
+		});
+
+		try {
+			await expect(
+				session.prompt("ultrathink queued across handoff", { streamingBehavior: "steer" }),
+			).rejects.toThrow("Session transition in progress");
+			expect(acceptanceCalls).toBe(2);
+			expect(session.agent.peekSteeringQueue()).toHaveLength(0);
+			expect(session.agent.peekFollowUpQueue()).toHaveLength(0);
+		} finally {
+			session.setPromptAcceptanceHookForTests(undefined);
+			session.setLifecycleTransitionFenceForTests(false);
+		}
+	});
+	it("does not orphan a keyword notice when a queued custom prompt loses lifecycle ownership", async () => {
+		await createSession({ "magicKeywords.enabled": true, "magicKeywords.ultrathink": true });
+		session.agent.state.isStreaming = true;
+		let acceptanceCalls = 0;
+		session.setPromptAcceptanceHookForTests(() => {
+			acceptanceCalls++;
+			if (acceptanceCalls !== 2) return;
+			session.setLifecycleTransitionFenceForTests(true);
+			session.setLifecycleTransitionFenceForTests(false);
+		});
+
+		try {
+			await expect(
+				session.promptCustomMessage(
+					{
+						customType: "skill-prompt",
+						content: "run the skill",
+						display: true,
+						details: { args: "ultrathink queued across handoff" },
+						attribution: "user",
+					},
+					{ queueOnly: true, streamingBehavior: "followUp" },
+				),
+			).rejects.toThrow("Session transition in progress");
+			expect(acceptanceCalls).toBe(2);
+			expect(session.agent.peekSteeringQueue()).toHaveLength(0);
+			expect(session.agent.peekFollowUpQueue()).toHaveLength(0);
+		} finally {
+			session.setPromptAcceptanceHookForTests(undefined);
+			session.setLifecycleTransitionFenceForTests(false);
+		}
+	});
+	it("does not run a prompt preflight for an unscoped semantic delivery", async () => {
+		await createSession({ "retry.usageAwareFallback": true });
+		const before = session.agent.state.messages.length;
+		const usageSpy = vi.spyOn(sharedAuthStorage, "getModelUsageHealth");
+
+		await expect(
+			session.sendCustomMessage(
+				{ customType: "cancelled-preflight", content: "must land passively", display: false, attribution: "agent" },
+				{ deliveryMode: "interrupt" },
+			),
+		).resolves.toEqual({ status: "downgraded", delivery: "plain_append", reason: "unscoped_automatic_turn" });
+		expect(usageSpy).not.toHaveBeenCalled();
+		expect(session.agent.state.messages).toHaveLength(before + 1);
+		expect(session.agent.peekSteeringQueue()).toHaveLength(0);
+		expect(session.agent.peekFollowUpQueue()).toHaveLength(0);
+		expect(session.hasPendingMessages()).toBe(false);
+	});
+	it("downgrades legacy trigger requests without running a prompt preflight", async () => {
+		const assertDowngraded = async (options: { deliverAs?: "nextTurn"; triggerTurn: true }) => {
+			await createSession({ "retry.usageAwareFallback": true });
+			const usageSpy = vi.spyOn(sharedAuthStorage, "getModelUsageHealth");
+
+			const sending = session.sendCustomMessage(
+				{
+					customType: "cancelled-legacy-preflight",
+					content: "must not land",
+					display: false,
+					attribution: "agent",
+				},
+				options,
+			);
+			await expect(sending).resolves.toEqual({
+				status: "downgraded",
+				delivery: "queued_next_turn",
+				reason: "unscoped_automatic_turn",
+			});
+			expect(usageSpy).not.toHaveBeenCalled();
+			expect(session.agent.peekSteeringQueue()).toHaveLength(0);
+			expect(session.agent.peekFollowUpQueue()).toHaveLength(0);
+			expect(session.hasPendingMessages()).toBe(true);
+			usageSpy.mockRestore();
+		};
+
+		await assertDowngraded({ triggerTurn: true });
+		await assertDowngraded({ deliverAs: "nextTurn", triggerTurn: true });
+	});
+	it("does not mutate a scoped semantic delivery when the client defers turns", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: mock.stream,
+			convertToLlm,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			modelRegistry: sharedModelRegistry,
+		});
+		session.setClientBridge({ capabilities: {}, deferAgentInitiatedTurns: true });
+		const before = session.agent.state.messages.length;
+
+		await expect(
+			session.sendCustomMessage(
+				{ customType: "exact-interrupt", content: "must not queue", display: false, attribution: "agent" },
+				{ deliveryMode: "interrupt", automaticTurnSource: "peer_message_wake" },
+			),
+		).resolves.toEqual({ status: "unavailable", reason: "client_deferred_turn" });
+		expect(session.agent.state.messages).toHaveLength(before);
+		expect(session.agent.peekSteeringQueue()).toHaveLength(0);
+		expect(session.agent.peekFollowUpQueue()).toHaveLength(0);
+		expect(session.hasPendingMessages()).toBe(false);
+		expect(mock.calls).toHaveLength(0);
+	});
+
+	describe("durable semantic delivery recovery", () => {
+		const pendingType = "omp:pending-semantic-delivery";
+		const settledType = "omp:settled-semantic-delivery";
+
+		function createPersistentSession(sessionManager: SessionManager, calls: Message[][] = []): AgentSession {
+			const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+			const agent = new Agent({
+				getApiKey: () => "test-key",
+				initialState: { model, systemPrompt: ["Test"], tools: [] },
+				convertToLlm,
+				streamFn: (_model, context) => {
+					calls.push([...context.messages]);
+					const stream = new AssistantMessageEventStream();
+					queueMicrotask(() => {
+						stream.push({ type: "start", partial: createAssistantMessage("") });
+						stream.push({ type: "done", reason: "stop", message: createAssistantMessage("Done") });
+					});
+					return stream;
+				},
+			});
+			return new AgentSession({
+				agent,
+				sessionManager,
+				settings: Settings.isolated(),
+				modelRegistry: sharedModelRegistry,
+			});
+		}
+
+		it("returns started_turn only after the scoped peer input is durably journaled", async () => {
+			const sessionDir = path.join(tempDir, "sessions");
+			const manager = SessionManager.create(tempDir, sessionDir);
+			const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+			let providerStream: AssistantMessageEventStream | undefined;
+			const agent = new Agent({
+				getApiKey: () => "test-key",
+				initialState: { model, systemPrompt: ["Test"], tools: [] },
+				convertToLlm,
+				streamFn: () => {
+					const stream = new AssistantMessageEventStream();
+					providerStream = stream;
+					queueMicrotask(() => {
+						stream.push({ type: "start", partial: createAssistantMessage("") });
+						stream.push({
+							type: "text_delta",
+							contentIndex: 0,
+							delta: "working",
+							partial: createAssistantMessage("working"),
+						});
+					});
+					return stream;
+				},
+			});
+			session = new AgentSession({
+				agent,
+				sessionManager: manager,
+				settings: Settings.isolated(),
+				modelRegistry: sharedModelRegistry,
+			});
+			let committed = false;
+
+			await expect(
+				session.sendCustomMessage(
+					{ customType: "peer-message", content: "durable idle wake", display: true, attribution: "agent" },
+					{
+						deliveryMode: "auto",
+						automaticTurnSource: "peer_message_wake",
+						onStartedTurnAccepted: () => {
+							committed = true;
+						},
+					},
+				),
+			).resolves.toEqual({ status: "accepted", delivery: "started_turn" });
+			expect(committed).toBe(true);
+			const sessionFile = manager.getSessionFile();
+			if (!sessionFile) throw new Error("Scoped wake did not materialize a session journal");
+			expect(await Bun.file(sessionFile).text()).toContain("durable idle wake");
+
+			providerStream?.push({ type: "done", reason: "stop", message: createAssistantMessage("Done") });
+			await session.waitForIdle();
+		});
+
+		async function acceptBeforeCrash(
+			mode: "interrupt" | "afterCurrent" | "steer" | "explicitPrompt",
+			content: string,
+		): Promise<{ sessionFile: string; sessionDir: string }> {
+			const sessionDir = path.join(tempDir, "sessions");
+			const manager = SessionManager.create(tempDir, sessionDir);
+			session = createPersistentSession(manager);
+			session.agent.state.isStreaming = true;
+			await session.sendCustomMessage(
+				{ customType: `mail-${mode}`, content, display: true, attribution: "agent" },
+				{ deliveryMode: mode },
+			);
+			const sessionFile = manager.getSessionFile();
+			if (!sessionFile) throw new Error("Semantic acceptance did not materialize a session file");
+			// Process-death simulation: reopen the flushed journal without disposing the old AgentSession.
+			session = undefined as unknown as AgentSession;
+			return { sessionFile, sessionDir };
+		}
+
+		async function reopen(sessionFile: string, sessionDir: string, calls: Message[][] = []): Promise<AgentSession> {
+			const reopened = await SessionManager.open(sessionFile, sessionDir, undefined, {
+				initialCwd: tempDir,
+				suppressBreadcrumb: true,
+			});
+			session = createPersistentSession(reopened, calls);
+			return session;
+		}
+
+		it.each([
+			["interrupt", "steer recovered after crash", "steer"],
+			["steer", "explicit steer recovered after crash", "steer"],
+			["afterCurrent", "follow-up recovered after crash", "followUp"],
+		] as const)("rehydrates busy %s delivery after a process boundary", async (mode, content, queue) => {
+			const { sessionFile, sessionDir } = await acceptBeforeCrash(mode, content);
+			const resumed = await reopen(sessionFile, sessionDir);
+			const recovered = queue === "steer" ? resumed.agent.peekSteeringQueue() : resumed.agent.peekFollowUpQueue();
+			expect(recovered).toHaveLength(1);
+			expect(JSON.stringify(recovered[0])).toContain(content);
+		});
+
+		it("keeps idle explicitPrompt recovery out of automatic turns until the next deliberate prompt", async () => {
+			const { sessionFile, sessionDir } = await acceptBeforeCrash("explicitPrompt", "idle status after crash");
+			const calls: Message[][] = [];
+			const resumed = await reopen(sessionFile, sessionDir, calls);
+
+			resumed.agent.state.isStreaming = false;
+			await expect(
+				resumed.sendCustomMessage(
+					{ customType: "urgent", content: "automatic urgent turn", display: true, attribution: "agent" },
+					{ deliveryMode: "interrupt" },
+				),
+			).resolves.toEqual({ status: "downgraded", delivery: "plain_append", reason: "unscoped_automatic_turn" });
+			expect(calls).toHaveLength(0);
+
+			await resumed.prompt("deliberate owner prompt");
+			expect(JSON.stringify(calls[0])).toContain("automatic urgent turn");
+			expect(JSON.stringify(calls[0])).toContain("idle status after crash");
+		});
+
+		it("reattaches busy explicitPrompt recovery to the next queued user prompt", async () => {
+			const { sessionFile, sessionDir } = await acceptBeforeCrash("explicitPrompt", "paired status after crash");
+			const calls: Message[][] = [];
+			const resumed = await reopen(sessionFile, sessionDir, calls);
+
+			await resumed.prompt("paired deliberate prompt");
+			const providerTurn = JSON.stringify(calls[0]);
+			expect(providerTurn).toContain("paired deliberate prompt");
+			expect(providerTurn).toContain("paired status after crash");
+		});
+
+		it("cancels pending semantic deliveries before an in-place context reset", async () => {
+			const sessionDir = path.join(tempDir, "sessions");
+			const manager = SessionManager.create(tempDir, sessionDir);
+			session = createPersistentSession(manager);
+			session.agent.state.isStreaming = true;
+			await session.sendCustomMessage(
+				{ customType: "reset-cancelled", content: "must stay before reset", display: false, attribution: "agent" },
+				{ deliveryMode: "steer" },
+			);
+			session.agent.state.isStreaming = false;
+			await expect(session.resetSessionContext()).resolves.toEqual({ droppedCount: 0 });
+
+			const sessionFile = manager.getSessionFile();
+			if (!sessionFile) throw new Error("Expected a materialized session");
+			const resumed = await reopen(sessionFile, sessionDir);
+			expect(resumed.agent.peekSteeringQueue()).toHaveLength(0);
+			expect(resumed.agent.peekFollowUpQueue()).toHaveLength(0);
+			expect(resumed.hasPendingMessages()).toBe(false);
+		});
+
+		it("keeps queued acceptance on the retained session when a lifecycle fence begins during persistence", async () => {
+			const sessionDir = path.join(tempDir, "sessions");
+			const manager = SessionManager.create(tempDir, sessionDir);
+			session = createPersistentSession(manager);
+			session.agent.state.isStreaming = true;
+			const rewriteStarted = Promise.withResolvers<void>();
+			const continueRewrite = Promise.withResolvers<void>();
+			const ensureOnDisk = manager.ensureOnDisk.bind(manager);
+			vi.spyOn(manager, "ensureOnDisk").mockImplementation(async () => {
+				rewriteStarted.resolve();
+				await continueRewrite.promise;
+				await ensureOnDisk();
+			});
+
+			const sending = session.sendCustomMessage(
+				{ customType: "acceptance-race", content: "must stay retained", display: false, attribution: "agent" },
+				{ deliveryMode: "steer" },
+			);
+			await rewriteStarted.promise;
+			session.setLifecycleTransitionFenceForTests(true);
+			continueRewrite.resolve();
+
+			await expect(sending).resolves.toEqual({ status: "accepted", delivery: "queued_steer" });
+			expect(session.agent.peekSteeringQueue()).toHaveLength(1);
+			session.setLifecycleTransitionFenceForTests(false);
+		});
+
+		it("settles a concurrent queued acceptance before resetting its delivery", async () => {
+			const sessionDir = path.join(tempDir, "sessions");
+			const manager = SessionManager.create(tempDir, sessionDir);
+			session = createPersistentSession(manager);
+			session.agent.state.isStreaming = true;
+			const rewriteStarted = Promise.withResolvers<void>();
+			const continueRewrite = Promise.withResolvers<void>();
+			const ensureOnDisk = manager.ensureOnDisk.bind(manager);
+			vi.spyOn(manager, "ensureOnDisk").mockImplementation(async () => {
+				rewriteStarted.resolve();
+				await continueRewrite.promise;
+				await ensureOnDisk();
+			});
+
+			const sending = session.sendCustomMessage(
+				{ customType: "reset-race", content: "cancel before reset", display: false, attribution: "agent" },
+				{ deliveryMode: "explicitPrompt" },
+			);
+			await rewriteStarted.promise;
+			session.agent.state.isStreaming = false;
+			const resetting = session.resetSessionContext();
+			continueRewrite.resolve();
+
+			await expect(sending).resolves.toEqual({ status: "accepted", delivery: "queued_next_turn" });
+			await expect(resetting).resolves.toEqual({ droppedCount: 0 });
+			const sessionFile = manager.getSessionFile();
+			if (!sessionFile) throw new Error("Expected a materialized session");
+			const resumed = await reopen(sessionFile, sessionDir);
+			expect(resumed.agent.peekSteeringQueue()).toHaveLength(0);
+			expect(resumed.hasPendingMessages()).toBe(false);
+		});
+		it("persists the conversation message before its semantic-delivery settlement", async () => {
+			const sessionDir = path.join(tempDir, "sessions");
+
+			const manager = SessionManager.create(tempDir, sessionDir);
+			session = createPersistentSession(manager);
+			session.agent.state.isStreaming = true;
+			await session.sendCustomMessage(
+				{ customType: "ordered", content: "ordered delivery", display: false, attribution: "agent" },
+				{ deliveryMode: "steer" },
+			);
+
+			const queued = session.agent.peekSteeringQueue()[0];
+			if (!queued) throw new Error("Expected a queued semantic steer");
+			session.agent.state.isStreaming = false;
+			session.agent.emitExternalEvent({ type: "message_start", message: queued });
+			session.agent.emitExternalEvent({ type: "message_end", message: queued });
+			await waitFor(() =>
+				manager.getBranch().some(entry => entry.type === "custom" && entry.customType === settledType),
+			);
+
+			const branch = manager.getBranch();
+			const pendingIndex = branch.findIndex(entry => entry.type === "custom" && entry.customType === pendingType);
+			const messageIndex = branch.findIndex(
+				entry => entry.type === "custom_message" && entry.customType === "ordered",
+			);
+			const settledIndex = branch.findIndex(entry => entry.type === "custom" && entry.customType === settledType);
+			expect(pendingIndex).toBeGreaterThanOrEqual(0);
+			expect(messageIndex).toBeGreaterThan(pendingIndex);
+			expect(settledIndex).toBeGreaterThan(messageIndex);
+		});
+
+		it("recovers one pending delivery when conversation settlement persistence fails", async () => {
+			const sessionDir = path.join(tempDir, "sessions");
+			const manager = SessionManager.create(tempDir, sessionDir);
+			session = createPersistentSession(manager);
+			session.agent.state.isStreaming = true;
+			await session.sendCustomMessage(
+				{ customType: "failed-settlement", content: "recover exactly once", display: false, attribution: "agent" },
+				{ deliveryMode: "steer" },
+			);
+
+			const queued = session.agent.peekSteeringQueue()[0];
+			if (!queued) throw new Error("Expected a queued semantic steer");
+			const atomicBatch = vi
+				.spyOn(manager, "appendEntriesAtomically")
+				.mockRejectedValueOnce(new Error("conversation settlement publish failed"));
+			session.agent.state.isStreaming = false;
+			session.agent.emitExternalEvent({ type: "message_start", message: queued });
+			session.agent.emitExternalEvent({ type: "message_end", message: queued });
+			await waitFor(() => atomicBatch.mock.calls.length === 1);
+
+			const sessionFile = manager.getSessionFile();
+			if (!sessionFile) throw new Error("Expected a materialized session");
+			session = undefined as unknown as AgentSession;
+			const resumed = await reopen(sessionFile, sessionDir);
+			expect(resumed.agent.peekSteeringQueue()).toHaveLength(1);
+			expect(JSON.stringify(resumed.agent.peekSteeringQueue()[0])).toContain("recover exactly once");
+			expect(
+				resumed.sessionManager
+					.getBranch()
+					.some(entry => entry.type === "custom_message" && entry.customType === "failed-settlement"),
+			).toBe(false);
+			expect(
+				resumed.sessionManager
+					.getBranch()
+					.some(entry => entry.type === "custom" && entry.customType === settledType),
+			).toBe(false);
+		});
+	});
+
 	it("should throw when prompt() called while streaming", async () => {
 		await createSession();
 
@@ -152,6 +1423,64 @@ describe("AgentSession concurrent prompt guard", () => {
 		// Cleanup
 		await session.abort();
 		await firstPrompt.catch(() => {}); // Ignore abort error
+	});
+
+	it("coalesces concurrent abort callers onto one teardown promise", async () => {
+		await createSession();
+		const prompt = session.prompt("First message");
+		await waitFor(() => session.isStreaming);
+		const agentAbort = vi.spyOn(session.agent, "abort");
+
+		const firstAbort = session.abort();
+		const secondAbort = session.abort();
+		expect(secondAbort).toBe(firstAbort);
+		await expect(firstAbort).resolves.toBeUndefined();
+		await prompt.catch(() => {});
+		expect(agentAbort).toHaveBeenCalledTimes(1);
+	});
+
+	it("upgrades an in-flight internal abort to user-interrupt semantics", async () => {
+		await createSession();
+		const postPromptGate = Promise.withResolvers<void>();
+		session.trackPostPromptTaskForTests(postPromptGate.promise);
+		const agentAbort = vi.spyOn(session.agent, "abort");
+		const taskAborted = vi.spyOn(session.goalRuntime, "onTaskAborted").mockResolvedValue(undefined);
+
+		const internalAbort = session.abort({
+			goalReason: "internal",
+			preserveCompaction: true,
+			preserveToolChoice: true,
+		});
+		const userAbort = session.abort({ reason: USER_INTERRUPT_LABEL });
+		expect(userAbort).toBe(internalAbort);
+		expect(agentAbort).toHaveBeenLastCalledWith(USER_INTERRUPT_LABEL);
+
+		postPromptGate.resolve();
+		await userAbort;
+		expect(taskAborted).toHaveBeenCalledWith({ reason: "interrupted" });
+	});
+
+	it("does not begin a new prompt until abort teardown settles", async () => {
+		await createSession();
+		const promptAgent = vi.spyOn(session.agent, "prompt");
+		const firstPrompt = session.prompt("First message");
+		await waitFor(() => promptAgent.mock.calls.length === 1);
+		const postPromptGate = Promise.withResolvers<void>();
+		session.trackPostPromptTaskForTests(postPromptGate.promise);
+
+		const abort = session.abort();
+		const secondPrompt = session.prompt("Second message");
+		try {
+			await scheduler.yield();
+			expect(promptAgent).toHaveBeenCalledTimes(1);
+		} finally {
+			postPromptGate.resolve();
+		}
+
+		await abort;
+		await waitFor(() => promptAgent.mock.calls.length === 2);
+		await session.abort();
+		await Promise.allSettled([firstPrompt, secondPrompt]);
 	});
 
 	it("should allow steer() while streaming", async () => {
@@ -184,6 +1513,31 @@ describe("AgentSession concurrent prompt guard", () => {
 
 		// Cleanup
 		session.agent.clearAllQueues();
+		await session.abort();
+		await firstPrompt.catch(() => {});
+	});
+
+	it("reports hidden queued messages as pending without exposing them in the visible count", async () => {
+		await createSession();
+
+		const firstPrompt = session.prompt("First message");
+		await waitFor(() => session.isStreaming);
+		await session.sendCustomMessage(
+			{
+				customType: "hidden-follow-up",
+				content: "Hidden follow-up",
+				display: false,
+				attribution: "agent",
+			},
+			{ deliverAs: "followUp" },
+		);
+
+		expect(session.queuedMessageCount).toBe(0);
+		expect(session.hasPendingMessages()).toBe(true);
+		expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+
+		session.agent.clearAllQueues();
+		expect(session.hasPendingMessages()).toBe(false);
 		await session.abort();
 		await firstPrompt.catch(() => {});
 	});
@@ -268,7 +1622,258 @@ describe("AgentSession concurrent prompt guard", () => {
 		}
 	});
 
-	it("delivers hidden nextTurn stop reactions through the next LLM call without exposing them in the visible queue", async () => {
+	it("serializes extension command follow-ups after the active turn fully settles", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const streamStarted = Promise.withResolvers<void>();
+		const finishStream = Promise.withResolvers<void>();
+		const releaseFirstCommand = Promise.withResolvers<void>();
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: createAssistantMessage("") });
+					streamStarted.resolve();
+					void finishStream.promise.then(() => {
+						stream.push({ type: "done", reason: "stop", message: createAssistantMessage("Done") });
+					});
+				});
+				return stream;
+			},
+		});
+		const commandCalls: string[] = [];
+		const commandStreamingStates: boolean[] = [];
+		const extensionRuntime = new ExtensionRuntime();
+		const extension = await loadExtensionFromFactory(
+			pi => {
+				pi.registerCommand("after-turn", {
+					handler: async args => {
+						commandCalls.push(args);
+						commandStreamingStates.push(session.isStreaming);
+						if (args === "first") await releaseFirstCommand.promise;
+					},
+				});
+			},
+			tempDir,
+			new EventBus(),
+			extensionRuntime,
+			"follow-up-command",
+		);
+		const sessionManager = SessionManager.inMemory();
+		const settings = Settings.isolated();
+		const modelRegistry = sharedModelRegistry;
+		const extensionRunner = new ExtensionRunner(
+			[extension],
+			extensionRuntime,
+			tempDir,
+			sessionManager,
+			modelRegistry,
+		);
+		session = new AgentSession({ agent, sessionManager, settings, modelRegistry, extensionRunner });
+
+		const firstPrompt = session.prompt("First message");
+		await streamStarted.promise;
+		const firstCommand = session.sendUserMessage("/after-turn first", { deliverAs: "followUp" });
+		const secondCommand = session.sendUserMessage("/after-turn second", { deliverAs: "followUp" });
+
+		await scheduler.yield();
+		expect(commandCalls).toEqual([]);
+		finishStream.resolve();
+		await firstPrompt;
+		await waitFor(() => commandCalls.length > 0);
+		try {
+			expect(commandCalls).toEqual(["first"]);
+			expect(commandStreamingStates).toEqual([false]);
+		} finally {
+			releaseFirstCommand.resolve();
+		}
+		await Promise.all([firstCommand, secondCommand]);
+
+		expect(commandCalls).toEqual(["first", "second"]);
+		expect(commandStreamingStates).toEqual([false, false]);
+		expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+		expect(JSON.stringify(sessionManager.getEntries())).not.toContain("/after-turn");
+	});
+
+	it("terminates an exclusive handoff without waking the child until direct user input", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const extensionRuntime = new ExtensionRuntime();
+		let mutatorCalls = 0;
+		let commandCalls = 0;
+		let sourceFile: string | undefined;
+		let childFile: string | undefined;
+		let childTurn: Promise<unknown> | undefined;
+		const childGoal = {
+			id: "child-handoff-goal",
+			objective: "Continue only in the child session",
+			status: "active" as const,
+			tokensUsed: 0,
+			timeUsedSeconds: 0,
+			createdAt: Date.now(),
+			updatedAt: Date.now(),
+		};
+		const extension = await loadExtensionFromFactory(
+			pi => {
+				pi.registerTool({
+					name: "commit_handoff",
+					label: "Commit handoff",
+					description: "Commit a terminal child handoff",
+					parameters: pi.arktype({}),
+					concurrency: "exclusive",
+					terminalAfterSuccess: true,
+					async execute() {
+						pi.sendUserMessage("/commit-handoff child", { deliverAs: "followUp" });
+						return { content: [{ type: "text", text: "handoff committed" }], details: {} };
+					},
+				});
+				pi.registerTool({
+					name: "later_mutator",
+					label: "Later mutator",
+					description: "Must not run after the terminal handoff",
+					parameters: pi.arktype({}),
+					async execute() {
+						mutatorCalls++;
+						return { content: [{ type: "text", text: "mutated" }], details: {} };
+					},
+				});
+				pi.registerTool({
+					name: "child_complete",
+					label: "Child complete",
+					description: "Settle the child proof without another provider call",
+					parameters: pi.arktype({}),
+					concurrency: "exclusive",
+					terminalAfterSuccess: true,
+					async execute() {
+						return { content: [{ type: "text", text: "child settled" }], details: {} };
+					},
+				});
+				pi.registerCommand("commit-handoff", {
+					handler: async (_args, ctx) => {
+						commandCalls++;
+						if (!sourceFile) throw new Error("Expected source session file");
+						const result = await ctx.newSession({
+							parentSession: sourceFile,
+							setup: async manager => {
+								manager.appendCustomEntry("smarty-stack.handoff", { phase: "child_committed" });
+								manager.appendModeChange("goal", { goal: childGoal });
+							},
+						});
+						if (result.cancelled) throw new Error("Child handoff was cancelled");
+						childFile = session.sessionFile;
+						childTurn = pi.sendMessage(
+							{
+								customType: "smarty-stack.handoff-next-turn",
+								content: "Continue in the child session.",
+								display: false,
+								attribution: "agent",
+							},
+							{ deliverAs: "nextTurn", triggerTurn: true },
+						);
+					},
+				});
+			},
+			tempDir,
+			new EventBus(),
+			extensionRuntime,
+			"terminal-handoff",
+		);
+		const sessionManager = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+		const extensionRunner = new ExtensionRunner(
+			[extension],
+			extensionRuntime,
+			tempDir,
+			sessionManager,
+			sharedModelRegistry,
+		);
+		const tools = wrapRegisteredTools(extensionRunner.getAllRegisteredTools(), extensionRunner);
+		const requestSessionFiles: string[] = [];
+		let providerCalls = 0;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools },
+			convertToLlm,
+			streamFn: () => {
+				providerCalls++;
+				requestSessionFiles.push(session.sessionFile ?? "missing");
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: createAssistantMessage("") });
+					if (providerCalls === 1) {
+						const message = createAssistantMessage("");
+						message.stopReason = "toolUse";
+						message.content = [
+							{ type: "toolCall", id: "handoff-call", name: "commit_handoff", arguments: {} },
+							{ type: "toolCall", id: "mutator-call", name: "later_mutator", arguments: {} },
+						] as ToolCall[];
+						stream.push({ type: "done", reason: "toolUse", message });
+						return;
+					}
+					const message = createAssistantMessage("");
+					message.stopReason = "toolUse";
+					message.content = [
+						{ type: "text", text: "HANDOFF_CHILD_OK" },
+						{ type: "toolCall", id: "child-complete-call", name: "child_complete", arguments: {} },
+					] as AssistantMessage["content"];
+					stream.push({ type: "done", reason: "toolUse", message });
+				});
+				return stream;
+			},
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: sharedModelRegistry,
+			extensionRunner,
+			toolRegistry: new Map(tools.map(tool => [tool.name, tool])),
+		});
+		sourceFile = session.sessionFile;
+		if (!sourceFile) throw new Error("Expected persisted source session");
+		await initializeExtensions(session, {
+			reportSendError: (_action, error) => {
+				throw error;
+			},
+			reportRuntimeError: error => {
+				throw new Error(error.error);
+			},
+		});
+
+		await session.prompt("Commit the handoff");
+		await waitFor(() => childTurn !== undefined);
+		if (!childTurn) throw new Error("Expected child continuation task");
+		await childTurn;
+		expect(providerCalls).toBe(1);
+		await session.prompt("Continue in the child session");
+		await session.sessionManager.flush();
+		if (!childFile) throw new Error("Expected persisted child session");
+
+		const assistantTexts = async (file: string): Promise<string[]> =>
+			(await Bun.file(file).text())
+				.split("\n")
+				.filter(Boolean)
+				.flatMap(line => {
+					const entry = JSON.parse(line) as { type?: string; message?: AgentMessage };
+					if (entry.type !== "message" || entry.message?.role !== "assistant") return [];
+					return entry.message.content.flatMap(block => (block.type === "text" ? [block.text] : []));
+				});
+		const sourceAssistantTexts = await assistantTexts(sourceFile);
+		const childAssistantTexts = await assistantTexts(childFile);
+
+		expect(mutatorCalls).toBe(0);
+		expect(commandCalls).toBe(1);
+		expect(providerCalls).toBe(2);
+		expect(requestSessionFiles).toEqual([sourceFile, childFile]);
+		expect(sourceAssistantTexts).not.toContain("HANDOFF_CHILD_OK");
+		expect(childAssistantTexts).toContain("HANDOFF_CHILD_OK");
+		expect(session.getGoalModeState()).toMatchObject({
+			enabled: true,
+			mode: "active",
+			goal: { id: childGoal.id, objective: childGoal.objective, status: "active" },
+		});
+	});
+
+	it("defers hidden nextTurn stop reactions until the next direct user prompt", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		let firstStream: AssistantMessageEventStream | undefined;
 		const callMessages: Message[][] = [];
@@ -325,6 +1930,9 @@ describe("AgentSession concurrent prompt guard", () => {
 		firstStream?.push({ type: "done", reason: "stop", message: createAssistantMessage("Done") });
 		await firstPrompt;
 		await session.waitForIdle();
+		expect(callMessages).toHaveLength(1);
+
+		await session.prompt("Continue deliberately");
 
 		expect(callMessages).toHaveLength(2);
 		expect(
@@ -340,7 +1948,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		).toBe(true);
 	});
 
-	it("continues a main session from session_stop feedback before settling", async () => {
+	it("records session_stop feedback without starting an unscoped turn", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const mock = createMockModel({
 			handler: () => ({ content: ["Done"] }),
@@ -384,37 +1992,28 @@ describe("AgentSession concurrent prompt guard", () => {
 		await session.waitForIdle();
 
 		const callMessages = mock.calls.map(call => call.context.messages);
-		expect(callMessages).toHaveLength(2);
+		expect(callMessages).toHaveLength(1);
 		expect(
-			callMessages[1]?.some(message =>
+			callMessages[0]?.some(message =>
 				typeof message.content === "string"
 					? message.content.includes("Mission incomplete; continue.")
 					: message.content.some(
 							content => content.type === "text" && content.text.includes("Mission incomplete; continue."),
 						),
 			),
-		).toBe(true);
+		).toBe(false);
 		expect(eventOrder.filter(type => type === "session_stop" || type === "agent_end")).toEqual([
 			"session_stop",
 			"agent_end",
-			"session_stop",
-			"agent_end",
 		]);
-		expect(stopEvents.map(event => event.stop_hook_active)).toEqual([false, true]);
-		expect(stopEvents.map(event => event.turn_id)).toEqual([0, 0]);
+		expect(stopEvents.map(event => event.stop_hook_active)).toEqual([false]);
+		expect(stopEvents.map(event => event.turn_id)).toEqual([0]);
 		expect(stopEvents[0]?.session_id).toBe(session.sessionId);
 		expect(stopEvents[0]?.last_assistant_message?.role).toBe("assistant");
-		expect(
-			stopEvents[1]?.messages.some(
-				message =>
-					message.role === "user" &&
-					Array.isArray(message.content) &&
-					message.content.some(block => block.type === "text" && block.text === "First message"),
-			),
-		).toBe(true);
+		expect(stopEvents[0]?.messages.some(message => message.role === "user")).toBe(true);
 	});
 
-	it("uses non-empty session_stop reason when additional context is empty", async () => {
+	it("does not use a session_stop reason to create a hidden turn", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const mock = createMockModel({
 			handler: () => ({ content: ["Done"] }),
@@ -450,16 +2049,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		await session.prompt("First message");
 		await session.waitForIdle();
 
-		expect(mock.calls).toHaveLength(2);
-		expect(
-			mock.calls[1]?.context.messages.some(message =>
-				typeof message.content === "string"
-					? message.content.includes("Continue from fallback reason.")
-					: message.content.some(
-							content => content.type === "text" && content.text.includes("Continue from fallback reason."),
-						),
-			),
-		).toBe(true);
+		expect(mock.calls).toHaveLength(1);
 	});
 
 	it("does not emit session_stop when abort starts before the settle pass", async () => {
@@ -585,7 +2175,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		).toBe(false);
 	});
 
-	it("caps consecutive session_stop continuations at eight", async () => {
+	it("does not start any session_stop continuation", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const mock = createMockModel({
 			handler: () => ({ content: ["Pass"] }),
@@ -610,8 +2200,8 @@ describe("AgentSession concurrent prompt guard", () => {
 		await session.prompt("First message");
 		await session.waitForIdle();
 
-		expect(mock.calls).toHaveLength(9);
-		expect(extensionRunner.emitSessionStop).toHaveBeenCalledTimes(9);
+		expect(mock.calls).toHaveLength(1);
+		expect(extensionRunner.emitSessionStop).toHaveBeenCalledTimes(1);
 	});
 
 	it("emits session_stop only after empty-stop recovery reaches a final stop", async () => {
@@ -672,7 +2262,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		expect(extensionRunner.emitSessionStop).toHaveBeenCalledTimes(1);
 	});
 
-	it("continues session_stop feedback in ACP sessions with deferred client turns", async () => {
+	it("does not continue session_stop feedback in ACP sessions", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const mock = createMockModel({
 			handler: () => ({ content: ["Done"] }),
@@ -708,16 +2298,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		await session.prompt("First message");
 		await session.waitForIdle();
 
-		expect(mock.calls).toHaveLength(2);
-		expect(
-			mock.calls[1]?.context.messages.some(message =>
-				typeof message.content === "string"
-					? message.content.includes("ACP stop continuation.")
-					: message.content.some(
-							content => content.type === "text" && content.text.includes("ACP stop continuation."),
-						),
-			),
-		).toBe(true);
+		expect(mock.calls).toHaveLength(1);
 	});
 
 	it("does not emit session_stop for subagent sessions", async () => {
@@ -937,7 +2518,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		expect(session.isStreaming).toBe(false);
 		const callsAfterFirstPrompt = mock.calls.length;
 
-		await session.sendCustomMessage(
+		const disposition = await session.sendCustomMessage(
 			{
 				customType: "async-result",
 				content: "Background result",
@@ -946,7 +2527,11 @@ describe("AgentSession concurrent prompt guard", () => {
 			},
 			{ deliverAs: "followUp", triggerTurn: true },
 		);
-
+		expect(disposition).toEqual({
+			status: "downgraded",
+			delivery: "queued_next_turn",
+			reason: "unscoped_automatic_turn",
+		});
 		expect(mock.calls).toHaveLength(callsAfterFirstPrompt);
 		expect(session.isStreaming).toBe(false);
 
@@ -967,7 +2552,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		).toBe(true);
 	});
 
-	it("runs drained ACP async completions as owned follow-up turns despite deferred client turns", async () => {
+	it("persists owner-scoped ACP async completions without an open origin turn", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
 		const agent = new Agent({
@@ -985,8 +2570,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		const settings = Settings.isolated();
 		const modelRegistry = sharedModelRegistry;
 		const ownerId = "acp-session-a";
-		const deliveryGate = Promise.withResolvers<void>();
-		let deliveryStarted = false;
+		const jobGate = Promise.withResolvers<void>();
 		const asyncJobManager = new AsyncJobManager({
 			maxRunningJobs: 2,
 			retentionMs: 1_000,
@@ -1005,54 +2589,32 @@ describe("AgentSession concurrent prompt guard", () => {
 			capabilities: {},
 			deferAgentInitiatedTurns: true,
 		});
-		// Override the session's self-registered sink: the test gates delivery
-		// and reproduces the ACP follow-up injection explicitly.
-		asyncJobManager.registerDeliverySink(ownerId, async () => {
-			deliveryStarted = true;
-			await deliveryGate.promise;
-			await session.sendCustomMessage(
-				{
-					customType: "async-result",
-					content: "Background result",
-					display: true,
-					attribution: "agent",
-				},
-				{ deliverAs: "followUp", triggerTurn: true },
-			);
-		});
-
 		await session.prompt("First message");
 		expect(session.isStreaming).toBe(false);
 		const callsAfterFirstPrompt = mock.calls.length;
 
 		try {
-			asyncJobManager.register("bash", "owned job", async () => "Background result", {
-				id: "owned-job",
-				ownerId,
-			});
-			await waitFor(() => deliveryStarted);
-
-			const drainedPromise = session.drainAsyncJobDeliveriesForAcp({ timeoutMs: 1_000 });
-			await waitFor(() => asyncJobManager.getDeliveryState({ ownerId }).delivering);
-			deliveryGate.resolve();
-
-			await expect(drainedPromise).resolves.toBe(true);
+			asyncJobManager.register(
+				"bash",
+				"owned job",
+				async () => {
+					await jobGate.promise;
+					return "Background result";
+				},
+				{
+					id: "owned-job",
+					ownerId,
+				},
+			);
+			jobGate.resolve();
+			await asyncJobManager.waitForOwnerJobs(ownerId);
+			await asyncJobManager.drainDeliveries({ timeoutMs: 1_000, filter: { ownerId } });
 			await session.waitForIdle();
 
-			expect(mock.calls).toHaveLength(callsAfterFirstPrompt + 1);
-			expect(
-				mock.calls.at(-1)?.context.messages.some(message => {
-					if (typeof message.content === "string") {
-						return message.content.includes("Background result");
-					}
-
-					return message.content.some(
-						content => content.type === "text" && content.text.includes("Background result"),
-					);
-				}),
-			).toBe(true);
+			expect(mock.calls).toHaveLength(callsAfterFirstPrompt);
+			expect(agent.state.messages.some(message => JSON.stringify(message).includes("Background result"))).toBe(true);
 		} finally {
-			deliveryGate.resolve();
+			jobGate.resolve();
 		}
 	});
 

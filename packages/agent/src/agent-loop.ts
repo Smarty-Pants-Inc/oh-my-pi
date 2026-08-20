@@ -5,6 +5,7 @@
 import {
 	type AssistantMessage,
 	type AssistantMessageEvent,
+	type AssistantMessageEventStream,
 	type ComputerAction,
 	type ComputerSafetyCheck,
 	type Context,
@@ -48,6 +49,7 @@ import {
 } from "@oh-my-pi/pi-ai/utils/harmony-leak";
 import { logger, sanitizeText, structuredCloneJSON } from "@oh-my-pi/pi-utils";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
+import { collectCompactionContextInstructions } from "./compaction/messages";
 import { agentPauseGate } from "./pause";
 import { type AgentRunCoverage, type AgentRunSummary, ToolCallBlockedError } from "./run-collector";
 import {
@@ -84,7 +86,7 @@ import type {
 	SteeringQueueState,
 	StreamFn,
 } from "./types";
-import { ASIDE_MESSAGE_COMMIT, ASIDE_MESSAGE_DISCARD, isSoftToolRequirement } from "./types";
+import { ASIDE_MESSAGE_COMMIT, ASIDE_MESSAGE_DISCARD, ASIDE_MESSAGE_SEAL, isSoftToolRequirement } from "./types";
 import { yieldIfDue } from "./utils/yield";
 
 /** Stop-details marker for a provider error after assistant content/tool args already streamed. */
@@ -121,6 +123,13 @@ function hardToolChoiceBlocks(choice: ToolChoice | undefined, requiredTool: stri
 	if (choice.type === "computer") return requiredTool !== "computer";
 	const name = choice.type === "tool" ? choice.name : "function" in choice ? choice.function.name : choice.name;
 	return name !== requiredTool;
+}
+
+/** Return the named tool targeted by a provider-specific hard choice. */
+function namedToolChoice(choice: ToolChoice | undefined): string | undefined {
+	if (!choice || typeof choice === "string") return undefined;
+	if (choice.type === "computer") return "computer";
+	return choice.type === "tool" ? choice.name : "function" in choice ? choice.function.name : choice.name;
 }
 
 /**
@@ -538,9 +547,8 @@ export function agentLoop(
 			...context,
 			messages: [...context.messages, ...prompts],
 		};
-		for (const prompt of prompts) {
-			(prompt as CommittableAsideMessage)[ASIDE_MESSAGE_COMMIT]?.();
-		}
+		sealAsides(prompts);
+		if (config.onProviderCallStarted === undefined) commitAsides(prompts);
 
 		stream.push({ type: "agent_start" });
 
@@ -983,6 +991,23 @@ function discardAsides(messages: readonly AgentMessage[], error: Error): void {
 		(message as CommittableAsideMessage)[ASIDE_MESSAGE_DISCARD]?.(error);
 	}
 }
+function commitAsides(messages: readonly AgentMessage[]): void {
+	for (const message of messages) {
+		(message as CommittableAsideMessage)[ASIDE_MESSAGE_COMMIT]?.();
+	}
+}
+function sealAsides(messages: readonly AgentMessage[]): void {
+	for (const message of messages) {
+		(message as CommittableAsideMessage)[ASIDE_MESSAGE_SEAL]?.();
+	}
+}
+function removeMessagesByIdentity(target: AgentMessage[], removed: readonly AgentMessage[]): void {
+	if (removed.length === 0) return;
+	const removedSet = new Set(removed);
+	for (let index = target.length - 1; index >= 0; index--) {
+		if (removedSet.has(target[index]!)) target.splice(index, 1);
+	}
+}
 
 async function runLoopBody(
 	currentContext: AgentContext,
@@ -1012,14 +1037,48 @@ async function runLoopBody(
 	}
 
 	const softRequirementState = config.softToolRequirementState ?? { escalations: 0 };
+	const initialSoftRequirementState = {
+		id: softRequirementState.id,
+		forcedToolChoice: softRequirementState.forcedToolChoice,
+		escalations: softRequirementState.escalations,
+	};
 	let preserveSoftRequirementState = false;
+	let providerCallAccepted = config.onProviderCallStarted === undefined;
+	let provisionalMessages: AgentMessage[] = providerCallAccepted ? [] : [...initialMessages];
+	let provisionalTurnMessages: AgentMessage[] | undefined;
+	let provisionalSoftRequirementState: typeof initialSoftRequirementState | undefined;
+	let pendingHardToolChoiceRollback = false;
+	const rollbackPendingHardToolChoice = (): void => {
+		if (!pendingHardToolChoiceRollback) return;
+		pendingHardToolChoiceRollback = false;
+		config.onToolChoiceRejected?.();
+	};
+	const finishAgentStream = () =>
+		endAgentStream(stream, providerCallAccepted ? newMessages : [], telemetry, stepCounter.count);
 
+	const rollbackProvisionalMessages = (error: Error): void => {
+		if (provisionalMessages.length === 0 && !provisionalSoftRequirementState) return;
+		const messages = provisionalMessages;
+		provisionalMessages = [];
+		removeMessagesByIdentity(currentContext.messages, messages);
+		removeMessagesByIdentity(newMessages, messages);
+		if (provisionalTurnMessages) removeMessagesByIdentity(provisionalTurnMessages, messages);
+		provisionalTurnMessages = undefined;
+		discardAsides(messages, error);
+		if (provisionalSoftRequirementState) {
+			softRequirementState.id = provisionalSoftRequirementState.id;
+			softRequirementState.forcedToolChoice = provisionalSoftRequirementState.forcedToolChoice;
+			softRequirementState.escalations = provisionalSoftRequirementState.escalations;
+			provisionalSoftRequirementState = undefined;
+		}
+	};
 	let pendingMessages: AgentMessage[] = [];
 	try {
 		let messagesToEmit = [...initialMessages];
+		if (!providerCallAccepted) provisionalTurnMessages = messagesToEmit;
 		if (isDeadlineExceeded(config.deadline)) {
-			emitInputMessages(stream, messagesToEmit);
-			endAgentStream(stream, newMessages, telemetry, stepCounter.count);
+			if (providerCallAccepted) emitInputMessages(stream, messagesToEmit);
+			finishAgentStream();
 			return;
 		}
 		// Check for steering messages at start (user may have typed while waiting).
@@ -1028,8 +1087,10 @@ async function runLoopBody(
 		try {
 			pendingMessages = signal?.aborted ? [] : (await config.getSteeringMessages?.(signal)) || [];
 		} catch (error) {
-			stream.push({ type: "turn_start" });
-			emitInputMessages(stream, messagesToEmit);
+			if (providerCallAccepted) {
+				stream.push({ type: "turn_start" });
+				emitInputMessages(stream, messagesToEmit);
+			}
 			throw error;
 		}
 		let harmonyRetryAttempt = 0;
@@ -1053,9 +1114,17 @@ async function runLoopBody(
 
 			// Inner loop: process tool calls and steering messages
 			while (hasMoreToolCalls || pendingMessages.length > 0) {
+				let providerRequestAccepted = config.onProviderCallStarted === undefined;
+				if (!providerRequestAccepted) {
+					provisionalSoftRequirementState = {
+						id: softRequirementState.id,
+						forcedToolChoice: softRequirementState.forcedToolChoice,
+						escalations: softRequirementState.escalations,
+					};
+				}
 				if (isDeadlineExceeded(config.deadline)) {
-					emitInputMessages(stream, messagesToEmit);
-					endAgentStream(stream, newMessages, telemetry, stepCounter.count);
+					if (providerCallAccepted) emitInputMessages(stream, messagesToEmit);
+					finishAgentStream();
 					return;
 				}
 				// Yield at the top of each iteration to prevent busy-wait when
@@ -1072,12 +1141,18 @@ async function runLoopBody(
 				const turnMessages = messagesToEmit;
 				messagesToEmit = [];
 				if (pendingMessages.length > 0) {
+					if (!providerRequestAccepted) provisionalTurnMessages = turnMessages;
 					for (const message of pendingMessages) {
 						currentContext.messages.push(message);
 						newMessages.push(message);
 						turnMessages.push(message);
-						(message as CommittableAsideMessage)[ASIDE_MESSAGE_COMMIT]?.();
+						if (providerRequestAccepted) {
+							(message as CommittableAsideMessage)[ASIDE_MESSAGE_COMMIT]?.();
+						} else {
+							provisionalMessages.push(message);
+						}
 					}
+					sealAsides(pendingMessages);
 					pendingMessages = [];
 				}
 
@@ -1092,6 +1167,7 @@ async function runLoopBody(
 						const directive = signal?.aborted ? undefined : config.getToolChoice?.();
 						const softReq = isSoftToolRequirement(directive) ? directive : undefined;
 						hostToolChoice = directive === undefined || isSoftToolRequirement(directive) ? undefined : directive;
+						pendingHardToolChoiceRollback = hostToolChoice !== undefined;
 						softRequiredTool = softReq?.toolName;
 						softSatisfies = softReq?.satisfies;
 						const softRequirementId = softRequirementState.id;
@@ -1104,6 +1180,10 @@ async function runLoopBody(
 									currentContext.messages.push(reminder);
 									newMessages.push(reminder);
 									turnMessages.push(reminder);
+									if (!providerRequestAccepted) {
+										provisionalTurnMessages = turnMessages;
+										provisionalMessages.push(reminder);
+									}
 								}
 							}
 						} else {
@@ -1117,7 +1197,11 @@ async function runLoopBody(
 					preparedProviderCall = await prepareProviderCall(currentContext, config, signal);
 					gateResult = (await config.beforeModelCall?.(preparedProviderCall.context, signal)) || undefined;
 				} catch (error) {
-					if (!turnOpen) {
+					if (!providerRequestAccepted) {
+						rollbackProvisionalMessages(error instanceof Error ? error : new Error(String(error)));
+						if (!signal?.aborted) rollbackPendingHardToolChoice();
+					}
+					if (!turnOpen && providerRequestAccepted) {
 						stream.push({ type: "turn_start" });
 						emitInputMessages(stream, turnMessages);
 						turnOpen = true;
@@ -1128,20 +1212,26 @@ async function runLoopBody(
 					gateResult = { stop: true };
 				}
 				if (gateResult?.stop) {
+					if (!providerRequestAccepted) {
+						rollbackProvisionalMessages(new Error("Queued message was not committed before provider dispatch"));
+					}
 					if (gateResult.reason) {
 						logger.debug("Agent loop stopped before the model call", { reason: gateResult.reason });
 					}
 					if (!turnOpen && !signal?.aborted) {
 						try {
+							pendingHardToolChoiceRollback = false;
 							config.onToolChoiceRejected?.();
 						} catch (error) {
-							stream.push({ type: "turn_start" });
-							emitInputMessages(stream, turnMessages);
-							turnOpen = true;
+							if (providerRequestAccepted) {
+								stream.push({ type: "turn_start" });
+								emitInputMessages(stream, turnMessages);
+								turnOpen = true;
+							}
 							throw error;
 						}
 					}
-					emitInputMessages(stream, turnMessages);
+					if (providerRequestAccepted) emitInputMessages(stream, turnMessages);
 					if (turnOpen) {
 						const stopMessage = createGateStopMessage(preparedProviderCall.model, gateResult.reason);
 						currentContext.messages.push(stopMessage);
@@ -1161,23 +1251,45 @@ async function runLoopBody(
 						turnOpen = false;
 					}
 					preserveSoftRequirementState = !signal?.aborted;
-					endAgentStream(stream, newMessages, telemetry, stepCounter.count);
+					finishAgentStream();
 					return;
 				}
 
-				if (!turnOpen) {
+				const deferTurnStart = !turnOpen && !providerRequestAccepted;
+				if (!turnOpen && !deferTurnStart) {
 					stream.push({ type: "turn_start" });
 					emitInputMessages(stream, turnMessages);
 					turnOpen = true;
 				}
+				const providerConfig = !providerRequestAccepted
+					? {
+							...config,
+							onProviderCallStarted: () => {
+								config.onProviderCallStarted?.();
+								pendingHardToolChoiceRollback = false;
+								provisionalSoftRequirementState = undefined;
+								commitAsides(provisionalMessages);
+								provisionalMessages = [];
+								provisionalTurnMessages = undefined;
+								providerRequestAccepted = true;
+								providerCallAccepted = true;
+								if (!turnOpen) {
+									stream.push({ type: "turn_start" });
+									emitInputMessages(stream, turnMessages);
+									turnOpen = true;
+								}
+							},
+						}
+					: config;
 
 				// Stream assistant response
 				let recovered: HarmonyRecoveredToolCall | undefined;
 				let message: AssistantMessage;
+				if (providerRequestAccepted) pendingHardToolChoiceRollback = false;
 				try {
 					message = await streamAssistantResponse(
 						currentContext,
-						config,
+						providerConfig,
 						signal,
 						stream,
 						telemetry,
@@ -1192,6 +1304,11 @@ async function runLoopBody(
 					harmonyRetryAttempt = 0;
 					harmonyTruncateResumeCount = 0;
 				} catch (err) {
+					if (!providerRequestAccepted) {
+						rollbackProvisionalMessages(err instanceof Error ? err : new Error(String(err)));
+						if (!signal?.aborted) rollbackPendingHardToolChoice();
+						throw err;
+					}
 					if (!(err instanceof HarmonyLeakInterruption)) throw err;
 					if (err.recovered) {
 						if (harmonyTruncateResumeCount >= 2) {
@@ -1275,8 +1392,7 @@ async function runLoopBody(
 					await emitTurnEnd(stream, currentContext, message, toolResults, config, signal, { willContinue: false });
 					turnOpen = false;
 
-					stream.push(buildAgentEndEvent(newMessages, telemetry, stepCounter.count));
-					stream.end(newMessages);
+					finishAgentStream();
 					return;
 				}
 
@@ -1311,37 +1427,37 @@ async function runLoopBody(
 					hasMoreToolCalls = false;
 				}
 
-				// A turn is compliant ONLY when it calls the required tool and nothing
-				// else — mirroring the forced-tool_choice turn, which can emit only that
-				// tool. A required+detour batch is treated as non-compliant so detour
-				// tools never run side effects while the requirement is still pending.
+				// Owned/in-band dialects cannot send native tool_choice, so emulate a
+				// named hard choice with the same local gate used by soft requirements.
+				// Keep the consumed host directive live across retries until the model
+				// calls only the required tool; detour calls are paired but never run.
+				const ownedHardRequiredTool = preparedProviderCall.ownedDialect
+					? namedToolChoice(hostToolChoice ?? config.toolChoice)
+					: undefined;
+				const requiredTool = ownedHardRequiredTool ?? softRequiredTool;
+				const requiredSatisfies = ownedHardRequiredTool === undefined ? softSatisfies : undefined;
 				const calledOnlyRequiredTool =
-					softRequiredTool !== undefined &&
+					requiredTool !== undefined &&
 					toolCalls.length > 0 &&
-					toolCalls.every(toolCall => softSatisfies?.(toolCall) ?? toolCall.name === softRequiredTool);
-				const softGateActive =
-					softRequiredTool !== undefined && !hardToolChoiceBlocks(config.toolChoice, softRequiredTool);
-				const softNonCompliant = softGateActive && !calledOnlyRequiredTool;
+					toolCalls.every(toolCall => requiredSatisfies?.(toolCall) ?? toolCall.name === requiredTool);
+				const requirementActive =
+					requiredTool !== undefined &&
+					(ownedHardRequiredTool !== undefined || !hardToolChoiceBlocks(config.toolChoice, requiredTool));
+				const requirementNonCompliant = requirementActive && !calledOnlyRequiredTool;
 
 				const toolResults: ToolResultMessage[] = [];
-				if (softNonCompliant && softRequiredTool !== undefined) {
+				if (requirementNonCompliant && requiredTool !== undefined) {
 					if (softRequirementState.escalations >= MAX_SOFT_TOOL_ESCALATIONS) {
 						throw new Error(
-							`Soft tool requirement '${softRequiredTool}' was not satisfied after ${MAX_SOFT_TOOL_ESCALATIONS} forced turns; aborting to avoid an unbounded force loop.`,
+							`Required tool '${requiredTool}' was not satisfied after ${MAX_SOFT_TOOL_ESCALATIONS} retry turns; aborting to avoid an unbounded force loop.`,
 						);
 					}
-					// A soft-required tool is pending but the model called something else
-					// (or yielded). Do NOT execute the detour — pair each call with a
-					// skipped result and force the required tool next turn. This is the
-					// only turn that changes toolChoice; a model that complies with the
-					// reminder pays no message-cache invalidation. Re-engage so the loop
-					// never yields while the requirement is unmet.
 					for (const toolCall of toolCalls) {
 						const result = createAbortedToolResult(
 							toolCall,
 							stream,
 							"skipped",
-							`Not executed: call the \`${softRequiredTool}\` tool to resolve the pending action before using other tools.`,
+							`Not executed: call the \`${requiredTool}\` tool to resolve the pending action before using other tools.`,
 						);
 						currentContext.messages.push(result);
 						newMessages.push(result);
@@ -1352,7 +1468,13 @@ async function runLoopBody(
 							status: "skipped",
 						});
 					}
-					softRequirementState.forcedToolChoice = { type: "tool", name: softRequiredTool };
+					if (ownedHardRequiredTool !== undefined) {
+						// The queue source is consuming. Do not fetch the next directive until
+						// this in-band model has satisfied the current named choice.
+						directiveResolvedForTurn = true;
+					} else {
+						softRequirementState.forcedToolChoice = { type: "tool", name: requiredTool };
+					}
 					softRequirementState.escalations++;
 					hasMoreToolCalls = true;
 				} else if (hasMoreToolCalls) {
@@ -1422,7 +1544,7 @@ async function runLoopBody(
 				turnOpen = false;
 
 				if (isDeadlineExceeded(config.deadline)) {
-					endAgentStream(stream, newMessages, telemetry, stepCounter.count);
+					finishAgentStream();
 					return;
 				}
 				// On external abort (user interrupt), leave the steering queue intact: the
@@ -1445,7 +1567,7 @@ async function runLoopBody(
 			}
 
 			if (isDeadlineExceeded(config.deadline)) {
-				endAgentStream(stream, newMessages, telemetry, stepCounter.count);
+				finishAgentStream();
 				return;
 			}
 
@@ -1453,7 +1575,7 @@ async function runLoopBody(
 			await config.onBeforeYield?.();
 
 			if (isDeadlineExceeded(config.deadline)) {
-				endAgentStream(stream, newMessages, telemetry, stepCounter.count);
+				finishAgentStream();
 				return;
 			}
 			// Skip queue drains when externally aborted (same stranding hazard as above).
@@ -1473,20 +1595,23 @@ async function runLoopBody(
 			break;
 		}
 
-		endAgentStream(stream, newMessages, telemetry, stepCounter.count);
+		finishAgentStream();
 	} finally {
+		rollbackProvisionalMessages(new Error("Queued message was not committed before provider dispatch"));
 		discardAsides(pendingMessages, new Error("Aside message was not committed before the agent loop ended"));
-		if (!preserveSoftRequirementState) {
+		if (!providerCallAccepted) {
+			softRequirementState.id = initialSoftRequirementState.id;
+			softRequirementState.forcedToolChoice = initialSoftRequirementState.forcedToolChoice;
+			softRequirementState.escalations = initialSoftRequirementState.escalations;
+		} else if (!preserveSoftRequirementState) {
 			softRequirementState.id = undefined;
 			softRequirementState.forcedToolChoice = undefined;
 			softRequirementState.escalations = 0;
 		}
-		if (deadlineTimer) {
-			clearTimeout(deadlineTimer);
-		}
+		if (deadlineTimer) clearTimeout(deadlineTimer);
+		if (!providerCallAccepted) rollbackPendingHardToolChoice();
 	}
 }
-
 async function emitHarmonyAudit(
 	config: AgentLoopConfig,
 	interruption: HarmonyLeakInterruption,
@@ -1523,6 +1648,7 @@ async function prepareProviderCall(
 	}
 
 	const llmMessages = await config.convertToLlm(messages);
+	const compactionInstructions = collectCompactionContextInstructions(messages, config.contextTarget ?? "main");
 	const normalizedMessages = normalizeMessagesForProvider(llmMessages, model);
 	const ownedDialect: Dialect | undefined = config.dialect ?? resolveOwnedDialectFromEnv(Bun.env.PI_DIALECT);
 	const pruneToolDescriptions = !!config.pruneToolDescriptions && !ownedDialect;
@@ -1536,12 +1662,16 @@ async function prepareProviderCall(
 	} else {
 		llmContext = {
 			systemPrompt: context.systemPrompt,
+			instructions: compactionInstructions,
 			messages: normalizedMessages,
 			tools: normalizeTools(context.tools, {
 				injectIntent: !!config.intentTracing,
 				pruneDescriptions: pruneToolDescriptions,
 			}),
 		};
+	}
+	if (config.appendOnlyContext && compactionInstructions.length > 0) {
+		llmContext = { ...llmContext, instructions: compactionInstructions };
 	}
 	if (config.transformProviderContext) {
 		llmContext = await config.transformProviderContext(llmContext, model);
@@ -1602,15 +1732,28 @@ async function streamAssistantResponse(
 	// `requestSignal`), so it cancels the request without tripping the loop's
 	// external-abort handling (`abortRacePromise` / `requestSignal.aborted`).
 	const promptToolAbortController = ownedDialect ? new AbortController() : undefined;
+	const providerAcceptanceAbortController = config.onProviderCallStarted ? new AbortController() : undefined;
 	const providerAbortSignals: AbortSignal[] = [];
 	if (requestSignal) providerAbortSignals.push(requestSignal);
 	if (promptToolAbortController) providerAbortSignals.push(promptToolAbortController.signal);
+	if (providerAcceptanceAbortController) providerAbortSignals.push(providerAcceptanceAbortController.signal);
 	const finalRequestSignal =
 		providerAbortSignals.length === 0
 			? undefined
 			: providerAbortSignals.length === 1
 				? providerAbortSignals[0]!
 				: AbortSignal.any(providerAbortSignals);
+	let providerResponseAccepted = config.onProviderCallStarted === undefined;
+	const acceptProviderResponse = (): void => {
+		if (providerResponseAccepted) return;
+		try {
+			config.onProviderCallStarted?.();
+			providerResponseAccepted = true;
+		} catch (error) {
+			providerAcceptanceAbortController?.abort(error);
+			throw error;
+		}
+	};
 	const requestApiKey = (config.getApiKey ? await config.getApiKey(model) : undefined) ?? config.apiKey;
 	const resolvedApiKey = await resolveApiKeyOnce(requestApiKey, finalRequestSignal);
 	const apiKey = isApiKeyResolver(requestApiKey) ? seedApiKeyResolver(resolvedApiKey, requestApiKey) : requestApiKey;
@@ -1655,6 +1798,7 @@ async function streamAssistantResponse(
 	const userOnResponse = config.onResponse;
 	const captureOnResponse: AgentLoopConfig["onResponse"] = (response, modelInfo) => {
 		capturedHeaders = response.headers;
+		acceptProviderResponse();
 		return userOnResponse?.(response, modelInfo);
 	};
 
@@ -1669,19 +1813,35 @@ async function streamAssistantResponse(
 
 	try {
 		return await runInActiveSpan(chatSpan, async () => {
-			let response = await streamFunction(model, llmContext, {
-				...config,
-				apiKey,
-				metadata: resolvedMetadata,
-				toolChoice: effectiveToolChoice,
-				reasoning: effectiveReasoning,
-				disableReasoning: effectiveDisableReasoning,
-				temperature: effectiveTemperature,
-				serviceTier: effectiveServiceTier,
-				cwd: effectiveCwd,
-				signal: finalRequestSignal,
-				onResponse: captureOnResponse,
-			});
+			const onPayload: AgentLoopConfig["onPayload"] =
+				promptToolWireTools && ownedDialect && config.onToolContracts
+					? async (payload, payloadModel) => {
+							const replacement = await config.onPayload?.(payload, payloadModel);
+							await config.onToolContracts?.({ tools: promptToolWireTools }, payloadModel ?? model);
+							return replacement;
+						}
+					: config.onPayload;
+			let response: AssistantMessageEventStream;
+			try {
+				response = await streamFunction(model, llmContext, {
+					...config,
+					apiKey,
+					metadata: resolvedMetadata,
+					toolChoice: effectiveToolChoice,
+					reasoning: effectiveReasoning,
+					disableReasoning: effectiveDisableReasoning,
+					temperature: effectiveTemperature,
+					serviceTier: effectiveServiceTier,
+					cwd: effectiveCwd,
+					signal: finalRequestSignal,
+					onPayload,
+					onToolContracts: ownedDialect ? undefined : config.onToolContracts,
+					onResponse: captureOnResponse,
+				});
+			} catch (error) {
+				providerAcceptanceAbortController?.abort(error);
+				throw error;
+			}
 			if (promptToolWireTools && ownedDialect) {
 				// Re-materialize in-band tool-call text as native toolCall content blocks
 				// so the rest of the loop executes them unchanged. When the model starts
@@ -1700,6 +1860,24 @@ async function streamAssistantResponse(
 			let partialMessage: AssistantMessage | null = null;
 			let addedPartial = false;
 			const completedToolCallIds = new Set<string>();
+			let provisionalStartEvent: Extract<AssistantMessageEvent, { type: "start" }> | undefined;
+			const applyStartEvent = (event: Extract<AssistantMessageEvent, { type: "start" }>): void => {
+				partialMessage = event.partial;
+				if (addedPartial) {
+					context.messages[context.messages.length - 1] = partialMessage;
+					completedToolCallIds.clear();
+					const messageSnapshot = snapshotAssistantMessage(partialMessage);
+					stream.push({
+						type: "message_update",
+						assistantMessageEvent: snapshotAssistantMessageEvent(event, messageSnapshot),
+						message: messageSnapshot,
+					});
+				} else {
+					context.messages.push(partialMessage);
+					addedPartial = true;
+					stream.push({ type: "message_start", message: snapshotAssistantMessage(partialMessage) });
+				}
+			};
 
 			const responseIterator = response[Symbol.asyncIterator]();
 			const finishAbortedStream = async (): Promise<AssistantMessage> => {
@@ -1708,6 +1886,12 @@ async function streamAssistantResponse(
 					if (cleanup) void cleanup.catch(() => {});
 				} catch {
 					// Provider cancellation failures cannot change the committed aborted message.
+				}
+				if (!providerResponseAccepted) {
+					const reason = requestSignal?.reason;
+					throw reason instanceof Error
+						? reason
+						: new Error("Provider request aborted before response acceptance");
 				}
 				const aborted = emitAbortedAssistantMessage(
 					partialMessage,
@@ -1753,6 +1937,21 @@ async function streamAssistantResponse(
 					if (next.done) break;
 
 					const event = next.value;
+					if (event.type === "start" && !providerResponseAccepted) {
+						provisionalStartEvent = event;
+						continue;
+					}
+					if (event.type === "error" && !providerResponseAccepted) {
+						const failure = await response.result();
+						throw new Error(failure.errorMessage ?? "Provider request failed before response acceptance");
+					}
+					if (event.type !== "start" && event.type !== "error") {
+						acceptProviderResponse();
+						if (provisionalStartEvent) {
+							applyStartEvent(provisionalStartEvent);
+							provisionalStartEvent = undefined;
+						}
+					}
 					if (event.type === "done" || event.type === "error") {
 						let finalMessage = recoverTransientErrorToolTurn(
 							retainCompletedToolCalls(await response.result(), completedToolCallIds),
@@ -1815,25 +2014,7 @@ async function streamAssistantResponse(
 
 					switch (event.type) {
 						case "start":
-							partialMessage = event.partial;
-							if (addedPartial) {
-								context.messages[context.messages.length - 1] = partialMessage;
-								completedToolCallIds.clear();
-								// `message` and `assistantMessageEvent.partial` intentionally share one
-								// immutable snapshot of the streaming partial: every message_update
-								// consumer treats both as read-only, so cloning the identical partial
-								// twice per delta was pure waste.
-								const messageSnapshot = snapshotAssistantMessage(partialMessage);
-								stream.push({
-									type: "message_update",
-									assistantMessageEvent: snapshotAssistantMessageEvent(event, messageSnapshot),
-									message: messageSnapshot,
-								});
-							} else {
-								context.messages.push(partialMessage);
-								addedPartial = true;
-								stream.push({ type: "message_start", message: snapshotAssistantMessage(partialMessage) });
-							}
+							applyStartEvent(event);
 							break;
 
 						case "text_start":
@@ -1871,6 +2052,10 @@ async function streamAssistantResponse(
 				detachAbortListener?.();
 			}
 
+			if (!providerResponseAccepted) {
+				throw new Error("Provider stream ended before response acceptance");
+			}
+
 			let trailing = await response.result();
 			if (harmonyMitigationEnabled) {
 				const detection = detectHarmonyLeakInAssistantMessage(trailing);
@@ -1898,12 +2083,13 @@ async function streamAssistantResponse(
 			return trailing;
 		});
 	} catch (err) {
+		const finalError = err;
 		failChatSpan(telemetry, chatSpan, {
-			errorObject: err,
+			errorObject: finalError,
 			responseHeaders: capturedHeaders,
 			baseUrl: model.baseUrl,
 		});
-		throw err;
+		throw finalError;
 	}
 }
 

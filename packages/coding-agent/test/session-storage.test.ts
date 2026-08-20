@@ -205,7 +205,19 @@ describe("FileSessionStorage.deleteSessionWithArtifacts", () => {
 		expect(fs.existsSync(artifactsDir)).toBe(false);
 	});
 
-	it("throws when artifact cleanup fails after the session file is deleted", async () => {
+	it("removes artifacts even when the session journal never materialized", async () => {
+		const sessionPath = path.join(tempDir, "artifact-only.jsonl");
+		const artifactsDir = sessionPath.slice(0, -6);
+		await fsp.mkdir(path.join(artifactsDir, "local"), { recursive: true });
+		await fsp.writeFile(path.join(artifactsDir, "local", "secret.txt"), "secret");
+
+		await expect(storage.deleteSessionWithArtifacts(sessionPath)).resolves.toBeUndefined();
+
+		expect(fs.existsSync(sessionPath)).toBe(false);
+		expect(fs.existsSync(artifactsDir)).toBe(false);
+	});
+
+	it("retains a durable deletion intent and retries failed artifact cleanup", async () => {
 		const sessionPath = await createSessionFile("cleanup-failure");
 		const artifactsDir = sessionPath.slice(0, -6);
 		await fsp.mkdir(artifactsDir, { recursive: true });
@@ -214,12 +226,26 @@ describe("FileSessionStorage.deleteSessionWithArtifacts", () => {
 		const rmError = new Error("permission denied");
 		const rmSpy = vi.spyOn(fsp, "rm").mockRejectedValueOnce(rmError);
 
-		await expect(storage.deleteSessionWithArtifacts(sessionPath)).rejects.toThrow(
-			`Session file deleted but failed to remove artifacts directory ${artifactsDir}: permission denied`,
-		);
+		await expect(storage.deleteSessionWithArtifacts(sessionPath)).rejects.toMatchObject({
+			message: `Failed to delete session and artifacts for ${sessionPath}`,
+			errors: [rmError],
+		});
 		expect(rmSpy).toHaveBeenCalledWith(artifactsDir, { recursive: true, force: true });
 		expect(fs.existsSync(sessionPath)).toBe(false);
 		expect(fs.existsSync(artifactsDir)).toBe(true);
+
+		rmSpy.mockRestore();
+		const intentName = (await fsp.readdir(tempDir)).find(name => name.startsWith(".omp-artifact-operation-delete-"));
+		if (!intentName) throw new Error("expected durable deletion intent");
+		const intentPath = path.join(tempDir, intentName);
+		const intent = JSON.parse(await fsp.readFile(intentPath, "utf8")) as { ownerPid: number };
+		intent.ownerPid = 0;
+		await fsp.writeFile(intentPath, `${JSON.stringify(intent)}\n`);
+
+		storage.reconcileArtifactOperationsSync(tempDir);
+
+		expect(fs.existsSync(artifactsDir)).toBe(false);
+		expect(fs.existsSync(intentPath)).toBe(false);
 	});
 });
 

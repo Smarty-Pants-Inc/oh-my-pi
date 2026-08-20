@@ -287,7 +287,7 @@ describe("AgentSession auto-compaction progress guard", () => {
 		expect(noProgress.length).toBe(1);
 	});
 
-	it("drains queued messages when no-headroom compaction pauses auto-continue", async () => {
+	it("does not drain an unscoped queued message when no-headroom compaction pauses", async () => {
 		session.agent.followUp({
 			role: "custom",
 			customType: "test",
@@ -296,9 +296,7 @@ describe("AgentSession auto-compaction progress guard", () => {
 			timestamp: Date.now(),
 		});
 
-		const continueSpy = vi.spyOn(session.agent, "continue").mockImplementation(async () => {
-			session.agent.clearAllQueues();
-		});
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue(undefined);
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined as never);
 		vi.spyOn(session, "getContextUsage").mockReturnValue({ tokens: 190000, contextWindow: 200000, percent: 95 });
 
@@ -317,9 +315,11 @@ describe("AgentSession auto-compaction progress guard", () => {
 		await session.waitForIdle();
 
 		expect(promptSpy).not.toHaveBeenCalled();
-		expect(continueSpy).toHaveBeenCalledTimes(1);
+		expect(continueSpy).not.toHaveBeenCalled();
+		expect(session.agent.hasQueuedMessages()).toBe(true);
 		const noProgress = notices.filter(n => n.source === NOTICE_SOURCE && n.message.includes(NO_PROGRESS_FRAGMENT));
 		expect(noProgress.length).toBe(1);
+		session.agent.clearAllQueues();
 	});
 
 	it("blocks automatic maintenance when threshold compaction has nothing to summarize", async () => {
@@ -353,7 +353,7 @@ describe("AgentSession auto-compaction progress guard", () => {
 		expect(noProgress.length).toBe(1);
 	});
 
-	it("drains queued messages when no-op threshold compaction pauses automatic maintenance", async () => {
+	it("does not drain an unscoped queued message when no-op compaction pauses", async () => {
 		session.agent.followUp({
 			role: "custom",
 			customType: "test",
@@ -362,9 +362,7 @@ describe("AgentSession auto-compaction progress guard", () => {
 			timestamp: Date.now(),
 		});
 
-		const continueSpy = vi.spyOn(session.agent, "continue").mockImplementation(async () => {
-			session.agent.clearAllQueues();
-		});
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue(undefined);
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined as never);
 		vi.spyOn(compactionModule, "prepareCompaction").mockReturnValue(undefined);
 
@@ -383,9 +381,11 @@ describe("AgentSession auto-compaction progress guard", () => {
 		await session.waitForIdle();
 
 		expect(promptSpy).not.toHaveBeenCalled();
-		expect(continueSpy).toHaveBeenCalledTimes(1);
+		expect(continueSpy).not.toHaveBeenCalled();
+		expect(session.agent.hasQueuedMessages()).toBe(true);
 		const noProgress = notices.filter(n => n.source === NOTICE_SOURCE && n.message.includes(NO_PROGRESS_FRAGMENT));
 		expect(noProgress.length).toBe(1);
+		session.agent.clearAllQueues();
 	});
 
 	it("does not auto-continue after compaction of a terminal text answer with no queued work", async () => {
@@ -437,6 +437,75 @@ describe("AgentSession auto-compaction progress guard", () => {
 		expect(promptSpy).toHaveBeenCalledTimes(1);
 		const noProgress = notices.filter(n => n.source === NOTICE_SOURCE && n.message.includes(NO_PROGRESS_FRAGMENT));
 		expect(noProgress.length).toBe(0);
+	});
+
+	it("parks agent-attributed IRC when a user turn arrives after compaction selects goal continuation", async () => {
+		activateOngoingGoal("late-user-owner");
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined as never);
+		const continueSpy = vi.spyOn(session.agent, "continue").mockImplementation(async () => {
+			expect([...session.agent.peekSteeringQueue(), ...session.agent.peekFollowUpQueue()]).toEqual([
+				expect.objectContaining({
+					role: "user",
+					content: "late attributed user",
+					attribution: "user",
+				}),
+			]);
+			session.agent.clearAllQueues();
+		});
+		vi.spyOn(session, "getContextUsage").mockReturnValue({ tokens: 1000, contextWindow: 200000, percent: 0.5 });
+
+		const realHasQueuedMessages = session.agent.hasQueuedMessages.bind(session.agent);
+		let injectOnNextEmptyQueueCheck = false;
+		const queueChecks: boolean[] = [];
+		vi.spyOn(session.agent, "hasQueuedMessages").mockImplementation(() => {
+			const queued = realHasQueuedMessages();
+			queueChecks.push(queued);
+			if (injectOnNextEmptyQueueCheck && !queued) {
+				injectOnNextEmptyQueueCheck = false;
+				session.agent.steer({
+					role: "user",
+					content: "late parent IRC",
+					attribution: "agent",
+					steering: true,
+					timestamp: Date.now(),
+				});
+				session.agent.followUp({
+					role: "user",
+					content: "late attributed user",
+					attribution: "user",
+					timestamp: Date.now(),
+				});
+			}
+			return queued;
+		});
+
+		const { promise: compactionDone, resolve: onCompactionDone } = Promise.withResolvers<void>();
+		session.subscribe(event => {
+			if (event.type === "auto_compaction_end") {
+				injectOnNextEmptyQueueCheck = true;
+				onCompactionDone();
+			}
+		});
+
+		const assistantMsg = highUsageAssistant();
+		session.agent.emitExternalEvent({ type: "message_end", message: assistantMsg });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
+
+		await compactionDone;
+		await session.waitForIdle();
+
+		// The first post-event queue check selected goal continuation with an empty
+		// queue. Its microtask then observed the newly arrived mixed queue.
+		expect(queueChecks).toContain(false);
+		expect(promptSpy).not.toHaveBeenCalled();
+		expect(continueSpy).not.toHaveBeenCalled();
+		expect(session.agent.peekSteeringQueue()).toEqual([
+			expect.objectContaining({ content: "late parent IRC", attribution: "agent" }),
+		]);
+		expect(session.agent.peekFollowUpQueue()).toEqual([
+			expect.objectContaining({ content: "late attributed user", attribution: "user" }),
+		]);
+		session.agent.clearAllQueues();
 	});
 
 	it("rebases the in-flight prompt snapshot so mid-run compaction is not misread as a dead-end", async () => {
@@ -807,10 +876,9 @@ describe("AgentSession auto-compaction progress guard", () => {
 		// written a compaction summary. Restore the failed assistant before the queue
 		// drains so the transcript keeps the reason recovery stopped.
 		session.agent.followUp({
-			role: "custom",
-			customType: "test",
+			role: "user",
 			content: [{ type: "text", text: "Queued while recovering" }],
-			display: false,
+			attribution: "user",
 			timestamp: Date.now(),
 		});
 		vi.spyOn(compactionModule, "prepareCompaction").mockReturnValue(undefined);
@@ -855,82 +923,6 @@ describe("AgentSession auto-compaction progress guard", () => {
 					role: "assistant",
 					stopReason: "error",
 					errorMessage: assistantMsg.errorMessage,
-				}),
-			}),
-		);
-	});
-
-	it("drops a length stop and retries after handoff recovery commits", async () => {
-		session.settings.set("compaction.methodOrder", ["handoff", "soft"]);
-		session.settings.set("compaction.enabled", true);
-		session.settings.set("compaction.keepRecentTokens", 1);
-		compactHookEnabled = false;
-		sessionManager.appendMessage({
-			role: "assistant",
-			content: [{ type: "text", text: "completed seed" }],
-			api: "anthropic-messages",
-			provider: "anthropic",
-			model: "claude-sonnet-4-5",
-			stopReason: "stop",
-			usage: {
-				input: 1,
-				output: 1,
-				cacheRead: 0,
-				cacheWrite: 0,
-				totalTokens: 2,
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-			},
-			timestamp: Date.now(),
-		});
-		session.settings.set("contextPromotion.enabled", false);
-		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined as never);
-		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
-		const generateHandoffSpy = vi
-			.spyOn(compactionModule, "generateHandoffFromContext")
-			.mockResolvedValue("handoff document");
-
-		const { promise: compactionDone, resolve: onCompactionDone } = Promise.withResolvers<void>();
-		session.subscribe(event => {
-			if (event.type === "auto_compaction_end") onCompactionDone();
-		});
-
-		const assistantMsg = {
-			role: "assistant" as const,
-			content: [{ type: "text" as const, text: "unfinished" }],
-			api: "anthropic-messages" as const,
-			provider: "anthropic" as const,
-			model: "claude-sonnet-4-5",
-			stopReason: "length" as const,
-			usage: {
-				input: 10_000,
-				output: 1_000,
-				cacheRead: 0,
-				cacheWrite: 0,
-				totalTokens: 11_000,
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-			},
-			timestamp: Date.now(),
-		};
-		sessionManager.appendMessage(assistantMsg);
-		session.agent.emitExternalEvent({ type: "message_end", message: assistantMsg });
-		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
-
-		await compactionDone;
-		await session.waitForIdle();
-
-		expect(promptSpy).not.toHaveBeenCalled();
-		expect(generateHandoffSpy).toHaveBeenCalledTimes(1);
-		expect(continueSpy).toHaveBeenCalledTimes(1);
-		expect(sessionManager.getBranch().at(-1)).toMatchObject({
-			type: "compaction",
-			summary: "handoff document",
-		});
-		expect(sessionManager.getBranch()).not.toContainEqual(
-			expect.objectContaining({
-				type: "message",
-				message: expect.objectContaining({
-					role: "assistant",
-					stopReason: "length",
 				}),
 			}),
 		);

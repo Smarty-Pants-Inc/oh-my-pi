@@ -4,6 +4,7 @@ import {
 	discoverGitLabDuoWorkflowRuntimeNamespace,
 	type GitLabDuoWorkflowNamespaceSelection,
 } from "@oh-my-pi/pi-catalog/discovery/gitlab-duo-workflow";
+import { mapContextInstructionsForModel } from "../context-instructions";
 import * as AIError from "../error";
 import type {
 	Api,
@@ -372,6 +373,7 @@ export interface GitLabDuoWorkflowProviderSessionState extends ProviderSessionSt
 export interface GitLabDuoWorkflowStreamState {
 	stream: AssistantMessageEventStream;
 	output: AssistantMessage;
+	model?: Model<"gitlab-duo-agent">;
 	activeTextIndex?: number;
 	activeThinkingIndex?: number;
 	activeCheckpointMessageKey?: string;
@@ -428,7 +430,7 @@ export const streamGitLabDuoWorkflow: StreamFunction<"gitlab-duo-agent"> = (
 	const stream = new AssistantMessageEventStream();
 	const output = createAssistantMessage(model);
 	stream.push({ type: "start", partial: output });
-	const state: GitLabDuoWorkflowStreamState = { stream, output, started: true };
+	const state: GitLabDuoWorkflowStreamState = { stream, output, model, started: true };
 
 	void runGitLabDuoWorkflow(model, context, options, state).catch(error => {
 		const errorText = gitLabDuoWorkflowErrorText(error);
@@ -550,7 +552,7 @@ export function buildGitLabDuoWorkflowStartRequest(
 		mcpTools,
 		preapproved_tools: mcpTools.map(tool => tool.name),
 		flowConfigSchemaVersion: "v1" as const,
-		flowConfig: buildGitLabDuoWorkflowInlineFlowConfig(buildGitLabDuoWorkflowSystemPrompt(context)),
+		flowConfig: buildGitLabDuoWorkflowInlineFlowConfig(buildGitLabDuoWorkflowSystemPrompt(model, context)),
 	};
 }
 
@@ -613,6 +615,139 @@ export function buildGitLabDuoWorkflowClientAdditionalContext(): GitLabDuoWorkfl
 
 export function buildGitLabDuoWorkflowMcpTools(tools: Tool[] | undefined): GitLabMcpToolDefinition[] {
 	return tools?.map(buildGitLabMcpToolDefinition) ?? [];
+}
+
+async function applyGitLabDuoWorkflowPayloadGuard(
+	startPayload: GitLabDuoWorkflowStartRequest,
+	model: Model<"gitlab-duo-agent">,
+	options: GitLabDuoWorkflowOptions,
+): Promise<GitLabDuoWorkflowStartRequest> {
+	const binding = {
+		workflowID: startPayload.workflowID,
+		clientVersion: startPayload.clientVersion,
+		workflowDefinition: startPayload.workflowDefinition,
+		workflowMetadata: startPayload.workflowMetadata,
+		flowConfigSchemaVersion: startPayload.flowConfigSchemaVersion,
+		flowConfigId: startPayload.flowConfigId,
+		flowVersion: startPayload.flowVersion,
+	};
+	const frame = { startRequest: startPayload };
+	const replacement = await options.onPayload?.(frame, model);
+	const finalFrame = replacement ?? frame;
+	if (
+		typeof finalFrame !== "object" ||
+		finalFrame === null ||
+		Array.isArray(finalFrame) ||
+		Object.keys(finalFrame).length !== 1 ||
+		!("startRequest" in finalFrame)
+	) {
+		throw new AIError.ValidationError(
+			"GitLab Duo Workflow onPayload replacement must preserve the startRequest protocol envelope",
+		);
+	}
+	const finalStartRequest = finalFrame.startRequest;
+	if (typeof finalStartRequest !== "object" || finalStartRequest === null || Array.isArray(finalStartRequest)) {
+		throw new AIError.ValidationError("GitLab Duo Workflow onPayload replacement must contain a startRequest object");
+	}
+	const candidate = finalStartRequest as GitLabDuoWorkflowStartRequest;
+	if (
+		candidate.workflowID !== binding.workflowID ||
+		candidate.clientVersion !== binding.clientVersion ||
+		candidate.workflowDefinition !== binding.workflowDefinition ||
+		candidate.workflowMetadata !== binding.workflowMetadata ||
+		candidate.flowConfigSchemaVersion !== binding.flowConfigSchemaVersion ||
+		candidate.flowConfigId !== binding.flowConfigId ||
+		candidate.flowVersion !== binding.flowVersion
+	) {
+		throw new AIError.ValidationError(
+			"GitLab Duo Workflow onPayload replacement cannot change the startRequest workflow binding",
+		);
+	}
+	if (
+		typeof candidate.goal !== "string" ||
+		!Array.isArray(candidate.mcpTools) ||
+		!Array.isArray(candidate.preapproved_tools)
+	) {
+		throw new AIError.ValidationError(
+			"GitLab Duo Workflow onPayload replacement must preserve the startRequest goal and tool arrays",
+		);
+	}
+	return candidate;
+}
+
+async function applyGitLabDuoWorkflowCreatePayloadGuard(
+	body: Record<string, string | boolean | string[] | number[]>,
+	model: Model<"gitlab-duo-agent">,
+	options: GitLabDuoWorkflowOptions,
+): Promise<Record<string, string | boolean | string[] | number[]>> {
+	const keys = Object.keys(body).sort();
+	const immutableEntries = Object.entries(body)
+		.filter(([key]) => key !== "goal")
+		.map(([key, value]) => [key, JSON.stringify(value)] as const);
+	const replacement = await options.onPayload?.(body, model);
+	const candidate = replacement ?? body;
+	if (typeof candidate !== "object" || candidate === null || Array.isArray(candidate)) {
+		throw new AIError.ValidationError("GitLab Duo Workflow onPayload replacement must preserve the create body");
+	}
+	const finalBody = candidate as Record<string, string | boolean | string[] | number[]>;
+	if (
+		JSON.stringify(Object.keys(finalBody).sort()) !== JSON.stringify(keys) ||
+		immutableEntries.some(([key, value]) => JSON.stringify(finalBody[key]) !== value) ||
+		typeof finalBody.goal !== "string"
+	) {
+		throw new AIError.ValidationError("GitLab Duo Workflow onPayload replacement may change only the create goal");
+	}
+	return finalBody;
+}
+
+async function applyGitLabDuoWorkflowActionResponseGuard(
+	response: GitLabDuoWorkflowActionResponse,
+	model: Model<"gitlab-duo-agent"> | undefined,
+	options: GitLabDuoWorkflowOptions,
+): Promise<GitLabDuoWorkflowActionResponse> {
+	const requestID = response.actionResponse.requestID;
+	const replacement = await options.onPayload?.(response, model);
+	const candidate = replacement ?? response;
+	if (
+		typeof candidate !== "object" ||
+		candidate === null ||
+		Array.isArray(candidate) ||
+		Object.keys(candidate).length !== 1 ||
+		!("actionResponse" in candidate) ||
+		typeof candidate.actionResponse !== "object" ||
+		candidate.actionResponse === null ||
+		Array.isArray(candidate.actionResponse)
+	) {
+		throw new AIError.ValidationError(
+			"GitLab Duo Workflow onPayload replacement must preserve the actionResponse protocol envelope",
+		);
+	}
+	const finalResponse = candidate as GitLabDuoWorkflowActionResponse;
+	if (finalResponse.actionResponse.requestID !== requestID) {
+		throw new AIError.ValidationError(
+			"GitLab Duo Workflow onPayload replacement cannot change actionResponse.requestID",
+		);
+	}
+	return finalResponse;
+}
+
+async function notifyGitLabDuoWorkflowToolContracts(
+	startPayload: GitLabDuoWorkflowStartRequest,
+	model: Model<"gitlab-duo-agent">,
+	options: GitLabDuoWorkflowOptions,
+): Promise<void> {
+	// Extract after onPayload replacement: these names, descriptions, and schema
+	// strings are the definitions the WebSocket start request will send.
+	await options.onToolContracts?.(
+		{
+			tools: startPayload.mcpTools.map(tool => ({
+				name: tool.name,
+				description: tool.description,
+				jsonSchemaString: tool.inputSchema,
+			})),
+		},
+		model,
+	);
 }
 
 export function selectGitLabDuoWorkflowModelRef(
@@ -1159,6 +1294,8 @@ async function runGitLabDuoWorkflow(
 				baseUrl,
 				apiKey,
 				createNamespaceId,
+				model,
+				options,
 				goal,
 				restProjectId,
 				workflowDefinition,
@@ -1253,7 +1390,13 @@ async function runGitLabDuoWorkflow(
 	const workflowConnection = setup.workflowConnection;
 	const selectedModelIdentifier = setup.selectedModelIdentifier;
 	let workflowId = setup.workflowId;
-	let startPayload = setup.startPayload;
+	let startPayload: GitLabDuoWorkflowStartRequest;
+	try {
+		startPayload = await applyGitLabDuoWorkflowPayloadGuard(setup.startPayload, model, options);
+	} catch (error) {
+		await stopGitLabDuoWorkflow(fetchImpl, baseUrl, apiKey, workflowId);
+		throw error;
+	}
 	// Three byte zones (see GITLAB_DUO_WORKFLOW_GOAL_*_OVERFLOW_BYTES):
 	//  - [HARD, ∞): necessary-fail. Do NOT spend the request — emit the overflow error
 	//    now so the session compacts immediately. The fresh-workflow already created in
@@ -1298,6 +1441,7 @@ async function runGitLabDuoWorkflow(
 	let settledNormally = false;
 	try {
 		for (let attempt = 0; attempt < 12; attempt++) {
+			await notifyGitLabDuoWorkflowToolContracts(startPayload, model, options);
 			const ws = openGitLabDuoWorkflowSocket(workflowConnection.baseUrl ?? baseUrl, {
 				token: workflowConnection.token,
 				projectId: webSocketProjectId,
@@ -1330,7 +1474,11 @@ async function runGitLabDuoWorkflow(
 			}
 			lastSocketResult = await runGitLabDuoWorkflowSocket(ws, startPayload, state, options);
 			if (lastSocketResult === "approval") {
-				startPayload = buildGitLabDuoWorkflowApprovalStartRequest(startPayload);
+				startPayload = await applyGitLabDuoWorkflowPayloadGuard(
+					buildGitLabDuoWorkflowApprovalStartRequest(startPayload),
+					model,
+					options,
+				);
 				state.lastApprovalStatus = undefined;
 				continue;
 			}
@@ -1352,12 +1500,18 @@ async function runGitLabDuoWorkflow(
 					baseUrl,
 					apiKey,
 					createNamespaceId,
+					model,
+					options,
 					goal,
 					restProjectId,
 					workflowDefinition,
 					options.signal,
 				);
-				startPayload = { ...startPayload, workflowID: workflowId };
+				startPayload = await applyGitLabDuoWorkflowPayloadGuard(
+					{ ...startPayload, workflowID: workflowId },
+					model,
+					options,
+				);
 				continue;
 			}
 			// The server caps each workflow at a fixed step (graph-recursion) limit.
@@ -1380,12 +1534,18 @@ async function runGitLabDuoWorkflow(
 					baseUrl,
 					apiKey,
 					createNamespaceId,
+					model,
+					options,
 					goal,
 					restProjectId,
 					workflowDefinition,
 					options.signal,
 				);
-				startPayload = { ...startPayload, workflowID: workflowId };
+				startPayload = await applyGitLabDuoWorkflowPayloadGuard(
+					{ ...startPayload, workflowID: workflowId },
+					model,
+					options,
+				);
 				continue;
 			}
 			// The server emitted a fresh tool-call boundary whose `ui_chat_log` total did
@@ -1407,12 +1567,18 @@ async function runGitLabDuoWorkflow(
 					baseUrl,
 					apiKey,
 					createNamespaceId,
+					model,
+					options,
 					goal,
 					restProjectId,
 					workflowDefinition,
 					options.signal,
 				);
-				startPayload = { ...startPayload, workflowID: workflowId };
+				startPayload = await applyGitLabDuoWorkflowPayloadGuard(
+					{ ...startPayload, workflowID: workflowId },
+					model,
+					options,
+				);
 				continue;
 			}
 			// The server returned its de-identified catch-all FAILED — a wrapper over a
@@ -1435,12 +1601,18 @@ async function runGitLabDuoWorkflow(
 					baseUrl,
 					apiKey,
 					createNamespaceId,
+					model,
+					options,
 					goal,
 					restProjectId,
 					workflowDefinition,
 					options.signal,
 				);
-				startPayload = { ...startPayload, workflowID: workflowId };
+				startPayload = await applyGitLabDuoWorkflowPayloadGuard(
+					{ ...startPayload, workflowID: workflowId },
+					model,
+					options,
+				);
 				continue;
 			}
 			// A retryable error that exhausted its retries must surface as a real error;
@@ -1693,16 +1865,22 @@ async function createGitLabDuoWorkflow(
 	baseUrl: string,
 	apiKey: string,
 	namespaceId: string,
+	model: Model<"gitlab-duo-agent">,
+	options: GitLabDuoWorkflowOptions,
 	goal?: string,
 	projectId?: string,
 	workflowDefinition: GitLabDuoWorkflowDefinition = GITLAB_DUO_WORKFLOW_DEFINITION,
 	signal?: AbortSignal,
 ): Promise<string> {
-	const body = buildGitLabDuoWorkflowCreateBody(namespaceId, {
-		goal: isGitLabDuoWorkflowInlineFlow(workflowDefinition) ? "" : goal,
-		projectId,
-		workflowDefinition,
-	});
+	const body = await applyGitLabDuoWorkflowCreatePayloadGuard(
+		buildGitLabDuoWorkflowCreateBody(namespaceId, {
+			goal: isGitLabDuoWorkflowInlineFlow(workflowDefinition) ? "" : goal,
+			projectId,
+			workflowDefinition,
+		}),
+		model,
+		options,
+	);
 	const response = await fetchImpl(gitLabApiUrl(baseUrl, "/api/v4/ai/duo_workflows/workflows"), {
 		method: "POST",
 		headers: {
@@ -2012,9 +2190,13 @@ export function runGitLabDuoWorkflowSocket(
 		// inline flow only ever has one.) DWS matches it by requestID to the awaiting
 		// outbox future and the workflow continues on the same connection.
 		const responses = Array.isArray(resumeResponse) ? resumeResponse : [resumeResponse];
-		for (const response of responses) {
-			ws.send(JSON.stringify(response));
-		}
+		void (async () => {
+			for (const response of responses) {
+				const finalResponse = await applyGitLabDuoWorkflowActionResponseGuard(response, state.model, options);
+				if (settled) return;
+				ws.send(JSON.stringify(finalResponse));
+			}
+		})().catch(error => settle("closed", error));
 	} else {
 		ws.onopen = () => {
 			traceGitLabDuoWorkflow("websocket.open", {
@@ -2559,8 +2741,13 @@ const GITLAB_DUO_WORKFLOW_CHATML_HISTORY_NOTE = chatmlHistoryNote.trim();
 // transcript (not a lone bare-text prompt), append the history-note so the model does
 // not mimic the transcript's `<|im_start|>`/`<ran …>` markers as its own tool-call
 // output — markers it kept copying even after they were reframed to past tense.
-function buildGitLabDuoWorkflowSystemPrompt(context: Context): string {
-	const base = normalizeSystemPrompts(context.systemPrompt).join("\n\n");
+function buildGitLabDuoWorkflowSystemPrompt(model: Model<"gitlab-duo-agent">, context: Context): string {
+	const base = [
+		...normalizeSystemPrompts(context.systemPrompt),
+		...mapContextInstructionsForModel(context.instructions, model).map(instruction =>
+			instruction.renderedText.toWellFormed(),
+		),
+	].join("\n\n");
 	if (!isGitLabDuoWorkflowChatMlGoal(context)) return base;
 	return base ? `${base}\n\n${GITLAB_DUO_WORKFLOW_CHATML_HISTORY_NOTE}` : GITLAB_DUO_WORKFLOW_CHATML_HISTORY_NOTE;
 }

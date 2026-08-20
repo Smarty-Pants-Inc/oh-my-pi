@@ -40,8 +40,8 @@ describe("SYSTEM.md prompt assembly", () => {
 	afterEach(cleanupTempHome(() => ({ tempDir, tempHomeDir, originalHome })));
 
 	it("keeps per-request date/cwd out of the system prompt footer", async () => {
-		// The date/cwd line was moved out of the system prompt and onto the first
-		// user turn (#7404): any byte that changes per request at the tail of the
+		// The date/cwd line was moved out of the system prompt into typed per-request
+		// internal context: any byte that changes per request at the tail of the
 		// system block invalidates the tool-schema prefix cache on open-weight
 		// providers. The footer must not interpolate the cwd or the date.
 		const projectDir = path.join(os.homedir(), "project");
@@ -103,7 +103,7 @@ describe("SYSTEM.md prompt assembly", () => {
 		const promptText = renderedPrompt.join("\n\n");
 		const matches = promptText.match(new RegExp(escapeRegExp(systemPrompt), "g")) ?? [];
 		expect(matches).toHaveLength(1);
-		expect(promptText).toContain('<skill name="focused-work">');
+		expect(promptText).toContain("- focused-work: Focused work instructions");
 	});
 
 	it("does not resolve already-loaded prompt text as a path", async () => {
@@ -165,9 +165,9 @@ describe("SYSTEM.md prompt assembly", () => {
 		expect(systemPrompt).toHaveLength(2);
 		expect(promptText).toContain("CLI custom prompt");
 		expect(promptText).toContain("<workspace-tree>");
-		expect(promptText).toContain("<dir-context>");
-		// The project/environment footer survives even though the date/cwd line was
-		// relocated out of it; <workstation> is rendered only by that footer.
+		expect(promptText).toContain("Additional directory instruction files");
+		// The project/environment footer survives even though volatile date/cwd data
+		// is delivered separately; <workstation> is rendered only by that footer.
 		expect(promptText).toContain("<workstation>");
 		expect(appendMatches).toHaveLength(1);
 		expect(promptText).not.toContain("Discovered project SYSTEM prompt");
@@ -227,8 +227,8 @@ describe("SYSTEM.md prompt assembly", () => {
 		const promptText = systemPrompt.join("\n\n");
 		const matches = promptText.match(new RegExp(escapeRegExp(sharedContent), "g")) ?? [];
 		expect(matches).toHaveLength(1);
-		expect(promptText).not.toContain(`<file path="${farPath}">`);
-		expect(promptText).toContain(`<file path="${nearPath}">`);
+		expect(promptText).not.toContain(`<external_instruction path="${farPath}">`);
+		expect(promptText).toContain(`<external_instruction path="${nearPath}">`);
 	});
 
 	it("drops identical discovered context entries and keeps the closest copy", async () => {

@@ -4,6 +4,7 @@ import type {
 	AssistantMessageEvent,
 	AssistantMessageEventStream,
 	Context,
+	ContextTarget,
 	Effort,
 	ImageContent,
 	Message,
@@ -31,12 +32,15 @@ export type StreamFn = (
 	...args: Parameters<typeof streamSimple>
 ) => AssistantMessageEventStream | Promise<AssistantMessageEventStream>;
 
-/** Called once an aside has been inserted into the agent's live context. */
+/** Called after an aside joins the live turn and can no longer accept late companions. */
+export const ASIDE_MESSAGE_SEAL = Symbol("aside-message-seal");
+/** Called once the provider accepts the live turn containing this aside. */
 export const ASIDE_MESSAGE_COMMIT = Symbol("aside-message-commit");
-/** Called when an aside was drained but the agent loop ended before inserting it. */
+/** Called when an aside was drained but the agent loop ended before provider acceptance. */
 export const ASIDE_MESSAGE_DISCARD = Symbol("aside-message-discard");
 
 export type CommittableAsideMessage = AgentMessage & {
+	[ASIDE_MESSAGE_SEAL]?: () => void;
 	[ASIDE_MESSAGE_COMMIT]?: () => void;
 	[ASIDE_MESSAGE_DISCARD]?: (error: Error) => void;
 };
@@ -146,6 +150,8 @@ export interface SteeringQueueState {
  */
 export interface AgentLoopConfig extends SimpleStreamOptions {
 	model: Model;
+	/** Semantic target for fresh internal context assembled by the core loop. */
+	contextTarget?: ContextTarget;
 
 	/**
 	 * When to interrupt tool execution for steering messages.
@@ -330,6 +336,13 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * the run is canceled or its deadline expires.
 	 */
 	beforeModelCall?: AgentBeforeModelCall;
+
+	/**
+	 * Called after the provider accepts the request and exposes response metadata or
+	 * the first non-error response event. Initial input events stay provisional until
+	 * this returns.
+	 */
+	onProviderCallStarted?: () => void;
 
 	/**
 	 * Optional transform applied to tool call arguments before execution.
@@ -763,6 +776,8 @@ export interface AgentTool<TParameters extends TSchema = TSchema, TDetails = any
 	extends Tool<TParameters> {
 	// A human-readable label for the tool to be displayed in UI
 	label: string;
+	/** Stop the current provider loop after this tool returns a successful result. */
+	terminalAfterSuccess?: boolean;
 	/** If true, tool is excluded unless explicitly listed in --tools or agent's tools field */
 	hidden?: boolean;
 	/** If true, tool can stage a pending action that requires explicit resolution via the resolve tool. */

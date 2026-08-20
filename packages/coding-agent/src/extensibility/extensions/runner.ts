@@ -14,10 +14,11 @@ import type { KeyId } from "@oh-my-pi/pi-tui";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../../config/model-registry";
 import type { Settings } from "../../config/settings";
+import { type ContextReleaseManifest, isApprovedCandidateSource } from "../../context/manifest";
 import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
 import type { MemoryRuntimeContext } from "../../memory-backend";
 import { type Theme, theme } from "../../modes/theme/theme";
-import type { AsyncJobSnapshot } from "../../session/agent-session";
+import type { AsyncJobCounts, AsyncJobSnapshot } from "../../session/agent-session";
 import type { SessionManager } from "../../session/session-manager";
 import { addFileDeleteFallback, addFileWriteFallback } from "../../tools/file-write-fallback";
 import type { BranchHandler, NavigateTreeHandler, NewSessionHandler } from "../session-handler-types";
@@ -48,6 +49,7 @@ import type {
 	ExtensionShortcut,
 	ExtensionUIContext,
 	ExtensionUIDialogOptions,
+	HostInternalExtensionBinding,
 	InputEvent,
 	InputEventResult,
 	McpNotificationEvent,
@@ -61,8 +63,13 @@ import type {
 	SessionBeforeSwitchResult,
 	SessionBeforeTreeResult,
 	SessionCompactingResult,
+	SessionMutationEvent,
 	SessionStopEvent,
 	SessionStopEventResult,
+	SystemPromptBuilder,
+	TerminalInputHandler,
+	ToolApprovalRequestedEvent,
+	ToolApprovalResolvedEvent,
 	ToolCallEvent,
 	ToolCallEventResult,
 	ToolRegistrationListener,
@@ -76,14 +83,72 @@ import type {
 
 /** Combined result from all before_agent_start handlers */
 interface BeforeAgentStartCombinedResult {
-	messages?: NonNullable<BeforeAgentStartEventResult["message"]>[];
+	messages?: Array<{
+		message: NonNullable<BeforeAgentStartEventResult["message"]>;
+		extensionPath: string;
+	}>;
 	systemPrompt?: string[];
+}
+
+export function serializedProviderPayload(value: unknown): string {
+	try {
+		return JSON.stringify(value);
+	} catch {
+		throw new Error("PROMPT_POLICY_REVIEW_REQUIRED: provider payload is not deterministically serializable");
+	}
+}
+
+export function assertApprovedProviderPayloadUnchanged(
+	approvedSnapshot: string,
+	currentPayload: unknown,
+	extensionPath: string,
+): void {
+	if (serializedProviderPayload(currentPayload) !== approvedSnapshot) {
+		throw new Error(
+			`PROMPT_POLICY_REVIEW_REQUIRED: ${extensionPath} changed the serialized provider payload after approval`,
+		);
+	}
+}
+
+export function assertApprovedPerTurnSystemPromptNotReplaced(
+	protectedRuntime: boolean,
+	replacement: string | string[] | undefined,
+	extensionPath: string,
+): void {
+	if (protectedRuntime && replacement !== undefined) {
+		throw new Error(`PROMPT_POLICY_REVIEW_REQUIRED: ${extensionPath} attempted a per-turn system prompt replacement`);
+	}
+}
+
+export function assertApprovedContextUnchanged(
+	approvedSnapshot: string | undefined,
+	currentMessages: AgentMessage[],
+	extensionPath: string,
+): void {
+	if (approvedSnapshot !== undefined && serializedProviderPayload(currentMessages) !== approvedSnapshot) {
+		throw new Error(`PROMPT_POLICY_REVIEW_REQUIRED: ${extensionPath} changed approved model context`);
+	}
+}
+
+export function assertApprovedInputUnchanged(
+	approvedSnapshot: string | undefined,
+	current: { text: string; images: ImageContent[] | undefined },
+	handled: boolean | undefined,
+	extensionPath: string,
+): void {
+	if (
+		approvedSnapshot !== undefined &&
+		(handled === true || serializedProviderPayload(current) !== approvedSnapshot)
+	) {
+		throw new Error(`PROMPT_POLICY_REVIEW_REQUIRED: ${extensionPath} changed approved direct input`);
+	}
 }
 
 export type ExtensionErrorListener = (error: ExtensionError) => void;
 
 export const EXTENSION_HANDLER_TIMEOUT_MS = 30_000;
 let extensionHandlerTimeoutMs = EXTENSION_HANDLER_TIMEOUT_MS;
+const FRESH_SNAPSHOT_ACK_FAILURE = Symbol.for("oh-my-pi.fresh-omp.snapshot-ack-failure");
 
 function throwUnsupportedServiceTierAction(): never {
 	throw new Error("This extension host does not support service-tier actions");
@@ -242,8 +307,9 @@ async function raceHandlerWithTimeout<T>(
 	work: (handlerSignal: AbortSignal, timeoutBudget: HandlerTimeoutBudget) => Promise<T> | T,
 	timeoutMs: number,
 	signal?: AbortSignal,
+	invokeWhenAborted = false,
 ): Promise<T | typeof EXTENSION_HANDLER_TIMEOUT | typeof EXTENSION_HANDLER_ABORTED> {
-	if (signal?.aborted) return EXTENSION_HANDLER_ABORTED;
+	if (signal?.aborted && !invokeWhenAborted) return EXTENSION_HANDLER_ABORTED;
 
 	const timeoutController = new AbortController();
 	const handlerSignal = signal ? AbortSignal.any([signal, timeoutController.signal]) : timeoutController.signal;
@@ -296,8 +362,9 @@ async function raceHandlerWithTimeout<T>(
 	};
 	armTimer();
 	try {
-		if (signal?.aborted) return EXTENSION_HANDLER_ABORTED;
+		if (signal?.aborted && !invokeWhenAborted) return EXTENSION_HANDLER_ABORTED;
 		const workPromise = Promise.resolve(work(handlerSignal, timeoutBudget));
+		if (signal?.aborted && !invokeWhenAborted) resolveInterrupt(EXTENSION_HANDLER_ABORTED);
 		const result = await Promise.race([workPromise, interruptPromise]);
 		if (result === EXTENSION_HANDLER_TIMEOUT) {
 			await Promise.race([
@@ -367,6 +434,9 @@ type RunnerEmitResult<TEvent extends RunnerEmitEvent> = TEvent extends { type: "
 						? SessionStopEventResult | undefined
 						: undefined;
 
+type HostCompletionContinuation = () => void | Promise<void>;
+type HostCompletionPreparation = () => void | HostCompletionContinuation | Promise<void | HostCompletionContinuation>;
+
 // Session-lifecycle handler types live once in session-handler-types (imported
 // above for local use); re-exported here to keep this module's public API stable.
 export type { BranchHandler, NavigateTreeHandler, NewSessionHandler };
@@ -375,25 +445,17 @@ export type SwitchSessionHandler = (sessionPath: string) => Promise<{ cancelled:
 
 export type ShutdownHandler = () => void;
 
-/**
- * Emit `session_shutdown`, dispose file-write-fallback registrations, and clear
- * timers owned by an extension runner.
- *
- * Returns whether any shutdown handlers were present. Fallback disposal and timer
- * cleanup run even when a handler fails so extension background work — and a
- * fallback bound to this session's context — cannot outlive its host.
- */
+/** Emit `session_shutdown`, dispose fallbacks, and retain timers only for failed cleanup. */
 export async function emitSessionShutdownEvent(extensionRunner: ExtensionRunner | undefined): Promise<boolean> {
 	if (!extensionRunner) return false;
+	let failedExtensions: ReadonlySet<string> = new Set();
 	try {
 		if (!extensionRunner.hasHandlers("session_shutdown")) return false;
-		await extensionRunner.emit({
-			type: "session_shutdown",
-		});
+		failedExtensions = await extensionRunner.emitSessionShutdown();
 		return true;
 	} finally {
 		extensionRunner.disposeFileFallbacks();
-		extensionRunner.clearManagedTimers();
+		extensionRunner.clearManagedTimers(failedExtensions);
 	}
 }
 
@@ -437,15 +499,19 @@ export class ExtensionRunner {
 	#mode: ExtensionMode = "print";
 	#toolApprovalPreviewWaiter?: (toolCallId: string) => Promise<void>;
 	#errorListeners: Set<ExtensionErrorListener> = new Set();
+	#reportedPromptPolicyReviews = new Set<string>();
+	#shutdownFailedExtensions = new Set<string>();
 	#getModel: () => Model | undefined = () => undefined;
 	#isIdleFn: () => boolean = () => true;
+	#isCompactingFn: () => boolean = () => false;
 	#waitForIdleFn: () => Promise<void> = async () => {};
-	#abortFn: () => void = () => {};
+	#abortFn: () => void | Promise<void> = () => {};
 	#hasPendingMessagesFn: () => boolean = () => false;
 	#getContextUsageFn: () => ContextUsage | undefined = () => undefined;
 	#compactFn: (instructionsOrOptions?: string | CompactOptions) => Promise<void> = async () => {};
 	#getSystemPromptFn: () => string[] = () => [];
 	#getAsyncJobSnapshotFn: () => AsyncJobSnapshot | null = () => null;
+	#getAsyncJobCountsFn: () => AsyncJobCounts | null = () => null;
 	#newSessionHandler: NewSessionHandler = async () => ({ cancelled: false });
 	#branchHandler: BranchHandler = async () => ({ cancelled: false });
 	#navigateTreeHandler: NavigateTreeHandler = async () => ({ cancelled: false });
@@ -454,9 +520,13 @@ export class ExtensionRunner {
 	#shutdownHandler: ShutdownHandler = () => {};
 	#getMemoryFn?: () => MemoryRuntimeContext | undefined;
 	#commandDiagnostics: Array<{ type: string; message: string; path: string }> = [];
+	readonly #publicExtensions: Extension[];
+	readonly #hostInternalExtension?: HostInternalExtensionBinding;
+	private readonly extensions: Extension[];
 	#toolRegistrationScope = new AsyncLocalStorage<ToolRegistrationScope>();
 	#toolRegistrationBarrier: Promise<void> | undefined;
 	#initialized = false;
+	#extensionTimerOwner = new AsyncLocalStorage<string>();
 	/**
 	 * Buffer for `credential_disabled` events received via {@link emitCredentialDisabled}
 	 * before {@link initialize} has run. Drained through {@link emit} once initialize sets
@@ -596,7 +666,7 @@ export class ExtensionRunner {
 	}
 
 	constructor(
-		private readonly extensions: Extension[],
+		publicExtensions: Extension[],
 		private readonly runtime: ExtensionRuntime,
 		/** Ignored: `cwd` is always read live via the `cwd` getter below, not cached here. */
 		_initialCwd: string,
@@ -606,10 +676,19 @@ export class ExtensionRunner {
 		private readonly settings?: Settings,
 		private readonly localProtocolOptions?: LocalProtocolOptions,
 		getAsyncJobSnapshot?: () => AsyncJobSnapshot | null,
+		hostInternalExtension?: HostInternalExtensionBinding,
+		getAsyncJobCounts?: () => AsyncJobCounts | null,
+		private readonly releaseManifest?: ContextReleaseManifest,
 	) {
 		this.#uiContext = noOpUIContext;
 		this.#getMemoryFn = getMemory;
 		this.#getAsyncJobSnapshotFn = getAsyncJobSnapshot ?? (() => null);
+		this.#getAsyncJobCountsFn = getAsyncJobCounts ?? (() => null);
+		this.#hostInternalExtension = hostInternalExtension;
+		this.#publicExtensions = publicExtensions;
+		this.extensions = hostInternalExtension
+			? [hostInternalExtension.extension, ...publicExtensions]
+			: publicExtensions;
 	}
 
 	/**
@@ -678,6 +757,7 @@ export class ExtensionRunner {
 		// Context actions (required)
 		this.#getModel = contextActions.getModel;
 		this.#isIdleFn = contextActions.isIdle;
+		this.#isCompactingFn = contextActions.isCompacting;
 		this.#abortFn = contextActions.abort;
 		this.#hasPendingMessagesFn = contextActions.hasPendingMessages;
 		this.#shutdownHandler = contextActions.shutdown;
@@ -711,10 +791,9 @@ export class ExtensionRunner {
 			// extension that only brokers writes never appears in the delete registry.
 			if (ext.fileWriteFallbackHandlers.length === 0 && ext.fileDeleteFallbackHandlers.length === 0) continue;
 			// One trampoline per extension per seam, not per handler: the list is walked
-			// at mutation time so a handler this extension adds later still takes effect,
-			// and `createContext()` takes no extension argument, so within one invocation
-			// a single context is all any of this extension's handlers would have
-			// received anyway.
+			// at mutation time so a handler this extension adds later still takes effect.
+			// Every handler in one invocation shares a context scoped to the extension
+			// path, so managed timers keep their owner through shutdown cleanup.
 			//
 			// The context is built PER INVOCATION rather than captured here, matching
 			// every other dispatch site. `createContext()` materializes `cwd` and
@@ -733,7 +812,7 @@ export class ExtensionRunner {
 			if (ext.fileWriteFallbackHandlers.length > 0) {
 				this.#fileFallbackDisposers.push(
 					addFileWriteFallback(async req => {
-						const ctx = this.createContext();
+						const ctx = this.createContext(undefined, undefined, ext.path);
 						for (const handler of ext.fileWriteFallbackHandlers) {
 							try {
 								if (await handler(req, ctx)) return true;
@@ -751,7 +830,7 @@ export class ExtensionRunner {
 			if (ext.fileDeleteFallbackHandlers.length > 0) {
 				this.#fileFallbackDisposers.push(
 					addFileDeleteFallback(async req => {
-						const ctx = this.createContext();
+						const ctx = this.createContext(undefined, undefined, ext.path);
 						for (const handler of ext.fileDeleteFallbackHandlers) {
 							try {
 								if (await handler(req, ctx)) return true;
@@ -880,13 +959,36 @@ export class ExtensionRunner {
 	}
 
 	getExtensionPaths(): string[] {
-		return this.extensions.map(e => e.path);
+		return this.#publicExtensions.map(e => e.path);
+	}
+
+	async getSystemPromptBuilder(): Promise<SystemPromptBuilder | undefined> {
+		const owners = this.extensions.filter(extension => extension.systemPromptBuilder);
+		if (!this.releaseManifest && owners.length > 1) {
+			throw new Error(`Multiple system prompt builders registered: ${owners.map(owner => owner.path).join(", ")}`);
+		}
+		const approvedOwners: Extension[] = [];
+		for (const owner of owners) {
+			if (await this.#canRunProtectedHandler(owner, "system_prompt_builder")) approvedOwners.push(owner);
+		}
+		if (approvedOwners.length > 1) {
+			const owner = approvedOwners[0]!;
+			this.#reportPromptPolicyReview(
+				owner,
+				"system_prompt_builder",
+				new Error(
+					`PROMPT_POLICY_REVIEW_REQUIRED: multiple approved system prompt builders registered: ${approvedOwners.map(candidate => candidate.path).join(", ")}`,
+				),
+			);
+			return undefined;
+		}
+		return approvedOwners[0]?.systemPromptBuilder;
 	}
 
 	/** Get all registered tools from all extensions. */
 	getAllRegisteredTools(): RegisteredTool[] {
 		const tools: RegisteredTool[] = [];
-		for (const ext of this.extensions) {
+		for (const ext of this.#publicExtensions) {
 			for (const tool of ext.tools.values()) {
 				tools.push(tool);
 			}
@@ -896,8 +998,8 @@ export class ExtensionRunner {
 
 	/** Get the effective registered tool for a name using normal last-extension-wins precedence. */
 	getRegisteredTool(name: string): RegisteredTool | undefined {
-		for (let index = this.extensions.length - 1; index >= 0; index -= 1) {
-			const tool = this.extensions[index]?.tools.get(name);
+		for (let index = this.#publicExtensions.length - 1; index >= 0; index -= 1) {
+			const tool = this.#publicExtensions[index]?.tools.get(name);
 			if (tool) return tool;
 		}
 		return undefined;
@@ -910,7 +1012,7 @@ export class ExtensionRunner {
 	 */
 	onToolRegistered(listener: (tool: RegisteredTool, signal?: AbortSignal) => void | Promise<void>): () => void {
 		const subscriptions: Array<{ extension: Extension; listener: ToolRegistrationListener }> = [];
-		for (const extension of this.extensions) {
+		for (const extension of this.#publicExtensions) {
 			const trackRegistration = (pending: Promise<void>): void => {
 				const registrationBarrier = pending.then(
 					() => undefined,
@@ -993,7 +1095,7 @@ export class ExtensionRunner {
 	}
 
 	getFlags(): Map<string, ExtensionFlag> {
-		return ExtensionRunner.aggregateFlags(this.extensions);
+		return ExtensionRunner.aggregateFlags(this.#publicExtensions);
 	}
 
 	getFlagValues(): Map<string, boolean | string> {
@@ -1026,7 +1128,7 @@ export class ExtensionRunner {
 
 	getShortcuts(): Map<KeyId, ExtensionShortcut> {
 		const allShortcuts = new Map<KeyId, ExtensionShortcut>();
-		for (const ext of this.extensions) {
+		for (const ext of this.#publicExtensions) {
 			for (const [key, shortcut] of ext.shortcuts) {
 				const normalizedKey = key.toLowerCase() as KeyId;
 
@@ -1059,7 +1161,57 @@ export class ExtensionRunner {
 
 	emitError(error: ExtensionError): void {
 		for (const listener of this.#errorListeners) {
-			listener(error);
+			try {
+				listener(error);
+			} catch (listenerError) {
+				logger.warn("Extension error listener failed", {
+					error: listenerError instanceof Error ? listenerError.message : String(listenerError),
+				});
+			}
+		}
+	}
+
+	#reportPromptPolicyReview(ext: Extension, event: string, error: unknown): void {
+		const message = error instanceof Error ? error.message : String(error);
+		const key = `${ext.resolvedPath}\0${event}\0${message}`;
+		if (this.#reportedPromptPolicyReviews.has(key)) return;
+		this.#reportedPromptPolicyReviews.add(key);
+		logger.warn("Protected extension handler skipped because prompt policy requires review", {
+			extensionPath: ext.path,
+			event,
+			error: message,
+		});
+		this.emitError({
+			extensionPath: ext.path,
+			event,
+			error: message,
+			stack: error instanceof Error ? error.stack : undefined,
+		});
+	}
+
+	async #canRunProtectedHandler(ext: Extension, event: string): Promise<boolean> {
+		if (!this.releaseManifest || (await isApprovedCandidateSource(ext.resolvedPath, this.releaseManifest))) {
+			return true;
+		}
+		this.#reportPromptPolicyReview(
+			ext,
+			event,
+			new Error(`PROMPT_POLICY_REVIEW_REQUIRED: extension source is not approved: ${ext.path}`),
+		);
+		return false;
+	}
+
+	#captureProtectedSnapshot(
+		ext: Extension,
+		event: string,
+		value: unknown,
+	): { snapshot: string | undefined; failed: boolean } {
+		if (!this.releaseManifest) return { snapshot: undefined, failed: false };
+		try {
+			return { snapshot: serializedProviderPayload(value), failed: false };
+		} catch (error) {
+			this.#reportPromptPolicyReview(ext, event, error);
+			return { snapshot: undefined, failed: true };
 		}
 	}
 
@@ -1073,8 +1225,13 @@ export class ExtensionRunner {
 		return false;
 	}
 
+	/** Supply host-owned bindings with the interactive terminal-input registrar. */
+	setHostTerminalInput(register: (handler: TerminalInputHandler) => () => void): void {
+		this.#hostInternalExtension?.setHostTerminalInput?.(register);
+	}
+
 	getMessageRenderer(customType: string): MessageRenderer | undefined {
-		for (const ext of this.extensions) {
+		for (const ext of this.#publicExtensions) {
 			const renderer = ext.messageRenderers.get(customType);
 			if (renderer) {
 				return renderer;
@@ -1084,14 +1241,14 @@ export class ExtensionRunner {
 	}
 
 	getAssistantThinkingRenderers(): AssistantThinkingRenderer[] {
-		return this.extensions.flatMap(ext => ext.assistantThinkingRenderers);
+		return this.#publicExtensions.flatMap(ext => ext.assistantThinkingRenderers);
 	}
 
 	getRegisteredCommands(reserved?: ReadonlySet<string>): RegisteredCommand[] {
 		this.#commandDiagnostics = [];
 
 		const commands = new Map<string, RegisteredCommand>();
-		for (const ext of this.extensions) {
+		for (const ext of this.#publicExtensions) {
 			for (const command of ext.commands.values()) {
 				if (reserved?.has(command.name)) {
 					const message = `Extension command '${command.name}' from ${ext.path} conflicts with built-in commands. Skipping.`;
@@ -1113,8 +1270,8 @@ export class ExtensionRunner {
 	}
 
 	getCommand(name: string): RegisteredCommand | undefined {
-		for (let index = this.extensions.length - 1; index >= 0; index -= 1) {
-			const command = this.extensions[index]?.commands.get(name);
+		for (let index = this.#publicExtensions.length - 1; index >= 0; index -= 1) {
+			const command = this.#publicExtensions[index]?.commands.get(name);
 			if (command) {
 				return command;
 			}
@@ -1142,14 +1299,17 @@ export class ExtensionRunner {
 			signal?: AbortSignal;
 			onUpdate?: AgentToolUpdateCallback;
 		},
+		extensionPath?: string,
 	): ExtensionContext {
 		const getModel = model ? () => model : this.#getModel;
 		return {
 			ui: this.#uiContext,
 			mode: this.#mode,
 			getContextUsage: () => this.#getContextUsageFn(),
+			isCompacting: () => this.#isCompactingFn(),
 			compact: instructionsOrOptions => this.#compactFn(instructionsOrOptions),
 			getAsyncJobSnapshot: () => this.#getAsyncJobSnapshotFn(),
+			getAsyncJobCounts: () => this.#getAsyncJobCountsFn(),
 			hasUI: this.hasUI(),
 			cwd: this.cwd,
 			sessionManager: this.sessionManager,
@@ -1159,14 +1319,26 @@ export class ExtensionRunner {
 			},
 			models: createExtensionModelQuery(this.modelRegistry, this.settings, getModel),
 			isIdle: () => this.#isIdleFn(),
-			abort: () => this.#abortFn(),
+			abort: async () => await this.#abortFn(),
 			hasPendingMessages: () => this.#hasPendingMessagesFn(),
 			shutdown: () => this.#shutdownHandler(),
 			getSystemPrompt: () => this.#getSystemPromptFn(),
 			localProtocolOptions: this.localProtocolOptions,
 			memory: this.#getMemoryFn?.(),
-			setInterval: (callback, ms, ...args) => this.#managedTimers.setInterval(callback, ms, ...args),
-			setTimeout: (callback, ms, ...args) => this.#managedTimers.setTimeout(callback, ms, ...args),
+			setInterval: (callback, ms, ...args) =>
+				this.#managedTimers.setInterval(
+					extensionPath ?? this.#extensionTimerOwner.getStore(),
+					callback,
+					ms,
+					...args,
+				),
+			setTimeout: (callback, ms, ...args) =>
+				this.#managedTimers.setTimeout(
+					extensionPath ?? this.#extensionTimerOwner.getStore(),
+					callback,
+					ms,
+					...args,
+				),
 			clearTimer: timer => this.#managedTimers.clear(timer),
 			invokeTool:
 				delegation !== undefined && this.hasNativeTool(delegation.toolName)
@@ -1196,8 +1368,15 @@ export class ExtensionRunner {
 	 * outlive the session (a self-scheduling interval would otherwise keep
 	 * firing against a disposed session).
 	 */
-	clearManagedTimers(): void {
-		this.#managedTimers.clearAll();
+	clearManagedTimers(retainedOwners: ReadonlySet<string> = new Set()): void {
+		this.#managedTimers.clearAll(retainedOwners);
+	}
+
+	/** Emit shutdown handlers and retain timers only for extensions whose cleanup failed. */
+	async emitSessionShutdown(): Promise<ReadonlySet<string>> {
+		this.#shutdownFailedExtensions.clear();
+		await this.emit({ type: "session_shutdown" });
+		return this.#shutdownFailedExtensions;
 	}
 
 	/**
@@ -1224,6 +1403,12 @@ export class ExtensionRunner {
 		};
 	}
 
+	/** True only while an extension event handler is actively on the current async call chain. */
+	isHandlingEvent(): boolean {
+		const scope = this.#toolRegistrationScope.getStore();
+		return scope !== undefined && !scope.closed;
+	}
+
 	#isSessionBeforeEvent(event: RunnerEmitEvent): event is SessionBeforeEvent {
 		return (
 			event.type === "session_before_switch" ||
@@ -1241,6 +1426,10 @@ export class ExtensionRunner {
 		ctx: ExtensionContext,
 		ext: Extension,
 		timeoutMs: number,
+		scopeContextToHandler = true,
+		signal?: AbortSignal,
+		invokeWhenAborted = false,
+		propagateSnapshotAcknowledgementFailure = false,
 		onFailure?: (kind: "timeout" | "error", message: string) => TResult,
 		outerSignal?: AbortSignal,
 	): Promise<TResult | undefined> {
@@ -1248,13 +1437,14 @@ export class ExtensionRunner {
 		// the outer dispatch signal (loop request or wrapper execute) so an abort
 		// while a handler awaits a human dialog cancels the dialog and settles the
 		// gate without executing the underlying tool. Compose whichever apply.
-		const sessionStopSignal =
+		const eventSignal =
 			event.type === "session_stop" && "signal" in event && event.signal instanceof AbortSignal
 				? event.signal
 				: undefined;
-		const signals = [outerSignal, sessionStopSignal].filter((s): s is AbortSignal => s !== undefined);
-		const signal = signals.length === 0 ? undefined : signals.length === 1 ? signals[0] : AbortSignal.any(signals);
-		if (signal?.aborted) return undefined;
+		const signals = [signal, outerSignal, eventSignal].filter((item): item is AbortSignal => item !== undefined);
+		const dispatchSignal =
+			signals.length === 0 ? undefined : signals.length === 1 ? signals[0] : AbortSignal.any(signals);
+		if (dispatchSignal?.aborted && !invokeWhenAborted) return undefined;
 		const registrationScope: ToolRegistrationScope = { pending: new Set(), closed: false };
 		let handlerResult: TResult | typeof EXTENSION_HANDLER_TIMEOUT | typeof EXTENSION_HANDLER_ABORTED | undefined;
 		let handlerFailure: { error: unknown } | undefined;
@@ -1264,10 +1454,18 @@ export class ExtensionRunner {
 					registrationScope.signal = handlerSignal;
 					let result: TResult | undefined;
 					try {
-						result = await this.#toolRegistrationScope.run(registrationScope, () =>
-							handler(
-								event,
-								createHandlerContext(ctx, handlerSignal, event.type === "tool_call" ? budget : undefined),
+						result = await this.#extensionTimerOwner.run(ext.path, () =>
+							this.#toolRegistrationScope.run(registrationScope, () =>
+								handler(
+									event,
+									scopeContextToHandler
+										? createHandlerContext(
+												ctx,
+												handlerSignal,
+												event.type === "tool_call" ? budget : undefined,
+											)
+										: ctx,
+								),
 							),
 						);
 					} catch (error) {
@@ -1283,9 +1481,11 @@ export class ExtensionRunner {
 					return result;
 				},
 				timeoutMs,
-				signal,
+				dispatchSignal,
+				invokeWhenAborted,
 			);
 		} catch (error) {
+			if (dispatchSignal?.aborted) return undefined;
 			handlerFailure = { error };
 		} finally {
 			registrationScope.closed = true;
@@ -1303,6 +1503,9 @@ export class ExtensionRunner {
 				event: event.type,
 				error,
 			});
+			if (event.type === "session_shutdown") {
+				this.#shutdownFailedExtensions.add(ext.path);
+			}
 			return onFailure?.("timeout", error);
 		}
 		if (handlerFailure) {
@@ -1315,6 +1518,16 @@ export class ExtensionRunner {
 				error: message,
 				stack,
 			});
+			if (event.type === "session_shutdown") {
+				this.#shutdownFailedExtensions.add(ext.path);
+			}
+			if (
+				propagateSnapshotAcknowledgementFailure &&
+				typeof handlerFailure.error === "object" &&
+				handlerFailure.error !== null &&
+				(handlerFailure.error as Record<PropertyKey, unknown>)[FRESH_SNAPSHOT_ACK_FAILURE] === true
+			)
+				throw handlerFailure.error;
 			return onFailure?.("error", message);
 		}
 		return handlerResult as TResult | undefined;
@@ -1334,9 +1547,9 @@ export class ExtensionRunner {
 			for (const ext of this.extensions) {
 				const handlers = ext.handlers.get(event.type);
 				if (!handlers || handlers.length === 0) continue;
-				ctx ??= this.createContext();
+				const extensionContext = this.createContext(undefined, undefined, ext.path);
 				for (const handler of handlers) {
-					promises.push(this.#runHandlerWithTimeout(handler, event, ctx, ext, timeoutMs));
+					promises.push(this.#runHandlerWithTimeout(handler, event, extensionContext, ext, timeoutMs));
 				}
 			}
 			if (promises.length > 0) await Promise.all(promises);
@@ -1381,6 +1594,101 @@ export class ExtensionRunner {
 		}
 
 		return result as RunnerEmitResult<TEvent>;
+	}
+
+	/** Run public fences, then the host-owned observer, before a committed session mutation. */
+	async emitBeforeSessionMutation(event: SessionMutationEvent): Promise<void> {
+		const ctx = this.createContext();
+		for (const ext of this.#publicExtensions) {
+			for (const handler of ext.sessionMutationFences) {
+				await this.#runHandlerWithTimeout(
+					handler,
+					event,
+					ctx,
+					ext,
+					handlerTimeoutForEvent(event.type),
+					true,
+					undefined,
+					false,
+					false,
+					(_kind, message) => {
+						throw new Error(`Session mutation fence failed: ${message}`);
+					},
+				);
+			}
+		}
+
+		const binding = this.#hostInternalExtension;
+		if (!binding?.beforeSessionMutation) return;
+		await this.#runHandlerWithTimeout(
+			binding.beforeSessionMutation,
+			event,
+			ctx,
+			binding.extension,
+			handlerTimeoutForEvent(event.type),
+			false,
+		);
+	}
+
+	/**
+	 * Emit an ordinary event to every matching handler, await optional lifecycle
+	 * preparation, then run host-owned post-dispatch publication against a newly
+	 * sampled context. Preparation may return the continuation that activates the
+	 * selected lifecycle owner; that continuation runs only after every
+	 * `afterDispatch` callback has completed. Preparation failures and the Fresh
+	 * snapshot-ack publication sentinel propagate and suppress activation; unrelated
+	 * host callback errors and timeouts remain contained.
+	 */
+	async emitWithHostCompletion<TEvent extends RunnerEmitEvent>(
+		event: TEvent,
+		prepareHostCompletion?: HostCompletionPreparation,
+	): Promise<RunnerEmitResult<TEvent>> {
+		const result = await this.emit(event);
+		const prepared = await prepareHostCompletion?.();
+		const postHostContinuation = typeof prepared === "function" ? prepared : undefined;
+		const binding = this.#hostInternalExtension;
+		if (binding?.afterDispatch) {
+			await this.#runHandlerWithTimeout(
+				binding.afterDispatch,
+				event,
+				this.createContext(),
+				binding.extension,
+				handlerTimeoutForEvent(event.type),
+				false,
+				undefined,
+				false,
+				true,
+			);
+		}
+		await postHostContinuation?.();
+		return result;
+	}
+
+	/** Dispatch approval lifecycle handlers with the active tool-call cancellation signal. */
+	async emitApproval(
+		event: ToolApprovalRequestedEvent | ToolApprovalResolvedEvent,
+		signal?: AbortSignal,
+	): Promise<void> {
+		const ctx = this.createContext();
+		const invokeWhenAborted = event.type === "tool_approval_resolved";
+		for (const ext of this.extensions) {
+			const handlers = ext.handlers.get(event.type);
+			if (!handlers || handlers.length === 0) continue;
+
+			for (const handler of handlers) {
+				if (signal?.aborted && !invokeWhenAborted) return;
+				await this.#runHandlerWithTimeout(
+					handler,
+					event,
+					ctx,
+					ext,
+					handlerTimeoutForEvent(event.type),
+					true,
+					signal,
+					invokeWhenAborted,
+				);
+			}
+		}
 	}
 
 	async emitToolResult(event: ToolResultEvent): Promise<ToolResultEventResult | undefined> {
@@ -1459,6 +1767,10 @@ export class ExtensionRunner {
 					ctx,
 					ext,
 					timeoutMs,
+					true,
+					undefined,
+					false,
+					false,
 					(kind, message) => ({
 						block: true,
 						reason:
@@ -1574,13 +1886,39 @@ export class ExtensionRunner {
 
 		for (const ext of this.extensions) {
 			for (const handler of ext.handlers.get("input") ?? []) {
-				const event: InputEvent = { type: "input", text: currentText, images: currentImages, source };
+				if (!(await this.#canRunProtectedHandler(ext, "input"))) continue;
+				const snapshot = this.#captureProtectedSnapshot(ext, "input", { text: currentText, images: currentImages });
+				if (snapshot.failed) continue;
+				const approvedSnapshot = snapshot.snapshot;
+				const protectedInput = approvedSnapshot
+					? (JSON.parse(approvedSnapshot) as { text: string; images: ImageContent[] | undefined })
+					: undefined;
+				const event: InputEvent = {
+					type: "input",
+					text: protectedInput?.text ?? currentText,
+					images: protectedInput?.images ?? currentImages,
+					source,
+				};
 				const result = (await this.#runHandlerWithTimeout(handler, event, ctx, ext, extensionHandlerTimeoutMs)) as
 					| InputEventResult
 					| undefined;
-				if (result?.handled) return result;
+				const protectedResult = approvedSnapshot
+					? { text: result?.text ?? event.text, images: result?.images ?? event.images }
+					: undefined;
+				try {
+					assertApprovedInputUnchanged(
+						approvedSnapshot,
+						protectedResult ?? { text: currentText, images: currentImages },
+						result?.handled,
+						ext.path,
+					);
+				} catch (error) {
+					this.#reportPromptPolicyReview(ext, "input", error);
+					continue;
+				}
 				if (result?.text !== undefined) currentText = result.text;
 				if (result?.images !== undefined) currentImages = result.images;
+				if (result?.handled) return result;
 			}
 		}
 		const transformed: InputEventResult = {};
@@ -1606,9 +1944,7 @@ export class ExtensionRunner {
 		try {
 			currentMessages = structuredClone(messages);
 		} catch {
-			// Messages may contain non-cloneable objects (e.g. in ToolResultMessage.details
-			// or ProviderPayload). Fall back to a shallow array clone — extensions should
-			// return new message arrays rather than mutating in place.
+			// Preserve legacy extension behavior for non-protected local sessions.
 			currentMessages = [...messages];
 		}
 
@@ -1617,6 +1953,10 @@ export class ExtensionRunner {
 			if (!handlers || handlers.length === 0) continue;
 
 			for (const handler of handlers) {
+				if (!(await this.#canRunProtectedHandler(ext, "context"))) continue;
+				const snapshot = this.#captureProtectedSnapshot(ext, "context", currentMessages);
+				if (snapshot.failed) continue;
+				const approvedSnapshot = snapshot.snapshot;
 				const event: ContextEvent = { type: "context", messages: currentMessages };
 				const handlerResult = await this.#runHandlerWithTimeout(
 					handler,
@@ -1626,9 +1966,20 @@ export class ExtensionRunner {
 					extensionHandlerTimeoutMs,
 				);
 
-				if (handlerResult && (handlerResult as ContextEventResult).messages) {
-					currentMessages = (handlerResult as ContextEventResult).messages!;
+				const nextMessages =
+					handlerResult && (handlerResult as ContextEventResult).messages
+						? (handlerResult as ContextEventResult).messages!
+						: currentMessages;
+				try {
+					assertApprovedContextUnchanged(approvedSnapshot, nextMessages, ext.path);
+				} catch (error) {
+					this.#reportPromptPolicyReview(ext, "context", error);
+					if (approvedSnapshot !== undefined) {
+						currentMessages = JSON.parse(approvedSnapshot) as AgentMessage[];
+					}
+					continue;
 				}
+				currentMessages = nextMessages;
 			}
 		}
 
@@ -1645,9 +1996,14 @@ export class ExtensionRunner {
 			if (!handlers || handlers.length === 0) continue;
 
 			for (const handler of handlers) {
+				if (!(await this.#canRunProtectedHandler(ext, "before_provider_request"))) continue;
+				const snapshot = this.#captureProtectedSnapshot(ext, "before_provider_request", currentPayload);
+				if (snapshot.failed) continue;
+				const approvedSnapshot = snapshot.snapshot;
+				const eventPayload = approvedSnapshot ? JSON.parse(approvedSnapshot) : currentPayload;
 				const event: BeforeProviderRequestEvent = {
 					type: "before_provider_request",
-					payload: currentPayload,
+					payload: eventPayload,
 				};
 				const handlerResult = await this.#runHandlerWithTimeout(
 					handler,
@@ -1656,9 +2012,15 @@ export class ExtensionRunner {
 					ext,
 					extensionHandlerTimeoutMs,
 				);
-				if (handlerResult !== undefined) {
-					currentPayload = handlerResult;
+				if (approvedSnapshot !== undefined) {
+					try {
+						assertApprovedProviderPayloadUnchanged(approvedSnapshot, handlerResult ?? eventPayload, ext.path);
+					} catch (error) {
+						this.#reportPromptPolicyReview(ext, "before_provider_request", error);
+						continue;
+					}
 				}
+				if (handlerResult !== undefined) currentPayload = handlerResult;
 			}
 		}
 
@@ -1692,7 +2054,7 @@ export class ExtensionRunner {
 		systemPrompt: string[],
 	): Promise<BeforeAgentStartCombinedResult | undefined> {
 		const ctx = this.createContext();
-		const messages: NonNullable<BeforeAgentStartEventResult["message"]>[] = [];
+		const messages: NonNullable<BeforeAgentStartCombinedResult["messages"]> = [];
 		let currentSystemPrompt = systemPrompt;
 		let systemPromptModified = false;
 
@@ -1701,11 +2063,12 @@ export class ExtensionRunner {
 			if (!handlers || handlers.length === 0) continue;
 
 			for (const handler of handlers) {
+				if (!(await this.#canRunProtectedHandler(ext, "before_agent_start"))) continue;
 				const event: BeforeAgentStartEvent = {
 					type: "before_agent_start",
 					prompt,
-					images,
-					systemPrompt: currentSystemPrompt,
+					images: images?.map(image => ({ ...image })),
+					systemPrompt: [...currentSystemPrompt],
 				};
 				const handlerResult = await this.#runHandlerWithTimeout(
 					handler,
@@ -1717,13 +2080,23 @@ export class ExtensionRunner {
 
 				if (handlerResult) {
 					const result = handlerResult as BeforeAgentStartEventResult;
-					if (result.message) {
-						messages.push(result.message);
-					}
 					if (result.systemPrompt !== undefined) {
+						try {
+							assertApprovedPerTurnSystemPromptNotReplaced(
+								this.releaseManifest !== undefined,
+								result.systemPrompt,
+								ext.path,
+							);
+						} catch (error) {
+							this.#reportPromptPolicyReview(ext, "before_agent_start", error);
+							continue;
+						}
 						currentSystemPrompt =
 							typeof result.systemPrompt === "string" ? [result.systemPrompt] : result.systemPrompt;
 						systemPromptModified = true;
+					}
+					if (result.message) {
+						messages.push({ message: result.message, extensionPath: ext.resolvedPath });
 					}
 				}
 			}

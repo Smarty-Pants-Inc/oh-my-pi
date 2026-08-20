@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { streamBedrock } from "@oh-my-pi/pi-ai/providers/amazon-bedrock";
-import type { Context, Model } from "@oh-my-pi/pi-ai/types";
+import type { Context, ContextInstruction, Model } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 
 interface Payload {
@@ -30,9 +30,13 @@ function abortedSignal(): AbortSignal {
 
 // Capture the request payload the provider would send, without a network call:
 // an already-aborted signal short-circuits after `onPayload` fires.
-async function capturePayload(systemPrompt: Context["systemPrompt"]): Promise<Payload> {
+async function capturePayload(
+	systemPrompt: Context["systemPrompt"],
+	instructions?: ContextInstruction[],
+): Promise<Payload> {
 	const context: Context = {
 		systemPrompt,
+		instructions,
 		messages: [{ role: "user", content: "hi", timestamp: 0 }],
 	};
 	const { promise, resolve } = Promise.withResolvers<Payload | undefined>();
@@ -75,5 +79,23 @@ describe("Bedrock system prompt normalization", () => {
 		const fromString = await capturePayload("You are a test." as unknown as string[]);
 		const fromArray = await capturePayload(["You are a test."]);
 		expect(textBlocks(fromString)).toEqual(textBlocks(fromArray));
+	});
+
+	test("serializes typed internal context as a Bedrock system block", async () => {
+		const payload = await capturePayload(
+			[],
+			[
+				{
+					id: "goal.continuation",
+					sourcePath: "packages/coding-agent/src/prompts/goals/continuation.md",
+					role: "internal_context",
+					target: "main",
+					trigger: "goal-continuation",
+					sha256: "test-sha256",
+					renderedText: "Continue the active goal without overriding the user.",
+				},
+			],
+		);
+		expect(textBlocks(payload)).toEqual(["Continue the active goal without overriding the user."]);
 	});
 });

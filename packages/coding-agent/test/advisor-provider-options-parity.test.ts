@@ -119,7 +119,7 @@ describe("AgentSession advisor provider-options parity", () => {
 		expect(advisor.promptCacheKey).toBe(advisor.sessionId);
 	});
 
-	it("captures the SDK-provided onPayload, onResponse, onSseEvent, and transformProviderContext on the advisor's stream call", async () => {
+	it("keeps main-request tool evidence out of advisor stream options", async () => {
 		const capturedStreamOptions: Array<SimpleStreamOptions | undefined> = [];
 		const captureStreamFn: StreamFn = (_m, _ctx, opts) => {
 			capturedStreamOptions.push(opts);
@@ -165,6 +165,7 @@ describe("AgentSession advisor provider-options parity", () => {
 		// `RawSseDebugBuffer` — what matters here is that *something* is wired,
 		// not the exact closure identity for those two).
 		expect(typeof opts.onPayload).toBe("function");
+		expect(opts.onToolContracts).toBeUndefined();
 		expect(typeof opts.onResponse).toBe("function");
 		expect(typeof opts.onSseEvent).toBe("function");
 

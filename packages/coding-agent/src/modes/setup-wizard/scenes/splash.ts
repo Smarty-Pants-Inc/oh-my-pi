@@ -117,11 +117,11 @@ function waterAmplitude(
 }
 
 /**
- * Animated setup splash, in the spirit of the omp landing page: the brand π
- * mark rendered with the live diagonal gradient + shine sweep, rising out of a
- * rippling, gradient-lit water surface, under a faint twinkling starfield. The
- * mark and water share one continuous gradient so the sweep reads across the
- * whole scene; the water surface drifts each frame.
+ * Animated setup splash: the Smarty-Pants SP mark rendered with the live
+ * diagonal gradient + shine sweep, rising out of a rippling, gradient-lit
+ * water surface, under a faint twinkling starfield. The mark and water share
+ * one continuous gradient so the sweep reads across the whole scene; the water
+ * surface drifts each frame.
  */
 export function renderSetupSplash(width: number, height: number, elapsedMs: number): string[] {
 	const w = Math.max(1, width);
@@ -188,14 +188,19 @@ export function renderSetupSplash(width: number, height: number, elapsedMs: numb
 
 /** Centered fallback for windows too small to hold the full scene. */
 function renderCompactSplash(width: number, height: number, phase: number, shine: ShineConfig): string[] {
-	const art = height >= 14 ? LARGE_LOGO : PI_LOGO;
-	const content = [...gradientLogo(art, phase, shine), "", theme.bold("O h   M y   P i")];
-	const start = Math.max(0, Math.floor((height - content.length) / 2));
+	const art = height >= LARGE_LOGO.length + 3 ? LARGE_LOGO : PI_LOGO;
+	const bodyHeight = height > 1 ? height - 1 : height;
+	const content = [
+		...gradientLogo(art, phase, shine),
+		...(bodyHeight > art.length + 1 ? [""] : []),
+		theme.bold("smarty pants"),
+	];
+	const start = Math.max(0, Math.floor((bodyHeight - content.length) / 2));
 	const lines: string[] = [];
 	for (let y = 0; y < height; y++) {
-		const item = content[y - start];
+		const item = y < bodyHeight ? content[y - start] : undefined;
 		lines.push(clampLine(item !== undefined ? centerLine(item, width) : "", width));
 	}
-	if (height > 2) lines[height - 2] = clampLine(centerLine(theme.fg("dim", SKIP_HINT), width), width);
+	if (height > 1) lines[height - 1] = clampLine(centerLine(theme.fg("dim", SKIP_HINT), width), width);
 	return lines;
 }

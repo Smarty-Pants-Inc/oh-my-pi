@@ -1,0 +1,49 @@
+version: 1
+
+automaticTurns:
+  allowed:
+    - active_goal_continuation
+    - active_async_result_wake
+    - bounded_transport_or_protocol_retry
+    - peer_message_wake
+  forbidden:
+    - incomplete_todo
+    - stale_plan
+    - reviewer_finding
+    - cleanup_opportunity
+    - paused_goal
+    - terminal_goal
+    - unscoped_peer_message
+
+goal:
+  enabled: true
+  create: clear_user_or_system_request_only
+  autoContinue: active_only
+  continuationModes: [interactive]
+  continuationRole: internal_context
+  modelOperations: [get, create, complete, block]
+  ownerOrSystemOperations: [set, edit, replace, pause, resume, budget, drop, clear]
+  sameRouteFailureLimit: 2
+
+todo:
+  enabled: true
+  context: every_turn_when_present
+  contextItems: [pending, in_progress, blocked]
+  autoContinue: false
+  stopReminders: false
+  midRunNudges: false
+  eager: default
+
+task:
+  enabled: true
+  eager: default
+  forcedFanout: false
+  maxRecursionDepth: 2
+
+subagent:
+  forceToolCallBeforeYield: false
+  semanticAutoRetry: false
+  boundedTransportRetry: true
+
+roles:
+  internalInstructionMayUseUserRole: false

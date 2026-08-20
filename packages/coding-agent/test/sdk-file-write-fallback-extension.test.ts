@@ -32,7 +32,10 @@ import type {
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { type CreateAgentSessionOptions, createAgentSession, discoverAuthStorage } from "@oh-my-pi/pi-coding-agent/sdk";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import type { FileWriteFallbackRequest } from "@oh-my-pi/pi-coding-agent/tools/file-write-fallback";
+import {
+	type FileWriteFallbackRequest,
+	writeFileWithFallback,
+} from "@oh-my-pi/pi-coding-agent/tools/file-write-fallback";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 
 /**
@@ -45,7 +48,7 @@ import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 function initializeRunnerForTest(runner: ExtensionRunner | undefined): void {
 	if (!runner) return;
 	const actions: ExtensionActions = {
-		sendMessage: () => {},
+		sendMessage: () => Promise.resolve({ status: "accepted", delivery: "plain_append" }),
 		sendUserMessage: () => {},
 		appendEntry: () => {},
 		setLabel: () => {},
@@ -62,6 +65,7 @@ function initializeRunnerForTest(runner: ExtensionRunner | undefined): void {
 	const contextActions: ExtensionContextActions = {
 		getModel: () => undefined,
 		isIdle: () => true,
+		isCompacting: () => false,
 		abort: () => {},
 		hasPendingMessages: () => false,
 		shutdown: () => {},
@@ -583,4 +587,45 @@ describe("registerFileWriteFallback end-to-end (real extension, real session)", 
 			}
 		},
 	);
+
+	it("keeps fallback-created timers owned when shutdown cleanup fails", async () => {
+		const tempDir = makeTempDir();
+		const tickedAfterDispose = Promise.withResolvers<void>();
+		let disposed = false;
+		const factory: ExtensionFactory = pi => {
+			pi.registerFileWriteFallback(async (_req, ctx) => {
+				ctx.setInterval(() => {
+					if (disposed) tickedAfterDispose.resolve();
+				}, 10);
+				return true;
+			});
+			pi.on("session_shutdown", () => {
+				throw new Error("cleanup failed");
+			});
+		};
+
+		const { session } = await createAgentSession(baseOptions(tempDir, [factory]));
+		initializeRunnerForTest(session.extensionRunner);
+		const denial = Object.assign(new Error("permission denied"), { code: "EACCES" });
+		const deniedFile = {
+			write: async () => {
+				throw denial;
+			},
+		} as unknown as Bun.BunFile;
+
+		try {
+			await writeFileWithFallback(path.join(tempDir, "timer-owner.txt"), "content", deniedFile);
+			await session.dispose();
+			disposed = true;
+			await Promise.race([
+				tickedAfterDispose.promise,
+				Bun.sleep(250).then(() => {
+					throw new Error("fallback-owned timer was cleared during failed shutdown");
+				}),
+			]);
+		} finally {
+			session.extensionRunner?.clearManagedTimers();
+			await session.dispose();
+		}
+	});
 });

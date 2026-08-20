@@ -58,16 +58,23 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 		{
 			sendMessage: (message, sendOptions) => {
 				const sendTask = session.sendCustomMessage(message, sendOptions);
-				if (sendOptions?.triggerTurn) {
-					if (trackAgentInvokingMessage) {
-						trackAgentInvokingMessage(sendTask);
-					} else {
-						markAgentInvokingMessage?.();
-					}
+				const turnTask = sendTask.then(
+					disposition => disposition.status === "accepted" && disposition.delivery === "started_turn",
+				);
+				if (trackAgentInvokingMessage) {
+					trackAgentInvokingMessage(turnTask);
+				} else {
+					void turnTask.then(
+						started => {
+							if (started) markAgentInvokingMessage?.();
+						},
+						() => {},
+					);
 				}
-				sendTask.catch(e => {
+				void sendTask.catch(e => {
 					reportSendError("extension_send", e instanceof Error ? e : new Error(String(e)));
 				});
+				return sendTask;
 			},
 			sendUserMessage: (content, sendOptions) => {
 				const sendTask = session.sendUserMessage(content, sendOptions);
@@ -104,8 +111,9 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 		{
 			getModel: () => session.model,
 			isIdle: () => !session.isStreaming,
+			isCompacting: () => session.isCompacting,
 			abort: () => session.abort({ reason: USER_INTERRUPT_LABEL }),
-			hasPendingMessages: () => session.queuedMessageCount > 0,
+			hasPendingMessages: () => session.hasPendingMessages(),
 			shutdown,
 			getContextUsage: () => session.getContextUsage(),
 			getSystemPrompt: () => session.systemPrompt,
@@ -116,10 +124,7 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			getContextUsage: () => session.getContextUsage(),
 			waitForIdle: () => session.agent.waitForIdle(),
 			newSession: async newOptions => {
-				const success = await session.newSession({ parentSession: newOptions?.parentSession });
-				if (success && newOptions?.setup) {
-					await newOptions.setup(session.sessionManager);
-				}
+				const success = await session.newSession({ parentSession: newOptions?.parentSession }, newOptions?.setup);
 				return { cancelled: !success };
 			},
 			branch: async entryId => {

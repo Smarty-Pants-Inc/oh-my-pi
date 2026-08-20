@@ -47,7 +47,13 @@ import {
 } from "./compaction-v2-streaming";
 import type { CompactionEntry, SessionEntry } from "./entries";
 import { NativeCompactionError } from "./errors";
-import { type ConvertToLlm, createBranchSummaryMessage, createCustomMessage, defaultConvertToLlm } from "./messages";
+import {
+	type ConvertToLlm,
+	collectCompactionContextInstructions,
+	createBranchSummaryMessage,
+	createCustomMessage,
+	defaultConvertToLlm,
+} from "./messages";
 import {
 	buildOpenAiNativeHistory,
 	getPreservedOpenAiRemoteCompactionData,
@@ -66,6 +72,7 @@ import handoffDocumentPrompt from "./prompts/handoff-document.md" with { type: "
 import snapcompactArchiveContextPrompt from "./prompts/snapcompact-archive-context.md" with { type: "text" };
 
 import {
+	compactionInstructionContext,
 	computeFileLists,
 	createFileOps,
 	escapeSummaryBoundaryTags,
@@ -762,214 +769,88 @@ function createSnapcompactArchiveMigrationMessage(archiveText: string): Message 
 	};
 }
 
-/**
- * Fallback window for a model whose catalog entry carries no usable context
- * window; matches the smallest window any compaction-capable model ships with.
- */
-const DEFAULT_SUMMARY_INPUT_WINDOW = 200_000;
-
-/**
- * Floor for one summarization window, so a tiny model still makes progress.
- * Scaled down (never below 1k) for models whose window cannot host the full
- * floor next to the carried summary and output reserves.
- */
+const DEFAULT_SUMMARY_CONTEXT_WINDOW = 200_000;
+const SUMMARY_CONTEXT_HEADROOM_TOKENS = 4_096;
+const SUMMARY_INITIAL_BYTES_PER_TOKEN = 2;
 const MIN_SUMMARY_INPUT_TOKENS = 16_384;
 
-/** Smallest window worth planning for `model`; below this, overflow recovery gives up. */
 function minSummaryInputTokens(model: Model): number {
-	const window = model.contextWindow && model.contextWindow > 0 ? model.contextWindow : DEFAULT_SUMMARY_INPUT_WINDOW;
+	const window = model.contextWindow && model.contextWindow > 0 ? model.contextWindow : DEFAULT_SUMMARY_CONTEXT_WINDOW;
 	return Math.min(MIN_SUMMARY_INPUT_TOKENS, Math.max(1_024, Math.floor(window / 8)));
 }
 
-/**
- * Usable conversation input for ONE summarization call: the summarizer's window
- * minus the summary it must emit, the previous summary it carries forward, and
- * prompt scaffolding. Providers tokenize differently from the local cl100k
- * estimate, so the window is discounted before the fixed reserves come off.
- */
-function summaryInputBudgetTokens(model: Model, maxTokens: number): number {
-	const window = model.contextWindow && model.contextWindow > 0 ? model.contextWindow : DEFAULT_SUMMARY_INPUT_WINDOW;
-	// 0.8, not "window minus reserves": provider tokenizers disagree with the
-	// local cl100k estimate by a few percent, and being wrong here is a hard
-	// 400 on the one call that is supposed to rescue an oversized session.
-	return Math.max(minSummaryInputTokens(model), Math.floor(window * 0.8) - maxTokens - MAX_SUMMARY_TOKENS);
-}
-
-/**
- * Clamp one serialized window to the budget. Only reachable when a SINGLE
- * message serializes above the budget (an oversized paste): the alternative is
- * a provider rejection that no retry can clear, which strands the session with
- * a full window forever.
- */
-function clampConversationToBudget(text: string, budgetTokens: number, tokens: number): string {
-	if (tokens <= budgetTokens) return text;
-	const keep = Math.max(1024, Math.floor((text.length * budgetTokens * 0.95) / tokens));
-	if (keep >= text.length) return text;
-	return `${text.slice(0, keep)}\n\n[... ${text.length - keep} more characters truncated]`;
-}
-
-/** One planned summarization call: its messages and the budget they were packed for. */
-interface SummaryWindow {
-	messages: Message[];
-	budgetTokens: number;
-	/** Serialization reused from the fit check, so the common path serializes once. */
-	text?: string;
-}
-
-/**
- * Partition a conversation into windows that each fit `budgetTokens`, splitting
- * on message boundaries. Only called when the whole conversation does not fit —
- * the common single-window path never pays this per-message sizing pass.
- */
-function planSummaryWindows(
-	messages: Message[],
-	tokenizer: Tokenizer,
-	dialect: Dialect | undefined,
-	budgetTokens: number,
-): Message[][] {
-	const windows: Message[][] = [];
-	let current: Message[] = [];
-	let currentTokens = 0;
-	for (const message of messages) {
-		const tokens = tokenizer.countTokens(serializeConversationForSummary([message], dialect));
-		if (currentTokens > 0 && currentTokens + tokens > budgetTokens) {
-			windows.push(current);
-			current = [];
-			currentTokens = 0;
-		}
-		current.push(message);
-		currentTokens += tokens;
-	}
-	if (current.length > 0) windows.push(current);
-	return windows;
-}
-
-export async function generateSummary(
-	currentMessages: AgentMessage[],
-	model: Model,
-	reserveTokens: number,
-	apiKey: ApiKey,
-	signal?: AbortSignal,
-	customInstructions?: string,
-	previousSummary?: string,
-	options?: SummaryOptions,
-): Promise<string> {
-	const maxTokens = Math.min(Math.floor(0.8 * reserveTokens), MAX_SUMMARY_TOKENS);
-
-	// Serialize conversation to text so model doesn't try to continue it
-	// Convert to LLM messages first (handles custom app messages when caller provides a transformer).
-	const llmMessages = (options?.convertToLlm ?? defaultConvertToLlm)(currentMessages);
-	const dialect = preferredDialect(model.id);
-	const tokenizer = new Tokenizer(model);
-	const wholeConversation = serializeConversationForSummary(llmMessages, dialect);
-	const budgetTokens = summaryInputBudgetTokens(model, maxTokens);
-	// A span that outgrew the summarizer's window is summarized as a fold: each
-	// window updates the summary carried out of the previous one, which is the
-	// same contract the update prompt already implements for iterative
-	// compaction. The alternative is a hard provider rejection on a prompt no
-	// retry can shrink — the state a cross-provider compaction boundary
-	// (see `prepareCompaction`) puts a long session into. One window is the
-	// common case and costs exactly the one call it always did.
-	const pending: SummaryWindow[] = tokenizer.checkTokenBudget(wholeConversation, budgetTokens).fits
-		? [{ messages: llmMessages, budgetTokens, text: wholeConversation }]
-		: planSummaryWindows(llmMessages, tokenizer, dialect, budgetTokens).map(messages => ({ messages, budgetTokens }));
-
-	let carriedSummary = previousSummary;
-	while (pending.length > 0) {
-		const window = pending[0];
-		const text = window.text ?? serializeConversationForSummary(window.messages, dialect);
-		// A budget probe, not a raw count: a window whose bytes already fit needs
-		// neither an exact count nor the clamp, and the bust path hands back the
-		// exact count the proportional clamp needs as its denominator.
-		const budget = tokenizer.checkTokenBudget(text, window.budgetTokens);
-		try {
-			carriedSummary = await summarizeConversationWindow(
-				budget.fits ? text : clampConversationToBudget(text, window.budgetTokens, budget.tokens),
-				carriedSummary,
-				model,
-				maxTokens,
-				apiKey,
-				signal,
-				customInstructions,
-				options,
-			);
-		} catch (error) {
-			// The catalog window can overstate what the provider actually accepts:
-			// `claude-sonnet-4-5` advertises 1M but is beta-gated to 200k on OAuth
-			// credentials (see `anthropic.ts` — the 1M beta is never advertised).
-			// Halve and re-plan rather than failing the whole compaction on a
-			// window size only the provider can tell us is wrong.
-			// Halve what was actually SENT, not the budget it was planned against:
-			// the rejection proves the plan was fiction, so converging on the real
-			// cap must not spend a call per level of an imaginary ladder. The cheap
-			// fit path never counted this window, so pay for the exact size here —
-			// one tokenization is nothing against the provider round trip already lost.
-			const sentTokens = budget.exact ? budget.tokens : tokenizer.countTokens(text, "strict");
-			const halved = Math.floor(Math.min(window.budgetTokens, sentTokens) / 2);
-			if (
-				!AIError.is(AIError.classify(error), AIError.Flag.ContextOverflow) ||
-				halved < minSummaryInputTokens(model)
-			) {
-				throw error;
-			}
-			pending.splice(
-				0,
-				1,
-				...planSummaryWindows(window.messages, tokenizer, dialect, halved).map(messages => ({
-					messages,
-					budgetTokens: halved,
-				})),
-			);
-			continue;
-		}
-		pending.shift();
-	}
-	return carriedSummary ?? "";
-}
-
-/** One summarization call over a single conversation window. */
-async function summarizeConversationWindow(
+function buildSummaryPrompt(
 	conversationText: string,
 	previousSummary: string | undefined,
-	model: Model,
-	maxTokens: number,
-	apiKey: ApiKey,
-	signal: AbortSignal | undefined,
-	customInstructions: string | undefined,
-	options: SummaryOptions | undefined,
-): Promise<string> {
-	// Use update prompt if we have a previous summary, otherwise initial prompt
-	let basePrompt = previousSummary ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT;
-	if (options?.promptOverride) {
-		basePrompt = options.promptOverride;
-	}
-	if (customInstructions) {
-		basePrompt = `${basePrompt}\n\nAdditional focus: ${customInstructions}`;
-	}
-
-	// Build the prompt with conversation wrapped in tags
+	basePrompt: string,
+	extraContext: SummaryOptions["extraContext"],
+): string {
 	let promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
 	if (previousSummary) {
 		promptText += `<previous-summary>\n${escapeSummaryBoundaryTags(previousSummary)}\n</previous-summary>\n\n`;
 	}
-	promptText += formatAdditionalContext(options?.extraContext);
+	promptText += formatAdditionalContext(extraContext);
 	promptText += basePrompt;
+	return promptText;
+}
 
-	const summarizationMessages = [
-		{
-			role: "user" as const,
-			content: [{ type: "text" as const, text: promptText }],
-			timestamp: Date.now(),
-		},
-	];
+function resolveSummaryPrompt(
+	previousSummary: string | undefined,
+	customInstructions: string | undefined,
+	options: SummaryOptions | undefined,
+): string {
+	let basePrompt = options?.promptOverride ?? (previousSummary ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT);
+	if (customInstructions) {
+		basePrompt = `${basePrompt}\n\nAdditional focus: ${customInstructions}`;
+	}
+	return basePrompt;
+}
 
-	if (options?.remoteEndpoint) {
-		const endpoint = options.remoteEndpoint;
+function findUtf8ChunkEnd(text: string, start: number, maxBytes: number): number {
+	let low = start + 1;
+	let high = Math.min(text.length, start + maxBytes);
+	let best = start;
+
+	while (low <= high) {
+		const middle = low + ((high - low) >> 1);
+		if (Buffer.byteLength(text.slice(start, middle), "utf8") <= maxBytes) {
+			best = middle;
+			low = middle + 1;
+		} else {
+			high = middle - 1;
+		}
+	}
+
+	// Never split a UTF-16 surrogate pair.
+	if (best < text.length && best > start) {
+		const nextCodeUnit = text.charCodeAt(best);
+		if (nextCodeUnit >= 0xdc00 && nextCodeUnit <= 0xdfff) best--;
+	}
+	if (best === text.length) return best;
+
+	// Prefer a transcript boundary when one is reasonably close to the byte limit.
+	const boundary = text.lastIndexOf("\n\n", best - 2);
+	if (boundary >= start + Math.floor((best - start) / 2)) return boundary + 2;
+	return best;
+}
+
+async function requestSummary(
+	promptText: string,
+	instructionId: string,
+	instructionSourcePath: string,
+	model: Model,
+	maxTokens: number,
+	apiKey: ApiKey,
+	signal: AbortSignal | undefined,
+	options: SummaryOptions | undefined,
+): Promise<string> {
+	const remoteEndpoint = options?.remoteEndpoint;
+	if (remoteEndpoint) {
 		const remote = await withAuth(
 			apiKey,
 			key =>
 				requestRemoteCompaction(
-					endpoint,
+					remoteEndpoint,
 					{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, prompt: promptText, maxTokens },
 					signal,
 					{ fetch: options.fetch, model, apiKey: key },
@@ -981,7 +862,7 @@ async function summarizeConversationWindow(
 
 	const response = await instrumentedCompleteSimple(
 		model,
-		{ systemPrompt: [SUMMARIZATION_SYSTEM_PROMPT], messages: summarizationMessages },
+		compactionInstructionContext(instructionId, instructionSourcePath, promptText),
 		{
 			maxTokens,
 			signal,
@@ -1007,12 +888,95 @@ async function summarizeConversationWindow(
 		throw createSummarizationError("Summarization failed", response);
 	}
 
-	const textContent = response.content
+	return response.content
 		.filter((c): c is { type: "text"; text: string } => c.type === "text")
 		.map(c => c.text)
 		.join("\n");
+}
 
-	return textContent;
+export async function generateSummary(
+	currentMessages: AgentMessage[],
+	model: Model,
+	reserveTokens: number,
+	apiKey: ApiKey,
+	signal?: AbortSignal,
+	customInstructions?: string,
+	previousSummary?: string,
+	options?: SummaryOptions,
+): Promise<string> {
+	const maxTokens = Math.min(Math.floor(0.8 * reserveTokens), MAX_SUMMARY_TOKENS);
+	const contextWindow =
+		model.contextWindow && model.contextWindow > 0 ? model.contextWindow : DEFAULT_SUMMARY_CONTEXT_WINDOW;
+	const headroom = Math.min(SUMMARY_CONTEXT_HEADROOM_TOKENS, Math.floor(contextWindow * 0.05));
+	let inputBudgetTokens = Math.max(minSummaryInputTokens(model), contextWindow - maxTokens - headroom);
+	const systemPromptBytes = Buffer.byteLength(SUMMARIZATION_SYSTEM_PROMPT, "utf8");
+
+	const llmMessages = (options?.convertToLlm ?? defaultConvertToLlm)(currentMessages);
+	const dialect: Dialect | undefined = preferredDialect(model.id);
+	const tokenizer = new Tokenizer(model);
+	const conversationText = serializeConversationForSummary(llmMessages, dialect);
+	let summary = previousSummary;
+	let offset = 0;
+	let bytesPerToken = contextWindow <= 64_000 ? 1 : SUMMARY_INITIAL_BYTES_PER_TOKEN;
+
+	do {
+		let end = offset;
+		for (;;) {
+			const basePrompt = resolveSummaryPrompt(summary, customInstructions, options);
+			const emptyPrompt = buildSummaryPrompt("", summary, basePrompt, options?.extraContext);
+			const promptBudgetBytes = inputBudgetTokens * bytesPerToken - systemPromptBytes;
+			const availableConversationBytes = promptBudgetBytes - Buffer.byteLength(emptyPrompt, "utf8");
+			if (availableConversationBytes <= 0) {
+				throw new Error(`Compaction summary prompt leaves no input room in ${contextWindow}-token model context`);
+			}
+
+			end =
+				conversationText.length === 0 ? 0 : findUtf8ChunkEnd(conversationText, offset, availableConversationBytes);
+			if (conversationText.length > 0 && end <= offset) {
+				throw new Error(`Compaction summary could not fit one character in ${contextWindow}-token model context`);
+			}
+
+			const promptText = buildSummaryPrompt(
+				conversationText.slice(offset, end),
+				summary,
+				basePrompt,
+				options?.extraContext,
+			);
+			try {
+				const update = summary !== undefined;
+				summary = await requestSummary(
+					promptText,
+					update
+						? "agent.compaction.prompts.compaction-update-summary"
+						: "agent.compaction.prompts.compaction-summary",
+					update
+						? "packages/agent/src/compaction/prompts/compaction-update-summary.md"
+						: "packages/agent/src/compaction/prompts/compaction-summary.md",
+					model,
+					maxTokens,
+					apiKey,
+					signal,
+					options,
+				);
+				break;
+			} catch (error) {
+				if (!AIError.is(AIError.classify(error), AIError.Flag.ContextOverflow)) throw error;
+				if (bytesPerToken > 1) {
+					bytesPerToken = 1;
+					continue;
+				}
+				const sentTokens = tokenizer.countTokens([SUMMARIZATION_SYSTEM_PROMPT, promptText], "strict");
+				const halved = Math.floor(Math.min(inputBudgetTokens, sentTokens) / 2);
+				if (halved < minSummaryInputTokens(model)) throw error;
+				inputBudgetTokens = halved;
+			}
+		}
+
+		if (conversationText.length === 0) break;
+		offset = end;
+	} while (offset < conversationText.length);
+
+	return summary ?? "";
 }
 
 // ============================================================================
@@ -1139,7 +1103,12 @@ export async function generateHandoff(
 	];
 
 	return generateHandoffFromContext(
-		{ systemPrompt: options.systemPrompt, messages: requestMessages, tools: options.tools },
+		{
+			systemPrompt: options.systemPrompt,
+			instructions: collectCompactionContextInstructions(messages, "side_model"),
+			messages: requestMessages,
+			tools: options.tools,
+		},
 		model,
 		{
 			streamOptions: {
@@ -1192,10 +1161,11 @@ async function generateShortSummary(
 
 	const response = await instrumentedCompleteSimple(
 		model,
-		{
-			systemPrompt: [SUMMARIZATION_SYSTEM_PROMPT],
-			messages: [{ role: "user", content: [{ type: "text", text: promptText }], timestamp: Date.now() }],
-		},
+		compactionInstructionContext(
+			"agent.compaction.prompts.compaction-short-summary",
+			"packages/agent/src/compaction/prompts/compaction-short-summary.md",
+			promptText,
+		),
 		{
 			maxTokens,
 			signal,
@@ -1804,17 +1774,13 @@ async function generateTurnPrefixSummary(
 	const llmMessages = (options?.convertToLlm ?? defaultConvertToLlm)(messages);
 	const conversationText = serializeConversationForSummary(llmMessages, preferredDialect(model.id));
 	const promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`;
-	const summarizationMessages = [
-		{
-			role: "user" as const,
-			content: [{ type: "text" as const, text: promptText }],
-			timestamp: Date.now(),
-		},
-	];
-
 	const response = await instrumentedCompleteSimple(
 		model,
-		{ systemPrompt: [SUMMARIZATION_SYSTEM_PROMPT], messages: summarizationMessages },
+		compactionInstructionContext(
+			"agent.compaction.prompts.compaction-turn-prefix",
+			"packages/agent/src/compaction/prompts/compaction-turn-prefix.md",
+			promptText,
+		),
 		{
 			maxTokens,
 			signal,

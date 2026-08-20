@@ -1,7 +1,9 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { $which, hasFsCode, isEisdir, isEnoent, isEnotdir, Snowflake } from "@oh-my-pi/pi-utils";
+import { hasFsCode, isEisdir, isEnoent, isEnotdir } from "@oh-my-pi/pi-utils/fs-error";
+import { Snowflake } from "@oh-my-pi/pi-utils/snowflake";
+import { $which } from "@oh-my-pi/pi-utils/which";
 import type { Subprocess } from "bun";
 import {
 	parseDiffHunks as parseCommitDiffHunks,
@@ -64,11 +66,14 @@ export interface DiffOptions {
 	readonly files?: readonly string[];
 	readonly head?: string;
 	readonly nameOnly?: boolean;
+	readonly nameStatus?: boolean;
+	readonly noRenames?: boolean;
 	readonly noIndex?: { left: string; right: string };
 	readonly numstat?: boolean;
 	readonly signal?: AbortSignal;
 	readonly stat?: boolean;
 	readonly requireComplete?: boolean;
+	readonly z?: boolean;
 }
 
 export interface StatusOptions {
@@ -660,6 +665,9 @@ function buildDiffArgs(options: DiffOptions): string[] {
 	if (options.binary) args.push("--binary");
 	if (options.cached) args.push("--cached");
 	if (options.nameOnly) args.push("--name-only");
+	if (options.nameStatus) args.push("--name-status");
+	if (options.noRenames) args.push("--no-renames");
+	if (options.z) args.push("-z");
 	if (options.stat) args.push("--stat");
 	if (options.numstat) args.push("--numstat");
 	if (options.noIndex) {
@@ -1911,6 +1919,21 @@ export const ref = {
 		return result.stdout.trim() || null;
 	},
 
+	/** Resolve a tree-ish to its immutable commit and root-tree object ids. */
+	async commitIdentity(
+		cwd: string,
+		refName: string,
+		signal?: AbortSignal,
+	): Promise<{ commit: string; tree: string } | null> {
+		const [commit, tree] = await Promise.all([
+			tryText(cwd, ["rev-parse", "--verify", `${refName}^{commit}`], { readOnly: true, signal }),
+			tryText(cwd, ["rev-parse", "--verify", `${refName}^{tree}`], { readOnly: true, signal }),
+		]);
+		const resolvedCommit = commit?.trim();
+		const resolvedTree = tree?.trim();
+		return resolvedCommit && resolvedTree ? { commit: resolvedCommit, tree: resolvedTree } : null;
+	},
+
 	/** Tags pointing at a ref. */
 	async tags(cwd: string, refName = "HEAD", signal?: AbortSignal): Promise<string[]> {
 		return splitLines(
@@ -2341,6 +2364,13 @@ export const head = {
 	/** Abbreviated HEAD commit SHA. */
 	async short(cwd: string, length = 7, signal?: AbortSignal): Promise<string | null> {
 		const result = await git(cwd, ["rev-parse", `--short=${length}`, "HEAD"], { readOnly: true, signal });
+		if (result.exitCode !== 0) return null;
+		return result.stdout.trim() || null;
+	},
+
+	/** Tree object for the current HEAD commit. */
+	async tree(cwd: string, signal?: AbortSignal): Promise<string | null> {
+		const result = await git(cwd, ["rev-parse", "HEAD^{tree}"], { readOnly: true, signal });
 		if (result.exitCode !== 0) return null;
 		return result.stdout.trim() || null;
 	},

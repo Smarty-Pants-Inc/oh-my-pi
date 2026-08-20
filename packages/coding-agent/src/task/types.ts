@@ -108,26 +108,43 @@ export const LABEL_MAX = 80;
 
 // Keep this explicit: ArkType serializes `unknown` as a boolean subschema, which llama.cpp grammars reject.
 const outputSchemaInputSchema = type("object | boolean | string | null");
+const modelRule = "string | string[]" as const;
 // Coarse per-spawn thinking effort; must stay in sync with TASK_EFFORTS in ../thinking.
 const effortRule = '"lo" | "med" | "hi"' as const;
+const selectableExecutionField = { "execution?": '"local" | "environment"' } as const;
 
-export const taskItemSchema = type({
-	"name?": "string",
-	agent: "string = 'task'",
-	task: "string",
-	"outputSchema?": outputSchemaInputSchema,
-	"schemaMode?": '"permissive" | "strict"',
-	"+": "delete",
-});
-const taskItemSchemaIsolated = type({
-	"name?": "string",
-	agent: "string = 'task'",
-	task: "string",
-	"outputSchema?": outputSchemaInputSchema,
-	"schemaMode?": '"permissive" | "strict"',
-	"isolated?": "boolean",
-	"+": "delete",
-});
+function rejectExecutionField<T>(schema: T): T {
+	return (schema as unknown as BaseType).filter((value, ctx) => {
+		if (value !== null && typeof value === "object" && Object.hasOwn(value, "execution")) {
+			return ctx.mustBe("provided without `execution`; that field is unavailable for this task shape");
+		}
+		return true;
+	}) as unknown as T;
+}
+
+export const taskItemSchema = rejectExecutionField(
+	type({
+		"name?": "string",
+		agent: "string = 'task'",
+		task: "string",
+		"model?": modelRule,
+		"outputSchema?": outputSchemaInputSchema,
+		"schemaMode?": '"permissive" | "strict"',
+		"+": "delete",
+	}),
+);
+const taskItemSchemaIsolated = rejectExecutionField(
+	type({
+		"name?": "string",
+		agent: "string = 'task'",
+		task: "string",
+		"model?": modelRule,
+		"outputSchema?": outputSchemaInputSchema,
+		"schemaMode?": '"permissive" | "strict"',
+		"isolated?": "boolean",
+		"+": "delete",
+	}),
+);
 
 /** Single task item. Fields are optional defensively: args stream in token by token. */
 export interface TaskItem {
@@ -137,6 +154,8 @@ export interface TaskItem {
 	agent?: string;
 	/** The work; required by the schema. */
 	task?: string;
+	/** Direct per-task model selector. Overrides the selected agent's default model. */
+	model?: string | string[];
 	/** Per-spawn thinking effort: lowest/middle/highest level the resolved model supports. Overrides the agent's default selector (e.g. `auto`). */
 	effort?: TaskEffort;
 	/** Caller-provided output schema; its presence overrides the selected agent's schema. */
@@ -151,30 +170,57 @@ export const taskSchema = type({
 	"name?": "string",
 	agent: "string = 'task'",
 	task: "string",
+	"model?": modelRule,
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
+	...selectableExecutionField,
 	"isolated?": "boolean",
 	"+": "delete",
 });
-const taskSchemaNoIsolation = type({
-	"name?": "string",
-	agent: "string = 'task'",
-	task: "string",
-	"outputSchema?": outputSchemaInputSchema,
-	"schemaMode?": '"permissive" | "strict"',
-	"+": "delete",
-});
-const taskSchemaBatch = type({
-	context: "string",
-	tasks: taskItemSchemaIsolated.array(),
-	"+": "delete",
-});
-const taskSchemaBatchNoIsolation = type({
-	context: "string",
-	tasks: taskItemSchema.array(),
-	"+": "delete",
-});
-const ALL_TASK_SCHEMAS = [taskSchema, taskSchemaNoIsolation, taskSchemaBatch, taskSchemaBatchNoIsolation] as const;
+const taskSchemaIsolated = rejectExecutionField(
+	type({
+		"name?": "string",
+		agent: "string = 'task'",
+		task: "string",
+		"model?": modelRule,
+		"outputSchema?": outputSchemaInputSchema,
+		"schemaMode?": '"permissive" | "strict"',
+		"isolated?": "boolean",
+		"+": "delete",
+	}),
+);
+const taskSchemaNoIsolation = rejectExecutionField(
+	type({
+		"name?": "string",
+		agent: "string = 'task'",
+		task: "string",
+		"model?": modelRule,
+		"outputSchema?": outputSchemaInputSchema,
+		"schemaMode?": '"permissive" | "strict"',
+		"+": "delete",
+	}),
+);
+const taskSchemaBatch = rejectExecutionField(
+	type({
+		context: "string",
+		tasks: taskItemSchemaIsolated.array(),
+		"+": "delete",
+	}),
+);
+const taskSchemaBatchNoIsolation = rejectExecutionField(
+	type({
+		context: "string",
+		tasks: taskItemSchema.array(),
+		"+": "delete",
+	}),
+);
+const ALL_TASK_SCHEMAS = [
+	taskSchema,
+	taskSchemaIsolated,
+	taskSchemaNoIsolation,
+	taskSchemaBatch,
+	taskSchemaBatchNoIsolation,
+] as const;
 
 type DynamicTaskSchema = (typeof ALL_TASK_SCHEMAS)[number];
 export type TaskSchema = typeof taskSchema;
@@ -197,63 +243,45 @@ function createTaskSchema(options: {
 	batchEnabled: boolean;
 	defaultAgent: string;
 	effortEnabled: boolean;
+	environmentEnabled: boolean;
 }): BaseType {
 	const agent = taskAgentSchemaRule(options.defaultAgent);
 	const effortField = options.effortEnabled ? { "effort?": effortRule } : {};
 	if (options.batchEnabled) {
-		if (options.isolationEnabled) {
-			const item = type.raw({
+		const item = rejectExecutionField(
+			type.raw({
 				"name?": "string",
 				agent,
 				task: "string",
+				"model?": modelRule,
 				...effortField,
 				"outputSchema?": outputSchemaInputSchema,
 				"schemaMode?": '"permissive" | "strict"',
-				"isolated?": "boolean",
+				...(options.isolationEnabled ? { "isolated?": "boolean" as const } : {}),
 				"+": "delete",
-			});
-			return type.raw({
+			}),
+		);
+		return rejectExecutionField(
+			type.raw({
 				context: "string",
 				tasks: item.array(),
 				"+": "delete",
-			});
-		}
-		const item = type.raw({
-			"name?": "string",
-			agent,
-			task: "string",
-			...effortField,
-			"outputSchema?": outputSchemaInputSchema,
-			"schemaMode?": '"permissive" | "strict"',
-			"+": "delete",
-		});
-		return type.raw({
-			context: "string",
-			tasks: item.array(),
-			"+": "delete",
-		});
+			}),
+		);
 	}
-	if (options.isolationEnabled) {
-		return type.raw({
-			"name?": "string",
-			agent,
-			task: "string",
-			...effortField,
-			"outputSchema?": outputSchemaInputSchema,
-			"schemaMode?": '"permissive" | "strict"',
-			"isolated?": "boolean",
-			"+": "delete",
-		});
-	}
-	return type.raw({
+	const schema = type.raw({
 		"name?": "string",
 		agent,
 		task: "string",
+		"model?": modelRule,
 		...effortField,
 		"outputSchema?": outputSchemaInputSchema,
 		"schemaMode?": '"permissive" | "strict"',
+		...(options.isolationEnabled ? { "isolated?": "boolean" as const } : {}),
+		...(options.environmentEnabled ? selectableExecutionField : {}),
 		"+": "delete",
 	});
+	return options.environmentEnabled ? schema : rejectExecutionField(schema);
 }
 
 /** Build the task wire schema for the current settings and spawn policy. */
@@ -262,17 +290,20 @@ export function getTaskSchema(options: {
 	batchEnabled: boolean;
 	effortEnabled?: boolean;
 	defaultAgent?: string;
+	environmentEnabled?: boolean;
 }): TaskToolSchemaInstance {
 	const defaultAgent = options.defaultAgent ?? "task";
 	const effortEnabled = options.effortEnabled ?? false;
+	const environmentEnabled = options.isolationEnabled && (options.environmentEnabled ?? false);
 	if (defaultAgent === "task" && !effortEnabled) {
 		if (options.batchEnabled) return options.isolationEnabled ? taskSchemaBatch : taskSchemaBatchNoIsolation;
-		return options.isolationEnabled ? taskSchema : taskSchemaNoIsolation;
+		if (!options.isolationEnabled) return taskSchemaNoIsolation;
+		return environmentEnabled ? taskSchema : taskSchemaIsolated;
 	}
-	const key = `${options.isolationEnabled ? "iso" : "flat"}:${options.batchEnabled ? "batch" : "single"}:${effortEnabled ? "effort" : "default"}:${defaultAgent}`;
+	const key = `${options.isolationEnabled ? "iso" : "flat"}:${options.batchEnabled ? "batch" : "single"}:${environmentEnabled ? "environment" : "local"}:${effortEnabled ? "effort" : "default"}:${defaultAgent}`;
 	const cached = taskSchemaCache.get(key);
 	if (cached) return cached;
-	const schema = createTaskSchema({ ...options, effortEnabled, defaultAgent });
+	const schema = createTaskSchema({ ...options, environmentEnabled, effortEnabled, defaultAgent });
 	taskSchemaCache.set(key, schema);
 	return schema;
 }
@@ -290,6 +321,8 @@ export interface TaskParams {
 	agent?: string;
 	/** The work (flat form). */
 	task?: string;
+	/** Direct per-task model selector. Overrides the selected agent's default model. */
+	model?: string | string[];
 	/** Per-spawn thinking effort (flat form): lowest/middle/highest level the resolved model supports. */
 	effort?: TaskEffort;
 	/** Caller-provided output schema; its presence overrides the selected agent's schema. */
@@ -302,6 +335,8 @@ export interface TaskParams {
 	context?: string;
 	/** Run in an isolated worktree (flat form; per-item in batch form). */
 	isolated?: boolean;
+	/** Select the execution substrate (flat form only). Defaults to local. */
+	execution?: "local" | "environment";
 }
 
 /**

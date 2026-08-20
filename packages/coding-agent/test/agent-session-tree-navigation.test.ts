@@ -26,6 +26,13 @@ describe.skipIf(!e2eApiKey("ANTHROPIC_API_KEY"))("AgentSession tree navigation e
 				treePreparationStarted.resolve();
 				return undefined;
 			}),
+			emitBeforeSessionMutation: vi.fn().mockResolvedValue(undefined),
+			emitWithHostCompletion: vi.fn(
+				async (_event: { type: string }, prepareHostCompletion?: () => unknown | Promise<unknown>) => {
+					const continuation = await prepareHostCompletion?.();
+					if (typeof continuation === "function") await continuation();
+				},
+			),
 		} as unknown as ExtensionRunner;
 		ctx = await createTestSession({
 			systemPrompt: ["You are a helpful assistant. Reply with just a few words."],

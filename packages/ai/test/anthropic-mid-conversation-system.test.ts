@@ -1,6 +1,15 @@
 import { describe, expect, it } from "bun:test";
-import { convertAnthropicMessages } from "@oh-my-pi/pi-ai/providers/anthropic";
-import type { AssistantMessage, DeveloperMessage, Message, Model, ModelSpec, UserMessage } from "@oh-my-pi/pi-ai/types";
+import { buildAnthropicContextSystemBlocks, convertAnthropicMessages } from "@oh-my-pi/pi-ai/providers/anthropic";
+import type {
+	AssistantMessage,
+	Context,
+	ContextInstruction,
+	DeveloperMessage,
+	Message,
+	Model,
+	ModelSpec,
+	UserMessage,
+} from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 
 /**
@@ -56,7 +65,33 @@ function assistant(text: string, model: Model<"anthropic-messages">): AssistantM
 	};
 }
 
+const internalInstruction: ContextInstruction = {
+	id: "goal.continuation",
+	sourcePath: "packages/coding-agent/src/prompts/goals/continuation.md",
+	role: "internal_context",
+	target: "main",
+	trigger: "goal-continuation",
+	sha256: "test-sha256",
+	renderedText: "Continue the active goal without overriding the user.",
+};
+
 describe("Anthropic mid-conversation system messages", () => {
+	it("keeps fresh internal context in the top-level system field instead of user history", () => {
+		const model = makeModel({ id: "claude-opus-4-5-20251101", name: "Claude Opus 4.5" });
+		const context: Context = {
+			instructions: [internalInstruction],
+			messages: [user("hi"), assistant("hello", model)],
+		};
+
+		expect(buildAnthropicContextSystemBlocks(context)).toEqual([
+			{ type: "text", text: internalInstruction.renderedText },
+		]);
+		const history = convertAnthropicMessages(context.messages, model, false);
+		expect(history.some(message => message.role === "system")).toBe(false);
+		expect(history.filter(message => message.role === "user")).toHaveLength(2);
+		expect(history.some(message => message.content === internalInstruction.renderedText)).toBe(false);
+	});
+
 	it("maps a trailing developer message after a user turn to role: system", () => {
 		const model = makeModel();
 		const params = convertAnthropicMessages(

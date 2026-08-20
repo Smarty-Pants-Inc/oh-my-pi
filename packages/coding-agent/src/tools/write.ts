@@ -26,6 +26,7 @@ import { getDiagnosticsLedger } from "../lsp/diagnostics-ledger";
 import { getLanguageFromPath, highlightCode, type Theme } from "../modes/theme/theme";
 import writeDescription from "../prompts/tools/write.md" with { type: "text" };
 import type { ToolSession } from "../sdk";
+import { mapExecutionEnvironmentPath } from "../session/execution-environment";
 import { fileHyperlink, framedBlock, renderStatusLine } from "../tui";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import {
@@ -491,6 +492,27 @@ function parseSqliteWriteTarget(subPath: string, queryString: string): { table: 
 	}
 
 	return { table, key };
+}
+
+function assertEnvironmentWriteSupported(writePath: string, content: string): void {
+	if (parseConflictUri(writePath)) {
+		throw new ToolError("Environment writes only support ordinary workspace files, not conflict:// targets");
+	}
+	if (parseArchivePathCandidates(writePath).some(candidate => candidate.archivePath !== writePath)) {
+		throw new ToolError("Environment writes do not support archive member targets");
+	}
+	if (parseSqlitePathCandidates(writePath).some(candidate => candidate.sqlitePath !== writePath)) {
+		throw new ToolError("Environment writes do not support SQLite table or row targets");
+	}
+	if (
+		content.includes("\0") ||
+		new TextDecoder("utf-8", { fatal: true }).decode(new TextEncoder().encode(content)) !== content
+	) {
+		throw new ToolError("Environment writes require strict UTF-8 text content");
+	}
+	if (content.startsWith("#!")) {
+		throw new ToolError("Environment writes do not support executable-mode preservation");
+	}
 }
 
 /**
@@ -1091,6 +1113,47 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		};
 	}
 
+	async #writeEnvironment(
+		writePath: string,
+		content: string,
+		stripped: boolean,
+		onUpdate: AgentToolUpdateCallback<WriteToolDetails> | undefined,
+	): Promise<AgentToolResult<WriteToolDetails> | undefined> {
+		const environment = this.session.getExecutionEnvironment?.();
+		if (!environment) return undefined;
+
+		assertEnvironmentWriteSupported(writePath, content);
+		let remotePath: string;
+		try {
+			remotePath = mapExecutionEnvironmentPath(environment, writePath);
+		} catch (error) {
+			throw new ToolError(error instanceof Error ? error.message : String(error));
+		}
+
+		emitWriteProgress(onUpdate, content, remotePath, remotePath);
+		try {
+			await environment.bridge.writeTextFile({ path: remotePath, content });
+			const verifiedContent = await environment.bridge.readTextFile({ path: remotePath });
+			if (verifiedContent !== content) {
+				throw new ToolError(
+					`Environment write verification failed for '${remotePath}': remote content did not match the requested text`,
+				);
+			}
+		} catch (error) {
+			if (error instanceof ToolError) throw error;
+			throw new ToolError(error instanceof Error ? error.message : String(error));
+		}
+
+		let resultText = `Successfully wrote ${content.length} bytes to ${remotePath}`;
+		if (stripped) {
+			resultText += "\nNote: auto-stripped hashline display prefixes from content before writing.";
+		}
+		return {
+			content: [{ type: "text", text: resultText }],
+			details: { resolvedPath: remotePath },
+		};
+	}
+
 	async execute(
 		_toolCallId: string,
 		{ path: rawPath, content }: WriteParams,
@@ -1189,6 +1252,15 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				if (scheme !== "local") await internalRouter.write(path, cleanContent);
 				// local:// is backed by the session-local artifact sandbox and is
 				// resolved by resolvePlanPath below so write/read share the same root.
+			}
+
+			// Internal protocols are handled by OMP's control plane above. An active
+			// environment owns every remaining ordinary workspace path; route before
+			// any local existence probe, archive/database inspection, LSP, snapshot,
+			// mode, ACP, or disk read/write behavior.
+			if (!internalRouter.canHandle(path)) {
+				const environmentResult = await this.#writeEnvironment(path, cleanContent, stripped, onUpdate);
+				if (environmentResult) return environmentResult;
 			}
 
 			const conflictUri = parseConflictUri(path);

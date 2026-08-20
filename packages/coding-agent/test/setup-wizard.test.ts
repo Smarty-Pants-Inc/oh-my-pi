@@ -416,6 +416,69 @@ describe("setup wizard short terminals", () => {
 			component.dispose();
 		}
 	});
+
+	it("commits a curated theme when its rendered row is clicked", async () => {
+		await initTheme(false, "unicode", false, "titanium", "light");
+		const settings = Settings.isolated();
+		const finished = Promise.withResolvers<string>();
+		const host = {
+			ctx: { settings, ui: { requestRender: () => {}, invalidate: () => {} } },
+			requestRender: () => {},
+			finish: (result: string) => finished.resolve(result),
+			setFocus: () => {},
+			restoreFocus: () => {},
+		} as unknown as SetupSceneHost;
+		const controller = themeSetupScene.mount(host);
+		const frame = controller.render?.(80, 24).map(line => Bun.stripANSI(line)) ?? [];
+		const titaniumRow = frame.findIndex(line => line.includes("Titanium"));
+		expect(titaniumRow).toBeGreaterThan(0);
+		controller.routeMouse?.(
+			{ button: 0, col: 0, row: titaniumRow, release: false, wheel: null, motion: false, leftClick: true },
+			titaniumRow,
+			0,
+		);
+		expect(await finished.promise).toBe("done");
+		expect(settings.get("theme.dark")).toBe("titanium");
+	});
+
+	it("keeps the all-theme search status and selection visible on a 24-row terminal", async () => {
+		await initTheme(false, "unicode", false, "titanium", "light");
+		const ctx = shortTerminalCtx(24);
+		const allThemesLoaded = Promise.withResolvers<void>();
+		let waitForAllThemes = false;
+		let component: SetupWizardComponent;
+		ctx.ui.requestRender = () => {
+			if (!waitForAllThemes) return;
+			const frame = component.render(80).map(line => Bun.stripANSI(line));
+			if (frame.some(line => line.includes("Type to search"))) allThemesLoaded.resolve();
+		};
+		component = new SetupWizardComponent(ctx, [themeSetupScene]);
+		void component.run();
+		component.handleInput("\r"); // splash → scene
+		const nowSpy = skipDissolve();
+		try {
+			// Resolve from the all-themes completion render rather than sleeping for
+			// the async filesystem lookup, so the following frame is fully loaded.
+			waitForAllThemes = true;
+			component.handleInput("6");
+			component.handleInput("\r");
+			await allThemesLoaded.promise;
+
+			const frame = component.render(80).map(line => Bun.stripANSI(line));
+			expect(frame).toHaveLength(24);
+			expect(frame.some(line => line.includes("Type to search"))).toBe(true);
+			expect(frame.some(line => line.trimStart().startsWith(theme.nav.cursor))).toBe(true);
+
+			component.handleInput("light");
+			const filteredFrame = component.render(80).map(line => Bun.stripANSI(line));
+			expect(filteredFrame).toHaveLength(24);
+			expect(filteredFrame.some(line => line.includes("Search: light"))).toBe(true);
+			expect(filteredFrame.some(line => line.trimStart().startsWith(theme.nav.cursor))).toBe(true);
+		} finally {
+			nowSpy.mockRestore();
+			component.dispose();
+		}
+	});
 });
 
 describe("setup wizard theme previews", () => {

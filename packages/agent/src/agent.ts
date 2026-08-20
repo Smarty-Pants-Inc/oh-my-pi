@@ -7,6 +7,7 @@ import {
 	type AssistantMessage,
 	type AssistantMessageEvent,
 	type Context,
+	type ContextTarget,
 	type CursorExecHandlers,
 	type CursorToolResultHandler,
 	type Effort,
@@ -36,6 +37,7 @@ import {
 	resolveOwnedDialectFromEnv,
 } from "./agent-loop";
 import type { AppendOnlyContextManager } from "./append-only-context";
+import { collectCompactionContextInstructions } from "./compaction/messages";
 import { isProviderRefusalMessage } from "./replay-policy";
 import { Tokenizer, tokenizerEncodingForModel } from "./tokenizer";
 import type {
@@ -53,7 +55,13 @@ import type {
 	ToolCallContext,
 	ToolChoiceDirective,
 } from "./types";
-import { isSoftToolRequirement } from "./types";
+import {
+	ASIDE_MESSAGE_COMMIT,
+	ASIDE_MESSAGE_DISCARD,
+	ASIDE_MESSAGE_SEAL,
+	type CommittableAsideMessage,
+	isSoftToolRequirement,
+} from "./types";
 import { EventLoopKeepalive } from "./utils/yield";
 
 /**
@@ -97,6 +105,8 @@ export class AgentBusyError extends Error {
 }
 export interface AgentOptions {
 	initialState?: Partial<AgentState>;
+	/** Semantic target for fresh internal context assembled by this agent. */
+	contextTarget?: ContextTarget;
 
 	/**
 	 * Converts AgentMessage[] to LLM-compatible Message[] before each LLM call.
@@ -173,6 +183,8 @@ export interface AgentOptions {
 	 * Inspect or replace provider payloads before they are sent.
 	 */
 	onPayload?: SimpleStreamOptions["onPayload"];
+	/** Observe final tool definitions delivered outside the primary provider payload. */
+	onToolContracts?: SimpleStreamOptions["onToolContracts"];
 	/**
 	 * Inspect provider response metadata after headers arrive and before streaming body consumption.
 	 */
@@ -337,6 +349,18 @@ export interface AgentOptions {
 
 export interface AgentPromptOptions {
 	toolChoice?: ToolChoice;
+	/**
+	 * Called after the provider accepts the request and exposes response metadata or
+	 * the first non-error response event. Input events stay provisional until the
+	 * callback returns; throwing leaves the prompt uncommitted.
+	 */
+	onProviderCallStarted?: () => void;
+}
+
+/** Transactional ownership of Agent session-scoped tool-directive state. */
+export interface AgentToolDirectiveSessionTransition {
+	commit(): void;
+	rollback(): void;
 }
 
 /** Buffered Cursor exec-channel tool result waiting to be emitted after the assistant message. */
@@ -349,6 +373,16 @@ interface CursorToolResultEntry {
 	 * `message_end` lands in the same chunk as the tool result.
 	 */
 	pending?: Promise<void>;
+}
+
+interface InFlightQueuedMessageCompanions {
+	owner: AgentMessage;
+	messages: AgentMessage[];
+	restore: (messages: AgentMessage[]) => void;
+	output: AgentMessage[];
+	seal: () => void;
+	commit: () => void;
+	discard: () => void;
 }
 
 export class Agent {
@@ -370,8 +404,14 @@ export class Agent {
 	#convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	#transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
 	#transformProviderContext?: (context: Context, model: Model) => Context | Promise<Context>;
+	#contextTarget: ContextTarget;
 	#steeringQueue: AgentMessage[] = [];
 	#followUpQueue: AgentMessage[] = [];
+	#queuedMessageCompanions = new Map<
+		AgentMessage,
+		{ messages: AgentMessage[]; restore: (messages: AgentMessage[]) => void }
+	>();
+	#inFlightQueuedMessageCompanions: InFlightQueuedMessageCompanions[] = [];
 	#steeringWaiters = new Set<() => void>();
 
 	#steeringMode: "all" | "one-at-a-time";
@@ -416,6 +456,7 @@ export class Agent {
 	#softToolRequirementState: NonNullable<AgentLoopConfig["softToolRequirementState"]> = { escalations: 0 };
 	#deferredToolChoice?: ToolChoice;
 	#onPayload?: SimpleStreamOptions["onPayload"];
+	#onToolContracts?: SimpleStreamOptions["onToolContracts"];
 	#onResponse?: SimpleStreamOptions["onResponse"];
 	#onSseEvent?: SimpleStreamOptions["onSseEvent"];
 	#onAssistantMessageEvent?: (message: AssistantMessage, event: AssistantMessageEvent) => void;
@@ -462,6 +503,7 @@ export class Agent {
 			this.#state.pendingToolCalls = new Set(opts.initialState.pendingToolCalls);
 		this.#syncTokenizer(this.#state.model);
 		this.#convertToLlm = opts.convertToLlm || defaultConvertToLlm;
+		this.#contextTarget = opts.contextTarget ?? "main";
 		this.#transformContext = opts.transformContext;
 		this.#steeringMode = opts.steeringMode || "one-at-a-time";
 		this.#followUpMode = opts.followUpMode || "one-at-a-time";
@@ -484,6 +526,7 @@ export class Agent {
 		this.#maxRetryDelayMs = opts.maxRetryDelayMs;
 		this.getApiKey = opts.getApiKey;
 		this.#onPayload = opts.onPayload;
+		this.#onToolContracts = opts.onToolContracts;
 		this.#onResponse = opts.onResponse;
 		this.#onSseEvent = opts.onSseEvent;
 		this.#getToolContext = opts.getToolContext;
@@ -785,6 +828,7 @@ export class Agent {
 	async buildSideRequestContext(
 		llmMessages: Message[],
 		systemPrompt: string[] = this.#state.systemPrompt,
+		sourceMessages?: readonly AgentMessage[],
 	): Promise<Context> {
 		const model = this.#state.model;
 		if (!model) throw new Error("No active model on agent");
@@ -796,7 +840,10 @@ export class Agent {
 					injectIntent: this.#intentTracing,
 					pruneDescriptions: this.#pruneToolDescriptions,
 				}) ?? []);
-		let context: Context = { systemPrompt, messages, tools };
+		const instructions = sourceMessages
+			? collectCompactionContextInstructions(sourceMessages, this.#contextTarget)
+			: undefined;
+		let context: Context = { systemPrompt, instructions, messages, tools };
 		if (this.#transformProviderContext) context = await this.#transformProviderContext(context, model);
 		return context;
 	}
@@ -969,10 +1016,161 @@ export class Agent {
 		this.#state.messages = ms.slice();
 	}
 
-	replaceQueues(steering: AgentMessage[], followUp: AgentMessage[]) {
+	replaceQueues(steering: AgentMessage[], followUp: AgentMessage[], preserveCompanions = false) {
 		this.#steeringQueue = steering.slice();
 		this.#followUpQueue = followUp.slice();
+		if (!preserveCompanions) this.releaseOrphanedQueuedMessageCompanions();
 		this.#notifySteeringWaiters();
+	}
+
+	attachQueuedMessageCompanions(
+		owner: AgentMessage,
+		messages: AgentMessage[],
+		restore: (messages: AgentMessage[]) => void,
+	): boolean {
+		const inFlight = this.#inFlightQueuedMessageCompanions.find(claim => claim.owner === owner);
+		if (inFlight) return this.#attachToInFlightQueuedMessageCompanions(inFlight, messages);
+		if (!this.#steeringQueue.includes(owner) && !this.#followUpQueue.includes(owner)) return false;
+		const existing = this.#queuedMessageCompanions.get(owner);
+		if (existing) existing.messages.push(...messages);
+		else this.#queuedMessageCompanions.set(owner, { messages: messages.slice(), restore });
+		return true;
+	}
+
+	attachInFlightQueuedMessageCompanions(
+		messages: AgentMessage[],
+		restore?: (messages: AgentMessage[]) => void,
+	): boolean {
+		const inFlight = this.#inFlightQueuedMessageCompanions[0];
+		if (!inFlight) return false;
+		if (restore && inFlight.messages.length === 0) inFlight.restore = restore;
+		return this.#attachToInFlightQueuedMessageCompanions(inFlight, messages);
+	}
+
+	#attachToInFlightQueuedMessageCompanions(
+		inFlight: InFlightQueuedMessageCompanions,
+		messages: AgentMessage[],
+	): boolean {
+		for (const message of messages) {
+			Object.defineProperties(message as CommittableAsideMessage, {
+				[ASIDE_MESSAGE_SEAL]: { configurable: true, value: inFlight.seal },
+				[ASIDE_MESSAGE_COMMIT]: { configurable: true, value: inFlight.commit },
+				[ASIDE_MESSAGE_DISCARD]: { configurable: true, value: inFlight.discard },
+			});
+			inFlight.messages.push(message);
+			inFlight.output.push(message);
+		}
+		return true;
+	}
+
+	captureQueuedMessageCompanions(): Array<{ owner: AgentMessage; messages: AgentMessage[] }> {
+		return [...this.#queuedMessageCompanions].map(([owner, companions]) => ({
+			owner,
+			messages: companions.messages.slice(),
+		}));
+	}
+
+	restoreQueuedMessageCompanions(
+		entries: Array<{ owner: AgentMessage; messages: AgentMessage[] }>,
+		restore: (messages: AgentMessage[]) => void,
+	): void {
+		this.#queuedMessageCompanions.clear();
+		for (const { owner, messages } of entries) {
+			if (this.#steeringQueue.includes(owner) || this.#followUpQueue.includes(owner)) {
+				this.#queuedMessageCompanions.set(owner, { messages: messages.slice(), restore });
+			} else {
+				restore(messages);
+			}
+		}
+	}
+
+	#queuedMessageRestorer(
+		queue: "steering" | "followUp",
+		batch: readonly AgentMessage[],
+	): (message: AgentMessage) => void {
+		const discarded = new Set<AgentMessage>();
+		return message => {
+			discarded.add(message);
+			const current = queue === "steering" ? this.#steeringQueue : this.#followUpQueue;
+			const restored = batch.filter(item => discarded.has(item));
+			const remaining = current.filter(item => !discarded.has(item));
+			if (queue === "steering") {
+				this.#steeringQueue = [...restored, ...remaining];
+				this.#notifySteeringWaiters();
+			} else {
+				this.#followUpQueue = [...restored, ...remaining];
+			}
+		};
+	}
+
+	#takeQueuedMessages(messages: AgentMessage[], restoreOwner?: (message: AgentMessage) => void): AgentMessage[] {
+		const expanded: AgentMessage[] = [];
+		for (const message of messages) {
+			expanded.push(message);
+			const companions = this.#queuedMessageCompanions.get(message);
+			if (!companions && message.role !== "user" && !restoreOwner) continue;
+			if (companions) this.#queuedMessageCompanions.delete(message);
+			let settled = false;
+			const restore = companions?.restore ?? (() => {});
+			let claim: InFlightQueuedMessageCompanions;
+			const seal = () => {
+				if (settled) return;
+				this.#inFlightQueuedMessageCompanions = this.#inFlightQueuedMessageCompanions.filter(
+					entry => entry !== claim,
+				);
+			};
+			const commit = () => {
+				if (settled) return;
+				settled = true;
+				this.#inFlightQueuedMessageCompanions = this.#inFlightQueuedMessageCompanions.filter(
+					entry => entry !== claim,
+				);
+			};
+			const discard = () => {
+				if (settled) return;
+				settled = true;
+				this.#inFlightQueuedMessageCompanions = this.#inFlightQueuedMessageCompanions.filter(
+					entry => entry !== claim,
+				);
+				if (restoreOwner) {
+					restoreOwner(message);
+					if (claim.messages.length > 0) {
+						this.#queuedMessageCompanions.set(message, {
+							messages: claim.messages.slice(),
+							restore: claim.restore,
+						});
+					}
+				} else {
+					claim.restore(claim.messages);
+				}
+			};
+			claim = {
+				owner: message,
+				messages: [],
+				restore,
+				output: expanded,
+				seal,
+				commit,
+				discard,
+			};
+			this.#inFlightQueuedMessageCompanions.push(claim);
+			Object.defineProperties(message as CommittableAsideMessage, {
+				[ASIDE_MESSAGE_SEAL]: { configurable: true, value: seal },
+				[ASIDE_MESSAGE_COMMIT]: { configurable: true, value: commit },
+				[ASIDE_MESSAGE_DISCARD]: { configurable: true, value: discard },
+			});
+			this.#attachToInFlightQueuedMessageCompanions(claim, companions?.messages ?? []);
+		}
+		return expanded;
+	}
+
+	releaseOrphanedQueuedMessageCompanions(): void {
+		const owners = new Set([...this.#steeringQueue, ...this.#followUpQueue]);
+		for (const [owner, companions] of this.#queuedMessageCompanions) {
+			if (owners.has(owner)) continue;
+			this.#queuedMessageCompanions.delete(owner);
+			companions.restore(companions.messages);
+		}
 	}
 
 	appendMessage(m: AgentMessage) {
@@ -1006,11 +1204,13 @@ export class Agent {
 
 	clearSteeringQueue() {
 		this.#steeringQueue = [];
+		this.releaseOrphanedQueuedMessageCompanions();
 		this.#notifySteeringWaiters();
 	}
 
 	clearFollowUpQueue() {
 		this.#followUpQueue = [];
+		this.releaseOrphanedQueuedMessageCompanions();
 	}
 
 	/**
@@ -1022,9 +1222,32 @@ export class Agent {
 		this.#softToolRequirementState = { escalations: 0 };
 	}
 
+	/**
+	 * Install empty session-scoped tool-directive state while retaining the current
+	 * state for an enclosing session transition. Commit selects the target without
+	 * discarding the retained snapshot until the owner transaction closes, so a
+	 * later pre-publication failure can still roll back exactly.
+	 */
+	beginToolDirectiveSessionTransition(): AgentToolDirectiveSessionTransition {
+		const retainedDeferredToolChoice = this.#deferredToolChoice;
+		const retainedSoftToolRequirementState = this.#softToolRequirementState;
+		this.clearDeferredToolDirectives();
+		let restored = false;
+		return {
+			commit: () => {},
+			rollback: () => {
+				if (restored) return;
+				restored = true;
+				this.#deferredToolChoice = retainedDeferredToolChoice;
+				this.#softToolRequirementState = retainedSoftToolRequirementState;
+			},
+		};
+	}
+
 	clearAllQueues() {
 		this.#steeringQueue = [];
 		this.#followUpQueue = [];
+		this.releaseOrphanedQueuedMessageCompanions();
 		this.#notifySteeringWaiters();
 		this.clearDeferredToolDirectives();
 	}
@@ -1052,31 +1275,19 @@ export class Agent {
 	}
 
 	#dequeueSteeringMessages(): AgentMessage[] {
-		if (this.#steeringMode === "one-at-a-time") {
-			if (this.#steeringQueue.length > 0) {
-				const first = this.#steeringQueue[0];
-				this.#steeringQueue = this.#steeringQueue.slice(1);
-				return [first];
-			}
-			return [];
-		}
-		const steering = this.#steeringQueue.slice();
-		this.#steeringQueue = [];
-		return steering;
+		const steering =
+			this.#steeringMode === "one-at-a-time" ? this.#steeringQueue.slice(0, 1) : this.#steeringQueue.slice();
+		if (steering.length === 0) return [];
+		this.#steeringQueue = this.#steeringQueue.slice(steering.length);
+		return this.#takeQueuedMessages(steering, this.#queuedMessageRestorer("steering", steering));
 	}
 
 	#dequeueFollowUpMessages(): AgentMessage[] {
-		if (this.#followUpMode === "one-at-a-time") {
-			if (this.#followUpQueue.length > 0) {
-				const first = this.#followUpQueue[0];
-				this.#followUpQueue = this.#followUpQueue.slice(1);
-				return [first];
-			}
-			return [];
-		}
-		const followUp = this.#followUpQueue.slice();
-		this.#followUpQueue = [];
-		return followUp;
+		const followUp =
+			this.#followUpMode === "one-at-a-time" ? this.#followUpQueue.slice(0, 1) : this.#followUpQueue.slice();
+		if (followUp.length === 0) return [];
+		this.#followUpQueue = this.#followUpQueue.slice(followUp.length);
+		return this.#takeQueuedMessages(followUp, this.#queuedMessageRestorer("followUp", followUp));
 	}
 
 	/**
@@ -1084,7 +1295,9 @@ export class Agent {
 	 * Used by dequeue keybinding.
 	 */
 	popLastSteer(): AgentMessage | undefined {
-		return this.#steeringQueue.pop();
+		const message = this.#steeringQueue.pop();
+		this.releaseOrphanedQueuedMessageCompanions();
+		return message;
 	}
 
 	/**
@@ -1092,7 +1305,9 @@ export class Agent {
 	 * Used by dequeue keybinding.
 	 */
 	popLastFollowUp(): AgentMessage | undefined {
-		return this.#followUpQueue.pop();
+		const message = this.#followUpQueue.pop();
+		this.releaseOrphanedQueuedMessageCompanions();
+		return message;
 	}
 
 	clearMessages() {
@@ -1138,6 +1353,7 @@ export class Agent {
 		this.#state.error = undefined;
 		this.#steeringQueue = [];
 		this.#followUpQueue = [];
+		this.releaseOrphanedQueuedMessageCompanions();
 		this.#notifySteeringWaiters();
 		this.clearDeferredToolDirectives();
 	}
@@ -1394,6 +1610,7 @@ export class Agent {
 			}
 			return refreshToolChoiceForActiveTools(options?.toolChoice, this.#state.tools);
 		};
+		let providerCallStarted = false;
 
 		const config: AgentLoopConfig = {
 			model,
@@ -1419,9 +1636,11 @@ export class Agent {
 			kimiApiFormat: this.#kimiApiFormat,
 			preferWebsockets: this.#preferWebsockets,
 			convertToLlm: this.#convertToLlm,
+			contextTarget: this.#contextTarget,
 			transformProviderContext: this.#transformProviderContext,
 			transformContext: this.#transformContext,
 			onPayload: this.#onPayload,
+			onToolContracts: this.#onToolContracts,
 			onResponse: this.#onResponse,
 			onSseEvent: this.#onSseEvent,
 			getApiKey: this.getApiKey,
@@ -1446,6 +1665,13 @@ export class Agent {
 							return undefined;
 						}
 					: undefined,
+			onProviderCallStarted: options?.onProviderCallStarted
+				? () => {
+						if (providerCallStarted) return;
+						options.onProviderCallStarted?.();
+						providerCallStarted = true;
+					}
+				: undefined,
 			cursorExecHandlers: this.#cursorExecHandlers,
 			cursorOnToolResult,
 			cwd: this.#cwd,
@@ -1590,6 +1816,15 @@ export class Agent {
 				}
 			}
 		} catch (err) {
+			if (options?.onProviderCallStarted && !providerCallStarted) {
+				// The provider stream was never accepted. Its prompt input stayed provisional
+				// in agent-loop, so keep the retry path free of a synthetic error turn too.
+				this.#state.error = undefined;
+				this.#state.isStreaming = false;
+				this.#state.streamMessage = null;
+				this.#emit({ type: "agent_end", messages: [] });
+				return;
+			}
 			const stoppedForAbort = loopSignal.aborted;
 			const errorMessage = stoppedForAbort
 				? abortReasonText(loopSignal)

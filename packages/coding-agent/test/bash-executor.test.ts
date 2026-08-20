@@ -445,6 +445,7 @@ exit 64
 				// does not isolate a system-level file; this is the opt-out Apple
 				// documents in that script.
 				SHELL_SESSIONS_DISABLE: "1",
+				ZDOTDIR: shellDir,
 			},
 			prefix: undefined,
 		});

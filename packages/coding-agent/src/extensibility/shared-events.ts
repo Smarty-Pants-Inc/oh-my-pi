@@ -29,11 +29,21 @@ export interface SessionStartEvent {
 	type: "session_start";
 }
 
+/** Fired after a committed session transition has fully restored authoritative state. Extension-only. */
+export interface SessionReadyEvent {
+	type: "session_ready";
+}
+
+/** Fired after a failed session transition has fully restored its retained checkpoint. Extension-only. */
+export interface SessionRollbackEvent {
+	type: "session_rollback";
+}
+
 /** Fired before switching to another session (can be cancelled) */
 export interface SessionBeforeSwitchEvent {
 	type: "session_before_switch";
 	/** Reason for the switch */
-	reason: "new" | "resume" | "fork";
+	reason: "new" | "resume" | "fork" | "handoff";
 	/** Session file we're switching to (only for "resume") */
 	targetSessionFile?: string;
 }
@@ -42,7 +52,7 @@ export interface SessionBeforeSwitchEvent {
 export interface SessionSwitchEvent {
 	type: "session_switch";
 	/** Reason for the switch */
-	reason: "new" | "resume" | "fork";
+	reason: "new" | "resume" | "fork" | "handoff";
 	/** Session file we came from */
 	previousSessionFile: string | undefined;
 }

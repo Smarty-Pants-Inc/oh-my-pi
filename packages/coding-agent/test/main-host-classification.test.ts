@@ -7,12 +7,16 @@ it("classifies an interactive host before opening auth storage", async () => {
 	const previous = setInteractiveHost(false);
 	const stop = new Error("stop after auth classification");
 	let observedTimeout: number | undefined;
+	let observedInteractive: boolean | undefined;
 	const parsed = parseArgs([]);
 	parsed.noExtensions = true;
 
 	try {
 		await expect(
 			runRootCommand(parsed, [], {
+				verifyApprovedStartup: async isInteractive => {
+					observedInteractive = isInteractive;
+				},
 				discoverAuthStorage: async () => {
 					observedTimeout = getDbBusyTimeoutMs();
 					throw stop;
@@ -24,4 +28,22 @@ it("classifies an interactive host before opening auth storage", async () => {
 	}
 
 	expect(observedTimeout).toBe(5000);
+	expect(observedInteractive).toBe(true);
+});
+
+it("classifies noninteractive launches before enforcing approved startup", async () => {
+	const stop = new Error("strict noninteractive policy check");
+	let observedInteractive: boolean | undefined;
+	const parsed = parseArgs(["--mode", "json"]);
+
+	await expect(
+		runRootCommand(parsed, ["--mode", "json"], {
+			verifyApprovedStartup: async isInteractive => {
+				observedInteractive = isInteractive;
+				throw stop;
+			},
+		}),
+	).rejects.toBe(stop);
+
+	expect(observedInteractive).toBe(false);
 });

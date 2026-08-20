@@ -1595,9 +1595,16 @@ async function persistReadUrlArtifact(
 	output: string,
 ): Promise<{ id?: string; path?: string } | undefined> {
 	const artifact = await session.allocateOutputArtifact?.("read");
-	if (!artifact?.path) return undefined;
-	await Bun.write(artifact.path, output);
-	return artifact;
+	if (!artifact?.path) {
+		artifact?.release?.();
+		return undefined;
+	}
+	try {
+		await Bun.write(artifact.path, output);
+		return artifact;
+	} finally {
+		artifact.release?.();
+	}
 }
 
 async function ensureReadUrlArtifact(session: ToolSession, entry: ReadUrlEntry): Promise<ReadUrlEntry> {

@@ -8,44 +8,11 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { TodoTool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
-/**
- * Regression coverage for the `#hasPendingAsyncWake()` gate shared by the
- * stop-time passes in the `agent_end` settle path: a background async job
- * (bash/task) owned by this agent re-wakes the loop when it completes — its
- * result delivery enqueues an async-result follow-up that continues the run,
- * and the stop-time passes re-run at that settle. A text-only stop with such a
- * job in flight is a scheduling pause, not a terminal stop, so both:
- *
- * - the todo reminder (`todo_reminder` event + injected `<system-reminder>`
- *   continuation in `#checkTodoCompletion`), and
- * - the `session_stop` extension hook pass (`#emitSessionStopEvent`)
- *
- * must stay silent and defer to the settle reached once the session is fully
- * idle.
- *
- * The contract these tests defend:
- * 1. A running job owned by this session's `agentId` (delivery not
- *    suppressed) defers the reminder: no `todo_reminder` event, no scheduled
- *    `agent.continue`.
- * 2. Jobs owned by a DIFFERENT agent do not defer — the stop still fires
- *    reminder attempt 1.
- * 3. The deferral is temporary: once the owned job completes and its delivery
- *    drains, the next text-only stop fires the reminder.
- * 4. With no incomplete todos at all, the same running owned job still defers
- *    the `session_stop` hook pass.
- * 5. That deferral lifts too: after the job completes and its delivery
- *    drains, the next stop invokes `session_stop` exactly once.
- *
- * Negative assertions rely on `session.waitForIdle()` being deterministic
- * here: the agent's synchronous `#emit` invokes the session's `agent_end`
- * handler, which registers itself as a tracked post-prompt task BEFORE its
- * first await, and anything it schedules (e.g. `agent.continue`) is tracked
- * the same way — so once `waitForIdle()` resolves, the settle has definitively
- * decided whether to fire the stop-time passes. No wall-clock sleeps needed.
- */
+/** Async ownership gates session_stop, while todo state remains passive and never emits reminders. */
 const sharedAuthStorage = createInMemoryAuthStorage();
 sharedAuthStorage.setRuntimeApiKey("anthropic", "test-key");
 const sharedModelRegistry = new ModelRegistry(sharedAuthStorage);
@@ -125,12 +92,27 @@ describe("AgentSession todo reminder async-job deferral", () => {
 
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected built-in anthropic model to exist");
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"todo.enabled": true,
+			"todo.reminders": true,
+			"todo.remindersMax": 3,
+		});
+		const toolSession: ToolSession = {
+			cwd: tempDir.path(),
+			hasUI: false,
+			getSessionFile: () => sessionManager.getSessionFile() ?? null,
+			getSessionSpawns: () => "*",
+			settings,
+			getTodoPhases: () => session?.getTodoPhases() ?? [],
+			setTodoPhases: phases => session?.setTodoPhases(phases),
+		};
 
 		const agent = new Agent({
 			initialState: {
 				model,
 				systemPrompt: ["Test"],
-				tools: [],
+				tools: [new TodoTool(toolSession)],
 				messages: [],
 			},
 		});
@@ -138,12 +120,7 @@ describe("AgentSession todo reminder async-job deferral", () => {
 		session = new AgentSession({
 			agent,
 			sessionManager,
-			settings: Settings.isolated({
-				"compaction.enabled": false,
-				"todo.enabled": true,
-				"todo.reminders": true,
-				"todo.remindersMax": 3,
-			}),
+			settings,
 			modelRegistry: sharedModelRegistry,
 			agentId: "Main",
 			asyncJobManager: manager,
@@ -177,7 +154,7 @@ describe("AgentSession todo reminder async-job deferral", () => {
 		vi.restoreAllMocks();
 	});
 
-	it("defers the reminder while an owned async job is running", async () => {
+	it("does not defer a terminal stop for an owned job without an open origin turn", async () => {
 		setIncompleteTodos();
 		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
 		registerGatedJob("Main");
@@ -187,10 +164,10 @@ describe("AgentSession todo reminder async-job deferral", () => {
 
 		expect(reminderAttempts).toEqual([]);
 		expect(continueSpy).not.toHaveBeenCalled();
-		expect(agentEndTerminalStates).toEqual([false]);
+		expect(agentEndTerminalStates).toEqual([true]);
 	});
 
-	it("does not defer for a running job owned by a different agent", async () => {
+	it("never creates a todo reminder for a job owned by a different agent", async () => {
 		setIncompleteTodos();
 		vi.spyOn(session.agent, "continue").mockResolvedValue();
 		registerGatedJob("OtherAgent");
@@ -198,10 +175,10 @@ describe("AgentSession todo reminder async-job deferral", () => {
 		emitTextOnlyStop();
 		await session.waitForIdle();
 
-		expect(reminderAttempts).toEqual([1]);
+		expect(reminderAttempts).toEqual([]);
 	});
 
-	it("fires the reminder on the next stop once the owned job completes and its delivery drains", async () => {
+	it("does not create a todo reminder after an owned job drains", async () => {
 		setIncompleteTodos();
 		vi.spyOn(session.agent, "continue").mockResolvedValue();
 		const job = registerGatedJob("Main");
@@ -220,29 +197,29 @@ describe("AgentSession todo reminder async-job deferral", () => {
 		emitTextOnlyStop();
 		await session.waitForIdle();
 
-		expect(reminderAttempts).toEqual([1]);
+		expect(reminderAttempts).toEqual([]);
 	});
 
-	it("defers the session_stop hook pass while an owned async job is running", async () => {
-		// No todo phases: the stop reaches the session_stop pass directly, and
-		// only the async-wake gate can defer it.
+	it("runs the session_stop hook for an owned job without an open origin turn", async () => {
+		// No todo phases: the stop reaches the session_stop pass directly. An
+		// unscoped job cannot defer or re-wake the model loop.
 		vi.spyOn(session.agent, "continue").mockResolvedValue();
 		registerGatedJob("Main");
 
 		emitTextOnlyStop();
 		await session.waitForIdle();
 
-		expect(extensionRunner.emitSessionStop).not.toHaveBeenCalled();
+		expect(extensionRunner.emitSessionStop).toHaveBeenCalledTimes(1);
 	});
 
-	it("invokes session_stop exactly once on the next stop after the owned job drains", async () => {
+	it("invokes session_stop on each stop around an unscoped owned job", async () => {
 		vi.spyOn(session.agent, "continue").mockResolvedValue();
 		const job = registerGatedJob("Main");
 
-		// Deferred while the job is in flight.
+		// The unscoped job does not defer the first stop.
 		emitTextOnlyStop();
 		await session.waitForIdle();
-		expect(extensionRunner.emitSessionStop).not.toHaveBeenCalled();
+		expect(extensionRunner.emitSessionStop).toHaveBeenCalledTimes(1);
 
 		job.resolve();
 		await manager.waitForAll();
@@ -251,6 +228,6 @@ describe("AgentSession todo reminder async-job deferral", () => {
 		emitTextOnlyStop();
 		await session.waitForIdle();
 
-		expect(extensionRunner.emitSessionStop).toHaveBeenCalledTimes(1);
+		expect(extensionRunner.emitSessionStop).toHaveBeenCalledTimes(2);
 	});
 });

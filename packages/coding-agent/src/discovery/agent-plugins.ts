@@ -18,7 +18,7 @@ import type { Dirent, Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getPluginsDir, isEnoent, normalizeFrontmatterKeys, parseFrontmatter } from "@oh-my-pi/pi-utils";
-import { registerProvider } from "../capability";
+import { isProviderEnabled, registerProvider } from "../capability";
 import { readFile } from "../capability/fs";
 import { type MCPServer, mcpCapability } from "../capability/mcp";
 import { type Skill, type SkillFrontmatter, skillCapability } from "../capability/skill";
@@ -53,13 +53,13 @@ interface CandidateRoot {
 }
 
 /**
- * Every directory that may contain an Agent Plugin: marketplace and
- * `--plugin-dir` roots from the shared registries, plus configured extension
- * package roots. First occurrence wins on duplicates.
+ * Every directory that may contain an Agent Plugin: OMP and (when enabled)
+ * Claude registries, `--plugin-dir` roots, and configured extension packages.
+ * First occurrence wins on duplicates.
  */
 async function listCandidateRoots(ctx: LoadContext): Promise<CandidateRoot[]> {
 	const [marketplace, extensionRoots] = await Promise.all([
-		listClaudePluginRoots(ctx.home, ctx.cwd),
+		listClaudePluginRoots(ctx.home, ctx.cwd, { includeClaudeRegistry: isProviderEnabled("claude") }),
 		listOmpExtensionRoots(ctx),
 	]);
 	const seen = new Set<string>();

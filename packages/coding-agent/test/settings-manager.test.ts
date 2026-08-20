@@ -6,6 +6,7 @@ import { clearCustomApis } from "@oh-my-pi/pi-ai/api-registry";
 import { createMockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
 import { __providerInFlightForTesting, streamSimple } from "@oh-my-pi/pi-ai/stream";
 import type { Context } from "@oh-my-pi/pi-ai/types";
+import { getDisabledProviders, initializeWithSettings, isProviderEnabled } from "@oh-my-pi/pi-coding-agent/capability";
 import {
 	onAppendOnlyModeChanged,
 	onModelRolesChanged,
@@ -125,6 +126,50 @@ describe("Settings", () => {
 			expect(await Bun.file(getConfigPath()).exists()).toBe(true);
 			expect(await Bun.file(yamlConfigPath).exists()).toBe(false);
 			expect((await readSettings()).setupVersion).toBe(1);
+		});
+	});
+
+	describe("provider isolation", () => {
+		it("excludes globally disabled providers from initial project settings discovery", async () => {
+			await writeSettings({ disabledProviders: ["claude"] });
+			fs.mkdirSync(path.join(projectDir, ".claude"), { recursive: true });
+			await Bun.write(path.join(projectDir, ".claude", "settings.json"), JSON.stringify({ setupVersion: 1 }));
+			await Bun.write(
+				path.join(getProjectAgentDir(projectDir), "settings.json"),
+				JSON.stringify({ setupVersion: 2 }),
+			);
+
+			for (const load of [
+				() => Settings.init({ cwd: projectDir, agentDir }),
+				() => Settings.loadIsolated({ cwd: projectDir, agentDir }),
+				() => Settings.loadReadOnly({ cwd: projectDir, agentDir }),
+			]) {
+				resetSettingsForTest();
+				expect((await load()).get("setupVersion")).toBe(2);
+			}
+		});
+
+		it("loads destination compatibility settings despite stale source provider state", async () => {
+			const targetDir = tempDir.join("provider-policy-target");
+			await writeSettings({
+				disabledProviders: [{ path: projectDir, providers: ["claude"] }],
+			});
+			fs.mkdirSync(path.join(targetDir, ".claude"), { recursive: true });
+			await Bun.write(path.join(targetDir, ".claude", "settings.json"), JSON.stringify({ setupVersion: 3 }));
+			const savedDisabledProviders = getDisabledProviders();
+
+			try {
+				const active = await Settings.loadIsolated({ cwd: projectDir, agentDir });
+				initializeWithSettings(active);
+				expect(isProviderEnabled("claude")).toBe(false);
+
+				await active.reloadForCwd(targetDir);
+				expect(active.get("setupVersion")).toBe(3);
+				initializeWithSettings(active);
+				expect(isProviderEnabled("claude")).toBe(true);
+			} finally {
+				initializeWithSettings(Settings.isolated({ disabledProviders: savedDisabledProviders }));
+			}
 		});
 	});
 
@@ -1213,7 +1258,7 @@ describe("Settings", () => {
 			expect(settings.get("dev.autoqa")).toBe(true);
 			expect(settings.isConfigured("dev.autoqa")).toBe(false);
 			expect(settings.get("todo.remindersMax")).toBe(5);
-			expect(settings.get("todo.reminders")).toBe(true);
+			expect(settings.get("todo.reminders")).toBe(false);
 			expect(settings.isConfigured("todo.reminders")).toBe(false);
 		});
 
@@ -1225,7 +1270,7 @@ describe("Settings", () => {
 			expect(settings.get("dev.autoqaConsent")).toBe("denied");
 			expect(settings.isConfigured("dev.autoqa")).toBe(false);
 			expect(settings.get("todo.remindersMax")).toBe(2);
-			expect(settings.get("todo.reminders")).toBe(true);
+			expect(settings.get("todo.reminders")).toBe(false);
 		});
 
 		it("lets explicit new keys win over legacy nested consent/max values", async () => {
@@ -1239,7 +1284,7 @@ describe("Settings", () => {
 			expect(settings.get("dev.autoqaConsent")).toBe("granted");
 			expect(settings.isConfigured("dev.autoqa")).toBe(false);
 			expect(settings.get("todo.remindersMax")).toBe(9);
-			expect(settings.get("todo.reminders")).toBe(true);
+			expect(settings.get("todo.reminders")).toBe(false);
 		});
 
 		it("preserves recoverable parent booleans alongside legacy leaf keys", async () => {
@@ -1294,7 +1339,7 @@ describe("Settings", () => {
 			expect(reloaded.get("dev.autoqaConsent")).toBe("denied");
 			expect(reloaded.isConfigured("dev.autoqa")).toBe(false);
 			expect(reloaded.get("todo.remindersMax")).toBe(1);
-			expect(reloaded.get("todo.reminders")).toBe(true);
+			expect(reloaded.get("todo.reminders")).toBe(false);
 		});
 
 		it("drops dead BM25-discovery keys and leaves tools.xdev at its default", async () => {

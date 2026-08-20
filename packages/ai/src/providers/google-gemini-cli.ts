@@ -13,6 +13,7 @@ import {
 	getGeminiCliHeaders,
 } from "@oh-my-pi/pi-catalog/wire/gemini-headers";
 import { extractHttpStatusFromError, fetchWithRetry, readSseJson } from "@oh-my-pi/pi-utils";
+import { mapContextInstructions } from "../context-instructions";
 import * as AIError from "../error";
 import type {
 	Api,
@@ -1266,7 +1267,11 @@ export function buildRequest(
 	options: GoogleGeminiCliOptions = {},
 	isAntigravity = false,
 ): CloudCodeAssistRequest {
-	const systemPrompts = normalizeSystemPrompts(context.systemPrompt);
+	const mappedInstructions = mapContextInstructions(context.instructions, false);
+	const systemPrompts = [
+		...normalizeSystemPrompts(context.systemPrompt),
+		...mappedInstructions.map(instruction => instruction.renderedText.toWellFormed()),
+	];
 	const contents = convertMessages(model, context);
 	const generationConfig: CloudCodeAssistRequest["request"]["generationConfig"] = {};
 	if (options.temperature !== undefined) {
@@ -1320,11 +1325,12 @@ export function buildRequest(
 		contents,
 	};
 
-	// System instruction is an object with parts, not a plain string. Antigravity
-	// tags it with role "user" to mirror the real client.
+	// System instruction is an object with parts, not a plain string. Preserve
+	// Antigravity's legacy marker only when no typed instruction is present: an
+	// internal-context component must never carry a user role marker.
 	if (systemPrompts.length > 0) {
 		request.systemInstruction = {
-			...(isAntigravity ? { role: "user" } : {}),
+			...(isAntigravity && mappedInstructions.length === 0 ? { role: "user" } : {}),
 			parts: systemPrompts.map(text => ({ text })),
 		};
 	}

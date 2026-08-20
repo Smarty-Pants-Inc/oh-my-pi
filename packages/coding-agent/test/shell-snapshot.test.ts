@@ -249,6 +249,8 @@ describe("getOrCreateSnapshot", () => {
 				`export FOO_TEST_DIR=/opt/foo`,
 				`mise () { command "$__MISE_EXE" "$@"; }`,
 				`shout () { echo "$FOO_TEST_DIR"; }`,
+				`git () { echo wrapped-git; }`,
+				`alias gh='echo wrapped-gh'`,
 				``,
 			].join("\n"),
 		);
@@ -271,6 +273,8 @@ describe("getOrCreateSnapshot", () => {
 
 		expect(content).toContain(`export __MISE_EXE='${REAL_ECHO}'`);
 		expect(content).toContain(`export FOO_TEST_DIR='/opt/foo'`);
+		expect(content).not.toContain("git ()");
+		expect(content).not.toContain("alias -- gh=");
 
 		// Replay the snapshot in a fresh bash with `set -u` and confirm the
 		// mise() function resolves cleanly instead of dying on the empty var.
