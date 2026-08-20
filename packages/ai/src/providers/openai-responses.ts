@@ -1227,11 +1227,8 @@ export function buildParams(
 		instructions: systemInstructions,
 		stream: true,
 		prompt_cache_key: promptCacheKey,
-		prompt_cache_retention: promptCacheKey
-			? cacheRetention === "long" && model.compat.supportsLongPromptCacheRetention
-				? "24h"
-				: undefined
-			: undefined,
+		prompt_cache_retention:
+			cacheRetention === "long" && model.compat.supportsLongPromptCacheRetention ? "24h" : undefined,
 		// Gateway routing: OpenRouter-only Responses wire field for sticky upstream
 		// routing + observability grouping; no equivalent on direct OpenAI.
 		session_id: model.compat.isOpenRouterHost ? getOpenRouterResponsesSessionId(options) : undefined,
