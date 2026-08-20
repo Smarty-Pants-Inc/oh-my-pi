@@ -247,6 +247,21 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 				source:
 					'import { Module } from "node:module"; new (Module.bind(null))("x").require("/absolute/outside.js");',
 			},
+			{
+				name: "destructured node:module constructor",
+				source:
+					'const { constructor: Build } = require("node:module"); Build("return require(\\"/absolute/outside.js\\")")();',
+			},
+			{
+				name: "direct node:module constructor",
+				source:
+					'const Build = require("node:module").constructor; Build("return require(\\"/absolute/outside.js\\")")();',
+			},
+			{
+				name: "destructured node:process constructor",
+				source:
+					'const { constructor: ProcessType } = require("node:process"); ProcessType.constructor("return require(\\"/absolute/outside.js\\")")();',
+			},
 		] as const;
 
 		for (const testCase of cases) {

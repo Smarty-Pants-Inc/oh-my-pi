@@ -731,7 +731,10 @@ function collectExtensionSpecifierReferences(
 					continue;
 				}
 				const propertyName = staticObjectPropertyName(property);
-				if (propertyName !== "default" && propertyName !== "dlopen") continue;
+				if (propertyName !== "default" && propertyName !== "dlopen") {
+					if (graphProof) graphProof.provable = false;
+					continue;
+				}
 				const propertyValue = asAstNode(property.value);
 				const propertyKey = asAstNode(property.key);
 				const local = propertyValue?.type === "AssignmentPattern" ? asAstNode(propertyValue.left) : propertyValue;
@@ -773,7 +776,10 @@ function collectExtensionSpecifierReferences(
 					if (graphProof) graphProof.provable = false;
 					continue;
 				}
-				if (propertyName !== "createRequire" && propertyName !== "Module") continue;
+				if (propertyName !== "createRequire" && propertyName !== "Module") {
+					if (graphProof) graphProof.provable = false;
+					continue;
+				}
 				const propertyValue = asAstNode(property.value);
 				const propertyKey = asAstNode(property.key);
 				const local = propertyValue?.type === "AssignmentPattern" ? asAstNode(propertyValue.left) : propertyValue;
@@ -800,7 +806,10 @@ function collectExtensionSpecifierReferences(
 				if (graphProof) graphProof.provable = false;
 				continue;
 			}
-			if (memberName !== "default" && memberName !== "dlopen") continue;
+			if (memberName !== "default" && memberName !== "dlopen") {
+				if (graphProof) graphProof.provable = false;
+				continue;
+			}
 			if (binding?.type !== "Identifier" || typeof binding.name !== "string") {
 				if (graphProof) graphProof.provable = false;
 				continue;
@@ -818,7 +827,10 @@ function collectExtensionSpecifierReferences(
 			continue;
 		}
 		const memberName = staticMemberPropertyName(initializer);
-		if (memberName !== "createRequire" && memberName !== "Module") continue;
+		if (memberName !== "createRequire" && memberName !== "Module") {
+			if (graphProof) graphProof.provable = false;
+			continue;
+		}
 		if (binding?.type !== "Identifier" || typeof binding.name !== "string") {
 			if (graphProof) graphProof.provable = false;
 			continue;
@@ -943,7 +955,10 @@ function collectExtensionSpecifierReferences(
 						continue;
 					}
 					const propertyName = staticObjectPropertyName(property);
-					if (propertyName !== "default" && propertyName !== "dlopen") continue;
+					if (propertyName !== "default" && propertyName !== "dlopen") {
+						if (graphProof) graphProof.provable = false;
+						continue;
+					}
 					const propertyValue = asAstNode(property.value);
 					const propertyKey = asAstNode(property.key);
 					const local =
