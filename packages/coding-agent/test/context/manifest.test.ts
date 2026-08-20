@@ -236,6 +236,65 @@ describe("tracked context manifest", () => {
 		}
 	});
 
+	it("approves core.symlinks=false placeholders while rejecting symlink content and type drift", async () => {
+		const repositoryRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-symlinks-false-extension-"));
+		const packageRoot = path.join(repositoryRoot, "packages/plugin");
+		const indexPath = path.join(packageRoot, "src/index.ts");
+		const linkPath = path.join(packageRoot, "current.txt");
+		const relativeLinkPath = "packages/plugin/current.txt";
+		const linkTarget = "target.txt";
+		const runGit = (...args: string[]): string => {
+			const result = Bun.spawnSync(["git", ...args], { cwd: repositoryRoot, stdout: "pipe", stderr: "pipe" });
+			if (result.exitCode !== 0) throw new Error(result.stderr.toString());
+			return result.stdout.toString().trim();
+		};
+		try {
+			await fs.mkdir(path.dirname(indexPath), { recursive: true });
+			await Promise.all([
+				Bun.write(path.join(packageRoot, "package.json"), '{"name":"symlink-plugin","type":"module"}\n'),
+				Bun.write(indexPath, "export default function plugin() {}\n"),
+				Bun.write(path.join(packageRoot, linkTarget), "target\n"),
+			]);
+			await fs.symlink(linkTarget, linkPath);
+			runGit("init", "-q");
+			runGit("config", "user.name", "OMP Test");
+			runGit("config", "user.email", "omp-test@example.com");
+			runGit("config", "core.symlinks", "true");
+			runGit("remote", "add", "origin", "https://github.com/Smarty-Pants-Inc/smarty-dev.git");
+			runGit("add", ".");
+			runGit("commit", "-qm", "approved symlink package");
+			const commit = runGit("rev-parse", "HEAD");
+			const tree = runGit("rev-parse", "HEAD^{tree}");
+			const release = {
+				candidates: [{ repository: "Smarty-Pants-Inc/smarty-dev", commit, tree }],
+			} as unknown as Parameters<typeof isApprovedCandidateSource>[1];
+
+			expect(runGit("ls-tree", "HEAD", "--", relativeLinkPath)).toStartWith("120000 blob ");
+			expect(await isApprovedCandidateSource(indexPath, release)).toBe(true);
+
+			runGit("update-index", "--assume-unchanged", relativeLinkPath);
+			await fs.rm(linkPath);
+			await Bun.write(linkPath, linkTarget);
+			expect((await fs.lstat(linkPath)).isFile()).toBe(true);
+			expect(runGit("status", "--porcelain=v1", "--", relativeLinkPath)).toBe("");
+			expect(await isApprovedCandidateSource(indexPath, release)).toBe(false);
+
+			runGit("config", "core.symlinks", "false");
+			expect(await isApprovedCandidateSource(indexPath, release)).toBe(true);
+
+			await Bun.write(linkPath, "other.txt");
+			expect(runGit("status", "--porcelain=v1", "--", relativeLinkPath)).toBe("");
+			expect(await isApprovedCandidateSource(indexPath, release)).toBe(false);
+
+			await fs.rm(linkPath);
+			await fs.mkdir(linkPath);
+			expect(runGit("status", "--porcelain=v1", "--", relativeLinkPath)).toBe("");
+			expect(await isApprovedCandidateSource(indexPath, release)).toBe(false);
+		} finally {
+			await fs.rm(repositoryRoot, { recursive: true, force: true });
+		}
+	});
+
 	it("keeps indexed executables approved when core.filemode disables filesystem mode checks", async () => {
 		const repositoryRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-filemode-false-extension-"));
 		const packageRoot = path.join(repositoryRoot, "packages/plugin");

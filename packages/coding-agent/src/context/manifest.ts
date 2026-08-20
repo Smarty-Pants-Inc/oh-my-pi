@@ -678,9 +678,10 @@ async function workingPackageTreeObjectId(
 	relativeSourceRoot: string,
 	expectedLength: number,
 ): Promise<string | undefined> {
-	const [trackedEntries, fileModeConfig] = await Promise.all([
+	const [trackedEntries, fileModeConfig, symlinksConfig] = await Promise.all([
 		ls.treeEntries(repositoryRoot, "HEAD", [`:(literal)${relativeSourceRoot || "."}`]),
 		config.get(repositoryRoot, "core.fileMode"),
+		config.get(repositoryRoot, "core.symlinks"),
 	]);
 	const normalizedFileMode = fileModeConfig?.toLowerCase();
 	const useFilesystemMode =
@@ -688,6 +689,12 @@ async function workingPackageTreeObjectId(
 		normalizedFileMode !== "no" &&
 		normalizedFileMode !== "off" &&
 		normalizedFileMode !== "0";
+	const normalizedSymlinks = symlinksConfig?.toLowerCase();
+	const useFilesystemSymlinks =
+		normalizedSymlinks !== "false" &&
+		normalizedSymlinks !== "no" &&
+		normalizedSymlinks !== "off" &&
+		normalizedSymlinks !== "0";
 	const root: Extract<WorkingTreeEntry, { kind: "tree" }> = { kind: "tree", entries: new Map() };
 	const verifiedDirectories = new Set<string>();
 	for (const { path: trackedPath, mode: trackedMode } of trackedEntries) {
@@ -739,10 +746,15 @@ async function workingPackageTreeObjectId(
 				mode = trackedMode;
 				bytes = UTF8_ENCODER.encode(await fs.readlink(absolutePath));
 			} else if (stats.isFile()) {
-				if (trackedMode !== "100644" && trackedMode !== "100755") return undefined;
-				const filesystemMode = (stats.mode & 0o100) === 0 ? "100644" : "100755";
-				if (useFilesystemMode && filesystemMode !== trackedMode) return undefined;
-				mode = trackedMode;
+				if (trackedMode === "120000") {
+					if (useFilesystemSymlinks) return undefined;
+					mode = trackedMode;
+				} else {
+					if (trackedMode !== "100644" && trackedMode !== "100755") return undefined;
+					const filesystemMode = (stats.mode & 0o100) === 0 ? "100644" : "100755";
+					if (useFilesystemMode && filesystemMode !== trackedMode) return undefined;
+					mode = trackedMode;
+				}
 				bytes = await Bun.file(absolutePath).bytes();
 			} else {
 				return undefined;
