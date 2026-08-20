@@ -574,9 +574,14 @@ describe("InteractiveMode goal mode integration", () => {
 	});
 
 	it("drops a tool-blocked goal through /goal and accepts a replacement", async () => {
-		await harness.mode.handleGoalModeCommand("Ship the release");
 		const goalTool = harness.toolRegistry.get("goal");
 		if (!goalTool) throw new Error("Expected goal tool to be active");
+		const created = await goalTool.execute("call-create", {
+			op: "create",
+			objective: "Ship the release",
+			token_budget: undefined,
+		});
+		expect(created.details?.goal).toMatchObject({ objective: "Ship the release", status: "active" });
 
 		const blocked = await goalTool.execute("call-block", { op: "block" });
 		expect(blocked.details?.goal?.status).toBe("blocked");
@@ -584,6 +589,7 @@ describe("InteractiveMode goal mode integration", () => {
 			enabled: false,
 			goal: { objective: "Ship the release", status: "blocked" },
 		});
+		expect(harness.mode.goalModeEnabled).toBe(false);
 
 		vi.spyOn(harness.mode, "showHookConfirm").mockResolvedValue(true);
 		await harness.mode.handleGoalModeCommand("drop");
