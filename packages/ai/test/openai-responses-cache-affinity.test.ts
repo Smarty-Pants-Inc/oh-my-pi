@@ -72,6 +72,18 @@ const xaiApiKeyResponsesModel: Model<"openai-responses"> = {
 	}),
 };
 
+const openAI55ResponsesModel: Model<"openai-responses"> = {
+	...model,
+	id: "gpt-5.5",
+	name: "GPT-5.5",
+	compat: buildOpenAIResponsesCompat({
+		id: "gpt-5.5",
+		name: "GPT-5.5",
+		provider: "openai",
+		baseUrl: "https://api.openai.com/v1",
+	}),
+};
+
 const openAI56ResponsesModel: Model<"openai-responses"> = {
 	...model,
 	id: "gpt-5.6",
@@ -320,7 +332,19 @@ describe("OpenAI Responses explicit prompt cache policy", () => {
 		expect(firstMessage.content[0]).not.toHaveProperty("prompt_cache_breakpoint");
 	});
 
-	it("emits 24h retention without requiring a prompt cache key or session ID", async () => {
+	it("emits legacy 24h retention without requiring a prompt cache key or session ID", async () => {
+		const body = await captureSimpleOpenAIResponseBody(
+			{ cacheRetention: "long" },
+			openAI55ResponsesModel,
+			historicalContext,
+		);
+
+		if (body === null) throw new Error("Expected a serialized Responses request");
+		expect(body.prompt_cache_retention).toBe("24h");
+		expect(body).not.toHaveProperty("prompt_cache_key");
+	});
+
+	it("does not send legacy 24h retention for GPT-5.6", async () => {
 		const body = await captureSimpleOpenAIResponseBody(
 			{ cacheRetention: "long" },
 			openAI56ResponsesModel,
@@ -328,7 +352,7 @@ describe("OpenAI Responses explicit prompt cache policy", () => {
 		);
 
 		if (body === null) throw new Error("Expected a serialized Responses request");
-		expect(body.prompt_cache_retention).toBe("24h");
+		expect(body).not.toHaveProperty("prompt_cache_retention");
 		expect(body).not.toHaveProperty("prompt_cache_key");
 	});
 

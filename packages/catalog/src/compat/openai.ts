@@ -136,15 +136,19 @@ function isOfficialOpenAIEndpoint(provider: string, baseUrl: string): boolean {
 	}
 }
 
+/** GPT-5.6+ moved prompt-cache lifetime control to `prompt_cache_options.ttl`. */
+function usesOpenAIPromptCacheOptions(modelId: string): boolean {
+	const model = parseOpenAIModel(bareModelId(modelId));
+	return model !== null && semverGte(model.version, "5.6");
+}
+
 /**
  * Explicit prompt-cache breakpoints are a GPT-5.6+ first-party contract. Keep
  * this intentionally narrow: compatible gateways and older OpenAI models
  * reject the new request fields unless their catalog compat opts in.
  */
 function supportsOfficialOpenAIPromptCacheBreakpoints(provider: string, modelId: string, baseUrl: string): boolean {
-	if (!isOfficialOpenAIEndpoint(provider, baseUrl)) return false;
-	const model = parseOpenAIModel(bareModelId(modelId));
-	return model !== null && semverGte(model.version, "5.6");
+	return isOfficialOpenAIEndpoint(provider, baseUrl) && usesOpenAIPromptCacheOptions(modelId);
 }
 
 /**
@@ -727,7 +731,7 @@ export function buildOpenAIResponsesCompat(spec: OpenAIResponsesSpecLike): Resol
 		// Only the Grok effort-capable allowlist accepts `reasoning.effort`;
 		// other reasoners (grok-build, grok-code-fast-1, …) 400 if it is sent.
 		supportsReasoningEffort: !isXaiHost || isGrokReasoningEffortCapable(id),
-		supportsLongPromptCacheRetention: isOpenAIUrl,
+		supportsLongPromptCacheRetention: isOpenAIUrl && !usesOpenAIPromptCacheOptions(id),
 		supportsPromptCacheBreakpoints,
 		promptCacheBreakpointTtl: supportsPromptCacheBreakpoints ? "30m" : undefined,
 		// Azure OpenAI and GitHub Copilot Responses paths require tool results
