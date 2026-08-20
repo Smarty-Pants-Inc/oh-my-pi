@@ -210,7 +210,7 @@ describe("GoalTool", () => {
 		expect(harness.getState()).toBeUndefined();
 	});
 
-	it("flips state to exiting and clears enabled when op=complete succeeds (fix #1)", async () => {
+	it("returns completion details but clears the headless current goal after op=complete", async () => {
 		const harness = createRuntimeHarness();
 		await harness.runtime.createGoal({ objective: "Ship the release", tokenBudget: 100 });
 		const tool = new GoalTool(
@@ -220,18 +220,17 @@ describe("GoalTool", () => {
 			}),
 		);
 
-		const result = await tool.execute("call-complete", {
+		const completed = await tool.execute("call-complete", {
 			op: "complete",
 			objective: undefined,
 			token_budget: undefined,
 		});
 
-		expect(result.details).toMatchObject({ op: "complete" });
-		const after = harness.getState();
-		expect(after?.enabled).toBe(false);
-		expect(after?.mode).toBe("exiting");
-		expect(after?.reason).toBe("completed");
-		expect(after?.goal.status).toBe("complete");
+		expect(completed.details?.goal?.status).toBe("complete");
+		expect(harness.getState()).toBeUndefined();
+		const current = await tool.execute("call-get", { op: "get", objective: undefined, token_budget: undefined });
+		expect(current.details?.goal).toBeNull();
+		expect(current.content).toEqual([{ type: "text", text: "No active goal." }]);
 	});
 
 	it("rejects complete for a paused goal", async () => {

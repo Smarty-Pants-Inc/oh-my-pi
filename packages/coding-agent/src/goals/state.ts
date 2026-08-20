@@ -27,6 +27,25 @@ export interface GoalModeState {
 	reason?: "completed";
 	goal: Goal;
 }
+export function isTerminalGoalStatus(status: GoalStatus): boolean {
+	return status === "complete" || status === "dropped" || status === "superseded";
+}
+
+export function isResumableGoalStatus(status: GoalStatus): boolean {
+	return status === "paused" || status === "blocked" || status === "budget_limited" || status === "usage_limited";
+}
+
+export function isGoalEnabledStatus(status: GoalStatus): boolean {
+	return status === "active" || status === "budget_limited";
+}
+
+export function isCurrentGoalStatus(status: GoalStatus): boolean {
+	return !isTerminalGoalStatus(status);
+}
+
+export function isCurrentGoalModeState(state: GoalModeState | undefined): state is GoalModeState {
+	return state !== undefined && isCurrentGoalStatus(state.goal.status);
+}
 
 const goalStatuses = new Set<GoalStatus>([
 	"active",
@@ -76,10 +95,10 @@ export function parseGoalModeState(mode: unknown, modeData: unknown): GoalModeSt
 		return undefined;
 	}
 	const status = normalizeGoalStatus(value.status);
-	if (!status) return undefined;
+	if (!status || !isCurrentGoalStatus(status)) return undefined;
 	if (mode === "goal_paused" ? status !== "paused" : status === "paused") return undefined;
 	return {
-		enabled: status === "active",
+		enabled: isGoalEnabledStatus(status),
 		mode: "active",
 		reason: undefined,
 		goal: {

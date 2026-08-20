@@ -1573,6 +1573,22 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		}
 	});
 
+	it("activates the late built-in goal for an unrestricted explicit SDK tool list", async () => {
+		const tempDir = makeTempDir();
+		const { session } = await createAgentSession({
+			...baseOptions(tempDir),
+			settings: Settings.isolated({ "goal.enabled": true }),
+			toolNames: ["read"],
+		});
+
+		try {
+			expect(session.getToolByName("goal")).toBeDefined();
+			expect(session.getActiveToolNames()).toContain("goal");
+		} finally {
+			await session.dispose();
+		}
+	});
+
 	it("normalizes legacy builtin toolNames before selecting the active SDK tools", async () => {
 		const tempDir = makeTempDir();
 

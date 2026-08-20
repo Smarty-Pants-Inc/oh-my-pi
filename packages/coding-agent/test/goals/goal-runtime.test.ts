@@ -435,7 +435,7 @@ Do not start new substantive work. Preserve useful state, report verified progre
 		expect(harness.hiddenMessages[0]?.customType).toBe("goal-budget-limit");
 	});
 
-	it("completeGoalFromTool clears enabled and flips status to complete with mode exiting (fix #1)", async () => {
+	it("persists terminal completion history while clearing the live goal state", async () => {
 		const harness = createHarness({
 			state: {
 				enabled: true,
@@ -447,14 +447,18 @@ Do not start new substantive work. Preserve useful state, report verified progre
 		const completed = await harness.runtime.completeGoalFromTool();
 
 		expect(completed.status).toBe("complete");
-		const state = harness.getState();
-		expect(state?.enabled).toBe(false);
-		expect(state?.mode).toBe("exiting");
-		expect(state?.reason).toBe("completed");
-		expect(state?.goal.status).toBe("complete");
+		expect(harness.getState()).toBeUndefined();
+		expect(harness.persists.at(-1)).toMatchObject({
+			mode: "goal",
+			state: { enabled: false, mode: "exiting", reason: "completed", goal: { status: "complete" } },
+		});
+		const lastEvent = harness.events.at(-1);
+		if (lastEvent?.type !== "goal_updated") throw new Error("expected goal_updated event after completeGoalFromTool");
+		expect(lastEvent.goal?.status).toBe("complete");
+		expect(lastEvent.state).toBeUndefined();
 	});
 
-	it("dropGoal persists the dropped final state instead of clearing its record", async () => {
+	it("persists a dropped terminal record without keeping it current", async () => {
 		const harness = createHarness({
 			state: {
 				enabled: true,
@@ -467,7 +471,7 @@ Do not start new substantive work. Preserve useful state, report verified progre
 
 		expect(dropped?.status).toBe("dropped");
 		expect(dropped?.id).toBe("g-99");
-		expect(harness.getState()).toMatchObject({ enabled: false, goal: { id: "g-99", status: "dropped" } });
+		expect(harness.getState()).toBeUndefined();
 		expect(harness.persists.at(-1)).toMatchObject({
 			mode: "goal",
 			state: { enabled: false, goal: { id: "g-99", status: "dropped" } },
@@ -477,7 +481,7 @@ Do not start new substantive work. Preserve useful state, report verified progre
 			throw new Error("expected goal_updated event after dropGoal");
 		}
 		expect(lastEvent.goal?.status).toBe("dropped");
-		expect(lastEvent.state?.enabled).toBe(false);
+		expect(lastEvent.state).toBeUndefined();
 	});
 
 	it("rejects op=create on the runtime when a non-dropped goal already exists", async () => {

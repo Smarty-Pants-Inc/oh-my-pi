@@ -124,6 +124,46 @@ async function toolNamesFor(harness: GoalHarness): Promise<string[]> {
 	return (await createTools(harness.toolSession, harness.session.getActiveToolNames())).map(tool => tool.name);
 }
 
+const currentGoalStatuses = ["active", "paused", "blocked", "budget_limited", "usage_limited"] as const;
+const resumableGoalStatuses = ["paused", "blocked", "budget_limited", "usage_limited"] as const;
+
+type CurrentGoalStatus = (typeof currentGoalStatuses)[number];
+
+function currentGoal(status: CurrentGoalStatus): {
+	id: string;
+	objective: string;
+	status: CurrentGoalStatus;
+	tokensUsed: number;
+	timeUsedSeconds: number;
+	createdAt: number;
+	updatedAt: number;
+} {
+	const now = Date.now();
+	return {
+		id: `${status}-goal`,
+		objective: `${status} objective`,
+		status,
+		tokensUsed: 0,
+		timeUsedSeconds: 0,
+		createdAt: now,
+		updatedAt: now,
+	};
+}
+
+function setResumableGoal(harness: GoalHarness, status: (typeof resumableGoalStatuses)[number]): void {
+	harness.session.setGoalModeState({
+		enabled: status === "budget_limited",
+		mode: "active",
+		goal: currentGoal(status),
+	});
+}
+
+function persistCurrentGoal(harness: GoalHarness, status: CurrentGoalStatus): void {
+	harness.session.sessionManager.appendModeChange(status === "paused" ? "goal_paused" : "goal", {
+		goal: currentGoal(status),
+	});
+}
+
 async function waitForMicrotasks(): Promise<void> {
 	// Pure microtask flush — deterministic and fake-timer-safe (no macrotask /
 	// real-clock dependency). Lets queued `.then` callbacks settle so a fired
@@ -190,6 +230,20 @@ describe("InteractiveMode goal mode integration", () => {
 		expect(await toolNamesFor(harness)).toContain("goal");
 	});
 
+	for (const status of currentGoalStatuses) {
+		it(`restores a ${status} goal with the owner goal tool active`, async () => {
+			persistCurrentGoal(harness, status);
+
+			await harness.mode.init({ suppressWelcomeIntro: true });
+
+			expect(harness.session.getGoalModeState()).toMatchObject({
+				enabled: status === "active" || status === "budget_limited",
+				goal: { status },
+			});
+			expect(harness.session.getActiveToolNames()).toContain("goal");
+		});
+	}
+
 	it("lets a headless agent create an unbounded goal before user-started goal mode", async () => {
 		expect(harness.session.getGoalModeState()).toBeUndefined();
 		const goalTool = (await createTools(harness.toolSession, harness.session.getActiveToolNames())).find(
@@ -212,6 +266,42 @@ describe("InteractiveMode goal mode integration", () => {
 		expect(harness.session.getGoalModeState()?.enabled).toBe(true);
 		expect(harness.session.getGoalModeState()?.goal.objective).toBe("Agent-started goal");
 		expect(harness.session.getGoalModeState()?.goal.tokenBudget).toBeUndefined();
+	});
+
+	it("recovers an agent-created blocked goal through owner show, resume, and replacement", async () => {
+		const goalTool = (await createTools(harness.toolSession, harness.session.getActiveToolNames())).find(
+			tool => tool.name === "goal",
+		);
+		if (!goalTool) throw new Error("Expected goal tool to be active");
+
+		const created = await goalTool.execute("call-create", {
+			op: "create",
+			objective: "Diagnosed scheduled goal",
+			token_budget: undefined,
+		});
+		const originalId = created.details?.goal?.id;
+		await goalTool.execute("call-block", { op: "block" });
+		expect(harness.session.getGoalModeState()).toMatchObject({
+			enabled: false,
+			goal: { id: originalId, status: "blocked" },
+		});
+
+		const showStatus = vi.spyOn(harness.mode, "showStatus");
+		await harness.mode.handleGoalModeCommand("show");
+		expect(showStatus).toHaveBeenCalledWith(expect.stringContaining("Status: blocked"));
+
+		await harness.mode.handleGoalModeCommand("resume");
+		expect(harness.session.getGoalModeState()).toMatchObject({
+			enabled: true,
+			goal: { id: originalId, status: "active" },
+		});
+
+		await harness.mode.handleGoalModeCommand("set Replacement goal");
+		expect(harness.session.getGoalModeState()).toMatchObject({
+			enabled: true,
+			goal: { objective: "Replacement goal", status: "active" },
+		});
+		expect(harness.session.getGoalModeState()?.goal.id).not.toBe(originalId);
 	});
 
 	it("replaces the active goal via /goal set", async () => {
@@ -594,7 +684,7 @@ describe("InteractiveMode goal mode integration", () => {
 		vi.spyOn(harness.mode, "showHookConfirm").mockResolvedValue(true);
 		await harness.mode.handleGoalModeCommand("drop");
 
-		expect(harness.session.getGoalModeState()?.goal.status).toBe("dropped");
+		expect(harness.session.getGoalModeState()).toBeUndefined();
 		const replacement = await goalTool.execute("call-create", {
 			op: "create",
 			objective: "Ship the successor",
@@ -620,6 +710,66 @@ describe("InteractiveMode goal mode integration", () => {
 		expect(harness.session.getGoalModeState()?.goal.objective).toBe("Ship the release");
 		expect(harness.session.getGoalModeState()?.goal.status).toBe("active");
 		expect(await toolNamesFor(harness)).toContain("goal");
+	});
+
+	for (const status of resumableGoalStatuses) {
+		it(`shows and resumes a ${status} goal from the owner menu`, async () => {
+			setResumableGoal(harness, status);
+			const selector = vi.spyOn(harness.mode, "showHookSelector").mockResolvedValue("Resume");
+
+			await harness.mode.handleGoalModeCommand();
+
+			expect(selector).toHaveBeenCalledWith(
+				expect.stringContaining(`(${status})`),
+				status === "budget_limited"
+					? ["Resume", "Show details", "Adjust budget…", "Drop"]
+					: ["Resume", "Show details", "Drop"],
+			);
+			expect(harness.session.getGoalModeState()).toMatchObject({ enabled: true, goal: { status: "active" } });
+			expect(harness.mode.goalModeEnabled).toBe(true);
+		});
+	}
+
+	it("shows the exact disabled goal status without calling it paused", async () => {
+		setResumableGoal(harness, "blocked");
+		const showStatus = vi.spyOn(harness.mode, "showStatus");
+
+		await harness.mode.handleGoalModeCommand("show");
+
+		expect(showStatus).toHaveBeenCalledWith(expect.stringContaining("Status: blocked"));
+		expect(showStatus).not.toHaveBeenCalledWith(expect.stringContaining("(paused)"));
+	});
+
+	it("renders the current exact goal status in the footer", async () => {
+		await harness.mode.init({ suppressWelcomeIntro: true });
+		setResumableGoal(harness, "blocked");
+		await harness.session.goalRuntime.onThreadResumed();
+		await waitForMicrotasks();
+
+		const footer = Bun.stripANSI(harness.mode.statusLine.getTopBorder(240).content);
+		expect(footer).toContain("Goal (blocked)");
+		expect(footer).not.toContain("Goal (paused)");
+	});
+	it("replaces an unfinished disabled goal through /goal set", async () => {
+		setResumableGoal(harness, "blocked");
+
+		await harness.mode.handleGoalModeCommand("set Replacement objective");
+
+		expect(harness.session.getGoalModeState()).toMatchObject({
+			enabled: true,
+			goal: { objective: "Replacement objective", status: "active" },
+		});
+	});
+
+	it("drops an unfinished disabled goal without retaining it as current", async () => {
+		setResumableGoal(harness, "usage_limited");
+		vi.spyOn(harness.mode, "showHookConfirm").mockResolvedValue(true);
+
+		await harness.mode.handleGoalModeCommand("drop");
+
+		expect(harness.session.getGoalModeState()).toBeUndefined();
+		const context = harness.session.sessionManager.buildSessionContext();
+		expect(context.modeData?.goal).toMatchObject({ status: "dropped" });
 	});
 
 	it("keeps owner-applied caps enforced and resumes when the owner clears them", async () => {
@@ -663,7 +813,9 @@ describe("InteractiveMode goal mode integration", () => {
 		expect(harness.session.getGoalModeState()?.goal.tokenBudget).toBeUndefined();
 	});
 
-	it("returns the completion report from the goal tool and exits goal mode before the next turn rebuild", async () => {
+	it("returns completion details while clearing current state and preserving terminal history", async () => {
+		const toolsBeforeGoalMode = harness.session.getActiveToolNames();
+		await harness.mode.init({ suppressWelcomeIntro: true });
 		await harness.mode.handleGoalModeCommand("Ship the release");
 		await harness.mode.handleGoalModeCommand("budget 50");
 		const goalId = harness.session.getGoalModeState()?.goal.id;
@@ -678,28 +830,16 @@ describe("InteractiveMode goal mode integration", () => {
 
 		const result = await goalTool.execute("call-1", { op: "complete" });
 		const completionText = JSON.stringify(result.content);
+		await waitForMicrotasks();
 
 		expect(result.details?.completionBudgetReport).toBe(
 			"Goal achieved. Report final budget usage to the user: tokens used: 0 of 50.",
 		);
 		expect(completionText).toContain("Goal achieved. Report final budget usage to the user: tokens used: 0 of 50.");
-		expect(harness.session.getGoalModeState()?.mode).toBe("exiting");
-		// The in-flight tool result first marks the state as exiting. The interactive
-		// boundary then persists one inert terminal state for restart/history fidelity.
-		expect(harness.session.getGoalModeState()?.enabled).toBe(false);
-		expect(await toolNamesFor(harness)).not.toContain("goal");
-
-		const nextTurn = harness.mode.getUserInput();
-		for (let i = 0; i < 100 && harness.session.getGoalModeState()?.mode === "exiting"; i++) {
-			await Bun.sleep(0);
-		}
 		expect(harness.mode.goalModeEnabled).toBe(false);
 		expect(harness.mode.goalModePaused).toBe(false);
-		expect(harness.session.getGoalModeState()).toMatchObject({
-			enabled: false,
-			mode: "active",
-			goal: { id: goalId, objective: "Ship the release", status: "complete", tokenBudget: 50 },
-		});
+		expect(harness.session.getGoalModeState()).toBeUndefined();
+		expect(harness.session.getActiveToolNames()).toEqual(toolsBeforeGoalMode);
 		expect(await toolNamesFor(harness)).toContain("goal");
 		expect(appendModeChange).toHaveBeenCalledWith(
 			"goal",
@@ -723,12 +863,10 @@ describe("InteractiveMode goal mode integration", () => {
 		const reopened = await SessionManager.open(sessionFile, harness.tempDir.path());
 		try {
 			const context = reopened.buildSessionContext();
-			expect(parseGoalModeState(context.mode, context.modeData)).toEqual(harness.session.getGoalModeState());
+			expect(context.modeData?.goal).toMatchObject({ id: goalId, status: "complete" });
+			expect(parseGoalModeState(context.mode, context.modeData)).toBeUndefined();
 		} finally {
 			await reopened.close();
 		}
-
-		harness.mode.onInputCallback?.(harness.mode.startPendingSubmission({ text: "next turn" }));
-		await nextTurn;
 	});
 });

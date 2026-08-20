@@ -2731,7 +2731,12 @@ async function createAgentSessionScoped(
 		for (const [name, tool] of toolRegistry) {
 			nativeToolsByName.set(name, tool);
 		}
-		if (!restrictToolNames && !toolRegistry.has("goal") && settings.get("goal.enabled")) {
+		if (
+			!restrictToolNames &&
+			!toolRegistry.has("goal") &&
+			settings.get("goal.enabled") &&
+			toolSession.getGoalModeState?.()?.mode !== "exiting"
+		) {
 			const goalTool = await logger.time("createTools:goal:session", HIDDEN_TOOLS.goal, toolSession);
 			if (goalTool) {
 				const wrapped = wrapToolWithMetaNotice(goalTool);
@@ -3121,6 +3126,13 @@ async function createAgentSessionScoped(
 				if (builtInToolNames.includes(name) && !explicitlyRequestedToolNames.includes(name)) {
 					explicitlyRequestedToolNames.push(name);
 				}
+			}
+			if (
+				builtInRegistryToolNames.has("goal") &&
+				toolSession.getGoalModeState?.()?.mode !== "exiting" &&
+				!explicitlyRequestedToolNames.includes("goal")
+			) {
+				explicitlyRequestedToolNames.push("goal");
 			}
 		}
 		// Checkpoint and rewind are a pair: `createTools` auto-includes the sister

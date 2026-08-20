@@ -6,6 +6,7 @@ import {
 	resolveCliModel,
 } from "../config/model-resolver";
 import type { SettingPath } from "../config/settings";
+import { isCurrentGoalModeState } from "../goals/state";
 import { describeLoopLimitRuntime } from "../modes/loop-limit";
 import type { InteractiveModeContext } from "../modes/types";
 import type { AgentSession } from "../session/agent-session";
@@ -249,7 +250,7 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 			{ name: "set", description: "Set or replace the goal", usage: "<objective>" },
 			{ name: "show", description: "Show current goal details" },
 			{ name: "pause", description: "Pause the current goal" },
-			{ name: "resume", description: "Resume a paused goal" },
+			{ name: "resume", description: "Resume a paused, blocked, or limited goal" },
 			{ name: "drop", description: "Drop the current goal" },
 			{ name: "budget", description: "Adjust the token budget", usage: "<N|off>" },
 		],
@@ -259,7 +260,9 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 			if (!runtime.ctx.settings.get("goal.enabled" as SettingPath)) return "Goal: disabled in settings";
 			if (runtime.ctx.planModeEnabled) return "Goal: blocked by plan mode";
 			const state = runtime.ctx.session.getGoalModeState();
-			return state ? `Goal: ${state.goal.status} (${shortDetail(state.goal.objective)})` : "Goal: off";
+			return isCurrentGoalModeState(state)
+				? `Goal: ${state.goal.status} (${shortDetail(state.goal.objective)})`
+				: "Goal: off";
 		},
 		handleTui: async (command, runtime) => {
 			await runWithDetachedModeDraft(command, runtime, () =>
