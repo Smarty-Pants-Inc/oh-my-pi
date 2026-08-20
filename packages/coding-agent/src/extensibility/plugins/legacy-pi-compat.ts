@@ -89,6 +89,7 @@ const MODULE_BINDING = 1 << 3;
 const EVAL_BINDING = 1 << 4;
 const FUNCTION_BINDING = 1 << 5;
 const PROCESS_BINDING = 1 << 6;
+const WORKER_BINDING = 1 << 7;
 
 interface StructuralAstNode {
 	readonly type: string;
@@ -153,6 +154,8 @@ function trackedBinding(name: unknown): number {
 			return FUNCTION_BINDING;
 		case "process":
 			return PROCESS_BINDING;
+		case "Worker":
+			return WORKER_BINDING;
 		default:
 			return 0;
 	}
@@ -180,6 +183,21 @@ function isEntirelyTypeOnlyModuleDeclaration(declaration: StructuralAstNode): bo
 			return specifier !== null && isTypeOnlyImportBinding(declaration, specifier);
 		})
 	);
+}
+
+function isErasedTypeScriptNode(node: StructuralAstNode): boolean {
+	if (node.declare === true) return true;
+	switch (node.type) {
+		case "TSDeclareFunction":
+		case "TSDeclareMethod":
+		case "TSInterfaceDeclaration":
+		case "TSTypeAliasDeclaration":
+		case "TSTypeReference":
+		case "TSTypeQuery":
+			return true;
+		default:
+			return false;
+	}
 }
 
 function addPatternBindings(scope: BindingScope, pattern: unknown): void {
@@ -380,7 +398,7 @@ function collectScopedAstNodes(
 		const item = stack.pop();
 		if (!item || seen.has(item.node)) continue;
 		seen.add(item.node);
-		if (runtimeBindingsOnly && (item.node.type === "TSTypeReference" || item.node.type === "TSTypeQuery")) continue;
+		if (runtimeBindingsOnly && isErasedTypeScriptNode(item.node)) continue;
 
 		registerOuterDeclaration(item.node, item.scope);
 		const kind = scopeKind(item.node, item.parent, item.parentKey);
@@ -608,6 +626,9 @@ function collectExtensionSpecifierReferences(
 			typeof node.end !== "number"
 		) {
 			return false;
+		}
+		if (graphProof && (node.value === "node:worker_threads" || node.value === "worker_threads")) {
+			graphProof.provable = false;
 		}
 		references.push({ kind, specifier: node.value, start: node.start, end: node.end });
 		return true;
@@ -1217,10 +1238,11 @@ function collectExtensionSpecifierReferences(
 				graphProof.provable = false;
 				continue;
 			}
-			const dynamicCodeIdentifier =
+			const runtimeEscapeIdentifier =
 				(node.name === "eval" && !scopeHasBinding(scope, EVAL_BINDING)) ||
-				(node.name === "Function" && !scopeHasBinding(scope, FUNCTION_BINDING));
-			if (dynamicCodeIdentifier && !nonReferenceProperty) {
+				(node.name === "Function" && !scopeHasBinding(scope, FUNCTION_BINDING)) ||
+				(node.name === "Worker" && !scopeHasBinding(scope, WORKER_BINDING));
+			if (runtimeEscapeIdentifier && !nonReferenceProperty) {
 				graphProof.provable = false;
 				continue;
 			}
@@ -1306,11 +1328,19 @@ function collectExtensionSpecifierReferences(
 		)) {
 			const object = asAstNode(node.object);
 			const memberName = staticMemberPropertyName(node);
-			const dynamicCodeMember =
-				(memberName === "eval" || memberName === "Function") &&
+			const globalRuntimeEscape =
+				(memberName === "eval" || memberName === "Function" || memberName === "Worker") &&
 				object?.type === "Identifier" &&
 				(object.name === "global" || object.name === "globalThis");
-			if (dynamicCodeMember) {
+			if (globalRuntimeEscape) {
+				graphProof.provable = false;
+				continue;
+			}
+			if (memberName === "constructor") {
+				graphProof.provable = false;
+				continue;
+			}
+			if (memberName === "getBuiltinModule" && isKnownProcessObject(object, scope)) {
 				graphProof.provable = false;
 				continue;
 			}

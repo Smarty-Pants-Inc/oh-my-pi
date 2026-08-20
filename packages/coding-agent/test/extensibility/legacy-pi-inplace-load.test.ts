@@ -270,6 +270,77 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 		}
 	});
 
+	it("rejects callable constructor code generation without rejecting constructor declarations", async () => {
+		const dir = await writePackage({
+			"outside.js": "export const outside = true;\n",
+			"package/package.json": JSON.stringify({ name: "function-constructor-ext", version: "1.0.0" }),
+			"package/index.cjs": [
+				"class SafeValue {",
+				"  constructor(value) { this.value = value; }",
+				"}",
+				"module.exports = new SafeValue(42);",
+			].join("\n"),
+		});
+		const packageRoot = path.join(dir, "package");
+		const entry = path.join(packageRoot, "index.cjs");
+
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+		await fs.writeFile(entry, "(async () => {}).constructor('return require(\"../outside.js\")')();\n");
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(false);
+	});
+
+	it("rejects Worker entry modules without rejecting a shadowed local Worker", async () => {
+		const dir = await writePackage({
+			"package/package.json": JSON.stringify({ name: "worker-entry-ext", version: "1.0.0", type: "module" }),
+			"package/worker.js": "export const worker = true;\n",
+			"package/index.js": [
+				"class Worker {",
+				"  constructor(entry) { this.entry = entry; }",
+				"}",
+				'export const localWorker = new Worker(new URL("./worker.js", import.meta.url));',
+			].join("\n"),
+		});
+		const packageRoot = path.join(dir, "package");
+		const entry = path.join(packageRoot, "index.js");
+
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+		await fs.writeFile(entry, 'new Worker(new URL("./worker.js", import.meta.url));\n');
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(false);
+		await fs.writeFile(
+			entry,
+			'import { Worker as Thread } from "node:worker_threads";\nnew Thread(new URL("./worker.js", import.meta.url));\n',
+		);
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(false);
+	});
+
+	it("rejects process.getBuiltinModule loader paths without rejecting a shadowed process", async () => {
+		const dir = await writePackage({
+			"outside.js": "export const outside = true;\n",
+			"package/package.json": JSON.stringify({
+				name: "builtin-module-loader-ext",
+				version: "1.0.0",
+				type: "module",
+			}),
+			"package/index.js": [
+				'const process = { getBuiltinModule: () => ({ label: "safe" }) };',
+				'export const label = process.getBuiltinModule("module").label;',
+			].join("\n"),
+		});
+		const packageRoot = path.join(dir, "package");
+		const entry = path.join(packageRoot, "index.js");
+
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+		const cases = [
+			'process.getBuiltinModule("module").createRequire(import.meta.url)("../outside.js");',
+			'const loadBuiltin = process.getBuiltinModule; loadBuiltin("module").createRequire(import.meta.url)("../outside.js");',
+			'process["get" + "BuiltinModule"]("module").createRequire(import.meta.url)("../outside.js");',
+		] as const;
+		for (const source of cases) {
+			await fs.writeFile(entry, source);
+			expect(await isExtensionSourceGraphContained(entry, packageRoot), source).toBe(false);
+		}
+	});
+
 	it("tracks createRequire imported through ESM and CommonJS Module variants", async () => {
 		const dir = await writePackage({
 			"outside.js": "export const outside = true;\n",
@@ -359,6 +430,26 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 			["const eval = {};", "const Function = {};", "void eval;", "void Function;"].join("\n"),
 		);
 		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+
+		await fs.writeFile(
+			entry,
+			[
+				"interface Function {",
+				"  readonly displayName: string;",
+				"}",
+				"export type DeclaredFunction = Function;",
+				"export const safe = true;",
+			].join("\n"),
+		);
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+
+		await fs.writeFile(
+			entry,
+			["const Build = Function as FunctionConstructor;", "new Build('return require(\"../outside.js\")')();"].join(
+				"\n",
+			),
+		);
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(false);
 
 		await fs.writeFile(entry, "export type Callback = Function;\n");
 		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);

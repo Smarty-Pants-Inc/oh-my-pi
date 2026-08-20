@@ -5139,7 +5139,7 @@
     },
     {
       "path": "packages/ai/src/providers/openai-responses.ts",
-      "sha256": "ba24f7a95bf4ebcc98c1c2131965438490f07ed7deeee6a7bc59a064fa5f3fed"
+      "sha256": "f3ad6a1af4ac07fe0353f154eed6cd071cb2f858e64c85478fa72adf814253ad"
     },
     {
       "path": "packages/ai/src/providers/openai-shared.ts",
@@ -7407,7 +7407,7 @@
     },
     {
       "path": "packages/coding-agent/src/extensibility/plugins/legacy-pi-compat.ts",
-      "sha256": "64b4fa8115c0455d96aa3dbcd6a34a20d4ab3d4ac8cc2d4709541cff319c7f90"
+      "sha256": "5fb20ac36989f7b3944e45a9440d1efd0f750282cad0b9631f77d8f84613db37"
     },
     {
       "path": "packages/coding-agent/src/extensibility/plugins/loader.ts",
@@ -10683,5 +10683,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "3ea7fed47e0f37236b0020ddcb7e81e1115bbe839be219d3550a54851af746cd"
+  "rootSha256": "c1a3d3b842d75af0706057938e4d9a43a783b19fff3590bee46e6243eb92fb1b"
 }
