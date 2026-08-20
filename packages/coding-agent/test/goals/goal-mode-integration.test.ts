@@ -573,6 +573,36 @@ describe("InteractiveMode goal mode integration", () => {
 		expect(harness.session.getGoalModeState()?.goal.status).toBe("paused");
 	});
 
+	it("drops a tool-blocked goal through /goal and accepts a replacement", async () => {
+		const goalTool = harness.toolRegistry.get("goal");
+		if (!goalTool) throw new Error("Expected goal tool to be active");
+		const created = await goalTool.execute("call-create", {
+			op: "create",
+			objective: "Ship the release",
+			token_budget: undefined,
+		});
+		expect(created.details?.goal).toMatchObject({ objective: "Ship the release", status: "active" });
+
+		const blocked = await goalTool.execute("call-block", { op: "block" });
+		expect(blocked.details?.goal?.status).toBe("blocked");
+		expect(harness.session.getGoalModeState()).toMatchObject({
+			enabled: false,
+			goal: { objective: "Ship the release", status: "blocked" },
+		});
+		expect(harness.mode.goalModeEnabled).toBe(false);
+
+		vi.spyOn(harness.mode, "showHookConfirm").mockResolvedValue(true);
+		await harness.mode.handleGoalModeCommand("drop");
+
+		expect(harness.session.getGoalModeState()?.goal.status).toBe("dropped");
+		const replacement = await goalTool.execute("call-create", {
+			op: "create",
+			objective: "Ship the successor",
+			token_budget: undefined,
+		});
+		expect(replacement.details?.goal).toMatchObject({ objective: "Ship the successor", status: "active" });
+	});
+
 	it("resumes the paused goal via the bare /goal menu", async () => {
 		await harness.mode.handleGoalModeCommand("Ship the release");
 		const selector = vi.spyOn(harness.mode, "showHookSelector").mockResolvedValueOnce("Pause");
