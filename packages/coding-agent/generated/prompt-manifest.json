@@ -5871,7 +5871,7 @@
     },
     {
       "path": "packages/catalog/src/compat/openai.ts",
-      "sha256": "0f5908de516e04f19c038c298958803ddf4acc629d181616851b3e9ae18bdd96"
+      "sha256": "1981d398f682d639a7d24b58fcdfeb9f8c1912a050cdb0c043a052d9892eaf3f"
     },
     {
       "path": "packages/catalog/src/discovery/antigravity.ts",
@@ -6823,7 +6823,7 @@
     },
     {
       "path": "packages/coding-agent/src/context/manifest.ts",
-      "sha256": "a02b19327b3d9c39351c2878f5d50fbec58bceaa6da2e7c49cff7c1479ce5d45"
+      "sha256": "896f060665ef4aaf380c24344391272490ad9be0b4b968feb97301b6fdadcbb6"
     },
     {
       "path": "packages/coding-agent/src/context/prompt-sources.generated.ts",
@@ -7407,7 +7407,7 @@
     },
     {
       "path": "packages/coding-agent/src/extensibility/plugins/legacy-pi-compat.ts",
-      "sha256": "536a41b3d966f123a7a4361ed45f4a724b4b5b0de3216450038392cc2c094600"
+      "sha256": "9b15893e34c25a1683316a4bcf6c59a0b5130513be668c610ca3fbe477538802"
     },
     {
       "path": "packages/coding-agent/src/extensibility/plugins/loader.ts",
@@ -8559,7 +8559,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/session-advisors.ts",
-      "sha256": "67ad8cef3eaccbb8c5d3a4da8abb5807a8fcbff8999ce0d2544c1751ca888079"
+      "sha256": "272a8eb3b4f4e2d0d57e52db78e6c7183a98ea3f94787b8c6d4facdb9900e439"
     },
     {
       "path": "packages/coding-agent/src/session/session-context.ts",
@@ -8599,7 +8599,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/session-maintenance.ts",
-      "sha256": "8ca7002abc2fd846c8bf3774a988885f13ce9e10ff2161a48403541e48efd402"
+      "sha256": "1807931c3c88b4763679bd4440af1cfc5c8229a14a021af8eaff5f6efaf3cc7e"
     },
     {
       "path": "packages/coding-agent/src/session/session-manager.ts",
@@ -8647,7 +8647,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/settings-stream-fn.ts",
-      "sha256": "d799ea65f4e826c983ab293b610aa64c0d94079e1338e7325230eccd1436ac42"
+      "sha256": "e4923ea994c558cc6cddef3d5753ce556a1aef572f0da007ef46a0357cd8da78"
     },
     {
       "path": "packages/coding-agent/src/session/shake-types.ts",
@@ -10683,5 +10683,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "0ce5466a1dbd1b6193d787bb8607535f35ee8fb4064e8336a7e538e771e6c218"
+  "rootSha256": "85b11140b2c34c7096de78776c96a36cb16b04e58181d532d5d88b15f0f6f50c"
 }
