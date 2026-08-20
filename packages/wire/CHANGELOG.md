@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added stale-todo closure rejection metadata to collaboration `agent_end` events so browser guests can distinguish unsuccessful settles from normal completion.
+
 ## [16.3.0] - 2026-07-02
 
 ### Breaking Changes

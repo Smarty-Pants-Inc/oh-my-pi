@@ -179,9 +179,20 @@ export interface CollabPromptDetails {
 // Events (handled subset)
 // ═══════════════════════════════════════════════════════════════════════════
 
+export interface TodoItem {
+	content: string;
+	status: "pending" | "in_progress" | "completed" | "abandoned" | "blocked";
+	blocker?: string;
+}
+
+export interface AgentClosureRejection {
+	reason: "stale_todos";
+	todos: TodoItem[];
+}
+
 export type AgentEvent =
 	| { type: "agent_start" }
-	| { type: "agent_end" }
+	| { type: "agent_end"; closureRejected?: AgentClosureRejection }
 	| { type: "turn_start" }
 	| { type: "turn_end" }
 	| { type: "message_start"; message: WireMessage }
