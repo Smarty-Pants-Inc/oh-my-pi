@@ -3703,7 +3703,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	async #confirmAndDropGoal(): Promise<void> {
-		if (!this.goalModeEnabled && !this.#getPausedGoalState()) {
+		const goal = this.session.getGoalModeState()?.goal;
+		if (!goal || goal.status === "complete" || goal.status === "dropped" || goal.status === "superseded") {
 			this.showWarning("No goal to drop.");
 			return;
 		}
