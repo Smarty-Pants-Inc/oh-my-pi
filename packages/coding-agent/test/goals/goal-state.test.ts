@@ -15,17 +15,8 @@ function persistedGoal(status: string): Record<string, unknown> {
 }
 
 describe("persisted goal state", () => {
-	it("restores every canonical state without changing goal identity or accounting", () => {
-		const statuses: GoalStatus[] = [
-			"active",
-			"paused",
-			"blocked",
-			"budget_limited",
-			"usage_limited",
-			"complete",
-			"dropped",
-			"superseded",
-		];
+	it("restores every current canonical state without changing identity or accounting", () => {
+		const statuses: GoalStatus[] = ["active", "paused", "blocked", "budget_limited", "usage_limited"];
 
 		for (const status of statuses) {
 			const restored = parseGoalModeState(status === "paused" ? "goal_paused" : "goal", {
@@ -38,11 +29,14 @@ describe("persisted goal state", () => {
 				tokensUsed: 25,
 				timeUsedSeconds: 12,
 			});
+			expect(restored?.enabled).toBe(status === "active");
 		}
 	});
 
 	it("migrates legacy hyphenated status values deterministically", () => {
-		expect(parseGoalModeState("goal", { goal: persistedGoal("budget-limited") })?.goal.status).toBe("budget_limited");
+		const budgetLimited = parseGoalModeState("goal", { goal: persistedGoal("budget-limited") });
+		expect(budgetLimited?.goal.status).toBe("budget_limited");
+		expect(budgetLimited?.enabled).toBe(false);
 		expect(parseGoalModeState("goal", { goal: persistedGoal("usage-limited") })?.goal.status).toBe("usage_limited");
 	});
 
@@ -51,12 +45,9 @@ describe("persisted goal state", () => {
 		expect(parseGoalModeState("goal_paused", { goal: persistedGoal("active") })).toBeUndefined();
 	});
 
-	it("restores completed state as inert without erasing its terminal record", () => {
-		expect(parseGoalModeState("goal", { goal: persistedGoal("complete") })).toMatchObject({
-			enabled: false,
-			mode: "active",
-			reason: undefined,
-			goal: { status: "complete" },
-		});
+	it("keeps terminal goal history out of the current projection", () => {
+		for (const status of ["complete", "dropped", "superseded"] as const) {
+			expect(parseGoalModeState("goal", { goal: persistedGoal(status) })).toBeUndefined();
+		}
 	});
 });

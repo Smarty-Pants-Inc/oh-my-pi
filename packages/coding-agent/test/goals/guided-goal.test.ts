@@ -197,7 +197,20 @@ describe("guided goal setup", () => {
 			const status = vi.spyOn(harness.mode, "showStatus");
 			const warning = vi.spyOn(harness.mode, "showWarning");
 
-			harness.mode.goalModeEnabled = true;
+			const now = Date.now();
+			harness.session.setGoalModeState({
+				enabled: true,
+				mode: "active",
+				goal: {
+					id: "g1",
+					objective: "Ship it",
+					status: "active",
+					tokensUsed: 0,
+					timeUsedSeconds: 0,
+					createdAt: now,
+					updatedAt: now,
+				},
+			});
 			await harness.mode.handleGuidedGoalCommand("ship it");
 			expect(promptSpy).not.toHaveBeenCalled();
 			expect(status).toHaveBeenCalledWith(
@@ -205,7 +218,6 @@ describe("guided goal setup", () => {
 			);
 
 			harness.mode.goalModeEnabled = false;
-			const now = Date.now();
 			harness.session.setGoalModeState({
 				enabled: false,
 				mode: "active",

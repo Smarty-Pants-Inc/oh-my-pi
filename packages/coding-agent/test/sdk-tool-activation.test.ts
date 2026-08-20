@@ -1573,6 +1573,72 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		}
 	});
 
+	it("activates the late built-in goal for an unrestricted explicit SDK tool list", async () => {
+		const tempDir = makeTempDir();
+		const { session } = await createAgentSession({
+			...baseOptions(tempDir),
+			settings: Settings.isolated({ "goal.enabled": true }),
+			toolNames: ["read"],
+		});
+
+		try {
+			expect(session.getToolByName("goal")).toBeDefined();
+			expect(session.getActiveToolNames()).toContain("goal");
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("activates goal when an extension replaces an explicitly requested built-in", async () => {
+		const tempDir = makeTempDir();
+		const replaceReadExtension: ExtensionFactory = pi => {
+			pi.registerTool({
+				name: "read",
+				label: "Extension Read",
+				description: "Extension replacement for the built-in read tool.",
+				parameters: type({}),
+				async execute() {
+					return { content: [{ type: "text", text: "extension read" }] };
+				},
+			});
+		};
+		const { session } = await createAgentSession({
+			...baseOptions(tempDir),
+			settings: Settings.isolated({ "goal.enabled": true }),
+			extensions: [replaceReadExtension],
+			toolNames: ["read"],
+		});
+
+		try {
+			expect(session.getToolByName("read")?.label).toBe("Extension Read");
+			expect(session.getActiveToolNames()).toEqual(expect.arrayContaining(["read", "goal"]));
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	for (const testCase of [
+		{ label: "an explicit empty list", toolNames: [] },
+		{ label: "the internal no-tools sentinel", toolNames: ["__none__"] },
+		{ label: "an invalid-only list", toolNames: ["not_a_registered_tool"] },
+	]) {
+		it(`does not activate goal for ${testCase.label}`, async () => {
+			const tempDir = makeTempDir();
+			const { session } = await createAgentSession({
+				...baseOptions(tempDir),
+				settings: Settings.isolated({ "goal.enabled": true }),
+				toolNames: testCase.toolNames,
+			});
+
+			try {
+				expect(session.getToolByName("goal")).toBeDefined();
+				expect(session.getActiveToolNames()).not.toContain("goal");
+			} finally {
+				await session.dispose();
+			}
+		});
+	}
+
 	it("normalizes legacy builtin toolNames before selecting the active SDK tools", async () => {
 		const tempDir = makeTempDir();
 

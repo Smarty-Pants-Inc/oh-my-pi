@@ -4,7 +4,16 @@ import goalBudgetLimitPrompt from "../prompts/goals/goal-budget-limit.md" with {
 import goalContinuationPrompt from "../prompts/goals/goal-continuation.md" with { type: "text" };
 import goalModeActivePrompt from "../prompts/goals/goal-mode-active.md" with { type: "text" };
 import goalObjectiveUpdatedPrompt from "../prompts/goals/goal-objective-updated.md" with { type: "text" };
-import type { Goal, GoalBudgetSteering, GoalModeState, GoalRuntimeEvent, GoalTokenUsage } from "./state";
+import {
+	type Goal,
+	type GoalBudgetSteering,
+	type GoalModeState,
+	type GoalRuntimeEvent,
+	type GoalTokenUsage,
+	isCurrentGoalModeState,
+	isGoalEnabledStatus,
+	isResumableGoalStatus,
+} from "./state";
 
 export interface GoalRuntimeHost {
 	getState(): GoalModeState | undefined;
@@ -120,14 +129,6 @@ function validateTokenBudget(tokenBudget: number | undefined): void {
 	}
 }
 
-function isAccountingStatus(goal: Goal): boolean {
-	return goal.status === "active" || goal.status === "budget_limited";
-}
-
-function isFinalStatus(goal: Goal): boolean {
-	return goal.status === "complete" || goal.status === "dropped" || goal.status === "superseded";
-}
-
 function persistenceMode(state: GoalModeState): "goal" | "goal_paused" {
 	return state.goal.status === "paused" ? "goal_paused" : "goal";
 }
@@ -160,7 +161,7 @@ export class GoalRuntime {
 
 	#hasAccountingState(): boolean {
 		const state = this.#host.getState();
-		return Boolean(state?.enabled && isAccountingStatus(state.goal));
+		return Boolean(state?.enabled && isGoalEnabledStatus(state.goal.status));
 	}
 
 	async #withAccounting<T>(fn: () => Promise<T> | T): Promise<T> {
@@ -187,12 +188,18 @@ export class GoalRuntime {
 		state: GoalModeState | undefined,
 		options?: { persist?: "goal" | "goal_paused" | "none"; emit?: boolean },
 	): Promise<void> {
-		this.#host.setState(state ? cloneState(state) : undefined);
+		const currentState = state && isCurrentGoalModeState(state) ? state : undefined;
+		const retainedState = currentState ?? (state?.mode === "exiting" ? state : undefined);
+		this.#host.setState(retainedState ? cloneState(retainedState) : undefined);
 		if (options?.persist) {
 			this.#host.persist(options.persist, state);
 		}
 		if (options?.emit !== false) {
-			await this.#host.emit({ type: "goal_updated", goal: state ? cloneGoal(state.goal) : null, state });
+			await this.#host.emit({
+				type: "goal_updated",
+				goal: currentState ? cloneGoal(currentState.goal) : state ? cloneGoal(state.goal) : null,
+				state: currentState ? cloneState(currentState) : undefined,
+			});
 		}
 	}
 
@@ -222,7 +229,7 @@ export class GoalRuntime {
 	onTurnStart(turnId: string, baselineUsage: GoalTokenUsage): void {
 		this.#turnSnapshot = { turnId, baselineUsage: { ...baselineUsage } };
 		const state = this.#host.getState();
-		if (state?.enabled && isAccountingStatus(state.goal)) {
+		if (state?.enabled && isGoalEnabledStatus(state.goal.status)) {
 			this.#turnSnapshot.activeGoalId = state.goal.id;
 			if (this.#wallClock.activeGoalId !== state.goal.id) {
 				this.#wallClock = { lastAccountedAt: this.#now(), activeGoalId: state.goal.id };
@@ -252,7 +259,7 @@ export class GoalRuntime {
 
 	async onTaskAborted(options?: { reason?: "interrupted" | "internal" }): Promise<void> {
 		const state = this.#host.getState();
-		const needsAccounting = state?.enabled && isAccountingStatus(state.goal);
+		const needsAccounting = state?.enabled && isGoalEnabledStatus(state.goal.status);
 		if (!needsAccounting) {
 			this.#turnSnapshot = undefined;
 			return;
@@ -266,12 +273,16 @@ export class GoalRuntime {
 	async onThreadResumed(_options?: { preserveActiveGoal?: boolean }): Promise<GoalModeState | undefined> {
 		const state = this.#getStateClone();
 		if (!state) return undefined;
+		if (!isCurrentGoalModeState(state)) {
+			await this.#commitState(state, { emit: true });
+			return undefined;
+		}
 		if (state.enabled && state.goal.status === "active") {
 			this.#markActiveAccounting(state.goal, true);
 			await this.#commitState(state, { emit: true });
 			return state;
 		}
-		if (state.enabled && isAccountingStatus(state.goal)) {
+		if (state.enabled && isGoalEnabledStatus(state.goal.status)) {
 			this.#markActiveAccounting(state.goal);
 		} else {
 			this.#clearActiveAccounting();
@@ -286,7 +297,7 @@ export class GoalRuntime {
 			this.#budgetReportedFor = undefined;
 			await this.#flushUsageLocked("suppressed");
 			const state = this.#getStateClone();
-			if (!state?.goal) return undefined;
+			if (!isCurrentGoalModeState(state)) return undefined;
 			state.goal.tokenBudget = newBudget;
 			state.goal.updatedAt = this.#now();
 			let shouldSteer = false;
@@ -314,7 +325,7 @@ export class GoalRuntime {
 		persistWallClock = false,
 	): Promise<void> {
 		const state = this.#getStateClone();
-		if (!state?.enabled || !isAccountingStatus(state.goal)) return;
+		if (!state?.enabled || !isGoalEnabledStatus(state.goal.status)) return;
 		if (this.#turnSnapshot?.activeGoalId !== state.goal.id && this.#wallClock.activeGoalId !== state.goal.id) return;
 
 		const tokenDelta =
@@ -386,7 +397,10 @@ export class GoalRuntime {
 		validateTokenBudget(input.tokenBudget);
 		return await this.#withAccounting(async () => {
 			const existing = this.#host.getState();
-			if (existing?.goal && !isFinalStatus(existing.goal)) {
+			if (existing?.mode === "exiting") {
+				throw new Error("cannot create a new goal while terminal cleanup is still in progress");
+			}
+			if (isCurrentGoalModeState(existing)) {
 				throw new Error("cannot create a new goal because this session already has a goal");
 			}
 			const state = this.#createGoalState(objective, input.tokenBudget);
@@ -403,12 +417,12 @@ export class GoalRuntime {
 		validateTokenBudget(input.tokenBudget);
 		return await this.#withAccounting(async () => {
 			const existing = this.#getStateClone();
-			if (!existing?.goal || isFinalStatus(existing.goal)) {
+			if (!isCurrentGoalModeState(existing)) {
 				throw new Error("cannot replace goal because no unfinished goal exists");
 			}
 			await this.#flushUsageLocked("suppressed");
 			const superseded = this.#getStateClone();
-			if (!superseded?.goal || isFinalStatus(superseded.goal)) {
+			if (!isCurrentGoalModeState(superseded)) {
 				throw new Error("cannot replace goal because no unfinished goal exists");
 			}
 			superseded.enabled = false;
@@ -416,7 +430,7 @@ export class GoalRuntime {
 			superseded.reason = undefined;
 			superseded.goal.status = "superseded";
 			superseded.goal.updatedAt = this.#now();
-			await this.#commitState(superseded, { persist: "goal" });
+			await this.#commitState(superseded, { persist: "goal", emit: false });
 			const state = this.#createGoalState(objective, input.tokenBudget);
 			this.#budgetReportedFor = undefined;
 			this.#markActiveAccounting(state.goal);
@@ -428,13 +442,8 @@ export class GoalRuntime {
 	async resumeGoal(): Promise<GoalModeState> {
 		return await this.#withAccounting(async () => {
 			const state = this.#getStateClone();
-			if (!state?.goal) throw new Error("No resumable goal.");
-			if (
-				state.goal.status !== "paused" &&
-				state.goal.status !== "blocked" &&
-				state.goal.status !== "budget_limited" &&
-				state.goal.status !== "usage_limited"
-			) {
+			if (!isCurrentGoalModeState(state)) throw new Error("No resumable goal.");
+			if (!isResumableGoalStatus(state.goal.status)) {
 				throw new Error("Goal is not resumable.");
 			}
 			state.enabled = true;
@@ -453,7 +462,7 @@ export class GoalRuntime {
 		return await this.#withAccounting(async () => {
 			await this.#flushUsageLocked("suppressed");
 			const state = this.#getStateClone();
-			if (!state?.goal) return undefined;
+			if (!isCurrentGoalModeState(state)) return undefined;
 			if (!state.enabled || state.goal.status !== "active") {
 				throw new Error("cannot pause goal because no goal is active");
 			}
@@ -473,10 +482,7 @@ export class GoalRuntime {
 		return await this.#withAccounting(async () => {
 			await this.#flushUsageLocked("suppressed");
 			const state = this.#getStateClone();
-			if (!state?.goal) return undefined;
-			if (isFinalStatus(state.goal)) {
-				throw new Error("cannot drop a final goal");
-			}
+			if (!isCurrentGoalModeState(state)) return undefined;
 			state.enabled = false;
 			state.mode = "active";
 			state.reason = undefined;
@@ -493,7 +499,7 @@ export class GoalRuntime {
 		return await this.#withAccounting(async () => {
 			await this.#flushUsageLocked("suppressed");
 			const state = this.#getStateClone();
-			if (!state?.enabled || state.goal.status !== "active") {
+			if (!isCurrentGoalModeState(state) || !state.enabled || state.goal.status !== "active") {
 				throw new Error("cannot complete goal because no goal is active");
 			}
 			state.enabled = false;
@@ -512,7 +518,7 @@ export class GoalRuntime {
 		return await this.#withAccounting(async () => {
 			await this.#flushUsageLocked("suppressed");
 			const state = this.#getStateClone();
-			if (!state?.enabled || state.goal.status !== "active") {
+			if (!isCurrentGoalModeState(state) || !state.enabled || state.goal.status !== "active") {
 				throw new Error("cannot block goal because no goal is active");
 			}
 			state.enabled = false;
@@ -529,7 +535,7 @@ export class GoalRuntime {
 		return await this.#withAccounting(async () => {
 			await this.#flushUsageLocked("suppressed");
 			const state = this.#getStateClone();
-			if (!state?.enabled || state.goal.status !== "active") return state;
+			if (!isCurrentGoalModeState(state) || !state.enabled || state.goal.status !== "active") return state;
 			state.enabled = false;
 			state.goal.status = "usage_limited";
 			state.goal.updatedAt = this.#now();

@@ -1795,6 +1795,7 @@ async function createAgentSessionScoped(
 			getPlanModeState: () => session?.getPlanModeState(),
 			getPlanReferencePath: () => session?.getPlanReferencePath() ?? "local://PLAN.md",
 			getGoalModeState: () => session?.getGoalModeState(),
+			isGoalModeExiting: () => session?.isGoalModeExiting() ?? false,
 			getGoalRuntime: () => session?.goalRuntime,
 			getUsageStatistics: () => sessionManager.getUsageStatistics(),
 			getTurnBudget: () => sessionManager.getTurnBudget(),
@@ -2731,7 +2732,12 @@ async function createAgentSessionScoped(
 		for (const [name, tool] of toolRegistry) {
 			nativeToolsByName.set(name, tool);
 		}
-		if (!restrictToolNames && !toolRegistry.has("goal") && settings.get("goal.enabled")) {
+		if (
+			!restrictToolNames &&
+			!toolRegistry.has("goal") &&
+			settings.get("goal.enabled") &&
+			toolSession.isGoalModeExiting?.() !== true
+		) {
 			const goalTool = await logger.time("createTools:goal:session", HIDDEN_TOOLS.goal, toolSession);
 			if (goalTool) {
 				const wrapped = wrapToolWithMetaNotice(goalTool);
@@ -3097,6 +3103,10 @@ async function createAgentSessionScoped(
 
 		const toolNamesFromRegistry = Array.from(toolRegistry.keys());
 		const explicitlyRequestedToolNames = options.toolNames ? normalizeToolNames(options.toolNames) : undefined;
+		const explicitOrdinaryBuiltInToolRequested =
+			explicitlyRequestedToolNames?.some(
+				name => name !== "goal" && name !== "yield" && name !== "think" && Object.hasOwn(BUILTIN_TOOLS, name),
+			) === true;
 		// When `requireYieldTool` is set, the subagent's prompts and idle-reminders demand a
 		// `yield` call to terminate. The tool registry already includes `yield` (see
 		// `createTools`), but an explicit `toolNames` list would otherwise drop it from the
@@ -3121,6 +3131,14 @@ async function createAgentSessionScoped(
 				if (builtInToolNames.includes(name) && !explicitlyRequestedToolNames.includes(name)) {
 					explicitlyRequestedToolNames.push(name);
 				}
+			}
+			if (
+				explicitOrdinaryBuiltInToolRequested &&
+				builtInRegistryToolNames.has("goal") &&
+				toolSession.isGoalModeExiting?.() !== true &&
+				!explicitlyRequestedToolNames.includes("goal")
+			) {
+				explicitlyRequestedToolNames.push("goal");
 			}
 		}
 		// Checkpoint and rewind are a pair: `createTools` auto-includes the sister

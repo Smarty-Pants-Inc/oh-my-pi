@@ -163,7 +163,7 @@ import type { Skill, SkillWarning } from "../extensibility/skills";
 import { expandSlashCommand, type FileSlashCommand } from "../extensibility/slash-commands";
 import { normalizeToolEventInput, resolveToolEventInput } from "../extensibility/tool-event-input";
 import { GoalRuntime } from "../goals/runtime";
-import { type GoalModeState, parseGoalModeState } from "../goals/state";
+import { type GoalModeState, isCurrentGoalModeState, parseGoalModeState } from "../goals/state";
 import type { HindsightSessionState } from "../hindsight/state";
 import { type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
 import type { IrcMessage } from "../irc/bus";
@@ -1603,7 +1603,7 @@ export class AgentSession {
 		this.#goalRuntime = new GoalRuntime({
 			getState: () => this.#goalModeState,
 			setState: state => {
-				this.#goalModeState = state;
+				this.setGoalModeState(state);
 			},
 			getCurrentUsage: () => {
 				const usage = this.getSessionStats().tokens;
@@ -1733,7 +1733,7 @@ export class AgentSession {
 			sessionId: () => this.sessionId,
 			messages: () => this.messages,
 			baseSystemPrompt: () => this.#tools.baseSystemPrompt,
-			goalModeState: () => this.#goalModeState,
+			goalModeState: () => this.getGoalModeState(),
 			planReferencePath: () => this.#planReferencePath,
 			nonMessageTokenSource: () => this,
 			memoryBackendSession: () => this,
@@ -5940,7 +5940,7 @@ export class AgentSession {
 
 	#rehydrateGoalModeState(mode: unknown, modeData: unknown): void {
 		this.#goalRuntime.clearAccounting();
-		this.#goalModeState = this.settings.get("goal.enabled") ? parseGoalModeState(mode, modeData) : undefined;
+		this.setGoalModeState(this.settings.get("goal.enabled") ? parseGoalModeState(mode, modeData) : undefined);
 	}
 
 	/**
@@ -6051,11 +6051,15 @@ export class AgentSession {
 	}
 
 	getGoalModeState(): GoalModeState | undefined {
-		return this.#goalModeState;
+		return isCurrentGoalModeState(this.#goalModeState) ? this.#goalModeState : undefined;
 	}
 
 	setGoalModeState(state: GoalModeState | undefined): void {
-		this.#goalModeState = state;
+		this.#goalModeState = state && (state.mode === "exiting" || isCurrentGoalModeState(state)) ? state : undefined;
+	}
+
+	isGoalModeExiting(): boolean {
+		return this.#goalModeState?.mode === "exiting";
 	}
 
 	getVibeModeState(): VibeModeState | undefined {
@@ -6173,9 +6177,11 @@ export class AgentSession {
 		this.#observedSessionId = checkpoint.observedSessionId;
 		this.#planModeState = checkpoint.planModeState ? { ...checkpoint.planModeState } : undefined;
 		this.#vibeModeState = checkpoint.vibeModeState ? { ...checkpoint.vibeModeState } : undefined;
-		this.#goalModeState = checkpoint.goalModeState
-			? { ...checkpoint.goalModeState, goal: { ...checkpoint.goalModeState.goal } }
-			: undefined;
+		this.setGoalModeState(
+			checkpoint.goalModeState
+				? { ...checkpoint.goalModeState, goal: { ...checkpoint.goalModeState.goal } }
+				: undefined,
+		);
 		this.#inspectImageModeOverride = checkpoint.inspectImageModeOverride;
 		this.#goalTurnCounter = checkpoint.goalTurnCounter;
 		this.#planReferenceSent = checkpoint.planReferenceSent;
