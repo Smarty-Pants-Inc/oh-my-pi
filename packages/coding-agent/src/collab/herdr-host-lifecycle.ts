@@ -1,14 +1,12 @@
 import type { InteractiveModeContext } from "../modes/types";
 import type { AgentSession } from "../session/agent-session";
+import { discoverHerdrHostBridge, type HerdrHostBridgeBootstrap } from "./herdr-bridge-bootstrap";
 import { CollabHost } from "./host";
 import { createHostBridgeTransport } from "./local-transport";
 
-export interface ManagedHerdrHostBridge {
+export interface ManagedHerdrHostBridge extends HerdrHostBridgeBootstrap {
 	role: "host";
 	managed: true;
-	address: string;
-	token: string;
-	paneId: string;
 	routeGeneration: number;
 }
 
@@ -23,7 +21,7 @@ const MAX_TERMINAL_REARMS = 1;
 export class HerdrCollabHostLifecycle {
 	readonly #ctx: InteractiveModeContext;
 	readonly #session: SessionChangeSource;
-	readonly #bridge: ManagedHerdrHostBridge;
+	#bridge: ManagedHerdrHostBridge;
 	#host: CollabHost | undefined;
 	#activeSessionId: string | undefined;
 	#committedSessionId: string | undefined;
@@ -116,6 +114,7 @@ export class HerdrCollabHostLifecycle {
 		let routeBusySessionId: string | undefined;
 		let routeBusyDeadline: number | undefined;
 		let routeBusyDelayMs = ROUTE_BUSY_RETRY_INITIAL_DELAY_MS;
+		let rediscovered = false;
 		while (!this.#stopping) {
 			if (this.#suspended || this.#ctx.collabGuest) {
 				await this.#deactivate(suspendedReason);
@@ -141,15 +140,21 @@ export class HerdrCollabHostLifecycle {
 
 			await this.#deactivate("session switched");
 			if (this.#stopping || this.#suspended || this.#ctx.collabGuest) return;
+			const refreshed = await discoverHerdrHostBridge(this.#bridge.discovery);
+			this.#bridge = { ...this.#bridge, current: refreshed };
+			if (this.#stopping || this.#suspended || this.#ctx.collabGuest) return;
+			const discoveredCurrentSessionId = this.#session.sessionManager.getSessionId();
+			const discoveredSessionId = this.#committedSessionId ?? discoveredCurrentSessionId;
+			if (discoveredCurrentSessionId !== sessionId || discoveredSessionId !== sessionId) continue;
 
 			const next = new CollabHost(this.#ctx);
 			let terminalReason: string | undefined;
 			try {
 				await next.startWithTransport(
 					createHostBridgeTransport(
-						this.#bridge.address,
-						this.#bridge.token,
-						this.#bridge.paneId,
+						refreshed.address,
+						refreshed.token,
+						refreshed.paneId,
 						sessionId,
 						this.#bridge.routeGeneration,
 					),
@@ -164,6 +169,7 @@ export class HerdrCollabHostLifecycle {
 				);
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
+				if (terminalReason !== undefined) throw error;
 				if (message.startsWith("route_busy:")) {
 					const now = Date.now();
 					routeBusyAttempts += 1;
@@ -178,12 +184,13 @@ export class HerdrCollabHostLifecycle {
 					routeBusyDelayMs = Math.min(routeBusyDelayMs * 2, ROUTE_BUSY_RETRY_MAX_DELAY_MS);
 					continue;
 				}
+				if (!rediscovered) {
+					rediscovered = true;
+					continue;
+				}
 				throw error;
 			}
-			if (terminalReason !== undefined) {
-				if (!this.#reserveTerminalRearm(sessionId, terminalReason)) return;
-				continue;
-			}
+			if (terminalReason !== undefined) throw new Error(terminalReason);
 			if (this.#stopping || this.#suspended || this.#ctx.collabGuest) {
 				await next.stop(this.#stopping ? "session stopped" : suspendedReason);
 				return;

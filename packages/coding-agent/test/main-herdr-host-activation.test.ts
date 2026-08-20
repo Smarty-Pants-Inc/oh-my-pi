@@ -177,9 +177,12 @@ describe("automatic Herdr host activation", () => {
 				if (scenario.join) parsed.join = scenario.join;
 				disableStartupFeatures(parsed, tempDir.join(`sessions-${scenario.name}`));
 				const herdrHostBridge = {
-					address: "127.0.0.1:4321",
-					token: `token-${scenario.name}`,
-					paneId: "pane-9",
+					current: {
+						address: "127.0.0.1:4321",
+						token: `token-${scenario.name}`,
+						paneId: "pane-9",
+					},
+					discovery: { socketPath: `/tmp/herdr-${scenario.name}.sock`, paneId: "pane-9" },
 				};
 				let manager: SessionManager | undefined;
 				let created = false;
@@ -211,9 +214,12 @@ describe("automatic Herdr host activation", () => {
 				expect(bridge).toEqual({
 					role: "host",
 					managed: true,
-					address: "127.0.0.1:4321",
-					token: `token-${scenario.name}`,
-					paneId: "pane-9",
+					current: {
+						address: "127.0.0.1:4321",
+						token: `token-${scenario.name}`,
+						paneId: "pane-9",
+					},
+					discovery: { socketPath: `/tmp/herdr-${scenario.name}.sock`, paneId: "pane-9" },
 					routeGeneration: 1,
 				});
 				expect(bridge).not.toHaveProperty("ompSessionId");
@@ -236,9 +242,12 @@ describe("automatic Herdr host activation", () => {
 		});
 		const diagnostic: CollabBridgeBootstrap = {
 			role: "host",
-			address: "127.0.0.1:9999",
-			token: "diagnostic-token",
-			paneId: "pane-diagnostic",
+			current: {
+				address: "127.0.0.1:9999",
+				token: "diagnostic-token",
+				paneId: "pane-diagnostic",
+			},
+			discovery: { socketPath: "/tmp/herdr-diagnostic.sock", paneId: "pane-diagnostic" },
 			ompSessionId: "caller-supplied-session",
 			routeGeneration: 7,
 		};

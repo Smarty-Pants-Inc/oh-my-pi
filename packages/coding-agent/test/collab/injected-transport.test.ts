@@ -514,6 +514,64 @@ describe("injected collab transport", () => {
 		]);
 	});
 
+	it("rejects startup when Herdr coalesces ready and close in one read", async () => {
+		const registrations: string[] = [];
+		const ctx = makeHostContext([], {});
+		ctx.session.subscribe = (callback: (event: AgentSessionEvent) => void) => {
+			registrations.push("session");
+			callback({ type: "agent_start" });
+			return () => {};
+		};
+		ctx.eventBus = {
+			on(channel: string, _handler: (data: unknown) => void) {
+				registrations.push(`event:${channel}`);
+				return () => {};
+			},
+		} as unknown as NonNullable<InteractiveModeContext["eventBus"]>;
+		ctx.sessionManager.subscribeEntryAppended = () => {
+			registrations.push("entry");
+			return () => {};
+		};
+
+		const socket = { write: () => 0, end: () => {} } as unknown as Bun.Socket<undefined>;
+		const connectSpy = spyOn(Bun, "connect").mockImplementation(((
+			options: Bun.TCPSocketConnectOptions<undefined>,
+		) => {
+			options.socket.open?.(socket);
+			options.socket.data?.(socket, Buffer.from('{"t":"ready"}\n{"t":"close","reason":"bridge dropped"}\n'));
+			return Promise.resolve(socket);
+		}) as typeof Bun.connect);
+		const intervalSpy = spyOn(globalThis, "setInterval").mockImplementation(
+			(() => 0) as unknown as typeof globalThis.setInterval,
+		);
+		const registrySpy = spyOn(AgentRegistry.global(), "onChange");
+		let terminatedReason: string | undefined;
+		try {
+			const host = new CollabHost(ctx);
+			await expect(
+				host.startWithTransport(
+					createHostBridgeTransport("127.0.0.1:1", "route-token", "pane-7", "host-session", 1),
+					{
+						trustedLocal: true,
+						privateHost: true,
+						onTerminated: reason => {
+							terminatedReason = reason;
+						},
+					},
+				),
+			).rejects.toThrow("bridge dropped");
+
+			expect(terminatedReason).toBe("bridge dropped");
+			expect(registrations).toEqual([]);
+			expect(registrySpy).not.toHaveBeenCalled();
+			expect(intervalSpy).not.toHaveBeenCalled();
+		} finally {
+			registrySpy.mockRestore();
+			intervalSpy.mockRestore();
+			connectSpy.mockRestore();
+		}
+	});
+
 	it("surfaces a Herdr error before ready as the exact host startup failure", async () => {
 		const server = Bun.listen({
 			hostname: "127.0.0.1",
