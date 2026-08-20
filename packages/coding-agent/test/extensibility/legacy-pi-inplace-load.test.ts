@@ -297,6 +297,13 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 			].join("\n"),
 		);
 		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+		await fs.writeFile(
+			entry,
+			["const get = Object.getOwnPropertyDescriptor;", "module.exports = get({ safe: 1 }, 'safe').value;"].join(
+				"\n",
+			),
+		);
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
 		const cases = [
 			{
 				name: "direct constructor call",
@@ -329,6 +336,11 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 				name: "aliased descriptor constructor value",
 				source:
 					"const descriptor = Object.getOwnPropertyDescriptor(async () => {}, 'constructor'); const Build = descriptor.value; Build('return require(\"../outside.js\")')();",
+			},
+			{
+				name: "descriptor helper alias constructor value",
+				source:
+					"const get = Object.getOwnPropertyDescriptor; get(async () => {}, 'constructor').value('return require(\"../outside.js\")')();",
 			},
 			{
 				name: "escaped constructor value",
@@ -403,6 +415,24 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 			'import { Worker as Thread } from "node:worker_threads";\nnew Thread(new URL("./worker.js", import.meta.url));\n',
 		);
 		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(false);
+	});
+
+	it("rejects node:vm execution builtins during graph proof", async () => {
+		const dir = await writePackage({
+			"package/package.json": JSON.stringify({ name: "vm-execution-ext", version: "1.0.0", type: "module" }),
+			"package/index.js": "export const safe = true;\n",
+		});
+		const packageRoot = path.join(dir, "package");
+		const entry = path.join(packageRoot, "index.js");
+
+		const cases = [
+			{ name: "node:vm import", source: 'import * as vm from "node:vm";\nvoid vm;' },
+			{ name: "vm require", source: 'const vm = require("vm");\nvoid vm;' },
+		] as const;
+		for (const testCase of cases) {
+			await fs.writeFile(entry, testCase.source);
+			expect(await isExtensionSourceGraphContained(entry, packageRoot), testCase.name).toBe(false);
+		}
 	});
 
 	it("rejects process.getBuiltinModule loader paths without rejecting a shadowed process", async () => {
@@ -539,6 +569,66 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 			expect(await isExtensionSourceGraphContained(entry, packageRoot), factory.name).toBe(true);
 			await fs.writeFile(entry, `${factory.source}\nlocalRequire("../outside.js");`);
 			expect(await isExtensionSourceGraphContained(entry, packageRoot), factory.name).toBe(false);
+		}
+	});
+
+	it("uses lexical identity for shadowed createRequire, localRequire, and process.dlopen aliases", async () => {
+		const dir = await writePackage({
+			"package/package.json": JSON.stringify({ name: "shadowed-loader-ext", version: "1.0.0", type: "module" }),
+			"package/index.js": "export {};\n",
+		});
+		const packageRoot = path.join(dir, "package");
+		const entry = path.join(packageRoot, "index.js");
+		const cases = [
+			{
+				name: "createRequire parameter",
+				source: [
+					'import { createRequire } from "node:module";',
+					"function invoke(createRequire) {",
+					"  const target = './not-a-module';",
+					"  return createRequire(target);",
+					"}",
+					"function safeCreateRequire() {",
+					"  const result = 'safe';",
+					"  return result;",
+					"}",
+					"export const value = invoke(safeCreateRequire);",
+				].join("\n"),
+			},
+			{
+				name: "localRequire block binding",
+				source: [
+					'import { createRequire } from "node:module";',
+					"const localRequire = createRequire(import.meta.url);",
+					"export function invoke() {",
+					"  const localRequire = () => {",
+					"    const result = 'safe';",
+					"    return result;",
+					"  };",
+					"  return localRequire('./not-a-module');",
+					"}",
+				].join("\n"),
+			},
+			{
+				name: "process.dlopen parameter",
+				source: [
+					'import { dlopen as open } from "node:process";',
+					"function invoke(open) {",
+					"  const value = 'safe';",
+					"  return open(value);",
+					"}",
+					"function echo(value) {",
+					"  const result = value;",
+					"  return result;",
+					"}",
+					"export const value = invoke(echo);",
+				].join("\n"),
+			},
+		] as const;
+
+		for (const testCase of cases) {
+			await fs.writeFile(entry, testCase.source);
+			expect(await isExtensionSourceGraphContained(entry, packageRoot), testCase.name).toBe(true);
 		}
 	});
 

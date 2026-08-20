@@ -4603,11 +4603,11 @@
     },
     {
       "path": "packages/agent/src/compaction/compaction-v2-streaming.ts",
-      "sha256": "3d05ecdfdd32882ff840c2c5e2d0bce7b0156955b5acbe5c01509ecbd124b6d1"
+      "sha256": "f81d8fb7b795d2923e9d7bf306f9be947e22c7b0a2e7547102f1cca02215269a"
     },
     {
       "path": "packages/agent/src/compaction/compaction.ts",
-      "sha256": "fb427b200f6ccdef0cbaf1845ae471e2505c4ec35949ec24e38a64654b53d5f4"
+      "sha256": "2039c9420c8dcca5efa8adea6c1a7eefb269fdbd78a7602eda90013a40957e19"
     },
     {
       "path": "packages/agent/src/compaction/entries.ts",
@@ -4631,7 +4631,7 @@
     },
     {
       "path": "packages/agent/src/compaction/openai.ts",
-      "sha256": "87483905047705f5f0379b6437e9bbd98bdd748dd2e8c8f2b4e381100f2bf508"
+      "sha256": "3bbaa31319e61d02e7c3a272822143b83838b67bd9b2266e19eabae9a9f6a7f5"
     },
     {
       "path": "packages/agent/src/compaction/pruning.ts",
@@ -5107,7 +5107,7 @@
     },
     {
       "path": "packages/ai/src/providers/openai-codex-responses.ts",
-      "sha256": "411b6cc3607134f82690dcb9823833234f51bf60266fb34179f42caea9c381f7"
+      "sha256": "d1b125a4de8b56d030ed64dea9eea0d49f3dc21e4729a8f046e4d3bb810a009e"
     },
     {
       "path": "packages/ai/src/providers/openai-codex/request-transformer.ts",
@@ -6071,7 +6071,7 @@
     },
     {
       "path": "packages/catalog/src/provider-models/cache-provider-id.ts",
-      "sha256": "f303ef29b65fdab6f5b8e31e47b6207daeb33df21ba5b97fd90f4860a3d99779"
+      "sha256": "9d8f4789783842798b85cc3d1c12166c037d40f423ea24486f68fa1b291dadfa"
     },
     {
       "path": "packages/catalog/src/provider-models/descriptor-types.ts",
@@ -6095,7 +6095,7 @@
     },
     {
       "path": "packages/catalog/src/provider-models/openai-compat.ts",
-      "sha256": "ff9ff04dbabc6feda631aa5a545700fb2536cb3c296e7d87bb55b6fcf0fd1310"
+      "sha256": "ba1bf61f45d480b172291cebb5b594034c99317aa5812a77c21f4fe250809364"
     },
     {
       "path": "packages/catalog/src/provider-models/special.ts",
@@ -6763,7 +6763,7 @@
     },
     {
       "path": "packages/coding-agent/src/config/model-registry.ts",
-      "sha256": "c5dc88e3eadeea7c63f66b1b0d6f1880245ea33ff86bb1aa328feb2208766b46"
+      "sha256": "f24f3fd7b2cde9b938675f10fb30cda4e793405758f3d464960a3af1cbaa6a31"
     },
     {
       "path": "packages/coding-agent/src/config/model-resolver.ts",
@@ -7407,7 +7407,7 @@
     },
     {
       "path": "packages/coding-agent/src/extensibility/plugins/legacy-pi-compat.ts",
-      "sha256": "9b15893e34c25a1683316a4bcf6c59a0b5130513be668c610ca3fbe477538802"
+      "sha256": "e6d0148da418f593da43c7b9b288ecbd908b49e50e84b2c97c51ee688e9cd6c4"
     },
     {
       "path": "packages/coding-agent/src/extensibility/plugins/loader.ts",
@@ -8559,7 +8559,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/session-advisors.ts",
-      "sha256": "272a8eb3b4f4e2d0d57e52db78e6c7183a98ea3f94787b8c6d4facdb9900e439"
+      "sha256": "2558c72c284fb3585f6afbbd77fc530299b1280789b0fee0c701fee76c55fa30"
     },
     {
       "path": "packages/coding-agent/src/session/session-context.ts",
@@ -8599,7 +8599,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/session-maintenance.ts",
-      "sha256": "1807931c3c88b4763679bd4440af1cfc5c8229a14a021af8eaff5f6efaf3cc7e"
+      "sha256": "f79d3595e5fd37d16d769d7fa6e7e7b3c9bcb2b7cd1c53b2d8022816371eec2f"
     },
     {
       "path": "packages/coding-agent/src/session/session-manager.ts",
@@ -10683,5 +10683,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "c0ea070f7f2222ff37978a725a9287333233d4081a3f0d8bd263e5b75a9113bf"
+  "rootSha256": "d4996d704e7e9609a41666e5a8b70fd8df4cd9fa8bcb967608d911d117dd4184"
 }

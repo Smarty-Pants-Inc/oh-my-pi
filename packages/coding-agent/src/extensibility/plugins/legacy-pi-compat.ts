@@ -553,13 +553,14 @@ function isNodeProcessRequireCall(node: StructuralAstNode | null, scope: Binding
 
 function isProcessDlopenCall(
 	node: StructuralAstNode | null,
-	processDlopenBindings: ReadonlySet<string>,
+	scope: BindingScope,
+	processDlopenBindings: ReadonlySet<StructuralAstNode>,
 	isProcessObject: (node: StructuralAstNode | null) => boolean,
 ): boolean {
 	if (node?.type !== "CallExpression" && node?.type !== "OptionalCallExpression") return false;
 	const callee = asAstNode(node.callee);
-	if (callee?.type === "Identifier" && typeof callee.name === "string") {
-		return processDlopenBindings.has(callee.name);
+	if (callee?.type === "Identifier") {
+		return hasLexicalBinding(processDlopenBindings, scope, callee);
 	}
 	if (
 		(callee?.type !== "MemberExpression" && callee?.type !== "OptionalMemberExpression") ||
@@ -576,14 +577,14 @@ function isProcessDlopenCall(
  */
 function isCreateRequireInvocation(
 	node: StructuralAstNode | null,
-	createRequireBindings: ReadonlySet<string>,
+	createRequireBindings: ReadonlySet<StructuralAstNode>,
 	moduleNamespaceBindings: ReadonlySet<StructuralAstNode>,
 	scope: BindingScope,
 ): boolean {
 	if (node?.type !== "CallExpression") return false;
 	const callee = asAstNode(node.callee);
-	if (callee?.type === "Identifier" && typeof callee.name === "string") {
-		return createRequireBindings.has(callee.name);
+	if (callee?.type === "Identifier") {
+		return hasLexicalBinding(createRequireBindings, scope, callee);
 	}
 	if (callee?.type !== "MemberExpression" || staticMemberPropertyName(callee) !== "createRequire") return false;
 	const object = asAstNode(callee.object);
@@ -593,8 +594,8 @@ function isCreateRequireInvocation(
 function isNodeProcessLoaderCall(
 	node: StructuralAstNode | null,
 	scope: BindingScope,
-	localRequireBindings: ReadonlySet<string>,
-	createRequireBindings: ReadonlySet<string>,
+	localRequireBindings: ReadonlySet<StructuralAstNode>,
+	createRequireBindings: ReadonlySet<StructuralAstNode>,
 	moduleNamespaceBindings: ReadonlySet<StructuralAstNode>,
 ): boolean {
 	if (isNodeProcessRequireCall(node, scope)) return true;
@@ -605,7 +606,7 @@ function isNodeProcessLoaderCall(
 	}
 	const callee = asAstNode(node.callee);
 	return (
-		(callee?.type === "Identifier" && typeof callee.name === "string" && localRequireBindings.has(callee.name)) ||
+		hasLexicalBinding(localRequireBindings, scope, callee) ||
 		isCreateRequireInvocation(callee, createRequireBindings, moduleNamespaceBindings, scope)
 	);
 }
@@ -671,18 +672,25 @@ function collectExtensionSpecifierReferences(
 		) {
 			return false;
 		}
-		if (graphProof && (node.value === "node:worker_threads" || node.value === "worker_threads")) {
+		if (
+			graphProof &&
+			(node.value === "node:worker_threads" ||
+				node.value === "worker_threads" ||
+				node.value === "node:vm" ||
+				node.value === "vm")
+		) {
 			graphProof.provable = false;
 		}
 		references.push({ kind, specifier: node.value, start: node.start, end: node.end });
 		return true;
 	};
-	const createRequireBindings = new Set<string>();
+	const createRequireBindings = new Set<StructuralAstNode>();
 	const moduleNamespaceBindings = new Set<StructuralAstNode>();
 	const commonJsModuleNamespaceBindings = new Set<StructuralAstNode>();
 	const processNamespaceBindings = new Set<StructuralAstNode>();
-	const processDlopenBindings = new Set<string>();
+	const processDlopenBindings = new Set<StructuralAstNode>();
 	const globalObjectBindings = new Set<StructuralAstNode>();
+	const propertyDescriptorGetterBindings = new Set<StructuralAstNode>();
 	const constructorValueBindings = new Set<StructuralAstNode>();
 	const constructorDescriptorBindings = new Set<StructuralAstNode>();
 	const createRequireBindingNodes = new WeakSet<object>();
@@ -692,6 +700,8 @@ function collectExtensionSpecifierReferences(
 	const globalObjectBindingNodes = new WeakSet<object>();
 	const globalObjectUseNodes = new WeakSet<object>();
 	const processObjectUseNodes = new WeakSet<object>();
+	const propertyDescriptorGetterBindingNodes = new WeakSet<object>();
+	const propertyDescriptorGetterUseNodes = new WeakSet<object>();
 	const constructorDescriptorBindingNodes = new WeakSet<object>();
 	const constructorDescriptorUseNodes = new WeakSet<object>();
 	const constructorValueBindingNodes = new WeakSet<object>();
@@ -730,7 +740,7 @@ function collectExtensionSpecifierReferences(
 					addLexicalBinding(processNamespaceBindings, scope, local);
 					processNamespaceBindingNodes.add(local);
 				} else if (specifier?.type === "ImportSpecifier" && importedName === "dlopen") {
-					processDlopenBindings.add(local.name);
+					addLexicalBinding(processDlopenBindings, scope, local);
 					processDlopenBindingNodes.add(local);
 				}
 				continue;
@@ -745,7 +755,7 @@ function collectExtensionSpecifierReferences(
 				addLexicalBinding(moduleNamespaceBindings, scope, local);
 				moduleNamespaceBindingNodes.add(local);
 			} else if (specifier?.type === "ImportSpecifier" && importedName === "createRequire") {
-				createRequireBindings.add(local.name);
+				addLexicalBinding(createRequireBindings, scope, local);
 				createRequireBindingNodes.add(local);
 			} else if (specifier?.type === "ImportSpecifier" && importedName === "_load") {
 				if (graphProof) graphProof.provable = false;
@@ -828,7 +838,7 @@ function collectExtensionSpecifierReferences(
 				}
 				if (propertyName === "dlopen") {
 					if (propertyKey) processDlopenBindingNodes.add(propertyKey);
-					processDlopenBindings.add(local.name);
+					addLexicalBinding(processDlopenBindings, scope, local);
 					processDlopenBindingNodes.add(local);
 				} else {
 					if (propertyKey) processNamespaceBindingNodes.add(propertyKey);
@@ -873,7 +883,7 @@ function collectExtensionSpecifierReferences(
 				}
 				if (propertyName === "createRequire") {
 					if (propertyKey) createRequireBindingNodes.add(propertyKey);
-					createRequireBindings.add(local.name);
+					addLexicalBinding(createRequireBindings, scope, local);
 					createRequireBindingNodes.add(local);
 				} else {
 					if (propertyKey) moduleNamespaceBindingNodes.add(propertyKey);
@@ -899,7 +909,7 @@ function collectExtensionSpecifierReferences(
 				continue;
 			}
 			if (memberName === "dlopen") {
-				processDlopenBindings.add(binding.name);
+				addLexicalBinding(processDlopenBindings, scope, binding);
 				processDlopenBindingNodes.add(binding);
 			} else {
 				addLexicalBinding(processNamespaceBindings, scope, binding);
@@ -920,7 +930,7 @@ function collectExtensionSpecifierReferences(
 			continue;
 		}
 		if (memberName === "createRequire") {
-			createRequireBindings.add(binding.name);
+			addLexicalBinding(createRequireBindings, scope, binding);
 			createRequireBindingNodes.add(binding);
 		} else {
 			addLexicalBinding(moduleNamespaceBindings, scope, binding);
@@ -929,8 +939,8 @@ function collectExtensionSpecifierReferences(
 		}
 	}
 
-	const localRequireBindings = new Set<string>();
-	const unprovableRequireBindings = new Set<string>();
+	const localRequireBindings = new Set<StructuralAstNode>();
+	const unprovableRequireBindings = new Set<StructuralAstNode>();
 	const requireBindingNodes = new WeakSet<object>();
 	for (const { node, scope } of variableDeclarations) {
 		const initializer = asAstNode(node.init);
@@ -942,9 +952,9 @@ function collectExtensionSpecifierReferences(
 		}
 		requireBindingNodes.add(binding);
 		if (isImportMetaUrl(nodeArgument(initializer, 0))) {
-			localRequireBindings.add(binding.name);
+			addLexicalBinding(localRequireBindings, scope, binding);
 		} else {
-			unprovableRequireBindings.add(binding.name);
+			addLexicalBinding(unprovableRequireBindings, scope, binding);
 			if (graphProof) graphProof.provable = false;
 		}
 	}
@@ -1086,10 +1096,7 @@ function collectExtensionSpecifierReferences(
 					}
 					if (propertyName === "dlopen") {
 						if (propertyKey) processDlopenBindingNodes.add(propertyKey);
-						if (!processDlopenBindings.has(local.name)) {
-							processDlopenBindings.add(local.name);
-							loaderBindingsChanged = true;
-						}
+						if (addLexicalBinding(processDlopenBindings, scope, local)) loaderBindingsChanged = true;
 						processDlopenBindingNodes.add(local);
 					} else {
 						if (propertyKey) processNamespaceBindingNodes.add(propertyKey);
@@ -1114,10 +1121,7 @@ function collectExtensionSpecifierReferences(
 				if (graphProof) graphProof.provable = false;
 				continue;
 			}
-			if (!processDlopenBindings.has(binding.name)) {
-				processDlopenBindings.add(binding.name);
-				loaderBindingsChanged = true;
-			}
+			if (addLexicalBinding(processDlopenBindings, scope, binding)) loaderBindingsChanged = true;
 			processDlopenBindingNodes.add(binding);
 		}
 	}
@@ -1139,6 +1143,88 @@ function collectExtensionSpecifierReferences(
 		}
 	}
 
+	function isKnownObjectConstructor(node: StructuralAstNode | null, scope: BindingScope): boolean {
+		if (isIdentifier(node, "Object")) return !scopeHasBinding(scope, OBJECT_BINDING);
+		return (
+			(node?.type === "MemberExpression" || node?.type === "OptionalMemberExpression") &&
+			staticMemberPropertyName(node) === "Object" &&
+			isKnownGlobalObject(asAstNode(node.object), scope)
+		);
+	}
+
+	function isPropertyDescriptorGetter(node: StructuralAstNode | null, scope: BindingScope): boolean {
+		if (!node) return false;
+		if (hasLexicalBinding(propertyDescriptorGetterBindings, scope, node)) return true;
+		if (node.type === "MemberExpression" || node.type === "OptionalMemberExpression") {
+			return (
+				staticMemberPropertyName(node) === "getOwnPropertyDescriptor" &&
+				isKnownObjectConstructor(asAstNode(node.object), scope)
+			);
+		}
+		if (node.type === "SequenceExpression") {
+			const expressions = nodeArray(node, "expressions");
+			return expressions ? isPropertyDescriptorGetter(asAstNode(expressions.at(-1)), scope) : false;
+		}
+		return isPropertyDescriptorGetter(transparentConstructorValue(node), scope);
+	}
+
+	let propertyDescriptorGetterBindingsChanged = true;
+	while (propertyDescriptorGetterBindingsChanged) {
+		propertyDescriptorGetterBindingsChanged = false;
+		for (const { node, scope, parent } of variableDeclarations) {
+			const initializer = asAstNode(node.init);
+			if (!initializer || !isPropertyDescriptorGetter(initializer, scope)) continue;
+			const binding = asAstNode(node.id);
+			if (binding?.type !== "Identifier" || typeof binding.name !== "string") {
+				if (graphProof) graphProof.provable = false;
+				continue;
+			}
+			propertyDescriptorGetterUseNodes.add(initializer);
+			if (addLexicalBinding(propertyDescriptorGetterBindings, scope, binding)) {
+				propertyDescriptorGetterBindingsChanged = true;
+			}
+			propertyDescriptorGetterBindingNodes.add(binding);
+			if (parent && exportedVariableDeclarations.has(parent) && graphProof) graphProof.provable = false;
+		}
+	}
+
+	function isPropertyDescriptorCall(node: StructuralAstNode | null, scope: BindingScope): boolean {
+		if (node?.type !== "CallExpression" && node?.type !== "OptionalCallExpression") return false;
+		return isPropertyDescriptorGetter(asAstNode(node.callee), scope);
+	}
+
+	if (graphProof) {
+		for (const { node, scope, parent, parentKey } of collectScopedAstNodes(
+			ast,
+			candidate =>
+				candidate.type === "Identifier" ||
+				candidate.type === "MemberExpression" ||
+				candidate.type === "OptionalMemberExpression" ||
+				candidate.type === "SequenceExpression" ||
+				transparentConstructorValue(candidate) !== null,
+			runtimeBindingsOnly,
+		)) {
+			if (!isPropertyDescriptorGetter(node, scope)) continue;
+			if (propertyDescriptorGetterBindingNodes.has(node) || propertyDescriptorGetterUseNodes.has(node)) continue;
+			if (parent && transparentConstructorValue(parent) === node) continue;
+			if (parent?.type === "SequenceExpression") continue;
+			if (
+				(parent?.type === "CallExpression" || parent?.type === "OptionalCallExpression") &&
+				parentKey === "callee" &&
+				isPropertyDescriptorCall(parent, scope)
+			) {
+				continue;
+			}
+			const nonReferenceProperty =
+				(parent?.type === "MemberExpression" && parentKey === "property" && parent.computed !== true) ||
+				(parentKey === "key" && parent?.computed !== true && parent?.shorthand !== true);
+			if (nonReferenceProperty || parent?.type === "BinaryExpression" || parent?.type === "UnaryExpression")
+				continue;
+			if (parent?.type === "ExpressionStatement") continue;
+			graphProof.provable = false;
+		}
+	}
+
 	function maySelectConstructorProperty(property: StructuralAstNode | null): boolean {
 		if (property?.type === "StringLiteral") return property.value === "constructor";
 		switch (property?.type) {
@@ -1155,21 +1241,7 @@ function collectExtensionSpecifierReferences(
 	}
 
 	function isConstructorDescriptorCall(node: StructuralAstNode | null, scope: BindingScope): boolean {
-		if (node?.type !== "CallExpression" && node?.type !== "OptionalCallExpression") return false;
-		const callee = asAstNode(node.callee);
-		if (
-			(callee?.type !== "MemberExpression" && callee?.type !== "OptionalMemberExpression") ||
-			staticMemberPropertyName(callee) !== "getOwnPropertyDescriptor"
-		) {
-			return false;
-		}
-		const object = asAstNode(callee.object);
-		const knownObject =
-			(isIdentifier(object, "Object") && !scopeHasBinding(scope, OBJECT_BINDING)) ||
-			((object?.type === "MemberExpression" || object?.type === "OptionalMemberExpression") &&
-				staticMemberPropertyName(object) === "Object" &&
-				isKnownGlobalObject(asAstNode(object.object), scope));
-		return knownObject && maySelectConstructorProperty(nodeArgument(node, 1));
+		return isPropertyDescriptorCall(node, scope) && maySelectConstructorProperty(nodeArgument(node, 1));
 	}
 
 	function isPotentialConstructorDescriptor(node: StructuralAstNode | null, scope: BindingScope): boolean {
@@ -1330,7 +1402,7 @@ function collectExtensionSpecifierReferences(
 		}
 	}
 	const isKnownProcessDlopenCall = (node: StructuralAstNode | null, scope: BindingScope): boolean =>
-		isProcessDlopenCall(node, processDlopenBindings, object => isKnownProcessObject(object, scope));
+		isProcessDlopenCall(node, scope, processDlopenBindings, object => isKnownProcessObject(object, scope));
 	for (const { node, scope, parent, parentKey } of collectScopedAstNodes(
 		ast,
 		isSpecifierReferenceNode,
@@ -1434,7 +1506,6 @@ function collectExtensionSpecifierReferences(
 			}
 		} else if (node.type === "CallExpression" || node.type === "OptionalCallExpression") {
 			const callee = asAstNode(node.callee);
-			const calleeName = callee?.type === "Identifier" && typeof callee.name === "string" ? callee.name : undefined;
 			if (callee?.type === "Import") {
 				const importSource = nodeArgument(node, 0);
 				if (
@@ -1460,7 +1531,7 @@ function collectExtensionSpecifierReferences(
 						parent?.type === "ExpressionStatement";
 					if (!supportedUse) graphProof.provable = false;
 				}
-			} else if (graphProof && calleeName && localRequireBindings.has(calleeName)) {
+			} else if (graphProof && hasLexicalBinding(localRequireBindings, scope, callee)) {
 				const argument = nodeArgument(node, 0);
 				if (
 					node.type === "CallExpression" &&
@@ -1472,7 +1543,7 @@ function collectExtensionSpecifierReferences(
 				} else {
 					graphProof.provable = false;
 				}
-			} else if (graphProof && calleeName && unprovableRequireBindings.has(calleeName)) {
+			} else if (graphProof && hasLexicalBinding(unprovableRequireBindings, scope, callee)) {
 				graphProof.provable = false;
 			} else if (isCreateRequireInvocation(callee, createRequireBindings, moduleNamespaceBindings, scope)) {
 				const argument = nodeArgument(node, 0);
@@ -1581,7 +1652,7 @@ function collectExtensionSpecifierReferences(
 				graphProof.provable = false;
 				continue;
 			}
-			if (processDlopenBindings.has(node.name)) {
+			if (hasLexicalBinding(processDlopenBindings, scope, node)) {
 				if (processDlopenBindingNodes.has(node)) continue;
 				if (
 					(parent?.type === "CallExpression" || parent?.type === "OptionalCallExpression") &&
@@ -1594,14 +1665,14 @@ function collectExtensionSpecifierReferences(
 				graphProof.provable = false;
 				continue;
 			}
-			if (localRequireBindings.has(node.name)) {
+			if (hasLexicalBinding(localRequireBindings, scope, node)) {
 				if (requireBindingNodes.has(node)) continue;
 				if (parent?.type === "CallExpression" && parentKey === "callee") continue;
 				if (nonReferenceProperty) continue;
 				graphProof.provable = false;
 				continue;
 			}
-			if (createRequireBindings.has(node.name)) {
+			if (hasLexicalBinding(createRequireBindings, scope, node)) {
 				if (createRequireBindingNodes.has(node)) continue;
 				if (parent?.type === "CallExpression" && parentKey === "callee") continue;
 				if (nonReferenceProperty) continue;
