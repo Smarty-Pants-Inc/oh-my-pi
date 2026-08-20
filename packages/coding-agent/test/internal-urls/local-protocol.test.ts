@@ -44,6 +44,7 @@ describe("LocalProtocolHandler", () => {
 			const resource = await router.resolve("local://");
 
 			expect(resource.contentType).toBe("text/markdown");
+			expect(resource.isDirectory).toBe(true);
 			expect(resource.content).toContain("handoff.json");
 		});
 	});
@@ -61,9 +62,11 @@ describe("LocalProtocolHandler", () => {
 			});
 			const router = InternalUrlRouter.instance();
 			const resource = await router.resolve("local://subtasks/trace.txt");
+			const directory = await router.resolve("local://subtasks/");
 
 			expect(resource.content).toBe("trace");
 			expect(resource.contentType).toBe("text/plain");
+			expect(directory.isDirectory).toBe(true);
 		});
 	});
 

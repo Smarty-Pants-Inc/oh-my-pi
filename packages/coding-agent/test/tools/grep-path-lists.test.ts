@@ -528,12 +528,16 @@ describe("tool path arrays", () => {
 			path: "apps/grep.txt, packages/grep.txt",
 		});
 		const text = getText(result);
-		const details = result.details as { notes?: string[] } | undefined;
+		const details = result.details as { notes?: string[]; displayReadTargetLinks?: Array<string | null> } | undefined;
 
 		expect(text).toContain("Note: interpreted as 2 paths: apps/grep.txt, packages/grep.txt");
 		expect(text).toContain("shared-needle apps");
 		expect(text).toContain("shared-needle packages");
 		expect(details?.notes).toEqual(["Note: interpreted as 2 paths: apps/grep.txt, packages/grep.txt"]);
+		expect(details?.displayReadTargetLinks).toEqual([
+			path.join(tempDir, "apps", "grep.txt"),
+			path.join(tempDir, "packages", "grep.txt"),
+		]);
 	});
 
 	it("read keeps readable delimited paths when peers are missing", async () => {
@@ -546,7 +550,7 @@ describe("tool path arrays", () => {
 			path: "missing.txt, packages/grep.txt",
 		});
 		const text = getText(result);
-		const details = result.details as { notes?: string[] } | undefined;
+		const details = result.details as { notes?: string[]; displayReadTargetLinks?: Array<string | null> } | undefined;
 
 		expect(text).toContain("Note: interpreted as 2 paths: missing.txt, packages/grep.txt");
 		expect(text).toContain("shared-needle packages");
@@ -555,6 +559,7 @@ describe("tool path arrays", () => {
 			"Note: interpreted as 2 paths: missing.txt, packages/grep.txt",
 			"Could not read missing.txt: Path 'missing.txt' not found",
 		]);
+		expect(details?.displayReadTargetLinks).toEqual([null, path.join(tempDir, "packages", "grep.txt")]);
 	});
 
 	it("ast_grep accepts quoted path and glob filters", async () => {

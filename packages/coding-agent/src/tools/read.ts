@@ -565,6 +565,8 @@ export interface ReadToolDetails {
 	conflictCount?: number;
 	/** Paths recovered from a delimited read argument; used only by the TUI to render one call as multiple read rows. */
 	displayReadTargets?: string[];
+	/** Confirmed filesystem link targets aligned with `displayReadTargets`; null means unlinked. */
+	displayReadTargetLinks?: Array<string | null>;
 }
 type ReadParams = ReadToolInput;
 
@@ -731,6 +733,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		const notes = [notice];
 		const content: Array<TextContent | ImageContent> = [];
 		const displayReadTargets: string[] = [];
+		const displayReadTargetLinks: Array<string | null> = [];
 		let pendingText = notice;
 		const flushText = () => {
 			if (pendingText.length === 0) return;
@@ -745,6 +748,12 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			try {
 				const result = await this.execute("read-delimited-part", { path: part }, signal);
 				displayReadTargets.push(result.details?.suffixResolution?.to ?? part);
+				const source = result.details?.meta?.source;
+				const linkPath =
+					!result.isError && result.details?.isDirectory !== true
+						? (result.details?.resolvedPath ?? (source?.type === "path" ? source.value : undefined))
+						: undefined;
+				displayReadTargetLinks.push(linkPath ?? null);
 				for (const block of result.content) {
 					if (block.type === "text") {
 						appendText(block.text);
@@ -759,12 +768,13 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				const errorNote = `Could not read ${part}: ${message}`;
 				notes.push(errorNote);
 				displayReadTargets.push(part);
+				displayReadTargetLinks.push(null);
 				appendText(`[${errorNote}]`);
 			}
 		}
 		flushText();
 
-		return toolResult<ReadToolDetails>({ notes, displayReadTargets }).content(content).done();
+		return toolResult<ReadToolDetails>({ notes, displayReadTargets, displayReadTargetLinks }).content(content).done();
 	}
 
 	async #readPdfPageScreenshot(options: {
@@ -2194,7 +2204,11 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				},
 			},
 		});
-		const details: ReadToolDetails = { resolvedPath: resource.sourcePath, contentType: resource.contentType };
+		const details: ReadToolDetails = {
+			resolvedPath: resource.sourcePath,
+			contentType: resource.contentType,
+			isDirectory: resource.isDirectory,
+		};
 
 		// If extraction was used, return directly (no pagination)
 		if (hasExtraction) {

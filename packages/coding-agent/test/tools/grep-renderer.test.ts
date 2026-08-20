@@ -120,7 +120,7 @@ describe("grepToolRenderer", () => {
 		expect(bodyLines.some(line => line.includes("thirdFlag"))).toBe(false);
 	});
 
-	it("links grouped file headers and code-frame lines to filesystem targets", async () => {
+	it("links grouped files but not directory scopes or headers", async () => {
 		settings.override("tui.hyperlinks", "always");
 		const theme = await getThemeByName("dark");
 		expect(theme).toBeDefined();
@@ -150,9 +150,11 @@ describe("grepToolRenderer", () => {
 
 		expect(uris).toContain(fileUri);
 		expect(uris).toContain(lineUri.href);
+		expect(uris).not.toContain(url.pathToFileURL(projectRoot).href);
+		expect(uris).not.toContain(url.pathToFileURL(path.join(projectRoot, "src")).href);
 	});
 
-	it("links single-file code-frame lines to the searched file", async () => {
+	it("links confirmed single-file scopes and code-frame lines", async () => {
 		settings.override("tui.hyperlinks", "always");
 		const theme = await getThemeByName("dark");
 		expect(theme).toBeDefined();
@@ -165,6 +167,7 @@ describe("grepToolRenderer", () => {
 				matchCount: 1,
 				fileCount: 1,
 				searchPath: filePath,
+				searchPathIsFile: true,
 				scopePath: "file.ts",
 				displayContent: "*7│needle();",
 			},
@@ -175,9 +178,12 @@ describe("grepToolRenderer", () => {
 			.render(240)
 			.join("\n");
 
-		const lineUri = new URL(url.pathToFileURL(path.resolve(filePath)).href);
+		const fileUri = url.pathToFileURL(path.resolve(filePath)).href;
+		const lineUri = new URL(fileUri);
 		lineUri.searchParams.set("line", "7");
-		expect(extractLinkUris(rendered)).toContain(lineUri.href);
+		const uris = extractLinkUris(rendered);
+		expect(uris).toContain(fileUri);
+		expect(uris).toContain(lineUri.href);
 	});
 
 	it("bounds the expanded single-file view instead of dumping every match", async () => {

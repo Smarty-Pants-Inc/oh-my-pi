@@ -807,6 +807,7 @@ export class VaultProtocolHandler implements ProtocolHandler {
 			contentType: "application/json",
 			size: Buffer.byteLength(content, "utf-8"),
 			sourcePath: root,
+			isDirectory: true,
 			immutable: true,
 		};
 	}
@@ -851,6 +852,7 @@ export class VaultProtocolHandler implements ProtocolHandler {
 			contentType: "text/markdown",
 			size: Buffer.byteLength(content, "utf-8"),
 			sourcePath: realTargetPath,
+			isDirectory: true,
 			immutable: true,
 		};
 	}

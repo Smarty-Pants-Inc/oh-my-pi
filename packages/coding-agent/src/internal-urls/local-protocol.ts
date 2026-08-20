@@ -206,6 +206,7 @@ async function buildListing(url: InternalUrl, localRoot: string): Promise<Intern
 		contentType: "text/markdown",
 		size: Buffer.byteLength(content, "utf-8"),
 		sourcePath: localRoot,
+		isDirectory: true,
 	};
 }
 
