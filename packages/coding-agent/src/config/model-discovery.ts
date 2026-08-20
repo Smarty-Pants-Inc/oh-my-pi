@@ -11,6 +11,7 @@ import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import {
 	getBundledModelReferenceIndex,
 	inheritReferenceThinking,
+	isQwen38PlusTemplateEffortModelId,
 	isQwenModelId,
 	resolveModelReference,
 	stripBracketedModelIdAffixes,
@@ -788,6 +789,7 @@ export async function discoverOpenAIModelsList(
 				return (await res.json()) as {
 					data?: Array<{
 						id?: string;
+						owned_by?: unknown;
 						max_model_len?: unknown;
 						context_length?: unknown;
 						input?: unknown;
@@ -822,6 +824,11 @@ export async function discoverOpenAIModelsList(
 		// headers/baseUrl/cost stay local.
 		const reference = resolveModelReference(id, references) as ModelSpec<Api> | undefined;
 		const referenceCompat = reference?.compat as OpenAICompat | undefined;
+		const isVllmBackend =
+			providerConfig.api === "openai-completions" &&
+			providerConfig.discovery.type !== "lm-studio" &&
+			typeof item.owned_by === "string" &&
+			item.owned_by.trim().toLowerCase() === "vllm";
 		const contextWindow =
 			toPositiveNumberOrUndefined(item.max_model_len) ??
 			toPositiveNumberOrUndefined(item.context_length) ??
@@ -861,6 +868,8 @@ export async function discoverOpenAIModelsList(
 					...(referenceCompat?.omitReasoningEffort !== undefined
 						? { omitReasoningEffort: referenceCompat.omitReasoningEffort }
 						: {}),
+					...(isVllmBackend && isQwenModelId(id) ? { thinkingFormat: "qwen-chat-template" as const } : {}),
+					...(isVllmBackend && isQwen38PlusTemplateEffortModelId(id) ? { qwenTemplateReasoningEffort: true } : {}),
 				},
 			} as ModelSpec<Api>),
 		);

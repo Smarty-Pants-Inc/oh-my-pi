@@ -1,11 +1,13 @@
 import type { ModelManagerOptions } from "../model-manager";
-import type { Api, FetchImpl } from "../types";
+import type { Api, FetchImpl, OpenAICompat } from "../types";
 
 /** Config passed to a provider's runtime model-manager factory. */
 export type ModelManagerConfig = {
 	apiKey?: string;
 	baseUrl?: string;
 	fetch?: FetchImpl;
+	/** Sparse OpenAI-compatible overrides that provider discovery must honor. */
+	compat?: OpenAICompat;
 	/** The supplied fetch already applies provider-specific authentication. */
 	authenticated?: boolean;
 };

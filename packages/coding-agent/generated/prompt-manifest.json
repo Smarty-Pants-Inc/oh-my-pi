@@ -5871,7 +5871,7 @@
     },
     {
       "path": "packages/catalog/src/compat/openai.ts",
-      "sha256": "1981d398f682d639a7d24b58fcdfeb9f8c1912a050cdb0c043a052d9892eaf3f"
+      "sha256": "728640981d693e15f2ebfaef7f7f36d0bba4d74137e94710e8401f27d261aadf"
     },
     {
       "path": "packages/catalog/src/discovery/antigravity.ts",
@@ -6075,7 +6075,7 @@
     },
     {
       "path": "packages/catalog/src/provider-models/descriptor-types.ts",
-      "sha256": "da100858a0a80f82203efe2902d027bc24e84110bb98169efadb6d684d0c453c"
+      "sha256": "34b79c14693fc35dd08d0ec535057c543526baa4530e32e4cdfce5970ee369c3"
     },
     {
       "path": "packages/catalog/src/provider-models/descriptors.ts",
@@ -6095,7 +6095,7 @@
     },
     {
       "path": "packages/catalog/src/provider-models/openai-compat.ts",
-      "sha256": "577118e4cc4ef8d32068e5740bb3048e54b5944f39d218558ef0b69553901347"
+      "sha256": "ff9ff04dbabc6feda631aa5a545700fb2536cb3c296e7d87bb55b6fcf0fd1310"
     },
     {
       "path": "packages/catalog/src/provider-models/special.ts",
@@ -6751,7 +6751,7 @@
     },
     {
       "path": "packages/coding-agent/src/config/model-discovery.ts",
-      "sha256": "db424755000a8ca9e5f7f0dd91f353ab309e173bbd24a8800c20b1edfa6c3f31"
+      "sha256": "fe69deef735750efa5a3b256f606e3c8017106caf3fcc56fc97ce7371b3a4e1d"
     },
     {
       "path": "packages/coding-agent/src/config/model-patch.ts",
@@ -6763,7 +6763,7 @@
     },
     {
       "path": "packages/coding-agent/src/config/model-registry.ts",
-      "sha256": "224f0a61ab6c86b6abf22035f059ae6fd69bf7e0999a9a51936c2bcf423d0728"
+      "sha256": "c5dc88e3eadeea7c63f66b1b0d6f1880245ea33ff86bb1aa328feb2208766b46"
     },
     {
       "path": "packages/coding-agent/src/config/model-resolver.ts",
@@ -6775,7 +6775,7 @@
     },
     {
       "path": "packages/coding-agent/src/config/models-config-schema-bundle.ts",
-      "sha256": "6fa52e2b6c112c58703a28d77f9719e21087529caa6b39fbfc336ebb0d0aff1d"
+      "sha256": "523f517e330ee0cab709d11ef62fc2741a8da9d36932895a49b53c13f8a04356"
     },
     {
       "path": "packages/coding-agent/src/config/models-config.ts",
@@ -10683,5 +10683,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "85b11140b2c34c7096de78776c96a36cb16b04e58181d532d5d88b15f0f6f50c"
+  "rootSha256": "c0ea070f7f2222ff37978a725a9287333233d4081a3f0d8bd263e5b75a9113bf"
 }

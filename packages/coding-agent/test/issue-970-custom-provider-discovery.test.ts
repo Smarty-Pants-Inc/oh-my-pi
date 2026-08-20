@@ -3,6 +3,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { stripVTControlCharacters } from "node:util";
+import { streamOpenAICompletions } from "@oh-my-pi/pi-ai/providers/openai-completions";
+import type { Context, Model } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
@@ -192,6 +194,73 @@ describe("issue #970 custom provider discovery", () => {
 		expect(qwen38?.thinking).toBeUndefined();
 	});
 
+	test("uses vLLM ownership metadata for arbitrary provider request shaping", async () => {
+		fs.writeFileSync(
+			modelsPath,
+			[
+				"providers:",
+				"  gpu-fast:",
+				"    baseUrl: https://gpu.example.test/v1",
+				"    api: openai-completions",
+				"    auth: none",
+				"    discovery:",
+				"      type: openai-models-list",
+			].join("\n"),
+		);
+
+		let requestBody: Record<string, unknown> | undefined;
+		const fetchMock: (input: string | URL | Request, init?: RequestInit) => Promise<Response> = async (
+			input,
+			init,
+		) => {
+			const url = String(input);
+			if (url === "https://gpu.example.test/v1/models") {
+				return new Response(
+					JSON.stringify({
+						data: [{ id: "Qwen3.8-27B-UD-Q6_K_XL", owned_by: "vllm", max_model_len: 262_144 }],
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			}
+			if (url === "https://gpu.example.test/v1/chat/completions") {
+				requestBody = JSON.parse(typeof init?.body === "string" ? init.body : "{}") as Record<string, unknown>;
+				return new Response(
+					`data: ${JSON.stringify({
+						id: "chatcmpl-test",
+						object: "chat.completion.chunk",
+						created: 0,
+						choices: [{ index: 0, delta: { content: "ok" }, finish_reason: null }],
+					})}\n\ndata: [DONE]\n\n`,
+					{ status: 200, headers: { "Content-Type": "text/event-stream" } },
+				);
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+
+		const registry = new ModelRegistryImpl(authStorage, modelsPath, { fetch: fetchMock });
+		await registry.refreshProvider("gpu-fast");
+
+		const model = registry.find("gpu-fast", "Qwen3.8-27B-UD-Q6_K_XL");
+		expect(model?.reasoning).toBe(true);
+		expect(model?.compat).toMatchObject({
+			thinkingFormat: "qwen-chat-template",
+			reasoningDisableMode: "qwen-template-false",
+			qwenTemplateReasoningEffort: true,
+		});
+		if (!model) throw new Error("Expected discovered gpu-fast Qwen model");
+
+		const context: Context = { messages: [{ role: "user", content: "hi", timestamp: 0 }] };
+		await streamOpenAICompletions(model as Model<"openai-completions">, context, {
+			apiKey: "test-key",
+			fetch: fetchMock,
+			reasoning: Effort.Low,
+		}).result();
+
+		expect(requestBody?.enable_thinking).toBeUndefined();
+		expect(requestBody?.reasoning_effort).toBeUndefined();
+		expect(requestBody?.chat_template_kwargs).toEqual({ enable_thinking: true, reasoning_effort: "low" });
+	});
+
 	test("upgrades warm local Qwen cache rows when compat proves template effort support", () => {
 		const cached = buildModel({
 			id: "Qwen3.8-27B-UD-Q6_K_XL",
@@ -295,7 +364,7 @@ describe("issue #970 custom provider discovery", () => {
 		expect(registry.getProviderDiscoveryState("vllm-fast")?.status).toBe("ok");
 		expect(registry.getProviderDiscoveryState("vllm-long")?.status).toBe("ok");
 	});
-	test("ignores old configured openai-models-list cache namespaces after adding vllm context parsing", async () => {
+	test("ignores pre-backend-identity openai-models-list cache namespaces", async () => {
 		fs.writeFileSync(
 			modelsPath,
 			[
@@ -309,7 +378,7 @@ describe("issue #970 custom provider discovery", () => {
 			].join("\n"),
 		);
 		writeModelCache(
-			"vllm-fast",
+			"vllm-fast:openai-models-list-context-v3",
 			Date.now(),
 			[
 				buildModel({
@@ -354,6 +423,69 @@ describe("issue #970 custom provider discovery", () => {
 		expect(calls).toEqual(["http://192.168.5.3:8085/v1/models"]);
 		expect(registry.find("vllm-fast", "Fresh")?.contextWindow).toBe(262_144);
 		expect(registry.find("vllm-fast", "Stale")).toBeUndefined();
+	});
+
+	test("honors explicit Qwen effort opt-out in built-in vLLM and LM Studio discovery", async () => {
+		fs.writeFileSync(
+			modelsPath,
+			[
+				"providers:",
+				"  vllm:",
+				"    baseUrl: http://127.0.0.1:8001/v1",
+				"    auth: none",
+				"    compat:",
+				"      qwenTemplateReasoningEffort: false",
+				"  lm-studio:",
+				"    baseUrl: http://127.0.0.1:1235/v1",
+				"    auth: none",
+				"    compat:",
+				"      qwenTemplateReasoningEffort: false",
+			].join("\n"),
+		);
+
+		const modelId = "Qwen3.8-27B-UD-Q6_K_XL";
+		const fetchMock: (input: string | URL | Request) => Promise<Response> = async input => {
+			const url = String(input);
+			if (url === "http://127.0.0.1:8001/v1/models") {
+				return new Response(JSON.stringify({ data: [{ id: modelId, owned_by: "vllm" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			if (url === "http://127.0.0.1:1235/v1/models") {
+				return new Response(JSON.stringify({ data: [{ id: modelId, owned_by: "lm-studio" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			if (url === "http://127.0.0.1:1235/api/v0/models") {
+				return new Response(JSON.stringify({ data: [{ id: modelId, type: "llm" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+
+		const registry = new ModelRegistryImpl(authStorage, modelsPath, { fetch: fetchMock });
+		await registry.refreshProvider("vllm");
+		await registry.refreshProvider("lm-studio");
+
+		const vllm = registry.find("vllm", modelId);
+		expect(vllm?.compat).toMatchObject({
+			thinkingFormat: "qwen-chat-template",
+			qwenTemplateReasoningEffort: false,
+		});
+		expect(vllm?.reasoning).toBe(false);
+		expect(vllm?.thinking).toBeUndefined();
+
+		const lmStudio = registry.find("lm-studio", modelId);
+		expect(lmStudio?.compat).toMatchObject({
+			thinkingFormat: "qwen",
+			qwenTemplateReasoningEffort: false,
+		});
+		expect(lmStudio?.reasoning).toBe(false);
+		expect(lmStudio?.thinking).toBeUndefined();
 	});
 
 	test("uses default vllm baseUrl override for built-in discovery", async () => {

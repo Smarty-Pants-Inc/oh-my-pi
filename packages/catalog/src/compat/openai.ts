@@ -297,7 +297,7 @@ function hasLocalLoopbackBaseUrl(baseUrl: string | undefined): boolean {
 export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): ResolvedOpenAICompat {
 	const provider = spec.provider;
 	const baseUrl = spec.baseUrl;
-	const isVllmProvider = provider === "vllm" || provider.startsWith("vllm-");
+	const isVllmProvider = provider === "vllm";
 	const hostModel = { provider, baseUrl };
 
 	const isCerebras = modelMatchesHost(hostModel, "cerebras");

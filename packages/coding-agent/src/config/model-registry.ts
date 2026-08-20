@@ -31,6 +31,7 @@ import {
 	resolveModelCacheProviderId,
 	resolveOllamaModelCacheProviderId,
 } from "@oh-my-pi/pi-catalog/provider-models";
+import type { OpenAICompat } from "@oh-my-pi/pi-catalog/types";
 import { collapseBuiltModelVariants } from "@oh-my-pi/pi-catalog/variant-collapse";
 import { getAgentDir, isBunTestRuntime, logger, wrapFetchForExtraCa } from "@oh-my-pi/pi-utils";
 import { resolveProviderModelReference } from "../config/model-resolver";
@@ -1077,10 +1078,10 @@ export class ModelRegistry {
 			return resolveOllamaModelCacheProviderId(providerConfig.provider, providerConfig.baseUrl);
 		}
 		if (providerConfig.discovery.type === "openai-models-list") {
-			// context-v3 invalidates rows cached before server-advertised input
-			// modalities were parsed from `/v1/models`; warm v2 rows pinned
-			// vision-capable ids at `input: ["text"]` until a forced refresh.
-			return `${providerConfig.provider}:openai-models-list-context-v3`;
+			// context-v4 invalidates rows cached before `/v1/models` backend
+			// ownership was projected into Qwen dialect compat. Without the bump,
+			// arbitrary provider ids backed by vLLM retain the generic Qwen wire shape.
+			return `${providerConfig.provider}:openai-models-list-context-v4`;
 		}
 		if (providerConfig.discovery.type === "litellm") {
 			// rich-v2 invalidates rows cached before reseller usage-suffix stripping
@@ -1376,11 +1377,19 @@ export class ModelRegistry {
 				(this.#runtimeProviderOverrides.has(descriptor.providerId) ||
 					this.#providerOverrides.has(descriptor.providerId) ||
 					this.#keylessProviders.has(descriptor.providerId));
+			const managerCompat =
+				descriptor.providerId === "vllm" || descriptor.providerId === "lm-studio"
+					? (mergeCompat(
+							this.#providerOverrides.get(descriptor.providerId)?.compat,
+							this.#runtimeProviderOverrides.get(descriptor.providerId)?.compat,
+						) as OpenAICompat | undefined)
+					: undefined;
 			if (isAuthenticated(apiKey) || descriptor.allowUnauthenticated || hasExplicitVllmConfig) {
 				const discoveryConfig = {
 					apiKey: isDiscoveryBearerApiKey(apiKey) ? apiKey : undefined,
 					baseUrl: this.#descriptorBaseUrl(descriptor.providerId),
 					fetch: this.#fetch,
+					...(managerCompat ? { compat: managerCompat } : {}),
 				};
 				const preparedConfig =
 					getProviderDefinition(descriptor.providerId)?.prepareModelDiscovery?.(discoveryConfig) ??
