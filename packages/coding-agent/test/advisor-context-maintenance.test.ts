@@ -11,6 +11,7 @@ import { estimateToolSchemaTokens } from "@oh-my-pi/pi-coding-agent/modes/utils/
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { createSettingsAwareStreamFn } from "@oh-my-pi/pi-coding-agent/session/settings-stream-fn";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
@@ -305,9 +306,9 @@ describe("AgentSession advisor context maintenance", () => {
 		// `compact(...)` request that bypasses the advisor `Agent`, so the metadata
 		// resolver installed on the agent never runs for it. The direct call must
 		// still emit the advisor's `metadata.user_id` session identity.
-		// The advisor model is the first compaction candidate; registering the mock
-		// API lets the compaction one-shot's `completeSimple` route to it so the
-		// summarization request actually reaches the mock (and its recorded calls).
+		// The advisor model uses the same settings-aware stream transport as its
+		// ordinary turns, so the direct compaction one-shot must preserve session
+		// request policy as well as reaching the mock transport.
 		registerMockApi();
 		const compactionStarted = Promise.withResolvers<void>();
 		const releaseCompaction = Promise.withResolvers<void>();
@@ -348,6 +349,7 @@ describe("AgentSession advisor context maintenance", () => {
 			"compaction.enabled": true,
 			"compaction.strategy": "context-full",
 			"contextPromotion.enabled": false,
+			"providers.cacheRetention": "long",
 		});
 		const agent = new Agent({
 			getApiKey: () => "test-key",
@@ -360,7 +362,7 @@ describe("AgentSession advisor context maintenance", () => {
 			settings,
 			modelRegistry,
 			advisorTools: [],
-			advisorStreamFn: advisorMock.stream,
+			advisorStreamFn: createSettingsAwareStreamFn(settings, advisorMock.stream),
 		});
 		settings.setModelRole("advisor", "anthropic/claude-sonnet-4-5");
 		expect(session.setAdvisorEnabled(true)).toBe(true);
@@ -405,6 +407,7 @@ describe("AgentSession advisor context maintenance", () => {
 		);
 		expect(compactionCalls.length).toBeGreaterThan(0);
 		expect(compactionCalls.every(call => call.options?.signal instanceof AbortSignal)).toBe(true);
+		expect(compactionCalls.every(call => call.options?.cacheRetention === "long")).toBe(true);
 
 		// Every advisor request — the compaction one-shot and the advisor turn —
 		// carries the advisor's own provider session id via metadata.user_id.

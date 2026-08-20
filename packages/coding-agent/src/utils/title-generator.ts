@@ -14,6 +14,7 @@ import { resolveRoleSelection } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import titleMarkerInstruction from "../prompts/system/title-marker-instruction.md" with { type: "text" };
 import titleSystemPrompt from "../prompts/system/title-system.md" with { type: "text" };
+import { resolveSettingsCacheRetention } from "../session/settings-stream-fn";
 import { formatTitleUserMessage } from "../tiny/message-preproc";
 import { isTinyTitleLocalModelKey, ONLINE_TINY_TITLE_MODEL_KEY } from "../tiny/models";
 import { isLowSignalTitleInput, normalizeGeneratedTitle } from "../tiny/text";
@@ -273,6 +274,7 @@ export async function generateTitleOnline(
 						temperature: 0,
 						metadata,
 						signal,
+						cacheRetention: resolveSettingsCacheRetention(settings),
 					},
 				),
 			{ signal },

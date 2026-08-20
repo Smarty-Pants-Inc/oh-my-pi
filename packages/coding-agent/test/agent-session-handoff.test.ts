@@ -21,6 +21,7 @@ import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/
 import type { AsyncResultEntry } from "@oh-my-pi/pi-coding-agent/session/async-job-delivery";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { createSettingsAwareStreamFn } from "@oh-my-pi/pi-coding-agent/session/settings-stream-fn";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir, withTimeout } from "@oh-my-pi/pi-utils";
 import * as snapcompact from "@oh-my-pi/snapcompact";
@@ -1813,6 +1814,13 @@ describe("AgentSession handoff", () => {
 			details: {},
 			preserveData: { resultState: "keep-result" },
 		});
+		const settings = Settings.isolated({
+			"compaction.enabled": true,
+			"compaction.autoContinue": false,
+			"compaction.strategy": "context-full",
+			"providers.cacheRetention": "none",
+		});
+		const sideMock = createMockModel({ provider: "anthropic", responses: [{ content: ["summary"] }] });
 		const promptCacheKey = "inherited-parent-cache";
 		const localAgent = new Agent({
 			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
@@ -1821,19 +1829,21 @@ describe("AgentSession handoff", () => {
 		const localSession = new AgentSession({
 			agent: localAgent,
 			sessionManager: localSessionManager,
-			settings: Settings.isolated({
-				"compaction.enabled": true,
-				"compaction.autoContinue": false,
-				"compaction.strategy": "context-full",
-			}),
+			settings,
 			modelRegistry,
 			extensionRunner,
+			sideStreamFn: createSettingsAwareStreamFn(settings, sideMock.stream),
 		});
 
 		try {
 			await localSession.runIdleCompaction();
 			expect(compactSpy).toHaveBeenCalledTimes(1);
 			expect(compactSpy.mock.calls[0]?.[5]?.promptCacheKey).toBe(promptCacheKey);
+			expect(compactSpy.mock.calls[0]?.[5]?.cacheRetention).toBe("none");
+			const completeImpl = compactSpy.mock.calls[0]?.[5]?.completeImpl;
+			if (!completeImpl) throw new Error("Expected automatic compaction to use the side stream transport");
+			await completeImpl(sideMock, { messages: [] }, {});
+			expect(sideMock.calls[0]?.options?.cacheRetention).toBe("none");
 			const compactionEntry = localSessionManager.getEntries().find(entry => entry.type === "compaction");
 			if (compactionEntry?.type !== "compaction") throw new Error("Expected persisted compaction entry");
 			expect(compactionEntry.preserveData).toEqual({

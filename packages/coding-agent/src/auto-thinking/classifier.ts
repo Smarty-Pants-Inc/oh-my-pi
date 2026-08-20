@@ -23,6 +23,7 @@ import { resolveRoleSelection } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import difficultySystemPrompt from "../prompts/system/auto-thinking-difficulty.md" with { type: "text" };
 import difficultyLocalPrompt from "../prompts/system/auto-thinking-difficulty-local.md" with { type: "text" };
+import { resolveSettingsCacheRetention } from "../session/settings-stream-fn";
 import { clampAutoThinkingEffort } from "../thinking";
 import { preprocessTinyMessage } from "../tiny/message-preproc";
 import {
@@ -139,6 +140,7 @@ async function classifyOnline(input: string, deps: ClassifyDifficultyDeps, ceili
 					disableReasoning: true,
 					metadata,
 					signal: deps.signal,
+					cacheRetention: resolveSettingsCacheRetention(deps.settings),
 				},
 			),
 		{ signal: deps.signal },

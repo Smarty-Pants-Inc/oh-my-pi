@@ -185,6 +185,29 @@ describe("auto thinking classifier helpers", () => {
 		expect(options?.maxTokens).toBeGreaterThan(1024);
 	});
 
+	it("disables prompt caching for the online classifier when cache retention is none", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-6");
+		if (!model) throw new Error("Expected bundled Claude Sonnet 4.6 model");
+		const settings = Settings.isolated({
+			"providers.autoThinkingModel": "online",
+			"providers.cacheRetention": "none",
+			modelRoles: { tiny: `${model.provider}/${model.id}` },
+		});
+		const registry = {
+			getAvailable: () => [model],
+			getApiKey: async () => "test-key",
+			resolver: () => async () => "test-key",
+		} as never;
+		const completeSimpleMock = vi.spyOn(ai, "completeSimple").mockResolvedValue({
+			stopReason: "stop",
+			content: [{ type: "text", text: "high" }],
+		} as never);
+
+		await classifyDifficulty("add validation around the retry path", { settings, registry, model });
+
+		expect(completeSimpleMock.mock.calls[0]?.[2]?.cacheRetention).toBe("none");
+	});
+
 	function createOnlineFixture(targetModel: Model, answer: string, maxEffort: "xhigh" | "max" = "xhigh") {
 		const classifierModel = getBundledModel("anthropic", "claude-sonnet-4-6");
 		if (!classifierModel) throw new Error("Expected bundled Claude Sonnet 4.6 model");

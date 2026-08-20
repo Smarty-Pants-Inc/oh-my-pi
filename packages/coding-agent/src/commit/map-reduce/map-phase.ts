@@ -1,5 +1,5 @@
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
-import type { Api, ApiKey, AssistantMessage, Message, Model } from "@oh-my-pi/pi-ai";
+import type { Api, ApiKey, AssistantMessage, Message, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
 import { completeSimple, retryTransientCompletion } from "@oh-my-pi/pi-ai";
 import { prompt } from "@oh-my-pi/pi-utils";
 import fileObserverSystemPrompt from "../../commit/prompts/file-observer-system.md" with { type: "text" };
@@ -20,6 +20,7 @@ export interface MapPhaseInput {
 	model: Model<Api>;
 	apiKey: ApiKey;
 	thinkingLevel?: ThinkingLevel;
+	cacheRetention?: SimpleStreamOptions["cacheRetention"];
 	files: FileDiff[];
 	config?: {
 		maxFileTokens?: number;
@@ -34,6 +35,7 @@ export async function runMapPhase({
 	model,
 	apiKey,
 	thinkingLevel,
+	cacheRetention,
 	files,
 	config,
 }: MapPhaseInput): Promise<FileObservation[]> {
@@ -72,6 +74,7 @@ export async function runMapPhase({
 					apiKey,
 					maxTokens: 400,
 					reasoning: toReasoningEffort(thinkingLevel),
+					cacheRetention,
 					signal: AbortSignal.timeout(timeoutMs),
 				}),
 			{ maxAttempts: maxRetries, baseDelayMs: retryBackoffMs },
