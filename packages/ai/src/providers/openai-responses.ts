@@ -1132,9 +1132,9 @@ function applyOpenAIResponsesPromptCachePolicy(
 		return;
 	}
 	const promptCache = options?.promptCache;
-	if (!promptCache) return;
+	if (!promptCache && cacheRetention !== "long") return;
 	if (!model.compat.supportsPromptCacheBreakpoints) {
-		if (promptCache.mode === "explicit") {
+		if (promptCache?.mode === "explicit") {
 			throw new AIError.ConfigurationError(
 				`OpenAI explicit prompt caching is unsupported for ${model.provider}/${model.id}; enable compat.supportsPromptCacheBreakpoints only for a compatible endpoint.`,
 			);
@@ -1142,11 +1142,12 @@ function applyOpenAIResponsesPromptCachePolicy(
 		return;
 	}
 
+	const mode = promptCache?.mode ?? "implicit";
 	params.prompt_cache_options = {
-		mode: promptCache.mode,
-		ttl: promptCache.ttl ?? model.compat.promptCacheBreakpointTtl,
+		mode,
+		ttl: promptCache?.ttl ?? model.compat.promptCacheBreakpointTtl,
 	};
-	if (promptCache.mode === "explicit" && promptCache.breakpoint !== "none")
+	if (mode === "explicit" && promptCache?.breakpoint !== "none")
 		markLatestStableResponsesCacheBreakpoint(params.input, statefulCacheBaseline);
 }
 
