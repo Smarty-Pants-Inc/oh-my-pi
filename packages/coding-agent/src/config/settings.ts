@@ -437,6 +437,7 @@ export class Settings {
 		return promise.then(
 			instance => {
 				globalInstance = instance;
+				applyHyperlinkSetting(instance.get("tui.hyperlinks"));
 				clearBoundSettingsMethods();
 				globalInstancePromise = Promise.resolve(instance);
 				return instance;
@@ -590,7 +591,7 @@ export class Settings {
 
 	#fireEffectiveSettingChanged(path: SettingPath, value: unknown, prev: unknown): void {
 		if (Object.is(value, prev)) return;
-		if (path === "tui.hyperlinks") {
+		if (path === "tui.hyperlinks" && this === globalInstance) {
 			applyHyperlinkSetting(value as SettingValue<"tui.hyperlinks">);
 		}
 		if (path === "statusLine.sessionAccent") {
@@ -2419,7 +2420,7 @@ export class Settings {
 	}
 
 	#fireAllHooks(): void {
-		applyHyperlinkSetting(this.get("tui.hyperlinks"));
+		if (this === globalInstance) applyHyperlinkSetting(this.get("tui.hyperlinks"));
 		for (const key of Object.keys(SETTING_HOOKS) as SettingPath[]) {
 			const hook = SETTING_HOOKS[key];
 			if (hook) {
