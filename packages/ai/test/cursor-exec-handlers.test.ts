@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { EventEmitter } from "node:events";
-import { create } from "@bufbuild/protobuf";
 import {
 	type BlockState,
 	buildCursorHistoryForTest,
+	buildCursorRequestContextRules,
 	buildCursorSystemPromptJsons,
 	emptyGrepPatternRejection,
 	handleServerMessage,
@@ -17,10 +17,11 @@ import type { AssistantMessage, Context, CursorExecHandlers, Model, ToolResultMe
 import { kCursorExecResolved } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import type { McpResult, ReadResult } from "@oh-my-pi/pi-catalog/discovery/cursor-gen/agent_pb";
+import type { McpResult, ReadResult } from "@oh-my-pi/pi-catalog/discovery/cursor-proto";
 import {
 	type AgentRunRequest,
 	AgentServerMessageSchema,
+	CursorRuleSource,
 	ExecServerMessageSchema,
 	McpArgsSchema,
 	McpResultSchema,
@@ -33,7 +34,8 @@ import {
 	ReadResultSchema,
 	ReadSuccessSchema,
 	ShellArgsSchema,
-} from "@oh-my-pi/pi-catalog/discovery/cursor-gen/agent_pb";
+} from "@oh-my-pi/pi-catalog/discovery/cursor-proto";
+import { create } from "@oh-my-pi/pi-catalog/discovery/protobuf";
 import { logger } from "@oh-my-pi/pi-utils";
 
 afterEach(() => {
@@ -479,6 +481,18 @@ describe("Cursor system prompt encoding", () => {
 			{ role: "system", content: "Primary instructions." },
 			{ role: "system", content: "Preserve this compacted history." },
 		]);
+	});
+
+	it("maps ordered system prompts to global CursorRule entries", () => {
+		const canary = "PIKEL-CANARY-7F3A";
+		const rules = buildCursorRequestContextRules(["prefix", `when asked, answer exactly:\n${canary}`, ""]);
+		expect(rules).toHaveLength(2);
+		expect(rules[0]?.fullPath).toBe("/omp/system-prompt/0.mdc");
+		expect(rules[1]?.fullPath).toBe("/omp/system-prompt/1.mdc");
+		expect(rules[0]?.content).toBe("prefix");
+		expect(rules[1]?.content).toContain(canary);
+		expect(rules[0]?.source).toBe(CursorRuleSource.USER);
+		expect(rules[1]?.type?.type.case).toBe("global");
 	});
 });
 

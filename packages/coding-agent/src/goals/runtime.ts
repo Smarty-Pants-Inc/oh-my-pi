@@ -130,10 +130,6 @@ function validateTokenBudget(tokenBudget: number | undefined): void {
 	}
 }
 
-function isAccountingStatus(goal: Goal): boolean {
-	return goal.status === "active" || goal.status === "budget_limited";
-}
-
 export function isFinalStatus(goal: Goal): boolean {
 	return goal.status === "complete" || goal.status === "dropped" || goal.status === "superseded";
 }

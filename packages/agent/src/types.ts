@@ -214,7 +214,7 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * @example
 	 * ```typescript
 	 * transformContext: async (messages) => {
-	 *   if (estimateTokens(messages) > MAX_TOKENS) {
+	 *   if (agent.tokenizer.countMessages(messages) > MAX_TOKENS) {
 	 *     return pruneOldMessages(messages);
 	 *   }
 	 *   return messages;
