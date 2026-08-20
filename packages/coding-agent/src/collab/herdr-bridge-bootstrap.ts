@@ -36,7 +36,10 @@ export interface HerdrBridgeBootstrap {
 }
 
 /** Capture bridge values and retain discovery only when Herdr advertised a managed bridge. */
-export function captureHerdrBridgeBootstrap(env: HerdrOmpBridgeEnvironment = process.env): HerdrBridgeBootstrap {
+export function captureHerdrBridgeBootstrap(
+	env: HerdrOmpBridgeEnvironment = process.env,
+	platform: NodeJS.Platform = process.platform,
+): HerdrBridgeBootstrap {
 	const address = env.HERDR_OMP_BRIDGE;
 	const hostToken = env.HERDR_OMP_BRIDGE_TOKEN;
 	const guestToken = env.HERDR_OMP_GUEST_BRIDGE_TOKEN;
@@ -47,7 +50,9 @@ export function captureHerdrBridgeBootstrap(env: HerdrOmpBridgeEnvironment = pro
 
 	const bridgeCapable = Boolean(address?.trim());
 	const hostBridgeDiscovery =
-		bridgeCapable && socketPath?.trim() && paneId?.trim() ? { socketPath, paneId } : undefined;
+		platform !== "win32" && bridgeCapable && socketPath?.trim() && paneId?.trim()
+			? { socketPath, paneId }
+			: undefined;
 	let currentHostBridge: HerdrHostBridgeCredentials | undefined;
 	if (hostToken !== undefined) {
 		if (hostToken.trim() && address?.trim() && paneId?.trim()) {

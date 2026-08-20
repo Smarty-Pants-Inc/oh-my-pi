@@ -63,6 +63,20 @@ function successResponse(request: Record<string, unknown>, paneId = "pane-1"): s
 }
 afterEach(() => vi.restoreAllMocks());
 
+it("leaves Windows startup unchanged while managed delivery is deferred", () => {
+	const env = {
+		HERDR_OMP_BRIDGE: "127.0.0.1:1234",
+		HERDR_OMP_BRIDGE_TOKEN: "current-token",
+		HERDR_OMP_GUEST_BRIDGE_TOKEN: "guest-token",
+		HERDR_SOCKET_PATH: String.raw`C:\Users\test\herdr.sock`,
+		HERDR_PANE_ID: "pane-1",
+	};
+
+	expect(captureHerdrBridgeBootstrap(env, "win32")).toEqual({ guestBridgeToken: "guest-token" });
+	expect(env.HERDR_OMP_BRIDGE_TOKEN).toBeUndefined();
+	expect(env.HERDR_OMP_GUEST_BRIDGE_TOKEN).toBeUndefined();
+});
+
 describe.skipIf(process.platform === "win32")("Herdr bridge credential discovery", () => {
 	it("preserves ordinary non-Herdr startup when no bridge locator exists", async () => {
 		expect(await resolveHerdrHostBridge(undefined)).toBeUndefined();
