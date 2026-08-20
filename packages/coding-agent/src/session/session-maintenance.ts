@@ -79,7 +79,7 @@ import type { SessionContext } from "./session-context";
 import { getLatestCompactionEntry, getOpenAiRemoteCompactionPayload } from "./session-context";
 import type { CompactionEntry, SessionEntry } from "./session-entries";
 import type { SessionManager } from "./session-manager";
-import { createCompleteFnFromStreamFn } from "./settings-stream-fn";
+import { createCompleteFnFromStreamFn, resolveSettingsCacheRetention } from "./settings-stream-fn";
 import type { ShakeMode, ShakeResult } from "./shake-types";
 
 export type CompactionCheckResult = Readonly<{
@@ -1607,6 +1607,7 @@ export class SessionMaintenance {
 						// via resolveCompactionEffort so unsupported-effort models
 						// (xai-oauth/grok-build) don't trip requireSupportedEffort.
 						thinkingLevel: this.#host.thinkingLevel(),
+						cacheRetention: resolveSettingsCacheRetention(this.#host.settings),
 						tools: this.#host.agent.state.tools,
 						sessionId: this.#host.sessionId(),
 						promptCacheKey: this.#host.agent.promptCacheKey ?? this.#host.agent.sessionId,
@@ -2700,6 +2701,7 @@ export class SessionMaintenance {
 									// site. Clamped per-model inside compact() via
 									// resolveCompactionEffort.
 									thinkingLevel: this.#host.thinkingLevel(),
+									cacheRetention: resolveSettingsCacheRetention(this.#host.settings),
 									tools: this.#host.agent.state.tools,
 									sessionId: this.#host.sessionId(),
 									promptCacheKey: this.#host.agent.promptCacheKey ?? this.#host.agent.sessionId,

@@ -98,7 +98,7 @@ import type { CompactionEntry, SessionEntry } from "./session-entries";
 import { formatSessionHistoryMarkdown } from "./session-history-format";
 import type { SessionManager } from "./session-manager";
 import { buildSessionMetadata } from "./session-metadata";
-import { createCompleteFnFromStreamFn } from "./settings-stream-fn";
+import { createCompleteFnFromStreamFn, resolveSettingsCacheRetention } from "./settings-stream-fn";
 import type { YieldQueue, YieldQueueTransaction } from "./yield-queue";
 
 const ADVISOR_CODEX_SSE_MAX_ATTEMPTS = 1;
@@ -1496,6 +1496,7 @@ export class SessionAdvisors {
 					signal,
 					{
 						thinkingLevel: advisorCompactionThinkingLevel,
+						cacheRetention: resolveSettingsCacheRetention(this.#host.settings),
 						convertToLlm: messages => this.#host.convertToLlmForSideRequest(messages),
 						telemetry,
 						tools: agent.state.tools,

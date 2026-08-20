@@ -1839,6 +1839,7 @@ describe("AgentSession handoff", () => {
 			await localSession.runIdleCompaction();
 			expect(compactSpy).toHaveBeenCalledTimes(1);
 			expect(compactSpy.mock.calls[0]?.[5]?.promptCacheKey).toBe(promptCacheKey);
+			expect(compactSpy.mock.calls[0]?.[5]?.cacheRetention).toBe("none");
 			const completeImpl = compactSpy.mock.calls[0]?.[5]?.completeImpl;
 			if (!completeImpl) throw new Error("Expected automatic compaction to use the side stream transport");
 			await completeImpl(sideMock, { messages: [] }, {});
