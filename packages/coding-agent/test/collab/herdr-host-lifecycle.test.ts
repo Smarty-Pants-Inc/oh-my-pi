@@ -195,6 +195,80 @@ describe("managed Herdr collab host lifecycle", () => {
 		expect(ctx.collabHost).toBe(publicHost);
 	});
 
+	it("does not announce a stale session when the session commits during bridge discovery", async () => {
+		let sessionId = "session-one";
+		let sessionChange: (() => void) | undefined;
+		const sessionManager = {
+			getSessionId: () => sessionId,
+			snapshotForReplication: () => ({
+				header: { type: "session", id: sessionId, timestamp: "2026-01-01T00:00:00Z", cwd: "/host" },
+				entries: [],
+			}),
+		};
+		const ctx = makeContext(sessionManager);
+		const records: Record<string, unknown>[] = [];
+		let pending = "";
+		const server = Bun.listen({
+			hostname: "127.0.0.1",
+			port: 0,
+			socket: {
+				open() {},
+				data(socket, data) {
+					pending += data.toString();
+					const newline = pending.indexOf("\n");
+					if (newline < 0) return;
+					const record = JSON.parse(pending.slice(0, newline)) as Record<string, unknown>;
+					pending = pending.slice(newline + 1);
+					if (record.t !== "host") return;
+					records.push(record);
+					socket.write('{"t":"ready"}\n');
+				},
+			},
+		});
+		const session = {
+			sessionManager,
+			registerSessionChangeCallback(callback: () => void) {
+				sessionChange = callback;
+				return () => {
+					if (sessionChange === callback) sessionChange = undefined;
+				};
+			},
+		} as unknown as Pick<AgentSession, "registerSessionChangeCallback" | "sessionManager">;
+		const credentials = {
+			address: `127.0.0.1:${server.port}`,
+			token: "bridge-token",
+			paneId: "pane-1",
+		};
+		const firstDiscovery = Promise.withResolvers<HerdrHostBridgeCredentials>();
+		const discoveryStarted = Promise.withResolvers<void>();
+		let discoveryRequests = 0;
+		const lifecycle = createLifecycle(ctx, session, credentials, async () => {
+			discoveryRequests += 1;
+			if (discoveryRequests === 1) {
+				discoveryStarted.resolve();
+				return firstDiscovery.promise;
+			}
+			return credentials;
+		});
+
+		try {
+			const starting = lifecycle.start();
+			await discoveryStarted.promise;
+			sessionId = "session-two";
+			sessionChange?.();
+			firstDiscovery.resolve(credentials);
+			await starting;
+			await lifecycle.whenIdle();
+
+			expect(discoveryRequests).toBe(2);
+			expect(records).toHaveLength(1);
+			expect(records[0]).toMatchObject({ t: "host", ompSessionId: "session-two" });
+		} finally {
+			await lifecycle.stop("test cleanup");
+			server.stop(true);
+		}
+	});
+
 	it("rejects initial activation when Herdr sends ready and terminal close in one read", async () => {
 		const sessionManager = {
 			getSessionId: () => "session-one",

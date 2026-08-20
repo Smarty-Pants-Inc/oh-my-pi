@@ -143,6 +143,9 @@ export class HerdrCollabHostLifecycle {
 			const refreshed = await discoverHerdrHostBridge(this.#bridge.discovery);
 			this.#bridge = { ...this.#bridge, current: refreshed };
 			if (this.#stopping || this.#suspended || this.#ctx.collabGuest) return;
+			const discoveredCurrentSessionId = this.#session.sessionManager.getSessionId();
+			const discoveredSessionId = this.#committedSessionId ?? discoveredCurrentSessionId;
+			if (discoveredCurrentSessionId !== sessionId || discoveredSessionId !== sessionId) continue;
 
 			const next = new CollabHost(this.#ctx);
 			let terminalReason: string | undefined;
