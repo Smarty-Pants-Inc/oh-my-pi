@@ -380,6 +380,7 @@ export type ReadonlySessionManager = Pick<
 	| "getSessionId"
 	| "getSessionFile"
 	| "getSessionName"
+	| "onSessionNameChanged"
 	| "getArtifactsDir"
 	| "getArtifactManager"
 	| "allocateArtifactPath"
