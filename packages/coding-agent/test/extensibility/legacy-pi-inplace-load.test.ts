@@ -204,6 +204,10 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 				source: 'const main = require.main; main.require("/absolute/outside.js");',
 			},
 			{
+				name: "boxed require.main",
+				source: 'const box = { main: require.main }; box.main.require("/absolute/outside.js");',
+			},
+			{
 				name: "aliased node:module _load",
 				source: 'const Module = require("node:module"); const load = Module._load; load("/absolute/outside.js");',
 			},
@@ -214,6 +218,21 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 			{
 				name: "nested node:module namespace _load",
 				source: 'import * as nodeModule from "node:module"; nodeModule.Module._load("/absolute/outside.js");',
+			},
+			{
+				name: "aliased nested node:module namespace _load",
+				source:
+					'import * as nodeModule from "node:module"; const Loader = nodeModule.Module; Loader._load("/absolute/outside.js");',
+			},
+			{
+				name: "boxed nested node:module namespace _load",
+				source:
+					'import * as nodeModule from "node:module"; const box = { Loader: nodeModule.Module }; box.Loader._load("/absolute/outside.js");',
+			},
+			{
+				name: "nested node:module namespace createRequire",
+				source:
+					'import * as nodeModule from "node:module"; const load = nodeModule.Module.createRequire(import.meta.url); load("/absolute/outside.js");',
 			},
 		] as const;
 

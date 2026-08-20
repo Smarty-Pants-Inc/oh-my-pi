@@ -890,6 +890,25 @@ function collectExtensionSpecifierReferences(
 			isKnownModuleLoaderObject(asAstNode(node.object), scope)
 		);
 	}
+	let moduleBindingsChanged = true;
+	while (moduleBindingsChanged) {
+		moduleBindingsChanged = false;
+		for (const { node, scope } of variableDeclarations) {
+			const initializer = asAstNode(node.init);
+			if (!isKnownModuleLoaderObject(initializer, scope)) continue;
+			const binding = asAstNode(node.id);
+			if (binding?.type === "ObjectPattern" && isNodeModuleRequireCall(initializer, scope)) continue;
+			if (binding?.type !== "Identifier" || typeof binding.name !== "string") {
+				if (graphProof) graphProof.provable = false;
+				continue;
+			}
+			if (!moduleNamespaceBindings.has(binding.name)) {
+				moduleNamespaceBindings.add(binding.name);
+				moduleBindingsChanged = true;
+			}
+			moduleNamespaceBindingNodes.add(binding);
+		}
+	}
 
 	let processBindingsChanged = true;
 	while (processBindingsChanged) {
@@ -1244,7 +1263,6 @@ function collectExtensionSpecifierReferences(
 				switch (staticMemberPropertyName(parent)) {
 					case "cache":
 					case "extensions":
-					case "main":
 					case "resolve":
 						continue;
 				}
@@ -1283,14 +1301,16 @@ function collectExtensionSpecifierReferences(
 				graphProof.provable = false;
 				continue;
 			}
-			const requireMainAlias =
-				memberName === "main" &&
-				isIdentifier(object, "require") &&
-				!scopeHasBinding(scope, REQUIRE_BINDING) &&
-				parent?.type === "VariableDeclarator" &&
-				parent.init === node;
-			if (requireMainAlias) {
-				graphProof.provable = false;
+			const moduleLoaderMember =
+				(memberName === "Module" || memberName === "default") && isKnownModuleLoaderObject(object, scope);
+			if (moduleLoaderMember) {
+				const binding = parent?.type === "VariableDeclarator" && parent.init === node ? asAstNode(parent.id) : null;
+				const trackedAlias = binding?.type === "Identifier" && moduleNamespaceBindingNodes.has(binding);
+				const directLoadReceiver =
+					(parent?.type === "MemberExpression" || parent?.type === "OptionalMemberExpression") &&
+					parentKey === "object" &&
+					staticMemberPropertyName(parent) === "_load";
+				if (!trackedAlias && !directLoadReceiver) graphProof.provable = false;
 				continue;
 			}
 			const moduleLoadMember = memberName === "_load" && isKnownModuleLoaderObject(object, scope);
