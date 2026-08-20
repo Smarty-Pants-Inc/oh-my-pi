@@ -160,6 +160,23 @@ describe("isHyperlinkEnabled", () => {
 		setHyperlinkMode("auto");
 		expect(terminalCaps.TERMINAL.hyperlinks).toBe(true);
 	});
+
+	it("keeps cloned settings from changing process-global hyperlink state", async () => {
+		delete Bun.env.PI_NO_HYPERLINKS;
+		delete Bun.env.PI_FORCE_HYPERLINKS;
+		setHyperlinkMode("off");
+
+		const cloned = await settings.cloneForCwd(path.join(process.cwd(), "cloned-settings"));
+		cloned.override("tui.hyperlinks", "always");
+		expect(cloned.get("tui.hyperlinks")).toBe("always");
+		expect(terminalCaps.TERMINAL.hyperlinks).toBe(false);
+
+		await cloned.cloneForCwd(path.join(process.cwd(), "nested-cloned-settings"));
+		expect(terminalCaps.TERMINAL.hyperlinks).toBe(false);
+
+		setHyperlinkMode("always");
+		expect(terminalCaps.TERMINAL.hyperlinks).toBe(true);
+	});
 });
 
 describe("fileHyperlink", () => {
