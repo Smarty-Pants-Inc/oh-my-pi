@@ -216,6 +216,16 @@ describe("runEvalCompletion", () => {
 		expect(result.details).toEqual({ model: "p/smol", tier: "smol", structured: false });
 	});
 
+	it("passes explicit session cache retention to the one-shot request", async () => {
+		const spy = vi.spyOn(ai, "completeSimple").mockResolvedValue(assistant({ text: "ok" }));
+		const session = makeSession();
+		session.settings.set("providers.cacheRetention", "none");
+
+		await runEvalCompletion({ prompt: "q", model: "smol" }, { session });
+
+		expect(spy.mock.calls[0]?.[2]?.cacheRetention).toBe("none");
+	});
+
 	it("supplies a non-empty systemPrompt when system is omitted (codex 'Instructions are required' guard)", async () => {
 		// The openai-codex Responses transformer drops `instructions` when no
 		// system prompt is provided, and the remote endpoint then 400s with

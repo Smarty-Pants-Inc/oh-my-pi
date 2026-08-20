@@ -27,6 +27,7 @@ import type { Settings } from "../config/settings";
 import { type LocalProtocolOptions, resolveLocalRoot } from "../internal-urls";
 import describeUserPrompt from "../prompts/tools/image-attachment-describe.md" with { type: "text" };
 import describeSystemPrompt from "../prompts/tools/image-attachment-describe-system.md" with { type: "text" };
+import { resolveSettingsCacheRetention } from "../session/settings-stream-fn";
 
 /** Telemetry tag for the oneshot vision-description calls. */
 const ONESHOT_KIND = "image_attachment_describe";
@@ -142,7 +143,11 @@ async function describeImage(
 					},
 				],
 			},
-			{ apiKey: deps.modelRegistry.resolver(visionModel, deps.sessionId), signal },
+			{
+				apiKey: deps.modelRegistry.resolver(visionModel, deps.sessionId),
+				cacheRetention: resolveSettingsCacheRetention(deps.settings),
+				signal,
+			},
 			{ telemetry, oneshotKind: ONESHOT_KIND, completeImpl: deps.completeImpl },
 		);
 		if (response.stopReason === "error" || response.stopReason === "aborted") {
