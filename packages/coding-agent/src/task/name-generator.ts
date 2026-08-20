@@ -1391,7 +1391,6 @@ const NOUNS = [
 	"octopus",
 	"opossum",
 	"orangutan",
-	"orca",
 	"ostrich",
 	"otter",
 	"owl",

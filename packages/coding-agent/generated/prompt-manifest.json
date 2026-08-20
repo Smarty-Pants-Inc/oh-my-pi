@@ -2825,7 +2825,7 @@
       "visibility": "model",
       "defaultEnabled": true,
       "order": 2350,
-      "sha256": "73e82de80cb8540cad7c0954938cbd65b757a97b8639296f914c5556fc5d3539"
+      "sha256": "d844d63561976e495e884776d20ca34cf5bd8e4a8e7b590b4a766dd75843769d"
     },
     {
       "id": "tool.task-async-contract",
@@ -3237,7 +3237,7 @@
     },
     {
       "id": "tool.task",
-      "descriptionSha256": "b396bbedb024e3f6010675f2b02019be53f88df975d39b0dc59079bc9c9985e6",
+      "descriptionSha256": "70739152121a6052b143a45ed7882e50d99822b98a145fe7c1642ad46c0a9613",
       "schemaSha256": "e559c6f989734d2144c5a88e4d9ed5fd49dfbd4daf137bf61af0cdf9031bd912"
     },
     {
@@ -6131,7 +6131,7 @@
     },
     {
       "path": "packages/coding-agent/generated/tool-contracts.json",
-      "sha256": "d01064ee14457eaf2ffc373f401905cb965237e3ddf0e9cb32510279ac2dd95c"
+      "sha256": "2b2d5226f4e4d47a8c6c379a0d6df2c29104c8692bf3e4425b10250f6215a1cb"
     },
     {
       "path": "packages/coding-agent/package.json",
@@ -8659,7 +8659,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/todo-tracker.ts",
-      "sha256": "0b1288d5d8b3b52eb40e28f1ab04659ca5c88f8dd0f760d5f37f74253d4222ac"
+      "sha256": "26c7cec0b9c2c070a9d2d987c344c2c426ec4a101d289f80e827b44408aa9e0d"
     },
     {
       "path": "packages/coding-agent/src/session/tool-choice-queue.ts",
@@ -8871,7 +8871,7 @@
     },
     {
       "path": "packages/coding-agent/src/task/name-generator.ts",
-      "sha256": "b06834d8a0686ef368b70da4b46bd35d47b0e6a6684c9cf5685b8537a198e7f0"
+      "sha256": "67a3c7eebb0e6d3f7ffc69538445a959aeb1dc839255b2e1b3d5ecb9d9d877d7"
     },
     {
       "path": "packages/coding-agent/src/task/omp-command.ts",
@@ -10675,5 +10675,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "ecf9ae3335bfb7993513b1fa2a214a95ceb0fea3e7efc77b7f469ed11fd45b2e"
+  "rootSha256": "9b2eefc3136b2540dd1909f695bbe8a9aaa9904ffc88e4f3e64ac9e1f47434c1"
 }

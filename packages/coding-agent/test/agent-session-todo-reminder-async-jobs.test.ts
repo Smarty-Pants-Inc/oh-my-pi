@@ -12,7 +12,7 @@ import { TodoTool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
-/** Async ownership gates session_stop, while todo state remains passive and never emits reminders. */
+/** Async ownership gates session_stop; terminal stops still surface bounded todo notifications. */
 const sharedAuthStorage = createInMemoryAuthStorage();
 sharedAuthStorage.setRuntimeApiKey("anthropic", "test-key");
 const sharedModelRegistry = new ModelRegistry(sharedAuthStorage);
@@ -154,7 +154,7 @@ describe("AgentSession todo reminder async-job deferral", () => {
 		vi.restoreAllMocks();
 	});
 
-	it("does not defer a terminal stop for an owned job without an open origin turn", async () => {
+	it("notifies on a terminal stop for an owned job without an open origin turn", async () => {
 		setIncompleteTodos();
 		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
 		registerGatedJob("Main");
@@ -162,12 +162,12 @@ describe("AgentSession todo reminder async-job deferral", () => {
 		emitTextOnlyStop();
 		await session.waitForIdle();
 
-		expect(reminderAttempts).toEqual([]);
+		expect(reminderAttempts).toEqual([1]);
 		expect(continueSpy).not.toHaveBeenCalled();
 		expect(agentEndTerminalStates).toEqual([true]);
 	});
 
-	it("never creates a todo reminder for a job owned by a different agent", async () => {
+	it("notifies when a different agent's job cannot wake this session", async () => {
 		setIncompleteTodos();
 		vi.spyOn(session.agent, "continue").mockResolvedValue();
 		registerGatedJob("OtherAgent");
@@ -175,21 +175,18 @@ describe("AgentSession todo reminder async-job deferral", () => {
 		emitTextOnlyStop();
 		await session.waitForIdle();
 
-		expect(reminderAttempts).toEqual([]);
+		expect(reminderAttempts).toEqual([1]);
 	});
 
-	it("does not create a todo reminder after an owned job drains", async () => {
+	it("does not repeat a todo notification after an unscoped owned job drains", async () => {
 		setIncompleteTodos();
 		vi.spyOn(session.agent, "continue").mockResolvedValue();
 		const job = registerGatedJob("Main");
 
-		// While the job runs, the stop stays silent.
 		emitTextOnlyStop();
 		await session.waitForIdle();
-		expect(reminderAttempts).toEqual([]);
+		expect(reminderAttempts).toEqual([1]);
 
-		// Complete the job and drain its result delivery — nothing is left to
-		// re-wake the loop, so the deferral must lift.
 		job.resolve();
 		await manager.waitForAll();
 		await manager.drainDeliveries();
@@ -197,7 +194,7 @@ describe("AgentSession todo reminder async-job deferral", () => {
 		emitTextOnlyStop();
 		await session.waitForIdle();
 
-		expect(reminderAttempts).toEqual([]);
+		expect(reminderAttempts).toEqual([1]);
 	});
 
 	it("runs the session_stop hook for an owned job without an open origin turn", async () => {
