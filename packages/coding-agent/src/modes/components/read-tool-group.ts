@@ -1,4 +1,3 @@
-import * as path from "node:path";
 import type { AssistantMessage, Usage } from "@oh-my-pi/pi-ai";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { Container, Text } from "@oh-my-pi/pi-tui";
@@ -6,7 +5,7 @@ import { InternalUrlRouter, XD_URL_PREFIX } from "../../internal-urls";
 import { getLanguageFromPath, theme } from "../../modes/theme/theme";
 import { parseLineRanges, selectorLineRanges, splitPathAndSel } from "../../tools/path-utils";
 import { PREVIEW_LIMITS, shortenPath } from "../../tools/render-utils";
-import { fileHyperlink, renderCodeCell, tryResolveInternalUrlSync } from "../../tui";
+import { fileHyperlink, renderCodeCell } from "../../tui";
 import { canonicalizeMessage } from "../../utils/thinking-display";
 import type { ToolExecutionHandle } from "./tool-execution";
 import { formatUsageRow } from "./usage-row";
@@ -86,7 +85,9 @@ type ReadToolResultDetails = {
 		to?: string;
 	};
 	conflictCount?: number;
+	isDirectory?: boolean;
 	displayReadTargets?: unknown;
+	displayReadTargetLinks?: unknown;
 	displayContent?: {
 		text?: string;
 		startLine?: number;
@@ -115,6 +116,7 @@ type ReadEntry = {
 	toolCallId: string;
 	path: string;
 	displayPaths?: string[];
+	displayLinkPaths?: Array<string | undefined>;
 	linkPath?: string;
 	status: "pending" | "success" | "warning" | "error";
 	correctedFrom?: string;
@@ -167,6 +169,13 @@ function getDisplayReadTargets(details: ReadToolResultDetails | undefined): stri
 	return targets.length > 0 ? targets : undefined;
 }
 
+function getDisplayReadTargetLinks(details: ReadToolResultDetails | undefined): Array<string | undefined> | undefined {
+	if (!Array.isArray(details?.displayReadTargetLinks)) return undefined;
+	return details.displayReadTargetLinks.map(target =>
+		typeof target === "string" && target.trim().length > 0 ? target.trim() : undefined,
+	);
+}
+
 function displayPathWithSuffixResolution(currentPath: string, suffixResolution: ReadToolSuffixResolution): string {
 	const currentSelector = splitPathAndSel(currentPath).sel;
 	if (!currentSelector || splitPathAndSel(suffixResolution.to).sel) return suffixResolution.to;
@@ -180,13 +189,6 @@ function readSourceFsPath(details: ReadToolResultDetails | undefined): string | 
 
 function readResultLinkPath(details: ReadToolResultDetails | undefined): string | undefined {
 	return typeof details?.resolvedPath === "string" ? details.resolvedPath : readSourceFsPath(details);
-}
-
-function readTargetLinkPath(basePath: string, entryLinkPath: string | undefined): string | undefined {
-	if (entryLinkPath) return entryLinkPath;
-	const resolvedInternalPath = tryResolveInternalUrlSync(basePath);
-	if (resolvedInternalPath) return resolvedInternalPath;
-	return path.isAbsolute(basePath) ? basePath : undefined;
 }
 
 function firstSelectorLine(selector: string | undefined): number | undefined {
@@ -440,14 +442,17 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 		const details = result.details as ReadToolResultDetails | undefined;
 		const suffixResolution = getSuffixResolution(details);
 		const displayPaths = getDisplayReadTargets(details);
-		entry.linkPath = readResultLinkPath(details);
+		const displayLinkPaths = result.isError ? undefined : getDisplayReadTargetLinks(details);
+		entry.linkPath = !result.isError && details?.isDirectory !== true ? readResultLinkPath(details) : undefined;
 		if (suffixResolution) {
 			entry.path = displayPathWithSuffixResolution(entry.path, suffixResolution);
 			entry.correctedFrom = suffixResolution.from;
 			entry.displayPaths = undefined;
+			entry.displayLinkPaths = undefined;
 		} else {
 			entry.correctedFrom = undefined;
 			entry.displayPaths = displayPaths;
+			entry.displayLinkPaths = displayLinkPaths;
 		}
 		const conflictCount =
 			typeof details?.conflictCount === "number" && details.conflictCount > 0 ? details.conflictCount : undefined;
@@ -569,9 +574,9 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 		for (const entry of entries) {
 			const pathSpecs = entry.displayPaths ?? splitReadDisplayPathSpecs(entry.path);
 			const useEntryLinkPath = pathSpecs.length === 1;
-			for (const pathSpec of pathSpecs) {
+			for (const [pathIndex, pathSpec] of pathSpecs.entries()) {
 				const split = splitPathAndSel(pathSpec);
-				const linkPath = readTargetLinkPath(split.path, useEntryLinkPath ? entry.linkPath : undefined);
+				const linkPath = useEntryLinkPath ? entry.linkPath : entry.displayLinkPaths?.[pathIndex];
 				for (const selector of splitSelectorDisplayParts(split.sel)) {
 					targets.push({
 						entry,
@@ -790,7 +795,7 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 					correctedFrom: entry.correctedFrom,
 					conflictCount: entry.conflictCount,
 					line: firstSelectorLine(split.sel),
-					linkPath: readTargetLinkPath(split.path, entry.linkPath),
+					linkPath: entry.linkPath,
 				})
 			: "";
 		const title = pathDisplay ? `Read ${pathDisplay}` : "Read";

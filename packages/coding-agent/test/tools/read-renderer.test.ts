@@ -62,7 +62,7 @@ describe("readToolRenderer hyperlinks", () => {
 		expect(extractLinkTexts(rendered)).not.toContain("local://handoff.md:2");
 	});
 
-	it("links absolute read call paths to file URIs with selector lines", async () => {
+	it("does not speculate file links for pending absolute read calls", async () => {
 		settings.override("tui.hyperlinks", "always");
 		const theme = await getThemeByName("dark");
 		expect(theme).toBeDefined();
@@ -76,11 +76,28 @@ describe("readToolRenderer hyperlinks", () => {
 
 		const rendered = component.render(200).join("\n");
 		expect(Bun.stripANSI(rendered)).toContain(`${examplePath}:10-12`);
-		const exampleUri = new URL(url.pathToFileURL(path.resolve(examplePath)).href);
-		exampleUri.searchParams.set("line", "10");
-		expect(extractLinkUris(rendered)).toContain(exampleUri.href);
-		expect(extractLinkTexts(rendered)).toContain(examplePath);
-		expect(extractLinkTexts(rendered)).not.toContain(`${examplePath}:10-12`);
+		expect(extractLinkUris(rendered)).toEqual([]);
+	});
+
+	it("leaves confirmed directory read titles unlinked", async () => {
+		settings.override("tui.hyperlinks", "always");
+		const theme = await getThemeByName("dark");
+		expect(theme).toBeDefined();
+
+		const directory = path.resolve("/tmp/omp-read/src");
+		const component = readToolRenderer.renderResult(
+			{
+				content: [{ type: "text", text: "file.ts" }],
+				details: { resolvedPath: directory, isDirectory: true, contentType: "text/plain" },
+			},
+			{ expanded: false, isPartial: false },
+			theme!,
+			{ path: directory },
+		);
+
+		const rendered = component.render(200).join("\n");
+		expect(Bun.stripANSI(rendered)).toContain(directory);
+		expect(extractLinkUris(rendered)).toEqual([]);
 	});
 
 	it("links HTTP read result headers to the final URL", async () => {

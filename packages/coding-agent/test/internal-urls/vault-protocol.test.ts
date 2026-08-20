@@ -197,10 +197,11 @@ describe("VaultProtocolHandler", () => {
 			});
 			const handler = testHandler(vaultProtocol.spawnObsidian);
 
-			await handler.resolve(resourceUrl("vault://Work"));
+			const resource = await handler.resolve(resourceUrl("vault://Work"));
 
 			expect(spawnSpy).toHaveBeenCalledTimes(1);
 			expect(spawnSpy.mock.calls[0][1]).toEqual(["vault=Work", "vault", "info"]);
+			expect(resource.isDirectory).toBe(true);
 		});
 	});
 	it("writes files through the protocol hook and resolves cached vault paths for edit plumbing", async () => {
@@ -239,6 +240,7 @@ describe("VaultProtocolHandler", () => {
 
 			expect(resource.contentType).toBe("text/markdown");
 			expect(resource.sourcePath).toBe(await fs.realpath(path.join(root, "Folder")));
+			expect(resource.isDirectory).toBe(true);
 			expect(resource.content).toContain("[note.md](vault://Work/Folder/note.md)");
 			expect(resource.content).toContain("[Sub/](vault://Work/Folder/Sub/)");
 		});
@@ -256,6 +258,7 @@ describe("VaultProtocolHandler", () => {
 
 			expect(resource.contentType).toBe("text/markdown");
 			expect(resource.sourcePath).toBe(await fs.realpath(path.join(root, "Folder")));
+			expect(resource.isDirectory).toBe(true);
 			expect(resource.content).toContain("[note.md](vault://Work/Folder/note.md)");
 			expect(resource.content).toContain("[Sub/](vault://Work/Folder/Sub/)");
 		});

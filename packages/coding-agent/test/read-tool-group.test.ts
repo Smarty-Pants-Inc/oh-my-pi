@@ -195,6 +195,7 @@ describe("ReadToolGroupComponent", () => {
 	});
 
 	it("uses result-provided recovered targets for delimited reads", () => {
+		settings.override("tui.hyperlinks", "always");
 		const component = new ReadToolGroupComponent();
 		const onePath = path.resolve("/tmp/one.ts");
 		const twoPath = path.resolve("/tmp/two.ts");
@@ -202,17 +203,23 @@ describe("ReadToolGroupComponent", () => {
 		component.updateResult(
 			{
 				content: [{ type: "text", text: "combined" }],
-				details: { displayReadTargets: [onePath, twoPath] },
+				details: {
+					displayReadTargets: [onePath, twoPath],
+					displayReadTargetLinks: [onePath, twoPath],
+				},
 			},
 			false,
 			"read-recovered",
 		);
 
 		const plain = Bun.stripANSI(component.render(120).join("\n"));
+		const uris = extractLinkUris(component.render(120).join("\n"));
 
 		expect(plain).toContain("Read (2)");
 		expect(plain).toContain(`${themeModule.theme.tree.branch} ${onePath}`);
 		expect(plain).toContain(`${themeModule.theme.tree.last} ${twoPath}`);
+		expect(uris).toContain(url.pathToFileURL(onePath).href);
+		expect(uris).toContain(url.pathToFileURL(twoPath).href);
 	});
 
 	it("renders warning previews with warning styling instead of success styling", () => {
@@ -331,6 +338,27 @@ describe("ReadToolGroupComponent", () => {
 		expect(extractLinkUris(rendered)).toContain(exampleUri.href);
 		expect(extractLinkTexts(rendered)).toContain("src/example.ts");
 		expect(extractLinkTexts(rendered)).not.toContain("src/example.ts:7-9");
+	});
+
+	it("leaves pending and directory grouped paths unlinked", () => {
+		settings.override("tui.hyperlinks", "always");
+		const component = new ReadToolGroupComponent();
+		const directory = path.resolve("/workspace/src");
+		component.updateArgs({ path: directory }, "read-directory");
+		expect(extractLinkUris(component.render(120).join("\n"))).toEqual([]);
+
+		component.updateResult(
+			{
+				content: [{ type: "text", text: "example.ts" }],
+				details: { resolvedPath: directory, isDirectory: true },
+			},
+			false,
+			"read-directory",
+		);
+
+		const rendered = component.render(120).join("\n");
+		expect(Bun.stripANSI(rendered)).toContain(directory);
+		expect(extractLinkUris(rendered)).toEqual([]);
 	});
 
 	it("links inline preview titles when the summary row is suppressed", () => {
