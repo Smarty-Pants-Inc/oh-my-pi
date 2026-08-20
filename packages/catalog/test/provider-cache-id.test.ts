@@ -32,3 +32,33 @@ test("ollama cache scope preserves reverse-proxy path prefixes", () => {
 	expect(teamA).toBe(resolveModelCacheProviderId("ollama", { baseUrl: "https://proxy.example/team-a/" }));
 	expect(teamA).not.toBe(resolveModelCacheProviderId("ollama", { baseUrl: "https://proxy.example/team-b/v1" }));
 });
+
+test("Qwen template-effort opt-out splits local cache identity without losing enabled hits", () => {
+	for (const [providerId, baseUrl] of [
+		["vllm", "http://vllm.example:8000/v1"],
+		["lm-studio", "http://lm-studio.example:1234/v1"],
+	] as const) {
+		const descriptor = PROVIDER_DESCRIPTORS.find(candidate => candidate.providerId === providerId);
+		if (!descriptor) throw new Error(`Missing descriptor for ${providerId}`);
+		const enabled = { baseUrl, compat: { qwenTemplateReasoningEffort: true } };
+		const disabled = { baseUrl, compat: { qwenTemplateReasoningEffort: false } };
+		const defaultCacheId = resolveModelCacheProviderId(providerId, { baseUrl });
+		expect(resolveModelCacheProviderId(providerId, enabled)).toBe(defaultCacheId);
+		expect(resolveModelCacheProviderId(providerId, disabled)).not.toBe(defaultCacheId);
+		expect(descriptor.createModelManagerOptions(disabled).cacheProviderId).toBe(
+			resolveModelCacheProviderId(providerId, disabled),
+		);
+	}
+
+	expect(
+		resolveModelCacheProviderId("vllm", {
+			baseUrl: "http://vllm-a.example/v1",
+			compat: { qwenTemplateReasoningEffort: false },
+		}),
+	).not.toBe(
+		resolveModelCacheProviderId("vllm", {
+			baseUrl: "http://vllm-b.example/v1",
+			compat: { qwenTemplateReasoningEffort: false },
+		}),
+	);
+});

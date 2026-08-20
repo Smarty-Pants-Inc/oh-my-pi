@@ -3399,7 +3399,7 @@ export function lmStudioModelManagerOptions(
 	const compat = config?.compat;
 	return {
 		providerId: "lm-studio",
-		cacheProviderId: resolveModelCacheProviderId("lm-studio", { apiKey, baseUrl }),
+		cacheProviderId: resolveModelCacheProviderId("lm-studio", { apiKey, baseUrl, compat }),
 		fetchDynamicModels: async () => {
 			const nativeMetadataPromise = fetchLmStudioNativeModelMetadata(baseUrl, config?.fetch, {
 				headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : undefined,
@@ -4995,7 +4995,7 @@ export function vllmModelManagerOptions(config?: VllmModelManagerConfig): ModelM
 	const compat = config?.compat;
 	return {
 		providerId: "vllm",
-		cacheProviderId: resolveModelCacheProviderId("vllm", { baseUrl }),
+		cacheProviderId: resolveModelCacheProviderId("vllm", { baseUrl, compat }),
 		fetchDynamicModels: () =>
 			fetchOpenAICompatibleModels({
 				api: "openai-completions",

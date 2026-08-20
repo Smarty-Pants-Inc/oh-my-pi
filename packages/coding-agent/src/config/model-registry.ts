@@ -665,12 +665,20 @@ export class ModelRegistry {
 		);
 	}
 
+	#builtInDiscoveryCompat(providerId: string): OpenAICompat | undefined {
+		if (providerId !== "vllm" && providerId !== "lm-studio") return undefined;
+		return mergeCompat(
+			this.#providerOverrides.get(providerId)?.compat,
+			this.#runtimeProviderOverrides.get(providerId)?.compat,
+		) as OpenAICompat | undefined;
+	}
+
 	#resolveStartupModelCacheProviderId(providerId: string): string {
 		const baseUrl =
 			this.#runtimeProviderOverrides.get(providerId)?.baseUrl ??
 			this.#providerOverrides.get(providerId)?.baseUrl ??
 			(this.#hasFullSnapshot ? this.getProviderBaseUrl(providerId) : undefined);
-		return resolveModelCacheProviderId(providerId, { baseUrl });
+		return resolveModelCacheProviderId(providerId, { baseUrl, compat: this.#builtInDiscoveryCompat(providerId) });
 	}
 
 	#loadCachedStandardProviderModels(): { models: Model<Api>[]; authoritativeFreshProviders: Set<string> } {
@@ -1377,13 +1385,7 @@ export class ModelRegistry {
 				(this.#runtimeProviderOverrides.has(descriptor.providerId) ||
 					this.#providerOverrides.has(descriptor.providerId) ||
 					this.#keylessProviders.has(descriptor.providerId));
-			const managerCompat =
-				descriptor.providerId === "vllm" || descriptor.providerId === "lm-studio"
-					? (mergeCompat(
-							this.#providerOverrides.get(descriptor.providerId)?.compat,
-							this.#runtimeProviderOverrides.get(descriptor.providerId)?.compat,
-						) as OpenAICompat | undefined)
-					: undefined;
+			const managerCompat = this.#builtInDiscoveryCompat(descriptor.providerId);
 			if (isAuthenticated(apiKey) || descriptor.allowUnauthenticated || hasExplicitVllmConfig) {
 				const discoveryConfig = {
 					apiKey: isDiscoveryBearerApiKey(apiKey) ? apiKey : undefined,

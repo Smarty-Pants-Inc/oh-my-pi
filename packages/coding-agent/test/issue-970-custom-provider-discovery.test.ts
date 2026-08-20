@@ -425,34 +425,37 @@ describe("issue #970 custom provider discovery", () => {
 		expect(registry.find("vllm-fast", "Stale")).toBeUndefined();
 	});
 
-	test("honors explicit Qwen effort opt-out in built-in vLLM and LM Studio discovery", async () => {
-		fs.writeFileSync(
-			modelsPath,
-			[
-				"providers:",
-				"  vllm:",
-				"    baseUrl: http://127.0.0.1:8001/v1",
-				"    auth: none",
-				"    compat:",
-				"      qwenTemplateReasoningEffort: false",
-				"  lm-studio:",
-				"    baseUrl: http://127.0.0.1:1235/v1",
-				"    auth: none",
-				"    compat:",
-				"      qwenTemplateReasoningEffort: false",
-			].join("\n"),
-		);
+	test("invalidates fresh built-in Qwen caches when template effort is disabled after restart", async () => {
+		const vllmBaseUrl = "http://127.0.0.1:8001/v1";
+		const lmStudioBaseUrl = "http://127.0.0.1:1235/v1";
+		const writeConfig = (disableTemplateEffort: boolean) => {
+			fs.writeFileSync(
+				modelsPath,
+				[
+					"providers:",
+					"  vllm:",
+					`    baseUrl: ${vllmBaseUrl}`,
+					"    auth: none",
+					...(disableTemplateEffort ? ["    compat:", "      qwenTemplateReasoningEffort: false"] : []),
+					"  lm-studio:",
+					`    baseUrl: ${lmStudioBaseUrl}`,
+					"    auth: none",
+					...(disableTemplateEffort ? ["    compat:", "      qwenTemplateReasoningEffort: false"] : []),
+				].join("\n"),
+			);
+		};
+		writeConfig(false);
 
 		const modelId = "Qwen3.8-27B-UD-Q6_K_XL";
 		const fetchMock: (input: string | URL | Request) => Promise<Response> = async input => {
 			const url = String(input);
-			if (url === "http://127.0.0.1:8001/v1/models") {
+			if (url === `${vllmBaseUrl}/models`) {
 				return new Response(JSON.stringify({ data: [{ id: modelId, owned_by: "vllm" }] }), {
 					status: 200,
 					headers: { "Content-Type": "application/json" },
 				});
 			}
-			if (url === "http://127.0.0.1:1235/v1/models") {
+			if (url === `${lmStudioBaseUrl}/models`) {
 				return new Response(JSON.stringify({ data: [{ id: modelId, owned_by: "lm-studio" }] }), {
 					status: 200,
 					headers: { "Content-Type": "application/json" },
@@ -467,11 +470,21 @@ describe("issue #970 custom provider discovery", () => {
 			throw new Error(`Unexpected URL: ${url}`);
 		};
 
-		const registry = new ModelRegistryImpl(authStorage, modelsPath, { fetch: fetchMock });
-		await registry.refreshProvider("vllm");
-		await registry.refreshProvider("lm-studio");
+		const firstRegistry = new ModelRegistryImpl(authStorage, modelsPath, { fetch: fetchMock });
+		await firstRegistry.refreshProvider("vllm");
+		expect(firstRegistry.find("vllm", modelId)?.reasoning).toBe(true);
+		await firstRegistry.refreshProvider("lm-studio");
+		expect(firstRegistry.find("lm-studio", modelId)?.reasoning).toBe(true);
 
-		const vllm = registry.find("vllm", modelId);
+		writeConfig(true);
+		const restartedRegistry = new ModelRegistryImpl(authStorage, modelsPath, { fetch: fetchMock });
+		expect(restartedRegistry.find("vllm", modelId)?.reasoning).not.toBe(true);
+		expect(restartedRegistry.find("vllm", modelId)?.thinking).toBeUndefined();
+		expect(restartedRegistry.find("lm-studio", modelId)?.reasoning).not.toBe(true);
+		expect(restartedRegistry.find("lm-studio", modelId)?.thinking).toBeUndefined();
+
+		await restartedRegistry.refreshProvider("vllm", "online-if-uncached");
+		const vllm = restartedRegistry.find("vllm", modelId);
 		expect(vllm?.compat).toMatchObject({
 			thinkingFormat: "qwen-chat-template",
 			qwenTemplateReasoningEffort: false,
@@ -479,13 +492,24 @@ describe("issue #970 custom provider discovery", () => {
 		expect(vllm?.reasoning).toBe(false);
 		expect(vllm?.thinking).toBeUndefined();
 
-		const lmStudio = registry.find("lm-studio", modelId);
+		await restartedRegistry.refreshProvider("lm-studio", "online-if-uncached");
+		const lmStudio = restartedRegistry.find("lm-studio", modelId);
 		expect(lmStudio?.compat).toMatchObject({
 			thinkingFormat: "qwen",
 			qwenTemplateReasoningEffort: false,
 		});
 		expect(lmStudio?.reasoning).toBe(false);
 		expect(lmStudio?.thinking).toBeUndefined();
+
+		const cachedFetch = vi.fn(async (input: string | URL | Request): Promise<Response> => {
+			throw new Error(`Unexpected online fetch: ${String(input)}`);
+		});
+		const cachedRegistry = new ModelRegistryImpl(authStorage, modelsPath, { fetch: cachedFetch });
+		expect(cachedRegistry.find("vllm", modelId)?.reasoning).toBe(false);
+		expect(cachedRegistry.find("lm-studio", modelId)?.reasoning).toBe(false);
+		await cachedRegistry.refreshProvider("vllm", "online-if-uncached");
+		await cachedRegistry.refreshProvider("lm-studio", "online-if-uncached");
+		expect(cachedFetch).not.toHaveBeenCalled();
 	});
 
 	test("uses default vllm baseUrl override for built-in discovery", async () => {
