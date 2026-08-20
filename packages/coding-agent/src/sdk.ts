@@ -3334,6 +3334,9 @@ async function createAgentSessionScoped(
 				registeredInstructions.length > 0 || existingInstructions?.length !== context.instructions?.length
 					? { ...context, instructions: [...(existingInstructions ?? []), ...registeredInstructions] }
 					: context;
+			if (contextTarget === defaultContextTarget && transformed.instructions?.length) {
+				session?.retainPrimaryProviderInstructions(transformed.instructions);
+			}
 			transformed = obfuscator ? obfuscateProviderContext(obfuscator, transformed) : transformed;
 			if (snapcompactInline) transformed = await snapcompactInline.transform(transformed, transformModel);
 			transformed = clampProviderContextImages(transformed, transformModel);

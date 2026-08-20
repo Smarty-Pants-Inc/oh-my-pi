@@ -51,6 +51,7 @@ const NON_WIRE_KEYS = new Set<keyof SimpleStreamOptions>([
 	"signal",
 	"apiKey",
 	"fetch",
+	"providerDispatchGuard",
 	"onPayload",
 	"onToolContracts",
 	"onResponse",

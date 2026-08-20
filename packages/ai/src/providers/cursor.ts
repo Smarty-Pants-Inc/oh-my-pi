@@ -300,6 +300,12 @@ const NOT_IMPLEMENTED = `Not implemented by this client`;
 
 const conversationStateCache = new Map<string, ConversationStateStructure>();
 const conversationBlobStores = new Map<string, Map<string, Uint8Array>>();
+const cursorProviderDispatchGuards = new WeakMap<http2.ClientHttp2Stream, () => void>();
+
+function writeCursorProviderFrame(h2Request: http2.ClientHttp2Stream, frame: Buffer): boolean {
+	cursorProviderDispatchGuards.get(h2Request)?.();
+	return h2Request.write(frame);
+}
 const warnedCursorKimiK3ReplayMessages = new Set<string>();
 const PROVIDER_PAYLOAD_EVIDENCE = Symbol.for("oh-my-pi.provider-payload-evidence");
 /**
@@ -575,6 +581,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		let h2Settled = false;
 		let sawTurnEnded = false;
 		let endStreamError: Error | null = null;
+		let dispatchError: Error | null = null;
 		// Reachable from the catch: a stream that dies mid-turn must still close
 		// and pair the blocks it left open, and `state` itself is scoped to the
 		// try below.
@@ -674,6 +681,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					})
 				: undefined;
 
+			if (options?.signal?.aborted) throw new AIError.AbortError();
 			const proxyUrl = shouldBypassProxy(new URL(baseUrl)) ? undefined : getProxyForProvider(model.provider);
 			if (proxyUrl) {
 				const tlsSocket = await connectProxiedSocket(proxyUrl, baseUrl, {
@@ -688,6 +696,8 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			}
 			h2Client.on("error", error => settleH2(mapH2TransportError(error, baseUrl)));
 
+			options?.providerDispatchGuard?.();
+			if (options?.signal?.aborted) throw new AIError.AbortError();
 			h2Request = h2Client.request(requestHeaders);
 
 			stream.push({ type: "start", partial: output });
@@ -792,8 +802,13 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 							usageState!,
 							requestContextTools,
 							onConversationCheckpoint,
+							options?.providerDispatchGuard,
 						).catch(error => {
-							log("error", "handleServerMessage", { error: String(error) });
+							const reason = error instanceof Error ? error : new Error(String(error));
+							dispatchError ??= reason;
+							log("error", "handleServerMessage", { error: String(reason) });
+							settleH2(reason);
+							h2Request?.close();
 						});
 						inFlightDispatches.add(dispatch);
 						void dispatch.finally(() => inFlightDispatches.delete(dispatch));
@@ -865,6 +880,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			// unpaired and stripped from every rebuilt transcript. Each dispatch
 			// already swallows its own rejection, so this only waits.
 			await drainInFlightDispatches();
+			if (dispatchError) throw dispatchError;
 
 			endCurrentTextBlock(output, stream, state);
 			endCurrentThinkingBlock(output, stream, state);
@@ -1010,7 +1026,9 @@ export async function handleServerMessage(
 	usageState: UsageState,
 	requestContextTools: McpToolDefinition[],
 	onConversationCheckpoint?: (checkpoint: ConversationStateStructure) => void,
+	providerDispatchGuard?: () => void,
 ): Promise<void> {
+	if (providerDispatchGuard) cursorProviderDispatchGuards.set(h2Request, providerDispatchGuard);
 	const msgCase = msg.message.case;
 
 	log("serverMessage", msgCase, msg.message.value);
@@ -1067,7 +1085,7 @@ function handleKvServerMessage(
 		});
 
 		const responseBytes = toBinary(AgentClientMessageSchema, kvClientMessage);
-		h2Request.write(frameConnectMessage(responseBytes));
+		writeCursorProviderFrame(h2Request, frameConnectMessage(responseBytes));
 
 		log("kvClient", "getBlobResult", { blobId: blobIdKey.slice(0, 40) });
 	} else if (kvCase === "setBlobArgs") {
@@ -1088,7 +1106,7 @@ function handleKvServerMessage(
 		});
 
 		const responseBytes = toBinary(AgentClientMessageSchema, kvClientMessage);
-		h2Request.write(frameConnectMessage(responseBytes));
+		writeCursorProviderFrame(h2Request, frameConnectMessage(responseBytes));
 
 		log("kvClient", "setBlobResult", { blobId: blobIdKey.slice(0, 40) });
 	}
@@ -2301,7 +2319,7 @@ function sendExecClientMessage<TCase extends NonNullable<ExecClientMessage["mess
 	});
 
 	const responseBytes = toBinary(AgentClientMessageSchema, clientMessage);
-	h2Request.write(frameConnectMessage(responseBytes));
+	writeCursorProviderFrame(h2Request, frameConnectMessage(responseBytes));
 
 	log("execClientMessage", messageCase, value);
 }
@@ -2337,7 +2355,7 @@ function sendExecClientThrow(
 	const clientMessage = create(AgentClientMessageSchema, {
 		message: { case: "execClientControlMessage", value: controlMessage },
 	});
-	h2Request.write(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
+	writeCursorProviderFrame(h2Request, frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
 	log("execClientControl", "throw", { id: execMsg.id, execId: execMsg.execId, error, errorCode });
 	sendExecClientStreamClose(h2Request, execMsg);
 }
@@ -2355,7 +2373,7 @@ function sendExecClientStreamClose(h2Request: http2.ClientHttp2Stream, execMsg: 
 		message: { case: "execClientControlMessage", value: closeMessage },
 	});
 	const responseBytes = toBinary(AgentClientMessageSchema, clientMessage);
-	h2Request.write(frameConnectMessage(responseBytes));
+	writeCursorProviderFrame(h2Request, frameConnectMessage(responseBytes));
 	log("execClientControl", "streamClose", { id: execMsg.id, execId: execMsg.execId });
 }
 

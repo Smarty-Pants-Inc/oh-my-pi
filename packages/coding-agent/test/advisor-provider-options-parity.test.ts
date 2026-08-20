@@ -20,9 +20,10 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { bindRenderedInstruction } from "@oh-my-pi/pi-coding-agent/context/registry";
+import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import type { GoalModeState } from "@oh-my-pi/pi-coding-agent/goals/state";
 import { createAgentSession, type ExtensionFactory } from "@oh-my-pi/pi-coding-agent/sdk";
-import { SecretObfuscator } from "@oh-my-pi/pi-coding-agent/secrets/obfuscator";
+import { obfuscateProviderContext, SecretObfuscator } from "@oh-my-pi/pi-coding-agent/secrets";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -515,6 +516,376 @@ describe("AgentSession advisor provider-options parity", () => {
 		expect(serialized).not.toContain(oldObjective);
 	});
 
+	it("discards a mission before a slash command awaits with a regex secret", async () => {
+		const capturedContexts: Context[] = [];
+		const advisorCredentialStarted = Promise.withResolvers<void>();
+		const releaseAdvisorCredential = Promise.withResolvers<void>();
+		const commandStarted = Promise.withResolvers<void>();
+		const releaseCommand = Promise.withResolvers<void>();
+		const originalGetApiKey = authStorage.getApiKey.bind(authStorage);
+		let delayCredential = true;
+		vi.spyOn(authStorage, "getApiKey").mockImplementation(async (provider, sessionId, options) => {
+			if (delayCredential) {
+				delayCredential = false;
+				advisorCredentialStarted.resolve();
+				await releaseAdvisorCredential.promise;
+			}
+			return originalGetApiKey(provider, sessionId, options);
+		});
+		const successStream = (): AssistantMessageEventStream => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const message = createAssistantMessage("ok");
+				stream.push({ type: "text_delta", contentIndex: 0, delta: "ok", partial: message });
+				stream.push({ type: "done", reason: "stop", message });
+			});
+			return stream;
+		};
+		const plainSecret = "OTHERSECRET";
+		const regexSecret = "tok_abc123";
+		const obfuscator = new SecretObfuscator(
+			[
+				{ type: "plain", content: plainSecret, friendlyName: "TOKABC123" },
+				{ type: "regex", content: "tok_[a-z0-9]+", mode: "replace" },
+			],
+			"test-key",
+		);
+		const mainAgent = new Agent({
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: successStream,
+		});
+		session = new AgentSession({
+			agent: mainAgent,
+			sessionManager,
+			settings: settings(),
+			modelRegistry,
+			advisorTools: [],
+			advisorStreamFn: (_requestModel, context) => {
+				capturedContexts.push(context);
+				return successStream();
+			},
+			obfuscator,
+			transformProviderContext: async context => context,
+			customCommands: [
+				{
+					path: "hold.ts",
+					resolvedPath: "/test/hold.ts",
+					source: "project",
+					command: {
+						name: "hold",
+						description: "Hold prompt expansion",
+						execute: async () => {
+							commandStarted.resolve();
+							await releaseCommand.promise;
+						},
+					},
+				},
+			],
+		});
+		session.setGoalModeState({
+			enabled: true,
+			mode: "active",
+			goal: {
+				id: "credential-secret-race-goal",
+				objective: `Finish using ${plainSecret}`,
+				status: "active",
+				tokenBudget: 100,
+				tokensUsed: 10,
+				timeUsedSeconds: 2,
+				createdAt: 1,
+				updatedAt: 2,
+			},
+		});
+		session.settings.setModelRole("advisor", "anthropic/claude-sonnet-4-5");
+		expect(session.setAdvisorEnabled(true)).toBe(true);
+		const advisor = session.getAdvisorAgent();
+		if (!advisor) throw new Error("Expected advisor agent to be live");
+
+		const stalePrompt = advisor.prompt("Start credential resolution").catch(() => {});
+		await advisorCredentialStarted.promise;
+		const activePrimaryPrompt = session.prompt(`/hold ${regexSecret}`);
+		await commandStarted.promise;
+		releaseAdvisorCredential.resolve();
+		await stalePrompt;
+		releaseCommand.resolve();
+		await activePrimaryPrompt;
+
+		expect(capturedContexts).toHaveLength(0);
+	});
+
+	it("discards a mission prepared before an @file load adds a regex secret", async () => {
+		const capturedContexts: Context[] = [];
+		const advisorCredentialStarted = Promise.withResolvers<void>();
+		const releaseAdvisorCredential = Promise.withResolvers<void>();
+		const beforeAgentStartEntered = Promise.withResolvers<void>();
+		const releaseBeforeAgentStart = Promise.withResolvers<void>();
+		const originalGetApiKey = authStorage.getApiKey.bind(authStorage);
+		let delayCredential = true;
+		vi.spyOn(authStorage, "getApiKey").mockImplementation(async (provider, sessionId, options) => {
+			if (delayCredential) {
+				delayCredential = false;
+				advisorCredentialStarted.resolve();
+				await releaseAdvisorCredential.promise;
+			}
+			return originalGetApiKey(provider, sessionId, options);
+		});
+		const successStream = (): AssistantMessageEventStream => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const message = createAssistantMessage("ok");
+				stream.push({ type: "text_delta", contentIndex: 0, delta: "ok", partial: message });
+				stream.push({ type: "done", reason: "stop", message });
+			});
+			return stream;
+		};
+		const plainSecret = "OTHERSECRET";
+		const regexSecret = "tok_file123";
+		await Bun.write(tempDir.join("secret.txt"), `Loaded content contains ${regexSecret}`);
+		const obfuscator = new SecretObfuscator(
+			[
+				{ type: "plain", content: plainSecret, friendlyName: "TOKFILE123" },
+				{ type: "regex", content: "tok_[a-z0-9]+", mode: "replace" },
+			],
+			"test-key",
+		);
+		const extensionRunner = {
+			emitBeforeAgentStart: vi.fn(async () => {
+				beforeAgentStartEntered.resolve();
+				await releaseBeforeAgentStart.promise;
+				return undefined;
+			}),
+			emit: vi.fn().mockResolvedValue(undefined),
+		} as unknown as ExtensionRunner;
+		const mainAgent = new Agent({
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: successStream,
+		});
+		session = new AgentSession({
+			agent: mainAgent,
+			sessionManager,
+			settings: settings(),
+			modelRegistry,
+			advisorTools: [],
+			advisorStreamFn: (_requestModel, context) => {
+				capturedContexts.push(context);
+				return successStream();
+			},
+			obfuscator,
+			transformProviderContext: async context => context,
+			extensionRunner,
+		});
+		session.setGoalModeState({
+			enabled: true,
+			mode: "active",
+			goal: {
+				id: "file-secret-race-goal",
+				objective: `Finish using ${plainSecret}`,
+				status: "active",
+				tokenBudget: 100,
+				tokensUsed: 10,
+				timeUsedSeconds: 2,
+				createdAt: 1,
+				updatedAt: 2,
+			},
+		});
+		session.settings.setModelRole("advisor", "anthropic/claude-sonnet-4-5");
+		expect(session.setAdvisorEnabled(true)).toBe(true);
+		const advisor = session.getAdvisorAgent();
+		if (!advisor) throw new Error("Expected advisor agent to be live");
+
+		const stalePrompt = advisor.prompt("Start credential resolution").catch(() => {});
+		await advisorCredentialStarted.promise;
+		const activePrimaryPrompt = session.prompt("Inspect @secret.txt");
+		await beforeAgentStartEntered.promise;
+		releaseAdvisorCredential.resolve();
+		await stalePrompt;
+		releaseBeforeAgentStart.resolve();
+		await activePrimaryPrompt;
+
+		expect(capturedContexts).toHaveLength(0);
+	});
+
+	it("discards a mission before an idle user-attributed custom message is appended", async () => {
+		const capturedContexts: Context[] = [];
+		const credentialStarted = Promise.withResolvers<void>();
+		const releaseCredential = Promise.withResolvers<void>();
+		const originalGetApiKey = authStorage.getApiKey.bind(authStorage);
+		let delayCredential = true;
+		vi.spyOn(authStorage, "getApiKey").mockImplementation(async (provider, sessionId, options) => {
+			if (delayCredential) {
+				delayCredential = false;
+				credentialStarted.resolve();
+				await releaseCredential.promise;
+			}
+			return originalGetApiKey(provider, sessionId, options);
+		});
+		const successStream = (): AssistantMessageEventStream => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const message = createAssistantMessage("ok");
+				stream.push({ type: "text_delta", contentIndex: 0, delta: "ok", partial: message });
+				stream.push({ type: "done", reason: "stop", message });
+			});
+			return stream;
+		};
+		const plainSecret = "OTHERSECRET";
+		const regexSecret = "tok_tan123";
+		const obfuscator = new SecretObfuscator(
+			[
+				{ type: "plain", content: plainSecret, friendlyName: "TOKTAN123" },
+				{ type: "regex", content: "tok_[a-z0-9]+", mode: "replace" },
+			],
+			"test-key",
+		);
+		const mainAgent = new Agent({
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: successStream,
+		});
+		session = new AgentSession({
+			agent: mainAgent,
+			sessionManager,
+			settings: settings(),
+			modelRegistry,
+			advisorTools: [],
+			advisorStreamFn: (_requestModel, context) => {
+				capturedContexts.push(context);
+				return successStream();
+			},
+			obfuscator,
+			transformProviderContext: async context => context,
+		});
+		session.setGoalModeState({
+			enabled: true,
+			mode: "active",
+			goal: {
+				id: "custom-secret-race-goal",
+				objective: `Finish using ${plainSecret}`,
+				status: "active",
+				tokenBudget: 100,
+				tokensUsed: 10,
+				timeUsedSeconds: 2,
+				createdAt: 1,
+				updatedAt: 2,
+			},
+		});
+		session.settings.setModelRole("advisor", "anthropic/claude-sonnet-4-5");
+		expect(session.setAdvisorEnabled(true)).toBe(true);
+		const advisor = session.getAdvisorAgent();
+		if (!advisor) throw new Error("Expected advisor agent to be live");
+
+		const stalePrompt = advisor.prompt("Start credential resolution").catch(() => {});
+		await credentialStarted.promise;
+		await session.sendCustomMessage(
+			{
+				customType: "background-tan-dispatch",
+				content: `Background task contains ${regexSecret}`,
+				display: false,
+				attribution: "user",
+			},
+			{ deliverAs: "nextTurn", triggerTurn: false },
+		);
+		releaseCredential.resolve();
+		await stalePrompt;
+
+		expect(capturedContexts).toHaveLength(0);
+	});
+	it("carries sensitive-value validation to deferred provider dispatch", async () => {
+		const dispatchedContexts: Context[] = [];
+		const dispatchStarted = Promise.withResolvers<void>();
+		const releaseDispatch = Promise.withResolvers<void>();
+		const plainSecret = "OTHERSECRET";
+		const regexSecret = "tok_abc123";
+		const derivedPrefix = "TOKABC123";
+		const obfuscator = new SecretObfuscator(
+			[
+				{ type: "plain", content: plainSecret, friendlyName: derivedPrefix },
+				{ type: "regex", content: "tok_[a-z0-9]+", mode: "replace" },
+			],
+			"test-key",
+		);
+		const successStream = (): AssistantMessageEventStream => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const message = createAssistantMessage("ok");
+				stream.push({ type: "text_delta", contentIndex: 0, delta: "ok", partial: message });
+				stream.push({ type: "done", reason: "stop", message });
+			});
+			return stream;
+		};
+		const mainAgent = new Agent({
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: successStream,
+		});
+		let firstPreparedContext: Context | undefined;
+		let requestCount = 0;
+		session = new AgentSession({
+			agent: mainAgent,
+			sessionManager,
+			settings: settings(),
+			modelRegistry,
+			advisorTools: [],
+			advisorStreamFn: (_requestModel, context, options) => {
+				requestCount++;
+				if (requestCount > 1) {
+					dispatchedContexts.push(context);
+					return successStream();
+				}
+				firstPreparedContext = context;
+				const stream = new AssistantMessageEventStream();
+				void (async () => {
+					dispatchStarted.resolve();
+					await releaseDispatch.promise;
+					try {
+						options?.providerDispatchGuard?.();
+						dispatchedContexts.push(context);
+						const message = createAssistantMessage("ok");
+						stream.push({ type: "text_delta", contentIndex: 0, delta: "ok", partial: message });
+						stream.push({ type: "done", reason: "stop", message });
+					} catch (error) {
+						stream.fail(error);
+					}
+				})();
+				return stream;
+			},
+			obfuscator,
+			transformProviderContext: async context => context,
+		});
+		session.setGoalModeState({
+			enabled: true,
+			mode: "active",
+			goal: {
+				id: "deferred-secret-race-goal",
+				objective: `Finish using ${plainSecret}`,
+				status: "active",
+				tokenBudget: 100,
+				tokensUsed: 10,
+				timeUsedSeconds: 2,
+				createdAt: 1,
+				updatedAt: 2,
+			},
+		});
+		session.settings.setModelRole("advisor", "anthropic/claude-sonnet-4-5");
+		expect(session.setAdvisorEnabled(true)).toBe(true);
+		const advisor = session.getAdvisorAgent();
+		if (!advisor) throw new Error("Expected advisor agent to be live");
+
+		const stalePrompt = advisor.prompt("Wait before provider dispatch").catch(() => {});
+		await dispatchStarted.promise;
+		expect(JSON.stringify(firstPreparedContext)).toContain(derivedPrefix);
+		mainAgent.appendMessage({
+			role: "toolResult",
+			toolCallId: "tool-secret",
+			toolName: "read",
+			content: [{ type: "text", text: `Tool output contains ${regexSecret}` }],
+			isError: false,
+			timestamp: Date.now(),
+		});
+		releaseDispatch.resolve();
+		await stalePrompt;
+
+		expect(dispatchedContexts).not.toContain(firstPreparedContext);
+	});
+
 	it("suppresses a persisted terminal mission after mode reconciliation and tree navigation", async () => {
 		const capturedContexts: Context[] = [];
 		const captureStreamFn: StreamFn = (_m, context) => {
@@ -697,7 +1068,7 @@ describe("AgentSession advisor provider-options parity", () => {
 		expect(JSON.stringify(firstRequest)).not.toContain(completedObjective);
 	});
 
-	it("chooses collision-safe placeholders across advisor messages and the mission instruction", async () => {
+	it("chooses collision-safe placeholders when inherited transforms redact advisor messages first", async () => {
 		const capturedContexts: Context[] = [];
 		const captureStreamFn: StreamFn = (_m, context) => {
 			capturedContexts.push(context);
@@ -724,14 +1095,14 @@ describe("AgentSession advisor provider-options parity", () => {
 			advisorTools: [],
 			advisorStreamFn: captureStreamFn,
 			obfuscator,
-			transformProviderContext: async context => context,
+			transformProviderContext: async context => obfuscateProviderContext(obfuscator, context),
 		});
 		session.setGoalModeState({
 			enabled: true,
 			mode: "active",
 			goal: {
 				id: "goal-collision",
-				objective: `Finish <mission> & preserve ${regexSecret}`,
+				objective: `Finish <mission> & preserve ${plainSecret}`,
 				status: "active",
 				tokenBudget: 100,
 				tokensUsed: 10,
@@ -744,7 +1115,7 @@ describe("AgentSession advisor provider-options parity", () => {
 		expect(session.setAdvisorEnabled(true)).toBe(true);
 		const advisor = session.getAdvisorAgent();
 		if (!advisor) throw new Error("Expected advisor agent to be live");
-		await advisor.prompt(`Review the result containing ${plainSecret}`).catch(() => {});
+		await advisor.prompt(`Review the result containing ${regexSecret}`).catch(() => {});
 
 		expect(capturedContexts).toHaveLength(1);
 		const serialized = JSON.stringify(capturedContexts[0]);
@@ -755,7 +1126,7 @@ describe("AgentSession advisor provider-options parity", () => {
 		expect(mission?.renderedText).toContain("Finish &lt;mission&gt; &amp; preserve");
 	});
 
-	it("uses retained primary regex secrets when redacting the mission instruction", async () => {
+	it("uses retained primary regex secrets when an advisor starts after session resume", async () => {
 		const capturedContexts: Context[] = [];
 		const plainSecret = "OTHERSECRET";
 		const regexSecret = "tok_abc123";
@@ -777,7 +1148,12 @@ describe("AgentSession advisor provider-options parity", () => {
 			return stream;
 		};
 		const mainAgent = new Agent({
-			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [{ role: "user", content: `Resumed primary delta contains ${regexSecret}`, timestamp: 1 }],
+			},
 			streamFn: mainStreamFn,
 		});
 		const advisorSettings = settings();
@@ -810,8 +1186,10 @@ describe("AgentSession advisor provider-options parity", () => {
 		});
 		session.settings.setModelRole("advisor", "anthropic/claude-sonnet-4-5");
 		expect(session.setAdvisorEnabled(true)).toBe(true);
+		const advisor = session.getAdvisorAgent();
+		if (!advisor) throw new Error("Expected advisor agent to be live");
 
-		await mainAgent.prompt(`Primary delta contains ${regexSecret}`);
+		await advisor.prompt("Review the retained mission").catch(() => {});
 
 		expect(capturedContexts).toHaveLength(1);
 		const serialized = JSON.stringify(capturedContexts[0]);
@@ -824,6 +1202,13 @@ describe("AgentSession advisor provider-options parity", () => {
 		const provider = "mission-wire-provider";
 		const api = "mission-wire-api";
 		const modelId = "mission-wire-model";
+		const plainSecret = "OTHERSECRET";
+		const regexSecret = "tok_abc123";
+		const derivedPrefix = "TOKABC123";
+		await Bun.write(
+			tempDir.join(".omp/secrets.yml"),
+			`- type: plain\n  content: ${plainSecret}\n  friendlyName: ${derivedPrefix}\n- type: regex\n  content: tok_[a-z0-9]+\n  mode: replace\n`,
+		);
 		const sourceId = "<inline-0>";
 		const sdkAuthStorage = createInMemoryAuthStorage();
 		const sdkModelRegistry = new ModelRegistry(sdkAuthStorage, tempDir.join("mission-models.yml"));
@@ -856,7 +1241,7 @@ describe("AgentSession advisor provider-options parity", () => {
 				],
 			});
 		};
-		const sdkSettings = Settings.isolated({ "compaction.enabled": false });
+		const sdkSettings = Settings.isolated({ "compaction.enabled": false, "secrets.enabled": true });
 		sdkSettings.setModelRole("default", `${provider}/${modelId}`);
 		sdkSettings.setModelRole("advisor", `${provider}/${modelId}`);
 
@@ -878,14 +1263,20 @@ describe("AgentSession advisor provider-options parity", () => {
 				enableMCP: false,
 				enableLsp: false,
 				skipPythonPreflight: true,
+				contextInstructions: [
+					bindRenderedInstruction("todo.snapshot", `Primary-only instruction contains ${regexSecret}`, "main"),
+				],
 			});
 			session = created.session;
+			await session.prompt("Prepare the primary context");
+			expect(capturedContexts).toHaveLength(1);
+			capturedContexts.length = 0;
 			session.setGoalModeState({
 				enabled: true,
 				mode: "active",
 				goal: {
 					id: "sdk-goal",
-					objective: "Deliver the SDK mission through the real provider transform",
+					objective: `Deliver the SDK mission through the real provider transform with ${plainSecret}`,
 					status: "active",
 					tokenBudget: 100,
 					tokensUsed: 20,
@@ -907,6 +1298,10 @@ describe("AgentSession advisor provider-options parity", () => {
 			expect(delivered.some(instruction => instruction.id === "goal.active")).toBe(false);
 			expect(missions[0]?.renderedText).toContain("Deliver the SDK mission through the real provider transform");
 			expect(missions[0]?.renderedText).not.toContain("tokensUsed");
+			const serialized = JSON.stringify(capturedContexts[0]);
+			expect(serialized).not.toContain(plainSecret);
+			expect(serialized).not.toContain(regexSecret);
+			expect(serialized).not.toContain(derivedPrefix);
 		} finally {
 			await session?.dispose();
 			sdkModelRegistry.clearSourceRegistrations(sourceId);

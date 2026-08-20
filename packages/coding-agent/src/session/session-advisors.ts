@@ -87,7 +87,7 @@ import {
 } from "../thinking";
 import type { AgentSessionEvent } from "./agent-session-events";
 import type { ClientBridge } from "./client-bridge";
-import type { CustomMessage, CustomMessagePayload } from "./messages";
+import { type CustomMessage, type CustomMessagePayload, convertToLlm } from "./messages";
 import { isAdvisorCard, isTerminalTextAssistantAnswer } from "./queued-messages";
 import {
 	formatRetryFallbackSelector,
@@ -174,6 +174,7 @@ interface ActiveAdvisor {
 	missionGenerationInFlight?: number;
 	missionKeyInFlight?: string;
 	missionTerminalInFlight?: boolean;
+	retainedRegexSecretValuesInFlight?: Set<string>;
 	reviewedTerminalMissionKey?: string;
 }
 
@@ -329,6 +330,7 @@ export class SessionAdvisors {
 	#advisorYieldQueueUnsubscribe: (() => void) | undefined;
 	#missionGeneration = 0;
 	#pendingTerminalMissionKey: string | undefined;
+	#primaryRegexSecretValues = new Set<string>();
 
 	constructor(host: SessionAdvisorsHost, options: SessionAdvisorsOptions) {
 		this.#host = host;
@@ -346,9 +348,26 @@ export class SessionAdvisors {
 		this.#completeWithAdvisorStream = createCompleteFnFromStreamFn(options.streamFn ?? streamSimple);
 		this.#transformProviderContext = options.transformProviderContext;
 		if (options.initialCosts) this.#advisorCosts = new Map(options.initialCosts);
+		this.#host.agent.addBeforeInputHook(messages => this.retainPrimaryInput(messages));
+		this.retainPrimaryInput(this.#host.agent.state.messages);
 		if (this.#advisorEnabled) this.#buildAdvisorRuntime();
 	}
 
+	retainPrimaryInput(messages: readonly AgentMessage[]): void {
+		this.#retainPrimaryContext({ messages: convertToLlm([...messages]) });
+	}
+
+	retainPrimaryInstructions(instructions: readonly ContextInstruction[]): void {
+		this.#retainPrimaryContext({ messages: [], instructions: [...instructions] });
+	}
+
+	#retainPrimaryContext(context: Context): void {
+		if (!this.#host.obfuscator?.hasSecrets()) return;
+		const values = collectProviderContextRegexSecretValues(this.#host.obfuscator, context);
+		if (values.size === 0) return;
+		for (const value of values) this.#primaryRegexSecretValues.add(value);
+		for (const advisor of this.#advisors) advisor.runtime.retainRegexSecretValues(values);
+	}
 	async #transformAdvisorProviderContext(context: Context, model: Model, advisor: ActiveAdvisor): Promise<Context> {
 		const missionId = "goal.advisor_mission";
 		const generation = this.#missionGeneration;
@@ -359,13 +378,18 @@ export class SessionAdvisors {
 			preparedInstructions.length > 0 || context.instructions
 				? { ...context, instructions: preparedInstructions }
 				: context;
+		const sharedRegexSecretValues = collectProviderContextRegexSecretValues(this.#host.obfuscator, prepared);
+		for (const value of this.#primaryRegexSecretValues) sharedRegexSecretValues.add(value);
+		advisor.runtime.copyRetainedRegexSecretValuesTo(sharedRegexSecretValues);
 		const transformed = this.#transformProviderContext
 			? await this.#transformProviderContext(prepared, model, "side_model")
 			: prepared;
 		if (generation !== this.#missionGeneration) {
 			throw new Error("advisor mission changed during provider context transform");
 		}
-		const sharedRegexSecretValues = collectProviderContextRegexSecretValues(this.#host.obfuscator, transformed);
+		for (const value of collectProviderContextRegexSecretValues(this.#host.obfuscator, transformed)) {
+			sharedRegexSecretValues.add(value);
+		}
 		advisor.runtime.copyRetainedRegexSecretValuesTo(sharedRegexSecretValues);
 		const candidateMission = this.#host.advisorMissionContext(sharedRegexSecretValues);
 		advisor.runtime.retainRegexSecretValues(sharedRegexSecretValues);
@@ -382,6 +406,7 @@ export class SessionAdvisors {
 		advisor.missionGenerationInFlight = generation;
 		advisor.missionKeyInFlight = mission?.key;
 		advisor.missionTerminalInFlight = mission?.terminal;
+		advisor.retainedRegexSecretValuesInFlight = new Set(sharedRegexSecretValues);
 		const obfuscated = obfuscateProviderContext(this.#host.obfuscator, withMission, sharedRegexSecretValues);
 		if (!obfuscated.instructions) return obfuscated;
 		let keptMission = false;
@@ -402,6 +427,7 @@ export class SessionAdvisors {
 			advisor.missionGenerationInFlight = undefined;
 			advisor.missionKeyInFlight = undefined;
 			advisor.missionTerminalInFlight = undefined;
+			advisor.retainedRegexSecretValuesInFlight = undefined;
 			advisor.reviewedTerminalMissionKey = undefined;
 			advisor.runtime.reset("advisor-mission-changed");
 		}
@@ -415,6 +441,7 @@ export class SessionAdvisors {
 		advisor.missionGenerationInFlight = undefined;
 		advisor.missionKeyInFlight = undefined;
 		advisor.missionTerminalInFlight = undefined;
+		advisor.retainedRegexSecretValuesInFlight = undefined;
 		if (generation !== this.#missionGeneration || !terminal || key !== this.#pendingTerminalMissionKey) return;
 		advisor.reviewedTerminalMissionKey = key;
 		this.#consumeTerminalMissionWhenReviewed();
@@ -665,17 +692,19 @@ export class SessionAdvisors {
 	 */
 	#resetAdvisorSessionState(preserveCost: boolean, preserveDeliveries: boolean): void {
 		if (!preserveCost) this.#advisorCosts.clear();
+		this.#primaryRegexSecretValues.clear();
 		// Mute the recorder across the re-prime: AdvisorRuntime.reset() aborts the advisor
 		// loop, and that abort can emit an `aborted` message_end we must not attribute to
 		// either session's transcript. Detach, reset, then re-attach the live agent's feed.
 		for (const a of this.#advisors) {
 			a.agentUnsubscribe?.();
 			a.agentUnsubscribe = undefined;
-			a.runtime.reset("conversation-boundary");
+			a.runtime.reset("conversation-boundary", { clearRetainedRegexSecretValues: true });
 			a.adviseTool.resetDeliveredNotes();
 			a.emissionGuard.reset();
 			this.#attachAdvisorRecorderFeed(a);
 		}
+		this.retainPrimaryInput(this.#host.agent.state.messages);
 		this.#advisorPrimaryTurnsCompleted = 0;
 		this.#advisorInterruptImmuneTurnStart = undefined;
 		this.#advisorAutoResumeSuppressed = false;
@@ -923,12 +952,30 @@ export class SessionAdvisors {
 			});
 			const baseAdvisorStreamFn = this.#advisorStreamFn ?? streamSimple;
 			const advisorStreamFn: StreamFn = (requestModel, context, options) => {
-				if (advisorRef.missionGenerationInFlight !== this.#missionGeneration) {
-					throw new Error("advisor mission changed before provider dispatch");
-				}
+				const generation = advisorRef.missionGenerationInFlight;
+				const preparedRegexSecretValues = advisorRef.retainedRegexSecretValuesInFlight;
+				const validateProviderDispatch = (): void => {
+					if (generation !== this.#missionGeneration) {
+						throw new Error("advisor mission changed before provider dispatch");
+					}
+					const currentRegexSecretValues = new Set<string>();
+					advisorRef.runtime.copyRetainedRegexSecretValuesTo(currentRegexSecretValues);
+					if (
+						!preparedRegexSecretValues ||
+						[...currentRegexSecretValues].some(value => !preparedRegexSecretValues.has(value))
+					) {
+						throw new Error("advisor sensitive values changed before provider dispatch");
+					}
+				};
+				validateProviderDispatch();
+				const providerDispatchGuard = (): void => {
+					validateProviderDispatch();
+					options?.providerDispatchGuard?.();
+				};
+				const guardedOptions = { ...options, providerDispatchGuard };
 				if (requestModel.api === "openai-codex-responses") {
 					return baseAdvisorStreamFn(requestModel, context, {
-						...options,
+						...guardedOptions,
 						codexSseMaxAttempts: ADVISOR_CODEX_SSE_MAX_ATTEMPTS,
 					});
 				}
@@ -937,9 +984,9 @@ export class SessionAdvisors {
 					requestModel.api === "google-gemini-cli" ||
 					requestModel.api === "google-vertex"
 				) {
-					return baseAdvisorStreamFn(requestModel, context, { ...options, acceptEmptyResponse: true });
+					return baseAdvisorStreamFn(requestModel, context, { ...guardedOptions, acceptEmptyResponse: true });
 				}
-				return baseAdvisorStreamFn(requestModel, context, options);
+				return baseAdvisorStreamFn(requestModel, context, guardedOptions);
 			};
 			const advisorAgent = new Agent({
 				contextTarget: "side_model",
@@ -1090,6 +1137,7 @@ export class SessionAdvisors {
 			this.#refreshAdvisorProviderIdentity(advisorRef);
 			this.#attachAdvisorRecorderFeed(advisorRef);
 			if (seedToCurrent) runtime.seedTo(this.#host.agent.state.messages.length);
+			runtime.retainRegexSecretValues(this.#primaryRegexSecretValues);
 			this.#advisorStatuses.set(slug, { name: advisorName, status: "running" });
 			this.#advisors.push(advisorRef);
 		}

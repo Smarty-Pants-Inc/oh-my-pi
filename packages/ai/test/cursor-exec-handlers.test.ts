@@ -1297,6 +1297,71 @@ describe("Cursor exec local-work tracking (issue #4593)", () => {
 		expect(written.length).toBe(1);
 	});
 
+	it("revalidates after a local exec handler before writing its result", async () => {
+		const output = cursorAssistantMessage();
+		const stream = new AssistantMessageEventStream();
+		const state = newBlockState();
+		const written: unknown[] = [];
+		const h2Request = {
+			write: (chunk: unknown) => {
+				written.push(chunk);
+				return true;
+			},
+		} as unknown as Parameters<typeof handleServerMessage>[5];
+		const handlerStarted = Promise.withResolvers<void>();
+		const releaseHandler = Promise.withResolvers<void>();
+		const execHandlers: CursorExecHandlers = {
+			async read(args) {
+				handlerStarted.resolve();
+				await releaseHandler.promise;
+				return {
+					role: "toolResult",
+					toolCallId: args.toolCallId,
+					toolName: "read",
+					content: [{ type: "text", text: "newly sensitive file contents" }],
+					isError: false,
+					timestamp: 1,
+				} satisfies ToolResultMessage;
+			},
+		};
+		const serverMsg = create(AgentServerMessageSchema, {
+			message: {
+				case: "execServerMessage",
+				value: create(ExecServerMessageSchema, {
+					id: 1,
+					execId: "exec-guarded-read",
+					message: {
+						case: "readArgs",
+						value: create(ReadArgsSchema, { path: "/tmp/slow-file", toolCallId: "call-guarded-read" }),
+					},
+				}),
+			},
+		});
+		let valid = true;
+		const dispatch = handleServerMessage(
+			serverMsg,
+			output,
+			stream,
+			state,
+			new Map(),
+			h2Request,
+			execHandlers,
+			undefined,
+			{ sawTokenDelta: false },
+			[],
+			undefined,
+			() => {
+				if (!valid) throw new Error("Cursor request became stale during local exec");
+			},
+		);
+
+		await handlerStarted.promise;
+		valid = false;
+		releaseHandler.resolve();
+
+		await expect(dispatch).rejects.toThrow("Cursor request became stale during local exec");
+		expect(written).toEqual([]);
+	});
 	it("synthesizes an MCP call when the exec frame precedes its streamed block", async () => {
 		const output = cursorAssistantMessage();
 		const stream = new AssistantMessageEventStream();

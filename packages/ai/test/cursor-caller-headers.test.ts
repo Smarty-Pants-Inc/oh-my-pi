@@ -186,4 +186,44 @@ describe("Cursor caller headers reach the wire", () => {
 		expect(sent.host).toBeUndefined();
 		expect(sent["x-trace"]).toBe("kept");
 	});
+
+	it("revalidates after async preparation before opening the HTTP/2 stream", async () => {
+		const baseUrl = await startServer();
+		const preparationStarted = Promise.withResolvers<void>();
+		const releasePreparation = Promise.withResolvers<void>();
+		let valid = true;
+		const stream = streamCursor(makeModel(baseUrl), context, {
+			apiKey: "test-token",
+			onToolContracts: async () => {
+				preparationStarted.resolve();
+				await releasePreparation.promise;
+			},
+			providerDispatchGuard: () => {
+				if (!valid) throw new Error("Cursor request became stale during preparation");
+			},
+		});
+
+		await preparationStarted.promise;
+		valid = false;
+		releasePreparation.resolve();
+		const result = await stream.result();
+
+		expect(result.errorMessage).toContain("Cursor request became stale during preparation");
+		expect(received).toEqual({});
+	});
+
+	it("does not open an HTTP/2 stream for an already-aborted request", async () => {
+		const baseUrl = await startServer();
+		const controller = new AbortController();
+		controller.abort();
+
+		const stream = streamCursor(makeModel(baseUrl), context, {
+			apiKey: "test-token",
+			signal: controller.signal,
+		});
+		const result = await stream.result();
+
+		expect(result.stopReason).toBe("aborted");
+		expect(received).toEqual({});
+	});
 });

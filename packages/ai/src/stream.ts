@@ -25,7 +25,7 @@ import { isConcurrencyCapExclusion, isUsageLimitOutcome } from "./error/rate-lim
 import type { BedrockOptions } from "./providers/amazon-bedrock";
 import type { AnthropicOptions } from "./providers/anthropic";
 import type { MessageCreateParamsStreaming } from "./providers/anthropic-wire";
-import { coworkFetch } from "./providers/cowork-fetch";
+import { COWORK_PROVIDER_DISPATCH_GUARD, coworkFetch } from "./providers/cowork-fetch";
 import type { CursorOptions } from "./providers/cursor";
 import type { DevinOptions } from "./providers/devin";
 import { isGitLabDuoModel, streamGitLabDuo } from "./providers/gitlab-duo";
@@ -87,6 +87,31 @@ import { withThinkingLoopGuard } from "./utils/thinking-loop";
 function defaultFetchForModel(model: Model<Api>): FetchImpl {
 	if (model.provider === "anthropic" && model.api === "anthropic-messages") return coworkFetch;
 	return globalThis.fetch;
+}
+
+const providerDispatchGuardedFetches = new WeakMap<FetchImpl, NonNullable<StreamOptions["providerDispatchGuard"]>>();
+
+function withProviderDispatchGuard(fetchImpl: FetchImpl, guard: StreamOptions["providerDispatchGuard"]): FetchImpl {
+	if (!guard || providerDispatchGuardedFetches.get(fetchImpl) === guard) return fetchImpl;
+	const guardedFetch: FetchImpl = (input, init) => {
+		guard();
+		return fetchImpl(input, { ...(init ?? {}), [COWORK_PROVIDER_DISPATCH_GUARD]: guard } as RequestInit);
+	};
+	if (fetchImpl.preconnect) guardedFetch.preconnect = fetchImpl.preconnect;
+	providerDispatchGuardedFetches.set(guardedFetch, guard);
+	return guardedFetch;
+}
+
+function prepareProviderRequestOptions<T extends Pick<StreamOptions, "fetch" | "providerDispatchGuard">>(
+	model: Model<Api>,
+	inputOptions: T,
+): T {
+	const guard = inputOptions.providerDispatchGuard;
+	const guardedFetch = withProviderDispatchGuard(inputOptions.fetch ?? defaultFetchForModel(model), guard);
+	const debugOptions = withExtraCaFetch(withRequestDebugFetch({ ...inputOptions, fetch: guardedFetch } as T));
+	const fetch = wrapFetchForProxy(debugOptions.fetch ?? guardedFetch, model.provider);
+	if (guard) providerDispatchGuardedFetches.set(fetch, guard);
+	return { ...debugOptions, fetch } as T;
 }
 
 function isGoogleVertexAuthenticatedModel(model: Model<Api>): boolean {
@@ -643,7 +668,9 @@ export const __providerInFlightForTesting = {
 	},
 };
 
-function withProviderInFlightLimit<TOptions extends Pick<StreamOptions, "signal" | "maxInFlightRequests">>(
+function withProviderInFlightLimit<
+	TOptions extends Pick<StreamOptions, "signal" | "maxInFlightRequests" | "providerDispatchGuard">,
+>(
 	model: Model<Api>,
 	options: TOptions | undefined,
 	dispatch: () => AssistantMessageEventStream,
@@ -653,7 +680,10 @@ function withProviderInFlightLimit<TOptions extends Pick<StreamOptions, "signal"
 	// provider exits are covered by one wrap. Official first-party providers are
 	// exempt (see `healLeakedThinking`); healing is otherwise idempotent.
 	const limit = resolveProviderInFlightLimit(model.provider, options);
-	if (limit === undefined) return healLeakedThinking(model, dispatch());
+	if (limit === undefined) {
+		options?.providerDispatchGuard?.();
+		return healLeakedThinking(model, dispatch());
+	}
 
 	const outer = new AssistantMessageEventStream();
 	void (async () => {
@@ -688,6 +718,7 @@ function withProviderInFlightLimit<TOptions extends Pick<StreamOptions, "signal"
 			if (options?.signal?.aborted) {
 				throw options.signal.reason ?? new AIError.AbortError("Provider request aborted before dispatch");
 			}
+			options?.providerDispatchGuard?.();
 			const inner = healLeakedThinking(model, dispatch());
 			let terminalEvent: AssistantMessageEvent | undefined;
 			for await (const event of inner) {
@@ -883,13 +914,7 @@ function streamDispatch<TApi extends Api>(
 	context: Context,
 	options?: OptionsForApi<TApi>,
 ): AssistantMessageEventStream {
-	const inputOptions = (options || {}) as StreamOptions;
-	const baseOptions = { ...inputOptions, fetch: inputOptions.fetch ?? defaultFetchForModel(model) };
-	const debugOptions = withExtraCaFetch(withRequestDebugFetch(baseOptions));
-	const requestOptions = {
-		...debugOptions,
-		fetch: wrapFetchForProxy(debugOptions.fetch, model.provider),
-	} as OptionsForApi<TApi>;
+	const requestOptions = prepareProviderRequestOptions(model, (options || {}) as OptionsForApi<TApi>);
 	assertExplicitOpenAIResponsesPromptCacheSupport(model, requestOptions);
 
 	// Check custom API registry first (extension-provided APIs like "vertex-claude-api")
@@ -1414,13 +1439,7 @@ function streamSimpleRequest<TApi extends Api>(
 	context: Context,
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
-	const inputOptions = (options || {}) as SimpleStreamOptions;
-	const baseOptions = { ...inputOptions, fetch: inputOptions.fetch ?? defaultFetchForModel(model) };
-	const debugOptions = withExtraCaFetch(withRequestDebugFetch(baseOptions));
-	const requestOptions = {
-		...debugOptions,
-		fetch: wrapFetchForProxy(debugOptions.fetch, model.provider),
-	} as SimpleStreamOptions;
+	const requestOptions = prepareProviderRequestOptions(model, (options || {}) as SimpleStreamOptions);
 
 	const apiKeyResolver = isApiKeyResolver(requestOptions?.apiKey) ? requestOptions.apiKey : undefined;
 	if (apiKeyResolver) {
@@ -1588,16 +1607,17 @@ function streamSimpleRequest<TApi extends Api>(
 
 	// GitLab Duo Workflow - IDE workflow protocol + WebSocket action bridge
 	if (model.api === "gitlab-duo-agent") {
-		// Does not route through withProviderInFlightLimit, so heal explicitly.
-		return withThinkingLoopGuard(model, requestOptions, opts =>
-			healLeakedThinking(
+		// Does not route through withProviderInFlightLimit, so guard and heal explicitly.
+		return withThinkingLoopGuard(model, requestOptions, opts => {
+			opts?.providerDispatchGuard?.();
+			return healLeakedThinking(
 				model,
 				streamGitLabDuoWorkflow(model as Model<"gitlab-duo-agent">, context, {
 					...opts,
 					apiKey,
 				}),
-			),
-		);
+			);
+		});
 	}
 
 	// Kimi Code - route to dedicated handler that wraps OpenAI or Anthropic API
@@ -1901,6 +1921,7 @@ function mapOptionsForApi<TApi extends Api>(
 		codexSseMaxAttempts: options?.codexSseMaxAttempts,
 		providerSessionState: options?.providerSessionState,
 		maxInFlightRequests: options?.maxInFlightRequests,
+		providerDispatchGuard: options?.providerDispatchGuard,
 		onPayload: options?.onPayload,
 		onToolContracts: options?.onToolContracts,
 		onResponse: options?.onResponse,

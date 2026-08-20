@@ -2625,6 +2625,78 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 		expect(output.content).toEqual([{ type: "text", text: "OK" }]);
 	});
 
+	it("revalidates before writing start and resume WebSocket frames", async () => {
+		const createSocket = () => {
+			let closed = false;
+			const sent: string[] = [];
+			const socket: GitLabDuoWorkflowWebSocketLike = {
+				onopen: null,
+				onmessage: null,
+				onerror: null,
+				onclose: null,
+				send(data) {
+					sent.push(data);
+				},
+				close() {
+					closed = true;
+				},
+			};
+			return { socket, sent, isClosed: () => closed };
+		};
+		const createState = (): GitLabDuoWorkflowStreamState => ({
+			stream: new AssistantMessageEventStream(),
+			output: {
+				role: "assistant",
+				content: [],
+				api: "gitlab-duo-agent",
+				provider: "gitlab-duo-agent",
+				model: model.id,
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: Date.now(),
+			},
+			model,
+			started: true,
+		});
+		const options = {
+			apiKey: "redacted",
+			providerDispatchGuard: () => {
+				throw new Error("GitLab request became stale before socket send");
+			},
+		};
+
+		const start = createSocket();
+		const startRun = runGitLabDuoWorkflowSocket(
+			start.socket,
+			buildGitLabDuoWorkflowStartRequest("workflow-1", model, context),
+			createState(),
+			options,
+		);
+		start.socket.onopen?.(new Event("open"));
+		await expect(startRun).rejects.toThrow("GitLab request became stale before socket send");
+		expect(start.sent).toEqual([]);
+		expect(start.isClosed()).toBe(true);
+
+		const resume = createSocket();
+		const resumeRun = runGitLabDuoWorkflowSocket(
+			resume.socket,
+			buildGitLabDuoWorkflowStartRequest("workflow-1", model, context),
+			createState(),
+			options,
+			{ actionResponse: { requestID: "req-read-1", plainTextResponse: { response: "README file text" } } },
+		);
+		await expect(resumeRun).rejects.toThrow("GitLab request became stale before socket send");
+		expect(resume.sent).toEqual([]);
+		expect(resume.isClosed()).toBe(true);
+	});
+
 	it("renders procedural agent checkpoints as text, matching the official chat client", async () => {
 		const socket: GitLabDuoWorkflowWebSocketLike = {
 			onopen: null,

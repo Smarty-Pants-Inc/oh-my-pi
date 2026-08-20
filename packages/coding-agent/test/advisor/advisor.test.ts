@@ -3875,7 +3875,7 @@ describe("advisor", () => {
 			runtime.copyRetainedRegexSecretValuesTo(retained);
 			expect(retained).toContain(regexSecret);
 
-			runtime.reset();
+			runtime.reset("conversation-boundary", { clearRetainedRegexSecretValues: true });
 			const afterReset = new Set<string>();
 			runtime.copyRetainedRegexSecretValuesTo(afterReset);
 			expect(afterReset).toEqual(new Set());
@@ -4743,6 +4743,49 @@ describe("advisor", () => {
 			expect(promptInputs).toHaveLength(2);
 			expect(promptText(promptInputs[1])).toContain("new-conversation");
 			expect(promptText(promptInputs[1])).not.toContain("old-conversation");
+		});
+
+		it("does not report success when a reset-aborted advisor prompt resolves", async () => {
+			const firstPromptStarted = Promise.withResolvers<void>();
+			const promptGate = Promise.withResolvers<void>();
+			const state: { messages: AgentMessage[] } = { messages: [] };
+			let successCalls = 0;
+			const agent: AdvisorAgent = {
+				prompt: () => {
+					firstPromptStarted.resolve();
+					return promptGate.promise;
+				},
+				reset: () => {
+					state.messages.length = 0;
+				},
+				abort: () => {
+					state.messages.push({
+						role: "assistant",
+						content: [{ type: "text", text: "aborted output" }],
+						stopReason: "aborted",
+						timestamp: 2,
+					} as unknown as AgentMessage);
+					promptGate.resolve();
+				},
+				state,
+			};
+			const messages: AgentMessage[] = [{ role: "user", content: "old-conversation", timestamp: 1 } as AgentMessage];
+			const runtime = new AdvisorRuntime(agent, {
+				snapshotMessages: () => messages,
+				enqueueAdvice: () => {},
+				onTurnSuccess: () => {
+					successCalls++;
+				},
+			});
+
+			runtime.onTurnEnd(messages);
+			await firstPromptStarted.promise;
+			runtime.reset();
+			await new Promise<void>(resolve => setImmediate(resolve));
+
+			expect(state.messages).toHaveLength(1);
+			expect(runtime.backlog).toBe(0);
+			expect(successCalls).toBe(0);
 		});
 
 		it("retries the interrupted batch after a session transition rolls back", async () => {

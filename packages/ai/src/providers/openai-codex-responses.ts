@@ -1848,6 +1848,7 @@ async function openCodexWebSocketTransport(
 			firstEventTimeoutMs: requestSetup.websocketFirstEventTimeoutMs,
 		},
 		requestSetup.requestSignal,
+		options?.providerDispatchGuard,
 		onSseEvent,
 	);
 	return {
@@ -3713,6 +3714,7 @@ class CodexWebSocketConnection {
 		request: Record<string, unknown>,
 		timeouts: CodexWebSocketRequestTimeouts,
 		signal?: AbortSignal,
+		providerDispatchGuard?: () => void,
 		onSseEvent?: (event: RawSseEvent) => void,
 	): AsyncGenerator<Record<string, unknown>> {
 		if (!this.#socket || this.#socket.readyState !== WebSocket.OPEN) {
@@ -3764,6 +3766,7 @@ class CodexWebSocketConnection {
 			if (!socket || socket.readyState !== WebSocket.OPEN) {
 				throw new CodexWebSocketTransportError(`websocket connection is unavailable`);
 			}
+			providerDispatchGuard?.();
 			try {
 				socket.send(requestPayload);
 			} catch (error) {

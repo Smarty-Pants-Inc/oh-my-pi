@@ -6149,6 +6149,10 @@ export class AgentSession {
 		return this.#goalRuntime;
 	}
 
+	retainPrimaryProviderInstructions(instructions: readonly ContextInstruction[]): void {
+		this.#advisors.retainPrimaryInstructions(instructions);
+	}
+
 	/** Fresh registered components injected at the provider boundary, never persisted as messages. */
 	buildProviderContextInstructions(): ContextInstruction[] {
 		const instructions: ContextInstruction[] = [...this.#turnExtensionInstructions];
@@ -6644,6 +6648,25 @@ export class AgentSession {
 			!(expandPromptTemplates && text.startsWith("/"));
 		if (queueDuringSemanticMaintenance) this.#assertQueuedUserMessageCanStart(lifecycleGeneration);
 		else this.#assertPromptCanStart(lifecycleGeneration);
+		const promptAttribution = options?.attribution ?? (options?.synthetic ? "agent" : "user");
+		const retainPromptText = (promptText: string): void => {
+			this.#advisors.retainPrimaryInput([
+				options?.synthetic
+					? {
+							role: "developer",
+							content: [{ type: "text", text: promptText }],
+							attribution: promptAttribution,
+							timestamp: Date.now(),
+						}
+					: {
+							role: "user",
+							content: [{ type: "text", text: promptText }],
+							attribution: promptAttribution,
+							timestamp: Date.now(),
+						},
+			]);
+		};
+		retainPromptText(text);
 
 		// Handle extension commands first (execute immediately, even during streaming)
 		if (expandPromptTemplates && text.startsWith("/")) {
@@ -6670,6 +6693,7 @@ export class AgentSession {
 
 		// Expand file-based prompt templates if requested
 		const expandedText = expandPromptTemplates ? expandPromptTemplate(text, [...this.#promptTemplates]) : text;
+		retainPromptText(expandedText);
 
 		// Magic keywords ("ultrathink", "orchestrate"): append hidden system notices after the
 		// user's message that steer this turn. User-authored prompts only — synthetic /
@@ -6732,7 +6756,6 @@ export class AgentSession {
 			? await this.#buildImageDescriptionNotice(normalizedImages)
 			: undefined;
 
-		const promptAttribution = options?.attribution ?? (options?.synthetic ? "agent" : "user");
 		if (externalThinkingToolChoice) {
 			this.#toolChoiceQueue.pushOnce(externalThinkingToolChoice, {
 				label: "external-thinking",
@@ -6881,6 +6904,12 @@ export class AgentSession {
 		if (abort) await abort;
 		this.onBeforePromptAcceptance?.();
 		this.#assertPromptCanStart(options?.lifecycleGeneration);
+		this.#advisors.retainPrimaryInput([
+			...(options?.prependMessages ?? []),
+			message,
+			...(options?.consumeExplicitPromptMessages ? this.#pendingExplicitPromptMessages : []),
+			...this.#pendingNextTurnMessages,
+		]);
 		const automaticTurn =
 			options?.automaticTurn ??
 			(message.role === "custom" && message.customType === "goal-continuation"
@@ -7004,6 +7033,7 @@ export class AgentSession {
 					useHashLines: resolveFileDisplayMode(this).hashLines,
 					snapshotStore: getFileSnapshotStore(this),
 				});
+				this.#advisors.retainPrimaryInput(fileMentionMessages);
 				for (const fileMentionMessage of fileMentionMessages) {
 					messages.push(await this.#normalizeAgentMessageImages(fileMentionMessage));
 				}
@@ -7472,6 +7502,9 @@ export class AgentSession {
 	): Promise<void> {
 		const acceptedLifecycleGeneration = lifecycleGeneration ?? this.#lifecycleTransitionGeneration;
 		this.#assertQueuedUserMessageCanStart(acceptedLifecycleGeneration);
+		this.#advisors.retainPrimaryInput([
+			{ role: "user", content: [{ type: "text", text }], attribution: "user", timestamp: Date.now() },
+		]);
 		const normalizedPrependMessages: CustomMessage[] = [];
 		for (const message of prependMessages) {
 			normalizedPrependMessages.push(
@@ -7880,6 +7913,7 @@ export class AgentSession {
 			const message = this.#withPendingSemanticDeliveryId(data.message, pendingId);
 			this.#pendingSemanticDeliveryIds.add(pendingId);
 			if (data.kind === "explicitPrompt") {
+				this.#advisors.retainPrimaryInput([message]);
 				this.#pendingExplicitPromptMessages.push(message);
 			} else if (data.kind === "followUp") {
 				this.agent.followUp(message);
@@ -7904,6 +7938,7 @@ export class AgentSession {
 	}
 
 	#queueExplicitPromptMessage(message: CustomMessage): void {
+		this.#advisors.retainPrimaryInput([message]);
 		if (
 			this.agent.attachInFlightQueuedMessageCompanions([message], restored =>
 				this.restoreExplicitPromptMessages(restored),
@@ -7922,6 +7957,7 @@ export class AgentSession {
 	}
 
 	#queueNextTurnMessage(message: CustomMessage): void {
+		this.#advisors.retainPrimaryInput([message]);
 		this.#pendingNextTurnMessages.push(message);
 	}
 
@@ -7969,6 +8005,7 @@ export class AgentSession {
 			attribution: message.attribution ?? "agent",
 			timestamp: Date.now(),
 		};
+		this.#advisors.retainPrimaryInput([appMessage]);
 		const normalizedAppMessage = await this.#normalizeAgentMessageImages(appMessage);
 		this.onBeforePromptAcceptance?.();
 		if (allowSemanticMaintenance) this.#assertQueuedUserMessageCanStart(lifecycleGeneration);
@@ -8089,6 +8126,7 @@ export class AgentSession {
 			attribution: normalizedPayload.attribution,
 			timestamp: Date.now(),
 		};
+		this.#advisors.retainPrimaryInput([appMessage]);
 		const normalizedAppMessage = await this.#normalizeAgentMessageImages(appMessage);
 		if (semanticMode) {
 			const acceptance = this.#beginSemanticDeliveryAcceptance();

@@ -469,6 +469,7 @@ export class Agent {
 	#appendOnlyContext?: AppendOnlyContextManager;
 	#beforeQueuedMessageDequeueHooks = new Set<(signal?: AbortSignal) => Promise<void> | void>();
 	#beforeModelCallHooks = new Set<(signal?: AbortSignal) => Promise<void> | void>();
+	#beforeInputHooks = new Set<(messages: readonly AgentMessage[]) => void>();
 
 	/** Buffered Cursor tool results with text length at time of call (for correct ordering) */
 	#cursorToolResultBuffer: CursorToolResultEntry[] = [];
@@ -847,6 +848,16 @@ export class Agent {
 		return () => this.#beforeModelCallHooks.delete(registration);
 	}
 
+	/** Register a synchronous hook that runs before provider-visible context is accepted. */
+	addBeforeInputHook(hook: (messages: readonly AgentMessage[]) => void): () => void {
+		this.#beforeInputHooks.add(hook);
+		return () => this.#beforeInputHooks.delete(hook);
+	}
+
+	#runBeforeInputHooks(messages: readonly AgentMessage[]): void {
+		for (const hook of this.#beforeInputHooks) hook(messages);
+	}
+
 	async #runBeforeModelCallHooks(signal?: AbortSignal): Promise<void> {
 		for (const hook of this.#beforeModelCallHooks) await hook(signal);
 	}
@@ -1153,6 +1164,14 @@ export class Agent {
 	}
 
 	appendMessage(m: AgentMessage) {
+		if (
+			m.role === "user" ||
+			m.role === "assistant" ||
+			m.role === "toolResult" ||
+			("attribution" in m && m.attribution === "user")
+		) {
+			this.#runBeforeInputHooks([m]);
+		}
 		this.#state.messages.push(m);
 	}
 
@@ -1169,6 +1188,7 @@ export class Agent {
 	 * Delivered after current tool execution, skips remaining tools.
 	 */
 	steer(m: AgentMessage) {
+		this.#runBeforeInputHooks([m]);
 		this.#steeringQueue.push(m);
 		this.#notifySteeringWaiters();
 	}
@@ -1178,6 +1198,7 @@ export class Agent {
 	 * Delivered only when agent has no more tool calls or steering messages.
 	 */
 	followUp(m: AgentMessage) {
+		this.#runBeforeInputHooks([m]);
 		this.#followUpQueue.push(m);
 	}
 
@@ -1382,6 +1403,7 @@ export class Agent {
 			msgs = [input];
 			promptOptions = imagesOrOptions as AgentPromptOptions | undefined;
 		}
+		this.#runBeforeInputHooks(msgs);
 
 		await this.#runLoop(msgs, promptOptions);
 	}

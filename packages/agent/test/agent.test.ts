@@ -18,6 +18,31 @@ describe("Agent", () => {
 		expect(agent.state.messages).not.toContainEqual(message);
 	});
 
+	it("runs input hooks for provider-visible direct appends", () => {
+		const agent = new Agent();
+		const accepted: string[] = [];
+		agent.addBeforeInputHook(messages => {
+			accepted.push(...messages.map(message => message.role));
+		});
+
+		agent.appendMessage({
+			role: "developer",
+			content: [{ type: "text", text: "User-edited todo state" }],
+			attribution: "user",
+			timestamp: Date.now(),
+		});
+		agent.appendMessage(createAssistantMessage([{ type: "text", text: "model output" }]));
+		agent.appendMessage({
+			role: "toolResult",
+			toolCallId: "call-1",
+			toolName: "read",
+			content: [{ type: "text", text: "repository output" }],
+			isError: false,
+			timestamp: Date.now(),
+		});
+
+		expect(accepted).toEqual(["developer", "assistant", "toolResult"]);
+	});
 	it("classifies agent-authored steering as a parent steering message", async () => {
 		const toolSchema = type({ value: type("string") });
 		const executed: string[] = [];

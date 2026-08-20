@@ -317,7 +317,7 @@ export class AdvisorRuntime {
 	#seenContextInFlight: [string, string][] | undefined;
 	/** Incremented whenever the advisor loses context so queued raw deltas are re-rendered against fresh dedupe state. */
 	#renderRevision = 0;
-	/** Regex secret values observed in primary deltas and retained until advisor context resets. */
+	/** Regex secret values observed in primary deltas and retained until the conversation ends. */
 	#advisorRegexSecretValues = new Set<string>();
 	#pending: PendingDelta[] = [];
 	#busy = false;
@@ -509,7 +509,6 @@ export class AdvisorRuntime {
 	#clearAdvisorContextAtCurrentCursor(): void {
 		this.#consecutiveFailures = 0;
 		this.#clearSeenContext();
-		this.#advisorRegexSecretValues.clear();
 		try {
 			this.agent.reset();
 		} catch {}
@@ -588,11 +587,13 @@ export class AdvisorRuntime {
 	 * switch/resume, branch). Clears the advisor's own (non-persisted) context
 	 * and rewinds the cursor to 0 so the NEXT turn replays the full current —
 	 * post-compaction — transcript, giving the advisor fresh context instead of
-	 * leaving it blind to everything before the rewrite.
+	 * leaving it blind to everything before the rewrite. Retained regex-secret
+	 * values survive same-conversation rewrites and are cleared only when callers
+	 * mark a conversation boundary.
 	 * Destructive boundary operation: callers inside a fallible session transition
 	 * must defer it until commit because pending deltas and cursor/context are lost.
 	 */
-	reset(reason = "external"): void {
+	reset(reason = "external", options?: { clearRetainedRegexSecretValues?: boolean }): void {
 		// Step-1 observability (issue #7226): every re-prime logs its trigger so
 		// live investigations can attribute full-transcript replays (cached_tokens
 		// pinned at the instructions/tools boundary) to a concrete path instead of
@@ -608,6 +609,7 @@ export class AdvisorRuntime {
 		this.#refusalModelsTried.clear();
 		this.#failureNotified = false;
 		this.#resetAdvisorContext(true, true, reason);
+		if (options?.clearRetainedRegexSecretValues) this.#advisorRegexSecretValues.clear();
 	}
 
 	/**
@@ -1183,6 +1185,7 @@ export class AdvisorRuntime {
 					} finally {
 						if (this.#promptInFlight === prompt) this.#promptInFlight = undefined;
 					}
+					if (this.#epoch !== epoch) continue;
 					// Agent.#runLoop catches provider/stream failures internally and
 					// resolves prompt() cleanly with stopReason: "error". Treat that
 					// as a failed turn so endpoint rejections trip the retry path.

@@ -2076,6 +2076,10 @@ export function runGitLabDuoWorkflowSocket(
 			// Ignore close failures from test doubles or already closed sockets.
 		}
 	};
+	const guardedSend = (data: string): void => {
+		options.providerDispatchGuard?.();
+		ws.send(data);
+	};
 	const abort = (): void => {
 		close();
 		settle("closed", new AIError.AbortError("GitLab Duo Workflow request aborted"));
@@ -2194,9 +2198,12 @@ export function runGitLabDuoWorkflowSocket(
 			for (const response of responses) {
 				const finalResponse = await applyGitLabDuoWorkflowActionResponseGuard(response, state.model, options);
 				if (settled) return;
-				ws.send(JSON.stringify(finalResponse));
+				guardedSend(JSON.stringify(finalResponse));
 			}
-		})().catch(error => settle("closed", error));
+		})().catch(error => {
+			close();
+			settle("closed", error);
+		});
 	} else {
 		ws.onopen = () => {
 			traceGitLabDuoWorkflow("websocket.open", {
@@ -2208,7 +2215,12 @@ export function runGitLabDuoWorkflowSocket(
 				mcpTools: startPayload.mcpTools.length,
 				preapprovedTools: startPayload.preapproved_tools.length,
 			});
-			ws.send(JSON.stringify({ startRequest: startPayload }));
+			try {
+				guardedSend(JSON.stringify({ startRequest: startPayload }));
+			} catch (error) {
+				close();
+				settle("closed", error);
+			}
 		};
 	}
 	resetIdleTimer();
