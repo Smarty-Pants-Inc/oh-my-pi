@@ -95,6 +95,7 @@ async function createGoalHarness(shared: SharedFixture): Promise<GoalHarness> {
 	const mode = new InteractiveMode(session, "test");
 	const toolSession = createToolSession(tempDir.path(), settings, {
 		getGoalModeState: () => session.getGoalModeState(),
+		isGoalModeExiting: () => session.isGoalModeExiting(),
 		getGoalRuntime: () => session.goalRuntime,
 		getTodoPhases: () => session.getTodoPhases(),
 		setTodoPhases: phases => session.setTodoPhases(phases),
@@ -237,12 +238,46 @@ describe("InteractiveMode goal mode integration", () => {
 			await harness.mode.init({ suppressWelcomeIntro: true });
 
 			expect(harness.session.getGoalModeState()).toMatchObject({
-				enabled: status === "active" || status === "budget_limited",
+				enabled: status === "active",
 				goal: { status },
 			});
 			expect(harness.session.getActiveToolNames()).toContain("goal");
 		});
 	}
+
+	it("restores a blocked goal, preserves baseline goal availability after owner drop, and accepts replacement", async () => {
+		await harness.session.setActiveToolsByName(["read", "goal"]);
+		persistCurrentGoal(harness, "blocked");
+		await harness.mode.init({ suppressWelcomeIntro: true });
+		const goalTool = harness.toolRegistry.get("goal");
+		if (!goalTool) throw new Error("Expected goal tool to remain registered");
+
+		vi.spyOn(harness.mode, "showHookConfirm").mockResolvedValue(true);
+		await harness.mode.handleGoalModeCommand("drop");
+
+		expect(harness.session.getActiveToolNames()).toContain("goal");
+		const replacement = await goalTool.execute("call-replacement", {
+			op: "create",
+			objective: "Replacement after restart",
+			token_budget: undefined,
+		});
+		expect(replacement.details?.goal).toMatchObject({
+			objective: "Replacement after restart",
+			status: "active",
+		});
+	});
+
+	it("restores a blocked goal temporarily without widening an intentional no-tools baseline after drop", async () => {
+		await harness.session.setActiveToolsByName([]);
+		persistCurrentGoal(harness, "blocked");
+		await harness.mode.init({ suppressWelcomeIntro: true });
+		expect(harness.session.getActiveToolNames()).toContain("goal");
+
+		vi.spyOn(harness.mode, "showHookConfirm").mockResolvedValue(true);
+		await harness.mode.handleGoalModeCommand("drop");
+
+		expect(harness.session.getActiveToolNames()).not.toContain("goal");
+	});
 
 	it("lets a headless agent create an unbounded goal before user-started goal mode", async () => {
 		expect(harness.session.getGoalModeState()).toBeUndefined();
@@ -811,6 +846,55 @@ describe("InteractiveMode goal mode integration", () => {
 		expect(showWarning).toHaveBeenCalledWith("Resume the goal before adjusting the budget.");
 		// Mutation must not have run while the goal is paused.
 		expect(harness.session.getGoalModeState()?.goal.tokenBudget).toBeUndefined();
+	});
+
+	it("keeps terminal state internal and blocks goal re-entry until asynchronous tool restoration finishes", async () => {
+		await harness.session.setActiveToolsByName(["read", "goal"]);
+		const baselineTools = harness.session.getActiveToolNames();
+		await harness.mode.init({ suppressWelcomeIntro: true });
+		await harness.mode.handleGoalModeCommand("Ship the release");
+		const goalTool = harness.toolRegistry.get("goal");
+		if (!goalTool) throw new Error("Expected goal tool to be active");
+		const cleanupStarted = Promise.withResolvers<void>();
+		const continueCleanup = Promise.withResolvers<void>();
+		const toolsRestored = Promise.withResolvers<void>();
+		const setActiveTools = harness.session.setActiveToolsByName.bind(harness.session);
+		vi.spyOn(harness.session, "setActiveToolsByName").mockImplementationOnce(async toolNames => {
+			cleanupStarted.resolve();
+			await continueCleanup.promise;
+			await setActiveTools(toolNames);
+			toolsRestored.resolve();
+		});
+
+		const completion = goalTool.execute("call-complete", { op: "complete" });
+		await cleanupStarted.promise;
+		await completion;
+		try {
+			expect(harness.session.getGoalModeState()).toBeUndefined();
+			expect(harness.session.isGoalModeExiting()).toBe(true);
+			expect(harness.session.getActiveToolNames()).toContain("goal");
+			expect(await toolNamesFor(harness)).not.toContain("goal");
+			await expect(
+				goalTool.execute("call-before-cleanup", {
+					op: "create",
+					objective: "Too early",
+					token_budget: undefined,
+				}),
+			).rejects.toThrow("terminal cleanup is still in progress");
+		} finally {
+			continueCleanup.resolve();
+		}
+		await toolsRestored.promise;
+		await waitForMicrotasks();
+
+		expect(harness.session.isGoalModeExiting()).toBe(false);
+		expect(harness.session.getActiveToolNames()).toEqual(baselineTools);
+		const replacement = await goalTool.execute("call-after-cleanup", {
+			op: "create",
+			objective: "Clean replacement",
+			token_budget: undefined,
+		});
+		expect(replacement.details?.goal).toMatchObject({ objective: "Clean replacement", status: "active" });
 	});
 
 	it("returns completion details while clearing current state and preserving terminal history", async () => {

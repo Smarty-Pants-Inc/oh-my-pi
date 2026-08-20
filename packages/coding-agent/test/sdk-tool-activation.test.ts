@@ -1589,6 +1589,28 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		}
 	});
 
+	for (const testCase of [
+		{ label: "an explicit empty list", toolNames: [] },
+		{ label: "the internal no-tools sentinel", toolNames: ["__none__"] },
+		{ label: "an invalid-only list", toolNames: ["not_a_registered_tool"] },
+	]) {
+		it(`does not activate goal for ${testCase.label}`, async () => {
+			const tempDir = makeTempDir();
+			const { session } = await createAgentSession({
+				...baseOptions(tempDir),
+				settings: Settings.isolated({ "goal.enabled": true }),
+				toolNames: testCase.toolNames,
+			});
+
+			try {
+				expect(session.getToolByName("goal")).toBeDefined();
+				expect(session.getActiveToolNames()).not.toContain("goal");
+			} finally {
+				await session.dispose();
+			}
+		});
+	}
+
 	it("normalizes legacy builtin toolNames before selecting the active SDK tools", async () => {
 		const tempDir = makeTempDir();
 

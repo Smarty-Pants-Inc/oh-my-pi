@@ -189,7 +189,8 @@ export class GoalRuntime {
 		options?: { persist?: "goal" | "goal_paused" | "none"; emit?: boolean },
 	): Promise<void> {
 		const currentState = state && isCurrentGoalModeState(state) ? state : undefined;
-		this.#host.setState(currentState ? cloneState(currentState) : undefined);
+		const retainedState = currentState ?? (state?.mode === "exiting" ? state : undefined);
+		this.#host.setState(retainedState ? cloneState(retainedState) : undefined);
 		if (options?.persist) {
 			this.#host.persist(options.persist, state);
 		}
@@ -396,6 +397,9 @@ export class GoalRuntime {
 		validateTokenBudget(input.tokenBudget);
 		return await this.#withAccounting(async () => {
 			const existing = this.#host.getState();
+			if (existing?.mode === "exiting") {
+				throw new Error("cannot create a new goal while terminal cleanup is still in progress");
+			}
 			if (isCurrentGoalModeState(existing)) {
 				throw new Error("cannot create a new goal because this session already has a goal");
 			}

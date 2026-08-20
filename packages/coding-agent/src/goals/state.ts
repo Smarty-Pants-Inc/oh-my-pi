@@ -98,7 +98,7 @@ export function parseGoalModeState(mode: unknown, modeData: unknown): GoalModeSt
 	if (!status || !isCurrentGoalStatus(status)) return undefined;
 	if (mode === "goal_paused" ? status !== "paused" : status === "paused") return undefined;
 	return {
-		enabled: isGoalEnabledStatus(status),
+		enabled: status === "active",
 		mode: "active",
 		reason: undefined,
 		goal: {

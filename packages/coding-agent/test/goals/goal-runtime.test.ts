@@ -6,7 +6,13 @@ import {
 	renderGoalPrompt,
 	renderTrustedObjective,
 } from "@oh-my-pi/pi-coding-agent/goals/runtime";
-import type { Goal, GoalModeState, GoalRuntimeEvent, GoalTokenUsage } from "@oh-my-pi/pi-coding-agent/goals/state";
+import {
+	type Goal,
+	type GoalModeState,
+	type GoalRuntimeEvent,
+	type GoalTokenUsage,
+	parseGoalModeState,
+} from "@oh-my-pi/pi-coding-agent/goals/state";
 import { escapeXmlText } from "@oh-my-pi/pi-utils";
 
 function createUsage(overrides: Partial<GoalTokenUsage> = {}): GoalTokenUsage {
@@ -250,7 +256,7 @@ describe("goal runtime", () => {
 		expect(harness.hiddenMessages).toHaveLength(2);
 	});
 
-	it("preserves owner caps across a runtime restart and resumes after cap removal", async () => {
+	it("restores a budget-limited goal disabled without charging restart idle time, then lets the owner resume", async () => {
 		const first = createHarness({
 			state: {
 				enabled: true,
@@ -262,16 +268,28 @@ describe("goal runtime", () => {
 		await first.runtime.onBudgetMutated(5);
 		const persisted = first.persists.at(-1)?.state;
 		if (!persisted) throw new Error("expected owner cap to persist");
+		const restored = parseGoalModeState("goal", { goal: persisted.goal });
+		if (!restored) throw new Error("expected budget-limited goal to restore");
 
-		const restarted = createHarness({ state: persisted });
+		const restarted = createHarness({ state: restored });
 		await restarted.runtime.onThreadResumed();
-		expect(restarted.getState()?.goal.tokenBudget).toBe(5);
-		expect(restarted.getState()?.goal.status).toBe("budget_limited");
+		restarted.advance(10_000);
+		await restarted.runtime.flushUsage("suppressed");
 
+		expect(restarted.getState()).toMatchObject({
+			enabled: false,
+			goal: { tokenBudget: 5, status: "budget_limited", timeUsedSeconds: 0 },
+		});
+
+		const resumed = await restarted.runtime.resumeGoal();
+		expect(resumed).toMatchObject({ enabled: true, goal: { status: "active", timeUsedSeconds: 0 } });
 		await restarted.runtime.onBudgetMutated(undefined);
-		expect(restarted.getState()?.goal.tokenBudget).toBeUndefined();
-		expect(restarted.getState()?.goal.status).toBe("active");
-		expect(restarted.getState()?.enabled).toBe(true);
+		restarted.advance(1_000);
+		await restarted.runtime.flushUsage("suppressed");
+		expect(restarted.getState()).toMatchObject({
+			enabled: true,
+			goal: { status: "active", timeUsedSeconds: 1 },
+		});
 	});
 
 	it("keeps an active goal active when an interruption aborts only the current task", async () => {
@@ -435,7 +453,7 @@ Do not start new substantive work. Preserve useful state, report verified progre
 		expect(harness.hiddenMessages[0]?.customType).toBe("goal-budget-limit");
 	});
 
-	it("persists terminal completion history while clearing the live goal state", async () => {
+	it("persists terminal completion history while retaining only an internal exiting sentinel", async () => {
 		const harness = createHarness({
 			state: {
 				enabled: true,
@@ -447,7 +465,12 @@ Do not start new substantive work. Preserve useful state, report verified progre
 		const completed = await harness.runtime.completeGoalFromTool();
 
 		expect(completed.status).toBe("complete");
-		expect(harness.getState()).toBeUndefined();
+		expect(harness.getState()).toMatchObject({
+			enabled: false,
+			mode: "exiting",
+			reason: "completed",
+			goal: { status: "complete" },
+		});
 		expect(harness.persists.at(-1)).toMatchObject({
 			mode: "goal",
 			state: { enabled: false, mode: "exiting", reason: "completed", goal: { status: "complete" } },
@@ -527,7 +550,7 @@ Do not start new substantive work. Preserve useful state, report verified progre
 		expect(harness.persists.at(-1)?.state?.goal.objective).toBe("Second");
 	});
 
-	it("allows creating a new goal after the previous one is complete", async () => {
+	it("rejects goal re-entry until terminal cleanup clears the exiting sentinel", async () => {
 		const harness = createHarness({
 			state: {
 				enabled: false,
@@ -536,6 +559,11 @@ Do not start new substantive work. Preserve useful state, report verified progre
 				goal: createGoal({ status: "complete" }),
 			},
 		});
+
+		await expect(harness.runtime.createGoal({ objective: "Phase 4" })).rejects.toThrow(
+			"terminal cleanup is still in progress",
+		);
+		harness.setState(undefined);
 
 		const next = await harness.runtime.createGoal({ objective: "Phase 4" });
 		expect(next.goal.objective).toBe("Phase 4");

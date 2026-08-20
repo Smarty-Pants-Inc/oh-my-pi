@@ -1601,7 +1601,7 @@ export class AgentSession {
 		this.#syncAgentSessionId();
 		this.#todo.syncFromBranch();
 		this.#goalRuntime = new GoalRuntime({
-			getState: () => this.getGoalModeState(),
+			getState: () => this.#goalModeState,
 			setState: state => {
 				this.setGoalModeState(state);
 			},
@@ -6055,7 +6055,11 @@ export class AgentSession {
 	}
 
 	setGoalModeState(state: GoalModeState | undefined): void {
-		this.#goalModeState = isCurrentGoalModeState(state) ? state : undefined;
+		this.#goalModeState = state && (state.mode === "exiting" || isCurrentGoalModeState(state)) ? state : undefined;
+	}
+
+	isGoalModeExiting(): boolean {
+		return this.#goalModeState?.mode === "exiting";
 	}
 
 	getVibeModeState(): VibeModeState | undefined {

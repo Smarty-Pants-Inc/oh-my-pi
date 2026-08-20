@@ -678,6 +678,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	readonly #startupChangelog: StartupChangelogSelection | undefined;
 	#planModePreviousTools: string[] | undefined;
 	#goalModePreviousTools: string[] | undefined;
+	#goalModeExitPromise: Promise<void> | undefined;
 	#vibeModePreviousTools: string[] | undefined;
 	#vibeModeOwnerScope: VibeOwnerScope | undefined;
 	#vibeScopeSuspendedForSwitch = false;
@@ -1476,7 +1477,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	async getUserInput(): Promise<SubmittedUserInput> {
-		if (this.session.getGoalModeState()?.mode === "exiting") {
+		if (this.session.isGoalModeExiting()) {
 			await this.#exitGoalMode({ reason: "completed", silent: true });
 		}
 		const { promise, resolve } = Promise.withResolvers<SubmittedUserInput>();
@@ -2351,7 +2352,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (event.type !== "agent_end") {
 			return;
 		}
-		if (this.session.getGoalModeState()?.mode === "exiting") {
+		if (this.session.isGoalModeExiting()) {
 			await this.#exitGoalMode({ reason: "completed", silent: true });
 			return;
 		}
@@ -2555,7 +2556,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.goalModeEnabled = restored?.enabled === true;
 			this.goalModePaused = restored?.goal.status === "paused";
 			if (isCurrentGoalModeState(restored)) {
-				const previousTools = this.session.getEnabledToolNames().filter(name => name !== "goal");
+				const previousTools = this.session.getEnabledToolNames();
 				this.#goalModePreviousTools = previousTools;
 				await this.session.setActiveToolsByName([...new Set([...previousTools, "goal"])]);
 			}
@@ -2804,23 +2805,44 @@ export class InteractiveMode implements InteractiveModeContext {
 		reason?: "completed" | "paused" | "dropped";
 		terminalGoal?: Goal;
 	}): Promise<void> {
+		const inProgress = this.#goalModeExitPromise;
+		if (inProgress) {
+			await inProgress;
+			return;
+		}
+		const exit = this.#finishGoalModeExit(options);
+		this.#goalModeExitPromise = exit;
+		try {
+			await exit;
+		} finally {
+			if (this.#goalModeExitPromise === exit) this.#goalModeExitPromise = undefined;
+		}
+	}
+
+	async #finishGoalModeExit(options?: {
+		silent?: boolean;
+		paused?: boolean;
+		reason?: "completed" | "paused" | "dropped";
+		terminalGoal?: Goal;
+	}): Promise<void> {
 		const previousTools = this.#goalModePreviousTools;
 		if (previousTools) {
 			await this.session.setActiveToolsByName(previousTools);
 		}
 		const terminalGoal = options?.terminalGoal;
-		if (terminalGoal && isTerminalGoalStatus(terminalGoal.status)) {
+		const terminalGoalIsFinal = terminalGoal !== undefined && isTerminalGoalStatus(terminalGoal.status);
+		if (terminalGoalIsFinal || this.session.isGoalModeExiting()) {
 			this.session.setGoalModeState(undefined);
-			if (options?.reason === "completed") {
-				this.sessionManager.appendCustomEntry("goal-completed", {
-					id: terminalGoal.id,
-					status: terminalGoal.status,
-					objective: terminalGoal.objective,
-					tokensUsed: terminalGoal.tokensUsed,
-					tokenBudget: terminalGoal.tokenBudget,
-					timeUsedSeconds: terminalGoal.timeUsedSeconds,
-				});
-			}
+		}
+		if (terminalGoalIsFinal && options?.reason === "completed") {
+			this.sessionManager.appendCustomEntry("goal-completed", {
+				id: terminalGoal.id,
+				status: terminalGoal.status,
+				objective: terminalGoal.objective,
+				tokensUsed: terminalGoal.tokensUsed,
+				tokenBudget: terminalGoal.tokenBudget,
+				timeUsedSeconds: terminalGoal.timeUsedSeconds,
+			});
 		}
 		this.goalModeEnabled = false;
 		this.goalModePaused = options?.paused ?? false;
@@ -3552,11 +3574,11 @@ export class InteractiveMode implements InteractiveModeContext {
 			}
 
 			// Expose the goal tool for the interview so the agent can finish by
-			// calling `goal create`. Record the pre-interview toolset first: the
-			// tool-driven create flips goalModeEnabled via `goal_updated`, and the
-			// eventual goal exit restores this set (dropping the goal tool again).
+			// calling `goal create`. Record the exact pre-interview toolset first:
+			// the eventual goal exit must restore an already-available goal tool while
+			// still returning intentional no-tools sessions to their empty baseline.
 			const enabledTools = this.session.getEnabledToolNames();
-			this.#goalModePreviousTools = enabledTools.filter(name => name !== "goal");
+			this.#goalModePreviousTools = enabledTools;
 			if (!enabledTools.includes("goal")) {
 				await this.session.setActiveToolsByName([...enabledTools, "goal"]);
 			}

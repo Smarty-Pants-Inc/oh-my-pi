@@ -7463,11 +7463,11 @@
     },
     {
       "path": "packages/coding-agent/src/goals/runtime.ts",
-      "sha256": "120fd80384fa30f90ba32e981501ee66fea2184d76742d02e5b39aef90b6d1ca"
+      "sha256": "d5f0a02d79b0fe232f7631a06c810acfaa070c70f5cd1cb0b4b5fe1c19b81d42"
     },
     {
       "path": "packages/coding-agent/src/goals/state.ts",
-      "sha256": "ead3c2fb5ca07b8ae110e96cddc1c7fbdbdce8e876c25146f449af845f2a4f1a"
+      "sha256": "d05ac7d69890e969dd75d28f010bc7103af82b204f9f70bfd753fa5cfa30c3d1"
     },
     {
       "path": "packages/coding-agent/src/goals/tools/goal-tool.ts",
@@ -8187,7 +8187,7 @@
     },
     {
       "path": "packages/coding-agent/src/modes/interactive-mode.ts",
-      "sha256": "38e007f19303a938a39d9f51ef72a7388977e8ab61d8ecb8f86afcf3f4981147"
+      "sha256": "06bd25d04131e37a09600d6f165b19e5a31d1de82460a570d400a78ac2b036b0"
     },
     {
       "path": "packages/coding-agent/src/modes/loop-limit.ts",
@@ -8327,7 +8327,7 @@
     },
     {
       "path": "packages/coding-agent/src/sdk.ts",
-      "sha256": "bbcb6eb911f146e6f4f95c61cc4382efb051b505ad02794b537c9f07141000fb"
+      "sha256": "e6769391b4680a5960ce9a658a8089cac2ba8e57fd5bf03c652384cc7e23a059"
     },
     {
       "path": "packages/coding-agent/src/secrets/index.ts",
@@ -8431,7 +8431,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/agent-session.ts",
-      "sha256": "d553990226f69ce417a0a7fe135ea870744514f25bfcd54efd43a0b8bb722a3d"
+      "sha256": "138079918526b977221b351ac5231ce04ff043bcd5a6022ad9a7e250e2f6f5d5"
     },
     {
       "path": "packages/coding-agent/src/session/agent-storage.ts",
@@ -9251,7 +9251,7 @@
     },
     {
       "path": "packages/coding-agent/src/tools/index.ts",
-      "sha256": "e0784abf760dae6e50043d157557a51d51a28ab930c1b39bf81e9e8e6b7692e4"
+      "sha256": "7dd65ec0cfb651a1002eb0d85c8336514310a12e3da61780b72f44e7349b53c5"
     },
     {
       "path": "packages/coding-agent/src/tools/inspect-image.ts",
@@ -10683,5 +10683,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "e468b4a63a13f2eed0fb00a137d478f78c600509a749602b1557d6ccef6e1ae2"
+  "rootSha256": "ed1276a46ee6e684db190fdff2a0acbb3e228605a698d042724bdbcf5be62655"
 }

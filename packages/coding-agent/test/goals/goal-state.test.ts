@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { type GoalStatus, isGoalEnabledStatus, parseGoalModeState } from "@oh-my-pi/pi-coding-agent/goals/state";
+import { type GoalStatus, parseGoalModeState } from "@oh-my-pi/pi-coding-agent/goals/state";
 
 function persistedGoal(status: string): Record<string, unknown> {
 	return {
@@ -29,14 +29,14 @@ describe("persisted goal state", () => {
 				tokensUsed: 25,
 				timeUsedSeconds: 12,
 			});
-			expect(restored?.enabled).toBe(isGoalEnabledStatus(status));
+			expect(restored?.enabled).toBe(status === "active");
 		}
 	});
 
 	it("migrates legacy hyphenated status values deterministically", () => {
 		const budgetLimited = parseGoalModeState("goal", { goal: persistedGoal("budget-limited") });
 		expect(budgetLimited?.goal.status).toBe("budget_limited");
-		expect(budgetLimited?.enabled).toBe(true);
+		expect(budgetLimited?.enabled).toBe(false);
 		expect(parseGoalModeState("goal", { goal: persistedGoal("usage-limited") })?.goal.status).toBe("usage_limited");
 	});
 

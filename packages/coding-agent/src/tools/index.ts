@@ -319,6 +319,8 @@ export interface ToolSession {
 	getPlanReferencePath?: () => string;
 	/** Goal mode state (if active or paused) */
 	getGoalModeState?: () => GoalModeState | undefined;
+	/** Whether terminal goal cleanup is still restoring the prior toolset. */
+	isGoalModeExiting?: () => boolean;
 	/** Goal runtime for the active agent session. */
 	getGoalRuntime?: () => GoalRuntime | undefined;
 	/** Get cumulative session usage statistics (input/output tokens, cost). */
@@ -478,7 +480,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 			? normalizeToolNames(toolNames)
 			: undefined;
 	const goalEnabled = session.settings.get("goal.enabled");
-	const goalModeExiting = session.getGoalModeState?.()?.mode === "exiting";
+	const goalModeExiting = session.isGoalModeExiting?.() === true;
 	const goalExplicitlyRequested = requestedTools?.includes("goal") === true;
 	const goalAvailable =
 		!restrictToolNames &&

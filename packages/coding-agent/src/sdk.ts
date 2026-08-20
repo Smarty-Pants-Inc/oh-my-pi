@@ -1795,6 +1795,7 @@ async function createAgentSessionScoped(
 			getPlanModeState: () => session?.getPlanModeState(),
 			getPlanReferencePath: () => session?.getPlanReferencePath() ?? "local://PLAN.md",
 			getGoalModeState: () => session?.getGoalModeState(),
+			isGoalModeExiting: () => session?.isGoalModeExiting() ?? false,
 			getGoalRuntime: () => session?.goalRuntime,
 			getUsageStatistics: () => sessionManager.getUsageStatistics(),
 			getTurnBudget: () => sessionManager.getTurnBudget(),
@@ -2735,7 +2736,7 @@ async function createAgentSessionScoped(
 			!restrictToolNames &&
 			!toolRegistry.has("goal") &&
 			settings.get("goal.enabled") &&
-			toolSession.getGoalModeState?.()?.mode !== "exiting"
+			toolSession.isGoalModeExiting?.() !== true
 		) {
 			const goalTool = await logger.time("createTools:goal:session", HIDDEN_TOOLS.goal, toolSession);
 			if (goalTool) {
@@ -3102,6 +3103,10 @@ async function createAgentSessionScoped(
 
 		const toolNamesFromRegistry = Array.from(toolRegistry.keys());
 		const explicitlyRequestedToolNames = options.toolNames ? normalizeToolNames(options.toolNames) : undefined;
+		const explicitOrdinaryBuiltInToolRequested =
+			explicitlyRequestedToolNames?.some(
+				name => name !== "goal" && name !== "yield" && name !== "think" && builtInRegistryToolNames.has(name),
+			) === true;
 		// When `requireYieldTool` is set, the subagent's prompts and idle-reminders demand a
 		// `yield` call to terminate. The tool registry already includes `yield` (see
 		// `createTools`), but an explicit `toolNames` list would otherwise drop it from the
@@ -3128,8 +3133,9 @@ async function createAgentSessionScoped(
 				}
 			}
 			if (
+				explicitOrdinaryBuiltInToolRequested &&
 				builtInRegistryToolNames.has("goal") &&
-				toolSession.getGoalModeState?.()?.mode !== "exiting" &&
+				toolSession.isGoalModeExiting?.() !== true &&
 				!explicitlyRequestedToolNames.includes("goal")
 			) {
 				explicitlyRequestedToolNames.push("goal");
