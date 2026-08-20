@@ -34,7 +34,7 @@ import {
 	captureHerdrBridgeBootstrap,
 	clearHerdrGuestBridgeTokenHandoff,
 	clearHerdrHostBridgeHandoff,
-	type HerdrHostBridgeCredentials,
+	type HerdrHostBridgeBootstrap,
 	handoffHerdrGuestBridgeToken,
 	handoffHerdrHostBridge,
 } from "./collab/herdr-bridge-bootstrap";
@@ -336,7 +336,7 @@ async function runTinyWorker(): Promise<void> {
 
 /** Run the CLI with the given argv (no `process.argv` prefix). */
 export async function runCli(argv: string[]): Promise<void> {
-	let capturedHerdrHostBridge: HerdrHostBridgeCredentials | undefined;
+	let capturedHerdrHostBridge: HerdrHostBridgeBootstrap | undefined;
 	let capturedHerdrGuestBridgeToken: string | undefined;
 	let resolvedArgv = argv;
 	try {
@@ -429,13 +429,13 @@ export async function runCli(argv: string[]): Promise<void> {
 		return;
 	}
 	const command = resolved.argv[0];
-	if (command === "launch" || command === "join" || command === "__collab-host-bridge") {
-		handoffHerdrHostBridge(capturedHerdrHostBridge);
-	}
-	if (command === "__collab-guest-bridge") {
-		handoffHerdrGuestBridgeToken(capturedHerdrGuestBridgeToken);
-	}
 	try {
+		if (command === "launch" || command === "join" || command === "__collab-host-bridge") {
+			handoffHerdrHostBridge(capturedHerdrHostBridge);
+		}
+		if (command === "__collab-guest-bridge") {
+			handoffHerdrGuestBridgeToken(capturedHerdrGuestBridgeToken);
+		}
 		await run({ bin: APP_NAME, version: VERSION, argv: resolved.argv, commands, metadataHelp: showHelp });
 	} finally {
 		clearHerdrHostBridgeHandoff();

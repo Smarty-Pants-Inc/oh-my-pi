@@ -33,6 +33,7 @@ import { selectSession } from "./cli/session-picker";
 import { applyStartupCwd } from "./cli/startup-cwd";
 import { getLatestRelease } from "./cli/update-cli";
 import { CollabGuestLink, getCollabGuestRestorationCompletion } from "./collab/guest";
+import { type HerdrHostBridgeBootstrap, resolveHerdrHostBridge } from "./collab/herdr-bridge-bootstrap";
 import { HerdrCollabHostLifecycle, type ManagedHerdrHostBridge } from "./collab/herdr-host-lifecycle";
 import { CollabHost } from "./collab/host";
 import { createHostBridgeTransport, LocalCollabTransport } from "./collab/local-transport";
@@ -565,7 +566,11 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 }
 
 export type CollabBridgeBootstrap =
-	| { role: "host"; address: string; token: string; paneId: string; ompSessionId: string; routeGeneration: number }
+	| (HerdrHostBridgeBootstrap & {
+			role: "host";
+			ompSessionId: string;
+			routeGeneration: number;
+	  })
 	| ManagedHerdrHostBridge
 	| { role: "guest"; address: string; roomId: string; token: string };
 async function rethrowAfterInteractiveStartupCleanup(error: unknown, cleanup: () => Promise<void>): Promise<never> {
@@ -669,12 +674,14 @@ async function runInteractiveMode(
 	});
 
 	if (bridge?.role === "host" && !("managed" in bridge)) {
+		const hostBridge = await resolveHerdrHostBridge(bridge);
+		if (!hostBridge) throw new Error("Herdr OMP bridge credentials are unavailable");
 		const host = new CollabHost(mode);
 		await host.startWithTransport(
 			createHostBridgeTransport(
-				bridge.address,
-				bridge.token,
-				bridge.paneId,
+				hostBridge.address,
+				hostBridge.token,
+				hostBridge.paneId,
 				bridge.ompSessionId,
 				bridge.routeGeneration,
 			),
@@ -1397,7 +1404,7 @@ interface RunRootCommandDependencies {
 	consumeFreshOmpCompanionLaunchEnv?: typeof consumeFreshOmpCompanionLaunchEnv;
 	collabBridge?: CollabBridgeBootstrap;
 	verifyApprovedStartup?: (isInteractive: boolean) => Promise<void>;
-	herdrHostBridge?: { address: string; token: string; paneId: string };
+	herdrHostBridge?: HerdrHostBridgeBootstrap;
 	runInteractiveMode?: typeof runInteractiveMode;
 }
 const DEFAULT_RUN_ROOT_DEPENDENCIES: RunRootCommandDependencies = {};
