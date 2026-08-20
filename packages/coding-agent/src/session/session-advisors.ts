@@ -149,6 +149,12 @@ interface AdvisorRetryFallbackState {
 	lastAppliedThinkingLevel: ThinkingLevel;
 }
 
+interface AdvisorMissionContext {
+	instruction: ContextInstruction;
+	key: string;
+	terminal: boolean;
+}
+
 interface ActiveAdvisor {
 	name: string;
 	slug: string;
@@ -165,6 +171,10 @@ interface ActiveAdvisor {
 	retryFallback?: AdvisorRetryFallbackState;
 	retryFallbackPendingSuccess: boolean;
 	signature: string;
+	missionGenerationInFlight?: number;
+	missionKeyInFlight?: string;
+	missionTerminalInFlight?: boolean;
+	reviewedTerminalMissionKey?: string;
 }
 
 interface AdvisorCompactionSummaryMessage extends CompactionSummaryMessage {
@@ -250,7 +260,8 @@ export interface SessionAdvisorsHost {
 	abortInProgress(): boolean;
 	allowAgentInitiatedTurns(): boolean;
 	planModeState(): PlanModeState | undefined;
-	advisorMissionContext(sharedRegexSecretValues: Set<string>): ContextInstruction | undefined;
+	advisorMissionContext(sharedRegexSecretValues: Set<string>): AdvisorMissionContext | undefined;
+	consumeAdvisorTerminalMission(key: string): void;
 	clientBridge(): ClientBridge | undefined;
 	emitSessionEvent(event: AgentSessionEvent): Promise<void>;
 	emitNotice(level: "info" | "warning" | "error", message: string, source?: string): void;
@@ -316,6 +327,8 @@ export class SessionAdvisors {
 	#advisorInterruptImmuneTurnStart: number | undefined;
 	#pendingAdvisorCardEvents = new Set<Promise<void>>();
 	#advisorYieldQueueUnsubscribe: (() => void) | undefined;
+	#missionGeneration = 0;
+	#pendingTerminalMissionKey: string | undefined;
 
 	constructor(host: SessionAdvisorsHost, options: SessionAdvisorsOptions) {
 		this.#host = host;
@@ -336,15 +349,12 @@ export class SessionAdvisors {
 		if (this.#advisorEnabled) this.#buildAdvisorRuntime();
 	}
 
-	async #transformAdvisorProviderContext(context: Context, model: Model, runtime: AdvisorRuntime): Promise<Context> {
+	async #transformAdvisorProviderContext(context: Context, model: Model, advisor: ActiveAdvisor): Promise<Context> {
 		const missionId = "goal.advisor_mission";
-		const sharedRegexSecretValues = collectProviderContextRegexSecretValues(this.#host.obfuscator, context);
-		runtime.copyRetainedRegexSecretValuesTo(sharedRegexSecretValues);
-		const mission = this.#host.advisorMissionContext(sharedRegexSecretValues);
+		const generation = this.#missionGeneration;
 		const preparedInstructions = (context.instructions ?? []).filter(
 			instruction => instruction.target === "side_model" && instruction.id !== missionId,
 		);
-		if (mission) preparedInstructions.push(mission);
 		const prepared =
 			preparedInstructions.length > 0 || context.instructions
 				? { ...context, instructions: preparedInstructions }
@@ -352,17 +362,73 @@ export class SessionAdvisors {
 		const transformed = this.#transformProviderContext
 			? await this.#transformProviderContext(prepared, model, "side_model")
 			: prepared;
-		const obfuscated = obfuscateProviderContext(this.#host.obfuscator, transformed, sharedRegexSecretValues);
+		if (generation !== this.#missionGeneration) {
+			throw new Error("advisor mission changed during provider context transform");
+		}
+		const sharedRegexSecretValues = collectProviderContextRegexSecretValues(this.#host.obfuscator, transformed);
+		advisor.runtime.copyRetainedRegexSecretValuesTo(sharedRegexSecretValues);
+		const candidateMission = this.#host.advisorMissionContext(sharedRegexSecretValues);
+		advisor.runtime.retainRegexSecretValues(sharedRegexSecretValues);
+		const mission =
+			candidateMission?.terminal && advisor.reviewedTerminalMissionKey === candidateMission.key
+				? undefined
+				: candidateMission;
+		const instructions = (transformed.instructions ?? []).filter(
+			instruction => instruction.target === "side_model" && instruction.id !== missionId,
+		);
+		if (mission) instructions.push(mission.instruction);
+		const withMission =
+			instructions.length > 0 || transformed.instructions ? { ...transformed, instructions } : transformed;
+		advisor.missionGenerationInFlight = generation;
+		advisor.missionKeyInFlight = mission?.key;
+		advisor.missionTerminalInFlight = mission?.terminal;
+		const obfuscated = obfuscateProviderContext(this.#host.obfuscator, withMission, sharedRegexSecretValues);
 		if (!obfuscated.instructions) return obfuscated;
 		let keptMission = false;
-		const instructions = obfuscated.instructions.filter(instruction => {
+		const filteredInstructions = obfuscated.instructions.filter(instruction => {
 			if (instruction.target !== "side_model") return false;
 			if (instruction.id !== missionId) return true;
 			if (!mission || keptMission) return false;
 			keptMission = true;
 			return true;
 		});
-		return { ...obfuscated, instructions };
+		return { ...obfuscated, instructions: filteredInstructions };
+	}
+
+	onMissionChanged(key: string | undefined, terminalPending: boolean): void {
+		this.#missionGeneration++;
+		this.#pendingTerminalMissionKey = terminalPending ? key : undefined;
+		for (const advisor of this.#advisors) {
+			advisor.missionGenerationInFlight = undefined;
+			advisor.missionKeyInFlight = undefined;
+			advisor.missionTerminalInFlight = undefined;
+			advisor.reviewedTerminalMissionKey = undefined;
+			advisor.runtime.reset("advisor-mission-changed");
+		}
+		this.#consumeTerminalMissionWhenReviewed();
+	}
+
+	#recordAdvisorMissionSuccess(advisor: ActiveAdvisor): void {
+		const generation = advisor.missionGenerationInFlight;
+		const key = advisor.missionKeyInFlight;
+		const terminal = advisor.missionTerminalInFlight;
+		advisor.missionGenerationInFlight = undefined;
+		advisor.missionKeyInFlight = undefined;
+		advisor.missionTerminalInFlight = undefined;
+		if (generation !== this.#missionGeneration || !terminal || key !== this.#pendingTerminalMissionKey) return;
+		advisor.reviewedTerminalMissionKey = key;
+		this.#consumeTerminalMissionWhenReviewed();
+	}
+
+	#consumeTerminalMissionWhenReviewed(): void {
+		const key = this.#pendingTerminalMissionKey;
+		if (!key) return;
+		const liveAdvisors = this.#advisors.filter(advisor => !advisor.runtime.disposed);
+		if (liveAdvisors.length > 0 && !liveAdvisors.every(advisor => advisor.reviewedTerminalMissionKey === key)) {
+			return;
+		}
+		this.#pendingTerminalMissionKey = undefined;
+		this.#host.consumeAdvisorTerminalMission(key);
 	}
 
 	/** Delivers one completed primary turn to every live advisor. */
@@ -389,7 +455,7 @@ export class SessionAdvisors {
 	/** Rebuilds live advisors when role assignments alter their resolved runtime inputs. */
 	onModelRolesChanged(): void {
 		if (!this.#advisorEnabled || this.#host.isDisposed()) return;
-		if (this.#advisors.length > 0 && !this.#advisorRuntimeMatchesCurrentConfig()) this.#stopAdvisorRuntime();
+		if (this.#advisors.length > 0 && !this.#advisorRuntimeMatchesCurrentConfig()) this.#stopAdvisorRuntime(true);
 		this.#buildAdvisorRuntime(true);
 	}
 
@@ -857,6 +923,9 @@ export class SessionAdvisors {
 			});
 			const baseAdvisorStreamFn = this.#advisorStreamFn ?? streamSimple;
 			const advisorStreamFn: StreamFn = (requestModel, context, options) => {
+				if (advisorRef.missionGenerationInFlight !== this.#missionGeneration) {
+					throw new Error("advisor mission changed before provider dispatch");
+				}
 				if (requestModel.api === "openai-codex-responses") {
 					return baseAdvisorStreamFn(requestModel, context, {
 						...options,
@@ -872,7 +941,6 @@ export class SessionAdvisors {
 				}
 				return baseAdvisorStreamFn(requestModel, context, options);
 			};
-			let runtime: AdvisorRuntime;
 			const advisorAgent = new Agent({
 				contextTarget: "side_model",
 				initialState: {
@@ -894,7 +962,7 @@ export class SessionAdvisors {
 				onResponse: this.#host.onResponse,
 				onSseEvent: this.#host.onSseEvent,
 				transformProviderContext: (context, model) =>
-					this.#transformAdvisorProviderContext(context, model, runtime),
+					this.#transformAdvisorProviderContext(context, model, advisorRef),
 				intentTracing: false,
 				transformAssistantMessage: message => {
 					quarantinedAdvisorOutput = quarantineAdvisorUnsafeOutput(
@@ -961,7 +1029,7 @@ export class SessionAdvisors {
 				// so two SessionManagers never hold the same file at once.
 				this.#advisorRecorderClosed,
 			);
-			runtime = new AdvisorRuntime(advisorAgentFacade, {
+			const runtime = new AdvisorRuntime(advisorAgentFacade, {
 				snapshotMessages: () => this.#host.agent.state.messages,
 				enqueueAdvice: (note, severity) => this.#routeAdvice(advisorRef, note, severity),
 				maintainContext: (incomingTokens, signal) =>
@@ -975,6 +1043,7 @@ export class SessionAdvisors {
 				onTurnError: (error, failedMessages, signal) =>
 					this.#recoverAdvisorTurn(advisorRef, error, failedMessages, signal),
 				onTurnSuccess: async () => {
+					this.#recordAdvisorMissionSuccess(advisorRef);
 					const fallback = advisorRef.retryFallback;
 					if (!advisorRef.retryFallbackPendingSuccess || !fallback) return;
 					advisorRef.retryFallbackPendingSuccess = false;
@@ -1045,6 +1114,7 @@ export class SessionAdvisors {
 			});
 		}
 
+		this.#consumeTerminalMissionWhenReviewed();
 		return this.#advisors.length > 0;
 	}
 
@@ -1150,7 +1220,7 @@ export class SessionAdvisors {
 		for (const a of this.#advisors) a.runtime.reset(reason);
 	}
 
-	#stopAdvisorRuntime(): void {
+	#stopAdvisorRuntime(preservePendingTerminalMission = false): void {
 		// Detach each recorder feed BEFORE aborting its advisor agent: dispose() aborts
 		// the loop, and an abort emits a final `message_end` we must not enqueue against
 		// a closing recorder (it would reopen and resurrect an already-released file).
@@ -1166,6 +1236,7 @@ export class SessionAdvisors {
 		}
 		this.#advisorRecorderClosed = Promise.all(closes).then(() => {});
 		this.#advisors = [];
+		if (!preservePendingTerminalMission) this.#consumeTerminalMissionWhenReviewed();
 		this.#advisorYieldQueueUnsubscribe?.();
 		this.#advisorYieldQueueUnsubscribe = undefined;
 	}
@@ -1640,7 +1711,7 @@ export class SessionAdvisors {
 	setAdvisorEnabled(enabled: boolean): boolean {
 		this.#advisorEnabled = enabled;
 		if (enabled) {
-			if (this.#advisors.length > 0 && !this.#advisorRuntimeMatchesCurrentConfig()) this.#stopAdvisorRuntime();
+			if (this.#advisors.length > 0 && !this.#advisorRuntimeMatchesCurrentConfig()) this.#stopAdvisorRuntime(true);
 			return this.#buildAdvisorRuntime(true);
 		}
 		this.#stopAdvisorRuntime();
@@ -1668,7 +1739,7 @@ export class SessionAdvisors {
 		this.#advisorConfigs = advisors;
 		this.#advisorSharedInstructions = sharedInstructions;
 		if (!this.#advisorEnabled) return 0;
-		this.#stopAdvisorRuntime();
+		this.#stopAdvisorRuntime(true);
 		this.#buildAdvisorRuntime(true);
 		return this.#advisors.length;
 	}
@@ -1683,7 +1754,7 @@ export class SessionAdvisors {
 		if (contextPrompt === this.#advisorContextPrompt) return;
 		this.#advisorContextPrompt = contextPrompt;
 		if (!this.#advisorEnabled || this.#advisors.length === 0) return;
-		this.#stopAdvisorRuntime();
+		this.#stopAdvisorRuntime(true);
 		this.#buildAdvisorRuntime(true);
 	}
 

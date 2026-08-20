@@ -126,12 +126,15 @@ type UserFacingMessage = Extract<Message, { role: "user" | "developer" | "toolRe
 function obfuscateTextBlocks(
 	obfuscator: SecretObfuscator,
 	content: (TextContent | ImageContent)[],
-	sharedRegexSecretValues?: ReadonlySet<string>,
+	sharedRegexSecretValues: ReadonlySet<string>,
 ): (TextContent | ImageContent)[] {
 	let changed = false;
 	const result = content.map((block): TextContent | ImageContent => {
 		if (block.type !== "text") return block;
-		const text = obfuscator.obfuscate(block.text, sharedRegexSecretValues);
+		const text = obfuscator.stripUnsafeFriendlyPlaceholderPrefixes(
+			obfuscator.obfuscate(block.text, sharedRegexSecretValues),
+			sharedRegexSecretValues,
+		);
 		if (text === block.text) return block;
 		changed = true;
 		return { ...block, text };
@@ -266,7 +269,10 @@ function obfuscateMessagesWithSharedRegexSecretValues(
 		}
 		const target = message as UserFacingMessage;
 		if (typeof target.content === "string") {
-			const content = obfuscator.obfuscate(target.content, sharedRegexSecretValues);
+			const content = obfuscator.stripUnsafeFriendlyPlaceholderPrefixes(
+				obfuscator.obfuscate(target.content, sharedRegexSecretValues),
+				sharedRegexSecretValues,
+			);
 			if (content === target.content) return message;
 			changed = true;
 			return { ...target, content } as Message;
@@ -319,7 +325,10 @@ export function obfuscateProviderContext(
 	const messages = obfuscateMessagesWithSharedRegexSecretValues(obfuscator, context.messages, sharedRegexSecretValues);
 	let instructionsChanged = false;
 	const instructions = context.instructions?.map(instruction => {
-		const renderedText = obfuscator.obfuscate(instruction.renderedText, sharedRegexSecretValues);
+		const renderedText = obfuscator.stripUnsafeFriendlyPlaceholderPrefixes(
+			obfuscator.obfuscate(instruction.renderedText, sharedRegexSecretValues),
+			sharedRegexSecretValues,
+		);
 		if (renderedText === instruction.renderedText) return instruction;
 		instructionsChanged = true;
 		return { ...instruction, sha256: sha256(renderedText), renderedText };

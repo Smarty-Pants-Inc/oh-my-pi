@@ -394,6 +394,10 @@ export class AdvisorRuntime {
 		for (const value of this.#advisorRegexSecretValues) target.add(value);
 	}
 
+	retainRegexSecretValues(values: ReadonlySet<string>): void {
+		for (const value of values) this.#advisorRegexSecretValues.add(value);
+	}
+
 	/**
 	 * Called after each primary turn ends. Renders the incremental delta and
 	 * queues it for the advisor model.
@@ -499,13 +503,13 @@ export class AdvisorRuntime {
 	#clearSeenContext(): void {
 		this.#seenContext.clear();
 		this.#seenContextInFlight = undefined;
-		this.#advisorRegexSecretValues.clear();
 		this.#renderRevision++;
 	}
 
 	#clearAdvisorContextAtCurrentCursor(): void {
 		this.#consecutiveFailures = 0;
 		this.#clearSeenContext();
+		this.#advisorRegexSecretValues.clear();
 		try {
 			this.agent.reset();
 		} catch {}
@@ -624,6 +628,7 @@ export class AdvisorRuntime {
 		this.#failing = false;
 		this.#droppedBacklogs = 0;
 		this.#failureNotified = false;
+		this.#advisorRegexSecretValues.clear();
 		this.#clearSeenContext();
 		this.#wakeAllWaiters();
 	}

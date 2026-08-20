@@ -284,7 +284,238 @@ describe("AgentSession advisor provider-options parity", () => {
 		}
 	});
 
-	it("drops an abandoned terminal mission after tree navigation rewrites history", async () => {
+	it("projects a terminal mission for one successful advisor review", async () => {
+		const capturedContexts: Context[] = [];
+		const plainSecret = "OTHERSECRET";
+		const regexSecret = "tok_abc123";
+		const derivedPrefix = "TOKABC123";
+		const obfuscator = new SecretObfuscator(
+			[
+				{ type: "plain", content: plainSecret, friendlyName: derivedPrefix },
+				{ type: "regex", content: "tok_[a-z0-9]+", mode: "replace" },
+			],
+			"test-key",
+		);
+		const successStream = (): AssistantMessageEventStream => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const message = createAssistantMessage("ok");
+				stream.push({ type: "text_delta", contentIndex: 0, delta: "ok", partial: message });
+				stream.push({ type: "done", reason: "stop", message });
+			});
+			return stream;
+		};
+		const mainAgent = new Agent({
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: () => successStream(),
+		});
+		const advisorSettings = settings();
+		advisorSettings.set("advisor.syncBacklog", "1");
+		session = new AgentSession({
+			agent: mainAgent,
+			sessionManager,
+			settings: advisorSettings,
+			modelRegistry,
+			advisorTools: [],
+			advisorStreamFn: (_requestModel, context) => {
+				capturedContexts.push(context);
+				return successStream();
+			},
+			obfuscator,
+		});
+		const activeGoalState: GoalModeState = {
+			enabled: true,
+			mode: "active",
+			goal: {
+				id: "one-shot-terminal-goal",
+				objective: "Review this terminal transition exactly once",
+				status: "active",
+				tokenBudget: 100,
+				tokensUsed: 10,
+				timeUsedSeconds: 2,
+				createdAt: 1,
+				updatedAt: 1,
+			},
+		};
+		session.setGoalModeState(activeGoalState);
+		session.settings.setModelRole("advisor", "anthropic/claude-sonnet-4-5");
+		expect(session.setAdvisorEnabled(true)).toBe(true);
+
+		await mainAgent.prompt(`Review the active mission containing ${plainSecret}`);
+		session.setGoalModeState({
+			...activeGoalState,
+			enabled: false,
+			mode: "exiting",
+			reason: "completed",
+			goal: {
+				...activeGoalState.goal,
+				objective: `Review this terminal transition exactly once with ${regexSecret}`,
+				status: "complete",
+				updatedAt: 2,
+			},
+		});
+		session.setAdvisorContextPrompt("Updated context during the terminal transition");
+		await mainAgent.prompt("Review the terminal transition");
+		await mainAgent.prompt("Continue after the completed goal");
+
+		expect(capturedContexts).toHaveLength(3);
+		const missions = capturedContexts.map(context =>
+			context.instructions?.find(instruction => instruction.id === "goal.advisor_mission"),
+		);
+		expect(missions[0]?.renderedText).toContain('status="active"');
+		expect(missions[1]?.renderedText).toContain('status="complete"');
+		expect(missions[2]).toBeUndefined();
+		expect(JSON.stringify(capturedContexts[1])).not.toContain(derivedPrefix);
+		expect(JSON.stringify(capturedContexts[2])).not.toContain(derivedPrefix);
+	});
+
+	it("discards a provider transform that races a semantic mission change", async () => {
+		const capturedContexts: Context[] = [];
+		const firstTransformStarted = Promise.withResolvers<void>();
+		const releaseFirstTransform = Promise.withResolvers<void>();
+		let transformCalls = 0;
+		const successStream = (): AssistantMessageEventStream => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const message = createAssistantMessage("ok");
+				stream.push({ type: "text_delta", contentIndex: 0, delta: "ok", partial: message });
+				stream.push({ type: "done", reason: "stop", message });
+			});
+			return stream;
+		};
+		const mainAgent = new Agent({
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+		});
+		session = new AgentSession({
+			agent: mainAgent,
+			sessionManager,
+			settings: settings(),
+			modelRegistry,
+			advisorTools: [],
+			advisorStreamFn: (_requestModel, context) => {
+				capturedContexts.push(context);
+				return successStream();
+			},
+			transformProviderContext: async context => {
+				transformCalls++;
+				if (transformCalls === 1) {
+					firstTransformStarted.resolve();
+					await releaseFirstTransform.promise;
+				}
+				return context;
+			},
+		});
+		const oldObjective = "Do not send this stale mission";
+		const newObjective = "Send only this current mission";
+		const goalState = (objective: string): GoalModeState => ({
+			enabled: true,
+			mode: "active",
+			goal: {
+				id: "transform-race-goal",
+				objective,
+				status: "active",
+				tokenBudget: 100,
+				tokensUsed: 10,
+				timeUsedSeconds: 2,
+				createdAt: 1,
+				updatedAt: 1,
+			},
+		});
+		session.setGoalModeState(goalState(oldObjective));
+		session.settings.setModelRole("advisor", "anthropic/claude-sonnet-4-5");
+		expect(session.setAdvisorEnabled(true)).toBe(true);
+		const advisor = session.getAdvisorAgent();
+		if (!advisor) throw new Error("Expected advisor agent to be live");
+
+		const stalePrompt = advisor.prompt("Start the stale review").catch(() => {});
+		await firstTransformStarted.promise;
+		session.setGoalModeState(goalState(newObjective));
+		releaseFirstTransform.resolve();
+		await stalePrompt;
+		advisor.reset();
+		await advisor.prompt("Review the current mission");
+
+		expect(capturedContexts).toHaveLength(1);
+		const serialized = JSON.stringify(capturedContexts[0]);
+		expect(serialized).toContain(newObjective);
+		expect(serialized).not.toContain(oldObjective);
+	});
+
+	it("discards a transformed mission that changes during credential resolution", async () => {
+		const capturedContexts: Context[] = [];
+		const credentialStarted = Promise.withResolvers<void>();
+		const releaseCredential = Promise.withResolvers<void>();
+		const originalGetApiKey = authStorage.getApiKey.bind(authStorage);
+		let delayCredential = true;
+		vi.spyOn(authStorage, "getApiKey").mockImplementation(async (provider, sessionId, options) => {
+			if (delayCredential) {
+				delayCredential = false;
+				credentialStarted.resolve();
+				await releaseCredential.promise;
+			}
+			return originalGetApiKey(provider, sessionId, options);
+		});
+		const successStream = (): AssistantMessageEventStream => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const message = createAssistantMessage("ok");
+				stream.push({ type: "text_delta", contentIndex: 0, delta: "ok", partial: message });
+				stream.push({ type: "done", reason: "stop", message });
+			});
+			return stream;
+		};
+		const mainAgent = new Agent({
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+		});
+		session = new AgentSession({
+			agent: mainAgent,
+			sessionManager,
+			settings: settings(),
+			modelRegistry,
+			advisorTools: [],
+			advisorStreamFn: (_requestModel, context) => {
+				capturedContexts.push(context);
+				return successStream();
+			},
+			transformProviderContext: async context => context,
+		});
+		const oldObjective = "Do not dispatch this stale mission";
+		const newObjective = "Dispatch only this current mission";
+		const goalState = (objective: string): GoalModeState => ({
+			enabled: true,
+			mode: "active",
+			goal: {
+				id: "credential-race-goal",
+				objective,
+				status: "active",
+				tokenBudget: 100,
+				tokensUsed: 10,
+				timeUsedSeconds: 2,
+				createdAt: 1,
+				updatedAt: 1,
+			},
+		});
+		session.setGoalModeState(goalState(oldObjective));
+		session.settings.setModelRole("advisor", "anthropic/claude-sonnet-4-5");
+		expect(session.setAdvisorEnabled(true)).toBe(true);
+		const advisor = session.getAdvisorAgent();
+		if (!advisor) throw new Error("Expected advisor agent to be live");
+
+		const stalePrompt = advisor.prompt("Start credential resolution").catch(() => {});
+		await credentialStarted.promise;
+		session.setGoalModeState(goalState(newObjective));
+		releaseCredential.resolve();
+		await stalePrompt;
+		advisor.reset();
+		await advisor.prompt("Review the current mission");
+
+		expect(capturedContexts).toHaveLength(1);
+		const serialized = JSON.stringify(capturedContexts[0]);
+		expect(serialized).toContain(newObjective);
+		expect(serialized).not.toContain(oldObjective);
+	});
+
+	it("suppresses a persisted terminal mission after mode reconciliation and tree navigation", async () => {
 		const capturedContexts: Context[] = [];
 		const captureStreamFn: StreamFn = (_m, context) => {
 			capturedContexts.push(context);
@@ -326,6 +557,10 @@ describe("AgentSession advisor provider-options parity", () => {
 		});
 		session.settings.setModelRole("advisor", "anthropic/claude-sonnet-4-5");
 		expect(session.setAdvisorEnabled(true)).toBe(true);
+		const rehydratedTerminalState = session.getGoalModeState();
+		if (!rehydratedTerminalState) throw new Error("Expected persisted terminal goal state");
+		session.setGoalModeState(undefined);
+		session.rehydrateGoalModeState(rehydratedTerminalState);
 
 		const abandonedAdvisor = session.getAdvisorAgent();
 		if (!abandonedAdvisor) throw new Error("Expected advisor agent to be live");
@@ -341,8 +576,8 @@ describe("AgentSession advisor provider-options parity", () => {
 		const missions = capturedContexts.map(context =>
 			context.instructions?.find(instruction => instruction.id === "goal.advisor_mission"),
 		);
-		expect(missions[0]?.renderedText).toContain(abandonedObjective);
-		expect(missions[0]?.renderedText).toContain('status="complete"');
+		expect(missions[0]).toBeUndefined();
+		expect(JSON.stringify(capturedContexts[0])).not.toContain(abandonedObjective);
 		expect(missions[1]).toBeUndefined();
 	});
 
@@ -492,13 +727,12 @@ describe("AgentSession advisor provider-options parity", () => {
 			transformProviderContext: async context => context,
 		});
 		session.setGoalModeState({
-			enabled: false,
-			mode: "exiting",
-			reason: "completed",
+			enabled: true,
+			mode: "active",
 			goal: {
 				id: "goal-collision",
 				objective: `Finish <mission> & preserve ${regexSecret}`,
-				status: "complete",
+				status: "active",
 				tokenBudget: 100,
 				tokensUsed: 10,
 				timeUsedSeconds: 2,

@@ -125,7 +125,7 @@ function isAccountingStatus(goal: Goal): boolean {
 	return goal.status === "active" || goal.status === "budget_limited";
 }
 
-function isFinalStatus(goal: Goal): boolean {
+export function isFinalStatus(goal: Goal): boolean {
 	return goal.status === "complete" || goal.status === "dropped" || goal.status === "superseded";
 }
 

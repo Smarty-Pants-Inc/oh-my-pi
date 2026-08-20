@@ -114,6 +114,7 @@ import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-temp
 import { buildServiceTierByFamily } from "../config/service-tier";
 import type { Settings, SkillsSettings } from "../config/settings";
 import { onAppendOnlyModeChanged, onModelRolesChanged } from "../config/settings";
+import { sha256 } from "../context/canonical";
 import {
 	explainContext as buildContextExplanation,
 	type ContextExplanation,
@@ -162,7 +163,7 @@ import type { HookCommandContext } from "../extensibility/hooks/types";
 import type { Skill, SkillWarning } from "../extensibility/skills";
 import { expandSlashCommand, type FileSlashCommand } from "../extensibility/slash-commands";
 import { normalizeToolEventInput, resolveToolEventInput } from "../extensibility/tool-event-input";
-import { GoalRuntime } from "../goals/runtime";
+import { GoalRuntime, isFinalStatus } from "../goals/runtime";
 import { type GoalModeState, parseGoalModeState } from "../goals/state";
 import type { HindsightSessionState } from "../hindsight/state";
 import { type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
@@ -614,9 +615,12 @@ export class AgentSession {
 	#inspectImageModeOverride: InspectImageMode | undefined;
 	#vibeModeState: VibeModeState | undefined;
 	#goalModeState: GoalModeState | undefined;
+	#advisorMissionKey: string | undefined;
+	#pendingAdvisorTerminalMissionKey: string | undefined;
 	#goalRuntime: GoalRuntime;
 	#goalContinuationContext = false;
 	readonly #advisors: SessionAdvisors;
+	#advisorsInitialized = false;
 	#goalTurnCounter = 0;
 	#planReferenceSent = false;
 	#planReferencePath = "local://PLAN.md";
@@ -1602,9 +1606,7 @@ export class AgentSession {
 		this.#todo.syncFromBranch();
 		this.#goalRuntime = new GoalRuntime({
 			getState: () => this.#goalModeState,
-			setState: state => {
-				this.#goalModeState = state;
-			},
+			setState: state => this.#setGoalModeState(state, "mutation"),
 			getCurrentUsage: () => {
 				const usage = this.getSessionStats().tokens;
 				return {
@@ -1671,6 +1673,11 @@ export class AgentSession {
 			allowAgentInitiatedTurns: () => this.#allowAcpAgentInitiatedTurns,
 			planModeState: () => this.#planModeState,
 			advisorMissionContext: sharedRegexSecretValues => {
+				const state = this.#goalModeState;
+				const key = this.#advisorMissionKey;
+				if (!state?.goal || !key) return undefined;
+				const terminal = isFinalStatus(state.goal);
+				if (terminal && this.#pendingAdvisorTerminalMissionKey !== key) return undefined;
 				const missionPrompt = this.#goalRuntime.buildAdvisorMissionPrompt(objective => {
 					const obfuscator = this.#obfuscator;
 					if (!obfuscator?.hasSecrets()) return objective;
@@ -1680,8 +1687,15 @@ export class AgentSession {
 					return obfuscator.obfuscate(objective, sharedRegexSecretValues);
 				});
 				return missionPrompt
-					? bindRenderedInstruction("goal.advisor_mission", missionPrompt, "side_model")
+					? {
+							instruction: bindRenderedInstruction("goal.advisor_mission", missionPrompt, "side_model"),
+							key,
+							terminal,
+						}
 					: undefined;
+			},
+			consumeAdvisorTerminalMission: key => {
+				if (this.#pendingAdvisorTerminalMissionKey === key) this.#pendingAdvisorTerminalMissionKey = undefined;
 			},
 			clientBridge: () => this.#clientBridge,
 			emitSessionEvent: event => this.#emitSessionEvent(event),
@@ -1727,6 +1741,7 @@ export class AgentSession {
 			transformProviderContext: config.transformProviderContext,
 			initialCosts: config.initialAdvisorCosts,
 		});
+		this.#advisorsInitialized = true;
 
 		const maintenanceHost: SessionMaintenanceHost = {
 			agent: this.agent,
@@ -5953,9 +5968,43 @@ export class AgentSession {
 		return this.#providerBoundary.buildDisplaySessionContext();
 	}
 
+	#setGoalModeState(
+		state: GoalModeState | undefined,
+		source: "mutation" | "rehydrate" | "restore",
+		pendingTerminalMissionKey?: string,
+	): void {
+		const previousKey = this.#advisorMissionKey;
+		const previousPendingKey = this.#pendingAdvisorTerminalMissionKey;
+		const nextKey = state?.goal
+			? sha256(JSON.stringify([state.goal.id, state.goal.objective, state.goal.status]))
+			: undefined;
+		this.#goalModeState = state;
+		this.#advisorMissionKey = nextKey;
+		if (source === "rehydrate") {
+			this.#pendingAdvisorTerminalMissionKey = undefined;
+		} else if (source === "restore") {
+			this.#pendingAdvisorTerminalMissionKey =
+				pendingTerminalMissionKey === nextKey && state?.goal && isFinalStatus(state.goal) ? nextKey : undefined;
+		} else if (nextKey !== previousKey) {
+			this.#pendingAdvisorTerminalMissionKey = state?.goal && isFinalStatus(state.goal) ? nextKey : undefined;
+		}
+		if (
+			this.#advisorsInitialized &&
+			(previousKey !== nextKey || previousPendingKey !== this.#pendingAdvisorTerminalMissionKey)
+		) {
+			this.#advisors.onMissionChanged(
+				nextKey,
+				this.#pendingAdvisorTerminalMissionKey !== undefined && this.#pendingAdvisorTerminalMissionKey === nextKey,
+			);
+		}
+	}
+
 	#rehydrateGoalModeState(mode: unknown, modeData: unknown): void {
 		this.#goalRuntime.clearAccounting();
-		this.#goalModeState = this.settings.get("goal.enabled") ? parseGoalModeState(mode, modeData) : undefined;
+		this.#setGoalModeState(
+			this.settings.get("goal.enabled") ? parseGoalModeState(mode, modeData) : undefined,
+			"rehydrate",
+		);
 	}
 
 	#replaceMessagesFromSessionContext(context: SessionContext, messages = context.messages): void {
@@ -6075,7 +6124,11 @@ export class AgentSession {
 	}
 
 	setGoalModeState(state: GoalModeState | undefined): void {
-		this.#goalModeState = state;
+		this.#setGoalModeState(state, "mutation");
+	}
+
+	rehydrateGoalModeState(state: GoalModeState | undefined): void {
+		this.#setGoalModeState(state, "rehydrate");
 	}
 
 	getVibeModeState(): VibeModeState | undefined {
@@ -6178,6 +6231,7 @@ export class AgentSession {
 			goalModeState: this.#goalModeState
 				? { ...this.#goalModeState, goal: { ...this.#goalModeState.goal } }
 				: undefined,
+			pendingAdvisorTerminalMissionKey: this.#pendingAdvisorTerminalMissionKey,
 			inspectImageModeOverride: this.#inspectImageModeOverride,
 			goalTurnCounter: this.#goalTurnCounter,
 			planReferenceSent: this.#planReferenceSent,
@@ -6193,9 +6247,13 @@ export class AgentSession {
 		this.#observedSessionId = checkpoint.observedSessionId;
 		this.#planModeState = checkpoint.planModeState ? { ...checkpoint.planModeState } : undefined;
 		this.#vibeModeState = checkpoint.vibeModeState ? { ...checkpoint.vibeModeState } : undefined;
-		this.#goalModeState = checkpoint.goalModeState
-			? { ...checkpoint.goalModeState, goal: { ...checkpoint.goalModeState.goal } }
-			: undefined;
+		this.#setGoalModeState(
+			checkpoint.goalModeState
+				? { ...checkpoint.goalModeState, goal: { ...checkpoint.goalModeState.goal } }
+				: undefined,
+			"restore",
+			checkpoint.pendingAdvisorTerminalMissionKey,
+		);
 		this.#inspectImageModeOverride = checkpoint.inspectImageModeOverride;
 		this.#goalTurnCounter = checkpoint.goalTurnCounter;
 		this.#planReferenceSent = checkpoint.planReferenceSent;

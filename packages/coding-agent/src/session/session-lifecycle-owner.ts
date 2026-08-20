@@ -899,6 +899,7 @@ export interface RetainedSessionRuntimeFields {
 	planModeState: PlanModeState | undefined;
 	vibeModeState: VibeModeState | undefined;
 	goalModeState: GoalModeState | undefined;
+	pendingAdvisorTerminalMissionKey: string | undefined;
 	inspectImageModeOverride: InspectImageMode | undefined;
 	goalTurnCounter: number;
 	planReferenceSent: boolean;
