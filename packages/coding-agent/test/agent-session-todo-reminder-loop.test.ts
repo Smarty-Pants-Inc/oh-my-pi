@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { Agent } from "@oh-my-pi/pi-agent-core";
-import type { AssistantMessage, TextContent, ToolCall } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, TextContent } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -10,7 +10,7 @@ import { TodoTool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
-/** Stop-time todo notifications preserve user control: no continuation or forced tool choice. */
+/** Stale todo closure is rejected once per prompt without a hidden continuation loop. */
 const sharedAuthStorage = createInMemoryAuthStorage();
 sharedAuthStorage.setRuntimeApiKey("anthropic", "test-key");
 const sharedModelRegistry = new ModelRegistry(sharedAuthStorage);
@@ -24,6 +24,7 @@ describe("AgentSession stop-time todo notifications", () => {
 	let session: AgentSession;
 	let sessionManager: SessionManager;
 	let reminderAttempts: number[];
+	let agentEndTerminalStates: Array<boolean | undefined>;
 
 	function textOnlyAssistantMessage(text = "paused at your instruction"): AssistantMessage {
 		return {
@@ -49,57 +50,6 @@ describe("AgentSession stop-time todo notifications", () => {
 		const msg = textOnlyAssistantMessage(text);
 		session.agent.emitExternalEvent({ type: "message_end", message: msg });
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [msg] });
-	}
-
-	function emitToolResult(toolName: string, details: Record<string, unknown> = {}): void {
-		const toolCallId = `call_${toolName}_${Date.now()}_${Math.random()}`;
-		const toolCall: ToolCall = { type: "toolCall", id: toolCallId, name: toolName, arguments: {} };
-		const assistantMsg: AssistantMessage = {
-			role: "assistant",
-			content: [toolCall],
-			api: "anthropic-messages",
-			provider: "anthropic",
-			model: "claude-sonnet-4-5",
-			stopReason: "toolUse",
-			usage: {
-				input: 50,
-				output: 10,
-				cacheRead: 0,
-				cacheWrite: 0,
-				totalTokens: 60,
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-			},
-			timestamp: Date.now(),
-		};
-		session.agent.emitExternalEvent({ type: "message_end", message: assistantMsg });
-		const content: TextContent[] = [{ type: "text", text: "ok" }];
-		session.agent.emitExternalEvent({
-			type: "message_end",
-			message: {
-				role: "toolResult",
-				toolCallId,
-				toolName,
-				content,
-				isError: false,
-				details,
-				timestamp: Date.now(),
-			},
-		});
-	}
-
-	function emitAsyncTaskResult(): void {
-		session.agent.emitExternalEvent({
-			type: "message_end",
-			message: {
-				role: "custom",
-				customType: "async-result",
-				content: "Background task completed.",
-				display: true,
-				attribution: "agent",
-				details: { jobs: [{ jobId: "task-review", type: "task" }] },
-				timestamp: Date.now(),
-			},
-		});
 	}
 
 	function todoReminderTranscriptEntry() {
@@ -153,11 +103,11 @@ describe("AgentSession stop-time todo notifications", () => {
 			modelRegistry: sharedModelRegistry,
 		});
 
+		agentEndTerminalStates = [];
 		reminderAttempts = [];
 		session.subscribe((event: AgentSessionEvent) => {
-			if (event.type === "todo_reminder") {
-				reminderAttempts.push(event.attempt);
-			}
+			if (event.type === "todo_reminder") reminderAttempts.push(event.attempt);
+			if (event.type === "agent_end") agentEndTerminalStates.push(event.isTerminal);
 		});
 
 		session.setTodoPhases([
@@ -179,24 +129,42 @@ describe("AgentSession stop-time todo notifications", () => {
 		vi.restoreAllMocks();
 	});
 
-	it("notifies once for actionable todos without continuing or forcing a tool", async () => {
+	it("rejects stale todo closure without continuing or forcing a tool", async () => {
 		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
 		emitTextOnlyStop();
 		await session.waitForIdle();
 
 		expect(reminderAttempts).toEqual([1]);
+		expect(agentEndTerminalStates).toEqual([false]);
 		expect(session.toolChoiceQueue.nextToolChoice()).toBeUndefined();
 		expect(todoReminderTranscriptEntry()).toBeUndefined();
 		expect(continueSpy).not.toHaveBeenCalled();
 	});
 
-	it("does not remind or continue when the assistant yields with a user-facing question", async () => {
+	it("rejects a later user turn while actionable todos remain", async () => {
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+		emitTextOnlyStop();
+		await session.waitForIdle();
+		vi.spyOn(session.agent, "prompt").mockImplementation(async () => {
+			emitTextOnlyStop("The tracked work is still incomplete.");
+		});
+
+		await session.prompt("Continue the tracked work.");
+		await session.waitForIdle();
+
+		expect(reminderAttempts).toEqual([1, 1]);
+		expect(agentEndTerminalStates).toEqual([false, false]);
+		expect(continueSpy).not.toHaveBeenCalled();
+	});
+
+	it("rejects stale closure when the assistant asks for user input", async () => {
 		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
 
 		emitTextOnlyStop("I need your feedback before continuing. Which trade-off should I optimize for?");
 		await session.waitForIdle();
 
-		expect(reminderAttempts).toEqual([]);
+		expect(reminderAttempts).toEqual([1]);
+		expect(agentEndTerminalStates).toEqual([false]);
 		expect(todoReminderTranscriptEntry()).toBeUndefined();
 		expect(continueSpy).not.toHaveBeenCalled();
 	});
@@ -210,6 +178,7 @@ describe("AgentSession stop-time todo notifications", () => {
 
 		expect(reminderAttempts).toEqual([]);
 		expect(todoReminderTranscriptEntry()).toBeUndefined();
+		expect(agentEndTerminalStates).toEqual([true]);
 		expect(continueSpy).not.toHaveBeenCalled();
 	});
 
@@ -234,15 +203,17 @@ describe("AgentSession stop-time todo notifications", () => {
 
 		expect(reminderAttempts).toEqual([]);
 		expect(session.toolChoiceQueue.nextToolChoice()).toBeUndefined();
+		expect(agentEndTerminalStates).toEqual([true, true]);
 	});
 
-	it("does not remind or continue when the assistant yields with a non-English (Chinese) question", async () => {
+	it("rejects stale closure for a non-English user-facing question", async () => {
 		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
 
 		emitTextOnlyStop("我遇到一个需要你决定的问题：是否应该继续删除旧的配置文件？");
 		await session.waitForIdle();
 
-		expect(reminderAttempts).toEqual([]);
+		expect(reminderAttempts).toEqual([1]);
+		expect(agentEndTerminalStates).toEqual([false]);
 		expect(todoReminderTranscriptEntry()).toBeUndefined();
 		expect(continueSpy).not.toHaveBeenCalled();
 	});
@@ -291,6 +262,7 @@ describe("AgentSession stop-time todo notifications", () => {
 		await session.waitForIdle();
 
 		expect(reminderAttempts).toEqual([1]);
+		expect(agentEndTerminalStates).toEqual([false, false]);
 		expect(continueSpy).not.toHaveBeenCalled();
 	});
 });

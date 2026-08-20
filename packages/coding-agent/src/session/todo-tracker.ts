@@ -1,5 +1,5 @@
 import type { Agent, AgentMessage, AgentTool } from "@oh-my-pi/pi-agent-core";
-import type { AssistantMessage, Model, TextContent, ToolChoice } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, Model, ToolChoice } from "@oh-my-pi/pi-ai";
 import { isRecord, logger, prompt, stringProperty } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
 import { agentBehavior } from "../context/registry";
@@ -12,19 +12,6 @@ import type { AgentSessionEvent } from "./agent-session-events";
 import type { SessionManager } from "./session-manager";
 
 const PASSIVE_TODO_STATUSES = new Set<string>(agentBehavior.todo.contextItems);
-const MARKDOWN_PROMPT_PREFIX_RE = /^(?:>\s*)?(?:(?:[-*+]|\d+[.)])\s+)*/;
-const PROMPT_LABEL_RE = /^(?:q(?:uestion)?|ask)\s*\d*\s*[:.)-]\s*/i;
-const QUESTION_PROMPT_RE =
-	/^(?:what|which|when|where|why|how|who|whom|whose|do|does|did|can|could|would|will|should|is|are|am|may|shall)\b/i;
-const USER_DIRECTED_PROMPT_RE = /\b(?:you|your|we|our)\b/i;
-const USER_RESPONSE_CUE_RE =
-	/^(?:please\s+)?(?:confirm|reply|choose|pick|decide|advise)\b|^(?:please\s+)?answer\b|^(?:please\s+)?(?:let\s+me\s+know|tell\s+me)\b/i;
-const NON_ASCII_TEXT_RE = /[^\x00-\x7F]/;
-
-interface PromptLine {
-	text: string;
-	hadPromptLabel: boolean;
-}
 
 export interface PassiveTodoSnapshot {
 	semanticRole: "internal_context";
@@ -226,31 +213,31 @@ export class TodoTracker {
 		return nudges;
 	}
 
-	/** Emits one bounded stop-time notification for actionable incomplete todos. */
-	async checkCompletion(message: AssistantMessage): Promise<boolean> {
+	/** Emits one bounded stop-time notification and rejects stale todo closure. */
+	async checkCompletion(_message: AssistantMessage): Promise<boolean> {
 		if (this.#host.consumeLastServedToolChoiceLabel() === "user-force" || this.#host.planModeEnabled()) return false;
-		if (this.#stopReminderSent) return false;
 		if (!this.#host.settings.get("todo.reminders") || !this.#host.settings.get("todo.enabled")) {
 			this.#reminderCount = 0;
 			this.#stopReminderSent = false;
 			return false;
 		}
 		if (!this.#host.getActiveToolNames().includes("todo")) return false;
-		const maxAttempts = this.#host.settings.get("todo.remindersMax");
-		if (this.#reminderCount >= maxAttempts) return false;
 		const todos = this.phases
 			.flatMap(phase => phase.tasks)
 			.filter(task => task.status === "pending" || task.status === "in_progress");
-		if (todos.length === 0 || isAwaitingUserAnswer(message) || this.#host.hasPendingAsyncWake()) return false;
-		this.#reminderCount++;
-		await this.#host.emitSessionEvent({
-			type: "todo_reminder",
-			todos,
-			attempt: this.#reminderCount,
-			maxAttempts,
-		});
-		this.#stopReminderSent = true;
-		return false;
+		if (todos.length === 0 || this.#host.hasPendingAsyncWake()) return false;
+		const maxAttempts = this.#host.settings.get("todo.remindersMax");
+		if (!this.#stopReminderSent && this.#reminderCount < maxAttempts) {
+			this.#reminderCount++;
+			await this.#host.emitSessionEvent({
+				type: "todo_reminder",
+				todos,
+				attempt: this.#reminderCount,
+				maxAttempts,
+			});
+			this.#stopReminderSent = true;
+		}
+		return true;
 	}
 
 	/** Todo state never injects a mid-turn nudge. */
@@ -294,46 +281,4 @@ function toolCallOpFromMessage(message: AgentMessage, toolCallId: string): strin
 		return isRecord(block.arguments) ? stringProperty(block.arguments, "op") : undefined;
 	}
 	return undefined;
-}
-
-function assistantText(message: AssistantMessage): string {
-	return message.content
-		.filter((content): content is TextContent => content.type === "text")
-		.map(content => content.text)
-		.join("\n")
-		.trim();
-}
-
-function promptLine(line: string): PromptLine {
-	const withoutMarkdownPrefix = line.trim().replace(MARKDOWN_PROMPT_PREFIX_RE, "").trim();
-	const withoutPromptLabel = withoutMarkdownPrefix.replace(PROMPT_LABEL_RE, "").trim();
-	return {
-		text: withoutPromptLabel,
-		hadPromptLabel: withoutPromptLabel !== withoutMarkdownPrefix,
-	};
-}
-
-function isQuestionPromptLine(line: string): boolean {
-	const candidate = promptLine(line);
-	if (!/[?？]\s*$/.test(candidate.text)) return false;
-	return (
-		candidate.hadPromptLabel ||
-		QUESTION_PROMPT_RE.test(candidate.text) ||
-		USER_DIRECTED_PROMPT_RE.test(candidate.text) ||
-		NON_ASCII_TEXT_RE.test(candidate.text)
-	);
-}
-
-function isResponseCueLine(line: string): boolean {
-	const candidate = promptLine(line)
-		.text.replace(/[.!?。！？]+$/, "")
-		.trim();
-	return USER_RESPONSE_CUE_RE.test(candidate);
-}
-
-function isAwaitingUserAnswer(message: AssistantMessage): boolean {
-	const text = assistantText(message);
-	if (!text) return false;
-	const lastLine = text.split(/\r?\n/).at(-1)?.trim();
-	return lastLine !== undefined && (isQuestionPromptLine(lastLine) || isResponseCueLine(lastLine));
 }

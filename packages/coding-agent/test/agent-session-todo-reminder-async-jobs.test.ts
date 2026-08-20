@@ -12,7 +12,7 @@ import { TodoTool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
-/** Async ownership gates session_stop; terminal stops still surface bounded todo notifications. */
+/** Async ownership gates session_stop; actionable todos reject terminal closure without a hidden wake. */
 const sharedAuthStorage = createInMemoryAuthStorage();
 sharedAuthStorage.setRuntimeApiKey("anthropic", "test-key");
 const sharedModelRegistry = new ModelRegistry(sharedAuthStorage);
@@ -154,7 +154,7 @@ describe("AgentSession todo reminder async-job deferral", () => {
 		vi.restoreAllMocks();
 	});
 
-	it("notifies on a terminal stop for an owned job without an open origin turn", async () => {
+	it("rejects terminal closure for an owned job without an open origin turn", async () => {
 		setIncompleteTodos();
 		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
 		registerGatedJob("Main");
@@ -164,7 +164,7 @@ describe("AgentSession todo reminder async-job deferral", () => {
 
 		expect(reminderAttempts).toEqual([1]);
 		expect(continueSpy).not.toHaveBeenCalled();
-		expect(agentEndTerminalStates).toEqual([true]);
+		expect(agentEndTerminalStates).toEqual([false]);
 	});
 
 	it("notifies when a different agent's job cannot wake this session", async () => {
