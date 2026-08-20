@@ -294,27 +294,80 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
 	});
 
-	it("contains static process.dlopen targets and rejects outside or dynamic targets", async () => {
+	it("contains static process.dlopen targets and rejects aliases, outside, or dynamic targets", async () => {
 		const dir = await writePackage({
 			"outside.node": "outside-native-addon",
 			"package/package.json": JSON.stringify({ name: "dlopen-graph-ext", version: "1.0.0" }),
 			"package/addon.node": "contained-native-addon",
 			"package/index.cjs": "module.exports = {};\n",
+			"package/index.mjs": "export {};\n",
 		});
 		const packageRoot = path.join(dir, "package");
-		const entry = path.join(packageRoot, "index.cjs");
+		const cjsEntry = path.join(packageRoot, "index.cjs");
+		const esmEntry = path.join(packageRoot, "index.mjs");
 		const insideTarget = await fs.realpath(path.join(packageRoot, "addon.node"));
 		const outsideTarget = await fs.realpath(path.join(dir, "outside.node"));
 
-		await fs.writeFile(entry, `process.dlopen(module, ${JSON.stringify(insideTarget)});\nmodule.exports = {};\n`);
-		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
-		await fs.writeFile(entry, `process.dlopen(module, ${JSON.stringify(outsideTarget)});\nmodule.exports = {};\n`);
-		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(false);
+		const aliasCases = [
+			{
+				entry: cjsEntry,
+				source: (target: string) =>
+					`const processModule = require("node:process");\nprocessModule.dlopen(module, ${JSON.stringify(target)});\n`,
+			},
+			{
+				entry: cjsEntry,
+				source: (target: string) =>
+					`const { dlopen: open } = require("node:process");\nopen(module, ${JSON.stringify(target)});\n`,
+			},
+			{
+				entry: cjsEntry,
+				source: (target: string) =>
+					`const open = require("node:process").dlopen;\nopen(module, ${JSON.stringify(target)});\n`,
+			},
+			{
+				entry: esmEntry,
+				source: (target: string) =>
+					`import processModule from "node:process";\nprocessModule.dlopen(module, ${JSON.stringify(target)});\n`,
+			},
+			{
+				entry: esmEntry,
+				source: (target: string) =>
+					`import * as processModule from "node:process";\nprocessModule.dlopen(module, ${JSON.stringify(target)});\n`,
+			},
+			{
+				entry: esmEntry,
+				source: (target: string) =>
+					`import { dlopen as open } from "node:process";\nopen(module, ${JSON.stringify(target)});\n`,
+			},
+		];
+		for (const { entry, source } of aliasCases) {
+			await fs.writeFile(entry, source(insideTarget));
+			expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+			await fs.writeFile(entry, source(outsideTarget));
+			expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(false);
+		}
+
+		await fs.writeFile(cjsEntry, `process.dlopen(module, ${JSON.stringify(insideTarget)});\nmodule.exports = {};\n`);
+		expect(await isExtensionSourceGraphContained(cjsEntry, packageRoot)).toBe(true);
+		await fs.writeFile(cjsEntry, `process.dlopen(module, ${JSON.stringify(outsideTarget)});\nmodule.exports = {};\n`);
+		expect(await isExtensionSourceGraphContained(cjsEntry, packageRoot)).toBe(false);
 		await fs.writeFile(
-			entry,
-			`const target = ${JSON.stringify(insideTarget)};\nprocess.dlopen(module, target);\nmodule.exports = {};\n`,
+			cjsEntry,
+			`const processModule = require("node:process");\nconst target = ${JSON.stringify(insideTarget)};\nprocessModule.dlopen(module, target);\n`,
 		);
-		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(false);
+		expect(await isExtensionSourceGraphContained(cjsEntry, packageRoot)).toBe(false);
+		await fs.writeFile(
+			cjsEntry,
+			`let open;\n({ dlopen: open } = require("node:process"));\nopen(module, ${JSON.stringify(outsideTarget)});\n`,
+		);
+		expect(await isExtensionSourceGraphContained(cjsEntry, packageRoot)).toBe(false);
+		await fs.writeFile(
+			esmEntry,
+			`const processModule = await import("node:process");\nprocessModule.dlopen(module, ${JSON.stringify(outsideTarget)});\n`,
+		);
+		expect(await isExtensionSourceGraphContained(esmEntry, packageRoot)).toBe(false);
+		await fs.writeFile(esmEntry, 'export { dlopen as open } from "node:process";\n');
+		expect(await isExtensionSourceGraphContained(esmEntry, packageRoot)).toBe(false);
 	});
 
 	it("contains runtime-loadable non-source targets", async () => {

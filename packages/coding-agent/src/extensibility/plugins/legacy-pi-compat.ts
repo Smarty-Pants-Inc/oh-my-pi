@@ -466,11 +466,30 @@ function isNodeModuleRequireCall(node: StructuralAstNode | null, scope: BindingS
 	return specifier?.type === "StringLiteral" && (specifier.value === "node:module" || specifier.value === "module");
 }
 
-function isProcessDlopenCall(node: StructuralAstNode | null, scope: BindingScope): boolean {
+function isNodeProcessRequireCall(node: StructuralAstNode | null, scope: BindingScope): boolean {
+	if (!isGlobalRequireCall(node, scope)) return false;
+	const specifier = nodeArgument(node, 0);
+	return specifier?.type === "StringLiteral" && (specifier.value === "node:process" || specifier.value === "process");
+}
+
+function isProcessDlopenCall(
+	node: StructuralAstNode | null,
+	scope: BindingScope,
+	processNamespaceBindings: ReadonlySet<string>,
+	processDlopenBindings: ReadonlySet<string>,
+): boolean {
 	if (node?.type !== "CallExpression" && node?.type !== "OptionalCallExpression") return false;
 	const callee = asAstNode(node.callee);
+	if (callee?.type === "Identifier" && typeof callee.name === "string") {
+		return processDlopenBindings.has(callee.name);
+	}
 	if (callee?.type !== "MemberExpression" || staticMemberPropertyName(callee) !== "dlopen") return false;
-	return isIdentifier(asAstNode(callee.object), "process") && !scopeHasBinding(scope, PROCESS_BINDING);
+	const object = asAstNode(callee.object);
+	return (
+		(isIdentifier(object, "process") && !scopeHasBinding(scope, PROCESS_BINDING)) ||
+		(object?.type === "Identifier" && typeof object.name === "string" && processNamespaceBindings.has(object.name)) ||
+		isNodeProcessRequireCall(object, scope)
+	);
 }
 
 /**
@@ -563,9 +582,13 @@ function collectExtensionSpecifierReferences(
 	const createRequireBindings = new Set<string>();
 	const moduleNamespaceBindings = new Set<string>();
 	const commonJsModuleNamespaceBindings = new Set<string>();
+	const processNamespaceBindings = new Set<string>();
+	const processDlopenBindings = new Set<string>();
 	const createRequireBindingNodes = new WeakSet<object>();
-	const runtimeBindingsOnly = graphProof !== undefined;
 	const moduleNamespaceBindingNodes = new WeakSet<object>();
+	const processNamespaceBindingNodes = new WeakSet<object>();
+	const processDlopenBindingNodes = new WeakSet<object>();
+	const runtimeBindingsOnly = graphProof !== undefined;
 	const nonRuntimeBindingNodes = new WeakSet<object>();
 	for (const { node } of collectScopedAstNodes(
 		ast,
@@ -575,6 +598,8 @@ function collectExtensionSpecifierReferences(
 		const source = asAstNode(node.source);
 		const isNodeModuleSource =
 			source?.type === "StringLiteral" && (source.value === "node:module" || source.value === "module");
+		const isNodeProcessSource =
+			source?.type === "StringLiteral" && (source.value === "node:process" || source.value === "process");
 		for (const value of Array.isArray(node.specifiers) ? node.specifiers : []) {
 			const specifier = asAstNode(value);
 			const local = asAstNode(specifier?.local);
@@ -583,12 +608,26 @@ function collectExtensionSpecifierReferences(
 				nonRuntimeBindingNodes.add(local);
 				continue;
 			}
-			if (!isNodeModuleSource) continue;
 			const imported = asAstNode(specifier?.imported);
 			const importedName =
 				imported?.type === "Identifier" || imported?.type === "StringLiteral"
 					? (imported.name ?? imported.value)
 					: undefined;
+			if (isNodeProcessSource) {
+				if (
+					specifier?.type === "ImportNamespaceSpecifier" ||
+					specifier?.type === "ImportDefaultSpecifier" ||
+					importedName === "default"
+				) {
+					processNamespaceBindings.add(local.name);
+					processNamespaceBindingNodes.add(local);
+				} else if (specifier?.type === "ImportSpecifier" && importedName === "dlopen") {
+					processDlopenBindings.add(local.name);
+					processDlopenBindingNodes.add(local);
+				}
+				continue;
+			}
+			if (!isNodeModuleSource) continue;
 			if (
 				specifier?.type === "ImportNamespaceSpecifier" ||
 				specifier?.type === "ImportDefaultSpecifier" ||
@@ -617,12 +656,13 @@ function collectExtensionSpecifierReferences(
 		const moduleReference = asAstNode(node.moduleReference);
 		const expression =
 			moduleReference?.type === "TSExternalModuleReference" ? asAstNode(moduleReference.expression) : null;
-		if (
-			expression?.type !== "StringLiteral" ||
-			(expression.value !== "node:module" && expression.value !== "module")
-		) {
+		if (expression?.type !== "StringLiteral") continue;
+		if (expression.value === "node:process" || expression.value === "process") {
+			processNamespaceBindings.add(binding.name);
+			processNamespaceBindingNodes.add(binding);
 			continue;
 		}
+		if (expression.value !== "node:module" && expression.value !== "module") continue;
 		moduleNamespaceBindings.add(binding.name);
 		commonJsModuleNamespaceBindings.add(binding.name);
 		moduleNamespaceBindingNodes.add(binding);
@@ -639,6 +679,43 @@ function collectExtensionSpecifierReferences(
 			nonRuntimeBindingNodes.add(binding);
 		}
 		const initializer = asAstNode(node.init);
+		if (isNodeProcessRequireCall(initializer, scope)) {
+			if (binding?.type === "Identifier" && typeof binding.name === "string") {
+				processNamespaceBindings.add(binding.name);
+				processNamespaceBindingNodes.add(binding);
+				continue;
+			}
+			if (binding?.type !== "ObjectPattern") {
+				if (graphProof) graphProof.provable = false;
+				continue;
+			}
+			for (const value of Array.isArray(binding.properties) ? binding.properties : []) {
+				const property = asAstNode(value);
+				if (!property || property.type === "RestElement" || property.computed === true) {
+					if (graphProof) graphProof.provable = false;
+					continue;
+				}
+				const propertyName = staticObjectPropertyName(property);
+				if (propertyName !== "default" && propertyName !== "dlopen") continue;
+				const propertyValue = asAstNode(property.value);
+				const propertyKey = asAstNode(property.key);
+				const local = propertyValue?.type === "AssignmentPattern" ? asAstNode(propertyValue.left) : propertyValue;
+				if (local?.type !== "Identifier" || typeof local.name !== "string") {
+					if (graphProof) graphProof.provable = false;
+					continue;
+				}
+				if (propertyName === "dlopen") {
+					if (propertyKey) processDlopenBindingNodes.add(propertyKey);
+					processDlopenBindings.add(local.name);
+					processDlopenBindingNodes.add(local);
+				} else {
+					if (propertyKey) processNamespaceBindingNodes.add(propertyKey);
+					processNamespaceBindings.add(local.name);
+					processNamespaceBindingNodes.add(local);
+				}
+			}
+			continue;
+		}
 		if (isNodeModuleRequireCall(initializer, scope)) {
 			if (binding?.type === "Identifier" && typeof binding.name === "string") {
 				moduleNamespaceBindings.add(binding.name);
@@ -675,6 +752,26 @@ function collectExtensionSpecifierReferences(
 					commonJsModuleNamespaceBindings.add(local.name);
 					moduleNamespaceBindingNodes.add(local);
 				}
+			}
+			continue;
+		}
+		if (initializer?.type === "MemberExpression" && isNodeProcessRequireCall(asAstNode(initializer.object), scope)) {
+			const memberName = staticMemberPropertyName(initializer);
+			if (memberName === null) {
+				if (graphProof) graphProof.provable = false;
+				continue;
+			}
+			if (memberName !== "default" && memberName !== "dlopen") continue;
+			if (binding?.type !== "Identifier" || typeof binding.name !== "string") {
+				if (graphProof) graphProof.provable = false;
+				continue;
+			}
+			if (memberName === "dlopen") {
+				processDlopenBindings.add(binding.name);
+				processDlopenBindingNodes.add(binding);
+			} else {
+				processNamespaceBindings.add(binding.name);
+				processNamespaceBindingNodes.add(binding);
 			}
 			continue;
 		}
@@ -731,7 +828,7 @@ function collectExtensionSpecifierReferences(
 			if (!isBoundFactory && !isImmediatelyInvoked && graphProof) graphProof.provable = false;
 		}
 		if (node.type === "CallExpression" || node.type === "OptionalCallExpression") {
-			if (graphProof && isProcessDlopenCall(node, scope)) {
+			if (graphProof && isProcessDlopenCall(node, scope, processNamespaceBindings, processDlopenBindings)) {
 				const target = nodeArgument(node, 1);
 				if (
 					node.type === "CallExpression" &&
@@ -780,7 +877,10 @@ function collectExtensionSpecifierReferences(
 				graphProof &&
 				node.type !== "ImportDeclaration" &&
 				importSource?.type === "StringLiteral" &&
-				(importSource.value === "node:module" || importSource.value === "module")
+				(importSource.value === "node:module" ||
+					importSource.value === "module" ||
+					importSource.value === "node:process" ||
+					importSource.value === "process")
 			) {
 				graphProof.provable = false;
 			}
@@ -790,7 +890,10 @@ function collectExtensionSpecifierReferences(
 				graphProof &&
 				(!record("import", node.source) ||
 					(importSource?.type === "StringLiteral" &&
-						(importSource.value === "node:module" || importSource.value === "module")))
+						(importSource.value === "node:module" ||
+							importSource.value === "module" ||
+							importSource.value === "node:process" ||
+							importSource.value === "process")))
 			) {
 				graphProof.provable = false;
 			} else if (!graphProof) {
@@ -810,7 +913,10 @@ function collectExtensionSpecifierReferences(
 					graphProof &&
 					(!record("import", importSource) ||
 						(importSource?.type === "StringLiteral" &&
-							(importSource.value === "node:module" || importSource.value === "module")))
+							(importSource.value === "node:module" ||
+								importSource.value === "module" ||
+								importSource.value === "node:process" ||
+								importSource.value === "process")))
 				) {
 					graphProof.provable = false;
 				} else if (!graphProof) {
@@ -819,7 +925,7 @@ function collectExtensionSpecifierReferences(
 			} else if (isIdentifier(callee, "require") && !scopeHasBinding(scope, REQUIRE_BINDING)) {
 				if (!record("require", nodeArgument(node, 0)) && graphProof) graphProof.provable = false;
 				if (node.type === "OptionalCallExpression" && graphProof) graphProof.provable = false;
-				if (isNodeModuleRequireCall(node, scope) && graphProof) {
+				if ((isNodeModuleRequireCall(node, scope) || isNodeProcessRequireCall(node, scope)) && graphProof) {
 					const supportedUse =
 						(parent?.type === "VariableDeclarator" && parent.init === node) ||
 						(parent?.type === "MemberExpression" && parentKey === "object") ||
@@ -889,7 +995,7 @@ function collectExtensionSpecifierReferences(
 					(parent?.type === "CallExpression" || parent?.type === "OptionalCallExpression") &&
 					parentKey === "arguments" &&
 					nodeArgument(parent, 0) === node &&
-					isProcessDlopenCall(parent, scope);
+					isProcessDlopenCall(parent, scope, processNamespaceBindings, processDlopenBindings);
 				if (directExportsTarget || typeofOperand || processDlopenModuleArgument) continue;
 				graphProof.provable = false;
 				continue;
@@ -907,6 +1013,29 @@ function collectExtensionSpecifierReferences(
 				(node.name === "eval" && !scopeHasBinding(scope, EVAL_BINDING)) ||
 				(node.name === "Function" && !scopeHasBinding(scope, FUNCTION_BINDING));
 			if (dynamicCodeIdentifier && !nonReferenceProperty) {
+				graphProof.provable = false;
+				continue;
+			}
+			if (processDlopenBindings.has(node.name)) {
+				if (processDlopenBindingNodes.has(node)) continue;
+				if (
+					(parent?.type === "CallExpression" || parent?.type === "OptionalCallExpression") &&
+					parentKey === "callee" &&
+					isProcessDlopenCall(parent, scope, processNamespaceBindings, processDlopenBindings)
+				) {
+					continue;
+				}
+				if (nonReferenceProperty) continue;
+				graphProof.provable = false;
+				continue;
+			}
+			if (processNamespaceBindings.has(node.name)) {
+				if (processNamespaceBindingNodes.has(node)) continue;
+				if (parent?.type === "MemberExpression" && parentKey === "object") {
+					if (staticMemberPropertyName(parent) === null) graphProof.provable = false;
+					continue;
+				}
+				if (nonReferenceProperty) continue;
 				graphProof.provable = false;
 				continue;
 			}
@@ -968,15 +1097,22 @@ function collectExtensionSpecifierReferences(
 				continue;
 			}
 			const processDlopenMember =
-				memberName === "dlopen" && isIdentifier(object, "process") && !scopeHasBinding(scope, PROCESS_BINDING);
+				memberName === "dlopen" &&
+				((isIdentifier(object, "process") && !scopeHasBinding(scope, PROCESS_BINDING)) ||
+					(object?.type === "Identifier" &&
+						typeof object.name === "string" &&
+						processNamespaceBindings.has(object.name)) ||
+					isNodeProcessRequireCall(object, scope));
 			if (processDlopenMember) {
 				if (
 					(parent?.type === "CallExpression" || parent?.type === "OptionalCallExpression") &&
 					parentKey === "callee" &&
-					isProcessDlopenCall(parent, scope)
+					isProcessDlopenCall(parent, scope, processNamespaceBindings, processDlopenBindings)
 				) {
 					continue;
 				}
+				const binding = parent?.type === "VariableDeclarator" && parent.init === node ? asAstNode(parent.id) : null;
+				if (binding && processDlopenBindingNodes.has(binding)) continue;
 				graphProof.provable = false;
 				continue;
 			}
