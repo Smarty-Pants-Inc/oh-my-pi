@@ -234,6 +234,10 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 				source:
 					'import * as nodeModule from "node:module"; const load = nodeModule.Module.createRequire(import.meta.url); load("/absolute/outside.js");',
 			},
+			{
+				name: "valueOf-wrapped node:module _load",
+				source: 'import Module from "node:module"; Module.valueOf()._load("/absolute/outside.js");',
+			},
 		] as const;
 
 		for (const testCase of cases) {

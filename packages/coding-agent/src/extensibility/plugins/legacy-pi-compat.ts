@@ -883,6 +883,13 @@ function collectExtensionSpecifierReferences(
 			return true;
 		}
 		if (isNodeModuleRequireCall(node, scope)) return true;
+		if (node?.type === "CallExpression" || node?.type === "OptionalCallExpression") {
+			const callee = asAstNode(node.callee);
+			if (callee?.type !== "MemberExpression" && callee?.type !== "OptionalMemberExpression") return false;
+			return (
+				staticMemberPropertyName(callee) === "valueOf" && isKnownModuleLoaderObject(asAstNode(callee.object), scope)
+			);
+		}
 		if (node?.type !== "MemberExpression" && node?.type !== "OptionalMemberExpression") return false;
 		const memberName = staticMemberPropertyName(node);
 		return (
