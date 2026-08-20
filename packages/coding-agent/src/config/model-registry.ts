@@ -31,6 +31,7 @@ import {
 	resolveModelCacheProviderId,
 	resolveOllamaModelCacheProviderId,
 } from "@oh-my-pi/pi-catalog/provider-models";
+import type { OpenAICompat } from "@oh-my-pi/pi-catalog/types";
 import { collapseBuiltModelVariants } from "@oh-my-pi/pi-catalog/variant-collapse";
 import { getAgentDir, isBunTestRuntime, logger, wrapFetchForExtraCa } from "@oh-my-pi/pi-utils";
 import { resolveProviderModelReference } from "../config/model-resolver";
@@ -66,6 +67,7 @@ import {
 	getOllamaContextLengthOverride,
 	normalizeLiteLLMDiscoveryBaseUrl,
 	normalizeLlamaCppBaseUrl,
+	normalizeQwenTemplateReasoning,
 } from "./model-discovery";
 import {
 	AUTHORITATIVE_RUNTIME_CATALOG_PROVIDERS,
@@ -663,12 +665,20 @@ export class ModelRegistry {
 		);
 	}
 
+	#builtInDiscoveryCompat(providerId: string): OpenAICompat | undefined {
+		if (providerId !== "vllm" && providerId !== "lm-studio") return undefined;
+		return mergeCompat(
+			this.#providerOverrides.get(providerId)?.compat,
+			this.#runtimeProviderOverrides.get(providerId)?.compat,
+		) as OpenAICompat | undefined;
+	}
+
 	#resolveStartupModelCacheProviderId(providerId: string): string {
 		const baseUrl =
 			this.#runtimeProviderOverrides.get(providerId)?.baseUrl ??
 			this.#providerOverrides.get(providerId)?.baseUrl ??
 			(this.#hasFullSnapshot ? this.getProviderBaseUrl(providerId) : undefined);
-		return resolveModelCacheProviderId(providerId, { baseUrl });
+		return resolveModelCacheProviderId(providerId, { baseUrl, compat: this.#builtInDiscoveryCompat(providerId) });
 	}
 
 	#loadCachedStandardProviderModels(): { models: Model<Api>[]; authoritativeFreshProviders: Set<string> } {
@@ -804,14 +814,15 @@ export class ModelRegistry {
 	}
 
 	#normalizeDiscoverableModels(providerConfig: DiscoveryProviderConfig, models: Model<Api>[]): Model<Api>[] {
+		const withQwenTemplateReasoning = models.map(normalizeQwenTemplateReasoning);
 		const withDecoderMetadata =
 			providerConfig.discovery.type === "ollama" ||
 			providerConfig.discovery.type === "llama.cpp" ||
 			providerConfig.discovery.type === "lm-studio"
-				? models.map(model =>
+				? withQwenTemplateReasoning.map(model =>
 						buildModel({ ...model, imageInputDecoder: "stb", compat: model.compatConfig } as ModelSpec<Api>),
 					)
-				: models;
+				: withQwenTemplateReasoning;
 
 		const withRemoteCompaction = providerConfig.remoteCompaction
 			? withDecoderMetadata.map(model =>
@@ -1075,10 +1086,10 @@ export class ModelRegistry {
 			return resolveOllamaModelCacheProviderId(providerConfig.provider, providerConfig.baseUrl);
 		}
 		if (providerConfig.discovery.type === "openai-models-list") {
-			// context-v3 invalidates rows cached before server-advertised input
-			// modalities were parsed from `/v1/models`; warm v2 rows pinned
-			// vision-capable ids at `input: ["text"]` until a forced refresh.
-			return `${providerConfig.provider}:openai-models-list-context-v3`;
+			// context-v4 invalidates rows cached before `/v1/models` backend
+			// ownership was projected into Qwen dialect compat. Without the bump,
+			// arbitrary provider ids backed by vLLM retain the generic Qwen wire shape.
+			return `${providerConfig.provider}:openai-models-list-context-v4`;
 		}
 		if (providerConfig.discovery.type === "litellm") {
 			// rich-v2 invalidates rows cached before reseller usage-suffix stripping
@@ -1374,11 +1385,13 @@ export class ModelRegistry {
 				(this.#runtimeProviderOverrides.has(descriptor.providerId) ||
 					this.#providerOverrides.has(descriptor.providerId) ||
 					this.#keylessProviders.has(descriptor.providerId));
+			const managerCompat = this.#builtInDiscoveryCompat(descriptor.providerId);
 			if (isAuthenticated(apiKey) || descriptor.allowUnauthenticated || hasExplicitVllmConfig) {
 				const discoveryConfig = {
 					apiKey: isDiscoveryBearerApiKey(apiKey) ? apiKey : undefined,
 					baseUrl: this.#descriptorBaseUrl(descriptor.providerId),
 					fetch: this.#fetch,
+					...(managerCompat ? { compat: managerCompat } : {}),
 				};
 				const preparedConfig =
 					getProviderDefinition(descriptor.providerId)?.prepareModelDiscovery?.(discoveryConfig) ??

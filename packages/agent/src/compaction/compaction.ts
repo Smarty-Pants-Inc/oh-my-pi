@@ -9,6 +9,7 @@ import {
 	type Api,
 	type ApiKey,
 	type AssistantMessage,
+	type CacheRetention,
 	type CodexCompactionContext,
 	type Context,
 	Effort,
@@ -812,6 +813,8 @@ export interface SummaryOptions {
 	 * `resolveCompactionEffort` for the conversion contract.
 	 */
 	thinkingLevel?: ThinkingLevel;
+	/** Resolved prompt-cache policy shared by local and provider-native compaction requests. */
+	cacheRetention?: CacheRetention;
 	/** Session routing key for remote compaction transports with sticky provider sessions. */
 	sessionId?: string;
 	/** Prompt-cache key for remote compaction transports that support provider prefix caching. */
@@ -994,6 +997,7 @@ async function requestSummary(
 			fetch: options?.fetch,
 			sessionId: options?.sessionId,
 			promptCacheKey: options?.promptCacheKey,
+			cacheRetention: options?.cacheRetention,
 			providerSessionState: options?.providerSessionState,
 			codexCompaction: localCodexCompaction(options),
 		},
@@ -1293,6 +1297,7 @@ async function generateShortSummary(
 			fetch: options?.fetch,
 			sessionId: options?.sessionId,
 			promptCacheKey: options?.promptCacheKey,
+			cacheRetention: options?.cacheRetention,
 			providerSessionState: options?.providerSessionState,
 			codexCompaction: localCodexCompaction(options),
 		},
@@ -1592,6 +1597,7 @@ export async function compact(
 		// silently falls back to Effort.High — the same defect e07b47ee4 fixed
 		// at the call sites, leaked back in here. See resolveCompactionEffort.
 		thinkingLevel: options?.thinkingLevel,
+		cacheRetention: options?.cacheRetention,
 		sessionId: options?.sessionId,
 		promptCacheKey: options?.promptCacheKey,
 		providerSessionState: options?.providerSessionState,
@@ -1665,6 +1671,7 @@ export async function compact(
 					reasoning: buildCompactionV2Reasoning(model, summaryOptions.thinkingLevel),
 					sessionId: summaryOptions.sessionId,
 					promptCacheKey: summaryOptions.promptCacheKey,
+					cacheRetention: summaryOptions.cacheRetention,
 					retainedMessageBudget: settings.v2RetainedMessageBudget,
 				});
 				const remote = await withAuth(
@@ -1723,6 +1730,7 @@ export async function compact(
 							{
 								fetch: summaryOptions.fetch,
 								sessionId: summaryOptions.sessionId,
+								cacheRetention: summaryOptions.cacheRetention,
 								providerSessionState: summaryOptions.providerSessionState,
 								codexCompaction: summaryOptions.codexCompaction,
 							},
@@ -1870,6 +1878,7 @@ async function generateTurnPrefixSummary(
 			fetch: options?.fetch,
 			sessionId: options?.sessionId,
 			promptCacheKey: options?.promptCacheKey,
+			cacheRetention: options?.cacheRetention,
 			providerSessionState: options?.providerSessionState,
 			codexCompaction: localCodexCompaction(options),
 		},

@@ -33,6 +33,7 @@ import {
 	isMinimaxM2FamilyModelId,
 	isMinimaxM3FamilyModelId,
 	isOpenAIGptOssModelId,
+	isQwen38_24TA95BModelId,
 	supportsAdaptiveThinkingDisplay,
 } from "./identity/family";
 import type {
@@ -71,6 +72,11 @@ const LOW_HIGH_MAX_REASONING_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Hi
 const HIGH_MAX_REASONING_EFFORTS: readonly Effort[] = [Effort.High, Effort.Max];
 /** OpenRouter's DeepSeek route accepts only `high`. */
 const HIGH_ONLY_REASONING_EFFORTS: readonly Effort[] = [Effort.High];
+/**
+ * Qwen 3.8+ open-weight chat template: prompt-steered `reasoning_effort`
+ * kwarg with exactly three wire tiers (template default is `xhigh`).
+ */
+const QWEN38_TEMPLATE_REASONING_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effort.XHigh];
 /**
  * Five wire tiers with a `low` floor: GPT-5.6+, Anthropic adaptive models
  * with the real xhigh tier (Opus 4.7+, Sonnet 5+, Fable/Mythos 5), and the
@@ -179,7 +185,7 @@ function fillThinkingWireDefaults<TApi extends Api>(
 		thinking.supportsDisplay === undefined &&
 		(spec.api === "anthropic-messages" || spec.api === "bedrock-converse-stream") &&
 		supportsAdaptiveThinkingDisplay(spec.id);
-	const needsRequiresEffort = thinking.requiresEffort === undefined && impliesMandatoryReasoning(parsed, spec.id);
+	const needsRequiresEffort = thinking.requiresEffort === undefined && impliesMandatoryReasoning(parsed, spec, compat);
 	const needsDefaultLevel =
 		thinking.defaultLevel === undefined && (isKimiK3ModelId(spec.id) || isGlm53ReasoningEffortModelId(spec.id));
 	if (!effortsChanged && !shouldReplaceEffortMap && !needsDisplay && !needsRequiresEffort && !needsDefaultLevel) {
@@ -232,7 +238,7 @@ export function deriveThinking<TApi extends Api>(spec: ModelSpec<TApi>, compat: 
 	) {
 		config.supportsDisplay = true;
 	}
-	if (impliesMandatoryReasoning(parsed, spec.id)) {
+	if (impliesMandatoryReasoning(parsed, spec, compat)) {
 		config.requiresEffort = true;
 	}
 	return config;
@@ -376,6 +382,12 @@ function getModelDefinedEfforts<TApi extends Api>(
 	if (spec.provider === "ollama") {
 		return OLLAMA_REASONING_EFFORTS;
 	}
+	// Qwen 3.8+ served through a local llama.cpp-style backend: the chat
+	// template's prompt-steered `reasoning_effort` kwarg accepts exactly
+	// low/medium/xhigh while the thinking-off path is checkpoint-specific.
+	if (isOpenAICompatReasoningApi(spec.api) && isQwenTemplateReasoningEffortCompat(compat)) {
+		return QWEN38_TEMPLATE_REASONING_EFFORTS;
+	}
 	if (
 		(isOpenAICompatReasoningApi(spec.api) || (spec.api === "ollama-chat" && spec.provider === "ollama-cloud")) &&
 		isDeepseekReasoningModel(spec)
@@ -483,6 +495,12 @@ function isOpenRouterThinkingFormat(compat: CompatOf<Api>): boolean {
 function isZaiThinkingFormat(compat: CompatOf<Api>): boolean {
 	return compat !== undefined && "thinkingFormat" in compat && compat.thinkingFormat === "zai";
 }
+/** Resolved-compat gate for the Qwen 3.8+ local template `reasoning_effort` dialect. */
+function isQwenTemplateReasoningEffortCompat(compat: CompatOf<Api>): boolean {
+	return (
+		compat !== undefined && "qwenTemplateReasoningEffort" in compat && compat.qwenTemplateReasoningEffort === true
+	);
+}
 
 function inferDetectedEffortMap<TApi extends Api>(
 	spec: ModelSpec<TApi>,
@@ -583,12 +601,20 @@ const OPENAI_O_SERIES_RE = /^o[134](?:$|[-:.])/i;
  * - Gemini 3.x exposes levels only; Gemini 2.5 Pro floors thinkingBudget at
  *   128 and rejects 0 (2.5 Flash/Flash-Lite keep the off switch).
  * - OpenAI o-series and MiniMax M2 are reasoning-first architectures.
+ * - Qwen3.8-2.4T-A95B's local/vLLM template rejects `enable_thinking: false`;
+ *   Qwen3.8-27B remains switchable.
  * - Thinking-variant SKUs (`*-thinking`, `*-reasoner`, `*-reasoning`) ARE the
  *   thinking checkpoint; live bare twins pair-collapse away
  *   (variant-collapse) and the collapsed entry owns off — this floor protects
  *   the orphans.
  */
-function impliesMandatoryReasoning(parsed: ParsedModel, modelId: string): boolean {
+function impliesMandatoryReasoning<TApi extends Api>(
+	parsed: ParsedModel,
+	spec: ModelSpec<TApi>,
+	compat: CompatOf<TApi>,
+): boolean {
+	const modelId = spec.id;
+	if (isQwen38_24TA95BModelId(modelId) && isQwenTemplateReasoningEffortCompat(compat)) return true;
 	if (parsed.family === "gemini") {
 		if (semverGte(parsed.version, "3.0")) return true;
 		if (parsed.kind === "pro" && semverGte(parsed.version, "2.5")) return true;

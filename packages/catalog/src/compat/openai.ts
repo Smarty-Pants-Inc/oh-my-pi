@@ -22,6 +22,7 @@ import {
 	isKimiModelId,
 	isMimoModelIdOrName,
 	isOpenAISamplingRestrictedModelId,
+	isQwen38PlusTemplateEffortModelId,
 	isQwenModelId,
 } from "../identity/family";
 import type {
@@ -135,15 +136,19 @@ function isOfficialOpenAIEndpoint(provider: string, baseUrl: string): boolean {
 	}
 }
 
+/** GPT-5.6+ moved prompt-cache lifetime control to `prompt_cache_options.ttl`. */
+function usesOpenAIPromptCacheOptions(modelId: string): boolean {
+	const model = parseOpenAIModel(bareModelId(modelId));
+	return model !== null && semverGte(model.version, "5.6");
+}
+
 /**
  * Explicit prompt-cache breakpoints are a GPT-5.6+ first-party contract. Keep
  * this intentionally narrow: compatible gateways and older OpenAI models
  * reject the new request fields unless their catalog compat opts in.
  */
 function supportsOfficialOpenAIPromptCacheBreakpoints(provider: string, modelId: string, baseUrl: string): boolean {
-	if (!isOfficialOpenAIEndpoint(provider, baseUrl)) return false;
-	const model = parseOpenAIModel(bareModelId(modelId));
-	return model !== null && semverGte(model.version, "5.6");
+	return isOfficialOpenAIEndpoint(provider, baseUrl) && usesOpenAIPromptCacheOptions(modelId);
 }
 
 /**
@@ -292,6 +297,7 @@ function hasLocalLoopbackBaseUrl(baseUrl: string | undefined): boolean {
 export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): ResolvedOpenAICompat {
 	const provider = spec.provider;
 	const baseUrl = spec.baseUrl;
+	const isVllmProvider = provider === "vllm";
 	const hostModel = { provider, baseUrl };
 
 	const isCerebras = modelMatchesHost(hostModel, "cerebras");
@@ -465,7 +471,7 @@ export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): Resolv
 			? "zai"
 			: isOpenRouter
 				? "openrouter"
-				: isQwen && isNvidiaNim
+				: isQwen && (isNvidiaNim || isVllmProvider)
 					? "qwen-chat-template"
 					: isQwen && isFireworks
 						? "openai"
@@ -588,6 +594,18 @@ export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): Resolv
 		// parameter, so the flag stays a no-op outside the Qwen path.
 		qwenPreserveThinking:
 			(thinkingFormat === "qwen" || thinkingFormat === "qwen-chat-template") && isLocalOpenAICompatBackend,
+		// Qwen 3.8+ templates steer thinking depth via the `reasoning_effort`
+		// template kwarg (low/medium/xhigh, default xhigh); without routing the
+		// requested effort there, the enable_thinking toggle alone leaves the
+		// model at xhigh no matter what the user selects.
+		// Local-only like `qwenPreserveThinking`: first-party Qwen APIs
+		// (Dashscope, Qwen Portal) drive effort through their own OpenAI-style
+		// dialect, and local Ollama keeps its native effort vocabulary.
+		qwenTemplateReasoningEffort:
+			(thinkingFormat === "qwen" || thinkingFormat === "qwen-chat-template") &&
+			(isLocalOpenAICompatBackend || isVllmProvider) &&
+			provider !== "ollama" &&
+			isQwen38PlusTemplateEffortModelId(spec.id),
 		requiresAssistantContentForToolCalls: isKimiModel || isDirectDeepseekReasoning,
 		cacheControlFormat: isOpenRouter && spec.id.startsWith("anthropic/") ? "anthropic" : undefined,
 		supportsPromptCacheBreakpoints,
@@ -713,7 +731,7 @@ export function buildOpenAIResponsesCompat(spec: OpenAIResponsesSpecLike): Resol
 		// Only the Grok effort-capable allowlist accepts `reasoning.effort`;
 		// other reasoners (grok-build, grok-code-fast-1, …) 400 if it is sent.
 		supportsReasoningEffort: !isXaiHost || isGrokReasoningEffortCapable(id),
-		supportsLongPromptCacheRetention: isOpenAIUrl,
+		supportsLongPromptCacheRetention: isOpenAIUrl && !usesOpenAIPromptCacheOptions(id),
 		supportsPromptCacheBreakpoints,
 		promptCacheBreakpointTtl: supportsPromptCacheBreakpoints ? "30m" : undefined,
 		// Azure OpenAI and GitHub Copilot Responses paths require tool results
@@ -762,6 +780,7 @@ export function buildOpenAIResponsesCompat(spec: OpenAIResponsesSpecLike): Resol
 		// Responses-only; the Qwen `preserve_thinking` template knob lives on
 		// the chat-completions wire shape, never on Responses.
 		qwenPreserveThinking: false,
+		qwenTemplateReasoningEffort: false,
 		requiresThinkingAsText: false,
 		requiresMistralToolIds: false,
 		requiresToolResultName: false,

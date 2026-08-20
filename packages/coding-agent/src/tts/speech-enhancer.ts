@@ -21,6 +21,7 @@ import type { ModelRegistry } from "../config/model-registry";
 import { getModelMatchPreferences, resolveModelRoleValue } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import speechRewritePrompt from "../prompts/system/speech-rewrite.md" with { type: "text" };
+import { resolveSettingsCacheRetention } from "../session/settings-stream-fn";
 
 const SYSTEM_PROMPT = prompt.render(speechRewritePrompt);
 // Rewrite budget: a paragraph in, a spoken paragraph (usually shorter) out.
@@ -96,6 +97,7 @@ export class SpeechEnhancer {
 							maxTokens: ANSWER_MAX_TOKENS,
 							disableReasoning: true,
 							metadata,
+							cacheRetention: resolveSettingsCacheRetention(settings),
 							signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
 						},
 					);

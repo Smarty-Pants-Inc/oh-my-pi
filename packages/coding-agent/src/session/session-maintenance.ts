@@ -79,6 +79,7 @@ import type { SessionContext } from "./session-context";
 import { getLatestCompactionEntry, getOpenAiRemoteCompactionPayload } from "./session-context";
 import type { CompactionEntry, SessionEntry } from "./session-entries";
 import type { SessionManager } from "./session-manager";
+import { createCompleteFnFromStreamFn, resolveSettingsCacheRetention } from "./settings-stream-fn";
 import type { ShakeMode, ShakeResult } from "./shake-types";
 
 export type CompactionCheckResult = Readonly<{
@@ -291,6 +292,7 @@ export class SessionMaintenance {
 	#midTurnDeadEndPendingPrePrompt = false;
 	#skipPostTurnMaintenanceAssistantTimestamp: number | undefined;
 	readonly #host: SessionMaintenanceHost;
+	readonly #completeWithSideStream: NonNullable<SummaryOptions["completeImpl"]>;
 
 	get #model(): Model | undefined {
 		return this.#host.model();
@@ -302,6 +304,7 @@ export class SessionMaintenance {
 
 	constructor(host: SessionMaintenanceHost) {
 		this.#host = host;
+		this.#completeWithSideStream = createCompleteFnFromStreamFn(host.sideStreamFn);
 	}
 
 	/** Whether manual or automatic context maintenance is active. */
@@ -1604,6 +1607,7 @@ export class SessionMaintenance {
 						// via resolveCompactionEffort so unsupported-effort models
 						// (xai-oauth/grok-build) don't trip requireSupportedEffort.
 						thinkingLevel: this.#host.thinkingLevel(),
+						cacheRetention: resolveSettingsCacheRetention(this.#host.settings),
 						tools: this.#host.agent.state.tools,
 						sessionId: this.#host.sessionId(),
 						promptCacheKey: this.#host.agent.promptCacheKey ?? this.#host.agent.sessionId,
@@ -1617,10 +1621,7 @@ export class SessionMaintenance {
 						// subagents auto/manually compacting issued uncapped
 						// summary requests in parallel (chatgpt-codex review on
 						// #3751).
-						completeImpl: async (requestModel, requestContext, requestOptions) => {
-							const stream = await this.#host.sideStreamFn(requestModel, requestContext, requestOptions);
-							return stream.result();
-						},
+						completeImpl: this.#completeWithSideStream,
 					},
 				);
 			} catch (error) {
@@ -2700,6 +2701,7 @@ export class SessionMaintenance {
 									// site. Clamped per-model inside compact() via
 									// resolveCompactionEffort.
 									thinkingLevel: this.#host.thinkingLevel(),
+									cacheRetention: resolveSettingsCacheRetention(this.#host.settings),
 									tools: this.#host.agent.state.tools,
 									sessionId: this.#host.sessionId(),
 									promptCacheKey: this.#host.agent.promptCacheKey ?? this.#host.agent.sessionId,
@@ -2711,6 +2713,7 @@ export class SessionMaintenance {
 									// retry too — the budgets would multiply and each outer
 									// wait would stack on top of an inner backoff.
 									oneshotRetry: false,
+									completeImpl: this.#completeWithSideStream,
 								},
 							);
 							break;

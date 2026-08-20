@@ -3,7 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { YAML } from "bun";
 import trackedManifestSource from "../../generated/prompt-manifest.json" with { type: "text" };
-import { diff, fetch as gitFetch, ref, remote, repo, show, status } from "../utils/git";
+import { config, diff, fetch as gitFetch, ls, ref, remote, repo, show, status } from "../utils/git";
 import { canonicalJson, compareUnicodeCodePoints, type JsonValue, sha256 } from "./canonical";
 import { computeImplementationSources } from "./implementation-sources";
 import {
@@ -585,19 +585,213 @@ export function canonicalAgentDirPath(): string {
 
 export function approvedCandidateSourceMatches(
 	repository: string | undefined,
-	identity: Pick<CandidateIdentity, "commit" | "tree"> | undefined,
-	workingSha256: string,
-	committedSha256: string,
+	approvedIdentity: Pick<CandidateIdentity, "commit" | "tree"> | undefined,
+	approvedPackageTree: string | undefined,
+	headPackageTree: string | undefined,
+	workingSourceStatus: string,
 	release: Pick<ContextReleaseManifest, "candidates">,
 ): boolean {
-	if (!repository || !identity) return false;
+	if (!repository || !approvedIdentity || !approvedPackageTree || !headPackageTree) return false;
 	const candidate = release.candidates.find(item => item.repository === repository);
 	return (
-		candidate?.commit === identity.commit && candidate.tree === identity.tree && workingSha256 === committedSha256
+		candidate?.commit === approvedIdentity.commit &&
+		candidate.tree === approvedIdentity.tree &&
+		approvedPackageTree === headPackageTree &&
+		workingSourceStatus === ""
 	);
 }
 
-/** Bind an external runtime source to exact bytes in one approved candidate. */
+type WorkingTreeEntry =
+	| { readonly kind: "file"; readonly mode: "100644" | "100755" | "120000"; readonly objectId: string }
+	| { readonly kind: "tree"; readonly entries: Map<string, WorkingTreeEntry> };
+
+const UTF8_ENCODER = new TextEncoder();
+
+function gitObjectId(type: "blob" | "tree", bytes: Uint8Array, expectedLength: number): string | undefined {
+	const hasher =
+		expectedLength === 40
+			? new Bun.CryptoHasher("sha1")
+			: expectedLength === 64
+				? new Bun.CryptoHasher("sha256")
+				: undefined;
+	if (!hasher) return undefined;
+	hasher.update(`${type} ${bytes.byteLength}\0`);
+	hasher.update(bytes);
+	return hasher.digest("hex");
+}
+
+function objectIdBytes(objectId: string): Uint8Array | undefined {
+	if (objectId.length % 2 !== 0 || !/^[a-f0-9]+$/.test(objectId)) return undefined;
+	const bytes = new Uint8Array(objectId.length / 2);
+	for (let index = 0; index < bytes.length; index++) {
+		bytes[index] = Number.parseInt(objectId.slice(index * 2, index * 2 + 2), 16);
+	}
+	return bytes;
+}
+
+function concatenateBytes(chunks: readonly Uint8Array[]): Uint8Array {
+	const bytes = new Uint8Array(chunks.reduce((total, chunk) => total + chunk.byteLength, 0));
+	let offset = 0;
+	for (const chunk of chunks) {
+		bytes.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	return bytes;
+}
+
+function compareGitTreeEntries(
+	[leftName, left]: readonly [string, WorkingTreeEntry],
+	[rightName, right]: readonly [string, WorkingTreeEntry],
+): number {
+	const leftBytes = UTF8_ENCODER.encode(leftName);
+	const rightBytes = UTF8_ENCODER.encode(rightName);
+	const commonLength = Math.min(leftBytes.length, rightBytes.length);
+	for (let index = 0; index < commonLength; index++) {
+		const difference = (leftBytes[index] ?? 0) - (rightBytes[index] ?? 0);
+		if (difference !== 0) return difference;
+	}
+	const leftTerminator =
+		leftBytes.length === commonLength ? (left.kind === "tree" ? 0x2f : 0) : leftBytes[commonLength];
+	const rightTerminator =
+		rightBytes.length === commonLength ? (right.kind === "tree" ? 0x2f : 0) : rightBytes[commonLength];
+	return (leftTerminator ?? 0) - (rightTerminator ?? 0);
+}
+
+function workingTreeObjectId(
+	tree: Extract<WorkingTreeEntry, { kind: "tree" }>,
+	expectedLength: number,
+): string | undefined {
+	const chunks: Uint8Array[] = [];
+	for (const [name, entry] of [...tree.entries].sort(compareGitTreeEntries)) {
+		const objectId = entry.kind === "tree" ? workingTreeObjectId(entry, expectedLength) : entry.objectId;
+		if (!objectId) return undefined;
+		const idBytes = objectIdBytes(objectId);
+		if (!idBytes) return undefined;
+		const mode = entry.kind === "tree" ? "40000" : entry.mode;
+		chunks.push(UTF8_ENCODER.encode(`${mode} ${name}\0`), idBytes);
+	}
+	return gitObjectId("tree", concatenateBytes(chunks), expectedLength);
+}
+
+async function workingPackageTreeObjectId(
+	repositoryRoot: string,
+	relativeSourceRoot: string,
+	expectedLength: number,
+): Promise<string | undefined> {
+	const [trackedEntries, fileModeConfig, symlinksConfig] = await Promise.all([
+		ls.treeEntries(repositoryRoot, "HEAD", [`:(literal)${relativeSourceRoot || "."}`]),
+		config.get(repositoryRoot, "core.fileMode"),
+		config.get(repositoryRoot, "core.symlinks"),
+	]);
+	const normalizedFileMode = fileModeConfig?.toLowerCase();
+	const useFilesystemMode =
+		normalizedFileMode !== "false" &&
+		normalizedFileMode !== "no" &&
+		normalizedFileMode !== "off" &&
+		normalizedFileMode !== "0";
+	const normalizedSymlinks = symlinksConfig?.toLowerCase();
+	const useFilesystemSymlinks =
+		normalizedSymlinks !== "false" &&
+		normalizedSymlinks !== "no" &&
+		normalizedSymlinks !== "off" &&
+		normalizedSymlinks !== "0";
+	const root: Extract<WorkingTreeEntry, { kind: "tree" }> = { kind: "tree", entries: new Map() };
+	const verifiedDirectories = new Set<string>();
+	for (const { path: trackedPath, mode: trackedMode } of trackedEntries) {
+		const relative = relativeSourceRoot ? path.posix.relative(relativeSourceRoot, trackedPath) : trackedPath;
+		if (!relative || relative === ".." || relative.startsWith("../") || path.posix.isAbsolute(relative))
+			return undefined;
+		const parts = relative.split("/");
+		let tree = root;
+		for (let index = 0; index < parts.length - 1; index++) {
+			const directoryPath = path.resolve(repositoryRoot, relativeSourceRoot, ...parts.slice(0, index + 1));
+			if (!verifiedDirectories.has(directoryPath)) {
+				try {
+					if (!(await fs.lstat(directoryPath)).isDirectory()) return undefined;
+				} catch {
+					return undefined;
+				}
+				verifiedDirectories.add(directoryPath);
+			}
+			const name = parts[index];
+			if (!name) return undefined;
+			const existing = tree.entries.get(name);
+			if (existing?.kind === "file") return undefined;
+			if (existing) {
+				tree = existing;
+			} else {
+				const child: Extract<WorkingTreeEntry, { kind: "tree" }> = { kind: "tree", entries: new Map() };
+				tree.entries.set(name, child);
+				tree = child;
+			}
+		}
+
+		const name = parts.at(-1);
+		if (!name || tree.entries.has(name)) return undefined;
+		const absolutePath = path.resolve(repositoryRoot, trackedPath);
+		const repositoryRelative = path.relative(repositoryRoot, absolutePath);
+		if (
+			repositoryRelative === ".." ||
+			repositoryRelative.startsWith(`..${path.sep}`) ||
+			path.isAbsolute(repositoryRelative)
+		) {
+			return undefined;
+		}
+		let bytes: Uint8Array;
+		let mode: "100644" | "100755" | "120000";
+		try {
+			const stats = await fs.lstat(absolutePath);
+			if (stats.isSymbolicLink()) {
+				if (trackedMode !== "120000") return undefined;
+				mode = trackedMode;
+				bytes = UTF8_ENCODER.encode(await fs.readlink(absolutePath));
+			} else if (stats.isFile()) {
+				if (trackedMode === "120000") {
+					if (useFilesystemSymlinks) return undefined;
+					mode = trackedMode;
+				} else {
+					if (trackedMode !== "100644" && trackedMode !== "100755") return undefined;
+					const filesystemMode = (stats.mode & 0o100) === 0 ? "100644" : "100755";
+					if (useFilesystemMode && filesystemMode !== trackedMode) return undefined;
+					mode = trackedMode;
+				}
+				bytes = await Bun.file(absolutePath).bytes();
+			} else {
+				return undefined;
+			}
+		} catch {
+			return undefined;
+		}
+		const objectId = gitObjectId("blob", bytes, expectedLength);
+		if (!objectId) return undefined;
+		tree.entries.set(name, { kind: "file", mode, objectId });
+	}
+	return trackedEntries.length > 0 ? workingTreeObjectId(root, expectedLength) : undefined;
+}
+
+async function approvedCandidateSourceRoot(
+	repositoryRoot: string,
+	resolvedSource: string,
+	candidateCommit: string,
+): Promise<string | undefined> {
+	let current = path.dirname(resolvedSource);
+	while (true) {
+		const relativeManifest = path
+			.relative(repositoryRoot, path.join(current, "package.json"))
+			.replaceAll(path.sep, "/");
+		try {
+			await show(repositoryRoot, `${candidateCommit}:${relativeManifest}`);
+			return current;
+		} catch {
+			if (current === repositoryRoot) return undefined;
+			const parent = path.dirname(current);
+			if (parent === current) return undefined;
+			current = parent;
+		}
+	}
+}
+
+/** Bind an external runtime source to an unchanged, clean package in one approved candidate. */
 export async function isApprovedCandidateSource(filePath: string, release: ContextReleaseManifest): Promise<boolean> {
 	try {
 		const resolved = await fs.realpath(path.resolve(filePath));
@@ -605,23 +799,42 @@ export async function isApprovedCandidateSource(filePath: string, release: Conte
 		if (!repositoryRoot) return false;
 		const relative = path.relative(repositoryRoot, resolved).replaceAll(path.sep, "/");
 		if (relative.startsWith("../") || path.isAbsolute(relative)) return false;
-		const identity = await ref.commitIdentity(repositoryRoot, "HEAD");
-		if (!identity) return false;
 		const remoteNames = await remote.list(repositoryRoot);
 		let repository: string | undefined;
 		for (const name of ["origin", ...remoteNames.filter(name => name !== "origin")]) {
 			repository = canonicalGithubRepository(await remote.url(repositoryRoot, name));
 			if (repository) break;
 		}
-		const [workingSource, committedSource] = await Promise.all([
-			readRequiredSource(resolved, `candidate source ${resolved}`),
-			show(repositoryRoot, `HEAD:${relative}`),
-		]);
+		const candidate = release.candidates.find(item => item.repository === repository);
+		if (!candidate) return false;
+		const approvedIdentity = await ref.commitIdentity(repositoryRoot, candidate.commit);
+		const sourceRoot = await approvedCandidateSourceRoot(repositoryRoot, resolved, candidate.commit);
+		if (!sourceRoot) return false;
+		const relativeSourceRoot = path.relative(repositoryRoot, sourceRoot).replaceAll(path.sep, "/");
+		const packagePathspec = `:(literal)${relativeSourceRoot || "."}`;
+		// Keep runtime plugin graph loading outside native-free offline context commands.
+		const { isExtensionSourceGraphContained } = await import("../extensibility/plugins/legacy-pi-compat");
+		const [approvedPackageTree, headPackageTree, workingSourceStatus, workingPackageTree, sourceGraphContained] =
+			await Promise.all([
+				ref.resolve(repositoryRoot, `${candidate.commit}:${relativeSourceRoot}`),
+				ref.resolve(repositoryRoot, `HEAD:${relativeSourceRoot}`),
+				status(repositoryRoot, {
+					porcelainV1: true,
+					untrackedFiles: "all",
+					includeIgnored: true,
+					z: true,
+					pathspecs: [packagePathspec],
+				}),
+				workingPackageTreeObjectId(repositoryRoot, relativeSourceRoot, candidate.tree.length),
+				isExtensionSourceGraphContained(resolved, sourceRoot),
+			]);
+		if (!headPackageTree || workingPackageTree !== headPackageTree || !sourceGraphContained) return false;
 		return approvedCandidateSourceMatches(
 			repository,
-			identity,
-			sha256(workingSource),
-			sha256(committedSource),
+			approvedIdentity ?? undefined,
+			approvedPackageTree ?? undefined,
+			headPackageTree ?? undefined,
+			workingSourceStatus,
 			release,
 		);
 	} catch {

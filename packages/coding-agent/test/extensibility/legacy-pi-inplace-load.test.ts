@@ -6,6 +6,7 @@ import * as url from "node:url";
 import {
 	__collectLegacyPiExtensionSourcesForTests,
 	__rewriteLegacyExtensionSourceForTests,
+	isExtensionSourceGraphContained,
 	loadLegacyPiModule,
 } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/legacy-pi-compat";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
@@ -79,6 +80,858 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 		expect(mod.requiredValue).toBe("required-cjs-ok");
 		expect(mod.defaultValue).toBe(42);
 		expect(mod.namedValue).toBe("named-cjs-ok");
+	});
+
+	it("rejects package imports whose selected target is outside the approved package", async () => {
+		const dir = await writePackage({
+			"node_modules/outside-dep/package.json": JSON.stringify({
+				name: "outside-dep",
+				version: "1.0.0",
+				type: "module",
+				exports: "./index.js",
+			}),
+			"node_modules/outside-dep/index.js": "export const outside = true;\n",
+			"package/package.json": JSON.stringify({
+				name: "package-import-graph-ext",
+				version: "1.0.0",
+				type: "module",
+				imports: {
+					"#local": "./local.js",
+					"#outside": "outside-dep",
+					"#conditional": { import: "./local.js", require: "outside-dep" },
+				},
+			}),
+			"package/local.js": "export const local = true;\n",
+			"package/index.js": 'import "#local";\n',
+		});
+		const packageRoot = path.join(dir, "package");
+		const entry = path.join(packageRoot, "index.js");
+
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+		await fs.writeFile(entry, 'import "#outside";\n');
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(false);
+		await fs.writeFile(entry, 'import "#conditional";\n');
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+		await fs.writeFile(entry, 'require("#conditional");\n');
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(false);
+	});
+
+	it("contains literal local createRequire edges and rejects unprovable ones", async () => {
+		const dir = await writePackage({
+			"outside.js": "export const outside = true;\n",
+			"package/package.json": JSON.stringify({ name: "create-require-graph-ext", version: "1.0.0", type: "module" }),
+			"package/local.js": "export const local = true;\n",
+			"package/index.js": [
+				'import { createRequire } from "node:module";',
+				"const localRequire = createRequire(import.meta.url);",
+				'localRequire("./local.js");',
+			].join("\n"),
+		});
+		const packageRoot = path.join(dir, "package");
+		const entry = path.join(packageRoot, "index.js");
+
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+		await fs.writeFile(
+			entry,
+			[
+				'import { createRequire } from "node:module";',
+				"const localRequire = createRequire(import.meta.url);",
+				'localRequire("../outside.js");',
+			].join("\n"),
+		);
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(false);
+		await fs.writeFile(
+			entry,
+			[
+				'import { createRequire } from "node:module";',
+				"const localRequire = createRequire(import.meta.url);",
+				'const target = "./local.js";',
+				"localRequire(target);",
+			].join("\n"),
+		);
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(false);
+		await fs.writeFile(
+			entry,
+			[
+				'import { createRequire } from "node:module";',
+				"const factory = createRequire;",
+				"const localRequire = factory(import.meta.url);",
+				'localRequire("../outside.js");',
+			].join("\n"),
+		);
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(false);
+	});
+
+	it("rejects dynamic and disguised require/import edges", async () => {
+		const dir = await writePackage({
+			"outside.js": "export const outside = true;\n",
+			"package/package.json": JSON.stringify({ name: "unprovable-graph-ext", version: "1.0.0" }),
+			"package/index.cjs": "module.exports = {};\n",
+		});
+		const packageRoot = path.join(dir, "package");
+		const entry = path.join(packageRoot, "index.cjs");
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+		const cases = [
+			{ name: "dynamic bare require", source: 'const target = "../outside.js"; require(target);' },
+			{ name: "dynamic bare import", source: 'const target = "../outside.js"; import(target);' },
+			{ name: "aliased require", source: 'const load = require; load("../outside.js");' },
+			{ name: "sequence-wrapped require", source: '(0, require)("../outside.js");' },
+			{ name: "module.require", source: 'module.require("../outside.js");' },
+			{ name: "aliased module.require", source: 'const load = module.require; load("../outside.js");' },
+			{ name: "aliased module object", source: 'const m = module; m.require("../outside.js");' },
+			{
+				name: "escaped module value",
+				source: 'const escaped = { value: module }; escaped.value.require("../outside.js");',
+			},
+			{ name: "eval-hidden require", source: "eval('require(\"../outside.js\")');" },
+			{ name: "Function-hidden require", source: "new Function('return require(\"../outside.js\")')();" },
+			{ name: "aliased eval", source: "const run = eval; run('require(\"../outside.js\")');" },
+			{
+				name: "aliased Function",
+				source: "const Build = Function; new Build('return require(\"../outside.js\")')();",
+			},
+			{ name: "global eval-hidden require", source: "globalThis.eval('require(\"../outside.js\")');" },
+			{
+				name: "global Function-hidden require",
+				source: "new globalThis.Function('return require(\"../outside.js\")')();",
+			},
+			{
+				name: "destructured global require",
+				source: 'const { require: r } = globalThis; r("node:process").dlopen(r.main, "/absolute/outside.node");',
+			},
+			{
+				name: "aliased require.main",
+				source: 'const main = require.main; main.require("/absolute/outside.js");',
+			},
+			{
+				name: "boxed require.main",
+				source: 'const box = { main: require.main }; box.main.require("/absolute/outside.js");',
+			},
+			{
+				name: "aliased node:module _load",
+				source: 'const Module = require("node:module"); const load = Module._load; load("/absolute/outside.js");',
+			},
+			{
+				name: "destructured node:module _load",
+				source: 'const { _load: load } = require("node:module"); load("/absolute/outside.js");',
+			},
+			{
+				name: "nested node:module namespace _load",
+				source: 'import * as nodeModule from "node:module"; nodeModule.Module._load("/absolute/outside.js");',
+			},
+			{
+				name: "aliased nested node:module namespace _load",
+				source:
+					'import * as nodeModule from "node:module"; const Loader = nodeModule.Module; Loader._load("/absolute/outside.js");',
+			},
+			{
+				name: "boxed nested node:module namespace _load",
+				source:
+					'import * as nodeModule from "node:module"; const box = { Loader: nodeModule.Module }; box.Loader._load("/absolute/outside.js");',
+			},
+			{
+				name: "nested node:module namespace createRequire",
+				source:
+					'import * as nodeModule from "node:module"; const load = nodeModule.Module.createRequire(import.meta.url); load("/absolute/outside.js");',
+			},
+			{
+				name: "valueOf-wrapped node:module _load",
+				source: 'import Module from "node:module"; Module.valueOf()._load("/absolute/outside.js");',
+			},
+			{
+				name: "computed node:module _load",
+				source: 'import { Module } from "node:module"; Module["_" + "load"]("/absolute/outside.js");',
+			},
+			{
+				name: "bound node:module constructor",
+				source:
+					'import { Module } from "node:module"; new (Module.bind(null))("x").require("/absolute/outside.js");',
+			},
+			{
+				name: "destructured node:module constructor",
+				source:
+					'const { constructor: Build } = require("node:module"); Build("return require(\\"/absolute/outside.js\\")")();',
+			},
+			{
+				name: "direct node:module constructor",
+				source:
+					'const Build = require("node:module").constructor; Build("return require(\\"/absolute/outside.js\\")")();',
+			},
+			{
+				name: "destructured node:process constructor",
+				source:
+					'const { constructor: ProcessType } = require("node:process"); ProcessType.constructor("return require(\\"/absolute/outside.js\\")")();',
+			},
+		] as const;
+
+		for (const testCase of cases) {
+			await fs.writeFile(entry, testCase.source);
+			expect(await isExtensionSourceGraphContained(entry, packageRoot), testCase.name).toBe(false);
+		}
+	});
+
+	it("tracks callable constructor values without rejecting benign constructor metadata", async () => {
+		const dir = await writePackage({
+			"outside.js": "export const outside = true;\n",
+			"package/package.json": JSON.stringify({ name: "function-constructor-ext", version: "1.0.0" }),
+			"package/index.cjs": [
+				"class Plugin {",
+				"  isPluginType() { return this.constructor === Plugin; }",
+				"}",
+				'const error = new Error("safe");',
+				"const ErrorType = error.constructor;",
+				"module.exports = { directName: error.constructor.name, aliasName: ErrorType.name, matches: new Plugin().isPluginType() };",
+			].join("\n"),
+		});
+		const packageRoot = path.join(dir, "package");
+		const entry = path.join(packageRoot, "index.cjs");
+
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+		await fs.writeFile(
+			entry,
+			[
+				"function inspect(Object) {",
+				"  return Object.getOwnPropertyDescriptor({}, 'constructor').value.name;",
+				"}",
+				"module.exports = inspect({ getOwnPropertyDescriptor: () => ({ value: { name: 'safe' } }) });",
+			].join("\n"),
+		);
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+		await fs.writeFile(
+			entry,
+			["const get = Object.getOwnPropertyDescriptor;", "module.exports = get({ safe: 1 }, 'safe').value;"].join(
+				"\n",
+			),
+		);
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+		const cases = [
+			{
+				name: "direct constructor call",
+				source: "(async () => {}).constructor('return require(\"../outside.js\")')();",
+			},
+			{
+				name: "constructor alias call",
+				source: "const Build = (async () => {}).constructor; Build('return require(\"../outside.js\")')();",
+			},
+			{
+				name: "destructured constructor alias",
+				source: "const { constructor: Build } = async () => {}; Build('return require(\"../outside.js\")')();",
+			},
+			{
+				name: "Reflect.get constructor alias",
+				source:
+					"const Build = Reflect.get(async () => {}, 'constructor'); Build('return require(\"../outside.js\")')();",
+			},
+			{
+				name: "nonliteral computed constructor alias",
+				source:
+					"const key = 'constructor'; const Build = (async () => {})[key]; Build('return require(\"../outside.js\")')();",
+			},
+			{
+				name: "descriptor constructor value",
+				source:
+					"Object.getOwnPropertyDescriptor(async () => {}, 'constructor').value('return require(\"../outside.js\")')();",
+			},
+			{
+				name: "aliased descriptor constructor value",
+				source:
+					"const descriptor = Object.getOwnPropertyDescriptor(async () => {}, 'constructor'); const Build = descriptor.value; Build('return require(\"../outside.js\")')();",
+			},
+			{
+				name: "descriptor helper alias constructor value",
+				source:
+					"const get = Object.getOwnPropertyDescriptor; get(async () => {}, 'constructor').value('return require(\"../outside.js\")')();",
+			},
+			{
+				name: "computed destructured descriptor helper",
+				source:
+					"const { ['getOwnPropertyDescriptor']: get } = Object; get(async () => {}, 'constructor').value('return require(\"../outside.js\")')();",
+			},
+			{
+				name: "escaped constructor value",
+				source: "module.exports = (async () => {}).constructor;",
+			},
+		] as const;
+		for (const testCase of cases) {
+			await fs.writeFile(entry, testCase.source);
+			expect(await isExtensionSourceGraphContained(entry, packageRoot), testCase.name).toBe(false);
+		}
+	});
+
+	it("tracks destructured Object descriptor helpers lexically in CommonJS and ESM", async () => {
+		const dir = await writePackage({
+			"package/package.json": JSON.stringify({
+				name: "destructured-descriptor-ext",
+				version: "1.0.0",
+				type: "module",
+			}),
+			"package/index.cjs": "module.exports = true;\n",
+			"package/index.js": "export const safe = true;\n",
+		});
+		const packageRoot = path.join(dir, "package");
+		const cases = [
+			{
+				name: "CommonJS",
+				entry: path.join(packageRoot, "index.cjs"),
+				benign: [
+					"const { getOwnPropertyDescriptor: get } = Object;",
+					"function inspect(get) { return get({ safe: 2 }, 'safe').value; }",
+					"module.exports = [get({ safe: 1 }, 'safe').value, inspect(() => ({ value: 2 }))];",
+				].join("\n"),
+				dangerous:
+					"const { getOwnPropertyDescriptor: get } = Object; get(async () => {}, 'constructor').value('return require(\"../outside.js\")')();",
+			},
+			{
+				name: "ESM",
+				entry: path.join(packageRoot, "index.js"),
+				benign: [
+					"const { getOwnPropertyDescriptor: get } = Object;",
+					"function inspect(get) { return get({ safe: 2 }, 'safe').value; }",
+					"export const values = [get({ safe: 1 }, 'safe').value, inspect(() => ({ value: 2 }))];",
+				].join("\n"),
+				dangerous:
+					"const { getOwnPropertyDescriptor: get } = Object; export const value = get(async () => {}, 'constructor').value('return process')();",
+			},
+		] as const;
+
+		for (const testCase of cases) {
+			await fs.writeFile(testCase.entry, testCase.benign);
+			expect(await isExtensionSourceGraphContained(testCase.entry, packageRoot), `${testCase.name} benign`).toBe(
+				true,
+			);
+			await fs.writeFile(testCase.entry, testCase.dangerous);
+			expect(await isExtensionSourceGraphContained(testCase.entry, packageRoot), `${testCase.name} dangerous`).toBe(
+				false,
+			);
+		}
+	});
+
+	it("rejects Module loaders exposed through require.cache", async () => {
+		const dir = await writePackage({
+			"outside.js": "export const outside = true;\n",
+			"package/package.json": JSON.stringify({ name: "require-cache-ext", version: "1.0.0" }),
+			"package/local.cjs": "module.exports = true;\n",
+			"package/index.cjs": 'module.exports = require.resolve("./local.cjs");\n',
+		});
+		const packageRoot = path.join(dir, "package");
+		const entry = path.join(packageRoot, "index.cjs");
+
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+		await fs.writeFile(entry, 'require.cache[__filename].require("../outside.js");\n');
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(false);
+	});
+
+	it("rejects process.mainModule loader chains without rejecting a shadowed process", async () => {
+		const dir = await writePackage({
+			"outside.js": "export const outside = true;\n",
+			"package/package.json": JSON.stringify({ name: "process-main-module-ext", version: "1.0.0" }),
+			"package/index.cjs": [
+				"const process = { mainModule: { require: { name: 'safe' } } };",
+				"module.exports = process.mainModule.require.name;",
+			].join("\n"),
+		});
+		const packageRoot = path.join(dir, "package");
+		const entry = path.join(packageRoot, "index.cjs");
+
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+		const cases = [
+			'process.mainModule.require("../outside.js");',
+			'const mainModule = process.mainModule; mainModule.require("../outside.js");',
+			'const processAlias = process; processAlias.mainModule.require("../outside.js");',
+			'const processAlias = process; const mainModule = processAlias.mainModule; mainModule.require("../outside.js");',
+		] as const;
+		for (const source of cases) {
+			await fs.writeFile(entry, source);
+			expect(await isExtensionSourceGraphContained(entry, packageRoot), source).toBe(false);
+		}
+	});
+
+	it("rejects Worker entry modules without rejecting a shadowed local Worker", async () => {
+		const dir = await writePackage({
+			"package/package.json": JSON.stringify({ name: "worker-entry-ext", version: "1.0.0", type: "module" }),
+			"package/worker.js": "export const worker = true;\n",
+			"package/index.js": [
+				"class Worker {",
+				"  constructor(entry) { this.entry = entry; }",
+				"}",
+				'export const localWorker = new Worker(new URL("./worker.js", import.meta.url));',
+			].join("\n"),
+		});
+		const packageRoot = path.join(dir, "package");
+		const entry = path.join(packageRoot, "index.js");
+
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+		await fs.writeFile(entry, 'new Worker(new URL("./worker.js", import.meta.url));\n');
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(false);
+		await fs.writeFile(
+			entry,
+			'import { Worker as Thread } from "node:worker_threads";\nnew Thread(new URL("./worker.js", import.meta.url));\n',
+		);
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(false);
+	});
+
+	it("rejects VM and child-process execution builtins during graph proof", async () => {
+		const dir = await writePackage({
+			"package/package.json": JSON.stringify({ name: "execution-builtin-ext", version: "1.0.0", type: "module" }),
+			"package/index.cjs": "module.exports = true;\n",
+			"package/index.js": "export const safe = true;\n",
+		});
+		const packageRoot = path.join(dir, "package");
+		const commonJsEntry = path.join(packageRoot, "index.cjs");
+		const esmEntry = path.join(packageRoot, "index.js");
+
+		const cases = [
+			{ name: "node:vm ESM import", entry: esmEntry, source: 'import * as vm from "node:vm";\nvoid vm;' },
+			{ name: "vm CommonJS require", entry: commonJsEntry, source: 'const vm = require("vm");\nvoid vm;' },
+			{
+				name: "node:child_process ESM import",
+				entry: esmEntry,
+				source: 'import * as childProcess from "node:child_process";\nvoid childProcess;',
+			},
+			{
+				name: "child_process ESM import",
+				entry: esmEntry,
+				source: 'import * as childProcess from "child_process";\nvoid childProcess;',
+			},
+			{
+				name: "node:child_process CommonJS require",
+				entry: commonJsEntry,
+				source: 'const childProcess = require("node:child_process");\nvoid childProcess;',
+			},
+			{
+				name: "child_process CommonJS require",
+				entry: commonJsEntry,
+				source: 'const childProcess = require("child_process");\nvoid childProcess;',
+			},
+		] as const;
+		for (const testCase of cases) {
+			await fs.writeFile(testCase.entry, testCase.source);
+			expect(await isExtensionSourceGraphContained(testCase.entry, packageRoot), testCase.name).toBe(false);
+		}
+	});
+
+	it("rejects process.getBuiltinModule loader paths without rejecting a shadowed process", async () => {
+		const dir = await writePackage({
+			"outside.js": "export const outside = true;\n",
+			"package/package.json": JSON.stringify({
+				name: "builtin-module-loader-ext",
+				version: "1.0.0",
+				type: "module",
+			}),
+			"package/index.js": [
+				'const process = { getBuiltinModule: () => ({ label: "safe" }) };',
+				'export const label = process.getBuiltinModule("module").label;',
+			].join("\n"),
+		});
+		const packageRoot = path.join(dir, "package");
+		const entry = path.join(packageRoot, "index.js");
+
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+		const cases = [
+			'process.getBuiltinModule("module").createRequire(import.meta.url)("../outside.js");',
+			'const loadBuiltin = process.getBuiltinModule; loadBuiltin("module").createRequire(import.meta.url)("../outside.js");',
+			'process["get" + "BuiltinModule"]("module").createRequire(import.meta.url)("../outside.js");',
+		] as const;
+		for (const source of cases) {
+			await fs.writeFile(entry, source);
+			expect(await isExtensionSourceGraphContained(entry, packageRoot), source).toBe(false);
+		}
+	});
+
+	it("tracks chained global and process identities through aliases", async () => {
+		const dir = await writePackage({
+			"outside.js": "export const outside = true;\n",
+			"package/package.json": JSON.stringify({ name: "global-alias-ext", version: "1.0.0", type: "module" }),
+			"package/worker.js": "export const worker = true;\n",
+			"package/index.js": [
+				"const globalThis = { globalThis: { Function: { name: 'safe' } } };",
+				"export const name = globalThis.globalThis.Function.name;",
+			].join("\n"),
+		});
+		const packageRoot = path.join(dir, "package");
+		const entry = path.join(packageRoot, "index.js");
+
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+		const cases = [
+			"globalThis.globalThis.Function('return require(\"../outside.js\")')();",
+			"const root = globalThis.globalThis; root.Function('return require(\"../outside.js\")')();",
+			'new globalThis.globalThis.Worker(new URL("./worker.js", import.meta.url));',
+			'const root = global; const same = root.global; new same.Worker(new URL("./worker.js", import.meta.url));',
+			'globalThis.globalThis.process.getBuiltinModule("module").createRequire(import.meta.url)("../outside.js");',
+			'const root = globalThis.globalThis; const processAlias = root.process; processAlias.getBuiltinModule("module");',
+		] as const;
+		for (const source of cases) {
+			await fs.writeFile(entry, source);
+			expect(await isExtensionSourceGraphContained(entry, packageRoot), source).toBe(false);
+		}
+	});
+
+	it("tracks process, global, module, and constructor aliases by lexical binding", async () => {
+		const dir = await writePackage({
+			"outside.js": "export const outside = true;\n",
+			"package/package.json": JSON.stringify({ name: "lexical-alias-ext", version: "1.0.0" }),
+			"package/index.cjs": [
+				"const processValue = process;",
+				"const globalValue = globalThis;",
+				'const moduleValue = require("node:module");',
+				"const constructorValue = (async () => {}).constructor;",
+				"function inspect(processValue, moduleValue) {",
+				"  const globalValue = { label: 'global' };",
+				"  const constructorValue = { name: 'Safe' };",
+				"  return [processValue.label, globalValue.label, moduleValue.label, constructorValue.name];",
+				"}",
+				"module.exports = inspect({ label: 'process' }, { label: 'module' });",
+			].join("\n"),
+		});
+		const packageRoot = path.join(dir, "package");
+		const entry = path.join(packageRoot, "index.cjs");
+
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+		const cases = [
+			'const processValue = process; processValue.getBuiltinModule("module");',
+			"const globalValue = globalThis; globalValue.Function('return require(\"../outside.js\")')();",
+			'const moduleValue = require("node:module"); moduleValue._load("../outside.js");',
+			"const constructorValue = (async () => {}).constructor; constructorValue('return require(\"../outside.js\")')();",
+		] as const;
+		for (const source of cases) {
+			await fs.writeFile(entry, source);
+			expect(await isExtensionSourceGraphContained(entry, packageRoot), source).toBe(false);
+		}
+	});
+
+	it("tracks createRequire imported through ESM and CommonJS Module variants", async () => {
+		const dir = await writePackage({
+			"outside.js": "export const outside = true;\n",
+			"package/package.json": JSON.stringify({
+				name: "commonjs-create-require-ext",
+				version: "1.0.0",
+				type: "module",
+			}),
+			"package/local.js": "export const local = true;\n",
+			"package/index.js": "export {};\n",
+		});
+		const packageRoot = path.join(dir, "package");
+		const entry = path.join(packageRoot, "index.js");
+		const factories = [
+			{
+				name: "destructured",
+				source:
+					'const { createRequire } = require("node:module");\nconst localRequire = createRequire(import.meta.url);',
+			},
+			{
+				name: "namespace",
+				source: 'const Module = require("module");\nconst localRequire = Module.createRequire(import.meta.url);',
+			},
+			{
+				name: "ESM named Module export",
+				source:
+					'import { Module as NodeModule } from "node:module";\nconst localRequire = NodeModule.createRequire(import.meta.url);',
+			},
+			{
+				name: "CommonJS named Module export",
+				source:
+					'const { Module: NodeModule } = require("node:module");\nconst localRequire = NodeModule.createRequire(import.meta.url);',
+			},
+			{
+				name: "CommonJS Module member",
+				source:
+					'const NodeModule = require("node:module").Module;\nconst localRequire = NodeModule.createRequire(import.meta.url);',
+			},
+		] as const;
+
+		for (const factory of factories) {
+			await fs.writeFile(entry, `${factory.source}\nlocalRequire("./local.js");`);
+			expect(await isExtensionSourceGraphContained(entry, packageRoot), factory.name).toBe(true);
+			await fs.writeFile(entry, `${factory.source}\nlocalRequire("../outside.js");`);
+			expect(await isExtensionSourceGraphContained(entry, packageRoot), factory.name).toBe(false);
+		}
+	});
+
+	it("uses lexical identity for shadowed createRequire, localRequire, and process.dlopen aliases", async () => {
+		const dir = await writePackage({
+			"package/package.json": JSON.stringify({ name: "shadowed-loader-ext", version: "1.0.0", type: "module" }),
+			"package/index.js": "export {};\n",
+		});
+		const packageRoot = path.join(dir, "package");
+		const entry = path.join(packageRoot, "index.js");
+		const cases = [
+			{
+				name: "createRequire parameter",
+				source: [
+					'import { createRequire } from "node:module";',
+					"function invoke(createRequire) {",
+					"  const target = './not-a-module';",
+					"  return createRequire(target);",
+					"}",
+					"function safeCreateRequire() {",
+					"  const result = 'safe';",
+					"  return result;",
+					"}",
+					"export const value = invoke(safeCreateRequire);",
+				].join("\n"),
+			},
+			{
+				name: "localRequire block binding",
+				source: [
+					'import { createRequire } from "node:module";',
+					"const localRequire = createRequire(import.meta.url);",
+					"export function invoke() {",
+					"  const localRequire = () => {",
+					"    const result = 'safe';",
+					"    return result;",
+					"  };",
+					"  return localRequire('./not-a-module');",
+					"}",
+				].join("\n"),
+			},
+			{
+				name: "process.dlopen parameter",
+				source: [
+					'import { dlopen as open } from "node:process";',
+					"function invoke(open) {",
+					"  const value = 'safe';",
+					"  return open(value);",
+					"}",
+					"function echo(value) {",
+					"  const result = value;",
+					"  return result;",
+					"}",
+					"export const value = invoke(echo);",
+				].join("\n"),
+			},
+		] as const;
+
+		for (const testCase of cases) {
+			await fs.writeFile(entry, testCase.source);
+			expect(await isExtensionSourceGraphContained(entry, packageRoot), testCase.name).toBe(true);
+		}
+	});
+
+	it("does not treat TypeScript ambient or type-only declarations as runtime eval/Function shadows", async () => {
+		const dir = await writePackage({
+			"outside.js": "export const outside = true;\n",
+			"package/package.json": JSON.stringify({ name: "typescript-shadow-ext", version: "1.0.0", type: "module" }),
+			"package/types.ts": "export type DynamicFunction = (source: string) => unknown;\n",
+			"package/index.ts": [
+				'import type { DynamicFunction as Function } from "./types.ts";',
+				"export const safe = true;",
+			].join("\n"),
+		});
+		const packageRoot = path.join(dir, "package");
+		const entry = path.join(packageRoot, "index.ts");
+
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+		await fs.writeFile(entry, "class Plugin implements Function {}\nexport default Plugin;\n");
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+		await fs.writeFile(entry, "class Plugin extends Function {}\nexport default Plugin;\n");
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(false);
+
+		await fs.writeFile(
+			entry,
+			[
+				'import type { DynamicFunction as Function } from "./types.ts";',
+				"const Build = Function;",
+				"new Build('return require(\"../outside.js\")')();",
+			].join("\n"),
+		);
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(false);
+
+		await fs.writeFile(entry, "declare const eval: (source: string) => unknown;\nexport const safe = true;\n");
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+		await fs.writeFile(
+			entry,
+			[
+				"declare const eval: (source: string) => unknown;",
+				"const run = eval;",
+				"run('require(\"../outside.js\")');",
+			].join("\n"),
+		);
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(false);
+
+		await fs.writeFile(
+			entry,
+			["const eval = {};", "const Function = {};", "void eval;", "void Function;"].join("\n"),
+		);
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+
+		await fs.writeFile(
+			entry,
+			[
+				"interface Function {",
+				"  readonly displayName: string;",
+				"}",
+				"export type DeclaredFunction = Function;",
+				"export const safe = true;",
+			].join("\n"),
+		);
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+
+		await fs.writeFile(
+			entry,
+			["const Build = Function as FunctionConstructor;", "new Build('return require(\"../outside.js\")')();"].join(
+				"\n",
+			),
+		);
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(false);
+
+		await fs.writeFile(entry, "export type Callback = Function;\n");
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+
+		await fs.writeFile(
+			entry,
+			[
+				"export type LocalRequire = typeof require;",
+				"export type LocalProcess = typeof process;",
+				"export type LocalGlobal = typeof globalThis;",
+				"export default () => {};",
+			].join("\n"),
+		);
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+	});
+
+	it("excludes erased type-only module references from the runtime containment graph", async () => {
+		const dir = await writePackage({
+			"outside.ts": "export type Outside = string;\nexport const runtime = true;\n",
+			"package/package.json": JSON.stringify({ name: "type-only-graph-ext", version: "1.0.0", type: "module" }),
+			"package/index.ts": 'import type { Outside } from "../outside.ts";\nexport type Alias = Outside;\n',
+		});
+		const packageRoot = path.join(dir, "package");
+		const entry = path.join(packageRoot, "index.ts");
+
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+		await fs.writeFile(entry, 'import { type Outside, runtime } from "../outside.ts";\nvoid runtime;\n');
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(false);
+		await fs.writeFile(entry, 'import type Outside = require("../outside.ts");\nexport type Alias = Outside;\n');
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+		await fs.writeFile(entry, 'export type { Outside } from "../outside.ts";\n');
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+	});
+
+	it("contains static process.dlopen targets and rejects aliases, outside, or dynamic targets", async () => {
+		const dir = await writePackage({
+			"outside.node": "outside-native-addon",
+			"package/package.json": JSON.stringify({ name: "dlopen-graph-ext", version: "1.0.0" }),
+			"package/addon.node": "contained-native-addon",
+			"package/index.cjs": "module.exports = {};\n",
+			"package/index.mjs": "export {};\n",
+		});
+		const packageRoot = path.join(dir, "package");
+		const cjsEntry = path.join(packageRoot, "index.cjs");
+		const esmEntry = path.join(packageRoot, "index.mjs");
+		const insideTarget = await fs.realpath(path.join(packageRoot, "addon.node"));
+		const outsideTarget = await fs.realpath(path.join(dir, "outside.node"));
+
+		const aliasCases = [
+			{
+				entry: cjsEntry,
+				source: (target: string) =>
+					`const processModule = require("node:process");\nprocessModule.dlopen(module, ${JSON.stringify(target)});\n`,
+			},
+			{
+				entry: cjsEntry,
+				source: (target: string) =>
+					`const { dlopen: open } = require("node:process");\nopen(module, ${JSON.stringify(target)});\n`,
+			},
+			{
+				entry: cjsEntry,
+				source: (target: string) =>
+					`const open = require("node:process").dlopen;\nopen(module, ${JSON.stringify(target)});\n`,
+			},
+			{
+				entry: esmEntry,
+				source: (target: string) =>
+					`import processModule from "node:process";\nprocessModule.dlopen(module, ${JSON.stringify(target)});\n`,
+			},
+			{
+				entry: esmEntry,
+				source: (target: string) =>
+					`import * as processModule from "node:process";\nprocessModule.dlopen(module, ${JSON.stringify(target)});\n`,
+			},
+			{
+				entry: esmEntry,
+				source: (target: string) =>
+					`import { dlopen as open } from "node:process";\nopen(module, ${JSON.stringify(target)});\n`,
+			},
+			{
+				entry: esmEntry,
+				source: (target: string) =>
+					`import { createRequire } from "node:module";\nconst localRequire = createRequire(import.meta.url);\nconst processModule = localRequire("node:process");\nprocessModule.dlopen(module, ${JSON.stringify(target)});\n`,
+			},
+			{
+				entry: esmEntry,
+				source: (target: string) =>
+					`import { createRequire } from "node:module";\ncreateRequire(import.meta.url)("node:process").dlopen(module, ${JSON.stringify(target)});\n`,
+			},
+			{
+				entry: esmEntry,
+				source: (target: string) =>
+					`import * as processNamespace from "node:process";\nprocessNamespace.default.dlopen(module, ${JSON.stringify(target)});\n`,
+			},
+			{
+				entry: cjsEntry,
+				source: (target: string) => `globalThis.process.dlopen(module, ${JSON.stringify(target)});\n`,
+			},
+			{
+				entry: esmEntry,
+				source: (target: string) =>
+					`import { createRequire } from "node:module";\nconst localRequire = createRequire(import.meta.url);\nlocalRequire("node:process").valueOf().dlopen(module, ${JSON.stringify(target)});\n`,
+			},
+			{
+				entry: esmEntry,
+				source: (target: string) =>
+					`import * as processNamespace from "node:process";\nconst { dlopen: open } = processNamespace.default;\nopen(module, ${JSON.stringify(target)});\n`,
+			},
+		];
+		for (const { entry, source } of aliasCases) {
+			await fs.writeFile(entry, source(insideTarget));
+			expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+			await fs.writeFile(entry, source(outsideTarget));
+			expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(false);
+		}
+
+		await fs.writeFile(cjsEntry, `process.dlopen(module, ${JSON.stringify(insideTarget)});\nmodule.exports = {};\n`);
+		expect(await isExtensionSourceGraphContained(cjsEntry, packageRoot)).toBe(true);
+		await fs.writeFile(cjsEntry, `process.dlopen(module, ${JSON.stringify(outsideTarget)});\nmodule.exports = {};\n`);
+		expect(await isExtensionSourceGraphContained(cjsEntry, packageRoot)).toBe(false);
+		await fs.writeFile(
+			cjsEntry,
+			`const processModule = require("node:process");\nconst target = ${JSON.stringify(insideTarget)};\nprocessModule.dlopen(module, target);\n`,
+		);
+		expect(await isExtensionSourceGraphContained(cjsEntry, packageRoot)).toBe(false);
+		await fs.writeFile(
+			cjsEntry,
+			`let open;\n({ dlopen: open } = require("node:process"));\nopen(module, ${JSON.stringify(outsideTarget)});\n`,
+		);
+		expect(await isExtensionSourceGraphContained(cjsEntry, packageRoot)).toBe(false);
+		await fs.writeFile(
+			esmEntry,
+			`import { createRequire } from "node:module";\nconst localRequire = createRequire(import.meta.url);\nlet processModule;\nprocessModule = localRequire("node:process");\nprocessModule.dlopen(module, ${JSON.stringify(outsideTarget)});\n`,
+		);
+		expect(await isExtensionSourceGraphContained(esmEntry, packageRoot)).toBe(false);
+		await fs.writeFile(
+			esmEntry,
+			`const processModule = await import("node:process");\nprocessModule.dlopen(module, ${JSON.stringify(outsideTarget)});\n`,
+		);
+		expect(await isExtensionSourceGraphContained(esmEntry, packageRoot)).toBe(false);
+		await fs.writeFile(esmEntry, 'export { dlopen as open } from "node:process";\n');
+		expect(await isExtensionSourceGraphContained(esmEntry, packageRoot)).toBe(false);
+		await fs.writeFile(cjsEntry, `globalThis.process["dlo" + "pen"](module, ${JSON.stringify(outsideTarget)});\n`);
+		expect(await isExtensionSourceGraphContained(cjsEntry, packageRoot)).toBe(false);
+	});
+
+	it("contains runtime-loadable non-source targets", async () => {
+		const dir = await writePackage({
+			"outside.node": "outside-native-addon",
+			"package/package.json": JSON.stringify({ name: "native-target-graph-ext", version: "1.0.0" }),
+			"package/addon.node": "contained-native-addon",
+			"package/index.cjs": 'require("./addon.node");',
+		});
+		const packageRoot = path.join(dir, "package");
+		const entry = path.join(packageRoot, "index.cjs");
+
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+		await fs.writeFile(entry, 'require("../outside.node");');
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(false);
 	});
 
 	it("remaps legacy Pi requires in graph-owned CommonJS packages to the host shim", async () => {

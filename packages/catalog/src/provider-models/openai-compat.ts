@@ -16,6 +16,7 @@ import {
 	isGrokReasoningEffortCapable,
 	isKimiK3ModelId,
 	isKimiModelId,
+	isQwen38PlusTemplateEffortModelId,
 	isReasoningGlmModelId,
 } from "../identity/family";
 import { resolveModelReference } from "../identity/reference";
@@ -3386,6 +3387,7 @@ export interface LmStudioModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
 	fetch?: FetchImpl;
+	compat?: OpenAICompat;
 }
 
 export function lmStudioModelManagerOptions(
@@ -3394,8 +3396,10 @@ export function lmStudioModelManagerOptions(
 	const apiKey = config?.apiKey;
 	const baseUrl = config?.baseUrl ?? Bun.env.LM_STUDIO_BASE_URL ?? "http://127.0.0.1:1234/v1";
 	const references = createBundledReferenceMap<"openai-completions">("lm-studio" as any);
+	const compat = config?.compat;
 	return {
 		providerId: "lm-studio",
+		cacheProviderId: resolveModelCacheProviderId("lm-studio", { apiKey, baseUrl, compat }),
 		fetchDynamicModels: async () => {
 			const nativeMetadataPromise = fetchLmStudioNativeModelMetadata(baseUrl, config?.fetch, {
 				headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : undefined,
@@ -3407,7 +3411,14 @@ export function lmStudioModelManagerOptions(
 				apiKey,
 				mapModel: (entry, defaults) => {
 					const reference = references.get(defaults.id);
-					return mapWithBundledReference(entry, defaults, reference);
+					const model = mapWithBundledReference(entry, defaults, reference);
+					return {
+						...model,
+						reasoning:
+							model.reasoning ||
+							(compat?.qwenTemplateReasoningEffort !== false && isQwen38PlusTemplateEffortModelId(model.id)),
+						...(compat ? { compat: { ...(model.compat ?? {}), ...compat } } : {}),
+					};
 				},
 				fetch: config?.fetch,
 			});
@@ -4974,15 +4985,17 @@ export interface VllmModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
 	fetch?: FetchImpl;
+	compat?: OpenAICompat;
 }
 
 export function vllmModelManagerOptions(config?: VllmModelManagerConfig): ModelManagerOptions<"openai-completions"> {
 	const apiKey = config?.apiKey;
 	const baseUrl = config?.baseUrl ?? getDefaultModelDiscoveryBaseUrl("vllm")!;
 	const references = createBundledReferenceMap<"openai-completions">("vllm" as Parameters<typeof getBundledModels>[0]);
+	const compat = config?.compat;
 	return {
 		providerId: "vllm",
-		cacheProviderId: resolveModelCacheProviderId("vllm", { baseUrl }),
+		cacheProviderId: resolveModelCacheProviderId("vllm", { baseUrl, compat }),
 		fetchDynamicModels: () =>
 			fetchOpenAICompatibleModels({
 				api: "openai-completions",
@@ -4994,6 +5007,13 @@ export function vllmModelManagerOptions(config?: VllmModelManagerConfig): ModelM
 					return {
 						...model,
 						contextWindow: toPositiveNumber(entry.max_model_len, model.contextWindow),
+						// vLLM's /v1/models reports no reasoning capability. Qwen 3.8+
+						// open weights expose the template effort dial, so mark the
+						// capability unless the configured provider explicitly disables it.
+						reasoning:
+							model.reasoning ||
+							(compat?.qwenTemplateReasoningEffort !== false && isQwen38PlusTemplateEffortModelId(model.id)),
+						...(compat ? { compat: { ...(model.compat ?? {}), ...compat } } : {}),
 					};
 				},
 				fetch: config?.fetch,

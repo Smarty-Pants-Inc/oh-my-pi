@@ -20,6 +20,7 @@ import {
 	NativeCompactionError,
 	prepareCompaction,
 	type SessionMessageEntry,
+	type SummaryOptions,
 	shouldCompact,
 	shouldUseProviderNativeCompaction,
 } from "@oh-my-pi/pi-agent-core/compaction";
@@ -97,6 +98,7 @@ import type { CompactionEntry, SessionEntry } from "./session-entries";
 import { formatSessionHistoryMarkdown } from "./session-history-format";
 import type { SessionManager } from "./session-manager";
 import { buildSessionMetadata } from "./session-metadata";
+import { createCompleteFnFromStreamFn, resolveSettingsCacheRetention } from "./settings-stream-fn";
 import type { YieldQueue, YieldQueueTransaction } from "./yield-queue";
 
 const ADVISOR_CODEX_SSE_MAX_ATTEMPTS = 1;
@@ -295,6 +297,7 @@ export class SessionAdvisors {
 	#advisorSharedInstructions: string | undefined;
 	#advisorContextPrompt: string | undefined;
 	#advisorStreamFn: StreamFn | undefined;
+	readonly #completeWithAdvisorStream: NonNullable<SummaryOptions["completeImpl"]>;
 	#transformProviderContext: ((context: Context, model: Model) => Context | Promise<Context>) | undefined;
 	#advisors: ActiveAdvisor[] = [];
 	#advisorConfigs: AdvisorConfig[] | undefined;
@@ -322,6 +325,7 @@ export class SessionAdvisors {
 		this.#advisorContextPrompt = options.contextPrompt;
 		this.#advisorConfigs = options.configs;
 		this.#advisorStreamFn = options.streamFn;
+		this.#completeWithAdvisorStream = createCompleteFnFromStreamFn(options.streamFn ?? streamSimple);
 		this.#transformProviderContext = options.transformProviderContext;
 		if (options.initialCosts) this.#advisorCosts = new Map(options.initialCosts);
 		if (this.#advisorEnabled) this.#buildAdvisorRuntime();
@@ -1492,6 +1496,7 @@ export class SessionAdvisors {
 					signal,
 					{
 						thinkingLevel: advisorCompactionThinkingLevel,
+						cacheRetention: resolveSettingsCacheRetention(this.#host.settings),
 						convertToLlm: messages => this.#host.convertToLlmForSideRequest(messages),
 						telemetry,
 						tools: agent.state.tools,
@@ -1501,6 +1506,7 @@ export class SessionAdvisors {
 						providerSessionState: this.#host.providerSessionState,
 						preferWebsockets: this.#host.preferWebsockets,
 						codexCompaction,
+						completeImpl: this.#completeWithAdvisorStream,
 					},
 				);
 				break;

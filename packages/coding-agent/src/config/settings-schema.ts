@@ -5255,6 +5255,44 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"providers.cacheRetention": {
+		type: "enum",
+		values: ["auto", "short", "long", "none"] as const,
+		default: "auto",
+		ui: {
+			tab: "providers",
+			group: "Protocol",
+			label: "Prompt Cache Retention",
+			description:
+				"Prompt-cache retention forwarded to providers that support it (Anthropic, Bedrock, OpenRouter, OpenAI)",
+			options: [
+				{
+					value: "auto",
+					label: "Auto",
+					description:
+						"Provider default — Anthropic uses 5m entries kept warm by idle keep-alive refreshes; PI_CACHE_RETENTION still applies",
+				},
+				{
+					value: "short",
+					label: "Short (5m)",
+					description:
+						"Cheapest cache writes; Anthropic keeps the entry warm with bounded keep-alive refreshes while idle",
+				},
+				{
+					value: "long",
+					label: "Long",
+					description:
+						"Extended retention where supported (Anthropic, Bedrock, and compatible gateways: 1h; OpenAI Responses: 24h); pricier writes, no Anthropic keep-alive refresh requests",
+				},
+				{
+					value: "none",
+					label: "Off",
+					description: "Disable cache-affinity routing and opt out of prompt caching where supported",
+				},
+			],
+		},
+	},
+
 	"providers.streamFirstEventTimeoutSeconds": {
 		type: "number",
 		default: -1,

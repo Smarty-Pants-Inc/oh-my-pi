@@ -7,6 +7,7 @@ import type { Settings } from "../config/settings";
 import unexpectedStopClassifierPrompt from "../prompts/system/unexpected-stop-classifier.md" with { type: "text" };
 import { isTinyMemoryLocalModelKey, ONLINE_MEMORY_MODEL_KEY } from "../tiny/models";
 import { tinyModelClient } from "../tiny/title-client";
+import { resolveSettingsCacheRetention } from "./settings-stream-fn";
 
 const CLASSIFIER_SYSTEM_PROMPT = prompt.render(unexpectedStopClassifierPrompt);
 
@@ -110,6 +111,7 @@ async function classifyOnline(text: string, deps: ClassifyUnexpectedStopDeps): P
 					disableReasoning: true,
 					metadata,
 					signal: deps.signal,
+					cacheRetention: resolveSettingsCacheRetention(deps.settings),
 				},
 			),
 		{ signal: deps.signal },

@@ -24,6 +24,7 @@ import {
 	getModelMatchPreferences,
 	resolveModelFromString,
 } from "../config/model-resolver";
+import { resolveSettingsCacheRetention } from "../session/settings-stream-fn";
 import type { ToolSession } from "../tools";
 import { ToolError } from "../tools/tool-errors";
 import { withBridgeTimeoutPause } from "./bridge-timeout";
@@ -162,6 +163,7 @@ export async function runEvalCompletion(
 			},
 			{
 				apiKey: registry.resolver(model, options.session.getSessionId?.() ?? undefined),
+				cacheRetention: resolveSettingsCacheRetention(options.session.settings),
 				signal: options.signal,
 				reasoning: reasoningForTier(finalTier, model),
 				toolChoice: schema ? { type: "tool", name: STRUCTURED_TOOL_NAME } : undefined,

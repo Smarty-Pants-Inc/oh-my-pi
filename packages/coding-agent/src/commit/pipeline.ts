@@ -1,10 +1,11 @@
 import * as path from "node:path";
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
-import type { Api, ApiKey, Model } from "@oh-my-pi/pi-ai";
+import type { Api, ApiKey, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
 import { getProjectDir, logger, prompt } from "@oh-my-pi/pi-utils";
 import { ModelRegistry } from "../config/model-registry";
 import { Settings } from "../config/settings";
 import { discoverAuthStorage, loadCliExtensionProviders } from "../sdk";
+import { resolveSettingsCacheRetention } from "../session/settings-stream-fn";
 import { loadProjectContextFiles } from "../system-prompt";
 import * as git from "../utils/git";
 import { runAgenticCommit } from "./agentic";
@@ -48,6 +49,7 @@ async function runLegacyCommitCommand(args: CommitCommandArgs): Promise<void> {
 	const cwd = getProjectDir();
 	const settings = await Settings.init({ cwd });
 	const commitSettings = settings.getGroup("commit");
+	const cacheRetention = resolveSettingsCacheRetention(settings);
 	const authStorage = await discoverAuthStorage();
 	const modelRegistry = new ModelRegistry(authStorage);
 	await modelRegistry.refresh();
@@ -89,6 +91,7 @@ async function runLegacyCommitCommand(args: CommitCommandArgs): Promise<void> {
 			stagedFiles,
 			dryRun: args.dryRun,
 			maxDiffChars: commitSettings.changelogMaxDiffChars,
+			cacheRetention,
 		});
 	}
 
@@ -117,6 +120,7 @@ async function runLegacyCommitCommand(args: CommitCommandArgs): Promise<void> {
 		smolApiKey,
 		smolThinkingLevel,
 		commitSettings,
+		cacheRetention,
 	});
 
 	const analysisValidation = validateAnalysis(analysis);
@@ -131,6 +135,7 @@ async function runLegacyCommitCommand(args: CommitCommandArgs): Promise<void> {
 		apiKey: primaryApiKey,
 		thinkingLevel: primaryThinkingLevel,
 		userContext: args.context,
+		cacheRetention,
 	});
 
 	const commitMessage = formatCommitMessage(analysis, summary.summary);
@@ -164,6 +169,7 @@ async function generateAnalysis(input: {
 	smolModel: Model<Api>;
 	smolApiKey: ApiKey;
 	smolThinkingLevel?: ThinkingLevel;
+	cacheRetention?: SimpleStreamOptions["cacheRetention"];
 	commitSettings: {
 		mapReduceEnabled: boolean;
 		mapReduceMinFiles: number;
@@ -192,6 +198,7 @@ async function generateAnalysis(input: {
 			stat: input.stat,
 			scopeCandidates: input.scopeCandidates,
 			typesDescription: TYPES_DESCRIPTION(),
+			cacheRetention: input.cacheRetention,
 			settings: {
 				enabled: input.commitSettings.mapReduceEnabled,
 				minFiles: input.commitSettings.mapReduceMinFiles,
@@ -206,6 +213,7 @@ async function generateAnalysis(input: {
 		model: input.primaryModel,
 		apiKey: input.primaryApiKey,
 		thinkingLevel: input.primaryThinkingLevel,
+		cacheRetention: input.cacheRetention,
 		contextFiles: input.contextFiles,
 		userContext: input.userContext,
 		typesDescription: TYPES_DESCRIPTION(),
@@ -223,6 +231,7 @@ async function generateSummaryWithRetry(input: {
 	apiKey: ApiKey;
 	thinkingLevel?: ThinkingLevel;
 	userContext?: string;
+	cacheRetention?: SimpleStreamOptions["cacheRetention"];
 }): Promise<{ summary: string }> {
 	let context = input.userContext;
 	for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -230,6 +239,7 @@ async function generateSummaryWithRetry(input: {
 			model: input.model,
 			apiKey: input.apiKey,
 			thinkingLevel: input.thinkingLevel,
+			cacheRetention: input.cacheRetention,
 			commitType: input.analysis.type,
 			scope: input.analysis.scope,
 			details: input.analysis.details.map(detail => detail.text),

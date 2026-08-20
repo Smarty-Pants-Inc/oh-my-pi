@@ -9,6 +9,9 @@
 ### Fixed
 
 - Kept interactive turns usable when prompt-policy review rejects an extension hook; OMP now skips the protected hook, preserves the original turn data, and reports the review condition without stopping the harness.
+### Added
+
+- Added `providers.cacheRetention` setting (`/settings` → Providers → Protocol) to control prompt-cache retention per request: `auto` keeps the provider default (Anthropic: 5m entries with idle keep-alive refreshes), `short` forces 5m, `long` requests extended retention (Anthropic, Bedrock, and compatible gateways: 1h; OpenAI Responses: 24h) and disables Anthropic keep-alive refreshes, `none` disables prompt caching.
 - Kept scoped peer-message wake prompts provisional until provider stream creation and durable acceptance succeed, so pre-model stops, stream initialization failures, and acceptance failures remain cleanly retryable without duplicate transcript turns.
 
 ## [17.3.7] - 2026-08-17

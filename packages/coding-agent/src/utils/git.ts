@@ -78,6 +78,7 @@ export interface StatusOptions {
 	readonly porcelainV1?: boolean;
 	readonly signal?: AbortSignal;
 	readonly untrackedFiles?: "all" | "no" | "normal";
+	readonly includeIgnored?: boolean;
 	readonly z?: boolean;
 }
 
@@ -1320,6 +1321,7 @@ export const status = Object.assign(
 		args.push(options.porcelainV1 ? "--porcelain=v1" : "--porcelain");
 		if (options.z) args.push("-z");
 		if (options.untrackedFiles) args.push(`--untracked-files=${options.untrackedFiles}`);
+		if (options.includeIgnored) args.push("--ignored=matching");
 		if (options.pathspecs?.length) args.push("--", ...options.pathspecs);
 		return runText(cwd, args, { readOnly: true, signal: options.signal });
 	},
@@ -2244,6 +2246,12 @@ export async function clean(
 // ════════════════════════════════════════════════════════════════════════════
 // API: ls
 // ════════════════════════════════════════════════════════════════════════════
+export interface GitTreeEntry {
+	readonly mode: string;
+	readonly type: string;
+	readonly objectId: string;
+	readonly path: string;
+}
 
 export const ls = {
 	/** List files tracked or untracked by git. */
@@ -2268,6 +2276,26 @@ export const ls = {
 		if (files.length > 0) args.push("--", ...files);
 		const raw = await runText(cwd, args, { readOnly: true, signal });
 		return raw.split("\0").filter(entry => entry.length > 0);
+	},
+
+	/** List recursive tree entries with their tracked modes and object ids. */
+	async treeEntries(
+		cwd: string,
+		ref: string,
+		files: readonly string[] = [],
+		signal?: AbortSignal,
+	): Promise<GitTreeEntry[]> {
+		const args = ["ls-tree", "-r", "-z", ref];
+		if (files.length > 0) args.push("--", ...files);
+		const raw = await runText(cwd, args, { readOnly: true, signal });
+		return raw
+			.split("\0")
+			.filter(entry => entry.length > 0)
+			.map(entry => {
+				const match = /^([0-7]{6}) ([^ ]+) ([0-9a-f]+)\t([\s\S]+)$/.exec(entry);
+				if (!match?.[1] || !match[2] || !match[3] || !match[4]) throw new Error("Invalid git ls-tree output");
+				return { mode: match[1], type: match[2], objectId: match[3], path: match[4] };
+			});
 	},
 
 	/** List submodule paths (recursive). */
