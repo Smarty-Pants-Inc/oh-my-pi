@@ -6751,7 +6751,7 @@
     },
     {
       "path": "packages/coding-agent/src/config/model-discovery.ts",
-      "sha256": "fb7be16f8455f5683790ba31e7e506ce45aab1ca127eee4cc10775400b8f46e8"
+      "sha256": "db424755000a8ca9e5f7f0dd91f353ab309e173bbd24a8800c20b1edfa6c3f31"
     },
     {
       "path": "packages/coding-agent/src/config/model-patch.ts",
@@ -6823,7 +6823,7 @@
     },
     {
       "path": "packages/coding-agent/src/context/manifest.ts",
-      "sha256": "e444e009243b1dc074cbce98d23102107fd34afdb8ab5dddb748178a57a292e7"
+      "sha256": "a02b19327b3d9c39351c2878f5d50fbec58bceaa6da2e7c49cff7c1479ce5d45"
     },
     {
       "path": "packages/coding-agent/src/context/prompt-sources.generated.ts",
@@ -7091,7 +7091,7 @@
     },
     {
       "path": "packages/coding-agent/src/eval/completion-bridge.ts",
-      "sha256": "b747cdd7ef13c0a60fef75a5ed4a616fb9c4b14024e58b627a693b58f0e3daf0"
+      "sha256": "1c594eff9f5a15556817e09d3599e61ff234c8e9e0b7504f0a8b99897650f74f"
     },
     {
       "path": "packages/coding-agent/src/eval/concurrency-bridge.ts",
@@ -7407,7 +7407,7 @@
     },
     {
       "path": "packages/coding-agent/src/extensibility/plugins/legacy-pi-compat.ts",
-      "sha256": "5fb20ac36989f7b3944e45a9440d1efd0f750282cad0b9631f77d8f84613db37"
+      "sha256": "536a41b3d966f123a7a4361ed45f4a724b4b5b0de3216450038392cc2c094600"
     },
     {
       "path": "packages/coding-agent/src/extensibility/plugins/loader.ts",
@@ -9255,7 +9255,7 @@
     },
     {
       "path": "packages/coding-agent/src/tools/inspect-image.ts",
-      "sha256": "ee17be84cd4a2ca6ed6cbd8f19356a3e8f0c260be43607bff837f40b2a0ff088"
+      "sha256": "bd89a04a36aa431ae0fc527516ea704f19b6de5a27655e8e44421524a7c73332"
     },
     {
       "path": "packages/coding-agent/src/tools/jtd-to-json-schema.ts",
@@ -9563,7 +9563,7 @@
     },
     {
       "path": "packages/coding-agent/src/utils/git.ts",
-      "sha256": "70f9c764c0c2521c4b164a0d227a42bbc4b2a0e2dffb03a613b476feae1b33ff"
+      "sha256": "37e9b1ed409574fb1067ecb0495716591fa772ff4a28924ec7f450f336c79134"
     },
     {
       "path": "packages/coding-agent/src/utils/image-loading.ts",
@@ -9575,7 +9575,7 @@
     },
     {
       "path": "packages/coding-agent/src/utils/image-vision-fallback.ts",
-      "sha256": "90790114fe53483674bf0823478c0288b767c2f11bd55db1b97cf1a7b2f12a00"
+      "sha256": "6a2a149c563d2825d18e827fa327c7281921ab99c41e180c8504b98124e523bf"
     },
     {
       "path": "packages/coding-agent/src/utils/inspect-image-mode.ts",
@@ -10683,5 +10683,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "c1a3d3b842d75af0706057938e4d9a43a783b19fff3590bee46e6243eb92fb1b"
+  "rootSha256": "0ce5466a1dbd1b6193d787bb8607535f35ee8fb4064e8336a7e538e771e6c218"
 }

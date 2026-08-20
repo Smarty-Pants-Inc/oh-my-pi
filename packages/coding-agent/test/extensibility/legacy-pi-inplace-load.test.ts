@@ -270,22 +270,69 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 		}
 	});
 
-	it("rejects callable constructor code generation without rejecting constructor declarations", async () => {
+	it("tracks callable constructor values without rejecting benign constructor metadata", async () => {
 		const dir = await writePackage({
 			"outside.js": "export const outside = true;\n",
 			"package/package.json": JSON.stringify({ name: "function-constructor-ext", version: "1.0.0" }),
 			"package/index.cjs": [
-				"class SafeValue {",
-				"  constructor(value) { this.value = value; }",
+				"class Plugin {",
+				"  isPluginType() { return this.constructor === Plugin; }",
 				"}",
-				"module.exports = new SafeValue(42);",
+				'const error = new Error("safe");',
+				"const ErrorType = error.constructor;",
+				"module.exports = { directName: error.constructor.name, aliasName: ErrorType.name, matches: new Plugin().isPluginType() };",
 			].join("\n"),
 		});
 		const packageRoot = path.join(dir, "package");
 		const entry = path.join(packageRoot, "index.cjs");
 
 		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
-		await fs.writeFile(entry, "(async () => {}).constructor('return require(\"../outside.js\")')();\n");
+		const cases = [
+			{
+				name: "direct constructor call",
+				source: "(async () => {}).constructor('return require(\"../outside.js\")')();",
+			},
+			{
+				name: "constructor alias call",
+				source: "const Build = (async () => {}).constructor; Build('return require(\"../outside.js\")')();",
+			},
+			{
+				name: "destructured constructor alias",
+				source: "const { constructor: Build } = async () => {}; Build('return require(\"../outside.js\")')();",
+			},
+			{
+				name: "Reflect.get constructor alias",
+				source:
+					"const Build = Reflect.get(async () => {}, 'constructor'); Build('return require(\"../outside.js\")')();",
+			},
+			{
+				name: "nonliteral computed constructor alias",
+				source:
+					"const key = 'constructor'; const Build = (async () => {})[key]; Build('return require(\"../outside.js\")')();",
+			},
+			{
+				name: "escaped constructor value",
+				source: "module.exports = (async () => {}).constructor;",
+			},
+		] as const;
+		for (const testCase of cases) {
+			await fs.writeFile(entry, testCase.source);
+			expect(await isExtensionSourceGraphContained(entry, packageRoot), testCase.name).toBe(false);
+		}
+	});
+
+	it("rejects Module loaders exposed through require.cache", async () => {
+		const dir = await writePackage({
+			"outside.js": "export const outside = true;\n",
+			"package/package.json": JSON.stringify({ name: "require-cache-ext", version: "1.0.0" }),
+			"package/local.cjs": "module.exports = true;\n",
+			"package/index.cjs": 'module.exports = require.resolve("./local.cjs");\n',
+		});
+		const packageRoot = path.join(dir, "package");
+		const entry = path.join(packageRoot, "index.cjs");
+
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+		await fs.writeFile(entry, 'require.cache[__filename].require("../outside.js");\n');
 		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(false);
 	});
 
@@ -334,6 +381,34 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 			'process.getBuiltinModule("module").createRequire(import.meta.url)("../outside.js");',
 			'const loadBuiltin = process.getBuiltinModule; loadBuiltin("module").createRequire(import.meta.url)("../outside.js");',
 			'process["get" + "BuiltinModule"]("module").createRequire(import.meta.url)("../outside.js");',
+		] as const;
+		for (const source of cases) {
+			await fs.writeFile(entry, source);
+			expect(await isExtensionSourceGraphContained(entry, packageRoot), source).toBe(false);
+		}
+	});
+
+	it("tracks chained global and process identities through aliases", async () => {
+		const dir = await writePackage({
+			"outside.js": "export const outside = true;\n",
+			"package/package.json": JSON.stringify({ name: "global-alias-ext", version: "1.0.0", type: "module" }),
+			"package/worker.js": "export const worker = true;\n",
+			"package/index.js": [
+				"const globalThis = { globalThis: { Function: { name: 'safe' } } };",
+				"export const name = globalThis.globalThis.Function.name;",
+			].join("\n"),
+		});
+		const packageRoot = path.join(dir, "package");
+		const entry = path.join(packageRoot, "index.js");
+
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+		const cases = [
+			"globalThis.globalThis.Function('return require(\"../outside.js\")')();",
+			"const root = globalThis.globalThis; root.Function('return require(\"../outside.js\")')();",
+			'new globalThis.globalThis.Worker(new URL("./worker.js", import.meta.url));',
+			'const root = global; const same = root.global; new same.Worker(new URL("./worker.js", import.meta.url));',
+			'globalThis.globalThis.process.getBuiltinModule("module").createRequire(import.meta.url)("../outside.js");',
+			'const root = globalThis.globalThis; const processAlias = root.process; processAlias.getBuiltinModule("module");',
 		] as const;
 		for (const source of cases) {
 			await fs.writeFile(entry, source);
@@ -403,6 +478,11 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 		const entry = path.join(packageRoot, "index.ts");
 
 		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+		await fs.writeFile(entry, "class Plugin implements Function {}\nexport default Plugin;\n");
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+		await fs.writeFile(entry, "class Plugin extends Function {}\nexport default Plugin;\n");
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(false);
+
 		await fs.writeFile(
 			entry,
 			[

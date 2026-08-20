@@ -90,6 +90,9 @@ const EVAL_BINDING = 1 << 4;
 const FUNCTION_BINDING = 1 << 5;
 const PROCESS_BINDING = 1 << 6;
 const WORKER_BINDING = 1 << 7;
+const GLOBAL_BINDING = 1 << 8;
+const GLOBAL_THIS_BINDING = 1 << 9;
+const REFLECT_BINDING = 1 << 10;
 
 interface StructuralAstNode {
 	readonly type: string;
@@ -156,6 +159,12 @@ function trackedBinding(name: unknown): number {
 			return PROCESS_BINDING;
 		case "Worker":
 			return WORKER_BINDING;
+		case "global":
+			return GLOBAL_BINDING;
+		case "globalThis":
+			return GLOBAL_THIS_BINDING;
+		case "Reflect":
+			return REFLECT_BINDING;
 		default:
 			return 0;
 	}
@@ -194,6 +203,7 @@ function isErasedTypeScriptNode(node: StructuralAstNode): boolean {
 		case "TSTypeAliasDeclaration":
 		case "TSTypeReference":
 		case "TSTypeQuery":
+		case "TSExpressionWithTypeArguments":
 			return true;
 		default:
 			return false;
@@ -638,10 +648,17 @@ function collectExtensionSpecifierReferences(
 	const commonJsModuleNamespaceBindings = new Set<string>();
 	const processNamespaceBindings = new Set<string>();
 	const processDlopenBindings = new Set<string>();
+	const globalObjectBindings = new Set<string>();
+	const constructorValueBindings = new Set<string>();
 	const createRequireBindingNodes = new WeakSet<object>();
 	const moduleNamespaceBindingNodes = new WeakSet<object>();
 	const processNamespaceBindingNodes = new WeakSet<object>();
 	const processDlopenBindingNodes = new WeakSet<object>();
+	const globalObjectBindingNodes = new WeakSet<object>();
+	const globalObjectUseNodes = new WeakSet<object>();
+	const processObjectUseNodes = new WeakSet<object>();
+	const constructorValueBindingNodes = new WeakSet<object>();
+	const constructorValueUseNodes = new WeakSet<object>();
 	const runtimeBindingsOnly = graphProof !== undefined;
 	const nonRuntimeBindingNodes = new WeakSet<object>();
 	for (const { node } of collectScopedAstNodes(
@@ -729,6 +746,15 @@ function collectExtensionSpecifierReferences(
 		candidate => candidate.type === "VariableDeclarator",
 		runtimeBindingsOnly,
 	);
+	const exportedVariableDeclarations = new WeakSet<object>();
+	for (const { node } of collectScopedAstNodes(
+		ast,
+		candidate => candidate.type === "ExportNamedDeclaration",
+		runtimeBindingsOnly,
+	)) {
+		const declaration = asAstNode(node.declaration);
+		if (declaration?.type === "VariableDeclaration") exportedVariableDeclarations.add(declaration);
+	}
 	for (const { node, scope, parent } of variableDeclarations) {
 		const binding = asAstNode(node.id);
 		if (parent?.type === "VariableDeclaration" && parent.declare === true && binding?.type === "Identifier") {
@@ -886,6 +912,59 @@ function collectExtensionSpecifierReferences(
 		}
 	}
 
+	function isKnownGlobalObject(node: StructuralAstNode | null, scope: BindingScope): boolean {
+		if (node?.type === "Identifier") {
+			if (node.name === "global" && !scopeHasBinding(scope, GLOBAL_BINDING)) return true;
+			if (node.name === "globalThis" && !scopeHasBinding(scope, GLOBAL_THIS_BINDING)) return true;
+			return typeof node.name === "string" && globalObjectBindings.has(node.name);
+		}
+		if (node?.type !== "MemberExpression" && node?.type !== "OptionalMemberExpression") return false;
+		const memberName = staticMemberPropertyName(node);
+		return (
+			(memberName === "global" || memberName === "globalThis") && isKnownGlobalObject(asAstNode(node.object), scope)
+		);
+	}
+
+	let globalBindingsChanged = true;
+	while (globalBindingsChanged) {
+		globalBindingsChanged = false;
+		for (const { node, scope, parent } of variableDeclarations) {
+			const initializer = asAstNode(node.init);
+			if (!initializer || !isKnownGlobalObject(initializer, scope)) continue;
+			const binding = asAstNode(node.id);
+			if (binding?.type !== "Identifier" || typeof binding.name !== "string") {
+				if (graphProof) graphProof.provable = false;
+				continue;
+			}
+			globalObjectUseNodes.add(initializer);
+			if (!globalObjectBindings.has(binding.name)) {
+				globalObjectBindings.add(binding.name);
+				globalBindingsChanged = true;
+			}
+			globalObjectBindingNodes.add(binding);
+			if (parent && exportedVariableDeclarations.has(parent) && graphProof) graphProof.provable = false;
+		}
+	}
+
+	function isKnownReflectObject(node: StructuralAstNode | null, scope: BindingScope): boolean {
+		if (isIdentifier(node, "Reflect")) return !scopeHasBinding(scope, REFLECT_BINDING);
+		return (
+			(node?.type === "MemberExpression" || node?.type === "OptionalMemberExpression") &&
+			staticMemberPropertyName(node) === "Reflect" &&
+			isKnownGlobalObject(asAstNode(node.object), scope)
+		);
+	}
+
+	function isReflectGetCall(node: StructuralAstNode | null, scope: BindingScope): boolean {
+		if (node?.type !== "CallExpression" && node?.type !== "OptionalCallExpression") return false;
+		const callee = asAstNode(node.callee);
+		return (
+			(callee?.type === "MemberExpression" || callee?.type === "OptionalMemberExpression") &&
+			staticMemberPropertyName(callee) === "get" &&
+			isKnownReflectObject(asAstNode(callee.object), scope)
+		);
+	}
+
 	const isKnownProcessLoaderCall = (node: StructuralAstNode | null, scope: BindingScope): boolean =>
 		isNodeProcessLoaderCall(node, scope, localRequireBindings, createRequireBindings, moduleNamespaceBindings);
 	function isKnownProcessObject(node: StructuralAstNode | null, scope: BindingScope): boolean {
@@ -897,13 +976,7 @@ function collectExtensionSpecifierReferences(
 		if (node?.type === "MemberExpression" || node?.type === "OptionalMemberExpression") {
 			const memberName = staticMemberPropertyName(node);
 			const object = asAstNode(node.object);
-			if (
-				memberName === "process" &&
-				object?.type === "Identifier" &&
-				(object.name === "global" || object.name === "globalThis")
-			) {
-				return true;
-			}
+			if (memberName === "process" && isKnownGlobalObject(object, scope)) return true;
 			return memberName === "default" && isKnownProcessObject(object, scope);
 		}
 		if (node?.type !== "CallExpression" && node?.type !== "OptionalCallExpression") return false;
@@ -953,16 +1026,18 @@ function collectExtensionSpecifierReferences(
 	let processBindingsChanged = true;
 	while (processBindingsChanged) {
 		processBindingsChanged = false;
-		for (const { node, scope } of variableDeclarations) {
+		for (const { node, scope, parent } of variableDeclarations) {
 			const initializer = asAstNode(node.init);
 			const binding = asAstNode(node.id);
-			if (isKnownProcessObject(initializer, scope)) {
+			if (initializer && isKnownProcessObject(initializer, scope)) {
 				if (binding?.type === "Identifier" && typeof binding.name === "string") {
 					if (!processNamespaceBindings.has(binding.name)) {
 						processNamespaceBindings.add(binding.name);
 						processBindingsChanged = true;
 					}
 					processNamespaceBindingNodes.add(binding);
+					processObjectUseNodes.add(initializer);
+					if (parent && exportedVariableDeclarations.has(parent) && graphProof) graphProof.provable = false;
 					continue;
 				}
 				if (binding?.type !== "ObjectPattern") {
@@ -1004,6 +1079,8 @@ function collectExtensionSpecifierReferences(
 						processNamespaceBindingNodes.add(local);
 					}
 				}
+				processObjectUseNodes.add(initializer);
+				if (parent && exportedVariableDeclarations.has(parent) && graphProof) graphProof.provable = false;
 				continue;
 			}
 			if (initializer?.type !== "MemberExpression" && initializer?.type !== "OptionalMemberExpression") {
@@ -1024,6 +1101,141 @@ function collectExtensionSpecifierReferences(
 				processBindingsChanged = true;
 			}
 			processDlopenBindingNodes.add(binding);
+		}
+	}
+
+	function transparentConstructorValue(node: StructuralAstNode): StructuralAstNode | null {
+		switch (node.type) {
+			case "ParenthesizedExpression":
+			case "TypeCastExpression":
+			case "TSAsExpression":
+			case "TSInstantiationExpression":
+			case "TSNonNullExpression":
+			case "TSSatisfiesExpression":
+			case "TSTypeAssertion":
+				return asAstNode(node.expression);
+			case "ChainExpression":
+				return asAstNode(node.expression);
+			default:
+				return null;
+		}
+	}
+
+	function maySelectConstructorProperty(property: StructuralAstNode | null): boolean {
+		if (property?.type === "StringLiteral") return property.value === "constructor";
+		switch (property?.type) {
+			case "NumericLiteral":
+			case "BigIntLiteral":
+			case "BooleanLiteral":
+			case "NullLiteral":
+			case "DecimalLiteral":
+			case "RegExpLiteral":
+				return false;
+			default:
+				return true;
+		}
+	}
+
+	function isPotentialConstructorValue(node: StructuralAstNode | null, scope: BindingScope): boolean {
+		if (!node) return false;
+		if (node.type === "Identifier") {
+			return typeof node.name === "string" && constructorValueBindings.has(node.name);
+		}
+		if (node.type === "MemberExpression" || node.type === "OptionalMemberExpression") {
+			const memberName = staticMemberPropertyName(node);
+			if (
+				memberName === "constructor" ||
+				(node.computed === true && maySelectConstructorProperty(asAstNode(node.property)))
+			) {
+				return true;
+			}
+			return (
+				(memberName === "call" || memberName === "apply" || memberName === "bind") &&
+				isPotentialConstructorValue(asAstNode(node.object), scope)
+			);
+		}
+		if (isReflectGetCall(node, scope)) return maySelectConstructorProperty(nodeArgument(node, 1));
+		if (node.type === "SequenceExpression") {
+			const expressions = nodeArray(node, "expressions");
+			return expressions ? isPotentialConstructorValue(asAstNode(expressions.at(-1)), scope) : false;
+		}
+		return isPotentialConstructorValue(transparentConstructorValue(node), scope);
+	}
+
+	for (const { node, parent } of variableDeclarations) {
+		const binding = asAstNode(node.id);
+		if (binding?.type !== "ObjectPattern") continue;
+		for (const value of Array.isArray(binding.properties) ? binding.properties : []) {
+			const property = asAstNode(value);
+			if (!property || property.type === "RestElement") continue;
+			const constructorProperty =
+				property.computed === true
+					? maySelectConstructorProperty(asAstNode(property.key))
+					: staticObjectPropertyName(property) === "constructor";
+			if (!constructorProperty) continue;
+			const propertyValue = asAstNode(property.value);
+			const local = propertyValue?.type === "AssignmentPattern" ? asAstNode(propertyValue.left) : propertyValue;
+			if (local?.type !== "Identifier" || typeof local.name !== "string") {
+				if (graphProof) graphProof.provable = false;
+				continue;
+			}
+			constructorValueBindings.add(local.name);
+			constructorValueBindingNodes.add(local);
+			if (parent && exportedVariableDeclarations.has(parent) && graphProof) graphProof.provable = false;
+		}
+	}
+	let constructorBindingsChanged = true;
+	while (constructorBindingsChanged) {
+		constructorBindingsChanged = false;
+		for (const { node, scope, parent } of variableDeclarations) {
+			const initializer = asAstNode(node.init);
+			if (!initializer || !isPotentialConstructorValue(initializer, scope)) continue;
+			const binding = asAstNode(node.id);
+			if (binding?.type !== "Identifier" || typeof binding.name !== "string") {
+				if (graphProof) graphProof.provable = false;
+				continue;
+			}
+			constructorValueUseNodes.add(initializer);
+			if (!constructorValueBindings.has(binding.name)) {
+				constructorValueBindings.add(binding.name);
+				constructorBindingsChanged = true;
+			}
+			constructorValueBindingNodes.add(binding);
+			if (parent && exportedVariableDeclarations.has(parent) && graphProof) graphProof.provable = false;
+		}
+	}
+
+	if (graphProof) {
+		for (const { node, scope, parent, parentKey } of collectScopedAstNodes(
+			ast,
+			candidate =>
+				candidate.type === "Identifier" ||
+				candidate.type === "MemberExpression" ||
+				candidate.type === "OptionalMemberExpression" ||
+				candidate.type === "CallExpression" ||
+				candidate.type === "OptionalCallExpression" ||
+				candidate.type === "SequenceExpression" ||
+				transparentConstructorValue(candidate) !== null,
+			runtimeBindingsOnly,
+		)) {
+			if (!isPotentialConstructorValue(node, scope)) continue;
+			const nonReferenceProperty =
+				(parent?.type === "MemberExpression" && parentKey === "property" && parent.computed !== true) ||
+				(parentKey === "key" && parent?.computed !== true && parent?.shorthand !== true);
+			if (nonReferenceProperty || constructorValueBindingNodes.has(node) || constructorValueUseNodes.has(node)) {
+				continue;
+			}
+			if (parent && transparentConstructorValue(parent) === node) continue;
+			if (parent?.type === "SequenceExpression") continue;
+			if (
+				(parent?.type === "MemberExpression" || parent?.type === "OptionalMemberExpression") &&
+				parentKey === "object"
+			) {
+				continue;
+			}
+			if (parent?.type === "BinaryExpression" || parent?.type === "UnaryExpression") continue;
+			if (parent?.type === "ExpressionStatement") continue;
+			graphProof.provable = false;
 		}
 	}
 	const isKnownProcessDlopenCall = (node: StructuralAstNode | null, scope: BindingScope): boolean =>
@@ -1066,9 +1278,7 @@ function collectExtensionSpecifierReferences(
 			const memberName = callee?.type === "MemberExpression" ? staticMemberPropertyName(callee) : null;
 			const memberObject = callee?.type === "MemberExpression" ? asAstNode(callee.object) : null;
 			const moduleRequireObject = isIdentifier(memberObject, "module") && !scopeHasBinding(scope, MODULE_BINDING);
-			const globalRequireObject =
-				memberObject?.type === "Identifier" &&
-				(memberObject.name === "global" || memberObject.name === "globalThis");
+			const globalRequireObject = isKnownGlobalObject(memberObject, scope);
 			const requireMainObject =
 				memberObject?.type === "MemberExpression" &&
 				staticMemberPropertyName(memberObject) === "main" &&
@@ -1220,21 +1430,48 @@ function collectExtensionSpecifierReferences(
 				graphProof.provable = false;
 				continue;
 			}
-			if (node.name === "process" && !scopeHasBinding(scope, PROCESS_BINDING) && !nonReferenceProperty) {
-				const staticMemberObject =
+			const knownProcessIdentifier =
+				(node.name === "process" && !scopeHasBinding(scope, PROCESS_BINDING)) ||
+				processNamespaceBindings.has(node.name);
+			if (knownProcessIdentifier && !nonReferenceProperty) {
+				if (processNamespaceBindingNodes.has(node) || processObjectUseNodes.has(node) || typeofOperand) {
+					continue;
+				}
+				if (
 					(parent?.type === "MemberExpression" || parent?.type === "OptionalMemberExpression") &&
-					parentKey === "object" &&
-					staticMemberPropertyName(parent) !== null;
-				if (staticMemberObject || typeofOperand) continue;
+					parentKey === "object"
+				) {
+					if (staticMemberPropertyName(parent) === null) graphProof.provable = false;
+					continue;
+				}
 				graphProof.provable = false;
 				continue;
 			}
-			if ((node.name === "global" || node.name === "globalThis") && !nonReferenceProperty) {
-				const staticMemberObject =
+			const knownGlobalIdentifier =
+				(node.name === "global" && !scopeHasBinding(scope, GLOBAL_BINDING)) ||
+				(node.name === "globalThis" && !scopeHasBinding(scope, GLOBAL_THIS_BINDING)) ||
+				globalObjectBindings.has(node.name);
+			if (knownGlobalIdentifier && !nonReferenceProperty) {
+				if (globalObjectBindingNodes.has(node) || globalObjectUseNodes.has(node) || typeofOperand) continue;
+				if (
+					(parent?.type === "MemberExpression" || parent?.type === "OptionalMemberExpression") &&
+					parentKey === "object"
+				) {
+					if (staticMemberPropertyName(parent) === null) graphProof.provable = false;
+					continue;
+				}
+				graphProof.provable = false;
+				continue;
+			}
+			if (node.name === "Reflect" && !scopeHasBinding(scope, REFLECT_BINDING) && !nonReferenceProperty) {
+				if (typeofOperand) continue;
+				if (
 					(parent?.type === "MemberExpression" || parent?.type === "OptionalMemberExpression") &&
 					parentKey === "object" &&
-					staticMemberPropertyName(parent) !== null;
-				if (staticMemberObject || typeofOperand) continue;
+					staticMemberPropertyName(parent) !== null
+				) {
+					continue;
+				}
 				graphProof.provable = false;
 				continue;
 			}
@@ -1253,19 +1490,6 @@ function collectExtensionSpecifierReferences(
 					parentKey === "callee" &&
 					isKnownProcessDlopenCall(parent, scope)
 				) {
-					continue;
-				}
-				if (nonReferenceProperty) continue;
-				graphProof.provable = false;
-				continue;
-			}
-			if (processNamespaceBindings.has(node.name)) {
-				if (processNamespaceBindingNodes.has(node)) continue;
-				if (
-					(parent?.type === "MemberExpression" || parent?.type === "OptionalMemberExpression") &&
-					parentKey === "object"
-				) {
-					if (staticMemberPropertyName(parent) === null) graphProof.provable = false;
 					continue;
 				}
 				if (nonReferenceProperty) continue;
@@ -1313,7 +1537,6 @@ function collectExtensionSpecifierReferences(
 			if (parent?.type === "UnaryExpression" && parent.operator === "typeof" && parentKey === "argument") continue;
 			if (parent?.type === "MemberExpression" && parentKey === "object") {
 				switch (staticMemberPropertyName(parent)) {
-					case "cache":
 					case "extensions":
 					case "resolve":
 						continue;
@@ -1330,13 +1553,34 @@ function collectExtensionSpecifierReferences(
 			const memberName = staticMemberPropertyName(node);
 			const globalRuntimeEscape =
 				(memberName === "eval" || memberName === "Function" || memberName === "Worker") &&
-				object?.type === "Identifier" &&
-				(object.name === "global" || object.name === "globalThis");
-			if (globalRuntimeEscape) {
+				isKnownGlobalObject(object, scope);
+			if (globalRuntimeEscape || (memberName === null && isKnownGlobalObject(object, scope))) {
 				graphProof.provable = false;
 				continue;
 			}
-			if (memberName === "constructor") {
+			if (memberName === "Reflect" && isKnownGlobalObject(object, scope)) {
+				if (
+					(parent?.type === "MemberExpression" || parent?.type === "OptionalMemberExpression") &&
+					parentKey === "object" &&
+					staticMemberPropertyName(parent) !== null
+				) {
+					continue;
+				}
+				graphProof.provable = false;
+				continue;
+			}
+			if (memberName === "get" && isKnownReflectObject(object, scope)) {
+				if (
+					(parent?.type === "CallExpression" || parent?.type === "OptionalCallExpression") &&
+					parentKey === "callee" &&
+					isReflectGetCall(parent, scope)
+				) {
+					continue;
+				}
+				graphProof.provable = false;
+				continue;
+			}
+			if (memberName === null && isKnownReflectObject(object, scope)) {
 				graphProof.provable = false;
 				continue;
 			}
@@ -1381,7 +1625,7 @@ function collectExtensionSpecifierReferences(
 			const disguisedRequireMember =
 				memberName === "require" &&
 				((isIdentifier(object, "module") && !scopeHasBinding(scope, MODULE_BINDING)) ||
-					(object?.type === "Identifier" && (object.name === "global" || object.name === "globalThis")) ||
+					isKnownGlobalObject(object, scope) ||
 					(object?.type === "MemberExpression" &&
 						staticMemberPropertyName(object) === "main" &&
 						isIdentifier(asAstNode(object.object), "require") &&
