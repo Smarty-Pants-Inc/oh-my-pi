@@ -11,6 +11,7 @@ import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
+import * as ai from "@oh-my-pi/pi-ai";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { HindsightApi } from "@oh-my-pi/pi-coding-agent/hindsight/client";
 import type { HindsightConfig } from "@oh-my-pi/pi-coding-agent/hindsight/config";
@@ -262,6 +263,57 @@ describe("Mnemopi tool factories", () => {
 		expect(MemoryRecallTool.createIf(session)).toBeInstanceOf(MemoryRecallTool);
 		expect(MemoryReflectTool.createIf(session)).toBeInstanceOf(MemoryReflectTool);
 		expect(MemoryEditTool.createIf(session)).toBeInstanceOf(MemoryEditTool);
+	});
+
+	it("forwards cache retention to the smol memory adapter", async () => {
+		const settings = Settings.isolated({
+			"memory.backend": "mnemopi",
+			"mnemopi.noEmbeddings": true,
+			"mnemopi.llmMode": "smol",
+			"providers.cacheRetention": "none",
+			modelRoles: { smol: "test/smol-model" },
+		});
+		const model = {
+			provider: "test",
+			id: "smol-model",
+			name: "Smol Model",
+			api: "openai-completions",
+			baseUrl: "https://example.com/v1",
+			contextWindow: 8192,
+		};
+		const modelRegistry = {
+			getAvailable: () => [model],
+			getApiKey: async () => "test-key",
+			getApiKeyForProvider: async () => undefined,
+			resolver: () => async () => "test-key",
+		};
+		tempDbDir = TempDir.createSync(`@mnemopi-cache-retention-${Date.now()}-`);
+		const session = {
+			sessionId: TEST_SESSION_ID,
+			settings,
+			modelRegistry,
+			sessionManager: { getEntries: () => [], getCwd: () => tempDbDir?.path() ?? "/tmp" },
+			subscribe: () => () => {},
+			refreshBaseSystemPrompt: async () => {},
+		};
+		const completeSpy = vi.spyOn(ai, "completeSimple").mockResolvedValue({
+			stopReason: "end_turn",
+			content: [{ type: "text", text: "memory result" }],
+		} as never);
+
+		await mnemopiBackend.start({
+			session,
+			settings,
+			agentDir: tempDbDir.path(),
+			modelRegistry,
+			taskDepth: 0,
+		} as never);
+		registeredMnemopiState = getMnemopiSessionState(session as never);
+		const llm = registeredMnemopiState?.config.providerOptions.llm;
+		if (typeof llm !== "function") throw new Error("Expected smol Mnemopi LLM adapter");
+
+		expect(await llm("remember this", { maxTokens: 64 })).toBe("memory result");
+		expect(completeSpy.mock.calls[0]?.[2]).toMatchObject({ cacheRetention: "none", maxTokens: 64 });
 	});
 });
 

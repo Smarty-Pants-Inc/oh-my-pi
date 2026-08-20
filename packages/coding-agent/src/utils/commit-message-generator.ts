@@ -12,6 +12,7 @@ import { getModelMatchPreferences, resolveModelRoleValue } from "../config/model
 import type { Settings } from "../config/settings";
 import MODEL_PRIO from "../priority.json" with { type: "json" };
 import commitSystemPrompt from "../prompts/system/commit-message-system.md" with { type: "text" };
+import { resolveSettingsCacheRetention } from "../session/settings-stream-fn";
 import { concreteThinkingLevel, toReasoningEffort } from "../thinking";
 
 const COMMIT_SYSTEM_PROMPT = prompt.render(commitSystemPrompt);
@@ -117,6 +118,7 @@ export async function generateCommitMessage(
 						apiKey: registry.resolver(candidate.model, sessionId),
 						maxTokens,
 						reasoning: toReasoningEffort(candidate.thinkingLevel),
+						cacheRetention: resolveSettingsCacheRetention(settings),
 					},
 				),
 			);

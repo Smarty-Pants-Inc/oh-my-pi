@@ -159,13 +159,26 @@ function trackedBinding(name: unknown): number {
 }
 
 function isTypeOnlyImportBinding(declaration: StructuralAstNode, specifier?: StructuralAstNode | null): boolean {
-	const declarationKind = declaration.importKind;
-	const specifierKind = specifier?.importKind;
+	const declarationKind = declaration.importKind ?? declaration.exportKind;
+	const specifierKind = specifier?.importKind ?? specifier?.exportKind;
 	return (
 		declarationKind === "type" ||
 		declarationKind === "typeof" ||
 		specifierKind === "type" ||
 		specifierKind === "typeof"
+	);
+}
+
+function isEntirelyTypeOnlyModuleDeclaration(declaration: StructuralAstNode): boolean {
+	if (isTypeOnlyImportBinding(declaration)) return true;
+	const specifiers = nodeArray(declaration, "specifiers");
+	return (
+		specifiers !== null &&
+		specifiers.length > 0 &&
+		specifiers.every(value => {
+			const specifier = asAstNode(value);
+			return specifier !== null && isTypeOnlyImportBinding(declaration, specifier);
+		})
 	);
 }
 
@@ -474,25 +487,21 @@ function isNodeProcessRequireCall(node: StructuralAstNode | null, scope: Binding
 
 function isProcessDlopenCall(
 	node: StructuralAstNode | null,
-	scope: BindingScope,
-	processNamespaceBindings: ReadonlySet<string>,
 	processDlopenBindings: ReadonlySet<string>,
-	localRequireBindings: ReadonlySet<string>,
-	createRequireBindings: ReadonlySet<string>,
-	moduleNamespaceBindings: ReadonlySet<string>,
+	isProcessObject: (node: StructuralAstNode | null) => boolean,
 ): boolean {
 	if (node?.type !== "CallExpression" && node?.type !== "OptionalCallExpression") return false;
 	const callee = asAstNode(node.callee);
 	if (callee?.type === "Identifier" && typeof callee.name === "string") {
 		return processDlopenBindings.has(callee.name);
 	}
-	if (callee?.type !== "MemberExpression" || staticMemberPropertyName(callee) !== "dlopen") return false;
-	const object = asAstNode(callee.object);
-	return (
-		(isIdentifier(object, "process") && !scopeHasBinding(scope, PROCESS_BINDING)) ||
-		(object?.type === "Identifier" && typeof object.name === "string" && processNamespaceBindings.has(object.name)) ||
-		isNodeProcessLoaderCall(object, scope, localRequireBindings, createRequireBindings, moduleNamespaceBindings)
-	);
+	if (
+		(callee?.type !== "MemberExpression" && callee?.type !== "OptionalMemberExpression") ||
+		staticMemberPropertyName(callee) !== "dlopen"
+	) {
+		return false;
+	}
+	return isProcessObject(asAstNode(callee.object));
 }
 
 /**
@@ -837,69 +846,107 @@ function collectExtensionSpecifierReferences(
 		}
 	}
 
-	for (const { node, scope } of variableDeclarations) {
-		const initializer = asAstNode(node.init);
-		if (isNodeProcessRequireCall(initializer, scope)) continue;
-		const binding = asAstNode(node.id);
-		if (
-			isNodeProcessLoaderCall(
-				initializer,
-				scope,
-				localRequireBindings,
-				createRequireBindings,
-				moduleNamespaceBindings,
-			)
-		) {
-			if (binding?.type === "Identifier" && typeof binding.name === "string") {
-				processNamespaceBindings.add(binding.name);
-				processNamespaceBindingNodes.add(binding);
-			} else if (graphProof) {
-				graphProof.provable = false;
-			}
-			continue;
-		}
-		if (
-			initializer?.type !== "MemberExpression" ||
-			!isNodeProcessLoaderCall(
-				asAstNode(initializer.object),
-				scope,
-				localRequireBindings,
-				createRequireBindings,
-				moduleNamespaceBindings,
-			)
-		) {
-			continue;
-		}
-		const memberName = staticMemberPropertyName(initializer);
-		if (memberName === null) {
-			if (graphProof) graphProof.provable = false;
-			continue;
-		}
-		if (memberName !== "default" && memberName !== "dlopen") continue;
-		if (binding?.type !== "Identifier" || typeof binding.name !== "string") {
-			if (graphProof) graphProof.provable = false;
-			continue;
-		}
-		if (memberName === "dlopen") {
-			processDlopenBindings.add(binding.name);
-			processDlopenBindingNodes.add(binding);
-		} else {
-			processNamespaceBindings.add(binding.name);
-			processNamespaceBindingNodes.add(binding);
-		}
-	}
 	const isKnownProcessLoaderCall = (node: StructuralAstNode | null, scope: BindingScope): boolean =>
 		isNodeProcessLoaderCall(node, scope, localRequireBindings, createRequireBindings, moduleNamespaceBindings);
+	function isKnownProcessObject(node: StructuralAstNode | null, scope: BindingScope): boolean {
+		if (isIdentifier(node, "process") && !scopeHasBinding(scope, PROCESS_BINDING)) return true;
+		if (node?.type === "Identifier" && typeof node.name === "string" && processNamespaceBindings.has(node.name)) {
+			return true;
+		}
+		if (isKnownProcessLoaderCall(node, scope)) return true;
+		if (node?.type === "MemberExpression" || node?.type === "OptionalMemberExpression") {
+			const memberName = staticMemberPropertyName(node);
+			const object = asAstNode(node.object);
+			if (
+				memberName === "process" &&
+				object?.type === "Identifier" &&
+				(object.name === "global" || object.name === "globalThis")
+			) {
+				return true;
+			}
+			return memberName === "default" && isKnownProcessObject(object, scope);
+		}
+		if (node?.type !== "CallExpression" && node?.type !== "OptionalCallExpression") return false;
+		const callee = asAstNode(node.callee);
+		if (callee?.type !== "MemberExpression" && callee?.type !== "OptionalMemberExpression") return false;
+		return staticMemberPropertyName(callee) === "valueOf" && isKnownProcessObject(asAstNode(callee.object), scope);
+	}
+
+	let processBindingsChanged = true;
+	while (processBindingsChanged) {
+		processBindingsChanged = false;
+		for (const { node, scope } of variableDeclarations) {
+			const initializer = asAstNode(node.init);
+			const binding = asAstNode(node.id);
+			if (isKnownProcessObject(initializer, scope)) {
+				if (binding?.type === "Identifier" && typeof binding.name === "string") {
+					if (!processNamespaceBindings.has(binding.name)) {
+						processNamespaceBindings.add(binding.name);
+						processBindingsChanged = true;
+					}
+					processNamespaceBindingNodes.add(binding);
+					continue;
+				}
+				if (binding?.type !== "ObjectPattern") {
+					if (graphProof) graphProof.provable = false;
+					continue;
+				}
+				for (const value of Array.isArray(binding.properties) ? binding.properties : []) {
+					const property = asAstNode(value);
+					if (!property || property.type === "RestElement" || property.computed === true) {
+						if (graphProof) graphProof.provable = false;
+						continue;
+					}
+					const propertyName = staticObjectPropertyName(property);
+					if (propertyName !== "default" && propertyName !== "dlopen") continue;
+					const propertyValue = asAstNode(property.value);
+					const propertyKey = asAstNode(property.key);
+					const local =
+						propertyValue?.type === "AssignmentPattern" ? asAstNode(propertyValue.left) : propertyValue;
+					if (local?.type !== "Identifier" || typeof local.name !== "string") {
+						if (graphProof) graphProof.provable = false;
+						continue;
+					}
+					if (propertyName === "dlopen") {
+						if (propertyKey) processDlopenBindingNodes.add(propertyKey);
+						if (!processDlopenBindings.has(local.name)) {
+							processDlopenBindings.add(local.name);
+							processBindingsChanged = true;
+						}
+						processDlopenBindingNodes.add(local);
+					} else {
+						if (propertyKey) processNamespaceBindingNodes.add(propertyKey);
+						if (!processNamespaceBindings.has(local.name)) {
+							processNamespaceBindings.add(local.name);
+							processBindingsChanged = true;
+						}
+						processNamespaceBindingNodes.add(local);
+					}
+				}
+				continue;
+			}
+			if (initializer?.type !== "MemberExpression" && initializer?.type !== "OptionalMemberExpression") {
+				continue;
+			}
+			if (
+				staticMemberPropertyName(initializer) !== "dlopen" ||
+				!isKnownProcessObject(asAstNode(initializer.object), scope)
+			) {
+				continue;
+			}
+			if (binding?.type !== "Identifier" || typeof binding.name !== "string") {
+				if (graphProof) graphProof.provable = false;
+				continue;
+			}
+			if (!processDlopenBindings.has(binding.name)) {
+				processDlopenBindings.add(binding.name);
+				processBindingsChanged = true;
+			}
+			processDlopenBindingNodes.add(binding);
+		}
+	}
 	const isKnownProcessDlopenCall = (node: StructuralAstNode | null, scope: BindingScope): boolean =>
-		isProcessDlopenCall(
-			node,
-			scope,
-			processNamespaceBindings,
-			processDlopenBindings,
-			localRequireBindings,
-			createRequireBindings,
-			moduleNamespaceBindings,
-		);
+		isProcessDlopenCall(node, processDlopenBindings, object => isKnownProcessObject(object, scope));
 	for (const { node, scope, parent, parentKey } of collectScopedAstNodes(
 		ast,
 		isSpecifierReferenceNode,
@@ -964,10 +1011,12 @@ function collectExtensionSpecifierReferences(
 			node.type === "ExportNamedDeclaration" ||
 			node.type === "ExportAllDeclaration"
 		) {
-			record("import", node.source);
+			const typeOnlyReference = graphProof && isEntirelyTypeOnlyModuleDeclaration(node);
+			if (!typeOnlyReference) record("import", node.source);
 			const importSource = asAstNode(node.source);
 			if (
 				graphProof &&
+				!typeOnlyReference &&
 				node.type !== "ImportDeclaration" &&
 				importSource?.type === "StringLiteral" &&
 				(importSource.value === "node:module" ||
@@ -994,7 +1043,7 @@ function collectExtensionSpecifierReferences(
 			}
 		} else if (node.type === "TSImportEqualsDeclaration") {
 			const moduleReference = asAstNode(node.moduleReference);
-			if (moduleReference?.type === "TSExternalModuleReference") {
+			if (moduleReference?.type === "TSExternalModuleReference" && (!graphProof || !isTypeOnlyImportBinding(node))) {
 				if (!record("require", moduleReference.expression) && graphProof) graphProof.provable = false;
 			}
 		} else if (node.type === "CallExpression" || node.type === "OptionalCallExpression") {
@@ -1095,7 +1144,16 @@ function collectExtensionSpecifierReferences(
 			}
 			if (node.name === "process" && !scopeHasBinding(scope, PROCESS_BINDING) && !nonReferenceProperty) {
 				const staticMemberObject =
-					parent?.type === "MemberExpression" &&
+					(parent?.type === "MemberExpression" || parent?.type === "OptionalMemberExpression") &&
+					parentKey === "object" &&
+					staticMemberPropertyName(parent) !== null;
+				if (staticMemberObject || typeofOperand) continue;
+				graphProof.provable = false;
+				continue;
+			}
+			if ((node.name === "global" || node.name === "globalThis") && !nonReferenceProperty) {
+				const staticMemberObject =
+					(parent?.type === "MemberExpression" || parent?.type === "OptionalMemberExpression") &&
 					parentKey === "object" &&
 					staticMemberPropertyName(parent) !== null;
 				if (staticMemberObject || typeofOperand) continue;
@@ -1124,7 +1182,10 @@ function collectExtensionSpecifierReferences(
 			}
 			if (processNamespaceBindings.has(node.name)) {
 				if (processNamespaceBindingNodes.has(node)) continue;
-				if (parent?.type === "MemberExpression" && parentKey === "object") {
+				if (
+					(parent?.type === "MemberExpression" || parent?.type === "OptionalMemberExpression") &&
+					parentKey === "object"
+				) {
 					if (staticMemberPropertyName(parent) === null) graphProof.provable = false;
 					continue;
 				}
@@ -1176,7 +1237,7 @@ function collectExtensionSpecifierReferences(
 		}
 		for (const { node, scope, parent, parentKey } of collectScopedAstNodes(
 			ast,
-			candidate => candidate.type === "MemberExpression",
+			candidate => candidate.type === "MemberExpression" || candidate.type === "OptionalMemberExpression",
 			runtimeBindingsOnly,
 		)) {
 			const object = asAstNode(node.object);
@@ -1189,14 +1250,11 @@ function collectExtensionSpecifierReferences(
 				graphProof.provable = false;
 				continue;
 			}
-			const processDlopenMember =
-				memberName === "dlopen" &&
-				((isIdentifier(object, "process") && !scopeHasBinding(scope, PROCESS_BINDING)) ||
-					(object?.type === "Identifier" &&
-						typeof object.name === "string" &&
-						processNamespaceBindings.has(object.name)) ||
-					isNodeProcessRequireCall(object, scope));
-			if (processDlopenMember) {
+			if (memberName === null && isKnownProcessObject(object, scope)) {
+				graphProof.provable = false;
+				continue;
+			}
+			if (memberName === "dlopen") {
 				if (
 					(parent?.type === "CallExpression" || parent?.type === "OptionalCallExpression") &&
 					parentKey === "callee" &&

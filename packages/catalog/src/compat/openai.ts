@@ -599,7 +599,7 @@ export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): Resolv
 		// dialect, and local Ollama keeps its native effort vocabulary.
 		qwenTemplateReasoningEffort:
 			(thinkingFormat === "qwen" || thinkingFormat === "qwen-chat-template") &&
-			isLocalOpenAICompatBackend &&
+			(isLocalOpenAICompatBackend || isVllmProvider) &&
 			provider !== "ollama" &&
 			isQwen38PlusTemplateEffortModelId(spec.id),
 		requiresAssistantContentForToolCalls: isKimiModel || isDirectDeepseekReasoning,

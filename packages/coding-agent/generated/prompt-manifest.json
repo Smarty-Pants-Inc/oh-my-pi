@@ -5871,7 +5871,7 @@
     },
     {
       "path": "packages/catalog/src/compat/openai.ts",
-      "sha256": "d70ca6bb3faa5a0ccfb9c66a4c6e6629a071ac7b3430771922e13c56837c1cb8"
+      "sha256": "0f5908de516e04f19c038c298958803ddf4acc629d181616851b3e9ae18bdd96"
     },
     {
       "path": "packages/catalog/src/discovery/antigravity.ts",
@@ -7407,7 +7407,7 @@
     },
     {
       "path": "packages/coding-agent/src/extensibility/plugins/legacy-pi-compat.ts",
-      "sha256": "25562d07e6775ee3552dc6c769ef97e1fa2128fd44583188e859ca017b9bb93f"
+      "sha256": "1046ad0a9413e18082ba8ec3d881dbbdbfdad48cad8b0af36273bcc95a214251"
     },
     {
       "path": "packages/coding-agent/src/extensibility/plugins/loader.ts",
@@ -7907,7 +7907,7 @@
     },
     {
       "path": "packages/coding-agent/src/memories/index.ts",
-      "sha256": "7c0b4e4805d905cc3648f795d3af3f7e19a0f47cadbcbbd59dfc9ba1e062ea35"
+      "sha256": "eef14904f850b43b4d5933bda680ab5fc4e51e5f5d58ba74e5f1ef133ab54745"
     },
     {
       "path": "packages/coding-agent/src/memories/storage.ts",
@@ -7943,7 +7943,7 @@
     },
     {
       "path": "packages/coding-agent/src/mnemopi/backend.ts",
-      "sha256": "2663984f3ce815d66904ad05ecb275d452e20a02c79c38bb74ad7712f3490219"
+      "sha256": "0f4719f76413302b1ccd621348003730ac5ecb8e867efa7cec4f10b111e0a5a2"
     },
     {
       "path": "packages/coding-agent/src/mnemopi/config.ts",
@@ -9495,7 +9495,7 @@
     },
     {
       "path": "packages/coding-agent/src/tts/speech-enhancer.ts",
-      "sha256": "917289ac4ee3b984d184b831b1f99d210c568f0df632c29f93d53ae2b9623156"
+      "sha256": "2827fa1d8afc1d9b4a79b7fcbfdf5a1cc7356d2f8d9bbd0862a60201ca07f11c"
     },
     {
       "path": "packages/coding-agent/src/tts/tts-client.ts",
@@ -9527,7 +9527,7 @@
     },
     {
       "path": "packages/coding-agent/src/utils/commit-message-generator.ts",
-      "sha256": "1560c1c7a222fec63c45273fd39c2967aab0cf8cf554150541fbf529e288919c"
+      "sha256": "2d881f8ae878b63998cf0515b54c0c610a5d66016743800f011b04388839663a"
     },
     {
       "path": "packages/coding-agent/src/utils/cpuprofile.ts",
@@ -10683,5 +10683,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "c52d5e975cb0c713460db7c63500f4aa52fd14c6eed7bb3683fb20be1455dbc5"
+  "rootSha256": "c0ad69ffd2d039c1054a45511d18e24809bcc12095165423f94db35ab54d4e8c"
 }

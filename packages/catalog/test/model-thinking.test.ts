@@ -1047,7 +1047,7 @@ describe("Qwen 3.8 local template effort ladder", () => {
 			id: "qwen3.8-27b",
 			api: "openai-completions",
 			provider: "vllm-fast",
-			baseUrl: "http://192.168.5.3:8085/v1",
+			baseUrl: "https://vllm.example.com/v1",
 		});
 		expect(namedVllm.compat).toMatchObject({
 			thinkingFormat: "qwen-chat-template",

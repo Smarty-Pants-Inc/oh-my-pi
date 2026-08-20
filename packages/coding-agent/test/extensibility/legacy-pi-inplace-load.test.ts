@@ -195,6 +195,10 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 				name: "global Function-hidden require",
 				source: "new globalThis.Function('return require(\"../outside.js\")')();",
 			},
+			{
+				name: "destructured global require",
+				source: 'const { require: r } = globalThis; r("node:process").dlopen(r.main, "/absolute/outside.node");',
+			},
 		] as const;
 
 		for (const testCase of cases) {
@@ -294,6 +298,24 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
 	});
 
+	it("excludes erased type-only module references from the runtime containment graph", async () => {
+		const dir = await writePackage({
+			"outside.ts": "export type Outside = string;\nexport const runtime = true;\n",
+			"package/package.json": JSON.stringify({ name: "type-only-graph-ext", version: "1.0.0", type: "module" }),
+			"package/index.ts": 'import type { Outside } from "../outside.ts";\nexport type Alias = Outside;\n',
+		});
+		const packageRoot = path.join(dir, "package");
+		const entry = path.join(packageRoot, "index.ts");
+
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+		await fs.writeFile(entry, 'import { type Outside, runtime } from "../outside.ts";\nvoid runtime;\n');
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(false);
+		await fs.writeFile(entry, 'import type Outside = require("../outside.ts");\nexport type Alias = Outside;\n');
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+		await fs.writeFile(entry, 'export type { Outside } from "../outside.ts";\n');
+		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(true);
+	});
+
 	it("contains static process.dlopen targets and rejects aliases, outside, or dynamic targets", async () => {
 		const dir = await writePackage({
 			"outside.node": "outside-native-addon",
@@ -349,6 +371,25 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 				source: (target: string) =>
 					`import { createRequire } from "node:module";\ncreateRequire(import.meta.url)("node:process").dlopen(module, ${JSON.stringify(target)});\n`,
 			},
+			{
+				entry: esmEntry,
+				source: (target: string) =>
+					`import * as processNamespace from "node:process";\nprocessNamespace.default.dlopen(module, ${JSON.stringify(target)});\n`,
+			},
+			{
+				entry: cjsEntry,
+				source: (target: string) => `globalThis.process.dlopen(module, ${JSON.stringify(target)});\n`,
+			},
+			{
+				entry: esmEntry,
+				source: (target: string) =>
+					`import { createRequire } from "node:module";\nconst localRequire = createRequire(import.meta.url);\nlocalRequire("node:process").valueOf().dlopen(module, ${JSON.stringify(target)});\n`,
+			},
+			{
+				entry: esmEntry,
+				source: (target: string) =>
+					`import * as processNamespace from "node:process";\nconst { dlopen: open } = processNamespace.default;\nopen(module, ${JSON.stringify(target)});\n`,
+			},
 		];
 		for (const { entry, source } of aliasCases) {
 			await fs.writeFile(entry, source(insideTarget));
@@ -383,6 +424,8 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 		expect(await isExtensionSourceGraphContained(esmEntry, packageRoot)).toBe(false);
 		await fs.writeFile(esmEntry, 'export { dlopen as open } from "node:process";\n');
 		expect(await isExtensionSourceGraphContained(esmEntry, packageRoot)).toBe(false);
+		await fs.writeFile(cjsEntry, `globalThis.process["dlo" + "pen"](module, ${JSON.stringify(outsideTarget)});\n`);
+		expect(await isExtensionSourceGraphContained(cjsEntry, packageRoot)).toBe(false);
 	});
 
 	it("contains runtime-loadable non-source targets", async () => {
