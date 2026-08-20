@@ -3698,7 +3698,7 @@ function collectCommonJsNamedExports(source: string, modulePath: string, visited
 				for (const value of properties) {
 					const property = asAstNode(value);
 					if (!property || (property.type !== "ObjectProperty" && property.type !== "ObjectMethod")) continue;
-					const name = staticObjectPropertyName(property);
+					const name = property.computed === true ? null : staticObjectPropertyName(property);
 					if (name && name !== "default" && COMMONJS_NAMED_EXPORT_IDENTIFIER.test(name)) {
 						names.add(name);
 					}
