@@ -677,7 +677,9 @@ function collectExtensionSpecifierReferences(
 			(node.value === "node:worker_threads" ||
 				node.value === "worker_threads" ||
 				node.value === "node:vm" ||
-				node.value === "vm")
+				node.value === "vm" ||
+				node.value === "node:child_process" ||
+				node.value === "child_process")
 		) {
 			graphProof.provable = false;
 		}
@@ -1173,8 +1175,29 @@ function collectExtensionSpecifierReferences(
 		propertyDescriptorGetterBindingsChanged = false;
 		for (const { node, scope, parent } of variableDeclarations) {
 			const initializer = asAstNode(node.init);
-			if (!initializer || !isPropertyDescriptorGetter(initializer, scope)) continue;
 			const binding = asAstNode(node.id);
+			if (initializer && binding?.type === "ObjectPattern" && isKnownObjectConstructor(initializer, scope)) {
+				for (const value of Array.isArray(binding.properties) ? binding.properties : []) {
+					const property = asAstNode(value);
+					if (!property || staticObjectPropertyName(property) !== "getOwnPropertyDescriptor") continue;
+					const propertyValue = asAstNode(property.value);
+					const propertyKey = asAstNode(property.key);
+					const local =
+						propertyValue?.type === "AssignmentPattern" ? asAstNode(propertyValue.left) : propertyValue;
+					if (local?.type !== "Identifier" || typeof local.name !== "string") {
+						if (graphProof) graphProof.provable = false;
+						continue;
+					}
+					if (propertyKey) propertyDescriptorGetterBindingNodes.add(propertyKey);
+					if (addLexicalBinding(propertyDescriptorGetterBindings, scope, local)) {
+						propertyDescriptorGetterBindingsChanged = true;
+					}
+					propertyDescriptorGetterBindingNodes.add(local);
+					if (parent && exportedVariableDeclarations.has(parent) && graphProof) graphProof.provable = false;
+				}
+				continue;
+			}
+			if (!initializer || !isPropertyDescriptorGetter(initializer, scope)) continue;
 			if (binding?.type !== "Identifier" || typeof binding.name !== "string") {
 				if (graphProof) graphProof.provable = false;
 				continue;

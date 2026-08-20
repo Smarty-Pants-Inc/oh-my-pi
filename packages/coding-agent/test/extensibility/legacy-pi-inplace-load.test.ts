@@ -353,6 +353,54 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 		}
 	});
 
+	it("tracks destructured Object descriptor helpers lexically in CommonJS and ESM", async () => {
+		const dir = await writePackage({
+			"package/package.json": JSON.stringify({
+				name: "destructured-descriptor-ext",
+				version: "1.0.0",
+				type: "module",
+			}),
+			"package/index.cjs": "module.exports = true;\n",
+			"package/index.js": "export const safe = true;\n",
+		});
+		const packageRoot = path.join(dir, "package");
+		const cases = [
+			{
+				name: "CommonJS",
+				entry: path.join(packageRoot, "index.cjs"),
+				benign: [
+					"const { getOwnPropertyDescriptor: get } = Object;",
+					"function inspect(get) { return get({ safe: 2 }, 'safe').value; }",
+					"module.exports = [get({ safe: 1 }, 'safe').value, inspect(() => ({ value: 2 }))];",
+				].join("\n"),
+				dangerous:
+					"const { getOwnPropertyDescriptor: get } = Object; get(async () => {}, 'constructor').value('return require(\"../outside.js\")')();",
+			},
+			{
+				name: "ESM",
+				entry: path.join(packageRoot, "index.js"),
+				benign: [
+					"const { getOwnPropertyDescriptor: get } = Object;",
+					"function inspect(get) { return get({ safe: 2 }, 'safe').value; }",
+					"export const values = [get({ safe: 1 }, 'safe').value, inspect(() => ({ value: 2 }))];",
+				].join("\n"),
+				dangerous:
+					"const { getOwnPropertyDescriptor: get } = Object; export const value = get(async () => {}, 'constructor').value('return process')();",
+			},
+		] as const;
+
+		for (const testCase of cases) {
+			await fs.writeFile(testCase.entry, testCase.benign);
+			expect(await isExtensionSourceGraphContained(testCase.entry, packageRoot), `${testCase.name} benign`).toBe(
+				true,
+			);
+			await fs.writeFile(testCase.entry, testCase.dangerous);
+			expect(await isExtensionSourceGraphContained(testCase.entry, packageRoot), `${testCase.name} dangerous`).toBe(
+				false,
+			);
+		}
+	});
+
 	it("rejects Module loaders exposed through require.cache", async () => {
 		const dir = await writePackage({
 			"outside.js": "export const outside = true;\n",
@@ -417,21 +465,43 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 		expect(await isExtensionSourceGraphContained(entry, packageRoot)).toBe(false);
 	});
 
-	it("rejects node:vm execution builtins during graph proof", async () => {
+	it("rejects VM and child-process execution builtins during graph proof", async () => {
 		const dir = await writePackage({
-			"package/package.json": JSON.stringify({ name: "vm-execution-ext", version: "1.0.0", type: "module" }),
+			"package/package.json": JSON.stringify({ name: "execution-builtin-ext", version: "1.0.0", type: "module" }),
+			"package/index.cjs": "module.exports = true;\n",
 			"package/index.js": "export const safe = true;\n",
 		});
 		const packageRoot = path.join(dir, "package");
-		const entry = path.join(packageRoot, "index.js");
+		const commonJsEntry = path.join(packageRoot, "index.cjs");
+		const esmEntry = path.join(packageRoot, "index.js");
 
 		const cases = [
-			{ name: "node:vm import", source: 'import * as vm from "node:vm";\nvoid vm;' },
-			{ name: "vm require", source: 'const vm = require("vm");\nvoid vm;' },
+			{ name: "node:vm ESM import", entry: esmEntry, source: 'import * as vm from "node:vm";\nvoid vm;' },
+			{ name: "vm CommonJS require", entry: commonJsEntry, source: 'const vm = require("vm");\nvoid vm;' },
+			{
+				name: "node:child_process ESM import",
+				entry: esmEntry,
+				source: 'import * as childProcess from "node:child_process";\nvoid childProcess;',
+			},
+			{
+				name: "child_process ESM import",
+				entry: esmEntry,
+				source: 'import * as childProcess from "child_process";\nvoid childProcess;',
+			},
+			{
+				name: "node:child_process CommonJS require",
+				entry: commonJsEntry,
+				source: 'const childProcess = require("node:child_process");\nvoid childProcess;',
+			},
+			{
+				name: "child_process CommonJS require",
+				entry: commonJsEntry,
+				source: 'const childProcess = require("child_process");\nvoid childProcess;',
+			},
 		] as const;
 		for (const testCase of cases) {
-			await fs.writeFile(entry, testCase.source);
-			expect(await isExtensionSourceGraphContained(entry, packageRoot), testCase.name).toBe(false);
+			await fs.writeFile(testCase.entry, testCase.source);
+			expect(await isExtensionSourceGraphContained(testCase.entry, packageRoot), testCase.name).toBe(false);
 		}
 	});
 
