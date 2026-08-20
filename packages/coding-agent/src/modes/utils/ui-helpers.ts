@@ -95,6 +95,7 @@ type QueuedPromptEditState = {
 	session: InteractiveModeContext["viewSession"];
 	selectedId: string;
 	selectedIndex: number;
+	persistedDelivery: QueuedPromptDelivery;
 	draftDelivery: QueuedPromptDelivery;
 	unsubscribeInput: () => void;
 	unsubscribeQueue: () => void;
@@ -932,6 +933,7 @@ export class UiHelpers {
 			selectedId: selected.id,
 			selectedIndex,
 			draftDelivery: selected.delivery,
+			persistedDelivery: selected.delivery,
 			unsubscribeInput: () => {},
 			unsubscribeQueue: () => {},
 		};
@@ -975,8 +977,10 @@ export class UiHelpers {
 			this.#stopQueuedPromptEditing();
 			return;
 		}
+		const selected = prompts[selectedIndex]!;
 		state.selectedIndex = selectedIndex;
-		state.draftDelivery = prompts[selectedIndex]!.delivery;
+		if (state.draftDelivery === state.persistedDelivery) state.draftDelivery = selected.delivery;
+		state.persistedDelivery = selected.delivery;
 		this.updatePendingMessagesDisplay();
 	}
 
@@ -989,7 +993,7 @@ export class UiHelpers {
 		}
 		if (state.session !== this.ctx.viewSession || state.session.isCompacting) {
 			this.#stopQueuedPromptEditing();
-			return undefined;
+			return { consume: true };
 		}
 
 		const prompts = state.session.getQueuedPrompts();
@@ -1023,6 +1027,7 @@ export class UiHelpers {
 			state.selectedIndex = Math.max(0, Math.min(prompts.length - 1, state.selectedIndex + move));
 			const selected = prompts[state.selectedIndex]!;
 			state.selectedId = selected.id;
+			state.persistedDelivery = selected.delivery;
 			state.draftDelivery = selected.delivery;
 			this.updatePendingMessagesDisplay();
 			return { consume: true };

@@ -846,6 +846,65 @@ describe("UiHelpers / InputController against derived queued custom display", ()
 		expect(inputListeners.size).toBe(0);
 	});
 
+	it("preserves an in-place timing draft across unrelated queue changes", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		session.agent.followUp({
+			role: "user",
+			content: "selected prompt",
+			attribution: "user",
+			timestamp: Date.now(),
+		});
+
+		const { ctx, pendingMessagesContainer, dispatchInput } = createStubInteractiveModeContextForUiHelpers(session);
+		const uiHelpers = new UiHelpers(ctx);
+		uiHelpers.editQueuedPrompts();
+		await Promise.resolve();
+
+		expect(dispatchInput("\x1b[D")).toEqual({ consume: true });
+		session.agent.followUp({
+			role: "user",
+			content: "unrelated prompt",
+			attribution: "user",
+			timestamp: Date.now(),
+		});
+
+		const rendered = Bun.stripANSI(pendingMessagesContainer.render(120).join("\n"));
+		expect(rendered).toContain("1. [Next safe moment] selected prompt");
+		expect(dispatchInput("\r")).toEqual({ consume: true });
+		expect(session.getQueuedPrompts().map(prompt => [prompt.text, prompt.delivery])).toEqual([
+			["selected prompt", "steer"],
+			["unrelated prompt", "afterCurrent"],
+		]);
+	});
+
+	it("consumes the first key after compaction makes the timing editor stale", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		session.agent.followUp({
+			role: "user",
+			content: "queued prompt",
+			attribution: "user",
+			timestamp: Date.now(),
+		});
+
+		const { ctx, editor, dispatchInput, inputListeners } = createStubInteractiveModeContextForUiHelpers(session);
+		editor.setText("unfinished draft");
+		const uiHelpers = new UiHelpers(ctx);
+		uiHelpers.editQueuedPrompts();
+		await Promise.resolve();
+
+		Object.defineProperty(session, "isCompacting", { configurable: true, get: () => true });
+		expect(dispatchInput("\r")).toEqual({ consume: true });
+		Reflect.deleteProperty(session, "isCompacting");
+
+		expect(inputListeners.size).toBe(0);
+		expect(editor.getText()).toBe("unfinished draft");
+		expect(session.getQueuedPrompts()).toEqual([
+			{ id: expect.any(String), text: "queued prompt", delivery: "afterCurrent" },
+		]);
+	});
+
 	it("exits when the selected prompt leaves the queue without touching another prompt or the editor draft", async () => {
 		fixture = await createRealSession();
 		const { session } = fixture;
