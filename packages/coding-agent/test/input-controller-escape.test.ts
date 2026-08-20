@@ -306,7 +306,7 @@ describe("InputController escape behavior", () => {
 			text: "hello",
 			images: undefined,
 			imageLinks: undefined,
-			streamingBehavior: "steer",
+			streamingBehavior: "followUp",
 		});
 		expect(spies.onInputCallback).toHaveBeenCalledWith(submission);
 

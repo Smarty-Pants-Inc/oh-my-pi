@@ -1,12 +1,14 @@
+import { stripVTControlCharacters } from "node:util";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, ImageContent, Message, Usage } from "@oh-my-pi/pi-ai";
 import { getStreamingPartialJson } from "@oh-my-pi/pi-ai/utils/block-symbols";
-import { type Component, Spacer, Text, TruncatedText } from "@oh-my-pi/pi-tui";
+import { type Component, matchesKey, Spacer, Text, TruncatedText } from "@oh-my-pi/pi-tui";
 import type { AdvisorMessageDetails } from "../../advisor";
 import { COLLAB_PROMPT_MESSAGE_TYPE, type CollabPromptDetails } from "../../collab/protocol";
 import { settings } from "../../config/settings";
 import { getEditClipboard } from "../../edit/edit-clipboard";
 import { getFileSnapshotStore } from "../../edit/file-snapshot-store";
+import type { QueuedPromptDelivery } from "../../extensibility/extensions";
 import { createAdvisorMessageCard } from "../../modes/components/advisor-message";
 import { AssistantMessageComponent } from "../../modes/components/assistant-message";
 import { createBackgroundTanDispatchBlock } from "../../modes/components/background-tan-message";
@@ -83,6 +85,26 @@ type QueuedMessages = {
 	steering: string[];
 	followUp: string[];
 };
+const QUEUED_PROMPT_DELIVERIES: readonly QueuedPromptDelivery[] = ["interrupt", "steer", "afterCurrent"];
+const QUEUED_PROMPT_TIMING_LABELS: Record<QueuedPromptDelivery, string> = {
+	interrupt: "Interrupt now",
+	steer: "Next safe moment",
+	afterCurrent: "After current turn",
+};
+type QueuedPromptEditState = {
+	session: InteractiveModeContext["viewSession"];
+	selectedId: string;
+	selectedIndex: number;
+	draftDelivery: QueuedPromptDelivery;
+	unsubscribeInput: () => void;
+	unsubscribeQueue: () => void;
+};
+function queuedPromptText(text: string): string {
+	return stripVTControlCharacters(replaceTabs(text))
+		.replace(/\r?\n/g, " ↵ ")
+		.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ");
+}
+
 type AddMessageOptions = {
 	populateHistory?: boolean;
 	imageLinks?: readonly (string | undefined)[];
@@ -103,6 +125,7 @@ function imageLinksForMessage(
 
 export class UiHelpers {
 	constructor(private ctx: InteractiveModeContext) {}
+	#queuedPromptEdit: QueuedPromptEditState | undefined;
 
 	/** Extract text content from a user message */
 	getUserMessageText(message: Message): string {
@@ -888,10 +911,190 @@ export class UiHelpers {
 		this.ctx.present(block);
 	}
 
+	editQueuedPrompts(): void {
+		const session = this.ctx.viewSession;
+		if (session.isCompacting) {
+			this.ctx.showWarning("Wait for compaction to finish before changing queued prompt timing.");
+			return;
+		}
+
+		const prompts = session.getQueuedPrompts();
+		if (prompts.length === 0) {
+			this.ctx.showStatus("No user prompts are queued.");
+			return;
+		}
+
+		this.#stopQueuedPromptEditing(false);
+		const selectedIndex = prompts.length - 1;
+		const selected = prompts[selectedIndex]!;
+		const state: QueuedPromptEditState = {
+			session,
+			selectedId: selected.id,
+			selectedIndex,
+			draftDelivery: selected.delivery,
+			unsubscribeInput: () => {},
+			unsubscribeQueue: () => {},
+		};
+		this.#queuedPromptEdit = state;
+		state.unsubscribeQueue = session.onQueuedPromptsChanged(() => this.#refreshQueuedPromptEditor(state));
+		// The shortcut that opens this editor is itself terminal input. Install the
+		// modal listener after that dispatch finishes so Shift+Up cannot also move
+		// the new selection.
+		queueMicrotask(() => {
+			if (this.#queuedPromptEdit === state) {
+				state.unsubscribeInput = this.ctx.ui.addInputListener(data => this.#handleQueuedPromptEditInput(data));
+			}
+		});
+		this.updatePendingMessagesDisplay();
+	}
+
+	#stopQueuedPromptEditing(render = true): void {
+		const state = this.#queuedPromptEdit;
+		if (!state) return;
+		this.#queuedPromptEdit = undefined;
+		state.unsubscribeInput();
+		state.unsubscribeQueue();
+		if (render) this.updatePendingMessagesDisplay();
+	}
+
+	#refreshQueuedPromptEditor(state: QueuedPromptEditState): void {
+		if (this.#queuedPromptEdit !== state) return;
+		if (state.session !== this.ctx.viewSession || state.session.isCompacting) {
+			this.#stopQueuedPromptEditing();
+			return;
+		}
+
+		const prompts = state.session.getQueuedPrompts();
+		if (prompts.length === 0) {
+			this.#stopQueuedPromptEditing();
+			return;
+		}
+
+		const selectedIndex = prompts.findIndex(prompt => prompt.id === state.selectedId);
+		if (selectedIndex === -1) {
+			this.#stopQueuedPromptEditing();
+			return;
+		}
+		state.selectedIndex = selectedIndex;
+		state.draftDelivery = prompts[selectedIndex]!.delivery;
+		this.updatePendingMessagesDisplay();
+	}
+
+	#handleQueuedPromptEditInput(data: string): { consume: true } | undefined {
+		const state = this.#queuedPromptEdit;
+		if (!state) return undefined;
+		if (matchesKey(data, "ctrl+c") || matchesKey(data, "ctrl+d")) {
+			this.#stopQueuedPromptEditing();
+			return undefined;
+		}
+		if (state.session !== this.ctx.viewSession || state.session.isCompacting) {
+			this.#stopQueuedPromptEditing();
+			return undefined;
+		}
+
+		const prompts = state.session.getQueuedPrompts();
+		if (prompts.length === 0) {
+			this.#stopQueuedPromptEditing();
+			return { consume: true };
+		}
+		const selectedIndex = prompts.findIndex(prompt => prompt.id === state.selectedId);
+		if (selectedIndex === -1) {
+			this.#stopQueuedPromptEditing();
+			return { consume: true };
+		}
+		state.selectedIndex = selectedIndex;
+
+		if (
+			this.ctx.keybindings.matches(data, "tui.select.cancel") ||
+			matchesKey(data, "escape") ||
+			matchesKey(data, "esc")
+		) {
+			this.#stopQueuedPromptEditing();
+			return { consume: true };
+		}
+
+		const move =
+			this.ctx.keybindings.matches(data, "tui.select.up") || matchesKey(data, "up")
+				? -1
+				: this.ctx.keybindings.matches(data, "tui.select.down") || matchesKey(data, "down")
+					? 1
+					: 0;
+		if (move !== 0) {
+			state.selectedIndex = Math.max(0, Math.min(prompts.length - 1, state.selectedIndex + move));
+			const selected = prompts[state.selectedIndex]!;
+			state.selectedId = selected.id;
+			state.draftDelivery = selected.delivery;
+			this.updatePendingMessagesDisplay();
+			return { consume: true };
+		}
+
+		const timingMove = matchesKey(data, "left") ? -1 : matchesKey(data, "right") ? 1 : 0;
+		if (timingMove !== 0) {
+			const deliveryIndex = QUEUED_PROMPT_DELIVERIES.indexOf(state.draftDelivery);
+			const nextIndex = Math.max(0, Math.min(QUEUED_PROMPT_DELIVERIES.length - 1, deliveryIndex + timingMove));
+			state.draftDelivery = QUEUED_PROMPT_DELIVERIES[nextIndex]!;
+			this.updatePendingMessagesDisplay();
+			return { consume: true };
+		}
+
+		if (
+			this.ctx.keybindings.matches(data, "tui.select.confirm") ||
+			matchesKey(data, "enter") ||
+			matchesKey(data, "return") ||
+			data === "\n"
+		) {
+			const { selectedId, draftDelivery, session } = state;
+			this.#stopQueuedPromptEditing(false);
+			const result = session.setQueuedPromptDelivery(selectedId, draftDelivery);
+			if (result.status === "updated") {
+				this.ctx.showStatus(`Queued prompt set to ${QUEUED_PROMPT_TIMING_LABELS[draftDelivery].toLowerCase()}.`);
+			} else if (result.status === "unavailable") {
+				this.ctx.showWarning("Queued prompt timing is unavailable during a session transition.");
+			} else {
+				this.ctx.showWarning("That prompt is no longer queued.");
+			}
+			this.updatePendingMessagesDisplay();
+			return { consume: true };
+		}
+
+		return { consume: true };
+	}
+
+	#renderQueuedPromptEditor(state: QueuedPromptEditState): boolean {
+		const prompts = state.session.getQueuedPrompts();
+		if (prompts.length === 0) return false;
+
+		this.ctx.pendingMessagesContainer.addChild(new Spacer(1));
+		const heading = theme.fg("muted", `Queued${theme.sep.dot}${prompts.length}`);
+		this.ctx.pendingMessagesContainer.addChild(new TruncatedText(heading, 1, 0));
+		for (let index = 0; index < prompts.length; index++) {
+			const prompt = prompts[index]!;
+			const selected = prompt.id === state.selectedId;
+			const delivery = selected ? state.draftDelivery : prompt.delivery;
+			let row = `  ${selected ? "›" : " "} ${index + 1}. [${QUEUED_PROMPT_TIMING_LABELS[delivery]}] ${queuedPromptText(prompt.text)}`;
+			row = selected ? theme.bg("selectedBg", theme.bold(theme.fg("accent", row))) : theme.fg("dim", row);
+			this.ctx.pendingMessagesContainer.addChild(new TruncatedText(row, 1, 0));
+		}
+		const hint = theme.fg("dim", "  ↑/↓ select · ←/→ timing · Enter save · Esc cancel");
+		this.ctx.pendingMessagesContainer.addChild(new TruncatedText(hint, 1, 0));
+		return true;
+	}
+
 	updatePendingMessagesDisplay(): void {
 		this.ctx.pendingMessagesContainer.disposeChildren();
-		const queuedMessages = this.ctx.viewSession.getQueuedMessages() as QueuedMessages;
+		const editState = this.#queuedPromptEdit;
+		if (editState) {
+			if (editState.session !== this.ctx.viewSession || editState.session.isCompacting) {
+				this.#stopQueuedPromptEditing(false);
+			} else if (this.#renderQueuedPromptEditor(editState)) {
+				this.ctx.ui.requestComponentRender(this.ctx.pendingMessagesContainer);
+				return;
+			} else {
+				this.#stopQueuedPromptEditing(false);
+			}
+		}
 
+		const queuedMessages = this.ctx.viewSession.getQueuedMessages() as QueuedMessages;
 		const steeringMessages = [...queuedMessages.steering];
 		for (const entry of this.ctx.compactionQueuedMessages as CompactionQueuedMessage[]) {
 			if (entry.mode === "steer") steeringMessages.push(entry.text);
@@ -912,8 +1115,7 @@ export class UiHelpers {
 				const heading = theme.fg("muted", `${group.label}${theme.sep.dot}${group.messages.length}`);
 				this.ctx.pendingMessagesContainer.addChild(new TruncatedText(heading, 1, 0));
 				for (let index = 0; index < group.messages.length; index++) {
-					const message = replaceTabs(group.messages[index] ?? "").replace(/\r?\n/g, " ↵ ");
-					const queuedText = theme.fg("dim", `  ${index + 1}. ${message}`);
+					const queuedText = theme.fg("dim", `  ${index + 1}. ${queuedPromptText(group.messages[index] ?? "")}`);
 					this.ctx.pendingMessagesContainer.addChild(new TruncatedText(queuedText, 1, 0));
 				}
 			}

@@ -155,8 +155,11 @@ import { createExtensionModelQuery } from "../extensibility/extensions/model-api
 import type {
 	CompactOptions,
 	ContextUsage,
+	QueuedPrompt,
+	QueuedPromptDelivery,
 	SendMessageDisposition,
 	SendMessageOptions,
+	SetQueuedPromptDeliveryResult,
 } from "../extensibility/extensions/types";
 import type { HookCommandContext } from "../extensibility/hooks/types";
 import type { Skill, SkillWarning } from "../extensibility/skills";
@@ -600,6 +603,10 @@ export class AgentSession {
 	#commandMetadataChangedListeners: CommandMetadataChangedListener[] = [];
 	#sessionChangeCallbacks = new Set<SessionChangeRegistration>();
 	#observedSessionId: string | undefined;
+	readonly #queuedPromptIds = new WeakMap<AgentMessage, string>();
+	readonly #queuedPromptListeners = new Set<() => void>();
+	#queuedPromptSnapshotFingerprint = "";
+	#unsubscribeAgentQueueChanges: (() => void) | undefined;
 
 	/** Host messages retained only for the next deliberate prompt. */
 	#pendingNextTurnMessages: CustomMessage[] = [];
@@ -1836,6 +1843,9 @@ export class AgentSession {
 		// Always subscribe to agent events for internal handling
 		// (session persistence, hooks, auto-compaction, retry logic)
 		this.#unsubscribeAgent = this.agent.subscribe(this.#handleAgentEvent);
+		// One queue subscription fans out only visible identity/delivery changes.
+		this.#queuedPromptSnapshotFingerprint = this.#visibleQueuedPromptFingerprint();
+		this.#unsubscribeAgentQueueChanges = this.agent.subscribeQueueChanges(() => this.#notifyQueuedPromptsChanged());
 		// Re-evaluate append-only context mode when the setting changes at runtime.
 		this.#unsubscribeAppendOnly = onAppendOnlyModeChanged(_value => this.#syncAppendOnlyContext(this.model));
 		this.#rehydratePendingSemanticDeliveries();
@@ -5068,6 +5078,9 @@ export class AgentSession {
 	 */
 	beginDispose(): void {
 		this.#isDisposed = true;
+		this.#unsubscribeAgentQueueChanges?.();
+		this.#unsubscribeAgentQueueChanges = undefined;
+		this.#queuedPromptListeners.clear();
 		this.#queuedMessageDrainBlocked = false;
 		this.#usagePreflightReadyForNextModelCall = false;
 		this.#detachUsageBeforeQueueDequeue?.();
@@ -7202,6 +7215,9 @@ export class AgentSession {
 			isCompacting: () => this.isCompacting,
 			abort: () => this.abort(),
 			hasPendingMessages: () => this.hasPendingMessages(),
+			getQueuedPrompts: () => this.getQueuedPrompts(),
+			onQueuedPromptsChanged: listener => this.onQueuedPromptsChanged(listener),
+			setQueuedPromptDelivery: (id, delivery) => this.setQueuedPromptDelivery(id, delivery),
 			shutdown: () => {
 				// Await the idempotent dispose() before exiting so the browser
 				// reaper and other bounded teardown complete — a fire-and-forget
@@ -8298,6 +8314,105 @@ export class AgentSession {
 			this.agent.peekFollowUpQueue().filter(isDisplayableQueuedMessage).length +
 			this.#pendingNextTurnMessages.filter(isDisplayableQueuedMessage).length
 		);
+	}
+	#queuedPromptId(message: AgentMessage): string {
+		let id = this.#queuedPromptIds.get(message);
+		if (id === undefined) {
+			id = Snowflake.next();
+			this.#queuedPromptIds.set(message, id);
+		}
+		return id;
+	}
+
+	#visibleQueuedPromptFingerprint(): string {
+		const parts: string[] = [];
+		for (const message of this.agent.peekSteeringQueue()) {
+			if (isUserQueuedMessage(message)) parts.push(`${this.#queuedPromptId(message)}:steer`);
+		}
+		for (const message of this.agent.peekFollowUpQueue()) {
+			if (isUserQueuedMessage(message)) parts.push(`${this.#queuedPromptId(message)}:afterCurrent`);
+		}
+		return parts.join("|");
+	}
+
+	#notifyQueuedPromptsChanged(): void {
+		const fingerprint = this.#visibleQueuedPromptFingerprint();
+		if (fingerprint === this.#queuedPromptSnapshotFingerprint) return;
+		this.#queuedPromptSnapshotFingerprint = fingerprint;
+		for (const listener of [...this.#queuedPromptListeners]) {
+			try {
+				listener();
+			} catch (error) {
+				logger.error("Queued prompt listener threw", { error });
+			}
+		}
+	}
+
+	getQueuedPrompts(): readonly QueuedPrompt[] {
+		const queued: Array<{ message: AgentMessage; delivery: Exclude<QueuedPromptDelivery, "interrupt"> }> = [];
+		for (const message of this.agent.peekSteeringQueue()) {
+			if (isUserQueuedMessage(message)) queued.push({ message, delivery: "steer" });
+		}
+		for (const message of this.agent.peekFollowUpQueue()) {
+			if (isUserQueuedMessage(message)) queued.push({ message, delivery: "afterCurrent" });
+		}
+		queued.sort((left, right) => left.message.timestamp - right.message.timestamp);
+		return queued.map(({ message, delivery }) => ({
+			id: this.#queuedPromptId(message),
+			text: queueChipText(message),
+			delivery,
+		}));
+	}
+
+	onQueuedPromptsChanged(listener: () => void): () => void {
+		if (this.#isDisposed) return () => {};
+		this.#queuedPromptListeners.add(listener);
+		return () => this.#queuedPromptListeners.delete(listener);
+	}
+
+	setQueuedPromptDelivery(id: string, delivery: QueuedPromptDelivery): SetQueuedPromptDeliveryResult {
+		if (this.#isDisposed || this.#lifecycleTransitionFenceActive) {
+			return { status: "unavailable", reason: "session_transition" };
+		}
+
+		const steering = [...this.agent.peekSteeringQueue()];
+		const followUp = [...this.agent.peekFollowUpQueue()];
+		let source: "steer" | "afterCurrent" | undefined;
+		let ownerIndex = steering.findIndex(
+			message => isUserQueuedMessage(message) && this.#queuedPromptId(message) === id,
+		);
+		if (ownerIndex !== -1) {
+			source = "steer";
+		} else {
+			ownerIndex = followUp.findIndex(
+				message => isUserQueuedMessage(message) && this.#queuedPromptId(message) === id,
+			);
+			if (ownerIndex !== -1) source = "afterCurrent";
+		}
+		if (source === undefined) return { status: "stale" };
+		if (delivery === source) return { status: "updated" };
+
+		const sourceQueue = source === "steer" ? steering : followUp;
+		const owner = sourceQueue[ownerIndex];
+		let blockStart = ownerIndex;
+		while (blockStart > 0 && isHiddenUserCompanion(sourceQueue[blockStart - 1])) blockStart--;
+		const block = sourceQueue.slice(blockStart, ownerIndex + 1);
+		const sourceRemainder = [...sourceQueue.slice(0, blockStart), ...sourceQueue.slice(ownerIndex + 1)];
+		let nextSteering = source === "steer" ? sourceRemainder : steering;
+		let nextFollowUp = source === "afterCurrent" ? sourceRemainder : followUp;
+
+		if (owner.role === "user") {
+			if (delivery === "afterCurrent") delete owner.steering;
+			else owner.steering = true;
+		}
+		if (delivery === "afterCurrent") nextFollowUp = [...nextFollowUp, ...block];
+		else if (delivery === "steer") nextSteering = [...nextSteering, ...block];
+		else nextSteering = [...block, ...nextSteering];
+
+		this.agent.replaceQueues(nextSteering, nextFollowUp, true);
+		if (delivery === "interrupt") void this.abort({ reason: USER_INTERRUPT_LABEL });
+		this.#reconcileQueuedMessageDrain();
+		return { status: "updated" };
 	}
 
 	getQueuedMessages(): { steering: readonly string[]; followUp: readonly string[] } {

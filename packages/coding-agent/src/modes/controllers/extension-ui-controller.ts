@@ -126,6 +126,7 @@ export class ExtensionUiController {
 			input: (title, placeholder, dialogOptions) => this.showHookInput(title, placeholder, dialogOptions),
 			askDialog: (questions, dialogOptions) => this.showAskDialog(questions, dialogOptions),
 			notify: (message, type) => this.showHookNotify(message, type),
+			editQueuedPrompts: () => this.ctx.editQueuedPrompts(),
 			onTerminalInput: handler => this.addExtensionTerminalInputListener(handler),
 			setStatus: (key, text) => this.setHookStatus(key, text),
 			setWorkingMessage: message => this.ctx.setWorkingMessage(message),
@@ -225,6 +226,9 @@ export class ExtensionUiController {
 			isCompacting: () => this.ctx.session.isCompacting,
 			abort: () => this.ctx.session.abort({ reason: USER_INTERRUPT_LABEL }),
 			hasPendingMessages: () => this.ctx.session.hasPendingMessages(),
+			getQueuedPrompts: () => this.ctx.session.getQueuedPrompts(),
+			onQueuedPromptsChanged: listener => this.ctx.session.onQueuedPromptsChanged(listener),
+			setQueuedPromptDelivery: (id, delivery) => this.ctx.session.setQueuedPromptDelivery(id, delivery),
 			shutdown: () => {
 				// Defer the actual teardown to the main loop, which calls
 				// `checkShutdownRequested()` at idle boundaries so any queued
@@ -457,6 +461,9 @@ export class ExtensionUiController {
 			isCompacting: () => this.ctx.session.isCompacting,
 			abort: () => this.ctx.session.abort({ reason: USER_INTERRUPT_LABEL }),
 			hasPendingMessages: () => this.ctx.session.hasPendingMessages(),
+			getQueuedPrompts: () => this.ctx.session.getQueuedPrompts(),
+			onQueuedPromptsChanged: listener => this.ctx.session.onQueuedPromptsChanged(listener),
+			setQueuedPromptDelivery: (id, delivery) => this.ctx.session.setQueuedPromptDelivery(id, delivery),
 			shutdown: () => {
 				// Defer the actual teardown to the main loop, which calls
 				// `checkShutdownRequested()` at idle boundaries so any queued

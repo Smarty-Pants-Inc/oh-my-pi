@@ -4538,6 +4538,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#uiHelpers.updatePendingMessagesDisplay();
 	}
 
+	editQueuedPrompts(): void {
+		this.#uiHelpers.editQueuedPrompts();
+	}
+
 	queueCompactionMessage(text: string, mode: "steer" | "followUp", images?: ImageContent[]): void {
 		this.#uiHelpers.queueCompactionMessage(text, mode, images);
 	}

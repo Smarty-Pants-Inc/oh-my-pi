@@ -773,17 +773,17 @@ export class InputController {
 				return;
 			}
 
-			// Handle skill commands (/skill:name [args]). Enter ⇒ steer (matches the
-			// free-text Enter semantics below); Ctrl+Enter routes through `handleFollowUp`.
+			// Handle skill commands (/skill:name [args]). Ordinary Enter waits for
+			// the active turn; Ctrl+Enter routes through `handleFollowUp` explicitly.
 			// During compaction, queue immediately so bash/python/loop-mode branches do
 			// not consume the skill before the compaction-resume path re-parses it.
 			if (text && isKnownSkillCommand(this.ctx, text)) {
 				if (this.ctx.session.isCompacting) {
 					const images = inputImages && inputImages.length > 0 ? [...inputImages] : undefined;
-					this.ctx.queueCompactionMessage(text, "steer", images);
+					this.ctx.queueCompactionMessage(text, "followUp", images);
 					return;
 				}
-				if (await this.#invokeSkillCommand(text, "steer", inputImages, inputImageLinks)) {
+				if (await this.#invokeSkillCommand(text, "followUp", inputImages, inputImageLinks)) {
 					return;
 				}
 			}
@@ -834,7 +834,7 @@ export class InputController {
 			// Queue input during compaction
 			if (this.ctx.session.isCompacting) {
 				const images = inputImages && inputImages.length > 0 ? [...inputImages] : undefined;
-				this.ctx.queueCompactionMessage(text, "steer", images);
+				this.ctx.queueCompactionMessage(text, "followUp", images);
 				return;
 			}
 			// Extension commands are local actions. Execute them before the normal
@@ -851,8 +851,8 @@ export class InputController {
 				return;
 			}
 
-			// If streaming, use prompt() with steer behavior
-			// This handles extension commands (execute immediately), prompt template expansion, and queueing
+			// If streaming, use prompt() with after-current behavior.
+			// This handles extension commands (execute immediately), prompt template expansion, and queueing.
 			if (this.ctx.session.isStreaming) {
 				this.ctx.editor.addToHistory(text);
 				this.ctx.editor.setText("");
@@ -867,11 +867,11 @@ export class InputController {
 				try {
 					await this.ctx.withLocalSubmission(
 						text,
-						() => this.ctx.session.prompt(text, { streamingBehavior: "steer", images }),
+						() => this.ctx.session.prompt(text, { streamingBehavior: "followUp", images }),
 						{ imageCount: images?.length ?? 0 },
 					);
 				} catch (error) {
-					// Don't lose the queued steer draft: restore text and images so
+					// Don't lose the queued follow-up draft: restore text and images so
 					// the user can retry after dispatch validation/queue failures.
 					this.ctx.editor.setText(text);
 					if (images && images.length > 0) {
@@ -899,17 +899,16 @@ export class InputController {
 				this.ctx.editor.pendingImages = [];
 				this.ctx.editor.pendingImageLinks = [];
 
-				// Render user message immediately, then let session events catch up.
-				// Tag the submission as "steer": this is a normal Enter the controller
-				// believed was idle, but a background turn can start in the gap before
-				// `submitInteractiveInput` dispatches it. Steering matches the
-				// streaming-branch Enter (above) and keeps the message from throwing
-				// AgentBusyError on that race.
+				// Render the user message immediately, then let session events catch up.
+				// A normal Enter waits until the current turn ends. The controller may
+				// believe the session is idle while a background turn starts before
+				// `submitInteractiveInput` dispatches it, so keep the same after-current
+				// behavior across that race.
 				const submission = this.ctx.startPendingSubmission({
 					text,
 					images,
 					imageLinks: inputImageLinks,
-					streamingBehavior: "steer",
+					streamingBehavior: "followUp",
 				});
 				// Start titling only after the optimistic row painted, so the local
 				// tiny-title worker's subprocess spawn never blocks the first frame.
@@ -922,8 +921,8 @@ export class InputController {
 				// momentarily idle. The editor already cleared itself on Enter, so
 				// falling through here would silently swallow the message. Submit a
 				// real prompt directly; if a background turn starts in the gap,
-				// `streamingBehavior: "steer"` preserves the typed-message queueing
-				// semantics instead of throwing AgentBusyError.
+				// `streamingBehavior: "followUp"` preserves after-current queueing
+				// instead of throwing AgentBusyError.
 				this.ctx.editor.imageLinks = undefined;
 				const images = inputImages && inputImages.length > 0 ? [...inputImages] : undefined;
 				this.ctx.editor.pendingImages = [];
@@ -932,7 +931,7 @@ export class InputController {
 				try {
 					await this.ctx.withLocalSubmission(
 						text,
-						() => this.ctx.session.prompt(text, { streamingBehavior: "steer", images }),
+						() => this.ctx.session.prompt(text, { streamingBehavior: "followUp", images }),
 						{
 							imageCount: images?.length ?? 0,
 						},

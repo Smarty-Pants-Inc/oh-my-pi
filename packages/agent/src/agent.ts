@@ -399,6 +399,7 @@ export class Agent {
 	};
 
 	#listeners = new Set<(e: AgentEvent) => void>();
+	#queueChangeListeners = new Set<() => void>();
 	#abortController?: AbortController;
 	#convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	#transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
@@ -833,6 +834,11 @@ export class Agent {
 		return () => this.#listeners.delete(fn);
 	}
 
+	subscribeQueueChanges(listener: () => void): () => void {
+		this.#queueChangeListeners.add(listener);
+		return () => this.#queueChangeListeners.delete(listener);
+	}
+
 	/** Register an independently removable hook that runs before queued messages are consumed. */
 	addBeforeQueuedMessageDequeueHook(hook: (signal?: AbortSignal) => Promise<void> | void): () => void {
 		const registration = (signal?: AbortSignal) => hook(signal);
@@ -996,10 +1002,16 @@ export class Agent {
 	}
 
 	replaceQueues(steering: AgentMessage[], followUp: AgentMessage[], preserveCompanions = false) {
+		const changed =
+			this.#steeringQueue.length !== steering.length ||
+			this.#steeringQueue.some((message, index) => message !== steering[index]) ||
+			this.#followUpQueue.length !== followUp.length ||
+			this.#followUpQueue.some((message, index) => message !== followUp[index]);
 		this.#steeringQueue = steering.slice();
 		this.#followUpQueue = followUp.slice();
 		if (!preserveCompanions) this.releaseOrphanedQueuedMessageCompanions();
 		this.#notifySteeringWaiters();
+		if (changed) this.#notifyQueueChanges();
 	}
 
 	attachQueuedMessageCompanions(
@@ -1079,6 +1091,7 @@ export class Agent {
 			} else {
 				this.#followUpQueue = [...restored, ...remaining];
 			}
+			this.#notifyQueueChanges();
 		};
 	}
 
@@ -1171,6 +1184,7 @@ export class Agent {
 	steer(m: AgentMessage) {
 		this.#steeringQueue.push(m);
 		this.#notifySteeringWaiters();
+		this.#notifyQueueChanges();
 	}
 
 	/**
@@ -1179,17 +1193,22 @@ export class Agent {
 	 */
 	followUp(m: AgentMessage) {
 		this.#followUpQueue.push(m);
+		this.#notifyQueueChanges();
 	}
 
 	clearSteeringQueue() {
+		const changed = this.#steeringQueue.length > 0;
 		this.#steeringQueue = [];
 		this.releaseOrphanedQueuedMessageCompanions();
 		this.#notifySteeringWaiters();
+		if (changed) this.#notifyQueueChanges();
 	}
 
 	clearFollowUpQueue() {
+		const changed = this.#followUpQueue.length > 0;
 		this.#followUpQueue = [];
 		this.releaseOrphanedQueuedMessageCompanions();
+		if (changed) this.#notifyQueueChanges();
 	}
 
 	/**
@@ -1224,10 +1243,12 @@ export class Agent {
 	}
 
 	clearAllQueues() {
+		const changed = this.#steeringQueue.length > 0 || this.#followUpQueue.length > 0;
 		this.#steeringQueue = [];
 		this.#followUpQueue = [];
 		this.releaseOrphanedQueuedMessageCompanions();
 		this.#notifySteeringWaiters();
+		if (changed) this.#notifyQueueChanges();
 		this.clearDeferredToolDirectives();
 	}
 
@@ -1258,7 +1279,9 @@ export class Agent {
 			this.#steeringMode === "one-at-a-time" ? this.#steeringQueue.slice(0, 1) : this.#steeringQueue.slice();
 		if (steering.length === 0) return [];
 		this.#steeringQueue = this.#steeringQueue.slice(steering.length);
-		return this.#takeQueuedMessages(steering, this.#queuedMessageRestorer("steering", steering));
+		const messages = this.#takeQueuedMessages(steering, this.#queuedMessageRestorer("steering", steering));
+		this.#notifyQueueChanges();
+		return messages;
 	}
 
 	#dequeueFollowUpMessages(): AgentMessage[] {
@@ -1266,7 +1289,9 @@ export class Agent {
 			this.#followUpMode === "one-at-a-time" ? this.#followUpQueue.slice(0, 1) : this.#followUpQueue.slice();
 		if (followUp.length === 0) return [];
 		this.#followUpQueue = this.#followUpQueue.slice(followUp.length);
-		return this.#takeQueuedMessages(followUp, this.#queuedMessageRestorer("followUp", followUp));
+		const messages = this.#takeQueuedMessages(followUp, this.#queuedMessageRestorer("followUp", followUp));
+		this.#notifyQueueChanges();
+		return messages;
 	}
 
 	/**
@@ -1276,6 +1301,7 @@ export class Agent {
 	popLastSteer(): AgentMessage | undefined {
 		const message = this.#steeringQueue.pop();
 		this.releaseOrphanedQueuedMessageCompanions();
+		if (message) this.#notifyQueueChanges();
 		return message;
 	}
 
@@ -1286,6 +1312,7 @@ export class Agent {
 	popLastFollowUp(): AgentMessage | undefined {
 		const message = this.#followUpQueue.pop();
 		this.releaseOrphanedQueuedMessageCompanions();
+		if (message) this.#notifyQueueChanges();
 		return message;
 	}
 
@@ -1324,7 +1351,20 @@ export class Agent {
 		for (const resolve of waiters) resolve();
 	}
 
+	#notifyQueueChanges(): void {
+		for (const listener of this.#queueChangeListeners) {
+			try {
+				listener();
+			} catch (err) {
+				logger.warn("Agent queue-change listener threw", {
+					error: err instanceof Error ? err.message : String(err),
+				});
+			}
+		}
+	}
+
 	reset() {
+		const queuesChanged = this.#steeringQueue.length > 0 || this.#followUpQueue.length > 0;
 		this.#state.messages.length = 0;
 		this.#state.isStreaming = false;
 		this.#state.streamMessage = null;
@@ -1334,6 +1374,7 @@ export class Agent {
 		this.#followUpQueue = [];
 		this.releaseOrphanedQueuedMessageCompanions();
 		this.#notifySteeringWaiters();
+		if (queuesChanged) this.#notifyQueueChanges();
 		this.clearDeferredToolDirectives();
 	}
 

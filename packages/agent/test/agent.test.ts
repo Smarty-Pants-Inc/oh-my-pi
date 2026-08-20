@@ -18,6 +18,62 @@ describe("Agent", () => {
 		expect(agent.state.messages).not.toContainEqual(message);
 	});
 
+	it("notifies queue subscribers after visible queue mutations", () => {
+		const agent = new Agent();
+		const steering = { role: "user" as const, content: "steer", timestamp: 1 };
+		const followUp = { role: "user" as const, content: "follow up", timestamp: 2 };
+		const snapshots: Array<[number, number]> = [];
+		const unsubscribe = agent.subscribeQueueChanges(() => {
+			snapshots.push([agent.peekSteeringQueue().length, agent.peekFollowUpQueue().length]);
+		});
+
+		agent.steer(steering);
+		agent.followUp(followUp);
+		agent.clearSteeringQueue();
+		agent.clearFollowUpQueue();
+		agent.replaceQueues([steering], [followUp]);
+		agent.replaceQueues([steering], [followUp]);
+		agent.popLastSteer();
+		agent.popLastFollowUp();
+		agent.replaceQueues([steering], [followUp]);
+		agent.reset();
+		agent.replaceQueues([steering], [followUp]);
+		agent.clearAllQueues();
+		agent.clearAllQueues();
+		unsubscribe();
+		agent.steer(steering);
+
+		expect(snapshots).toEqual([
+			[1, 0],
+			[1, 1],
+			[0, 1],
+			[0, 0],
+			[1, 1],
+			[0, 1],
+			[0, 0],
+			[1, 1],
+			[0, 0],
+			[1, 1],
+			[0, 0],
+		]);
+	});
+
+	it("notifies queue subscribers when queued steering is consumed", async () => {
+		const mock = createMockModel({ responses: [{ content: ["done"] }] });
+		const agent = new Agent({ streamFn: mock.stream });
+		agent.replaceMessages([createAssistantMessage([{ type: "text", text: "ready" }])]);
+		agent.steer({ role: "user", content: "consume me", timestamp: Date.now() });
+		const snapshots: Array<[number, number]> = [];
+		const unsubscribe = agent.subscribeQueueChanges(() => {
+			snapshots.push([agent.peekSteeringQueue().length, agent.peekFollowUpQueue().length]);
+		});
+
+		await agent.continue();
+		unsubscribe();
+
+		expect(snapshots).toEqual([[0, 0]]);
+	});
+
 	it("classifies agent-authored steering as a parent steering message", async () => {
 		const toolSchema = type({ value: type("string") });
 		const executed: string[] = [];
