@@ -673,6 +673,7 @@ export async function runRpcMode(
 	process.env.PI_NOTIFICATIONS = "off";
 
 	const frameEncoder = new RpcFrameEncoder();
+	let closureRejectionSupported = false;
 	// Ordered stdout writer honoring backpressure: chunked v2 frames are produced
 	// lazily by the encoder and written one physical line at a time, so a near-limit
 	// logical frame never materializes its full base64 transport in memory.
@@ -949,8 +950,14 @@ export async function runRpcMode(
 		uiContext: rpcUiContext,
 	});
 
-	// Output all agent events as JSON
+	// Forward closure failures only after the client opts in. Older v1/v2
+	// clients otherwise treat every agent_end as success, so withhold it and
+	// leave their completion wait fail-closed instead.
 	session.subscribe(event => {
+		if (event.type === "agent_end" && event.closureRejected && !closureRejectionSupported) {
+			output({ type: "rpc_frame_error", error: "Completion rejected; upgrade the RPC client" });
+			return;
+		}
 		output(event);
 	});
 
@@ -980,7 +987,11 @@ export async function runRpcMode(
 			case "negotiate_protocol": {
 				if (command.protocolVersion !== 2)
 					return error(id, "negotiate_protocol", `Unsupported RPC protocol version: ${command.protocolVersion}`);
-				return success(id, "negotiate_protocol", { protocolVersion: 2 });
+				closureRejectionSupported = command.closureRejection === true;
+				return success(id, "negotiate_protocol", {
+					protocolVersion: 2,
+					...(closureRejectionSupported ? { closureRejection: true } : {}),
+				});
 			}
 
 			// =================================================================

@@ -351,6 +351,15 @@ class RpcProtocolError(RpcError):
         super().__init__(" ".join(fragments))
 
 
+def _closure_rejected_error(event: AgentEndEvent) -> RpcError | None:
+    closure_rejected = event.closure_rejected
+    if closure_rejected is None:
+        return None
+    return RpcError(
+        f"Completion rejected: {len(closure_rejected.todos)} incomplete todo item(s) remain."
+    )
+
+
 @dataclass(slots=True, frozen=True)
 class ListenerErrorEvent:
     listener_kind: str
@@ -655,7 +664,11 @@ class RpcClient:
         ):
             try:
                 self._protocol_v2_enabled = True
-                negotiation = self._request("negotiate_protocol", protocolVersion=2)
+                negotiation = self._request(
+                    "negotiate_protocol",
+                    protocolVersion=2,
+                    closureRejection=True,
+                )
                 if negotiation.get("protocolVersion") != 2:
                     raise RpcError("RPC protocol v2 negotiation failed")
                 self._protocol_version = 2
@@ -1141,13 +1154,14 @@ class RpcClient:
         images: Sequence[ImageContent] | None = None,
         streaming_behavior: StreamingBehavior | None = None,
     ) -> None:
+        start_async_error_index = self._current_async_error_index()
         self._request(
             "prompt",
             message=message,
             images=list(images) if images is not None else None,
             streamingBehavior=streaming_behavior,
         )
-        self._mark_agent_run_scheduled()
+        self._mark_agent_run_scheduled(start_async_error_index)
 
     def steer(
         self, message: str, *, images: Sequence[ImageContent] | None = None
@@ -1173,12 +1187,13 @@ class RpcClient:
     def abort_and_prompt(
         self, message: str, *, images: Sequence[ImageContent] | None = None
     ) -> None:
+        start_async_error_index = self._current_async_error_index()
         self._request(
             "abort_and_prompt",
             message=message,
             images=list(images) if images is not None else None,
         )
-        self._mark_agent_run_scheduled()
+        self._mark_agent_run_scheduled(start_async_error_index)
 
     def prompt_and_wait(
         self,
@@ -1239,10 +1254,10 @@ class RpcClient:
         with self._event_condition:
             return self._async_errors.current_index()
 
-    def _mark_agent_run_scheduled(self) -> None:
+    def _mark_agent_run_scheduled(self, async_error_index: int) -> None:
         with self._event_condition:
             self._scheduled_agent_runs += 1
-            self._last_schedule_async_error_index = self._async_errors.current_index()
+            self._last_schedule_async_error_index = async_error_index
 
     def _mark_agent_run_completed(self) -> None:
         with self._event_condition:
@@ -1354,7 +1369,10 @@ class RpcClient:
                 event_payloads = self._events.snapshot_from(start_index)
                 if any(
                     payload.get("type") == "agent_end"
-                    and payload.get("isTerminal") is not False
+                    and (
+                        payload.get("closureRejected") is not None
+                        or payload.get("isTerminal") is not False
+                    )
                     for payload in event_payloads
                 ):
                     events = tuple(
@@ -1909,9 +1927,9 @@ class RpcClient:
                     notification = UnknownNotification(
                         _clone_json_object(payload), parse_error=str(exc)
                     )
-                    if (
-                        payload_type == "agent_end"
-                        and payload.get("isTerminal") is not False
+                    if payload_type == "agent_end" and (
+                        payload.get("closureRejected") is not None
+                        or payload.get("isTerminal") is not False
                     ):
                         self._append_async_error(
                             RpcError(f"Failed to parse terminal agent_end: {exc}")
@@ -1966,11 +1984,12 @@ class RpcClient:
 
                 event = cast(RpcAgentEvent, notification)
                 self._append_event(payload)
-                if (
-                    isinstance(event, AgentEndEvent)
-                    and event.is_terminal is not False
-                ):
-                    self._mark_agent_run_completed()
+                if isinstance(event, AgentEndEvent):
+                    closure_error = _closure_rejected_error(event)
+                    if closure_error is not None:
+                        self._append_async_error(closure_error)
+                    if closure_error is not None or event.is_terminal is not False:
+                        self._mark_agent_run_completed()
                 self._dispatch_listeners(
                     "event", event.type, self._event_listeners, event
                 )

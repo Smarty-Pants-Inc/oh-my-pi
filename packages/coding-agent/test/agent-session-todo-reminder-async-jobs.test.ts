@@ -6,6 +6,7 @@ import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import type { AgentClosureRejection } from "@oh-my-pi/pi-coding-agent/extensibility/shared-events";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TodoTool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
@@ -30,6 +31,7 @@ describe("AgentSession todo reminder async-job deferral", () => {
 	let gates: Array<PromiseWithResolvers<string>>;
 	let reminderAttempts: number[];
 	let agentEndTerminalStates: Array<boolean | undefined>;
+	let closureRejections: AgentClosureRejection[];
 
 	function textOnlyAssistantMessage(): AssistantMessage {
 		return {
@@ -57,11 +59,39 @@ describe("AgentSession todo reminder async-job deferral", () => {
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [msg] });
 	}
 
+	function emitSuccessfulYieldStop(): void {
+		const yieldCall = {
+			type: "toolCall" as const,
+			id: "call-async-todo-yield",
+			name: "yield",
+			arguments: { data: { ok: true } },
+		};
+		const msg: AssistantMessage = {
+			...textOnlyAssistantMessage(),
+			content: [yieldCall],
+			stopReason: "toolUse",
+		};
+		session.agent.emitExternalEvent({ type: "message_end", message: msg });
+		session.agent.emitExternalEvent({
+			type: "tool_execution_end",
+			toolCallId: yieldCall.id,
+			toolName: "yield",
+			isError: false,
+			result: {
+				content: [{ type: "text", text: "Result submitted." }],
+				details: { status: "success", data: { ok: true } },
+			},
+		});
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [msg] });
+	}
 	/** Register a job that stays running until the returned resolver fires. */
-	function registerGatedJob(ownerId: string): { resolve: () => void } {
+	function registerGatedJob(ownerId: string, originTurnId?: string): { resolve: () => void } {
 		const gate = Promise.withResolvers<string>();
 		gates.push(gate);
-		manager.register("bash", `gated job owned by ${ownerId}`, async () => await gate.promise, { ownerId });
+		manager.register("bash", `gated job owned by ${ownerId}`, async () => await gate.promise, {
+			ownerId,
+			originTurnId,
+		});
 		return { resolve: () => gate.resolve("done") };
 	}
 
@@ -132,12 +162,14 @@ describe("AgentSession todo reminder async-job deferral", () => {
 
 		reminderAttempts = [];
 		agentEndTerminalStates = [];
+		closureRejections = [];
 		session.subscribe((event: AgentSessionEvent) => {
 			if (event.type === "todo_reminder") reminderAttempts.push(event.attempt);
 			if (event.type === "agent_end") {
 				agentEndTerminalStates.push(
 					(event as Extract<AgentSessionEvent, { type: "agent_end" }> & { isTerminal?: boolean }).isTerminal,
 				);
+				if (event.closureRejected) closureRejections.push(event.closureRejected);
 			}
 		});
 	});
@@ -164,9 +196,39 @@ describe("AgentSession todo reminder async-job deferral", () => {
 
 		expect(reminderAttempts).toEqual([1]);
 		expect(continueSpy).not.toHaveBeenCalled();
-		expect(agentEndTerminalStates).toEqual([false]);
+		expect(agentEndTerminalStates).toEqual([true]);
 	});
 
+	it("keeps a successful yield nonterminal while an owned origin job can still wake it", async () => {
+		setIncompleteTodos();
+		const started = Promise.withResolvers<void>();
+		const releasePrompt = Promise.withResolvers<void>();
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+		vi.spyOn(session.agent, "prompt").mockImplementation(async () => {
+			session.agent.state.isStreaming = true;
+			started.resolve();
+			await releasePrompt.promise;
+			session.agent.state.isStreaming = false;
+		});
+
+		const prompt = session.prompt("Complete the delegated work.");
+		await started.promise;
+		const originTurnId = session.getCurrentTurnId();
+		if (!originTurnId) throw new Error("Expected an active turn before registering the owned job");
+		const job = registerGatedJob("Main", originTurnId);
+
+		emitSuccessfulYieldStop();
+		releasePrompt.resolve();
+		await prompt;
+
+		expect(reminderAttempts).toEqual([]);
+		expect(agentEndTerminalStates).toEqual([false]);
+		expect(closureRejections).toEqual([]);
+		expect(continueSpy).not.toHaveBeenCalled();
+		job.resolve();
+		await manager.waitForAll();
+		await manager.drainDeliveries();
+	});
 	it("notifies when a different agent's job cannot wake this session", async () => {
 		setIncompleteTodos();
 		vi.spyOn(session.agent, "continue").mockResolvedValue();

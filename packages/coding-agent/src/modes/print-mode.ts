@@ -7,7 +7,9 @@
  */
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
-import { logger, sanitizeText } from "@oh-my-pi/pi-utils";
+import { logger, postmortem, sanitizeText } from "@oh-my-pi/pi-utils";
+import type { AgentClosureRejection } from "../extensibility/shared-events";
+
 import { type AgentSession, type AgentSessionEvent, SHUTDOWN_CONSOLIDATE_BUDGET_MS } from "../session/agent-session";
 import { isSilentAbort } from "../session/messages";
 import { flushTelemetryExport } from "../telemetry-export";
@@ -171,9 +173,14 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 	let primaryError: unknown;
 	let headlessAdvisorDrainPrepared = false;
 	let hardExitStarted = false;
+	let closureRejected: AgentClosureRejection | undefined;
+
 	try {
 		// Always subscribe to enable session persistence via _handleAgentEvent
 		session.subscribe(event => {
+			if (event.type === "agent_end" && event.isTerminal !== false && event.closureRejected) {
+				closureRejected = event.closureRejected;
+			}
 			// In JSON mode, output all events
 			if (mode === "json") {
 				writeStdoutLine(`${JSON.stringify(printableEvent(event))}\n`);
@@ -191,6 +198,8 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 		if (initialMessage !== undefined) {
 			writeTextWorkingIndicator();
 			if (mode === "text") session.setTextOutputCommitted(false);
+			closureRejected = undefined;
+
 			await logger.time("print:prompt:initial", () => session.prompt(initialMessage, { images: initialImages }));
 			await drainExtensionAgentTasks();
 		}
@@ -199,6 +208,7 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 		for (const message of messages) {
 			writeTextWorkingIndicator();
 			if (mode === "text") session.setTextOutputCommitted(false);
+			closureRejected = undefined;
 			await logger.time("print:prompt:next", () => session.prompt(message));
 			await drainExtensionAgentTasks();
 		}
@@ -216,31 +226,37 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 			// assistant message (and its error) from a last-element read.
 			const assistantMsg = session.getLastAssistantMessage();
 
-			if (assistantMsg) {
-				// Check for error/aborted — skip silent-abort (plan-mode compaction transition)
-				if (
-					(assistantMsg.stopReason === "error" || assistantMsg.stopReason === "aborted") &&
-					!isSilentAbort(assistantMsg)
-				) {
-					const errorLine = sanitizeText(assistantMsg.errorMessage || `Request ${assistantMsg.stopReason}`);
-					// This branch hard-exits, bypassing the `await session.dispose()` at
-					// the end of runPrintMode. Flush telemetry and dispose the session
-					// HERE so error spans reach the exporter (the postmortem `exit`
-					// handler can't await) and the browser reaper installed in
-					// `dispose()` (releaseTabsForOwner) actually runs — otherwise an
-					// OMP-owned Chromium survives this exit (issue #5643). `dispose()`
-					// is idempotent, so the unreachable call below is a harmless no-op.
-					await session.waitForAdvisorCatchup(PRINT_MODE_ERROR_ADVISOR_DRAIN_TIMEOUT_MS);
-					await flushTelemetryExport();
-					await session.dispose({ mnemopiConsolidateTimeoutMs: SHUTDOWN_CONSOLIDATE_BUDGET_MS });
-					const flushed = process.stderr.write(`${errorLine}\n`);
-					if (!flushed) {
-						await new Promise<void>(resolve => process.stderr.once("drain", resolve));
-					}
-					hardExitStarted = true;
-					process.exit(1);
+			const closureRejectedError = closureRejected
+				? `Completion rejected: ${closureRejected.todos.length} incomplete todo item(s) remain.`
+				: undefined;
+			const assistantError =
+				assistantMsg &&
+				(assistantMsg.stopReason === "error" || assistantMsg.stopReason === "aborted") &&
+				!isSilentAbort(assistantMsg)
+					? sanitizeText(assistantMsg.errorMessage || `Request ${assistantMsg.stopReason}`)
+					: undefined;
+			const errorLine = closureRejectedError ?? assistantError;
+			if (errorLine) {
+				// This branch hard-exits, bypassing the `await session.dispose()` at
+				// the end of runPrintMode. Flush telemetry and dispose the session
+				// HERE so error spans reach the exporter (the postmortem `exit`
+				// handler can't await) and the browser reaper installed in
+				// `dispose()` (releaseTabsForOwner) actually runs — otherwise an
+				// OMP-owned Chromium survives this exit (issue #5643). `dispose()`
+				// is idempotent, so the unreachable call below is a harmless no-op.
+				await session.waitForAdvisorCatchup(PRINT_MODE_ERROR_ADVISOR_DRAIN_TIMEOUT_MS);
+				await flushTelemetryExport();
+				await session.dispose({ mnemopiConsolidateTimeoutMs: SHUTDOWN_CONSOLIDATE_BUDGET_MS });
+				const flushed = process.stderr.write(`${errorLine}\n`);
+				if (!flushed) {
+					await new Promise<void>(resolve => process.stderr.once("drain", resolve));
 				}
+				hardExitStarted = true;
+				process.exit(1);
+				return;
+			}
 
+			if (assistantMsg) {
 				if (
 					assistantMsg.errorMessage &&
 					assistantMsg.stopReason !== "error" &&
@@ -293,4 +309,12 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 		primaryError ??= error;
 	}
 	if (primaryError !== undefined) throw primaryError;
+	// JSON consumers receive the authoritative terminal event above. Once that
+	// record has drained, a rejected closure must still make the one-shot
+	// process unsuccessful rather than looking like an accepted response.
+	if (mode === "json" && closureRejected) {
+		await flushTelemetryExport();
+		await postmortem.quit(1);
+		return;
+	}
 }

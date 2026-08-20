@@ -159,6 +159,7 @@ import type {
 	SendMessageOptions,
 } from "../extensibility/extensions/types";
 import type { HookCommandContext } from "../extensibility/hooks/types";
+import type { AgentClosureRejection } from "../extensibility/shared-events";
 import type { Skill, SkillWarning } from "../extensibility/skills";
 import { expandSlashCommand, type FileSlashCommand } from "../extensibility/slash-commands";
 import { normalizeToolEventInput, resolveToolEventInput } from "../extensibility/tool-event-input";
@@ -3662,13 +3663,16 @@ export class AgentSession {
 			// TTSR retry work runs concurrently and clears the live flag before
 			// maintenance can emit agent_end, so preserve the state at settle entry.
 			const ttsrAbortPendingAtAgentEnd = this.#ttsr.abortPending;
-			const emitAgentEndNotification = async (options?: { willContinue?: boolean }) => {
+			const emitAgentEndNotification = async (options?: {
+				willContinue?: boolean;
+				closureRejected?: AgentClosureRejection;
+			}) => {
 				this.#emitRunState("idle");
 				// Public agent_end is held out of the eager display pass and emitted
 				// here after maintenance routing, tagged isTerminal so subscribers can
 				// tell final settles from scheduled continuations.
 				await this.#emitSessionEvent(
-					{ ...event, isTerminal: !options?.willContinue },
+					{ ...event, isTerminal: !options?.willContinue, closureRejected: options?.closureRejected },
 					options?.willContinue === true ? undefined : { closeTurnId: settledTurnId },
 				);
 				void this.#emitAgentEndNotification([...activeMessages], options).catch(err => {
@@ -3761,6 +3765,22 @@ export class AgentSession {
 			// empty/aborted assistant stop must NOT revive the agent loop. The
 			// `#yieldTerminationPending` sticky flag clears on the next `prompt()`.
 			if (successfulYieldMessage || this.#yieldTerminationPending) {
+				if (successfulYieldMessage) {
+					const completion = await this.#todo.checkCompletion();
+					if (completion === "deferred") {
+						this.#lastSuccessfulYieldToolCallId = undefined;
+						maintenanceRoute("successful-yield-async-deferred");
+						await emitAgentEndNotification({ willContinue: true });
+						return;
+					}
+					if (completion) {
+						this.#lastSuccessfulYieldToolCallId = undefined;
+						maintenanceRoute("successful-yield-closure-rejected");
+						await emitAgentEndNotification({ closureRejected: completion });
+						return;
+					}
+				}
+
 				this.#lastSuccessfulYieldToolCallId = undefined;
 				if (successfulYieldMessage && activeGoal) {
 					maintenanceRoute(
@@ -3948,9 +3968,15 @@ export class AgentSession {
 					await emitAgentEndNotification({ willContinue: true });
 					return;
 				}
-				const todoContinuationScheduled = await this.#todo.checkCompletion(msg);
-				if (todoContinuationScheduled) {
+				const completion = await this.#todo.checkCompletion();
+				if (completion === "deferred") {
+					maintenanceRoute("todo-closure-deferred");
 					await emitAgentEndNotification({ willContinue: true });
+					return;
+				}
+				if (completion) {
+					maintenanceRoute("todo-closure-rejected");
+					await emitAgentEndNotification({ closureRejected: completion });
 					return;
 				}
 			}
@@ -4633,11 +4659,15 @@ export class AgentSession {
 		return undefined;
 	}
 
-	async #emitAgentEndNotification(messages: AgentMessage[], options?: { willContinue?: boolean }): Promise<void> {
+	async #emitAgentEndNotification(
+		messages: AgentMessage[],
+		options?: { willContinue?: boolean; closureRejected?: AgentClosureRejection },
+	): Promise<void> {
 		await this.#extensionRunner?.emit({
 			type: "agent_end",
 			messages,
 			willContinue: options?.willContinue,
+			closureRejected: options?.closureRejected,
 		});
 	}
 

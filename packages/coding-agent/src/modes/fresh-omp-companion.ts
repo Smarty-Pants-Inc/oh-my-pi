@@ -1111,7 +1111,9 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 			guarded(ctx, () => {
 				state.agentActive = false;
 				state.continuationActive = event.willContinue === true;
-				if (!event.willContinue) state.lastSettledFailed = hasSettledFailure(event.messages);
+				if (!event.willContinue) {
+					state.lastSettledFailed = event.closureRejected !== undefined || hasSettledFailure(event.messages);
+				}
 				scheduleChangedSnapshot(ctx);
 			}),
 		);

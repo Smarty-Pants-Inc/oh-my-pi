@@ -42,6 +42,7 @@ if (Bun.env.MOCK_RPC_EXIT_BEFORE_READY) {
 }
 
 let protocolV2Enabled = false;
+let closureRejectionSupported = false;
 process.stdout.write(
 	`${JSON.stringify(
 		supportsProtocolV2
@@ -95,12 +96,16 @@ for await (const raw of console) {
 			if (Bun.env.MOCK_RPC_IGNORE_COMMANDS === "1") continue;
 			const id = typeof frame.id === "string" ? frame.id : undefined;
 			if (frame.type === "negotiate_protocol" && frame.protocolVersion === 2) {
+				closureRejectionSupported = frame.closureRejection === true;
 				writeFrame({
 					id,
 					type: "response",
 					command: frame.type,
 					success: true,
-					data: { protocolVersion: 2 },
+					data: {
+						protocolVersion: 2,
+						...(closureRejectionSupported ? { closureRejection: true } : {}),
+					},
 				});
 				protocolV2Enabled = true;
 				continue;
@@ -179,6 +184,34 @@ for await (const raw of console) {
 					success: true,
 					data,
 				});
+				continue;
+			}
+
+			if (frame.type === "prompt" && Bun.env.MOCK_RPC_CLOSURE_REJECTED === "1") {
+				if (closureRejectionSupported) {
+					writeFrame({
+						type: "agent_end",
+						messages: [],
+						closureRejected: {
+							reason: "stale_todos",
+							todos: [{ content: "Finish RPC task", status: "pending" }],
+						},
+					});
+				} else {
+					writeFrame({ type: "rpc_frame_error", error: "Completion rejected; upgrade the RPC client" });
+				}
+			}
+			if (frame.type === "prompt" && Bun.env.MOCK_RPC_NON_TERMINAL_AGENT_END === "1") {
+				writeFrame({ type: "agent_end", messages: [], isTerminal: false });
+				writeFrame({
+					id,
+					type: "response",
+					command: frame.type,
+					success: true,
+					data: {},
+				});
+				await Bun.sleep(50);
+				writeFrame({ type: "agent_end", messages: [], isTerminal: true });
 				continue;
 			}
 

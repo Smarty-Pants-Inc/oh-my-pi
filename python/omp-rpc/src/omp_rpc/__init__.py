@@ -34,6 +34,7 @@ from .host_uris import (
     host_uri,
 )
 from .protocol import (
+    AgentClosureRejection,
     AgentEndEvent,
     AgentMessage,
     AssistantMessage,
@@ -102,6 +103,7 @@ from .protocol import (
 
 __all__ = [
     "AgentEventListener",
+    "AgentClosureRejection",
     "AgentEndEvent",
     "AgentMessage",
     "AssistantMessage",

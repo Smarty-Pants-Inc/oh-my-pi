@@ -27,7 +27,7 @@ import type { RpcMessagesPage } from "./rpc-messages";
 
 export type RpcCommand =
 	// Protocol
-	| { id?: string; type: "negotiate_protocol"; protocolVersion: number }
+	| { id?: string; type: "negotiate_protocol"; protocolVersion: number; closureRejection?: true }
 
 	// Prompting
 	| { id?: string; type: "prompt"; message: string; images?: ImageContent[]; streamingBehavior?: "steer" | "followUp" }
@@ -200,7 +200,7 @@ export type RpcResponse =
 			type: "response";
 			command: "negotiate_protocol";
 			success: true;
-			data: { protocolVersion: 2 };
+			data: { protocolVersion: 2; closureRejection?: true };
 	  }
 
 	// Prompting (async - events follow)

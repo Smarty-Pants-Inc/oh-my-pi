@@ -4,6 +4,7 @@ import type { AssistantMessage, TextContent } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { AgentClosureRejection } from "@oh-my-pi/pi-coding-agent/extensibility/shared-events";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TodoTool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
@@ -25,6 +26,7 @@ describe("AgentSession stop-time todo notifications", () => {
 	let sessionManager: SessionManager;
 	let reminderAttempts: number[];
 	let agentEndTerminalStates: Array<boolean | undefined>;
+	let closureRejections: AgentClosureRejection[];
 
 	function textOnlyAssistantMessage(text = "paused at your instruction"): AssistantMessage {
 		return {
@@ -49,6 +51,45 @@ describe("AgentSession stop-time todo notifications", () => {
 	function emitTextOnlyStop(text?: string): void {
 		const msg = textOnlyAssistantMessage(text);
 		session.agent.emitExternalEvent({ type: "message_end", message: msg });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [msg] });
+	}
+
+	function emitSuccessfulYieldStop(): void {
+		const now = Date.now();
+		const yieldCall = {
+			type: "toolCall" as const,
+			id: "call-stale-todo-yield",
+			name: "yield",
+			arguments: { data: { ok: true } },
+		};
+		const msg: AssistantMessage = {
+			role: "assistant",
+			content: [yieldCall],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			stopReason: "toolUse",
+			usage: {
+				input: 100,
+				output: 20,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 120,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: now,
+		};
+		session.agent.emitExternalEvent({ type: "message_end", message: msg });
+		session.agent.emitExternalEvent({
+			type: "tool_execution_end",
+			toolCallId: yieldCall.id,
+			toolName: "yield",
+			isError: false,
+			result: {
+				content: [{ type: "text", text: "Result submitted." }],
+				details: { status: "success", data: { ok: true } },
+			},
+		});
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [msg] });
 	}
 
@@ -104,10 +145,14 @@ describe("AgentSession stop-time todo notifications", () => {
 		});
 
 		agentEndTerminalStates = [];
+		closureRejections = [];
 		reminderAttempts = [];
 		session.subscribe((event: AgentSessionEvent) => {
 			if (event.type === "todo_reminder") reminderAttempts.push(event.attempt);
-			if (event.type === "agent_end") agentEndTerminalStates.push(event.isTerminal);
+			if (event.type === "agent_end") {
+				agentEndTerminalStates.push(event.isTerminal);
+				if (event.closureRejected) closureRejections.push(event.closureRejected);
+			}
 		});
 
 		session.setTodoPhases([
@@ -135,9 +180,38 @@ describe("AgentSession stop-time todo notifications", () => {
 		await session.waitForIdle();
 
 		expect(reminderAttempts).toEqual([1]);
-		expect(agentEndTerminalStates).toEqual([false]);
+		expect(agentEndTerminalStates).toEqual([true]);
+		expect(closureRejections).toEqual([
+			{
+				reason: "stale_todos",
+				todos: [
+					{ content: "Slice 81", status: "pending" },
+					{ content: "Slice 82", status: "pending" },
+				],
+			},
+		]);
 		expect(session.toolChoiceQueue.nextToolChoice()).toBeUndefined();
 		expect(todoReminderTranscriptEntry()).toBeUndefined();
+		expect(continueSpy).not.toHaveBeenCalled();
+	});
+
+	it("rejects a successful terminal yield while actionable todos remain", async () => {
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+		emitSuccessfulYieldStop();
+		await session.waitForIdle();
+
+		expect(reminderAttempts).toEqual([1]);
+		expect(agentEndTerminalStates).toEqual([true]);
+		expect(closureRejections).toEqual([
+			{
+				reason: "stale_todos",
+				todos: [
+					{ content: "Slice 81", status: "pending" },
+					{ content: "Slice 82", status: "pending" },
+				],
+			},
+		]);
+		expect(session.toolChoiceQueue.nextToolChoice()).toBeUndefined();
 		expect(continueSpy).not.toHaveBeenCalled();
 	});
 
@@ -153,7 +227,7 @@ describe("AgentSession stop-time todo notifications", () => {
 		await session.waitForIdle();
 
 		expect(reminderAttempts).toEqual([1, 1]);
-		expect(agentEndTerminalStates).toEqual([false, false]);
+		expect(agentEndTerminalStates).toEqual([true, true]);
 		expect(continueSpy).not.toHaveBeenCalled();
 	});
 
@@ -164,7 +238,7 @@ describe("AgentSession stop-time todo notifications", () => {
 		await session.waitForIdle();
 
 		expect(reminderAttempts).toEqual([1]);
-		expect(agentEndTerminalStates).toEqual([false]);
+		expect(agentEndTerminalStates).toEqual([true]);
 		expect(todoReminderTranscriptEntry()).toBeUndefined();
 		expect(continueSpy).not.toHaveBeenCalled();
 	});
@@ -213,7 +287,7 @@ describe("AgentSession stop-time todo notifications", () => {
 		await session.waitForIdle();
 
 		expect(reminderAttempts).toEqual([1]);
-		expect(agentEndTerminalStates).toEqual([false]);
+		expect(agentEndTerminalStates).toEqual([true]);
 		expect(todoReminderTranscriptEntry()).toBeUndefined();
 		expect(continueSpy).not.toHaveBeenCalled();
 	});
@@ -262,7 +336,7 @@ describe("AgentSession stop-time todo notifications", () => {
 		await session.waitForIdle();
 
 		expect(reminderAttempts).toEqual([1]);
-		expect(agentEndTerminalStates).toEqual([false, false]);
+		expect(agentEndTerminalStates).toEqual([true, true]);
 		expect(continueSpy).not.toHaveBeenCalled();
 	});
 });

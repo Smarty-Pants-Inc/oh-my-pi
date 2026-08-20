@@ -240,6 +240,10 @@ delivery will resume the session before its true final settle. Subscribers that
 use `agent_end` as a completion signal MUST wait for `isTerminal !== false`.
 Treat an absent field as terminal for compatibility with older runtimes.
 
+A terminal `agent_end` may also contain `closureRejected?: { reason: "stale_todos"; todos: TodoItem[] }`.
+It means actionable todos prevented successful closure. No continuation was scheduled, but consumers
+MUST treat this otherwise-terminal event as an unsuccessful completion.
+
 ## Prompt lifecycle
 
 `session.prompt(text, options?)` is the primary entry point.

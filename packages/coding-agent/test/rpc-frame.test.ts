@@ -246,18 +246,23 @@ describe("RPC frame encoding", () => {
 		expect(decoded).toEqual(frame);
 	});
 
-	it("preserves terminal message counts above the protocol v2 ceiling", () => {
+	it("preserves terminal closure rejection markers above the protocol v2 ceiling", () => {
 		const encoder = new RpcFrameEncoder();
 		encoder.setProtocolVersion(2);
 		const encoded = encoder.encode({
 			type: "agent_end",
 			messages: [{ role: "assistant", content: "😀".repeat(Math.ceil(MAX_RPC_REASSEMBLED_BYTES / 4)) }],
+			closureRejected: {
+				reason: "stale_todos",
+				todos: [{ content: "Finish RPC task", status: "pending" }],
+			},
 		});
 
 		expect(decode(encoded)).toEqual({
 			type: "agent_end",
 			messages: [],
 			messageCount: 1,
+			closureRejected: { reason: "stale_todos", todos: [] },
 		});
 	});
 

@@ -83,7 +83,7 @@ export function createWarpEventEmitter(options: WarpEventEmitterOptions): WarpEv
 type LastAssistantStop = {
 	response: string;
 	event: "stop" | "stop_failure";
-	error_type?: "error" | "aborted";
+	error_type?: "error" | "aborted" | "closure_rejected";
 };
 
 function lastAssistantStop(messages: readonly AgentMessage[]): LastAssistantStop {
@@ -220,7 +220,13 @@ export function createWarpEventBridgeExtension(): ExtensionFactory {
 			if (event.willContinue) {
 				return;
 			}
-			const stop = lastAssistantStop(event.messages);
+			const stop = event.closureRejected
+				? {
+						response: `Completion rejected: ${event.closureRejected.todos.length} incomplete todo item(s) remain.`,
+						event: "stop_failure" as const,
+						error_type: "closure_rejected" as const,
+					}
+				: lastAssistantStop(event.messages);
 			emitter?.emit({
 				event: stop.event,
 				query: activePrompt,

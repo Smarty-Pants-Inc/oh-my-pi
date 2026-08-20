@@ -221,6 +221,9 @@ allows:
   waiting request when they can be matched unambiguously
 - late `prompt` / `abort_and_prompt` scheduling failures cause
   `prompt_and_wait()` and `wait_for_idle()` to raise instead of timing out
+- terminal `closureRejected` events are delivered to listeners, while
+  `prompt_and_wait()` and `wait_for_idle()` raise `RpcError` instead of
+  reporting a successful completion
 - unmatched background error responses are exposed through
   `client.protocol_errors` and `client.on_protocol_error(...)`
 - listener exceptions no longer kill the stdout reader thread; they are exposed

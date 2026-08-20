@@ -1656,6 +1656,18 @@ describe("Fresh OMP companion fault containment", () => {
 		advance(50);
 		expect(parseFrame(write.mock.calls.at(-1)?.[0] as string, SECRET).envelope.snapshot.state).toBe("error");
 
+		harness.invoke("agent_start");
+		advance(50);
+		harness.invoke("agent_end", {
+			messages: [],
+			closureRejected: {
+				reason: "stale_todos",
+				todos: [{ content: "Finish companion task", status: "pending" }],
+			},
+		});
+		advance(50);
+		expect(parseFrame(write.mock.calls.at(-1)?.[0] as string, SECRET).envelope.snapshot.state).toBe("error");
+
 		harness.idle = false;
 		harness.invoke("agent_end", { messages: [failed], willContinue: true });
 		harness.invoke("auto_retry_start", { attempt: 1, maxAttempts: 2, delayMs: 10, errorMessage: "retry" });

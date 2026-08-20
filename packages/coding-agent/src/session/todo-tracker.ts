@@ -1,8 +1,9 @@
 import type { Agent, AgentMessage, AgentTool } from "@oh-my-pi/pi-agent-core";
-import type { AssistantMessage, Model, ToolChoice } from "@oh-my-pi/pi-ai";
+import type { Model, ToolChoice } from "@oh-my-pi/pi-ai";
 import { isRecord, logger, prompt, stringProperty } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
 import { agentBehavior } from "../context/registry";
+import type { AgentClosureRejection } from "../extensibility/shared-events";
 import eagerTaskPrompt from "../prompts/system/eager-task.md" with { type: "text" };
 import eagerTodoPrompt from "../prompts/system/eager-todo.md" with { type: "text" };
 import passiveTodoSnapshotPrompt from "../prompts/todos/current.md" with { type: "text" };
@@ -85,6 +86,9 @@ export interface TodoTrackerHost {
 	planModeEnabled(): boolean;
 	consumeLastServedToolChoiceLabel(): string | undefined;
 }
+
+/** Result of a stop-time todo completion check; undefined means no todo gate applies. */
+export type TodoCompletionResult = AgentClosureRejection | "deferred" | undefined;
 
 /** Owns canonical todo state, eager preludes, and passive snapshots. */
 export class TodoTracker {
@@ -213,19 +217,21 @@ export class TodoTracker {
 		return nudges;
 	}
 
-	/** Emits one bounded stop-time notification and rejects stale todo closure. */
-	async checkCompletion(_message: AssistantMessage): Promise<boolean> {
-		if (this.#host.consumeLastServedToolChoiceLabel() === "user-force" || this.#host.planModeEnabled()) return false;
+	/** Emits one bounded stop-time notification and reports stale or deferred todo closure. */
+	async checkCompletion(): Promise<TodoCompletionResult> {
+		if (this.#host.consumeLastServedToolChoiceLabel() === "user-force" || this.#host.planModeEnabled())
+			return undefined;
 		if (!this.#host.settings.get("todo.reminders") || !this.#host.settings.get("todo.enabled")) {
 			this.#reminderCount = 0;
 			this.#stopReminderSent = false;
-			return false;
+			return undefined;
 		}
-		if (!this.#host.getActiveToolNames().includes("todo")) return false;
+		if (!this.#host.getActiveToolNames().includes("todo")) return undefined;
 		const todos = this.phases
 			.flatMap(phase => phase.tasks)
 			.filter(task => task.status === "pending" || task.status === "in_progress");
-		if (todos.length === 0 || this.#host.hasPendingAsyncWake()) return false;
+		if (todos.length === 0) return undefined;
+		if (this.#host.hasPendingAsyncWake()) return "deferred";
 		const maxAttempts = this.#host.settings.get("todo.remindersMax");
 		if (!this.#stopReminderSent && this.#reminderCount < maxAttempts) {
 			this.#reminderCount++;
@@ -237,7 +243,7 @@ export class TodoTracker {
 			});
 			this.#stopReminderSent = true;
 		}
-		return true;
+		return { reason: "stale_todos", todos };
 	}
 
 	/** Todo state never injects a mid-turn nudge. */

@@ -273,6 +273,23 @@ describe("EventController — notifications through the real turn-end path (#han
 		expect(spy).toHaveBeenCalledTimes(1);
 		expect(spy).toHaveBeenCalledWith(expect.objectContaining({ body: "Stopped with error", type: "error" }));
 	});
+
+	it("does not send a Complete toast when stale todos reject the terminal closure", async () => {
+		const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
+		settings.override("completion.notify", "on");
+		const controller = new EventController(makeTurnEndContext());
+		const event = {
+			...makeAgentEndEvent([makeAssistantMessage("stop")]),
+			closureRejected: {
+				reason: "stale_todos" as const,
+				todos: [{ content: "Finish the implementation", status: "pending" as const }],
+			},
+		} as Extract<AgentSessionEvent, { type: "agent_end" }>;
+
+		await controller.handleEvent(event);
+
+		expect(spy).not.toHaveBeenCalled();
+	});
 });
 
 describe("EventController — error toast gated while auto-retry is pending", () => {

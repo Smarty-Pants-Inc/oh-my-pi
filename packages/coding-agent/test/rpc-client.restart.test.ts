@@ -30,6 +30,86 @@ describe("RpcClient lifecycle (issue #4079 B)", () => {
 		]);
 	}, 20_000);
 
+	test("forwards rejected terminal closures to every subscriber and rejects completion helpers", async () => {
+		using client = new RpcClient({
+			cliPath: MOCK_AGENT,
+			env: { MOCK_RPC_V2: "1", MOCK_RPC_CLOSURE_REJECTED: "1" },
+		});
+		const firstSubscriber: unknown[] = [];
+		const secondSubscriber: unknown[] = [];
+		let unsubscribeFirst = () => {};
+		unsubscribeFirst = client.onSessionEvent(event => {
+			if (event.type !== "agent_end") return;
+			firstSubscriber.push(event);
+			unsubscribeFirst();
+		});
+
+		await client.start();
+		client.onSessionEvent(event => {
+			if (event.type === "agent_end") secondSubscriber.push(event);
+		});
+		await client.prompt("first prompt");
+		expect(firstSubscriber).toHaveLength(1);
+		expect(secondSubscriber).toHaveLength(1);
+
+		// The closure frame is emitted before the prompt response, so this exact
+		// documented sequence proves waitForIdle() consumes the terminal latch.
+		await expect(client.waitForIdle()).rejects.toThrow("Completion rejected: 1 incomplete todo item(s) remain.");
+		await expect(client.promptAndWait("second prompt")).rejects.toThrow(
+			"Completion rejected: 1 incomplete todo item(s) remain.",
+		);
+
+		expect(secondSubscriber).toHaveLength(2);
+		for (const event of [...firstSubscriber, ...secondSubscriber]) {
+			expect(event).toEqual(
+				expect.objectContaining({
+					type: "agent_end",
+					closureRejected: {
+						reason: "stale_todos",
+						todos: [{ content: "Finish RPC task", status: "pending" }],
+					},
+				}),
+			);
+		}
+	}, 20_000);
+
+	test("fails closed when closure capability was not negotiated", async () => {
+		using client = new RpcClient({
+			cliPath: MOCK_AGENT,
+			env: { MOCK_RPC_CLOSURE_REJECTED: "1" },
+		});
+
+		await client.start();
+		await client.prompt("legacy prompt");
+		await expect(client.waitForIdle(500)).rejects.toThrow("Timeout waiting for agent to become idle");
+	}, 20_000);
+	test("wait helpers ignore nonterminal agent_end frames", async () => {
+		using client = new RpcClient({
+			cliPath: MOCK_AGENT,
+			env: { MOCK_RPC_NON_TERMINAL_AGENT_END: "1" },
+		});
+		const terminalEvents: unknown[] = [];
+		client.onSessionEvent(event => {
+			if (event.type === "agent_end") terminalEvents.push(event);
+		});
+
+		await client.start();
+		const idle = client.waitForIdle();
+		await client.prompt("first prompt");
+		await idle;
+		expect(terminalEvents).toEqual([
+			expect.objectContaining({ type: "agent_end", isTerminal: false }),
+			expect.objectContaining({ type: "agent_end", isTerminal: true }),
+		]);
+
+		const events = client.collectEvents();
+		await client.prompt("second prompt");
+		expect(await events).toEqual([
+			expect.objectContaining({ type: "agent_end", isTerminal: false }),
+			expect.objectContaining({ type: "agent_end", isTerminal: true }),
+		]);
+	}, 20_000);
+
 	test("normalizes omitted state fields and a runtime-invalid tokensPerSecond", async () => {
 		using client = new RpcClient({
 			cliPath: MOCK_AGENT,

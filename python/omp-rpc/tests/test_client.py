@@ -405,8 +405,45 @@ FAKE_SERVER = textwrap.dedent(
         elif command_type in {"steer", "follow_up", "abort"}:
             respond(request_id, command_type, {})
         elif command_type in {"prompt", "abort_and_prompt"}:
-            respond(request_id, command_type, {})
             message = command["message"]
+            if message == "closure rejected":
+                print(
+                    json.dumps(
+                        {
+                            "type": "agent_end",
+                            "messages": [],
+                            "closureRejected": {
+                                "reason": "stale_todos",
+                                "todos": [
+                                    {
+                                        "content": "Finish Python RPC task",
+                                        "status": "pending",
+                                    }
+                                ],
+                            },
+                        }
+                    ),
+                    flush=True,
+                )
+                respond(request_id, command_type, {})
+                continue
+            if message == "nonterminal before response":
+                print(
+                    json.dumps(
+                        {"type": "agent_end", "messages": [], "isTerminal": False}
+                    ),
+                    flush=True,
+                )
+                respond(request_id, command_type, {})
+                time.sleep(0.05)
+                print(
+                    json.dumps(
+                        {"type": "agent_end", "messages": [], "isTerminal": True}
+                    ),
+                    flush=True,
+                )
+                continue
+            respond(request_id, command_type, {})
             if message == "needs ui":
                 print(json.dumps({"type": "extension_ui_request", "id": "ui-1", "method": "input", "title": "Need input", "placeholder": "value"}), flush=True)
                 continue
@@ -1267,6 +1304,60 @@ class RpcClientTests(unittest.TestCase):
         self.assertGreaterEqual(len(events), 1)
         self.assertEqual(events[-1].type, "agent_end")
 
+    def test_terminal_closure_rejection_reaches_listeners_and_fails_waiters(
+        self,
+    ) -> None:
+        first_subscriber: list[AgentEndEvent] = []
+        second_subscriber: list[AgentEndEvent] = []
+
+        with self.make_client() as client:
+            client.on_agent_end(first_subscriber.append)
+            client.on_agent_end(second_subscriber.append)
+
+            # The fixture emits agent_end before this response, matching the
+            # documented `prompt(); wait_for_idle()` race.
+            client.prompt("closure rejected")
+            with self.assertRaisesRegex(
+                RpcError, "Completion rejected: 1 incomplete todo item\\(s\\) remain"
+            ):
+                client.wait_for_idle(timeout=2.0)
+            with self.assertRaisesRegex(
+                RpcError, "Completion rejected: 1 incomplete todo item\\(s\\) remain"
+            ):
+                client.prompt_and_wait("closure rejected", timeout=2.0)
+
+        self.assertEqual(first_subscriber, second_subscriber)
+        self.assertEqual(len(first_subscriber), 2)
+        for event in first_subscriber:
+            closure_rejected = event.closure_rejected
+            self.assertIsNotNone(closure_rejected)
+            assert closure_rejected is not None
+            self.assertEqual(closure_rejected.reason, "stale_todos")
+            self.assertEqual(
+                tuple(todo.content for todo in closure_rejected.todos),
+                ("Finish Python RPC task",),
+            )
+
+    def test_wait_helpers_ignore_nonterminal_agent_end(self) -> None:
+        received: list[AgentEndEvent] = []
+
+        with self.make_client() as client:
+            client.on_agent_end(received.append)
+            client.prompt("nonterminal before response")
+            client.wait_for_idle(timeout=2.0)
+            self.assertEqual([event.is_terminal for event in received], [False, True])
+
+            turn = client.prompt_and_wait("nonterminal before response", timeout=2.0)
+
+        self.assertEqual(
+            [
+                event.is_terminal
+                for event in turn.events
+                if isinstance(event, AgentEndEvent)
+            ],
+            [False, True],
+        )
+
     def test_all_typed_event_listeners_receive_eventful_prompt(self) -> None:
         seen: list[str] = []
 
@@ -1353,9 +1444,7 @@ class RpcClientTests(unittest.TestCase):
             client.on_unknown_notification(
                 lambda event: unknown_errors.append(event.parse_error)
             )
-            with self.assertRaisesRegex(
-                RpcError, "Failed to parse terminal agent_end"
-            ):
+            with self.assertRaisesRegex(RpcError, "Failed to parse terminal agent_end"):
                 client.prompt_and_wait("malformed terminal", timeout=1.0)
 
         self.assertEqual(len(unknown_errors), 1)

@@ -170,6 +170,15 @@ function isAgentSessionEvent(value: unknown): value is AgentSessionEvent {
 	return sessionEventTypes.has(type as AgentSessionEvent["type"]);
 }
 
+function closureRejectedError(event: AgentSessionEvent): Error | undefined {
+	if (event.type !== "agent_end" || !event.closureRejected) return undefined;
+	return new Error(`Completion rejected: ${event.closureRejected.todos.length} incomplete todo item(s) remain.`);
+}
+
+function isTerminalAgentEnd(event: AgentSessionEvent): boolean {
+	return event.type === "agent_end" && (event.closureRejected !== undefined || event.isTerminal !== false);
+}
+
 function isRpcSubagentLifecycleFrame(value: unknown): value is RpcSubagentLifecycleFrame {
 	if (!isRecord(value)) return false;
 	return value.type === "subagent_lifecycle" && isRecord(value.payload);
@@ -259,6 +268,7 @@ export class RpcClient {
 	#pendingHostToolCalls = new Map<string, { controller: AbortController }>();
 	#requestId = 0;
 	#protocolVersion: RpcProtocolVersion = 1;
+	#terminalOutcome: Error | null | undefined;
 	#extensionUiListeners: Set<(req: RpcExtensionUIRequest) => void> = new Set();
 	#abortController = new AbortController();
 
@@ -284,6 +294,7 @@ export class RpcClient {
 		// short-circuit the new stdout reader (issue #4079).
 		this.#abortController = new AbortController();
 		this.#protocolVersion = 1;
+		this.#terminalOutcome = undefined;
 
 		const cliPath = this.options.cliPath ?? "dist/cli.js";
 		const args = ["--mode", "rpc"];
@@ -417,7 +428,11 @@ export class RpcClient {
 			await readyPromise;
 			if (protocolV2Supported) {
 				protocolV2Enabled = true;
-				const response = await this.#send({ type: "negotiate_protocol", protocolVersion: 2 });
+				const response = await this.#send({
+					type: "negotiate_protocol",
+					protocolVersion: 2,
+					closureRejection: true,
+				});
 				if (
 					!response.success ||
 					response.command !== "negotiate_protocol" ||
@@ -561,6 +576,7 @@ export class RpcClient {
 	 * Use waitForIdle() to wait for completion.
 	 */
 	async prompt(message: string, images?: ImageContent[]): Promise<void> {
+		this.#terminalOutcome = undefined;
 		await this.#send({ type: "prompt", message, images });
 	}
 
@@ -589,6 +605,7 @@ export class RpcClient {
 	 * Abort current operation and immediately start a new turn with the given message.
 	 */
 	async abortAndPrompt(message: string, images?: ImageContent[]): Promise<void> {
+		this.#terminalOutcome = undefined;
 		await this.#send({ type: "abort_and_prompt", message, images });
 	}
 
@@ -962,18 +979,23 @@ export class RpcClient {
 
 	/**
 	 * Wait for agent to become idle (no streaming).
-	 * Resolves when agent_end event is received.
+	 * Resolves when a terminal agent_end is received, or rejects when terminal closure failed.
 	 */
 	waitForIdle(timeout = 60000): Promise<void> {
+		const outcome = this.#takeTerminalOutcome();
+		if (outcome !== undefined) return outcome ? Promise.reject(outcome) : Promise.resolve();
+
 		const { promise, resolve, reject } = Promise.withResolvers<void>();
 		let settled = false;
-		const unsubscribe = this.onEvent(event => {
-			if (event.type === "agent_end") {
-				settled = true;
-				unsubscribe();
-				clearTimeout(timeoutId);
-				resolve();
-			}
+		const unsubscribe = this.onSessionEvent(event => {
+			if (!isTerminalAgentEnd(event)) return;
+			settled = true;
+			unsubscribe();
+			clearTimeout(timeoutId);
+			this.#takeTerminalOutcome();
+			const rejection = closureRejectedError(event);
+			if (rejection) reject(rejection);
+			else resolve();
 		});
 
 		const timeoutId = this.#startTimeout(timeout, () => {
@@ -987,19 +1009,22 @@ export class RpcClient {
 
 	/**
 	 * Collect events until agent becomes idle.
+	 * Rejects after forwarding a terminal closure rejection to session listeners.
 	 */
 	collectEvents(timeout = 60000): Promise<AgentEvent[]> {
 		const { promise, resolve, reject } = Promise.withResolvers<AgentEvent[]>();
 		const events: AgentEvent[] = [];
 		let settled = false;
-		const unsubscribe = this.onEvent(event => {
-			events.push(event);
-			if (event.type === "agent_end") {
-				settled = true;
-				unsubscribe();
-				clearTimeout(timeoutId);
-				resolve(events);
-			}
+		const unsubscribe = this.onSessionEvent(event => {
+			if (isAgentEvent(event)) events.push(event);
+			if (!isTerminalAgentEnd(event)) return;
+			settled = true;
+			unsubscribe();
+			clearTimeout(timeoutId);
+			this.#takeTerminalOutcome();
+			const rejection = closureRejectedError(event);
+			if (rejection) reject(rejection);
+			else resolve(events);
 		});
 
 		const timeoutId = this.#startTimeout(timeout, () => {
@@ -1016,13 +1041,19 @@ export class RpcClient {
 	 */
 	async promptAndWait(message: string, images?: ImageContent[], timeout = 60000): Promise<AgentEvent[]> {
 		const eventsPromise = this.collectEvents(timeout);
-		await this.prompt(message, images);
-		return eventsPromise;
+		const promptPromise = this.prompt(message, images);
+		const [events] = await Promise.all([eventsPromise, promptPromise]);
+		return events;
 	}
 
 	// =========================================================================
 	// Internal
 	// =========================================================================
+	#takeTerminalOutcome(): Error | null | undefined {
+		const outcome = this.#terminalOutcome;
+		this.#terminalOutcome = undefined;
+		return outcome;
+	}
 
 	#handleLine(data: unknown): void {
 		// Check if it's a response to a pending request
@@ -1082,8 +1113,9 @@ export class RpcClient {
 		}
 
 		if (!isAgentSessionEvent(data)) return;
+		if (isTerminalAgentEnd(data)) this.#terminalOutcome = closureRejectedError(data) ?? null;
 
-		for (const listener of this.#sessionEventListeners) {
+		for (const listener of [...this.#sessionEventListeners]) {
 			listener(data);
 		}
 
