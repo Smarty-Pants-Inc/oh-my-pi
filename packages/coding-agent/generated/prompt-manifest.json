@@ -25,7 +25,7 @@
       "visibility": "model",
       "defaultEnabled": false,
       "order": 810,
-      "sha256": "f5f9ef72a0931545509dabbabbbd450d67fd66bb61242dea6754521d7b7d5b52"
+      "sha256": "db91a45d791777182ba3b326002a49f7e72cf331ca1e9529613a00acc9c9e1d1"
     },
     {
       "id": "advisor.active-repo-watchdog",
@@ -1328,6 +1328,19 @@
       "defaultEnabled": false,
       "order": 490,
       "sha256": "4b9e4f20010345fbaccb3f0ef7f9325465b8e6777bf3a0918d156b247cc16207"
+    },
+    {
+      "id": "goal.advisor_mission",
+      "path": "packages/coding-agent/src/prompts/advisor/mission-context.md",
+      "role": "internal_context",
+      "target": [
+        "side_model"
+      ],
+      "trigger": "goal_updated",
+      "visibility": "model",
+      "defaultEnabled": false,
+      "order": 995,
+      "sha256": "225f29edcf50c8214800b475f2d047f92ca57c9b0e04c511fa07d95677d3c66f"
     },
     {
       "id": "goal.budget_limited",
@@ -4587,7 +4600,7 @@
     },
     {
       "path": "packages/agent/src/agent.ts",
-      "sha256": "570cd083d1c189a9d86714362f44c9f37df126b45455673dbfeb5e939a32589c"
+      "sha256": "65b81a173e1b350cb3bb8c137578221a3fb5d103ba4f1ca0e0109e540ab112fe"
     },
     {
       "path": "packages/agent/src/append-only-context.ts",
@@ -4983,7 +4996,7 @@
     },
     {
       "path": "packages/ai/src/providers/anthropic.ts",
-      "sha256": "eadef83a03f27fa6777f6618e1937b75bfebf828a01f95368cd1246f9d2f1ecb"
+      "sha256": "2858f127ebfa41e88bf99d7d113d2daec81d2f05dfc7e91fbfc56df823df8ab3"
     },
     {
       "path": "packages/ai/src/providers/aws-credentials.ts",
@@ -5011,7 +5024,7 @@
     },
     {
       "path": "packages/ai/src/providers/cowork-fetch.ts",
-      "sha256": "f41dcebb75a730abeb924315bcc405e43333297dadcb0c041f5da2345158fc8d"
+      "sha256": "e552b6021b3de80c22f9b95363197164fe11e946caf9f3afa9ae99dc32e86beb"
     },
     {
       "path": "packages/ai/src/providers/cursor-pi-args.ts",
@@ -5019,7 +5032,7 @@
     },
     {
       "path": "packages/ai/src/providers/cursor.ts",
-      "sha256": "e1466003bb075fb152f906649e7efaba720683bbdec2957f7cb2805baf326d31"
+      "sha256": "7c36b2a0367c182620a29e17d37b6f289ec4c347b99cce883c18f4f1bc238619"
     },
     {
       "path": "packages/ai/src/providers/cursor/exec-modern.ts",
@@ -5043,7 +5056,7 @@
     },
     {
       "path": "packages/ai/src/providers/gitlab-duo-workflow.ts",
-      "sha256": "2dc9ea8ae604d364c42ee353e49bbd7c740579679864303a59e24ce00624b94d"
+      "sha256": "a6b49dc843056f7ee4bdce5d75552a24e02eb590da639608f26acde55bf9b3c0"
     },
     {
       "path": "packages/ai/src/providers/gitlab-duo.ts",
@@ -5107,7 +5120,7 @@
     },
     {
       "path": "packages/ai/src/providers/openai-codex-responses.ts",
-      "sha256": "d1b125a4de8b56d030ed64dea9eea0d49f3dc21e4729a8f046e4d3bb810a009e"
+      "sha256": "61900f9c0b507b9cf821c9585f1516364ce97ba7e7671e80810cc4438cf72a7a"
     },
     {
       "path": "packages/ai/src/providers/openai-codex/request-transformer.ts",
@@ -5147,7 +5160,7 @@
     },
     {
       "path": "packages/ai/src/providers/pi-native-client.ts",
-      "sha256": "bfe10ae15a0f52b683d93f24a88760083a43b6315ce60d260bb713e3a6a21d54"
+      "sha256": "ee795220115ca42baa0afb38245b669dd89a985b8bb865d7043e4d44c1d15859"
     },
     {
       "path": "packages/ai/src/providers/pi-native-server.ts",
@@ -5591,11 +5604,11 @@
     },
     {
       "path": "packages/ai/src/stream.ts",
-      "sha256": "349200eb614ffbcffb612e54c9c9cf0d500762bd46972678a22f55398e226f9c"
+      "sha256": "2597caa105273d02fe712538acaf37f8084049a6c9f7f7e7b58c4fd2b43901ee"
     },
     {
       "path": "packages/ai/src/types.ts",
-      "sha256": "01ecba6db60d2071ddfbf87574d226ca61613886d9386714a8e31cea8084df26"
+      "sha256": "c4168d8c34283e44cab63cb6f46cfc6c1a1b1a3dfa4c1eeab770a1d29893c418"
     },
     {
       "path": "packages/ai/src/usage.ts",
@@ -6175,7 +6188,7 @@
     },
     {
       "path": "packages/coding-agent/src/advisor/runtime.ts",
-      "sha256": "86339d1ad233835c21fe0010b5a4709d3b261e6b0b283a891ad3dc4464990851"
+      "sha256": "1dfd38b9f6180c9e13b67ce9b537ffb4aae27ca515d2c90e2f909b185fac7eea"
     },
     {
       "path": "packages/coding-agent/src/advisor/watchdog.ts",
@@ -6827,7 +6840,7 @@
     },
     {
       "path": "packages/coding-agent/src/context/prompt-sources.generated.ts",
-      "sha256": "b65ebf69ab27f4fa5449ba0e4dea92b3e572b6d358217dc51bb79fadcedcf5e4"
+      "sha256": "96903252703c3d46ad62a3a5f347d85f38447f83132e0f2965e2aea1e0af0e2d"
     },
     {
       "path": "packages/coding-agent/src/context/registry.ts",
@@ -6847,7 +6860,7 @@
     },
     {
       "path": "packages/coding-agent/src/cursor.ts",
-      "sha256": "79fc5e8574bb8d641c019dfb48c16b84735e48a4bf9ee0cbbb40df63ca14baea"
+      "sha256": "447038028f0e68e653672ca64613afbd367868de909aa8d52b23d75434fcd962"
     },
     {
       "path": "packages/coding-agent/src/dap/client.ts",
@@ -7463,7 +7476,7 @@
     },
     {
       "path": "packages/coding-agent/src/goals/runtime.ts",
-      "sha256": "d5f0a02d79b0fe232f7631a06c810acfaa070c70f5cd1cb0b4b5fe1c19b81d42"
+      "sha256": "174f71badc7766d70a5ed36fbc44a72bc5f08cd5e76bc054c5c0ff1499cfb6d9"
     },
     {
       "path": "packages/coding-agent/src/goals/state.ts",
@@ -8187,7 +8200,7 @@
     },
     {
       "path": "packages/coding-agent/src/modes/interactive-mode.ts",
-      "sha256": "06bd25d04131e37a09600d6f165b19e5a31d1de82460a570d400a78ac2b036b0"
+      "sha256": "4eed500be4687e57c24d140ab23363442ec725a6711edf76ef77d758d4d99915"
     },
     {
       "path": "packages/coding-agent/src/modes/loop-limit.ts",
@@ -8311,7 +8324,7 @@
     },
     {
       "path": "packages/coding-agent/src/prompt-registry.yml",
-      "sha256": "a81a9cfd03064e1df91522b9b20cedd69ea7706e86102ed58f1ecf1071474454"
+      "sha256": "9d9e185ecfe23af6b29eb09dceb3105f3ea9bfa601168a5d32ade0df6ba254f9"
     },
     {
       "path": "packages/coding-agent/src/registry/agent-lifecycle.ts",
@@ -8327,15 +8340,15 @@
     },
     {
       "path": "packages/coding-agent/src/sdk.ts",
-      "sha256": "2fc2e93ec21f43eff2778840bafe3e2420b868d3618164352bf9f934a03a2e62"
+      "sha256": "dda2b4a577a97b24f11f7af21dcef6c608b6a18cfa180a736bd6cebd29aa9ef5"
     },
     {
       "path": "packages/coding-agent/src/secrets/index.ts",
-      "sha256": "874dabf0f9a076b468acf29eaed6fb140b012c8cd40f668feae45cef3de0e8fc"
+      "sha256": "238b716acc921a019c2542415d97e9fdd5f78e0bcab8b35b83f40ae1282762ee"
     },
     {
       "path": "packages/coding-agent/src/secrets/message-transform.ts",
-      "sha256": "ccb830688fcc356c0c836cb07e5c24df740417b97fc74839e5ba2eddbe88dc4c"
+      "sha256": "08077f8255aa42e9ad2a1551ef2fd6e149714d4cd51a141cbb1012a9f528c15f"
     },
     {
       "path": "packages/coding-agent/src/secrets/obfuscator.ts",
@@ -8431,7 +8444,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/agent-session.ts",
-      "sha256": "138079918526b977221b351ac5231ce04ff043bcd5a6022ad9a7e250e2f6f5d5"
+      "sha256": "6385058c1a6452f58c232f24eb90e2b9c7a88afbf196329f56d0af11e94445a2"
     },
     {
       "path": "packages/coding-agent/src/session/agent-storage.ts",
@@ -8559,7 +8572,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/session-advisors.ts",
-      "sha256": "2558c72c284fb3585f6afbbd77fc530299b1280789b0fee0c701fee76c55fa30"
+      "sha256": "38650d443b762012be95babd01f34e1a195208446bb81ded83725b4bd5d363bd"
     },
     {
       "path": "packages/coding-agent/src/session/session-context.ts",
@@ -8575,7 +8588,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/session-handoff.ts",
-      "sha256": "fad5b4697a662d36b8882705112f6a8ccc5f62dbb584daf280811d772a0c6a55"
+      "sha256": "34a535d3a795e3fdf4e2683dcc2e0894b2bec0041ef1a9678719e0a63d68ba46"
     },
     {
       "path": "packages/coding-agent/src/session/session-history-format.ts",
@@ -8583,7 +8596,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/session-lifecycle-owner.ts",
-      "sha256": "f42c8ec056f8712ba2d84a408fa42dff03698b6d740a823ea9c065bd2bef3273"
+      "sha256": "1dafc47647bd7196b215d326c5db7f234c71196778323a975c1892eb30e83beb"
     },
     {
       "path": "packages/coding-agent/src/session/session-lifecycle-transaction.ts",
@@ -10683,5 +10696,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "e52f21658913498a7fa7bba82b07e76af054d5406b450ea16585a438e37fc25e"
+  "rootSha256": "8d396fd0b4735aaa23f0c2631905c3e137308db2398d573db784e5b81266e9ec"
 }

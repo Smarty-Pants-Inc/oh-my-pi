@@ -6,6 +6,9 @@ import * as zlib from "node:zlib";
 import type { FetchImpl } from "../types";
 import { connectProxiedSocket } from "../utils/proxy";
 
+export const COWORK_PROVIDER_DISPATCH_GUARD = Symbol("providerDispatchGuard");
+export const BYPASS_PROVIDER_DISPATCH_GUARD = Symbol("bypassProviderDispatchGuard");
+
 type CoworkTlsOptions = {
 	ca?: string | string[];
 	cert?: string;
@@ -18,6 +21,8 @@ type CoworkTlsOptions = {
 type CoworkRequestInit = RequestInit & {
 	proxy?: string;
 	tls?: CoworkTlsOptions;
+	[COWORK_PROVIDER_DISPATCH_GUARD]?: () => void;
+	[BYPASS_PROVIDER_DISPATCH_GUARD]?: boolean;
 };
 
 type RequestBody = string | Uint8Array;
@@ -136,6 +141,12 @@ async function sendCoworkRequest(
 	const signal = init.signal ?? undefined;
 	const tlsOptions = resolveTlsOptions(url, init.tls);
 	const lease = await acquireAgent(url, init.proxy, tlsOptions, signal);
+	try {
+		init[COWORK_PROVIDER_DISPATCH_GUARD]?.();
+	} catch (error) {
+		lease.release?.();
+		throw error;
+	}
 	const headers = buildOrderedHeaders(url, sourceHeaders, body);
 	const result = Promise.withResolvers<Response>();
 	let request: ClientRequest | undefined;

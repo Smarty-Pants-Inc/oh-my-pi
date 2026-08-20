@@ -91,7 +91,12 @@ export interface SessionLifecycleOwnerHost {
 	>;
 	advisors: Pick<
 		SessionAdvisors,
-		"beginSessionTransitionDelivery" | "refreshProviderIdentity" | "resetSessionState" | "clearCost"
+		| "beginSessionTransitionDelivery"
+		| "commitSessionTransitionMissionChange"
+		| "rollbackSessionTransitionMissionChange"
+		| "refreshProviderIdentity"
+		| "resetSessionState"
+		| "clearCost"
 	>;
 	toolChoiceQueue: Pick<ToolChoiceQueue, "beginSessionTransition">;
 	sessionTools: Pick<SessionTools, "beginSessionTransition">;
@@ -418,6 +423,7 @@ function createParticipantTable(
 			initializationCleanup: () =>
 				advisorDeliveryTransition
 					? [
+							operation("advisor mission change", () => host.advisors.rollbackSessionTransitionMissionChange()),
 							operation("advisor delivery ownership selection", () => advisorDeliveryTransition!.rollback()),
 							operation("advisor delivery ownership", () => advisorDeliveryTransition!.activate()),
 						]
@@ -584,6 +590,11 @@ function createParticipantTable(
 			activateCommit: commitOptions => {
 				if (!advisorDeliveryTransition) return NO_OPERATIONS;
 				const operations: LifecycleOperation[] = [
+					operation("advisor mission change", () =>
+						host.advisors.commitSessionTransitionMissionChange({
+							resetRuntimes: commitOptions?.preserveAdvisorState === true,
+						}),
+					),
 					operation("advisor provider identity", () => host.advisors.refreshProviderIdentity()),
 				];
 				if (commitOptions?.preserveAdvisorState) {
@@ -604,7 +615,10 @@ function createParticipantTable(
 			},
 			activateRollback: () =>
 				advisorDeliveryTransition
-					? [operation("advisor provider identity", () => host.advisors.refreshProviderIdentity())]
+					? [
+							operation("advisor mission change", () => host.advisors.rollbackSessionTransitionMissionChange()),
+							operation("advisor provider identity", () => host.advisors.refreshProviderIdentity()),
+						]
 					: NO_OPERATIONS,
 		},
 	};
@@ -899,6 +913,7 @@ export interface RetainedSessionRuntimeFields {
 	planModeState: PlanModeState | undefined;
 	vibeModeState: VibeModeState | undefined;
 	goalModeState: GoalModeState | undefined;
+	pendingAdvisorTerminalMissionKey: string | undefined;
 	inspectImageModeOverride: InspectImageMode | undefined;
 	goalTurnCounter: number;
 	planReferenceSent: boolean;

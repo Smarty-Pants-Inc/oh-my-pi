@@ -13,6 +13,7 @@ import {
 import type {
 	Context,
 	ContextInstruction,
+	ContextTarget,
 	CredentialDisabledEvent,
 	Effort,
 	Message,
@@ -147,7 +148,6 @@ import {
 	buildSecretObfuscator,
 	deobfuscateSessionContext,
 	deobfuscateToolArguments,
-	obfuscateMessages,
 	obfuscateProviderContext,
 	type SecretObfuscator,
 } from "./secrets";
@@ -3281,17 +3281,16 @@ async function createAgentSessionScoped(
 			return converted;
 		};
 
-		// Final convertToLlm: live provider replay drops API-level refusal errors,
-		// then applies secret obfuscation to the remaining outbound context.
+		// Final convertToLlm: live provider replay drops API-level refusal errors.
+		// Secret obfuscation runs once in transformProviderContext, after registered
+		// instructions are present, so regex collisions are resolved across the full request.
 		const convertToLlmFinal = (messages: AgentMessage[]): Message[] => {
 			const providerMessages = messages.filter(
 				message =>
 					message.role !== "custom" ||
 					(message.customType !== "goal-continuation" && message.customType !== "goal-mode-context"),
 			);
-			const converted = filterProviderReplayMessages(convertToLlmWithBlockImages(providerMessages));
-			if (!obfuscator?.hasSecrets()) return converted;
-			return obfuscateMessages(obfuscator, converted);
+			return filterProviderReplayMessages(convertToLlmWithBlockImages(providerMessages));
 		};
 
 		const transformContext = async (messages: AgentMessage[], _signal?: AbortSignal) => {
@@ -3317,7 +3316,12 @@ async function createAgentSessionScoped(
 					)
 				: undefined;
 		let pendingProviderInstructions: readonly ContextInstruction[] = [];
-		const transformProviderContext = async (context: Context, transformModel: Model): Promise<Context> => {
+		const defaultContextTarget: ContextTarget = agentKind === "sub" ? "subagent" : "main";
+		const transformProviderContext = async (
+			context: Context,
+			transformModel: Model,
+			contextTarget: ContextTarget = defaultContextTarget,
+		): Promise<Context> => {
 			const executionEnvironment = toolSession.getExecutionEnvironment?.();
 			if (executionEnvironment && context.systemPrompt) {
 				assertExecutionEnvironmentSystemPrompt(executionEnvironment, context.systemPrompt);
@@ -3325,8 +3329,8 @@ async function createAgentSessionScoped(
 			const registeredInstructions = [
 				...(options.contextInstructions ?? []),
 				...(session?.buildProviderContextInstructions() ?? []),
-			];
-			if (context.systemPrompt?.length) {
+			].filter(instruction => instruction.target === contextTarget);
+			if (contextTarget !== "side_model" && context.systemPrompt?.length) {
 				const promptCwd = normalizePromptPath(
 					executionEnvironment ? mapExecutionEnvironmentPath(executionEnvironment, ".") : sessionManager.getCwd(),
 				);
@@ -3334,21 +3338,26 @@ async function createAgentSessionScoped(
 					bindRenderedInstruction(
 						"system.date-cwd-reminder",
 						renderDateCwdReminder(formatLocalCalendarDate(), promptCwd),
-						agentKind === "sub" ? "subagent" : "main",
+						contextTarget,
 					),
 				);
 				registeredInstructions.sort(
 					(left, right) => (left.order ?? 0) - (right.order ?? 0) || left.id.localeCompare(right.id),
 				);
 			}
-			let transformed: Context = registeredInstructions.length
-				? { ...context, instructions: [...(context.instructions ?? []), ...registeredInstructions] }
-				: context;
+			const existingInstructions = context.instructions?.filter(instruction => instruction.target === contextTarget);
+			let transformed: Context =
+				registeredInstructions.length > 0 || existingInstructions?.length !== context.instructions?.length
+					? { ...context, instructions: [...(existingInstructions ?? []), ...registeredInstructions] }
+					: context;
+			if (contextTarget === defaultContextTarget) session?.retainPrimaryProviderContext(transformed);
 			transformed = obfuscator ? obfuscateProviderContext(obfuscator, transformed) : transformed;
 			if (snapcompactInline) transformed = await snapcompactInline.transform(transformed, transformModel);
 			transformed = clampProviderContextImages(transformed, transformModel);
 			transformed = await normalizeProviderContextImagesForModel(transformed, transformModel);
-			pendingProviderInstructions = structuredClone(transformed.instructions ?? []);
+			if (contextTarget === defaultContextTarget) {
+				pendingProviderInstructions = structuredClone(transformed.instructions ?? []);
+			}
 			return transformed;
 		};
 		const captureRenderedToolContracts = (payload: unknown, model?: Model) => {

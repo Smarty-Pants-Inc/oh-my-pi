@@ -1,5 +1,6 @@
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Context, ImageContent, Message, TextContent } from "@oh-my-pi/pi-ai";
+import { sha256 } from "../context/canonical";
 import type { SessionContext } from "../session/session-context";
 import type { JsonValue, SecretObfuscator } from "./obfuscator";
 import { collectJsonRegexSecretValues, mapJsonStrings } from "./placeholder-scan";
@@ -125,12 +126,15 @@ type UserFacingMessage = Extract<Message, { role: "user" | "developer" | "toolRe
 function obfuscateTextBlocks(
 	obfuscator: SecretObfuscator,
 	content: (TextContent | ImageContent)[],
-	sharedRegexSecretValues?: ReadonlySet<string>,
+	sharedRegexSecretValues: ReadonlySet<string>,
 ): (TextContent | ImageContent)[] {
 	let changed = false;
 	const result = content.map((block): TextContent | ImageContent => {
 		if (block.type !== "text") return block;
-		const text = obfuscator.obfuscate(block.text, sharedRegexSecretValues);
+		const text = obfuscator.stripUnsafeFriendlyPlaceholderPrefixes(
+			obfuscator.obfuscate(block.text, sharedRegexSecretValues),
+			sharedRegexSecretValues,
+		);
 		if (text === block.text) return block;
 		changed = true;
 		return { ...block, text };
@@ -245,9 +249,11 @@ function collectMessageRegexSecretValues(obfuscator: SecretObfuscator, messages:
  * expands keyed placeholders locally before the next provider request. Inline
  * image bytes are never walked.
  */
-export function obfuscateMessages(obfuscator: SecretObfuscator, messages: Message[]): Message[] {
-	if (!obfuscator.hasSecrets()) return messages;
-	const sharedRegexSecretValues = collectMessageRegexSecretValues(obfuscator, messages);
+function obfuscateMessagesWithSharedRegexSecretValues(
+	obfuscator: SecretObfuscator,
+	messages: Message[],
+	sharedRegexSecretValues: ReadonlySet<string>,
+): Message[] {
 	let changed = false;
 	const result = messages.map((message): Message => {
 		if (
@@ -263,7 +269,10 @@ export function obfuscateMessages(obfuscator: SecretObfuscator, messages: Messag
 		}
 		const target = message as UserFacingMessage;
 		if (typeof target.content === "string") {
-			const content = obfuscator.obfuscate(target.content, sharedRegexSecretValues);
+			const content = obfuscator.stripUnsafeFriendlyPlaceholderPrefixes(
+				obfuscator.obfuscate(target.content, sharedRegexSecretValues),
+				sharedRegexSecretValues,
+			);
 			if (content === target.content) return message;
 			changed = true;
 			return { ...target, content } as Message;
@@ -276,12 +285,54 @@ export function obfuscateMessages(obfuscator: SecretObfuscator, messages: Messag
 	return changed ? result : messages;
 }
 
+export function obfuscateMessages(obfuscator: SecretObfuscator, messages: Message[]): Message[] {
+	if (!obfuscator.hasSecrets()) return messages;
+	return obfuscateMessagesWithSharedRegexSecretValues(
+		obfuscator,
+		messages,
+		collectMessageRegexSecretValues(obfuscator, messages),
+	);
+}
+
+/** Collect regex-secret values across one outbound provider request. */
+export function collectProviderContextRegexSecretValues(
+	obfuscator: SecretObfuscator | undefined,
+	context: Context,
+): Set<string> {
+	if (!obfuscator?.hasSecrets()) return new Set();
+	const values = collectMessageRegexSecretValues(obfuscator, context.messages);
+	for (const instruction of context.instructions ?? []) {
+		for (const value of obfuscator.collectRegexSecretValuesForObfuscation(instruction.renderedText)) {
+			values.add(value);
+		}
+	}
+	return values;
+}
+
 /**
- * Redact outbound provider context. Only conversation messages are rewritten;
- * the static system prompt and tool schemas pass through unchanged.
+ * Redact outbound provider context. Registered instructions can contain dynamic
+ * user-authored text, so scan them together with conversation messages before
+ * choosing collision-safe placeholders for the complete request.
  */
-export function obfuscateProviderContext(obfuscator: SecretObfuscator | undefined, context: Context): Context {
+export function obfuscateProviderContext(
+	obfuscator: SecretObfuscator | undefined,
+	context: Context,
+	additionalRegexSecretValues?: ReadonlySet<string>,
+): Context {
 	if (!obfuscator?.hasSecrets()) return context;
-	const messages = obfuscateMessages(obfuscator, context.messages);
-	return messages === context.messages ? context : { ...context, messages };
+	const sharedRegexSecretValues = collectProviderContextRegexSecretValues(obfuscator, context);
+	for (const value of additionalRegexSecretValues ?? []) sharedRegexSecretValues.add(value);
+	const messages = obfuscateMessagesWithSharedRegexSecretValues(obfuscator, context.messages, sharedRegexSecretValues);
+	let instructionsChanged = false;
+	const instructions = context.instructions?.map(instruction => {
+		const renderedText = obfuscator.stripUnsafeFriendlyPlaceholderPrefixes(
+			obfuscator.obfuscate(instruction.renderedText, sharedRegexSecretValues),
+			sharedRegexSecretValues,
+		);
+		if (renderedText === instruction.renderedText) return instruction;
+		instructionsChanged = true;
+		return { ...instruction, sha256: sha256(renderedText), renderedText };
+	});
+	if (messages === context.messages && !instructionsChanged) return context;
+	return { ...context, messages, ...(instructions ? { instructions } : {}) };
 }

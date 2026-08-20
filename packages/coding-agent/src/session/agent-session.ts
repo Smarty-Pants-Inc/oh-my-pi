@@ -57,6 +57,7 @@ import {
 import type {
 	AssistantMessage,
 	CodexCompactionContext,
+	Context,
 	ContextInstruction,
 	ImageContent,
 	Message,
@@ -114,6 +115,7 @@ import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-temp
 import { buildServiceTierByFamily } from "../config/service-tier";
 import type { Settings, SkillsSettings } from "../config/settings";
 import { onAppendOnlyModeChanged, onModelRolesChanged } from "../config/settings";
+import { sha256 } from "../context/canonical";
 import {
 	explainContext as buildContextExplanation,
 	type ContextExplanation,
@@ -162,7 +164,7 @@ import type { HookCommandContext } from "../extensibility/hooks/types";
 import type { Skill, SkillWarning } from "../extensibility/skills";
 import { expandSlashCommand, type FileSlashCommand } from "../extensibility/slash-commands";
 import { normalizeToolEventInput, resolveToolEventInput } from "../extensibility/tool-event-input";
-import { GoalRuntime } from "../goals/runtime";
+import { GoalRuntime, isFinalStatus } from "../goals/runtime";
 import { type GoalModeState, isCurrentGoalModeState, parseGoalModeState } from "../goals/state";
 import type { HindsightSessionState } from "../hindsight/state";
 import { type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
@@ -614,9 +616,12 @@ export class AgentSession {
 	#inspectImageModeOverride: InspectImageMode | undefined;
 	#vibeModeState: VibeModeState | undefined;
 	#goalModeState: GoalModeState | undefined;
+	#advisorMissionKey: string | undefined;
+	#pendingAdvisorTerminalMissionKey: string | undefined;
 	#goalRuntime: GoalRuntime;
 	#goalContinuationContext = false;
 	readonly #advisors: SessionAdvisors;
+	#advisorsInitialized = false;
 	#goalTurnCounter = 0;
 	#planReferenceSent = false;
 	#planReferencePath = "local://PLAN.md";
@@ -1602,9 +1607,7 @@ export class AgentSession {
 		this.#todo.syncFromBranch();
 		this.#goalRuntime = new GoalRuntime({
 			getState: () => this.#goalModeState,
-			setState: state => {
-				this.setGoalModeState(state);
-			},
+			setState: state => this.#setGoalModeState(state, "mutation"),
 			getCurrentUsage: () => {
 				const usage = this.getSessionStats().tokens;
 				return {
@@ -1670,6 +1673,31 @@ export class AgentSession {
 			abortInProgress: () => this.#abortInProgress,
 			allowAgentInitiatedTurns: () => this.#allowAcpAgentInitiatedTurns,
 			planModeState: () => this.#planModeState,
+			advisorMissionContext: sharedRegexSecretValues => {
+				const state = this.#goalModeState;
+				const key = this.#advisorMissionKey;
+				if (!state?.goal || !key) return undefined;
+				const terminal = isFinalStatus(state.goal);
+				if (terminal && this.#pendingAdvisorTerminalMissionKey !== key) return undefined;
+				const missionPrompt = this.#goalRuntime.buildAdvisorMissionPrompt(objective => {
+					const obfuscator = this.#obfuscator;
+					if (!obfuscator?.hasSecrets()) return objective;
+					for (const value of obfuscator.collectRegexSecretValuesForObfuscation(objective)) {
+						sharedRegexSecretValues.add(value);
+					}
+					return obfuscator.obfuscate(objective, sharedRegexSecretValues);
+				});
+				return missionPrompt
+					? {
+							instruction: bindRenderedInstruction("goal.advisor_mission", missionPrompt, "side_model"),
+							key,
+							terminal,
+						}
+					: undefined;
+			},
+			consumeAdvisorTerminalMission: key => {
+				if (this.#pendingAdvisorTerminalMissionKey === key) this.#pendingAdvisorTerminalMissionKey = undefined;
+			},
 			clientBridge: () => this.#clientBridge,
 			emitSessionEvent: event => this.#emitSessionEvent(event),
 			emitNotice: (level, message, source) => this.emitNotice(level, message, source),
@@ -1714,6 +1742,7 @@ export class AgentSession {
 			transformProviderContext: config.transformProviderContext,
 			initialCosts: config.initialAdvisorCosts,
 		});
+		this.#advisorsInitialized = true;
 
 		const maintenanceHost: SessionMaintenanceHost = {
 			agent: this.agent,
@@ -1795,6 +1824,7 @@ export class AgentSession {
 			thinkingLevel: () => this.thinkingLevel,
 			sessionId: () => this.sessionId,
 			sessionFile: () => this.sessionFile,
+			goalModeState: () => this.#goalModeState,
 			baseSystemPrompt: () => this.#tools.baseSystemPrompt,
 			assertVibeSessionTransitionAllowed: action => this.#assertVibeSessionTransitionAllowed(action),
 			setSkipPostTurnMaintenance: timestamp => {
@@ -1826,6 +1856,7 @@ export class AgentSession {
 			restoreExplicitPromptMessages: messages => this.restoreExplicitPromptMessages(messages),
 			resetTodoCycle: () => this.#todo.resetCycle(),
 			buildDisplaySessionContext: () => this.buildDisplaySessionContext(),
+			replaceMessagesFromSessionContext: context => this.#replaceMessagesFromSessionContext(context),
 			drainAndDetachAdvisorRecorders: () => this.#advisors.drainAndDetachRecorders(),
 			syncTodoPhasesFromBranch: () => this.#todo.syncFromBranch(),
 		};
@@ -5452,6 +5483,7 @@ export class AgentSession {
 			// conversation. The on-disk record and the plain `transcript:true` export
 			// path keep the full pre-reset history.
 			this.sessionManager.appendResetBoundary();
+			await this.#goalRuntime.clearFinalGoalAtHistoryBoundary();
 			return { droppedCount };
 		} finally {
 			releaseSemanticFence();
@@ -5938,9 +5970,48 @@ export class AgentSession {
 		return this.#providerBoundary.buildDisplaySessionContext();
 	}
 
+	#setGoalModeState(
+		state: GoalModeState | undefined,
+		source: "mutation" | "rehydrate" | "restore",
+		pendingTerminalMissionKey?: string,
+	): void {
+		const previousKey = this.#advisorMissionKey;
+		const previousPendingKey = this.#pendingAdvisorTerminalMissionKey;
+		const nextKey = state?.goal
+			? sha256(JSON.stringify([state.goal.id, state.goal.objective, state.goal.status]))
+			: undefined;
+		this.#goalModeState = state;
+		this.#advisorMissionKey = nextKey;
+		if (source === "rehydrate") {
+			this.#pendingAdvisorTerminalMissionKey = undefined;
+		} else if (source === "restore") {
+			this.#pendingAdvisorTerminalMissionKey =
+				pendingTerminalMissionKey === nextKey && state?.goal && isFinalStatus(state.goal) ? nextKey : undefined;
+		} else if (nextKey !== previousKey) {
+			this.#pendingAdvisorTerminalMissionKey = state?.goal && isFinalStatus(state.goal) ? nextKey : undefined;
+		}
+		if (
+			this.#advisorsInitialized &&
+			(previousKey !== nextKey || previousPendingKey !== this.#pendingAdvisorTerminalMissionKey)
+		) {
+			this.#advisors.onMissionChanged(
+				nextKey,
+				this.#pendingAdvisorTerminalMissionKey !== undefined && this.#pendingAdvisorTerminalMissionKey === nextKey,
+			);
+		}
+	}
+
 	#rehydrateGoalModeState(mode: unknown, modeData: unknown): void {
 		this.#goalRuntime.clearAccounting();
-		this.setGoalModeState(this.settings.get("goal.enabled") ? parseGoalModeState(mode, modeData) : undefined);
+		this.#setGoalModeState(
+			this.settings.get("goal.enabled") ? parseGoalModeState(mode, modeData) : undefined,
+			"rehydrate",
+		);
+	}
+
+	#replaceMessagesFromSessionContext(context: SessionContext, messages = context.messages): void {
+		this.#rehydrateGoalModeState(context.mode, context.modeData);
+		this.agent.replaceMessages(messages);
 	}
 
 	/**
@@ -6055,11 +6126,15 @@ export class AgentSession {
 	}
 
 	setGoalModeState(state: GoalModeState | undefined): void {
-		this.#goalModeState = state && (state.mode === "exiting" || isCurrentGoalModeState(state)) ? state : undefined;
+		this.#setGoalModeState(state, "mutation");
 	}
 
 	isGoalModeExiting(): boolean {
 		return this.#goalModeState?.mode === "exiting";
+	}
+
+	rehydrateGoalModeState(state: GoalModeState | undefined): void {
+		this.#setGoalModeState(state, "rehydrate");
 	}
 
 	getVibeModeState(): VibeModeState | undefined {
@@ -6078,6 +6153,10 @@ export class AgentSession {
 
 	get goalRuntime(): GoalRuntime {
 		return this.#goalRuntime;
+	}
+
+	retainPrimaryProviderContext(context: Context): void {
+		this.#advisors.retainPrimaryContext(context);
 	}
 
 	/** Fresh registered components injected at the provider boundary, never persisted as messages. */
@@ -6162,6 +6241,7 @@ export class AgentSession {
 			goalModeState: this.#goalModeState
 				? { ...this.#goalModeState, goal: { ...this.#goalModeState.goal } }
 				: undefined,
+			pendingAdvisorTerminalMissionKey: this.#pendingAdvisorTerminalMissionKey,
 			inspectImageModeOverride: this.#inspectImageModeOverride,
 			goalTurnCounter: this.#goalTurnCounter,
 			planReferenceSent: this.#planReferenceSent,
@@ -6177,10 +6257,12 @@ export class AgentSession {
 		this.#observedSessionId = checkpoint.observedSessionId;
 		this.#planModeState = checkpoint.planModeState ? { ...checkpoint.planModeState } : undefined;
 		this.#vibeModeState = checkpoint.vibeModeState ? { ...checkpoint.vibeModeState } : undefined;
-		this.setGoalModeState(
+		this.#setGoalModeState(
 			checkpoint.goalModeState
 				? { ...checkpoint.goalModeState, goal: { ...checkpoint.goalModeState.goal } }
 				: undefined,
+			"restore",
+			checkpoint.pendingAdvisorTerminalMissionKey,
 		);
 		this.#inspectImageModeOverride = checkpoint.inspectImageModeOverride;
 		this.#goalTurnCounter = checkpoint.goalTurnCounter;
@@ -6572,6 +6654,25 @@ export class AgentSession {
 			!(expandPromptTemplates && text.startsWith("/"));
 		if (queueDuringSemanticMaintenance) this.#assertQueuedUserMessageCanStart(lifecycleGeneration);
 		else this.#assertPromptCanStart(lifecycleGeneration);
+		const promptAttribution = options?.attribution ?? (options?.synthetic ? "agent" : "user");
+		const retainPromptText = (promptText: string): void => {
+			this.#advisors.retainPrimaryInput([
+				options?.synthetic
+					? {
+							role: "developer",
+							content: [{ type: "text", text: promptText }],
+							attribution: promptAttribution,
+							timestamp: Date.now(),
+						}
+					: {
+							role: "user",
+							content: [{ type: "text", text: promptText }],
+							attribution: promptAttribution,
+							timestamp: Date.now(),
+						},
+			]);
+		};
+		retainPromptText(text);
 
 		// Handle extension commands first (execute immediately, even during streaming)
 		if (expandPromptTemplates && text.startsWith("/")) {
@@ -6598,6 +6699,7 @@ export class AgentSession {
 
 		// Expand file-based prompt templates if requested
 		const expandedText = expandPromptTemplates ? expandPromptTemplate(text, [...this.#promptTemplates]) : text;
+		retainPromptText(expandedText);
 
 		// Magic keywords ("ultrathink", "orchestrate"): append hidden system notices after the
 		// user's message that steer this turn. User-authored prompts only — synthetic /
@@ -6660,7 +6762,6 @@ export class AgentSession {
 			? await this.#buildImageDescriptionNotice(normalizedImages)
 			: undefined;
 
-		const promptAttribution = options?.attribution ?? (options?.synthetic ? "agent" : "user");
 		if (externalThinkingToolChoice) {
 			this.#toolChoiceQueue.pushOnce(externalThinkingToolChoice, {
 				label: "external-thinking",
@@ -6809,6 +6910,12 @@ export class AgentSession {
 		if (abort) await abort;
 		this.onBeforePromptAcceptance?.();
 		this.#assertPromptCanStart(options?.lifecycleGeneration);
+		this.#advisors.retainPrimaryInput([
+			...(options?.prependMessages ?? []),
+			message,
+			...(options?.consumeExplicitPromptMessages ? this.#pendingExplicitPromptMessages : []),
+			...this.#pendingNextTurnMessages,
+		]);
 		const automaticTurn =
 			options?.automaticTurn ??
 			(message.role === "custom" && message.customType === "goal-continuation"
@@ -6932,6 +7039,7 @@ export class AgentSession {
 					useHashLines: resolveFileDisplayMode(this).hashLines,
 					snapshotStore: getFileSnapshotStore(this),
 				});
+				this.#advisors.retainPrimaryInput(fileMentionMessages);
 				for (const fileMentionMessage of fileMentionMessages) {
 					messages.push(await this.#normalizeAgentMessageImages(fileMentionMessage));
 				}
@@ -7400,6 +7508,9 @@ export class AgentSession {
 	): Promise<void> {
 		const acceptedLifecycleGeneration = lifecycleGeneration ?? this.#lifecycleTransitionGeneration;
 		this.#assertQueuedUserMessageCanStart(acceptedLifecycleGeneration);
+		this.#advisors.retainPrimaryInput([
+			{ role: "user", content: [{ type: "text", text }], attribution: "user", timestamp: Date.now() },
+		]);
 		const normalizedPrependMessages: CustomMessage[] = [];
 		for (const message of prependMessages) {
 			normalizedPrependMessages.push(
@@ -7808,6 +7919,7 @@ export class AgentSession {
 			const message = this.#withPendingSemanticDeliveryId(data.message, pendingId);
 			this.#pendingSemanticDeliveryIds.add(pendingId);
 			if (data.kind === "explicitPrompt") {
+				this.#advisors.retainPrimaryInput([message]);
 				this.#pendingExplicitPromptMessages.push(message);
 			} else if (data.kind === "followUp") {
 				this.agent.followUp(message);
@@ -7832,6 +7944,7 @@ export class AgentSession {
 	}
 
 	#queueExplicitPromptMessage(message: CustomMessage): void {
+		this.#advisors.retainPrimaryInput([message]);
 		if (
 			this.agent.attachInFlightQueuedMessageCompanions([message], restored =>
 				this.restoreExplicitPromptMessages(restored),
@@ -7850,6 +7963,7 @@ export class AgentSession {
 	}
 
 	#queueNextTurnMessage(message: CustomMessage): void {
+		this.#advisors.retainPrimaryInput([message]);
 		this.#pendingNextTurnMessages.push(message);
 	}
 
@@ -7897,6 +8011,7 @@ export class AgentSession {
 			attribution: message.attribution ?? "agent",
 			timestamp: Date.now(),
 		};
+		this.#advisors.retainPrimaryInput([appMessage]);
 		const normalizedAppMessage = await this.#normalizeAgentMessageImages(appMessage);
 		this.onBeforePromptAcceptance?.();
 		if (allowSemanticMaintenance) this.#assertQueuedUserMessageCanStart(lifecycleGeneration);
@@ -8017,6 +8132,7 @@ export class AgentSession {
 			attribution: normalizedPayload.attribution,
 			timestamp: Date.now(),
 		};
+		this.#advisors.retainPrimaryInput([appMessage]);
 		const normalizedAppMessage = await this.#normalizeAgentMessageImages(appMessage);
 		if (semanticMode) {
 			const acceptance = this.#beginSemanticDeliveryAcceptance();
@@ -9126,7 +9242,7 @@ export class AgentSession {
 		if (activeMessages) {
 			activeMessages.splice(0, activeMessages.length, ...sessionContext.messages);
 		}
-		this.agent.replaceMessages(activeMessages ?? sessionContext.messages);
+		this.#replaceMessagesFromSessionContext(sessionContext, activeMessages ?? sessionContext.messages);
 		this.#advisors.resetSessionState({ preserveCost: true });
 		this.#todo.syncFromBranch();
 		this.#closeCodexProviderSessionsForHistoryRewrite();
@@ -9973,7 +10089,11 @@ export class AgentSession {
 			await this.#memory.resetContextForNewTranscript();
 
 			const sessionContext = this.buildDisplaySessionContext();
-			if (!skipConversationRestore) this.agent.replaceMessages(sessionContext.messages);
+			if (skipConversationRestore) {
+				this.#rehydrateGoalModeState(sessionContext.mode, sessionContext.modeData);
+			} else {
+				this.#replaceMessagesFromSessionContext(sessionContext);
+			}
 
 			await this.sessionManager.ensureOnDisk();
 			const commitOptions: SessionLifecycleCommitOptions = {
@@ -10100,7 +10220,8 @@ export class AgentSession {
 			this.#syncAgentSessionId(undefined, false, false);
 			this.#memory.rekeyForCurrentSessionId();
 			await this.#memory.resetContextForNewTranscript();
-			this.agent.replaceMessages(this.buildDisplaySessionContext().messages);
+			const sessionContext = this.buildDisplaySessionContext();
+			this.#replaceMessagesFromSessionContext(sessionContext);
 
 			await this.sessionManager.ensureOnDisk();
 			const commitOptions: SessionLifecycleCommitOptions = {
@@ -10444,7 +10565,7 @@ export class AgentSession {
 			// Update agent state — build display context to populate agent messages.
 			const stateContext = this.sessionManager.buildSessionContext();
 			const displayContext = deobfuscateSessionContext(stateContext, this.#obfuscator);
-			this.agent.replaceMessages(displayContext.messages);
+			this.#replaceMessagesFromSessionContext(displayContext);
 			this.#rehydrateCheckpointRewindState();
 			this.#todo.syncFromBranch();
 

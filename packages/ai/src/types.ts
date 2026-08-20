@@ -510,6 +510,12 @@ export interface StreamOptions {
 	 */
 	maxInFlightRequests?: Record<string, number>;
 	/**
+	 * Synchronous security veto run at provider dispatch boundaries, including after
+	 * concurrency waits and immediately before network writes. It may run more than
+	 * once; keep it side-effect free. Throw to cancel dispatch.
+	 */
+	providerDispatchGuard?: () => void;
+	/**
 	 * Optional callback for inspecting or replacing provider payloads before sending.
 	 * Return undefined to keep the payload unchanged.
 	 */
@@ -1145,6 +1151,7 @@ export interface CursorExecHandlers {
 	shellStream?: (
 		args: ShellArgs,
 		callbacks: CursorShellStreamCallbacks,
+		signal?: AbortSignal,
 	) => Promise<CursorExecHandlerResult<ShellResult>>;
 	diagnostics?: (args: DiagnosticsArgs) => Promise<CursorExecHandlerResult<DiagnosticsResult>>;
 	mcp?: (call: CursorMcpCall) => Promise<CursorExecHandlerResult<McpResult>>;

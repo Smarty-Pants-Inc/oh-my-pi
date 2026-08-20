@@ -469,6 +469,7 @@ export class Agent {
 	#appendOnlyContext?: AppendOnlyContextManager;
 	#beforeQueuedMessageDequeueHooks = new Set<(signal?: AbortSignal) => Promise<void> | void>();
 	#beforeModelCallHooks = new Set<(signal?: AbortSignal) => Promise<void> | void>();
+	#beforeInputHooks = new Set<(messages: readonly AgentMessage[]) => void>();
 
 	/** Buffered Cursor tool results with text length at time of call (for correct ordering) */
 	#cursorToolResultBuffer: CursorToolResultEntry[] = [];
@@ -847,6 +848,16 @@ export class Agent {
 		return () => this.#beforeModelCallHooks.delete(registration);
 	}
 
+	/** Register a synchronous hook that runs before messages enter accepted input state. */
+	addBeforeInputHook(hook: (messages: readonly AgentMessage[]) => void): () => void {
+		this.#beforeInputHooks.add(hook);
+		return () => this.#beforeInputHooks.delete(hook);
+	}
+
+	#runBeforeInputHooks(messages: readonly AgentMessage[]): void {
+		for (const hook of this.#beforeInputHooks) hook(messages);
+	}
+
 	async #runBeforeModelCallHooks(signal?: AbortSignal): Promise<void> {
 		for (const hook of this.#beforeModelCallHooks) await hook(signal);
 	}
@@ -990,9 +1001,10 @@ export class Agent {
 	}
 
 	replaceMessages(ms: AgentMessage[]) {
-		// New array assignment is intentional: caller-owned `ms` may be mutated
-		// after handoff; snapshot it so external mutations cannot leak in.
-		this.#state.messages = ms.slice();
+		// Snapshot first so hooks inspect the exact list that will be accepted.
+		const next = ms.slice();
+		this.#runBeforeInputHooks(next);
+		this.#state.messages = next;
 	}
 
 	replaceQueues(steering: AgentMessage[], followUp: AgentMessage[], preserveCompanions = false) {
@@ -1153,6 +1165,7 @@ export class Agent {
 	}
 
 	appendMessage(m: AgentMessage) {
+		this.#runBeforeInputHooks([m]);
 		this.#state.messages.push(m);
 	}
 
@@ -1169,6 +1182,7 @@ export class Agent {
 	 * Delivered after current tool execution, skips remaining tools.
 	 */
 	steer(m: AgentMessage) {
+		this.#runBeforeInputHooks([m]);
 		this.#steeringQueue.push(m);
 		this.#notifySteeringWaiters();
 	}
@@ -1178,6 +1192,7 @@ export class Agent {
 	 * Delivered only when agent has no more tool calls or steering messages.
 	 */
 	followUp(m: AgentMessage) {
+		this.#runBeforeInputHooks([m]);
 		this.#followUpQueue.push(m);
 	}
 
@@ -1382,6 +1397,7 @@ export class Agent {
 			msgs = [input];
 			promptOptions = imagesOrOptions as AgentPromptOptions | undefined;
 		}
+		this.#runBeforeInputHooks(msgs);
 
 		await this.#runLoop(msgs, promptOptions);
 	}

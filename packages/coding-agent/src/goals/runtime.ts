@@ -1,5 +1,6 @@
 import { escapeXmlText, prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import { agentBehavior } from "../context/registry";
+import advisorMissionContextPrompt from "../prompts/advisor/mission-context.md" with { type: "text" };
 import goalBudgetLimitPrompt from "../prompts/goals/goal-budget-limit.md" with { type: "text" };
 import goalContinuationPrompt from "../prompts/goals/goal-continuation.md" with { type: "text" };
 import goalModeActivePrompt from "../prompts/goals/goal-mode-active.md" with { type: "text" };
@@ -129,6 +130,13 @@ function validateTokenBudget(tokenBudget: number | undefined): void {
 	}
 }
 
+function isAccountingStatus(goal: Goal): boolean {
+	return goal.status === "active" || goal.status === "budget_limited";
+}
+
+export function isFinalStatus(goal: Goal): boolean {
+	return goal.status === "complete" || goal.status === "dropped" || goal.status === "superseded";
+}
 function persistenceMode(state: GoalModeState): "goal" | "goal_paused" {
 	return state.goal.status === "paused" ? "goal_paused" : "goal";
 }
@@ -224,6 +232,16 @@ export class GoalRuntime {
 		this.#turnSnapshot = undefined;
 		this.#clearActiveAccounting();
 		this.#budgetReportedFor = undefined;
+	}
+
+	async clearFinalGoalAtHistoryBoundary(): Promise<boolean> {
+		return await this.#withAccounting(async () => {
+			const state = this.#getStateClone();
+			if (!state?.goal || !isFinalStatus(state.goal)) return false;
+			this.clearAccounting();
+			await this.#commitState(undefined, { persist: "none" });
+			return true;
+		});
 	}
 
 	onTurnStart(turnId: string, baselineUsage: GoalTokenUsage): void {
@@ -543,6 +561,17 @@ export class GoalRuntime {
 			this.#budgetReportedFor = undefined;
 			await this.#commitState(state, { persist: "goal" });
 			return state;
+		});
+	}
+
+	buildAdvisorMissionPrompt(
+		transformObjective: (objective: string) => string = objective => objective,
+	): string | undefined {
+		const goal = this.#host.getState()?.goal;
+		if (!goal) return undefined;
+		return prompt.render(advisorMissionContextPrompt, {
+			objective: escapeXmlText(transformObjective(goal.objective)),
+			status: goal.status,
 		});
 	}
 

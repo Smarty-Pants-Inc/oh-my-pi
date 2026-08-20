@@ -201,7 +201,7 @@ describe("AgentSession context promotion", () => {
 		session.agent.emitExternalEvent({ type: "message_end", message: overflowMessage });
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [overflowMessage] });
 
-		await waitFor(() => session.model?.id === largeModel.id);
+		await session.waitForIdle();
 
 		expect(session.model?.provider).toBe(largeModel.provider);
 		expect(session.model?.id).toBe(largeModel.id);
@@ -244,7 +244,7 @@ describe("AgentSession context promotion", () => {
 		session.agent.emitExternalEvent({ type: "message_end", message: overflowMessage });
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [overflowMessage] });
 
-		await waitFor(() => session.model?.id === largeModel.id);
+		await session.waitForIdle();
 
 		expect(session.model?.provider).toBe(largeModel.provider);
 		expect(session.model?.id).toBe(largeModel.id);
@@ -574,7 +574,7 @@ describe("AgentSession context promotion", () => {
 		session.agent.emitExternalEvent({ type: "message_end", message: incompleteMessage });
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [incompleteMessage] });
 
-		await waitFor(() => session.model?.id === largeModel.id);
+		await session.waitForIdle();
 
 		expect(session.model?.provider).toBe(largeModel.provider);
 		expect(session.model?.id).toBe(largeModel.id);

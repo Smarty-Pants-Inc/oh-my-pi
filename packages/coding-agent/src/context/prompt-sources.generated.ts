@@ -234,6 +234,7 @@ import source230 from "../prompts/tools/vibe-turn-result.md" with { type: "text"
 import source231 from "../prompts/tools/vibe-wait.md" with { type: "text" };
 import source232 from "../prompts/tools/web-search.md" with { type: "text" };
 import source233 from "../prompts/tools/write.md" with { type: "text" };
+import source234 from "../prompts/advisor/mission-context.md" with { type: "text" };
 
 export const PROMPT_SOURCES: Readonly<Record<string, string>> = Object.freeze({
 	"_agent/compaction/prompts/auto-handoff-threshold-focus.md": source0,
@@ -470,4 +471,5 @@ export const PROMPT_SOURCES: Readonly<Record<string, string>> = Object.freeze({
 	"prompts/tools/vibe-wait.md": source231,
 	"prompts/tools/web-search.md": source232,
 	"prompts/tools/write.md": source233,
+	"prompts/advisor/mission-context.md": source234,
 });

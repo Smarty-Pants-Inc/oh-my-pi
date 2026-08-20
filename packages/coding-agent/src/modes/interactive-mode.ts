@@ -2549,7 +2549,7 @@ export class InteractiveMode implements InteractiveModeContext {
 				this.sessionManager.appendModeChange("none");
 				return result;
 			}
-			this.session.setGoalModeState(goalState);
+			this.session.rehydrateGoalModeState(goalState);
 			const restored = await this.session.goalRuntime.onThreadResumed({
 				preserveActiveGoal: options?.preserveActiveGoal,
 			});

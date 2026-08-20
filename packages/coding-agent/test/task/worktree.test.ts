@@ -1162,8 +1162,8 @@ describe("commitToBranch preserves agent commits", () => {
 			await runGit(parent, ["commit", "-q", "-m", "add fixture"]);
 
 			// Refresh the independent isolation object database at the new HEAD.
-			await fs.rm(isolation, { recursive: true, force: true });
-			await fs.cp(parent, isolation, { recursive: true });
+			await runGit(isolation, ["fetch", "-q", parent, "HEAD"]);
+			await runGit(isolation, ["reset", "-q", "--hard", "FETCH_HEAD"]);
 
 			// Parent WIP: change line 10 (unstaged edit to an existing tracked file).
 			const wipLines = head.split("\n");
@@ -1238,8 +1238,8 @@ describe("commitToBranch preserves agent commits", () => {
 			await fs.writeFile(path.join(parent, "src/wip-only.py"), "unchanged\n");
 			await runGit(parent, ["add", "."]);
 			await runGit(parent, ["commit", "-q", "-m", "seed"]);
-			await fs.rm(isolation, { recursive: true, force: true });
-			await fs.cp(parent, isolation, { recursive: true });
+			await runGit(isolation, ["fetch", "-q", parent, "HEAD"]);
+			await runGit(isolation, ["reset", "-q", "--hard", "FETCH_HEAD"]);
 
 			await fs.writeFile(path.join(parent, "src/wip-only.py"), "wip edit\n");
 			await fs.writeFile(path.join(parent, "src/wanted.py"), "wip mixed\n");
