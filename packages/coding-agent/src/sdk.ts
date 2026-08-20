@@ -3105,7 +3105,7 @@ async function createAgentSessionScoped(
 		const explicitlyRequestedToolNames = options.toolNames ? normalizeToolNames(options.toolNames) : undefined;
 		const explicitOrdinaryBuiltInToolRequested =
 			explicitlyRequestedToolNames?.some(
-				name => name !== "goal" && name !== "yield" && name !== "think" && builtInRegistryToolNames.has(name),
+				name => name !== "goal" && name !== "yield" && name !== "think" && Object.hasOwn(BUILTIN_TOOLS, name),
 			) === true;
 		// When `requireYieldTool` is set, the subagent's prompts and idle-reminders demand a
 		// `yield` call to terminate. The tool registry already includes `yield` (see

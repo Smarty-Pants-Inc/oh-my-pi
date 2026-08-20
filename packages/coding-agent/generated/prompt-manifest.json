@@ -8327,7 +8327,7 @@
     },
     {
       "path": "packages/coding-agent/src/sdk.ts",
-      "sha256": "e6769391b4680a5960ce9a658a8089cac2ba8e57fd5bf03c652384cc7e23a059"
+      "sha256": "2fc2e93ec21f43eff2778840bafe3e2420b868d3618164352bf9f934a03a2e62"
     },
     {
       "path": "packages/coding-agent/src/secrets/index.ts",
@@ -10683,5 +10683,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "ed1276a46ee6e684db190fdff2a0acbb3e228605a698d042724bdbcf5be62655"
+  "rootSha256": "e52f21658913498a7fa7bba82b07e76af054d5406b450ea16585a438e37fc25e"
 }
