@@ -1894,6 +1894,14 @@ prompts:
     visibility: model
     defaultEnabled: true
     order: 2440
+  - id: live.agent-closure-rejected
+    path: live/prompts/agent-closure-rejected.md
+    role: system
+    target: [side_model]
+    trigger: side_request
+    visibility: model
+    defaultEnabled: false
+    order: 2450
 
 nonModelDocumentation:
   - modes/components/snapcompact-shape-preview-doc.md
