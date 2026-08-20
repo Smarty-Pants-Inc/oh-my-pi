@@ -1251,9 +1251,17 @@ function collectExtensionSpecifierReferences(
 			}
 			if (moduleNamespaceBindings.has(node.name)) {
 				if (moduleNamespaceBindingNodes.has(node)) continue;
-				if (parent?.type === "MemberExpression" && parentKey === "object") {
+				if (
+					(parent?.type === "MemberExpression" || parent?.type === "OptionalMemberExpression") &&
+					parentKey === "object"
+				) {
 					const memberName = staticMemberPropertyName(parent);
-					if (commonJsModuleNamespaceBindings.has(node.name) && (memberName === null || memberName === "Module")) {
+					const supportedMember =
+						memberName === "createRequire" ||
+						memberName === "Module" ||
+						memberName === "default" ||
+						memberName === "_load";
+					if (!supportedMember || (commonJsModuleNamespaceBindings.has(node.name) && memberName === "Module")) {
 						graphProof.provable = false;
 					}
 					continue;
