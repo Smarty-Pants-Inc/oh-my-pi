@@ -3,7 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { YAML } from "bun";
 import trackedManifestSource from "../../generated/prompt-manifest.json" with { type: "text" };
-import { diff, fetch as gitFetch, ls, ref, remote, repo, show, status } from "../utils/git";
+import { config, diff, fetch as gitFetch, ls, ref, remote, repo, show, status } from "../utils/git";
 import { canonicalJson, compareUnicodeCodePoints, type JsonValue, sha256 } from "./canonical";
 import { computeImplementationSources } from "./implementation-sources";
 import {
@@ -678,10 +678,19 @@ async function workingPackageTreeObjectId(
 	relativeSourceRoot: string,
 	expectedLength: number,
 ): Promise<string | undefined> {
-	const trackedPaths = await ls.tree(repositoryRoot, "HEAD", [`:(literal)${relativeSourceRoot || "."}`]);
+	const [trackedEntries, fileModeConfig] = await Promise.all([
+		ls.treeEntries(repositoryRoot, "HEAD", [`:(literal)${relativeSourceRoot || "."}`]),
+		config.get(repositoryRoot, "core.fileMode"),
+	]);
+	const normalizedFileMode = fileModeConfig?.toLowerCase();
+	const useFilesystemMode =
+		normalizedFileMode !== "false" &&
+		normalizedFileMode !== "no" &&
+		normalizedFileMode !== "off" &&
+		normalizedFileMode !== "0";
 	const root: Extract<WorkingTreeEntry, { kind: "tree" }> = { kind: "tree", entries: new Map() };
 	const verifiedDirectories = new Set<string>();
-	for (const trackedPath of trackedPaths) {
+	for (const { path: trackedPath, mode: trackedMode } of trackedEntries) {
 		const relative = relativeSourceRoot ? path.posix.relative(relativeSourceRoot, trackedPath) : trackedPath;
 		if (!relative || relative === ".." || relative.startsWith("../") || path.posix.isAbsolute(relative))
 			return undefined;
@@ -726,10 +735,14 @@ async function workingPackageTreeObjectId(
 		try {
 			const stats = await fs.lstat(absolutePath);
 			if (stats.isSymbolicLink()) {
-				mode = "120000";
+				if (trackedMode !== "120000") return undefined;
+				mode = trackedMode;
 				bytes = UTF8_ENCODER.encode(await fs.readlink(absolutePath));
 			} else if (stats.isFile()) {
-				mode = (stats.mode & 0o100) === 0 ? "100644" : "100755";
+				if (trackedMode !== "100644" && trackedMode !== "100755") return undefined;
+				const filesystemMode = (stats.mode & 0o100) === 0 ? "100644" : "100755";
+				if (useFilesystemMode && filesystemMode !== trackedMode) return undefined;
+				mode = trackedMode;
 				bytes = await Bun.file(absolutePath).bytes();
 			} else {
 				return undefined;
@@ -741,7 +754,7 @@ async function workingPackageTreeObjectId(
 		if (!objectId) return undefined;
 		tree.entries.set(name, { kind: "file", mode, objectId });
 	}
-	return trackedPaths.length > 0 ? workingTreeObjectId(root, expectedLength) : undefined;
+	return trackedEntries.length > 0 ? workingTreeObjectId(root, expectedLength) : undefined;
 }
 
 async function approvedCandidateSourceRoot(

@@ -236,6 +236,55 @@ describe("tracked context manifest", () => {
 		}
 	});
 
+	it("keeps indexed executables approved when core.filemode disables filesystem mode checks", async () => {
+		const repositoryRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-filemode-false-extension-"));
+		const packageRoot = path.join(repositoryRoot, "packages/plugin");
+		const indexPath = path.join(packageRoot, "src/index.ts");
+		const executablePath = path.join(packageRoot, "bin/run.js");
+		const relativeExecutablePath = "packages/plugin/bin/run.js";
+		const runGit = (...args: string[]): string => {
+			const result = Bun.spawnSync(["git", ...args], { cwd: repositoryRoot, stdout: "pipe", stderr: "pipe" });
+			if (result.exitCode !== 0) throw new Error(result.stderr.toString());
+			return result.stdout.toString().trim();
+		};
+		try {
+			await Promise.all([
+				fs.mkdir(path.dirname(indexPath), { recursive: true }),
+				fs.mkdir(path.dirname(executablePath), { recursive: true }),
+			]);
+			await Promise.all([
+				Bun.write(path.join(packageRoot, "package.json"), '{"name":"filemode-plugin","type":"module"}\n'),
+				Bun.write(indexPath, "export default function plugin() {}\n"),
+				Bun.write(executablePath, '#!/usr/bin/env bun\nconsole.log("clean");\n'),
+			]);
+			runGit("init", "-q");
+			runGit("config", "user.name", "OMP Test");
+			runGit("config", "user.email", "omp-test@example.com");
+			runGit("config", "core.fileMode", "false");
+			runGit("remote", "add", "origin", "https://github.com/Smarty-Pants-Inc/smarty-dev.git");
+			runGit("add", ".");
+			runGit("update-index", "--chmod=+x", relativeExecutablePath);
+			runGit("commit", "-qm", "approved executable package");
+			await fs.chmod(executablePath, 0o644);
+			const commit = runGit("rev-parse", "HEAD");
+			const tree = runGit("rev-parse", "HEAD^{tree}");
+			const release = {
+				candidates: [{ repository: "Smarty-Pants-Inc/smarty-dev", commit, tree }],
+			} as unknown as Parameters<typeof isApprovedCandidateSource>[1];
+
+			expect(runGit("ls-tree", "HEAD", "--", relativeExecutablePath)).toStartWith("100755 blob ");
+			expect(runGit("status", "--porcelain=v1", "--", relativeExecutablePath)).toBe("");
+			expect(await isApprovedCandidateSource(indexPath, release)).toBe(true);
+
+			runGit("update-index", "--assume-unchanged", relativeExecutablePath);
+			await Bun.write(executablePath, '#!/usr/bin/env bun\nconsole.log("drift");\n');
+			expect(runGit("status", "--porcelain=v1", "--", relativeExecutablePath)).toBe("");
+			expect(await isApprovedCandidateSource(indexPath, release)).toBe(false);
+		} finally {
+			await fs.rm(repositoryRoot, { recursive: true, force: true });
+		}
+	});
+
 	it("treats package directories as literal Git pathspecs", async () => {
 		const repositoryRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-literal-package-pathspec-"));
 		const packageRoot = path.join(repositoryRoot, "packages/plugin[1]");
