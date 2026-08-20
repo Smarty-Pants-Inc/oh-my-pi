@@ -3,7 +3,7 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { getSegmenter } from "@oh-my-pi/pi-tui";
 import { isRecord } from "@oh-my-pi/pi-utils";
 import type { ExtensionAPI } from "../extensibility/extensions/types";
-import type { Goal, GoalStatus } from "../goals/state";
+import { type Goal, type GoalStatus, parseGoalModeState } from "../goals/state";
 import { isSilentAbort, isUserInterruptAbort } from "../session/messages";
 import type { SessionEntry } from "../session/session-entries";
 import { isTodoPhase, nextActionableTask, type TodoPhase } from "../tools/todo";
@@ -49,16 +49,6 @@ const THINKING_LEVELS: Record<ThinkingLevel, true> = {
 	high: true,
 	xhigh: true,
 	max: true,
-};
-const GOAL_STATUSES: Record<GoalStatus, true> = {
-	active: true,
-	paused: true,
-	blocked: true,
-	budget_limited: true,
-	usage_limited: true,
-	complete: true,
-	dropped: true,
-	superseded: true,
 };
 
 export type CompanionStateName =
@@ -261,15 +251,9 @@ function normalizeThinkingLevel(value: unknown): ThinkingLevel | undefined {
 }
 
 export function summarizeGoal(value: unknown): GoalSummary | undefined {
-	if (
-		!isRecord(value) ||
-		typeof value.objective !== "string" ||
-		typeof value.status !== "string" ||
-		!Object.hasOwn(GOAL_STATUSES, value.status)
-	) {
-		return undefined;
-	}
-	return { objective: value.objective, status: value.status as GoalStatus };
+	if (!isRecord(value) || typeof value.status !== "string") return undefined;
+	const state = parseGoalModeState(value.status === "paused" ? "goal_paused" : "goal", { goal: value });
+	return state ? { objective: state.goal.objective, status: state.goal.status } : undefined;
 }
 
 export function goalFromBranch(entries: readonly SessionEntry[]): GoalSummary | undefined {
@@ -277,7 +261,8 @@ export function goalFromBranch(entries: readonly SessionEntry[]): GoalSummary | 
 		const entry = entries[index];
 		if (entry.type !== "mode_change") continue;
 		if (entry.mode !== "goal" && entry.mode !== "goal_paused") return undefined;
-		return summarizeGoal(entry.data?.goal);
+		const state = parseGoalModeState(entry.mode, entry.data);
+		return state ? { objective: state.goal.objective, status: state.goal.status } : undefined;
 	}
 	return undefined;
 }

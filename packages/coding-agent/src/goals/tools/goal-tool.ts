@@ -12,7 +12,7 @@ import { formatErrorDetail, TRUNCATE_LENGTHS } from "../../tools/render-utils";
 import { ToolError } from "../../tools/tool-errors";
 import { framedBlock, renderStatusLine, truncateToWidth } from "../../tui";
 import { completionBudgetReport, remainingTokens, sameRouteFailureLimitLabel } from "../runtime";
-import type { Goal, GoalStatus, GoalToolDetails } from "../state";
+import { type Goal, type GoalStatus, type GoalToolDetails, isCurrentGoalModeState } from "../state";
 
 const goalSchema = type({
 	op: type("'create' | 'get' | 'complete' | 'block'").describe("goal operation"),
@@ -89,7 +89,7 @@ export class GoalTool implements AgentTool<typeof goalSchema, GoalToolDetails> {
 			response = buildGoalToolResponse(created.goal);
 		} else if (params.op === "get") {
 			const state = this.#session.getGoalModeState?.();
-			response = buildGoalToolResponse(state?.goal ?? null);
+			response = buildGoalToolResponse(isCurrentGoalModeState(state) ? state.goal : null);
 		} else if (params.op === "complete") {
 			const completed = await runtime.completeGoalFromTool();
 			response = buildGoalToolResponse(completed, { includeCompletionReport: true });

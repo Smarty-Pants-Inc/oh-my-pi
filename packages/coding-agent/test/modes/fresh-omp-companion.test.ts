@@ -9,6 +9,7 @@ import type {
 	ExtensionHandler,
 	TerminalInputHandler,
 } from "../../src/extensibility/extensions/types";
+import type { GoalStatus } from "../../src/goals/state";
 import {
 	createFreshOmpCompanionController,
 	type FreshOmpCompanionController,
@@ -198,6 +199,18 @@ function modeEntry(mode: string, data?: Record<string, unknown>): SessionEntry {
 		mode,
 		data,
 	} as never as SessionEntry;
+}
+
+function persistedGoal(objective: string, status: GoalStatus = "active"): Record<string, unknown> {
+	return {
+		id: "goal-1",
+		objective,
+		status,
+		tokensUsed: 0,
+		timeUsedSeconds: 0,
+		createdAt: 0,
+		updatedAt: 0,
+	};
 }
 
 function thinkingEntry(configured: "auto" | "off" | "low" | "high"): SessionEntry {
@@ -495,7 +508,7 @@ describe("Fresh OMP companion wire snapshots", () => {
 		harness.jobCounts = { running: 1, recentFailures: 3, pendingDelivery: 4 };
 		harness.branch = [
 			modeEntry("goal", {
-				goal: { objective: "  Ship\n\u202e safely  ", status: "active" },
+				goal: persistedGoal("  Ship\n\u202e safely  "),
 			}),
 			todoEntry([
 				{
@@ -598,6 +611,36 @@ describe("Fresh OMP companion wire snapshots", () => {
 		});
 		advance(50);
 		expect(parseFrame(write.mock.calls.at(-1)?.[0] as string, SECRET).envelope.snapshot.todos).toBeUndefined();
+	});
+
+	it("omits terminal goal history from the current companion snapshot", async () => {
+		vi.useFakeTimers();
+		const write = vi.spyOn(process.stdout, "write").mockReturnValue(true);
+		const harness = new CompanionHarness();
+		harness.branch = [modeEntry("goal", { goal: persistedGoal("Shipped", "complete") })];
+
+		await harness.start();
+		advance(1_000);
+
+		expect(parseFrame(write.mock.calls.at(-1)?.[0] as string, SECRET).envelope.snapshot.goal).toBeUndefined();
+	});
+
+	it("clears terminal goal updates from the current companion snapshot", async () => {
+		vi.useFakeTimers();
+		const write = vi.spyOn(process.stdout, "write").mockReturnValue(true);
+		const harness = new CompanionHarness();
+		await harness.start();
+
+		harness.invoke("goal_updated", { goal: persistedGoal("Shipping") });
+		advance(50);
+		expect(parseFrame(write.mock.calls.at(-1)?.[0] as string, SECRET).envelope.snapshot.goal).toEqual({
+			objective: "Shipping",
+			status: "active",
+		});
+
+		harness.invoke("goal_updated", { goal: persistedGoal("Shipped", "complete") });
+		advance(50);
+		expect(parseFrame(write.mock.calls.at(-1)?.[0] as string, SECRET).envelope.snapshot.goal).toBeUndefined();
 	});
 });
 
@@ -989,7 +1032,7 @@ describe("Fresh OMP companion lifecycle and generation isolation", () => {
 			sessionGeneration: 3,
 		});
 
-		harness.branch = [modeEntry("goal", { goal: { objective: "Old goal", status: "active" } })];
+		harness.branch = [modeEntry("goal", { goal: persistedGoal("Old goal") })];
 		const beforeBranch = write.mock.calls.length;
 		harness.beforeSessionMutation("session_branch");
 		harness.invoke("session_branch", { previousSessionFile: "/retained" });
@@ -1042,10 +1085,7 @@ describe("Fresh OMP companion lifecycle and generation isolation", () => {
 		vi.useFakeTimers();
 		const write = vi.spyOn(process.stdout, "write").mockReturnValue(true);
 		const harness = new CompanionHarness();
-		harness.branch = [
-			modeEntry("goal", { goal: { objective: "Cached goal", status: "active" } }),
-			thinkingEntry("low"),
-		];
+		harness.branch = [modeEntry("goal", { goal: persistedGoal("Cached goal") }), thinkingEntry("low")];
 		harness.controller.setThinkingLevel("auto");
 		await harness.start();
 		expect(harness.getBranch).toHaveBeenCalledTimes(1);
