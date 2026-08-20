@@ -187,7 +187,7 @@ describe("issue #970 custom provider discovery", () => {
 		await registry.refreshProvider("vllm");
 
 		const qwen38 = registry.find("vllm", "Qwen3.8-27B-UD-Q6_K_XL");
-		expect(qwen38?.compat.qwenTemplateReasoningEffort).toBe(false);
+		expect(qwen38?.compat).toMatchObject({ qwenTemplateReasoningEffort: false });
 		expect(qwen38?.reasoning).toBe(false);
 		expect(qwen38?.thinking).toBeUndefined();
 	});
