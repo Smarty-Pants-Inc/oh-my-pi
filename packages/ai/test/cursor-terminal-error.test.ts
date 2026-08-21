@@ -1,8 +1,13 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import * as http2 from "node:http2";
-import { create, toBinary } from "@bufbuild/protobuf";
 import { streamCursor } from "@oh-my-pi/pi-ai/providers/cursor";
-import type { Context, CursorToolResultHandler, Model, ToolResultMessage } from "@oh-my-pi/pi-ai/types";
+import type {
+	Context,
+	CursorExecHandlers,
+	CursorToolResultHandler,
+	Model,
+	ToolResultMessage,
+} from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import {
 	AgentServerMessageSchema,
@@ -15,7 +20,8 @@ import {
 	TurnEndedUpdateSchema,
 	UpdateTodosArgsSchema,
 	UpdateTodosToolCallSchema,
-} from "@oh-my-pi/pi-catalog/discovery/cursor-gen/agent_pb";
+} from "@oh-my-pi/pi-catalog/discovery/cursor-proto";
+import { create, toBinary } from "@oh-my-pi/pi-catalog/discovery/protobuf";
 
 const CONNECT_END_STREAM_FLAG = 0b00000010;
 
@@ -273,12 +279,19 @@ const context: Context = {
 
 async function collectStream(
 	model: Model<"cursor-agent">,
-	options?: { signal?: AbortSignal; onToolResult?: CursorToolResultHandler },
+	options?: {
+		signal?: AbortSignal;
+		onToolResult?: CursorToolResultHandler;
+		execHandlers?: CursorExecHandlers;
+		providerDispatchGuard?: () => void;
+	},
 ) {
 	const stream = streamCursor(model, context, {
 		apiKey: "test-token",
 		signal: options?.signal,
 		onToolResult: options?.onToolResult,
+		execHandlers: options?.execHandlers,
+		providerDispatchGuard: options?.providerDispatchGuard,
 	});
 	const eventTypes: string[] = [];
 	for await (const event of stream) {
@@ -404,6 +417,42 @@ describe("Cursor terminal lifecycle after turnEnded", () => {
 		expect(eventTypes.at(-1)).toBe("error");
 		expect(eventTypes).not.toContain("done");
 		expect(result.stopReason).toBe("aborted");
+	});
+
+	it("terminates when the dispatch guard rejects a local exec result", async () => {
+		scenario = { kind: "exec-then-hang" };
+		const baseUrl = await startServer();
+		const handlerStarted = Promise.withResolvers<void>();
+		const releaseHandler = Promise.withResolvers<void>();
+		let valid = true;
+		const completion = collectStream(makeModel(baseUrl), {
+			execHandlers: {
+				async read(args) {
+					handlerStarted.resolve();
+					await releaseHandler.promise;
+					return {
+						role: "toolResult",
+						toolCallId: args.toolCallId,
+						toolName: "read",
+						content: [{ type: "text", text: "newly sensitive file contents" }],
+						isError: false,
+						timestamp: 1,
+					};
+				},
+			},
+			providerDispatchGuard: () => {
+				if (!valid) throw new Error("Cursor request became stale during local exec");
+			},
+		});
+
+		await handlerStarted.promise;
+		valid = false;
+		releaseHandler.resolve();
+		const { eventTypes, result } = await completion;
+
+		expect(eventTypes.at(-1)).toBe("error");
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("Cursor request became stale during local exec");
 	});
 
 	it("waits for an exec handler decoded from the final chunk before done", async () => {

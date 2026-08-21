@@ -442,41 +442,44 @@ export class HubTool implements AgentTool<typeof hubSchema, HubDetails> {
 		emitProgress();
 
 		try {
-			if (signal) {
-				const { promise: abortPromise, resolve: abortResolve } = Promise.withResolvers<void>();
-				const onAbort = () => abortResolve();
-				signal.addEventListener("abort", onAbort, { once: true });
-				racePromises.push(abortPromise);
-				try {
+			try {
+				if (signal) {
+					const { promise: abortPromise, resolve: abortResolve } = Promise.withResolvers<void>();
+					const onAbort = () => abortResolve();
+					signal.addEventListener("abort", onAbort, { once: true });
+					racePromises.push(abortPromise);
+					try {
+						await Promise.race(racePromises);
+					} finally {
+						signal.removeEventListener("abort", onAbort);
+					}
+				} else {
 					await Promise.race(racePromises);
-				} finally {
-					signal.removeEventListener("abort", onAbort);
 				}
-			} else {
-				await Promise.race(racePromises);
+			} finally {
+				clearTimeout(timeoutHandle);
+				clearInterval(progressTimer);
+				busAbort?.abort(busCancelled);
+				removeBusAbortListener?.();
+				if (usedSmartWindow) {
+					// Reset the idle-gap clock: escalate if the agent waits again soon,
+					// drop back to the floor once it goes quiet for a while.
+					manager.recordPollWaitEnd(ownerId);
+				}
 			}
+
+			// A message consumed by the bus waiter must never be dropped — it wins
+			// even a photo-finish race. Keep jobs watched until this choice is made
+			// so a manual job result can acknowledge before automatic delivery resumes.
+			if (busLeg && messaging) {
+				const settled = await busLeg;
+				if (settled.message) return messageResult(messaging.senderId, settled.message);
+			}
+
+			return buildJobResult(this.session, manager, "wait", jobsToWatch, []);
 		} finally {
-			manager.unwatchJobs(watchedJobIds);
-			if (timeoutHandle) clearTimeout(timeoutHandle);
-			if (progressTimer) clearInterval(progressTimer);
-			busAbort?.abort(busCancelled);
-			removeBusAbortListener?.();
-			if (usedSmartWindow) {
-				// Reset the idle-gap clock: escalate if the agent waits again soon,
-				// drop back to the floor once it goes quiet for a while.
-				manager.recordPollWaitEnd(ownerId);
-			}
+			manager.unwatchJobs(watchedJobIds, { resumeDeliveries: true });
 		}
-
-		// A message consumed by the bus waiter must never be dropped — it wins
-		// even a photo-finish race (job results re-deliver themselves; a
-		// dequeued message would otherwise be lost).
-		if (busLeg && messaging) {
-			const settled = await busLeg;
-			if (settled.message) return messageResult(messaging.senderId, settled.message);
-		}
-
-		return buildJobResult(this.session, manager, "wait", jobsToWatch, []);
 	}
 }
 

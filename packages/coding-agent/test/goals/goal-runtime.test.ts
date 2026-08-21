@@ -401,6 +401,34 @@ Do not start new substantive work. Preserve useful state, report verified progre
 		expect(rendered).not.toContain("unbounded");
 	});
 
+	it("keeps the current goal objective and status visible to advisors without volatile accounting", () => {
+		expect(createHarness().runtime.buildAdvisorMissionPrompt()).toBeUndefined();
+
+		for (const status of [
+			"active",
+			"paused",
+			"blocked",
+			"budget_limited",
+			"usage_limited",
+			"complete",
+			"dropped",
+			"superseded",
+		] as const) {
+			const harness = createHarness({
+				state: {
+					enabled: status === "active",
+					mode: status === "complete" ? "exiting" : "active",
+					goal: createGoal({ status, tokenBudget: 100, tokensUsed: 75 }),
+				},
+			});
+			const rendered = harness.runtime.buildAdvisorMissionPrompt();
+			expect(rendered).toContain(`status="${status}"`);
+			expect(rendered).toContain("Ship &lt;fast&gt; &amp; safely");
+			expect(rendered).not.toContain("Budget:");
+			expect(rendered).not.toContain("75");
+		}
+	});
+
 	it("builds active and continuation context only for an active goal", () => {
 		const active = createHarness({ state: { enabled: true, mode: "active", goal: createGoal() } });
 		expect(active.runtime.buildActivePrompt()).toContain("Active goal:");

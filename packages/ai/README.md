@@ -634,7 +634,7 @@ All providers accept the base `StreamOptions` (in addition to provider-specific 
 - `headers`: Extra request headers merged on top of model-defined headers
 - `sessionId`: Provider-specific session identifier (prompt caching/routing)
 - `signal`: Abort in-flight requests
-- `onPayload`: Callback invoked with the provider request payload just before sending
+- `onPayload`: Callback invoked with the provider request payload just before sending. Return a replacement payload object (sync or async) to send it instead of the original; return `undefined` to keep the original. Devin exposes credential-redacted ProtoJSON to the hook, validates the JSON-safe replacement, restores credentials, and then encodes protobuf bytes.
 
 Example:
 

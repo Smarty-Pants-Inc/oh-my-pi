@@ -150,6 +150,7 @@ async function readPlaceholderKeyFile(keyPath: string, retry: boolean): Promise<
 type RawSecretEntry = Omit<SecretEntry, "friendlyName"> & { friendlyName?: unknown };
 
 export {
+	collectProviderContextRegexSecretValues,
 	deobfuscateSessionContext,
 	deobfuscateToolArguments,
 	obfuscateMessages,

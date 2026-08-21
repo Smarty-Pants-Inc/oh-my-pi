@@ -5,11 +5,15 @@
  * messaging/job suites.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
+import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
+import type { ImageContent } from "@oh-my-pi/pi-ai";
+import { type AsyncJob, AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { type CoordinationDetails, HubTool } from "@oh-my-pi/pi-coding-agent/tools/hub";
+import { wrapToolWithMetaNotice } from "@oh-my-pi/pi-coding-agent/tools/output-meta";
 
 const SELF_ID = "Main";
 
@@ -32,10 +36,22 @@ function makeSession(manager: AsyncJobManager | undefined): ToolSession {
 }
 
 /** Register a job that never settles on its own; returns its id + resolver. */
-function registerHangingJob(manager: AsyncJobManager, label: string): { id: string; finish: (text: string) => void } {
-	const { promise, resolve } = Promise.withResolvers<string>();
-	const id = manager.register("bash", label, async () => promise, { ownerId: SELF_ID });
-	return { id, finish: resolve };
+function registerHangingJob(
+	manager: AsyncJobManager,
+	label: string,
+): { id: string; finish: (text: string, resultContent?: AsyncJob["resultContent"]) => void } {
+	const gate = Promise.withResolvers<{ text: string; resultContent?: AsyncJob["resultContent"] }>();
+	const id = manager.register(
+		"bash",
+		label,
+		async ({ setResultContent }) => {
+			const result = await gate.promise;
+			if (result.resultContent) setResultContent(result.resultContent);
+			return result.text;
+		},
+		{ ownerId: SELF_ID },
+	);
+	return { id, finish: (text, resultContent) => gate.resolve({ text, resultContent }) };
 }
 
 describe("hub unified wait", () => {
@@ -74,6 +90,88 @@ describe("hub unified wait", () => {
 		manager.cancel(job.id);
 	});
 
+	test("requeues a photo-finish job when a peer message wins", async () => {
+		const registry = AgentRegistry.global();
+		registry.register({ id: SELF_ID, displayName: "main", kind: "main", session: null });
+		registry.register({ id: "Peer", displayName: "task", kind: "sub", parentId: SELF_ID, session: null });
+
+		const automaticDeliveries: Array<{ jobId: string; text: string }> = [];
+		const manager = new AsyncJobManager({});
+		manager.registerDeliverySink(SELF_ID, (jobId, text) => {
+			automaticDeliveries.push({ jobId, text });
+		});
+		const job = registerHangingJob(manager, "photo finish");
+		const pending = new HubTool(makeSession(manager)).execute("call_photo_finish", { op: "wait", ids: [job.id] });
+
+		// Resolving the parked message waiter first makes the message the race
+		// winner; settling the job in the same turn keeps it watched until cleanup.
+		const send = IrcBus.global().send({ from: "Peer", to: SELF_ID, body: "message wins" });
+		job.finish("job also finished");
+		await send;
+		const result = await pending;
+		await manager.drainDeliveries({ filter: { ownerId: SELF_ID }, timeoutMs: 100 });
+
+		const details = result.details as CoordinationDetails;
+		expect(details.waited?.body).toBe("message wins");
+		expect(manager.getJob(job.id)?.status).toBe("completed");
+		expect(manager.isDeliverySuppressed(job.id)).toBe(false);
+		expect(automaticDeliveries).toEqual([{ jobId: job.id, text: "job also finished" }]);
+	});
+
+	test("delivers a watched photo-finish before zero-retention eviction", async () => {
+		const registry = AgentRegistry.global();
+		registry.register({ id: SELF_ID, displayName: "main", kind: "main", session: null });
+		registry.register({ id: "Peer", displayName: "task", kind: "sub", parentId: SELF_ID, session: null });
+
+		const automaticDeliveries: string[] = [];
+		const manager = new AsyncJobManager({ retentionMs: 0 });
+		manager.registerDeliverySink(SELF_ID, (_jobId, text) => {
+			automaticDeliveries.push(text);
+		});
+		const job = registerHangingJob(manager, "zero retention photo finish");
+		const pending = new HubTool(makeSession(manager)).execute("call_zero_retention", {
+			op: "wait",
+			ids: [job.id],
+		});
+
+		const send = IrcBus.global().send({ from: "Peer", to: SELF_ID, body: "message before eviction" });
+		job.finish("retained until delivery");
+		await send;
+		const result = await pending;
+		await manager.drainDeliveries({ filter: { ownerId: SELF_ID }, timeoutMs: 100 });
+
+		expect((result.details as CoordinationDetails).waited?.body).toBe("message before eviction");
+		expect(automaticDeliveries).toEqual(["retained until delivery"]);
+		expect(manager.getJob(job.id)).toBeUndefined();
+	});
+
+	test("keeps a shared watch until the overlapping manual wait acknowledges", async () => {
+		const registry = AgentRegistry.global();
+		registry.register({ id: SELF_ID, displayName: "main", kind: "main", session: null });
+		registry.register({ id: "Peer", displayName: "task", kind: "sub", parentId: SELF_ID, session: null });
+
+		const automaticDeliveries: string[] = [];
+		const manager = new AsyncJobManager({});
+		manager.registerDeliverySink(SELF_ID, (_jobId, text) => {
+			automaticDeliveries.push(text);
+		});
+		const job = registerHangingJob(manager, "shared watch");
+		const tool = new HubTool(makeSession(manager));
+		const messageWait = tool.execute("call_overlap_message", { op: "wait", ids: [job.id] });
+		const manualWait = tool.execute("call_overlap_manual", { op: "wait", ids: [job.id] });
+
+		const send = IrcBus.global().send({ from: "Peer", to: SELF_ID, body: "first wait wins message" });
+		job.finish("shared result");
+		await send;
+		const [messageResult, manualResult] = await Promise.all([messageWait, manualWait]);
+		await manager.drainDeliveries({ filter: { ownerId: SELF_ID }, timeoutMs: 1 });
+
+		expect((messageResult.details as CoordinationDetails).waited?.body).toBe("first wait wins message");
+		expect((manualResult.details as CoordinationDetails).jobs?.[0]?.resultText).toBe("shared result");
+		expect(manager.isDeliverySuppressed(job.id)).toBe(true);
+		expect(automaticDeliveries).toEqual([]);
+	});
+
 	test("a settling job returns the snapshot exactly like the old poll", async () => {
 		const registry = AgentRegistry.global();
 		registry.register({ id: SELF_ID, displayName: "main", kind: "main", session: null });
@@ -93,6 +191,111 @@ describe("hub unified wait", () => {
 		expect(details.jobs?.[0]?.resultText).toBe("done output");
 		const text = result.content[0]?.type === "text" ? result.content[0].text : "";
 		expect(text).toContain("## Completed (1)");
+		expect(result.content).toHaveLength(1);
+	});
+
+	test("returns two image jobs with recoverable boundaries and suppresses automatic delivery", async () => {
+		const registry = AgentRegistry.global();
+		registry.register({ id: SELF_ID, displayName: "main", kind: "main", session: null });
+		registry.register({ id: "Peer", displayName: "task", kind: "sub", parentId: SELF_ID, session: null });
+
+		const automaticDeliveries: string[] = [];
+		const manager = new AsyncJobManager({});
+		manager.registerDeliverySink(SELF_ID, (_jobId, text) => {
+			automaticDeliveries.push(text);
+		});
+		const first = registerHangingJob(manager, "first image job");
+		const second = registerHangingJob(manager, "second image job");
+		const tool = new HubTool(makeSession(manager));
+		const firstImage: ImageContent = { type: "image", data: "Zmlyc3Q=", mimeType: "image/png" };
+		const secondImage: ImageContent = { type: "image", data: "c2Vjb25k", mimeType: "image/jpeg" };
+
+		const pending = tool.execute("call_images", { op: "wait", ids: [first.id, second.id] });
+		first.finish("first image ready", [{ type: "text", text: "first image ready" }, firstImage]);
+		second.finish("second image ready", [{ type: "text", text: "second image ready" }, secondImage]);
+		const result = await pending;
+
+		const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+		expect(text).toContain(`Image #1: job \`${first.id}\``);
+		expect(text).toContain(`Image #2: job \`${second.id}\``);
+		expect(text.indexOf(`Image #1: job \`${first.id}\``)).toBeLessThan(
+			text.indexOf(`Image #2: job \`${second.id}\``),
+		);
+		expect(text).not.toContain(firstImage.data);
+		expect(text).not.toContain(secondImage.data);
+		expect(result.content[1]).toBe(firstImage);
+		expect(result.content[2]).toBe(secondImage);
+		expect(manager.isDeliverySuppressed(first.id)).toBe(true);
+		expect(manager.isDeliverySuppressed(second.id)).toBe(true);
+		await manager.drainDeliveries({ filter: { ownerId: SELF_ID }, timeoutMs: 1 });
+		expect(automaticDeliveries).toEqual([]);
+	});
+
+	test("spills oversized mixed job results without moving images ahead of their job map", async () => {
+		const registry = AgentRegistry.global();
+		registry.register({ id: SELF_ID, displayName: "main", kind: "main", session: null });
+
+		const manager = new AsyncJobManager({});
+		manager.registerDeliverySink(SELF_ID, () => {});
+		const firstImage: ImageContent = { type: "image", data: "c3BpbGwtZmlyc3Q=", mimeType: "image/png" };
+		const secondImage: ImageContent = { type: "image", data: "c3BpbGwtc2Vjb25k", mimeType: "image/jpeg" };
+		const hugeResult = `spill payload start\n${"x".repeat(8_192)}\nspill payload end`;
+		const firstId = manager.register(
+			"eval",
+			"oversized image job",
+			async ({ setResultContent }) => {
+				setResultContent([{ type: "text", text: hugeResult }, firstImage]);
+				return hugeResult;
+			},
+			{ id: "spill-image-1", ownerId: SELF_ID },
+		);
+		const secondId = manager.register(
+			"eval",
+			"small image job",
+			async ({ setResultContent }) => {
+				setResultContent([{ type: "text", text: "second ready" }, secondImage]);
+				return "second ready";
+			},
+			{ id: "spill-image-2", ownerId: SELF_ID },
+		);
+		await Promise.all([manager.getJob(firstId)?.promise, manager.getJob(secondId)?.promise]);
+
+		const spillSettings = Settings.isolated({
+			"tools.artifactSpillThreshold": 1,
+			"tools.artifactTailBytes": 1,
+			"tools.artifactTailLines": 100,
+			"tools.artifactHeadBytes": 1,
+		});
+		const saved: string[] = [];
+		const context = {
+			settings: spillSettings,
+			sessionManager: {
+				saveArtifact: async (content: string) => {
+					saved.push(content);
+					return "hub-spill";
+				},
+			},
+		} as unknown as AgentToolContext;
+		const result = await wrapToolWithMetaNotice(new HubTool(makeSession(manager))).execute(
+			"call_spill",
+			{ op: "jobs" },
+			undefined,
+			undefined,
+			context,
+		);
+
+		expect(saved).toHaveLength(1);
+		expect(saved[0]).toContain("spill payload start");
+		expect(saved[0]).toContain(`Image #1: job \`${firstId}\``);
+		expect(saved[0]).toContain(`Image #2: job \`${secondId}\``);
+		expect(result.content.map(block => block.type)).toEqual(["text", "image", "image"]);
+		const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+		expect(text).toContain("artifact://hub-spill");
+		expect(text).toContain(`Image #1: job \`${firstId}\``);
+		expect(text).toContain(`Image #2: job \`${secondId}\``);
+		expect(result.content[1]).toBe(firstImage);
+		expect(result.content[2]).toBe(secondImage);
+		await manager.dispose();
 	});
 
 	test("bare wait with no jobs and no running peers returns immediately", async () => {

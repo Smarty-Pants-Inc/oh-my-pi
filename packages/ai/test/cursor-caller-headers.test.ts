@@ -1,6 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import * as http2 from "node:http2";
-import { create, toBinary } from "@bufbuild/protobuf";
 import { streamCursor } from "@oh-my-pi/pi-ai/providers/cursor";
 import type { Context, Model } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
@@ -9,7 +8,8 @@ import {
 	InteractionUpdateSchema,
 	TextDeltaUpdateSchema,
 	TurnEndedUpdateSchema,
-} from "@oh-my-pi/pi-catalog/discovery/cursor-gen/agent_pb";
+} from "@oh-my-pi/pi-catalog/discovery/cursor-proto";
+import { create, toBinary } from "@oh-my-pi/pi-catalog/discovery/protobuf";
 
 // Cursor forwards caller headers (including `before_provider_headers` extension
 // edits), and it speaks HTTP/2. These assert the TRANSPORT contract against a
@@ -185,5 +185,45 @@ describe("Cursor caller headers reach the wire", () => {
 		expect(sent[":authority"]).toContain("127.0.0.1");
 		expect(sent.host).toBeUndefined();
 		expect(sent["x-trace"]).toBe("kept");
+	});
+
+	it("revalidates after async preparation before opening the HTTP/2 stream", async () => {
+		const baseUrl = await startServer();
+		const preparationStarted = Promise.withResolvers<void>();
+		const releasePreparation = Promise.withResolvers<void>();
+		let valid = true;
+		const stream = streamCursor(makeModel(baseUrl), context, {
+			apiKey: "test-token",
+			onToolContracts: async () => {
+				preparationStarted.resolve();
+				await releasePreparation.promise;
+			},
+			providerDispatchGuard: () => {
+				if (!valid) throw new Error("Cursor request became stale during preparation");
+			},
+		});
+
+		await preparationStarted.promise;
+		valid = false;
+		releasePreparation.resolve();
+		const result = await stream.result();
+
+		expect(result.errorMessage).toContain("Cursor request became stale during preparation");
+		expect(received).toEqual({});
+	});
+
+	it("does not open an HTTP/2 stream for an already-aborted request", async () => {
+		const baseUrl = await startServer();
+		const controller = new AbortController();
+		controller.abort();
+
+		const stream = streamCursor(makeModel(baseUrl), context, {
+			apiKey: "test-token",
+			signal: controller.signal,
+		});
+		const result = await stream.result();
+
+		expect(result.stopReason).toBe("aborted");
+		expect(received).toEqual({});
 	});
 });

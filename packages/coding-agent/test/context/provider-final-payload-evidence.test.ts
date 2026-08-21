@@ -1,10 +1,10 @@
 import { describe, expect, it } from "bun:test";
-import { create, toBinary } from "@bufbuild/protobuf";
 import type { ContextInstruction, Model } from "@oh-my-pi/pi-ai";
 import { streamCursor } from "@oh-my-pi/pi-ai/providers/cursor";
 import { streamDevin } from "@oh-my-pi/pi-ai/providers/devin";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import { GetUserJwtResponseSchema } from "@oh-my-pi/pi-catalog/discovery/devin-gen/exa/auth_pb/auth_pb";
+import { GetUserJwtResponseSchema } from "@oh-my-pi/pi-catalog/discovery/devin-proto";
+import { create, toBinary } from "@oh-my-pi/pi-catalog/discovery/protobuf";
 import { sha256 } from "../../src/context/canonical";
 import { captureRuntimeContextEvidence } from "../../src/context/explain";
 
