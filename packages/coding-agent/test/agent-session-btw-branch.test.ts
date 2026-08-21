@@ -470,6 +470,7 @@ describe("AgentSession.branchFromBtw", () => {
 					checkpoint: unknown;
 					advisorStats: StableAdvisorStats;
 					goalModeState: GoalModeState | undefined;
+					terminalGoalHistoryEntry: unknown;
 					advisorYieldQueued: boolean;
 					receiptSettled: boolean;
 					advisorPaused: boolean;
@@ -509,6 +510,9 @@ describe("AgentSession.branchFromBtw", () => {
 							checkpoint: activeSession.getCheckpointState(),
 							advisorStats: stableAdvisorStats(activeSession.getAdvisorStats()),
 							goalModeState: activeSession.getGoalModeState(),
+							terminalGoalHistoryEntry: activeSession.sessionManager
+								.getEntries()
+								.findLast(entry => entry.type === "mode_change" && entry.mode === "goal"),
 							advisorYieldQueued: activeSession.yieldQueue.has("advisor"),
 							receiptSettled,
 							advisorPaused: !advisorResumed,
@@ -545,6 +549,7 @@ describe("AgentSession.branchFromBtw", () => {
 		});
 		activeSession.settings.setModelRole("advisor", "anthropic/claude-sonnet-4-5");
 		expect(activeSession.toggleAdvisorEnabled()).toBe(true);
+		activeSession.sessionManager.appendModeChange("goal", { goal: terminalGoalState.goal });
 		activeSession.setGoalModeState(terminalGoalState);
 		const advisor = activeSession.getAdvisorAgent();
 		if (!advisor) throw new Error("Expected advisor agent to exist");
@@ -646,7 +651,12 @@ describe("AgentSession.branchFromBtw", () => {
 			followUp: [retainedFollowUp],
 			checkpoint,
 			advisorStats: retainedAdvisorStats,
-			goalModeState: terminalGoalState,
+			goalModeState: undefined,
+			terminalGoalHistoryEntry: expect.objectContaining({
+				type: "mode_change",
+				mode: "goal",
+				data: { goal: terminalGoalState.goal },
+			}),
 			advisorYieldQueued: true,
 			receiptSettled: false,
 			advisorPaused: true,
@@ -659,7 +669,7 @@ describe("AgentSession.branchFromBtw", () => {
 		expect(activeSession.sessionManager.getLeafId()).toBe(retainedLeafId);
 		expect(activeSession.sessionManager.getEntries().map(entry => entry.id)).toEqual(retainedEntries);
 		expect(activeSession.getAdvisorCost()).toBe(7);
-		expect(activeSession.getGoalModeState()).toEqual(terminalGoalState);
+		expect(activeSession.getGoalModeState()).toBeUndefined();
 		expect(replacementSessionFile).toBeString();
 		expect(replacementSessionFile).not.toBe(retainedSessionFile);
 		expect(fs.existsSync(replacementSessionFile!)).toBe(false);

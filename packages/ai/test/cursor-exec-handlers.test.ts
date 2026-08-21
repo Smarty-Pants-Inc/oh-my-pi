@@ -458,29 +458,30 @@ describe("Cursor system prompt encoding", () => {
 		const jsons = buildCursorSystemPromptJsons(["", ""]);
 		expect(jsons).toHaveLength(1);
 		expect(JSON.parse(jsons[0])).toEqual({ role: "system", content: "You are a helpful assistant." });
+		expect(buildCursorRequestContextRules(["", ""])[0]?.content).toBe("You are a helpful assistant.");
 	});
 
-	it("encodes typed internal context as a system blob and never a user blob", () => {
-		const jsons = buildCursorSystemPromptJsons(
-			["Primary instructions."],
-			[
-				{
-					id: "compaction.summary",
-					sourcePath: "packages/agent/src/compaction/prompt.md",
-					role: "internal_context",
-					target: "main",
-					trigger: "compaction",
-					sha256: "test-sha256",
-					renderedText: "Preserve this compacted history.",
-				},
-			],
-			cursorModel,
-		);
+	it("encodes typed internal context as matching system blobs and global rules", () => {
+		const instructions: Context["instructions"] = [
+			{
+				id: "compaction.summary",
+				sourcePath: "packages/agent/src/compaction/prompt.md",
+				role: "internal_context",
+				target: "main",
+				trigger: "compaction",
+				sha256: "test-sha256",
+				renderedText: "Preserve this compacted history.",
+			},
+		];
+		const jsons = buildCursorSystemPromptJsons(["Primary instructions."], instructions, cursorModel);
+		const rules = buildCursorRequestContextRules(["Primary instructions."], instructions, cursorModel);
 
 		expect(jsons.map(json => JSON.parse(json))).toEqual([
 			{ role: "system", content: "Primary instructions." },
 			{ role: "system", content: "Preserve this compacted history." },
 		]);
+		expect(rules.map(rule => rule.content)).toEqual(["Primary instructions.", "Preserve this compacted history."]);
+		expect(rules.every(rule => rule.type?.type.case === "global")).toBe(true);
 	});
 
 	it("maps ordered system prompts to global CursorRule entries", () => {
@@ -1366,6 +1367,7 @@ describe("Cursor exec local-work tracking (issue #4593)", () => {
 			{ sawTokenDelta: false },
 			[],
 			undefined,
+			undefined,
 			() => {
 				if (!valid) throw new Error("Cursor request became stale during local exec");
 			},
@@ -1444,6 +1446,7 @@ describe("Cursor exec local-work tracking (issue #4593)", () => {
 			onToolResult,
 			{ sawTokenDelta: false },
 			[],
+			undefined,
 			undefined,
 			() => {
 				if (!valid) throw new Error("Cursor request became stale before output flush");

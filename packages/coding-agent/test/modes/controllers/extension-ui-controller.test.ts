@@ -406,6 +406,7 @@ function makeNewSessionInputHarness() {
 		setHostTerminalInput: vi.fn((register: (handler: InputListener) => () => void) => {
 			setHostTerminalInput?.(register);
 		}),
+		getComposerShapes: () => [],
 	};
 	const ctx = {
 		editor: new CustomEditor(getEditorTheme()),
@@ -431,6 +432,7 @@ function makeNewSessionInputHarness() {
 		},
 		setToolUIContext: vi.fn(),
 		addAutocompleteProvider: vi.fn(),
+		syncComposerShape: vi.fn(),
 		clearTransientSessionUi: vi.fn(),
 		statusLine: { invalidate: vi.fn(), resetActiveTime: vi.fn() },
 		resetTranscript: vi.fn(),

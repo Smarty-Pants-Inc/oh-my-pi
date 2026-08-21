@@ -8,6 +8,7 @@
  * This replaces the old single hardwired `onJobComplete` closure that routed
  * every completion — regardless of owner — into the first top-level session.
  */
+import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { prompt } from "@oh-my-pi/pi-utils";
 import type { AsyncJob, AsyncJobType } from "../async";
 import asyncResultTemplate from "../prompts/tools/async-result.md" with { type: "text" };
@@ -51,6 +52,27 @@ type AsyncResultJobDetails = {
 export type AsyncResultDetails = {
 	jobs: AsyncResultJobDetails[];
 };
+export function buildAsyncResultImageAttachments(
+	jobs: readonly { jobId: string; resultContent?: AsyncJob["resultContent"] }[],
+): { images: ImageContent[]; orderText?: string } {
+	const images: ImageContent[] = [];
+	const orderLines: string[] = [];
+	for (const job of jobs) {
+		const jobImages = job.resultContent?.filter((block): block is ImageContent => block.type === "image") ?? [];
+		for (const [index, image] of jobImages.entries()) {
+			images.push(image);
+			orderLines.push(
+				`- Image #${images.length}: job \`${job.jobId}\` (result image ${index + 1} of ${jobImages.length})`,
+			);
+		}
+	}
+	return {
+		images,
+		...(orderLines.length > 0
+			? { orderText: `Attached image order (preserved below):\n${orderLines.join("\n")}` }
+			: {}),
+	};
+}
 
 export function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): CustomMessage<AsyncResultDetails> | null {
 	if (entries.length === 0) return null;
@@ -71,13 +93,21 @@ export function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): Custo
 			originTurnId: job.originTurnId,
 		})),
 	};
+	const rendered = prompt.render(asyncResultTemplate, {
+		multiple: jobs.length > 1,
+		jobs,
+	});
+	const attachments = buildAsyncResultImageAttachments(
+		entries.map(entry => ({ jobId: entry.jobId, resultContent: entry.job?.resultContent })),
+	);
+	const renderedWithImageOrder = attachments.orderText ? `${rendered}\n\n${attachments.orderText}` : rendered;
 	return {
 		role: "custom",
 		customType: ASYNC_RESULT_MESSAGE_TYPE,
-		content: prompt.render(asyncResultTemplate, {
-			multiple: jobs.length > 1,
-			jobs,
-		}),
+		content:
+			attachments.images.length > 0
+				? [{ type: "text", text: renderedWithImageOrder }, ...attachments.images]
+				: renderedWithImageOrder,
 		display: true,
 		attribution: "agent",
 		details,

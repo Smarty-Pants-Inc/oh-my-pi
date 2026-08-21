@@ -407,6 +407,11 @@ function resolveStripTemplateKwargFallback(
 	if (effort === undefined) return undefined;
 	const status = extractHttpStatusFromError(error) ?? captured?.status;
 	if (status !== 400 && status !== 422) return undefined;
+	const code = capturedStringField(captured, "code")?.trim().toLowerCase();
+	const param = capturedStringField(captured, "param")?.trim().toLowerCase();
+	if (code === "unknown_parameter" && param === "chat_template_kwargs.reasoning_effort") {
+		return STRIP_TEMPLATE_KWARG_REASONING_EFFORT;
+	}
 	const message = collectMessageParts(error, captured);
 	if (!TEMPLATE_KWARG_EFFORT_PATTERN.test(message) || !FIELD_REJECTION_PATTERN.test(message)) return undefined;
 	// A value-level rejection listing allowed levels wants the value remapped

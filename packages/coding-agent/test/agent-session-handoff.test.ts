@@ -20,6 +20,8 @@ import { SecretObfuscator } from "@oh-my-pi/pi-coding-agent/secrets";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AsyncResultEntry } from "@oh-my-pi/pi-coding-agent/session/async-job-delivery";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { SessionHandoff, type SessionHandoffHost } from "@oh-my-pi/pi-coding-agent/session/session-handoff";
+import { SessionMaintenance } from "@oh-my-pi/pi-coding-agent/session/session-maintenance";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { createSettingsAwareStreamFn } from "@oh-my-pi/pi-coding-agent/session/settings-stream-fn";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
@@ -327,6 +329,223 @@ describe("AgentSession handoff", () => {
 			releaseApiKey.resolve();
 			await handoff;
 		}
+	});
+
+	it("rejects a concurrent direct handoff without losing the first abort owner", async () => {
+		const started = Promise.withResolvers<void>();
+		const cancelled = Promise.withResolvers<string>();
+		const generateHandoffSpy = vi
+			.spyOn(compactionModule, "generateHandoffFromContext")
+			.mockImplementation((_context, _model, options) => {
+				started.resolve();
+				options.streamOptions.signal?.addEventListener(
+					"abort",
+					() => cancelled.reject(new Error("provider request aborted")),
+					{ once: true },
+				);
+				return cancelled.promise;
+			});
+
+		const first = session.handoff();
+		await started.promise;
+		await expect(session.handoff()).rejects.toThrow("Handoff generation is already in progress");
+		expect(session.isGeneratingHandoff).toBe(true);
+
+		const abort = session.abort({ reason: "Cancel the original handoff" });
+		await expect(first).rejects.toThrow("Cancel the original handoff");
+		await abort;
+
+		expect(generateHandoffSpy).toHaveBeenCalledTimes(1);
+		expect(session.isGeneratingHandoff).toBe(false);
+	});
+
+	it("aborts after document generation while retained flush is pending before creating a target", async () => {
+		await sessionManager.ensureOnDisk();
+		await sessionManager.flush();
+		const retainedSessionFile = session.sessionFile;
+		if (!retainedSessionFile) throw new Error("Expected retained session file");
+		const retainedEntryIds = sessionManager.getEntries().map(entry => entry.id);
+		vi.spyOn(compactionModule, "generateHandoffFromContext").mockResolvedValue("## Goal\nContinue from here");
+
+		let retainedCaptured = false;
+		const capturePersistedSessionFile = sessionManager.capturePersistedSessionFile.bind(sessionManager);
+		vi.spyOn(sessionManager, "capturePersistedSessionFile").mockImplementation(async () => {
+			const snapshot = await capturePersistedSessionFile();
+			retainedCaptured = true;
+			return snapshot;
+		});
+		const flushStarted = Promise.withResolvers<void>();
+		const releaseFlush = Promise.withResolvers<void>();
+		let blocked = false;
+		const flush = sessionManager.flush.bind(sessionManager);
+		vi.spyOn(sessionManager, "flush").mockImplementation(async () => {
+			if (retainedCaptured && !blocked) {
+				blocked = true;
+				flushStarted.resolve();
+				await releaseFlush.promise;
+			}
+			await flush();
+		});
+		const newSession = vi.spyOn(sessionManager, "newSession");
+
+		const handoff = session.handoff();
+		await flushStarted.promise;
+		const abort = session.abort({ reason: "Abort during handoff flush" });
+		releaseFlush.resolve();
+
+		await expect(handoff).rejects.toThrow("Abort during handoff flush");
+		await abort;
+		expect(newSession).not.toHaveBeenCalled();
+		expect(session.sessionFile).toBe(retainedSessionFile);
+		expect(sessionManager.getEntries().map(entry => entry.id)).toEqual(retainedEntryIds);
+	});
+
+	it("rolls back an abort during target materialization before handoff commit", async () => {
+		await sessionManager.ensureOnDisk();
+		await sessionManager.flush();
+		const retainedSessionFile = session.sessionFile;
+		if (!retainedSessionFile) throw new Error("Expected retained session file");
+		const retainedEntryIds = sessionManager.getEntries().map(entry => entry.id);
+		vi.spyOn(compactionModule, "generateHandoffFromContext").mockResolvedValue("## Goal\nContinue from here");
+
+		const materializationStarted = Promise.withResolvers<void>();
+		const releaseMaterialization = Promise.withResolvers<void>();
+		let replacementSessionFile: string | undefined;
+		const ensureOnDisk = sessionManager.ensureOnDisk.bind(sessionManager);
+		vi.spyOn(sessionManager, "ensureOnDisk").mockImplementation(async () => {
+			if (session.sessionFile !== retainedSessionFile) {
+				replacementSessionFile = session.sessionFile;
+				materializationStarted.resolve();
+				await releaseMaterialization.promise;
+			}
+			await ensureOnDisk();
+		});
+		const closeProviderSession = vi.fn();
+		session.providerSessionState.set("late-abort-materialization", { close: closeProviderSession });
+
+		const handoff = session.handoff();
+		await materializationStarted.promise;
+		const abort = session.abort({ reason: "Abort during target materialization" });
+		releaseMaterialization.resolve();
+
+		await expect(handoff).rejects.toThrow("Abort during target materialization");
+		await abort;
+		expect(session.sessionFile).toBe(retainedSessionFile);
+		expect(sessionManager.getEntries().map(entry => entry.id)).toEqual(retainedEntryIds);
+		expect(closeProviderSession).not.toHaveBeenCalled();
+		expect(replacementSessionFile).toBeString();
+		expect(await Bun.file(replacementSessionFile!).exists()).toBe(false);
+	});
+
+	it("rolls back an abort during session_ready before commit activation", async () => {
+		await sessionManager.ensureOnDisk();
+		await sessionManager.flush();
+		const retainedSessionFile = session.sessionFile;
+		if (!retainedSessionFile) throw new Error("Expected retained session file");
+		await session.dispose();
+		sessionManager = await SessionManager.open(retainedSessionFile, tempDir.path());
+
+		const readyStarted = Promise.withResolvers<void>();
+		const releaseReady = Promise.withResolvers<void>();
+		const extensionRunner = {
+			hasHandlers: vi.fn(() => false),
+			emit: vi.fn().mockResolvedValue(undefined),
+			emitBeforeSessionMutation: vi.fn().mockResolvedValue(undefined),
+			emitWithHostCompletion: vi.fn(
+				async (event: { type: string }, prepare?: () => void | Promise<void | (() => void | Promise<void>)>) => {
+					const prepared = await prepare?.();
+					if (event.type === "session_ready") {
+						readyStarted.resolve();
+						await releaseReady.promise;
+					}
+					if (typeof prepared === "function") await prepared();
+				},
+			),
+		} as unknown as ExtensionRunner;
+		session = new AgentSession({
+			agent: new Agent({
+				getApiKey: () => "test-key",
+				initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			}),
+			sessionManager,
+			settings: Settings.isolated({
+				"compaction.enabled": true,
+				"compaction.autoContinue": false,
+				"compaction.asyncEnabled": false,
+			}),
+			modelRegistry,
+			extensionRunner,
+			obfuscator,
+		});
+		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+		const retainedEntryIds = sessionManager.getEntries().map(entry => entry.id);
+		vi.spyOn(compactionModule, "generateHandoffFromContext").mockResolvedValue("## Goal\nContinue from here");
+		const closeProviderSession = vi.fn();
+		session.providerSessionState.set("late-abort-ready", { close: closeProviderSession });
+
+		const handoff = session.handoff();
+		await readyStarted.promise;
+		const abort = session.abort({ reason: "Abort during session_ready" });
+		releaseReady.resolve();
+
+		await expect(handoff).rejects.toThrow("Abort during session_ready");
+		await abort;
+		expect(session.sessionFile).toBe(retainedSessionFile);
+		expect(sessionManager.getEntries().map(entry => entry.id)).toEqual(retainedEntryIds);
+		expect(closeProviderSession).not.toHaveBeenCalled();
+		expect(extensionRunner.emitWithHostCompletion).toHaveBeenCalledWith(
+			{ type: "session_rollback" },
+			expect.any(Function),
+		);
+	});
+
+	it("cancels speculation before delegating an explicit handoff", async () => {
+		const order: string[] = [];
+		vi.spyOn(SessionMaintenance.prototype, "cancelSpeculation").mockImplementation(() => {
+			order.push("cancel");
+		});
+		vi.spyOn(SessionHandoff.prototype, "handoffToNewSession").mockImplementation(async () => {
+			order.push("delegate");
+			return { document: "## Goal\nExplicit handoff" };
+		});
+
+		await expect(session.handoff()).resolves.toMatchObject({ document: "## Goal\nExplicit handoff" });
+		expect(order).toEqual(["cancel", "delegate"]);
+	});
+
+	it("leaves no orphan file when deferred speculative handoff generation is discarded", async () => {
+		session.settings.set("compaction.handoffSaveToDisk", true);
+		const artifactsDir = sessionManager.getArtifactsDir();
+		if (!artifactsDir) throw new Error("Expected artifacts directory");
+		await fs.mkdir(artifactsDir, { recursive: true });
+		vi.spyOn(compactionModule, "generateHandoffFromContext").mockResolvedValue("## Goal\nSpeculative handoff");
+		const handoffHost = {
+			agent: session.agent,
+			sessionManager,
+			settings: session.settings,
+			modelRegistry,
+			extensionRunner: undefined,
+			sideStreamFn: async () => {
+				throw new Error("Mocked handoff generation should not stream");
+			},
+			obfuscator,
+			model: () => model,
+			thinkingLevel: () => undefined,
+			sessionId: () => sessionManager.getSessionId(),
+			baseSystemPrompt: () => ["Test"],
+			obfuscateTextForProvider: text => text,
+			deobfuscateFromProvider: text => text,
+			convertMessagesToLlm: async () => [],
+			prepareSimpleStreamOptions: options => options,
+			effectiveServiceTier: () => undefined,
+		} satisfies Partial<SessionHandoffHost>;
+		const handoff = new SessionHandoff(handoffHost as unknown as SessionHandoffHost);
+
+		const result = await handoff.generateDocument(undefined, { autoTriggered: true }, true);
+
+		expect(result?.document).toBe("## Goal\nSpeculative handoff");
+		expect(result?.savedPath).toBeUndefined();
+		expect((await fs.readdir(artifactsDir)).filter(file => /^handoff-.*\.md$/.test(file))).toEqual([]);
 	});
 
 	it("waits for an accepted peer wake to finish before capturing the handoff snapshot", async () => {

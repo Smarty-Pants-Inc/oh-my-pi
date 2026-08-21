@@ -1835,8 +1835,9 @@ export class AgentSession {
 			getContextUsage: options => this.getContextUsage(options),
 			shake: (mode, options) => this.shake(mode, options),
 			dropImages: () => this.dropImages(),
-			generateHandoffDocument: (customInstructions, options) =>
-				this.#handoff.generateDocument(customInstructions, options),
+			generateHandoffDocument: (customInstructions, options, deferPersistence) =>
+				this.#handoff.generateDocument(customInstructions, options, deferPersistence),
+			persistHandoffDocument: result => this.#handoff.persistAutoDocument(result),
 			removeAssistantMessageFromActiveContext: message =>
 				this.#recovery.removeAssistantMessageFromActiveContext(message),
 			dropPersistedAssistantTurn: message => this.#recovery.dropPersistedAssistantTurn(message),
@@ -5559,6 +5560,15 @@ export class AgentSession {
 			// path keep the full pre-reset history.
 			this.sessionManager.appendResetBoundary();
 			await this.#goalRuntime.clearFinalGoalAtHistoryBoundary();
+			// Persisted terminal goals are deliberately omitted from the live goal
+			// projection on rehydrate. Normalize that history-only mode at the reset
+			// boundary too so it cannot become the current mode again.
+			if (!this.#goalModeState) {
+				const { mode } = this.sessionManager.buildSessionContext();
+				if (mode === "goal" || mode === "goal_paused") {
+					this.sessionManager.appendModeChange("none");
+				}
+			}
 			return { droppedCount };
 		} finally {
 			releaseSemanticFence();
@@ -9342,6 +9352,7 @@ export class AgentSession {
 		options?: SessionHandoffOptions,
 		semanticDeliveryAcceptance?: Promise<void>,
 	): Promise<HandoffResult | undefined> {
+		this.#maintenance.cancelSpeculation();
 		return this.#handoff.handoffToNewSession(customInstructions, options, semanticDeliveryAcceptance);
 	}
 

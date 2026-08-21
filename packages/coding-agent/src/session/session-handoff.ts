@@ -128,13 +128,34 @@ export class SessionHandoff {
 	async generateDocument(
 		customInstructions?: string,
 		options?: SessionHandoffOptions,
+		deferPersistence = false,
 	): Promise<HandoffResult | undefined> {
 		const signal = options?.signal ?? new AbortController().signal;
 		try {
-			return await this.#generateDocument(customInstructions, options, signal);
+			return await this.#generateDocument(customInstructions, options, signal, deferPersistence);
 		} catch (error) {
 			throwIfHandoffAborted(signal);
 			throw error;
+		}
+	}
+
+	/** Persist an auto-generated handoff result to the active session artifacts. */
+	async persistAutoDocument(result: HandoffResult): Promise<void> {
+		if (result.savedPath || !this.#host.settings.get("compaction.handoffSaveToDisk")) return;
+		const artifactsDir = this.#host.sessionManager.getArtifactsDir();
+		if (!artifactsDir) {
+			logger.debug("Skipping handoff document save because session is not persisted");
+			return;
+		}
+		const handoffFilePath = path.join(artifactsDir, createHandoffFileName());
+		try {
+			await Bun.write(handoffFilePath, `${result.document}\n`);
+			result.savedPath = handoffFilePath;
+		} catch (error) {
+			logger.warn("Failed to save handoff document to disk", {
+				path: handoffFilePath,
+				error: error instanceof Error ? error.message : String(error),
+			});
 		}
 	}
 
@@ -145,6 +166,7 @@ export class SessionHandoff {
 		semanticDeliveryAcceptance?: Promise<void>,
 		prepared?: HandoffResult,
 	): Promise<HandoffResult | undefined> {
+		if (this.#handoffAbortController) throw new Error("Handoff generation is already in progress");
 		this.#host.assertVibeSessionTransitionAllowed("handoff to a new session");
 		const entries = this.#host.sessionManager.getBranch();
 		const messageCount = entries.filter(entry => entry.type === "message").length;
@@ -173,6 +195,7 @@ export class SessionHandoff {
 					type: "session_before_switch",
 					reason: "handoff",
 				})) as SessionBeforeSwitchResult | undefined;
+				throwIfHandoffAborted(handoffSignal);
 				if (result?.cancel) {
 					options?.onSwitchCancelled?.();
 					return undefined;
@@ -186,6 +209,7 @@ export class SessionHandoff {
 				handoffSignal,
 				options?.autoTriggered !== true && semanticDeliveryAcceptance === undefined,
 			);
+			throwIfHandoffAborted(handoffSignal);
 
 			const handoffResult = prepared ?? (await this.#generateDocument(customInstructions, options, handoffSignal));
 			if (!handoffResult) throw EMPTY_AUTO_HANDOFF;
@@ -194,16 +218,24 @@ export class SessionHandoff {
 			if (this.#host.extensionRunner) {
 				lifecycle.markPublicationStarted();
 				await this.#host.extensionRunner.emitBeforeSessionMutation({ type: "session_switch" });
+				throwIfHandoffAborted(handoffSignal);
 			}
 			await lifecycle.captureRetained({ capturePersistedSessionFile: true });
+			throwIfHandoffAborted(handoffSignal);
 			await this.#host.flushPendingBash();
+			throwIfHandoffAborted(handoffSignal);
 			await this.#host.sessionManager.flush();
+			throwIfHandoffAborted(handoffSignal);
 			await this.#host.drainAndDetachAdvisorRecorders();
+			throwIfHandoffAborted(handoffSignal);
 			await lifecycle.recaptureRetained({ capturePersistedSessionFile: true });
+			throwIfHandoffAborted(handoffSignal);
 			await lifecycle.acquireOwnership();
+			throwIfHandoffAborted(handoffSignal);
 
 			if (this.#host.extensionRunner) {
 				await this.#host.extensionRunner.emit({ type: "session_switch", reason: "handoff", previousSessionFile });
+				throwIfHandoffAborted(handoffSignal);
 			}
 
 			const localProtocolOptions = {
@@ -222,9 +254,11 @@ export class SessionHandoff {
 				preservedFollowUp,
 				preservedCompanions,
 			);
+			throwIfHandoffAborted(handoffSignal);
 			await this.#host.sessionManager.newSession(
 				previousSessionFile ? { parentSession: previousSessionFile } : undefined,
 			);
+			throwIfHandoffAborted(handoffSignal);
 			if (preservedGoal) {
 				this.#host.sessionManager.appendModeChange(preservedGoal.status === "paused" ? "goal_paused" : "goal", {
 					goal: preservedGoal,
@@ -235,6 +269,7 @@ export class SessionHandoff {
 			this.#host.syncAgentSessionId(false, false);
 			this.#host.rekeyMemoryForCurrentSessionId();
 			await this.#host.resetMemoryContextForNewTranscript();
+			throwIfHandoffAborted(handoffSignal);
 
 			try {
 				const newLocalRoot = resolveLocalUrlToPath("local://", localProtocolOptions);
@@ -244,16 +279,19 @@ export class SessionHandoff {
 					error: error instanceof Error ? error.message : String(error),
 				});
 			}
+			throwIfHandoffAborted(handoffSignal);
 
 			const handoffContent = createHandoffContext(handoffResult.document);
 			this.#host.sessionManager.appendCustomMessageEntry("handoff", handoffContent, true, undefined, "agent");
 			await this.#host.sessionManager.ensureOnDisk();
+			throwIfHandoffAborted(handoffSignal);
 
 			const sessionContext = this.#host.buildDisplaySessionContext();
 			this.#host.agent.reset();
 			this.#host.clearCheckpointRuntimeState();
 			this.#host.clearPendingNextTurnMessages();
 			const migratedQueues = await pendingSemanticDeliveryHandoff.migrate();
+			throwIfHandoffAborted(handoffSignal);
 			this.#host.agent.replaceQueues(migratedQueues.steering, migratedQueues.followUp);
 			this.#host.agent.restoreQueuedMessageCompanions(migratedQueues.companions, messages =>
 				this.#host.restoreExplicitPromptMessages(messages),
@@ -265,14 +303,24 @@ export class SessionHandoff {
 			const commitOptions = {
 				finalizeProviderSessions: () => this.#host.closeAllProviderSessions("handoff"),
 			};
+			const transaction = lifecycle;
+			const prepareCommit = async () => {
+				throwIfHandoffAborted(handoffSignal);
+				const activate = await transaction.prepareCommit(commitOptions);
+				return async () => {
+					throwIfHandoffAborted(handoffSignal);
+					await activate();
+				};
+			};
 			if (this.#host.extensionRunner) {
-				const transaction = lifecycle;
-				await this.#host.extensionRunner.emitWithHostCompletion({ type: "session_ready" }, () =>
-					transaction.prepareCommit(commitOptions),
-				);
-				await lifecycle.activateCommitAfterHostPublication();
+				await this.#host.extensionRunner.emitWithHostCompletion({ type: "session_ready" }, prepareCommit);
+				if (transaction.phase !== "committed") {
+					throwIfHandoffAborted(handoffSignal);
+					await transaction.activateCommitAfterHostPublication();
+				}
 			} else {
-				await lifecycle.commit(commitOptions);
+				const activate = await prepareCommit();
+				await activate();
 			}
 			return handoffResult;
 		} catch (error) {
@@ -306,6 +354,7 @@ export class SessionHandoff {
 		customInstructions: string | undefined,
 		options: SessionHandoffOptions | undefined,
 		signal: AbortSignal,
+		deferPersistence = false,
 	): Promise<HandoffResult | undefined> {
 		throwIfHandoffAborted(signal);
 		const model = this.#host.model();
@@ -371,24 +420,8 @@ export class SessionHandoff {
 			throw new Error("Handoff generation produced no content");
 		}
 
-		let savedPath: string | undefined;
-		if (options?.autoTriggered && this.#host.settings.get("compaction.handoffSaveToDisk")) {
-			const artifactsDir = this.#host.sessionManager.getArtifactsDir();
-			if (artifactsDir) {
-				const handoffFilePath = path.join(artifactsDir, createHandoffFileName());
-				try {
-					await Bun.write(handoffFilePath, `${handoffText}\n`);
-					savedPath = handoffFilePath;
-				} catch (error) {
-					logger.warn("Failed to save handoff document to disk", {
-						path: handoffFilePath,
-						error: error instanceof Error ? error.message : String(error),
-					});
-				}
-			} else {
-				logger.debug("Skipping handoff document save because session is not persisted");
-			}
-		}
-		return { document: handoffText, savedPath };
+		const result: HandoffResult = { document: handoffText };
+		if (options?.autoTriggered && !deferPersistence) await this.persistAutoDocument(result);
+		return result;
 	}
 }

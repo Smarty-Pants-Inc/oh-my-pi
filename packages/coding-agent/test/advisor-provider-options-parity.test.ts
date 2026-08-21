@@ -967,10 +967,11 @@ describe("AgentSession advisor provider-options parity", () => {
 		});
 		session.settings.setModelRole("advisor", "anthropic/claude-sonnet-4-5");
 		expect(session.setAdvisorEnabled(true)).toBe(true);
-		const rehydratedTerminalState = session.getGoalModeState();
-		if (!rehydratedTerminalState) throw new Error("Expected persisted terminal goal state");
-		session.setGoalModeState(undefined);
-		session.rehydrateGoalModeState(rehydratedTerminalState);
+		expect(sessionManager.buildSessionContext().modeData?.goal).toMatchObject({
+			id: "abandoned-goal",
+			status: "complete",
+		});
+		expect(session.getGoalModeState()).toBeUndefined();
 
 		const abandonedAdvisor = session.getAdvisorAgent();
 		if (!abandonedAdvisor) throw new Error("Expected advisor agent to be live");

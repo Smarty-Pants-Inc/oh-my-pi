@@ -6,7 +6,7 @@ import {
 	generateSummary,
 	type SessionEntry,
 } from "@oh-my-pi/pi-agent-core/compaction";
-import type { AssistantMessage, Model } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, Context, Model } from "@oh-my-pi/pi-ai";
 import * as ai from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 
@@ -45,8 +45,10 @@ function turn(index: number, tokens: number): AgentMessage[] {
 }
 
 function promptTextOf(call: unknown[]): string {
-	const context = call[1] as { messages: { content: { type: string; text: string }[] }[] };
-	return context.messages[0].content[0].text;
+	const context = call[1] as Context;
+	const instruction = context.instructions?.[0];
+	if (instruction?.role !== "internal_context") throw new Error("summary request lacked internal context");
+	return instruction.renderedText;
 }
 
 describe("summarization input budget", () => {

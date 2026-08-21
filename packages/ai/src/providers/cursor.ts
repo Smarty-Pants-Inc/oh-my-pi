@@ -655,7 +655,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				},
 				model,
 			);
-			const requestContextRules = buildCursorRequestContextRules(context.systemPrompt);
+			const requestContextRules = buildCursorRequestContextRules(context.systemPrompt, context.instructions, model);
 
 			const baseUrl = model.baseUrl || CURSOR_API_URL;
 			const requestPath = "/agent.v1.AgentService/Run";
@@ -1090,7 +1090,7 @@ export async function handleServerMessage(
 		// aborts a live stream with "Provider stream stalled while waiting for
 		// the next event" (cursor-grok-4.6-xhigh after a WebFetch/WebSearch
 		// permission prompt).
-		handleInteractionQuery(msg.message.value, h2Request);
+		handleInteractionQuery(msg.message.value, frame => writeCursorProviderFrame(h2Request, frame));
 	} else if (msgCase === "conversationCheckpointUpdate") {
 		handleConversationCheckpointUpdate(msg.message.value, output, usageState, onConversationCheckpoint);
 	}
@@ -4527,14 +4527,35 @@ function readCursorBlob(blobStore: Map<string, Uint8Array>, blobId: Uint8Array):
 	return data;
 }
 
+/** Ordered model-visible system text shared by Cursor's blob and rule prompt paths. */
+function buildCursorSystemPromptTexts(
+	systemPrompt: readonly string[] | undefined,
+	instructions?: Context["instructions"],
+	model?: Model<"cursor-agent">,
+): string[] {
+	const prompts = [
+		...normalizeSystemPrompts(systemPrompt),
+		...(model
+			? mapContextInstructionsForModel(instructions, model).map(instruction =>
+					instruction.renderedText.toWellFormed(),
+				)
+			: []),
+	];
+	return prompts.length > 0 ? prompts : ["You are a helpful assistant."];
+}
+
 /**
  * Cursor AgentService reconstructs the model prompt from `requestContext.rules`,
  * not from the client-supplied `rootPromptMessagesJson` system blobs. Map each
- * OMP system-prompt entry to a global CursorRule so always-apply rules survive
- * that reconstruction.
+ * ordered OMP system prompt and typed instruction to a global CursorRule so
+ * always-apply context survives that reconstruction.
  */
-export function buildCursorRequestContextRules(systemPrompt: readonly string[] | undefined): CursorRule[] {
-	return normalizeSystemPrompts(systemPrompt).map((content, index) =>
+export function buildCursorRequestContextRules(
+	systemPrompt: readonly string[] | undefined,
+	instructions?: Context["instructions"],
+	model?: Model<"cursor-agent">,
+): CursorRule[] {
+	return buildCursorSystemPromptTexts(systemPrompt, instructions, model).map((content, index) =>
 		create(CursorRuleSchema, {
 			fullPath: `/omp/system-prompt/${index}.mdc`,
 			content,
@@ -4785,18 +4806,9 @@ export function buildCursorSystemPromptJsons(
 	instructions?: Context["instructions"],
 	model?: Model<"cursor-agent">,
 ): string[] {
-	const systemPrompts = [
-		...normalizeSystemPrompts(systemPrompt),
-		...(model
-			? mapContextInstructionsForModel(instructions, model).map(instruction =>
-					instruction.renderedText.toWellFormed(),
-				)
-			: []),
-	];
-	if (systemPrompts.length === 0) {
-		return [JSON.stringify({ role: "system", content: "You are a helpful assistant." })];
-	}
-	return systemPrompts.map(content => JSON.stringify({ role: "system", content }));
+	return buildCursorSystemPromptTexts(systemPrompt, instructions, model).map(content =>
+		JSON.stringify({ role: "system", content }),
+	);
 }
 
 function buildRootPromptMessagesJson(

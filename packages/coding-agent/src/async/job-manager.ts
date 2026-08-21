@@ -1,3 +1,4 @@
+import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
 
 const DELIVERY_RETRY_BASE_MS = 500;
@@ -41,6 +42,8 @@ export interface AsyncJob {
 	abortController: AbortController;
 	promise: Promise<void>;
 	resultText?: string;
+	/** Exact terminal content retained for structured completion delivery. */
+	resultContent?: (TextContent | ImageContent)[];
 	errorText?: string;
 	/** Latest tool-render details reported by the running job. */
 	latestDetails?: Record<string, unknown>;
@@ -159,7 +162,7 @@ export class AsyncJobManager {
 	readonly #deliveries: AsyncJobDelivery[] = [];
 	readonly #inFlightDeliveries: AsyncJobDelivery[] = [];
 	readonly #suppressedDeliveries = new Set<string>();
-	readonly #watchedJobs = new Set<string>();
+	readonly #watchedJobs = new Map<string, number>();
 	readonly #evictionTimers = new Map<AsyncJob, NodeJS.Timeout>();
 	readonly #pollEscalation = new Map<string | undefined, PollEscalationState>();
 	readonly #deliverySinks = new Map<string, AsyncJobDeliverySink>();
@@ -208,6 +211,8 @@ export class AsyncJobManager {
 			jobId: string;
 			signal: AbortSignal;
 			reportProgress: (text: string, details?: Record<string, unknown>) => Promise<void>;
+			/** Retain exact terminal blocks alongside the job's text summary. */
+			setResultContent: (content: (TextContent | ImageContent)[]) => void;
 			/** Clear the queued flag once the job actually starts executing. */
 			markRunning: () => void;
 		}) => Promise<string>,
@@ -268,6 +273,9 @@ export class AsyncJobManager {
 					jobId: id,
 					signal: abortController.signal,
 					reportProgress,
+					setResultContent: content => {
+						job.resultContent = content;
+					},
 					markRunning: () => {
 						job.queued = false;
 					},
@@ -394,19 +402,28 @@ export class AsyncJobManager {
 	watchJobs(jobIds: string[]): number {
 		const uniqueJobIds = Array.from(new Set(jobIds.map(id => id.trim()).filter(id => id.length > 0)));
 		for (const jobId of uniqueJobIds) {
-			this.#watchedJobs.add(jobId);
+			this.#watchedJobs.set(jobId, (this.#watchedJobs.get(jobId) ?? 0) + 1);
 		}
 		this.#notifyDeliveryQueueChanged();
 		return uniqueJobIds.length;
 	}
 
-	unwatchJobs(jobIds: string[]): number {
+	unwatchJobs(jobIds: string[], options?: { resumeDeliveries?: boolean }): number {
 		const uniqueJobIds = Array.from(new Set(jobIds.map(id => id.trim()).filter(id => id.length > 0)));
 		let removed = 0;
 		for (const jobId of uniqueJobIds) {
-			if (this.#watchedJobs.delete(jobId)) {
-				removed += 1;
+			const watchers = this.#watchedJobs.get(jobId);
+			if (!watchers) continue;
+			removed += 1;
+			if (watchers > 1) {
+				this.#watchedJobs.set(jobId, watchers - 1);
+				continue;
 			}
+			const job = this.#jobs.get(jobId);
+			this.#watchedJobs.delete(jobId);
+			if (options?.resumeDeliveries) this.#resumeSettledDelivery(jobId);
+			// A same-turn manual waiter may acknowledge immediately after unwatch.
+			if (job && job.status !== "running") queueMicrotask(() => this.#scheduleEviction(job));
 		}
 		return removed;
 	}
@@ -455,6 +472,16 @@ export class AsyncJobManager {
 		return before - this.#deliveries.length;
 	}
 
+	#resumeSettledDelivery(jobId: string): void {
+		const job = this.#jobs.get(jobId);
+		if (!job || (job.status !== "completed" && job.status !== "failed")) return;
+		const queued =
+			this.#deliveries.some(delivery => delivery.jobId === jobId) ||
+			this.#inFlightDeliveries.some(delivery => delivery.jobId === jobId);
+		if (queued) return;
+		this.#enqueueDelivery(job, job.status === "completed" ? (job.resultText ?? "") : (job.errorText ?? ""));
+	}
+
 	/**
 	 * Lift a foreground-wait suppression set via `acknowledgeDeliveries`. If the
 	 * job already finished while suppressed (its delivery enqueue was skipped),
@@ -465,13 +492,7 @@ export class AsyncJobManager {
 			const jobId = rawId.trim();
 			if (!jobId) continue;
 			if (!this.#suppressedDeliveries.delete(jobId)) continue;
-			const job = this.#jobs.get(jobId);
-			if (!job || (job.status !== "completed" && job.status !== "failed")) continue;
-			const queued =
-				this.#deliveries.some(delivery => delivery.jobId === jobId) ||
-				this.#inFlightDeliveries.some(delivery => delivery.jobId === jobId);
-			if (queued) continue;
-			this.#enqueueDelivery(job, job.status === "completed" ? (job.resultText ?? "") : (job.errorText ?? ""));
+			this.#resumeSettledDelivery(jobId);
 		}
 	}
 
@@ -769,6 +790,7 @@ export class AsyncJobManager {
 
 	#scheduleEviction(job: AsyncJob): void {
 		if (this.#disposed || this.#jobs.get(job.id) !== job) return;
+		if (this.#watchedJobs.has(job.id)) return;
 		if (this.#retentionMs <= 0) {
 			this.#evictJob(job);
 			return;

@@ -684,21 +684,21 @@ describe("AgentSession advisor toggle", () => {
 		await session.dispose();
 		expect((await loadAdvisorTranscriptCosts(previousSessionFile)).get("")).toBeCloseTo(0.75, 8);
 	});
-	it("resets advisor runtimes after an in-place handoff compaction", async () => {
+	it("starts a fresh handoff session and resets advisor state", async () => {
 		vi.spyOn(compactionModule, "generateHandoffFromContext").mockResolvedValue("## Goal\nContinue from here");
 		const advisor = enableAdvisor();
 		prepareHandoffConversation(advisor);
-		session.settings.set("compaction.keepRecentTokens", 1);
 		const sessionFile = session.sessionFile;
+		expect(session.getAdvisorCost()).toBeCloseTo(0.5, 8);
+		expect(advisor.state.messages).toContainEqual(advisorMessage(0.5, 1));
 
 		const result = await session.handoff();
 
 		expect(result?.document).toContain("Continue from here");
-		expect(session.sessionFile).toBe(sessionFile);
-		const compaction = sessionManager.getBranch().at(-1);
-		expect(compaction).toMatchObject({ type: "compaction" });
-		if (compaction?.type !== "compaction") throw new Error("Expected handoff compaction entry");
-		expect(compaction.summary).toContain("Continue from here");
+		expect(session.sessionFile).not.toBe(sessionFile);
+		expect(sessionManager.getBranch().at(-1)).toMatchObject({ type: "custom_message", customType: "handoff" });
+		expect(session.getAdvisorCost()).toBe(0);
+		expect(advisor.state.messages).toEqual([]);
 	});
 	it("clears advisor cost when a branch skips conversation restore", async () => {
 		const extensionRunner = {

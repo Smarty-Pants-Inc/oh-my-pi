@@ -186,6 +186,7 @@ interface ArmedSpeculation {
 	action: "context-full" | "handoff" | "remote";
 	method: CompactionMethod;
 	codexCompaction?: CodexCompactionContext;
+	handoffDocument?: HandoffResult;
 	/** Last branch entry covered by the speculated summary's source snapshot. */
 	snapshotLeafId: string;
 	/** Context size when speculation started; drives refresh-on-growth. */
@@ -197,6 +198,8 @@ interface SpeculationRun {
 	controller: AbortController;
 	promise: Promise<void>;
 	contextTokensAtStart: number;
+	method: "remote" | "handoff" | "soft";
+	settings: ConfiguredCompactionSettings;
 	armed?: ArmedSpeculation;
 }
 
@@ -318,7 +321,9 @@ export interface SessionMaintenanceHost {
 	generateHandoffDocument(
 		customInstructions?: string,
 		options?: SessionHandoffOptions,
+		deferPersistence?: boolean,
 	): Promise<HandoffResult | undefined>;
+	persistHandoffDocument(result: HandoffResult): Promise<void>;
 	removeAssistantMessageFromActiveContext(message: AssistantMessage): void;
 	dropPersistedAssistantTurn(message: AssistantMessage): Promise<string | undefined>;
 	runRecoveryCompactionWithRollback(
@@ -1165,38 +1170,62 @@ export class SessionMaintenance {
 	maybeStartSpeculativeCompaction(contextTokens: number, contextWindow: number): void {
 		if (contextWindow <= 0 || this.#host.isDisposed()) return;
 		const settings = this.#host.settings.getGroup("compaction");
-		if (!settings.enabled || settings.asyncEnabled === false || !hasConfiguredCompactionMethod(settings)) return;
-		if (this.isCompacting || this.#host.isGeneratingHandoff()) return;
+		if (!settings.enabled || settings.asyncEnabled === false || !hasConfiguredCompactionMethod(settings)) {
+			this.cancelSpeculation();
+			return;
+		}
+		const model = this.#model;
+		if (!model) {
+			this.cancelSpeculation();
+			return;
+		}
+		const method = resolveSpeculationMethod(model, settings);
+		if (!method) {
+			this.cancelSpeculation();
+			return;
+		}
 		// Extensions that intercept compaction (cancel/replace) keep exact
 		// blocking semantics; a speculated result would bypass their veto.
-		if (this.#host.extensionRunner?.hasHandlers("session_before_compact")) return;
+		if (this.#host.extensionRunner?.hasHandlers("session_before_compact")) {
+			this.cancelSpeculation();
+			return;
+		}
+		const current = this.#speculation;
+		if (current && !this.#speculationConfigurationMatches(current)) this.cancelSpeculation();
+		if (this.isCompacting || this.#host.isGeneratingHandoff()) return;
 		const thresholdTokens = resolveThresholdTokens(contextWindow, settings);
 		if (contextTokens >= thresholdTokens) return; // real maintenance owns it now
 		if (thresholdTokens - contextTokens > resolveSpeculationLeadTokens(thresholdTokens)) return;
-		const current = this.#speculation;
-		if (current) {
-			if (!current.armed) return; // one run at a time
+		const active = this.#speculation;
+		if (active) {
+			if (!active.armed) return; // one run at a time
 			// Refresh-on-growth: the armed summary's kept tail grows with every
 			// turn; once the growth exceeds the keep-recent budget, a fresh cut
 			// reclaims materially more context at apply time.
-			const growth = contextTokens - current.armed.contextTokensAtStart;
+			const growth = contextTokens - active.armed.contextTokensAtStart;
 			const refreshBudget = Math.max(settings.keepRecentTokens, SPECULATION_LEAD_MIN_TOKENS);
-			if (growth <= refreshBudget && this.#armedSpeculationValid(current.armed)) return;
+			if (growth <= refreshBudget && this.#armedSpeculationValid(active)) return;
 			this.cancelSpeculation();
 		}
-		const model = this.#model;
-		if (!model) return;
-		const method = resolveSpeculationMethod(model, settings);
-		if (!method) return;
-		this.#startSpeculationRun(contextTokens, method);
+		this.#startSpeculationRun(contextTokens, method, settings);
 	}
 
 	/** Install and launch one background speculation run for `method`. */
-	#startSpeculationRun(contextTokens: number, method: "remote" | "handoff" | "soft"): void {
+	#startSpeculationRun(
+		contextTokens: number,
+		method: "remote" | "handoff" | "soft",
+		settings: ConfiguredCompactionSettings,
+	): void {
 		const controller = new AbortController();
-		const run: SpeculationRun = { controller, promise: Promise.resolve(), contextTokensAtStart: contextTokens };
+		const run: SpeculationRun = {
+			controller,
+			promise: Promise.resolve(),
+			contextTokensAtStart: contextTokens,
+			method,
+			settings: structuredClone(settings),
+		};
 		this.#speculation = run;
-		run.promise = this.#runSpeculation(run, method, contextTokens).catch(error => {
+		run.promise = this.#runSpeculation(run, contextTokens).catch(error => {
 			logger.debug("Speculative compaction failed", {
 				method,
 				error: error instanceof Error ? error.message : String(error),
@@ -1225,14 +1254,27 @@ export class SessionMaintenance {
 	deferThresholdCompactionToSpeculation(contextTokens: number, contextWindow: number): boolean {
 		if (contextWindow <= 0 || this.#host.isDisposed()) return false;
 		const settings = this.#host.settings.getGroup("compaction");
-		if (!settings.enabled || settings.asyncEnabled === false || !hasConfiguredCompactionMethod(settings))
+		if (!settings.enabled || settings.asyncEnabled === false || !hasConfiguredCompactionMethod(settings)) {
+			this.cancelSpeculation();
 			return false;
-		if (this.isCompacting || this.#host.isGeneratingHandoff()) return false;
-		if (this.#host.extensionRunner?.hasHandlers("session_before_compact")) return false;
+		}
 		const model = this.#model;
-		if (!model) return false;
+		if (!model) {
+			this.cancelSpeculation();
+			return false;
+		}
 		const method = resolveSpeculationMethod(model, settings);
-		if (!method) return false;
+		if (!method) {
+			this.cancelSpeculation();
+			return false;
+		}
+		if (this.#host.extensionRunner?.hasHandlers("session_before_compact")) {
+			this.cancelSpeculation();
+			return false;
+		}
+		const current = this.#speculation;
+		if (current && !this.#speculationConfigurationMatches(current)) this.cancelSpeculation();
+		if (this.isCompacting || this.#host.isGeneratingHandoff()) return false;
 		const thresholdTokens = resolveThresholdTokens(contextWindow, settings);
 		const graceCapTokens = Math.min(
 			thresholdTokens + resolveSpeculationLeadTokens(thresholdTokens),
@@ -1244,23 +1286,19 @@ export class SessionMaintenance {
 			if (run.armed) return false; // ready — the real pass splices it in now
 			return true; // still summarizing in the background
 		}
-		this.#startSpeculationRun(contextTokens, method);
+		this.#startSpeculationRun(contextTokens, method, settings);
 		return true;
 	}
 
 	/** Produce and arm one speculative compaction result off a branch snapshot. */
-	async #runSpeculation(
-		run: SpeculationRun,
-		method: "remote" | "handoff" | "soft",
-		contextTokens: number,
-	): Promise<void> {
+	async #runSpeculation(run: SpeculationRun, contextTokens: number): Promise<void> {
 		const clear = () => {
 			if (this.#speculation === run) this.#speculation = undefined;
 		};
+		const { method } = run;
 		const model = this.#model;
 		if (!model) return clear();
-		const settings = this.#host.settings.getGroup("compaction");
-		const effectiveSettings = resolveMethodSettings(settings, method);
+		const effectiveSettings = resolveMethodSettings(run.settings, method);
 		const branch = this.#host.sessionManager.getBranch();
 		const snapshotLeafId = branch[branch.length - 1]?.id;
 		if (!snapshotLeafId) return clear();
@@ -1269,10 +1307,14 @@ export class SessionMaintenance {
 		const signal = run.controller.signal;
 		let armed: ArmedSpeculation;
 		if (method === "handoff") {
-			const generated = await this.#host.generateHandoffDocument(AUTO_HANDOFF_THRESHOLD_FOCUS, {
-				autoTriggered: true,
-				signal,
-			});
+			const generated = await this.#host.generateHandoffDocument(
+				AUTO_HANDOFF_THRESHOLD_FOCUS,
+				{
+					autoTriggered: true,
+					signal,
+				},
+				true,
+			);
 			if (!generated) return clear();
 			const { summary, details } = handoffSummaryFromDocument(generated.document, preparation);
 			armed = {
@@ -1285,6 +1327,7 @@ export class SessionMaintenance {
 				},
 				action: "handoff",
 				method,
+				handoffDocument: generated,
 				snapshotLeafId,
 				contextTokensAtStart: contextTokens,
 			};
@@ -1336,7 +1379,7 @@ export class SessionMaintenance {
 				contextTokensAtStart: contextTokens,
 			};
 		}
-		if (signal.aborted || this.#speculation !== run) return;
+		if (signal.aborted || this.#speculation !== run || !this.#speculationConfigurationMatches(run)) return clear();
 		run.armed = armed;
 		logger.debug("Speculative compaction armed", {
 			method,
@@ -1345,19 +1388,33 @@ export class SessionMaintenance {
 		});
 	}
 
-	/**
-	 * An armed result is committable only when the branch prefix it summarized
-	 * is still intact: its snapshot leaf is on the active path with no later
-	 * compaction or reset boundary, and any provider-native replay payload is
-	 * still readable by the active model.
-	 */
-	#armedSpeculationValid(armed: ArmedSpeculation): boolean {
+	/** Whether a live speculation still describes the currently resolved automatic configuration. */
+	#speculationConfigurationMatches(run: SpeculationRun): boolean {
 		const model = this.#model;
 		if (!model) return false;
 		const settings = this.#host.settings.getGroup("compaction");
+		return (
+			settings.enabled &&
+			settings.asyncEnabled !== false &&
+			resolveSpeculationMethod(model, settings) === run.method &&
+			Bun.deepEquals(settings, run.settings)
+		);
+	}
+
+	/**
+	 * An armed result is committable only when its configuration still matches
+	 * and the branch prefix it summarized is still intact: its snapshot leaf is
+	 * on the active path with no later compaction or reset boundary, and any
+	 * provider-native replay payload is still readable by the active model.
+	 */
+	#armedSpeculationValid(run: SpeculationRun): boolean {
+		const armed = run.armed;
+		if (!armed || !this.#speculationConfigurationMatches(run)) return false;
+		const model = this.#model;
+		if (!model) return false;
 		if (
 			armed.result.preserveData &&
-			!remotePreserveReusable(armed.result.preserveData, model, resolveMethodSettings(settings, armed.method))
+			!remotePreserveReusable(armed.result.preserveData, model, resolveMethodSettings(run.settings, armed.method))
 		) {
 			return false;
 		}
@@ -1384,10 +1441,8 @@ export class SessionMaintenance {
 			run.controller.abort();
 			return undefined;
 		}
-		const settings = this.#host.settings.getGroup("compaction");
-		if (settings.asyncEnabled === false) return undefined;
 		if (this.#host.extensionRunner?.hasHandlers("session_before_compact")) return undefined;
-		return this.#armedSpeculationValid(run.armed) ? run.armed : undefined;
+		return this.#armedSpeculationValid(run) ? run.armed : undefined;
 	}
 
 	/**
@@ -1408,6 +1463,7 @@ export class SessionMaintenance {
 		codexCompaction: CodexCompactionContext | undefined;
 		advisorResetReason: string;
 		detachExtensionEmit?: boolean;
+		onAppended?: (entry: CompactionEntry) => void | Promise<void>;
 	}): Promise<CompactionEntry | undefined> {
 		const entryId = this.#host.sessionManager.appendCompaction(
 			args.summary,
@@ -1423,6 +1479,10 @@ export class SessionMaintenance {
 			},
 		);
 		const newEntries = this.#host.sessionManager.getEntries();
+		const savedCompactionEntry = newEntries.find(e => e.type === "compaction" && e.id === entryId) as
+			| CompactionEntry
+			| undefined;
+		if (savedCompactionEntry) await args.onAppended?.(savedCompactionEntry);
 		const sessionContext = this.#host.buildDisplaySessionContext();
 		this.#host.agent.replaceMessages(sessionContext.messages);
 		this.#host.rebaseAfterCompaction();
@@ -1437,9 +1497,6 @@ export class SessionMaintenance {
 		} else {
 			this.#host.closeCodexProviderSessionsForHistoryRewrite();
 		}
-		const savedCompactionEntry = newEntries.find(e => e.type === "compaction" && e.id === entryId) as
-			| CompactionEntry
-			| undefined;
 		if (this.#host.extensionRunner && savedCompactionEntry) {
 			const compactEmit = this.#host.extensionRunner.emit({
 				type: "session_compact",
@@ -2782,9 +2839,15 @@ export class SessionMaintenance {
 		lease: AutoCompactionLease,
 	): Promise<CompactionCheckResult> {
 		const compactionSettings = this.#host.settings.getGroup("compaction");
-		if (reason !== "idle" && !compactionSettings.enabled) return COMPACTION_CHECK_NONE;
+		if (!compactionSettings.enabled) {
+			this.cancelSpeculation();
+			if (reason !== "idle") return COMPACTION_CHECK_NONE;
+		}
 		const methods = resolveCompactionMethodOrder(compactionSettings.methodOrder);
-		if (methods.length === 0) return COMPACTION_CHECK_NONE;
+		if (methods.length === 0) {
+			this.cancelSpeculation();
+			return COMPACTION_CHECK_NONE;
+		}
 		const generation = this.#host.promptGeneration();
 		const terminalTextAnswer =
 			options.terminalTextAnswer ?? isTerminalTextAssistantAnswer(this.#host.findLastAssistantMessage());
@@ -2922,6 +2985,7 @@ export class SessionMaintenance {
 					fromExtension: false,
 					codexCompaction: armedSpec.codexCompaction,
 					method: armedSpec.method,
+					handoffDocument: armedSpec.handoffDocument,
 					action,
 					reason,
 					willRetry,
@@ -3145,10 +3209,14 @@ export class SessionMaintenance {
 			// configured preference.
 			let handoffDocument: HandoffResult | undefined;
 			if (action === "handoff" && compactionPrep.kind !== "fromHook") {
-				handoffDocument = await this.#host.generateHandoffDocument(AUTO_HANDOFF_THRESHOLD_FOCUS, {
-					autoTriggered: true,
-					signal: autoCompactionSignal,
-				});
+				handoffDocument = await this.#host.generateHandoffDocument(
+					AUTO_HANDOFF_THRESHOLD_FOCUS,
+					{
+						autoTriggered: true,
+						signal: autoCompactionSignal,
+					},
+					true,
+				);
 				if (autoCompactionSignal.aborted) {
 					await this.#emitLifecycleEvent(
 						{
@@ -3519,6 +3587,7 @@ export class SessionMaintenance {
 				fromExtension,
 				codexCompaction,
 				method: fromExtension ? undefined : method,
+				handoffDocument,
 				action,
 				reason,
 				willRetry,
@@ -3611,6 +3680,7 @@ export class SessionMaintenance {
 		fromExtension: boolean;
 		codexCompaction: CodexCompactionContext | undefined;
 		method: CompactionMethod | undefined;
+		handoffDocument?: HandoffResult;
 		action: "context-full" | "handoff" | "snapcompact" | "remote";
 		reason: "overflow" | "threshold" | "idle" | "incomplete";
 		willRetry: boolean;
@@ -3638,7 +3708,6 @@ export class SessionMaintenance {
 			return COMPACTION_CHECK_NONE;
 		}
 
-		args.onCommitted();
 		const savedCompactionEntry = await this.#commitCompactionEntry({
 			summary: args.summary,
 			shortSummary: args.shortSummary,
@@ -3651,6 +3720,10 @@ export class SessionMaintenance {
 			method: args.method,
 			advisorResetReason: "auto-compaction",
 			detachExtensionEmit: detachPostCommit,
+			onAppended: async () => {
+				args.onCommitted();
+				if (args.handoffDocument) await this.#host.persistHandoffDocument(args.handoffDocument);
+			},
 		});
 
 		const result: CompactionResult = {
@@ -3950,6 +4023,7 @@ export class SessionMaintenance {
 	 * Toggle auto-compaction setting.
 	 */
 	setAutoCompactionEnabled(enabled: boolean): void {
+		if (this.#host.settings.get("compaction.enabled") !== enabled) this.cancelSpeculation();
 		this.#host.settings.set("compaction.enabled", enabled);
 		if (enabled && resolveCompactionMethodOrder(this.#host.settings.get("compaction.methodOrder")).length === 0) {
 			this.#host.settings.set("compaction.methodOrder", [...DEFAULT_COMPACTION_METHOD_ORDER]);

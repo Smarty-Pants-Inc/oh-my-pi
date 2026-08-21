@@ -3,7 +3,14 @@ import { gunzipSync } from "node:zlib";
 import { type DevinOptions, streamDevin } from "@oh-my-pi/pi-ai/providers/devin";
 import type { AssistantMessage, Context, Model } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import { GetChatMessageRequestSchema, GetUserJwtResponseSchema } from "@oh-my-pi/pi-catalog/discovery/devin-proto";
+import {
+	CacheControlType,
+	ChatMessageRequestType,
+	ChatMessageSource,
+	ConversationalPlannerMode,
+	GetChatMessageRequestSchema,
+	GetUserJwtResponseSchema,
+} from "@oh-my-pi/pi-catalog/discovery/devin-proto";
 import { create, fromBinary, toBinary } from "@oh-my-pi/pi-catalog/discovery/protobuf";
 
 const devinModel: Model<"devin-agent"> = buildModel({
@@ -162,7 +169,11 @@ describe("streamDevin history handoff", () => {
 					await Promise.resolve();
 					events.push("payload");
 					observedPayload = payload;
-					return { ...(payload as object), prompt: "replacement Devin prompt" };
+					return {
+						...(payload as object),
+						prompt: "replacement Devin prompt",
+						requestType: "CHAT_MESSAGE_REQUEST_TYPE_GENERAL",
+					};
 				},
 				onToolContracts: async payload => {
 					await Promise.resolve();
@@ -173,10 +184,20 @@ describe("streamDevin history handoff", () => {
 		);
 
 		expect(events).toEqual(["payload", "contracts"]);
-		expect(observedPayload).toMatchObject({ metadata: { apiKey: "", userJwt: "" } });
+		expect(observedPayload).toMatchObject({
+			metadata: { apiKey: "", userJwt: "" },
+			requestType: "CHAT_MESSAGE_REQUEST_TYPE_CASCADE",
+			plannerMode: "CONVERSATIONAL_PLANNER_MODE_DEFAULT",
+			systemPromptCacheOptions: { type: "CACHE_CONTROL_TYPE_EPHEMERAL" },
+			chatMessagePrompts: [{ source: "CHAT_MESSAGE_SOURCE_USER" }],
+		});
 		expect(JSON.stringify(observedPayload)).not.toContain("devin-session-token$token");
 		expect(JSON.stringify(observedPayload)).not.toContain("jwt");
 		expect(request.prompt).toBe("replacement Devin prompt");
+		expect(request.requestType).toBe(ChatMessageRequestType.GENERAL);
+		expect(request.plannerMode).toBe(ConversationalPlannerMode.DEFAULT);
+		expect(request.systemPromptCacheOptions?.type).toBe(CacheControlType.EPHEMERAL);
+		expect(request.chatMessagePrompts[0]?.source).toBe(ChatMessageSource.USER);
 		expect(request.metadata?.apiKey).toBe("devin-session-token$token");
 		expect(request.metadata?.userJwt).toBe("jwt");
 		expect(observedContracts).toMatchObject({
@@ -188,6 +209,31 @@ describe("streamDevin history handoff", () => {
 				},
 			],
 		});
+	});
+
+	it("rejects unknown symbolic enum replacements before sending the chat request", async () => {
+		const authPayload = toBinary(GetUserJwtResponseSchema, create(GetUserJwtResponseSchema, { userJwt: "jwt" }));
+		let chatRequests = 0;
+		const result = await streamDevin(
+			devinModel,
+			{ messages: [{ role: "user", content: "hello", timestamp: 0 }] },
+			{
+				apiKey: "token",
+				fetch: (async input => {
+					if (String(input).includes("GetUserJwt")) return new Response(authPayload);
+					chatRequests++;
+					return new Response(new Uint8Array());
+				}) as typeof fetch,
+				onPayload: payload => ({
+					...(payload as Record<string, unknown>),
+					requestType: "CHAT_MESSAGE_REQUEST_TYPE_MISSING",
+				}),
+			},
+		).result();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("Unknown protobuf enum value CHAT_MESSAGE_REQUEST_TYPE_MISSING");
+		expect(chatRequests).toBe(0);
 	});
 
 	it("rejects callback attempts to inject auth before the chat request is sent", async () => {

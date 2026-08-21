@@ -683,6 +683,10 @@ const streamOpenAICompletionsOnce = (
 				activeReasoningEffortFallbackKey = reasoningEffortFallbackKey;
 				const replacedParams = await options?.onPayload?.(params, model);
 				if (replacedParams !== undefined) params = replacedParams as typeof params;
+				// A replacement must not resurrect a field this endpoint already rejected.
+				if (requestReasoningEffortFallback !== undefined) {
+					applyOpenAIReasoningEffortFallback(params, requestReasoningEffortFallback);
+				}
 				activeRequestParams = params;
 				rawRequestDump = {
 					provider: model.provider,

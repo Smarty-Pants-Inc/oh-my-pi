@@ -15,12 +15,38 @@ export enum CommandClassifierResult_SuggestedSandboxMode {
 	UNDETERMINED = 3,
 }
 
+const CommandClassifierResult_SuggestedSandboxModeJson = {
+	SUGGESTED_SANDBOX_MODE_UNSPECIFIED: 0,
+	SUGGESTED_SANDBOX_MODE_SANDBOX: 1,
+	SUGGESTED_SANDBOX_MODE_NO_SANDBOX: 2,
+	SUGGESTED_SANDBOX_MODE_UNDETERMINED: 3,
+} as const;
+
 /** Cursor agent enum ConversationSearchSource. */
 export enum ConversationSearchSource {
 	UNSPECIFIED = 0,
 	LOCAL = 1,
 	CLOUD_CACHE = 2,
 }
+
+const ConversationSearchSourceJson = {
+	CONVERSATION_SEARCH_SOURCE_UNSPECIFIED: 0,
+	CONVERSATION_SEARCH_SOURCE_LOCAL: 1,
+	CONVERSATION_SEARCH_SOURCE_CLOUD_CACHE: 2,
+} as const;
+
+/** Cursor agent enum CursorRuleSource. */
+export enum CursorRuleSource {
+	UNSPECIFIED = 0,
+	TEAM = 1,
+	USER = 2,
+}
+
+const CursorRuleSourceJson = {
+	CURSOR_RULE_SOURCE_UNSPECIFIED: 0,
+	CURSOR_RULE_SOURCE_TEAM: 1,
+	CURSOR_RULE_SOURCE_USER: 2,
+} as const;
 
 /** Cursor agent enum DiagnosticSeverity. */
 export enum DiagnosticSeverity {
@@ -31,12 +57,13 @@ export enum DiagnosticSeverity {
 	HINT = 4,
 }
 
-/** Cursor agent enum CursorRuleSource. */
-export enum CursorRuleSource {
-	UNSPECIFIED = 0,
-	TEAM = 1,
-	USER = 2,
-}
+const DiagnosticSeverityJson = {
+	DIAGNOSTIC_SEVERITY_UNSPECIFIED: 0,
+	DIAGNOSTIC_SEVERITY_ERROR: 1,
+	DIAGNOSTIC_SEVERITY_WARNING: 2,
+	DIAGNOSTIC_SEVERITY_INFORMATION: 3,
+	DIAGNOSTIC_SEVERITY_HINT: 4,
+} as const;
 
 /** Cursor agent enum ForceBackgroundShellStatus. */
 export enum ForceBackgroundShellStatus {
@@ -45,12 +72,24 @@ export enum ForceBackgroundShellStatus {
 	NOT_FOUND = 2,
 }
 
+const ForceBackgroundShellStatusJson = {
+	FORCE_BACKGROUND_SHELL_STATUS_UNSPECIFIED: 0,
+	FORCE_BACKGROUND_SHELL_STATUS_ACCEPTED: 1,
+	FORCE_BACKGROUND_SHELL_STATUS_NOT_FOUND: 2,
+} as const;
+
 /** Cursor agent enum ForceBackgroundSubagentStatus. */
 export enum ForceBackgroundSubagentStatus {
 	UNSPECIFIED = 0,
 	ACCEPTED = 1,
 	NOT_FOUND = 2,
 }
+
+const ForceBackgroundSubagentStatusJson = {
+	FORCE_BACKGROUND_SUBAGENT_STATUS_UNSPECIFIED: 0,
+	FORCE_BACKGROUND_SUBAGENT_STATUS_ACCEPTED: 1,
+	FORCE_BACKGROUND_SUBAGENT_STATUS_NOT_FOUND: 2,
+} as const;
 
 /** Cursor agent enum GetDiffRequest_OutputFormat. */
 export enum GetDiffRequest_OutputFormat {
@@ -61,12 +100,26 @@ export enum GetDiffRequest_OutputFormat {
 	DIFFS_WITH_BEFORE_AND_AFTER = 4,
 }
 
+const GetDiffRequest_OutputFormatJson = {
+	OUTPUT_FORMAT_UNSPECIFIED: 0,
+	OUTPUT_FORMAT_NAME_STATUS: 1,
+	OUTPUT_FORMAT_NAME_STATUS_AND_NUMSTAT: 2,
+	OUTPUT_FORMAT_FILE_DIFFS: 3,
+	OUTPUT_FORMAT_DIFFS_WITH_BEFORE_AND_AFTER: 4,
+} as const;
+
 /** Cursor agent enum GitDiff_DiffType. */
 export enum GitDiff_DiffType {
 	UNSPECIFIED = 0,
 	DIFF_TO_HEAD = 1,
 	DIFF_FROM_BRANCH_TO_MAIN = 2,
 }
+
+const GitDiff_DiffTypeJson = {
+	DIFF_TYPE_UNSPECIFIED: 0,
+	DIFF_TYPE_DIFF_TO_HEAD: 1,
+	DIFF_TYPE_DIFF_FROM_BRANCH_TO_MAIN: 2,
+} as const;
 
 /** Cursor agent enum ShellBackgroundReason. */
 export enum ShellBackgroundReason {
@@ -75,11 +128,22 @@ export enum ShellBackgroundReason {
 	USER_REQUEST = 2,
 }
 
+const ShellBackgroundReasonJson = {
+	SHELL_BACKGROUND_REASON_UNSPECIFIED: 0,
+	SHELL_BACKGROUND_REASON_TIMEOUT: 1,
+	SHELL_BACKGROUND_REASON_USER_REQUEST: 2,
+} as const;
+
 /** Cursor agent enum ShellHookApprovalRequirement_Kind. */
 export enum ShellHookApprovalRequirement_Kind {
 	UNSPECIFIED = 0,
 	FORCE_PROMPT = 1,
 }
+
+const ShellHookApprovalRequirement_KindJson = {
+	SHELL_HOOK_APPROVAL_REQUIREMENT_KIND_UNSPECIFIED: 0,
+	SHELL_HOOK_APPROVAL_REQUIREMENT_KIND_FORCE_PROMPT: 1,
+} as const;
 
 /** Cursor agent enum SmartModeClassifierDecision. */
 export enum SmartModeClassifierDecision {
@@ -88,6 +152,12 @@ export enum SmartModeClassifierDecision {
 	BLOCK = 2,
 }
 
+const SmartModeClassifierDecisionJson = {
+	SMART_MODE_CLASSIFIER_DECISION_UNSPECIFIED: 0,
+	SMART_MODE_CLASSIFIER_DECISION_ALLOW: 1,
+	SMART_MODE_CLASSIFIER_DECISION_BLOCK: 2,
+} as const;
+
 /** Cursor agent enum SubagentBackgroundReason. */
 export enum SubagentBackgroundReason {
 	UNSPECIFIED = 0,
@@ -95,6 +165,13 @@ export enum SubagentBackgroundReason {
 	USER_REQUEST = 2,
 	QUEUED_FOLLOW_UP = 3,
 }
+
+const SubagentBackgroundReasonJson = {
+	SUBAGENT_BACKGROUND_REASON_UNSPECIFIED: 0,
+	SUBAGENT_BACKGROUND_REASON_AGENT_REQUEST: 1,
+	SUBAGENT_BACKGROUND_REASON_USER_REQUEST: 2,
+	SUBAGENT_BACKGROUND_REASON_QUEUED_FOLLOW_UP: 3,
+} as const;
 
 /** Cursor agent message agent.v1.AfterAgentResponseRequestQuery. */
 export interface AfterAgentResponseRequestQuery extends ProtoMessage {
@@ -804,7 +881,7 @@ export interface CommandClassifierResult extends ProtoMessage {
 
 export const CommandClassifierResultSchema: MessageCodec<CommandClassifierResult> = pb<CommandClassifierResult>("agent.v1.CommandClassifierResult", [
 	{ no: 1, name: "commands", kind: "message", T: () => CommandClassifierResult_ClassifiedCommandSchema, repeat: true },
-	{ no: 2, name: "suggestedSandboxMode", kind: "enum" },
+	{ no: 2, name: "suggestedSandboxMode", kind: "enum", E: () => CommandClassifierResult_SuggestedSandboxModeJson },
 	{ no: 3, name: "classificationFailed", kind: "bool" },
 ]);
 
@@ -1111,7 +1188,7 @@ export interface ConversationSearchHit extends ProtoMessage {
 export const ConversationSearchHitSchema: MessageCodec<ConversationSearchHit> = pb<ConversationSearchHit>("agent.v1.ConversationSearchHit", [
 	{ no: 1, name: "conversationId", kind: "string" },
 	{ no: 2, name: "title", kind: "string" },
-	{ no: 3, name: "source", kind: "enum" },
+	{ no: 3, name: "source", kind: "enum", E: () => ConversationSearchSourceJson },
 	{ no: 4, name: "updatedAtMs", kind: "int64" },
 	{ no: 5, name: "snippet", kind: "string", optional: true },
 ]);
@@ -1615,7 +1692,7 @@ export interface DiagnosticItem extends ProtoMessage {
 }
 
 export const DiagnosticItemSchema: MessageCodec<DiagnosticItem> = pb<DiagnosticItem>("agent.v1.DiagnosticItem", [
-	{ no: 1, name: "severity", kind: "enum" },
+	{ no: 1, name: "severity", kind: "enum", E: () => DiagnosticSeverityJson },
 	{ no: 2, name: "range", kind: "message", T: () => DiagnosticRangeSchema },
 	{ no: 3, name: "message", kind: "string" },
 	{ no: 4, name: "source", kind: "string" },
@@ -2696,7 +2773,7 @@ export interface ForceBackgroundShellResult extends ProtoMessage {
 }
 
 export const ForceBackgroundShellResultSchema: MessageCodec<ForceBackgroundShellResult> = pb<ForceBackgroundShellResult>("agent.v1.ForceBackgroundShellResult", [
-	{ no: 1, name: "status", kind: "enum" },
+	{ no: 1, name: "status", kind: "enum", E: () => ForceBackgroundShellStatusJson },
 	{ no: 2, name: "shellResult", kind: "message", T: () => ShellResultSchema },
 ]);
 
@@ -2715,7 +2792,7 @@ export interface ForceBackgroundSubagentResult extends ProtoMessage {
 }
 
 export const ForceBackgroundSubagentResultSchema: MessageCodec<ForceBackgroundSubagentResult> = pb<ForceBackgroundSubagentResult>("agent.v1.ForceBackgroundSubagentResult", [
-	{ no: 1, name: "status", kind: "enum" },
+	{ no: 1, name: "status", kind: "enum", E: () => ForceBackgroundSubagentStatusJson },
 ]);
 
 /** Cursor agent message agent.v1.GenerateImageArgs. */
@@ -2831,7 +2908,7 @@ export const GetDiffRequestSchema: MessageCodec<GetDiffRequest> = pb<GetDiffRequ
 	{ no: 12, name: "computePatchId", kind: "bool" },
 	{ no: 13, name: "returnHeadSha", kind: "bool", optional: true },
 	{ no: 14, name: "maxResponseBytes", kind: "int32", optional: true },
-	{ no: 8, name: "outputFormat", kind: "enum", optional: true },
+	{ no: 8, name: "outputFormat", kind: "enum", E: () => GetDiffRequest_OutputFormatJson, optional: true },
 ]);
 
 /** Cursor agent message agent.v1.GetDiffResponse. */
@@ -2890,7 +2967,7 @@ export interface GitDiff extends ProtoMessage {
 
 export const GitDiffSchema: MessageCodec<GitDiff> = pb<GitDiff>("agent.v1.GitDiff", [
 	{ no: 1, name: "diffs", kind: "message", T: () => FileDiffSchema, repeat: true },
-	{ no: 2, name: "diffType", kind: "enum" },
+	{ no: 2, name: "diffType", kind: "enum", E: () => GitDiff_DiffTypeJson },
 ]);
 
 /** Cursor agent message agent.v1.GitRepoInfo. */
@@ -6400,7 +6477,7 @@ export interface ShellHookApprovalRequirement extends ProtoMessage {
 }
 
 export const ShellHookApprovalRequirementSchema: MessageCodec<ShellHookApprovalRequirement> = pb<ShellHookApprovalRequirement>("agent.v1.ShellHookApprovalRequirement", [
-	{ no: 1, name: "kind", kind: "enum" },
+	{ no: 1, name: "kind", kind: "enum", E: () => ShellHookApprovalRequirement_KindJson },
 	{ no: 2, name: "reason", kind: "string", optional: true },
 ]);
 
@@ -6567,7 +6644,7 @@ export const ShellStreamBackgroundedSchema: MessageCodec<ShellStreamBackgrounded
 	{ no: 3, name: "workingDirectory", kind: "string" },
 	{ no: 4, name: "pid", kind: "uint32", optional: true },
 	{ no: 5, name: "msToWait", kind: "int32", optional: true },
-	{ no: 6, name: "reason", kind: "enum", optional: true },
+	{ no: 6, name: "reason", kind: "enum", E: () => ShellBackgroundReasonJson, optional: true },
 ]);
 
 /** Cursor agent message agent.v1.ShellStreamExit. */
@@ -6660,7 +6737,7 @@ export const ShellSuccessSchema: MessageCodec<ShellSuccess> = pb<ShellSuccess>("
 	{ no: 11, name: "pid", kind: "uint32", optional: true },
 	{ no: 12, name: "msToWait", kind: "int32", optional: true },
 	{ no: 13, name: "localExecutionTimeMs", kind: "int32", optional: true },
-	{ no: 14, name: "backgroundReason", kind: "enum", optional: true },
+	{ no: 14, name: "backgroundReason", kind: "enum", E: () => ShellBackgroundReasonJson, optional: true },
 	{ no: 15, name: "outputHead", kind: "string", optional: true },
 	{ no: 16, name: "outputTail", kind: "string", optional: true },
 	{ no: 17, name: "elidedChars", kind: "uint32", optional: true },
@@ -6829,7 +6906,7 @@ export interface SmartModeClassifierSuccess extends ProtoMessage {
 }
 
 export const SmartModeClassifierSuccessSchema: MessageCodec<SmartModeClassifierSuccess> = pb<SmartModeClassifierSuccess>("agent.v1.SmartModeClassifierSuccess", [
-	{ no: 1, name: "decision", kind: "enum" },
+	{ no: 1, name: "decision", kind: "enum", E: () => SmartModeClassifierDecisionJson },
 	{ no: 2, name: "blockReason", kind: "string", optional: true },
 ]);
 
@@ -7231,7 +7308,7 @@ export const SubagentSuccessSchema: MessageCodec<SubagentSuccess> = pb<SubagentS
 	{ no: 1, name: "agentId", kind: "string" },
 	{ no: 2, name: "finalMessage", kind: "string", optional: true },
 	{ no: 3, name: "toolCallCount", kind: "int32" },
-	{ no: 4, name: "backgroundReason", kind: "enum" },
+	{ no: 4, name: "backgroundReason", kind: "enum", E: () => SubagentBackgroundReasonJson },
 	{ no: 5, name: "transcriptPath", kind: "string", optional: true },
 ]);
 

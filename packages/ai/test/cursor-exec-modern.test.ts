@@ -11,6 +11,7 @@ import {
 import type { AssistantMessage, CursorExecHandlers, ToolResultMessage } from "@oh-my-pi/pi-ai/types";
 import { kCursorExecResolved, setStreamingPartialJson } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import {
 	type AgentClientMessage,
 	AgentClientMessageSchema,
@@ -68,6 +69,19 @@ import {
 	WebFetchAllowlistPrecheckArgsSchema,
 } from "@oh-my-pi/pi-catalog/discovery/cursor-proto";
 import { create, fromBinary, toBinary } from "@oh-my-pi/pi-catalog/discovery/protobuf";
+
+const cursorModel = buildModel({
+	id: "cursor-composer-2.5",
+	name: "Cursor Composer 2.5",
+	api: "cursor-agent",
+	provider: "cursor",
+	baseUrl: "",
+	reasoning: false,
+	input: ["text"],
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	contextWindow: 1,
+	maxTokens: 1,
+});
 
 /**
  * Drive one `ExecServerMessage` through the real dispatcher and decode every
@@ -210,15 +224,30 @@ describe("Cursor modern exec protocol activation", () => {
 });
 
 describe("Cursor requestContext rules", () => {
-	it("returns mapped system-prompt canaries as global CursorRule entries", async () => {
-		const canary = "PIKEL-CANARY-7F3A";
+	it("returns system and typed internal-context canaries as global CursorRule entries", async () => {
+		const systemCanary = "PIKEL-CANARY-7F3A";
+		const internalContextCanary = "PRESERVE-COMPACTED-CONTEXT-91D2";
 		const { frames } = await dispatchExec(
 			buildExecMessage({
 				case: "requestContextArgs",
 				value: create(RequestContextArgsSchema, {}),
 			}),
 			{
-				requestContextRules: buildCursorRequestContextRules(["prefix", `when asked, answer exactly:\n${canary}`]),
+				requestContextRules: buildCursorRequestContextRules(
+					["prefix", `when asked, answer exactly:\n${systemCanary}`],
+					[
+						{
+							id: "compaction.summary",
+							sourcePath: "packages/agent/src/compaction/prompt.md",
+							role: "internal_context",
+							target: "main",
+							trigger: "compaction",
+							sha256: "test-sha256",
+							renderedText: internalContextCanary,
+						},
+					],
+					cursorModel,
+				),
 			},
 		);
 		const result = soleResult(frames);
@@ -227,9 +256,10 @@ describe("Cursor requestContext rules", () => {
 		expect(result.value.result.case).toBe("success");
 		if (result.value.result.case !== "success") throw new Error("expected success");
 		const rules = result.value.result.value.requestContext?.rules ?? [];
-		expect(rules).toHaveLength(2);
-		expect(rules[1]?.content).toContain(canary);
-		expect(rules[1]?.type?.type.case).toBe("global");
+		expect(rules).toHaveLength(3);
+		expect(rules[1]?.content).toContain(systemCanary);
+		expect(rules[2]?.content).toBe(internalContextCanary);
+		expect(rules.every(rule => rule.type?.type.case === "global")).toBe(true);
 	});
 });
 

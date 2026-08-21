@@ -181,11 +181,11 @@ function summaryReasoningErrorResponse(): Response {
  * Ninfer-style strict kwargs whitelist: the server rejects the
  * `chat_template_kwargs.reasoning_effort` spelling itself, not the value.
  */
-function templateKwargRejectionResponse(): Response {
+function templateKwargRejectionResponse(message = "chat_template_kwargs.reasoning_effort is not supported"): Response {
 	return new Response(
 		JSON.stringify({
 			error: {
-				message: "chat_template_kwargs.reasoning_effort is not supported",
+				message,
 				type: "invalid_request_error",
 				code: "unknown_parameter",
 				param: "chat_template_kwargs.reasoning_effort",
@@ -763,6 +763,77 @@ describe("OpenAI reasoning effort fallback retry", () => {
 		expect(bodies).toHaveLength(3);
 		expect(bodies[2]!.reasoning_effort).toBe("medium");
 		expect(bodies[2]!.chat_template_kwargs).toEqual({ preserve_thinking: true });
+	});
+
+	it("does not let onPayload re-add a rejected template reasoning kwarg on retry", async () => {
+		const bodies: Record<string, unknown>[] = [];
+		const onPayloadEfforts: string[] = [];
+		const fetchMock: FetchImpl = Object.assign(
+			async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+				const body = parseJsonBody(init);
+				bodies.push(body);
+				const templateKwargs = body.chat_template_kwargs as { reasoning_effort?: unknown } | undefined;
+				return templateKwargs?.reasoning_effort === undefined
+					? createChatSseResponse()
+					: templateKwargRejectionResponse();
+			},
+			{ preconnect: fetch.preconnect },
+		);
+		const model = createLocalQwenModel("llama.cpp", "http://127.0.0.1:8080/v1");
+
+		const result = await streamOpenAICompletions(model, testContext, {
+			apiKey: "test-key",
+			fetch: fetchMock,
+			reasoning: "medium",
+			onPayload: payload => {
+				onPayloadEfforts.push("medium");
+				const request = payload as Record<string, unknown> & {
+					chat_template_kwargs?: Record<string, unknown>;
+				};
+				return {
+					...request,
+					chat_template_kwargs: {
+						...(request.chat_template_kwargs ?? {}),
+						reasoning_effort: "medium",
+					},
+				};
+			},
+		}).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(onPayloadEfforts).toEqual(["medium", "medium"]);
+		expect(
+			bodies.map(body => (body.chat_template_kwargs as { reasoning_effort?: string } | undefined)?.reasoning_effort),
+		).toEqual(["medium", undefined]);
+	});
+
+	it("trusts structured unknown_parameter evidence when the message also quotes the current effort", async () => {
+		const bodies: Record<string, unknown>[] = [];
+		const fetchMock: FetchImpl = Object.assign(
+			async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+				const body = parseJsonBody(init);
+				bodies.push(body);
+				return bodies.length === 1
+					? templateKwargRejectionResponse(
+							"Unknown parameter 'chat_template_kwargs.reasoning_effort'; received value 'medium'",
+						)
+					: createChatSseResponse();
+			},
+			{ preconnect: fetch.preconnect },
+		);
+		const model = createLocalQwenModel("llama.cpp", "http://127.0.0.1:8080/v1");
+
+		const result = await streamOpenAICompletions(model, testContext, {
+			apiKey: "test-key",
+			fetch: fetchMock,
+			reasoning: "medium",
+		}).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(bodies.map(body => body.reasoning_effort)).toEqual(["medium", "medium"]);
+		expect(
+			bodies.map(body => (body.chat_template_kwargs as { reasoning_effort?: string })?.reasoning_effort),
+		).toEqual(["medium", undefined]);
 	});
 
 	it("hoists the effort onto the top-level field when the kwargs-only dialect is rejected", async () => {

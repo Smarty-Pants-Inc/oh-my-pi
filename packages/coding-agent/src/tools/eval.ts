@@ -538,7 +538,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 		const jobId = autoBgManager.register(
 			"eval",
 			label,
-			async ({ jobId, signal: runSignal, reportProgress }) => {
+			async ({ jobId, signal: runSignal, reportProgress, setResultContent }) => {
 				try {
 					const result = await run(runSignal, (text, details) => {
 						latestText = text;
@@ -546,6 +546,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 						void reportProgress(text, { async: { state: "running", jobId, type: "eval" } });
 						if (forwardUpdates) emitToolUpdate?.(text, details);
 					});
+					setResultContent(result.content);
 					const finalText = result.content.find(block => block.type === "text")?.text ?? "";
 					latestText = finalText;
 					// Hand the full result (images included) to the foreground waiter

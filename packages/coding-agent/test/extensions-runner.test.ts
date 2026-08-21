@@ -4470,7 +4470,7 @@ describe("ExtensionRunner", () => {
 			await expect(runner.emitWithHostCompletion({ type: "session_rollback" })).resolves.toBeUndefined();
 			const finalizerFailure = new Error("lifecycle finalizer failed");
 			await expect(
-				runner.emitWithHostCompletion({ type: "session_rollback" }, () => {
+				runner.emitWithHostCompletion({ type: "session_ready" }, () => {
 					order.push("finalizer:reject");
 					throw finalizerFailure;
 				}),
@@ -4487,11 +4487,11 @@ describe("ExtensionRunner", () => {
 			expect(activateAfterAcknowledgement).not.toHaveBeenCalled();
 
 			expect(order).toEqual([
+				"finalizer:start",
+				"finalizer:end",
 				"host-a:false",
 				"public:start",
 				"public:end",
-				"finalizer:start",
-				"finalizer:end",
 				"after-a:true",
 				"after-a:true",
 				"finalizer:reject",

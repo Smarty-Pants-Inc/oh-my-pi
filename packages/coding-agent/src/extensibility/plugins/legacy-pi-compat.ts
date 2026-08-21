@@ -1861,7 +1861,7 @@ function collectExtensionSpecifierReferences(
 	return references;
 }
 
-const EXTENSION_PARSE_CACHE_SCHEMA_VERSION = 1;
+const EXTENSION_PARSE_CACHE_SCHEMA_VERSION = 2;
 const EXTENSION_PARSE_CACHE_MAX_BYTES = 8 * 1024 * 1024;
 const EXTENSION_PARSE_CACHE_MAX_ENTRIES = 10_000;
 

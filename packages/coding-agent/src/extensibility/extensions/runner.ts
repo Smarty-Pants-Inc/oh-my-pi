@@ -1642,20 +1642,20 @@ export class ExtensionRunner {
 	}
 
 	/**
-	 * Emit an ordinary event to every matching handler, await optional lifecycle
-	 * preparation, then run host-owned post-dispatch publication against a newly
-	 * sampled context. Preparation may return the continuation that activates the
-	 * selected lifecycle owner; that continuation runs only after every
+	 * Await optional lifecycle preparation, emit an ordinary event to every
+	 * matching handler, then run host-owned post-dispatch publication against a
+	 * newly sampled context. Preparation may return the continuation that activates
+	 * the selected lifecycle owner; that continuation runs only after every
 	 * `afterDispatch` callback has completed. Preparation failures and the Fresh
-	 * snapshot-ack publication sentinel propagate and suppress activation; unrelated
-	 * host callback errors and timeouts remain contained.
+	 * snapshot-ack publication sentinel propagate and suppress event dispatch or
+	 * activation; unrelated host callback errors and timeouts remain contained.
 	 */
 	async emitWithHostCompletion<TEvent extends RunnerEmitEvent>(
 		event: TEvent,
 		prepareHostCompletion?: HostCompletionPreparation,
 	): Promise<RunnerEmitResult<TEvent>> {
-		const result = await this.emit(event);
 		const prepared = await prepareHostCompletion?.();
+		const result = await this.emit(event);
 		const postHostContinuation = typeof prepared === "function" ? prepared : undefined;
 		const binding = this.#hostInternalExtension;
 		if (binding?.afterDispatch) {

@@ -43,7 +43,7 @@
 ### Fixed
 
 - Fixed thinking effort selections being ignored for local Qwen 3.8+ models on llama.cpp and vLLM: the Qwen chat-completions dialects only toggled `enable_thinking`, so the chat template always reasoned at its `xhigh` default no matter which level was selected. The encoder now routes the requested effort onto the template's `reasoning_effort` kwarg (`chat_template_kwargs` for both Qwen dialects, plus the top-level field newer llama.cpp builds map natively).
-- Fixed OpenAI Completions, Amazon Bedrock, and Cursor providers ignoring `onPayload` replacement payloads. The hook now transforms the actual request body sent upstream on these providers, matching the Anthropic/Gemini/OpenAI Responses replacement contract. `devin-agent` still does not fire the hook (its payload is a protobuf object).
+- Fixed OpenAI Completions, Amazon Bedrock, Cursor, and Devin providers ignoring `onPayload` replacement payloads. The hook now transforms the actual request body sent upstream on these providers, matching the Anthropic/Gemini/OpenAI Responses replacement contract. Devin exposes credential-redacted canonical ProtoJSON and restores credentials only after validating the replacement.
 - Fixed Codex requests failing outright when the signed-in ChatGPT account is not entitled to the requested model; the exact model denial is now classified as an account-policy error so credential rotation can reach an entitled sibling account
 - Fixed Perplexity email-OTP login after its verification response renamed the encrypted session token from `token` to `challenge_token`.
 - Cloud Code Assist Gemini 3.6/3.7 Flash requests at `minimal` now send `thinkingLevel: LOW` on the aliased `-low` SKU instead of `MINIMAL`, which the API rejects with HTTP 400.

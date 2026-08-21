@@ -67,10 +67,12 @@ export type ScalarKind =
 
 export type WireType = 0 | 1 | 2 | 5;
 
+export type EnumReference = Readonly<Record<string, number>>;
+
 export interface ScalarFieldDesc {
 	readonly no: number;
 	readonly name: string;
-	readonly kind: ScalarKind;
+	readonly kind: Exclude<ScalarKind, "enum">;
 	readonly optional?: boolean;
 	readonly repeat?: boolean;
 }
@@ -87,20 +89,25 @@ export interface EnumFieldDesc {
 	readonly no: number;
 	readonly name: string;
 	readonly kind: "enum";
+	readonly E: () => EnumReference;
 	readonly optional?: boolean;
 	readonly repeat?: boolean;
 }
 
-export interface MapFieldDesc {
+export type MapFieldDesc = {
 	readonly no: number;
 	readonly name: string;
 	readonly kind: "map";
 	readonly K: "string";
-	readonly V: ScalarKind | (() => MessageReference);
-}
+} & (
+	| { readonly V: Exclude<ScalarKind, "enum"> }
+	| { readonly V: "enum"; readonly E: () => EnumReference }
+	| { readonly V: () => MessageReference }
+);
 
 export type VariantDesc =
-	| { readonly no: number; readonly name: string; readonly kind: ScalarKind }
+	| { readonly no: number; readonly name: string; readonly kind: Exclude<ScalarKind, "enum"> }
+	| { readonly no: number; readonly name: string; readonly kind: "enum"; readonly E: () => EnumReference }
 	| { readonly no: number; readonly name: string; readonly kind: "message"; readonly T: () => MessageReference };
 
 export interface OneofFieldDesc {
@@ -220,7 +227,7 @@ function compileCodec<T extends ProtoMessage>(typeName: string, fieldDescs: read
 			compiledFields.push(msgHandler);
 			byNumber.set(desc.no, msgHandler);
 		} else {
-			const valCodec = scalarValue(desc.kind);
+			const valCodec = desc.kind === "enum" ? enumValue(desc.E) : scalarValue(desc.kind);
 			const scalarHandler = desc.repeat
 				? compileRepeatedField(desc.name, desc.no, valCodec)
 				: compileSingularField(desc.name, desc.no, valCodec, desc.optional);
@@ -411,7 +418,8 @@ function compileMapField(desc: MapFieldDesc): CompiledField {
 	const name = desc.name;
 	const number = desc.no;
 	const key = scalarValue("string");
-	const valCodec = typeof desc.V === "function" ? messageValue(desc.V) : scalarValue(desc.V);
+	const valCodec =
+		typeof desc.V === "function" ? messageValue(desc.V) : desc.V === "enum" ? enumValue(desc.E) : scalarValue(desc.V);
 
 	return {
 		number,
@@ -492,7 +500,12 @@ function compileOneofField(desc: OneofFieldDesc): CompiledField {
 	const variantsByNumber = new Map<number, { name: string; codec: ValueCodec<unknown> }>();
 
 	for (const variant of desc.variants) {
-		const codec = variant.kind === "message" ? messageValue(variant.T) : scalarValue(variant.kind);
+		const codec =
+			variant.kind === "message"
+				? messageValue(variant.T)
+				: variant.kind === "enum"
+					? enumValue(variant.E)
+					: scalarValue(variant.kind);
 		variantsByName.set(variant.name, { no: variant.no, codec });
 		variantsByNumber.set(variant.no, { name: variant.name, codec });
 	}
@@ -544,7 +557,35 @@ function isPackableScalar(value: ValueCodec<unknown>): boolean {
 	return value.wireType === 0 || value.wireType === 1 || value.wireType === 5;
 }
 
-function scalarValue(kind: ScalarKind): ValueCodec<unknown> {
+function enumValue(E: () => EnumReference): ValueCodec<unknown> {
+	let namesByNumber: Map<number, string> | undefined;
+	return scalar(
+		0,
+		0,
+		requireInt32,
+		(value, writer) => writer.int32(value),
+		reader => reader.int32(),
+		value => {
+			if (!namesByNumber) {
+				namesByNumber = new Map<number, string>();
+				for (const [name, number] of Object.entries(E())) {
+					if (!namesByNumber.has(number)) namesByNumber.set(number, name);
+				}
+			}
+			return namesByNumber.get(value) ?? value;
+		},
+		value => value === 0,
+		value => {
+			if (typeof value === "number") return requireInt32(value);
+			const name = requireString(value);
+			const number = E()[name];
+			if (number === undefined) throw new Error(`Unknown protobuf enum value ${name}`);
+			return requireInt32(number);
+		},
+	);
+}
+
+function scalarValue(kind: Exclude<ScalarKind, "enum">): ValueCodec<unknown> {
 	switch (kind) {
 		case "bool":
 			return scalar(
@@ -573,15 +614,6 @@ function scalarValue(kind: ScalarKind): ValueCodec<unknown> {
 				requireNumber,
 				(value, writer) => writer.double(value),
 				reader => reader.double(),
-				value => value,
-			);
-		case "enum":
-			return scalar(
-				0,
-				0,
-				requireInt32,
-				(value, writer) => writer.int32(value),
-				reader => reader.int32(),
 				value => value,
 			);
 		case "float":

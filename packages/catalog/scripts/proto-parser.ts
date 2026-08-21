@@ -1476,6 +1476,10 @@ export function generateProtoTs(
 		}
 		lines.push("}");
 		lines.push("");
+		lines.push(`const ${enm.name}Json = {`);
+		for (const val of enm.values) lines.push(`\t${val.name}: ${val.number},`);
+		lines.push("} as const;");
+		lines.push("");
 	}
 
 	// Emit Messages
@@ -1540,7 +1544,8 @@ function emitFieldDescriptor(field: ProtoField): string {
 		return `{ no: ${field.number}, name: "${field.jsonName}", kind: "${field.scalarType}"${optionalStr}${repeatStr} }`;
 	}
 	if (field.kind === "enum") {
-		return `{ no: ${field.number}, name: "${field.jsonName}", kind: "enum"${optionalStr}${repeatStr} }`;
+		const targetEnum = `${cleanTypeName(field.resolvedTypeName || field.typeName)}Json`;
+		return `{ no: ${field.number}, name: "${field.jsonName}", kind: "enum", E: () => ${targetEnum}${optionalStr}${repeatStr} }`;
 	}
 	if (field.kind === "message") {
 		const targetSchema = `${cleanTypeName(field.resolvedTypeName || field.typeName)}Schema`;
@@ -1551,8 +1556,11 @@ function emitFieldDescriptor(field: ProtoField): string {
 			const targetSchema = `${cleanTypeName(field.resolvedValueTypeName || field.valueType)}Schema`;
 			return `{ no: ${field.number}, name: "${field.jsonName}", kind: "map", K: "string", V: () => ${targetSchema} }`;
 		}
-		const valKind = field.valueKind === "enum" ? "enum" : field.valueType;
-		return `{ no: ${field.number}, name: "${field.jsonName}", kind: "map", K: "string", V: "${valKind}" }`;
+		if (field.valueKind === "enum") {
+			const targetEnum = `${cleanTypeName(field.resolvedValueTypeName || field.valueType)}Json`;
+			return `{ no: ${field.number}, name: "${field.jsonName}", kind: "map", K: "string", V: "enum", E: () => ${targetEnum} }`;
+		}
+		return `{ no: ${field.number}, name: "${field.jsonName}", kind: "map", K: "string", V: "${field.valueType}" }`;
 	}
 	return "";
 }
@@ -1563,7 +1571,8 @@ function emitVariantDescriptor(field: ProtoScalarField | ProtoMessageField | Pro
 		return `{ no: ${field.number}, name: "${field.jsonName}", kind: "message", T: () => ${targetSchema} }`;
 	}
 	if (field.kind === "enum") {
-		return `{ no: ${field.number}, name: "${field.jsonName}", kind: "enum" }`;
+		const targetEnum = `${cleanTypeName(field.resolvedTypeName || field.typeName)}Json`;
+		return `{ no: ${field.number}, name: "${field.jsonName}", kind: "enum", E: () => ${targetEnum} }`;
 	}
 	return `{ no: ${field.number}, name: "${field.jsonName}", kind: "${field.scalarType}" }`;
 }
