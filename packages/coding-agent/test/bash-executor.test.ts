@@ -1328,7 +1328,10 @@ describe("executeBash :async: background retention", () => {
 				});
 				expect(res.cancelled).toBe(false);
 
-				await pollUntil(() => fs.existsSync(pidFile), Date.now() + 4000);
+				await pollUntil(() => {
+					if (!fs.existsSync(pidFile)) return false;
+					return /^[1-9]\d*$/.test(fs.readFileSync(pidFile, "utf8").trim());
+				}, Date.now() + 4000);
 				pid = Number.parseInt(fs.readFileSync(pidFile, "utf8").trim(), 10);
 				expect(Number.isInteger(pid)).toBe(true);
 
