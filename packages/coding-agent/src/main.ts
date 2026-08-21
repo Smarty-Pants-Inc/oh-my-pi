@@ -626,6 +626,17 @@ export async function reconcilePrivateHerdrAfterStartupJoin(mode: {
 	}
 }
 
+export function shouldLoadSetupWizard(
+	bridge: CollabBridgeBootstrap | undefined,
+	forceSetupWizard: boolean,
+	storedSetupVersion: number,
+	showStartupSplash: boolean,
+): boolean {
+	return (
+		bridge?.role !== "guest" && (forceSetupWizard || storedSetupVersion < CURRENT_SETUP_VERSION || showStartupSplash)
+	);
+}
+
 async function runInteractiveMode(
 	session: AgentSession,
 	version: string,
@@ -663,10 +674,9 @@ async function runInteractiveMode(
 	// barrel only when setup is stale, forced, or the explicit startup splash
 	// setting needs the shared setup splash renderer.
 	const storedSetupVersion = settings.get("setupVersion");
-	const setupWizard =
-		forceSetupWizard || storedSetupVersion < CURRENT_SETUP_VERSION || showStartupSplash
-			? await import("./modes/setup-wizard")
-			: undefined;
+	const setupWizard = shouldLoadSetupWizard(bridge, forceSetupWizard, storedSetupVersion, showStartupSplash)
+		? await import("./modes/setup-wizard")
+		: undefined;
 	const setupScenes = setupWizard
 		? await setupWizard.selectSetupScenes(storedSetupVersion, setupWizard.ALL_SCENES, mode, {
 				resuming,
@@ -675,9 +685,9 @@ async function runInteractiveMode(
 				force: forceSetupWizard,
 			})
 		: [];
-	const playStartupSplash = showStartupSplash && setupScenes.length === 0;
+	const playStartupSplash = setupWizard !== undefined && showStartupSplash && setupScenes.length === 0;
 	await mode.init({
-		suppressWelcomeIntro: resuming || setupScenes.length > 0 || playStartupSplash,
+		suppressWelcomeIntro: bridge?.role === "guest" || resuming || setupScenes.length > 0 || playStartupSplash,
 		clearInitialTerminalHistory: true,
 	});
 
