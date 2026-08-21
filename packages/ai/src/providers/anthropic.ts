@@ -2047,6 +2047,7 @@ const streamAnthropicOnce = (
 					...createSdkStreamRequestOptions(requestSignal, requestTimeoutMs),
 					maxRetries: 0,
 				};
+				options?.providerDispatchGuard?.();
 				const request: unknown =
 					isOAuthToken && client.beta
 						? client.beta.messages.create(refreshParams, requestOptions)
@@ -2193,6 +2194,7 @@ const streamAnthropicOnce = (
 					maxRetries: 0,
 					...(perRequestHeaders ? { headers: perRequestHeaders } : {}),
 				};
+				options?.providerDispatchGuard?.();
 				const anthropicRequest: unknown =
 					isOAuthToken && client.beta
 						? client.beta.messages.create({ ...params, stream: true }, requestOptions)
@@ -3560,6 +3562,12 @@ function buildToolResultBlock(
 			if (block.type === "image") hoistedImages.push(block);
 		}
 		content = content.filter(block => block.type === "text");
+	}
+	// An empty array is valid for the official API, but strict Anthropic-compatible
+	// endpoints (Z.AI GLM: 400 code 1213 "The prompt parameter was not received
+	// normally") reject it; the empty-string form is accepted by both.
+	if (Array.isArray(content) && content.length === 0) {
+		content = "";
 	}
 	content = ensureErrorToolResultWireContent(content, msg.isError);
 	const block: ContentBlockParam = {

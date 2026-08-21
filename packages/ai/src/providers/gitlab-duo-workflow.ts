@@ -24,6 +24,7 @@ import type {
 import { normalizeSystemPrompts } from "../utils";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { toolWireSchema } from "../utils/schema/wire";
+import { BYPASS_PROVIDER_DISPATCH_GUARD } from "./cowork-fetch";
 import chatmlHistoryNote from "./gitlab-duo-workflow-chatml-note.md" with { type: "text" };
 import { redactSensitiveCredentials } from "./transform-messages";
 
@@ -1926,7 +1927,7 @@ async function stopGitLabDuoWorkflow(
 	// otherwise leave the `runGitLabDuoWorkflow` promise unresolved forever — the
 	// bounded budget keeps cleanup best-effort in both directions.
 	try {
-		await fetchImpl(gitLabApiUrl(baseUrl, `/api/v4/ai/duo_workflows/workflows/${encodeURIComponent(workflowId)}`), {
+		const requestInit = {
 			method: "PATCH",
 			headers: {
 				Authorization: `Bearer ${apiKey}`,
@@ -1934,7 +1935,12 @@ async function stopGitLabDuoWorkflow(
 			},
 			body: JSON.stringify(buildGitLabDuoWorkflowStopBody()),
 			signal: gitLabDuoWorkflowRestSignal(),
-		});
+			[BYPASS_PROVIDER_DISPATCH_GUARD]: true,
+		} satisfies RequestInit & { [BYPASS_PROVIDER_DISPATCH_GUARD]: boolean };
+		await fetchImpl(
+			gitLabApiUrl(baseUrl, `/api/v4/ai/duo_workflows/workflows/${encodeURIComponent(workflowId)}`),
+			requestInit,
+		);
 	} catch (error) {
 		// Server-side stop is best-effort: a timeout / network fault must not reject
 		// the caller (the local stream already emitted its terminal event). Trace and
@@ -2076,6 +2082,10 @@ export function runGitLabDuoWorkflowSocket(
 			// Ignore close failures from test doubles or already closed sockets.
 		}
 	};
+	const guardedSend = (data: string): void => {
+		options.providerDispatchGuard?.();
+		ws.send(data);
+	};
 	const abort = (): void => {
 		close();
 		settle("closed", new AIError.AbortError("GitLab Duo Workflow request aborted"));
@@ -2194,9 +2204,12 @@ export function runGitLabDuoWorkflowSocket(
 			for (const response of responses) {
 				const finalResponse = await applyGitLabDuoWorkflowActionResponseGuard(response, state.model, options);
 				if (settled) return;
-				ws.send(JSON.stringify(finalResponse));
+				guardedSend(JSON.stringify(finalResponse));
 			}
-		})().catch(error => settle("closed", error));
+		})().catch(error => {
+			close();
+			settle("closed", error);
+		});
 	} else {
 		ws.onopen = () => {
 			traceGitLabDuoWorkflow("websocket.open", {
@@ -2208,7 +2221,12 @@ export function runGitLabDuoWorkflowSocket(
 				mcpTools: startPayload.mcpTools.length,
 				preapprovedTools: startPayload.preapproved_tools.length,
 			});
-			ws.send(JSON.stringify({ startRequest: startPayload }));
+			try {
+				guardedSend(JSON.stringify({ startRequest: startPayload }));
+			} catch (error) {
+				close();
+				settle("closed", error);
+			}
 		};
 	}
 	resetIdleTimer();

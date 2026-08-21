@@ -255,6 +255,7 @@ This skill is added after session creation.
 			sessionManager: SessionManager.inMemory(tempDir),
 			modelRegistry: sharedModelRegistry,
 			settings,
+			enableMCP: false,
 		});
 		let commandMetadataChanges = 0;
 		const unsubscribeCommandMetadata = session.subscribeCommandMetadataChanged(() => {
