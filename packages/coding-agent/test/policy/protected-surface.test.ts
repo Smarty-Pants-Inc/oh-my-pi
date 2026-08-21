@@ -109,6 +109,10 @@ describe("protected surface path classification", () => {
 		expect(classifyProtectedPath("packages/catalog/src/compat/openai.ts").map(item => item.surface)).toEqual([
 			"provider-mapping",
 		]);
+		expect(classifyProtectedPath("packages/catalog/src/discovery/protobuf.ts").map(item => item.surface)).toEqual([
+			"provider-mapping",
+			"provider-wrapper",
+		]);
 		expect(classifyProtectedPath("packages/coding-agent/src/session/messages.ts").map(item => item.surface)).toEqual([
 			"provider-wrapper",
 		]);

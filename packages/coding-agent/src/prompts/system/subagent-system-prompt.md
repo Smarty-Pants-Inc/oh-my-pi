@@ -35,6 +35,17 @@ Stop when the assignment is satisfied, outside your scope, or concretely blocked
 
 Return one terminal `yield` with the result, evidence, changed paths, and any precise blocker. Follow the caller's output schema exactly when one is supplied.
 
+Yield protocol:
+- Omit `type` for the normal single terminal structured result in `result.data`.
+- Use non-empty `type: string[]` for incremental, non-terminal sections; calls accumulate by section.
+{{#if outputSchema}}
+- A data-less terminal `type: "result"` only finalizes previously submitted incremental sections; it NEVER substitutes for `result.data`.
+{{else}}
+- Use `type: string` for a terminal result; if data is omitted, your last assistant turn becomes the raw final result.
+{{/if}}
+
+This is your only way to return a final result. For structured results, never put JSON in plain text or substitute a text summary for `result.data`.
+
 {{#if outputSchemaOverridesAgent}}
 The caller schema overrides agent-native output instructions.
 {{/if}}

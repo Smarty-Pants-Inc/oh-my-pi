@@ -439,6 +439,13 @@ exit 64
 				PATH: Bun.env.PATH ?? "",
 				HOME: shellDir,
 				ZDOTDIR: shellDir,
+				// The command runs through an interactive login zsh, which loads the
+				// system `/etc/zshrc`. On macOS that pulls in
+				// `/etc/zshrc_Apple_Terminal`, and under Apple Terminal it appends
+				// "Saving session..." lines to the captured output on exit. `HOME`
+				// does not isolate a system-level file; this is the opt-out Apple
+				// documents in that script.
+				SHELL_SESSIONS_DISABLE: "1",
 			},
 			prefix: undefined,
 		});
@@ -1321,7 +1328,10 @@ describe("executeBash :async: background retention", () => {
 				});
 				expect(res.cancelled).toBe(false);
 
-				await pollUntil(() => fs.existsSync(pidFile), Date.now() + 4000);
+				await pollUntil(() => {
+					if (!fs.existsSync(pidFile)) return false;
+					return /^[1-9]\d*$/.test(fs.readFileSync(pidFile, "utf8").trim());
+				}, Date.now() + 4000);
 				pid = Number.parseInt(fs.readFileSync(pidFile, "utf8").trim(), 10);
 				expect(Number.isInteger(pid)).toBe(true);
 

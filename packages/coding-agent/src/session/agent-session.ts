@@ -50,18 +50,19 @@ import {
 	type CompactionResult,
 	calculatePromptTokens,
 	collectEntriesForBranchSummary,
-	estimateTokens,
 	generateBranchSummary,
 	type ShakeConfig,
 } from "@oh-my-pi/pi-agent-core/compaction";
 import type {
 	AssistantMessage,
 	CodexCompactionContext,
+	Context,
 	ContextInstruction,
 	ImageContent,
 	Message,
 	Model,
 	OAuthAccountIdentity,
+	ProviderResponseMetadata,
 	ProviderSessionState,
 	ResetCreditAccountStatus,
 	ResetCreditRedeemOutcome,
@@ -85,7 +86,6 @@ import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { MacOSPowerAssertion } from "@oh-my-pi/pi-natives";
 import {
 	$env,
-	APP_NAME,
 	formatDuration,
 	getAgentDbPath,
 	isBunTestRuntime,
@@ -113,7 +113,13 @@ import type { ResolvedModelRoleValue } from "../config/model-resolver";
 import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-templates";
 import { buildServiceTierByFamily } from "../config/service-tier";
 import type { Settings, SkillsSettings } from "../config/settings";
-import { onAppendOnlyModeChanged, onModelRolesChanged } from "../config/settings";
+import {
+	onAppendOnlyModeChanged,
+	onCodeModeChanged,
+	onExtendedContextChanged,
+	onModelRolesChanged,
+} from "../config/settings";
+import { sha256 } from "../context/canonical";
 import {
 	explainContext as buildContextExplanation,
 	type ContextExplanation,
@@ -162,7 +168,7 @@ import type { HookCommandContext } from "../extensibility/hooks/types";
 import type { Skill, SkillWarning } from "../extensibility/skills";
 import { expandSlashCommand, type FileSlashCommand } from "../extensibility/slash-commands";
 import { normalizeToolEventInput, resolveToolEventInput } from "../extensibility/tool-event-input";
-import { GoalRuntime } from "../goals/runtime";
+import { GoalRuntime, isFinalStatus } from "../goals/runtime";
 import { type GoalModeState, isCurrentGoalModeState, parseGoalModeState } from "../goals/state";
 import type { HindsightSessionState } from "../hindsight/state";
 import { type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
@@ -228,6 +234,7 @@ import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import { extractFileMentions, generateFileMentionMessages } from "../utils/file-mentions";
 import { normalizeModelContextImages } from "../utils/image-loading";
 import type { InspectImageMode } from "../utils/inspect-image-mode";
+import { resumeCommand } from "../utils/resume-command";
 import { generateSessionTitle } from "../utils/title-generator";
 import { buildNamedToolChoice, isToolChoiceActive } from "../utils/tool-choice";
 import type { VibeModeState } from "../vibe/state";
@@ -239,6 +246,7 @@ import type {
 	AsyncJobSnapshot,
 	CommandMetadataChangedListener,
 	ContextUsageBreakdown,
+	DroppedPrompt,
 	FollowUpOptions,
 	FreshSessionResult,
 	HandoffResult,
@@ -383,6 +391,7 @@ import { SessionProviderBoundary, type SessionProviderBoundaryHost } from "./ses
 import { SessionStatsTracker, type SessionStatsTrackerHost } from "./session-stats";
 import { SessionTools, type SessionToolsHost } from "./session-tools";
 import type { ShakeMode, ShakeResult } from "./shake-types";
+import { skillPromptTitleInput } from "./skill-title-input";
 import { ToolChoiceQueue } from "./tool-choice-queue";
 import { planTurnPersistence, sameMessageContent, sessionMessagePersistenceKey } from "./turn-persistence";
 import { TurnRecovery, type TurnRecoveryHost } from "./turn-recovery";
@@ -593,6 +602,8 @@ export class AgentSession {
 	#exitRecorded = false;
 	#unsubscribeAppendOnly?: () => void;
 	#unsubscribeModelRoles?: () => void;
+	#unsubscribeExtendedContext?: () => void;
+	#unsubscribeCodeMode?: () => void;
 	/** Last (enable, providerId) tuple resolved by `#syncAppendOnlyContext` — used to skip no-op invalidations. */
 	#lastAppendOnlyResolution?: { enable: boolean; providerId: string | undefined };
 	#eventListeners: AgentSessionEventListener[] = [];
@@ -614,9 +625,12 @@ export class AgentSession {
 	#inspectImageModeOverride: InspectImageMode | undefined;
 	#vibeModeState: VibeModeState | undefined;
 	#goalModeState: GoalModeState | undefined;
+	#advisorMissionKey: string | undefined;
+	#pendingAdvisorTerminalMissionKey: string | undefined;
 	#goalRuntime: GoalRuntime;
 	#goalContinuationContext = false;
 	readonly #advisors: SessionAdvisors;
+	#advisorsInitialized = false;
 	#goalTurnCounter = 0;
 	#planReferenceSent = false;
 	#planReferencePath = "local://PLAN.md";
@@ -644,6 +658,11 @@ export class AgentSession {
 	 *  generation path. Refresh via {@link AgentSession.setTitleSystemPrompt} when
 	 *  the session cwd changes. */
 	#titleSystemPrompt: string | undefined;
+	#titleGenerationStart: (() => void) | undefined;
+	#titleGenerationInFlightFor: string | undefined;
+	/** Host hook invoked when a typed user prompt is dropped before dispatch;
+	 *  see {@link setPromptDropped}. */
+	#promptDropped: ((prompt: DroppedPrompt) => void) | undefined;
 	#titleGenerationAbortController = new AbortController();
 	#toolChoiceQueue = new ToolChoiceQueue();
 
@@ -739,6 +758,13 @@ export class AgentSession {
 	#transformContext: (messages: AgentMessage[], signal?: AbortSignal) => AgentMessage[] | Promise<AgentMessage[]>;
 	#onPayload: SimpleStreamOptions["onPayload"] | undefined;
 	#onResponse: SimpleStreamOptions["onResponse"] | undefined;
+	/**
+	 * Providers/models (`${provider}/${id}`) whose runtime context window has
+	 * already been re-probed after their first successful inference this session,
+	 * so a lazy-load local model (LM Studio JIT, llama.cpp cold start) is
+	 * refreshed exactly once rather than on every response (#9001).
+	 */
+	#lazyContextRefreshed = new Set<string>();
 	#onSseEvent: SimpleStreamOptions["onSseEvent"] | undefined;
 	#sideStreamFn: StreamFn;
 	#preferWebsockets: boolean | undefined;
@@ -1100,11 +1126,14 @@ export class AgentSession {
 		return listPlanFiles({ localProtocolOptions: this.#localProtocolOptions() });
 	}
 
+	#codeModeState: { namespacesInfo?: unknown };
+
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
 		this.#desiredSteeringMode = this.agent.getSteeringMode();
 		this.#desiredFollowUpMode = this.agent.getFollowUpMode();
 		this.#desiredInterruptMode = this.agent.getInterruptMode();
+		this.#codeModeState = config.codeModeState ?? {};
 		this.sessionManager = config.sessionManager;
 		this.settings = config.settings;
 		this.#getMcpServerInstructionSources = config.getMcpServerInstructionSources;
@@ -1154,8 +1183,13 @@ export class AgentSession {
 			emitNotice: (level, message, source) => this.emitNotice(level, message, source),
 			setModelTemporary: (model, thinkingLevel, options) => this.setModelTemporary(model, thinkingLevel, options),
 			setActiveToolsByName: names => this.setActiveToolsByName(names),
+			setActiveToolPresentation: (toolNames, mountedToolNames) =>
+				this.setActiveToolPresentation(toolNames, mountedToolNames),
+			runToolRegistryMutation: mutation => this.runToolRegistryMutation(mutation),
 			getActiveToolNames: () => this.getActiveToolNames(),
 			getEnabledToolNames: () => this.getEnabledToolNames(),
+			getSelectedMCPToolNames: () => this.getSelectedMCPToolNames(),
+			getMountedXdevToolNames: () => this.getMountedXdevToolNames(),
 			hasBuiltInTool: name => this.hasBuiltInTool(name),
 			getPlanModeState: () => this.getPlanModeState(),
 			setPlanModeState: state => this.setPlanModeState(state),
@@ -1188,6 +1222,7 @@ export class AgentSession {
 			promptGeneration: () => this.#promptGeneration,
 			hasPendingAsyncWake: () => this.#hasPendingAsyncWake(),
 			getActiveToolNames: () => this.getActiveToolNames(),
+			getEnabledToolNames: () => this.getEnabledToolNames(),
 			toolRegistry: () => this.#tools.registry,
 			planModeEnabled: () => this.#planModeState?.enabled === true,
 			consumeLastServedToolChoiceLabel: () => this.#toolChoiceQueue.consumeLastServedLabel(),
@@ -1336,11 +1371,15 @@ export class AgentSession {
 			? async (response, model) => {
 					this.rawSseDebugBuffer.recordResponse(response, model);
 					this.#stats.ingestProviderUsageHeaders(response, model);
+					await this.#maybeRefreshLazyLocalContext(response, model);
 					await configuredOnResponse(response, model);
 				}
 			: (response, model) => {
 					this.rawSseDebugBuffer.recordResponse(response, model);
 					this.#stats.ingestProviderUsageHeaders(response, model);
+					// Returns void (no allocation) unless a one-time lazy-model
+					// refresh is actually due, preserving the sync fast path.
+					return this.#maybeRefreshLazyLocalContext(response, model);
 				};
 		const configuredOnSseEvent = config.onSseEvent;
 		this.#onSseEvent = configuredOnSseEvent
@@ -1452,6 +1491,9 @@ export class AgentSession {
 			hasPendingMessages: () => this.hasPendingMessages(),
 			planModeEnabled: () => this.#planModeState?.enabled === true,
 			model: () => this.model,
+			setCodeModeNamespacesInfo: info => {
+				this.#codeModeState.namespacesInfo = info;
+			},
 			memoryBackendSession: () => this,
 			clearInheritedProviderPromptCacheKey: () => this.#clearInheritedProviderPromptCacheKey(),
 			clearMemoryPromotionSnapshot: () => this.#memory.clearPromotionSnapshot(),
@@ -1602,9 +1644,7 @@ export class AgentSession {
 		this.#todo.syncFromBranch();
 		this.#goalRuntime = new GoalRuntime({
 			getState: () => this.#goalModeState,
-			setState: state => {
-				this.setGoalModeState(state);
-			},
+			setState: state => this.#setGoalModeState(state, "mutation"),
 			getCurrentUsage: () => {
 				const usage = this.getSessionStats().tokens;
 				return {
@@ -1650,7 +1690,7 @@ export class AgentSession {
 			if (!sessionId || !this.sessionManager.getSessionFile()) return undefined;
 			return {
 				label: this.#agentId ?? (this.#agentKind === "main" ? "Main" : "Agent"),
-				command: `${APP_NAME} --resume ${sessionId}`,
+				command: resumeCommand(sessionId),
 			};
 		});
 
@@ -1670,6 +1710,31 @@ export class AgentSession {
 			abortInProgress: () => this.#abortInProgress,
 			allowAgentInitiatedTurns: () => this.#allowAcpAgentInitiatedTurns,
 			planModeState: () => this.#planModeState,
+			advisorMissionContext: sharedRegexSecretValues => {
+				const state = this.#goalModeState;
+				const key = this.#advisorMissionKey;
+				if (!state?.goal || !key) return undefined;
+				const terminal = isFinalStatus(state.goal);
+				if (terminal && this.#pendingAdvisorTerminalMissionKey !== key) return undefined;
+				const missionPrompt = this.#goalRuntime.buildAdvisorMissionPrompt(objective => {
+					const obfuscator = this.#obfuscator;
+					if (!obfuscator?.hasSecrets()) return objective;
+					for (const value of obfuscator.collectRegexSecretValuesForObfuscation(objective)) {
+						sharedRegexSecretValues.add(value);
+					}
+					return obfuscator.obfuscate(objective, sharedRegexSecretValues);
+				});
+				return missionPrompt
+					? {
+							instruction: bindRenderedInstruction("goal.advisor_mission", missionPrompt, "side_model"),
+							key,
+							terminal,
+						}
+					: undefined;
+			},
+			consumeAdvisorTerminalMission: key => {
+				if (this.#pendingAdvisorTerminalMissionKey === key) this.#pendingAdvisorTerminalMissionKey = undefined;
+			},
 			clientBridge: () => this.#clientBridge,
 			emitSessionEvent: event => this.#emitSessionEvent(event),
 			emitNotice: (level, message, source) => this.emitNotice(level, message, source),
@@ -1691,6 +1756,8 @@ export class AgentSession {
 				this.#maintenance.resolveCompactionModelCandidates(model, availableModels),
 			resolveRetryFallbackRole: (selector, model, roleHint) =>
 				this.#recovery.resolveRetryFallbackRole(selector, model, roleHint),
+			retryFallbackChainKeys: (selector, model, options) =>
+				this.#recovery.retryFallbackChainKeys(selector, model, options),
 			findRetryFallbackCandidates: (role, selector, model) =>
 				this.#recovery.findRetryFallbackCandidates(role, selector, model),
 			isRetryFallbackSelectorSuppressed: selector => this.#recovery.isRetryFallbackSelectorSuppressed(selector),
@@ -1714,6 +1781,7 @@ export class AgentSession {
 			transformProviderContext: config.transformProviderContext,
 			initialCosts: config.initialAdvisorCosts,
 		});
+		this.#advisorsInitialized = true;
 
 		const maintenanceHost: SessionMaintenanceHost = {
 			agent: this.agent,
@@ -1745,8 +1813,10 @@ export class AgentSession {
 			scheduleCompactionContinuation: options => this.#scheduleCompactionContinuation(options),
 			persistTurnMessagesForMidRunCompaction: context => this.#persistTurnMessagesForMidRunCompaction(context),
 			findLastAssistantMessage: () => this.#findLastAssistantMessage(),
-			beginSemanticDeliveryMaintenance: signal => this.#beginSemanticDeliveryMaintenance(signal),
+			beginSemanticDeliveryMaintenance: (signal, exemptAcceptance) =>
+				this.#beginSemanticDeliveryMaintenance(signal, exemptAcceptance),
 			disconnectFromAgent: () => this.#disconnectFromAgent(),
+			drainStrandedQueuedMessages: () => this.#drainStrandedQueuedMessages(),
 			reconnectToAgent: () => this.#reconnectToAgent(),
 			buildDisplaySessionContext: () => this.buildDisplaySessionContext(),
 			convertToLlmForSideRequest: messages => this.#convertToLlmForSideRequest(messages),
@@ -1765,10 +1835,9 @@ export class AgentSession {
 			getContextUsage: options => this.getContextUsage(options),
 			shake: (mode, options) => this.shake(mode, options),
 			dropImages: () => this.dropImages(),
-			runHandoff: (customInstructions, options, semanticDeliveryAcceptance) =>
-				semanticDeliveryAcceptance === undefined
-					? this.handoff(customInstructions, options)
-					: this.handoff(customInstructions, options, semanticDeliveryAcceptance),
+			generateHandoffDocument: (customInstructions, options, deferPersistence) =>
+				this.#handoff.generateDocument(customInstructions, options, deferPersistence),
+			persistHandoffDocument: result => this.#handoff.persistAutoDocument(result),
 			removeAssistantMessageFromActiveContext: message =>
 				this.#recovery.removeAssistantMessageFromActiveContext(message),
 			dropPersistedAssistantTurn: message => this.#recovery.dropPersistedAssistantTurn(message),
@@ -1786,8 +1855,8 @@ export class AgentSession {
 			sessionManager: this.sessionManager,
 			settings: this.settings,
 			modelRegistry: this.#modelRegistry,
-			extensionRunner: this.#extensionRunner,
 			sideStreamFn: this.#sideStreamFn,
+			extensionRunner: this.#extensionRunner,
 			beginLifecycleTransaction: (semanticDeliveryAcceptance, signal, quiesceAgent) =>
 				this.#beginLifecycleTransaction({ quiesceAgent, signal }, semanticDeliveryAcceptance),
 			obfuscator: this.#obfuscator,
@@ -1795,8 +1864,9 @@ export class AgentSession {
 			thinkingLevel: () => this.thinkingLevel,
 			sessionId: () => this.sessionId,
 			sessionFile: () => this.sessionFile,
-			baseSystemPrompt: () => this.#tools.baseSystemPrompt,
+			goalModeState: () => this.#goalModeState,
 			assertVibeSessionTransitionAllowed: action => this.#assertVibeSessionTransitionAllowed(action),
+			baseSystemPrompt: () => this.#tools.baseSystemPrompt,
 			setSkipPostTurnMaintenance: timestamp => {
 				this.#maintenance.skipPostTurnMaintenanceAssistantTimestamp = timestamp;
 			},
@@ -1826,6 +1896,7 @@ export class AgentSession {
 			restoreExplicitPromptMessages: messages => this.restoreExplicitPromptMessages(messages),
 			resetTodoCycle: () => this.#todo.resetCycle(),
 			buildDisplaySessionContext: () => this.buildDisplaySessionContext(),
+			replaceMessagesFromSessionContext: context => this.#replaceMessagesFromSessionContext(context),
 			drainAndDetachAdvisorRecorders: () => this.#advisors.drainAndDetachRecorders(),
 			syncTodoPhasesFromBranch: () => this.#todo.syncFromBranch(),
 		};
@@ -1840,6 +1911,24 @@ export class AgentSession {
 		this.#unsubscribeAppendOnly = onAppendOnlyModeChanged(_value => this.#syncAppendOnlyContext(this.model));
 		this.#rehydratePendingSemanticDeliveries();
 		this.#unsubscribeModelRoles = onModelRolesChanged(() => this.#advisors.onModelRolesChanged());
+		// Re-derive the active model's effective context window when the
+		// extended-context setting flips at runtime: the registry re-clamps (or
+		// restores) premium long-context windows, and the live model object must
+		// follow so compaction thresholds and context display react immediately.
+		this.#unsubscribeExtendedContext = onExtendedContextChanged(() => void this.#reapplyExtendedContextPolicy());
+		this.#unsubscribeCodeMode = onCodeModeChanged(() => {
+			void this.#tools.reconcileCodeMode().catch(error => {
+				logger.warn("Code Mode reconcile after setting change failed", { error: String(error) });
+			});
+		});
+
+		// An advisor enabled in config resolves its role against the model catalog
+		// as it stands at construction. Discovery-backed providers (e.g. GitHub
+		// Copilot) may not be populated yet — background discovery is started
+		// fire-and-forget before the session is built — so a valid configured model
+		// can land as `no_model`. Retry once the initial refresh settles so the
+		// advisor activates without a manual /advisor toggle. See #9010.
+		void this.#retryInactiveAdvisorAfterModelDiscovery();
 	}
 	/** Model registry for API key resolution and model discovery */
 	get modelRegistry(): ModelRegistry {
@@ -2392,7 +2481,10 @@ export class AgentSession {
 			throw error;
 		}
 	}
-	async #beginSemanticDeliveryMaintenance(signal?: AbortSignal): Promise<() => void> {
+	async #beginSemanticDeliveryMaintenance(
+		signal?: AbortSignal,
+		exemptAcceptance?: Promise<void>,
+	): Promise<() => void> {
 		const releaseLifecycleFence = this.#acquireLifecycleTransitionFence();
 		this.#semanticDeliveryMaintenanceFenceActive = true;
 		let released = false;
@@ -2403,7 +2495,7 @@ export class AgentSession {
 			releaseLifecycleFence();
 		};
 		try {
-			await this.#waitForSemanticDeliveryAcceptances(undefined, signal);
+			await this.#waitForSemanticDeliveryAcceptances(exemptAcceptance, signal);
 			return releaseFence;
 		} catch (error) {
 			releaseFence();
@@ -3212,7 +3304,9 @@ export class AgentSession {
 			if (assistantMsg.stopReason !== "aborted" && assistantMsg.stopReason !== "error" && assistantMsg.usage) {
 				assistantMsg.contextSnapshot = {
 					promptTokens: calculatePromptTokens(assistantMsg.usage),
-					nonMessageTokens: this.#stats.pendingNonMessageTokens ?? computeNonMessageTokens(this),
+					nonMessageTokens:
+						this.#stats.pendingNonMessageTokens ?? computeNonMessageTokens(this, this.agent.tokenizer),
+					compactionEpoch: this.#stats.compactionEpoch,
 				};
 			}
 		}
@@ -4433,14 +4527,10 @@ export class AgentSession {
 	}): boolean {
 		if (options.suppressContinuation) return false;
 		if (this.agent.hasQueuedMessages()) {
-			const queuedAuthority = this.#queuedTurnAuthority();
-			if (!queuedAuthority) return false;
-			this.#scheduleAgentContinue({
-				...queuedAuthority,
-				delayMs: 100,
-				generation: options.generation,
-				shouldContinue: () => this.agent.hasQueuedMessages(),
-			});
+			if (!this.#queuedTurnAuthority()) return false;
+			// Queue-preserving compaction releases its lifecycle fence after reconnecting;
+			// that release owns the single stranded-queue drain. Scheduling here as well
+			// races the release and can start the same queued turn twice.
 			return true;
 		}
 		if (!options.autoContinue) return false;
@@ -4474,6 +4564,14 @@ export class AgentSession {
 		this.#schedulePostPromptTask(
 			async signal => {
 				await Promise.resolve();
+				while (this.#lifecycleTransitionFenceActive) {
+					try {
+						await scheduler.wait(1, { signal });
+					} catch {
+						return;
+					}
+				}
+				if (this.#promptGeneration !== generation) return;
 				if (signal.aborted) return;
 				if (this.agent.hasQueuedMessages()) {
 					const queuedAuthority = this.#queuedTurnAuthority();
@@ -5242,6 +5340,7 @@ export class AgentSession {
 		await cleanupEmptyMoveSession(this.sessionManager, this.#movedFromEmptySessionFile);
 		this.#movedFromEmptySessionFile = undefined;
 		this.#closeAllProviderSessions("dispose");
+		this.#maintenance.cancelSpeculation();
 		this.setHindsightSessionState(undefined);
 		hindsightState?.dispose();
 		this.#disconnectFromAgent();
@@ -5252,6 +5351,14 @@ export class AgentSession {
 		if (this.#unsubscribeModelRoles) {
 			this.#unsubscribeModelRoles();
 			this.#unsubscribeModelRoles = undefined;
+		}
+		if (this.#unsubscribeExtendedContext) {
+			this.#unsubscribeExtendedContext();
+			this.#unsubscribeExtendedContext = undefined;
+		}
+		if (this.#unsubscribeCodeMode) {
+			this.#unsubscribeCodeMode();
+			this.#unsubscribeCodeMode = undefined;
 		}
 		this.#eventListeners = [];
 		this.#runStateListeners.clear();
@@ -5452,6 +5559,16 @@ export class AgentSession {
 			// conversation. The on-disk record and the plain `transcript:true` export
 			// path keep the full pre-reset history.
 			this.sessionManager.appendResetBoundary();
+			await this.#goalRuntime.clearFinalGoalAtHistoryBoundary();
+			// Persisted terminal goals are deliberately omitted from the live goal
+			// projection on rehydrate. Normalize that history-only mode at the reset
+			// boundary too so it cannot become the current mode again.
+			if (!this.#goalModeState) {
+				const { mode } = this.sessionManager.buildSessionContext();
+				if (mode === "goal" || mode === "goal_paused") {
+					this.sessionManager.appendModeChange("none");
+				}
+			}
 			return { droppedCount };
 		} finally {
 			releaseSemanticFence();
@@ -5470,6 +5587,49 @@ export class AgentSession {
 	/** Current model (may be undefined if not yet selected) */
 	get model(): Model | undefined {
 		return this.agent.state.model;
+	}
+
+	/**
+	 * On the first successful response from a lazy-load local model, re-probe its
+	 * runtime context window and fold the result into the live session model.
+	 *
+	 * Discovery snapshots a not-yet-loaded LM Studio model with its architectural
+	 * `max_context_length`; the runtime `loaded_context_length` only exists once
+	 * the model JIT-loads on the first inference (llama.cpp has the same cold-start
+	 * gap for `meta.n_ctx`). A 2xx here means the load completed, so the probe now
+	 * returns the window the backend actually serves. Compaction and the context
+	 * bar read `agent.state.model` every turn, so `agent.setModel` propagates it
+	 * immediately without a provider-session reset (#9001).
+	 *
+	 * Returns `void` synchronously when nothing is due — the common case — so the
+	 * no-callback `#onResponse` fast path stays allocation-free.
+	 */
+	#maybeRefreshLazyLocalContext(response: ProviderResponseMetadata, model: Model | undefined): void | Promise<void> {
+		if (!model || response.status < 200 || response.status >= 300) return;
+		const key = `${model.provider}/${model.id}`;
+		if (this.#lazyContextRefreshed.has(key)) return;
+		if (!this.#modelRegistry.hasLazyRuntimeMetadata(model.provider)) return;
+		this.#lazyContextRefreshed.add(key);
+		return this.#refreshLazyLocalContext(model);
+	}
+
+	async #refreshLazyLocalContext(model: Model): Promise<void> {
+		try {
+			const refreshed = await this.#modelRegistry.refreshSelectedModelMetadata(model);
+			const current = this.model;
+			// Skip if the user switched models mid-stream, or the runtime window
+			// matches what the session already holds.
+			if (!current || !modelsAreEqual(current, refreshed) || refreshed.contextWindow === current.contextWindow) {
+				return;
+			}
+			this.agent.setModel(refreshed);
+		} catch (error) {
+			logger.debug("Lazy local model context refresh failed", {
+				provider: model.provider,
+				model: model.id,
+				error,
+			});
+		}
 	}
 
 	/**
@@ -5672,6 +5832,16 @@ export class AgentSession {
 		return this.#tools.getToolByName(name);
 	}
 
+	/** Looks up an enabled eval-bridge tool with the session's permission gate applied. */
+	getToolForEvalBridge(name: string): AgentTool | undefined {
+		return this.#tools.getToolForEvalBridge(name);
+	}
+
+	/** Names currently authorized through the eval bridge. */
+	getEvalBridgeToolNames(): string[] {
+		return this.#tools.getEvalBridgeToolNames();
+	}
+
 	/** Whether a registry entry came from a built-in factory. */
 	hasBuiltInTool(name: string): boolean {
 		return this.#tools.hasBuiltInTool(name);
@@ -5757,6 +5927,29 @@ export class AgentSession {
 	/** Rediscovers reloadable skills and refreshes prompt metadata. */
 	refreshSkills(): Promise<void> {
 		return this.#tools.refreshSkills();
+	}
+
+	/**
+	 * Applies Code Mode at session startup: when the initial model activates
+	 * it (`codeMode` `on`, or `auto` matching a `code_mode_only` catalog flag),
+	 * the initial tool surface is routed through the Code Mode-aware path so
+	 * the restricted direct surface and namespaces snapshot exist before the
+	 * first provider turn instead of waiting for an unrelated reconciliation.
+	 *
+	 * Inactive sessions keep their initial surface untouched: re-applying an
+	 * unchanged set would seed the prompt-rebuild signature cache and suppress
+	 * the first late tool registration's rebuild (non-MCP `xd://` mounts are
+	 * deliberately not part of that signature).
+	 */
+	initializeCodeMode(): Promise<void> {
+		const model = this.model;
+		if (!model || !this.#tools.codeModeChangesBetween(undefined, model)) return Promise.resolve();
+		return this.#tools.reconcileCodeMode();
+	}
+
+	/** Current Code Mode `tool_namespaces_info` snapshot, or `undefined` when inactive. */
+	get codeModeNamespacesInfo(): unknown {
+		return this.#codeModeState.namespacesInfo;
 	}
 
 	/** Selects enabled tools, ignoring names absent from the registry. */
@@ -5865,6 +6058,10 @@ export class AgentSession {
 		return this.#maintenance.isCompacting;
 	}
 
+	/** Background speculative-compaction state, for UI indicators. */
+	get compactionSpeculation(): "idle" | "running" | "armed" {
+		return this.#maintenance.speculationState;
+	}
 	/** Strip image content from the current branch and persist the rewrite. */
 	dropImages(): Promise<{ removed: number }> {
 		return this.#maintenance.dropImages();
@@ -5938,9 +6135,48 @@ export class AgentSession {
 		return this.#providerBoundary.buildDisplaySessionContext();
 	}
 
+	#setGoalModeState(
+		state: GoalModeState | undefined,
+		source: "mutation" | "rehydrate" | "restore",
+		pendingTerminalMissionKey?: string,
+	): void {
+		const previousKey = this.#advisorMissionKey;
+		const previousPendingKey = this.#pendingAdvisorTerminalMissionKey;
+		const nextKey = state?.goal
+			? sha256(JSON.stringify([state.goal.id, state.goal.objective, state.goal.status]))
+			: undefined;
+		this.#goalModeState = state;
+		this.#advisorMissionKey = nextKey;
+		if (source === "rehydrate") {
+			this.#pendingAdvisorTerminalMissionKey = undefined;
+		} else if (source === "restore") {
+			this.#pendingAdvisorTerminalMissionKey =
+				pendingTerminalMissionKey === nextKey && state?.goal && isFinalStatus(state.goal) ? nextKey : undefined;
+		} else if (nextKey !== previousKey) {
+			this.#pendingAdvisorTerminalMissionKey = state?.goal && isFinalStatus(state.goal) ? nextKey : undefined;
+		}
+		if (
+			this.#advisorsInitialized &&
+			(previousKey !== nextKey || previousPendingKey !== this.#pendingAdvisorTerminalMissionKey)
+		) {
+			this.#advisors.onMissionChanged(
+				nextKey,
+				this.#pendingAdvisorTerminalMissionKey !== undefined && this.#pendingAdvisorTerminalMissionKey === nextKey,
+			);
+		}
+	}
+
 	#rehydrateGoalModeState(mode: unknown, modeData: unknown): void {
 		this.#goalRuntime.clearAccounting();
-		this.setGoalModeState(this.settings.get("goal.enabled") ? parseGoalModeState(mode, modeData) : undefined);
+		this.#setGoalModeState(
+			this.settings.get("goal.enabled") ? parseGoalModeState(mode, modeData) : undefined,
+			"rehydrate",
+		);
+	}
+
+	#replaceMessagesFromSessionContext(context: SessionContext, messages = context.messages): void {
+		this.#rehydrateGoalModeState(context.mode, context.modeData);
+		this.agent.replaceMessages(messages);
 	}
 
 	/**
@@ -6055,11 +6291,15 @@ export class AgentSession {
 	}
 
 	setGoalModeState(state: GoalModeState | undefined): void {
-		this.#goalModeState = state && (state.mode === "exiting" || isCurrentGoalModeState(state)) ? state : undefined;
+		this.#setGoalModeState(state, "mutation");
 	}
 
 	isGoalModeExiting(): boolean {
 		return this.#goalModeState?.mode === "exiting";
+	}
+
+	rehydrateGoalModeState(state: GoalModeState | undefined): void {
+		this.#setGoalModeState(state, "rehydrate");
 	}
 
 	getVibeModeState(): VibeModeState | undefined {
@@ -6078,6 +6318,10 @@ export class AgentSession {
 
 	get goalRuntime(): GoalRuntime {
 		return this.#goalRuntime;
+	}
+
+	retainPrimaryProviderContext(context: Context): void {
+		this.#advisors.retainPrimaryContext(context);
 	}
 
 	/** Fresh registered components injected at the provider boundary, never persisted as messages. */
@@ -6162,6 +6406,7 @@ export class AgentSession {
 			goalModeState: this.#goalModeState
 				? { ...this.#goalModeState, goal: { ...this.#goalModeState.goal } }
 				: undefined,
+			pendingAdvisorTerminalMissionKey: this.#pendingAdvisorTerminalMissionKey,
 			inspectImageModeOverride: this.#inspectImageModeOverride,
 			goalTurnCounter: this.#goalTurnCounter,
 			planReferenceSent: this.#planReferenceSent,
@@ -6177,10 +6422,12 @@ export class AgentSession {
 		this.#observedSessionId = checkpoint.observedSessionId;
 		this.#planModeState = checkpoint.planModeState ? { ...checkpoint.planModeState } : undefined;
 		this.#vibeModeState = checkpoint.vibeModeState ? { ...checkpoint.vibeModeState } : undefined;
-		this.setGoalModeState(
+		this.#setGoalModeState(
 			checkpoint.goalModeState
 				? { ...checkpoint.goalModeState, goal: { ...checkpoint.goalModeState.goal } }
 				: undefined,
+			"restore",
+			checkpoint.pendingAdvisorTerminalMissionKey,
 		);
 		this.#inspectImageModeOverride = checkpoint.inspectImageModeOverride;
 		this.#goalTurnCounter = checkpoint.goalTurnCounter;
@@ -6491,14 +6738,14 @@ export class AgentSession {
 			});
 		}
 		if (this.#magicKeywordEnabled("orchestrate") && containsOrchestrate(text)) {
-			const activeToolNames = this.getActiveToolNames();
+			const enabledToolNames = this.getEnabledToolNames();
 			// The contract is entirely about `task` subagent dispatch; without the
 			// task tool the notice would demand an unavailable capability.
-			if (activeToolNames.includes("task")) {
+			if (enabledToolNames.includes("task")) {
 				keywordNotices.push({
 					role: "custom",
 					customType: "orchestrate-notice",
-					content: renderOrchestrateNotice({ tools: activeToolNames }),
+					content: renderOrchestrateNotice({ tools: enabledToolNames }),
 					display: false,
 					attribution: "user",
 					timestamp,
@@ -6506,8 +6753,8 @@ export class AgentSession {
 			}
 		}
 		if (this.#magicKeywordEnabled("workflow") && containsWorkflow(text)) {
-			const activeToolNames = this.getActiveToolNames();
-			if (activeToolNames.includes("task") && activeToolNames.includes("eval")) {
+			const enabledToolNames = this.getEnabledToolNames();
+			if (enabledToolNames.includes("task") && enabledToolNames.includes("eval")) {
 				keywordNotices.push({
 					role: "custom",
 					customType: "workflow-notice",
@@ -6565,6 +6812,7 @@ export class AgentSession {
 		if (abort) await abort;
 		const lifecycleGeneration = this.#lifecycleTransitionGeneration;
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
+		const typedText = text;
 		const queueDuringSemanticMaintenance =
 			this.#semanticDeliveryMaintenanceFenceActive &&
 			options?.streamingBehavior !== undefined &&
@@ -6572,6 +6820,25 @@ export class AgentSession {
 			!(expandPromptTemplates && text.startsWith("/"));
 		if (queueDuringSemanticMaintenance) this.#assertQueuedUserMessageCanStart(lifecycleGeneration);
 		else this.#assertPromptCanStart(lifecycleGeneration);
+		const promptAttribution = options?.attribution ?? (options?.synthetic ? "agent" : "user");
+		const retainPromptText = (promptText: string): void => {
+			this.#advisors.retainPrimaryInput([
+				options?.synthetic
+					? {
+							role: "developer",
+							content: [{ type: "text", text: promptText }],
+							attribution: promptAttribution,
+							timestamp: Date.now(),
+						}
+					: {
+							role: "user",
+							content: [{ type: "text", text: promptText }],
+							attribution: promptAttribution,
+							timestamp: Date.now(),
+						},
+			]);
+		};
+		retainPromptText(text);
 
 		// Handle extension commands first (execute immediately, even during streaming)
 		if (expandPromptTemplates && text.startsWith("/")) {
@@ -6598,6 +6865,7 @@ export class AgentSession {
 
 		// Expand file-based prompt templates if requested
 		const expandedText = expandPromptTemplates ? expandPromptTemplate(text, [...this.#promptTemplates]) : text;
+		retainPromptText(expandedText);
 
 		// Magic keywords ("ultrathink", "orchestrate"): append hidden system notices after the
 		// user's message that steer this turn. User-authored prompts only — synthetic /
@@ -6660,7 +6928,6 @@ export class AgentSession {
 			? await this.#buildImageDescriptionNotice(normalizedImages)
 			: undefined;
 
-		const promptAttribution = options?.attribution ?? (options?.synthetic ? "agent" : "user");
 		if (externalThinkingToolChoice) {
 			this.#toolChoiceQueue.pushOnce(externalThinkingToolChoice, {
 				label: "external-thinking",
@@ -6684,8 +6951,9 @@ export class AgentSession {
 			preludeMessages.push(eagerTaskPrelude);
 		}
 
+		let dispatched = false;
 		try {
-			await this.#promptWithMessage(message, expandedText, {
+			dispatched = await this.#promptWithMessage(message, expandedText, {
 				...options,
 				images: normalizedImages,
 				consumeExplicitPromptMessages: message.role === "user",
@@ -6700,6 +6968,13 @@ export class AgentSession {
 			// (e.g., compaction aborted, validation failed).
 			this.#toolChoiceQueue.removeByLabel("eager-todo");
 			this.#toolChoiceQueue.removeByLabel("external-thinking");
+		}
+		if (!dispatched && message.role === "user") {
+			// An abort (Esc) or preflight denial raced turn setup: the prompt never
+			// reached the agent or the session file. Hand it back to the host so the
+			// user can edit/resubmit instead of losing it (tree/branch can't offer
+			// a message that was never persisted).
+			this.#promptDropped?.({ text: typedText, images: options?.images });
 		}
 		return true;
 	}
@@ -6726,11 +7001,20 @@ export class AgentSession {
 		let keywordNotices: CustomMessage[] = [];
 		if (message.customType === SKILL_PROMPT_MESSAGE_TYPE && message.attribution === "user") {
 			const details = message.details;
+			let skillName: string | undefined;
 			let skillArgs = "";
-			if (details && typeof details === "object" && "args" in details && typeof details.args === "string") {
-				skillArgs = details.args;
+			if (details && typeof details === "object") {
+				if ("name" in details && typeof details.name === "string") skillName = details.name;
+				if ("args" in details && typeof details.args === "string") skillArgs = details.args;
 			}
 			keywordNotices = this.#createMagicKeywordNotices(skillArgs);
+			this.maybeStartTitleGeneration(
+				skillPromptTitleInput({
+					name: skillName,
+					args: skillArgs,
+					queueChipText: options?.queueChipText,
+				}),
+			);
 		}
 		const isGoalContinuation = message.customType === "goal-continuation";
 		if (isGoalContinuation && (options?.queueOnly || this.isStreaming)) {
@@ -6805,10 +7089,18 @@ export class AgentSession {
 			};
 		},
 	): Promise<boolean> {
+		// Returns false when the prompt was dropped before reaching the agent so
+		// prompt() can restore the exact typed text to the host.
 		const abort = this.#abortPromise;
 		if (abort) await abort;
 		this.onBeforePromptAcceptance?.();
 		this.#assertPromptCanStart(options?.lifecycleGeneration);
+		this.#advisors.retainPrimaryInput([
+			...(options?.prependMessages ?? []),
+			message,
+			...(options?.consumeExplicitPromptMessages ? this.#pendingExplicitPromptMessages : []),
+			...this.#pendingNextTurnMessages,
+		]);
 		const automaticTurn =
 			options?.automaticTurn ??
 			(message.role === "custom" && message.customType === "goal-continuation"
@@ -6932,6 +7224,7 @@ export class AgentSession {
 					useHashLines: resolveFileDisplayMode(this).hashLines,
 					snapshotStore: getFileSnapshotStore(this),
 				});
+				this.#advisors.retainPrimaryInput(fileMentionMessages);
 				for (const fileMentionMessage of fileMentionMessages) {
 					messages.push(await this.#normalizeAgentMessageImages(fileMentionMessage));
 				}
@@ -7043,14 +7336,14 @@ export class AgentSession {
 								: {}),
 						}
 					: undefined;
-			const nonMessageTokens = computeNonMessageTokens(this);
+			const nonMessageTokens = computeNonMessageTokens(this, this.agent.tokenizer);
 			const contextWindow = this.model?.contextWindow ?? 0;
 			const breakdown = this.getContextBreakdown({ contextWindow, pendingMessages: messages });
 			const promptTokens =
 				breakdown?.usedTokens ??
 				nonMessageTokens +
-					this.messages.reduce((sum, msg) => sum + estimateTokens(msg), 0) +
-					messages.reduce((sum, msg) => sum + estimateTokens(msg), 0);
+					this.agent.tokenizer.countMessages(this.messages) +
+					this.agent.tokenizer.countMessages(messages);
 			this.#stats.setPendingSnapshot({
 				promptTokens,
 				nonMessageTokens,
@@ -7202,6 +7495,8 @@ export class AgentSession {
 			cwd: this.sessionManager.getCwd(),
 			sessionManager: this.sessionManager,
 			modelRegistry: this.#modelRegistry,
+			isProjectTrusted: () => true,
+
 			model: this.model ?? undefined,
 			models: createExtensionModelQuery(this.#modelRegistry, this.settings, () => this.model ?? undefined),
 			isIdle: () => !this.isStreaming,
@@ -7400,6 +7695,9 @@ export class AgentSession {
 	): Promise<void> {
 		const acceptedLifecycleGeneration = lifecycleGeneration ?? this.#lifecycleTransitionGeneration;
 		this.#assertQueuedUserMessageCanStart(acceptedLifecycleGeneration);
+		this.#advisors.retainPrimaryInput([
+			{ role: "user", content: [{ type: "text", text }], attribution: "user", timestamp: Date.now() },
+		]);
 		const normalizedPrependMessages: CustomMessage[] = [];
 		for (const message of prependMessages) {
 			normalizedPrependMessages.push(
@@ -7808,6 +8106,7 @@ export class AgentSession {
 			const message = this.#withPendingSemanticDeliveryId(data.message, pendingId);
 			this.#pendingSemanticDeliveryIds.add(pendingId);
 			if (data.kind === "explicitPrompt") {
+				this.#advisors.retainPrimaryInput([message]);
 				this.#pendingExplicitPromptMessages.push(message);
 			} else if (data.kind === "followUp") {
 				this.agent.followUp(message);
@@ -7832,6 +8131,7 @@ export class AgentSession {
 	}
 
 	#queueExplicitPromptMessage(message: CustomMessage): void {
+		this.#advisors.retainPrimaryInput([message]);
 		if (
 			this.agent.attachInFlightQueuedMessageCompanions([message], restored =>
 				this.restoreExplicitPromptMessages(restored),
@@ -7850,6 +8150,7 @@ export class AgentSession {
 	}
 
 	#queueNextTurnMessage(message: CustomMessage): void {
+		this.#advisors.retainPrimaryInput([message]);
 		this.#pendingNextTurnMessages.push(message);
 	}
 
@@ -7897,6 +8198,7 @@ export class AgentSession {
 			attribution: message.attribution ?? "agent",
 			timestamp: Date.now(),
 		};
+		this.#advisors.retainPrimaryInput([appMessage]);
 		const normalizedAppMessage = await this.#normalizeAgentMessageImages(appMessage);
 		this.onBeforePromptAcceptance?.();
 		if (allowSemanticMaintenance) this.#assertQueuedUserMessageCanStart(lifecycleGeneration);
@@ -8017,6 +8319,7 @@ export class AgentSession {
 			attribution: normalizedPayload.attribution,
 			timestamp: Date.now(),
 		};
+		this.#advisors.retainPrimaryInput([appMessage]);
 		const normalizedAppMessage = await this.#normalizeAgentMessageImages(appMessage);
 		if (semanticMode) {
 			const acceptance = this.#beginSemanticDeliveryAcceptance();
@@ -8427,14 +8730,31 @@ export class AgentSession {
 			this.#extensionRunner?.getCommand(
 				extensionCommandSpace === -1 ? firstMessage.slice(1) : firstMessage.slice(1, extensionCommandSpace),
 			) !== undefined;
-		if (isLocalExtensionCommand || this.sessionName || $env.PI_NO_TITLE || isLowSignalTitleInput(firstMessage)) {
+		const sessionId = this.sessionManager.getSessionId();
+		if (
+			isLocalExtensionCommand ||
+			this.sessionName ||
+			this.#titleGenerationInFlightFor === sessionId ||
+			$env.PI_NO_TITLE ||
+			isLowSignalTitleInput(firstMessage)
+		) {
 			return;
 		}
-		onStart?.();
+		this.#titleGenerationInFlightFor = sessionId;
+		try {
+			(onStart ?? this.#titleGenerationStart)?.();
+		} catch (error) {
+			if (this.#titleGenerationInFlightFor === sessionId) {
+				this.#titleGenerationInFlightFor = undefined;
+			}
+			throw error;
+		}
 		this.generateTitle(firstMessage)
 			.then(async title => {
-				// Re-check after generation so concurrent attempts cannot replace
-				// the first title that completed.
+				// Re-check after generation so a later completion cannot replace
+				// the first title, and a request from a replaced session cannot
+				// name the current one.
+				if (this.sessionManager.getSessionId() !== sessionId) return;
 				if (title && !this.sessionName) {
 					await this.sessionManager.setSessionName(title, "auto");
 				}
@@ -8445,6 +8765,11 @@ export class AgentSession {
 					reason: "uncaught-auto-title-error",
 					error: err instanceof Error ? err.message : String(err),
 				});
+			})
+			.finally(() => {
+				if (this.#titleGenerationInFlightFor === sessionId) {
+					this.#titleGenerationInFlightFor = undefined;
+				}
 			});
 	}
 
@@ -8489,6 +8814,20 @@ export class AgentSession {
 	 *  against the destination project's override. */
 	setTitleSystemPrompt(prompt: string | undefined): void {
 		this.#titleSystemPrompt = prompt;
+	}
+
+	/** Install the interactive title-download UI hook. Used when `/skill:` starts
+	 *  titling from {@link promptCustomMessage} without the input-controller callback. */
+	setTitleGenerationStart(handler: (() => void) | undefined): void {
+		this.#titleGenerationStart = handler;
+	}
+
+	/** Install the host hook that receives a typed user prompt dropped before
+	 *  dispatch (an Esc abort or usage preflight denial raced turn setup). The
+	 *  prompt never reached the agent or the session file, so without this hook
+	 *  it would vanish; interactive mode restores it to the editor for editing. */
+	setPromptDropped(handler: ((prompt: DroppedPrompt) => void) | undefined): void {
+		this.#promptDropped = handler;
 	}
 
 	/**
@@ -9000,7 +9339,9 @@ export class AgentSession {
 	}
 
 	/**
-	 * Generate a handoff document with a oneshot LLM call, then start a new session with it.
+	 * Generate a handoff document with a oneshot LLM call and transactionally
+	 * move the retained context, queues, goal, companions, and artifacts into a
+	 * fresh child session.
 	 *
 	 * @param customInstructions Optional focus for the handoff document
 	 * @param options Handoff execution options
@@ -9011,7 +9352,8 @@ export class AgentSession {
 		options?: SessionHandoffOptions,
 		semanticDeliveryAcceptance?: Promise<void>,
 	): Promise<HandoffResult | undefined> {
-		return this.#handoff.handoff(customInstructions, options, semanticDeliveryAcceptance);
+		this.#maintenance.cancelSpeculation();
+		return this.#handoff.handoffToNewSession(customInstructions, options, semanticDeliveryAcceptance);
 	}
 
 	#isTerminalToolResult(event: { toolName: string; isError?: boolean; result?: { details?: unknown } }): boolean {
@@ -9126,7 +9468,7 @@ export class AgentSession {
 		if (activeMessages) {
 			activeMessages.splice(0, activeMessages.length, ...sessionContext.messages);
 		}
-		this.agent.replaceMessages(activeMessages ?? sessionContext.messages);
+		this.#replaceMessagesFromSessionContext(sessionContext, activeMessages ?? sessionContext.messages);
 		this.#advisors.resetSessionState({ preserveCost: true });
 		this.#todo.syncFromBranch();
 		this.#closeCodexProviderSessionsForHistoryRewrite();
@@ -9195,12 +9537,33 @@ export class AgentSession {
 		return false;
 	}
 
+	/**
+	 * Rebuild the model catalog after an `extendedContext` toggle and rebind the
+	 * active model when its effective context window changed. Same-model rebinds
+	 * skip provider-session resets (`modelsAreEqual` sees no change), so this
+	 * only refreshes metadata consumers (compaction thresholds, context display).
+	 */
+	async #reapplyExtendedContextPolicy(): Promise<void> {
+		try {
+			await this.#modelRegistry.reapplyModelPolicies();
+			const currentModel = this.model;
+			if (!currentModel || this.#isDisposed) return;
+			const updated = this.#modelRegistry.find(currentModel.provider, currentModel.id);
+			if (updated && updated.contextWindow !== currentModel.contextWindow) {
+				await this.#setModelWithProviderSessionReset(updated);
+			}
+		} catch (error) {
+			logger.warn("extended-context policy reapply failed", { error: String(error) });
+		}
+	}
+
 	async #setModelWithProviderSessionReset(
 		model: Model,
 		options: { closeProviderSessions?: boolean } = {},
 	): Promise<void> {
 		const currentModel = this.model;
 		const isChanging = !currentModel || !modelsAreEqual(currentModel, model);
+		const codeModeChanged = this.#tools.codeModeChangesBetween(currentModel, model);
 		if (currentModel) {
 			if (options.closeProviderSessions !== false) this.#closeProviderSessionsForModelSwitch(currentModel, model);
 			if (isChanging) {
@@ -9227,6 +9590,14 @@ export class AgentSession {
 
 		// Re-evaluate append-only context mode — provider or setting may have changed
 		this.#syncAppendOnlyContext(model);
+
+		if (codeModeChanged || this.#tools.codeModeDirectWireMetadataChanged()) {
+			try {
+				await this.#tools.reconcileCodeMode();
+			} catch (error) {
+				logger.warn("Code Mode reconcile after model change failed", { error: String(error) });
+			}
+		}
 
 		// inspect_image auto mode keys off model image capability. Reconcile
 		// centrally here so retry-fallback model changes (turn-recovery.ts),
@@ -9973,7 +10344,11 @@ export class AgentSession {
 			await this.#memory.resetContextForNewTranscript();
 
 			const sessionContext = this.buildDisplaySessionContext();
-			if (!skipConversationRestore) this.agent.replaceMessages(sessionContext.messages);
+			if (skipConversationRestore) {
+				this.#rehydrateGoalModeState(sessionContext.mode, sessionContext.modeData);
+			} else {
+				this.#replaceMessagesFromSessionContext(sessionContext);
+			}
 
 			await this.sessionManager.ensureOnDisk();
 			const commitOptions: SessionLifecycleCommitOptions = {
@@ -10100,7 +10475,8 @@ export class AgentSession {
 			this.#syncAgentSessionId(undefined, false, false);
 			this.#memory.rekeyForCurrentSessionId();
 			await this.#memory.resetContextForNewTranscript();
-			this.agent.replaceMessages(this.buildDisplaySessionContext().messages);
+			const sessionContext = this.buildDisplaySessionContext();
+			this.#replaceMessagesFromSessionContext(sessionContext);
 
 			await this.sessionManager.ensureOnDisk();
 			const commitOptions: SessionLifecycleCommitOptions = {
@@ -10444,7 +10820,7 @@ export class AgentSession {
 			// Update agent state — build display context to populate agent messages.
 			const stateContext = this.sessionManager.buildSessionContext();
 			const displayContext = deobfuscateSessionContext(stateContext, this.#obfuscator);
-			this.agent.replaceMessages(displayContext.messages);
+			this.#replaceMessagesFromSessionContext(displayContext);
 			this.#rehydrateCheckpointRewindState();
 			this.#todo.syncFromBranch();
 
@@ -11118,9 +11494,9 @@ export class AgentSession {
 	}
 	/**
 	 * Get text content of the most recent visible handoff message.
-	 * Fresh handoff sessions store the handoff context as a custom message, not
-	 * an assistant message, so callers that copy the "last" message can use this
-	 * as a fallback before the new session has an assistant response.
+	 * Sessions created by older versions injected the handoff document as a
+	 * custom message at the top of a fresh session; callers that copy the
+	 * "last" message use this as a fallback while no assistant response exists.
 	 */
 	getLastVisibleHandoffText(): string | undefined {
 		for (let i = this.messages.length - 1; i >= 0; i--) {
@@ -11209,6 +11585,19 @@ export class AgentSession {
 	}
 
 	/**
+	 * Reactivate an advisor that resolved to `no_model` at construction because a
+	 * discovery-backed provider had not populated the model registry yet. Awaits
+	 * the initial background refresh, then rebuilds the advisor and emits
+	 * `model_changed` so the status line reflects the now-active advisor. See #9010.
+	 */
+	async #retryInactiveAdvisorAfterModelDiscovery(): Promise<void> {
+		if (this.#isDisposed || !this.#advisors.hasInactiveNoModelAdvisor()) return;
+		await this.#modelRegistry.awaitBackgroundRefresh();
+		if (this.#isDisposed) return;
+		if (this.#advisors.retryAfterModelDiscovery()) this.#emit({ type: "model_changed" });
+	}
+
+	/**
 	 * Toggle the advisor setting and start/stop the runtime accordingly.
 	 *
 	 * @returns true when the advisor is actively running after the call.
@@ -11289,6 +11678,10 @@ export class AgentSession {
 	/** Return cumulative cost recorded for the current session's advisor activity. */
 	getAdvisorCost(): number {
 		return this.#advisors.getAdvisorCost();
+	}
+	/** Return whether any active or configured advisor is running on an OAuth/subscription model. */
+	isAdvisorUsingSubscription(): boolean {
+		return this.#advisors.isUsingSubscription();
 	}
 	/**
 	 * Return structured advisor stats for the status command and TUI panel.
