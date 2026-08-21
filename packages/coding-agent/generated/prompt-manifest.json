@@ -7801,7 +7801,7 @@
     },
     {
       "path": "packages/coding-agent/src/main.ts",
-      "sha256": "572818d4d5a92d208535ae279a8fd20960b84a816d06a984e72033af218d1c35"
+      "sha256": "507662dd48c36663a36df1ccd508150333b05ef3d1ae71cd40dc3c5dbe950686"
     },
     {
       "path": "packages/coding-agent/src/markit/converters/docx.ts",
@@ -10737,5 +10737,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "1d2ea1ab078c6cc23b9518df3f630c9847495e4ba7fc84f012fab46ca105ed0c"
+  "rootSha256": "bdf59f7d8d71d184c468dbc202df53bd5c9f745bb9d4550c2e573f493b449599"
 }
