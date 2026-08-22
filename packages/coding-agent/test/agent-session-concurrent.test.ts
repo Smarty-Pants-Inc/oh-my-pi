@@ -2206,32 +2206,57 @@ describe("AgentSession concurrent prompt guard", () => {
 			expect(resumed.getQueuedPrompts().map(prompt => prompt.text)).toEqual(["keep after failure"]);
 		});
 
-		it("suppresses post-abort queue drain when interrupt-side durable clearing fails", async () => {
-			const manager = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
-			const calls: Message[][] = [];
-			session = createPersistentSession(manager, calls);
-			session.agent.state.isStreaming = true;
-			await session.sendCustomMessage(
-				{
-					customType: "failed-interrupt-clear",
-					content: "keep queued for editing",
-					display: true,
-					attribution: "user",
-				},
-				{ deliveryMode: "steer" },
-			);
-			session.agent.state.isStreaming = false;
-			vi.spyOn(manager, "appendEntriesAtomically").mockRejectedValueOnce(new Error("interrupt cancellation failed"));
+		it.each([
+			["steering", "steer"],
+			["follow-up", "afterCurrent"],
+		] as const)(
+			"keeps an active %s dequeue from consuming the unchanged queue after an interrupt-side clear failure",
+			async (_queue, deliveryMode) => {
+				const manager = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+				const calls: Message[][] = [];
+				session = createPersistentSession(manager, calls);
+				session.agent.state.isStreaming = true;
+				await session.sendCustomMessage(
+					{
+						customType: "failed-interrupt-clear",
+						content: "keep queued for editing",
+						display: true,
+						attribution: "user",
+					},
+					{ deliveryMode },
+				);
+				session.agent.state.isStreaming = false;
+				const writeStarted = Promise.withResolvers<void>();
+				const releaseWrite = Promise.withResolvers<void>();
+				vi.spyOn(manager, "appendEntriesAtomically").mockImplementationOnce(async () => {
+					writeStarted.resolve();
+					await releaseWrite.promise;
+					throw new Error("interrupt cancellation failed");
+				});
 
-			await expect(session.clearQueueDurably({ forInterrupt: true })).rejects.toThrow(
-				"interrupt cancellation failed",
-			);
-			await session.abort({ reason: USER_INTERRUPT_LABEL, suppressQueuedMessageDrain: true });
-			await Bun.sleep(10);
+				const clearing = session.clearQueueDurably({ forInterrupt: true });
+				await writeStarted.promise;
+				const dequeueStarted = Promise.withResolvers<void>();
+				const removeDequeueHook = session.agent.addBeforeQueuedMessageDequeueHook(() => {
+					dequeueStarted.resolve();
+				});
+				const continuing = session.agent.continue().catch(() => undefined);
+				await dequeueStarted.promise;
+				releaseWrite.resolve();
 
-			expect(calls).toHaveLength(0);
-			expect(session.getQueuedPrompts().map(prompt => prompt.text)).toEqual(["keep queued for editing"]);
-		});
+				try {
+					await expect(clearing).rejects.toThrow("interrupt cancellation failed");
+					await session.abort({ reason: USER_INTERRUPT_LABEL });
+					await continuing;
+					await Bun.sleep(10);
+				} finally {
+					removeDequeueHook();
+				}
+
+				expect(calls).toHaveLength(0);
+				expect(session.getQueuedPrompts().map(prompt => prompt.text)).toEqual(["keep queued for editing"]);
+			},
+		);
 
 		it("recovers authoritative persistence before releasing a failed durable cancellation", async () => {
 			const storage = new ScriptedAtomicFailureStorage();

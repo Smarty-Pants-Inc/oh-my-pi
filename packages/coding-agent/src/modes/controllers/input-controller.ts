@@ -1445,7 +1445,7 @@ export class InputController {
 				`Failed to restore queued messages: ${error instanceof Error ? error.message : String(error)}`,
 			);
 			if (options?.abort) {
-				void this.ctx.session.abort({ reason: USER_INTERRUPT_LABEL, suppressQueuedMessageDrain: true });
+				void this.ctx.session.abort({ reason: USER_INTERRUPT_LABEL });
 			}
 			return 0;
 		}

@@ -465,8 +465,6 @@ type AgentSessionAbortOptions = {
 	preserveCompaction?: boolean;
 	preserveToolChoice?: boolean;
 	postPromptDrainTimeoutMs?: number;
-	/** Keep an unchanged queue from auto-resuming after an interrupt-side removal failure. */
-	suppressQueuedMessageDrain?: boolean;
 };
 
 type AbortIntent = {
@@ -8830,6 +8828,13 @@ export class AgentSession {
 				this.#reconcileQueuedMessageDrain();
 			}
 			return { steering, followUp };
+		} catch (error) {
+			if (options?.forInterrupt) {
+				if (this.agent.hasQueuedMessages()) this.#queuedMessageDrainBlocked = true;
+				// Abort before releasing the mutation claim so blocked dequeuers observe the signal first.
+				this.agent.abort(USER_INTERRUPT_LABEL);
+			}
+			throw error;
 		} finally {
 			releaseMutation?.();
 			releaseReservation();
@@ -9326,9 +9331,6 @@ export class AgentSession {
 	 * abort. Omit it for internal/lifecycle aborts.
 	 */
 	abort(options: AgentSessionAbortOptions = {}): Promise<void> {
-		if (options.suppressQueuedMessageDrain && this.agent.hasQueuedMessages()) {
-			this.#queuedMessageDrainBlocked = true;
-		}
 		if (this.#abortPromise) {
 			const intent = this.#abortIntent;
 			if (
