@@ -4374,7 +4374,7 @@
     },
     {
       "path": "docs/rpc.md",
-      "sha256": "a7cb009876e2195c0b2baca8c3c2a27bd0c5ce52d85710db4f657c67e414cc7b"
+      "sha256": "0fa364ba24b20db859e2a0cb187aa74edffc94a96f639ef1f8b71125fc905ea2"
     },
     {
       "path": "docs/rulebook-matching-pipeline.md",
@@ -8258,7 +8258,7 @@
     },
     {
       "path": "packages/coding-agent/src/modes/rpc/rpc-mode.ts",
-      "sha256": "6201d2576e036b4d64aa4a17eef0ec4b99ae588029681ac2579d2d50a954a7bd"
+      "sha256": "8344f1c910c32793de644f2518b80f7ed38e6c636d42871a4531314f4f74afd7"
     },
     {
       "path": "packages/coding-agent/src/modes/runtime-init.ts",
@@ -8462,7 +8462,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/agent-session.ts",
-      "sha256": "89024a06309710452938b70bde613c1d9e31582abf011a2b2292430ff626c55f"
+      "sha256": "ca657475bb7920454939f67b7da8008ac13bdc6661435660449f51ab93eec11d"
     },
     {
       "path": "packages/coding-agent/src/session/agent-storage.ts",
@@ -8562,7 +8562,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/irc-bridge.ts",
-      "sha256": "4c41c85544f208ec13bb14f3dbbade0354c2a5ae4436ca4c5adb15ebefdc1fc3"
+      "sha256": "e52f56fcc36dff75370f63205379381541b4dd1d9cba99c938ecb1be3be590b7"
     },
     {
       "path": "packages/coding-agent/src/session/launch-completion.ts",
@@ -10746,5 +10746,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "a63ee6deea892d054c51c8b93d4dc72c5be734f75bb79e2e13e9705e34308f09"
+  "rootSha256": "e978a467c5df44df0e3f165457b846ba464c08e0f52aab6f58a7802bcf379600"
 }
