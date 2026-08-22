@@ -6449,7 +6449,7 @@
     },
     {
       "path": "packages/coding-agent/src/collab/herdr-bridge-bootstrap.ts",
-      "sha256": "e2c5a6075b44cbbb3d95ab4ef06ec3ca7884f29a11198f479c32b59bebbfbfdf"
+      "sha256": "501b3818ffacbc0a303feb9ecc3274ae22d7eac89e72415394e256c1f32985cf"
     },
     {
       "path": "packages/coding-agent/src/collab/host.ts",
@@ -8449,7 +8449,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/agent-session.ts",
-      "sha256": "f1fe9e95eaa5f8a3064e242f7f334e769b1c44c5e4ad488ca857907460718411"
+      "sha256": "272c17f70ecfffad4e9b35e16fc0f01b82d3cc5571e2da22fac7ba1883ff9a8e"
     },
     {
       "path": "packages/coding-agent/src/session/agent-storage.ts",
@@ -8557,7 +8557,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/messages.ts",
-      "sha256": "623653150b77af6edcf083ef14f39b3dc22bf5700c6fcce53b031f3d4ced4789"
+      "sha256": "f66e33b5181f9d883168ce6376775f0aec07d93a35acddfa0115b1eb0baa79b9"
     },
     {
       "path": "packages/coding-agent/src/session/model-controls.ts",
@@ -8629,7 +8629,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/session-manager.ts",
-      "sha256": "5e04c771a92357abc16f4f893a1a502092304890571ad324c2f5743d28a116e0"
+      "sha256": "9dac6fde0bca13607947c209e6a5a54872d6e0f8ab3c3c71716c534b90a6f1c3"
     },
     {
       "path": "packages/coding-agent/src/session/session-memory.ts",
@@ -10733,5 +10733,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "026581090637ce39c0816c04522ba7b23c402563ca1408d63265e15e5c654b32"
+  "rootSha256": "46234d0021db2cf313715ea8749c10c524604d48f676b17fd2128e4c4eba4a50"
 }

@@ -54,14 +54,8 @@ export function captureHerdrBridgeBootstrap(
 			? { socketPath, paneId }
 			: undefined;
 	let currentHostBridge: HerdrHostBridgeCredentials | undefined;
-	if (hostToken !== undefined) {
-		if (hostToken.trim() && address?.trim() && paneId?.trim()) {
-			currentHostBridge = { address, token: hostToken, paneId };
-		} else if (!hostBridgeDiscovery) {
-			throw new Error(
-				"Incomplete Herdr OMP bridge environment: HERDR_OMP_BRIDGE, HERDR_OMP_BRIDGE_TOKEN, and HERDR_PANE_ID must all be non-empty",
-			);
-		}
+	if (hostToken?.trim() && address?.trim() && paneId?.trim()) {
+		currentHostBridge = { address, token: hostToken, paneId };
 	}
 	if (guestToken !== undefined && !guestToken.trim()) {
 		throw new Error("Incomplete Herdr OMP guest bridge environment: HERDR_OMP_GUEST_BRIDGE_TOKEN must be non-empty");

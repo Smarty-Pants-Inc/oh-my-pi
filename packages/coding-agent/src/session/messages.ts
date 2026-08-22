@@ -620,6 +620,22 @@ export function readPendingSemanticDeliveryId(details: unknown): string | undefi
  *  change — unrelated future payload fields are never silently dropped. */
 export const INTERNAL_DETAILS_FIELDS = ["__queueChipText", "__pendingSemanticDeliveryId"] as const;
 
+type InternalDetailsField = (typeof INTERNAL_DETAILS_FIELDS)[number];
+
+/** Clone extension details without changing arrays into objects, then add one transient runtime field. */
+export function withInternalDetailsField<T, K extends InternalDetailsField>(
+	details: T | undefined,
+	field: K,
+	value: string,
+): T & Record<K, string> {
+	const copy = Array.isArray(details)
+		? Object.assign([...details], details)
+		: details !== null && typeof details === "object"
+			? { ...(details as Record<string, unknown>) }
+			: {};
+	return Object.assign(copy, { [field]: value }) as T & Record<K, string>;
+}
+
 /** Return a `details` copy with every key in `INTERNAL_DETAILS_FIELDS`
  *  removed. Returns the input unchanged when there is nothing to strip
  *  (null/non-object, or no listed fields present) so callers don't pay a
@@ -635,9 +651,11 @@ export function stripInternalDetailsFields<T>(details: T | undefined): T | undef
 		}
 	}
 	if (!hit) return details;
-	const cleaned: Record<string, unknown> = { ...obj };
+	const cleaned: unknown[] | Record<string, unknown> = Array.isArray(details)
+		? Object.assign([...details], details)
+		: { ...obj };
 	for (const key of INTERNAL_DETAILS_FIELDS) {
-		delete cleaned[key];
+		Reflect.deleteProperty(cleaned, key);
 	}
 	return cleaned as T;
 }
