@@ -1980,11 +1980,12 @@ export async function runRootCommand(
 				)
 			: undefined;
 
-		const { session, setToolUIContext, modelFallbackMessage, lspServers, mcpManager } = await createSession({
-			...sessionOptions,
-			eventBus,
-			preloadedExtensions: extensionsResult,
-		});
+		const { session, setToolUIContext, modelFallbackMessage, lspServers, mcpManager, protectedRuntime } =
+			await createSession({
+				...sessionOptions,
+				eventBus,
+				preloadedExtensions: extensionsResult,
+			});
 		const interactiveCollabBridge: CollabBridgeBootstrap | undefined =
 			deps.collabBridge ??
 			(automaticHerdrHostBridge
@@ -2026,6 +2027,7 @@ export async function runRootCommand(
 				settings: settingsInstance,
 				enableLsp: sessionOptions.enableLsp ?? true,
 				eventBus,
+				protectedRuntime: protectedRuntime === true,
 			}),
 			Math.trunc(Number(settingsInstance.get("task.agentIdleTtlMs") ?? 420_000) || 0),
 		);

@@ -656,6 +656,8 @@ export interface CreateAgentSessionResult {
 	lspServers?: LspStartupServerInfo[];
 	/** Shared event bus for tool/extension communication */
 	eventBus: EventBus;
+	/** Whether this session is bound to an approved protected release. */
+	protectedRuntime?: boolean;
 }
 
 export type DialectFormat = "auto" | "native" | Dialect;
@@ -4267,6 +4269,7 @@ async function createAgentSessionScoped(
 			modelFallbackMessage,
 			lspServers,
 			eventBus,
+			protectedRuntime: releaseManifest !== undefined,
 		};
 	} catch (error) {
 		// Release the subscription if the throw happened after install but before the

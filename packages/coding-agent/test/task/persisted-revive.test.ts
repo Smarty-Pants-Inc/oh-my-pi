@@ -103,7 +103,7 @@ async function createPersistedSession(
 	return sessionFile;
 }
 
-function createFactory(cwd: string, eventBus?: EventBus) {
+function createFactory(cwd: string, eventBus?: EventBus, protectedRuntime = false) {
 	const parentSession = {
 		sessionManager: {
 			getCwd: () => cwd,
@@ -120,6 +120,7 @@ function createFactory(cwd: string, eventBus?: EventBus) {
 		settings: Settings.isolated(),
 		enableLsp: true,
 		eventBus,
+		protectedRuntime,
 	});
 }
 
@@ -130,6 +131,15 @@ afterEach(async () => {
 });
 
 describe("persisted subagent revival", () => {
+	it("keeps persisted prompts transcript-only in a protected runtime", async () => {
+		const cwd = makeTempDir("@pi-protected-revive-");
+		const sessionFile = await createPersistedSession(cwd);
+		const peek = vi.spyOn(SessionManager, "peekSessionInit");
+
+		expect(await createFactory(cwd, undefined, true)(createRef(sessionFile))).toBeUndefined();
+		expect(peek).not.toHaveBeenCalled();
+	});
+
 	it("initializes the extension runtime on cold revival so tool_call handlers are not fail-closed blocked", async () => {
 		const cwd = makeTempDir("@pi-revive-ext-init-");
 		const sessionFile = await createPersistedSession(cwd);

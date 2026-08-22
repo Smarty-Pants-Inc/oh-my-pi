@@ -80,13 +80,25 @@ describe("tracked context manifest", () => {
 		expect(packageJson.exports["./context/internal-session.js"]).toBeNull();
 	});
 
-	it("prefers a verified materialized package over an enclosing Git checkout", async () => {
+	it("accepts only the active immutable materialized Stack package", async () => {
 		const repositoryRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-materialized-extension-"));
-		const packageRoot = path.join(repositoryRoot, "home/.smarty-stack/versions/0.20.11");
-		const entryPath = path.join(packageRoot, "extensions/smarty-prompt-guard/src/index.ts");
+		const stackRoot = path.join(repositoryRoot, "home/.smarty-stack");
+		const packageRoot = path.join(stackRoot, "versions/0.20.11");
+		const currentRoot = path.join(stackRoot, "current");
+		const relativeEntry = "extensions/smarty-prompt-guard/src/index.ts";
+		const entryPath = path.join(packageRoot, relativeEntry);
+		const currentEntryPath = path.join(currentRoot, relativeEntry);
 		const repository = "Smarty-Pants-Inc/smarty-stack";
 		const commit = "a".repeat(40);
 		const tree = "b".repeat(40);
+		const chmodTree = async (directory: string, directoryMode: number, fileMode: number): Promise<void> => {
+			for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
+				const target = path.join(directory, entry.name);
+				if (entry.isDirectory()) await chmodTree(target, directoryMode, fileMode);
+				else if (entry.isFile()) await fs.chmod(target, fileMode);
+			}
+			await fs.chmod(directory, directoryMode);
+		};
 		try {
 			await fs.mkdir(path.dirname(entryPath), { recursive: true });
 			const provenance = {
@@ -108,7 +120,7 @@ describe("tracked context manifest", () => {
 					"extensions/smarty-prompt-guard/package.json",
 					'{"type":"module","omp":{"extensions":["./src/index.ts"]}}\n',
 				],
-				["extensions/smarty-prompt-guard/src/index.ts", "export default function promptGuard() {}\n"],
+				[relativeEntry, "export default function promptGuard() {}\n"],
 				[
 					"runtime-package.json",
 					'{"schema":"smarty.stack.runtime_projection.v1","files":["PROVENANCE.json","runtime-package.json"],"directories":["extensions/smarty-prompt-guard"]}\n',
@@ -142,14 +154,21 @@ describe("tracked context manifest", () => {
 				.map(([relative, digest]) => `${digest}  ${relative}`)
 				.join("\n");
 			await Bun.write(path.join(packageRoot, "SHA256SUMS.txt"), `${checksums}\n`);
+			await fs.symlink(path.join("versions", "0.20.11"), currentRoot);
 			const result = Bun.spawnSync(["git", "init", "-q"], { cwd: repositoryRoot, stdout: "pipe", stderr: "pipe" });
 			expect(result.exitCode).toBe(0);
 			const release = {
 				candidates: [{ repository, commit, tree }],
 			} as unknown as Parameters<typeof isApprovedCandidateSource>[1];
 
-			expect(await isApprovedCandidateSource(entryPath, release)).toBe(true);
+			expect(await isApprovedCandidateSource(currentEntryPath, release)).toBe(false);
+			await chmodTree(packageRoot, 0o555, 0o444);
+			expect(await isApprovedCandidateSource(entryPath, release)).toBe(false);
+			expect(await isApprovedCandidateSource(currentEntryPath, release)).toBe(true);
 		} finally {
+			try {
+				await chmodTree(packageRoot, 0o755, 0o644);
+			} catch {}
 			await fs.rm(repositoryRoot, { recursive: true, force: true });
 		}
 	});

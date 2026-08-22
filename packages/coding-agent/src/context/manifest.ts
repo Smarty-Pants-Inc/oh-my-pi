@@ -803,7 +803,16 @@ async function materializedPackageRoot(resolvedSource: string): Promise<string |
 	}
 }
 
-async function materializedPackageFiles(directory: string, prefix = ""): Promise<string[] | undefined> {
+async function materializedPackageFiles(directory: string, owner: number, prefix = ""): Promise<string[] | undefined> {
+	const directoryStats = await fs.lstat(directory);
+	if (
+		!directoryStats.isDirectory() ||
+		directoryStats.isSymbolicLink() ||
+		directoryStats.uid !== owner ||
+		(directoryStats.mode & 0o222) !== 0
+	) {
+		return undefined;
+	}
 	const files: string[] = [];
 	const entries = await fs.readdir(directory, { withFileTypes: true });
 	entries.sort((left, right) => compareUnicodeCodePoints(left.name, right.name));
@@ -811,9 +820,9 @@ async function materializedPackageFiles(directory: string, prefix = ""): Promise
 		const absolute = path.join(directory, entry.name);
 		const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
 		const stats = await fs.lstat(absolute);
-		if (stats.isSymbolicLink()) return undefined;
+		if (stats.isSymbolicLink() || stats.uid !== owner || (stats.mode & 0o222) !== 0) return undefined;
 		if (stats.isDirectory()) {
-			const nested = await materializedPackageFiles(absolute, relative);
+			const nested = await materializedPackageFiles(absolute, owner, relative);
 			if (!nested) return undefined;
 			files.push(...nested);
 		} else if (stats.isFile()) {
@@ -826,6 +835,7 @@ async function materializedPackageFiles(directory: string, prefix = ""): Promise
 }
 
 async function isApprovedMaterializedCandidateSource(
+	absoluteSource: string,
 	resolvedSource: string,
 	release: ContextReleaseManifest,
 ): Promise<boolean> {
@@ -878,6 +888,30 @@ async function isApprovedMaterializedCandidateSource(
 		return false;
 	}
 	const candidate = release.candidates.find(item => item.repository === provenance.repository);
+	const owner = process.getuid?.();
+	if (owner === undefined) return false;
+	const versions = path.dirname(root);
+	const stackRoot = path.dirname(versions);
+	if (path.basename(versions) !== "versions" || path.basename(root) !== manifest.version) return false;
+	let current = path.dirname(absoluteSource);
+	while (path.basename(current) !== "current" || path.basename(path.dirname(current)) !== ".smarty-stack") {
+		const parent = path.dirname(current);
+		if (parent === current) return false;
+		current = parent;
+	}
+	const currentStats = await fs.lstat(current);
+	if (
+		!currentStats.isSymbolicLink() ||
+		currentStats.uid !== owner ||
+		(await fs.realpath(path.dirname(current))) !== stackRoot ||
+		(await fs.realpath(current)) !== root
+	) {
+		return false;
+	}
+	const currentRelative = path.relative(current, absoluteSource);
+	if (!currentRelative || currentRelative.startsWith(`..${path.sep}`) || path.isAbsolute(currentRelative))
+		return false;
+	if (path.resolve(root, currentRelative) !== resolvedSource) return false;
 	if (!candidate || candidate.commit !== provenance.commit || candidate.tree !== provenance.tree) return false;
 
 	const expectedChecksums = new Map<string, string>();
@@ -931,7 +965,7 @@ async function isApprovedMaterializedCandidateSource(
 	) {
 		return false;
 	}
-	const actualFiles = await materializedPackageFiles(root);
+	const actualFiles = await materializedPackageFiles(root, owner);
 	const expectedFiles = [...expectedChecksums.keys(), "SHA256SUMS.txt"].sort(compareUnicodeCodePoints);
 	if (
 		!actualFiles ||
@@ -948,8 +982,9 @@ async function isApprovedMaterializedCandidateSource(
 /** Bind an external runtime source to an unchanged, clean package in one approved candidate. */
 export async function isApprovedCandidateSource(filePath: string, release: ContextReleaseManifest): Promise<boolean> {
 	try {
-		const resolved = await fs.realpath(path.resolve(filePath));
-		if (await isApprovedMaterializedCandidateSource(resolved, release)) return true;
+		const absolute = path.resolve(filePath);
+		const resolved = await fs.realpath(absolute);
+		if (await isApprovedMaterializedCandidateSource(absolute, resolved, release)) return true;
 		const repositoryRoot = await repo.root(path.dirname(resolved));
 		if (!repositoryRoot) return false;
 		const relative = path.relative(repositoryRoot, resolved).replaceAll(path.sep, "/");
