@@ -25,7 +25,11 @@ import { GoalRuntime } from "@oh-my-pi/pi-coding-agent/goals/runtime";
 import { initializeExtensions } from "@oh-my-pi/pi-coding-agent/modes/runtime-init";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import { convertToLlm, USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
+import {
+	convertToLlm,
+	readPendingSemanticDeliveryId,
+	USER_INTERRUPT_LABEL,
+} from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
@@ -1139,6 +1143,22 @@ describe("AgentSession concurrent prompt guard", () => {
 			});
 		}
 
+		function holdFirstEnsureOnDisk(manager: SessionManager): { entered: Promise<void>; release: () => void } {
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const ensureOnDisk = manager.ensureOnDisk.bind(manager);
+			let held = true;
+			vi.spyOn(manager, "ensureOnDisk").mockImplementation(async () => {
+				if (held) {
+					held = false;
+					entered.resolve();
+					await release.promise;
+				}
+				await ensureOnDisk();
+			});
+			return { entered: entered.promise, release: () => release.resolve() };
+		}
+
 		it("returns started_turn only after the scoped peer input is durably journaled", async () => {
 			const sessionDir = path.join(tempDir, "sessions");
 			const manager = SessionManager.create(tempDir, sessionDir);
@@ -1190,6 +1210,92 @@ describe("AgentSession concurrent prompt guard", () => {
 
 			providerStream?.push({ type: "done", reason: "stop", message: createAssistantMessage("Done") });
 			await session.waitForIdle();
+		});
+
+		it.each([
+			["interrupt", { status: "downgraded", delivery: "plain_append", reason: "unscoped_automatic_turn" }],
+			["steer", { status: "accepted", delivery: "plain_append" }],
+		] as const)(
+			"routes busy %s delivery through the idle path when persistence observes the state change",
+			async (mode, expected) => {
+				const sessionDir = path.join(tempDir, "sessions");
+				const manager = SessionManager.create(tempDir, sessionDir);
+				session = createPersistentSession(manager);
+				session.agent.state.isStreaming = true;
+				const gate = holdFirstEnsureOnDisk(manager);
+
+				const sending = session.sendCustomMessage(
+					{
+						customType: `busy-idle-${mode}`,
+						content: `${mode} became idle`,
+						display: false,
+						attribution: "agent",
+					},
+					{ deliveryMode: mode },
+				);
+				await gate.entered;
+				session.agent.state.isStreaming = false;
+				gate.release();
+
+				await expect(sending).resolves.toEqual(expected);
+				expect(session.agent.peekSteeringQueue()).toHaveLength(0);
+				expect(session.agent.peekFollowUpQueue()).toHaveLength(0);
+				expect(session.agent.state.messages.at(-1)).toMatchObject({ customType: `busy-idle-${mode}` });
+				const branch = manager.getBranch();
+				const pending = branch.find(entry => entry.type === "custom" && entry.customType === pendingType);
+				if (!pending) throw new Error("Expected a durable pending semantic delivery");
+				expect(branch).toContainEqual(
+					expect.objectContaining({ type: "custom_message", customType: `busy-idle-${mode}` }),
+				);
+				expect(branch).toContainEqual(
+					expect.objectContaining({
+						type: "custom",
+						customType: settledType,
+						data: { pendingId: pending.id, outcome: "delivered" },
+					}),
+				);
+			},
+		);
+
+		it("starts a scoped auto turn when a busy receiver becomes idle during pending persistence", async () => {
+			const sessionDir = path.join(tempDir, "sessions");
+			const manager = SessionManager.create(tempDir, sessionDir);
+			const calls: Message[][] = [];
+			session = createPersistentSession(manager, calls);
+			session.agent.state.isStreaming = true;
+			const gate = holdFirstEnsureOnDisk(manager);
+			let committed = false;
+
+			const sending = session.sendCustomMessage(
+				{ customType: "busy-idle-auto", content: "start after persistence", display: true, attribution: "agent" },
+				{
+					deliveryMode: "auto",
+					automaticTurnSource: "peer_message_wake",
+					onStartedTurnAccepted: () => {
+						committed = true;
+					},
+				},
+			);
+			await gate.entered;
+			session.agent.state.isStreaming = false;
+			gate.release();
+
+			await expect(sending).resolves.toEqual({ status: "accepted", delivery: "started_turn" });
+			await session.waitForIdle();
+			expect(committed).toBe(true);
+			expect(session.agent.peekSteeringQueue()).toHaveLength(0);
+			expect(session.agent.peekFollowUpQueue()).toHaveLength(0);
+			expect(JSON.stringify(calls[0])).toContain("start after persistence");
+			const branch = manager.getBranch();
+			const pending = branch.find(entry => entry.type === "custom" && entry.customType === pendingType);
+			if (!pending) throw new Error("Expected a durable pending semantic delivery");
+			expect(branch).toContainEqual(
+				expect.objectContaining({
+					type: "custom",
+					customType: settledType,
+					data: { pendingId: pending.id, outcome: "delivered" },
+				}),
+			);
 		});
 
 		async function acceptBeforeCrash(
@@ -1306,6 +1412,34 @@ describe("AgentSession concurrent prompt guard", () => {
 			await continuing;
 			expect(calls).toHaveLength(1);
 			expect(JSON.stringify(calls[0])).toContain("wait for commit");
+		});
+
+		it("preserves array-valued details through queued semantic recovery", async () => {
+			const details = [{ messageId: "one" }, { messageId: "two" }];
+			const sessionDir = path.join(tempDir, "sessions");
+			const manager = SessionManager.create(tempDir, sessionDir);
+			session = createPersistentSession(manager);
+			session.agent.state.isStreaming = true;
+			await session.sendCustomMessage(
+				{ customType: "array-details", content: "preserve metadata", display: true, details, attribution: "agent" },
+				{ deliveryMode: "steer" },
+			);
+
+			const queued = session.agent.peekSteeringQueue()[0];
+			if (queued?.role !== "custom") throw new Error("Expected a queued custom message");
+			expect(Array.isArray(queued.details)).toBe(true);
+			expect([...(queued.details as typeof details)]).toEqual(details);
+			expect(readPendingSemanticDeliveryId(queued.details)).toBeString();
+			const sessionFile = manager.getSessionFile();
+			if (!sessionFile) throw new Error("Expected a persisted semantic delivery");
+
+			session = undefined as unknown as AgentSession;
+			const resumed = await reopen(sessionFile, sessionDir);
+			const recovered = resumed.agent.peekSteeringQueue()[0];
+			if (recovered?.role !== "custom") throw new Error("Expected a recovered custom message");
+			expect(Array.isArray(recovered.details)).toBe(true);
+			expect([...(recovered.details as typeof details)]).toEqual(details);
+			expect(readPendingSemanticDeliveryId(recovered.details)).toBeString();
 		});
 
 		it("keeps idle explicitPrompt recovery out of automatic turns until the next deliberate prompt", async () => {
