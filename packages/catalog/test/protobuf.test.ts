@@ -1,0 +1,143 @@
+import { expect, it } from "bun:test";
+import {
+	decodeJsonValue,
+	encodeJsonValue,
+	type JsonValue,
+	type MessageCodec,
+	type ProtoMessage,
+	pb,
+} from "../src/discovery/protobuf";
+
+interface Envelope extends ProtoMessage {
+	enabled?: boolean;
+	choice: { case: undefined; value?: undefined } | { case: "text"; value: string };
+}
+
+const EnvelopeSchema = pb<Envelope>("test.Envelope", [
+	{ no: 1, name: "enabled", kind: "bool", optional: true },
+	{
+		kind: "oneof",
+		name: "choice",
+		variants: [{ no: 2, name: "text", kind: "string" }],
+	},
+]);
+
+interface Counter extends ProtoMessage {
+	value: number;
+}
+
+const CounterSchema = pb<Counter>("test.Counter", [{ no: 1, name: "value", kind: "int32" }]);
+
+interface Node extends ProtoMessage {
+	label: string;
+	child?: Node;
+}
+
+const NodeSchema: MessageCodec<Node> = pb<Node>("test.Node", [
+	{ no: 1, name: "label", kind: "string" },
+	{ no: 2, name: "child", kind: "message", T: () => NodeSchema },
+]);
+
+enum TestStatus {
+	UNSPECIFIED = 0,
+	READY = 1,
+}
+
+const TestStatusJson = {
+	TEST_STATUS_UNSPECIFIED: 0,
+	TEST_STATUS_READY: 1,
+	TEST_STATUS_READY_ALIAS: 1,
+} as const;
+
+interface EnumEnvelope extends ProtoMessage {
+	status: TestStatus;
+	statuses: TestStatus[];
+	statusesByName: Record<string, TestStatus>;
+	choice: { case: undefined; value?: undefined } | { case: "statusChoice"; value: TestStatus };
+}
+
+const EnumEnvelopeSchema = pb<EnumEnvelope>("test.EnumEnvelope", [
+	{ no: 1, name: "status", kind: "enum", E: () => TestStatusJson },
+	{ no: 2, name: "statuses", kind: "enum", E: () => TestStatusJson, repeat: true },
+	{ no: 3, name: "statusesByName", kind: "map", K: "string", V: "enum", E: () => TestStatusJson },
+	{
+		kind: "oneof",
+		name: "choice",
+		variants: [{ no: 4, name: "statusChoice", kind: "enum", E: () => TestStatusJson }],
+	},
+]);
+
+it("preserves selected oneofs and explicit optional defaults", () => {
+	const decoded = EnvelopeSchema.decode(
+		EnvelopeSchema.encode({ enabled: false, choice: { case: "text", value: "hello" } }),
+	);
+
+	expect(decoded).toMatchObject({ enabled: false, choice: { case: "text", value: "hello" } });
+	expect(EnvelopeSchema.toJson(decoded)).toEqual({ enabled: false, text: "hello" });
+});
+
+it("decodes protobuf JSON into typed oneofs and nested messages", () => {
+	const envelope = EnvelopeSchema.fromJson({ enabled: false, text: "hello" });
+	const node = NodeSchema.fromJson({ label: "root", child: { label: "leaf" } });
+
+	expect(envelope).toMatchObject({ enabled: false, choice: { case: "text", value: "hello" } });
+	expect(node.child?.label).toBe("leaf");
+});
+
+it("uses canonical protobuf JSON names for known enums and numbers for unknown values", () => {
+	const known = EnumEnvelopeSchema.create({
+		status: TestStatus.READY,
+		statuses: [TestStatus.READY],
+		statusesByName: { primary: TestStatus.READY },
+		choice: { case: "statusChoice", value: TestStatus.READY },
+	});
+	expect(EnumEnvelopeSchema.toJson(known)).toEqual({
+		status: "TEST_STATUS_READY",
+		statuses: ["TEST_STATUS_READY"],
+		statusesByName: { primary: "TEST_STATUS_READY" },
+		statusChoice: "TEST_STATUS_READY",
+	});
+
+	const parsed = EnumEnvelopeSchema.fromJson({
+		status: "TEST_STATUS_READY_ALIAS",
+		statuses: ["TEST_STATUS_READY", 1],
+		statusesByName: { primary: "TEST_STATUS_READY_ALIAS" },
+		statusChoice: "TEST_STATUS_READY",
+	});
+	expect(parsed).toMatchObject({
+		status: TestStatus.READY,
+		statuses: [TestStatus.READY, TestStatus.READY],
+		statusesByName: { primary: TestStatus.READY },
+		choice: { case: "statusChoice", value: TestStatus.READY },
+	});
+	expect(EnumEnvelopeSchema.toJson(parsed)).toMatchObject({ status: "TEST_STATUS_READY" });
+
+	const unknown = EnumEnvelopeSchema.fromJson({ status: 9 });
+	expect(Number(unknown.status)).toBe(9);
+	expect(EnumEnvelopeSchema.toJson(unknown)).toMatchObject({ status: 9 });
+	expect(Number(EnumEnvelopeSchema.decode(EnumEnvelopeSchema.encode(unknown)).status)).toBe(9);
+	expect(() => EnumEnvelopeSchema.fromJson({ status: "READY" })).toThrow("Unknown protobuf enum value READY");
+	expect(() => EnumEnvelopeSchema.fromJson({ status: "TEST_STATUS_MISSING" })).toThrow(
+		"Unknown protobuf enum value TEST_STATUS_MISSING",
+	);
+});
+
+it("retains unknown wire fields while re-encoding a message", () => {
+	const input = new Uint8Array([0x08, 0x2a, 0x10, 0x07]);
+
+	expect(CounterSchema.encode(CounterSchema.decode(input))).toEqual(input);
+});
+
+it("round-trips JSON values with empty struct keys", () => {
+	const value: JsonValue = { "": ["kept", { nested: true }], count: 1 };
+
+	expect(decodeJsonValue(encodeJsonValue(value))).toEqual(value);
+});
+
+it("resolves recursive static message descriptors on demand", () => {
+	const decoded = NodeSchema.decode(
+		NodeSchema.encode({ label: "root", child: { label: "child", child: { label: "leaf" } } }),
+	);
+
+	expect(decoded.child?.child?.label).toBe("leaf");
+});

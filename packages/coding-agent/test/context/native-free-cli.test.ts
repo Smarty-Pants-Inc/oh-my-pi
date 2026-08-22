@@ -65,7 +65,9 @@ async function writePolicyState(repositoryRoot: string, manifestModule: string):
 		});
 		process.stdout.write(JSON.stringify(release));
 	`;
-	const child = Bun.spawnSync(["/usr/bin/env", Bun.which("bun") ?? process.execPath, "-e", script], {
+	const scriptPath = path.join(home, "build-context-release-manifest.ts");
+	await Bun.write(scriptPath, script);
+	const child = Bun.spawnSync(["/usr/bin/env", Bun.which("bun") ?? process.execPath, scriptPath], {
 		cwd: repositoryRoot,
 		env: {
 			...Bun.env,

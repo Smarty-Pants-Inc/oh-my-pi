@@ -270,6 +270,8 @@ const RPC_BACKGROUND_DEFAULTED_SETTING_PATHS: SettingPath[] = [
 	"async.maxJobs",
 	"bash.autoBackground.enabled",
 	"bash.autoBackground.thresholdMs",
+	"eval.autoBackground.enabled",
+	"eval.autoBackground.thresholdMs",
 ];
 
 // Protocol-mode hosts opt into a small set of paths whose host-default we
@@ -456,7 +458,12 @@ export async function submitInteractiveInput(
 	}
 }
 
-type AcpSessionFactory = (cwd: string) => Promise<AgentSession>;
+interface AcpSessionHandle {
+	session: AgentSession;
+	setToolUIContext: (uiContext: ExtensionUIContext, hasUI: boolean) => void;
+}
+
+type AcpSessionFactory = (cwd: string, options?: { interactivePrompts?: boolean }) => Promise<AcpSessionHandle>;
 
 export interface AcpSessionFactoryOptions {
 	baseOptions: CreateAgentSessionOptions;
@@ -500,7 +507,7 @@ async function loadTrustedSessionExtensions(
  * tool registry and shadow the client-supplied servers (issue #1234).
  */
 export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSessionFactory {
-	return async cwd => {
+	return async (cwd, factoryOptions) => {
 		const nextSettings = await args.settings.cloneForCwd(cwd);
 		const nextSessionManager = SessionManager.create(cwd, args.sessionDir);
 		const agentId = `acp:${nextSessionManager.getSessionId()}`;
@@ -521,7 +528,7 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 				`Trusted extension failed to load: ${trustedExtensions.errors.map(item => item.error).join("; ")}`,
 			);
 		}
-		const { session: nextSession } = await args.createSession({
+		const { session: nextSession, setToolUIContext } = await args.createSession({
 			...args.baseOptions,
 			cwd,
 			sessionManager: nextSessionManager,
@@ -529,8 +536,9 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 			authStorage: args.authStorage,
 			modelRegistry: args.modelRegistry,
 			agentId,
-			// Preserve reserve-policy confirmation until ACP capabilities are known
-			// without enabling AskTool or other UI-only session behavior.
+			// ACP defers the `ask` capability and reserve-policy confirmation until
+			// client capabilities are known, without enabling other UI-only behavior.
+			interactivePrompts: factoryOptions?.interactivePrompts,
 			deferUsageReserveConfirmation: true,
 			enableMCP: false,
 			titleSystemPrompt,
@@ -561,7 +569,7 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 				throw error;
 			}
 		}
-		return nextSession;
+		return { session: nextSession, setToolUIContext };
 	};
 }
 
@@ -1527,7 +1535,6 @@ export async function runRootCommand(
 		process.stderr.write(`${chalk.red(`Error: ${message}`)}\n`);
 		process.exit(1);
 	}
-	const modelRegistry = logger.time("modelRegistry:init", () => new ModelRegistry(authStorage));
 
 	const settingsInstance =
 		deps.settings ?? (await logger.time("settings:init", Settings.init, { cwd, configFiles: parsedArgs.config }));
@@ -1545,6 +1552,13 @@ export async function runRootCommand(
 	} else if (parsedArgs.mode === "acp") {
 		applyAcpDefaultSettingOverrides(settingsInstance);
 	}
+
+	// The registry composes policy-dependent metadata synchronously, including
+	// extended-context window caps, so it must receive the finalized settings.
+	const modelRegistry = logger.time(
+		"modelRegistry:init",
+		() => new ModelRegistry(authStorage, undefined, { settings: settingsInstance }),
+	);
 	if (parsedArgs.noPty || parsedArgs.mode === "rpc-ui") {
 		Bun.env.PI_NO_PTY = "1";
 	}

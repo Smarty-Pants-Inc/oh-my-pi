@@ -319,7 +319,8 @@ describe("createTools", () => {
 			settings: createSettingsWithOverrides({
 				"goal.enabled": true,
 			}),
-			getGoalModeState: () => ({ ...createActiveGoalState(), enabled: false, mode: "exiting", reason: "completed" }),
+			getGoalModeState: () => undefined,
+			isGoalModeExiting: () => true,
 			getGoalRuntime: () => ({}) as never,
 		});
 		const tools = await createTools(session, ["read"]);

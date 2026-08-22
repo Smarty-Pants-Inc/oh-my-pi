@@ -6,7 +6,13 @@ import {
 	renderGoalPrompt,
 	renderTrustedObjective,
 } from "@oh-my-pi/pi-coding-agent/goals/runtime";
-import type { Goal, GoalModeState, GoalRuntimeEvent, GoalTokenUsage } from "@oh-my-pi/pi-coding-agent/goals/state";
+import {
+	type Goal,
+	type GoalModeState,
+	type GoalRuntimeEvent,
+	type GoalTokenUsage,
+	parseGoalModeState,
+} from "@oh-my-pi/pi-coding-agent/goals/state";
 import { escapeXmlText } from "@oh-my-pi/pi-utils";
 
 function createUsage(overrides: Partial<GoalTokenUsage> = {}): GoalTokenUsage {
@@ -250,7 +256,7 @@ describe("goal runtime", () => {
 		expect(harness.hiddenMessages).toHaveLength(2);
 	});
 
-	it("preserves owner caps across a runtime restart and resumes after cap removal", async () => {
+	it("restores a budget-limited goal disabled without charging restart idle time, then lets the owner resume", async () => {
 		const first = createHarness({
 			state: {
 				enabled: true,
@@ -262,16 +268,28 @@ describe("goal runtime", () => {
 		await first.runtime.onBudgetMutated(5);
 		const persisted = first.persists.at(-1)?.state;
 		if (!persisted) throw new Error("expected owner cap to persist");
+		const restored = parseGoalModeState("goal", { goal: persisted.goal });
+		if (!restored) throw new Error("expected budget-limited goal to restore");
 
-		const restarted = createHarness({ state: persisted });
+		const restarted = createHarness({ state: restored });
 		await restarted.runtime.onThreadResumed();
-		expect(restarted.getState()?.goal.tokenBudget).toBe(5);
-		expect(restarted.getState()?.goal.status).toBe("budget_limited");
+		restarted.advance(10_000);
+		await restarted.runtime.flushUsage("suppressed");
 
+		expect(restarted.getState()).toMatchObject({
+			enabled: false,
+			goal: { tokenBudget: 5, status: "budget_limited", timeUsedSeconds: 0 },
+		});
+
+		const resumed = await restarted.runtime.resumeGoal();
+		expect(resumed).toMatchObject({ enabled: true, goal: { status: "active", timeUsedSeconds: 0 } });
 		await restarted.runtime.onBudgetMutated(undefined);
-		expect(restarted.getState()?.goal.tokenBudget).toBeUndefined();
-		expect(restarted.getState()?.goal.status).toBe("active");
-		expect(restarted.getState()?.enabled).toBe(true);
+		restarted.advance(1_000);
+		await restarted.runtime.flushUsage("suppressed");
+		expect(restarted.getState()).toMatchObject({
+			enabled: true,
+			goal: { status: "active", timeUsedSeconds: 1 },
+		});
 	});
 
 	it("keeps an active goal active when an interruption aborts only the current task", async () => {
@@ -383,6 +401,34 @@ Do not start new substantive work. Preserve useful state, report verified progre
 		expect(rendered).not.toContain("unbounded");
 	});
 
+	it("keeps the current goal objective and status visible to advisors without volatile accounting", () => {
+		expect(createHarness().runtime.buildAdvisorMissionPrompt()).toBeUndefined();
+
+		for (const status of [
+			"active",
+			"paused",
+			"blocked",
+			"budget_limited",
+			"usage_limited",
+			"complete",
+			"dropped",
+			"superseded",
+		] as const) {
+			const harness = createHarness({
+				state: {
+					enabled: status === "active",
+					mode: status === "complete" ? "exiting" : "active",
+					goal: createGoal({ status, tokenBudget: 100, tokensUsed: 75 }),
+				},
+			});
+			const rendered = harness.runtime.buildAdvisorMissionPrompt();
+			expect(rendered).toContain(`status="${status}"`);
+			expect(rendered).toContain("Ship &lt;fast&gt; &amp; safely");
+			expect(rendered).not.toContain("Budget:");
+			expect(rendered).not.toContain("75");
+		}
+	});
+
 	it("builds active and continuation context only for an active goal", () => {
 		const active = createHarness({ state: { enabled: true, mode: "active", goal: createGoal() } });
 		expect(active.runtime.buildActivePrompt()).toContain("Active goal:");
@@ -435,7 +481,7 @@ Do not start new substantive work. Preserve useful state, report verified progre
 		expect(harness.hiddenMessages[0]?.customType).toBe("goal-budget-limit");
 	});
 
-	it("completeGoalFromTool clears enabled and flips status to complete with mode exiting (fix #1)", async () => {
+	it("persists terminal completion history while retaining only an internal exiting sentinel", async () => {
 		const harness = createHarness({
 			state: {
 				enabled: true,
@@ -447,14 +493,23 @@ Do not start new substantive work. Preserve useful state, report verified progre
 		const completed = await harness.runtime.completeGoalFromTool();
 
 		expect(completed.status).toBe("complete");
-		const state = harness.getState();
-		expect(state?.enabled).toBe(false);
-		expect(state?.mode).toBe("exiting");
-		expect(state?.reason).toBe("completed");
-		expect(state?.goal.status).toBe("complete");
+		expect(harness.getState()).toMatchObject({
+			enabled: false,
+			mode: "exiting",
+			reason: "completed",
+			goal: { status: "complete" },
+		});
+		expect(harness.persists.at(-1)).toMatchObject({
+			mode: "goal",
+			state: { enabled: false, mode: "exiting", reason: "completed", goal: { status: "complete" } },
+		});
+		const lastEvent = harness.events.at(-1);
+		if (lastEvent?.type !== "goal_updated") throw new Error("expected goal_updated event after completeGoalFromTool");
+		expect(lastEvent.goal?.status).toBe("complete");
+		expect(lastEvent.state).toBeUndefined();
 	});
 
-	it("dropGoal persists the dropped final state instead of clearing its record", async () => {
+	it("persists a dropped terminal record without keeping it current", async () => {
 		const harness = createHarness({
 			state: {
 				enabled: true,
@@ -467,7 +522,7 @@ Do not start new substantive work. Preserve useful state, report verified progre
 
 		expect(dropped?.status).toBe("dropped");
 		expect(dropped?.id).toBe("g-99");
-		expect(harness.getState()).toMatchObject({ enabled: false, goal: { id: "g-99", status: "dropped" } });
+		expect(harness.getState()).toBeUndefined();
 		expect(harness.persists.at(-1)).toMatchObject({
 			mode: "goal",
 			state: { enabled: false, goal: { id: "g-99", status: "dropped" } },
@@ -477,7 +532,7 @@ Do not start new substantive work. Preserve useful state, report verified progre
 			throw new Error("expected goal_updated event after dropGoal");
 		}
 		expect(lastEvent.goal?.status).toBe("dropped");
-		expect(lastEvent.state?.enabled).toBe(false);
+		expect(lastEvent.state).toBeUndefined();
 	});
 
 	it("rejects op=create on the runtime when a non-dropped goal already exists", async () => {
@@ -523,7 +578,7 @@ Do not start new substantive work. Preserve useful state, report verified progre
 		expect(harness.persists.at(-1)?.state?.goal.objective).toBe("Second");
 	});
 
-	it("allows creating a new goal after the previous one is complete", async () => {
+	it("rejects goal re-entry until terminal cleanup clears the exiting sentinel", async () => {
 		const harness = createHarness({
 			state: {
 				enabled: false,
@@ -532,6 +587,11 @@ Do not start new substantive work. Preserve useful state, report verified progre
 				goal: createGoal({ status: "complete" }),
 			},
 		});
+
+		await expect(harness.runtime.createGoal({ objective: "Phase 4" })).rejects.toThrow(
+			"terminal cleanup is still in progress",
+		);
+		harness.setState(undefined);
 
 		const next = await harness.runtime.createGoal({ objective: "Phase 4" });
 		expect(next.goal.objective).toBe("Phase 4");

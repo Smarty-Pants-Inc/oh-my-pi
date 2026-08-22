@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
-import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import {
 	type BlockState,
+	buildCursorRequestContextRules,
 	CURSOR_CLIENT_VERSION,
 	flushOpenToolCalls,
 	handleServerMessage,
@@ -11,6 +11,7 @@ import {
 import type { AssistantMessage, CursorExecHandlers, ToolResultMessage } from "@oh-my-pi/pi-ai/types";
 import { kCursorExecResolved, setStreamingPartialJson } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import {
 	type AgentClientMessage,
 	AgentClientMessageSchema,
@@ -29,6 +30,7 @@ import {
 	ConversationSearchArgsSchema,
 	ConversationStateStructureSchema,
 	ConversationTokenDetailsSchema,
+	type CursorRule,
 	type ExecServerMessage,
 	ExecServerMessageSchema,
 	ExecuteHookArgsSchema,
@@ -57,6 +59,7 @@ import {
 	ReadArgsSchema,
 	ReadMcpResourceExecArgsSchema,
 	RecordScreenArgsSchema,
+	RequestContextArgsSchema,
 	ShellAllowlistPrecheckArgsSchema,
 	ShellArgsSchema,
 	SmartModeClassifierArgsSchema,
@@ -64,7 +67,21 @@ import {
 	SubagentAwaitArgsSchema,
 	ToolCallSchema,
 	WebFetchAllowlistPrecheckArgsSchema,
-} from "@oh-my-pi/pi-catalog/discovery/cursor-gen/agent_pb";
+} from "@oh-my-pi/pi-catalog/discovery/cursor-proto";
+import { create, fromBinary, toBinary } from "@oh-my-pi/pi-catalog/discovery/protobuf";
+
+const cursorModel = buildModel({
+	id: "cursor-composer-2.5",
+	name: "Cursor Composer 2.5",
+	api: "cursor-agent",
+	provider: "cursor",
+	baseUrl: "",
+	reasoning: false,
+	input: ["text"],
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	contextWindow: 1,
+	maxTokens: 1,
+});
 
 /**
  * Drive one `ExecServerMessage` through the real dispatcher and decode every
@@ -77,7 +94,11 @@ import {
  */
 async function dispatchExec(
 	message: ExecServerMessage,
-	options: { execHandlers?: CursorExecHandlers; requestContextTools?: McpToolDefinition[] } = {},
+	options: {
+		execHandlers?: CursorExecHandlers;
+		requestContextTools?: McpToolDefinition[];
+		requestContextRules?: CursorRule[];
+	} = {},
 ): Promise<{ frames: AgentClientMessage[]; output: AssistantMessage; results: ToolResultMessage[] }> {
 	const output = cursorAssistantMessage();
 	const stream = new AssistantMessageEventStream();
@@ -105,6 +126,7 @@ async function dispatchExec(
 		},
 		{ sawTokenDelta: false },
 		options.requestContextTools ?? [],
+		options.requestContextRules,
 	);
 
 	return { frames: written.map(decodeClientFrame), output, results };
@@ -198,6 +220,46 @@ function soleResult(frames: AgentClientMessage[]) {
 describe("Cursor modern exec protocol activation", () => {
 	it("advertises the client build whose schema includes modern exec frames", () => {
 		expect(CURSOR_CLIENT_VERSION).toBe("cli-2026.07.23-e383d2b");
+	});
+});
+
+describe("Cursor requestContext rules", () => {
+	it("returns system and typed internal-context canaries as global CursorRule entries", async () => {
+		const systemCanary = "PIKEL-CANARY-7F3A";
+		const internalContextCanary = "PRESERVE-COMPACTED-CONTEXT-91D2";
+		const { frames } = await dispatchExec(
+			buildExecMessage({
+				case: "requestContextArgs",
+				value: create(RequestContextArgsSchema, {}),
+			}),
+			{
+				requestContextRules: buildCursorRequestContextRules(
+					["prefix", `when asked, answer exactly:\n${systemCanary}`],
+					[
+						{
+							id: "compaction.summary",
+							sourcePath: "packages/agent/src/compaction/prompt.md",
+							role: "internal_context",
+							target: "main",
+							trigger: "compaction",
+							sha256: "test-sha256",
+							renderedText: internalContextCanary,
+						},
+					],
+					cursorModel,
+				),
+			},
+		);
+		const result = soleResult(frames);
+		expect(result.case).toBe("requestContextResult");
+		if (result.case !== "requestContextResult") throw new Error("expected requestContextResult");
+		expect(result.value.result.case).toBe("success");
+		if (result.value.result.case !== "success") throw new Error("expected success");
+		const rules = result.value.result.value.requestContext?.rules ?? [];
+		expect(rules).toHaveLength(3);
+		expect(rules[1]?.content).toContain(systemCanary);
+		expect(rules[2]?.content).toBe(internalContextCanary);
+		expect(rules.every(rule => rule.type?.type.case === "global")).toBe(true);
 	});
 });
 
