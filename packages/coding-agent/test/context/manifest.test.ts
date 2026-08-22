@@ -205,6 +205,15 @@ describe("tracked context manifest", () => {
 				Bun.write(indexPath, 'import "./store.js";\nexport default function plugin() {}\n'),
 				Bun.write(storePath, "export const value = 1;\n"),
 				Bun.write(path.join(repositoryRoot, ".gitignore"), "packages/plugin/src/store.js\n"),
+				Bun.write(
+					path.join(packageRoot, "MANIFEST.json"),
+					'{"schema":"smarty.stack.release_manifest.v1","version":"0.20.11","createdAt":"2026-08-22","status":"protected_candidate_requires_external_approval","files":[]}\n',
+				),
+				Bun.write(
+					path.join(packageRoot, "PROVENANCE.json"),
+					'{"schema":"smarty.stack.provenance.v1","version":"0.20.11","repository":"Smarty-Pants-Inc/smarty-dev","commit":null,"tree":null,"createdAt":"2026-08-22","purpose":"test","sources":[],"authority":"test","recovery":"test","nonclaims":[]}\n',
+				),
+				Bun.write(path.join(packageRoot, "SHA256SUMS.txt"), ""),
 			]);
 			await fs.symlink(packageRoot, linkedRoot);
 			runGit("init", "-q");

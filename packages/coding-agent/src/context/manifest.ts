@@ -862,6 +862,7 @@ async function isApprovedMaterializedCandidateSource(
 	assertString(provenance.version, "materialized package provenance version");
 	assertString(provenance.repository, "materialized package provenance repository");
 	assertString(provenance.createdAt, "materialized package provenance creation date");
+	if (provenance.commit === null && provenance.tree === null) return false;
 	assertGitObject(provenance.commit, "materialized package provenance commit");
 	assertGitObject(provenance.tree, "materialized package provenance tree");
 	if (
