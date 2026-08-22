@@ -7,6 +7,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { compareUnicodeCodePoints, sha256 } from "@oh-my-pi/pi-coding-agent/context/canonical";
 import { type ContextReleaseManifest, stackPackageContentSha256 } from "@oh-my-pi/pi-coding-agent/context/manifest";
 import type { ExtensionFactory, ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import { loadExtensions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import {
 	type CreateAgentSessionOptions,
 	createAgentSession,
@@ -64,6 +65,12 @@ function writeMaterializedPromptBuilderPackage(
 	markerPath: string,
 	registersBuilder = true,
 	mismatchTriggerPath?: string,
+	sideEffects: {
+		moduleMarkerPath?: string;
+		factoryMarkerPath?: string;
+		registrationMarkerPath?: string;
+		registeredCommandName?: string;
+	} = {},
 ): {
 	sourcePath: string;
 	release: ContextReleaseManifest;
@@ -77,8 +84,26 @@ function writeMaterializedPromptBuilderPackage(
 	const packageRoot = path.join(stackRoot, "versions", version);
 	const currentRoot = path.join(stackRoot, "current");
 	const sourcePath = "extensions/smarty-prompt-guard/src/index.ts";
+	const markerSourcePath = "extensions/smarty-prompt-guard/src/marker.ts";
 	const mismatchSource = mismatchTriggerPath
 		? `\t\tif (await Bun.file(${JSON.stringify(mismatchTriggerPath)}).exists()) return { systemPrompt: ["mismatch"] };\n`
+		: "";
+	const factorySource = sideEffects.factoryMarkerPath
+		? `\tawait Bun.write(${JSON.stringify(sideEffects.factoryMarkerPath)}, "factory\\n");\n`
+		: "";
+	const registrationSource = sideEffects.registeredCommandName
+		? `\tpi.registerCommand(${JSON.stringify(sideEffects.registeredCommandName)}, { handler: async () => {} });\n${
+				sideEffects.registrationMarkerPath
+					? `\tawait Bun.write(${JSON.stringify(sideEffects.registrationMarkerPath)}, "registration\\n");\n`
+					: ""
+			}`
+		: "";
+	const builderSource = registersBuilder
+		? `\tpi.registerSystemPromptBuilder(async context => {
+\t\tawait Bun.write(${JSON.stringify(markerPath)}, "verified\\n");
+${mismatchSource}\t\treturn context.build(context.templates);
+\t});
+`
 		: "";
 	const sources = new Map<string, string>([
 		[
@@ -107,16 +132,23 @@ function writeMaterializedPromptBuilderPackage(
 			`${JSON.stringify({ name: "test-prompt-guard", version, type: "module" })}\n`,
 		],
 		[
-			sourcePath,
-			registersBuilder
-				? `export default function register(pi) {
-	pi.registerSystemPromptBuilder(async context => {
-		await Bun.write(${JSON.stringify(markerPath)}, "verified\\n");
-${mismatchSource}		return context.build(context.templates);
-	});
+			markerSourcePath,
+			sideEffects.moduleMarkerPath
+				? `export async function markModuleLoaded() {
+\tawait Bun.write(${JSON.stringify(sideEffects.moduleMarkerPath)}, "module\\n");
 }
 `
-				: "export default function register() {}\n",
+				: "export async function markModuleLoaded() {}\n",
+		],
+		[
+			sourcePath,
+			`import { markModuleLoaded } from "./marker";
+
+await markModuleLoaded();
+
+export default async function register(pi) {
+${factorySource}${registrationSource}${builderSource}}
+`,
 		],
 	]);
 	for (const [relative, source] of sources) {
@@ -296,15 +328,61 @@ describe("extension system prompt builders", () => {
 			}
 
 			const selfAttestedMarkerPath = tempDir.join("self-attested-builder-ran.txt");
+			const selfAttestedModuleMarkerPath = tempDir.join("self-attested-module-ran.txt");
+			const selfAttestedFactoryMarkerPath = tempDir.join("self-attested-factory-ran.txt");
+			const selfAttestedRegistrationMarkerPath = tempDir.join("self-attested-registration-ran.txt");
+			const selfAttestedCommandName = "self-attested-command";
 			const selfAttested = writeMaterializedPromptBuilderPackage(
 				tempDir.join("self-attested-stack"),
 				selfAttestedMarkerPath,
+				true,
+				undefined,
+				{
+					moduleMarkerPath: selfAttestedModuleMarkerPath,
+					factoryMarkerPath: selfAttestedFactoryMarkerPath,
+					registrationMarkerPath: selfAttestedRegistrationMarkerPath,
+					registeredCommandName: selfAttestedCommandName,
+				},
 			);
-			await expect(createProtectedSession(false, selfAttested.sourcePath)).rejects.toThrow(
-				"PROMPT_POLICY_REVIEW_REQUIRED: one or more configured system prompt builder sources are not approved",
-			);
+			const blocked = await loadExtensions([selfAttested.sourcePath], tempDir.path(), undefined, release);
+			expect(blocked.extensions).toEqual([]);
+			expect(blocked.errors).toEqual([
+				{
+					path: selfAttested.sourcePath,
+					error: `PROMPT_POLICY_REVIEW_REQUIRED: extension source is not approved: ${selfAttested.sourcePath}`,
+				},
+			]);
+			expect(fs.existsSync(selfAttestedModuleMarkerPath)).toBe(false);
+			expect(fs.existsSync(selfAttestedFactoryMarkerPath)).toBe(false);
+			expect(fs.existsSync(selfAttestedRegistrationMarkerPath)).toBe(false);
 			expect(fs.existsSync(selfAttestedMarkerPath)).toBe(false);
 
+			const unprotectedPreload = await loadExtensions([selfAttested.sourcePath], tempDir.path());
+			expect(unprotectedPreload.extensions[0]?.commands.has(selfAttestedCommandName)).toBe(true);
+			expect(fs.readFileSync(selfAttestedModuleMarkerPath, "utf8")).toBe("module\n");
+			expect(fs.readFileSync(selfAttestedFactoryMarkerPath, "utf8")).toBe("factory\n");
+			expect(fs.readFileSync(selfAttestedRegistrationMarkerPath, "utf8")).toBe("registration\n");
+			fs.rmSync(selfAttestedModuleMarkerPath);
+			fs.rmSync(selfAttestedFactoryMarkerPath);
+			fs.rmSync(selfAttestedRegistrationMarkerPath);
+			const preloaded = await createProtectedSession(true, selfAttested.sourcePath, {
+				preloadedExtensions: unprotectedPreload,
+			});
+			try {
+				expect(fs.existsSync(selfAttestedModuleMarkerPath)).toBe(false);
+				expect(fs.existsSync(selfAttestedFactoryMarkerPath)).toBe(false);
+				expect(fs.existsSync(selfAttestedRegistrationMarkerPath)).toBe(false);
+				expect(
+					preloaded.extensionsResult.extensions.some(extension => extension.commands.has(selfAttestedCommandName)),
+				).toBe(false);
+			} finally {
+				await preloaded.session.dispose();
+			}
+
+			await expect(createProtectedSession(false, selfAttested.sourcePath)).rejects.toThrow(
+				"PROMPT_POLICY_REVIEW_REQUIRED: an approved system prompt builder is required",
+			);
+			expect(fs.existsSync(selfAttestedMarkerPath)).toBe(false);
 			await expect(
 				createProtectedSession(false, sourcePath, { systemPrompt: ["external override"] }),
 			).rejects.toThrow(
@@ -339,7 +417,7 @@ describe("extension system prompt builders", () => {
 			fs.chmodSync(sourcePath, 0o644);
 			fs.appendFileSync(sourcePath, "// drift\n");
 			await expect(createProtectedSession(false)).rejects.toThrow(
-				"PROMPT_POLICY_REVIEW_REQUIRED: one or more configured system prompt builder sources are not approved",
+				"PROMPT_POLICY_REVIEW_REQUIRED: an approved system prompt builder is required",
 			);
 
 			const interactive = await createProtectedSession(true);
@@ -357,7 +435,7 @@ describe("extension system prompt builders", () => {
 				expect(fs.existsSync(markerPath)).toBe(false);
 				expect(statuses).toContainEqual(["omp-prompt-policy", "Prompt policy: REVIEW REQUIRED"]);
 				expect(notifications).toContainEqual([
-					"PROMPT_POLICY_REVIEW_REQUIRED: one or more configured system prompt builder sources are not approved",
+					"PROMPT_POLICY_REVIEW_REQUIRED: an approved system prompt builder is required",
 					"warning",
 				]);
 			} finally {

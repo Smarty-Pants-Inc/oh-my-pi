@@ -1007,16 +1007,19 @@ async function isApprovedMaterializedCandidateSource(
 	return await isExtensionSourceGraphContained(resolvedSource, root);
 }
 
-/** Bind an external runtime source to an unchanged, clean package in one approved candidate. */
-export async function isApprovedCandidateSource(filePath: string, release: ContextReleaseManifest): Promise<boolean> {
+/** Resolve an external runtime source to its verified on-disk entry path. */
+export async function approvedCandidateSourcePath(
+	filePath: string,
+	release: ContextReleaseManifest,
+): Promise<string | undefined> {
 	try {
 		const absolute = path.resolve(filePath);
 		const resolved = await fs.realpath(absolute);
-		if (await isApprovedMaterializedCandidateSource(absolute, resolved, release)) return true;
+		if (await isApprovedMaterializedCandidateSource(absolute, resolved, release)) return resolved;
 		const repositoryRoot = await repo.root(path.dirname(resolved));
-		if (!repositoryRoot) return false;
+		if (!repositoryRoot) return undefined;
 		const relative = path.relative(repositoryRoot, resolved).replaceAll(path.sep, "/");
-		if (relative.startsWith("../") || path.isAbsolute(relative)) return false;
+		if (relative.startsWith("../") || path.isAbsolute(relative)) return undefined;
 		const remoteNames = await remote.list(repositoryRoot);
 		let repository: string | undefined;
 		for (const name of ["origin", ...remoteNames.filter(name => name !== "origin")]) {
@@ -1024,10 +1027,10 @@ export async function isApprovedCandidateSource(filePath: string, release: Conte
 			if (repository) break;
 		}
 		const candidate = release.candidates.find(item => item.repository === repository);
-		if (!candidate) return false;
+		if (!candidate) return undefined;
 		const approvedIdentity = await ref.commitIdentity(repositoryRoot, candidate.commit);
 		const sourceRoot = await approvedCandidateSourceRoot(repositoryRoot, resolved, candidate.commit);
-		if (!sourceRoot) return false;
+		if (!sourceRoot) return undefined;
 		const relativeSourceRoot = path.relative(repositoryRoot, sourceRoot).replaceAll(path.sep, "/");
 		const packagePathspec = `:(literal)${relativeSourceRoot || "."}`;
 		// Keep runtime plugin graph loading outside native-free offline context commands.
@@ -1046,7 +1049,7 @@ export async function isApprovedCandidateSource(filePath: string, release: Conte
 				workingPackageTreeObjectId(repositoryRoot, relativeSourceRoot, candidate.tree.length),
 				isExtensionSourceGraphContained(resolved, sourceRoot),
 			]);
-		if (!headPackageTree || workingPackageTree !== headPackageTree || !sourceGraphContained) return false;
+		if (!headPackageTree || workingPackageTree !== headPackageTree || !sourceGraphContained) return undefined;
 		return approvedCandidateSourceMatches(
 			repository,
 			approvedIdentity ?? undefined,
@@ -1054,10 +1057,17 @@ export async function isApprovedCandidateSource(filePath: string, release: Conte
 			headPackageTree ?? undefined,
 			workingSourceStatus,
 			release,
-		);
+		)
+			? resolved
+			: undefined;
 	} catch {
-		return false;
+		return undefined;
 	}
+}
+
+/** Bind an external runtime source to an unchanged, clean package in one approved candidate. */
+export async function isApprovedCandidateSource(filePath: string, release: ContextReleaseManifest): Promise<boolean> {
+	return (await approvedCandidateSourcePath(filePath, release)) !== undefined;
 }
 
 export async function buildContextReleaseManifest(

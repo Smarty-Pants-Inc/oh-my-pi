@@ -41,8 +41,8 @@ import type { CreateAgentSessionOptions, CreateAgentSessionResult, LoadExtension
 import {
 	discoverContextFiles,
 	discoverPromptTemplates,
-	discoverSessionExtensionPaths,
 	discoverSkills,
+	loadSessionExtensions,
 	createAgentSession as ompCreateAgentSession,
 } from "../sdk";
 import {
@@ -61,7 +61,7 @@ import { formatBytes } from "../tools/render-utils";
 import { WriteTool } from "../tools/write";
 import { EventBus } from "../utils/event-bus";
 import { convertImageToPng } from "../utils/image-loading";
-import { discoverExtensionPaths, loadExtensionFromFactory, loadExtensions } from "./extensions";
+import { discoverExtensionPaths, loadExtensionFromFactory } from "./extensions";
 import { ExtensionRuntime } from "./extensions/loader";
 import type {
 	BashToolResultEvent,
@@ -1133,16 +1133,15 @@ export class DefaultResourceLoader implements ResourceLoader {
 			return { extensions: [], errors: [], runtime: createExtensionRuntime() };
 		}
 
-		const paths = await discoverSessionExtensionPaths(
+		const result = await loadSessionExtensions(
 			{
 				disableExtensionDiscovery: noExtensions,
 				additionalExtensionPaths,
 			},
 			cwd,
 			settings,
+			eventBus,
 		);
-
-		const result = await loadExtensions(paths, cwd, eventBus);
 		for (let i = 0; i < extensionFactories.length; i++) {
 			const loaded = await loadExtensionFromFactory(
 				extensionFactories[i],
@@ -1280,6 +1279,8 @@ export class DefaultResourceLoader implements ResourceLoader {
 		systemPrompt: string | undefined;
 		appendSystemPrompt: string[];
 		extensionFactories: ExtensionFactory[];
+		disableExtensionDiscovery: boolean;
+		additionalExtensionPaths: string[];
 	} {
 		return {
 			cwd: this.#state.cwd,
@@ -1293,6 +1294,8 @@ export class DefaultResourceLoader implements ResourceLoader {
 			systemPrompt: this.#systemPrompt,
 			appendSystemPrompt: this.#appendSystemPrompt,
 			extensionFactories: this.#state.extensionFactories,
+			disableExtensionDiscovery: this.#state.noExtensions,
+			additionalExtensionPaths: this.#state.additionalExtensionPaths,
 		};
 	}
 }
@@ -1345,6 +1348,8 @@ export async function createAgentSession(
 					systemPrompt: loader.getSystemPrompt(),
 					appendSystemPrompt: loader.getAppendSystemPrompt(),
 					extensionFactories: [] as ExtensionFactory[],
+					disableExtensionDiscovery: false,
+					additionalExtensionPaths: [],
 				};
 
 	const { resourceLoader: _, ...rest } = options;
@@ -1360,11 +1365,17 @@ export async function createAgentSession(
 	if (rest.settings === undefined && rest.settingsManager === undefined && state.settingsPromise !== undefined) {
 		forwarded.settingsManager = state.settingsPromise;
 	}
+	if (rest.disableExtensionDiscovery === undefined) {
+		forwarded.disableExtensionDiscovery = state.disableExtensionDiscovery;
+	}
+	if (rest.additionalExtensionPaths === undefined) {
+		forwarded.additionalExtensionPaths = state.additionalExtensionPaths;
+	}
 
 	// Route the loader's already-loaded extension result through the SDK's
-	// `preloadedExtensions` seam. Skipping this branch would let
-	// `createAgentSession` re-run its own discovery and undo the caller's
-	// `noExtensions: true`.
+	// `preloadedExtensions` seam. Protected sessions rebuild verified sources
+	// using the forwarded discovery options; unprotected sessions reuse this
+	// snapshot, preserving the caller's `noExtensions: true` opt-out.
 	if (rest.preloadedExtensions === undefined && rest.preloadedExtensionPaths === undefined) {
 		forwarded.preloadedExtensions = state.extensionsResult;
 	}

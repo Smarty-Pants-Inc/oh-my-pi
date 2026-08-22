@@ -6405,7 +6405,7 @@
     },
     {
       "path": "packages/coding-agent/src/cli/models-cli.ts",
-      "sha256": "d69f9ad785cb09e46b1589bcdc3e6cc0c6d05d0144d1f4e88445f5ce4e6ed2da"
+      "sha256": "964c2f4af585976ed573430f7cf37a3cec45e3c9eb36ef16f4ff5575fd70b080"
     },
     {
       "path": "packages/coding-agent/src/cli/plugin-cli.ts",
@@ -6833,7 +6833,7 @@
     },
     {
       "path": "packages/coding-agent/src/context/manifest.ts",
-      "sha256": "842aeae774f8aa17a0c1eab5c7000c43a1d1f0a4810686dadf838c3d441d8cbc"
+      "sha256": "3fd8ee73a6a72173245b311b486291e62df17dc8cd9e725627a616a0e088b178"
     },
     {
       "path": "packages/coding-agent/src/context/prompt-sources.generated.ts",
@@ -7369,7 +7369,7 @@
     },
     {
       "path": "packages/coding-agent/src/extensibility/extensions/loader.ts",
-      "sha256": "21f0611ffe8804867427c4e0f5b498cd6e5eeb579a33009389ffdb706335c280"
+      "sha256": "50d03061f2af1092b9cb911034134ac9de20c0f02451937d4b21959a7489c156"
     },
     {
       "path": "packages/coding-agent/src/extensibility/extensions/managed-timers.ts",
@@ -7409,7 +7409,7 @@
     },
     {
       "path": "packages/coding-agent/src/extensibility/legacy-pi-coding-agent-shim.ts",
-      "sha256": "f4b85c8928bccb6d1095d2f0fe24062573d9fe7fc90caa04920e5709e5191355"
+      "sha256": "64275ecc559eb6b785c60c016e89192c4e9de025f43b3a152a5da79e5751ea5f"
     },
     {
       "path": "packages/coding-agent/src/extensibility/legacy-typebox.ts",
@@ -7801,7 +7801,7 @@
     },
     {
       "path": "packages/coding-agent/src/main.ts",
-      "sha256": "adc4815eaac6dae742b0f6c8f2a04d44b00a08c6c19a83e417b210b30d4b3a4e"
+      "sha256": "572818d4d5a92d208535ae279a8fd20960b84a816d06a984e72033af218d1c35"
     },
     {
       "path": "packages/coding-agent/src/markit/converters/docx.ts",
@@ -8349,7 +8349,7 @@
     },
     {
       "path": "packages/coding-agent/src/sdk.ts",
-      "sha256": "d017aa0ef9bf110bc836b5b5a2344208bfae29bb39158a520a075c0deac0c73a"
+      "sha256": "795aaf0cc324d1249b5975d0a49311303f4d641538a1422e9567fd7c30ff7297"
     },
     {
       "path": "packages/coding-agent/src/secrets/index.ts",
@@ -10737,5 +10737,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "46103800a87c6a692a889ae114a27e4b5d7cb0c5ee5fc02824fa7857f803d675"
+  "rootSha256": "569f6ffd8d0df4b7c8313eab32b278ecc6a8b797aab0d6313998ed8af9df706a"
 }
