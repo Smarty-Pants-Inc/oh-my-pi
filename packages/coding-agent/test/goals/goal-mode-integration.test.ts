@@ -646,6 +646,7 @@ describe("InteractiveMode goal mode integration", () => {
 	});
 
 	it("continues an active goal after text-only settles with empty or fully closed todos", async () => {
+		await harness.mode.init({ suppressWelcomeIntro: true });
 		await harness.mode.handleGoalModeCommand("Ship the release");
 
 		for (const phases of [
@@ -675,6 +676,7 @@ describe("InteractiveMode goal mode integration", () => {
 	});
 
 	it("does not continue an active goal after stale todo closure rejection", async () => {
+		await harness.mode.init({ suppressWelcomeIntro: true });
 		await harness.mode.handleGoalModeCommand("Ship the release");
 		await harness.session.setActiveToolsByName(["goal", "todo"]);
 		harness.settings.set("todo.reminders", true);
@@ -682,8 +684,6 @@ describe("InteractiveMode goal mode integration", () => {
 			{ name: "Work", tasks: [{ content: "Finish the requested work", status: "pending" }] },
 		]);
 
-		vi.useFakeTimers();
-		const waiter = await armInputWaiter(harness.mode);
 		harness.session.agent.emitExternalEvent({ type: "agent_start" });
 		const message = createAssistantMessage("Stopping before the todo is done.");
 		message.stopReason = "stop";
@@ -696,16 +696,18 @@ describe("InteractiveMode goal mode integration", () => {
 		try {
 			harness.session.agent.emitExternalEvent({ type: "agent_end", messages: [message] });
 			await rejected.promise;
+
+			vi.useFakeTimers();
+			const waiter = await armInputWaiter(harness.mode);
 			vi.advanceTimersByTime(800);
 			await waitForMicrotasks();
 
 			expect(waiter.getResolvedInput()).toBeUndefined();
+			harness.mode.onInputCallback?.(harness.mode.startPendingSubmission({ text: "cleanup" }));
+			await waiter.inputPromise;
 		} finally {
 			unsubscribe();
 		}
-
-		harness.mode.onInputCallback?.(harness.mode.startPendingSubmission({ text: "cleanup" }));
-		await waiter.inputPromise;
 	});
 
 	it("drops a goal continuation tick while the agent is streaming", async () => {
