@@ -2026,6 +2026,60 @@ describe("AgentSession concurrent prompt guard", () => {
 			},
 		);
 
+		it.each(["clear", "pop"] as const)(
+			"lets an earlier durable %s reservation cancel a scheduled direct-user continuation",
+			async removal => {
+				const manager = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+				const calls: Message[][] = [];
+				session = createPersistentSession(manager, calls);
+				session.agent.state.isStreaming = true;
+				await session.sendCustomMessage(
+					{
+						customType: "scheduled-owner",
+						content: "remove before scheduled send",
+						display: true,
+						attribution: "user",
+					},
+					{ deliveryMode: "steer" },
+				);
+				session.agent.state.isStreaming = false;
+				const gate = holdFirstEnsureOnDisk(manager);
+				const accepting = session.sendCustomMessage(
+					{
+						customType: "scheduled-gate",
+						content: "hold scheduled continuation",
+						display: false,
+						attribution: "agent",
+					},
+					{ deliveryMode: "steer" },
+				);
+				await gate.entered;
+				await session.runModeExitTeardown(async () => {});
+				await Bun.sleep(10);
+				const removing = removal === "clear" ? session.clearQueueDurably() : session.popLastQueuedMessageDurably();
+				try {
+					expect(calls).toHaveLength(0);
+					expect(session.getQueuedPrompts().map(prompt => prompt.text)).toEqual(["remove before scheduled send"]);
+				} finally {
+					gate.release();
+				}
+
+				await accepting;
+				const removed = await removing;
+				await Bun.sleep(10);
+				if (removal === "clear") {
+					expect(removed).toEqual({
+						steering: [{ text: "remove before scheduled send", images: undefined }],
+						followUp: [],
+					});
+				} else {
+					expect(removed).toEqual({ text: "remove before scheduled send", images: undefined });
+				}
+				expect(calls).toHaveLength(0);
+				expect(session.agent.hasQueuedMessages()).toBe(false);
+			},
+		);
+
 		it("reserves durable queue mutation before waiting for semantic acceptance", async () => {
 			const manager = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
 			session = createPersistentSession(manager);
@@ -2150,6 +2204,33 @@ describe("AgentSession concurrent prompt guard", () => {
 			session = undefined as unknown as AgentSession;
 			const resumed = await reopen(sessionFile, sessionDir);
 			expect(resumed.getQueuedPrompts().map(prompt => prompt.text)).toEqual(["keep after failure"]);
+		});
+
+		it("suppresses post-abort queue drain when interrupt-side durable clearing fails", async () => {
+			const manager = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+			const calls: Message[][] = [];
+			session = createPersistentSession(manager, calls);
+			session.agent.state.isStreaming = true;
+			await session.sendCustomMessage(
+				{
+					customType: "failed-interrupt-clear",
+					content: "keep queued for editing",
+					display: true,
+					attribution: "user",
+				},
+				{ deliveryMode: "steer" },
+			);
+			session.agent.state.isStreaming = false;
+			vi.spyOn(manager, "appendEntriesAtomically").mockRejectedValueOnce(new Error("interrupt cancellation failed"));
+
+			await expect(session.clearQueueDurably({ forInterrupt: true })).rejects.toThrow(
+				"interrupt cancellation failed",
+			);
+			await session.abort({ reason: USER_INTERRUPT_LABEL, suppressQueuedMessageDrain: true });
+			await Bun.sleep(10);
+
+			expect(calls).toHaveLength(0);
+			expect(session.getQueuedPrompts().map(prompt => prompt.text)).toEqual(["keep queued for editing"]);
 		});
 
 		it("recovers authoritative persistence before releasing a failed durable cancellation", async () => {

@@ -4641,7 +4641,7 @@
     },
     {
       "path": "packages/agent/src/agent.ts",
-      "sha256": "6def33d428ca61d3087c2bb5991403b942d3a7b3944bf93c8b1ae8d7198a4933"
+      "sha256": "5ba5144bc7c77b861008f9dd2fd94118111473ea1209a5219f299b1b262aeaa5"
     },
     {
       "path": "packages/agent/src/append-only-context.ts",
@@ -8145,7 +8145,7 @@
     },
     {
       "path": "packages/coding-agent/src/modes/controllers/input-controller.ts",
-      "sha256": "7ee1b14923435aa8f00654a8eb574cfeb8ab21a4205b378c4ce480e89f51c596"
+      "sha256": "122bbbb8b9a0ed0881c7769bc6b5fe30b083fe0f7f1face21086c3debfa8f565"
     },
     {
       "path": "packages/coding-agent/src/modes/controllers/live-command-controller.ts",
@@ -8449,7 +8449,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/agent-session.ts",
-      "sha256": "6d08c788c6b82742e5d79d3d329e38909088a1fe58ed62629091fd761fed7908"
+      "sha256": "2a8ba6adc27149fcd6bca894e88b748f7e4eb437f012934f07b94859674209d3"
     },
     {
       "path": "packages/coding-agent/src/session/agent-storage.ts",
@@ -10733,5 +10733,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "c0c0cb764479ee0fb01ff0985a02e12627d6dbbd70a113f09929024714062acf"
+  "rootSha256": "97bf822057f35b3050c87cbdb0b2453071d67984c25849dd6bbd0c345ce06aa5"
 }

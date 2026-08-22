@@ -577,6 +577,32 @@ describe("Agent", () => {
 		expect(agent.peekFollowUpQueue()).toEqual([]);
 	});
 
+	it.each(["steering", "followUp"] as const)(
+		"dequeues leading queue companions with their owner from the %s queue",
+		async queue => {
+			const mock = createMockModel({ responses: [{ content: ["owner done"] }, { content: ["later done"] }] });
+			const agent = new Agent({ streamFn: mock.stream });
+			agent.replaceMessages([createAssistantMessage([{ type: "text", text: "ready" }])]);
+			const companion = { role: "user" as const, content: "leading companion", timestamp: 1 };
+			const owner = { role: "user" as const, content: "logical owner", timestamp: 2 };
+			const later = { role: "user" as const, content: "later owner", timestamp: 3 };
+			agent.setQueuedMessageCompanionPredicate(message => message === companion);
+			agent.replaceQueues(
+				queue === "steering" ? [companion, owner, later] : [],
+				queue === "followUp" ? [companion, owner, later] : [],
+			);
+
+			await agent.continue();
+
+			const firstContext = JSON.stringify(mock.calls[0]?.context.messages ?? []);
+			expect(firstContext).toContain("leading companion");
+			expect(firstContext).toContain("logical owner");
+			expect(firstContext).not.toContain("later owner");
+			expect(JSON.stringify(mock.calls[1]?.context.messages ?? [])).toContain("later owner");
+			expect(agent.hasQueuedMessages()).toBe(false);
+		},
+	);
+
 	it("does not interrupt tools for steering held by a queue claim", async () => {
 		const parameters = type({ value: "string" });
 		const executed: string[] = [];

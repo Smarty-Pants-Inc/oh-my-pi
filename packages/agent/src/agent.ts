@@ -431,6 +431,7 @@ export class Agent {
 	#inFlightQueuedMessageCompanions: InFlightQueuedMessageCompanions[] = [];
 	#queuedMessageClaims = new Set<ActiveQueuedMessageClaim>();
 	#steeringWaiters = new Set<() => void>();
+	#isQueuedMessageCompanion?: (message: AgentMessage) => boolean;
 
 	#steeringMode: "all" | "one-at-a-time";
 	#followUpMode: "all" | "one-at-a-time";
@@ -962,7 +963,12 @@ export class Agent {
 	#queuedMessageBatch(queue: QueuedMessageQueue): AgentMessage[] {
 		const current = queue === "steering" ? this.#steeringQueue : this.#followUpQueue;
 		const mode = queue === "steering" ? this.#steeringMode : this.#followUpMode;
-		return mode === "one-at-a-time" ? current.slice(0, 1) : current.slice();
+		if (mode === "all" || current.length < 2 || !this.#isQueuedMessageCompanion?.(current[0]!)) {
+			return mode === "one-at-a-time" ? current.slice(0, 1) : current.slice();
+		}
+		let end = 1;
+		while (end < current.length && this.#isQueuedMessageCompanion(current[end - 1]!)) end++;
+		return current.slice(0, end);
 	}
 
 	#queuedMessagesBlocked(messages: readonly AgentMessage[]): boolean {
@@ -1183,6 +1189,11 @@ export class Agent {
 
 	getFollowUpMode(): "all" | "one-at-a-time" {
 		return this.#followUpMode;
+	}
+
+	/** Keep matching leading queue companions with their immediately following owner. */
+	setQueuedMessageCompanionPredicate(predicate: ((message: AgentMessage) => boolean) | undefined): void {
+		this.#isQueuedMessageCompanion = predicate;
 	}
 
 	setInterruptMode(mode: "immediate" | "wait") {

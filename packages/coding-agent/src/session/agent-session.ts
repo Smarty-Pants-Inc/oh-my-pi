@@ -465,6 +465,8 @@ type AgentSessionAbortOptions = {
 	preserveCompaction?: boolean;
 	preserveToolChoice?: boolean;
 	postPromptDrainTimeoutMs?: number;
+	/** Keep an unchanged queue from auto-resuming after an interrupt-side removal failure. */
+	suppressQueuedMessageDrain?: boolean;
 };
 
 type AbortIntent = {
@@ -1149,6 +1151,7 @@ export class AgentSession {
 
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
+		this.agent.setQueuedMessageCompanionPredicate(isHiddenUserCompanion);
 		this.#desiredSteeringMode = this.agent.getSteeringMode();
 		this.#desiredFollowUpMode = this.agent.getFollowUpMode();
 		this.#desiredInterruptMode = this.agent.getInterruptMode();
@@ -4373,6 +4376,10 @@ export class AgentSession {
 					} while (this.#semanticDeliveryAcceptances.size > 0);
 					if (options.shouldContinue && !options.shouldContinue()) {
 						this.#skipAgentContinue("should-continue-false", options);
+						return;
+					}
+					if (this.#queuedPromptDeliveryMutationReservations > 0 || this.#queuedPromptDeliveryMutationInFlight) {
+						this.#skipAgentContinue("session-unavailable", options);
 						return;
 					}
 					const directUser = this.#isolateDirectUserContinuationOwner();
@@ -7821,6 +7828,7 @@ export class AgentSession {
 		if (!this.agent.hasQueuedMessages()) return false;
 		if (this.#queuedMessageDrainScheduled) return true;
 		if (this.#modeExitDrainSuppressionDepth > 0) return false;
+		if (this.#queuedMessageDrainBlocked) return false;
 		if (
 			!this.isStreaming &&
 			this.agent.peekSteeringQueue().length === 0 &&
@@ -7845,7 +7853,7 @@ export class AgentSession {
 				);
 			}
 		}
-		if (this.#queuedMessageDrainBlocked || !this.#canAutoContinueForFollowUp()) return false;
+		if (!this.#canAutoContinueForFollowUp()) return false;
 		const queuedAuthority = this.#queuedTurnAuthority();
 		if (!queuedAuthority) return false;
 		this.#queuedMessageDrainScheduled = true;
@@ -9051,8 +9059,8 @@ export class AgentSession {
 			return { status: "updated" };
 		} finally {
 			claim.release();
-			acceptance.release();
 			this.#queuedPromptDeliveryMutationInFlight = false;
+			acceptance.release();
 		}
 	}
 
@@ -9318,6 +9326,9 @@ export class AgentSession {
 	 * abort. Omit it for internal/lifecycle aborts.
 	 */
 	abort(options: AgentSessionAbortOptions = {}): Promise<void> {
+		if (options.suppressQueuedMessageDrain && this.agent.hasQueuedMessages()) {
+			this.#queuedMessageDrainBlocked = true;
+		}
 		if (this.#abortPromise) {
 			const intent = this.#abortIntent;
 			if (

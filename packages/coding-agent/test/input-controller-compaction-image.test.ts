@@ -193,7 +193,7 @@ describe("compaction queue Alt+Up restore", () => {
 		expect(ctx.compactionQueuedMessages).toEqual(queued);
 		expect(ctx.editor.getText()).toBe("");
 		expect(showError).toHaveBeenCalledWith("Failed to restore queued messages: disk unavailable");
-		expect(session.abort).toHaveBeenCalledTimes(1);
+		expect(session.abort).toHaveBeenCalledWith({ reason: "Interrupted by user", suppressQueuedMessageDrain: true });
 	});
 });
 
