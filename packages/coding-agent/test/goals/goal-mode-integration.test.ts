@@ -674,6 +674,40 @@ describe("InteractiveMode goal mode integration", () => {
 		}
 	});
 
+	it("does not continue an active goal after stale todo closure rejection", async () => {
+		await harness.mode.handleGoalModeCommand("Ship the release");
+		await harness.session.setActiveToolsByName(["goal", "todo"]);
+		harness.settings.set("todo.reminders", true);
+		harness.session.setTodoPhases([
+			{ name: "Work", tasks: [{ content: "Finish the requested work", status: "pending" }] },
+		]);
+
+		vi.useFakeTimers();
+		const waiter = await armInputWaiter(harness.mode);
+		harness.session.agent.emitExternalEvent({ type: "agent_start" });
+		const message = createAssistantMessage("Stopping before the todo is done.");
+		message.stopReason = "stop";
+		harness.session.agent.emitExternalEvent({ type: "message_end", message });
+		const rejected = Promise.withResolvers<void>();
+		const unsubscribe = harness.session.subscribe(event => {
+			if (event.type === "agent_end" && event.closureRejected) rejected.resolve();
+		});
+
+		try {
+			harness.session.agent.emitExternalEvent({ type: "agent_end", messages: [message] });
+			await rejected.promise;
+			vi.advanceTimersByTime(800);
+			await waitForMicrotasks();
+
+			expect(waiter.getResolvedInput()).toBeUndefined();
+		} finally {
+			unsubscribe();
+		}
+
+		harness.mode.onInputCallback?.(harness.mode.startPendingSubmission({ text: "cleanup" }));
+		await waiter.inputPromise;
+	});
+
 	it("drops a goal continuation tick while the agent is streaming", async () => {
 		// Repro for the race the streaming guard on /goal set X exposed: the
 		// 800ms continuation timer armed by getUserInput() can outlive the idle

@@ -2507,6 +2507,10 @@ export class InteractiveMode implements InteractiveModeContext {
 			await this.#exitGoalMode({ reason: "completed", silent: true });
 			return;
 		}
+		if (event.closureRejected) {
+			this.#cancelGoalContinuation();
+			return;
+		}
 		this.#scheduleGoalContinuation();
 	}
 
