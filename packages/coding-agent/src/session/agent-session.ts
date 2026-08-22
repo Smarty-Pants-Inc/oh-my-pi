@@ -341,6 +341,7 @@ import {
 	sanitizeAssistantForReparentedHistory,
 	stripInternalDetailsFields,
 	USER_INTERRUPT_LABEL,
+	withInternalDetailsField,
 } from "./messages";
 import { ModelControls, type ModelControlsHost } from "./model-controls";
 import { isPrewalkPlanNudge, PrewalkCoordinator, type PrewalkCoordinatorHost } from "./prewalk";
@@ -7883,15 +7884,11 @@ export class AgentSession {
 		this.#pendingExplicitPromptMessages = [...(messages as CustomMessage[]), ...this.#pendingExplicitPromptMessages];
 	}
 
-	#withPendingSemanticDeliveryId(message: CustomMessage, pendingId: string): CustomMessage {
-		const details = {
-			...((message.details && typeof message.details === "object" ? message.details : {}) as Record<
-				string,
-				unknown
-			>),
-			__pendingSemanticDeliveryId: pendingId,
+	#withPendingSemanticDeliveryId<T>(message: CustomMessage<T>, pendingId: string): CustomMessage<T> {
+		return {
+			...message,
+			details: withInternalDetailsField(message.details, "__pendingSemanticDeliveryId", pendingId),
 		};
-		return { ...message, details };
 	}
 
 	#semanticDeliveryUnavailable(lifecycleGeneration: number): boolean {
@@ -7928,10 +7925,10 @@ export class AgentSession {
 		);
 	}
 
-	async #persistPendingSemanticDelivery(
+	async #persistPendingSemanticDelivery<T>(
 		kind: PendingSemanticDeliveryKind,
-		message: CustomMessage,
-	): Promise<CustomMessage> {
+		message: CustomMessage<T>,
+	): Promise<CustomMessage<T>> {
 		const data: PendingSemanticDeliveryData = {
 			v: 1,
 			kind,
@@ -8071,6 +8068,37 @@ export class AgentSession {
 		this.sessionManager.appendCustomEntry(SETTLED_SEMANTIC_DELIVERY_TYPE, { pendingId, outcome });
 	}
 
+	#pendingSemanticDeliveryId(message: CustomMessage): string {
+		const pendingId = readPendingSemanticDeliveryId(message.details);
+		if (!pendingId || !this.#pendingSemanticDeliveryIds.has(pendingId)) {
+			throw new Error("Pending semantic delivery lost its durable journal id");
+		}
+		return pendingId;
+	}
+
+	async #appendPendingSemanticDeliveryAsPlainMessage(message: CustomMessage, pendingId: string): Promise<void> {
+		this.agent.appendMessage(message);
+		await this.sessionManager.appendEntriesAtomically(() => {
+			this.sessionManager.appendCustomMessageEntry(
+				message.customType,
+				message.content,
+				message.display,
+				message.details,
+				message.attribution,
+			);
+			this.#appendPendingSemanticDeliverySettlement(pendingId, "delivered");
+		});
+		this.#pendingSemanticDeliveryIds.delete(pendingId);
+	}
+
+	async #cancelPendingSemanticDelivery(pendingId: string): Promise<void> {
+		if (!this.#pendingSemanticDeliveryIds.has(pendingId)) return;
+		await this.sessionManager.appendEntriesAtomically(() => {
+			this.#appendPendingSemanticDeliverySettlement(pendingId, "cancelled");
+		});
+		this.#pendingSemanticDeliveryIds.delete(pendingId);
+	}
+
 	async #cancelPendingSemanticDeliveries(): Promise<void> {
 		const pendingIds = [...this.#pendingSemanticDeliveryIds];
 		if (pendingIds.length === 0) return;
@@ -8181,13 +8209,7 @@ export class AgentSession {
 		else this.#assertPromptCanStart(lifecycleGeneration);
 		const details =
 			queueChipText !== undefined
-				? ({
-						...((message.details && typeof message.details === "object" ? message.details : {}) as Record<
-							string,
-							unknown
-						>),
-						__queueChipText: queueChipText,
-					} as T)
+				? withInternalDetailsField(message.details, "__queueChipText", queueChipText)
 				: message.details;
 		const appMessage: CustomMessage<T> = {
 			role: "custom",
@@ -8303,12 +8325,7 @@ export class AgentSession {
 		const normalizedPayload = normalizeCustomMessagePayload<T>(message);
 		const details =
 			options?.queueChipText && options.deliverAs !== "nextTurn"
-				? ({
-						...((normalizedPayload.details && typeof normalizedPayload.details === "object"
-							? normalizedPayload.details
-							: {}) as Record<string, unknown>),
-						__queueChipText: options.queueChipText,
-					} as T)
+				? withInternalDetailsField(normalizedPayload.details, "__queueChipText", options.queueChipText)
 				: normalizedPayload.details;
 		const appMessage: CustomMessage<T> = {
 			role: "custom",
@@ -8331,49 +8348,62 @@ export class AgentSession {
 				if (semanticMode === "interrupt" || semanticMode === "afterCurrent" || semanticMode === "auto") {
 					const busy = this.isStreaming;
 					const effectiveMode = semanticMode === "auto" ? (busy ? "afterCurrent" : "interrupt") : semanticMode;
+					let deliveryMessage = normalizedAppMessage;
+					let pendingId: string | undefined;
 					if (busy) {
-						if (effectiveMode === "afterCurrent") {
-							const queuedMessage = await this.#persistPendingSemanticDelivery("followUp", normalizedAppMessage);
+						const queuedMessage = await this.#persistPendingSemanticDelivery(
+							effectiveMode === "afterCurrent" ? "followUp" : "steer",
+							normalizedAppMessage,
+						);
+						if (this.isStreaming) {
 							this.#allowQueuedMessageDrainRetry();
-							this.agent.followUp(queuedMessage);
+							if (effectiveMode === "afterCurrent") {
+								this.agent.followUp(queuedMessage);
+								this.#scheduleIdleQueueDrain();
+								return { status: "accepted", delivery: "queued_follow_up" };
+							}
+							this.agent.steer(queuedMessage);
 							this.#scheduleIdleQueueDrain();
-							return { status: "accepted", delivery: "queued_follow_up" };
+							return { status: "accepted", delivery: "queued_steer" };
 						}
-						const queuedMessage = await this.#persistPendingSemanticDelivery("steer", normalizedAppMessage);
-						this.#allowQueuedMessageDrainRetry();
-						this.agent.steer(queuedMessage);
-						this.#scheduleIdleQueueDrain();
-						return { status: "accepted", delivery: "queued_steer" };
+						deliveryMessage = queuedMessage;
+						pendingId = this.#pendingSemanticDeliveryId(queuedMessage);
 					}
 					if (!options?.automaticTurnSource) {
-						this.agent.appendMessage(normalizedAppMessage);
-						this.sessionManager.appendCustomMessageEntry(
-							normalizedAppMessage.customType,
-							normalizedAppMessage.content,
-							normalizedAppMessage.display,
-							normalizedAppMessage.details,
-							normalizedAppMessage.attribution,
-						);
+						if (pendingId) {
+							await this.#appendPendingSemanticDeliveryAsPlainMessage(normalizedAppMessage, pendingId);
+						} else {
+							this.agent.appendMessage(normalizedAppMessage);
+							this.sessionManager.appendCustomMessageEntry(
+								normalizedAppMessage.customType,
+								normalizedAppMessage.content,
+								normalizedAppMessage.display,
+								normalizedAppMessage.details,
+								normalizedAppMessage.attribution,
+							);
+						}
 						return { status: "downgraded", delivery: "plain_append", reason: "unscoped_automatic_turn" };
 					}
 					if (this.#extensionRunner?.isHandlingEvent?.()) {
+						if (pendingId) await this.#cancelPendingSemanticDelivery(pendingId);
 						return { status: "unavailable", reason: "reentrant_extension_handler" };
 					}
 					if (this.#clientBridge?.deferAgentInitiatedTurns && !this.#allowAcpAgentInitiatedTurns) {
+						if (pendingId) await this.#cancelPendingSemanticDelivery(pendingId);
 						return { status: "unavailable", reason: "client_deferred_turn" };
 					}
 
 					const textContent =
-						typeof normalizedAppMessage.content === "string"
-							? normalizedAppMessage.content
-							: normalizedAppMessage.content
+						typeof deliveryMessage.content === "string"
+							? deliveryMessage.content
+							: deliveryMessage.content
 									.filter((content): content is TextContent => content.type === "text")
 									.map(content => content.text)
 									.join("");
 					const start = Promise.withResolvers<boolean>();
 					let providerStarted = false;
 					let startSettled = false;
-					const prompt = this.#promptWithMessage(normalizedAppMessage, textContent, {
+					const prompt = this.#promptWithMessage(deliveryMessage, textContent, {
 						automaticTurn: {
 							source: options.automaticTurnSource,
 							semanticDeliveryAcceptance: acceptance.settled,
@@ -8391,7 +8421,7 @@ export class AgentSession {
 									throw error;
 								}
 								providerStarted = true;
-								void this.#waitForMessageEndPersistence(normalizedAppMessage).then(
+								void this.#waitForMessageEndPersistence(deliveryMessage).then(
 									() => {
 										if (startSettled) return;
 										startSettled = true;
@@ -8426,17 +8456,31 @@ export class AgentSession {
 							});
 						},
 					);
-					return (await start.promise)
-						? { status: "accepted", delivery: "started_turn" }
-						: { status: "unavailable", reason: "prompt_preflight_cancelled" };
+					try {
+						const started = await start.promise;
+						if (!started && pendingId) await this.#cancelPendingSemanticDelivery(pendingId);
+						return started
+							? { status: "accepted", delivery: "started_turn" }
+							: { status: "unavailable", reason: "prompt_preflight_cancelled" };
+					} catch (error) {
+						if (!providerStarted && pendingId) await this.#cancelPendingSemanticDelivery(pendingId);
+						throw error;
+					}
 				}
 				if (semanticMode === "steer") {
 					if (this.isStreaming) {
 						const queuedMessage = await this.#persistPendingSemanticDelivery("steer", normalizedAppMessage);
-						this.#allowQueuedMessageDrainRetry();
-						this.agent.steer(queuedMessage);
-						this.#scheduleIdleQueueDrain();
-						return { status: "accepted", delivery: "queued_steer" };
+						if (this.isStreaming) {
+							this.#allowQueuedMessageDrainRetry();
+							this.agent.steer(queuedMessage);
+							this.#scheduleIdleQueueDrain();
+							return { status: "accepted", delivery: "queued_steer" };
+						}
+						await this.#appendPendingSemanticDeliveryAsPlainMessage(
+							normalizedAppMessage,
+							this.#pendingSemanticDeliveryId(queuedMessage),
+						);
+						return { status: "accepted", delivery: "plain_append" };
 					}
 					this.agent.appendMessage(normalizedAppMessage);
 					this.sessionManager.appendCustomMessageEntry(
