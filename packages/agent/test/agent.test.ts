@@ -1,6 +1,13 @@
 import { describe, expect, it } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
-import { Agent, AgentBusyError, type AgentEvent, type AgentTool, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import {
+	Agent,
+	AgentBusyError,
+	type AgentEvent,
+	type AgentMessage,
+	type AgentTool,
+	ThinkingLevel,
+} from "@oh-my-pi/pi-agent-core";
 import type { SimpleStreamOptions, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { kCursorExecResolved } from "@oh-my-pi/pi-ai/utils/block-symbols";
@@ -18,6 +25,77 @@ describe("Agent", () => {
 		expect(agent.state.messages).not.toContainEqual(message);
 	});
 
+	it("runs input hooks for provider-visible direct appends", () => {
+		const agent = new Agent();
+		const accepted: string[] = [];
+		agent.addBeforeInputHook(messages => {
+			accepted.push(...messages.map(message => message.role));
+		});
+
+		agent.appendMessage({
+			role: "developer",
+			content: [{ type: "text", text: "User-edited todo state" }],
+			attribution: "user",
+			timestamp: Date.now(),
+		});
+		agent.appendMessage(createAssistantMessage([{ type: "text", text: "model output" }]));
+		agent.appendMessage({
+			role: "toolResult",
+			toolCallId: "call-1",
+			toolName: "read",
+			content: [{ type: "text", text: "repository output" }],
+			isError: false,
+			timestamp: Date.now(),
+		});
+		agent.appendMessage({
+			role: "bashExecution",
+			command: "printf provider-visible",
+			output: "provider-visible",
+			exitCode: 0,
+			timestamp: Date.now(),
+		} as unknown as AgentMessage);
+		agent.appendMessage({
+			role: "pythonExecution",
+			code: "print('provider-visible')",
+			output: "provider-visible",
+			exitCode: 0,
+			timestamp: Date.now(),
+		} as unknown as AgentMessage);
+
+		expect(accepted).toEqual(["developer", "assistant", "toolResult", "bashExecution", "pythonExecution"]);
+	});
+	it("runs input hooks before bulk replacement", () => {
+		const agent = new Agent();
+		const accepted: string[] = [];
+		const removeHook = agent.addBeforeInputHook(messages => {
+			expect(agent.state.messages).toHaveLength(0);
+			accepted.push(...messages.map(message => message.role));
+		});
+		const replacement = [
+			{ role: "user", content: "replacement", timestamp: Date.now() },
+			{
+				role: "bashExecution",
+				command: "printf replacement",
+				output: "replacement",
+				exitCode: 0,
+				timestamp: Date.now(),
+			},
+		] as unknown as AgentMessage[];
+
+		agent.replaceMessages(replacement);
+
+		expect(accepted).toEqual(["user", "bashExecution"]);
+		expect(agent.state.messages).not.toBe(replacement);
+		expect(agent.state.messages).toEqual(replacement);
+		removeHook();
+		agent.addBeforeInputHook(() => {
+			throw new Error("replacement rejected");
+		});
+		expect(() => agent.replaceMessages([{ role: "user", content: "rejected", timestamp: Date.now() }])).toThrow(
+			"replacement rejected",
+		);
+		expect(agent.state.messages).toEqual(replacement);
+	});
 	it("classifies agent-authored steering as a parent steering message", async () => {
 		const toolSchema = type({ value: type("string") });
 		const executed: string[] = [];

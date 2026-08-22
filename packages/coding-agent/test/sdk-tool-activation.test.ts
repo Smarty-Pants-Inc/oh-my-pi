@@ -206,7 +206,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			await session.setModel(fable);
 			expect(session.getToolByName("think")).toBeDefined();
 			expect(session.getActiveToolNames()).toContain("think");
-			expect(session.systemPrompt.join("\n")).toContain("private scratchpad; not shown to user");
+			expect(session.systemPrompt.join("\n")).toContain("`think` is a private scratchpad; not shown to user.");
 
 			await session.setModel(responses);
 			expect(session.getActiveToolNames()).toContain("think");
@@ -217,7 +217,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 
 			await session.setModel(unsupported);
 			expect(session.getActiveToolNames()).not.toContain("think");
-			expect(session.systemPrompt.join("\n")).not.toContain("private scratchpad; not shown to user");
+			expect(session.systemPrompt.join("\n")).not.toContain("`think` is a private scratchpad; not shown to user.");
 		} finally {
 			await session.dispose();
 		}
@@ -1573,6 +1573,72 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		}
 	});
 
+	it("activates the late built-in goal for an unrestricted explicit SDK tool list", async () => {
+		const tempDir = makeTempDir();
+		const { session } = await createAgentSession({
+			...baseOptions(tempDir),
+			settings: Settings.isolated({ "goal.enabled": true }),
+			toolNames: ["read"],
+		});
+
+		try {
+			expect(session.getToolByName("goal")).toBeDefined();
+			expect(session.getActiveToolNames()).toContain("goal");
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("activates goal when an extension replaces an explicitly requested built-in", async () => {
+		const tempDir = makeTempDir();
+		const replaceReadExtension: ExtensionFactory = pi => {
+			pi.registerTool({
+				name: "read",
+				label: "Extension Read",
+				description: "Extension replacement for the built-in read tool.",
+				parameters: type({}),
+				async execute() {
+					return { content: [{ type: "text", text: "extension read" }] };
+				},
+			});
+		};
+		const { session } = await createAgentSession({
+			...baseOptions(tempDir),
+			settings: Settings.isolated({ "goal.enabled": true }),
+			extensions: [replaceReadExtension],
+			toolNames: ["read"],
+		});
+
+		try {
+			expect(session.getToolByName("read")?.label).toBe("Extension Read");
+			expect(session.getActiveToolNames()).toEqual(expect.arrayContaining(["read", "goal"]));
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	for (const testCase of [
+		{ label: "an explicit empty list", toolNames: [] },
+		{ label: "the internal no-tools sentinel", toolNames: ["__none__"] },
+		{ label: "an invalid-only list", toolNames: ["not_a_registered_tool"] },
+	]) {
+		it(`does not activate goal for ${testCase.label}`, async () => {
+			const tempDir = makeTempDir();
+			const { session } = await createAgentSession({
+				...baseOptions(tempDir),
+				settings: Settings.isolated({ "goal.enabled": true }),
+				toolNames: testCase.toolNames,
+			});
+
+			try {
+				expect(session.getToolByName("goal")).toBeDefined();
+				expect(session.getActiveToolNames()).not.toContain("goal");
+			} finally {
+				await session.dispose();
+			}
+		});
+	}
+
 	it("normalizes legacy builtin toolNames before selecting the active SDK tools", async () => {
 		const tempDir = makeTempDir();
 
@@ -2004,13 +2070,14 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		}
 	});
 
-	// A session created on another provider keeps its configured-mode `edit` in
-	// the registry (only a Cursor-created session moves it out) and the tool
-	// roster is built once, at creation — switching to Cursor later does not
-	// rebuild it. These two cover both directions of that wiring: the granted
-	// session must still reach a replace-mode instance for `pi_edit` (whose
-	// `old_string`/`new_string` args do not validate against the default `hashline`
-	// schema), and the restricted one must still be refused.
+	// Hashline `edit` stays in the registry on Cursor so the model can still
+	// call it as MCP. Native StrReplace arrives as `editToolCall` and is
+	// materialized via exec read/write; `pi_edit` still uses the replace-mode
+	// instance from `getEditReplaceTool`. The roster is built once at creation.
+	// These two cover both directions of that wiring: the granted session must
+	// still reach a replace-mode instance for `pi_edit` (whose `old_string` /
+	// `new_string` args do not validate against the default `hashline` schema),
+	// and the restricted one must still be refused.
 	//
 	// The handlers are internal to the session; `streamFn` is where they are
 	// handed to the provider, which is the externally observable seam.
@@ -2065,6 +2132,24 @@ describe("createAgentSession defaultInactive tool activation", () => {
 
 				expect(result.isError).toBeFalsy();
 				expect(fs.readFileSync(target, "utf8")).toBe("alpha\ngamma\n");
+			} finally {
+				await session.dispose();
+			}
+		});
+	});
+
+	it("keeps hashline edit advertised when the session starts on Cursor", async () => {
+		const tempDir = makeTempDir();
+		const cursorModel = getBundledModel("cursor", "composer-1.5");
+		if (!cursorModel) throw new Error("expected bundled Cursor model");
+
+		await withProviderAuth(["cursor"], async () => {
+			const { session } = await createAgentSession({
+				...baseOptions(tempDir),
+				model: cursorModel,
+			});
+			try {
+				expect(session.getActiveToolNames()).toContain("edit");
 			} finally {
 				await session.dispose();
 			}

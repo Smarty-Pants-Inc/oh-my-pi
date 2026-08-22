@@ -24,6 +24,7 @@ import {
 	type Usage,
 	withAuth,
 } from "@oh-my-pi/pi-ai";
+import type { Dialect } from "@oh-my-pi/pi-ai/dialect";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { createOpenAICodexCompactionRequestContext } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import { convertTools } from "@oh-my-pi/pi-ai/providers/openai-responses";
@@ -31,11 +32,11 @@ import { buildResponsesInput, resolveOpenAICompatPolicy } from "@oh-my-pi/pi-ai/
 import { stripOpenAIResponsesOutputOnlyStatusesForReplay } from "@oh-my-pi/pi-ai/utils";
 import { preferredDialect } from "@oh-my-pi/pi-catalog/identity";
 import { clampThinkingLevelForModel } from "@oh-my-pi/pi-catalog/model-thinking";
-import { isRecord, logger, prompt, stringifyJson } from "@oh-my-pi/pi-utils";
+import { isRecord, logger, prompt } from "@oh-my-pi/pi-utils";
 import * as snapcompact from "@oh-my-pi/snapcompact";
 import { type AgentTelemetry, instrumentedCompleteSimple } from "../telemetry";
 import { ThinkingLevel } from "../thinking";
-import { countTokens } from "../tokenizer";
+import { Tokenizer } from "../tokenizer";
 import type { AgentMessage } from "../types";
 import {
 	buildCompactionV2Request,
@@ -47,7 +48,6 @@ import {
 } from "./compaction-v2-streaming";
 import type { CompactionEntry, SessionEntry } from "./entries";
 import { NativeCompactionError } from "./errors";
-import { isEstimateCacheable, readEstimateCache, writeEstimateCache } from "./message-cache";
 import {
 	type ConvertToLlm,
 	collectCompactionContextInstructions,
@@ -76,6 +76,7 @@ import {
 	compactionInstructionContext,
 	computeFileLists,
 	createFileOps,
+	escapeSummaryBoundaryTags,
 	extractFileOpsFromMessage,
 	type FileOperations,
 	SUMMARIZATION_SYSTEM_PROMPT,
@@ -396,144 +397,17 @@ export function resolveThresholdTokens(contextWindow: number, settings: Compacti
 // Cut point detection
 // ============================================================================
 
-/**
- * Image content has no tokenizer representation; charge a fixed estimate
- * matching what providers typically bill for inline images.
- */
-const IMAGE_TOKEN_ESTIMATE = 1200;
-
-/**
- * Estimate token count for a message using cl100k_base via the native
- * tokenizer. This is not Claude's first-party tokenizer (Anthropic doesn't
- * publish one) but is within ~5–10% across English/code text.
- *
- * `excludeEncryptedReasoning` drops opaque provider reasoning payloads
- * (`thinkingSignature`, `redactedThinking`) from the estimate. Those are billed
- * by the provider on replay, so the default counts them — but their *local*
- * byte size can diverge wildly from what the provider charges, so the
- * compaction floor (which only needs the reliably-countable, on-wire-compressible
- * content) excludes them to avoid false triggers on thinking-heavy turns.
- */
-export function estimateTokens(message: AgentMessage, options?: { excludeEncryptedReasoning?: boolean }): number {
-	// Settled historical messages are counted once and reused until an owner
-	// (prune/shake/strip-images) invalidates them; streaming assistants bypass
-	// the cache entirely (see message-cache.ts settle-gate invariant).
-	const cacheable = isEstimateCacheable(message);
-	const excludeEncryptedReasoning = options?.excludeEncryptedReasoning === true;
-	if (cacheable) {
-		const cached = readEstimateCache(message, excludeEncryptedReasoning);
-		if (cached !== undefined) return cached;
-	}
-	const result = computeMessageTokens(message, options);
-	if (cacheable) writeEstimateCache(message, excludeEncryptedReasoning, result);
-	return result;
-}
-
-function computeMessageTokens(message: AgentMessage, options?: { excludeEncryptedReasoning?: boolean }): number {
-	const fragments: string[] = [];
-	let extra = 0;
-	if ((message as { role?: string }).role === "bashExecution") {
-		const bash = message as { command?: unknown; output?: unknown };
-		if (typeof bash.command === "string") fragments.push(bash.command);
-		if (typeof bash.output === "string") fragments.push(bash.output);
-		return fragments.length === 0 ? 0 : countTokens(fragments);
-	}
-
-	switch (message.role) {
-		case "user": {
-			const content = (message as { content: string | Array<{ type: string; text?: string }> }).content;
-			if (typeof content === "string") {
-				fragments.push(content);
-			} else if (Array.isArray(content)) {
-				for (const block of content) {
-					if (block.type === "text" && block.text) {
-						fragments.push(block.text);
-					}
-				}
-			}
-			break;
-		}
-		case "assistant": {
-			const assistant = message as AssistantMessage;
-			for (const block of assistant.content) {
-				if (block.type === "text") {
-					fragments.push(block.text);
-				} else if (block.type === "thinking") {
-					fragments.push(block.thinking);
-					// Providers charge for the opaque signature/reasoning payload that
-					// rides alongside the thinking text (OpenAI Responses encrypted
-					// reasoning items, Anthropic signed thinking blocks, etc.). Without
-					// counting it, this estimator can read ~half of the provider-reported
-					// usage on thinking-heavy turns — see #2275 for the resulting
-					// compaction-trigger / post-check metric divergence. The compaction
-					// floor excludes it (its local byte size diverges from provider billing).
-					if (block.thinkingSignature && !options?.excludeEncryptedReasoning) {
-						fragments.push(block.thinkingSignature);
-					}
-				} else if (block.type === "toolCall") {
-					fragments.push(block.name);
-					fragments.push(stringifyJson(block.arguments) ?? "null");
-				} else if (block.type === "redactedThinking") {
-					// Encrypted reasoning blob the provider still bills for on replay;
-					// excluded from the compaction floor for the same reason as above.
-					if (!options?.excludeEncryptedReasoning) fragments.push(block.data);
-				} else if (block.type === "anthropicServerTool") {
-					// Native Anthropic server-tool call/result replayed verbatim on the
-					// wire (server_tool_use input and opaque result content). This opaque
-					// provider-replay state the provider still
-					// bills for on same-provider replay; excluded from the compaction
-					// floor like other encrypted reasoning because its local byte size
-					// diverges from provider billing.
-					if (!options?.excludeEncryptedReasoning) fragments.push(stringifyJson(block.block) ?? "null");
-				}
-			}
-			break;
-		}
-		case "hookMessage":
-		case "toolResult": {
-			if (typeof message.content === "string") {
-				fragments.push(message.content);
-			} else {
-				for (const block of message.content) {
-					if (block.type === "text" && block.text) {
-						fragments.push(block.text);
-					} else if (block.type === "image") {
-						extra += IMAGE_TOKEN_ESTIMATE;
-					}
-				}
-			}
-			break;
-		}
-		case "branchSummary":
-		case "compactionSummary": {
-			fragments.push(message.summary);
-			if (message.role === "compactionSummary") {
-				if (message.blocks) {
-					for (const block of message.blocks) {
-						if (block.type === "text") fragments.push(block.text);
-						else extra += snapcompact.FRAME_TOKEN_ESTIMATE;
-					}
-				} else if (message.images) {
-					// Snapcompact frames render at ≥1568px; providers bill the downscaled cap.
-					extra += message.images.length * snapcompact.FRAME_TOKEN_ESTIMATE;
-				}
-			}
-			break;
-		}
-		default:
-			return 0;
-	}
-
-	if (fragments.length === 0) return extra;
-	return extra + countTokens(fragments);
-}
-
-function estimateEntriesTokens(entries: SessionEntry[], startIndex: number, endIndex: number): number {
+function estimateEntriesTokens(
+	entries: SessionEntry[],
+	tokenizer: Tokenizer,
+	startIndex: number,
+	endIndex: number,
+): number {
 	let total = 0;
 	for (let i = startIndex; i < endIndex; i++) {
 		const msg = getMessageFromEntry(entries[i]);
 		if (msg) {
-			total += estimateTokens(msg);
+			total += tokenizer.countMessage(msg);
 		}
 	}
 	return total;
@@ -632,6 +506,7 @@ export interface CutPointResult {
  */
 export function findCutPoint(
 	entries: SessionEntry[],
+	tokenizer: Tokenizer,
 	startIndex: number,
 	endIndex: number,
 	keepRecentTokens: number,
@@ -651,7 +526,7 @@ export function findCutPoint(
 		if (entry.type !== "message") continue;
 
 		// Estimate this message's size
-		const messageTokens = estimateTokens(entry.message);
+		const messageTokens = tokenizer.countMessage(entry.message);
 		accumulatedTokens += messageTokens;
 
 		// Check if we've exceeded the budget
@@ -897,11 +772,33 @@ function createSnapcompactArchiveMigrationMessage(archiveText: string): Message 
 	};
 }
 
-const DEFAULT_SUMMARY_CONTEXT_WINDOW = 200_000;
-const SUMMARY_CONTEXT_HEADROOM_TOKENS = 4_096;
-const SUMMARY_INITIAL_BYTES_PER_TOKEN = 2;
+/**
+ * Fallback window for a model whose catalog entry carries no usable context
+ * window; matches the smallest window any compaction-capable model ships with.
+ */
+const DEFAULT_SUMMARY_INPUT_WINDOW = 200_000;
+
+/**
+ * Floor for one message-boundary summarization window, so a tiny model still
+ * makes progress. Byte fallback can go lower because it is the last recovery
+ * path for a single oversized serialized message.
+ */
+const MIN_SUMMARY_INPUT_TOKENS = 16_384;
+const MIN_SUMMARY_FALLBACK_BYTES = 1_024;
 const SUMMARY_CONTEXT_OVERFLOW_PATTERN =
 	/prompt is too long|input is too long|exceeds the context window|maximum context length|too many tokens|token limit exceeded|context[_ ]length[_ ]exceeded|request_too_large/i;
+
+/** Smallest message-boundary window worth planning for `model`. */
+function minSummaryInputTokens(model: Model): number {
+	const window = model.contextWindow && model.contextWindow > 0 ? model.contextWindow : DEFAULT_SUMMARY_INPUT_WINDOW;
+	return Math.min(MIN_SUMMARY_INPUT_TOKENS, Math.max(MIN_SUMMARY_FALLBACK_BYTES, Math.floor(window / 8)));
+}
+
+/** Usable conversation input for one summarization call. */
+function summaryInputBudgetTokens(model: Model, maxTokens: number): number {
+	const window = model.contextWindow && model.contextWindow > 0 ? model.contextWindow : DEFAULT_SUMMARY_INPUT_WINDOW;
+	return Math.max(minSummaryInputTokens(model), Math.floor(window * 0.8) - maxTokens - MAX_SUMMARY_TOKENS);
+}
 
 function buildSummaryPrompt(
 	conversationText: string,
@@ -911,7 +808,7 @@ function buildSummaryPrompt(
 ): string {
 	let promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
 	if (previousSummary) {
-		promptText += `<previous-summary>\n${previousSummary}\n</previous-summary>\n\n`;
+		promptText += `<previous-summary>\n${escapeSummaryBoundaryTags(previousSummary)}\n</previous-summary>\n\n`;
 	}
 	promptText += formatAdditionalContext(extraContext);
 	promptText += basePrompt;
@@ -952,10 +849,56 @@ function findUtf8ChunkEnd(text: string, start: number, maxBytes: number): number
 	}
 	if (best === text.length) return best;
 
-	// Prefer a transcript boundary when one is reasonably close to the byte limit.
+	// Prefer a readable transcript boundary when one is reasonably close.
 	const boundary = text.lastIndexOf("\n\n", best - 2);
 	if (boundary >= start + Math.floor((best - start) / 2)) return boundary + 2;
 	return best;
+}
+
+type SummaryWindow = { messages: Message[]; budgetTokens: number; text?: string } | { text: string; maxBytes: number };
+
+/** Partition a conversation on message boundaries before using byte fallback. */
+function planSummaryWindows(
+	messages: Message[],
+	tokenizer: Tokenizer,
+	dialect: Dialect | undefined,
+	budgetTokens: number,
+): Message[][] {
+	const windows: Message[][] = [];
+	let current: Message[] = [];
+	let currentTokens = 0;
+	for (const message of messages) {
+		const tokens = tokenizer.countTokens(serializeConversationForSummary([message], dialect));
+		if (currentTokens > 0 && currentTokens + tokens > budgetTokens) {
+			windows.push(current);
+			current = [];
+			currentTokens = 0;
+		}
+		current.push(message);
+		currentTokens += tokens;
+	}
+	if (current.length > 0) windows.push(current);
+	return windows;
+}
+
+/** Split one unsplittable serialized message without dropping any bytes. */
+function planUtf8SummaryWindows(text: string, maxBytes: number): SummaryWindow[] {
+	const windows: SummaryWindow[] = [];
+	let offset = 0;
+	while (offset < text.length) {
+		const end = findUtf8ChunkEnd(text, offset, maxBytes);
+		if (end <= offset) throw new Error("Compaction summary byte fallback could not fit one character");
+		windows.push({ text: text.slice(offset, end), maxBytes });
+		offset = end;
+	}
+	return windows;
+}
+
+function isSummaryContextOverflow(error: unknown): boolean {
+	return (
+		AIError.is(AIError.classify(error), AIError.Flag.ContextOverflow) ||
+		(error instanceof Error && SUMMARY_CONTEXT_OVERFLOW_PATTERN.test(error.message))
+	);
 }
 
 async function requestSummary(
@@ -1030,74 +973,74 @@ export async function generateSummary(
 	options?: SummaryOptions,
 ): Promise<string> {
 	const maxTokens = Math.min(Math.floor(0.8 * reserveTokens), MAX_SUMMARY_TOKENS);
-	const contextWindow = model.contextWindow ?? DEFAULT_SUMMARY_CONTEXT_WINDOW;
-	const headroom = Math.min(SUMMARY_CONTEXT_HEADROOM_TOKENS, Math.floor(contextWindow * 0.05));
-	const inputBudgetTokens = contextWindow - maxTokens - headroom;
-	const systemPromptBytes = Buffer.byteLength(SUMMARIZATION_SYSTEM_PROMPT, "utf8");
-
 	const llmMessages = (options?.convertToLlm ?? defaultConvertToLlm)(currentMessages);
-	const conversationText = serializeConversationForSummary(llmMessages, preferredDialect(model.id));
-	let summary = previousSummary;
-	let offset = 0;
-	let bytesPerToken = SUMMARY_INITIAL_BYTES_PER_TOKEN;
+	const dialect = preferredDialect(model.id);
+	const tokenizer = new Tokenizer(model);
+	const wholeConversation = serializeConversationForSummary(llmMessages, dialect);
+	const budgetTokens = summaryInputBudgetTokens(model, maxTokens);
+	const pending: SummaryWindow[] = tokenizer.checkTokenBudget(wholeConversation, budgetTokens).fits
+		? [{ messages: llmMessages, budgetTokens, text: wholeConversation }]
+		: planSummaryWindows(llmMessages, tokenizer, dialect, budgetTokens).map(messages => ({
+				messages,
+				budgetTokens,
+			}));
 
-	do {
-		let end = offset;
-		for (;;) {
-			const basePrompt = resolveSummaryPrompt(summary, customInstructions, options);
-			const emptyPrompt = buildSummaryPrompt("", summary, basePrompt, options?.extraContext);
-			const promptBudgetBytes = inputBudgetTokens * bytesPerToken - systemPromptBytes;
-			const availableConversationBytes = promptBudgetBytes - Buffer.byteLength(emptyPrompt, "utf8");
-			if (availableConversationBytes <= 0) {
-				throw new Error(`Compaction summary prompt leaves no input room in ${contextWindow}-token model context`);
-			}
-
-			end =
-				conversationText.length === 0 ? 0 : findUtf8ChunkEnd(conversationText, offset, availableConversationBytes);
-			if (conversationText.length > 0 && end <= offset) {
-				throw new Error(`Compaction summary could not fit one character in ${contextWindow}-token model context`);
-			}
-
-			const promptText = buildSummaryPrompt(
-				conversationText.slice(offset, end),
-				summary,
-				basePrompt,
-				options?.extraContext,
+	let carriedSummary = previousSummary;
+	while (pending.length > 0) {
+		const window = pending[0];
+		const text =
+			"messages" in window
+				? (window.text ?? serializeConversationForSummary(window.messages, dialect))
+				: window.text;
+		try {
+			const basePrompt = resolveSummaryPrompt(carriedSummary, customInstructions, options);
+			const promptText = buildSummaryPrompt(text, carriedSummary, basePrompt, options?.extraContext);
+			const update = carriedSummary !== undefined;
+			carriedSummary = await requestSummary(
+				promptText,
+				update
+					? "agent.compaction.prompts.compaction-update-summary"
+					: "agent.compaction.prompts.compaction-summary",
+				update
+					? "packages/agent/src/compaction/prompts/compaction-update-summary.md"
+					: "packages/agent/src/compaction/prompts/compaction-summary.md",
+				model,
+				maxTokens,
+				apiKey,
+				signal,
+				options,
 			);
-			try {
-				const update = summary !== undefined;
-				summary = await requestSummary(
-					promptText,
-					update
-						? "agent.compaction.prompts.compaction-update-summary"
-						: "agent.compaction.prompts.compaction-summary",
-					update
-						? "packages/agent/src/compaction/prompts/compaction-update-summary.md"
-						: "packages/agent/src/compaction/prompts/compaction-summary.md",
-					model,
-					maxTokens,
-					apiKey,
-					signal,
-					options,
-				);
-				break;
-			} catch (error) {
-				if (bytesPerToken > 1 && error instanceof Error && SUMMARY_CONTEXT_OVERFLOW_PATTERN.test(error.message)) {
-					// Most code/transcript text averages at least two UTF-8 bytes per token.
-					// If a denser provider tokenizer rejects that estimate, retry this and
-					// every remaining chunk at the hard-safe one-byte-per-token bound.
-					bytesPerToken = 1;
+		} catch (error) {
+			if (!isSummaryContextOverflow(error)) throw error;
+
+			if ("messages" in window) {
+				if (window.messages.length === 1) {
+					pending.splice(0, 1, ...planUtf8SummaryWindows(text, window.budgetTokens));
 					continue;
 				}
-				throw error;
+				const sentTokens = tokenizer.countTokens(text, "strict");
+				const halved = Math.floor(Math.min(window.budgetTokens, sentTokens) / 2);
+				if (halved < minSummaryInputTokens(model)) throw error;
+				pending.splice(
+					0,
+					1,
+					...planSummaryWindows(window.messages, tokenizer, dialect, halved).map(messages => ({
+						messages,
+						budgetTokens: halved,
+					})),
+				);
+				continue;
 			}
+
+			const halved = Math.floor(window.maxBytes / 2);
+			if (halved < MIN_SUMMARY_FALLBACK_BYTES) throw error;
+			pending.splice(0, 1, ...planUtf8SummaryWindows(text, halved));
+			continue;
 		}
+		pending.shift();
+	}
 
-		if (conversationText.length === 0) break;
-		offset = end;
-	} while (offset < conversationText.length);
-
-	return summary ?? "";
+	return carriedSummary ?? "";
 }
 
 // ============================================================================
@@ -1259,7 +1202,7 @@ async function generateShortSummary(
 
 	let promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
 	if (historySummary) {
-		promptText += `<previous-summary>\n${historySummary}\n</previous-summary>\n\n`;
+		promptText += `<previous-summary>\n${escapeSummaryBoundaryTags(historySummary)}\n</previous-summary>\n\n`;
 	}
 	promptText += formatAdditionalContext(options?.extraContext);
 	promptText += SHORT_SUMMARY_PROMPT;
@@ -1360,7 +1303,7 @@ export interface CompactionPreparation {
  * let the active model replay it, so keying reuse on "any candidate shares the
  * provider" left a provider-switched session permanently context-less (#6343).
  */
-function remotePreserveReusable(
+export function remotePreserveReusable(
 	preserveData: Record<string, unknown> | undefined,
 	activeModel: Model,
 	settings: CompactionSettings,
@@ -1373,38 +1316,75 @@ function remotePreserveReusable(
 	return v2Ok || shouldUseOpenAiRemoteCompaction(activeModel);
 }
 
+/**
+ * Index of the newest compaction entry the active model can actually read, or
+ * `-1` when none can.
+ *
+ * A provider-native remote compaction (V2 or V1) stores an opaque replay payload
+ * and only a placeholder summary, so for any OTHER provider that entry
+ * summarizes nothing and the history behind it is still live context. Callers
+ * must therefore treat it as absent: `prepareCompaction` re-expands past it and
+ * summarizes those messages locally, and the maintenance ops that use the
+ * compaction boundary to skip "already summarized away" entries must not skip
+ * entries that no summary covers.
+ */
+export function findReadableCompactionIndex(
+	pathEntries: SessionEntry[],
+	settings: CompactionSettings,
+	activeModel?: Model,
+): number {
+	for (let i = pathEntries.length - 1; i >= 0; i--) {
+		if (pathEntries[i].type !== "compaction") continue;
+		const entry = pathEntries[i] as CompactionEntry;
+		if (activeModel && !remotePreserveReusable(entry.preserveData, activeModel, settings)) continue;
+		return i;
+	}
+	return -1;
+}
+
+/**
+ * Pass the caller's warm `tokenizer` (the Agent's for the active model) so the
+ * full-branch estimate walk hits its memo; the cold default is for one-shot
+ * callers that have no live agent.
+ */
 export function prepareCompaction(
 	pathEntries: SessionEntry[],
 	settings: CompactionSettings,
 	activeModel?: Model,
+	tokenizer: Tokenizer = new Tokenizer(activeModel),
 ): CompactionPreparation | undefined {
 	if (pathEntries.length > 0 && pathEntries[pathEntries.length - 1].type === "compaction") {
 		return undefined;
 	}
 
-	let prevCompactionIndex = -1;
-	for (let i = pathEntries.length - 1; i >= 0; i--) {
-		if (pathEntries[i].type !== "compaction") continue;
-		// Skip a prior remote compaction (V2 or V1) whose provider-native replay the
-		// active model cannot read: its summary is only an opaque placeholder, so
-		// re-expand its original messages and summarize them locally rather than
-		// stranding that history. compact() still reuses the payload when the active
-		// model can replay it (same provider, remote enabled).
-		const entry = pathEntries[i] as CompactionEntry;
-		if (activeModel && !remotePreserveReusable(entry.preserveData, activeModel, settings)) {
-			continue;
+	let prevCompactionIndex = findReadableCompactionIndex(pathEntries, settings, activeModel);
+
+	// Honor the latest `/clear` reset boundary. `/clear` records a
+	// `reset_boundary` marker and reports the model context empty, so compaction
+	// must not resurrect the dropped pre-clear turns into its summary — matching
+	// how buildSessionContext starts the model-context rebuild after the boundary.
+	// A boundary after the last reusable compaction supersedes it: the pre-reset
+	// summary was cleared too, so drop the previous-compaction reuse and start
+	// fresh after the boundary. A boundary at or before that compaction is already
+	// superseded by it, so only scan newer entries.
+	let resetBoundaryIndex = -1;
+	for (let i = pathEntries.length - 1; i > prevCompactionIndex; i--) {
+		if (pathEntries[i].type === "reset_boundary") {
+			resetBoundaryIndex = i;
+			break;
 		}
-		prevCompactionIndex = i;
-		break;
 	}
-	const boundaryStart = prevCompactionIndex + 1;
+	if (resetBoundaryIndex > prevCompactionIndex) {
+		prevCompactionIndex = -1;
+	}
+	const boundaryStart = Math.max(prevCompactionIndex, resetBoundaryIndex) + 1;
 	const boundaryEnd = pathEntries.length;
 
 	const lastUsage = getLastAssistantUsage(pathEntries);
 	const tokensBefore = lastUsage ? calculateContextTokens(lastUsage) : 0;
 	let keepRecentTokens = settings.keepRecentTokens;
 	if (lastUsage) {
-		const estimatedTokens = estimateEntriesTokens(pathEntries, boundaryStart, boundaryEnd);
+		const estimatedTokens = estimateEntriesTokens(pathEntries, tokenizer, boundaryStart, boundaryEnd);
 		const promptTokens = calculatePromptTokens(lastUsage);
 		const ratio = estimatedTokens > 0 ? promptTokens / estimatedTokens : 0;
 		if (Number.isFinite(ratio) && ratio > 1) {
@@ -1412,7 +1392,7 @@ export function prepareCompaction(
 		}
 	}
 
-	const cutPoint = findCutPoint(pathEntries, boundaryStart, boundaryEnd, keepRecentTokens);
+	const cutPoint = findCutPoint(pathEntries, tokenizer, boundaryStart, boundaryEnd, keepRecentTokens);
 
 	// Get ID of first kept entry
 	const firstKeptEntry = pathEntries[cutPoint.firstKeptEntryIndex];
@@ -1652,6 +1632,7 @@ export async function compact(
 					: undefined;
 				const trimmed = trimRemoteCompactionInputToContextWindow(
 					remoteHistory,
+					new Tokenizer(model),
 					model.contextWindow,
 					instructions,
 					tools,

@@ -70,7 +70,9 @@ async function writePolicyState(checkout: string, home: string): Promise<void> {
 		});
 		process.stdout.write(JSON.stringify(release));
 	`;
-	const result = await run([bun, "-e", script], checkout, {
+	const scriptPath = path.join(home, "build-context-release-manifest.ts");
+	await Bun.write(scriptPath, script);
+	const result = await run([bun, scriptPath], checkout, {
 		...Bun.env,
 		HOME: home,
 		USERPROFILE: home,

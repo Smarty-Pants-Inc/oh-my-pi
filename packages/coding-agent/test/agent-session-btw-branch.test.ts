@@ -12,6 +12,7 @@ import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import type { GoalModeState } from "@oh-my-pi/pi-coding-agent/goals/state";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AsyncResultEntry } from "@oh-my-pi/pi-coding-agent/session/async-job-delivery";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -441,6 +442,20 @@ describe("AgentSession.branchFromBtw", () => {
 			advisorResumed = true;
 		});
 		const advisorReset = vi.spyOn(SessionAdvisors.prototype, "resetSessionState");
+		const terminalGoalState: GoalModeState = {
+			enabled: false,
+			mode: "exiting",
+			reason: "completed",
+			goal: {
+				id: "retained-terminal-goal",
+				objective: "Preserve pending advisor work across rollback",
+				status: "complete",
+				tokensUsed: 7,
+				timeUsedSeconds: 3,
+				createdAt: 1,
+				updatedAt: 2,
+			},
+		};
 		let activeSession: AgentSession;
 		let replacementSessionFile: string | undefined;
 		let rollbackAtDispatch:
@@ -454,6 +469,8 @@ describe("AgentSession.branchFromBtw", () => {
 					followUp: AgentMessage[];
 					checkpoint: unknown;
 					advisorStats: StableAdvisorStats;
+					goalModeState: GoalModeState | undefined;
+					terminalGoalHistoryEntry: unknown;
 					advisorYieldQueued: boolean;
 					receiptSettled: boolean;
 					advisorPaused: boolean;
@@ -473,6 +490,7 @@ describe("AgentSession.branchFromBtw", () => {
 					if (event.type === "session_branch") {
 						phases.push("branch");
 						expect(activeSession.yieldQueue.has("advisor")).toBe(false);
+						expect(activeSession.getGoalModeState()).toBeUndefined();
 						expect(activeSession.agent.peekSteeringQueue()).toEqual([]);
 						replacementSessionFile = activeSession.sessionFile;
 						throw failure;
@@ -491,6 +509,10 @@ describe("AgentSession.branchFromBtw", () => {
 							followUp: [...activeSession.agent.peekFollowUpQueue()],
 							checkpoint: activeSession.getCheckpointState(),
 							advisorStats: stableAdvisorStats(activeSession.getAdvisorStats()),
+							goalModeState: activeSession.getGoalModeState(),
+							terminalGoalHistoryEntry: activeSession.sessionManager
+								.getEntries()
+								.findLast(entry => entry.type === "mode_change" && entry.mode === "goal"),
 							advisorYieldQueued: activeSession.yieldQueue.has("advisor"),
 							receiptSettled,
 							advisorPaused: !advisorResumed,
@@ -527,6 +549,8 @@ describe("AgentSession.branchFromBtw", () => {
 		});
 		activeSession.settings.setModelRole("advisor", "anthropic/claude-sonnet-4-5");
 		expect(activeSession.toggleAdvisorEnabled()).toBe(true);
+		activeSession.sessionManager.appendModeChange("goal", { goal: terminalGoalState.goal });
+		activeSession.setGoalModeState(terminalGoalState);
 		const advisor = activeSession.getAdvisorAgent();
 		if (!advisor) throw new Error("Expected advisor agent to exist");
 		const retainedAdvisorMessage = createBtwAssistant();
@@ -627,6 +651,12 @@ describe("AgentSession.branchFromBtw", () => {
 			followUp: [retainedFollowUp],
 			checkpoint,
 			advisorStats: retainedAdvisorStats,
+			goalModeState: undefined,
+			terminalGoalHistoryEntry: expect.objectContaining({
+				type: "mode_change",
+				mode: "goal",
+				data: { goal: terminalGoalState.goal },
+			}),
 			advisorYieldQueued: true,
 			receiptSettled: false,
 			advisorPaused: true,
@@ -639,6 +669,7 @@ describe("AgentSession.branchFromBtw", () => {
 		expect(activeSession.sessionManager.getLeafId()).toBe(retainedLeafId);
 		expect(activeSession.sessionManager.getEntries().map(entry => entry.id)).toEqual(retainedEntries);
 		expect(activeSession.getAdvisorCost()).toBe(7);
+		expect(activeSession.getGoalModeState()).toBeUndefined();
 		expect(replacementSessionFile).toBeString();
 		expect(replacementSessionFile).not.toBe(retainedSessionFile);
 		expect(fs.existsSync(replacementSessionFile!)).toBe(false);
