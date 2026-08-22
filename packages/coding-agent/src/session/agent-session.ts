@@ -327,6 +327,7 @@ import {
 	demoteInterruptedThinking,
 	didSessionMessagesChange,
 	type FileMentionMessage,
+	GENERIC_ABORT_SENTINEL,
 	type HookMessage,
 	INTERRUPTED_THINKING_MESSAGE_TYPE,
 	type InterruptedThinkingDetails,
@@ -384,6 +385,7 @@ import {
 	COMPACTION_CHECK_NONE,
 	createCodexCompactionContext as createMaintenanceCodexCompactionContext,
 	SessionMaintenance,
+	type SessionMaintenanceCallContext,
 	type SessionMaintenanceHost,
 } from "./session-maintenance";
 import { cleanupEmptyMoveSession, type SessionManager } from "./session-manager";
@@ -404,7 +406,7 @@ export * from "./agent-session-types";
 export type { AdvisorStats, PerAdvisorStat } from "./session-advisors";
 
 import { LoopGuards, type StreamGuardsHost, StreamingEditGuard } from "./stream-guards";
-import { TodoTracker, type TodoTrackerHost } from "./todo-tracker";
+import { type TodoCompletionCheck, TodoTracker, type TodoTrackerHost } from "./todo-tracker";
 import { TtsrCoordinator, type TtsrCoordinatorHost } from "./ttsr-coordinator";
 
 const PLAN_MODE_REMINDER_MAX = 3;
@@ -485,9 +487,43 @@ type ScheduledAgentContinueOptions = {
 	originTurnId?: string;
 	delayMs?: number;
 	generation?: number;
+	signal?: AbortSignal;
 	shouldContinue?: () => boolean;
 	onSkip?: (reason: AgentContinueSkipReason) => void;
 	onError?: (error: unknown) => void;
+	onStartSettled?: () => void;
+	maintenanceCallContext?: SessionMaintenanceCallContext;
+};
+
+type GoalCompletionFinalizationState = {
+	phase: "pending" | "active";
+	cancelled: boolean;
+	publishCancellationBoundary: boolean;
+	cancellationReason?: string;
+	startSettlementOwnedByScheduler: boolean;
+	queuesRestored: boolean;
+	readonly maintenanceDisconnectOwner: object;
+	readonly abortController: AbortController;
+	readonly start: PromiseWithResolvers<boolean>;
+	readonly precedingAgentEnd: PromiseWithResolvers<void>;
+	readonly toolChoiceLabel: string;
+	readonly parkQueues: () => void;
+	readonly restoreQueues: () => void;
+	scheduledContinuation?: Promise<void>;
+};
+
+type GoalCompletionAgentEndOwnership = {
+	readonly finalization: GoalCompletionFinalizationState;
+	readonly phase: GoalCompletionFinalizationState["phase"];
+};
+
+type PendingAgentEndEmit = {
+	readonly event: AgentSessionEvent;
+	readonly closeTurnId?: string;
+	readonly shouldEmit?: () => boolean;
+	readonly resolveEvent?: () => AgentSessionEvent;
+	readonly onEmit?: (event: AgentSessionEvent) => void;
+	readonly onSettled?: (emitted: boolean) => void;
 };
 
 type SessionTitleSource = "auto" | "user";
@@ -803,7 +839,10 @@ export class AgentSession {
 	// Cursor exec, TUI listeners) is held back. Without this, a client that resumes
 	// on `agent_end` can fire its next `prompt` before #promptWithMessage's finally
 	#promptGeneration = 0;
-	#pendingAgentEndEmit: { event: AgentSessionEvent; closeTurnId?: string } | undefined;
+	#pendingAgentEndEmit: PendingAgentEndEmit | undefined;
+	#pendingAgentEndTestWaiters:
+		| Set<{ predicate: (event: AgentSessionEvent) => boolean; resolve: (event: AgentSessionEvent) => void }>
+		| undefined;
 	#inFlightBeforeAgentEndCallbacks: Array<() => void | Promise<void>> = [];
 	#inFlightSettledCallbacks: Array<() => void | Promise<void>> = [];
 	#inFlightSettling = false;
@@ -842,6 +881,8 @@ export class AgentSession {
 	 */
 	#yieldTerminationPending = false;
 	#synchronouslyTerminatedToolCallIds = new Set<string>();
+	/** A successful goal completion stopped its tool batch and owns one bounded text-only finalization. */
+	#goalCompletionFinalization: GoalCompletionFinalizationState | undefined;
 	#providerSessionState = new Map<string, ProviderSessionState>();
 	#hindsightSessionState: HindsightSessionState | undefined = undefined;
 	readonly #memory: SessionMemory;
@@ -1095,8 +1136,17 @@ export class AgentSession {
 		const pending = this.#pendingAgentEndEmit;
 		if (!pending) return;
 		this.#pendingAgentEndEmit = undefined;
-		this.#closeTurn(pending.closeTurnId);
-		this.#emit(pending.event);
+		let emitted = false;
+		try {
+			if (this.#isDisposed || (pending.shouldEmit && !pending.shouldEmit())) return;
+			const event = pending.resolveEvent?.() ?? pending.event;
+			this.#closeTurn(pending.closeTurnId);
+			pending.onEmit?.(event);
+			this.#emit(event);
+			emitted = true;
+		} finally {
+			pending.onSettled?.(emitted);
+		}
 	}
 
 	/**
@@ -1827,7 +1877,7 @@ export class AgentSession {
 			findLastAssistantMessage: () => this.#findLastAssistantMessage(),
 			beginSemanticDeliveryMaintenance: (signal, exemptAcceptance) =>
 				this.#beginSemanticDeliveryMaintenance(signal, exemptAcceptance),
-			disconnectFromAgent: () => this.#disconnectFromAgent(),
+			disconnectFromAgent: callContext => this.#disconnectFromAgent(callContext),
 			drainStrandedQueuedMessages: () => this.#drainStrandedQueuedMessages(),
 			reconnectToAgent: () => this.#reconnectToAgent(),
 			buildDisplaySessionContext: () => this.buildDisplaySessionContext(),
@@ -2424,7 +2474,7 @@ export class AgentSession {
 		try {
 			await this.#waitForSemanticDeliveryAcceptances(exemptSemanticDeliveryAcceptance, options.signal);
 			if (options.quiesceAgent) await this.#waitForSessionQuiescence(options.signal);
-			this.#disconnectFromAgent();
+			await this.#disconnectFromAgent();
 		} catch (error) {
 			releaseFence();
 			throw error;
@@ -3054,7 +3104,14 @@ export class AgentSession {
 
 	async #emitSessionEvent(
 		event: AgentSessionEvent,
-		options: { detachExtensions?: boolean; closeTurnId?: string } = {},
+		options: {
+			detachExtensions?: boolean;
+			closeTurnId?: string;
+			shouldEmit?: () => boolean;
+			resolveEvent?: () => AgentSessionEvent;
+			onEmit?: (event: AgentSessionEvent) => void;
+			onSettled?: (emitted: boolean) => void;
+		} = {},
 	): Promise<void> {
 		if (event.type === "message_update") {
 			this.#emit(event);
@@ -3068,6 +3125,14 @@ export class AgentSession {
 		const { promise: gate, resolve: releaseGate } = Promise.withResolvers<void>();
 		this.#subscriberEmitGate = gate;
 		try {
+			// A disposed agent_end is suppressed, but it still owns its FIFO ticket:
+			// teardown must not cross the terminal boundary while an earlier ordinary
+			// event is still inside its extension/public fan-out.
+			if (event.type === "agent_end" && this.#isDisposed) {
+				await previousGate;
+				options.onSettled?.(false);
+				return;
+			}
 			const extensionEmit = this.#emitExtensionEvent(event);
 			if (options.detachExtensions) {
 				void extensionEmit.catch(error => {
@@ -3080,6 +3145,12 @@ export class AgentSession {
 				await extensionEmit;
 			}
 			await previousGate;
+			// Disposal may begin while this ticket waits behind an earlier event.
+			// Recheck at the publication boundary so agent_end remains suppressed.
+			if (event.type === "agent_end" && this.#isDisposed) {
+				options.onSettled?.(false);
+				return;
+			}
 			// Hold the wire-level agent_end until in-flight prompts unwind. Subscribers
 			// (rpc-mode, ACP, Cursor) treat agent_end as the "session is idle" signal;
 			// emitting while #promptInFlightCount > 0 lets a client fire its next
@@ -3088,12 +3159,33 @@ export class AgentSession {
 			// an auto-compaction turn that starts before the original prompt unwinds)
 			// supersedes the pending one, which is what subscribers want — they only
 			// care about the final settle.
-			if (event.type === "agent_end" && this.#promptInFlightCount > 0) {
-				this.#pendingAgentEndEmit = { event, closeTurnId: options.closeTurnId };
+			if (options.shouldEmit && !options.shouldEmit()) {
+				options.onSettled?.(false);
 				return;
 			}
-			if (event.type === "agent_end") this.#closeTurn(options.closeTurnId);
-			this.#emit(event);
+			if (event.type === "agent_end" && this.#promptInFlightCount > 0) {
+				const superseded = this.#pendingAgentEndEmit;
+				this.#pendingAgentEndEmit = {
+					event,
+					closeTurnId: options.closeTurnId,
+					shouldEmit: options.shouldEmit,
+					resolveEvent: options.resolveEvent,
+					onEmit: options.onEmit,
+					onSettled: options.onSettled,
+				};
+				for (const waiter of this.#pendingAgentEndTestWaiters ?? []) {
+					if (waiter.predicate(event)) waiter.resolve(event);
+				}
+				superseded?.onSettled?.(false);
+				return;
+			}
+			const resolvedEvent = options.resolveEvent?.() ?? event;
+			if (resolvedEvent.type === "agent_end") {
+				this.#closeTurn(options.closeTurnId);
+				options.onEmit?.(resolvedEvent);
+			}
+			this.#emit(resolvedEvent);
+			options.onSettled?.(true);
 		} finally {
 			releaseGate();
 		}
@@ -3161,10 +3253,7 @@ export class AgentSession {
 	#dispatchAgentEvent = async (event: AgentEvent): Promise<void> => {
 		if (event.type === "tool_execution_end" && this.#isTerminalToolResult(event)) {
 			const alreadyTerminated = this.#synchronouslyTerminatedToolCallIds.delete(event.toolCallId);
-			if (!alreadyTerminated) {
-				if (this.#isTerminalYieldToolResult(event)) this.#markTerminalYieldToolCall(event.toolCallId);
-				this.agent.abort(TERMINAL_TOOL_RESULT_ABORT_REASON);
-			}
+			if (!alreadyTerminated) this.#terminateAfterToolResult(event, event.toolCallId);
 		}
 		if (event.type !== "agent_end") {
 			const processing = this.#processAgentEvent(event);
@@ -3173,10 +3262,12 @@ export class AgentSession {
 			}
 			return processing;
 		}
+		const finalization = this.#goalCompletionFinalization;
+		const goalCompletionOwnership = finalization ? { finalization, phase: finalization.phase } : undefined;
 		const { promise, resolve } = Promise.withResolvers<void>();
 		this.#trackPostPromptTask(promise);
 		try {
-			await this.#processAgentEvent(event);
+			await this.#processAgentEvent(event, goalCompletionOwnership);
 		} finally {
 			resolve();
 		}
@@ -3497,7 +3588,10 @@ export class AgentSession {
 		return true;
 	}
 
-	#processAgentEvent = async (event: AgentEvent): Promise<void> => {
+	#processAgentEvent = async (
+		event: AgentEvent,
+		goalCompletionOwnership?: GoalCompletionAgentEndOwnership,
+	): Promise<void> => {
 		// A fresh run supersedes the previously settled (and pruned) refusal
 		// turn: state-based lookups take over again.
 		if (event.type === "agent_start") {
@@ -3827,20 +3921,41 @@ export class AgentSession {
 			// TTSR retry work runs concurrently and clears the live flag before
 			// maintenance can emit agent_end, so preserve the state at settle entry.
 			const ttsrAbortPendingAtAgentEnd = this.#ttsr.abortPending;
-			const emitAgentEndNotification = async (options?: {
-				willContinue?: boolean;
-				closureRejected?: AgentClosureRejection;
-			}) => {
-				this.#emitRunState("idle");
+			const emitAgentEndNotification = async (
+				options?: { willContinue?: boolean; closureRejected?: AgentClosureRejection },
+				shouldEmit?: () => boolean,
+				onSettled?: (emitted: boolean) => void,
+				resolveAgentEnd?: () => Extract<AgentEvent, { type: "agent_end" }>,
+			) => {
+				if (!options?.willContinue) this.#emitRunState("idle");
+				const publicEvent: AgentSessionEvent = {
+					...event,
+					isTerminal: !options?.willContinue,
+					closureRejected: options?.closureRejected,
+				};
+				const queueExtensionNotification = (published: AgentSessionEvent) => {
+					if (published.type !== "agent_end") return;
+					const extensionMessages =
+						published.messages === event.messages ? [...activeMessages] : [...published.messages];
+					void this.#emitAgentEndNotification(extensionMessages, options).catch(err => {
+						logger.error("Agent end extension notification failed", { err });
+					});
+				};
 				// Public agent_end is held out of the eager display pass and emitted
 				// here after maintenance routing, tagged isTerminal so subscribers can
 				// tell final settles from scheduled continuations.
-				await this.#emitSessionEvent(
-					{ ...event, isTerminal: !options?.willContinue, closureRejected: options?.closureRejected },
-					options?.willContinue === true ? undefined : { closeTurnId: settledTurnId },
-				);
-				void this.#emitAgentEndNotification([...activeMessages], options).catch(err => {
-					logger.error("Agent end extension notification failed", { err });
+				await this.#emitSessionEvent(publicEvent, {
+					closeTurnId: options?.willContinue === true ? undefined : settledTurnId,
+					shouldEmit,
+					resolveEvent: resolveAgentEnd
+						? () => ({
+								...resolveAgentEnd(),
+								isTerminal: !options?.willContinue,
+								closureRejected: options?.closureRejected,
+							})
+						: undefined,
+					onEmit: queueExtensionNotification,
+					onSettled,
 				});
 			};
 			const usage = this.getSessionStats().tokens;
@@ -3857,6 +3972,80 @@ export class AgentSession {
 				.find((message): message is AssistantMessage => message.role === "assistant");
 			const msg = this.#lastAssistantMessage ?? fallbackAssistant;
 			this.#lastAssistantMessage = undefined;
+			const ownership = goalCompletionOwnership;
+			if (ownership?.phase === "active") {
+				const { finalization } = ownership;
+				this.#toolChoiceQueue.removeByLabel(finalization.toolChoiceLabel);
+				this.#lastSuccessfulYieldToolCallId = undefined;
+				this.#recovery.resolveRetry();
+				await finalization.precedingAgentEnd.promise;
+				await emitAgentEndNotification(
+					undefined,
+					() =>
+						this.#goalCompletionFinalization === finalization &&
+						!this.#isDisposed &&
+						(finalization.cancelled ? finalization.publishCancellationBoundary : !this.#abortInProgress),
+					() => this.#finishGoalCompletionFinalization(finalization),
+					() => (finalization.cancelled ? this.#cancelledGoalCompletionAgentEnd(event, finalization) : event),
+				);
+				return;
+			}
+			if (ownership?.phase === "pending") {
+				const { finalization } = ownership;
+				this.#lastSuccessfulYieldToolCallId = undefined;
+				this.#toolChoiceQueue.removeByLabel(finalization.toolChoiceLabel);
+				const settleStart = (started: boolean): void => {
+					if (finalization.phase !== "pending") return;
+					if (started && this.#goalCompletionFinalization === finalization) {
+						finalization.phase = "active";
+						finalization.start.resolve(true);
+						return;
+					}
+					this.#toolChoiceQueue.removeByLabel(finalization.toolChoiceLabel);
+					finalization.start.resolve(false);
+				};
+				if (finalization.cancelled) {
+					finalization.start.resolve(false);
+				} else {
+					this.#toolChoiceQueue.pushOnce("none", { label: finalization.toolChoiceLabel, now: true });
+					finalization.startSettlementOwnedByScheduler = true;
+					finalization.scheduledContinuation = this.#scheduleAgentContinue({
+						authority: "bounded_transport_or_protocol_retry",
+						generation: this.#promptGeneration,
+						signal: finalization.abortController.signal,
+						maintenanceCallContext: { disconnectOwner: finalization.maintenanceDisconnectOwner },
+						onStartSettled: () => settleStart(true),
+						onSkip: () => settleStart(false),
+						onError: () => settleStart(false),
+					});
+				}
+				const started = await finalization.start.promise;
+				if (!started) this.#recovery.resolveRetry();
+				const shouldEmit = started
+					? () =>
+							this.#goalCompletionFinalization === finalization &&
+							!finalization.cancelled &&
+							!this.#abortInProgress &&
+							!this.#isDisposed
+					: () =>
+							this.#goalCompletionFinalization === finalization &&
+							!this.#isDisposed &&
+							(finalization.cancelled ? finalization.publishCancellationBoundary : !this.#abortInProgress);
+				try {
+					await emitAgentEndNotification(
+						started ? { willContinue: true } : undefined,
+						shouldEmit,
+						started ? undefined : () => this.#finishGoalCompletionFinalization(finalization),
+						started
+							? undefined
+							: () =>
+									finalization.cancelled ? this.#cancelledGoalCompletionAgentEnd(event, finalization) : event,
+					);
+				} finally {
+					finalization.precedingAgentEnd.resolve();
+				}
+				return;
+			}
 			if (!msg) {
 				this.#lastSuccessfulYieldToolCallId = undefined;
 				logger.debug("agent_end maintenance routing", {
@@ -3930,7 +4119,8 @@ export class AgentSession {
 			// `#yieldTerminationPending` sticky flag clears on the next `prompt()`.
 			if (successfulYieldMessage || this.#yieldTerminationPending) {
 				if (successfulYieldMessage) {
-					const completion = await this.#todo.checkCompletion();
+					const todoCompletionCheck = this.#todo.beginCompletionCheck();
+					let completion = await this.#todo.checkCompletion(todoCompletionCheck);
 					if (completion === "deferred") {
 						this.#lastSuccessfulYieldToolCallId = undefined;
 						maintenanceRoute("successful-yield-async-deferred");
@@ -3938,11 +4128,20 @@ export class AgentSession {
 						return;
 					}
 					if (completion) {
-						this.#lastSuccessfulYieldToolCallId = undefined;
-						maintenanceRoute("successful-yield-closure-rejected");
 						await this.#emitSessionStopEvent(activeMessages, msg);
-						await emitAgentEndNotification({ closureRejected: completion });
-						return;
+						completion = await this.#todo.checkCompletion(todoCompletionCheck);
+						if (completion === "deferred") {
+							this.#lastSuccessfulYieldToolCallId = undefined;
+							maintenanceRoute("successful-yield-async-deferred-after-session-stop");
+							await emitAgentEndNotification({ willContinue: true });
+							return;
+						}
+						if (completion) {
+							this.#lastSuccessfulYieldToolCallId = undefined;
+							maintenanceRoute("successful-yield-closure-rejected");
+							await emitAgentEndNotification({ closureRejected: completion });
+							return;
+						}
 					}
 				}
 
@@ -4127,22 +4326,18 @@ export class AgentSession {
 				await emitAgentEndNotification(compactionResult.continuationScheduled ? { willContinue: true } : undefined);
 				return;
 			}
+			let todoCompletionCheck: TodoCompletionCheck | undefined;
 			if (msg.stopReason !== "error") {
 				const planModeContinuationScheduled = await this.#enforcePlanModeDecisionAtSettle();
 				if (planModeContinuationScheduled) {
 					await emitAgentEndNotification({ willContinue: true });
 					return;
 				}
-				const completion = await this.#todo.checkCompletion();
+				todoCompletionCheck = this.#todo.beginCompletionCheck();
+				const completion = await this.#todo.checkCompletion(todoCompletionCheck);
 				if (completion === "deferred") {
 					maintenanceRoute("todo-closure-deferred");
 					await emitAgentEndNotification({ willContinue: true });
-					return;
-				}
-				if (completion) {
-					maintenanceRoute("todo-closure-rejected");
-					await this.#emitSessionStopEvent(activeMessages, msg);
-					await emitAgentEndNotification({ closureRejected: completion });
 					return;
 				}
 			}
@@ -4156,6 +4351,19 @@ export class AgentSession {
 				return;
 			}
 			const sessionStopWillContinue = await this.#emitSessionStopEvent(activeMessages, msg);
+			if (todoCompletionCheck) {
+				const completion = await this.#todo.checkCompletion(todoCompletionCheck);
+				if (completion === "deferred") {
+					maintenanceRoute("todo-closure-deferred-after-session-stop");
+					await emitAgentEndNotification({ willContinue: true });
+					return;
+				}
+				if (completion) {
+					maintenanceRoute("todo-closure-rejected");
+					await emitAgentEndNotification({ closureRejected: completion });
+					return;
+				}
+			}
 			await emitAgentEndNotification(sessionStopWillContinue ? { willContinue: true } : undefined);
 		}
 	};
@@ -4190,7 +4398,7 @@ export class AgentSession {
 	#schedulePostPromptTask(
 		task: (signal: AbortSignal) => Promise<void>,
 		options?: { delayMs?: number; generation?: number; onSkip?: (reason: PostPromptSkipReason) => void },
-	): void {
+	): Promise<void> {
 		const delayMs = options?.delayMs ?? 0;
 		const signal = this.#postPromptTasksAbortController.signal;
 		const scheduled = (async () => {
@@ -4213,6 +4421,7 @@ export class AgentSession {
 			await task(signal);
 		})();
 		this.#trackPostPromptTask(scheduled);
+		return scheduled;
 	}
 
 	#skipAgentContinue(reason: AgentContinueSkipReason, options: ScheduledAgentContinueOptions | undefined): void {
@@ -4275,6 +4484,59 @@ export class AgentSession {
 		this.agent.setSteeringMode(directUserActive ? "one-at-a-time" : this.#desiredSteeringMode);
 		this.agent.setFollowUpMode(directUserActive ? "one-at-a-time" : this.#desiredFollowUpMode);
 		this.agent.setInterruptMode(directUserActive ? "wait" : this.#desiredInterruptMode);
+	}
+
+	#isolateGoalCompletionFinalizationQueues(): { parkQueues: () => void; restoreQueues: () => void } {
+		const steering = [...this.agent.peekSteeringQueue()];
+		const followUp = [...this.agent.peekFollowUpQueue()];
+		const parkedArrivalSteering: AgentMessage[] = [];
+		const parkedArrivalFollowUp: AgentMessage[] = [];
+		let queuesIsolated = false;
+		let restored = false;
+		const parkQueues = () => {
+			const currentSteering = [...this.agent.peekSteeringQueue()];
+			const currentFollowUp = [...this.agent.peekFollowUpQueue()];
+			if (currentSteering.length === 0 && currentFollowUp.length === 0) return;
+			parkedArrivalSteering.push(...currentSteering);
+			parkedArrivalFollowUp.push(...currentFollowUp);
+			this.agent.replaceQueues([], [], true);
+			this.#reconcileQueuedMessageDrain();
+		};
+		const detachQueueGuard = this.agent.addBeforeQueuedMessageDequeueHook(parkQueues);
+		const restore = () => {
+			if (restored) return;
+			restored = true;
+			try {
+				detachQueueGuard();
+				if (!queuesIsolated) return;
+				this.agent.replaceQueues(
+					[...steering, ...parkedArrivalSteering, ...this.agent.peekSteeringQueue()],
+					[...followUp, ...parkedArrivalFollowUp, ...this.agent.peekFollowUpQueue()],
+					true,
+				);
+			} finally {
+				this.#reconcileQueuedMessageDrain();
+			}
+		};
+		try {
+			this.agent.replaceQueues([], [], true);
+			queuesIsolated = true;
+			this.#reconcileQueuedMessageDrain();
+		} catch (error) {
+			restore();
+			throw error;
+		}
+		return { parkQueues, restoreQueues: restore };
+	}
+
+	#restoreGoalCompletionFinalizationQueuesAfterAgentEnd(finalization: GoalCompletionFinalizationState): void {
+		if (finalization.queuesRestored) return;
+		this.#inFlightSettledCallbacks.push(() => {
+			if (finalization.queuesRestored) return;
+			finalization.queuesRestored = true;
+			finalization.restoreQueues();
+		});
+		this.#scheduleInFlightSettlement();
 	}
 
 	#isolateDirectUserContinuationOwner(): { owner: AgentMessage; restore: () => void } | undefined {
@@ -4354,10 +4616,15 @@ export class AgentSession {
 		return { owner, restore };
 	}
 
-	#scheduleAgentContinue(options?: ScheduledAgentContinueOptions): void {
-		if (!options || !this.#automaticTurns.authorize(options.authority, options.originTurnId)) return;
-		this.#schedulePostPromptTask(
+	#scheduleAgentContinue(options?: ScheduledAgentContinueOptions): Promise<void> {
+		if (!options) return Promise.resolve();
+		if (!this.#automaticTurns.authorize(options.authority, options.originTurnId)) {
+			options.onSkip?.("should-continue-false");
+			return Promise.resolve();
+		}
+		return this.#schedulePostPromptTask(
 			async signal => {
+				const continuationSignal = options.signal ? AbortSignal.any([signal, options.signal]) : signal;
 				let directTurnId: string | undefined;
 				let continuationTurnId: string | undefined;
 				let directUserOwner: AgentMessage | undefined;
@@ -4368,7 +4635,7 @@ export class AgentSession {
 				// streaming turn — agent.continue() here would race the handoff's session
 				// reset. The first-class fix is in #checkCompaction/the agent_end handler,
 				// but this guard catches anything that bypasses that path.
-				if (signal.aborted || this.#isDisposed || this.isCompacting || this.isGeneratingHandoff) {
+				if (continuationSignal.aborted || this.#isDisposed || this.isCompacting || this.isGeneratingHandoff) {
 					this.#skipAgentContinue("session-unavailable", options);
 					return;
 				}
@@ -4403,7 +4670,7 @@ export class AgentSession {
 					this.#beginInFlight();
 					inFlight = true;
 					const reverted = await this.#recovery.maybeRestoreRetryFallbackPrimary();
-					if (signal.aborted || this.#isDisposed) {
+					if (continuationSignal.aborted || this.#isDisposed) {
 						this.#skipAgentContinue("post-restore-unavailable", options);
 						return;
 					}
@@ -4413,20 +4680,27 @@ export class AgentSession {
 					// path must do the same so agent.continue() never sends a
 					// predictably oversized request to the reverted (smaller) model.
 					if (reverted) {
-						await this.#maintenance.runPrePromptCompactionIfNeeded([]);
-						if (signal.aborted || this.#isDisposed) {
+						await this.#maintenance.runPrePromptCompactionIfNeeded([], undefined, options.maintenanceCallContext);
+						if (continuationSignal.aborted || this.#isDisposed) {
 							this.#skipAgentContinue("post-restore-unavailable", options);
 							return;
 						}
 					}
 					if (this.settings.get("retry.usageAwareFallback")) {
-						if (!(await this.#runQueuedUsageAwarePreflight(signal))) {
+						if (!(await this.#runQueuedUsageAwarePreflight(continuationSignal))) {
 							this.#skipAgentContinue("session-unavailable", options);
 							return;
 						}
+						if (continuationSignal.aborted || this.#isDisposed) {
+							this.#skipAgentContinue("post-restore-unavailable", options);
+							return;
+						}
 					}
-					this.#armAutomaticTurnStart(options.authority, continuationTurnId);
-					await this.agent.continue(signal);
+					this.#armAutomaticTurnStart(options.authority, continuationTurnId, options.onStartSettled);
+					await this.agent.continue(continuationSignal);
+					if (options.onStartSettled && this.#pendingAutomaticTurnStart?.source === options.authority) {
+						throw new Error("Agent continuation did not start");
+					}
 					await this.#drainInFlightEventHandlers();
 				} catch (error) {
 					this.#recordAutomaticTurnFailed(options.authority, error, continuationTurnId);
@@ -4727,9 +5001,8 @@ export class AgentSession {
 			result: ctx.result,
 		};
 		if (this.#isTerminalToolResult(event)) {
-			if (this.#isTerminalYieldToolResult(event)) this.#markTerminalYieldToolCall(ctx.toolCall.id);
 			this.#synchronouslyTerminatedToolCallIds.add(ctx.toolCall.id);
-			this.agent.abort(TERMINAL_TOOL_RESULT_ABORT_REASON);
+			this.#terminateAfterToolResult(event, ctx.toolCall.id);
 		}
 		return this.#ttsr.afterToolCall(ctx);
 	}
@@ -4833,12 +5106,19 @@ export class AgentSession {
 		messages: AgentMessage[],
 		options?: { willContinue?: boolean; closureRejected?: AgentClosureRejection },
 	): Promise<void> {
-		await this.#extensionRunner?.emit({
-			type: "agent_end",
-			messages,
-			willContinue: options?.willContinue,
-			closureRejected: options?.closureRejected,
-		});
+		if (this.#isDisposed) return;
+		const runner = this.#extensionRunner;
+		if (!runner) return;
+		const emit = () =>
+			runner.emit({
+				type: "agent_end",
+				messages,
+				willContinue: options?.willContinue,
+				closureRejected: options?.closureRejected,
+			});
+		const queued = this.#queuedExtensionEvents.then(emit, emit);
+		this.#queuedExtensionEvents = queued.catch(() => {});
+		await queued;
 	}
 
 	/** @returns true when a hidden session_stop continuation turn was scheduled. */
@@ -5089,10 +5369,34 @@ export class AgentSession {
 	 * User listeners are preserved and will receive events again after resubscribe().
 	 * Used internally during operations that need to pause event processing.
 	 */
-	#disconnectFromAgent(): void {
+	async #disconnectFromAgent(callContext?: SessionMaintenanceCallContext): Promise<void> {
+		const finalization = this.#goalCompletionFinalization;
+		const continuationOwnsDisconnect =
+			finalization !== undefined &&
+			callContext?.disconnectOwner !== undefined &&
+			callContext.disconnectOwner === finalization.maintenanceDisconnectOwner;
+		if (finalization) {
+			if (continuationOwnsDisconnect) {
+				finalization.abortController.abort(GENERIC_ABORT_SENTINEL);
+				this.#toolChoiceQueue.removeByLabel(finalization.toolChoiceLabel);
+			} else {
+				this.#cancelGoalCompletionFinalization(false);
+			}
+			finalization.parkQueues();
+		}
 		if (this.#unsubscribeAgent) {
 			this.#unsubscribeAgent();
 			this.#unsubscribeAgent = undefined;
+		}
+		if (!finalization) return;
+		const scheduledContinuation = finalization.scheduledContinuation;
+		// The maintenance call is inside this promise. Its skip/error callback settles
+		// `start`; the resulting terminal agent_end owns idempotent finish/restore.
+		if (continuationOwnsDisconnect && scheduledContinuation) return;
+		try {
+			await scheduledContinuation;
+		} finally {
+			this.#finishGoalCompletionFinalization(finalization, true);
 		}
 	}
 
@@ -5238,6 +5542,7 @@ export class AgentSession {
 	 */
 	beginDispose(): void {
 		this.#isDisposed = true;
+		this.#cancelGoalCompletionFinalization(false);
 		this.#queuedMessageDrainBlocked = false;
 		this.#usagePreflightReadyForNextModelCall = false;
 		this.#detachUsageBeforeQueueDequeue?.();
@@ -5377,6 +5682,7 @@ export class AgentSession {
 		}
 		await Promise.all([...this.#branchSummarySettlements, ...this.#activeLifecycleSettlements]);
 		await this.#memory.transition;
+		await this.#queuedExtensionEvents;
 
 		// This is the terminal extension boundary: all abort, pre-fence side work,
 		// and lifecycle ownership has settled, and no later teardown calls extensions.
@@ -5415,7 +5721,7 @@ export class AgentSession {
 		this.#maintenance.cancelSpeculation();
 		this.setHindsightSessionState(undefined);
 		hindsightState?.dispose();
-		this.#disconnectFromAgent();
+		await this.#disconnectFromAgent();
 		if (this.#unsubscribeAppendOnly) {
 			this.#unsubscribeAppendOnly();
 			this.#unsubscribeAppendOnly = undefined;
@@ -6187,6 +6493,33 @@ export class AgentSession {
 	trackPostPromptTaskForTests(task: Promise<unknown>): void {
 		if (!isBunTestRuntime()) throw new Error("trackPostPromptTaskForTests is test-only");
 		this.#trackPostPromptTask(task);
+	}
+
+	/** Drive the ordered extension/public event pipeline in focused race tests. */
+	emitSessionEventForTests(event: AgentSessionEvent): Promise<void> {
+		if (!isBunTestRuntime()) throw new Error("emitSessionEventForTests is test-only");
+		return this.#emitSessionEvent(event);
+	}
+
+	/** Wait for matching deferred public agent-end publication in race regressions. */
+	waitForPendingAgentEndForTests(predicate: (event: AgentSessionEvent) => boolean): Promise<AgentSessionEvent> {
+		if (!isBunTestRuntime()) throw new Error("waitForPendingAgentEndForTests is test-only");
+		const pending = this.#pendingAgentEndEmit?.event;
+		if (pending && predicate(pending)) return Promise.resolve(pending);
+		const { promise, resolve } = Promise.withResolvers<AgentSessionEvent>();
+		const waiter = { predicate, resolve };
+		this.#pendingAgentEndTestWaiters ??= new Set();
+		this.#pendingAgentEndTestWaiters.add(waiter);
+		return promise.finally(() => {
+			this.#pendingAgentEndTestWaiters?.delete(waiter);
+		});
+	}
+
+	/** Inspect goal-finalization ownership in cancellation race regressions. */
+	goalCompletionFinalizationForTests(): { phase: "pending" | "active"; cancelled: boolean } | undefined {
+		if (!isBunTestRuntime()) throw new Error("goalCompletionFinalizationForTests is test-only");
+		const finalization = this.#goalCompletionFinalization;
+		return finalization ? { phase: finalization.phase, cancelled: finalization.cancelled } : undefined;
 	}
 
 	/** All messages including custom types like BashExecutionMessage */
@@ -8362,9 +8695,12 @@ export class AgentSession {
 	}
 
 	/** Override the internal agent event connection in focused tests. */
-	setAgentEventConnectionForTests(connected: boolean): void {
-		if (connected) this.#reconnectToAgent();
-		else this.#disconnectFromAgent();
+	async setAgentEventConnectionForTests(connected: boolean): Promise<void> {
+		if (connected) {
+			this.#reconnectToAgent();
+			return;
+		}
+		await this.#disconnectFromAgent();
 	}
 
 	/** Test-only hook after async normalization and immediately before receiver-state acceptance. */
@@ -8947,6 +9283,7 @@ export class AgentSession {
 	 * abort. Omit it for internal/lifecycle aborts.
 	 */
 	abort(options: AgentSessionAbortOptions = {}): Promise<void> {
+		this.#cancelGoalCompletionFinalization(true, options.reason);
 		if (this.#abortPromise) {
 			const intent = this.#abortIntent;
 			if (
@@ -9044,6 +9381,7 @@ export class AgentSession {
 			// Clear prompt-in-flight state: waitForIdle resolves when the agent loop's finally
 			// block runs, but nested prompt setup/finalizers may still be unwinding.
 			this.#resetInFlight();
+			if (this.#unsubscribeAgent === undefined) this.#emitRunState("idle");
 			this.#resetSessionStopContinuationState();
 			this.#clearPendingSessionStopContinuations();
 			if (!intent.preserveToolChoice && this.#toolChoiceQueue.hasInFlight) {
@@ -9464,6 +9802,68 @@ export class AgentSession {
 		return this.#handoff.handoffToNewSession(customInstructions, options, semanticDeliveryAcceptance);
 	}
 
+	#cancelledGoalCompletionAgentEnd(
+		event: Extract<AgentEvent, { type: "agent_end" }>,
+		finalization: GoalCompletionFinalizationState,
+	): Extract<AgentEvent, { type: "agent_end" }> {
+		const messages = [...event.messages];
+		for (let index = messages.length - 1; index >= 0; index--) {
+			const message = messages[index];
+			if (message.role !== "assistant") continue;
+			const cancelled: AssistantMessage = {
+				...message,
+				stopReason: "aborted",
+				errorMessage: finalization.cancellationReason ?? GENERIC_ABORT_SENTINEL,
+			};
+			if (this.#pendingAbortErrorId !== undefined) {
+				cancelled.errorId = this.#pendingAbortErrorId;
+				this.#pendingAbortErrorId = undefined;
+			}
+			messages[index] = cancelled;
+			break;
+		}
+		return { ...event, messages };
+	}
+
+	#finishGoalCompletionFinalization(
+		finalization: GoalCompletionFinalizationState,
+		restoreQueuesImmediately = false,
+	): void {
+		if (this.#goalCompletionFinalization === finalization) {
+			this.#goalCompletionFinalization = undefined;
+		}
+		this.#toolChoiceQueue.removeByLabel(finalization.toolChoiceLabel);
+		if (restoreQueuesImmediately) {
+			if (!finalization.queuesRestored) {
+				finalization.queuesRestored = true;
+				finalization.restoreQueues();
+			}
+			return;
+		}
+		this.#restoreGoalCompletionFinalizationQueuesAfterAgentEnd(finalization);
+	}
+
+	#cancelGoalCompletionFinalization(publishCancellationBoundary = true, reason?: string): void {
+		const finalization = this.#goalCompletionFinalization;
+		if (!finalization) return;
+		if (finalization.cancelled) {
+			if (
+				finalization.publishCancellationBoundary &&
+				publishCancellationBoundary &&
+				reason === USER_INTERRUPT_LABEL
+			) {
+				finalization.cancellationReason = reason;
+			}
+			return;
+		}
+		finalization.cancelled = true;
+		finalization.publishCancellationBoundary = publishCancellationBoundary;
+		finalization.cancellationReason = reason ?? GENERIC_ABORT_SENTINEL;
+		finalization.abortController.abort(finalization.cancellationReason);
+		this.#toolChoiceQueue.removeByLabel(finalization.toolChoiceLabel);
+		if (!finalization.startSettlementOwnedByScheduler) finalization.start.resolve(false);
+	}
+
 	#isTerminalToolResult(event: { toolName: string; isError?: boolean; result?: { details?: unknown } }): boolean {
 		if (event.isError) return false;
 		if (this.#isTerminalYieldToolResult(event)) return true;
@@ -9474,6 +9874,37 @@ export class AgentSession {
 			candidate => candidate.name === event.toolName || candidate.customWireName === event.toolName,
 		);
 		return tool?.terminalAfterSuccess === true;
+	}
+	#terminateAfterToolResult(
+		event: { toolName: string; isError?: boolean; result?: { details?: unknown } },
+		toolCallId: string,
+	): void {
+		if (this.#isTerminalYieldToolResult(event)) {
+			this.#markTerminalYieldToolCall(toolCallId);
+		} else if (
+			event.toolName === "goal" &&
+			!this.#abortInProgress &&
+			!this.#abortPromise &&
+			!this.#isDisposed &&
+			!this.#goalCompletionFinalization
+		) {
+			const { parkQueues, restoreQueues } = this.#isolateGoalCompletionFinalizationQueues();
+			this.#goalCompletionFinalization = {
+				phase: "pending",
+				cancelled: false,
+				publishCancellationBoundary: false,
+				abortController: new AbortController(),
+				startSettlementOwnedByScheduler: false,
+				maintenanceDisconnectOwner: {},
+				queuesRestored: false,
+				start: Promise.withResolvers<boolean>(),
+				precedingAgentEnd: Promise.withResolvers<void>(),
+				toolChoiceLabel: "goal-completion-finalization",
+				parkQueues,
+				restoreQueues,
+			};
+		}
+		this.agent.abort(TERMINAL_TOOL_RESULT_ABORT_REASON);
 	}
 
 	#isTerminalYieldToolResult(event: { toolName: string; isError?: boolean; result?: { details?: unknown } }): boolean {

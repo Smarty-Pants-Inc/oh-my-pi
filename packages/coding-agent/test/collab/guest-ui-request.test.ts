@@ -22,7 +22,7 @@ import {
 	formatCollabLink,
 	parseCollabLink,
 } from "@oh-my-pi/pi-coding-agent/collab/protocol";
-import { CollabSocket } from "@oh-my-pi/pi-coding-agent/collab/relay-client";
+import { CollabSocket, type CollabTransport } from "@oh-my-pi/pi-coding-agent/collab/relay-client";
 import type {
 	ExtensionAskDialogQuestion,
 	ExtensionUIDialogOptions,
@@ -31,6 +31,7 @@ import type {
 import { reconcilePrivateHerdrAfterStartupJoin } from "@oh-my-pi/pi-coding-agent/main";
 import { ExtensionUiController } from "@oh-my-pi/pi-coding-agent/modes/controllers/extension-ui-controller";
 import type { InteractiveModeContext, InteractiveSelectorDialogOptions } from "@oh-my-pi/pi-coding-agent/modes/types";
+import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session-events";
 import { FakeWebSocket, installInMemoryRelay, uninstallInMemoryRelay } from "./helpers/in-memory-relay";
 
 // In-memory transport: shared FakeWebSocket + InMemoryRelay harness (see
@@ -67,6 +68,8 @@ interface GuestUiHarness {
 	uiResponses: UiResponseRecord[];
 	/** Errors surfaced locally by the guest. */
 	errors: string[];
+	/** Every replicated event delivered to the native event controller. */
+	handledEvents: AgentSessionEvent[];
 	/** Join failure retained for tests that simulate a partial replica switch. */
 	joinError: unknown;
 	nextDialog(): Promise<DialogStub>;
@@ -84,6 +87,8 @@ interface GuestUiHarness {
 interface GuestUiHarnessOptions {
 	readOnly?: boolean;
 	dedicated?: boolean;
+	/** Test-only direct transport for deterministic receive/close ordering. */
+	transport?: CollabTransport;
 	returnSessionFile?: string | null;
 	onNewSession?: () => void;
 	onSwitchSession?: () => void;
@@ -94,6 +99,7 @@ interface GuestUiHarnessOptions {
 	allowJoinFailure?: boolean;
 	onError?: (message: string) => void;
 	herdrCollabHostLifecycle?: InteractiveModeContext["herdrCollabHostLifecycle"];
+	handleEvent?: (event: AgentSessionEvent) => Promise<void>;
 }
 
 function makeState(): CollabSessionState {
@@ -106,6 +112,56 @@ function makeState(): CollabSessionState {
 	};
 }
 
+/** Direct transport used only where receive acceptance must precede terminal close exactly. */
+class ControlledGuestTransport implements CollabTransport {
+	onOpen?: () => void;
+	onFrame?: CollabTransport["onFrame"];
+	onControl?: CollabTransport["onControl"];
+	onClose?: CollabTransport["onClose"];
+	#open = false;
+
+	get isOpen(): boolean {
+		return this.#open;
+	}
+
+	connect(): void {
+		this.#open = true;
+		this.onOpen?.();
+	}
+
+	send(frame: CollabFrame): boolean {
+		if (!this.#open) return false;
+		if (frame.t === "hello") {
+			this.onFrame?.(
+				{
+					t: "welcome",
+					proto: COLLAB_PROTO,
+					header: { type: "session", id: "remote-session", timestamp: "2026-06-30T00:00:00Z", cwd: "/tmp" },
+					state: makeState(),
+					agents: [],
+					entryCount: 0,
+				},
+				0,
+			);
+		}
+		return true;
+	}
+
+	close(): void {
+		this.end("closed");
+	}
+
+	deliver(frame: CollabFrame): void {
+		if (this.#open) this.onFrame?.(frame, 0);
+	}
+
+	end(reason: string): void {
+		if (!this.#open) return;
+		this.#open = false;
+		this.onClose?.(reason, false);
+	}
+}
+
 async function makeHarness(opts?: GuestUiHarnessOptions): Promise<GuestUiHarness> {
 	const roomId = "ui-request-room";
 	const roomKey = generateRoomKey();
@@ -113,6 +169,7 @@ async function makeHarness(opts?: GuestUiHarnessOptions): Promise<GuestUiHarness
 	const link = formatCollabLink("ws://localhost:8788", roomId, roomKey);
 
 	const errors: string[] = [];
+	const handledEvents: AgentSessionEvent[] = [];
 	const dialogLog: DialogStub[] = [];
 	const dialogQueue: DialogStub[] = [];
 	const dialogWaiters: ((stub: DialogStub) => void)[] = [];
@@ -275,7 +332,12 @@ async function makeHarness(opts?: GuestUiHarnessOptions): Promise<GuestUiHarness
 		},
 		updateEditorTopBorder: () => {},
 		updateEditorBorderColor: () => {},
-		eventController: { handleEvent: () => Promise.resolve() },
+		eventController: {
+			handleEvent: (event: AgentSessionEvent) => {
+				handledEvents.push(event);
+				return opts?.handleEvent?.(event) ?? Promise.resolve();
+			},
+		},
 		syncRunningSubagentBadge: () => {},
 		showHookSelector: (
 			title: string,
@@ -291,7 +353,9 @@ async function makeHarness(opts?: GuestUiHarnessOptions): Promise<GuestUiHarness
 
 	const guest = new CollabGuestLink(ctx);
 	let joinError: unknown;
-	if (opts?.dedicated) {
+	if (opts?.transport) {
+		await guest.joinWithTransport(opts.transport, { roomId });
+	} else if (opts?.dedicated) {
 		await guest.joinWithTransport(
 			new CollabSocket({ wsUrl: `ws://localhost:8788/r/${roomId}`, role: "guest", key: cryptoKey }),
 			{ roomId },
@@ -312,6 +376,7 @@ async function makeHarness(opts?: GuestUiHarnessOptions): Promise<GuestUiHarness
 		dialogLog,
 		uiResponses,
 		errors,
+		handledEvents,
 		joinError,
 		nextDialog,
 		nextUiResponse,
@@ -515,7 +580,7 @@ it("restores the local session after a replica switch fails before welcome", asy
 	expect(order).toEqual(["suspend", "remote-switch", "local-restore", "resume"]);
 });
 
-it("cancels replica finalization when the relay closes during the snapshot write", async () => {
+it("drains replica finalization before restoring when the relay closes during the snapshot write", async () => {
 	const writeStarted = Promise.withResolvers<void>();
 	const finishWrite = Promise.withResolvers<number>();
 	writeSpy?.mockRestore();
@@ -560,7 +625,7 @@ it("cancels replica finalization when the relay closes during the snapshot write
 	const h = await harnessPromise;
 	harnessCleanups.push(h.cleanup);
 	expect(h.joinError).toBeInstanceOf(Error);
-	expect(order).toEqual(["suspend", "resume"]);
+	expect(order).toEqual(["suspend", "remote-switch", "local-restore", "resume"]);
 });
 
 it("waits for startup guest restoration instead of resuming from collabGuest absence", async () => {
@@ -595,6 +660,84 @@ it("waits for startup guest restoration instead of resuming from collabGuest abs
 	finishRestoration.resolve();
 	await reconciliation;
 	expect(order).toEqual(["suspend", "local-restore", "resume"]);
+});
+
+it("turns a rejected remote closure into a persistent native todo reminder", async () => {
+	const h = await openHarness();
+	const closureRejected = {
+		reason: "stale_todos" as const,
+		todos: [{ content: "Finish the requested work", status: "pending" as const }],
+	};
+
+	h.hostSocket.send({ t: "event", event: { type: "agent_end", messages: [], closureRejected } });
+	await h.barrier();
+	await Promise.resolve();
+
+	expect(h.handledEvents).toEqual([
+		{ type: "agent_end", messages: [], closureRejected },
+		{ type: "todo_reminder", todos: closureRejected.todos, attempt: 1, maxAttempts: 1 },
+	]);
+});
+
+it("completes a rejected closure reminder before applying a newer event frame", async () => {
+	const reminderStarted = Promise.withResolvers<void>();
+	const unblockReminder = Promise.withResolvers<void>();
+	const h = await openHarness({
+		handleEvent: event => {
+			if (event.type !== "todo_reminder") return Promise.resolve();
+			reminderStarted.resolve();
+			return unblockReminder.promise;
+		},
+	});
+	const closureRejected = {
+		reason: "stale_todos" as const,
+		todos: [{ content: "Finish the requested work", status: "pending" as const }],
+	};
+
+	h.hostSocket.send({ t: "event", event: { type: "agent_end", messages: [], closureRejected } });
+	h.hostSocket.send({ t: "event", event: { type: "notice", level: "info", message: "newer frame" } });
+	await reminderStarted.promise;
+
+	expect(h.handledEvents.map(event => event.type)).toEqual(["agent_end", "todo_reminder"]);
+	unblockReminder.resolve();
+	await h.barrier();
+	expect(h.handledEvents.map(event => event.type)).toEqual(["agent_end", "todo_reminder", "notice"]);
+});
+
+it("drains a queued rejected closure before terminal transport teardown", async () => {
+	const firstEventStarted = Promise.withResolvers<void>();
+	const releaseFirstEvent = Promise.withResolvers<void>();
+	const order: string[] = [];
+	const transport = new ControlledGuestTransport();
+	const h = await openHarness({
+		transport,
+		handleEvent: async event => {
+			order.push(event.type);
+			if (event.type === "notice" && event.message === "block first frame") {
+				firstEventStarted.resolve();
+				await releaseFirstEvent.promise;
+			}
+		},
+	});
+	const closureRejected = {
+		reason: "stale_todos" as const,
+		todos: [{ content: "Finish the requested work", status: "pending" as const }],
+	};
+	const ended = h.guest.ended.then(() => order.push("ended"));
+
+	transport.deliver({ t: "event", event: { type: "notice", level: "info", message: "block first frame" } });
+	await firstEventStarted.promise;
+	transport.deliver({ t: "event", event: { type: "agent_end", messages: [], closureRejected } });
+	transport.end("room closed");
+	releaseFirstEvent.resolve();
+	await ended;
+
+	expect(order).toEqual(["notice", "agent_end", "todo_reminder", "ended"]);
+	expect(h.handledEvents).toEqual([
+		{ type: "notice", level: "info", message: "block first frame" },
+		{ type: "agent_end", messages: [], closureRejected },
+		{ type: "todo_reminder", todos: closureRejected.todos, attempt: 1, maxAttempts: 1 },
+	]);
 });
 
 describe("collab TUI guest ui-request handling (#4049)", () => {

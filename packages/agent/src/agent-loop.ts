@@ -1420,7 +1420,13 @@ async function runLoopBody(
 						c.type === "toolCall" && (c as CursorExecResolvedCarrier)[kCursorExecResolved] !== true,
 				);
 				const runnableStop = message.stopReason === "toolUse" || message.stopReason === "stop";
-				hasMoreToolCalls = runnableStop && toolCalls.length > 0;
+				// Owned dialects keep tools in the in-band catalog, so `none` must also
+				// disable parsed calls locally; omitting native tool_choice is not enough.
+				const ownedToolChoice = preparedProviderCall.ownedDialect
+					? (hostToolChoice ?? config.toolChoice)
+					: undefined;
+				const ownedToolsDisabled = ownedToolChoice === "none";
+				hasMoreToolCalls = runnableStop && toolCalls.length > 0 && !ownedToolsDisabled;
 
 				const deadlinePassed = isDeadlineExceeded(config.deadline);
 				if (hasMoreToolCalls && deadlinePassed) {
@@ -1432,7 +1438,7 @@ async function runLoopBody(
 				// Keep the consumed host directive live across retries until the model
 				// calls only the required tool; detour calls are paired but never run.
 				const ownedHardRequiredTool = preparedProviderCall.ownedDialect
-					? namedToolChoice(hostToolChoice ?? config.toolChoice)
+					? namedToolChoice(ownedToolChoice)
 					: undefined;
 				const requiredTool = ownedHardRequiredTool ?? softRequiredTool;
 				const requiredSatisfies = ownedHardRequiredTool === undefined ? softSatisfies : undefined;

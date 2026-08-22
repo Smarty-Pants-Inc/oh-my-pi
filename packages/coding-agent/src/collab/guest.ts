@@ -174,6 +174,11 @@ export class CollabGuestLink {
 	#welcomed = false;
 	/** Set before the replica switch so a partially applied join is restored even without a welcome. */
 	#replicaSessionMayBeActive = false;
+	/** False once terminal close/leave starts; already queued frames still drain. */
+	#acceptingFrames = true;
+	/** Shared completion for concurrent terminal close and leave paths. */
+	#finishPromise: Promise<void> | null = null;
+	/** True once accepted frames have drained and link-owned UI has detached. */
 	#left = false;
 	/**
 	 * Buffer for the in-flight chunked welcome. Set by the small `welcome`
@@ -334,6 +339,7 @@ export class CollabGuestLink {
 			});
 		};
 		socket.onFrame = frame => {
+			if (!this.#acceptingFrames) return;
 			this.#applyChain = this.#applyChain
 				.then(async () => {
 					if (frame.t === "welcome") {
@@ -360,7 +366,7 @@ export class CollabGuestLink {
 						return;
 					}
 					if (!this.#welcomed || this.#left) return;
-					this.#applyFrame(frame);
+					await this.#applyFrame(frame);
 				})
 				.catch(err => {
 					logger.warn("collab guest frame apply failed", { type: frame.t, error: String(err) });
@@ -373,7 +379,7 @@ export class CollabGuestLink {
 			this.#clearWelcomeTimer();
 			this.#clearSnapshotProgressTimer();
 			this.#flushPendingTranscripts();
-			if (this.#left) return;
+			if (this.#left || !this.#acceptingFrames) return;
 			if (!joined) {
 				firstWelcome.reject(new Error(reason));
 				return;
@@ -553,7 +559,7 @@ export class CollabGuestLink {
 		}
 	}
 
-	#applyFrame(frame: CollabFrame): void {
+	async #applyFrame(frame: CollabFrame): Promise<void> {
 		switch (frame.t) {
 			case "entry": {
 				// Entries are never rendered directly — rendering is events-only
@@ -566,7 +572,7 @@ export class CollabGuestLink {
 				break;
 			}
 			case "event":
-				this.#applyEvent(frame.event);
+				await this.#applyEvent(frame.event);
 				break;
 			case "state": {
 				this.state = frame.state;
@@ -624,7 +630,7 @@ export class CollabGuestLink {
 		}
 	}
 
-	#applyEvent(event: AgentSessionEvent): void {
+	async #applyEvent(event: AgentSessionEvent): Promise<void> {
 		// Orphan-delta guard: when joining mid-turn the message_start for the
 		// in-flight assistant message predates the snapshot. message_update
 		// carries the full accumulating message, so synthesize the missing start
@@ -638,9 +644,20 @@ export class CollabGuestLink {
 			!this.#assistantStreamSynced
 		) {
 			this.#assistantStreamSynced = true;
-			void this.#ctx.eventController.handleEvent({ type: "message_start", message: event.message });
+			await this.#ctx.eventController.handleEvent({ type: "message_start", message: event.message });
 		}
-		void this.#ctx.eventController.handleEvent(event);
+		await this.#ctx.eventController.handleEvent(event);
+		if (event.type !== "agent_end" || !event.closureRejected) return;
+		// `todo_reminder` is not replicated, but the closure carries the
+		// actionable todos. Reuse its transcript-anchored native rendering so a
+		// rejected remote completion stays visible instead of only suppressing
+		// the normal completion notification.
+		await this.#ctx.eventController.handleEvent({
+			type: "todo_reminder",
+			todos: event.closureRejected.todos,
+			attempt: 1,
+			maxAttempts: 1,
+		});
 	}
 
 	/**
@@ -794,7 +811,7 @@ export class CollabGuestLink {
 	}
 
 	#finishSessionAfterTransportEnd(): void {
-		if (this.#left) return;
+		if (this.#finishPromise) return;
 		void this.#finishSession()
 			.then(() => this.#afterEnd)
 			.catch(error => {
@@ -803,25 +820,29 @@ export class CollabGuestLink {
 			});
 	}
 
-	async #finishSession(): Promise<void> {
-		if (this.#left) return;
-		this.#left = true;
+	#finishSession(): Promise<void> {
+		if (this.#finishPromise) return this.#finishPromise;
+		this.#acceptingFrames = false;
 		const socket = this.#socket;
 		this.#socket = null;
-		socket?.close();
 		this.#clearWelcomeTimer();
 		this.#clearSnapshotProgressTimer();
 		this.#flushPendingTranscripts();
-		await this.#applyChain;
-		if (this.#ctx.collabGuest === this) {
-			this.#ctx.collabGuest = undefined;
-			this.#ctx.statusLine.setCollabStatus(null);
-			this.#clearAgentMirror();
-			this.#ctx.syncRunningSubagentBadge();
-			this.#ctx.resetObserverRegistry();
-			this.#clearTransientUi();
-		}
-		this.#ended.resolve();
+		this.#finishPromise = (async () => {
+			await this.#applyChain;
+			this.#left = true;
+			if (this.#ctx.collabGuest === this) {
+				this.#ctx.collabGuest = undefined;
+				this.#ctx.statusLine.setCollabStatus(null);
+				this.#clearAgentMirror();
+				this.#ctx.syncRunningSubagentBadge();
+				this.#ctx.resetObserverRegistry();
+				this.#clearTransientUi();
+			}
+			this.#ended.resolve();
+		})();
+		socket?.close();
+		return this.#finishPromise;
 	}
 
 	async #restoreLocalSession(): Promise<boolean> {

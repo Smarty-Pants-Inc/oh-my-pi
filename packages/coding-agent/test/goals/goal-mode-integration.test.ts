@@ -1,17 +1,23 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
+import * as compactionModule from "@oh-my-pi/pi-agent-core/compaction";
 import type { ImageContent, Model, ToolCall } from "@oh-my-pi/pi-ai";
+import type { Dialect } from "@oh-my-pi/pi-ai/dialect";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import { parseGoalModeState } from "@oh-my-pi/pi-coding-agent/goals/state";
 import { GoalTool } from "@oh-my-pi/pi-coding-agent/goals/tools/goal-tool";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { SubmittedUserInput } from "@oh-my-pi/pi-coding-agent/modes/types";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { SessionMaintenance } from "@oh-my-pi/pi-coding-agent/session/session-maintenance";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { executeBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/builtin-registry";
 import { createTools, type Tool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
@@ -65,14 +71,25 @@ async function createSharedFixture(): Promise<SharedFixture> {
 	return { authStorage, modelRegistry, model, baseDir };
 }
 
-async function createGoalHarness(shared: SharedFixture): Promise<GoalHarness> {
+type GoalHarnessModelConfig = {
+	modelRegistry: ModelRegistry;
+	model: Model;
+	compactionEnabled?: boolean;
+};
+
+async function createGoalHarness(
+	shared: SharedFixture,
+	extensionRunner?: ExtensionRunner,
+	dialect?: Dialect,
+	modelConfig?: GoalHarnessModelConfig,
+): Promise<GoalHarness> {
 	resetSettingsForTest();
 	const tempDir = TempDir.createSync("@pi-goal-mode-");
 	await Settings.init({ inMemory: true, cwd: tempDir.path() });
-	const { modelRegistry, model } = shared;
+	const { modelRegistry, model } = modelConfig ?? shared;
 
 	const settings = Settings.isolated({
-		"compaction.enabled": false,
+		"compaction.enabled": modelConfig?.compactionEnabled ?? false,
 		"goal.enabled": true,
 		"plan.enabled": true,
 	});
@@ -80,20 +97,25 @@ async function createGoalHarness(shared: SharedFixture): Promise<GoalHarness> {
 	const initialTools = await createTools(bootstrapToolSession, ["read"]);
 	const toolRegistry = new Map<string, Tool>(initialTools.map(tool => [tool.name, tool] as const));
 
-	const session = new AgentSession({
-		agent: new Agent({
-			initialState: {
-				model,
-				systemPrompt: ["Test"],
-				tools: initialTools,
-				messages: [],
-			},
-		}),
+	let session: AgentSession | undefined;
+	const agent = new Agent({
+		initialState: {
+			model,
+			systemPrompt: ["Test"],
+			tools: initialTools,
+			messages: [],
+		},
+		getToolChoice: () => session?.nextToolChoiceDirective(),
+		dialect,
+	});
+	session = new AgentSession({
+		agent,
 		sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
 		settings,
 		modelRegistry,
 		toolRegistry,
 		rebuildSystemPrompt: async () => ({ systemPrompt: ["Test"] }),
+		extensionRunner,
 	});
 	const mode = new InteractiveMode(session, "test");
 	const toolSession = createToolSession(tempDir.path(), settings, {
@@ -190,6 +212,156 @@ async function armInputWaiter(mode: InteractiveMode): Promise<{
 		inputPromise,
 		getResolvedInput: () => resolvedInput,
 	};
+}
+
+type GoalFinalizationOutcome = "text" | "empty" | "retryable-error" | "aborted";
+
+function installGoalCompletionStream(
+	harness: GoalHarness,
+	outcome: GoalFinalizationOutcome,
+	includeSibling = false,
+	onFinalizationCall?: () => void,
+	finalizationRelease?: Promise<void>,
+	textOutcome = "Goal complete. Final budget summary delivered.",
+): { providerCalls: number; providerContexts: string[]; providerToolChoices: unknown[] } {
+	const observed = {
+		providerCalls: 0,
+		providerContexts: [] as string[],
+		providerToolChoices: [] as unknown[],
+	};
+	harness.session.agent.streamFn = (_model, context, options) => {
+		const call = ++observed.providerCalls;
+		observed.providerContexts.push(JSON.stringify(context.messages));
+		observed.providerToolChoices.push(options?.toolChoice);
+		const stream = new AssistantMessageEventStream();
+		queueMicrotask(async () => {
+			if (call === 1) {
+				stream.push({ type: "start", partial: createAssistantMessage("") });
+				const message = createAssistantMessage("");
+				message.stopReason = "toolUse";
+				const toolCalls: ToolCall[] = [
+					{ type: "toolCall", id: "complete-goal", name: "goal", arguments: { op: "complete" } },
+				];
+				if (includeSibling) {
+					toolCalls.push({
+						type: "toolCall",
+						id: "later-todo-mutation",
+						name: "todo",
+						arguments: { op: "init", list: [{ phase: "Later", items: ["Must not run"] }] },
+					});
+				}
+				message.content = toolCalls;
+				stream.push({ type: "done", reason: "toolUse", message });
+				return;
+			}
+			if (call > 2) {
+				const message = createAssistantMessage("Unexpected follow-on.");
+				stream.push({ type: "start", partial: createAssistantMessage("") });
+				stream.push({ type: "done", reason: "stop", message });
+				return;
+			}
+			onFinalizationCall?.();
+			if (finalizationRelease) await finalizationRelease;
+			if (outcome === "retryable-error" || outcome === "aborted") {
+				const message = createAssistantMessage("");
+				message.stopReason = outcome === "aborted" ? "aborted" : "error";
+				message.errorMessage =
+					outcome === "aborted" ? "Request was aborted" : "rate limit exceeded retry-after-ms=0";
+				stream.push({ type: "start", partial: createAssistantMessage("") });
+				stream.push({ type: "error", reason: message.stopReason, error: message });
+				return;
+			}
+			const text = outcome === "text" ? textOutcome : "";
+			const message = createAssistantMessage(text);
+			stream.push({ type: "start", partial: createAssistantMessage("") });
+			if (text) {
+				stream.push({ type: "text_delta", contentIndex: 0, delta: text, partial: message });
+			}
+			stream.push({ type: "done", reason: "stop", message });
+		});
+		return stream;
+	};
+	return observed;
+}
+
+type RecordedExtensionAgentEnd = {
+	type: "agent_end";
+	messages: unknown[];
+	willContinue?: boolean;
+};
+
+function createExtensionRecorder(
+	agentEnds: RecordedExtensionAgentEnd[],
+	gate?: { eventType: string; entered: () => void; release: Promise<void> },
+): ExtensionRunner {
+	let gateUsed = false;
+	return {
+		emit: vi.fn(async (event: { type: string; messages?: unknown[]; willContinue?: boolean }) => {
+			if (event.type === "agent_end") {
+				agentEnds.push({ type: "agent_end", messages: event.messages ?? [], willContinue: event.willContinue });
+			}
+			if (!gateUsed && gate?.eventType === event.type) {
+				gateUsed = true;
+				gate.entered();
+				await gate.release;
+			}
+		}),
+		emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
+		hasHandlers: vi.fn((type: string) => type === gate?.eventType),
+		getRegisteredCommands: vi.fn().mockReturnValue([]),
+		setToolApprovalPreviewWaiter: vi.fn().mockReturnValue(() => {}),
+	} as unknown as ExtensionRunner;
+}
+
+function queueFinalizationArrival(harness: GoalHarness, text: string): void {
+	harness.session.agent.steer({
+		role: "user",
+		content: text,
+		attribution: "user",
+		steering: true,
+		timestamp: Date.now(),
+	});
+}
+
+const GOAL_FINALIZATION_TEXT = "Goal complete. Final budget summary delivered.";
+
+function containsGoalFinalizationText(value: unknown): boolean {
+	return JSON.stringify(value).includes(GOAL_FINALIZATION_TEXT);
+}
+
+function endsWithGoalFinalization(messages: unknown): boolean {
+	if (!Array.isArray(messages)) return false;
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index];
+		if (!message || typeof message !== "object" || !("role" in message) || message.role !== "assistant") continue;
+		return containsGoalFinalizationText(message);
+	}
+	return false;
+}
+
+function endsWithGoalCompletionToolCall(messages: unknown): boolean {
+	if (!Array.isArray(messages)) return false;
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index];
+		if (!message || typeof message !== "object" || !("role" in message) || message.role !== "assistant") continue;
+		if (!("content" in message) || !Array.isArray(message.content)) return false;
+		return message.content.some((content: unknown) => {
+			if (!content || typeof content !== "object") return false;
+			return "type" in content && content.type === "toolCall" && "name" in content && content.name === "goal";
+		});
+	}
+	return false;
+}
+
+function lastAssistant(messages: unknown): { stopReason?: unknown; errorMessage?: unknown } | undefined {
+	if (!Array.isArray(messages)) return undefined;
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index];
+		if (message && typeof message === "object" && "role" in message && message.role === "assistant") {
+			return message;
+		}
+	}
+	return undefined;
 }
 
 describe("InteractiveMode goal mode integration", () => {
@@ -536,31 +708,24 @@ describe("InteractiveMode goal mode integration", () => {
 		expect(harness.mode.editor.pendingImageLinks).toEqual(["file:///later.png"]);
 	});
 
-	it("does not let a terminal goal completion race a later todo mutation in one tool batch", async () => {
+	it("stops sibling tools after goal completion and runs one text-only provider finalization", async () => {
+		const extensionAgentEnds: RecordedExtensionAgentEnd[] = [];
+		await harness.cleanup();
+		harness = await createGoalHarness(shared, createExtensionRecorder(extensionAgentEnds));
 		await harness.session.setActiveToolsByName(["goal", "todo"]);
-		await harness.session.goalRuntime.createGoal({ objective: "Complete the tracked work" });
-		harness.session.agent.streamFn = () => {
-			const stream = new AssistantMessageEventStream();
-			queueMicrotask(() => {
-				stream.push({ type: "start", partial: createAssistantMessage("") });
-				const message = createAssistantMessage("");
-				message.stopReason = "toolUse";
-				message.content = [
-					{ type: "toolCall", id: "complete-goal", name: "goal", arguments: { op: "complete" } },
-					{
-						type: "toolCall",
-						id: "later-todo-mutation",
-						name: "todo",
-						arguments: { op: "init", list: [{ phase: "Later", items: ["Must not run"] }] },
-					},
-				] as ToolCall[];
-				stream.push({ type: "done", reason: "toolUse", message });
-			});
-			return stream;
-		};
+		await harness.session.goalRuntime.createGoal({ objective: "Complete the tracked work", tokenBudget: 1_000 });
+		const observed = installGoalCompletionStream(harness, "text", true);
 		const closureRejections: unknown[] = [];
+		const toolResults: Array<{ toolName: string; isError: boolean }> = [];
+		const liveText: string[] = [];
 		const unsubscribe = harness.session.subscribe(event => {
 			if (event.type === "agent_end" && event.closureRejected) closureRejections.push(event.closureRejected);
+			if (event.type === "tool_execution_end") {
+				toolResults.push({ toolName: event.toolName, isError: event.isError ?? false });
+			}
+			if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+				liveText.push(event.assistantMessageEvent.delta);
+			}
 		});
 
 		try {
@@ -570,9 +735,733 @@ describe("InteractiveMode goal mode integration", () => {
 			unsubscribe();
 		}
 
+		expect(observed.providerCalls).toBe(2);
+		expect(observed.providerToolChoices).toEqual([undefined, "none"]);
+		expect(observed.providerContexts[1]).toContain("Goal achieved. Report final budget usage to the user");
+		expect(toolResults).toEqual([
+			{ toolName: "goal", isError: false },
+			{ toolName: "todo", isError: true },
+		]);
+		expect(liveText).toEqual(["Goal complete. Final budget summary delivered."]);
 		expect(harness.session.getTodoPhases()).toEqual([]);
 		expect(closureRejections).toEqual([]);
+		expect(extensionAgentEnds.filter(event => endsWithGoalFinalization(event.messages))).toHaveLength(1);
 	});
+
+	it("does not self-await when fallback reversion triggers threshold compaction during goal finalization", async () => {
+		const modelsConfigPath = path.join(shared.baseDir.path(), "goal-finalization-self-await-models.json");
+		await Bun.write(
+			modelsConfigPath,
+			JSON.stringify({
+				providers: {
+					anthropic: {
+						modelOverrides: {
+							"claude-sonnet-4-5": { contextWindow: 4_000 },
+							"claude-opus-4-5": { contextWindow: 1_000_000 },
+						},
+					},
+				},
+			}),
+		);
+		const modelRegistry = new ModelRegistry(shared.authStorage, modelsConfigPath);
+		const primaryModel = modelRegistry.find("anthropic", "claude-sonnet-4-5");
+		const fallbackModel = modelRegistry.find("anthropic", "claude-opus-4-5");
+		if (!primaryModel || !fallbackModel) throw new Error("Expected goal finalization regression models");
+		expect(primaryModel.contextWindow).toBe(4_000);
+
+		await harness.cleanup();
+		harness = await createGoalHarness(shared, undefined, undefined, {
+			modelRegistry,
+			model: primaryModel,
+			compactionEnabled: true,
+		});
+		harness.settings.set("compaction.asyncEnabled", false);
+		harness.settings.set("compaction.methodOrder", ["soft"]);
+		harness.settings.set("compaction.thresholdTokens", 3_000);
+		harness.settings.set("compaction.keepRecentTokens", 1);
+		harness.settings.set("contextPromotion.enabled", false);
+		harness.settings.set("retry.baseDelayMs", 1);
+		harness.settings.set("retry.maxRetries", 2);
+		harness.settings.set("retry.fallbackChains", {
+			default: [`${fallbackModel.provider}/${fallbackModel.id}`],
+		});
+		harness.settings.set("retry.fallbackRevertPolicy", "cooldown-expiry");
+		harness.settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
+		await harness.session.setActiveToolsByName(["goal"]);
+		await harness.session.goalRuntime.createGoal({ objective: "Complete the tracked work", tokenBudget: 20_000 });
+
+		let now = Date.now();
+		vi.spyOn(Date, "now").mockImplementation(() => now);
+		const seededMessage = { role: "user" as const, content: "old completed work", timestamp: now };
+		const firstKeptEntryId = harness.session.sessionManager.appendMessage(seededMessage);
+		harness.session.agent.appendMessage(seededMessage);
+		vi.spyOn(compactionModule, "prepareCompaction").mockReturnValue({
+			firstKeptEntryId,
+			messagesToSummarize: [{ role: "user", content: "older completed work", timestamp: now - 1 }],
+			turnPrefixMessages: [],
+			recentMessages: [],
+			isSplitTurn: false,
+			tokensBefore: 5_000,
+			fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+			settings: { ...compactionModule.DEFAULT_COMPACTION_SETTINGS, strategy: "context-full" },
+		});
+		let prePromptCalls = 0;
+		vi.spyOn(SessionMaintenance.prototype, "runPrePromptCompactionIfNeeded").mockImplementation(function (
+			this: SessionMaintenance,
+			_messages,
+			_semanticDeliveryAcceptance,
+			callContext,
+		) {
+			prePromptCalls++;
+			if (prePromptCalls === 1) return Promise.resolve();
+			return this.runAutoCompaction("threshold", false, false, false, {
+				autoContinue: false,
+				triggerContextTokens: 5_000,
+				phase: "pre_turn",
+				callContext,
+			}).then(() => {});
+		});
+		const compactSpy = vi.spyOn(compactionModule, "compact").mockImplementation(async preparation => ({
+			summary: "goal finalization threshold compaction",
+			shortSummary: undefined,
+			firstKeptEntryId: preparation.firstKeptEntryId,
+			tokensBefore: preparation.tokensBefore,
+			details: {},
+		}));
+		const requestedModels: string[] = [];
+		let providerCalls = 0;
+		harness.session.agent.streamFn = model => {
+			requestedModels.push(`${model.provider}/${model.id}`);
+			const call = ++providerCalls;
+			const stream = new AssistantMessageEventStream();
+			if (call === 2) now += 60_000;
+			queueMicrotask(() => {
+				stream.push({ type: "start", partial: createAssistantMessage("") });
+				if (call === 1) {
+					const message = createAssistantMessage("");
+					message.stopReason = "error";
+					message.errorMessage = "rate limit exceeded retry-after-ms=200";
+					stream.push({ type: "error", reason: "error", error: message });
+					return;
+				}
+				if (call === 2) {
+					const message = createAssistantMessage("");
+					message.stopReason = "toolUse";
+					message.content = [
+						{ type: "toolCall", id: "complete-goal", name: "goal", arguments: { op: "complete" } },
+					];
+					stream.push({ type: "done", reason: "toolUse", message });
+					return;
+				}
+				stream.push({ type: "done", reason: "stop", message: createAssistantMessage("Unexpected follow-on.") });
+			});
+			return stream;
+		};
+
+		const terminalAgentEnds: unknown[] = [];
+		let thresholdCompactions = 0;
+		let completedCompactions = 0;
+		const unsubscribe = harness.session.subscribe(event => {
+			if (event.type === "agent_end" && event.isTerminal) terminalAgentEnds.push(event);
+			if (event.type === "auto_compaction_start" && event.reason === "threshold") thresholdCompactions++;
+			if (event.type === "auto_compaction_end") completedCompactions++;
+		});
+		let promptSettled = false;
+		let idleSettled = false;
+		const completed = (async () => {
+			await harness.session.prompt("Complete the goal after fallback recovery.");
+			promptSettled = true;
+			await harness.session.waitForIdle();
+			idleSettled = true;
+		})();
+		const watchdog = Promise.withResolvers<"watchdog">();
+		// A promise self-cycle has no clock to advance or event to await, so this failure-only wall-clock watchdog is intentional.
+		const timer = setTimeout(() => watchdog.resolve("watchdog"), 2_000);
+		let outcome: "completed" | "watchdog";
+		try {
+			outcome = await Promise.race([completed.then(() => "completed" as const), watchdog.promise]);
+		} finally {
+			clearTimeout(timer);
+			unsubscribe();
+		}
+		if (outcome === "watchdog") {
+			const wedgedHarness = harness;
+			harness = await createGoalHarness(shared);
+			wedgedHarness.mode.stop();
+			wedgedHarness.tempDir.removeSync();
+			throw new Error(
+				`Goal finalization self-await watchdog fired (promptSettled=${promptSettled}, idleSettled=${idleSettled})`,
+			);
+		}
+		expect(requestedModels).toEqual([
+			`${primaryModel.provider}/${primaryModel.id}`,
+			`${fallbackModel.provider}/${fallbackModel.id}`,
+		]);
+		expect(compactSpy).toHaveBeenCalledTimes(1);
+		expect(thresholdCompactions).toBe(1);
+		expect(completedCompactions).toBe(1);
+		expect(terminalAgentEnds).toHaveLength(1);
+		expect(harness.session.goalCompletionFinalizationForTests()).toBeUndefined();
+		expect(harness.session.model?.id).toBe(primaryModel.id);
+		expect(promptSettled).toBe(true);
+		expect(idleSettled).toBe(true);
+		expect(harness.session.isStreaming).toBe(false);
+	});
+
+	it("blocks mutating owned-dialect tools during the bounded goal finalization", async () => {
+		await harness.cleanup();
+		harness = await createGoalHarness(shared, undefined, "glm");
+		await harness.session.setActiveToolsByName(["goal", "todo"]);
+		const todoTool = harness.toolRegistry.get("todo");
+		if (!todoTool) throw new Error("Expected todo tool in registry");
+		const executeTodo = vi.spyOn(todoTool, "execute");
+		await harness.session.goalRuntime.createGoal({ objective: "Complete the tracked work", tokenBudget: 1_000 });
+		const responses = [
+			"<tool_call>goal\n<arg_key>op</arg_key>\n<arg_value>complete</arg_value>\n</tool_call>",
+			'<tool_call>todo\n<arg_key>op</arg_key>\n<arg_value>init</arg_value>\n<arg_key>items</arg_key>\n<arg_value>["Must not run"]</arg_value>\n</tool_call>',
+			"Unexpected third provider turn.",
+		];
+		const providerToolChoices: unknown[] = [];
+		let providerCalls = 0;
+		harness.session.agent.streamFn = (_model, _context, options) => {
+			providerToolChoices.push(options?.toolChoice);
+			const text = responses[providerCalls++] ?? "Unexpected extra provider turn.";
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const message = createAssistantMessage(text);
+				stream.push({ type: "start", partial: createAssistantMessage("") });
+				stream.push({ type: "text_delta", contentIndex: 0, delta: text, partial: message });
+				stream.push({ type: "done", reason: "stop", message });
+			});
+			return stream;
+		};
+
+		await harness.session.prompt("Complete the goal.");
+		await harness.session.waitForIdle();
+
+		expect(providerCalls).toBe(2);
+		expect(providerToolChoices).toEqual([undefined, undefined]);
+		expect(executeTodo).not.toHaveBeenCalled();
+		expect(harness.session.getTodoPhases()).toEqual([]);
+	});
+
+	it("keeps the registry running until the goal finalization turn terminates", async () => {
+		await harness.session.setActiveToolsByName(["goal"]);
+		await harness.session.goalRuntime.createGoal({ objective: "Complete the tracked work", tokenBudget: 1_000 });
+		const finalizationEntered = Promise.withResolvers<void>();
+		const finalizationRelease = Promise.withResolvers<void>();
+		installGoalCompletionStream(
+			harness,
+			"text",
+			false,
+			() => finalizationEntered.resolve(),
+			finalizationRelease.promise,
+		);
+		const registry = new AgentRegistry();
+		const ref = registry.register({
+			id: "Main",
+			displayName: "Main",
+			kind: "main",
+			session: harness.session,
+			status: "idle",
+		});
+		const unsubscribeStatus = registry.syncSessionStatus(ref.id, harness.session);
+
+		try {
+			const prompt = harness.session.prompt("Complete the goal.");
+			await finalizationEntered.promise;
+			await waitForMicrotasks();
+			expect(ref.status).toBe("running");
+
+			finalizationRelease.resolve();
+			await prompt;
+			await harness.session.waitForIdle();
+			expect(ref.status).toBe("idle");
+		} finally {
+			finalizationRelease.resolve();
+			unsubscribeStatus();
+		}
+	});
+
+	it.each(["steer", "followUp"] as const)(
+		"parks a queued %s arrival until terminal goal finalization, then drains it as a fresh turn",
+		async delivery => {
+			await harness.session.setActiveToolsByName(["goal"]);
+			await harness.session.goalRuntime.createGoal({ objective: "Complete the tracked work", tokenBudget: 1_000 });
+			const queuedText = `queued ${delivery} after goal completion`;
+			const observed = installGoalCompletionStream(harness, "text", false, () => {
+				const message = {
+					role: "user" as const,
+					content: queuedText,
+					attribution: "user" as const,
+					timestamp: Date.now(),
+				};
+				if (delivery === "steer") harness.session.agent.steer({ ...message, steering: true });
+				else harness.session.agent.followUp(message);
+			});
+			let queuesAtFinalizationEnd: [steering: number, followUp: number] | undefined;
+			const terminalProviderCalls: number[] = [];
+			const unsubscribe = harness.session.subscribe(event => {
+				if (event.type !== "agent_end" || !event.isTerminal) return;
+				terminalProviderCalls.push(observed.providerCalls);
+				if (observed.providerCalls === 2) {
+					queuesAtFinalizationEnd = [
+						harness.session.agent.peekSteeringQueue().length,
+						harness.session.agent.peekFollowUpQueue().length,
+					];
+				}
+			});
+
+			try {
+				await harness.session.prompt("Complete the goal.");
+				await harness.session.waitForIdle();
+			} finally {
+				unsubscribe();
+			}
+
+			expect(observed.providerCalls).toBe(3);
+			expect(observed.providerToolChoices).toEqual([undefined, "none", undefined]);
+			expect(observed.providerContexts[1]).not.toContain(queuedText);
+			expect(terminalProviderCalls[0]).toBe(2);
+			expect(queuesAtFinalizationEnd).toEqual([0, 0]);
+			expect(observed.providerContexts[2]).toContain(queuedText);
+			expect(harness.session.getAutomaticTurnOutcomes()).toEqual(
+				expect.arrayContaining([expect.objectContaining({ source: "direct_user_input", status: "started" })]),
+			);
+		},
+	);
+
+	it.each(["empty", "retryable-error", "aborted"] as const)(
+		"treats a %s goal finalization result as terminal without another provider call",
+		async outcome => {
+			await harness.session.setActiveToolsByName(["goal"]);
+			await harness.session.goalRuntime.createGoal({ objective: "Complete the tracked work", tokenBudget: 1_000 });
+			const observed = installGoalCompletionStream(harness, outcome);
+			const terminalStates: Array<boolean | undefined> = [];
+			const unsubscribe = harness.session.subscribe(event => {
+				if (event.type === "agent_end") terminalStates.push(event.isTerminal);
+			});
+
+			try {
+				await harness.session.prompt("Complete the goal.");
+				await harness.session.waitForIdle();
+			} finally {
+				unsubscribe();
+			}
+
+			expect(observed.providerCalls).toBe(2);
+			expect(observed.providerToolChoices).toEqual([undefined, "none"]);
+			expect(terminalStates.at(-1)).toBe(true);
+		},
+	);
+
+	it.each(["skips", "errors"] as const)(
+		"emits the original settle terminally when goal finalization %s before start",
+		async outcome => {
+			await harness.session.setActiveToolsByName(["goal"]);
+			await harness.session.goalRuntime.createGoal({ objective: "Complete the tracked work", tokenBudget: 1_000 });
+			const observed = installGoalCompletionStream(harness, "text");
+			const continueSpy = vi.spyOn(harness.session.agent, "continue");
+			if (outcome === "skips") continueSpy.mockResolvedValueOnce();
+			else continueSpy.mockRejectedValueOnce(new Error("finalization pre-start failure"));
+			const terminalStates: Array<boolean | undefined> = [];
+			const unsubscribe = harness.session.subscribe(event => {
+				if (event.type === "agent_end") terminalStates.push(event.isTerminal);
+			});
+
+			try {
+				await harness.session.prompt("Complete the goal.");
+				await harness.session.waitForIdle();
+			} finally {
+				unsubscribe();
+			}
+
+			expect(observed.providerCalls).toBe(1);
+			expect(continueSpy).toHaveBeenCalledTimes(1);
+			expect(terminalStates).toEqual([true]);
+		},
+	);
+
+	it("lets an external abort suppress a late successful goal completion", async () => {
+		const goalTool = harness.toolRegistry.get("goal");
+		if (!goalTool) throw new Error("Expected goal tool in registry");
+		const executeGoal = goalTool.execute.bind(goalTool);
+		const completionReady = Promise.withResolvers<void>();
+		const releaseCompletion = Promise.withResolvers<void>();
+		vi.spyOn(goalTool, "execute").mockImplementation(async (...args) => {
+			const result = await executeGoal(...args);
+			completionReady.resolve();
+			await releaseCompletion.promise;
+			return result;
+		});
+		await harness.session.setActiveToolsByName(["goal"]);
+		await harness.session.goalRuntime.createGoal({ objective: "Complete the tracked work", tokenBudget: 1_000 });
+		const observed = installGoalCompletionStream(harness, "text");
+		const continueSpy = vi.spyOn(harness.session.agent, "continue");
+
+		const prompt = harness.session.prompt("Complete the goal.");
+		await completionReady.promise;
+		const abort = harness.session.abort({ reason: USER_INTERRUPT_LABEL });
+		releaseCompletion.resolve();
+		await Promise.allSettled([prompt, abort]);
+		await harness.session.waitForIdle();
+
+		expect(observed.providerToolChoices).not.toContain("none");
+		expect(continueSpy).not.toHaveBeenCalled();
+	});
+
+	it("keeps cancelled finalization ownership until a buffered agent_start and its abort settle", async () => {
+		await harness.session.setActiveToolsByName(["goal"]);
+		await harness.session.goalRuntime.createGoal({ objective: "Complete the tracked work", tokenBudget: 1_000 });
+		const activeAgentEndEntered = Promise.withResolvers<void>();
+		const releaseActiveAgentEnd = Promise.withResolvers<void>();
+		const onAgentEnd = harness.session.goalRuntime.onAgentEnd.bind(harness.session.goalRuntime);
+		let agentEndCalls = 0;
+		vi.spyOn(harness.session.goalRuntime, "onAgentEnd").mockImplementation(async context => {
+			await onAgentEnd(context);
+			agentEndCalls++;
+			if (agentEndCalls !== 2) return;
+			activeAgentEndEntered.resolve();
+			await releaseActiveAgentEnd.promise;
+		});
+		const queuedText = "queued across buffered finalization start";
+		const providerContexts: string[] = [];
+		let stateAtCancellation: { phase: "pending" | "active"; cancelled: boolean } | undefined;
+		let continuationStreamingAtCancellation = false;
+		let abort: Promise<void> | undefined;
+		let providerCalls = 0;
+		await harness.session.setAgentEventConnectionForTests(false);
+		let agentStarts = 0;
+		const unsubscribeAgentProbe = harness.session.agent.subscribe(event => {
+			if (event.type !== "agent_start" || ++agentStarts !== 2) return;
+			continuationStreamingAtCancellation = harness.session.agent.state.isStreaming;
+			queueFinalizationArrival(harness, queuedText);
+			abort = harness.session.abort({ reason: USER_INTERRUPT_LABEL });
+			stateAtCancellation = harness.session.goalCompletionFinalizationForTests();
+		});
+		await harness.session.setAgentEventConnectionForTests(true);
+		harness.session.agent.streamFn = (_model, context, options) => {
+			const call = ++providerCalls;
+			providerContexts.push(JSON.stringify(context.messages));
+			if (call === 1) {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: createAssistantMessage("") });
+					const message = createAssistantMessage("");
+					message.stopReason = "toolUse";
+					message.content = [
+						{ type: "toolCall", id: "complete-goal", name: "goal", arguments: { op: "complete" } },
+					];
+					stream.push({ type: "done", reason: "toolUse", message });
+				});
+				return stream;
+			}
+			if (call === 2) {
+				const stream = new AssistantMessageEventStream();
+				stream.push({ type: "start", partial: createAssistantMessage("") });
+				options?.signal?.addEventListener(
+					"abort",
+					() => {
+						const message = createAssistantMessage("");
+						message.stopReason = "aborted";
+						message.errorMessage = "Request was aborted";
+						stream.push({ type: "error", reason: "aborted", error: message });
+					},
+					{ once: true },
+				);
+				return stream;
+			}
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				stream.push({ type: "start", partial: createAssistantMessage("") });
+				stream.push({ type: "done", reason: "stop", message: createAssistantMessage("Queued arrival handled.") });
+			});
+			return stream;
+		};
+
+		try {
+			const prompt = harness.session.prompt("Complete the goal.");
+			await activeAgentEndEntered.promise;
+			expect(continuationStreamingAtCancellation).toBe(true);
+			expect(stateAtCancellation).toEqual({ phase: "pending", cancelled: true });
+			expect(harness.session.goalCompletionFinalizationForTests()).toEqual({ phase: "active", cancelled: true });
+			releaseActiveAgentEnd.resolve();
+			if (!abort) throw new Error("Expected agent_start probe to cancel finalization");
+			await Promise.allSettled([prompt, abort]);
+			await harness.session.waitForIdle();
+
+			expect(harness.session.goalCompletionFinalizationForTests()).toBeUndefined();
+			expect(providerCalls).toBe(3);
+			expect(providerContexts.filter(context => context.includes(queuedText))).toHaveLength(1);
+		} finally {
+			releaseActiveAgentEnd.resolve();
+			unsubscribeAgentProbe();
+		}
+	});
+
+	it("restores active finalization queues before disconnecting from agent events", async () => {
+		await harness.session.setActiveToolsByName(["goal"]);
+		await harness.session.goalRuntime.createGoal({ objective: "Complete the tracked work", tokenBudget: 1_000 });
+		const startConsumed = Promise.withResolvers<void>();
+		const queuedText = "queued before lifecycle disconnect";
+		let providerCalls = 0;
+		harness.session.agent.streamFn = (_model, _context, options) => {
+			const call = ++providerCalls;
+			if (call === 1) {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: createAssistantMessage("") });
+					const message = createAssistantMessage("");
+					message.stopReason = "toolUse";
+					message.content = [
+						{ type: "toolCall", id: "complete-goal", name: "goal", arguments: { op: "complete" } },
+					];
+					stream.push({ type: "done", reason: "toolUse", message });
+				});
+				return stream;
+			}
+			const stream = new (class extends AssistantMessageEventStream {
+				override async *[Symbol.asyncIterator]() {
+					const start = this.queue.shift();
+					if (start) yield start;
+					startConsumed.resolve();
+					const iterator = super[Symbol.asyncIterator]();
+					while (true) {
+						const result = await iterator.next();
+						if (result.done) return;
+						yield result.value;
+					}
+				}
+			})();
+			stream.push({ type: "start", partial: createAssistantMessage("") });
+			options?.signal?.addEventListener(
+				"abort",
+				() => {
+					const message = createAssistantMessage("");
+					message.stopReason = "aborted";
+					message.errorMessage = "Request was aborted";
+					stream.push({ type: "error", reason: "aborted", error: message });
+				},
+				{ once: true },
+			);
+			return stream;
+		};
+
+		const prompt = harness.session.prompt("Complete the goal.");
+		await startConsumed.promise;
+		expect(harness.session.goalCompletionFinalizationForTests()).toEqual({ phase: "active", cancelled: false });
+		queueFinalizationArrival(harness, queuedText);
+
+		await harness.session.setAgentEventConnectionForTests(false);
+		expect(harness.session.goalCompletionFinalizationForTests()).toBeUndefined();
+		expect(harness.session.agent.peekSteeringQueue()).toContainEqual(
+			expect.objectContaining({ content: queuedText }),
+		);
+
+		await Promise.allSettled([prompt, harness.session.abort({ reason: USER_INTERRUPT_LABEL })]);
+		expect(harness.session.agent.peekSteeringQueue()).toContainEqual(
+			expect.objectContaining({ content: queuedText }),
+		);
+	});
+
+	it.each(["newSession", "switchSession"] as const)(
+		"keeps finalization queues parked until a retiring continuation exits during %s",
+		async transition => {
+			await harness.session.setActiveToolsByName(["goal"]);
+			await harness.session.goalRuntime.createGoal({ objective: "Complete the tracked work", tokenBudget: 1_000 });
+			const observed = installGoalCompletionStream(harness, "text");
+			const continueEntered = Promise.withResolvers<void>();
+			const releaseContinue = Promise.withResolvers<void>();
+			const continueAgent = harness.session.agent.continue.bind(harness.session.agent);
+			let continuationObservedAbort = false;
+			vi.spyOn(harness.session.agent, "continue").mockImplementation(async signal => {
+				continueEntered.resolve();
+				await releaseContinue.promise;
+				continuationObservedAbort = signal?.aborted === true;
+				return continueAgent(signal);
+			});
+			let targetPath: string | undefined;
+			if (transition === "switchSession") {
+				const targetManager = SessionManager.create(harness.tempDir.path(), harness.tempDir.path());
+				targetManager.appendMessage({ role: "user", content: "target session", timestamp: Date.now() });
+				await targetManager.ensureOnDisk();
+				targetPath = targetManager.getSessionFile() ?? undefined;
+				await targetManager.close();
+				if (!targetPath) throw new Error("Expected switch target session file");
+			}
+
+			const prompt = harness.session.prompt("Complete the goal.");
+			await continueEntered.promise;
+			const queuedText = `queued before ${transition}`;
+			queueFinalizationArrival(harness, queuedText);
+			const lifecycle =
+				transition === "newSession" ? harness.session.newSession() : harness.session.switchSession(targetPath!);
+
+			try {
+				await waitForMicrotasks();
+				expect(harness.session.goalCompletionFinalizationForTests()).toEqual({
+					phase: "pending",
+					cancelled: true,
+				});
+				expect(harness.session.agent.peekSteeringQueue()).toEqual([]);
+
+				releaseContinue.resolve();
+				await expect(lifecycle).resolves.toBe(true);
+				await Promise.allSettled([prompt]);
+				expect(observed.providerCalls).toBe(2);
+				expect(continuationObservedAbort).toBe(true);
+				expect(observed.providerContexts.some(context => context.includes(queuedText))).toBe(false);
+			} finally {
+				releaseContinue.resolve();
+			}
+		},
+	);
+
+	it("emits one cancelled terminal when a finalization message_end subscriber aborts before routing", async () => {
+		const extensionAgentEnds: RecordedExtensionAgentEnd[] = [];
+		await harness.cleanup();
+		harness = await createGoalHarness(shared, createExtensionRecorder(extensionAgentEnds));
+		await harness.session.setActiveToolsByName(["goal"]);
+		await harness.session.goalRuntime.createGoal({ objective: "Complete the tracked work", tokenBudget: 1_000 });
+		const observed = installGoalCompletionStream(harness, "text");
+		const terminalPublicAgentEnds: Array<{ messages: unknown }> = [];
+		let abortPromise: Promise<void> | undefined;
+		const unsubscribe = harness.session.subscribe(event => {
+			if (
+				event.type === "message_end" &&
+				event.message.role === "assistant" &&
+				containsGoalFinalizationText(event.message) &&
+				!abortPromise
+			) {
+				abortPromise = harness.session.abort({ reason: USER_INTERRUPT_LABEL });
+			}
+			if (event.type === "agent_end" && event.isTerminal && endsWithGoalFinalization(event.messages)) {
+				terminalPublicAgentEnds.push(event);
+			}
+		});
+
+		try {
+			await Promise.allSettled([harness.session.prompt("Complete the goal.")]);
+			if (!abortPromise) throw new Error("Expected finalization message_end subscriber to abort");
+			await abortPromise;
+			await harness.session.waitForIdle();
+		} finally {
+			unsubscribe();
+		}
+
+		expect(terminalPublicAgentEnds).toHaveLength(1);
+		expect(lastAssistant(terminalPublicAgentEnds[0]?.messages)).toMatchObject({
+			stopReason: "aborted",
+			errorMessage: USER_INTERRUPT_LABEL,
+		});
+		const terminalExtensionAgentEnds = extensionAgentEnds.filter(event => endsWithGoalFinalization(event.messages));
+		expect(terminalExtensionAgentEnds).toHaveLength(1);
+		expect(lastAssistant(terminalExtensionAgentEnds[0]?.messages)).toMatchObject({
+			stopReason: "aborted",
+			errorMessage: USER_INTERRUPT_LABEL,
+		});
+		expect(observed.providerCalls).toBe(2);
+	});
+
+	it("emits one cancelled original goal settle while a preceding extension ticket is blocked", async () => {
+		const extensionAgentEnds: RecordedExtensionAgentEnd[] = [];
+		const originalExtensionEntered = Promise.withResolvers<void>();
+		const releaseOriginalExtension = Promise.withResolvers<void>();
+		await harness.cleanup();
+		harness = await createGoalHarness(
+			shared,
+			createExtensionRecorder(extensionAgentEnds, {
+				eventType: "tool_execution_end",
+				entered: () => originalExtensionEntered.resolve(),
+				release: releaseOriginalExtension.promise,
+			}),
+		);
+		await harness.session.setActiveToolsByName(["goal"]);
+		await harness.session.goalRuntime.createGoal({ objective: "Complete the tracked work", tokenBudget: 1_000 });
+		const queuedText = "queued while preceding extension is blocked";
+		const observed = installGoalCompletionStream(
+			harness,
+			"text",
+			false,
+			undefined,
+			undefined,
+			"Queued arrival handled.",
+		);
+		const publicAgentEnds: Array<{ messages: unknown }> = [];
+		const unsubscribe = harness.session.subscribe(event => {
+			if (event.type === "agent_end") publicAgentEnds.push(event);
+		});
+
+		try {
+			const prompt = harness.session.prompt("Complete the goal.");
+			await originalExtensionEntered.promise;
+			expect(harness.session.goalCompletionFinalizationForTests()?.phase).toBe("pending");
+			queueFinalizationArrival(harness, queuedText);
+			const abort = harness.session.abort({ reason: USER_INTERRUPT_LABEL });
+			releaseOriginalExtension.resolve();
+			await Promise.allSettled([prompt, abort]);
+			await harness.session.waitForIdle();
+		} finally {
+			unsubscribe();
+			releaseOriginalExtension.resolve();
+		}
+
+		const terminalPublicAgentEnds = publicAgentEnds.filter(event => endsWithGoalCompletionToolCall(event.messages));
+		expect(terminalPublicAgentEnds).toHaveLength(1);
+		expect(lastAssistant(terminalPublicAgentEnds[0]?.messages)).toMatchObject({ stopReason: "aborted" });
+		const terminalExtensionAgentEnds = extensionAgentEnds.filter(event =>
+			endsWithGoalCompletionToolCall(event.messages),
+		);
+		expect(terminalExtensionAgentEnds).toHaveLength(1);
+		expect(lastAssistant(terminalExtensionAgentEnds[0]?.messages)).toMatchObject({ stopReason: "aborted" });
+		expect(observed.providerToolChoices).not.toContain("none");
+		expect(observed.providerContexts.filter(context => context.includes(queuedText))).toHaveLength(1);
+	});
+
+	it("converts a deferred finalization agent_end to one cancelled terminal before flushing", async () => {
+		const extensionAgentEnds: RecordedExtensionAgentEnd[] = [];
+		await harness.cleanup();
+		harness = await createGoalHarness(shared, createExtensionRecorder(extensionAgentEnds));
+		await harness.session.setActiveToolsByName(["goal"]);
+		await harness.session.goalRuntime.createGoal({ objective: "Complete the tracked work", tokenBudget: 1_000 });
+		const releasePostPrompt = Promise.withResolvers<void>();
+		const queuedText = "queued before deferred terminal flush";
+		const observed = installGoalCompletionStream(harness, "text", false, () => {
+			harness.session.trackPostPromptTaskForTests(releasePostPrompt.promise);
+			queueFinalizationArrival(harness, queuedText);
+		});
+		const terminalPublicAgentEnds: Array<{ messages: unknown }> = [];
+		const unsubscribe = harness.session.subscribe(event => {
+			if (event.type === "agent_end" && event.isTerminal && endsWithGoalFinalization(event.messages)) {
+				terminalPublicAgentEnds.push(event);
+			}
+		});
+
+		try {
+			const prompt = harness.session.prompt("Complete the goal.");
+			await harness.session.waitForPendingAgentEndForTests(
+				pending =>
+					pending.type === "agent_end" &&
+					pending.isTerminal === true &&
+					endsWithGoalFinalization(pending.messages),
+			);
+			const abort = harness.session.abort({ reason: USER_INTERRUPT_LABEL });
+			releasePostPrompt.resolve();
+			await Promise.allSettled([prompt, abort]);
+			await harness.session.waitForIdle();
+		} finally {
+			unsubscribe();
+			releasePostPrompt.resolve();
+		}
+
+		expect(terminalPublicAgentEnds).toHaveLength(1);
+		expect(lastAssistant(terminalPublicAgentEnds[0]?.messages)).toMatchObject({ stopReason: "aborted" });
+		const terminalExtensionAgentEnds = extensionAgentEnds.filter(event => endsWithGoalFinalization(event.messages));
+		expect(terminalExtensionAgentEnds).toHaveLength(1);
+		expect(lastAssistant(terminalExtensionAgentEnds[0]?.messages)).toMatchObject({ stopReason: "aborted" });
+		expect(observed.providerContexts.filter(context => context.includes(queuedText))).toHaveLength(1);
+	});
+
 	it("includes only open todo state in typed provider context during goal turns", async () => {
 		await harness.session.setActiveToolsByName(["read", "todo"]);
 		await harness.mode.handleGoalModeCommand("Ship the release");

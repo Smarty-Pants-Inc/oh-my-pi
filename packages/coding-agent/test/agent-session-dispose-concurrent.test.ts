@@ -14,7 +14,7 @@ import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage
 import { EvalRunner } from "@oh-my-pi/pi-coding-agent/session/eval-runner";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { logger, TempDir } from "@oh-my-pi/pi-utils";
-import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
+import { createAssistantMessage, createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
 async function flushMicrotasks(): Promise<void> {
 	await Promise.resolve();
@@ -231,6 +231,165 @@ describe("AgentSession concurrent disposal", () => {
 		expect(shutdown).toHaveBeenCalledTimes(1);
 		expect(extensionRunner.clearManagedTimers).toHaveBeenCalledTimes(1);
 	});
+
+	it("drains a queued extension agent_end before session_shutdown", async () => {
+		const extensionEntered = Promise.withResolvers<void>();
+		const releaseExtension = Promise.withResolvers<void>();
+		const publicAgentEnd = Promise.withResolvers<void>();
+		const order: string[] = [];
+		let shutdownPublished = false;
+		const extensionRunner = {
+			hasHandlers: vi.fn((type: string) => type === "agent_end" || type === "session_shutdown"),
+			emit: vi.fn(async (event: { type: string }) => {
+				if (shutdownPublished) order.push(`after-shutdown:${event.type}`);
+				if (event.type !== "agent_end") return;
+				order.push("agent_end:start");
+				extensionEntered.resolve();
+				await releaseExtension.promise;
+				order.push("agent_end:end");
+			}),
+			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
+			emitSessionShutdown: vi.fn(async () => {
+				shutdownPublished = true;
+				order.push("session_shutdown");
+				return new Set<string>();
+			}),
+			disposeFileFallbacks: vi.fn(),
+			clearManagedTimers: vi.fn(),
+		} as unknown as ExtensionRunner;
+		const current = createSession(undefined, { extensionRunner });
+		let dispose: Promise<void> | undefined;
+		current.subscribe(event => {
+			if (event.type !== "agent_end") return;
+			publicAgentEnd.resolve();
+			dispose ??= current.dispose();
+		});
+
+		const prompt = current.prompt("finish before shutdown");
+		await publicAgentEnd.promise;
+		await extensionEntered.promise;
+		expect(shutdownPublished).toBe(false);
+
+		releaseExtension.resolve();
+		await Promise.all([prompt, dispose!]);
+		session = undefined;
+
+		expect(order).toEqual(["agent_end:start", "agent_end:end", "session_shutdown"]);
+		expect(order.filter(event => event.startsWith("after-shutdown:"))).toEqual([]);
+	});
+
+	it("keeps a suppressed abort agent_end behind blocked message_end fan-out before shutdown", async () => {
+		const extensionEntered = Promise.withResolvers<void>();
+		const releaseExtension = Promise.withResolvers<void>();
+		const order: string[] = [];
+		let shutdownPublished = false;
+		const extensionRunner = {
+			hasHandlers: vi.fn((type: string) => type === "message_end" || type === "session_shutdown"),
+			emit: vi.fn(async (event: { type: string }) => {
+				if (event.type !== "message_end") return;
+				order.push("message_end:extension:start");
+				extensionEntered.resolve();
+				await releaseExtension.promise;
+				if (shutdownPublished) order.push("after-shutdown:message_end:extension");
+				order.push("message_end:extension:end");
+			}),
+			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
+			emitSessionShutdown: vi.fn(async () => {
+				shutdownPublished = true;
+				order.push("session_shutdown");
+				return new Set<string>();
+			}),
+			disposeFileFallbacks: vi.fn(),
+			clearManagedTimers: vi.fn(),
+		} as unknown as ExtensionRunner;
+		const current = createSession(undefined, { extensionRunner });
+		let publicAgentEnds = 0;
+		current.subscribe(event => {
+			if (event.type === "agent_end") publicAgentEnds++;
+			if (event.type !== "message_end") return;
+			if (shutdownPublished) order.push("after-shutdown:message_end:public");
+			order.push("message_end:public");
+		});
+
+		const message = createAssistantMessage("blocked ordinary event");
+		const messageEnd = current.emitSessionEventForTests({ type: "message_end", message });
+		await extensionEntered.promise;
+
+		// beginDispose() is dispose's synchronous fence; the tracked promise models
+		// #dispatchAgentEvent's abort agent_end ownership before teardown drains it.
+		current.beginDispose();
+		const abortedMessage = { ...createAssistantMessage("aborted terminal"), stopReason: "aborted" as const };
+		const abortAgentEnd = current
+			.emitSessionEventForTests({ type: "agent_end", messages: [abortedMessage] })
+			.then(() => order.push("agent_end:suppressed"));
+		current.trackPostPromptTaskForTests(abortAgentEnd);
+		const dispose = current.dispose();
+		for (let i = 0; i < 20 && !shutdownPublished; i++) await flushMicrotasks();
+		expect(shutdownPublished).toBe(false);
+		expect(order).toEqual(["message_end:extension:start"]);
+
+		releaseExtension.resolve();
+		await Promise.all([messageEnd, abortAgentEnd, dispose]);
+		session = undefined;
+
+		expect(publicAgentEnds).toBe(0);
+		expect(order).toEqual([
+			"message_end:extension:start",
+			"message_end:extension:end",
+			"message_end:public",
+			"agent_end:suppressed",
+			"session_shutdown",
+		]);
+		expect(order.filter(event => event.startsWith("after-shutdown:"))).toEqual([]);
+	});
+
+	it("does not publish a late agent_end after session_shutdown", async () => {
+		vi.spyOn(logger, "warn").mockImplementation(() => {});
+		const releaseLateTask = Promise.withResolvers<void>();
+		const shutdownEntered = Promise.withResolvers<void>();
+		const releaseShutdown = Promise.withResolvers<void>();
+		const extensionAgentEnds: string[] = [];
+		const publicAgentEnds: string[] = [];
+		let shutdownPublished = false;
+		const extensionRunner = {
+			hasHandlers: vi.fn((type: string) => type === "agent_end" || type === "session_shutdown"),
+			emit: vi.fn(async (event: { type: string }) => {
+				if (event.type === "agent_end") extensionAgentEnds.push(shutdownPublished ? "after" : "before");
+			}),
+			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
+			emitSessionShutdown: vi.fn(async () => {
+				shutdownPublished = true;
+				shutdownEntered.resolve();
+				await releaseShutdown.promise;
+				return new Set<string>();
+			}),
+			disposeFileFallbacks: vi.fn(),
+			clearManagedTimers: vi.fn(),
+		} as unknown as ExtensionRunner;
+		const current = createSession(undefined, { extensionRunner });
+		current.subscribe(event => {
+			if (event.type === "agent_end") publicAgentEnds.push(shutdownPublished ? "after" : "before");
+		});
+		const lateAssistant = createAssistantMessage("late terminal");
+		const lateTask = releaseLateTask.promise.then(() => {
+			current.agent.emitExternalEvent({ type: "agent_end", messages: [lateAssistant] });
+		});
+		current.trackPostPromptTaskForTests(lateTask);
+
+		const dispose = current.dispose();
+		await shutdownEntered.promise;
+		releaseLateTask.resolve();
+		await lateTask;
+		await flushMicrotasks();
+		expect(publicAgentEnds).toEqual([]);
+		expect(extensionAgentEnds).toEqual([]);
+
+		releaseShutdown.resolve();
+		await dispose;
+		session = undefined;
+		expect(publicAgentEnds).toEqual([]);
+		expect(extensionAgentEnds).toEqual([]);
+	}, 15_000);
 
 	it("bounds post-prompt work that ignores abort", async () => {
 		vi.useFakeTimers();

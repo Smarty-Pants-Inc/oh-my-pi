@@ -294,8 +294,11 @@ FAKE_SERVER = textwrap.dedent(
                 command_type,
                 {
                     "protocolVersion": 2,
-                    "closureRejection": True,
-                    "idleBarrier": True,
+                    "closureRejection": (
+                        command.get("closureRejection") is True
+                        and os.environ.get("NEGOTIATE_NO_CLOSURE_REJECTION") != "1"
+                    ),
+                    "idleBarrier": command.get("idleBarrier") is True,
                 },
             )
         elif command_type == "wait_for_idle":
@@ -993,6 +996,75 @@ OVERLAPPING_LATE_PROMPT_FAILURE_SERVER = textwrap.dedent(
 )
 
 
+LOCAL_PROMPT_RESULT_OVERLAP_SERVER = textwrap.dedent(
+    """
+    import json
+    import os
+    import sys
+
+    def respond(request_id, command, data=None):
+        payload = {
+            "id": request_id,
+            "type": "response",
+            "command": command,
+            "success": True,
+        }
+        if data is not None:
+            payload["data"] = data
+        print(json.dumps(payload), flush=True)
+
+    ready = {"type": "ready"}
+    if os.environ.get("PARTIAL_V2") == "1":
+        ready.update(
+            {
+                "protocolVersion": 1,
+                "supportedProtocolVersions": [1, 2],
+                "maxFrameBytes": 1024 * 1024,
+                "maxReassembledFrameBytes": 64 * 1024 * 1024,
+            }
+        )
+    print(json.dumps(ready), flush=True)
+    first_prompt_id = None
+
+    for raw_line in sys.stdin:
+        command = json.loads(raw_line)
+        command_type = command["type"]
+        request_id = command.get("id")
+        if command_type == "negotiate_protocol":
+            respond(
+                request_id,
+                command_type,
+                {"protocolVersion": 2, "closureRejection": False, "idleBarrier": True},
+            )
+        elif command_type == "prompt" and first_prompt_id is None:
+            first_prompt_id = request_id
+            respond(request_id, command_type)
+        elif command_type == "prompt":
+            respond(request_id, command_type)
+            print(
+                json.dumps(
+                    {
+                        "type": "prompt_result",
+                        "id": first_prompt_id,
+                        "agentInvoked": False,
+                    }
+                ),
+                flush=True,
+            )
+        elif command_type == "release":
+            print(
+                json.dumps({"type": "agent_end", "messages": [], "isTerminal": True}),
+                flush=True,
+            )
+            respond(request_id, command_type)
+        elif command_type == "wait_for_idle":
+            continue
+        else:
+            respond(request_id, command_type)
+    """
+)
+
+
 STDERR_SERVER = textwrap.dedent(
     """
     import json
@@ -1534,6 +1606,46 @@ class RpcClientTests(unittest.TestCase):
         self.assertEqual(turn.events, ())
         self.assertIsNone(turn.assistant_text)
 
+    def test_legacy_wait_for_idle_returns_after_correlated_prompt_result(
+        self,
+    ) -> None:
+        with self.make_client() as client:
+            client.prompt("local prompt result")
+            client.wait_for_idle(timeout=2.0)
+
+    def test_partial_v2_local_prompt_result_completes_only_its_schedule(
+        self,
+    ) -> None:
+        env = {
+            "FAKE_RPC_V2": "1",
+            "NEGOTIATE_NO_CLOSURE_REJECTION": "1",
+            "HANG_IDLE_BARRIER": "1",
+        }
+        for command in ("prompt", "abort_and_prompt"):
+            with self.subTest(command=command), self.make_client(env=env) as client:
+                if command == "prompt":
+                    client.prompt("local prompt result")
+                else:
+                    client.abort_and_prompt("local prompt result")
+                client.wait_for_idle(timeout=0.2)
+
+    def test_older_prompt_result_does_not_complete_a_newer_schedule(
+        self,
+    ) -> None:
+        for name, env in (("legacy", {}), ("partial-v2", {"PARTIAL_V2": "1"})):
+            with (
+                self.subTest(protocol=name),
+                self.make_client(
+                    server=LOCAL_PROMPT_RESULT_OVERLAP_SERVER, env=env
+                ) as client,
+            ):
+                client.prompt("schedule A")
+                client.prompt("schedule B")
+                with self.assertRaises(RpcTimeoutError):
+                    client.wait_for_idle(timeout=0.05)
+                client.request_raw("release")
+                client.wait_for_idle(timeout=0.2)
+
     def test_wait_for_idle_reaches_barrier_after_async_local_prompt_result(
         self,
     ) -> None:
@@ -1712,6 +1824,24 @@ class RpcClientTests(unittest.TestCase):
             elapsed = time.monotonic() - started
 
         self.assertLess(elapsed, 1.0)
+
+    def test_wait_for_idle_uses_legacy_terminal_without_closure_capability(
+        self,
+    ) -> None:
+        client = RpcClient(
+            command=[sys.executable, "-u", "-c", FAKE_SERVER],
+            env={
+                "FAKE_RPC_V2": "1",
+                "HANG_IDLE_BARRIER": "1",
+                "NEGOTIATE_NO_CLOSURE_REJECTION": "1",
+            },
+            startup_timeout=2.0,
+            request_timeout=2.0,
+        )
+
+        with client:
+            client.prompt("say hello")
+            client.wait_for_idle(timeout=0.2)
 
     def test_rejected_terminal_event_is_published_before_barrier_completion(
         self,
@@ -2135,6 +2265,323 @@ class StopUnblocksPromptAndWaitTests(unittest.TestCase):
         finally:
             # stop() is idempotent; safe to call again on cleanup paths.
             client.stop()
+
+    def test_stop_fails_registered_requests_and_rejects_late_registration(self) -> None:
+        from omp_rpc import RpcProcessExitError
+
+        client = RpcClient(
+            command=[sys.executable, "-u", "-c", HANGING_SERVER],
+            startup_timeout=2.0,
+            request_timeout=2.0,
+        )
+        first_errors: list[BaseException] = []
+        late_errors: list[BaseException] = []
+        first_done = threading.Event()
+        late_snapshot = threading.Event()
+        allow_late_registration = threading.Event()
+        closed = threading.Event()
+        allow_stop = threading.Event()
+
+        def send_first() -> None:
+            try:
+                client.request_raw("get_state")
+            except BaseException as exc:
+                first_errors.append(exc)
+            finally:
+                first_done.set()
+
+        client.start()
+        first_thread = threading.Thread(target=send_first)
+        first_thread.start()
+        try:
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                with client._state_lock:
+                    if client._pending:
+                        break
+                time.sleep(0.01)
+            with client._state_lock:
+                self.assertTrue(client._pending, "first request was not registered")
+
+            original_require_process = client._require_process
+            original_mark_closed = client._mark_closed
+
+            def pause_after_process_snapshot() -> object:
+                process = original_require_process()
+                late_snapshot.set()
+                allow_late_registration.wait(2.0)
+                return process
+
+            def pause_after_closure(error: BaseException) -> None:
+                original_mark_closed(error)
+                closed.set()
+                allow_stop.wait(2.0)
+
+            def send_late() -> None:
+                try:
+                    client.request_raw("get_state")
+                except BaseException as exc:
+                    late_errors.append(exc)
+
+            with (
+                patch.object(client, "_require_process", pause_after_process_snapshot),
+                patch.object(client, "_mark_closed", pause_after_closure),
+            ):
+                late_thread = threading.Thread(target=send_late)
+                late_thread.start()
+                self.assertTrue(late_snapshot.wait(2.0))
+
+                stop_thread = threading.Thread(target=client.stop)
+                stop_thread.start()
+                self.assertTrue(closed.wait(2.0))
+
+                allow_late_registration.set()
+                late_thread.join(timeout=2.0)
+                self.assertFalse(late_thread.is_alive())
+                self.assertEqual(len(late_errors), 1)
+                self.assertIsInstance(late_errors[0], RpcProcessExitError)
+
+                self.assertTrue(first_done.wait(2.0))
+                self.assertEqual(len(first_errors), 1)
+                self.assertIsInstance(first_errors[0], RpcProcessExitError)
+
+                allow_stop.set()
+                stop_thread.join(timeout=3.0)
+                self.assertFalse(stop_thread.is_alive())
+        finally:
+            allow_late_registration.set()
+            allow_stop.set()
+            first_thread.join(timeout=2.0)
+            client.stop()
+
+    def test_stop_waits_for_teardown_owner_and_releases_after_failure(self) -> None:
+        client = RpcClient(
+            command=[sys.executable, "-u", "-c", FAKE_SERVER],
+            startup_timeout=2.0,
+            request_timeout=2.0,
+        )
+        client.start()
+        teardown_entered = threading.Event()
+        release_teardown = threading.Event()
+        owner_errors: list[BaseException] = []
+        follower_errors: list[BaseException] = []
+        follower_done = threading.Event()
+
+        def fail_teardown(*_args: object) -> None:
+            teardown_entered.set()
+            release_teardown.wait(timeout=2.0)
+            raise RuntimeError("teardown failed")
+
+        def stop_owner() -> None:
+            try:
+                client.stop()
+            except BaseException as exc:
+                owner_errors.append(exc)
+
+        def stop_follower() -> None:
+            try:
+                client.stop()
+            except BaseException as exc:
+                follower_errors.append(exc)
+            finally:
+                follower_done.set()
+
+        with patch("omp_rpc.client._terminate_process_group", fail_teardown):
+            owner = threading.Thread(target=stop_owner)
+            owner.start()
+            self.assertTrue(teardown_entered.wait(timeout=2.0))
+
+            follower = threading.Thread(target=stop_follower)
+            follower.start()
+            self.assertFalse(follower_done.wait(timeout=0.1))
+
+            release_teardown.set()
+            owner.join(timeout=2.0)
+            follower.join(timeout=2.0)
+
+        self.assertFalse(owner.is_alive())
+        self.assertFalse(follower.is_alive())
+        self.assertEqual(len(owner_errors), 1)
+        self.assertIsInstance(owner_errors[0], RuntimeError)
+        self.assertEqual(follower_errors, [])
+        self.assertTrue(follower_done.is_set())
+
+        client.start()
+        client.stop()
+
+    def test_delayed_stop_follower_keeps_its_owner_completion_across_restart(
+        self,
+    ) -> None:
+        client = RpcClient(
+            command=[sys.executable, "-u", "-c", FAKE_SERVER],
+            startup_timeout=2.0,
+            request_timeout=2.0,
+        )
+        client.start()
+        first_teardown_entered = threading.Event()
+        release_first_teardown = threading.Event()
+        second_teardown_entered = threading.Event()
+        release_second_teardown = threading.Event()
+        follower_wait_entered = threading.Event()
+        release_follower_wait = threading.Event()
+        follower_done = threading.Event()
+        completion = threading.Event()
+        teardown_calls = 0
+
+        class DelayedCompletion:
+            def set(self) -> None:
+                completion.set()
+
+            def clear(self) -> None:
+                completion.clear()
+
+            def is_set(self) -> bool:
+                return completion.is_set()
+
+            def wait(self, timeout: float | None = None) -> bool:
+                follower_wait_entered.set()
+                release_follower_wait.wait(timeout=2.0)
+                return completion.wait(timeout)
+
+        delayed_completion = DelayedCompletion()
+        client._stop_complete = delayed_completion  # type: ignore[assignment]
+
+        def hold_teardown(*_args: object) -> None:
+            nonlocal teardown_calls
+            teardown_calls += 1
+            if teardown_calls == 1:
+                first_teardown_entered.set()
+                release_first_teardown.wait(timeout=2.0)
+            else:
+                second_teardown_entered.set()
+                release_second_teardown.wait(timeout=2.0)
+
+        def stop_follower() -> None:
+            try:
+                client.stop()
+            finally:
+                follower_done.set()
+
+        first_owner = threading.Thread(target=client.stop)
+        follower = threading.Thread(target=stop_follower)
+        second_owner = threading.Thread(target=client.stop)
+        try:
+            with patch("omp_rpc.client._terminate_process_group", hold_teardown):
+                with patch(
+                    "omp_rpc.client.threading.Event",
+                    return_value=delayed_completion,
+                ):
+                    first_owner.start()
+                    self.assertTrue(first_teardown_entered.wait(timeout=2.0))
+                    follower.start()
+                    self.assertTrue(follower_wait_entered.wait(timeout=2.0))
+                    release_first_teardown.set()
+                    first_owner.join(timeout=2.0)
+                    self.assertFalse(first_owner.is_alive())
+
+                client.start()
+                second_owner.start()
+                self.assertTrue(second_teardown_entered.wait(timeout=2.0))
+                release_follower_wait.set()
+                self.assertTrue(
+                    follower_done.wait(timeout=0.5),
+                    "a later stop generation cleared the prior owner's completion",
+                )
+        finally:
+            release_first_teardown.set()
+            release_second_teardown.set()
+            release_follower_wait.set()
+            first_owner.join(timeout=2.0)
+            follower.join(timeout=2.0)
+            second_owner.join(timeout=2.0)
+            client.stop()
+
+    def test_stop_returns_from_same_thread_reentrant_teardown(self) -> None:
+        client = RpcClient(
+            command=[sys.executable, "-u", "-c", FAKE_SERVER],
+            startup_timeout=2.0,
+            request_timeout=2.0,
+        )
+        client.start()
+        reentrant_returned = threading.Event()
+        owner = threading.Thread(target=client.stop)
+        original_mark_closed = client._mark_closed
+
+        def reenter_stop(error: BaseException) -> None:
+            client.stop()
+            reentrant_returned.set()
+            original_mark_closed(error)
+
+        with patch.object(client, "_mark_closed", reenter_stop):
+            owner.start()
+            owner.join(timeout=2.0)
+            if owner.is_alive():
+                client._stop_complete.set()
+                owner.join(timeout=2.0)
+
+        self.assertFalse(owner.is_alive(), "same-thread stop reentrancy deadlocked")
+        self.assertTrue(reentrant_returned.is_set())
+        self.assertTrue(client._stop_complete.is_set())
+        with client._state_lock:
+            self.assertIsNone(client._stop_owner_thread_id)
+
+        client.start()
+        client.stop()
+
+    def test_stop_rejects_registered_request_paused_before_write(self) -> None:
+        from omp_rpc import RpcProcessExitError
+
+        client = RpcClient(
+            command=[sys.executable, "-u", "-c", HANGING_SERVER],
+            startup_timeout=2.0,
+            request_timeout=2.0,
+        )
+        client.start()
+        write_paused = threading.Event()
+        allow_write = threading.Event()
+        stopped = threading.Event()
+        errors: list[BaseException] = []
+        original_write_json = client._write_json
+        original_mark_closed = client._mark_closed
+
+        def pause_before_write(*args: object) -> None:
+            write_paused.set()
+            allow_write.wait(timeout=2.0)
+            original_write_json(*args)  # type: ignore[arg-type]
+
+        def record_stop(error: BaseException) -> None:
+            original_mark_closed(error)
+            stopped.set()
+
+        def send_request() -> None:
+            try:
+                client.request_raw("get_state")
+            except BaseException as exc:
+                errors.append(exc)
+
+        with (
+            patch.object(client, "_write_json", pause_before_write),
+            patch.object(client, "_mark_closed", record_stop),
+        ):
+            request = threading.Thread(target=send_request)
+            request.start()
+            self.assertTrue(write_paused.wait(timeout=2.0))
+            with client._state_lock:
+                self.assertTrue(client._pending, "request was not registered")
+
+            stopper = threading.Thread(target=client.stop)
+            stopper.start()
+            self.assertTrue(stopped.wait(timeout=2.0))
+
+            allow_write.set()
+            request.join(timeout=2.0)
+            stopper.join(timeout=2.0)
+
+        self.assertFalse(request.is_alive())
+        self.assertFalse(stopper.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], RpcProcessExitError)
+        client.stop()
 
     def test_stop_allows_server_eof_cleanup(self) -> None:
         work = tempfile.mkdtemp()

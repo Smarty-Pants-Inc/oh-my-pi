@@ -628,7 +628,7 @@ describe("AgentSession dispose releases retained memory", () => {
 		await reopened.close();
 	});
 
-	it("preserves the agent_end transcript for an asynchronous extension during dispose", async () => {
+	it("lets an asynchronous agent_end extension read the transcript before dispose releases it", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("expected bundled model");
 		const mock = createMockModel({ handler: () => ({ content: ["ok"] }) });
@@ -696,12 +696,11 @@ describe("AgentSession dispose releases retained memory", () => {
 			resetDone.resolve();
 		});
 		const disposeP = current.dispose();
-		await resetDone.promise;
-		expect(agent.state.messages).toHaveLength(0);
-
 		release.resolve();
 		await notificationDone.promise;
 		await disposeP;
+		await resetDone.promise;
+		expect(agent.state.messages).toHaveLength(0);
 		session = undefined;
 		expect(observedMessageCount).toBe(1);
 	});

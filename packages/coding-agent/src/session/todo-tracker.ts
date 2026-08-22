@@ -7,7 +7,7 @@ import type { AgentClosureRejection } from "../extensibility/shared-events";
 import eagerTaskPrompt from "../prompts/system/eager-task.md" with { type: "text" };
 import eagerTodoPrompt from "../prompts/system/eager-todo.md" with { type: "text" };
 import passiveTodoSnapshotPrompt from "../prompts/todos/current.md" with { type: "text" };
-import { getLatestTodoPhasesFromEntries, isTodoPhase, type TodoPhase } from "../tools/todo";
+import { getLatestTodoPhasesFromEntries, isTodoPhase, type TodoItem, type TodoPhase } from "../tools/todo";
 import { buildNamedToolChoice } from "../utils/tool-choice";
 import type { AgentSessionEvent } from "./agent-session-events";
 import type { SessionManager } from "./session-manager";
@@ -90,6 +90,9 @@ export interface TodoTrackerHost {
 
 /** Result of a stop-time todo completion check; undefined means no todo gate applies. */
 export type TodoCompletionResult = AgentClosureRejection | "deferred" | undefined;
+export interface TodoCompletionCheck {
+	readonly bypass: boolean;
+}
 
 /** Owns canonical todo state, eager preludes, and passive snapshots. */
 export class TodoTracker {
@@ -223,22 +226,24 @@ export class TodoTracker {
 		return nudges;
 	}
 
-	/** Emits one bounded stop-time notification and reports stale or deferred todo closure. */
-	async checkCompletion(): Promise<TodoCompletionResult> {
-		if (this.#host.consumeLastServedToolChoiceLabel() === "user-force" || this.#host.planModeEnabled())
-			return undefined;
+	/** Snapshots one-shot completion bypasses for a full settle transaction. */
+	beginCompletionCheck(): TodoCompletionCheck {
+		return {
+			bypass: this.#host.consumeLastServedToolChoiceLabel() === "user-force" || this.#host.planModeEnabled(),
+		};
+	}
+
+	/** Emits one bounded stop-time notification and reports current deferred or stale todo closure. */
+	async checkCompletion(check: TodoCompletionCheck): Promise<TodoCompletionResult> {
+		if (check.bypass) return undefined;
 		if (!this.#host.settings.get("todo.reminders") || !this.#host.settings.get("todo.enabled")) {
-			this.#reminderCount = 0;
-			this.#stopReminderSent = false;
+			this.#resetCompletionState();
 			return undefined;
 		}
 		if (!this.#host.getActiveToolNames().includes("todo")) return undefined;
-		const todos = this.phases
-			.flatMap(phase => phase.tasks)
-			.filter(task => task.status === "pending" || task.status === "in_progress");
+		let todos = this.#openTodos();
 		if (todos.length === 0) {
-			this.#reminderCount = 0;
-			this.#stopReminderSent = false;
+			this.#resetCompletionState();
 			return undefined;
 		}
 		if (this.#host.hasPendingAsyncWake()) return "deferred";
@@ -252,6 +257,12 @@ export class TodoTracker {
 				maxAttempts,
 			});
 			this.#stopReminderSent = true;
+			todos = this.#openTodos();
+			if (todos.length === 0) {
+				this.#resetCompletionState();
+				return undefined;
+			}
+			if (this.#host.hasPendingAsyncWake()) return "deferred";
 		}
 		return { reason: "stale_todos", todos };
 	}
@@ -276,6 +287,16 @@ export class TodoTracker {
 			toolRefs: { task: wireName("task"), todo: wireName("todo") },
 			taskBatch: this.#host.settings.get("task.batch"),
 		};
+	}
+	#openTodos(): TodoItem[] {
+		return this.phases
+			.flatMap(phase => phase.tasks)
+			.filter(task => task.status === "pending" || task.status === "in_progress");
+	}
+
+	#resetCompletionState(): void {
+		this.#reminderCount = 0;
+		this.#stopReminderSent = false;
 	}
 
 	#clonePhases(phases: TodoPhase[]): TodoPhase[] {

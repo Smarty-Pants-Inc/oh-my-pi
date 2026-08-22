@@ -43,6 +43,15 @@ if (Bun.env.MOCK_RPC_EXIT_BEFORE_READY) {
 
 let protocolV2Enabled = false;
 let closureRejectionSupported = false;
+let firstOverlappingPromptId: string | undefined;
+let heldBarrierPromptId: string | undefined;
+let heldIdleBarrierId: string | undefined;
+let heldDelayedAcceptancePromptId: string | undefined;
+let heldBarrierReleased = false;
+let heldSessionReplacement: { id: string | undefined; command: string; data: unknown } | undefined;
+let scheduledDuringReplacement = 0;
+let overlappingLocalPromptCount = 0;
+let olderPromptResultSent = false;
 process.stdout.write(
 	`${JSON.stringify(
 		supportsProtocolV2
@@ -95,8 +104,17 @@ for await (const raw of console) {
 			}
 			if (Bun.env.MOCK_RPC_IGNORE_COMMANDS === "1") continue;
 			const id = typeof frame.id === "string" ? frame.id : undefined;
+			if (
+				heldSessionReplacement &&
+				(frame.type === "prompt" || frame.type === "steer" || frame.type === "follow_up")
+			) {
+				scheduledDuringReplacement += 1;
+			}
 			if (frame.type === "negotiate_protocol" && frame.protocolVersion === 2) {
-				closureRejectionSupported = frame.closureRejection === true;
+				const closureRejectionRequested = frame.closureRejection === true;
+				const idleBarrierRequested = frame.idleBarrier === true;
+				const acknowledgeClosure = closureRejectionRequested && Bun.env.MOCK_RPC_IDLE_WITHOUT_CLOSURE_ACK !== "1";
+				closureRejectionSupported = acknowledgeClosure;
 				writeFrame({
 					id,
 					type: "response",
@@ -104,8 +122,12 @@ for await (const raw of console) {
 					success: true,
 					data: {
 						protocolVersion: 2,
-						idleBarrier: Bun.env.MOCK_RPC_LEGACY_V2 === "1" ? undefined : true,
-						...(closureRejectionSupported ? { closureRejection: true } : {}),
+						...(acknowledgeClosure ? { closureRejection: true } : {}),
+						...(Bun.env.MOCK_RPC_LEGACY_V2 !== "1" && acknowledgeClosure && idleBarrierRequested
+							? { idleBarrier: true }
+							: Bun.env.MOCK_RPC_IDLE_WITHOUT_CLOSURE_ACK === "1"
+								? { idleBarrier: true }
+								: {}),
 					},
 				});
 				protocolV2Enabled = true;
@@ -170,6 +192,41 @@ for await (const raw of console) {
 				});
 				continue;
 			}
+			if (frame.type === "get_state" && Bun.env.MOCK_RPC_OVERLAPPING_LOCAL_PROMPT_RESULT === "1") {
+				while (!olderPromptResultSent) await Bun.sleep(1);
+				writeFrame({
+					id,
+					type: "response",
+					command: frame.type,
+					success: true,
+					data: { olderPromptResultSent },
+				});
+				continue;
+			}
+			if (frame.type === "get_messages" && Bun.env.MOCK_RPC_OVERLAPPING_LOCAL_PROMPT_RESULT === "1") {
+				writeFrame({ type: "agent_end", messages: [], isTerminal: true });
+				writeFrame({ id, type: "response", command: frame.type, success: true, data: { messages: [] } });
+				continue;
+			}
+			if (frame.type === "get_state" && heldSessionReplacement) {
+				writeFrame({
+					id,
+					type: "response",
+					command: frame.type,
+					success: true,
+					data: { scheduledDuringReplacement },
+				});
+				const replacement = heldSessionReplacement;
+				heldSessionReplacement = undefined;
+				writeFrame({
+					id: replacement.id,
+					type: "response",
+					command: replacement.command,
+					success: true,
+					data: replacement.data,
+				});
+				continue;
+			}
 			if (
 				frame.type === "get_state" &&
 				(Bun.env.MOCK_RPC_LEGACY_STATE === "1" || Bun.env.MOCK_RPC_INVALID_TPS === "1")
@@ -188,6 +245,194 @@ for await (const raw of console) {
 				continue;
 			}
 
+			if (frame.type === "wait_for_idle") {
+				if (Bun.env.MOCK_RPC_DELAYED_ACCEPTANCE_LATE_FAILURE === "1" && heldDelayedAcceptancePromptId) {
+					const promptId = heldDelayedAcceptancePromptId;
+					heldDelayedAcceptancePromptId = undefined;
+					writeFrame({ id: promptId, type: "response", command: "prompt", success: true, data: {} });
+					writeFrame({
+						id: promptId,
+						type: "response",
+						command: "prompt",
+						success: false,
+						error: "late failure",
+					});
+					writeFrame({ id, type: "response", command: frame.type, success: true, data: {} });
+					continue;
+				}
+				if (Bun.env.MOCK_RPC_SESSION_REPLACEMENT_RACE === "1" && !heldBarrierReleased) {
+					heldIdleBarrierId = id;
+					continue;
+				}
+				if (Bun.env.MOCK_RPC_HELD_BARRIER_FAILURES && !heldBarrierReleased) {
+					heldIdleBarrierId = id;
+					continue;
+				}
+				const delayMs = Number(Bun.env.MOCK_RPC_IDLE_DELAY_MS ?? 0);
+				if (delayMs > 0) await Bun.sleep(delayMs);
+				if (Bun.env.MOCK_RPC_REJECT_IDLE_BARRIER === "1") {
+					writeFrame({
+						id,
+						type: "response",
+						command: frame.type,
+						success: false,
+						error: "idle barrier was not negotiated",
+					});
+				} else {
+					writeFrame({ id, type: "response", command: frame.type, success: true, data: {} });
+				}
+				continue;
+			}
+
+			if (
+				frame.type === "new_session" ||
+				frame.type === "switch_session" ||
+				frame.type === "branch" ||
+				frame.type === "handoff"
+			) {
+				const data =
+					frame.type === "branch"
+						? { text: "branched prompt", cancelled: Bun.env.MOCK_RPC_CANCEL_SESSION_CHANGE === "1" }
+						: frame.type === "handoff"
+							? Bun.env.MOCK_RPC_CANCEL_HANDOFF === "1"
+								? null
+								: { savedPath: "/tmp/handoff.md" }
+							: { cancelled: Bun.env.MOCK_RPC_CANCEL_SESSION_CHANGE === "1" };
+				if (Bun.env.MOCK_RPC_HOLD_SESSION_REPLACEMENT === "1") continue;
+				if (Bun.env.MOCK_RPC_SESSION_REPLACEMENT_RACE === "1") {
+					writeFrame({ type: "agent_end", messages: [], isTerminal: true });
+					if (heldIdleBarrierId) {
+						writeFrame({
+							id: heldIdleBarrierId,
+							type: "response",
+							command: "wait_for_idle",
+							success: true,
+							data: {},
+						});
+						heldBarrierReleased = true;
+					}
+					heldSessionReplacement = { id, command: frame.type, data };
+					continue;
+				}
+				if (Bun.env.MOCK_RPC_TARGET_CLOSURE_BEFORE_REPLACEMENT_RESPONSE === "1") {
+					writeFrame({
+						type: "agent_end",
+						messages: [],
+						closureRejected: {
+							reason: "stale_todos",
+							todos: [{ content: "Finish target session task", status: "pending" }],
+						},
+					});
+				}
+				writeFrame({ id, type: "response", command: frame.type, success: true, data });
+				continue;
+			}
+
+			if (frame.type === "prompt" && Bun.env.MOCK_RPC_HELD_BARRIER_FAILURES) {
+				if (!heldBarrierPromptId) {
+					heldBarrierPromptId = id;
+					writeFrame({ id, type: "response", command: frame.type, success: true, data: {} });
+					continue;
+				}
+
+				writeFrame({ id, type: "response", command: frame.type, success: true, data: {} });
+				if (Bun.env.MOCK_RPC_HELD_BARRIER_FAILURES === "earlier_and_later") {
+					writeFrame({
+						id: heldBarrierPromptId,
+						type: "response",
+						command: frame.type,
+						success: false,
+						error: "earlier failure",
+					});
+				}
+				writeFrame({
+					id,
+					type: "response",
+					command: frame.type,
+					success: false,
+					error: "later failure",
+				});
+				if (heldIdleBarrierId) {
+					writeFrame({
+						id: heldIdleBarrierId,
+						type: "response",
+						command: "wait_for_idle",
+						success: true,
+						data: {},
+					});
+					heldBarrierReleased = true;
+				}
+				continue;
+			}
+
+			if (frame.type === "prompt" && Bun.env.MOCK_RPC_DELAYED_ACCEPTANCE_LATE_FAILURE === "1") {
+				heldDelayedAcceptancePromptId = id;
+				if (!protocolV2Enabled) {
+					void Bun.sleep(25).then(() => {
+						if (heldDelayedAcceptancePromptId !== id) return;
+						heldDelayedAcceptancePromptId = undefined;
+						writeFrame({ id, type: "response", command: frame.type, success: true, data: {} });
+						writeFrame({ id, type: "response", command: frame.type, success: false, error: "late failure" });
+					});
+				}
+				continue;
+			}
+
+			if (frame.type === "prompt" && Bun.env.MOCK_RPC_OVERLAPPING_LATE_PROMPT_FAILURE === "1") {
+				if (!firstOverlappingPromptId) {
+					firstOverlappingPromptId = id;
+					writeFrame({ id, type: "response", command: frame.type, success: true, data: {} });
+					continue;
+				}
+				writeFrame({
+					id: firstOverlappingPromptId,
+					type: "response",
+					command: frame.type,
+					success: false,
+					error: "late failure",
+				});
+				await Bun.sleep(50);
+				writeFrame({ id, type: "response", command: frame.type, success: true, data: {} });
+				continue;
+			}
+
+			if (frame.type === "prompt" && Bun.env.MOCK_RPC_OVERLAPPING_LOCAL_PROMPT_RESULT === "1") {
+				overlappingLocalPromptCount += 1;
+				writeFrame({ id, type: "response", command: frame.type, success: true, data: {} });
+				if (overlappingLocalPromptCount === 1) {
+					void Bun.sleep(25).then(() => {
+						olderPromptResultSent = true;
+						writeFrame({ type: "prompt_result", id, agentInvoked: false });
+					});
+				}
+				continue;
+			}
+			if (frame.type === "prompt" && Bun.env.MOCK_RPC_LOCAL_ONLY_PROMPT) {
+				if (Bun.env.MOCK_RPC_LOCAL_ONLY_PROMPT === "result") {
+					writeFrame({ id, type: "response", command: frame.type, success: true, data: {} });
+					await Bun.sleep(25);
+					writeFrame({ type: "prompt_result", id, agentInvoked: false });
+				} else {
+					writeFrame({ id, type: "response", command: frame.type, success: true, data: { agentInvoked: false } });
+				}
+				continue;
+			}
+
+			if (
+				(frame.type === "prompt" || frame.type === "abort_and_prompt") &&
+				Bun.env.MOCK_RPC_LATE_FAILURE_COMMAND === frame.type
+			) {
+				writeFrame({ id, type: "response", command: frame.type, success: true, data: {} });
+				await Bun.sleep(25);
+				writeFrame({
+					id,
+					type: "response",
+					command: frame.type,
+					success: false,
+					error: "late failure",
+				});
+				continue;
+			}
 			if (frame.type === "prompt" && Bun.env.MOCK_RPC_CLOSURE_REJECTED === "1") {
 				if (closureRejectionSupported) {
 					writeFrame({
@@ -226,6 +471,10 @@ for await (const raw of console) {
 				await Bun.sleep(50);
 				writeFrame({ type: "agent_end", messages: [], isTerminal: true });
 				continue;
+			}
+
+			if (frame.type === "prompt" && Bun.env.MOCK_RPC_PROMPT_AGENT_END === "1") {
+				writeFrame({ type: "agent_end", messages: [] });
 			}
 
 			writeFrame({

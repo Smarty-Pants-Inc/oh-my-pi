@@ -203,6 +203,11 @@ interface SpeculationRun {
 	armed?: ArmedSpeculation;
 }
 
+/** Identifies the scheduler-owned call path allowed to disconnect without awaiting itself. */
+export interface SessionMaintenanceCallContext {
+	readonly disconnectOwner?: object;
+}
+
 interface AutoCompactionOptions {
 	autoContinue?: boolean;
 	triggerContextTokens?: number;
@@ -212,6 +217,7 @@ interface AutoCompactionOptions {
 	/** Mid-turn: splice history then return; do not await UI/extension fan-out. */
 	detachPostCommit?: boolean;
 	semanticDeliveryAcceptance?: Promise<void>;
+	callContext?: SessionMaintenanceCallContext;
 	/** Index to resume from after an earlier preferred method failed. */
 	methodIndex?: number;
 	/** A preceding shake already rewrote history before this fallback attempt. */
@@ -298,7 +304,7 @@ export interface SessionMaintenanceHost {
 	findLastAssistantMessage(): AssistantMessage | undefined;
 	beginSemanticDeliveryMaintenance(signal?: AbortSignal, exemptAcceptance?: Promise<void>): Promise<() => void>;
 	drainStrandedQueuedMessages(): boolean;
-	disconnectFromAgent(): void;
+	disconnectFromAgent(callContext?: SessionMaintenanceCallContext): Promise<void>;
 	reconnectToAgent(): void;
 	buildDisplaySessionContext(): SessionContext;
 	convertToLlmForSideRequest(messages: AgentMessage[]): Message[];
@@ -724,7 +730,7 @@ export class SessionMaintenance {
 				releaseSemanticDeliveryMaintenance = await this.#host.beginSemanticDeliveryMaintenance(
 					compactionAbortController.signal,
 				);
-				this.#host.disconnectFromAgent();
+				await this.#host.disconnectFromAgent();
 				await this.#host.abort({ goalReason: "internal", preserveCompaction: true });
 			}
 			const activeModel = this.#model;
@@ -1554,6 +1560,7 @@ export class SessionMaintenance {
 	async runPrePromptCompactionIfNeeded(
 		messages: AgentMessage[],
 		semanticDeliveryAcceptance?: Promise<void>,
+		callContext?: SessionMaintenanceCallContext,
 	): Promise<void> {
 		const model = this.#model;
 		if (!model) return;
@@ -1611,6 +1618,7 @@ export class SessionMaintenance {
 			triggerContextTokens: contextTokens,
 			phase: "pre_turn",
 			semanticDeliveryAcceptance,
+			callContext,
 		});
 	}
 
@@ -2809,7 +2817,7 @@ export class SessionMaintenance {
 				controller.signal,
 				options.semanticDeliveryAcceptance,
 			);
-			this.#host.disconnectFromAgent();
+			await this.#host.disconnectFromAgent(options.callContext);
 			return await this.#runAutoCompactionAttempt(reason, willRetry, deferred, allowDefer, options, {
 				controller,
 				signal: controller.signal,

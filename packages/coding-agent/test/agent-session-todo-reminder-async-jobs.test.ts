@@ -259,6 +259,76 @@ describe("AgentSession todo reminder async-job deferral", () => {
 		expect(reminderAttempts).toEqual([1]);
 	});
 
+	it("preserves a served user-force bypass through post-session_stop todo revalidation", async () => {
+		setIncompleteTodos();
+		session.setForcedToolChoice("todo");
+		expect(session.nextToolChoiceDirective()).toEqual({ type: "tool", name: "todo" });
+		session.toolChoiceQueue.resolve();
+
+		emitTextOnlyStop();
+		await session.waitForIdle();
+
+		expect(reminderAttempts).toEqual([]);
+		expect(extensionRunner.emitSessionStop).toHaveBeenCalledTimes(1);
+		expect(closureRejections).toEqual([]);
+		expect(agentEndTerminalStates).toEqual([true]);
+	});
+
+	it("accepts closure when an awaited todo_reminder hook closes the canonical todos", async () => {
+		setIncompleteTodos();
+		const hookStarted = Promise.withResolvers<void>();
+		const releaseHook = Promise.withResolvers<void>();
+		vi.spyOn(extensionRunner, "hasHandlers").mockImplementation(
+			eventType => eventType === "session_stop" || eventType === "todo_reminder",
+		);
+		vi.spyOn(extensionRunner, "emit").mockImplementation(async event => {
+			if (event.type === "todo_reminder") {
+				hookStarted.resolve();
+				await releaseHook.promise;
+			}
+			return undefined as never;
+		});
+		emitTextOnlyStop();
+		await hookStarted.promise;
+		session.setTodoPhases([]);
+		releaseHook.resolve();
+		await session.waitForIdle();
+
+		expect(reminderAttempts).toEqual([1]);
+		expect(extensionRunner.emitSessionStop).toHaveBeenCalledTimes(1);
+		expect(closureRejections).toEqual([]);
+		expect(agentEndTerminalStates).toEqual([true]);
+	});
+
+	it("rejects closure when an awaited session_stop hook opens canonical todos", async () => {
+		const hookStarted = Promise.withResolvers<void>();
+		const releaseHook = Promise.withResolvers<void>();
+		vi.spyOn(extensionRunner, "emitSessionStop").mockImplementation(async () => {
+			hookStarted.resolve();
+			await releaseHook.promise;
+			return undefined;
+		});
+
+		emitTextOnlyStop();
+		await hookStarted.promise;
+		setIncompleteTodos();
+		releaseHook.resolve();
+		await session.waitForIdle();
+
+		expect(reminderAttempts).toEqual([1]);
+		expect(extensionRunner.emitSessionStop).toHaveBeenCalledTimes(1);
+		expect(closureRejections).toEqual([
+			{
+				reason: "stale_todos",
+				todos: [
+					{ content: "Slice 81", status: "pending" },
+					{ content: "Slice 82", status: "pending" },
+				],
+			},
+		]);
+		expect(agentEndTerminalStates).toEqual([true]);
+	});
+
 	it("runs session_stop before rejecting a text closure with stale todos", async () => {
 		setIncompleteTodos();
 		const hookStarted = Promise.withResolvers<void>();

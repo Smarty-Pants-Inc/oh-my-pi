@@ -27,7 +27,7 @@ import type { RpcMessagesPage } from "./rpc-messages";
 
 export type RpcCommand =
 	// Protocol
-	| { id?: string; type: "negotiate_protocol"; protocolVersion: number; closureRejection?: true }
+	| { id?: string; type: "negotiate_protocol"; protocolVersion: number; closureRejection?: true; idleBarrier?: true }
 
 	// Prompting
 	| { id?: string; type: "prompt"; message: string; images?: ImageContent[]; streamingBehavior?: "steer" | "followUp" }

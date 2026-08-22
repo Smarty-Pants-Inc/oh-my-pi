@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { RpcHostToolBridge } from "@oh-my-pi/pi-coding-agent/modes/rpc/host-tools";
 import {
 	dispatchRpcInputFrame,
+	getRpcProtocolCapabilities,
 	type PendingExtensionRequest,
 	RpcInputDispatcher,
 	type RpcInputFrameDeps,
@@ -75,6 +76,15 @@ const cancelledBashResponse = (id: string): RpcResponse => ({
 		outputLines: 0,
 		outputBytes: 0,
 	},
+});
+
+describe("RPC protocol capabilities", () => {
+	test("idleBarrier is advertised only when both capabilities are requested", () => {
+		expect(getRpcProtocolCapabilities(false, false)).toEqual({});
+		expect(getRpcProtocolCapabilities(true, false)).toEqual({ closureRejection: true });
+		expect(getRpcProtocolCapabilities(false, true)).toEqual({});
+		expect(getRpcProtocolCapabilities(true, true)).toEqual({ closureRejection: true, idleBarrier: true });
+	});
 });
 
 describe("dispatchRpcInputFrame", () => {

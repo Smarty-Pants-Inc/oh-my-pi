@@ -666,6 +666,19 @@ export function requestRpcDialog<T>(
 	output({ type: "extension_ui_request", id, ...request } as RpcExtensionUIRequest);
 	return promise;
 }
+
+/** Capabilities whose semantics require terminal closure rejection support. */
+export function getRpcProtocolCapabilities(
+	closureRejectionRequested: boolean,
+	idleBarrierRequested: boolean,
+): {
+	closureRejection?: true;
+	idleBarrier?: true;
+} {
+	if (!closureRejectionRequested) return {};
+	return idleBarrierRequested ? { closureRejection: true, idleBarrier: true } : { closureRejection: true };
+}
+
 /**
  * Run in RPC mode.
  * Listens for JSON commands on stdin, outputs events and responses on stdout.
@@ -1010,11 +1023,14 @@ export async function runRpcMode(
 			case "negotiate_protocol": {
 				if (command.protocolVersion !== 2)
 					return error(id, "negotiate_protocol", `Unsupported RPC protocol version: ${command.protocolVersion}`);
-				closureRejectionSupported = command.closureRejection === true;
+				const capabilities = getRpcProtocolCapabilities(
+					command.closureRejection === true,
+					command.idleBarrier === true,
+				);
+				closureRejectionSupported = capabilities.closureRejection === true;
 				return success(id, "negotiate_protocol", {
 					protocolVersion: 2,
-					idleBarrier: true,
-					...(closureRejectionSupported ? { closureRejection: true } : {}),
+					...capabilities,
 				});
 			}
 

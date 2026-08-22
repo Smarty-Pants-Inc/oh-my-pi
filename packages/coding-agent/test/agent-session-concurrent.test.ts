@@ -288,7 +288,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			expect.objectContaining({ source: "peer_message_wake", status: "failed" }),
 		]);
 		session.setCustomMessageAcceptanceHookForTests(undefined);
-		session.setAgentEventConnectionForTests(true);
+		await session.setAgentEventConnectionForTests(true);
 	});
 
 	it("rejects reentrant extension compaction throughout scoped semantic acceptance", async () => {
@@ -2749,7 +2749,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		expect(reentrantPromptResults).toEqual(["resolved"]);
 	});
 
-	it("does not let extension notifications block public agent_end", async () => {
+	it("emits public agent_end before its extension hook settles but keeps waitForIdle authoritative", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
 		const agent = new Agent({
@@ -2775,12 +2775,20 @@ describe("AgentSession concurrent prompt guard", () => {
 			if (event.type === "agent_end") onPublicAgentEnd();
 		});
 
-		await session.prompt("First message");
+		const prompt = session.prompt("First message");
 		await publicAgentEnd;
 		expect(extensionRunner.emit).toHaveBeenCalledWith({ type: "agent_end", messages: expect.any(Array) });
 
+		let idleSettled = false;
+		const idle = session.waitForIdle().then(() => {
+			idleSettled = true;
+		});
+		await Promise.resolve();
+		expect(idleSettled).toBe(false);
+
 		releaseExtension();
-		await session.waitForIdle();
+		await Promise.all([prompt, idle]);
+		expect(idleSettled).toBe(true);
 	});
 
 	it("queues idle ACP client-triggered custom messages instead of starting an ownerless turn", async () => {
@@ -3136,7 +3144,7 @@ describe("AgentSession TTSR resume gate", () => {
 		expect(session.isStreaming).toBe(false);
 	});
 
-	it("marks extension agent_end willContinue for TTSR abort and not ordinary abort", async () => {
+	it("omits extension agent_end for a superseded TTSR settle and does not continue ordinary aborts", async () => {
 		collapseSchedulerSettleDelays();
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) {
@@ -3230,11 +3238,10 @@ describe("AgentSession TTSR resume gate", () => {
 
 		const ttsrEnds = extensionEmits.filter(event => event.type === "agent_end");
 		expect(streamCallCount).toBeGreaterThanOrEqual(2);
-		// Intermediate TTSR-abort settle continues; terminal settle after retry does not.
-		expect(ttsrEnds.length).toBeGreaterThanOrEqual(2);
-		expect(ttsrEnds[0]?.willContinue).toBe(true);
-		expect(ttsrEnds.slice(1, -1).every(event => !event.willContinue)).toBe(true);
-		expect(ttsrEnds.at(-1)?.willContinue).toBeFalsy();
+		// The intermediate TTSR-abort settle is superseded before public publication,
+		// so its extension notification is discarded with it; only the terminal retry settle remains.
+		expect(ttsrEnds).toHaveLength(1);
+		expect(ttsrEnds[0]?.willContinue).toBeFalsy();
 
 		extensionEmits.length = 0;
 		const ordinaryAgent = new Agent({

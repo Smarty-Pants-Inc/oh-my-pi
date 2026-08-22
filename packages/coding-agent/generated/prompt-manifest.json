@@ -4374,7 +4374,7 @@
     },
     {
       "path": "docs/rpc.md",
-      "sha256": "0fa364ba24b20db859e2a0cb187aa74edffc94a96f639ef1f8b71125fc905ea2"
+      "sha256": "190a78e25194c5fbd2218a4e97e0697c71475da5a26ede0ea14ea0bd00357040"
     },
     {
       "path": "docs/rulebook-matching-pipeline.md",
@@ -4650,7 +4650,7 @@
     },
     {
       "path": "packages/agent/src/agent-loop.ts",
-      "sha256": "a14cee248d98ce560421a407742081ebca69d3ab797af073062ab6e83e0c0568"
+      "sha256": "053a2164d26fdcf0a19e9a36a90a030f71c770cb2877f012b8d8408739a7bf29"
     },
     {
       "path": "packages/agent/src/agent.ts",
@@ -6458,7 +6458,7 @@
     },
     {
       "path": "packages/coding-agent/src/collab/guest.ts",
-      "sha256": "5529f5dd97a7226c8e64b33fbf51fc2d49494d9ce0a7457d12c5d79565cd992d"
+      "sha256": "f58dbb9f13ebbecb91739b6a2a25e092b177670a3424874cd34846a855047e78"
     },
     {
       "path": "packages/coding-agent/src/collab/herdr-bridge-bootstrap.ts",
@@ -8258,7 +8258,7 @@
     },
     {
       "path": "packages/coding-agent/src/modes/rpc/rpc-mode.ts",
-      "sha256": "8344f1c910c32793de644f2518b80f7ed38e6c636d42871a4531314f4f74afd7"
+      "sha256": "7b63cdebeae99f6e87cd8a83f6517e575b843c8b4d98c194b9e82bf81356355c"
     },
     {
       "path": "packages/coding-agent/src/modes/runtime-init.ts",
@@ -8462,7 +8462,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/agent-session.ts",
-      "sha256": "ca657475bb7920454939f67b7da8008ac13bdc6661435660449f51ab93eec11d"
+      "sha256": "55c28b3fd0a62076b9cd192e955c9d46a8cf274df22fc31fb5345e3424f14097"
     },
     {
       "path": "packages/coding-agent/src/session/agent-storage.ts",
@@ -8638,7 +8638,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/session-maintenance.ts",
-      "sha256": "309429cbc511f95f2f0728a28c62a2dc461b5cad00402e95281a313f2d851062"
+      "sha256": "fa4b2fa80b20390e1ef18ad52f6ca860a390465d07162f6d2c925630799ce514"
     },
     {
       "path": "packages/coding-agent/src/session/session-manager.ts",
@@ -8714,7 +8714,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/todo-tracker.ts",
-      "sha256": "d3af2c85d289e068373a3a4c60dc28ecc9d2c0f1dbed58f40fb71571fef1bc87"
+      "sha256": "9ab6ae1c7448f6da7bf960fa0e94e2f5a237e0f4dd01e000cd09d8c8b65ec157"
     },
     {
       "path": "packages/coding-agent/src/session/tool-choice-queue.ts",
@@ -10746,5 +10746,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "e978a467c5df44df0e3f165457b846ba464c08e0f52aab6f58a7802bcf379600"
+  "rootSha256": "3742476b5b2c149b49abedfb370c87f7b5fb99887eaf81deee58884039680a44"
 }

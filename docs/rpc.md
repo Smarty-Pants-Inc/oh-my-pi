@@ -52,13 +52,15 @@ Current clients that support protocol v2 SHOULD immediately send:
   "id": "protocol-1",
   "type": "negotiate_protocol",
   "protocolVersion": 2,
-  "closureRejection": true
+  "closureRejection": true,
+  "idleBarrier": true
 }
 ```
 
-The negotiation success data includes `idleBarrier: true` when the server supports
-the authoritative `wait_for_idle` command. The bundled TypeScript client uses
-that capability and retains terminal-event waiting only for older servers.
+The negotiation success data includes `closureRejection: true` when requested.
+It includes `idleBarrier: true` only when the client requested **both** flags.
+The bundled TypeScript client uses the barrier only when both capabilities are
+acknowledged and retains terminal-event waiting as an explicit legacy fallback.
 
 After the success response, oversized stdout objects are emitted losslessly as an uninterrupted sequence of `rpc_chunk` frames. Each chunk carries a base64 segment of the original UTF-8 JSON object:
 
@@ -75,7 +77,7 @@ After the success response, oversized stdout objects are emitted losslessly as a
 
 Clients MUST validate `chunkId`, `index`, `count`, and `byteLength`, reject interleaved or interrupted sequences, enforce the advertised reassembly limit, concatenate decoded bytes in index order, decode them as strict UTF-8, and parse the result as one JSON object. The TypeScript `RpcFrameDecoder`, exported from `@oh-my-pi/pi-coding-agent/modes/rpc/rpc-frame`, implements this validation. The bundled TypeScript and Python `RpcClient` implementations negotiate v2 and `closureRejection` automatically when the ready frame advertises it.
 
-V1 and v2 describe framing, not a general event-semantic version. A client that omits `closureRejection: true` may be an older v1 or v2 client that treats every `agent_end` as success. To fail closed rather than report that false success, the server withholds a rejected `agent_end` from such a client and emits an uncorrelated `rpc_frame_error`; its lifecycle wait therefore fails by timeout unless the host surfaces that frame. Closure-sensitive hosts MUST upgrade to a bundled current client or negotiate the capability. V1 retains its bounded fallback behavior for oversized output. Responses above the v2 reassembly ceiling fail explicitly; terminal `agent_end` fallbacks remain bounded while preserving their rejection marker.
+V1 and v2 describe framing, not a general event-semantic version. A client that omits `closureRejection: true` may be an older v1 or v2 client that treats every `agent_end` as success. To fail closed rather than report that false success, the server withholds a rejected `agent_end` from such a client, emits an uncorrelated `rpc_frame_error`, and does not advertise `idleBarrier`; its lifecycle wait therefore uses the legacy fallback and fails by timeout unless the host surfaces that frame. Closure-sensitive hosts MUST upgrade to a bundled current client or negotiate the capability. V1 retains its bounded fallback behavior for oversized output. Responses above the v2 reassembly ceiling fail explicitly; terminal `agent_end` fallbacks remain bounded while preserving their rejection marker.
 
 ### Outbound frame categories (stdout)
 
@@ -138,17 +140,19 @@ so a later `abort` can overtake a run that would otherwise keep the barrier
 blocked. Later commands can therefore overlap the barrier; clients MUST use the
 response `id` and avoid treating response order as command order.
 
-The protocol-v2 negotiation response advertises `data.idleBarrier: true` when
-this command is supported. Current bundled clients use the barrier only after
-that capability is negotiated. With an older server, they retain the legacy
-fallback: an immediate `agentInvoked: false` response is already complete;
-otherwise they wait for the first terminal `agent_end`. That fallback cannot
-distinguish an active predecessor from a queued successor, so hosts that need
-authoritative quiescence MUST use a server that advertises `idleBarrier`.
+The protocol-v2 negotiation response advertises `data.closureRejection: true`
+when requested. It advertises `data.idleBarrier: true` only when the request
+also included `idleBarrier: true`; current bundled clients use the barrier only
+after both capabilities are negotiated. With an older server, they retain the
+explicit legacy fallback: an immediate `agentInvoked: false` response is
+already complete; otherwise they wait for the first terminal `agent_end`. That
+fallback cannot distinguish an active predecessor from a queued successor, so
+hosts that need authoritative quiescence MUST use a server that advertises both
+capabilities.
 
 ### Protocol
 
-- `{ id?, type: "negotiate_protocol", protocolVersion: 2, closureRejection?: true }`
+- `{ id?, type: "negotiate_protocol", protocolVersion: 2, closureRejection?: true, idleBarrier?: true }`
 
 ### State
 
@@ -900,6 +904,9 @@ Current helper characteristics:
 - Dispatches recognized core `AgentEvent` types to listeners
 - Supports host-owned custom tools via `setCustomTools()` and automatic handling of `host_tool_call` / `host_tool_cancel`
 - Wraps common protocol commands including OAuth `getLoginProviders()` / `login(...)`; use raw protocol frames for any surface not wrapped by the helper.
+- Retains same-id late `prompt` / `abort_and_prompt` scheduling failures with their accepted schedule, so each wait surfaces only fresh failures included in its immutable barrier cutoff
+- Allows only one `waitForIdle()`, `collectEvents()`, or `promptAndWait()` lifecycle collector at a time per client instance
+- Clears retained terminal completion state after a successful `newSession()`, `switchSession()`, `branch()`, or `handoff()` session replacement
 
 ### Python package
 

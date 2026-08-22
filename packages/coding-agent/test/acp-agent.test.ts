@@ -1365,6 +1365,39 @@ describe("ACP agent", () => {
 		await Bun.sleep(0);
 	});
 
+	it("finishes a prompt as cancelled from an aborted terminal agent_end", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId);
+		if (!session) throw new Error("session not registered");
+
+		const cancelledMessage = {
+			...makeAssistantMessage(""),
+			stopReason: "aborted" as const,
+			errorMessage: "Cancelled by user",
+		};
+		session.prompt = async (text: string): Promise<boolean> => {
+			session.promptCalls.push(text);
+			session.isStreaming = true;
+			session.sessionManager.appendMessage(cancelledMessage);
+			for (const listener of session.listeners()) {
+				listener({ type: "agent_end", messages: [cancelledMessage], isTerminal: true } as AgentSessionEvent);
+			}
+			session.isStreaming = false;
+			return true;
+		};
+
+		const response = await harness.agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "Cancel during finalization" }],
+		});
+		expectAcpStructure(zPromptResponse, response);
+		expect(response.stopReason).toBe("cancelled");
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
 	it("returns a protocol refusal for a stale todo terminal closure", async () => {
 		const harness = await createHarness();
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
