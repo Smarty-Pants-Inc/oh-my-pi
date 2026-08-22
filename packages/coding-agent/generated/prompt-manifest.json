@@ -7377,11 +7377,11 @@
     },
     {
       "path": "packages/coding-agent/src/extensibility/extensions/runner.ts",
-      "sha256": "b26e380f37a98511913ba0c2d724683999285a18fb65634a72ec50fae27bebb4"
+      "sha256": "37ecd7e641dfafbe290193ee3c344f7b48f72e96331b7e257c744de479fa9b4b"
     },
     {
       "path": "packages/coding-agent/src/extensibility/extensions/types.ts",
-      "sha256": "e004ecd9decd334c2b8fcc38fe295e352e6f897f5c4341b241c12386246bcbb9"
+      "sha256": "47347f8ed60ccce77cac27256bd29ea4c736d3e45cc4869e210be2f0d4182a89"
     },
     {
       "path": "packages/coding-agent/src/extensibility/extensions/wrapper.ts",
@@ -8245,7 +8245,7 @@
     },
     {
       "path": "packages/coding-agent/src/modes/rpc/rpc-mode.ts",
-      "sha256": "987a5d7a989723c880f751905055b4fdc8a2ffbb2e5f35e8a35ac8eabd4226a3"
+      "sha256": "673f23e8587da7e350c046f8c7d6af32c152bda996c6f30e99722324473ca620"
     },
     {
       "path": "packages/coding-agent/src/modes/runtime-init.ts",
@@ -8297,7 +8297,7 @@
     },
     {
       "path": "packages/coding-agent/src/modes/utils/ui-helpers.ts",
-      "sha256": "936b13f87c6720a0ca607b33b982496663a9dd3d88bda8a995938c2ee819473d"
+      "sha256": "cf227053763207753e3ae73357981c4ce91f1de1ec116c1bd294bf397991cd34"
     },
     {
       "path": "packages/coding-agent/src/modes/workflow.ts",
@@ -8449,7 +8449,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/agent-session.ts",
-      "sha256": "bbc39e7b1f1d5bf64681bab33d5689364155214cbe3a0690743682af25e6d0e0"
+      "sha256": "49bb4fa5f984056a1b13f9bf767d553bc59bbabd866e6d570635a7d9bbdbb7c7"
     },
     {
       "path": "packages/coding-agent/src/session/agent-storage.ts",
@@ -8557,7 +8557,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/messages.ts",
-      "sha256": "623653150b77af6edcf083ef14f39b3dc22bf5700c6fcce53b031f3d4ced4789"
+      "sha256": "79c6e2e7e75ddbcd8196457540574aef02b6f7282524025cb15ed7590c623590"
     },
     {
       "path": "packages/coding-agent/src/session/model-controls.ts",
@@ -10733,5 +10733,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "c0e0366c4d731e11817d09554e1c229340ac04b80d192727ec77161cff08a3cb"
+  "rootSha256": "fa47c0c0968d8d1463d4bf2a28a017252cd21c5373fcd68a1541bf4ef478a314"
 }

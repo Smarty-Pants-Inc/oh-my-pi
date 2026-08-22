@@ -7,8 +7,9 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import { type CustomMessage, USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { type CustomMessage, convertToLlm, USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { COLLAB_PROMPT_MESSAGE_TYPE } from "@oh-my-pi/pi-wire";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
 const model = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -43,6 +44,12 @@ function customMessage(
 		timestamp: options.timestamp,
 		details: options.details,
 	};
+}
+
+function waitForImmediate(): Promise<void> {
+	const { promise, resolve } = Promise.withResolvers<void>();
+	setImmediate(resolve);
+	return promise;
 }
 
 function hiddenCompanion(
@@ -90,6 +97,7 @@ describe("AgentSession queued prompt seam", () => {
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry,
 		});
+		vi.spyOn(agent, "continue").mockResolvedValue(undefined);
 		return session;
 	}
 
@@ -137,7 +145,7 @@ describe("AgentSession queued prompt seam", () => {
 		expect(target.getQueuedPrompts().map(prompt => prompt.text)).toEqual(["older follow-up", "newer steer"]);
 	});
 
-	it("retimes only the selected owner and its contiguous preceding companions", () => {
+	it("retimes only the selected owner and its contiguous preceding companions", async () => {
 		const agent = createAgent();
 		const target = createSession(agent);
 		const existingSteer = userMessage("existing steer", 10, true);
@@ -161,8 +169,8 @@ describe("AgentSession queued prompt seam", () => {
 		if (!id) throw new Error("Expected selected queued prompt id");
 		const replaceQueues = vi.spyOn(agent, "replaceQueues");
 
-		expect(target.setQueuedPromptDelivery(id, "steer")).toEqual({ status: "updated" });
-		expect(replaceQueues).toHaveBeenCalledTimes(1);
+		expect(await target.setQueuedPromptDelivery(id, "steer")).toEqual({ status: "updated" });
+		await waitForImmediate();
 		expect(replaceQueues.mock.calls[0]?.[2]).toBe(true);
 		expect([...agent.peekSteeringQueue()]).toEqual([existingSteer, magicCompanion, imageCompanion, owner]);
 		expect([...agent.peekFollowUpQueue()]).toEqual([earlierFollowUp, unrelatedHidden, laterFollowUp]);
@@ -174,11 +182,11 @@ describe("AgentSession queued prompt seam", () => {
 		expect(owner.steering).toBe(true);
 		expect(target.getQueuedPrompts().find(prompt => prompt.id === id)?.delivery).toBe("steer");
 
-		expect(target.setQueuedPromptDelivery(id, "steer")).toEqual({ status: "updated" });
-		expect(replaceQueues).toHaveBeenCalledTimes(1);
+		expect(await target.setQueuedPromptDelivery(id, "steer")).toEqual({ status: "updated" });
 
-		expect(target.setQueuedPromptDelivery(id, "afterCurrent")).toEqual({ status: "updated" });
-		expect(replaceQueues).toHaveBeenCalledTimes(2);
+		await waitForImmediate();
+		expect(await target.setQueuedPromptDelivery(id, "afterCurrent")).toEqual({ status: "updated" });
+		await waitForImmediate();
 		expect([...agent.peekSteeringQueue()]).toEqual([existingSteer]);
 		expect([...agent.peekFollowUpQueue()]).toEqual([
 			earlierFollowUp,
@@ -237,7 +245,7 @@ describe("AgentSession queued prompt seam", () => {
 		expect(secondListener).toHaveBeenCalledTimes(2);
 	});
 
-	it("returns stale for departed owners and unavailable across lifecycle fences", () => {
+	it("returns stale for departed owners and unavailable across lifecycle fences", async () => {
 		const agent = createAgent();
 		const target = createSession(agent);
 		const staleOwner = userMessage("stale", 40, true);
@@ -245,7 +253,7 @@ describe("AgentSession queued prompt seam", () => {
 		const staleId = target.getQueuedPrompts()[0]?.id;
 		if (!staleId) throw new Error("Expected stale prompt id");
 		agent.clearAllQueues();
-		expect(target.setQueuedPromptDelivery(staleId, "afterCurrent")).toEqual({ status: "stale" });
+		expect(await target.setQueuedPromptDelivery(staleId, "afterCurrent")).toEqual({ status: "stale" });
 
 		const liveOwner = userMessage("live", 41, true);
 		agent.replaceQueues([liveOwner], [], true);
@@ -253,7 +261,7 @@ describe("AgentSession queued prompt seam", () => {
 		if (!liveId) throw new Error("Expected live prompt id");
 		const replaceQueues = vi.spyOn(agent, "replaceQueues");
 		target.setLifecycleTransitionFenceForTests(true);
-		expect(target.setQueuedPromptDelivery(liveId, "afterCurrent")).toEqual({
+		expect(await target.setQueuedPromptDelivery(liveId, "afterCurrent")).toEqual({
 			status: "unavailable",
 			reason: "session_transition",
 		});
@@ -261,14 +269,14 @@ describe("AgentSession queued prompt seam", () => {
 		target.setLifecycleTransitionFenceForTests(false);
 
 		target.beginDispose();
-		expect(target.setQueuedPromptDelivery(liveId, "afterCurrent")).toEqual({
+		expect(await target.setQueuedPromptDelivery(liveId, "afterCurrent")).toEqual({
 			status: "unavailable",
 			reason: "session_transition",
 		});
 		expect(agent.peekSteeringQueue()[0]).toBe(liveOwner);
 	});
 
-	it("promotes an interrupt block before aborting and keeps interrupt out of persistent delivery metadata", () => {
+	it("promotes an interrupt block before aborting and keeps interrupt out of persistent delivery metadata", async () => {
 		const agent = createAgent();
 		const target = createSession(agent);
 		const existingFirst = userMessage("existing first", 50, true);
@@ -297,7 +305,7 @@ describe("AgentSession queued prompt seam", () => {
 			return Promise.resolve();
 		});
 
-		expect(target.setQueuedPromptDelivery(id, "interrupt")).toEqual({ status: "updated" });
+		expect(await target.setQueuedPromptDelivery(id, "interrupt")).toEqual({ status: "updated" });
 		expect(order).toEqual(["replace", "abort"]);
 		expect(abort).toHaveBeenCalledTimes(1);
 		expect(steeringAtAbort).toEqual([companion, owner, existingFirst, existingSecond]);
@@ -306,5 +314,27 @@ describe("AgentSession queued prompt seam", () => {
 		expect(agent.peekSteeringQueue()[1]).toBe(owner);
 		expect(owner.steering).toBe(true);
 		expect(target.getQueuedPrompts().find(prompt => prompt.id === id)).toMatchObject({ id, delivery: "steer" });
+	});
+
+	it("converts a collab prompt retimed to after-current as a raw user turn", async () => {
+		const agent = createAgent();
+		const target = createSession(agent);
+		const owner = customMessage(COLLAB_PROMPT_MESSAGE_TYPE, "guest follow-up", {
+			display: true,
+			attribution: "user",
+			timestamp: 60,
+			details: { from: "guest" },
+		});
+		agent.replaceQueues([owner], [], true);
+		const id = target.getQueuedPrompts()[0]?.id;
+		if (!id) throw new Error("Expected collab queued prompt id");
+
+		expect(await target.setQueuedPromptDelivery(id, "afterCurrent")).toEqual({ status: "updated" });
+		expect(owner.details).toMatchObject({ from: "guest", __ompSteering: false });
+		const converted = convertToLlm([owner]);
+		expect(converted).toHaveLength(1);
+		expect(converted[0]?.role).toBe("user");
+		expect(JSON.stringify(converted[0])).toContain("guest follow-up");
+		expect(JSON.stringify(converted[0])).not.toContain("system-notice");
 	});
 });

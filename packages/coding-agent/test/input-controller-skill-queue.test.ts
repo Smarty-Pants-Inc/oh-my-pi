@@ -37,6 +37,12 @@ type StubEditor = {
 	imageLinks?: (string | undefined)[];
 };
 
+function waitForImmediate(): Promise<void> {
+	const { promise, resolve } = Promise.withResolvers<void>();
+	setImmediate(resolve);
+	return promise;
+}
+
 type PromptCustomMessage = Mock<
 	(
 		message: {
@@ -933,6 +939,7 @@ describe("UiHelpers / InputController against derived queued custom display", ()
 	it("edits one queued prompt's timing in place and commits once", async () => {
 		fixture = await createRealSession();
 		const { session } = fixture;
+		vi.spyOn(session.agent, "continue").mockResolvedValue(undefined);
 		for (const text of ["first prompt", "second prompt"]) {
 			session.agent.followUp({
 				role: "user",
@@ -960,18 +967,48 @@ describe("UiHelpers / InputController against derived queued custom display", ()
 		expect(rendered).toContain("1. [Next safe moment] first prompt");
 
 		expect(dispatchInput("\r")).toEqual({ consume: true });
+		await session.waitForIdle();
+		await waitForImmediate();
 		expect(session.getQueuedPrompts()).toEqual([
 			{ id: expect.any(String), text: "first prompt", delivery: "steer" },
 			{ id: expect.any(String), text: "second prompt", delivery: "afterCurrent" },
 		]);
 		expect(showStatus).toHaveBeenCalledWith("Queued prompt set to next safe moment.");
-		expect(inputListeners.size).toBe(0);
+		expect(inputListeners.size).toBe(1);
 		rendered = Bun.stripANSI(pendingMessagesContainer.render(120).join("\n"));
 		expect(rendered).toContain("Steering · 1");
 		expect(rendered).toContain("After yield · 1");
 		expect(rendered).not.toContain("←/→ timing");
 	});
 
+	it("handles modal Left before a later focused-subagent listener", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		vi.spyOn(session.agent, "continue").mockResolvedValue(undefined);
+		session.agent.followUp({
+			role: "user",
+			content: "retime before unfocus",
+			attribution: "user",
+			timestamp: Date.now(),
+		});
+
+		const { ctx, pendingMessagesContainer, dispatchInput, inputListeners } =
+			createStubInteractiveModeContextForUiHelpers(session);
+		const uiHelpers = new UiHelpers(ctx);
+		const focusedSubagentLeft = vi.fn(() => ({ consume: true as const }));
+		inputListeners.add(focusedSubagentLeft);
+		uiHelpers.editQueuedPrompts();
+
+		expect(dispatchInput("\x1b[D")).toEqual({ consume: true });
+		expect(focusedSubagentLeft).not.toHaveBeenCalled();
+		const draft = Bun.stripANSI(pendingMessagesContainer.render(120).join("\n"));
+		expect(draft).toContain("[Next safe moment] retime before unfocus");
+		expect(dispatchInput("\r")).toEqual({ consume: true });
+		await session.waitForIdle();
+		await waitForImmediate();
+		await Promise.resolve();
+		expect(session.getQueuedPrompts()[0]?.delivery).toBe("steer");
+	});
 	it("cancels an in-place timing draft without moving the prompt", async () => {
 		fixture = await createRealSession();
 		const { session } = fixture;
@@ -987,12 +1024,13 @@ describe("UiHelpers / InputController against derived queued custom display", ()
 
 		expect(session.getQueuedPrompts()[0]?.delivery).toBe("steer");
 		expect(showStatus).not.toHaveBeenCalled();
-		expect(inputListeners.size).toBe(0);
+		expect(inputListeners.size).toBe(1);
 	});
 
 	it("preserves an in-place timing draft across unrelated queue changes", async () => {
 		fixture = await createRealSession();
 		const { session } = fixture;
+		vi.spyOn(session.agent, "continue").mockResolvedValue(undefined);
 		session.agent.followUp({
 			role: "user",
 			content: "selected prompt",
@@ -1016,6 +1054,8 @@ describe("UiHelpers / InputController against derived queued custom display", ()
 		const rendered = Bun.stripANSI(pendingMessagesContainer.render(120).join("\n"));
 		expect(rendered).toContain("1. [Next safe moment] selected prompt");
 		expect(dispatchInput("\r")).toEqual({ consume: true });
+		await session.waitForIdle();
+		await waitForImmediate();
 		expect(session.getQueuedPrompts().map(prompt => [prompt.text, prompt.delivery])).toEqual([
 			["selected prompt", "steer"],
 			["unrelated prompt", "afterCurrent"],
@@ -1042,7 +1082,7 @@ describe("UiHelpers / InputController against derived queued custom display", ()
 		expect(dispatchInput("\r")).toBeUndefined();
 		Reflect.deleteProperty(session, "isCompacting");
 
-		expect(inputListeners.size).toBe(0);
+		expect(inputListeners.size).toBe(1);
 		expect(editor.getText()).toBe("unfinished draft");
 		expect(session.getQueuedPrompts()).toEqual([
 			{ id: expect.any(String), text: "queued prompt", delivery: "afterCurrent" },
@@ -1066,7 +1106,7 @@ describe("UiHelpers / InputController against derived queued custom display", ()
 
 		setFocused(new Container());
 		expect(dispatchInput("\r")).toBeUndefined();
-		expect(inputListeners.size).toBe(0);
+		expect(inputListeners.size).toBe(1);
 		expect(session.getQueuedPrompts()[0]?.delivery).toBe("afterCurrent");
 	});
 
@@ -1088,7 +1128,7 @@ describe("UiHelpers / InputController against derived queued custom display", ()
 
 		setOverlayVisible(true);
 		expect(dispatchInput("\x1b[D")).toBeUndefined();
-		expect(inputListeners.size).toBe(0);
+		expect(inputListeners.size).toBe(1);
 		expect(session.getQueuedPrompts()[0]?.delivery).toBe("afterCurrent");
 	});
 
@@ -1117,7 +1157,7 @@ describe("UiHelpers / InputController against derived queued custom display", ()
 
 		session.agent.replaceQueues([], [older], true);
 
-		expect(inputListeners.size).toBe(0);
+		expect(inputListeners.size).toBe(1);
 		expect(dispatchInput("\r")).toBeUndefined();
 		expect(session.getQueuedPrompts()).toEqual([
 			{ id: expect.any(String), text: "older prompt", delivery: "afterCurrent" },
@@ -1142,7 +1182,7 @@ describe("UiHelpers / InputController against derived queued custom display", ()
 		});
 		expect(dispatchInput("\r")).toBeUndefined();
 
-		expect(inputListeners.size).toBe(0);
+		expect(inputListeners.size).toBe(1);
 		expect(editor.getText()).toBe("unfinished draft");
 	});
 

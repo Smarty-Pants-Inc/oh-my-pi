@@ -135,7 +135,7 @@ describe("runSubprocess terminal results", () => {
 		const queuedPrompts = [{ id: "queued-1", text: "later", delivery: "afterCurrent" as const }];
 		const unsubscribe = vi.fn();
 		const onQueuedPromptsChanged = vi.fn((_listener: () => void) => unsubscribe);
-		const setQueuedPromptDelivery = vi.fn((_id: string, _delivery: "interrupt" | "steer" | "afterCurrent") => ({
+		const setQueuedPromptDelivery = vi.fn(async (_id: string, _delivery: "interrupt" | "steer" | "afterCurrent") => ({
 			status: "updated" as const,
 		}));
 		let contextActions: ExtensionContextActions | undefined;
@@ -199,7 +199,7 @@ describe("runSubprocess terminal results", () => {
 		const listener = vi.fn();
 		expect(contextActions?.onQueuedPromptsChanged?.(listener)).toBe(unsubscribe);
 		expect(onQueuedPromptsChanged).toHaveBeenCalledWith(listener);
-		expect(contextActions?.setQueuedPromptDelivery?.("queued-1", "steer")).toEqual({ status: "updated" });
+		expect(await contextActions?.setQueuedPromptDelivery?.("queued-1", "steer")).toEqual({ status: "updated" });
 		expect(setQueuedPromptDelivery).toHaveBeenCalledWith("queued-1", "steer");
 	});
 

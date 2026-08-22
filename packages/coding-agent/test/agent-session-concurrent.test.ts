@@ -29,6 +29,7 @@ import { convertToLlm, USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/se
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
+import { COLLAB_PROMPT_MESSAGE_TYPE } from "@oh-my-pi/pi-wire";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 
 // Mock stream that mimics AssistantMessageEventStream
@@ -1229,6 +1230,82 @@ describe("AgentSession concurrent prompt guard", () => {
 			const recovered = queue === "steer" ? resumed.agent.peekSteeringQueue() : resumed.agent.peekFollowUpQueue();
 			expect(recovered).toHaveLength(1);
 			expect(JSON.stringify(recovered[0])).toContain(content);
+		});
+
+		it("rehydrates a durable custom prompt with its retimed queue kind", async () => {
+			const sessionDir = path.join(tempDir, "sessions");
+			const manager = SessionManager.create(tempDir, sessionDir);
+			session = createPersistentSession(manager);
+			session.agent.state.isStreaming = true;
+			await session.sendCustomMessage(
+				{
+					customType: COLLAB_PROMPT_MESSAGE_TYPE,
+					content: "recover after retime",
+					display: true,
+					details: { from: "guest" },
+					attribution: "user",
+				},
+				{ deliveryMode: "afterCurrent" },
+			);
+			const queuedId = session.getQueuedPrompts()[0]?.id;
+			if (!queuedId) throw new Error("Expected durable queued prompt");
+			await expect(session.setQueuedPromptDelivery(queuedId, "steer")).resolves.toEqual({ status: "updated" });
+			const sessionFile = manager.getSessionFile();
+			if (!sessionFile) throw new Error("Expected retimed session journal");
+
+			session = undefined as unknown as AgentSession;
+			const resumed = await reopen(sessionFile, sessionDir);
+			expect(resumed.agent.peekFollowUpQueue()).toHaveLength(0);
+			expect(resumed.agent.peekSteeringQueue()).toHaveLength(1);
+			expect(resumed.agent.peekSteeringQueue()[0]).toMatchObject({
+				customType: COLLAB_PROMPT_MESSAGE_TYPE,
+				content: "recover after retime",
+				details: { from: "guest", __ompSteering: true },
+			});
+		});
+
+		it("holds an in-flight dequeue until a durable retime commit finishes", async () => {
+			const sessionDir = path.join(tempDir, "sessions");
+			const manager = SessionManager.create(tempDir, sessionDir);
+			const calls: Message[][] = [];
+			session = createPersistentSession(manager, calls);
+			session.agent.state.isStreaming = true;
+			await session.sendCustomMessage(
+				{ customType: "barrier-mail", content: "wait for commit", display: true, attribution: "user" },
+				{ deliveryMode: "steer" },
+			);
+			session.agent.state.isStreaming = false;
+			const queuedId = session.getQueuedPrompts()[0]?.id;
+			if (!queuedId) throw new Error("Expected durable queued prompt");
+			const dequeueStarted = Promise.withResolvers<void>();
+			const releaseDequeue = Promise.withResolvers<void>();
+			const removeDequeueGate = session.agent.addBeforeQueuedMessageDequeueHook(async () => {
+				dequeueStarted.resolve();
+				await releaseDequeue.promise;
+			});
+			const continuing = session.agent.continue();
+			await dequeueStarted.promise;
+
+			const writeStarted = Promise.withResolvers<void>();
+			const releaseWrite = Promise.withResolvers<void>();
+			const appendEntriesAtomically = manager.appendEntriesAtomically.bind(manager);
+			vi.spyOn(manager, "appendEntriesAtomically").mockImplementation(async append => {
+				writeStarted.resolve();
+				await releaseWrite.promise;
+				return appendEntriesAtomically(append);
+			});
+
+			const retiming = session.setQueuedPromptDelivery(queuedId, "afterCurrent");
+			await writeStarted.promise;
+			releaseDequeue.resolve();
+			await Promise.resolve();
+			expect(calls).toHaveLength(0);
+			releaseWrite.resolve();
+			await expect(retiming).resolves.toEqual({ status: "updated" });
+			removeDequeueGate();
+			await continuing;
+			expect(calls).toHaveLength(1);
+			expect(JSON.stringify(calls[0])).toContain("wait for commit");
 		});
 
 		it("keeps idle explicitPrompt recovery out of automatic turns until the next deliberate prompt", async () => {

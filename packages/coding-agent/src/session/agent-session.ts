@@ -344,6 +344,7 @@ import {
 	sanitizeAssistantForReparentedHistory,
 	stripInternalDetailsFields,
 	USER_INTERRUPT_LABEL,
+	withCollabPromptSteering,
 } from "./messages";
 import { ModelControls, type ModelControlsHost } from "./model-controls";
 import { isPrewalkPlanNudge, PrewalkCoordinator, type PrewalkCoordinatorHost } from "./prewalk";
@@ -387,7 +388,7 @@ import {
 	SessionMaintenance,
 	type SessionMaintenanceHost,
 } from "./session-maintenance";
-import { cleanupEmptyMoveSession, type SessionManager } from "./session-manager";
+import { cleanupEmptyMoveSession, type SessionManager, SessionPersistenceIndeterminateError } from "./session-manager";
 import { SessionMemory, type SessionMemoryHost } from "./session-memory";
 import { buildSessionMetadata } from "./session-metadata";
 import { SessionProviderBoundary, type SessionProviderBoundaryHost } from "./session-provider-boundary";
@@ -543,6 +544,14 @@ interface LaunchCompletionSessionTransition {
 	};
 }
 
+interface QueuedPromptLocation {
+	steering: AgentMessage[];
+	followUp: AgentMessage[];
+	source: Exclude<QueuedPromptDelivery, "interrupt">;
+	ownerIndex: number;
+	owner: AgentMessage;
+}
+
 type RuntimeContextModel = Pick<Model, "provider" | "id" | "api" | "compat" | "reasoning">;
 /**
  * Clone one top-level notification field without ever returning an object owned
@@ -621,12 +630,14 @@ export class AgentSession {
 
 	/** Host messages retained only for the next deliberate prompt. */
 	#pendingNextTurnMessages: CustomMessage[] = [];
+	#queuedPromptNotificationsSuppressed = false;
 	/** Messages owned exclusively by the next deliberate user-authored prompt. */
 	#pendingExplicitPromptMessages: CustomMessage[] = [];
 	/** Durable queued semantic deliveries not yet persisted into conversation history. */
 	#pendingSemanticDeliveryIds = new Set<string>();
 	#semanticDeliveryAcceptances = new Set<Promise<void>>();
 	#queuedMessageDrainScheduled = false;
+	#queuedPromptDeliveryMutationInFlight = false;
 	#planModeState: PlanModeState | undefined;
 	/** Session-scoped `/vision` override; undefined = follow persisted `inspect_image.mode`. */
 	#inspectImageModeOverride: InspectImageMode | undefined;
@@ -7948,16 +7959,26 @@ export class AgentSession {
 		kind: PendingSemanticDeliveryKind,
 		message: CustomMessage,
 	): Promise<CustomMessage> {
+		const queuedMessage = withCollabPromptSteering(message, kind !== "followUp");
 		const data: PendingSemanticDeliveryData = {
 			v: 1,
 			kind,
-			message: { ...message, details: stripInternalDetailsFields(message.details) },
+			message: { ...queuedMessage, details: stripInternalDetailsFields(queuedMessage.details) },
 		};
 		const pendingId = await this.sessionManager.appendEntriesAtomically(() =>
 			this.sessionManager.appendCustomEntry(PENDING_SEMANTIC_DELIVERY_TYPE, data),
 		);
 		this.#pendingSemanticDeliveryIds.add(pendingId);
-		return this.#withPendingSemanticDeliveryId(message, pendingId);
+		return this.#withPendingSemanticDeliveryId(queuedMessage, pendingId);
+	}
+
+	#pendingSemanticDeliveryKind(pendingId: string): PendingSemanticDeliveryKind | undefined {
+		const entry = this.sessionManager.getEntry(pendingId);
+		if (entry?.type !== "custom" || entry.customType !== PENDING_SEMANTIC_DELIVERY_TYPE) return undefined;
+		const data = entry.data as PendingSemanticDeliveryData | undefined;
+		return data?.v === 1 && (data.kind === "steer" || data.kind === "followUp" || data.kind === "explicitPrompt")
+			? data.kind
+			: undefined;
 	}
 
 	async #preparePendingSemanticDeliveryHandoff(
@@ -7994,15 +8015,19 @@ export class AgentSession {
 				existing.standaloneExplicitPrompt ||= standaloneExplicitPrompt;
 				return;
 			}
-			const target: CustomMessage = {
-				...message,
-				details: stripInternalDetailsFields(message.details),
-			};
+			const kind = kindById.get(pendingId) ?? fallback;
+			const target = withCollabPromptSteering(
+				{
+					...message,
+					details: stripInternalDetailsFields(message.details),
+				},
+				kind !== "followUp",
+			);
 			migratedByMessage.set(message, target);
 			migrations.set(pendingId, {
 				source: message,
 				target,
-				kind: kindById.get(pendingId) ?? fallback,
+				kind,
 				standaloneExplicitPrompt,
 			});
 		};
@@ -8038,13 +8063,11 @@ export class AgentSession {
 				const orderedMigrations = [...migrations.entries()];
 				const targetPendingIds = await this.sessionManager.appendEntriesAtomically(() =>
 					orderedMigrations.map(([, migration]) => {
+						const message = withCollabPromptSteering(migration.source, migration.kind !== "followUp");
 						const data: PendingSemanticDeliveryData = {
 							v: 1,
 							kind: migration.kind,
-							message: {
-								...migration.source,
-								details: stripInternalDetailsFields(migration.source.details),
-							},
+							message: { ...message, details: stripInternalDetailsFields(message.details) },
 						};
 						return this.sessionManager.appendCustomEntry(PENDING_SEMANTIC_DELIVERY_TYPE, data);
 					}),
@@ -8119,7 +8142,10 @@ export class AgentSession {
 		let queued = false;
 		for (const [pendingId, data] of pending) {
 			if (settled.has(pendingId)) continue;
-			const message = this.#withPendingSemanticDeliveryId(data.message, pendingId);
+			const message = this.#withPendingSemanticDeliveryId(
+				withCollabPromptSteering(data.message, data.kind !== "followUp"),
+				pendingId,
+			);
 			this.#pendingSemanticDeliveryIds.add(pendingId);
 			if (data.kind === "explicitPrompt") {
 				this.#advisors.retainPrimaryInput([message]);
@@ -8244,14 +8270,15 @@ export class AgentSession {
 			queueChipText,
 			acceptedLifecycleGeneration,
 		);
+		const queuedAppMessage = withCollabPromptSteering(normalizedAppMessage, deliverAs === "steer");
 		this.#assertPromptCanStart(acceptedLifecycleGeneration);
 		this.#allowQueuedMessageDrainRetry();
 		if (deliverAs === "followUp") {
 			for (const prependMessage of normalizedPrependMessages) this.agent.followUp(prependMessage);
-			this.agent.followUp(normalizedAppMessage);
+			this.agent.followUp(queuedAppMessage);
 		} else {
 			for (const prependMessage of normalizedPrependMessages) this.agent.steer(prependMessage);
-			this.agent.steer(normalizedAppMessage);
+			this.agent.steer(queuedAppMessage);
 		}
 		if (scheduleIdleDrain) this.#scheduleIdleQueueDrain();
 	}
@@ -8349,13 +8376,19 @@ export class AgentSession {
 					const effectiveMode = semanticMode === "auto" ? (busy ? "afterCurrent" : "interrupt") : semanticMode;
 					if (busy) {
 						if (effectiveMode === "afterCurrent") {
-							const queuedMessage = await this.#persistPendingSemanticDelivery("followUp", normalizedAppMessage);
+							const queuedMessage = await this.#persistPendingSemanticDelivery(
+								"followUp",
+								withCollabPromptSteering(normalizedAppMessage, false),
+							);
 							this.#allowQueuedMessageDrainRetry();
 							this.agent.followUp(queuedMessage);
 							this.#scheduleIdleQueueDrain();
 							return { status: "accepted", delivery: "queued_follow_up" };
 						}
-						const queuedMessage = await this.#persistPendingSemanticDelivery("steer", normalizedAppMessage);
+						const queuedMessage = await this.#persistPendingSemanticDelivery(
+							"steer",
+							withCollabPromptSteering(normalizedAppMessage, true),
+						);
 						this.#allowQueuedMessageDrainRetry();
 						this.agent.steer(queuedMessage);
 						this.#scheduleIdleQueueDrain();
@@ -8448,7 +8481,10 @@ export class AgentSession {
 				}
 				if (semanticMode === "steer") {
 					if (this.isStreaming) {
-						const queuedMessage = await this.#persistPendingSemanticDelivery("steer", normalizedAppMessage);
+						const queuedMessage = await this.#persistPendingSemanticDelivery(
+							"steer",
+							withCollabPromptSteering(normalizedAppMessage, true),
+						);
 						this.#allowQueuedMessageDrainRetry();
 						this.agent.steer(queuedMessage);
 						this.#scheduleIdleQueueDrain();
@@ -8482,11 +8518,11 @@ export class AgentSession {
 			}
 			this.#allowQueuedMessageDrainRetry();
 			if (options?.deliverAs === "followUp") {
-				this.agent.followUp(normalizedAppMessage);
+				this.agent.followUp(withCollabPromptSteering(normalizedAppMessage, false));
 				this.#scheduleIdleQueueDrain();
 				return { status: "accepted", delivery: "queued_follow_up" };
 			}
-			this.agent.steer(normalizedAppMessage);
+			this.agent.steer(withCollabPromptSteering(normalizedAppMessage, true));
 			this.#scheduleIdleQueueDrain();
 			return { status: "accepted", delivery: "queued_steer" };
 		}
@@ -8645,6 +8681,7 @@ export class AgentSession {
 	}
 
 	#notifyQueuedPromptsChanged(): void {
+		if (this.#queuedPromptNotificationsSuppressed) return;
 		const fingerprint = this.#visibleQueuedPromptFingerprint();
 		if (fingerprint === this.#queuedPromptSnapshotFingerprint) return;
 		this.#queuedPromptSnapshotFingerprint = fingerprint;
@@ -8679,49 +8716,168 @@ export class AgentSession {
 		return () => this.#queuedPromptListeners.delete(listener);
 	}
 
-	setQueuedPromptDelivery(id: string, delivery: QueuedPromptDelivery): SetQueuedPromptDeliveryResult {
+	async setQueuedPromptDelivery(id: string, delivery: QueuedPromptDelivery): Promise<SetQueuedPromptDeliveryResult> {
 		if (this.#isDisposed || this.#lifecycleTransitionFenceActive) {
 			return { status: "unavailable", reason: "session_transition" };
 		}
+		if (this.#queuedPromptDeliveryMutationInFlight) {
+			return { status: "unavailable", reason: "queue_mutation" };
+		}
 
-		const steering = [...this.agent.peekSteeringQueue()];
-		const followUp = [...this.agent.peekFollowUpQueue()];
-		let source: "steer" | "afterCurrent" | undefined;
-		let ownerIndex = steering.findIndex(
-			message => isUserQueuedMessage(message) && this.#queuedPromptId(message) === id,
-		);
-		if (ownerIndex !== -1) {
-			source = "steer";
-		} else {
-			ownerIndex = followUp.findIndex(
+		const locate = (): QueuedPromptLocation | undefined => {
+			const steering = [...this.agent.peekSteeringQueue()];
+			const followUp = [...this.agent.peekFollowUpQueue()];
+			const steeringIndex = steering.findIndex(
 				message => isUserQueuedMessage(message) && this.#queuedPromptId(message) === id,
 			);
-			if (ownerIndex !== -1) source = "afterCurrent";
-		}
-		if (source === undefined) return { status: "stale" };
-		if (delivery === source) return { status: "updated" };
+			if (steeringIndex !== -1) {
+				return {
+					steering,
+					followUp,
+					source: "steer" as const,
+					ownerIndex: steeringIndex,
+					owner: steering[steeringIndex]!,
+				};
+			}
+			const followUpIndex = followUp.findIndex(
+				message => isUserQueuedMessage(message) && this.#queuedPromptId(message) === id,
+			);
+			if (followUpIndex === -1) return undefined;
+			return {
+				steering,
+				followUp,
+				source: "afterCurrent" as const,
+				ownerIndex: followUpIndex,
+				owner: followUp[followUpIndex]!,
+			};
+		};
 
-		const sourceQueue = source === "steer" ? steering : followUp;
-		const owner = sourceQueue[ownerIndex];
-		let blockStart = ownerIndex;
+		const move = (location: QueuedPromptLocation): void => {
+			const { steering, followUp, source, ownerIndex, owner } = location;
+			const sourceQueue = source === "steer" ? steering : followUp;
+			let blockStart = ownerIndex;
+			while (blockStart > 0 && isHiddenUserCompanion(sourceQueue[blockStart - 1])) blockStart--;
+			const block = sourceQueue.slice(blockStart, ownerIndex + 1);
+			const sourceRemainder = [...sourceQueue.slice(0, blockStart), ...sourceQueue.slice(ownerIndex + 1)];
+			let nextSteering = source === "steer" ? sourceRemainder : steering;
+			let nextFollowUp = source === "afterCurrent" ? sourceRemainder : followUp;
+
+			if (owner.role === "user") {
+				if (delivery === "afterCurrent") delete owner.steering;
+				else owner.steering = true;
+			} else if (owner.role === "custom") {
+				owner.details = withCollabPromptSteering(owner, delivery !== "afterCurrent").details;
+			}
+			if (delivery === "afterCurrent") nextFollowUp = [...nextFollowUp, ...block];
+			else if (delivery === "steer") nextSteering = [...nextSteering, ...block];
+			else nextSteering = [...block, ...nextSteering];
+
+			this.agent.replaceQueues(nextSteering, nextFollowUp, true);
+			if (delivery === "interrupt") {
+				void this.abort({ reason: USER_INTERRUPT_LABEL });
+				this.#reconcileQueuedMessageDrain();
+			} else {
+				this.#allowQueuedMessageDrainRetry();
+				this.#scheduleIdleQueueDrain();
+			}
+		};
+
+		const initial = locate();
+		if (!initial) return { status: "stale" };
+		if (delivery === initial.source) return { status: "updated" };
+
+		const pendingId =
+			initial.owner.role === "custom" ? readPendingSemanticDeliveryId(initial.owner.details) : undefined;
+		const durableKind = pendingId ? this.#pendingSemanticDeliveryKind(pendingId) : undefined;
+		const targetKind: PendingSemanticDeliveryKind = delivery === "afterCurrent" ? "followUp" : "steer";
+		if (!pendingId || !this.#pendingSemanticDeliveryIds.has(pendingId) || durableKind === targetKind) {
+			move(initial);
+			return { status: "updated" };
+		}
+		const durableOwner = initial.owner as CustomMessage;
+
+		this.#queuedPromptDeliveryMutationInFlight = true;
+		this.#queuedPromptNotificationsSuppressed = true;
+		const acceptance = this.#beginSemanticDeliveryAcceptance();
+		const dequeueBarrier = Promise.withResolvers<void>();
+		const removeDequeueBarrier = this.agent.addBeforeQueuedMessageDequeueHook(() => dequeueBarrier.promise);
+		const sourceQueue = initial.source === "steer" ? initial.steering : initial.followUp;
+		let blockStart = initial.ownerIndex;
 		while (blockStart > 0 && isHiddenUserCompanion(sourceQueue[blockStart - 1])) blockStart--;
-		const block = sourceQueue.slice(blockStart, ownerIndex + 1);
-		const sourceRemainder = [...sourceQueue.slice(0, blockStart), ...sourceQueue.slice(ownerIndex + 1)];
-		let nextSteering = source === "steer" ? sourceRemainder : steering;
-		let nextFollowUp = source === "afterCurrent" ? sourceRemainder : followUp;
+		const block = sourceQueue.slice(blockStart, initial.ownerIndex + 1);
+		const sourceRemainder = [...sourceQueue.slice(0, blockStart), ...sourceQueue.slice(initial.ownerIndex + 1)];
+		const claimedSteering = initial.source === "steer" ? sourceRemainder : initial.steering;
+		const claimedFollowUp = initial.source === "afterCurrent" ? sourceRemainder : initial.followUp;
+		const persistedOwner = withCollabPromptSteering(durableOwner, targetKind !== "followUp");
+		const restoreClaim = (): void => {
+			const steering = [...this.agent.peekSteeringQueue()];
+			const followUp = [...this.agent.peekFollowUpQueue()];
+			const queue = initial.source === "steer" ? steering : followUp;
+			const insertionIndex = Math.min(blockStart, queue.length);
+			const restored = [...queue.slice(0, insertionIndex), ...block, ...queue.slice(insertionIndex)];
+			this.agent.replaceQueues(
+				initial.source === "steer" ? restored : steering,
+				initial.source === "afterCurrent" ? restored : followUp,
+				true,
+			);
+		};
 
-		if (owner.role === "user") {
-			if (delivery === "afterCurrent") delete owner.steering;
-			else owner.steering = true;
+		try {
+			// Claim the exact owner block before the first await. A dequeue that already
+			// won is absent from the live queue and would have returned stale above.
+			this.agent.replaceQueues(claimedSteering, claimedFollowUp, true);
+			let replacementPendingId: string;
+			try {
+				replacementPendingId = await this.sessionManager.appendEntriesAtomically(() => {
+					const data: PendingSemanticDeliveryData = {
+						v: 1,
+						kind: targetKind,
+						message: { ...persistedOwner, details: stripInternalDetailsFields(persistedOwner.details) },
+					};
+					const replacementId = this.sessionManager.appendCustomEntry(PENDING_SEMANTIC_DELIVERY_TYPE, data);
+					this.#appendPendingSemanticDeliverySettlement(pendingId, "cancelled");
+					return replacementId;
+				});
+			} catch (error) {
+				if (error instanceof SessionPersistenceIndeterminateError) {
+					try {
+						await this.sessionManager.recoverPersistenceFromCurrentState();
+					} catch (recoveryError) {
+						throw new AggregateError(
+							[error, recoveryError],
+							"Queued prompt retiming persistence is indeterminate; the claimed prompt remains unavailable.",
+						);
+					}
+				}
+				restoreClaim();
+				throw error;
+			}
+
+			this.#pendingSemanticDeliveryIds.delete(pendingId);
+			this.#pendingSemanticDeliveryIds.add(replacementPendingId);
+			durableOwner.details = this.#withPendingSemanticDeliveryId(persistedOwner, replacementPendingId).details;
+			let nextSteering = [...this.agent.peekSteeringQueue()];
+			let nextFollowUp = [...this.agent.peekFollowUpQueue()];
+			if (delivery === "afterCurrent") nextFollowUp = [...nextFollowUp, ...block];
+			else if (delivery === "steer") nextSteering = [...nextSteering, ...block];
+			else nextSteering = [...block, ...nextSteering];
+			this.agent.replaceQueues(nextSteering, nextFollowUp, true);
+			if (delivery === "interrupt") {
+				void this.abort({ reason: USER_INTERRUPT_LABEL });
+				this.#reconcileQueuedMessageDrain();
+			} else {
+				this.#allowQueuedMessageDrainRetry();
+				this.#scheduleIdleQueueDrain();
+			}
+			return { status: "updated" };
+		} finally {
+			removeDequeueBarrier();
+			dequeueBarrier.resolve();
+			acceptance.release();
+			this.#queuedPromptDeliveryMutationInFlight = false;
+			this.#queuedPromptNotificationsSuppressed = false;
+			this.#notifyQueuedPromptsChanged();
 		}
-		if (delivery === "afterCurrent") nextFollowUp = [...nextFollowUp, ...block];
-		else if (delivery === "steer") nextSteering = [...nextSteering, ...block];
-		else nextSteering = [...block, ...nextSteering];
-
-		this.agent.replaceQueues(nextSteering, nextFollowUp, true);
-		if (delivery === "interrupt") void this.abort({ reason: USER_INTERRUPT_LABEL });
-		this.#reconcileQueuedMessageDrain();
-		return { status: "updated" };
 	}
 
 	getQueuedMessages(): { steering: readonly string[]; followUp: readonly string[] } {

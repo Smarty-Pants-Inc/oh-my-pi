@@ -206,7 +206,7 @@ describe("ExtensionRunner", () => {
 		const queuedPrompts = [{ id: "queue-1", text: "check the logs", delivery: "steer" as const }];
 		let queueListener: (() => void) | undefined;
 		const unsubscribe = vi.fn();
-		const setQueuedPromptDelivery = vi.fn(() => ({ status: "updated" as const }));
+		const setQueuedPromptDelivery = vi.fn(async () => ({ status: "updated" as const }));
 		const contextActions = {
 			getModel: () => undefined,
 			isIdle: () => true,
@@ -242,7 +242,7 @@ describe("ExtensionRunner", () => {
 		expect(ctx.onQueuedPromptsChanged(changed)).toBe(unsubscribe);
 		queueListener?.();
 		expect(changed).toHaveBeenCalledTimes(1);
-		expect(ctx.setQueuedPromptDelivery("queue-1", "afterCurrent")).toEqual({ status: "updated" });
+		expect(await ctx.setQueuedPromptDelivery("queue-1", "afterCurrent")).toEqual({ status: "updated" });
 		expect(setQueuedPromptDelivery).toHaveBeenCalledWith("queue-1", "afterCurrent");
 	});
 

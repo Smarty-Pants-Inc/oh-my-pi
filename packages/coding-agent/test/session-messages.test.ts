@@ -418,6 +418,28 @@ describe("wrapSteeringForModel", () => {
 		});
 	});
 
+	it("presents collab prompts marked non-steering as raw user turns", () => {
+		const message: AgentMessage = {
+			role: "custom",
+			customType: COLLAB_PROMPT_MESSAGE_TYPE,
+			content: "Wait until the current turn finishes",
+			display: true,
+			details: { from: "guest", __ompSteering: false },
+			attribution: "user",
+			timestamp: 1,
+		};
+
+		const directlyConverted = convertToLlm([message]);
+		const wrapped = wrapSteeringForModel([message]);
+
+		expect(directlyConverted).toHaveLength(1);
+		expect(directlyConverted[0]?.role).toBe("user");
+		expect(getUserText(directlyConverted[0])).toBe("Wait until the current turn finishes");
+		expect(getUserText(directlyConverted[0])).not.toContain("system-notice");
+		expect(wrapped).toBeDefined();
+		expect(wrapped[0]).toBe(message);
+	});
+
 	it("wraps buried steering messages too so wire bytes stay stable across turns", () => {
 		const buried: AgentMessage = {
 			role: "user",

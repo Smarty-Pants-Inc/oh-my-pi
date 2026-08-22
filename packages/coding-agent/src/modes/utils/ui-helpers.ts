@@ -111,7 +111,6 @@ type QueuedPromptEditState = {
 	selectedIndex: number;
 	persistedDelivery: QueuedPromptDelivery;
 	draftDelivery: QueuedPromptDelivery;
-	unsubscribeInput: () => void;
 	unsubscribeQueue: () => void;
 };
 function queuedPromptText(text: string): string {
@@ -139,7 +138,9 @@ function imageLinksForMessage(
 }
 
 export class UiHelpers {
-	constructor(private ctx: InteractiveModeContext) {}
+	constructor(private ctx: InteractiveModeContext) {
+		this.ctx.ui?.addInputListener?.(data => this.#handleQueuedPromptEditInput(data));
+	}
 	#queuedPromptEdit: QueuedPromptEditState | undefined;
 
 	/** Extract text content from a user message */
@@ -954,22 +955,10 @@ export class UiHelpers {
 			selectedIndex,
 			draftDelivery: selected.delivery,
 			persistedDelivery: selected.delivery,
-			unsubscribeInput: () => {},
 			unsubscribeQueue: () => {},
 		};
 		this.#queuedPromptEdit = state;
 		state.unsubscribeQueue = session.onQueuedPromptsChanged(() => this.#refreshQueuedPromptEditor(state));
-		// The shortcut that opens this editor is itself terminal input. Install the
-		// modal listener after that dispatch finishes so Shift+Up cannot also move
-		// the new selection.
-		queueMicrotask(() => {
-			if (this.#queuedPromptEdit !== state) return;
-			if (!this.#queuedPromptEditorOwnsInput(state)) {
-				this.#stopQueuedPromptEditing();
-				return;
-			}
-			state.unsubscribeInput = this.ctx.ui.addInputListener(data => this.#handleQueuedPromptEditInput(data));
-		});
 		this.updatePendingMessagesDisplay();
 	}
 
@@ -977,7 +966,6 @@ export class UiHelpers {
 		const state = this.#queuedPromptEdit;
 		if (!state) return;
 		this.#queuedPromptEdit = undefined;
-		state.unsubscribeInput();
 		state.unsubscribeQueue();
 		if (render) this.updatePendingMessagesDisplay();
 	}
@@ -1087,19 +1075,38 @@ export class UiHelpers {
 		) {
 			const { selectedId, draftDelivery, session } = state;
 			this.#stopQueuedPromptEditing(false);
-			const result = session.setQueuedPromptDelivery(selectedId, draftDelivery);
-			if (result.status === "updated") {
-				this.ctx.showStatus(`Queued prompt set to ${QUEUED_PROMPT_TIMING_LABELS[draftDelivery].toLowerCase()}.`);
-			} else if (result.status === "unavailable") {
-				this.ctx.showWarning("Queued prompt timing is unavailable during a session transition.");
-			} else {
-				this.ctx.showWarning("That prompt is no longer queued.");
-			}
-			this.updatePendingMessagesDisplay();
+			void this.#commitQueuedPromptDelivery(session, selectedId, draftDelivery);
 			return { consume: true };
 		}
 
 		return { consume: true };
+	}
+
+	async #commitQueuedPromptDelivery(
+		session: InteractiveModeContext["viewSession"],
+		selectedId: string,
+		draftDelivery: QueuedPromptDelivery,
+	): Promise<void> {
+		try {
+			const result = await session.setQueuedPromptDelivery(selectedId, draftDelivery);
+			if (result.status === "updated") {
+				this.ctx.showStatus(`Queued prompt set to ${QUEUED_PROMPT_TIMING_LABELS[draftDelivery].toLowerCase()}.`);
+			} else if (result.status === "unavailable") {
+				this.ctx.showWarning(
+					result.reason === "queue_mutation"
+						? "Another queued prompt timing change is still being saved."
+						: "Queued prompt timing is unavailable during a session transition.",
+				);
+			} else {
+				this.ctx.showWarning("That prompt is no longer queued.");
+			}
+		} catch (error) {
+			this.showError(
+				`Failed to save queued prompt timing: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+		await waitForImmediate();
+		this.updatePendingMessagesDisplay();
 	}
 
 	#renderQueuedPromptEditor(state: QueuedPromptEditState): boolean {

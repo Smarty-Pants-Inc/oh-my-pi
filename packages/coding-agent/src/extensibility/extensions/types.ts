@@ -474,7 +474,7 @@ export interface QueuedPrompt {
 export type SetQueuedPromptDeliveryResult =
 	| { status: "updated" }
 	| { status: "stale" }
-	| { status: "unavailable"; reason: "session_transition" };
+	| { status: "unavailable"; reason: "session_transition" | "queue_mutation" };
 
 export interface ExtensionContext {
 	/** UI methods for user interaction */
@@ -516,7 +516,7 @@ export interface ExtensionContext {
 	/** Listen for changes to the sanitized queued-prompt snapshot. */
 	onQueuedPromptsChanged(listener: () => void): () => void;
 	/** Atomically change one queued user prompt's delivery boundary. */
-	setQueuedPromptDelivery(id: string, delivery: QueuedPromptDelivery): SetQueuedPromptDeliveryResult;
+	setQueuedPromptDelivery(id: string, delivery: QueuedPromptDelivery): Promise<SetQueuedPromptDeliveryResult>;
 	/** Gracefully shutdown and exit. */
 	shutdown(): void;
 	/** Get the current effective system prompt. */
@@ -1832,7 +1832,7 @@ export interface ExtensionContextActions {
 	hasPendingMessages: () => boolean;
 	getQueuedPrompts?: () => readonly QueuedPrompt[];
 	onQueuedPromptsChanged?: (listener: () => void) => () => void;
-	setQueuedPromptDelivery?: (id: string, delivery: QueuedPromptDelivery) => SetQueuedPromptDeliveryResult;
+	setQueuedPromptDelivery?: (id: string, delivery: QueuedPromptDelivery) => Promise<SetQueuedPromptDeliveryResult>;
 	shutdown: () => void;
 	getContextUsage: () => ContextUsage | undefined;
 	compact: (instructionsOrOptions?: string | CompactOptions) => Promise<void>;

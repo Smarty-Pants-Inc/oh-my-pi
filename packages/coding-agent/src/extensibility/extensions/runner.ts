@@ -513,10 +513,11 @@ export class ExtensionRunner {
 	#hasPendingMessagesFn: () => boolean = () => false;
 	#getQueuedPromptsFn: () => readonly QueuedPrompt[] = () => [];
 	#onQueuedPromptsChangedFn: (listener: () => void) => () => void = () => () => {};
-	#setQueuedPromptDeliveryFn: (id: string, delivery: QueuedPromptDelivery) => SetQueuedPromptDeliveryResult = () => ({
-		status: "unavailable",
-		reason: "session_transition",
-	});
+	#setQueuedPromptDeliveryFn: (id: string, delivery: QueuedPromptDelivery) => Promise<SetQueuedPromptDeliveryResult> =
+		async () => ({
+			status: "unavailable",
+			reason: "session_transition",
+		});
 	#getContextUsageFn: () => ContextUsage | undefined = () => undefined;
 	#compactFn: (instructionsOrOptions?: string | CompactOptions) => Promise<void> = async () => {};
 	#getSystemPromptFn: () => string[] = () => [];
@@ -773,7 +774,8 @@ export class ExtensionRunner {
 		this.#getQueuedPromptsFn = contextActions.getQueuedPrompts ?? (() => []);
 		this.#onQueuedPromptsChangedFn = contextActions.onQueuedPromptsChanged ?? (() => () => {});
 		this.#setQueuedPromptDeliveryFn =
-			contextActions.setQueuedPromptDelivery ?? (() => ({ status: "unavailable", reason: "session_transition" }));
+			contextActions.setQueuedPromptDelivery ??
+			(async () => ({ status: "unavailable", reason: "session_transition" }));
 		this.#shutdownHandler = contextActions.shutdown;
 		this.#getSystemPromptFn = contextActions.getSystemPrompt;
 
