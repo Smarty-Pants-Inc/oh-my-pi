@@ -940,6 +940,7 @@ describe("UiHelpers / InputController against derived queued custom display", ()
 		fixture = await createRealSession();
 		const { session } = fixture;
 		vi.spyOn(session.agent, "continue").mockResolvedValue(undefined);
+		vi.spyOn(session.agent, "continueQueuedMessageBlock").mockResolvedValue(undefined);
 		for (const text of ["first prompt", "second prompt"]) {
 			session.agent.followUp({
 				role: "user",
@@ -985,6 +986,7 @@ describe("UiHelpers / InputController against derived queued custom display", ()
 		fixture = await createRealSession();
 		const { session } = fixture;
 		vi.spyOn(session.agent, "continue").mockResolvedValue(undefined);
+		vi.spyOn(session.agent, "continueQueuedMessageBlock").mockResolvedValue(undefined);
 		session.agent.followUp({
 			role: "user",
 			content: "retime before unfocus",
@@ -1031,6 +1033,7 @@ describe("UiHelpers / InputController against derived queued custom display", ()
 		fixture = await createRealSession();
 		const { session } = fixture;
 		vi.spyOn(session.agent, "continue").mockResolvedValue(undefined);
+		vi.spyOn(session.agent, "continueQueuedMessageBlock").mockResolvedValue(undefined);
 		session.agent.followUp({
 			role: "user",
 			content: "selected prompt",

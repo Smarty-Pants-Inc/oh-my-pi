@@ -638,6 +638,7 @@ export class AgentSession {
 	#semanticDeliveryAcceptances = new Set<Promise<void>>();
 	#queuedMessageDrainScheduled = false;
 	#queuedPromptDeliveryMutationInFlight = false;
+	#queuedPromptDeliveryMutationReservations = 0;
 	#planModeState: PlanModeState | undefined;
 	/** Session-scoped `/vision` override; undefined = follow persisted `inspect_image.mode`. */
 	#inspectImageModeOverride: InspectImageMode | undefined;
@@ -4230,7 +4231,14 @@ export class AgentSession {
 		this.agent.setInterruptMode(directUserActive ? "wait" : this.#desiredInterruptMode);
 	}
 
-	#isolateDirectUserContinuationOwner(): { owner: AgentMessage; restore: () => void } | undefined {
+	#isolateDirectUserContinuationOwner():
+		| {
+				owner: AgentMessage;
+				queue?: "steering" | "followUp";
+				block?: AgentMessage[];
+				restore: () => void;
+		  }
+		| undefined {
 		if (this.#activeDirectUserContinuationOwner) return undefined;
 		const steering = [...this.agent.peekSteeringQueue()];
 		const followUp = [...this.agent.peekFollowUpQueue()];
@@ -4238,12 +4246,19 @@ export class AgentSession {
 		const transcriptTail = this.agent.state.messages.at(-1);
 		const transcriptOwner =
 			pendingAskReanswerOwner && transcriptTail === pendingAskReanswerOwner ? pendingAskReanswerOwner : undefined;
-		const queuedOwner = transcriptOwner ? undefined : [...steering, ...followUp].find(isUserQueuedMessage);
+		const steeringOwnerIndex = transcriptOwner ? -1 : steering.findIndex(isUserQueuedMessage);
+		const followUpOwnerIndex =
+			transcriptOwner || steeringOwnerIndex >= 0 ? -1 : followUp.findIndex(isUserQueuedMessage);
+		const queue = steeringOwnerIndex >= 0 ? "steering" : followUpOwnerIndex >= 0 ? "followUp" : undefined;
+		const ownerIndex = steeringOwnerIndex >= 0 ? steeringOwnerIndex : followUpOwnerIndex;
+		const queuedOwner = queue ? (queue === "steering" ? steering : followUp)[ownerIndex] : undefined;
 		const owner = transcriptOwner ?? queuedOwner;
 		if (!owner) {
 			this.#pendingAskReanswerOwner = undefined;
 			return undefined;
 		}
+		const block = queue ? this.#queuedOwnerBlock(queue === "steering" ? steering : followUp, ownerIndex) : [];
+		const blockMessages = new Set(block);
 		this.#activeDirectUserContinuationOwner = owner;
 		this.#pendingAskReanswerOwner = undefined;
 		this.#syncAgentQueueModes();
@@ -4255,14 +4270,14 @@ export class AgentSession {
 			if (this.#activeDirectUserContinuationOwner !== owner) return;
 			const currentSteering = [...this.agent.peekSteeringQueue()];
 			const currentFollowUp = [...this.agent.peekFollowUpQueue()];
-			const extraSteering = currentSteering.filter(message => message !== owner);
-			const extraFollowUp = currentFollowUp.filter(message => message !== owner);
+			const extraSteering = currentSteering.filter(message => !blockMessages.has(message));
+			const extraFollowUp = currentFollowUp.filter(message => !blockMessages.has(message));
 			if (extraSteering.length === 0 && extraFollowUp.length === 0) return;
 			parkedArrivalSteering.push(...extraSteering);
 			parkedArrivalFollowUp.push(...extraFollowUp);
 			this.agent.replaceQueues(
-				currentSteering.filter(message => message === owner),
-				currentFollowUp.filter(message => message === owner),
+				currentSteering.filter(message => blockMessages.has(message)),
+				currentFollowUp.filter(message => blockMessages.has(message)),
 				true,
 			);
 		});
@@ -4272,19 +4287,19 @@ export class AgentSession {
 			try {
 				detachQueueGuard();
 				if (!queuesIsolated) return;
-				const currentSteering = [...this.agent.peekSteeringQueue()].filter(message => message !== owner);
-				const currentFollowUp = [...this.agent.peekFollowUpQueue()].filter(message => message !== owner);
+				const currentSteering = [...this.agent.peekSteeringQueue()].filter(message => !blockMessages.has(message));
+				const currentFollowUp = [...this.agent.peekFollowUpQueue()].filter(message => !blockMessages.has(message));
 				const ownerPending =
 					queuedOwner !== undefined &&
 					(this.agent.peekSteeringQueue().includes(owner) || this.agent.peekFollowUpQueue().includes(owner));
 				this.agent.replaceQueues(
 					[
-						...(ownerPending ? steering : steering.filter(message => message !== owner)),
+						...(ownerPending ? steering : steering.filter(message => !blockMessages.has(message))),
 						...parkedArrivalSteering,
 						...currentSteering,
 					],
 					[
-						...(ownerPending ? followUp : followUp.filter(message => message !== owner)),
+						...(ownerPending ? followUp : followUp.filter(message => !blockMessages.has(message))),
 						...parkedArrivalFollowUp,
 						...currentFollowUp,
 					],
@@ -4298,13 +4313,13 @@ export class AgentSession {
 			}
 		};
 		try {
-			this.agent.replaceQueues(queuedOwner ? [owner] : [], [], true);
+			this.agent.replaceQueues(queue === "steering" ? block : [], queue === "followUp" ? block : [], true);
 			queuesIsolated = true;
 		} catch (error) {
 			restore();
 			throw error;
 		}
-		return { owner, restore };
+		return { owner, queue, block: queue ? block : undefined, restore };
 	}
 
 	#scheduleAgentContinue(options?: ScheduledAgentContinueOptions): void {
@@ -4315,6 +4330,8 @@ export class AgentSession {
 				let continuationTurnId: string | undefined;
 				let directUserOwner: AgentMessage | undefined;
 				let restoreDirectUserQueues: (() => void) | undefined;
+				let directUserQueue: "steering" | "followUp" | undefined;
+				let directUserBlock: AgentMessage[] | undefined;
 				let inFlight = false;
 				// Defense in depth: if compaction/handoff slipped onto the post-prompt queue
 				// alongside us (e.g. via a scheduler we don't own), refuse to start a fresh
@@ -4365,6 +4382,8 @@ export class AgentSession {
 					}
 					directUserOwner = directUser.owner;
 					restoreDirectUserQueues = directUser.restore;
+					directUserQueue = directUser.queue;
+					directUserBlock = directUser.block;
 				}
 				try {
 					if (options.authority === "direct_user_input") {
@@ -4400,7 +4419,11 @@ export class AgentSession {
 						}
 					}
 					this.#armAutomaticTurnStart(options.authority, continuationTurnId);
-					await this.agent.continue(signal);
+					if (directUserQueue && directUserBlock) {
+						await this.agent.continueQueuedMessageBlock(directUserQueue, directUserBlock, signal);
+					} else {
+						await this.agent.continue(signal);
+					}
 					await this.#drainInFlightEventHandlers();
 				} catch (error) {
 					this.#recordAutomaticTurnFailed(options.authority, error, continuationTurnId);
@@ -7973,6 +7996,16 @@ export class AgentSession {
 		);
 	}
 
+	#reserveQueuedPromptMutation(): () => void {
+		this.#queuedPromptDeliveryMutationReservations++;
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			this.#queuedPromptDeliveryMutationReservations--;
+		};
+	}
+
 	async #beginQueuedPromptMutation(): Promise<() => void> {
 		do {
 			await this.#waitForSemanticDeliveryAcceptances();
@@ -8152,20 +8185,22 @@ export class AgentSession {
 	}
 
 	async #appendSemanticDeliveryAsPlainMessage(message: CustomMessage, pendingId?: string): Promise<void> {
+		const details = stripInternalDetailsFields(message.details);
+		const plainMessage = details === message.details ? message : { ...message, details };
 		try {
-			this.agent.appendMessage(message);
+			this.agent.appendMessage(plainMessage);
 			await this.sessionManager.appendEntriesAtomically(() => {
 				this.sessionManager.appendCustomMessageEntry(
-					message.customType,
-					message.content,
-					message.display,
-					message.details,
-					message.attribution,
+					plainMessage.customType,
+					plainMessage.content,
+					plainMessage.display,
+					plainMessage.details,
+					plainMessage.attribution,
 				);
 				if (pendingId) this.#appendPendingSemanticDeliverySettlement(pendingId, "delivered");
 			});
 		} catch (error) {
-			this.agent.removeMessage(message);
+			this.agent.removeMessage(plainMessage);
 			if (pendingId) {
 				try {
 					await this.#cancelPendingSemanticDelivery(pendingId);
@@ -8192,11 +8227,25 @@ export class AgentSession {
 			this.#pendingSemanticDeliveryIds.has(pendingId),
 		);
 		if (activePendingIds.length === 0) return;
-		await this.sessionManager.appendEntriesAtomically(() => {
-			for (const pendingId of activePendingIds) {
-				this.#appendPendingSemanticDeliverySettlement(pendingId, "cancelled");
+		try {
+			await this.sessionManager.appendEntriesAtomically(() => {
+				for (const pendingId of activePendingIds) {
+					this.#appendPendingSemanticDeliverySettlement(pendingId, "cancelled");
+				}
+			});
+		} catch (error) {
+			if (error instanceof SessionPersistenceIndeterminateError) {
+				try {
+					await this.sessionManager.recoverPersistenceFromCurrentState();
+				} catch (recoveryError) {
+					throw new AggregateError(
+						[error, recoveryError],
+						"Semantic delivery cancellation is indeterminate and authoritative recovery failed",
+					);
+				}
 			}
-		});
+			throw error;
+		}
 		for (const pendingId of activePendingIds) this.#pendingSemanticDeliveryIds.delete(pendingId);
 	}
 
@@ -8205,12 +8254,7 @@ export class AgentSession {
 	}
 
 	async #cancelPendingSemanticDeliveries(): Promise<void> {
-		const pendingIds = [...this.#pendingSemanticDeliveryIds];
-		if (pendingIds.length === 0) return;
-		await this.sessionManager.appendEntriesAtomically(() => {
-			for (const pendingId of pendingIds) this.#appendPendingSemanticDeliverySettlement(pendingId, "cancelled");
-		});
-		for (const pendingId of pendingIds) this.#pendingSemanticDeliveryIds.delete(pendingId);
+		await this.#cancelPendingSemanticDeliveryIds([...this.#pendingSemanticDeliveryIds]);
 	}
 
 	#rehydratePendingSemanticDeliveries(): void {
@@ -8479,7 +8523,7 @@ export class AgentSession {
 						pendingId = this.#pendingSemanticDeliveryId(queuedMessage);
 					}
 					if (!options?.automaticTurnSource) {
-						await this.#appendSemanticDeliveryAsPlainMessage(normalizedAppMessage, pendingId);
+						await this.#appendSemanticDeliveryAsPlainMessage(deliveryMessage, pendingId);
 						return { status: "downgraded", delivery: "plain_append", reason: "unscoped_automatic_turn" };
 					}
 					if (this.#extensionRunner?.isHandlingEvent?.()) {
@@ -8575,7 +8619,7 @@ export class AgentSession {
 							return { status: "accepted", delivery: "queued_steer" };
 						}
 						await this.#appendSemanticDeliveryAsPlainMessage(
-							normalizedAppMessage,
+							queuedMessage,
 							this.#pendingSemanticDeliveryId(queuedMessage),
 						);
 						return { status: "accepted", delivery: "plain_append" };
@@ -8703,7 +8747,7 @@ export class AgentSession {
 
 	#assertSynchronousQueueRemovalAllowed(messages: readonly AgentMessage[]): void {
 		if (messages.length === 0) return;
-		if (this.#queuedPromptDeliveryMutationInFlight) {
+		if (this.#queuedPromptDeliveryMutationReservations > 0 || this.#queuedPromptDeliveryMutationInFlight) {
 			throw new AgentBusyError("Queued messages are already being changed.");
 		}
 		if (messages.some(message => this.#queuedPendingSemanticDeliveryId(message))) {
@@ -8744,9 +8788,11 @@ export class AgentSession {
 		steering: RestoredQueuedMessage[];
 		followUp: RestoredQueuedMessage[];
 	}> {
-		const releaseMutation = await this.#beginQueuedPromptMutation();
-		let claim: ReturnType<Agent["claimQueuedMessageBlock"]>;
+		const releaseReservation = this.#reserveQueuedPromptMutation();
+		const dequeueBarrier = this.agent.claimQueuedMessageMutation();
+		let releaseMutation: (() => void) | undefined;
 		try {
+			releaseMutation = await this.#beginQueuedPromptMutation();
 			const steeringAll = [...this.agent.peekSteeringQueue()];
 			const followUpAll = [...this.agent.peekFollowUpQueue()];
 			const keep: (message: AgentMessage) => boolean = options?.forInterrupt
@@ -8756,14 +8802,6 @@ export class AgentSession {
 			const removedFollowUp = followUpAll.filter(message => !keep(message));
 			const steering = steeringAll.filter(isUserQueuedMessage).map(toRestoredQueuedMessage);
 			const followUp = followUpAll.filter(isUserQueuedMessage).map(toRestoredQueuedMessage);
-			if (removedSteering.length > 0) {
-				claim = this.agent.claimQueuedMessageBlock("steering", steeringAll);
-			} else if (removedFollowUp.length > 0) {
-				claim = this.agent.claimQueuedMessageBlock("followUp", followUpAll);
-			}
-			if ((removedSteering.length > 0 || removedFollowUp.length > 0) && !claim) {
-				throw new AgentBusyError("Queued messages are already being changed.");
-			}
 			const removed = new Set([...removedSteering, ...removedFollowUp]);
 			await this.#cancelPendingSemanticDeliveryIds(
 				[...removed].flatMap(message => {
@@ -8780,8 +8818,9 @@ export class AgentSession {
 			}
 			return { steering, followUp };
 		} finally {
-			claim?.release();
-			releaseMutation();
+			releaseMutation?.();
+			releaseReservation();
+			dequeueBarrier.release();
 		}
 	}
 
@@ -8861,7 +8900,7 @@ export class AgentSession {
 		if (this.#isDisposed || this.#lifecycleTransitionFenceActive) {
 			return { status: "unavailable", reason: "session_transition" };
 		}
-		if (this.#queuedPromptDeliveryMutationInFlight) {
+		if (this.#queuedPromptDeliveryMutationReservations > 0 || this.#queuedPromptDeliveryMutationInFlight) {
 			return { status: "unavailable", reason: "queue_mutation" };
 		}
 
@@ -9058,8 +9097,11 @@ export class AgentSession {
 	}
 
 	async popLastQueuedMessageDurably(): Promise<RestoredQueuedMessage | undefined> {
-		const releaseMutation = await this.#beginQueuedPromptMutation();
+		const releaseReservation = this.#reserveQueuedPromptMutation();
+		const dequeueBarrier = this.agent.claimQueuedMessageMutation();
+		let releaseMutation: (() => void) | undefined;
 		try {
+			releaseMutation = await this.#beginQueuedPromptMutation();
 			const steering = [...this.agent.peekSteeringQueue()];
 			const followUp = [...this.agent.peekFollowUpQueue()];
 			const fromSteer = this.#lastQueuedUserIndex(steering);
@@ -9069,27 +9111,23 @@ export class AgentSession {
 			if (ownerIndex < 0) return undefined;
 			const owner = queue[ownerIndex]!;
 			const block = this.#queuedOwnerBlock(queue, ownerIndex);
-			const claim = this.agent.claimQueuedMessageBlock(fromSteer >= 0 ? "steering" : "followUp", queue);
-			if (!claim) throw new AgentBusyError("Queued messages are already being changed.");
-			try {
-				await this.#cancelPendingSemanticDeliveryIds(
-					block.flatMap(message => {
-						const pendingId = this.#queuedPendingSemanticDeliveryId(message);
-						return pendingId ? [pendingId] : [];
-					}),
-				);
-				const removed = new Set(block);
-				this.agent.replaceQueues(
-					this.agent.peekSteeringQueue().filter(message => !removed.has(message)),
-					this.agent.peekFollowUpQueue().filter(message => !removed.has(message)),
-				);
-				this.#reconcileQueuedMessageDrain();
-				return toRestoredQueuedMessage(owner);
-			} finally {
-				claim.release();
-			}
+			await this.#cancelPendingSemanticDeliveryIds(
+				block.flatMap(message => {
+					const pendingId = this.#queuedPendingSemanticDeliveryId(message);
+					return pendingId ? [pendingId] : [];
+				}),
+			);
+			const removed = new Set(block);
+			this.agent.replaceQueues(
+				this.agent.peekSteeringQueue().filter(message => !removed.has(message)),
+				this.agent.peekFollowUpQueue().filter(message => !removed.has(message)),
+			);
+			this.#reconcileQueuedMessageDrain();
+			return toRestoredQueuedMessage(owner);
 		} finally {
-			releaseMutation();
+			releaseMutation?.();
+			releaseReservation();
+			dequeueBarrier.release();
 		}
 	}
 

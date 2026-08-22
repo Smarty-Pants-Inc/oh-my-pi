@@ -49,6 +49,7 @@ function makeCtx(initialQueue: CompactionQueuedMessage[] = []) {
 			steering: [] as RestoredQueuedMessage[],
 			followUp: [] as RestoredQueuedMessage[],
 		}),
+		abort: mock(async () => {}),
 		prompt: mock(async (text: string, opts?: PromptOpts): Promise<void> => {
 			promptCalls.push({ text, opts });
 		}),
@@ -188,10 +189,11 @@ describe("compaction queue Alt+Up restore", () => {
 			throw new Error("disk unavailable");
 		};
 
-		await expect(new InputController(ctx).restoreQueuedMessagesToEditor()).resolves.toBe(0);
+		await expect(new InputController(ctx).restoreQueuedMessagesToEditor({ abort: true })).resolves.toBe(0);
 		expect(ctx.compactionQueuedMessages).toEqual(queued);
 		expect(ctx.editor.getText()).toBe("");
 		expect(showError).toHaveBeenCalledWith("Failed to restore queued messages: disk unavailable");
+		expect(session.abort).toHaveBeenCalledTimes(1);
 	});
 });
 

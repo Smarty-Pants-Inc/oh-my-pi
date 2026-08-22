@@ -98,6 +98,7 @@ describe("AgentSession queued prompt seam", () => {
 			modelRegistry,
 		});
 		vi.spyOn(agent, "continue").mockResolvedValue(undefined);
+		vi.spyOn(agent, "continueQueuedMessageBlock").mockResolvedValue(undefined);
 		return session;
 	}
 

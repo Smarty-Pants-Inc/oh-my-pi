@@ -30,7 +30,11 @@ import {
 	readPendingSemanticDeliveryId,
 	USER_INTERRUPT_LABEL,
 } from "@oh-my-pi/pi-coding-agent/session/messages";
-import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import {
+	SessionManager,
+	SessionPersistenceIndeterminateError,
+} from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { MemorySessionStorage, type WriteTextAtomicOptions } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 import { COLLAB_PROMPT_MESSAGE_TYPE } from "@oh-my-pi/pi-wire";
@@ -67,6 +71,20 @@ afterAll(() => {
 	sharedAuthStorage.close();
 	removeSyncWithRetries(sharedDir);
 });
+
+class ScriptedAtomicFailureStorage extends MemorySessionStorage {
+	readonly behaviors: Array<{ commit: boolean; error: Error }> = [];
+
+	override async writeTextAtomic(path: string, content: string, options?: WriteTextAtomicOptions): Promise<void> {
+		const behavior = this.behaviors.shift();
+		if (!behavior) {
+			await super.writeTextAtomic(path, content, options);
+			return;
+		}
+		if (behavior.commit) await super.writeTextAtomic(path, content, options);
+		throw behavior.error;
+	}
+}
 
 describe("AgentSession concurrent prompt guard", () => {
 	let session: AgentSession;
@@ -1261,6 +1279,47 @@ describe("AgentSession concurrent prompt guard", () => {
 			},
 		);
 
+		it("preserves after-current collaboration timing when a busy receiver becomes idle", async () => {
+			const manager = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+			session = createPersistentSession(manager);
+			session.agent.state.isStreaming = true;
+			const gate = holdFirstEnsureOnDisk(manager);
+
+			const sending = session.sendCustomMessage(
+				{
+					customType: COLLAB_PROMPT_MESSAGE_TYPE,
+					content: "after current became idle",
+					display: true,
+					details: { from: "guest" },
+					attribution: "user",
+				},
+				{ deliveryMode: "afterCurrent" },
+			);
+			await gate.entered;
+			session.agent.state.isStreaming = false;
+			gate.release();
+
+			await expect(sending).resolves.toEqual({
+				status: "downgraded",
+				delivery: "plain_append",
+				reason: "unscoped_automatic_turn",
+			});
+			const delivered = session.agent.state.messages.at(-1);
+			expect(delivered).toMatchObject({
+				customType: COLLAB_PROMPT_MESSAGE_TYPE,
+				details: { from: "guest", __ompSteering: false },
+			});
+			if (delivered?.role !== "custom") throw new Error("Expected a delivered collaboration message");
+			expect(readPendingSemanticDeliveryId(delivered.details)).toBeUndefined();
+			expect(manager.getBranch()).toContainEqual(
+				expect.objectContaining({
+					type: "custom_message",
+					customType: COLLAB_PROMPT_MESSAGE_TYPE,
+					details: { from: "guest", __ompSteering: false },
+				}),
+			);
+		});
+
 		it("rolls back a failed fresh idle steer before crash-safe retry", async () => {
 			const sessionDir = path.join(tempDir, "sessions");
 			const manager = SessionManager.create(tempDir, sessionDir);
@@ -1924,6 +1983,96 @@ describe("AgentSession concurrent prompt guard", () => {
 			expect(resumed.agent.peekFollowUpQueue()).toHaveLength(0);
 		});
 
+		it.each(["clear", "pop"] as const)(
+			"blocks dequeue before durable %s waits for another semantic acceptance",
+			async removal => {
+				const manager = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+				const calls: Message[][] = [];
+				session = createPersistentSession(manager, calls);
+				session.agent.state.isStreaming = true;
+				await session.sendCustomMessage(
+					{ customType: "barrier-owner", content: "remove after acceptance", display: true, attribution: "user" },
+					{ deliveryMode: "steer" },
+				);
+				session.agent.state.isStreaming = false;
+				const gate = holdFirstEnsureOnDisk(manager);
+				const accepting = session.sendCustomMessage(
+					{ customType: "acceptance-gate", content: "hold queue mutation", display: false, attribution: "agent" },
+					{ deliveryMode: "steer" },
+				);
+				await gate.entered;
+				const removing = removal === "clear" ? session.clearQueueDurably() : session.popLastQueuedMessageDurably();
+				const continuing = session.agent.continue().catch(() => undefined);
+				try {
+					await Bun.sleep(10);
+					expect(calls).toHaveLength(0);
+					expect(session.getQueuedPrompts().map(prompt => prompt.text)).toEqual(["remove after acceptance"]);
+				} finally {
+					gate.release();
+				}
+
+				await accepting;
+				const removed = await removing;
+				await continuing;
+				if (removal === "clear") {
+					expect(removed).toEqual({
+						steering: [{ text: "remove after acceptance", images: undefined }],
+						followUp: [],
+					});
+				} else {
+					expect(removed).toEqual({ text: "remove after acceptance", images: undefined });
+				}
+				expect(session.agent.hasQueuedMessages()).toBe(false);
+			},
+		);
+
+		it("reserves durable queue mutation before waiting for semantic acceptance", async () => {
+			const manager = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+			session = createPersistentSession(manager);
+			session.agent.state.isStreaming = true;
+			const gate = holdFirstEnsureOnDisk(manager);
+			const accepting = session.sendCustomMessage(
+				{
+					customType: "acceptance-reservation",
+					content: "hold durable queue mutation",
+					display: false,
+					attribution: "agent",
+				},
+				{ deliveryMode: "steer" },
+			);
+			await gate.entered;
+
+			const clearing = session.clearQueueDurably();
+			try {
+				const owner = {
+					role: "user" as const,
+					content: "keep until durable clear",
+					attribution: "user" as const,
+					timestamp: Date.now(),
+				};
+				session.agent.steer(owner);
+				const queuedId = session.getQueuedPrompts()[0]?.id;
+				if (!queuedId) throw new Error("Expected a queued direct-user message");
+
+				expect(() => session.clearQueue()).toThrow(AgentBusyError);
+				expect(session.agent.peekSteeringQueue()).toEqual([owner]);
+				await expect(session.setQueuedPromptDelivery(queuedId, "afterCurrent")).resolves.toEqual({
+					status: "unavailable",
+					reason: "queue_mutation",
+				});
+				expect(session.agent.peekSteeringQueue()).toEqual([owner]);
+			} finally {
+				session.agent.state.isStreaming = false;
+				gate.release();
+			}
+			await accepting;
+			await expect(clearing).resolves.toEqual({
+				steering: [{ text: "keep until durable clear", images: undefined }],
+				followUp: [],
+			});
+			expect(session.agent.hasQueuedMessages()).toBe(false);
+		});
+
 		it.each([
 			["clear", false],
 			["pop", false],
@@ -2001,6 +2150,34 @@ describe("AgentSession concurrent prompt guard", () => {
 			session = undefined as unknown as AgentSession;
 			const resumed = await reopen(sessionFile, sessionDir);
 			expect(resumed.getQueuedPrompts().map(prompt => prompt.text)).toEqual(["keep after failure"]);
+		});
+
+		it("recovers authoritative persistence before releasing a failed durable cancellation", async () => {
+			const storage = new ScriptedAtomicFailureStorage();
+			const manager = SessionManager.create(tempDir, path.join(tempDir, "sessions"), storage);
+			session = createPersistentSession(manager);
+			session.agent.state.isStreaming = true;
+			await session.sendCustomMessage(
+				{
+					customType: "indeterminate-cancel",
+					content: "remain queued after recovery",
+					display: true,
+					attribution: "user",
+				},
+				{ deliveryMode: "steer" },
+			);
+			session.agent.state.isStreaming = false;
+			const sessionFile = manager.getSessionFile();
+			if (!sessionFile) throw new Error("Expected durable queued prompt journal");
+			storage.behaviors.push(
+				{ commit: true, error: new Error("cancellation acknowledgement failed") },
+				{ commit: false, error: new Error("authoritative cancellation repair failed") },
+			);
+
+			await expect(session.clearQueueDurably()).rejects.toBeInstanceOf(SessionPersistenceIndeterminateError);
+			expect(session.getQueuedPrompts().map(prompt => prompt.text)).toEqual(["remain queued after recovery"]);
+			await expect(manager.flush()).resolves.toBeUndefined();
+			expect(await storage.readText(sessionFile)).not.toContain('"outcome":"cancelled"');
 		});
 
 		it("rejects synchronous removal before mutating a durable queue", async () => {

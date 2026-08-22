@@ -363,16 +363,21 @@ export interface AgentToolDirectiveSessionTransition {
 	rollback(): void;
 }
 
-/** Narrow transaction that keeps one queued message block visible while preventing dequeue. */
+/** Narrow transaction that keeps queued messages visible while preventing conflicting dequeue. */
 export interface AgentQueuedMessageClaim {
 	isCurrent(): boolean;
 	release(): void;
 }
 
-interface ActiveQueuedMessageClaim {
+type QueuedMessageQueue = "steering" | "followUp";
+
+interface ActiveQueuedMessageClaimSettlement {
 	settled: Promise<void>;
 	resolve: () => void;
 }
+
+type ActiveQueuedMessageClaim = ActiveQueuedMessageClaimSettlement &
+	({ kind: "block"; queue: QueuedMessageQueue; messages: ReadonlySet<AgentMessage> } | { kind: "mutation" });
 
 /** Buffered Cursor exec-channel tool result waiting to be emitted after the assistant message. */
 interface CursorToolResultEntry {
@@ -424,7 +429,7 @@ export class Agent {
 		{ messages: AgentMessage[]; restore: (messages: AgentMessage[]) => void }
 	>();
 	#inFlightQueuedMessageCompanions: InFlightQueuedMessageCompanions[] = [];
-	#queuedMessageClaim: ActiveQueuedMessageClaim | undefined;
+	#queuedMessageClaims = new Set<ActiveQueuedMessageClaim>();
 	#steeringWaiters = new Set<() => void>();
 
 	#steeringMode: "all" | "one-at-a-time";
@@ -881,14 +886,24 @@ export class Agent {
 
 	/**
 	 * Keep an exact queued block visible to synchronous queue operations while
-	 * preventing any dequeue from passing the final ownership boundary.
+	 * preventing a conflicting dequeue from passing the final ownership boundary.
 	 */
 	claimQueuedMessageBlock(
-		queue: "steering" | "followUp",
+		queue: QueuedMessageQueue,
 		messages: readonly AgentMessage[],
 	): AgentQueuedMessageClaim | undefined {
-		if (this.#queuedMessageClaim || messages.length === 0) return undefined;
+		if (messages.length === 0 || [...this.#queuedMessageClaims].some(claim => claim.kind === "mutation")) {
+			return undefined;
+		}
 		const claimedMessages = [...messages];
+		const claimedIdentities = new Set(claimedMessages);
+		if (
+			[...this.#queuedMessageClaims].some(
+				claim => claim.kind === "block" && claimedMessages.some(message => claim.messages.has(message)),
+			)
+		) {
+			return undefined;
+		}
 		const containsBlock = (): boolean => {
 			const current = queue === "steering" ? this.#steeringQueue : this.#followUpQueue;
 			for (let start = 0; start <= current.length - claimedMessages.length; start++) {
@@ -900,36 +915,74 @@ export class Agent {
 
 		const settlement = Promise.withResolvers<void>();
 		const active: ActiveQueuedMessageClaim = {
+			kind: "block",
+			queue,
+			messages: claimedIdentities,
 			settled: settlement.promise,
 			resolve: settlement.resolve,
 		};
-		this.#queuedMessageClaim = active;
+		return this.#activateQueuedMessageClaim(active, containsBlock);
+	}
+
+	/** Block every queued-message dequeue while a session queue mutation serializes. */
+	claimQueuedMessageMutation(): AgentQueuedMessageClaim {
+		const settlement = Promise.withResolvers<void>();
+		const active: ActiveQueuedMessageClaim = {
+			kind: "mutation",
+			settled: settlement.promise,
+			resolve: settlement.resolve,
+		};
+		return this.#activateQueuedMessageClaim(active, () => true);
+	}
+
+	#activateQueuedMessageClaim(
+		active: ActiveQueuedMessageClaim,
+		remainsCurrent: () => boolean,
+	): AgentQueuedMessageClaim {
+		this.#queuedMessageClaims.add(active);
 		let released = false;
-		const isCurrent = (): boolean => this.#queuedMessageClaim === active && containsBlock();
 		return {
-			isCurrent,
+			isCurrent: () => !released && this.#queuedMessageClaims.has(active) && remainsCurrent(),
 			release: () => {
 				if (released) return;
 				released = true;
-				if (this.#queuedMessageClaim === active) this.#queuedMessageClaim = undefined;
+				this.#queuedMessageClaims.delete(active);
 				active.resolve();
+				this.#notifySteeringWaiters();
 			},
 		};
 	}
 
-	async #waitForQueuedMessageClaim(signal?: AbortSignal): Promise<void> {
+	#blockingQueuedMessageClaims(messages: readonly AgentMessage[]): ActiveQueuedMessageClaim[] {
+		return [...this.#queuedMessageClaims].filter(
+			claim => claim.kind === "mutation" || messages.some(message => claim.messages.has(message)),
+		);
+	}
+
+	#queuedMessageBatch(queue: QueuedMessageQueue): AgentMessage[] {
+		const current = queue === "steering" ? this.#steeringQueue : this.#followUpQueue;
+		const mode = queue === "steering" ? this.#steeringMode : this.#followUpMode;
+		return mode === "one-at-a-time" ? current.slice(0, 1) : current.slice();
+	}
+
+	#queuedMessagesBlocked(messages: readonly AgentMessage[]): boolean {
+		return this.#blockingQueuedMessageClaims(messages).length > 0;
+	}
+
+	async #waitForQueuedMessageClaims(messages: readonly AgentMessage[], signal?: AbortSignal): Promise<void> {
 		while (!signal?.aborted) {
-			const claim = this.#queuedMessageClaim;
-			if (!claim) return;
+			const claims = this.#blockingQueuedMessageClaims(messages);
+			if (claims.length === 0) return;
+			const settled = Promise.race(claims.map(claim => claim.settled));
 			if (!signal) {
-				await claim.settled;
+				await settled;
 				continue;
 			}
 			const abort = Promise.withResolvers<void>();
 			const onAbort = () => abort.resolve();
 			signal.addEventListener("abort", onAbort, { once: true });
 			try {
-				await Promise.race([claim.settled, abort.promise]);
+				await Promise.race([settled, abort.promise]);
 			} finally {
 				signal.removeEventListener("abort", onAbort);
 			}
@@ -965,9 +1018,13 @@ export class Agent {
 		if (signal?.aborted || this.#steeringQueue.length === 0) return [];
 		await this.#runBeforeQueuedMessageDequeueHooks(signal);
 		while (!signal?.aborted) {
-			await this.#waitForQueuedMessageClaim(signal);
+			const batch = this.#queuedMessageBatch("steering");
+			if (batch.length === 0) return [];
+			await this.#waitForQueuedMessageClaims(batch, signal);
 			if (signal?.aborted) return [];
-			if (!this.#queuedMessageClaim) return this.#dequeueSteeringMessages();
+			const current = this.#queuedMessageBatch("steering");
+			if (current.length === 0) return [];
+			if (!this.#queuedMessagesBlocked(current)) return this.#dequeueSteeringMessages();
 		}
 		return [];
 	}
@@ -976,9 +1033,43 @@ export class Agent {
 		if (signal?.aborted || this.#followUpQueue.length === 0) return [];
 		await this.#runBeforeQueuedMessageDequeueHooks(signal);
 		while (!signal?.aborted) {
-			await this.#waitForQueuedMessageClaim(signal);
+			const batch = this.#queuedMessageBatch("followUp");
+			if (batch.length === 0) return [];
+			await this.#waitForQueuedMessageClaims(batch, signal);
 			if (signal?.aborted) return [];
-			if (!this.#queuedMessageClaim) return this.#dequeueFollowUpMessages();
+			const current = this.#queuedMessageBatch("followUp");
+			if (current.length === 0) return [];
+			if (!this.#queuedMessagesBlocked(current)) return this.#dequeueFollowUpMessages();
+		}
+		return [];
+	}
+
+	async #dequeueQueuedMessageBlockAfterHooks(
+		queue: QueuedMessageQueue,
+		messages: readonly AgentMessage[],
+		signal?: AbortSignal,
+	): Promise<AgentMessage[]> {
+		const block = [...messages];
+		const initial = queue === "steering" ? this.#steeringQueue : this.#followUpQueue;
+		if (signal?.aborted || block.length === 0 || initial.length === 0) return [];
+		await this.#runBeforeQueuedMessageDequeueHooks(signal);
+		while (!signal?.aborted) {
+			let current = queue === "steering" ? this.#steeringQueue : this.#followUpQueue;
+			if (current.length < block.length || !block.every((message, index) => current[index] === message)) {
+				return [];
+			}
+			await this.#waitForQueuedMessageClaims(block, signal);
+			if (signal?.aborted) return [];
+			current = queue === "steering" ? this.#steeringQueue : this.#followUpQueue;
+			if (current.length < block.length || !block.every((message, index) => current[index] === message)) {
+				return [];
+			}
+			if (this.#queuedMessagesBlocked(block)) continue;
+			if (queue === "steering") this.#steeringQueue = current.slice(block.length);
+			else this.#followUpQueue = current.slice(block.length);
+			const taken = this.#takeQueuedMessages(block, this.#queuedMessageRestorer(queue, block));
+			this.#notifyQueueChanges();
+			return taken;
 		}
 		return [];
 	}
@@ -1399,8 +1490,7 @@ export class Agent {
 	}
 
 	#dequeueSteeringMessages(): AgentMessage[] {
-		const steering =
-			this.#steeringMode === "one-at-a-time" ? this.#steeringQueue.slice(0, 1) : this.#steeringQueue.slice();
+		const steering = this.#queuedMessageBatch("steering");
 		if (steering.length === 0) return [];
 		this.#steeringQueue = this.#steeringQueue.slice(steering.length);
 		const messages = this.#takeQueuedMessages(steering, this.#queuedMessageRestorer("steering", steering));
@@ -1409,8 +1499,7 @@ export class Agent {
 	}
 
 	#dequeueFollowUpMessages(): AgentMessage[] {
-		const followUp =
-			this.#followUpMode === "one-at-a-time" ? this.#followUpQueue.slice(0, 1) : this.#followUpQueue.slice();
+		const followUp = this.#queuedMessageBatch("followUp");
 		if (followUp.length === 0) return [];
 		this.#followUpQueue = this.#followUpQueue.slice(followUp.length);
 		const messages = this.#takeQueuedMessages(followUp, this.#queuedMessageRestorer("followUp", followUp));
@@ -1459,7 +1548,10 @@ export class Agent {
 	 * tool watcher never survives the tool batch that owns it.
 	 */
 	#waitForSteeringMessages(signal?: AbortSignal): Promise<void> {
-		if (this.#steeringQueue.length > 0 || signal?.aborted) return Promise.resolve();
+		const batch = this.#queuedMessageBatch("steering");
+		if ((batch.length > 0 && !this.#queuedMessagesBlocked(batch)) || signal?.aborted) {
+			return Promise.resolve();
+		}
 		const { promise, resolve } = Promise.withResolvers<void>();
 		const onAbort = (): void => resolve();
 		this.#steeringWaiters.add(resolve);
@@ -1573,7 +1665,24 @@ export class Agent {
 		return signals.length === 1 ? signals[0] : AbortSignal.any(signals);
 	}
 
-	async continue(signal?: AbortSignal) {
+	async continue(signal?: AbortSignal): Promise<void> {
+		await this.#continueInternal(signal);
+	}
+
+	/** Continue with one exact queued owner block, regardless of the configured queue batch mode. */
+	async continueQueuedMessageBlock(
+		queue: "steering" | "followUp",
+		messages: readonly AgentMessage[],
+		signal?: AbortSignal,
+	): Promise<void> {
+		if (messages.length === 0) throw new Error("Queued continuation block cannot be empty");
+		await this.#continueInternal(signal, { queue, messages: [...messages] });
+	}
+
+	async #continueInternal(
+		signal?: AbortSignal,
+		queuedBlock?: { queue: "steering" | "followUp"; messages: AgentMessage[] },
+	): Promise<void> {
 		if (this.#state.isStreaming) {
 			throw new AgentBusyError();
 		}
@@ -1589,6 +1698,21 @@ export class Agent {
 
 		try {
 			const dequeueSignal = this.#continuationDequeueSignal(signal);
+			if (queuedBlock) {
+				const queued = await this.#dequeueQueuedMessageBlockAfterHooks(
+					queuedBlock.queue,
+					queuedBlock.messages,
+					dequeueSignal,
+				);
+				if (queued.length === 0) throw new Error("Queued continuation block is no longer available");
+				await this.#runLoop(
+					queued,
+					queuedBlock.queue === "steering" ? { skipInitialSteeringPoll: true } : undefined,
+					signal,
+					true,
+				);
+				return;
+			}
 			const messages = this.#state.messages;
 			if (messages.length === 0) {
 				// An empty transcript has nothing to resume, but a queued steer/follow-up
@@ -1853,16 +1977,16 @@ export class Agent {
 				return this.#dequeueSteeringMessagesAfterHooks(signal);
 			},
 			hasSteeringMessages: () => {
-				if (this.#steeringQueue.length === 0) {
+				const messages = this.#queuedMessageBatch("steering");
+				if (messages.length === 0 || this.#queuedMessagesBlocked(messages)) {
 					return { queued: false };
 				}
-				const messageCount = this.#steeringMode === "one-at-a-time" ? 1 : this.#steeringQueue.length;
 				let hasAgentSteering = false;
-				for (let i = 0; i < messageCount; i++) {
-					const message = this.#steeringQueue[i];
+				for (const message of messages) {
 					const role = "role" in message ? message.role : undefined;
 					const attribution = "attribution" in message ? message.attribution : undefined;
-					if (attribution === "user") {
+					const hiddenCustom = role === "custom" && "display" in message && message.display === false;
+					if (attribution === "user" && !hiddenCustom) {
 						return { queued: true, source: "user" };
 					}
 					if (role !== "user") continue;

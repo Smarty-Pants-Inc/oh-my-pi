@@ -190,6 +190,14 @@ describe("AgentSession automatic turn authority", () => {
 			attribution: "user" as const,
 			timestamp: Date.now() + 1,
 		};
+		const physicalCompanion = {
+			role: "custom" as const,
+			customType: "ultrathink-notice",
+			content: "PHYSICAL USER ONE COMPANION",
+			display: false,
+			attribution: "user" as const,
+			timestamp: Date.now(),
+		};
 		const companion = {
 			role: "custom" as const,
 			customType: "authority-user-companion",
@@ -209,6 +217,7 @@ describe("AgentSession automatic turn authority", () => {
 				body: "tail-race authority probe",
 				ts: Date.now(),
 			});
+			session.agent.followUp(physicalCompanion);
 			session.agent.followUp(firstUser);
 			companionAttached = session.agent.attachQueuedMessageCompanions(firstUser, [companion], () => {});
 			session.agent.followUp(secondUser);
@@ -223,6 +232,7 @@ describe("AgentSession automatic turn authority", () => {
 		expect(modelCalls()).toBe(5);
 		expect(modelContextText(1)).toContain("genuine user owner one");
 		expect(modelContextText(1)).toContain("USER ONE COMPANION");
+		expect(modelContextText(1)).toContain("PHYSICAL USER ONE COMPANION");
 		expect(modelContextText(1)).not.toContain("genuine user owner two");
 		expect(modelContextText(1)).not.toContain("tail-race authority probe");
 		expect(modelContextText(3)).toContain("genuine user owner two");
@@ -232,6 +242,9 @@ describe("AgentSession automatic turn authority", () => {
 				.peekSteeringQueue()
 				.some(message => message.role === "user" && message.attribution === "agent" && message.steering === true),
 		).toBe(true);
+		expect(
+			JSON.stringify([...session.agent.peekSteeringQueue(), ...session.agent.peekFollowUpQueue()]),
+		).not.toContain("PHYSICAL USER ONE COMPANION");
 		expect(recorded).toEqual(["legitimate.user.one", "legitimate.user.two"]);
 		expect(session.getAutomaticTurnOutcomes()).toEqual([
 			expect.objectContaining({ source: "direct_user_input", status: "accepted" }),
