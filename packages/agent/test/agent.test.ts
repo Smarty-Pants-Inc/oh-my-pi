@@ -5,6 +5,7 @@ import {
 	AgentBusyError,
 	type AgentEvent,
 	type AgentMessage,
+	type AgentQueuedMessageClaim,
 	type AgentTool,
 	ThinkingLevel,
 } from "@oh-my-pi/pi-agent-core";
@@ -23,6 +24,62 @@ describe("Agent", () => {
 
 		// The message is queued but not yet in state.messages
 		expect(agent.state.messages).not.toContainEqual(message);
+	});
+
+	it("notifies queue subscribers after visible queue mutations", () => {
+		const agent = new Agent();
+		const steering = { role: "user" as const, content: "steer", timestamp: 1 };
+		const followUp = { role: "user" as const, content: "follow up", timestamp: 2 };
+		const snapshots: Array<[number, number]> = [];
+		const unsubscribe = agent.subscribeQueueChanges(() => {
+			snapshots.push([agent.peekSteeringQueue().length, agent.peekFollowUpQueue().length]);
+		});
+
+		agent.steer(steering);
+		agent.followUp(followUp);
+		agent.clearSteeringQueue();
+		agent.clearFollowUpQueue();
+		agent.replaceQueues([steering], [followUp]);
+		agent.replaceQueues([steering], [followUp]);
+		agent.popLastSteer();
+		agent.popLastFollowUp();
+		agent.replaceQueues([steering], [followUp]);
+		agent.reset();
+		agent.replaceQueues([steering], [followUp]);
+		agent.clearAllQueues();
+		agent.clearAllQueues();
+		unsubscribe();
+		agent.steer(steering);
+
+		expect(snapshots).toEqual([
+			[1, 0],
+			[1, 1],
+			[0, 1],
+			[0, 0],
+			[1, 1],
+			[0, 1],
+			[0, 0],
+			[1, 1],
+			[0, 0],
+			[1, 1],
+			[0, 0],
+		]);
+	});
+
+	it("notifies queue subscribers when queued steering is consumed", async () => {
+		const mock = createMockModel({ responses: [{ content: ["done"] }] });
+		const agent = new Agent({ streamFn: mock.stream });
+		agent.replaceMessages([createAssistantMessage([{ type: "text", text: "ready" }])]);
+		agent.steer({ role: "user", content: "consume me", timestamp: Date.now() });
+		const snapshots: Array<[number, number]> = [];
+		const unsubscribe = agent.subscribeQueueChanges(() => {
+			snapshots.push([agent.peekSteeringQueue().length, agent.peekFollowUpQueue().length]);
+		});
+
+		await agent.continue();
+		unsubscribe();
+
+		expect(snapshots).toEqual([[0, 0]]);
 	});
 
 	it("runs input hooks for provider-visible direct appends", () => {
@@ -229,6 +286,79 @@ describe("Agent", () => {
 		expect(skippedContent.text).not.toContain("pending system advisory");
 	});
 
+	it("classifies hidden user-attributed custom steering as a system advisory", async () => {
+		const toolSchema = type({ value: type("string") });
+		const executed: string[] = [];
+		let agent: Agent;
+		const tool: AgentTool<typeof toolSchema, { value: string }> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: toolSchema,
+			concurrency: "exclusive",
+			async execute(_toolCallId, params) {
+				executed.push(params.value);
+				if (params.value === "first") {
+					agent.steer({
+						role: "custom",
+						customType: "ultrathink-notice",
+						content: "hidden companion steering",
+						display: false,
+						attribution: "user",
+						timestamp: Date.now(),
+					});
+					agent.steer({
+						role: "user",
+						content: "visible queued user steering",
+						timestamp: Date.now(),
+					});
+				}
+				return {
+					content: [{ type: "text", text: `ok:${params.value}` }],
+					details: { value: params.value },
+				};
+			},
+		};
+		const mock = createMockModel({
+			responses: [
+				{
+					content: [
+						{ type: "toolCall", id: "tool-1", name: "echo", arguments: { value: "first" } },
+						{ type: "toolCall", id: "tool-2", name: "echo", arguments: { value: "second" } },
+					],
+				},
+				{ content: ["hidden handled"] },
+				{ content: ["visible handled"] },
+			],
+		});
+		agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["Test"], tools: [tool], messages: [] },
+			streamFn: mock.stream,
+			steeringMode: "one-at-a-time",
+			interruptMode: "immediate",
+		});
+		const events: AgentEvent[] = [];
+		const unsubscribe = agent.subscribe(event => events.push(event));
+
+		await agent.prompt("start");
+		unsubscribe();
+
+		expect(executed).toEqual(["first"]);
+		const skipped = events.find(
+			(event): event is Extract<AgentEvent, { type: "tool_execution_end" }> =>
+				event.type === "tool_execution_end" && event.toolCallId === "tool-2",
+		);
+		expect(skipped).toBeDefined();
+		const skippedContent = skipped?.result.content[0];
+		expect(skippedContent?.type).toBe("text");
+		if (skippedContent?.type !== "text") throw new Error("skipped tool result must be text");
+		expect(skippedContent.text).toContain("Skipped due to pending system advisory");
+		expect(skippedContent.text).not.toContain("queued user message");
+		expect(agent.state.messages).toContainEqual(
+			expect.objectContaining({ customType: "ultrathink-notice", content: "hidden companion steering" }),
+		);
+	});
+
 	it("classifies one-at-a-time steering from the next queued mixed source", async () => {
 		const cases = [
 			{
@@ -343,6 +473,215 @@ describe("Agent", () => {
 		agent.followUp({ role: "user", content: "second turn", timestamp: Date.now() });
 		await agent.continue();
 		expect(calls).toBe(1);
+	});
+
+	it("holds dequeue at the final boundary while a visible queued block is claimed", async () => {
+		const mock = createMockModel({ responses: [{ content: ["done"] }] });
+		const agent = new Agent({ streamFn: mock.stream });
+		agent.replaceMessages([createAssistantMessage([{ type: "text", text: "ready" }])]);
+		const queued = { role: "user" as const, content: "claimed turn", timestamp: Date.now() };
+		agent.followUp(queued);
+		const hooksFinished = Promise.withResolvers<void>();
+		const releaseHook = Promise.withResolvers<void>();
+		agent.addBeforeQueuedMessageDequeueHook(async () => {
+			await releaseHook.promise;
+			hooksFinished.resolve();
+		});
+
+		const continuing = agent.continue();
+		releaseHook.resolve();
+		await hooksFinished.promise;
+		const claim = agent.claimQueuedMessageBlock("followUp", [queued]);
+		if (!claim) throw new Error("Expected queued block claim");
+		await Promise.resolve();
+		expect(mock.calls).toHaveLength(0);
+		expect(agent.peekFollowUpQueue()).toEqual([queued]);
+
+		claim.release();
+		await continuing;
+		expect(mock.calls).toHaveLength(1);
+		expect(agent.peekFollowUpQueue()).toHaveLength(0);
+	});
+
+	it("rechecks a claim acquired after an empty final-boundary wait", async () => {
+		const mock = createMockModel({ responses: [{ content: ["done"] }] });
+		const agent = new Agent({ streamFn: mock.stream });
+		agent.replaceMessages([createAssistantMessage([{ type: "text", text: "ready" }])]);
+		const queued = { role: "user" as const, content: "late claim", timestamp: Date.now() };
+		agent.followUp(queued);
+		const claimStarted = Promise.withResolvers<ReturnType<Agent["claimQueuedMessageBlock"]>>();
+		agent.addBeforeQueuedMessageDequeueHook(() => {
+			queueMicrotask(() => {
+				queueMicrotask(() => {
+					queueMicrotask(() => {
+						claimStarted.resolve(agent.claimQueuedMessageBlock("followUp", [queued]));
+					});
+				});
+			});
+		});
+
+		const continuing = agent.continue();
+		const claim = await claimStarted.promise;
+		expect(claim).toBeDefined();
+		if (!claim) {
+			await continuing;
+			throw new Error("Expected late queued block claim");
+		}
+		await Promise.resolve();
+		expect(mock.calls).toHaveLength(0);
+		expect(agent.peekFollowUpQueue()).toEqual([queued]);
+
+		claim.release();
+		await continuing;
+		expect(mock.calls).toHaveLength(1);
+	});
+
+	it("releases a claimed dequeue wait when the run is aborted", async () => {
+		const mock = createMockModel({ responses: [{ content: ["done"] }] });
+		const agent = new Agent({ streamFn: mock.stream });
+		agent.replaceMessages([createAssistantMessage([{ type: "text", text: "ready" }])]);
+		const queued = { role: "user" as const, content: "still queued", timestamp: Date.now() };
+		agent.followUp(queued);
+		const claim = agent.claimQueuedMessageBlock("followUp", [queued]);
+		if (!claim) throw new Error("Expected queued block claim");
+
+		const continuing = agent.continue();
+		await Promise.resolve();
+		agent.abort("cancel claimed dequeue");
+		await expect(continuing).rejects.toThrow("Cannot continue from message role: assistant");
+		expect(agent.peekFollowUpQueue()).toEqual([queued]);
+		expect(mock.calls).toHaveLength(0);
+
+		claim.release();
+		await agent.continue();
+		expect(mock.calls).toHaveLength(1);
+	});
+
+	it("continues with one exact queued block despite one-at-a-time mode", async () => {
+		const mock = createMockModel({ responses: [{ content: ["done"] }, { content: ["later done"] }] });
+		const agent = new Agent({ streamFn: mock.stream });
+		agent.replaceMessages([createAssistantMessage([{ type: "text", text: "ready" }])]);
+		agent.setFollowUpMode("one-at-a-time");
+		const companion = { role: "user" as const, content: "physical companion", timestamp: 1 };
+		const owner = { role: "user" as const, content: "direct owner", timestamp: 2 };
+		const later = { role: "user" as const, content: "later owner", timestamp: 3 };
+		agent.replaceQueues([], [companion, owner, later]);
+
+		await agent.continueQueuedMessageBlock("followUp", [companion, owner]);
+
+		const providerContext = JSON.stringify(mock.calls[0]?.context.messages ?? []);
+		expect(providerContext).toContain("physical companion");
+		expect(providerContext).toContain("direct owner");
+		expect(providerContext).not.toContain("later owner");
+		expect(JSON.stringify(mock.calls[1]?.context.messages ?? [])).toContain("later owner");
+		expect(agent.peekFollowUpQueue()).toEqual([]);
+	});
+
+	it.each(["steering", "followUp"] as const)(
+		"dequeues leading queue companions with their owner from the %s queue",
+		async queue => {
+			const mock = createMockModel({ responses: [{ content: ["owner done"] }, { content: ["later done"] }] });
+			const agent = new Agent({ streamFn: mock.stream });
+			agent.replaceMessages([createAssistantMessage([{ type: "text", text: "ready" }])]);
+			const companion = { role: "user" as const, content: "leading companion", timestamp: 1 };
+			const owner = { role: "user" as const, content: "logical owner", timestamp: 2 };
+			const later = { role: "user" as const, content: "later owner", timestamp: 3 };
+			agent.setQueuedMessageCompanionPredicate(message => message === companion);
+			agent.replaceQueues(
+				queue === "steering" ? [companion, owner, later] : [],
+				queue === "followUp" ? [companion, owner, later] : [],
+			);
+
+			await agent.continue();
+
+			const firstContext = JSON.stringify(mock.calls[0]?.context.messages ?? []);
+			expect(firstContext).toContain("leading companion");
+			expect(firstContext).toContain("logical owner");
+			expect(firstContext).not.toContain("later owner");
+			expect(JSON.stringify(mock.calls[1]?.context.messages ?? [])).toContain("later owner");
+			expect(agent.hasQueuedMessages()).toBe(false);
+		},
+	);
+
+	it("does not interrupt tools for steering held by a queue claim", async () => {
+		const parameters = type({ value: "string" });
+		const executed: string[] = [];
+		const secondStarted = Promise.withResolvers<void>();
+		let claim: AgentQueuedMessageClaim | undefined;
+		let agent: Agent;
+		const tool: AgentTool<typeof parameters, { value: string }> = {
+			name: "step",
+			label: "Step",
+			description: "Run one test step",
+			parameters,
+			async execute(_toolCallId, { value }) {
+				executed.push(value);
+				if (value === "first") {
+					const queued = { role: "user" as const, content: "claimed steer", timestamp: Date.now() };
+					agent.steer(queued);
+					claim = agent.claimQueuedMessageBlock("steering", [queued]);
+					if (!claim) throw new Error("Expected steering claim");
+				} else {
+					secondStarted.resolve();
+				}
+				return { content: [{ type: "text", text: value }], details: { value } };
+			},
+		};
+		const mock = createMockModel({
+			responses: [
+				{
+					content: [
+						{ type: "toolCall", id: "step-1", name: "step", arguments: { value: "first" } },
+						{ type: "toolCall", id: "step-2", name: "step", arguments: { value: "second" } },
+					],
+				},
+				{ content: ["done"] },
+			],
+		});
+		agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["Test"], tools: [tool], messages: [] },
+			streamFn: mock.stream,
+			interruptMode: "immediate",
+		});
+
+		const prompting = agent.prompt("start");
+		const secondRanBeforeRelease = await Promise.race([
+			secondStarted.promise.then(() => true),
+			Bun.sleep(50).then(() => false),
+		]);
+		claim?.release();
+		await prompting;
+
+		expect(secondRanBeforeRelease).toBe(true);
+		expect(executed).toEqual(["first", "second"]);
+	});
+
+	it("restores companion ownership before rollback listeners observe the owner", async () => {
+		const mock = createMockModel({ responses: [{ content: ["unused"] }] });
+		const agent = new Agent({ streamFn: mock.stream });
+		const owner = { role: "user" as const, content: "restore me", timestamp: Date.now() };
+		const originalCompanion = { role: "user" as const, content: "original companion", timestamp: Date.now() };
+		const lateCompanion = { role: "user" as const, content: "late companion", timestamp: Date.now() };
+		const restored: AgentMessage[] = [];
+		agent.steer(owner);
+		expect(
+			agent.attachQueuedMessageCompanions(owner, [originalCompanion], messages => restored.push(...messages)),
+		).toBe(true);
+		let handled = false;
+		agent.subscribeQueueChanges(() => {
+			if (handled || !agent.peekSteeringQueue().includes(owner)) return;
+			handled = true;
+			expect(
+				agent.attachQueuedMessageCompanions(owner, [lateCompanion], messages => restored.push(...messages)),
+			).toBe(true);
+			agent.clearSteeringQueue();
+		});
+		agent.setBeforeModelCall(() => ({ stop: true, reason: "rollback" }));
+
+		await agent.prompt("peer wake", { onProviderCallStarted: () => {} });
+
+		expect(agent.peekSteeringQueue()).toHaveLength(0);
+		expect(restored).toEqual([originalCompanion, lateCompanion]);
 	});
 
 	it("continue() leaves queued messages owned when its signal is already aborted", async () => {

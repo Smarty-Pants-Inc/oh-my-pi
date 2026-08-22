@@ -499,16 +499,18 @@ describe("AgentSession auto-compaction queue resume", () => {
 		});
 		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
 
-		const continueSpy = vi.spyOn(session.agent, "continue").mockImplementation(async () => {
-			expect([...session.agent.peekSteeringQueue(), ...session.agent.peekFollowUpQueue()]).toEqual([
-				expect.objectContaining({
-					role: "user",
-					content: [{ type: "text", text: "please respond after compaction" }],
-					attribution: "user",
-				}),
-			]);
-			session.agent.clearAllQueues();
-		});
+		const continueSpy = vi
+			.spyOn(session.agent, "continueQueuedMessageBlock")
+			.mockImplementation(async (_queue, block) => {
+				expect(block).toEqual([
+					expect.objectContaining({
+						role: "user",
+						content: [{ type: "text", text: "please respond after compaction" }],
+						attribution: "user",
+					}),
+				]);
+				session.agent.clearAllQueues();
+			});
 
 		// Park compaction inside its awaited hook so we can queue a follow-up while
 		// the session is disconnected and abort has already run its finally.

@@ -66,8 +66,8 @@ export type SubmittedUserInput = {
 	display?: boolean;
 	/** Queue intent if the session is (or becomes) busy when this submission is
 	 *  dispatched: "steer" (interrupt the active turn) or "followUp" (process after
-	 *  it). Normal user Enter carries "steer" to match the streaming-branch Enter;
-	 *  background/continuation submits omit it and default to "followUp". */
+	 *  it). Ordinary Enter and background/continuation submits use "followUp";
+	 *  explicit interrupt paths use "steer". */
 	streamingBehavior?: "steer" | "followUp";
 	cancelled: boolean;
 	started: boolean;
@@ -283,6 +283,7 @@ export interface InteractiveModeContext {
 	showNewVersionNotification(newVersion: string): void;
 	clearEditor(): void;
 	updatePendingMessagesDisplay(): void;
+	editQueuedPrompts(): void;
 	queueCompactionMessage(text: string, mode: "steer" | "followUp", images?: ImageContent[]): void;
 	flushCompactionQueue(options?: { willRetry?: boolean }): Promise<void>;
 	flushPendingBashComponents(): void;

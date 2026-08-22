@@ -133,7 +133,7 @@ export async function tryRunRpcSkillCommand(
 			details: built.details,
 			attribution: "user",
 		},
-		{ streamingBehavior },
+		{ streamingBehavior, queueChipText: text },
 	);
 	return { agentInvoked: true };
 }

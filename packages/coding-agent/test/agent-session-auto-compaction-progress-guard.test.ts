@@ -442,16 +442,18 @@ describe("AgentSession auto-compaction progress guard", () => {
 	it("parks agent-attributed IRC when a user turn arrives after compaction selects goal continuation", async () => {
 		activateOngoingGoal("late-user-owner");
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined as never);
-		const continueSpy = vi.spyOn(session.agent, "continue").mockImplementation(async () => {
-			expect([...session.agent.peekSteeringQueue(), ...session.agent.peekFollowUpQueue()]).toEqual([
-				expect.objectContaining({
-					role: "user",
-					content: "late attributed user",
-					attribution: "user",
-				}),
-			]);
-			session.agent.clearAllQueues();
-		});
+		const continueSpy = vi
+			.spyOn(session.agent, "continueQueuedMessageBlock")
+			.mockImplementation(async (_queue, block) => {
+				expect(block).toEqual([
+					expect.objectContaining({
+						role: "user",
+						content: "late attributed user",
+						attribution: "user",
+					}),
+				]);
+				session.agent.clearAllQueues();
+			});
 		vi.spyOn(session, "getContextUsage").mockReturnValue({ tokens: 1000, contextWindow: 200000, percent: 0.5 });
 
 		const realHasQueuedMessages = session.agent.hasQueuedMessages.bind(session.agent);
@@ -881,7 +883,7 @@ describe("AgentSession auto-compaction progress guard", () => {
 		});
 		vi.spyOn(compactionModule, "prepareCompaction").mockReturnValue(undefined);
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined as never);
-		const continueSpy = vi.spyOn(session.agent, "continue").mockImplementation(async () => {
+		const continueSpy = vi.spyOn(session.agent, "continueQueuedMessageBlock").mockImplementation(async () => {
 			expect(sessionManager.getBranch()).toContainEqual(
 				expect.objectContaining({
 					type: "message",

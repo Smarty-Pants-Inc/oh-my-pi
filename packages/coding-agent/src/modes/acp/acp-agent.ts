@@ -2557,6 +2557,9 @@ export class AcpAgent implements Agent {
 					void record.session.abort({ reason: USER_INTERRUPT_LABEL });
 				},
 				hasPendingMessages: () => record.session.hasPendingMessages(),
+				getQueuedPrompts: () => record.session.getQueuedPrompts(),
+				onQueuedPromptsChanged: listener => record.session.onQueuedPromptsChanged(listener),
+				setQueuedPromptDelivery: (id, delivery) => record.session.setQueuedPromptDelivery(id, delivery),
 				shutdown: () => {},
 				getContextUsage: () => record.session.getContextUsage(),
 				getSystemPrompt: () => record.session.systemPrompt,
