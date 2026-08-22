@@ -6445,7 +6445,7 @@
     },
     {
       "path": "packages/coding-agent/src/collab/guest.ts",
-      "sha256": "5529f5dd97a7226c8e64b33fbf51fc2d49494d9ce0a7457d12c5d79565cd992d"
+      "sha256": "195afbbd556aed482b1c2aaf4aeaef680e464f9805fc425abaa0b0ab21859034"
     },
     {
       "path": "packages/coding-agent/src/collab/herdr-bridge-bootstrap.ts",
@@ -6453,11 +6453,11 @@
     },
     {
       "path": "packages/coding-agent/src/collab/host.ts",
-      "sha256": "f3905c7a7d703c7b8a8928d641d6e4ce02de2b5f568de2947d406b953ebf178a"
+      "sha256": "2036008c860d46717b0c8671d41ac1278a3b00db2fc1cc35836864f5bfbb8c63"
     },
     {
       "path": "packages/coding-agent/src/collab/local-transport.ts",
-      "sha256": "4dbc8b202838202ed641c6fd60e85a79baf4a9dfbb8addb5094db6a1f11d766b"
+      "sha256": "5087d4f88686d5e7a67ed7bc433efcae8e091ce8713932459c8e3b6e5e74839e"
     },
     {
       "path": "packages/coding-agent/src/collab/protocol.ts",
@@ -6465,7 +6465,7 @@
     },
     {
       "path": "packages/coding-agent/src/collab/relay-client.ts",
-      "sha256": "34faa51c1524974f236106aa93ad851cfddb290fc348e82c1f9c8d52c170b66d"
+      "sha256": "911e258c0f91eceb74b566f61937da60feb6b5d144150edab01d487df834789b"
     },
     {
       "path": "packages/coding-agent/src/collab/replication-shrink.ts",
@@ -7801,7 +7801,7 @@
     },
     {
       "path": "packages/coding-agent/src/main.ts",
-      "sha256": "3fd187b9f450b9f241557b522d91db5895faf3b97d5e6c0b567c37510c759657"
+      "sha256": "4f945c860266d3510727b825f1a3ab68689c0f9a817f155881652300ae62d25d"
     },
     {
       "path": "packages/coding-agent/src/markit/converters/docx.ts",
@@ -8209,7 +8209,7 @@
     },
     {
       "path": "packages/coding-agent/src/modes/interactive-mode.ts",
-      "sha256": "2386894fe78da5cc3b71470031b7da8323c43525d88be68149a81fbbb1d760a9"
+      "sha256": "70c6f18ba2413b778da823ab153aa8978c15afc99990954c58f4ba58cbb4aa2a"
     },
     {
       "path": "packages/coding-agent/src/modes/loop-limit.ts",
@@ -10737,5 +10737,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "3b0a52c4bddf08f443a875c888774a8077b9505d7eb7f463e28b0b7efee85704"
+  "rootSha256": "3aa976e5c8b77bf428cc6ae8797e82a22dca25e6198f52a05566d39a29e162b7"
 }

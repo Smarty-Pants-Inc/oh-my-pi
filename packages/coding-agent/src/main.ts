@@ -394,7 +394,10 @@ export function buildModelScopeNotification(
 			return `${scopedModel.model.id}${thinkingStr}`;
 		})
 		.join(", ");
-	return { kind: "info", message: `Model scope: ${modelList} (Ctrl+P to cycle)` };
+	return {
+		kind: "info",
+		message: `Model scope: ${modelList} (Ctrl+P to cycle)`,
+	};
 }
 export async function submitInteractiveInput(
 	mode: Pick<
@@ -449,7 +452,10 @@ export async function submitInteractiveInput(
 				userInitiated: input.userInitiated,
 			});
 		} else {
-			await session.prompt(input.text, { images: input.images, streamingBehavior });
+			await session.prompt(input.text, {
+				images: input.images,
+				streamingBehavior,
+			});
 		}
 	} catch (error: unknown) {
 		const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
@@ -588,7 +594,9 @@ async function rethrowAfterInteractiveStartupCleanup(error: unknown, cleanup: ()
 	try {
 		await cleanup();
 	} catch (cleanupError) {
-		logger.error("Interactive startup cleanup failed", { error: String(cleanupError) });
+		logger.error("Interactive startup cleanup failed", {
+			error: String(cleanupError),
+		});
 	}
 	throw error;
 }
@@ -714,9 +722,15 @@ async function runInteractiveMode(
 		void guest.ended
 			.then(() => mode.shutdown())
 			.catch(error => logger.error("collab guest bridge shutdown failed", error));
-		await guest.joinWithTransport(new LocalCollabTransport(bridge.address, { t: "guest", token: bridge.token }), {
-			roomId: bridge.roomId,
-		});
+		await guest.joinWithTransport(
+			new LocalCollabTransport(bridge.address, {
+				t: "guest",
+				token: bridge.token,
+			}),
+			{
+				roomId: bridge.roomId,
+			},
+		);
 	}
 	const managedBridge = bridge?.role === "host" && "managed" in bridge ? bridge : undefined;
 	await runInteractiveStartupSequence(
@@ -737,10 +751,14 @@ async function runInteractiveMode(
 
 	// Cold-launch cleanup: the first paint already clears native history, and this
 	// replay replaces the welcome/startup frame with the resumed/new transcript.
-	// Every in-process session load also uses `clearTerminalHistory`; cold launch
-	// follows the same clean-cutover path instead of preserving a previous run's
-	// transcript above the fresh one.
-	await mode.renderInitialMessages({ preserveExistingChat: true, clearTerminalHistory: true });
+	// A collab guest finalized and rendered its streamed replica during join, so
+	// replaying again with preserveExistingChat would duplicate every late-join entry.
+	if (bridge?.role !== "guest") {
+		await mode.renderInitialMessages({
+			preserveExistingChat: true,
+			clearTerminalHistory: true,
+		});
+	}
 	// A resolved version check must not insert its banner into a partial transcript.
 	checkedVersionPromise.then(newVersion => {
 		if (!settings.get("startup.checkUpdate")) {
@@ -1275,7 +1293,11 @@ export async function buildSessionOptions(
 			: !restoringSession && activeSettings.get("prewalk.enabled");
 	if (prewalkEnabled) {
 		const rolePattern = expandRoleAlias(parsed.prewalkInto ?? DEFAULT_PREWALK_TARGET, activeSettings);
-		const resolved = resolveCliModel({ cliModel: rolePattern, modelRegistry, preferences: modelMatchPreferences });
+		const resolved = resolveCliModel({
+			cliModel: rolePattern,
+			modelRegistry,
+			preferences: modelMatchPreferences,
+		});
 		if (resolved.warning) {
 			process.stderr.write(`${chalk.yellow(`Warning: ${resolved.warning}`)}\n`);
 		}
@@ -1293,7 +1315,10 @@ export async function buildSessionOptions(
 				`${chalk.yellow(`Warning: prewalk disabled — no API key for ${resolved.model.provider}/${resolved.model.id}`)}\n`,
 			);
 		} else {
-			options.prewalk = { target: resolved.model, thinkingLevel: resolved.thinkingLevel };
+			options.prewalk = {
+				target: resolved.model,
+				thinkingLevel: resolved.thinkingLevel,
+			};
 		}
 	}
 
@@ -1302,7 +1327,11 @@ export async function buildSessionOptions(
 	}
 	if (parsed.planYolo) {
 		const rolePattern = expandRoleAlias(parsed.planYoloInto ?? "@smol", activeSettings);
-		const resolved = resolveCliModel({ cliModel: rolePattern, modelRegistry, preferences: modelMatchPreferences });
+		const resolved = resolveCliModel({
+			cliModel: rolePattern,
+			modelRegistry,
+			preferences: modelMatchPreferences,
+		});
 		if (resolved.warning) {
 			process.stderr.write(`${chalk.yellow(`Warning: ${resolved.warning}`)}\n`);
 		}
@@ -1312,7 +1341,10 @@ export async function buildSessionOptions(
 		if (!modelRegistry.hasConfiguredAuth(resolved.model)) {
 			throw new Error(`No API key for ${resolved.model.provider}/${resolved.model.id}`);
 		}
-		options.planYolo = { target: resolved.model, thinkingLevel: resolved.thinkingLevel };
+		options.planYolo = {
+			target: resolved.model,
+			thinkingLevel: resolved.thinkingLevel,
+		};
 	}
 
 	// Thinking level
@@ -1528,7 +1560,9 @@ export async function runRootCommand(
 		try {
 			companionController = createFreshOmpCompanionController(companionSecret);
 		} catch {
-			logger.warn("Fresh OMP companion disabled", { reason: "host_controller_create_failed" });
+			logger.warn("Fresh OMP companion disabled", {
+				reason: "host_controller_create_failed",
+			});
 		} finally {
 			// The controller copied its capability during construction; do not retain
 			// another live decoded secret on this long-running startup frame.
@@ -1550,7 +1584,11 @@ export async function runRootCommand(
 	}
 
 	const settingsInstance =
-		deps.settings ?? (await logger.time("settings:init", Settings.init, { cwd, configFiles: parsedArgs.config }));
+		deps.settings ??
+		(await logger.time("settings:init", Settings.init, {
+			cwd,
+			configFiles: parsedArgs.config,
+		}));
 	if (parsedArgs.approvalMode) {
 		// Runtime override (not persisted): every settings.get("tools.approvalMode") downstream
 		// sees this value. The wrapper still honours --auto-approve / --yolo on top of it.
@@ -1924,7 +1962,9 @@ export async function runRootCommand(
 				};
 			} catch {
 				companionController = undefined;
-				logger.warn("Fresh OMP companion disabled", { reason: "host_extension_load_failed" });
+				logger.warn("Fresh OMP companion disabled", {
+					reason: "host_extension_load_failed",
+				});
 			}
 		}
 		sessionOptions.hostInternalExtension = hostInternalExtension;
@@ -2049,12 +2089,13 @@ export async function runRootCommand(
 			authStorage.setRuntimeApiKey(session.model.provider, parsedArgs.apiKey);
 		}
 
-		if (modelFallbackMessage) {
+		const isCollabGuest = interactiveCollabBridge?.role === "guest";
+		if (modelFallbackMessage && !isCollabGuest) {
 			notifs.push({ kind: "warn", message: modelFallbackMessage });
 		}
 
 		const modelRegistryError = modelRegistry.getError();
-		if (modelRegistryError) {
+		if (modelRegistryError && !isCollabGuest) {
 			notifs.push({ kind: "error", message: modelRegistryError.message });
 		}
 
@@ -2080,7 +2121,9 @@ export async function runRootCommand(
 			stopStartupWatchdog();
 			await runRpcMode(session, mode === "rpc-ui" ? setToolUIContext : undefined, eventBus, rpcInput);
 		} else if (isInteractive) {
-			const versionCheckPromise = checkForNewVersion(VERSION).catch(() => undefined);
+			const versionCheckPromise = isCollabGuest
+				? Promise.resolve(undefined)
+				: checkForNewVersion(VERSION).catch(() => undefined);
 			const startupChangelog = await startupChangelogPromise;
 
 			const modelScopeNotification = buildModelScopeNotification(
