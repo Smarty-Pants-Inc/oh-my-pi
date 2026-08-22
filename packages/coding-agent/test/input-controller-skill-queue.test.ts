@@ -726,7 +726,10 @@ describe("AgentSession derived queued custom display", () => {
 	});
 });
 
-function createStubInteractiveModeContextForUiHelpers(session: AgentSession) {
+function createStubInteractiveModeContextForUiHelpers(
+	session: AgentSession,
+	options: { shortcutDescription?: string } = {},
+) {
 	let editorText = "";
 	const editor: StubEditor = {
 		setText(text) {
@@ -769,6 +772,26 @@ function createStubInteractiveModeContextForUiHelpers(session: AgentSession) {
 	};
 	const showStatus = vi.fn();
 	const showWarning = vi.fn();
+	if (options.shortcutDescription) {
+		Object.defineProperty(session, "extensionRunner", {
+			configurable: true,
+			value: {
+				getShortcuts: () =>
+					new Map([
+						[
+							"shift+up",
+							{
+								shortcut: "shift+up",
+								description: options.shortcutDescription,
+								whenKeybinding: "app.message.dequeue",
+								handler: () => {},
+								extensionPath: "/test/prompt-steering.ts",
+							},
+						],
+					]),
+			},
+		});
+	}
 
 	const ctx = {
 		editor,
@@ -843,6 +866,23 @@ describe("UiHelpers / InputController against derived queued custom display", ()
 		expect(rendered).toContain("Steering · 1");
 		expect(rendered).toContain("1. /skill:test-skill arg1 arg2");
 		expect(rendered).not.toContain("Steer:");
+		expect(rendered).toContain("Shift+Up to restore");
+		expect(rendered).not.toContain("edit timing");
+	});
+
+	it("shows timing help only while the prompt-steering shortcut is active", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		queueCustomSteer(session, "queued prompt");
+
+		const { ctx, pendingMessagesContainer } = createStubInteractiveModeContextForUiHelpers(session, {
+			shortcutDescription: "Edit queued prompt delivery timing",
+		});
+		new UiHelpers(ctx).updatePendingMessagesDisplay();
+
+		const rendered = Bun.stripANSI(pendingMessagesContainer.render(120).join("\n"));
+		expect(rendered).toContain("Shift+Up: Edit queued prompt delivery timing");
+		expect(rendered).not.toContain("Shift+Up to restore");
 	});
 
 	it("requests the pending-container repaint after rebuilding and clearing it", async () => {
@@ -886,9 +926,8 @@ describe("UiHelpers / InputController against derived queued custom display", ()
 		expect(rendered).toContain("2. run tests");
 		expect(rendered).toContain("3. summarize");
 		expect(rendered).not.toContain("Follow-up:");
-		expect(rendered).toContain("Shift+Up to edit timing");
-		expect(rendered).toContain("Up to restore");
-		expect(rendered).not.toContain("Alt+Up/Shift+Up to edit");
+		expect(rendered).toContain("Shift+Up to restore");
+		expect(rendered).not.toContain("edit timing");
 	});
 
 	it("edits one queued prompt's timing in place and commits once", async () => {

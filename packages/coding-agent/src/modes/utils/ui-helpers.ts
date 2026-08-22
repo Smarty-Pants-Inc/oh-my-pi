@@ -6,8 +6,8 @@ import { type Component, matchesKey, Spacer, Text, TruncatedText } from "@oh-my-
 import { logger } from "@oh-my-pi/pi-utils";
 import type { AdvisorMessageDetails } from "../../advisor";
 import { COLLAB_PROMPT_MESSAGE_TYPE, type CollabPromptDetails } from "../../collab/protocol";
-import { settings } from "../../config/settings";
 import { formatKeyHints } from "../../config/keybindings";
+import { settings } from "../../config/settings";
 import { getEditClipboard } from "../../edit/edit-clipboard";
 import { getFileSnapshotStore } from "../../edit/file-snapshot-store";
 import type { QueuedPromptDelivery } from "../../extensibility/extensions";
@@ -1162,10 +1162,20 @@ export class UiHelpers {
 				}
 			}
 			const dequeueKeys = this.ctx.keybindings.getKeys("app.message.dequeue");
-			const editKeys = dequeueKeys.filter(key => key === "shift+up");
-			const restoreKeys = dequeueKeys.filter(key => key !== "shift+up");
+			const shortcuts = this.ctx.session.extensionRunner?.getShortcuts();
+			const restoreKeys: typeof dequeueKeys = [];
 			const hints: string[] = [];
-			if (editKeys.length > 0) hints.push(`${formatKeyHints(editKeys)} to edit timing`);
+			for (const key of dequeueKeys) {
+				const shortcut = shortcuts?.get(key);
+				const activeShortcut =
+					shortcut &&
+					(!shortcut.whenKeybinding || this.ctx.keybindings.getKeys(shortcut.whenKeybinding).includes(key));
+				if (!activeShortcut) {
+					restoreKeys.push(key);
+					continue;
+				}
+				if (shortcut.description) hints.push(`${formatKeyHints(key)}: ${shortcut.description}`);
+			}
 			if (restoreKeys.length > 0) hints.push(`${formatKeyHints(restoreKeys)} to restore`);
 			if (hints.length > 0) {
 				const hintText = theme.fg("dim", `  ${theme.tree.hook} ${hints.join(" · ")}`);

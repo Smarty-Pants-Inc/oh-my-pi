@@ -2,7 +2,11 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import { AgentBusyError, type AgentTelemetryConfig, type Tracer } from "@oh-my-pi/pi-agent-core";
 import { type AssistantMessage, Effort, mapContextInstructions } from "@oh-my-pi/pi-ai";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import type { ExtensionActions, LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import type {
+	ExtensionActions,
+	ExtensionContextActions,
+	LoadExtensionsResult,
+} from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent, PromptOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -128,6 +132,13 @@ describe("runSubprocess terminal results", () => {
 		let extensionSendUserMessage: ExtensionActions["sendUserMessage"] | undefined;
 		let messageInFlight = false;
 		let sendStarted = false;
+		const queuedPrompts = [{ id: "queued-1", text: "later", delivery: "afterCurrent" as const }];
+		const unsubscribe = vi.fn();
+		const onQueuedPromptsChanged = vi.fn((_listener: () => void) => unsubscribe);
+		const setQueuedPromptDelivery = vi.fn((_id: string, _delivery: "interrupt" | "steer" | "afterCurrent") => ({
+			status: "updated" as const,
+		}));
+		let contextActions: ExtensionContextActions | undefined;
 
 		const session = createMockSession(({ emit }) => {
 			if (messageInFlight) {
@@ -147,6 +158,9 @@ describe("runSubprocess terminal results", () => {
 		const mutableSession = session as unknown as {
 			extensionRunner: NonNullable<AgentSession["extensionRunner"]>;
 			sendUserMessage: AgentSession["sendUserMessage"];
+			getQueuedPrompts: () => typeof queuedPrompts;
+			onQueuedPromptsChanged: typeof onQueuedPromptsChanged;
+			setQueuedPromptDelivery: typeof setQueuedPromptDelivery;
 		};
 		mutableSession.sendUserMessage = async () => {
 			sendStarted = true;
@@ -154,9 +168,13 @@ describe("runSubprocess terminal results", () => {
 			await Bun.sleep(20);
 			messageInFlight = false;
 		};
+		mutableSession.getQueuedPrompts = () => queuedPrompts;
+		mutableSession.onQueuedPromptsChanged = onQueuedPromptsChanged;
+		mutableSession.setQueuedPromptDelivery = setQueuedPromptDelivery;
 		mutableSession.extensionRunner = {
-			initialize: (actions: ExtensionActions) => {
+			initialize: (actions: ExtensionActions, actionsContext: ExtensionContextActions) => {
 				extensionSendUserMessage = actions.sendUserMessage;
+				contextActions = actionsContext;
 			},
 			onError: () => {},
 			emit: async (event: { type: string }) => {
@@ -177,6 +195,12 @@ describe("runSubprocess terminal results", () => {
 		expect(sendStarted).toBe(true);
 		expect(result.exitCode).toBe(0);
 		expect(result.error).toBeUndefined();
+		expect(contextActions?.getQueuedPrompts?.()).toEqual(queuedPrompts);
+		const listener = vi.fn();
+		expect(contextActions?.onQueuedPromptsChanged?.(listener)).toBe(unsubscribe);
+		expect(onQueuedPromptsChanged).toHaveBeenCalledWith(listener);
+		expect(contextActions?.setQueuedPromptDelivery?.("queued-1", "steer")).toEqual({ status: "updated" });
+		expect(setQueuedPromptDelivery).toHaveBeenCalledWith("queued-1", "steer");
 	});
 
 	it("skips modelRegistry.refresh when reusing the parent registry", async () => {
