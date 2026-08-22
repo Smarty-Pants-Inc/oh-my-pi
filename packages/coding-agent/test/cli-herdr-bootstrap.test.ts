@@ -104,7 +104,7 @@ describe("Herdr bridge CLI bootstrap", () => {
 		});
 	});
 
-	it("rejects incomplete bridge state before loading a command", async () => {
+	it("ignores and scrubs stale inherited bridge state before loading a command", async () => {
 		const env = { ...process.env };
 		delete env.HERDR_PANE_ID;
 		const result = await $`bun ${probeEntry} auth-broker`
@@ -114,12 +114,12 @@ describe("Herdr bridge CLI bootstrap", () => {
 				HERDR_SOCKET_PATH: undefined,
 				HERDR_OMP_BRIDGE: "127.0.0.1:1234",
 				HERDR_OMP_BRIDGE_TOKEN: "bridge-secret",
-				HERDR_OMP_GUEST_BRIDGE_TOKEN: undefined,
+				HERDR_OMP_GUEST_BRIDGE_TOKEN: "guest-secret",
 			})
 			.quiet()
 			.nothrow();
-		expect(result.exitCode).toBe(1);
-		expect(result.stderr.toString()).toContain("Incomplete Herdr OMP bridge environment");
+		expect(result.exitCode).toBe(0);
+		expect(result.text()).toContain("HERDR_CHILD_TOKENS=<absent>|<absent>;EXIT=0");
 	});
 
 	it("scrubs both bridge tokens before reporting an invalid guest token", async () => {
