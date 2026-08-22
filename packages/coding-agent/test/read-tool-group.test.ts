@@ -324,7 +324,7 @@ describe("ReadToolGroupComponent", () => {
 		component.updateResult(
 			{
 				content: [{ type: "text", text: "line 7" }],
-				details: { meta: { source: { type: "path", value: examplePath } } },
+				details: { isDirectory: false, meta: { source: { type: "path", value: examplePath } } },
 			},
 			false,
 			"read-link",
@@ -369,7 +369,7 @@ describe("ReadToolGroupComponent", () => {
 		component.updateResult(
 			{
 				content: [{ type: "text", text: "line 20\nline 21\nline 22" }],
-				details: { resolvedPath: previewPath },
+				details: { resolvedPath: previewPath, isDirectory: false },
 			},
 			false,
 			"read-preview-link",

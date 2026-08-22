@@ -6809,7 +6809,7 @@
     },
     {
       "path": "packages/coding-agent/src/config/settings.ts",
-      "sha256": "3ca361eec9473b7c1d785b086041766eb0fecf370b3753e766f03bff18d6a856"
+      "sha256": "21090602e20aedb495a2a239f5a3fbde622118fbd999f4f9330d8cd32883b204"
     },
     {
       "path": "packages/coding-agent/src/context/approved-policy.ts",
@@ -7549,7 +7549,7 @@
     },
     {
       "path": "packages/coding-agent/src/internal-urls/filesystem-resource.ts",
-      "sha256": "a20c01f819dac9d33f14ba588a76d814193f7ec0d64aee60089d27e5a5322625"
+      "sha256": "6948fb6225bfb4477ba1d28551687138a78d41cd163583b05dcf3c609a7327ae"
     },
     {
       "path": "packages/coding-agent/src/internal-urls/history-protocol.ts",
@@ -7569,7 +7569,7 @@
     },
     {
       "path": "packages/coding-agent/src/internal-urls/local-protocol.ts",
-      "sha256": "33ac0e37d770a600ced11b244677ea9d7dca9747bcd9ff5d82ec56c3b45dfbba"
+      "sha256": "ce39d919598d565d9e02dd93c4ef4a2200f83b0b08da6561200c6b1f99de4498"
     },
     {
       "path": "packages/coding-agent/src/internal-urls/mcp-protocol.ts",
@@ -7613,7 +7613,7 @@
     },
     {
       "path": "packages/coding-agent/src/internal-urls/vault-protocol.ts",
-      "sha256": "1c7499814a4b73264e6d14cc86e49db12c5d721ff8fde7489c7ca97c721c0f2d"
+      "sha256": "9e872624970eda00bff26e36c8556fc93eb7e9638cad8b096d7e51a6921011af"
     },
     {
       "path": "packages/coding-agent/src/internal-urls/xd-protocol.ts",
@@ -9029,11 +9029,11 @@
     },
     {
       "path": "packages/coding-agent/src/tools/ast-edit.ts",
-      "sha256": "f6448083aa0ec501752bc4328156b7e34b3b1cff40729643963a5b9f91a190f2"
+      "sha256": "20ce878cdae9d176d368b5a9725545eb0ecc59929794faf2ee14356fd4d2ef81"
     },
     {
       "path": "packages/coding-agent/src/tools/ast-grep.ts",
-      "sha256": "f24b959faf68f7d4a44b04aee1219831ae389ba72e5180a84bee87d4cd87776d"
+      "sha256": "5ebd09b97dac33a8d8b3a79ac5e581f27817bfa5b9a44ea8ce8b1d18ce9a700e"
     },
     {
       "path": "packages/coding-agent/src/tools/auto-generated-guard.ts",
@@ -9265,7 +9265,7 @@
     },
     {
       "path": "packages/coding-agent/src/tools/grep.ts",
-      "sha256": "e010c880e141af4f37436132e000d6e6d8964a076831c5edb6c101c1177f711f"
+      "sha256": "e9b73aa5d1d5179d558a1a514289e5f53393421a039739e8c48962c7ddf8861c"
     },
     {
       "path": "packages/coding-agent/src/tools/grouped-file-output.ts",
@@ -9457,7 +9457,7 @@
     },
     {
       "path": "packages/coding-agent/src/tools/read.ts",
-      "sha256": "719c81fcc0f7bbcd6f21049d7a5f0231693d5d25deb970b85ba28250caa37e05"
+      "sha256": "d58a5e7e1c37ceb0d7d2ab22d46feed0fab88c68f5d8508f822d09668fab834b"
     },
     {
       "path": "packages/coding-agent/src/tools/render-utils.ts",
@@ -10733,5 +10733,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "7a4c8437ca16abef43a3149480743d01a02c079080637a592db30b2671286a61"
+  "rootSha256": "026581090637ce39c0816c04522ba7b23c402563ca1408d63265e15e5c654b32"
 }

@@ -44,6 +44,7 @@ describe("readToolRenderer hyperlinks", () => {
 				details: {
 					resolvedPath: handoffPath,
 					displayContent: { text: "second line", startLine: 2 },
+					isDirectory: false,
 					contentType: "text/plain",
 				},
 			},
@@ -77,6 +78,24 @@ describe("readToolRenderer hyperlinks", () => {
 		const rendered = component.render(200).join("\n");
 		expect(Bun.stripANSI(rendered)).toContain(`${examplePath}:10-12`);
 		expect(extractLinkUris(rendered)).toEqual([]);
+	});
+
+	it("does not link completed reads without confirmed file metadata", async () => {
+		settings.override("tui.hyperlinks", "always");
+		const theme = await getThemeByName("dark");
+		expect(theme).toBeDefined();
+
+		const component = readToolRenderer.renderResult(
+			{
+				content: [{ type: "text", text: "content" }],
+				details: { resolvedPath: path.resolve("/tmp/omp-read/unconfirmed.ts") },
+			},
+			{ expanded: false, isPartial: false },
+			theme!,
+			{ path: "unconfirmed.ts" },
+		);
+
+		expect(extractLinkUris(component.render(200).join("\n"))).toEqual([]);
 	});
 
 	it("leaves confirmed directory read titles unlinked", async () => {
