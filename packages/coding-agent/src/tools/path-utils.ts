@@ -1410,6 +1410,7 @@ export interface ToolScopeResolution {
 	scopePath: string;
 	globFilter: string | undefined;
 	isDirectory: boolean;
+	isFile: boolean;
 	multiTargets?: ResolvedSearchTarget[];
 	exactFilePaths?: string[];
 	missingPaths: string[];
@@ -1547,9 +1548,11 @@ export async function resolveToolSearchScope(opts: ToolScopeOptions): Promise<To
 	}
 
 	let isDirectory: boolean;
+	let isFile: boolean;
 	try {
 		const stat = await Bun.file(searchPath).stat();
 		isDirectory = stat.isDirectory();
+		isFile = stat.isFile();
 	} catch {
 		const hint = opts.multipathStatHint && rawPaths.length > 1 ? opts.multipathStatHint : "";
 		throw new ToolError(`Path not found: ${scopePath}${hint}`);
@@ -1560,6 +1563,7 @@ export async function resolveToolSearchScope(opts: ToolScopeOptions): Promise<To
 		scopePath,
 		globFilter,
 		isDirectory,
+		isFile,
 		multiTargets,
 		exactFilePaths,
 		missingPaths,

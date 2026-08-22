@@ -6809,7 +6809,7 @@
     },
     {
       "path": "packages/coding-agent/src/config/settings.ts",
-      "sha256": "21090602e20aedb495a2a239f5a3fbde622118fbd999f4f9330d8cd32883b204"
+      "sha256": "665618afee0dba5028518137642d1fd40b942967017b670c7ea8fe0781dada77"
     },
     {
       "path": "packages/coding-agent/src/context/approved-policy.ts",
@@ -9265,7 +9265,7 @@
     },
     {
       "path": "packages/coding-agent/src/tools/grep.ts",
-      "sha256": "e9b73aa5d1d5179d558a1a514289e5f53393421a039739e8c48962c7ddf8861c"
+      "sha256": "903c4bd46ec02bb6c76c0bde8fada33b2f0a361151d95df095470030ced07e90"
     },
     {
       "path": "packages/coding-agent/src/tools/grouped-file-output.ts",
@@ -9361,7 +9361,7 @@
     },
     {
       "path": "packages/coding-agent/src/tools/path-utils.ts",
-      "sha256": "38d0324408ed48a628b2a01541939bafb9b1cca716c2afc46d4679374c5bd551"
+      "sha256": "2fba59de0353ddf4586839975184a14f3894badd629ca906279ddaff67ef4454"
     },
     {
       "path": "packages/coding-agent/src/tools/plan-mode-guard.ts",
@@ -10733,5 +10733,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "a8d8bb191081344ddfedcbe0cf95bf93e73ff02110c7734bd154b70e6ada7e28"
+  "rootSha256": "07e7f21155cbca99612d4bd8716e9ab13c44d624459f9417b899214ccea168dc"
 }

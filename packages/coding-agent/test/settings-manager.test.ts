@@ -20,6 +20,7 @@ import * as discovery from "@oh-my-pi/pi-coding-agent/discovery";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { AUTO_IMAGE_PROVIDER_ORDER } from "@oh-my-pi/pi-coding-agent/tools/image-providers";
 import { SEARCH_PROVIDER_ORDER } from "@oh-my-pi/pi-coding-agent/web/search/types";
+import { shouldEnableHyperlinks, TERMINAL } from "@oh-my-pi/pi-tui";
 import { getProjectAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import * as fileLock from "@oh-my-pi/pi-utils/file-lock";
 import { YAML } from "bun";
@@ -86,6 +87,29 @@ describe("Settings", () => {
 		await tempDir?.remove();
 	});
 
+	it("recomputes terminal hyperlinks from the default mode when reset discards a global override", async () => {
+		const originalNoHyperlinks = Bun.env.PI_NO_HYPERLINKS;
+		delete Bun.env.PI_NO_HYPERLINKS;
+
+		try {
+			await Settings.init({
+				cwd: projectDir,
+				agentDir,
+				inMemory: true,
+				overrides: { "tui.hyperlinks": "always" },
+			});
+			expect(TERMINAL.hyperlinks).toBe(true);
+
+			resetSettingsForTest();
+			expect(TERMINAL.hyperlinks).toBe(
+				shouldEnableHyperlinks("auto", Bun.env, TERMINAL.id, process.stdout.isTTY === true),
+			);
+		} finally {
+			if (originalNoHyperlinks === undefined) delete Bun.env.PI_NO_HYPERLINKS;
+			else Bun.env.PI_NO_HYPERLINKS = originalNoHyperlinks;
+			resetSettingsForTest();
+		}
+	});
 	describe("main config file selection", () => {
 		it("loads and updates an existing config.yaml without creating config.yml", async () => {
 			const yamlConfigPath = path.join(agentDir, "config.yaml");

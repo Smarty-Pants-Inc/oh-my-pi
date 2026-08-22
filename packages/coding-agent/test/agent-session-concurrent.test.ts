@@ -2504,7 +2504,7 @@ describe("AgentSession concurrent prompt guard", () => {
 					.some(entry => entry.type === "custom" && entry.customType === settledType),
 			).toBe(false);
 		});
-		it("does not duplicate a pending delivery after busy-to-idle settlement persistence fails", async () => {
+		it("cancels a pending delivery when busy-to-idle settlement persistence fails", async () => {
 			const sessionDir = path.join(tempDir, "sessions");
 			const manager = SessionManager.create(tempDir, sessionDir);
 			session = createPersistentSession(manager);
@@ -2527,23 +2527,29 @@ describe("AgentSession concurrent prompt guard", () => {
 			gate.release();
 
 			await expect(sending).rejects.toBe(failure);
-			expect(settlement).toHaveBeenCalledTimes(1);
+			expect(settlement).toHaveBeenCalledTimes(2);
 			expect(session.agent.state.messages).toHaveLength(0);
 			expect(
 				manager
 					.getBranch()
 					.some(entry => entry.type === "custom_message" && entry.customType === "failed-idle-settlement"),
 			).toBe(false);
+			const failedBranch = manager.getBranch();
+			const pending = failedBranch.find(entry => entry.type === "custom" && entry.customType === pendingType);
+			if (!pending) throw new Error("Expected a durable pending semantic delivery");
+			expect(failedBranch).toContainEqual(
+				expect.objectContaining({
+					type: "custom",
+					customType: settledType,
+					data: { pendingId: pending.id, outcome: "cancelled" },
+				}),
+			);
 
 			const sessionFile = manager.getSessionFile();
 			if (!sessionFile) throw new Error("Expected a materialized session");
 			session = undefined as unknown as AgentSession;
 			const resumed = await reopen(sessionFile, sessionDir);
-			expect(resumed.agent.peekSteeringQueue()).toHaveLength(1);
-			expect(resumed.agent.peekSteeringQueue()[0]).toMatchObject({
-				customType: "failed-idle-settlement",
-				content: "recover exactly once after idle settlement",
-			});
+			expect(resumed.agent.peekSteeringQueue()).toHaveLength(0);
 		});
 	});
 

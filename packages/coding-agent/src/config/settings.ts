@@ -2664,6 +2664,8 @@ export function resetSettingsForTest(): void {
 	clearBoundSettingsMethods();
 	configureProviderMaxInFlightRequests(undefined);
 	configureCredentialRedaction(false);
+	// `tui.hyperlinks` is process-global; without settings, restore its default effective mode.
+	applyHyperlinkSetting(getDefault("tui.hyperlinks"));
 }
 
 /**

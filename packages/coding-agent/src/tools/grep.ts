@@ -1028,6 +1028,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 				let scopePath: string;
 				let globFilter: string | undefined;
 				let isDirectory: boolean;
+				let isFile: boolean;
 				let multiTargets: ResolvedSearchTarget[] | undefined;
 				let exactFilePaths: string[] | undefined;
 				let missingPaths: string[];
@@ -1049,6 +1050,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 					});
 					searchPath = scope.searchPath;
 					isDirectory = scope.isDirectory;
+					isFile = scope.isFile;
 					multiTargets = scope.multiTargets;
 					exactFilePaths = scope.exactFilePaths;
 					missingPaths = scope.missingPaths;
@@ -1101,6 +1103,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 					scopePath = internalResolution.virtualScopePath ?? ".";
 					globFilter = undefined;
 					isDirectory = false;
+					isFile = false;
 					multiTargets = undefined;
 					exactFilePaths = undefined;
 					missingPaths = [];
@@ -1429,7 +1432,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 					[missingPathsNote, archiveNote, oversizedNote, oversizedScanNote]
 						.filter((s): s is string => Boolean(s))
 						.join("\n") || undefined;
-				const searchPathIsFile = searchablePaths.length > 0 && !isDirectory && !globFilter && !multiTargets;
+				const searchPathIsFile = searchablePaths.length > 0 && isFile && !globFilter && !multiTargets;
 				if (selectedMatches.length === 0) {
 					const details: GrepToolDetails = {
 						scopePath,
