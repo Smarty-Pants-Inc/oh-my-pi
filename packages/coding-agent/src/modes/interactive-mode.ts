@@ -5151,7 +5151,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	handleDequeue(): void {
-		this.#inputController.handleDequeue();
+		void this.#inputController.handleDequeue();
 	}
 
 	handleImagePaste(): Promise<boolean> {

@@ -1119,7 +1119,11 @@ describe("AgentSession concurrent prompt guard", () => {
 		const pendingType = "omp:pending-semantic-delivery";
 		const settledType = "omp:settled-semantic-delivery";
 
-		function createPersistentSession(sessionManager: SessionManager, calls: Message[][] = []): AgentSession {
+		function createPersistentSession(
+			sessionManager: SessionManager,
+			calls: Message[][] = [],
+			settingsOverrides?: Partial<Record<SettingPath, unknown>>,
+		): AgentSession {
 			const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 			const agent = new Agent({
 				getApiKey: () => "test-key",
@@ -1138,7 +1142,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			return new AgentSession({
 				agent,
 				sessionManager,
-				settings: Settings.isolated(),
+				settings: Settings.isolated(settingsOverrides),
 				modelRegistry: sharedModelRegistry,
 			});
 		}
@@ -1403,6 +1407,7 @@ describe("AgentSession concurrent prompt guard", () => {
 
 			const retiming = session.setQueuedPromptDelivery(queuedId, "afterCurrent");
 			await writeStarted.promise;
+			expect(session.getQueuedPrompts().map(prompt => prompt.text)).toEqual(["wait for commit"]);
 			releaseDequeue.resolve();
 			await Promise.resolve();
 			expect(calls).toHaveLength(0);
@@ -1412,6 +1417,441 @@ describe("AgentSession concurrent prompt guard", () => {
 			await continuing;
 			expect(calls).toHaveLength(1);
 			expect(JSON.stringify(calls[0])).toContain("wait for commit");
+		});
+
+		it("rebases a durable retime when the owner is preserved across queue relocation", async () => {
+			const sessionDir = path.join(tempDir, "sessions");
+			const manager = SessionManager.create(tempDir, sessionDir);
+			session = createPersistentSession(manager);
+			session.agent.state.isStreaming = true;
+			await session.sendCustomMessage(
+				{ customType: "relocated-retime", content: "preserve relocated owner", display: true, attribution: "user" },
+				{ deliveryMode: "afterCurrent" },
+			);
+			const owner = session.agent.peekFollowUpQueue()[0];
+			const queuedId = session.getQueuedPrompts()[0]?.id;
+			if (!owner || !queuedId) throw new Error("Expected durable queued prompt");
+			const sessionFile = manager.getSessionFile();
+			if (!sessionFile) throw new Error("Expected durable queued prompt journal");
+
+			const writeStarted = Promise.withResolvers<void>();
+			const releaseWrite = Promise.withResolvers<void>();
+			const appendEntriesAtomically = manager.appendEntriesAtomically.bind(manager);
+			vi.spyOn(manager, "appendEntriesAtomically").mockImplementationOnce(async append => {
+				writeStarted.resolve();
+				await releaseWrite.promise;
+				return appendEntriesAtomically(append);
+			});
+
+			const retiming = session.setQueuedPromptDelivery(queuedId, "steer");
+			await writeStarted.promise;
+			session.agent.replaceQueues([owner], [], true);
+			releaseWrite.resolve();
+			await expect(retiming).resolves.toEqual({ status: "updated" });
+			expect(session.agent.peekSteeringQueue()).toEqual([owner]);
+			expect(session.agent.peekFollowUpQueue()).toHaveLength(0);
+
+			session = undefined as unknown as AgentSession;
+			const resumed = await reopen(sessionFile, sessionDir);
+			expect(resumed.agent.peekSteeringQueue()).toHaveLength(1);
+			expect(resumed.agent.peekFollowUpQueue()).toHaveLength(0);
+		});
+
+		it.each(["retime", "continuation"] as const)(
+			"finishes durable retiming before a direct continuation isolates and skips the owner when %s starts first",
+			async first => {
+				const sessionDir = path.join(tempDir, "sessions");
+				const manager = SessionManager.create(tempDir, sessionDir);
+				const calls: Message[][] = [];
+				session = createPersistentSession(manager, calls, {
+					"compaction.enabled": false,
+					"retry.modelFallback": false,
+					"retry.usageAwareFallback": true,
+					"retry.usageReservePolicy": "fail-closed",
+				});
+				const usageHealth = vi.spyOn(sharedAuthStorage, "getModelUsageHealth").mockResolvedValue({
+					state: "reserve",
+					accounts: [
+						{
+							credentialId: 1,
+							credentialType: "oauth",
+							state: "reserve",
+							remainingFraction: 0.05,
+						},
+					],
+				});
+				session.agent.state.isStreaming = true;
+				await session.sendCustomMessage(
+					{
+						customType: "preflight-retime",
+						content: "survive skipped continuation",
+						display: true,
+						attribution: "user",
+					},
+					{ deliveryMode: "afterCurrent" },
+				);
+				session.agent.state.isStreaming = false;
+				const queuedId = session.getQueuedPrompts()[0]?.id;
+				if (!queuedId) throw new Error("Expected durable queued prompt");
+				const sessionFile = manager.getSessionFile();
+				if (!sessionFile) throw new Error("Expected durable queued prompt journal");
+
+				const writeStarted = Promise.withResolvers<void>();
+				const releaseWrite = Promise.withResolvers<void>();
+				const appendEntriesAtomically = manager.appendEntriesAtomically.bind(manager);
+				vi.spyOn(manager, "appendEntriesAtomically").mockImplementationOnce(async append => {
+					writeStarted.resolve();
+					await releaseWrite.promise;
+					return appendEntriesAtomically(append);
+				});
+
+				let retiming: ReturnType<AgentSession["setQueuedPromptDelivery"]>;
+				if (first === "continuation") {
+					session.resumeAfterAskReanswer();
+					retiming = session.setQueuedPromptDelivery(queuedId, "steer");
+				} else {
+					retiming = session.setQueuedPromptDelivery(queuedId, "steer");
+					await writeStarted.promise;
+					session.resumeAfterAskReanswer();
+				}
+				await writeStarted.promise;
+				expect(usageHealth).not.toHaveBeenCalled();
+				expect(session.agent.peekFollowUpQueue()).toHaveLength(1);
+				releaseWrite.resolve();
+				await expect(retiming).resolves.toEqual({ status: "updated" });
+				await session.waitForIdle();
+
+				expect(usageHealth).toHaveBeenCalled();
+				expect(calls).toHaveLength(0);
+				expect(session.agent.peekSteeringQueue()).toHaveLength(1);
+				expect(session.agent.peekFollowUpQueue()).toHaveLength(0);
+
+				session = undefined as unknown as AgentSession;
+				const resumed = await reopen(sessionFile, sessionDir);
+				expect(resumed.agent.peekSteeringQueue()).toHaveLength(1);
+				expect(resumed.agent.peekFollowUpQueue()).toHaveLength(0);
+			},
+		);
+
+		it("rejects retiming a parked owner while a direct continuation owns the queues", async () => {
+			const sessionDir = path.join(tempDir, "sessions");
+			const manager = SessionManager.create(tempDir, sessionDir);
+			const calls: Message[][] = [];
+			session = createPersistentSession(manager, calls, {
+				"compaction.enabled": false,
+				"retry.modelFallback": false,
+				"retry.usageAwareFallback": true,
+				"retry.usageReservePolicy": "fail-closed",
+			});
+			const preflightEntered = Promise.withResolvers<void>();
+			const releasePreflight = Promise.withResolvers<void>();
+			vi.spyOn(sharedAuthStorage, "getModelUsageHealth").mockImplementation(async () => {
+				preflightEntered.resolve();
+				await releasePreflight.promise;
+				return {
+					state: "reserve",
+					accounts: [
+						{
+							credentialId: 1,
+							credentialType: "oauth",
+							state: "reserve",
+							remainingFraction: 0.05,
+						},
+					],
+				};
+			});
+			session.agent.state.isStreaming = true;
+			for (const content of ["direct owner", "parked owner"]) {
+				await session.sendCustomMessage(
+					{ customType: "parked-retime", content, display: true, attribution: "user" },
+					{ deliveryMode: "afterCurrent" },
+				);
+			}
+			session.agent.state.isStreaming = false;
+			const queued = session.getQueuedPrompts();
+			const parkedId = queued[1]?.id;
+			if (!parkedId) throw new Error("Expected a second durable queued prompt");
+			const sessionFile = manager.getSessionFile();
+			if (!sessionFile) throw new Error("Expected durable queued prompt journal");
+
+			session.resumeAfterAskReanswer();
+			await preflightEntered.promise;
+			await expect(session.setQueuedPromptDelivery(parkedId, "steer")).resolves.toEqual({
+				status: "unavailable",
+				reason: "queue_mutation",
+			});
+			releasePreflight.resolve();
+			await session.waitForIdle();
+
+			expect(calls).toHaveLength(0);
+			expect([...session.agent.peekSteeringQueue(), ...session.agent.peekFollowUpQueue()]).toHaveLength(2);
+
+			session = undefined as unknown as AgentSession;
+			const resumed = await reopen(sessionFile, sessionDir);
+			expect([...resumed.agent.peekSteeringQueue(), ...resumed.agent.peekFollowUpQueue()]).toHaveLength(2);
+		});
+
+		it("verifies a durable after-current retime before idle drain promotion", async () => {
+			const sessionDir = path.join(tempDir, "sessions");
+			const manager = SessionManager.create(tempDir, sessionDir);
+			const calls: Message[][] = [];
+			session = createPersistentSession(manager, calls, {
+				"compaction.enabled": false,
+				"retry.modelFallback": false,
+				"retry.usageAwareFallback": true,
+				"retry.usageReservePolicy": "fail-closed",
+			});
+			vi.spyOn(sharedAuthStorage, "getModelUsageHealth").mockResolvedValue({
+				state: "reserve",
+				accounts: [
+					{
+						credentialId: 1,
+						credentialType: "oauth",
+						state: "reserve",
+						remainingFraction: 0.05,
+					},
+				],
+			});
+			session.agent.state.isStreaming = true;
+			await session.sendCustomMessage(
+				{ customType: "idle-retime", content: "survive idle promotion", display: true, attribution: "user" },
+				{ deliveryMode: "steer" },
+			);
+			session.agent.state.isStreaming = false;
+			const queuedId = session.getQueuedPrompts()[0]?.id;
+			if (!queuedId) throw new Error("Expected durable queued prompt");
+			const sessionFile = manager.getSessionFile();
+			if (!sessionFile) throw new Error("Expected durable queued prompt journal");
+
+			await expect(session.setQueuedPromptDelivery(queuedId, "afterCurrent")).resolves.toEqual({
+				status: "updated",
+			});
+			await session.waitForIdle();
+			expect(calls).toHaveLength(0);
+			expect([...session.agent.peekSteeringQueue(), ...session.agent.peekFollowUpQueue()]).toHaveLength(1);
+
+			session = undefined as unknown as AgentSession;
+			const resumed = await reopen(sessionFile, sessionDir);
+			expect([...resumed.agent.peekSteeringQueue(), ...resumed.agent.peekFollowUpQueue()]).toHaveLength(1);
+		});
+
+		it("skips a direct continuation when a lifecycle fence starts during durable retiming", async () => {
+			const sessionDir = path.join(tempDir, "sessions");
+			const manager = SessionManager.create(tempDir, sessionDir);
+			const calls: Message[][] = [];
+			session = createPersistentSession(manager, calls);
+			session.agent.state.isStreaming = true;
+			await session.sendCustomMessage(
+				{ customType: "lifecycle-retime", content: "wait behind lifecycle", display: true, attribution: "user" },
+				{ deliveryMode: "afterCurrent" },
+			);
+			session.agent.state.isStreaming = false;
+			const queuedId = session.getQueuedPrompts()[0]?.id;
+			if (!queuedId) throw new Error("Expected durable queued prompt");
+
+			const writeStarted = Promise.withResolvers<void>();
+			const releaseWrite = Promise.withResolvers<void>();
+			const appendEntriesAtomically = manager.appendEntriesAtomically.bind(manager);
+			vi.spyOn(manager, "appendEntriesAtomically").mockImplementationOnce(async append => {
+				writeStarted.resolve();
+				await releaseWrite.promise;
+				return appendEntriesAtomically(append);
+			});
+
+			const retiming = session.setQueuedPromptDelivery(queuedId, "steer");
+			await writeStarted.promise;
+			session.resumeAfterAskReanswer();
+			session.setLifecycleTransitionFenceForTests(true);
+			try {
+				releaseWrite.resolve();
+				await expect(retiming).resolves.toEqual({ status: "updated" });
+				await session.waitForIdle();
+				expect(calls).toHaveLength(0);
+				expect([...session.agent.peekSteeringQueue(), ...session.agent.peekFollowUpQueue()]).toHaveLength(1);
+			} finally {
+				session.setLifecycleTransitionFenceForTests(false);
+			}
+		});
+
+		it("waits for durable retiming before disposal seals the session journal", async () => {
+			const sessionDir = path.join(tempDir, "sessions");
+			const manager = SessionManager.create(tempDir, sessionDir);
+			session = createPersistentSession(manager);
+			session.agent.state.isStreaming = true;
+			await session.sendCustomMessage(
+				{ customType: "dispose-retime", content: "commit before seal", display: true, attribution: "user" },
+				{ deliveryMode: "afterCurrent" },
+			);
+			session.agent.state.isStreaming = false;
+			const queuedId = session.getQueuedPrompts()[0]?.id;
+			if (!queuedId) throw new Error("Expected durable queued prompt");
+			const sessionFile = manager.getSessionFile();
+			if (!sessionFile) throw new Error("Expected durable queued prompt journal");
+
+			const writeStarted = Promise.withResolvers<void>();
+			const releaseWrite = Promise.withResolvers<void>();
+			const appendEntriesAtomically = manager.appendEntriesAtomically.bind(manager);
+			vi.spyOn(manager, "appendEntriesAtomically").mockImplementationOnce(async append => {
+				writeStarted.resolve();
+				await releaseWrite.promise;
+				return appendEntriesAtomically(append);
+			});
+			const seal = vi.spyOn(manager, "seal");
+
+			const retiming = session.setQueuedPromptDelivery(queuedId, "steer");
+			await writeStarted.promise;
+			const disposing = session.dispose();
+			await Promise.resolve();
+			expect(seal).not.toHaveBeenCalled();
+			releaseWrite.resolve();
+			await expect(retiming).resolves.toEqual({ status: "updated" });
+			await disposing;
+			expect(seal).toHaveBeenCalled();
+
+			session = undefined as unknown as AgentSession;
+			const resumed = await reopen(sessionFile, sessionDir);
+			expect([...resumed.agent.peekSteeringQueue(), ...resumed.agent.peekFollowUpQueue()]).toHaveLength(1);
+		});
+
+		it("serializes durable clear behind an in-flight retime", async () => {
+			const sessionDir = path.join(tempDir, "sessions");
+			const manager = SessionManager.create(tempDir, sessionDir);
+			session = createPersistentSession(manager);
+			session.agent.state.isStreaming = true;
+			await session.sendCustomMessage(
+				{ customType: "publish-retime", content: "remove during publish", display: true, attribution: "user" },
+				{ deliveryMode: "steer" },
+			);
+			session.agent.state.isStreaming = false;
+			const queuedId = session.getQueuedPrompts()[0]?.id;
+			if (!queuedId) throw new Error("Expected durable queued prompt");
+			const sessionFile = manager.getSessionFile();
+			if (!sessionFile) throw new Error("Expected durable queued prompt journal");
+
+			const writeStarted = Promise.withResolvers<void>();
+			const releaseWrite = Promise.withResolvers<void>();
+			const appendEntriesAtomically = manager.appendEntriesAtomically.bind(manager);
+			vi.spyOn(manager, "appendEntriesAtomically").mockImplementationOnce(async append => {
+				writeStarted.resolve();
+				await releaseWrite.promise;
+				return appendEntriesAtomically(append);
+			});
+
+			const retiming = session.setQueuedPromptDelivery(queuedId, "afterCurrent");
+			await writeStarted.promise;
+			let clearSettled = false;
+			const clearing = session.clearQueueDurably().finally(() => {
+				clearSettled = true;
+			});
+			await Promise.resolve();
+			expect(clearSettled).toBe(false);
+			expect(session.getQueuedPrompts().map(prompt => prompt.text)).toEqual(["remove during publish"]);
+
+			releaseWrite.resolve();
+			await expect(retiming).resolves.toEqual({ status: "updated" });
+			const restored = await clearing;
+			expect([...restored.steering, ...restored.followUp]).toEqual([
+				{ text: "remove during publish", images: undefined },
+			]);
+			expect(session.agent.hasQueuedMessages()).toBe(false);
+
+			session = undefined as unknown as AgentSession;
+			const resumed = await reopen(sessionFile, sessionDir);
+			expect(resumed.agent.peekSteeringQueue()).toHaveLength(0);
+			expect(resumed.agent.peekFollowUpQueue()).toHaveLength(0);
+		});
+
+		it.each([
+			["clear", false],
+			["pop", false],
+			["clear", true],
+		] as const)(
+			"keeps a durable prompt visible while %s waits for a retime write failure=%s",
+			async (removal, writeFails) => {
+				const sessionDir = path.join(tempDir, "sessions");
+				const manager = SessionManager.create(tempDir, sessionDir);
+				session = createPersistentSession(manager);
+				session.agent.state.isStreaming = true;
+				await session.sendCustomMessage(
+					{ customType: "removable-retime", content: "remove during save", display: true, attribution: "user" },
+					{ deliveryMode: "steer" },
+				);
+				session.agent.state.isStreaming = false;
+				const queuedId = session.getQueuedPrompts()[0]?.id;
+				if (!queuedId) throw new Error("Expected durable queued prompt");
+				const sessionFile = manager.getSessionFile();
+				if (!sessionFile) throw new Error("Expected durable queued prompt journal");
+
+				const writeStarted = Promise.withResolvers<void>();
+				const releaseWrite = Promise.withResolvers<void>();
+				const appendEntriesAtomically = manager.appendEntriesAtomically.bind(manager);
+				vi.spyOn(manager, "appendEntriesAtomically").mockImplementationOnce(async append => {
+					writeStarted.resolve();
+					await releaseWrite.promise;
+					if (writeFails) throw new Error("retime write failed");
+					return appendEntriesAtomically(append);
+				});
+
+				const retiming = session.setQueuedPromptDelivery(queuedId, "afterCurrent");
+				await writeStarted.promise;
+				const clearing = removal === "clear" ? session.clearQueueDurably() : undefined;
+				const popping = removal === "pop" ? session.popLastQueuedMessageDurably() : undefined;
+				await Promise.resolve();
+				expect(session.getQueuedPrompts().map(prompt => prompt.text)).toEqual(["remove during save"]);
+
+				releaseWrite.resolve();
+				if (writeFails) await expect(retiming).rejects.toThrow("retime write failed");
+				else await expect(retiming).resolves.toEqual({ status: "updated" });
+				if (clearing) {
+					const restored = await clearing;
+					expect([...restored.steering, ...restored.followUp]).toEqual([
+						{ text: "remove during save", images: undefined },
+					]);
+				} else {
+					await expect(popping).resolves.toEqual({ text: "remove during save", images: undefined });
+				}
+				expect(session.agent.hasQueuedMessages()).toBe(false);
+
+				session = undefined as unknown as AgentSession;
+				const resumed = await reopen(sessionFile, sessionDir);
+				expect(resumed.agent.peekSteeringQueue()).toHaveLength(0);
+				expect(resumed.agent.peekFollowUpQueue()).toHaveLength(0);
+			},
+		);
+
+		it("leaves a durable queue unchanged when cancellation persistence fails", async () => {
+			const sessionDir = path.join(tempDir, "sessions");
+			const manager = SessionManager.create(tempDir, sessionDir);
+			session = createPersistentSession(manager);
+			session.agent.state.isStreaming = true;
+			await session.sendCustomMessage(
+				{ customType: "failed-cancel", content: "keep after failure", display: true, attribution: "user" },
+				{ deliveryMode: "steer" },
+			);
+			const sessionFile = manager.getSessionFile();
+			if (!sessionFile) throw new Error("Expected durable queued prompt journal");
+			vi.spyOn(manager, "appendEntriesAtomically").mockRejectedValueOnce(new Error("cancellation failed"));
+
+			await expect(session.clearQueueDurably()).rejects.toThrow("cancellation failed");
+			expect(session.getQueuedPrompts().map(prompt => prompt.text)).toEqual(["keep after failure"]);
+
+			session = undefined as unknown as AgentSession;
+			const resumed = await reopen(sessionFile, sessionDir);
+			expect(resumed.getQueuedPrompts().map(prompt => prompt.text)).toEqual(["keep after failure"]);
+		});
+
+		it("rejects synchronous removal before mutating a durable queue", async () => {
+			const manager = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+			session = createPersistentSession(manager);
+			session.agent.state.isStreaming = true;
+			await session.sendCustomMessage(
+				{ customType: "sync-cancel", content: "do not lose me", display: true, attribution: "user" },
+				{ deliveryMode: "steer" },
+			);
+
+			expect(() => session.clearQueue()).toThrow(AgentBusyError);
+			expect(() => session.popLastQueuedMessage()).toThrow(AgentBusyError);
+			expect(session.getQueuedPrompts().map(prompt => prompt.text)).toEqual(["do not lose me"]);
 		});
 
 		it("preserves array-valued details through queued semantic recovery", async () => {

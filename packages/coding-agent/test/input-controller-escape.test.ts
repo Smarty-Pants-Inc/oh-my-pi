@@ -92,7 +92,7 @@ function createContext(): {
 	const abortHandoff = vi.fn();
 	const addMessageToChat = vi.fn();
 	const cancelPendingSubmission = vi.fn(() => false);
-	const clearQueue = vi.fn(() => ({ steering: [], followUp: [] }));
+	const clearQueue = vi.fn(async () => ({ steering: [], followUp: [] }));
 	const getQueuedMessages = vi.fn(() => ({ steering: [], followUp: [] }));
 	const onInputCallback = vi.fn();
 	const requestRender = vi.fn();
@@ -163,7 +163,7 @@ function createContext(): {
 			abort,
 			abortBash,
 			abortEval,
-			clearQueue,
+			clearQueueDurably: clearQueue,
 			getQueuedMessages,
 			maybeStartTitleGeneration: vi.fn(),
 			prompt,
@@ -356,13 +356,14 @@ describe("InputController escape behavior", () => {
 		expect(editor.getText()).toBe("");
 	});
 
-	it("falls back to aborting the active session when no pending optimistic submission exists", () => {
+	it("falls back to aborting the active session when no pending optimistic submission exists", async () => {
 		const { ctx, editor, spies } = createContext();
 		ctx.loadingAnimation = {} as InteractiveModeContext["loadingAnimation"];
 		const controller = new InputController(ctx);
 
 		controller.setupKeyHandlers();
 		editor.onEscape?.();
+		await Promise.resolve();
 
 		expect(spies.cancelPendingSubmission).toHaveBeenCalledTimes(1);
 		expect(spies.clearQueue).toHaveBeenCalledTimes(1);

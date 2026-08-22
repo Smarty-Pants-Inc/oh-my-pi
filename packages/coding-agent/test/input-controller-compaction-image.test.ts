@@ -45,7 +45,10 @@ function makeCtx(initialQueue: CompactionQueuedMessage[] = []) {
 		extensionRunner: undefined,
 		customCommands: [] as Array<{ command: { name: string } }>,
 		getQueuedMessages: () => ({ steering: [] as string[], followUp: [] as string[] }),
-		clearQueue: () => ({ steering: [] as RestoredQueuedMessage[], followUp: [] as RestoredQueuedMessage[] }),
+		clearQueueDurably: async () => ({
+			steering: [] as RestoredQueuedMessage[],
+			followUp: [] as RestoredQueuedMessage[],
+		}),
 		prompt: mock(async (text: string, opts?: PromptOpts): Promise<void> => {
 			promptCalls.push({ text, opts });
 		}),
@@ -146,34 +149,49 @@ describe("compaction queue image forwarding", () => {
 });
 
 describe("compaction queue Alt+Up restore", () => {
-	test("restoreQueuedMessagesToEditor drains a compaction-queued skill", () => {
+	test("restoreQueuedMessagesToEditor drains a compaction-queued skill", async () => {
 		const { ctx } = makeCtx([{ text: "/skill:foo bar", mode: "followUp", images: undefined }]);
-		const restored = new InputController(ctx).restoreQueuedMessagesToEditor();
+		const restored = await new InputController(ctx).restoreQueuedMessagesToEditor();
 		expect(restored).toBe(1);
 		expect(ctx.editor.getText()).toBe("/skill:foo bar");
 		expect(ctx.compactionQueuedMessages).toEqual([]);
 	});
 
-	test("restored compaction images return to the pending-image buffer", () => {
+	test("restored compaction images return to the pending-image buffer", async () => {
 		const image = img("YmF6");
 		const { ctx } = makeCtx([{ text: "look", mode: "steer", images: [image] }]);
-		const restored = new InputController(ctx).restoreQueuedMessagesToEditor();
+		const restored = await new InputController(ctx).restoreQueuedMessagesToEditor();
 		expect(restored).toBe(1);
 		expect(ctx.editor.pendingImages).toEqual([image]);
 	});
 
-	test("session and compaction queues restore in pending-bar order", () => {
+	test("session and compaction queues restore in pending-bar order", async () => {
 		const { ctx, session } = makeCtx([
 			{ text: "compaction steer", mode: "steer", images: undefined },
 			{ text: "compaction followup", mode: "followUp", images: undefined },
 		]);
-		session.clearQueue = () => ({
+		session.clearQueueDurably = async () => ({
 			steering: [{ text: "session steer" }],
 			followUp: [{ text: "session followup" }],
 		});
-		const restored = new InputController(ctx).restoreQueuedMessagesToEditor();
+		const restored = await new InputController(ctx).restoreQueuedMessagesToEditor();
 		expect(restored).toBe(4);
 		expect(ctx.editor.getText()).toBe("session steer\n\ncompaction steer\n\nsession followup\n\ncompaction followup");
+	});
+
+	test("keeps compaction input when durable queue clearing fails", async () => {
+		const queued = [{ text: "keep me", mode: "steer" as const, images: undefined }];
+		const { ctx, session } = makeCtx(queued);
+		const showError = mock(() => {});
+		ctx.showError = showError;
+		session.clearQueueDurably = async () => {
+			throw new Error("disk unavailable");
+		};
+
+		await expect(new InputController(ctx).restoreQueuedMessagesToEditor()).resolves.toBe(0);
+		expect(ctx.compactionQueuedMessages).toEqual(queued);
+		expect(ctx.editor.getText()).toBe("");
+		expect(showError).toHaveBeenCalledWith("Failed to restore queued messages: disk unavailable");
 	});
 });
 
@@ -209,7 +227,7 @@ describe("restoreQueuedMessagesToEditor image marker alignment", () => {
 			pendingImageLinks: opts.draftImages ? opts.draftImages.map(() => undefined) : ([] as (string | undefined)[]),
 		};
 		const session = {
-			clearQueue: mock(() => ({ steering: opts.queued ?? [], followUp: [] })),
+			clearQueueDurably: mock(async () => ({ steering: opts.queued ?? [], followUp: [] })),
 			abort: mock(async () => {}),
 		};
 		const ctx = {
@@ -222,7 +240,7 @@ describe("restoreQueuedMessagesToEditor image marker alignment", () => {
 		return { ctx, editor };
 	}
 
-	test("renumbers queued markers when the draft already holds a pending image", () => {
+	test("renumbers queued markers when the draft already holds a pending image", async () => {
 		const draftImg = img("ZHJhZnQ=");
 		const queuedImg = img("cXVldWVk");
 		const { ctx, editor } = makeRestoreCtx({
@@ -231,7 +249,7 @@ describe("restoreQueuedMessagesToEditor image marker alignment", () => {
 			queued: [{ text: "[Image #1] queued text", images: [queuedImg] }],
 		});
 
-		const restored = new InputController(ctx).restoreQueuedMessagesToEditor();
+		const restored = await new InputController(ctx).restoreQueuedMessagesToEditor();
 
 		// The draft marker stays at #1 (its image kept slot 0); the queued
 		// marker is bumped to #2 because the queued image is appended at slot 1.
@@ -243,7 +261,7 @@ describe("restoreQueuedMessagesToEditor image marker alignment", () => {
 		expect(ctx.editor.pendingImages[1]).toBe(queuedImg); // matches [Image #2]
 	});
 
-	test("preserves the WxH metadata tail when renumbering", () => {
+	test("preserves the WxH metadata tail when renumbering", async () => {
 		const draftImg = img("ZHJhZnQ=");
 		const queuedImg = img("cXVldWVk");
 		const { ctx, editor } = makeRestoreCtx({
@@ -252,12 +270,12 @@ describe("restoreQueuedMessagesToEditor image marker alignment", () => {
 			queued: [{ text: "look [Image #1, 800x600] now", images: [queuedImg] }],
 		});
 
-		new InputController(ctx).restoreQueuedMessagesToEditor();
+		await new InputController(ctx).restoreQueuedMessagesToEditor();
 
 		expect(editor.getText()).toBe("look [Image #2, 800x600] now\n\n[Image #1, 100x100]");
 	});
 
-	test("accumulates the offset across multiple queued image-messages", () => {
+	test("accumulates the offset across multiple queued image-messages", async () => {
 		const draftImg = img("ZHJhZnQ=");
 		const queued1 = img("cTE=");
 		const queued2a = img("cTJh");
@@ -271,20 +289,20 @@ describe("restoreQueuedMessagesToEditor image marker alignment", () => {
 			],
 		});
 
-		new InputController(ctx).restoreQueuedMessagesToEditor();
+		await new InputController(ctx).restoreQueuedMessagesToEditor();
 
 		// msg1 markers shift by 1 (draft images), msg2 markers shift by 1+1=2.
 		expect(editor.getText()).toBe("first [Image #2]\n\nsecond [Image #3] and [Image #4]\n\nsee [Image #1]");
 		expect(ctx.editor.pendingImages).toEqual([draftImg, queued1, queued2a, queued2b]);
 	});
 
-	test("leaves the queued text untouched when the draft has no pending images", () => {
+	test("leaves the queued text untouched when the draft has no pending images", async () => {
 		const queuedImg = img("cXVldWVk");
 		const { ctx, editor } = makeRestoreCtx({
 			queued: [{ text: "[Image #1] queued", images: [queuedImg] }],
 		});
 
-		new InputController(ctx).restoreQueuedMessagesToEditor();
+		await new InputController(ctx).restoreQueuedMessagesToEditor();
 
 		expect(editor.getText()).toBe("[Image #1] queued");
 		expect(ctx.editor.pendingImages).toEqual([queuedImg]);

@@ -160,15 +160,14 @@ describe("InteractiveMode deferred command preview", () => {
 		expect(noticeText(mode)).toBe("");
 	});
 
-	it("removes the timing-editor key listener when the session surface resets", async () => {
+	it("removes the timing-editor queue subscription when the session surface resets", async () => {
 		const { mode } = await createHarness();
 		mode.ui.setFocus(mode.editor);
 		const unsubscribe = vi.fn();
-		const addInputListener = vi.spyOn(mode.ui, "addInputListener").mockReturnValue(unsubscribe);
+		const onQueuedPromptsChanged = vi.spyOn(mode.session, "onQueuedPromptsChanged").mockReturnValue(unsubscribe);
 
 		mode.editQueuedPrompts();
-		await Promise.resolve();
-		expect(addInputListener).toHaveBeenCalledTimes(1);
+		expect(onQueuedPromptsChanged).toHaveBeenCalledTimes(1);
 
 		mode.clearTransientSessionUi();
 		expect(unsubscribe).toHaveBeenCalledTimes(1);

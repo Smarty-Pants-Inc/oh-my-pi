@@ -390,7 +390,7 @@ export class InputController {
 				if (this.ctx.cancelPendingSubmission()) {
 					return;
 				}
-				this.restoreQueuedMessagesToEditor({ abort: true });
+				void this.restoreQueuedMessagesToEditor({ abort: true });
 			} else if (this.ctx.session.isBashRunning) {
 				this.ctx.session.abortBash();
 			} else if (this.ctx.isBashMode) {
@@ -489,7 +489,7 @@ export class InputController {
 		);
 		this.ctx.editor.onToggleToolActivity = () => this.toggleToolActivityVisibility();
 		this.ctx.editor.setActionKeys("app.message.dequeue", this.ctx.keybindings.getKeys("app.message.dequeue"));
-		this.ctx.editor.onDequeue = () => this.handleDequeue();
+		this.ctx.editor.onDequeue = () => void this.handleDequeue();
 		this.ctx.editor.setActionKeys("app.retry", this.ctx.keybindings.getKeys("app.retry"));
 		this.ctx.editor.onRetry = () => void this.handleRetry();
 		this.ctx.editor.clearCustomKeyHandlers();
@@ -1136,8 +1136,8 @@ export class InputController {
 		}
 	}
 
-	handleDequeue(): void {
-		const restored = this.restoreQueuedMessagesToEditor();
+	async handleDequeue(): Promise<void> {
+		const restored = await this.restoreQueuedMessagesToEditor();
 		if (restored === 0) {
 			this.ctx.showStatus("No queued messages to restore");
 		} else {
@@ -1436,11 +1436,18 @@ export class InputController {
 		}
 	}
 
-	restoreQueuedMessagesToEditor(options?: { abort?: boolean; currentText?: string }): number {
+	async restoreQueuedMessagesToEditor(options?: { abort?: boolean; currentText?: string }): Promise<number> {
+		let queues: Awaited<ReturnType<InteractiveModeContext["session"]["clearQueueDurably"]>>;
+		try {
+			queues = await this.ctx.session.clearQueueDurably({ forInterrupt: options?.abort });
+		} catch (error) {
+			this.ctx.showError(
+				`Failed to restore queued messages: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			return 0;
+		}
 		this.ctx.locallySubmittedUserSignatures.clear();
-		// On Esc (abort) drop non-user internal steers so the post-abort drain can't
-		// auto-resume; plain Alt+Up dequeue preserves them for the continuing stream.
-		const { steering, followUp } = this.ctx.session.clearQueue({ forInterrupt: options?.abort });
+		const { steering, followUp } = queues;
 		// Messages typed while compacting live in `compactionQueuedMessages`, not the
 		// agent queue `clearQueue()` drains — but the pending bar shows the same
 		// "Alt+Up to edit" hint for them (ui-helpers `updatePendingMessagesDisplay`).

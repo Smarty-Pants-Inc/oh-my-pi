@@ -631,7 +631,6 @@ export class AgentSession {
 
 	/** Host messages retained only for the next deliberate prompt. */
 	#pendingNextTurnMessages: CustomMessage[] = [];
-	#queuedPromptNotificationsSuppressed = false;
 	/** Messages owned exclusively by the next deliberate user-authored prompt. */
 	#pendingExplicitPromptMessages: CustomMessage[] = [];
 	/** Durable queued semantic deliveries not yet persisted into conversation history. */
@@ -4338,6 +4337,27 @@ export class AgentSession {
 					return;
 				}
 				if (options.authority === "direct_user_input") {
+					do {
+						try {
+							await this.#waitForSemanticDeliveryAcceptances(undefined, signal);
+						} catch (error) {
+							if (!signal.aborted) throw error;
+						}
+						if (
+							signal.aborted ||
+							this.#isDisposed ||
+							this.#lifecycleTransitionFenceActive ||
+							this.isCompacting ||
+							this.isGeneratingHandoff
+						) {
+							this.#skipAgentContinue("session-unavailable", options);
+							return;
+						}
+					} while (this.#semanticDeliveryAcceptances.size > 0);
+					if (options.shouldContinue && !options.shouldContinue()) {
+						this.#skipAgentContinue("should-continue-false", options);
+						return;
+					}
 					const directUser = this.#isolateDirectUserContinuationOwner();
 					if (!directUser) {
 						this.#skipAgentContinue("should-continue-false", options);
@@ -5329,6 +5349,7 @@ export class AgentSession {
 			logger.warn("Session abort failed during dispose", { error: String(error) });
 		}
 		await Promise.all([...this.#branchSummarySettlements, ...this.#activeLifecycleSettlements]);
+		await this.#waitForSemanticDeliveryAcceptances();
 		await this.#memory.transition;
 
 		// This is the terminal extension boundary: all abort, pre-fence side work,
@@ -7952,6 +7973,21 @@ export class AgentSession {
 		);
 	}
 
+	async #beginQueuedPromptMutation(): Promise<() => void> {
+		do {
+			await this.#waitForSemanticDeliveryAcceptances();
+		} while (this.#semanticDeliveryAcceptances.size > 0 || this.#queuedPromptDeliveryMutationInFlight);
+		if (this.#isDisposed || this.#lifecycleTransitionFenceActive || this.#activeDirectUserContinuationOwner) {
+			throw new AgentBusyError("Queued messages cannot be changed during a session transition.");
+		}
+		this.#queuedPromptDeliveryMutationInFlight = true;
+		const acceptance = this.#beginSemanticDeliveryAcceptance();
+		return () => {
+			this.#queuedPromptDeliveryMutationInFlight = false;
+			acceptance.release();
+		};
+	}
+
 	async #persistPendingSemanticDelivery<T>(
 		kind: PendingSemanticDeliveryKind,
 		message: CustomMessage<T>,
@@ -8130,12 +8166,27 @@ export class AgentSession {
 		this.#pendingSemanticDeliveryIds.delete(pendingId);
 	}
 
-	async #cancelPendingSemanticDelivery(pendingId: string): Promise<void> {
-		if (!this.#pendingSemanticDeliveryIds.has(pendingId)) return;
+	#queuedPendingSemanticDeliveryId(message: AgentMessage): string | undefined {
+		if (message.role !== "custom") return undefined;
+		const pendingId = readPendingSemanticDeliveryId(message.details);
+		return pendingId && this.#pendingSemanticDeliveryIds.has(pendingId) ? pendingId : undefined;
+	}
+
+	async #cancelPendingSemanticDeliveryIds(pendingIds: readonly string[]): Promise<void> {
+		const activePendingIds = [...new Set(pendingIds)].filter(pendingId =>
+			this.#pendingSemanticDeliveryIds.has(pendingId),
+		);
+		if (activePendingIds.length === 0) return;
 		await this.sessionManager.appendEntriesAtomically(() => {
-			this.#appendPendingSemanticDeliverySettlement(pendingId, "cancelled");
+			for (const pendingId of activePendingIds) {
+				this.#appendPendingSemanticDeliverySettlement(pendingId, "cancelled");
+			}
 		});
-		this.#pendingSemanticDeliveryIds.delete(pendingId);
+		for (const pendingId of activePendingIds) this.#pendingSemanticDeliveryIds.delete(pendingId);
+	}
+
+	async #cancelPendingSemanticDelivery(pendingId: string): Promise<void> {
+		await this.#cancelPendingSemanticDeliveryIds([pendingId]);
 	}
 
 	async #cancelPendingSemanticDeliveries(): Promise<void> {
@@ -8653,6 +8704,16 @@ export class AgentSession {
 		});
 	}
 
+	#assertSynchronousQueueRemovalAllowed(messages: readonly AgentMessage[]): void {
+		if (messages.length === 0) return;
+		if (this.#queuedPromptDeliveryMutationInFlight) {
+			throw new AgentBusyError("Queued messages are already being changed.");
+		}
+		if (messages.some(message => this.#queuedPendingSemanticDeliveryId(message))) {
+			throw new AgentBusyError("Durable queued messages must be removed with the asynchronous queue API.");
+		}
+	}
+
 	/** Clear queued messages and return the user-restorable ones (text plus any attached images).
 	 *  Only user-authored messages (plain user turns, `attribution:"user"` custom like `/skill`) are
 	 *  returned for editor restore. Other queued messages stay in the agent-core queues so a continuing
@@ -8665,17 +8726,66 @@ export class AgentSession {
 		steering: RestoredQueuedMessage[];
 		followUp: RestoredQueuedMessage[];
 	} {
-		const steeringAll = this.agent.peekSteeringQueue();
-		const followUpAll = this.agent.peekFollowUpQueue();
+		const steeringAll = [...this.agent.peekSteeringQueue()];
+		const followUpAll = [...this.agent.peekFollowUpQueue()];
+		const keep: (message: AgentMessage) => boolean = options?.forInterrupt
+			? isAdvisorCard
+			: message => !isUserQueuedMessage(message) && !isHiddenUserCompanion(message);
+		const removed = [
+			...steeringAll.filter(message => !keep(message)),
+			...followUpAll.filter(message => !keep(message)),
+		];
+		this.#assertSynchronousQueueRemovalAllowed(removed);
 		const steering = steeringAll.filter(isUserQueuedMessage).map(toRestoredQueuedMessage);
 		const followUp = followUpAll.filter(isUserQueuedMessage).map(toRestoredQueuedMessage);
-		const keep: (m: AgentMessage) => boolean = options?.forInterrupt
-			? isAdvisorCard
-			: m => !isUserQueuedMessage(m) && !isHiddenUserCompanion(m);
 		this.agent.replaceQueues(steeringAll.filter(keep), followUpAll.filter(keep));
-		this.agent.releaseOrphanedQueuedMessageCompanions();
 		this.#reconcileQueuedMessageDrain();
 		return { steering, followUp };
+	}
+
+	async clearQueueDurably(options?: { forInterrupt?: boolean }): Promise<{
+		steering: RestoredQueuedMessage[];
+		followUp: RestoredQueuedMessage[];
+	}> {
+		const releaseMutation = await this.#beginQueuedPromptMutation();
+		let claim: ReturnType<Agent["claimQueuedMessageBlock"]>;
+		try {
+			const steeringAll = [...this.agent.peekSteeringQueue()];
+			const followUpAll = [...this.agent.peekFollowUpQueue()];
+			const keep: (message: AgentMessage) => boolean = options?.forInterrupt
+				? isAdvisorCard
+				: message => !isUserQueuedMessage(message) && !isHiddenUserCompanion(message);
+			const removedSteering = steeringAll.filter(message => !keep(message));
+			const removedFollowUp = followUpAll.filter(message => !keep(message));
+			const steering = steeringAll.filter(isUserQueuedMessage).map(toRestoredQueuedMessage);
+			const followUp = followUpAll.filter(isUserQueuedMessage).map(toRestoredQueuedMessage);
+			if (removedSteering.length > 0) {
+				claim = this.agent.claimQueuedMessageBlock("steering", steeringAll);
+			} else if (removedFollowUp.length > 0) {
+				claim = this.agent.claimQueuedMessageBlock("followUp", followUpAll);
+			}
+			if ((removedSteering.length > 0 || removedFollowUp.length > 0) && !claim) {
+				throw new AgentBusyError("Queued messages are already being changed.");
+			}
+			const removed = new Set([...removedSteering, ...removedFollowUp]);
+			await this.#cancelPendingSemanticDeliveryIds(
+				[...removed].flatMap(message => {
+					const pendingId = this.#queuedPendingSemanticDeliveryId(message);
+					return pendingId ? [pendingId] : [];
+				}),
+			);
+			if (removed.size > 0) {
+				this.agent.replaceQueues(
+					this.agent.peekSteeringQueue().filter(message => !removed.has(message)),
+					this.agent.peekFollowUpQueue().filter(message => !removed.has(message)),
+				);
+				this.#reconcileQueuedMessageDrain();
+			}
+			return { steering, followUp };
+		} finally {
+			claim?.release();
+			releaseMutation();
+		}
 	}
 
 	/** True when any message is waiting for this session. */
@@ -8716,7 +8826,6 @@ export class AgentSession {
 	}
 
 	#notifyQueuedPromptsChanged(): void {
-		if (this.#queuedPromptNotificationsSuppressed) return;
 		const fingerprint = this.#visibleQueuedPromptFingerprint();
 		if (fingerprint === this.#queuedPromptSnapshotFingerprint) return;
 		this.#queuedPromptSnapshotFingerprint = fingerprint;
@@ -8787,7 +8896,17 @@ export class AgentSession {
 			};
 		};
 
-		const move = (location: QueuedPromptLocation): void => {
+		const applyDeliverySideEffects = (): void => {
+			if (delivery === "interrupt") {
+				void this.abort({ reason: USER_INTERRUPT_LABEL });
+				this.#reconcileQueuedMessageDrain();
+			} else {
+				this.#allowQueuedMessageDrainRetry();
+				this.#scheduleIdleQueueDrain();
+			}
+		};
+
+		const move = (location: QueuedPromptLocation, applySideEffects = true): void => {
 			const { steering, followUp, source, ownerIndex, owner } = location;
 			const sourceQueue = source === "steer" ? steering : followUp;
 			let blockStart = ownerIndex;
@@ -8808,15 +8927,12 @@ export class AgentSession {
 			else nextSteering = [...block, ...nextSteering];
 
 			this.agent.replaceQueues(nextSteering, nextFollowUp, true);
-			if (delivery === "interrupt") {
-				void this.abort({ reason: USER_INTERRUPT_LABEL });
-				this.#reconcileQueuedMessageDrain();
-			} else {
-				this.#allowQueuedMessageDrainRetry();
-				this.#scheduleIdleQueueDrain();
-			}
+			if (applySideEffects) applyDeliverySideEffects();
 		};
 
+		if (this.#activeDirectUserContinuationOwner) {
+			return { status: "unavailable", reason: "queue_mutation" };
+		}
 		const initial = locate();
 		if (!initial) return { status: "stale" };
 		if (delivery === initial.source) return { status: "updated" };
@@ -8832,36 +8948,21 @@ export class AgentSession {
 		const durableOwner = initial.owner as CustomMessage;
 
 		this.#queuedPromptDeliveryMutationInFlight = true;
-		this.#queuedPromptNotificationsSuppressed = true;
 		const acceptance = this.#beginSemanticDeliveryAcceptance();
-		const dequeueBarrier = Promise.withResolvers<void>();
-		const removeDequeueBarrier = this.agent.addBeforeQueuedMessageDequeueHook(() => dequeueBarrier.promise);
 		const sourceQueue = initial.source === "steer" ? initial.steering : initial.followUp;
 		let blockStart = initial.ownerIndex;
 		while (blockStart > 0 && isHiddenUserCompanion(sourceQueue[blockStart - 1])) blockStart--;
 		const block = sourceQueue.slice(blockStart, initial.ownerIndex + 1);
-		const sourceRemainder = [...sourceQueue.slice(0, blockStart), ...sourceQueue.slice(initial.ownerIndex + 1)];
-		const claimedSteering = initial.source === "steer" ? sourceRemainder : initial.steering;
-		const claimedFollowUp = initial.source === "afterCurrent" ? sourceRemainder : initial.followUp;
+		const claim = this.agent.claimQueuedMessageBlock(initial.source === "steer" ? "steering" : "followUp", block);
+		if (!claim) {
+			acceptance.release();
+			this.#queuedPromptDeliveryMutationInFlight = false;
+			return { status: "stale" };
+		}
 		const persistedOwner = withCollabPromptSteering(durableOwner, targetKind !== "followUp");
-		const restoreClaim = (): void => {
-			const steering = [...this.agent.peekSteeringQueue()];
-			const followUp = [...this.agent.peekFollowUpQueue()];
-			const queue = initial.source === "steer" ? steering : followUp;
-			const insertionIndex = Math.min(blockStart, queue.length);
-			const restored = [...queue.slice(0, insertionIndex), ...block, ...queue.slice(insertionIndex)];
-			this.agent.replaceQueues(
-				initial.source === "steer" ? restored : steering,
-				initial.source === "afterCurrent" ? restored : followUp,
-				true,
-			);
-		};
+		let replacementPendingId: string | undefined;
 
 		try {
-			// Claim the exact owner block before the first await. A dequeue that already
-			// won is absent from the live queue and would have returned stale above.
-			this.agent.replaceQueues(claimedSteering, claimedFollowUp, true);
-			let replacementPendingId: string;
 			try {
 				replacementPendingId = await this.sessionManager.appendEntriesAtomically(() => {
 					const data: PendingSemanticDeliveryData = {
@@ -8880,38 +8981,37 @@ export class AgentSession {
 					} catch (recoveryError) {
 						throw new AggregateError(
 							[error, recoveryError],
-							"Queued prompt retiming persistence is indeterminate; the claimed prompt remains unavailable.",
+							"Queued prompt retiming persistence is indeterminate; the prompt remains at its prior timing.",
 						);
 					}
 				}
-				restoreClaim();
+				if (!claim.isCurrent() && locate()?.owner !== durableOwner) {
+					await this.#cancelPendingSemanticDelivery(pendingId);
+					return { status: "stale" };
+				}
 				throw error;
 			}
 
 			this.#pendingSemanticDeliveryIds.delete(pendingId);
 			this.#pendingSemanticDeliveryIds.add(replacementPendingId);
-			durableOwner.details = this.#withPendingSemanticDeliveryId(persistedOwner, replacementPendingId).details;
-			let nextSteering = [...this.agent.peekSteeringQueue()];
-			let nextFollowUp = [...this.agent.peekFollowUpQueue()];
-			if (delivery === "afterCurrent") nextFollowUp = [...nextFollowUp, ...block];
-			else if (delivery === "steer") nextSteering = [...nextSteering, ...block];
-			else nextSteering = [...block, ...nextSteering];
-			this.agent.replaceQueues(nextSteering, nextFollowUp, true);
-			if (delivery === "interrupt") {
-				void this.abort({ reason: USER_INTERRUPT_LABEL });
-				this.#reconcileQueuedMessageDrain();
-			} else {
-				this.#allowQueuedMessageDrainRetry();
-				this.#scheduleIdleQueueDrain();
+			const current = locate();
+			if (current?.owner !== durableOwner) {
+				await this.#cancelPendingSemanticDelivery(replacementPendingId);
+				return { status: "stale" };
 			}
+			durableOwner.details = this.#withPendingSemanticDeliveryId(persistedOwner, replacementPendingId).details;
+			move(current, false);
+			const moved = locate();
+			const expectedSource = targetKind === "followUp" ? "afterCurrent" : "steer";
+			if (moved?.owner !== durableOwner || moved.source !== expectedSource) {
+				throw new Error("Queued prompt moved unexpectedly during its durable retime commit");
+			}
+			applyDeliverySideEffects();
 			return { status: "updated" };
 		} finally {
-			removeDequeueBarrier();
-			dequeueBarrier.resolve();
+			claim.release();
 			acceptance.release();
 			this.#queuedPromptDeliveryMutationInFlight = false;
-			this.#queuedPromptNotificationsSuppressed = false;
-			this.#notifyQueuedPromptsChanged();
 		}
 	}
 
@@ -8922,45 +9022,78 @@ export class AgentSession {
 		};
 	}
 
+	#lastQueuedUserIndex(queue: readonly AgentMessage[]): number {
+		for (let index = queue.length - 1; index >= 0; index--) {
+			if (isUserQueuedMessage(queue[index])) return index;
+		}
+		return -1;
+	}
+
+	#queuedOwnerBlock(queue: readonly AgentMessage[], ownerIndex: number): AgentMessage[] {
+		let start = ownerIndex;
+		while (start > 0 && isHiddenUserCompanion(queue[start - 1])) start--;
+		return queue.slice(start, ownerIndex + 1);
+	}
+
 	/**
 	 * Pop the last queued message (steering first, then follow-up).
 	 * Used by dequeue keybinding to restore messages to editor one at a time.
 	 * Steps over agent-authored queued messages (advisor cards, hidden/internal steers).
 	 */
 	popLastQueuedMessage(): RestoredQueuedMessage | undefined {
-		const steering = this.agent.peekSteeringQueue();
-		const followUp = this.agent.peekFollowUpQueue();
-		const lastUserIndex = (queue: readonly AgentMessage[]): number => {
-			for (let i = queue.length - 1; i >= 0; i--) {
-				if (isUserQueuedMessage(queue[i])) return i;
+		const steering = [...this.agent.peekSteeringQueue()];
+		const followUp = [...this.agent.peekFollowUpQueue()];
+		const fromSteer = this.#lastQueuedUserIndex(steering);
+		const fromFollowUp = fromSteer < 0 ? this.#lastQueuedUserIndex(followUp) : -1;
+		const queue = fromSteer >= 0 ? steering : followUp;
+		const ownerIndex = fromSteer >= 0 ? fromSteer : fromFollowUp;
+		if (ownerIndex < 0) return undefined;
+		const owner = queue[ownerIndex]!;
+		const block = this.#queuedOwnerBlock(queue, ownerIndex);
+		this.#assertSynchronousQueueRemovalAllowed(block);
+		const removed = new Set(block);
+		this.agent.replaceQueues(
+			steering.filter(message => !removed.has(message)),
+			followUp.filter(message => !removed.has(message)),
+		);
+		this.#reconcileQueuedMessageDrain();
+		return toRestoredQueuedMessage(owner);
+	}
+
+	async popLastQueuedMessageDurably(): Promise<RestoredQueuedMessage | undefined> {
+		const releaseMutation = await this.#beginQueuedPromptMutation();
+		try {
+			const steering = [...this.agent.peekSteeringQueue()];
+			const followUp = [...this.agent.peekFollowUpQueue()];
+			const fromSteer = this.#lastQueuedUserIndex(steering);
+			const fromFollowUp = fromSteer < 0 ? this.#lastQueuedUserIndex(followUp) : -1;
+			const queue = fromSteer >= 0 ? steering : followUp;
+			const ownerIndex = fromSteer >= 0 ? fromSteer : fromFollowUp;
+			if (ownerIndex < 0) return undefined;
+			const owner = queue[ownerIndex]!;
+			const block = this.#queuedOwnerBlock(queue, ownerIndex);
+			const claim = this.agent.claimQueuedMessageBlock(fromSteer >= 0 ? "steering" : "followUp", queue);
+			if (!claim) throw new AgentBusyError("Queued messages are already being changed.");
+			try {
+				await this.#cancelPendingSemanticDeliveryIds(
+					block.flatMap(message => {
+						const pendingId = this.#queuedPendingSemanticDeliveryId(message);
+						return pendingId ? [pendingId] : [];
+					}),
+				);
+				const removed = new Set(block);
+				this.agent.replaceQueues(
+					this.agent.peekSteeringQueue().filter(message => !removed.has(message)),
+					this.agent.peekFollowUpQueue().filter(message => !removed.has(message)),
+				);
+				this.#reconcileQueuedMessageDrain();
+				return toRestoredQueuedMessage(owner);
+			} finally {
+				claim.release();
 			}
-			return -1;
-		};
-		// Notices queue immediately before their user message, so dropping the popped
-		// prompt means also dropping the contiguous hidden-user companions right before
-		// it — companions of other queued prompts stay put.
-		const removeWithCompanions = (queue: readonly AgentMessage[], userIndex: number): AgentMessage[] => {
-			let start = userIndex;
-			while (start > 0 && isHiddenUserCompanion(queue[start - 1])) start--;
-			const next = queue.slice();
-			next.splice(start, userIndex - start + 1);
-			return next;
-		};
-		const fromSteer = lastUserIndex(steering);
-		if (fromSteer >= 0) {
-			const removed = steering[fromSteer];
-			this.agent.replaceQueues(removeWithCompanions(steering, fromSteer), followUp.slice());
-			this.#reconcileQueuedMessageDrain();
-			return toRestoredQueuedMessage(removed);
+		} finally {
+			releaseMutation();
 		}
-		const fromFollowUp = lastUserIndex(followUp);
-		if (fromFollowUp >= 0) {
-			const removed = followUp[fromFollowUp];
-			this.agent.replaceQueues(steering.slice(), removeWithCompanions(followUp, fromFollowUp));
-			this.#reconcileQueuedMessageDrain();
-			return toRestoredQueuedMessage(removed);
-		}
-		return undefined;
 	}
 
 	get skillsSettings(): SkillsSettings | undefined {

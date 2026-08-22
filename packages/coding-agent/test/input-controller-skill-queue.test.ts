@@ -1193,7 +1193,7 @@ describe("UiHelpers / InputController against derived queued custom display", ()
 
 		const { ctx, editor } = createStubInteractiveModeContextForUiHelpers(session);
 		const controller = new InputController(ctx);
-		const count = controller.restoreQueuedMessagesToEditor();
+		const count = await controller.restoreQueuedMessagesToEditor();
 
 		expect(count).toBe(1);
 		expect(editor.getText()).toBe("/skill:test-skill arg1 arg2");

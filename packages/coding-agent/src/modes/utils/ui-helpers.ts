@@ -1254,8 +1254,17 @@ export class UiHelpers {
 		this.ctx.compactionQueuedMessages = [] as CompactionQueuedMessage[];
 		this.ctx.updatePendingMessagesDisplay();
 
-		const restoreQueue = (error: unknown) => {
-			this.ctx.session.clearQueue();
+		const restoreQueue = async (error: unknown): Promise<void> => {
+			try {
+				await this.ctx.session.clearQueueDurably();
+			} catch (clearError) {
+				this.ctx.compactionQueuedMessages = queuedMessages;
+				this.ctx.updatePendingMessagesDisplay();
+				this.ctx.showError(
+					`Failed to restore queued messages: ${clearError instanceof Error ? clearError.message : String(clearError)}`,
+				);
+				return;
+			}
 			this.ctx.compactionQueuedMessages = queuedMessages;
 			this.ctx.updatePendingMessagesDisplay();
 			this.ctx.showError(
@@ -1325,9 +1334,9 @@ export class UiHelpers {
 						streamingBehavior: firstPrompt.mode === "followUp" ? "followUp" : "steer",
 						images: firstPrompt.images,
 					})
-					.catch((error: unknown) => {
+					.catch(async (error: unknown) => {
 						disposeFirstPrompt();
-						restoreQueue(error);
+						await restoreQueue(error);
 					});
 			}
 
@@ -1337,7 +1346,7 @@ export class UiHelpers {
 			this.ctx.updatePendingMessagesDisplay();
 			void promptPromise;
 		} catch (error) {
-			restoreQueue(error);
+			await restoreQueue(error);
 		}
 	}
 

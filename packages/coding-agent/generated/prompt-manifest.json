@@ -4641,7 +4641,7 @@
     },
     {
       "path": "packages/agent/src/agent.ts",
-      "sha256": "c05d54fc863aadb520d24581465cf2a4b914dbac619144687841d57d210b4ef2"
+      "sha256": "f63fb0bf0ea935d2894a7d72d685a8a66c069441e09bf452895facbdabd8caba"
     },
     {
       "path": "packages/agent/src/append-only-context.ts",
@@ -8145,7 +8145,7 @@
     },
     {
       "path": "packages/coding-agent/src/modes/controllers/input-controller.ts",
-      "sha256": "4636db31c170e6d7b42dd3f810eba2cac27a48d40466d8b3fba0d6e2f4e1151b"
+      "sha256": "ca78eff43db66053ca7f0522c673dc7056b4a784003305a6edaf992be5210737"
     },
     {
       "path": "packages/coding-agent/src/modes/controllers/live-command-controller.ts",
@@ -8205,7 +8205,7 @@
     },
     {
       "path": "packages/coding-agent/src/modes/interactive-mode.ts",
-      "sha256": "eeeff4ba79359111daee09f5807af7878d137e60a4d914e001d88ab1e083c78e"
+      "sha256": "2386894fe78da5cc3b71470031b7da8323c43525d88be68149a81fbbb1d760a9"
     },
     {
       "path": "packages/coding-agent/src/modes/loop-limit.ts",
@@ -8297,7 +8297,7 @@
     },
     {
       "path": "packages/coding-agent/src/modes/utils/ui-helpers.ts",
-      "sha256": "cf227053763207753e3ae73357981c4ce91f1de1ec116c1bd294bf397991cd34"
+      "sha256": "fb4c6cbb9096b8451c2f8512f0b2b3d75368e7a3ffe12e2ebfe6c3cb7e3058a2"
     },
     {
       "path": "packages/coding-agent/src/modes/workflow.ts",
@@ -8449,7 +8449,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/agent-session.ts",
-      "sha256": "f98168eb27dfe341fd62a54b7f3d016ab4251a3ef817d00569a15820b91e63c9"
+      "sha256": "c1f307803f71dce816045b7a52284682c44b14e9dc740586b77f0fd3910799ae"
     },
     {
       "path": "packages/coding-agent/src/session/agent-storage.ts",
@@ -8629,7 +8629,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/session-manager.ts",
-      "sha256": "9dac6fde0bca13607947c209e6a5a54872d6e0f8ab3c3c71716c534b90a6f1c3"
+      "sha256": "72b0065e77b62cc529e78d58e3f772806613bac5654715f4d361d3581046a5de"
     },
     {
       "path": "packages/coding-agent/src/session/session-memory.ts",
@@ -10733,5 +10733,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "89a1ea6aac0a216658437d8c21464b0efd348d450f36483a3834af713e477327"
+  "rootSha256": "6369411d3205bc15ee272cbfcc614443d2f3ae828c800dee21d428a326e747fc"
 }

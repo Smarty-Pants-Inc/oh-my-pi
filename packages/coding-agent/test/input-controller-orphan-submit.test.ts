@@ -234,14 +234,14 @@ describe("InputController orphaned submit", () => {
 	it("returns queued images to the pending-image buffer on queue restore", async () => {
 		const { ctx, editor } = createContext();
 		const image = { type: "image" as const, data: "abc", mimeType: "image/png" };
-		const session = ctx.session as unknown as { clearQueue: () => unknown };
-		session.clearQueue = () => ({
+		const session = ctx.session as unknown as { clearQueueDurably: () => Promise<unknown> };
+		session.clearQueueDurably = async () => ({
 			steering: [{ text: "queued with image", images: [image] }],
 			followUp: [],
 		});
 		const controller = new InputController(ctx);
 
-		const restored = controller.restoreQueuedMessagesToEditor();
+		const restored = await controller.restoreQueuedMessagesToEditor();
 
 		expect(restored).toBe(1);
 		expect(editor.getText()).toBe("queued with image");

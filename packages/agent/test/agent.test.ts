@@ -401,6 +401,116 @@ describe("Agent", () => {
 		expect(calls).toBe(1);
 	});
 
+	it("holds dequeue at the final boundary while a visible queued block is claimed", async () => {
+		const mock = createMockModel({ responses: [{ content: ["done"] }] });
+		const agent = new Agent({ streamFn: mock.stream });
+		agent.replaceMessages([createAssistantMessage([{ type: "text", text: "ready" }])]);
+		const queued = { role: "user" as const, content: "claimed turn", timestamp: Date.now() };
+		agent.followUp(queued);
+		const hooksFinished = Promise.withResolvers<void>();
+		const releaseHook = Promise.withResolvers<void>();
+		agent.addBeforeQueuedMessageDequeueHook(async () => {
+			await releaseHook.promise;
+			hooksFinished.resolve();
+		});
+
+		const continuing = agent.continue();
+		releaseHook.resolve();
+		await hooksFinished.promise;
+		const claim = agent.claimQueuedMessageBlock("followUp", [queued]);
+		if (!claim) throw new Error("Expected queued block claim");
+		await Promise.resolve();
+		expect(mock.calls).toHaveLength(0);
+		expect(agent.peekFollowUpQueue()).toEqual([queued]);
+
+		claim.release();
+		await continuing;
+		expect(mock.calls).toHaveLength(1);
+		expect(agent.peekFollowUpQueue()).toHaveLength(0);
+	});
+
+	it("rechecks a claim acquired after an empty final-boundary wait", async () => {
+		const mock = createMockModel({ responses: [{ content: ["done"] }] });
+		const agent = new Agent({ streamFn: mock.stream });
+		agent.replaceMessages([createAssistantMessage([{ type: "text", text: "ready" }])]);
+		const queued = { role: "user" as const, content: "late claim", timestamp: Date.now() };
+		agent.followUp(queued);
+		const claimStarted = Promise.withResolvers<ReturnType<Agent["claimQueuedMessageBlock"]>>();
+		agent.addBeforeQueuedMessageDequeueHook(() => {
+			queueMicrotask(() => {
+				queueMicrotask(() => {
+					queueMicrotask(() => {
+						claimStarted.resolve(agent.claimQueuedMessageBlock("followUp", [queued]));
+					});
+				});
+			});
+		});
+
+		const continuing = agent.continue();
+		const claim = await claimStarted.promise;
+		expect(claim).toBeDefined();
+		if (!claim) {
+			await continuing;
+			throw new Error("Expected late queued block claim");
+		}
+		await Promise.resolve();
+		expect(mock.calls).toHaveLength(0);
+		expect(agent.peekFollowUpQueue()).toEqual([queued]);
+
+		claim.release();
+		await continuing;
+		expect(mock.calls).toHaveLength(1);
+	});
+
+	it("releases a claimed dequeue wait when the run is aborted", async () => {
+		const mock = createMockModel({ responses: [{ content: ["done"] }] });
+		const agent = new Agent({ streamFn: mock.stream });
+		agent.replaceMessages([createAssistantMessage([{ type: "text", text: "ready" }])]);
+		const queued = { role: "user" as const, content: "still queued", timestamp: Date.now() };
+		agent.followUp(queued);
+		const claim = agent.claimQueuedMessageBlock("followUp", [queued]);
+		if (!claim) throw new Error("Expected queued block claim");
+
+		const continuing = agent.continue();
+		await Promise.resolve();
+		agent.abort("cancel claimed dequeue");
+		await expect(continuing).rejects.toThrow("Cannot continue from message role: assistant");
+		expect(agent.peekFollowUpQueue()).toEqual([queued]);
+		expect(mock.calls).toHaveLength(0);
+
+		claim.release();
+		await agent.continue();
+		expect(mock.calls).toHaveLength(1);
+	});
+
+	it("restores companion ownership before rollback listeners observe the owner", async () => {
+		const mock = createMockModel({ responses: [{ content: ["unused"] }] });
+		const agent = new Agent({ streamFn: mock.stream });
+		const owner = { role: "user" as const, content: "restore me", timestamp: Date.now() };
+		const originalCompanion = { role: "user" as const, content: "original companion", timestamp: Date.now() };
+		const lateCompanion = { role: "user" as const, content: "late companion", timestamp: Date.now() };
+		const restored: AgentMessage[] = [];
+		agent.steer(owner);
+		expect(
+			agent.attachQueuedMessageCompanions(owner, [originalCompanion], messages => restored.push(...messages)),
+		).toBe(true);
+		let handled = false;
+		agent.subscribeQueueChanges(() => {
+			if (handled || !agent.peekSteeringQueue().includes(owner)) return;
+			handled = true;
+			expect(
+				agent.attachQueuedMessageCompanions(owner, [lateCompanion], messages => restored.push(...messages)),
+			).toBe(true);
+			agent.clearSteeringQueue();
+		});
+		agent.setBeforeModelCall(() => ({ stop: true, reason: "rollback" }));
+
+		await agent.prompt("peer wake", { onProviderCallStarted: () => {} });
+
+		expect(agent.peekSteeringQueue()).toHaveLength(0);
+		expect(restored).toEqual([originalCompanion, lateCompanion]);
+	});
+
 	it("continue() leaves queued messages owned when its signal is already aborted", async () => {
 		const agent = new Agent();
 		agent.replaceMessages([createAssistantMessage([{ type: "text", text: "ready" }])]);
