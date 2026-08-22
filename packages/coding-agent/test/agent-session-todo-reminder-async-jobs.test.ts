@@ -259,6 +259,61 @@ describe("AgentSession todo reminder async-job deferral", () => {
 		expect(reminderAttempts).toEqual([1]);
 	});
 
+	it("runs session_stop before rejecting a text closure with stale todos", async () => {
+		setIncompleteTodos();
+		const hookStarted = Promise.withResolvers<void>();
+		const releaseHook = Promise.withResolvers<void>();
+		vi.spyOn(extensionRunner, "emitSessionStop").mockImplementation(async () => {
+			hookStarted.resolve();
+			await releaseHook.promise;
+			return undefined;
+		});
+
+		emitTextOnlyStop();
+		await hookStarted.promise;
+		expect(closureRejections).toEqual([]);
+		releaseHook.resolve();
+		await session.waitForIdle();
+
+		expect(extensionRunner.emitSessionStop).toHaveBeenCalledTimes(1);
+		expect(closureRejections).toEqual([
+			{
+				reason: "stale_todos",
+				todos: [
+					{ content: "Slice 81", status: "pending" },
+					{ content: "Slice 82", status: "pending" },
+				],
+			},
+		]);
+	});
+
+	it("runs session_stop before rejecting a successful yield with stale todos", async () => {
+		setIncompleteTodos();
+		const hookStarted = Promise.withResolvers<void>();
+		const releaseHook = Promise.withResolvers<void>();
+		vi.spyOn(extensionRunner, "emitSessionStop").mockImplementation(async () => {
+			hookStarted.resolve();
+			await releaseHook.promise;
+			return undefined;
+		});
+
+		emitSuccessfulYieldStop();
+		await hookStarted.promise;
+		expect(closureRejections).toEqual([]);
+		releaseHook.resolve();
+		await session.waitForIdle();
+
+		expect(extensionRunner.emitSessionStop).toHaveBeenCalledTimes(1);
+		expect(closureRejections).toEqual([
+			{
+				reason: "stale_todos",
+				todos: [
+					{ content: "Slice 81", status: "pending" },
+					{ content: "Slice 82", status: "pending" },
+				],
+			},
+		]);
+	});
 	it("runs the session_stop hook for an owned job without an open origin turn", async () => {
 		// No todo phases: the stop reaches the session_stop pass directly. An
 		// unscoped job cannot defer or re-wake the model loop.

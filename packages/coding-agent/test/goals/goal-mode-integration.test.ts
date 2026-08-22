@@ -1,7 +1,8 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
-import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
+import type { ImageContent, Model, ToolCall } from "@oh-my-pi/pi-ai";
+import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { parseGoalModeState } from "@oh-my-pi/pi-coding-agent/goals/state";
@@ -16,6 +17,7 @@ import { executeBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-comm
 import { createTools, type Tool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import type { TodoPhase } from "@oh-my-pi/pi-coding-agent/tools/todo";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createAssistantMessage } from "../helpers/agent-session-setup";
 
 function createToolSession(cwd: string, settings: Settings, overrides: Partial<ToolSession> = {}): ToolSession {
 	return {
@@ -54,6 +56,7 @@ type SharedFixture = {
 async function createSharedFixture(): Promise<SharedFixture> {
 	const baseDir = TempDir.createSync("@pi-goal-mode-shared-");
 	const authStorage = await AuthStorage.create(path.join(baseDir.path(), "testauth.db"));
+	authStorage.setRuntimeApiKey("anthropic", "test-key");
 	const modelRegistry = new ModelRegistry(authStorage);
 	const model = modelRegistry.find("anthropic", "claude-sonnet-4-5");
 	if (!model) {
@@ -533,6 +536,43 @@ describe("InteractiveMode goal mode integration", () => {
 		expect(harness.mode.editor.pendingImageLinks).toEqual(["file:///later.png"]);
 	});
 
+	it("does not let a terminal goal completion race a later todo mutation in one tool batch", async () => {
+		await harness.session.setActiveToolsByName(["goal", "todo"]);
+		await harness.session.goalRuntime.createGoal({ objective: "Complete the tracked work" });
+		harness.session.agent.streamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				stream.push({ type: "start", partial: createAssistantMessage("") });
+				const message = createAssistantMessage("");
+				message.stopReason = "toolUse";
+				message.content = [
+					{ type: "toolCall", id: "complete-goal", name: "goal", arguments: { op: "complete" } },
+					{
+						type: "toolCall",
+						id: "later-todo-mutation",
+						name: "todo",
+						arguments: { op: "init", list: [{ phase: "Later", items: ["Must not run"] }] },
+					},
+				] as ToolCall[];
+				stream.push({ type: "done", reason: "toolUse", message });
+			});
+			return stream;
+		};
+		const closureRejections: unknown[] = [];
+		const unsubscribe = harness.session.subscribe(event => {
+			if (event.type === "agent_end" && event.closureRejected) closureRejections.push(event.closureRejected);
+		});
+
+		try {
+			await harness.session.prompt("Complete the goal.");
+			await harness.session.waitForIdle();
+		} finally {
+			unsubscribe();
+		}
+
+		expect(harness.session.getTodoPhases()).toEqual([]);
+		expect(closureRejections).toEqual([]);
+	});
 	it("includes only open todo state in typed provider context during goal turns", async () => {
 		await harness.session.setActiveToolsByName(["read", "todo"]);
 		await harness.mode.handleGoalModeCommand("Ship the release");

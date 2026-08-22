@@ -180,12 +180,15 @@ describe("GoalTool", () => {
 		).rejects.toThrow("cannot create a new goal because this session already has a goal");
 	});
 
-	it("rejects complete when no goal is active", async () => {
+	it("rejects no active goal before inspecting open todos", async () => {
 		const harness = createRuntimeHarness();
 		const tool = new GoalTool(
 			createToolSession({
 				getGoalRuntime: () => harness.runtime,
 				getGoalModeState: () => harness.getState(),
+				settings: Settings.isolated({ "todo.enabled": true, "todo.reminders": true }),
+				isToolActive: name => name === "todo",
+				getTodoPhases: () => [{ name: "Pending", tasks: [{ content: "Open task", status: "pending" }] }],
 			}),
 		);
 
@@ -351,7 +354,7 @@ describe("GoalTool", () => {
 		expect(current.content).toEqual([{ type: "text", text: "No active goal." }]);
 	});
 
-	it("rejects complete for a paused goal", async () => {
+	it("rejects a paused goal before inspecting open todos", async () => {
 		const harness = createRuntimeHarness({
 			enabled: false,
 			mode: "active",
@@ -361,6 +364,9 @@ describe("GoalTool", () => {
 			createToolSession({
 				getGoalRuntime: () => harness.runtime,
 				getGoalModeState: () => harness.getState(),
+				settings: Settings.isolated({ "todo.enabled": true, "todo.reminders": true }),
+				isToolActive: name => name === "todo",
+				getTodoPhases: () => [{ name: "Pending", tasks: [{ content: "Open task", status: "pending" }] }],
 			}),
 		);
 

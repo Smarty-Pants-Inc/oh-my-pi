@@ -7494,7 +7494,7 @@
     },
     {
       "path": "packages/coding-agent/src/goals/runtime.ts",
-      "sha256": "4dbe96fcb26730aa0d900d00ec535eec1d11a51442319409c760f7ce28f1ee8c"
+      "sha256": "e4f2804fe52c56df2a6ade2799bf75e30f7c2dbead29ec387875ee0dd66b6962"
     },
     {
       "path": "packages/coding-agent/src/goals/state.ts",
@@ -7502,7 +7502,7 @@
     },
     {
       "path": "packages/coding-agent/src/goals/tools/goal-tool.ts",
-      "sha256": "ab6197afffee203cc5ad05e502ba57f9c6f1a1a53b3b00d80bfc74a855d0805d"
+      "sha256": "84ea8cdfadade2ffe8012a014b07c469f6328f6b27eee5b384e63205997712de"
     },
     {
       "path": "packages/coding-agent/src/hindsight/backend.ts",
@@ -8462,7 +8462,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/agent-session.ts",
-      "sha256": "5e029489acc9ed1f3e0d29de6ae17908378dfe333a6bcf5ff36099b6893e0a50"
+      "sha256": "da697da3067191131b655228e185ea4ceae235d27fb52aee6f25fdb916528b80"
     },
     {
       "path": "packages/coding-agent/src/session/agent-storage.ts",
@@ -8714,7 +8714,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/todo-tracker.ts",
-      "sha256": "dcbe22ae07de46ba910b4ae4d286cbfb00460287c8c2254e137d49dbfa06a433"
+      "sha256": "d3af2c85d289e068373a3a4c60dc28ecc9d2c0f1dbed58f40fb71571fef1bc87"
     },
     {
       "path": "packages/coding-agent/src/session/tool-choice-queue.ts",
@@ -10742,9 +10742,9 @@
     },
     {
       "path": "packages/wire/src/index.ts",
-      "sha256": "269cf425f1f6ef1a74a3e5443db6c01e10e93504c38e6e8c0c367479981ff507"
+      "sha256": "15d6362cb54ac8ec37347b6b13db02336e2da259617a9076f52f978a12141f7c"
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "7d62f7a1365959f5fa7d462dd51e1a7a9abe4be733c70e3cb863dd7dc55d62e9"
+  "rootSha256": "91fa7e993718fe5cedc8b830deee909767d117778356c703805678221e4b1171"
 }

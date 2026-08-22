@@ -73,6 +73,34 @@ describe("RpcClient lifecycle (issue #4079 B)", () => {
 		}
 	}, 20_000);
 
+	test("waits for a queued steer to settle instead of retaining a prior rejected closure", async () => {
+		using client = new RpcClient({
+			cliPath: MOCK_AGENT,
+			env: { MOCK_RPC_V2: "1", MOCK_RPC_CLOSURE_REJECTED: "1", MOCK_RPC_QUEUED_TERMINAL: "1" },
+		});
+
+		await client.start();
+		await client.prompt("first prompt");
+		await expect(client.waitForIdle()).rejects.toThrow("Completion rejected: 1 incomplete todo item(s) remain.");
+
+		await client.steer("Continue with the corrected request.");
+		await expect(client.waitForIdle()).resolves.toBeUndefined();
+	}, 20_000);
+
+	test("waits for a queued follow-up to settle instead of retaining a prior rejected closure", async () => {
+		using client = new RpcClient({
+			cliPath: MOCK_AGENT,
+			env: { MOCK_RPC_V2: "1", MOCK_RPC_CLOSURE_REJECTED: "1", MOCK_RPC_QUEUED_TERMINAL: "1" },
+		});
+
+		await client.start();
+		await client.prompt("first prompt");
+		await expect(client.waitForIdle()).rejects.toThrow("Completion rejected: 1 incomplete todo item(s) remain.");
+
+		await client.followUp("Continue with the corrected request.");
+		await expect(client.waitForIdle()).resolves.toBeUndefined();
+	}, 20_000);
+
 	test("fails closed when closure capability was not negotiated", async () => {
 		using client = new RpcClient({
 			cliPath: MOCK_AGENT,

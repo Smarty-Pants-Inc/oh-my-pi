@@ -215,6 +215,13 @@ for await (const raw of console) {
 				continue;
 			}
 
+			if ((frame.type === "steer" || frame.type === "follow_up") && Bun.env.MOCK_RPC_QUEUED_TERMINAL === "1") {
+				writeFrame({ id, type: "response", command: frame.type, success: true, data: {} });
+				await Bun.sleep(50);
+				writeFrame({ type: "agent_end", messages: [], isTerminal: true });
+				continue;
+			}
+
 			writeFrame({
 				id,
 				type: "response",

@@ -11,6 +11,8 @@ import textwrap
 import threading
 import time
 import unittest
+from unittest.mock import patch
+
 
 from omp_rpc import (
     AgentEndEvent,
@@ -1337,6 +1339,66 @@ class RpcClientTests(unittest.TestCase):
                 tuple(todo.content for todo in closure_rejected.todos),
                 ("Finish Python RPC task",),
             )
+
+    def test_rejected_terminal_event_publishes_error_before_waiters_observe_completion(
+        self,
+    ) -> None:
+        client = self.make_client()
+        client._scheduled_agent_runs = 1
+        client._stopping = True
+        terminal = json.dumps(
+            {
+                "type": "agent_end",
+                "messages": [],
+                "closureRejected": {
+                    "reason": "stale_todos",
+                    "todos": [{"content": "Finish race", "status": "pending"}],
+                },
+            }
+        )
+
+        class FakeProcess:
+            stdout = (f"{terminal}\n",)
+
+        client._process = FakeProcess()  # type: ignore[assignment]
+        waiter_ready = threading.Event()
+        waiter_finished = threading.Event()
+        outcomes: list[BaseException | None] = []
+        original_event_index = client._current_event_index
+        original_append_async_error = client._append_async_error
+
+        def capture_event_index() -> int:
+            waiter_ready.set()
+            return original_event_index()
+
+        def append_error_after_waiter(error: BaseException) -> None:
+            waiter_finished.wait(timeout=1.0)
+            original_append_async_error(error)
+
+        def wait_for_terminal() -> None:
+            try:
+                client.wait_for_idle(timeout=1.0)
+            except BaseException as error:
+                outcomes.append(error)
+            else:
+                outcomes.append(None)
+            finally:
+                waiter_finished.set()
+
+        with patch.object(client, "_current_event_index", side_effect=capture_event_index):
+            waiter = threading.Thread(target=wait_for_terminal)
+            waiter.start()
+            self.assertTrue(waiter_ready.wait(timeout=1.0))
+            with patch.object(client, "_append_async_error", side_effect=append_error_after_waiter):
+                reader = threading.Thread(target=client._read_stdout_loop)
+                reader.start()
+                waiter.join(timeout=1.0)
+                reader.join(timeout=1.0)
+
+        self.assertFalse(waiter.is_alive())
+        self.assertFalse(reader.is_alive())
+        self.assertEqual(len(outcomes), 1)
+        self.assertIsInstance(outcomes[0], RpcError)
 
     def test_wait_helpers_ignore_nonterminal_agent_end(self) -> None:
         received: list[AgentEndEvent] = []

@@ -584,6 +584,7 @@ export class RpcClient {
 	 * Queue a steering message to interrupt the agent mid-run.
 	 */
 	async steer(message: string, images?: ImageContent[]): Promise<void> {
+		this.#terminalOutcome = undefined;
 		await this.#send({ type: "steer", message, images });
 	}
 
@@ -591,6 +592,7 @@ export class RpcClient {
 	 * Queue a follow-up message to be processed after the agent finishes.
 	 */
 	async followUp(message: string, images?: ImageContent[]): Promise<void> {
+		this.#terminalOutcome = undefined;
 		await this.#send({ type: "follow_up", message, images });
 	}
 

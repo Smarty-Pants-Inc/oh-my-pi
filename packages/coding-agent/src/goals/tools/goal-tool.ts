@@ -78,6 +78,7 @@ export class GoalTool implements AgentTool<typeof goalSchema, GoalToolDetails> {
 	readonly parameters = goalSchema;
 	readonly strict = true;
 	readonly intent = "omit" as const;
+	readonly concurrency = "exclusive";
 	readonly #session: ToolSession;
 
 	constructor(session: ToolSession) {
@@ -104,12 +105,13 @@ export class GoalTool implements AgentTool<typeof goalSchema, GoalToolDetails> {
 			const state = this.#session.getGoalModeState?.();
 			response = buildGoalToolResponse(isCurrentGoalModeState(state) ? state.goal : null);
 		} else if (params.op === "complete") {
-			if (hasOpenTodoTasks(this.#session)) {
-				throw new ToolError(
-					"goal_completion_blocked_by_open_todos: complete or abandon pending and in-progress todo tasks before completing the goal",
-				);
-			}
-			const completed = await runtime.completeGoalFromTool();
+			const completed = await runtime.completeGoalFromTool(() => {
+				if (hasOpenTodoTasks(this.#session)) {
+					throw new ToolError(
+						"goal_completion_blocked_by_open_todos: complete or abandon pending and in-progress todo tasks before completing the goal",
+					);
+				}
+			});
 			response = buildGoalToolResponse(completed, { includeCompletionReport: true });
 		} else {
 			const blocked = await runtime.blockGoalFromTool();

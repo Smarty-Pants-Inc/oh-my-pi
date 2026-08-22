@@ -3901,6 +3901,7 @@ export class AgentSession {
 					if (completion) {
 						this.#lastSuccessfulYieldToolCallId = undefined;
 						maintenanceRoute("successful-yield-closure-rejected");
+						await this.#emitSessionStopEvent(activeMessages, msg);
 						await emitAgentEndNotification({ closureRejected: completion });
 						return;
 					}
@@ -4101,6 +4102,7 @@ export class AgentSession {
 				}
 				if (completion) {
 					maintenanceRoute("todo-closure-rejected");
+					await this.#emitSessionStopEvent(activeMessages, msg);
 					await emitAgentEndNotification({ closureRejected: completion });
 					return;
 				}
@@ -7163,7 +7165,7 @@ export class AgentSession {
 			this.#eval.flushPending();
 			this.#irc.flushPending();
 
-			this.#todo.resetCycle();
+			this.#todo.startCycle();
 			this.#resetPromptMaintenanceState();
 			this.#recovery.setAcceptTerminalEmptyStop(options?.acceptTerminalEmptyStop === true);
 
@@ -9433,6 +9435,9 @@ export class AgentSession {
 	#isTerminalToolResult(event: { toolName: string; isError?: boolean; result?: { details?: unknown } }): boolean {
 		if (event.isError) return false;
 		if (this.#isTerminalYieldToolResult(event)) return true;
+		if (event.toolName === "goal" && isRecord(event.result?.details) && event.result.details.op === "complete") {
+			return true;
+		}
 		const tool = this.agent.state.tools.find(
 			candidate => candidate.name === event.toolName || candidate.customWireName === event.toolName,
 		);

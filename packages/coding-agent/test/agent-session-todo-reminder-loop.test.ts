@@ -215,7 +215,7 @@ describe("AgentSession stop-time todo notifications", () => {
 		expect(continueSpy).not.toHaveBeenCalled();
 	});
 
-	it("rejects a later user turn while actionable todos remain", async () => {
+	it("caps stale todo reminders across later user prompts", async () => {
 		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
 		emitTextOnlyStop();
 		await session.waitForIdle();
@@ -223,11 +223,13 @@ describe("AgentSession stop-time todo notifications", () => {
 			emitTextOnlyStop("The tracked work is still incomplete.");
 		});
 
-		await session.prompt("Continue the tracked work.");
-		await session.waitForIdle();
+		for (let turn = 0; turn < 3; turn++) {
+			await session.prompt("Continue the tracked work.");
+			await session.waitForIdle();
+		}
 
-		expect(reminderAttempts).toEqual([1, 1]);
-		expect(agentEndTerminalStates).toEqual([true, true]);
+		expect(reminderAttempts).toEqual([1, 2, 3]);
+		expect(agentEndTerminalStates).toEqual([true, true, true, true]);
 		expect(continueSpy).not.toHaveBeenCalled();
 	});
 

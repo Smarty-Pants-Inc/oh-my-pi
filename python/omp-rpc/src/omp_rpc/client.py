@@ -1983,13 +1983,17 @@ class RpcClient:
                     continue
 
                 event = cast(RpcAgentEvent, notification)
-                self._append_event(payload)
-                if isinstance(event, AgentEndEvent):
-                    closure_error = _closure_rejected_error(event)
-                    if closure_error is not None:
-                        self._append_async_error(closure_error)
-                    if closure_error is not None or event.is_terminal is not False:
-                        self._mark_agent_run_completed()
+                closure_error = (
+                    _closure_rejected_error(event)
+                    if isinstance(event, AgentEndEvent)
+                    else None
+                )
+                self._publish_agent_event(
+                    payload,
+                    closure_error=closure_error,
+                    completed=closure_error is not None
+                    or (isinstance(event, AgentEndEvent) and event.is_terminal is not False),
+                )
                 self._dispatch_listeners(
                     "event", event.type, self._event_listeners, event
                 )
@@ -2110,9 +2114,19 @@ class RpcClient:
             return None
         return RpcProtocolError(_clone_json_object(payload))
 
-    def _append_event(self, payload: JsonObject) -> None:
+    def _publish_agent_event(
+        self,
+        payload: JsonObject,
+        *,
+        closure_error: BaseException | None = None,
+        completed: bool = False,
+    ) -> None:
         with self._event_condition:
             self._events.append(_clone_json_object(payload))
+            if closure_error is not None:
+                self._async_errors.append(closure_error)
+            if completed:
+                self._completed_agent_runs += 1
             self._event_condition.notify_all()
 
     def _append_async_error(self, error: BaseException) -> None:

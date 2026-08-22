@@ -122,7 +122,12 @@ export class TodoTracker {
 		return this.#clonePhases(phases);
 	}
 
-	/** Resets the stop-time reminder state for a new prompt. */
+	/** Starts a new prompt without resetting the session-wide reminder cap. */
+	startCycle(): void {
+		this.#stopReminderSent = false;
+	}
+
+	/** Resets the stop-time reminder state for a new session. */
 	resetCycle(): void {
 		this.#reminderCount = 0;
 		this.#stopReminderSent = false;
@@ -231,7 +236,11 @@ export class TodoTracker {
 		const todos = this.phases
 			.flatMap(phase => phase.tasks)
 			.filter(task => task.status === "pending" || task.status === "in_progress");
-		if (todos.length === 0) return undefined;
+		if (todos.length === 0) {
+			this.#reminderCount = 0;
+			this.#stopReminderSent = false;
+			return undefined;
+		}
 		if (this.#host.hasPendingAsyncWake()) return "deferred";
 		const maxAttempts = this.#host.settings.get("todo.remindersMax");
 		if (!this.#stopReminderSent && this.#reminderCount < maxAttempts) {

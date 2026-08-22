@@ -407,8 +407,10 @@ export type WireFrame = GuestFrame | HostFrame;
  *   host), so they must be rejected at hello.
  * - `4`: guest prompts may carry a display name, and persisted prompt details
  *   carry the display-name revision used by identity-aware renderers.
+ * - `5`: terminal `agent_end` frames may carry `closureRejected`, so guests
+ *   can distinguish stale-todo closure failures from successful settles.
  */
-export const COLLAB_PROTO = 4;
+export const COLLAB_PROTO = 5;
 
 /** Parameter key used for intent tracing (e.g. prompt explanation/reasoning) */
 export const INTENT_FIELD = "i";
