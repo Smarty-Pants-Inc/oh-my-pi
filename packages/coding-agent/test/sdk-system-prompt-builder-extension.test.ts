@@ -73,6 +73,9 @@ function writeMaterializedPromptBuilderPackage(
 	const tree = "b".repeat(40);
 	const version = "0.20.11";
 	const createdAt = "2026-08-22";
+	const stackRoot = path.join(root, ".smarty-stack");
+	const packageRoot = path.join(stackRoot, "versions", version);
+	const currentRoot = path.join(stackRoot, "current");
 	const sourcePath = "extensions/smarty-prompt-guard/src/index.ts";
 	const mismatchSource = mismatchTriggerPath
 		? `\t\tif (await Bun.file(${JSON.stringify(mismatchTriggerPath)}).exists()) return { systemPrompt: ["mismatch"] };\n`
@@ -117,7 +120,7 @@ ${mismatchSource}		return context.build(context.templates);
 		],
 	]);
 	for (const [relative, source] of sources) {
-		const absolute = path.join(root, relative);
+		const absolute = path.join(packageRoot, relative);
 		fs.mkdirSync(path.dirname(absolute), { recursive: true });
 		fs.writeFileSync(absolute, source);
 	}
@@ -139,18 +142,28 @@ ${mismatchSource}		return context.build(context.templates);
 		null,
 		2,
 	)}\n`;
-	fs.writeFileSync(path.join(root, "MANIFEST.json"), manifestSource);
+	fs.writeFileSync(path.join(packageRoot, "MANIFEST.json"), manifestSource);
 	const checksumSources = new Map(sources);
 	checksumSources.set("MANIFEST.json", manifestSource);
 	fs.writeFileSync(
-		path.join(root, "SHA256SUMS.txt"),
+		path.join(packageRoot, "SHA256SUMS.txt"),
 		[...checksumSources]
 			.sort(([left], [right]) => compareUnicodeCodePoints(left, right))
 			.map(([relative, source]) => `${sha256(source)}  ${relative}\n`)
 			.join(""),
 	);
+	fs.symlinkSync(path.join("versions", version), currentRoot);
+	const chmodTree = (directory: string): void => {
+		for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+			const target = path.join(directory, entry.name);
+			if (entry.isDirectory()) chmodTree(target);
+			else if (entry.isFile()) fs.chmodSync(target, 0o444);
+		}
+		fs.chmodSync(directory, 0o555);
+	};
+	chmodTree(packageRoot);
 	return {
-		sourcePath: path.join(root, sourcePath),
+		sourcePath: path.join(currentRoot, sourcePath),
 		release: {
 			candidates: [{ repository, commit, tree }],
 		} as unknown as ContextReleaseManifest,
@@ -307,6 +320,7 @@ describe("extension system prompt builders", () => {
 			).rejects.toThrow("PROMPT_POLICY_REVIEW_REQUIRED: an approved system prompt builder is required");
 
 			fs.rmSync(markerPath, { force: true });
+			fs.chmodSync(sourcePath, 0o644);
 			fs.appendFileSync(sourcePath, "// drift\n");
 			await expect(createProtectedSession(false)).rejects.toThrow(
 				"PROMPT_POLICY_REVIEW_REQUIRED: one or more configured system prompt builder sources are not approved",
