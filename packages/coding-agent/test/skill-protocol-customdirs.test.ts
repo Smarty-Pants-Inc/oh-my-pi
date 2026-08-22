@@ -48,6 +48,7 @@ describe("skill:// resolution honors skills.customDirectories (#7190)", () => {
 		const handler = new SkillProtocolHandler();
 		const resource = await handler.resolve(parseInternalUrl("skill://my-custom-skill/"));
 		expect(resource.sourcePath).toBe(path.join(skillDir, "SKILL.md"));
+		expect(resource.isDirectory).toBe(false);
 		expect(resource.content).toContain(`from ${tempDir}`);
 	});
 

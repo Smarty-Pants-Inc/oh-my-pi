@@ -247,6 +247,7 @@ describe("MemoryProtocolHandler", () => {
 
 			expect(resource.content).toBe("second session summary");
 			expect(resource.sourcePath).toBe(await fs.realpath(secondSummaryPath));
+			expect(resource.isDirectory).toBe(false);
 		} finally {
 			setAgentDir(previousAgentDir);
 			await removeWithRetries(cleanupRoot);

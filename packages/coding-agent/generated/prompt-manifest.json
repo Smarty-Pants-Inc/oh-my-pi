@@ -7545,7 +7545,7 @@
     },
     {
       "path": "packages/coding-agent/src/internal-urls/artifact-protocol.ts",
-      "sha256": "222f9c399d20921922a1a87617a8a2175b0a9cf3ba07cacaee6b017b4e8f3c10"
+      "sha256": "f10e017a93204a0141f634b4afbcbcd3151219815d01463eeb96824bb102a84b"
     },
     {
       "path": "packages/coding-agent/src/internal-urls/docs-index.ts",
@@ -7573,7 +7573,7 @@
     },
     {
       "path": "packages/coding-agent/src/internal-urls/local-protocol.ts",
-      "sha256": "ce39d919598d565d9e02dd93c4ef4a2200f83b0b08da6561200c6b1f99de4498"
+      "sha256": "6d92aa262fb00e363dcbfe564423aae52696dcfb7ced9a939a1455b090f63cea"
     },
     {
       "path": "packages/coding-agent/src/internal-urls/mcp-protocol.ts",
@@ -7581,7 +7581,7 @@
     },
     {
       "path": "packages/coding-agent/src/internal-urls/memory-protocol.ts",
-      "sha256": "cc666467933eb29a68b6319060b4f36982690b4b4f9ce11d35199fcc6adbd37b"
+      "sha256": "e588c134258505b6a2904db917c81e3e144531d9c1574cf0be1f4b0553dc8a4f"
     },
     {
       "path": "packages/coding-agent/src/internal-urls/omp-protocol.ts",
@@ -7609,7 +7609,7 @@
     },
     {
       "path": "packages/coding-agent/src/internal-urls/skill-protocol.ts",
-      "sha256": "d73fdff48a965606a5a4cab55ebdc44ab353ca856548fcc94b292d676535bbb4"
+      "sha256": "0f976843bc587a8fccbbc70ae4ff81794642f1454f64c3e5e7ff65f504701b81"
     },
     {
       "path": "packages/coding-agent/src/internal-urls/ssh-protocol.ts",
@@ -7617,7 +7617,7 @@
     },
     {
       "path": "packages/coding-agent/src/internal-urls/vault-protocol.ts",
-      "sha256": "9e872624970eda00bff26e36c8556fc93eb7e9638cad8b096d7e51a6921011af"
+      "sha256": "a6d53d6f12c7a69125efb3467e91f3afd22e10f5311c01984695476331a01d71"
     },
     {
       "path": "packages/coding-agent/src/internal-urls/xd-protocol.ts",

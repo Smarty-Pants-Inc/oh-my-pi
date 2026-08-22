@@ -1,10 +1,13 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import * as url from "node:url";
 import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ToolExecutionComponent } from "@oh-my-pi/pi-coding-agent/modes/components/tool-execution";
 import { theme as activeTheme, getThemeByName, initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
-import { readToolRenderer } from "@oh-my-pi/pi-coding-agent/tools/read";
+import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { ReadTool, readToolRenderer } from "@oh-my-pi/pi-coding-agent/tools/read";
 import type { TUI } from "@oh-my-pi/pi-tui";
 
 function extractLinkUris(text: string): string[] {
@@ -61,6 +64,45 @@ describe("readToolRenderer hyperlinks", () => {
 		expect(extractLinkUris(rendered)).toContain(handoffUri.href);
 		expect(extractLinkTexts(rendered)).toContain("local://handoff.md");
 		expect(extractLinkTexts(rendered)).not.toContain("local://handoff.md:2");
+	});
+
+	it("links an actual skill protocol read after regular-file confirmation", async () => {
+		settings.override("tui.hyperlinks", "always");
+		const theme = await getThemeByName("dark");
+		expect(theme).toBeDefined();
+
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-read-renderer-skill-"));
+		try {
+			const skillDir = path.join(tempDir, "demo");
+			const skillPath = path.join(skillDir, "SKILL.md");
+			await fs.mkdir(skillDir, { recursive: true });
+			await fs.writeFile(skillPath, "# Demo\n");
+			const session: ToolSession = {
+				cwd: tempDir,
+				hasUI: false,
+				getSessionFile: () => null,
+				getSessionSpawns: () => "*",
+				settings: Settings.isolated(),
+				skills: [
+					{
+						name: "demo",
+						description: "Demo skill",
+						filePath: skillPath,
+						baseDir: skillDir,
+						source: "test",
+					},
+				],
+			};
+			const result = await new ReadTool(session).execute("read-skill-link", { path: "skill://demo" });
+
+			expect(result.details?.isDirectory).toBe(false);
+			const component = readToolRenderer.renderResult(result, { expanded: false, isPartial: false }, theme!, {
+				path: "skill://demo",
+			});
+			expect(extractLinkUris(component.render(200).join("\n"))).toContain(url.pathToFileURL(skillPath).href);
+		} finally {
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
 	});
 
 	it("does not speculate file links for pending absolute read calls", async () => {

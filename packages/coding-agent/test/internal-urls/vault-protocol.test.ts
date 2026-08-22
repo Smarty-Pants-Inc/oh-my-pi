@@ -158,6 +158,7 @@ describe("VaultProtocolHandler", () => {
 			expect(resource.content).toBe("# Note\nbody");
 			expect(resource.contentType).toBe("text/markdown");
 			expect(resource.sourcePath).toBe(await fs.realpath(note));
+			expect(resource.isDirectory).toBe(false);
 			expect(spawnSpy).not.toHaveBeenCalled();
 		});
 	});
