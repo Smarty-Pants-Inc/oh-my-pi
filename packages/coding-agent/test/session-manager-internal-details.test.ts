@@ -12,7 +12,13 @@
  * `__`-prefixed fields not in the allowlist) is preserved verbatim.
  */
 import { describe, expect, it } from "bun:test";
-import { type SkillPromptDetails, stripInternalDetailsFields } from "@oh-my-pi/pi-coding-agent/session/messages";
+import {
+	readPendingSemanticDeliveryId,
+	readQueueChipText,
+	type SkillPromptDetails,
+	stripInternalDetailsFields,
+	withInternalDetailsField,
+} from "@oh-my-pi/pi-coding-agent/session/messages";
 import type { CustomMessageEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 
@@ -126,5 +132,24 @@ describe("SessionManager.appendCustomMessageEntry (allowlist strip + persistence
 		for (const key of Object.keys(input)) {
 			expect(Object.hasOwn(result as object, key)).toBe(true);
 		}
+	});
+
+	it("F6: internal metadata injection and stripping preserve array-valued extension details", () => {
+		const input = Object.assign([{ messageId: "one" }, { messageId: "two" }], { __future_field: "preserve-me" });
+		const withPending = withInternalDetailsField(input, "__pendingSemanticDeliveryId", "pending-1");
+		const withQueueChip = withInternalDetailsField(withPending, "__queueChipText", "Queued");
+
+		expect(Array.isArray(withQueueChip)).toBe(true);
+		expect(withQueueChip).not.toBe(input);
+		expect([...withQueueChip]).toEqual(input);
+		expect(readPendingSemanticDeliveryId(withQueueChip)).toBe("pending-1");
+		expect(readQueueChipText(withQueueChip)).toBe("Queued");
+
+		const stripped = stripInternalDetailsFields(withQueueChip);
+		expect(Array.isArray(stripped)).toBe(true);
+		expect([...(stripped as typeof input)]).toEqual([...input]);
+		expect((stripped as typeof input).__future_field).toBe("preserve-me");
+		expect(readPendingSemanticDeliveryId(stripped)).toBeUndefined();
+		expect(readQueueChipText(stripped)).toBeUndefined();
 	});
 });

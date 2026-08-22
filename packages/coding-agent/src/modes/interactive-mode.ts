@@ -755,6 +755,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		return this.#focusController.unfocus();
 	}
 	clearTransientSessionUi(): void {
+		this.#uiHelpers.stopQueuedPromptEditing(false);
 		if (this.loadingAnimation) {
 			this.loadingAnimation.stop();
 			this.loadingAnimation = undefined;
@@ -4694,6 +4695,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#uiHelpers.updatePendingMessagesDisplay();
 	}
 
+	editQueuedPrompts(): void {
+		this.#uiHelpers.editQueuedPrompts();
+	}
+
 	queueCompactionMessage(text: string, mode: "steer" | "followUp", images?: ImageContent[]): void {
 		this.#uiHelpers.queueCompactionMessage(text, mode, images);
 	}
@@ -5146,7 +5151,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	handleDequeue(): void {
-		this.#inputController.handleDequeue();
+		void this.#inputController.handleDequeue();
 	}
 
 	handleImagePaste(): Promise<boolean> {

@@ -601,8 +601,10 @@ describe("AgentSession advisor auto-resume suppression", () => {
 		running.catch(() => {});
 	});
 
-	it("persists a stranded IRC aside while keeping a blocked follow-up queued", async () => {
-		const { session, sessionManager, mock, streamStarted } = await createParkedSession();
+	it("resumes a blocked follow-up after it is retimed to steer", async () => {
+		const { session, sessionManager, mock, streamStarted } = await createParkedSession([
+			{ content: ["resumed after retime"] },
+		]);
 		const running = session.prompt("do the thing");
 		await streamStarted;
 		// The user queues a follow-up (Ctrl+Enter) and an IRC ping lands as an aside...
@@ -622,5 +624,15 @@ describe("AgentSession advisor auto-resume suppression", () => {
 		expect(userMessageText([...session.agent.peekFollowUpQueue()])).toContain("then add the test");
 		expect(userMessageText(session.agent.state.messages)).not.toContain("then add the test");
 		expect(mock.calls.length).toBe(1);
+
+		const queuedId = session.getQueuedPrompts().find(prompt => prompt.text === "then add the test")?.id;
+		if (!queuedId) throw new Error("Expected blocked follow-up prompt");
+		await expect(session.setQueuedPromptDelivery(queuedId, "steer")).resolves.toEqual({ status: "updated" });
+		await session.waitForIdle();
+
+		expect(session.agent.peekFollowUpQueue()).toEqual([]);
+		expect(session.agent.peekSteeringQueue()).toEqual([]);
+		expect(userMessageText(session.agent.state.messages)).toContain("then add the test");
+		expect(mock.calls.length).toBe(2);
 	});
 });

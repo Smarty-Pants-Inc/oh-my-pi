@@ -381,6 +381,7 @@ export type ReadonlySessionManager = Pick<
 	| "getSessionId"
 	| "getSessionFile"
 	| "getSessionName"
+	| "onSessionNameChanged"
 	| "getArtifactsDir"
 	| "getArtifactManager"
 	| "allocateArtifactPath"
@@ -1004,7 +1005,7 @@ export class SessionManager {
 				if (!sessionFile) return false;
 				if (this.#diskEpoch !== epoch) return false;
 				await this.#storage.writeTextAtomic(sessionFile, this.#fileBody(), {
-					commitGuard: () => !this.#released && this.#diskEpoch === epoch,
+					commitGuard: () => !this.#released && this.#diskEpoch === epoch && !this.#atomicRewriteDirty,
 				});
 				if (this.#diskEpoch !== epoch) return false;
 			} while (this.#atomicRewriteDirty);

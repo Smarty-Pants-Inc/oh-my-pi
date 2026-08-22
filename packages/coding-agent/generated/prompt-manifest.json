@@ -4641,7 +4641,7 @@
     },
     {
       "path": "packages/agent/src/agent.ts",
-      "sha256": "e1e1added82ec7c7d7313a620ad593cf0a0fb2ee100ae2fdcaf0d47a20c1d9d6"
+      "sha256": "5ba5144bc7c77b861008f9dd2fd94118111473ea1209a5219f299b1b262aeaa5"
     },
     {
       "path": "packages/agent/src/append-only-context.ts",
@@ -6449,7 +6449,7 @@
     },
     {
       "path": "packages/coding-agent/src/collab/herdr-bridge-bootstrap.ts",
-      "sha256": "e2c5a6075b44cbbb3d95ab4ef06ec3ca7884f29a11198f479c32b59bebbfbfdf"
+      "sha256": "501b3818ffacbc0a303feb9ecc3274ae22d7eac89e72415394e256c1f32985cf"
     },
     {
       "path": "packages/coding-agent/src/collab/host.ts",
@@ -7369,7 +7369,7 @@
     },
     {
       "path": "packages/coding-agent/src/extensibility/extensions/loader.ts",
-      "sha256": "ae64dbf04d34d2dd91dc6c8fbecc6b1e44abf74f6873107de5630dc1f84511f3"
+      "sha256": "21f0611ffe8804867427c4e0f5b498cd6e5eeb579a33009389ffdb706335c280"
     },
     {
       "path": "packages/coding-agent/src/extensibility/extensions/managed-timers.ts",
@@ -7381,11 +7381,11 @@
     },
     {
       "path": "packages/coding-agent/src/extensibility/extensions/runner.ts",
-      "sha256": "6e783bf51392062159ef280828592e207d7b19faa1af07178041aa31be40fb03"
+      "sha256": "d68ddacfdb5715b439a91e44323351cc0c0ecbc22c9987fe0a7f9a35456b02d6"
     },
     {
       "path": "packages/coding-agent/src/extensibility/extensions/types.ts",
-      "sha256": "a97f46c6af928d71264e2f539c42040808cb51c5ec683b49e34135370de1547c"
+      "sha256": "47347f8ed60ccce77cac27256bd29ea4c736d3e45cc4869e210be2f0d4182a89"
     },
     {
       "path": "packages/coding-agent/src/extensibility/extensions/wrapper.ts",
@@ -7985,7 +7985,7 @@
     },
     {
       "path": "packages/coding-agent/src/modes/acp/acp-agent.ts",
-      "sha256": "cb98566bfddf4ff18201d4157163d0f9a7e2c1779d8b454702ef7ea6b00a5915"
+      "sha256": "4dfa67d12125edaf66098c916d566c777a037f4528f2bc60bd6d32d63d7ab030"
     },
     {
       "path": "packages/coding-agent/src/modes/acp/acp-client-bridge.ts",
@@ -8025,7 +8025,7 @@
     },
     {
       "path": "packages/coding-agent/src/modes/components/custom-editor.ts",
-      "sha256": "340b48d2024d96df02a249b63b569dec02d27a7eb27d9b4cb604c9ba8713379a"
+      "sha256": "6b719f39a95562896470948b8f3599c36bac6a789f45b7d9a9d29669ff273eef"
     },
     {
       "path": "packages/coding-agent/src/modes/components/extensions/extension-dashboard.ts",
@@ -8145,11 +8145,11 @@
     },
     {
       "path": "packages/coding-agent/src/modes/controllers/extension-ui-controller.ts",
-      "sha256": "4ef1910c009cfc83aa68b7e2b1ec72025ede7bcce3c2eff6dc1715f4995f2682"
+      "sha256": "461d5e161dead9d7713018cdc2213830bf4d43fdfaf09da177a9b328102c7870"
     },
     {
       "path": "packages/coding-agent/src/modes/controllers/input-controller.ts",
-      "sha256": "b4eba4814c556c019943c2d653fca893e8e401f3d1c7691e60ee73421be36c68"
+      "sha256": "7ee1b14923435aa8f00654a8eb574cfeb8ab21a4205b378c4ce480e89f51c596"
     },
     {
       "path": "packages/coding-agent/src/modes/controllers/live-command-controller.ts",
@@ -8209,7 +8209,7 @@
     },
     {
       "path": "packages/coding-agent/src/modes/interactive-mode.ts",
-      "sha256": "64d8b64ccb382165ef9840c82d647b5df4600052b98614c5daf8b8adbd0ed02c"
+      "sha256": "2386894fe78da5cc3b71470031b7da8323c43525d88be68149a81fbbb1d760a9"
     },
     {
       "path": "packages/coding-agent/src/modes/loop-limit.ts",
@@ -8249,11 +8249,11 @@
     },
     {
       "path": "packages/coding-agent/src/modes/rpc/rpc-mode.ts",
-      "sha256": "987a5d7a989723c880f751905055b4fdc8a2ffbb2e5f35e8a35ac8eabd4226a3"
+      "sha256": "673f23e8587da7e350c046f8c7d6af32c152bda996c6f30e99722324473ca620"
     },
     {
       "path": "packages/coding-agent/src/modes/runtime-init.ts",
-      "sha256": "d1b7401731126f6190c2eb35cde0989fbbc960191149967f71bdd5035244577f"
+      "sha256": "3b9fb75690bf99ad537a60b1319e7a29b6822ca86d8d92ca1941bca2b033e577"
     },
     {
       "path": "packages/coding-agent/src/modes/session-teardown.ts",
@@ -8301,7 +8301,7 @@
     },
     {
       "path": "packages/coding-agent/src/modes/utils/ui-helpers.ts",
-      "sha256": "b56c29333744b5a059af91d45d838d0f065a067881ec66772bbd84b48e6cc128"
+      "sha256": "fb4c6cbb9096b8451c2f8512f0b2b3d75368e7a3ffe12e2ebfe6c3cb7e3058a2"
     },
     {
       "path": "packages/coding-agent/src/modes/workflow.ts",
@@ -8453,7 +8453,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/agent-session.ts",
-      "sha256": "f1fe9e95eaa5f8a3064e242f7f334e769b1c44c5e4ad488ca857907460718411"
+      "sha256": "af7ed6169706dee58b4d66238237ada82c13ff47b393b88623fcde930920117e"
     },
     {
       "path": "packages/coding-agent/src/session/agent-storage.ts",
@@ -8561,7 +8561,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/messages.ts",
-      "sha256": "623653150b77af6edcf083ef14f39b3dc22bf5700c6fcce53b031f3d4ced4789"
+      "sha256": "c809545ecce4e95a77cc4390602269b68ef2de527991d290eb39d71b1dcd41ae"
     },
     {
       "path": "packages/coding-agent/src/session/model-controls.ts",
@@ -8633,7 +8633,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/session-manager.ts",
-      "sha256": "5e04c771a92357abc16f4f893a1a502092304890571ad324c2f5743d28a116e0"
+      "sha256": "72b0065e77b62cc529e78d58e3f772806613bac5654715f4d361d3581046a5de"
     },
     {
       "path": "packages/coding-agent/src/session/session-memory.ts",
@@ -8897,7 +8897,7 @@
     },
     {
       "path": "packages/coding-agent/src/task/executor.ts",
-      "sha256": "c9e96031e9f18b56ccce333cfe7c853735a88940640e13f4afa3c6bce566bed3"
+      "sha256": "97f73f71be2191f3bdb6ae8b462013801ced819d1777a554893d1830fe820140"
     },
     {
       "path": "packages/coding-agent/src/task/index.ts",
@@ -10737,5 +10737,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "efd3670b7fef84a4a6bac4d5469de4820628c86b7c0a90e4e23d26d200233ef5"
+  "rootSha256": "8d1220fb9c045885c3271d613e774eb0ba0cdbed83e182157d9ab8dc8d06291d"
 }

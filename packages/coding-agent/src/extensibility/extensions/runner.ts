@@ -55,6 +55,8 @@ import type {
 	InputEventResult,
 	McpNotificationEvent,
 	MessageRenderer,
+	QueuedPrompt,
+	QueuedPromptDelivery,
 	RegisteredCommand,
 	RegisteredTool,
 	ResourcesDiscoverEvent,
@@ -67,6 +69,7 @@ import type {
 	SessionMutationEvent,
 	SessionStopEvent,
 	SessionStopEventResult,
+	SetQueuedPromptDeliveryResult,
 	SystemPromptBuilder,
 	TerminalInputHandler,
 	ToolApprovalRequestedEvent,
@@ -508,6 +511,13 @@ export class ExtensionRunner {
 	#waitForIdleFn: () => Promise<void> = async () => {};
 	#abortFn: () => void | Promise<void> = () => {};
 	#hasPendingMessagesFn: () => boolean = () => false;
+	#getQueuedPromptsFn: () => readonly QueuedPrompt[] = () => [];
+	#onQueuedPromptsChangedFn: (listener: () => void) => () => void = () => () => {};
+	#setQueuedPromptDeliveryFn: (id: string, delivery: QueuedPromptDelivery) => Promise<SetQueuedPromptDeliveryResult> =
+		async () => ({
+			status: "unavailable",
+			reason: "session_transition",
+		});
 	#getContextUsageFn: () => ContextUsage | undefined = () => undefined;
 	#compactFn: (instructionsOrOptions?: string | CompactOptions) => Promise<void> = async () => {};
 	#getSystemPromptFn: () => string[] = () => [];
@@ -761,6 +771,11 @@ export class ExtensionRunner {
 		this.#isCompactingFn = contextActions.isCompacting;
 		this.#abortFn = contextActions.abort;
 		this.#hasPendingMessagesFn = contextActions.hasPendingMessages;
+		this.#getQueuedPromptsFn = contextActions.getQueuedPrompts ?? (() => []);
+		this.#onQueuedPromptsChangedFn = contextActions.onQueuedPromptsChanged ?? (() => () => {});
+		this.#setQueuedPromptDeliveryFn =
+			contextActions.setQueuedPromptDelivery ??
+			(async () => ({ status: "unavailable", reason: "session_transition" }));
 		this.#shutdownHandler = contextActions.shutdown;
 		this.#getSystemPromptFn = contextActions.getSystemPrompt;
 
@@ -1341,6 +1356,9 @@ export class ExtensionRunner {
 			isIdle: () => this.#isIdleFn(),
 			abort: async () => await this.#abortFn(),
 			hasPendingMessages: () => this.#hasPendingMessagesFn(),
+			getQueuedPrompts: () => this.#getQueuedPromptsFn(),
+			onQueuedPromptsChanged: listener => this.#onQueuedPromptsChangedFn(listener),
+			setQueuedPromptDelivery: (id, delivery) => this.#setQueuedPromptDeliveryFn(id, delivery),
 			shutdown: () => this.#shutdownHandler(),
 			getSystemPrompt: () => this.#getSystemPromptFn(),
 			localProtocolOptions: this.localProtocolOptions,

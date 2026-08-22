@@ -51,7 +51,7 @@ import type {
 	TUI,
 } from "@oh-my-pi/pi-tui";
 import type { logger as PiLogger } from "@oh-my-pi/pi-utils";
-import type { KeybindingsManager } from "../../config/keybindings";
+import type { AppKeybinding, KeybindingsManager } from "../../config/keybindings";
 import type { ModelRegistry } from "../../config/model-registry";
 import type { ContextReleaseManifest } from "../../context/manifest";
 import type { EditToolDetails } from "../../edit";
@@ -283,6 +283,9 @@ export interface ExtensionUIContext {
 	/** Show a notification to the user. */
 	notify(message: string, type?: "info" | "warning" | "error"): void;
 
+	/** Edit one queued user prompt's delivery timing in the existing TUI queue display. */
+	editQueuedPrompts?(): void;
+
 	/** Listen to raw terminal input (interactive mode only). Returns an unsubscribe function. */
 	onTerminalInput(handler: TerminalInputHandler): () => void;
 
@@ -457,6 +460,22 @@ export interface ExtensionModelQuery {
 /** Runtime host mode exposed to Pi-compatible extensions. */
 export type ExtensionMode = "tui" | "rpc" | "json" | "print";
 
+/** Delivery boundary assigned to a user-owned queued prompt. */
+export type QueuedPromptDelivery = "interrupt" | "steer" | "afterCurrent";
+
+/** Sanitized user-owned queue item. The id is opaque and valid only while queued. */
+export interface QueuedPrompt {
+	id: string;
+	text: string;
+	delivery: QueuedPromptDelivery;
+}
+
+/** Result of an atomic queued-prompt delivery change. */
+export type SetQueuedPromptDeliveryResult =
+	| { status: "updated" }
+	| { status: "stale" }
+	| { status: "unavailable"; reason: "session_transition" | "queue_mutation" };
+
 export interface ExtensionContext {
 	/** UI methods for user interaction */
 	ui: ExtensionUIContext;
@@ -492,6 +511,12 @@ export interface ExtensionContext {
 	abort(): Promise<void>;
 	/** Whether any visible or hidden message is waiting for this session. */
 	hasPendingMessages(): boolean;
+	/** Get a sanitized snapshot of user-owned queued prompts. */
+	getQueuedPrompts(): readonly QueuedPrompt[];
+	/** Listen for changes to the sanitized queued-prompt snapshot. */
+	onQueuedPromptsChanged(listener: () => void): () => void;
+	/** Atomically change one queued user prompt's delivery boundary. */
+	setQueuedPromptDelivery(id: string, delivery: QueuedPromptDelivery): Promise<SetQueuedPromptDeliveryResult>;
 	/** Gracefully shutdown and exit. */
 	shutdown(): void;
 	/** Get the current effective system prompt. */
@@ -1456,6 +1481,8 @@ export interface ExtensionAPI {
 	registerShortcut(
 		shortcut: KeyId,
 		options: {
+			/** Register only while this exact shortcut remains bound to the named app action. */
+			whenKeybinding?: AppKeybinding;
 			description?: string;
 			handler: (ctx: ExtensionContext) => Promise<void> | void;
 		},
@@ -1728,6 +1755,8 @@ export interface ExtensionFlag {
 export interface ExtensionShortcut {
 	shortcut: KeyId;
 	description?: string;
+	/** Register only while this exact shortcut remains bound to the named app action. */
+	whenKeybinding?: AppKeybinding;
 	handler: (ctx: ExtensionContext) => Promise<void> | void;
 	extensionPath: string;
 }
@@ -1801,6 +1830,9 @@ export interface ExtensionContextActions {
 	isCompacting: () => boolean;
 	abort: () => void | Promise<void>;
 	hasPendingMessages: () => boolean;
+	getQueuedPrompts?: () => readonly QueuedPrompt[];
+	onQueuedPromptsChanged?: (listener: () => void) => () => void;
+	setQueuedPromptDelivery?: (id: string, delivery: QueuedPromptDelivery) => Promise<SetQueuedPromptDeliveryResult>;
 	shutdown: () => void;
 	getContextUsage: () => ContextUsage | undefined;
 	compact: (instructionsOrOptions?: string | CompactOptions) => Promise<void>;
