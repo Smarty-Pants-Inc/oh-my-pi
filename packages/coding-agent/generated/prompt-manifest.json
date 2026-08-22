@@ -8462,7 +8462,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/agent-session.ts",
-      "sha256": "ba32ea3e9845814e2b8bf85df713978b2cece185ee2992c5b0cb1143e5b0c5de"
+      "sha256": "5e029489acc9ed1f3e0d29de6ae17908378dfe333a6bcf5ff36099b6893e0a50"
     },
     {
       "path": "packages/coding-agent/src/session/agent-storage.ts",
@@ -8570,7 +8570,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/messages.ts",
-      "sha256": "623653150b77af6edcf083ef14f39b3dc22bf5700c6fcce53b031f3d4ced4789"
+      "sha256": "f66e33b5181f9d883168ce6376775f0aec07d93a35acddfa0115b1eb0baa79b9"
     },
     {
       "path": "packages/coding-agent/src/session/model-controls.ts",
@@ -10746,5 +10746,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "2caf5ea096018fcefd9bef4238dc904e064695469c131675839e7d92d5f43155"
+  "rootSha256": "a40b5d55dbb392fd0a3f16745be8eb8138b6ffe8ca379d9f63e0cbd3261bfa5b"
 }
