@@ -104,6 +104,7 @@ for await (const raw of console) {
 					success: true,
 					data: {
 						protocolVersion: 2,
+						idleBarrier: Bun.env.MOCK_RPC_LEGACY_V2 === "1" ? undefined : true,
 						...(closureRejectionSupported ? { closureRejection: true } : {}),
 					},
 				});
@@ -215,6 +216,11 @@ for await (const raw of console) {
 				continue;
 			}
 
+			if ((frame.type === "steer" || frame.type === "follow_up") && Bun.env.MOCK_RPC_REJECT_QUEUED === "1") {
+				writeFrame({ id, type: "response", command: frame.type, success: false, error: "rejected command" });
+				continue;
+			}
+
 			if ((frame.type === "steer" || frame.type === "follow_up") && Bun.env.MOCK_RPC_QUEUED_TERMINAL === "1") {
 				writeFrame({ id, type: "response", command: frame.type, success: true, data: {} });
 				await Bun.sleep(50);
@@ -227,7 +233,7 @@ for await (const raw of console) {
 				type: "response",
 				command: frame.type,
 				success: true,
-				data: supportsProtocolV2 ? { payload: "😀".repeat(270_000) } : {},
+				data: supportsProtocolV2 && frame.type === "get_state" ? { payload: "😀".repeat(270_000) } : {},
 			});
 		}
 	} catch {

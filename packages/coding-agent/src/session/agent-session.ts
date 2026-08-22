@@ -942,6 +942,7 @@ export class AgentSession {
 		if (
 			this.#promptInFlightCount === 0 &&
 			!this.#inFlightSettling &&
+			this.#pendingAgentEndEmit === undefined &&
 			this.#inFlightBeforeAgentEndCallbacks.length === 0 &&
 			this.#inFlightSettledCallbacks.length === 0
 		) {
@@ -1033,6 +1034,14 @@ export class AgentSession {
 			return;
 		}
 		this.#persistPassiveCustomMessages(records);
+	}
+
+	#trackIrcWakeTask(task: Promise<void>): void {
+		this.#ircWakeTasks.add(task);
+		void task.then(
+			() => this.#ircWakeTasks.delete(task),
+			() => this.#ircWakeTasks.delete(task),
+		);
 	}
 
 	async #waitForIrcWakeTasks(): Promise<void> {
@@ -1173,6 +1182,7 @@ export class AgentSession {
 			isStreaming: () => this.isStreaming,
 			planModeEnabled: () => this.#planModeState?.enabled === true,
 			emitSessionEvent: event => this.#emitSessionEvent(event),
+			trackTask: task => this.#trackIrcWakeTask(task),
 			wakeForIrc: records => this.#wakeForIrc(records),
 			runEphemeralTurn: args => this.runEphemeralTurn(args),
 		};
@@ -2506,13 +2516,42 @@ export class AgentSession {
 	}
 
 	async #waitForSessionQuiescence(signal?: AbortSignal): Promise<void> {
-		await untilAborted(signal, () => this.agent.waitForIdle());
-		await untilAborted(signal, () => this.#drainInFlightEventHandlers());
-		await this.#waitForInFlightQuiescence(signal);
-		await untilAborted(signal, () => this.#waitForIrcWakeTasks());
-		await untilAborted(signal, () => this.#advisors.waitForPendingCardEvents());
-		await untilAborted(signal, () => this.#waitForPostPromptRecovery());
-		await untilAborted(signal, () => this.#waitForIrcWakeTasks());
+		while (true) {
+			await untilAborted(signal, () => this.agent.waitForIdle());
+			const extensionEventTail = this.#queuedExtensionEvents;
+			await untilAborted(signal, extensionEventTail);
+			await untilAborted(signal, () => this.#drainInFlightEventHandlers());
+			await this.#waitForInFlightQuiescence(signal);
+			await untilAborted(signal, () => this.#waitForIrcWakeTasks());
+			await untilAborted(signal, () => this.#advisors.waitForPendingCardEvents());
+			await untilAborted(signal, () => this.#waitForPostPromptRecovery());
+			await untilAborted(signal, () => this.#waitForIrcWakeTasks());
+			await untilAborted(signal, () => this.#drainInFlightEventHandlers());
+			await this.#waitForInFlightQuiescence(signal);
+			const abort = this.#abortPromise;
+			if (abort) {
+				await untilAborted(signal, abort);
+				continue;
+			}
+			if (
+				!this.isStreaming &&
+				this.#queuedExtensionEvents === extensionEventTail &&
+				this.#abortPromise === undefined &&
+				this.#inFlightEventHandlers.size === 0 &&
+				!this.#inFlightSettling &&
+				this.#pendingAgentEndEmit === undefined &&
+				this.#inFlightBeforeAgentEndCallbacks.length === 0 &&
+				this.#inFlightSettledCallbacks.length === 0 &&
+				this.#ircWakeTasks.size === 0 &&
+				this.#postPromptTasks.size === 0 &&
+				this.#postPromptTasksPromise === undefined &&
+				this.#recovery.retryPromise === undefined &&
+				this.#ttsr.resumeGate === undefined &&
+				!this.#queuedMessageDrainScheduled
+			) {
+				return;
+			}
+		}
 	}
 	#acquireLifecycleTransitionFence(): () => void {
 		if (this.#lifecycleTransitionFenceActive) throw new Error("Lifecycle transition fence already active");
@@ -5774,13 +5813,9 @@ export class AgentSession {
 		return this.agent.isAborting;
 	}
 
-	/** Wait until streaming, event persistence, and deferred recovery work are fully settled. */
+	/** Wait until streaming, event persistence, public terminal emission, and deferred recovery work are settled. */
 	async waitForIdle(): Promise<void> {
-		await this.agent.waitForIdle();
-		await this.#waitForIrcWakeTasks();
-		await this.#advisors.waitForPendingCardEvents();
-		await this.#waitForPostPromptRecovery();
-		await this.#waitForIrcWakeTasks();
+		await this.#waitForSessionQuiescence();
 	}
 	/**
 	 * Prevent advisor notes from starting hidden primary turns while a headless

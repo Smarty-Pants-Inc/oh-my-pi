@@ -9,7 +9,7 @@
  *  T3. A plan-mode turn that stops without a decision tool call records one
  *      passive reminder, then yields to the user without a hidden turn.
  */
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
 import {
 	Agent,
@@ -282,6 +282,33 @@ describe("AgentSession plan-mode convergence", () => {
 			expect(harness.mock.calls.length).toBe(0);
 			expect(harness.session.agent.state.messages.some(m => m.role === "assistant")).toBe(false);
 		} finally {
+			registry.unregister("peer");
+		}
+	});
+
+	it("T2c: waitForIdle joins a detached IRC auto-reply", async () => {
+		const harness = await createPlanSession([]);
+		const replyGate = Promise.withResolvers<{ replyText: string; assistantMessage: never }>();
+		const runReply = vi.spyOn(harness.session, "runEphemeralTurn").mockImplementation(() => replyGate.promise);
+		const registry = AgentRegistry.global();
+		registry.register({ id: "peer", displayName: "peer", kind: "sub", session: null, status: "running" });
+		try {
+			const replyPromise = IrcBus.global().wait("peer", { from: "me" }, 0);
+			const msg: IrcMessage = { id: "m3", from: "peer", to: "me", body: "status?", ts: Date.now() };
+			await harness.session.deliverIrcMessage(msg, { expectsReply: true });
+
+			let idleSettled = false;
+			const idle = harness.session.waitForIdle().then(() => {
+				idleSettled = true;
+			});
+			for (let hop = 0; hop < 10; hop++) await Promise.resolve();
+			expect(idleSettled).toBe(false);
+
+			replyGate.resolve({ replyText: "still planning", assistantMessage: {} as never });
+			await idle;
+			expect((await replyPromise)?.replyTo).toBe("m3");
+		} finally {
+			runReply.mockRestore();
 			registry.unregister("peer");
 		}
 	});

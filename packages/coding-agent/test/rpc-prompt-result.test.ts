@@ -380,6 +380,31 @@ describe("watchAndReportLocalOnlyPromptResult", () => {
 		expect(output).toEqual([{ type: "prompt_result", id: "req_1", agentInvoked: false }]);
 	});
 
+	test("returns a task that joins a local-only abort_and_prompt lifecycle", async () => {
+		const output: object[] = [];
+		const extensionUserMessages = new RpcExtensionUserMessageTracker();
+		const prompt = Promise.withResolvers<boolean>();
+		let settled = false;
+
+		const task = watchAndReportLocalOnlyPromptResult({
+			id: "abort_1",
+			startPrompt: () => prompt.promise,
+			output: frame => output.push(frame),
+			onError: error => {
+				throw error;
+			},
+			extensionUserMessageTracker: extensionUserMessages,
+		}).then(() => {
+			settled = true;
+		});
+		await Promise.resolve();
+		expect(settled).toBe(false);
+
+		prompt.resolve(false);
+		await task;
+		expect(output).toEqual([{ type: "prompt_result", id: "abort_1", agentInvoked: false }]);
+	});
+
 	test("does not report builtin residual prompts that invoke the agent", async () => {
 		const output: object[] = [];
 		const extensionUserMessages = new RpcExtensionUserMessageTracker();

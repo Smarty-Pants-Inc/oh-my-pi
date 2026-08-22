@@ -20,14 +20,17 @@ from omp_rpc import (
     RpcCommandError,
     RpcConcurrencyError,
     RpcError,
+    RpcTimeoutError,
     host_tool,
 )
 from omp_rpc.client import _RpcFrameDecoder
+from omp_rpc.protocol import AgentStartEvent, MessageEndEvent
 
 
 FAKE_SERVER = textwrap.dedent(
     """
     import json
+    import os
     import sys
     import time
 
@@ -247,7 +250,17 @@ FAKE_SERVER = textwrap.dedent(
             payload["error"] = error
         print(json.dumps(payload), flush=True)
 
-    print(json.dumps({"type": "ready"}), flush=True)
+    ready = {"type": "ready"}
+    if os.environ.get("FAKE_RPC_V2") == "1":
+        ready.update(
+            {
+                "protocolVersion": 1,
+                "supportedProtocolVersions": [1, 2],
+                "maxFrameBytes": 1024 * 1024,
+                "maxReassembledFrameBytes": 64 * 1024 * 1024,
+            }
+        )
+    print(json.dumps(ready), flush=True)
     todo_phases = []
     messages = []
     branch_messages = [{"entryId": "entry-1", "text": "branch message"}]
@@ -275,7 +288,22 @@ FAKE_SERVER = textwrap.dedent(
             emit_prompt_turn("ui acknowledged")
             continue
 
-        if command_type == "get_state":
+        if command_type == "negotiate_protocol":
+            respond(
+                request_id,
+                command_type,
+                {
+                    "protocolVersion": 2,
+                    "closureRejection": True,
+                    "idleBarrier": True,
+                },
+            )
+        elif command_type == "wait_for_idle":
+            if os.environ.get("HANG_IDLE_BARRIER") == "1":
+                time.sleep(5.0)
+            else:
+                respond(request_id, "wait_for_idle", {})
+        elif command_type == "get_state":
             respond(request_id, "get_state", current_state())
         elif command_type == "set_host_tools":
             registered_host_tools = command.get("tools", [])
@@ -404,10 +432,36 @@ FAKE_SERVER = textwrap.dedent(
         elif command_type == "set_session_name":
             session_name = command["name"]
             respond(request_id, "set_session_name", {})
-        elif command_type in {"steer", "follow_up", "abort"}:
+        elif command_type in {"steer", "follow_up"}:
+            if command.get("message") == "reject command":
+                respond(request_id, command_type, success=False, error="rejected command")
+                continue
+            respond(request_id, command_type, {})
+            time.sleep(0.05)
+            emit_prompt_turn("resumed")
+        elif command_type == "abort":
             respond(request_id, command_type, {})
         elif command_type in {"prompt", "abort_and_prompt"}:
             message = command["message"]
+            if message == "local response":
+                respond(request_id, command_type, {"agentInvoked": False})
+                continue
+            if message == "local prompt result":
+                respond(request_id, command_type, {})
+                print(
+                    json.dumps(
+                        {
+                            "type": "prompt_result",
+                            "id": request_id,
+                            "agentInvoked": False,
+                        }
+                    ),
+                    flush=True,
+                )
+                continue
+            if message == "dropped prompt":
+                respond(request_id, command_type, {})
+                continue
             if message == "closure rejected":
                 print(
                     json.dumps(
@@ -541,6 +595,81 @@ FAKE_SERVER = textwrap.dedent(
     """
 )
 
+
+ACTIVE_TO_IDLE_STEER_RACE_SERVER = textwrap.dedent(
+    """
+    import json
+    import sys
+    import threading
+    import time
+
+    output_lock = threading.Lock()
+    steer_received = threading.Event()
+    old_turn_done = threading.Event()
+    successor_done = threading.Event()
+
+    def emit(payload):
+        with output_lock:
+            print(json.dumps(payload), flush=True)
+
+    def respond(request_id, command):
+        emit(
+            {
+                "id": request_id,
+                "type": "response",
+                "command": command,
+                "success": True,
+            }
+        )
+
+    def finish_old_turn():
+        steer_received.wait()
+        emit(
+            {
+                "type": "agent_end",
+                "messages": [],
+                "closureRejected": {
+                    "reason": "stale_todos",
+                    "todos": [{"content": "Finish predecessor", "status": "pending"}],
+                },
+            }
+        )
+        old_turn_done.set()
+
+    def finish_successor():
+        old_turn_done.wait()
+        time.sleep(0.1)
+        emit({"type": "agent_end", "messages": []})
+        successor_done.set()
+
+    emit({"type": "ready"})
+    for raw_line in sys.stdin:
+        command = json.loads(raw_line)
+        command_type = command["type"]
+        request_id = command.get("id")
+        if command_type == "prompt":
+            respond(request_id, command_type)
+            threading.Thread(target=finish_old_turn, daemon=True).start()
+        elif command_type == "steer":
+            steer_received.set()
+            threading.Thread(target=finish_successor, daemon=True).start()
+            successor_done.wait()
+            respond(request_id, command_type)
+        elif command_type == "wait_for_idle":
+            successor_done.wait()
+            respond(request_id, command_type)
+        else:
+            emit(
+                {
+                    "id": request_id,
+                    "type": "response",
+                    "command": command_type,
+                    "success": False,
+                    "error": f"unsupported: {command_type}",
+                }
+            )
+    """
+)
 
 V2_MESSAGES_SERVER = textwrap.dedent(
     """
@@ -800,6 +929,70 @@ LATE_PROMPT_FAILURE_SERVER = textwrap.dedent(
     """
 )
 
+
+OVERLAPPING_LATE_PROMPT_FAILURE_SERVER = textwrap.dedent(
+    """
+    import json
+    import sys
+    import time
+
+    def respond(request_id, command, data=None, *, success=True, error=None):
+        payload = {
+            "id": request_id,
+            "type": "response",
+            "command": command,
+            "success": success,
+        }
+        if data is not None:
+            payload["data"] = data
+        if error is not None:
+            payload["error"] = error
+        print(json.dumps(payload), flush=True)
+
+    print(
+        json.dumps(
+            {
+                "type": "ready",
+                "protocolVersion": 1,
+                "supportedProtocolVersions": [1, 2],
+                "maxFrameBytes": 1024 * 1024,
+                "maxReassembledFrameBytes": 64 * 1024 * 1024,
+            }
+        ),
+        flush=True,
+    )
+    first_prompt_id = None
+
+    for raw_line in sys.stdin:
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+
+        command = json.loads(raw_line)
+        command_type = command["type"]
+        request_id = command.get("id")
+        if command_type == "negotiate_protocol":
+            respond(
+                request_id,
+                command_type,
+                {"protocolVersion": 2, "closureRejection": True, "idleBarrier": True},
+            )
+        elif command_type == "prompt" and first_prompt_id is None:
+            first_prompt_id = request_id
+            respond(request_id, command_type)
+        elif command_type == "prompt":
+            respond(first_prompt_id, command_type, success=False, error="late failure")
+            time.sleep(0.05)
+            respond(request_id, command_type)
+        elif command_type == "wait_for_idle":
+            time.sleep(0.15)
+            respond(request_id, command_type)
+        else:
+            respond(request_id, command_type)
+    """
+)
+
+
 STDERR_SERVER = textwrap.dedent(
     """
     import json
@@ -861,17 +1054,17 @@ FORWARD_COMPAT_SERVER = textwrap.dedent(
     print(json.dumps({"type": "ready"}), flush=True)
     for raw_line in sys.stdin:
         command = json.loads(raw_line)
-        print(
-            json.dumps(
-                {
-                    "id": command.get("id"),
-                    "type": "response",
-                    "command": command["type"],
-                    "success": True,
-                }
-            ),
-            flush=True,
-        )
+        command_type = command["type"]
+        success = command_type != "wait_for_idle"
+        response = {
+            "id": command.get("id"),
+            "type": "response",
+            "command": command_type,
+            "success": success,
+        }
+        if not success:
+            response["error"] = "unsupported: wait_for_idle"
+        print(json.dumps(response), flush=True)
         if command["type"] != "prompt":
             continue
         if command.get("message") == "malformed terminal":
@@ -1032,6 +1225,68 @@ class RpcClientTests(unittest.TestCase):
             ["pong", "terminal"],
         )
         self.assertEqual(turn.require_assistant_text(), "terminal")
+
+    def test_prompt_turn_does_not_reuse_predecessor_assistant_text(self) -> None:
+        draft = {"role": "assistant", "content": [{"type": "text", "text": "draft"}]}
+        events = (
+            AgentStartEvent(),
+            MessageEndEvent(draft),  # type: ignore[arg-type]
+            AgentEndEvent((draft,)),  # type: ignore[arg-type]
+            AgentStartEvent(),
+            AgentEndEvent(()),
+        )
+
+        turn = self.make_client()._build_prompt_turn(events)
+
+        self.assertEqual(turn.messages, ())
+        self.assertIsNone(turn.assistant_text)
+
+    def test_prompt_turn_ignores_a_later_nonterminal_end(self) -> None:
+        complete = {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "complete"}],
+        }
+        partial = {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "partial"}],
+        }
+        events = (
+            AgentStartEvent(),
+            MessageEndEvent(complete),  # type: ignore[arg-type]
+            AgentEndEvent((complete,), is_terminal=True),  # type: ignore[arg-type]
+            AgentStartEvent(),
+            MessageEndEvent(partial),  # type: ignore[arg-type]
+            AgentEndEvent((partial,), is_terminal=False),  # type: ignore[arg-type]
+        )
+
+        turn = self.make_client()._build_prompt_turn(events)
+
+        self.assertEqual(turn.require_assistant_text(), "complete")
+
+    def test_prompt_turn_reconstructs_messages_across_nonterminal_end(self) -> None:
+        first = {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "first"}],
+        }
+        second = {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "second"}],
+        }
+        events = (
+            AgentStartEvent(),
+            MessageEndEvent(first),  # type: ignore[arg-type]
+            AgentEndEvent((), is_terminal=False),
+            MessageEndEvent(second),  # type: ignore[arg-type]
+            AgentEndEvent((second,), message_count=2),  # type: ignore[arg-type]
+        )
+
+        turn = self.make_client()._build_prompt_turn(events)
+
+        self.assertEqual(
+            [message["content"][0]["text"] for message in turn.messages],
+            ["first", "second"],
+        )
+        self.assertEqual(turn.require_assistant_text(), "second")
 
     def test_custom_tools_are_registered_and_executed_via_rpc(self) -> None:
         def echo_host(args: dict[str, str], context) -> str:
@@ -1267,6 +1522,45 @@ class RpcClientTests(unittest.TestCase):
             client.wait_for_idle(timeout=2.0)
             self.assertEqual(client.get_last_assistant_text(), "pong")
 
+    def test_legacy_wait_for_idle_returns_after_local_prompt_response(self) -> None:
+        with self.make_client() as client:
+            client.prompt("local response")
+            client.wait_for_idle(timeout=2.0)
+
+    def test_legacy_prompt_and_wait_returns_after_local_prompt_response(self) -> None:
+        with self.make_client() as client:
+            turn = client.prompt_and_wait("local response", timeout=2.0)
+
+        self.assertEqual(turn.events, ())
+        self.assertIsNone(turn.assistant_text)
+
+    def test_wait_for_idle_reaches_barrier_after_async_local_prompt_result(
+        self,
+    ) -> None:
+        with self.make_client(env={"FAKE_RPC_V2": "1"}) as client:
+            client.prompt("local prompt result")
+            client.wait_for_idle(timeout=2.0)
+
+    def test_prompt_and_wait_returns_after_local_only_prompt(self) -> None:
+        for message in ("local response", "local prompt result"):
+            with (
+                self.subTest(message=message),
+                self.make_client(env={"FAKE_RPC_V2": "1"}) as client,
+            ):
+                turn = client.prompt_and_wait(message, timeout=2.0)
+                self.assertEqual(turn.events, ())
+                self.assertIsNone(turn.assistant_text)
+
+    def test_wait_for_idle_handles_prompt_dropped_before_agent_start(self) -> None:
+        with self.make_client(env={"FAKE_RPC_V2": "1"}) as client:
+            client.prompt("dropped prompt")
+            client.wait_for_idle(timeout=2.0)
+
+    def test_wait_for_idle_handles_local_only_abort_and_prompt(self) -> None:
+        with self.make_client(env={"FAKE_RPC_V2": "1"}) as client:
+            client.abort_and_prompt("local response")
+            client.wait_for_idle(timeout=2.0)
+
     def test_protocol_v2_reassembles_chunked_message_pages(self) -> None:
         with self.make_client(server=V2_MESSAGES_SERVER) as client:
             messages = client.get_messages()
@@ -1340,12 +1634,91 @@ class RpcClientTests(unittest.TestCase):
                 ("Finish Python RPC task",),
             )
 
-    def test_rejected_terminal_event_publishes_error_before_waiters_observe_completion(
+    def test_rejected_schedule_keeps_previous_closure_baseline(self) -> None:
+        with self.make_client() as client:
+            client.prompt("closure rejected")
+            with self.assertRaisesRegex(RpcCommandError, "rejected command"):
+                client.steer("reject command")
+            with self.assertRaisesRegex(
+                RpcError, "Completion rejected: 1 incomplete todo item\\(s\\) remain"
+            ):
+                client.wait_for_idle(timeout=2.0)
+
+    def test_idle_steer_after_rejected_closure_waits_for_fresh_terminal(self) -> None:
+        agent_ends: list[AgentEndEvent] = []
+
+        with self.make_client() as client:
+            client.on_agent_end(agent_ends.append)
+            client.prompt("closure rejected")
+            with self.assertRaisesRegex(
+                RpcError, "Completion rejected: 1 incomplete todo item\\(s\\) remain"
+            ):
+                client.wait_for_idle(timeout=2.0)
+
+            client.steer("resume after closure rejection")
+            client.wait_for_idle(timeout=2.0)
+
+        self.assertEqual(len(agent_ends), 2)
+        self.assertIsNotNone(agent_ends[0].closure_rejected)
+        self.assertIsNone(agent_ends[1].closure_rejected)
+
+    def test_idle_follow_up_after_rejected_closure_waits_for_fresh_terminal(
+        self,
+    ) -> None:
+        agent_ends: list[AgentEndEvent] = []
+
+        with self.make_client() as client:
+            client.on_agent_end(agent_ends.append)
+            client.prompt("closure rejected")
+            with self.assertRaisesRegex(
+                RpcError, "Completion rejected: 1 incomplete todo item\\(s\\) remain"
+            ):
+                client.wait_for_idle(timeout=2.0)
+
+            client.follow_up("resume after closure rejection")
+            client.wait_for_idle(timeout=2.0)
+
+        self.assertEqual(len(agent_ends), 2)
+        self.assertIsNotNone(agent_ends[0].closure_rejected)
+        self.assertIsNone(agent_ends[1].closure_rejected)
+
+    def test_active_to_idle_steer_uses_the_latest_terminal_outcome(self) -> None:
+        agent_ends: list[AgentEndEvent] = []
+
+        with self.make_client(server=ACTIVE_TO_IDLE_STEER_RACE_SERVER) as client:
+            client.on_agent_end(agent_ends.append)
+            client.prompt("start active turn")
+            client.steer("arrive at the terminal boundary")
+            client.wait_for_idle(timeout=2.0)
+
+        self.assertEqual(len(agent_ends), 2)
+        self.assertIsNotNone(agent_ends[0].closure_rejected)
+        self.assertIsNone(agent_ends[1].closure_rejected)
+
+    def test_wait_for_idle_timeout_applies_to_server_barrier(self) -> None:
+        client = RpcClient(
+            command=[sys.executable, "-u", "-c", FAKE_SERVER],
+            env={"FAKE_RPC_V2": "1", "HANG_IDLE_BARRIER": "1"},
+            startup_timeout=2.0,
+            request_timeout=2.0,
+        )
+
+        with client:
+            started = time.monotonic()
+            with self.assertRaisesRegex(
+                RpcTimeoutError, "Timed out waiting for response to wait_for_idle"
+            ):
+                client.wait_for_idle(timeout=0.05)
+            elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 1.0)
+
+    def test_rejected_terminal_event_is_published_before_barrier_completion(
         self,
     ) -> None:
         client = self.make_client()
-        client._scheduled_agent_runs = 1
         client._stopping = True
+        client._idle_barrier_supported = True
         terminal = json.dumps(
             {
                 "type": "agent_end",
@@ -1361,19 +1734,15 @@ class RpcClientTests(unittest.TestCase):
             stdout = (f"{terminal}\n",)
 
         client._process = FakeProcess()  # type: ignore[assignment]
-        waiter_ready = threading.Event()
-        waiter_finished = threading.Event()
+        barrier_entered = threading.Event()
+        release_barrier = threading.Event()
         outcomes: list[BaseException | None] = []
-        original_event_index = client._current_event_index
-        original_append_async_error = client._append_async_error
 
-        def capture_event_index() -> int:
-            waiter_ready.set()
-            return original_event_index()
-
-        def append_error_after_waiter(error: BaseException) -> None:
-            waiter_finished.wait(timeout=1.0)
-            original_append_async_error(error)
+        def barrier_request(command: str, **_payload: object) -> dict[str, object]:
+            self.assertEqual(command, "wait_for_idle")
+            barrier_entered.set()
+            release_barrier.wait(timeout=1.0)
+            return {}
 
         def wait_for_terminal() -> None:
             try:
@@ -1382,18 +1751,16 @@ class RpcClientTests(unittest.TestCase):
                 outcomes.append(error)
             else:
                 outcomes.append(None)
-            finally:
-                waiter_finished.set()
 
-        with patch.object(client, "_current_event_index", side_effect=capture_event_index):
+        with patch.object(client, "_request", side_effect=barrier_request):
             waiter = threading.Thread(target=wait_for_terminal)
             waiter.start()
-            self.assertTrue(waiter_ready.wait(timeout=1.0))
-            with patch.object(client, "_append_async_error", side_effect=append_error_after_waiter):
-                reader = threading.Thread(target=client._read_stdout_loop)
-                reader.start()
-                waiter.join(timeout=1.0)
-                reader.join(timeout=1.0)
+            self.assertTrue(barrier_entered.wait(timeout=1.0))
+            reader = threading.Thread(target=client._read_stdout_loop)
+            reader.start()
+            reader.join(timeout=1.0)
+            release_barrier.set()
+            waiter.join(timeout=1.0)
 
         self.assertFalse(waiter.is_alive())
         self.assertFalse(reader.is_alive())
@@ -1499,6 +1866,12 @@ class RpcClientTests(unittest.TestCase):
         self.assertEqual(len(unknown_errors), 1)
         self.assertIn("auto_compaction_start.reason", unknown_errors[0] or "")
 
+    def test_legacy_wait_for_idle_uses_known_idle_and_terminal_events(self) -> None:
+        with self.make_client(server=FORWARD_COMPAT_SERVER) as client:
+            client.wait_for_idle(timeout=2.0)
+            client.prompt("forward compatible")
+            client.wait_for_idle(timeout=2.0)
+
     def test_malformed_terminal_agent_end_wakes_waiter(self) -> None:
         unknown_errors: list[str | None] = []
 
@@ -1603,6 +1976,21 @@ class RpcClientTests(unittest.TestCase):
         self.assertEqual(ctx.exception.error, "late failure")
         self.assertEqual(len(protocol_errors), 1)
         self.assertIn("late failure", protocol_errors[0])
+        self.assertEqual(len(client.protocol_errors), 1)
+
+    def test_late_explicit_failure_does_not_steal_an_overlapping_response(
+        self,
+    ) -> None:
+        with self.make_client(server=OVERLAPPING_LATE_PROMPT_FAILURE_SERVER) as client:
+            client.prompt("first")
+            client.prompt("second")
+
+            started = time.monotonic()
+            with self.assertRaisesRegex(RpcCommandError, "late failure"):
+                client.wait_for_idle(timeout=2.0)
+            elapsed = time.monotonic() - started
+
+        self.assertGreaterEqual(elapsed, 0.1)
         self.assertEqual(len(client.protocol_errors), 1)
 
     def test_listener_exceptions_are_reported_without_stopping_client(self) -> None:
@@ -1747,6 +2135,51 @@ class StopUnblocksPromptAndWaitTests(unittest.TestCase):
         finally:
             # stop() is idempotent; safe to call again on cleanup paths.
             client.stop()
+
+    def test_stop_allows_server_eof_cleanup(self) -> None:
+        work = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, work, ignore_errors=True)
+        marker = os.path.join(work, "disposed")
+        server = textwrap.dedent(
+            """
+            import json
+            import os
+            import sys
+            import time
+
+            print(json.dumps({"type": "ready"}), flush=True)
+            sys.stdin.read()
+            time.sleep(0.05)
+            with open(os.environ["EOF_MARKER"], "w", encoding="utf-8") as marker:
+                marker.write("disposed")
+            """
+        )
+        client = RpcClient(
+            command=[sys.executable, "-u", "-c", server],
+            env={"EOF_MARKER": marker},
+            startup_timeout=2.0,
+            request_timeout=2.0,
+        )
+
+        client.start()
+        client.stop()
+
+        with open(marker, encoding="utf-8") as marker_file:
+            self.assertEqual(marker_file.read(), "disposed")
+
+    def test_wait_for_idle_fails_after_stop(self) -> None:
+        from omp_rpc import RpcProcessExitError
+
+        client = RpcClient(
+            command=[sys.executable, "-u", "-c", HANGING_SERVER],
+            startup_timeout=2.0,
+            request_timeout=2.0,
+        )
+        client.start()
+        client.stop()
+
+        with self.assertRaises(RpcProcessExitError):
+            client.wait_for_idle(timeout=0.1)
 
 
 class TerminatesProcessGroupTests(unittest.TestCase):

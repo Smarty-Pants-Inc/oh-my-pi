@@ -248,6 +248,18 @@ time on a client instance. If a host needs concurrent orchestration, use
 separate `RpcClient` instances instead of overlapping lifecycle waiters on one
 session.
 
+When the server negotiates `idleBarrier`, `wait_for_idle()` uses its
+authoritative quiescence barrier. The barrier joins every earlier accepted
+prompt lifecycle, including local-only or dropped prompts that emit no terminal
+event. It waits through a queued `steer()` or `follow_up()` successor, deferred
+terminal publication, and post-prompt recovery.
+
+With a legacy server, the client returns immediately for a known-idle session
+or an immediate `agentInvoked: false` response; otherwise it retains the legacy
+first-terminal `agent_end` fallback. That fallback cannot distinguish an active
+predecessor from a queued successor. Use a server that advertises
+`idleBarrier` when authoritative quiescence is required.
+
 ## Text Helpers
 
 `assistant_text()` and `message_text()` now return visible text blocks only.

@@ -918,9 +918,16 @@ describe("AgentSession message pipeline", () => {
 
 		expect(events.some(event => event.type === "message_update")).toBe(true);
 		expect(extensionEmit).toHaveBeenCalledTimes(1);
+		let idleSettled = false;
+		const idle = session.waitForIdle().then(() => {
+			idleSettled = true;
+		});
+		for (let hop = 0; hop < 10; hop++) await Promise.resolve();
+		expect(idleSettled).toBe(false);
 
 		resolve();
-		await Bun.sleep(0);
+		await idle;
+		expect(idleSettled).toBe(true);
 	});
 
 	it("keeps first-turn memory in the stable prompt on the next turn", async () => {

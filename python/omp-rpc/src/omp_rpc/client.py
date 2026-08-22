@@ -304,6 +304,10 @@ class RpcError(RuntimeError):
     """Base exception for the Python RPC client."""
 
 
+class _RpcClosureRejectedError(RpcError):
+    """Internal marker for a terminal closure rejection."""
+
+
 class RpcTimeoutError(RpcError):
     """Raised when the server does not respond before a timeout."""
 
@@ -351,11 +355,11 @@ class RpcProtocolError(RpcError):
         super().__init__(" ".join(fragments))
 
 
-def _closure_rejected_error(event: AgentEndEvent) -> RpcError | None:
+def _closure_rejected_error(event: AgentEndEvent) -> _RpcClosureRejectedError | None:
     closure_rejected = event.closure_rejected
     if closure_rejected is None:
         return None
-    return RpcError(
+    return _RpcClosureRejectedError(
         f"Completion rejected: {len(closure_rejected.todos)} incomplete todo item(s) remain."
     )
 
@@ -526,9 +530,9 @@ class RpcClient:
         self._async_errors = _BoundedHistory[BaseException](
             _DEFAULT_ERROR_HISTORY_LIMIT
         )
-        self._scheduled_agent_runs = 0
-        self._completed_agent_runs = 0
+        self._last_schedule_event_index = 0
         self._last_schedule_async_error_index = 0
+        self._legacy_idle_known = True
         self._ui_requests: queue.Queue[ExtensionUiRequest] = queue.Queue()
         self._stderr_chunks = _BoundedHistory[str](self._max_stderr_chunks)
         self._closed_error: BaseException | None = None
@@ -537,6 +541,7 @@ class RpcClient:
         self._ready_event: ReadyEvent | None = None
         self._protocol_version = 1
         self._protocol_v2_enabled = False
+        self._idle_barrier_supported = False
         self._frame_decoder = _RpcFrameDecoder()
         self._protocol_errors = _BoundedHistory[RpcProtocolError](
             _DEFAULT_ERROR_HISTORY_LIMIT
@@ -593,11 +598,12 @@ class RpcClient:
         self._protocol_version = 1
         self._protocol_v2_enabled = False
         self._frame_decoder = _RpcFrameDecoder()
+        self._idle_barrier_supported = False
         self._events.clear()
         self._async_errors.clear()
-        self._scheduled_agent_runs = 0
-        self._completed_agent_runs = 0
+        self._last_schedule_event_index = 0
         self._last_schedule_async_error_index = 0
+        self._legacy_idle_known = True
         self._ui_requests = queue.Queue()
         with self._state_lock:
             self._stderr_chunks.clear()
@@ -672,6 +678,7 @@ class RpcClient:
                 if negotiation.get("protocolVersion") != 2:
                     raise RpcError("RPC protocol v2 negotiation failed")
                 self._protocol_version = 2
+                self._idle_barrier_supported = negotiation.get("idleBarrier") is True
             except BaseException:
                 self.stop()
                 raise
@@ -692,6 +699,8 @@ class RpcClient:
             pending_call.cancel_event.set()
         for pending_uri in self._pending_host_uri_requests.values():
             pending_uri.cancel_event.set()
+        # Wake local waiters before waiting for server-side EOF cleanup.
+        self._mark_closed(RpcProcessExitError("RPC process stopped"))
 
         try:
             if process.stdin is not None:
@@ -699,6 +708,14 @@ class RpcClient:
                     process.stdin.close()
                 except OSError:
                     pass
+
+            # RPC mode drains accepted work and disposes the session after EOF.
+            # Give that bounded cleanup a chance before terminating the process
+            # group; the group fallback still reaps stuck descendants.
+            try:
+                process.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                pass
 
             _terminate_process_group(process, self._pgid)
         finally:
@@ -712,15 +729,6 @@ class RpcClient:
                     process.stderr.close()
                 except OSError:
                     pass
-            # Mark the client closed so any thread blocked in
-            # `_wait_for_agent_end` raises `RpcProcessExitError` instead of
-            # waiting for its request timeout. The stdout reader loop would
-            # normally do this when it observes the closed pipe, but it
-            # guards on `if not self._stopping:` — which is True by the time
-            # we get here — and so skips it. Calling `_mark_closed` directly
-            # closes the gap. It is idempotent: a second call (e.g. from the
-            # reader's exception path) returns early.
-            self._mark_closed(RpcProcessExitError("RPC process stopped"))
             self._pending_host_tool_calls.clear()
             self._host_tool_dispatch_names.clear()
             self._pending_host_uri_requests.clear()
@@ -1154,32 +1162,28 @@ class RpcClient:
         images: Sequence[ImageContent] | None = None,
         streaming_behavior: StreamingBehavior | None = None,
     ) -> None:
-        start_async_error_index = self._current_async_error_index()
-        self._request(
+        baseline = self._snapshot_schedule_baseline()
+        result = self._request(
             "prompt",
             message=message,
             images=list(images) if images is not None else None,
             streamingBehavior=streaming_behavior,
         )
-        self._mark_agent_run_scheduled(start_async_error_index)
+        agent_invoked = result.get("agentInvoked")
+        self._commit_schedule_baseline(
+            baseline,
+            agent_invoked=agent_invoked if isinstance(agent_invoked, bool) else None,
+        )
 
     def steer(
         self, message: str, *, images: Sequence[ImageContent] | None = None
     ) -> None:
-        self._request(
-            "steer",
-            message=message,
-            images=list(images) if images is not None else None,
-        )
+        self._send_queued_agent_message("steer", message, images)
 
     def follow_up(
         self, message: str, *, images: Sequence[ImageContent] | None = None
     ) -> None:
-        self._request(
-            "follow_up",
-            message=message,
-            images=list(images) if images is not None else None,
-        )
+        self._send_queued_agent_message("follow_up", message, images)
 
     def abort(self) -> None:
         self._request("abort")
@@ -1187,13 +1191,17 @@ class RpcClient:
     def abort_and_prompt(
         self, message: str, *, images: Sequence[ImageContent] | None = None
     ) -> None:
-        start_async_error_index = self._current_async_error_index()
-        self._request(
+        baseline = self._snapshot_schedule_baseline()
+        result = self._request(
             "abort_and_prompt",
             message=message,
             images=list(images) if images is not None else None,
         )
-        self._mark_agent_run_scheduled(start_async_error_index)
+        agent_invoked = result.get("agentInvoked")
+        self._commit_schedule_baseline(
+            baseline,
+            agent_invoked=agent_invoked if isinstance(agent_invoked, bool) else None,
+        )
 
     def prompt_and_wait(
         self,
@@ -1207,12 +1215,9 @@ class RpcClient:
         self._prompt_lifecycle.acquire(operation)
         try:
             start_index = self._current_event_index()
-            start_async_error_index = self._current_async_error_index()
             self.prompt(message, images=images, streaming_behavior=streaming_behavior)
-            events = self._wait_for_agent_end(
-                start_index, start_async_error_index, timeout=timeout
-            )
-            return self._build_prompt_turn(events)
+            self._wait_for_idle_barrier(timeout)
+            return self._build_prompt_turn(self._snapshot_agent_events(start_index))
         finally:
             self._prompt_lifecycle.release(operation)
 
@@ -1220,14 +1225,7 @@ class RpcClient:
         operation = "wait_for_idle"
         self._prompt_lifecycle.acquire(operation)
         try:
-            if self._is_agent_idle():
-                self._check_async_errors()
-                return
-            start_index = self._current_event_index()
-            start_async_error_index = self._current_async_error_index()
-            self._wait_for_agent_end(
-                start_index, start_async_error_index, timeout=timeout
-            )
+            self._wait_for_idle_barrier(timeout)
         finally:
             self._prompt_lifecycle.release(operation)
 
@@ -1254,37 +1252,167 @@ class RpcClient:
         with self._event_condition:
             return self._async_errors.current_index()
 
-    def _mark_agent_run_scheduled(self, async_error_index: int) -> None:
+    def _snapshot_agent_events(self, start_index: int) -> tuple[RpcAgentEvent, ...]:
         with self._event_condition:
-            self._scheduled_agent_runs += 1
-            self._last_schedule_async_error_index = async_error_index
+            if start_index < self._events.offset:
+                raise RpcError(
+                    "Event history limit was exceeded while waiting for agent completion. "
+                    "Increase max_event_history to retain more streamed events."
+                )
+            payloads = self._events.snapshot_from(start_index)
+        return tuple(
+            cast(RpcAgentEvent, parse_notification(payload)) for payload in payloads
+        )
 
-    def _mark_agent_run_completed(self) -> None:
+    def _wait_for_idle_barrier(self, timeout: float | None) -> None:
+        deadline = time.monotonic() + (timeout if timeout is not None else 60.0)
         with self._event_condition:
-            self._completed_agent_runs += 1
+            closed_error = self._closed_error
+            start_event_index = self._last_schedule_event_index
+            start_async_error_index = self._last_schedule_async_error_index
+            legacy_idle_known = self._legacy_idle_known
+        if closed_error is not None:
+            raise RpcProcessExitError(str(closed_error))
+        self._require_process()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RpcTimeoutError(
+                f"Timed out waiting for agent to become idle. Stderr: {self.stderr}"
+            )
+        if self._idle_barrier_supported:
+            self._request("wait_for_idle", response_timeout=remaining)
+            with self._event_condition:
+                self._legacy_idle_known = True
+        elif not legacy_idle_known:
+            self._wait_for_agent_end(
+                start_event_index,
+                start_async_error_index,
+                timeout=remaining,
+                raise_closure_errors=False,
+            )
+        self._check_async_errors(start_event_index, start_async_error_index)
+        with self._event_condition:
+            closed_error = self._closed_error
+        if closed_error is not None:
+            raise RpcProcessExitError(str(closed_error))
+
+    def _send_queued_agent_message(
+        self,
+        command_type: str,
+        message: str,
+        images: Sequence[ImageContent] | None,
+    ) -> None:
+        baseline = self._snapshot_schedule_baseline()
+        self._request(
+            command_type,
+            message=message,
+            images=list(images) if images is not None else None,
+        )
+        self._commit_schedule_baseline(baseline)
+
+    def _snapshot_schedule_baseline(self) -> tuple[int, int]:
+        with self._event_condition:
+            return self._events.current_index(), self._async_errors.current_index()
+
+    def _commit_schedule_baseline(
+        self,
+        baseline: tuple[int, int],
+        *,
+        agent_invoked: bool | None = None,
+    ) -> None:
+        event_index, async_error_index = baseline
+        with self._event_condition:
+            terminal_seen = event_index >= self._events.offset and any(
+                payload.get("type") == "agent_end"
+                and (
+                    payload.get("closureRejected") is not None
+                    or payload.get("isTerminal") is not False
+                )
+                for payload in self._events.snapshot_from(event_index)
+            )
+            self._legacy_idle_known = agent_invoked is False or terminal_seen
+            self._last_schedule_event_index = max(
+                self._last_schedule_event_index, event_index
+            )
+            self._last_schedule_async_error_index = max(
+                self._last_schedule_async_error_index, async_error_index
+            )
             self._event_condition.notify_all()
 
-    def _is_agent_idle(self) -> bool:
+    def _check_async_errors(
+        self,
+        start_event_index: int,
+        start_async_error_index: int,
+    ) -> None:
         with self._event_condition:
-            return self._scheduled_agent_runs == self._completed_agent_runs
-
-    def _check_async_errors(self) -> None:
-        with self._event_condition:
-            errors = self._async_errors.snapshot_from(
-                self._last_schedule_async_error_index
+            if start_async_error_index < self._async_errors.offset:
+                raise RpcError(
+                    "Async error history limit was exceeded while waiting for the idle barrier."
+                )
+            errors = self._async_errors.snapshot_from(start_async_error_index)
+            non_closure = next(
+                (
+                    error
+                    for error in errors
+                    if not isinstance(error, _RpcClosureRejectedError)
+                ),
+                None,
             )
-        if errors:
-            raise errors[0]
+            if non_closure is not None:
+                raise non_closure
+            closure_errors = tuple(
+                error for error in errors if isinstance(error, _RpcClosureRejectedError)
+            )
+            if not closure_errors:
+                return
+            if start_event_index < self._events.offset:
+                raise RpcError(
+                    "Event history limit was exceeded while resolving terminal closure. "
+                    "Increase max_event_history to retain the idle-barrier outcome."
+                )
+            event_payloads = self._events.snapshot_from(start_event_index)
+
+        for payload in reversed(event_payloads):
+            if payload.get("type") != "agent_end":
+                continue
+            if (
+                payload.get("closureRejected") is None
+                and payload.get("isTerminal") is False
+            ):
+                continue
+            event = parse_notification(payload)
+            if not isinstance(event, AgentEndEvent):
+                continue
+            closure_error = _closure_rejected_error(event)
+            if closure_error is not None:
+                raise closure_error
+            return
+        raise closure_errors[-1]
 
     def _build_prompt_turn(self, events: tuple[RpcAgentEvent, ...]) -> PromptTurn:
         final_messages: tuple[AgentMessage, ...] = ()
+        final_run_events = events
         for event_index in range(len(events) - 1, -1, -1):
             event = events[event_index]
-            if isinstance(event, AgentEndEvent):
-                final_messages = self._complete_agent_end_messages(
-                    events[:event_index], event
-                )
-                break
+            if not isinstance(event, AgentEndEvent):
+                continue
+            if event.closure_rejected is None and event.is_terminal is False:
+                continue
+            run_start = 0
+            for boundary_index in range(event_index - 1, -1, -1):
+                boundary = events[boundary_index]
+                if isinstance(boundary, AgentStartEvent) or (
+                    isinstance(boundary, AgentEndEvent)
+                    and (
+                        boundary.closure_rejected is not None
+                        or boundary.is_terminal is not False
+                    )
+                ):
+                    run_start = boundary_index + 1
+                    break
+            final_run_events = events[run_start:event_index]
+            final_messages = self._complete_agent_end_messages(final_run_events, event)
+            break
 
         assistant_message: AssistantMessage | None = None
         for message in reversed(final_messages):
@@ -1293,7 +1421,7 @@ class RpcClient:
                 break
 
         if assistant_message is None:
-            for event in reversed(events):
+            for event in reversed(final_run_events):
                 if hasattr(event, "message"):
                     message = cast(AgentMessage | None, getattr(event, "message", None))
                     if isinstance(message, dict) and message.get("role") == "assistant":
@@ -1343,6 +1471,8 @@ class RpcClient:
         start_index: int,
         start_async_error_index: int,
         timeout: float | None = None,
+        *,
+        raise_closure_errors: bool = True,
     ) -> tuple[RpcAgentEvent, ...]:
         deadline = time.monotonic() + (timeout if timeout is not None else 60.0)
         with self._event_condition:
@@ -1363,8 +1493,17 @@ class RpcClient:
                     )
 
                 async_errors = self._async_errors.snapshot_from(start_async_error_index)
-                if len(async_errors) > 0:
-                    raise async_errors[0]
+                async_error = next(
+                    (
+                        error
+                        for error in async_errors
+                        if raise_closure_errors
+                        or not isinstance(error, _RpcClosureRejectedError)
+                    ),
+                    None,
+                )
+                if async_error is not None:
+                    raise async_error
 
                 event_payloads = self._events.snapshot_from(start_index)
                 if any(
@@ -1388,7 +1527,13 @@ class RpcClient:
                     )
                 self._event_condition.wait(remaining)
 
-    def _request(self, command_type: str, **payload: JsonValue) -> JsonObject:
+    def _request(
+        self,
+        command_type: str,
+        *,
+        response_timeout: float | None = None,
+        **payload: JsonValue,
+    ) -> JsonObject:
         process = self._require_process()
         request_id = self._next_request_id()
         envelope: JsonObject = {"id": request_id, "type": command_type}
@@ -1410,7 +1555,11 @@ class RpcClient:
             raise
 
         try:
-            response = response_queue.get(timeout=self._request_timeout)
+            response = response_queue.get(
+                timeout=self._request_timeout
+                if response_timeout is None
+                else response_timeout
+            )
         except queue.Empty as exc:
             with self._state_lock:
                 self._pending.pop(request_id, None)
@@ -1934,7 +2083,6 @@ class RpcClient:
                         self._append_async_error(
                             RpcError(f"Failed to parse terminal agent_end: {exc}")
                         )
-                        self._mark_agent_run_completed()
                 self._dispatch_listeners(
                     "notification",
                     notification.type,
@@ -1988,12 +2136,7 @@ class RpcClient:
                     if isinstance(event, AgentEndEvent)
                     else None
                 )
-                self._publish_agent_event(
-                    payload,
-                    closure_error=closure_error,
-                    completed=closure_error is not None
-                    or (isinstance(event, AgentEndEvent) and event.is_terminal is not False),
-                )
+                self._publish_agent_event(payload, closure_error=closure_error)
                 self._dispatch_listeners(
                     "event", event.type, self._event_listeners, event
                 )
@@ -2061,7 +2204,9 @@ class RpcClient:
                 pending.response_queue.put(payload)
                 return
 
-        if self._deliver_correlated_error_response(payload):
+        if not isinstance(request_id, str) and self._deliver_correlated_error_response(
+            payload
+        ):
             return
 
         protocol_error = self._build_protocol_error(payload)
@@ -2075,8 +2220,6 @@ class RpcClient:
             self._append_async_error(
                 RpcCommandError(protocol_error.command, protocol_error.remote_error)
             )
-            self._mark_agent_run_completed()
-
         self._record_protocol_error(protocol_error)
 
     def _deliver_correlated_error_response(self, payload: JsonObject) -> bool:
@@ -2119,14 +2262,16 @@ class RpcClient:
         payload: JsonObject,
         *,
         closure_error: BaseException | None = None,
-        completed: bool = False,
     ) -> None:
         with self._event_condition:
             self._events.append(_clone_json_object(payload))
             if closure_error is not None:
                 self._async_errors.append(closure_error)
-            if completed:
-                self._completed_agent_runs += 1
+            if payload.get("type") == "agent_end" and (
+                payload.get("closureRejected") is not None
+                or payload.get("isTerminal") is not False
+            ):
+                self._legacy_idle_known = True
             self._event_condition.notify_all()
 
     def _append_async_error(self, error: BaseException) -> None:

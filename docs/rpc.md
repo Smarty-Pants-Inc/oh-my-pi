@@ -56,6 +56,10 @@ Current clients that support protocol v2 SHOULD immediately send:
 }
 ```
 
+The negotiation success data includes `idleBarrier: true` when the server supports
+the authoritative `wait_for_idle` command. The bundled TypeScript client uses
+that capability and retains terminal-event waiting only for older servers.
+
 After the success response, oversized stdout objects are emitted losslessly as an uninterrupted sequence of `rpc_chunk` frames. Each chunk carries a base64 segment of the original UTF-8 JSON object:
 
 ```json
@@ -108,7 +112,7 @@ Important edge behavior from runtime:
 - Malformed JSON and synchronous dispatch failures emit `command: "parse"` with `id: undefined`. Exceptions while handling a recognized command emit a failure with that command's `type` and `id`.
 - `prompt` and `abort_and_prompt` return immediate success, then may emit a later error response with the **same** id if async prompt scheduling fails.
 - `prompt` success responses may include `data.agentInvoked`. `false` means the prompt completed locally without an agent turn; `true` means the prompt produced agent lifecycle events; omitted means the host must rely on session events for completion.
-- `abort_and_prompt` does not currently emit `data.agentInvoked` or `prompt_result`; hosts should treat it as the legacy abort-then-schedule path and rely on session events or same-id scheduling errors.
+- A scheduled `prompt` or `abort_and_prompt` that later completes locally emits `prompt_result` with the request id and `agentInvoked: false`. Hosts using `wait_for_idle` do not need to infer completion from this hint.
 
 ## Command Schema (canonical)
 
@@ -121,7 +125,26 @@ Important edge behavior from runtime:
 - `{ id?, type: "follow_up", message: string, images?: ImageContent[] }`
 - `{ id?, type: "abort" }`
 - `{ id?, type: "abort_and_prompt", message: string, images?: ImageContent[] }`
+- `{ id?, type: "wait_for_idle" }`
 - `{ id?, type: "new_session", parentSession?: string }`
+
+`wait_for_idle` is a server-authoritative quiescence barrier. Its success
+response is emitted only after every earlier accepted prompt lifecycle, the
+agent loop, in-flight event persistence, detached extension/IRC work, deferred
+public `agent_end`, queued-message recovery, an overtaking abort, and
+post-prompt retry/TTSR work reach a fixed point. The server starts the barrier
+after all earlier serialized commands, but does not place it on the serial tail,
+so a later `abort` can overtake a run that would otherwise keep the barrier
+blocked. Later commands can therefore overlap the barrier; clients MUST use the
+response `id` and avoid treating response order as command order.
+
+The protocol-v2 negotiation response advertises `data.idleBarrier: true` when
+this command is supported. Current bundled clients use the barrier only after
+that capability is negotiated. With an older server, they retain the legacy
+fallback: an immediate `agentInvoked: false` response is already complete;
+otherwise they wait for the first terminal `agent_end`. That fallback cannot
+distinguish an active predecessor from a queued successor, so hosts that need
+authoritative quiescence MUST use a server that advertises `idleBarrier`.
 
 ### Protocol
 
