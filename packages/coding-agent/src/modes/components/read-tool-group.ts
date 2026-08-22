@@ -172,7 +172,7 @@ function getDisplayReadTargets(details: ReadToolResultDetails | undefined): stri
 function getDisplayReadTargetLinks(details: ReadToolResultDetails | undefined): Array<string | undefined> | undefined {
 	if (!Array.isArray(details?.displayReadTargetLinks)) return undefined;
 	return details.displayReadTargetLinks.map(target =>
-		typeof target === "string" && target.trim().length > 0 ? target.trim() : undefined,
+		typeof target === "string" && target.trim().length > 0 ? target : undefined,
 	);
 }
 
