@@ -1261,6 +1261,169 @@ describe("AgentSession concurrent prompt guard", () => {
 			},
 		);
 
+		it("rolls back a failed fresh idle steer before crash-safe retry", async () => {
+			const sessionDir = path.join(tempDir, "sessions");
+			const manager = SessionManager.create(tempDir, sessionDir);
+			session = createPersistentSession(manager);
+			const ensureEntered = Promise.withResolvers<void>();
+			const releaseEnsure = Promise.withResolvers<void>();
+			const ensureOnDisk = manager.ensureOnDisk.bind(manager);
+			let failFirstEnsure = true;
+			vi.spyOn(manager, "ensureOnDisk").mockImplementation(async () => {
+				if (failFirstEnsure) {
+					failFirstEnsure = false;
+					ensureEntered.resolve();
+					await releaseEnsure.promise;
+					throw new Error("fresh semantic persistence failed");
+				}
+				await ensureOnDisk();
+			});
+			const payload = {
+				customType: "fresh-retry-safe-plain",
+				content: "persist exactly once after fresh retry",
+				display: false,
+				attribution: "agent" as const,
+			};
+
+			const sending = session.sendCustomMessage(payload, { deliveryMode: "steer" });
+			await ensureEntered.promise;
+			const laterMessage = { role: "user" as const, content: "keep later fresh append", timestamp: Date.now() };
+			session.agent.appendMessage(laterMessage);
+			expect(session.agent.state.messages.at(-2)).toMatchObject({ customType: payload.customType });
+			releaseEnsure.resolve();
+
+			await expect(sending).rejects.toThrow("fresh semantic persistence failed");
+			expect(session.agent.state.messages).toEqual([laterMessage]);
+			const failedBranch = manager.getBranch();
+			expect(
+				failedBranch.some(entry => entry.type === "custom_message" && entry.customType === payload.customType),
+			).toBe(false);
+			expect(
+				failedBranch.some(
+					entry =>
+						entry.type === "custom" && (entry.customType === pendingType || entry.customType === settledType),
+				),
+			).toBe(false);
+			const sessionFile = manager.getSessionFile();
+			if (!sessionFile) throw new Error("Failed persistence did not retain a recoverable session path");
+			expect(await Bun.file(sessionFile).text()).not.toContain(payload.content);
+
+			session = undefined as unknown as AgentSession;
+			const resumed = await reopen(sessionFile, sessionDir);
+			expect(resumed.agent.peekSteeringQueue()).toHaveLength(0);
+			expect(resumed.agent.peekFollowUpQueue()).toHaveLength(0);
+			expect(
+				resumed.agent.state.messages.filter(
+					message => message.role === "custom" && message.customType === payload.customType,
+				),
+			).toHaveLength(0);
+
+			await expect(resumed.sendCustomMessage(payload, { deliveryMode: "steer" })).resolves.toEqual({
+				status: "accepted",
+				delivery: "plain_append",
+			});
+			expect(
+				resumed.agent.state.messages.filter(
+					message => message.role === "custom" && message.customType === payload.customType,
+				),
+			).toHaveLength(1);
+			await resumed.sessionManager.flush();
+
+			session = undefined as unknown as AgentSession;
+			const afterRetry = await reopen(sessionFile, sessionDir);
+			expect(
+				afterRetry.sessionManager
+					.getBranch()
+					.filter(entry => entry.type === "custom_message" && entry.customType === payload.customType),
+			).toHaveLength(1);
+			expect(afterRetry.agent.peekSteeringQueue()).toHaveLength(0);
+		});
+
+		it("rolls back the exact live append and durable pending record before a mailbox retry", async () => {
+			const sessionDir = path.join(tempDir, "sessions");
+			const manager = SessionManager.create(tempDir, sessionDir);
+			session = createPersistentSession(manager);
+			session.agent.state.isStreaming = true;
+			const firstEnsureEntered = Promise.withResolvers<void>();
+			const releaseFirstEnsure = Promise.withResolvers<void>();
+			const secondEnsureEntered = Promise.withResolvers<void>();
+			const releaseSecondEnsure = Promise.withResolvers<void>();
+			const ensureOnDisk = manager.ensureOnDisk.bind(manager);
+			let ensureCalls = 0;
+			vi.spyOn(manager, "ensureOnDisk").mockImplementation(async () => {
+				ensureCalls++;
+				if (ensureCalls === 1) {
+					firstEnsureEntered.resolve();
+					await releaseFirstEnsure.promise;
+					await ensureOnDisk();
+					return;
+				}
+				if (ensureCalls === 2) {
+					secondEnsureEntered.resolve();
+					await releaseSecondEnsure.promise;
+					throw new Error("conversation settlement publish failed");
+				}
+				await ensureOnDisk();
+			});
+			const payload = {
+				customType: "retry-safe-plain",
+				content: "deliver exactly once after retry",
+				display: false,
+				attribution: "agent" as const,
+			};
+
+			const sending = session.sendCustomMessage(payload, { deliveryMode: "steer" });
+			await firstEnsureEntered.promise;
+			session.agent.state.isStreaming = false;
+			releaseFirstEnsure.resolve();
+			await secondEnsureEntered.promise;
+			const laterMessage = { role: "user" as const, content: "keep later append", timestamp: Date.now() };
+			session.agent.appendMessage(laterMessage);
+			expect(session.agent.state.messages.at(-2)).toMatchObject({ customType: payload.customType });
+			releaseSecondEnsure.resolve();
+
+			await expect(sending).rejects.toThrow("conversation settlement publish failed");
+			expect(session.agent.state.messages).toEqual([laterMessage]);
+			const failedBranch = manager.getBranch();
+			const pending = failedBranch.find(entry => entry.type === "custom" && entry.customType === pendingType);
+			if (!pending) throw new Error("Expected a durable pending semantic delivery");
+			expect(failedBranch).toContainEqual(
+				expect.objectContaining({
+					type: "custom",
+					customType: settledType,
+					data: { pendingId: pending.id, outcome: "cancelled" },
+				}),
+			);
+			expect(
+				failedBranch.some(entry => entry.type === "custom_message" && entry.customType === payload.customType),
+			).toBe(false);
+
+			await expect(session.sendCustomMessage(payload, { deliveryMode: "steer" })).resolves.toEqual({
+				status: "accepted",
+				delivery: "plain_append",
+			});
+			expect(
+				session.agent.state.messages.filter(
+					message => message.role === "custom" && message.customType === payload.customType,
+				),
+			).toHaveLength(1);
+			expect(session.agent.state.messages).toContain(laterMessage);
+			await manager.ensureOnDisk();
+			await manager.flush();
+			const sessionFile = manager.getSessionFile();
+			if (!sessionFile) throw new Error("Expected a materialized session");
+
+			await session.dispose();
+			session = undefined as unknown as AgentSession;
+			const resumed = await reopen(sessionFile, sessionDir);
+			expect(resumed.agent.peekSteeringQueue()).toHaveLength(0);
+			expect(
+				resumed.sessionManager
+					.getBranch()
+					.filter(entry => entry.type === "custom_message" && entry.customType === payload.customType),
+			).toHaveLength(1);
+		});
+
 		it("starts a scoped auto turn when a busy receiver becomes idle during pending persistence", async () => {
 			const sessionDir = path.join(tempDir, "sessions");
 			const manager = SessionManager.create(tempDir, sessionDir);

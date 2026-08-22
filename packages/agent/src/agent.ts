@@ -1290,6 +1290,15 @@ export class Agent {
 		return removed;
 	}
 
+	/** Remove one exact live message by object identity without re-running input hooks. */
+	removeMessage(message: AgentMessage): boolean {
+		const index = this.#state.messages.lastIndexOf(message);
+		if (index === -1) return false;
+		this.#state.messages.splice(index, 1);
+		if (this.#state.streamMessage === message) this.#state.streamMessage = null;
+		return true;
+	}
+
 	/**
 	 * Queue a steering message to interrupt the agent mid-run.
 	 * Delivered after current tool execution, skips remaining tools.
