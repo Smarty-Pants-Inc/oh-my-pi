@@ -20,6 +20,7 @@ import {
 } from "../config/model-resolver";
 import inspectImageDescription from "../prompts/tools/inspect-image.md" with { type: "text" };
 import inspectImageSystemPromptTemplate from "../prompts/tools/inspect-image-system.md" with { type: "text" };
+import { resolveSettingsCacheRetention } from "../session/settings-stream-fn";
 import { concreteThinkingLevel, resolveThinkingLevelForModel, toReasoningEffort } from "../thinking";
 import {
 	ImageInputTooLargeError,
@@ -277,6 +278,7 @@ export class InspectImageTool implements AgentTool<typeof inspectImageSchema, In
 				},
 				{
 					apiKey: modelRegistry.resolver(model, this.session.getSessionId?.() ?? undefined),
+					cacheRetention: resolveSettingsCacheRetention(this.session.settings),
 					signal: effectiveSignal,
 					reasoning,
 				},

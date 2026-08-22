@@ -32,7 +32,9 @@ import { buildInitialMessage } from "./cli/initial-message";
 import { selectSession } from "./cli/session-picker";
 import { applyStartupCwd } from "./cli/startup-cwd";
 import { getLatestRelease } from "./cli/update-cli";
-import { CollabGuestLink } from "./collab/guest";
+import { CollabGuestLink, getCollabGuestRestorationCompletion } from "./collab/guest";
+import { type HerdrHostBridgeBootstrap, resolveHerdrHostBridge } from "./collab/herdr-bridge-bootstrap";
+import { HerdrCollabHostLifecycle, type ManagedHerdrHostBridge } from "./collab/herdr-host-lifecycle";
 import { CollabHost } from "./collab/host";
 import { createHostBridgeTransport, LocalCollabTransport } from "./collab/local-transport";
 import { findConfigFile } from "./config";
@@ -268,6 +270,8 @@ const RPC_BACKGROUND_DEFAULTED_SETTING_PATHS: SettingPath[] = [
 	"async.maxJobs",
 	"bash.autoBackground.enabled",
 	"bash.autoBackground.thresholdMs",
+	"eval.autoBackground.enabled",
+	"eval.autoBackground.thresholdMs",
 ];
 
 // Protocol-mode hosts opt into a small set of paths whose host-default we
@@ -454,7 +458,12 @@ export async function submitInteractiveInput(
 	}
 }
 
-type AcpSessionFactory = (cwd: string) => Promise<AgentSession>;
+interface AcpSessionHandle {
+	session: AgentSession;
+	setToolUIContext: (uiContext: ExtensionUIContext, hasUI: boolean) => void;
+}
+
+type AcpSessionFactory = (cwd: string, options?: { interactivePrompts?: boolean }) => Promise<AcpSessionHandle>;
 
 export interface AcpSessionFactoryOptions {
 	baseOptions: CreateAgentSessionOptions;
@@ -498,7 +507,7 @@ async function loadTrustedSessionExtensions(
  * tool registry and shadow the client-supplied servers (issue #1234).
  */
 export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSessionFactory {
-	return async cwd => {
+	return async (cwd, factoryOptions) => {
 		const nextSettings = await args.settings.cloneForCwd(cwd);
 		const nextSessionManager = SessionManager.create(cwd, args.sessionDir);
 		const agentId = `acp:${nextSessionManager.getSessionId()}`;
@@ -519,7 +528,7 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 				`Trusted extension failed to load: ${trustedExtensions.errors.map(item => item.error).join("; ")}`,
 			);
 		}
-		const { session: nextSession } = await args.createSession({
+		const { session: nextSession, setToolUIContext } = await args.createSession({
 			...args.baseOptions,
 			cwd,
 			sessionManager: nextSessionManager,
@@ -527,8 +536,9 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 			authStorage: args.authStorage,
 			modelRegistry: args.modelRegistry,
 			agentId,
-			// Preserve reserve-policy confirmation until ACP capabilities are known
-			// without enabling AskTool or other UI-only session behavior.
+			// ACP defers the `ask` capability and reserve-policy confirmation until
+			// client capabilities are known, without enabling other UI-only behavior.
+			interactivePrompts: factoryOptions?.interactivePrompts,
 			deferUsageReserveConfirmation: true,
 			enableMCP: false,
 			titleSystemPrompt,
@@ -559,13 +569,62 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 				throw error;
 			}
 		}
-		return nextSession;
+		return { session: nextSession, setToolUIContext };
 	};
 }
 
 export type CollabBridgeBootstrap =
-	| { role: "host"; address: string; token: string; paneId: string; ompSessionId: string; routeGeneration: number }
+	| (HerdrHostBridgeBootstrap & {
+			role: "host";
+			ompSessionId: string;
+			routeGeneration: number;
+	  })
+	| ManagedHerdrHostBridge
 	| { role: "guest"; address: string; roomId: string; token: string };
+async function rethrowAfterInteractiveStartupCleanup(error: unknown, cleanup: () => Promise<void>): Promise<never> {
+	try {
+		await cleanup();
+	} catch (cleanupError) {
+		logger.error("Interactive startup cleanup failed", { error: String(cleanupError) });
+	}
+	throw error;
+}
+
+export async function runInteractiveStartupSequence(
+	runSplash: (() => Promise<void>) | undefined,
+	runSetup: (() => Promise<void>) | undefined,
+	startPrivateHost: (() => Promise<void>) | undefined,
+	cleanupAfterPrivateHostFailure?: () => Promise<void>,
+): Promise<void> {
+	await runSplash?.();
+	await runSetup?.();
+	try {
+		await startPrivateHost?.();
+	} catch (error) {
+		if (cleanupAfterPrivateHostFailure) {
+			await rethrowAfterInteractiveStartupCleanup(error, cleanupAfterPrivateHostFailure);
+		}
+		throw error;
+	}
+}
+
+export async function reconcilePrivateHerdrAfterStartupJoin(mode: {
+	collabGuest?: unknown;
+	herdrCollabHostLifecycle?: Pick<HerdrCollabHostLifecycle, "resume">;
+	shutdown(): Promise<void>;
+}): Promise<void> {
+	if (mode.collabGuest) return;
+	try {
+		const restoration = getCollabGuestRestorationCompletion(mode);
+		if (restoration) {
+			await restoration;
+			return;
+		}
+		await mode.herdrCollabHostLifecycle?.resume();
+	} catch (error) {
+		await rethrowAfterInteractiveStartupCleanup(error, () => mode.shutdown());
+	}
+}
 
 async function runInteractiveMode(
 	session: AgentSession,
@@ -622,13 +681,15 @@ async function runInteractiveMode(
 		clearInitialTerminalHistory: true,
 	});
 
-	if (bridge?.role === "host") {
+	if (bridge?.role === "host" && !("managed" in bridge)) {
+		const hostBridge = await resolveHerdrHostBridge(bridge);
+		if (!hostBridge) throw new Error("Herdr OMP bridge credentials are unavailable");
 		const host = new CollabHost(mode);
 		await host.startWithTransport(
 			createHostBridgeTransport(
-				bridge.address,
-				bridge.token,
-				bridge.paneId,
+				hostBridge.address,
+				hostBridge.token,
+				hostBridge.paneId,
 				bridge.ompSessionId,
 				bridge.routeGeneration,
 			),
@@ -644,13 +705,19 @@ async function runInteractiveMode(
 			roomId: bridge.roomId,
 		});
 	}
-	if (setupWizard && playStartupSplash) {
-		await setupWizard.runStartupSplash(mode);
-	}
-
-	if (setupWizard && setupScenes.length > 0) {
-		await setupWizard.runSetupWizard(mode, setupScenes);
-	}
+	const managedBridge = bridge?.role === "host" && "managed" in bridge ? bridge : undefined;
+	await runInteractiveStartupSequence(
+		setupWizard && playStartupSplash ? () => setupWizard.runStartupSplash(mode) : undefined,
+		setupWizard && setupScenes.length > 0 ? () => setupWizard.runSetupWizard(mode, setupScenes) : undefined,
+		managedBridge
+			? async () => {
+					const lifecycle = new HerdrCollabHostLifecycle(mode, session, managedBridge);
+					mode.herdrCollabHostLifecycle = lifecycle;
+					await lifecycle.start(joinLink !== undefined);
+				}
+			: undefined,
+		managedBridge ? () => mode.shutdown() : undefined,
+	);
 
 	// Consume failures immediately, but defer any banner until the transcript is stable.
 	const checkedVersionPromise = versionCheckPromise.catch(() => undefined);
@@ -688,6 +755,7 @@ async function runInteractiveMode(
 	// `/join` so collab guards and error rendering stay in one place.
 	if (joinLink !== undefined) {
 		await executeBuiltinSlashCommand(`/join ${joinLink}`, { ctx: mode });
+		await reconcilePrivateHerdrAfterStartupJoin(mode);
 	}
 
 	if (initialMessage !== undefined) {
@@ -1344,6 +1412,8 @@ interface RunRootCommandDependencies {
 	consumeFreshOmpCompanionLaunchEnv?: typeof consumeFreshOmpCompanionLaunchEnv;
 	collabBridge?: CollabBridgeBootstrap;
 	verifyApprovedStartup?: (isInteractive: boolean) => Promise<void>;
+	herdrHostBridge?: HerdrHostBridgeBootstrap;
+	runInteractiveMode?: typeof runInteractiveMode;
 }
 const DEFAULT_RUN_ROOT_DEPENDENCIES: RunRootCommandDependencies = {};
 async function disposeSessionAndQuit(session: AgentSession, code: number): Promise<void> {
@@ -1429,6 +1499,7 @@ export async function runRootCommand(
 	// title refresh) can tell a focusable process from a print/RPC/eval one.
 	setInteractiveHost(isInteractive);
 	await deps.verifyApprovedStartup?.(isInteractive);
+	const automaticHerdrHostBridge = isInteractive && deps.collabBridge === undefined ? deps.herdrHostBridge : undefined;
 	const companionLaunchEnv = (deps.consumeFreshOmpCompanionLaunchEnv ?? consumeFreshOmpCompanionLaunchEnv)();
 	const companionSecret = await consumeFreshOmpCompanionSecret({
 		isInteractive,
@@ -1464,7 +1535,6 @@ export async function runRootCommand(
 		process.stderr.write(`${chalk.red(`Error: ${message}`)}\n`);
 		process.exit(1);
 	}
-	const modelRegistry = logger.time("modelRegistry:init", () => new ModelRegistry(authStorage));
 
 	const settingsInstance =
 		deps.settings ?? (await logger.time("settings:init", Settings.init, { cwd, configFiles: parsedArgs.config }));
@@ -1482,6 +1552,13 @@ export async function runRootCommand(
 	} else if (parsedArgs.mode === "acp") {
 		applyAcpDefaultSettingOverrides(settingsInstance);
 	}
+
+	// The registry composes policy-dependent metadata synchronously, including
+	// extended-context window caps, so it must receive the finalized settings.
+	const modelRegistry = logger.time(
+		"modelRegistry:init",
+		() => new ModelRegistry(authStorage, undefined, { settings: settingsInstance }),
+	);
 	if (parsedArgs.noPty || parsedArgs.mode === "rpc-ui") {
 		Bun.env.PI_NO_PTY = "1";
 	}
@@ -1908,6 +1985,16 @@ export async function runRootCommand(
 			eventBus,
 			preloadedExtensions: extensionsResult,
 		});
+		const interactiveCollabBridge: CollabBridgeBootstrap | undefined =
+			deps.collabBridge ??
+			(automaticHerdrHostBridge
+				? {
+						role: "host",
+						managed: true,
+						...automaticHerdrHostBridge,
+						routeGeneration: 1,
+					}
+				: undefined);
 		const activeCompanionController = companionController;
 		if (activeCompanionController) {
 			session.subscribe(event => {
@@ -2001,7 +2088,7 @@ export async function runRootCommand(
 
 			stopStartupWatchdog();
 			logger.endTiming();
-			await runInteractiveMode(
+			await (deps.runInteractiveMode ?? runInteractiveMode)(
 				session,
 				VERSION,
 				startupChangelog,
@@ -2019,7 +2106,7 @@ export async function runRootCommand(
 				initialImages,
 				parsedArgs.join,
 				activeCompanionController?.setStatusText,
-				deps.collabBridge,
+				interactiveCollabBridge,
 			);
 		} else {
 			// Branch-only single-shot runner: keep print-mode code out of normal interactive startup.

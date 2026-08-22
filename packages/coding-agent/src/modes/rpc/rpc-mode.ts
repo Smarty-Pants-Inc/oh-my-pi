@@ -1011,6 +1011,7 @@ export async function runRpcMode(
 					output: text => output({ type: "command_output", text }),
 					refreshCommands: emitAvailableCommandsUpdate,
 					reloadPlugins: reloadPluginState,
+					runCommandInBackground: task => shutdownCoordinator.track(task()),
 					notifyTitleChanged: async () => {
 						output({ type: "session_info_update", title: session.sessionName, sessionId: session.sessionId });
 					},
@@ -1029,7 +1030,11 @@ export async function runRpcMode(
 						});
 						return success(id, "prompt");
 					}
-					return success(id, "prompt", { agentInvoked: false });
+					// A consumed builtin is normally local-only, but some (e.g.
+					// `/retry`) schedule an agent turn whose events stream after
+					// this response. Report that so the host does not finalize the
+					// request as non-agent work while the agent is running.
+					return success(id, "prompt", { agentInvoked: builtinResult.agentInvoked === true });
 				}
 
 				// Don't await - events will stream

@@ -112,6 +112,7 @@ export interface InteractiveModeContext {
 	subagentContainer: Container;
 	btwContainer: Container;
 	omfgContainer: Container;
+	cleanseContainer: Container;
 	errorBannerContainer: Container;
 	modelCycleContainer: Container;
 	deferredCommandContainer: Container;
@@ -120,6 +121,7 @@ export interface InteractiveModeContext {
 	hookWidgetContainerAbove: Container;
 	hookWidgetContainerBelow: Container;
 	statusLine: StatusLineComponent;
+	syncComposerShape(): void;
 
 	// Session access
 	session: AgentSession;
@@ -145,6 +147,12 @@ export interface InteractiveModeContext {
 	mcpManager?: MCPManager;
 	lspServers?: LspStartupServerInfo[];
 	collabHost?: CollabHost;
+	herdrCollabHost?: CollabHost;
+	herdrCollabHostLifecycle?: {
+		stop(reason: string): Promise<void>;
+		suspend(reason: string): Promise<void>;
+		resume(): Promise<void>;
+	};
 	collabGuest?: CollabGuestLink;
 	eventController: EventController;
 	eventBus?: EventBus;
@@ -313,6 +321,17 @@ export interface InteractiveModeContext {
 		message: AgentMessage,
 		options?: { imageLinks?: readonly (string | undefined)[] },
 	): void;
+	/** True while an optimistically-rendered `/skill:` row awaits its canonical `message_start`. */
+	optimisticSkillMessagePending: boolean;
+	/** Optimistically renders a user-invoked `/skill:` row before its awaited dispatch (issue #8895). */
+	renderOptimisticSkillMessage(
+		message: AgentMessage,
+		options?: { imageLinks?: readonly (string | undefined)[] },
+	): void;
+	/** Swaps the optimistic `/skill:` row for the canonical message emitted by the session. */
+	reconcileOptimisticSkillMessage(message: AgentMessage): void;
+	/** Drops the optimistic `/skill:` row when dispatch fails or bails before reaching the agent. */
+	clearOptimisticSkillMessage(): void;
 	isKnownSlashCommand(text: string): boolean;
 	addMessageToChat(
 		message: AgentMessage,
@@ -400,7 +419,7 @@ export interface InteractiveModeContext {
 	showCopySelector(): void;
 	showTreeSelector(): void;
 	showSessionSelector(source?: ForeignSessionSource): void;
-	handleResumeSession(sessionPath: string): Promise<void>;
+	handleResumeSession(sessionPath: string): Promise<boolean>;
 	handleSessionDeleteCommand(): Promise<void>;
 	showOAuthSelector(mode: "login" | "logout", providerId?: string): Promise<void>;
 	showSessionPinSelector(): Promise<void>;
@@ -439,6 +458,9 @@ export interface InteractiveModeContext {
 	handleOmfgCommand(complaint: string): Promise<void>;
 	hasActiveOmfg(): boolean;
 	handleOmfgEscape(): boolean;
+	handleCleanseCommand(args: string): Promise<void>;
+	hasActiveCleanse(): boolean;
+	handleCleanseEscape(): boolean;
 	cycleThinkingLevel(): void;
 	cycleRoleModel(direction?: "forward" | "backward"): Promise<void>;
 	toggleToolOutputExpansion(): void;

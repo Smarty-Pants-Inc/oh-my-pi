@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { CollabHost } from "@oh-my-pi/pi-coding-agent/collab/host";
-import { LocalCollabTransport } from "@oh-my-pi/pi-coding-agent/collab/local-transport";
+import { createHostBridgeTransport, LocalCollabTransport } from "@oh-my-pi/pi-coding-agent/collab/local-transport";
 import { COLLAB_PROTO, type CollabFrame, type CollabUiRequestDraft } from "@oh-my-pi/pi-coding-agent/collab/protocol";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
+import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session-events";
 import { InMemoryCollabRouter, type InMemoryCollabTransport } from "./helpers/in-memory-transport";
@@ -12,18 +13,30 @@ const flush = async (): Promise<void> => {
 	await new Promise<void>(resolve => queueMicrotask(resolve));
 };
 
+interface NoticeRecord {
+	level: "info" | "warning" | "error";
+	message: string;
+	source?: string;
+}
+
 function makeHostContext(
 	prompts: { content: unknown; details?: unknown; options?: unknown }[],
 	listener: { current?: (event: AgentSessionEvent) => void },
 	onPrompt?: () => void,
+	options?: { getSessionId?: () => string; notices?: NoticeRecord[]; onAbort?: () => void },
 ): InteractiveModeContext {
 	return {
 		settings: { get: () => "" },
 		sessionManager: {
-			getSessionId: () => "host-session",
+			getSessionId: options?.getSessionId ?? (() => "host-session"),
 			getCwd: () => "/host",
 			snapshotForReplication: () => ({
-				header: { type: "session", id: "host-session", timestamp: "2026-01-01T00:00:00Z", cwd: "/host" },
+				header: {
+					type: "session",
+					id: options?.getSessionId?.() ?? "host-session",
+					timestamp: "2026-01-01T00:00:00Z",
+					cwd: "/host",
+				},
 				entries: [],
 			}),
 			onEntryAppended: undefined,
@@ -38,13 +51,18 @@ function makeHostContext(
 				listener.current = callback;
 				return () => {};
 			},
-			emitNotice: () => {},
+			emitNotice: (level: NoticeRecord["level"], message: string, source?: string) => {
+				options?.notices?.push({ level, message, source });
+			},
 			promptCustomMessage: (message: { content: unknown; details?: unknown }, options: unknown) => {
 				prompts.push({ content: message.content, details: message.details, options });
 				onPrompt?.();
 				return Promise.resolve();
 			},
-			abort: () => Promise.resolve(),
+			abort: () => {
+				options?.onAbort?.();
+				return Promise.resolve();
+			},
 		},
 		eventBus: undefined,
 		statusLine: {
@@ -71,9 +89,200 @@ function framesOf<T extends CollabFrame["t"]>(frames: CollabFrame[], type: T): E
 	return frames.filter((frame): frame is Extract<CollabFrame, { t: T }> => frame.t === type);
 }
 
-afterEach(() => AgentRegistry.resetGlobalForTests());
+afterEach(() => {
+	AgentLifecycleManager.resetGlobalForTests();
+	AgentRegistry.resetGlobalForTests();
+});
 
 describe("injected collab transport", () => {
+	it("keeps private notices isolated and its route alive across a rolled-back provisional target append", async () => {
+		let sessionId = "host-session";
+		const notices: NoticeRecord[] = [];
+		const listener: { current?: (event: AgentSessionEvent) => void } = {};
+		const router = new InMemoryCollabRouter();
+		const hostTransport = router.host();
+		const ctx = makeHostContext([], listener, undefined, { getSessionId: () => sessionId, notices });
+		const host = new CollabHost(ctx);
+		await host.startWithTransport(hostTransport, { trustedLocal: true, privateHost: true });
+		const peer = router.guest();
+		router.setAuthority(peer.peerId, true);
+		connectRawPeer(peer, "Herdr user");
+		await flush();
+		peer.send({ t: "abort" });
+		await flush();
+		peer.close();
+		await flush();
+		sessionId = "provisional-target";
+		ctx.sessionManager.onEntryAppended?.({
+			type: "thinking_level_change",
+			id: "entry-provisional",
+			parentId: null,
+			timestamp: "2026-01-01T00:00:01Z",
+			thinkingLevel: "low",
+		});
+		await flush();
+		sessionId = "host-session";
+		expect(hostTransport.isOpen).toBe(true);
+		hostTransport.close();
+		await flush();
+		expect(notices).toEqual([]);
+	});
+
+	it("replays a pending private UI request after the writable native renderer disconnects and is replaced", async () => {
+		const router = new InMemoryCollabRouter();
+		const host = new CollabHost(makeHostContext([], {}));
+		await host.startWithTransport(router.host(), { trustedLocal: true, privateHost: true });
+		try {
+			const first = router.guest();
+			router.setAuthority(first.peerId, true);
+			const firstFrames = connectRawPeer(first, "native renderer");
+			await flush();
+
+			const pending = host.requestGuestUi({ kind: "editor", title: "Needs native input" });
+			if (!pending) throw new Error("expected writable private renderer to accept UI requests");
+			await flush();
+			const original = framesOf(firstFrames, "ui-request").at(-1);
+			if (!original) throw new Error("expected private UI request");
+			let settled = false;
+			void pending.then(() => {
+				settled = true;
+			});
+
+			first.close();
+			await flush();
+			expect(host.participants).toHaveLength(1);
+			expect(settled).toBe(false);
+
+			const replacement = router.guest();
+			router.setAuthority(replacement.peerId, true);
+			const replacementFrames = connectRawPeer(replacement, "replacement renderer");
+			await flush();
+			expect(framesOf(replacementFrames, "ui-request")).toEqual([original]);
+
+			replacement.send({ t: "ui-response", reqId: original.request.reqId, value: "replacement answer" });
+			expect(await pending).toEqual({ kind: "answered", value: "replacement answer" });
+		} finally {
+			await host.stop("test cleanup");
+		}
+	});
+
+	it("rejects private-route mutations during a session mismatch and accepts them after rearm", async () => {
+		let sessionId = "host-session";
+		let aborts = 0;
+		const prompts: { content: unknown; details?: unknown; options?: unknown }[] = [];
+		const listener: { current?: (event: AgentSessionEvent) => void } = {};
+		const ctx = makeHostContext(prompts, listener, undefined, {
+			getSessionId: () => sessionId,
+			onAbort: () => aborts++,
+		});
+		const router = new InMemoryCollabRouter();
+		const transport = router.host();
+		const host = new CollabHost(ctx);
+		let rearmed: CollabHost | undefined;
+		try {
+			await host.startWithTransport(transport, { trustedLocal: true, privateHost: true });
+			const peer = router.guest();
+			router.setAuthority(peer.peerId, true);
+			const frames = connectRawPeer(peer, "Herdr user");
+			await flush();
+
+			const pending = host.requestGuestUi({ kind: "select", title: "Continue?", options: ["Yes"] });
+			if (!pending) throw new Error("expected writable private route");
+			await flush();
+			const pendingRequest = framesOf(frames, "ui-request").at(-1);
+			if (!pendingRequest) throw new Error("expected private UI request");
+			sessionId = "provisional-target";
+			expect(host.requestGuestUi({ kind: "select", title: "Blocked", options: ["Yes"] })).toBeNull();
+			expect(framesOf(frames, "ui-request")).toHaveLength(1);
+			const mutations: CollabFrame[] = [
+				{ t: "hello", proto: COLLAB_PROTO, name: "stale renderer" },
+				{ t: "prompt", text: "blocked" },
+				{ t: "abort" },
+				{ t: "agent-cmd", cmd: "kill", agentId: "subagent" },
+				{ t: "ui-response", reqId: pendingRequest.request.reqId, value: "Yes" },
+			];
+			for (const frame of mutations) transport.onFrame?.(frame, peer.peerId);
+			await flush();
+
+			expect(prompts).toEqual([]);
+			expect(aborts).toBe(0);
+			expect(await pending).toEqual({ kind: "unavailable" });
+			expect(framesOf(frames, "welcome")).toHaveLength(1);
+			expect(framesOf(frames, "error").map(frame => frame.message)).toEqual(
+				mutations.map(() => "private collab route is rearming for a session switch"),
+			);
+
+			await host.stop("session switched");
+
+			const rearmedRouter = new InMemoryCollabRouter();
+			rearmed = new CollabHost(ctx);
+			await rearmed.startWithTransport(rearmedRouter.host(), { trustedLocal: true, privateHost: true });
+			const rearmedPeer = rearmedRouter.guest();
+			rearmedRouter.setAuthority(rearmedPeer.peerId, true);
+			const rearmedFrames = connectRawPeer(rearmedPeer, "Herdr user");
+			await flush();
+
+			rearmedPeer.send({ t: "prompt", text: "accepted" });
+			rearmedPeer.send({ t: "abort" });
+			rearmedPeer.send({ t: "agent-cmd", cmd: "kill", agentId: "subagent" });
+			await flush();
+			expect(prompts).toEqual([
+				{
+					content: "accepted",
+					details: { from: "Herdr user" },
+					options: { streamingBehavior: "steer", queueChipText: "accepted" },
+				},
+			]);
+			expect(aborts).toBe(1);
+			expect(framesOf(rearmedFrames, "error")).toEqual([]);
+
+			const rearmedPending = rearmed.requestGuestUi({ kind: "select", title: "Continue?", options: ["Yes"] });
+			if (!rearmedPending) throw new Error("expected writable rearmed route");
+			await flush();
+			const request = framesOf(rearmedFrames, "ui-request").at(-1);
+			if (!request) throw new Error("expected rearmed UI request");
+			rearmedPeer.send({ t: "ui-response", reqId: request.request.reqId, value: "Yes" });
+			expect(await rearmedPending).toEqual({ kind: "answered", value: "Yes" });
+		} finally {
+			await rearmed?.stop("test cleanup");
+			await host.stop("test cleanup");
+		}
+	});
+
+	it("emits join, interrupt, leave, session-switch, and close notices for public collab", async () => {
+		let sessionId = "host-session";
+		const notices: NoticeRecord[] = [];
+		const listener: { current?: (event: AgentSessionEvent) => void } = {};
+		const router = new InMemoryCollabRouter();
+		const host = new CollabHost(makeHostContext([], listener, undefined, { getSessionId: () => sessionId, notices }));
+		await host.startWithTransport(router.host(), { trustedLocal: true });
+		const peer = router.guest();
+		router.setAuthority(peer.peerId, true);
+		connectRawPeer(peer, "Public guest");
+		await flush();
+		peer.send({ t: "abort" });
+		await flush();
+		peer.close();
+		await flush();
+		sessionId = "committed-target";
+		listener.current?.({ type: "agent_start" });
+		await flush();
+
+		const closeRouter = new InMemoryCollabRouter();
+		const closeTransport = closeRouter.host();
+		const closeHost = new CollabHost(makeHostContext([], {}, undefined, { notices }));
+		await closeHost.startWithTransport(closeTransport, { trustedLocal: true });
+		closeTransport.close();
+		await flush();
+
+		expect(notices).toEqual([
+			{ level: "info", message: "Public guest joined the collab session", source: "collab" },
+			{ level: "info", message: "Public guest interrupted", source: "collab" },
+			{ level: "info", message: "Public guest left the collab session", source: "collab" },
+			{ level: "warning", message: "Collab ended: session switched", source: "collab" },
+			{ level: "warning", message: "Collab ended: closed", source: "collab" },
+		]);
+	});
 	it("keeps one trusted-local controller and independently routes snapshots, UI, failover, and broadcasts", async () => {
 		const router = new InMemoryCollabRouter();
 		const prompts: { content: unknown; details?: unknown; options?: unknown }[] = [];
@@ -327,6 +536,90 @@ describe("injected collab transport", () => {
 			},
 		]);
 	});
+
+	it("rejects startup when Herdr coalesces ready and close in one read", async () => {
+		const registrations: string[] = [];
+		const ctx = makeHostContext([], {});
+		ctx.session.subscribe = (callback: (event: AgentSessionEvent) => void) => {
+			registrations.push("session");
+			callback({ type: "agent_start" });
+			return () => {};
+		};
+		ctx.eventBus = {
+			on(channel: string, _handler: (data: unknown) => void) {
+				registrations.push(`event:${channel}`);
+				return () => {};
+			},
+		} as unknown as NonNullable<InteractiveModeContext["eventBus"]>;
+		ctx.sessionManager.subscribeEntryAppended = () => {
+			registrations.push("entry");
+			return () => {};
+		};
+
+		const socket = { write: () => 0, end: () => {} } as unknown as Bun.Socket<undefined>;
+		const connectSpy = spyOn(Bun, "connect").mockImplementation(((
+			options: Bun.TCPSocketConnectOptions<undefined>,
+		) => {
+			options.socket.open?.(socket);
+			options.socket.data?.(socket, Buffer.from('{"t":"ready"}\n{"t":"close","reason":"bridge dropped"}\n'));
+			return Promise.resolve(socket);
+		}) as typeof Bun.connect);
+		const intervalSpy = spyOn(globalThis, "setInterval").mockImplementation(
+			(() => 0) as unknown as typeof globalThis.setInterval,
+		);
+		const registrySpy = spyOn(AgentRegistry.global(), "onChange");
+		let terminatedReason: string | undefined;
+		try {
+			const host = new CollabHost(ctx);
+			await expect(
+				host.startWithTransport(
+					createHostBridgeTransport("127.0.0.1:1", "route-token", "pane-7", "host-session", 1),
+					{
+						trustedLocal: true,
+						privateHost: true,
+						onTerminated: reason => {
+							terminatedReason = reason;
+						},
+					},
+				),
+			).rejects.toThrow("bridge dropped");
+
+			expect(terminatedReason).toBe("bridge dropped");
+			expect(registrations).toEqual([]);
+			expect(registrySpy).not.toHaveBeenCalled();
+			expect(intervalSpy).not.toHaveBeenCalled();
+		} finally {
+			registrySpy.mockRestore();
+			intervalSpy.mockRestore();
+			connectSpy.mockRestore();
+		}
+	});
+
+	it("surfaces a Herdr error before ready as the exact host startup failure", async () => {
+		const server = Bun.listen({
+			hostname: "127.0.0.1",
+			port: 0,
+			socket: {
+				open(socket) {
+					socket.write('{"t":"error","code":"omp-build-mismatch","message":"expected build-a, got build-b"}\n');
+				},
+				data() {},
+			},
+		});
+		try {
+			const prompts: { content: unknown; details?: unknown; options?: unknown }[] = [];
+			const listener: { current?: (event: AgentSessionEvent) => void } = {};
+			const host = new CollabHost(makeHostContext(prompts, listener));
+			await expect(
+				host.startWithTransport(
+					createHostBridgeTransport(`127.0.0.1:${server.port}`, "route-token", "pane-7", "host-session", 1),
+					{ trustedLocal: true, privateHost: true },
+				),
+			).rejects.toThrow("omp-build-mismatch: expected build-a, got build-b");
+		} finally {
+			server.stop(true);
+		}
+	});
 	it("rejects malformed outer attribution without closing the Herdr transport", async () => {
 		const opened = Promise.withResolvers<Bun.Socket<undefined>>();
 		const server = Bun.listen({
@@ -335,6 +628,7 @@ describe("injected collab transport", () => {
 			socket: {
 				open(socket) {
 					opened.resolve(socket);
+					socket.write('{"t":"ready"}\n');
 				},
 				data() {},
 			},
@@ -372,6 +666,7 @@ describe("injected collab transport", () => {
 			socket: {
 				open(socket) {
 					opened.resolve(socket);
+					socket.write('{"t":"ready"}\n');
 				},
 				data() {},
 			},
@@ -407,6 +702,7 @@ describe("injected collab transport", () => {
 			socket: {
 				open(socket) {
 					opened.resolve(socket);
+					socket.write('{"t":"ready"}\n');
 				},
 				data() {},
 			},

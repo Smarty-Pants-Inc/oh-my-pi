@@ -5,7 +5,8 @@ import {
 	getModelMatchPreferences,
 	resolveCliModel,
 } from "../config/model-resolver";
-import type { SettingPath } from "../config/settings";
+import type { SettingPath, Settings } from "../config/settings";
+import { isCurrentGoalModeState } from "../goals/state";
 import { describeLoopLimitRuntime } from "../modes/loop-limit";
 import type { InteractiveModeContext } from "../modes/types";
 import type { AgentSession } from "../session/agent-session";
@@ -52,6 +53,32 @@ async function runWithDetachedModeDraft(
 /** `/fast status` label for the active model: "on" when its family is priority, else "off". */
 function formatFastModeStatus(session: AgentSession): string {
 	return session.isFastModeEnabled() ? "on" : "off";
+}
+
+/** `/extended-context status` label for the premium long-context window setting. */
+function formatExtendedContextStatus(settings: Settings): string {
+	return settings.get("extendedContext") ? "on" : "off";
+}
+
+/** Applies an `/extended-context` argument and returns its operator feedback. */
+function applyExtendedContextCommand(settings: Settings, args: string): string | undefined {
+	const arg = args.trim().toLowerCase();
+	const current = settings.get("extendedContext");
+	if (!arg || arg === "toggle") {
+		const enabled = !current;
+		settings.set("extendedContext", enabled);
+		return `Extended context ${enabled ? "enabled" : "disabled"}.`;
+	}
+	if (arg === "on") {
+		settings.set("extendedContext", true);
+		return "Extended context enabled.";
+	}
+	if (arg === "off") {
+		settings.set("extendedContext", false);
+		return "Extended context disabled.";
+	}
+	if (arg === "status") return `Extended context is ${formatExtendedContextStatus(settings)}.`;
+	return undefined;
 }
 
 /** Detailed, session-effective `/computer status` diagnostics. */
@@ -249,7 +276,7 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 			{ name: "set", description: "Set or replace the goal", usage: "<objective>" },
 			{ name: "show", description: "Show current goal details" },
 			{ name: "pause", description: "Pause the current goal" },
-			{ name: "resume", description: "Resume a paused goal" },
+			{ name: "resume", description: "Resume a paused, blocked, or limited goal" },
 			{ name: "drop", description: "Drop the current goal" },
 			{ name: "budget", description: "Adjust the token budget", usage: "<N|off>" },
 		],
@@ -259,7 +286,9 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 			if (!runtime.ctx.settings.get("goal.enabled" as SettingPath)) return "Goal: disabled in settings";
 			if (runtime.ctx.planModeEnabled) return "Goal: blocked by plan mode";
 			const state = runtime.ctx.session.getGoalModeState();
-			return state ? `Goal: ${state.goal.status} (${shortDetail(state.goal.objective)})` : "Goal: off";
+			return isCurrentGoalModeState(state)
+				? `Goal: ${state.goal.status} (${shortDetail(state.goal.objective)})`
+				: "Goal: off";
 		},
 		handleTui: async (command, runtime) => {
 			await runWithDetachedModeDraft(command, runtime, () =>
@@ -430,6 +459,32 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 				return;
 			}
 			runtime.ctx.showStatus("Usage: /fast [on|off|status]");
+			runtime.ctx.editor.setText("");
+		},
+	},
+	{
+		name: "extended-context",
+		description: "Toggle premium long-context windows",
+		acpDescription: "Toggle extended context",
+		acpInputHint: "[on|off|status]",
+		subcommands: [
+			{ name: "on", description: "Enable premium long-context windows" },
+			{ name: "off", description: "Use standard-pricing context windows" },
+			{ name: "status", description: "Show extended context status" },
+		],
+		allowArgs: true,
+		getTuiAutocompleteDescription: runtime =>
+			`Extended context: ${formatExtendedContextStatus(runtime.ctx.settings)}`,
+		handle: async (command, runtime) => {
+			const output = applyExtendedContextCommand(runtime.settings, command.args);
+			if (!output) return usage("Usage: /extended-context [on|off|status]", runtime);
+			await runtime.output(output);
+			return commandConsumed();
+		},
+		handleTui: (command, runtime) => {
+			const output = applyExtendedContextCommand(runtime.ctx.settings, command.args);
+			refreshStatusLine(runtime.ctx);
+			runtime.ctx.showStatus(output ?? "Usage: /extended-context [on|off|status]");
 			runtime.ctx.editor.setText("");
 		},
 	},

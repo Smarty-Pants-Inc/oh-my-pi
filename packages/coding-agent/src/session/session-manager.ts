@@ -26,6 +26,7 @@ import {
 	type ArtifactWriterLease,
 } from "./artifacts";
 import { type BlobPutOptions, type BlobPutResult, BlobStore } from "./blob-store";
+import type { CompactionMethod } from "./compaction-methods";
 import {
 	type BashExecutionMessage,
 	type CustomMessage,
@@ -542,6 +543,13 @@ export class SessionManager {
 	 * in-memory (pre-blob-externalization) entry, so inline images survive.
 	 */
 	onEntryAppended?: (entry: SessionEntry) => void;
+	readonly #entryAppendedSubscribers = new Set<(entry: SessionEntry) => void>();
+
+	/** Subscribe without replacing another collaboration host's replication tap. */
+	subscribeEntryAppended(callback: (entry: SessionEntry) => void): () => void {
+		this.#entryAppendedSubscribers.add(callback);
+		return () => this.#entryAppendedSubscribers.delete(callback);
+	}
 
 	#turnBudgetTotal: number | null = null;
 	#turnBudgetHard = false;
@@ -1148,14 +1156,16 @@ export class SessionManager {
 	}
 
 	#notifyEntryAppended(entry: SessionEntry): void {
-		const callback = this.onEntryAppended;
-		if (callback) {
+		const notify = (callback: ((entry: SessionEntry) => void) | undefined): void => {
+			if (!callback) return;
 			try {
 				callback(entry);
 			} catch (err) {
-				logger.warn("collab entry hook failed", { error: String(err) });
+				logger.warn("session entry hook failed", { error: String(err) });
 			}
-		}
+		};
+		notify(this.onEntryAppended);
+		for (const callback of this.#entryAppendedSubscribers) notify(callback);
 	}
 
 	#resetToNewSession(options?: NewSessionOptions, forcedSessionFile?: string): string | undefined {
@@ -2270,6 +2280,21 @@ export class SessionManager {
 		return this.#sessionFile;
 	}
 
+	/**
+	 * Whether the current session has actually been materialized to durable
+	 * storage (the JSONL exists on disk / in the active storage backend).
+	 *
+	 * Session persistence is lazy: the file is only written once the history
+	 * contains an assistant message (or an explicit {@link ensureOnDisk}
+	 * caller forces it). Until then {@link getSessionFile} returns an allocated
+	 * path that leads nowhere, so a `--resume <id>` hint built from it would
+	 * always fail. Consumers that advertise a resume command must gate on this
+	 * (issue #8860).
+	 */
+	isSessionOnDisk(): boolean {
+		return !!this.#sessionFile && this.#storage.existsSync(this.#sessionFile);
+	}
+
 	getArtifactsDir(): string | null {
 		if (this.#adoptedArtifactManager) return this.#adoptedArtifactManager.dir;
 		return artifactsDirectoryFor(this.#sessionFile);
@@ -2643,9 +2668,13 @@ export class SessionManager {
 		shortSummary: string | undefined,
 		firstKeptEntryId: string,
 		tokensBefore: number,
-		details?: T,
-		fromExtension?: boolean,
-		preserveData?: Record<string, unknown>,
+		options: {
+			details?: T;
+			fromExtension?: boolean;
+			preserveData?: Record<string, unknown>;
+			method?: CompactionMethod;
+			tokensAfter?: number;
+		} = {},
 	): string {
 		const entry: CompactionEntry<T> = {
 			type: "compaction",
@@ -2654,9 +2683,11 @@ export class SessionManager {
 			shortSummary,
 			firstKeptEntryId,
 			tokensBefore,
-			details,
-			fromExtension,
-			preserveData,
+			tokensAfter: options.tokensAfter,
+			method: options.method,
+			details: options.details,
+			fromExtension: options.fromExtension,
+			preserveData: options.preserveData,
 		};
 		this.#recordEntry(entry);
 		return entry.id;

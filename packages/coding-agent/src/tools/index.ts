@@ -1,5 +1,5 @@
 import type { Clipboard, InMemorySnapshotStore } from "@oh-my-pi/hashline";
-import type { AgentOptions, AgentTelemetryConfig, AgentTool } from "@oh-my-pi/pi-agent-core";
+import type { AgentOptions, AgentTelemetryConfig, AgentTool, AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import type { FetchImpl, ImageContent, Model, ServiceTierByFamily, ToolChoice } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { AsyncJobManager } from "../async/job-manager";
@@ -161,6 +161,8 @@ export interface ToolSession {
 	additionalDirectories?: string[];
 	/** Whether UI is available */
 	hasUI: boolean;
+	/** Whether `ask` can reach a human. Defaults to `hasUI`. */
+	canPromptUser?: boolean;
 	/** Whether this session has begun disposal. */
 	isDisposed?: () => boolean;
 	/**
@@ -256,6 +258,12 @@ export interface ToolSession {
 	getCurrentTurnId?: () => string | undefined;
 	/** Look up a registered tool by name (used by the eval js backend's tool bridge). */
 	getToolByName?: (name: string) => AgentTool | undefined;
+	/** Look up an enabled tool through the eval bridge's normal permission pipeline. */
+	getToolForEvalBridge?: (name: string) => AgentTool | undefined;
+	/** Current session context for eval-bridged tool execution. */
+	getToolContext?: () => AgentToolContext | undefined;
+	/** Names currently authorized for invocation through the eval bridge. */
+	getEvalBridgeToolNames?: () => readonly string[];
 	/** Return whether a built-in tool is active in this turn's tool set. */
 	isToolActive?: (name: string) => boolean;
 	/** Update the active built-in tool predicate when a session changes tools mid-run. */
@@ -319,6 +327,8 @@ export interface ToolSession {
 	getPlanReferencePath?: () => string;
 	/** Goal mode state (if active or paused) */
 	getGoalModeState?: () => GoalModeState | undefined;
+	/** Whether terminal goal cleanup is still restoring the prior toolset. */
+	isGoalModeExiting?: () => boolean;
 	/** Goal runtime for the active agent session. */
 	getGoalRuntime?: () => GoalRuntime | undefined;
 	/** Get cumulative session usage statistics (input/output tokens, cost). */
@@ -399,7 +409,10 @@ export interface ToolSession {
 	/** Register cleanup that runs when this session is disposed; returns a handle that removes the cleanup. */
 	registerDisposeCallback?(callback: () => void): (() => void) | void;
 	/** Register cleanup that runs when this ToolSession adopts a different session ID. */
-	registerSessionChangeCallback?(callback: () => void, options?: { onDiscard?: () => void }): (() => void) | void;
+	registerSessionChangeCallback?(
+		callback: () => void,
+		options?: { onDiscard?: () => void; onRollback?: () => void },
+	): (() => void) | void;
 	/** Queue late LSP diagnostics (arrived after an edit/write returned) to be shown
 	 *  in the transcript and delivered to the model at the next yield, like background
 	 *  job results. */
@@ -475,7 +488,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 			? normalizeToolNames(toolNames)
 			: undefined;
 	const goalEnabled = session.settings.get("goal.enabled");
-	const goalModeExiting = session.getGoalModeState?.()?.mode === "exiting";
+	const goalModeExiting = session.isGoalModeExiting?.() === true;
 	const goalExplicitlyRequested = requestedTools?.includes("goal") === true;
 	const goalAvailable =
 		!restrictToolNames &&

@@ -5,6 +5,11 @@
 ### Fixed
 
 - Fixed terminal stale-todo closure rejections appearing as ordinary completion; browser guests now show a persistent error notice instead.
+## [17.3.8] - 2026-08-19
+
+### Fixed
+
+- The ask tool card now renders the note the user attached to their answer; previously it was dropped from HTML exports and the collab guest view.
 
 ## [17.2.10] - 2026-08-06
 

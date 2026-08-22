@@ -550,6 +550,14 @@ prompts:
     visibility: model
     defaultEnabled: false
     order: 750
+  - id: edit.sloppy
+    path: edit/sloppy.md
+    role: system
+    target: [main]
+    trigger: optional_mode
+    visibility: model
+    defaultEnabled: false
+    order: 755
   - id: live.agent-final-message
     path: live/prompts/agent-final-message.md
     role: system
@@ -1590,6 +1598,14 @@ prompts:
     visibility: model
     defaultEnabled: true
     order: 2060
+  - id: tool.eval-code-mode
+    path: prompts/tools/eval-code-mode.md
+    role: system
+    target: [main, subagent]
+    trigger: tool_available
+    visibility: model
+    defaultEnabled: true
+    order: 2065
   - id: tool.eval
     path: prompts/tools/eval.md
     role: system
@@ -1902,6 +1918,22 @@ prompts:
     visibility: model
     defaultEnabled: false
     order: 2450
+  - id: tool.yield
+    path: prompts/tools/yield.md
+    role: system
+    target: [main, subagent]
+    trigger: tool_available
+    visibility: model
+    defaultEnabled: true
+    order: 2445
+  - id: goal.advisor_mission
+    path: prompts/advisor/mission-context.md
+    role: internal_context
+    target: [side_model]
+    trigger: goal_updated
+    visibility: model
+    defaultEnabled: false
+    order: 995
 
 nonModelDocumentation:
   - modes/components/snapcompact-shape-preview-doc.md

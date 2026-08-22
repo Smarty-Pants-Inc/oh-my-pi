@@ -37,6 +37,7 @@ import type { HindsightSessionState } from "../hindsight/state";
 import type { LocalProtocolOptions } from "../internal-urls";
 import type { MCPManager } from "../mcp/manager";
 import type { MnemopiSessionState } from "../mnemopi/state";
+import { initializeExtensions } from "../modes/runtime-init";
 import { AgentLifecycleManager, type AgentReviver } from "../registry/agent-lifecycle";
 import { AgentRegistry } from "../registry/agent-registry";
 import { type CreateAgentSessionOptions, createAgentSession, discoverAuthStorage } from "../sdk";
@@ -906,7 +907,7 @@ export function createSubagentSettings(
 	return Settings.isolated(
 		{
 			...snapshot,
-			// Async jobs and bash auto-backgrounding are inherited from the parent:
+			// Async jobs and bash/eval auto-backgrounding are inherited from the parent:
 			// background jobs are owner-routed to the subagent's own session, and
 			// the run driver's quiescence barrier + teardown reap guarantee no
 			// owner job outlives the run, so worktree capture/cleanup stays
@@ -3101,6 +3102,16 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					const { session: revived } = await createAgentSession(
 						buildSubagentSessionOptions(reopened, expectedAgentRef),
 					);
+					// Re-run the executor's extension wiring on the rebuilt session.
+					// Skipping it leaves the runner pre-init, so a `tool_call` handler
+					// touching a runtime action trips the fail-closed gate and blocks
+					// every tool (including `yield`) in the revived agent (issue #8824).
+					await initializeExtensions(revived, {
+						reportSendError: (action, err) =>
+							logger.error("Extension send failed", { action, error: err.message }),
+						reportRuntimeError: err =>
+							logger.error("Extension error", { path: err.extensionPath, error: err.error }),
+					});
 					AgentRegistry.global().syncSessionStatus(id, revived);
 					installIrcWakeTurnMonitor(revived);
 					return revived;
@@ -3135,7 +3146,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			session.sessionManager.appendSessionInit({
 				systemPrompt: session.agent.state.systemPrompt.join("\n\n"),
 				task,
-				tools: session.getActiveToolNames(),
+				tools: session.getEnabledToolNames(),
 				agent: agent.name,
 				modelRole: modelRole ?? resolveExplicitModelRole(modelOverride ?? agent.model, subagentSettings),
 				resolvedModel: progress.resolvedModel,

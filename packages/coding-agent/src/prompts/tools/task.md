@@ -11,6 +11,10 @@ Execution returns job IDs immediately; completed results are delivered automatic
 Execution waits for each assignment to finish.
 {{/if}}
 
+# Task Design
+- Pick each item's most specific available agent. Omitting `agent` selects the spawn-policy default (`{{defaultAgent}}`); omit it only when that agent fits the task. Otherwise pass the specialist explicitly.
+- Parallelize independent ownership. Same-file edits are not guaranteed to merge.{{#if ircEnabled}} Have siblings coordinate through `hub` before editing shared files.{{/if}} Keep coupled changes under one integration owner.
+
 # Inputs
 {{#if batchEnabled}}
 - `context`: Shared goal, constraints, and contracts for every assignment.
@@ -40,6 +44,7 @@ Execution waits for each assignment to finish.
 {{#if spawningDisabled}}
 Agent spawning is disabled.
 {{else}}
+Pick the most specific agent. Omit `agent` only when the spawn-policy default is that agent.
 {{#list agents join="\n"}}
 ### {{name}}{{#if readOnly}} (read-only){{/if}}{{#if blocking}} (blocking){{/if}}
 {{description}}

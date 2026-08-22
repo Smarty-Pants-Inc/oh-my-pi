@@ -32,6 +32,7 @@ import type {
 	BeforeProviderRequestEvent,
 	BeforeProviderRequestEventResult,
 	CompactOptions,
+	ComposerShapeDefinition,
 	ContextEvent,
 	ContextEventResult,
 	ContextUsage,
@@ -1078,6 +1079,15 @@ export class ExtensionRunner {
 		if (firstFailure) throw firstFailure.reason;
 	}
 
+	/** Composer shapes registered during extension load, with later extensions winning id collisions. */
+	getComposerShapes(): ComposerShapeDefinition[] {
+		const shapes = new Map<string, ComposerShapeDefinition>();
+		for (const extension of this.extensions) {
+			for (const [id, shape] of extension.composerShapes) shapes.set(id, shape);
+		}
+		return [...shapes.values()];
+	}
+
 	/**
 	 * Aggregate the registered CLI flags across a set of extensions (last write
 	 * wins on name collision). Static so callers that need the flag set before a
@@ -1314,6 +1324,7 @@ export class ExtensionRunner {
 			cwd: this.cwd,
 			sessionManager: this.sessionManager,
 			modelRegistry: this.modelRegistry,
+			isProjectTrusted: () => true,
 			get model() {
 				return getModel();
 			},
@@ -1631,20 +1642,20 @@ export class ExtensionRunner {
 	}
 
 	/**
-	 * Emit an ordinary event to every matching handler, await optional lifecycle
-	 * preparation, then run host-owned post-dispatch publication against a newly
-	 * sampled context. Preparation may return the continuation that activates the
-	 * selected lifecycle owner; that continuation runs only after every
+	 * Await optional lifecycle preparation, emit an ordinary event to every
+	 * matching handler, then run host-owned post-dispatch publication against a
+	 * newly sampled context. Preparation may return the continuation that activates
+	 * the selected lifecycle owner; that continuation runs only after every
 	 * `afterDispatch` callback has completed. Preparation failures and the Fresh
-	 * snapshot-ack publication sentinel propagate and suppress activation; unrelated
-	 * host callback errors and timeouts remain contained.
+	 * snapshot-ack publication sentinel propagate and suppress event dispatch or
+	 * activation; unrelated host callback errors and timeouts remain contained.
 	 */
 	async emitWithHostCompletion<TEvent extends RunnerEmitEvent>(
 		event: TEvent,
 		prepareHostCompletion?: HostCompletionPreparation,
 	): Promise<RunnerEmitResult<TEvent>> {
-		const result = await this.emit(event);
 		const prepared = await prepareHostCompletion?.();
+		const result = await this.emit(event);
 		const postHostContinuation = typeof prepared === "function" ? prepared : undefined;
 		const binding = this.#hostInternalExtension;
 		if (binding?.afterDispatch) {
@@ -2027,8 +2038,9 @@ export class ExtensionRunner {
 		return currentPayload;
 	}
 
-	async emitAfterProviderResponse(response: ProviderResponseMetadata, _model?: Model): Promise<void> {
-		const ctx = this.createContext();
+	/** Runs response hooks with the model that produced that provider response. */
+	async emitAfterProviderResponse(response: ProviderResponseMetadata, model?: Model): Promise<void> {
+		const ctx = this.createContext(model);
 
 		for (const ext of this.extensions) {
 			const handlers = ext.handlers.get("after_provider_response");

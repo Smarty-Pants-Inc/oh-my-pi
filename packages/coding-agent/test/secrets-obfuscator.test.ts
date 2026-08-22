@@ -10,6 +10,7 @@ import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Context, Message, TextContent } from "@oh-my-pi/pi-ai";
+import { bindRenderedInstruction } from "@oh-my-pi/pi-coding-agent/context/registry";
 import {
 	builtinCredentialSecretEntries,
 	getExistingSecretPlaceholderKey,
@@ -172,6 +173,51 @@ describe("SecretObfuscator regex behavior", () => {
 		expect(obfuscator.deobfuscate(JSON.stringify(obfuscated.messages))).toContain(secret);
 		// ...but the author-controlled system prompt passes through by reference.
 		expect(obfuscated.systemPrompt).toBe(context.systemPrompt);
+	});
+
+	it("shares collision discovery across messages and registered instructions", () => {
+		const obfuscator = new SecretObfuscator(
+			[
+				{ type: "plain", content: "OTHERSECRET", friendlyName: "TOKABC123" },
+				{ type: "regex", content: "tok_[a-z0-9]+", mode: "replace" },
+			],
+			"test-key",
+		);
+		const context: Context = {
+			messages: [{ role: "user", content: "use OTHERSECRET", timestamp: 1 }],
+			instructions: [bindRenderedInstruction("goal.advisor_mission", "finish tok_abc123", "side_model")],
+		};
+
+		const obfuscated = obfuscateProviderContext(obfuscator, context);
+		const serialized = JSON.stringify(obfuscated);
+		expect(serialized).not.toContain("OTHERSECRET");
+		expect(serialized).not.toContain("tok_abc123");
+		expect(serialized).not.toContain("TOKABC123");
+		expect(obfuscated.instructions?.[0]?.target).toBe("side_model");
+	});
+
+	it("rehashes redacted instructions before custom provider context serialization", () => {
+		const secret = "SUPER_SECRET_TOKEN_12345";
+		const obfuscator = new SecretObfuscator([{ type: "plain", content: secret }], "test-key");
+		const instruction = bindRenderedInstruction("goal.advisor_mission", `finish with ${secret}`, "side_model");
+		const originalSha256 = instruction.sha256;
+		const context: Context = { messages: [], instructions: [instruction] };
+
+		const obfuscated = obfuscateProviderContext(obfuscator, context);
+		const emitted = obfuscated.instructions?.[0];
+		if (!emitted) throw new Error("Expected provider instruction");
+		const serialized = JSON.stringify(obfuscated);
+
+		expect(serialized).not.toContain(secret);
+		expect(serialized).not.toContain(originalSha256);
+		expect(emitted.renderedText).not.toContain(secret);
+		expect(emitted.sha256).toBe(crypto.createHash("sha256").update(emitted.renderedText).digest("hex"));
+		expect(emitted.sha256).not.toBe(originalSha256);
+		expect(emitted).toEqual({
+			...instruction,
+			sha256: emitted.sha256,
+			renderedText: emitted.renderedText,
+		});
 	});
 
 	it("leaves tool schemas untouched in provider context (no clone, no redaction)", () => {

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
-import type { AgentMessage, AgentTelemetryConfig } from "@oh-my-pi/pi-agent-core";
+import { type AgentMessage, type AgentTelemetryConfig, Tokenizer } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { kCursorExecResolved } from "@oh-my-pi/pi-ai/utils/block-symbols";
@@ -440,23 +440,61 @@ describe("advisor", () => {
 			expect(onAdvice).toHaveBeenNthCalledWith(3, note, "blocker");
 		});
 
-		it("withholds non-blockers for in-progress updates without consuming dedupe state", async () => {
+		it("defers non-blockers during in-progress updates and flushes them on the next completed update", async () => {
 			const onAdvice = vi.fn();
 			const tool = new AdviseTool(onAdvice);
 			const note = "The result still needs a focused regression test.";
 
 			tool.beginUpdate(true);
-			await tool.execute("tc-1", { note, severity: "concern" });
+			const deferred = await tool.execute("tc-1", { note, severity: "concern" });
 			await tool.execute("tc-2", { note: "Minor naming cleanup.", severity: "nit" });
 			await tool.execute("tc-3", { note: "A destructive command is running.", severity: "blocker" });
 
+			// Deferred notes are NOT delivered mid-turn; blocker still goes through.
 			expect(onAdvice).toHaveBeenCalledTimes(1);
 			expect(onAdvice).toHaveBeenCalledWith("A destructive command is running.", "blocker");
+			// The tool tells the advisor the note is deferred, not silently "Recorded.".
+			expect(JSON.stringify(deferred.content)).toContain("Deferred");
+
+			// Completing the turn deterministically flushes both withheld notes,
+			// oldest first — no reliance on the advisor model re-raising them.
+			tool.beginUpdate(false);
+			expect(onAdvice).toHaveBeenCalledTimes(3);
+			expect(onAdvice).toHaveBeenNthCalledWith(2, note, "concern");
+			expect(onAdvice).toHaveBeenNthCalledWith(3, "Minor naming cleanup.", "nit");
+
+			// A later explicit re-raise of the same note is deduped (already delivered).
+			await tool.execute("tc-4", { note, severity: "concern" });
+			expect(onAdvice).toHaveBeenCalledTimes(3);
+		});
+
+		it("does not pile up duplicate deferred notes during a long mid-turn", async () => {
+			const onAdvice = vi.fn();
+			const tool = new AdviseTool(onAdvice);
+			const note = "Same point raised repeatedly.";
+
+			tool.beginUpdate(true);
+			await tool.execute("tc-1", { note, severity: "concern" });
+			await tool.execute("tc-2", { note, severity: "concern" });
+			await tool.execute("tc-3", { note, severity: "concern" });
 
 			tool.beginUpdate(false);
-			await tool.execute("tc-4", { note, severity: "concern" });
-			expect(onAdvice).toHaveBeenCalledTimes(2);
-			expect(onAdvice).toHaveBeenLastCalledWith(note, "concern");
+			// Identical note queued once, flushed once.
+			expect(onAdvice).toHaveBeenCalledTimes(1);
+			expect(onAdvice).toHaveBeenCalledWith(note, "concern");
+		});
+
+		it("retains the highest severity when duplicate deferred advice escalates", async () => {
+			const onAdvice = vi.fn();
+			const tool = new AdviseTool(onAdvice);
+
+			tool.beginUpdate(true);
+			await tool.execute("tc-1", { note: "Same point raised repeatedly.", severity: "nit" });
+			await tool.execute("tc-2", { note: "Same   point raised repeatedly.", severity: "concern" });
+
+			tool.beginUpdate(false);
+			expect(onAdvice).toHaveBeenCalledTimes(1);
+			expect(onAdvice).toHaveBeenCalledWith("Same point raised repeatedly.", "concern");
 		});
 
 		it("validates parameters using ArkType", () => {
@@ -2436,8 +2474,11 @@ describe("advisor", () => {
 			const host: AdvisorRuntimeHost = {
 				snapshotMessages: () => messages,
 				enqueueAdvice: () => {},
-				maintainContext: async tokens => {
-					expect(tokens).toBeGreaterThan(0);
+				maintainContext: async incoming => {
+					// The host receives the pending update itself and sizes it with its
+					// own model's tokenizer, so it must arrive as a non-empty message.
+					expect(incoming.role).toBe("user");
+					expect(promptText([incoming]).length).toBeGreaterThan(0);
 					return shouldResetContext;
 				},
 			};
@@ -2674,8 +2715,8 @@ describe("advisor", () => {
 				{
 					snapshotMessages: () => messages,
 					enqueueAdvice: () => {},
-					maintainContext: async incomingTokens => {
-						maintenanceTokens.push(incomingTokens);
+					maintainContext: async incoming => {
+						maintenanceTokens.push(new Tokenizer().countMessage(incoming));
 						if (maintenanceTokens.length === 4) fourthMaintenance.resolve();
 						return false;
 					},
@@ -3783,13 +3824,24 @@ describe("advisor", () => {
 			expect(failures).toEqual([]);
 		});
 
-		it("surfaces a persistent classifier refusal after one stripped resend", async () => {
+		it("retains prior regex collisions across a persistent classifier refusal", async () => {
 			const promptInputs: Array<string | AgentMessage[]> = [];
 			const failures: unknown[] = [];
 			const state: { messages: AgentMessage[]; error?: string } = { messages: [] };
+			let shouldRefuse = false;
 			const agent: AdvisorAgent = {
 				prompt: async input => {
 					promptInputs.push(input);
+					if (!shouldRefuse) {
+						state.error = undefined;
+						state.messages.push({
+							role: "assistant",
+							content: [],
+							stopReason: "stop",
+							timestamp: promptInputs.length + 1,
+						} as unknown as AgentMessage);
+						return;
+					}
 					state.error = "Refusal (reasoning_extraction): reasoning may not be echoed";
 					state.messages.push({
 						role: "assistant",
@@ -3801,19 +3853,30 @@ describe("advisor", () => {
 					} as unknown as AgentMessage);
 				},
 				abort: () => {},
-				reset: () => {},
+				reset: () => {
+					state.messages.length = 0;
+					state.error = undefined;
+				},
 				rollbackTo: count => {
 					state.messages.length = count;
 					state.error = undefined;
 				},
 				state,
 			};
+			const regexSecret = "tok_abc123";
+			const obfuscator = new SecretObfuscator(
+				[
+					{ type: "plain", content: "OTHERSECRET", friendlyName: "TOKABC123" },
+					{ type: "regex", content: "tok_[a-z0-9]+", mode: "replace" },
+				],
+				"test-key",
+			);
 			const messages = [
 				{
 					role: "assistant",
 					content: [
 						{ type: "thinking", thinking: "private reasoning" },
-						{ type: "text", text: "answer" },
+						{ type: "text", text: `answer with ${regexSecret}` },
 					],
 					timestamp: 1,
 				} as AgentMessage,
@@ -3824,17 +3887,40 @@ describe("advisor", () => {
 					snapshotMessages: () => messages,
 					enqueueAdvice: () => {},
 					notifyFailure: error => failures.push(error),
+					obfuscator,
 				},
 				0,
 			);
 
 			runtime.onTurnEnd(messages);
+			await settleUntil(() => promptInputs.length === 1 && runtime.backlog === 0);
+			expect(state.messages).toHaveLength(1);
+			shouldRefuse = true;
+			messages.push({
+				role: "assistant",
+				content: [
+					{ type: "thinking", thinking: "more private reasoning" },
+					{ type: "text", text: "second answer" },
+				],
+				timestamp: 2,
+			} as AgentMessage);
+			runtime.onTurnEnd(messages);
 			await settleUntil(() => failures.length === 1 && runtime.backlog === 0);
 
-			expect(promptInputs).toHaveLength(2);
-			expect(promptText(promptInputs[0])).toContain("private reasoning");
-			expect(promptText(promptInputs[1])).not.toContain("private reasoning");
+			expect(promptInputs).toHaveLength(3);
+			expect(promptText(promptInputs[1])).toContain("more private reasoning");
+			expect(promptText(promptInputs[2])).not.toContain("more private reasoning");
 			expect(failures).toHaveLength(1);
+			expect(state.messages).toHaveLength(1);
+			const retained = new Set<string>();
+			runtime.copyRetainedRegexSecretValuesTo(retained);
+			expect(retained).toContain(regexSecret);
+
+			runtime.reset("conversation-boundary", { clearRetainedRegexSecretValues: true });
+			const afterReset = new Set<string>();
+			runtime.copyRetainedRegexSecretValuesTo(afterReset);
+			expect(afterReset).toEqual(new Set());
+			expect(state.messages).toEqual([]);
 		});
 
 		it("asks the host to switch models when a refusal outlives the stripped resend", async () => {
@@ -4700,6 +4786,49 @@ describe("advisor", () => {
 			expect(promptText(promptInputs[1])).not.toContain("old-conversation");
 		});
 
+		it("does not report success when a reset-aborted advisor prompt resolves", async () => {
+			const firstPromptStarted = Promise.withResolvers<void>();
+			const promptGate = Promise.withResolvers<void>();
+			const state: { messages: AgentMessage[] } = { messages: [] };
+			let successCalls = 0;
+			const agent: AdvisorAgent = {
+				prompt: () => {
+					firstPromptStarted.resolve();
+					return promptGate.promise;
+				},
+				reset: () => {
+					state.messages.length = 0;
+				},
+				abort: () => {
+					state.messages.push({
+						role: "assistant",
+						content: [{ type: "text", text: "aborted output" }],
+						stopReason: "aborted",
+						timestamp: 2,
+					} as unknown as AgentMessage);
+					promptGate.resolve();
+				},
+				state,
+			};
+			const messages: AgentMessage[] = [{ role: "user", content: "old-conversation", timestamp: 1 } as AgentMessage];
+			const runtime = new AdvisorRuntime(agent, {
+				snapshotMessages: () => messages,
+				enqueueAdvice: () => {},
+				onTurnSuccess: () => {
+					successCalls++;
+				},
+			});
+
+			runtime.onTurnEnd(messages);
+			await firstPromptStarted.promise;
+			runtime.reset();
+			await new Promise<void>(resolve => setImmediate(resolve));
+
+			expect(state.messages).toHaveLength(1);
+			expect(runtime.backlog).toBe(0);
+			expect(successCalls).toBe(0);
+		});
+
 		it("retries the interrupted batch after a session transition rolls back", async () => {
 			const promptInputs: Array<string | AgentMessage[]> = [];
 			const firstPromptStarted = Promise.withResolvers<void>();
@@ -5126,7 +5255,7 @@ describe("advisor", () => {
 			const host: AdvisorRuntimeHost = {
 				snapshotMessages: () => [],
 				enqueueAdvice: () => {},
-				maintainContext: async (_incomingTokens, signal) => {
+				maintainContext: async (_incoming, signal) => {
 					maintenanceSignals.push(signal);
 					return false;
 				},
@@ -5509,7 +5638,7 @@ describe("advisor", () => {
 			).toBe("steer");
 		});
 
-		it("routes interrupting notes to the aside queue during immune turns without overriding preservation", () => {
+		it("downgrades concern to aside during immune turns, but still steers a blocker (#5628)", () => {
 			expect(
 				resolveAdvisorDeliveryChannel({
 					severity: "concern",
@@ -5519,6 +5648,15 @@ describe("advisor", () => {
 					interruptImmuneTurnActive: true,
 				}),
 			).toBe("aside");
+			expect(
+				resolveAdvisorDeliveryChannel({
+					severity: "blocker",
+					autoResumeSuppressed: false,
+					streaming: false,
+					aborting: false,
+					interruptImmuneTurnActive: true,
+				}),
+			).toBe("steer");
 			expect(
 				resolveAdvisorDeliveryChannel({
 					severity: "blocker",

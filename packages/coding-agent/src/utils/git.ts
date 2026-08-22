@@ -23,6 +23,8 @@ export interface GitCommandResult {
 	exitCode: number;
 	stdout: string;
 	stderr: string;
+	/** True when stdout or stderr hit {@link GIT_COMMAND_OUTPUT_LIMIT_BYTES} and the captured text is incomplete. */
+	truncated: boolean;
 }
 
 export interface GitRepository {
@@ -70,6 +72,7 @@ export interface DiffOptions {
 	readonly numstat?: boolean;
 	readonly signal?: AbortSignal;
 	readonly stat?: boolean;
+	readonly requireComplete?: boolean;
 	readonly z?: boolean;
 }
 
@@ -78,6 +81,7 @@ export interface StatusOptions {
 	readonly porcelainV1?: boolean;
 	readonly signal?: AbortSignal;
 	readonly untrackedFiles?: "all" | "no" | "normal";
+	readonly includeIgnored?: boolean;
 	readonly z?: boolean;
 }
 
@@ -173,6 +177,29 @@ export class GitCommandError extends Error {
 	constructor(args: readonly string[], result: GitCommandResult) {
 		super(formatCommandFailure(args, result));
 		this.name = "GitCommandError";
+		this.args = [...args];
+		this.result = result;
+	}
+}
+
+/**
+ * A git subprocess produced more output than {@link GIT_COMMAND_OUTPUT_LIMIT_BYTES}
+ * and its captured stdout was truncated. Thrown only for callers that opt into
+ * completeness via `diff({ requireComplete: true })`, where operating on a partial
+ * diff would silently corrupt downstream parsing — e.g. the split-commit builder,
+ * which would otherwise throw a misleading "No diff found" for files sorting after
+ * a large binary blob whose base85 payload pushed the diff past the cap.
+ */
+export class GitOutputTruncatedError extends Error {
+	readonly args: readonly string[];
+	readonly result: GitCommandResult;
+
+	constructor(args: readonly string[], result: GitCommandResult) {
+		const limitMiB = Math.round(GIT_COMMAND_OUTPUT_LIMIT_BYTES / (1024 * 1024));
+		super(
+			`git ${args.join(" ")} produced more than ${limitMiB} MiB of output; the captured result is truncated and incomplete.`,
+		);
+		this.name = "GitOutputTruncatedError";
 		this.args = [...args];
 		this.result = result;
 	}
@@ -317,7 +344,10 @@ async function waitForExitWithTimeout(
 	}
 }
 
-async function readCappedText(stream: ReadableStream<Uint8Array>, maxBytes: number): Promise<string> {
+async function readCappedText(
+	stream: ReadableStream<Uint8Array>,
+	maxBytes: number,
+): Promise<{ text: string; truncated: boolean }> {
 	const reader = stream.getReader();
 	const decoder = new TextDecoder();
 	const chunks: string[] = [];
@@ -340,7 +370,7 @@ async function readCappedText(stream: ReadableStream<Uint8Array>, maxBytes: numb
 		}
 		chunks.push(decoder.decode());
 		if (truncated) chunks.push(GIT_OUTPUT_TRUNCATED_MARKER);
-		return chunks.join("");
+		return { text: chunks.join(""), truncated };
 	} finally {
 		reader.releaseLock();
 	}
@@ -377,10 +407,15 @@ async function collectSubprocessResult(
 		void stdoutPromise.catch(() => undefined);
 		void stderrPromise.catch(() => undefined);
 		await Promise.all([cancelOutput(stdoutStream), cancelOutput(stderrStream)]);
-		return { exitCode: GIT_COMMAND_TIMEOUT_EXIT_CODE, stdout: "", stderr: exit.stderr };
+		return { exitCode: GIT_COMMAND_TIMEOUT_EXIT_CODE, stdout: "", stderr: exit.stderr, truncated: false };
 	}
 	const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
-	return { exitCode: exit.exitCode ?? 0, stdout, stderr };
+	return {
+		exitCode: exit.exitCode ?? 0,
+		stdout: stdout.text,
+		stderr: stderr.text,
+		truncated: stdout.truncated || stderr.truncated,
+	};
 }
 
 interface CommandOptions {
@@ -501,7 +536,7 @@ async function git(cwd: string, args: readonly string[], options: CommandOptions
 			// A deleted/nonexistent cwd also surfaces as a spawn ENOENT; only blame
 			// the binary when the working directory actually exists.
 			const stderr = fs.existsSync(cwd) ? "git is not installed." : `working directory does not exist: ${cwd}`;
-			return { exitCode: GIT_SPAWN_ENOENT_EXIT_CODE, stdout: "", stderr };
+			return { exitCode: GIT_SPAWN_ENOENT_EXIT_CODE, stdout: "", stderr, truncated: false };
 		}
 		throw err;
 	}
@@ -1248,7 +1283,11 @@ export const diff = Object.assign(
 		if (options.allowFailure) {
 			return (await git(cwd, args, { env: options.env, readOnly: true, signal: options.signal })).stdout;
 		}
-		return runText(cwd, args, { env: options.env, readOnly: true, signal: options.signal });
+		const result = await runChecked(cwd, args, { env: options.env, readOnly: true, signal: options.signal });
+		if (options.requireComplete && result.truncated) {
+			throw new GitOutputTruncatedError(args, result);
+		}
+		return result.stdout;
 	},
 	{
 		/** List changed file paths. */
@@ -1320,6 +1359,7 @@ export const status = Object.assign(
 		args.push(options.porcelainV1 ? "--porcelain=v1" : "--porcelain");
 		if (options.z) args.push("-z");
 		if (options.untrackedFiles) args.push(`--untracked-files=${options.untrackedFiles}`);
+		if (options.includeIgnored) args.push("--ignored=matching");
 		if (options.pathspecs?.length) args.push("--", ...options.pathspecs);
 		return runText(cwd, args, { readOnly: true, signal: options.signal });
 	},
@@ -2028,12 +2068,17 @@ export const patch = {
 		}
 	},
 
-	/** Join patch parts into a single patch string. */
+	/**
+	 * Join patch parts into a single patch string.
+	 *
+	 * Each part is terminated with a single `\n` if it lacks one, then parts are
+	 * concatenated verbatim — matching git's native multi-file diff layout. Parts
+	 * are NOT separated by an extra blank line and trailing newlines are NOT
+	 * stripped: a `GIT binary patch` block ends in a blank line that
+	 * `git apply --binary` requires, and stripping it corrupts the patch (#8899).
+	 */
 	join(parts: string[]): string {
-		return `${parts
-			.map(part => (part.endsWith("\n") ? part : `${part}\n`))
-			.join("\n")
-			.replace(/\n+$/, "")}\n`;
+		return parts.map(part => (part.endsWith("\n") ? part : `${part}\n`)).join("");
 	},
 };
 
@@ -2244,6 +2289,12 @@ export async function clean(
 // ════════════════════════════════════════════════════════════════════════════
 // API: ls
 // ════════════════════════════════════════════════════════════════════════════
+export interface GitTreeEntry {
+	readonly mode: string;
+	readonly type: string;
+	readonly objectId: string;
+	readonly path: string;
+}
 
 export const ls = {
 	/** List files tracked or untracked by git. */
@@ -2268,6 +2319,26 @@ export const ls = {
 		if (files.length > 0) args.push("--", ...files);
 		const raw = await runText(cwd, args, { readOnly: true, signal });
 		return raw.split("\0").filter(entry => entry.length > 0);
+	},
+
+	/** List recursive tree entries with their tracked modes and object ids. */
+	async treeEntries(
+		cwd: string,
+		ref: string,
+		files: readonly string[] = [],
+		signal?: AbortSignal,
+	): Promise<GitTreeEntry[]> {
+		const args = ["ls-tree", "-r", "-z", ref];
+		if (files.length > 0) args.push("--", ...files);
+		const raw = await runText(cwd, args, { readOnly: true, signal });
+		return raw
+			.split("\0")
+			.filter(entry => entry.length > 0)
+			.map(entry => {
+				const match = /^([0-7]{6}) ([^ ]+) ([0-9a-f]+)\t([\s\S]+)$/.exec(entry);
+				if (!match?.[1] || !match[2] || !match[3] || !match[4]) throw new Error("Invalid git ls-tree output");
+				return { mode: match[1], type: match[2], objectId: match[3], path: match[4] };
+			});
 	},
 
 	/** List submodule paths (recursive). */

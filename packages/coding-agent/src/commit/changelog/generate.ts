@@ -1,6 +1,6 @@
 import { type } from "@oh-my-pi/omptype";
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
-import type { Api, ApiKey, AssistantMessage, Model } from "@oh-my-pi/pi-ai";
+import type { Api, ApiKey, AssistantMessage, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
 import { completeSimple, retryTransientCompletion, validateToolCall } from "@oh-my-pi/pi-ai";
 import { prompt } from "@oh-my-pi/pi-utils";
 import changelogSystemPrompt from "../../commit/prompts/changelog-system.md" with { type: "text" };
@@ -31,6 +31,7 @@ export interface ChangelogPromptInput {
 	model: Model<Api>;
 	apiKey: ApiKey;
 	thinkingLevel?: ThinkingLevel;
+	cacheRetention?: SimpleStreamOptions["cacheRetention"];
 	changelogPath: string;
 	isPackageChangelog: boolean;
 	existingEntries?: string;
@@ -42,6 +43,7 @@ export async function generateChangelogEntries({
 	model,
 	apiKey,
 	thinkingLevel,
+	cacheRetention,
 	changelogPath,
 	isPackageChangelog,
 	existingEntries,
@@ -63,7 +65,12 @@ export async function generateChangelogEntries({
 				messages: [{ role: "user", content: userContent, timestamp: Date.now() }],
 				tools: [changelogTool],
 			},
-			{ apiKey, maxTokens: 1200, reasoning: toReasoningEffort(thinkingLevel) },
+			{
+				apiKey,
+				maxTokens: 1200,
+				reasoning: toReasoningEffort(thinkingLevel),
+				cacheRetention,
+			},
 		),
 	);
 

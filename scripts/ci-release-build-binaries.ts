@@ -131,10 +131,11 @@ async function embedNative(target: BinaryTarget): Promise<void> {
 
 async function buildBinary(target: BinaryTarget): Promise<void> {
 	console.log(`Building ${target.outfile}...`);
+	const buildId = Bun.env.OMP_BUILD_ID ?? "";
 	await embedNative(target);
 	if (isDryRun) {
 		console.log(
-			`DRY RUN Bun.build target=${target.target} outfile=${target.outfile} external=${COMPILED_EXTERNAL_DEPENDENCIES.join(",")}`,
+			`DRY RUN Bun.build target=${target.target} outfile=${target.outfile} external=${COMPILED_EXTERNAL_DEPENDENCIES.join(",")} buildId=${buildId || "<unpaired>"}`,
 		);
 		return;
 	}
@@ -144,6 +145,7 @@ async function buildBinary(target: BinaryTarget): Promise<void> {
 		entrypoint,
 		outfile: path.join(repoRoot, target.outfile),
 		transformersVersion,
+		buildId,
 		target: target.target,
 		minifyIdentifiers: true,
 		skipBuiltinCodesign: shouldAdhocSignDarwinBinary(target),

@@ -27,13 +27,24 @@ import {
 import { interceptUnhandledRejections } from "@oh-my-pi/pi-utils/postmortem";
 import { setProcessName } from "@oh-my-pi/pi-utils/process-name";
 import { declareWorkerHostEntry, installWorkerInbox, isWorkerHostSelector } from "@oh-my-pi/pi-utils/worker-host";
+import { OMP_BUILD_ID } from "./build-identity";
 import { installProfileAlias, resolveProfileAliasCommandFromProcess } from "./cli/profile-alias";
 import { extractProfileFlags } from "./cli/profile-bootstrap";
+import {
+	captureHerdrBridgeBootstrap,
+	clearHerdrGuestBridgeTokenHandoff,
+	clearHerdrHostBridgeHandoff,
+	type HerdrHostBridgeBootstrap,
+	handoffHerdrGuestBridgeToken,
+	handoffHerdrHostBridge,
+} from "./collab/herdr-bridge-bootstrap";
 import { startJsEvalProcess } from "./eval/js/process-entry";
 import type { WorkerInbound as JsWorkerInbound, WorkerOutbound as JsWorkerOutbound } from "./eval/js/worker-protocol";
 import { DAEMON_BROKER_WORKER_ARG } from "./launch/protocol";
 import { TERMINAL_OUTPUT_WORKER_ARG } from "./launch/terminal-output-worker-protocol";
 import { LSP_MUX_WORKER_ARG } from "./lsp/mux/protocol";
+import rootLicense from "./tools/browser/relay/extension-assets/LICENSE.txt" with { type: "text" };
+import thirdPartyNotices from "./tools/browser/relay/extension-assets/THIRD-PARTY-NOTICES.txt" with { type: "text" };
 import { COMPUTER_WORKER_ARG } from "./tools/computer/protocol";
 import { smokeTestComputerWorker } from "./tools/computer/supervisor";
 import { startComputerWorker } from "./tools/computer/worker-entry";
@@ -54,6 +65,10 @@ setProcessName(APP_NAME);
 // CLI builds are unaffected. A compiled binary's entry module is by definition
 // the process entry, so the define-folded PI_COMPILED marker stands in.
 const isProcessEntry = import.meta.main || process.env.PI_COMPILED === "true";
+
+function formatLicenseOutput(): string {
+	return `OMP License and Third-Party Notices\n\n${rootLicense.trimEnd()}\n\n${thirdPartyNotices.trimEnd()}\n`;
+}
 
 // Worker-host entry declaration (Worker threads and worker subprocesses
 // re-enter `Bun.main` with a hidden argv selector instead of loading separate
@@ -327,8 +342,13 @@ async function runTinyWorker(): Promise<void> {
 
 /** Run the CLI with the given argv (no `process.argv` prefix). */
 export async function runCli(argv: string[]): Promise<void> {
+	let capturedHerdrHostBridge: HerdrHostBridgeBootstrap | undefined;
+	let capturedHerdrGuestBridgeToken: string | undefined;
 	let resolvedArgv = argv;
 	try {
+		const bootstrap = captureHerdrBridgeBootstrap();
+		capturedHerdrHostBridge = bootstrap.hostBridge;
+		capturedHerdrGuestBridgeToken = bootstrap.guestBridgeToken;
 		const extracted = extractProfileFlags(resolvedArgv);
 		resolvedArgv = extracted.argv;
 		if (extracted.profile !== undefined) {
@@ -371,14 +391,19 @@ export async function runCli(argv: string[]): Promise<void> {
 	// Worker-thread entry dispatch must run before the first `await`: the
 	// stats sync worker's buffering onmessage handler is installed in the
 	// synchronous prefix of `runWorkerEntrypoint`, and Bun flushes the
-	// worker's parked initial messages as soon as the entry module's
-	// top-level evaluation finishes.
+	// worker's parked initial messages as soon as the entry module's top-level
+	// evaluation finishes.
 	if (isWorkerHostSelector(resolvedArgv[0])) {
 		const dispatched = await runWorkerEntrypoint(resolvedArgv[0]);
 		if (!dispatched) {
 			process.stderr.write(`Error: unknown worker selector: ${resolvedArgv[0]}\n`);
 			process.exitCode = 1;
 		}
+		return;
+	}
+
+	if (resolvedArgv.length === 1 && resolvedArgv[0] === "__build-id") {
+		process.stdout.write(`${OMP_BUILD_ID}\n`);
 		return;
 	}
 
@@ -397,11 +422,15 @@ export async function runCli(argv: string[]): Promise<void> {
 		await runSmokeTest();
 		return;
 	}
+	if (resolvedArgv[0] === "--license") {
+		process.stdout.write(formatLicenseOutput());
+		return;
+	}
 	const [{ run }, { commands, resolveCliArgv }] = await Promise.all([
 		import("@oh-my-pi/pi-utils/cli"),
 		import("./cli-commands"),
 	]);
-	// --help and --version are handled by run() directly, don't rewrite those.
+	// --help and --version are handled by run() directly; --license returned above.
 	// Everything else that isn't a known subcommand routes to "launch".
 	const resolved = resolveCliArgv(resolvedArgv);
 	if ("error" in resolved) {
@@ -409,7 +438,19 @@ export async function runCli(argv: string[]): Promise<void> {
 		process.exitCode = 1;
 		return;
 	}
-	return run({ bin: APP_NAME, version: VERSION, argv: resolved.argv, commands, metadataHelp: showHelp });
+	const command = resolved.argv[0];
+	try {
+		if (command === "launch" || command === "join" || command === "__collab-host-bridge") {
+			handoffHerdrHostBridge(capturedHerdrHostBridge);
+		}
+		if (command === "__collab-guest-bridge") {
+			handoffHerdrGuestBridgeToken(capturedHerdrGuestBridgeToken);
+		}
+		await run({ bin: APP_NAME, version: VERSION, argv: resolved.argv, commands, metadataHelp: showHelp });
+	} finally {
+		clearHerdrHostBridgeHandoff();
+		clearHerdrGuestBridgeTokenHandoff();
+	}
 }
 
 // Floating call instead of top-level await: TLA forces `--bytecode` (CJS

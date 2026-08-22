@@ -1,5 +1,11 @@
 import { describe, expect, it } from "bun:test";
-import { LocalCollabTransport, NdjsonRecordParser, serializeBridgeFrameRecord } from "../../src/collab/local-transport";
+import { OMP_BUILD_ID } from "../../src/build-identity";
+import {
+	createHostBridgeTransport,
+	LocalCollabTransport,
+	NdjsonRecordParser,
+	serializeBridgeFrameRecord,
+} from "../../src/collab/local-transport";
 import {
 	COLLAB_PROTO,
 	MAX_LOCAL_BRIDGE_INBOUND_RECORD_BYTES,
@@ -91,7 +97,9 @@ describe("NdjsonRecordParser", () => {
 			hostname: "127.0.0.1",
 			port: 0,
 			socket: {
-				open() {},
+				open(socket) {
+					socket.write('{"t":"ready"}\n');
+				},
 				data(_socket, data) {
 					received.resolve(data.toString());
 				},
@@ -114,13 +122,130 @@ describe("NdjsonRecordParser", () => {
 		}
 	});
 
+	it("announces before exposing an open route and waits for Herdr ready", async () => {
+		const received = Promise.withResolvers<{ text: string; socket: Bun.Socket<undefined> }>();
+		const server = Bun.listen({
+			hostname: "127.0.0.1",
+			port: 0,
+			socket: {
+				open() {},
+				data(socket, data) {
+					received.resolve({ text: data.toString(), socket });
+				},
+			},
+		});
+		try {
+			const transport = createHostBridgeTransport(
+				`127.0.0.1:${server.port}`,
+				"route-token",
+				"pane-7",
+				"session-result",
+				1,
+			);
+			let opened = false;
+			const ready = Promise.withResolvers<void>();
+			transport.onOpen = () => {
+				opened = true;
+				ready.resolve();
+			};
+			transport.connect();
+			const announced = await received.promise;
+			expect(JSON.parse(announced.text.trim())).toEqual({
+				t: "host",
+				token: "route-token",
+				paneId: "pane-7",
+				ompSessionId: "session-result",
+				routeGeneration: 1,
+				ompBuildId: OMP_BUILD_ID,
+			});
+			expect(opened).toBe(false);
+			expect(transport.isOpen).toBe(false);
+			announced.socket.write('{"t":"ready"}\n');
+			await ready.promise;
+			expect(transport.isOpen).toBe(true);
+			transport.close();
+		} finally {
+			server.stop(true);
+		}
+	});
+
+	it("opens a guest bridge on TCP connection and sends hello without Herdr ready", async () => {
+		const received = Promise.withResolvers<unknown[]>();
+		const records: unknown[] = [];
+		let pending = "";
+		const server = Bun.listen({
+			hostname: "127.0.0.1",
+			port: 0,
+			socket: {
+				open() {},
+				data(_socket, data) {
+					pending += data.toString();
+					let newline = pending.indexOf("\n");
+					while (newline >= 0) {
+						const line = pending.slice(0, newline);
+						pending = pending.slice(newline + 1);
+						if (line.trim()) records.push(JSON.parse(line));
+						if (records.length === 2) received.resolve(records);
+						newline = pending.indexOf("\n");
+					}
+				},
+			},
+		});
+		try {
+			const transport = new LocalCollabTransport(`127.0.0.1:${server.port}`, { t: "guest", token: "route-token" });
+			const opened = Promise.withResolvers<boolean>();
+			transport.onOpen = () => opened.resolve(transport.send({ t: "hello", proto: COLLAB_PROTO, name: "guest" }));
+			transport.connect();
+			expect(await opened.promise).toBe(true);
+			expect(transport.isOpen).toBe(true);
+			expect(await received.promise).toEqual([
+				{ t: "guest", token: "route-token" },
+				{
+					t: "frame",
+					targetPeer: 0,
+					mutation: false,
+					frame: { t: "hello", proto: COLLAB_PROTO, name: "guest" },
+				},
+			]);
+			transport.close();
+		} finally {
+			server.stop(true);
+		}
+	});
+
+	it("maps a post-ready Herdr error code and message to the close reason", async () => {
+		const server = Bun.listen({
+			hostname: "127.0.0.1",
+			port: 0,
+			socket: {
+				open(socket) {
+					socket.write('{"t":"ready"}\n');
+					socket.write('{"t":"error","code":"route-replaced","message":"newer route won"}\n');
+				},
+				data() {},
+			},
+		});
+		try {
+			const transport = new LocalCollabTransport(`127.0.0.1:${server.port}`);
+			const closed = Promise.withResolvers<string>();
+			transport.onClose = reason => closed.resolve(reason);
+			transport.connect();
+			expect(await closed.promise).toBe("route-replaced: newer route won");
+			expect(transport.isOpen).toBe(false);
+		} finally {
+			server.stop(true);
+		}
+	});
+
 	it("does not swallow frame-handler errors", async () => {
 		const server = Bun.listen({
 			hostname: "127.0.0.1",
 			port: 0,
 			socket: {
 				open(socket) {
-					socket.write(`{"t":"frame","fromPeer":1,"frame":{"t":"hello","proto":${COLLAB_PROTO},"name":"x"}}\n`);
+					socket.write(
+						`{"t":"ready"}\n{"t":"frame","fromPeer":1,"frame":{"t":"hello","proto":${COLLAB_PROTO},"name":"x"}}\n`,
+					);
 				},
 				data() {},
 			},
@@ -159,6 +284,7 @@ describe("LocalCollabTransport attribution", () => {
 			transport.onFrame = (frame, peer, metadata) => received.resolve({ frame, peer, metadata });
 			transport.connect();
 			const socket = await opened.promise;
+			socket.write('{"t":"ready"}\n');
 			socket.write(
 				'{"t":"frame","fromPeer":7,"displayName":"Alice","displayNameRevision":2,"frame":{"t":"prompt","text":"hello","displayName":"forged","displayNameRevision":99}}\n',
 			);
@@ -191,6 +317,7 @@ describe("LocalCollabTransport attribution", () => {
 			transport.onFrame = (frame, _peer, metadata) => received.resolve({ frame, metadata });
 			transport.connect();
 			const socket = await opened.promise;
+			socket.write('{"t":"ready"}\n');
 			socket.write(
 				'{"t":"frame","fromPeer":7,"displayName":"Alice","displayNameRevision":2,"frame":{"t":"prompt","text":"hello"}}\n',
 			);

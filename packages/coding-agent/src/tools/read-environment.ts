@@ -1,12 +1,12 @@
 import * as path from "node:path";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
+import { parseArchivePathCandidates } from "@oh-my-pi/pi-utils/ar";
 import { getFileSnapshotStore, parseSeenLinesFromHashlineBody } from "../edit/file-snapshot-store";
 import { normalizeToLF } from "../edit/normalize";
 import type { ToolSession } from "../sdk";
 import { type ExecutionEnvironmentBinding, mapExecutionEnvironmentPath } from "../session/execution-environment";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import { CONVERTIBLE_EXTENSIONS } from "../utils/markit";
-import { parseArchivePathCandidates } from "../utils/zip";
 import { splitPathAndSel } from "./path-utils";
 import type { ReadToolDetails } from "./read";
 import {

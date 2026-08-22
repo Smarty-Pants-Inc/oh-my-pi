@@ -11,6 +11,7 @@ import { getKimiCommonHeaders } from "../registry/oauth/kimi";
 import { getEnvApiKey } from "../stream";
 import type {
 	AssistantMessage,
+	CacheRetention,
 	Context,
 	Message,
 	MessageAttribution,
@@ -74,6 +75,7 @@ import {
 	createOpenAIReasoningEffortFallbackKey,
 	createOpenAIReasoningEffortFallbackState,
 	getOpenAIReasoningEffortFallback,
+	mergeOpenAIReasoningEffortFallback,
 	type OpenAIReasoningEffortFallback,
 	type OpenAIReasoningEffortFallbackState,
 	rememberOpenAIReasoningEffortFallback,
@@ -107,6 +109,7 @@ import {
 	resolveOpenAICompletionsOutputClamp,
 	resolveOpenAIOutputTokenParam,
 	resolveOpenAIRequestSetup,
+	shouldDropAutoToolChoiceForReasoning,
 	shouldRetryWithoutStrictTools,
 } from "./openai-shared";
 import { transformMessages } from "./transform-messages";
@@ -664,9 +667,7 @@ const streamOpenAICompletionsOnce = (
 				: `${trimmedBaseUrl}/chat/completions`;
 			const createCompletionsStream = async (toolStrictModeOverride?: ToolStrictModeOverride) => {
 				const effectiveToolStrictModeOverride = disableStrictTools ? "none" : toolStrictModeOverride;
-				const builtParams = buildParams(model, context, options, effectiveToolStrictModeOverride);
-				let params = builtParams.params;
-				const strictToolsApplied = builtParams.strictToolsApplied;
+				let { params, strictToolsApplied } = buildParams(model, context, options, effectiveToolStrictModeOverride);
 				appliedStrictTools = strictToolsApplied;
 				const reasoningEffortFallbackKey = createOpenAIReasoningEffortFallbackKey(
 					"chat-completions",
@@ -680,8 +681,12 @@ const streamOpenAICompletionsOnce = (
 					applyOpenAIReasoningEffortFallback(params, requestReasoningEffortFallback);
 				}
 				activeReasoningEffortFallbackKey = reasoningEffortFallbackKey;
-				const replacementPayload = await options?.onPayload?.(params, model);
-				if (replacementPayload !== undefined) params = replacementPayload as OpenAICompletionsParams;
+				const replacedParams = await options?.onPayload?.(params, model);
+				if (replacedParams !== undefined) params = replacedParams as typeof params;
+				// A replacement must not resurrect a field this endpoint already rejected.
+				if (requestReasoningEffortFallback !== undefined) {
+					applyOpenAIReasoningEffortFallback(params, requestReasoningEffortFallback);
+				}
 				activeRequestParams = params;
 				rawRequestDump = {
 					provider: model.provider,
@@ -725,39 +730,59 @@ const streamOpenAICompletionsOnce = (
 				}
 			};
 			let openaiStream: AsyncIterable<ChatCompletionChunk>;
-			try {
-				openaiStream = await callWithCopilotModelRetry(() => createCompletionsStream(), {
-					provider: model.provider,
-					signal: requestSignal,
-				});
-			} catch (error) {
-				const capturedErrorResponse = error instanceof OpenAIHttpError ? error.captured : undefined;
-				const reasoningEffortFallback =
-					activeReasoningEffortFallbackKey && activeRequestParams && !requestSignal.aborted
-						? resolveOpenAIReasoningEffortFallback(error, capturedErrorResponse, activeRequestParams, {
-								explicitDisable: options?.disableReasoning === true && options.reasoning === undefined,
-							})
-						: undefined;
-				if (reasoningEffortFallback !== undefined && activeReasoningEffortFallbackKey) {
-					const retryMarker = `${activeReasoningEffortFallbackKey}:${String(reasoningEffortFallback)}`;
-					if (attemptedReasoningEffortFallbacks.has(retryMarker)) throw error;
-					attemptedReasoningEffortFallbacks.add(retryMarker);
-					requestReasoningEffortFallbacks.set(activeReasoningEffortFallbackKey, reasoningEffortFallback);
-					openaiStream = await createCompletionsStream();
-					rememberOpenAIReasoningEffortFallback(
-						providerSessionState,
-						activeReasoningEffortFallbackKey,
-						reasoningEffortFallback,
-					);
-				} else if (
-					isOpenRouterAnthropicModel(model) &&
-					!disableStrictTools &&
-					isCompiledGrammarTooLargeStrictError(error, capturedErrorResponse)
-				) {
-					disableStrictToolsForScope(providerSessionState, strictToolsScope);
-					disableStrictTools = true;
-					openaiStream = await createCompletionsStream("none");
-				} else {
+			let pendingReasoningEffortFallback: { key: string; fallback: OpenAIReasoningEffortFallback } | undefined;
+			while (true) {
+				try {
+					openaiStream = await callWithCopilotModelRetry(() => createCompletionsStream(), {
+						provider: model.provider,
+						signal: requestSignal,
+					});
+					if (pendingReasoningEffortFallback) {
+						rememberOpenAIReasoningEffortFallback(
+							providerSessionState,
+							pendingReasoningEffortFallback.key,
+							pendingReasoningEffortFallback.fallback,
+						);
+						pendingReasoningEffortFallback = undefined;
+					}
+					break;
+				} catch (error) {
+					const capturedErrorResponse = error instanceof OpenAIHttpError ? error.captured : undefined;
+					const reasoningEffortFallback =
+						activeReasoningEffortFallbackKey && activeRequestParams && !requestSignal.aborted
+							? resolveOpenAIReasoningEffortFallback(error, capturedErrorResponse, activeRequestParams, {
+									explicitDisable: options?.disableReasoning === true && options.reasoning === undefined,
+								})
+							: undefined;
+					if (reasoningEffortFallback !== undefined && activeReasoningEffortFallbackKey) {
+						const retryMarker = `${activeReasoningEffortFallbackKey}:${String(reasoningEffortFallback)}`;
+						if (attemptedReasoningEffortFallbacks.has(retryMarker)) throw error;
+						attemptedReasoningEffortFallbacks.add(retryMarker);
+						const accumulatedReasoningEffortFallback = mergeOpenAIReasoningEffortFallback(
+							requestReasoningEffortFallbacks.has(activeReasoningEffortFallbackKey)
+								? requestReasoningEffortFallbacks.get(activeReasoningEffortFallbackKey)
+								: getOpenAIReasoningEffortFallback(providerSessionState, activeReasoningEffortFallbackKey),
+							reasoningEffortFallback,
+						);
+						requestReasoningEffortFallbacks.set(
+							activeReasoningEffortFallbackKey,
+							accumulatedReasoningEffortFallback,
+						);
+						pendingReasoningEffortFallback = {
+							key: activeReasoningEffortFallbackKey,
+							fallback: accumulatedReasoningEffortFallback,
+						};
+						continue;
+					}
+					if (
+						isOpenRouterAnthropicModel(model) &&
+						!disableStrictTools &&
+						isCompiledGrammarTooLargeStrictError(error, capturedErrorResponse)
+					) {
+						disableStrictToolsForScope(providerSessionState, strictToolsScope);
+						disableStrictTools = true;
+						continue;
+					}
 					if (
 						!shouldRetryWithoutStrictTools(error, capturedErrorResponse, {
 							model,
@@ -771,7 +796,6 @@ const streamOpenAICompletionsOnce = (
 					// subsequent request doesn't pay a strict-400 + retry round-trip.
 					disableStrictToolsForScope(providerSessionState, strictToolsScope);
 					disableStrictTools = true;
-					openaiStream = await createCompletionsStream("none");
 				}
 			}
 			if (premiumRequestsTotal !== undefined) {
@@ -1520,8 +1544,15 @@ function applyOpenAIChatCompletionsPromptCachePolicy(
 		params.prompt_cache_key = promptCacheKey;
 	}
 
+	const cacheRetention = resolveCacheRetention(options?.cacheRetention);
+	if (cacheRetention === "none") {
+		if (model.compat.supportsPromptCacheBreakpoints) {
+			params.prompt_cache_options = { mode: "explicit" };
+		}
+		return;
+	}
 	const promptCache = options?.promptCache;
-	if (!promptCache || resolveCacheRetention(options?.cacheRetention) === "none") return;
+	if (!promptCache) return;
 	if (!model.compat.supportsPromptCacheBreakpoints) {
 		if (promptCache.mode === "explicit") {
 			throw new AIError.ConfigurationError(
@@ -1695,6 +1726,10 @@ function buildParams(
 		delete params.tool_choice;
 	}
 
+	if (shouldDropAutoToolChoiceForReasoning(model, initialCompat, params.tool_choice, options)) {
+		delete params.tool_choice;
+	}
+
 	const finalPolicy = resolveOpenAICompatPolicy(model, {
 		endpoint: "chat-completions",
 		reasoning: options?.reasoning,
@@ -1703,7 +1738,7 @@ function buildParams(
 	});
 	const compat = finalPolicy.compat as ResolvedOpenAICompat;
 	const messages = convertMessages(model, context, compat);
-	maybeAddAnthropicCacheControl(compat, messages);
+	maybeAddAnthropicCacheControl(compat, messages, cacheRetention);
 	params.messages = messages;
 	const outputToken = resolveOpenAIOutputTokenParam({
 		field: compat.maxTokensField,
@@ -1781,8 +1816,14 @@ export function parseChunkUsage(
 	return usage;
 }
 
-function maybeAddAnthropicCacheControl(compat: ResolvedOpenAICompat, messages: ChatCompletionMessageParam[]): void {
-	if (compat.cacheControlFormat !== "anthropic") return;
+function maybeAddAnthropicCacheControl(
+	compat: ResolvedOpenAICompat,
+	messages: ChatCompletionMessageParam[],
+	cacheRetention: CacheRetention,
+): void {
+	if (compat.cacheControlFormat !== "anthropic" || cacheRetention === "none") return;
+	const cacheControl =
+		cacheRetention === "long" ? { type: "ephemeral" as const, ttl: "1h" as const } : { type: "ephemeral" as const };
 	// Anthropic-style caching requires cache_control on a text part. Add a breakpoint
 	// on the last user/assistant message (walking backwards until we find text content).
 	for (let i = messages.length - 1; i >= 0; i--) {
@@ -1792,9 +1833,7 @@ function maybeAddAnthropicCacheControl(compat: ResolvedOpenAICompat, messages: C
 		const content = msg.content;
 		if (typeof content === "string") {
 			if (content.trim().length === 0) continue;
-			msg.content = [
-				Object.assign({ type: "text" as const, text: content }, { cache_control: { type: "ephemeral" } }),
-			];
+			msg.content = [Object.assign({ type: "text" as const, text: content }, { cache_control: cacheControl })];
 			return;
 		}
 
@@ -1806,7 +1845,7 @@ function maybeAddAnthropicCacheControl(compat: ResolvedOpenAICompat, messages: C
 		for (let j = content.length - 1; j >= 0; j--) {
 			const part = content[j];
 			if (part?.type === "text" && part.text.trim().length > 0) {
-				Object.assign(part, { cache_control: { type: "ephemeral" } });
+				Object.assign(part, { cache_control: cacheControl });
 				return;
 			}
 		}
