@@ -137,7 +137,7 @@ const PATH_RULES: readonly PathRule[] = [
 	{ pattern: /(?:^|\/)src\/config\/(?:settings|settings-schema)\.[cm]?[jt]s$/i, surface: "configuration" },
 	{
 		pattern:
-			/(?:^|\/)src\/(?:commands\/context|context\/(?:approved-policy|canonical|diff|explain|implementation-sources|manifest)|policy\/protected-surface|utils\/git)\.[cm]?[jt]s$/i,
+			/(?:^|\/)src\/(?:commands\/context|context\/(?:approved-policy|canonical|diff|explain|implementation-sources|internal-session|manifest)|policy\/protected-surface|utils\/git)\.[cm]?[jt]s$/i,
 		surface: "guard",
 	},
 	{

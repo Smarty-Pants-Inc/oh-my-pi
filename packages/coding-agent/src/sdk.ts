@@ -78,6 +78,7 @@ import { buildServiceTierByFamily } from "./config/service-tier";
 import { Settings, type SkillsSettings } from "./config/settings";
 import { ensureApprovedStartup, promptPolicyReviewWarning } from "./context/approved-policy";
 import { captureRuntimeContextEvidence, isRuntimeContextEvidencePayload } from "./context/explain";
+import { isOmpInternalSession } from "./context/internal-session";
 import { type ContextReleaseManifest, canonicalAgentDirPath } from "./context/manifest";
 import { bindRenderedInstruction } from "./context/registry";
 import { exportRenderedToolContracts } from "./context/tool-contracts";
@@ -112,6 +113,7 @@ import {
 	loadExtensionFromFactory,
 	loadExtensions,
 	type RegisteredTool,
+	type SystemPromptBuilder,
 	type ToolDefinition,
 	wrapRegisteredTools,
 } from "./extensibility/extensions";
@@ -1285,8 +1287,15 @@ export function createAutoLearnCaptureRunner(
  * });
  * ```
  */
+let testApprovedStartupManifest: ContextReleaseManifest | undefined;
+
+export function testSetApprovedStartupManifest(manifest: ContextReleaseManifest | undefined): void {
+	if (!isBunTestRuntime()) throw new Error("testSetApprovedStartupManifest is test-only");
+	testApprovedStartupManifest = manifest;
+}
+
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
-	let releaseManifest = isBunTestRuntime() ? undefined : await ensureApprovedStartup();
+	let releaseManifest = isBunTestRuntime() ? testApprovedStartupManifest : await ensureApprovedStartup();
 	if (releaseManifest && path.resolve(options.agentDir ?? getAgentDir()) !== canonicalAgentDirPath()) {
 		logger.warn("Prompt policy requires review; continuing with the requested agent directory", {
 			error: `PROMPT_POLICY_REVIEW_REQUIRED: runtime agent directory must be ${canonicalAgentDirPath()}`,
@@ -1304,6 +1313,7 @@ async function createAgentSessionScoped(
 	options: CreateAgentSessionOptions,
 	releaseManifest: ContextReleaseManifest | undefined,
 ): Promise<CreateAgentSessionResult> {
+	const ompInternalSession = isOmpInternalSession(options);
 	const cwd = options.cwd ?? getProjectDir();
 	const agentDir = options.agentDir ?? getAgentDir();
 	const eventBus = options.eventBus ?? new EventBus();
@@ -2676,7 +2686,30 @@ async function createAgentSessionScoped(
 			() => (hasSession ? session.getAsyncJobCounts() : null),
 			releaseManifest,
 		);
-		const systemPromptBuilder = await extensionRunner.getSystemPromptBuilder();
+		let systemPromptBuilder: SystemPromptBuilder | undefined;
+		let startupPromptPolicyWarning: string | undefined;
+		let promptPolicyUIContext: ExtensionUIContext | undefined;
+		let notifiedPromptPolicyWarning: string | undefined;
+		const publishPromptPolicyWarning = (warning: string) => {
+			startupPromptPolicyWarning = warning;
+			logger.warn("Prompt policy requires review; continuing with the stock system prompt", { error: warning });
+			if (promptPolicyUIContext) {
+				promptPolicyUIContext.setStatus("omp-prompt-policy", "Prompt policy: REVIEW REQUIRED");
+				if (notifiedPromptPolicyWarning !== warning) {
+					promptPolicyUIContext.notify(warning, "warning");
+					notifiedPromptPolicyWarning = warning;
+				}
+			}
+		};
+		if (!(releaseManifest && ompInternalSession)) {
+			try {
+				systemPromptBuilder = await extensionRunner.getSystemPromptBuilder();
+			} catch (error) {
+				const warning = releaseManifest ? promptPolicyReviewWarning(error) : undefined;
+				if (!warning || options.hasUI !== true) throw error;
+				publishPromptPolicyWarning(warning);
+			}
+		}
 
 		credentialDisabledTarget = extensionRunner;
 		for (const event of startupCredentialDisabledEvents.splice(0)) {
@@ -3062,7 +3095,7 @@ async function createAgentSessionScoped(
 				}
 			};
 			let defaultPrompt = releaseManifest ? clonePromptResult(stockPrompt) : stockPrompt;
-			if (systemPromptBuilder && !releaseManifest) {
+			if (systemPromptBuilder) {
 				try {
 					defaultPrompt = await systemPromptBuilder({
 						hasUI: options.hasUI === true,
@@ -3076,18 +3109,21 @@ async function createAgentSessionScoped(
 					});
 				} catch (error) {
 					const warning = releaseManifest ? promptPolicyReviewWarning(error) : undefined;
-					if (!warning) throw error;
-					logger.warn("Prompt policy requires review; continuing with the stock system prompt", {
-						error: warning,
-					});
+					if (!warning || options.hasUI !== true) throw error;
+					publishPromptPolicyWarning(warning);
+					defaultPrompt = clonePromptResult(stockPrompt);
 				}
 			}
-			if (releaseManifest && systemPromptBuilder !== undefined) {
-				if (!matchesStockPrompt(defaultPrompt)) {
-					logger.warn("Prompt policy requires review; continuing with the stock system prompt", {
-						error: "PROMPT_POLICY_REVIEW_REQUIRED: provider-facing system prompt differs from the approved stock prompt",
-					});
-				}
+			if (
+				releaseManifest &&
+				!ompInternalSession &&
+				systemPromptBuilder !== undefined &&
+				!matchesStockPrompt(defaultPrompt)
+			) {
+				const error =
+					"PROMPT_POLICY_REVIEW_REQUIRED: provider-facing system prompt differs from the approved stock prompt";
+				if (options.hasUI !== true) throw new Error(error);
+				publishPromptPolicyWarning(error);
 				defaultPrompt = clonePromptResult(stockPrompt);
 			}
 
@@ -3101,11 +3137,12 @@ async function createAgentSessionScoped(
 			let result: BuildSystemPromptResult = {
 				systemPrompt: typeof customPrompt === "string" ? [customPrompt] : customPrompt,
 			};
-			if (releaseManifest) {
+			if (releaseManifest && !ompInternalSession) {
 				if (!matchesStockPrompt(result)) {
-					logger.warn("Prompt policy requires review; continuing with the stock system prompt", {
-						error: "PROMPT_POLICY_REVIEW_REQUIRED: provider-facing system prompt differs from the approved stock prompt",
-					});
+					const warning =
+						"PROMPT_POLICY_REVIEW_REQUIRED: provider-facing system prompt differs from the approved stock prompt";
+					if (options.hasUI !== true) throw new Error(warning);
+					publishPromptPolicyWarning(warning);
 				}
 				result = clonePromptResult(stockPrompt);
 			}
@@ -3409,6 +3446,14 @@ async function createAgentSessionScoped(
 
 		const setToolUIContext = (uiContext: ExtensionUIContext, hasUI: boolean) => {
 			toolContextStore.setUIContext(uiContext, hasUI);
+			promptPolicyUIContext = hasUI ? uiContext : undefined;
+			if (hasUI && startupPromptPolicyWarning) {
+				uiContext.setStatus("omp-prompt-policy", "Prompt policy: REVIEW REQUIRED");
+				if (notifiedPromptPolicyWarning !== startupPromptPolicyWarning) {
+					uiContext.notify(startupPromptPolicyWarning, "warning");
+					notifiedPromptPolicyWarning = startupPromptPolicyWarning;
+				}
+			}
 		};
 
 		const initialTools = initialToolNames

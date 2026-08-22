@@ -6137,7 +6137,7 @@
     },
     {
       "path": "packages/coding-agent/package.json",
-      "sha256": "08e0916819df60019b103a1df3c2e5154f68069bf49fd21dcdd5dfc09a31a603"
+      "sha256": "71c4b63a6c26640f3b4590faec9e87f080be2819bbe9e3bb9245fe6e4f293c81"
     },
     {
       "path": "packages/coding-agent/scripts/bundle-dist.ts",
@@ -6549,7 +6549,7 @@
     },
     {
       "path": "packages/coding-agent/src/commit/agentic/agent.ts",
-      "sha256": "10d847a93165763428a3f9c3ab6b7d2faa8e26681e832d12282fbf5e19cb001a"
+      "sha256": "9acb83620b3055659477f544ccc108577fc04111f250ece8e6b1e7b2ef2461de"
     },
     {
       "path": "packages/coding-agent/src/commit/agentic/fallback.ts",
@@ -6721,7 +6721,7 @@
     },
     {
       "path": "packages/coding-agent/src/compress/session.ts",
-      "sha256": "e05f3f54e5e026e1c682c4db7c98b9caf6f2c305efdae64e95141d45cc4a2715"
+      "sha256": "fe9d806334ad89e72c3308b9a502c11f7d6875a299db5ea373f627bb71558574"
     },
     {
       "path": "packages/coding-agent/src/config.ts",
@@ -6828,8 +6828,12 @@
       "sha256": "be84060c81c6ce50c9cc48748a2ef4b7c683f13a1415f916f73433628c318f87"
     },
     {
+      "path": "packages/coding-agent/src/context/internal-session.ts",
+      "sha256": "926487563b3f085f89ef5954c4a7a46beb3dea34562b389ea42f0572f94cb6d0"
+    },
+    {
       "path": "packages/coding-agent/src/context/manifest.ts",
-      "sha256": "896f060665ef4aaf380c24344391272490ad9be0b4b968feb97301b6fdadcbb6"
+      "sha256": "256dac320dfe825096a7f94cd9fa17d031c022cb3ded67234d9c2e6bdd0ce2a0"
     },
     {
       "path": "packages/coding-agent/src/context/prompt-sources.generated.ts",
@@ -7377,7 +7381,7 @@
     },
     {
       "path": "packages/coding-agent/src/extensibility/extensions/runner.ts",
-      "sha256": "a9c940d08eaa7162268c29a784e0dfeba4c99bb514dd78443f1624a597c328b2"
+      "sha256": "6e783bf51392062159ef280828592e207d7b19faa1af07178041aa31be40fb03"
     },
     {
       "path": "packages/coding-agent/src/extensibility/extensions/types.ts",
@@ -8009,7 +8013,7 @@
     },
     {
       "path": "packages/coding-agent/src/modes/components/agents-hub.ts",
-      "sha256": "5bdf1b184045d7d3b700c1fab3bbbe79b22fc38867bade4d4a049cd959af0caa"
+      "sha256": "4f305f450f143d6ac66bef64efba14c51c4d6ef1325431f05f18bfa31eba54d7"
     },
     {
       "path": "packages/coding-agent/src/modes/components/ask-dialog.ts",
@@ -8177,7 +8181,7 @@
     },
     {
       "path": "packages/coding-agent/src/modes/controllers/tan-command-controller.ts",
-      "sha256": "d6ff527d3a276fe07ce1b2c901e2c4d51e45c348c93a6fc776e92eda7e1e5468"
+      "sha256": "594f0df603fd0b4cafdaa90fb12087f7f7a67473f8c2a2f1abc5f3bc5c2bc7df"
     },
     {
       "path": "packages/coding-agent/src/modes/controllers/todo-command-controller.ts",
@@ -8345,7 +8349,7 @@
     },
     {
       "path": "packages/coding-agent/src/sdk.ts",
-      "sha256": "b7f8c1b24fc01df6ff463c84d53bdb28008ae4f333c18676de080ed8e2893917"
+      "sha256": "fc304f9c8828370ab40139f4a1e5faad46e4a8f590e7390161c0e8f592a6e4e6"
     },
     {
       "path": "packages/coding-agent/src/secrets/index.ts",
@@ -8405,7 +8409,7 @@
     },
     {
       "path": "packages/coding-agent/src/security/coordinator.ts",
-      "sha256": "ce143a165bc94c35fff782a2c99a7a65b70b3db60ab6a01d4acf5055bd297120"
+      "sha256": "3b43d125b0c9c4e6fd9a006dc1af1b632676547b87f43d7e4578f4fe705cbb6f"
     },
     {
       "path": "packages/coding-agent/src/security/importers/codex-security.ts",
@@ -8893,7 +8897,7 @@
     },
     {
       "path": "packages/coding-agent/src/task/executor.ts",
-      "sha256": "fbc581f0982f5f3512191a65c4b156a878dcbebb228d4fbf5f7a93bacbabcce4"
+      "sha256": "c9e96031e9f18b56ccce333cfe7c853735a88940640e13f4afa3c6bce566bed3"
     },
     {
       "path": "packages/coding-agent/src/task/index.ts",
@@ -8929,7 +8933,7 @@
     },
     {
       "path": "packages/coding-agent/src/task/persisted-revive.ts",
-      "sha256": "5df02a79a3bbbe02f6a64411c78187900412b864cff9fe1f6f969cdd7e04315a"
+      "sha256": "f7253686dd556b6651b917b0c43e8b7a0d7f64d7915f5d904346e2afdb319ade"
     },
     {
       "path": "packages/coding-agent/src/task/prewalk.ts",
@@ -10733,5 +10737,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "7a4c8437ca16abef43a3149480743d01a02c079080637a592db30b2671286a61"
+  "rootSha256": "efd3670b7fef84a4a6bac4d5469de4820628c86b7c0a90e4e23d26d200233ef5"
 }

@@ -72,6 +72,88 @@ describe("tracked context manifest", () => {
 		expect(canonicalGithubRepository("https://example.com/Smarty-Pants-Inc/oh-my-pi.git")).toBeUndefined();
 	});
 
+	it("keeps the OMP internal prompt capability off the package API", async () => {
+		const packageJson = (await Bun.file(path.resolve(import.meta.dir, "../../package.json")).json()) as {
+			exports: Record<string, unknown>;
+		};
+		expect(packageJson.exports["./context/internal-session"]).toBeNull();
+		expect(packageJson.exports["./context/internal-session.js"]).toBeNull();
+	});
+
+	it("prefers a verified materialized package over an enclosing Git checkout", async () => {
+		const repositoryRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-materialized-extension-"));
+		const packageRoot = path.join(repositoryRoot, "home/.smarty-stack/versions/0.20.11");
+		const entryPath = path.join(packageRoot, "extensions/smarty-prompt-guard/src/index.ts");
+		const repository = "Smarty-Pants-Inc/smarty-stack";
+		const commit = "a".repeat(40);
+		const tree = "b".repeat(40);
+		try {
+			await fs.mkdir(path.dirname(entryPath), { recursive: true });
+			const provenance = {
+				schema: "smarty.stack.provenance.v1",
+				version: "0.20.11",
+				repository,
+				commit,
+				tree,
+				createdAt: "2026-08-22",
+				purpose: "test package",
+				sources: [],
+				authority: "test",
+				recovery: "test",
+				nonclaims: [],
+			};
+			const files = new Map<string, string>([
+				["PROVENANCE.json", `${JSON.stringify(provenance, null, 2)}\n`],
+				[
+					"extensions/smarty-prompt-guard/package.json",
+					'{"type":"module","omp":{"extensions":["./src/index.ts"]}}\n',
+				],
+				["extensions/smarty-prompt-guard/src/index.ts", "export default function promptGuard() {}\n"],
+				[
+					"runtime-package.json",
+					'{"schema":"smarty.stack.runtime_projection.v1","files":["PROVENANCE.json","runtime-package.json"],"directories":["extensions/smarty-prompt-guard"]}\n',
+				],
+			]);
+			for (const [relative, source] of files) {
+				const target = path.join(packageRoot, relative);
+				await fs.mkdir(path.dirname(target), { recursive: true });
+				await Bun.write(target, source);
+			}
+			const manifest = {
+				schema: "smarty.stack.release_manifest.v1",
+				version: "0.20.11",
+				createdAt: "2026-08-22",
+				status: "protected_candidate_requires_external_approval",
+				files: [...files]
+					.map(([relative, source]) => ({
+						path: relative,
+						bytes: Buffer.byteLength(source),
+						sha256: sha256(source),
+					}))
+					.sort((left, right) => compareUnicodeCodePoints(left.path, right.path)),
+			};
+			const manifestSource = `${JSON.stringify(manifest, null, 2)}\n`;
+			await Bun.write(path.join(packageRoot, "MANIFEST.json"), manifestSource);
+			const checksums = [
+				...manifest.files.map(entry => [entry.path, entry.sha256] as const),
+				["MANIFEST.json", sha256(manifestSource)] as const,
+			]
+				.sort(([left], [right]) => compareUnicodeCodePoints(left, right))
+				.map(([relative, digest]) => `${digest}  ${relative}`)
+				.join("\n");
+			await Bun.write(path.join(packageRoot, "SHA256SUMS.txt"), `${checksums}\n`);
+			const result = Bun.spawnSync(["git", "init", "-q"], { cwd: repositoryRoot, stdout: "pipe", stderr: "pipe" });
+			expect(result.exitCode).toBe(0);
+			const release = {
+				candidates: [{ repository, commit, tree }],
+			} as unknown as Parameters<typeof isApprovedCandidateSource>[1];
+
+			expect(await isApprovedCandidateSource(entryPath, release)).toBe(true);
+		} finally {
+			await fs.rm(repositoryRoot, { recursive: true, force: true });
+		}
+	});
+
 	it("binds extension packages to approved identity, tree, and clean source", () => {
 		const identity = {
 			repository: "Smarty-Pants-Inc/oh-my-pi",

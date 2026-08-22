@@ -3,6 +3,7 @@ import { logger } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
 import { formatModelRoleAlias } from "../config/model-roles";
 import type { Settings } from "../config/settings";
+import { markOmpInternalSession } from "../context/internal-session";
 import { MCPManager } from "../mcp/manager";
 import { initializeExtensions } from "../modes/runtime-init";
 import type { PersistedSubagentReviverFactory } from "../registry/agent-lifecycle";
@@ -113,44 +114,46 @@ export function createPersistedSubagentReviverFactory(
 			const restrictToolNames = init.restrictToolNames === true;
 			const mcpManager = restrictToolNames ? undefined : MCPManager.instance();
 			const mcpProxyTools = mcpManager ? createMCPProxyTools(mcpManager) : [];
-			const { session } = await createAgentSession({
-				cwd: ctx.session.sessionManager.getCwd(),
-				authStorage: ctx.authStorage,
-				modelRegistry: ctx.modelRegistry,
-				...(persistedModelPattern ? { modelPattern: persistedModelPattern } : {}),
-				modelPatternAuthFallback: init.resolvedModel,
-				settings: subagentSettings,
-				sessionManager: reopened,
-				agentId: ref.id,
-				agentDisplayName: ref.displayName,
-				parentTaskPrefix: ref.id,
-				parentAgentId: ref.parentId,
-				expectedAgentRef: expectedRef,
-				taskDepth,
-				toolNames: init.tools,
-				outputSchema: init.outputSchema,
-				outputSchemaMode: init.outputSchemaMode,
-				restrictToolNames: restrictToolNames || undefined,
-				requireYieldTool: true,
-				systemPrompt: () => [init.systemPrompt],
-				// Old files predate persisted spawns: deny re-spawning rather than let
-				// createAgentSession default to wildcard ("*").
-				spawns: init.spawns ?? "",
-				hasUI: false,
-				enableLsp: restrictToolNames ? false : ctx.enableLsp,
-				...(restrictToolNames
-					? {
-							enableIrc: false,
-							enableMCP: false,
-							preloadedExtensionPaths: [],
-							preloadedCustomToolPaths: [],
-						}
-					: {
-							enableMCP: !mcpManager,
-							mcpManager,
-							customTools: mcpProxyTools.length > 0 ? mcpProxyTools : undefined,
-						}),
-			});
+			const { session } = await createAgentSession(
+				markOmpInternalSession({
+					cwd: ctx.session.sessionManager.getCwd(),
+					authStorage: ctx.authStorage,
+					modelRegistry: ctx.modelRegistry,
+					...(persistedModelPattern ? { modelPattern: persistedModelPattern } : {}),
+					modelPatternAuthFallback: init.resolvedModel,
+					settings: subagentSettings,
+					sessionManager: reopened,
+					agentId: ref.id,
+					agentDisplayName: ref.displayName,
+					parentTaskPrefix: ref.id,
+					parentAgentId: ref.parentId,
+					expectedAgentRef: expectedRef,
+					taskDepth,
+					toolNames: init.tools,
+					outputSchema: init.outputSchema,
+					outputSchemaMode: init.outputSchemaMode,
+					restrictToolNames: restrictToolNames || undefined,
+					requireYieldTool: true,
+					systemPrompt: () => [init.systemPrompt],
+					// Old files predate persisted spawns: deny re-spawning rather than let
+					// createAgentSession default to wildcard ("*").
+					spawns: init.spawns ?? "",
+					hasUI: false,
+					enableLsp: restrictToolNames ? false : ctx.enableLsp,
+					...(restrictToolNames
+						? {
+								enableIrc: false,
+								enableMCP: false,
+								preloadedExtensionPaths: [],
+								preloadedCustomToolPaths: [],
+							}
+						: {
+								enableMCP: !mcpManager,
+								mcpManager,
+								customTools: mcpProxyTools.length > 0 ? mcpProxyTools : undefined,
+							}),
+				}),
+			);
 			// Clamp the active set to the persisted list: createAgentSession's
 			// `alwaysInclude` can re-add non-defaultInactive extension/custom tools
 			// the original run didn't carry. Unknown/missing names are ignored.

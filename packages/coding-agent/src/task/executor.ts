@@ -26,6 +26,7 @@ import type { PromptTemplate } from "../config/prompt-templates";
 import { buildServiceTierByFamily, resolveSubagentServiceTier } from "../config/service-tier";
 import { Settings } from "../config/settings";
 import { SETTINGS_SCHEMA, type SettingPath } from "../config/settings-schema";
+import { markOmpInternalSession } from "../context/internal-session";
 import { renderInstruction } from "../context/registry";
 import type { ToolPathWithSource } from "../extensibility/custom-tools";
 import type { CustomTool } from "../extensibility/custom-tools/types";
@@ -2977,68 +2978,72 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			const buildSubagentSessionOptions = (
 				sessionManagerForRun: SessionManager,
 				expectedAgentRef: CreateAgentSessionOptions["expectedAgentRef"],
-			): CreateAgentSessionOptions => ({
-				cwd: worktree ?? cwd,
-				additionalDirectories: worktree !== undefined ? undefined : options.additionalDirectories,
-				authStorage,
-				modelRegistry,
-				getApiKey: options.getApiKey,
-				settings: subagentSettings,
-				executionEnvironment: options.executionEnvironment,
-				model,
-				modelPattern: model || modelOverride === undefined ? undefined : modelPatterns,
-				modelPatternAuthFallback:
-					model || modelOverride === undefined ? undefined : options.parentActiveModelPattern,
-				modelPatternFallbackRole:
-					model || modelOverride === undefined ? undefined : `${SUBAGENT_RETRY_FALLBACK_ROLE_PREFIX}${id}`,
-				modelPatternDefaultFallbackChain:
-					model || modelOverride === undefined ? undefined : inheritedRetryFallbackChain,
-				thinkingLevel: effectiveThinkingLevel,
-				thinkingLevelCeiling: spawnEffortCeiling,
-				toolNames,
-				outputSchema,
-				outputSchemaMode: options.outputSchemaMode,
-				restrictToolNames,
-				requireYieldTool: true,
-				contextInstructions: subagentContextInstructions,
-				contextFiles: options.contextFiles,
-				skills: options.skills,
-				promptTemplates: options.promptTemplates,
-				workspaceTree: options.workspaceTree,
-				rules: options.rules,
-				preloadedExtensionPaths: subagentRuntimeAllows(runtimeProfile, "extensions")
-					? options.preloadedExtensionPaths
-					: [],
-				preloadedCustomToolPaths: subagentRuntimeAllows(runtimeProfile, "customTools")
-					? options.preloadedCustomToolPaths
-					: [],
-				sessionManager: sessionManagerForRun,
-				hasUI: false,
-				prewalk,
-				spawns: spawnsEnv,
-				taskDepth: childDepth,
-				parentHindsightSessionState: options.parentHindsightSessionState,
-				parentMnemopiSessionState: options.parentMnemopiSessionState,
-				parentTaskPrefix: id,
-				parentAgentId: options.parentAgentId,
-				agentId: id,
-				agentDisplayName: agent.name,
-				expectedAgentRef,
-				enableLsp: lspEnabled,
-				enableIrc: subagentRuntimeAllows(runtimeProfile, "irc"),
-				skipPythonPreflight,
-				enableMCP,
-				mcpManager,
-				customTools: mcpProxyTools.length > 0 ? mcpProxyTools : undefined,
-				localProtocolOptions: options.localProtocolOptions,
-				telemetry: subagentTelemetry,
-				parentEvalSessionId: subagentRuntimeAllows(runtimeProfile, "sharedEvalState")
-					? options.parentEvalSessionId
-					: undefined,
-				onFirstChatDispatch: () => {
-					firstChatDispatchAt ??= performance.now();
-				},
-			});
+			): CreateAgentSessionOptions => {
+				const sessionOptions: CreateAgentSessionOptions = {
+					cwd: worktree ?? cwd,
+					additionalDirectories: worktree !== undefined ? undefined : options.additionalDirectories,
+					authStorage,
+					modelRegistry,
+					getApiKey: options.getApiKey,
+					settings: subagentSettings,
+					executionEnvironment: options.executionEnvironment,
+					model,
+					modelPattern: model || modelOverride === undefined ? undefined : modelPatterns,
+					modelPatternAuthFallback:
+						model || modelOverride === undefined ? undefined : options.parentActiveModelPattern,
+					modelPatternFallbackRole:
+						model || modelOverride === undefined ? undefined : `${SUBAGENT_RETRY_FALLBACK_ROLE_PREFIX}${id}`,
+					modelPatternDefaultFallbackChain:
+						model || modelOverride === undefined ? undefined : inheritedRetryFallbackChain,
+					thinkingLevel: effectiveThinkingLevel,
+					thinkingLevelCeiling: spawnEffortCeiling,
+					toolNames,
+					outputSchema,
+					outputSchemaMode: options.outputSchemaMode,
+					restrictToolNames,
+					disableExtensionDiscovery: restrictToolNames || undefined,
+					requireYieldTool: true,
+					contextInstructions: subagentContextInstructions,
+					contextFiles: options.contextFiles,
+					skills: options.skills,
+					promptTemplates: options.promptTemplates,
+					workspaceTree: options.workspaceTree,
+					rules: options.rules,
+					preloadedExtensionPaths: subagentRuntimeAllows(runtimeProfile, "extensions")
+						? options.preloadedExtensionPaths
+						: [],
+					preloadedCustomToolPaths: subagentRuntimeAllows(runtimeProfile, "customTools")
+						? options.preloadedCustomToolPaths
+						: [],
+					sessionManager: sessionManagerForRun,
+					hasUI: false,
+					prewalk,
+					spawns: spawnsEnv,
+					taskDepth: childDepth,
+					parentHindsightSessionState: options.parentHindsightSessionState,
+					parentMnemopiSessionState: options.parentMnemopiSessionState,
+					parentTaskPrefix: id,
+					parentAgentId: options.parentAgentId,
+					agentId: id,
+					agentDisplayName: agent.name,
+					expectedAgentRef,
+					enableLsp: lspEnabled,
+					enableIrc: subagentRuntimeAllows(runtimeProfile, "irc"),
+					skipPythonPreflight,
+					enableMCP,
+					mcpManager,
+					customTools: mcpProxyTools.length > 0 ? mcpProxyTools : undefined,
+					localProtocolOptions: options.localProtocolOptions,
+					telemetry: subagentTelemetry,
+					parentEvalSessionId: subagentRuntimeAllows(runtimeProfile, "sharedEvalState")
+						? options.parentEvalSessionId
+						: undefined,
+					onFirstChatDispatch: () => {
+						firstChatDispatchAt ??= performance.now();
+					},
+				};
+				return restrictToolNames ? markOmpInternalSession(sessionOptions) : sessionOptions;
+			};
 
 			const sessionManager = await awaitAbortable(sessionManagerPromise);
 			if (options.parentArtifactManager) {
