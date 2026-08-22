@@ -419,7 +419,10 @@ export function buildModelScopeNotification(
 			return `${scopedModel.model.id}${thinkingStr}`;
 		})
 		.join(", ");
-	return { kind: "info", message: `Model scope: ${modelList} (Ctrl+P to cycle)` };
+	return {
+		kind: "info",
+		message: `Model scope: ${modelList} (Ctrl+P to cycle)`,
+	};
 }
 export async function submitInteractiveInput(
 	mode: Pick<
@@ -474,7 +477,10 @@ export async function submitInteractiveInput(
 				userInitiated: input.userInitiated,
 			});
 		} else {
-			await session.prompt(input.text, { images: input.images, streamingBehavior });
+			await session.prompt(input.text, {
+				images: input.images,
+				streamingBehavior,
+			});
 		}
 	} catch (error: unknown) {
 		const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
@@ -613,7 +619,9 @@ async function rethrowAfterInteractiveStartupCleanup(error: unknown, cleanup: ()
 	try {
 		await cleanup();
 	} catch (cleanupError) {
-		logger.error("Interactive startup cleanup failed", { error: String(cleanupError) });
+		logger.error("Interactive startup cleanup failed", {
+			error: String(cleanupError),
+		});
 	}
 	throw error;
 }
@@ -770,9 +778,15 @@ async function runInteractiveMode(
 		void guest.ended
 			.then(() => mode.shutdown())
 			.catch(error => logger.error("collab guest bridge shutdown failed", error));
-		await guest.joinWithTransport(new LocalCollabTransport(bridge.address, { t: "guest", token: bridge.token }), {
-			roomId: bridge.roomId,
-		});
+		await guest.joinWithTransport(
+			new LocalCollabTransport(bridge.address, {
+				t: "guest",
+				token: bridge.token,
+			}),
+			{
+				roomId: bridge.roomId,
+			},
+		);
 	}
 	const managedBridge = bridge?.role === "host" && "managed" in bridge ? bridge : undefined;
 	await runInteractiveStartupSequence(
@@ -786,11 +800,13 @@ async function runInteractiveMode(
 
 	// `init` already cleared native history before painting the startup frame.
 	// Replaying resumed transcript rows and repainting the viewport is enough;
-	// another clear would only archive the startup frame. In-process session
-	// replacements still request `clearTerminalHistory` at their own callsites.
-	await logger.time("InteractiveMode.renderInitialMessages", () =>
-		mode.renderInitialMessages({ preserveExistingChat: true }),
-	);
+	// another clear would only archive the startup frame. A collab guest finalized
+	// and rendered its streamed replica during join, so do not replay it.
+	if (bridge?.role !== "guest") {
+		await logger.time("InteractiveMode.renderInitialMessages", () =>
+			mode.renderInitialMessages({ preserveExistingChat: true }),
+		);
+	}
 	// A resolved version check must not insert its banner into a partial transcript.
 	checkedVersionPromise.then(newVersion => {
 		if (!settings.get("startup.checkUpdate")) {
@@ -1470,7 +1486,11 @@ export async function buildSessionOptions(
 			: !restoringSession && activeSettings.get("prewalk.enabled");
 	if (prewalkEnabled) {
 		const rolePattern = expandRoleAlias(parsed.prewalkInto ?? DEFAULT_PREWALK_TARGET, activeSettings);
-		const resolved = resolveCliModel({ cliModel: rolePattern, modelRegistry, preferences: modelMatchPreferences });
+		const resolved = resolveCliModel({
+			cliModel: rolePattern,
+			modelRegistry,
+			preferences: modelMatchPreferences,
+		});
 		if (resolved.warning) {
 			process.stderr.write(`${chalk.yellow(`Warning: ${resolved.warning}`)}\n`);
 		}
@@ -1488,7 +1508,10 @@ export async function buildSessionOptions(
 				`${chalk.yellow(`Warning: prewalk disabled — no API key for ${resolved.model.provider}/${resolved.model.id}`)}\n`,
 			);
 		} else {
-			options.prewalk = { target: resolved.model, thinkingLevel: resolved.thinkingLevel };
+			options.prewalk = {
+				target: resolved.model,
+				thinkingLevel: resolved.thinkingLevel,
+			};
 		}
 	}
 
@@ -1497,7 +1520,11 @@ export async function buildSessionOptions(
 	}
 	if (parsed.planYolo) {
 		const rolePattern = expandRoleAlias(parsed.planYoloInto ?? "@smol", activeSettings);
-		const resolved = resolveCliModel({ cliModel: rolePattern, modelRegistry, preferences: modelMatchPreferences });
+		const resolved = resolveCliModel({
+			cliModel: rolePattern,
+			modelRegistry,
+			preferences: modelMatchPreferences,
+		});
 		if (resolved.warning) {
 			process.stderr.write(`${chalk.yellow(`Warning: ${resolved.warning}`)}\n`);
 		}
@@ -1507,7 +1534,10 @@ export async function buildSessionOptions(
 		if (!modelRegistry.hasConfiguredAuth(resolved.model)) {
 			throw new Error(`No API key for ${resolved.model.provider}/${resolved.model.id}`);
 		}
-		options.planYolo = { target: resolved.model, thinkingLevel: resolved.thinkingLevel };
+		options.planYolo = {
+			target: resolved.model,
+			thinkingLevel: resolved.thinkingLevel,
+		};
 	}
 
 	// Thinking level
@@ -2297,12 +2327,13 @@ export async function runRootCommand(
 				);
 			}
 
-			if (modelFallbackMessage) {
+			const isCollabGuest = interactiveCollabBridge?.role === "guest";
+			if (modelFallbackMessage && !isCollabGuest) {
 				notifs.push({ kind: "warn", message: modelFallbackMessage });
 			}
 
 			const modelRegistryError = modelRegistry.getError();
-			if (modelRegistryError) {
+			if (modelRegistryError && !isCollabGuest) {
 				notifs.push({ kind: "error", message: modelRegistryError.message });
 			}
 
@@ -2342,13 +2373,15 @@ export async function runRootCommand(
 					await runRpcMode(session, mode === "rpc-ui" ? setToolUIContext : undefined, subagentEventBus, rpcInput);
 				}
 			} else if (isInteractive) {
-				const versionCheckPromise = checkForNewVersion(VERSION).catch(() => undefined);
+				const versionCheckPromise = isCollabGuest
+					? Promise.resolve(undefined)
+					: checkForNewVersion(VERSION).catch(() => undefined);
 				const startupChangelog = await startupChangelogPromise;
 				const modelScopeNotification = buildModelScopeNotification(
 					scopedModels,
 					settingsInstance.get("startup.quiet"),
 				);
-				if (modelScopeNotification) {
+				if (modelScopeNotification && !isCollabGuest) {
 					notifs.push(modelScopeNotification);
 				}
 				if ($env.PI_TIMING) {

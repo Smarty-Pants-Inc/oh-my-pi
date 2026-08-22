@@ -304,7 +304,7 @@ describe("managed Herdr collab host lifecycle", () => {
 			await lifecycle.stop("test cleanup");
 		}
 	});
-	it("waits through a delayed route release and rearms one terminal private-route close", async () => {
+	it("waits through delayed route release and temporary discovery loss while rearming", async () => {
 		const sessionManager = {
 			getSessionId: () => "session-one",
 			snapshotForReplication: () => ({
@@ -314,11 +314,7 @@ describe("managed Herdr collab host lifecycle", () => {
 		};
 		const ctx = makeContext(sessionManager);
 		const errors: string[] = [];
-		const failClosed = Promise.withResolvers<void>();
-		ctx.showError = message => {
-			errors.push(message);
-			if (message.includes("automatic rearm limit reached")) failClosed.resolve();
-		};
+		ctx.showError = message => errors.push(message);
 
 		const records: Record<string, unknown>[] = [];
 		const closers: (() => void)[] = [];
@@ -374,8 +370,13 @@ describe("managed Herdr collab host lifecycle", () => {
 			paneId: "pane-1",
 		};
 		let discoveryRequests = 0;
+		let discoveryFailuresRemaining = 0;
 		const lifecycle = createLifecycle(ctx, session, credentials, async () => {
 			discoveryRequests += 1;
+			if (discoveryFailuresRemaining > 0) {
+				discoveryFailuresRemaining -= 1;
+				throw new Error("replacement API socket is not ready");
+			}
 			return credentials;
 		});
 
@@ -398,10 +399,11 @@ describe("managed Herdr collab host lifecycle", () => {
 
 			const closeResumedHost = closers[4];
 			if (!closeResumedHost) throw new Error("Expected resumed host close handle");
+			discoveryFailuresRemaining = 2;
 			closeResumedHost();
 			await waitForRecord(5);
 			await lifecycle.whenIdle();
-			expect(discoveryRequests).toBe(6);
+			expect(discoveryRequests).toBe(8);
 			const rearmedHost = ctx.herdrCollabHost;
 			expect(rearmedHost).toBeDefined();
 			expect(rearmedHost).not.toBe(resumedHost);
@@ -410,18 +412,22 @@ describe("managed Herdr collab host lifecycle", () => {
 			const closeRearmedHost = closers[5];
 			if (!closeRearmedHost) throw new Error("Expected rearmed host close handle");
 			closeRearmedHost();
-			await failClosed.promise;
+			const finalRecord = await waitForRecord(6);
 			await lifecycle.whenIdle();
-			expect(ctx.herdrCollabHost).toBeUndefined();
-			expect(records).toHaveLength(6);
-			expect(errors).toContain("Herdr OMP bridge ended (bridge dropped); automatic rearm limit reached");
+			expect(discoveryRequests).toBe(9);
+			const finalHost = ctx.herdrCollabHost;
+			expect(finalRecord).toMatchObject({ t: "host", ompSessionId: "session-one" });
+			expect(records).toHaveLength(7);
+			expect(finalHost).toBeDefined();
+			expect(finalHost).not.toBe(rearmedHost);
+			expect(errors).toEqual([]);
 		} finally {
 			await lifecycle.stop("test cleanup");
 			server.stop(true);
 		}
 	});
 
-	it("bounds route_busy retries when a renderer never detaches", async () => {
+	it("keeps retrying route_busy until Herdr admits the delayed route release", async () => {
 		const sessionManager = {
 			getSessionId: () => "session-one",
 			snapshotForReplication: () => ({
@@ -450,7 +456,7 @@ describe("managed Herdr collab host lifecycle", () => {
 							if (record.t === "host") {
 								hostAnnouncements += 1;
 								socket.write(
-									hostAnnouncements === 1
+									hostAnnouncements === 1 || hostAnnouncements === 10
 										? '{"t":"ready"}\n'
 										: '{"t":"error","code":"route_busy","message":"OMP host route is already active"}\n',
 								);
@@ -474,12 +480,12 @@ describe("managed Herdr collab host lifecycle", () => {
 		try {
 			await lifecycle.start();
 			await lifecycle.suspend("public collab guest active");
-			await expect(lifecycle.resume()).rejects.toThrow(/route remained busy/);
+			await lifecycle.resume();
 			await lifecycle.whenIdle();
 
-			expect(hostAnnouncements).toBeGreaterThan(4);
-			expect(hostAnnouncements).toBeLessThan(12);
-			expect(errors.some(error => error.includes("route remained busy"))).toBe(true);
+			expect(hostAnnouncements).toBe(10);
+			expect(ctx.herdrCollabHost).toBeDefined();
+			expect(errors).toEqual([]);
 		} finally {
 			await lifecycle.stop("test cleanup");
 			server.stop(true);

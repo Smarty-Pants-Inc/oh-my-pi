@@ -6847,7 +6847,7 @@
     },
     {
       "path": "packages/coding-agent/src/collab/local-transport.ts",
-      "sha256": "4dbc8b202838202ed641c6fd60e85a79baf4a9dfbb8addb5094db6a1f11d766b"
+      "sha256": "5087d4f88686d5e7a67ed7bc433efcae8e091ce8713932459c8e3b6e5e74839e"
     },
     {
       "path": "packages/coding-agent/src/collab/protocol.ts",

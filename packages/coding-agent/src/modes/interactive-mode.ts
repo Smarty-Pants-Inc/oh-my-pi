@@ -5416,6 +5416,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		return this.#uiHelpers.truncateTranscriptFromMessage(message);
 	}
 
+	refreshModelDisplay(): void {
+		this.#updateWelcomeModel();
+	}
+
 	getUserMessageText(message: Message): string {
 		return this.#uiHelpers.getUserMessageText(message);
 	}
