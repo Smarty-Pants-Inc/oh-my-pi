@@ -6449,7 +6449,7 @@
     },
     {
       "path": "packages/coding-agent/src/collab/herdr-bridge-bootstrap.ts",
-      "sha256": "e2c5a6075b44cbbb3d95ab4ef06ec3ca7884f29a11198f479c32b59bebbfbfdf"
+      "sha256": "501b3818ffacbc0a303feb9ecc3274ae22d7eac89e72415394e256c1f32985cf"
     },
     {
       "path": "packages/coding-agent/src/collab/host.ts",
@@ -10733,5 +10733,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "7a4c8437ca16abef43a3149480743d01a02c079080637a592db30b2671286a61"
+  "rootSha256": "c518ce650f2209bcea0dc5d83e138fc9b51191309c428705dec9973b4d5c84f8"
 }
