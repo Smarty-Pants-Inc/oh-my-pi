@@ -6153,7 +6153,7 @@
     },
     {
       "path": "packages/coding-agent/scripts/legacy-pi-virtual-module.ts",
-      "sha256": "9fc681104ef2d16859b97fad109e0dd04c9a7e8cfc9f55309a1495b0a3c43b16"
+      "sha256": "34aab402ff6ab787a2e8a0ad0a4d6abee69b8699a90fea28ef90ff064cbb5612"
     },
     {
       "path": "packages/coding-agent/src/advisor/advise-tool.ts",
@@ -10737,5 +10737,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "04b562aa28ed323a3cd9992b3acac1aef2d8635fffa1ddf4eab927730a30ef23"
+  "rootSha256": "8d3c599e336a79eccae72625957539b4e7384caa7df679d93b725e986a904593"
 }
