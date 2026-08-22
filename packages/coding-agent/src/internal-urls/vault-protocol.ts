@@ -895,6 +895,7 @@ export class VaultProtocolHandler implements ProtocolHandler {
 			contentType: getContentType(realTargetPath),
 			size: Buffer.byteLength(content, "utf-8"),
 			sourcePath: realTargetPath,
+			isDirectory: false,
 		};
 	}
 

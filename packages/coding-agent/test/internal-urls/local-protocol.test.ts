@@ -170,6 +170,7 @@ describe("LocalProtocolHandler", () => {
 			// `sourcePath` is canonicalized by the handler after symlink escape checks.
 			// On macOS this may turn `/var/...` into `/private/var/...`.
 			expect(resource.sourcePath).toBe(expectedSourcePath);
+			expect(resource.isDirectory).toBe(false);
 		});
 	});
 
