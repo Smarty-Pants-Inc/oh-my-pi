@@ -21,6 +21,29 @@ const OMP_SCOPE_BASE = {
 	tree: "a20c0452f99155e7adeaecfad28e4afd0223c684",
 } as const;
 const OMP_SCOPE_BASE_URL = "https://github.com/can1357/oh-my-pi.git";
+const MATERIALIZED_STACK_PACKAGE_METADATA_PATHS: Record<string, true> = {
+	"PROVENANCE.json": true,
+	"MANIFEST.json": true,
+	"SHA256SUMS.txt": true,
+	"extensions/smarty-prompt-guard/package.json": true,
+};
+
+/** Hash the immutable Stack content shared by source candidates and materialized runtimes. */
+export function stackPackageContentSha256(entries: readonly { path: string; sha256: string }[]): string {
+	let previousPath: string | undefined;
+	const retained: Array<{ path: string; sha256: string }> = [];
+	for (const entry of entries) {
+		if (previousPath !== undefined && compareUnicodeCodePoints(previousPath, entry.path) >= 0) {
+			throw new Error("Stack package entries must be sorted and unique by path");
+		}
+		previousPath = entry.path;
+		if (!Object.hasOwn(MATERIALIZED_STACK_PACKAGE_METADATA_PATHS, entry.path)) {
+			retained.push({ path: entry.path, sha256: entry.sha256 });
+		}
+	}
+	if (retained.length === 0) throw new Error("Stack package has no static content entries");
+	return sha256(canonicalJson(retained));
+}
 
 export function canonicalGithubRepository(url: string | undefined): string | undefined {
 	if (!url) return undefined;
@@ -86,6 +109,7 @@ export interface ContextReleaseManifest {
 	commit: string;
 	tree: string;
 	candidates: CandidateIdentity[];
+	stackPackageContentSha256: string;
 	contentManifest: ContentManifest;
 	contentManifestRootSha256: string;
 	behaviorSha256: string;
@@ -348,6 +372,7 @@ export function parseContextReleaseManifest(source: string): ContextReleaseManif
 			"commit",
 			"tree",
 			"candidates",
+			"stackPackageContentSha256",
 			"contentManifest",
 			"contentManifestRootSha256",
 			"behaviorSha256",
@@ -383,6 +408,7 @@ export function parseContextReleaseManifest(source: string): ContextReleaseManif
 		"configurationSourceSha256",
 		"configurationSemanticSha256",
 		"combinedPromptBehaviorSha256",
+		"stackPackageContentSha256",
 		"rootSha256",
 	] as const) {
 		assertSha256(value[field], `release manifest ${field}`);
@@ -568,11 +594,10 @@ function validateCandidateSet(
 	return sorted;
 }
 
-async function loadActivationCandidates(): Promise<CandidateIdentity[] | undefined> {
+async function loadActivationState(): Promise<ContextReleaseManifest | undefined> {
 	const statePath = activationStatePath();
 	if (!(await Bun.file(statePath).exists())) return undefined;
-	const state = parseContextReleaseManifest(await Bun.file(statePath).text());
-	return state.candidates;
+	return parseContextReleaseManifest(await Bun.file(statePath).text());
 }
 
 export function activationStatePath(explicitPath?: string): string {
@@ -915,6 +940,7 @@ async function isApprovedMaterializedCandidateSource(
 	if (!candidate || candidate.commit !== provenance.commit || candidate.tree !== provenance.tree) return false;
 
 	const expectedChecksums = new Map<string, string>();
+	const contentEntries: Array<{ path: string; sha256: string }> = [];
 	let previousPath: string | undefined;
 	for (const [index, rawEntry] of manifest.files.entries()) {
 		if (!isRecord(rawEntry)) return false;
@@ -933,8 +959,10 @@ async function isApprovedMaterializedCandidateSource(
 		const bytes = await fs.readFile(absolute);
 		if (bytes.byteLength !== rawEntry.bytes || sha256(bytes) !== rawEntry.sha256) return false;
 		expectedChecksums.set(rawEntry.path, rawEntry.sha256);
+		contentEntries.push({ path: rawEntry.path, sha256: rawEntry.sha256 });
 		previousPath = rawEntry.path;
 	}
+	if (release.stackPackageContentSha256 !== stackPackageContentSha256(contentEntries)) return false;
 	const sourceRelative = path.relative(root, resolvedSource).replaceAll(path.sep, "/");
 	if (!expectedChecksums.has(sourceRelative)) return false;
 	expectedChecksums.set("MANIFEST.json", sha256(manifestSource));
@@ -1035,7 +1063,7 @@ export async function isApprovedCandidateSource(filePath: string, release: Conte
 export async function buildContextReleaseManifest(
 	_projectCwd: string = process.cwd(),
 	candidateOverride?: readonly CandidateIdentity[],
-	options?: { requireCleanCanonicalCheckout?: boolean; scopeCoverage?: unknown },
+	options?: { requireCleanCanonicalCheckout?: boolean; scopeCoverage?: unknown; stackPackageContentSha256?: string },
 ): Promise<ContextReleaseManifest> {
 	const packageRoot = path.resolve(import.meta.dir, "../..");
 	const repositoryRoot = await repo.root(packageRoot);
@@ -1056,8 +1084,14 @@ export async function buildContextReleaseManifest(
 		}
 	}
 	const content = await assertTrackedManifestCurrent();
-	const candidateInput = candidateOverride ?? (await loadActivationCandidates());
+	const activation = candidateOverride ? undefined : await loadActivationState();
+	const candidateInput = candidateOverride ?? activation?.candidates;
 	const suppliedOmp = candidateInput?.find(candidate => candidate.repository === OMP_REPOSITORY);
+	const stackPackageContentSha256 = options?.stackPackageContentSha256 ?? activation?.stackPackageContentSha256;
+	if (!stackPackageContentSha256) {
+		throw new Error("PROMPT_POLICY_REVIEW_REQUIRED: missing approved Stack package content hash");
+	}
+	assertSha256(stackPackageContentSha256, "approved Stack package content hash");
 	const scopeCoverageInput = options?.scopeCoverage ?? suppliedOmp?.scopeCoverage;
 	if (!scopeCoverageInput) {
 		throw new Error("PROMPT_POLICY_REVIEW_REQUIRED: missing reviewed OMP scopeCoverage input");
@@ -1083,6 +1117,7 @@ export async function buildContextReleaseManifest(
 		commit,
 		tree,
 		candidates,
+		stackPackageContentSha256,
 		contentManifest: content,
 		contentManifestRootSha256: content.rootSha256,
 		behaviorSha256: content.behaviorSha256,

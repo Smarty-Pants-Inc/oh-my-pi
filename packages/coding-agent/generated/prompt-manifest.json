@@ -6813,7 +6813,7 @@
     },
     {
       "path": "packages/coding-agent/src/context/approved-policy.ts",
-      "sha256": "53ee6ad9f46fd1b3bb69859d3bcdcb3c9d8578ebd9e3b4ce3c2eb557cc2ca6f5"
+      "sha256": "c0611213e392227027ea6e4d91590f751251870c6fb2f77917b70c4d8834ea7c"
     },
     {
       "path": "packages/coding-agent/src/context/canonical.ts",
@@ -6833,7 +6833,7 @@
     },
     {
       "path": "packages/coding-agent/src/context/manifest.ts",
-      "sha256": "9e1123b7ed101b1f0af5b9b0267c155409d450d36cafcb66dad9ae32c1c4d773"
+      "sha256": "842aeae774f8aa17a0c1eab5c7000c43a1d1f0a4810686dadf838c3d441d8cbc"
     },
     {
       "path": "packages/coding-agent/src/context/prompt-sources.generated.ts",
@@ -8933,7 +8933,7 @@
     },
     {
       "path": "packages/coding-agent/src/task/persisted-revive.ts",
-      "sha256": "6ef7b2f67e088954860f13bbdb747740e127a9c99f66aa5b351cb4cd0628e519"
+      "sha256": "a963720690e173da3eacac16c3656665e16cdb148d9f0b35addb9b3cf86dd120"
     },
     {
       "path": "packages/coding-agent/src/task/prewalk.ts",
@@ -10737,5 +10737,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "1cd020bdfe19b36dabc249e22a4a08bdf0e18b1bc43ce1934589b3bb78828187"
+  "rootSha256": "46103800a87c6a692a889ae114a27e4b5d7cb0c5ee5fc02824fa7857f803d675"
 }

@@ -16,6 +16,7 @@ import {
 	isApprovedCandidateSource,
 	parseContentManifest,
 	parseContextReleaseManifest,
+	stackPackageContentSha256,
 	trackedContentManifest,
 	validateScopeCoverage,
 } from "../../src/context/manifest";
@@ -159,6 +160,7 @@ describe("tracked context manifest", () => {
 			expect(result.exitCode).toBe(0);
 			const release = {
 				candidates: [{ repository, commit, tree }],
+				stackPackageContentSha256: stackPackageContentSha256(manifest.files),
 			} as unknown as Parameters<typeof isApprovedCandidateSource>[1];
 
 			expect(await isApprovedCandidateSource(currentEntryPath, release)).toBe(false);
@@ -611,6 +613,7 @@ describe("tracked context manifest", () => {
 			configurationSourceSha256: "d".repeat(64),
 			configurationSemanticSha256: "e".repeat(64),
 			combinedPromptBehaviorSha256,
+			stackPackageContentSha256: "f".repeat(64),
 		};
 		const release = {
 			...releasePayload,

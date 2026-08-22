@@ -5,7 +5,7 @@ import { createMockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { compareUnicodeCodePoints, sha256 } from "@oh-my-pi/pi-coding-agent/context/canonical";
-import type { ContextReleaseManifest } from "@oh-my-pi/pi-coding-agent/context/manifest";
+import { type ContextReleaseManifest, stackPackageContentSha256 } from "@oh-my-pi/pi-coding-agent/context/manifest";
 import type { ExtensionFactory, ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import {
 	type CreateAgentSessionOptions,
@@ -162,10 +162,16 @@ ${mismatchSource}		return context.build(context.templates);
 		fs.chmodSync(directory, 0o555);
 	};
 	chmodTree(packageRoot);
+	const contentSha256 = stackPackageContentSha256(
+		[...sources]
+			.sort(([left], [right]) => compareUnicodeCodePoints(left, right))
+			.map(([path, source]) => ({ path, sha256: sha256(source) })),
+	);
 	return {
 		sourcePath: path.join(currentRoot, sourcePath),
 		release: {
 			candidates: [{ repository, commit, tree }],
+			stackPackageContentSha256: contentSha256,
 		} as unknown as ContextReleaseManifest,
 	};
 }
@@ -289,6 +295,16 @@ describe("extension system prompt builders", () => {
 				await approved.session.dispose();
 			}
 
+			const selfAttestedMarkerPath = tempDir.join("self-attested-builder-ran.txt");
+			const selfAttested = writeMaterializedPromptBuilderPackage(
+				tempDir.join("self-attested-stack"),
+				selfAttestedMarkerPath,
+			);
+			await expect(createProtectedSession(false, selfAttested.sourcePath)).rejects.toThrow(
+				"PROMPT_POLICY_REVIEW_REQUIRED: one or more configured system prompt builder sources are not approved",
+			);
+			expect(fs.existsSync(selfAttestedMarkerPath)).toBe(false);
+
 			await expect(
 				createProtectedSession(false, sourcePath, { systemPrompt: ["external override"] }),
 			).rejects.toThrow(
@@ -353,6 +369,7 @@ describe("extension system prompt builders", () => {
 				tempDir.join("unused-marker.txt"),
 				false,
 			);
+			testSetApprovedStartupManifest(withoutBuilder.release);
 			await expect(createProtectedSession(false, withoutBuilder.sourcePath)).rejects.toThrow(
 				"PROMPT_POLICY_REVIEW_REQUIRED: an approved system prompt builder is required",
 			);
@@ -364,6 +381,7 @@ describe("extension system prompt builders", () => {
 				true,
 				mismatchTriggerPath,
 			);
+			testSetApprovedStartupManifest(mismatch.release);
 			fs.writeFileSync(mismatchTriggerPath, "on\n");
 			await expect(createProtectedSession(false, mismatch.sourcePath)).rejects.toThrow(
 				"PROMPT_POLICY_REVIEW_REQUIRED: provider-facing system prompt differs from the approved stock prompt",

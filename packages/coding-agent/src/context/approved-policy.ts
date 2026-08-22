@@ -21,6 +21,7 @@ export interface ApprovedPolicy {
 		approvedAt: string;
 	};
 	candidates: CandidateIdentity[];
+	stackPackageContentSha256: string;
 	contentManifestRootSha256: string;
 	behaviorSha256: string;
 	globalAgentsSha256: string;
@@ -63,6 +64,7 @@ export function parseApprovedPolicy(source: string): ApprovedPolicy {
 			"schema",
 			"approval",
 			"candidates",
+			"stackPackageContentSha256",
 			"contentManifestRootSha256",
 			"behaviorSha256",
 			"globalAgentsSha256",
@@ -95,6 +97,7 @@ export function parseApprovedPolicy(source: string): ApprovedPolicy {
 	assertSha256(policy.globalAgentsSha256, "globalAgentsSha256");
 	assertSha256(policy.configurationSemanticSha256, "configurationSemanticSha256");
 	assertSha256(policy.combinedPromptBehaviorSha256, "combinedPromptBehaviorSha256");
+	assertSha256(policy.stackPackageContentSha256, "stackPackageContentSha256");
 	assertSha256(policy.rootSha256, "rootSha256");
 	const expectedRoot = sha256(canonicalJson(policyPayload(policy) as unknown as JsonValue));
 	if (policy.rootSha256 !== expectedRoot) throw new Error("approved policy rootSha256 does not match its payload");
@@ -120,6 +123,7 @@ function policyMismatches(policy: ApprovedPolicy, release: ContextReleaseManifes
 	compare("globalAgentsSha256", policy.globalAgentsSha256, release.globalAgentsSourceSha256);
 	compare("configurationSemanticSha256", policy.configurationSemanticSha256, release.configurationSemanticSha256);
 	compare("combinedPromptBehaviorSha256", policy.combinedPromptBehaviorSha256, release.combinedPromptBehaviorSha256);
+	compare("stackPackageContentSha256", policy.stackPackageContentSha256, release.stackPackageContentSha256);
 	if (
 		canonicalJson(policy.candidates as unknown as JsonValue) !==
 		canonicalJson(release.candidates as unknown as JsonValue)
@@ -144,6 +148,7 @@ export function releaseProjectionMismatches(
 	compare("behaviorSha256", activated.behaviorSha256, current.behaviorSha256);
 	compare("globalAgentsSha256", activated.globalAgentsSha256, current.globalAgentsSha256);
 	compare("configurationSemanticSha256", activated.configurationSemanticSha256, current.configurationSemanticSha256);
+	compare("stackPackageContentSha256", activated.stackPackageContentSha256, current.stackPackageContentSha256);
 	compare(
 		"combinedPromptBehaviorSha256",
 		activated.combinedPromptBehaviorSha256,
@@ -176,14 +181,19 @@ export async function assertApprovedStartup(cwd: string = process.cwd()): Promis
 		throw new Error(`PROMPT_POLICY_REVIEW_REQUIRED: missing ${statePath}`);
 	}
 	const activated = parseContextReleaseManifest(await Bun.file(statePath).text());
-	const release = await buildContextReleaseManifest(cwd, undefined, { requireCleanCanonicalCheckout: true });
+	const policy = await loadApprovedPolicy();
+	if (!policy) throw new Error(`PROMPT_POLICY_REVIEW_REQUIRED: missing ${approvedPolicyPath()}`);
+	const release = await buildContextReleaseManifest(cwd, policy.candidates, {
+		requireCleanCanonicalCheckout: true,
+		stackPackageContentSha256: policy.stackPackageContentSha256,
+	});
 	const activationMismatches = releaseProjectionMismatches(activated, release);
 	if (activationMismatches.length > 0) {
 		throw new Error(`PROMPT_POLICY_REVIEW_REQUIRED: ${activationMismatches.join("; ")}`);
 	}
-	const status = await approvalStatus(release);
-	if (status.status !== "approved") {
-		throw new Error(`PROMPT_POLICY_REVIEW_REQUIRED: ${status.reasons.join("; ")}`);
+	const approvalMismatches = policyMismatches(policy, release);
+	if (approvalMismatches.length > 0) {
+		throw new Error(`PROMPT_POLICY_REVIEW_REQUIRED: ${approvalMismatches.join("; ")}`);
 	}
 	return release;
 }
