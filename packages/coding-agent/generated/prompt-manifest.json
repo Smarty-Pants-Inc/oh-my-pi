@@ -7502,7 +7502,7 @@
     },
     {
       "path": "packages/coding-agent/src/goals/tools/goal-tool.ts",
-      "sha256": "854999e7b601202c8306a6be94cad62303530322b9cabab3ab76748828d78afe"
+      "sha256": "ab6197afffee203cc5ad05e502ba57f9c6f1a1a53b3b00d80bfc74a855d0805d"
     },
     {
       "path": "packages/coding-agent/src/hindsight/backend.ts",
@@ -10746,5 +10746,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "a40b5d55dbb392fd0a3f16745be8eb8138b6ffe8ca379d9f63e0cbd3261bfa5b"
+  "rootSha256": "7d62f7a1365959f5fa7d462dd51e1a7a9abe4be733c70e3cb863dd7dc55d62e9"
 }
