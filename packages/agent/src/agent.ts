@@ -39,6 +39,7 @@ import {
 import type { AppendOnlyContextManager } from "./append-only-context";
 import { collectCompactionContextInstructions } from "./compaction/messages";
 import { isProviderRefusalMessage } from "./replay-policy";
+import { Tokenizer, tokenizerEncodingForModel } from "./tokenizer";
 import type {
 	AgentBeforeModelCall,
 	AgentContext,
@@ -397,7 +398,7 @@ export class Agent {
 		pendingToolCalls: new Set<string>(),
 		error: undefined,
 	};
-
+	#tokenizer = new Tokenizer(this.#state.model);
 	#listeners = new Set<(e: AgentEvent) => void>();
 	#queueChangeListeners = new Set<() => void>();
 	#abortController?: AbortController;
@@ -470,6 +471,7 @@ export class Agent {
 	#appendOnlyContext?: AppendOnlyContextManager;
 	#beforeQueuedMessageDequeueHooks = new Set<(signal?: AbortSignal) => Promise<void> | void>();
 	#beforeModelCallHooks = new Set<(signal?: AbortSignal) => Promise<void> | void>();
+	#beforeInputHooks = new Set<(messages: readonly AgentMessage[]) => void>();
 
 	/** Buffered Cursor tool results with text length at time of call (for correct ordering) */
 	#cursorToolResultBuffer: CursorToolResultEntry[] = [];
@@ -501,6 +503,7 @@ export class Agent {
 		if (opts.initialState?.messages) this.#state.messages = opts.initialState.messages.slice();
 		if (opts.initialState?.pendingToolCalls)
 			this.#state.pendingToolCalls = new Set(opts.initialState.pendingToolCalls);
+		this.#syncTokenizer(this.#state.model);
 		this.#convertToLlm = opts.convertToLlm || defaultConvertToLlm;
 		this.#contextTarget = opts.contextTarget ?? "main";
 		this.#transformContext = opts.transformContext;
@@ -764,9 +767,27 @@ export class Agent {
 	set maxRetryDelayMs(value: number | undefined) {
 		this.#maxRetryDelayMs = value;
 	}
-
 	get state(): AgentState {
 		return this.#state;
+	}
+
+	/**
+	 * Tokenizer for the active model. The instance is replaced whenever the
+	 * active model's encoding changes (see {@link setModel}), so callers must
+	 * not cache it across model switches.
+	 */
+	get tokenizer(): Tokenizer {
+		return this.#tokenizer;
+	}
+
+	/**
+	 * Swap the tokenizer only when the encoding actually changes, so the warm
+	 * per-message memo survives same-encoding model switches.
+	 */
+	#syncTokenizer(model: Model | null | undefined): void {
+		if (tokenizerEncodingForModel(model) !== this.#tokenizer.encoding) {
+			this.#tokenizer = new Tokenizer(model);
+		}
 	}
 
 	get appendOnlyContext(): AppendOnlyContextManager | undefined {
@@ -851,6 +872,16 @@ export class Agent {
 		const registration = (signal?: AbortSignal) => hook(signal);
 		this.#beforeModelCallHooks.add(registration);
 		return () => this.#beforeModelCallHooks.delete(registration);
+	}
+
+	/** Register a synchronous hook that runs before messages enter accepted input state. */
+	addBeforeInputHook(hook: (messages: readonly AgentMessage[]) => void): () => void {
+		this.#beforeInputHooks.add(hook);
+		return () => this.#beforeInputHooks.delete(hook);
+	}
+
+	#runBeforeInputHooks(messages: readonly AgentMessage[]): void {
+		for (const hook of this.#beforeInputHooks) hook(messages);
 	}
 
 	async #runBeforeModelCallHooks(signal?: AbortSignal): Promise<void> {
@@ -955,8 +986,9 @@ export class Agent {
 		this.#state.systemPrompt = typeof v === "string" ? [v] : v;
 	}
 
-	setModel(m: Model) {
-		this.#state.model = m;
+	setModel(model: Model) {
+		this.#state.model = model;
+		this.#syncTokenizer(model);
 	}
 
 	setThinkingLevel(l: Effort | undefined) {
@@ -996,9 +1028,10 @@ export class Agent {
 	}
 
 	replaceMessages(ms: AgentMessage[]) {
-		// New array assignment is intentional: caller-owned `ms` may be mutated
-		// after handoff; snapshot it so external mutations cannot leak in.
-		this.#state.messages = ms.slice();
+		// Snapshot first so hooks inspect the exact list that will be accepted.
+		const next = ms.slice();
+		this.#runBeforeInputHooks(next);
+		this.#state.messages = next;
 	}
 
 	replaceQueues(steering: AgentMessage[], followUp: AgentMessage[], preserveCompanions = false) {
@@ -1166,6 +1199,7 @@ export class Agent {
 	}
 
 	appendMessage(m: AgentMessage) {
+		this.#runBeforeInputHooks([m]);
 		this.#state.messages.push(m);
 	}
 
@@ -1182,6 +1216,7 @@ export class Agent {
 	 * Delivered after current tool execution, skips remaining tools.
 	 */
 	steer(m: AgentMessage) {
+		this.#runBeforeInputHooks([m]);
 		this.#steeringQueue.push(m);
 		this.#notifySteeringWaiters();
 		this.#notifyQueueChanges();
@@ -1192,6 +1227,7 @@ export class Agent {
 	 * Delivered only when agent has no more tool calls or steering messages.
 	 */
 	followUp(m: AgentMessage) {
+		this.#runBeforeInputHooks([m]);
 		this.#followUpQueue.push(m);
 		this.#notifyQueueChanges();
 	}
@@ -1423,6 +1459,7 @@ export class Agent {
 			msgs = [input];
 			promptOptions = imagesOrOptions as AgentPromptOptions | undefined;
 		}
+		this.#runBeforeInputHooks(msgs);
 
 		await this.#runLoop(msgs, promptOptions);
 	}

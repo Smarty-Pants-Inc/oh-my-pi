@@ -1,5 +1,5 @@
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
-import type { Api, ApiKey, Model } from "@oh-my-pi/pi-ai";
+import type { Api, ApiKey, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
 import { completeSimple, retryTransientCompletion } from "@oh-my-pi/pi-ai";
 import { prompt } from "@oh-my-pi/pi-utils";
 import reduceSystemPrompt from "../../commit/prompts/reduce-system.md" with { type: "text" };
@@ -14,6 +14,7 @@ export interface ReducePhaseInput {
 	model: Model<Api>;
 	apiKey: ApiKey;
 	thinkingLevel?: ThinkingLevel;
+	cacheRetention?: SimpleStreamOptions["cacheRetention"];
 	observations: FileObservation[];
 	stat: string;
 	scopeCandidates: string;
@@ -24,6 +25,7 @@ export async function runReducePhase({
 	model,
 	apiKey,
 	thinkingLevel,
+	cacheRetention,
 	observations,
 	stat,
 	scopeCandidates,
@@ -43,7 +45,12 @@ export async function runReducePhase({
 				messages: [{ role: "user", content: userContent, timestamp: Date.now() }],
 				tools: [ReduceTool],
 			},
-			{ apiKey, maxTokens: 2400, reasoning: toReasoningEffort(thinkingLevel) },
+			{
+				apiKey,
+				maxTokens: 2400,
+				reasoning: toReasoningEffort(thinkingLevel),
+				cacheRetention,
+			},
 		),
 	);
 

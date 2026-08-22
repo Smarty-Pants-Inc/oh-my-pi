@@ -1475,10 +1475,12 @@ describe("runGcCommand cold-session archive", () => {
 		db.prepare("INSERT INTO messages (session_file) VALUES (?)").run(session);
 		db.close();
 		const sessionMoved = (async () => {
-			for await (const event of fs.watch(path.dirname(session))) {
-				if (event.filename === path.basename(session)) return true;
+			const deadline = Date.now() + 5_000;
+			while (await Bun.file(session).exists()) {
+				if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${session} to be archived`);
+				await Bun.sleep(10);
 			}
-			return false;
+			return true;
 		})();
 
 		let gcPromise: Promise<GcResult> | undefined;

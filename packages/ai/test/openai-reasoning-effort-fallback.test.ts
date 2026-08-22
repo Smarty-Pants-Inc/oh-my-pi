@@ -70,11 +70,15 @@ function createResponsesSseResponse(id = "resp_reasoning_fallback"): Response {
 	});
 }
 
-function invalidReasoningResponse(param: "reasoning_effort" | "reasoning.effort", value: string): Response {
+function invalidReasoningResponse(
+	param: string,
+	value: string,
+	allowed: readonly string[] = ["high", "medium", "low", "max", "none"],
+): Response {
 	return new Response(
 		JSON.stringify({
 			error: {
-				message: `invalid reasoning value: '${value}' (must be "high", "medium", "low", "max", or "none")`,
+				message: `invalid reasoning value: '${value}' (must be ${allowed.map(item => `"${item}"`).join(", ")})`,
 				type: "invalid_request_error",
 				param,
 			},
@@ -82,6 +86,46 @@ function invalidReasoningResponse(param: "reasoning_effort" | "reasoning.effort"
 		{ status: 400, headers: { "content-type": "application/json" } },
 	);
 }
+
+function stalePreviousResponse(): Response {
+	return new Response(
+		JSON.stringify({
+			error: {
+				message: "Previous response with id 'resp_reasoning_baseline' not found.",
+				type: "invalid_request_error",
+				param: "previous_response_id",
+				code: "previous_response_not_found",
+			},
+		}),
+		{ status: 404, headers: { "content-type": "application/json" } },
+	);
+}
+
+function invalidQwenTemplateEffortResponse(): Response {
+	return new Response(
+		JSON.stringify({
+			error: {
+				message: 'Invalid option: expected one of "high"|"medium"|"low"',
+				type: "invalid_request_error",
+				param: "chat_template_kwargs.reasoning_effort",
+			},
+		}),
+		{ status: 400, headers: { "content-type": "application/json" } },
+	);
+}
+function invalidQwenTemplateEffortWithoutAlternativesResponse(): Response {
+	return new Response(
+		JSON.stringify({
+			error: {
+				message: "invalid reasoning_effort 'xhigh'",
+				type: "invalid_request_error",
+				param: "chat_template_kwargs.reasoning_effort",
+			},
+		}),
+		{ status: 400, headers: { "content-type": "application/json" } },
+	);
+}
+
 function invalidMediumReasoningResponse(): Response {
 	return new Response(
 		JSON.stringify({
@@ -133,6 +177,37 @@ function summaryReasoningErrorResponse(): Response {
 	);
 }
 
+/**
+ * Ninfer-style strict kwargs whitelist: the server rejects the
+ * `chat_template_kwargs.reasoning_effort` spelling itself, not the value.
+ */
+function templateKwargRejectionResponse(message = "chat_template_kwargs.reasoning_effort is not supported"): Response {
+	return new Response(
+		JSON.stringify({
+			error: {
+				message,
+				type: "invalid_request_error",
+				code: "unknown_parameter",
+				param: "chat_template_kwargs.reasoning_effort",
+			},
+		}),
+		{ status: 400, headers: { "content-type": "application/json" } },
+	);
+}
+
+function templateKwargValueRejectionResponse(): Response {
+	return new Response(
+		JSON.stringify({
+			error: {
+				message: "chat_template_kwargs.reasoning_effort: 'xhigh' is not supported, valid levels: low, medium, high",
+				type: "invalid_request_error",
+				param: "chat_template_kwargs.reasoning_effort",
+			},
+		}),
+		{ status: 400, headers: { "content-type": "application/json" } },
+	);
+}
+
 function parseJsonBody(init: RequestInit | undefined): Record<string, unknown> {
 	return JSON.parse(typeof init?.body === "string" ? init.body : "{}") as Record<string, unknown>;
 }
@@ -158,6 +233,21 @@ function createCompletionsModel(): Model<"openai-completions"> {
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 128_000,
 		maxTokens: 16_384,
+	});
+}
+
+function createLocalQwenModel(provider: "vllm" | "llama.cpp", baseUrl: string): Model<"openai-completions"> {
+	return buildModel({
+		id: "qwen3.8-27b",
+		name: "Qwen 3.8 27B",
+		api: "openai-completions",
+		provider,
+		baseUrl,
+		reasoning: true,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 262_144,
+		maxTokens: 32_768,
 	});
 }
 
@@ -253,6 +343,172 @@ describe("OpenAI reasoning effort fallback retry", () => {
 		expect(bodies.map(body => body.reasoning_effort)).toEqual(["xhigh", "max"]);
 	});
 
+	it("compresses a remembered Chat Completions xhigh fallback after high is also rejected", async () => {
+		const bodies: Record<string, unknown>[] = [];
+		const fetchMock: FetchImpl = Object.assign(
+			async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+				const body = parseJsonBody(init);
+				bodies.push(body);
+				if (bodies.length === 1) {
+					return invalidReasoningResponse("reasoning_effort", "xhigh", ["high", "low"]);
+				}
+				if (bodies.length === 3) return invalidReasoningResponse("reasoning_effort", "high", ["low"]);
+				return createChatSseResponse();
+			},
+			{ preconnect: fetch.preconnect },
+		);
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const model = createCompletionsModel();
+
+		for (let request = 0; request < 3; request++) {
+			const result = await streamOpenAICompletions(model, testContext, {
+				apiKey: "test-key",
+				fetch: fetchMock,
+				providerSessionState,
+				reasoning: "xhigh",
+			}).result();
+			expect(result.stopReason).toBe("stop");
+		}
+
+		expect(bodies.map(body => body.reasoning_effort)).toEqual(["xhigh", "high", "high", "low", "low"]);
+	});
+
+	it("retries Chat Completions xhigh through high to low in one request", async () => {
+		const bodies: Record<string, unknown>[] = [];
+		const fetchMock: FetchImpl = Object.assign(
+			async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+				const body = parseJsonBody(init);
+				bodies.push(body);
+				if (bodies.length === 1) {
+					return invalidReasoningResponse("reasoning_effort", "xhigh", ["high", "low"]);
+				}
+				if (bodies.length === 2) return invalidReasoningResponse("reasoning_effort", "high", ["low"]);
+				return createChatSseResponse();
+			},
+			{ preconnect: fetch.preconnect },
+		);
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const model = createCompletionsModel();
+
+		const initialResult = await streamOpenAICompletions(model, testContext, {
+			apiKey: "test-key",
+			fetch: fetchMock,
+			providerSessionState,
+			reasoning: "xhigh",
+		}).result();
+		expect(initialResult.stopReason).toBe("stop");
+		expect(bodies.map(body => body.reasoning_effort)).toEqual(["xhigh", "high", "low"]);
+
+		for (const reasoning of ["xhigh", "high", "low", "medium"] as const) {
+			const result = await streamOpenAICompletions(model, testContext, {
+				apiKey: "test-key",
+				fetch: fetchMock,
+				providerSessionState,
+				reasoning,
+			}).result();
+			expect(result.stopReason).toBe("stop");
+		}
+
+		expect(bodies.map(body => body.reasoning_effort)).toEqual([
+			"xhigh",
+			"high",
+			"low",
+			"low",
+			"low",
+			"low",
+			"medium",
+		]);
+	});
+
+	it("remembers the vLLM Qwen xhigh fallback without overriding later efforts", async () => {
+		const bodies: Record<string, unknown>[] = [];
+		const fetchMock: FetchImpl = Object.assign(
+			async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+				bodies.push(parseJsonBody(init));
+				return bodies.length === 1 ? invalidQwenTemplateEffortResponse() : createChatSseResponse();
+			},
+			{ preconnect: fetch.preconnect },
+		);
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const model = createLocalQwenModel("vllm", "http://127.0.0.1:8000/v1");
+
+		for (const reasoning of ["xhigh", "xhigh", "low", "medium"] as const) {
+			const result = await streamOpenAICompletions(model, testContext, {
+				apiKey: "test-key",
+				fetch: fetchMock,
+				providerSessionState,
+				reasoning,
+			}).result();
+			expect(result.stopReason).toBe("stop");
+		}
+
+		expect(bodies.map(body => body.reasoning_effort)).toEqual([
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+		]);
+		expect(
+			bodies.map(body => (body.chat_template_kwargs as { reasoning_effort?: string } | undefined)?.reasoning_effort),
+		).toEqual(["xhigh", "high", "high", "low", "medium"]);
+	});
+
+	it("keeps later low effort instead of letting remembered null restore Qwen's xhigh default", async () => {
+		const bodies: Record<string, unknown>[] = [];
+		const fetchMock: FetchImpl = Object.assign(
+			async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+				bodies.push(parseJsonBody(init));
+				return bodies.length === 1
+					? invalidQwenTemplateEffortWithoutAlternativesResponse()
+					: createChatSseResponse();
+			},
+			{ preconnect: fetch.preconnect },
+		);
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const model = createLocalQwenModel("vllm", "http://127.0.0.1:8000/v1");
+
+		for (const reasoning of ["xhigh", "xhigh", "low"] as const) {
+			const result = await streamOpenAICompletions(model, testContext, {
+				apiKey: "test-key",
+				fetch: fetchMock,
+				providerSessionState,
+				reasoning,
+			}).result();
+			expect(result.stopReason).toBe("stop");
+		}
+
+		expect(
+			bodies.map(body => (body.chat_template_kwargs as { reasoning_effort?: string } | undefined)?.reasoning_effort),
+		).toEqual(["xhigh", undefined, undefined, "low"]);
+	});
+
+	it("synchronizes both llama.cpp Qwen effort copies on fallback retry", async () => {
+		const bodies: Record<string, unknown>[] = [];
+		const fetchMock: FetchImpl = Object.assign(
+			async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+				bodies.push(parseJsonBody(init));
+				return bodies.length === 1 ? invalidQwenTemplateEffortResponse() : createChatSseResponse();
+			},
+			{ preconnect: fetch.preconnect },
+		);
+
+		const result = await streamOpenAICompletions(
+			createLocalQwenModel("llama.cpp", "http://127.0.0.1:8080/v1"),
+			testContext,
+			{ apiKey: "test-key", fetch: fetchMock, reasoning: "xhigh" },
+		).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(bodies.map(body => body.reasoning_effort)).toEqual(["xhigh", "high"]);
+		expect(bodies.map(body => body.chat_template_kwargs)).toEqual([
+			{ preserve_thinking: true, reasoning_effort: "xhigh" },
+			{ preserve_thinking: true, reasoning_effort: "high" },
+		]);
+		expect(bodies.map(body => body.enable_thinking)).toEqual([true, true]);
+		expect(bodies.map(body => body.preserve_thinking)).toEqual([true, true]);
+	});
+
 	it("retries Responses xhigh as provider max and stores the successful fallback params", async () => {
 		const bodies: Record<string, unknown>[] = [];
 		const fetchMock: FetchImpl = Object.assign(
@@ -283,6 +539,74 @@ describe("OpenAI reasoning effort fallback retry", () => {
 		};
 		const chain = [...state.chains.values()][0]!;
 		expect(chain.lastParams?.reasoning?.effort).toBe("max");
+	});
+
+	it("accumulates multi-step Responses fallbacks across request rebuilds and persists each rejected tier", async () => {
+		const bodies: Record<string, unknown>[] = [];
+		const fetchMock: FetchImpl = Object.assign(
+			async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+				const body = parseJsonBody(init);
+				bodies.push(body);
+				if (bodies.length === 1) return createResponsesSseResponse("resp_reasoning_baseline");
+				if (bodies.length === 2) {
+					return invalidReasoningResponse("reasoning.effort", "xhigh", ["high", "low"]);
+				}
+				if (bodies.length === 3) return invalidReasoningResponse("reasoning.effort", "high", ["low"]);
+				if (bodies.length === 4) return stalePreviousResponse();
+				return createResponsesSseResponse(`resp_reasoning_${bodies.length}`);
+			},
+			{ preconnect: fetch.preconnect },
+		);
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const model = createResponsesModel();
+		const statefulOptions = {
+			apiKey: "test-key",
+			fetch: fetchMock,
+			providerSessionState,
+			reasoning: "xhigh" as const,
+			statefulResponses: true,
+			sessionId: "reasoning-fallback-rebuild-session",
+		};
+
+		const baseline = await streamOpenAIResponses(model, testContext, statefulOptions).result();
+		expect(baseline.stopReason).toBe("stop");
+		const recovered = await streamOpenAIResponses(
+			model,
+			{
+				messages: [...testContext.messages, baseline, { role: "user", content: "continue", timestamp: 1 }],
+			},
+			statefulOptions,
+		).result();
+		expect(recovered.stopReason).toBe("stop");
+
+		for (const reasoning of ["xhigh", "high", "low", "medium"] as const) {
+			const result = await streamOpenAIResponses(model, testContext, {
+				apiKey: "test-key",
+				fetch: fetchMock,
+				providerSessionState,
+				reasoning,
+				statefulResponses: false,
+			}).result();
+			expect(result.stopReason).toBe("stop");
+		}
+
+		expect(bodies.map(body => (body.reasoning as { effort?: string } | undefined)?.effort)).toEqual([
+			"xhigh",
+			"xhigh",
+			"high",
+			"low",
+			"low",
+			"low",
+			"low",
+			"low",
+			"medium",
+		]);
+		expect(bodies.slice(1, 4).map(body => body.previous_response_id)).toEqual([
+			"resp_reasoning_baseline",
+			"resp_reasoning_baseline",
+			"resp_reasoning_baseline",
+		]);
+		expect(bodies[4]?.previous_response_id).toBeUndefined();
 	});
 
 	it("retries pipe-delimited reasoning.effort errors with the nearest supported tier", async () => {
@@ -397,5 +721,175 @@ describe("OpenAI reasoning effort fallback retry", () => {
 		expect(result.stopReason).toBe("error");
 		expect(result.errorStatus).toBe(400);
 		expect(attempts).toBe(1);
+	});
+
+	it("strips a rejected chat_template_kwargs.reasoning_effort, keeps the top-level twin, and remembers it", async () => {
+		const bodies: Record<string, unknown>[] = [];
+		const fetchMock: FetchImpl = Object.assign(
+			async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+				const body = parseJsonBody(init);
+				bodies.push(body);
+				return bodies.length === 1 ? templateKwargRejectionResponse() : createChatSseResponse();
+			},
+			{ preconnect: fetch.preconnect },
+		);
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const model = createLocalQwenModel("llama.cpp", "http://127.0.0.1:8080/v1");
+
+		const first = await streamOpenAICompletions(model, testContext, {
+			apiKey: "test-key",
+			fetch: fetchMock,
+			reasoning: "medium",
+			providerSessionState,
+		}).result();
+
+		expect(first.stopReason).toBe("stop");
+		expect(bodies).toHaveLength(2);
+		// The qwen dialect twin-emits; the rejected kwarg must vanish while the
+		// top-level field keeps the user's effort selection alive.
+		expect(bodies[0]!.reasoning_effort).toBe("medium");
+		expect(bodies[0]!.chat_template_kwargs).toEqual({ preserve_thinking: true, reasoning_effort: "medium" });
+		expect(bodies[1]!.reasoning_effort).toBe("medium");
+		expect(bodies[1]!.chat_template_kwargs).toEqual({ preserve_thinking: true });
+
+		// Remembered per session: the next request pre-strips without a 400.
+		const second = await streamOpenAICompletions(model, testContext, {
+			apiKey: "test-key",
+			fetch: fetchMock,
+			reasoning: "medium",
+			providerSessionState,
+		}).result();
+		expect(second.stopReason).toBe("stop");
+		expect(bodies).toHaveLength(3);
+		expect(bodies[2]!.reasoning_effort).toBe("medium");
+		expect(bodies[2]!.chat_template_kwargs).toEqual({ preserve_thinking: true });
+	});
+
+	it("does not let onPayload re-add a rejected template reasoning kwarg on retry", async () => {
+		const bodies: Record<string, unknown>[] = [];
+		const onPayloadEfforts: string[] = [];
+		const fetchMock: FetchImpl = Object.assign(
+			async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+				const body = parseJsonBody(init);
+				bodies.push(body);
+				const templateKwargs = body.chat_template_kwargs as { reasoning_effort?: unknown } | undefined;
+				return templateKwargs?.reasoning_effort === undefined
+					? createChatSseResponse()
+					: templateKwargRejectionResponse();
+			},
+			{ preconnect: fetch.preconnect },
+		);
+		const model = createLocalQwenModel("llama.cpp", "http://127.0.0.1:8080/v1");
+
+		const result = await streamOpenAICompletions(model, testContext, {
+			apiKey: "test-key",
+			fetch: fetchMock,
+			reasoning: "medium",
+			onPayload: payload => {
+				onPayloadEfforts.push("medium");
+				const request = payload as Record<string, unknown> & {
+					chat_template_kwargs?: Record<string, unknown>;
+				};
+				return {
+					...request,
+					chat_template_kwargs: {
+						...(request.chat_template_kwargs ?? {}),
+						reasoning_effort: "medium",
+					},
+				};
+			},
+		}).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(onPayloadEfforts).toEqual(["medium", "medium"]);
+		expect(
+			bodies.map(body => (body.chat_template_kwargs as { reasoning_effort?: string } | undefined)?.reasoning_effort),
+		).toEqual(["medium", undefined]);
+	});
+
+	it("trusts structured unknown_parameter evidence when the message also quotes the current effort", async () => {
+		const bodies: Record<string, unknown>[] = [];
+		const fetchMock: FetchImpl = Object.assign(
+			async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+				const body = parseJsonBody(init);
+				bodies.push(body);
+				return bodies.length === 1
+					? templateKwargRejectionResponse(
+							"Unknown parameter 'chat_template_kwargs.reasoning_effort'; received value 'medium'",
+						)
+					: createChatSseResponse();
+			},
+			{ preconnect: fetch.preconnect },
+		);
+		const model = createLocalQwenModel("llama.cpp", "http://127.0.0.1:8080/v1");
+
+		const result = await streamOpenAICompletions(model, testContext, {
+			apiKey: "test-key",
+			fetch: fetchMock,
+			reasoning: "medium",
+		}).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(bodies.map(body => body.reasoning_effort)).toEqual(["medium", "medium"]);
+		expect(
+			bodies.map(body => (body.chat_template_kwargs as { reasoning_effort?: string })?.reasoning_effort),
+		).toEqual(["medium", undefined]);
+	});
+
+	it("hoists the effort onto the top-level field when the kwargs-only dialect is rejected", async () => {
+		const bodies: Record<string, unknown>[] = [];
+		const fetchMock: FetchImpl = Object.assign(
+			async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+				const body = parseJsonBody(init);
+				bodies.push(body);
+				return bodies.length === 1 ? templateKwargRejectionResponse() : createChatSseResponse();
+			},
+			{ preconnect: fetch.preconnect },
+		);
+		const model = createLocalQwenModel("vllm", "http://127.0.0.1:8000/v1");
+
+		const result = await streamOpenAICompletions(model, testContext, {
+			apiKey: "test-key",
+			fetch: fetchMock,
+			reasoning: "medium",
+		}).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(bodies).toHaveLength(2);
+		// vLLM dialect rides kwargs alone — nothing top-level on the first try.
+		expect(bodies[0]!.reasoning_effort).toBeUndefined();
+		expect(bodies[0]!.chat_template_kwargs).toEqual({
+			preserve_thinking: true,
+			enable_thinking: true,
+			reasoning_effort: "medium",
+		});
+		expect(bodies[1]!.reasoning_effort).toBe("medium");
+		expect(bodies[1]!.chat_template_kwargs).toEqual({ preserve_thinking: true, enable_thinking: true });
+	});
+
+	it("remaps a rejected kwargs effort value in both spellings when the error lists allowed levels", async () => {
+		const bodies: Record<string, unknown>[] = [];
+		const fetchMock: FetchImpl = Object.assign(
+			async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+				const body = parseJsonBody(init);
+				bodies.push(body);
+				return bodies.length === 1 ? templateKwargValueRejectionResponse() : createChatSseResponse();
+			},
+			{ preconnect: fetch.preconnect },
+		);
+		const model = createLocalQwenModel("llama.cpp", "http://127.0.0.1:8080/v1");
+
+		const result = await streamOpenAICompletions(model, testContext, {
+			apiKey: "test-key",
+			fetch: fetchMock,
+			reasoning: "xhigh",
+		}).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(bodies).toHaveLength(2);
+		expect(bodies[0]!.reasoning_effort).toBe("xhigh");
+		expect(bodies[1]!.reasoning_effort).toBe("high");
+		// The kwargs twin must not keep the stale rejected value.
+		expect(bodies[1]!.chat_template_kwargs).toEqual({ preserve_thinking: true, reasoning_effort: "high" });
 	});
 });

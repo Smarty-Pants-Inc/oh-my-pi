@@ -36,12 +36,14 @@ import type {
 	Static,
 	TextContent,
 	TSchema,
+	UsageProvider,
 } from "@oh-my-pi/pi-ai";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@oh-my-pi/pi-ai/oauth/types";
 import type {
 	AutocompleteItem,
 	AutocompleteProvider,
 	Component,
+	ComposerStyle,
 	EditorTheme,
 	KeyId,
 	OverlayHandle,
@@ -49,7 +51,7 @@ import type {
 	TUI,
 } from "@oh-my-pi/pi-tui";
 import type { logger as PiLogger } from "@oh-my-pi/pi-utils";
-import type { KeybindingsManager } from "../../config/keybindings";
+import type { AppKeybinding, KeybindingsManager } from "../../config/keybindings";
 import type { ModelRegistry } from "../../config/model-registry";
 import type { ContextReleaseManifest } from "../../context/manifest";
 import type { EditToolDetails } from "../../edit";
@@ -376,6 +378,16 @@ export interface ExtensionUIContext {
 	setToolsExpanded(expanded: boolean): void;
 }
 
+/** Visual composer style and selector copy registered by an extension. */
+export interface ComposerShapeDefinition {
+	/** User-facing name shown in composer-shape selectors. */
+	label: string;
+	/** Optional detail shown under the selector label. */
+	description?: string;
+	/** Renderer contract; its id becomes the persisted `composer.shape` value. */
+	style: ComposerStyle;
+}
+
 // ============================================================================
 // Extension Context
 // ============================================================================
@@ -392,9 +404,9 @@ export interface CompactOptions {
 	onComplete?: (result: CompactionResult) => void;
 	onError?: (error: Error) => void;
 	/**
-	 * Force a one-off compaction mode for this invocation, overriding the
-	 * configured `compaction.strategy` / `remoteEnabled` (the `/compact`
-	 * subcommands: `soft` | `remote` | `snapcompact`). Omitted = configured behavior.
+	 * Force a one-off compaction mode for this invocation, replacing the
+	 * configured `compaction.methodOrder` (`/compact soft`, `remote`, or
+	 * `snapcompact`). Omitted = configured preference order.
 	 */
 	mode?: CompactMode;
 	/**
@@ -544,6 +556,21 @@ export interface ExtensionContext {
 		params: Record<string, unknown>,
 		options?: { signal?: AbortSignal; onUpdate?: AgentToolUpdateCallback<TDetails> },
 	): Promise<AgentToolResult<TDetails>>;
+
+	/**
+	 * Whether project-local inputs for the current working directory (extensions, settings,
+	 * skills, resources) are trusted. Upstream `@earendil-works/pi-coding-agent` (>=0.79) asks the
+	 * user once per directory before loading project-local inputs and exposes the saved decision
+	 * here; extensions written against that API (e.g. Plannotator) feature-detect this method to
+	 * decide whether project-local config is safe to load, and warn when it is absent.
+	 *
+	 * OMP has no equivalent per-directory trust gate: `.omp/extensions`, `.omp/config.yml`, and
+	 * other project-local inputs are already discovered and loaded unconditionally (see
+	 * `docs/extension-loading.md`). This method exists for compatibility with that upstream surface
+	 * and always returns `true`, truthfully reflecting that OMP already trusts project-local inputs
+	 * by default -- it does not narrow or widen OMP's own security model.
+	 */
+	isProjectTrusted(): boolean;
 }
 
 /**
@@ -1454,6 +1481,8 @@ export interface ExtensionAPI {
 	registerShortcut(
 		shortcut: KeyId,
 		options: {
+			/** Register only while this exact shortcut remains bound to the named app action. */
+			whenKeybinding?: AppKeybinding;
 			description?: string;
 			handler: (ctx: ExtensionContext) => Promise<void> | void;
 		},
@@ -1484,6 +1513,14 @@ export interface ExtensionAPI {
 
 	/** Register a renderer for assistant thinking blocks. Rendered after the original thinking text. */
 	registerAssistantThinkingRenderer(renderer: AssistantThinkingRenderer): void;
+
+	/**
+	 * Register a composer shape for the interactive editor.
+	 *
+	 * Registration happens during extension load. Built-in ids cannot be
+	 * replaced; when extensions reuse an id, the later extension wins.
+	 */
+	registerComposerShape(definition: ComposerShapeDefinition): void;
 
 	// =========================================================================
 	// Actions
@@ -1640,6 +1677,8 @@ export interface ProviderConfig {
 	authHeader?: boolean;
 	/** Models to register. If provided, replaces all existing models for this provider. */
 	models?: ProviderModelConfig[];
+	/** Optional normalized usage fetcher used by AuthStorage for this provider. */
+	usage?: UsageProvider;
 	/** OAuth provider for /login support. */
 	oauth?: {
 		/** Display name in login UI. */
@@ -1716,6 +1755,8 @@ export interface ExtensionFlag {
 export interface ExtensionShortcut {
 	shortcut: KeyId;
 	description?: string;
+	/** Register only while this exact shortcut remains bound to the named app action. */
+	whenKeybinding?: AppKeybinding;
 	handler: (ctx: ExtensionContext) => Promise<void> | void;
 	extensionPath: string;
 }
@@ -1834,6 +1875,7 @@ export interface Extension {
 	fileWriteFallbackHandlers: FileWriteFallbackHandler[];
 	fileDeleteFallbackHandlers: FileDeleteFallbackHandler[];
 	messageRenderers: Map<string, MessageRenderer>;
+	composerShapes: Map<string, ComposerShapeDefinition>;
 	commands: Map<string, RegisteredCommand>;
 	flags: Map<string, ExtensionFlag>;
 	shortcuts: Map<KeyId, ExtensionShortcut>;

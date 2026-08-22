@@ -89,6 +89,9 @@ function createStubInputControllerContext(opts: {
 	const updatePendingMessagesDisplay = vi.fn();
 	const requestRender = vi.fn();
 	const showError = vi.fn();
+	const renderOptimisticSkillMessage = vi.fn();
+	const reconcileOptimisticSkillMessage = vi.fn();
+	const clearOptimisticSkillMessage = vi.fn();
 	const queueCompactionMessage = vi.fn((_text: string, _mode: "steer" | "followUp", _images?: ImageContent[]) => {});
 	const ctx = {
 		editor,
@@ -117,6 +120,10 @@ function createStubInputControllerContext(opts: {
 		locallySubmittedUserSignatures: new Set<string>(),
 		withLocalSubmission: async (_text: string, fn: () => unknown) => fn(),
 		queueCompactionMessage,
+		optimisticSkillMessagePending: false,
+		renderOptimisticSkillMessage,
+		reconcileOptimisticSkillMessage,
+		clearOptimisticSkillMessage,
 	} as unknown as InteractiveModeContext;
 
 	return {
@@ -128,6 +135,10 @@ function createStubInputControllerContext(opts: {
 		updatePendingMessagesDisplay,
 		requestRender,
 		queueCompactionMessage,
+		showError,
+		renderOptimisticSkillMessage,
+		reconcileOptimisticSkillMessage,
+		clearOptimisticSkillMessage,
 	};
 }
 
@@ -270,6 +281,83 @@ describe("InputController skill queue chip metadata", () => {
 		expect(editor.pendingImages).toEqual([]);
 		expect(editor.pendingImageLinks).toEqual([]);
 		expect(editor.imageLinks).toBeUndefined();
+	});
+});
+
+describe("InputController optimistic skill row (#8895)", () => {
+	let tempDir: TempDir;
+	let skillCommands: Map<string, Skill>;
+
+	beforeEach(async () => {
+		tempDir = TempDir.createSync("@pi-skill-optimistic-stub-");
+		const skill = await writeSkillFile(tempDir.path(), "test-skill", "Do the thing.");
+		skillCommands = new Map<string, Skill>([["skill:test-skill", skill]]);
+	});
+
+	afterEach(() => {
+		tempDir.removeSync();
+		vi.restoreAllMocks();
+	});
+
+	it("paints the optimistic row before dispatching the idle skill turn", async () => {
+		const { ctx, editor, promptCustomMessage, renderOptimisticSkillMessage } = createStubInputControllerContext({
+			skillCommands,
+			isStreaming: false,
+		});
+		// A slow preflight (memory recall, before_agent_start hooks, auto-thinking)
+		// lives inside promptCustomMessage; the row must already be painted when the
+		// dispatch begins, so it stays visible while that preflight runs.
+		const order: string[] = [];
+		renderOptimisticSkillMessage.mockImplementation(() => order.push("render"));
+		promptCustomMessage.mockImplementation(async () => {
+			order.push("dispatch");
+		});
+
+		const controller = new InputController(ctx);
+		controller.setupEditorSubmitHandler();
+		editor.setText("/skill:test-skill go");
+		await editor.onSubmit?.("/skill:test-skill go");
+
+		expect(order).toEqual(["render", "dispatch"]);
+		expect(renderOptimisticSkillMessage.mock.calls[0]?.[0]).toMatchObject({
+			role: "custom",
+			customType: SKILL_PROMPT_MESSAGE_TYPE,
+			attribution: "user",
+			display: true,
+			details: { name: "test-skill" },
+		});
+	});
+
+	it("skips the optimistic row when the skill submission queues while streaming", async () => {
+		const { ctx, editor, promptCustomMessage, renderOptimisticSkillMessage } = createStubInputControllerContext({
+			skillCommands,
+			isStreaming: true,
+		});
+		const controller = new InputController(ctx);
+		controller.setupEditorSubmitHandler();
+		editor.setText("/skill:test-skill go");
+		await editor.onSubmit?.("/skill:test-skill go");
+
+		expect(renderOptimisticSkillMessage).not.toHaveBeenCalled();
+		expect(promptCustomMessage).toHaveBeenCalledTimes(1);
+	});
+
+	it("drops the optimistic row and restores the draft when dispatch throws", async () => {
+		const { ctx, editor, promptCustomMessage, renderOptimisticSkillMessage, clearOptimisticSkillMessage, showError } =
+			createStubInputControllerContext({ skillCommands, isStreaming: false });
+		promptCustomMessage.mockImplementation(async () => {
+			throw new Error("preflight failed");
+		});
+
+		const controller = new InputController(ctx);
+		controller.setupEditorSubmitHandler();
+		editor.setText("/skill:test-skill go");
+		await editor.onSubmit?.("/skill:test-skill go");
+
+		expect(renderOptimisticSkillMessage).toHaveBeenCalledTimes(1);
+		expect(clearOptimisticSkillMessage).toHaveBeenCalledTimes(1);
+		expect(showError).toHaveBeenCalledTimes(1);
+		expect(editor.getText()).toBe("/skill:test-skill go");
 	});
 });
 
@@ -666,6 +754,8 @@ function createStubInteractiveModeContextForUiHelpers(session: AgentSession) {
 	const requestComponentRender = vi.fn();
 	const updatePendingMessagesDisplay = vi.fn();
 	const inputListeners = new Set<(data: string) => { consume?: boolean; data?: string } | undefined>();
+	let focused: unknown = editor;
+	let overlayVisible = false;
 	const addInputListener = (listener: (data: string) => { consume?: boolean; data?: string } | undefined) => {
 		inputListeners.add(listener);
 		return () => inputListeners.delete(listener);
@@ -682,13 +772,19 @@ function createStubInteractiveModeContextForUiHelpers(session: AgentSession) {
 
 	const ctx = {
 		editor,
-		ui: { requestRender, requestComponentRender, addInputListener },
+		ui: {
+			requestRender,
+			requestComponentRender,
+			addInputListener,
+			getFocused: () => focused,
+			hasOverlay: () => overlayVisible,
+		},
 		pendingMessagesContainer,
 		session,
 		viewSession: session,
 		compactionQueuedMessages: [],
 		keybindings: {
-			getDisplayString: (_action: string) => "Alt+Up",
+			getKeys: (_action: string) => ["alt+up", "shift+up"],
 			matches: (_data: string, _action: string) => false,
 		},
 		updatePendingMessagesDisplay,
@@ -706,6 +802,12 @@ function createStubInteractiveModeContextForUiHelpers(session: AgentSession) {
 		inputListeners,
 		showStatus,
 		showWarning,
+		setFocused: (value: unknown) => {
+			focused = value;
+		},
+		setOverlayVisible: (value: boolean) => {
+			overlayVisible = value;
+		},
 	};
 }
 
@@ -784,6 +886,9 @@ describe("UiHelpers / InputController against derived queued custom display", ()
 		expect(rendered).toContain("2. run tests");
 		expect(rendered).toContain("3. summarize");
 		expect(rendered).not.toContain("Follow-up:");
+		expect(rendered).toContain("Shift+Up to edit timing");
+		expect(rendered).toContain("Up to restore");
+		expect(rendered).not.toContain("Alt+Up/Shift+Up to edit");
 	});
 
 	it("edits one queued prompt's timing in place and commits once", async () => {
@@ -878,7 +983,7 @@ describe("UiHelpers / InputController against derived queued custom display", ()
 		]);
 	});
 
-	it("consumes the first key after compaction makes the timing editor stale", async () => {
+	it("passes the first key through after compaction makes the timing editor stale", async () => {
 		fixture = await createRealSession();
 		const { session } = fixture;
 		session.agent.followUp({
@@ -895,7 +1000,7 @@ describe("UiHelpers / InputController against derived queued custom display", ()
 		await Promise.resolve();
 
 		Object.defineProperty(session, "isCompacting", { configurable: true, get: () => true });
-		expect(dispatchInput("\r")).toEqual({ consume: true });
+		expect(dispatchInput("\r")).toBeUndefined();
 		Reflect.deleteProperty(session, "isCompacting");
 
 		expect(inputListeners.size).toBe(0);
@@ -903,6 +1008,49 @@ describe("UiHelpers / InputController against derived queued custom display", ()
 		expect(session.getQueuedPrompts()).toEqual([
 			{ id: expect.any(String), text: "queued prompt", delivery: "afterCurrent" },
 		]);
+	});
+
+	it("passes the first key through when another surface takes focus", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		session.agent.followUp({
+			role: "user",
+			content: "queued prompt",
+			attribution: "user",
+			timestamp: Date.now(),
+		});
+
+		const { ctx, dispatchInput, inputListeners, setFocused } = createStubInteractiveModeContextForUiHelpers(session);
+		const uiHelpers = new UiHelpers(ctx);
+		uiHelpers.editQueuedPrompts();
+		await Promise.resolve();
+
+		setFocused(new Container());
+		expect(dispatchInput("\r")).toBeUndefined();
+		expect(inputListeners.size).toBe(0);
+		expect(session.getQueuedPrompts()[0]?.delivery).toBe("afterCurrent");
+	});
+
+	it("passes the first key through when an overlay covers the editor", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		session.agent.followUp({
+			role: "user",
+			content: "queued prompt",
+			attribution: "user",
+			timestamp: Date.now(),
+		});
+
+		const { ctx, dispatchInput, inputListeners, setOverlayVisible } =
+			createStubInteractiveModeContextForUiHelpers(session);
+		const uiHelpers = new UiHelpers(ctx);
+		uiHelpers.editQueuedPrompts();
+		await Promise.resolve();
+
+		setOverlayVisible(true);
+		expect(dispatchInput("\x1b[D")).toBeUndefined();
+		expect(inputListeners.size).toBe(0);
+		expect(session.getQueuedPrompts()[0]?.delivery).toBe("afterCurrent");
 	});
 
 	it("exits when the selected prompt leaves the queue without touching another prompt or the editor draft", async () => {
@@ -943,7 +1091,7 @@ describe("UiHelpers / InputController against derived queued custom display", ()
 		const { session } = fixture;
 		queueUserSteer(session, "queued prompt");
 
-		const { ctx, editor, inputListeners } = createStubInteractiveModeContextForUiHelpers(session);
+		const { ctx, dispatchInput, editor, inputListeners } = createStubInteractiveModeContextForUiHelpers(session);
 		editor.setText("unfinished draft");
 		const uiHelpers = new UiHelpers(ctx);
 		uiHelpers.editQueuedPrompts();
@@ -953,7 +1101,7 @@ describe("UiHelpers / InputController against derived queued custom display", ()
 			configurable: true,
 			value: { isCompacting: false, getQueuedMessages: () => ({ steering: [], followUp: [] }) },
 		});
-		uiHelpers.updatePendingMessagesDisplay();
+		expect(dispatchInput("\r")).toBeUndefined();
 
 		expect(inputListeners.size).toBe(0);
 		expect(editor.getText()).toBe("unfinished draft");
@@ -974,10 +1122,11 @@ describe("UiHelpers / InputController against derived queued custom display", ()
 	});
 });
 
-function createEventControllerFixture() {
+function createEventControllerFixture(opts?: { optimisticSkillMessagePending?: boolean }) {
 	const updatePendingMessagesDisplay = vi.fn();
 	const addMessageToChat = vi.fn();
 	const requestRender = vi.fn();
+	const reconcileOptimisticSkillMessage = vi.fn();
 	const ctx = {
 		isInitialized: true,
 		init: vi.fn(async () => {}),
@@ -989,13 +1138,15 @@ function createEventControllerFixture() {
 		transcriptMessageComponents: new WeakMap(),
 		pendingTools: new Map(),
 		session: {},
+		optimisticSkillMessagePending: opts?.optimisticSkillMessagePending ?? false,
+		reconcileOptimisticSkillMessage,
 		get viewSession() {
 			return (this as typeof ctx).session;
 		},
 	} as unknown as InteractiveModeContext;
 
 	const controller = new EventController(ctx);
-	return { controller, updatePendingMessagesDisplay, addMessageToChat };
+	return { controller, updatePendingMessagesDisplay, addMessageToChat, reconcileOptimisticSkillMessage };
 }
 
 describe("EventController custom queued-message refresh", () => {
@@ -1041,5 +1192,50 @@ describe("EventController custom queued-message refresh", () => {
 
 		expect(updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
 		expect(addMessageToChat).toHaveBeenCalledTimes(2);
+	});
+
+	it("reconciles the optimistic skill row instead of duplicating it on the canonical message_start", async () => {
+		const { controller, addMessageToChat, reconcileOptimisticSkillMessage } = createEventControllerFixture({
+			optimisticSkillMessagePending: true,
+		});
+		const event: Extract<AgentSessionEvent, { type: "message_start" }> = {
+			type: "message_start",
+			message: {
+				role: "custom",
+				customType: SKILL_PROMPT_MESSAGE_TYPE,
+				content: "skill body",
+				display: true,
+				attribution: "user",
+				details: { name: "test-skill", path: "/s.md", lineCount: 1 } satisfies SkillPromptDetails,
+				timestamp: Date.now(),
+			},
+		};
+		await controller.handleEvent(event);
+
+		expect(reconcileOptimisticSkillMessage).toHaveBeenCalledTimes(1);
+		expect(reconcileOptimisticSkillMessage.mock.calls[0]?.[0]).toBe(event.message);
+		expect(addMessageToChat).not.toHaveBeenCalled();
+	});
+
+	it("renders normally when no optimistic skill row is pending", async () => {
+		const { controller, addMessageToChat, reconcileOptimisticSkillMessage } = createEventControllerFixture({
+			optimisticSkillMessagePending: false,
+		});
+		const event: Extract<AgentSessionEvent, { type: "message_start" }> = {
+			type: "message_start",
+			message: {
+				role: "custom",
+				customType: SKILL_PROMPT_MESSAGE_TYPE,
+				content: "skill body",
+				display: true,
+				attribution: "user",
+				details: { name: "test-skill", path: "/s.md", lineCount: 1 } satisfies SkillPromptDetails,
+				timestamp: Date.now(),
+			},
+		};
+		await controller.handleEvent(event);
+
+		expect(reconcileOptimisticSkillMessage).not.toHaveBeenCalled();
+		expect(addMessageToChat).toHaveBeenCalledTimes(1);
 	});
 });

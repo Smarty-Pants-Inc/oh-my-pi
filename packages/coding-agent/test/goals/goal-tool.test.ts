@@ -52,6 +52,9 @@ function createRuntimeHarness(initialState?: GoalModeState) {
 	return {
 		runtime,
 		getState: () => cloneState(state),
+		setState: (next: GoalModeState | undefined) => {
+			state = cloneState(next);
+		},
 	};
 }
 
@@ -210,7 +213,7 @@ describe("GoalTool", () => {
 		expect(harness.getState()).toBeUndefined();
 	});
 
-	it("flips state to exiting and clears enabled when op=complete succeeds (fix #1)", async () => {
+	it("returns completion details while hiding the retained headless exit sentinel from op=get", async () => {
 		const harness = createRuntimeHarness();
 		await harness.runtime.createGoal({ objective: "Ship the release", tokenBudget: 100 });
 		const tool = new GoalTool(
@@ -220,18 +223,17 @@ describe("GoalTool", () => {
 			}),
 		);
 
-		const result = await tool.execute("call-complete", {
+		const completed = await tool.execute("call-complete", {
 			op: "complete",
 			objective: undefined,
 			token_budget: undefined,
 		});
 
-		expect(result.details).toMatchObject({ op: "complete" });
-		const after = harness.getState();
-		expect(after?.enabled).toBe(false);
-		expect(after?.mode).toBe("exiting");
-		expect(after?.reason).toBe("completed");
-		expect(after?.goal.status).toBe("complete");
+		expect(completed.details?.goal?.status).toBe("complete");
+		expect(harness.getState()).toMatchObject({ mode: "exiting", goal: { status: "complete" } });
+		const current = await tool.execute("call-get", { op: "get", objective: undefined, token_budget: undefined });
+		expect(current.details?.goal).toBeNull();
+		expect(current.content).toEqual([{ type: "text", text: "No active goal." }]);
 	});
 
 	it("rejects complete for a paused goal", async () => {
@@ -257,7 +259,7 @@ describe("GoalTool", () => {
 		expect(harness.getState()?.goal.status).toBe("paused");
 	});
 
-	it("allows create after previous goal is complete", async () => {
+	it("rejects create until terminal cleanup clears the previous completed goal", async () => {
 		const harness = createRuntimeHarness({
 			enabled: false,
 			mode: "exiting",
@@ -271,7 +273,16 @@ describe("GoalTool", () => {
 			}),
 		);
 
-		const result = await tool.execute("call-create", {
+		await expect(
+			tool.execute("call-create-before-cleanup", {
+				op: "create",
+				objective: "Next goal",
+				token_budget: undefined,
+			}),
+		).rejects.toThrow("terminal cleanup is still in progress");
+		harness.setState(undefined);
+
+		const result = await tool.execute("call-create-after-cleanup", {
 			op: "create",
 			objective: "Next goal",
 			token_budget: undefined,

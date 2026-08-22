@@ -1,12 +1,18 @@
 /// <reference path="./legacy-pi-virtual-modules.d.ts" />
 
+import { Database } from "bun:sqlite";
 import * as fs from "node:fs";
 import { createRequire, isBuiltin } from "node:module";
 import * as path from "node:path";
 import * as url from "node:url";
 import type { ParseResult, ParserPlugin } from "@babel/parser";
 import { parse as parseBabel } from "@babel/parser";
-import { isCompiledBinary, stripWindowsExtendedLengthPathPrefix } from "@oh-my-pi/pi-utils";
+import {
+	getLegacyPiExtensionCacheDbPath,
+	isCompiledBinary,
+	logger,
+	stripWindowsExtendedLengthPathPrefix,
+} from "@oh-my-pi/pi-utils";
 import { registerPluginCacheInvalidator } from "../../discovery/helpers";
 
 const IS_COMPILED_BINARY = isCompiledBinary();
@@ -86,6 +92,13 @@ const REQUIRE_BINDING = 1 << 0;
 const OBJECT_BINDING = 1 << 1;
 const EXPORTS_BINDING = 1 << 2;
 const MODULE_BINDING = 1 << 3;
+const EVAL_BINDING = 1 << 4;
+const FUNCTION_BINDING = 1 << 5;
+const PROCESS_BINDING = 1 << 6;
+const WORKER_BINDING = 1 << 7;
+const GLOBAL_BINDING = 1 << 8;
+const GLOBAL_THIS_BINDING = 1 << 9;
+const REFLECT_BINDING = 1 << 10;
 
 interface StructuralAstNode {
 	readonly type: string;
@@ -95,12 +108,15 @@ interface StructuralAstNode {
 interface BindingScope {
 	readonly parent: BindingScope | null;
 	readonly ownsVarBindings: boolean;
+	readonly bindingIdentities: Map<string, StructuralAstNode>;
 	bindings: number;
 }
 
 interface ScopedAstNode {
 	readonly node: StructuralAstNode;
 	readonly scope: BindingScope;
+	readonly parent: StructuralAstNode | null;
+	readonly parentKey: string | null;
 	readonly order: number;
 }
 
@@ -142,8 +158,62 @@ function trackedBinding(name: unknown): number {
 			return EXPORTS_BINDING;
 		case "module":
 			return MODULE_BINDING;
+		case "eval":
+			return EVAL_BINDING;
+		case "Function":
+			return FUNCTION_BINDING;
+		case "process":
+			return PROCESS_BINDING;
+		case "Worker":
+			return WORKER_BINDING;
+		case "global":
+			return GLOBAL_BINDING;
+		case "globalThis":
+			return GLOBAL_THIS_BINDING;
+		case "Reflect":
+			return REFLECT_BINDING;
 		default:
 			return 0;
+	}
+}
+
+function isTypeOnlyImportBinding(declaration: StructuralAstNode, specifier?: StructuralAstNode | null): boolean {
+	const declarationKind = declaration.importKind ?? declaration.exportKind;
+	const specifierKind = specifier?.importKind ?? specifier?.exportKind;
+	return (
+		declarationKind === "type" ||
+		declarationKind === "typeof" ||
+		specifierKind === "type" ||
+		specifierKind === "typeof"
+	);
+}
+
+function isEntirelyTypeOnlyModuleDeclaration(declaration: StructuralAstNode): boolean {
+	if (isTypeOnlyImportBinding(declaration)) return true;
+	const specifiers = nodeArray(declaration, "specifiers");
+	return (
+		specifiers !== null &&
+		specifiers.length > 0 &&
+		specifiers.every(value => {
+			const specifier = asAstNode(value);
+			return specifier !== null && isTypeOnlyImportBinding(declaration, specifier);
+		})
+	);
+}
+
+function isErasedTypeScriptNode(node: StructuralAstNode): boolean {
+	if (node.declare === true) return true;
+	switch (node.type) {
+		case "TSDeclareFunction":
+		case "TSDeclareMethod":
+		case "TSInterfaceDeclaration":
+		case "TSTypeAliasDeclaration":
+		case "TSTypeReference":
+		case "TSTypeQuery":
+		case "TSExpressionWithTypeArguments":
+			return true;
+		default:
+			return false;
 	}
 }
 
@@ -155,6 +225,9 @@ function addPatternBindings(scope: BindingScope, pattern: unknown): void {
 		switch (node.type) {
 			case "Identifier":
 				scope.bindings |= trackedBinding(node.name);
+				if (typeof node.name === "string" && !scope.bindingIdentities.has(node.name)) {
+					scope.bindingIdentities.set(node.name, node);
+				}
 				break;
 			case "AssignmentPattern":
 				stack.push(node.left);
@@ -250,7 +323,7 @@ function registerOuterDeclaration(node: StructuralAstNode, scope: BindingScope |
 	}
 }
 
-function registerScopeBindings(node: StructuralAstNode, scope: BindingScope): void {
+function registerScopeBindings(node: StructuralAstNode, scope: BindingScope, runtimeBindingsOnly = false): void {
 	if (isFunctionScopeNode(node)) {
 		addPatternBindings(scope, node.id);
 		const parameters = nodeArray(node, "params");
@@ -266,12 +339,14 @@ function registerScopeBindings(node: StructuralAstNode, scope: BindingScope): vo
 		if (specifiers) {
 			for (const value of specifiers) {
 				const specifier = asAstNode(value);
-				if (specifier) addPatternBindings(scope, specifier.local);
+				if (specifier && (!runtimeBindingsOnly || !isTypeOnlyImportBinding(node, specifier))) {
+					addPatternBindings(scope, specifier.local);
+				}
 			}
 		}
 	} else if (node.type === "TSImportEqualsDeclaration") {
-		addPatternBindings(scope, node.id);
-	} else if (node.type === "VariableDeclaration") {
+		if (!runtimeBindingsOnly || !isTypeOnlyImportBinding(node)) addPatternBindings(scope, node.id);
+	} else if (node.type === "VariableDeclaration" && (!runtimeBindingsOnly || node.declare !== true)) {
 		const target = node.kind === "var" ? nearestVarScope(scope) : scope;
 		const declarations = nodeArray(node, "declarations");
 		if (declarations) {
@@ -327,7 +402,11 @@ function scopeForChild(
  * Scope frames are fully populated before selected nodes are returned, so
  * hoisted and TDZ bindings behave independently of textual declaration order.
  */
-function collectScopedAstNodes(root: unknown, select: (node: StructuralAstNode) => boolean): ScopedAstNode[] {
+function collectScopedAstNodes(
+	root: unknown,
+	select: (node: StructuralAstNode) => boolean,
+	runtimeBindingsOnly = false,
+): ScopedAstNode[] {
 	const rootNode = asAstNode(root);
 	if (!rootNode) return [];
 
@@ -339,6 +418,7 @@ function collectScopedAstNodes(root: unknown, select: (node: StructuralAstNode) 
 		const item = stack.pop();
 		if (!item || seen.has(item.node)) continue;
 		seen.add(item.node);
+		if (runtimeBindingsOnly && isErasedTypeScriptNode(item.node)) continue;
 
 		registerOuterDeclaration(item.node, item.scope);
 		const kind = scopeKind(item.node, item.parent, item.parentKey);
@@ -348,11 +428,20 @@ function collectScopedAstNodes(root: unknown, select: (node: StructuralAstNode) 
 				: {
 						parent: item.scope,
 						ownsVarBindings: kind === 2,
+						bindingIdentities: new Map(),
 						bindings: 0,
 					};
 		if (activeScope) {
-			registerScopeBindings(item.node, activeScope);
-			if (select(item.node)) selected.push({ node: item.node, scope: activeScope, order });
+			registerScopeBindings(item.node, activeScope, runtimeBindingsOnly);
+			if (select(item.node)) {
+				selected.push({
+					node: item.node,
+					scope: activeScope,
+					parent: item.parent,
+					parentKey: item.parentKey,
+					order,
+				});
+			}
 		}
 		order++;
 
@@ -389,6 +478,38 @@ function scopeHasBinding(scope: BindingScope, binding: number): boolean {
 	return false;
 }
 
+function lexicalBindingIdentity(scope: BindingScope, node: StructuralAstNode | null): StructuralAstNode | null {
+	if (node?.type !== "Identifier" || typeof node.name !== "string") return null;
+	let current: BindingScope | null = scope;
+	while (current) {
+		const identity = current.bindingIdentities.get(node.name);
+		if (identity) return identity;
+		current = current.parent;
+	}
+	return null;
+}
+
+function hasLexicalBinding(
+	bindings: ReadonlySet<StructuralAstNode>,
+	scope: BindingScope,
+	node: StructuralAstNode | null,
+): boolean {
+	const identity = lexicalBindingIdentity(scope, node);
+	return identity !== null && bindings.has(identity);
+}
+
+function addLexicalBinding(
+	bindings: Set<StructuralAstNode>,
+	scope: BindingScope,
+	node: StructuralAstNode | null,
+): boolean {
+	const identity = lexicalBindingIdentity(scope, node);
+	if (!identity) return false;
+	const size = bindings.size;
+	bindings.add(identity);
+	return bindings.size !== size;
+}
+
 function isSpecifierReferenceNode(node: StructuralAstNode): boolean {
 	switch (node.type) {
 		case "ImportDeclaration":
@@ -397,6 +518,7 @@ function isSpecifierReferenceNode(node: StructuralAstNode): boolean {
 		case "ImportExpression":
 		case "TSImportEqualsDeclaration":
 		case "CallExpression":
+		case "OptionalCallExpression":
 			return true;
 		default:
 			return false;
@@ -417,10 +539,42 @@ function isUnshadowedExportsTarget(node: StructuralAstNode | null, scope: Bindin
 
 function isGlobalRequireCall(node: StructuralAstNode | null, scope: BindingScope): boolean {
 	return (
-		node?.type === "CallExpression" &&
+		(node?.type === "CallExpression" || node?.type === "OptionalCallExpression") &&
 		isIdentifier(asAstNode(node.callee), "require") &&
 		!scopeHasBinding(scope, REQUIRE_BINDING)
 	);
+}
+
+function isNodeModuleRequireCall(node: StructuralAstNode | null, scope: BindingScope): boolean {
+	if (!isGlobalRequireCall(node, scope)) return false;
+	const specifier = nodeArgument(node, 0);
+	return specifier?.type === "StringLiteral" && (specifier.value === "node:module" || specifier.value === "module");
+}
+
+function isNodeProcessRequireCall(node: StructuralAstNode | null, scope: BindingScope): boolean {
+	if (!isGlobalRequireCall(node, scope)) return false;
+	const specifier = nodeArgument(node, 0);
+	return specifier?.type === "StringLiteral" && (specifier.value === "node:process" || specifier.value === "process");
+}
+
+function isProcessDlopenCall(
+	node: StructuralAstNode | null,
+	scope: BindingScope,
+	processDlopenBindings: ReadonlySet<StructuralAstNode>,
+	isProcessObject: (node: StructuralAstNode | null) => boolean,
+): boolean {
+	if (node?.type !== "CallExpression" && node?.type !== "OptionalCallExpression") return false;
+	const callee = asAstNode(node.callee);
+	if (callee?.type === "Identifier") {
+		return hasLexicalBinding(processDlopenBindings, scope, callee);
+	}
+	if (
+		(callee?.type !== "MemberExpression" && callee?.type !== "OptionalMemberExpression") ||
+		staticMemberPropertyName(callee) !== "dlopen"
+	) {
+		return false;
+	}
+	return isProcessObject(asAstNode(callee.object));
 }
 
 /**
@@ -429,17 +583,38 @@ function isGlobalRequireCall(node: StructuralAstNode | null, scope: BindingScope
  */
 function isCreateRequireInvocation(
 	node: StructuralAstNode | null,
-	createRequireBindings: ReadonlySet<string>,
-	moduleNamespaceBindings: ReadonlySet<string>,
+	createRequireBindings: ReadonlySet<StructuralAstNode>,
+	moduleNamespaceBindings: ReadonlySet<StructuralAstNode>,
+	scope: BindingScope,
 ): boolean {
 	if (node?.type !== "CallExpression") return false;
 	const callee = asAstNode(node.callee);
-	if (callee?.type === "Identifier" && typeof callee.name === "string") {
-		return createRequireBindings.has(callee.name);
+	if (callee?.type === "Identifier") {
+		return hasLexicalBinding(createRequireBindings, scope, callee);
 	}
 	if (callee?.type !== "MemberExpression" || staticMemberPropertyName(callee) !== "createRequire") return false;
 	const object = asAstNode(callee.object);
-	return object?.type === "Identifier" && typeof object.name === "string" && moduleNamespaceBindings.has(object.name);
+	return hasLexicalBinding(moduleNamespaceBindings, scope, object) || isNodeModuleRequireCall(object, scope);
+}
+
+function isNodeProcessLoaderCall(
+	node: StructuralAstNode | null,
+	scope: BindingScope,
+	localRequireBindings: ReadonlySet<StructuralAstNode>,
+	createRequireBindings: ReadonlySet<StructuralAstNode>,
+	moduleNamespaceBindings: ReadonlySet<StructuralAstNode>,
+): boolean {
+	if (isNodeProcessRequireCall(node, scope)) return true;
+	if (node?.type !== "CallExpression") return false;
+	const specifier = nodeArgument(node, 0);
+	if (specifier?.type !== "StringLiteral" || (specifier.value !== "node:process" && specifier.value !== "process")) {
+		return false;
+	}
+	const callee = asAstNode(node.callee);
+	return (
+		hasLexicalBinding(localRequireBindings, scope, callee) ||
+		isCreateRequireInvocation(callee, createRequireBindings, moduleNamespaceBindings, scope)
+	);
 }
 
 function staticMemberPropertyName(node: StructuralAstNode): string | null {
@@ -454,87 +629,1389 @@ function staticMemberPropertyName(node: StructuralAstNode): string | null {
 }
 
 function staticObjectPropertyName(node: StructuralAstNode): string | null {
-	if (node.computed === true) return null;
 	const key = asAstNode(node.key);
-	if (key?.type === "Identifier" && typeof key.name === "string") return key.name;
+	if (node.computed !== true && key?.type === "Identifier" && typeof key.name === "string") return key.name;
 	return key?.type === "StringLiteral" && typeof key.value === "string" ? key.value : null;
+}
+
+interface ExtensionGraphProof {
+	provable: boolean;
+	readonly fileTargets: Set<string>;
+}
+
+function isImportMetaUrl(node: StructuralAstNode | null): boolean {
+	if (node?.type !== "MemberExpression" || staticMemberPropertyName(node) !== "url") return false;
+	const object = asAstNode(node.object);
+	return (
+		object?.type === "MetaProperty" &&
+		isIdentifier(asAstNode(object.meta), "import") &&
+		isIdentifier(asAstNode(object.property), "meta")
+	);
+}
+
+function isGraphResolvableSpecifier(specifier: string): boolean {
+	return (
+		specifier.startsWith(".") ||
+		specifier.startsWith("#") ||
+		specifier.startsWith("node:") ||
+		specifier.startsWith("bun:") ||
+		isBuiltin(specifier) ||
+		isBareExtensionDependencySpecifier(specifier)
+	);
 }
 
 function collectExtensionSpecifierReferences(
 	source: string,
 	importerPath: string,
 	ast: ParseResult = parseExtensionSource(source, importerPath),
+	graphProof?: ExtensionGraphProof,
 ): ExtensionSpecifierReference[] {
 	const references: ExtensionSpecifierReference[] = [];
-	const record = (kind: ExtensionSpecifierReference["kind"], literal: unknown): void => {
+	const record = (kind: ExtensionSpecifierReference["kind"], literal: unknown): boolean => {
 		const node = asAstNode(literal);
 		if (
-			node?.type === "StringLiteral" &&
-			typeof node.value === "string" &&
-			typeof node.start === "number" &&
-			typeof node.end === "number"
+			node?.type !== "StringLiteral" ||
+			typeof node.value !== "string" ||
+			typeof node.start !== "number" ||
+			typeof node.end !== "number"
 		) {
-			references.push({ kind, specifier: node.value, start: node.start, end: node.end });
+			return false;
 		}
+		if (
+			graphProof &&
+			(node.value === "node:worker_threads" ||
+				node.value === "worker_threads" ||
+				node.value === "node:vm" ||
+				node.value === "vm" ||
+				node.value === "node:child_process" ||
+				node.value === "child_process")
+		) {
+			graphProof.provable = false;
+		}
+		references.push({ kind, specifier: node.value, start: node.start, end: node.end });
+		return true;
 	};
-	const createRequireBindings = new Set<string>();
-	const moduleNamespaceBindings = new Set<string>();
-	for (const { node } of collectScopedAstNodes(ast, candidate => candidate.type === "ImportDeclaration")) {
+	const createRequireBindings = new Set<StructuralAstNode>();
+	const moduleNamespaceBindings = new Set<StructuralAstNode>();
+	const commonJsModuleNamespaceBindings = new Set<StructuralAstNode>();
+	const processNamespaceBindings = new Set<StructuralAstNode>();
+	const processDlopenBindings = new Set<StructuralAstNode>();
+	const globalObjectBindings = new Set<StructuralAstNode>();
+	const propertyDescriptorGetterBindings = new Set<StructuralAstNode>();
+	const constructorValueBindings = new Set<StructuralAstNode>();
+	const constructorDescriptorBindings = new Set<StructuralAstNode>();
+	const createRequireBindingNodes = new WeakSet<object>();
+	const moduleNamespaceBindingNodes = new WeakSet<object>();
+	const processNamespaceBindingNodes = new WeakSet<object>();
+	const processDlopenBindingNodes = new WeakSet<object>();
+	const globalObjectBindingNodes = new WeakSet<object>();
+	const globalObjectUseNodes = new WeakSet<object>();
+	const processObjectUseNodes = new WeakSet<object>();
+	const propertyDescriptorGetterBindingNodes = new WeakSet<object>();
+	const propertyDescriptorGetterUseNodes = new WeakSet<object>();
+	const constructorDescriptorBindingNodes = new WeakSet<object>();
+	const constructorDescriptorUseNodes = new WeakSet<object>();
+	const constructorValueBindingNodes = new WeakSet<object>();
+	const constructorValueUseNodes = new WeakSet<object>();
+	const runtimeBindingsOnly = graphProof !== undefined;
+	const nonRuntimeBindingNodes = new WeakSet<object>();
+	for (const { node, scope } of collectScopedAstNodes(
+		ast,
+		candidate => candidate.type === "ImportDeclaration",
+		runtimeBindingsOnly,
+	)) {
 		const source = asAstNode(node.source);
-		if (source?.type !== "StringLiteral" || (source.value !== "node:module" && source.value !== "module")) continue;
+		const isNodeModuleSource =
+			source?.type === "StringLiteral" && (source.value === "node:module" || source.value === "module");
+		const isNodeProcessSource =
+			source?.type === "StringLiteral" && (source.value === "node:process" || source.value === "process");
 		for (const value of Array.isArray(node.specifiers) ? node.specifiers : []) {
 			const specifier = asAstNode(value);
 			const local = asAstNode(specifier?.local);
 			if (local?.type !== "Identifier" || typeof local.name !== "string") continue;
-			if (specifier?.type === "ImportNamespaceSpecifier") {
-				moduleNamespaceBindings.add(local.name);
-			} else if (specifier?.type === "ImportSpecifier") {
-				const imported = asAstNode(specifier.imported);
+			if (specifier && isTypeOnlyImportBinding(node, specifier)) {
+				nonRuntimeBindingNodes.add(local);
+				continue;
+			}
+			const imported = asAstNode(specifier?.imported);
+			const importedName =
+				imported?.type === "Identifier" || imported?.type === "StringLiteral"
+					? (imported.name ?? imported.value)
+					: undefined;
+			if (isNodeProcessSource) {
 				if (
-					(imported?.type === "Identifier" && imported.name === "createRequire") ||
-					(imported?.type === "StringLiteral" && imported.value === "createRequire")
+					specifier?.type === "ImportNamespaceSpecifier" ||
+					specifier?.type === "ImportDefaultSpecifier" ||
+					importedName === "default"
 				) {
-					createRequireBindings.add(local.name);
+					addLexicalBinding(processNamespaceBindings, scope, local);
+					processNamespaceBindingNodes.add(local);
+				} else if (specifier?.type === "ImportSpecifier" && importedName === "dlopen") {
+					addLexicalBinding(processDlopenBindings, scope, local);
+					processDlopenBindingNodes.add(local);
 				}
+				continue;
+			}
+			if (!isNodeModuleSource) continue;
+			if (
+				specifier?.type === "ImportNamespaceSpecifier" ||
+				specifier?.type === "ImportDefaultSpecifier" ||
+				importedName === "default" ||
+				(specifier?.type === "ImportSpecifier" && importedName === "Module")
+			) {
+				addLexicalBinding(moduleNamespaceBindings, scope, local);
+				moduleNamespaceBindingNodes.add(local);
+			} else if (specifier?.type === "ImportSpecifier" && importedName === "createRequire") {
+				addLexicalBinding(createRequireBindings, scope, local);
+				createRequireBindingNodes.add(local);
+			} else if (specifier?.type === "ImportSpecifier" && importedName === "_load") {
+				if (graphProof) graphProof.provable = false;
 			}
 		}
 	}
-	for (const { node, scope } of collectScopedAstNodes(ast, isSpecifierReferenceNode)) {
+	for (const { node, scope } of collectScopedAstNodes(
+		ast,
+		candidate => candidate.type === "TSImportEqualsDeclaration",
+		runtimeBindingsOnly,
+	)) {
+		const binding = asAstNode(node.id);
+		if (binding?.type !== "Identifier" || typeof binding.name !== "string") continue;
+		if (isTypeOnlyImportBinding(node)) {
+			nonRuntimeBindingNodes.add(binding);
+			continue;
+		}
+		const moduleReference = asAstNode(node.moduleReference);
+		const expression =
+			moduleReference?.type === "TSExternalModuleReference" ? asAstNode(moduleReference.expression) : null;
+		if (expression?.type !== "StringLiteral") continue;
+		if (expression.value === "node:process" || expression.value === "process") {
+			addLexicalBinding(processNamespaceBindings, scope, binding);
+			processNamespaceBindingNodes.add(binding);
+			continue;
+		}
+		if (expression.value !== "node:module" && expression.value !== "module") continue;
+		addLexicalBinding(moduleNamespaceBindings, scope, binding);
+		addLexicalBinding(commonJsModuleNamespaceBindings, scope, binding);
+		moduleNamespaceBindingNodes.add(binding);
+	}
+
+	const variableDeclarations = collectScopedAstNodes(
+		ast,
+		candidate => candidate.type === "VariableDeclarator",
+		runtimeBindingsOnly,
+	);
+	const exportedVariableDeclarations = new WeakSet<object>();
+	for (const { node } of collectScopedAstNodes(
+		ast,
+		candidate => candidate.type === "ExportNamedDeclaration",
+		runtimeBindingsOnly,
+	)) {
+		const declaration = asAstNode(node.declaration);
+		if (declaration?.type === "VariableDeclaration") exportedVariableDeclarations.add(declaration);
+	}
+	for (const { node, scope, parent } of variableDeclarations) {
+		const binding = asAstNode(node.id);
+		if (parent?.type === "VariableDeclaration" && parent.declare === true && binding?.type === "Identifier") {
+			nonRuntimeBindingNodes.add(binding);
+		}
+		const initializer = asAstNode(node.init);
+		if (isNodeProcessRequireCall(initializer, scope)) {
+			if (binding?.type === "Identifier" && typeof binding.name === "string") {
+				addLexicalBinding(processNamespaceBindings, scope, binding);
+				processNamespaceBindingNodes.add(binding);
+				continue;
+			}
+			if (binding?.type !== "ObjectPattern") {
+				if (graphProof) graphProof.provable = false;
+				continue;
+			}
+			for (const value of Array.isArray(binding.properties) ? binding.properties : []) {
+				const property = asAstNode(value);
+				if (!property || property.type === "RestElement" || property.computed === true) {
+					if (graphProof) graphProof.provable = false;
+					continue;
+				}
+				const propertyName = staticObjectPropertyName(property);
+				if (propertyName !== "default" && propertyName !== "dlopen") {
+					if (graphProof) graphProof.provable = false;
+					continue;
+				}
+				const propertyValue = asAstNode(property.value);
+				const propertyKey = asAstNode(property.key);
+				const local = propertyValue?.type === "AssignmentPattern" ? asAstNode(propertyValue.left) : propertyValue;
+				if (local?.type !== "Identifier" || typeof local.name !== "string") {
+					if (graphProof) graphProof.provable = false;
+					continue;
+				}
+				if (propertyName === "dlopen") {
+					if (propertyKey) processDlopenBindingNodes.add(propertyKey);
+					addLexicalBinding(processDlopenBindings, scope, local);
+					processDlopenBindingNodes.add(local);
+				} else {
+					if (propertyKey) processNamespaceBindingNodes.add(propertyKey);
+					addLexicalBinding(processNamespaceBindings, scope, local);
+					processNamespaceBindingNodes.add(local);
+				}
+			}
+			continue;
+		}
+		if (isNodeModuleRequireCall(initializer, scope)) {
+			if (binding?.type === "Identifier" && typeof binding.name === "string") {
+				addLexicalBinding(moduleNamespaceBindings, scope, binding);
+				addLexicalBinding(commonJsModuleNamespaceBindings, scope, binding);
+				moduleNamespaceBindingNodes.add(binding);
+				continue;
+			}
+			if (binding?.type !== "ObjectPattern") {
+				if (graphProof) graphProof.provable = false;
+				continue;
+			}
+			for (const value of Array.isArray(binding.properties) ? binding.properties : []) {
+				const property = asAstNode(value);
+				if (!property || property.type === "RestElement" || property.computed === true) {
+					if (graphProof) graphProof.provable = false;
+					continue;
+				}
+				const propertyName = staticObjectPropertyName(property);
+				if (propertyName === "_load") {
+					if (graphProof) graphProof.provable = false;
+					continue;
+				}
+				if (propertyName !== "createRequire" && propertyName !== "Module") {
+					if (graphProof) graphProof.provable = false;
+					continue;
+				}
+				const propertyValue = asAstNode(property.value);
+				const propertyKey = asAstNode(property.key);
+				const local = propertyValue?.type === "AssignmentPattern" ? asAstNode(propertyValue.left) : propertyValue;
+				if (local?.type !== "Identifier" || typeof local.name !== "string") {
+					if (graphProof) graphProof.provable = false;
+					continue;
+				}
+				if (propertyName === "createRequire") {
+					if (propertyKey) createRequireBindingNodes.add(propertyKey);
+					addLexicalBinding(createRequireBindings, scope, local);
+					createRequireBindingNodes.add(local);
+				} else {
+					if (propertyKey) moduleNamespaceBindingNodes.add(propertyKey);
+					addLexicalBinding(moduleNamespaceBindings, scope, local);
+					addLexicalBinding(commonJsModuleNamespaceBindings, scope, local);
+					moduleNamespaceBindingNodes.add(local);
+				}
+			}
+			continue;
+		}
+		if (initializer?.type === "MemberExpression" && isNodeProcessRequireCall(asAstNode(initializer.object), scope)) {
+			const memberName = staticMemberPropertyName(initializer);
+			if (memberName === null) {
+				if (graphProof) graphProof.provable = false;
+				continue;
+			}
+			if (memberName !== "default" && memberName !== "dlopen") {
+				if (graphProof) graphProof.provable = false;
+				continue;
+			}
+			if (binding?.type !== "Identifier" || typeof binding.name !== "string") {
+				if (graphProof) graphProof.provable = false;
+				continue;
+			}
+			if (memberName === "dlopen") {
+				addLexicalBinding(processDlopenBindings, scope, binding);
+				processDlopenBindingNodes.add(binding);
+			} else {
+				addLexicalBinding(processNamespaceBindings, scope, binding);
+				processNamespaceBindingNodes.add(binding);
+			}
+			continue;
+		}
+		if (initializer?.type !== "MemberExpression" || !isNodeModuleRequireCall(asAstNode(initializer.object), scope)) {
+			continue;
+		}
+		const memberName = staticMemberPropertyName(initializer);
+		if (memberName !== "createRequire" && memberName !== "Module") {
+			if (graphProof) graphProof.provable = false;
+			continue;
+		}
+		if (binding?.type !== "Identifier" || typeof binding.name !== "string") {
+			if (graphProof) graphProof.provable = false;
+			continue;
+		}
+		if (memberName === "createRequire") {
+			addLexicalBinding(createRequireBindings, scope, binding);
+			createRequireBindingNodes.add(binding);
+		} else {
+			addLexicalBinding(moduleNamespaceBindings, scope, binding);
+			addLexicalBinding(commonJsModuleNamespaceBindings, scope, binding);
+			moduleNamespaceBindingNodes.add(binding);
+		}
+	}
+
+	const localRequireBindings = new Set<StructuralAstNode>();
+	const unprovableRequireBindings = new Set<StructuralAstNode>();
+	const requireBindingNodes = new WeakSet<object>();
+	for (const { node, scope } of variableDeclarations) {
+		const initializer = asAstNode(node.init);
+		if (!isCreateRequireInvocation(initializer, createRequireBindings, moduleNamespaceBindings, scope)) continue;
+		const binding = asAstNode(node.id);
+		if (binding?.type !== "Identifier" || typeof binding.name !== "string") {
+			if (graphProof) graphProof.provable = false;
+			continue;
+		}
+		requireBindingNodes.add(binding);
+		if (isImportMetaUrl(nodeArgument(initializer, 0))) {
+			addLexicalBinding(localRequireBindings, scope, binding);
+		} else {
+			addLexicalBinding(unprovableRequireBindings, scope, binding);
+			if (graphProof) graphProof.provable = false;
+		}
+	}
+
+	function isKnownGlobalObject(node: StructuralAstNode | null, scope: BindingScope): boolean {
+		if (node?.type === "Identifier") {
+			if (node.name === "global" && !scopeHasBinding(scope, GLOBAL_BINDING)) return true;
+			if (node.name === "globalThis" && !scopeHasBinding(scope, GLOBAL_THIS_BINDING)) return true;
+			return hasLexicalBinding(globalObjectBindings, scope, node);
+		}
+		if (node?.type !== "MemberExpression" && node?.type !== "OptionalMemberExpression") return false;
+		const memberName = staticMemberPropertyName(node);
+		return (
+			(memberName === "global" || memberName === "globalThis") && isKnownGlobalObject(asAstNode(node.object), scope)
+		);
+	}
+
+	let globalBindingsChanged = true;
+	while (globalBindingsChanged) {
+		globalBindingsChanged = false;
+		for (const { node, scope, parent } of variableDeclarations) {
+			const initializer = asAstNode(node.init);
+			if (!initializer || !isKnownGlobalObject(initializer, scope)) continue;
+			const binding = asAstNode(node.id);
+			if (binding?.type !== "Identifier" || typeof binding.name !== "string") {
+				if (graphProof) graphProof.provable = false;
+				continue;
+			}
+			globalObjectUseNodes.add(initializer);
+			if (addLexicalBinding(globalObjectBindings, scope, binding)) globalBindingsChanged = true;
+			globalObjectBindingNodes.add(binding);
+			if (parent && exportedVariableDeclarations.has(parent) && graphProof) graphProof.provable = false;
+		}
+	}
+
+	function isKnownReflectObject(node: StructuralAstNode | null, scope: BindingScope): boolean {
+		if (isIdentifier(node, "Reflect")) return !scopeHasBinding(scope, REFLECT_BINDING);
+		return (
+			(node?.type === "MemberExpression" || node?.type === "OptionalMemberExpression") &&
+			staticMemberPropertyName(node) === "Reflect" &&
+			isKnownGlobalObject(asAstNode(node.object), scope)
+		);
+	}
+
+	function isReflectGetCall(node: StructuralAstNode | null, scope: BindingScope): boolean {
+		if (node?.type !== "CallExpression" && node?.type !== "OptionalCallExpression") return false;
+		const callee = asAstNode(node.callee);
+		return (
+			(callee?.type === "MemberExpression" || callee?.type === "OptionalMemberExpression") &&
+			staticMemberPropertyName(callee) === "get" &&
+			isKnownReflectObject(asAstNode(callee.object), scope)
+		);
+	}
+
+	const isKnownProcessLoaderCall = (node: StructuralAstNode | null, scope: BindingScope): boolean =>
+		isNodeProcessLoaderCall(node, scope, localRequireBindings, createRequireBindings, moduleNamespaceBindings);
+	function isKnownProcessObject(node: StructuralAstNode | null, scope: BindingScope): boolean {
+		if (isIdentifier(node, "process") && !scopeHasBinding(scope, PROCESS_BINDING)) return true;
+		if (hasLexicalBinding(processNamespaceBindings, scope, node)) return true;
+		if (isKnownProcessLoaderCall(node, scope)) return true;
+		if (node?.type === "MemberExpression" || node?.type === "OptionalMemberExpression") {
+			const memberName = staticMemberPropertyName(node);
+			const object = asAstNode(node.object);
+			if (memberName === "process" && isKnownGlobalObject(object, scope)) return true;
+			return memberName === "default" && isKnownProcessObject(object, scope);
+		}
+		if (node?.type !== "CallExpression" && node?.type !== "OptionalCallExpression") return false;
+		const callee = asAstNode(node.callee);
+		if (callee?.type !== "MemberExpression" && callee?.type !== "OptionalMemberExpression") return false;
+		return staticMemberPropertyName(callee) === "valueOf" && isKnownProcessObject(asAstNode(callee.object), scope);
+	}
+	function isKnownModuleLoaderObject(node: StructuralAstNode | null, scope: BindingScope): boolean {
+		if (hasLexicalBinding(moduleNamespaceBindings, scope, node)) return true;
+		if (isNodeModuleRequireCall(node, scope)) return true;
+		if (node?.type === "CallExpression" || node?.type === "OptionalCallExpression") {
+			const callee = asAstNode(node.callee);
+			if (callee?.type !== "MemberExpression" && callee?.type !== "OptionalMemberExpression") return false;
+			return (
+				staticMemberPropertyName(callee) === "valueOf" && isKnownModuleLoaderObject(asAstNode(callee.object), scope)
+			);
+		}
+		if (node?.type !== "MemberExpression" && node?.type !== "OptionalMemberExpression") return false;
+		const memberName = staticMemberPropertyName(node);
+		const object = asAstNode(node.object);
+		return (
+			(memberName === "mainModule" && isKnownProcessObject(object, scope)) ||
+			((memberName === "Module" || memberName === "default") && isKnownModuleLoaderObject(object, scope))
+		);
+	}
+	let loaderBindingsChanged = true;
+	while (loaderBindingsChanged) {
+		loaderBindingsChanged = false;
+		for (const { node, scope } of variableDeclarations) {
+			const initializer = asAstNode(node.init);
+			if (!isKnownModuleLoaderObject(initializer, scope)) continue;
+			const binding = asAstNode(node.id);
+			if (binding?.type === "ObjectPattern" && isNodeModuleRequireCall(initializer, scope)) continue;
+			if (binding?.type !== "Identifier" || typeof binding.name !== "string") {
+				if (graphProof) graphProof.provable = false;
+				continue;
+			}
+			if (addLexicalBinding(moduleNamespaceBindings, scope, binding)) loaderBindingsChanged = true;
+			moduleNamespaceBindingNodes.add(binding);
+		}
+
+		for (const { node, scope, parent } of variableDeclarations) {
+			const initializer = asAstNode(node.init);
+			const binding = asAstNode(node.id);
+			if (initializer && isKnownProcessObject(initializer, scope)) {
+				if (binding?.type === "Identifier" && typeof binding.name === "string") {
+					if (addLexicalBinding(processNamespaceBindings, scope, binding)) loaderBindingsChanged = true;
+					processNamespaceBindingNodes.add(binding);
+					processObjectUseNodes.add(initializer);
+					if (parent && exportedVariableDeclarations.has(parent) && graphProof) graphProof.provable = false;
+					continue;
+				}
+				if (binding?.type !== "ObjectPattern") {
+					if (graphProof) graphProof.provable = false;
+					continue;
+				}
+				for (const value of Array.isArray(binding.properties) ? binding.properties : []) {
+					const property = asAstNode(value);
+					if (!property || property.type === "RestElement" || property.computed === true) {
+						if (graphProof) graphProof.provable = false;
+						continue;
+					}
+					const propertyName = staticObjectPropertyName(property);
+					if (propertyName !== "default" && propertyName !== "dlopen") {
+						if (graphProof) graphProof.provable = false;
+						continue;
+					}
+					const propertyValue = asAstNode(property.value);
+					const propertyKey = asAstNode(property.key);
+					const local =
+						propertyValue?.type === "AssignmentPattern" ? asAstNode(propertyValue.left) : propertyValue;
+					if (local?.type !== "Identifier" || typeof local.name !== "string") {
+						if (graphProof) graphProof.provable = false;
+						continue;
+					}
+					if (propertyName === "dlopen") {
+						if (propertyKey) processDlopenBindingNodes.add(propertyKey);
+						if (addLexicalBinding(processDlopenBindings, scope, local)) loaderBindingsChanged = true;
+						processDlopenBindingNodes.add(local);
+					} else {
+						if (propertyKey) processNamespaceBindingNodes.add(propertyKey);
+						if (addLexicalBinding(processNamespaceBindings, scope, local)) loaderBindingsChanged = true;
+						processNamespaceBindingNodes.add(local);
+					}
+				}
+				processObjectUseNodes.add(initializer);
+				if (parent && exportedVariableDeclarations.has(parent) && graphProof) graphProof.provable = false;
+				continue;
+			}
+			if (initializer?.type !== "MemberExpression" && initializer?.type !== "OptionalMemberExpression") {
+				continue;
+			}
+			if (
+				staticMemberPropertyName(initializer) !== "dlopen" ||
+				!isKnownProcessObject(asAstNode(initializer.object), scope)
+			) {
+				continue;
+			}
+			if (binding?.type !== "Identifier" || typeof binding.name !== "string") {
+				if (graphProof) graphProof.provable = false;
+				continue;
+			}
+			if (addLexicalBinding(processDlopenBindings, scope, binding)) loaderBindingsChanged = true;
+			processDlopenBindingNodes.add(binding);
+		}
+	}
+
+	function transparentConstructorValue(node: StructuralAstNode): StructuralAstNode | null {
+		switch (node.type) {
+			case "ParenthesizedExpression":
+			case "TypeCastExpression":
+			case "TSAsExpression":
+			case "TSInstantiationExpression":
+			case "TSNonNullExpression":
+			case "TSSatisfiesExpression":
+			case "TSTypeAssertion":
+				return asAstNode(node.expression);
+			case "ChainExpression":
+				return asAstNode(node.expression);
+			default:
+				return null;
+		}
+	}
+
+	function isKnownObjectConstructor(node: StructuralAstNode | null, scope: BindingScope): boolean {
+		if (isIdentifier(node, "Object")) return !scopeHasBinding(scope, OBJECT_BINDING);
+		return (
+			(node?.type === "MemberExpression" || node?.type === "OptionalMemberExpression") &&
+			staticMemberPropertyName(node) === "Object" &&
+			isKnownGlobalObject(asAstNode(node.object), scope)
+		);
+	}
+
+	function isPropertyDescriptorGetter(node: StructuralAstNode | null, scope: BindingScope): boolean {
+		if (!node) return false;
+		if (hasLexicalBinding(propertyDescriptorGetterBindings, scope, node)) return true;
+		if (node.type === "MemberExpression" || node.type === "OptionalMemberExpression") {
+			return (
+				staticMemberPropertyName(node) === "getOwnPropertyDescriptor" &&
+				isKnownObjectConstructor(asAstNode(node.object), scope)
+			);
+		}
+		if (node.type === "SequenceExpression") {
+			const expressions = nodeArray(node, "expressions");
+			return expressions ? isPropertyDescriptorGetter(asAstNode(expressions.at(-1)), scope) : false;
+		}
+		return isPropertyDescriptorGetter(transparentConstructorValue(node), scope);
+	}
+
+	let propertyDescriptorGetterBindingsChanged = true;
+	while (propertyDescriptorGetterBindingsChanged) {
+		propertyDescriptorGetterBindingsChanged = false;
+		for (const { node, scope, parent } of variableDeclarations) {
+			const initializer = asAstNode(node.init);
+			const binding = asAstNode(node.id);
+			if (initializer && binding?.type === "ObjectPattern" && isKnownObjectConstructor(initializer, scope)) {
+				for (const value of Array.isArray(binding.properties) ? binding.properties : []) {
+					const property = asAstNode(value);
+					if (!property || staticObjectPropertyName(property) !== "getOwnPropertyDescriptor") continue;
+					const propertyValue = asAstNode(property.value);
+					const propertyKey = asAstNode(property.key);
+					const local =
+						propertyValue?.type === "AssignmentPattern" ? asAstNode(propertyValue.left) : propertyValue;
+					if (local?.type !== "Identifier" || typeof local.name !== "string") {
+						if (graphProof) graphProof.provable = false;
+						continue;
+					}
+					if (propertyKey) propertyDescriptorGetterBindingNodes.add(propertyKey);
+					if (addLexicalBinding(propertyDescriptorGetterBindings, scope, local)) {
+						propertyDescriptorGetterBindingsChanged = true;
+					}
+					propertyDescriptorGetterBindingNodes.add(local);
+					if (parent && exportedVariableDeclarations.has(parent) && graphProof) graphProof.provable = false;
+				}
+				continue;
+			}
+			if (!initializer || !isPropertyDescriptorGetter(initializer, scope)) continue;
+			if (binding?.type !== "Identifier" || typeof binding.name !== "string") {
+				if (graphProof) graphProof.provable = false;
+				continue;
+			}
+			propertyDescriptorGetterUseNodes.add(initializer);
+			if (addLexicalBinding(propertyDescriptorGetterBindings, scope, binding)) {
+				propertyDescriptorGetterBindingsChanged = true;
+			}
+			propertyDescriptorGetterBindingNodes.add(binding);
+			if (parent && exportedVariableDeclarations.has(parent) && graphProof) graphProof.provable = false;
+		}
+	}
+
+	function isPropertyDescriptorCall(node: StructuralAstNode | null, scope: BindingScope): boolean {
+		if (node?.type !== "CallExpression" && node?.type !== "OptionalCallExpression") return false;
+		return isPropertyDescriptorGetter(asAstNode(node.callee), scope);
+	}
+
+	if (graphProof) {
+		for (const { node, scope, parent, parentKey } of collectScopedAstNodes(
+			ast,
+			candidate =>
+				candidate.type === "Identifier" ||
+				candidate.type === "MemberExpression" ||
+				candidate.type === "OptionalMemberExpression" ||
+				candidate.type === "SequenceExpression" ||
+				transparentConstructorValue(candidate) !== null,
+			runtimeBindingsOnly,
+		)) {
+			if (!isPropertyDescriptorGetter(node, scope)) continue;
+			if (propertyDescriptorGetterBindingNodes.has(node) || propertyDescriptorGetterUseNodes.has(node)) continue;
+			if (parent && transparentConstructorValue(parent) === node) continue;
+			if (parent?.type === "SequenceExpression") continue;
+			if (
+				(parent?.type === "CallExpression" || parent?.type === "OptionalCallExpression") &&
+				parentKey === "callee" &&
+				isPropertyDescriptorCall(parent, scope)
+			) {
+				continue;
+			}
+			const nonReferenceProperty =
+				(parent?.type === "MemberExpression" && parentKey === "property" && parent.computed !== true) ||
+				(parentKey === "key" && parent?.computed !== true && parent?.shorthand !== true);
+			if (nonReferenceProperty || parent?.type === "BinaryExpression" || parent?.type === "UnaryExpression")
+				continue;
+			if (parent?.type === "ExpressionStatement") continue;
+			graphProof.provable = false;
+		}
+	}
+
+	function maySelectConstructorProperty(property: StructuralAstNode | null): boolean {
+		if (property?.type === "StringLiteral") return property.value === "constructor";
+		switch (property?.type) {
+			case "NumericLiteral":
+			case "BigIntLiteral":
+			case "BooleanLiteral":
+			case "NullLiteral":
+			case "DecimalLiteral":
+			case "RegExpLiteral":
+				return false;
+			default:
+				return true;
+		}
+	}
+
+	function isConstructorDescriptorCall(node: StructuralAstNode | null, scope: BindingScope): boolean {
+		return isPropertyDescriptorCall(node, scope) && maySelectConstructorProperty(nodeArgument(node, 1));
+	}
+
+	function isPotentialConstructorDescriptor(node: StructuralAstNode | null, scope: BindingScope): boolean {
+		if (!node) return false;
+		if (hasLexicalBinding(constructorDescriptorBindings, scope, node)) return true;
+		if (isConstructorDescriptorCall(node, scope)) return true;
+		if (node.type === "SequenceExpression") {
+			const expressions = nodeArray(node, "expressions");
+			return expressions ? isPotentialConstructorDescriptor(asAstNode(expressions.at(-1)), scope) : false;
+		}
+		return isPotentialConstructorDescriptor(transparentConstructorValue(node), scope);
+	}
+
+	function isPotentialConstructorValue(node: StructuralAstNode | null, scope: BindingScope): boolean {
+		if (!node) return false;
+		if (hasLexicalBinding(constructorValueBindings, scope, node)) return true;
+		if (node.type === "MemberExpression" || node.type === "OptionalMemberExpression") {
+			const memberName = staticMemberPropertyName(node);
+			const object = asAstNode(node.object);
+			if (memberName === "value" && isPotentialConstructorDescriptor(object, scope)) return true;
+			if (
+				memberName === "constructor" ||
+				(node.computed === true && maySelectConstructorProperty(asAstNode(node.property)))
+			) {
+				return true;
+			}
+			return (
+				(memberName === "call" || memberName === "apply" || memberName === "bind") &&
+				isPotentialConstructorValue(object, scope)
+			);
+		}
+		if (isReflectGetCall(node, scope)) return maySelectConstructorProperty(nodeArgument(node, 1));
+		if (node.type === "SequenceExpression") {
+			const expressions = nodeArray(node, "expressions");
+			return expressions ? isPotentialConstructorValue(asAstNode(expressions.at(-1)), scope) : false;
+		}
+		return isPotentialConstructorValue(transparentConstructorValue(node), scope);
+	}
+
+	let constructorDescriptorBindingsChanged = true;
+	while (constructorDescriptorBindingsChanged) {
+		constructorDescriptorBindingsChanged = false;
+		for (const { node, scope, parent } of variableDeclarations) {
+			const initializer = asAstNode(node.init);
+			if (!initializer || !isPotentialConstructorDescriptor(initializer, scope)) continue;
+			const binding = asAstNode(node.id);
+			if (binding?.type !== "Identifier" || typeof binding.name !== "string") {
+				if (graphProof) graphProof.provable = false;
+				continue;
+			}
+			constructorDescriptorUseNodes.add(initializer);
+			if (addLexicalBinding(constructorDescriptorBindings, scope, binding)) {
+				constructorDescriptorBindingsChanged = true;
+			}
+			constructorDescriptorBindingNodes.add(binding);
+			if (parent && exportedVariableDeclarations.has(parent) && graphProof) graphProof.provable = false;
+		}
+	}
+
+	if (graphProof) {
+		for (const { node, scope, parent, parentKey } of collectScopedAstNodes(
+			ast,
+			candidate =>
+				candidate.type === "Identifier" ||
+				candidate.type === "CallExpression" ||
+				candidate.type === "OptionalCallExpression" ||
+				candidate.type === "SequenceExpression" ||
+				transparentConstructorValue(candidate) !== null,
+			runtimeBindingsOnly,
+		)) {
+			if (!isPotentialConstructorDescriptor(node, scope)) continue;
+			if (constructorDescriptorBindingNodes.has(node) || constructorDescriptorUseNodes.has(node)) continue;
+			if (parent && transparentConstructorValue(parent) === node) continue;
+			if (parent?.type === "SequenceExpression") continue;
+			if (
+				(parent?.type === "MemberExpression" || parent?.type === "OptionalMemberExpression") &&
+				parentKey === "object"
+			) {
+				continue;
+			}
+			if (parent?.type === "BinaryExpression" || parent?.type === "UnaryExpression") continue;
+			if (parent?.type === "ExpressionStatement") continue;
+			graphProof.provable = false;
+		}
+	}
+
+	for (const { node, scope, parent } of variableDeclarations) {
+		const binding = asAstNode(node.id);
+		if (binding?.type !== "ObjectPattern") continue;
+		for (const value of Array.isArray(binding.properties) ? binding.properties : []) {
+			const property = asAstNode(value);
+			if (!property || property.type === "RestElement") continue;
+			const constructorProperty =
+				property.computed === true
+					? maySelectConstructorProperty(asAstNode(property.key))
+					: staticObjectPropertyName(property) === "constructor";
+			if (!constructorProperty) continue;
+			const propertyValue = asAstNode(property.value);
+			const local = propertyValue?.type === "AssignmentPattern" ? asAstNode(propertyValue.left) : propertyValue;
+			if (local?.type !== "Identifier" || typeof local.name !== "string") {
+				if (graphProof) graphProof.provable = false;
+				continue;
+			}
+			addLexicalBinding(constructorValueBindings, scope, local);
+			constructorValueBindingNodes.add(local);
+			if (parent && exportedVariableDeclarations.has(parent) && graphProof) graphProof.provable = false;
+		}
+	}
+	let constructorBindingsChanged = true;
+	while (constructorBindingsChanged) {
+		constructorBindingsChanged = false;
+		for (const { node, scope, parent } of variableDeclarations) {
+			const initializer = asAstNode(node.init);
+			if (!initializer || !isPotentialConstructorValue(initializer, scope)) continue;
+			const binding = asAstNode(node.id);
+			if (binding?.type !== "Identifier" || typeof binding.name !== "string") {
+				if (graphProof) graphProof.provable = false;
+				continue;
+			}
+			constructorValueUseNodes.add(initializer);
+			if (addLexicalBinding(constructorValueBindings, scope, binding)) constructorBindingsChanged = true;
+			constructorValueBindingNodes.add(binding);
+			if (parent && exportedVariableDeclarations.has(parent) && graphProof) graphProof.provable = false;
+		}
+	}
+
+	if (graphProof) {
+		for (const { node, scope, parent, parentKey } of collectScopedAstNodes(
+			ast,
+			candidate =>
+				candidate.type === "Identifier" ||
+				candidate.type === "MemberExpression" ||
+				candidate.type === "OptionalMemberExpression" ||
+				candidate.type === "CallExpression" ||
+				candidate.type === "OptionalCallExpression" ||
+				candidate.type === "SequenceExpression" ||
+				transparentConstructorValue(candidate) !== null,
+			runtimeBindingsOnly,
+		)) {
+			if (!isPotentialConstructorValue(node, scope)) continue;
+			const nonReferenceProperty =
+				(parent?.type === "MemberExpression" && parentKey === "property" && parent.computed !== true) ||
+				(parentKey === "key" && parent?.computed !== true && parent?.shorthand !== true);
+			if (nonReferenceProperty || constructorValueBindingNodes.has(node) || constructorValueUseNodes.has(node)) {
+				continue;
+			}
+			if (parent && transparentConstructorValue(parent) === node) continue;
+			if (parent?.type === "SequenceExpression") continue;
+			if (
+				(parent?.type === "MemberExpression" || parent?.type === "OptionalMemberExpression") &&
+				parentKey === "object"
+			) {
+				continue;
+			}
+			if (parent?.type === "BinaryExpression" || parent?.type === "UnaryExpression") continue;
+			if (parent?.type === "ExpressionStatement") continue;
+			graphProof.provable = false;
+		}
+	}
+	const isKnownProcessDlopenCall = (node: StructuralAstNode | null, scope: BindingScope): boolean =>
+		isProcessDlopenCall(node, scope, processDlopenBindings, object => isKnownProcessObject(object, scope));
+	for (const { node, scope, parent, parentKey } of collectScopedAstNodes(
+		ast,
+		isSpecifierReferenceNode,
+		runtimeBindingsOnly,
+	)) {
+		if (
+			node.type === "CallExpression" &&
+			isCreateRequireInvocation(node, createRequireBindings, moduleNamespaceBindings, scope)
+		) {
+			const isBoundFactory = parent?.type === "VariableDeclarator" && parent.init === node;
+			const isImmediatelyInvoked = parent?.type === "CallExpression" && parentKey === "callee";
+			if (!isBoundFactory && !isImmediatelyInvoked && graphProof) graphProof.provable = false;
+		}
+		if (node.type === "CallExpression" || node.type === "OptionalCallExpression") {
+			if (graphProof && isKnownProcessLoaderCall(node, scope)) {
+				const supportedUse =
+					(parent?.type === "VariableDeclarator" && parent.init === node) ||
+					(parent?.type === "MemberExpression" && parentKey === "object") ||
+					parent?.type === "ExpressionStatement";
+				if (!supportedUse) graphProof.provable = false;
+			}
+			if (graphProof && isKnownProcessDlopenCall(node, scope)) {
+				const target = nodeArgument(node, 1);
+				if (
+					node.type === "CallExpression" &&
+					target?.type === "StringLiteral" &&
+					typeof target.value === "string" &&
+					path.isAbsolute(target.value)
+				) {
+					graphProof.fileTargets.add(target.value);
+				} else {
+					graphProof.provable = false;
+				}
+			}
+			const callee = asAstNode(node.callee);
+			const memberName =
+				callee?.type === "MemberExpression" || callee?.type === "OptionalMemberExpression"
+					? staticMemberPropertyName(callee)
+					: null;
+			const memberObject =
+				callee?.type === "MemberExpression" || callee?.type === "OptionalMemberExpression"
+					? asAstNode(callee.object)
+					: null;
+			const moduleRequireObject = isIdentifier(memberObject, "module") && !scopeHasBinding(scope, MODULE_BINDING);
+			const globalRequireObject = isKnownGlobalObject(memberObject, scope);
+			const requireMainObject =
+				memberObject?.type === "MemberExpression" &&
+				staticMemberPropertyName(memberObject) === "main" &&
+				isIdentifier(asAstNode(memberObject.object), "require") &&
+				!scopeHasBinding(scope, REQUIRE_BINDING);
+			const moduleLoaderObject = isKnownModuleLoaderObject(memberObject, scope);
+			if (
+				graphProof &&
+				((memberName === "require" &&
+					(moduleRequireObject || globalRequireObject || requireMainObject || moduleLoaderObject)) ||
+					(memberName === "_load" && moduleLoaderObject))
+			) {
+				graphProof.provable = false;
+			}
+		}
+
 		if (
 			node.type === "ImportDeclaration" ||
 			node.type === "ExportNamedDeclaration" ||
 			node.type === "ExportAllDeclaration"
 		) {
-			record("import", node.source);
+			const typeOnlyReference = graphProof && isEntirelyTypeOnlyModuleDeclaration(node);
+			if (!typeOnlyReference) record("import", node.source);
+			const importSource = asAstNode(node.source);
+			if (
+				graphProof &&
+				!typeOnlyReference &&
+				node.type !== "ImportDeclaration" &&
+				importSource?.type === "StringLiteral" &&
+				(importSource.value === "node:module" ||
+					importSource.value === "module" ||
+					importSource.value === "node:process" ||
+					importSource.value === "process")
+			) {
+				graphProof.provable = false;
+			}
 		} else if (node.type === "ImportExpression") {
-			record("import", node.source);
+			const importSource = asAstNode(node.source);
+			if (
+				graphProof &&
+				(!record("import", node.source) ||
+					(importSource?.type === "StringLiteral" &&
+						(importSource.value === "node:module" ||
+							importSource.value === "module" ||
+							importSource.value === "node:process" ||
+							importSource.value === "process")))
+			) {
+				graphProof.provable = false;
+			} else if (!graphProof) {
+				record("import", node.source);
+			}
 		} else if (node.type === "TSImportEqualsDeclaration") {
 			const moduleReference = asAstNode(node.moduleReference);
-			if (moduleReference?.type === "TSExternalModuleReference") {
-				record("require", moduleReference.expression);
+			if (moduleReference?.type === "TSExternalModuleReference" && (!graphProof || !isTypeOnlyImportBinding(node))) {
+				if (!record("require", moduleReference.expression) && graphProof) graphProof.provable = false;
 			}
-		} else if (node.type === "CallExpression") {
+		} else if (node.type === "CallExpression" || node.type === "OptionalCallExpression") {
 			const callee = asAstNode(node.callee);
 			if (callee?.type === "Import") {
-				record("import", nodeArgument(node, 0));
+				const importSource = nodeArgument(node, 0);
+				if (
+					graphProof &&
+					(!record("import", importSource) ||
+						(importSource?.type === "StringLiteral" &&
+							(importSource.value === "node:module" ||
+								importSource.value === "module" ||
+								importSource.value === "node:process" ||
+								importSource.value === "process")))
+				) {
+					graphProof.provable = false;
+				} else if (!graphProof) {
+					record("import", importSource);
+				}
 			} else if (isIdentifier(callee, "require") && !scopeHasBinding(scope, REQUIRE_BINDING)) {
-				record("require", nodeArgument(node, 0));
-			} else if (isCreateRequireInvocation(callee, createRequireBindings, moduleNamespaceBindings)) {
-				// `createRequire(base)(spec)` — pin the invoked bare dependency so it
-				// loads without a runtime `node_modules` lookup. Relative specifiers
-				// resolve against `base`, which is not rewritten, so restrict to bare.
+				if (!record("require", nodeArgument(node, 0)) && graphProof) graphProof.provable = false;
+				if (node.type === "OptionalCallExpression" && graphProof) graphProof.provable = false;
+				if ((isNodeModuleRequireCall(node, scope) || isNodeProcessRequireCall(node, scope)) && graphProof) {
+					const supportedUse =
+						(parent?.type === "VariableDeclarator" && parent.init === node) ||
+						(parent?.type === "MemberExpression" && parentKey === "object") ||
+						parent?.type === "ExpressionStatement";
+					if (!supportedUse) graphProof.provable = false;
+				}
+			} else if (graphProof && hasLexicalBinding(localRequireBindings, scope, callee)) {
 				const argument = nodeArgument(node, 0);
 				if (
+					node.type === "CallExpression" &&
 					argument?.type === "StringLiteral" &&
 					typeof argument.value === "string" &&
-					isBareExtensionDependencySpecifier(argument.value)
+					isGraphResolvableSpecifier(argument.value)
 				) {
 					record("require", argument);
+				} else {
+					graphProof.provable = false;
+				}
+			} else if (graphProof && hasLexicalBinding(unprovableRequireBindings, scope, callee)) {
+				graphProof.provable = false;
+			} else if (isCreateRequireInvocation(callee, createRequireBindings, moduleNamespaceBindings, scope)) {
+				const argument = nodeArgument(node, 0);
+				const localBase = isImportMetaUrl(nodeArgument(callee, 0));
+				if (
+					graphProof &&
+					node.type === "CallExpression" &&
+					argument?.type === "StringLiteral" &&
+					typeof argument.value === "string" &&
+					localBase &&
+					isGraphResolvableSpecifier(argument.value)
+				) {
+					record("require", argument);
+				} else {
+					if (
+						argument?.type === "StringLiteral" &&
+						typeof argument.value === "string" &&
+						isBareExtensionDependencySpecifier(argument.value)
+					) {
+						record("require", argument);
+					}
+					if (graphProof) graphProof.provable = false;
 				}
 			}
 		}
 	}
+
+	if (graphProof) {
+		for (const { node, scope, parent, parentKey } of collectScopedAstNodes(
+			ast,
+			candidate => candidate.type === "Identifier",
+			runtimeBindingsOnly,
+		)) {
+			if (typeof node.name !== "string") continue;
+			const nonReferenceProperty =
+				(parent?.type === "MemberExpression" && parentKey === "property" && parent.computed !== true) ||
+				(parentKey === "key" && parent?.computed !== true && parent?.shorthand !== true) ||
+				(parent?.type === "ImportSpecifier" && parentKey === "imported");
+			if (nonRuntimeBindingNodes.has(node)) continue;
+			const typeofOperand =
+				parent?.type === "UnaryExpression" && parent.operator === "typeof" && parentKey === "argument";
+			if (node.name === "module" && !scopeHasBinding(scope, MODULE_BINDING) && !nonReferenceProperty) {
+				const directExportsTarget =
+					parent?.type === "MemberExpression" &&
+					parentKey === "object" &&
+					staticMemberPropertyName(parent) === "exports";
+				const processDlopenModuleArgument =
+					(parent?.type === "CallExpression" || parent?.type === "OptionalCallExpression") &&
+					parentKey === "arguments" &&
+					nodeArgument(parent, 0) === node &&
+					isKnownProcessDlopenCall(parent, scope);
+				if (directExportsTarget || typeofOperand || processDlopenModuleArgument) continue;
+				graphProof.provable = false;
+				continue;
+			}
+			const knownProcessIdentifier =
+				(node.name === "process" && !scopeHasBinding(scope, PROCESS_BINDING)) ||
+				hasLexicalBinding(processNamespaceBindings, scope, node);
+			if (knownProcessIdentifier && !nonReferenceProperty) {
+				if (processNamespaceBindingNodes.has(node) || processObjectUseNodes.has(node) || typeofOperand) {
+					continue;
+				}
+				if (
+					(parent?.type === "MemberExpression" || parent?.type === "OptionalMemberExpression") &&
+					parentKey === "object"
+				) {
+					if (staticMemberPropertyName(parent) === null) graphProof.provable = false;
+					continue;
+				}
+				graphProof.provable = false;
+				continue;
+			}
+			const knownGlobalIdentifier =
+				(node.name === "global" && !scopeHasBinding(scope, GLOBAL_BINDING)) ||
+				(node.name === "globalThis" && !scopeHasBinding(scope, GLOBAL_THIS_BINDING)) ||
+				hasLexicalBinding(globalObjectBindings, scope, node);
+			if (knownGlobalIdentifier && !nonReferenceProperty) {
+				if (globalObjectBindingNodes.has(node) || globalObjectUseNodes.has(node) || typeofOperand) continue;
+				if (
+					(parent?.type === "MemberExpression" || parent?.type === "OptionalMemberExpression") &&
+					parentKey === "object"
+				) {
+					if (staticMemberPropertyName(parent) === null) graphProof.provable = false;
+					continue;
+				}
+				graphProof.provable = false;
+				continue;
+			}
+			if (node.name === "Reflect" && !scopeHasBinding(scope, REFLECT_BINDING) && !nonReferenceProperty) {
+				if (typeofOperand) continue;
+				if (
+					(parent?.type === "MemberExpression" || parent?.type === "OptionalMemberExpression") &&
+					parentKey === "object" &&
+					staticMemberPropertyName(parent) !== null
+				) {
+					continue;
+				}
+				graphProof.provable = false;
+				continue;
+			}
+			const runtimeEscapeIdentifier =
+				(node.name === "eval" && !scopeHasBinding(scope, EVAL_BINDING)) ||
+				(node.name === "Function" && !scopeHasBinding(scope, FUNCTION_BINDING)) ||
+				(node.name === "Worker" && !scopeHasBinding(scope, WORKER_BINDING));
+			if (runtimeEscapeIdentifier && !nonReferenceProperty) {
+				graphProof.provable = false;
+				continue;
+			}
+			if (hasLexicalBinding(processDlopenBindings, scope, node)) {
+				if (processDlopenBindingNodes.has(node)) continue;
+				if (
+					(parent?.type === "CallExpression" || parent?.type === "OptionalCallExpression") &&
+					parentKey === "callee" &&
+					isKnownProcessDlopenCall(parent, scope)
+				) {
+					continue;
+				}
+				if (nonReferenceProperty) continue;
+				graphProof.provable = false;
+				continue;
+			}
+			if (hasLexicalBinding(localRequireBindings, scope, node)) {
+				if (requireBindingNodes.has(node)) continue;
+				if (parent?.type === "CallExpression" && parentKey === "callee") continue;
+				if (nonReferenceProperty) continue;
+				graphProof.provable = false;
+				continue;
+			}
+			if (hasLexicalBinding(createRequireBindings, scope, node)) {
+				if (createRequireBindingNodes.has(node)) continue;
+				if (parent?.type === "CallExpression" && parentKey === "callee") continue;
+				if (nonReferenceProperty) continue;
+				graphProof.provable = false;
+				continue;
+			}
+			if (hasLexicalBinding(moduleNamespaceBindings, scope, node)) {
+				if (moduleNamespaceBindingNodes.has(node)) continue;
+				if (
+					(parent?.type === "MemberExpression" || parent?.type === "OptionalMemberExpression") &&
+					parentKey === "object"
+				) {
+					const memberName = staticMemberPropertyName(parent);
+					const supportedMember =
+						memberName === "createRequire" ||
+						memberName === "Module" ||
+						memberName === "default" ||
+						memberName === "require" ||
+						memberName === "_load";
+					if (
+						!supportedMember ||
+						(hasLexicalBinding(commonJsModuleNamespaceBindings, scope, node) && memberName === "Module")
+					) {
+						graphProof.provable = false;
+					}
+					continue;
+				}
+				if (nonReferenceProperty) continue;
+				graphProof.provable = false;
+				continue;
+			}
+			if (node.name !== "require" || scopeHasBinding(scope, REQUIRE_BINDING)) continue;
+			if (parent?.type === "CallExpression" && parentKey === "callee") continue;
+			if (nonReferenceProperty) continue;
+			if (parent?.type === "UnaryExpression" && parent.operator === "typeof" && parentKey === "argument") continue;
+			if (parent?.type === "MemberExpression" && parentKey === "object") {
+				switch (staticMemberPropertyName(parent)) {
+					case "extensions":
+					case "resolve":
+						continue;
+				}
+			}
+			graphProof.provable = false;
+		}
+		for (const { node, scope, parent, parentKey } of collectScopedAstNodes(
+			ast,
+			candidate => candidate.type === "MemberExpression" || candidate.type === "OptionalMemberExpression",
+			runtimeBindingsOnly,
+		)) {
+			const object = asAstNode(node.object);
+			const memberName = staticMemberPropertyName(node);
+			const globalRuntimeEscape =
+				(memberName === "eval" || memberName === "Function" || memberName === "Worker") &&
+				isKnownGlobalObject(object, scope);
+			if (globalRuntimeEscape || (memberName === null && isKnownGlobalObject(object, scope))) {
+				graphProof.provable = false;
+				continue;
+			}
+			if (memberName === "Reflect" && isKnownGlobalObject(object, scope)) {
+				if (
+					(parent?.type === "MemberExpression" || parent?.type === "OptionalMemberExpression") &&
+					parentKey === "object" &&
+					staticMemberPropertyName(parent) !== null
+				) {
+					continue;
+				}
+				graphProof.provable = false;
+				continue;
+			}
+			if (memberName === "get" && isKnownReflectObject(object, scope)) {
+				if (
+					(parent?.type === "CallExpression" || parent?.type === "OptionalCallExpression") &&
+					parentKey === "callee" &&
+					isReflectGetCall(parent, scope)
+				) {
+					continue;
+				}
+				graphProof.provable = false;
+				continue;
+			}
+			if (memberName === null && isKnownReflectObject(object, scope)) {
+				graphProof.provable = false;
+				continue;
+			}
+			if (memberName === "getBuiltinModule" && isKnownProcessObject(object, scope)) {
+				graphProof.provable = false;
+				continue;
+			}
+			if (memberName === null && isKnownProcessObject(object, scope)) {
+				graphProof.provable = false;
+				continue;
+			}
+			if (memberName === "dlopen") {
+				if (
+					(parent?.type === "CallExpression" || parent?.type === "OptionalCallExpression") &&
+					parentKey === "callee" &&
+					isKnownProcessDlopenCall(parent, scope)
+				) {
+					continue;
+				}
+				const binding = parent?.type === "VariableDeclarator" && parent.init === node ? asAstNode(parent.id) : null;
+				if (binding && processDlopenBindingNodes.has(binding)) continue;
+				graphProof.provable = false;
+				continue;
+			}
+			const moduleLoaderMember =
+				((memberName === "Module" || memberName === "default") && isKnownModuleLoaderObject(object, scope)) ||
+				(memberName === "mainModule" && isKnownProcessObject(object, scope));
+			if (moduleLoaderMember) {
+				const binding = parent?.type === "VariableDeclarator" && parent.init === node ? asAstNode(parent.id) : null;
+				const trackedAlias = binding?.type === "Identifier" && moduleNamespaceBindingNodes.has(binding);
+				const directLoadReceiver =
+					(parent?.type === "MemberExpression" || parent?.type === "OptionalMemberExpression") &&
+					parentKey === "object" &&
+					(staticMemberPropertyName(parent) === "_load" || staticMemberPropertyName(parent) === "require");
+				if (!trackedAlias && !directLoadReceiver) graphProof.provable = false;
+				continue;
+			}
+			const moduleLoadMember =
+				(memberName === "_load" || memberName === "require") && isKnownModuleLoaderObject(object, scope);
+			if (moduleLoadMember) {
+				graphProof.provable = false;
+				continue;
+			}
+			const disguisedRequireMember =
+				memberName === "require" &&
+				((isIdentifier(object, "module") && !scopeHasBinding(scope, MODULE_BINDING)) ||
+					isKnownGlobalObject(object, scope) ||
+					isKnownModuleLoaderObject(object, scope) ||
+					(object?.type === "MemberExpression" &&
+						staticMemberPropertyName(object) === "main" &&
+						isIdentifier(asAstNode(object.object), "require") &&
+						!scopeHasBinding(scope, REQUIRE_BINDING)));
+			if (disguisedRequireMember) {
+				graphProof.provable = false;
+				continue;
+			}
+			const namespaceCreateRequire =
+				memberName === "createRequire" && hasLexicalBinding(moduleNamespaceBindings, scope, object);
+			const directCommonJsCreateRequire = memberName === "createRequire" && isNodeModuleRequireCall(object, scope);
+			if (namespaceCreateRequire || directCommonJsCreateRequire) {
+				if (parent?.type === "CallExpression" && parentKey === "callee") continue;
+				const binding = parent?.type === "VariableDeclarator" && parent.init === node ? asAstNode(parent.id) : null;
+				if (binding && createRequireBindingNodes.has(binding)) continue;
+				graphProof.provable = false;
+				continue;
+			}
+			if (
+				isNodeModuleRequireCall(object, scope) &&
+				(memberName === null || memberName === "Module" || memberName === "default")
+			) {
+				const binding = parent?.type === "VariableDeclarator" && parent.init === node ? asAstNode(parent.id) : null;
+				if (memberName === "Module" && binding && moduleNamespaceBindingNodes.has(binding)) continue;
+				graphProof.provable = false;
+			}
+		}
+	}
 	return references;
+}
+
+const EXTENSION_PARSE_CACHE_SCHEMA_VERSION = 2;
+const EXTENSION_PARSE_CACHE_MAX_BYTES = 8 * 1024 * 1024;
+const EXTENSION_PARSE_CACHE_MAX_ENTRIES = 10_000;
+
+interface ExtensionSourceAnalysis {
+	readonly sourceType: "script" | "module";
+	readonly references: readonly ExtensionSpecifierReference[];
+	readonly commonJsNamedExports: readonly string[];
+	readonly commonJsReexportSpecifiers: readonly string[];
+}
+
+interface ExtensionParseCacheRow {
+	source_type: "script" | "module";
+	references: string;
+	commonjs_named_exports: string;
+	commonjs_reexport_specifiers: string;
+}
+
+let extensionParseCacheDb: Database | null | undefined;
+const extensionSourceAnalysisCache = new Map<string, ExtensionSourceAnalysis>();
+
+function extensionParseCacheKey(source: string, importerPath: string): string {
+	return `${EXTENSION_PARSE_CACHE_SCHEMA_VERSION}:${path.extname(importerPath).toLowerCase()}:${Bun.hash(source).toString(16)}`;
+}
+
+function getExtensionParseCacheDb(): Database | null {
+	if (extensionParseCacheDb !== undefined) return extensionParseCacheDb;
+	try {
+		const cachePath = getLegacyPiExtensionCacheDbPath();
+		try {
+			if (fs.statSync(cachePath).size > EXTENSION_PARSE_CACHE_MAX_BYTES) {
+				fs.rmSync(cachePath, { force: true });
+			}
+		} catch {
+			// A missing or unreadable cache is a cold cache.
+		}
+		fs.mkdirSync(path.dirname(cachePath), { recursive: true });
+		const db = new Database(cachePath, { create: true });
+		db.run("PRAGMA busy_timeout = 50");
+		db.run(
+			"CREATE TABLE IF NOT EXISTS extension_parse_cache (cache_key TEXT PRIMARY KEY, source_type TEXT NOT NULL, references TEXT NOT NULL, commonjs_named_exports TEXT NOT NULL, commonjs_reexport_specifiers TEXT NOT NULL)",
+		);
+		extensionParseCacheDb = db;
+		return db;
+	} catch (error) {
+		logger.debug("legacy Pi extension parse cache unavailable", {
+			error: error instanceof Error ? error.message : String(error),
+		});
+		extensionParseCacheDb = null;
+		return null;
+	}
+}
+
+function parseCachedAnalysis(row: ExtensionParseCacheRow): ExtensionSourceAnalysis | null {
+	try {
+		if (row.source_type !== "script" && row.source_type !== "module") return null;
+		const references = JSON.parse(row.references) as unknown;
+		const commonJsNamedExports = JSON.parse(row.commonjs_named_exports) as unknown;
+		const commonJsReexportSpecifiers = JSON.parse(row.commonjs_reexport_specifiers) as unknown;
+		if (
+			!Array.isArray(references) ||
+			!references.every(
+				reference =>
+					reference &&
+					typeof reference === "object" &&
+					(reference.kind === "import" || reference.kind === "require") &&
+					typeof reference.specifier === "string" &&
+					typeof reference.start === "number" &&
+					typeof reference.end === "number",
+			) ||
+			!Array.isArray(commonJsNamedExports) ||
+			!commonJsNamedExports.every(name => typeof name === "string") ||
+			!Array.isArray(commonJsReexportSpecifiers) ||
+			!commonJsReexportSpecifiers.every(specifier => typeof specifier === "string")
+		) {
+			return null;
+		}
+		return {
+			sourceType: row.source_type,
+			references: references as ExtensionSpecifierReference[],
+			commonJsNamedExports,
+			commonJsReexportSpecifiers,
+		};
+	} catch {
+		return null;
+	}
+}
+
+function writeExtensionSourceAnalysis(cacheKey: string, analysis: ExtensionSourceAnalysis): void {
+	void Promise.resolve()
+		.then(() => {
+			const db = getExtensionParseCacheDb();
+			if (!db) return;
+			db.run(
+				"INSERT OR REPLACE INTO extension_parse_cache (cache_key, source_type, references, commonjs_named_exports, commonjs_reexport_specifiers) VALUES (?, ?, ?, ?, ?)",
+				[
+					cacheKey,
+					analysis.sourceType,
+					JSON.stringify(analysis.references),
+					JSON.stringify(analysis.commonJsNamedExports),
+					JSON.stringify(analysis.commonJsReexportSpecifiers),
+				],
+			);
+			const count =
+				db.query<{ count: number }, []>("SELECT count(*) AS count FROM extension_parse_cache").get()?.count ?? 0;
+			if (count > EXTENSION_PARSE_CACHE_MAX_ENTRIES) {
+				db.run("DELETE FROM extension_parse_cache");
+			}
+		})
+		.catch(error => {
+			logger.debug("legacy Pi extension parse cache write failed", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		});
+}
+
+function getExtensionSourceAnalysis(source: string, importerPath: string): ExtensionSourceAnalysis {
+	const cacheKey = extensionParseCacheKey(source, importerPath);
+	const memoryCached = extensionSourceAnalysisCache.get(cacheKey);
+	if (memoryCached) return memoryCached;
+
+	const db = getExtensionParseCacheDb();
+	try {
+		const row = db
+			?.query<ExtensionParseCacheRow, [string]>(
+				"SELECT source_type, references, commonjs_named_exports, commonjs_reexport_specifiers FROM extension_parse_cache WHERE cache_key = ?",
+			)
+			.get(cacheKey);
+		if (row) {
+			const cached = parseCachedAnalysis(row);
+			if (cached) {
+				extensionSourceAnalysisCache.set(cacheKey, cached);
+				return cached;
+			}
+		}
+	} catch (error) {
+		logger.debug("legacy Pi extension parse cache read failed", {
+			error: error instanceof Error ? error.message : String(error),
+		});
+	}
+
+	const ast = parseExtensionSource(source, importerPath);
+	const commonJs = collectCommonJsExportAnalysis(ast);
+	const analysis: ExtensionSourceAnalysis = {
+		sourceType: ast.program.sourceType,
+		references: collectExtensionSpecifierReferences(source, importerPath, ast),
+		...commonJs,
+	};
+	extensionSourceAnalysisCache.set(cacheKey, analysis);
+	writeExtensionSourceAnalysis(cacheKey, analysis);
+	return analysis;
 }
 
 function applySpecifierReplacements(
@@ -1003,7 +2480,7 @@ async function rewriteLegacyExtensionSource(
 	// Compiled mode completes the override map from the build-supplied module
 	// keys on first use; every rewrite path must see the full map.
 	await ensureLegacyPiOverridesReady();
-	const references = collectExtensionSpecifierReferences(source, importerPath);
+	const references = getExtensionSourceAnalysis(source, importerPath).references;
 	const replacements: Array<ExtensionSpecifierReference & { replacement: string }> = [];
 	for (const reference of references) {
 		if (reference.kind !== "import") continue;
@@ -1162,6 +2639,36 @@ async function resolvePackageFileTarget(packageRoot: string, targetPath: string)
 	return isPathInsideRoot(realPackageRoot, resolved) ? resolved : null;
 }
 
+async function resolveRuntimeFileTarget(candidate: string): Promise<string | null> {
+	try {
+		if (!(await fs.promises.stat(candidate)).isFile()) return null;
+		return realpathOrSelfUncached(candidate);
+	} catch {
+		return null;
+	}
+}
+
+async function resolveRelativeGraphTarget(
+	specifier: string,
+	importerPath: string,
+	kind: ExtensionSpecifierReference["kind"],
+): Promise<string | null> {
+	if (kind === "require") {
+		const sourceTarget = await resolveRelativeCommonJsRequire(specifier, importerPath);
+		if (sourceTarget) return sourceTarget;
+		try {
+			return resolveRuntimeFileTarget(createRequire(importerPath).resolve(specifier));
+		} catch {
+			return null;
+		}
+	}
+	try {
+		return resolveRuntimeFileTarget(Bun.resolveSync(specifier, path.dirname(importerPath)));
+	} catch {
+		return null;
+	}
+}
+
 async function findPackageRoot(importerPath: string): Promise<string | null> {
 	let dir = path.dirname(importerPath);
 	while (true) {
@@ -1240,15 +2747,25 @@ async function resolvePackageImportTarget(
 	packageRoot: string,
 	target: string,
 	wildcard: string | null,
+	includeNonSource = false,
 ): Promise<string | null> {
 	if (!target.startsWith("./")) {
 		return null;
 	}
 	const substituted = wildcard === null ? target : target.replaceAll("*", wildcard);
-	return resolvePackageSourceTarget(packageRoot, path.resolve(packageRoot, substituted));
+	const targetPath = path.resolve(packageRoot, substituted);
+	const sourceTarget = await resolvePackageSourceTarget(packageRoot, targetPath);
+	if (sourceTarget || !includeNonSource) return sourceTarget;
+	const fileTarget = await resolvePackageFileTarget(packageRoot, targetPath);
+	return fileTarget ? resolveRuntimeFileTarget(fileTarget) : null;
 }
 
-async function resolvePackageImportSpecifier(specifier: string, importerPath: string): Promise<string | null> {
+async function resolvePackageImportSpecifier(
+	specifier: string,
+	importerPath: string,
+	includeNonSource = false,
+	conditions: ReadonlySet<string> = SUPPORTED_PACKAGE_IMPORT_CONDITIONS,
+): Promise<string | null> {
 	if (!specifier.startsWith("#")) {
 		return null;
 	}
@@ -1263,12 +2780,12 @@ async function resolvePackageImportSpecifier(specifier: string, importerPath: st
 		return null;
 	}
 
-	const exactTarget = selectPackageImportTarget(imports[specifier]);
+	const exactTarget = selectPackageImportTarget(imports[specifier], conditions);
 	if (exactTarget === PACKAGE_IMPORT_EXCLUDED) {
 		return null;
 	}
 	if (exactTarget !== null) {
-		return resolvePackageImportTarget(packageRoot, exactTarget, null);
+		return resolvePackageImportTarget(packageRoot, exactTarget, null, includeNonSource);
 	}
 
 	let bestMatch: { keyLength: number; target: ResolvedPackageImportTargetSelection; wildcard: string } | null = null;
@@ -1282,7 +2799,7 @@ async function resolvePackageImportSpecifier(specifier: string, importerPath: st
 			continue;
 		}
 
-		const target = selectPackageImportTarget(entry);
+		const target = selectPackageImportTarget(entry, conditions);
 		if (target === null) {
 			continue;
 		}
@@ -1299,7 +2816,7 @@ async function resolvePackageImportSpecifier(specifier: string, importerPath: st
 	if (!bestMatch || bestMatch.target === PACKAGE_IMPORT_EXCLUDED) {
 		return null;
 	}
-	return resolvePackageImportTarget(packageRoot, bestMatch.target, bestMatch.wildcard);
+	return resolvePackageImportTarget(packageRoot, bestMatch.target, bestMatch.wildcard, includeNonSource);
 }
 
 function isBareExtensionDependencySpecifier(specifier: string): boolean {
@@ -1351,12 +2868,59 @@ async function findNodePackageRootUncached(packageName: string, importerPath: st
 		if (await pathExists(path.join(candidate, "package.json"))) {
 			return candidate;
 		}
+		const workspaceMember = await findWorkspaceMemberPackageRoot(dir, packageName);
+		if (workspaceMember) {
+			return workspaceMember;
+		}
 		const parent = path.dirname(dir);
 		if (parent === dir) {
 			return null;
 		}
 		dir = parent;
 	}
+}
+
+/**
+ * Resolve `packageName` as a workspace member when `dir` is a workspace root.
+ *
+ * An installed git dependency of a monorepo plugin contains the full
+ * workspace tree but no node_modules links: `bun install` materializes a git
+ * dependency's regular npm dependencies into the host tree and skips its
+ * `workspace:*` / `file:` edges. Bare imports between workspace siblings
+ * therefore never resolve through the node_modules walk above. When a
+ * directory on that walk declares `workspaces` (array form or the yarn-style
+ * `{ packages: [...] }` object), scan the member manifests for the requested
+ * package name. node_modules candidates at the same level win, so an
+ * explicitly installed copy still shadows the workspace member.
+ */
+async function findWorkspaceMemberPackageRoot(dir: string, packageName: string): Promise<string | null> {
+	if (!(await pathExists(path.join(dir, "package.json")))) {
+		return null;
+	}
+	const manifest = await readPackageManifest(dir);
+	const rawWorkspaces = manifest?.workspaces;
+	const patterns = Array.isArray(rawWorkspaces)
+		? rawWorkspaces
+		: isRecord(rawWorkspaces) && Array.isArray(rawWorkspaces.packages)
+			? rawWorkspaces.packages
+			: null;
+	if (!patterns) {
+		return null;
+	}
+	for (const pattern of patterns) {
+		if (typeof pattern !== "string" || pattern.startsWith("!")) {
+			continue;
+		}
+		const glob = new Bun.Glob(path.join(pattern, "package.json"));
+		for await (const match of glob.scan({ cwd: dir, onlyFiles: true })) {
+			const memberRoot = path.dirname(path.join(dir, match));
+			const memberManifest = await readPackageManifest(memberRoot);
+			if (memberManifest?.name === packageName) {
+				return memberRoot;
+			}
+		}
+	}
+	return null;
 }
 
 async function readPackageManifest(packageRoot: string): Promise<Record<string, unknown> | null> {
@@ -1401,7 +2965,7 @@ async function isCommonJsModulePath(
 		return true;
 	}
 	const parsedSourceType =
-		sourceType ?? parseExtensionSource(await Bun.file(modulePath).text(), modulePath).program.sourceType;
+		sourceType ?? getExtensionSourceAnalysis(await Bun.file(modulePath).text(), modulePath).sourceType;
 	if (parsedSourceType === "module") {
 		return false;
 	}
@@ -1729,7 +3293,7 @@ async function rewriteExtensionSpecifiers(
 	importerPath: string,
 	rewriteImports = false,
 ): Promise<string> {
-	const references = collectExtensionSpecifierReferences(source, importerPath);
+	const references = getExtensionSourceAnalysis(source, importerPath).references;
 	const resolvedSpecifierTargets = new Map<string, string>();
 	const replacements: Array<ExtensionSpecifierReference & { replacement: string }> = [];
 	for (const reference of references) {
@@ -1761,7 +3325,7 @@ function rewriteExtensionSpecifiersFromCache(source: string, importerPath: strin
 		return source;
 	}
 	const replacements: Array<ExtensionSpecifierReference & { replacement: string }> = [];
-	for (const reference of collectExtensionSpecifierReferences(source, importerPath)) {
+	for (const reference of getExtensionSourceAnalysis(source, importerPath).references) {
 		const replacement = resolvedSpecifierTargets.get(`${reference.kind}\0${reference.specifier}`);
 		if (replacement) {
 			replacements.push({ ...reference, replacement });
@@ -1792,7 +3356,7 @@ async function moduleRequiresNativeAddonUncached(modulePath: string): Promise<bo
 	} catch {
 		return false;
 	}
-	for (const reference of collectExtensionSpecifierReferences(source, modulePath)) {
+	for (const reference of getExtensionSourceAnalysis(source, modulePath).references) {
 		if (reference.kind === "require" && (await resolveExtensionNativeAddon(reference.specifier, modulePath))) {
 			return true;
 		}
@@ -1993,18 +3557,18 @@ async function collectExtensionModules(entryRealPath: string): Promise<Extension
 			continue;
 		}
 		modules.set(file, source);
-		const ast = parseExtensionSource(source, file);
+		const analysis = getExtensionSourceAnalysis(source, file);
 		const sourceIsCommonJs = await isGraphOwnedCommonJsModule(
 			file,
 			entryRealPath,
-			ast.program.sourceType,
+			analysis.sourceType,
 			inheritedModuleKind,
 		);
 		if (sourceIsCommonJs) {
 			commonJsPaths.add(file);
 		}
 		const dir = path.dirname(file);
-		const references = collectExtensionSpecifierReferences(source, file, ast);
+		const references = analysis.references;
 		for (const reference of references) {
 			const specifier = reference.specifier;
 			try {
@@ -2042,7 +3606,12 @@ async function collectExtensionModules(entryRealPath: string): Promise<Extension
 						}
 					}
 				} else if (specifier.startsWith("#")) {
-					const candidate = await resolvePackageImportSpecifier(specifier, file);
+					const candidate = await resolvePackageImportSpecifier(
+						specifier,
+						file,
+						false,
+						isRequired ? SUPPORTED_PACKAGE_REQUIRE_CONDITIONS : SUPPORTED_PACKAGE_IMPORT_CONDITIONS,
+					);
 					if (candidate) {
 						const inheritedTargetKind = isRequired
 							? sourceIsCommonJs
@@ -2171,6 +3740,70 @@ async function collectExtensionModules(entryRealPath: string): Promise<Extension
 	};
 }
 
+async function collectExtensionSourceGraph(entryRealPath: string): Promise<Set<string> | null> {
+	if (!hasSourceModuleExtension(entryRealPath)) return null;
+	const graphPaths = new Set<string>();
+	const queue = [entryRealPath];
+	while (queue.length > 0) {
+		const file = queue.pop();
+		if (!file || graphPaths.has(file)) continue;
+		graphPaths.add(file);
+		if (!hasSourceModuleExtension(file)) continue;
+
+		let source: string;
+		try {
+			source = await Bun.file(file).text();
+		} catch {
+			return null;
+		}
+		const ast = parseExtensionSource(source, file);
+		const proof: ExtensionGraphProof = { provable: true, fileTargets: new Set<string>() };
+		const references = collectExtensionSpecifierReferences(source, file, ast, proof);
+		if (!proof.provable) return null;
+		for (const target of proof.fileTargets) {
+			const resolved = await resolveRuntimeFileTarget(target);
+			if (!resolved) return null;
+			if (!graphPaths.has(resolved)) queue.push(resolved);
+		}
+		for (const reference of references) {
+			const specifier = reference.specifier;
+			if (!isGraphResolvableSpecifier(specifier)) return null;
+			let resolved: string | null = null;
+			try {
+				if (specifier.startsWith(".")) {
+					resolved = await resolveRelativeGraphTarget(specifier, file, reference.kind);
+				} else if (specifier.startsWith("#")) {
+					resolved = await resolvePackageImportSpecifier(
+						specifier,
+						file,
+						true,
+						reference.kind === "require"
+							? SUPPORTED_PACKAGE_REQUIRE_CONDITIONS
+							: SUPPORTED_PACKAGE_IMPORT_CONDITIONS,
+					);
+					if (!resolved) return null;
+				} else if (
+					isBareExtensionDependencySpecifier(specifier) &&
+					!remapLegacyPiSpecifier(specifier) &&
+					specifier !== "typebox" &&
+					specifier !== "@sinclair/typebox"
+				) {
+					const candidate =
+						reference.kind === "require"
+							? await resolveExtensionBareRequire(specifier, file)
+							: await resolveExtensionBareDependency(specifier, file);
+					if (candidate) resolved = await resolveRuntimeFileTarget(candidate);
+				}
+			} catch {
+				if (specifier.startsWith("#")) return null;
+				// Other unresolved literals cannot extend the runtime graph.
+			}
+			if (resolved && !graphPaths.has(resolved)) queue.push(resolved);
+		}
+	}
+	return graphPaths;
+}
+
 /** Test seam for compiled-binary dependency graph discovery and rewriting. */
 export async function __collectLegacyPiExtensionSourcesForTests(
 	entryPath: string,
@@ -2180,28 +3813,33 @@ export async function __collectLegacyPiExtensionSourcesForTests(
 	return graph.modules;
 }
 
+/** Prove every extension-owned source module resolves inside one approved package root. */
+export async function isExtensionSourceGraphContained(entryPath: string, packageRoot: string): Promise<boolean> {
+	const [entryRealPath, packageRealPath] = await Promise.all([
+		realpathOrSelfUncached(path.resolve(entryPath)),
+		fs.promises.realpath(path.resolve(packageRoot)),
+	]);
+	const sourcePaths = await collectExtensionSourceGraph(entryRealPath);
+	if (!sourcePaths?.has(entryRealPath)) return false;
+	for (const modulePath of sourcePaths) {
+		const resolvedModulePath = await realpathOrSelfUncached(modulePath);
+		const relative = path.relative(packageRealPath, resolvedModulePath);
+		if (relative.startsWith(`..${path.sep}`) || relative === ".." || path.isAbsolute(relative)) return false;
+	}
+	return true;
+}
+
 /**
  * Discovers CommonJS export names Bun normally exposes to ESM importers. The
  * bridge must declare them statically because its default export is synthetic.
  */
 const COMMONJS_NAMED_EXPORT_IDENTIFIER = /^[A-Za-z_$][\w$]*$/;
 
-function collectCommonJsNamedExports(source: string, modulePath: string, visited = new Set<string>()): string[] {
-	let realModulePath = modulePath;
-	try {
-		realModulePath = fs.realpathSync(modulePath);
-	} catch {
-		// The caller's path remains the stable cycle key when realpath fails.
-	}
-	if (visited.has(realModulePath)) {
-		return [];
-	}
-	visited.add(realModulePath);
-
+function collectCommonJsExportAnalysis(
+	ast: ParseResult,
+): Pick<ExtensionSourceAnalysis, "commonJsNamedExports" | "commonJsReexportSpecifiers"> {
 	const names = new Set<string>();
-
 	const reexportSpecifiers = new Set<string>();
-	const ast = parseExtensionSource(source, modulePath);
 	for (const { node, scope } of collectScopedAstNodes(
 		ast,
 		candidate => candidate.type === "CallExpression" || candidate.type === "AssignmentExpression",
@@ -2237,17 +3875,13 @@ function collectCommonJsNamedExports(source: string, modulePath: string, visited
 		if (node.type !== "AssignmentExpression" || node.operator !== "=") continue;
 		const left = asAstNode(node.left);
 		if (left?.type !== "MemberExpression") continue;
-
 		const propertyName = staticMemberPropertyName(left);
 		const object = asAstNode(left.object);
 		if (propertyName !== null && isUnshadowedExportsTarget(object, scope)) {
-			if (propertyName !== "default" && COMMONJS_NAMED_EXPORT_IDENTIFIER.test(propertyName)) {
-				names.add(propertyName);
-			}
+			if (propertyName !== "default" && COMMONJS_NAMED_EXPORT_IDENTIFIER.test(propertyName)) names.add(propertyName);
 			continue;
 		}
 		if (!isUncomputedMember(left, "module", "exports") || scopeHasBinding(scope, MODULE_BINDING)) continue;
-
 		const right = asAstNode(node.right);
 		if (right?.type === "ObjectExpression") {
 			const properties = nodeArray(right, "properties");
@@ -2255,7 +3889,7 @@ function collectCommonJsNamedExports(source: string, modulePath: string, visited
 				for (const value of properties) {
 					const property = asAstNode(value);
 					if (!property || (property.type !== "ObjectProperty" && property.type !== "ObjectMethod")) continue;
-					const name = staticObjectPropertyName(property);
+					const name = property.computed === true ? null : staticObjectPropertyName(property);
 					if (name && name !== "default" && COMMONJS_NAMED_EXPORT_IDENTIFIER.test(name)) {
 						names.add(name);
 					}
@@ -2265,19 +3899,30 @@ function collectCommonJsNamedExports(source: string, modulePath: string, visited
 		}
 		if (isGlobalRequireCall(right, scope)) {
 			const argument = nodeArgument(right, 0);
-			if (argument?.type === "StringLiteral" && typeof argument.value === "string") {
+			if (argument?.type === "StringLiteral" && typeof argument.value === "string")
 				reexportSpecifiers.add(argument.value);
-			}
 		}
 	}
+	return { commonJsNamedExports: [...names], commonJsReexportSpecifiers: [...reexportSpecifiers] };
+}
+
+function collectCommonJsNamedExports(source: string, modulePath: string, visited = new Set<string>()): string[] {
+	let realModulePath = modulePath;
+	try {
+		realModulePath = fs.realpathSync(modulePath);
+	} catch {
+		// The caller's path remains the stable cycle key when realpath fails.
+	}
+	if (visited.has(realModulePath)) return [];
+	visited.add(realModulePath);
+	const analysis = getExtensionSourceAnalysis(source, modulePath);
+	const names = new Set(analysis.commonJsNamedExports);
 	const nativeRequire = createRequire(modulePath);
-	for (const specifier of reexportSpecifiers) {
+	for (const specifier of analysis.commonJsReexportSpecifiers) {
 		try {
 			const resolved = fs.realpathSync(nativeRequire.resolve(specifier));
 			const reexportedSource = rewriteExtensionSpecifiersFromCache(fs.readFileSync(resolved, "utf8"), resolved);
-			for (const name of collectCommonJsNamedExports(reexportedSource, resolved, visited)) {
-				names.add(name);
-			}
+			for (const name of collectCommonJsNamedExports(reexportedSource, resolved, visited)) names.add(name);
 		} catch {
 			// Native modules and non-source re-exports do not expose analyzable names.
 		}

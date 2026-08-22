@@ -109,6 +109,17 @@ describe("describeAttachedImagesForTextModel", () => {
 		expect(saved.toString("base64")).toBe(TINY_PNG_BASE64);
 	});
 
+	it("passes explicit session cache retention to the vision description request", async () => {
+		const stub = makeCompleteStub("A red balloon.");
+		const deps = makeDeps(testDir, [textModel, visionModel], stub.fn);
+		deps.settings.set("providers.cacheRetention", "none");
+
+		await describeAttachedImagesForTextModel([{ type: "image", data: TINY_PNG_BASE64, mimeType: "image/png" }], deps);
+
+		const options = stub.calls[0]?.[2] as { cacheRetention?: string } | undefined;
+		expect(options?.cacheRetention).toBe("none");
+	});
+
 	it("saves the image but emits a no-vision note when no vision model is available", async () => {
 		const stub = makeCompleteStub("should not be used");
 		const blocks = await describeAttachedImagesForTextModel(

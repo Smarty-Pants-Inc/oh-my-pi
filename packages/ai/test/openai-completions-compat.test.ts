@@ -126,7 +126,11 @@ function kimiZaiModel(): Model<"openai-completions"> {
 async function captureOpenAICompletionsPayload(
 	model: Model<"openai-completions">,
 	context: Context = baseContext(),
-	options?: { reasoning?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max"; temperature?: number },
+	options?: {
+		reasoning?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+		temperature?: number;
+		cacheRetention?: "short" | "long" | "none";
+	},
 ): Promise<unknown> {
 	const { promise, resolve } = Promise.withResolvers<unknown>();
 	const fetchMock = createMockFetch(["[DONE]"]);
@@ -213,6 +217,7 @@ describe("openai-completions compatibility", () => {
 			allowsSyntheticReasoningContentForToolCalls: true,
 			replayReasoningContent: false,
 			qwenPreserveThinking: false,
+			qwenTemplateReasoningEffort: false,
 			requiresAssistantContentForToolCalls: false,
 			openRouterRouting: {},
 			vercelGatewayRouting: {},
@@ -1822,7 +1827,9 @@ describe("kimi model detection via detectCompat", () => {
 	// Dropping reasoning_effort does not turn off the gateway's default thinking
 	// mode, so the compat descriptor itself must mark forced tool choice
 	// unsupported (no per-model override) and buildParams must downgrade the
-	// selector to "auto" while keeping the tool advertised.
+	// selector while keeping the tool advertised. The downgraded "auto" is then
+	// dropped as redundant so reasoning survives (#1207) — omission and "auto"
+	// are wire-equivalent for tool selection.
 	it("scopes the DeepSeek forced tool_choice downgrade to OpenCode gateways", async () => {
 		const todoTool: Tool = {
 			name: "todo",
@@ -1869,7 +1876,7 @@ describe("kimi model detection via detectCompat", () => {
 		const openCode = buildModel(deepseekSpec);
 		expect(openCode.compat.supportsForcedToolChoice).toBe(false);
 		const openCodePayload = await captureToolChoice(openCode);
-		expect(openCodePayload.tool_choice).toBe("auto");
+		expect(openCodePayload.tool_choice).toBeUndefined();
 		expect(
 			Array.isArray(openCodePayload.tools) &&
 				openCodePayload.tools.some(tool => getNestedObject(tool, "function")?.name === "todo"),
@@ -1883,7 +1890,7 @@ describe("kimi model detection via detectCompat", () => {
 		} satisfies ModelSpec<"openai-completions">);
 		expect(customOpenCode.compat.supportsForcedToolChoice).toBe(false);
 		const customPayload = await captureToolChoice(customOpenCode);
-		expect(customPayload.tool_choice).toBe("auto");
+		expect(customPayload.tool_choice).toBeUndefined();
 
 		const nvidia = buildModel({
 			...deepseekSpec,
@@ -2400,6 +2407,25 @@ describe("anthropic cache control for OpenAI-compatible chat completions", () =>
 
 		expect(textPart?.text).toBe("cache me");
 		expect(textPart?.cache_control).toEqual({ type: "ephemeral" });
+	});
+
+	it("honors none and long retention for Anthropic cache markers", async () => {
+		const nonePayload = await captureOpenAICompletionsPayload(
+			claudeProxyModel({ cacheControlFormat: "anthropic" }),
+			cacheContext(),
+			{ cacheRetention: "none" },
+		);
+		expect(getLastTextPart(getLastPayloadContent(nonePayload))?.cache_control).toBeUndefined();
+
+		const longPayload = await captureOpenAICompletionsPayload(
+			claudeProxyModel({ cacheControlFormat: "anthropic" }),
+			cacheContext(),
+			{ cacheRetention: "long" },
+		);
+		expect(getLastTextPart(getLastPayloadContent(longPayload))?.cache_control).toEqual({
+			type: "ephemeral",
+			ttl: "1h",
+		});
 	});
 
 	it("preserves OpenRouter Anthropic cache_control detection", async () => {

@@ -44,6 +44,8 @@ async function createHarness(): Promise<Harness> {
 		get isStreaming() {
 			return streaming;
 		},
+		getQueuedPrompts: () => [{ id: "queued", text: "queued prompt", delivery: "afterCurrent" as const }],
+		onQueuedPromptsChanged: () => () => {},
 	} as unknown as AgentSession;
 	const mode = new InteractiveMode(session, "test");
 	harness = {
@@ -156,6 +158,20 @@ describe("InteractiveMode deferred command preview", () => {
 		mode.clearTransientSessionUi();
 
 		expect(noticeText(mode)).toBe("");
+	});
+
+	it("removes the timing-editor key listener when the session surface resets", async () => {
+		const { mode } = await createHarness();
+		mode.ui.setFocus(mode.editor);
+		const unsubscribe = vi.fn();
+		const addInputListener = vi.spyOn(mode.ui, "addInputListener").mockReturnValue(unsubscribe);
+
+		mode.editQueuedPrompts();
+		await Promise.resolve();
+		expect(addInputListener).toHaveBeenCalledTimes(1);
+
+		mode.clearTransientSessionUi();
+		expect(unsubscribe).toHaveBeenCalledTimes(1);
 	});
 
 	it("starts the queue over after a reset, so a later command previews alone", async () => {

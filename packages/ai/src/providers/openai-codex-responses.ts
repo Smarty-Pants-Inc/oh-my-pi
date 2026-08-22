@@ -2,6 +2,7 @@ import { scheduler } from "node:timers/promises";
 import { type } from "@oh-my-pi/omptype";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import {
+	applyCodexResidencyHeader,
 	CODEX_BASE_URL,
 	CODEX_CLIENT_VERSION,
 	getCodexAccountId,
@@ -26,6 +27,7 @@ import { getEnvApiKey, isOfficialCodexApiUrl } from "../stream";
 import type {
 	Api,
 	AssistantMessage,
+	CacheRetention,
 	CodexCompactionContext,
 	CodexCompactionRequestContext,
 	Context,
@@ -115,6 +117,7 @@ import {
 	finalizeReasoningThinking,
 	finalizeToolCallArgumentsDone,
 	getOpenAIPromptCacheKey,
+	getOpenAIResponsesRoutingSessionId,
 	hasExecutableIncompleteResponsesToolCalls,
 	isOpenAIResponsesProgressEvent,
 	mapOpenAIResponsesStopReason,
@@ -182,6 +185,7 @@ export interface OpenAICodexCompactionStreamOptions extends OpenAICodexResponses
 /** Inputs for synthesizing Codex request identity outside the normal stream path. */
 export interface OpenAICodexCompatibilityMetadataOptions {
 	sessionId?: string;
+	cacheRetention?: CacheRetention;
 	providerSessionState?: Map<string, ProviderSessionState>;
 	requestKind: OpenAICodexRequestKind;
 	compaction?: CodexCompactionRequestContext;
@@ -496,12 +500,15 @@ interface CodexCompatibilityIdentity {
 	sessionId: string;
 	threadId: string;
 	windowId: string;
-	turnMetadataJson?: string;
+	/** Header projection: identity fields only, never the Code Mode snapshot. */
+	turnMetadataHeaderJson?: string;
 }
 
 interface CodexRequestMetadata extends CodexCompatibilityIdentity {
 	turnId: string;
+	/** Canonical body projection, including `tool_namespaces_info` when present. */
 	turnMetadataJson: string;
+	turnMetadataHeaderJson: string;
 	clientMetadata: Record<string, string>;
 }
 
@@ -518,10 +525,11 @@ const CODEX_RESERVED_METADATA_KEYS: Record<string, true> = {
 	[OPENAI_HEADERS.SUBAGENT]: true,
 	request_kind: true,
 	compaction: true,
-	// codex-rs reserves `code_mode_tool_names` for its Responses Lite Code Mode
-	// mapping (#35271); OMP never emits it, but callers must not smuggle it in
-	// as an extra either.
+	// codex-rs retired `code_mode_tool_names` in favor of `tool_namespaces_info`
+	// for its Responses Lite Code Mode mapping; both stay reserved so callers
+	// cannot smuggle them in as extras.
 	code_mode_tool_names: true,
+	tool_namespaces_info: true,
 	turn_started_at_unix_ms: true,
 	forked_from_thread_id: true,
 	parent_thread_id: true,
@@ -599,6 +607,7 @@ function createCodexRequestMetadata(
 		clientMetadata?: Readonly<Record<string, string>>;
 		parentTurnId?: string;
 		compaction?: CodexCompactionRequestContext;
+		toolNamespacesInfo?: unknown;
 	},
 ): CodexRequestMetadata {
 	if (options.startNewTurn || !session.turnId) {
@@ -638,7 +647,17 @@ function createCodexRequestMetadata(
 		turnMetadata.turn_started_at_unix_ms = session.turnStartedAtUnixMs;
 	}
 	for (const key in extra) turnMetadata[key] = extra[key];
-	const turnMetadataJson = toAsciiJsonString(turnMetadata);
+	// The `x-codex-turn-metadata` header is capped at 100KB by the Codex
+	// backend, while `tool_namespaces_info` grows with the session's tool count
+	// (409 tools ~ 100KB on its own). The body's `client_metadata` is the
+	// canonical envelope, so the snapshot rides there only and the header keeps
+	// the fixed-size identity projection.
+	const turnMetadataHeaderJson = toAsciiJsonString(turnMetadata);
+	let turnMetadataJson = turnMetadataHeaderJson;
+	if (options.toolNamespacesInfo !== undefined) {
+		turnMetadata.tool_namespaces_info = options.toolNamespacesInfo;
+		turnMetadataJson = toAsciiJsonString(turnMetadata);
+	}
 	const clientMetadata: Record<string, string> = {
 		[OPENAI_HEADERS.INSTALLATION_ID]: identity.installationId,
 		session_id: identity.sessionId,
@@ -654,6 +673,7 @@ function createCodexRequestMetadata(
 		...identity,
 		turnId: session.turnId,
 		turnMetadataJson,
+		turnMetadataHeaderJson,
 		clientMetadata,
 	};
 }
@@ -662,8 +682,8 @@ function applyCodexCompatibilityHeaders(headers: Headers, metadata: CodexCompati
 	headers.set(OPENAI_HEADERS.SCOPED_SESSION_ID, metadata.sessionId);
 	headers.set(OPENAI_HEADERS.THREAD_ID, metadata.threadId);
 	headers.set(OPENAI_HEADERS.WINDOW_ID, metadata.windowId);
-	if (metadata.turnMetadataJson) {
-		headers.set(OPENAI_HEADERS.TURN_METADATA, metadata.turnMetadataJson);
+	if (metadata.turnMetadataHeaderJson) {
+		headers.set(OPENAI_HEADERS.TURN_METADATA, metadata.turnMetadataHeaderJson);
 	} else {
 		headers.delete(OPENAI_HEADERS.TURN_METADATA);
 	}
@@ -677,7 +697,21 @@ export function createOpenAICodexCompatibilityMetadata(
 	options: OpenAICodexCompatibilityMetadataOptions,
 ): OpenAICodexCompatibilityMetadata {
 	const providerState = getCodexProviderSessionState(options.providerSessionState);
-	const sessionId = normalizeOpenAIPromptCacheKey(options.sessionId) ?? crypto.randomUUID();
+	const sessionId = getOpenAIResponsesRoutingSessionId({
+		cacheRetention: options.cacheRetention,
+		sessionId: options.sessionId ?? crypto.randomUUID(),
+	});
+	if (!sessionId) {
+		const installationId = getInstallId();
+		const headers = new Headers();
+		if (options.includeInstallationHeader) {
+			headers.set(OPENAI_HEADERS.INSTALLATION_ID, installationId);
+		}
+		return {
+			clientMetadata: { [OPENAI_HEADERS.INSTALLATION_ID]: installationId },
+			headers: Object.fromEntries(headers.entries()),
+		};
+	}
 	const session = getOrCreateCodexMetadataSessionState(sessionId, providerState);
 	const startNewTurn = resolveCodexStartNewTurn(
 		session,
@@ -1381,6 +1415,7 @@ function createCodexRequestContext(
 	options: OpenAICodexResponsesOptions | undefined,
 	contextOptions: {
 		isolateCompactionTransport: boolean;
+		requestKind?: OpenAICodexRequestKind;
 		startNewTurn?: boolean;
 		turnStartedAtUnixMs?: number;
 	},
@@ -1394,7 +1429,15 @@ function createCodexRequestContext(
 	const baseUrl = model.baseUrl || CODEX_BASE_URL;
 	const url = resolveCodexResponsesUrl(baseUrl);
 
-	const transportSessionId = normalizeOpenAIPromptCacheKey(options?.sessionId);
+	const compaction = options?.codexCompaction;
+	const requestKind = contextOptions.requestKind ?? (compaction ? "compaction" : "turn");
+	const transportSessionId =
+		requestKind === "compaction"
+			? getOpenAIResponsesRoutingSessionId({
+					cacheRetention: options?.cacheRetention,
+					sessionId: options?.sessionId,
+				})
+			: normalizeOpenAIPromptCacheKey(options?.sessionId);
 	const codexClientVersion = CODEX_CLIENT_VERSION;
 	const requestHeaders = { ...(model.headers ?? {}), ...(options?.headers ?? {}) };
 	const rawRequestDump: RawHttpRequestDump = {
@@ -1433,28 +1476,41 @@ function createCodexRequestContext(
 		websocketState.turnState = sharedWebsocketState.turnState;
 		websocketState.modelsEtag = sharedWebsocketState.modelsEtag;
 	}
-	const metadataSessionId = transportSessionId ?? crypto.randomUUID();
-	const metadataSession = getOrCreateCodexMetadataSessionState(metadataSessionId, providerSessionState);
-	const compaction = options?.codexCompaction;
-	const requestKind: OpenAICodexRequestKind = compaction ? "compaction" : "turn";
-	const startNewTurn = resolveCodexStartNewTurn(metadataSession, requestKind, compaction, contextOptions.startNewTurn);
+	const metadataSessionId =
+		requestKind === "compaction"
+			? getOpenAIResponsesRoutingSessionId({
+					cacheRetention: options?.cacheRetention,
+					sessionId: options?.sessionId ?? crypto.randomUUID(),
+				})
+			: (transportSessionId ?? crypto.randomUUID());
+	const metadataSession = metadataSessionId
+		? getOrCreateCodexMetadataSessionState(metadataSessionId, providerSessionState)
+		: undefined;
+	const startNewTurn = metadataSession
+		? resolveCodexStartNewTurn(metadataSession, requestKind, compaction, contextOptions.startNewTurn)
+		: (contextOptions.startNewTurn ?? requestKind === "turn");
 	if (websocketState && startNewTurn) {
 		// Codex scopes turn-state to one turn. Mid-turn compaction preserves it;
 		// a pre-turn or standalone compaction starts without it.
 		websocketState.turnState = undefined;
 	}
-	const requestMetadata = createCodexRequestMetadata(metadataSession, requestKind, {
-		startNewTurn,
-		turnStartedAtUnixMs: compaction
-			? startNewTurn || !metadataSession.turnId
-				? Date.now()
-				: undefined
-			: contextOptions.turnStartedAtUnixMs,
-		clientMetadata: transformedBody.client_metadata,
-		parentTurnId: options?.parentTurnId,
-		compaction,
-	});
-	transformedBody.client_metadata = requestMetadata.clientMetadata;
+	const requestMetadata = metadataSession
+		? createCodexRequestMetadata(metadataSession, requestKind, {
+				startNewTurn,
+				turnStartedAtUnixMs: compaction
+					? startNewTurn || !metadataSession.turnId
+						? Date.now()
+						: undefined
+					: contextOptions.turnStartedAtUnixMs,
+				clientMetadata: transformedBody.client_metadata,
+				parentTurnId: options?.parentTurnId,
+				compaction,
+				toolNamespacesInfo: options?.toolNamespacesInfo,
+			})
+		: undefined;
+	transformedBody.client_metadata = requestMetadata?.clientMetadata ?? {
+		[OPENAI_HEADERS.INSTALLATION_ID]: getInstallId(),
+	};
 	return {
 		apiKey,
 		accountId,
@@ -1482,6 +1538,7 @@ async function buildCodexRequestContext(
 	const transformedBody = await buildTransformedCodexRequestBody(model, context, options, promptCacheKey);
 	return createCodexRequestContext(model, transformedBody, options, {
 		isolateCompactionTransport: true,
+		requestKind: options?.codexCompaction ? "compaction" : "turn",
 		startNewTurn: options?.codexCompaction ? undefined : !isCodexWithinTurnContinuation(context),
 		turnStartedAtUnixMs: options?.codexCompaction ? undefined : getCodexTurnStartedAtUnixMs(context),
 	});
@@ -1631,6 +1688,7 @@ export async function openCodexCompactionEventStream(
 	try {
 		requestContext = createCodexRequestContext(model, toCodexRequestBody(body), options, {
 			isolateCompactionTransport: false,
+			requestKind: "compaction",
 		});
 		initial = await openInitialCodexEventStream(model, options, requestSetup, requestContext);
 	} catch (error) {
@@ -1808,6 +1866,7 @@ async function openCodexWebSocketTransport(
 			firstEventTimeoutMs: requestSetup.websocketFirstEventTimeoutMs,
 		},
 		requestSetup.requestSignal,
+		options?.providerDispatchGuard,
 		onSseEvent,
 	);
 	return {
@@ -1984,6 +2043,8 @@ async function handleCodexStreamFailure(context: CodexStreamFailureContext, erro
 	}
 	const result = await AIError.finalize(error, {
 		api: context.model.api,
+		provider: context.model.provider,
+		model: context.model.id,
 		signal: context.options?.signal,
 		rawRequestDump: context.requestContext.rawRequestDump,
 	});
@@ -3673,6 +3734,7 @@ class CodexWebSocketConnection {
 		request: Record<string, unknown>,
 		timeouts: CodexWebSocketRequestTimeouts,
 		signal?: AbortSignal,
+		providerDispatchGuard?: () => void,
 		onSseEvent?: (event: RawSseEvent) => void,
 	): AsyncGenerator<Record<string, unknown>> {
 		if (!this.#socket || this.#socket.readyState !== WebSocket.OPEN) {
@@ -3724,6 +3786,7 @@ class CodexWebSocketConnection {
 			if (!socket || socket.readyState !== WebSocket.OPEN) {
 				throw new CodexWebSocketTransportError(`websocket connection is unavailable`);
 			}
+			providerDispatchGuard?.();
 			try {
 				socket.send(requestPayload);
 			} catch (error) {
@@ -4245,6 +4308,12 @@ function createCodexHeaders(
 	headers.delete("x-api-key");
 	headers.set("Authorization", `Bearer ${accessToken}`);
 	if (accountId) headers.set(OPENAI_HEADERS.ACCOUNT_ID, accountId);
+	// Region-pinned enterprise workspaces answer 401 `Workspace is not authorized
+	// in this region.` when the request's egress region does not match them and
+	// the client did not declare the workspace's residency. The access token
+	// already carries it, so this needs no configuration. A caller-supplied
+	// header still wins: a proxy fronting Codex may want a different value.
+	applyCodexResidencyHeader(headers, accessToken);
 	if (attestation) {
 		headers.set(OPENAI_HEADERS.ATTESTATION, attestation);
 	} else {

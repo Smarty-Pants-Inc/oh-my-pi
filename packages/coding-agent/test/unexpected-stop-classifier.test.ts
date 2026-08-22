@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import * as ai from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
 	classifyUnexpectedStop,
 	isUnexpectedStopCandidate,
@@ -145,6 +146,33 @@ describe("classifyUnexpectedStop", () => {
 		expect(options?.disableReasoning).toBe(true);
 		expect(options?.maxTokens).toBe(4096);
 		expect(options?.maxTokens).toBeGreaterThan(1024);
+	});
+
+	it("disables prompt caching for online classification when cache retention is none", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Claude Sonnet 4.5 model");
+		const settings = Settings.isolated({
+			"providers.unexpectedStopModel": "online",
+			"providers.cacheRetention": "none",
+			modelRoles: { tiny: `${model.provider}/${model.id}` },
+		});
+		const registry = {
+			getAvailable: () => [model],
+			getApiKey: async () => "test-key",
+			resolver: () => async () => "test-key",
+		} as never;
+		const completeSimpleMock = vi.spyOn(ai, "completeSimple").mockResolvedValue({
+			stopReason: "stop",
+			content: [{ type: "text", text: "YES" }],
+		} as never);
+
+		await classifyUnexpectedStop("I will continue with the next command.", {
+			settings,
+			registry,
+			sessionId: "session-1",
+		});
+
+		expect(completeSimpleMock.mock.calls[0]?.[2]?.cacheRetention).toBe("none");
 	});
 });
 

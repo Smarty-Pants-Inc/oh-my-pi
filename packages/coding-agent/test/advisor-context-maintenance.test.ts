@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
-import { Agent, type AgentMessage, type CompactionSummaryMessage, countTokens } from "@oh-my-pi/pi-agent-core";
+import { Agent, type AgentMessage, type CompactionSummaryMessage } from "@oh-my-pi/pi-agent-core";
 import * as compactionModule from "@oh-my-pi/pi-agent-core/compaction";
-import { calculateContextTokens, estimateTokens, resolveThresholdTokens } from "@oh-my-pi/pi-agent-core/compaction";
+import { calculateContextTokens, resolveThresholdTokens } from "@oh-my-pi/pi-agent-core/compaction";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { createMockModel, type MockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -11,6 +11,7 @@ import { estimateToolSchemaTokens } from "@oh-my-pi/pi-coding-agent/modes/utils/
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { createSettingsAwareStreamFn } from "@oh-my-pi/pi-coding-agent/session/settings-stream-fn";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
@@ -66,7 +67,7 @@ describe("AgentSession advisor context maintenance", () => {
 		const settings = Settings.isolated({
 			"advisor.syncBacklog": "1",
 			"compaction.enabled": true,
-			"compaction.strategy": "context-full",
+			"compaction.methodOrder": ["soft"],
 			"contextPromotion.enabled": contextPromotionEnabled,
 		});
 		const agent = new Agent({
@@ -153,7 +154,7 @@ describe("AgentSession advisor context maintenance", () => {
 		const settings = Settings.isolated({
 			"advisor.syncBacklog": "1",
 			"compaction.enabled": true,
-			"compaction.strategy": "context-full",
+			"compaction.methodOrder": ["soft"],
 			"contextPromotion.enabled": false,
 		});
 		settings.setModelRole("advisor", `${nativeModel.provider}/${nativeModel.id}`);
@@ -198,7 +199,8 @@ describe("AgentSession advisor context maintenance", () => {
 		const update = advisorCall.context.messages.find(message => message.role === "user");
 		if (!update) throw new Error("Expected the advisor's incremental update");
 		const threshold = resolveThresholdTokens(CONTEXT_WINDOW, settings.getGroup("compaction"));
-		const providerAndUpdateTokens = calculateContextTokens(anchor.usage) + estimateTokens(update as AgentMessage);
+		const providerAndUpdateTokens =
+			calculateContextTokens(anchor.usage) + advisor.tokenizer.countMessage(update as AgentMessage);
 		expect(calculateContextTokens(anchor.usage)).toBe(CACHE_READ_TOKENS + INPUT_TOKENS + OUTPUT_TOKENS);
 		expect(providerAndUpdateTokens).toBeGreaterThan(threshold);
 
@@ -249,8 +251,10 @@ describe("AgentSession advisor context maintenance", () => {
 		const { advisor, advisorMock, settings } = createHarness();
 		const seed: AgentMessage = { role: "user", content: "small stored advisor message", timestamp: 1 };
 		advisor.state.messages.push(seed);
-		const storedTokens = estimateTokens(seed, { excludeEncryptedReasoning: true });
-		const fixedPrefixTokens = countTokens(advisor.state.systemPrompt) + estimateToolSchemaTokens(advisor.state.tools);
+		const storedTokens = advisor.tokenizer.countMessage(seed, { excludeEncryptedReasoning: true });
+		const fixedPrefixTokens =
+			advisor.tokenizer.countTokens(advisor.state.systemPrompt) +
+			estimateToolSchemaTokens(advisor.state.tools, advisor.tokenizer);
 		const threshold = storedTokens + Math.floor(fixedPrefixTokens / 2);
 		settings.set("compaction.thresholdTokens", threshold);
 
@@ -259,7 +263,7 @@ describe("AgentSession advisor context maintenance", () => {
 		const advisorCall = advisorMock.calls[0];
 		const update = advisorCall.context.messages.find(message => message.role === "user");
 		if (!update) throw new Error("Expected the advisor's incremental update");
-		const messagesOnlyTokens = storedTokens + estimateTokens(update as AgentMessage);
+		const messagesOnlyTokens = storedTokens + advisor.tokenizer.countMessage(update as AgentMessage);
 		expect(messagesOnlyTokens).toBeLessThan(threshold);
 		expect(messagesOnlyTokens + fixedPrefixTokens).toBeGreaterThan(threshold);
 		expect(JSON.stringify(advisor.state.messages)).not.toContain("small stored advisor message");
@@ -305,9 +309,9 @@ describe("AgentSession advisor context maintenance", () => {
 		// `compact(...)` request that bypasses the advisor `Agent`, so the metadata
 		// resolver installed on the agent never runs for it. The direct call must
 		// still emit the advisor's `metadata.user_id` session identity.
-		// The advisor model is the first compaction candidate; registering the mock
-		// API lets the compaction one-shot's `completeSimple` route to it so the
-		// summarization request actually reaches the mock (and its recorded calls).
+		// The advisor model uses the same settings-aware stream transport as its
+		// ordinary turns, so the direct compaction one-shot must preserve session
+		// request policy as well as reaching the mock transport.
 		registerMockApi();
 		const compactionStarted = Promise.withResolvers<void>();
 		const releaseCompaction = Promise.withResolvers<void>();
@@ -346,8 +350,9 @@ describe("AgentSession advisor context maintenance", () => {
 		const settings = Settings.isolated({
 			"advisor.syncBacklog": "1",
 			"compaction.enabled": true,
-			"compaction.strategy": "context-full",
+			"compaction.methodOrder": ["soft"],
 			"contextPromotion.enabled": false,
+			"providers.cacheRetention": "long",
 		});
 		const agent = new Agent({
 			getApiKey: () => "test-key",
@@ -360,7 +365,7 @@ describe("AgentSession advisor context maintenance", () => {
 			settings,
 			modelRegistry,
 			advisorTools: [],
-			advisorStreamFn: advisorMock.stream,
+			advisorStreamFn: createSettingsAwareStreamFn(settings, advisorMock.stream),
 		});
 		settings.setModelRole("advisor", "anthropic/claude-sonnet-4-5");
 		expect(session.setAdvisorEnabled(true)).toBe(true);
@@ -405,6 +410,7 @@ describe("AgentSession advisor context maintenance", () => {
 		);
 		expect(compactionCalls.length).toBeGreaterThan(0);
 		expect(compactionCalls.every(call => call.options?.signal instanceof AbortSignal)).toBe(true);
+		expect(compactionCalls.every(call => call.options?.cacheRetention === "long")).toBe(true);
 
 		// Every advisor request — the compaction one-shot and the advisor turn —
 		// carries the advisor's own provider session id via metadata.user_id.

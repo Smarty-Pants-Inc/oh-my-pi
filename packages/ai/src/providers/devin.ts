@@ -1,32 +1,34 @@
 import { gunzipSync, gzipSync } from "node:zlib";
-import { create, fromBinary, fromJson, type JsonValue, toBinary, toJson } from "@bufbuild/protobuf";
-import {
-	ChatMessageRequestType,
-	GetChatMessageRequestSchema,
-	GetChatMessageResponseSchema,
-} from "@oh-my-pi/pi-catalog/discovery/devin-gen/exa/api_server_pb/api_server_pb";
-import {
-	GetUserJwtRequestSchema,
-	GetUserJwtResponseSchema,
-} from "@oh-my-pi/pi-catalog/discovery/devin-gen/exa/auth_pb/auth_pb";
+
 import {
 	CacheControlType,
 	type ChatMessagePrompt,
 	ChatMessagePromptSchema,
-	ChatToolChoiceSchema,
-	ChatToolDefinitionSchema,
-	PromptCacheOptionsSchema,
-} from "@oh-my-pi/pi-catalog/discovery/devin-gen/exa/chat_pb/chat_pb";
-import {
+	ChatMessageRequestType,
 	ChatMessageSource,
 	type ChatToolCall,
 	ChatToolCallSchema,
+	ChatToolChoiceSchema,
+	ChatToolDefinitionSchema,
 	CompletionConfigurationSchema,
 	ConversationalPlannerMode,
+	GetChatMessageRequestSchema,
+	GetChatMessageResponseSchema,
+	GetUserJwtRequestSchema,
+	GetUserJwtResponseSchema,
 	ImageDataSchema,
 	MetadataSchema,
+	PromptCacheOptionsSchema,
 	StopReason,
-} from "@oh-my-pi/pi-catalog/discovery/devin-gen/exa/codeium_common_pb/codeium_common_pb";
+} from "@oh-my-pi/pi-catalog/discovery/devin-proto";
+import {
+	create,
+	fromBinary,
+	fromJson,
+	type JsonValue,
+	toBinary,
+	toJson,
+} from "@oh-my-pi/pi-catalog/discovery/protobuf";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import { logger, parseStreamingJson, parseStreamingJsonThrottled } from "@oh-my-pi/pi-utils";
 import { mapContextInstructionsForModel } from "../context-instructions";

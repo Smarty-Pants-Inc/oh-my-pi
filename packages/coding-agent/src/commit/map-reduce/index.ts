@@ -1,5 +1,5 @@
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
-import type { Api, ApiKey, Model } from "@oh-my-pi/pi-ai";
+import type { Api, ApiKey, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
 import { $env } from "@oh-my-pi/pi-utils";
 import { parseFileDiffs } from "../../commit/git/diff";
 import type { ConventionalAnalysis } from "../../commit/types";
@@ -23,6 +23,7 @@ export interface MapReduceInput {
 	model: Model<Api>;
 	apiKey: ApiKey;
 	thinkingLevel?: ThinkingLevel;
+	cacheRetention?: SimpleStreamOptions["cacheRetention"];
 	smolModel: Model<Api>;
 	smolApiKey: ApiKey;
 	smolThinkingLevel?: ThinkingLevel;
@@ -54,6 +55,7 @@ export async function runMapReduceAnalysis(input: MapReduceInput): Promise<Conve
 		model: input.smolModel,
 		apiKey: input.smolApiKey,
 		thinkingLevel: input.smolThinkingLevel,
+		cacheRetention: input.cacheRetention,
 		files: fileDiffs,
 		config: input.settings,
 	});
@@ -61,6 +63,7 @@ export async function runMapReduceAnalysis(input: MapReduceInput): Promise<Conve
 		model: input.model,
 		apiKey: input.apiKey,
 		thinkingLevel: input.thinkingLevel,
+		cacheRetention: input.cacheRetention,
 		observations,
 		stat: input.stat,
 		scopeCandidates: input.scopeCandidates,

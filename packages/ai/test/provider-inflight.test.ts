@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { clearCustomApis } from "@oh-my-pi/pi-ai/api-registry";
+import { clearCustomApis, registerCustomApi } from "@oh-my-pi/pi-ai/api-registry";
+import { coworkFetch } from "@oh-my-pi/pi-ai/providers/cowork-fetch";
 import { createMockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
 import {
 	__providerInFlightForTesting,
@@ -10,6 +11,8 @@ import {
 	streamSimple,
 } from "@oh-my-pi/pi-ai/stream";
 import type { Context } from "@oh-my-pi/pi-ai/types";
+import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
 
 function context(): Context {
 	return {
@@ -94,6 +97,123 @@ describe("provider in-flight request limits", () => {
 		expect(secondMessage.content).toEqual([{ type: "text", text: "reply 2" }]);
 		expect(maxActive).toBe(1);
 		expect(mock.calls).toHaveLength(2);
+	});
+
+	test("revalidates after waiting and vetoes stale provider dispatch", async () => {
+		registerMockApi();
+		const providerDir = limiterDir("tests");
+		const externalLease = path.join(providerDir, "external");
+		await fs.mkdir(externalLease, { recursive: true });
+		await Bun.write(
+			path.join(externalLease, "info.json"),
+			JSON.stringify({ pid: process.pid, timestamp: Date.now(), token: "external" }),
+		);
+		const mock = createMockModel({ provider: "tests", responses: [{ content: ["must not dispatch"] }] });
+		let valid = true;
+		const waiting = nextLimiterWait();
+		const guarded = streamSimple(mock.model, context(), {
+			maxInFlightRequests: { tests: 1 },
+			providerDispatchGuard: () => {
+				if (!valid) throw new Error("request became stale while queued");
+			},
+		});
+
+		await waiting;
+		valid = false;
+		await fs.rm(externalLease, { recursive: true, force: true });
+
+		await expect(guarded.result()).rejects.toThrow("request became stale while queued");
+		expect(mock.calls).toHaveLength(0);
+	});
+
+	test("revalidates after asynchronous provider preparation", async () => {
+		const preparationStarted = Promise.withResolvers<void>();
+		const releasePreparation = Promise.withResolvers<void>();
+		let valid = true;
+		let fetchCalls = 0;
+		registerCustomApi("deferred-fetch-test", (_model, _context, options) => {
+			const stream = new AssistantMessageEventStream();
+			void (async () => {
+				preparationStarted.resolve();
+				await releasePreparation.promise;
+				try {
+					await options?.fetch?.("https://example.invalid/provider");
+				} catch (error) {
+					stream.fail(error);
+				}
+			})();
+			return stream;
+		});
+		const model = buildModel({
+			id: "deferred-fetch-model",
+			name: "Deferred Fetch Model",
+			api: "deferred-fetch-test",
+			provider: "tests",
+			baseUrl: "https://example.invalid",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 200_000,
+			maxTokens: 8_192,
+		});
+		const guarded = streamSimple(model, context(), {
+			apiKey: "test-key",
+			providerDispatchGuard: () => {
+				if (!valid) throw new Error("request became stale during provider preparation");
+			},
+			fetch: async () => {
+				fetchCalls++;
+				return new Response(null, { status: 200 });
+			},
+		});
+
+		await preparationStarted.promise;
+		valid = false;
+		releasePreparation.resolve();
+
+		await expect(guarded.result()).rejects.toThrow("request became stale during provider preparation");
+		expect(fetchCalls).toBe(0);
+	});
+
+	test("revalidates after Cowork agent acquisition", async () => {
+		registerCustomApi("cowork-guard-test", (_model, _context, options) => {
+			const stream = new AssistantMessageEventStream();
+			void options
+				?.fetch?.("https://api.anthropic.com/v1/messages", {
+					method: "POST",
+					headers: { "content-type": "application/json" },
+					body: "{}",
+				})
+				.then(() => stream.fail(new Error("unexpected provider dispatch")))
+				.catch(error => stream.fail(error));
+			return stream;
+		});
+		const model = buildModel({
+			id: "cowork-guard-model",
+			name: "Cowork Guard Model",
+			api: "cowork-guard-test",
+			provider: "tests",
+			baseUrl: "https://api.anthropic.com",
+			input: ["text"],
+			reasoning: false,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 200_000,
+			maxTokens: 8_192,
+		});
+		let valid = true;
+		let guardCalls = 0;
+		const guarded = streamSimple(model, context(), {
+			apiKey: "test-key",
+			fetch: coworkFetch,
+			providerDispatchGuard: () => {
+				guardCalls++;
+				if (guardCalls === 2) queueMicrotask(() => (valid = false));
+				if (!valid) throw new Error("request became stale during Cowork agent acquisition");
+			},
+		});
+
+		await expect(guarded.result()).rejects.toThrow("request became stale during Cowork agent acquisition");
+		expect(guardCalls).toBe(3);
 	});
 
 	test("releases its provider lease before reporting terminal completion", async () => {

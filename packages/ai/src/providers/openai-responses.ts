@@ -58,6 +58,7 @@ import {
 	createOpenAIReasoningEffortFallbackKey,
 	createOpenAIReasoningEffortFallbackState,
 	getOpenAIReasoningEffortFallback,
+	mergeOpenAIReasoningEffortFallback,
 	type OpenAIReasoningEffortFallback,
 	type OpenAIReasoningEffortFallbackState,
 	rememberOpenAIReasoningEffortFallback,
@@ -100,6 +101,7 @@ import {
 	resolveOpenAIOutputTokenParam,
 	resolveOpenAIRequestSetup,
 	resolveOpenAIResponsesOutputClamp,
+	shouldDropAutoToolChoiceForReasoning,
 	shouldRetryWithoutStrictTools,
 } from "./openai-shared";
 
@@ -611,13 +613,22 @@ const streamOpenAIResponsesOnce = (
 							const retryMarker = `${activeReasoningEffortFallbackKey}:${String(reasoningEffortFallback)}`;
 							if (attemptedReasoningEffortFallbacks.has(retryMarker)) throw error;
 							attemptedReasoningEffortFallbacks.add(retryMarker);
-							requestReasoningEffortFallbacks.set(activeReasoningEffortFallbackKey, reasoningEffortFallback);
-							applyOpenAIReasoningEffortFallback(chained.params, reasoningEffortFallback);
-							applyOpenAIReasoningEffortFallback(activeParams, reasoningEffortFallback);
+							const accumulatedReasoningEffortFallback = mergeOpenAIReasoningEffortFallback(
+								requestReasoningEffortFallbacks.has(activeReasoningEffortFallbackKey)
+									? requestReasoningEffortFallbacks.get(activeReasoningEffortFallbackKey)
+									: getOpenAIReasoningEffortFallback(providerSessionState, activeReasoningEffortFallbackKey),
+								reasoningEffortFallback,
+							);
+							requestReasoningEffortFallbacks.set(
+								activeReasoningEffortFallbackKey,
+								accumulatedReasoningEffortFallback,
+							);
+							applyOpenAIReasoningEffortFallback(chained.params, accumulatedReasoningEffortFallback);
+							applyOpenAIReasoningEffortFallback(activeParams, accumulatedReasoningEffortFallback);
 							activeRawRequestDump.body = chained.params;
 							pendingReasoningEffortFallback = {
 								key: activeReasoningEffortFallbackKey,
-								fallback: reasoningEffortFallback,
+								fallback: accumulatedReasoningEffortFallback,
 							};
 							continue;
 						}
@@ -1114,10 +1125,17 @@ function applyOpenAIResponsesPromptCachePolicy(
 	options: OpenAIResponsesOptions | undefined,
 	statefulCacheBaseline?: ResponseInput,
 ): void {
+	const cacheRetention = resolveCacheRetention(options?.cacheRetention);
+	if (cacheRetention === "none") {
+		if (model.compat.supportsPromptCacheBreakpoints) {
+			params.prompt_cache_options = { mode: "explicit" };
+		}
+		return;
+	}
 	const promptCache = options?.promptCache;
-	if (!promptCache || resolveCacheRetention(options?.cacheRetention) === "none") return;
+	if (!promptCache && cacheRetention !== "long") return;
 	if (!model.compat.supportsPromptCacheBreakpoints) {
-		if (promptCache.mode === "explicit") {
+		if (promptCache?.mode === "explicit") {
 			throw new AIError.ConfigurationError(
 				`OpenAI explicit prompt caching is unsupported for ${model.provider}/${model.id}; enable compat.supportsPromptCacheBreakpoints only for a compatible endpoint.`,
 			);
@@ -1125,11 +1143,12 @@ function applyOpenAIResponsesPromptCachePolicy(
 		return;
 	}
 
+	const mode = promptCache?.mode ?? "implicit";
 	params.prompt_cache_options = {
-		mode: promptCache.mode,
-		ttl: promptCache.ttl ?? model.compat.promptCacheBreakpointTtl,
+		mode,
+		ttl: promptCache?.ttl ?? model.compat.promptCacheBreakpointTtl,
 	};
-	if (promptCache.mode === "explicit" && promptCache.breakpoint !== "none")
+	if (mode === "explicit" && promptCache?.breakpoint !== "none")
 		markLatestStableResponsesCacheBreakpoint(params.input, statefulCacheBaseline);
 }
 
@@ -1210,11 +1229,8 @@ export function buildParams(
 		instructions: systemInstructions,
 		stream: true,
 		prompt_cache_key: promptCacheKey,
-		prompt_cache_retention: promptCacheKey
-			? cacheRetention === "long" && model.compat.supportsLongPromptCacheRetention
-				? "24h"
-				: undefined
-			: undefined,
+		prompt_cache_retention:
+			cacheRetention === "long" && model.compat.supportsLongPromptCacheRetention ? "24h" : undefined,
 		// Gateway routing: OpenRouter-only Responses wire field for sticky upstream
 		// routing + observability grouping; no equivalent on direct OpenAI.
 		session_id: model.compat.isOpenRouterHost ? getOpenRouterResponsesSessionId(options) : undefined,
@@ -1283,6 +1299,10 @@ export function buildParams(
 				}
 			}
 		}
+	}
+
+	if (shouldDropAutoToolChoiceForReasoning(model, model.compat, params.tool_choice, options)) {
+		delete params.tool_choice;
 	}
 
 	const reasoningPolicy = resolveOpenAICompatPolicy(model, {

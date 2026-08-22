@@ -11,10 +11,11 @@ function getModelOrThrow(id: string) {
 	return model;
 }
 
-function createSettings(modelRoles: Record<string, string>) {
+function createSettings(modelRoles: Record<string, string>, cacheRetention = "auto") {
 	return {
 		get(path: string) {
 			if (path === "providers.tinyModel") return "online";
+			if (path === "providers.cacheRetention") return cacheRetention;
 			return undefined;
 		},
 		getModelRole(role: string) {
@@ -37,10 +38,13 @@ afterEach(() => {
 describe("role thinking helper propagation", () => {
 	it("passes smol-role thinking to commit message generation", async () => {
 		const model = getModelOrThrow("claude-sonnet-4-5");
-		const settings = createSettings({
-			default: `${model.provider}/${model.id}:high`,
-			smol: "@default:minimal",
-		});
+		const settings = createSettings(
+			{
+				default: `${model.provider}/${model.id}:high`,
+				smol: "@default:minimal",
+			},
+			"long",
+		);
 		const registry = {
 			getAvailable: () => [model],
 			getApiKey: async () => "test-key",
@@ -56,6 +60,7 @@ describe("role thinking helper propagation", () => {
 		expect(completeSimpleMock.mock.calls[0]?.[2]).toMatchObject({
 			reasoning: Effort.Minimal,
 			maxTokens: 1024,
+			cacheRetention: "long",
 		});
 	});
 
