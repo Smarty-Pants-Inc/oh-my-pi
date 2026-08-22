@@ -3,9 +3,11 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { AudioCapture } from "@oh-my-pi/pi-natives";
 import { prompt } from "@oh-my-pi/pi-utils";
+import type { AgentClosureRejection } from "../extensibility/shared-events";
 import type { AgentSession } from "../session/agent-session";
 import type { AgentSessionEvent } from "../session/agent-session-events";
 import { LIVE_DELEGATION_MESSAGE_TYPE } from "../session/messages";
+import agentClosureRejectedTemplate from "./prompts/agent-closure-rejected.md" with { type: "text" };
 import agentFinalMessageTemplate from "./prompts/agent-final-message.md" with { type: "text" };
 import liveInstructionsTemplate from "./prompts/live-instructions.md" with { type: "text" };
 import {
@@ -320,6 +322,10 @@ export class LiveSessionController {
 			return;
 		}
 		if (event.type !== "agent_end" || event.isTerminal === false) return;
+		if (event.closureRejected) {
+			this.#appendClosureRejection(event.closureRejected);
+			return;
+		}
 		this.#appendFinalResponse(event.messages);
 	}
 
@@ -346,6 +352,17 @@ export class LiveSessionController {
 				this.#queueSend(buildDelegationContextAppend(delegationId, chunk));
 			}
 			break;
+		}
+		this.#activeDelegationId = undefined;
+		this.#refreshAudioPhase();
+	}
+
+	#appendClosureRejection(closureRejected: AgentClosureRejection): void {
+		const delegationId = this.#activeDelegationId;
+		if (!delegationId) return;
+		const finalContext = prompt.render(agentClosureRejectedTemplate, { count: closureRejected.todos.length });
+		for (const chunk of chunkLiveContext(finalContext)) {
+			this.#queueSend(buildDelegationContextAppend(delegationId, chunk));
 		}
 		this.#activeDelegationId = undefined;
 		this.#refreshAudioPhase();

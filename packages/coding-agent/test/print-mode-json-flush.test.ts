@@ -15,6 +15,8 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { runPrintMode } from "@oh-my-pi/pi-coding-agent/modes/print-mode";
 import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import * as telemetryExport from "@oh-my-pi/pi-coding-agent/telemetry-export";
+import { postmortem } from "@oh-my-pi/pi-utils";
 
 interface FlushHarness {
 	session: AgentSession;
@@ -146,5 +148,55 @@ describe("print-mode JSON flush (#7635)", () => {
 		// The complete payload survives — not a pipe-buffer-sized prefix.
 		expect(agentEndLine).toContain(payload);
 		expect(JSON.parse(agentEndLine as string)).toMatchObject({ type: "agent_end" });
+	});
+
+	it("emits a rejected terminal closure before exiting non-zero", async () => {
+		const writes: string[] = [];
+		vi.spyOn(process.stdout, "write").mockImplementation((...args: unknown[]) => {
+			const chunk = args[0];
+			writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk as Uint8Array).toString());
+			const callback = args[args.length - 1];
+			if (typeof callback === "function") callback(null);
+			return true;
+		});
+		let agentEndWrittenBeforeQuit = false;
+		const order: string[] = [];
+		const flushSpy = vi.spyOn(telemetryExport, "flushTelemetryExport").mockImplementation(async () => {
+			order.push("flush");
+		});
+		const quitSpy = vi.spyOn(postmortem, "quit").mockImplementation(async code => {
+			agentEndWrittenBeforeQuit = writes.some(line => line.includes('"type":"agent_end"'));
+			order.push(`quit:${code}`);
+		});
+
+		const harness = createFlushHarness();
+		const run = runPrintMode(harness.session, { mode: "json", initialMessage: "hello" });
+		await harness.promptStarted;
+		harness.emit({
+			type: "agent_end",
+			messages: [],
+			closureRejected: {
+				reason: "stale_todos",
+				todos: [{ content: "Finish the implementation", status: "pending" }],
+			},
+		} as unknown as AgentSessionEvent);
+		harness.emit({ type: "agent_end", messages: [] } as unknown as AgentSessionEvent);
+		harness.resolvePrompt();
+
+		await run;
+
+		const agentEnd = writes.find(line => line.includes('"type":"agent_end"'));
+		expect(agentEndWrittenBeforeQuit).toBe(true);
+		expect(flushSpy).toHaveBeenCalledTimes(1);
+		expect(quitSpy).toHaveBeenCalledWith(1);
+		expect(order).toEqual(["flush", "quit:1"]);
+		expect(harness.disposed()).toBe(true);
+		expect(JSON.parse(agentEnd as string)).toMatchObject({
+			type: "agent_end",
+			closureRejected: {
+				reason: "stale_todos",
+				todos: [{ content: "Finish the implementation", status: "pending" }],
+			},
+		});
 	});
 });

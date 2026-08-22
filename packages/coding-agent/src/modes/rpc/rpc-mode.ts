@@ -145,12 +145,11 @@ export function reportLocalOnlyPromptResult(input: {
 	onError: (error: Error) => void;
 	hasExtensionAgentMessageTask?: () => boolean;
 	waitForExtensionAgentMessageTasks?: () => Promise<void>;
-}): void {
-	void input.prompt
+}): Promise<void> {
+	return input.prompt
 		.then(async agentInvoked => {
-			if (agentInvoked) return;
 			await input.waitForExtensionAgentMessageTasks?.();
-			if (!input.hasExtensionAgentMessageTask?.()) {
+			if (!agentInvoked && !input.hasExtensionAgentMessageTask?.()) {
 				input.output({ type: "prompt_result", id: input.id, agentInvoked: false });
 			}
 		})
@@ -237,9 +236,9 @@ export function watchAndReportLocalOnlyPromptResult(input: {
 	output: (obj: object) => void;
 	onError: (error: Error) => void;
 	extensionUserMessageTracker: RpcExtensionUserMessageTracker;
-}): void {
+}): Promise<void> {
 	const trackedPrompt = input.extensionUserMessageTracker.watchPrompt(input.startPrompt);
-	reportLocalOnlyPromptResult({
+	return reportLocalOnlyPromptResult({
 		id: input.id,
 		prompt: trackedPrompt.prompt,
 		output: input.output,
@@ -304,17 +303,17 @@ export function dispatchRpcControlFrame(parsed: unknown, deps: RpcInputFrameDeps
 /**
  * Dispatch a single parsed frame from the RPC input stream.
  *
- * Bash commands are dispatched in the background so the caller can keep reading
- * subsequent frames while a shell command is still running. This lets a client
- * send `abort_bash` while a long-running `bash` is in flight. Response
- * correlation is preserved via each command's `id`; ordering across concurrent
- * commands is not guaranteed and clients MUST match on `id`.
+ * Long-running commands are dispatched in the background so the caller can
+ * keep reading frames that must be able to overtake them. `bash` permits
+ * `abort_bash`; `wait_for_idle` permits `abort`. Response correlation is
+ * preserved via each command's `id`; ordering across concurrent commands is
+ * not guaranteed and clients MUST match on `id`.
  *
  * @returns `undefined` when the frame was routed to a side-channel handler
  *   (extension UI response, host tool/URI frames) or dispatched in the
- *   background (`bash`). Otherwise a promise that resolves once the response
- *   for the command has been emitted via `output`. Errors from `handleCommand`
- *   on non-`bash` commands propagate; the caller is expected to wrap them.
+ *   background (`bash`, `wait_for_idle`). Otherwise a promise that resolves
+ *   once the response for the command has been emitted via `output`. Errors
+ *   from ordinary commands propagate; the caller is expected to wrap them.
  */
 export function dispatchRpcInputFrame(parsed: unknown, deps: RpcInputFrameDeps): Promise<void> | undefined {
 	if (dispatchRpcControlFrame(parsed, deps)) return undefined;
@@ -324,17 +323,16 @@ export function dispatchRpcInputFrame(parsed: unknown, deps: RpcInputFrameDeps):
 	// the union here.
 	const command = parsed as RpcCommand;
 
-	// `bash` can run for a long time. Dispatch it in the background so a
-	// subsequent `abort_bash` frame can be read and handled without waiting
-	// for the shell command to finish on its own. The response is emitted
-	// when `handleCommand` resolves; clients correlate via `command.id`.
-	if (command.type === "bash") {
+	// Keep the input reader moving while a long-running operation waits so its
+	// cancellation command can overtake it. The response is emitted when
+	// `handleCommand` resolves; clients correlate via `command.id`.
+	if (command.type === "bash" || command.type === "wait_for_idle") {
 		const task = (async () => {
 			try {
 				deps.output(await deps.handleCommand(command));
 			} catch (err: unknown) {
 				const message = err instanceof Error ? err.message : String(err);
-				deps.output(deps.errorResponse(command.id, "bash", message));
+				deps.output(deps.errorResponse(command.id, command.type, message));
 			}
 		})();
 		deps.trackBackgroundTask?.(task);
@@ -366,6 +364,19 @@ export class RpcInputDispatcher {
 			const command = parsed as RpcCommand;
 			if (command.type === "bash") {
 				dispatchRpcInputFrame(command, this.#deps);
+				return;
+			}
+			if (command.type === "wait_for_idle") {
+				// Start only after every earlier serial command has been admitted, but
+				// do not extend the serial tail: a later abort must be able to overtake
+				// the barrier while the active run is still settling.
+				const launch = this.#tail.then(() => {
+					dispatchRpcInputFrame(command, this.#deps);
+				});
+				this.#tasks.add(launch);
+				void launch.finally(() => {
+					this.#tasks.delete(launch);
+				});
 				return;
 			}
 
@@ -673,6 +684,7 @@ export async function runRpcMode(
 	process.env.PI_NOTIFICATIONS = "off";
 
 	const frameEncoder = new RpcFrameEncoder();
+	let closureRejectionSupported = false;
 	// Ordered stdout writer honoring backpressure: chunked v2 frames are produced
 	// lazily by the encoder and written one physical line at a time, so a near-limit
 	// logical frame never materializes its full base64 transport in memory.
@@ -949,8 +961,14 @@ export async function runRpcMode(
 		uiContext: rpcUiContext,
 	});
 
-	// Output all agent events as JSON
+	// Forward closure failures only after the client opts in. Older v1/v2
+	// clients otherwise treat every agent_end as success, so withhold it and
+	// leave their completion wait fail-closed instead.
 	session.subscribe(event => {
+		if (event.type === "agent_end" && event.closureRejected && !closureRejectionSupported) {
+			output({ type: "rpc_frame_error", error: "Completion rejected; upgrade the RPC client" });
+			return;
+		}
 		output(event);
 	});
 
@@ -972,6 +990,18 @@ export async function runRpcMode(
 	});
 	await emitAvailableCommandsUpdate();
 
+	const pendingPromptTasks = new Set<Promise<void>>();
+	const trackPromptTask = (task: Promise<void>): void => {
+		pendingPromptTasks.add(task);
+		void task.then(
+			() => pendingPromptTasks.delete(task),
+			() => pendingPromptTasks.delete(task),
+		);
+	};
+	const waitForAcceptedPromptTasks = async (): Promise<void> => {
+		await Promise.allSettled(Array.from(pendingPromptTasks));
+	};
+
 	// Handle a single command
 	const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
 		const id = command.id;
@@ -980,7 +1010,12 @@ export async function runRpcMode(
 			case "negotiate_protocol": {
 				if (command.protocolVersion !== 2)
 					return error(id, "negotiate_protocol", `Unsupported RPC protocol version: ${command.protocolVersion}`);
-				return success(id, "negotiate_protocol", { protocolVersion: 2 });
+				closureRejectionSupported = command.closureRejection === true;
+				return success(id, "negotiate_protocol", {
+					protocolVersion: 2,
+					idleBarrier: true,
+					...(closureRejectionSupported ? { closureRejection: true } : {}),
+				});
 			}
 
 			// =================================================================
@@ -1000,7 +1035,11 @@ export async function runRpcMode(
 					output: text => output({ type: "command_output", text }),
 					refreshCommands: emitAvailableCommandsUpdate,
 					reloadPlugins: reloadPluginState,
-					runCommandInBackground: task => shutdownCoordinator.track(task()),
+					runCommandInBackground: task => {
+						const pending = task();
+						trackPromptTask(pending);
+						shutdownCoordinator.track(pending);
+					},
 					notifyTitleChanged: async () => {
 						output({ type: "session_info_update", title: session.sessionName, sessionId: session.sessionId });
 					},
@@ -1010,13 +1049,15 @@ export async function runRpcMode(
 				});
 				if (builtinResult !== false) {
 					if ("prompt" in builtinResult) {
-						watchAndReportLocalOnlyPromptResult({
-							id,
-							startPrompt: () => session.prompt(builtinResult.prompt, { images: command.images }),
-							output,
-							onError: promptError => output(error(id, "prompt", promptError.message)),
-							extensionUserMessageTracker,
-						});
+						trackPromptTask(
+							watchAndReportLocalOnlyPromptResult({
+								id,
+								startPrompt: () => session.prompt(builtinResult.prompt, { images: command.images }),
+								output,
+								onError: promptError => output(error(id, "prompt", promptError.message)),
+								extensionUserMessageTracker,
+							}),
+						);
 						return success(id, "prompt");
 					}
 					// A consumed builtin is normally local-only, but some (e.g.
@@ -1029,17 +1070,19 @@ export async function runRpcMode(
 				// Don't await - events will stream
 				// Extension commands are executed immediately, file prompt templates are expanded
 				// If streaming and streamingBehavior specified, queues via steer/followUp
-				watchAndReportLocalOnlyPromptResult({
-					id,
-					startPrompt: () =>
-						session.prompt(command.message, {
-							images: command.images,
-							streamingBehavior: command.streamingBehavior,
-						}),
-					output,
-					onError: promptError => output(error(id, "prompt", promptError.message)),
-					extensionUserMessageTracker,
-				});
+				trackPromptTask(
+					watchAndReportLocalOnlyPromptResult({
+						id,
+						startPrompt: () =>
+							session.prompt(command.message, {
+								images: command.images,
+								streamingBehavior: command.streamingBehavior,
+							}),
+						output,
+						onError: promptError => output(error(id, "prompt", promptError.message)),
+						extensionUserMessageTracker,
+					}),
+				);
 				return success(id, "prompt");
 			}
 
@@ -1058,11 +1101,23 @@ export async function runRpcMode(
 				return success(id, "abort");
 			}
 
+			case "wait_for_idle": {
+				await waitForAcceptedPromptTasks();
+				await session.waitForIdle();
+				return success(id, "wait_for_idle");
+			}
+
 			case "abort_and_prompt": {
 				await session.abort({ reason: USER_INTERRUPT_LABEL });
-				session
-					.prompt(command.message, { images: command.images })
-					.catch(e => output(error(id, "abort_and_prompt", e.message)));
+				trackPromptTask(
+					watchAndReportLocalOnlyPromptResult({
+						id,
+						startPrompt: () => session.prompt(command.message, { images: command.images }),
+						output,
+						onError: promptError => output(error(id, "abort_and_prompt", promptError.message)),
+						extensionUserMessageTracker,
+					}),
+				);
 				return success(id, "abort_and_prompt");
 			}
 
@@ -1455,7 +1510,7 @@ export async function runRpcMode(
 	};
 
 	// Deferred shutdown (pi.shutdown() from an extension) must not kill the
-	// process while a background-dispatched bash still owes the client its
+	// process while a background-dispatched command still owes the client its
 	// response frame. The coordinator drains tracked tasks before exiting and
 	// re-checks the request as each task settles.
 	const shutdownCoordinator = new RpcShutdownCoordinator({
@@ -1488,11 +1543,11 @@ export async function runRpcMode(
 	});
 
 	// Keep the stdin reader moving: side-channel frames dispatch immediately,
-	// ordinary commands serialize through inputDispatcher, and bash remains
-	// background-dispatched so abort_bash can overtake it. Frames are read
-	// line-by-line by readRpcInputFrames so a single malformed line is reported
-	// as an error frame and the loop keeps running instead of throwing out of
-	// the reader and killing the whole process (issue #5194).
+	// ordinary commands serialize through inputDispatcher, and long-running
+	// cancellation barriers run in the background. Frames are read line-by-line
+	// by readRpcInputFrames so a single malformed line is reported as an error
+	// frame and the loop keeps running instead of throwing out of the reader and
+	// killing the whole process (issue #5194).
 	await readRpcInputFrames(
 		input ?? Bun.stdin.stream(),
 		parsed => inputDispatcher.dispatch(parsed),

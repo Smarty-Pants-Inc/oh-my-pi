@@ -11,6 +11,7 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import type { AgentClosureRejection } from "@oh-my-pi/pi-coding-agent/extensibility/shared-events";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
@@ -27,6 +28,7 @@ import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 function yieldEmittingSession(
 	initialTools: string[] = ["read", "yield"],
 	modelSwitch?: { from: Model; to: Model },
+	closureRejected?: AgentClosureRejection,
 ): AgentSession {
 	const listeners: Array<(event: AgentSessionEvent) => void> = [];
 	let activeTools = initialTools;
@@ -73,6 +75,11 @@ function yieldEmittingSession(
 					},
 					isError: false,
 				});
+			}
+			if (closureRejected) {
+				for (const listener of listeners) {
+					listener({ type: "agent_end", messages: [], closureRejected });
+				}
 			}
 		},
 		waitForIdle: async () => {},
@@ -334,6 +341,27 @@ describe("runSubprocess per-agent prewalk", () => {
 
 		expect(result.exitCode).toBe(0);
 		expect(session.getActiveToolNames()).toContain("todo");
+	});
+
+	it("fails a prewalk subagent yield when terminal closure rejects stale todos", async () => {
+		const session = yieldEmittingSession(["read", "todo", "yield"], undefined, {
+			reason: "stale_todos",
+			todos: [{ content: "Finish prewalk task", status: "pending" }],
+		});
+		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+
+		const result = await runSubprocess({
+			...baseOptions("subagent-prewalk-stale-todos", Settings.isolated()),
+			agent: {
+				...baseAgent,
+				model: [`${primary.provider}/${primary.id}`],
+				prewalk: `${target.provider}/${target.id}`,
+			},
+		});
+
+		expect(spy.mock.calls[0]?.[0]?.prewalk?.target.id).toBe(target.id);
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toBe("Subagent completion rejected: 1 incomplete todo item(s) remain.");
 	});
 
 	it("strips the parent-owned todo tool from non-prewalk subagents", async () => {

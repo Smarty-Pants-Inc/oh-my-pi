@@ -31,6 +31,7 @@ import type { ToolPathWithSource } from "../extensibility/custom-tools";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import { runExtensionCompact, runExtensionSetModel } from "../extensibility/extensions/compact-handler";
 import { getSessionSlashCommands } from "../extensibility/extensions/get-commands-handler";
+import type { AgentClosureRejection } from "../extensibility/shared-events";
 import { buildSkillPromptMessage, type Skill } from "../extensibility/skills";
 import type { HindsightSessionState } from "../hindsight/state";
 import type { LocalProtocolOptions } from "../internal-urls";
@@ -573,6 +574,7 @@ interface FinalizeSubprocessOutputArgs {
 	outputSchemaMode?: StructuredSubagentSchemaMode;
 	outputSchemaSource?: StructuredSubagentSchemaSource;
 	lastAssistantText?: string;
+	closureRejected?: AgentClosureRejection;
 }
 
 interface FinalizeSubprocessOutputResult {
@@ -587,6 +589,10 @@ export const SUBAGENT_WARNING_SCHEMA_OVERRIDDEN =
 	"SYSTEM WARNING: Subagent exhausted schema-retry budget; result was accepted despite failing the output schema.";
 export const SUBAGENT_WARNING_NULL_YIELD = "SYSTEM WARNING: Subagent called yield with null data.";
 export const SUBAGENT_WARNING_MISSING_YIELD = "Subagent exited without a result.";
+
+function staleTodoClosureError(closureRejected: AgentClosureRejection): string {
+	return `Subagent completion rejected: ${closureRejected.todos.length} incomplete todo item(s) remain.`;
+}
 
 /** Build a schema_violation outcome — surfaced as a non-zero exit so callers treat it as a failure. */
 function buildSchemaViolationOutcome(
@@ -736,6 +742,12 @@ export function finalizeSubprocessOutput(args: FinalizeSubprocessOutputArgs): Fi
 			exitCode = 1;
 			stderr = SUBAGENT_WARNING_MISSING_YIELD;
 		}
+	}
+	if (args.closureRejected) {
+		const closureError = staleTodoClosureError(args.closureRejected);
+		exitCode = 1;
+		rawOutput = rawOutput ? `${rawOutput}\n\n${closureError}` : closureError;
+		stderr = stderr ? `${stderr}\n${closureError}` : closureError;
 	}
 
 	return { rawOutput, exitCode, stderr, abortedViaYield, hasYield, structuredOutput };
@@ -981,6 +993,9 @@ interface SubagentRunMonitor {
 	/** The abort kind for this run, when an abort was requested. */
 	abortKind(): AbortReason | undefined;
 	terminalError(): string | undefined;
+	/** A terminal stale-todo closure rejection observed from the child session. */
+	closureRejected(): AgentClosureRejection | undefined;
+
 	/** True when the abort carries a precise external reason (signal / wall-clock / budget). */
 	hasExplicitAbortReason(): boolean;
 	/** Whether the (attempted) abort counts as a cancelled run rather than an internal failure. */
@@ -1088,6 +1103,8 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	let budgetStopAbortPromise: Promise<void> | undefined;
 	let terminalError: string | undefined;
 	let consecutiveYieldToolErrors = 0;
+	let closureRejected: AgentClosureRejection | undefined;
+
 	let lastAssistantSalvageText: string | undefined;
 	let activeSessionAbortPromise: Promise<void> | undefined;
 
@@ -1714,6 +1731,10 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		return session.subscribe(event => {
 			emitSubagentEvent(event);
 			publishServingModel();
+			if (event.type === "agent_end" && event.isTerminal !== false && event.closureRejected) {
+				closureRejected = event.closureRejected;
+			}
+
 			if (event.type === "auto_retry_start") {
 				progress.retryState = {
 					attempt: event.attempt,
@@ -1784,6 +1805,8 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		yieldCalled: () => yieldCalled,
 		runtimeLimitExceeded: () => runtimeLimitExceeded,
 		terminalError: () => terminalError,
+		closureRejected: () => closureRejected,
+
 		hasExplicitAbortReason: () =>
 			abortReason === "signal" ||
 			abortReason === "shutdown" ||
@@ -2037,6 +2060,7 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 			outputSchemaMode: args.outputSchemaMode,
 			outputSchemaSource: args.outputSchemaSource,
 			lastAssistantText: monitor.lastAssistantSalvageText(),
+			closureRejected: monitor.closureRejected(),
 		});
 	} finally {
 		popLoopPhase();
@@ -2692,7 +2716,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		maxRuntimeMs,
 	});
 	const progress = monitor.progress;
-	let unsubscribe: (() => void) | null = null;
+	const monitorSubscription: { unsubscribe: (() => void) | null } = { unsubscribe: null };
 	let reviveSession: AgentReviver | null = null;
 	const installIrcWakeTurnMonitor = (target: AgentSession): void => {
 		attachIrcWakeTurnMonitor(target, {
@@ -3214,7 +3238,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				}
 			}
 
-			unsubscribe = monitor.attach(session);
+			monitorSubscription.unsubscribe = monitor.attach(session);
 
 			checkAbort();
 			// Autoload skills via sendCustomMessage (same mechanic as /skill:<name>)
@@ -3282,14 +3306,6 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
 					});
 				}
-			}
-			if (unsubscribe) {
-				try {
-					unsubscribe();
-				} catch {
-					// Ignore unsubscribe errors
-				}
-				unsubscribe = null;
 			}
 			const jobManager = AsyncJobManager.instance();
 			if (jobManager) {
@@ -3389,6 +3405,15 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	};
 
 	const done = await runSubagent();
+	const unsubscribe = monitorSubscription.unsubscribe;
+	if (unsubscribe) {
+		try {
+			unsubscribe();
+		} catch {
+			// Ignore unsubscribe errors
+		}
+		monitorSubscription.unsubscribe = null;
+	}
 	monitor.finish();
 
 	const result = await finalizeRunResult({

@@ -12,6 +12,7 @@ import {
 	AcpAgent,
 	createAcpExtensionUiContext,
 } from "@oh-my-pi/pi-coding-agent/modes/acp/acp-agent";
+import { createAcpConnection } from "@oh-my-pi/pi-coding-agent/modes/acp/acp-mode";
 import type { PlanModeState } from "@oh-my-pi/pi-coding-agent/plan-mode/state";
 import type {
 	AgentSession,
@@ -32,6 +33,7 @@ import {
 import { getConfigRootDir, setAgentDir } from "@oh-my-pi/pi-utils";
 import type {
 	AgentSideConnection,
+	Client,
 	ClientCapabilities,
 	CreateElicitationRequest,
 	CreateElicitationResponse,
@@ -40,6 +42,8 @@ import type {
 	Validator,
 } from "@oh-my-pi/pi-utils/acp";
 import {
+	ClientSideConnection,
+	ndJsonStream,
 	zForkSessionResponse,
 	zLoadSessionResponse,
 	zNewSessionResponse,
@@ -52,6 +56,13 @@ import { TOOL_NAME as DELAYED_MCP_TOOL_NAME } from "./fixtures/delayed-tool-mcp"
 function expectAcpStructure(schema: Validator<unknown>, value: unknown): void {
 	const result = schema.safeParse(value);
 	expect(result.success, result.success ? undefined : JSON.stringify(result.error.issues, null, 2)).toBe(true);
+}
+
+async function closeAcpTransport(writable: WritableStream<unknown>): Promise<void> {
+	for (let attempt = 0; attempt < 100 && writable.locked; attempt += 1) {
+		await Promise.resolve();
+	}
+	await Promise.allSettled([writable.close()]);
 }
 
 const TEST_MODELS: Model[] = [
@@ -1352,6 +1363,108 @@ describe("ACP agent", () => {
 
 		harness.abortController.abort();
 		await Bun.sleep(0);
+	});
+
+	it("returns a protocol refusal for a stale todo terminal closure", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId);
+		if (!session) throw new Error("session not registered");
+
+		const assistantMessage = makeAssistantMessage("Draft answer that must not settle successfully.");
+		session.prompt = async (text: string): Promise<boolean> => {
+			session.promptCalls.push(text);
+			session.isStreaming = true;
+			for (const listener of session.listeners()) {
+				listener({
+					type: "agent_end",
+					messages: [assistantMessage],
+					closureRejected: {
+						reason: "stale_todos",
+						todos: [{ content: "Finish the requested work", status: "pending" }],
+					},
+				} as AgentSessionEvent);
+			}
+			session.isStreaming = false;
+			return true;
+		};
+
+		const response = await harness.agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "Complete the task" }],
+		});
+		expectAcpStructure(zPromptResponse, response);
+		expect(response.stopReason).toBe("refusal");
+
+		const messageChunks = harness.updates.filter(
+			update => update.sessionId === created.sessionId && update.update.sessionUpdate === "agent_message_chunk",
+		);
+		expect(messageChunks).toHaveLength(0);
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("returns a refusal application result over the ClientSideConnection wire", async () => {
+		const harness = await createHarness();
+		const clientToAgent = new TransformStream<Uint8Array, Uint8Array>();
+		const agentToClient = new TransformStream<Uint8Array, Uint8Array>();
+		const client: Client = {
+			requestPermission: async () => ({ outcome: { outcome: "selected", optionId: "allow_once" } }),
+			sessionUpdate: async () => {},
+		};
+		const clientConnection = new ClientSideConnection(
+			() => client,
+			ndJsonStream(clientToAgent.writable, agentToClient.readable),
+		);
+		const sessions: FakeAgentSession[] = [];
+		const serverConnection = createAcpConnection(
+			ndJsonStream(agentToClient.writable, clientToAgent.readable),
+			async cwd => {
+				const session = new FakeAgentSession(cwd);
+				sessions.push(session);
+				return session as unknown as AgentSession;
+			},
+		);
+
+		try {
+			await clientConnection.initialize({ protocolVersion: 1, clientCapabilities: {} });
+			const created = await clientConnection.newSession({ cwd: harness.cwdA, mcpServers: [] });
+			const session = sessions.find(candidate => candidate.sessionId === created.sessionId);
+			if (!session) throw new Error("wire session was not created");
+
+			const assistantMessage = makeAssistantMessage("Draft answer that must not settle successfully.");
+			session.prompt = async (text: string): Promise<boolean> => {
+				session.promptCalls.push(text);
+				session.isStreaming = true;
+				for (const listener of session.listeners()) {
+					listener({
+						type: "agent_end",
+						messages: [assistantMessage],
+						closureRejected: {
+							reason: "stale_todos",
+							todos: [{ content: "Finish the requested work", status: "pending" }],
+						},
+					} as AgentSessionEvent);
+				}
+				session.isStreaming = false;
+				return true;
+			};
+
+			const response = await clientConnection.prompt({
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: "Complete the task" }],
+			});
+
+			expectAcpStructure(zPromptResponse, response);
+			expect(response.stopReason).toBe("refusal");
+		} finally {
+			await closeAcpTransport(clientToAgent.writable);
+			await closeAcpTransport(agentToClient.writable);
+			await Promise.allSettled([clientConnection.closed, serverConnection.closed]);
+			harness.abortController.abort();
+			await Promise.resolve();
+		}
 	});
 
 	it("does not re-send a streamed error chunk from the agent_end fallback", async () => {

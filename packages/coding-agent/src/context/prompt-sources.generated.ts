@@ -236,8 +236,9 @@ import source232 from "../prompts/tools/vibe-turn-result.md" with { type: "text"
 import source233 from "../prompts/tools/vibe-wait.md" with { type: "text" };
 import source234 from "../prompts/tools/web-search.md" with { type: "text" };
 import source235 from "../prompts/tools/write.md" with { type: "text" };
-import source236 from "../prompts/tools/yield.md" with { type: "text" };
-import source237 from "../prompts/advisor/mission-context.md" with { type: "text" };
+import source236 from "../live/prompts/agent-closure-rejected.md" with { type: "text" };
+import source237 from "../prompts/tools/yield.md" with { type: "text" };
+import source238 from "../prompts/advisor/mission-context.md" with { type: "text" };
 
 export const PROMPT_SOURCES: Readonly<Record<string, string>> = Object.freeze({
 	"_agent/compaction/prompts/auto-handoff-threshold-focus.md": source0,
@@ -476,6 +477,7 @@ export const PROMPT_SOURCES: Readonly<Record<string, string>> = Object.freeze({
 	"prompts/tools/vibe-wait.md": source233,
 	"prompts/tools/web-search.md": source234,
 	"prompts/tools/write.md": source235,
-	"prompts/tools/yield.md": source236,
-	"prompts/advisor/mission-context.md": source237,
+	"live/prompts/agent-closure-rejected.md": source236,
+	"prompts/tools/yield.md": source237,
+	"prompts/advisor/mission-context.md": source238,
 });

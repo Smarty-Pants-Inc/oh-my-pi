@@ -27,7 +27,7 @@ import type { RpcMessagesPage } from "./rpc-messages";
 
 export type RpcCommand =
 	// Protocol
-	| { id?: string; type: "negotiate_protocol"; protocolVersion: number }
+	| { id?: string; type: "negotiate_protocol"; protocolVersion: number; closureRejection?: true }
 
 	// Prompting
 	| { id?: string; type: "prompt"; message: string; images?: ImageContent[]; streamingBehavior?: "steer" | "followUp" }
@@ -36,6 +36,7 @@ export type RpcCommand =
 	| { id?: string; type: "abort" }
 	| { id?: string; type: "abort_and_prompt"; message: string; images?: ImageContent[] }
 	| { id?: string; type: "new_session"; parentSession?: string }
+	| { id?: string; type: "wait_for_idle" }
 
 	// State
 	| { id?: string; type: "get_state" }
@@ -200,7 +201,7 @@ export type RpcResponse =
 			type: "response";
 			command: "negotiate_protocol";
 			success: true;
-			data: { protocolVersion: 2 };
+			data: { protocolVersion: 2; closureRejection?: true; idleBarrier?: true };
 	  }
 
 	// Prompting (async - events follow)
@@ -210,6 +211,7 @@ export type RpcResponse =
 	| { id?: string; type: "response"; command: "abort"; success: true }
 	| { id?: string; type: "response"; command: "abort_and_prompt"; success: true }
 	| { id?: string; type: "response"; command: "new_session"; success: true; data: { cancelled: boolean } }
+	| { id?: string; type: "response"; command: "wait_for_idle"; success: true }
 
 	// State
 	| { id?: string; type: "response"; command: "get_state"; success: true; data: RpcSessionState }

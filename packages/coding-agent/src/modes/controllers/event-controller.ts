@@ -2255,6 +2255,7 @@ export class EventController {
 	}
 
 	sendCompletionNotification(event: Extract<AgentSessionEvent, { type: "agent_end" }>): void {
+		if (event.isTerminal === false || event.closureRejected) return;
 		const notify = settings.get("completion.notify");
 		if (notify === "off") return;
 

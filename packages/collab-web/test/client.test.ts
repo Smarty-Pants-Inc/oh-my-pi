@@ -10,6 +10,9 @@ import type {
 	SubagentProgressPayload,
 	WireMessage,
 } from "@oh-my-pi/pi-wire";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import { Toasts } from "../src/components/shell/Toasts";
 import { GuestClient } from "../src/lib/client";
 import { COLLAB_PROTO, encodeBase64Url } from "../src/lib/link";
 import { CollabSocket } from "../src/lib/socket";
@@ -192,6 +195,34 @@ describe("GuestClient frame apply", () => {
 		client.applyFrameForTest({ t: "state", state: { ...STATE, isStreaming: false } });
 		expect(client.getSnapshot().working).toBe(false);
 	});
+
+	it("renders stale-todo closure rejection as an error instead of ordinary completion", () => {
+		const client = liveClient();
+		client.applyFrameForTest({ t: "event", event: { type: "agent_start" } });
+		client.applyFrameForTest({
+			t: "event",
+			event: {
+				type: "agent_end",
+				closureRejected: {
+					reason: "stale_todos",
+					todos: [{ content: "Finish the requested work", status: "pending" }],
+				},
+			},
+		});
+
+		const snap = client.getSnapshot();
+		expect(snap.working).toBe(false);
+		expect(snap.notices).toHaveLength(1);
+		expect(snap.notices[0]).toMatchObject({
+			level: "error",
+			message: "Completion rejected: 1 incomplete todo item(s) remain.",
+		});
+
+		const html = renderToStaticMarkup(createElement(Toasts, { notices: snap.notices }));
+		expect(html).toContain("sh-toast-error");
+		expect(html).toContain("Completion rejected: 1 incomplete todo item(s) remain.");
+	});
+
 	it("a state frame recovers a stuck-idle guest when agent_start was dropped", () => {
 		// The host begins streaming mid-turn, but the matching `agent_start`
 		// never arrived (e.g. dropped on a reconnect). Before the fix nothing

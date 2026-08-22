@@ -165,6 +165,7 @@ import type {
 	SendMessageOptions,
 } from "../extensibility/extensions/types";
 import type { HookCommandContext } from "../extensibility/hooks/types";
+import type { AgentClosureRejection } from "../extensibility/shared-events";
 import type { Skill, SkillWarning } from "../extensibility/skills";
 import { expandSlashCommand, type FileSlashCommand } from "../extensibility/slash-commands";
 import { normalizeToolEventInput, resolveToolEventInput } from "../extensibility/tool-event-input";
@@ -941,6 +942,7 @@ export class AgentSession {
 		if (
 			this.#promptInFlightCount === 0 &&
 			!this.#inFlightSettling &&
+			this.#pendingAgentEndEmit === undefined &&
 			this.#inFlightBeforeAgentEndCallbacks.length === 0 &&
 			this.#inFlightSettledCallbacks.length === 0
 		) {
@@ -1032,6 +1034,14 @@ export class AgentSession {
 			return;
 		}
 		this.#persistPassiveCustomMessages(records);
+	}
+
+	#trackIrcWakeTask(task: Promise<void>): void {
+		this.#ircWakeTasks.add(task);
+		void task.then(
+			() => this.#ircWakeTasks.delete(task),
+			() => this.#ircWakeTasks.delete(task),
+		);
 	}
 
 	async #waitForIrcWakeTasks(): Promise<void> {
@@ -1172,6 +1182,7 @@ export class AgentSession {
 			isStreaming: () => this.isStreaming,
 			planModeEnabled: () => this.#planModeState?.enabled === true,
 			emitSessionEvent: event => this.#emitSessionEvent(event),
+			trackTask: task => this.#trackIrcWakeTask(task),
 			wakeForIrc: records => this.#wakeForIrc(records),
 			runEphemeralTurn: args => this.runEphemeralTurn(args),
 		};
@@ -2505,13 +2516,42 @@ export class AgentSession {
 	}
 
 	async #waitForSessionQuiescence(signal?: AbortSignal): Promise<void> {
-		await untilAborted(signal, () => this.agent.waitForIdle());
-		await untilAborted(signal, () => this.#drainInFlightEventHandlers());
-		await this.#waitForInFlightQuiescence(signal);
-		await untilAborted(signal, () => this.#waitForIrcWakeTasks());
-		await untilAborted(signal, () => this.#advisors.waitForPendingCardEvents());
-		await untilAborted(signal, () => this.#waitForPostPromptRecovery());
-		await untilAborted(signal, () => this.#waitForIrcWakeTasks());
+		while (true) {
+			await untilAborted(signal, () => this.agent.waitForIdle());
+			const extensionEventTail = this.#queuedExtensionEvents;
+			await untilAborted(signal, extensionEventTail);
+			await untilAborted(signal, () => this.#drainInFlightEventHandlers());
+			await this.#waitForInFlightQuiescence(signal);
+			await untilAborted(signal, () => this.#waitForIrcWakeTasks());
+			await untilAborted(signal, () => this.#advisors.waitForPendingCardEvents());
+			await untilAborted(signal, () => this.#waitForPostPromptRecovery());
+			await untilAborted(signal, () => this.#waitForIrcWakeTasks());
+			await untilAborted(signal, () => this.#drainInFlightEventHandlers());
+			await this.#waitForInFlightQuiescence(signal);
+			const abort = this.#abortPromise;
+			if (abort) {
+				await untilAborted(signal, abort);
+				continue;
+			}
+			if (
+				!this.isStreaming &&
+				this.#queuedExtensionEvents === extensionEventTail &&
+				this.#abortPromise === undefined &&
+				this.#inFlightEventHandlers.size === 0 &&
+				!this.#inFlightSettling &&
+				this.#pendingAgentEndEmit === undefined &&
+				this.#inFlightBeforeAgentEndCallbacks.length === 0 &&
+				this.#inFlightSettledCallbacks.length === 0 &&
+				this.#ircWakeTasks.size === 0 &&
+				this.#postPromptTasks.size === 0 &&
+				this.#postPromptTasksPromise === undefined &&
+				this.#recovery.retryPromise === undefined &&
+				this.#ttsr.resumeGate === undefined &&
+				!this.#queuedMessageDrainScheduled
+			) {
+				return;
+			}
+		}
 	}
 	#acquireLifecycleTransitionFence(): () => void {
 		if (this.#lifecycleTransitionFenceActive) throw new Error("Lifecycle transition fence already active");
@@ -3787,13 +3827,16 @@ export class AgentSession {
 			// TTSR retry work runs concurrently and clears the live flag before
 			// maintenance can emit agent_end, so preserve the state at settle entry.
 			const ttsrAbortPendingAtAgentEnd = this.#ttsr.abortPending;
-			const emitAgentEndNotification = async (options?: { willContinue?: boolean }) => {
+			const emitAgentEndNotification = async (options?: {
+				willContinue?: boolean;
+				closureRejected?: AgentClosureRejection;
+			}) => {
 				this.#emitRunState("idle");
 				// Public agent_end is held out of the eager display pass and emitted
 				// here after maintenance routing, tagged isTerminal so subscribers can
 				// tell final settles from scheduled continuations.
 				await this.#emitSessionEvent(
-					{ ...event, isTerminal: !options?.willContinue },
+					{ ...event, isTerminal: !options?.willContinue, closureRejected: options?.closureRejected },
 					options?.willContinue === true ? undefined : { closeTurnId: settledTurnId },
 				);
 				void this.#emitAgentEndNotification([...activeMessages], options).catch(err => {
@@ -3886,6 +3929,23 @@ export class AgentSession {
 			// empty/aborted assistant stop must NOT revive the agent loop. The
 			// `#yieldTerminationPending` sticky flag clears on the next `prompt()`.
 			if (successfulYieldMessage || this.#yieldTerminationPending) {
+				if (successfulYieldMessage) {
+					const completion = await this.#todo.checkCompletion();
+					if (completion === "deferred") {
+						this.#lastSuccessfulYieldToolCallId = undefined;
+						maintenanceRoute("successful-yield-async-deferred");
+						await emitAgentEndNotification({ willContinue: true });
+						return;
+					}
+					if (completion) {
+						this.#lastSuccessfulYieldToolCallId = undefined;
+						maintenanceRoute("successful-yield-closure-rejected");
+						await this.#emitSessionStopEvent(activeMessages, msg);
+						await emitAgentEndNotification({ closureRejected: completion });
+						return;
+					}
+				}
+
 				this.#lastSuccessfulYieldToolCallId = undefined;
 				if (successfulYieldMessage && activeGoal) {
 					maintenanceRoute(
@@ -4073,9 +4133,16 @@ export class AgentSession {
 					await emitAgentEndNotification({ willContinue: true });
 					return;
 				}
-				const todoContinuationScheduled = await this.#todo.checkCompletion(msg);
-				if (todoContinuationScheduled) {
+				const completion = await this.#todo.checkCompletion();
+				if (completion === "deferred") {
+					maintenanceRoute("todo-closure-deferred");
 					await emitAgentEndNotification({ willContinue: true });
+					return;
+				}
+				if (completion) {
+					maintenanceRoute("todo-closure-rejected");
+					await this.#emitSessionStopEvent(activeMessages, msg);
+					await emitAgentEndNotification({ closureRejected: completion });
 					return;
 				}
 			}
@@ -4762,11 +4829,15 @@ export class AgentSession {
 		return undefined;
 	}
 
-	async #emitAgentEndNotification(messages: AgentMessage[], options?: { willContinue?: boolean }): Promise<void> {
+	async #emitAgentEndNotification(
+		messages: AgentMessage[],
+		options?: { willContinue?: boolean; closureRejected?: AgentClosureRejection },
+	): Promise<void> {
 		await this.#extensionRunner?.emit({
 			type: "agent_end",
 			messages,
 			willContinue: options?.willContinue,
+			closureRejected: options?.closureRejected,
 		});
 	}
 
@@ -5742,13 +5813,9 @@ export class AgentSession {
 		return this.agent.isAborting;
 	}
 
-	/** Wait until streaming, event persistence, and deferred recovery work are fully settled. */
+	/** Wait until streaming, event persistence, public terminal emission, and deferred recovery work are settled. */
 	async waitForIdle(): Promise<void> {
-		await this.agent.waitForIdle();
-		await this.#waitForIrcWakeTasks();
-		await this.#advisors.waitForPendingCardEvents();
-		await this.#waitForPostPromptRecovery();
-		await this.#waitForIrcWakeTasks();
+		await this.#waitForSessionQuiescence();
 	}
 	/**
 	 * Prevent advisor notes from starting hidden primary turns while a headless
@@ -7133,7 +7200,7 @@ export class AgentSession {
 			this.#eval.flushPending();
 			this.#irc.flushPending();
 
-			this.#todo.resetCycle();
+			this.#todo.startCycle();
 			this.#resetPromptMaintenanceState();
 			this.#recovery.setAcceptTerminalEmptyStop(options?.acceptTerminalEmptyStop === true);
 
@@ -9400,6 +9467,9 @@ export class AgentSession {
 	#isTerminalToolResult(event: { toolName: string; isError?: boolean; result?: { details?: unknown } }): boolean {
 		if (event.isError) return false;
 		if (this.#isTerminalYieldToolResult(event)) return true;
+		if (event.toolName === "goal" && isRecord(event.result?.details) && event.result.details.op === "complete") {
+			return true;
+		}
 		const tool = this.agent.state.tools.find(
 			candidate => candidate.name === event.toolName || candidate.customWireName === event.toolName,
 		);

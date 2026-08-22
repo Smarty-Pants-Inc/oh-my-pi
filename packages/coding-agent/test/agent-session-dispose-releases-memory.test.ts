@@ -65,6 +65,101 @@ describe("AgentSession dispose releases retained memory", () => {
 		return session;
 	}
 
+	it("waitForIdle blocks until an in-flight message_end handler settles", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("expected bundled model");
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["test"], tools: [] },
+			streamFn: createMockModel({ handler: () => ({ content: ["ok"] }) }).stream,
+		});
+		const sessionManager = SessionManager.inMemory(tempDir.path());
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
+		const reached = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const runtime = new ExtensionRuntime();
+		const extension = await loadExtensionFromFactory(
+			pi => {
+				pi.on("message_end", async () => {
+					reached.resolve();
+					await release.promise;
+				});
+			},
+			tempDir.path(),
+			new EventBus(),
+			runtime,
+			"block-idle-message-end",
+		);
+		const extensionRunner = new ExtensionRunner([extension], runtime, tempDir.path(), sessionManager, modelRegistry);
+
+		const current = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated(),
+			modelRegistry,
+			agentId: "Main",
+			extensionRunner,
+		});
+		session = current;
+		const message: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "settled" }],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		};
+
+		current.agent.emitExternalEvent({ type: "message_end", message });
+		await reached.promise;
+		let idleSettled = false;
+		const idle = current.waitForIdle().then(() => {
+			idleSettled = true;
+		});
+		for (let hop = 0; hop < 10; hop++) await Promise.resolve();
+		expect(idleSettled).toBe(false);
+
+		release.resolve();
+		await idle;
+		expect(current.sessionManager.getEntries()).toHaveLength(1);
+	});
+
+	it("waitForIdle joins an abort that overtakes the barrier", async () => {
+		const current = createSession();
+		const abortReachedIdle = Promise.withResolvers<void>();
+		const releaseAbort = Promise.withResolvers<void>();
+		let waitCalls = 0;
+		vi.spyOn(current.agent, "waitForIdle").mockImplementation(async () => {
+			waitCalls += 1;
+			if (waitCalls === 1) {
+				abortReachedIdle.resolve();
+				await releaseAbort.promise;
+			}
+		});
+
+		const abort = current.abort();
+		await abortReachedIdle.promise;
+		let idleSettled = false;
+		const idle = current.waitForIdle().then(() => {
+			idleSettled = true;
+		});
+		for (let hop = 0; hop < 10; hop++) await Promise.resolve();
+		expect(idleSettled).toBe(false);
+
+		releaseAbort.resolve();
+		await Promise.all([abort, idle]);
+		expect(waitCalls).toBeGreaterThanOrEqual(2);
+	});
+
 	it("releases all in-memory transcript copies and the raw-SSE buffer on dispose", async () => {
 		const current = createSession();
 		const bulk = "x".repeat(4096);

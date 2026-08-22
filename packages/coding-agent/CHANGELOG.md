@@ -10,6 +10,8 @@
 
 - Kept interactive turns usable when prompt-policy review rejects an extension hook; OMP now skips the protected hook, preserves the original turn data, and reports the review condition without stopping the harness.
 - Fixed ordinary OMP startup exiting when stale Herdr bridge credentials were inherited without pane identity.
+- Fixed terminal goal completion racing batched todo mutations, stale-todo reminder caps resetting across prompts, and missing `session_stop` hooks on rejected closures.
+- Fixed RPC clients retaining a rejected terminal outcome after a queued steer or follow-up.
 
 ### Added
 

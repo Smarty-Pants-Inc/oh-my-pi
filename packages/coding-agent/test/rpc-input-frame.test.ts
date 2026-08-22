@@ -132,7 +132,7 @@ describe("dispatchRpcInputFrame", () => {
 		}
 	});
 
-	test("non-bash commands are dispatched serially (ordering preserved)", async () => {
+	test("ordinary commands return awaitable responses", async () => {
 		const started: string[] = [];
 		const finished: string[] = [];
 		const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
@@ -187,6 +187,28 @@ describe("dispatchRpcInputFrame", () => {
 			success: false,
 			error: "kaboom",
 		});
+	});
+
+	test("wait_for_idle handler errors preserve background response correlation", async () => {
+		const { deps, outputs } = makeDeps(async command => {
+			if (command.type === "wait_for_idle") throw new Error("idle barrier failed");
+			throw new Error(`unexpected: ${command.type}`);
+		});
+
+		const awaited = dispatchRpcInputFrame({ id: "idle-error", type: "wait_for_idle" }, deps);
+		expect(awaited).toBeUndefined();
+		await flushMicrotasks();
+		await flushMicrotasks();
+
+		expect(outputs).toEqual([
+			{
+				id: "idle-error",
+				type: "response",
+				command: "wait_for_idle",
+				success: false,
+				error: "idle barrier failed",
+			},
+		]);
 	});
 
 	test("background bash task is exposed so EOF cleanup can await its response", async () => {
@@ -350,6 +372,50 @@ describe("RpcInputDispatcher", () => {
 		expect((outputs[0] as RpcResponse).id).toBe("first");
 		expect((outputs[1] as RpcResponse).id).toBe("second");
 		expect((outputs[1] as RpcResponse).command).toBe("get_state");
+	});
+
+	test("wait_for_idle starts after prior commands without blocking a later abort", async () => {
+		const releasePrior = Promise.withResolvers<void>();
+		const releaseIdle = Promise.withResolvers<void>();
+		const idleStarted = Promise.withResolvers<void>();
+		const started: string[] = [];
+		const { deps, outputs } = makeDeps(async command => {
+			started.push(command.type);
+			if (command.type === "abort_retry") {
+				await releasePrior.promise;
+				return { id: command.id, type: "response", command: "abort_retry", success: true };
+			}
+			if (command.type === "wait_for_idle") {
+				idleStarted.resolve();
+				await releaseIdle.promise;
+				return { id: command.id, type: "response", command: "wait_for_idle", success: true };
+			}
+			if (command.type === "abort") {
+				return { id: command.id, type: "response", command: "abort", success: true };
+			}
+			throw new Error(`unexpected command type: ${command.type}`);
+		});
+		const backgroundTasks: Promise<void>[] = [];
+		deps.trackBackgroundTask = task => backgroundTasks.push(task);
+		const dispatcher = new RpcInputDispatcher({ deps });
+
+		dispatcher.dispatch({ id: "prior", type: "abort_retry" });
+		dispatcher.dispatch({ id: "idle", type: "wait_for_idle" });
+		dispatcher.dispatch({ id: "abort", type: "abort" });
+		await flushMicrotasks();
+		expect(started).toEqual(["abort_retry"]);
+
+		releasePrior.resolve();
+		await idleStarted.promise;
+		await dispatcher.drain();
+
+		expect(started).toEqual(["abort_retry", "wait_for_idle", "abort"]);
+		expect(outputs.map(output => (output as RpcResponse).command)).toEqual(["abort_retry", "abort"]);
+		expect(backgroundTasks).toHaveLength(1);
+
+		releaseIdle.resolve();
+		await Promise.all(backgroundTasks);
+		expect(outputs.map(output => (output as RpcResponse).command)).toEqual(["abort_retry", "abort", "wait_for_idle"]);
 	});
 
 	test("serial command rejection emits an error response and does not poison the queue", async () => {

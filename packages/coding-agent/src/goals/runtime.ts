@@ -509,13 +509,14 @@ export class GoalRuntime {
 		});
 	}
 
-	async completeGoalFromTool(): Promise<Goal> {
+	async completeGoalFromTool(beforeComplete?: () => void): Promise<Goal> {
 		return await this.#withAccounting(async () => {
 			await this.#flushUsageLocked("suppressed");
 			const state = this.#getStateClone();
 			if (!isCurrentGoalModeState(state) || !state.enabled || state.goal.status !== "active") {
 				throw new Error("cannot complete goal because no goal is active");
 			}
+			beforeComplete?.();
 			state.enabled = false;
 			state.goal.status = "complete";
 			state.goal.updatedAt = this.#now();

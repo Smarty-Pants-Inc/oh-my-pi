@@ -297,6 +297,10 @@ Cancelable pre-events:
 - `turn_start` / `turn_end`
 - `message_start` / `message_update` / `message_end` — lifecycle notifications; `message_end` receives a detached message snapshot, so use `tool_result` or `context` when an extension needs to change provider context
 
+A terminal `agent_end` can carry `closureRejected?: { reason: "stale_todos"; todos: TodoItem[] }`.
+It is settled with no continuation, but it is an unsuccessful closure and extensions must not report
+the work as done.
+
 ### Tool lifecycle
 
 - `tool_call` (pre-exec, may block, or revise the tool's execution `input`; for model-issued calls it fires at arg-prep time in the agent loop, so a revision is revalidated and seen by concurrency scheduling, execution events, the persisted assistant message, and the approval gate alike)

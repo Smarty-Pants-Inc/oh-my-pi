@@ -6,13 +6,14 @@ import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import type { AgentClosureRejection } from "@oh-my-pi/pi-coding-agent/extensibility/shared-events";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TodoTool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
-/** Async ownership gates session_stop, while todo state remains passive and never emits reminders. */
+/** Async ownership gates session_stop; actionable todos reject terminal closure without a hidden wake. */
 const sharedAuthStorage = createInMemoryAuthStorage();
 sharedAuthStorage.setRuntimeApiKey("anthropic", "test-key");
 const sharedModelRegistry = new ModelRegistry(sharedAuthStorage);
@@ -30,6 +31,7 @@ describe("AgentSession todo reminder async-job deferral", () => {
 	let gates: Array<PromiseWithResolvers<string>>;
 	let reminderAttempts: number[];
 	let agentEndTerminalStates: Array<boolean | undefined>;
+	let closureRejections: AgentClosureRejection[];
 
 	function textOnlyAssistantMessage(): AssistantMessage {
 		return {
@@ -57,11 +59,39 @@ describe("AgentSession todo reminder async-job deferral", () => {
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [msg] });
 	}
 
+	function emitSuccessfulYieldStop(): void {
+		const yieldCall = {
+			type: "toolCall" as const,
+			id: "call-async-todo-yield",
+			name: "yield",
+			arguments: { data: { ok: true } },
+		};
+		const msg: AssistantMessage = {
+			...textOnlyAssistantMessage(),
+			content: [yieldCall],
+			stopReason: "toolUse",
+		};
+		session.agent.emitExternalEvent({ type: "message_end", message: msg });
+		session.agent.emitExternalEvent({
+			type: "tool_execution_end",
+			toolCallId: yieldCall.id,
+			toolName: "yield",
+			isError: false,
+			result: {
+				content: [{ type: "text", text: "Result submitted." }],
+				details: { status: "success", data: { ok: true } },
+			},
+		});
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [msg] });
+	}
 	/** Register a job that stays running until the returned resolver fires. */
-	function registerGatedJob(ownerId: string): { resolve: () => void } {
+	function registerGatedJob(ownerId: string, originTurnId?: string): { resolve: () => void } {
 		const gate = Promise.withResolvers<string>();
 		gates.push(gate);
-		manager.register("bash", `gated job owned by ${ownerId}`, async () => await gate.promise, { ownerId });
+		manager.register("bash", `gated job owned by ${ownerId}`, async () => await gate.promise, {
+			ownerId,
+			originTurnId,
+		});
 		return { resolve: () => gate.resolve("done") };
 	}
 
@@ -132,12 +162,14 @@ describe("AgentSession todo reminder async-job deferral", () => {
 
 		reminderAttempts = [];
 		agentEndTerminalStates = [];
+		closureRejections = [];
 		session.subscribe((event: AgentSessionEvent) => {
 			if (event.type === "todo_reminder") reminderAttempts.push(event.attempt);
 			if (event.type === "agent_end") {
 				agentEndTerminalStates.push(
 					(event as Extract<AgentSessionEvent, { type: "agent_end" }> & { isTerminal?: boolean }).isTerminal,
 				);
+				if (event.closureRejected) closureRejections.push(event.closureRejected);
 			}
 		});
 	});
@@ -154,7 +186,7 @@ describe("AgentSession todo reminder async-job deferral", () => {
 		vi.restoreAllMocks();
 	});
 
-	it("does not defer a terminal stop for an owned job without an open origin turn", async () => {
+	it("rejects terminal closure for an owned job without an open origin turn", async () => {
 		setIncompleteTodos();
 		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
 		registerGatedJob("Main");
@@ -162,12 +194,42 @@ describe("AgentSession todo reminder async-job deferral", () => {
 		emitTextOnlyStop();
 		await session.waitForIdle();
 
-		expect(reminderAttempts).toEqual([]);
+		expect(reminderAttempts).toEqual([1]);
 		expect(continueSpy).not.toHaveBeenCalled();
 		expect(agentEndTerminalStates).toEqual([true]);
 	});
 
-	it("never creates a todo reminder for a job owned by a different agent", async () => {
+	it("keeps a successful yield nonterminal while an owned origin job can still wake it", async () => {
+		setIncompleteTodos();
+		const started = Promise.withResolvers<void>();
+		const releasePrompt = Promise.withResolvers<void>();
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+		vi.spyOn(session.agent, "prompt").mockImplementation(async () => {
+			session.agent.state.isStreaming = true;
+			started.resolve();
+			await releasePrompt.promise;
+			session.agent.state.isStreaming = false;
+		});
+
+		const prompt = session.prompt("Complete the delegated work.");
+		await started.promise;
+		const originTurnId = session.getCurrentTurnId();
+		if (!originTurnId) throw new Error("Expected an active turn before registering the owned job");
+		const job = registerGatedJob("Main", originTurnId);
+
+		emitSuccessfulYieldStop();
+		releasePrompt.resolve();
+		await prompt;
+
+		expect(reminderAttempts).toEqual([]);
+		expect(agentEndTerminalStates).toEqual([false]);
+		expect(closureRejections).toEqual([]);
+		expect(continueSpy).not.toHaveBeenCalled();
+		job.resolve();
+		await manager.waitForAll();
+		await manager.drainDeliveries();
+	});
+	it("notifies when a different agent's job cannot wake this session", async () => {
 		setIncompleteTodos();
 		vi.spyOn(session.agent, "continue").mockResolvedValue();
 		registerGatedJob("OtherAgent");
@@ -175,21 +237,18 @@ describe("AgentSession todo reminder async-job deferral", () => {
 		emitTextOnlyStop();
 		await session.waitForIdle();
 
-		expect(reminderAttempts).toEqual([]);
+		expect(reminderAttempts).toEqual([1]);
 	});
 
-	it("does not create a todo reminder after an owned job drains", async () => {
+	it("does not repeat a todo notification after an unscoped owned job drains", async () => {
 		setIncompleteTodos();
 		vi.spyOn(session.agent, "continue").mockResolvedValue();
 		const job = registerGatedJob("Main");
 
-		// While the job runs, the stop stays silent.
 		emitTextOnlyStop();
 		await session.waitForIdle();
-		expect(reminderAttempts).toEqual([]);
+		expect(reminderAttempts).toEqual([1]);
 
-		// Complete the job and drain its result delivery — nothing is left to
-		// re-wake the loop, so the deferral must lift.
 		job.resolve();
 		await manager.waitForAll();
 		await manager.drainDeliveries();
@@ -197,9 +256,64 @@ describe("AgentSession todo reminder async-job deferral", () => {
 		emitTextOnlyStop();
 		await session.waitForIdle();
 
-		expect(reminderAttempts).toEqual([]);
+		expect(reminderAttempts).toEqual([1]);
 	});
 
+	it("runs session_stop before rejecting a text closure with stale todos", async () => {
+		setIncompleteTodos();
+		const hookStarted = Promise.withResolvers<void>();
+		const releaseHook = Promise.withResolvers<void>();
+		vi.spyOn(extensionRunner, "emitSessionStop").mockImplementation(async () => {
+			hookStarted.resolve();
+			await releaseHook.promise;
+			return undefined;
+		});
+
+		emitTextOnlyStop();
+		await hookStarted.promise;
+		expect(closureRejections).toEqual([]);
+		releaseHook.resolve();
+		await session.waitForIdle();
+
+		expect(extensionRunner.emitSessionStop).toHaveBeenCalledTimes(1);
+		expect(closureRejections).toEqual([
+			{
+				reason: "stale_todos",
+				todos: [
+					{ content: "Slice 81", status: "pending" },
+					{ content: "Slice 82", status: "pending" },
+				],
+			},
+		]);
+	});
+
+	it("runs session_stop before rejecting a successful yield with stale todos", async () => {
+		setIncompleteTodos();
+		const hookStarted = Promise.withResolvers<void>();
+		const releaseHook = Promise.withResolvers<void>();
+		vi.spyOn(extensionRunner, "emitSessionStop").mockImplementation(async () => {
+			hookStarted.resolve();
+			await releaseHook.promise;
+			return undefined;
+		});
+
+		emitSuccessfulYieldStop();
+		await hookStarted.promise;
+		expect(closureRejections).toEqual([]);
+		releaseHook.resolve();
+		await session.waitForIdle();
+
+		expect(extensionRunner.emitSessionStop).toHaveBeenCalledTimes(1);
+		expect(closureRejections).toEqual([
+			{
+				reason: "stale_todos",
+				todos: [
+					{ content: "Slice 81", status: "pending" },
+					{ content: "Slice 82", status: "pending" },
+				],
+			},
+		]);
+	});
 	it("runs the session_stop hook for an owned job without an open origin turn", async () => {
 		// No todo phases: the stop reaches the session_stop pass directly. An
 		// unscoped job cannot defer or re-wake the model loop.

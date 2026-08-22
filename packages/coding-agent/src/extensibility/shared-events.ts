@@ -199,6 +199,12 @@ export interface AgentStartEvent {
 	type: "agent_start";
 }
 
+/** A terminal settle was rejected because actionable todo items remain. */
+export interface AgentClosureRejection {
+	reason: "stale_todos";
+	todos: TodoItem[];
+}
+
 /** Fired when an agent loop ends */
 export interface AgentEndEvent {
 	type: "agent_end";
@@ -209,6 +215,11 @@ export interface AgentEndEvent {
 	 * treat this as a user-visible terminal settle.
 	 */
 	willContinue?: boolean;
+	/**
+	 * A terminal closure was rejected and no continuation was scheduled.
+	 * Consumers must treat this as an unsuccessful settle.
+	 */
+	closureRejected?: AgentClosureRejection;
 }
 
 /** Fired at the start of each turn */

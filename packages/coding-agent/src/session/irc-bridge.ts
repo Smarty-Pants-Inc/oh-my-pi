@@ -19,6 +19,7 @@ export interface IrcBridgeHost {
 	isStreaming(): boolean;
 	planModeEnabled(): boolean;
 	emitSessionEvent(event: AgentSessionEvent): Promise<void>;
+	trackTask(task: Promise<void>): void;
 	wakeForIrc(records: CustomMessage[]): void;
 	runEphemeralTurn(args: { promptText: string }): Promise<{ replyText: string }>;
 }
@@ -129,7 +130,7 @@ export class IrcBridge {
 			attribution: "agent",
 			timestamp: msg.ts,
 		};
-		void this.#host.emitSessionEvent({ type: "irc_message", message: record });
+		this.#host.trackTask(this.#host.emitSessionEvent({ type: "irc_message", message: record }));
 		if (streaming) {
 			const recipientParentId = AgentRegistry.global().get(msg.to)?.parentId;
 			if (recipientParentId === msg.from) {
@@ -143,7 +144,7 @@ export class IrcBridge {
 			} else {
 				this.#interrupts.push(record);
 			}
-			if (autoReply) void this.#runAutoReply(msg);
+			if (autoReply) this.#host.trackTask(this.#runAutoReply(msg));
 			return "injected";
 		}
 		if (this.#host.planModeEnabled()) {
@@ -155,7 +156,7 @@ export class IrcBridge {
 				record.details,
 				record.attribution ?? "agent",
 			);
-			if (autoReply) void this.#runAutoReply(msg);
+			if (autoReply) this.#host.trackTask(this.#runAutoReply(msg));
 			return "injected";
 		}
 		this.#host.wakeForIrc([record]);
@@ -164,7 +165,7 @@ export class IrcBridge {
 
 	/** Emits an IRC relay observation for rendering without persisting it. */
 	emitRelayObservation(record: CustomMessage): void {
-		void this.#host.emitSessionEvent({ type: "irc_message", message: record });
+		this.#host.trackTask(this.#host.emitSessionEvent({ type: "irc_message", message: record }));
 	}
 
 	/** Persists queued IRC records that missed their step-boundary injection. */
@@ -195,7 +196,7 @@ export class IrcBridge {
 				attribution: "agent",
 				timestamp: Date.now(),
 			};
-			void this.#host.emitSessionEvent({ type: "irc_message", message: record });
+			await this.#host.emitSessionEvent({ type: "irc_message", message: record });
 			this.#asides.push(record);
 			const receipt = await IrcBus.global().send({ from: msg.to, to: msg.from, body, replyTo: msg.id });
 			if (receipt.outcome === "failed") {

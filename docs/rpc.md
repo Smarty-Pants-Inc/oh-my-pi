@@ -45,11 +45,20 @@ The initial ready frame uses protocol v1 and advertises the opt-in lossless tran
 }
 ```
 
-Clients that support protocol v2 SHOULD immediately send:
+Current clients that support protocol v2 SHOULD immediately send:
 
 ```json
-{ "id": "protocol-1", "type": "negotiate_protocol", "protocolVersion": 2 }
+{
+  "id": "protocol-1",
+  "type": "negotiate_protocol",
+  "protocolVersion": 2,
+  "closureRejection": true
+}
 ```
+
+The negotiation success data includes `idleBarrier: true` when the server supports
+the authoritative `wait_for_idle` command. The bundled TypeScript client uses
+that capability and retains terminal-event waiting only for older servers.
 
 After the success response, oversized stdout objects are emitted losslessly as an uninterrupted sequence of `rpc_chunk` frames. Each chunk carries a base64 segment of the original UTF-8 JSON object:
 
@@ -64,9 +73,9 @@ After the success response, oversized stdout objects are emitted losslessly as a
 }
 ```
 
-Clients MUST validate `chunkId`, `index`, `count`, and `byteLength`, reject interleaved or interrupted sequences, enforce the advertised reassembly limit, concatenate decoded bytes in index order, decode them as strict UTF-8, and parse the result as one JSON object. The TypeScript `RpcFrameDecoder`, exported from `@oh-my-pi/pi-coding-agent/modes/rpc/rpc-frame`, implements this validation. The bundled TypeScript and Python `RpcClient` implementations negotiate v2 automatically when the ready frame advertises it.
+Clients MUST validate `chunkId`, `index`, `count`, and `byteLength`, reject interleaved or interrupted sequences, enforce the advertised reassembly limit, concatenate decoded bytes in index order, decode them as strict UTF-8, and parse the result as one JSON object. The TypeScript `RpcFrameDecoder`, exported from `@oh-my-pi/pi-coding-agent/modes/rpc/rpc-frame`, implements this validation. The bundled TypeScript and Python `RpcClient` implementations negotiate v2 and `closureRejection` automatically when the ready frame advertises it.
 
-Legacy clients may ignore the added ready fields and remain on v1. V1 retains its bounded fallback behavior for oversized output. Frames above the v2 reassembly ceiling still fail explicitly; large history APIs should use pagination rather than depending on arbitrarily large logical frames.
+V1 and v2 describe framing, not a general event-semantic version. A client that omits `closureRejection: true` may be an older v1 or v2 client that treats every `agent_end` as success. To fail closed rather than report that false success, the server withholds a rejected `agent_end` from such a client and emits an uncorrelated `rpc_frame_error`; its lifecycle wait therefore fails by timeout unless the host surfaces that frame. Closure-sensitive hosts MUST upgrade to a bundled current client or negotiate the capability. V1 retains its bounded fallback behavior for oversized output. Responses above the v2 reassembly ceiling fail explicitly; terminal `agent_end` fallbacks remain bounded while preserving their rejection marker.
 
 ### Outbound frame categories (stdout)
 
@@ -77,10 +86,11 @@ Legacy clients may ignore the added ready fields and remain on v1. V1 retains it
 5. Host tool requests/cancellations (`host_tool_call`, `host_tool_cancel`)
 6. Host URI requests/cancellations (`host_uri_request`, `host_uri_cancel`)
 7. Extension errors (`{ type: "extension_error", extensionPath, event, error }`)
-8. Available-commands updates (`{ type: "available_commands_update", commands }`), emitted at startup and whenever command metadata changes
-9. Prompt lifecycle hints (`{ type: "prompt_result", id?, agentInvoked }`) for scheduled prompts that later resolve without invoking the agent
-10. Subagent frames (`subagent_lifecycle`, `subagent_progress`, `subagent_event`), gated by `set_subagent_subscription`
-11. Builtin slash-command side channels (`command_output`, `session_info_update`, `config_update`)
+8. Frame errors (`{ type: "rpc_frame_error", error }`)
+9. Available-commands updates (`{ type: "available_commands_update", commands }`), emitted at startup and whenever command metadata changes
+10. Prompt lifecycle hints (`{ type: "prompt_result", id?, agentInvoked }`) for scheduled prompts that later resolve without invoking the agent
+11. Subagent frames (`subagent_lifecycle`, `subagent_progress`, `subagent_event`), gated by `set_subagent_subscription`
+12. Builtin slash-command side channels (`command_output`, `session_info_update`, `config_update`)
 
 ### Inbound frame categories (stdin)
 
@@ -102,7 +112,7 @@ Important edge behavior from runtime:
 - Malformed JSON and synchronous dispatch failures emit `command: "parse"` with `id: undefined`. Exceptions while handling a recognized command emit a failure with that command's `type` and `id`.
 - `prompt` and `abort_and_prompt` return immediate success, then may emit a later error response with the **same** id if async prompt scheduling fails.
 - `prompt` success responses may include `data.agentInvoked`. `false` means the prompt completed locally without an agent turn; `true` means the prompt produced agent lifecycle events; omitted means the host must rely on session events for completion.
-- `abort_and_prompt` does not currently emit `data.agentInvoked` or `prompt_result`; hosts should treat it as the legacy abort-then-schedule path and rely on session events or same-id scheduling errors.
+- A scheduled `prompt` or `abort_and_prompt` that later completes locally emits `prompt_result` with the request id and `agentInvoked: false`. Hosts using `wait_for_idle` do not need to infer completion from this hint.
 
 ## Command Schema (canonical)
 
@@ -115,11 +125,30 @@ Important edge behavior from runtime:
 - `{ id?, type: "follow_up", message: string, images?: ImageContent[] }`
 - `{ id?, type: "abort" }`
 - `{ id?, type: "abort_and_prompt", message: string, images?: ImageContent[] }`
+- `{ id?, type: "wait_for_idle" }`
 - `{ id?, type: "new_session", parentSession?: string }`
+
+`wait_for_idle` is a server-authoritative quiescence barrier. Its success
+response is emitted only after every earlier accepted prompt lifecycle, the
+agent loop, in-flight event persistence, detached extension/IRC work, deferred
+public `agent_end`, queued-message recovery, an overtaking abort, and
+post-prompt retry/TTSR work reach a fixed point. The server starts the barrier
+after all earlier serialized commands, but does not place it on the serial tail,
+so a later `abort` can overtake a run that would otherwise keep the barrier
+blocked. Later commands can therefore overlap the barrier; clients MUST use the
+response `id` and avoid treating response order as command order.
+
+The protocol-v2 negotiation response advertises `data.idleBarrier: true` when
+this command is supported. Current bundled clients use the barrier only after
+that capability is negotiated. With an older server, they retain the legacy
+fallback: an immediate `agentInvoked: false` response is already complete;
+otherwise they wait for the first terminal `agent_end`. That fallback cannot
+distinguish an active predecessor from a queued successor, so hosts that need
+authoritative quiescence MUST use a server that advertises `idleBarrier`.
 
 ### Protocol
 
-- `{ id?, type: "negotiate_protocol", protocolVersion: 2 }`
+- `{ id?, type: "negotiate_protocol", protocolVersion: 2, closureRejection?: true }`
 
 ### State
 
@@ -506,13 +535,26 @@ Extension runner errors are emitted separately as:
   type: "agent_end";
   messages: AgentMessage[];
   isTerminal?: boolean;
+  closureRejected?: { reason: "stale_todos"; todos: TodoItem[] };
 }
 ```
 
 `isTerminal: false` means maintenance or async delivery has scheduled more work,
-so the session will resume before its true final settle. Treat an `agent_end` as
-run completion only when `isTerminal !== false`; the field is optional so frames
-from older runtimes, where it is absent, remain terminal-compatible.
+so the session will resume before its true final settle. Wait helpers MUST ignore
+that frame and treat an `agent_end` as completion only when `isTerminal !== false`.
+The field is optional so frames from older runtimes, where it is absent, remain
+terminal-compatible.
+
+`closureRejected` means the terminal closure failed because actionable todos remain.
+It takes precedence over `isTerminal`, is emitted without scheduling a continuation,
+and consumers MUST treat it as unsuccessful. The current TypeScript and Python
+clients forward the event to all session listeners and reject `waitForIdle()` /
+`wait_for_idle()` and `promptAndWait()` / `prompt_and_wait()`. They retain an
+already-arrived terminal outcome, so the documented sequence `await prompt(); await
+waitForIdle()` (or Python equivalent) cannot miss a closure frame emitted before the
+prompt response. When an `agent_end` exceeds the 64 MiB v2 reassembly ceiling, its
+bounded fallback keeps `closureRejected: { reason: "stale_todos", todos: [] }` so
+the failure is never converted into success.
 
 ### Available commands
 

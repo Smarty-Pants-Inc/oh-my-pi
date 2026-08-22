@@ -701,6 +701,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	#vibeModeOwnerScope: VibeOwnerScope | undefined;
 	#vibeScopeSuspendedForSwitch = false;
 	#goalContinuationTimer: NodeJS.Timeout | undefined;
+	/** Keep a rejected closure idle until direct work or an explicit goal update starts. */
+	#goalContinuationSuppressed = false;
 	#planModePreviousModelState: { model: Model; thinkingLevel?: ConfiguredThinkingLevel } | undefined;
 	#pendingModelSwitch: { model: Model; thinkingLevel?: ConfiguredThinkingLevel } | undefined;
 	/** Whether #pendingModelSwitch was queued by the live plan-role reconciler. */
@@ -1530,6 +1532,7 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	#scheduleGoalContinuation(): void {
 		this.#cancelGoalContinuation();
+		if (this.#goalContinuationSuppressed) return;
 		if (!this.onInputCallback) return;
 		if (!this.session.settings.get("goal.continuationModes").includes("interactive")) return;
 		if (this.planModeEnabled || this.planModePaused) return;
@@ -2478,10 +2481,12 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	async #handleGoalSessionEvent(event: AgentSessionEvent): Promise<void> {
 		if (event.type === "agent_start") {
+			this.#goalContinuationSuppressed = false;
 			this.#cancelGoalContinuation();
 			return;
 		}
 		if (event.type === "goal_updated") {
+			this.#goalContinuationSuppressed = false;
 			const terminalGoal = event.goal;
 			if (terminalGoal && isTerminalGoalStatus(terminalGoal.status)) {
 				await this.#exitGoalMode({
@@ -2505,6 +2510,11 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 		if (this.session.isGoalModeExiting()) {
 			await this.#exitGoalMode({ reason: "completed", silent: true });
+			return;
+		}
+		if (event.closureRejected) {
+			this.#goalContinuationSuppressed = true;
+			this.#cancelGoalContinuation();
 			return;
 		}
 		this.#scheduleGoalContinuation();

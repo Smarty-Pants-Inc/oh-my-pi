@@ -1180,7 +1180,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 		expect(capturedIsCompacting).toBe(true);
 	});
 
-	it("does not emit todo reminder lifecycle signals or continue automatically", async () => {
+	it("emits one todo reminder lifecycle signal without continuing automatically", async () => {
 		vi.spyOn(session, "getActiveToolNames").mockReturnValue(["todo"]);
 		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
 
@@ -1221,7 +1221,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 		await withTimeout(agentEnd, 1000, "Agent end timed out");
 		await Promise.resolve();
 
-		expect(getRuntimeSignals().some(signal => signal.startsWith("todo:"))).toBe(false);
+		expect(getRuntimeSignals()).toContain("todo:1/3");
 		expect(continueSpy).not.toHaveBeenCalled();
 		await session.waitForIdle();
 	});

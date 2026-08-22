@@ -214,6 +214,13 @@ function compactTerminalFrame(
 	};
 }
 
+function boundedClosureRejection(frame: Record<string, unknown>): { reason: "stale_todos"; todos: [] } | undefined {
+	const closureRejected = frame.closureRejected;
+	if (!isRecord(closureRejected) || closureRejected.reason !== "stale_todos" || !Array.isArray(closureRejected.todos))
+		return undefined;
+	return { reason: "stale_todos", todos: [] };
+}
+
 function overflowFrame(frame: object): object {
 	if (!isRecord(frame)) return { type: "rpc_frame_error", error: "RPC frame exceeded the transport limit" };
 	if (frame.type === "response") {
@@ -226,10 +233,12 @@ function overflowFrame(frame: object): object {
 		};
 	}
 	if (frame.type === "agent_end") {
+		const closureRejected = boundedClosureRejection(frame);
 		return {
 			type: "agent_end",
 			messages: [],
 			messageCount: typeof frame.messageCount === "number" ? frame.messageCount : 0,
+			...(closureRejected ? { closureRejected } : {}),
 		};
 	}
 	return {

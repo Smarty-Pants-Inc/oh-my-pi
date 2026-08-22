@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed terminal stale-todo closure rejections appearing as ordinary completion; browser guests now show a persistent error notice instead.
 ## [17.3.8] - 2026-08-19
 
 ### Fixed

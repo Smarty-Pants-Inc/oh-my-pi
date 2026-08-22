@@ -283,18 +283,17 @@ describe("AgentSession mid-run todo reconciliation nudge", () => {
 		expect(reminderEvents).toEqual([]);
 	});
 
-	it("never emits a stop-time reminder after mutations", async () => {
+	it("only emits its todo reminder at a terminal stop", async () => {
 		vi.spyOn(session.agent, "continue").mockResolvedValue();
 		for (let i = 0; i < THRESHOLD - 1; i++) emitToolResult("edit");
 
 		emitTextOnlyStop();
 		await session.waitForIdle();
-		expect(reminderEvents.length).toBe(0);
+		expect(reminderEvents).toHaveLength(1);
 
-		// The stop-time reminder reset the mutation counter, so one more landed
-		// mutation (crossing the stale pre-reminder threshold) must stay silent.
+		// The stop-time notification does not enable the retired mid-run nudge path.
 		emitToolResult("edit");
 		expect(await drainNudges()).toEqual([]);
-		expect(reminderEvents.length).toBe(0);
+		expect(reminderEvents).toHaveLength(1);
 	});
 });

@@ -1,8 +1,9 @@
 import type { Agent, AgentMessage, AgentTool } from "@oh-my-pi/pi-agent-core";
-import type { AssistantMessage, Model, ToolChoice } from "@oh-my-pi/pi-ai";
+import type { Model, ToolChoice } from "@oh-my-pi/pi-ai";
 import { isRecord, logger, prompt, stringProperty } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
 import { agentBehavior } from "../context/registry";
+import type { AgentClosureRejection } from "../extensibility/shared-events";
 import eagerTaskPrompt from "../prompts/system/eager-task.md" with { type: "text" };
 import eagerTodoPrompt from "../prompts/system/eager-todo.md" with { type: "text" };
 import passiveTodoSnapshotPrompt from "../prompts/todos/current.md" with { type: "text" };
@@ -87,10 +88,15 @@ export interface TodoTrackerHost {
 	consumeLastServedToolChoiceLabel(): string | undefined;
 }
 
+/** Result of a stop-time todo completion check; undefined means no todo gate applies. */
+export type TodoCompletionResult = AgentClosureRejection | "deferred" | undefined;
+
 /** Owns canonical todo state, eager preludes, and passive snapshots. */
 export class TodoTracker {
 	readonly #host: TodoTrackerHost;
 	#phases: TodoPhase[] = [];
+	#reminderCount = 0;
+	#stopReminderSent = false;
 
 	constructor(host: TodoTrackerHost) {
 		this.#host = host;
@@ -116,8 +122,16 @@ export class TodoTracker {
 		return this.#clonePhases(phases);
 	}
 
-	/** Compatibility no-op: todo state has no per-turn continuation budget. */
-	resetCycle(): void {}
+	/** Starts a new prompt without resetting the session-wide reminder cap. */
+	startCycle(): void {
+		this.#stopReminderSent = false;
+	}
+
+	/** Resets the stop-time reminder state for a new session. */
+	resetCycle(): void {
+		this.#reminderCount = 0;
+		this.#stopReminderSent = false;
+	}
 
 	/** Compatibility no-op: subagent completion never starts todo reconciliation. */
 	noteTaskCompletion(): void {}
@@ -209,9 +223,37 @@ export class TodoTracker {
 		return nudges;
 	}
 
-	/** Todo state never schedules a turn after the model stops. */
-	async checkCompletion(_message: AssistantMessage): Promise<boolean> {
-		return false;
+	/** Emits one bounded stop-time notification and reports stale or deferred todo closure. */
+	async checkCompletion(): Promise<TodoCompletionResult> {
+		if (this.#host.consumeLastServedToolChoiceLabel() === "user-force" || this.#host.planModeEnabled())
+			return undefined;
+		if (!this.#host.settings.get("todo.reminders") || !this.#host.settings.get("todo.enabled")) {
+			this.#reminderCount = 0;
+			this.#stopReminderSent = false;
+			return undefined;
+		}
+		if (!this.#host.getActiveToolNames().includes("todo")) return undefined;
+		const todos = this.phases
+			.flatMap(phase => phase.tasks)
+			.filter(task => task.status === "pending" || task.status === "in_progress");
+		if (todos.length === 0) {
+			this.#reminderCount = 0;
+			this.#stopReminderSent = false;
+			return undefined;
+		}
+		if (this.#host.hasPendingAsyncWake()) return "deferred";
+		const maxAttempts = this.#host.settings.get("todo.remindersMax");
+		if (!this.#stopReminderSent && this.#reminderCount < maxAttempts) {
+			this.#reminderCount++;
+			await this.#host.emitSessionEvent({
+				type: "todo_reminder",
+				todos,
+				attempt: this.#reminderCount,
+				maxAttempts,
+			});
+			this.#stopReminderSent = true;
+		}
+		return { reason: "stale_todos", todos };
 	}
 
 	/** Todo state never injects a mid-turn nudge. */

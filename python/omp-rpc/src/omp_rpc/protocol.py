@@ -82,6 +82,7 @@ _WIDGET_PLACEMENT_VALUES: Final[frozenset[str]] = frozenset(
 _TODO_STATUS_VALUES: Final[frozenset[str]] = frozenset(
     {"pending", "in_progress", "completed", "abandoned", "blocked"}
 )
+_CLOSURE_REJECTION_REASON_VALUES: Final[frozenset[str]] = frozenset({"stale_todos"})
 _EXTENSION_UI_METHOD_VALUES: Final[frozenset[str]] = frozenset(
     {
         "select",
@@ -782,6 +783,12 @@ class TodoItem:
 
 
 @dataclass(slots=True, frozen=True)
+class AgentClosureRejection:
+    reason: Literal["stale_todos"]
+    todos: tuple[TodoItem, ...]
+
+
+@dataclass(slots=True, frozen=True)
 class TodoPhase:
     id: str
     name: str
@@ -972,6 +979,7 @@ class AgentEndEvent:
     type: Literal["agent_end"] = "agent_end"
     message_count: int | None = field(default=None, kw_only=True)
     is_terminal: bool | None = field(default=None, kw_only=True)
+    closure_rejected: AgentClosureRejection | None = field(default=None, kw_only=True)
 
 
 @dataclass(slots=True, frozen=True)
@@ -1320,6 +1328,31 @@ def parse_todo_item(payload: JsonObject) -> TodoItem:
     )
 
 
+def parse_agent_closure_rejection(value: object) -> AgentClosureRejection | None:
+    payload = _optional_json_object(value, field="agent_end.closureRejected")
+    if payload is None:
+        return None
+    raw_todos = payload.get("todos")
+    if not isinstance(raw_todos, list):
+        raise TypeError("agent_end.closureRejected.todos must be a list")
+    return AgentClosureRejection(
+        reason=cast(
+            Literal["stale_todos"],
+            _require_literal(
+                payload.get("reason"),
+                _CLOSURE_REJECTION_REASON_VALUES,
+                field="agent_end.closureRejected.reason",
+            ),
+        ),
+        todos=tuple(
+            parse_todo_item(
+                _clone_json_object(item, field="agent_end.closureRejected.todos[]")
+            )
+            for item in raw_todos
+        ),
+    )
+
+
 def parse_todo_phase(payload: JsonObject) -> TodoPhase:
     raw_tasks = payload.get("tasks")
     if raw_tasks is None:
@@ -1616,6 +1649,9 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
             ),
             message_count=_optional_int(payload, "messageCount"),
             is_terminal=_optional_bool(payload, "isTerminal"),
+            closure_rejected=parse_agent_closure_rejection(
+                payload.get("closureRejected")
+            ),
         )
     if event_type == "turn_start":
         return TurnStartEvent()

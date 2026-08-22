@@ -393,6 +393,29 @@ describe("injected collab transport", () => {
 		await host.stop("test cleanup");
 	});
 
+	it("forwards terminal stale-todo closure rejection to collab guests", async () => {
+		const router = new InMemoryCollabRouter();
+		const prompts: { content: unknown; details?: unknown; options?: unknown }[] = [];
+		const listener: { current?: (event: AgentSessionEvent) => void } = {};
+		const host = new CollabHost(makeHostContext(prompts, listener));
+		await host.startWithTransport(router.host(), { trustedLocal: true });
+		const peer = router.guest();
+		const frames = connectRawPeer(peer, "observer");
+		await flush();
+
+		const closureRejected = {
+			reason: "stale_todos" as const,
+			todos: [{ content: "Finish the requested work", status: "pending" as const }],
+		};
+		listener.current?.({ type: "agent_end", messages: [], closureRejected });
+		await flush();
+
+		const event = framesOf(frames, "event").at(-1)?.event;
+		if (event?.type !== "agent_end") throw new Error("expected terminal agent_end frame");
+		expect(event.closureRejected).toEqual(closureRejected);
+		await host.stop("test cleanup");
+	});
+
 	it("keeps trusted-local peers read-only until explicit authority arrives", async () => {
 		const router = new InMemoryCollabRouter();
 		const prompts: { content: unknown; details?: unknown; options?: unknown }[] = [];

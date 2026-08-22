@@ -12,6 +12,7 @@ import { runPrintMode } from "@oh-my-pi/pi-coding-agent/modes/print-mode";
 import {
 	type AgentSession,
 	type AgentSessionDisposeOptions,
+	type AgentSessionEvent,
 	SHUTDOWN_CONSOLIDATE_BUDGET_MS,
 } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SILENT_ABORT_MARKER } from "@oh-my-pi/pi-coding-agent/session/messages";
@@ -150,6 +151,36 @@ describe("Print-mode silent-abort regression", () => {
 		// process.exit(1) SHOULD have been called
 		expect(exitSpy).toHaveBeenCalledWith(1);
 		expect(disposeOptions?.mnemopiConsolidateTimeoutMs).toBe(SHUTDOWN_CONSOLIDATE_BUDGET_MS);
+	});
+
+	it("exits non-zero without printing a final answer when terminal closure is rejected", async () => {
+		const assistantMessage = makeAssistantMessage();
+		const session = createMockSession([assistantMessage]);
+		let listener: ((event: AgentSessionEvent) => void) | undefined;
+		const mutableSession = session as unknown as {
+			subscribe: (callback: (event: AgentSessionEvent) => void) => () => void;
+			prompt: () => Promise<void>;
+		};
+		mutableSession.subscribe = callback => {
+			listener = callback;
+			return () => {};
+		};
+		mutableSession.prompt = async () => {
+			listener?.({
+				type: "agent_end",
+				messages: [assistantMessage],
+				closureRejected: {
+					reason: "stale_todos",
+					todos: [{ content: "Finish print-mode task", status: "pending" }],
+				},
+			});
+		};
+
+		await runPrintMode(session, { mode: "text", initialMessage: "Finish the task" });
+
+		expect(exitSpy).toHaveBeenCalledWith(1);
+		expect(stderrOutput.join("")).toContain("Completion rejected: 1 incomplete todo item(s) remain.");
+		expect(stdoutOutput.join("")).toBe("");
 	});
 
 	it("prints thinking blocks only when printThoughts is enabled", async () => {

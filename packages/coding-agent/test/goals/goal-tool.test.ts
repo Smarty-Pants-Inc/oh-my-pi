@@ -1,8 +1,10 @@
 import { describe, expect, it, vi } from "bun:test";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { completionBudgetReport, GoalRuntime } from "@oh-my-pi/pi-coding-agent/goals/runtime";
-import type { Goal, GoalModeState, GoalTokenUsage } from "@oh-my-pi/pi-coding-agent/goals/state";
+import type { Goal, GoalModeState, GoalRuntimeEvent, GoalTokenUsage } from "@oh-my-pi/pi-coding-agent/goals/state";
 import { GoalTool } from "@oh-my-pi/pi-coding-agent/goals/tools/goal-tool";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { ToolError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
 
 function createUsage(overrides: Partial<GoalTokenUsage> = {}): GoalTokenUsage {
 	return {
@@ -32,20 +34,29 @@ function cloneState(state: GoalModeState | undefined): GoalModeState | undefined
 	return state ? { ...state, goal: { ...state.goal } } : undefined;
 }
 
-function createToolSession(overrides: Partial<ToolSession>): ToolSession {
-	return overrides as ToolSession;
+function createToolSession(overrides: Partial<ToolSession> = {}): ToolSession {
+	return {
+		settings: Settings.isolated({ "todo.enabled": false, "todo.reminders": false }),
+		...overrides,
+	} as ToolSession;
 }
 
 function createRuntimeHarness(initialState?: GoalModeState) {
 	let state = cloneState(initialState);
+	const events: GoalRuntimeEvent[] = [];
+	const persists: Array<{ mode: "goal" | "goal_paused" | "none"; state?: GoalModeState }> = [];
 	const runtime = new GoalRuntime({
 		getState: () => cloneState(state),
 		setState: next => {
 			state = cloneState(next);
 		},
 		getCurrentUsage: () => createUsage(),
-		emit: async () => {},
-		persist: (_mode, _state) => {},
+		emit: async event => {
+			events.push(event);
+		},
+		persist: (mode, persistedState) => {
+			persists.push({ mode, state: cloneState(persistedState) });
+		},
 		sendHiddenMessage: async _message => {},
 		now: () => 0,
 	});
@@ -55,6 +66,8 @@ function createRuntimeHarness(initialState?: GoalModeState) {
 		setState: (next: GoalModeState | undefined) => {
 			state = cloneState(next);
 		},
+		events,
+		persists,
 	};
 }
 
@@ -167,18 +180,123 @@ describe("GoalTool", () => {
 		).rejects.toThrow("cannot create a new goal because this session already has a goal");
 	});
 
-	it("rejects complete when no goal is active", async () => {
+	it("rejects no active goal before inspecting open todos", async () => {
 		const harness = createRuntimeHarness();
 		const tool = new GoalTool(
 			createToolSession({
 				getGoalRuntime: () => harness.runtime,
 				getGoalModeState: () => harness.getState(),
+				settings: Settings.isolated({ "todo.enabled": true, "todo.reminders": true }),
+				isToolActive: name => name === "todo",
+				getTodoPhases: () => [{ name: "Pending", tasks: [{ content: "Open task", status: "pending" }] }],
 			}),
 		);
 
 		await expect(
 			tool.execute("call-complete", { op: "complete", objective: undefined, token_budget: undefined }),
 		).rejects.toThrow("cannot complete goal because no goal is active");
+	});
+
+	it("rejects completion before persisting a terminal goal when todo reminders have open work", async () => {
+		const harness = createRuntimeHarness();
+		await harness.runtime.createGoal({ objective: "Ship the release" });
+		const persistedBefore = harness.persists.length;
+		const eventsBefore = harness.events.length;
+		const tool = new GoalTool(
+			createToolSession({
+				getGoalRuntime: () => harness.runtime,
+				getGoalModeState: () => harness.getState(),
+				settings: Settings.isolated({ "todo.enabled": true, "todo.reminders": true }),
+				isToolActive: name => name === "todo",
+				getTodoPhases: () => [
+					{
+						name: "Verification",
+						tasks: [
+							{ content: "Run focused checks", status: "in_progress" },
+							{ content: "Review results", status: "pending" },
+						],
+					},
+				],
+			}),
+		);
+
+		let rejection: unknown;
+		try {
+			await tool.execute("call-complete", {
+				op: "complete",
+				objective: undefined,
+				token_budget: undefined,
+			});
+		} catch (error) {
+			rejection = error;
+		}
+
+		expect(rejection).toBeInstanceOf(ToolError);
+		expect(rejection).toMatchObject({
+			message:
+				"goal_completion_blocked_by_open_todos: complete or abandon pending and in-progress todo tasks before completing the goal",
+		});
+		expect(harness.getState()).toMatchObject({
+			enabled: true,
+			mode: "active",
+			goal: { objective: "Ship the release", status: "active" },
+		});
+		expect(harness.persists).toHaveLength(persistedBefore);
+		expect(harness.persists.at(-1)).toMatchObject({
+			mode: "goal",
+			state: { enabled: true, mode: "active", goal: { status: "active" } },
+		});
+		expect(harness.events.slice(eventsBefore)).toEqual([]);
+	});
+
+	it("completes with todo reminders when every todo is complete", async () => {
+		const harness = createRuntimeHarness();
+		await harness.runtime.createGoal({ objective: "Ship the release" });
+		const tool = new GoalTool(
+			createToolSession({
+				getGoalRuntime: () => harness.runtime,
+				getGoalModeState: () => harness.getState(),
+				settings: Settings.isolated({ "todo.enabled": true, "todo.reminders": true }),
+				isToolActive: name => name === "todo",
+				getTodoPhases: () => [
+					{ name: "Verification", tasks: [{ content: "Run focused checks", status: "completed" }] },
+				],
+			}),
+		);
+
+		const result = await tool.execute("call-complete", {
+			op: "complete",
+			objective: undefined,
+			token_budget: undefined,
+		});
+
+		expect(result.details?.goal?.status).toBe("complete");
+		expect(harness.getState()).toMatchObject({ enabled: false, mode: "exiting", goal: { status: "complete" } });
+	});
+
+	it("completes despite open todos when todo reminders are disabled", async () => {
+		const harness = createRuntimeHarness();
+		await harness.runtime.createGoal({ objective: "Ship the release" });
+		const tool = new GoalTool(
+			createToolSession({
+				getGoalRuntime: () => harness.runtime,
+				getGoalModeState: () => harness.getState(),
+				settings: Settings.isolated({ "todo.enabled": true, "todo.reminders": false }),
+				isToolActive: name => name === "todo",
+				getTodoPhases: () => [
+					{ name: "Verification", tasks: [{ content: "Run focused checks", status: "pending" }] },
+				],
+			}),
+		);
+
+		const result = await tool.execute("call-complete", {
+			op: "complete",
+			objective: undefined,
+			token_budget: undefined,
+		});
+
+		expect(result.details?.goal?.status).toBe("complete");
+		expect(harness.getState()).toMatchObject({ enabled: false, mode: "exiting", goal: { status: "complete" } });
 	});
 
 	it("rejects op=create when the objective is missing or only whitespace", async () => {
@@ -236,7 +354,7 @@ describe("GoalTool", () => {
 		expect(current.content).toEqual([{ type: "text", text: "No active goal." }]);
 	});
 
-	it("rejects complete for a paused goal", async () => {
+	it("rejects a paused goal before inspecting open todos", async () => {
 		const harness = createRuntimeHarness({
 			enabled: false,
 			mode: "active",
@@ -246,6 +364,9 @@ describe("GoalTool", () => {
 			createToolSession({
 				getGoalRuntime: () => harness.runtime,
 				getGoalModeState: () => harness.getState(),
+				settings: Settings.isolated({ "todo.enabled": true, "todo.reminders": true }),
+				isToolActive: name => name === "todo",
+				getTodoPhases: () => [{ name: "Pending", tasks: [{ content: "Open task", status: "pending" }] }],
 			}),
 		);
 

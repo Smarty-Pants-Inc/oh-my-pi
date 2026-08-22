@@ -3,6 +3,7 @@ Delegate one or more bounded assignments when independent work can reduce wall-c
 Each assignment must be self-contained, scoped to the current request or active goal, and explicit about allowed files, expected result, and integration boundary. Run independent assignments concurrently. Keep coupled changes under one owner.
 
 Delegation divides existing scope; it never creates scope. Do not delegate when dispatch and integration cost exceed the expected benefit.
+Dispatch the initial explicit independent wave, integrate and resolve ownership, then refill only with newly ready independent work.
 
 {{#if asyncEnabled}}
 Execution returns job IDs immediately; completed results are delivered automatically.

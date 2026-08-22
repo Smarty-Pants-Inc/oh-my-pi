@@ -568,6 +568,26 @@ describe("Warp CLI-agent events", () => {
 			query: "prompt aborted",
 			response: "provider cancelled stream",
 		});
+
+		write.mockClear();
+		messageStart(userMessageStart("prompt stale todos"));
+		agentEnd({
+			type: "agent_end",
+			messages: [{ role: "assistant", content: [{ type: "text", text: "draft answer" }] } as never],
+			closureRejected: {
+				reason: "stale_todos",
+				todos: [
+					{ content: "Finish the implementation", status: "pending" },
+					{ content: "Run verification", status: "in_progress" },
+				],
+			},
+		});
+		expect(parseBodies(write).at(-1)).toMatchObject({
+			event: "stop_failure",
+			error_type: "closure_rejected",
+			query: "prompt stale todos",
+			response: "Completion rejected: 2 incomplete todo item(s) remain.",
+		});
 	});
 
 	it("suppresses stop OSC when agent_end willContinue", () => {

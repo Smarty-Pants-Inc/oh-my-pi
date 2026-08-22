@@ -274,6 +274,102 @@ describe("runSubprocess terminal results", () => {
 		expect(result.output.includes("SYSTEM WARNING")).toBe(false);
 	});
 
+	it("fails a yielded subagent result when terminal closure rejects stale todos", async () => {
+		const session = createMockSession(({ emit }) => {
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-stale-todos",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { ok: true } },
+				},
+				isError: false,
+			});
+			emit({
+				type: "agent_end",
+				messages: [],
+				closureRejected: {
+					reason: "stale_todos",
+					todos: [{ content: "Finish delegated work", status: "in_progress" }],
+				},
+			});
+		});
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({ ...baseOptions, id: "subagent-stale-todo-yield" });
+
+		expect(result.exitCode).toBe(1);
+		expect(result.aborted).toBe(false);
+		expect(result.stderr).toBe("Subagent completion rejected: 1 incomplete todo item(s) remain.");
+		expect(result.error).toBe(result.stderr);
+	});
+
+	it("keeps a stale closure failure model-visible without replacing a prior error", () => {
+		const result = finalizeSubprocessOutput({
+			rawOutput: "Draft output from the subagent.",
+			exitCode: 1,
+			stderr: "Earlier execution failure.",
+			doneAborted: false,
+			signalAborted: false,
+			outputSchema: undefined,
+			closureRejected: {
+				reason: "stale_todos",
+				todos: [{ content: "Finish delegated work", status: "pending" }],
+			},
+		});
+
+		expect(result.exitCode).toBe(1);
+		expect(result.rawOutput).toBe(
+			"Draft output from the subagent.\n\nSubagent completion rejected: 1 incomplete todo item(s) remain.",
+		);
+		expect(result.stderr).toBe(
+			"Earlier execution failure.\nSubagent completion rejected: 1 incomplete todo item(s) remain.",
+		);
+	});
+
+	it("captures a stale closure emitted after a deferred agent_end during teardown", async () => {
+		let emitDeferredEnd: ((event: AgentSessionEvent) => void) | undefined;
+		const session = createMockSession(({ emit }) => {
+			emitDeferredEnd = emit;
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-deferred-stale-todos",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { ok: true } },
+				},
+				isError: false,
+			});
+		});
+		const teardownSession = session as unknown as { dispose: () => Promise<void> };
+		teardownSession.dispose = async () => {
+			await Promise.resolve();
+			if (!emitDeferredEnd) throw new Error("Expected the session monitor to be attached before teardown");
+			emitDeferredEnd({ type: "agent_end", messages: [], isTerminal: false } as AgentSessionEvent);
+			emitDeferredEnd({
+				type: "agent_end",
+				messages: [],
+				closureRejected: {
+					reason: "stale_todos",
+					todos: [{ content: "Finish delegated work", status: "in_progress" }],
+				},
+			} as AgentSessionEvent);
+		};
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "subagent-deferred-stale-todo-yield",
+			keepAlive: false,
+		});
+
+		expect(result.exitCode).toBe(1);
+		expect(result.output).toContain("Subagent completion rejected: 1 incomplete todo item(s) remain.");
+		expect(result.stderr).toBe("Subagent completion rejected: 1 incomplete todo item(s) remain.");
+	});
+
 	it("accepts text when a subagent stops before yielding", async () => {
 		const session = createMockSession(({ promptIndex, emit, state }) => {
 			if (promptIndex === 1) {

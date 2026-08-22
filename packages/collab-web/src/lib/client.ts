@@ -454,6 +454,12 @@ export class GuestClient {
 				break;
 			case "agent_end":
 				this.#working = false;
+				if (event.closureRejected) {
+					this.#pushNotice(
+						"error",
+						`Completion rejected: ${event.closureRejected.todos.length} incomplete todo item(s) remain.`,
+					);
+				}
 				break;
 			case "notice":
 				this.#pushNotice(event.level, event.message);

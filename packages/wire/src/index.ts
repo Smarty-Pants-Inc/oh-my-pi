@@ -179,9 +179,20 @@ export interface CollabPromptDetails {
 // Events (handled subset)
 // ═══════════════════════════════════════════════════════════════════════════
 
+export interface TodoItem {
+	content: string;
+	status: "pending" | "in_progress" | "completed" | "abandoned" | "blocked";
+	blocker?: string;
+}
+
+export interface AgentClosureRejection {
+	reason: "stale_todos";
+	todos: TodoItem[];
+}
+
 export type AgentEvent =
 	| { type: "agent_start" }
-	| { type: "agent_end" }
+	| { type: "agent_end"; closureRejected?: AgentClosureRejection }
 	| { type: "turn_start" }
 	| { type: "turn_end" }
 	| { type: "message_start"; message: WireMessage }
@@ -396,8 +407,10 @@ export type WireFrame = GuestFrame | HostFrame;
  *   host), so they must be rejected at hello.
  * - `4`: guest prompts may carry a display name, and persisted prompt details
  *   carry the display-name revision used by identity-aware renderers.
+ * - `5`: terminal `agent_end` frames may carry `closureRejected`, so guests
+ *   can distinguish stale-todo closure failures from successful settles.
  */
-export const COLLAB_PROTO = 4;
+export const COLLAB_PROTO = 5;
 
 /** Parameter key used for intent tracing (e.g. prompt explanation/reasoning) */
 export const INTENT_FIELD = "i";
