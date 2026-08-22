@@ -1657,6 +1657,30 @@ describe("AgentSession handoff", () => {
 		).toHaveLength(1);
 	});
 
+	it("hands off a durable custom prompt with its retimed queue kind", async () => {
+		vi.spyOn(compactionModule, "generateHandoffFromContext").mockResolvedValue("## Goal\nContinue");
+		session.agent.state.isStreaming = true;
+		await session.sendCustomMessage(
+			{ customType: "retimed-handoff-mail", content: "keep new timing", display: true, attribution: "user" },
+			{ deliveryMode: "afterCurrent" },
+		);
+		const queuedId = session.getQueuedPrompts()[0]?.id;
+		if (!queuedId) throw new Error("Expected durable handoff prompt");
+		await expect(session.setQueuedPromptDelivery(queuedId, "steer")).resolves.toEqual({ status: "updated" });
+		session.agent.state.isStreaming = false;
+
+		await session.handoff();
+
+		expect(session.agent.peekFollowUpQueue()).toHaveLength(0);
+		expect(session.agent.peekSteeringQueue()).toHaveLength(1);
+		expect(JSON.stringify(session.agent.peekSteeringQueue()[0])).toContain("keep new timing");
+		const pending = sessionManager
+			.getBranch()
+			.filter(entry => entry.type === "custom" && entry.customType === "omp:pending-semantic-delivery");
+		expect(pending).toHaveLength(1);
+		expect(pending[0]).toMatchObject({ data: { kind: "steer" } });
+	});
+
 	it("keeps durable semantic queue ownership on the source when handoff rolls back", async () => {
 		vi.spyOn(compactionModule, "generateHandoffFromContext").mockResolvedValue("## Goal\nContinue");
 		session.agent.state.isStreaming = true;

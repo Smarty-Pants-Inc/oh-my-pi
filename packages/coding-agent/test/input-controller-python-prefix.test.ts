@@ -97,7 +97,7 @@ describe("InputController Python prompt prefix", () => {
 			text: "$HOME is home",
 			images: undefined,
 			imageLinks: undefined,
-			streamingBehavior: "steer",
+			streamingBehavior: "followUp",
 		});
 		expect(onInputCallback).toHaveBeenCalledTimes(1);
 		expect(submitted).toEqual([
@@ -105,7 +105,7 @@ describe("InputController Python prompt prefix", () => {
 				text: "$HOME is home",
 				images: undefined,
 				imageLinks: undefined,
-				streamingBehavior: "steer",
+				streamingBehavior: "followUp",
 			},
 		]);
 	});
@@ -127,7 +127,7 @@ describe("InputController Python prompt prefix", () => {
 			text: transcript,
 			images: undefined,
 			imageLinks: undefined,
-			streamingBehavior: "steer",
+			streamingBehavior: "followUp",
 		});
 		expect(onInputCallback).toHaveBeenCalledTimes(1);
 		expect(submitted).toEqual([
@@ -135,7 +135,7 @@ describe("InputController Python prompt prefix", () => {
 				text: transcript,
 				images: undefined,
 				imageLinks: undefined,
-				streamingBehavior: "steer",
+				streamingBehavior: "followUp",
 			},
 		]);
 	});

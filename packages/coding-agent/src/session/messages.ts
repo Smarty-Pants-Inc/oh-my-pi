@@ -613,6 +613,20 @@ export function readPendingSemanticDeliveryId(details: unknown): string | undefi
 	return typeof candidate === "string" ? candidate : undefined;
 }
 
+/** Return a collab prompt copy whose persisted details record whether the model
+ * should receive the steering envelope. Absence remains steering for backward
+ * compatibility with older journals. */
+export function withCollabPromptSteering<T>(message: CustomMessage<T>, steering: boolean): CustomMessage<T> {
+	if (message.customType !== COLLAB_PROMPT_MESSAGE_TYPE) return message;
+	const details: Record<string, unknown> = isRecord(message.details) ? message.details : {};
+	if (details.__ompSteering === steering) return message;
+	return { ...message, details: { ...details, __ompSteering: steering } as T };
+}
+
+function collabPromptUsesSteeringEnvelope(details: unknown): boolean {
+	return !isRecord(details) || details.__ompSteering !== false;
+}
+
 /** Explicit allowlist of `details` field names that are AgentSession-internal
  *  transient bookkeeping and MUST be removed before SessionManager persists
  *  the CustomMessageEntry to disk. Scoped intentionally narrow: only fields
@@ -720,11 +734,17 @@ type SteeringUserMessage =
 			attribution: "user";
 	  });
 
-function isSteeringUserMessage(message: AgentMessage | undefined): message is SteeringUserMessage {
-	if (message?.role === "user") return message.steering === true;
+function isCollabUserMessage(
+	message: AgentMessage | undefined,
+): message is CustomMessage & { customType: typeof COLLAB_PROMPT_MESSAGE_TYPE; attribution: "user" } {
 	return (
 		message?.role === "custom" && message.customType === COLLAB_PROMPT_MESSAGE_TYPE && message.attribution === "user"
 	);
+}
+
+function isSteeringUserMessage(message: AgentMessage | undefined): message is SteeringUserMessage {
+	if (message?.role === "user") return message.steering === true;
+	return isCollabUserMessage(message) && collabPromptUsesSteeringEnvelope(message.details);
 }
 
 function userMessageWithoutSteering(message: UserMessage): UserMessage {
@@ -1267,6 +1287,16 @@ function convertOne(m: AgentMessage, interruptedNext: boolean): Message[] {
 			if (isSteeringUserMessage(m)) {
 				const converted = convertMessageToLlm(wrapSteeringUserMessage(m));
 				return converted ? [converted] : [];
+			}
+			if (isCollabUserMessage(m)) {
+				return [
+					{
+						role: "user",
+						content: customMessageContentToLlmContent(m.content),
+						attribution: "user",
+						timestamp: m.timestamp,
+					},
+				];
 			}
 			if (isUserInvokedSkillPrompt(m)) {
 				return [

@@ -37,6 +37,7 @@ import { getAllPluginExtensionPaths } from "../plugins/loader";
 
 import { resolvePath, withHostGuard } from "../utils";
 import type {
+	AppKeybinding,
 	AssistantThinkingRenderer,
 	ComposerShapeDefinition,
 	Extension,
@@ -219,6 +220,8 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 	registerShortcut(
 		shortcut: KeyId,
 		options: {
+			/** Register only while this exact shortcut remains bound to the named app action. */
+			whenKeybinding?: AppKeybinding;
 			description?: string;
 			handler: (ctx: ExtensionContext) => Promise<void> | void;
 		},

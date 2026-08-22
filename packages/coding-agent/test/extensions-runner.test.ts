@@ -203,12 +203,22 @@ describe("ExtensionRunner", () => {
 			getSessionName: () => undefined,
 			setSessionName: async () => {},
 		};
+		const queuedPrompts = [{ id: "queue-1", text: "check the logs", delivery: "steer" as const }];
+		let queueListener: (() => void) | undefined;
+		const unsubscribe = vi.fn();
+		const setQueuedPromptDelivery = vi.fn(async () => ({ status: "updated" as const }));
 		const contextActions = {
 			getModel: () => undefined,
 			isIdle: () => true,
 			isCompacting: () => false,
 			abort: () => {},
 			hasPendingMessages: () => false,
+			getQueuedPrompts: () => queuedPrompts,
+			onQueuedPromptsChanged: (listener: () => void) => {
+				queueListener = listener;
+				return unsubscribe;
+			},
+			setQueuedPromptDelivery,
 			shutdown: () => {},
 			getContextUsage: () => undefined,
 			compact: async () => {},
@@ -225,6 +235,15 @@ describe("ExtensionRunner", () => {
 
 		runner.initialize(actions, contextActions, undefined, undefined, "tui");
 		expect(runner.createContext().mode).toBe("tui");
+
+		const ctx = runner.createContext();
+		expect(ctx.getQueuedPrompts()).toEqual(queuedPrompts);
+		const changed = vi.fn();
+		expect(ctx.onQueuedPromptsChanged(changed)).toBe(unsubscribe);
+		queueListener?.();
+		expect(changed).toHaveBeenCalledTimes(1);
+		expect(await ctx.setQueuedPromptDelivery("queue-1", "afterCurrent")).toEqual({ status: "updated" });
+		expect(setQueuedPromptDelivery).toHaveBeenCalledWith("queue-1", "afterCurrent");
 	});
 
 	describe("shortcut conflicts", () => {

@@ -145,7 +145,7 @@ describe("InputController orphaned submit", () => {
 		await editor.onSubmit?.("do not lose me");
 
 		expect(spies.prompt).toHaveBeenCalledWith("do not lose me", {
-			streamingBehavior: "steer",
+			streamingBehavior: "followUp",
 			images: undefined,
 		});
 		expect(spies.steer).not.toHaveBeenCalled();
@@ -206,7 +206,7 @@ describe("InputController orphaned submit", () => {
 
 		await editor.onSubmit?.("look at this");
 
-		expect(spies.prompt).toHaveBeenCalledWith("look at this", { streamingBehavior: "steer", images: [image] });
+		expect(spies.prompt).toHaveBeenCalledWith("look at this", { streamingBehavior: "followUp", images: [image] });
 		expect(ctx.locallySubmittedUserSignatures.has("look at this\u00001")).toBe(true);
 		expect(ctx.editor.pendingImages.length).toBe(0);
 	});
@@ -234,14 +234,14 @@ describe("InputController orphaned submit", () => {
 	it("returns queued images to the pending-image buffer on queue restore", async () => {
 		const { ctx, editor } = createContext();
 		const image = { type: "image" as const, data: "abc", mimeType: "image/png" };
-		const session = ctx.session as unknown as { clearQueue: () => unknown };
-		session.clearQueue = () => ({
+		const session = ctx.session as unknown as { clearQueueDurably: () => Promise<unknown> };
+		session.clearQueueDurably = async () => ({
 			steering: [{ text: "queued with image", images: [image] }],
 			followUp: [],
 		});
 		const controller = new InputController(ctx);
 
-		const restored = controller.restoreQueuedMessagesToEditor();
+		const restored = await controller.restoreQueuedMessagesToEditor();
 
 		expect(restored).toBe(1);
 		expect(editor.getText()).toBe("queued with image");
@@ -327,7 +327,7 @@ describe("InputController orphaned submit", () => {
 				await editor.onSubmit?.(forwardedText);
 
 				expect(promptSpy).toHaveBeenCalledWith(forwardedText, {
-					streamingBehavior: "steer",
+					streamingBehavior: "followUp",
 					images: undefined,
 				});
 				expect(titleSpy).toHaveBeenCalledWith(forwardedText);

@@ -73,6 +73,23 @@ describe("CustomEditor keybindings", () => {
 		expect(onDisplayReset).toHaveBeenCalledTimes(1);
 		expect(onLiveToggle).toHaveBeenCalledTimes(1);
 	});
+
+	it("lets a custom Shift+Up handler override only that dequeue chord", () => {
+		const editor = new CustomEditor(getEditorTheme());
+		const onDequeue = vi.fn();
+		const queueSelector = vi.fn();
+
+		editor.onDequeue = onDequeue;
+		editor.setCustomKeyHandler("shift+up", queueSelector);
+
+		editor.handleInput("\x1b[1;2A");
+		expect(queueSelector).toHaveBeenCalledTimes(1);
+		expect(onDequeue).not.toHaveBeenCalled();
+
+		editor.handleInput("\x1b[1;3A");
+		expect(queueSelector).toHaveBeenCalledTimes(1);
+		expect(onDequeue).toHaveBeenCalledTimes(1);
+	});
 });
 
 describe("shipped dequeue defaults", () => {
