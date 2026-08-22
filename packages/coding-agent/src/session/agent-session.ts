@@ -8108,7 +8108,7 @@ export class AgentSession {
 		return pendingId;
 	}
 
-	async #appendPendingSemanticDeliveryAsPlainMessage(message: CustomMessage, pendingId: string): Promise<void> {
+	async #appendSemanticDeliveryAsPlainMessage(message: CustomMessage, pendingId?: string): Promise<void> {
 		try {
 			this.agent.appendMessage(message);
 			await this.sessionManager.appendEntriesAtomically(() => {
@@ -8119,21 +8119,23 @@ export class AgentSession {
 					message.details,
 					message.attribution,
 				);
-				this.#appendPendingSemanticDeliverySettlement(pendingId, "delivered");
+				if (pendingId) this.#appendPendingSemanticDeliverySettlement(pendingId, "delivered");
 			});
 		} catch (error) {
 			this.agent.removeMessage(message);
-			try {
-				await this.#cancelPendingSemanticDelivery(pendingId);
-			} catch (rollbackError) {
-				throw new AggregateError(
-					[error, rollbackError],
-					"Plain semantic delivery failed and durable rollback was incomplete",
-				);
+			if (pendingId) {
+				try {
+					await this.#cancelPendingSemanticDelivery(pendingId);
+				} catch (rollbackError) {
+					throw new AggregateError(
+						[error, rollbackError],
+						"Plain semantic delivery failed and durable rollback was incomplete",
+					);
+				}
 			}
 			throw error;
 		}
-		this.#pendingSemanticDeliveryIds.delete(pendingId);
+		if (pendingId) this.#pendingSemanticDeliveryIds.delete(pendingId);
 	}
 
 	async #cancelPendingSemanticDelivery(pendingId: string): Promise<void> {
@@ -8415,18 +8417,7 @@ export class AgentSession {
 						pendingId = this.#pendingSemanticDeliveryId(queuedMessage);
 					}
 					if (!options?.automaticTurnSource) {
-						if (pendingId) {
-							await this.#appendPendingSemanticDeliveryAsPlainMessage(normalizedAppMessage, pendingId);
-						} else {
-							this.agent.appendMessage(normalizedAppMessage);
-							this.sessionManager.appendCustomMessageEntry(
-								normalizedAppMessage.customType,
-								normalizedAppMessage.content,
-								normalizedAppMessage.display,
-								normalizedAppMessage.details,
-								normalizedAppMessage.attribution,
-							);
-						}
+						await this.#appendSemanticDeliveryAsPlainMessage(normalizedAppMessage, pendingId);
 						return { status: "downgraded", delivery: "plain_append", reason: "unscoped_automatic_turn" };
 					}
 					if (this.#extensionRunner?.isHandlingEvent?.()) {
@@ -8521,20 +8512,13 @@ export class AgentSession {
 							this.#scheduleIdleQueueDrain();
 							return { status: "accepted", delivery: "queued_steer" };
 						}
-						await this.#appendPendingSemanticDeliveryAsPlainMessage(
+						await this.#appendSemanticDeliveryAsPlainMessage(
 							normalizedAppMessage,
 							this.#pendingSemanticDeliveryId(queuedMessage),
 						);
 						return { status: "accepted", delivery: "plain_append" };
 					}
-					this.agent.appendMessage(normalizedAppMessage);
-					this.sessionManager.appendCustomMessageEntry(
-						normalizedAppMessage.customType,
-						normalizedAppMessage.content,
-						normalizedAppMessage.display,
-						normalizedAppMessage.details,
-						normalizedAppMessage.attribution,
-					);
+					await this.#appendSemanticDeliveryAsPlainMessage(normalizedAppMessage);
 					return { status: "accepted", delivery: "plain_append" };
 				}
 				const queuedMessage = await this.#persistPendingSemanticDelivery("explicitPrompt", normalizedAppMessage);
