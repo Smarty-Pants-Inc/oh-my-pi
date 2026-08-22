@@ -222,6 +222,31 @@ describe("ReadToolGroupComponent", () => {
 		expect(uris).toContain(url.pathToFileURL(twoPath).href);
 	});
 
+	it("preserves whitespace in confirmed grouped read link targets", () => {
+		settings.override("tui.hyperlinks", "always");
+		const component = new ReadToolGroupComponent();
+		const onePath = path.resolve("/tmp/one.ts");
+		const twoPath = path.resolve("/tmp/two.ts");
+		const confirmedOnePath = `${onePath} `;
+		component.updateArgs({ path: `${onePath} ${twoPath}` }, "read-whitespace-link");
+		component.updateResult(
+			{
+				content: [{ type: "text", text: "combined" }],
+				details: {
+					displayReadTargets: [onePath, twoPath],
+					displayReadTargetLinks: [confirmedOnePath, twoPath],
+				},
+			},
+			false,
+			"read-whitespace-link",
+		);
+
+		const uris = extractLinkUris(component.render(120).join("\n"));
+
+		expect(uris).toContain(url.pathToFileURL(confirmedOnePath).href);
+		expect(uris).not.toContain(url.pathToFileURL(onePath).href);
+	});
+
 	it("renders warning previews with warning styling instead of success styling", () => {
 		const component = new ReadToolGroupComponent({ showContentPreview: true });
 		const examplePath = path.resolve("/tmp/example.ts");

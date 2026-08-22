@@ -8077,7 +8077,6 @@ export class AgentSession {
 	}
 
 	async #appendPendingSemanticDeliveryAsPlainMessage(message: CustomMessage, pendingId: string): Promise<void> {
-		this.agent.appendMessage(message);
 		await this.sessionManager.appendEntriesAtomically(() => {
 			this.sessionManager.appendCustomMessageEntry(
 				message.customType,
@@ -8088,6 +8087,7 @@ export class AgentSession {
 			);
 			this.#appendPendingSemanticDeliverySettlement(pendingId, "delivered");
 		});
+		this.agent.appendMessage(message);
 		this.#pendingSemanticDeliveryIds.delete(pendingId);
 	}
 
