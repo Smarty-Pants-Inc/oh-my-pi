@@ -7828,14 +7828,19 @@ export class AgentSession {
 			!this.#canAutoContinueForFollowUp()
 		) {
 			const followUp = [...this.agent.peekFollowUpQueue()];
-			const directUser = followUp.filter(isUserQueuedMessage);
-			if (directUser.length > 0) {
+			const directUserBlock = new Set<AgentMessage>();
+			for (const [index, message] of followUp.entries()) {
+				if (!isUserQueuedMessage(message)) continue;
+				for (const blockMessage of this.#queuedOwnerBlock(followUp, index)) directUserBlock.add(blockMessage);
+			}
+			if (directUserBlock.size > 0) {
 				// A lifecycle rollback can restore an internal-context tail after the
-				// user queued a follow-up. Promote that direct input to the initial
-				// steering poll so it wins without giving the internal source a turn.
+				// user queued a follow-up. Promote that direct input and its hidden
+				// companions to the initial steering poll so the whole owner block wins
+				// without giving the internal source a turn.
 				this.agent.replaceQueues(
-					directUser,
-					followUp.filter(message => !isUserQueuedMessage(message)),
+					followUp.filter(message => directUserBlock.has(message)),
+					followUp.filter(message => !directUserBlock.has(message)),
 					true,
 				);
 			}

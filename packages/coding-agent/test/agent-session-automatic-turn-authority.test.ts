@@ -254,6 +254,44 @@ describe("AgentSession automatic turn authority", () => {
 		]);
 	});
 
+	it("promotes a hidden physical companion with its direct follow-up after an invalid tail", async () => {
+		const { session, modelCalls, modelContextText } = await createHarness([done("resumed")]);
+		session.agent.appendMessage({
+			role: "custom",
+			customType: "invalid-tail",
+			content: "internal tail",
+			display: false,
+			attribution: "agent",
+			timestamp: Date.now(),
+		});
+		const companion = {
+			role: "custom" as const,
+			customType: "ultrathink-notice",
+			content: "PROMOTED PHYSICAL COMPANION",
+			display: false,
+			attribution: "user" as const,
+			timestamp: Date.now() + 1,
+		};
+		const owner = {
+			role: "user" as const,
+			content: "promoted direct follow-up",
+			attribution: "user" as const,
+			timestamp: Date.now() + 2,
+		};
+
+		await session.runModeExitTeardown(async () => {
+			session.agent.followUp(companion);
+			session.agent.followUp(owner);
+		});
+		await session.waitForIdle();
+
+		expect(modelCalls()).toBe(1);
+		expect(modelContextText(0)).toContain("PROMOTED PHYSICAL COMPANION");
+		expect(modelContextText(0)).toContain("promoted direct follow-up");
+		expect(session.agent.peekSteeringQueue()).toEqual([]);
+		expect(session.agent.peekFollowUpQueue()).toEqual([]);
+	});
+
 	it("parks queued IRC and defers repeated resume while an attributed ask re-answer owns the direct turn", async () => {
 		const gate = Promise.withResolvers<void>();
 		const { session, recorded, modelCalls, modelContextText } = await createHarness(
