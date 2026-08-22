@@ -6137,7 +6137,7 @@
     },
     {
       "path": "packages/coding-agent/package.json",
-      "sha256": "71c4b63a6c26640f3b4590faec9e87f080be2819bbe9e3bb9245fe6e4f293c81"
+      "sha256": "08e0916819df60019b103a1df3c2e5154f68069bf49fd21dcdd5dfc09a31a603"
     },
     {
       "path": "packages/coding-agent/scripts/bundle-dist.ts",
@@ -6153,7 +6153,7 @@
     },
     {
       "path": "packages/coding-agent/scripts/legacy-pi-virtual-module.ts",
-      "sha256": "34aab402ff6ab787a2e8a0ad0a4d6abee69b8699a90fea28ef90ff064cbb5612"
+      "sha256": "9fc681104ef2d16859b97fad109e0dd04c9a7e8cfc9f55309a1495b0a3c43b16"
     },
     {
       "path": "packages/coding-agent/src/advisor/advise-tool.ts",
@@ -6405,7 +6405,7 @@
     },
     {
       "path": "packages/coding-agent/src/cli/models-cli.ts",
-      "sha256": "964c2f4af585976ed573430f7cf37a3cec45e3c9eb36ef16f4ff5575fd70b080"
+      "sha256": "d69f9ad785cb09e46b1589bcdc3e6cc0c6d05d0144d1f4e88445f5ce4e6ed2da"
     },
     {
       "path": "packages/coding-agent/src/cli/plugin-cli.ts",
@@ -6549,7 +6549,7 @@
     },
     {
       "path": "packages/coding-agent/src/commit/agentic/agent.ts",
-      "sha256": "9acb83620b3055659477f544ccc108577fc04111f250ece8e6b1e7b2ef2461de"
+      "sha256": "10d847a93165763428a3f9c3ab6b7d2faa8e26681e832d12282fbf5e19cb001a"
     },
     {
       "path": "packages/coding-agent/src/commit/agentic/fallback.ts",
@@ -6721,7 +6721,7 @@
     },
     {
       "path": "packages/coding-agent/src/compress/session.ts",
-      "sha256": "fe9d806334ad89e72c3308b9a502c11f7d6875a299db5ea373f627bb71558574"
+      "sha256": "e05f3f54e5e026e1c682c4db7c98b9caf6f2c305efdae64e95141d45cc4a2715"
     },
     {
       "path": "packages/coding-agent/src/config.ts",
@@ -6813,7 +6813,7 @@
     },
     {
       "path": "packages/coding-agent/src/context/approved-policy.ts",
-      "sha256": "c0611213e392227027ea6e4d91590f751251870c6fb2f77917b70c4d8834ea7c"
+      "sha256": "53ee6ad9f46fd1b3bb69859d3bcdcb3c9d8578ebd9e3b4ce3c2eb557cc2ca6f5"
     },
     {
       "path": "packages/coding-agent/src/context/canonical.ts",
@@ -6828,12 +6828,8 @@
       "sha256": "be84060c81c6ce50c9cc48748a2ef4b7c683f13a1415f916f73433628c318f87"
     },
     {
-      "path": "packages/coding-agent/src/context/internal-session.ts",
-      "sha256": "926487563b3f085f89ef5954c4a7a46beb3dea34562b389ea42f0572f94cb6d0"
-    },
-    {
       "path": "packages/coding-agent/src/context/manifest.ts",
-      "sha256": "aba3e773b6c2eff4f49110d883790589ac955cc09e08fb6acee6a604915ec2f8"
+      "sha256": "896f060665ef4aaf380c24344391272490ad9be0b4b968feb97301b6fdadcbb6"
     },
     {
       "path": "packages/coding-agent/src/context/prompt-sources.generated.ts",
@@ -7369,7 +7365,7 @@
     },
     {
       "path": "packages/coding-agent/src/extensibility/extensions/loader.ts",
-      "sha256": "8e327f50f920d3023e12991759cd262991a4d6b3ebd33f5ad797f49437117336"
+      "sha256": "21f0611ffe8804867427c4e0f5b498cd6e5eeb579a33009389ffdb706335c280"
     },
     {
       "path": "packages/coding-agent/src/extensibility/extensions/managed-timers.ts",
@@ -7381,7 +7377,7 @@
     },
     {
       "path": "packages/coding-agent/src/extensibility/extensions/runner.ts",
-      "sha256": "d68ddacfdb5715b439a91e44323351cc0c0ecbc22c9987fe0a7f9a35456b02d6"
+      "sha256": "37ecd7e641dfafbe290193ee3c344f7b48f72e96331b7e257c744de479fa9b4b"
     },
     {
       "path": "packages/coding-agent/src/extensibility/extensions/types.ts",
@@ -7409,7 +7405,7 @@
     },
     {
       "path": "packages/coding-agent/src/extensibility/legacy-pi-coding-agent-shim.ts",
-      "sha256": "64275ecc559eb6b785c60c016e89192c4e9de025f43b3a152a5da79e5751ea5f"
+      "sha256": "f4b85c8928bccb6d1095d2f0fe24062573d9fe7fc90caa04920e5709e5191355"
     },
     {
       "path": "packages/coding-agent/src/extensibility/legacy-typebox.ts",
@@ -7429,7 +7425,7 @@
     },
     {
       "path": "packages/coding-agent/src/extensibility/plugins/legacy-pi-compat.ts",
-      "sha256": "7ce0ab192d002f3403d95256d4c3b735611a0f91c91ef1bd8f4714a3e4b67e15"
+      "sha256": "4a9b7192efd6a09ba7aed47959000129182e46c2f9240b835b70704463647d2f"
     },
     {
       "path": "packages/coding-agent/src/extensibility/plugins/loader.ts",
@@ -7801,7 +7797,7 @@
     },
     {
       "path": "packages/coding-agent/src/main.ts",
-      "sha256": "572818d4d5a92d208535ae279a8fd20960b84a816d06a984e72033af218d1c35"
+      "sha256": "5a4b199e29b1b4f278f17763731e5a013c980fc89f889bf8cede3fb089e34fca"
     },
     {
       "path": "packages/coding-agent/src/markit/converters/docx.ts",
@@ -8013,7 +8009,7 @@
     },
     {
       "path": "packages/coding-agent/src/modes/components/agents-hub.ts",
-      "sha256": "4f305f450f143d6ac66bef64efba14c51c4d6ef1325431f05f18bfa31eba54d7"
+      "sha256": "5bdf1b184045d7d3b700c1fab3bbbe79b22fc38867bade4d4a049cd959af0caa"
     },
     {
       "path": "packages/coding-agent/src/modes/components/ask-dialog.ts",
@@ -8181,7 +8177,7 @@
     },
     {
       "path": "packages/coding-agent/src/modes/controllers/tan-command-controller.ts",
-      "sha256": "594f0df603fd0b4cafdaa90fb12087f7f7a67473f8c2a2f1abc5f3bc5c2bc7df"
+      "sha256": "d6ff527d3a276fe07ce1b2c901e2c4d51e45c348c93a6fc776e92eda7e1e5468"
     },
     {
       "path": "packages/coding-agent/src/modes/controllers/todo-command-controller.ts",
@@ -8349,7 +8345,7 @@
     },
     {
       "path": "packages/coding-agent/src/sdk.ts",
-      "sha256": "795aaf0cc324d1249b5975d0a49311303f4d641538a1422e9567fd7c30ff7297"
+      "sha256": "b7f8c1b24fc01df6ff463c84d53bdb28008ae4f333c18676de080ed8e2893917"
     },
     {
       "path": "packages/coding-agent/src/secrets/index.ts",
@@ -8409,7 +8405,7 @@
     },
     {
       "path": "packages/coding-agent/src/security/coordinator.ts",
-      "sha256": "3b43d125b0c9c4e6fd9a006dc1af1b632676547b87f43d7e4578f4fe705cbb6f"
+      "sha256": "ce143a165bc94c35fff782a2c99a7a65b70b3db60ab6a01d4acf5055bd297120"
     },
     {
       "path": "packages/coding-agent/src/security/importers/codex-security.ts",
@@ -8897,7 +8893,7 @@
     },
     {
       "path": "packages/coding-agent/src/task/executor.ts",
-      "sha256": "97f73f71be2191f3bdb6ae8b462013801ced819d1777a554893d1830fe820140"
+      "sha256": "46020d18bba4fcddabea8230cf5d9fee2b5e3ce09a11efb846f00efe88e1ea8f"
     },
     {
       "path": "packages/coding-agent/src/task/index.ts",
@@ -8933,7 +8929,7 @@
     },
     {
       "path": "packages/coding-agent/src/task/persisted-revive.ts",
-      "sha256": "a963720690e173da3eacac16c3656665e16cdb148d9f0b35addb9b3cf86dd120"
+      "sha256": "5df02a79a3bbbe02f6a64411c78187900412b864cff9fe1f6f969cdd7e04315a"
     },
     {
       "path": "packages/coding-agent/src/task/prewalk.ts",
@@ -10737,5 +10733,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "da9068b1158759e9840f0e2a059b7aabfdb073168b7e34aa6ddf9c24f8781d6b"
+  "rootSha256": "a8d8bb191081344ddfedcbe0cf95bf93e73ff02110c7734bd154b70e6ada7e28"
 }
