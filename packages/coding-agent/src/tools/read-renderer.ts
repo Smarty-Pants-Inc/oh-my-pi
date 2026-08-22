@@ -62,8 +62,9 @@ function formatReadPathLink(
 		sourcePath?: string;
 		suffixResolution?: { from: string; to: string };
 		offset?: number;
+		sourceLineAligned?: boolean;
 		fallbackLabel?: string;
-		link?: boolean;
+		link: boolean;
 	},
 ): string {
 	const split = splitReadRenderPath(rawPath);
@@ -77,7 +78,7 @@ function formatReadPathLink(
 		options.link === false
 			? undefined
 			: (options.resolvedPath ?? options.sourcePath ?? tryResolveInternalUrlSync(basePath) ?? absoluteInputPath);
-	const line = firstReadSelectorLine(split.sel) ?? options.offset;
+	const line = options.sourceLineAligned === false ? undefined : (firstReadSelectorLine(split.sel) ?? options.offset);
 	const linkOptions = line !== undefined ? { line } : undefined;
 	const linkedPath = target ? fileHyperlink(target, plainDisplayPath, linkOptions) : plainDisplayPath;
 	return `${linkedPath}${selectorSuffix}`;
@@ -94,7 +95,7 @@ export const readToolRenderer = {
 		const offset = args.offset;
 		const limit = args.limit;
 
-		let pathDisplay = formatReadPathLink(rawPath, { offset, fallbackLabel: "…", link: false }) || "…";
+		let pathDisplay = formatReadPathLink(rawPath, { fallbackLabel: "…", link: false }) || "…";
 		if (offset !== undefined || limit !== undefined) {
 			const startLine = offset ?? 1;
 			const endLine = limit !== undefined ? startLine + limit - 1 : "";
@@ -131,12 +132,7 @@ export const readToolRenderer = {
 			const errorText = (rawErrorText || "Unknown error").replace(/^Error:\s*/, "");
 			const rawPath =
 				typeof args?.file_path === "string" ? args.file_path : typeof args?.path === "string" ? args.path : "";
-			const filePath =
-				formatReadPathLink(rawPath, {
-					offset: args?.offset,
-					sourcePath: readSourceFsPath(result.details),
-					link: false,
-				}) || shortenPath(rawPath);
+			const filePath = formatReadPathLink(rawPath, { link: false }) || shortenPath(rawPath);
 			let title = filePath ? `Read ${filePath}` : "Read";
 			if (args?.offset !== undefined || args?.limit !== undefined) {
 				const startLine = args.offset ?? 1;
@@ -191,6 +187,7 @@ export const readToolRenderer = {
 				sourcePath: readSourceFsPath(details),
 				suffixResolution: suffix,
 				fallbackLabel: "image",
+				sourceLineAligned: details?.sourceLineAligned,
 				link: details?.isDirectory === false,
 			});
 			const correction = suffix ? ` ${uiTheme.fg("dim", `(corrected from ${shortenPath(suffix.from)})`)}` : "";
@@ -230,6 +227,7 @@ export const readToolRenderer = {
 			resolvedPath: details?.resolvedPath,
 			sourcePath: readSourceFsPath(details),
 			suffixResolution: suffix,
+			sourceLineAligned: details?.sourceLineAligned,
 			offset: args?.offset,
 			link: details?.isDirectory === false,
 		});

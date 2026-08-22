@@ -492,6 +492,24 @@ describe("Settings", () => {
 			expect(settings.getModelRole("global_role")).toBe("openai/global");
 			expect(settings.getModelRole("project_role")).toBe("openai/project");
 		});
+		it("resynchronizes terminal hyperlinks from a persisted reload", async () => {
+			const originalNoHyperlinks = Bun.env.PI_NO_HYPERLINKS;
+			delete Bun.env.PI_NO_HYPERLINKS;
+			try {
+				await writeSettings({ tui: { hyperlinks: "off" } });
+				const settings = await Settings.init({ cwd: projectDir, agentDir });
+				expect(TERMINAL.hyperlinks).toBe(false);
+
+				await writeSettings({ tui: { hyperlinks: "always" } });
+				await settings.reloadFromDisk();
+
+				expect(settings.get("tui.hyperlinks")).toBe("always");
+				expect(TERMINAL.hyperlinks).toBe(true);
+			} finally {
+				if (originalNoHyperlinks === undefined) delete Bun.env.PI_NO_HYPERLINKS;
+				else Bun.env.PI_NO_HYPERLINKS = originalNoHyperlinks;
+			}
+		});
 		it("retries when a persisted setting changes while files are being read", async () => {
 			await writeSettings({ setupVersion: 1 });
 			const settings = await Settings.init({ cwd: projectDir, agentDir });

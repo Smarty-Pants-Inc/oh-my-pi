@@ -724,6 +724,7 @@ export class Settings {
 			this.#configOverlay = overlayResult.value.settings;
 			this.#overlayShellPathSource = overlayResult.value.shellPathSource;
 			this.#rebuildMerged();
+			if (this === globalInstance) applyHyperlinkSetting(this.get("tui.hyperlinks"));
 
 			const nextModelRoles = this.get("modelRoles");
 			if (!Bun.deepEquals(nextModelRoles, previousSignaledValues.modelRoles)) {

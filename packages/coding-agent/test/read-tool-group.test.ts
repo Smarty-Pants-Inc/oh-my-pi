@@ -365,6 +365,28 @@ describe("ReadToolGroupComponent", () => {
 		expect(extractLinkTexts(rendered)).not.toContain("src/example.ts:7-9");
 	});
 
+	it("links transformed backing files without raw selector line targets", () => {
+		settings.override("tui.hyperlinks", "always");
+		const component = new ReadToolGroupComponent();
+		const backingPath = path.resolve("/workspace/fixture.zip");
+		component.updateArgs({ path: `${backingPath}:member.txt:7` }, "read-transformed-link");
+		component.updateResult(
+			{
+				content: [{ type: "text", text: "rendered member line" }],
+				details: { resolvedPath: backingPath, isDirectory: false, sourceLineAligned: false },
+			},
+			false,
+			"read-transformed-link",
+		);
+
+		const rendered = component.render(120).join("\n");
+		const backingUri = url.pathToFileURL(backingPath).href;
+		const backingLineUri = new URL(backingUri);
+		backingLineUri.searchParams.set("line", "7");
+		expect(extractLinkUris(rendered)).toContain(backingUri);
+		expect(extractLinkUris(rendered)).not.toContain(backingLineUri.href);
+	});
+
 	it("leaves pending and directory grouped paths unlinked", () => {
 		settings.override("tui.hyperlinks", "always");
 		const component = new ReadToolGroupComponent();

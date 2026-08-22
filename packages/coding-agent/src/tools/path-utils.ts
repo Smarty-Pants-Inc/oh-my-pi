@@ -329,6 +329,12 @@ export function splitPathAndSel(rawPath: string): { path: string; sel?: string }
 	return { path: basePath, sel };
 }
 
+/** Preserve a trailing read selector when suffix resolution replaced only the path. */
+export function recombineReadPathSelector(currentPath: string, resolvedPath: string): string {
+	const selector = splitPathAndSel(currentPath).sel;
+	return selector && !splitPathAndSel(resolvedPath).sel ? `${resolvedPath}:${selector}` : resolvedPath;
+}
+
 /**
  * Three-way probe for whether the exact filesystem entry named by `filePath`
  * exists. `stat` (used earlier) failed for reasons other than "no such file"

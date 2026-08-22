@@ -74,6 +74,7 @@ import {
 	type LineRange,
 	pathTargetsSsh,
 	probeLiteralPathExists,
+	recombineReadPathSelector,
 	resolveReadPath,
 	splitDelimitedPathEntry,
 	splitInternalUrlSel,
@@ -541,6 +542,8 @@ export interface ReadToolDetails {
 	truncation?: TruncationResult;
 	/** True for a directory, false only for a confirmed regular filesystem file. */
 	isDirectory?: boolean;
+	/** False when rendered lines are transformed and do not map to raw lines in the confirmed backing file. */
+	sourceLineAligned?: boolean;
 	resolvedPath?: string;
 	suffixResolution?: { from: string; to: string };
 	url?: string;
@@ -735,6 +738,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		const content: Array<TextContent | ImageContent> = [];
 		const displayReadTargets: string[] = [];
 		const displayReadTargetLinks: Array<string | null> = [];
+		let sourceLineAligned = true;
 		let pendingText = notice;
 		const flushText = () => {
 			if (pendingText.length === 0) return;
@@ -748,13 +752,9 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		for (const part of parts) {
 			try {
 				const result = await this.execute("read-delimited-part", { path: part }, signal);
+				if (result.details?.sourceLineAligned === false) sourceLineAligned = false;
 				const suffixResolution = result.details?.suffixResolution;
-				const selector = splitPathAndSel(part).sel;
-				displayReadTargets.push(
-					suffixResolution && selector && !splitPathAndSel(suffixResolution.to).sel
-						? `${suffixResolution.to}:${selector}`
-						: (suffixResolution?.to ?? part),
-				);
+				displayReadTargets.push(suffixResolution ? recombineReadPathSelector(part, suffixResolution.to) : part);
 				const source = result.details?.meta?.source;
 				const linkPath =
 					!result.isError && result.details?.isDirectory === false
@@ -781,7 +781,9 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		}
 		flushText();
 
-		return toolResult<ReadToolDetails>({ notes, displayReadTargets, displayReadTargetLinks }).content(content).done();
+		const details: ReadToolDetails = { notes, displayReadTargets, displayReadTargetLinks };
+		if (!sourceLineAligned) details.sourceLineAligned = false;
+		return toolResult(details).content(content).done();
 	}
 
 	async #readPdfPageScreenshot(options: {
@@ -1357,14 +1359,14 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			if (rendered) {
 				if (isMultiRange(parsed) && parsed.kind === "lines") {
 					return buildInMemoryMultiRangeResult(this.session, rendered, parsed.ranges, {
-						details: { resolvedPath: absolutePath, isDirectory: false },
+						details: { resolvedPath: absolutePath, isDirectory: false, sourceLineAligned: false },
 						sourcePath: absolutePath,
 						entityLabel: "profile summary",
 					});
 				}
 				const { offset, limit } = selToOffsetLimit(parsed);
 				return buildInMemoryTextResult(this.session, rendered, offset, limit, {
-					details: { resolvedPath: absolutePath, isDirectory: false },
+					details: { resolvedPath: absolutePath, isDirectory: false, sourceLineAligned: false },
 					sourcePath: absolutePath,
 					entityLabel: "profile summary",
 				});
@@ -1391,20 +1393,22 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			const notebookText = await readEditableNotebookText(absolutePath, resolvedDisplayPath);
 			if (isMultiRange(parsed) && parsed.kind === "lines") {
 				return buildInMemoryMultiRangeResult(this.session, notebookText, parsed.ranges, {
-					details: { resolvedPath: absolutePath, isDirectory: false },
+					details: { resolvedPath: absolutePath, isDirectory: false, sourceLineAligned: false },
 					sourcePath: absolutePath,
 					entityLabel: "notebook",
 				});
 			}
 			const { offset, limit } = selToOffsetLimit(parsed);
 			return buildInMemoryTextResult(this.session, notebookText, offset, limit, {
-				details: { resolvedPath: absolutePath, isDirectory: false },
+				details: { resolvedPath: absolutePath, isDirectory: false, sourceLineAligned: false },
 				sourcePath: absolutePath,
 				entityLabel: "notebook",
 			});
 		} else if (shouldConvertWithMarkit) {
 			// Convert document via markit.
 			const result = await convertFileWithMarkit(absolutePath, signal);
+			// Converted output is addressed by its own lines, not raw source-file lines.
+			details.sourceLineAligned = false;
 			if (result.ok) {
 				const renderedContent = result.content;
 				// Route the converted markdown through the in-memory text builder
@@ -1418,6 +1422,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 							resolvedPath: absolutePath,
 							contentType: this.session.settings.get("read.renderMarkdown") ? "text/markdown" : undefined,
 							isDirectory: false,
+							sourceLineAligned: false,
 						},
 						sourcePath: absolutePath,
 						entityLabel: "document",
@@ -1429,6 +1434,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						resolvedPath: absolutePath,
 						contentType: this.session.settings.get("read.renderMarkdown") ? "text/markdown" : undefined,
 						isDirectory: false,
+						sourceLineAligned: false,
 					},
 					sourcePath: absolutePath,
 					entityLabel: "document",
