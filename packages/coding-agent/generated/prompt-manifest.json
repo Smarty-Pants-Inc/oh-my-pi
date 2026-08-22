@@ -8642,7 +8642,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/session-manager.ts",
-      "sha256": "5e04c771a92357abc16f4f893a1a502092304890571ad324c2f5743d28a116e0"
+      "sha256": "9dac6fde0bca13607947c209e6a5a54872d6e0f8ab3c3c71716c534b90a6f1c3"
     },
     {
       "path": "packages/coding-agent/src/session/session-memory.ts",
@@ -10746,5 +10746,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "cf52d8735d152b81c82185a48a562c3b56708e12692604cfae7ff448578346cf"
+  "rootSha256": "2caf5ea096018fcefd9bef4238dc904e064695469c131675839e7d92d5f43155"
 }
