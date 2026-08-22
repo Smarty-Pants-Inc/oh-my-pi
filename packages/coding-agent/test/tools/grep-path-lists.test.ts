@@ -540,6 +540,26 @@ describe("tool path arrays", () => {
 		]);
 	});
 
+	it("read preserves selectors on suffix-resolved delimited paths", async () => {
+		const recovered = path.join(tempDir, "nested", "missing", "apps", "recovered.txt");
+		await fs.mkdir(path.dirname(recovered), { recursive: true });
+		await fs.writeFile(recovered, "recovered\n");
+		const tools = await createTools(createTestSession(tempDir));
+		const tool = tools.find(entry => entry.name === "read");
+		expect(tool).toBeDefined();
+		if (!tool) throw new Error("Missing read tool");
+
+		const result = await tool.execute("read-delimited-suffix", {
+			path: "missing/apps/recovered.txt:1-1, packages/grep.txt:1-1",
+		});
+		const details = result.details as
+			| { displayReadTargets?: string[]; displayReadTargetLinks?: Array<string | null> }
+			| undefined;
+
+		expect(details?.displayReadTargets).toEqual(["nested/missing/apps/recovered.txt:1-1", "packages/grep.txt:1-1"]);
+		expect(details?.displayReadTargetLinks).toEqual([recovered, path.join(tempDir, "packages", "grep.txt")]);
+	});
+
 	it("read keeps readable delimited paths when peers are missing", async () => {
 		const tools = await createTools(createTestSession(tempDir));
 		const tool = tools.find(entry => entry.name === "read");

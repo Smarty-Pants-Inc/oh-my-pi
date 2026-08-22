@@ -443,7 +443,7 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 		const suffixResolution = getSuffixResolution(details);
 		const displayPaths = getDisplayReadTargets(details);
 		const displayLinkPaths = result.isError ? undefined : getDisplayReadTargetLinks(details);
-		entry.linkPath = !result.isError && details?.isDirectory !== true ? readResultLinkPath(details) : undefined;
+		entry.linkPath = !result.isError && details?.isDirectory === false ? readResultLinkPath(details) : undefined;
 		if (suffixResolution) {
 			entry.path = displayPathWithSuffixResolution(entry.path, suffixResolution);
 			entry.correctedFrom = suffixResolution.from;

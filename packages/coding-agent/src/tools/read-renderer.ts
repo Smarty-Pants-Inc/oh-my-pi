@@ -191,7 +191,7 @@ export const readToolRenderer = {
 				sourcePath: readSourceFsPath(details),
 				suffixResolution: suffix,
 				fallbackLabel: "image",
-				link: details?.isDirectory !== true,
+				link: details?.isDirectory === false,
 			});
 			const correction = suffix ? ` ${uiTheme.fg("dim", `(corrected from ${shortenPath(suffix.from)})`)}` : "";
 			const header = renderStatusLine(
@@ -231,7 +231,7 @@ export const readToolRenderer = {
 			sourcePath: readSourceFsPath(details),
 			suffixResolution: suffix,
 			offset: args?.offset,
-			link: details?.isDirectory !== true,
+			link: details?.isDirectory === false,
 		});
 		const correction = suffix ? ` ${uiTheme.fg("dim", `(corrected from ${shortenPath(suffix.from)})`)}` : "";
 		let title = displayPath ? `Read ${displayPath}${correction}` : "Read";
