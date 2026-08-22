@@ -8109,17 +8109,30 @@ export class AgentSession {
 	}
 
 	async #appendPendingSemanticDeliveryAsPlainMessage(message: CustomMessage, pendingId: string): Promise<void> {
-		this.agent.appendMessage(message);
-		await this.sessionManager.appendEntriesAtomically(() => {
-			this.sessionManager.appendCustomMessageEntry(
-				message.customType,
-				message.content,
-				message.display,
-				message.details,
-				message.attribution,
-			);
-			this.#appendPendingSemanticDeliverySettlement(pendingId, "delivered");
-		});
+		try {
+			this.agent.appendMessage(message);
+			await this.sessionManager.appendEntriesAtomically(() => {
+				this.sessionManager.appendCustomMessageEntry(
+					message.customType,
+					message.content,
+					message.display,
+					message.details,
+					message.attribution,
+				);
+				this.#appendPendingSemanticDeliverySettlement(pendingId, "delivered");
+			});
+		} catch (error) {
+			this.agent.removeMessage(message);
+			try {
+				await this.#cancelPendingSemanticDelivery(pendingId);
+			} catch (rollbackError) {
+				throw new AggregateError(
+					[error, rollbackError],
+					"Plain semantic delivery failed and durable rollback was incomplete",
+				);
+			}
+			throw error;
+		}
 		this.#pendingSemanticDeliveryIds.delete(pendingId);
 	}
 
