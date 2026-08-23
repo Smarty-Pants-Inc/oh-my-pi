@@ -826,6 +826,7 @@ async function joinRawGuest(
 		event: true,
 		bus: true,
 		"snapshot-chunk": true,
+		"replay-complete": true,
 	};
 	socket.onFrame = frame => {
 		if (filtered[frame.t]) return;

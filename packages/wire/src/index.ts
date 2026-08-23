@@ -357,6 +357,8 @@ export type HostFrame =
 			 * with `final: true`).
 			 */
 			entryCount: number;
+			/** Monotonic host replay epoch completed by the matching `replay-complete` frame. */
+			replayEpoch?: number;
 			/** True when this peer joined through a read-only (view) link. */
 			readOnly?: boolean;
 	  }
@@ -367,6 +369,8 @@ export type HostFrame =
 	 * carries `final: true`; guests finalize the replica on that frame.
 	 */
 	| { t: "snapshot-chunk"; entries: SessionEntry[]; final: boolean }
+	/** Snapshot replay boundary sent after authority and any pending UI requests for that replay. */
+	| { t: "replay-complete"; replayEpoch: number }
 	| { t: "entry"; entry: SessionEntry }
 	| { t: "event"; event: AgentEvent }
 	| { t: "state"; state: SessionState }

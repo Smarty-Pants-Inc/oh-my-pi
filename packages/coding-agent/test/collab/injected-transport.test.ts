@@ -158,6 +158,14 @@ describe("injected collab transport", () => {
 			const replacementFrames = connectRawPeer(replacement, "replacement renderer");
 			await flush();
 			expect(framesOf(replacementFrames, "ui-request")).toEqual([original]);
+			const finalSnapshotIndex = replacementFrames.findIndex(frame => frame.t === "snapshot-chunk" && frame.final);
+			const requestIndex = replacementFrames.findIndex(frame => frame.t === "ui-request");
+			const replayCompleteIndex = replacementFrames.findIndex(frame => frame.t === "replay-complete");
+			const welcome = framesOf(replacementFrames, "welcome").at(-1);
+			const replayComplete = framesOf(replacementFrames, "replay-complete").at(-1);
+			expect(requestIndex).toBeGreaterThan(finalSnapshotIndex);
+			expect(replayCompleteIndex).toBeGreaterThan(requestIndex);
+			expect(replayComplete?.replayEpoch).toBe(welcome?.replayEpoch);
 
 			replacement.send({ t: "ui-response", reqId: original.request.reqId, value: "replacement answer" });
 			expect(await pending).toEqual({ kind: "answered", value: "replacement answer" });

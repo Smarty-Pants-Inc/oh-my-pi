@@ -80,6 +80,7 @@ interface PendingSnapshot {
 	readOnly: boolean;
 	entryCount: number;
 	entries: SessionEntry[];
+	replayEpoch: number | undefined;
 	isResync: boolean;
 }
 
@@ -171,6 +172,12 @@ export class CollabGuestLink {
 	#returnSessionFile: string | null = null;
 	/** Frames apply strictly in arrival order through this chain. */
 	#applyChain: Promise<void> = Promise.resolve();
+	/** Latest replay epoch received from a welcome, including one still queued for application. */
+	#latestReplayEpoch: number | undefined;
+	/** Latest replay epoch whose snapshot has fully finalized. */
+	#activeReplayEpoch: number | undefined;
+	/** Replay epoch already reported through the optional local bridge hook. */
+	#notifiedReplayEpoch: number | undefined;
 	/** True after the initial snapshot has been written to disk and resumed. */
 	#welcomed = false;
 	/** Set before the replica switch so a partially applied join is restored even without a welcome. */
@@ -327,6 +334,9 @@ export class CollabGuestLink {
 			this.#pendingSnapshot = null;
 			this.#clearSnapshotProgressTimer();
 			this.#armWelcomeTimer();
+			this.#latestReplayEpoch = undefined;
+			this.#activeReplayEpoch = undefined;
+			this.#notifiedReplayEpoch = undefined;
 			socket.send({
 				t: "hello",
 				proto: COLLAB_PROTO,
@@ -335,6 +345,7 @@ export class CollabGuestLink {
 			});
 		};
 		socket.onFrame = frame => {
+			if (frame.t === "welcome") this.#latestReplayEpoch = frame.replayEpoch;
 			this.#applyChain = this.#applyChain
 				.then(async () => {
 					if (frame.t === "welcome") {
@@ -456,6 +467,7 @@ export class CollabGuestLink {
 			agents: frame.agents,
 			readOnly: frame.readOnly === true,
 			entryCount: frame.entryCount,
+			replayEpoch: frame.replayEpoch,
 			entries: [],
 			isResync,
 		};
@@ -521,7 +533,10 @@ export class CollabGuestLink {
 		this.#ctx.showStatus(
 			pending.isResync ? `Reconnected to collab session${suffix}` : `Joined collab session${suffix}`,
 		);
-		this.#socket?.notifyReplicaReady?.();
+		this.#activeReplayEpoch =
+			pending.replayEpoch !== undefined && pending.replayEpoch === this.#latestReplayEpoch
+				? pending.replayEpoch
+				: undefined;
 	}
 
 	#armWelcomeTimer(): void {
@@ -596,6 +611,9 @@ export class CollabGuestLink {
 			case "ui-request-end":
 				this.#endUiRequest(frame.reqId);
 				break;
+			case "replay-complete":
+				this.#notifyReplicaReady(frame.replayEpoch);
+				break;
 			case "transcript": {
 				const resolve = this.#pendingTranscripts.get(frame.reqId);
 				if (resolve) {
@@ -625,6 +643,21 @@ export class CollabGuestLink {
 			default:
 				logger.debug("collab guest ignoring unexpected frame", { type: frame.t });
 		}
+	}
+
+	#notifyReplicaReady(replayEpoch: number): void {
+		const socket = this.#socket;
+		if (
+			this.#left ||
+			!this.#welcomed ||
+			replayEpoch !== this.#latestReplayEpoch ||
+			replayEpoch !== this.#activeReplayEpoch ||
+			replayEpoch === this.#notifiedReplayEpoch ||
+			!socket?.notifyReplicaReady
+		)
+			return;
+		this.#notifiedReplayEpoch = replayEpoch;
+		socket.notifyReplicaReady();
 	}
 
 	#applyEvent(event: AgentSessionEvent): void {

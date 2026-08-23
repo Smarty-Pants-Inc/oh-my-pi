@@ -6445,7 +6445,7 @@
     },
     {
       "path": "packages/coding-agent/src/collab/guest.ts",
-      "sha256": "195afbbd556aed482b1c2aaf4aeaef680e464f9805fc425abaa0b0ab21859034"
+      "sha256": "56c33b47401d0f23782aac65ec116257e0d12a93736291b6e9b598bfaa57402d"
     },
     {
       "path": "packages/coding-agent/src/collab/herdr-bridge-bootstrap.ts",
@@ -6453,7 +6453,7 @@
     },
     {
       "path": "packages/coding-agent/src/collab/host.ts",
-      "sha256": "2036008c860d46717b0c8671d41ac1278a3b00db2fc1cc35836864f5bfbb8c63"
+      "sha256": "39ce14e47146a430cde5d5b0b927055979ab40e4acd8c6c82e543c2d104d6cc7"
     },
     {
       "path": "packages/coding-agent/src/collab/local-transport.ts",
@@ -6461,7 +6461,7 @@
     },
     {
       "path": "packages/coding-agent/src/collab/protocol.ts",
-      "sha256": "4b12d744112368c43c25901479cc33c283d94bf0c0874fe954025cf4a02bb711"
+      "sha256": "8f09cd6d4eb775b7e79d45f7dc2bbeab0e0b032bc4d3fe17b3623f94ebb9d0f6"
     },
     {
       "path": "packages/coding-agent/src/collab/relay-client.ts",
@@ -10733,9 +10733,9 @@
     },
     {
       "path": "packages/wire/src/index.ts",
-      "sha256": "d6b15d084687adb4288dec626ffae8e49435a6d3c036ad63df8f48cf22936645"
+      "sha256": "dc4d67872f8fdc7708a268b7e0833c11a926be06d218262207530a5c9e081b38"
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "3aa976e5c8b77bf428cc6ae8797e82a22dca25e6198f52a05566d39a29e162b7"
+  "rootSha256": "c81a1025f7170be77a072f8678f445afeae71e3c031adde14532fd893a4c156f"
 }
