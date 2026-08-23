@@ -582,6 +582,11 @@ export interface ReadToolDetails {
 	/** Confirmed filesystem link targets and line alignment, aligned with `displayReadTargets`. */
 	displayReadTargetLinks?: ReadDisplayTargetLink[];
 }
+
+function confirmedRegularFileDetails(details: Omit<ReadToolDetails, "isDirectory"> = {}): ReadToolDetails {
+	return { ...details, isDirectory: false };
+}
+
 type ReadParams = ReadToolInput;
 
 /** Identical reads tolerated before the loop hint is appended. */
@@ -868,7 +873,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			];
 			return {
 				content: [{ type: "text", text: metadataLines.join("\n") }],
-				details: { isDirectory: false, sourceLineAligned: false },
+				details: confirmedRegularFileDetails({ sourceLineAligned: false }),
 				sourcePath: absolutePath,
 			};
 		}
@@ -896,7 +901,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					{ type: "text", text: imageInput.textNote },
 					{ type: "image", data: imageInput.data, mimeType: imageInput.mimeType },
 				],
-				details: { isDirectory: false, sourceLineAligned: false },
+				details: confirmedRegularFileDetails({ sourceLineAligned: false }),
 				sourcePath: imageInput.resolvedPath,
 			};
 		} catch (error) {
@@ -940,7 +945,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				const bridgeResult = buildInMemoryMultiRangeResult(this.session, bridgeText, ranges, {
 					details: markMarkdownContentType(
 						this.session,
-						{ resolvedPath: absolutePath, suffixResolution, isDirectory: false },
+						confirmedRegularFileDetails({ resolvedPath: absolutePath, suffixResolution }),
 						absolutePath,
 					),
 					sourcePath: absolutePath,
@@ -1384,7 +1389,10 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				if (isMultiRange(parsed) && parsed.kind === "lines") {
 					return markLiteralResult(
 						buildInMemoryMultiRangeResult(this.session, rendered, parsed.ranges, {
-							details: { resolvedPath: absolutePath, isDirectory: false, sourceLineAligned: false },
+							details: confirmedRegularFileDetails({
+								resolvedPath: absolutePath,
+								sourceLineAligned: false,
+							}),
 							sourcePath: absolutePath,
 							entityLabel: "profile summary",
 						}),
@@ -1393,7 +1401,10 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				const { offset, limit } = selToOffsetLimit(parsed);
 				return markLiteralResult(
 					buildInMemoryTextResult(this.session, rendered, offset, limit, {
-						details: { resolvedPath: absolutePath, isDirectory: false, sourceLineAligned: false },
+						details: confirmedRegularFileDetails({
+							resolvedPath: absolutePath,
+							sourceLineAligned: false,
+						}),
 						sourcePath: absolutePath,
 						entityLabel: "profile summary",
 					}),
@@ -1402,7 +1413,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		}
 		// Read the file based on type
 		let content: Array<TextContent | ImageContent> | undefined;
-		let details: ReadToolDetails = { isDirectory: false };
+		let details: ReadToolDetails = confirmedRegularFileDetails();
 		let sourcePath: string | undefined;
 		let columnTruncated = 0;
 		let truncationInfo:
@@ -1422,7 +1433,10 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			if (isMultiRange(parsed) && parsed.kind === "lines") {
 				return markLiteralResult(
 					buildInMemoryMultiRangeResult(this.session, notebookText, parsed.ranges, {
-						details: { resolvedPath: absolutePath, isDirectory: false, sourceLineAligned: false },
+						details: confirmedRegularFileDetails({
+							resolvedPath: absolutePath,
+							sourceLineAligned: false,
+						}),
 						sourcePath: absolutePath,
 						entityLabel: "notebook",
 					}),
@@ -1431,7 +1445,10 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			const { offset, limit } = selToOffsetLimit(parsed);
 			return markLiteralResult(
 				buildInMemoryTextResult(this.session, notebookText, offset, limit, {
-					details: { resolvedPath: absolutePath, isDirectory: false, sourceLineAligned: false },
+					details: confirmedRegularFileDetails({
+						resolvedPath: absolutePath,
+						sourceLineAligned: false,
+					}),
 					sourcePath: absolutePath,
 					entityLabel: "notebook",
 				}),
@@ -1451,12 +1468,11 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				if (isMultiRange(parsed) && parsed.kind === "lines") {
 					return markLiteralResult(
 						buildInMemoryMultiRangeResult(this.session, renderedContent, parsed.ranges, {
-							details: {
+							details: confirmedRegularFileDetails({
 								resolvedPath: absolutePath,
 								contentType: this.session.settings.get("read.renderMarkdown") ? "text/markdown" : undefined,
-								isDirectory: false,
 								sourceLineAligned: false,
-							},
+							}),
 							sourcePath: absolutePath,
 							entityLabel: "document",
 						}),
@@ -1465,12 +1481,11 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				const { offset, limit } = selToOffsetLimit(parsed);
 				return markLiteralResult(
 					buildInMemoryTextResult(this.session, renderedContent, offset, limit, {
-						details: {
+						details: confirmedRegularFileDetails({
 							resolvedPath: absolutePath,
 							contentType: this.session.settings.get("read.renderMarkdown") ? "text/markdown" : undefined,
-							isDirectory: false,
 							sourceLineAligned: false,
-						},
+						}),
 						sourcePath: absolutePath,
 						entityLabel: "document",
 						raw: isRawSelector(parsed),
@@ -1502,12 +1517,13 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					? isProbablyBinaryHeader(wholeFileBytes.subarray(0, BINARY_SNIFF_BYTES))
 					: await isProbablyBinary(absolutePath));
 			if (looksBinary) {
-				const binaryResult = toolResult<ReadToolDetails>({
-					resolvedPath: absolutePath,
-					suffixResolution,
-					isDirectory: false,
-					sourceLineAligned: false,
-				})
+				const binaryResult = toolResult<ReadToolDetails>(
+					confirmedRegularFileDetails({
+						resolvedPath: absolutePath,
+						suffixResolution,
+						sourceLineAligned: false,
+					}),
+				)
 					.text(
 						prependSuffixResolutionNotice(
 							`[Cannot read binary file '${resolvedDisplayPath}' (${formatBytes(fileSize)}); not valid UTF-8 text. Use ':raw' to read bytes verbatim.]`,
@@ -1549,15 +1565,14 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					if (summaryHashContext?.tag) {
 						recordSeenLinesFromBody(this.session, absolutePath, summaryHashContext.tag, renderedSummary.text);
 					}
-					details = {
-						isDirectory: false,
+					details = confirmedRegularFileDetails({
 						displayContent: { text: renderedSummary.displayText, startLine: 1 },
 						summary: {
 							lines: countTextLines(renderedSummary.text),
 							elidedSpans: renderedSummary.elidedRanges.length,
 							elidedLines: renderedSummary.elidedLines,
 						},
-					};
+					});
 
 					sourcePath = absolutePath;
 					content = [{ type: "text", text: modelText }];
@@ -1580,8 +1595,8 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					content = [{ type: "text", text: multiResult.outputText }];
 					sourcePath = absolutePath;
 					details = multiResult.displayContent
-						? { isDirectory: false, displayContent: multiResult.displayContent }
-						: { isDirectory: false };
+						? confirmedRegularFileDetails({ displayContent: multiResult.displayContent })
+						: confirmedRegularFileDetails();
 					if (multiResult.columnTruncated > 0) {
 						columnTruncated = multiResult.columnTruncated;
 					}
@@ -1597,7 +1612,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 							const bridgeResult = buildInMemoryTextResult(this.session, bridgeText, offset, limit, {
 								details: markMarkdownContentType(
 									this.session,
-									{ resolvedPath: absolutePath, suffixResolution, isDirectory: false },
+									confirmedRegularFileDetails({ resolvedPath: absolutePath, suffixResolution }),
 									absolutePath,
 								),
 								sourcePath: absolutePath,
@@ -1673,11 +1688,9 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 							totalFileLines === 0
 								? "The file is empty."
 								: `Use :1 to read from the start, or :${totalFileLines} to read the last line.`;
-						const outOfBoundsResult = toolResult<ReadToolDetails>({
-							resolvedPath: absolutePath,
-							suffixResolution,
-							isDirectory: false,
-						})
+						const outOfBoundsResult = toolResult<ReadToolDetails>(
+							confirmedRegularFileDetails({ resolvedPath: absolutePath, suffixResolution }),
+						)
 							.text(
 								`Line ${requestedStart + 1} is beyond end of file (${totalFileLines} lines total). ${suggestion}`,
 							)
@@ -1826,7 +1839,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 								firstLineBytes,
 							)}, exceeds ${formatBytes(maxBytesForRead)} limit. Unable to display a valid UTF-8 snippet.]`;
 						}
-						details = { truncation, isDirectory: false };
+						details = confirmedRegularFileDetails({ truncation });
 						sourcePath = absolutePath;
 						truncationInfo = {
 							result: truncation,
@@ -1838,7 +1851,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						};
 					} else if (truncation.truncated) {
 						outputText = formatBracketAwareText() ?? formatText(truncation.content, startLineDisplay);
-						details = { truncation, isDirectory: false };
+						details = confirmedRegularFileDetails({ truncation });
 						sourcePath = absolutePath;
 						truncationInfo = {
 							result: truncation,
@@ -1855,12 +1868,12 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						outputText += reachedEof
 							? `\n\n[${totalFileLines - (startLine + userLimitedLines)} more lines in file. Use :${nextOffset} to continue]`
 							: `\n\n[More lines in file (${formatBytes(fileSize)} total; not scanned to EOF). Use :${nextOffset} to continue]`;
-						details = { isDirectory: false };
+						details = confirmedRegularFileDetails();
 						sourcePath = absolutePath;
 					} else {
 						// No truncation, no user limit exceeded
 						outputText = formatBracketAwareText() ?? formatText(truncation.content, startLineDisplay);
-						details = { isDirectory: false };
+						details = confirmedRegularFileDetails();
 						sourcePath = absolutePath;
 					}
 					if (reachedEof) details.totalLines = totalFileLines;
@@ -1978,11 +1991,10 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		const formattedBody = formatTextWithMode(rawText, region.startLine, shouldAddHashLines, shouldAddLineNumbers);
 		const formattedText = prependHashlineHeader(formattedBody, hashContext);
 
-		const details: ReadToolDetails = {
+		const details = confirmedRegularFileDetails({
 			resolvedPath: entry.absolutePath,
-			isDirectory: false,
 			displayContent: { text: rawText, startLine: region.startLine },
-		};
+		});
 		return toolResult<ReadToolDetails>(details).text(formattedText).sourcePath(entry.absolutePath).done();
 	}
 
@@ -2014,12 +2026,11 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				? `No unresolved git merge conflicts in ${displayPath}.`
 				: formatConflictSummary(entries, { displayPath, scanTruncated: scan.scanTruncated });
 
-		const details: ReadToolDetails = {
+		const details = confirmedRegularFileDetails({
 			resolvedPath: absolutePath,
-			isDirectory: false,
 			suffixResolution,
 			conflictCount: entries.length,
-		};
+		});
 		return toolResult<ReadToolDetails>(details).text(summary).sourcePath(absolutePath).done();
 	}
 
@@ -2048,11 +2059,10 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			skills: this.session.skills,
 		});
 		const artifactUrl = `artifact://${artifact.id}`;
-		const details: ReadToolDetails = {
+		const details = confirmedRegularFileDetails({
 			resolvedPath: artifact.path,
 			contentType: "text/plain",
-			isDirectory: false,
-		};
+		});
 
 		if (parsedSel.kind === "raw" && artifact.size > MAX_ARTIFACT_RAW_INLINE_BYTES) {
 			return toolResult<ReadToolDetails>(details)
