@@ -63,11 +63,12 @@ function formatReadPathLink(
 		suffixResolution?: { from: string; to: string };
 		offset?: number;
 		sourceLineAligned?: boolean;
+		literalPath?: boolean;
 		fallbackLabel?: string;
 		link: boolean;
 	},
 ): string {
-	const split = splitReadRenderPath(rawPath);
+	const split = options.literalPath === true ? { path: rawPath } : splitReadRenderPath(rawPath);
 	const basePath = split.path || rawPath;
 	const selectorSuffix = split.sel ? `:${split.sel}` : "";
 	const plainDisplayPath = options.suffixResolution
@@ -78,7 +79,10 @@ function formatReadPathLink(
 		options.link === false
 			? undefined
 			: (options.resolvedPath ?? options.sourcePath ?? tryResolveInternalUrlSync(basePath) ?? absoluteInputPath);
-	const line = options.sourceLineAligned === false ? undefined : (firstReadSelectorLine(split.sel) ?? options.offset);
+	const line =
+		options.literalPath === true || options.sourceLineAligned === false
+			? undefined
+			: (firstReadSelectorLine(split.sel) ?? options.offset);
 	const linkOptions = line !== undefined ? { line } : undefined;
 	const linkedPath = target ? fileHyperlink(target, plainDisplayPath, linkOptions) : plainDisplayPath;
 	return `${linkedPath}${selectorSuffix}`;
@@ -158,7 +162,7 @@ export const readToolRenderer = {
 		const imageContent = result.content?.find(c => c.type === "image");
 		const rawPath =
 			typeof args?.file_path === "string" ? args.file_path : typeof args?.path === "string" ? args.path : "";
-		const renderPath = splitReadRenderPath(rawPath);
+		const renderPath = details?.literalPath === true ? { path: rawPath } : splitReadRenderPath(rawPath);
 		const lang = getLanguageFromPath(renderPath.path);
 
 		const warningLines: string[] = [];
@@ -188,6 +192,7 @@ export const readToolRenderer = {
 				suffixResolution: suffix,
 				fallbackLabel: "image",
 				sourceLineAligned: details?.sourceLineAligned,
+				literalPath: details?.literalPath,
 				link: details?.isDirectory === false,
 			});
 			const correction = suffix ? ` ${uiTheme.fg("dim", `(corrected from ${shortenPath(suffix.from)})`)}` : "";
@@ -228,6 +233,7 @@ export const readToolRenderer = {
 			sourcePath: readSourceFsPath(details),
 			suffixResolution: suffix,
 			sourceLineAligned: details?.sourceLineAligned,
+			literalPath: details?.literalPath,
 			offset: args?.offset,
 			link: details?.isDirectory === false,
 		});

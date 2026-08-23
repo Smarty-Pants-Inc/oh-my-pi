@@ -63,9 +63,45 @@ describe("readToolRenderer hyperlinks", () => {
 		expect(rendered).toContain(":2");
 		const handoffUri = new URL(url.pathToFileURL(path.resolve(handoffPath)).href);
 		handoffUri.searchParams.set("line", "2");
-		expect(extractLinkUris(rendered)).toContain(handoffUri.href);
+		expect(extractLinkUris(rendered)).toEqual([handoffUri.href]);
 		expect(extractLinkTexts(rendered)).toContain("local://handoff.md");
 		expect(extractLinkTexts(rendered)).not.toContain("local://handoff.md:2");
+	});
+
+	it("keeps literal-colon read titles fully clickable without a line query", async () => {
+		settings.override("tui.hyperlinks", "always");
+		const theme = await getThemeByName("dark");
+		expect(theme).toBeDefined();
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-read-renderer-literal-"));
+		try {
+			const literalName = "foo:100";
+			const literalPath = path.join(tempDir, literalName);
+			await Bun.write(literalPath, "literal content\n");
+			const session: ToolSession = {
+				cwd: tempDir,
+				hasUI: false,
+				getSessionFile: () => null,
+				getSessionSpawns: () => "*",
+				settings: Settings.isolated({ "read.summarize.enabled": false }),
+			};
+			const result = await new ReadTool(session).execute("read-renderer-literal", { path: literalName });
+
+			expect(result.details).toMatchObject({
+				isDirectory: false,
+				literalPath: true,
+				meta: { source: { type: "path", value: literalPath } },
+			});
+			const component = readToolRenderer.renderResult(result, { expanded: false, isPartial: false }, theme!, {
+				path: literalName,
+			});
+			const rendered = component.render(200).join("\n");
+
+			expect(extractLinkUris(rendered)).toEqual([url.pathToFileURL(literalPath).href]);
+			expect(extractLinkUris(rendered).map(uri => new URL(uri).search)).toEqual([""]);
+			expect(extractLinkTexts(rendered)).toEqual([literalName]);
+		} finally {
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
 	});
 
 	it("links an actual skill protocol read after regular-file confirmation", async () => {
@@ -117,8 +153,10 @@ describe("readToolRenderer hyperlinks", () => {
 			const plainPath = path.join(tempDir, "plain.txt");
 			const archivePath = path.join(tempDir, "fixture.zip");
 			const sqlitePath = path.join(tempDir, "fixture.sqlite");
+			const binaryPath = path.join(tempDir, "fixture.bin");
 			await fs.writeFile(plainPath, "first line\nsecond line\n");
 			await writeArchive(archivePath, "zip", [["member.txt", "first member line\nsecond member line\n"]]);
+			await Bun.write(binaryPath, new Uint8Array([0, 1, 2, 3]));
 			const database = new Database(sqlitePath);
 			try {
 				database.run("CREATE TABLE records (id INTEGER PRIMARY KEY, value TEXT NOT NULL)");
@@ -138,9 +176,11 @@ describe("readToolRenderer hyperlinks", () => {
 			const plainResult = await readTool.execute("read-plain-link", { path: `${plainPath}:2` });
 			const archiveResult = await readTool.execute("read-archive-link", { path: `${archivePath}:member.txt:2` });
 			const sqliteResult = await readTool.execute("read-sqlite-link", { path: `${sqlitePath}:records:1` });
+			const binaryResult = await readTool.execute("read-binary-link", { path: `${binaryPath}:7` });
 			const archiveDirectoryResult = await readTool.execute("read-archive-directory", { path: archivePath });
 
 			expect(plainResult.details?.isDirectory).toBe(false);
+			expect(plainResult.details?.sourceLineAligned).toBeUndefined();
 			expect(archiveResult.details).toMatchObject({
 				resolvedPath: archivePath,
 				isDirectory: false,
@@ -148,6 +188,11 @@ describe("readToolRenderer hyperlinks", () => {
 			});
 			expect(sqliteResult.details).toMatchObject({
 				resolvedPath: sqlitePath,
+				isDirectory: false,
+				sourceLineAligned: false,
+			});
+			expect(binaryResult.details).toMatchObject({
+				resolvedPath: binaryPath,
 				isDirectory: false,
 				sourceLineAligned: false,
 			});
@@ -167,6 +212,10 @@ describe("readToolRenderer hyperlinks", () => {
 				.renderResult(sqliteResult, { expanded: false, isPartial: false }, theme!, {
 					path: `${sqlitePath}:records:1`,
 				})
+				.render(200)
+				.join("\n");
+			const binaryRendered = readToolRenderer
+				.renderResult(binaryResult, { expanded: false, isPartial: false }, theme!, { path: `${binaryPath}:7` })
 				.render(200)
 				.join("\n");
 			const archiveDirectoryRendered = readToolRenderer
@@ -189,6 +238,12 @@ describe("readToolRenderer hyperlinks", () => {
 			sqliteLineUri.searchParams.set("line", "1");
 			expect(extractLinkUris(sqliteRendered)).toContain(sqliteUri);
 			expect(extractLinkUris(sqliteRendered)).not.toContain(sqliteLineUri.href);
+
+			const binaryUri = url.pathToFileURL(binaryPath).href;
+			const binaryLineUri = new URL(binaryUri);
+			binaryLineUri.searchParams.set("line", "7");
+			expect(extractLinkUris(binaryRendered)).toContain(binaryUri);
+			expect(extractLinkUris(binaryRendered)).not.toContain(binaryLineUri.href);
 			expect(extractLinkUris(archiveDirectoryRendered)).toEqual([]);
 		} finally {
 			await fs.rm(tempDir, { recursive: true, force: true });
@@ -228,27 +283,6 @@ describe("readToolRenderer hyperlinks", () => {
 		);
 
 		expect(extractLinkUris(component.render(200).join("\n"))).toEqual([]);
-	});
-
-	it("leaves confirmed directory read titles unlinked", async () => {
-		settings.override("tui.hyperlinks", "always");
-		const theme = await getThemeByName("dark");
-		expect(theme).toBeDefined();
-
-		const directory = path.resolve("/tmp/omp-read/src");
-		const component = readToolRenderer.renderResult(
-			{
-				content: [{ type: "text", text: "file.ts" }],
-				details: { resolvedPath: directory, isDirectory: true, contentType: "text/plain" },
-			},
-			{ expanded: false, isPartial: false },
-			theme!,
-			{ path: directory },
-		);
-
-		const rendered = component.render(200).join("\n");
-		expect(Bun.stripANSI(rendered)).toContain(directory);
-		expect(extractLinkUris(rendered)).toEqual([]);
 	});
 
 	it("links HTTP read result headers to the final URL", async () => {

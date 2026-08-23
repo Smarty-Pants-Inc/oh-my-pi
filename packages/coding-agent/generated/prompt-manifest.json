@@ -6809,7 +6809,7 @@
     },
     {
       "path": "packages/coding-agent/src/config/settings.ts",
-      "sha256": "665618afee0dba5028518137642d1fd40b942967017b670c7ea8fe0781dada77"
+      "sha256": "34c271a03ada6c876bf6ef6170f3d23743e5a1bde5d77a65b7041aa944265b77"
     },
     {
       "path": "packages/coding-agent/src/context/approved-policy.ts",
@@ -7537,7 +7537,7 @@
     },
     {
       "path": "packages/coding-agent/src/internal-urls/agent-protocol.ts",
-      "sha256": "a918d47504afd9e9d2f871a88ded9edc8c7ca9fad034303fe693655512b0686f"
+      "sha256": "340d50318dfd86dc2b201d66b4b10760966d00fbdf9fd25f11aa13699960dcbb"
     },
     {
       "path": "packages/coding-agent/src/internal-urls/artifact-protocol.ts",
@@ -7553,7 +7553,7 @@
     },
     {
       "path": "packages/coding-agent/src/internal-urls/history-protocol.ts",
-      "sha256": "6af437ff38ea97064f3257007c17a203e1380b60204287bde6775c013ba9f9b2"
+      "sha256": "09b1c135d1a82b3c388746966c673a9fab413d79e5406842cf8317eb01a145f6"
     },
     {
       "path": "packages/coding-agent/src/internal-urls/index.ts",
@@ -7569,7 +7569,7 @@
     },
     {
       "path": "packages/coding-agent/src/internal-urls/local-protocol.ts",
-      "sha256": "6d92aa262fb00e363dcbfe564423aae52696dcfb7ced9a939a1455b090f63cea"
+      "sha256": "6edc4523e414d479d6f2fef2f55150a838c4765ab11d452cf916ab0599e78b31"
     },
     {
       "path": "packages/coding-agent/src/internal-urls/mcp-protocol.ts",
@@ -7597,7 +7597,7 @@
     },
     {
       "path": "packages/coding-agent/src/internal-urls/rule-protocol.ts",
-      "sha256": "1085d9c58e5af9dce93a8648b23eb261364213ac5f340cc7919638076a268c11"
+      "sha256": "39ad4bd6f531a53279c2444c2f684bdf92e83ba6a71ad6affb0dde7e6ac3da42"
     },
     {
       "path": "packages/coding-agent/src/internal-urls/security-protocol.ts",
@@ -8005,7 +8005,7 @@
     },
     {
       "path": "packages/coding-agent/src/modes/components/agent-transcript-viewer.ts",
-      "sha256": "2bbab7c367878a433900c5408ab991791013ef147c4adab62d387ca01a30448c"
+      "sha256": "25c314ae916f1692c1b6cbe7b441ef561dc51790fd2a10a6f1692e49e00f658c"
     },
     {
       "path": "packages/coding-agent/src/modes/components/agents-hub.ts",
@@ -8205,7 +8205,7 @@
     },
     {
       "path": "packages/coding-agent/src/modes/interactive-mode.ts",
-      "sha256": "2386894fe78da5cc3b71470031b7da8323c43525d88be68149a81fbbb1d760a9"
+      "sha256": "d81d5e957a6ee8c42e3f68fa7fdfc149f4de05ea8bc34a4fcbee5127bce5caed"
     },
     {
       "path": "packages/coding-agent/src/modes/loop-limit.ts",
@@ -9361,7 +9361,7 @@
     },
     {
       "path": "packages/coding-agent/src/tools/path-utils.ts",
-      "sha256": "2fba59de0353ddf4586839975184a14f3894badd629ca906279ddaff67ef4454"
+      "sha256": "f3cdaa7fac9e2e77335e361b8035707bc33deec5c93771f4385957e65758a17f"
     },
     {
       "path": "packages/coding-agent/src/tools/plan-mode-guard.ts",
@@ -9425,7 +9425,7 @@
     },
     {
       "path": "packages/coding-agent/src/tools/read-archive.ts",
-      "sha256": "a8b116075c122dd5c4205ecdd53c38218e675a350ba301fe407d4a95dece5ce0"
+      "sha256": "c73d9104063893005da993d905ef1109784cad474629722595a5d5c3adec6a40"
     },
     {
       "path": "packages/coding-agent/src/tools/read-environment.ts",
@@ -9449,7 +9449,7 @@
     },
     {
       "path": "packages/coding-agent/src/tools/read-sqlite.ts",
-      "sha256": "df9950c1fcef154b758eb17190cb46a71bbd375386e25006b5c36e116f8c4877"
+      "sha256": "452e7397a5f99d290754d89a0139cb4bd0aaf56a8ea5c59d8d1edaf9f9985772"
     },
     {
       "path": "packages/coding-agent/src/tools/read-summary.ts",
@@ -9457,7 +9457,7 @@
     },
     {
       "path": "packages/coding-agent/src/tools/read.ts",
-      "sha256": "d58a5e7e1c37ceb0d7d2ab22d46feed0fab88c68f5d8508f822d09668fab834b"
+      "sha256": "209ca558429b9a4dc386a44e2ceb4bfdcfc06b738a7594c7f8621f0287431e90"
     },
     {
       "path": "packages/coding-agent/src/tools/render-utils.ts",
@@ -10733,5 +10733,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "07e7f21155cbca99612d4bd8716e9ab13c44d624459f9417b899214ccea168dc"
+  "rootSha256": "82cc3cc3878cac74a9ee480ebad75013d60a08b3d13f6255370e3c1ebb0bcbe1"
 }

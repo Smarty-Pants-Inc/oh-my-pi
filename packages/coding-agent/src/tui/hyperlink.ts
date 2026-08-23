@@ -43,7 +43,7 @@ function buildFileUri(filePath: string, opts?: { line?: number; col?: number }):
  *
  * Respects `tui.hyperlinks` setting:
  * - `"off"`: never
- * - `"auto"`: always in Herdr (which consumes OSC 8 as metadata); otherwise when stdout is a TTY and `NO_COLOR` is unset
+ * - `"auto"`: in Herdr when stdout is a TTY; otherwise when stdout is a TTY and `NO_COLOR` is unset
  * - `"always"`: unconditionally (useful for viewers that support OSC 8 without advertising it)
  * Before settings initialization, returns false so early render paths stay plain text.
  */

@@ -1,7 +1,12 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import * as url from "node:url";
-import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import {
+	onHyperlinkModeChanged,
+	resetSettingsForTest,
+	Settings,
+	settings,
+} from "@oh-my-pi/pi-coding-agent/config/settings";
 import { LocalProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/local-protocol";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import {
@@ -122,19 +127,17 @@ describe("isHyperlinkEnabled", () => {
 		}
 	});
 
-	it("keeps OSC 8 hyperlinks enabled in Herdr's headless guest", () => {
-		setHyperlinkMode("auto");
+	it("disables OSC 8 in Herdr when stdout is redirected", () => {
+		setHyperlinkMode("off");
 		Bun.env.NO_COLOR = "1";
 		Bun.env.HERDR_ENV = "1";
 		const origTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
-		const terminalState = terminalCaps.TERMINAL as unknown as { hyperlinks: boolean };
-		const origHyperlinks = terminalState.hyperlinks;
 		try {
 			Object.defineProperty(process.stdout, "isTTY", { value: false, configurable: true });
-			terminalState.hyperlinks = false;
-			expect(isHyperlinkEnabled()).toBe(true);
+			setHyperlinkMode("auto");
+			expect(isHyperlinkEnabled()).toBe(false);
+			expect(terminalCaps.TERMINAL.hyperlinks).toBe(false);
 		} finally {
-			terminalState.hyperlinks = origHyperlinks;
 			if (origTTY) {
 				Object.defineProperty(process.stdout, "isTTY", origTTY);
 			} else {
@@ -156,7 +159,7 @@ describe("isHyperlinkEnabled", () => {
 		Bun.env.HERDR_ENV = "1";
 		setHyperlinkMode("off");
 		expect(terminalCaps.TERMINAL.hyperlinks).toBe(false);
-		setHyperlinkMode("auto");
+		setHyperlinkMode("always");
 		expect(terminalCaps.TERMINAL.hyperlinks).toBe(true);
 	});
 
@@ -175,6 +178,71 @@ describe("isHyperlinkEnabled", () => {
 
 		setHyperlinkMode("always");
 		expect(terminalCaps.TERMINAL.hyperlinks).toBe(true);
+	});
+
+	it("signals off/auto transitions when only Always links can emit on a non-TTY", () => {
+		const originalTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+		delete Bun.env.HERDR_ENV;
+		delete Bun.env.NO_COLOR;
+		delete Bun.env.PI_NO_HYPERLINKS;
+		delete Bun.env.PI_FORCE_HYPERLINKS;
+		try {
+			Object.defineProperty(process.stdout, "isTTY", { value: false, configurable: true });
+			setHyperlinkMode("off");
+			let changes = 0;
+			const unsubscribe = onHyperlinkModeChanged(() => {
+				changes++;
+			});
+			try {
+				expect(terminalCaps.TERMINAL.hyperlinks).toBe(false);
+				expect(urlHyperlinkAlways("https://example.com/path", "example")).toBe("example");
+
+				setHyperlinkMode("auto");
+				expect(terminalCaps.TERMINAL.hyperlinks).toBe(false);
+				expect(urlHyperlinkAlways("https://example.com/path", "example")).toContain(`${OSC}8;`);
+
+				setHyperlinkMode("off");
+				expect(urlHyperlinkAlways("https://example.com/path", "example")).toBe("example");
+				expect(changes).toBe(2);
+			} finally {
+				unsubscribe();
+			}
+		} finally {
+			if (originalTTY) {
+				Object.defineProperty(process.stdout, "isTTY", originalTTY);
+			} else {
+				Reflect.deleteProperty(process.stdout, "isTTY");
+			}
+		}
+	});
+
+	it("does not signal when auto and always have the same hyperlink output policy", () => {
+		const originalTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+		delete Bun.env.PI_NO_HYPERLINKS;
+		Bun.env.PI_FORCE_HYPERLINKS = "1";
+		try {
+			Object.defineProperty(process.stdout, "isTTY", { value: false, configurable: true });
+			setHyperlinkMode("off");
+			setHyperlinkMode("auto");
+			let changes = 0;
+			const unsubscribe = onHyperlinkModeChanged(() => {
+				changes++;
+			});
+			try {
+				setHyperlinkMode("always");
+				expect(terminalCaps.TERMINAL.hyperlinks).toBe(true);
+				expect(urlHyperlinkAlways("https://example.com/path", "example")).toContain(`${OSC}8;`);
+				expect(changes).toBe(0);
+			} finally {
+				unsubscribe();
+			}
+		} finally {
+			if (originalTTY) {
+				Object.defineProperty(process.stdout, "isTTY", originalTTY);
+			} else {
+				Reflect.deleteProperty(process.stdout, "isTTY");
+			}
+		}
 	});
 });
 

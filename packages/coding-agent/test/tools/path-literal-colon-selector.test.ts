@@ -16,6 +16,7 @@ import {
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { GrepOutputMode } from "@oh-my-pi/pi-natives";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
+import { writeArchive } from "@oh-my-pi/pi-utils/ar";
 import { runGrepCommand } from "../../src/cli/grep-cli";
 import { initTheme } from "../../src/modes/theme/theme";
 import { GrepTool } from "../../src/tools/grep";
@@ -148,6 +149,24 @@ describe("literal colon filename resolution (issue #4618)", () => {
 			expect(output).not.toMatch(/not found/i);
 		});
 
+		it("keeps literal path identity for an empty file", async () => {
+			const literal = path.join(tmpDir, "empty:100");
+			await Bun.write(literal, "");
+
+			const result = await new ReadTool(createSession()).execute("read-empty-literal", { path: literal });
+
+			expect(result.details).toMatchObject({ isDirectory: false, literalPath: true });
+		});
+
+		it("keeps literal path identity when binary reads return early", async () => {
+			const literal = path.join(tmpDir, "binary:100");
+			await Bun.write(literal, new Uint8Array([0, 1, 2, 3]));
+
+			const result = await new ReadTool(createSession()).execute("read-binary-literal", { path: literal });
+
+			expect(result.details).toMatchObject({ resolvedPath: literal, isDirectory: false, literalPath: true });
+		});
+
 		it("reads a shell-escaped literal file whose name ends in a selector-shaped suffix", async () => {
 			await fs.mkdir(path.join(tmpDir, "dir"), { recursive: true });
 			await Bun.write(path.join(tmpDir, "dir", "a b:1-2"), "escaped literal read\n");
@@ -171,6 +190,31 @@ describe("literal colon filename resolution (issue #4618)", () => {
 
 			expect(output).toContain("colon file wins");
 			expect(output).not.toContain("line 1");
+		});
+
+		it("keeps distinct literal colon files separate in delimited read metadata", async () => {
+			const one = "foo:100";
+			const two = "foo:200";
+			const onePath = path.join(tmpDir, one);
+			const twoPath = path.join(tmpDir, two);
+			await Bun.write(onePath, "first literal\n");
+			await Bun.write(twoPath, "second literal\n");
+
+			const result = await new ReadTool(createSession()).execute("read-literal-delimited", {
+				path: `${onePath};${twoPath}`,
+			});
+			const details = result.details as
+				| {
+						displayReadTargets?: string[];
+						displayReadTargetLinks?: Array<{ path: string | null; literalPath?: boolean }>;
+				  }
+				| undefined;
+
+			expect(details?.displayReadTargets).toEqual([onePath, twoPath]);
+			expect(details?.displayReadTargetLinks).toEqual([
+				{ path: onePath, literalPath: true },
+				{ path: twoPath, literalPath: true },
+			]);
 		});
 
 		it("still honors the `:5-10` selector when only the base file exists on disk", async () => {
@@ -197,6 +241,51 @@ describe("literal colon filename resolution (issue #4618)", () => {
 			// still peels because the raw `notes:5-10` path does not exist literally.
 			expect(output).not.toContain("line 30");
 			expect(output).not.toContain("line 40");
+		});
+
+		it("keeps a promoted local selector when its resolved filename contains a colon", async () => {
+			const artifactsDir = path.join(tmpDir, "artifacts");
+			const localName = "foo:bar.txt";
+			const localPath = path.join(artifactsDir, "local", localName);
+			await fs.mkdir(path.dirname(localPath), { recursive: true });
+			await Bun.write(localPath, "line one\nline two\n");
+			const session = createSession({
+				localProtocolOptions: {
+					getArtifactsDir: () => artifactsDir,
+					getSessionId: () => "literal-local-selector",
+				},
+				settings: Settings.isolated({ "read.summarize.enabled": false }),
+			});
+
+			const result = await new ReadTool(session).execute("read-local-selector", {
+				path: "local://foo%3Abar.txt:2",
+			});
+
+			expect(getText(result)).toContain("line two");
+			expect(result.details?.isDirectory).toBe(false);
+			expect(result.details?.literalPath).toBeUndefined();
+		});
+
+		it("dispatches a promoted local archive selector when only an ancestor path contains a colon", async () => {
+			if (process.platform === "win32") return;
+			const artifactsDir = path.join(tmpDir, "artifacts:session");
+			const archivePath = path.join(artifactsDir, "local", "bundle.zip");
+			await fs.mkdir(path.dirname(archivePath), { recursive: true });
+			await writeArchive(archivePath, "zip", [["first.txt", "archive content\n"]]);
+			const session = createSession({
+				localProtocolOptions: {
+					getArtifactsDir: () => artifactsDir,
+					getSessionId: () => "ancestor-colon-selector",
+				},
+			});
+
+			const result = await new ReadTool(session).execute("read-local-archive-selector", {
+				path: "local://bundle.zip:1",
+			});
+
+			expect(getText(result)).toContain("first.txt");
+			expect(getText(result)).not.toContain("Cannot read binary file");
+			expect(result.details?.isDirectory).toBe(true);
 		});
 
 		it("reads a literal file that looks like an archive selector (`data.zip:1-2`)", async () => {

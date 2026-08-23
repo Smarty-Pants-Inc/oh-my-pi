@@ -466,7 +466,7 @@ export function shouldEnableHyperlinks(
 	if (override === false || mode === "off") return false;
 	if (mode === "always" || override === true) return true;
 	const supported = shouldEnableHyperlinksByDefault(env, terminalId);
-	return supported && (env.HERDR_ENV === "1" || (!env.NO_COLOR && stdoutIsTty));
+	return supported && stdoutIsTty && (env.HERDR_ENV === "1" || !env.NO_COLOR);
 }
 
 function getFallbackImageProtocol(terminalId: TerminalId): ImageProtocol | null {

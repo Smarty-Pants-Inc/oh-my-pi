@@ -92,6 +92,7 @@ type ReadToolResultDetails = {
 	conflictCount?: number;
 	isDirectory?: boolean;
 	sourceLineAligned?: boolean;
+	literalPath?: boolean;
 	displayReadTargets?: unknown;
 	displayReadTargetLinks?: unknown;
 	displayContent?: {
@@ -121,6 +122,7 @@ function getSuffixResolution(details: ReadToolResultDetails | undefined): ReadTo
 type ReadDisplayTargetLink = {
 	path?: string;
 	sourceLineAligned?: boolean;
+	literalPath?: boolean;
 };
 
 type ReadEntry = {
@@ -130,6 +132,7 @@ type ReadEntry = {
 	displayLinkPaths?: Array<ReadDisplayTargetLink | undefined>;
 	linkPath?: string;
 	sourceLineAligned?: boolean;
+	literalPath?: boolean;
 	status: "pending" | "success" | "warning" | "error";
 	correctedFrom?: string;
 	contentText?: string;
@@ -155,6 +158,7 @@ type ReadDisplayTarget = {
 	basePath: string;
 	linkPath?: string;
 	sourceLineAligned?: boolean;
+	literalPath?: boolean;
 	selector?: string;
 };
 
@@ -191,10 +195,11 @@ function getDisplayReadTargetLinks(
 			return target.trim().length > 0 ? { path: target } : undefined;
 		}
 		if (!target || typeof target !== "object" || Array.isArray(target)) return undefined;
-		const link = target as { path?: unknown; sourceLineAligned?: unknown };
+		const link = target as { path?: unknown; sourceLineAligned?: unknown; literalPath?: unknown };
 		return {
 			path: typeof link.path === "string" && link.path.trim().length > 0 ? link.path : undefined,
 			sourceLineAligned: link.sourceLineAligned === false ? false : undefined,
+			literalPath: link.literalPath === true ? true : undefined,
 		};
 	});
 }
@@ -462,6 +467,7 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 		const displayLinkPaths = result.isError ? undefined : getDisplayReadTargetLinks(details);
 		entry.linkPath = !result.isError && details?.isDirectory === false ? readResultLinkPath(details) : undefined;
 		entry.sourceLineAligned = details?.sourceLineAligned;
+		entry.literalPath = details?.literalPath === true;
 		if (suffixResolution) {
 			entry.path = applyReadSuffixResolution(entry.path, suffixResolution);
 			entry.correctedFrom = suffixResolution.from;
@@ -529,6 +535,10 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 		super.invalidate();
 	}
 
+	override invalidate(): void {
+		this.#updateDisplay();
+	}
+
 	getComponent(): Component {
 		return this;
 	}
@@ -590,11 +600,13 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 	#displayTargetsForEntries(entries: ReadEntry[]): ReadDisplayTarget[] {
 		const targets: ReadDisplayTarget[] = [];
 		for (const entry of entries) {
-			const pathSpecs = entry.displayPaths ?? splitReadDisplayPathSpecs(entry.path);
+			const pathSpecs =
+				entry.literalPath === true ? [entry.path] : (entry.displayPaths ?? splitReadDisplayPathSpecs(entry.path));
 			const useEntryLinkPath = pathSpecs.length === 1;
 			for (const [pathIndex, pathSpec] of pathSpecs.entries()) {
-				const split = splitPathAndSel(pathSpec);
 				const displayLink = entry.displayLinkPaths?.[pathIndex];
+				const literalPath = displayLink?.literalPath ?? (useEntryLinkPath ? entry.literalPath : undefined);
+				const split = literalPath ? { path: pathSpec } : splitPathAndSel(pathSpec);
 				const linkPath = useEntryLinkPath ? (entry.linkPath ?? displayLink?.path) : displayLink?.path;
 				const sourceLineAligned = displayLink?.sourceLineAligned ?? entry.sourceLineAligned;
 				for (const selector of splitSelectorDisplayParts(split.sel)) {
@@ -604,6 +616,7 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 						basePath: split.path,
 						linkPath,
 						sourceLineAligned,
+						literalPath,
 						selector,
 					});
 				}
@@ -631,7 +644,11 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 		for (const [basePath, targetsByBatch] of selectorTargetsByBasePathAndBatch) {
 			if (!basePath) continue;
 			for (const groupedTargets of targetsByBatch.values()) {
-				if (groupedTargets.length <= 1) continue;
+				if (
+					groupedTargets.length <= 1 ||
+					groupedTargets.some(target => target.linkPath !== groupedTargets[0]!.linkPath)
+				)
+					continue;
 				for (const target of groupedTargets) {
 					mergedTargetsByTarget.set(target, groupedTargets);
 				}
@@ -730,6 +747,7 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 				? undefined
 				: firstSelectorLineForTargets(row.targets),
 			linkPath: linkPathForTargets(row.targets),
+			literalPath: row.targets.some(target => target.literalPath === true),
 		});
 	}
 
@@ -777,15 +795,21 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 
 	#formatPathValue(
 		value: string,
-		options: { correctedFrom?: string; conflictCount?: number; line?: number; linkPath?: string } = {},
+		options: {
+			correctedFrom?: string;
+			conflictCount?: number;
+			line?: number;
+			linkPath?: string;
+			literalPath?: boolean;
+		} = {},
 	): string {
-		const split = splitPathAndSel(value);
+		const split = options.literalPath === true ? { path: value } : splitPathAndSel(value);
 		const selectorSuffix = split.sel ? `:${split.sel}` : "";
 		const baseValue = split.sel ? split.path : value;
 		const filePath = shortenPath(baseValue);
 		let pathDisplay = filePath ? theme.fg("accent", filePath) : theme.fg("toolOutput", "…");
 		if (filePath && options.linkPath) {
-			const linkOptions = options.line !== undefined ? { line: options.line } : undefined;
+			const linkOptions = options.line !== undefined && split.sel ? { line: options.line } : undefined;
 			pathDisplay = fileHyperlink(options.linkPath, pathDisplay, linkOptions);
 		}
 		if (selectorSuffix) {
@@ -810,15 +834,17 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 	 * When expanded: shows full content.
 	 */
 	#addContentPreview(entry: ReadEntry): void {
-		const split = splitPathAndSel(entry.path);
+		const literalPath = entry.literalPath === true;
+		const split = literalPath ? { path: entry.path } : splitPathAndSel(entry.path);
 		const lang = getLanguageFromPath(split.path);
 		const pathValue = shortenPath(entry.path);
 		const pathDisplay = pathValue
 			? this.#formatPathValue(entry.path, {
 					correctedFrom: entry.correctedFrom,
 					conflictCount: entry.conflictCount,
-					line: entry.sourceLineAligned === false ? undefined : firstSelectorLine(split.sel),
+					line: literalPath || entry.sourceLineAligned === false ? undefined : firstSelectorLine(split.sel),
 					linkPath: entry.linkPath,
+					literalPath,
 				})
 			: "";
 		const title = pathDisplay ? `Read ${pathDisplay}` : "Read";

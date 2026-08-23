@@ -103,6 +103,7 @@ function buildNonTextLocalResource(url: InternalUrl, filePath: string, size: num
 		size: Buffer.byteLength(content, "utf-8"),
 		sourcePath: filePath,
 		isDirectory: false,
+		sourceLineAligned: false,
 		notes: [LOCAL_WRITE_NOTE],
 	};
 }
@@ -116,6 +117,7 @@ function buildLargeLocalTextResource(url: InternalUrl, filePath: string, size: n
 		size: Buffer.byteLength(content, "utf-8"),
 		sourcePath: filePath,
 		isDirectory: false,
+		sourceLineAligned: false,
 		notes: [LOCAL_WRITE_NOTE],
 	};
 }

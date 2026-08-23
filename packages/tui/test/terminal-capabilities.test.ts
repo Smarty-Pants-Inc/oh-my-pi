@@ -384,8 +384,10 @@ describe("shouldEnableHyperlinksByDefault", () => {
 });
 
 describe("shouldEnableHyperlinks", () => {
-	it("keeps direct Herdr hyperlinks enabled in auto mode without a TTY", () => {
-		expect(shouldEnableHyperlinks("auto", { HERDR_ENV: "1", TERM: "dumb" }, "base", false)).toBe(true);
+	it("requires a TTY for Herdr auto hyperlinks", () => {
+		const herdr = { HERDR_ENV: "1", TERM: "dumb" };
+		expect(shouldEnableHyperlinks("auto", herdr, "base", false)).toBe(false);
+		expect(shouldEnableHyperlinks("auto", herdr, "base", true)).toBe(true);
 	});
 
 	it("lets the setting and kill switch disable every positive heuristic", () => {

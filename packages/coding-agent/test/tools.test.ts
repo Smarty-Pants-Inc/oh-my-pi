@@ -1646,6 +1646,7 @@ describe("Coding Agent Tools", () => {
 			expect(output).toContain("question");
 			expect(output).not.toContain("optional context");
 			expect(result.content.some(c => c.type === "image")).toBe(false);
+			expect(result.details?.sourceLineAligned).toBe(false);
 		});
 
 		it("omits inspect_image from the description when the tool is disabled", () => {

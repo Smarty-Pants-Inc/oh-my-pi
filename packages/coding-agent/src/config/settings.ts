@@ -17,7 +17,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { configureCredentialRedaction } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import { configureProviderMaxInFlightRequests } from "@oh-my-pi/pi-ai/stream";
-import { shouldEnableHyperlinks, TERMINAL } from "@oh-my-pi/pi-tui";
+import { hyperlinksUserOverride, shouldEnableHyperlinks, TERMINAL } from "@oh-my-pi/pi-tui";
 import {
 	getAgentDbPath,
 	getAgentDir,
@@ -53,10 +53,6 @@ import {
 	type SettingPath,
 	type SettingValue,
 } from "./settings-schema";
-
-function applyHyperlinkSetting(mode: SettingValue<"tui.hyperlinks">): void {
-	TERMINAL.hyperlinks = shouldEnableHyperlinks(mode, Bun.env, TERMINAL.id, process.stdout.isTTY === true);
-}
 
 // Re-export types that callers need
 export type * from "./settings-schema";
@@ -591,9 +587,6 @@ export class Settings {
 
 	#fireEffectiveSettingChanged(path: SettingPath, value: unknown, prev: unknown): void {
 		if (Object.is(value, prev)) return;
-		if (path === "tui.hyperlinks" && this === globalInstance) {
-			applyHyperlinkSetting(value as SettingValue<"tui.hyperlinks">);
-		}
 		if (path === "statusLine.sessionAccent") {
 			statusLineSessionAccentSignal.fire();
 		}
@@ -724,7 +717,6 @@ export class Settings {
 			this.#configOverlay = overlayResult.value.settings;
 			this.#overlayShellPathSource = overlayResult.value.shellPathSource;
 			this.#rebuildMerged();
-			this.#syncGlobalHyperlinks();
 
 			const nextModelRoles = this.get("modelRoles");
 			if (!Bun.deepEquals(nextModelRoles, previousSignaledValues.modelRoles)) {
@@ -2333,12 +2325,10 @@ export class Settings {
 				this.#modifiedGlobalModelRoles.add(role);
 			}
 			this.#rebuildMerged();
-			this.#syncGlobalHyperlinks();
 			throw error;
 		}
 
 		this.#rebuildMerged();
-		this.#syncGlobalHyperlinks();
 	}
 	#queueProjectSave(): void {
 		if (!this.#persist) return;
@@ -2420,14 +2410,10 @@ export class Settings {
 		this.#merged = this.#deepMerge(this.#merged, this.#overrides);
 		this.#resolvedCache.clear();
 		this.#editVariantCache = undefined;
-	}
-
-	#syncGlobalHyperlinks(): void {
 		if (this === globalInstance) applyHyperlinkSetting(this.get("tui.hyperlinks"));
 	}
 
 	#fireAllHooks(): void {
-		this.#syncGlobalHyperlinks();
 		for (const key of Object.keys(SETTING_HOOKS) as SettingPath[]) {
 			const hook = SETTING_HOOKS[key];
 			if (hook) {
@@ -2505,6 +2491,23 @@ class SettingSignal<A extends unknown[] = []> {
 			}
 		}
 	}
+}
+
+/** Fires when the effective terminal hyperlink output changes at runtime. */
+const hyperlinkModeSignal = new SettingSignal("tui.hyperlinks");
+
+/** Subscribe to effective terminal hyperlink output changes. */
+export const onHyperlinkModeChanged: (cb: () => void) => () => void = hyperlinkModeSignal.on.bind(hyperlinkModeSignal);
+
+let alwaysHyperlinkOutputEnabled = false;
+
+function applyHyperlinkSetting(mode: SettingValue<"tui.hyperlinks">): void {
+	const enabled = shouldEnableHyperlinks(mode, Bun.env, TERMINAL.id, process.stdout.isTTY === true);
+	const alwaysEnabled = isSettingsInitialized() && mode !== "off" && hyperlinksUserOverride(Bun.env) !== false;
+	const changed = TERMINAL.hyperlinks !== enabled || alwaysHyperlinkOutputEnabled !== alwaysEnabled;
+	TERMINAL.hyperlinks = enabled;
+	alwaysHyperlinkOutputEnabled = alwaysEnabled;
+	if (changed) hyperlinkModeSignal.fire();
 }
 
 const SETTING_HOOKS: Partial<Record<SettingPath, SettingHook<any>>> = {

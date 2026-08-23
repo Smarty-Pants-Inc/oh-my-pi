@@ -1,7 +1,10 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
-import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { ReadToolGroupComponent } from "@oh-my-pi/pi-coding-agent/modes/components/read-tool-group";
+import { ToolExecutionComponent } from "@oh-my-pi/pi-coding-agent/modes/components/tool-execution";
+import { MCPAuthorizationLinkPrompt } from "@oh-my-pi/pi-coding-agent/modes/controllers/mcp-command-controller";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
 import {
 	enableAutoTheme,
@@ -15,7 +18,7 @@ import {
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { TUI } from "@oh-my-pi/pi-tui";
+import { TERMINAL, TUI } from "@oh-my-pi/pi-tui";
 import type { TerminalAppearance, TerminalAppearanceRequestToken } from "@oh-my-pi/pi-tui/terminal";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal";
@@ -182,6 +185,124 @@ describe("InteractiveMode theme scrollback refresh", () => {
 		await terminal.waitForRender();
 
 		expect(writes.join("")).toContain("\x1b[3J");
+	});
+
+	it("rebuilds and replays existing transcript links when hyperlink mode changes", () => {
+		const originalTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+		const group = new ReadToolGroupComponent();
+		const target = tempDir.join("cached.ts");
+		const tool = new ToolExecutionComponent("read", { path: target }, {}, undefined, mode.ui, tempDir.path());
+		try {
+			Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+			settings.override("tui.hyperlinks", "off");
+			group.updateArgs({ path: target }, "cached-read");
+			group.updateResult(
+				{
+					content: [{ type: "text", text: "cached" }],
+					details: { isDirectory: false, resolvedPath: target },
+				},
+				false,
+				"cached-read",
+			);
+			tool.updateResult(
+				{
+					content: [{ type: "text", text: "cached" }],
+					details: {
+						isDirectory: false,
+						resolvedPath: target,
+						displayContent: { text: "cached", startLine: 1 },
+						contentType: "text/plain",
+					},
+				},
+				false,
+			);
+			mode.chatContainer.addChild(group);
+			mode.chatContainer.addChild(tool);
+			const before = mode.chatContainer.render(100).join("\n");
+			mode.chatContainer.setNativeScrollbackCommittedRows(before.split("\n").length);
+			expect(before).not.toContain("\x1b]8;id=");
+
+			const writes: string[] = [];
+			const realWrite = terminal.write.bind(terminal);
+			vi.spyOn(terminal, "write").mockImplementation(data => {
+				writes.push(data);
+				realWrite(data);
+			});
+			settings.override("tui.hyperlinks", "always");
+
+			const after = mode.chatContainer.render(100).join("\n");
+			expect(after.match(/\x1b\]8;id=/g)?.length).toBeGreaterThanOrEqual(2);
+			expect(writes.join("")).toContain("\x1b[3J");
+			expect(writes.join("")).toContain("\x1b]8;id=");
+		} finally {
+			mode.chatContainer.removeChild(group);
+			mode.chatContainer.removeChild(tool);
+			tool.stopAnimation();
+			mode.chatContainer.setNativeScrollbackCommittedRows(0);
+			if (originalTTY) {
+				Object.defineProperty(process.stdout, "isTTY", originalTTY);
+			} else {
+				Reflect.deleteProperty(process.stdout, "isTTY");
+			}
+			settings.clearOverride("tui.hyperlinks");
+		}
+	});
+
+	it("replays active Always links across off/auto changes on a non-TTY", () => {
+		const originalTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+		const originalEnv = {
+			HERDR_ENV: Bun.env.HERDR_ENV,
+			NO_COLOR: Bun.env.NO_COLOR,
+			PI_NO_HYPERLINKS: Bun.env.PI_NO_HYPERLINKS,
+			PI_FORCE_HYPERLINKS: Bun.env.PI_FORCE_HYPERLINKS,
+		};
+		const prompt = new MCPAuthorizationLinkPrompt("https://example.com/authorize");
+		const writes: string[] = [];
+		try {
+			Object.defineProperty(process.stdout, "isTTY", { value: false, configurable: true });
+			delete Bun.env.HERDR_ENV;
+			delete Bun.env.NO_COLOR;
+			delete Bun.env.PI_NO_HYPERLINKS;
+			delete Bun.env.PI_FORCE_HYPERLINKS;
+			settings.override("tui.hyperlinks", "off");
+			mode.chatContainer.setNativeScrollbackCommittedRows(0);
+			mode.chatContainer.addChild(prompt);
+			const plain = mode.chatContainer.render(100).join("\n");
+			expect(plain).not.toContain("\x1b]8;");
+			mode.chatContainer.setNativeScrollbackCommittedRows(plain.split("\n").length);
+
+			const realWrite = terminal.write.bind(terminal);
+			vi.spyOn(terminal, "write").mockImplementation(data => {
+				writes.push(data);
+				realWrite(data);
+			});
+			settings.override("tui.hyperlinks", "auto");
+			const linked = mode.chatContainer.render(100).join("\n");
+			expect(linked).toContain("\x1b]8;id=");
+			expect(TERMINAL.hyperlinks).toBe(false);
+			expect(writes.join("")).toContain("\x1b[3J");
+			expect(writes.join("")).toContain("\x1b]8;id=");
+
+			writes.length = 0;
+			mode.chatContainer.setNativeScrollbackCommittedRows(linked.split("\n").length);
+			settings.override("tui.hyperlinks", "off");
+			const replayedPlain = mode.chatContainer.render(100).join("\n");
+			expect(replayedPlain).not.toContain("\x1b]8;");
+			expect(writes.join("")).toContain("\x1b[3J");
+		} finally {
+			mode.chatContainer.removeChild(prompt);
+			mode.chatContainer.setNativeScrollbackCommittedRows(0);
+			if (originalTTY) {
+				Object.defineProperty(process.stdout, "isTTY", originalTTY);
+			} else {
+				Reflect.deleteProperty(process.stdout, "isTTY");
+			}
+			for (const [key, value] of Object.entries(originalEnv)) {
+				if (value === undefined) delete Bun.env[key];
+				else Bun.env[key] = value;
+			}
+			settings.clearOverride("tui.hyperlinks");
+		}
 	});
 
 	it("preserves the viewport on automatic appearance changes until Alt+L requests a full replay", async () => {

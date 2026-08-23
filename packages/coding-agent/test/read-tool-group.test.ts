@@ -1,4 +1,6 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import * as url from "node:url";
 import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -8,6 +10,10 @@ import {
 	readArgsCollapseIntoGroup,
 } from "@oh-my-pi/pi-coding-agent/modes/components/read-tool-group";
 import * as themeModule from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
+import * as markit from "@oh-my-pi/pi-coding-agent/utils/markit";
+import { removeWithRetries } from "@oh-my-pi/pi-utils";
 
 function extractLinkUris(text: string): string[] {
 	return [...text.matchAll(/\x1b\]8;[^;]*;([^\x1b]+)\x1b\\/g)].map(match => match[1]!);
@@ -163,6 +169,64 @@ describe("ReadToolGroupComponent", () => {
 		expect(plain).toContain(`${themeModule.theme.tree.branch} ${onePath}:1-2`);
 		expect(plain).toContain(`${themeModule.theme.tree.branch} ${twoPath}:3-4`);
 		expect(plain).toContain(`${themeModule.theme.tree.last} ${threePath}:5-6`);
+	});
+
+	it("keeps selector-shaped literal files in separate rows and links", () => {
+		settings.override("tui.hyperlinks", "always");
+		const component = new ReadToolGroupComponent();
+		const onePath = path.resolve("/tmp/foo:100");
+		const twoPath = path.resolve("/tmp/foo:200");
+		component.updateArgs({ path: `${onePath};${twoPath}` }, "read-literal-files");
+		component.updateResult(
+			{
+				content: [{ type: "text", text: "combined" }],
+				details: {
+					displayReadTargets: [onePath, twoPath],
+					displayReadTargetLinks: [
+						{ path: onePath, literalPath: true },
+						{ path: twoPath, literalPath: true },
+					],
+				},
+			},
+			false,
+			"read-literal-files",
+		);
+
+		const rendered = component.render(120).join("\n");
+		const plain = Bun.stripANSI(rendered);
+		const expectedUris = [url.pathToFileURL(onePath).href, url.pathToFileURL(twoPath).href];
+
+		expect(plain).toContain("Read (2)");
+		expect(plain).toContain(`${themeModule.theme.tree.branch} ${onePath}`);
+		expect(plain).toContain(`${themeModule.theme.tree.last} ${twoPath}`);
+		expect(plain).not.toContain(`${onePath},${twoPath}`);
+		expect(extractLinkUris(rendered)).toEqual(expectedUris);
+		expect(extractLinkTexts(rendered)).toEqual([onePath, twoPath]);
+	});
+
+	it("keeps an exact literal containing selector-like semicolon parts whole", () => {
+		settings.override("tui.hyperlinks", "always");
+		const component = new ReadToolGroupComponent();
+		const literal = "foo:1-2;bar:3-4";
+		const literalPath = path.resolve("/tmp", literal);
+		component.updateArgs({ path: literal }, "read-semicolon-literal");
+		component.updateResult(
+			{
+				content: [{ type: "text", text: "literal content" }],
+				details: { isDirectory: false, literalPath: true, resolvedPath: literalPath },
+			},
+			false,
+			"read-semicolon-literal",
+		);
+
+		const rendered = component.render(120).join("\n");
+		const uris = extractLinkUris(rendered);
+
+		expect(Bun.stripANSI(rendered)).toContain(`Read ${literal}`);
+		expect(Bun.stripANSI(rendered)).not.toContain("Read (2)");
+		expect(uris).toEqual([url.pathToFileURL(literalPath).href]);
+		expect(uris.map(uri => new URL(uri).search)).toEqual([""]);
+		expect(extractLinkTexts(rendered)).toEqual([literal]);
 	});
 
 	it("merges multi-range selectors into one file row", () => {
@@ -371,14 +435,14 @@ describe("ReadToolGroupComponent", () => {
 		expect(usageIndices[0]).toBeGreaterThan(previewIndex);
 	});
 
-	it("links grouped summary paths to resolved filesystem paths and selector lines", () => {
+	it("keeps genuine selectors anchored to their base path and selected line", () => {
 		settings.override("tui.hyperlinks", "always");
 		const component = new ReadToolGroupComponent();
-		const examplePath = path.resolve("/workspace/src/example.ts");
-		component.updateArgs({ path: "src/example.ts:7-9" }, "read-link");
+		const examplePath = path.resolve("/workspace/foo");
+		component.updateArgs({ path: "foo:100" }, "read-link");
 		component.updateResult(
 			{
-				content: [{ type: "text", text: "line 7" }],
+				content: [{ type: "text", text: "line 100" }],
 				details: { isDirectory: false, meta: { source: { type: "path", value: examplePath } } },
 			},
 			false,
@@ -386,13 +450,12 @@ describe("ReadToolGroupComponent", () => {
 		);
 
 		const rendered = component.render(120).join("\n");
+		const exampleUri = new URL(url.pathToFileURL(examplePath).href);
+		exampleUri.searchParams.set("line", "100");
 
-		const exampleUri = new URL(url.pathToFileURL(path.resolve(examplePath)).href);
-		exampleUri.searchParams.set("line", "7");
-		expect(Bun.stripANSI(rendered)).toContain("Read src/example.ts:7-9");
-		expect(extractLinkUris(rendered)).toContain(exampleUri.href);
-		expect(extractLinkTexts(rendered)).toContain("src/example.ts");
-		expect(extractLinkTexts(rendered)).not.toContain("src/example.ts:7-9");
+		expect(Bun.stripANSI(rendered)).toContain("Read foo:100");
+		expect(extractLinkUris(rendered)).toEqual([exampleUri.href]);
+		expect(extractLinkTexts(rendered)).toEqual(["foo"]);
 	});
 
 	it("links transformed backing files without raw selector line targets", () => {
@@ -417,6 +480,45 @@ describe("ReadToolGroupComponent", () => {
 		expect(extractLinkUris(rendered)).not.toContain(backingLineUri.href);
 	});
 
+	it("links failed document conversions to their confirmed source path", async () => {
+		settings.override("tui.hyperlinks", "always");
+		const testDir = await fs.mkdtemp(path.join(os.tmpdir(), "read-group-conversion-"));
+		try {
+			const documentPath = path.join(testDir, "broken.pdf");
+			await Bun.write(documentPath, "not a real PDF\n");
+			const convert = vi.spyOn(markit, "convertFileWithMarkit").mockResolvedValue({
+				ok: false,
+				content: "",
+				error: "simulated conversion failure",
+			});
+			const session = {
+				cwd: testDir,
+				hasUI: false,
+				getSessionFile: () => null,
+				getSessionSpawns: () => "*",
+				settings: Settings.isolated(),
+			} as ToolSession;
+			const result = await new ReadTool(session).execute("read-failed-conversion", { path: documentPath });
+
+			expect(convert).toHaveBeenCalledWith(documentPath, undefined);
+			expect(result.details).toMatchObject({
+				resolvedPath: documentPath,
+				isDirectory: false,
+				sourceLineAligned: false,
+				meta: { source: { type: "path", value: documentPath } },
+			});
+
+			const component = new ReadToolGroupComponent();
+			component.updateArgs({ path: documentPath }, "read-failed-conversion");
+			component.updateResult(result, false, "read-failed-conversion");
+			const rendered = component.render(120).join("\n");
+
+			expect(extractLinkUris(rendered)).toEqual([url.pathToFileURL(documentPath).href]);
+			expect(extractLinkTexts(rendered)).toEqual([documentPath]);
+		} finally {
+			await removeWithRetries(testDir);
+		}
+	});
 	it("leaves pending and directory grouped paths unlinked", () => {
 		settings.override("tui.hyperlinks", "always");
 		const component = new ReadToolGroupComponent();
@@ -460,6 +562,28 @@ describe("ReadToolGroupComponent", () => {
 		expect(extractLinkUris(rendered)).toContain(previewUri.href);
 		expect(extractLinkTexts(rendered)).toContain("src/preview.ts");
 		expect(extractLinkTexts(rendered)).not.toContain("src/preview.ts:20-22");
+	});
+
+	it("keeps literal-colon preview titles fully clickable without a line query", () => {
+		settings.override("tui.hyperlinks", "always");
+		const component = new ReadToolGroupComponent({ showContentPreview: true });
+		const literalPath = path.resolve("/workspace/foo:100");
+		component.updateArgs({ path: "foo:100" }, "read-literal-preview");
+		component.updateResult(
+			{
+				content: [{ type: "text", text: "literal content" }],
+				details: { resolvedPath: literalPath, isDirectory: false, literalPath: true },
+			},
+			false,
+			"read-literal-preview",
+		);
+
+		const rendered = component.render(120).join("\n");
+		const uris = extractLinkUris(rendered);
+
+		expect(uris).toEqual([url.pathToFileURL(literalPath).href]);
+		expect(uris.map(uri => new URL(uri).search)).toEqual([""]);
+		expect(extractLinkTexts(rendered)).toEqual(["foo:100"]);
 	});
 });
 
