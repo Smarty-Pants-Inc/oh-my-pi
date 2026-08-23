@@ -23,10 +23,8 @@ function collabWebLinkClickable(webLink: string): string {
 }
 
 /** Join hint printed by /collab: compact terminal link + clickable browser deep link. */
-function collabLinkHint(host: CollabHost, heading: string, view = false): string {
+function collabLinkHint(link: string, webLink: string, heading: string, view = false): string {
 	const bullet = theme.fg("accent", theme.format.bullet);
-	const link = view ? host.viewLink : host.link;
-	const webLink = view ? host.webViewLink : host.webLink;
 	return [
 		theme.fg("success", heading),
 		` ${bullet} ${theme.fg("muted", view ? "Watch from another terminal:" : "Join from another terminal:")} ${APP_NAME} join "${link}"`,
@@ -49,8 +47,11 @@ function showCollabQrCode(ctx: InteractiveModeContext, webLink: string): void {
 }
 
 function showCollabLink(ctx: InteractiveModeContext, host: CollabHost, heading: string, view = false): void {
-	ctx.showStatus(collabLinkHint(host, heading, view), { dim: false });
-	showCollabQrCode(ctx, view ? host.webViewLink : host.webLink);
+	const link = view ? host.viewLink : host.link;
+	const webLink = view ? host.webViewLink : host.webLink;
+	const rebuild = () => collabLinkHint(link, webLink, heading, view);
+	ctx.showStatus(rebuild(), { dim: false }, rebuild);
+	showCollabQrCode(ctx, webLink);
 }
 
 export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
@@ -298,7 +299,10 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
 					const names = ctx.collabHost.participants.map(p =>
 						p.role === "host" ? `${p.name} (host)` : p.readOnly ? `${p.name} (view-only)` : p.name,
 					);
-					ctx.showStatus(`Collab: ${names.join(", ")} — ${collabWebLinkClickable(ctx.collabHost.webLink)}`);
+					const participants = names.join(", ");
+					const webLink = ctx.collabHost.webLink;
+					const rebuild = () => `Collab: ${participants} — ${collabWebLinkClickable(webLink)}`;
+					ctx.showStatus(rebuild(), undefined, rebuild);
 				} else if (ctx.collabGuest) {
 					ctx.showStatus(
 						ctx.collabGuest.readOnly

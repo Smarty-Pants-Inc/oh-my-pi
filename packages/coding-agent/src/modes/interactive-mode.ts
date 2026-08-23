@@ -4455,8 +4455,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.chatContainer.clear();
 	}
 
-	showStatus(message: string, options?: { dim?: boolean }): void {
-		this.#uiHelpers.showStatus(message, options);
+	showStatus(message: string, options?: { dim?: boolean }, rebuild?: () => string): void {
+		this.#uiHelpers.showStatus(message, options, rebuild);
 	}
 
 	showError(message: string): void {

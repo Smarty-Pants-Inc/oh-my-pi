@@ -8209,7 +8209,7 @@
     },
     {
       "path": "packages/coding-agent/src/modes/interactive-mode.ts",
-      "sha256": "d81d5e957a6ee8c42e3f68fa7fdfc149f4de05ea8bc34a4fcbee5127bce5caed"
+      "sha256": "9ea27e7b66a8ef27cfefb797b2379328aaa705ed88132281fe3b6d78bec97047"
     },
     {
       "path": "packages/coding-agent/src/modes/loop-limit.ts",
@@ -8301,7 +8301,7 @@
     },
     {
       "path": "packages/coding-agent/src/modes/utils/ui-helpers.ts",
-      "sha256": "fb4c6cbb9096b8451c2f8512f0b2b3d75368e7a3ffe12e2ebfe6c3cb7e3058a2"
+      "sha256": "9f4a39616c47c53a17ac8e06c2308214184e52bb384324bf7f7fb5453b0145d0"
     },
     {
       "path": "packages/coding-agent/src/modes/workflow.ts",
@@ -8741,7 +8741,7 @@
     },
     {
       "path": "packages/coding-agent/src/slash-commands/builtin-collaboration.ts",
-      "sha256": "6f5ad82ae448ad818e8090b117ff5d5b23c79fa0340a0a0ea48d09c6a3d93fd2"
+      "sha256": "64246364d63d57e1337207caab83b817efcc2c4166d2886777a86e9f38bef1c7"
     },
     {
       "path": "packages/coding-agent/src/slash-commands/builtin-completions.ts",
@@ -10737,5 +10737,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "cb4c81679e62f6d5ce8c3d1eba9731016f8fc1f9e5c1218c29c3224f0e5a5120"
+  "rootSha256": "111c71fec205e59a8573f1fc7d8f401945eb0cd0cbba82dc3ea8f5fdea5d9e1e"
 }

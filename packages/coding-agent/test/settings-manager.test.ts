@@ -102,6 +102,34 @@ describe("Settings", () => {
 			shouldEnableHyperlinks("auto", Bun.env, TERMINAL.id, process.stdout.isTTY === true),
 		);
 	});
+
+	it("restores hyperlink environment overrides before recomputing terminal capability", () => {
+		delete Bun.env.PI_NO_HYPERLINKS;
+		Bun.env.PI_FORCE_HYPERLINKS = "1";
+		const forceState = beginSettingsTest();
+
+		Bun.env.PI_NO_HYPERLINKS = "1";
+		delete Bun.env.PI_FORCE_HYPERLINKS;
+		resetSettingsForTest();
+		expect(TERMINAL.hyperlinks).toBe(false);
+
+		restoreSettingsTestState(forceState);
+		expect(process.env.PI_NO_HYPERLINKS).toBeUndefined();
+		expect(process.env.PI_FORCE_HYPERLINKS).toBe("1");
+		expect(TERMINAL.hyperlinks).toBe(true);
+
+		Bun.env.PI_NO_HYPERLINKS = "1";
+		const noHyperlinksState = beginSettingsTest();
+
+		delete Bun.env.PI_NO_HYPERLINKS;
+		resetSettingsForTest();
+		expect(TERMINAL.hyperlinks).toBe(true);
+
+		restoreSettingsTestState(noHyperlinksState);
+		expect(process.env.PI_NO_HYPERLINKS).toBe("1");
+		expect(process.env.PI_FORCE_HYPERLINKS).toBe("1");
+		expect(TERMINAL.hyperlinks).toBe(false);
+	});
 	describe("main config file selection", () => {
 		it("loads and updates an existing config.yaml without creating config.yml", async () => {
 			const yamlConfigPath = path.join(agentDir, "config.yaml");
