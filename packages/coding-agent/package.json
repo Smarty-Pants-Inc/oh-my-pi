@@ -106,6 +106,8 @@
       "types": "./src/index.ts",
       "import": "./src/index.ts"
     },
+    "./context/internal-session": null,
+    "./context/internal-session.js": null,
     "./*": {
       "types": "./src/*.ts",
       "import": "./src/*.ts"

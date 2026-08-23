@@ -127,7 +127,7 @@ describe("ExtensionRunner", () => {
 		expect(errors[0]?.error).toContain("PROMPT_POLICY_REVIEW_REQUIRED: extension source is not approved");
 	});
 
-	it("skips multiple unapproved system prompt builders without blocking startup", async () => {
+	it("fails protected startup when every configured system prompt builder is unapproved", async () => {
 		for (const name of ["builder-a.ts", "builder-b.ts"]) {
 			fs.writeFileSync(
 				path.join(extensionsDir, name),
@@ -154,7 +154,9 @@ describe("ExtensionRunner", () => {
 		const errors: ExtensionError[] = [];
 		runner.onError(error => errors.push(error));
 
-		expect(await runner.getSystemPromptBuilder()).toBeUndefined();
+		await expect(runner.getSystemPromptBuilder()).rejects.toThrow(
+			"PROMPT_POLICY_REVIEW_REQUIRED: one or more configured system prompt builder sources are not approved",
+		);
 		expect(errors).toHaveLength(2);
 		expect(errors.every(error => error.event === "system_prompt_builder")).toBe(true);
 		expect(errors.every(error => error.error.includes("PROMPT_POLICY_REVIEW_REQUIRED"))).toBe(true);

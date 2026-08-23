@@ -127,6 +127,7 @@ export async function collectBundledPiEntries(): Promise<BundledPiEntry[]> {
 
 		for (const exportKey in exportsField) {
 			if (!exportKey.startsWith("./") || exportKey === "." || exportKey.includes("*")) continue;
+			if (!exportImportTarget(exportsField[exportKey])) continue;
 			const subpath = exportKey.slice(2);
 			const key = `${manifest.name}/${subpath}`;
 			addEntry(key, bindingForSubpath(pkg.identifier, subpath), key);

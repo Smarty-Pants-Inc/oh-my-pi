@@ -51,6 +51,8 @@ import {
 import { ModelsConfigFile } from "./config/models-config";
 import { serviceTierSettingToTier } from "./config/service-tier";
 import { getDefault, type SettingPath, Settings, type SettingValue, settings } from "./config/settings";
+import { ensureApprovedStartup } from "./context/approved-policy";
+import type { ContextReleaseManifest } from "./context/manifest";
 import { initializeWithSettings, isProviderEnabled } from "./discovery";
 import {
 	clearPluginRootsAndCaches,
@@ -480,6 +482,7 @@ async function loadTrustedSessionExtensions(
 	options: Pick<CreateAgentSessionOptions, "additionalExtensionPaths">,
 	cwd: string,
 	eventBus: EventBus,
+	releaseManifest?: ContextReleaseManifest,
 ) {
 	const paths = options.additionalExtensionPaths ?? [];
 	for (const trustedPath of paths) {
@@ -493,7 +496,7 @@ async function loadTrustedSessionExtensions(
 			throw new Error(`Trusted extension must be a module file, not a directory: ${trustedPath}`);
 		}
 	}
-	return loadExtensions(paths, cwd, eventBus);
+	return loadExtensions(paths, cwd, eventBus, releaseManifest ?? (await ensureApprovedStartup()));
 }
 
 /**
@@ -1882,16 +1885,17 @@ export async function runRootCommand(
 		// (createAgentSession writes the terminal breadcrumb eagerly). Loading the
 		// extensions here also makes `@file` classification extension-aware — e.g. a
 		// string-flag value such as `--target @notes.md` is the flag's value, not a
-		// file — and the same result is handed to createAgentSession via
-		// `preloadedExtensions` so the discovery work is not repeated.
+		// file. Unprotected sessions reuse these bindings; protected sessions
+		// independently verify and rebind source paths before session creation.
 		if (isInteractive && !parsedArgs.trustedExtensions?.length) {
 			sessionOptions.extensions = [...(sessionOptions.extensions ?? []), createWarpEventBridgeExtension()];
 		}
 
 		const eventBus = new EventBus();
+		const releaseManifest = await ensureApprovedStartup();
 		const extensionsResult = parsedArgs.trustedExtensions?.length
-			? await loadTrustedSessionExtensions(sessionOptions, cwd, eventBus)
-			: await loadSessionExtensions(sessionOptions, cwd, settingsInstance, eventBus);
+			? await loadTrustedSessionExtensions(sessionOptions, cwd, eventBus, releaseManifest)
+			: await loadSessionExtensions(sessionOptions, cwd, settingsInstance, eventBus, releaseManifest);
 		let hostInternalExtension: HostInternalExtensionBinding | undefined;
 		if (companionController) {
 			try {
@@ -1980,11 +1984,12 @@ export async function runRootCommand(
 				)
 			: undefined;
 
-		const { session, setToolUIContext, modelFallbackMessage, lspServers, mcpManager } = await createSession({
-			...sessionOptions,
-			eventBus,
-			preloadedExtensions: extensionsResult,
-		});
+		const { session, setToolUIContext, modelFallbackMessage, lspServers, mcpManager, protectedRuntime } =
+			await createSession({
+				...sessionOptions,
+				eventBus,
+				preloadedExtensions: extensionsResult,
+			});
 		const interactiveCollabBridge: CollabBridgeBootstrap | undefined =
 			deps.collabBridge ??
 			(automaticHerdrHostBridge
@@ -2026,6 +2031,7 @@ export async function runRootCommand(
 				settings: settingsInstance,
 				enableLsp: sessionOptions.enableLsp ?? true,
 				eventBus,
+				protectedRuntime: protectedRuntime === true,
 			}),
 			Math.trunc(Number(settingsInstance.get("task.agentIdleTtlMs") ?? 420_000) || 0),
 		);

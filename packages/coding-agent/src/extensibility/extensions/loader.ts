@@ -21,6 +21,7 @@ import { hasFsCode, isEacces, isEnoent, logger } from "@oh-my-pi/pi-utils";
 import { type ExtensionModule, extensionModuleCapability } from "../../capability/extension-module";
 import { type Hook, hookCapability } from "../../capability/hook";
 import { isServiceTierFamily, isServiceTierForFamily } from "../../config/service-tier";
+import { approvedCandidateSourceModule, type ContextReleaseManifest } from "../../context/manifest";
 import { loadCapability } from "../../discovery";
 import { getExtensionNameFromPath } from "../../discovery/helpers";
 import type { ExecOptions } from "../../exec/exec";
@@ -32,7 +33,11 @@ import type { CustomMessagePayload } from "../../session/messages";
 import type { FileDeleteFallbackHandler, FileWriteFallbackHandler } from "../../tools/file-write-fallback";
 import { EventBus } from "../../utils/event-bus";
 import * as TypeBox from "../legacy-typebox";
-import { installLegacyPiSpecifierShim, loadLegacyPiModule } from "../plugins/legacy-pi-compat";
+import {
+	type ApprovedLegacyPiModule,
+	installLegacyPiSpecifierShim,
+	loadLegacyPiModule,
+} from "../plugins/legacy-pi-compat";
 import { getAllPluginExtensionPaths } from "../plugins/loader";
 
 import { resolvePath, withHostGuard } from "../utils";
@@ -410,10 +415,16 @@ interface ImportedExtensionModule {
 	error: string | null;
 }
 
-async function importExtensionModule(extensionPath: string, cwd: string): Promise<ImportedExtensionModule> {
+async function importExtensionModule(
+	extensionPath: string,
+	cwd: string,
+	approvedModule?: ApprovedLegacyPiModule,
+): Promise<ImportedExtensionModule> {
 	const resolvedPath = resolvePath(extensionPath, cwd);
 	try {
-		const module = (await withHostGuard(() => loadLegacyPiModule(resolvedPath))) as LoadedExtensionModule;
+		const module = (await withHostGuard(() =>
+			loadLegacyPiModule(approvedModule?.entryPath ?? resolvedPath, approvedModule),
+		)) as LoadedExtensionModule;
 		const factory = getExtensionFactory(module);
 
 		if (typeof factory !== "function") {
@@ -479,7 +490,12 @@ export async function loadExtensionFromFactory(
  * sequentially in the original path order, so registration semantics
  * (last-wins collisions, shared runtime flag defaults) stay deterministic.
  */
-export async function loadExtensions(paths: string[], cwd: string, eventBus?: EventBus): Promise<LoadExtensionsResult> {
+export async function loadExtensions(
+	paths: string[],
+	cwd: string,
+	eventBus?: EventBus,
+	releaseManifest?: ContextReleaseManifest,
+): Promise<LoadExtensionsResult> {
 	const extensions: Extension[] = [];
 	const errors: Array<{ path: string; error: string }> = [];
 	const resolvedEventBus = eventBus ?? new EventBus();
@@ -497,11 +513,34 @@ export async function loadExtensions(paths: string[], cwd: string, eventBus?: Ev
 		seen.add(canonicalPath);
 		uniquePaths.push(extPath);
 	}
-	const imported = await Promise.all(uniquePaths.map(extPath => importExtensionModule(extPath, cwd)));
+
+	// In protected mode, capture and attest every configured graph before any
+	// extension module evaluation or factory invocation.
+	const approvedModules = releaseManifest
+		? await Promise.all(
+				uniquePaths.map(extPath => approvedCandidateSourceModule(resolvePath(extPath, cwd), releaseManifest)),
+			)
+		: uniquePaths.map(() => undefined);
+	const imported = await Promise.all(
+		uniquePaths.map((extPath, index) => {
+			const approvedModule = approvedModules[index];
+			return releaseManifest && !approvedModule
+				? Promise.resolve(null)
+				: importExtensionModule(extPath, cwd, approvedModule);
+		}),
+	);
 
 	for (let i = 0; i < uniquePaths.length; i++) {
 		const extPath = uniquePaths[i]!;
-		const { extension, error } = await bindExtension(extPath, imported[i]!, cwd, resolvedEventBus, runtime);
+		const importedExtension = imported[i]!;
+		if (!importedExtension) {
+			errors.push({
+				path: extPath,
+				error: `PROMPT_POLICY_REVIEW_REQUIRED: extension source is not approved: ${extPath}`,
+			});
+			continue;
+		}
+		const { extension, error } = await bindExtension(extPath, importedExtension, cwd, resolvedEventBus, runtime);
 
 		if (error) {
 			errors.push({ path: extPath, error });
@@ -798,7 +837,8 @@ export async function discoverAndLoadExtensions(
 	eventBus?: EventBus,
 	disabledExtensionIds?: string[],
 	options: DiscoverExtensionPathOptions = {},
+	releaseManifest?: ContextReleaseManifest,
 ): Promise<LoadExtensionsResult> {
 	const paths = await discoverExtensionPaths(configuredPaths, cwd, disabledExtensionIds, options);
-	return loadExtensions(paths, cwd, eventBus);
+	return loadExtensions(paths, cwd, eventBus, releaseManifest);
 }

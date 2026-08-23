@@ -61,6 +61,7 @@ async function writePolicyState(checkout: string, home: string): Promise<void> {
 	const script = `
 		import { buildContextReleaseManifest } from ${JSON.stringify(manifestModule)};
 		const release = await buildContextReleaseManifest(${JSON.stringify(checkout)}, undefined, {
+			stackPackageContentSha256: "a".repeat(64),
 			scopeCoverage: ${JSON.stringify(
 				paths.map(changedPath => ({
 					path: changedPath,
@@ -133,6 +134,7 @@ describe("clean-checkout native-free context CLI", () => {
 					approvedAt: "2026-08-15T12:00:00-04:00",
 				},
 				candidates: manifest.candidates,
+				stackPackageContentSha256: manifest.stackPackageContentSha256,
 				contentManifestRootSha256: manifest.contentManifestRootSha256,
 				behaviorSha256: manifest.behaviorSha256,
 				globalAgentsSha256: manifest.globalAgentsSha256,

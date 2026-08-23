@@ -78,6 +78,7 @@ import { buildServiceTierByFamily } from "./config/service-tier";
 import { Settings, type SkillsSettings } from "./config/settings";
 import { ensureApprovedStartup, promptPolicyReviewWarning } from "./context/approved-policy";
 import { captureRuntimeContextEvidence, isRuntimeContextEvidencePayload } from "./context/explain";
+import { isOmpInternalSession } from "./context/internal-session";
 import { type ContextReleaseManifest, canonicalAgentDirPath } from "./context/manifest";
 import { bindRenderedInstruction } from "./context/registry";
 import { exportRenderedToolContracts } from "./context/tool-contracts";
@@ -112,6 +113,7 @@ import {
 	loadExtensionFromFactory,
 	loadExtensions,
 	type RegisteredTool,
+	type SystemPromptBuilder,
 	type ToolDefinition,
 	wrapRegisteredTools,
 } from "./extensibility/extensions";
@@ -458,9 +460,9 @@ export interface CreateAgentSessionOptions {
 	disableExtensionDiscovery?: boolean;
 	/**
 	 * Pre-loaded extensions (skips file discovery and the per-session factory
-	 * call). Used by the CLI when extensions are loaded early to parse custom
-	 * flags — the same process owns the returned instances, so reusing them is
-	 * safe.
+	 * call) for an unprotected CLI session that already loaded custom flags.
+	 * Protected sessions ignore these caller-supplied objects and reconstruct
+	 * extensions from freshly verified source paths.
 	 *
 	 * NEVER pass this across session boundaries (e.g. parent → subagent).
 	 * `Extension` instances close over a parent-bound `ExtensionAPI` (cwd,
@@ -654,6 +656,8 @@ export interface CreateAgentSessionResult {
 	lspServers?: LspStartupServerInfo[];
 	/** Shared event bus for tool/extension communication */
 	eventBus: EventBus;
+	/** Whether this session is bound to an approved protected release. */
+	protectedRuntime?: boolean;
 }
 
 export type DialectFormat = "auto" | "native" | Dialect;
@@ -740,8 +744,7 @@ export async function discoverAuthStorage(agentDir: string = getAgentDir()): Pro
  */
 export async function discoverExtensions(cwd?: string): Promise<LoadExtensionsResult> {
 	const resolvedCwd = cwd ?? getProjectDir();
-
-	return discoverAndLoadExtensions([], resolvedCwd);
+	return discoverAndLoadExtensions([], resolvedCwd, undefined, undefined, {}, await startupReleaseManifest());
 }
 
 /**
@@ -772,18 +775,19 @@ export async function discoverSessionExtensionPaths(
  * createAgentSession} would load except the inline factory extensions it appends
  * itself. Extracted so the CLI can resolve extension-registered flags (and thus
  * classify `@file` arguments extension-aware) *before* a session — and its
- * terminal breadcrumb — is created, then hand the result back through
- * {@link CreateAgentSessionOptions.preloadedExtensions} so the work is not
- * repeated. Keep this the single source of the discovery branch logic.
+ * terminal breadcrumb — is created. In protected mode, source verification
+ * happens before any module evaluation.
  */
 export async function loadSessionExtensions(
 	options: Pick<CreateAgentSessionOptions, "disableExtensionDiscovery" | "additionalExtensionPaths">,
 	cwd: string,
 	settings: Settings,
 	eventBus: EventBus,
+	releaseManifest?: ContextReleaseManifest,
 ): Promise<LoadExtensionsResult> {
+	const activeReleaseManifest = releaseManifest ?? (await startupReleaseManifest());
 	const paths = await discoverSessionExtensionPaths(options, cwd, settings);
-	const result = await logger.time("loadExtensions", loadExtensions, paths, cwd, eventBus);
+	const result = await logger.time("loadExtensions", loadExtensions, paths, cwd, eventBus, activeReleaseManifest);
 	for (const { path, error } of result.errors) {
 		logger.error("Failed to load extension", { path, error });
 	}
@@ -1285,8 +1289,19 @@ export function createAutoLearnCaptureRunner(
  * });
  * ```
  */
+let testApprovedStartupManifest: ContextReleaseManifest | undefined;
+
+async function startupReleaseManifest(): Promise<ContextReleaseManifest | undefined> {
+	return isBunTestRuntime() ? testApprovedStartupManifest : await ensureApprovedStartup();
+}
+
+export function testSetApprovedStartupManifest(manifest: ContextReleaseManifest | undefined): void {
+	if (!isBunTestRuntime()) throw new Error("testSetApprovedStartupManifest is test-only");
+	testApprovedStartupManifest = manifest;
+}
+
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
-	let releaseManifest = isBunTestRuntime() ? undefined : await ensureApprovedStartup();
+	let releaseManifest = await startupReleaseManifest();
 	if (releaseManifest && path.resolve(options.agentDir ?? getAgentDir()) !== canonicalAgentDirPath()) {
 		logger.warn("Prompt policy requires review; continuing with the requested agent directory", {
 			error: `PROMPT_POLICY_REVIEW_REQUIRED: runtime agent directory must be ${canonicalAgentDirPath()}`,
@@ -1304,6 +1319,7 @@ async function createAgentSessionScoped(
 	options: CreateAgentSessionOptions,
 	releaseManifest: ContextReleaseManifest | undefined,
 ): Promise<CreateAgentSessionResult> {
+	const ompInternalSession = isOmpInternalSession(options);
 	const cwd = options.cwd ?? getProjectDir();
 	const agentDir = options.agentDir ?? getAgentDir();
 	const eventBus = options.eventBus ?? new EventBus();
@@ -2061,10 +2077,9 @@ async function createAgentSessionScoped(
 		toolSession.customToolPaths = customToolPaths;
 
 		// Load extensions. Three paths:
-		//   1. `preloadedExtensions` (CLI): caller already loaded — reuse the
-		//      Extension instances. Shallow-clone `extensions` so the inline
-		//      push below cannot mutate the caller's array. `runtime` is shared
-		//      so flag values set pre-creation flow into the live session.
+		//   1. `preloadedExtensions` (CLI): unprotected callers reuse the loaded
+		//      instances. Protected callers rediscover and reload verified paths;
+		//      caller-owned Extension objects are not evidence of loaded bytes.
 		//   2. `preloadedExtensionPaths` (subagent): caller resolved paths;
 		//      skip the FS scan but always re-call `loadExtensions` here so
 		//      each `Extension` binds to THIS session's `ExtensionAPI`
@@ -2078,20 +2093,46 @@ async function createAgentSessionScoped(
 			// Allocate a session runtime without evaluating caller-provided extension
 			// instances, paths, or factories.
 			extensionPaths = [];
-			extensionsResult = await loadExtensions([], cwd, eventBus);
+			extensionsResult = await loadExtensions([], cwd, eventBus, releaseManifest);
 		} else if (options.preloadedExtensions) {
-			extensionsResult = {
-				...options.preloadedExtensions,
-				extensions: [...options.preloadedExtensions.extensions],
-			};
-			// Capture paths for downstream forwarding; filter inline-factory
-			// entries (`<inline-N>`) — those are per-session, not source paths.
-			extensionPaths = extensionsResult.extensions
-				.map(ext => ext.resolvedPath)
-				.filter(p => !p.startsWith("<inline"));
+			if (releaseManifest) {
+				// Reconstruct from discovery rather than accepting caller-owned
+				// `resolvedPath` fields or registrations as proof of loaded content.
+				extensionPaths = await logger.time("discoverSessionExtensionPaths", () =>
+					discoverSessionExtensionPaths(options, cwd, settings),
+				);
+				extensionsResult = await logger.time(
+					"loadExtensions",
+					loadExtensions,
+					extensionPaths,
+					cwd,
+					eventBus,
+					releaseManifest,
+				);
+				for (const { path, error } of extensionsResult.errors) {
+					logger.error("Failed to load extension", { path, error });
+				}
+			} else {
+				extensionsResult = {
+					...options.preloadedExtensions,
+					extensions: [...options.preloadedExtensions.extensions],
+				};
+				// Capture paths for downstream forwarding; filter inline-factory
+				// entries (`<inline-N>`) — those are per-session, not source paths.
+				extensionPaths = extensionsResult.extensions
+					.map(ext => ext.resolvedPath)
+					.filter(p => !p.startsWith("<inline"));
+			}
 		} else if (options.preloadedExtensionPaths) {
 			extensionPaths = options.preloadedExtensionPaths;
-			extensionsResult = await logger.time("loadExtensions", loadExtensions, extensionPaths, cwd, eventBus);
+			extensionsResult = await logger.time(
+				"loadExtensions",
+				loadExtensions,
+				extensionPaths,
+				cwd,
+				eventBus,
+				releaseManifest,
+			);
 			for (const { path, error } of extensionsResult.errors) {
 				logger.error("Failed to load extension", { path, error });
 			}
@@ -2099,7 +2140,14 @@ async function createAgentSessionScoped(
 			extensionPaths = await logger.time("discoverSessionExtensionPaths", () =>
 				discoverSessionExtensionPaths(options, cwd, settings),
 			);
-			extensionsResult = await logger.time("loadExtensions", loadExtensions, extensionPaths, cwd, eventBus);
+			extensionsResult = await logger.time(
+				"loadExtensions",
+				loadExtensions,
+				extensionPaths,
+				cwd,
+				eventBus,
+				releaseManifest,
+			);
 			for (const { path, error } of extensionsResult.errors) {
 				logger.error("Failed to load extension", { path, error });
 			}
@@ -2676,7 +2724,30 @@ async function createAgentSessionScoped(
 			() => (hasSession ? session.getAsyncJobCounts() : null),
 			releaseManifest,
 		);
-		const systemPromptBuilder = await extensionRunner.getSystemPromptBuilder();
+		let systemPromptBuilder: SystemPromptBuilder | undefined;
+		let startupPromptPolicyWarning: string | undefined;
+		let promptPolicyUIContext: ExtensionUIContext | undefined;
+		let notifiedPromptPolicyWarning: string | undefined;
+		const publishPromptPolicyWarning = (warning: string) => {
+			startupPromptPolicyWarning = warning;
+			logger.warn("Prompt policy requires review; continuing with the stock system prompt", { error: warning });
+			if (promptPolicyUIContext) {
+				promptPolicyUIContext.setStatus("omp-prompt-policy", "Prompt policy: REVIEW REQUIRED");
+				if (notifiedPromptPolicyWarning !== warning) {
+					promptPolicyUIContext.notify(warning, "warning");
+					notifiedPromptPolicyWarning = warning;
+				}
+			}
+		};
+		if (!(releaseManifest && ompInternalSession)) {
+			try {
+				systemPromptBuilder = await extensionRunner.getSystemPromptBuilder();
+			} catch (error) {
+				const warning = releaseManifest ? promptPolicyReviewWarning(error) : undefined;
+				if (!warning || options.hasUI !== true) throw error;
+				publishPromptPolicyWarning(warning);
+			}
+		}
 
 		credentialDisabledTarget = extensionRunner;
 		for (const event of startupCredentialDisabledEvents.splice(0)) {
@@ -3062,7 +3133,7 @@ async function createAgentSessionScoped(
 				}
 			};
 			let defaultPrompt = releaseManifest ? clonePromptResult(stockPrompt) : stockPrompt;
-			if (systemPromptBuilder && !releaseManifest) {
+			if (systemPromptBuilder) {
 				try {
 					defaultPrompt = await systemPromptBuilder({
 						hasUI: options.hasUI === true,
@@ -3076,18 +3147,21 @@ async function createAgentSessionScoped(
 					});
 				} catch (error) {
 					const warning = releaseManifest ? promptPolicyReviewWarning(error) : undefined;
-					if (!warning) throw error;
-					logger.warn("Prompt policy requires review; continuing with the stock system prompt", {
-						error: warning,
-					});
+					if (!warning || options.hasUI !== true) throw error;
+					publishPromptPolicyWarning(warning);
+					defaultPrompt = clonePromptResult(stockPrompt);
 				}
 			}
-			if (releaseManifest && systemPromptBuilder !== undefined) {
-				if (!matchesStockPrompt(defaultPrompt)) {
-					logger.warn("Prompt policy requires review; continuing with the stock system prompt", {
-						error: "PROMPT_POLICY_REVIEW_REQUIRED: provider-facing system prompt differs from the approved stock prompt",
-					});
-				}
+			if (
+				releaseManifest &&
+				!ompInternalSession &&
+				systemPromptBuilder !== undefined &&
+				!matchesStockPrompt(defaultPrompt)
+			) {
+				const error =
+					"PROMPT_POLICY_REVIEW_REQUIRED: provider-facing system prompt differs from the approved stock prompt";
+				if (options.hasUI !== true) throw new Error(error);
+				publishPromptPolicyWarning(error);
 				defaultPrompt = clonePromptResult(stockPrompt);
 			}
 
@@ -3101,11 +3175,12 @@ async function createAgentSessionScoped(
 			let result: BuildSystemPromptResult = {
 				systemPrompt: typeof customPrompt === "string" ? [customPrompt] : customPrompt,
 			};
-			if (releaseManifest) {
+			if (releaseManifest && !ompInternalSession) {
 				if (!matchesStockPrompt(result)) {
-					logger.warn("Prompt policy requires review; continuing with the stock system prompt", {
-						error: "PROMPT_POLICY_REVIEW_REQUIRED: provider-facing system prompt differs from the approved stock prompt",
-					});
+					const warning =
+						"PROMPT_POLICY_REVIEW_REQUIRED: provider-facing system prompt differs from the approved stock prompt";
+					if (options.hasUI !== true) throw new Error(warning);
+					publishPromptPolicyWarning(warning);
 				}
 				result = clonePromptResult(stockPrompt);
 			}
@@ -3409,6 +3484,14 @@ async function createAgentSessionScoped(
 
 		const setToolUIContext = (uiContext: ExtensionUIContext, hasUI: boolean) => {
 			toolContextStore.setUIContext(uiContext, hasUI);
+			promptPolicyUIContext = hasUI ? uiContext : undefined;
+			if (hasUI && startupPromptPolicyWarning) {
+				uiContext.setStatus("omp-prompt-policy", "Prompt policy: REVIEW REQUIRED");
+				if (notifiedPromptPolicyWarning !== startupPromptPolicyWarning) {
+					uiContext.notify(startupPromptPolicyWarning, "warning");
+					notifiedPromptPolicyWarning = startupPromptPolicyWarning;
+				}
+			}
 		};
 
 		const initialTools = initialToolNames
@@ -4222,6 +4305,7 @@ async function createAgentSessionScoped(
 			modelFallbackMessage,
 			lspServers,
 			eventBus,
+			protectedRuntime: releaseManifest !== undefined,
 		};
 	} catch (error) {
 		// Release the subscription if the throw happened after install but before the

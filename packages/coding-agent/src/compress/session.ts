@@ -9,6 +9,7 @@ import { getProjectDir } from "@oh-my-pi/pi-utils";
 import { ModelRegistry } from "../config/model-registry";
 import { formatModelString, resolveCliModel } from "../config/model-resolver";
 import { Settings } from "../config/settings";
+import { markOmpInternalSession } from "../context/internal-session";
 import { createAgentSession, discoverAuthStorage } from "../sdk";
 import type { AgentSession } from "../session/agent-session";
 import systemPrompt from "./prompts/system.md" with { type: "text" };
@@ -38,35 +39,37 @@ export async function createCompressSession(options: {
 	if (resolved && (resolved.error || !resolved.model)) {
 		throw new Error(resolved.error ?? `Model "${options.model}" not found`);
 	}
-	const { session } = await createAgentSession({
-		cwd,
-		settings,
-		authStorage,
-		modelRegistry,
-		...(resolved?.model ? { model: resolved.model } : {}),
-		customTools: [options.protocol.rewriteTool(), options.protocol.approveTool()],
-		toolNames: ["rewrite", "approve"],
-		restrictToolNames: true,
-		allowRestrictedCustomTools: true,
-		// Replace the default blocks outright: a compressor needs its own contract, not
-		// the coding-agent workflow. Every discovery source below defaults to ON when
-		// omitted, and each one would inject instruction-shaped project text into a
-		// session whose only legitimate input is the source document.
-		systemPrompt: [systemPrompt.trim()],
-		skills: [],
-		rules: [],
-		contextFiles: [],
-		promptTemplates: [],
-		slashCommands: [],
-		disableExtensionDiscovery: true,
-		enableMCP: false,
-		enableIrc: false,
-		enableLsp: false,
-		hasUI: false,
-		autoApprove: true,
-		agentId: options.agentId ?? "Compress",
-		agentDisplayName: "compress",
-	});
+	const { session } = await createAgentSession(
+		markOmpInternalSession({
+			cwd,
+			settings,
+			authStorage,
+			modelRegistry,
+			...(resolved?.model ? { model: resolved.model } : {}),
+			customTools: [options.protocol.rewriteTool(), options.protocol.approveTool()],
+			toolNames: ["rewrite", "approve"],
+			restrictToolNames: true,
+			allowRestrictedCustomTools: true,
+			// Replace the default blocks outright: a compressor needs its own contract, not
+			// the coding-agent workflow. Every discovery source below defaults to ON when
+			// omitted, and each one would inject instruction-shaped project text into a
+			// session whose only legitimate input is the source document.
+			systemPrompt: [systemPrompt.trim()],
+			skills: [],
+			rules: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			disableExtensionDiscovery: true,
+			enableMCP: false,
+			enableIrc: false,
+			enableLsp: false,
+			hasUI: false,
+			autoApprove: true,
+			agentId: options.agentId ?? "Compress",
+			agentDisplayName: "compress",
+		}),
+	);
 	const active = resolved?.model ?? session.model;
 	return { session, model: active ? formatModelString(active) : "session default" };
 }

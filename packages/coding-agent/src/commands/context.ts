@@ -38,7 +38,11 @@ export default class Context extends Command {
 			if (flags["approved-policy"] && !approvedPolicy) {
 				throw new Error(`missing approved policy: ${flags["approved-policy"]}`);
 			}
-			const manifest = await buildContextReleaseManifest(process.cwd(), approvedPolicy?.candidates);
+			const manifest = await buildContextReleaseManifest(
+				process.cwd(),
+				approvedPolicy?.candidates,
+				approvedPolicy ? { stackPackageContentSha256: approvedPolicy.stackPackageContentSha256 } : undefined,
+			);
 			if (flags["approved-policy"]) {
 				const status = await approvalStatus(manifest, flags["approved-policy"]);
 				if (status.status !== "approved") {

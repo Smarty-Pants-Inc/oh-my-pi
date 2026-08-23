@@ -2476,6 +2476,7 @@ async function rewriteLegacyExtensionSource(
 	importerPath: string,
 	mtimeTag: string | null = null,
 	resolvedImportMtimeTag: string | null = mtimeTag,
+	snapshotModulePaths?: ReadonlySet<string>,
 ): Promise<string> {
 	// Compiled mode completes the override map from the build-supplied module
 	// keys on first use; every rewrite path must see the full map.
@@ -2499,12 +2500,25 @@ async function rewriteLegacyExtensionSource(
 		if (!replacement && TYPEBOX_SHIM_PATH && (specifier === "typebox" || specifier === "@sinclair/typebox")) {
 			replacement = toImportSpecifier(TYPEBOX_SHIM_PATH);
 		}
+		if (!replacement && snapshotModulePaths && specifier.startsWith(".")) {
+			const resolved = await resolveRelativeGraphTarget(specifier, importerPath, "import");
+			if (!resolved || !snapshotModulePaths.has(resolved)) {
+				throw new Error(`Uncaptured protected extension import: ${specifier}`);
+			}
+			replacement = toGraphImportSpecifier(resolved, mtimeTag);
+		}
 		if (!replacement && specifier.startsWith("#")) {
 			const resolved = await resolvePackageImportSpecifier(specifier, importerPath);
+			if (snapshotModulePaths && (!resolved || !snapshotModulePaths.has(resolved))) {
+				throw new Error(`Uncaptured protected extension import: ${specifier}`);
+			}
 			if (resolved) replacement = toGraphImportSpecifier(resolved, resolvedImportMtimeTag);
 		}
 		if (!replacement && isBareExtensionDependencySpecifier(specifier)) {
 			const resolved = await resolveExtensionBareDependency(specifier, importerPath);
+			if (snapshotModulePaths && (!resolved || !snapshotModulePaths.has(resolved))) {
+				throw new Error(`Uncaptured protected extension import: ${specifier}`);
+			}
 			if (resolved) replacement = toGraphImportSpecifier(resolved, resolvedImportMtimeTag);
 		}
 		if (!replacement && mtimeTag && /^\.\.?\//.test(specifier) && !specifier.includes("?")) {
@@ -2515,7 +2529,7 @@ async function rewriteLegacyExtensionSource(
 		}
 	}
 	const withImports = applySpecifierReplacements(source, replacements);
-	return rewriteExtensionSpecifiers(withImports, importerPath);
+	return rewriteExtensionSpecifiers(withImports, importerPath, snapshotModulePaths !== undefined);
 }
 
 /** Test seam for compiled-binary legacy extension source rewriting. */
@@ -3379,6 +3393,8 @@ function escapeRegExp(value: string): string {
 // the previous load.
 const extensionGraphHookModules = new Map<string, Set<string>>();
 const extensionGraphCacheBustResolvedImportModules = new Map<string, Set<string>>();
+const approvedLegacyPiModuleSnapshots = new Map<string, LegacyPiModuleSnapshot>();
+const approvedLegacyPiModuleAttestations = new WeakMap<ApprovedLegacyPiModule, LegacyPiModuleSnapshot>();
 const commonJsModuleSources = new Map<string, string>();
 const commonJsFallbackModulePaths = new Map<string, string>();
 const extensionSynchronousSpecifierTargets = new Map<string, Map<string, string>>();
@@ -3510,9 +3526,50 @@ async function realpathOrSelfUncached(p: string): Promise<string> {
 
 interface ExtensionModuleGraph {
 	readonly modules: Map<string, string>;
+	readonly sourceModules: Map<string, string>;
 	readonly cacheBustResolvedImportModules: Set<string>;
 	readonly commonJsPaths: Set<string>;
 	readonly synchronousSourcePaths: Set<string>;
+}
+
+export interface LegacyPiModuleSnapshot {
+	readonly entryRealPath: string;
+	readonly loadTag: string;
+	readonly modules: ReadonlyMap<string, string>;
+	readonly sourceModules: ReadonlyMap<string, string>;
+	readonly sourcePaths: ReadonlySet<string>;
+	readonly cacheBustResolvedImportModules: ReadonlySet<string>;
+}
+
+/** Opaque host-issued authority to evaluate one verified legacy extension graph. */
+export interface ApprovedLegacyPiModule {
+	readonly entryPath: string;
+}
+
+function approvedLegacyPiModuleSource(mtimeTag: string | null, sourcePath: string): string | undefined {
+	if (!mtimeTag) return undefined;
+	const snapshot = approvedLegacyPiModuleSnapshots.get(mtimeTag);
+	if (!snapshot) return undefined;
+	const source = snapshot.modules.get(sourcePath);
+	if (source === undefined) {
+		throw new Error(`Missing approved extension source snapshot: ${sourcePath}`);
+	}
+	return source;
+}
+
+/** Issue an opaque evaluation authority after the host has verified a captured graph. */
+export function createApprovedLegacyPiModule(snapshot: LegacyPiModuleSnapshot): ApprovedLegacyPiModule {
+	const immutableSnapshot: LegacyPiModuleSnapshot = {
+		entryRealPath: snapshot.entryRealPath,
+		loadTag: snapshot.loadTag,
+		modules: new Map(snapshot.modules),
+		sourceModules: new Map(snapshot.sourceModules),
+		sourcePaths: new Set(snapshot.sourcePaths),
+		cacheBustResolvedImportModules: new Set(snapshot.cacheBustResolvedImportModules),
+	};
+	const module = Object.freeze({ entryPath: immutableSnapshot.entryRealPath });
+	approvedLegacyPiModuleAttestations.set(module, immutableSnapshot);
+	return module;
 }
 
 /**
@@ -3527,6 +3584,7 @@ interface ExtensionModuleGraph {
  */
 async function collectExtensionModules(entryRealPath: string): Promise<ExtensionModuleGraph> {
 	const modules = new Map<string, string>();
+	const sourceModules = new Map<string, string>();
 	const commonJsPaths = new Set<string>();
 	const synchronousSourcePaths = new Set<string>();
 	const queuedCacheBustResolvedImports = new Map<string, boolean>([[entryRealPath, true]]);
@@ -3557,6 +3615,7 @@ async function collectExtensionModules(entryRealPath: string): Promise<Extension
 			continue;
 		}
 		modules.set(file, source);
+		sourceModules.set(file, source);
 		const analysis = getExtensionSourceAnalysis(source, file);
 		const sourceIsCommonJs = await isGraphOwnedCommonJsModule(
 			file,
@@ -3706,6 +3765,7 @@ async function collectExtensionModules(entryRealPath: string): Promise<Extension
 					if (modules.has(resolved) && (queuedModuleKind !== mergedModuleKind || synchronousSourceUpgraded)) {
 						modules.delete(resolved);
 						commonJsPaths.delete(resolved);
+						sourceModules.delete(resolved);
 					}
 					if (!modules.has(resolved)) {
 						queue.push({
@@ -3730,6 +3790,7 @@ async function collectExtensionModules(entryRealPath: string): Promise<Extension
 	}
 	return {
 		modules,
+		sourceModules,
 		commonJsPaths,
 		synchronousSourcePaths,
 		cacheBustResolvedImportModules: new Set(
@@ -3740,7 +3801,10 @@ async function collectExtensionModules(entryRealPath: string): Promise<Extension
 	};
 }
 
-async function collectExtensionSourceGraph(entryRealPath: string): Promise<Set<string> | null> {
+async function collectExtensionSourceGraph(
+	entryRealPath: string,
+	capturedSourceModules?: ReadonlyMap<string, string>,
+): Promise<Set<string> | null> {
 	if (!hasSourceModuleExtension(entryRealPath)) return null;
 	const graphPaths = new Set<string>();
 	const queue = [entryRealPath];
@@ -3750,11 +3814,14 @@ async function collectExtensionSourceGraph(entryRealPath: string): Promise<Set<s
 		graphPaths.add(file);
 		if (!hasSourceModuleExtension(file)) continue;
 
-		let source: string;
-		try {
-			source = await Bun.file(file).text();
-		} catch {
-			return null;
+		let source = capturedSourceModules?.get(file);
+		if (source === undefined) {
+			if (capturedSourceModules) return null;
+			try {
+				source = await Bun.file(file).text();
+			} catch {
+				return null;
+			}
 		}
 		const ast = parseExtensionSource(source, file);
 		const proof: ExtensionGraphProof = { provable: true, fileTargets: new Set<string>() };
@@ -3811,6 +3878,77 @@ export async function __collectLegacyPiExtensionSourcesForTests(
 	const entryRealPath = await realpathOrSelf(path.resolve(entryPath));
 	const graph = await collectExtensionModules(entryRealPath);
 	return graph.modules;
+}
+
+/**
+ * Capture one complete, statically provable ESM extension graph before a
+ * protected caller validates and authorizes its bytes. Unsupported synchronous
+ * graphs fail closed rather than gaining a later on-disk load path.
+ */
+export async function captureLegacyPiModuleSnapshot(entryPath: string): Promise<LegacyPiModuleSnapshot | undefined> {
+	try {
+		const entryRealPath = await realpathOrSelfUncached(path.resolve(entryPath));
+		const graph = await collectExtensionModules(entryRealPath);
+		if (graph.commonJsPaths.size > 0 || graph.synchronousSourcePaths.size > 0) return undefined;
+		const sourcePaths = await collectExtensionSourceGraph(entryRealPath, graph.sourceModules);
+		const sourceModulePaths = new Set(graph.sourceModules.keys());
+		if (
+			!sourcePaths?.has(entryRealPath) ||
+			sourcePaths.size !== sourceModulePaths.size ||
+			[...sourcePaths].some(modulePath => !sourceModulePaths.has(modulePath))
+		) {
+			return undefined;
+		}
+		for (const [modulePath, source] of graph.sourceModules) {
+			if (
+				getExtensionSourceAnalysis(source, modulePath).references.some(reference => reference.kind === "require")
+			) {
+				return undefined;
+			}
+		}
+		const loadTag = nextLegacyPiLoadTag();
+		const modules = new Map<string, string>();
+		for (const [modulePath, source] of graph.sourceModules) {
+			modules.set(
+				modulePath,
+				await rewriteLegacyExtensionSource(source, modulePath, loadTag, loadTag, sourceModulePaths),
+			);
+		}
+		return {
+			entryRealPath,
+			loadTag,
+			modules,
+			sourceModules: new Map(graph.sourceModules),
+			sourcePaths: new Set(sourcePaths),
+			cacheBustResolvedImportModules: new Set(graph.cacheBustResolvedImportModules),
+		};
+	} catch {
+		return undefined;
+	}
+}
+
+/** Verify a captured graph's canonical paths remain inside one approved package root. */
+export async function isLegacyPiModuleSnapshotContained(
+	snapshot: LegacyPiModuleSnapshot,
+	packageRoot: string,
+): Promise<boolean> {
+	try {
+		const packageRealPath = await fs.promises.realpath(path.resolve(packageRoot));
+		if (
+			!snapshot.sourcePaths.has(snapshot.entryRealPath) ||
+			snapshot.sourcePaths.size !== snapshot.sourceModules.size
+		) {
+			return false;
+		}
+		for (const modulePath of snapshot.sourcePaths) {
+			if (!snapshot.sourceModules.has(modulePath)) return false;
+			const relative = path.relative(packageRealPath, path.resolve(modulePath));
+			if (relative.startsWith(`..${path.sep}`) || relative === ".." || path.isAbsolute(relative)) return false;
+		}
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 /** Prove every extension-owned source module resolves inside one approved package root. */
@@ -3992,19 +4130,22 @@ async function installExtensionGraphHook(
 	commonJsPaths: Set<string>,
 	synchronousSourcePaths: ReadonlySet<string>,
 	cacheBustResolvedImportModules: ReadonlySet<string>,
+	approvedSnapshot?: LegacyPiModuleSnapshot,
 ): Promise<{ asyncModules: Map<string, string> }> {
+	const asyncModulePaths = new Set<string>();
 	const asyncModules = new Map<string, string>();
 	for (const [modulePath, source] of modules) {
 		if (commonJsPaths.has(modulePath) || synchronousSourcePaths.has(modulePath)) {
 			continue;
 		}
-		asyncModules.set(modulePath, source);
+		asyncModulePaths.add(modulePath);
+		if (!approvedSnapshot) asyncModules.set(modulePath, source);
 	}
 
-	if (asyncModules.size > 0) {
-		const alternation = [...asyncModules.keys()].map(escapeRegExp).join("|");
+	if (asyncModulePaths.size > 0) {
+		const alternation = [...asyncModulePaths].map(escapeRegExp).join("|");
 		const filter = new RegExp(`^(?:${alternation})(?:\\?mtime=\\d+)?$`);
-		const hookId = Bun.hash(`${entryRealPath}\0async\0${[...asyncModules.keys()].join("\0")}`).toString(36);
+		const hookId = Bun.hash(`${entryRealPath}\0async\0${[...asyncModulePaths].join("\0")}`).toString(36);
 		Bun.plugin({
 			name: `omp:legacy-pi-ext:${hookId}`,
 			setup(build) {
@@ -4012,6 +4153,10 @@ async function installExtensionGraphHook(
 					const queryIndex = args.path.indexOf("?mtime=");
 					const sourcePath = queryIndex >= 0 ? args.path.slice(0, queryIndex) : args.path;
 					const mtimeTag = queryIndex >= 0 ? args.path.slice(queryIndex + "?mtime=".length) : null;
+					const approvedSource = approvedLegacyPiModuleSource(mtimeTag, sourcePath);
+					if (approvedSource !== undefined) {
+						return { contents: approvedSource, loader: getLoader(sourcePath) };
+					}
 					// A later reload can upgrade this module to synchronous loading (a
 					// new `require()` edge reaches it) without re-registering hooks:
 					// this filter keeps matching and `require()` rejects async onLoad
@@ -4052,6 +4197,11 @@ async function installExtensionGraphHook(
 				build.onLoad({ filter, namespace: "file" }, args => {
 					const queryIndex = args.path.indexOf("?mtime=");
 					const sourcePath = queryIndex >= 0 ? args.path.slice(0, queryIndex) : args.path;
+					const mtimeTag = queryIndex >= 0 ? args.path.slice(queryIndex + "?mtime=".length) : null;
+					const approvedSource = approvedLegacyPiModuleSource(mtimeTag, sourcePath);
+					if (approvedSource !== undefined) {
+						return { contents: approvedSource, loader: getLoader(sourcePath) };
+					}
 					let source = commonJsModuleSources.get(sourcePath);
 					if (source === undefined) {
 						const targetPath = commonJsFallbackModulePaths.get(sourcePath) ?? sourcePath;
@@ -4075,6 +4225,11 @@ async function installExtensionGraphHook(
 					const queryIndex = args.path.indexOf("?mtime=");
 					const sourcePath = queryIndex >= 0 ? args.path.slice(0, queryIndex) : args.path;
 					const source = synchronousModuleSources.get(sourcePath);
+					const mtimeTag = queryIndex >= 0 ? args.path.slice(queryIndex + "?mtime=".length) : null;
+					const approvedSource = approvedLegacyPiModuleSource(mtimeTag, sourcePath);
+					if (approvedSource !== undefined) {
+						return { contents: approvedSource, loader: getLoader(sourcePath) };
+					}
 					if (source === undefined) {
 						throw new Error(`Missing pre-rewritten synchronous extension source: ${sourcePath}`);
 					}
@@ -4094,13 +4249,17 @@ async function installExtensionGraphHook(
  * Returns a clearable handle to drop cached sources that weren't consumed
  * during the initial load; `undefined` when no new modules were discovered.
  */
-async function ensureExtensionGraphHook(entryRealPath: string): Promise<{ clear(): void } | undefined> {
-	const {
-		modules: currentModules,
-		commonJsPaths,
-		cacheBustResolvedImportModules: discoveredCacheBustModules,
-		synchronousSourcePaths,
-	} = await collectExtensionModules(entryRealPath);
+async function ensureExtensionGraphHook(
+	entryRealPath: string,
+	approvedSnapshot?: LegacyPiModuleSnapshot,
+): Promise<{ clear(): void } | undefined> {
+	const graph = approvedSnapshot ? undefined : await collectExtensionModules(entryRealPath);
+	const currentModules = approvedSnapshot?.modules ?? graph?.modules;
+	if (!currentModules) throw new Error("Missing extension graph");
+	const commonJsPaths = graph?.commonJsPaths ?? new Set<string>();
+	const synchronousSourcePaths = graph?.synchronousSourcePaths ?? new Set<string>();
+	const discoveredCacheBustModules =
+		approvedSnapshot?.cacheBustResolvedImportModules ?? graph?.cacheBustResolvedImportModules ?? new Set<string>();
 	let cacheBustResolvedImportModules = extensionGraphCacheBustResolvedImportModules.get(entryRealPath);
 	if (!cacheBustResolvedImportModules) {
 		cacheBustResolvedImportModules = new Set<string>();
@@ -4109,19 +4268,21 @@ async function ensureExtensionGraphHook(entryRealPath: string): Promise<{ clear(
 	for (const modulePath of discoveredCacheBustModules) {
 		cacheBustResolvedImportModules.add(modulePath);
 	}
-	for (const [modulePath, source] of currentModules) {
-		if (commonJsPaths.has(modulePath)) {
-			commonJsModuleSources.set(modulePath, await prepareCommonJsDefaultModule(modulePath, source));
-			commonJsGraphModulePaths.add(modulePath);
-		}
-		if (synchronousSourcePaths.has(modulePath)) {
-			synchronousModuleSources.set(modulePath, source);
-		} else if (synchronousModuleSources.has(modulePath)) {
-			// The path lost its require() edges on this walk, but the permanent
-			// hooks installed while it was synchronous still serve it from this
-			// map — keep the pre-rewritten bytes fresh instead of serving the
-			// stale snapshot from the walk that flagged it.
-			synchronousModuleSources.set(modulePath, await rewriteLegacyExtensionSource(source, modulePath));
+	if (!approvedSnapshot) {
+		for (const [modulePath, source] of currentModules) {
+			if (commonJsPaths.has(modulePath)) {
+				commonJsModuleSources.set(modulePath, await prepareCommonJsDefaultModule(modulePath, source));
+				commonJsGraphModulePaths.add(modulePath);
+			}
+			if (synchronousSourcePaths.has(modulePath)) {
+				synchronousModuleSources.set(modulePath, source);
+			} else if (synchronousModuleSources.has(modulePath)) {
+				// The path lost its require() edges on this walk, but the permanent
+				// hooks installed while it was synchronous still serve it from this
+				// map — keep the pre-rewritten bytes fresh instead of serving the
+				// stale snapshot from the walk that flagged it.
+				synchronousModuleSources.set(modulePath, await rewriteLegacyExtensionSource(source, modulePath));
+			}
 		}
 	}
 	let hookedModules = extensionGraphHookModules.get(entryRealPath);
@@ -4156,11 +4317,13 @@ async function ensureExtensionGraphHook(entryRealPath: string): Promise<{ clear(
 			pendingCommonJsPaths,
 			pendingSynchronousSourcePaths,
 			cacheBustResolvedImportModules,
+			approvedSnapshot,
 		));
 		for (const modulePath of pendingModules.keys()) {
 			hookedModules.add(modulePath);
 		}
 	}
+	if (approvedSnapshot) return undefined;
 	return {
 		clear() {
 			asyncModules.clear();
@@ -4176,21 +4339,32 @@ async function ensureExtensionGraphHook(entryRealPath: string): Promise<{ clear(
 /**
  * Load a legacy Pi extension module from its real on-disk location.
  *
- * The extension runs in place, so its `import.meta.url` is the real source file
- * and `__dirname`-relative `readFileSync` asset loads (HTML/CSS bundled next to
- * the entry) resolve exactly as they do under the original Pi runtime — no
- * temp-directory mirroring and no asset copying. An `onLoad` hook scoped to the
- * entry's source graph rewrites only host-resolved compatibility imports in the
- * extension's own source; everything else resolves natively.
+ * Unapproved extensions retain in-place loading and hot reload. An opaque
+ * approved module instead evaluates its verified snapshot for both initial and
+ * lazy graph imports, without rereading extension source files.
  */
-export async function loadLegacyPiModule(resolvedPath: string): Promise<unknown> {
+export async function loadLegacyPiModule(
+	resolvedPath: string,
+	approvedModule?: ApprovedLegacyPiModule,
+): Promise<unknown> {
+	const approvedSnapshot = approvedModule ? approvedLegacyPiModuleAttestations.get(approvedModule) : undefined;
+	if (approvedModule && !approvedSnapshot) {
+		throw new Error("Invalid approved extension module");
+	}
+	if (approvedSnapshot && process.platform === "win32") {
+		// Bun drops the file URL query used to identify snapshot bytes on Windows.
+		throw new Error("Approved legacy extension snapshots cannot load on Windows");
+	}
 	// Bun reports the realpath of a loaded module to `onLoad` and exposes it as
-	// `import.meta.url`. Resolve symlinks here too (macOS `/var`→`/private/var`,
-	// `bun link`/pnpm installs) so the rewrite filter matches the path Bun
-	// actually hands the hook.
-	const entryRealPath = await realpathOrSelf(path.resolve(resolvedPath));
+	// `import.meta.url`. Resolve symlinks for unapproved modules too (macOS
+	// `/var`→`/private/var`, `bun link`/pnpm installs) so the rewrite filter
+	// matches the path Bun actually hands the hook.
+	const entryRealPath = approvedSnapshot?.entryRealPath ?? (await realpathOrSelf(path.resolve(resolvedPath)));
 	await ensureLegacyPiOverridesReady();
-	const pendingSources = await ensureExtensionGraphHook(entryRealPath);
+	if (approvedSnapshot) {
+		approvedLegacyPiModuleSnapshots.set(approvedSnapshot.loadTag, approvedSnapshot);
+	}
+	const pendingSources = await ensureExtensionGraphHook(entryRealPath, approvedSnapshot);
 	try {
 		// Dynamic import is required: legacy extension entry paths are user/plugin supplied at runtime.
 		// On POSIX, use the raw filesystem path so Bun keys the `?mtime`
@@ -4200,12 +4374,14 @@ export async function loadLegacyPiModule(resolvedPath: string): Promise<unknown>
 			process.platform === "win32" || isBundledVirtualSpecifier(entryRealPath)
 				? toImportSpecifier(entryRealPath)
 				: entryRealPath;
-		return await import(`${entrySpecifier}?mtime=${nextLegacyPiLoadTag()}`);
+		return await import(`${entrySpecifier}?mtime=${approvedSnapshot?.loadTag ?? nextLegacyPiLoadTag()}`);
 	} finally {
-		// Drop whatever the initial import didn't consume: graph modules only
-		// reached by lazy dynamic imports must be read from disk at their actual
-		// import time, not served from this load-time snapshot.
-		pendingSources?.clear();
+		if (!approvedSnapshot) {
+			// Drop whatever the initial import didn't consume: graph modules only
+			// reached by lazy dynamic imports must be read from disk at their actual
+			// import time, not served from this load-time snapshot.
+			pendingSources?.clear();
+		}
 	}
 }
 

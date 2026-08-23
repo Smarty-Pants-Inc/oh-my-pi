@@ -7,6 +7,7 @@ import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import typesDescriptionPrompt from "../../commit/prompts/types-description.md" with { type: "text" };
 import type { ModelRegistry } from "../../config/model-registry";
 import type { Settings } from "../../config/settings";
+import { markOmpInternalSession } from "../../context/internal-session";
 import { getMarkdownTheme } from "../../modes/theme/theme";
 import { createAgentSession } from "../../sdk";
 import type { AgentSessionEvent } from "../../session/agent-session";
@@ -55,26 +56,28 @@ export async function runCommitAgentSession(input: CommitAgentInput): Promise<Co
 		enableAnalyzeFiles: true,
 	});
 
-	const { session } = await createAgentSession({
-		cwd: input.cwd,
-		authStorage: input.authStorage,
-		modelRegistry: input.modelRegistry,
-		settings: input.settings,
-		model: input.model,
-		thinkingLevel: input.thinkingLevel,
-		systemPrompt: [systemPrompt],
-		customTools: tools,
-		enableLsp: false,
-		enableMCP: false,
-		hasUI: false,
-		spawns,
-		toolNames: ["__none__"],
-		contextFiles: input.contextFiles,
-		disableExtensionDiscovery: true,
-		skills: [],
-		promptTemplates: [],
-		slashCommands: [],
-	});
+	const { session } = await createAgentSession(
+		markOmpInternalSession({
+			cwd: input.cwd,
+			authStorage: input.authStorage,
+			modelRegistry: input.modelRegistry,
+			settings: input.settings,
+			model: input.model,
+			thinkingLevel: input.thinkingLevel,
+			systemPrompt: [systemPrompt],
+			customTools: tools,
+			enableLsp: false,
+			enableMCP: false,
+			hasUI: false,
+			spawns,
+			toolNames: ["__none__"],
+			contextFiles: input.contextFiles,
+			disableExtensionDiscovery: true,
+			skills: [],
+			promptTemplates: [],
+			slashCommands: [],
+		}),
+	);
 	let toolCalls = 0;
 	let messageCount = 0;
 	let isThinking = false;

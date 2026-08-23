@@ -5,6 +5,7 @@ import { logger, prompt } from "@oh-my-pi/pi-utils";
 import type { AsyncJobManager } from "../async/job-manager";
 import type { ModelRegistry } from "../config/model-registry";
 import type { Settings } from "../config/settings";
+import { markOmpInternalSession } from "../context/internal-session";
 import type { ToolDefinition } from "../extensibility/extensions";
 import securityReviewerPrompt from "../prompts/agents/security-reviewer.md" with { type: "text" };
 import securityCoordinatorPrompt from "../prompts/security/scan-coordinator.md" with { type: "text" };
@@ -237,35 +238,37 @@ async function createDefaultSecuritySession(input: SecurityScanSessionFactoryInp
 		...scanSettings.get("task.agentPrewalk"),
 		"security-reviewer": "off",
 	});
-	const { session } = await createAgentSession({
-		cwd: input.executionRoot,
-		authStorage: input.host.authStorage,
-		modelRegistry: input.host.modelRegistry,
-		settings: scanSettings,
-		model: input.model,
-		getApiKey: createExactSecurityOAuthResolver({
+	const { session } = await createAgentSession(
+		markOmpInternalSession({
+			cwd: input.executionRoot,
 			authStorage: input.host.authStorage,
-			account: input.plan.account,
+			modelRegistry: input.host.modelRegistry,
+			settings: scanSettings,
+			model: input.model,
+			getApiKey: createExactSecurityOAuthResolver({
+				authStorage: input.host.authStorage,
+				account: input.plan.account,
+			}),
+			providerSessionId: `security:${input.scanId}`,
+			sessionManager: input.sessionManager,
+			customTools: [input.publicationTool],
+			toolNames: SECURITY_SESSION_TOOLS,
+			restrictToolNames: true,
+			allowRestrictedCustomTools: true,
+			spawns: "security-reviewer",
+			appendSystemPrompt: securityCoordinatorPrompt.trim(),
+			disableExtensionDiscovery: true,
+			enableMCP: false,
+			enableIrc: false,
+			enableLsp: true,
+			lspReadOnly: true,
+			hasUI: false,
+			autoApprove: true,
+			skipPythonPreflight: true,
+			agentId: `Security-${input.scanId.slice(-12)}`,
+			agentDisplayName: "security",
 		}),
-		providerSessionId: `security:${input.scanId}`,
-		sessionManager: input.sessionManager,
-		customTools: [input.publicationTool],
-		toolNames: SECURITY_SESSION_TOOLS,
-		restrictToolNames: true,
-		allowRestrictedCustomTools: true,
-		spawns: "security-reviewer",
-		appendSystemPrompt: securityCoordinatorPrompt.trim(),
-		disableExtensionDiscovery: true,
-		enableMCP: false,
-		enableIrc: false,
-		enableLsp: true,
-		lspReadOnly: true,
-		hasUI: false,
-		autoApprove: true,
-		skipPythonPreflight: true,
-		agentId: `Security-${input.scanId.slice(-12)}`,
-		agentDisplayName: "security",
-	});
+	);
 	return session;
 }
 

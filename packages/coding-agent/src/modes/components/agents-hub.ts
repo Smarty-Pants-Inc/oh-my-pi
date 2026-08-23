@@ -39,6 +39,7 @@ import {
 	resolveModelOverride,
 } from "../../config/model-resolver";
 import type { Settings } from "../../config/settings";
+import { markOmpInternalSession } from "../../context/internal-session";
 import agentCreationArchitectPrompt from "../../prompts/system/agent-creation-architect.md" with { type: "text" };
 import agentCreationUserPrompt from "../../prompts/system/agent-creation-user.md" with { type: "text" };
 import { createAgentSession } from "../../sdk";
@@ -743,24 +744,26 @@ export class AgentsHubComponent implements Component {
 		}
 		const systemPrompt = prompt.render(agentCreationArchitectPrompt, {});
 		const userPrompt = prompt.render(agentCreationUserPrompt, { request: description });
-		const { session } = await createAgentSession({
-			cwd: this.#cwd,
-			authStorage: modelRegistry.authStorage,
-			modelRegistry,
-			settings: this.#settings,
-			model: selectedModel,
-			systemPrompt: [systemPrompt],
-			hasUI: false,
-			enableLsp: false,
-			enableMCP: false,
-			disableExtensionDiscovery: true,
-			toolNames: ["__none__"],
-			customTools: [],
-			skills: [],
-			contextFiles: [],
-			promptTemplates: [],
-			slashCommands: [],
-		});
+		const { session } = await createAgentSession(
+			markOmpInternalSession({
+				cwd: this.#cwd,
+				authStorage: modelRegistry.authStorage,
+				modelRegistry,
+				settings: this.#settings,
+				model: selectedModel,
+				systemPrompt: [systemPrompt],
+				hasUI: false,
+				enableLsp: false,
+				enableMCP: false,
+				disableExtensionDiscovery: true,
+				toolNames: ["__none__"],
+				customTools: [],
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+			}),
+		);
 		const unsubscribe = session.subscribe(event => {
 			if (event.type === "message_update" && "assistantMessageEvent" in event) {
 				const ame = event.assistantMessageEvent;
