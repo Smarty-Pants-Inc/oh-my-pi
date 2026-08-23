@@ -2,7 +2,10 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { approvedCandidateSourceModule, type ContextReleaseManifest } from "@oh-my-pi/pi-coding-agent/context/manifest";
-import { loadLegacyPiModule } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/legacy-pi-compat";
+import {
+	createApprovedLegacyPiModule,
+	loadLegacyPiModule,
+} from "@oh-my-pi/pi-coding-agent/extensibility/plugins/legacy-pi-compat";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 interface TestExtensionApi {
@@ -135,5 +138,27 @@ describe("approved source-linked extension snapshots", () => {
 		expect(await Bun.file(factoryMarker).text()).toBe("approved-factory:approved\n");
 		expect(await Bun.file(registrationMarker).text()).toBe("approved-registration\n");
 		expect(registeredCommands).toEqual(["approved-factory-command", "approved-lazy-command"]);
+	});
+
+	it("fails approved snapshots closed on Windows before loading disk source", async () => {
+		const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+		if (!originalPlatform) throw new Error("Missing process platform descriptor");
+		const approvedModule = createApprovedLegacyPiModule({
+			entryRealPath: "/approved-snapshot.ts",
+			loadTag: "approved-snapshot",
+			modules: new Map<string, string>(),
+			sourceModules: new Map<string, string>(),
+			sourcePaths: new Set<string>(),
+			cacheBustResolvedImportModules: new Set<string>(),
+		});
+
+		Object.defineProperty(process, "platform", { ...originalPlatform, value: "win32" });
+		try {
+			await expect(loadLegacyPiModule("/mutated-disk-source.ts", approvedModule)).rejects.toThrow(
+				"Approved legacy extension snapshots cannot load on Windows",
+			);
+		} finally {
+			Object.defineProperty(process, "platform", originalPlatform);
+		}
 	});
 });

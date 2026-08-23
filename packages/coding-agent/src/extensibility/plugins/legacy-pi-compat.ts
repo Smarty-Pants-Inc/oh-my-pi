@@ -4351,6 +4351,10 @@ export async function loadLegacyPiModule(
 	if (approvedModule && !approvedSnapshot) {
 		throw new Error("Invalid approved extension module");
 	}
+	if (approvedSnapshot && process.platform === "win32") {
+		// Bun drops the file URL query used to identify snapshot bytes on Windows.
+		throw new Error("Approved legacy extension snapshots cannot load on Windows");
+	}
 	// Bun reports the realpath of a loaded module to `onLoad` and exposes it as
 	// `import.meta.url`. Resolve symlinks for unapproved modules too (macOS
 	// `/var`→`/private/var`, `bun link`/pnpm installs) so the rewrite filter
