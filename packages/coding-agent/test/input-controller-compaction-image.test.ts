@@ -45,6 +45,9 @@ function makeCtx(initialQueue: CompactionQueuedMessage[] = []) {
 		extensionRunner: undefined,
 		customCommands: [] as Array<{ command: { name: string } }>,
 		getQueuedMessages: () => ({ steering: [] as string[], followUp: [] as string[] }),
+		getQueuedPrompts: () => [],
+		getQueuedPromptDraft: (_id: string) => undefined,
+		getQueuedPromptTimestamp: (_id: string) => undefined,
 		clearQueueDurably: async () => ({
 			steering: [] as RestoredQueuedMessage[],
 			followUp: [] as RestoredQueuedMessage[],
@@ -161,7 +164,9 @@ describe("compaction queue image forwarding", () => {
 
 	test("flush forwards the first queued prompt's images via session.prompt", async () => {
 		const image = img("d29ybGQ=");
-		const { ctx, promptCalls } = makeCtx([{ text: "describe this", mode: "steer", images: [image] }]);
+		const { ctx, promptCalls } = makeCtx([
+			{ id: "describe", timestamp: 1, text: "describe this", mode: "steer", images: [image] },
+		]);
 
 		await new UiHelpers(ctx).flushCompactionQueue({ willRetry: false });
 		await Promise.resolve();
@@ -174,7 +179,9 @@ describe("compaction queue image forwarding", () => {
 
 	test("willRetry flush forwards a follow-up's images via session.followUp", async () => {
 		const image = img("Zm9v");
-		const { ctx, followUpCalls } = makeCtx([{ text: "and this one", mode: "followUp", images: [image] }]);
+		const { ctx, followUpCalls } = makeCtx([
+			{ id: "follow-up", timestamp: 1, text: "and this one", mode: "followUp", images: [image] },
+		]);
 
 		await new UiHelpers(ctx).flushCompactionQueue({ willRetry: true });
 
@@ -184,7 +191,9 @@ describe("compaction queue image forwarding", () => {
 
 describe("compaction queue Alt+Up restore", () => {
 	test("restoreQueuedMessagesToEditor drains a compaction-queued skill", async () => {
-		const { ctx } = makeCtx([{ text: "/skill:foo bar", mode: "followUp", images: undefined }]);
+		const { ctx } = makeCtx([
+			{ id: "skill", timestamp: 1, text: "/skill:foo bar", mode: "followUp", images: undefined },
+		]);
 		const restored = await new InputController(ctx).restoreQueuedMessagesToEditor();
 		expect(restored).toBe(1);
 		expect(ctx.editor.getText()).toBe("/skill:foo bar");
@@ -193,24 +202,35 @@ describe("compaction queue Alt+Up restore", () => {
 
 	test("restored compaction images return to the pending-image buffer", async () => {
 		const image = img("YmF6");
-		const { ctx } = makeCtx([{ text: "look", mode: "steer", images: [image] }]);
+		const { ctx } = makeCtx([{ id: "image", timestamp: 1, text: "look", mode: "steer", images: [image] }]);
 		const restored = await new InputController(ctx).restoreQueuedMessagesToEditor();
 		expect(restored).toBe(1);
 		expect(ctx.editor.pendingImages).toEqual([image]);
 	});
 
 	test("restores one newest compaction prompt before session queues", async () => {
-		const { ctx, session } = makeCtx([
-			{ text: "compaction steer", mode: "steer", images: undefined },
-			{ text: "compaction followup", mode: "followUp", images: undefined },
-		]);
+		const compactionSteer: CompactionQueuedMessage = {
+			id: "compaction-steer",
+			timestamp: 1,
+			text: "compaction steer",
+			mode: "steer",
+			images: undefined,
+		};
+		const compactionFollowUp: CompactionQueuedMessage = {
+			id: "compaction-follow-up",
+			timestamp: 2,
+			text: "compaction followup",
+			mode: "followUp",
+			images: undefined,
+		};
+		const { ctx, session } = makeCtx([compactionSteer, compactionFollowUp]);
 		const popLastQueuedMessageDurably = mock(async () => ({ text: "session newest" }));
 		session.popLastQueuedMessageDurably = popLastQueuedMessageDurably;
 
 		expect(await new InputController(ctx).restoreQueuedMessagesToEditor()).toBe(1);
 		expect(ctx.editor.getText()).toBe("compaction followup");
 		expect(popLastQueuedMessageDurably).not.toHaveBeenCalled();
-		expect(ctx.compactionQueuedMessages).toEqual([{ text: "compaction steer", mode: "steer", images: undefined }]);
+		expect(ctx.compactionQueuedMessages).toEqual([compactionSteer]);
 
 		expect(await new InputController(ctx).restoreQueuedMessagesToEditor()).toBe(1);
 		expect(ctx.editor.getText()).toBe("compaction steer\n\ncompaction followup");
@@ -238,7 +258,9 @@ describe("compaction queue Alt+Up restore", () => {
 	});
 
 	test("keeps compaction input when durable queue clearing fails", async () => {
-		const queued = [{ text: "keep me", mode: "steer" as const, images: undefined }];
+		const queued: CompactionQueuedMessage[] = [
+			{ id: "keep", timestamp: 1, text: "keep me", mode: "steer", images: undefined },
+		];
 		const { ctx, session } = makeCtx(queued);
 		const showError = mock(() => {});
 		ctx.showError = showError;
@@ -289,6 +311,9 @@ describe("restoreQueuedMessagesToEditor image marker alignment", () => {
 		};
 		const queued = [...(opts.queued ?? [])];
 		const session = {
+			getQueuedPrompts: () => [],
+			getQueuedPromptDraft: (_id: string) => undefined,
+			getQueuedPromptTimestamp: (_id: string) => undefined,
 			popLastQueuedMessageDurably: mock(async () => queued.pop()),
 			clearQueueDurably: mock(async () => ({ steering: queued, followUp: [] })),
 			abort: mock(async () => {}),

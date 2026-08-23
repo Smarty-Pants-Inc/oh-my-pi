@@ -53,7 +53,7 @@ function waitForImmediate(): Promise<void> {
 }
 
 function hiddenCompanion(
-	customType: "ultrathink-notice" | "image-attachment-description",
+	customType: "ultrathink-notice" | "orchestrate-notice" | "workflow-notice" | "image-attachment-description",
 	text: string,
 	timestamp: number,
 ) {
@@ -94,7 +94,13 @@ describe("AgentSession queued prompt seam", () => {
 		session = new AgentSession({
 			agent,
 			sessionManager: SessionManager.inMemory(),
-			settings: Settings.isolated({ "compaction.enabled": false }),
+			settings: Settings.isolated({
+				"compaction.enabled": false,
+				"magicKeywords.enabled": true,
+				"magicKeywords.ultrathink": true,
+				"magicKeywords.orchestrate": true,
+				"magicKeywords.workflow": true,
+			}),
 			modelRegistry,
 		});
 		vi.spyOn(agent, "continue").mockResolvedValue(undefined);
@@ -237,10 +243,10 @@ describe("AgentSession queued prompt seam", () => {
 		expect(changed).toHaveBeenCalledTimes(1);
 	});
 
-	it("replaces edited images and only regenerates their owned description companion", async () => {
+	it("regenerates an edited image description and drops a stale keyword companion", async () => {
 		const agent = createAgent();
 		const target = createSession(agent);
-		const magic = hiddenCompanion("ultrathink-notice", "keep magic", 33);
+		const magic = hiddenCompanion("ultrathink-notice", "stale magic", 33);
 		const oldDescription = hiddenCompanion("image-attachment-description", "old image", 34);
 		const owner: UserMessage = {
 			role: "user",
@@ -259,10 +265,84 @@ describe("AgentSession queued prompt seam", () => {
 		expect(await target.updateQueuedPromptText(id, "new [Image #1]", [replacement])).toEqual({
 			status: "updated",
 		});
-		expect(agent.peekSteeringQueue()[0]).toBe(magic);
+		expect(agent.peekSteeringQueue()).not.toContain(magic);
 		expect(agent.peekSteeringQueue()).not.toContain(oldDescription);
 		expect(agent.peekSteeringQueue().at(-1)).toBe(owner);
 		expect(target.getQueuedPromptDraft(id)).toEqual({ text: "new [Image #1]", images: [replacement] });
+	});
+
+	it("removes stale magic-keyword companions when edited text removes their keywords", async () => {
+		const agent = createAgent();
+		const target = createSession(agent);
+		const owners = [
+			userMessage("ultrathink this", 41, true),
+			userMessage("orchestrate this", 43, true),
+			userMessage("workflowz this", 45, true),
+		];
+		agent.replaceQueues(
+			[
+				hiddenCompanion("ultrathink-notice", "old ultrathink", 40),
+				owners[0]!,
+				hiddenCompanion("orchestrate-notice", "old orchestrate", 42),
+				owners[1]!,
+				hiddenCompanion("workflow-notice", "old workflow", 44),
+				owners[2]!,
+			],
+			[],
+			true,
+		);
+		const ids = target.getQueuedPrompts().map(prompt => prompt.id);
+
+		for (const [index, id] of ids.entries()) {
+			expect(await target.updateQueuedPromptText(id, `plain edit ${index}`)).toEqual({ status: "updated" });
+		}
+		expect(agent.peekSteeringQueue()).toEqual(owners);
+	});
+
+	it("adds magic-keyword companions from final edited text without restarting the turn budget", async () => {
+		const agent = createAgent();
+		const target = createSession(agent);
+		vi.spyOn(target, "getEnabledToolNames").mockReturnValue(["task", "eval"]);
+		const beginTurnBudget = vi.spyOn(target.sessionManager, "beginTurnBudget");
+		const owners = [
+			userMessage("plain one", 50, true),
+			userMessage("plain two", 51, true),
+			userMessage("plain three", 52, true),
+		];
+		agent.replaceQueues(owners, [], true);
+		const ids = target.getQueuedPrompts().map(prompt => prompt.id);
+
+		expect(await target.updateQueuedPromptText(ids[0]!, "please ultrathink +250k")).toEqual({ status: "updated" });
+		expect(await target.updateQueuedPromptText(ids[1]!, "please orchestrate this")).toEqual({ status: "updated" });
+		expect(await target.updateQueuedPromptText(ids[2]!, "please workflowz this")).toEqual({ status: "updated" });
+		expect(
+			agent.peekSteeringQueue().map(message => (message.role === "custom" ? message.customType : message.role)),
+		).toEqual(["ultrathink-notice", "user", "orchestrate-notice", "user", "workflow-notice", "user"]);
+		expect(beginTurnBudget).not.toHaveBeenCalled();
+	});
+
+	it("replaces a plain prompt's stale magic notice with the final skill semantics", async () => {
+		const agent = createAgent();
+		const target = createSession(agent);
+		const staleNotice = hiddenCompanion("ultrathink-notice", "stale", 60);
+		const owner = userMessage("ultrathink stale", 61, true);
+		agent.replaceQueues([staleNotice, owner], [], true);
+		const id = target.getQueuedPrompts()[0]?.id;
+		if (!id) throw new Error("Expected queued prompt");
+
+		expect(
+			await target.updateQueuedPromptText(id, "/skill:review", undefined, {
+				customType: "skill-prompt",
+				content: "expanded skill prompt",
+				display: true,
+				details: { name: "review", args: "" },
+				attribution: "user",
+			}),
+		).toEqual({ status: "updated" });
+		expect(agent.peekSteeringQueue()).toHaveLength(1);
+		expect(agent.peekSteeringQueue()[0]).toBe(owner);
+		expect(agent.peekSteeringQueue()[0]?.role).toBe("custom");
+		expect(agent.peekSteeringQueue()).not.toContain(staleNotice);
 	});
 
 	it("removes only the selected prompt and its contiguous companions", async () => {

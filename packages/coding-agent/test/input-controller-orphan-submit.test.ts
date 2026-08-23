@@ -87,6 +87,9 @@ function createContext(sessionOverride?: InteractiveModeContext["session"]) {
 			maybeStartTitleGeneration: vi.fn(),
 			queuedMessageCount: 0,
 			getQueuedMessages: () => ({ steering: [], followUp: [] }),
+			getQueuedPrompts: () => [],
+			getQueuedPromptDraft: (_id: string) => undefined,
+			getQueuedPromptTimestamp: (_id: string) => undefined,
 		} as unknown as InteractiveModeContext["session"]);
 
 	const ctx = {

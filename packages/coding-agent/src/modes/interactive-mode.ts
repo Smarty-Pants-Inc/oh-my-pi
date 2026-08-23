@@ -119,6 +119,7 @@ import {
 import type { CompactMode } from "../session/compact-modes";
 import type { ForeignSessionSource } from "../session/foreign-session-store";
 import { HistoryStorage } from "../session/history-storage";
+import { localSubmissionSignature } from "../session/queued-messages";
 import type { SessionContext } from "../session/session-context";
 import { getRecentSessions } from "../session/session-listing";
 import type { SessionManager } from "../session/session-manager";
@@ -1668,7 +1669,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (this.isKnownSlashCommand(text)) {
 			return () => {};
 		}
-		const signature = `${text}\u0000${imageCount}`;
+		const signature = localSubmissionSignature(text, imageCount);
 		this.locallySubmittedUserSignatures.add(signature);
 		let disposed = false;
 		return () => {
@@ -1784,7 +1785,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#pendingSubmissionPreservesDraft = options?.preserveDraft === true;
 		if (!submission.customType) {
 			const imageCount = submission.images?.length ?? 0;
-			this.optimisticUserMessageSignature = `${submission.text}\u0000${imageCount}`;
+			this.optimisticUserMessageSignature = localSubmissionSignature(submission.text, imageCount);
 			this.#pendingSubmissionDispose = this.recordLocalSubmission(submission.text, imageCount);
 			this.#optimisticUserMessageComponents = this.#captureAddedChatComponents(() => {
 				this.addMessageToChat(

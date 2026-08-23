@@ -421,7 +421,15 @@ describe("compaction skill re-invocation", () => {
 	it("re-invokes a queued skill as a user-attributed skill prompt", async () => {
 		const image: ImageContent = { type: "image", data: "aGVsbG8=", mimeType: "image/png" };
 		const { ctx, promptCustomMessage, promptCustomMessageCalled, prompt, steer, followUp } =
-			createCompactionDrainContext([{ text: "/skill:test-skill arg1 arg2", mode: "followUp", images: [image] }]);
+			createCompactionDrainContext([
+				{
+					id: "skill-follow-up",
+					timestamp: 1,
+					text: "/skill:test-skill arg1 arg2",
+					mode: "followUp",
+					images: [image],
+				},
+			]);
 		const uiHelpers = new UiHelpers(ctx);
 
 		await uiHelpers.flushCompactionQueue({ willRetry: false });
@@ -458,7 +466,13 @@ describe("compaction skill re-invocation", () => {
 		try {
 			const image: ImageContent = { type: "image", data: "cmV0cnk=", mimeType: "image/png" };
 			const { ctx } = createCompactionDrainContext([
-				{ text: "/skill:test-skill retry args", mode: "followUp", images: [image] },
+				{
+					id: "retry-skill",
+					timestamp: 1,
+					text: "/skill:test-skill retry args",
+					mode: "followUp",
+					images: [image],
+				},
 			]);
 			ctx.session = fixture.session;
 			const uiHelpers = new UiHelpers(ctx);
@@ -1205,7 +1219,12 @@ describe("UiHelpers / InputController against derived queued custom display", ()
 
 		Object.defineProperty(ctx, "viewSession", {
 			configurable: true,
-			value: { isCompacting: false, getQueuedMessages: () => ({ steering: [], followUp: [] }) },
+			value: {
+				isCompacting: false,
+				getQueuedMessages: () => ({ steering: [], followUp: [] }),
+				getQueuedPrompts: () => [],
+				getQueuedPromptTimestamp: (_id: string) => undefined,
+			},
 		});
 		expect(dispatchInput("\r")).toBeUndefined();
 

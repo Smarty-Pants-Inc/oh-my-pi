@@ -53,6 +53,11 @@ import {
 	SKILL_PROMPT_MESSAGE_TYPE,
 	type SkillPromptDetails,
 } from "../../session/messages";
+import {
+	localSubmissionSignature,
+	queuedPromptSignature,
+	releaseLocalSubmissionSignature,
+} from "../../session/queued-messages";
 import type { SessionContext, StrippedToolCallsMarker } from "../../session/session-context";
 import { replaceTabs } from "../../tools/render-utils";
 import { buildSkillCommandPrompt, invokeSkillCommandFromText, isKnownSkillCommand } from "../skill-command";
@@ -1130,8 +1135,7 @@ export class UiHelpers {
 		};
 		state.queuedImages = [...(draft.images ?? [])];
 		state.originalCustomType = prompt.customType;
-		state.originalSignature =
-			prompt.customType === undefined ? `${draft.text}\u0000${prompt.imageCount ?? 0}` : undefined;
+		state.originalSignature = queuedPromptSignature(prompt, draft.text);
 		if (state.originalSignature) this.ctx.locallySubmittedUserSignatures.add(state.originalSignature);
 		state.mode = "editText";
 		this.#setComposerDraft({
@@ -1322,7 +1326,7 @@ export class UiHelpers {
 				built === undefined &&
 				(state.originalCustomType === undefined || state.originalCustomType === SKILL_PROMPT_MESSAGE_TYPE);
 			if (becomesUserMessage) {
-				const signature = `${text}\u0000${editedImages.length}`;
+				const signature = localSubmissionSignature(text, editedImages.length);
 				if (!this.ctx.locallySubmittedUserSignatures.has(signature)) {
 					this.ctx.locallySubmittedUserSignatures.add(signature);
 					addedSignature = signature;
@@ -1335,17 +1339,11 @@ export class UiHelpers {
 				built?.message,
 			);
 			if (result.status === "updated") {
-				const prompts = state.session.getQueuedPrompts();
-				if (
-					state.originalSignature &&
-					!prompts.some(prompt => {
-						if (prompt.customType !== undefined) return false;
-						const draftText = state.session.getQueuedPromptDraft(prompt.id)?.text ?? prompt.text;
-						return `${draftText}\u0000${prompt.imageCount ?? 0}` === state.originalSignature;
-					})
-				) {
-					this.ctx.locallySubmittedUserSignatures.delete(state.originalSignature);
-				}
+				releaseLocalSubmissionSignature(
+					this.ctx.locallySubmittedUserSignatures,
+					state.session,
+					state.originalSignature,
+				);
 				if (this.#queuedPromptEdit === state) {
 					this.#restorePriorComposerDraft(state);
 					state.mode = "manage";
@@ -1380,25 +1378,13 @@ export class UiHelpers {
 	async #commitQueuedPromptRemoval(state: QueuedPromptEditState): Promise<void> {
 		const selected = state.session.getQueuedPrompts().find(prompt => prompt.id === state.selectedId);
 		const selectedDraft = state.session.getQueuedPromptDraft(state.selectedId);
-		const removedSignature =
-			selected && selected.customType === undefined
-				? `${selectedDraft?.text ?? selected.text}\u0000${selected.imageCount ?? 0}`
-				: undefined;
+		const removedSignature = selected ? queuedPromptSignature(selected, selectedDraft?.text) : undefined;
 		try {
 			const result = await state.session.removeQueuedPrompt(state.selectedId);
 			if (result.status === "updated") {
 				this.#interruptingQueuedPromptIds.delete(state.selectedId);
+				releaseLocalSubmissionSignature(this.ctx.locallySubmittedUserSignatures, state.session, removedSignature);
 				const prompts = state.session.getQueuedPrompts();
-				if (
-					removedSignature &&
-					!prompts.some(prompt => {
-						if (prompt.customType !== undefined) return false;
-						const draftText = state.session.getQueuedPromptDraft(prompt.id)?.text ?? prompt.text;
-						return `${draftText}\u0000${prompt.imageCount ?? 0}` === removedSignature;
-					})
-				) {
-					this.ctx.locallySubmittedUserSignatures.delete(removedSignature);
-				}
 				if (this.#queuedPromptEdit === state) {
 					if (prompts.length === 0) this.#stopQueuedPromptEditing(false);
 					else {
@@ -1481,29 +1467,29 @@ export class UiHelpers {
 			}
 		}
 
-		const prompts = this.ctx.viewSession.getQueuedPrompts?.() ?? [];
+		const prompts = this.ctx.viewSession.getQueuedPrompts();
 		const liveIds = new Set(prompts.map(prompt => prompt.id));
 		for (const id of this.#interruptingQueuedPromptIds) {
 			if (!liveIds.has(id)) this.#interruptingQueuedPromptIds.delete(id);
 		}
 		const queuedRows: Array<
-			Pick<QueuedPrompt, "text" | "delivery" | "imageCount"> & {
-				id?: string;
+			Pick<QueuedPrompt, "id" | "text" | "delivery" | "imageCount"> & {
 				submittedAt: number;
 				orderId: string;
 			}
 		> = [
 			...prompts.map(prompt => ({
 				...prompt,
-				submittedAt: this.ctx.viewSession.getQueuedPromptTimestamp(prompt.id) ?? 0,
+				submittedAt: this.ctx.viewSession.getQueuedPromptTimestamp(prompt.id)!,
 				orderId: prompt.id,
 			})),
-			...this.ctx.compactionQueuedMessages.map((entry, index) => ({
+			...this.ctx.compactionQueuedMessages.map(entry => ({
+				id: entry.id,
 				text: entry.text,
 				delivery: entry.mode === "steer" ? ("steer" as const) : ("afterCurrent" as const),
 				...(entry.images?.length ? { imageCount: entry.images.length } : {}),
-				submittedAt: entry.timestamp ?? Number.MAX_SAFE_INTEGER,
-				orderId: entry.id ?? `~${index}`,
+				submittedAt: entry.timestamp,
+				orderId: entry.id,
 			})),
 		].sort((left, right) => left.submittedAt - right.submittedAt || left.orderId.localeCompare(right.orderId));
 		if (queuedRows.length > 0) {
@@ -1513,7 +1499,7 @@ export class UiHelpers {
 			this.ctx.pendingMessagesContainer.addChild(new TruncatedText(heading, 1, 0));
 			for (let index = 0; index < queuedRows.length; index++) {
 				const prompt = queuedRows[index]!;
-				const interrupting = prompt.id !== undefined && this.#interruptingQueuedPromptIds.has(prompt.id);
+				const interrupting = this.#interruptingQueuedPromptIds.has(prompt.id);
 				this.ctx.pendingMessagesContainer.addChild(
 					new TruncatedText(
 						queuedPromptRow(prompt, index, {

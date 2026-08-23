@@ -21,6 +21,7 @@ import type { InteractiveModeContext } from "../../modes/types";
 import manualContinuePrompt from "../../prompts/system/manual-continue.md" with { type: "text" };
 import type { RestoredQueuedMessage } from "../../session/agent-session-types";
 import { USER_INTERRUPT_LABEL } from "../../session/messages";
+import { localSubmissionSignature, releaseLocalSubmissionSignature } from "../../session/queued-messages";
 import { executeBuiltinSlashCommand } from "../../slash-commands/builtin-registry";
 import { parseSlashCommand } from "../../slash-commands/helpers/parse";
 import { isTinyTitleLocalModelKey } from "../../tiny/models";
@@ -1447,15 +1448,13 @@ export class InputController {
 		if (!options?.abort) {
 			let restored: RestoredQueuedMessage | undefined;
 			const compacted = this.ctx.compactionQueuedMessages.at(-1);
-			const coreNewest = this.ctx.session.getQueuedPrompts?.().at(-1);
-			const coreTimestamp = coreNewest ? this.ctx.session.getQueuedPromptTimestamp?.(coreNewest.id) : undefined;
+			const coreNewest = this.ctx.session.getQueuedPrompts().at(-1);
+			const coreTimestamp = coreNewest ? this.ctx.session.getQueuedPromptTimestamp(coreNewest.id) : undefined;
 			const compactedIsNewer =
 				compacted !== undefined &&
 				(coreNewest === undefined ||
-					compacted.timestamp === undefined ||
-					coreTimestamp === undefined ||
-					compacted.timestamp > coreTimestamp ||
-					(compacted.timestamp === coreTimestamp && (compacted.id ?? "") > coreNewest.id));
+					compacted.timestamp > coreTimestamp! ||
+					(compacted.timestamp === coreTimestamp && compacted.id > coreNewest.id));
 			if (compactedIsNewer) {
 				const entry = this.ctx.compactionQueuedMessages.pop()!;
 				restored = { text: entry.text, images: entry.images };
@@ -1477,14 +1476,11 @@ export class InputController {
 				return 0;
 			}
 			if (restored.customType === undefined) {
-				const signature = `${restored.text}\u0000${restored.images?.length ?? 0}`;
-				const duplicateRemains = (this.ctx.session.getQueuedPrompts?.() ?? []).some(
-					prompt =>
-						prompt.customType === undefined &&
-						`${this.ctx.session.getQueuedPromptDraft?.(prompt.id)?.text ?? prompt.text}\u0000${prompt.imageCount ?? 0}` ===
-							signature,
+				releaseLocalSubmissionSignature(
+					this.ctx.locallySubmittedUserSignatures,
+					this.ctx.session,
+					localSubmissionSignature(restored.text, restored.images?.length ?? 0),
 				);
-				if (!duplicateRemains) this.ctx.locallySubmittedUserSignatures.delete(signature);
 			}
 			this.#restoreQueuedEntriesToEditor([restored], options?.currentText);
 			this.ctx.updatePendingMessagesDisplay();

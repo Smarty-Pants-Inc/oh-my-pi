@@ -357,6 +357,7 @@ import {
 	isDisplayableQueuedMessage,
 	isHiddenUserCompanion,
 	isUserQueuedMessage,
+	MAGIC_KEYWORD_NOTICE_TYPES,
 	queueChipText,
 	queuedImageCount,
 	toRestoredQueuedMessage,
@@ -6809,10 +6810,13 @@ export class AgentSession {
 		return this.settings.get("magicKeywords.enabled") && this.settings.get(`magicKeywords.${keyword}`);
 	}
 
-	#createMagicKeywordNotices(text: string): CustomMessage[] {
-		const timestamp = Date.now();
+	#beginTurnBudget(text: string): void {
 		const turnBudget = parseTurnBudget(text);
 		this.sessionManager.beginTurnBudget(turnBudget?.total ?? null, turnBudget?.hard ?? false);
+	}
+
+	#createMagicKeywordNotices(text: string): CustomMessage[] {
+		const timestamp = Date.now();
 		const keywordNotices: CustomMessage[] = [];
 		if (this.#magicKeywordEnabled("ultrathink") && containsUltrathink(text)) {
 			keywordNotices.push({
@@ -6957,6 +6961,7 @@ export class AgentSession {
 		// Magic keywords ("ultrathink", "orchestrate"): append hidden system notices after the
 		// user's message that steer this turn. User-authored prompts only — synthetic /
 		// agent-initiated turns never trigger them.
+		if (!options?.synthetic) this.#beginTurnBudget(expandedText);
 		const keywordNotices = options?.synthetic ? [] : this.#createMagicKeywordNotices(expandedText);
 
 		// A user-initiated prompt (typed message or the `.`/`c` continue shortcut)
@@ -7094,6 +7099,7 @@ export class AgentSession {
 				if ("name" in details && typeof details.name === "string") skillName = details.name;
 				if ("args" in details && typeof details.args === "string") skillArgs = details.args;
 			}
+			this.#beginTurnBudget(skillArgs);
 			keywordNotices = this.#createMagicKeywordNotices(skillArgs);
 			this.maybeStartTitleGeneration(
 				skillPromptTitleInput({
@@ -9177,14 +9183,6 @@ export class AgentSession {
 				: requestedImages;
 			const sourceQueue = source === "steer" ? initial.steering : initial.followUp;
 			const initialCompanions = this.#queuedOwnerBlock(sourceQueue, initial.ownerIndex).slice(0, -1);
-			let replacementCompanions = initialCompanions;
-			if (imagesChanged) {
-				replacementCompanions = initialCompanions.filter(
-					message => message.role !== "custom" || message.customType !== IMAGE_ATTACHMENT_DESCRIPTION_TYPE,
-				);
-				const imageDescription = images.length > 0 ? await this.#buildImageDescriptionNotice(images) : undefined;
-				if (imageDescription) replacementCompanions = [...replacementCompanions, imageDescription];
-			}
 
 			let replacement: AgentMessage;
 			if (preparedCustomMessage) {
@@ -9227,6 +9225,49 @@ export class AgentSession {
 					...(source === "steer" ? { steering: true } : {}),
 				};
 			}
+			let keywordText: string | undefined;
+			if (replacement.role === "user") {
+				keywordText = text;
+			} else if (
+				replacement.role === "custom" &&
+				replacement.customType === SKILL_PROMPT_MESSAGE_TYPE &&
+				replacement.attribution === "user"
+			) {
+				const details = replacement.details;
+				if (details && typeof details === "object" && "args" in details && typeof details.args === "string") {
+					keywordText = details.args;
+				}
+			}
+			const existingKeywordNotices = new Map(
+				initialCompanions
+					.filter(
+						(message): message is CustomMessage =>
+							message.role === "custom" && MAGIC_KEYWORD_NOTICE_TYPES[message.customType] === true,
+					)
+					.map(message => [message.customType, message]),
+			);
+			const replacementKeywordNotices = (
+				keywordText === undefined ? [] : this.#createMagicKeywordNotices(keywordText)
+			).map(notice => {
+				const existing = existingKeywordNotices.get(notice.customType);
+				return existing?.content === notice.content ? existing : notice;
+			});
+			const preservedCompanions = initialCompanions.filter(
+				message =>
+					message.role !== "custom" ||
+					(MAGIC_KEYWORD_NOTICE_TYPES[message.customType] !== true &&
+						message.customType !== IMAGE_ATTACHMENT_DESCRIPTION_TYPE),
+			);
+			let imageDescription = initialCompanions.find(
+				message => message.role === "custom" && message.customType === IMAGE_ATTACHMENT_DESCRIPTION_TYPE,
+			);
+			if (imagesChanged)
+				imageDescription = images.length > 0 ? await this.#buildImageDescriptionNotice(images) : undefined;
+			const replacementCompanions = [
+				...replacementKeywordNotices,
+				...preservedCompanions,
+				...(imageDescription ? [imageDescription] : []),
+			];
 
 			const pendingId = this.#queuedPendingSemanticDeliveryId(owner);
 			let replacementPendingId: string | undefined;
@@ -9277,20 +9318,18 @@ export class AgentSession {
 			for (const key of Object.keys(owner)) Reflect.deleteProperty(owner, key);
 			Object.assign(owner, replacement);
 			invalidateMessageCache(owner);
-			if (imagesChanged) {
-				const blockStart = current.ownerIndex - currentBlock.length + 1;
-				const nextSourceQueue = [
-					...currentQueue.slice(0, blockStart),
-					...replacementCompanions,
-					owner,
-					...currentQueue.slice(current.ownerIndex + 1),
-				];
-				this.agent.replaceQueues(
-					current.source === "steer" ? nextSourceQueue : current.steering,
-					current.source === "afterCurrent" ? nextSourceQueue : current.followUp,
-					true,
-				);
-			}
+			const blockStart = current.ownerIndex - currentBlock.length + 1;
+			const nextSourceQueue = [
+				...currentQueue.slice(0, blockStart),
+				...replacementCompanions,
+				owner,
+				...currentQueue.slice(current.ownerIndex + 1),
+			];
+			this.agent.replaceQueues(
+				current.source === "steer" ? nextSourceQueue : current.steering,
+				current.source === "afterCurrent" ? nextSourceQueue : current.followUp,
+				true,
+			);
 			this.#notifyQueuedPromptsChanged();
 			return { status: "updated" };
 		} finally {

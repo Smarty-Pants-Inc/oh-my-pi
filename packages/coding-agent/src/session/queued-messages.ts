@@ -1,5 +1,6 @@
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, ImageContent } from "@oh-my-pi/pi-ai";
+import type { QueuedPrompt } from "../extensibility/extensions/types";
 import type { RestoredQueuedMessage } from "./agent-session-types";
 import { type CustomMessage, readQueueChipText } from "./messages";
 
@@ -26,6 +27,35 @@ function queuedImageContent(message: AgentMessage): ImageContent[] | undefined {
 /** Number of images owned by a queued user prompt. */
 export function queuedImageCount(message: AgentMessage): number {
 	return queuedImageContent(message)?.length ?? 0;
+}
+
+/** Stable key used to match an optimistic local submission to its queued/transcript copy. */
+export function localSubmissionSignature(text: string, imageCount: number): string {
+	return `${text}\u0000${imageCount}`;
+}
+
+/** Signature of a plain user-owned queued prompt, excluding custom-message queues. */
+export function queuedPromptSignature(prompt: QueuedPrompt, draftText?: string): string | undefined {
+	if (prompt.customType !== undefined) return undefined;
+	return localSubmissionSignature(draftText ?? prompt.text, prompt.imageCount ?? 0);
+}
+
+type QueuedPromptSignatureSource = {
+	getQueuedPrompts(): readonly QueuedPrompt[];
+	getQueuedPromptDraft(id: string): RestoredQueuedMessage | undefined;
+};
+
+/** Release a local submission key only after its final identical queued prompt leaves. */
+export function releaseLocalSubmissionSignature(
+	signatures: Set<string>,
+	source: QueuedPromptSignatureSource,
+	signature: string | undefined,
+): void {
+	if (!signature) return;
+	const duplicateRemains = source
+		.getQueuedPrompts()
+		.some(prompt => queuedPromptSignature(prompt, source.getQueuedPromptDraft(prompt.id)?.text) === signature);
+	if (!duplicateRemains) signatures.delete(signature);
 }
 
 /** Whether a queued message should render in the queue UI. */
