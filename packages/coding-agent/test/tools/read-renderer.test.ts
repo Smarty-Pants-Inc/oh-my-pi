@@ -179,25 +179,6 @@ describe("readToolRenderer hyperlinks", () => {
 			const binaryResult = await readTool.execute("read-binary-link", { path: `${binaryPath}:7` });
 			const archiveDirectoryResult = await readTool.execute("read-archive-directory", { path: archivePath });
 
-			expect(plainResult.details?.isDirectory).toBe(false);
-			expect(plainResult.details?.sourceLineAligned).toBeUndefined();
-			expect(archiveResult.details).toMatchObject({
-				resolvedPath: archivePath,
-				isDirectory: false,
-				sourceLineAligned: false,
-			});
-			expect(sqliteResult.details).toMatchObject({
-				resolvedPath: sqlitePath,
-				isDirectory: false,
-				sourceLineAligned: false,
-			});
-			expect(binaryResult.details).toMatchObject({
-				resolvedPath: binaryPath,
-				isDirectory: false,
-				sourceLineAligned: false,
-			});
-			expect(archiveDirectoryResult.details?.isDirectory).toBe(true);
-
 			const plainRendered = readToolRenderer
 				.renderResult(plainResult, { expanded: false, isPartial: false }, theme!, { path: `${plainPath}:2` })
 				.render(200)

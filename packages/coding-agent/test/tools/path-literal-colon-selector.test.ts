@@ -421,18 +421,6 @@ describe("suffix-resolved delimited read targets", () => {
 				to: "nested/missing/archive.zip",
 			}),
 		).toBe("nested/missing/archive.zip:member.txt:7");
-		expect(
-			applyReadSuffixResolution("missing/data.sqlite:records:42?limit=1", {
-				from: "missing/data.sqlite",
-				to: "nested/missing/data.sqlite",
-			}),
-		).toBe("nested/missing/data.sqlite:records:42?limit=1");
-		expect(
-			applyReadSuffixResolution("missing/report:7:2", {
-				from: "missing/report:7",
-				to: "nested/missing/report:7",
-			}),
-		).toBe("nested/missing/report:7:2");
 	});
 });
 

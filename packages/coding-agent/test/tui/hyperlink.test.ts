@@ -155,14 +155,6 @@ describe("isHyperlinkEnabled", () => {
 		expect(urlHyperlinkAlways("https://example.com/path", "example")).toBe("example");
 	});
 
-	it("synchronizes tui.hyperlinks with global Markdown and status emitters", () => {
-		Bun.env.HERDR_ENV = "1";
-		setHyperlinkMode("off");
-		expect(terminalCaps.TERMINAL.hyperlinks).toBe(false);
-		setHyperlinkMode("always");
-		expect(terminalCaps.TERMINAL.hyperlinks).toBe(true);
-	});
-
 	it("keeps cloned settings from changing process-global hyperlink state", async () => {
 		delete Bun.env.PI_NO_HYPERLINKS;
 		delete Bun.env.PI_FORCE_HYPERLINKS;

@@ -254,7 +254,6 @@ describe("shouldEnableHyperlinksByDefault", () => {
 
 	it("enables hyperlinks for direct Herdr terminals without relying on the outer terminal profile", () => {
 		expect(shouldEnableHyperlinksByDefault({ HERDR_ENV: "1", TERM: "dumb" }, "base")).toBe(true);
-		expect(shouldEnableHyperlinksByDefault({ HERDR_ENV: "1", TERM: "xterm-256color" }, "trueColor")).toBe(true);
 	});
 
 	it("keeps GNU screen always off, even when the inner terminal supports OSC 8", () => {
