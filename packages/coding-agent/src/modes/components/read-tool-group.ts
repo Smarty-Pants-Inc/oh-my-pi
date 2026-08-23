@@ -1,12 +1,16 @@
-import * as path from "node:path";
 import type { AssistantMessage, Usage } from "@oh-my-pi/pi-ai";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { Container, Text } from "@oh-my-pi/pi-tui";
 import { InternalUrlRouter, XD_URL_PREFIX } from "../../internal-urls";
 import { getLanguageFromPath, theme } from "../../modes/theme/theme";
-import { parseLineRanges, selectorLineRanges, splitPathAndSel } from "../../tools/path-utils";
+import {
+	applyReadSuffixResolution,
+	parseLineRanges,
+	selectorLineRanges,
+	splitPathAndSel,
+} from "../../tools/path-utils";
 import { PREVIEW_LIMITS, shortenPath } from "../../tools/render-utils";
-import { fileHyperlink, renderCodeCell, tryResolveInternalUrlSync } from "../../tui";
+import { fileHyperlink, renderCodeCell } from "../../tui";
 import { canonicalizeMessage } from "../../utils/thinking-display";
 import type { ToolExecutionHandle } from "./tool-execution";
 import { formatUsageRow } from "./usage-row";
@@ -86,7 +90,11 @@ type ReadToolResultDetails = {
 		to?: string;
 	};
 	conflictCount?: number;
+	isDirectory?: boolean;
+	sourceLineAligned?: boolean;
+	literalPath?: boolean;
 	displayReadTargets?: unknown;
+	displayReadTargetLinks?: unknown;
 	displayContent?: {
 		text?: string;
 		startLine?: number;
@@ -111,11 +119,20 @@ function getSuffixResolution(details: ReadToolResultDetails | undefined): ReadTo
 	return { from: details.suffixResolution.from, to: details.suffixResolution.to };
 }
 
+type ReadDisplayTargetLink = {
+	path?: string;
+	sourceLineAligned?: boolean;
+	literalPath?: boolean;
+};
+
 type ReadEntry = {
 	toolCallId: string;
 	path: string;
 	displayPaths?: string[];
+	displayLinkPaths?: Array<ReadDisplayTargetLink | undefined>;
 	linkPath?: string;
+	sourceLineAligned?: boolean;
+	literalPath?: boolean;
 	status: "pending" | "success" | "warning" | "error";
 	correctedFrom?: string;
 	contentText?: string;
@@ -140,6 +157,8 @@ type ReadDisplayTarget = {
 	targetPath: string;
 	basePath: string;
 	linkPath?: string;
+	sourceLineAligned?: boolean;
+	literalPath?: boolean;
 	selector?: string;
 };
 
@@ -167,10 +186,22 @@ function getDisplayReadTargets(details: ReadToolResultDetails | undefined): stri
 	return targets.length > 0 ? targets : undefined;
 }
 
-function displayPathWithSuffixResolution(currentPath: string, suffixResolution: ReadToolSuffixResolution): string {
-	const currentSelector = splitPathAndSel(currentPath).sel;
-	if (!currentSelector || splitPathAndSel(suffixResolution.to).sel) return suffixResolution.to;
-	return `${suffixResolution.to}:${currentSelector}`;
+function getDisplayReadTargetLinks(
+	details: ReadToolResultDetails | undefined,
+): Array<ReadDisplayTargetLink | undefined> | undefined {
+	if (!Array.isArray(details?.displayReadTargetLinks)) return undefined;
+	return details.displayReadTargetLinks.map(target => {
+		if (typeof target === "string") {
+			return target.trim().length > 0 ? { path: target } : undefined;
+		}
+		if (!target || typeof target !== "object" || Array.isArray(target)) return undefined;
+		const link = target as { path?: unknown; sourceLineAligned?: unknown; literalPath?: unknown };
+		return {
+			path: typeof link.path === "string" && link.path.trim().length > 0 ? link.path : undefined,
+			sourceLineAligned: link.sourceLineAligned === false ? false : undefined,
+			literalPath: link.literalPath === true ? true : undefined,
+		};
+	});
 }
 
 function readSourceFsPath(details: ReadToolResultDetails | undefined): string | undefined {
@@ -180,13 +211,6 @@ function readSourceFsPath(details: ReadToolResultDetails | undefined): string | 
 
 function readResultLinkPath(details: ReadToolResultDetails | undefined): string | undefined {
 	return typeof details?.resolvedPath === "string" ? details.resolvedPath : readSourceFsPath(details);
-}
-
-function readTargetLinkPath(basePath: string, entryLinkPath: string | undefined): string | undefined {
-	if (entryLinkPath) return entryLinkPath;
-	const resolvedInternalPath = tryResolveInternalUrlSync(basePath);
-	if (resolvedInternalPath) return resolvedInternalPath;
-	return path.isAbsolute(basePath) ? basePath : undefined;
 }
 
 function firstSelectorLine(selector: string | undefined): number | undefined {
@@ -440,14 +464,19 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 		const details = result.details as ReadToolResultDetails | undefined;
 		const suffixResolution = getSuffixResolution(details);
 		const displayPaths = getDisplayReadTargets(details);
-		entry.linkPath = readResultLinkPath(details);
+		const displayLinkPaths = result.isError ? undefined : getDisplayReadTargetLinks(details);
+		entry.linkPath = !result.isError && details?.isDirectory === false ? readResultLinkPath(details) : undefined;
+		entry.sourceLineAligned = details?.sourceLineAligned;
+		entry.literalPath = details?.literalPath === true;
 		if (suffixResolution) {
-			entry.path = displayPathWithSuffixResolution(entry.path, suffixResolution);
+			entry.path = applyReadSuffixResolution(entry.path, suffixResolution);
 			entry.correctedFrom = suffixResolution.from;
 			entry.displayPaths = undefined;
+			entry.displayLinkPaths = undefined;
 		} else {
 			entry.correctedFrom = undefined;
 			entry.displayPaths = displayPaths;
+			entry.displayLinkPaths = displayLinkPaths;
 		}
 		const conflictCount =
 			typeof details?.conflictCount === "number" && details.conflictCount > 0 ? details.conflictCount : undefined;
@@ -504,6 +533,10 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 	setToolActivityVisible(visible: boolean): void {
 		this.#toolActivityVisible = visible;
 		super.invalidate();
+	}
+
+	override invalidate(): void {
+		this.#updateDisplay();
 	}
 
 	getComponent(): Component {
@@ -567,17 +600,23 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 	#displayTargetsForEntries(entries: ReadEntry[]): ReadDisplayTarget[] {
 		const targets: ReadDisplayTarget[] = [];
 		for (const entry of entries) {
-			const pathSpecs = entry.displayPaths ?? splitReadDisplayPathSpecs(entry.path);
+			const pathSpecs =
+				entry.literalPath === true ? [entry.path] : (entry.displayPaths ?? splitReadDisplayPathSpecs(entry.path));
 			const useEntryLinkPath = pathSpecs.length === 1;
-			for (const pathSpec of pathSpecs) {
-				const split = splitPathAndSel(pathSpec);
-				const linkPath = readTargetLinkPath(split.path, useEntryLinkPath ? entry.linkPath : undefined);
+			for (const [pathIndex, pathSpec] of pathSpecs.entries()) {
+				const displayLink = entry.displayLinkPaths?.[pathIndex];
+				const literalPath = displayLink?.literalPath ?? (useEntryLinkPath ? entry.literalPath : undefined);
+				const split = literalPath ? { path: pathSpec } : splitPathAndSel(pathSpec);
+				const linkPath = useEntryLinkPath ? (entry.linkPath ?? displayLink?.path) : displayLink?.path;
+				const sourceLineAligned = displayLink?.sourceLineAligned ?? entry.sourceLineAligned;
 				for (const selector of splitSelectorDisplayParts(split.sel)) {
 					targets.push({
 						entry,
 						targetPath: selector ? `${split.path}:${selector}` : pathSpec,
 						basePath: split.path,
 						linkPath,
+						sourceLineAligned,
+						literalPath,
 						selector,
 					});
 				}
@@ -605,7 +644,11 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 		for (const [basePath, targetsByBatch] of selectorTargetsByBasePathAndBatch) {
 			if (!basePath) continue;
 			for (const groupedTargets of targetsByBatch.values()) {
-				if (groupedTargets.length <= 1) continue;
+				if (
+					groupedTargets.length <= 1 ||
+					groupedTargets.some(target => target.linkPath !== groupedTargets[0]!.linkPath)
+				)
+					continue;
 				for (const target of groupedTargets) {
 					mergedTargetsByTarget.set(target, groupedTargets);
 				}
@@ -700,8 +743,11 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 		return this.#formatPathValue(row.targetPath, {
 			correctedFrom: this.#correctedFromForTargets(row.targets),
 			conflictCount: this.#conflictCountForTargets(row.targets),
-			line: firstSelectorLineForTargets(row.targets),
+			line: row.targets.some(target => target.sourceLineAligned === false)
+				? undefined
+				: firstSelectorLineForTargets(row.targets),
 			linkPath: linkPathForTargets(row.targets),
+			literalPath: row.targets.some(target => target.literalPath === true),
 		});
 	}
 
@@ -749,15 +795,21 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 
 	#formatPathValue(
 		value: string,
-		options: { correctedFrom?: string; conflictCount?: number; line?: number; linkPath?: string } = {},
+		options: {
+			correctedFrom?: string;
+			conflictCount?: number;
+			line?: number;
+			linkPath?: string;
+			literalPath?: boolean;
+		} = {},
 	): string {
-		const split = splitPathAndSel(value);
+		const split = options.literalPath === true ? { path: value } : splitPathAndSel(value);
 		const selectorSuffix = split.sel ? `:${split.sel}` : "";
 		const baseValue = split.sel ? split.path : value;
 		const filePath = shortenPath(baseValue);
 		let pathDisplay = filePath ? theme.fg("accent", filePath) : theme.fg("toolOutput", "…");
 		if (filePath && options.linkPath) {
-			const linkOptions = options.line !== undefined ? { line: options.line } : undefined;
+			const linkOptions = options.line !== undefined && split.sel ? { line: options.line } : undefined;
 			pathDisplay = fileHyperlink(options.linkPath, pathDisplay, linkOptions);
 		}
 		if (selectorSuffix) {
@@ -782,15 +834,17 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 	 * When expanded: shows full content.
 	 */
 	#addContentPreview(entry: ReadEntry): void {
-		const split = splitPathAndSel(entry.path);
+		const literalPath = entry.literalPath === true;
+		const split = literalPath ? { path: entry.path } : splitPathAndSel(entry.path);
 		const lang = getLanguageFromPath(split.path);
 		const pathValue = shortenPath(entry.path);
 		const pathDisplay = pathValue
 			? this.#formatPathValue(entry.path, {
 					correctedFrom: entry.correctedFrom,
 					conflictCount: entry.conflictCount,
-					line: firstSelectorLine(split.sel),
-					linkPath: readTargetLinkPath(split.path, entry.linkPath),
+					line: literalPath || entry.sourceLineAligned === false ? undefined : firstSelectorLine(split.sel),
+					linkPath: entry.linkPath,
+					literalPath,
 				})
 			: "";
 		const title = pathDisplay ? `Read ${pathDisplay}` : "Read";

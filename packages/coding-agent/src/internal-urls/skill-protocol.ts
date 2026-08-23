@@ -118,6 +118,7 @@ export class SkillProtocolHandler implements ProtocolHandler {
 			contentType: getContentType(targetPath),
 			size: Buffer.byteLength(content, "utf-8"),
 			sourcePath: targetPath,
+			isDirectory: false,
 			notes: [],
 		};
 	}

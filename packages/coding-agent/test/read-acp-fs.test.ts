@@ -110,6 +110,20 @@ describe("read tool ACP fs routing", () => {
 		}
 	});
 
+	it("preserves literal path identity when the ACP bridge returns early", async () => {
+		const filePath = path.join(tmpDir, "foo:100");
+		await fs.writeFile(filePath, "disk content\n");
+		const bridge: ClientBridge = {
+			capabilities: { readTextFile: true },
+			readTextFile: async () => "bridge content\n",
+		};
+
+		const result = await new ReadTool(createSession(tmpDir, bridge)).execute("literal-bridge", { path: "foo:100" });
+
+		expect(textOutput(result)).toContain("bridge content");
+		expect(result.details).toMatchObject({ resolvedPath: filePath, isDirectory: false, literalPath: true });
+	});
+
 	it("applies requested line ranges to bridge content exactly once", async () => {
 		const filePath = path.join(tmpDir, "range.txt");
 		await fs.writeFile(filePath, "disk one\ndisk two\ndisk three\n");

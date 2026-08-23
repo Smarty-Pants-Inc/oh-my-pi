@@ -102,6 +102,8 @@ function buildNonTextLocalResource(url: InternalUrl, filePath: string, size: num
 		contentType: "text/plain",
 		size: Buffer.byteLength(content, "utf-8"),
 		sourcePath: filePath,
+		isDirectory: false,
+		sourceLineAligned: false,
 		notes: [LOCAL_WRITE_NOTE],
 	};
 }
@@ -114,6 +116,8 @@ function buildLargeLocalTextResource(url: InternalUrl, filePath: string, size: n
 		contentType: "text/plain",
 		size: Buffer.byteLength(content, "utf-8"),
 		sourcePath: filePath,
+		isDirectory: false,
+		sourceLineAligned: false,
 		notes: [LOCAL_WRITE_NOTE],
 	};
 }
@@ -161,6 +165,7 @@ async function buildFileResource(
 		contentType: getContentType(resolved.path),
 		size: Buffer.byteLength(content, "utf-8"),
 		sourcePath: resolved.path,
+		isDirectory: false,
 		notes: [LOCAL_WRITE_NOTE],
 	};
 }
@@ -206,6 +211,7 @@ async function buildListing(url: InternalUrl, localRoot: string): Promise<Intern
 		contentType: "text/markdown",
 		size: Buffer.byteLength(content, "utf-8"),
 		sourcePath: localRoot,
+		isDirectory: true,
 	};
 }
 

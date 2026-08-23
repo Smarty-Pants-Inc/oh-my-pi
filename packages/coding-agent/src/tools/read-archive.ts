@@ -47,7 +47,7 @@ export async function resolveArchiveReadPath(
 
 		try {
 			const stat = await Bun.file(absolutePath).stat();
-			if (stat.isDirectory()) continue;
+			if (!stat.isFile()) continue;
 			return {
 				absolutePath,
 				archiveSubPath: candidate.archivePath === readPath ? "" : candidate.subPath,
@@ -61,7 +61,7 @@ export async function resolveArchiveReadPath(
 
 			try {
 				const retryStat = await Bun.file(suffixMatch.absolutePath).stat();
-				if (retryStat.isDirectory()) continue;
+				if (!retryStat.isFile()) continue;
 
 				absolutePath = suffixMatch.absolutePath;
 				suffixResolution = { from: candidate.archivePath, to: suffixMatch.displayPath };
@@ -134,6 +134,8 @@ export async function readArchive(
 		{
 			resolvedPath: resolvedArchivePath.absolutePath,
 			suffixResolution: resolvedArchivePath.suffixResolution,
+			isDirectory: false,
+			sourceLineAligned: false,
 		},
 		resolvedArchivePath.archiveSubPath,
 	);

@@ -575,6 +575,27 @@ describe("GrepTool internal URL resolution", () => {
 		expect(text).toContain("virtual");
 	});
 
+	it("marks a zero-match single-file scope as clickable", async () => {
+		const file = path.join(tmpDir, "single.txt");
+		await Bun.write(file, "haystack\n");
+
+		const result = await new GrepTool(createSession()).execute("single-no-match", {
+			pattern: "needle",
+			path: file,
+		});
+
+		expect((result.details as { searchPathIsFile?: boolean } | undefined)?.searchPathIsFile).toBe(true);
+	});
+
+	it.skipIf(process.platform === "win32")("does not mark a device-backed file:// scope as clickable", async () => {
+		const result = await new GrepTool(createSession()).execute("device-file-scope", {
+			pattern: "needle",
+			path: "file:///dev/null",
+		});
+
+		expect((result.details as { searchPathIsFile?: boolean } | undefined)?.searchPathIsFile).toBe(false);
+	});
+
 	it("reports 'No more results' instead of 'No matches found' when skip is past the end", async () => {
 		await Bun.write(path.join(tmpDir, "a.txt"), "needle in a\n");
 		await Bun.write(path.join(tmpDir, "b.txt"), "needle in b\n");

@@ -63,6 +63,7 @@ import { formatModelString, type ResolvedModelRoleValue } from "../config/model-
 import { applyProviderGlobalsFromSettings } from "../config/provider-globals";
 import {
 	isSettingsInitialized,
+	onHyperlinkModeChanged,
 	onModelRolesChanged,
 	onStatusLineSessionAccentChanged,
 	Settings,
@@ -1276,6 +1277,7 @@ export class InteractiveMode implements InteractiveModeContext {
 				}
 				void this.#handleGoalSessionEvent(event);
 			}),
+			onHyperlinkModeChanged(() => this.ui.resetDisplay()),
 			onStatusLineSessionAccentChanged(() => {
 				this.#syncStatusLineSettings();
 				this.#handleSessionAccentInputsChanged();
@@ -4454,8 +4456,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.chatContainer.clear();
 	}
 
-	showStatus(message: string, options?: { dim?: boolean }): void {
-		this.#uiHelpers.showStatus(message, options);
+	showStatus(message: string, options?: { dim?: boolean }, rebuild?: () => string): void {
+		this.#uiHelpers.showStatus(message, options, rebuild);
 	}
 
 	showError(message: string): void {

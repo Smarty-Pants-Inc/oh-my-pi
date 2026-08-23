@@ -2,7 +2,10 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { ArtifactProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/artifact-protocol";
+import {
+	ArtifactProtocolHandler,
+	resolveArtifactFile,
+} from "@oh-my-pi/pi-coding-agent/internal-urls/artifact-protocol";
 import { parseInternalUrl } from "@oh-my-pi/pi-coding-agent/internal-urls/parse";
 import {
 	registerArtifactsDir,
@@ -47,8 +50,15 @@ describe("artifact:// path-only resolution", () => {
 
 		expect(resource.sourcePath).toBe(path.join(artifactDir, "0.mcp.log"));
 		expect(resource.size).toBe(9 * 1024 * 1024);
+		expect(resource.isDirectory).toBe(false);
 		// Content must NOT be materialized — that is the whole point of pathOnly.
 		expect(resource.content).toBe("");
+	});
+
+	it.skipIf(process.platform === "win32")("rejects non-regular artifact backing entries", async () => {
+		await fs.symlink("/dev/null", path.join(artifactDir, "7.mcp.log"));
+
+		await expect(resolveArtifactFile(parseInternalUrl("artifact://7"))).rejects.toThrow(/non-regular file/);
 	});
 
 	it("still rejects full content resolution for large artifacts (existing OOM guard)", async () => {
@@ -66,6 +76,7 @@ describe("artifact:// path-only resolution", () => {
 			const resource = await handler.resolve(url);
 			expect(resource.content).toBe("hello world\n");
 			expect(resource.sourcePath).toBe(path.join(smallArtifactDir, "9.mcp.log"));
+			expect(resource.isDirectory).toBe(false);
 		} finally {
 			unregisterSmall();
 		}

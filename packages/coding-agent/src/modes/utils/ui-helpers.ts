@@ -176,6 +176,25 @@ function imageLinksForMessage(
 	return materializeImageReferenceLinksSync(images, putBlobSync);
 }
 
+class StatusText extends Text {
+	#rebuild: (() => string) | undefined;
+
+	constructor(message: string, rebuild?: () => string) {
+		super(message, 1, 0);
+		this.#rebuild = rebuild;
+	}
+
+	setStatus(message: string, rebuild?: () => string): void {
+		this.#rebuild = rebuild;
+		this.setText(message);
+	}
+
+	override invalidate(): void {
+		if (this.#rebuild) this.setText(this.#rebuild());
+		super.invalidate();
+	}
+}
+
 export class UiHelpers {
 	constructor(private ctx: InteractiveModeContext) {
 		this.ctx.ui?.addInputListener?.(data => this.#handleQueuedPromptEditInput(data));
@@ -199,7 +218,7 @@ export class UiHelpers {
 	 * If multiple status messages are emitted back-to-back (without anything else being added to the chat),
 	 * we update the previous status line instead of appending new ones to avoid log spam.
 	 */
-	showStatus(message: string, options?: { dim?: boolean }): void {
+	showStatus(message: string, options?: { dim?: boolean }, rebuild?: () => string): void {
 		const children = this.ctx.chatContainer.children;
 		const last = children.length > 0 ? children[children.length - 1] : undefined;
 		const secondLast = children.length > 1 ? children[children.length - 2] : undefined;
@@ -210,13 +229,17 @@ export class UiHelpers {
 
 		if (last && secondLast && last === this.ctx.lastStatusText && secondLast === this.ctx.lastStatusSpacer) {
 			this.ctx.lastStatusText.setStyleFn(styleFn);
-			this.ctx.lastStatusText.setText(message);
+			if (this.ctx.lastStatusText instanceof StatusText) {
+				this.ctx.lastStatusText.setStatus(message, rebuild);
+			} else {
+				this.ctx.lastStatusText.setText(message);
+			}
 			this.ctx.ui.requestRender();
 			return;
 		}
 
 		const spacer = new Spacer(1);
-		const text = new Text(message, 1, 0).setStyleFn(styleFn);
+		const text = new StatusText(message, rebuild).setStyleFn(styleFn);
 		this.ctx.present([spacer, text]);
 		this.ctx.lastStatusSpacer = spacer;
 		this.ctx.lastStatusText = text;

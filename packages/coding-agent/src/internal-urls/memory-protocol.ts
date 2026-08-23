@@ -194,6 +194,7 @@ async function tryResolveInRoot(url: InternalUrl, memoryRoot: string): Promise<I
 		contentType,
 		size: Buffer.byteLength(content, "utf-8"),
 		sourcePath: realTargetPath,
+		isDirectory: false,
 		notes: [],
 	};
 }
