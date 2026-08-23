@@ -878,6 +878,8 @@ export interface GrepToolDetails {
 	/** Absolute base directory used during search. Used by the renderer to resolve
 	 * display-relative paths to absolute paths for OSC 8 hyperlinks. */
 	searchPath?: string;
+	/** Whether `searchPath` is one confirmed regular-file scope. */
+	searchPathIsFile?: boolean;
 	/** Session cwd at search time. The renderer resolves the display-relative
 	 * (cwd-relative) header/match paths against this for OSC 8 hyperlinks;
 	 * `searchPath` is the scope label target, not the display-path base. */
@@ -1026,6 +1028,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 				let scopePath: string;
 				let globFilter: string | undefined;
 				let isDirectory: boolean;
+				let isFile: boolean;
 				let multiTargets: ResolvedSearchTarget[] | undefined;
 				let exactFilePaths: string[] | undefined;
 				let missingPaths: string[];
@@ -1047,6 +1050,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 					});
 					searchPath = scope.searchPath;
 					isDirectory = scope.isDirectory;
+					isFile = scope.isFile;
 					multiTargets = scope.multiTargets;
 					exactFilePaths = scope.exactFilePaths;
 					missingPaths = scope.missingPaths;
@@ -1099,6 +1103,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 					scopePath = internalResolution.virtualScopePath ?? ".";
 					globFilter = undefined;
 					isDirectory = false;
+					isFile = false;
 					multiTargets = undefined;
 					exactFilePaths = undefined;
 					missingPaths = [];
@@ -1427,10 +1432,12 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 					[missingPathsNote, archiveNote, oversizedNote, oversizedScanNote]
 						.filter((s): s is string => Boolean(s))
 						.join("\n") || undefined;
+				const searchPathIsFile = searchablePaths.length > 0 && isFile && !globFilter && !multiTargets;
 				if (selectedMatches.length === 0) {
 					const details: GrepToolDetails = {
 						scopePath,
 						searchPath,
+						searchPathIsFile,
 						cwd: this.session.cwd,
 						matchCount: 0,
 						fileCount: 0,
@@ -1571,6 +1578,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 				const details: GrepToolDetails = {
 					scopePath,
 					searchPath,
+					searchPathIsFile,
 					cwd: this.session.cwd,
 					matchCount: selectedMatches.length,
 					fileCount: fileList.length,
@@ -1629,7 +1637,10 @@ const SEARCH_CODE_FRAME_LINE_RE = /^\s*\*?(\d+)│/;
 
 function searchScopeMeta(details: GrepToolDetails | undefined): string | undefined {
 	if (!details?.scopePath) return undefined;
-	const label = details.searchPath ? fileHyperlink(details.searchPath, details.scopePath) : details.scopePath;
+	const label =
+		details.searchPathIsFile && details.searchPath
+			? fileHyperlink(details.searchPath, details.scopePath)
+			: details.scopePath;
 	return `in ${label}`;
 }
 
@@ -1676,8 +1687,7 @@ function renderSearchDisplayLines(
 		const ctx = contexts[index]!;
 		if (ctx.kind === "dir") {
 			urlFile = undefined;
-			const styled = uiTheme.fg("accent", line);
-			return { raw: line, styled: ctx.headerPath ? fileHyperlink(ctx.headerPath, styled) : styled };
+			return { raw: line, styled: uiTheme.fg("accent", line) };
 		}
 		if (ctx.kind === "file") {
 			if (ctx.isUrl) {

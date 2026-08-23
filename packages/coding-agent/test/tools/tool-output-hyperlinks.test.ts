@@ -59,6 +59,7 @@ describe("tool output OSC 8 file:// hyperlinks", () => {
 			const tool = new ReadTool(createTestToolSession(dir));
 			const textRes = await tool.execute("t", { path: textPath });
 			const imgRes = await tool.execute("i", { path: imgPath });
+			const directoryRes = await tool.execute("d", { path: dir });
 
 			const textRender = readToolRenderer
 				.renderResult(
@@ -78,9 +79,23 @@ describe("tool output OSC 8 file:// hyperlinks", () => {
 				)
 				.render(200)
 				.join("\n");
+			const directoryRender = readToolRenderer
+				.renderResult(
+					{
+						content: directoryRes.content,
+						details: directoryRes.details,
+						isError: directoryRes.isError,
+					},
+					{ expanded: false, isPartial: false },
+					theme,
+					{ path: dir },
+				)
+				.render(200)
+				.join("\n");
 
 			expect(extractLinkUris(textRender)).toContain(url.pathToFileURL(path.resolve(textPath)).href);
 			expect(extractLinkUris(imgRender)).toContain(url.pathToFileURL(path.resolve(imgPath)).href);
+			expect(extractLinkUris(directoryRender)).toEqual([]);
 		} finally {
 			removeSyncWithRetries(dir);
 		}
@@ -169,6 +184,7 @@ describe("tool output OSC 8 file:// hyperlinks", () => {
 		const uris = extractLinkUris(rendered);
 		expect(uris).toContain(interactiveModeUri);
 		expect(uris.some(uri => uri.includes("/src/src/"))).toBe(false);
+		expect(uris).not.toContain(url.pathToFileURL(srcRoot).href);
 	});
 
 	it("links the edit header to the absolute details.path even when the arg path is relative", async () => {

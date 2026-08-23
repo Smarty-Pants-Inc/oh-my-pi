@@ -62,10 +62,13 @@ function formatReadPathLink(
 		sourcePath?: string;
 		suffixResolution?: { from: string; to: string };
 		offset?: number;
+		sourceLineAligned?: boolean;
+		literalPath?: boolean;
 		fallbackLabel?: string;
+		link: boolean;
 	},
 ): string {
-	const split = splitReadRenderPath(rawPath);
+	const split = options.literalPath === true ? { path: rawPath } : splitReadRenderPath(rawPath);
 	const basePath = split.path || rawPath;
 	const selectorSuffix = split.sel ? `:${split.sel}` : "";
 	const plainDisplayPath = options.suffixResolution
@@ -73,8 +76,13 @@ function formatReadPathLink(
 		: shortenPath(basePath || options.resolvedPath || options.fallbackLabel || rawPath);
 	const absoluteInputPath = path.isAbsolute(basePath) ? basePath : undefined;
 	const target =
-		options.resolvedPath ?? options.sourcePath ?? tryResolveInternalUrlSync(basePath) ?? absoluteInputPath;
-	const line = firstReadSelectorLine(split.sel) ?? options.offset;
+		options.link === false
+			? undefined
+			: (options.resolvedPath ?? options.sourcePath ?? tryResolveInternalUrlSync(basePath) ?? absoluteInputPath);
+	const line =
+		options.literalPath === true || options.sourceLineAligned === false
+			? undefined
+			: (firstReadSelectorLine(split.sel) ?? options.offset);
 	const linkOptions = line !== undefined ? { line } : undefined;
 	const linkedPath = target ? fileHyperlink(target, plainDisplayPath, linkOptions) : plainDisplayPath;
 	return `${linkedPath}${selectorSuffix}`;
@@ -91,7 +99,7 @@ export const readToolRenderer = {
 		const offset = args.offset;
 		const limit = args.limit;
 
-		let pathDisplay = formatReadPathLink(rawPath, { offset, fallbackLabel: "…" }) || "…";
+		let pathDisplay = formatReadPathLink(rawPath, { fallbackLabel: "…", link: false }) || "…";
 		if (offset !== undefined || limit !== undefined) {
 			const startLine = offset ?? 1;
 			const endLine = limit !== undefined ? startLine + limit - 1 : "";
@@ -128,9 +136,7 @@ export const readToolRenderer = {
 			const errorText = (rawErrorText || "Unknown error").replace(/^Error:\s*/, "");
 			const rawPath =
 				typeof args?.file_path === "string" ? args.file_path : typeof args?.path === "string" ? args.path : "";
-			const filePath =
-				formatReadPathLink(rawPath, { offset: args?.offset, sourcePath: readSourceFsPath(result.details) }) ||
-				shortenPath(rawPath);
+			const filePath = formatReadPathLink(rawPath, { link: false }) || shortenPath(rawPath);
 			let title = filePath ? `Read ${filePath}` : "Read";
 			if (args?.offset !== undefined || args?.limit !== undefined) {
 				const startLine = args.offset ?? 1;
@@ -156,7 +162,7 @@ export const readToolRenderer = {
 		const imageContent = result.content?.find(c => c.type === "image");
 		const rawPath =
 			typeof args?.file_path === "string" ? args.file_path : typeof args?.path === "string" ? args.path : "";
-		const renderPath = splitReadRenderPath(rawPath);
+		const renderPath = details?.literalPath === true ? { path: rawPath } : splitReadRenderPath(rawPath);
 		const lang = getLanguageFromPath(renderPath.path);
 
 		const warningLines: string[] = [];
@@ -185,6 +191,9 @@ export const readToolRenderer = {
 				sourcePath: readSourceFsPath(details),
 				suffixResolution: suffix,
 				fallbackLabel: "image",
+				sourceLineAligned: details?.sourceLineAligned,
+				literalPath: details?.literalPath,
+				link: details?.isDirectory === false,
 			});
 			const correction = suffix ? ` ${uiTheme.fg("dim", `(corrected from ${shortenPath(suffix.from)})`)}` : "";
 			const header = renderStatusLine(
@@ -223,7 +232,10 @@ export const readToolRenderer = {
 			resolvedPath: details?.resolvedPath,
 			sourcePath: readSourceFsPath(details),
 			suffixResolution: suffix,
+			sourceLineAligned: details?.sourceLineAligned,
+			literalPath: details?.literalPath,
 			offset: args?.offset,
+			link: details?.isDirectory === false,
 		});
 		const correction = suffix ? ` ${uiTheme.fg("dim", `(corrected from ${shortenPath(suffix.from)})`)}` : "";
 		let title = displayPath ? `Read ${displayPath}${correction}` : "Read";

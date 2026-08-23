@@ -667,8 +667,7 @@ export const astEditToolRenderer = {
 			// second vertical bar inside the frame border.
 			const display = replaceTabs(line.replace("│", " "));
 			if (ctx.kind === "dir") {
-				const styled = uiTheme.fg("accent", display);
-				return ctx.headerPath ? fileHyperlink(ctx.headerPath, styled) : styled;
+				return uiTheme.fg("accent", display);
 			}
 			if (ctx.kind === "file") {
 				const styled = uiTheme.fg(ctx.depth === 1 ? "accent" : "dim", display);
