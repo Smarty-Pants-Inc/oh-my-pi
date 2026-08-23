@@ -103,6 +103,7 @@ const FILTERED_FRAME_TYPES: Record<string, true> = {
 	event: true,
 	bus: true,
 	"snapshot-chunk": true,
+	"replay-complete": true,
 };
 
 /**

@@ -15,6 +15,7 @@
  * Everything renders through the same components, so ctrl+o, theming, and
  * transcript behavior are native by construction.
  */
+import { mkdir } from "node:fs/promises";
 import * as path from "node:path";
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
@@ -79,6 +80,7 @@ interface PendingSnapshot {
 	readOnly: boolean;
 	entryCount: number;
 	entries: SessionEntry[];
+	replayEpoch: number | undefined;
 	isResync: boolean;
 }
 
@@ -170,6 +172,12 @@ export class CollabGuestLink {
 	#returnSessionFile: string | null = null;
 	/** Frames apply strictly in arrival order through this chain. */
 	#applyChain: Promise<void> = Promise.resolve();
+	/** Latest replay epoch received from a welcome, including one still queued for application. */
+	#latestReplayEpoch: number | undefined;
+	/** Latest replay epoch whose snapshot has fully finalized. */
+	#activeReplayEpoch: number | undefined;
+	/** Replay epoch already reported through the optional local bridge hook. */
+	#notifiedReplayEpoch: number | undefined;
 	/** True after the initial snapshot has been written to disk and resumed. */
 	#welcomed = false;
 	/** Set before the replica switch so a partially applied join is restored even without a welcome. */
@@ -326,6 +334,9 @@ export class CollabGuestLink {
 			this.#pendingSnapshot = null;
 			this.#clearSnapshotProgressTimer();
 			this.#armWelcomeTimer();
+			this.#latestReplayEpoch = undefined;
+			this.#activeReplayEpoch = undefined;
+			this.#notifiedReplayEpoch = undefined;
 			socket.send({
 				t: "hello",
 				proto: COLLAB_PROTO,
@@ -334,6 +345,7 @@ export class CollabGuestLink {
 			});
 		};
 		socket.onFrame = frame => {
+			if (frame.t === "welcome") this.#latestReplayEpoch = frame.replayEpoch;
 			this.#applyChain = this.#applyChain
 				.then(async () => {
 					if (frame.t === "welcome") {
@@ -455,6 +467,7 @@ export class CollabGuestLink {
 			agents: frame.agents,
 			readOnly: frame.readOnly === true,
 			entryCount: frame.entryCount,
+			replayEpoch: frame.replayEpoch,
 			entries: [],
 			isResync,
 		};
@@ -490,6 +503,7 @@ export class CollabGuestLink {
 		this.#clearSnapshotProgressTimer();
 		if (!pending || this.#left) return;
 		const replicaPath = path.join(getConfigRootDir(), "collab", `${this.#roomId}.jsonl`);
+		await mkdir(path.dirname(replicaPath), { recursive: true });
 		const lines = [pending.header, ...pending.entries].map(entry => JSON.stringify(entry)).join("\n");
 		await Bun.write(replicaPath, `${lines}\n`);
 		if (this.#left) return;
@@ -519,6 +533,10 @@ export class CollabGuestLink {
 		this.#ctx.showStatus(
 			pending.isResync ? `Reconnected to collab session${suffix}` : `Joined collab session${suffix}`,
 		);
+		this.#activeReplayEpoch =
+			pending.replayEpoch !== undefined && pending.replayEpoch === this.#latestReplayEpoch
+				? pending.replayEpoch
+				: undefined;
 	}
 
 	#armWelcomeTimer(): void {
@@ -593,6 +611,9 @@ export class CollabGuestLink {
 			case "ui-request-end":
 				this.#endUiRequest(frame.reqId);
 				break;
+			case "replay-complete":
+				this.#notifyReplicaReady(frame.replayEpoch);
+				break;
 			case "transcript": {
 				const resolve = this.#pendingTranscripts.get(frame.reqId);
 				if (resolve) {
@@ -624,6 +645,21 @@ export class CollabGuestLink {
 		}
 	}
 
+	#notifyReplicaReady(replayEpoch: number): void {
+		const socket = this.#socket;
+		if (
+			this.#left ||
+			!this.#welcomed ||
+			replayEpoch !== this.#latestReplayEpoch ||
+			replayEpoch !== this.#activeReplayEpoch ||
+			replayEpoch === this.#notifiedReplayEpoch ||
+			!socket?.notifyReplicaReady
+		)
+			return;
+		this.#notifiedReplayEpoch = replayEpoch;
+		socket.notifyReplicaReady();
+	}
+
 	#applyEvent(event: AgentSessionEvent): void {
 		// Orphan-delta guard: when joining mid-turn the message_start for the
 		// in-flight assistant message predates the snapshot. message_update
@@ -651,12 +687,13 @@ export class CollabGuestLink {
 	 */
 	#applyHostState(state: CollabSessionState): void {
 		const session = this.#ctx.session;
+		const model = state.model;
 		if (
-			state.model &&
-			(session.agent.state.model?.id !== state.model.id ||
-				session.agent.state.model?.provider !== state.model.provider)
+			model &&
+			(session.agent.state.model?.id !== model.id || session.agent.state.model?.provider !== model.provider)
 		) {
-			session.agent.setModel(state.model);
+			session.agent.setModel(model);
+			this.#ctx.refreshModelDisplay?.();
 		}
 		const level = state.thinkingLevel as ThinkingLevel | undefined;
 		session.agent.setThinkingLevel(toReasoningEffort(level));

@@ -1098,7 +1098,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.ui.addChild(new Spacer(1));
 		}
 
-		if (!startupQuiet) {
+		if (!startupQuiet && !options.suppressWelcome) {
 			// Add welcome header
 			this.#welcomeComponent = new WelcomeComponent(
 				this.#version,
@@ -4750,6 +4750,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		clearTerminalHistory?: boolean;
 	}): Promise<void> {
 		await this.#uiHelpers.renderInitialMessages(options);
+	}
+
+	refreshModelDisplay(): void {
+		this.#updateWelcomeModel();
 	}
 
 	getUserMessageText(message: Message): string {

@@ -164,6 +164,7 @@ describe("InteractiveMode plan.defaultOnStartup", () => {
 		if (!planModel) throw new Error("Expected plan model");
 		expect(planModel.id).toBe("claude-haiku-4-5");
 		const rendered = Bun.stripANSI(created.ui.render(120).join("\n"));
+		expect(rendered).toContain("Welcome back!");
 		expect(rendered).toContain(planModel.name);
 		expect(rendered).not.toContain(initialModel.name);
 
@@ -175,6 +176,16 @@ describe("InteractiveMode plan.defaultOnStartup", () => {
 		const switched = Bun.stripANSI(created.ui.render(120).join("\n"));
 		expect(switched).toContain(initialModel.name);
 		expect(switched).not.toContain(planModel.name);
+	});
+
+	it("omits the welcome card when authoritative replay suppresses it", async () => {
+		Settings.instance.set("startup.quiet", false);
+		const created = createHarness(Settings.isolated({ "compaction.enabled": false }));
+
+		await created.init({ suppressWelcome: true, suppressWelcomeIntro: true });
+
+		const rendered = Bun.stripANSI(created.ui.render(120).join("\n"));
+		expect(rendered).not.toContain("Welcome back!");
 	});
 
 	it("activates write when entering plan mode even if it was hidden by discoveryMode (issue #3165)", async () => {

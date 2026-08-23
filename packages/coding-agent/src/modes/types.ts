@@ -88,6 +88,7 @@ export type TodoPhase = {
 };
 
 export interface InteractiveModeInitOptions {
+	suppressWelcome?: boolean;
 	suppressWelcomeIntro?: boolean;
 	clearInitialTerminalHistory?: boolean;
 }
@@ -355,6 +356,8 @@ export interface InteractiveModeContext {
 	extractAssistantText(message: AssistantMessage): string;
 	/** Refresh the running-subagents status badge from the active local or collab registry. */
 	syncRunningSubagentBadge(): void;
+	/** Refresh model-dependent UI after a trusted replica applies host state without persisting locally. */
+	refreshModelDisplay?(): void;
 	updateEditorBorderColor(): void;
 	rebuildChatFromMessages(options?: { reuseSettledComponents?: boolean }): void;
 	setTodos(todos: TodoItem[] | TodoPhase[]): void;

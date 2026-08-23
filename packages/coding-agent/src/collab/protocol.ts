@@ -82,6 +82,8 @@ export type CollabFrame =
 			 * (or a chunk arrives with `final: true`).
 			 */
 			entryCount: number;
+			/** Monotonic host replay epoch completed by the matching `replay-complete` frame. */
+			replayEpoch?: number;
 			/** True when this peer joined through a read-only (view) link. */
 			readOnly?: boolean;
 	  }
@@ -94,6 +96,8 @@ export type CollabFrame =
 	 * guest can finalize the replica session.
 	 */
 	| { t: "snapshot-chunk"; entries: SessionEntry[]; final: boolean }
+	/** Snapshot replay boundary sent after authority and any pending UI requests for that replay. */
+	| { t: "replay-complete"; replayEpoch: number }
 	| { t: "entry"; entry: SessionEntry }
 	| { t: "event"; event: AgentSessionEvent }
 	| { t: "state"; state: CollabSessionState }

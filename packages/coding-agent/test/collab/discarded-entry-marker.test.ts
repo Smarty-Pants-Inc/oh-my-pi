@@ -38,7 +38,7 @@ beforeAll(installInMemoryRelay);
 afterAll(uninstallInMemoryRelay);
 
 describe("discarded entry branch replication", () => {
-	it("keeps the pre-discard conversation connected on a guest snapshot", async () => {
+	it("keeps the visible conversation connected across filtered internal entries", async () => {
 		const manager = SessionManager.inMemory();
 		const priorId = manager.appendMessage({ role: "user", content: "prior", timestamp: Date.now() });
 		const discardedId = manager.appendMessage({
@@ -61,6 +61,7 @@ describe("discarded entry branch replication", () => {
 		await manager.discardEntryDurably(discardedId);
 		const markerId = manager.getBranch().at(-1)?.id;
 		if (!markerId) throw new Error("Expected a durable branch marker");
+		const hiddenSnapshotId = manager.appendCustomEntry("tool_execution_start");
 		const reminderId = manager.appendMessage({ role: "developer", content: "retry", timestamp: Date.now() });
 
 		const host = new CollabHost(makeHostContext(manager));
@@ -86,7 +87,24 @@ describe("discarded entry branch replication", () => {
 				if (frame.t !== "snapshot-chunk") continue;
 				for (const entry of frame.entries) guest.ingestReplicatedEntry(entry);
 			}
+			expect(guest.getEntry(hiddenSnapshotId)).toBeUndefined();
 			expect(guest.getBranch().map(entry => entry.id)).toEqual([priorId, markerId, reminderId]);
+
+			const liveFrameStart = frames.length;
+			const hiddenLiveId = manager.appendCustomEntry("tool_execution_start");
+			const liveId = manager.appendMessage({ role: "developer", content: "live retry", timestamp: Date.now() });
+			for (
+				let attempt = 0;
+				attempt < 100 && !frames.slice(liveFrameStart).some(frame => frame.t === "entry");
+				attempt++
+			) {
+				await Bun.sleep(1);
+			}
+			for (const frame of frames.slice(liveFrameStart)) {
+				if (frame.t === "entry") guest.ingestReplicatedEntry(frame.entry);
+			}
+			expect(guest.getEntry(hiddenLiveId)).toBeUndefined();
+			expect(guest.getBranch().map(entry => entry.id)).toEqual([priorId, markerId, reminderId, liveId]);
 		} finally {
 			socket?.close();
 			await host.stop("test done");

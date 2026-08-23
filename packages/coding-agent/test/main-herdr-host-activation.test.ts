@@ -1,18 +1,20 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { type Args, parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
 import * as collabGuestModule from "@oh-my-pi/pi-coding-agent/collab/guest";
-import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
 	type CollabBridgeBootstrap,
 	reconcilePrivateHerdrAfterStartupJoin,
 	runInteractiveStartupSequence,
 	runRootCommand,
 } from "@oh-my-pi/pi-coding-agent/main";
+import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
+import * as setupWizardModule from "@oh-my-pi/pi-coding-agent/modes/setup-wizard";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import type { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { setInteractiveHost, TempDir } from "@oh-my-pi/pi-utils";
 
 function disableStartupFeatures(parsed: Args, sessionDir: string): void {
@@ -36,13 +38,198 @@ function sessionResult(options: CreateAgentSessionOptions, session: AgentSession
 	};
 }
 
+function interactiveSession(sessionManager: SessionManager, activeSettings: Settings): AgentSession {
+	return {
+		sessionManager,
+		settings: activeSettings,
+		agent: { state: { tools: [] }, metadataForProvider: () => undefined },
+		customCommands: [],
+		skills: [],
+		autoCompactionEnabled: true,
+		messages: [],
+		systemPrompt: [],
+		state: { model: undefined },
+		model: undefined,
+		thinkingLevel: undefined,
+		getAllToolNames: () => [],
+	} as unknown as AgentSession;
+}
+
 afterEach(() => {
 	vi.restoreAllMocks();
 	AgentLifecycleManager.resetGlobalForTests();
 	setInteractiveHost(false);
+	resetSettingsForTest();
 });
 
 describe("automatic Herdr host activation", () => {
+	it("starts a fresh private guest without setup, splash, or welcome", async () => {
+		using tempDir = TempDir.createSync("@omp-private-guest-startup-");
+		await Settings.init({ inMemory: true, cwd: tempDir.path() });
+		Settings.instance.set("setupVersion", 0);
+		Settings.instance.set("startup.setupWizard", true);
+		Settings.instance.set("startup.showSplash", true);
+		Settings.instance.set("startup.checkUpdate", false);
+		Settings.instance.set("startup.changelogMode", "hidden");
+		Settings.instance.set("marketplace.autoUpdate", "off");
+
+		const parsed = parseArgs([]);
+		disableStartupFeatures(parsed, tempDir.join("sessions"));
+		const sessionManager = SessionManager.inMemory(tempDir.path());
+		const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
+		const session = interactiveSession(sessionManager, Settings.instance);
+		const stopped = new Error("startup reached input loop");
+		let mode: InteractiveMode | undefined;
+		let initOptions: Parameters<InteractiveMode["init"]>[0];
+		const setupEntered = new Error("private guest entered setup startup");
+		const selectSetupScenes = vi.spyOn(setupWizardModule, "selectSetupScenes").mockRejectedValue(setupEntered);
+		const runSetupWizard = vi.spyOn(setupWizardModule, "runSetupWizard").mockRejectedValue(setupEntered);
+		const runStartupSplash = vi.spyOn(setupWizardModule, "runStartupSplash").mockRejectedValue(setupEntered);
+		const join = vi
+			.spyOn(collabGuestModule.CollabGuestLink.prototype, "joinWithTransport")
+			.mockImplementation(async () => {
+				await mode?.renderInitialMessages({ clearTerminalHistory: true });
+			});
+		vi.spyOn(InteractiveMode.prototype, "init").mockImplementation(async function (this: InteractiveMode, options) {
+			mode = this;
+			initOptions = options;
+		});
+		const renderInitialMessages = vi.spyOn(InteractiveMode.prototype, "renderInitialMessages").mockResolvedValue();
+		vi.spyOn(InteractiveMode.prototype, "getUserInput").mockRejectedValue(stopped);
+
+		try {
+			await expect(
+				runRootCommand(parsed, [], {
+					collabBridge: {
+						role: "guest",
+						address: "127.0.0.1:4321",
+						roomId: "room-1",
+						token: "guest-token",
+					},
+					forceSetupWizard: true,
+					settings: Settings.instance,
+					discoverAuthStorage: async () => authStorage,
+					createAgentSession: async options => {
+						if (!options) throw new Error("Expected session options");
+						return sessionResult(options, session);
+					},
+				}),
+			).rejects.toBe(stopped);
+
+			expect(selectSetupScenes).not.toHaveBeenCalled();
+			expect(runSetupWizard).not.toHaveBeenCalled();
+			expect(runStartupSplash).not.toHaveBeenCalled();
+			expect(initOptions).toEqual({
+				suppressWelcome: true,
+				suppressWelcomeIntro: true,
+				clearInitialTerminalHistory: true,
+			});
+			expect(join).toHaveBeenCalledTimes(1);
+			expect(renderInitialMessages).toHaveBeenCalledTimes(1);
+			expect(renderInitialMessages).toHaveBeenCalledWith({
+				clearTerminalHistory: true,
+			});
+		} finally {
+			mode?.stop();
+			await sessionManager.close();
+			authStorage.close();
+		}
+	});
+
+	it("suppresses local model scope, model, and update notices for an authoritative guest replica", async () => {
+		using tempDir = TempDir.createSync("@omp-private-guest-notices-");
+		const settings = Settings.isolated({
+			"marketplace.autoUpdate": "off",
+			"startup.changelogMode": "off",
+			"startup.checkUpdate": true,
+			"startup.showSplash": false,
+		});
+		const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const parsed = parseArgs([]);
+		parsed.models = ["anthropic/claude-sonnet-4-5"];
+		disableStartupFeatures(parsed, tempDir.join("sessions"));
+		let manager: SessionManager | undefined;
+		let notifications: Array<{ kind: string; message: string }> = [];
+		let versionCheck: Promise<unknown> | undefined;
+
+		try {
+			await runRootCommand(parsed, [], {
+				collabBridge: {
+					role: "guest",
+					address: "127.0.0.1:4321",
+					roomId: "room-1",
+					token: "guest-token",
+				},
+				discoverAuthStorage: async () => authStorage,
+				settings,
+				createAgentSession: async options => {
+					if (!options?.sessionManager) throw new Error("Expected session manager");
+					manager = options.sessionManager;
+					return {
+						...sessionResult(options, interactiveSession(manager, settings)),
+						modelFallbackMessage:
+							"No models available. Use /login or set an API key environment variable. Then use /model to select a model.",
+					};
+				},
+				runInteractiveMode: async (...args) => {
+					notifications = args[3] as typeof notifications;
+					versionCheck = args[4] as Promise<unknown>;
+				},
+			});
+
+			expect(notifications).toEqual([]);
+			expect(await versionCheck).toBeUndefined();
+		} finally {
+			await manager?.close();
+			authStorage.close();
+		}
+	});
+
+	it("still enters forced setup for an ordinary launch", async () => {
+		using tempDir = TempDir.createSync("@omp-ordinary-setup-startup-");
+		await Settings.init({ inMemory: true, cwd: tempDir.path() });
+		Settings.instance.set("setupVersion", 0);
+		Settings.instance.set("startup.setupWizard", true);
+		Settings.instance.set("startup.showSplash", false);
+		Settings.instance.set("startup.checkUpdate", false);
+		Settings.instance.set("startup.changelogMode", "hidden");
+		Settings.instance.set("marketplace.autoUpdate", "off");
+
+		const parsed = parseArgs([]);
+		disableStartupFeatures(parsed, tempDir.join("sessions"));
+		const sessionManager = SessionManager.inMemory(tempDir.path());
+		const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
+		const session = interactiveSession(sessionManager, Settings.instance);
+		const setupEntered = new Error("ordinary launch entered setup startup");
+		let mode: InteractiveMode | undefined;
+		const selectSetupScenes = vi
+			.spyOn(setupWizardModule, "selectSetupScenes")
+			.mockImplementation(async (_storedVersion, _scenes, ctx) => {
+				mode = ctx as InteractiveMode;
+				throw setupEntered;
+			});
+
+		try {
+			await expect(
+				runRootCommand(parsed, [], {
+					forceSetupWizard: true,
+					settings: Settings.instance,
+					discoverAuthStorage: async () => authStorage,
+					createAgentSession: async options => {
+						if (!options) throw new Error("Expected session options");
+						return sessionResult(options, session);
+					},
+				}),
+			).rejects.toBe(setupEntered);
+			expect(selectSetupScenes).toHaveBeenCalledTimes(1);
+		} finally {
+			mode?.stop();
+			await sessionManager.close();
+			authStorage.close();
+		}
+	});
+
 	it("does not start the managed route until splash and setup gates finish", async () => {
 		const order: string[] = [];
 		const splash = Promise.withResolvers<void>();
@@ -119,7 +306,11 @@ describe("automatic Herdr host activation", () => {
 		expect(resumed).toBe(1);
 		expect(shutdowns).toBe(1);
 
-		await reconcilePrivateHerdrAfterStartupJoin({ collabGuest: {}, herdrCollabHostLifecycle: lifecycle, shutdown });
+		await reconcilePrivateHerdrAfterStartupJoin({
+			collabGuest: {},
+			herdrCollabHostLifecycle: lifecycle,
+			shutdown,
+		});
 		expect(resumed).toBe(1);
 		expect(shutdowns).toBe(1);
 	});
@@ -182,7 +373,10 @@ describe("automatic Herdr host activation", () => {
 						token: `token-${scenario.name}`,
 						paneId: "pane-9",
 					},
-					discovery: { socketPath: `/tmp/herdr-${scenario.name}.sock`, paneId: "pane-9" },
+					discovery: {
+						socketPath: `/tmp/herdr-${scenario.name}.sock`,
+						paneId: "pane-9",
+					},
 				};
 				let manager: SessionManager | undefined;
 				let created = false;
@@ -219,7 +413,10 @@ describe("automatic Herdr host activation", () => {
 						token: `token-${scenario.name}`,
 						paneId: "pane-9",
 					},
-					discovery: { socketPath: `/tmp/herdr-${scenario.name}.sock`, paneId: "pane-9" },
+					discovery: {
+						socketPath: `/tmp/herdr-${scenario.name}.sock`,
+						paneId: "pane-9",
+					},
 					routeGeneration: 1,
 				});
 				expect(bridge).not.toHaveProperty("ompSessionId");
@@ -247,7 +444,10 @@ describe("automatic Herdr host activation", () => {
 				token: "diagnostic-token",
 				paneId: "pane-diagnostic",
 			},
-			discovery: { socketPath: "/tmp/herdr-diagnostic.sock", paneId: "pane-diagnostic" },
+			discovery: {
+				socketPath: "/tmp/herdr-diagnostic.sock",
+				paneId: "pane-diagnostic",
+			},
 			ompSessionId: "caller-supplied-session",
 			routeGeneration: 7,
 		};

@@ -6445,7 +6445,7 @@
     },
     {
       "path": "packages/coding-agent/src/collab/guest.ts",
-      "sha256": "5529f5dd97a7226c8e64b33fbf51fc2d49494d9ce0a7457d12c5d79565cd992d"
+      "sha256": "56c33b47401d0f23782aac65ec116257e0d12a93736291b6e9b598bfaa57402d"
     },
     {
       "path": "packages/coding-agent/src/collab/herdr-bridge-bootstrap.ts",
@@ -6453,19 +6453,19 @@
     },
     {
       "path": "packages/coding-agent/src/collab/host.ts",
-      "sha256": "f3905c7a7d703c7b8a8928d641d6e4ce02de2b5f568de2947d406b953ebf178a"
+      "sha256": "39ce14e47146a430cde5d5b0b927055979ab40e4acd8c6c82e543c2d104d6cc7"
     },
     {
       "path": "packages/coding-agent/src/collab/local-transport.ts",
-      "sha256": "4dbc8b202838202ed641c6fd60e85a79baf4a9dfbb8addb5094db6a1f11d766b"
+      "sha256": "5087d4f88686d5e7a67ed7bc433efcae8e091ce8713932459c8e3b6e5e74839e"
     },
     {
       "path": "packages/coding-agent/src/collab/protocol.ts",
-      "sha256": "4b12d744112368c43c25901479cc33c283d94bf0c0874fe954025cf4a02bb711"
+      "sha256": "8f09cd6d4eb775b7e79d45f7dc2bbeab0e0b032bc4d3fe17b3623f94ebb9d0f6"
     },
     {
       "path": "packages/coding-agent/src/collab/relay-client.ts",
-      "sha256": "34faa51c1524974f236106aa93ad851cfddb290fc348e82c1f9c8d52c170b66d"
+      "sha256": "911e258c0f91eceb74b566f61937da60feb6b5d144150edab01d487df834789b"
     },
     {
       "path": "packages/coding-agent/src/collab/replication-shrink.ts",
@@ -7801,7 +7801,7 @@
     },
     {
       "path": "packages/coding-agent/src/main.ts",
-      "sha256": "572818d4d5a92d208535ae279a8fd20960b84a816d06a984e72033af218d1c35"
+      "sha256": "d02fe3117d9de2ac9f0ab062c8e7b52401a2fb4417d98730fd401fb5dfeb5c9c"
     },
     {
       "path": "packages/coding-agent/src/markit/converters/docx.ts",
@@ -8209,7 +8209,7 @@
     },
     {
       "path": "packages/coding-agent/src/modes/interactive-mode.ts",
-      "sha256": "2386894fe78da5cc3b71470031b7da8323c43525d88be68149a81fbbb1d760a9"
+      "sha256": "f9ad3a28b021168ec9ddfcff9eb7e5f7116103965a90374137feaa8d22d1e607"
     },
     {
       "path": "packages/coding-agent/src/modes/loop-limit.ts",
@@ -10733,9 +10733,9 @@
     },
     {
       "path": "packages/wire/src/index.ts",
-      "sha256": "d6b15d084687adb4288dec626ffae8e49435a6d3c036ad63df8f48cf22936645"
+      "sha256": "dc4d67872f8fdc7708a268b7e0833c11a926be06d218262207530a5c9e081b38"
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "da9068b1158759e9840f0e2a059b7aabfdb073168b7e34aa6ddf9c24f8781d6b"
+  "rootSha256": "ebc76d8d2d3b21b130105b653ec99c88c78d31b6748d02dbefb449fa966877d7"
 }

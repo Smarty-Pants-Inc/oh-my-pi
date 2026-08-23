@@ -174,6 +174,36 @@ function isWireAgentEvent(event: AgentSessionEvent): event is AgentSessionEvent 
 function isWireSessionEntry(entry: StoredSessionEntry): entry is StoredSessionEntry & WireSessionEntry {
 	return entry.type in WIRE_SESSION_ENTRY_TYPES;
 }
+
+type ReplicatedSessionEntry = StoredSessionEntry & WireSessionEntry;
+
+/** Project one durable entry onto the wire-visible branch without exposing internal entries. */
+function projectWireSessionEntry(
+	entry: StoredSessionEntry,
+	nearestWireAncestorByEntryId: Map<string, string | null>,
+): ReplicatedSessionEntry | null {
+	const parentId = entry.parentId === null ? null : (nearestWireAncestorByEntryId.get(entry.parentId) ?? null);
+	if (!isWireSessionEntry(entry)) {
+		nearestWireAncestorByEntryId.set(entry.id, parentId);
+		return null;
+	}
+	nearestWireAncestorByEntryId.set(entry.id, entry.id);
+	return parentId === entry.parentId ? entry : { ...entry, parentId };
+}
+
+/** Remove non-wire entries while reconnecting every retained child to its nearest retained ancestor. */
+function projectWireSessionEntries(entries: readonly StoredSessionEntry[]): {
+	entries: ReplicatedSessionEntry[];
+	nearestWireAncestorByEntryId: Map<string, string | null>;
+} {
+	const nearestWireAncestorByEntryId = new Map<string, string | null>();
+	const projected: ReplicatedSessionEntry[] = [];
+	for (const entry of entries) {
+		const wireEntry = projectWireSessionEntry(entry, nearestWireAncestorByEntryId);
+		if (wireEntry) projected.push(wireEntry);
+	}
+	return { entries: projected, nearestWireAncestorByEntryId };
+}
 const CONNECT_TIMEOUT_MS = 15_000;
 /** Max source bytes served per fetch-transcript reply (guest re-requests from `newSize`).
  * JSONL quotes/backslashes expand when embedded in bridge NDJSON, so keep this
@@ -208,6 +238,7 @@ export class CollabHost {
 	#peers = new Map<number, { name: string; canWrite: boolean }>();
 	#localPeerAuthority = new Map<number, boolean>();
 	#uiReqSeq = 0;
+	#replayEpoch = 0;
 	#pendingUi = new Map<number, { request: CollabUiRequest; settle(result: CollabGuestUiResult): void }>();
 	#lastStateJson = "";
 	#stateDebounce: Timer | null = null;
@@ -217,6 +248,7 @@ export class CollabHost {
 	#registryUnsubscribe?: () => void;
 	#stopped = false;
 	#entryAppendedUnsubscribe?: () => void;
+	#nearestWireAncestorByEntryId = new Map<string, string | null>();
 
 	#trustedLocalTransport = false;
 	#privateHost = false;
@@ -388,7 +420,8 @@ export class CollabHost {
 		}
 		this.#registryUnsubscribe = AgentRegistry.global().onChange(() => this.#scheduleAgentsBroadcast());
 		const entryListener = (entry: StoredSessionEntry): void => {
-			if (isWireSessionEntry(entry)) this.#broadcast({ t: "entry", entry: shrinkForReplication(entry) });
+			const wireEntry = projectWireSessionEntry(entry, this.#nearestWireAncestorByEntryId);
+			if (wireEntry) this.#broadcast({ t: "entry", entry: shrinkForReplication(wireEntry) });
 			this.#scheduleStateBroadcast();
 		};
 		const subscribeEntryAppended = this.#ctx.sessionManager.subscribeEntryAppended;
@@ -552,9 +585,12 @@ export class CollabHost {
 			}
 			logger.info("collab welcome exceeded size threshold; stripped images", { stripped });
 		}
-		const entries = snapshot.entries.filter(isWireSessionEntry);
+		const projection = projectWireSessionEntries(snapshot.entries);
+		this.#nearestWireAncestorByEntryId = projection.nearestWireAncestorByEntryId;
+		const entries = projection.entries;
 		const socket = this.#socket;
 		if (!socket) return;
+		const replayEpoch = ++this.#replayEpoch;
 		socket.send(
 			{
 				t: "welcome",
@@ -563,6 +599,7 @@ export class CollabHost {
 				state: this.#buildState(),
 				agents: this.#snapshotAgents(),
 				entryCount: entries.length,
+				replayEpoch,
 				readOnly: canWrite ? undefined : true,
 			},
 			fromPeer,
@@ -573,6 +610,7 @@ export class CollabHost {
 				socket.send({ t: "ui-request", request: pending.request }, fromPeer);
 			}
 		}
+		socket.send({ t: "replay-complete", replayEpoch }, fromPeer);
 		this.#emitCollabNotice("info", `${cleanName} joined the collab session${canWrite ? "" : " (read-only)"}`);
 		this.#updateStatusSegment();
 		this.#scheduleStateBroadcast();
