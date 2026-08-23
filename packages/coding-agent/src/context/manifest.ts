@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { YAML } from "bun";
 import trackedManifestSource from "../../generated/prompt-manifest.json" with { type: "text" };
+import type { ApprovedLegacyPiModule, LegacyPiModuleSnapshot } from "../extensibility/plugins/legacy-pi-compat";
 import { config, diff, fetch as gitFetch, ls, ref, remote, repo, show, status } from "../utils/git";
 import { canonicalJson, compareUnicodeCodePoints, type JsonValue, sha256 } from "./canonical";
 import { computeImplementationSources } from "./implementation-sources";
@@ -859,11 +860,16 @@ async function materializedPackageFiles(directory: string, owner: number, prefix
 	return files;
 }
 
+interface ApprovedMaterializedCandidateSource {
+	readonly root: string;
+	readonly sourceEntries: ReadonlyMap<string, { readonly bytes: number; readonly sha256: string }>;
+}
+
 async function isApprovedMaterializedCandidateSource(
 	absoluteSource: string,
 	resolvedSource: string,
 	release: ContextReleaseManifest,
-): Promise<boolean> {
+): Promise<ApprovedMaterializedCandidateSource | false> {
 	const root = await materializedPackageRoot(resolvedSource);
 	if (!root) return false;
 	const [manifestSource, provenanceSource, sumsSource] = await Promise.all([
@@ -940,6 +946,7 @@ async function isApprovedMaterializedCandidateSource(
 	if (!candidate || candidate.commit !== provenance.commit || candidate.tree !== provenance.tree) return false;
 
 	const expectedChecksums = new Map<string, string>();
+	const sourceEntries = new Map<string, { bytes: number; sha256: string }>();
 	const contentEntries: Array<{ path: string; sha256: string }> = [];
 	let previousPath: string | undefined;
 	for (const [index, rawEntry] of manifest.files.entries()) {
@@ -959,6 +966,7 @@ async function isApprovedMaterializedCandidateSource(
 		const bytes = await fs.readFile(absolute);
 		if (bytes.byteLength !== rawEntry.bytes || sha256(bytes) !== rawEntry.sha256) return false;
 		expectedChecksums.set(rawEntry.path, rawEntry.sha256);
+		sourceEntries.set(rawEntry.path, { bytes: rawEntry.bytes, sha256: rawEntry.sha256 });
 		contentEntries.push({ path: rawEntry.path, sha256: rawEntry.sha256 });
 		previousPath = rawEntry.path;
 	}
@@ -1002,24 +1010,76 @@ async function isApprovedMaterializedCandidateSource(
 	) {
 		return false;
 	}
-	// Keep runtime plugin graph loading outside native-free offline context commands.
-	const { isExtensionSourceGraphContained } = await import("../extensibility/plugins/legacy-pi-compat");
-	return await isExtensionSourceGraphContained(resolvedSource, root);
+	return { root, sourceEntries };
 }
 
-/** Resolve an external runtime source to its verified on-disk entry path. */
-export async function approvedCandidateSourcePath(
+function snapshotSourceRelativePath(root: string, sourcePath: string): string | undefined {
+	const relative = path.relative(root, sourcePath).replaceAll(path.sep, "/");
+	return !relative || relative === ".." || relative.startsWith("../") || path.isAbsolute(relative)
+		? undefined
+		: relative;
+}
+
+async function snapshotMatchesMaterializedCandidateSource(
+	snapshot: LegacyPiModuleSnapshot,
+	materialized: ApprovedMaterializedCandidateSource,
+	isSnapshotContained: (snapshot: LegacyPiModuleSnapshot, packageRoot: string) => Promise<boolean>,
+): Promise<boolean> {
+	if (!(await isSnapshotContained(snapshot, materialized.root))) return false;
+	for (const [modulePath, source] of snapshot.sourceModules) {
+		const relative = snapshotSourceRelativePath(materialized.root, modulePath);
+		const expected = relative ? materialized.sourceEntries.get(relative) : undefined;
+		const sourceBytes = UTF8_ENCODER.encode(source);
+		if (!expected || sourceBytes.byteLength !== expected.bytes || sha256(sourceBytes) !== expected.sha256)
+			return false;
+	}
+	return true;
+}
+
+async function snapshotMatchesCandidateSource(
+	snapshot: LegacyPiModuleSnapshot,
+	repositoryRoot: string,
+	sourceRoot: string,
+	candidateCommit: string,
+	isSnapshotContained: (snapshot: LegacyPiModuleSnapshot, packageRoot: string) => Promise<boolean>,
+): Promise<boolean> {
+	if (!(await isSnapshotContained(snapshot, sourceRoot))) return false;
+	for (const [modulePath, source] of snapshot.sourceModules) {
+		const relative = snapshotSourceRelativePath(repositoryRoot, modulePath);
+		if (!relative) return false;
+		const approvedSource = await show(repositoryRoot, `${candidateCommit}:${relative}`);
+		if (approvedSource !== source) return false;
+	}
+	return true;
+}
+
+/** Capture and attest an external runtime source graph before it can be evaluated. */
+export async function approvedCandidateSourceModule(
 	filePath: string,
 	release: ContextReleaseManifest,
-): Promise<string | undefined> {
+): Promise<ApprovedLegacyPiModule | undefined> {
 	try {
 		const absolute = path.resolve(filePath);
 		const resolved = await fs.realpath(absolute);
-		if (await isApprovedMaterializedCandidateSource(absolute, resolved, release)) return resolved;
+		// Keep runtime plugin graph loading outside native-free offline context commands.
+		const legacyPi = await import("../extensibility/plugins/legacy-pi-compat");
+		const snapshot = await legacyPi.captureLegacyPiModuleSnapshot(resolved);
+		if (!snapshot) return undefined;
+		const materialized = await isApprovedMaterializedCandidateSource(absolute, resolved, release);
+		if (
+			materialized &&
+			(await snapshotMatchesMaterializedCandidateSource(
+				snapshot,
+				materialized,
+				legacyPi.isLegacyPiModuleSnapshotContained,
+			))
+		) {
+			return legacyPi.createApprovedLegacyPiModule(snapshot);
+		}
 		const repositoryRoot = await repo.root(path.dirname(resolved));
 		if (!repositoryRoot) return undefined;
-		const relative = path.relative(repositoryRoot, resolved).replaceAll(path.sep, "/");
-		if (relative.startsWith("../") || path.isAbsolute(relative)) return undefined;
+		const relative = snapshotSourceRelativePath(repositoryRoot, resolved);
+		if (!relative) return undefined;
 		const remoteNames = await remote.list(repositoryRoot);
 		let repository: string | undefined;
 		for (const name of ["origin", ...remoteNames.filter(name => name !== "origin")]) {
@@ -1033,9 +1093,7 @@ export async function approvedCandidateSourcePath(
 		if (!sourceRoot) return undefined;
 		const relativeSourceRoot = path.relative(repositoryRoot, sourceRoot).replaceAll(path.sep, "/");
 		const packagePathspec = `:(literal)${relativeSourceRoot || "."}`;
-		// Keep runtime plugin graph loading outside native-free offline context commands.
-		const { isExtensionSourceGraphContained } = await import("../extensibility/plugins/legacy-pi-compat");
-		const [approvedPackageTree, headPackageTree, workingSourceStatus, workingPackageTree, sourceGraphContained] =
+		const [approvedPackageTree, headPackageTree, workingSourceStatus, workingPackageTree, snapshotMatches] =
 			await Promise.all([
 				ref.resolve(repositoryRoot, `${candidate.commit}:${relativeSourceRoot}`),
 				ref.resolve(repositoryRoot, `HEAD:${relativeSourceRoot}`),
@@ -1047,9 +1105,15 @@ export async function approvedCandidateSourcePath(
 					pathspecs: [packagePathspec],
 				}),
 				workingPackageTreeObjectId(repositoryRoot, relativeSourceRoot, candidate.tree.length),
-				isExtensionSourceGraphContained(resolved, sourceRoot),
+				snapshotMatchesCandidateSource(
+					snapshot,
+					repositoryRoot,
+					sourceRoot,
+					candidate.commit,
+					legacyPi.isLegacyPiModuleSnapshotContained,
+				),
 			]);
-		if (!headPackageTree || workingPackageTree !== headPackageTree || !sourceGraphContained) return undefined;
+		if (!headPackageTree || workingPackageTree !== headPackageTree || !snapshotMatches) return undefined;
 		return approvedCandidateSourceMatches(
 			repository,
 			approvedIdentity ?? undefined,
@@ -1058,16 +1122,24 @@ export async function approvedCandidateSourcePath(
 			workingSourceStatus,
 			release,
 		)
-			? resolved
+			? legacyPi.createApprovedLegacyPiModule(snapshot)
 			: undefined;
 	} catch {
 		return undefined;
 	}
 }
 
+/** Resolve an external runtime source to its approved snapshot entry path. */
+export async function approvedCandidateSourcePath(
+	filePath: string,
+	release: ContextReleaseManifest,
+): Promise<string | undefined> {
+	return (await approvedCandidateSourceModule(filePath, release))?.entryPath;
+}
+
 /** Bind an external runtime source to an unchanged, clean package in one approved candidate. */
 export async function isApprovedCandidateSource(filePath: string, release: ContextReleaseManifest): Promise<boolean> {
-	return (await approvedCandidateSourcePath(filePath, release)) !== undefined;
+	return (await approvedCandidateSourceModule(filePath, release)) !== undefined;
 }
 
 export async function buildContextReleaseManifest(

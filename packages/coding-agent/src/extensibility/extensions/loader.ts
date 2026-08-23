@@ -21,7 +21,7 @@ import { hasFsCode, isEacces, isEnoent, logger } from "@oh-my-pi/pi-utils";
 import { type ExtensionModule, extensionModuleCapability } from "../../capability/extension-module";
 import { type Hook, hookCapability } from "../../capability/hook";
 import { isServiceTierFamily, isServiceTierForFamily } from "../../config/service-tier";
-import { approvedCandidateSourcePath, type ContextReleaseManifest } from "../../context/manifest";
+import { approvedCandidateSourceModule, type ContextReleaseManifest } from "../../context/manifest";
 import { loadCapability } from "../../discovery";
 import { getExtensionNameFromPath } from "../../discovery/helpers";
 import type { ExecOptions } from "../../exec/exec";
@@ -33,7 +33,11 @@ import type { CustomMessagePayload } from "../../session/messages";
 import type { FileDeleteFallbackHandler, FileWriteFallbackHandler } from "../../tools/file-write-fallback";
 import { EventBus } from "../../utils/event-bus";
 import * as TypeBox from "../legacy-typebox";
-import { installLegacyPiSpecifierShim, loadLegacyPiModule } from "../plugins/legacy-pi-compat";
+import {
+	type ApprovedLegacyPiModule,
+	installLegacyPiSpecifierShim,
+	loadLegacyPiModule,
+} from "../plugins/legacy-pi-compat";
 import { getAllPluginExtensionPaths } from "../plugins/loader";
 
 import { resolvePath, withHostGuard } from "../utils";
@@ -414,12 +418,12 @@ interface ImportedExtensionModule {
 async function importExtensionModule(
 	extensionPath: string,
 	cwd: string,
-	verifiedPath?: string,
+	approvedModule?: ApprovedLegacyPiModule,
 ): Promise<ImportedExtensionModule> {
 	const resolvedPath = resolvePath(extensionPath, cwd);
 	try {
 		const module = (await withHostGuard(() =>
-			loadLegacyPiModule(verifiedPath ?? resolvedPath),
+			loadLegacyPiModule(approvedModule?.entryPath ?? resolvedPath, approvedModule),
 		)) as LoadedExtensionModule;
 		const factory = getExtensionFactory(module);
 
@@ -510,19 +514,19 @@ export async function loadExtensions(
 		uniquePaths.push(extPath);
 	}
 
-	// In protected mode, bind every configured entry to approved immutable bytes
-	// before beginning any extension module evaluation or factory invocation.
-	const verifiedPaths = releaseManifest
+	// In protected mode, capture and attest every configured graph before any
+	// extension module evaluation or factory invocation.
+	const approvedModules = releaseManifest
 		? await Promise.all(
-				uniquePaths.map(extPath => approvedCandidateSourcePath(resolvePath(extPath, cwd), releaseManifest)),
+				uniquePaths.map(extPath => approvedCandidateSourceModule(resolvePath(extPath, cwd), releaseManifest)),
 			)
 		: uniquePaths.map(() => undefined);
 	const imported = await Promise.all(
 		uniquePaths.map((extPath, index) => {
-			const verifiedPath = verifiedPaths[index];
-			return releaseManifest && !verifiedPath
+			const approvedModule = approvedModules[index];
+			return releaseManifest && !approvedModule
 				? Promise.resolve(null)
-				: importExtensionModule(extPath, cwd, verifiedPath);
+				: importExtensionModule(extPath, cwd, approvedModule);
 		}),
 	);
 

@@ -6833,7 +6833,7 @@
     },
     {
       "path": "packages/coding-agent/src/context/manifest.ts",
-      "sha256": "3fd8ee73a6a72173245b311b486291e62df17dc8cd9e725627a616a0e088b178"
+      "sha256": "aba3e773b6c2eff4f49110d883790589ac955cc09e08fb6acee6a604915ec2f8"
     },
     {
       "path": "packages/coding-agent/src/context/prompt-sources.generated.ts",
@@ -7369,7 +7369,7 @@
     },
     {
       "path": "packages/coding-agent/src/extensibility/extensions/loader.ts",
-      "sha256": "50d03061f2af1092b9cb911034134ac9de20c0f02451937d4b21959a7489c156"
+      "sha256": "8e327f50f920d3023e12991759cd262991a4d6b3ebd33f5ad797f49437117336"
     },
     {
       "path": "packages/coding-agent/src/extensibility/extensions/managed-timers.ts",
@@ -7429,7 +7429,7 @@
     },
     {
       "path": "packages/coding-agent/src/extensibility/plugins/legacy-pi-compat.ts",
-      "sha256": "4a9b7192efd6a09ba7aed47959000129182e46c2f9240b835b70704463647d2f"
+      "sha256": "50c3ff598bc88dff2c94d8322d8e5d8bd1c7aa8d3293bb97e3de6ae3c97ea404"
     },
     {
       "path": "packages/coding-agent/src/extensibility/plugins/loader.ts",
@@ -10737,5 +10737,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "569f6ffd8d0df4b7c8313eab32b278ecc6a8b797aab0d6313998ed8af9df706a"
+  "rootSha256": "f7174ae77ba1718d7175f29767a37aa39a2be119ea63d6859d1e0444d31d49dc"
 }
