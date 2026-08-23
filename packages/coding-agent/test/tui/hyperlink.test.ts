@@ -146,7 +146,6 @@ describe("isHyperlinkEnabled", () => {
 	it("lets PI_NO_HYPERLINKS disable Herdr and always mode", () => {
 		Bun.env.HERDR_ENV = "1";
 		Bun.env.PI_NO_HYPERLINKS = "1";
-		setHyperlinkMode("off");
 		setHyperlinkMode("always");
 		expect(isHyperlinkEnabled()).toBe(false);
 		expect(terminalCaps.TERMINAL.hyperlinks).toBe(false);

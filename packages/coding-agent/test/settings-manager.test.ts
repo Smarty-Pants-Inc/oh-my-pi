@@ -88,27 +88,19 @@ describe("Settings", () => {
 	});
 
 	it("recomputes terminal hyperlinks from the default mode when reset discards a global override", async () => {
-		const originalNoHyperlinks = Bun.env.PI_NO_HYPERLINKS;
 		delete Bun.env.PI_NO_HYPERLINKS;
+		await Settings.init({
+			cwd: projectDir,
+			agentDir,
+			inMemory: true,
+			overrides: { "tui.hyperlinks": "always" },
+		});
+		expect(TERMINAL.hyperlinks).toBe(true);
 
-		try {
-			await Settings.init({
-				cwd: projectDir,
-				agentDir,
-				inMemory: true,
-				overrides: { "tui.hyperlinks": "always" },
-			});
-			expect(TERMINAL.hyperlinks).toBe(true);
-
-			resetSettingsForTest();
-			expect(TERMINAL.hyperlinks).toBe(
-				shouldEnableHyperlinks("auto", Bun.env, TERMINAL.id, process.stdout.isTTY === true),
-			);
-		} finally {
-			if (originalNoHyperlinks === undefined) delete Bun.env.PI_NO_HYPERLINKS;
-			else Bun.env.PI_NO_HYPERLINKS = originalNoHyperlinks;
-			resetSettingsForTest();
-		}
+		resetSettingsForTest();
+		expect(TERMINAL.hyperlinks).toBe(
+			shouldEnableHyperlinks("auto", Bun.env, TERMINAL.id, process.stdout.isTTY === true),
+		);
 	});
 	describe("main config file selection", () => {
 		it("loads and updates an existing config.yaml without creating config.yml", async () => {
@@ -493,70 +485,52 @@ describe("Settings", () => {
 			expect(settings.getModelRole("project_role")).toBe("openai/project");
 		});
 		it("resynchronizes terminal hyperlinks from a persisted reload", async () => {
-			const originalNoHyperlinks = Bun.env.PI_NO_HYPERLINKS;
 			delete Bun.env.PI_NO_HYPERLINKS;
-			try {
-				await writeSettings({ tui: { hyperlinks: "off" } });
-				const settings = await Settings.init({ cwd: projectDir, agentDir });
-				expect(TERMINAL.hyperlinks).toBe(false);
+			await writeSettings({ tui: { hyperlinks: "off" } });
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(TERMINAL.hyperlinks).toBe(false);
 
-				await writeSettings({ tui: { hyperlinks: "always" } });
-				await settings.reloadFromDisk();
+			await writeSettings({ tui: { hyperlinks: "always" } });
+			await settings.reloadFromDisk();
 
-				expect(settings.get("tui.hyperlinks")).toBe("always");
-				expect(TERMINAL.hyperlinks).toBe(true);
-			} finally {
-				if (originalNoHyperlinks === undefined) delete Bun.env.PI_NO_HYPERLINKS;
-				else Bun.env.PI_NO_HYPERLINKS = originalNoHyperlinks;
-			}
+			expect(settings.get("tui.hyperlinks")).toBe("always");
+			expect(TERMINAL.hyperlinks).toBe(true);
 		});
 		it("resynchronizes terminal hyperlinks when a save merges an external config change", async () => {
-			const originalNoHyperlinks = Bun.env.PI_NO_HYPERLINKS;
 			delete Bun.env.PI_NO_HYPERLINKS;
-			try {
-				await writeSettings({ tui: { hyperlinks: "off" } });
-				const settings = await Settings.init({ cwd: projectDir, agentDir });
-				expect(TERMINAL.hyperlinks).toBe(false);
+			await writeSettings({ tui: { hyperlinks: "off" } });
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(TERMINAL.hyperlinks).toBe(false);
 
-				await writeSettings({ tui: { hyperlinks: "always" } });
-				settings.set("setupVersion", 1);
-				await settings.flush();
+			await writeSettings({ tui: { hyperlinks: "always" } });
+			settings.set("setupVersion", 1);
+			await settings.flush();
 
-				expect(settings.get("tui.hyperlinks")).toBe("always");
-				expect(TERMINAL.hyperlinks).toBe(true);
-			} finally {
-				if (originalNoHyperlinks === undefined) delete Bun.env.PI_NO_HYPERLINKS;
-				else Bun.env.PI_NO_HYPERLINKS = originalNoHyperlinks;
-			}
+			expect(settings.get("tui.hyperlinks")).toBe("always");
+			expect(TERMINAL.hyperlinks).toBe(true);
 		});
 
 		it("resynchronizes terminal hyperlinks when a merged config save fails", async () => {
-			const originalNoHyperlinks = Bun.env.PI_NO_HYPERLINKS;
 			delete Bun.env.PI_NO_HYPERLINKS;
-			try {
-				await writeSettings({ tui: { hyperlinks: "off" } });
-				const settings = await Settings.init({ cwd: projectDir, agentDir });
-				expect(TERMINAL.hyperlinks).toBe(false);
+			await writeSettings({ tui: { hyperlinks: "off" } });
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(TERMINAL.hyperlinks).toBe(false);
 
-				await writeSettings({ tui: { hyperlinks: "always" } });
-				const configPath = await fs.promises.realpath(getConfigPath());
-				const rename = fs.promises.rename.bind(fs.promises);
-				vi.spyOn(fs.promises, "rename").mockImplementation(async (source, target) => {
-					if (String(source).endsWith(".tmp") && String(target) === configPath) {
-						throw new FsCodeError("EIO", "injected save failure");
-					}
-					await rename(source, target);
-				});
+			await writeSettings({ tui: { hyperlinks: "always" } });
+			const configPath = await fs.promises.realpath(getConfigPath());
+			const rename = fs.promises.rename.bind(fs.promises);
+			vi.spyOn(fs.promises, "rename").mockImplementation(async (source, target) => {
+				if (String(source).endsWith(".tmp") && String(target) === configPath) {
+					throw new FsCodeError("EIO", "injected save failure");
+				}
+				await rename(source, target);
+			});
 
-				settings.set("setupVersion", 1);
-				await expect(settings.flush()).rejects.toThrow("injected save failure");
+			settings.set("setupVersion", 1);
+			await expect(settings.flush()).rejects.toThrow("injected save failure");
 
-				expect(settings.get("tui.hyperlinks")).toBe("always");
-				expect(TERMINAL.hyperlinks).toBe(true);
-			} finally {
-				if (originalNoHyperlinks === undefined) delete Bun.env.PI_NO_HYPERLINKS;
-				else Bun.env.PI_NO_HYPERLINKS = originalNoHyperlinks;
-			}
+			expect(settings.get("tui.hyperlinks")).toBe("always");
+			expect(TERMINAL.hyperlinks).toBe(true);
 		});
 		it("retries when a persisted setting changes while files are being read", async () => {
 			await writeSettings({ setupVersion: 1 });
