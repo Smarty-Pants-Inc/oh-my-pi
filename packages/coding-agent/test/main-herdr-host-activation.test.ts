@@ -120,6 +120,7 @@ describe("automatic Herdr host activation", () => {
 			expect(runSetupWizard).not.toHaveBeenCalled();
 			expect(runStartupSplash).not.toHaveBeenCalled();
 			expect(initOptions).toEqual({
+				suppressWelcome: true,
 				suppressWelcomeIntro: true,
 				clearInitialTerminalHistory: true,
 			});
@@ -135,7 +136,7 @@ describe("automatic Herdr host activation", () => {
 		}
 	});
 
-	it("suppresses local model and update notices for an authoritative guest replica", async () => {
+	it("suppresses local model scope, model, and update notices for an authoritative guest replica", async () => {
 		using tempDir = TempDir.createSync("@omp-private-guest-notices-");
 		const settings = Settings.isolated({
 			"marketplace.autoUpdate": "off",
@@ -144,7 +145,9 @@ describe("automatic Herdr host activation", () => {
 			"startup.showSplash": false,
 		});
 		const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
 		const parsed = parseArgs([]);
+		parsed.models = ["anthropic/claude-sonnet-4-5"];
 		disableStartupFeatures(parsed, tempDir.join("sessions"));
 		let manager: SessionManager | undefined;
 		let notifications: Array<{ kind: string; message: string }> = [];

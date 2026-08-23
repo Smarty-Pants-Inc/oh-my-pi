@@ -698,6 +698,7 @@ async function runInteractiveMode(
 		: [];
 	const playStartupSplash = setupWizard !== undefined && showStartupSplash && setupScenes.length === 0;
 	await mode.init({
+		suppressWelcome: bridge?.role === "guest",
 		suppressWelcomeIntro: bridge?.role === "guest" || resuming || setupScenes.length > 0 || playStartupSplash,
 		clearInitialTerminalHistory: true,
 	});
@@ -2130,7 +2131,7 @@ export async function runRootCommand(
 				scopedModels,
 				settingsInstance.get("startup.quiet"),
 			);
-			if (modelScopeNotification) {
+			if (modelScopeNotification && !isCollabGuest) {
 				// Routed through the TUI (not stdout): the startup capture owns the
 				// terminal in raw mode here, and the TUI's first clearScrollback paint
 				// would wipe a pre-TUI line anyway.

@@ -1098,7 +1098,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.ui.addChild(new Spacer(1));
 		}
 
-		if (!startupQuiet) {
+		if (!startupQuiet && !options.suppressWelcome) {
 			// Add welcome header
 			this.#welcomeComponent = new WelcomeComponent(
 				this.#version,

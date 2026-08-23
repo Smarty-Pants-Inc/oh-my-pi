@@ -88,6 +88,7 @@ export type TodoPhase = {
 };
 
 export interface InteractiveModeInitOptions {
+	suppressWelcome?: boolean;
 	suppressWelcomeIntro?: boolean;
 	clearInitialTerminalHistory?: boolean;
 }
