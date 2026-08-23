@@ -11143,7 +11143,7 @@
     },
     {
       "path": "packages/wire/src/index.ts",
-      "sha256": "d6b15d084687adb4288dec626ffae8e49435a6d3c036ad63df8f48cf22936645"
+      "sha256": "dc4d67872f8fdc7708a268b7e0833c11a926be06d218262207530a5c9e081b38"
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",

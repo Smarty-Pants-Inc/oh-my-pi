@@ -318,6 +318,7 @@ export class CollabHost {
 	#activeRpcRequests = new Set<string>();
 	#rpcSessionTransitions = new Set<string>();
 	#uiReqSeq = 0;
+	#replayEpoch = 0;
 	#pendingUi = new Map<number, { request: CollabUiRequest; settle(result: CollabGuestUiResult): void }>();
 	#lastStateJson = "";
 	#stateDebounce: Timer | null = null;
@@ -722,6 +723,7 @@ export class CollabHost {
 		const entries = projection.entries;
 		const socket = this.#socket;
 		if (!socket) return;
+		const replayEpoch = ++this.#replayEpoch;
 		socket.send(
 			{
 				t: "welcome",
@@ -745,6 +747,7 @@ export class CollabHost {
 				agents: this.#snapshotAgents(),
 				participant: { name: cleanName, role: "guest", readOnly: !canWrite },
 				entryCount: entries.length,
+				replayEpoch,
 				readOnly: canWrite ? undefined : true,
 			},
 			fromPeer,
@@ -756,6 +759,7 @@ export class CollabHost {
 				socket.send({ t: "ui-request", request: pending.request }, fromPeer);
 			}
 		}
+		socket.send({ t: "replay-complete", replayEpoch }, fromPeer);
 		this.#emitCollabNotice("info", `${cleanName} joined the collab session${canWrite ? "" : " (read-only)"}`);
 		this.#updateStatusSegment();
 		this.#scheduleStateBroadcast();

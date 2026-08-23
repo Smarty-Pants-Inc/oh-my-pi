@@ -230,21 +230,30 @@ describe("collab guest replica readiness", () => {
 		}
 	});
 
-	it("signals only after initial and resync snapshots fully finalize", async () => {
+	it("waits for snapshot-adjacent UI replay before signaling each active epoch", async () => {
 		const writeSpy = spyOn(Bun, "write").mockResolvedValue(0);
 		const router = new InMemoryCollabRouter();
 		const hostTransport = router.host();
-		const readySignals: string[] = [];
-		const resyncReady = Promise.withResolvers<void>();
+		const readySignals: number[] = [];
+		const firstReady = Promise.withResolvers<void>();
+		const secondReady = Promise.withResolvers<void>();
 		const guestTransport = Object.assign(router.guest(), {
 			notifyReplicaReady: () => {
-				readySignals.push("ready");
-				if (readySignals.length === 2) resyncReady.resolve();
+				readySignals.push(readySignals.length + 1);
+				if (readySignals.length === 1) firstReady.resolve();
+				if (readySignals.length === 2) secondReady.resolve();
 			},
 		});
+		const firstUiApplied = Promise.withResolvers<void>();
+		const secondUiApplied = Promise.withResolvers<void>();
+		const ctx = makeGuestContext([]);
+		ctx.showHookSelector = title => {
+			if (title === "initial pending ask") firstUiApplied.resolve();
+			if (title === "resync pending ask") secondUiApplied.resolve();
+			return Promise.withResolvers<string | undefined>().promise;
+		};
 		const firstSnapshotSwitchStarted = Promise.withResolvers<void>();
 		const finishFirstSnapshotSwitch = Promise.withResolvers<void>();
-		const ctx = makeGuestContext([]);
 		let switchCount = 0;
 		ctx.session.switchSession = async () => {
 			switchCount += 1;
@@ -270,7 +279,7 @@ describe("collab guest replica readiness", () => {
 				customType: "test",
 			},
 		];
-		const sendWelcome = (peer: number): void => {
+		const sendWelcome = (peer: number, replayEpoch: number): void => {
 			hostTransport.send(
 				{
 					t: "welcome",
@@ -279,6 +288,7 @@ describe("collab guest replica readiness", () => {
 					state: makeState(),
 					agents: [],
 					entryCount: entries.length,
+					replayEpoch,
 				},
 				peer,
 			);
@@ -286,7 +296,7 @@ describe("collab guest replica readiness", () => {
 		const initialWelcome = Promise.withResolvers<number>();
 		hostTransport.onFrame = (frame, peer) => {
 			if (frame.t !== "hello") return;
-			sendWelcome(peer);
+			sendWelcome(peer, 1);
 			initialWelcome.resolve(peer);
 		};
 		hostTransport.connect();
@@ -296,29 +306,50 @@ describe("collab guest replica readiness", () => {
 
 		try {
 			const peer = await initialWelcome.promise;
-			await flush();
-			expect(readySignals).toEqual([]);
-
 			hostTransport.send({ t: "snapshot-chunk", entries: [entries[0]], final: false }, peer);
-			await flush();
-			expect(readySignals).toEqual([]);
-
 			hostTransport.send({ t: "snapshot-chunk", entries: [entries[1]], final: true }, peer);
 			await firstSnapshotSwitchStarted.promise;
 			expect(readySignals).toEqual([]);
 			finishFirstSnapshotSwitch.resolve();
 			await joining;
-			expect(readySignals).toEqual(["ready"]);
+			expect(readySignals).toEqual([]);
 
-			sendWelcome(peer);
-			await flush();
-			expect(readySignals).toEqual(["ready"]);
+			hostTransport.send(
+				{
+					t: "ui-request",
+					request: { reqId: 1, kind: "select", title: "initial pending ask", options: ["Continue"] },
+				},
+				peer,
+			);
+			await firstUiApplied.promise;
+			expect(readySignals).toEqual([]);
+			hostTransport.send({ t: "replay-complete", replayEpoch: 1 }, peer);
+			await firstReady.promise;
+			expect(readySignals).toEqual([1]);
+
+			sendWelcome(peer, 2);
 			hostTransport.send({ t: "snapshot-chunk", entries: [entries[0]], final: false }, peer);
-			await flush();
-			expect(readySignals).toEqual(["ready"]);
 			hostTransport.send({ t: "snapshot-chunk", entries: [entries[1]], final: true }, peer);
-			await resyncReady.promise;
-			expect(readySignals).toEqual(["ready", "ready"]);
+			hostTransport.send({ t: "replay-complete", replayEpoch: 1 }, peer);
+			hostTransport.send(
+				{
+					t: "ui-request",
+					request: { reqId: 2, kind: "select", title: "resync pending ask", options: ["Continue"] },
+				},
+				peer,
+			);
+			await secondUiApplied.promise;
+			expect(readySignals).toEqual([1]);
+			hostTransport.send({ t: "replay-complete", replayEpoch: 2 }, peer);
+			await secondReady.promise;
+			hostTransport.send({ t: "replay-complete", replayEpoch: 2 }, peer);
+			await flush();
+			expect(readySignals).toEqual([1, 2]);
+
+			await guest.leave("detached");
+			guestTransport.onFrame?.({ t: "replay-complete", replayEpoch: 2 }, 0);
+			await flush();
+			expect(readySignals).toEqual([1, 2]);
 		} finally {
 			finishFirstSnapshotSwitch.resolve();
 			await guest.leave("test cleanup").catch(() => {});
