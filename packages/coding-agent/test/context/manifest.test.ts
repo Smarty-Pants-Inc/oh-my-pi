@@ -16,6 +16,7 @@ import {
 	isApprovedCandidateSource,
 	parseContentManifest,
 	parseContextReleaseManifest,
+	stackPackageContentSha256,
 	trackedContentManifest,
 	validateScopeCoverage,
 } from "../../src/context/manifest";
@@ -72,6 +73,108 @@ describe("tracked context manifest", () => {
 		expect(canonicalGithubRepository("https://example.com/Smarty-Pants-Inc/oh-my-pi.git")).toBeUndefined();
 	});
 
+	it("keeps the OMP internal prompt capability off the package API", async () => {
+		const packageJson = (await Bun.file(path.resolve(import.meta.dir, "../../package.json")).json()) as {
+			exports: Record<string, unknown>;
+		};
+		expect(packageJson.exports["./context/internal-session"]).toBeNull();
+		expect(packageJson.exports["./context/internal-session.js"]).toBeNull();
+	});
+
+	it("accepts only the active immutable materialized Stack package", async () => {
+		const repositoryRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-materialized-extension-"));
+		const stackRoot = path.join(repositoryRoot, "home/.smarty-stack");
+		const packageRoot = path.join(stackRoot, "versions/0.20.11");
+		const currentRoot = path.join(stackRoot, "current");
+		const relativeEntry = "extensions/smarty-prompt-guard/src/index.ts";
+		const entryPath = path.join(packageRoot, relativeEntry);
+		const currentEntryPath = path.join(currentRoot, relativeEntry);
+		const repository = "Smarty-Pants-Inc/smarty-stack";
+		const commit = "a".repeat(40);
+		const tree = "b".repeat(40);
+		const chmodTree = async (directory: string, directoryMode: number, fileMode: number): Promise<void> => {
+			for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
+				const target = path.join(directory, entry.name);
+				if (entry.isDirectory()) await chmodTree(target, directoryMode, fileMode);
+				else if (entry.isFile()) await fs.chmod(target, fileMode);
+			}
+			await fs.chmod(directory, directoryMode);
+		};
+		try {
+			await fs.mkdir(path.dirname(entryPath), { recursive: true });
+			const provenance = {
+				schema: "smarty.stack.provenance.v1",
+				version: "0.20.11",
+				repository,
+				commit,
+				tree,
+				createdAt: "2026-08-22",
+				purpose: "test package",
+				sources: [],
+				authority: "test",
+				recovery: "test",
+				nonclaims: [],
+			};
+			const files = new Map<string, string>([
+				["PROVENANCE.json", `${JSON.stringify(provenance, null, 2)}\n`],
+				[
+					"extensions/smarty-prompt-guard/package.json",
+					'{"type":"module","omp":{"extensions":["./src/index.ts"]}}\n',
+				],
+				[relativeEntry, "export default function promptGuard() {}\n"],
+				[
+					"runtime-package.json",
+					'{"schema":"smarty.stack.runtime_projection.v1","files":["PROVENANCE.json","runtime-package.json"],"directories":["extensions/smarty-prompt-guard"]}\n',
+				],
+			]);
+			for (const [relative, source] of files) {
+				const target = path.join(packageRoot, relative);
+				await fs.mkdir(path.dirname(target), { recursive: true });
+				await Bun.write(target, source);
+			}
+			const manifest = {
+				schema: "smarty.stack.release_manifest.v1",
+				version: "0.20.11",
+				createdAt: "2026-08-22",
+				status: "protected_candidate_requires_external_approval",
+				files: [...files]
+					.map(([relative, source]) => ({
+						path: relative,
+						bytes: Buffer.byteLength(source),
+						sha256: sha256(source),
+					}))
+					.sort((left, right) => compareUnicodeCodePoints(left.path, right.path)),
+			};
+			const manifestSource = `${JSON.stringify(manifest, null, 2)}\n`;
+			await Bun.write(path.join(packageRoot, "MANIFEST.json"), manifestSource);
+			const checksums = [
+				...manifest.files.map(entry => [entry.path, entry.sha256] as const),
+				["MANIFEST.json", sha256(manifestSource)] as const,
+			]
+				.sort(([left], [right]) => compareUnicodeCodePoints(left, right))
+				.map(([relative, digest]) => `${digest}  ${relative}`)
+				.join("\n");
+			await Bun.write(path.join(packageRoot, "SHA256SUMS.txt"), `${checksums}\n`);
+			await fs.symlink(path.join("versions", "0.20.11"), currentRoot);
+			const result = Bun.spawnSync(["git", "init", "-q"], { cwd: repositoryRoot, stdout: "pipe", stderr: "pipe" });
+			expect(result.exitCode).toBe(0);
+			const release = {
+				candidates: [{ repository, commit, tree }],
+				stackPackageContentSha256: stackPackageContentSha256(manifest.files),
+			} as unknown as Parameters<typeof isApprovedCandidateSource>[1];
+
+			expect(await isApprovedCandidateSource(currentEntryPath, release)).toBe(false);
+			await chmodTree(packageRoot, 0o555, 0o444);
+			expect(await isApprovedCandidateSource(entryPath, release)).toBe(false);
+			expect(await isApprovedCandidateSource(currentEntryPath, release)).toBe(true);
+		} finally {
+			try {
+				await chmodTree(packageRoot, 0o755, 0o644);
+			} catch {}
+			await fs.rm(repositoryRoot, { recursive: true, force: true });
+		}
+	});
+
 	it("binds extension packages to approved identity, tree, and clean source", () => {
 		const identity = {
 			repository: "Smarty-Pants-Inc/oh-my-pi",
@@ -123,6 +226,15 @@ describe("tracked context manifest", () => {
 				Bun.write(indexPath, 'import "./store.js";\nexport default function plugin() {}\n'),
 				Bun.write(storePath, "export const value = 1;\n"),
 				Bun.write(path.join(repositoryRoot, ".gitignore"), "packages/plugin/src/store.js\n"),
+				Bun.write(
+					path.join(packageRoot, "MANIFEST.json"),
+					'{"schema":"smarty.stack.release_manifest.v1","version":"0.20.11","createdAt":"2026-08-22","status":"protected_candidate_requires_external_approval","files":[]}\n',
+				),
+				Bun.write(
+					path.join(packageRoot, "PROVENANCE.json"),
+					'{"schema":"smarty.stack.provenance.v1","version":"0.20.11","repository":"Smarty-Pants-Inc/smarty-dev","commit":null,"tree":null,"createdAt":"2026-08-22","purpose":"test","sources":[],"authority":"test","recovery":"test","nonclaims":[]}\n',
+				),
+				Bun.write(path.join(packageRoot, "SHA256SUMS.txt"), ""),
 			]);
 			await fs.symlink(packageRoot, linkedRoot);
 			runGit("init", "-q");
@@ -501,6 +613,7 @@ describe("tracked context manifest", () => {
 			configurationSourceSha256: "d".repeat(64),
 			configurationSemanticSha256: "e".repeat(64),
 			combinedPromptBehaviorSha256,
+			stackPackageContentSha256: "f".repeat(64),
 		};
 		const release = {
 			...releasePayload,

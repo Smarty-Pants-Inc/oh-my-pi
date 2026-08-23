@@ -184,6 +184,7 @@ describe("AgentSession before_agent_start typed provider context", () => {
 			.filter(Boolean)
 			.sort(compareUnicodeCodePoints);
 		const release = await buildContextReleaseManifest(repository, undefined, {
+			stackPackageContentSha256: "a".repeat(64),
 			scopeCoverage: changedPaths.map(changedPath => ({
 				path: changedPath,
 				requirement: "§8.6 test fixture for the required expanded candidate schema.",

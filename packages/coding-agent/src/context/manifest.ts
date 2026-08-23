@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { YAML } from "bun";
 import trackedManifestSource from "../../generated/prompt-manifest.json" with { type: "text" };
+import type { ApprovedLegacyPiModule, LegacyPiModuleSnapshot } from "../extensibility/plugins/legacy-pi-compat";
 import { config, diff, fetch as gitFetch, ls, ref, remote, repo, show, status } from "../utils/git";
 import { canonicalJson, compareUnicodeCodePoints, type JsonValue, sha256 } from "./canonical";
 import { computeImplementationSources } from "./implementation-sources";
@@ -21,6 +22,29 @@ const OMP_SCOPE_BASE = {
 	tree: "a20c0452f99155e7adeaecfad28e4afd0223c684",
 } as const;
 const OMP_SCOPE_BASE_URL = "https://github.com/can1357/oh-my-pi.git";
+const MATERIALIZED_STACK_PACKAGE_METADATA_PATHS: Record<string, true> = {
+	"PROVENANCE.json": true,
+	"MANIFEST.json": true,
+	"SHA256SUMS.txt": true,
+	"extensions/smarty-prompt-guard/package.json": true,
+};
+
+/** Hash the immutable Stack content shared by source candidates and materialized runtimes. */
+export function stackPackageContentSha256(entries: readonly { path: string; sha256: string }[]): string {
+	let previousPath: string | undefined;
+	const retained: Array<{ path: string; sha256: string }> = [];
+	for (const entry of entries) {
+		if (previousPath !== undefined && compareUnicodeCodePoints(previousPath, entry.path) >= 0) {
+			throw new Error("Stack package entries must be sorted and unique by path");
+		}
+		previousPath = entry.path;
+		if (!Object.hasOwn(MATERIALIZED_STACK_PACKAGE_METADATA_PATHS, entry.path)) {
+			retained.push({ path: entry.path, sha256: entry.sha256 });
+		}
+	}
+	if (retained.length === 0) throw new Error("Stack package has no static content entries");
+	return sha256(canonicalJson(retained));
+}
 
 export function canonicalGithubRepository(url: string | undefined): string | undefined {
 	if (!url) return undefined;
@@ -86,6 +110,7 @@ export interface ContextReleaseManifest {
 	commit: string;
 	tree: string;
 	candidates: CandidateIdentity[];
+	stackPackageContentSha256: string;
 	contentManifest: ContentManifest;
 	contentManifestRootSha256: string;
 	behaviorSha256: string;
@@ -348,6 +373,7 @@ export function parseContextReleaseManifest(source: string): ContextReleaseManif
 			"commit",
 			"tree",
 			"candidates",
+			"stackPackageContentSha256",
 			"contentManifest",
 			"contentManifestRootSha256",
 			"behaviorSha256",
@@ -383,6 +409,7 @@ export function parseContextReleaseManifest(source: string): ContextReleaseManif
 		"configurationSourceSha256",
 		"configurationSemanticSha256",
 		"combinedPromptBehaviorSha256",
+		"stackPackageContentSha256",
 		"rootSha256",
 	] as const) {
 		assertSha256(value[field], `release manifest ${field}`);
@@ -568,11 +595,10 @@ function validateCandidateSet(
 	return sorted;
 }
 
-async function loadActivationCandidates(): Promise<CandidateIdentity[] | undefined> {
+async function loadActivationState(): Promise<ContextReleaseManifest | undefined> {
 	const statePath = activationStatePath();
 	if (!(await Bun.file(statePath).exists())) return undefined;
-	const state = parseContextReleaseManifest(await Bun.file(statePath).text());
-	return state.candidates;
+	return parseContextReleaseManifest(await Bun.file(statePath).text());
 }
 
 export function activationStatePath(explicitPath?: string): string {
@@ -791,14 +817,269 @@ async function approvedCandidateSourceRoot(
 	}
 }
 
-/** Bind an external runtime source to an unchanged, clean package in one approved candidate. */
-export async function isApprovedCandidateSource(filePath: string, release: ContextReleaseManifest): Promise<boolean> {
+async function materializedPackageRoot(resolvedSource: string): Promise<string | undefined> {
+	let current = path.dirname(resolvedSource);
+	while (true) {
+		const markers = ["MANIFEST.json", "PROVENANCE.json", "SHA256SUMS.txt"].map(name => path.join(current, name));
+		const present = await Promise.all(markers.map(async marker => await Bun.file(marker).exists()));
+		if (present.some(Boolean)) return present.every(Boolean) ? current : undefined;
+		const parent = path.dirname(current);
+		if (parent === current) return undefined;
+		current = parent;
+	}
+}
+
+async function materializedPackageFiles(directory: string, owner: number, prefix = ""): Promise<string[] | undefined> {
+	const directoryStats = await fs.lstat(directory);
+	if (
+		!directoryStats.isDirectory() ||
+		directoryStats.isSymbolicLink() ||
+		directoryStats.uid !== owner ||
+		(directoryStats.mode & 0o222) !== 0
+	) {
+		return undefined;
+	}
+	const files: string[] = [];
+	const entries = await fs.readdir(directory, { withFileTypes: true });
+	entries.sort((left, right) => compareUnicodeCodePoints(left.name, right.name));
+	for (const entry of entries) {
+		const absolute = path.join(directory, entry.name);
+		const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
+		const stats = await fs.lstat(absolute);
+		if (stats.isSymbolicLink() || stats.uid !== owner || (stats.mode & 0o222) !== 0) return undefined;
+		if (stats.isDirectory()) {
+			const nested = await materializedPackageFiles(absolute, owner, relative);
+			if (!nested) return undefined;
+			files.push(...nested);
+		} else if (stats.isFile()) {
+			files.push(relative);
+		} else {
+			return undefined;
+		}
+	}
+	return files;
+}
+
+interface ApprovedMaterializedCandidateSource {
+	readonly root: string;
+	readonly sourceEntries: ReadonlyMap<string, { readonly bytes: number; readonly sha256: string }>;
+}
+
+async function isApprovedMaterializedCandidateSource(
+	absoluteSource: string,
+	resolvedSource: string,
+	release: ContextReleaseManifest,
+): Promise<ApprovedMaterializedCandidateSource | false> {
+	const root = await materializedPackageRoot(resolvedSource);
+	if (!root) return false;
+	const [manifestSource, provenanceSource, sumsSource] = await Promise.all([
+		Bun.file(path.join(root, "MANIFEST.json")).text(),
+		Bun.file(path.join(root, "PROVENANCE.json")).text(),
+		Bun.file(path.join(root, "SHA256SUMS.txt")).text(),
+	]);
+	const manifest: unknown = JSON.parse(manifestSource);
+	const provenance: unknown = JSON.parse(provenanceSource);
+	if (!isRecord(manifest) || !isRecord(provenance)) return false;
+	assertExactKeys(manifest, ["schema", "version", "createdAt", "status", "files"], "materialized package manifest");
+	assertExactKeys(
+		provenance,
+		[
+			"schema",
+			"version",
+			"repository",
+			"commit",
+			"tree",
+			"createdAt",
+			"purpose",
+			"sources",
+			"authority",
+			"recovery",
+			"nonclaims",
+		],
+		"materialized package provenance",
+	);
+	assertString(manifest.version, "materialized package manifest version");
+	assertString(manifest.createdAt, "materialized package manifest creation date");
+	assertString(provenance.version, "materialized package provenance version");
+	assertString(provenance.repository, "materialized package provenance repository");
+	assertString(provenance.createdAt, "materialized package provenance creation date");
+	if (provenance.commit === null && provenance.tree === null) return false;
+	assertGitObject(provenance.commit, "materialized package provenance commit");
+	assertGitObject(provenance.tree, "materialized package provenance tree");
+	if (
+		manifest.schema !== "smarty.stack.release_manifest.v1" ||
+		manifest.status !== "protected_candidate_requires_external_approval" ||
+		provenance.schema !== "smarty.stack.provenance.v1" ||
+		provenance.version !== manifest.version ||
+		provenance.createdAt !== manifest.createdAt ||
+		!/^\d{4}-\d{2}-\d{2}$/.test(manifest.createdAt) ||
+		!Array.isArray(manifest.files) ||
+		manifest.files.length === 0
+	) {
+		return false;
+	}
+	const candidate = release.candidates.find(item => item.repository === provenance.repository);
+	const owner = process.getuid?.();
+	if (owner === undefined) return false;
+	const versions = path.dirname(root);
+	const stackRoot = path.dirname(versions);
+	if (path.basename(versions) !== "versions" || path.basename(root) !== manifest.version) return false;
+	let current = path.dirname(absoluteSource);
+	while (path.basename(current) !== "current" || path.basename(path.dirname(current)) !== ".smarty-stack") {
+		const parent = path.dirname(current);
+		if (parent === current) return false;
+		current = parent;
+	}
+	const currentStats = await fs.lstat(current);
+	if (
+		!currentStats.isSymbolicLink() ||
+		currentStats.uid !== owner ||
+		(await fs.realpath(path.dirname(current))) !== stackRoot ||
+		(await fs.realpath(current)) !== root
+	) {
+		return false;
+	}
+	const currentRelative = path.relative(current, absoluteSource);
+	if (!currentRelative || currentRelative.startsWith(`..${path.sep}`) || path.isAbsolute(currentRelative))
+		return false;
+	if (path.resolve(root, currentRelative) !== resolvedSource) return false;
+	if (!candidate || candidate.commit !== provenance.commit || candidate.tree !== provenance.tree) return false;
+
+	const expectedChecksums = new Map<string, string>();
+	const sourceEntries = new Map<string, { bytes: number; sha256: string }>();
+	const contentEntries: Array<{ path: string; sha256: string }> = [];
+	let previousPath: string | undefined;
+	for (const [index, rawEntry] of manifest.files.entries()) {
+		if (!isRecord(rawEntry)) return false;
+		assertExactKeys(rawEntry, ["path", "bytes", "sha256"], `materialized package file ${index}`);
+		assertRepositoryPath(rawEntry.path, `materialized package file ${index} path`);
+		assertSha256(rawEntry.sha256, `materialized package file ${index} sha256`);
+		if (typeof rawEntry.bytes !== "number" || !Number.isSafeInteger(rawEntry.bytes) || rawEntry.bytes < 0)
+			return false;
+		if (previousPath !== undefined && compareUnicodeCodePoints(previousPath, rawEntry.path) >= 0) return false;
+		if (rawEntry.path === "MANIFEST.json" || rawEntry.path === "SHA256SUMS.txt") return false;
+		const absolute = path.join(root, rawEntry.path);
+		const relative = path.relative(root, absolute);
+		if (relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return false;
+		const stats = await fs.lstat(absolute);
+		if (!stats.isFile() || stats.isSymbolicLink()) return false;
+		const bytes = await fs.readFile(absolute);
+		if (bytes.byteLength !== rawEntry.bytes || sha256(bytes) !== rawEntry.sha256) return false;
+		expectedChecksums.set(rawEntry.path, rawEntry.sha256);
+		sourceEntries.set(rawEntry.path, { bytes: rawEntry.bytes, sha256: rawEntry.sha256 });
+		contentEntries.push({ path: rawEntry.path, sha256: rawEntry.sha256 });
+		previousPath = rawEntry.path;
+	}
+	if (release.stackPackageContentSha256 !== stackPackageContentSha256(contentEntries)) return false;
+	const sourceRelative = path.relative(root, resolvedSource).replaceAll(path.sep, "/");
+	if (!expectedChecksums.has(sourceRelative)) return false;
+	expectedChecksums.set("MANIFEST.json", sha256(manifestSource));
+
+	if (!sumsSource.endsWith("\n")) return false;
+	const actualChecksums = new Map<string, string>();
+	for (const line of sumsSource.slice(0, -1).split("\n")) {
+		const match = line.match(/^([a-f0-9]{64}) {2}(.+)$/);
+		if (!match) return false;
+		const digest = match[1];
+		const name = match[2];
+		if (!digest || !name) return false;
+		assertRepositoryPath(name, "materialized package checksum path");
+		if (actualChecksums.has(name)) return false;
+		actualChecksums.set(name, digest);
+	}
+	const actualChecksumNames = [...actualChecksums.keys()];
+	if (
+		actualChecksumNames.some(
+			(name, index) => index > 0 && compareUnicodeCodePoints(actualChecksumNames[index - 1]!, name) >= 0,
+		)
+	) {
+		return false;
+	}
+	if (
+		actualChecksums.size !== expectedChecksums.size ||
+		[...expectedChecksums].some(([name, digest]) => actualChecksums.get(name) !== digest)
+	) {
+		return false;
+	}
+	const actualFiles = await materializedPackageFiles(root, owner);
+	const expectedFiles = [...expectedChecksums.keys(), "SHA256SUMS.txt"].sort(compareUnicodeCodePoints);
+	if (
+		!actualFiles ||
+		actualFiles.length !== expectedFiles.length ||
+		actualFiles.some((name, index) => name !== expectedFiles[index])
+	) {
+		return false;
+	}
+	return { root, sourceEntries };
+}
+
+function snapshotSourceRelativePath(root: string, sourcePath: string): string | undefined {
+	const relative = path.relative(root, sourcePath).replaceAll(path.sep, "/");
+	return !relative || relative === ".." || relative.startsWith("../") || path.isAbsolute(relative)
+		? undefined
+		: relative;
+}
+
+async function snapshotMatchesMaterializedCandidateSource(
+	snapshot: LegacyPiModuleSnapshot,
+	materialized: ApprovedMaterializedCandidateSource,
+	isSnapshotContained: (snapshot: LegacyPiModuleSnapshot, packageRoot: string) => Promise<boolean>,
+): Promise<boolean> {
+	if (!(await isSnapshotContained(snapshot, materialized.root))) return false;
+	for (const [modulePath, source] of snapshot.sourceModules) {
+		const relative = snapshotSourceRelativePath(materialized.root, modulePath);
+		const expected = relative ? materialized.sourceEntries.get(relative) : undefined;
+		const sourceBytes = UTF8_ENCODER.encode(source);
+		if (!expected || sourceBytes.byteLength !== expected.bytes || sha256(sourceBytes) !== expected.sha256)
+			return false;
+	}
+	return true;
+}
+
+async function snapshotMatchesCandidateSource(
+	snapshot: LegacyPiModuleSnapshot,
+	repositoryRoot: string,
+	sourceRoot: string,
+	candidateCommit: string,
+	isSnapshotContained: (snapshot: LegacyPiModuleSnapshot, packageRoot: string) => Promise<boolean>,
+): Promise<boolean> {
+	if (!(await isSnapshotContained(snapshot, sourceRoot))) return false;
+	for (const [modulePath, source] of snapshot.sourceModules) {
+		const relative = snapshotSourceRelativePath(repositoryRoot, modulePath);
+		if (!relative) return false;
+		const approvedSource = await show(repositoryRoot, `${candidateCommit}:${relative}`);
+		if (approvedSource !== source) return false;
+	}
+	return true;
+}
+
+/** Capture and attest an external runtime source graph before it can be evaluated. */
+export async function approvedCandidateSourceModule(
+	filePath: string,
+	release: ContextReleaseManifest,
+): Promise<ApprovedLegacyPiModule | undefined> {
 	try {
-		const resolved = await fs.realpath(path.resolve(filePath));
+		const absolute = path.resolve(filePath);
+		const resolved = await fs.realpath(absolute);
+		// Keep runtime plugin graph loading outside native-free offline context commands.
+		const legacyPi = await import("../extensibility/plugins/legacy-pi-compat");
+		const snapshot = await legacyPi.captureLegacyPiModuleSnapshot(resolved);
+		if (!snapshot) return undefined;
+		const materialized = await isApprovedMaterializedCandidateSource(absolute, resolved, release);
+		if (
+			materialized &&
+			(await snapshotMatchesMaterializedCandidateSource(
+				snapshot,
+				materialized,
+				legacyPi.isLegacyPiModuleSnapshotContained,
+			))
+		) {
+			return legacyPi.createApprovedLegacyPiModule(snapshot);
+		}
 		const repositoryRoot = await repo.root(path.dirname(resolved));
-		if (!repositoryRoot) return false;
-		const relative = path.relative(repositoryRoot, resolved).replaceAll(path.sep, "/");
-		if (relative.startsWith("../") || path.isAbsolute(relative)) return false;
+		if (!repositoryRoot) return undefined;
+		const relative = snapshotSourceRelativePath(repositoryRoot, resolved);
+		if (!relative) return undefined;
 		const remoteNames = await remote.list(repositoryRoot);
 		let repository: string | undefined;
 		for (const name of ["origin", ...remoteNames.filter(name => name !== "origin")]) {
@@ -806,15 +1087,13 @@ export async function isApprovedCandidateSource(filePath: string, release: Conte
 			if (repository) break;
 		}
 		const candidate = release.candidates.find(item => item.repository === repository);
-		if (!candidate) return false;
+		if (!candidate) return undefined;
 		const approvedIdentity = await ref.commitIdentity(repositoryRoot, candidate.commit);
 		const sourceRoot = await approvedCandidateSourceRoot(repositoryRoot, resolved, candidate.commit);
-		if (!sourceRoot) return false;
+		if (!sourceRoot) return undefined;
 		const relativeSourceRoot = path.relative(repositoryRoot, sourceRoot).replaceAll(path.sep, "/");
 		const packagePathspec = `:(literal)${relativeSourceRoot || "."}`;
-		// Keep runtime plugin graph loading outside native-free offline context commands.
-		const { isExtensionSourceGraphContained } = await import("../extensibility/plugins/legacy-pi-compat");
-		const [approvedPackageTree, headPackageTree, workingSourceStatus, workingPackageTree, sourceGraphContained] =
+		const [approvedPackageTree, headPackageTree, workingSourceStatus, workingPackageTree, snapshotMatches] =
 			await Promise.all([
 				ref.resolve(repositoryRoot, `${candidate.commit}:${relativeSourceRoot}`),
 				ref.resolve(repositoryRoot, `HEAD:${relativeSourceRoot}`),
@@ -826,9 +1105,15 @@ export async function isApprovedCandidateSource(filePath: string, release: Conte
 					pathspecs: [packagePathspec],
 				}),
 				workingPackageTreeObjectId(repositoryRoot, relativeSourceRoot, candidate.tree.length),
-				isExtensionSourceGraphContained(resolved, sourceRoot),
+				snapshotMatchesCandidateSource(
+					snapshot,
+					repositoryRoot,
+					sourceRoot,
+					candidate.commit,
+					legacyPi.isLegacyPiModuleSnapshotContained,
+				),
 			]);
-		if (!headPackageTree || workingPackageTree !== headPackageTree || !sourceGraphContained) return false;
+		if (!headPackageTree || workingPackageTree !== headPackageTree || !snapshotMatches) return undefined;
 		return approvedCandidateSourceMatches(
 			repository,
 			approvedIdentity ?? undefined,
@@ -836,16 +1121,31 @@ export async function isApprovedCandidateSource(filePath: string, release: Conte
 			headPackageTree ?? undefined,
 			workingSourceStatus,
 			release,
-		);
+		)
+			? legacyPi.createApprovedLegacyPiModule(snapshot)
+			: undefined;
 	} catch {
-		return false;
+		return undefined;
 	}
+}
+
+/** Resolve an external runtime source to its approved snapshot entry path. */
+export async function approvedCandidateSourcePath(
+	filePath: string,
+	release: ContextReleaseManifest,
+): Promise<string | undefined> {
+	return (await approvedCandidateSourceModule(filePath, release))?.entryPath;
+}
+
+/** Bind an external runtime source to an unchanged, clean package in one approved candidate. */
+export async function isApprovedCandidateSource(filePath: string, release: ContextReleaseManifest): Promise<boolean> {
+	return (await approvedCandidateSourceModule(filePath, release)) !== undefined;
 }
 
 export async function buildContextReleaseManifest(
 	_projectCwd: string = process.cwd(),
 	candidateOverride?: readonly CandidateIdentity[],
-	options?: { requireCleanCanonicalCheckout?: boolean; scopeCoverage?: unknown },
+	options?: { requireCleanCanonicalCheckout?: boolean; scopeCoverage?: unknown; stackPackageContentSha256?: string },
 ): Promise<ContextReleaseManifest> {
 	const packageRoot = path.resolve(import.meta.dir, "../..");
 	const repositoryRoot = await repo.root(packageRoot);
@@ -866,8 +1166,14 @@ export async function buildContextReleaseManifest(
 		}
 	}
 	const content = await assertTrackedManifestCurrent();
-	const candidateInput = candidateOverride ?? (await loadActivationCandidates());
+	const activation = candidateOverride ? undefined : await loadActivationState();
+	const candidateInput = candidateOverride ?? activation?.candidates;
 	const suppliedOmp = candidateInput?.find(candidate => candidate.repository === OMP_REPOSITORY);
+	const stackPackageContentSha256 = options?.stackPackageContentSha256 ?? activation?.stackPackageContentSha256;
+	if (!stackPackageContentSha256) {
+		throw new Error("PROMPT_POLICY_REVIEW_REQUIRED: missing approved Stack package content hash");
+	}
+	assertSha256(stackPackageContentSha256, "approved Stack package content hash");
 	const scopeCoverageInput = options?.scopeCoverage ?? suppliedOmp?.scopeCoverage;
 	if (!scopeCoverageInput) {
 		throw new Error("PROMPT_POLICY_REVIEW_REQUIRED: missing reviewed OMP scopeCoverage input");
@@ -893,6 +1199,7 @@ export async function buildContextReleaseManifest(
 		commit,
 		tree,
 		candidates,
+		stackPackageContentSha256,
 		contentManifest: content,
 		contentManifestRootSha256: content.rootSha256,
 		behaviorSha256: content.behaviorSha256,

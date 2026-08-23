@@ -9,6 +9,8 @@
 ### Fixed
 
 - Kept interactive turns usable when prompt-policy review rejects an extension hook; OMP now skips the protected hook, preserves the original turn data, and reports the review condition without stopping the harness.
+
+- Protected startup now verifies and executes the approved immutable Smarty Stack prompt guard; package, source, or produced-prompt drift shows a persistent interactive warning and fails headless prompt construction, while a package-private capability preserves OMP-owned internal prompt workflows without exposing a public bypass.
 - Fixed ordinary OMP startup exiting when stale Herdr bridge credentials were inherited without pane identity.
 
 ### Added

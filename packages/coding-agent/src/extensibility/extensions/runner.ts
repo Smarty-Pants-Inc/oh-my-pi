@@ -980,23 +980,32 @@ export class ExtensionRunner {
 
 	async getSystemPromptBuilder(): Promise<SystemPromptBuilder | undefined> {
 		const owners = this.extensions.filter(extension => extension.systemPromptBuilder);
-		if (!this.releaseManifest && owners.length > 1) {
-			throw new Error(`Multiple system prompt builders registered: ${owners.map(owner => owner.path).join(", ")}`);
+		if (!this.releaseManifest) {
+			if (owners.length > 1) {
+				throw new Error(
+					`Multiple system prompt builders registered: ${owners.map(owner => owner.path).join(", ")}`,
+				);
+			}
+			return owners[0]?.systemPromptBuilder;
+		}
+		if (owners.length === 0) {
+			throw new Error("PROMPT_POLICY_REVIEW_REQUIRED: an approved system prompt builder is required");
 		}
 		const approvedOwners: Extension[] = [];
 		for (const owner of owners) {
 			if (await this.#canRunProtectedHandler(owner, "system_prompt_builder")) approvedOwners.push(owner);
 		}
-		if (approvedOwners.length > 1) {
-			const owner = approvedOwners[0]!;
-			this.#reportPromptPolicyReview(
-				owner,
-				"system_prompt_builder",
-				new Error(
-					`PROMPT_POLICY_REVIEW_REQUIRED: multiple approved system prompt builders registered: ${approvedOwners.map(candidate => candidate.path).join(", ")}`,
-				),
+		if (approvedOwners.length !== owners.length) {
+			throw new Error(
+				"PROMPT_POLICY_REVIEW_REQUIRED: one or more configured system prompt builder sources are not approved",
 			);
-			return undefined;
+		}
+		if (approvedOwners.length > 1) {
+			const error = new Error(
+				`PROMPT_POLICY_REVIEW_REQUIRED: multiple approved system prompt builders registered: ${approvedOwners.map(candidate => candidate.path).join(", ")}`,
+			);
+			this.#reportPromptPolicyReview(approvedOwners[0]!, "system_prompt_builder", error);
+			throw error;
 		}
 		return approvedOwners[0]?.systemPromptBuilder;
 	}

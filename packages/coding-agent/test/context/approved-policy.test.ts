@@ -25,6 +25,7 @@ function validPolicy(): Record<string, unknown> {
 		schema: "smarty.approved_policy.v1",
 		approval: { reference: "owner-review-1", approvedBy: "paulbettner", approvedAt: "2026-08-15T12:00:00Z" },
 		candidates: [candidateIdentity()],
+		stackPackageContentSha256: "2".repeat(64),
 		contentManifestRootSha256: "c".repeat(64),
 		behaviorSha256: "d".repeat(64),
 		globalAgentsSha256: "e".repeat(64),
@@ -59,6 +60,7 @@ describe("approved policy", () => {
 		const parsed = parseApprovedPolicy(JSON.stringify(policy));
 		expect(parsed.rootSha256).toBe(String(policy.rootSha256));
 		expect(parsed.candidates).toEqual(policy.candidates as CandidateIdentity[]);
+		expect(parsed.stackPackageContentSha256).toBe("2".repeat(64));
 		const offsetPolicy: Record<string, unknown> = {
 			...policy,
 			approval: { ...(policy.approval as Record<string, unknown>), approvedAt: "2026-08-15T08:00:00-04:00" },
@@ -69,6 +71,13 @@ describe("approved policy", () => {
 			),
 		);
 		expect(parseApprovedPolicy(JSON.stringify(offsetPolicy)).approval.approvedAt).toEndWith("-04:00");
+		const malformedStackHash: Record<string, unknown> = { ...policy, stackPackageContentSha256: "not-a-hash" };
+		malformedStackHash.rootSha256 = sha256(
+			canonicalJson(
+				Object.fromEntries(Object.entries(malformedStackHash).filter(([key]) => key !== "rootSha256")) as JsonValue,
+			),
+		);
+		expect(() => parseApprovedPolicy(JSON.stringify(malformedStackHash))).toThrow("stackPackageContentSha256");
 		expect(() => parseApprovedPolicy(JSON.stringify({ ...policy, behaviorSha256: "0".repeat(64) }))).toThrow(
 			"rootSha256",
 		);
@@ -86,6 +95,7 @@ describe("approved policy", () => {
 			commit: "a".repeat(40),
 			tree: "b".repeat(40),
 			candidates: [candidateIdentity()],
+			stackPackageContentSha256: "2".repeat(64),
 			contentManifestRootSha256: "c".repeat(64),
 			behaviorSha256: "d".repeat(64),
 			globalAgentsSha256: "e".repeat(64),
@@ -98,6 +108,9 @@ describe("approved policy", () => {
 		);
 		expect(releaseProjectionMismatches({ ...current, behaviorSha256: "4".repeat(64) }, current)).toEqual([
 			`behaviorSha256: activated=${"4".repeat(64)} current=${"d".repeat(64)}`,
+		]);
+		expect(releaseProjectionMismatches({ ...current, stackPackageContentSha256: "3".repeat(64) }, current)).toEqual([
+			`stackPackageContentSha256: activated=${"3".repeat(64)} current=${"2".repeat(64)}`,
 		]);
 		const changedCoverage = {
 			...current,

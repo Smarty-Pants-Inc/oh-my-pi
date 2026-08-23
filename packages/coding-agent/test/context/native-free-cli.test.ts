@@ -61,6 +61,7 @@ async function writePolicyState(repositoryRoot: string, manifestModule: string):
 	const script = `
 		import { buildContextReleaseManifest } from ${JSON.stringify(manifestModule)};
 		const release = await buildContextReleaseManifest(${JSON.stringify(repositoryRoot)}, undefined, {
+			stackPackageContentSha256: "a".repeat(64),
 			scopeCoverage: ${JSON.stringify(fixtureScopeCoverage(repositoryRoot))},
 		});
 		process.stdout.write(JSON.stringify(release));

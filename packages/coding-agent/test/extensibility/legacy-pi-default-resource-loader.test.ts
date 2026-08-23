@@ -252,6 +252,8 @@ describe("createAgentSession({ resourceLoader }) (issue #4567)", () => {
 		// its own discovery inside the subagent and re-load the caller.
 		expect(forwarded.preloadedExtensions).toBeDefined();
 		expect(forwarded.preloadedExtensions?.extensions).toEqual([]);
+		expect(forwarded.disableExtensionDiscovery).toBe(true);
+		expect(forwarded.additionalExtensionPaths).toEqual([]);
 
 		// The loader's captured `noSkills` / `noPromptTemplates` /
 		// `noContextFiles` translate into empty arrays on the SDK options.
