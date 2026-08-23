@@ -53,6 +53,7 @@ import {
 	generateBranchSummary,
 	type ShakeConfig,
 } from "@oh-my-pi/pi-agent-core/compaction";
+import { invalidateMessageCache } from "@oh-my-pi/pi-agent-core/compaction/message-cache";
 import type {
 	AssistantMessage,
 	CodexCompactionContext,
@@ -163,6 +164,7 @@ import type {
 	ContextUsage,
 	QueuedPrompt,
 	QueuedPromptDelivery,
+	QueuedPromptMutationResult,
 	SendMessageDisposition,
 	SendMessageOptions,
 	SetQueuedPromptDeliveryResult,
@@ -350,11 +352,13 @@ import {
 import { ModelControls, type ModelControlsHost } from "./model-controls";
 import { isPrewalkPlanNudge, PrewalkCoordinator, type PrewalkCoordinatorHost } from "./prewalk";
 import {
+	IMAGE_ATTACHMENT_DESCRIPTION_TYPE,
 	isAdvisorCard,
 	isDisplayableQueuedMessage,
 	isHiddenUserCompanion,
 	isUserQueuedMessage,
 	queueChipText,
+	queuedImageCount,
 	toRestoredQueuedMessage,
 } from "./queued-messages";
 import type { ServingModel } from "./retry-fallback-chains";
@@ -834,6 +838,7 @@ export class AgentSession {
 	#currentTurnId: string | undefined;
 	#pendingAskReanswerOwner: ToolResultMessage | undefined;
 	#activeDirectUserContinuationOwner: AgentMessage | undefined;
+	#parkedDirectUserQueues: { steering: AgentMessage[]; followUp: AgentMessage[] } | undefined;
 	#desiredSteeringMode: "all" | "one-at-a-time";
 	#desiredFollowUpMode: "all" | "one-at-a-time";
 	#desiredInterruptMode: "immediate" | "wait";
@@ -4260,6 +4265,11 @@ export class AgentSession {
 		}
 		const block = queue ? this.#queuedOwnerBlock(queue === "steering" ? steering : followUp, ownerIndex) : [];
 		const blockMessages = new Set(block);
+		const parkedQueues = {
+			steering: steering.filter(message => !blockMessages.has(message)),
+			followUp: followUp.filter(message => !blockMessages.has(message)),
+		};
+		this.#parkedDirectUserQueues = parkedQueues;
 		this.#activeDirectUserContinuationOwner = owner;
 		this.#pendingAskReanswerOwner = undefined;
 		this.#syncAgentQueueModes();
@@ -4276,6 +4286,8 @@ export class AgentSession {
 			if (extraSteering.length === 0 && extraFollowUp.length === 0) return;
 			parkedArrivalSteering.push(...extraSteering);
 			parkedArrivalFollowUp.push(...extraFollowUp);
+			parkedQueues.steering.push(...extraSteering);
+			parkedQueues.followUp.push(...extraFollowUp);
 			this.agent.replaceQueues(
 				currentSteering.filter(message => blockMessages.has(message)),
 				currentFollowUp.filter(message => blockMessages.has(message)),
@@ -4307,6 +4319,7 @@ export class AgentSession {
 					true,
 				);
 			} finally {
+				if (this.#parkedDirectUserQueues === parkedQueues) this.#parkedDirectUserQueues = undefined;
 				if (this.#activeDirectUserContinuationOwner === owner) {
 					this.#activeDirectUserContinuationOwner = undefined;
 					this.#syncAgentQueueModes();
@@ -8803,6 +8816,12 @@ export class AgentSession {
 		const dequeueBarrier = this.agent.claimQueuedMessageMutation();
 		let releaseMutation: (() => void) | undefined;
 		try {
+			if (options?.forInterrupt) {
+				// A NOW continuation temporarily parks the other queues. Wait for its
+				// cancellation finalizer to restore them before taking the snapshot.
+				this.#queuedMessageDrainBlocked = true;
+				await this.abort({ reason: USER_INTERRUPT_LABEL });
+			}
 			releaseMutation = await this.#beginQueuedPromptMutation();
 			const steeringAll = [...this.agent.peekSteeringQueue()];
 			const followUpAll = [...this.agent.peekFollowUpQueue()];
@@ -8825,13 +8844,13 @@ export class AgentSession {
 					this.agent.peekSteeringQueue().filter(message => !removed.has(message)),
 					this.agent.peekFollowUpQueue().filter(message => !removed.has(message)),
 				);
-				this.#reconcileQueuedMessageDrain();
 			}
+			this.#reconcileQueuedMessageDrain();
 			return { steering, followUp };
 		} catch (error) {
 			if (options?.forInterrupt) {
 				if (this.agent.hasQueuedMessages()) this.#queuedMessageDrainBlocked = true;
-				// Abort before releasing the mutation claim so blocked dequeuers observe the signal first.
+				// Stop a dequeue that raced the failed persistence write before releasing its claim.
 				this.agent.abort(USER_INTERRUPT_LABEL);
 			}
 			throw error;
@@ -8842,10 +8861,38 @@ export class AgentSession {
 		}
 	}
 
+	#queuedMessageView(): { steering: readonly AgentMessage[]; followUp: readonly AgentMessage[] } {
+		const steering = this.agent.peekSteeringQueue();
+		const followUp = this.agent.peekFollowUpQueue();
+		const parked = this.#parkedDirectUserQueues;
+		if (!parked) return { steering, followUp };
+		const seen = new Set<AgentMessage>();
+		const merge = (current: readonly AgentMessage[], hidden: readonly AgentMessage[]): AgentMessage[] => {
+			const merged: AgentMessage[] = [];
+			for (const message of current) {
+				if (seen.has(message)) continue;
+				seen.add(message);
+				merged.push(message);
+			}
+			for (const message of hidden) {
+				if (seen.has(message)) continue;
+				seen.add(message);
+				merged.push(message);
+			}
+			return merged;
+		};
+		return {
+			steering: merge(steering, parked.steering),
+			followUp: merge(followUp, parked.followUp),
+		};
+	}
+
 	/** True when any message is waiting for this session. */
 	hasPendingMessages(): boolean {
+		const queued = this.#queuedMessageView();
 		return (
-			this.agent.hasQueuedMessages() ||
+			queued.steering.length > 0 ||
+			queued.followUp.length > 0 ||
 			this.#pendingNextTurnMessages.length > 0 ||
 			this.#pendingExplicitPromptMessages.length > 0
 		);
@@ -8853,9 +8900,10 @@ export class AgentSession {
 
 	/** Number of pending displayable messages for queue UI and RPC state. */
 	get queuedMessageCount(): number {
+		const queued = this.#queuedMessageView();
 		return (
-			this.agent.peekSteeringQueue().filter(isDisplayableQueuedMessage).length +
-			this.agent.peekFollowUpQueue().filter(isDisplayableQueuedMessage).length +
+			queued.steering.filter(isDisplayableQueuedMessage).length +
+			queued.followUp.filter(isDisplayableQueuedMessage).length +
 			this.#pendingNextTurnMessages.filter(isDisplayableQueuedMessage).length
 		);
 	}
@@ -8867,16 +8915,48 @@ export class AgentSession {
 		}
 		return id;
 	}
+	#locateQueuedPrompt(id: string): QueuedPromptLocation | undefined {
+		const queued = this.#queuedMessageView();
+		const steering = [...queued.steering];
+		const followUp = [...queued.followUp];
+		const steeringIndex = steering.findIndex(
+			message => isUserQueuedMessage(message) && this.#queuedPromptId(message) === id,
+		);
+		if (steeringIndex !== -1) {
+			return {
+				steering,
+				followUp,
+				source: "steer",
+				ownerIndex: steeringIndex,
+				owner: steering[steeringIndex]!,
+			};
+		}
+		const followUpIndex = followUp.findIndex(
+			message => isUserQueuedMessage(message) && this.#queuedPromptId(message) === id,
+		);
+		if (followUpIndex === -1) return undefined;
+		return {
+			steering,
+			followUp,
+			source: "afterCurrent",
+			ownerIndex: followUpIndex,
+			owner: followUp[followUpIndex]!,
+		};
+	}
+	#queuedPromptMutationUnavailable(): "session_transition" | "queue_mutation" | undefined {
+		if (this.#isDisposed || this.#lifecycleTransitionFenceActive || this.isCompacting) return "session_transition";
+		if (
+			this.#queuedPromptDeliveryMutationReservations > 0 ||
+			this.#queuedPromptDeliveryMutationInFlight ||
+			this.#activeDirectUserContinuationOwner
+		) {
+			return "queue_mutation";
+		}
+		return undefined;
+	}
 
 	#visibleQueuedPromptFingerprint(): string {
-		const parts: string[] = [];
-		for (const message of this.agent.peekSteeringQueue()) {
-			if (isUserQueuedMessage(message)) parts.push(`${this.#queuedPromptId(message)}:steer`);
-		}
-		for (const message of this.agent.peekFollowUpQueue()) {
-			if (isUserQueuedMessage(message)) parts.push(`${this.#queuedPromptId(message)}:afterCurrent`);
-		}
-		return parts.join("|");
+		return JSON.stringify(this.getQueuedPrompts());
 	}
 
 	#notifyQueuedPromptsChanged(): void {
@@ -8893,19 +8973,41 @@ export class AgentSession {
 	}
 
 	getQueuedPrompts(): readonly QueuedPrompt[] {
-		const queued: Array<{ message: AgentMessage; delivery: Exclude<QueuedPromptDelivery, "interrupt"> }> = [];
-		for (const message of this.agent.peekSteeringQueue()) {
-			if (isUserQueuedMessage(message)) queued.push({ message, delivery: "steer" });
+		const queued: Array<{
+			id: string;
+			message: AgentMessage;
+			delivery: Exclude<QueuedPromptDelivery, "interrupt">;
+		}> = [];
+		const queues = this.#queuedMessageView();
+		for (const message of queues.steering) {
+			if (isUserQueuedMessage(message))
+				queued.push({ id: this.#queuedPromptId(message), message, delivery: "steer" });
 		}
-		for (const message of this.agent.peekFollowUpQueue()) {
-			if (isUserQueuedMessage(message)) queued.push({ message, delivery: "afterCurrent" });
+		for (const message of queues.followUp) {
+			if (isUserQueuedMessage(message)) {
+				queued.push({ id: this.#queuedPromptId(message), message, delivery: "afterCurrent" });
+			}
 		}
-		queued.sort((left, right) => left.message.timestamp - right.message.timestamp);
-		return queued.map(({ message, delivery }) => ({
-			id: this.#queuedPromptId(message),
-			text: queueChipText(message),
-			delivery,
-		}));
+		queued.sort((left, right) => left.message.timestamp - right.message.timestamp || left.id.localeCompare(right.id));
+		return queued.map(({ id, message, delivery }) => {
+			const imageCount = queuedImageCount(message);
+			return {
+				id,
+				text: queueChipText(message),
+				delivery,
+				...(imageCount > 0 ? { imageCount } : {}),
+				...(message.role === "custom" ? { customType: message.customType } : {}),
+			};
+		});
+	}
+
+	getQueuedPromptTimestamp(id: string): number | undefined {
+		return this.#locateQueuedPrompt(id)?.owner.timestamp;
+	}
+
+	getQueuedPromptDraft(id: string): RestoredQueuedMessage | undefined {
+		const location = this.#locateQueuedPrompt(id);
+		return location ? toRestoredQueuedMessage(location.owner) : undefined;
 	}
 
 	onQueuedPromptsChanged(listener: () => void): () => void {
@@ -8915,40 +9017,8 @@ export class AgentSession {
 	}
 
 	async setQueuedPromptDelivery(id: string, delivery: QueuedPromptDelivery): Promise<SetQueuedPromptDeliveryResult> {
-		if (this.#isDisposed || this.#lifecycleTransitionFenceActive) {
-			return { status: "unavailable", reason: "session_transition" };
-		}
-		if (this.#queuedPromptDeliveryMutationReservations > 0 || this.#queuedPromptDeliveryMutationInFlight) {
-			return { status: "unavailable", reason: "queue_mutation" };
-		}
-
-		const locate = (): QueuedPromptLocation | undefined => {
-			const steering = [...this.agent.peekSteeringQueue()];
-			const followUp = [...this.agent.peekFollowUpQueue()];
-			const steeringIndex = steering.findIndex(
-				message => isUserQueuedMessage(message) && this.#queuedPromptId(message) === id,
-			);
-			if (steeringIndex !== -1) {
-				return {
-					steering,
-					followUp,
-					source: "steer" as const,
-					ownerIndex: steeringIndex,
-					owner: steering[steeringIndex]!,
-				};
-			}
-			const followUpIndex = followUp.findIndex(
-				message => isUserQueuedMessage(message) && this.#queuedPromptId(message) === id,
-			);
-			if (followUpIndex === -1) return undefined;
-			return {
-				steering,
-				followUp,
-				source: "afterCurrent" as const,
-				ownerIndex: followUpIndex,
-				owner: followUp[followUpIndex]!,
-			};
-		};
+		const unavailable = this.#queuedPromptMutationUnavailable();
+		if (unavailable) return { status: "unavailable", reason: unavailable };
 
 		const applyDeliverySideEffects = (): void => {
 			if (delivery === "interrupt") {
@@ -8984,11 +9054,13 @@ export class AgentSession {
 			if (applySideEffects) applyDeliverySideEffects();
 		};
 
-		if (this.#activeDirectUserContinuationOwner) {
-			return { status: "unavailable", reason: "queue_mutation" };
-		}
-		const initial = locate();
+		const initial = this.#locateQueuedPrompt(id);
 		if (!initial) return { status: "stale" };
+		if (delivery === "interrupt") {
+			if (!this.isStreaming) return { status: "unavailable", reason: "no_active_turn" };
+			move(initial);
+			return { status: "updated" };
+		}
 		if (delivery === initial.source) return { status: "updated" };
 
 		const pendingId =
@@ -9039,7 +9111,7 @@ export class AgentSession {
 						);
 					}
 				}
-				if (!claim.isCurrent() && locate()?.owner !== durableOwner) {
+				if (!claim.isCurrent() && this.#locateQueuedPrompt(id)?.owner !== durableOwner) {
 					await this.#cancelPendingSemanticDelivery(pendingId);
 					return { status: "stale" };
 				}
@@ -9048,14 +9120,14 @@ export class AgentSession {
 
 			this.#pendingSemanticDeliveryIds.delete(pendingId);
 			this.#pendingSemanticDeliveryIds.add(replacementPendingId);
-			const current = locate();
+			const current = this.#locateQueuedPrompt(id);
 			if (current?.owner !== durableOwner) {
 				await this.#cancelPendingSemanticDelivery(replacementPendingId);
 				return { status: "stale" };
 			}
 			durableOwner.details = this.#withPendingSemanticDeliveryId(persistedOwner, replacementPendingId).details;
 			move(current, false);
-			const moved = locate();
+			const moved = this.#locateQueuedPrompt(id);
 			const expectedSource = targetKind === "followUp" ? "afterCurrent" : "steer";
 			if (moved?.owner !== durableOwner || moved.source !== expectedSource) {
 				throw new Error("Queued prompt moved unexpectedly during its durable retime commit");
@@ -9068,19 +9140,211 @@ export class AgentSession {
 			acceptance.release();
 		}
 	}
+	async updateQueuedPromptText(
+		id: string,
+		text: string,
+		replacementImages?: readonly ImageContent[],
+		preparedCustomMessage?: Pick<CustomMessage, "customType" | "content" | "display" | "details" | "attribution">,
+	): Promise<QueuedPromptMutationResult> {
+		const unavailable = this.#queuedPromptMutationUnavailable();
+		if (unavailable) return { status: "unavailable", reason: unavailable };
+		const releaseReservation = this.#reserveQueuedPromptMutation();
+		const dequeueBarrier = this.agent.claimQueuedMessageMutation();
+		let releaseMutation: (() => void) | undefined;
+		try {
+			try {
+				releaseMutation = await this.#beginQueuedPromptMutation();
+			} catch (error) {
+				if (error instanceof AgentBusyError) return { status: "unavailable", reason: "session_transition" };
+				throw error;
+			}
+			const initial = this.#locateQueuedPrompt(id);
+			if (!initial) return { status: "stale" };
+			const { owner, source } = initial;
+			const originalImages = toRestoredQueuedMessage(owner).images ?? [];
+			const requestedImages = replacementImages ? [...replacementImages] : originalImages;
+			const imagesChanged =
+				replacementImages !== undefined &&
+				(originalImages.length !== requestedImages.length ||
+					originalImages.some(
+						(image, index) =>
+							image !== requestedImages[index] ||
+							image.data !== requestedImages[index]?.data ||
+							image.mimeType !== requestedImages[index]?.mimeType,
+					));
+			const images = imagesChanged
+				? ((await this.#normalizeImagesForModel(requestedImages)) ?? [])
+				: requestedImages;
+			const sourceQueue = source === "steer" ? initial.steering : initial.followUp;
+			const initialCompanions = this.#queuedOwnerBlock(sourceQueue, initial.ownerIndex).slice(0, -1);
+			let replacementCompanions = initialCompanions;
+			if (imagesChanged) {
+				replacementCompanions = initialCompanions.filter(
+					message => message.role !== "custom" || message.customType !== IMAGE_ATTACHMENT_DESCRIPTION_TYPE,
+				);
+				const imageDescription = images.length > 0 ? await this.#buildImageDescriptionNotice(images) : undefined;
+				if (imageDescription) replacementCompanions = [...replacementCompanions, imageDescription];
+			}
 
-	getQueuedMessages(): { steering: readonly string[]; followUp: readonly string[] } {
-		return {
-			steering: this.agent.peekSteeringQueue().filter(isUserQueuedMessage).map(queueChipText),
-			followUp: this.agent.peekFollowUpQueue().filter(isUserQueuedMessage).map(queueChipText),
-		};
+			let replacement: AgentMessage;
+			if (preparedCustomMessage) {
+				const nonImageContent =
+					typeof preparedCustomMessage.content === "string"
+						? preparedCustomMessage.content
+						: preparedCustomMessage.content.filter(part => part.type !== "image");
+				const content =
+					images.length === 0
+						? nonImageContent
+						: typeof nonImageContent === "string"
+							? [{ type: "text" as const, text: nonImageContent }, ...images]
+							: [...nonImageContent, ...images];
+				const custom: CustomMessage = {
+					role: "custom",
+					...preparedCustomMessage,
+					content,
+					details: withInternalDetailsField(preparedCustomMessage.details, "__queueChipText", text),
+					attribution: "user",
+					timestamp: owner.timestamp,
+				};
+				replacement = withCollabPromptSteering(custom, source === "steer");
+			} else if (owner.role === "custom" && owner.customType !== SKILL_PROMPT_MESSAGE_TYPE) {
+				const content = images.length > 0 ? [{ type: "text" as const, text }, ...images] : text;
+				replacement = withCollabPromptSteering(
+					{
+						...owner,
+						content,
+						details: withInternalDetailsField(owner.details, "__queueChipText", text),
+						timestamp: owner.timestamp,
+					},
+					source === "steer",
+				);
+			} else {
+				replacement = {
+					role: "user",
+					content: [{ type: "text", text }, ...images],
+					attribution: "user",
+					timestamp: owner.timestamp,
+					...(source === "steer" ? { steering: true } : {}),
+				};
+			}
+
+			const pendingId = this.#queuedPendingSemanticDeliveryId(owner);
+			let replacementPendingId: string | undefined;
+			if (pendingId && replacement.role === "custom") {
+				const durableReplacement = replacement;
+				const kind: PendingSemanticDeliveryKind = source === "steer" ? "steer" : "followUp";
+				try {
+					replacementPendingId = await this.sessionManager.appendEntriesAtomically(() => {
+						const data: PendingSemanticDeliveryData = {
+							v: 1,
+							kind,
+							message: {
+								...durableReplacement,
+								details: stripInternalDetailsFields(durableReplacement.details),
+							},
+						};
+						const nextId = this.sessionManager.appendCustomEntry(PENDING_SEMANTIC_DELIVERY_TYPE, data);
+						this.#appendPendingSemanticDeliverySettlement(pendingId, "cancelled");
+						return nextId;
+					});
+				} catch (error) {
+					if (error instanceof SessionPersistenceIndeterminateError) {
+						try {
+							await this.sessionManager.recoverPersistenceFromCurrentState();
+						} catch (recoveryError) {
+							throw new AggregateError(
+								[error, recoveryError],
+								"Queued prompt edit persistence is indeterminate; the prompt remains unchanged.",
+							);
+						}
+					}
+					throw error;
+				}
+				this.#pendingSemanticDeliveryIds.delete(pendingId);
+				this.#pendingSemanticDeliveryIds.add(replacementPendingId);
+				replacement = this.#withPendingSemanticDeliveryId(replacement, replacementPendingId);
+			} else if (pendingId) {
+				await this.#cancelPendingSemanticDelivery(pendingId);
+			}
+
+			const current = this.#locateQueuedPrompt(id);
+			if (current?.owner !== owner) {
+				if (replacementPendingId) await this.#cancelPendingSemanticDelivery(replacementPendingId);
+				return { status: "stale" };
+			}
+			const currentQueue = current.source === "steer" ? current.steering : current.followUp;
+			const currentBlock = this.#queuedOwnerBlock(currentQueue, current.ownerIndex);
+			for (const key of Object.keys(owner)) Reflect.deleteProperty(owner, key);
+			Object.assign(owner, replacement);
+			invalidateMessageCache(owner);
+			if (imagesChanged) {
+				const blockStart = current.ownerIndex - currentBlock.length + 1;
+				const nextSourceQueue = [
+					...currentQueue.slice(0, blockStart),
+					...replacementCompanions,
+					owner,
+					...currentQueue.slice(current.ownerIndex + 1),
+				];
+				this.agent.replaceQueues(
+					current.source === "steer" ? nextSourceQueue : current.steering,
+					current.source === "afterCurrent" ? nextSourceQueue : current.followUp,
+					true,
+				);
+			}
+			this.#notifyQueuedPromptsChanged();
+			return { status: "updated" };
+		} finally {
+			releaseMutation?.();
+			releaseReservation();
+			dequeueBarrier.release();
+		}
 	}
 
-	#lastQueuedUserIndex(queue: readonly AgentMessage[]): number {
-		for (let index = queue.length - 1; index >= 0; index--) {
-			if (isUserQueuedMessage(queue[index])) return index;
+	async removeQueuedPrompt(id: string): Promise<QueuedPromptMutationResult> {
+		const unavailable = this.#queuedPromptMutationUnavailable();
+		if (unavailable) return { status: "unavailable", reason: unavailable };
+		const releaseReservation = this.#reserveQueuedPromptMutation();
+		const dequeueBarrier = this.agent.claimQueuedMessageMutation();
+		let releaseMutation: (() => void) | undefined;
+		try {
+			try {
+				releaseMutation = await this.#beginQueuedPromptMutation();
+			} catch (error) {
+				if (error instanceof AgentBusyError) return { status: "unavailable", reason: "session_transition" };
+				throw error;
+			}
+			const location = this.#locateQueuedPrompt(id);
+			if (!location) return { status: "stale" };
+			const queue = location.source === "steer" ? location.steering : location.followUp;
+			const block = this.#queuedOwnerBlock(queue, location.ownerIndex);
+			await this.#cancelPendingSemanticDeliveryIds(
+				block.flatMap(message => {
+					const pendingId = this.#queuedPendingSemanticDeliveryId(message);
+					return pendingId ? [pendingId] : [];
+				}),
+			);
+			const current = this.#locateQueuedPrompt(id);
+			if (current?.owner !== location.owner) return { status: "stale" };
+			const removed = new Set(block);
+			this.agent.replaceQueues(
+				this.agent.peekSteeringQueue().filter(message => !removed.has(message)),
+				this.agent.peekFollowUpQueue().filter(message => !removed.has(message)),
+			);
+			this.#reconcileQueuedMessageDrain();
+			return { status: "updated" };
+		} finally {
+			releaseMutation?.();
+			releaseReservation();
+			dequeueBarrier.release();
 		}
-		return -1;
+	}
+
+	getQueuedMessages(): { steering: readonly string[]; followUp: readonly string[] } {
+		const queued = this.#queuedMessageView();
+		return {
+			steering: queued.steering.filter(isUserQueuedMessage).map(queueChipText),
+			followUp: queued.followUp.filter(isUserQueuedMessage).map(queueChipText),
+		};
 	}
 
 	#queuedOwnerBlock(queue: readonly AgentMessage[], ownerIndex: number): AgentMessage[] {
@@ -9088,20 +9352,35 @@ export class AgentSession {
 		while (start > 0 && isHiddenUserCompanion(queue[start - 1])) start--;
 		return queue.slice(start, ownerIndex + 1);
 	}
+	#newestQueuedUser(
+		steering: AgentMessage[],
+		followUp: AgentMessage[],
+	): { queue: AgentMessage[]; ownerIndex: number } | undefined {
+		let newest: { queue: AgentMessage[]; ownerIndex: number; owner: AgentMessage } | undefined;
+		for (const queue of [steering, followUp]) {
+			for (let ownerIndex = 0; ownerIndex < queue.length; ownerIndex++) {
+				const owner = queue[ownerIndex]!;
+				if (!isUserQueuedMessage(owner)) continue;
+				if (
+					!newest ||
+					owner.timestamp > newest.owner.timestamp ||
+					(owner.timestamp === newest.owner.timestamp &&
+						this.#queuedPromptId(owner) > this.#queuedPromptId(newest.owner))
+				) {
+					newest = { queue, ownerIndex, owner };
+				}
+			}
+		}
+		return newest ? { queue: newest.queue, ownerIndex: newest.ownerIndex } : undefined;
+	}
 
-	/**
-	 * Pop the last queued message (steering first, then follow-up).
-	 * Used by dequeue keybinding to restore messages to editor one at a time.
-	 * Steps over agent-authored queued messages (advisor cards, hidden/internal steers).
-	 */
+	/** Pop the newest queued user prompt and its contiguous hidden companions. */
 	popLastQueuedMessage(): RestoredQueuedMessage | undefined {
 		const steering = [...this.agent.peekSteeringQueue()];
 		const followUp = [...this.agent.peekFollowUpQueue()];
-		const fromSteer = this.#lastQueuedUserIndex(steering);
-		const fromFollowUp = fromSteer < 0 ? this.#lastQueuedUserIndex(followUp) : -1;
-		const queue = fromSteer >= 0 ? steering : followUp;
-		const ownerIndex = fromSteer >= 0 ? fromSteer : fromFollowUp;
-		if (ownerIndex < 0) return undefined;
+		const newest = this.#newestQueuedUser(steering, followUp);
+		if (!newest) return undefined;
+		const { queue, ownerIndex } = newest;
 		const owner = queue[ownerIndex]!;
 		const block = this.#queuedOwnerBlock(queue, ownerIndex);
 		this.#assertSynchronousQueueRemovalAllowed(block);
@@ -9111,7 +9390,8 @@ export class AgentSession {
 			followUp.filter(message => !removed.has(message)),
 		);
 		this.#reconcileQueuedMessageDrain();
-		return toRestoredQueuedMessage(owner);
+		const restored = toRestoredQueuedMessage(owner);
+		return owner.role === "custom" ? { ...restored, customType: owner.customType } : restored;
 	}
 
 	async popLastQueuedMessageDurably(): Promise<RestoredQueuedMessage | undefined> {
@@ -9122,11 +9402,9 @@ export class AgentSession {
 			releaseMutation = await this.#beginQueuedPromptMutation();
 			const steering = [...this.agent.peekSteeringQueue()];
 			const followUp = [...this.agent.peekFollowUpQueue()];
-			const fromSteer = this.#lastQueuedUserIndex(steering);
-			const fromFollowUp = fromSteer < 0 ? this.#lastQueuedUserIndex(followUp) : -1;
-			const queue = fromSteer >= 0 ? steering : followUp;
-			const ownerIndex = fromSteer >= 0 ? fromSteer : fromFollowUp;
-			if (ownerIndex < 0) return undefined;
+			const newest = this.#newestQueuedUser(steering, followUp);
+			if (!newest) return undefined;
+			const { queue, ownerIndex } = newest;
 			const owner = queue[ownerIndex]!;
 			const block = this.#queuedOwnerBlock(queue, ownerIndex);
 			await this.#cancelPendingSemanticDeliveryIds(
@@ -9141,7 +9419,8 @@ export class AgentSession {
 				this.agent.peekFollowUpQueue().filter(message => !removed.has(message)),
 			);
 			this.#reconcileQueuedMessageDrain();
-			return toRestoredQueuedMessage(owner);
+			const restored = toRestoredQueuedMessage(owner);
+			return owner.role === "custom" ? { ...restored, customType: owner.customType } : restored;
 		} finally {
 			releaseMutation?.();
 			releaseReservation();

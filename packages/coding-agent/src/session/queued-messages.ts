@@ -23,6 +23,10 @@ function queuedImageContent(message: AgentMessage): ImageContent[] | undefined {
 	}
 	return images.length > 0 ? images : undefined;
 }
+/** Number of images owned by a queued user prompt. */
+export function queuedImageCount(message: AgentMessage): number {
+	return queuedImageContent(message)?.length ?? 0;
+}
 
 /** Whether a queued message should render in the queue UI. */
 export function isDisplayableQueuedMessage(message: AgentMessage): boolean {
@@ -93,7 +97,11 @@ export function queueChipText(message: AgentMessage): string {
 	return queuedImageContent(message) ? "[Image]" : "";
 }
 
-/** Converts a queued user message to editor-restorable content. */
+/** Converts a queued user message to exact editor-restorable content. */
 export function toRestoredQueuedMessage(message: AgentMessage): RestoredQueuedMessage {
-	return { text: queueChipText(message), images: queuedImageContent(message) };
+	const text =
+		message.role === "custom"
+			? (readQueueChipText(message.details) ?? queuedTextContent(message) ?? "")
+			: (queuedTextContent(message) ?? "");
+	return { text, images: queuedImageContent(message) };
 }

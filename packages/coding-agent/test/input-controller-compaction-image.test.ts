@@ -49,7 +49,8 @@ function makeCtx(initialQueue: CompactionQueuedMessage[] = []) {
 			steering: [] as RestoredQueuedMessage[],
 			followUp: [] as RestoredQueuedMessage[],
 		}),
-		abort: mock(async () => {}),
+		popLastQueuedMessageDurably: mock(async (): Promise<RestoredQueuedMessage | undefined> => undefined),
+		abort: mock(async (_options?: { reason?: string }) => {}),
 		prompt: mock(async (text: string, opts?: PromptOpts): Promise<void> => {
 			promptCalls.push({ text, opts });
 		}),
@@ -84,6 +85,7 @@ function makeCtx(initialQueue: CompactionQueuedMessage[] = []) {
 			pendingImageLinks: [] as (string | undefined)[],
 		},
 		keybindings: { getDisplayString: () => "Alt+Up" },
+		ui: { requestRender: () => {} },
 		fileSlashCommands: new Set<string>(),
 		locallySubmittedUserSignatures: new Set<string>(),
 		isKnownSlashCommand: (text: string) => text.startsWith("/"),
@@ -112,7 +114,13 @@ describe("compaction queue image forwarding", () => {
 		new UiHelpers(ctx).queueCompactionMessage("look at this screenshot", "steer", [image]);
 
 		expect(ctx.compactionQueuedMessages).toEqual([
-			{ text: "look at this screenshot", mode: "steer", images: [image] },
+			{
+				id: expect.any(String),
+				timestamp: expect.any(Number),
+				text: "look at this screenshot",
+				mode: "steer",
+				images: [image],
+			},
 		]);
 		// Pending state is consumed so the next message does not resend the image.
 		expect(ctx.editor.pendingImages).toEqual([]);
@@ -123,7 +131,32 @@ describe("compaction queue image forwarding", () => {
 	test("empty image list is normalized to undefined on the queued entry", () => {
 		const { ctx } = makeCtx();
 		new UiHelpers(ctx).queueCompactionMessage("no images here", "followUp", []);
-		expect(ctx.compactionQueuedMessages).toEqual([{ text: "no images here", mode: "followUp", images: undefined }]);
+		expect(ctx.compactionQueuedMessages).toEqual([
+			{
+				id: expect.any(String),
+				timestamp: expect.any(Number),
+				text: "no images here",
+				mode: "followUp",
+				images: undefined,
+			},
+		]);
+	});
+
+	test("stamps yield-queue prompts created during compaction for chronological merging", async () => {
+		const { ctx, session } = makeCtx();
+		session.isCompacting = true;
+
+		await new InputController(ctx).handleQueueCommand("queued during compaction");
+
+		expect(ctx.compactionQueuedMessages).toEqual([
+			{
+				id: expect.any(String),
+				timestamp: expect.any(Number),
+				text: "queued during compaction",
+				mode: "followUp",
+				images: undefined,
+			},
+		]);
 	});
 
 	test("flush forwards the first queued prompt's images via session.prompt", async () => {
@@ -166,18 +199,42 @@ describe("compaction queue Alt+Up restore", () => {
 		expect(ctx.editor.pendingImages).toEqual([image]);
 	});
 
-	test("session and compaction queues restore in pending-bar order", async () => {
+	test("restores one newest compaction prompt before session queues", async () => {
 		const { ctx, session } = makeCtx([
 			{ text: "compaction steer", mode: "steer", images: undefined },
 			{ text: "compaction followup", mode: "followUp", images: undefined },
 		]);
-		session.clearQueueDurably = async () => ({
-			steering: [{ text: "session steer" }],
-			followUp: [{ text: "session followup" }],
-		});
-		const restored = await new InputController(ctx).restoreQueuedMessagesToEditor();
-		expect(restored).toBe(4);
-		expect(ctx.editor.getText()).toBe("session steer\n\ncompaction steer\n\nsession followup\n\ncompaction followup");
+		const popLastQueuedMessageDurably = mock(async () => ({ text: "session newest" }));
+		session.popLastQueuedMessageDurably = popLastQueuedMessageDurably;
+
+		expect(await new InputController(ctx).restoreQueuedMessagesToEditor()).toBe(1);
+		expect(ctx.editor.getText()).toBe("compaction followup");
+		expect(popLastQueuedMessageDurably).not.toHaveBeenCalled();
+		expect(ctx.compactionQueuedMessages).toEqual([{ text: "compaction steer", mode: "steer", images: undefined }]);
+
+		expect(await new InputController(ctx).restoreQueuedMessagesToEditor()).toBe(1);
+		expect(ctx.editor.getText()).toBe("compaction steer\n\ncompaction followup");
+		expect(popLastQueuedMessageDurably).not.toHaveBeenCalled();
+
+		expect(await new InputController(ctx).restoreQueuedMessagesToEditor()).toBe(1);
+		expect(ctx.editor.getText()).toBe("session newest\n\ncompaction steer\n\ncompaction followup");
+		expect(popLastQueuedMessageDurably).toHaveBeenCalledTimes(1);
+	});
+	test("restores a newer session prompt before an older compaction-local prompt", async () => {
+		const queued = { id: "local", timestamp: 10, text: "local older", mode: "steer" as const };
+		const { ctx, session } = makeCtx([queued]);
+		const target = session as unknown as {
+			getQueuedPrompts: () => Array<{ id: string; text: string; delivery: "steer" }>;
+			getQueuedPromptTimestamp: (id: string) => number | undefined;
+			popLastQueuedMessageDurably: () => Promise<RestoredQueuedMessage | undefined>;
+		};
+		target.getQueuedPrompts = () => [{ id: "core", text: "core newer", delivery: "steer" }];
+		target.getQueuedPromptTimestamp = id => (id === "core" ? 20 : undefined);
+		target.popLastQueuedMessageDurably = mock(async () => ({ text: "core newer" }));
+
+		expect(await new InputController(ctx).restoreQueuedMessagesToEditor()).toBe(1);
+		expect(ctx.editor.getText()).toBe("core newer");
+		expect(ctx.compactionQueuedMessages).toEqual([queued]);
 	});
 
 	test("keeps compaction input when durable queue clearing fails", async () => {
@@ -186,6 +243,7 @@ describe("compaction queue Alt+Up restore", () => {
 		const showError = mock(() => {});
 		ctx.showError = showError;
 		session.clearQueueDurably = async () => {
+			await session.abort({ reason: "Interrupted by user" });
 			throw new Error("disk unavailable");
 		};
 
@@ -194,6 +252,7 @@ describe("compaction queue Alt+Up restore", () => {
 		expect(ctx.editor.getText()).toBe("");
 		expect(showError).toHaveBeenCalledWith("Failed to restore queued messages: disk unavailable");
 		expect(session.abort).toHaveBeenCalledWith({ reason: "Interrupted by user" });
+		expect(session.abort).toHaveBeenCalledTimes(1);
 	});
 });
 
@@ -228,8 +287,10 @@ describe("restoreQueuedMessagesToEditor image marker alignment", () => {
 			pendingImages: opts.draftImages ? [...opts.draftImages] : ([] as ImageContent[]),
 			pendingImageLinks: opts.draftImages ? opts.draftImages.map(() => undefined) : ([] as (string | undefined)[]),
 		};
+		const queued = [...(opts.queued ?? [])];
 		const session = {
-			clearQueueDurably: mock(async () => ({ steering: opts.queued ?? [], followUp: [] })),
+			popLastQueuedMessageDurably: mock(async () => queued.pop()),
+			clearQueueDurably: mock(async () => ({ steering: queued, followUp: [] })),
 			abort: mock(async () => {}),
 		};
 		const ctx = {
@@ -238,6 +299,8 @@ describe("restoreQueuedMessagesToEditor image marker alignment", () => {
 			compactionQueuedMessages: [],
 			locallySubmittedUserSignatures: new Set<string>(),
 			updatePendingMessagesDisplay: () => {},
+			showError: () => {},
+			showWarning: () => {},
 		} as unknown as InteractiveModeContext;
 		return { ctx, editor };
 	}
@@ -292,10 +355,14 @@ describe("restoreQueuedMessagesToEditor image marker alignment", () => {
 		});
 
 		await new InputController(ctx).restoreQueuedMessagesToEditor();
+		expect(editor.getText()).toBe("second [Image #2] and [Image #3]\n\nsee [Image #1]");
 
-		// msg1 markers shift by 1 (draft images), msg2 markers shift by 1+1=2.
-		expect(editor.getText()).toBe("first [Image #2]\n\nsecond [Image #3] and [Image #4]\n\nsee [Image #1]");
-		expect(ctx.editor.pendingImages).toEqual([draftImg, queued1, queued2a, queued2b]);
+		await new InputController(ctx).restoreQueuedMessagesToEditor();
+
+		// Each Alt+Up restores one newest prompt. Earlier text is prepended while
+		// image slots stay append-only, so its marker moves past the current buffer.
+		expect(editor.getText()).toBe("first [Image #4]\n\nsecond [Image #2] and [Image #3]\n\nsee [Image #1]");
+		expect(ctx.editor.pendingImages).toEqual([draftImg, queued2a, queued2b, queued1]);
 	});
 
 	test("leaves the queued text untouched when the draft has no pending images", async () => {
