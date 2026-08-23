@@ -1,13 +1,17 @@
-import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { SegmentContext } from "@oh-my-pi/pi-coding-agent/modes/components/status-line/segments";
 import { renderSegment } from "@oh-my-pi/pi-coding-agent/modes/components/status-line/segments";
 import { initTheme, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { TERMINAL } from "@oh-my-pi/pi-tui";
 import { getProjectDir, pathIsWithin, removeSyncWithRetries, setProjectDir } from "@oh-my-pi/pi-utils";
 
 const originalProjectDir = getProjectDir();
+const originalPiNoHyperlinks = Bun.env.PI_NO_HYPERLINKS;
+const originalTerminalHyperlinks = TERMINAL.hyperlinks;
 const SCRATCH_ROOT_PREFIXES: readonly string[] = [
 	os.tmpdir(),
 	path.join(os.homedir(), "tmp"),
@@ -17,7 +21,21 @@ const SCRATCH_ROOT_PREFIXES: readonly string[] = [
 	"/private/var/tmp",
 ];
 beforeAll(async () => {
+	resetSettingsForTest();
+	delete Bun.env.PI_NO_HYPERLINKS;
+	await Settings.init({ inMemory: true });
+	settings.override("tui.hyperlinks", "off");
 	await initTheme();
+});
+
+afterAll(() => {
+	resetSettingsForTest();
+	TERMINAL.hyperlinks = originalTerminalHyperlinks;
+	if (originalPiNoHyperlinks === undefined) {
+		delete Bun.env.PI_NO_HYPERLINKS;
+	} else {
+		Bun.env.PI_NO_HYPERLINKS = originalPiNoHyperlinks;
+	}
 });
 
 function createPathContext(): SegmentContext {
@@ -77,6 +95,7 @@ function createPathContext(): SegmentContext {
 
 afterEach(() => {
 	vi.restoreAllMocks();
+	settings.override("tui.hyperlinks", "off");
 	setProjectDir(originalProjectDir);
 });
 
@@ -110,6 +129,13 @@ function createFakeHome(): { home: string; projectsRoot: string } {
 }
 
 describe("status line path segment", () => {
+	it("does not advertise the project directory as a clickable file", () => {
+		settings.override("tui.hyperlinks", "always");
+		const rendered = renderSegment("path", createPathContext());
+		expect(rendered.visible).toBe(true);
+		expect(rendered.content).not.toContain("\x1b]8;");
+	});
+
 	it.skipIf(CHECKOUT_IS_SCRATCH)("strips the Projects root for symlink-equivalent aliases", () => {
 		if (process.platform === "win32") return;
 
@@ -272,6 +298,12 @@ describe("status line path segment in a linked worktree", () => {
 		ctx.git = { branch, status: null, pr: null };
 		return ctx;
 	}
+	it("does not advertise a linked worktree directory as a clickable file", () => {
+		settings.override("tui.hyperlinks", "always");
+		const rendered = renderSegment("path", worktreeContext({ projectName: "pi", worktreeName: "xx" }, "xx"));
+		expect(rendered.visible).toBe(true);
+		expect(rendered.content).not.toContain("\x1b]8;");
+	});
 
 	it("collapses to the project name and drops the worktree dir when it equals the branch", () => {
 		const rendered = renderSegment("path", worktreeContext({ projectName: "pi", worktreeName: "xx" }, "xx"));

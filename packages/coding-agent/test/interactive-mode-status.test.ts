@@ -1,10 +1,11 @@
 import { beforeAll, describe, expect, test, vi } from "bun:test";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { InteractiveModeContext, RenderSessionContextOptions } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { UiHelpers } from "@oh-my-pi/pi-coding-agent/modes/utils/ui-helpers";
 import { buildSessionContext, type SessionContext } from "@oh-my-pi/pi-coding-agent/session/session-context";
+import { BUILTIN_COLLABORATION_SLASH_COMMANDS } from "@oh-my-pi/pi-coding-agent/slash-commands/builtin-collaboration";
 import { type Component, Container } from "@oh-my-pi/pi-tui";
 
 function renderLastLine(container: Container, width = 120): string {
@@ -46,6 +47,8 @@ function createInitialRenderHarness(): { ctx: InteractiveModeContext; helpers: U
 			renderChunk?: () => void,
 		) => helpers.renderSessionContextIncrementally(context, options, renderChunk),
 		addMessageToChat: (message: AgentMessage) => helpers.addMessageToChat(message),
+		showStatus: (message: string, options?: { dim?: boolean }, rebuild?: () => string) =>
+			helpers.showStatus(message, options, rebuild),
 		settings: { get: () => false },
 		session: {
 			retryAttempt: 0,
@@ -126,6 +129,44 @@ describe("InteractiveMode.showStatus", () => {
 		// adds spacer + text
 		expect(ctx.chatContainer.children).toHaveLength(5);
 		expect(renderLastLine(ctx.chatContainer)).toContain("STATUS_TWO");
+	});
+
+	test("rebuilds stored /collab status links when hyperlink mode changes", async () => {
+		const command = BUILTIN_COLLABORATION_SLASH_COMMANDS.find(candidate => candidate.name === "collab");
+		if (!command?.handleTui) throw new Error("Expected /collab TUI handler");
+
+		const previousNoHyperlinks = Bun.env.PI_NO_HYPERLINKS;
+		const { ctx } = createInitialRenderHarness();
+		const webLink = "https://collab.example/session";
+		ctx.editor = { setText: vi.fn() } as unknown as InteractiveModeContext["editor"];
+		ctx.collabHost = {
+			webLink,
+			participants: [{ name: "Paul", role: "host" }],
+		} as unknown as NonNullable<InteractiveModeContext["collabHost"]>;
+
+		try {
+			delete Bun.env.PI_NO_HYPERLINKS;
+			settings.override("tui.hyperlinks", "always");
+			await command.handleTui({ name: "collab", args: "status", text: "/collab status" }, { ctx });
+			// Keep the collab status in transcript history rather than as the active tail status.
+			ctx.chatContainer.addChild({ render: () => ["LATER"], invalidate: () => {} });
+
+			const linked = renderContainer(ctx.chatContainer);
+			expect(linked).toContain("\x1b]8;");
+			expect(linked).toContain("collab.example/session");
+
+			settings.override("tui.hyperlinks", "off");
+			ctx.chatContainer.invalidate();
+			expect(renderContainer(ctx.chatContainer)).not.toContain("\x1b]8;");
+
+			settings.override("tui.hyperlinks", "always");
+			ctx.chatContainer.invalidate();
+			expect(renderContainer(ctx.chatContainer)).toContain("\x1b]8;");
+		} finally {
+			settings.clearOverride("tui.hyperlinks");
+			if (previousNoHyperlinks === undefined) delete Bun.env.PI_NO_HYPERLINKS;
+			else Bun.env.PI_NO_HYPERLINKS = previousNoHyperlinks;
+		}
 	});
 
 	test("preserves startup notifications while rendering the initial transcript", async () => {

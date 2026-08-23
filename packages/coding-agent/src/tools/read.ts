@@ -69,6 +69,7 @@ import {
 import { executeReadUrl, fetchReadUrl, parseReadUrlTarget } from "./fetch";
 import { type OutputMeta, resolveOutputMaxColumns } from "./output-meta";
 import {
+	applyReadSuffixResolution,
 	expandPath,
 	formatPathRelativeToCwd,
 	type LineRange,
@@ -536,10 +537,23 @@ const readSchemaWithoutMemory = type({
 
 export type ReadToolInput = typeof readSchema.infer;
 
+export type ReadDisplayTargetLink = {
+	path: string | null;
+	/** False when the target's rendered lines do not map to its backing file. */
+	sourceLineAligned?: boolean;
+	/** True when a selector-shaped suffix belongs to the literal filename. */
+	literalPath?: boolean;
+};
+
 export interface ReadToolDetails {
 	kind?: "file" | "url";
 	truncation?: TruncationResult;
+	/** True for a directory, false only for a confirmed regular filesystem file. */
 	isDirectory?: boolean;
+	/** False when rendered lines are transformed and do not map to raw lines in the confirmed backing file. */
+	sourceLineAligned?: boolean;
+	/** True when the requested path's selector-shaped suffix was a literal filename. */
+	literalPath?: boolean;
 	resolvedPath?: string;
 	suffixResolution?: { from: string; to: string };
 	url?: string;
@@ -565,7 +579,14 @@ export interface ReadToolDetails {
 	conflictCount?: number;
 	/** Paths recovered from a delimited read argument; used only by the TUI to render one call as multiple read rows. */
 	displayReadTargets?: string[];
+	/** Confirmed filesystem link targets and line alignment, aligned with `displayReadTargets`. */
+	displayReadTargetLinks?: ReadDisplayTargetLink[];
 }
+
+function confirmedRegularFileDetails(details: Omit<ReadToolDetails, "isDirectory"> = {}): ReadToolDetails {
+	return { ...details, isDirectory: false };
+}
+
 type ReadParams = ReadToolInput;
 
 /** Identical reads tolerated before the loop hint is appended. */
@@ -731,6 +752,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		const notes = [notice];
 		const content: Array<TextContent | ImageContent> = [];
 		const displayReadTargets: string[] = [];
+		const displayReadTargetLinks: ReadDisplayTargetLink[] = [];
 		let pendingText = notice;
 		const flushText = () => {
 			if (pendingText.length === 0) return;
@@ -744,7 +766,17 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		for (const part of parts) {
 			try {
 				const result = await this.execute("read-delimited-part", { path: part }, signal);
-				displayReadTargets.push(result.details?.suffixResolution?.to ?? part);
+				const suffixResolution = result.details?.suffixResolution;
+				displayReadTargets.push(suffixResolution ? applyReadSuffixResolution(part, suffixResolution) : part);
+				const source = result.details?.meta?.source;
+				const linkPath =
+					!result.isError && result.details?.isDirectory === false
+						? (result.details?.resolvedPath ?? (source?.type === "path" ? source.value : undefined))
+						: undefined;
+				const displayLink: ReadDisplayTargetLink = { path: linkPath ?? null };
+				if (result.details?.sourceLineAligned === false) displayLink.sourceLineAligned = false;
+				if (result.details?.literalPath === true) displayLink.literalPath = true;
+				displayReadTargetLinks.push(displayLink);
 				for (const block of result.content) {
 					if (block.type === "text") {
 						appendText(block.text);
@@ -759,12 +791,13 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				const errorNote = `Could not read ${part}: ${message}`;
 				notes.push(errorNote);
 				displayReadTargets.push(part);
+				displayReadTargetLinks.push({ path: null });
 				appendText(`[${errorNote}]`);
 			}
 		}
 		flushText();
 
-		return toolResult<ReadToolDetails>({ notes, displayReadTargets }).content(content).done();
+		return toolResult<ReadToolDetails>({ notes, displayReadTargets, displayReadTargetLinks }).content(content).done();
 	}
 
 	async #readPdfPageScreenshot(options: {
@@ -793,6 +826,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		const image = loaded.content.find((entry): entry is ImageContent => entry.type === "image");
 		const details: ReadToolDetails = {
 			...loaded.details,
+			sourceLineAligned: false,
 			resolvedPath: absolutePdfPath,
 			contentType: image?.mimeType ?? screenshot.mimeType,
 			fileSize: pdfFileSize,
@@ -837,7 +871,11 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					this.session.cwd,
 				)}" and a question describing what to inspect and the desired output format.`,
 			];
-			return { content: [{ type: "text", text: metadataLines.join("\n") }], details: {}, sourcePath: absolutePath };
+			return {
+				content: [{ type: "text", text: metadataLines.join("\n") }],
+				details: confirmedRegularFileDetails({ sourceLineAligned: false }),
+				sourcePath: absolutePath,
+			};
 		}
 
 		if (fileSize > MAX_IMAGE_SIZE) {
@@ -863,7 +901,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					{ type: "text", text: imageInput.textNote },
 					{ type: "image", data: imageInput.data, mimeType: imageInput.mimeType },
 				],
-				details: {},
+				details: confirmedRegularFileDetails({ sourceLineAligned: false }),
 				sourcePath: imageInput.resolvedPath,
 			};
 		} catch (error) {
@@ -907,7 +945,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				const bridgeResult = buildInMemoryMultiRangeResult(this.session, bridgeText, ranges, {
 					details: markMarkdownContentType(
 						this.session,
-						{ resolvedPath: absolutePath, suffixResolution },
+						confirmedRegularFileDetails({ resolvedPath: absolutePath, suffixResolution }),
 						absolutePath,
 					),
 					sourcePath: absolutePath,
@@ -1181,14 +1219,26 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		// POSIX filenames containing selector-looking suffixes win over structured
 		// archive / sqlite / unsupported PDF-image dispatch. A selector promoted from local://
 		// remains separate so it cannot be mistaken for part of the resolved path.
+		const strictPathSplit = promotedSelector === undefined ? splitPathAndSel(readPath) : undefined;
 		const literalSplit =
 			promotedSelector === undefined
 				? await splitPathAndSelPreferringLiteral(readPath, this.session.cwd)
 				: { path: readPath, sel: promotedSelector };
+		// This is display identity only: local:// can promote a genuine selector
+		// while resolving to a filesystem filename containing a colon.
+		const requestedSuffixWasLiteral = strictPathSplit?.sel !== undefined && literalSplit.sel === undefined;
+		const markLiteralResult = (result: AgentToolResult<ReadToolDetails>): AgentToolResult<ReadToolDetails> => {
+			if (requestedSuffixWasLiteral) {
+				result.details ??= {};
+				result.details.literalPath = true;
+			}
+			return result;
+		};
 		const rawPathIsLiteral =
-			promotedSelector !== undefined
-				? readPath.includes(":") && (await probeLiteralPathExists(readPath, this.session.cwd)) !== "missing"
-				: literalSplit.sel === undefined && splitPathAndSel(readPath).sel !== undefined;
+			requestedSuffixWasLiteral ||
+			(promotedSelector !== undefined &&
+				path.basename(readPath).includes(":") &&
+				(await probeLiteralPathExists(readPath, this.session.cwd)) !== "missing");
 
 		let pdfImageRead: PdfImageReadTarget | null = null;
 
@@ -1230,10 +1280,12 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 
 		let isDirectory = false;
 		let fileSize = 0;
+		let isRegularFile = false;
 		try {
 			const stat = await Bun.file(absolutePath).stat();
 			fileSize = stat.size;
 			isDirectory = stat.isDirectory();
+			isRegularFile = stat.isFile();
 		} catch (error) {
 			if (isNotFoundError(error)) {
 				// Attempt unique suffix resolution before falling back to the approved-plan
@@ -1246,6 +1298,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 							absolutePath = suffixMatch.absolutePath;
 							fileSize = retryStat.size;
 							isDirectory = retryStat.isDirectory();
+							isRegularFile = retryStat.isFile();
 							suffixResolution = { from: localReadPath, to: suffixMatch.displayPath };
 						} catch {
 							// Suffix match candidate no longer stats — continue through
@@ -1263,6 +1316,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 							absolutePath = approvedPlanPath;
 							fileSize = approvedPlanStat.size;
 							isDirectory = approvedPlanStat.isDirectory();
+							isRegularFile = approvedPlanStat.isFile();
 							recoveredApprovedPlan = true;
 						} catch {
 							// The referenced plan disappeared after resolution; continue through
@@ -1273,7 +1327,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 
 				if (!recoveredApprovedPlan && !suffixResolution) {
 					const delimitedResult = await this.#tryReadDelimitedPaths(readPath, signal);
-					if (delimitedResult) return delimitedResult;
+					if (delimitedResult) return markLiteralResult(delimitedResult);
 					throw new ToolError(`Path '${localReadPath}' not found`);
 				}
 			} else {
@@ -1293,22 +1347,28 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				dirResult.details ??= {};
 				dirResult.details.suffixResolution = suffixResolution;
 			}
-			return dirResult;
+			return markLiteralResult(dirResult);
+		}
+
+		if (!isRegularFile) {
+			throw new ToolError(`Path '${localReadPath}' is not a regular file`);
 		}
 
 		if (parsed.kind === "conflicts") {
-			return this.#readFileConflicts(absolutePath, suffixResolution, signal);
+			return markLiteralResult(await this.#readFileConflicts(absolutePath, suffixResolution, signal));
 		}
 
 		if (pdfImageRead) {
-			return this.#readPdfPageScreenshot({
-				readPath,
-				absolutePdfPath: absolutePath,
-				page: pdfImageRead.page,
-				pdfFileSize: fileSize,
-				suffixResolution,
-				signal,
-			});
+			return markLiteralResult(
+				await this.#readPdfPageScreenshot({
+					readPath,
+					absolutePdfPath: absolutePath,
+					page: pdfImageRead.page,
+					pdfFileSize: fileSize,
+					suffixResolution,
+					signal,
+				}),
+			);
 		}
 
 		const imageMetadata = await readImageMetadata(absolutePath);
@@ -1327,23 +1387,33 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			else if (isCpuProfilePath(absolutePath)) rendered = renderCpuProfile(await Bun.file(absolutePath).text());
 			if (rendered) {
 				if (isMultiRange(parsed) && parsed.kind === "lines") {
-					return buildInMemoryMultiRangeResult(this.session, rendered, parsed.ranges, {
-						details: { resolvedPath: absolutePath },
-						sourcePath: absolutePath,
-						entityLabel: "profile summary",
-					});
+					return markLiteralResult(
+						buildInMemoryMultiRangeResult(this.session, rendered, parsed.ranges, {
+							details: confirmedRegularFileDetails({
+								resolvedPath: absolutePath,
+								sourceLineAligned: false,
+							}),
+							sourcePath: absolutePath,
+							entityLabel: "profile summary",
+						}),
+					);
 				}
 				const { offset, limit } = selToOffsetLimit(parsed);
-				return buildInMemoryTextResult(this.session, rendered, offset, limit, {
-					details: { resolvedPath: absolutePath },
-					sourcePath: absolutePath,
-					entityLabel: "profile summary",
-				});
+				return markLiteralResult(
+					buildInMemoryTextResult(this.session, rendered, offset, limit, {
+						details: confirmedRegularFileDetails({
+							resolvedPath: absolutePath,
+							sourceLineAligned: false,
+						}),
+						sourcePath: absolutePath,
+						entityLabel: "profile summary",
+					}),
+				);
 			}
 		}
 		// Read the file based on type
 		let content: Array<TextContent | ImageContent> | undefined;
-		let details: ReadToolDetails = {};
+		let details: ReadToolDetails = confirmedRegularFileDetails();
 		let sourcePath: string | undefined;
 		let columnTruncated = 0;
 		let truncationInfo:
@@ -1361,21 +1431,33 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		} else if (isNotebookPath(absolutePath) && !isRawSelector(parsed)) {
 			const notebookText = await readEditableNotebookText(absolutePath, resolvedDisplayPath);
 			if (isMultiRange(parsed) && parsed.kind === "lines") {
-				return buildInMemoryMultiRangeResult(this.session, notebookText, parsed.ranges, {
-					details: { resolvedPath: absolutePath },
-					sourcePath: absolutePath,
-					entityLabel: "notebook",
-				});
+				return markLiteralResult(
+					buildInMemoryMultiRangeResult(this.session, notebookText, parsed.ranges, {
+						details: confirmedRegularFileDetails({
+							resolvedPath: absolutePath,
+							sourceLineAligned: false,
+						}),
+						sourcePath: absolutePath,
+						entityLabel: "notebook",
+					}),
+				);
 			}
 			const { offset, limit } = selToOffsetLimit(parsed);
-			return buildInMemoryTextResult(this.session, notebookText, offset, limit, {
-				details: { resolvedPath: absolutePath },
-				sourcePath: absolutePath,
-				entityLabel: "notebook",
-			});
+			return markLiteralResult(
+				buildInMemoryTextResult(this.session, notebookText, offset, limit, {
+					details: confirmedRegularFileDetails({
+						resolvedPath: absolutePath,
+						sourceLineAligned: false,
+					}),
+					sourcePath: absolutePath,
+					entityLabel: "notebook",
+				}),
+			);
 		} else if (shouldConvertWithMarkit) {
 			// Convert document via markit.
 			const result = await convertFileWithMarkit(absolutePath, signal);
+			// Converted output is addressed by its own lines, not raw source-file lines.
+			details.sourceLineAligned = false;
 			if (result.ok) {
 				const renderedContent = result.content;
 				// Route the converted markdown through the in-memory text builder
@@ -1384,29 +1466,36 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				// `file.pdf:50-100` silently returned the head of the document
 				// because only `truncateHead` was being applied.
 				if (isMultiRange(parsed) && parsed.kind === "lines") {
-					return buildInMemoryMultiRangeResult(this.session, renderedContent, parsed.ranges, {
-						details: {
-							resolvedPath: absolutePath,
-							contentType: this.session.settings.get("read.renderMarkdown") ? "text/markdown" : undefined,
-						},
-						sourcePath: absolutePath,
-						entityLabel: "document",
-					});
+					return markLiteralResult(
+						buildInMemoryMultiRangeResult(this.session, renderedContent, parsed.ranges, {
+							details: confirmedRegularFileDetails({
+								resolvedPath: absolutePath,
+								contentType: this.session.settings.get("read.renderMarkdown") ? "text/markdown" : undefined,
+								sourceLineAligned: false,
+							}),
+							sourcePath: absolutePath,
+							entityLabel: "document",
+						}),
+					);
 				}
 				const { offset, limit } = selToOffsetLimit(parsed);
-				return buildInMemoryTextResult(this.session, renderedContent, offset, limit, {
-					details: {
-						resolvedPath: absolutePath,
-						contentType: this.session.settings.get("read.renderMarkdown") ? "text/markdown" : undefined,
-					},
-					sourcePath: absolutePath,
-					entityLabel: "document",
-					raw: isRawSelector(parsed),
-				});
-			} else if (result.error) {
-				content = [{ type: "text", text: `[Cannot read ${ext} file: ${result.error || "conversion failed"}]` }];
+				return markLiteralResult(
+					buildInMemoryTextResult(this.session, renderedContent, offset, limit, {
+						details: confirmedRegularFileDetails({
+							resolvedPath: absolutePath,
+							contentType: this.session.settings.get("read.renderMarkdown") ? "text/markdown" : undefined,
+							sourceLineAligned: false,
+						}),
+						sourcePath: absolutePath,
+						entityLabel: "document",
+						raw: isRawSelector(parsed),
+					}),
+				);
 			} else {
-				content = [{ type: "text", text: `[Cannot read ${ext} file: conversion failed]` }];
+				details.resolvedPath = absolutePath;
+				sourcePath = absolutePath;
+				const message = result.error || "conversion failed";
+				content = [{ type: "text", text: `[Cannot read ${ext} file: ${message}]` }];
 			}
 		} else {
 			// One read for every consumer below. The sniff, the structural summary,
@@ -1428,7 +1517,13 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					? isProbablyBinaryHeader(wholeFileBytes.subarray(0, BINARY_SNIFF_BYTES))
 					: await isProbablyBinary(absolutePath));
 			if (looksBinary) {
-				return toolResult<ReadToolDetails>({ resolvedPath: absolutePath, suffixResolution })
+				const binaryResult = toolResult<ReadToolDetails>(
+					confirmedRegularFileDetails({
+						resolvedPath: absolutePath,
+						suffixResolution,
+						sourceLineAligned: false,
+					}),
+				)
 					.text(
 						prependSuffixResolutionNotice(
 							`[Cannot read binary file '${resolvedDisplayPath}' (${formatBytes(fileSize)}); not valid UTF-8 text. Use ':raw' to read bytes verbatim.]`,
@@ -1437,6 +1532,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					)
 					.sourcePath(absolutePath)
 					.done();
+				return markLiteralResult(binaryResult);
 			}
 			// Decode only what survived the sniff.
 			const buffered = wholeFileBytes ? deriveBufferedFileText(wholeFileBytes) : undefined;
@@ -1469,14 +1565,14 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					if (summaryHashContext?.tag) {
 						recordSeenLinesFromBody(this.session, absolutePath, summaryHashContext.tag, renderedSummary.text);
 					}
-					details = {
+					details = confirmedRegularFileDetails({
 						displayContent: { text: renderedSummary.displayText, startLine: 1 },
 						summary: {
 							lines: countTextLines(renderedSummary.text),
 							elidedSpans: renderedSummary.elidedRanges.length,
 							elidedLines: renderedSummary.elidedLines,
 						},
-					};
+					});
 
 					sourcePath = absolutePath;
 					content = [{ type: "text", text: modelText }];
@@ -1495,10 +1591,12 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						suffixResolution,
 						undefined, // plain-file read: deterministic and fast, never abort mid-read
 					);
-					if (multiResult.bridgeResult) return multiResult.bridgeResult;
+					if (multiResult.bridgeResult) return markLiteralResult(multiResult.bridgeResult);
 					content = [{ type: "text", text: multiResult.outputText }];
 					sourcePath = absolutePath;
-					details = multiResult.displayContent ? { displayContent: multiResult.displayContent } : {};
+					details = multiResult.displayContent
+						? confirmedRegularFileDetails({ displayContent: multiResult.displayContent })
+						: confirmedRegularFileDetails();
 					if (multiResult.columnTruncated > 0) {
 						columnTruncated = multiResult.columnTruncated;
 					}
@@ -1514,7 +1612,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 							const bridgeResult = buildInMemoryTextResult(this.session, bridgeText, offset, limit, {
 								details: markMarkdownContentType(
 									this.session,
-									{ resolvedPath: absolutePath, suffixResolution },
+									confirmedRegularFileDetails({ resolvedPath: absolutePath, suffixResolution }),
 									absolutePath,
 								),
 								sourcePath: absolutePath,
@@ -1526,7 +1624,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 								const firstText = bridgeResult.content.find((c): c is TextContent => c.type === "text");
 								if (firstText) firstText.text = `${notice}\n${firstText.text}`;
 							}
-							return bridgeResult;
+							return markLiteralResult(bridgeResult);
 						} catch (error) {
 							logger.warn("ACP fs readTextFile failed; falling back to disk", { path: absolutePath, error });
 						}
@@ -1590,11 +1688,14 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 							totalFileLines === 0
 								? "The file is empty."
 								: `Use :1 to read from the start, or :${totalFileLines} to read the last line.`;
-						return toolResult<ReadToolDetails>({ resolvedPath: absolutePath, suffixResolution })
+						const outOfBoundsResult = toolResult<ReadToolDetails>(
+							confirmedRegularFileDetails({ resolvedPath: absolutePath, suffixResolution }),
+						)
 							.text(
 								`Line ${requestedStart + 1} is beyond end of file (${totalFileLines} lines total). ${suggestion}`,
 							)
 							.done();
+						return markLiteralResult(outOfBoundsResult);
 					}
 
 					// Per-line column cap. Skipped in raw mode so `:raw` always returns
@@ -1738,7 +1839,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 								firstLineBytes,
 							)}, exceeds ${formatBytes(maxBytesForRead)} limit. Unable to display a valid UTF-8 snippet.]`;
 						}
-						details = { truncation };
+						details = confirmedRegularFileDetails({ truncation });
 						sourcePath = absolutePath;
 						truncationInfo = {
 							result: truncation,
@@ -1750,7 +1851,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						};
 					} else if (truncation.truncated) {
 						outputText = formatBracketAwareText() ?? formatText(truncation.content, startLineDisplay);
-						details = { truncation };
+						details = confirmedRegularFileDetails({ truncation });
 						sourcePath = absolutePath;
 						truncationInfo = {
 							result: truncation,
@@ -1767,12 +1868,12 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						outputText += reachedEof
 							? `\n\n[${totalFileLines - (startLine + userLimitedLines)} more lines in file. Use :${nextOffset} to continue]`
 							: `\n\n[More lines in file (${formatBytes(fileSize)} total; not scanned to EOF). Use :${nextOffset} to continue]`;
-						details = {};
+						details = confirmedRegularFileDetails();
 						sourcePath = absolutePath;
 					} else {
 						// No truncation, no user limit exceeded
 						outputText = formatBracketAwareText() ?? formatText(truncation.content, startLineDisplay);
-						details = {};
+						details = confirmedRegularFileDetails();
 						sourcePath = absolutePath;
 					}
 					if (reachedEof) details.totalLines = totalFileLines;
@@ -1836,6 +1937,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			}
 		}
 
+		if (requestedSuffixWasLiteral) details.literalPath = true;
 		details.fileSize = fileSize;
 		markMarkdownContentType(this.session, details, absolutePath);
 		if (suffixResolution) {
@@ -1889,10 +1991,10 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		const formattedBody = formatTextWithMode(rawText, region.startLine, shouldAddHashLines, shouldAddLineNumbers);
 		const formattedText = prependHashlineHeader(formattedBody, hashContext);
 
-		const details: ReadToolDetails = {
+		const details = confirmedRegularFileDetails({
 			resolvedPath: entry.absolutePath,
 			displayContent: { text: rawText, startLine: region.startLine },
-		};
+		});
 		return toolResult<ReadToolDetails>(details).text(formattedText).sourcePath(entry.absolutePath).done();
 	}
 
@@ -1924,11 +2026,11 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				? `No unresolved git merge conflicts in ${displayPath}.`
 				: formatConflictSummary(entries, { displayPath, scanTruncated: scan.scanTruncated });
 
-		const details: ReadToolDetails = {
+		const details = confirmedRegularFileDetails({
 			resolvedPath: absolutePath,
 			suffixResolution,
 			conflictCount: entries.length,
-		};
+		});
 		return toolResult<ReadToolDetails>(details).text(summary).sourcePath(absolutePath).done();
 	}
 
@@ -1957,10 +2059,10 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			skills: this.session.skills,
 		});
 		const artifactUrl = `artifact://${artifact.id}`;
-		const details: ReadToolDetails = {
+		const details = confirmedRegularFileDetails({
 			resolvedPath: artifact.path,
 			contentType: "text/plain",
-		};
+		});
 
 		if (parsedSel.kind === "raw" && artifact.size > MAX_ARTIFACT_RAW_INLINE_BYTES) {
 			return toolResult<ReadToolDetails>(details)
@@ -2194,7 +2296,12 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				},
 			},
 		});
-		const details: ReadToolDetails = { resolvedPath: resource.sourcePath, contentType: resource.contentType };
+		const details: ReadToolDetails = {
+			resolvedPath: resource.sourcePath,
+			contentType: resource.contentType,
+			isDirectory: resource.isDirectory,
+			sourceLineAligned: resource.sourceLineAligned,
+		};
 
 		// If extraction was used, return directly (no pagination)
 		if (hasExtraction) {

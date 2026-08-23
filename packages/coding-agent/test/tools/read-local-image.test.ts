@@ -81,6 +81,7 @@ describe("read local:// images", () => {
 		// The pre-fix bug surfaced the PNG signature byte (0x89) UTF-8-decoded to
 		// the replacement char; the fixed path must never emit it as text.
 		expect(joinText(result.content)).not.toContain("\uFFFDPNG");
+		expect(result.details?.sourceLineAligned).toBe(false);
 	});
 
 	it("still reads a local:// text file as text (fast path falls through)", async () => {
@@ -91,6 +92,7 @@ describe("read local:// images", () => {
 
 		expect(result.content.some(c => c.type === "image")).toBe(false);
 		expect(joinText(result.content)).toContain("hello world");
+		expect(result.details?.sourceLineAligned).toBeUndefined();
 	});
 
 	it("rejects a local:// non-image binary without emitting decoded bytes", async () => {
@@ -103,6 +105,7 @@ describe("read local:// images", () => {
 		expect(text).toContain("Cannot read binary file");
 		expect(text).toContain("clip.mp4");
 		expect(text).not.toContain("\u0000");
+		expect(result.details?.sourceLineAligned).toBe(false);
 	});
 
 	it("rejects a large local:// binary whose first line exceeds the streaming byte budget", async () => {
@@ -132,6 +135,16 @@ describe("read local:// images", () => {
 		expect(resource.content).toContain("Cannot read binary local:// file");
 		expect(resource.content).toContain("archive.zip");
 		expect(resource.content).not.toContain("\u0000");
+		expect(resource.sourceLineAligned).toBe(false);
+	});
+
+	it("does not materialize oversized local:// text resources", async () => {
+		await Bun.write(path.join(localRoot, "oversized.txt"), new Uint8Array(1024 * 1024 + 1).fill(0x61));
+
+		const resource = await new LocalProtocolHandler().resolve(parseInternalUrl("local://oversized.txt"));
+
+		expect(resource.content).toContain("Cannot materialize local:// file");
+		expect(resource.sourceLineAligned).toBe(false);
 	});
 
 	it("does not read an image symlinked outside the local root", async () => {

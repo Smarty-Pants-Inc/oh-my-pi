@@ -118,6 +118,8 @@ export class AgentProtocolHandler implements ProtocolHandler {
 			contentType,
 			size: Buffer.byteLength(content, "utf-8"),
 			sourcePath: scan.foundPath,
+			isDirectory: false,
+			...(extract ? { sourceLineAligned: false } : {}),
 			notes,
 		};
 	}

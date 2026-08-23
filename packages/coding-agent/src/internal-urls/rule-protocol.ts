@@ -32,6 +32,8 @@ export class RuleProtocolHandler implements ProtocolHandler {
 			contentType: "text/markdown",
 			size: Buffer.byteLength(rule.content, "utf-8"),
 			sourcePath: rule.path,
+			isDirectory: false,
+			sourceLineAligned: false,
 			notes: [],
 		};
 	}

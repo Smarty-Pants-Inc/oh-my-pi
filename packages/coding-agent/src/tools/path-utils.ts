@@ -330,6 +330,21 @@ export function splitPathAndSel(rawPath: string): { path: string; sel?: string }
 }
 
 /**
+ * Replace only the filesystem prefix that suffix resolution corrected, leaving
+ * archive, SQLite, and read-selector syntax after it untouched.
+ */
+export function applyReadSuffixResolution(currentPath: string, suffixResolution: { from: string; to: string }): string {
+	const remainder = currentPath.slice(suffixResolution.from.length);
+	if (
+		currentPath === suffixResolution.from ||
+		(currentPath.startsWith(suffixResolution.from) && (remainder.startsWith(":") || remainder.startsWith("?")))
+	) {
+		return `${suffixResolution.to}${remainder}`;
+	}
+	return suffixResolution.to;
+}
+
+/**
  * Three-way probe for whether the exact filesystem entry named by `filePath`
  * exists. `stat` (used earlier) failed for reasons other than "no such file"
  * (dangling symlink, `EACCES` on a parent, transient I/O), and each of those
@@ -1410,6 +1425,7 @@ export interface ToolScopeResolution {
 	scopePath: string;
 	globFilter: string | undefined;
 	isDirectory: boolean;
+	isFile: boolean;
 	multiTargets?: ResolvedSearchTarget[];
 	exactFilePaths?: string[];
 	missingPaths: string[];
@@ -1547,9 +1563,11 @@ export async function resolveToolSearchScope(opts: ToolScopeOptions): Promise<To
 	}
 
 	let isDirectory: boolean;
+	let isFile: boolean;
 	try {
 		const stat = await Bun.file(searchPath).stat();
 		isDirectory = stat.isDirectory();
+		isFile = stat.isFile();
 	} catch {
 		const hint = opts.multipathStatHint && rawPaths.length > 1 ? opts.multipathStatHint : "";
 		throw new ToolError(`Path not found: ${scopePath}${hint}`);
@@ -1560,6 +1578,7 @@ export async function resolveToolSearchScope(opts: ToolScopeOptions): Promise<To
 		scopePath,
 		globFilter,
 		isDirectory,
+		isFile,
 		multiTargets,
 		exactFilePaths,
 		missingPaths,

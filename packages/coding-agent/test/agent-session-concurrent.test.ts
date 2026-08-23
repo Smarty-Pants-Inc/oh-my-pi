@@ -2504,6 +2504,53 @@ describe("AgentSession concurrent prompt guard", () => {
 					.some(entry => entry.type === "custom" && entry.customType === settledType),
 			).toBe(false);
 		});
+		it("cancels a pending delivery when busy-to-idle settlement persistence fails", async () => {
+			const sessionDir = path.join(tempDir, "sessions");
+			const manager = SessionManager.create(tempDir, sessionDir);
+			session = createPersistentSession(manager);
+			session.agent.state.isStreaming = true;
+			const gate = holdFirstEnsureOnDisk(manager);
+
+			const sending = session.sendCustomMessage(
+				{
+					customType: "failed-idle-settlement",
+					content: "recover exactly once after idle settlement",
+					display: false,
+					attribution: "agent",
+				},
+				{ deliveryMode: "steer" },
+			);
+			await gate.entered;
+			session.agent.state.isStreaming = false;
+			const failure = new Error("busy-to-idle settlement publish failed");
+			const settlement = vi.spyOn(manager, "appendEntriesAtomically").mockRejectedValueOnce(failure);
+			gate.release();
+
+			await expect(sending).rejects.toBe(failure);
+			expect(settlement).toHaveBeenCalledTimes(2);
+			expect(session.agent.state.messages).toHaveLength(0);
+			expect(
+				manager
+					.getBranch()
+					.some(entry => entry.type === "custom_message" && entry.customType === "failed-idle-settlement"),
+			).toBe(false);
+			const failedBranch = manager.getBranch();
+			const pending = failedBranch.find(entry => entry.type === "custom" && entry.customType === pendingType);
+			if (!pending) throw new Error("Expected a durable pending semantic delivery");
+			expect(failedBranch).toContainEqual(
+				expect.objectContaining({
+					type: "custom",
+					customType: settledType,
+					data: { pendingId: pending.id, outcome: "cancelled" },
+				}),
+			);
+
+			const sessionFile = manager.getSessionFile();
+			if (!sessionFile) throw new Error("Expected a materialized session");
+			session = undefined as unknown as AgentSession;
+			const resumed = await reopen(sessionFile, sessionDir);
+			expect(resumed.agent.peekSteeringQueue()).toHaveLength(0);
+		});
 	});
 
 	it("should throw when prompt() called while streaming", async () => {

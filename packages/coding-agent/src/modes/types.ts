@@ -274,7 +274,7 @@ export interface InteractiveModeContext {
 	 * leak.
 	 */
 	resetTranscript(): void;
-	showStatus(message: string, options?: { dim?: boolean }): void;
+	showStatus(message: string, options?: { dim?: boolean }, rebuild?: () => string): void;
 	showModelCycleTrack(track: string): void;
 	showError(message: string): void;
 	showPinnedError(message: string): void;

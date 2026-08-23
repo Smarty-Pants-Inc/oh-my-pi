@@ -28,6 +28,7 @@ export async function buildDirectoryResource(
 		contentType: "text/plain",
 		size: Buffer.byteLength(content, "utf-8"),
 		sourcePath: directoryPath,
+		isDirectory: true,
 		immutable: true,
 		...(notes ? { notes } : {}),
 	};
