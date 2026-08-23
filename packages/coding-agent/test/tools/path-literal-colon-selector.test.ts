@@ -6,6 +6,7 @@ import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config
 import { EditTool } from "@oh-my-pi/pi-coding-agent/edit";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import {
+	applyReadSuffixResolution,
 	expandPath,
 	probeLiteralPathExists,
 	resolveToCwd,
@@ -320,6 +321,29 @@ describe("literal colon filename resolution (issue #4618)", () => {
 			expect(rangedOutput).not.toContain("three");
 			expect(rangedOutput).not.toContain("four");
 		});
+	});
+});
+
+describe("suffix-resolved delimited read targets", () => {
+	it("replaces only the corrected filesystem prefix while preserving structured remainders", () => {
+		expect(
+			applyReadSuffixResolution("missing/archive.zip:member.txt:7", {
+				from: "missing/archive.zip",
+				to: "nested/missing/archive.zip",
+			}),
+		).toBe("nested/missing/archive.zip:member.txt:7");
+		expect(
+			applyReadSuffixResolution("missing/data.sqlite:records:42?limit=1", {
+				from: "missing/data.sqlite",
+				to: "nested/missing/data.sqlite",
+			}),
+		).toBe("nested/missing/data.sqlite:records:42?limit=1");
+		expect(
+			applyReadSuffixResolution("missing/report:7:2", {
+				from: "missing/report:7",
+				to: "nested/missing/report:7",
+			}),
+		).toBe("nested/missing/report:7:2");
 	});
 });
 

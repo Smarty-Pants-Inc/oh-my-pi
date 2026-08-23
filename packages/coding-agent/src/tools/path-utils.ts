@@ -329,10 +329,19 @@ export function splitPathAndSel(rawPath: string): { path: string; sel?: string }
 	return { path: basePath, sel };
 }
 
-/** Preserve a trailing read selector when suffix resolution replaced only the path. */
-export function recombineReadPathSelector(currentPath: string, resolvedPath: string): string {
-	const selector = splitPathAndSel(currentPath).sel;
-	return selector && !splitPathAndSel(resolvedPath).sel ? `${resolvedPath}:${selector}` : resolvedPath;
+/**
+ * Replace only the filesystem prefix that suffix resolution corrected, leaving
+ * archive, SQLite, and read-selector syntax after it untouched.
+ */
+export function applyReadSuffixResolution(currentPath: string, suffixResolution: { from: string; to: string }): string {
+	const remainder = currentPath.slice(suffixResolution.from.length);
+	if (
+		currentPath === suffixResolution.from ||
+		(currentPath.startsWith(suffixResolution.from) && (remainder.startsWith(":") || remainder.startsWith("?")))
+	) {
+		return `${suffixResolution.to}${remainder}`;
+	}
+	return suffixResolution.to;
 }
 
 /**

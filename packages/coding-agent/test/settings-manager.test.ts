@@ -510,6 +510,54 @@ describe("Settings", () => {
 				else Bun.env.PI_NO_HYPERLINKS = originalNoHyperlinks;
 			}
 		});
+		it("resynchronizes terminal hyperlinks when a save merges an external config change", async () => {
+			const originalNoHyperlinks = Bun.env.PI_NO_HYPERLINKS;
+			delete Bun.env.PI_NO_HYPERLINKS;
+			try {
+				await writeSettings({ tui: { hyperlinks: "off" } });
+				const settings = await Settings.init({ cwd: projectDir, agentDir });
+				expect(TERMINAL.hyperlinks).toBe(false);
+
+				await writeSettings({ tui: { hyperlinks: "always" } });
+				settings.set("setupVersion", 1);
+				await settings.flush();
+
+				expect(settings.get("tui.hyperlinks")).toBe("always");
+				expect(TERMINAL.hyperlinks).toBe(true);
+			} finally {
+				if (originalNoHyperlinks === undefined) delete Bun.env.PI_NO_HYPERLINKS;
+				else Bun.env.PI_NO_HYPERLINKS = originalNoHyperlinks;
+			}
+		});
+
+		it("resynchronizes terminal hyperlinks when a merged config save fails", async () => {
+			const originalNoHyperlinks = Bun.env.PI_NO_HYPERLINKS;
+			delete Bun.env.PI_NO_HYPERLINKS;
+			try {
+				await writeSettings({ tui: { hyperlinks: "off" } });
+				const settings = await Settings.init({ cwd: projectDir, agentDir });
+				expect(TERMINAL.hyperlinks).toBe(false);
+
+				await writeSettings({ tui: { hyperlinks: "always" } });
+				const configPath = await fs.promises.realpath(getConfigPath());
+				const rename = fs.promises.rename.bind(fs.promises);
+				vi.spyOn(fs.promises, "rename").mockImplementation(async (source, target) => {
+					if (String(source).endsWith(".tmp") && String(target) === configPath) {
+						throw new FsCodeError("EIO", "injected save failure");
+					}
+					await rename(source, target);
+				});
+
+				settings.set("setupVersion", 1);
+				await expect(settings.flush()).rejects.toThrow("injected save failure");
+
+				expect(settings.get("tui.hyperlinks")).toBe("always");
+				expect(TERMINAL.hyperlinks).toBe(true);
+			} finally {
+				if (originalNoHyperlinks === undefined) delete Bun.env.PI_NO_HYPERLINKS;
+				else Bun.env.PI_NO_HYPERLINKS = originalNoHyperlinks;
+			}
+		});
 		it("retries when a persisted setting changes while files are being read", async () => {
 			await writeSettings({ setupVersion: 1 });
 			const settings = await Settings.init({ cwd: projectDir, agentDir });

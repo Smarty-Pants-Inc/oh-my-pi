@@ -4,8 +4,8 @@ import { Container, Text } from "@oh-my-pi/pi-tui";
 import { InternalUrlRouter, XD_URL_PREFIX } from "../../internal-urls";
 import { getLanguageFromPath, theme } from "../../modes/theme/theme";
 import {
+	applyReadSuffixResolution,
 	parseLineRanges,
-	recombineReadPathSelector,
 	selectorLineRanges,
 	splitPathAndSel,
 } from "../../tools/path-utils";
@@ -118,11 +118,16 @@ function getSuffixResolution(details: ReadToolResultDetails | undefined): ReadTo
 	return { from: details.suffixResolution.from, to: details.suffixResolution.to };
 }
 
+type ReadDisplayTargetLink = {
+	path?: string;
+	sourceLineAligned?: boolean;
+};
+
 type ReadEntry = {
 	toolCallId: string;
 	path: string;
 	displayPaths?: string[];
-	displayLinkPaths?: Array<string | undefined>;
+	displayLinkPaths?: Array<ReadDisplayTargetLink | undefined>;
 	linkPath?: string;
 	sourceLineAligned?: boolean;
 	status: "pending" | "success" | "warning" | "error";
@@ -149,6 +154,7 @@ type ReadDisplayTarget = {
 	targetPath: string;
 	basePath: string;
 	linkPath?: string;
+	sourceLineAligned?: boolean;
 	selector?: string;
 };
 
@@ -176,11 +182,21 @@ function getDisplayReadTargets(details: ReadToolResultDetails | undefined): stri
 	return targets.length > 0 ? targets : undefined;
 }
 
-function getDisplayReadTargetLinks(details: ReadToolResultDetails | undefined): Array<string | undefined> | undefined {
+function getDisplayReadTargetLinks(
+	details: ReadToolResultDetails | undefined,
+): Array<ReadDisplayTargetLink | undefined> | undefined {
 	if (!Array.isArray(details?.displayReadTargetLinks)) return undefined;
-	return details.displayReadTargetLinks.map(target =>
-		typeof target === "string" && target.trim().length > 0 ? target : undefined,
-	);
+	return details.displayReadTargetLinks.map(target => {
+		if (typeof target === "string") {
+			return target.trim().length > 0 ? { path: target } : undefined;
+		}
+		if (!target || typeof target !== "object" || Array.isArray(target)) return undefined;
+		const link = target as { path?: unknown; sourceLineAligned?: unknown };
+		return {
+			path: typeof link.path === "string" && link.path.trim().length > 0 ? link.path : undefined,
+			sourceLineAligned: link.sourceLineAligned === false ? false : undefined,
+		};
+	});
 }
 
 function readSourceFsPath(details: ReadToolResultDetails | undefined): string | undefined {
@@ -447,7 +463,7 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 		entry.linkPath = !result.isError && details?.isDirectory === false ? readResultLinkPath(details) : undefined;
 		entry.sourceLineAligned = details?.sourceLineAligned;
 		if (suffixResolution) {
-			entry.path = recombineReadPathSelector(entry.path, suffixResolution.to);
+			entry.path = applyReadSuffixResolution(entry.path, suffixResolution);
 			entry.correctedFrom = suffixResolution.from;
 			entry.displayPaths = undefined;
 			entry.displayLinkPaths = undefined;
@@ -578,13 +594,16 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 			const useEntryLinkPath = pathSpecs.length === 1;
 			for (const [pathIndex, pathSpec] of pathSpecs.entries()) {
 				const split = splitPathAndSel(pathSpec);
-				const linkPath = useEntryLinkPath ? entry.linkPath : entry.displayLinkPaths?.[pathIndex];
+				const displayLink = entry.displayLinkPaths?.[pathIndex];
+				const linkPath = useEntryLinkPath ? (entry.linkPath ?? displayLink?.path) : displayLink?.path;
+				const sourceLineAligned = displayLink?.sourceLineAligned ?? entry.sourceLineAligned;
 				for (const selector of splitSelectorDisplayParts(split.sel)) {
 					targets.push({
 						entry,
 						targetPath: selector ? `${split.path}:${selector}` : pathSpec,
 						basePath: split.path,
 						linkPath,
+						sourceLineAligned,
 						selector,
 					});
 				}
@@ -707,7 +726,7 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 		return this.#formatPathValue(row.targetPath, {
 			correctedFrom: this.#correctedFromForTargets(row.targets),
 			conflictCount: this.#conflictCountForTargets(row.targets),
-			line: row.targets.some(target => target.entry.sourceLineAligned === false)
+			line: row.targets.some(target => target.sourceLineAligned === false)
 				? undefined
 				: firstSelectorLineForTargets(row.targets),
 			linkPath: linkPathForTargets(row.targets),

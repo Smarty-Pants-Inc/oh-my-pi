@@ -222,6 +222,36 @@ describe("ReadToolGroupComponent", () => {
 		expect(uris).toContain(url.pathToFileURL(twoPath).href);
 	});
 
+	it("keeps ordinary line links when a transformed delimited target is unaligned", () => {
+		settings.override("tui.hyperlinks", "always");
+		const component = new ReadToolGroupComponent();
+		const archivePath = path.resolve("/workspace/fixture.zip");
+		const filePath = path.resolve("/workspace/ordinary.ts");
+		component.updateArgs({ path: `${archivePath}:member.txt:7;${filePath}:3` }, "read-mixed-alignment");
+		component.updateResult(
+			{
+				content: [{ type: "text", text: "combined" }],
+				details: {
+					displayReadTargets: [`${archivePath}:member.txt:7`, `${filePath}:3`],
+					displayReadTargetLinks: [{ path: archivePath, sourceLineAligned: false }, { path: filePath }],
+				},
+			},
+			false,
+			"read-mixed-alignment",
+		);
+
+		const uris = extractLinkUris(component.render(120).join("\n"));
+		const archiveUri = url.pathToFileURL(archivePath).href;
+		const archiveLineUri = new URL(archiveUri);
+		archiveLineUri.searchParams.set("line", "7");
+		const fileLineUri = new URL(url.pathToFileURL(filePath).href);
+		fileLineUri.searchParams.set("line", "3");
+
+		expect(uris).toContain(archiveUri);
+		expect(uris).not.toContain(archiveLineUri.href);
+		expect(uris).toContain(fileLineUri.href);
+	});
+
 	it("preserves whitespace in confirmed grouped read link targets", () => {
 		settings.override("tui.hyperlinks", "always");
 		const component = new ReadToolGroupComponent();

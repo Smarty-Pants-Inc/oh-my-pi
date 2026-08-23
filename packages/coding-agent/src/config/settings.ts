@@ -724,7 +724,7 @@ export class Settings {
 			this.#configOverlay = overlayResult.value.settings;
 			this.#overlayShellPathSource = overlayResult.value.shellPathSource;
 			this.#rebuildMerged();
-			if (this === globalInstance) applyHyperlinkSetting(this.get("tui.hyperlinks"));
+			this.#syncGlobalHyperlinks();
 
 			const nextModelRoles = this.get("modelRoles");
 			if (!Bun.deepEquals(nextModelRoles, previousSignaledValues.modelRoles)) {
@@ -2333,10 +2333,12 @@ export class Settings {
 				this.#modifiedGlobalModelRoles.add(role);
 			}
 			this.#rebuildMerged();
+			this.#syncGlobalHyperlinks();
 			throw error;
 		}
 
 		this.#rebuildMerged();
+		this.#syncGlobalHyperlinks();
 	}
 	#queueProjectSave(): void {
 		if (!this.#persist) return;
@@ -2420,8 +2422,12 @@ export class Settings {
 		this.#editVariantCache = undefined;
 	}
 
-	#fireAllHooks(): void {
+	#syncGlobalHyperlinks(): void {
 		if (this === globalInstance) applyHyperlinkSetting(this.get("tui.hyperlinks"));
+	}
+
+	#fireAllHooks(): void {
+		this.#syncGlobalHyperlinks();
 		for (const key of Object.keys(SETTING_HOOKS) as SettingPath[]) {
 			const hook = SETTING_HOOKS[key];
 			if (hook) {

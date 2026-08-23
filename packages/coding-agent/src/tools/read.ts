@@ -69,12 +69,12 @@ import {
 import { executeReadUrl, fetchReadUrl, parseReadUrlTarget } from "./fetch";
 import { type OutputMeta, resolveOutputMaxColumns } from "./output-meta";
 import {
+	applyReadSuffixResolution,
 	expandPath,
 	formatPathRelativeToCwd,
 	type LineRange,
 	pathTargetsSsh,
 	probeLiteralPathExists,
-	recombineReadPathSelector,
 	resolveReadPath,
 	splitDelimitedPathEntry,
 	splitInternalUrlSel,
@@ -537,6 +537,12 @@ const readSchemaWithoutMemory = type({
 
 export type ReadToolInput = typeof readSchema.infer;
 
+export type ReadDisplayTargetLink = {
+	path: string | null;
+	/** False when the target's rendered lines do not map to its backing file. */
+	sourceLineAligned?: boolean;
+};
+
 export interface ReadToolDetails {
 	kind?: "file" | "url";
 	truncation?: TruncationResult;
@@ -569,8 +575,8 @@ export interface ReadToolDetails {
 	conflictCount?: number;
 	/** Paths recovered from a delimited read argument; used only by the TUI to render one call as multiple read rows. */
 	displayReadTargets?: string[];
-	/** Confirmed filesystem link targets aligned with `displayReadTargets`; null means unlinked. */
-	displayReadTargetLinks?: Array<string | null>;
+	/** Confirmed filesystem link targets and line alignment, aligned with `displayReadTargets`. */
+	displayReadTargetLinks?: ReadDisplayTargetLink[];
 }
 type ReadParams = ReadToolInput;
 
@@ -737,8 +743,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		const notes = [notice];
 		const content: Array<TextContent | ImageContent> = [];
 		const displayReadTargets: string[] = [];
-		const displayReadTargetLinks: Array<string | null> = [];
-		let sourceLineAligned = true;
+		const displayReadTargetLinks: ReadDisplayTargetLink[] = [];
 		let pendingText = notice;
 		const flushText = () => {
 			if (pendingText.length === 0) return;
@@ -752,15 +757,16 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		for (const part of parts) {
 			try {
 				const result = await this.execute("read-delimited-part", { path: part }, signal);
-				if (result.details?.sourceLineAligned === false) sourceLineAligned = false;
 				const suffixResolution = result.details?.suffixResolution;
-				displayReadTargets.push(suffixResolution ? recombineReadPathSelector(part, suffixResolution.to) : part);
+				displayReadTargets.push(suffixResolution ? applyReadSuffixResolution(part, suffixResolution) : part);
 				const source = result.details?.meta?.source;
 				const linkPath =
 					!result.isError && result.details?.isDirectory === false
 						? (result.details?.resolvedPath ?? (source?.type === "path" ? source.value : undefined))
 						: undefined;
-				displayReadTargetLinks.push(linkPath ?? null);
+				const displayLink: ReadDisplayTargetLink = { path: linkPath ?? null };
+				if (result.details?.sourceLineAligned === false) displayLink.sourceLineAligned = false;
+				displayReadTargetLinks.push(displayLink);
 				for (const block of result.content) {
 					if (block.type === "text") {
 						appendText(block.text);
@@ -775,15 +781,13 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				const errorNote = `Could not read ${part}: ${message}`;
 				notes.push(errorNote);
 				displayReadTargets.push(part);
-				displayReadTargetLinks.push(null);
+				displayReadTargetLinks.push({ path: null });
 				appendText(`[${errorNote}]`);
 			}
 		}
 		flushText();
 
-		const details: ReadToolDetails = { notes, displayReadTargets, displayReadTargetLinks };
-		if (!sourceLineAligned) details.sourceLineAligned = false;
-		return toolResult(details).content(content).done();
+		return toolResult<ReadToolDetails>({ notes, displayReadTargets, displayReadTargetLinks }).content(content).done();
 	}
 
 	async #readPdfPageScreenshot(options: {
