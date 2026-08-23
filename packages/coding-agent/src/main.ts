@@ -747,6 +747,7 @@ async function runInteractiveMode(
 		playStartupSplash = setupWizard !== undefined && showStartupSplash && setupScenes.length === 0;
 		await logger.time("InteractiveMode.init", () =>
 			mode.init({
+				suppressWelcome: bridge?.role === "guest",
 				suppressWelcomeIntro: bridge?.role === "guest" || resuming || setupScenes.length > 0 || playStartupSplash,
 				clearInitialTerminalHistory: true,
 				recentSessions: startupLease?.recentSessions,

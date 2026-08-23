@@ -92,6 +92,7 @@ export type TodoPhase = {
 };
 
 export interface InteractiveModeInitOptions {
+	suppressWelcome?: boolean;
 	suppressWelcomeIntro?: boolean;
 	clearInitialTerminalHistory?: boolean;
 	/** Recent-session rows loaded by the prepaint composer while runtime modules initialized. */

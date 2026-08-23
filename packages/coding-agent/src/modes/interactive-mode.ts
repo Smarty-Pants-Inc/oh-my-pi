@@ -1240,7 +1240,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			return sessions.map(s => ({ name: s.name, timeAgo: s.timeAgo }));
 		});
 		const startupQuiet = settings.get("startup.quiet");
-		this.composer.setPreferences({ quiet: startupQuiet });
+		this.composer.setPreferences({ quiet: startupQuiet || options.suppressWelcome });
 		this.composer.updateWelcome({
 			version: this.#version,
 			modelName,
