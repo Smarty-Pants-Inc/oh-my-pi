@@ -646,10 +646,11 @@ it(
 			maxSyncSpanMs = await streamDiff(guard, makeEvent, diff);
 		});
 
-		// performance.now() spans include runner-preemption time the ambient drift
-		// control also absorbs, so calibrate the guard-work ceiling against the
-		// measured jitter instead of trusting a fixed wall-clock bound alone.
-		expect(maxSyncSpanMs).toBeLessThan(Math.max(5, ambientDriftMs * 3));
+		// performance.now() spans include runner-preemption time. The ambient
+		// control cannot absorb guard-only work, so use the same 30ms absolute
+		// floor as the drift assertion; an unsliced 200-line x 2MB scan remains
+		// above that bound on supported runners.
+		expect(maxSyncSpanMs).toBeLessThan(Math.max(30, ambientDriftMs * 3));
 		// The guard run legitimately spends one tick decoding + LF-normalizing the
 		// 2MB target and then pays GC for that churn — single-digit ms locally,
 		// 12ms observed on a 2-core CI runner. The ambient control cannot absorb
