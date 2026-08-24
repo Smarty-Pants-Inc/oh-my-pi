@@ -31,7 +31,7 @@ async function runRustTaskWithFakeTools(extraArgs: string[]) {
 		const cargoLogPath = path.join(binDir, "cargo.log");
 		await Bun.write(gitPath, '#!/bin/sh\nprintf \'%s\\n\' "$@" > "$FAKE_GIT_LOG"\n');
 		await Bun.write(rustupPath, "#!/bin/sh\nprintf '%s\\n' \"$FAKE_CARGO\"\n");
-		await Bun.write(cargoPath, '#!/bin/sh\nprintf \'%s\\n\' "$@" > "$FAKE_CARGO_LOG"\n');
+		await Bun.write(cargoPath, '#!/bin/sh\nprintf \'%s\\n\' "$@" >> "$FAKE_CARGO_LOG"\n');
 		await Promise.all([gitPath, rustupPath, cargoPath].map(file => fs.chmod(file, 0o755)));
 
 		const inheritedPath = Bun.env.PATH;
@@ -181,7 +181,7 @@ describe("Rust runner routing", () => {
 				"brush-core",
 				"--status-level=fail",
 				"--final-status-level=fail",
-			].join("\n")}\n`,
+			].join("\n")}\n${["test", "--doc", "--workspace", "--exclude", "brush-core"].join("\n")}\n`,
 		);
 	});
 });

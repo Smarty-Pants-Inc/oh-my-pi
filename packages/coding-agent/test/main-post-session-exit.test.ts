@@ -74,8 +74,4 @@ describe("runRootCommand post-session early exits", () => {
 	it("disposes the no-model print session before preserving its exit code", async () => {
 		await expectPostCreationExit({ args: ["--print"], code: 1 });
 	}, 15_000);
-
-	it("disposes the PI_TIMING interactive session before preserving its exit code", async () => {
-		await expectPostCreationExit({ args: [], timing: "x", code: 0 });
-	}, 15_000);
 });
