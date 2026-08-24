@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { scheduler } from "node:timers/promises";
 import { Agent, type AgentMessage, type StreamFn } from "@oh-my-pi/pi-agent-core";
 import * as compactionModule from "@oh-my-pi/pi-agent-core/compaction";
 import type { AssistantMessage, Model, ToolCall } from "@oh-my-pi/pi-ai";
@@ -25,7 +26,7 @@ import { SessionMaintenance } from "@oh-my-pi/pi-coding-agent/session/session-ma
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { createSettingsAwareStreamFn } from "@oh-my-pi/pi-coding-agent/session/settings-stream-fn";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
-import { TempDir } from "@oh-my-pi/pi-utils";
+import { TempDir, withTimeout } from "@oh-my-pi/pi-utils";
 import * as snapcompact from "@oh-my-pi/snapcompact";
 
 const HANDOFF_SECRET = "HANDOFF_SECRET_TOKEN_12345";
@@ -46,6 +47,18 @@ describe("AgentSession handoff", () => {
 	let sessionManager: SessionManager;
 	let events: AgentSessionEvent[];
 	let obfuscator: SecretObfuscator;
+
+	/** Poll `predicate` until it holds (returns as soon as the state is reached) or the
+	 *  deadline elapses. Replaces blind settle sleeps for tests with a positive signal. */
+	async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<void> {
+		const deadline = Date.now() + timeoutMs;
+		while (!predicate()) {
+			if (Date.now() >= deadline) {
+				throw new Error("Timed out waiting for condition");
+			}
+			await scheduler.yield();
+		}
+	}
 
 	/** Drain post-turn maintenance deterministically for negative tests (those proving
 	 *  maintenance did NOT run, where there is no positive signal to poll on). Post-turn

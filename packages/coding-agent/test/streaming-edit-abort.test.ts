@@ -546,6 +546,7 @@ async function createLargeTargetSetup(abortCalls: { count: number }) {
 		localProtocolOptions: () => ({}),
 		emitNotice() {},
 		schedulePostPromptTask() {},
+		scheduleAgentContinue() {},
 		discardAssistantTurn() {},
 	});
 
@@ -704,6 +705,7 @@ function buildSmallTargetGuard(target: string, toolCallId: string, abortCalls: {
 		localProtocolOptions: () => ({}),
 		emitNotice() {},
 		schedulePostPromptTask() {},
+		scheduleAgentContinue() {},
 		discardAssistantTurn() {},
 	});
 	const makeEvent = (eventType: "toolcall_start" | "toolcall_delta", streamedDiff: string): AgentEvent => {

@@ -163,15 +163,23 @@ describe("InteractiveMode todo HUD persistence", () => {
 		expect(renderTodos(mode)).not.toContain("done task");
 	});
 
-	it("keeps the anchored todo panel in the live region while visible", () => {
+	it("updates the anchored todo panel in place without appending transcript history", () => {
 		setTodoClearDelay(-1);
+		const transcriptLength = mode.chatContainer.children.length;
 
 		mode.setTodos([{ name: "Implementation", tasks: [{ content: "pending task", status: "pending" }] }]);
-		const liveRegion = mode.todoContainer as unknown as NativeScrollbackLiveRegion;
-		expect(liveRegion.getNativeScrollbackLiveRegionStart?.()).toBe(0);
+		expect(renderTodos(mode)).toContain("pending task");
+		expect(mode.chatContainer.children).toHaveLength(transcriptLength);
+
+		mode.setTodos([{ name: "Implementation", tasks: [{ content: "replacement task", status: "pending" }] }]);
+		const updated = renderTodos(mode);
+		expect(updated).toContain("replacement task");
+		expect(updated).not.toContain("pending task");
+		expect(mode.chatContainer.children).toHaveLength(transcriptLength);
 
 		mode.setTodos([]);
-		expect(liveRegion.getNativeScrollbackLiveRegionStart?.()).toBeUndefined();
+		expect(mode.todoContainer.render(120)).toHaveLength(0);
+		expect(mode.chatContainer.children).toHaveLength(transcriptLength);
 	});
 
 	it("leaves canonical todos for the parent to reconcile when a subagent completes", async () => {

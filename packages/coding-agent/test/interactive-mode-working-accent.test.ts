@@ -103,17 +103,24 @@ afterAll(() => {
 });
 
 describe("InteractiveMode working-message session accent cache", () => {
-	it("reports a live seam only while status content is mounted", async () => {
+	it("updates the anchored loader in place without appending transcript history", async () => {
 		const { mode } = await createHarness("Live status");
-		const statusContainer = mode.statusContainer as Container & NativeScrollbackLiveRegion;
+		const transcriptLength = mode.chatContainer.children.length;
 
-		// Empty: no seam — the engine may commit freely past the container.
-		expect(statusContainer.getNativeScrollbackLiveRegionStart()).toBeUndefined();
-		// Loader mounted: every row is live, so the seam sits at 0 and keeps
-		// the animating loader out of immutable native scrollback.
+		expect(renderLoader(mode)).toBe("");
 		startStableLoader(mode);
-		expect(statusContainer.getNativeScrollbackLiveRegionStart()).toBe(0);
-		expect(statusContainer.isNativeScrollbackLiveRegionPinned?.()).toBe(true);
+		expect(Bun.stripANSI(renderLoader(mode))).toContain("Working");
+		expect(mode.chatContainer.children).toHaveLength(transcriptLength);
+
+		mode.setWorkingMessage("Inspecting files");
+		const updated = Bun.stripANSI(renderLoader(mode));
+		expect(updated).toContain("Inspecting files");
+		expect(updated).not.toContain("Working");
+		expect(mode.chatContainer.children).toHaveLength(transcriptLength);
+
+		mode.statusContainer.disposeChildren();
+		expect(renderLoader(mode)).toBe("");
+		expect(mode.chatContainer.children).toHaveLength(transcriptLength);
 	});
 
 	it("publishes the canonical loader message without the keyboard hint", async () => {
