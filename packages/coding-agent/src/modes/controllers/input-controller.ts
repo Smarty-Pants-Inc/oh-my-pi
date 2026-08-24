@@ -23,7 +23,7 @@ import manualContinuePrompt from "../../prompts/system/manual-continue.md" with 
 import type { RestoredQueuedMessage } from "../../session/agent-session-types";
 import { USER_INTERRUPT_LABEL } from "../../session/messages";
 import { localSubmissionSignature, releaseLocalSubmissionSignature } from "../../session/queued-messages";
-import { executeBuiltinSlashCommand } from "../../slash-commands/builtin-registry";
+import { executeBuiltinSlashCommand, lookupBuiltinSlashCommand } from "../../slash-commands/builtin-registry";
 import { parseSlashCommand } from "../../slash-commands/helpers/parse";
 import { isTinyTitleLocalModelKey } from "../../tiny/models";
 import { tinyTitleClient } from "../../tiny/title-client";
@@ -948,9 +948,8 @@ export class InputController {
 						{ imageCount: images?.length ?? 0 },
 					);
 				} catch (error) {
-					// Don't lose the queued follow-up draft: restore text and images so
-					// the user can retry after dispatch validation/queue failures.
-					this.ctx.editor.setText(text);
+					// Don't lose the queued follow-up draft: restore images, then the collapsed
+					// text so chip tokens (and band cards) survive the retry.
 					if (images && images.length > 0) {
 						this.ctx.editor.pendingImages = [...images];
 						this.ctx.editor.pendingImageLinks = inputImageLinks
@@ -1590,6 +1589,16 @@ export class InputController {
 		currentText?: string,
 		appendAfterCurrentText = false,
 	): void {
+		// Image markers are positional: `[Image #N]` ↔ `pendingImages[N-1]`
+		// (legacy drafts may still carry a trailing `attachment://N`). Each queued
+		// message numbered its references against its own local image list
+		// (1..K). Because we prepend the queued text but append the queued images
+		// to `pendingImages`, any existing draft images (M of them) — plus images
+		// already pulled in by earlier queued messages — shift the slot index that
+		// every reference must point to. Bumping each message's marker and URI
+		// indices by the running offset keeps the merged text aligned with the merged
+		// `pendingImages` order; draft markers stay valid because draft images
+		// keep their original positions.
 		const queuedImages = entries.flatMap(entry => entry.images ?? []);
 		let queuedText: string;
 		if (queuedImages.length > 0) {
@@ -1607,12 +1616,16 @@ export class InputController {
 		const combinedText = (appendAfterCurrentText ? [currentEditorText, queuedText] : [queuedText, currentEditorText])
 			.filter(text => text.trim())
 			.join("\n\n");
-		this.ctx.editor.setText(combinedText);
+		// Hand queued images back to the pending-image buffer first (links are
+		// re-materialized lazily), then set the text: setCollapsedText folds the
+		// renumbered `[Image #N, WxH]` references back into chip tokens, and the
+		// collapse only recognizes indices within the merged pendingImages range.
 		if (queuedImages.length > 0) {
 			this.ctx.editor.pendingImages.push(...queuedImages);
 			this.ctx.editor.pendingImageLinks.push(...queuedImages.map(() => undefined));
 			this.ctx.editor.imageLinks = this.ctx.editor.pendingImageLinks;
 		}
+		this.ctx.editor.setCollapsedText(combinedText);
 	}
 
 	async #insertPendingImage(imageData: ImageContent): Promise<void> {

@@ -35,6 +35,7 @@ import {
 	$env,
 	$flag,
 	getAgentDir,
+	getModelDbPath,
 	getProjectDir,
 	isBunTestRuntime,
 	logger,
@@ -3562,6 +3563,7 @@ async function createAgentSessionScoped(
 			if (snapcompactInline) transformed = await snapcompactInline.transform(transformed, transformModel);
 			transformed = clampProviderContextImages(transformed, transformModel);
 			transformed = await normalizeProviderContextImagesForModel(transformed, transformModel);
+			if (blobBroker) transformed = await blobBroker.decorateContext(transformed, transformModel);
 			if (contextTarget === defaultContextTarget) {
 				pendingProviderInstructions = structuredClone(transformed.instructions ?? []);
 			}
@@ -4269,6 +4271,7 @@ async function createAgentSessionScoped(
 						transformed = obfuscator ? obfuscateProviderContext(obfuscator, transformed) : transformed;
 						transformed = clampProviderContextImages(transformed, transformModel);
 						transformed = await normalizeProviderContextImagesForModel(transformed, transformModel);
+						if (blobBroker) transformed = await blobBroker.decorateContext(transformed, transformModel);
 						return transformed;
 					},
 					thinkingBudgets: agent.thinkingBudgets,
