@@ -468,13 +468,17 @@ export interface QueuedPrompt {
 	id: string;
 	text: string;
 	delivery: QueuedPromptDelivery;
+	imageCount?: number;
+	customType?: string;
 }
 
-/** Result of an atomic queued-prompt delivery change. */
-export type SetQueuedPromptDeliveryResult =
+/** Result of an atomic queued-prompt mutation. */
+export type QueuedPromptMutationResult =
 	| { status: "updated" }
 	| { status: "stale" }
-	| { status: "unavailable"; reason: "session_transition" | "queue_mutation" };
+	| { status: "unavailable"; reason: "session_transition" | "queue_mutation" | "no_active_turn" };
+
+export type SetQueuedPromptDeliveryResult = QueuedPromptMutationResult;
 
 export interface ExtensionContext {
 	/** UI methods for user interaction */

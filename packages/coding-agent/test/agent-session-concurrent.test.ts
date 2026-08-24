@@ -2020,7 +2020,11 @@ describe("AgentSession concurrent prompt guard", () => {
 						followUp: [],
 					});
 				} else {
-					expect(removed).toEqual({ text: "remove after acceptance", images: undefined });
+					expect(removed).toEqual({
+						text: "remove after acceptance",
+						images: undefined,
+						customType: "barrier-owner",
+					});
 				}
 				expect(session.agent.hasQueuedMessages()).toBe(false);
 			},
@@ -2073,7 +2077,11 @@ describe("AgentSession concurrent prompt guard", () => {
 						followUp: [],
 					});
 				} else {
-					expect(removed).toEqual({ text: "remove before scheduled send", images: undefined });
+					expect(removed).toEqual({
+						text: "remove before scheduled send",
+						images: undefined,
+						customType: "scheduled-owner",
+					});
 				}
 				expect(calls).toHaveLength(0);
 				expect(session.agent.hasQueuedMessages()).toBe(false);
@@ -2174,7 +2182,11 @@ describe("AgentSession concurrent prompt guard", () => {
 						{ text: "remove during save", images: undefined },
 					]);
 				} else {
-					await expect(popping).resolves.toEqual({ text: "remove during save", images: undefined });
+					await expect(popping).resolves.toEqual({
+						text: "remove during save",
+						images: undefined,
+						customType: "removable-retime",
+					});
 				}
 				expect(session.agent.hasQueuedMessages()).toBe(false);
 

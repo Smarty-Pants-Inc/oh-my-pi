@@ -53,7 +53,7 @@ function waitForImmediate(): Promise<void> {
 }
 
 function hiddenCompanion(
-	customType: "ultrathink-notice" | "image-attachment-description",
+	customType: "ultrathink-notice" | "orchestrate-notice" | "workflow-notice" | "image-attachment-description",
 	text: string,
 	timestamp: number,
 ) {
@@ -94,7 +94,13 @@ describe("AgentSession queued prompt seam", () => {
 		session = new AgentSession({
 			agent,
 			sessionManager: SessionManager.inMemory(),
-			settings: Settings.isolated({ "compaction.enabled": false }),
+			settings: Settings.isolated({
+				"compaction.enabled": false,
+				"magicKeywords.enabled": true,
+				"magicKeywords.ultrathink": true,
+				"magicKeywords.orchestrate": true,
+				"magicKeywords.workflow": true,
+			}),
 			modelRegistry,
 		});
 		vi.spyOn(agent, "continue").mockResolvedValue(undefined);
@@ -144,6 +150,247 @@ describe("AgentSession queued prompt seam", () => {
 		agent.replaceQueues([newerSteer], [olderFollowUp], true);
 
 		expect(target.getQueuedPrompts().map(prompt => prompt.text)).toEqual(["older follow-up", "newer steer"]);
+	});
+
+	it("reports image counts without exposing image bytes", () => {
+		const agent = createAgent();
+		const target = createSession(agent);
+		const owner: UserMessage = {
+			role: "user",
+			content: [
+				{ type: "text", text: "inspect screenshot" },
+				{ type: "image", mimeType: "image/png", data: "private-image-bytes" },
+			],
+			attribution: "user",
+			timestamp: 25,
+		};
+		agent.replaceQueues([owner], [], true);
+
+		expect(target.getQueuedPrompts()[0]).toEqual({
+			id: expect.any(String),
+			text: "inspect screenshot",
+			delivery: "steer",
+			imageCount: 1,
+		});
+		expect(JSON.stringify(target.getQueuedPrompts())).not.toContain("private-image-bytes");
+	});
+
+	it("keeps the display placeholder out of an image-only editor draft", () => {
+		const agent = createAgent();
+		const target = createSession(agent);
+		const owner: UserMessage = {
+			role: "user",
+			content: [{ type: "image", mimeType: "image/png", data: "image-only" }],
+			attribution: "user",
+			timestamp: 26,
+		};
+		agent.replaceQueues([owner], [], true);
+		const prompt = target.getQueuedPrompts()[0];
+		if (!prompt) throw new Error("Expected image-only queued prompt");
+
+		expect(prompt.text).toBe("[Image]");
+		expect(target.getQueuedPromptDraft(prompt.id)).toEqual({
+			text: "",
+			images: [{ type: "image", mimeType: "image/png", data: "image-only" }],
+		});
+	});
+
+	it("breaks equal-time ties by stable enqueue identity", () => {
+		const agent = createAgent();
+		const target = createSession(agent);
+		const first = userMessage("first follow-up", 27);
+		const second = userMessage("second steer", 27, true);
+		agent.followUp(first);
+		agent.steer(second);
+
+		expect(target.getQueuedPrompts().map(prompt => prompt.text)).toEqual(["first follow-up", "second steer"]);
+	});
+
+	it("updates only the selected prompt text while preserving identity, order, timing, images, and companions", async () => {
+		const agent = createAgent();
+		const target = createSession(agent);
+		const older = userMessage("older", 30, true);
+		const companion = hiddenCompanion("image-attachment-description", "hidden image description", 31);
+		const owner: UserMessage = {
+			role: "user",
+			content: [
+				{ type: "text", text: "before edit [Image #1]" },
+				{ type: "image", mimeType: "image/png", data: "image-data" },
+			],
+			attribution: "user",
+			timestamp: 32,
+		};
+		const newer = userMessage("newer", 33);
+		agent.replaceQueues([older, companion, owner], [newer], true);
+		const before = target.getQueuedPrompts();
+		const id = before.find(prompt => prompt.text.startsWith("before edit"))?.id;
+		if (!id) throw new Error("Expected editable queued prompt id");
+		const changed = vi.fn();
+		target.onQueuedPromptsChanged(changed);
+
+		expect(await target.updateQueuedPromptText(id, "after edit [Image #1]")).toEqual({ status: "updated" });
+		expect(target.getQueuedPrompts()).toEqual([
+			{ id: before[0]?.id, text: "older", delivery: "steer" },
+			{ id, text: "after edit [Image #1]", delivery: "steer", imageCount: 1 },
+			{ id: before[2]?.id, text: "newer", delivery: "afterCurrent" },
+		]);
+		expect(agent.peekSteeringQueue()[1]).toBe(companion);
+		expect(agent.peekSteeringQueue()[2]).toBe(owner);
+		expect(target.getQueuedPromptDraft(id)).toEqual({
+			text: "after edit [Image #1]",
+			images: [{ type: "image", mimeType: "image/png", data: "image-data" }],
+		});
+		expect(changed).toHaveBeenCalledTimes(1);
+	});
+
+	it("regenerates an edited image description and drops a stale keyword companion", async () => {
+		const agent = createAgent();
+		const target = createSession(agent);
+		const magic = hiddenCompanion("ultrathink-notice", "stale magic", 33);
+		const oldDescription = hiddenCompanion("image-attachment-description", "old image", 34);
+		const owner: UserMessage = {
+			role: "user",
+			content: [
+				{ type: "text", text: "old [Image #1]" },
+				{ type: "image", mimeType: "image/png", data: "old-image" },
+			],
+			attribution: "user",
+			timestamp: 35,
+		};
+		agent.replaceQueues([magic, oldDescription, owner], [], true);
+		const id = target.getQueuedPrompts()[0]?.id;
+		if (!id) throw new Error("Expected image-bearing queued prompt");
+		const replacement = { type: "image" as const, mimeType: "image/png", data: "new-image" };
+
+		expect(await target.updateQueuedPromptText(id, "new [Image #1]", [replacement])).toEqual({
+			status: "updated",
+		});
+		expect(agent.peekSteeringQueue()).not.toContain(magic);
+		expect(agent.peekSteeringQueue()).not.toContain(oldDescription);
+		expect(agent.peekSteeringQueue().at(-1)).toBe(owner);
+		expect(target.getQueuedPromptDraft(id)).toEqual({ text: "new [Image #1]", images: [replacement] });
+	});
+
+	it("removes stale magic-keyword companions when edited text removes their keywords", async () => {
+		const agent = createAgent();
+		const target = createSession(agent);
+		const owners = [
+			userMessage("ultrathink this", 41, true),
+			userMessage("orchestrate this", 43, true),
+			userMessage("workflowz this", 45, true),
+		];
+		agent.replaceQueues(
+			[
+				hiddenCompanion("ultrathink-notice", "old ultrathink", 40),
+				owners[0]!,
+				hiddenCompanion("orchestrate-notice", "old orchestrate", 42),
+				owners[1]!,
+				hiddenCompanion("workflow-notice", "old workflow", 44),
+				owners[2]!,
+			],
+			[],
+			true,
+		);
+		const ids = target.getQueuedPrompts().map(prompt => prompt.id);
+
+		for (const [index, id] of ids.entries()) {
+			expect(await target.updateQueuedPromptText(id, `plain edit ${index}`)).toEqual({ status: "updated" });
+		}
+		expect(agent.peekSteeringQueue()).toEqual(owners);
+	});
+
+	it("adds magic-keyword companions from final edited text without restarting the turn budget", async () => {
+		const agent = createAgent();
+		const target = createSession(agent);
+		vi.spyOn(target, "getEnabledToolNames").mockReturnValue(["task", "eval"]);
+		const beginTurnBudget = vi.spyOn(target.sessionManager, "beginTurnBudget");
+		const owners = [
+			userMessage("plain one", 50, true),
+			userMessage("plain two", 51, true),
+			userMessage("plain three", 52, true),
+		];
+		agent.replaceQueues(owners, [], true);
+		const ids = target.getQueuedPrompts().map(prompt => prompt.id);
+
+		expect(await target.updateQueuedPromptText(ids[0]!, "please ultrathink +250k")).toEqual({ status: "updated" });
+		expect(await target.updateQueuedPromptText(ids[1]!, "please orchestrate this")).toEqual({ status: "updated" });
+		expect(await target.updateQueuedPromptText(ids[2]!, "please workflowz this")).toEqual({ status: "updated" });
+		expect(
+			agent.peekSteeringQueue().map(message => (message.role === "custom" ? message.customType : message.role)),
+		).toEqual(["ultrathink-notice", "user", "orchestrate-notice", "user", "workflow-notice", "user"]);
+		expect(beginTurnBudget).not.toHaveBeenCalled();
+	});
+
+	it("replaces a plain prompt's stale magic notice with the final skill semantics", async () => {
+		const agent = createAgent();
+		const target = createSession(agent);
+		const staleNotice = hiddenCompanion("ultrathink-notice", "stale", 60);
+		const owner = userMessage("ultrathink stale", 61, true);
+		agent.replaceQueues([staleNotice, owner], [], true);
+		const id = target.getQueuedPrompts()[0]?.id;
+		if (!id) throw new Error("Expected queued prompt");
+
+		expect(
+			await target.updateQueuedPromptText(id, "/skill:review", undefined, {
+				customType: "skill-prompt",
+				content: "expanded skill prompt",
+				display: true,
+				details: { name: "review", args: "" },
+				attribution: "user",
+			}),
+		).toEqual({ status: "updated" });
+		expect(agent.peekSteeringQueue()).toHaveLength(1);
+		expect(agent.peekSteeringQueue()[0]).toBe(owner);
+		expect(agent.peekSteeringQueue()[0]?.role).toBe("custom");
+		expect(agent.peekSteeringQueue()).not.toContain(staleNotice);
+	});
+
+	it("removes only the selected prompt and its contiguous companions", async () => {
+		const agent = createAgent();
+		const target = createSession(agent);
+		const keep = userMessage("keep", 34, true);
+		const companion = hiddenCompanion("ultrathink-notice", "selected companion", 35);
+		const remove = userMessage("remove", 36, true);
+		const followUp = userMessage("follow up", 37);
+		agent.replaceQueues([keep, companion, remove], [followUp], true);
+		const id = target.getQueuedPrompts().find(prompt => prompt.text === "remove")?.id;
+		if (!id) throw new Error("Expected removable queued prompt id");
+
+		expect(await target.removeQueuedPrompt(id)).toEqual({ status: "updated" });
+		expect(agent.peekSteeringQueue()).toEqual([keep]);
+		expect(agent.peekFollowUpQueue()).toEqual([followUp]);
+		expect(await target.removeQueuedPrompt(id)).toEqual({ status: "stale" });
+	});
+
+	it("restores the newest prompt across timing lanes in reverse chronological order", async () => {
+		const agent = createAgent();
+		const target = createSession(agent);
+		const olderFollowUp = userMessage("older follow-up", 38);
+		const newerSteer = userMessage("newer steer", 39, true);
+		const newestFollowUp = userMessage("newest follow-up", 40);
+		agent.replaceQueues([newerSteer], [olderFollowUp, newestFollowUp], true);
+
+		expect((await target.popLastQueuedMessageDurably())?.text).toBe("newest follow-up");
+		expect((await target.popLastQueuedMessageDurably())?.text).toBe("newer steer");
+		expect((await target.popLastQueuedMessageDurably())?.text).toBe("older follow-up");
+		expect(await target.popLastQueuedMessageDurably()).toBeUndefined();
+	});
+
+	it("restores by chronology after retiming appends an older prompt behind a newer one", async () => {
+		const agent = createAgent();
+		const target = createSession(agent);
+		agent.state.isStreaming = true;
+		const olderFollowUp = userMessage("older retimed", 41);
+		const newerSteer = userMessage("newer stays newest", 42, true);
+		agent.replaceQueues([newerSteer], [olderFollowUp], true);
+		const olderId = target.getQueuedPrompts().find(prompt => prompt.text === "older retimed")?.id;
+		if (!olderId) throw new Error("Expected older queued prompt");
+
+		expect(await target.setQueuedPromptDelivery(olderId, "steer")).toEqual({ status: "updated" });
+		expect(agent.peekSteeringQueue()).toEqual([newerSteer, olderFollowUp]);
+		expect((await target.popLastQueuedMessageDurably())?.text).toBe("newer stays newest");
+		expect((await target.popLastQueuedMessageDurably())?.text).toBe("older retimed");
+		agent.state.isStreaming = false;
 	});
 
 	it("retimes only the selected owner and its contiguous preceding companions", async () => {
@@ -255,6 +502,8 @@ describe("AgentSession queued prompt seam", () => {
 		if (!staleId) throw new Error("Expected stale prompt id");
 		agent.clearAllQueues();
 		expect(await target.setQueuedPromptDelivery(staleId, "afterCurrent")).toEqual({ status: "stale" });
+		expect(await target.updateQueuedPromptText(staleId, "still stale")).toEqual({ status: "stale" });
+		expect(await target.removeQueuedPrompt(staleId)).toEqual({ status: "stale" });
 
 		const liveOwner = userMessage("live", 41, true);
 		agent.replaceQueues([liveOwner], [], true);
@@ -263,6 +512,14 @@ describe("AgentSession queued prompt seam", () => {
 		const replaceQueues = vi.spyOn(agent, "replaceQueues");
 		target.setLifecycleTransitionFenceForTests(true);
 		expect(await target.setQueuedPromptDelivery(liveId, "afterCurrent")).toEqual({
+			status: "unavailable",
+			reason: "session_transition",
+		});
+		expect(await target.updateQueuedPromptText(liveId, "blocked edit")).toEqual({
+			status: "unavailable",
+			reason: "session_transition",
+		});
+		expect(await target.removeQueuedPrompt(liveId)).toEqual({
 			status: "unavailable",
 			reason: "session_transition",
 		});
@@ -280,6 +537,7 @@ describe("AgentSession queued prompt seam", () => {
 	it("promotes an interrupt block before aborting and keeps interrupt out of persistent delivery metadata", async () => {
 		const agent = createAgent();
 		const target = createSession(agent);
+		agent.state.isStreaming = true;
 		const existingFirst = userMessage("existing first", 50, true);
 		const existingSecond = userMessage("existing second", 51, true);
 		const earlierFollowUp = userMessage("earlier follow-up", 52);
@@ -315,6 +573,26 @@ describe("AgentSession queued prompt seam", () => {
 		expect(agent.peekSteeringQueue()[1]).toBe(owner);
 		expect(owner.steering).toBe(true);
 		expect(target.getQueuedPrompts().find(prompt => prompt.id === id)).toMatchObject({ id, delivery: "steer" });
+		agent.state.isStreaming = false;
+	});
+
+	it("refuses NOW when the active turn ended before confirmation", async () => {
+		const agent = createAgent();
+		const target = createSession(agent);
+		const owner = userMessage("too late to interrupt", 59);
+		agent.replaceQueues([], [owner], true);
+		const id = target.getQueuedPrompts()[0]?.id;
+		if (!id) throw new Error("Expected queued prompt id");
+		const replaceQueues = vi.spyOn(agent, "replaceQueues");
+		const abort = vi.spyOn(target, "abort");
+
+		expect(await target.setQueuedPromptDelivery(id, "interrupt")).toEqual({
+			status: "unavailable",
+			reason: "no_active_turn",
+		});
+		expect(replaceQueues).not.toHaveBeenCalled();
+		expect(abort).not.toHaveBeenCalled();
+		expect(target.getQueuedPrompts()[0]).toMatchObject({ id, delivery: "afterCurrent" });
 	});
 
 	it("converts a collab prompt retimed to after-current as a raw user turn", async () => {

@@ -87,6 +87,9 @@ function createContext(sessionOverride?: InteractiveModeContext["session"]) {
 			maybeStartTitleGeneration: vi.fn(),
 			queuedMessageCount: 0,
 			getQueuedMessages: () => ({ steering: [], followUp: [] }),
+			getQueuedPrompts: () => [],
+			getQueuedPromptDraft: (_id: string) => undefined,
+			getQueuedPromptTimestamp: (_id: string) => undefined,
 		} as unknown as InteractiveModeContext["session"]);
 
 	const ctx = {
@@ -234,11 +237,10 @@ describe("InputController orphaned submit", () => {
 	it("returns queued images to the pending-image buffer on queue restore", async () => {
 		const { ctx, editor } = createContext();
 		const image = { type: "image" as const, data: "abc", mimeType: "image/png" };
-		const session = ctx.session as unknown as { clearQueueDurably: () => Promise<unknown> };
-		session.clearQueueDurably = async () => ({
-			steering: [{ text: "queued with image", images: [image] }],
-			followUp: [],
-		});
+		const session = ctx.session as unknown as {
+			popLastQueuedMessageDurably: () => Promise<{ text: string; images: (typeof image)[] } | undefined>;
+		};
+		session.popLastQueuedMessageDurably = async () => ({ text: "queued with image", images: [image] });
 		const controller = new InputController(ctx);
 
 		const restored = await controller.restoreQueuedMessagesToEditor();
