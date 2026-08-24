@@ -34,6 +34,7 @@ import {
 	isMinimaxM3FamilyModelId,
 	isOpenAIGptOssModelId,
 	isQwen38_24TA95BModelId,
+	isQwenModelId,
 	supportsAdaptiveThinkingDisplay,
 } from "./identity/family";
 import type {
@@ -185,7 +186,9 @@ function fillThinkingWireDefaults<TApi extends Api>(
 		thinking.supportsDisplay === undefined &&
 		(spec.api === "anthropic-messages" || spec.api === "bedrock-converse-stream") &&
 		supportsAdaptiveThinkingDisplay(spec.id);
-	const needsRequiresEffort = thinking.requiresEffort === undefined && impliesMandatoryReasoning(parsed, spec, compat);
+	const needsRequiresEffort =
+		thinking.requiresEffort === undefined &&
+		(impliesMandatoryReasoning(parsed, spec, compat) || isOpenCodeGatewayOxAlphaModel(spec));
 	const needsDefaultLevel =
 		thinking.defaultLevel === undefined && (isKimiK3ModelId(spec.id) || isGlm53ReasoningEffortModelId(spec.id));
 	if (!effortsChanged && !shouldReplaceEffortMap && !needsDisplay && !needsRequiresEffort && !needsDefaultLevel) {
@@ -238,7 +241,7 @@ export function deriveThinking<TApi extends Api>(spec: ModelSpec<TApi>, compat: 
 	) {
 		config.supportsDisplay = true;
 	}
-	if (impliesMandatoryReasoning(parsed, spec, compat)) {
+	if (impliesMandatoryReasoning(parsed, spec, compat) || isOpenCodeGatewayOxAlphaModel(spec)) {
 		config.requiresEffort = true;
 	}
 	return config;

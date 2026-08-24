@@ -147,13 +147,9 @@ async function sendCoworkRequest(
 	const method = init.method ?? "GET";
 	const signal = init.signal ?? undefined;
 	const tlsOptions = resolveTlsOptions(url, init.tls);
-	const lease = await acquireAgent(url, init.proxy, tlsOptions, signal);
-	try {
-		init[COWORK_PROVIDER_DISPATCH_GUARD]?.();
-	} catch (error) {
-		lease.release?.();
-		throw error;
-	}
+	// Yield once before opening the socket so queued stale-turn invalidations can run.
+	await Promise.resolve();
+	init[COWORK_PROVIDER_DISPATCH_GUARD]?.();
 	const headers = buildOrderedHeaders(url, sourceHeaders, body);
 	const result = Promise.withResolvers<Response>();
 	let request: ClientRequest | undefined;

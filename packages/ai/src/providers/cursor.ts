@@ -647,6 +647,11 @@ function streamCursorWithWireMode(
 		let sawTurnEnded = false;
 		let endStreamError: Error | null = null;
 		let dispatchError: Error | null = null;
+		// Blocks the discovered-id retry once the turn produced observable output or
+		// ran a side effect (streamed content/tool call, exec bridge, permission
+		// reply). Pure keepalive heartbeats never set it, so a `not_found` that
+		// arrives after a heartbeat but before any real work still falls back.
+		let sawProgressOrSideEffect = false;
 		// Reachable from the catch: a stream that dies mid-turn must still close
 		// and pair the blocks it left open, and `state` itself is scoped to the
 		// try below.
