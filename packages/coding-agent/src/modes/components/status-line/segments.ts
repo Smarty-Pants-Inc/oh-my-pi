@@ -295,13 +295,14 @@ const pathSegment: StatusLineSegment = {
 	render(ctx) {
 		const opts = ctx.options.path ?? {};
 		const stripPrefix = opts.stripWorkPrefix !== false;
-		const replicatedCwd = ctx.collab?.role === "guest" ? ctx.collab.stateOverride?.cwd : undefined;
+		const isReplicatedGuest = ctx.collab?.role === "guest";
+		const replicatedCwd = isReplicatedGuest ? sanitizeStatusText(ctx.collab?.stateOverride?.cwd ?? "") : undefined;
 
 		// Linked git worktree: the on-disk path nests the worktree base, the
 		// project, and a worktree dir that usually duplicates the branch (already
 		// shown by the git segment). Collapse to the project name, appending the
 		// worktree dir only when it diverges from the branch.
-		if (!replicatedCwd && stripPrefix && ctx.worktree) {
+		if (!isReplicatedGuest && stripPrefix && ctx.worktree) {
 			const { projectName, worktreeName } = ctx.worktree;
 			const label = ctx.git.branch === worktreeName ? projectName : `${projectName}/${worktreeName}`;
 			const text = clampPathLength(label, opts.maxLength ?? 40);
@@ -309,7 +310,7 @@ const pathSegment: StatusLineSegment = {
 			return { content: theme.fg("statusLinePath", content), visible: true };
 		}
 
-		const projectDir = replicatedCwd ?? ctx.activeRepo?.cwd ?? getProjectDir();
+		const projectDir = isReplicatedGuest ? (replicatedCwd ?? "") : (ctx.activeRepo?.cwd ?? getProjectDir());
 		const { scratch, relative } = classifyProjectDir(projectDir);
 		let pwd = projectDir;
 
@@ -320,7 +321,7 @@ const pathSegment: StatusLineSegment = {
 				pwd = stripDisplayRoot(pwd);
 			}
 		}
-		const repoSuffix = !replicatedCwd && ctx.activeRepo ? ` ↳ ${ctx.activeRepo.relativeRepoRoot}` : "";
+		const repoSuffix = !isReplicatedGuest && ctx.activeRepo ? ` ↳ ${ctx.activeRepo.relativeRepoRoot}` : "";
 		if (opts.abbreviate !== false) {
 			pwd = shortenPath(pwd);
 		}
