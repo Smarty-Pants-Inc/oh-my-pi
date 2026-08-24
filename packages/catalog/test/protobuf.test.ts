@@ -141,3 +141,19 @@ it("resolves recursive static message descriptors on demand", () => {
 
 	expect(decoded.child?.child?.label).toBe("leaf");
 });
+
+it("round-trips a map whose key is __proto__ without prototype pollution", () => {
+	// An object-literal `__proto__` sets the prototype instead of an own key,
+	// so build the entries through JSON.parse to get a genuine own data key.
+	const entries = JSON.parse('{"__proto__":"polluted","safe":"ok"}') as Record<string, string>;
+	const decoded = StringMapSchema.decode(StringMapSchema.encode({ entries }));
+
+	expect(Object.getPrototypeOf(decoded.entries)).toBeNull();
+	expect(Object.keys(decoded.entries).sort()).toEqual(["__proto__", "safe"]);
+	expect(Reflect.get(decoded.entries, "__proto__")).toBe("polluted");
+	expect(decoded.entries.safe).toBe("ok");
+
+	const json = StringMapSchema.toJson(decoded) as { entries: Record<string, string> };
+	expect(Object.keys(json.entries).sort()).toEqual(["__proto__", "safe"]);
+	expect(Reflect.get(json.entries, "__proto__")).toBe("polluted");
+});

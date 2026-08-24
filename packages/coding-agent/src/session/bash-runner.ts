@@ -2,7 +2,7 @@ import * as path from "node:path";
 import type { Agent } from "@oh-my-pi/pi-agent-core";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
-import { type BashResult, executeBash as executeBashCommand } from "../exec/bash-executor";
+import { type BashPtyOptions, type BashResult, executeBash as executeBashCommand } from "../exec/bash-executor";
 import type { ExtensionRunner } from "../extensibility/extensions";
 import { outputMeta } from "../tools/output-meta";
 import { clampTimeout } from "../tools/tool-timeouts";
@@ -111,7 +111,7 @@ export class BashRunner {
 	executeBash(
 		command: string,
 		onChunk?: (chunk: string) => void,
-		options?: { excludeFromContext?: boolean; useUserShell?: boolean },
+		options?: { excludeFromContext?: boolean; useUserShell?: boolean; pty?: BashPtyOptions },
 	): Promise<BashResult> {
 		const target = this.#captureSessionTarget();
 		const lifetime: BashCommandLifetime = { retainedSide: false };
@@ -128,7 +128,7 @@ export class BashRunner {
 		lifetime: BashCommandLifetime,
 		command: string,
 		onChunk?: (chunk: string) => void,
-		options?: { excludeFromContext?: boolean; useUserShell?: boolean },
+		options?: { excludeFromContext?: boolean; useUserShell?: boolean; pty?: BashPtyOptions },
 	): Promise<BashResult> {
 		let targetTransferred = false;
 		const excludeFromContext = options?.excludeFromContext === true;
@@ -153,6 +153,11 @@ export class BashRunner {
 				}
 			}
 
+			const shellEnv =
+				options?.useUserShell === true
+					? extensionRunner?.getRegisteredTool("bash")?.definition.shellEnv?.({ command, cwd, env: process.env })
+					: undefined;
+
 			const result = await executeBashCommand(command, {
 				onChunk,
 				signal: abortController.signal,
@@ -160,7 +165,9 @@ export class BashRunner {
 				cwd,
 				timeout: clampTimeout("bash", undefined, this.#host.settings.get("tools.maxTimeout")) * 1000,
 				onMinimizedSave: originalText => this.#saveOriginalArtifact(target, originalText),
+				env: shellEnv,
 				useUserShell: options?.useUserShell,
+				pty: options?.pty,
 			});
 			targetTransferred = true;
 			await this.#recordResultForTarget(target, lifetime.retainedSide, command, result, options);

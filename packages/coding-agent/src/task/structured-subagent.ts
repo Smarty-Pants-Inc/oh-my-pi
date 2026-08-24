@@ -633,6 +633,10 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 	let requiresRecoveryArtifacts = false;
 	let completedSuccessfully = false;
 	let deferredCleanup: Promise<void> | undefined;
+	const onSubprocessResult =
+		request.invocationKind === "eval"
+			? (result: SingleResult) => request.session.recordEvalSubagentUsage?.(result.usage?.output ?? 0)
+			: undefined;
 	try {
 		const id = await reserveStructuredSubagentId(request.session, {
 			...request.identity,
