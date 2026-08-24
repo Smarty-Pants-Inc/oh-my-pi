@@ -6956,20 +6956,18 @@ export class AgentSession {
 	async prompt(text: string, options?: PromptOptions): Promise<boolean> {
 		const abort = this.#abortPromise;
 		if (abort) await abort;
-		// A manual `/compact` runs with the agent subscription disconnected until its
-		// cleanup finally re-drains the preserved queues. Starting a turn before then
-		// would neither persist nor forward its events and could race the in-flight
-		// history rewrite. `abort` still overtakes compaction; ordinary prompts wait
-		// here. No-op when no manual compaction is active.
-		await this.#maintenance.manualCompactionCleanup;
-		const lifecycleGeneration = this.#lifecycleTransitionGeneration;
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
-		const typedText = text;
 		const queueDuringSemanticMaintenance =
 			this.#semanticDeliveryMaintenanceFenceActive &&
 			options?.streamingBehavior !== undefined &&
 			!options.synthetic &&
 			!(expandPromptTemplates && text.startsWith("/"));
+		// A manual `/compact` runs with the agent subscription disconnected until its
+		// cleanup finally re-drains the preserved queues. Ordinary prompts must wait,
+		// while an explicit steer/follow-up remains allowed to join that preserved queue.
+		if (!queueDuringSemanticMaintenance) await this.#maintenance.manualCompactionCleanup;
+		const lifecycleGeneration = this.#lifecycleTransitionGeneration;
+		const typedText = text;
 		if (queueDuringSemanticMaintenance) this.#assertQueuedUserMessageCanStart(lifecycleGeneration);
 		else this.#assertPromptCanStart(lifecycleGeneration);
 		const promptAttribution = options?.attribution ?? (options?.synthetic ? "agent" : "user");

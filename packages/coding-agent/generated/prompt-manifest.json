@@ -3262,7 +3262,7 @@
     },
     {
       "id": "tool.bash",
-      "descriptionSha256": "7bcdf38a23d1c9250b46733dd6827dcdc8514d67327bcf7e6fec16ecaee8f9cd",
+      "descriptionSha256": "0b788dd2c8a3255a26a277f04bbe4bf4fc15d6d8bf331cbd302621fbc3bd4d5b",
       "schemaSha256": "3262488c7bfecb7ab7e06798671ef48a3c1436e3f46068f3368569adf26f488b"
     },
     {
@@ -3292,7 +3292,7 @@
     },
     {
       "id": "tool.eval",
-      "descriptionSha256": "4e430d333b83a8ae7b8f289c6188f8c5ec6671d0405145058da08964e84d09a8",
+      "descriptionSha256": "b6ec6fab27433289bf48d87080a91a042b3d3d3bad2cd38932f6b269856d16e8",
       "schemaSha256": "3974f0dba834dc8866a31d34439b27541a14bb9c9f911e71d19a0232aa4425ff"
     },
     {
@@ -3322,7 +3322,7 @@
     },
     {
       "id": "tool.hub",
-      "descriptionSha256": "adf345647d307dabc34f7bf083cfc4f4ceaebc6a433c1a66a0c356b39fc9c405",
+      "descriptionSha256": "a25de18577b76593651f28d6c630b3b3ebda63a1ac0bd9c9c82144ada8f61047",
       "schemaSha256": "6c5ddad215c05322a637bb74647a10229d807bc15adb5aa64ffad29bbf8fb483"
     },
     {
@@ -3393,7 +3393,7 @@
     {
       "id": "tool.todo",
       "descriptionSha256": "c9cb8d1614b17803bc70dcf25933c0473d636fa5398efb45ab01aef3c0b628f6",
-      "schemaSha256": "fd7687479ccf81643d0a75eae2843bfd041f2490c74e115925dba463b8fed838"
+      "schemaSha256": "128c5d45a33c3b9b009577b115503974ec90bc1862d99b636d80e1345eb2709b"
     },
     {
       "id": "tool.tts",
@@ -4784,7 +4784,7 @@
     },
     {
       "path": "packages/agent/src/compaction/messages.ts",
-      "sha256": "3a69635b7c3f2961083740821748ca746e10d81d79a716046f2ca3764c789de0"
+      "sha256": "179340d1345e2ab6c428f9e89937ba4c622a6b5510ed387ccc9cc825ca2a9a08"
     },
     {
       "path": "packages/agent/src/compaction/openai.ts",
@@ -6168,7 +6168,7 @@
     },
     {
       "path": "packages/catalog/src/model-thinking.ts",
-      "sha256": "b284acb56f82ac8161de5ba1660c289079bccfaf3c1838699861aade4faad753"
+      "sha256": "23d4590d94c03e86d4a6b12860414c2aab559b7816e6ac3cf7c5031069263885"
     },
     {
       "path": "packages/catalog/src/model-tokenizer.ts",
@@ -6256,7 +6256,7 @@
     },
     {
       "path": "packages/coding-agent/generated/tool-contracts.json",
-      "sha256": "422a3232cb61680eef1e169a0ed8d8e245cc17d825918bdcdce9b93510410432"
+      "sha256": "37f306c49bb8fb75d77584f3f1605c06a86b3e9b3aa5a9ed5a3311c90cfa37d1"
     },
     {
       "path": "packages/coding-agent/package.json",
@@ -8044,7 +8044,7 @@
     },
     {
       "path": "packages/coding-agent/src/main.ts",
-      "sha256": "f11be1a7bd656ccfb82a7634dd2f1322e8213c16abd727cfd7e0a1119780ff7d"
+      "sha256": "9bc4c4de8d4a12affd5efbb31abe9962f037877ff8ab598397b0636df12b565c"
     },
     {
       "path": "packages/coding-agent/src/markit/converters/docx.ts",
@@ -8404,7 +8404,7 @@
     },
     {
       "path": "packages/coding-agent/src/modes/controllers/input-controller.ts",
-      "sha256": "10ed5293252fd42d26d405ff62dc9c492369f93a0541322f4a705f99fcc18da1"
+      "sha256": "3c74139fba1ec51710b5fdcda0f89f41404c9b17860ff364e53c44b4131eb644"
     },
     {
       "path": "packages/coding-agent/src/modes/controllers/live-command-controller.ts",
@@ -8716,7 +8716,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/agent-session.ts",
-      "sha256": "09cb90461d4b9439fe08b6cf34f21a71d89c6693f70ea90d65a03b442615ce7b"
+      "sha256": "367504a93dc88605bf1383d87c1e27e84a8d786607a48b90977fc3985b638a12"
     },
     {
       "path": "packages/coding-agent/src/session/agent-storage.ts",
@@ -9184,7 +9184,7 @@
     },
     {
       "path": "packages/coding-agent/src/task/isolation-runner.ts",
-      "sha256": "c1e1efc944f9b3adf9f84977bc0f3dc4fbe9e1441eca54317b03e962f52c5205"
+      "sha256": "f831edd1823f3ca6ac2b7d9bfc4b42286ebe84e1efd8aeeeb6c61bfe33b75ea1"
     },
     {
       "path": "packages/coding-agent/src/task/label.ts",
@@ -9240,7 +9240,7 @@
     },
     {
       "path": "packages/coding-agent/src/task/structured-subagent.ts",
-      "sha256": "f2724f0a0e7f79644db23f3ab29d82e176c9d920508b50bf39ef3a2851076ac7"
+      "sha256": "95aef7318924ce6b68342595a2c70c6b87176d9274093fe3810e6095eff2d6f6"
     },
     {
       "path": "packages/coding-agent/src/task/subprocess-tool-registry.ts",
@@ -11020,5 +11020,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "0a601dc4ea0d12134a8d9c68ea0f9578d06907e6ffb4d74775c44383be4f32fe"
+  "rootSha256": "cc4eeb9a1f3743d4be839ef22cd10ac655a40392c1472b063d2013fc1bef4da1"
 }

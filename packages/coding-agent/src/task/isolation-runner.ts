@@ -277,6 +277,7 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 					}
 				: {}),
 		});
+		opts.onSubprocessResult?.(result);
 		if (deferredCleanup) return rememberAgentArtifacts(result);
 
 		if (lease) {

@@ -666,9 +666,9 @@ async function runInteractiveMode(
 	initialImages?: ImageContent[],
 	joinLink?: string,
 	companionStatusTextSink?: (statusText?: string) => void,
-	bridge?: CollabBridgeBootstrap,
 	startBackgroundModelDiscovery?: () => Promise<void>,
 	startupLease?: ComposerLease,
+	bridge?: CollabBridgeBootstrap,
 ): Promise<void> {
 	let mode: InteractiveMode;
 	try {
@@ -1621,6 +1621,9 @@ export async function runRootCommand(
 		if (!isInteractive) {
 			stopPendingStartupComposer();
 		}
+		await deps.verifyApprovedStartup?.(isInteractive);
+		const automaticHerdrHostBridge =
+			isInteractive && deps.collabBridge === undefined ? deps.herdrHostBridge : undefined;
 		// Auth and settings are independent; start both before awaiting either.
 		// A configured-but-unreachable auth broker still receives the actionable
 		// startup error below, while its cache/config I/O overlaps settings I/O.
@@ -1639,9 +1642,6 @@ export async function runRootCommand(
 			process.stderr.write(`${chalk.red(`Error: ${message}`)}\n`);
 			process.exit(1);
 		}
-		await deps.verifyApprovedStartup?.(isInteractive);
-		const automaticHerdrHostBridge =
-			isInteractive && deps.collabBridge === undefined ? deps.herdrHostBridge : undefined;
 		const companionLaunchEnv = (deps.consumeFreshOmpCompanionLaunchEnv ?? consumeFreshOmpCompanionLaunchEnv)();
 		const companionSecret = await consumeFreshOmpCompanionSecret({
 			isInteractive,
@@ -2253,9 +2253,9 @@ export async function runRootCommand(
 						initialImages,
 						parsedArgs.join,
 						activeCompanionController?.setStatusText,
-						interactiveCollabBridge,
 						startBackgroundModelDiscovery,
 						startupLease,
+						interactiveCollabBridge,
 					);
 				} finally {
 					startupLease?.dispose();

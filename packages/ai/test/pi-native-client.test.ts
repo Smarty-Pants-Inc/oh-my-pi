@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, it, type Mock, mock, spyOn } from "bun:test";
 import { createHash } from "node:crypto";
 import { streamPiNative } from "@oh-my-pi/pi-ai/providers/pi-native-client";
-import { streamSimple } from "@oh-my-pi/pi-ai/stream";
 import type {
 	PiNativeBoundaryApprovalDecision,
 	PiNativeBoundaryApprovalKind,
@@ -9,6 +8,7 @@ import type {
 	PiNativeBoundaryPreparation,
 	PiNativeBoundaryPreparationEvent,
 } from "@oh-my-pi/pi-ai/providers/pi-native-server";
+import { streamSimple } from "@oh-my-pi/pi-ai/stream";
 import type {
 	AssistantMessage,
 	AssistantMessageEvent,

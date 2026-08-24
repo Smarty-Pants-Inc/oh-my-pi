@@ -660,22 +660,27 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 				);
 			}
 		}
-		const result = !isolationContext
-			? await runSubprocess(baseOptions)
-			: await runIsolatedSubprocess({
-					baseOptions,
-					context: isolationContext,
-					preferredBackend: parseIsolationMode(request.session.settings.get("task.isolation.mode")),
-					agentId: id,
-					mergeMode: policy.mergeMode,
-					...(policy.executionEnvironmentProvider
-						? { executionEnvironmentProvider: policy.executionEnvironmentProvider }
-						: {}),
-					artifactsDir: lease.artifactsDir,
-					description: trimToUndefined(request.identity?.label),
-					buildCommitMessage: makeIsolationCommitMessage(request.session),
-					buildFailureResult: buildFailureResult(request, policy, id, Date.now()),
-				});
+		let result: SingleResult;
+		if (!isolationContext) {
+			result = await runSubprocess(baseOptions);
+			onSubprocessResult?.(result);
+		} else {
+			result = await runIsolatedSubprocess({
+				baseOptions,
+				context: isolationContext,
+				preferredBackend: parseIsolationMode(request.session.settings.get("task.isolation.mode")),
+				agentId: id,
+				mergeMode: policy.mergeMode,
+				...(policy.executionEnvironmentProvider
+					? { executionEnvironmentProvider: policy.executionEnvironmentProvider }
+					: {}),
+				artifactsDir: lease.artifactsDir,
+				description: trimToUndefined(request.identity?.label),
+				buildCommitMessage: makeIsolationCommitMessage(request.session),
+				buildFailureResult: buildFailureResult(request, policy, id, Date.now()),
+				onSubprocessResult,
+			});
+		}
 		attachStructuredOutputMetadata(result, policy.schema);
 		requiresRecoveryArtifacts =
 			policy.isIsolated &&

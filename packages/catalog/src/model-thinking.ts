@@ -188,7 +188,9 @@ function fillThinkingWireDefaults<TApi extends Api>(
 		supportsAdaptiveThinkingDisplay(spec.id);
 	const needsRequiresEffort =
 		thinking.requiresEffort === undefined &&
-		(impliesMandatoryReasoning(parsed, spec, compat) || isOpenCodeGatewayOxAlphaModel(spec));
+		((effortsChanged && isQwenTemplateReasoningEffortCompat(compat)) ||
+			impliesMandatoryReasoning(parsed, spec, compat) ||
+			isOpenCodeGatewayOxAlphaModel(spec));
 	const needsDefaultLevel =
 		thinking.defaultLevel === undefined && (isKimiK3ModelId(spec.id) || isGlm53ReasoningEffortModelId(spec.id));
 	if (!effortsChanged && !shouldReplaceEffortMap && !needsDisplay && !needsRequiresEffort && !needsDefaultLevel) {

@@ -46,7 +46,6 @@ describe("async speculative compaction", () => {
 	let defaultModel: Model;
 	let sessionManager: SessionManager;
 	let maintenance: SessionMaintenance;
-	let agent: Agent;
 	let events: string[];
 	let emittedEvents: Array<{ type: string; errorMessage?: string }>;
 

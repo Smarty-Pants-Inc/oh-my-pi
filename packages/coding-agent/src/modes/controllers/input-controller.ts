@@ -96,6 +96,12 @@ const SHELL_PROMPT_COMMAND_RE =
 	/^(?:\.{0,2}\/|~\/|cd(?:\s|$)|sudo(?:\s|$)|git(?:\s|$)|bun(?:\s|$)|npm(?:\s|$)|pnpm(?:\s|$)|yarn(?:\s|$)|node(?:\s|$)|python\d*(?:\s|$)|cargo(?:\s|$)|go(?:\s|$)|make(?:\s|$)|docker(?:\s|$)|kubectl(?:\s|$))/;
 const SHELL_PROMPT_OPERATOR_RE = /(?:^|\s)(?:&&|\|\||\||2>&1|[<>]{1,2})(?:\s|$)/;
 const OMP_STATUS_LINE_RE = /^\s*in:\s+\d+\s+out:\s+\d+(?:\s+cache\s+\S+)?\s+t:\s+\S+\s+tok\/s:\s+\S+/m;
+const IMAGE_SUBMISSION_MARKER_RE = /[ \t]*\[Image #[1-9]\d*(?:,[^\]\n]*)?\](?:[ \t]+attachment:\/\/[1-9]\d*)?/g;
+
+/** Remove visual image placeholders before sending ordinary prose to the model. */
+function stripImageSubmissionMarkers(text: string): string {
+	return text.replace(IMAGE_SUBMISSION_MARKER_RE, "").trim();
+}
 
 function looksLikePastedShellPrompt(code: string): boolean {
 	const firstLine = code.split("\n", 1)[0]?.trimStart() ?? "";
@@ -684,11 +690,12 @@ export class InputController {
 		this.ctx.ui.addStartListener(() => this.#enhancedPaste?.enable());
 	}
 
-	/** Enforce the deleted-chip contract at submit time: images whose inline token was removed
-	 *  from the draft are dropped, and surviving markers are renumbered to the dense 1..K the
-	 *  positional `[Image #N] ↔ images[N-1]` mapping requires. Returns the rewritten text. */
+	/** Enforce dense image-marker indexing when a draft actually contains markers. */
 	#compactDraftImages(text: string): string {
 		const editor = this.ctx.editor;
+		// Older callers can provide the pending-image buffer separately from the text;
+		// do not discard that buffer merely because the editor text has no marker.
+		if (!/\[Image #[1-9]\d*/.test(text)) return text;
 		const compacted = compactImageMarkers(text, editor.pendingImages.length);
 		if (!compacted) return text;
 		editor.pendingImages = compacted.keep.map(i => editor.pendingImages[i]);
@@ -837,9 +844,10 @@ export class InputController {
 					return;
 				}
 				const images = inputImages && inputImages.length > 0 ? [...inputImages] : undefined;
+				const promptText = stripImageSubmissionMarkers(text);
 				// No local render: the prompt comes back from the host as a
 				// collab-prompt event/entry and renders with the author badge.
-				if (this.ctx.collabGuest.sendPrompt(text, images)) this.ctx.editor.clearDraft(text);
+				if (this.ctx.collabGuest.sendPrompt(promptText, images)) this.ctx.editor.clearDraft(promptText);
 				return;
 			}
 
@@ -928,6 +936,10 @@ export class InputController {
 				return;
 			}
 
+			const draftTextForRestore = text;
+			text = stripImageSubmissionMarkers(text);
+			if (!text && !hasInputImages) return;
+
 			// If streaming, use prompt() with after-current behavior.
 			// This handles extension commands (execute immediately), prompt template expansion, and queueing.
 			if (this.ctx.session.isStreaming) {
@@ -939,6 +951,7 @@ export class InputController {
 				this.ctx.editor.pendingImageLinks = [];
 				// Record the signature so the queued message's eventual delivery
 				// (a user-role `message_start` event) leaves any draft the user has
+
 				// typed since queuing intact. Same protection as #783, applied to
 				// the streaming/queue path.
 				try {
@@ -957,7 +970,7 @@ export class InputController {
 							: images.map(() => undefined);
 						this.ctx.editor.imageLinks = this.ctx.editor.pendingImageLinks;
 					}
-					this.ctx.editor.setCollapsedText(text);
+					this.ctx.editor.setCollapsedText(draftTextForRestore);
 					this.ctx.showError(error instanceof Error ? error.message : String(error));
 				}
 				this.ctx.updatePendingMessagesDisplay();
@@ -1024,7 +1037,7 @@ export class InputController {
 							: images.map(() => undefined);
 						this.ctx.editor.imageLinks = this.ctx.editor.pendingImageLinks;
 					}
-					this.ctx.editor.setCollapsedText(text);
+					this.ctx.editor.setCollapsedText(draftTextForRestore);
 					this.ctx.showError(error instanceof Error ? error.message : String(error));
 				}
 				this.ctx.updatePendingMessagesDisplay();
@@ -1625,7 +1638,11 @@ export class InputController {
 			this.ctx.editor.pendingImageLinks.push(...queuedImages.map(() => undefined));
 			this.ctx.editor.imageLinks = this.ctx.editor.pendingImageLinks;
 		}
-		this.ctx.editor.setCollapsedText(combinedText);
+		if (queuedImages.length > 0) {
+			this.ctx.editor.setCollapsedText(combinedText);
+		} else {
+			this.ctx.editor.setText(combinedText);
+		}
 	}
 
 	async #insertPendingImage(imageData: ImageContent): Promise<void> {

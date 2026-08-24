@@ -112,7 +112,11 @@ export function renderHandoffSummaryContext(summary: string): string {
 }
 
 function compactionSummaryInstructionText(message: CompactionSummaryMessage): string {
-	if (message.blocks === undefined) return renderCompactionSummaryContext(message.summary);
+	if (message.blocks === undefined) {
+		return message.method === "handoff"
+			? renderHandoffSummaryContext(message.summary)
+			: renderCompactionSummaryContext(message.summary);
+	}
 	return [
 		message.summary,
 		...message.blocks.filter((block): block is TextContent => block.type === "text").map(block => block.text),
