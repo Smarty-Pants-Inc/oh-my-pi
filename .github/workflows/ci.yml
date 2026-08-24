@@ -495,7 +495,7 @@ jobs:
          matrix:
             include:
                - {
-                    os: ubuntu-22.04,
+                    os: smarty-linux-16-core,
                     platform: linux,
                     arch: x64,
                     target_id: linux-x64,
@@ -503,7 +503,7 @@ jobs:
                     native_targets: linux-x64-baseline linux-x64-modern,
                  }
                - {
-                    os: ubuntu-22.04,
+                    os: smarty-linux-16-core,
                     platform: linux,
                     libc: musl,
                     arch: x64,
@@ -512,7 +512,7 @@ jobs:
                     native_targets: linux-musl-x64-baseline,
                  }
                - {
-                    os: ubuntu-24.04-arm,
+                    os: smarty-linux-arm-16-core,
                     platform: linux,
                     arch: arm64,
                     target_id: linux-arm64,
@@ -520,7 +520,7 @@ jobs:
                     native_targets: linux-arm64,
                  }
                - {
-                    os: ubuntu-24.04-arm,
+                    os: smarty-linux-arm-16-core,
                     platform: linux,
                     libc: musl,
                     arch: arm64,
@@ -529,7 +529,7 @@ jobs:
                     native_targets: linux-musl-arm64,
                  }
                - {
-                    os: ubuntu-22.04,
+                    os: smarty-linux-16-core,
                     platform: win32,
                     arch: x64,
                     target_id: win32-x64,
@@ -545,10 +545,12 @@ jobs:
            with:
               bun-version: "1.4"
          - name: Cache bun dependencies
-           uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+           uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
            with:
               path: ~/.bun/install/cache
               key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+              restore-keys: |
+                 bun-${{ runner.os }}-
          - run: bun install --frozen-lockfile
          - name: Install prebuilt native addon(s)
            uses: ./.github/actions/native-artifacts
@@ -600,13 +602,13 @@ jobs:
          matrix:
             include:
                - {
-                    os: macos-15-intel,
+                    os: smarty-macos-intel-12-core,
                     target_id: darwin-x64,
                     binary_path: packages/coding-agent/binaries/omp-darwin-x64,
                     native_targets: darwin-x64-baseline,
                  }
                - {
-                    os: macos-14,
+                    os: smarty-macos-arm-5-core,
                     target_id: darwin-arm64,
                     binary_path: packages/coding-agent/binaries/omp-darwin-arm64,
                     native_targets: darwin-arm64,
@@ -622,10 +624,12 @@ jobs:
            with:
               bun-version: "1.4"
          - name: Cache bun dependencies
-           uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+           uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
            with:
               path: ~/.bun/install/cache
               key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+              restore-keys: |
+                 bun-${{ runner.os }}-
          - run: bun install --frozen-lockfile
          # Darwin runners build their own architecture; cross-hosted artifacts
          # do not exist for macOS. The warm workflow keeps these scopes seeded
