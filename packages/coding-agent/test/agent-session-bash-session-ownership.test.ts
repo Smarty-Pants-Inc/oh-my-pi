@@ -245,10 +245,15 @@ describe("AgentSession bash session ownership", () => {
 				display: false,
 				attribution: "agent",
 			},
-			{ deliverAs: "nextTurn", triggerTurn: true, acceptTerminalEmptyStop: true },
+			{
+				deliveryMode: "auto",
+				automaticTurnSource: "peer_message_wake",
+				acceptTerminalEmptyStop: true,
+			},
 		);
+		expect(started).toEqual({ status: "accepted", delivery: "started_turn" });
+		await session.waitForIdle();
 		unsubscribe();
-		expect(started).toBe(true);
 		expect(session.hasPendingBashMessages).toBe(true);
 		const discardedAssistantEntry = sessionManager
 			.getEntries()
