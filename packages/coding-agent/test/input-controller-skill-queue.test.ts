@@ -10,6 +10,7 @@ import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent, TextContent, UserMessage } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { formatKeyHints } from "@oh-my-pi/pi-coding-agent/config/keybindings";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { Skill } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
@@ -894,7 +895,7 @@ describe("UiHelpers / InputController against derived queued custom display", ()
 		expect(rendered).toContain("1. [NEXT] /skill:test-skill arg1 arg2");
 		expect(rendered).not.toContain("Steer:");
 		expect(rendered).toContain("Shift+Up: Manage queued prompts");
-		expect(rendered).toContain("Option+Up to restore newest");
+		expect(rendered).toContain(`${formatKeyHints("alt+up")} to restore newest`);
 		expect(rendered).not.toContain("Shift+Up to restore");
 	});
 
@@ -911,7 +912,7 @@ describe("UiHelpers / InputController against derived queued custom display", ()
 		const rendered = Bun.stripANSI(pendingMessagesContainer.render(120).join("\n"));
 		expect(rendered).toContain("Shift+Up: Edit queued prompt delivery timing");
 		expect(rendered).not.toContain("Shift+Up to restore");
-		expect(rendered).toContain("Option+Up to restore newest");
+		expect(rendered).toContain(`${formatKeyHints("alt+up")} to restore newest`);
 	});
 
 	it("requests the pending-container repaint after rebuilding and clearing it", async () => {
@@ -956,7 +957,7 @@ describe("UiHelpers / InputController against derived queued custom display", ()
 		expect(rendered).toContain("3. [AFTER] summarize");
 		expect(rendered).not.toContain("Follow-up:");
 		expect(rendered).toContain("Shift+Up: Manage queued prompts");
-		expect(rendered).toContain("Option+Up to restore newest");
+		expect(rendered).toContain(`${formatKeyHints("alt+up")} to restore newest`);
 		expect(rendered).not.toContain("Shift+Up to restore");
 	});
 
