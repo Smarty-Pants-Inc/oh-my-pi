@@ -15,6 +15,7 @@
  * Everything renders through the same components, so ctrl+o, theming, and
  * transcript behavior are native by construction.
  */
+import { mkdir } from "node:fs/promises";
 import * as path from "node:path";
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
@@ -490,6 +491,7 @@ export class CollabGuestLink {
 		this.#clearSnapshotProgressTimer();
 		if (!pending || this.#left) return;
 		const replicaPath = path.join(getConfigRootDir(), "collab", `${this.#roomId}.jsonl`);
+		await mkdir(path.dirname(replicaPath), { recursive: true });
 		const lines = [pending.header, ...pending.entries].map(entry => JSON.stringify(entry)).join("\n");
 		await Bun.write(replicaPath, `${lines}\n`);
 		if (this.#left) return;
@@ -500,7 +502,12 @@ export class CollabGuestLink {
 		this.#clearTransientUi();
 		this.#clearAgentMirror();
 		this.#replicaSessionMayBeActive = true;
-		await this.#ctx.session.switchSession(replicaPath);
+		const switched = await this.#ctx.session.switchSession(replicaPath);
+		if (!switched) {
+			this.#replicaSessionMayBeActive = false;
+			this.#welcomed = false;
+			throw new Error("collab replica session switch was cancelled");
+		}
 		this.state = pending.state;
 		reconcileGuestSnapshotHostState(this.#ctx, pending.state.isStreaming);
 		this.#applyHostState(pending.state);
@@ -519,6 +526,7 @@ export class CollabGuestLink {
 		this.#ctx.showStatus(
 			pending.isResync ? `Reconnected to collab session${suffix}` : `Joined collab session${suffix}`,
 		);
+		this.#socket?.notifyReplicaReady?.();
 	}
 
 	#armWelcomeTimer(): void {
@@ -651,12 +659,13 @@ export class CollabGuestLink {
 	 */
 	#applyHostState(state: CollabSessionState): void {
 		const session = this.#ctx.session;
+		const model = state.model;
 		if (
-			state.model &&
-			(session.agent.state.model?.id !== state.model.id ||
-				session.agent.state.model?.provider !== state.model.provider)
+			model &&
+			(session.agent.state.model?.id !== model.id || session.agent.state.model?.provider !== model.provider)
 		) {
-			session.agent.setModel(state.model);
+			session.agent.setModel(model);
+			this.#ctx.refreshModelDisplay?.();
 		}
 		const level = state.thinkingLevel as ThinkingLevel | undefined;
 		session.agent.setThinkingLevel(toReasoningEffort(level));

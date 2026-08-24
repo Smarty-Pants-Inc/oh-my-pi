@@ -87,7 +87,7 @@ function makeHostContext(snapshot: SizedSnapshot): InteractiveModeContext {
 	return ctx as unknown as InteractiveModeContext;
 }
 
-function makeFailingGuestContext(failure: Error): InteractiveModeContext {
+function makeFailingGuestContext(failure: Error, switchResult: boolean | Error = failure): InteractiveModeContext {
 	const ctx = {
 		settings: { get: () => "" },
 		sessionManager: {
@@ -95,6 +95,10 @@ function makeFailingGuestContext(failure: Error): InteractiveModeContext {
 			switchSession: () => Promise.reject(failure),
 		},
 		session: {
+			switchSession: async () => {
+				if (switchResult instanceof Error) throw switchResult;
+				return switchResult;
+			},
 			newSession: () => Promise.resolve(),
 			messages: [],
 		},
@@ -205,18 +209,19 @@ describe("collab chunked welcome (#3144)", () => {
 		const failure = new Error("replica write failed during snapshot resume");
 		const writeSpy = spyOn(Bun, "write").mockRejectedValue(failure);
 		const guest = new CollabGuestLink(makeFailingGuestContext(failure));
-		const joinAttempt = guest.join(host.link);
 		try {
-			await expect(
-				Promise.race([
-					joinAttempt,
-					Bun.sleep(250).then(() => {
-						throw new Error("join did not reject");
-					}),
-				]),
-			).rejects.toThrow("replica write failed during snapshot resume");
+			await expect(guest.join(host.link)).rejects.toThrow("replica write failed during snapshot resume");
 		} finally {
 			writeSpy.mockRestore();
+			await guest.leave("test cleanup").catch(() => {});
+		}
+	});
+
+	it("rejects the pending join when replica session switching is cancelled", async () => {
+		const guest = new CollabGuestLink(makeFailingGuestContext(new Error("unused"), false));
+		try {
+			await expect(guest.join(host.link)).rejects.toThrow("collab replica session switch was cancelled");
+		} finally {
 			await guest.leave("test cleanup").catch(() => {});
 		}
 	});

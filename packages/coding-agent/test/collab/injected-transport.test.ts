@@ -456,7 +456,7 @@ describe("injected collab transport", () => {
 		connectRawPeer(observer, "observer");
 		await flush();
 		const image = { type: "image", data: "aW1hZ2U=", mimeType: "image/png" } as const;
-		local.onFrame?.({ t: "prompt", text: "[Alice] says: raw", images: [image] }, controller.peerId, {
+		local.onFrame?.({ t: "prompt", text: "raw", images: [image] }, controller.peerId, {
 			displayName: "Alice",
 			displayNameRevision: 2,
 		});
@@ -464,9 +464,9 @@ describe("injected collab transport", () => {
 		await flush();
 		expect(prompts).toHaveLength(1);
 		expect(prompts[0]).toMatchObject({
-			content: [{ type: "text", text: "[Alice] says: [Alice] says: raw" }, image],
+			content: [{ type: "text", text: "raw" }, image],
 			details: { from: "Alice", displayNameRevision: 2 },
-			options: { queueChipText: "[Alice] says: [Alice] says: raw" },
+			options: { queueChipText: "raw" },
 		});
 		local.onFrame?.({ t: "prompt", text: "missing revision" }, controller.peerId, { displayName: "Alice" });
 		local.onFrame?.({ t: "prompt", text: "invalid revision" }, controller.peerId, {
@@ -484,7 +484,7 @@ describe("injected collab transport", () => {
 		await flush();
 		expect(prompts).toHaveLength(2);
 		expect(prompts.at(-1)).toMatchObject({
-			content: "[Alice] says: still accepted",
+			content: "still accepted",
 			details: { from: "Alice", displayNameRevision: 3 },
 		});
 	});
@@ -597,7 +597,7 @@ describe("injected collab transport", () => {
 			server.stop(true);
 		}
 	});
-	it("rejects malformed outer attribution without closing the Herdr transport", async () => {
+	it("rejects malformed prompt frames without closing the Herdr transport", async () => {
 		const opened = Promise.withResolvers<Bun.Socket<undefined>>();
 		const server = Bun.listen({
 			hostname: "127.0.0.1",
@@ -625,10 +625,13 @@ describe("injected collab transport", () => {
 				'{"t":"frame","fromPeer":7,"displayName":42,"displayNameRevision":1,"frame":{"t":"prompt","text":"malformed"}}\n',
 			);
 			socket.write(
+				'{"t":"frame","fromPeer":7,"displayName":"Alice","displayNameRevision":2,"frame":{"t":"prompt","text":"bad image","images":[null]}}\n',
+			);
+			socket.write(
 				'{"t":"frame","fromPeer":7,"displayName":"Alice","displayNameRevision":2,"frame":{"t":"prompt","text":"accepted"}}\n',
 			);
 			await accepted.promise;
-			expect(prompts.map(prompt => prompt.content)).toEqual(["[Alice] says: accepted"]);
+			expect(prompts.map(prompt => prompt.content)).toEqual(["accepted"]);
 			await host.stop("test cleanup");
 		} finally {
 			server.stop(true);
@@ -664,7 +667,7 @@ describe("injected collab transport", () => {
 				'{"t":"frame","fromPeer":7,"displayName":"Alice","displayNameRevision":2,"frame":{"t":"prompt","text":"accepted"}}\n',
 			);
 			await accepted.promise;
-			expect(prompts.map(prompt => prompt.content)).toEqual(["[Alice] says: accepted"]);
+			expect(prompts.map(prompt => prompt.content)).toEqual(["accepted"]);
 			await host.stop("test cleanup");
 		} finally {
 			server.stop(true);
@@ -708,7 +711,7 @@ describe("injected collab transport", () => {
 			}
 			await accepted.promise;
 			expect(prompts).toHaveLength(1);
-			expect(prompts[0]?.content).toEqual([{ type: "text", text: "[Alice] says: accepted" }, ...images]);
+			expect(prompts[0]?.content).toEqual([{ type: "text", text: "accepted" }, ...images]);
 			await host.stop("test cleanup");
 		} finally {
 			server.stop(true);

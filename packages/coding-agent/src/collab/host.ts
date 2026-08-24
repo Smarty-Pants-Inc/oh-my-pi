@@ -123,6 +123,12 @@ function isValidHerdrDisplayName(name: string): boolean {
 	return scalars > 0 && Bun.stringWidth(name, { countAnsiEscapeCodes: false }) <= 32;
 }
 
+function isInboundImageContent(value: unknown): value is ImageContent {
+	if (!value || typeof value !== "object") return false;
+	const image = value as Record<string, unknown>;
+	return image.type === "image" && typeof image.data === "string" && typeof image.mimeType === "string";
+}
+
 function isValidHerdrDisplayNameRevision(revision: number | undefined): revision is number {
 	return typeof revision === "number" && Number.isSafeInteger(revision) && revision >= 1;
 }
@@ -146,7 +152,7 @@ function isInboundGuestFrame(frame: unknown): frame is InboundGuestFrame {
 			return (
 				typeof value.text === "string" &&
 				(value.displayName === undefined || typeof value.displayName === "string") &&
-				(value.images === undefined || Array.isArray(value.images))
+				(value.images === undefined || (Array.isArray(value.images) && value.images.every(isInboundImageContent)))
 			);
 		case "abort":
 			return true;
@@ -173,6 +179,36 @@ function isWireAgentEvent(event: AgentSessionEvent): event is AgentSessionEvent 
 
 function isWireSessionEntry(entry: StoredSessionEntry): entry is StoredSessionEntry & WireSessionEntry {
 	return entry.type in WIRE_SESSION_ENTRY_TYPES;
+}
+
+type ReplicatedSessionEntry = StoredSessionEntry & WireSessionEntry;
+
+/** Project one durable entry onto the wire-visible branch without exposing internal entries. */
+function projectWireSessionEntry(
+	entry: StoredSessionEntry,
+	nearestWireAncestorByEntryId: Map<string, string | null>,
+): ReplicatedSessionEntry | null {
+	const parentId = entry.parentId === null ? null : (nearestWireAncestorByEntryId.get(entry.parentId) ?? null);
+	if (!isWireSessionEntry(entry)) {
+		nearestWireAncestorByEntryId.set(entry.id, parentId);
+		return null;
+	}
+	nearestWireAncestorByEntryId.set(entry.id, entry.id);
+	return parentId === entry.parentId ? entry : { ...entry, parentId };
+}
+
+/** Remove non-wire entries while reconnecting every retained child to its nearest retained ancestor. */
+function projectWireSessionEntries(entries: readonly StoredSessionEntry[]): {
+	entries: ReplicatedSessionEntry[];
+	nearestWireAncestorByEntryId: Map<string, string | null>;
+} {
+	const nearestWireAncestorByEntryId = new Map<string, string | null>();
+	const projected: ReplicatedSessionEntry[] = [];
+	for (const entry of entries) {
+		const wireEntry = projectWireSessionEntry(entry, nearestWireAncestorByEntryId);
+		if (wireEntry) projected.push(wireEntry);
+	}
+	return { entries: projected, nearestWireAncestorByEntryId };
 }
 const CONNECT_TIMEOUT_MS = 15_000;
 /** Max source bytes served per fetch-transcript reply (guest re-requests from `newSize`).
@@ -217,6 +253,7 @@ export class CollabHost {
 	#registryUnsubscribe?: () => void;
 	#stopped = false;
 	#entryAppendedUnsubscribe?: () => void;
+	#nearestWireAncestorByEntryId = new Map<string, string | null>();
 
 	#trustedLocalTransport = false;
 	#privateHost = false;
@@ -388,7 +425,8 @@ export class CollabHost {
 		}
 		this.#registryUnsubscribe = AgentRegistry.global().onChange(() => this.#scheduleAgentsBroadcast());
 		const entryListener = (entry: StoredSessionEntry): void => {
-			if (isWireSessionEntry(entry)) this.#broadcast({ t: "entry", entry: shrinkForReplication(entry) });
+			const wireEntry = projectWireSessionEntry(entry, this.#nearestWireAncestorByEntryId);
+			if (wireEntry) this.#broadcast({ t: "entry", entry: shrinkForReplication(wireEntry) });
 			this.#scheduleStateBroadcast();
 		};
 		const subscribeEntryAppended = this.#ctx.sessionManager.subscribeEntryAppended;
@@ -552,7 +590,9 @@ export class CollabHost {
 			}
 			logger.info("collab welcome exceeded size threshold; stripped images", { stripped });
 		}
-		const entries = snapshot.entries.filter(isWireSessionEntry);
+		const projection = projectWireSessionEntries(snapshot.entries);
+		this.#nearestWireAncestorByEntryId = projection.nearestWireAncestorByEntryId;
+		const entries = projection.entries;
 		const socket = this.#socket;
 		if (!socket) return;
 		socket.send(
@@ -647,9 +687,8 @@ export class CollabHost {
 			return;
 		}
 		const name = this.#requiresHerdrAttribution ? displayName : peer.name;
-		const attributedText = this.#requiresHerdrAttribution ? `[${name}] says: ${text}` : text;
 		const content: string | (TextContent | ImageContent)[] =
-			images && images.length > 0 ? [{ type: "text", text: attributedText }, ...images] : attributedText;
+			images && images.length > 0 ? [{ type: "text", text }, ...images] : text;
 		const details: CollabPromptDetails = this.#requiresHerdrAttribution
 			? { from: name, displayNameRevision }
 			: { from: name };
@@ -667,7 +706,7 @@ export class CollabHost {
 					details,
 					attribution: "user",
 				},
-				{ streamingBehavior: "steer", queueChipText: attributedText },
+				{ streamingBehavior: "steer", queueChipText: text },
 			)
 			.catch(err => {
 				logger.warn("collab guest prompt failed", { error: String(err) });

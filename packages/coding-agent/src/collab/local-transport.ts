@@ -141,6 +141,11 @@ export class LocalCollabTransport implements CollabTransport {
 		return true;
 	}
 
+	notifyReplicaReady(): void {
+		if (!this.isOpen || !this.#socket) return;
+		this.#socket.write('{"t":"replica-ready"}\n');
+	}
+
 	requestAuthority(action: "request" | "release"): boolean {
 		if (!this.isOpen || !this.#socket) return false;
 		this.#socket.write(`${JSON.stringify({ t: "control", action: `${action}-controller` })}\n`);

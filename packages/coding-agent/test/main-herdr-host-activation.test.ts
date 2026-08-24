@@ -85,7 +85,11 @@ describe("automatic Herdr host activation", () => {
 		const selectSetupScenes = vi.spyOn(setupWizardModule, "selectSetupScenes").mockRejectedValue(setupEntered);
 		const runSetupWizard = vi.spyOn(setupWizardModule, "runSetupWizard").mockRejectedValue(setupEntered);
 		const runStartupSplash = vi.spyOn(setupWizardModule, "runStartupSplash").mockRejectedValue(setupEntered);
-		const join = vi.spyOn(collabGuestModule.CollabGuestLink.prototype, "joinWithTransport").mockResolvedValue();
+		const join = vi
+			.spyOn(collabGuestModule.CollabGuestLink.prototype, "joinWithTransport")
+			.mockImplementation(async () => {
+				await mode?.renderInitialMessages({ clearTerminalHistory: true });
+			});
 		vi.spyOn(InteractiveMode.prototype, "init").mockImplementation(async function (this: InteractiveMode, options) {
 			mode = this;
 			initOptions = options;
@@ -115,15 +119,66 @@ describe("automatic Herdr host activation", () => {
 			expect(selectSetupScenes).not.toHaveBeenCalled();
 			expect(runSetupWizard).not.toHaveBeenCalled();
 			expect(runStartupSplash).not.toHaveBeenCalled();
-			expect(initOptions).toEqual({ suppressWelcomeIntro: true, clearInitialTerminalHistory: true });
+			expect(initOptions).toEqual({
+				suppressWelcomeIntro: true,
+				clearInitialTerminalHistory: true,
+			});
 			expect(join).toHaveBeenCalledTimes(1);
+			expect(renderInitialMessages).toHaveBeenCalledTimes(1);
 			expect(renderInitialMessages).toHaveBeenCalledWith({
-				preserveExistingChat: true,
 				clearTerminalHistory: true,
 			});
 		} finally {
 			mode?.stop();
 			await sessionManager.close();
+			authStorage.close();
+		}
+	});
+
+	it("suppresses local model and update notices for an authoritative guest replica", async () => {
+		using tempDir = TempDir.createSync("@omp-private-guest-notices-");
+		const settings = Settings.isolated({
+			"marketplace.autoUpdate": "off",
+			"startup.changelogMode": "off",
+			"startup.checkUpdate": true,
+			"startup.showSplash": false,
+		});
+		const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
+		const parsed = parseArgs([]);
+		disableStartupFeatures(parsed, tempDir.join("sessions"));
+		let manager: SessionManager | undefined;
+		let notifications: Array<{ kind: string; message: string }> = [];
+		let versionCheck: Promise<unknown> | undefined;
+
+		try {
+			await runRootCommand(parsed, [], {
+				collabBridge: {
+					role: "guest",
+					address: "127.0.0.1:4321",
+					roomId: "room-1",
+					token: "guest-token",
+				},
+				discoverAuthStorage: async () => authStorage,
+				settings,
+				createAgentSession: async options => {
+					if (!options?.sessionManager) throw new Error("Expected session manager");
+					manager = options.sessionManager;
+					return {
+						...sessionResult(options, interactiveSession(manager, settings)),
+						modelFallbackMessage:
+							"No models available. Use /login or set an API key environment variable. Then use /model to select a model.",
+					};
+				},
+				runInteractiveMode: async (...args) => {
+					notifications = args[3] as typeof notifications;
+					versionCheck = args[4] as Promise<unknown>;
+				},
+			});
+
+			expect(notifications).toEqual([]);
+			expect(await versionCheck).toBeUndefined();
+		} finally {
+			await manager?.close();
 			authStorage.close();
 		}
 	});
@@ -248,7 +303,11 @@ describe("automatic Herdr host activation", () => {
 		expect(resumed).toBe(1);
 		expect(shutdowns).toBe(1);
 
-		await reconcilePrivateHerdrAfterStartupJoin({ collabGuest: {}, herdrCollabHostLifecycle: lifecycle, shutdown });
+		await reconcilePrivateHerdrAfterStartupJoin({
+			collabGuest: {},
+			herdrCollabHostLifecycle: lifecycle,
+			shutdown,
+		});
 		expect(resumed).toBe(1);
 		expect(shutdowns).toBe(1);
 	});
@@ -311,7 +370,10 @@ describe("automatic Herdr host activation", () => {
 						token: `token-${scenario.name}`,
 						paneId: "pane-9",
 					},
-					discovery: { socketPath: `/tmp/herdr-${scenario.name}.sock`, paneId: "pane-9" },
+					discovery: {
+						socketPath: `/tmp/herdr-${scenario.name}.sock`,
+						paneId: "pane-9",
+					},
 				};
 				let manager: SessionManager | undefined;
 				let created = false;
@@ -348,7 +410,10 @@ describe("automatic Herdr host activation", () => {
 						token: `token-${scenario.name}`,
 						paneId: "pane-9",
 					},
-					discovery: { socketPath: `/tmp/herdr-${scenario.name}.sock`, paneId: "pane-9" },
+					discovery: {
+						socketPath: `/tmp/herdr-${scenario.name}.sock`,
+						paneId: "pane-9",
+					},
 					routeGeneration: 1,
 				});
 				expect(bridge).not.toHaveProperty("ompSessionId");
@@ -376,7 +441,10 @@ describe("automatic Herdr host activation", () => {
 				token: "diagnostic-token",
 				paneId: "pane-diagnostic",
 			},
-			discovery: { socketPath: "/tmp/herdr-diagnostic.sock", paneId: "pane-diagnostic" },
+			discovery: {
+				socketPath: "/tmp/herdr-diagnostic.sock",
+				paneId: "pane-diagnostic",
+			},
 			ompSessionId: "caller-supplied-session",
 			routeGeneration: 7,
 		};

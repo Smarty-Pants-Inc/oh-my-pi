@@ -44,6 +44,8 @@ export interface CollabTransport {
 	readonly requiresHerdrAttribution?: boolean;
 	connect(): void;
 	send(frame: CollabFrame, targetPeer?: number): boolean;
+	/** Optional local bridge hook fired after a guest has fully applied a replica snapshot. */
+	notifyReplicaReady?(): void;
 	/** Request or release controller authority when the embedding transport supports it. */
 	requestAuthority?(action: "request" | "release"): boolean;
 	close(): void;

@@ -213,6 +213,36 @@ describe("NdjsonRecordParser", () => {
 		}
 	});
 
+	it("writes replica readiness as a local bridge record", async () => {
+		const received = Promise.withResolvers<string>();
+		const server = Bun.listen({
+			hostname: "127.0.0.1",
+			port: 0,
+			socket: {
+				open(socket) {
+					socket.write('{"t":"ready"}\n');
+				},
+				data(_socket, data) {
+					received.resolve(data.toString());
+				},
+			},
+		});
+		try {
+			const transport = new LocalCollabTransport(`127.0.0.1:${server.port}`);
+			const opened = Promise.withResolvers<void>();
+			transport.onOpen = () => {
+				transport.notifyReplicaReady();
+				opened.resolve();
+			};
+			transport.connect();
+			await opened.promise;
+			expect(await received.promise).toBe('{"t":"replica-ready"}\n');
+			transport.close();
+		} finally {
+			server.stop(true);
+		}
+	});
+
 	it("maps a post-ready Herdr error code and message to the close reason", async () => {
 		const server = Bun.listen({
 			hostname: "127.0.0.1",

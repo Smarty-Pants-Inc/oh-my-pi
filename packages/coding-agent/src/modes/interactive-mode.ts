@@ -4754,6 +4754,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		await this.#uiHelpers.renderInitialMessages(options);
 	}
 
+	refreshModelDisplay(): void {
+		this.#updateWelcomeModel();
+	}
+
 	getUserMessageText(message: Message): string {
 		return this.#uiHelpers.getUserMessageText(message);
 	}

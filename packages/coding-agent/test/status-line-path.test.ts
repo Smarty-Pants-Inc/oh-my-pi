@@ -238,6 +238,40 @@ describe("status line path segment", () => {
 		}
 	});
 
+	it("renders the authoritative host cwd for a collab guest", () => {
+		const localDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-status-line-local-"));
+		try {
+			setProjectDir(localDir);
+			const ctx = createPathContext();
+			ctx.collab = {
+				role: "guest",
+				participantCount: 2,
+				stateOverride: {
+					isStreaming: false,
+					queuedMessageCount: 0,
+					cwd: "/host/project",
+					participants: [],
+				},
+			};
+			ctx.activeRepo = {
+				cwd: localDir,
+				repoRoot: path.join(localDir, "local-repo"),
+				relativeRepoRoot: "local-repo",
+				source: "single-direct-child-repo",
+			};
+			ctx.worktree = { projectName: "local-project", worktreeName: "local-worktree" };
+
+			const content = Bun.stripANSI(renderSegment("path", ctx).content);
+			expect(content).toContain("host/project");
+			expect(content).not.toContain(path.basename(localDir));
+			expect(content).not.toContain("local-repo");
+			expect(content).not.toContain("local-project");
+		} finally {
+			setProjectDir(originalProjectDir);
+			removeSyncWithRetries(localDir);
+		}
+	});
+
 	it("renders the active nested repo suffix after the parent cwd", () => {
 		const parentDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-status-line-parent-"));
 		const repoDir = path.join(parentDir, "pr-workspace");

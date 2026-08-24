@@ -6445,7 +6445,7 @@
     },
     {
       "path": "packages/coding-agent/src/collab/guest.ts",
-      "sha256": "5529f5dd97a7226c8e64b33fbf51fc2d49494d9ce0a7457d12c5d79565cd992d"
+      "sha256": "195afbbd556aed482b1c2aaf4aeaef680e464f9805fc425abaa0b0ab21859034"
     },
     {
       "path": "packages/coding-agent/src/collab/herdr-bridge-bootstrap.ts",
@@ -6457,7 +6457,7 @@
     },
     {
       "path": "packages/coding-agent/src/collab/local-transport.ts",
-      "sha256": "4dbc8b202838202ed641c6fd60e85a79baf4a9dfbb8addb5094db6a1f11d766b"
+      "sha256": "5087d4f88686d5e7a67ed7bc433efcae8e091ce8713932459c8e3b6e5e74839e"
     },
     {
       "path": "packages/coding-agent/src/collab/protocol.ts",
@@ -6465,7 +6465,7 @@
     },
     {
       "path": "packages/coding-agent/src/collab/relay-client.ts",
-      "sha256": "34faa51c1524974f236106aa93ad851cfddb290fc348e82c1f9c8d52c170b66d"
+      "sha256": "911e258c0f91eceb74b566f61937da60feb6b5d144150edab01d487df834789b"
     },
     {
       "path": "packages/coding-agent/src/collab/replication-shrink.ts",
@@ -7801,7 +7801,7 @@
     },
     {
       "path": "packages/coding-agent/src/main.ts",
-      "sha256": "507662dd48c36663a36df1ccd508150333b05ef3d1ae71cd40dc3c5dbe950686"
+      "sha256": "066aa2e2d7294471e7ab53c911d1658ad4f4f76333450ac183e3eb9a7038831b"
     },
     {
       "path": "packages/coding-agent/src/markit/converters/docx.ts",
@@ -8209,7 +8209,7 @@
     },
     {
       "path": "packages/coding-agent/src/modes/interactive-mode.ts",
-      "sha256": "9ea27e7b66a8ef27cfefb797b2379328aaa705ed88132281fe3b6d78bec97047"
+      "sha256": "c393dbd2505bbde44ffcd18c2c8565d450d497bd3f12215e089003cdbca857b5"
     },
     {
       "path": "packages/coding-agent/src/modes/loop-limit.ts",
@@ -10737,5 +10737,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "bdf59f7d8d71d184c468dbc202df53bd5c9f745bb9d4550c2e573f493b449599"
+  "rootSha256": "88c245844413da02348554d52ffc2acdc9ded2969600b847a0aff5bb6d8a57e4"
 }
