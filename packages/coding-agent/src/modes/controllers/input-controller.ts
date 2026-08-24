@@ -2,7 +2,7 @@ import * as path from "node:path";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { type AutocompleteProvider, matchesKey, type SlashCommand } from "@oh-my-pi/pi-tui";
-import { isEnoent, logger, sanitizeText } from "@oh-my-pi/pi-utils";
+import { isEnoent, logger, Snowflake, sanitizeText } from "@oh-my-pi/pi-utils";
 import { isSettingsInitialized, settings } from "../../config/settings";
 import { resolveLocalRoot } from "../../internal-urls";
 import { AssistantMessageComponent } from "../../modes/components/assistant-message";
@@ -19,7 +19,9 @@ import { parseQueueShorthand, splitQueuedMessages } from "../../modes/queue-inpu
 import { buildSkillCommandPrompt, isKnownSkillCommand } from "../../modes/skill-command";
 import type { InteractiveModeContext } from "../../modes/types";
 import manualContinuePrompt from "../../prompts/system/manual-continue.md" with { type: "text" };
+import type { RestoredQueuedMessage } from "../../session/agent-session-types";
 import { USER_INTERRUPT_LABEL } from "../../session/messages";
+import { localSubmissionSignature, releaseLocalSubmissionSignature } from "../../session/queued-messages";
 import { executeBuiltinSlashCommand } from "../../slash-commands/builtin-registry";
 import { parseSlashCommand } from "../../slash-commands/helpers/parse";
 import { isTinyTitleLocalModelKey } from "../../tiny/models";
@@ -404,7 +406,7 @@ export class InputController {
 				this.ctx.isPythonMode = false;
 				this.ctx.updateEditorBorderColor();
 			} else if (this.ctx.session.isStreaming) {
-				this.#abortStreamingTurn();
+				void this.restoreQueuedMessagesToEditor({ abort: true });
 			} else if (this.ctx.editor.getText().trim()) {
 				// Esc must not destroy an in-progress draft.
 				this.ctx.lastEscapeTime = 0;
@@ -488,11 +490,15 @@ export class InputController {
 			this.ctx.keybindings.getKeys("app.tools.toggleVisibility"),
 		);
 		this.ctx.editor.onToggleToolActivity = () => this.toggleToolActivityVisibility();
-		this.ctx.editor.setActionKeys("app.message.dequeue", this.ctx.keybindings.getKeys("app.message.dequeue"));
+		const dequeueKeys = this.ctx.keybindings.getKeys("app.message.dequeue");
+		this.ctx.editor.setActionKeys("app.message.dequeue", dequeueKeys);
 		this.ctx.editor.onDequeue = () => void this.handleDequeue();
 		this.ctx.editor.setActionKeys("app.retry", this.ctx.keybindings.getKeys("app.retry"));
 		this.ctx.editor.onRetry = () => void this.handleRetry();
 		this.ctx.editor.clearCustomKeyHandlers();
+		if (dequeueKeys.includes("shift+up")) {
+			this.ctx.editor.setCustomKeyHandler("shift+up", () => this.ctx.editQueuedPrompts());
+		}
 		// Wire up extension shortcuts
 		this.registerExtensionShortcuts();
 		const planModeKeys = this.ctx.keybindings.getKeys("app.plan.toggle");
@@ -1265,6 +1271,8 @@ export class InputController {
 		if (this.ctx.session.isCompacting) {
 			for (let index = 0; index < messages.length; index++) {
 				this.ctx.compactionQueuedMessages.push({
+					id: Snowflake.next(),
+					timestamp: Date.now(),
 					text: messages[index] ?? "",
 					mode: "followUp",
 					images: index === 0 ? images : undefined,
@@ -1437,79 +1445,108 @@ export class InputController {
 	}
 
 	async restoreQueuedMessagesToEditor(options?: { abort?: boolean; currentText?: string }): Promise<number> {
-		let queues: Awaited<ReturnType<InteractiveModeContext["session"]["clearQueueDurably"]>>;
+		if (!options?.abort) {
+			if (this.ctx.session.isCompacting) {
+				this.ctx.showWarning("Wait for compaction to finish before restoring queued prompts.");
+				return 0;
+			}
+			let restored: RestoredQueuedMessage | undefined;
+			const compacted = this.ctx.compactionQueuedMessages.at(-1);
+			const coreNewest = this.ctx.session.getQueuedPrompts().at(-1);
+			const coreTimestamp = coreNewest ? this.ctx.session.getQueuedPromptTimestamp(coreNewest.id) : undefined;
+			const compactedIsNewer =
+				compacted !== undefined &&
+				(coreNewest === undefined ||
+					compacted.timestamp > coreTimestamp! ||
+					(compacted.timestamp === coreTimestamp && compacted.id > coreNewest.id));
+			if (compactedIsNewer) {
+				const entry = this.ctx.compactionQueuedMessages.pop()!;
+				restored = { text: entry.text, images: entry.images };
+			} else {
+				try {
+					restored = await this.ctx.session.popLastQueuedMessageDurably();
+				} catch (error) {
+					this.ctx.showError(
+						`Failed to restore queued message: ${error instanceof Error ? error.message : String(error)}`,
+					);
+					return 0;
+				}
+			}
+			if (!restored) {
+				this.ctx.updatePendingMessagesDisplay();
+				return 0;
+			}
+			if (restored.customType === undefined) {
+				releaseLocalSubmissionSignature(
+					this.ctx.locallySubmittedUserSignatures,
+					this.ctx.session,
+					localSubmissionSignature(restored.text, restored.images?.length ?? 0),
+				);
+			}
+			this.#restoreQueuedEntriesToEditor([restored], options?.currentText);
+			this.ctx.updatePendingMessagesDisplay();
+			return 1;
+		}
+
+		let queues: { steering: RestoredQueuedMessage[]; followUp: RestoredQueuedMessage[] };
 		try {
-			queues = await this.ctx.session.clearQueueDurably({ forInterrupt: options?.abort });
+			queues = await this.ctx.session.clearQueueDurably({ forInterrupt: true });
 		} catch (error) {
 			this.ctx.showError(
 				`Failed to restore queued messages: ${error instanceof Error ? error.message : String(error)}`,
 			);
-			if (options?.abort) {
-				void this.ctx.session.abort({ reason: USER_INTERRUPT_LABEL });
-			}
 			return 0;
 		}
 		this.ctx.locallySubmittedUserSignatures.clear();
-		const { steering, followUp } = queues;
-		// Messages typed while compacting live in `compactionQueuedMessages`, not the
-		// agent queue `clearQueue()` drains — but the pending bar shows the same
-		// "Alt+Up to edit" hint for them (ui-helpers `updatePendingMessagesDisplay`).
-		// Drain them here too so the dequeue restores every message the hint
-		// advertises; otherwise a skill/text queued during compaction is stranded and
-		// Alt+Up reports "No queued messages to restore".
 		const compactionQueued = this.ctx.compactionQueuedMessages;
 		this.ctx.compactionQueuedMessages = [];
 		const allQueued = [
-			...steering,
-			...compactionQueued.filter(e => e.mode === "steer").map(e => ({ text: e.text, images: e.images })),
-			...followUp,
-			...compactionQueued.filter(e => e.mode === "followUp").map(e => ({ text: e.text, images: e.images })),
+			...queues.steering,
+			...compactionQueued
+				.filter(entry => entry.mode === "steer")
+				.map(entry => ({ text: entry.text, images: entry.images })),
+			...queues.followUp,
+			...compactionQueued
+				.filter(entry => entry.mode === "followUp")
+				.map(entry => ({ text: entry.text, images: entry.images })),
 		];
 		if (allQueued.length === 0) {
 			this.ctx.updatePendingMessagesDisplay();
-			if (options?.abort) {
-				void this.ctx.session.abort({ reason: USER_INTERRUPT_LABEL });
-			}
 			return 0;
 		}
-		// Image markers are positional: `[Image #N]` ↔ `pendingImages[N-1]`. Each
-		// queued message numbered its markers against its own local image list
-		// (1..K). Because we prepend the queued text but append the queued images
-		// to `pendingImages`, any existing draft images (M of them) — plus images
-		// already pulled in by earlier queued messages — shift the slot index that
-		// every marker must point to. Bumping each message's markers by the
-		// running offset keeps the merged text aligned with the merged
-		// `pendingImages` order; draft markers stay valid because draft images
-		// keep their original positions.
-		const queuedImages = allQueued.flatMap(e => e.images ?? []);
+		this.#restoreQueuedEntriesToEditor(allQueued, options.currentText, true);
+		this.ctx.updatePendingMessagesDisplay();
+		return allQueued.length;
+	}
+
+	#restoreQueuedEntriesToEditor(
+		entries: readonly RestoredQueuedMessage[],
+		currentText?: string,
+		appendAfterCurrentText = false,
+	): void {
+		const queuedImages = entries.flatMap(entry => entry.images ?? []);
 		let queuedText: string;
 		if (queuedImages.length > 0) {
 			const parts: string[] = [];
 			let imageOffset = this.ctx.editor.pendingImages.length;
-			for (const entry of allQueued) {
+			for (const entry of entries) {
 				parts.push(shiftImageMarkers(entry.text, imageOffset));
-				if (entry.images && entry.images.length > 0) imageOffset += entry.images.length;
+				imageOffset += entry.images?.length ?? 0;
 			}
 			queuedText = parts.join("\n\n");
 		} else {
-			queuedText = allQueued.map(e => e.text).join("\n\n");
+			queuedText = entries.map(entry => entry.text).join("\n\n");
 		}
-		const currentText = options?.currentText ?? this.ctx.editor.getText();
-		const combinedText = [queuedText, currentText].filter(t => t.trim()).join("\n\n");
+		const currentEditorText = currentText ?? this.ctx.editor.getText();
+		const combinedText = (appendAfterCurrentText ? [currentEditorText, queuedText] : [queuedText, currentEditorText])
+			.filter(text => text.trim())
+			.join("\n\n");
 		this.ctx.editor.setText(combinedText);
-		// Hand queued images back to the pending-image buffer (links are
-		// re-materialized lazily; the restored text already carries the
-		// renumbered `[Image #N, WxH]` markers).
 		if (queuedImages.length > 0) {
 			this.ctx.editor.pendingImages.push(...queuedImages);
 			this.ctx.editor.pendingImageLinks.push(...queuedImages.map(() => undefined));
 			this.ctx.editor.imageLinks = this.ctx.editor.pendingImageLinks;
 		}
-		this.ctx.updatePendingMessagesDisplay();
-		if (options?.abort) {
-			void this.ctx.session.abort({ reason: USER_INTERRUPT_LABEL });
-		}
-		return allQueued.length;
 	}
 
 	async #insertPendingImage(imageData: ImageContent): Promise<void> {

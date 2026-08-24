@@ -47,6 +47,9 @@ export type CompactionQueuedMessage = {
 	text: string;
 	mode: "steer" | "followUp";
 	images?: ImageContent[];
+	/** Submission identity and time used to merge this local queue with the session queue. */
+	id: string;
+	timestamp: number;
 };
 
 export type SubmittedUserInput = {

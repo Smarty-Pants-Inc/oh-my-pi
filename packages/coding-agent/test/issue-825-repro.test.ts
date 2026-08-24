@@ -125,7 +125,9 @@ function makeCtx(initialQueue: CompactionQueuedMessage[]) {
 
 describe("issue #825: steer preview stuck after compaction", () => {
 	test("AgentBusyError on flush leaves the steer message in the session queue (submittable on next turn)", async () => {
-		const queued: CompactionQueuedMessage[] = [{ text: "address review feedback", mode: "steer" }];
+		const queued: CompactionQueuedMessage[] = [
+			{ id: "review-feedback", timestamp: 1, text: "address review feedback", mode: "steer" },
+		];
 		const { ctx, fake } = makeCtx(queued);
 
 		const helpers = new UiHelpers(ctx);
@@ -148,7 +150,9 @@ describe("issue #825: steer preview stuck after compaction", () => {
 	});
 
 	test("marks flushed compaction messages as local submissions before delivery", async () => {
-		const queued: CompactionQueuedMessage[] = [{ text: "draft-safe queued message", mode: "steer" }];
+		const queued: CompactionQueuedMessage[] = [
+			{ id: "draft-safe", timestamp: 1, text: "draft-safe queued message", mode: "steer" },
+		];
 		const { ctx, fake } = makeCtx(queued);
 		fake.session.isStreaming = false;
 		fake.session.prompt = mock(async (text: string, opts?: PromptOpts): Promise<void> => {
@@ -161,7 +165,7 @@ describe("issue #825: steer preview stuck after compaction", () => {
 		expect(ctx.locallySubmittedUserSignatures.has("draft-safe queued message\u00000")).toBe(true);
 	});
 	test("when the agent is genuinely idle, flush issues a fresh prompt as before", async () => {
-		const queued: CompactionQueuedMessage[] = [{ text: "ship it", mode: "steer" }];
+		const queued: CompactionQueuedMessage[] = [{ id: "ship-it", timestamp: 1, text: "ship it", mode: "steer" }];
 		const { ctx, fake } = makeCtx(queued);
 		// Agent is idle now: prompt must succeed (real agent-session ignores
 		// streamingBehavior when not streaming, so passing it must not break
@@ -182,7 +186,9 @@ describe("issue #825: steer preview stuck after compaction", () => {
 		expect(promptCalls[0].text).toBe("ship it");
 	});
 	test("removes the local-submission signature when willRetry delivery rejects", async () => {
-		const queued: CompactionQueuedMessage[] = [{ text: "willRetry boom", mode: "followUp" }];
+		const queued: CompactionQueuedMessage[] = [
+			{ id: "retry-boom", timestamp: 1, text: "willRetry boom", mode: "followUp" },
+		];
 		const { ctx, fake } = makeCtx(queued);
 		fake.session.followUp = mock(async () => {
 			throw new Error("delivery failed");
@@ -202,7 +208,9 @@ describe("issue #825: steer preview stuck after compaction", () => {
 	});
 
 	test("removes the local-submission signature when the fire-and-forget firstPrompt rejects", async () => {
-		const queued: CompactionQueuedMessage[] = [{ text: "fire and forget", mode: "steer" }];
+		const queued: CompactionQueuedMessage[] = [
+			{ id: "fire-and-forget", timestamp: 1, text: "fire and forget", mode: "steer" },
+		];
 		const { ctx, fake } = makeCtx(queued);
 		// Force the firstPrompt path (not willRetry, no slash commands) to reject.
 		fake.session.prompt = mock(async () => {

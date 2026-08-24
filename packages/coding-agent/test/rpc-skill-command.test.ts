@@ -94,7 +94,9 @@ describe("tryRunRpcSkillCommand", () => {
 
 			expect(await tryRunRpcSkillCommand(session, command)).toEqual({ agentInvoked: true });
 			const queued = session.getQueuedPrompts();
-			expect(queued).toEqual([{ id: expect.any(String), text: command, delivery: "steer" }]);
+			expect(queued).toEqual([
+				{ id: expect.any(String), text: command, delivery: "steer", customType: SKILL_PROMPT_MESSAGE_TYPE },
+			]);
 			expect(JSON.stringify(queued)).not.toContain(skillBody);
 
 			await session.abort();

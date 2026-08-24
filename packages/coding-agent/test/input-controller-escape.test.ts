@@ -92,7 +92,10 @@ function createContext(): {
 	const abortHandoff = vi.fn();
 	const addMessageToChat = vi.fn();
 	const cancelPendingSubmission = vi.fn(() => false);
-	const clearQueue = vi.fn(async () => ({ steering: [], followUp: [] }));
+	const clearQueue = vi.fn(async () => {
+		abort({ reason: USER_INTERRUPT_LABEL });
+		return { steering: [], followUp: [] };
+	});
 	const getQueuedMessages = vi.fn(() => ({ steering: [], followUp: [] }));
 	const onInputCallback = vi.fn();
 	const requestRender = vi.fn();
@@ -373,6 +376,30 @@ describe("InputController escape behavior", () => {
 		expect(spies.abort).toHaveBeenCalledWith({ reason: USER_INTERRUPT_LABEL });
 	});
 
+	it("restores remaining queued prompts with blank lines when Escape cancels a streaming turn", async () => {
+		const { ctx, editor, spies } = createContext();
+		mutableSessionState(ctx).isStreaming = true;
+		spies.clearQueue.mockImplementation(async () => {
+			spies.abort({ reason: USER_INTERRUPT_LABEL });
+			return {
+				steering: [{ text: "keep next" }],
+				followUp: [{ text: "keep after" }],
+			};
+		});
+		editor.setText("unfinished draft");
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.onEscape?.();
+		await Promise.resolve();
+
+		expect(spies.clearQueue).toHaveBeenCalledWith({ forInterrupt: true });
+		expect(editor.getText()).toBe("unfinished draft\n\nkeep next\n\nkeep after");
+		expect(spies.abort).toHaveBeenCalledTimes(1);
+		expect(spies.abort).toHaveBeenCalledWith({ reason: USER_INTERRUPT_LABEL });
+		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
+	});
+
 	it("aborts a streaming loop iteration without pausing the loop", () => {
 		const { ctx, editor, spies } = createContext();
 		const pauseLoop = vi.fn();
@@ -514,13 +541,14 @@ describe("InputController escape behavior", () => {
 		expect(spies.abort).not.toHaveBeenCalled();
 	});
 
-	it("aborts an active streaming turn on the first Esc without asking for confirmation", () => {
+	it("aborts an active streaming turn on the first Esc without asking for confirmation", async () => {
 		const { ctx, editor, spies } = createContext();
 		mutableSessionState(ctx).isStreaming = true;
 		const controller = new InputController(ctx);
 
 		controller.setupKeyHandlers();
 		editor.onEscape?.();
+		await Promise.resolve();
 
 		expect(spies.abort).toHaveBeenCalledTimes(1);
 		expect(spies.abort).toHaveBeenCalledWith({ reason: USER_INTERRUPT_LABEL });
@@ -540,6 +568,7 @@ describe("InputController escape behavior", () => {
 		ctx.loadingAnimation = undefined;
 
 		editor.onEscape?.();
+		await Promise.resolve();
 
 		expect(spies.cancelPendingSubmission).not.toHaveBeenCalled();
 		expect(spies.abort).toHaveBeenCalledTimes(1);
