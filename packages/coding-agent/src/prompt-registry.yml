@@ -118,6 +118,14 @@ prompts:
     visibility: conditional
     defaultEnabled: false
     order: 210
+  - id: agent.compaction.prompts.handoff-summary-context
+    path: _agent/compaction/prompts/handoff-summary-context.md
+    role: internal_context
+    target: [side_model]
+    trigger: compaction
+    visibility: conditional
+    defaultEnabled: false
+    order: 215
   - id: agent.compaction.prompts.snapcompact-archive-context
     path: _agent/compaction/prompts/snapcompact-archive-context.md
     role: internal_context
@@ -182,6 +190,15 @@ prompts:
     visibility: model
     defaultEnabled: false
     order: 290
+  - id: cleanse.follow-up
+    path: cleanse/prompts/follow-up.md
+    role: system
+    target: [side_model]
+    trigger: side_request
+    visibility: model
+    defaultEnabled: false
+    order: 295
+
   - id: commit.agentic.analyze-file
     path: commit/agentic/prompts/analyze-file.md
     role: system
@@ -558,6 +575,15 @@ prompts:
     visibility: model
     defaultEnabled: false
     order: 755
+  - id: edit.auto-repair
+    path: edit/auto-repair.md
+    role: system
+    target: [main]
+    trigger: optional_mode
+    visibility: model
+    defaultEnabled: false
+    order: 756
+
   - id: live.agent-final-message
     path: live/prompts/agent-final-message.md
     role: system
@@ -702,6 +728,31 @@ prompts:
     visibility: model
     defaultEnabled: false
     order: 930
+  - id: bench.chat
+    path: prompts/bench/chat.md
+    role: system
+    target: [side_model]
+    trigger: side_request
+    visibility: model
+    defaultEnabled: false
+    order: 935
+  - id: bench.generation
+    path: prompts/bench/generation.md
+    role: system
+    target: [side_model]
+    trigger: side_request
+    visibility: model
+    defaultEnabled: false
+    order: 936
+  - id: bench.prefill-instruction
+    path: prompts/bench/prefill-instruction.md
+    role: system
+    target: [side_model]
+    trigger: side_request
+    visibility: model
+    defaultEnabled: false
+    order: 937
+
   - id: ci-green-request
     path: prompts/ci-green-request.md
     role: internal_context
@@ -1214,6 +1265,14 @@ prompts:
     visibility: model
     defaultEnabled: false
     order: 1570
+  - id: plan-filename
+    path: prompts/system/plan-filename.md
+    role: system
+    target: [main]
+    trigger: optional_mode
+    visibility: model
+    defaultEnabled: false
+    order: 1575
   - id: plan-mode-subagent
     path: prompts/system/plan-mode-subagent.md
     role: system

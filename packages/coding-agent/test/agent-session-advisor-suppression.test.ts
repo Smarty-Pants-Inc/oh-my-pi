@@ -526,7 +526,7 @@ describe("AgentSession advisor auto-resume suppression", () => {
 		await running.catch(() => {});
 	});
 
-	it("keeps advisor auto-resume for a non-user (internal) abort", async () => {
+	it("does not mint turn authority from advisor advice after an internal abort", async () => {
 		const { session, mock, streamStarted } = await createParkedSession([{ content: ["resumed after advice"] }]);
 
 		const running = session.prompt("do the thing");
@@ -535,14 +535,14 @@ describe("AgentSession advisor auto-resume suppression", () => {
 		await session.sendCustomMessage(advisorCard("keep going"), { deliverAs: "steer", triggerTurn: true });
 		expect(session.agent.peekSteeringQueue().some(isAdvisorCard)).toBe(true);
 
-		// Internal abort (no USER_INTERRUPT_LABEL): the advisor card is NOT extracted;
-		// it stays in the queue and drives a normal auto-continue turn.
+		// Internal abort does not extract the advisor card, but agent-authored advice
+		// cannot authorize a fresh turn. It remains queued for the next deliberate prompt.
 		await session.abort();
 		await session.waitForIdle();
 		await running.catch(() => {});
 
-		expect(session.agent.peekSteeringQueue()).toEqual([]);
-		expect(mock.calls.length).toBe(2);
+		expect(session.agent.peekSteeringQueue().some(isAdvisorCard)).toBe(true);
+		expect(mock.calls.length).toBe(1);
 	});
 
 	it("reclaims a stranded advisor steer on settle while suppressed, instead of auto-resuming the stopped run", async () => {

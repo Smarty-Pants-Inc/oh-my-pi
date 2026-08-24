@@ -38,6 +38,14 @@ const NodeSchema: MessageCodec<Node> = pb<Node>("test.Node", [
 	{ no: 2, name: "child", kind: "message", T: () => NodeSchema },
 ]);
 
+interface StringMap extends ProtoMessage {
+	entries: Record<string, string>;
+}
+
+const StringMapSchema = pb<StringMap>("test.StringMap", [
+	{ no: 1, name: "entries", kind: "map", K: "string", V: "string" },
+]);
+
 enum TestStatus {
 	UNSPECIFIED = 0,
 	READY = 1,

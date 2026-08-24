@@ -2534,7 +2534,7 @@ async function rewriteLegacyExtensionSource(
 			replacement = toGraphImportSpecifier(resolved, mtimeTag);
 		}
 		if (!replacement && specifier.startsWith("#")) {
-			const resolved = await resolvePackageImportSpecifier(specifier, importerPath);
+			const resolved = packageImportPath(specifier, await resolvePackageImportSpecifier(specifier, importerPath));
 			if (snapshotModulePaths && (!resolved || !snapshotModulePaths.has(resolved))) {
 				throw new Error(`Uncaptured protected extension import: ${specifier}`);
 			}
@@ -2806,7 +2806,7 @@ async function resolvePackageImportSpecifier(
 	importerPath: string,
 	includeNonSource = false,
 	conditions: ReadonlySet<string> = SUPPORTED_PACKAGE_IMPORT_CONDITIONS,
-): Promise<string | null> {
+): Promise<PackageImportResolution> {
 	if (!specifier.startsWith("#")) {
 		return null;
 	}
@@ -3715,11 +3715,14 @@ async function collectExtensionModules(entryRealPath: string): Promise<Extension
 						}
 					}
 				} else if (specifier.startsWith("#")) {
-					const candidate = await resolvePackageImportSpecifier(
+					const candidate = packageImportPath(
 						specifier,
-						file,
-						false,
-						isRequired ? SUPPORTED_PACKAGE_REQUIRE_CONDITIONS : SUPPORTED_PACKAGE_IMPORT_CONDITIONS,
+						await resolvePackageImportSpecifier(
+							specifier,
+							file,
+							false,
+							isRequired ? SUPPORTED_PACKAGE_REQUIRE_CONDITIONS : SUPPORTED_PACKAGE_IMPORT_CONDITIONS,
+						),
 					);
 					if (candidate) {
 						const inheritedTargetKind = isRequired
@@ -3890,13 +3893,16 @@ async function collectExtensionSourceGraph(
 				if (specifier.startsWith(".")) {
 					resolved = await resolveRelativeGraphTarget(specifier, file, reference.kind);
 				} else if (specifier.startsWith("#")) {
-					resolved = await resolvePackageImportSpecifier(
+					resolved = packageImportPath(
 						specifier,
-						file,
-						true,
-						reference.kind === "require"
-							? SUPPORTED_PACKAGE_REQUIRE_CONDITIONS
-							: SUPPORTED_PACKAGE_IMPORT_CONDITIONS,
+						await resolvePackageImportSpecifier(
+							specifier,
+							file,
+							true,
+							reference.kind === "require"
+								? SUPPORTED_PACKAGE_REQUIRE_CONDITIONS
+								: SUPPORTED_PACKAGE_IMPORT_CONDITIONS,
+						),
 					);
 					if (!resolved) return null;
 				} else if (

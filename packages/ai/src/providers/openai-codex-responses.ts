@@ -1521,11 +1521,12 @@ function createCodexRequestContext(
 	const startNewTurn = metadataSession
 		? resolveCodexStartNewTurn(metadataSession, requestKind, compaction, contextOptions.startNewTurn)
 		: (contextOptions.startNewTurn ?? requestKind === "turn");
-	if (websocketState && startNewTurn) {
-		// Codex scopes turn-state to one turn. Mid-turn compaction preserves it;
-		// a pre-turn or standalone compaction starts without it.
-		websocketState.turnState = undefined;
-	}
+	const standaloneCompaction = compaction?.phase === "standalone_turn";
+	if (metadataSession) clearCodexTurnStatesForNewTurn(metadataSession, startNewTurn, compaction);
+	// Standalone or cache-disabled compaction owns a throwaway turn. Every live
+	// cell is isolated by the same credential/backend/model/Lite key as its transport session.
+	const turnState =
+		!metadataSession || standaloneCompaction ? {} : getOrCreateCodexTurnState(metadataSession, sessionKey);
 	const requestMetadata = metadataSession
 		? createCodexRequestMetadata(metadataSession, requestKind, {
 				startNewTurn,
