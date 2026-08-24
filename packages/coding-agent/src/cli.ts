@@ -458,22 +458,18 @@ export async function runCli(argv: string[]): Promise<void> {
 		stopStartupComposer = stopPendingStartupComposer;
 	}
 
-	try {
-		const [{ run }, { commands, resolveCliArgv }] = await Promise.all([
-			import("@oh-my-pi/pi-utils/cli"),
-			import("./cli-commands"),
-		]);
-		// --help and --version are handled by run() directly; --license returned above.
-		// Everything else that isn't a known subcommand routes to "launch".
-		const resolved = resolveCliArgv(resolvedArgv);
-		if ("error" in resolved) {
-			process.stderr.write(`error: ${resolved.error}\n`);
-			process.exitCode = 1;
-			return;
-		}
-		await run({ bin: APP_NAME, version: VERSION, argv: resolved.argv, commands, metadataHelp: showHelp });
-	} finally {
+	const [{ run }, { commands, resolveCliArgv }] = await Promise.all([
+		import("@oh-my-pi/pi-utils/cli"),
+		import("./cli-commands"),
+	]);
+	// --help and --version are handled by run() directly; --license returned above.
+	// Everything else that isn't a known subcommand routes to "launch".
+	const resolved = resolveCliArgv(resolvedArgv);
+	if ("error" in resolved) {
 		stopStartupComposer?.();
+		process.stderr.write(`error: ${resolved.error}\n`);
+		process.exitCode = 1;
+		return;
 	}
 	const command = resolved.argv[0];
 	try {
@@ -485,6 +481,7 @@ export async function runCli(argv: string[]): Promise<void> {
 		}
 		await run({ bin: APP_NAME, version: VERSION, argv: resolved.argv, commands, metadataHelp: showHelp });
 	} finally {
+		stopStartupComposer?.();
 		clearHerdrHostBridgeHandoff();
 		clearHerdrGuestBridgeTokenHandoff();
 	}
