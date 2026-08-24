@@ -40,6 +40,13 @@ import { type ActiveRepoContext, resolveActiveRepoContext } from "./utils/active
 import { normalizePromptPath } from "./utils/prompt-path";
 import { AGENTS_MD_LIMIT, buildWorkspaceTree, type WorkspaceTree } from "./workspace-tree";
 
+/** Bundled personality specs, keyed by the `personality` setting value. */
+const PERSONALITY_SPECS: Record<Exclude<Personality, "none">, string> = {
+	default: defaultPersonality,
+	friendly: friendlyPersonality,
+	pragmatic: pragmaticPersonality,
+};
+
 export interface SystemPromptTemplates {
 	system: string;
 	customSystem: string;

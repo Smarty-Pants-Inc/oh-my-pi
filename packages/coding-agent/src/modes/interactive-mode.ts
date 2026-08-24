@@ -20,6 +20,7 @@ import type {
 	Component,
 	EditorTheme,
 	LoaderMessageColorFn,
+	NativeScrollbackLiveRegion,
 	OverlayHandle,
 	SlashCommand,
 } from "@oh-my-pi/pi-tui";
@@ -241,6 +242,8 @@ import type {
 	TodoItem,
 	TodoPhase,
 } from "./types";
+
+export const TODO_COMPACT_TERMINAL_ROWS_THRESHOLD = 18;
 import { UiHelpers } from "./utils/ui-helpers";
 
 const STILL_CLOSING_DELAY_MS = 3_000;
@@ -470,25 +473,8 @@ class AnchoredLiveContainer extends Container implements NativeScrollbackLiveReg
 		return this.children.length > 0 ? 0 : undefined;
 	}
 
-	override render(width: number): readonly string[] {
-		if (this.mode.isCompactTodoMode()) {
-			return [];
-		}
-		return super.render(width);
-	}
-}
-
-class StatusHudContainer extends AnchoredLiveContainer {
-	constructor(private readonly mode: InteractiveMode) {
-		super();
-	}
-
-	override render(width: number): readonly string[] {
-		const childLines = super.render(width);
-		if (!this.mode.isCompactTodoMode()) {
-			return childLines;
-		}
-		return this.mode.renderCompactStatusLine(width, childLines);
+	isNativeScrollbackLiveRegionPinned(): boolean {
+		return true;
 	}
 
 	#notifyChildrenChanged(): void {
@@ -497,6 +483,30 @@ class StatusHudContainer extends AnchoredLiveContainer {
 		} catch {
 			// Status observers are auxiliary and must never break TUI ownership.
 		}
+	}
+}
+
+class TodoHudContainer extends AnchoredLiveContainer {
+	constructor(private readonly mode: InteractiveMode) {
+		super();
+	}
+
+	override render(width: number): readonly string[] {
+		return this.mode.isCompactTodoMode() ? [] : super.render(width);
+	}
+}
+
+class StatusHudContainer extends AnchoredLiveContainer {
+	constructor(
+		private readonly mode: InteractiveMode,
+		onChildrenChanged?: () => void,
+	) {
+		super(onChildrenChanged);
+	}
+
+	override render(width: number): readonly string[] {
+		const childLines = super.render(width);
+		return this.mode.isCompactTodoMode() ? this.mode.renderCompactStatusLine(width, childLines) : childLines;
 	}
 }
 
@@ -875,11 +885,13 @@ export class InteractiveMode implements InteractiveModeContext {
 		lspServers: LspStartupServerInfo[] | undefined = undefined,
 		mcpManager?: MCPManager,
 		eventBus?: EventBus,
-		companionStatusTextSink?: (statusText?: string) => void,
+		composerOrCompanion?: Composer | ((statusText?: string) => void),
 	) {
 		this.session = session;
 		this.sessionManager = session.sessionManager;
 		this.settings = session.settings;
+		const composer = typeof composerOrCompanion === "function" ? undefined : composerOrCompanion;
+		const companionStatusTextSink = typeof composerOrCompanion === "function" ? composerOrCompanion : undefined;
 		const preferences = {
 			quiet: settings.get("startup.quiet"),
 			composerShape: settings.get("composer.shape") ?? "box",
@@ -965,10 +977,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		setTerminalTextSizing(settings.get("tui.textSizing") && TERMINAL.supportsTextSizing);
 		this.chatContainer = new TranscriptContainer();
 		this.pendingMessagesContainer = new AnchoredLiveContainer();
-		this.statusContainer = new AnchoredLiveContainer(
+		this.statusContainer = new StatusHudContainer(this,
 			companionStatusTextSink ? () => this.#publishCompanionStatusText() : undefined,
 		);
-		this.todoContainer = new AnchoredLiveContainer();
+		this.todoContainer = new TodoHudContainer(this);
 		this.subagentContainer = new AnchoredLiveContainer();
 		this.btwContainer = new AnchoredLiveContainer();
 		this.omfgContainer = new AnchoredLiveContainer();

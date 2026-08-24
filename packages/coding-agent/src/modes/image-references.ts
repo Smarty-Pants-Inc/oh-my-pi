@@ -3,6 +3,17 @@ import { logger } from "@oh-my-pi/pi-utils";
 import { type BlobPutResult, blobExtensionForImageMimeType } from "../session/blob-store";
 import { fileHyperlink } from "../tui/hyperlink";
 
+const IMAGE_MARKER_REGEX = /\[Image #([1-9]\d*)((?:,[^\]\n]*)?)\]/g;
+
+/** Renumber queued image markers when restoring an edited prompt draft. */
+export function shiftImageMarkers(text: string, offset: number): string {
+	if (offset === 0) return text;
+	return text.replace(
+		IMAGE_MARKER_REGEX,
+		(_match, index: string, tail: string) => `[Image #${Number(index) + offset}${tail}]`,
+	);
+}
+
 /** Probed pixel dimensions riding on the draft image object itself; `null` records a failed
  *  probe so the chips band never re-decodes a corrupt header every frame. */
 const kImageDims = Symbol("omp.imageDimensions");

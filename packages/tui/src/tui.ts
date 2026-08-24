@@ -131,6 +131,13 @@ export interface TerminalFrameProvider {
 	resetHistory?(): void;
 }
 
+/** Compatibility contract for anchored live regions supplied by coding-agent. */
+export interface NativeScrollbackLiveRegion {
+	getNativeScrollbackLiveRegionStart(): number | undefined;
+	isNativeScrollbackLiveRegionPinned?(): boolean;
+	getNativeScrollbackLiveRegionPinnedStart?(): number | undefined;
+}
+
 export interface TUIStartOptions {
 	/** Clear saved native scrollback before the first paint. */
 	clearScrollback?: boolean;

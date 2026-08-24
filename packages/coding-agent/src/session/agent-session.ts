@@ -9739,13 +9739,13 @@ export class AgentSession {
 			// Abort the handoff first so generic compaction cancellation cannot replace
 			// the harness reason with an unreasoned "Handoff cancelled".
 			this.#handoff.abortHandoff(new Error(intent.reason ?? "Handoff aborted by session"));
-			if (intent.preserveCompaction) {
+				if (intent.preserveCompaction) {
 				// Manual `/compact` installed its own #compactionAbortController before
 				// this internal abort and must keep it alive. Automatic compaction must
 				// still be cancelled so it cannot race the manual rewrite.
-				this.#maintenance.abortAutomaticCompaction();
-			} else {
-				manualCompactionCleanup = this.#maintenance.abortCompaction(options?.reason);
+					this.#maintenance.abortAutomaticCompaction();
+				} else {
+					this.abortCompaction();
 			}
 			this.abortBash();
 			// Disposal gives tracked eval work its bounded grace period in
@@ -9773,7 +9773,6 @@ export class AgentSession {
 			// `/compact` disconnects the agent subscription until its finally block.
 			// Do not let abort-and-replace callers start a new prompt before that cleanup
 			// finishes, or the replacement turn's events are neither forwarded nor persisted.
-			await manualCompactionCleanup;
 			await this.#drainAutolearnCapture();
 			await this.#goalRuntime.onTaskAborted({ reason: intent.goalReason });
 			// Clear prompt-in-flight state: waitForIdle resolves when the agent loop's finally
