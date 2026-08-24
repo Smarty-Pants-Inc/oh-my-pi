@@ -38,6 +38,7 @@ function makeCtx(initialQueue: CompactionQueuedMessage[] = []) {
 	const promptCalls: Array<{ text: string; opts: PromptOpts }> = [];
 	const steerCalls: Array<{ text: string; images?: ImageContent[] }> = [];
 	const followUpCalls: Array<{ text: string; images?: ImageContent[] }> = [];
+	const showWarning = mock((_message: string) => {});
 
 	const session = {
 		isStreaming: false,
@@ -99,9 +100,10 @@ function makeCtx(initialQueue: CompactionQueuedMessage[] = []) {
 		updatePendingMessagesDisplay: () => {},
 		showError: () => {},
 		showStatus: () => {},
+		showWarning,
 	} as unknown as InteractiveModeContext;
 
-	return { ctx, session, promptCalls, steerCalls, followUpCalls };
+	return { ctx, session, promptCalls, steerCalls, followUpCalls, showWarning };
 }
 
 const img = (data: string): ImageContent => ({ type: "image", mimeType: "image/png", data });
@@ -198,6 +200,21 @@ describe("compaction queue Alt+Up restore", () => {
 		expect(restored).toBe(1);
 		expect(ctx.editor.getText()).toBe("/skill:foo bar");
 		expect(ctx.compactionQueuedMessages).toEqual([]);
+	});
+
+	test("does not pop a compaction-local prompt while compaction is active", async () => {
+		const queued: CompactionQueuedMessage = {
+			id: "locked",
+			timestamp: 1,
+			text: "keep locked",
+			mode: "followUp",
+		};
+		const { ctx, session, showWarning } = makeCtx([queued]);
+		session.isCompacting = true;
+
+		expect(await new InputController(ctx).restoreQueuedMessagesToEditor()).toBe(0);
+		expect(ctx.compactionQueuedMessages).toEqual([queued]);
+		expect(showWarning).toHaveBeenCalledWith("Wait for compaction to finish before restoring queued prompts.");
 	});
 
 	test("restored compaction images return to the pending-image buffer", async () => {

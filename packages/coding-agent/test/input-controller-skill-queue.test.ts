@@ -1232,7 +1232,7 @@ describe("UiHelpers / InputController against derived queued custom display", ()
 		expect(editor.getText()).toBe("unfinished draft");
 	});
 
-	it("previews NOW and applies it only on Enter", async () => {
+	it("previews NOW and requires confirmation before applying it", async () => {
 		fixture = await createRealSession();
 		const { session } = fixture;
 		queueUserSteer(session, "interrupt candidate");
@@ -1245,6 +1245,12 @@ describe("UiHelpers / InputController against derived queued custom display", ()
 		expect(dispatchInput("\x1b[D")).toEqual({ consume: true });
 		expect(setQueuedPromptDelivery).not.toHaveBeenCalled();
 		expect(Bun.stripANSI(pendingMessagesContainer.render(120).join("\n"))).toContain("[NOW] interrupt candidate");
+
+		expect(dispatchInput("\r")).toEqual({ consume: true });
+		expect(setQueuedPromptDelivery).not.toHaveBeenCalled();
+		expect(Bun.stripANSI(pendingMessagesContainer.render(120).join("\n"))).toContain(
+			"Run NOW: interrupt candidate and stop current work?",
+		);
 
 		expect(dispatchInput("\r")).toEqual({ consume: true });
 		expect(setQueuedPromptDelivery).toHaveBeenCalledWith(expect.any(String), "interrupt");
@@ -1335,6 +1341,7 @@ describe("UiHelpers / InputController against derived queued custom display", ()
 		editor.setText("edited but not resent");
 
 		session.agent.clearAllQueues();
+		expect(ctx.locallySubmittedUserSignatures.has("queued before\u00000")).toBe(false);
 
 		expect(editor.getText()).toBe("edited but not resent\n\nprior draft");
 		expect(showWarning).toHaveBeenCalledWith(
@@ -1469,6 +1476,36 @@ describe("UiHelpers / InputController against derived queued custom display", ()
 		expect(rendered).toContain("1. [NEXT] local oldest");
 		expect(rendered).toContain("2. [AFTER] core middle");
 		expect(rendered).toContain("3. [AFTER] local newest");
+	});
+	it("manages compaction-local rows with the same edit and remove controls", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		const { ctx, editor, pendingMessagesContainer, dispatchInput, showStatus } =
+			createStubInteractiveModeContextForUiHelpers(session);
+		ctx.compactionQueuedMessages = [{ id: "local", timestamp: 1, text: "local prompt", mode: "followUp" }];
+		const uiHelpers = new UiHelpers(ctx);
+		uiHelpers.editQueuedPrompts();
+
+		expect(Bun.stripANSI(pendingMessagesContainer.render(120).join("\n"))).toContain("1. [AFTER] local prompt");
+		expect(dispatchInput("e")).toEqual({ consume: true });
+		expect(editor.getText()).toBe("local prompt");
+		editor.setText("edited local prompt");
+		expect(dispatchInput("\r")).toEqual({ consume: true });
+		await waitForImmediate();
+		expect(ctx.compactionQueuedMessages[0]?.text).toBe("edited local prompt");
+		expect(showStatus).toHaveBeenCalledWith("Queued prompt updated.");
+		expect(dispatchInput("\x1b[D")).toEqual({ consume: true });
+		expect(Bun.stripANSI(pendingMessagesContainer.render(120).join("\n"))).toContain("1. [NEXT] edited local prompt");
+		expect(dispatchInput("\r")).toEqual({ consume: true });
+		await waitForImmediate();
+		expect(ctx.compactionQueuedMessages[0]?.mode).toBe("steer");
+		expect(showStatus).toHaveBeenCalledWith("Queued prompt set to NEXT.");
+		uiHelpers.editQueuedPrompts();
+
+		expect(dispatchInput("d")).toEqual({ consume: true });
+		expect(dispatchInput("\r")).toEqual({ consume: true });
+		await waitForImmediate();
+		expect(ctx.compactionQueuedMessages).toEqual([]);
 	});
 
 	it("restores the compact slash form into the editor and clears the queue", async () => {

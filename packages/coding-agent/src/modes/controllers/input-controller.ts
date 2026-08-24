@@ -1446,6 +1446,10 @@ export class InputController {
 
 	async restoreQueuedMessagesToEditor(options?: { abort?: boolean; currentText?: string }): Promise<number> {
 		if (!options?.abort) {
+			if (this.ctx.session.isCompacting) {
+				this.ctx.showWarning("Wait for compaction to finish before restoring queued prompts.");
+				return 0;
+			}
 			let restored: RestoredQueuedMessage | undefined;
 			const compacted = this.ctx.compactionQueuedMessages.at(-1);
 			const coreNewest = this.ctx.session.getQueuedPrompts().at(-1);
@@ -1458,9 +1462,6 @@ export class InputController {
 			if (compactedIsNewer) {
 				const entry = this.ctx.compactionQueuedMessages.pop()!;
 				restored = { text: entry.text, images: entry.images };
-			} else if (this.ctx.session.isCompacting) {
-				this.ctx.showWarning("Wait for compaction to finish before restoring queued prompts.");
-				return 0;
 			} else {
 				try {
 					restored = await this.ctx.session.popLastQueuedMessageDurably();

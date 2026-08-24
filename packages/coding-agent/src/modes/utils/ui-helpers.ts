@@ -53,11 +53,7 @@ import {
 	SKILL_PROMPT_MESSAGE_TYPE,
 	type SkillPromptDetails,
 } from "../../session/messages";
-import {
-	localSubmissionSignature,
-	queuedPromptSignature,
-	releaseLocalSubmissionSignature,
-} from "../../session/queued-messages";
+import { localSubmissionSignature, queuedPromptSignature } from "../../session/queued-messages";
 import type { SessionContext, StrippedToolCallsMarker } from "../../session/session-context";
 import { replaceTabs } from "../../tools/render-utils";
 import { buildSkillCommandPrompt, invokeSkillCommandFromText, isKnownSkillCommand } from "../skill-command";
@@ -106,11 +102,21 @@ const QUEUED_PROMPT_TIMING_LABELS: Record<QueuedPromptDelivery, string> = {
 	steer: "NEXT",
 	afterCurrent: "AFTER",
 };
-type QueuedPromptEditMode = "manage" | "confirmRemove" | "editText" | "savingEdit" | "savingRemove";
+type QueuedPromptEditMode =
+	| "manage"
+	| "confirmInterrupt"
+	| "confirmRemove"
+	| "editText"
+	| "savingEdit"
+	| "savingRemove";
 type QueuedPromptComposerDraft = {
 	text: string;
 	images: ImageContent[];
 	imageLinks: (string | undefined)[];
+};
+type QueuedPromptEditorEntry = {
+	prompt: QueuedPrompt;
+	local?: CompactionQueuedMessage;
 };
 type QueuedPromptEditState = {
 	session: InteractiveModeContext["viewSession"];
@@ -120,6 +126,7 @@ type QueuedPromptEditState = {
 	draftDelivery: QueuedPromptDelivery;
 	draftDeliveries: Map<string, QueuedPromptDelivery>;
 	mode: QueuedPromptEditMode;
+	confirmInterruptId?: string;
 	priorDraft?: QueuedPromptComposerDraft;
 	queuedImages?: ImageContent[];
 	originalSignature?: string;
@@ -1001,14 +1008,14 @@ export class UiHelpers {
 			this.ctx.showWarning("Wait for compaction to finish before changing queued prompts.");
 			return;
 		}
-		const prompts = session.getQueuedPrompts();
-		if (prompts.length === 0) {
+		const entries = this.#queuedPromptEntries(session);
+		if (entries.length === 0) {
 			this.ctx.showStatus("No user prompts are queued.");
 			return;
 		}
 		this.#stopQueuedPromptEditing(false);
-		const selectedIndex = prompts.length - 1;
-		const selected = prompts[selectedIndex]!;
+		const selectedIndex = entries.length - 1;
+		const selected = entries[selectedIndex]!.prompt;
 		const state: QueuedPromptEditState = {
 			session,
 			selectedId: selected.id,
@@ -1034,6 +1041,44 @@ export class UiHelpers {
 
 	stopQueuedPromptEditing(render = true): void {
 		this.#stopQueuedPromptEditing(render);
+	}
+
+	#queuedPromptEntries(session: InteractiveModeContext["viewSession"]): QueuedPromptEditorEntry[] {
+		const entries: QueuedPromptEditorEntry[] = [...session.getQueuedPrompts().map(prompt => ({ prompt }))];
+		if (session === this.ctx.session) {
+			entries.push(
+				...this.ctx.compactionQueuedMessages.map(local => ({
+					local,
+					prompt: {
+						id: local.id,
+						text: local.text,
+						delivery: local.mode === "steer" ? ("steer" as const) : ("afterCurrent" as const),
+						...(local.images?.length ? { imageCount: local.images.length } : {}),
+					},
+				})),
+			);
+		}
+		return entries.sort((left, right) => {
+			const leftTime = left.local?.timestamp ?? session.getQueuedPromptTimestamp(left.prompt.id) ?? 0;
+			const rightTime = right.local?.timestamp ?? session.getQueuedPromptTimestamp(right.prompt.id) ?? 0;
+			return leftTime - rightTime || left.prompt.id.localeCompare(right.prompt.id);
+		});
+	}
+
+	#queuedPromptEntry(session: InteractiveModeContext["viewSession"], id: string): QueuedPromptEditorEntry | undefined {
+		return this.#queuedPromptEntries(session).find(entry => entry.prompt.id === id);
+	}
+
+	#releaseQueuedPromptSignature(session: InteractiveModeContext["viewSession"], signature: string | undefined): void {
+		if (!signature) return;
+		const remains = this.#queuedPromptEntries(session).some(entry => {
+			if (entry.prompt.customType !== undefined) return false;
+			const draft = entry.local ? undefined : session.getQueuedPromptDraft(entry.prompt.id);
+			const text = entry.local?.text ?? draft?.text ?? entry.prompt.text;
+			const imageCount = entry.local?.images?.length ?? draft?.images?.length ?? entry.prompt.imageCount ?? 0;
+			return localSubmissionSignature(text, imageCount) === signature;
+		});
+		if (!remains) this.ctx.locallySubmittedUserSignatures.delete(signature);
 	}
 
 	#setComposerDraft(draft: QueuedPromptComposerDraft): void {
@@ -1067,6 +1112,7 @@ export class UiHelpers {
 		this.ctx.editor.pendingImageLinks = [...prior.imageLinks, ...editedImageLinks];
 		this.ctx.editor.imageLinks =
 			this.ctx.editor.pendingImages.length > 0 ? this.ctx.editor.pendingImageLinks : undefined;
+		this.#releaseQueuedPromptSignature(state.session, state.originalSignature);
 		state.priorDraft = undefined;
 		state.queuedImages = undefined;
 		state.originalCustomType = undefined;
@@ -1079,6 +1125,7 @@ export class UiHelpers {
 		state.persistedDelivery = prompt.delivery;
 		state.draftDelivery = state.draftDeliveries.get(prompt.id) ?? prompt.delivery;
 		state.mode = "manage";
+		state.confirmInterruptId = undefined;
 		state.originalCustomType = undefined;
 		state.originalSignature = undefined;
 	}
@@ -1090,18 +1137,20 @@ export class UiHelpers {
 			this.#stopQueuedPromptEditing();
 			return;
 		}
-		const prompts = state.session.getQueuedPrompts();
-		const liveIds = new Set(prompts.map(prompt => prompt.id));
+		const entries = this.#queuedPromptEntries(state.session);
+		const liveIds = new Set(entries.map(entry => entry.prompt.id));
 		for (const id of state.draftDeliveries.keys()) {
 			if (!liveIds.has(id)) state.draftDeliveries.delete(id);
 		}
-		for (const prompt of prompts) {
-			if (state.draftDeliveries.get(prompt.id) === prompt.delivery) state.draftDeliveries.delete(prompt.id);
+		for (const entry of entries) {
+			if (state.draftDeliveries.get(entry.prompt.id) === entry.prompt.delivery) {
+				state.draftDeliveries.delete(entry.prompt.id);
+			}
 		}
 		for (const id of this.#interruptingQueuedPromptIds) {
 			if (!liveIds.has(id)) this.#interruptingQueuedPromptIds.delete(id);
 		}
-		if (prompts.length === 0) {
+		if (entries.length === 0) {
 			if (state.mode === "editText" || state.mode === "savingEdit") {
 				this.#preserveEditedPromptAsDraft(state);
 				this.ctx.showWarning("That prompt ran while you were editing it. Your edit remains in the composer.");
@@ -1109,7 +1158,7 @@ export class UiHelpers {
 			this.#stopQueuedPromptEditing();
 			return;
 		}
-		const selectedIndex = prompts.findIndex(prompt => prompt.id === state.selectedId);
+		const selectedIndex = entries.findIndex(entry => entry.prompt.id === state.selectedId);
 		if (selectedIndex === -1) {
 			if (state.mode === "editText" || state.mode === "savingEdit") {
 				this.#preserveEditedPromptAsDraft(state);
@@ -1121,13 +1170,13 @@ export class UiHelpers {
 				this.updatePendingMessagesDisplay();
 				return;
 			}
-			const nextIndex = Math.min(state.selectedIndex, prompts.length - 1);
-			this.#selectQueuedPrompt(state, prompts[nextIndex]!, nextIndex);
+			const nextIndex = Math.min(state.selectedIndex, entries.length - 1);
+			this.#selectQueuedPrompt(state, entries[nextIndex]!.prompt, nextIndex);
 			this.ctx.showWarning("The selected prompt is no longer queued; selection moved to the nearest prompt.");
 			this.updatePendingMessagesDisplay();
 			return;
 		}
-		const selected = prompts[selectedIndex]!;
+		const selected = entries[selectedIndex]!.prompt;
 		state.selectedIndex = selectedIndex;
 		state.persistedDelivery = selected.delivery;
 		state.draftDelivery = state.draftDeliveries.get(selected.id) ?? selected.delivery;
@@ -1145,9 +1194,11 @@ export class UiHelpers {
 	}
 
 	#beginQueuedPromptTextEdit(state: QueuedPromptEditState): void {
-		const prompt = state.session.getQueuedPrompts().find(candidate => candidate.id === state.selectedId);
-		const draft = state.session.getQueuedPromptDraft(state.selectedId);
-		if (!prompt || !draft) {
+		const entry = this.#queuedPromptEntry(state.session, state.selectedId);
+		const draft = entry?.local
+			? { text: entry.local.text, images: entry.local.images }
+			: state.session.getQueuedPromptDraft(state.selectedId);
+		if (!entry || !draft) {
 			this.#refreshQueuedPromptEditor(state);
 			return;
 		}
@@ -1157,8 +1208,12 @@ export class UiHelpers {
 			imageLinks: [...this.ctx.editor.pendingImageLinks],
 		};
 		state.queuedImages = [...(draft.images ?? [])];
-		state.originalCustomType = prompt.customType;
-		state.originalSignature = queuedPromptSignature(prompt, draft.text);
+		state.originalCustomType = entry.prompt.customType;
+		state.originalSignature = entry.local
+			? draft.text.startsWith("/")
+				? undefined
+				: localSubmissionSignature(draft.text, state.queuedImages.length)
+			: queuedPromptSignature(entry.prompt, draft.text);
 		if (state.originalSignature) this.ctx.locallySubmittedUserSignatures.add(state.originalSignature);
 		state.mode = "editText";
 		this.#setComposerDraft({
@@ -1192,8 +1247,8 @@ export class UiHelpers {
 			this.#stopQueuedPromptEditing();
 			return undefined;
 		}
-		const prompts = state.session.getQueuedPrompts();
-		const selectedIndex = prompts.findIndex(prompt => prompt.id === state.selectedId);
+		const entries = this.#queuedPromptEntries(state.session);
+		const selectedIndex = entries.findIndex(entry => entry.prompt.id === state.selectedId);
 		if (selectedIndex === -1) {
 			this.#refreshQueuedPromptEditor(state);
 			return undefined;
@@ -1204,11 +1259,34 @@ export class UiHelpers {
 				this.#restorePriorComposerDraft(state);
 				state.mode = "manage";
 				this.updatePendingMessagesDisplay();
-			} else if (state.mode === "confirmRemove") {
+			} else if (state.mode === "confirmRemove" || state.mode === "confirmInterrupt") {
+				state.confirmInterruptId = undefined;
 				state.mode = "manage";
 				this.updatePendingMessagesDisplay();
 			} else {
 				this.#stopQueuedPromptEditing();
+			}
+			return { consume: true };
+		}
+		if (state.mode === "confirmInterrupt") {
+			if (confirm) {
+				const changes = entries.flatMap(entry => {
+					const delivery = state.draftDeliveries.get(entry.prompt.id);
+					return delivery === undefined || delivery === entry.prompt.delivery
+						? []
+						: [{ id: entry.prompt.id, delivery }];
+				});
+				const confirmed = changes.some(
+					change => change.id === state.confirmInterruptId && change.delivery === "interrupt",
+				);
+				if (!confirmed) {
+					state.confirmInterruptId = undefined;
+					state.mode = "manage";
+					this.updatePendingMessagesDisplay();
+					return { consume: true };
+				}
+				this.#stopQueuedPromptEditing();
+				if (changes.length > 0) void this.#commitQueuedPromptDeliveries(state.session, changes);
 			}
 			return { consume: true };
 		}
@@ -1235,8 +1313,8 @@ export class UiHelpers {
 					? 1
 					: 0;
 		if (move !== 0) {
-			const nextIndex = Math.max(0, Math.min(prompts.length - 1, state.selectedIndex + move));
-			this.#selectQueuedPrompt(state, prompts[nextIndex]!, nextIndex);
+			const nextIndex = Math.max(0, Math.min(entries.length - 1, state.selectedIndex + move));
+			this.#selectQueuedPrompt(state, entries[nextIndex]!.prompt, nextIndex);
 			this.updatePendingMessagesDisplay();
 			return { consume: true };
 		}
@@ -1268,13 +1346,23 @@ export class UiHelpers {
 			return { consume: true };
 		}
 		if (confirm) {
-			const { session } = state;
-			const changes = prompts.flatMap(prompt => {
-				const delivery = state.draftDeliveries.get(prompt.id);
-				return delivery === undefined || delivery === prompt.delivery ? [] : [{ id: prompt.id, delivery }];
+			const changes = entries.flatMap(entry => {
+				const delivery = state.draftDeliveries.get(entry.prompt.id);
+				return delivery === undefined || delivery === entry.prompt.delivery
+					? []
+					: [{ id: entry.prompt.id, delivery }];
 			});
+			const interrupt = changes.find(change => change.delivery === "interrupt");
+			if (interrupt) {
+				const interruptIndex = entries.findIndex(entry => entry.prompt.id === interrupt.id);
+				this.#selectQueuedPrompt(state, entries[interruptIndex]!.prompt, interruptIndex);
+				state.confirmInterruptId = interrupt.id;
+				state.mode = "confirmInterrupt";
+				this.updatePendingMessagesDisplay();
+				return { consume: true };
+			}
 			this.#stopQueuedPromptEditing();
-			if (changes.length > 0) void this.#commitQueuedPromptDeliveries(session, changes);
+			if (changes.length > 0) void this.#commitQueuedPromptDeliveries(state.session, changes);
 			return { consume: true };
 		}
 		return { consume: true };
@@ -1298,6 +1386,28 @@ export class UiHelpers {
 		draftDelivery: QueuedPromptDelivery,
 	): Promise<void> {
 		try {
+			const entry = this.#queuedPromptEntry(session, selectedId);
+			const local = entry?.local;
+			if (local) {
+				if (draftDelivery !== "interrupt") {
+					local.mode = draftDelivery === "afterCurrent" ? "followUp" : "steer";
+					this.ctx.showStatus(`Queued prompt set to ${QUEUED_PROMPT_TIMING_LABELS[draftDelivery]}.`);
+					this.updatePendingMessagesDisplay();
+					return;
+				}
+				if (!session.isStreaming) {
+					this.ctx.showWarning("Current work already ended; the queued prompt timing was not changed.");
+					this.updatePendingMessagesDisplay();
+					return;
+				}
+				await session.abort({ reason: "Interrupted by user" });
+				await this.#deliverQueuedMessage({ ...local, mode: "steer" });
+				const localIndex = this.ctx.compactionQueuedMessages.findIndex(entry => entry.id === selectedId);
+				if (localIndex !== -1) this.ctx.compactionQueuedMessages.splice(localIndex, 1);
+				this.ctx.showStatus("Interrupting current work with the selected queued prompt.");
+				this.updatePendingMessagesDisplay();
+				return;
+			}
 			const result = await session.setQueuedPromptDelivery(selectedId, draftDelivery);
 			if (result.status === "updated") {
 				if (draftDelivery === "interrupt") {
@@ -1337,6 +1447,31 @@ export class UiHelpers {
 		}
 		let addedSignature: string | undefined;
 		try {
+			const localIndex = this.ctx.compactionQueuedMessages.findIndex(entry => entry.id === state.selectedId);
+			if (localIndex !== -1) {
+				const signature = localSubmissionSignature(text, editedImages.length);
+				if (!this.ctx.locallySubmittedUserSignatures.has(signature)) {
+					this.ctx.locallySubmittedUserSignatures.add(signature);
+					addedSignature = signature;
+				}
+				const local = this.ctx.compactionQueuedMessages[localIndex]!;
+				this.ctx.compactionQueuedMessages[localIndex] = {
+					...local,
+					text,
+					images: editedImages.length > 0 ? editedImages : undefined,
+				};
+				this.#releaseQueuedPromptSignature(state.session, state.originalSignature);
+				if (this.#queuedPromptEdit === state) {
+					this.#restorePriorComposerDraft(state);
+					state.mode = "manage";
+					this.#refreshQueuedPromptEditor(state);
+				}
+				this.ctx.showStatus("Queued prompt updated.");
+				await waitForImmediate();
+				this.updatePendingMessagesDisplay();
+				return;
+			}
+
 			const built = isKnownSkillCommand(this.ctx, text)
 				? await buildSkillCommandPrompt(
 						this.ctx,
@@ -1362,11 +1497,7 @@ export class UiHelpers {
 				built?.message,
 			);
 			if (result.status === "updated") {
-				releaseLocalSubmissionSignature(
-					this.ctx.locallySubmittedUserSignatures,
-					state.session,
-					state.originalSignature,
-				);
+				this.#releaseQueuedPromptSignature(state.session, state.originalSignature);
 				if (this.#queuedPromptEdit === state) {
 					this.#restorePriorComposerDraft(state);
 					state.mode = "manage";
@@ -1399,20 +1530,33 @@ export class UiHelpers {
 		this.updatePendingMessagesDisplay();
 	}
 	async #commitQueuedPromptRemoval(state: QueuedPromptEditState): Promise<void> {
-		const selected = state.session.getQueuedPrompts().find(prompt => prompt.id === state.selectedId);
-		const selectedDraft = state.session.getQueuedPromptDraft(state.selectedId);
-		const removedSignature = selected ? queuedPromptSignature(selected, selectedDraft?.text) : undefined;
+		const entry = this.#queuedPromptEntry(state.session, state.selectedId);
+		const selectedDraft = entry?.local
+			? { text: entry.local.text }
+			: state.session.getQueuedPromptDraft(state.selectedId);
+		const removedSignature = entry?.local
+			? localSubmissionSignature(entry.local.text, entry.local.images?.length ?? 0)
+			: entry
+				? queuedPromptSignature(entry.prompt, selectedDraft?.text)
+				: undefined;
 		try {
-			const result = await state.session.removeQueuedPrompt(state.selectedId);
+			const localIndex = this.ctx.compactionQueuedMessages.findIndex(local => local.id === state.selectedId);
+			const result =
+				localIndex === -1
+					? await state.session.removeQueuedPrompt(state.selectedId)
+					: (() => {
+							this.ctx.compactionQueuedMessages.splice(localIndex, 1);
+							return { status: "updated" } as const;
+						})();
 			if (result.status === "updated") {
 				this.#interruptingQueuedPromptIds.delete(state.selectedId);
-				releaseLocalSubmissionSignature(this.ctx.locallySubmittedUserSignatures, state.session, removedSignature);
-				const prompts = state.session.getQueuedPrompts();
+				this.#releaseQueuedPromptSignature(state.session, removedSignature);
+				const entries = this.#queuedPromptEntries(state.session);
 				if (this.#queuedPromptEdit === state) {
-					if (prompts.length === 0) this.#stopQueuedPromptEditing(false);
+					if (entries.length === 0) this.#stopQueuedPromptEditing(false);
 					else {
-						const nextIndex = Math.min(state.selectedIndex, prompts.length - 1);
-						this.#selectQueuedPrompt(state, prompts[nextIndex]!, nextIndex);
+						const nextIndex = Math.min(state.selectedIndex, entries.length - 1);
+						this.#selectQueuedPrompt(state, entries[nextIndex]!.prompt, nextIndex);
 					}
 				}
 				this.ctx.showStatus("Queued prompt removed.");
@@ -1436,13 +1580,13 @@ export class UiHelpers {
 	}
 
 	#renderQueuedPromptEditor(state: QueuedPromptEditState): boolean {
-		const prompts = state.session.getQueuedPrompts();
-		if (prompts.length === 0) return false;
+		const entries = this.#queuedPromptEntries(state.session);
+		if (entries.length === 0) return false;
 		this.ctx.pendingMessagesContainer.addChild(new Spacer(1));
-		const heading = theme.fg("muted", `Queued${theme.sep.dot}${prompts.length}`);
+		const heading = theme.fg("muted", `Queued${theme.sep.dot}${entries.length}`);
 		this.ctx.pendingMessagesContainer.addChild(new TruncatedText(heading, 1, 0));
-		for (let index = 0; index < prompts.length; index++) {
-			const prompt = prompts[index]!;
+		for (let index = 0; index < entries.length; index++) {
+			const prompt = entries[index]!.prompt;
 			const selected = prompt.id === state.selectedId;
 			const delivery = this.#interruptingQueuedPromptIds.has(prompt.id)
 				? "interrupt"
@@ -1459,8 +1603,15 @@ export class UiHelpers {
 				),
 			);
 		}
+		const interruptEntry = state.confirmInterruptId
+			? entries.find(entry => entry.prompt.id === state.confirmInterruptId)
+			: undefined;
 		let hint: string;
-		if (state.mode === "confirmRemove") {
+		if (state.mode === "confirmInterrupt") {
+			hint = interruptEntry
+				? `  Run NOW: ${queuedPromptSummary(interruptEntry.prompt.text, interruptEntry.prompt.imageCount)} and stop current work? Enter confirm · Esc cancel`
+				: "  Run the selected NOW prompt by stopping current work? Enter confirm · Esc keep working";
+		} else if (state.mode === "confirmRemove") {
 			hint = "  Remove only this queued prompt and its attachments? Enter confirm · Esc keep";
 		} else if (state.mode === "editText") {
 			hint = "  Editing selected prompt in composer · Enter save · Esc cancel";
