@@ -21,6 +21,10 @@ function createContext(options?: {
 			setText(text: string) {
 				editorText = text;
 			},
+			// The stub skips chip collapsing so assertions read the wire-format text.
+			setCollapsedText(text: string) {
+				editorText = text;
+			},
 			getText() {
 				return editorText;
 			},
@@ -83,7 +87,7 @@ describe("empty submit with queued messages", () => {
 		const controller = new InputController(ctx);
 		controller.setupEditorSubmitHandler();
 
-		await ctx.editor.onSubmit?.("");
+		await ctx.editor.onSubmit?.("[Image #1]");
 
 		expect(abort).not.toHaveBeenCalled();
 		expect(prompt).toHaveBeenCalledWith("", { streamingBehavior: "followUp", images: [image] });
@@ -106,11 +110,11 @@ describe("empty submit with queued messages", () => {
 		const controller = new InputController(ctx);
 		controller.setupEditorSubmitHandler();
 
-		await ctx.editor.onSubmit?.("");
+		await ctx.editor.onSubmit?.("[Image #1]");
 
 		expect(abort).not.toHaveBeenCalled();
 		expect(showError).toHaveBeenCalledWith("queue rejected");
-		expect(ctx.editor.getText()).toBe("");
+		expect(ctx.editor.getText()).toBe("[Image #1]");
 		expect(ctx.editor.pendingImages).toEqual([image]);
 		expect(ctx.editor.pendingImageLinks).toEqual(["local://draft.png"]);
 		expect(ctx.editor.imageLinks).toEqual(["local://draft.png"]);
@@ -124,7 +128,7 @@ describe("empty submit with queued messages", () => {
 		const controller = new InputController(ctx);
 		controller.setupEditorSubmitHandler();
 
-		await ctx.editor.onSubmit?.("");
+		await ctx.editor.onSubmit?.("[Image #1]");
 
 		expect(abort).not.toHaveBeenCalled();
 		expect(prompt).toHaveBeenCalledWith("", { streamingBehavior: "followUp", images: [image] });

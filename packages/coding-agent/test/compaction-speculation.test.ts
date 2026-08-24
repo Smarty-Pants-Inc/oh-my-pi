@@ -43,8 +43,10 @@ describe("async speculative compaction", () => {
 	let authStorage: AuthStorage;
 	let modelRegistry: ModelRegistry;
 	let model: Model;
+	let defaultModel: Model;
 	let sessionManager: SessionManager;
 	let maintenance: SessionMaintenance;
+	let agent: Agent;
 	let events: string[];
 	let emittedEvents: Array<{ type: string; errorMessage?: string }>;
 
@@ -160,10 +162,12 @@ describe("async speculative compaction", () => {
 		modelRegistry = new ModelRegistry(authStorage);
 		const bundled = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!bundled) throw new Error("Expected built-in model");
-		model = { ...bundled, contextWindow: CONTEXT_WINDOW };
+		defaultModel = { ...bundled, contextWindow: CONTEXT_WINDOW };
+		model = defaultModel;
 	});
 
 	beforeEach(() => {
+		model = defaultModel;
 		sessionManager = SessionManager.inMemory();
 		events = [];
 		emittedEvents = [];

@@ -83,6 +83,10 @@ function makeCtx(initialQueue: CompactionQueuedMessage[] = []) {
 			setText: (text: string) => {
 				editorText = text;
 			},
+			// The stub skips chip collapsing so assertions read the wire-format text.
+			setCollapsedText: (text: string) => {
+				editorText = text;
+			},
 			getText: () => editorText,
 			imageLinks: undefined as (string | undefined)[] | undefined,
 			pendingImages: [] as ImageContent[],
@@ -312,6 +316,10 @@ describe("restoreQueuedMessagesToEditor image marker alignment", () => {
 		let editorText = opts.draftText ?? "";
 		const editor = {
 			setText: (text: string) => {
+				editorText = text;
+			},
+			// The stub skips chip collapsing so assertions read the wire-format text.
+			setCollapsedText: (text: string) => {
 				editorText = text;
 			},
 			getText: () => editorText,

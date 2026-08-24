@@ -13,8 +13,10 @@ import { prompt } from "@oh-my-pi/pi-utils";
 import type { AgentMessage } from "../types";
 import branchSummaryContextPrompt from "./prompts/branch-summary-context.md" with { type: "text" };
 import compactionSummaryContextPrompt from "./prompts/compaction-summary-context.md" with { type: "text" };
+import handoffSummaryContextPrompt from "./prompts/handoff-summary-context.md" with { type: "text" };
 
 const COMPACTION_SUMMARY_TEMPLATE = compactionSummaryContextPrompt;
+const HANDOFF_SUMMARY_TEMPLATE = handoffSummaryContextPrompt;
 const BRANCH_SUMMARY_TEMPLATE = branchSummaryContextPrompt;
 const BRANCH_SUMMARY_SOURCE = "packages/agent/src/compaction/prompts/branch-summary-context.md";
 const COMPACTION_SUMMARY_SOURCE = "packages/agent/src/compaction/prompts/compaction-summary-context.md";
@@ -97,6 +99,16 @@ export function renderBranchSummaryContext(summary: string): string {
 
 export function renderCompactionSummaryContext(summary: string): string {
 	return prompt.render(COMPACTION_SUMMARY_TEMPLATE, { summary });
+}
+/**
+ * Wrap a handoff document for injection into the successor context. Unlike the
+ * generic compaction wrapper, this names the mechanism and pins authorship —
+ * the document was written by a prior instance in its own voice, so without
+ * this framing the successor misreads first-person "Next Steps" as fresh user
+ * instructions (or tries to write the handoff again).
+ */
+export function renderHandoffSummaryContext(summary: string): string {
+	return prompt.render(HANDOFF_SUMMARY_TEMPLATE, { summary });
 }
 
 function compactionSummaryInstructionText(message: CompactionSummaryMessage): string {

@@ -424,7 +424,7 @@ function compileMapField(desc: MapFieldDesc): CompiledField {
 	return {
 		number,
 		initDefault(message) {
-			Reflect.set(message, name, {});
+			Reflect.set(message, name, Object.create(null));
 		},
 		encode(message, writer) {
 			const input = Reflect.get(message, name);
@@ -485,7 +485,7 @@ function compileMapField(desc: MapFieldDesc): CompiledField {
 		toJson(message, output) {
 			const input = Reflect.get(message, name);
 			if (!isMessageObject(input)) return;
-			const mapOutput: { [key: string]: JsonValue } = {};
+			const mapOutput: { [key: string]: JsonValue } = Object.create(null);
 			for (const entryKey in input) {
 				mapOutput[entryKey] = valCodec.toJson(input[entryKey]);
 			}
@@ -785,7 +785,7 @@ function arrayField(message: object, name: string): unknown[] {
 function mapField(message: object, name: string): Record<string, unknown> {
 	const value = Reflect.get(message, name);
 	if (isRecord(value)) return value;
-	const map: Record<string, unknown> = {};
+	const map: Record<string, unknown> = Object.create(null);
 	Reflect.set(message, name, map);
 	return map;
 }

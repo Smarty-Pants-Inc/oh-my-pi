@@ -206,7 +206,7 @@ describe("pi-native parseRequest", () => {
 		expect(parsed.options.statefulResponses).toBe(false);
 	});
 
-	it("preserves headers, metadata, sessionId, thinkingBudgets", () => {
+	it("preserves headers, metadata, sessionId, thinkingBudgets, and hidden thinking summaries", () => {
 		const parsed = parseRequest({
 			modelId: "x",
 			context: baseContext,
@@ -215,6 +215,7 @@ describe("pi-native parseRequest", () => {
 				metadata: { user_id: "u" },
 				sessionId: "explicit-session",
 				thinkingBudgets: { high: 8192 },
+				hideThinkingSummary: true,
 				stopSequences: ["\n\n"],
 				toolChoice: "required",
 				serviceTier: "priority",
@@ -225,10 +226,28 @@ describe("pi-native parseRequest", () => {
 		expect(parsed.options.metadata).toEqual({ user_id: "u" });
 		expect(parsed.options.sessionId).toBe("explicit-session");
 		expect(parsed.options.thinkingBudgets).toEqual({ high: 8192 });
+		expect(parsed.options.hideThinkingSummary).toBe(true);
 		expect(parsed.options.stopSequences).toEqual(["\n\n"]);
 		expect(parsed.options.toolChoice).toBe("required");
 		expect(parsed.options.serviceTier).toBe("priority");
 		expect(parsed.options.cacheRetention).toBe("long");
+	});
+	it("preserves Bedrock guardrails in the canonical options bag", () => {
+		const parsed = parseRequest({
+			modelId: "amazon-bedrock/amazon.nova-lite-v1:0",
+			context: baseContext,
+			options: {
+				guardrailIdentifier: "arn:aws:bedrock:eu-west-1:123456789012:guardrail/example",
+				guardrailVersion: "7",
+				guardrailTrace: "enabled_full",
+			},
+		});
+
+		expect(parsed.options).toMatchObject({
+			guardrailIdentifier: "arn:aws:bedrock:eu-west-1:123456789012:guardrail/example",
+			guardrailVersion: "7",
+			guardrailTrace: "enabled_full",
+		});
 	});
 
 	it("forwards the explicit prompt-cache policy through the canonical options bag", () => {
