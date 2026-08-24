@@ -58,7 +58,7 @@ function makeGuestContext(counts: number[], refreshedModels: string[] = []): Int
 		},
 		session: {
 			messages: [],
-			switchSession: () => Promise.resolve(),
+			switchSession: () => Promise.resolve(true),
 			newSession: () => Promise.resolve(),
 			agent: {
 				state: agentState,
