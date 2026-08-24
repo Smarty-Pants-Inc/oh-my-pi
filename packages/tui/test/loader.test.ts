@@ -121,8 +121,7 @@ describe("Loader component", () => {
 		expect(ui.requestComponentRender).toHaveBeenCalledTimes(1);
 
 		vi.advanceTimersByTime(17);
-		expect(ui.requestDirectWrite).toHaveBeenCalledTimes(2);
-		expect(ui.requestComponentRender).not.toHaveBeenCalled();
+		expect(ui.requestComponentRender).toHaveBeenCalledTimes(2);
 		expect(loader.render(40).join("\n")).toContain("0 Checking-");
 
 		loader.stop();
@@ -142,9 +141,9 @@ describe("Loader component", () => {
 		spyOn(performance, "now").mockImplementation(() => now);
 		const loader = new Loader(ui as unknown as TUI, text => text, colorMessage, "Checking", ["0"]);
 
-		expect(ui.requestDirectWrite).toHaveBeenCalledTimes(1);
+		expect(ui.requestComponentRender).toHaveBeenCalledTimes(1);
 		vi.advanceTimersByTime(17);
-		expect(ui.requestDirectWrite).toHaveBeenCalledTimes(2);
+		expect(ui.requestComponentRender).toHaveBeenCalledTimes(2);
 
 		vi.advanceTimersByTime(200);
 		expect(ui.requestComponentRender).toHaveBeenCalledTimes(2);

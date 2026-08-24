@@ -436,16 +436,14 @@ export interface InteractiveModeOptions {
 	initialMessages?: string[];
 }
 
+export const TODO_COMPACT_TERMINAL_ROWS_THRESHOLD = 18;
+
 /**
  * Anchored live-region container for the HUD/status rows between the transcript
- * and the editor (working loader, todo + subagent HUDs, transient notification
- * panels). While it has content every row is live: it reports a seam at 0 and
- * pins that live region so the engine never commits these anchored,
- * rebuilt-in-place rows to native scrollback — otherwise stale duplicates pile
- * up above the live copy on short terminals once the loader sits below a tall HUD. The transcript's own seam,
- * when present, sits higher and wins (topmost-seam merge in TUI.render).
+ * and the editor. Pinning this region prevents rebuilt status rows from being
+ * committed to native scrollback.
  */
-class AnchoredLiveContainer extends Container implements NativeScrollbackLiveRegion {
+class AnchoredLiveContainer extends Container {
 	constructor(private readonly onChildrenChanged?: () => void) {
 		super();
 	}
@@ -470,6 +468,24 @@ class AnchoredLiveContainer extends Container implements NativeScrollbackLiveReg
 		return this.children.length > 0 ? 0 : undefined;
 	}
 
+	isNativeScrollbackLiveRegionPinned(): boolean {
+		return true;
+	}
+
+	#notifyChildrenChanged(): void {
+		try {
+			this.onChildrenChanged?.();
+		} catch {
+			// Status observers are auxiliary and must never break TUI ownership.
+		}
+	}
+}
+
+class TodoHudContainer extends AnchoredLiveContainer {
+	constructor(private readonly mode: InteractiveMode) {
+		super();
+	}
+
 	override render(width: number): readonly string[] {
 		if (this.mode.isCompactTodoMode()) {
 			return [];
@@ -479,8 +495,11 @@ class AnchoredLiveContainer extends Container implements NativeScrollbackLiveReg
 }
 
 class StatusHudContainer extends AnchoredLiveContainer {
-	constructor(private readonly mode: InteractiveMode) {
-		super();
+	constructor(
+		private readonly mode: InteractiveMode,
+		onChildrenChanged?: () => void,
+	) {
+		super(onChildrenChanged);
 	}
 
 	override render(width: number): readonly string[] {
@@ -489,14 +508,6 @@ class StatusHudContainer extends AnchoredLiveContainer {
 			return childLines;
 		}
 		return this.mode.renderCompactStatusLine(width, childLines);
-	}
-
-	#notifyChildrenChanged(): void {
-		try {
-			this.onChildrenChanged?.();
-		} catch {
-			// Status observers are auxiliary and must never break TUI ownership.
-		}
 	}
 }
 
@@ -875,8 +886,12 @@ export class InteractiveMode implements InteractiveModeContext {
 		lspServers: LspStartupServerInfo[] | undefined = undefined,
 		mcpManager?: MCPManager,
 		eventBus?: EventBus,
+		composerOrCompanion?: Composer | ((statusText?: string) => void),
 		companionStatusTextSink?: (statusText?: string) => void,
 	) {
+		const composer = typeof composerOrCompanion === "function" ? undefined : composerOrCompanion;
+		const resolvedCompanionStatusTextSink =
+			typeof composerOrCompanion === "function" ? composerOrCompanion : companionStatusTextSink;
 		this.session = session;
 		this.sessionManager = session.sessionManager;
 		this.settings = session.settings;
@@ -926,7 +941,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			new MCPCommandController(this).handleMCPAuthChallenge(serverName, challenge),
 		);
 		this.#eventBus = eventBus;
-		this.#companionStatusTextSink = companionStatusTextSink;
+		this.#companionStatusTextSink = resolvedCompanionStatusTextSink;
 		if (eventBus) {
 			this.#eventBusUnsubscribers.push(
 				eventBus.on(LSP_STARTUP_EVENT_CHANNEL, data => {
@@ -965,10 +980,11 @@ export class InteractiveMode implements InteractiveModeContext {
 		setTerminalTextSizing(settings.get("tui.textSizing") && TERMINAL.supportsTextSizing);
 		this.chatContainer = new TranscriptContainer();
 		this.pendingMessagesContainer = new AnchoredLiveContainer();
-		this.statusContainer = new AnchoredLiveContainer(
-			companionStatusTextSink ? () => this.#publishCompanionStatusText() : undefined,
+		this.statusContainer = new StatusHudContainer(
+			this,
+			resolvedCompanionStatusTextSink ? () => this.#publishCompanionStatusText() : undefined,
 		);
-		this.todoContainer = new AnchoredLiveContainer();
+		this.todoContainer = new TodoHudContainer(this);
 		this.subagentContainer = new AnchoredLiveContainer();
 		this.btwContainer = new AnchoredLiveContainer();
 		this.omfgContainer = new AnchoredLiveContainer();

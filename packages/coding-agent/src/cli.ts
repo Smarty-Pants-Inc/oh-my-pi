@@ -27,6 +27,7 @@ import {
 import { interceptUnhandledRejections } from "@oh-my-pi/pi-utils/postmortem";
 import { setProcessName } from "@oh-my-pi/pi-utils/process-name";
 import { declareWorkerHostEntry, installWorkerInbox, isWorkerHostSelector } from "@oh-my-pi/pi-utils/worker-host";
+import { BLOB_BROKER_WORKER_ARG } from "./blob-broker/protocol";
 import { OMP_BUILD_ID } from "./build-identity";
 import { installProfileAlias, resolveProfileAliasCommandFromProcess } from "./cli/profile-alias";
 import { extractProfileFlags } from "./cli/profile-bootstrap";
@@ -471,12 +472,7 @@ export async function runCli(argv: string[]): Promise<void> {
 			process.exitCode = 1;
 			return;
 		}
-		await run({ bin: APP_NAME, version: VERSION, argv: resolved.argv, commands, metadataHelp: showHelp });
-	} finally {
-		stopStartupComposer?.();
-	}
-	const command = resolved.argv[0];
-	try {
+		const command = resolved.argv[0];
 		if (command === "launch" || command === "join" || command === "__collab-host-bridge") {
 			handoffHerdrHostBridge(capturedHerdrHostBridge);
 		}
@@ -485,6 +481,7 @@ export async function runCli(argv: string[]): Promise<void> {
 		}
 		await run({ bin: APP_NAME, version: VERSION, argv: resolved.argv, commands, metadataHelp: showHelp });
 	} finally {
+		stopStartupComposer?.();
 		clearHerdrHostBridgeHandoff();
 		clearHerdrGuestBridgeTokenHandoff();
 	}
