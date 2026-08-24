@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { hasFsCode, isEisdir, isEnoent, isEnotdir } from "@oh-my-pi/pi-utils/fs-error";
+import { hasFsCode, isEacces, isEisdir, isEnoent, isEnotdir } from "@oh-my-pi/pi-utils/fs-error";
 import { Snowflake } from "@oh-my-pi/pi-utils/snowflake";
 import { $which } from "@oh-my-pi/pi-utils/which";
 import type { Subprocess } from "bun";

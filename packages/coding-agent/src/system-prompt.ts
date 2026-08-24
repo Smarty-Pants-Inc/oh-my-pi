@@ -874,7 +874,7 @@ export async function buildSystemPrompt(
 	const cpuModelPromise = logger.time("getCpuModel", getCpuModel);
 	const gpuPromise = logger.time("getCachedGpu", getCachedGpu);
 	// "none" (explicit off — and every subagent) omits the block and skips the file lookup.
-	const bundledPersonality = personality === "none" ? "" : PERSONALITY_SPECS[personality].trim();
+	const bundledPersonality = personality === "none" ? "" : personalities[personality].trim();
 	const personalityPromise: Promise<string> =
 		personality === "none"
 			? Promise.resolve("")
@@ -1070,7 +1070,7 @@ export async function buildSystemPrompt(
 		additionalWorkspaceRoots: promptAdditionalWorkspaceRoots,
 		model: includeModelInPrompt ? (model ?? "") : "",
 		useCodexTaskPrompt: usesCodexTaskPrompt(model),
-		personality: personality === "none" ? "" : personalities[personality].trim(),
+		personality: personalityBlock,
 		intentTracing: !!intentField,
 		intentField: intentField ?? "",
 		eagerTasks,

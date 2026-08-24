@@ -766,6 +766,7 @@ export class SessionMaintenance {
 		let compactionCommitted = false;
 		let methodAttempted = false;
 		const compactionAbortController = retryController ?? new AbortController();
+		const manualCompactionCleanup = ownsCompactionController ? Promise.withResolvers<void>() : undefined;
 		let releaseSemanticDeliveryMaintenance: (() => void) | undefined;
 		if (ownsCompactionController) {
 			this.#compactionAbortController = compactionAbortController;
@@ -3111,6 +3112,9 @@ export class SessionMaintenance {
 					codexCompaction: armedSpec.codexCompaction,
 					method: armedSpec.method,
 					handoffDocument: armedSpec.handoffDocument,
+					providerReplayThroughEntryId: armedSpec.result.preserveData?.openaiRemoteCompaction
+						? armedSpec.snapshotLeafId
+						: undefined,
 					action,
 					reason,
 					willRetry,
@@ -3812,6 +3816,7 @@ export class SessionMaintenance {
 		codexCompaction: CodexCompactionContext | undefined;
 		method: CompactionMethod | undefined;
 		handoffDocument?: HandoffResult;
+		providerReplayThroughEntryId?: string;
 		action: "context-full" | "handoff" | "snapcompact" | "remote";
 		reason: "overflow" | "threshold" | "idle" | "incomplete";
 		willRetry: boolean;

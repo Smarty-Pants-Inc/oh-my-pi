@@ -109,6 +109,7 @@ import {
 	loadAdvisorTranscriptCosts,
 } from "../advisor";
 import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, type AsyncJob, type AsyncJobFilter, AsyncJobManager } from "../async";
+import { reset as resetCapabilities } from "../capability";
 import { shouldEnableAppendOnlyContext } from "../config/append-only-context-mode";
 import type { ModelRegistry } from "../config/model-registry";
 import type { ResolvedModelRoleValue } from "../config/model-resolver";
@@ -5693,6 +5694,8 @@ export class AgentSession {
 					this.sessionManager.appendModeChange("none");
 				}
 			}
+			resetCapabilities();
+			await this.refreshBaseSystemPrompt();
 			return { droppedCount };
 		} finally {
 			releaseSemanticFence();
@@ -6953,6 +6956,12 @@ export class AgentSession {
 	async prompt(text: string, options?: PromptOptions): Promise<boolean> {
 		const abort = this.#abortPromise;
 		if (abort) await abort;
+		// A manual `/compact` runs with the agent subscription disconnected until its
+		// cleanup finally re-drains the preserved queues. Starting a turn before then
+		// would neither persist nor forward its events and could race the in-flight
+		// history rewrite. `abort` still overtakes compaction; ordinary prompts wait
+		// here. No-op when no manual compaction is active.
+		await this.#maintenance.manualCompactionCleanup;
 		const lifecycleGeneration = this.#lifecycleTransitionGeneration;
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		const typedText = text;
@@ -9764,13 +9773,14 @@ export class AgentSession {
 			// Abort the handoff first so generic compaction cancellation cannot replace
 			// the harness reason with an unreasoned "Handoff cancelled".
 			this.#handoff.abortHandoff(new Error(intent.reason ?? "Handoff aborted by session"));
+			let manualCompactionCleanup: Promise<void> | undefined;
 			if (intent.preserveCompaction) {
 				// Manual `/compact` installed its own #compactionAbortController before
 				// this internal abort and must keep it alive. Automatic compaction must
 				// still be cancelled so it cannot race the manual rewrite.
 				this.#maintenance.abortAutomaticCompaction();
 			} else {
-				manualCompactionCleanup = this.#maintenance.abortCompaction(options?.reason);
+				manualCompactionCleanup = this.#maintenance.abortCompaction(intent.reason);
 			}
 			this.abortBash();
 			// Disposal gives tracked eval work its bounded grace period in
@@ -9895,6 +9905,7 @@ export class AgentSession {
 			this.#planReferenceSent = false;
 			this.#planReferencePath = "local://PLAN.md";
 
+			resetCapabilities();
 			const reconciliation = await this.#sessionSwitchReconciler?.();
 			try {
 				await this.refreshBaseSystemPrompt();
