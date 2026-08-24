@@ -6568,7 +6568,7 @@
     },
     {
       "path": "packages/coding-agent/src/cli.ts",
-      "sha256": "2bed240e06f8709863fe29ee79666624f7ba765a2375897e92626a8ca59a9054"
+      "sha256": "90c2005bd4adc76c8a5863c999df207749bb66797c70683c5326e45d9ce035db"
     },
     {
       "path": "packages/coding-agent/src/cli/agents-cli.ts",
@@ -8032,7 +8032,7 @@
     },
     {
       "path": "packages/coding-agent/src/main.ts",
-      "sha256": "764b167975b32e3f41c3a5fedfcdf6581f6c901171cc05bd729f32f240b904f5"
+      "sha256": "b689387df9fec80b9b643f1c2aced9812d0b4f81045782c17a5210208db04a12"
     },
     {
       "path": "packages/coding-agent/src/markit/converters/docx.ts",
@@ -8452,7 +8452,7 @@
     },
     {
       "path": "packages/coding-agent/src/modes/interactive-mode.ts",
-      "sha256": "aa5836774c705a1b3e239cde95f1a8d05bb5b821e16b4540af4408610bb70c95"
+      "sha256": "bd8f1649e74b272a1450f12cbc4b4ce95b1d87d91482e693f803d7ef72f6063d"
     },
     {
       "path": "packages/coding-agent/src/modes/loop-limit.ts",
@@ -8704,7 +8704,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/agent-session.ts",
-      "sha256": "643ea8b7e546ffc2d32e84260620e56bdcbe89f41a6f721aded1c77d1ef1434a"
+      "sha256": "fefbea7bdcc133b3b1267449cfc887517dd950ec91e22177d212d508a02088f5"
     },
     {
       "path": "packages/coding-agent/src/session/agent-storage.ts",
@@ -9140,7 +9140,7 @@
     },
     {
       "path": "packages/coding-agent/src/system-prompt.ts",
-      "sha256": "36ad3ef09f89abb7719ae3c31abe0a3baf64e58590a63c533a9e136b04fabe01"
+      "sha256": "4761412d20ea373e725a6795d469ec69bfb1939f60a8d65b2fdbf18f2566ae7c"
     },
     {
       "path": "packages/coding-agent/src/task/agents.ts",
@@ -11008,5 +11008,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "f49dcd278472243af9734033b21553b20a04ce9576b52d435ba18045ccb017d5"
+  "rootSha256": "0f7e0db6c986ea394f0acebaec1a136b8ca4886ee7905ede4ad614a054a53501"
 }
