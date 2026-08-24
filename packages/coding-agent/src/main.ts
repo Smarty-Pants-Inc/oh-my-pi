@@ -666,9 +666,9 @@ async function runInteractiveMode(
 	initialImages?: ImageContent[],
 	joinLink?: string,
 	companionStatusTextSink?: (statusText?: string) => void,
-	bridge?: CollabBridgeBootstrap,
 	startBackgroundModelDiscovery?: () => Promise<void>,
 	startupLease?: ComposerLease,
+	bridge?: CollabBridgeBootstrap,
 ): Promise<void> {
 	let mode: InteractiveMode;
 	try {
@@ -2263,9 +2263,9 @@ export async function runRootCommand(
 				initialImages,
 				parsedArgs.join,
 					activeCompanionController?.setStatusText,
-					interactiveCollabBridge,
 					startBackgroundModelDiscovery,
 					startupLease,
+					interactiveCollabBridge,
 				);
 				} finally {
 					startupLease?.dispose();
