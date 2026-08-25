@@ -2,6 +2,7 @@ import { beforeAll, describe, expect, it, vi } from "bun:test";
 import { stripVTControlCharacters } from "node:util";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ToolExecutionComponent } from "@oh-my-pi/pi-coding-agent/modes/components/tool-execution";
+import { TranscriptContainer } from "@oh-my-pi/pi-coding-agent/modes/components/transcript-container";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { AgentProgress, SingleResult, TaskToolDetails } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { TUI } from "@oh-my-pi/pi-tui";
@@ -104,5 +105,33 @@ describe("ToolExecutionComponent detached task lifecycle", () => {
 
 		const rendered = stripVTControlCharacters(component.render(100).join("\n"));
 		expect(rendered).toContain("found it in src/auth.ts");
+	});
+
+	it("freezes progress after the transcript acknowledges its history batch", () => {
+		const component = makeComponent();
+		const transcript = new TranscriptContainer();
+		transcript.addChild(component);
+		component.updateResult(asyncSnapshot("progress before history"), true);
+		component.parkAsBackground();
+		const batch = transcript.peekFinalizedBatch(100, 0);
+		expect(batch).toBeDefined();
+		transcript.acknowledgeFinalizedBatch(batch!.id);
+
+		component.updateResult(asyncSnapshot("progress after history"), true);
+		const rendered = stripVTControlCharacters(transcript.render(100).join("\n"));
+		expect(rendered).toContain("progress before history");
+		expect(rendered).not.toContain("progress after history");
+	});
+
+	it("freezes later progress after a detached task is sealed", () => {
+		const component = makeComponent();
+		component.updateResult(asyncSnapshot("progress before seal"), true);
+		component.parkAsBackground();
+		component.seal();
+		component.updateResult(asyncSnapshot("progress after seal"), true);
+
+		const rendered = stripVTControlCharacters(component.render(100).join("\n"));
+		expect(rendered).toContain("progress before seal");
+		expect(rendered).not.toContain("progress after seal");
 	});
 });

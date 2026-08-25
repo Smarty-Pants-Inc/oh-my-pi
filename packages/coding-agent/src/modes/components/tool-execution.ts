@@ -255,6 +255,8 @@ export interface ToolExecutionHandle extends Component {
 	setToolActivityVisible(visible: boolean): void;
 	/** Mark the call parked: it returned, but stays tracked for async job frames. */
 	parkAsBackground(): void;
+	/** Mark a parked task committed to transcript history; later progress must not mutate its bytes. */
+	markTranscriptHistoryCommitted?(): void;
 	/** Seal the block as final history and stop its animations. */
 	seal(): void;
 }
@@ -354,6 +356,11 @@ export class ToolExecutionComponent extends Container {
 	// A background task whose call already returned; later async job frames are
 	// partial updates, but the block is ready to retire as history.
 	#parkedBackground = false;
+	// Parked async task rows may continue receiving progress while they remain in the mutable transcript.
+	// Once sealed or committed, their styling and time-derived text must stay byte-stable.
+	#backgroundTaskFrozen = false;
+	#backgroundTaskFrozenStyled = false;
+	#historyCommitted = false;
 	#resultVersion = 0;
 	// Post-finalize mutation counter (see FinalizableBlock.getTranscriptBlockVersion):
 	// a tool block can keep changing after isTranscriptBlockFinalized() first
@@ -664,6 +671,10 @@ export class ToolExecutionComponent extends Container {
 		isPartial = false,
 		_toolCallId?: string,
 	): void {
+		if (this.#toolName === "task" && this.#backgroundTaskFrozen) {
+			if (isPartial || this.#historyCommitted) return;
+		}
+
 		const hadNoResult = this.#result === undefined;
 		const wasPartialResult = this.#result !== undefined && this.#isPartial;
 		const firstResultRepaintShapePainted = this.#firstResultViewportRepaintShapePainted;
@@ -875,6 +886,15 @@ export class ToolExecutionComponent extends Container {
 		this.#parkedBackground = true;
 	}
 
+	/** Freeze a parked task when its finalized rows are acknowledged by the transcript. */
+	markTranscriptHistoryCommitted(): void {
+		if (this.#toolName !== "task" || !this.#parkedBackground || this.#historyCommitted) return;
+		this.#historyCommitted = true;
+		this.#backgroundTaskFrozen = true;
+		this.#updateSpinnerAnimation();
+		this.#updateDisplay();
+	}
+
 	/**
 	 * Mark the tool terminal even though no result arrived (the turn aborted or
 	 * abandoned it) and stop animating so the container can retire it.
@@ -884,6 +904,10 @@ export class ToolExecutionComponent extends Container {
 		this.#sealed = true;
 		this.#blockVersion++;
 		this.#displaceableByToolName = undefined;
+		if (this.#toolName === "task") {
+			this.#backgroundTaskFrozen = true;
+			if (!this.#historyCommitted) this.#backgroundTaskFrozenStyled = true;
+		}
 		this.stopAnimation();
 		this.#updateDisplay();
 		this.#ui.requestRender();
@@ -967,7 +991,7 @@ export class ToolExecutionComponent extends Container {
 		// TUI startup, so a result rendered before it lands must re-shape once it
 		// does (it gates Image children vs text fallback in #rebuildDisplay); keyed
 		// here for the same reason markdown.ts keys its render cache on it.
-		const key = `${this.#resultVersion}|${this.#expanded}|${this.#isPartial}|${this.#argsComplete ? "1" : "0"}|${this.#executionStarted ? "1" : "0"}|${this.#spinnerFrame ?? "-"}|${this.#showImages}|${getThemeEpoch()}|${this.#displayInputVersion}|${TERMINAL.imageProtocol ?? "-"}|${this.#imageSizeKey()}`;
+		const key = `${this.#resultVersion}|${this.#expanded}|${this.#isPartial}|${this.#argsComplete ? "1" : "0"}|${this.#executionStarted ? "1" : "0"}|${this.#spinnerFrame ?? "-"}|${this.#backgroundTaskFrozen ? "1" : "0"}|${this.#backgroundTaskFrozenStyled ? "1" : "0"}|${this.#showImages}|${getThemeEpoch()}|${this.#displayInputVersion}|${TERMINAL.imageProtocol ?? "-"}|${this.#imageSizeKey()}`;
 		if (key === this.#lastDisplayKey && this.#displayBuilt) return;
 		this.#lastDisplayKey = key;
 
@@ -1442,7 +1466,8 @@ export class ToolExecutionComponent extends Container {
 			// draws every dispatched agent as a progress/result line, so tell
 			// `renderCall` to drop its duplicate streaming preview list.
 			context.hasResult = Boolean(this.#result);
-			this.#taskRenderNowMs = Date.now();
+			context.frozen = this.#backgroundTaskFrozenStyled;
+			if (!this.#backgroundTaskFrozen) this.#taskRenderNowMs = Date.now();
 			context.nowMs = this.#taskRenderNowMs;
 		} else if (isEditLikeToolName(this.#toolName)) {
 			context.editMode = this.#editMode;

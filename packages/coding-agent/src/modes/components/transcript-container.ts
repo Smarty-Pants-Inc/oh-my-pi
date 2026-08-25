@@ -17,6 +17,10 @@ interface FinalizableBlock {
 	isTranscriptBlockFinalized?(): boolean;
 }
 
+interface HistoryCommitAwareBlock {
+	markTranscriptHistoryCommitted?(): void;
+}
+
 /**
  * Block lifecycle:
  * - `active`: still mutating; renders live and counts against tool admission.
@@ -247,6 +251,8 @@ export class TranscriptContainer extends Container {
 		const offered = this.#offered;
 		if (offered === undefined || offered.batch.id !== id) return;
 		for (let index = this.#frontier; index < offered.end; index++) {
+			const component = this.#entries[index]!.component as Component & HistoryCommitAwareBlock;
+			component.markTranscriptHistoryCommitted?.();
 			this.#entries[index]!.state = "committed";
 		}
 		this.#frontier = offered.end;
