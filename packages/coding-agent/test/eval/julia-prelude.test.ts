@@ -1,9 +1,18 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import * as path from "node:path";
-import { $which, TempDir } from "@oh-my-pi/pi-utils";
+import { TempDir } from "@oh-my-pi/pi-utils";
 import { disposeJuliaKernelSessionsByOwner, executeJulia } from "../../src/eval/jl/executor";
+import { checkJuliaKernelAvailability } from "../../src/eval/jl/kernel";
 
-const HAS_JULIA = Boolean($which("julia"));
+async function hasWorkingJulia(): Promise<boolean> {
+	try {
+		return (await checkJuliaKernelAvailability(process.cwd())).ok;
+	} catch {
+		return false;
+	}
+}
+
+const HAS_JULIA = await hasWorkingJulia();
 const OWNER_ID = "julia-prelude-tests";
 
 describe.skipIf(!HAS_JULIA)("eval Julia prelude helpers", () => {

@@ -148,7 +148,7 @@ describe("AgentSession context promotion", () => {
 		const deadline = Date.now() + timeoutMs;
 		while (Date.now() < deadline) {
 			if (predicate()) return;
-			await Bun.sleep(10);
+			await scheduler.yield();
 		}
 		throw new Error("Timed out waiting for condition");
 	}
@@ -209,11 +209,10 @@ describe("AgentSession context promotion", () => {
 		expect(session.providerSessionState.size).toBe(0);
 	});
 
-	it("promotes on 413 payload-too-large overflow errors", async () => {
+	it("does not promote payload-shaped 413 errors with local context headroom", async () => {
 		const smallModel = modelRegistry.find("openai-codex", "gpt-5.5");
-		const largeModel = modelRegistry.find("openai-codex", "gpt-5.6-sol");
-		if (!smallModel || !largeModel) {
-			throw new Error("Expected small and large codex models to exist");
+		if (!smallModel) {
+			throw new Error("Expected small codex model to exist");
 		}
 
 		const settings = Settings.isolated({
@@ -246,8 +245,8 @@ describe("AgentSession context promotion", () => {
 
 		await session.waitForIdle();
 
-		expect(session.model?.provider).toBe(largeModel.provider);
-		expect(session.model?.id).toBe(largeModel.id);
+		expect(session.model?.provider).toBe(smallModel.provider);
+		expect(session.model?.id).toBe(smallModel.id);
 	});
 	it("clears codex provider session state on manual setModel switch away from codex", async () => {
 		const codexModel = modelRegistry.find("openai-codex", "gpt-5.4");

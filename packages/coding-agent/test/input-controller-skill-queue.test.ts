@@ -28,6 +28,7 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 
 type StubEditor = {
 	setText: (text: string) => void;
+	setCollapsedText: (text: string) => void;
 	getText: () => string;
 	getExpandedText: () => string;
 	clearDraft: (historyText?: string) => void;
@@ -72,6 +73,10 @@ function createStubInputControllerContext(opts: {
 	let editorText = "";
 	const editor: StubEditor = {
 		setText(text) {
+			editorText = text;
+		},
+		// The stub skips chip collapsing so assertions read the wire-format text.
+		setCollapsedText(text) {
 			editorText = text;
 		},
 		getText() {
@@ -272,11 +277,11 @@ describe("InputController skill queue chip metadata", () => {
 		const controller = new InputController(ctx);
 
 		controller.setupEditorSubmitHandler();
-		editor.setText("/skill:test-skill inspect this");
+		editor.setText("/skill:test-skill inspect this [Image #1]");
 		editor.pendingImages = [image];
 		editor.pendingImageLinks = ["file:///tmp/skill-image.png"];
 		editor.imageLinks = editor.pendingImageLinks;
-		await editor.onSubmit?.("/skill:test-skill inspect this");
+		await editor.onSubmit?.("/skill:test-skill inspect this [Image #1]");
 
 		expect(promptCustomMessage).toHaveBeenCalledTimes(1);
 		const message = promptCustomMessage.mock.calls[0]?.[0];
@@ -755,6 +760,10 @@ function createStubInteractiveModeContextForUiHelpers(
 	let editorText = "";
 	const editor: StubEditor = {
 		setText(text) {
+			editorText = text;
+		},
+		// The stub skips chip collapsing so assertions read the wire-format text.
+		setCollapsedText(text) {
 			editorText = text;
 		},
 		getText() {
