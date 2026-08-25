@@ -2231,6 +2231,13 @@ export async function runRootCommand(
 				if (modelScopeNotification) {
 					notifs.push(modelScopeNotification);
 				}
+				if ($env.PI_TIMING) {
+					logger.printTimings();
+					if (logger.shouldExitAfterTimings()) {
+						await disposeSessionAndQuit(session, 0);
+						return;
+					}
+				}
 				const startupLease = takeStartupComposerLease();
 				try {
 					stopStartupWatchdog();
