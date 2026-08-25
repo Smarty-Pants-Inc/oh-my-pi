@@ -57,6 +57,20 @@ describe("collab prompt message", () => {
 		expect(rendered.match(/x/g)?.length).toBe(body.length);
 	});
 
+	it("clips long sender attribution to the message width", () => {
+		const message: CustomMessage<CollabPromptDetails> = {
+			role: "custom",
+			customType: "collab-prompt",
+			content: "hello",
+			display: true,
+			details: { from: "sender".repeat(20), displayNameRevision: 1 },
+			timestamp: Date.now(),
+		};
+		const rendered = Bun.stripANSI(new CollabPromptMessageComponent(message).render(20).join("\n"));
+
+		expect(rendered.split("\n").every(line => line.length <= 20)).toBe(true);
+	});
+
 	it("keeps sender attribution and an image marker for an image-only prompt", () => {
 		const message: CustomMessage<CollabPromptDetails> = {
 			role: "custom",

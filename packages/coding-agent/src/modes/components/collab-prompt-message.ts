@@ -74,18 +74,22 @@ export class CollabPromptMessageComponent implements Component {
 		const lines = this.#body.render(width);
 		const firstContentIndex = lines.findIndex(line => Bun.stripANSI(line).trim().length > 0);
 		if (firstContentIndex < 0) {
-			return [applyBackgroundToLine(` ${this.#sender}`, width, value => theme.bg("userMessageBg", value))];
+			const sender = sliceWithWidth(` ${this.#sender}`, 0, Math.max(1, width), true).text;
+			return [applyBackgroundToLine(sender, width, value => theme.bg("userMessageBg", value))];
 		}
 		const line = lines[firstContentIndex]!;
 		const plain = Bun.stripANSI(line);
 		const leadingWidth = visibleWidth(plain.slice(0, plain.length - plain.trimStart().length));
 		const contentWidth = Math.max(0, visibleWidth(plain.trimEnd()) - leadingWidth);
-		const bodyWidth = Math.max(1, width - leadingWidth - visibleWidth(this.#sender));
-		const prefix = sliceWithWidth(line, 0, leadingWidth).text;
+		const availableWidth = Math.max(1, width);
+		const prefixWidth = Math.min(leadingWidth, availableWidth - 1);
+		const prefix = sliceWithWidth(line, 0, prefixWidth, true).text;
+		const sender = sliceWithWidth(this.#sender, 0, availableWidth - visibleWidth(prefix) - 1, true).text;
+		const bodyWidth = Math.max(1, availableWidth - visibleWidth(prefix) - visibleWidth(sender));
 		const body = sliceWithWidth(line, leadingWidth, contentWidth, true).text;
 		const bodyLines = wrapTextWithAnsi(body, bodyWidth);
 		const composed = [...lines];
-		composed[firstContentIndex] = `${prefix}${this.#sender}${bodyLines[0] ?? ""}`;
+		composed[firstContentIndex] = `${prefix}${sender}${bodyLines[0] ?? ""}`;
 		if (bodyLines.length > 1) {
 			const continuationLines = bodyLines
 				.slice(1)
