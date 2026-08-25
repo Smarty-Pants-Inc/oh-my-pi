@@ -8,6 +8,7 @@ import * as url from "node:url";
 import type { ParseResult, ParserPlugin } from "@babel/parser";
 import { parse as parseBabel } from "@babel/parser";
 import {
+	getDbBusyTimeoutMs,
 	getLegacyPiExtensionCacheDbPath,
 	isCompiledBinary,
 	logger,
@@ -1892,16 +1893,32 @@ function getExtensionParseCacheDb(): Database | null {
 		const cachePath = getLegacyPiExtensionCacheDbPath();
 		try {
 			if (fs.statSync(cachePath).size > EXTENSION_PARSE_CACHE_MAX_BYTES) {
-				fs.rmSync(cachePath, { force: true });
+				// Remove the full WAL set, not just the main db. A leftover
+				// `-wal`/`-shm` pair still owned by a concurrent omp process is
+				// adopted by this fresh connection; when that `-wal` has
+				// uncheckpointed frames (the normal case while another omp is
+				// writing its own cache entries), `journal_mode=WAL` fails with
+				// SQLITE_IOERR — disabling the parse cache for the whole process
+				// and forcing a reparse of every extension on startup. See #9549.
+				for (const suffix of ["", "-wal", "-shm"]) {
+					fs.rmSync(`${cachePath}${suffix}`, { force: true });
+				}
 			}
 		} catch {
 			// A missing or unreadable cache is a cold cache.
 		}
 		fs.mkdirSync(path.dirname(cachePath), { recursive: true });
 		const db = new Database(cachePath, { create: true });
-		db.run("PRAGMA busy_timeout = 50");
+		// Install the busy handler BEFORE any lock-taking statement (incl.
+		// `PRAGMA journal_mode=WAL`, which takes an exclusive lock during WAL
+		// recovery). See #2421. WAL + synchronous=NORMAL avoids the per-entry
+		// journal create/delete + fsync churn that serialized this cache behind
+		// concurrent omp startups and blocked the event loop for ~20s (#9549).
+		db.run(`PRAGMA busy_timeout = ${getDbBusyTimeoutMs()}`);
+		db.run("PRAGMA journal_mode=WAL");
+		db.run("PRAGMA synchronous=NORMAL");
 		db.run(
-			"CREATE TABLE IF NOT EXISTS extension_parse_cache (cache_key TEXT PRIMARY KEY, source_type TEXT NOT NULL, references TEXT NOT NULL, commonjs_named_exports TEXT NOT NULL, commonjs_reexport_specifiers TEXT NOT NULL)",
+			"CREATE TABLE IF NOT EXISTS extension_parse_cache (cache_key TEXT PRIMARY KEY, source_type TEXT NOT NULL, [references] TEXT NOT NULL, commonjs_named_exports TEXT NOT NULL, commonjs_reexport_specifiers TEXT NOT NULL)",
 		);
 		extensionParseCacheDb = db;
 		return db;
@@ -1912,6 +1929,15 @@ function getExtensionParseCacheDb(): Database | null {
 		extensionParseCacheDb = null;
 		return null;
 	}
+}
+
+/**
+ * Test seam: whether the extension parse cache opened successfully. Exercises
+ * the real eviction + open path, including full WAL-set cleanup on oversized
+ * caches (#9549).
+ */
+export function __isExtensionParseCacheAvailableForTests(): boolean {
+	return getExtensionParseCacheDb() !== null;
 }
 
 function parseCachedAnalysis(row: ExtensionParseCacheRow): ExtensionSourceAnalysis | null {
@@ -1955,7 +1981,7 @@ function writeExtensionSourceAnalysis(cacheKey: string, analysis: ExtensionSourc
 			const db = getExtensionParseCacheDb();
 			if (!db) return;
 			db.run(
-				"INSERT OR REPLACE INTO extension_parse_cache (cache_key, source_type, references, commonjs_named_exports, commonjs_reexport_specifiers) VALUES (?, ?, ?, ?, ?)",
+				"INSERT OR REPLACE INTO extension_parse_cache (cache_key, source_type, [references], commonjs_named_exports, commonjs_reexport_specifiers) VALUES (?, ?, ?, ?, ?)",
 				[
 					cacheKey,
 					analysis.sourceType,
@@ -1986,7 +2012,7 @@ function getExtensionSourceAnalysis(source: string, importerPath: string): Exten
 	try {
 		const row = db
 			?.query<ExtensionParseCacheRow, [string]>(
-				"SELECT source_type, references, commonjs_named_exports, commonjs_reexport_specifiers FROM extension_parse_cache WHERE cache_key = ?",
+				"SELECT source_type, [references], commonjs_named_exports, commonjs_reexport_specifiers FROM extension_parse_cache WHERE cache_key = ?",
 			)
 			.get(cacheKey);
 		if (row) {
@@ -2508,7 +2534,7 @@ async function rewriteLegacyExtensionSource(
 			replacement = toGraphImportSpecifier(resolved, mtimeTag);
 		}
 		if (!replacement && specifier.startsWith("#")) {
-			const resolved = await resolvePackageImportSpecifier(specifier, importerPath);
+			const resolved = packageImportPath(specifier, await resolvePackageImportSpecifier(specifier, importerPath));
 			if (snapshotModulePaths && (!resolved || !snapshotModulePaths.has(resolved))) {
 				throw new Error(`Uncaptured protected extension import: ${specifier}`);
 			}
@@ -2773,13 +2799,14 @@ async function resolvePackageImportTarget(
 	const fileTarget = await resolvePackageFileTarget(packageRoot, targetPath);
 	return fileTarget ? resolveRuntimeFileTarget(fileTarget) : null;
 }
+type PackageImportResolution = string | typeof PACKAGE_IMPORT_EXCLUDED | null;
 
 async function resolvePackageImportSpecifier(
 	specifier: string,
 	importerPath: string,
 	includeNonSource = false,
 	conditions: ReadonlySet<string> = SUPPORTED_PACKAGE_IMPORT_CONDITIONS,
-): Promise<string | null> {
+): Promise<PackageImportResolution> {
 	if (!specifier.startsWith("#")) {
 		return null;
 	}
@@ -2796,7 +2823,7 @@ async function resolvePackageImportSpecifier(
 
 	const exactTarget = selectPackageImportTarget(imports[specifier], conditions);
 	if (exactTarget === PACKAGE_IMPORT_EXCLUDED) {
-		return null;
+		return PACKAGE_IMPORT_EXCLUDED;
 	}
 	if (exactTarget !== null) {
 		return resolvePackageImportTarget(packageRoot, exactTarget, null, includeNonSource);
@@ -2828,9 +2855,15 @@ async function resolvePackageImportSpecifier(
 	}
 
 	if (!bestMatch || bestMatch.target === PACKAGE_IMPORT_EXCLUDED) {
-		return null;
+		return bestMatch?.target ?? null;
 	}
 	return resolvePackageImportTarget(packageRoot, bestMatch.target, bestMatch.wildcard, includeNonSource);
+}
+function packageImportPath(specifier: string, resolution: PackageImportResolution): string | null {
+	if (resolution === PACKAGE_IMPORT_EXCLUDED) {
+		throw new Error(`Package import "${specifier}" is excluded by its package imports map`);
+	}
+	return resolution;
 }
 
 function isBareExtensionDependencySpecifier(specifier: string): boolean {
@@ -2982,6 +3015,20 @@ async function isCommonJsModulePath(
 		sourceType ?? getExtensionSourceAnalysis(await Bun.file(modulePath).text(), modulePath).sourceType;
 	if (parsedSourceType === "module") {
 		return false;
+	}
+	if (parsedSourceType === "script") {
+		const ast = parseExtensionSource(await Bun.file(modulePath).text(), modulePath);
+		const hasUnshadowedCommonJsSyntax = collectScopedAstNodes(
+			ast,
+			node => node.type === "CallExpression" || node.type === "MemberExpression",
+		).some(({ node, scope }) => {
+			if (isGlobalRequireCall(node, scope)) return true;
+			if (node.type !== "MemberExpression") return false;
+			return isUnshadowedExportsTarget(node, scope) || isUnshadowedExportsTarget(asAstNode(node.object), scope);
+		});
+		if (hasUnshadowedCommonJsSyntax) {
+			return true;
+		}
 	}
 	if (inheritedKind) {
 		return inheritedKind === "commonjs";
@@ -3319,7 +3366,10 @@ async function rewriteExtensionSpecifiers(
 				const candidate = Bun.resolveSync(reference.specifier, path.dirname(importerPath));
 				resolved = hasSourceModuleExtension(candidate) ? await realpathOrSelf(candidate) : null;
 			} else if (reference.specifier.startsWith("#")) {
-				resolved = await resolvePackageImportSpecifier(reference.specifier, importerPath);
+				resolved = packageImportPath(
+					reference.specifier,
+					await resolvePackageImportSpecifier(reference.specifier, importerPath),
+				);
 			} else {
 				resolved = await resolveExtensionBareDependency(reference.specifier, importerPath);
 			}
@@ -3665,11 +3715,14 @@ async function collectExtensionModules(entryRealPath: string): Promise<Extension
 						}
 					}
 				} else if (specifier.startsWith("#")) {
-					const candidate = await resolvePackageImportSpecifier(
+					const candidate = packageImportPath(
 						specifier,
-						file,
-						false,
-						isRequired ? SUPPORTED_PACKAGE_REQUIRE_CONDITIONS : SUPPORTED_PACKAGE_IMPORT_CONDITIONS,
+						await resolvePackageImportSpecifier(
+							specifier,
+							file,
+							false,
+							isRequired ? SUPPORTED_PACKAGE_REQUIRE_CONDITIONS : SUPPORTED_PACKAGE_IMPORT_CONDITIONS,
+						),
 					);
 					if (candidate) {
 						const inheritedTargetKind = isRequired
@@ -3840,13 +3893,16 @@ async function collectExtensionSourceGraph(
 				if (specifier.startsWith(".")) {
 					resolved = await resolveRelativeGraphTarget(specifier, file, reference.kind);
 				} else if (specifier.startsWith("#")) {
-					resolved = await resolvePackageImportSpecifier(
+					resolved = packageImportPath(
 						specifier,
-						file,
-						true,
-						reference.kind === "require"
-							? SUPPORTED_PACKAGE_REQUIRE_CONDITIONS
-							: SUPPORTED_PACKAGE_IMPORT_CONDITIONS,
+						await resolvePackageImportSpecifier(
+							specifier,
+							file,
+							true,
+							reference.kind === "require"
+								? SUPPORTED_PACKAGE_REQUIRE_CONDITIONS
+								: SUPPORTED_PACKAGE_IMPORT_CONDITIONS,
+						),
 					);
 					if (!resolved) return null;
 				} else if (

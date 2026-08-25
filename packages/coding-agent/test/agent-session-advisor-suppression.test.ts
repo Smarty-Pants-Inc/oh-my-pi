@@ -18,7 +18,9 @@
  *     follow-up stays queued for the next explicit resume rather than auto-running.
  */
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
-import { Agent, type AgentMessage } from "@oh-my-pi/pi-agent-core";
+import { type } from "@oh-my-pi/omptype";
+import { Agent, type AgentMessage, type AgentTool } from "@oh-my-pi/pi-agent-core";
+import type { ToolCall } from "@oh-my-pi/pi-ai";
 import { createMockModel, type MockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -28,7 +30,18 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { TempDir } from "@oh-my-pi/pi-utils";
+import { Snowflake, TempDir } from "@oh-my-pi/pi-utils";
+
+interface MockYieldDetails {
+	status: "success";
+	data?: unknown;
+	type?: string | string[];
+}
+
+const mockYieldParameters = type({
+	result: "unknown",
+	"type?": "unknown",
+});
 
 const ADVISOR_TYPE = "advisor";
 
@@ -109,6 +122,56 @@ describe("AgentSession advisor auto-resume suppression", () => {
 		return { session, sessionManager, mock, streamStarted: started.promise };
 	}
 
+	function readYieldResultData(result: unknown): unknown {
+		if (!result || typeof result !== "object" || !("data" in result)) return undefined;
+		return result.data;
+	}
+
+	function isYieldType(value: unknown): value is string | string[] {
+		return (
+			typeof value === "string" ||
+			(Array.isArray(value) && value.length > 0 && value.every(item => typeof item === "string"))
+		);
+	}
+
+	function createMockYieldTool(): AgentTool<typeof mockYieldParameters, MockYieldDetails> {
+		return {
+			name: "yield",
+			label: "Yield",
+			description: "Mock yield tool",
+			parameters: mockYieldParameters,
+			execute: async (_toolCallId, params) => {
+				const details: MockYieldDetails = { status: "success", data: readYieldResultData(params.result) };
+				if (isYieldType(params.type)) details.type = params.type;
+				return {
+					content: [{ type: "text", text: "Result submitted." }],
+					details,
+				};
+			},
+		};
+	}
+
+	function createYieldMockResponse(args: { result: { data: unknown }; type?: string | string[] }): MockResponse {
+		const toolCall: ToolCall = {
+			type: "toolCall",
+			id: `call_yield_${Snowflake.next()}`,
+			name: "yield",
+			arguments: args,
+		};
+		return {
+			content: [toolCall],
+			stopReason: "toolUse",
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+		};
+	}
+
 	async function createCompletedAdvisorSession(
 		severity: "concern" | "blocker" = "concern",
 		extensionRunner?: AdvisorTestExtensionRunner,
@@ -168,7 +231,7 @@ describe("AgentSession advisor auto-resume suppression", () => {
 		};
 	}
 
-	function isAdvisorCard(message: AgentMessage): boolean {
+	function isAdvisorCard(message: AgentMessage): message is AgentMessage & { role: "custom"; content: string } {
 		return message.role === "custom" && (message as { customType?: string }).customType === ADVISOR_TYPE;
 	}
 
@@ -206,6 +269,62 @@ describe("AgentSession advisor auto-resume suppression", () => {
 					JSON.stringify(entry).includes(text),
 			);
 	}
+	it("preserves a final-yield blocker without starting a hidden post-yield turn", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({
+			responses: [
+				createYieldMockResponse({ result: { data: "FINAL RESULT" } }),
+				{ content: ["must not run"], stopReason: "stop" },
+			],
+		});
+		const advisorMock = createMockModel({
+			responses: [
+				{
+					content: [
+						{
+							type: "toolCall",
+							name: "advise",
+							arguments: { note: "Final yield needs correction", severity: "blocker" },
+						},
+					],
+				},
+				{ content: [], stopReason: "stop" },
+			],
+		});
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [createMockYieldTool()] },
+			streamFn: mock.stream,
+		});
+		const sessionManager = SessionManager.inMemory();
+		const settings = Settings.isolated({
+			"advisor.syncBacklog": "1",
+			"compaction.enabled": false,
+			"retry.enabled": false,
+		});
+		settings.setModelRole("advisor", "anthropic/claude-sonnet-4-5");
+		const authStorage = await AuthStorage.create(":memory:");
+		authStorages.push(authStorage);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings,
+			modelRegistry,
+			advisorTools: [],
+			advisorStreamFn: advisorMock.stream,
+		});
+		expect(session.setAdvisorEnabled(true)).toBe(true);
+		await session.prompt("yield the final result");
+		expect(await session.waitForAdvisorCatchup(1000)).toBe(true);
+
+		expect(advisorMock.calls).toHaveLength(2);
+		expect(mock.calls).toHaveLength(1);
+		const advisorCards = session.agent.state.messages.filter(isAdvisorCard);
+		expect(advisorCards).toHaveLength(1);
+		expect(advisorCards[0].content).toContain("Final yield needs correction");
+	});
 
 	it("preserves a late advisor concern after a terminal answer without waking the primary", async () => {
 		const { session, sessionManager, mock, advisorMock } = await createCompletedAdvisorSession();
@@ -407,7 +526,7 @@ describe("AgentSession advisor auto-resume suppression", () => {
 		await running.catch(() => {});
 	});
 
-	it("keeps advisor auto-resume for a non-user (internal) abort", async () => {
+	it("does not mint turn authority from advisor advice after an internal abort", async () => {
 		const { session, mock, streamStarted } = await createParkedSession([{ content: ["resumed after advice"] }]);
 
 		const running = session.prompt("do the thing");
@@ -416,14 +535,14 @@ describe("AgentSession advisor auto-resume suppression", () => {
 		await session.sendCustomMessage(advisorCard("keep going"), { deliverAs: "steer", triggerTurn: true });
 		expect(session.agent.peekSteeringQueue().some(isAdvisorCard)).toBe(true);
 
-		// Internal abort (no USER_INTERRUPT_LABEL): the advisor card is NOT extracted;
-		// it stays in the queue and drives a normal auto-continue turn.
+		// Internal abort does not extract the advisor card, but agent-authored advice
+		// cannot authorize a fresh turn. It remains queued for the next deliberate prompt.
 		await session.abort();
 		await session.waitForIdle();
 		await running.catch(() => {});
 
-		expect(session.agent.peekSteeringQueue()).toEqual([]);
-		expect(mock.calls.length).toBe(2);
+		expect(session.agent.peekSteeringQueue().some(isAdvisorCard)).toBe(true);
+		expect(mock.calls.length).toBe(1);
 	});
 
 	it("reclaims a stranded advisor steer on settle while suppressed, instead of auto-resuming the stopped run", async () => {

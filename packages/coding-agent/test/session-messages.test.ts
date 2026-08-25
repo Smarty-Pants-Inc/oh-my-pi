@@ -63,6 +63,24 @@ describe("convertToLlm compaction summary", () => {
 		expect(instruction?.role).toBe("internal_context");
 		expect(instruction?.renderedText).toContain("plain summary");
 	});
+
+	it("frames handoff summaries as prior-instance context", () => {
+		const messages: AgentMessage[] = [
+			{
+				role: "compactionSummary",
+				summary: "## Next Steps\n1. Continue the work",
+				tokensBefore: 1000,
+				method: "handoff",
+				timestamp: Date.now(),
+			},
+		];
+		const converted = convertToLlm(messages);
+		expect(converted).toEqual([]);
+		const [instruction] = collectCompactionContextInstructions(messages, "main");
+		expect(instruction?.renderedText).toContain("<handoff>");
+		expect(instruction?.renderedText).toContain("prior instance");
+		expect(instruction?.renderedText).not.toContain("<summary>");
+	});
 });
 
 describe("assistant refusal replay policy", () => {

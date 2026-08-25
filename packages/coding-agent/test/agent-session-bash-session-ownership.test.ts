@@ -5,9 +5,10 @@ import { Agent } from "@oh-my-pi/pi-agent-core";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
-import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import * as bashExecutor from "@oh-my-pi/pi-coding-agent/exec/bash-executor";
 import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import { createBashTool } from "@oh-my-pi/pi-coding-agent/extensibility/legacy-pi-coding-agent-shim";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { BashRunner } from "@oh-my-pi/pi-coding-agent/session/bash-runner";
@@ -32,8 +33,10 @@ describe("AgentSession bash session ownership", () => {
 	let session: AgentSession;
 	let additionalManagers: SessionManager[];
 
-	beforeEach(() => {
+	beforeEach(async () => {
+		resetSettingsForTest();
 		tempDir = TempDir.createSync("@pi-bash-session-owner-");
+		await Settings.init({ inMemory: true, cwd: tempDir.path() });
 		authStorage = createInMemoryAuthStorage();
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 		additionalManagers = [];
@@ -45,6 +48,7 @@ describe("AgentSession bash session ownership", () => {
 		await Promise.all(additionalManagers.map(manager => manager.close()));
 		authStorage.close();
 		tempDir.removeSync();
+		resetSettingsForTest();
 	});
 
 	function createSession(
@@ -154,6 +158,136 @@ describe("AgentSession bash session ownership", () => {
 		unsubscribe();
 		expect(session.hasPendingBashMessages).toBe(false);
 		expect(session.messages.some(message => message.role === "assistant")).toBe(false);
+	});
+
+	it("applies the registered bash shell environment to user-shell commands", async () => {
+		// BashRunner delegates execution to the global Settings-backed executor, so
+		// keep this extension-env contract independent of the developer's shell rc.
+		const shell = process.platform === "win32" ? (Bun.env.ComSpec ?? "cmd.exe") : "/bin/sh";
+		Settings.instance.set("shellPath", shell);
+		vi.spyOn(Settings.prototype, "getShellConfig").mockReturnValue({
+			shell,
+			args: process.platform === "win32" ? ["/c"] : ["-c"],
+			env: { PATH: Bun.env.PATH ?? "", HOME: tempDir.path(), SHELL: shell },
+			prefix: undefined,
+		});
+		const spawnHook = vi.fn(spawn => ({
+			...spawn,
+			env: { ...spawn.env, OMP_USER_SHELL_ENV: "extension-value" },
+		}));
+		const definition = createBashTool(tempDir.path(), { spawnHook });
+		const extensionRunner = {
+			hasHandlers: vi.fn(() => false),
+			getRegisteredTool: vi.fn((name: string) => (name === "bash" ? { definition } : undefined)),
+			emit: vi.fn().mockResolvedValue(undefined),
+			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
+		} as unknown as ExtensionRunner;
+		createSession(undefined, extensionRunner);
+
+		const result = await session.executeBash('printf "%s" "$OMP_USER_SHELL_ENV"', undefined, {
+			useUserShell: true,
+		});
+
+		expect(result.output).toBe("extension-value");
+		expect(spawnHook).toHaveBeenCalledWith(
+			expect.objectContaining({
+				command: 'printf "%s" "$OMP_USER_SHELL_ENV"',
+				cwd: tempDir.path(),
+			}),
+		);
+	});
+
+	it("does not run the shell environment hook when a user_bash handler replaces the result", async () => {
+		const spawnHook = vi.fn(() => {
+			throw new Error("shell env hook must not run when user_bash supplies a replacement result");
+		});
+		const definition = createBashTool(tempDir.path(), { spawnHook });
+		const emitUserBash = vi.fn().mockResolvedValue({ result: bashResult });
+		const extensionRunner = {
+			hasHandlers: vi.fn((eventType: string) => eventType === "user_bash"),
+			emitUserBash,
+			getRegisteredTool: vi.fn((name: string) => (name === "bash" ? { definition } : undefined)),
+			emit: vi.fn().mockResolvedValue(undefined),
+			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
+		} as unknown as ExtensionRunner;
+		createSession(undefined, extensionRunner);
+
+		const result = await session.executeBash("replaced-command", undefined, { useUserShell: true });
+
+		expect(result).toEqual(bashResult);
+		expect(spawnHook).not.toHaveBeenCalled();
+	});
+
+	it("keeps a queued bash result on the branch discarded by an empty stop", async () => {
+		const sessionManager = SessionManager.inMemory(tempDir.path());
+		let returnEmptyStop = true;
+		createSession(sessionManager, undefined, () => (returnEmptyStop ? [] : ["Done"]));
+		let forceStreaming = false;
+		Object.defineProperty(session, "isStreaming", {
+			configurable: true,
+			get: () => forceStreaming,
+		});
+		let discardedAssistantTimestamp: number | undefined;
+		const unsubscribe = session.agent.subscribe(event => {
+			if (event.type === "message_end" && event.message.role === "assistant" && returnEmptyStop) {
+				forceStreaming = true;
+				discardedAssistantTimestamp = event.message.timestamp;
+				session.recordBashResult("discarded-turn-command", bashResult);
+			} else if (event.type === "agent_end") {
+				forceStreaming = false;
+			}
+		});
+
+		const started = await session.sendCustomMessage(
+			{
+				customType: "ownership-test",
+				content: "Run an accepted empty turn",
+				display: false,
+				attribution: "agent",
+			},
+			{
+				deliveryMode: "auto",
+				automaticTurnSource: "peer_message_wake",
+				acceptTerminalEmptyStop: true,
+			},
+		);
+		expect(started).toEqual({ status: "accepted", delivery: "started_turn" });
+		await session.waitForIdle();
+		unsubscribe();
+		expect(session.hasPendingBashMessages).toBe(true);
+		const discardedAssistantEntry = sessionManager
+			.getEntries()
+			.find(
+				entry =>
+					entry.type === "message" &&
+					entry.message.role === "assistant" &&
+					entry.message.timestamp === discardedAssistantTimestamp,
+			);
+		if (!discardedAssistantEntry) throw new Error("Expected discarded assistant entry");
+
+		returnEmptyStop = false;
+		await session.prompt("flush queued bash result");
+		await session.waitForIdle();
+
+		const bashEntry = sessionManager
+			.getEntries()
+			.find(
+				entry =>
+					entry.type === "message" &&
+					entry.message.role === "bashExecution" &&
+					entry.message.command === "discarded-turn-command",
+			);
+		expect(bashEntry?.parentId).toBe(discardedAssistantEntry.id);
+		expect(
+			sessionManager
+				.getBranch()
+				.some(
+					entry =>
+						entry.type === "message" &&
+						entry.message.role === "bashExecution" &&
+						entry.message.command === "discarded-turn-command",
+				),
+		).toBe(false);
 	});
 
 	it("releases the bash owner when session transition preparation fails", async () => {
@@ -562,5 +696,34 @@ describe("AgentSession bash session ownership", () => {
 		expect(
 			session.messages.some(message => message.role === "bashExecution" && message.command === "old-branch-command"),
 		).toBe(false);
+	});
+});
+
+describe("legacy spawnHook shellEnv adapter", () => {
+	it("forwards only the hook's added or changed variables, not the spread baseline", () => {
+		const definition = createBashTool(process.cwd(), {
+			spawnHook: context => ({ ...context, env: { ...context.env, EXTRA: "1", CHANGED: "new" } }),
+		});
+		const result = definition.shellEnv?.({
+			command: "true",
+			cwd: process.cwd(),
+			env: { KEPT: "kept", CHANGED: "old" },
+		});
+		expect(result).toEqual({ EXTRA: "1", CHANGED: "new" });
+	});
+	it("forwards changes when the hook mutates its environment in place", () => {
+		const definition = createBashTool(process.cwd(), {
+			spawnHook: context => {
+				context.env.EXTRA = "1";
+				context.env.CHANGED = "new";
+				return context;
+			},
+		});
+		const result = definition.shellEnv?.({
+			command: "true",
+			cwd: process.cwd(),
+			env: { KEPT: "kept", CHANGED: "old" },
+		});
+		expect(result).toEqual({ EXTRA: "1", CHANGED: "new" });
 	});
 });

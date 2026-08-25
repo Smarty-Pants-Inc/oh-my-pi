@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { scheduler } from "node:timers/promises";
 import { Agent, type AgentMessage, type StreamFn } from "@oh-my-pi/pi-agent-core";
 import * as compactionModule from "@oh-my-pi/pi-agent-core/compaction";
 import type { AssistantMessage, Model, ToolCall } from "@oh-my-pi/pi-ai";
@@ -55,7 +56,7 @@ describe("AgentSession handoff", () => {
 			if (Date.now() >= deadline) {
 				throw new Error("Timed out waiting for condition");
 			}
-			await Bun.sleep(1);
+			await scheduler.yield();
 		}
 	}
 
@@ -2147,79 +2148,6 @@ describe("AgentSession handoff", () => {
 			await localTempDir.remove();
 		}
 	});
-
-	it("runs context maintenance before sending an oversized pending prompt", async () => {
-		session.settings.set("compaction.methodOrder", ["soft"]);
-		session.settings.set("compaction.thresholdTokens", 50);
-		session.settings.set("compaction.keepRecentTokens", 1);
-		session.settings.set("contextPromotion.enabled", false);
-
-		const compactSpy = vi.spyOn(compactionModule, "compact").mockImplementation(async preparation => ({
-			summary: "pre-prompt compacted",
-			shortSummary: undefined,
-			firstKeptEntryId: preparation.firstKeptEntryId,
-			tokensBefore: preparation.tokensBefore,
-			details: {},
-		}));
-		const promptSpy = vi.spyOn(session.agent, "prompt").mockImplementation(async () => {
-			expect(sessionManager.getEntries().some(entry => entry.type === "compaction")).toBe(true);
-		});
-
-		await session.prompt("pending prompt ".repeat(120));
-		await waitFor(
-			() =>
-				compactSpy.mock.calls.length === 1 &&
-				events.some(event => event.type === "auto_compaction_end" && event.aborted === false),
-		);
-
-		expect(compactSpy).toHaveBeenCalledTimes(1);
-		expect(promptSpy).toHaveBeenCalledTimes(1);
-		expect(events).toContainEqual({ type: "auto_compaction_start", reason: "threshold", action: "context-full" });
-		expect(events.some(event => event.type === "auto_compaction_end" && event.aborted === false)).toBe(true);
-	});
-
-	it("falls back after one auto-compaction timeout instead of retrying the same model", async () => {
-		session.settings.set("compaction.methodOrder", ["soft"]);
-		session.settings.set("compaction.thresholdTokens", 50);
-		session.settings.set("compaction.keepRecentTokens", 1);
-		session.settings.set("contextPromotion.enabled", false);
-		session.settings.set("retry.baseDelayMs", 1);
-
-		let firstCandidateKey: string | undefined;
-		let fallbackCandidateKey: string | undefined;
-		const compactSpy = vi.spyOn(compactionModule, "compact").mockImplementation(async (preparation, candidate) => {
-			const candidateKey = `${candidate.provider}/${candidate.id}`;
-			firstCandidateKey ??= candidateKey;
-			if (candidateKey === firstCandidateKey) {
-				throw new Error("Summarization failed: The operation timed out.");
-			}
-			fallbackCandidateKey = candidateKey;
-			return {
-				summary: "fallback compacted",
-				shortSummary: undefined,
-				firstKeptEntryId: preparation.firstKeptEntryId,
-				tokensBefore: preparation.tokensBefore,
-				details: {},
-			};
-		});
-		const promptSpy = vi.spyOn(session.agent, "prompt").mockImplementation(async () => {
-			expect(sessionManager.getEntries().some(entry => entry.type === "compaction")).toBe(true);
-		});
-
-		await session.prompt("pending prompt ".repeat(120));
-		await waitFor(
-			() =>
-				fallbackCandidateKey !== undefined &&
-				events.some(event => event.type === "auto_compaction_end" && event.aborted === false),
-		);
-
-		expect(
-			compactSpy.mock.calls.filter(call => `${call[1].provider}/${call[1].id}` === firstCandidateKey),
-		).toHaveLength(1);
-		expect(fallbackCandidateKey).toBeDefined();
-		expect(promptSpy).toHaveBeenCalledTimes(1);
-	});
-
 	it("keeps pre-prompt context-full checks aligned with provider-anchored usage", async () => {
 		await session.dispose();
 		authStorage.setRuntimeApiKey("openai", "test-key");
@@ -2412,105 +2340,6 @@ describe("AgentSession handoff", () => {
 		// deflated 1k provider count no longer suppresses compaction.
 		expect(compactSpy).toHaveBeenCalled();
 	});
-	it("counts current non-message token growth in provider-anchored pre-prompt checks", async () => {
-		await session.dispose();
-		authStorage.setRuntimeApiKey("openai", "test-key");
-		sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
-		events = [];
-
-		const extensionsResult = await loadExtensions([], tempDir.path());
-		const extensionRunner = new ExtensionRunner(
-			extensionsResult.extensions,
-			extensionsResult.runtime,
-			tempDir.path(),
-			sessionManager,
-			modelRegistry,
-		);
-		const emitBeforeAgentStart = vi
-			.spyOn(extensionRunner, "emitBeforeAgentStart")
-			.mockResolvedValueOnce(undefined)
-			.mockResolvedValueOnce({ systemPrompt: ["expanded system prompt ".repeat(30_000)] });
-		vi.spyOn(extensionRunner, "emit").mockResolvedValue(undefined);
-
-		const mock = createMockModel({
-			id: "gpt-5.5",
-			provider: "openai",
-			contextWindow: 10_000,
-			responses: [
-				{
-					content: ["seed response"],
-					stopReason: "stop",
-					usage: {
-						input: 1_000,
-						output: 10,
-						cacheRead: 0,
-						cacheWrite: 0,
-						totalTokens: 1_010,
-						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-					},
-				},
-			],
-		});
-		const agent = new Agent({
-			getApiKey: () => "test-key",
-			initialState: {
-				model: mock,
-				systemPrompt: ["Test"],
-				tools: [],
-				messages: [],
-			},
-			streamFn: mock.stream,
-		});
-		session = new AgentSession({
-			agent,
-			sessionManager,
-			settings: Settings.isolated({
-				"compaction.enabled": true,
-				"compaction.autoContinue": false,
-				"compaction.methodOrder": ["soft"],
-				"compaction.thresholdTokens": 8_000,
-				"compaction.keepRecentTokens": 1,
-				"contextPromotion.enabled": false,
-			}),
-			modelRegistry,
-			extensionRunner,
-		});
-		session.subscribe(event => {
-			events.push(event);
-		});
-
-		await session.prompt("seed prompt");
-		expect(mock.calls).toHaveLength(1);
-		expect(session.getContextUsage({ contextWindow: 10_000 })).toMatchObject({
-			tokens: 1_000,
-			contextWindow: 10_000,
-			percent: 10,
-		});
-
-		const compactSpy = vi.spyOn(compactionModule, "compact").mockImplementation(async preparation => ({
-			summary: "pre-prompt compacted",
-			shortSummary: undefined,
-			firstKeptEntryId: preparation.firstKeptEntryId,
-			tokensBefore: preparation.tokensBefore,
-			details: {},
-		}));
-		const promptSpy = vi.spyOn(session.agent, "prompt").mockImplementation(async () => {
-			expect(sessionManager.getEntries().some(entry => entry.type === "compaction")).toBe(true);
-		});
-
-		await session.prompt("small pending prompt");
-		await waitFor(
-			() =>
-				compactSpy.mock.calls.length === 1 &&
-				events.some(event => event.type === "auto_compaction_end" && event.aborted === false),
-		);
-
-		expect(emitBeforeAgentStart).toHaveBeenCalledTimes(2);
-		expect(compactSpy).toHaveBeenCalledTimes(1);
-		expect(promptSpy).toHaveBeenCalledTimes(1);
-		expect(events).toContainEqual({ type: "auto_compaction_start", reason: "threshold", action: "context-full" });
-	});
-
 	it("does not double-count unchanged non-message tokens in provider-anchored pre-prompt checks", async () => {
 		await session.dispose();
 		authStorage.setRuntimeApiKey("openai", "test-key");

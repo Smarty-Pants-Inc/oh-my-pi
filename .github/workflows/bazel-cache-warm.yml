@@ -6,15 +6,15 @@ name: Warm bazel disk cache
 # misses every action on a hosted image) — so seed each hosted consumer from
 # the same image it runs on:
 #
-#   warm_darwin (macos-*)  -> scopes `release-darwin-*`, consumed by the
+#   warm_darwin (smarty-macos-*)  -> scopes `release-darwin-*`, consumed by the
 #                             release_binary darwin jobs. Releases are the
 #                             only other producers for these scopes and a
 #                             release always changes CONFIG_HASH (version
 #                             bump rewrites Cargo.toml/Cargo.lock), so
 #                             without warming here every release rebuilt the
 #                             darwin addons cold (~40-50 min on
-#                             macos-15-intel — run 30357804722).
-#   warm_bun (ubuntu-22.04)-> the shared `bun-<os>-<lockhash>` store entry.
+#                             smarty-macos-intel-12-core).
+#   warm_bun (smarty-linux-16-core)-> the shared `bun-<os>-<lockhash>` store entry.
 #                             PR jobs restore it but never save (per-PR-ref
 #                             copies of the ~500 MB store once ate ~9.4 GB of
 #                             the 10 GB repo cache quota and evicted every
@@ -70,14 +70,14 @@ jobs:
          fail-fast: false
          matrix:
             include:
-               - { os: macos-15-intel, target: darwin-x64-baseline, scope: release-darwin-x64 }
-               - { os: macos-14, target: darwin-arm64, scope: release-darwin-arm64 }
+               - { os: smarty-macos-intel-12-core, target: darwin-x64-baseline, scope: release-darwin-x64 }
+               - { os: smarty-macos-arm-5-core, target: darwin-arm64, scope: release-darwin-arm64 }
       runs-on: ${{ matrix.os }}
       steps:
          - uses: actions/checkout@v4
          - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
            with:
-              bun-version: "1.3"
+              bun-version: "1.4"
          # scripts/bazel-natives.ts is dependency-free (node builtins only), so
          # no `bun install` is needed; the bazel-natives action restores,
          # builds, and saves the scope's disk cache.
@@ -91,7 +91,7 @@ jobs:
    # store, no GitHub cache), so this is the sole hosted-runner producer.
    warm_bun:
       name: Seed bun store cache
-      runs-on: ubuntu-22.04
+      runs-on: smarty-linux-16-core
       steps:
          - uses: actions/checkout@v4
          - uses: ./.github/actions/bun-install

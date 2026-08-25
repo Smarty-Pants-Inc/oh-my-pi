@@ -321,9 +321,25 @@ const PATH_RULES: readonly PathRule[] = [
 	{ pattern: /(?:^|\/)packages\/ai\/src\/error\//i, surface: "provider-wrapper" },
 	{
 		pattern:
-			/(?:^|\/)packages\/ai\/src\/utils\/(?:block-symbols|deterministic-id|empty-completion-retry|event-stream|google-validation|harmony-leak|http-inspector|leaked-thinking-stream|openai-http|provider-response|retry|retry-after|stream-markup-healing|thinking-loop|tool-call-loop-guard|tool-choice)\.[cm]?[jt]s$/i,
+			/(?:^|\/)packages\/ai\/src\/utils\/(?:block-symbols|deterministic-id|empty-completion-retry|event-stream|glyph-codec|google-validation|harmony-leak|http-inspector|leaked-thinking-stream|openai-http|provider-response|retry|retry-after|stream-markup-healing|thinking-loop|tool-call-loop-guard|tool-choice)\.[cm]?[jt]s$/i,
 		surface: "provider-wrapper",
 	},
+	{ pattern: /(?:^|\/)packages\/ai\/src\/utils\/glyph-notice\.md$/i, surface: "prompt-content" },
+	{ pattern: /(?:^|\/)packages\/ai\/src\/utils\/glyph-notice\.md$/i, surface: "provider-wrapper" },
+	{ pattern: /(?:^|\/)packages\/coding-agent\/src\/blob-broker\/.*\.[cm]?[jt]s$/i, surface: "provider-wrapper" },
+	{
+		pattern: /(?:^|\/)packages\/coding-agent\/src\/modes\/composer(?:-.*)?\.[cm]?[jt]s$/i,
+		surface: "provider-wrapper",
+	},
+	{ pattern: /(?:^|\/)packages\/coding-agent\/src\/modes\/macos-spelling\.[cm]?[jt]s$/i, surface: "capability" },
+	{ pattern: /(?:^|\/)packages\/coding-agent\/src\/modes\/startup-composer\.[cm]?[jt]s$/i, surface: "prompt-entry" },
+	{
+		pattern: /(?:^|\/)packages\/coding-agent\/src\/session\/(?:session-pins|title-index)\.[cm]?[jt]s$/i,
+		surface: "behavior",
+	},
+	{ pattern: /(?:^|\/)packages\/coding-agent\/src\/utils\/command-usage\.[cm]?[jt]s$/i, surface: "behavior" },
+	{ pattern: /(?:^|\/)packages\/natives\/native\/desktop-adapter\.js$/i, surface: "capability" },
+	{ pattern: /(?:^|\/)packages\/coding-agent\/src\/cli\/render-cli\.[cm]?[jt]s$/i, surface: "provider-wrapper" },
 	{
 		pattern:
 			/(?:^|\/)packages\/ai\/src\/(?:api-registry|registry\/(?:amazon-bedrock|bedrock-mantle|registry|types))\.[cm]?[jt]s$/i,

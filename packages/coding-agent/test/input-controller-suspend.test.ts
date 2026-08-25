@@ -36,6 +36,12 @@ function setPlatform(value: NodeJS.Platform): void {
 	Object.defineProperty(process, "platform", { value, configurable: true, writable: true });
 }
 
+function spyOnProcessOnce(): Mock<(event: NodeJS.Signals | string, listener: () => void) => NodeJS.Process> {
+	return vi.spyOn(process, "once") as unknown as Mock<
+		(event: NodeJS.Signals | string, listener: () => void) => NodeJS.Process
+	>;
+}
+
 afterEach(() => {
 	Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true, writable: true });
 	if (sigcontListener) process.removeListener("SIGCONT", sigcontListener);
@@ -49,7 +55,7 @@ describe("InputController.handleCtrlZ", () => {
 		const killSpy = vi.spyOn(process, "kill").mockImplementation(() => {
 			throw new Error("process.kill must not be called on win32");
 		});
-		const onceSpy = vi.spyOn(process, "once");
+		const onceSpy = spyOnProcessOnce();
 		const { ctx, ui, showStatus, showError } = createCtx();
 
 		const controller = new InputController(ctx);
@@ -67,7 +73,7 @@ describe("InputController.handleCtrlZ", () => {
 	it("SIGSTOPs the foreground process group and registers a SIGCONT resume hook on POSIX (#3461)", () => {
 		setPlatform("linux");
 		const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
-		const onceSpy = vi.spyOn(process, "once");
+		const onceSpy = spyOnProcessOnce();
 		const { ctx, ui, showError } = createCtx();
 
 		const controller = new InputController(ctx);
@@ -100,7 +106,7 @@ describe("InputController.handleCtrlZ", () => {
 		const killSpy = vi.spyOn(process, "kill").mockImplementation(() => {
 			throw new Error("Unknown signal: SIGSTOP");
 		});
-		const onceSpy = vi.spyOn(process, "once");
+		const onceSpy = spyOnProcessOnce();
 		const removeSpy = vi.spyOn(process, "removeListener");
 		const { ctx, ui, showError, showStatus } = createCtx();
 
