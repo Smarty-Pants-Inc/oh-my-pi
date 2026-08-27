@@ -1,11 +1,10 @@
 name: CI
 
 on:
+   # Mergify speculative branches are checked through their synthetic pull request.
+   # A second push run can be cancelled and make the queue treat smarty-ci as failed.
    push:
-      branches:
-         - main
-         - "mergify/merge-queue/**"
-         - "tmp-mergify/merge-queue/**"
+      branches: [main]
    pull_request:
       types: [opened, synchronize, reopened, ready_for_review]
       branches: [main]
