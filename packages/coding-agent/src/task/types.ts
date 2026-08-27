@@ -384,6 +384,8 @@ export interface AgentDefinition {
 	description: string;
 	systemPrompt: string;
 	tools?: string[];
+	/** Prevent runtime-added tool names beyond this agent's resolved tool set. */
+	restrictToolNames?: boolean;
 	spawns?: string[] | "*";
 	model?: string[];
 	thinkingLevel?: ConfiguredThinkingLevel;
