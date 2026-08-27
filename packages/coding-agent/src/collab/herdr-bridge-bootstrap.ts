@@ -57,11 +57,9 @@ export function captureHerdrBridgeBootstrap(
 	if (hostToken?.trim() && address?.trim() && paneId?.trim()) {
 		currentHostBridge = { address, token: hostToken, paneId };
 	}
-	if (guestToken !== undefined && !guestToken.trim()) {
-		throw new Error("Incomplete Herdr OMP guest bridge environment: HERDR_OMP_GUEST_BRIDGE_TOKEN must be non-empty");
-	}
+	const guestBridgeToken = guestToken?.trim() ? guestToken : undefined;
 	const hostBridge = hostBridgeDiscovery ? { current: currentHostBridge, discovery: hostBridgeDiscovery } : undefined;
-	return { hostBridge, guestBridgeToken: guestToken };
+	return { hostBridge, guestBridgeToken };
 }
 
 const DISCOVERY_TIMEOUT_MS = 1_000;

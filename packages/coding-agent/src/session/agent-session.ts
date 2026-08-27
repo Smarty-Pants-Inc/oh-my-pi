@@ -4310,8 +4310,6 @@ export class AgentSession {
 		this.#syncAgentQueueModes();
 		let restored = false;
 		let queuesIsolated = false;
-		const parkedArrivalSteering: AgentMessage[] = [];
-		const parkedArrivalFollowUp: AgentMessage[] = [];
 		const detachQueueGuard = this.agent.addBeforeQueuedMessageDequeueHook(() => {
 			if (this.#activeDirectUserContinuationOwner !== owner) return;
 			const currentSteering = [...this.agent.peekSteeringQueue()];
@@ -4319,8 +4317,6 @@ export class AgentSession {
 			const extraSteering = currentSteering.filter(message => !blockMessages.has(message));
 			const extraFollowUp = currentFollowUp.filter(message => !blockMessages.has(message));
 			if (extraSteering.length === 0 && extraFollowUp.length === 0) return;
-			parkedArrivalSteering.push(...extraSteering);
-			parkedArrivalFollowUp.push(...extraFollowUp);
 			parkedQueues.steering.push(...extraSteering);
 			parkedQueues.followUp.push(...extraFollowUp);
 			this.agent.replaceQueues(
@@ -4341,16 +4337,8 @@ export class AgentSession {
 					queuedOwner !== undefined &&
 					(this.agent.peekSteeringQueue().includes(owner) || this.agent.peekFollowUpQueue().includes(owner));
 				this.agent.replaceQueues(
-					[
-						...(ownerPending ? steering : steering.filter(message => !blockMessages.has(message))),
-						...parkedArrivalSteering,
-						...currentSteering,
-					],
-					[
-						...(ownerPending ? followUp : followUp.filter(message => !blockMessages.has(message))),
-						...parkedArrivalFollowUp,
-						...currentFollowUp,
-					],
+					[...(ownerPending && queue === "steering" ? block : []), ...parkedQueues.steering, ...currentSteering],
+					[...(ownerPending && queue === "followUp" ? block : []), ...parkedQueues.followUp, ...currentFollowUp],
 					true,
 				);
 			} finally {
@@ -9008,12 +8996,44 @@ export class AgentSession {
 			owner: followUp[followUpIndex]!,
 		};
 	}
-	#queuedPromptMutationUnavailable(): "session_transition" | "queue_mutation" | undefined {
+	#moveQueuedPromptToInterruptDuringActiveContinuation(id: string): boolean {
+		const parked = this.#parkedDirectUserQueues;
+		if (!parked) return false;
+		const liveSteering = [...this.agent.peekSteeringQueue()];
+		const liveFollowUp = [...this.agent.peekFollowUpQueue()];
+		const queues = [
+			{ queue: parked.steering, live: false },
+			{ queue: parked.followUp, live: false },
+			{ queue: liveSteering, live: true },
+			{ queue: liveFollowUp, live: true },
+		];
+		for (const { queue, live } of queues) {
+			const ownerIndex = queue.findIndex(
+				message => isUserQueuedMessage(message) && this.#queuedPromptId(message) === id,
+			);
+			if (ownerIndex === -1) continue;
+			let blockStart = ownerIndex;
+			while (blockStart > 0 && isHiddenUserCompanion(queue[blockStart - 1])) blockStart--;
+			const block = queue.splice(blockStart, ownerIndex - blockStart + 1);
+			const owner = block.at(-1)!;
+			if (owner.role === "user") owner.steering = true;
+			else if (owner.role === "custom") owner.details = withCollabPromptSteering(owner, true).details;
+			if (live) this.agent.replaceQueues(liveSteering, liveFollowUp, true);
+			parked.steering.unshift(...block);
+			this.#notifyQueuedPromptsChanged();
+			return true;
+		}
+		return false;
+	}
+
+	#queuedPromptMutationUnavailable(options?: {
+		allowActiveDirectUserContinuation?: boolean;
+	}): "session_transition" | "queue_mutation" | undefined {
 		if (this.#isDisposed || this.#lifecycleTransitionFenceActive || this.isCompacting) return "session_transition";
 		if (
 			this.#queuedPromptDeliveryMutationReservations > 0 ||
 			this.#queuedPromptDeliveryMutationInFlight ||
-			this.#activeDirectUserContinuationOwner
+			(!options?.allowActiveDirectUserContinuation && this.#activeDirectUserContinuationOwner)
 		) {
 			return "queue_mutation";
 		}
@@ -9082,6 +9102,19 @@ export class AgentSession {
 	}
 
 	async setQueuedPromptDelivery(id: string, delivery: QueuedPromptDelivery): Promise<SetQueuedPromptDeliveryResult> {
+		if (delivery === "interrupt" && this.#activeDirectUserContinuationOwner) {
+			const unavailable = this.#queuedPromptMutationUnavailable({ allowActiveDirectUserContinuation: true });
+			if (unavailable) return { status: "unavailable", reason: unavailable };
+			this.#queuedPromptDeliveryMutationInFlight = true;
+			try {
+				if (!this.#moveQueuedPromptToInterruptDuringActiveContinuation(id)) return { status: "stale" };
+				await this.abort({ reason: USER_INTERRUPT_LABEL });
+			} finally {
+				this.#queuedPromptDeliveryMutationInFlight = false;
+			}
+			this.#reconcileQueuedMessageDrain();
+			return { status: "updated" };
+		}
 		const unavailable = this.#queuedPromptMutationUnavailable();
 		if (unavailable) return { status: "unavailable", reason: unavailable };
 

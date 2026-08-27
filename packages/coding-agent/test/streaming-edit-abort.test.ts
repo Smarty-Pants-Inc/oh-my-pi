@@ -82,6 +82,25 @@ function chunkStringRandomly(text: string, seed: number): string[] {
 	return chunks;
 }
 
+function gateStreamOnGuardFileLoad(filePath: string): { ready: Promise<void>; restore(): void } {
+	const loaded = Promise.withResolvers<void>();
+	const realFile = Bun.file.bind(Bun);
+	const fileSpy = vi.spyOn(Bun, "file").mockImplementation(((pathLike: string) => {
+		const file = realFile(pathLike);
+		if (pathLike !== filePath) return file;
+		return {
+			async text() {
+				try {
+					return await file.text();
+				} finally {
+					loaded.resolve();
+				}
+			},
+		} as unknown as Bun.BunFile;
+	}) as typeof Bun.file);
+	return { ready: loaded.promise, restore: () => fileSpy.mockRestore() };
+}
+
 async function createSession(
 	tempDir: string,
 	streamFn: Agent["streamFn"],
@@ -273,13 +292,18 @@ afterEach(async () => {
 it(
 	"does not abort for successful patches across random streams",
 	async () => {
-		await Bun.write(path.join(tempDir, "sample.txt"), "alpha\nbeta\ngamma\n");
+		const target = path.join(tempDir, "sample.txt");
+		await Bun.write(target, "alpha\nbeta\ngamma\n");
 		const diff = "@@\n-beta\n+beta2\n";
 
 		for (const seed of seeds) {
 			const chunks = chunkStringRandomly(diff, seed);
 			const abortSignalRef: { current?: AbortSignal } = {};
-			const streamFn = createStreamForDiff("sample.txt", chunks, abortSignalRef);
+			const fileLoad = gateStreamOnGuardFileLoad(target);
+			const streamFn = createStreamForDiff("sample.txt", chunks, abortSignalRef, {
+				deltaCount: 0,
+				waitBeforeFirstDelta: fileLoad.ready,
+			});
 			const { session, authStorage } = await createSession(tempDir, streamFn, editTool);
 
 			try {
@@ -289,6 +313,7 @@ it(
 				expect(lastAssistant?.stopReason).not.toBe("aborted");
 				expect(abortSignalRef.current?.aborted ?? false).toBe(false);
 			} finally {
+				fileLoad.restore();
 				try {
 					await session.dispose();
 				} finally {
@@ -303,13 +328,18 @@ it(
 it(
 	"aborts for failing patches across random streams",
 	async () => {
-		await Bun.write(path.join(tempDir, "sample.txt"), "alpha\nbeta\ngamma\n");
+		const target = path.join(tempDir, "sample.txt");
+		await Bun.write(target, "alpha\nbeta\ngamma\n");
 		const diff = "@@\n-omega\n+beta2\n";
 
 		for (const seed of seeds) {
 			const chunks = chunkStringRandomly(diff, seed);
 			const abortSignalRef: { current?: AbortSignal } = {};
-			const streamFn = createStreamForDiff("sample.txt", chunks, abortSignalRef);
+			const fileLoad = gateStreamOnGuardFileLoad(target);
+			const streamFn = createStreamForDiff("sample.txt", chunks, abortSignalRef, {
+				deltaCount: 0,
+				waitBeforeFirstDelta: fileLoad.ready,
+			});
 			const { session, authStorage } = await createSession(tempDir, streamFn, editTool);
 
 			try {
@@ -319,6 +349,7 @@ it(
 				expect(lastAssistant?.stopReason).toBe("aborted");
 				expect(abortSignalRef.current?.aborted ?? false).toBe(true);
 			} finally {
+				fileLoad.restore();
 				try {
 					await session.dispose();
 				} finally {
