@@ -6676,7 +6676,7 @@
     },
     {
       "path": "packages/coding-agent/src/collab/herdr-bridge-bootstrap.ts",
-      "sha256": "501b3818ffacbc0a303feb9ecc3274ae22d7eac89e72415394e256c1f32985cf"
+      "sha256": "5d3bc0bf2b884afda08342e740aca95668864398bbdc31689cdf0c556f940e44"
     },
     {
       "path": "packages/coding-agent/src/collab/host.ts",
@@ -8044,7 +8044,7 @@
     },
     {
       "path": "packages/coding-agent/src/main.ts",
-      "sha256": "47935d033bccc45624f06d4c7419f758c81ea07c4bfade5a9a3daa6427312e2c"
+      "sha256": "5a94cae541fdf68a71214755da8f501f3ea0f1476ec3475de51632d53e417917"
     },
     {
       "path": "packages/coding-agent/src/markit/converters/docx.ts",
@@ -8716,7 +8716,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/agent-session.ts",
-      "sha256": "367504a93dc88605bf1383d87c1e27e84a8d786607a48b90977fc3985b638a12"
+      "sha256": "0c6fd751bd18db89819d19b300dc63927d1db6af6cdf181248455f9afd011b90"
     },
     {
       "path": "packages/coding-agent/src/session/agent-storage.ts",
@@ -11020,5 +11020,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "69dbaf83ca193fc1cb66c23bff94e1b4c9be359ff58663f408b97961e2ebd1ff"
+  "rootSha256": "b07d0c7e6811e8c95aebc75cb1da05b613a177b25e0945c182ca51b96a22c24a"
 }

@@ -1,12 +1,14 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { type Args, parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
 import * as collabGuestModule from "@oh-my-pi/pi-coding-agent/collab/guest";
+import { HerdrCollabHostLifecycle } from "@oh-my-pi/pi-coding-agent/collab/herdr-host-lifecycle";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
 	type CollabBridgeBootstrap,
 	reconcilePrivateHerdrAfterStartupJoin,
 	runInteractiveStartupSequence,
 	runRootCommand,
+	startManagedHerdrHost,
 } from "@oh-my-pi/pi-coding-agent/main";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
@@ -76,23 +78,28 @@ describe("automatic Herdr host activation", () => {
 		expect(order).toEqual(["splash-start", "splash-done", "setup-start", "setup-done", "private-start"]);
 	});
 
-	it("cleans up once and rethrows when initial managed activation fails", async () => {
+	it("continues without Herdr when initial managed activation fails", async () => {
 		const failure = new Error("managed bridge activation failed");
-		let cleanupCalls = 0;
+		const start = vi.spyOn(HerdrCollabHostLifecycle.prototype, "start").mockRejectedValue(failure);
+		const showError = vi.fn();
+		const mode = { showError, herdrCollabHostLifecycle: undefined } as unknown as Parameters<
+			typeof startManagedHerdrHost
+		>[0];
+		const session = {} as Parameters<typeof startManagedHerdrHost>[1];
+		const bridge = {
+			role: "host",
+			managed: true,
+			discovery: { socketPath: "/tmp/stale-herdr.sock", paneId: "pane-1" },
+			routeGeneration: 1,
+		} as const;
 
-		await expect(
-			runInteractiveStartupSequence(
-				undefined,
-				undefined,
-				async () => {
-					throw failure;
-				},
-				async () => {
-					cleanupCalls += 1;
-				},
-			),
-		).rejects.toBe(failure);
-		expect(cleanupCalls).toBe(1);
+		await expect(startManagedHerdrHost(mode, session, bridge, false)).resolves.toBeUndefined();
+
+		expect(start).toHaveBeenCalledWith(false);
+		expect(mode.herdrCollabHostLifecycle).toBeUndefined();
+		expect(showError).toHaveBeenCalledWith(
+			"Herdr OMP bridge unavailable; continuing without Herdr bridge: managed bridge activation failed",
+		);
 	});
 
 	it("surfaces private-route resume failure when startup join returns without a guest", async () => {
