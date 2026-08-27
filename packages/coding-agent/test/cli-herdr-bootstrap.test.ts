@@ -122,7 +122,7 @@ describe("Herdr bridge CLI bootstrap", () => {
 		expect(result.text()).toContain("HERDR_CHILD_TOKENS=<absent>|<absent>;EXIT=0");
 	});
 
-	it("scrubs both bridge tokens before reporting an invalid guest token", async () => {
+	it("ignores and scrubs a blank stale guest token before loading an ordinary command", async () => {
 		const result = await $`bun ${probeEntry} auth-broker`
 			.cwd(packageDir)
 			.env({
@@ -135,8 +135,8 @@ describe("Herdr bridge CLI bootstrap", () => {
 			})
 			.quiet()
 			.nothrow();
-		expect(result.exitCode).toBe(1);
-		expect(result.stderr.toString()).toContain("Incomplete Herdr OMP guest bridge environment");
+		expect(result.exitCode).toBe(0);
+		expect(result.stderr.toString()).not.toContain("Incomplete Herdr OMP guest bridge environment");
 		expect(result.text()).toContain("HERDR_CHILD_TOKENS=<absent>|<absent>;EXIT=0");
 	});
 });

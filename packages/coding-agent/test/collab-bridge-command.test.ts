@@ -54,6 +54,18 @@ describe("CollabGuestBridge token parsing", () => {
 		});
 	});
 
+	it("rejects a blank captured token for the explicit guest bridge command", async () => {
+		const runRootCommand = vi.spyOn(main, "runRootCommand").mockResolvedValue(undefined);
+		process.env.HERDR_OMP_GUEST_BRIDGE_TOKEN = " ";
+
+		await expect(
+			runCli(["__collab-guest-bridge", "127.0.0.1:1234", "room-1", "--token-env", "--no-tools"]),
+		).rejects.toThrow("with HERDR_OMP_GUEST_BRIDGE_TOKEN");
+
+		expect(process.env.HERDR_OMP_GUEST_BRIDGE_TOKEN).toBeUndefined();
+		expect(runRootCommand).not.toHaveBeenCalled();
+	});
+
 	it("normalizes the legacy positional token without forwarding it to the guest", async () => {
 		const runRootCommand = vi.spyOn(main, "runRootCommand").mockResolvedValue(undefined);
 

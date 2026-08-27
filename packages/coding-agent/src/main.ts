@@ -616,17 +616,29 @@ export async function runInteractiveStartupSequence(
 	runSplash: (() => Promise<void>) | undefined,
 	runSetup: (() => Promise<void>) | undefined,
 	startPrivateHost: (() => Promise<void>) | undefined,
-	cleanupAfterPrivateHostFailure?: () => Promise<void>,
 ): Promise<void> {
 	await runSplash?.();
 	await runSetup?.();
+	await startPrivateHost?.();
+}
+
+export async function startManagedHerdrHost(
+	mode: InteractiveMode,
+	session: AgentSession,
+	bridge: ManagedHerdrHostBridge,
+	suspended: boolean,
+): Promise<void> {
+	const lifecycle = new HerdrCollabHostLifecycle(mode, session, bridge);
+	mode.herdrCollabHostLifecycle = lifecycle;
 	try {
-		await startPrivateHost?.();
+		await lifecycle.start(suspended);
 	} catch (error) {
-		if (cleanupAfterPrivateHostFailure) {
-			await rethrowAfterInteractiveStartupCleanup(error, cleanupAfterPrivateHostFailure);
-		}
-		throw error;
+		mode.herdrCollabHostLifecycle = undefined;
+		mode.showError(
+			`Herdr OMP bridge unavailable; continuing without Herdr bridge: ${
+				error instanceof Error ? error.message : String(error)
+			}`,
+		);
 	}
 }
 
@@ -748,14 +760,7 @@ async function runInteractiveMode(
 	await runInteractiveStartupSequence(
 		setupWizard && playStartupSplash ? () => setupWizard.runStartupSplash(mode) : undefined,
 		setupWizard && setupScenes.length > 0 ? () => setupWizard.runSetupWizard(mode, setupScenes) : undefined,
-		managedBridge
-			? async () => {
-					const lifecycle = new HerdrCollabHostLifecycle(mode, session, managedBridge);
-					mode.herdrCollabHostLifecycle = lifecycle;
-					await lifecycle.start(joinLink !== undefined);
-				}
-			: undefined,
-		managedBridge ? () => mode.shutdown() : undefined,
+		managedBridge ? () => startManagedHerdrHost(mode, session, managedBridge, joinLink !== undefined) : undefined,
 	);
 
 	// Consume failures immediately, but defer any banner until the transcript is stable.
