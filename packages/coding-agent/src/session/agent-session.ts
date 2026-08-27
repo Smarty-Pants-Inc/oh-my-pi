@@ -8996,11 +8996,18 @@ export class AgentSession {
 			owner: followUp[followUpIndex]!,
 		};
 	}
-	#moveParkedQueuedPromptToInterrupt(id: string): boolean {
+	#moveQueuedPromptToInterruptDuringActiveContinuation(id: string): boolean {
 		const parked = this.#parkedDirectUserQueues;
 		if (!parked) return false;
-		for (const source of ["steering", "followUp"] as const) {
-			const queue = parked[source];
+		const liveSteering = [...this.agent.peekSteeringQueue()];
+		const liveFollowUp = [...this.agent.peekFollowUpQueue()];
+		const queues = [
+			{ queue: parked.steering, live: false },
+			{ queue: parked.followUp, live: false },
+			{ queue: liveSteering, live: true },
+			{ queue: liveFollowUp, live: true },
+		];
+		for (const { queue, live } of queues) {
 			const ownerIndex = queue.findIndex(
 				message => isUserQueuedMessage(message) && this.#queuedPromptId(message) === id,
 			);
@@ -9011,6 +9018,7 @@ export class AgentSession {
 			const owner = block.at(-1)!;
 			if (owner.role === "user") owner.steering = true;
 			else if (owner.role === "custom") owner.details = withCollabPromptSteering(owner, true).details;
+			if (live) this.agent.replaceQueues(liveSteering, liveFollowUp, true);
 			parked.steering.unshift(...block);
 			this.#notifyQueuedPromptsChanged();
 			return true;
@@ -9018,12 +9026,14 @@ export class AgentSession {
 		return false;
 	}
 
-	#queuedPromptMutationUnavailable(): "session_transition" | "queue_mutation" | undefined {
+	#queuedPromptMutationUnavailable(options?: {
+		allowActiveDirectUserContinuation?: boolean;
+	}): "session_transition" | "queue_mutation" | undefined {
 		if (this.#isDisposed || this.#lifecycleTransitionFenceActive || this.isCompacting) return "session_transition";
 		if (
 			this.#queuedPromptDeliveryMutationReservations > 0 ||
 			this.#queuedPromptDeliveryMutationInFlight ||
-			this.#activeDirectUserContinuationOwner
+			(!options?.allowActiveDirectUserContinuation && this.#activeDirectUserContinuationOwner)
 		) {
 			return "queue_mutation";
 		}
@@ -9093,12 +9103,11 @@ export class AgentSession {
 
 	async setQueuedPromptDelivery(id: string, delivery: QueuedPromptDelivery): Promise<SetQueuedPromptDeliveryResult> {
 		if (delivery === "interrupt" && this.#activeDirectUserContinuationOwner) {
-			if (this.#queuedPromptDeliveryMutationReservations > 0 || this.#queuedPromptDeliveryMutationInFlight) {
-				return { status: "unavailable", reason: "queue_mutation" };
-			}
+			const unavailable = this.#queuedPromptMutationUnavailable({ allowActiveDirectUserContinuation: true });
+			if (unavailable) return { status: "unavailable", reason: unavailable };
 			this.#queuedPromptDeliveryMutationInFlight = true;
 			try {
-				if (!this.#moveParkedQueuedPromptToInterrupt(id)) return { status: "stale" };
+				if (!this.#moveQueuedPromptToInterruptDuringActiveContinuation(id)) return { status: "stale" };
 				await this.abort({ reason: USER_INTERRUPT_LABEL });
 			} finally {
 				this.#queuedPromptDeliveryMutationInFlight = false;
