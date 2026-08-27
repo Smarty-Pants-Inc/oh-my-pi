@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { runCli } from "../src/cli";
+import * as collabRpcGuest from "../src/collab/rpc-guest";
 import * as main from "../src/main";
 
 const bridgeEnvNames = [
@@ -69,6 +70,23 @@ describe("CollabGuestBridge token parsing", () => {
 			address: "127.0.0.1:1234",
 			roomId: "room-legacy",
 			token: "legacy-secret",
+		});
+	});
+});
+
+describe("CollabRpcGuest command", () => {
+	it("uses the captured guest token without starting runRootCommand", async () => {
+		const runRootCommand = vi.spyOn(main, "runRootCommand").mockResolvedValue(undefined);
+		const runGuest = vi.spyOn(collabRpcGuest, "runCollabRpcGuest").mockResolvedValue(undefined);
+		process.env.HERDR_OMP_GUEST_BRIDGE_TOKEN = "environment-secret";
+
+		await runCli(["__collab-rpc-guest", "127.0.0.1:1234", "room-rpc", "--token-env"]);
+
+		expect(runRootCommand).not.toHaveBeenCalled();
+		expect(runGuest).toHaveBeenCalledWith({
+			address: "127.0.0.1:1234",
+			roomId: "room-rpc",
+			token: "environment-secret",
 		});
 	});
 });

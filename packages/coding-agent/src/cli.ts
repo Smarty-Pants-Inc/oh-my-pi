@@ -476,7 +476,7 @@ export async function runCli(argv: string[]): Promise<void> {
 		if (command === "launch" || command === "join" || command === "__collab-host-bridge") {
 			handoffHerdrHostBridge(capturedHerdrHostBridge);
 		}
-		if (command === "__collab-guest-bridge") {
+		if (command === "__collab-guest-bridge" || command === "__collab-rpc-guest") {
 			handoffHerdrGuestBridgeToken(capturedHerdrGuestBridgeToken);
 		}
 		await run({ bin: APP_NAME, version: VERSION, argv: resolved.argv, commands, metadataHelp: showHelp });

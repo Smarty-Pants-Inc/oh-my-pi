@@ -7,6 +7,7 @@
 import type { AgentMessage, AgentToolResult, ThinkingLevel, ToolLoadMode } from "@oh-my-pi/pi-agent-core";
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type { Effort, ImageContent, Model, ToolExample } from "@oh-my-pi/pi-ai";
+import type { CollabSessionState } from "../../collab/protocol";
 import type { BashResult } from "../../exec/bash-executor";
 import type { ContextUsage } from "../../extensibility/extensions/types";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
@@ -35,6 +36,8 @@ export type RpcCommand =
 	| { id?: string; type: "follow_up"; message: string; images?: ImageContent[] }
 	| { id?: string; type: "abort" }
 	| { id?: string; type: "abort_and_prompt"; message: string; images?: ImageContent[] }
+	| { id?: string; type: "request_control" }
+	| { id?: string; type: "release_control" }
 	| { id?: string; type: "new_session"; parentSession?: string }
 
 	// State
@@ -210,6 +213,8 @@ export type RpcResponse =
 	| { id?: string; type: "response"; command: "abort"; success: true }
 	| { id?: string; type: "response"; command: "abort_and_prompt"; success: true }
 	| { id?: string; type: "response"; command: "new_session"; success: true; data: { cancelled: boolean } }
+	| { id?: string; type: "response"; command: "request_control"; success: true }
+	| { id?: string; type: "response"; command: "release_control"; success: true }
 
 	// State
 	| { id?: string; type: "response"; command: "get_state"; success: true; data: RpcSessionState }
@@ -340,6 +345,21 @@ export type RpcResponse =
 
 	// Error response (any command can fail); `code` is an optional machine-readable reason.
 	| { id?: string; type: "response"; command: string; success: false; error: string; code?: string };
+// ============================================================================
+// Collab Events (stdout)
+// ============================================================================
+
+export interface RpcCollabStateUpdateFrame {
+	type: "collab_state_update";
+	state: CollabSessionState;
+}
+
+export interface RpcCollabAuthorityUpdateFrame {
+	type: "collab_authority_update";
+	canWrite: boolean;
+}
+
+export type RpcCollabFrame = RpcCollabStateUpdateFrame | RpcCollabAuthorityUpdateFrame;
 
 // ============================================================================
 // Subagent Events (stdout)
@@ -362,7 +382,7 @@ export interface RpcSubagentEventFrame {
 
 export type RpcSubagentFrame = RpcSubagentLifecycleFrame | RpcSubagentProgressFrame | RpcSubagentEventFrame;
 
-export type RpcSessionEventFrame = AgentSessionEvent | RpcSubagentFrame;
+export type RpcSessionEventFrame = AgentSessionEvent | RpcSubagentFrame | RpcCollabFrame;
 
 // ============================================================================
 // Extension UI Events (stdout)

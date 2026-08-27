@@ -82,6 +82,11 @@ export const commands: CommandEntry[] = [
 		help: { hidden: true },
 	},
 	{
+		name: "__collab-rpc-guest",
+		load: () => import("./commands/collab-rpc-guest").then(m => m.default),
+		help: { hidden: true },
+	},
+	{
 		name: "compress",
 		load: () => import("./commands/compress").then(m => m.default),
 		help: commandHelp.compressHelp,
