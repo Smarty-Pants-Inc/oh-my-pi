@@ -258,6 +258,42 @@ describe("AgentSession queued steer delivery", () => {
 		await active;
 	});
 
+	it("lets a second queued prompt become NOW while the first NOW continuation runs", async () => {
+		const { session, mock } = await createSession([
+			{ content: ["active response"], delayMs: 1_000 },
+			{ content: ["first interrupt response"], delayMs: 1_000 },
+			{ content: ["second interrupt response"] },
+		]);
+		const activeStarted = Promise.withResolvers<void>();
+		const unsubscribe = session.subscribe(event => {
+			if (event.type === "agent_start") activeStarted.resolve();
+		});
+		const active = session.prompt("active");
+		await activeStarted.promise;
+		unsubscribe();
+
+		await session.prompt("first interrupt", { streamingBehavior: "followUp" });
+		await session.prompt("second interrupt", { streamingBehavior: "followUp" });
+		const queued = session.getQueuedPrompts();
+		const firstId = queued.find(prompt => prompt.text === "first interrupt")?.id;
+		const secondId = queued.find(prompt => prompt.text === "second interrupt")?.id;
+		if (!firstId || !secondId) throw new Error("Expected two queued prompt ids");
+
+		const firstDelivered = nextUserMessage(session, "first interrupt");
+		expect(await session.setQueuedPromptDelivery(firstId, "interrupt")).toEqual({ status: "updated" });
+		await firstDelivered;
+		expect(session.isStreaming).toBe(true);
+
+		const secondDelivered = nextUserMessage(session, "second interrupt");
+		expect(await session.setQueuedPromptDelivery(secondId, "interrupt")).toEqual({ status: "updated" });
+		await secondDelivered;
+		await active;
+		await session.waitForIdle();
+
+		expect(mock.calls).toHaveLength(3);
+		expect(session.getQueuedPrompts()).toEqual([]);
+	});
+
 	it("clears parked prompts after cancelling a NOW continuation", async () => {
 		const { session, mock } = await createSession([
 			{ content: ["active response"], delayMs: 1_000 },
