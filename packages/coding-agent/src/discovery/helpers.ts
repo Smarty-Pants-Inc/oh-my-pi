@@ -258,6 +258,7 @@ export interface ParsedAgentFields {
 	name: string;
 	description: string;
 	tools?: string[];
+	restrictToolNames?: boolean;
 	spawns?: string[] | "*";
 	model?: string[];
 	output?: unknown;
@@ -333,6 +334,7 @@ export function parseAgentFields(frontmatter: Record<string, unknown>): ParsedAg
 	const thinkingLevel = parseConfiguredThinkingLevel(rawThinkingLevel);
 	const model = parseModelList(frontmatter.model);
 	const blocking = parseBoolean(frontmatter.blocking);
+	const restrictToolNames = parseBoolean(frontmatter.restrictToolNames);
 	const readSummarize = parseBoolean(frontmatter.readSummarize);
 	// prewalk: true → hand off to the default prewalk target; "<pattern>" → custom target.
 	let prewalk: boolean | string | undefined = parseBoolean(frontmatter.prewalk);
@@ -353,6 +355,7 @@ export function parseAgentFields(frontmatter: Record<string, unknown>): ParsedAg
 		name,
 		description,
 		tools,
+		restrictToolNames,
 		spawns,
 		model,
 		output,
