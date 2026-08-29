@@ -389,10 +389,10 @@ describe("LocalCollabTransport attribution", () => {
 			const socket = await opened.promise;
 			socket.write('{"t":"ready"}\n');
 			socket.write(
-				'{"t":"frame","fromPeer":7,"displayName":"Alice","displayNameRevision":2,"frame":{"t":"prompt","text":"hello","displayName":"forged","displayNameRevision":99}}\n',
+				'{"t":"frame","fromPeer":7,"displayName":"Alice","displayNameRevision":2,"frame":{"t":"prompt","text":"hello","streamingBehavior":"followUp","displayName":"forged","displayNameRevision":99}}\n',
 			);
 			expect(await received.promise).toEqual({
-				frame: { t: "prompt", text: "hello" },
+				frame: { t: "prompt", text: "hello", streamingBehavior: "followUp" },
 				peer: 7,
 				metadata: { displayName: "Alice", displayNameRevision: 2 },
 			});

@@ -76,7 +76,7 @@ function startTestRelay(): { url: string; stop(): void } {
 
 interface CapturedPrompt {
 	details?: { from?: string };
-	options?: { streamingBehavior?: "steer"; queueChipText?: string };
+	options?: { streamingBehavior?: "steer" | "followUp"; queueChipText?: string };
 }
 
 interface StreamingHostHarness {
@@ -206,5 +206,26 @@ describe("collab mid-turn guest prompts", () => {
 			if (frame.t === "state" && frame.state.queuedMessageCount === 1) sawQueuedCount = true;
 		}
 		expect(sawQueuedCount).toBe(true);
+	});
+
+	it("preserves an explicit follow-up instead of steering it into the active turn", async () => {
+		const relay = startTestRelay();
+		cleanups.push(relay.stop);
+		const harness = makeStreamingHostContext();
+		const host = new CollabHost(harness.ctx);
+		await host.start(relay.url);
+		cleanups.push(() => host.stop("test done"));
+
+		const guest = await joinAsGuest(host.link, "writer");
+		cleanups.push(() => guest.socket.close());
+		const welcome = await guest.nextFrame();
+		if (welcome.t !== "welcome") throw new Error(`expected welcome, got ${welcome.t}`);
+
+		const prompted = harness.nextPrompt();
+		guest.socket.send({ t: "prompt", text: "after the host turn", streamingBehavior: "followUp" });
+		const prompt = await prompted;
+
+		expect(prompt.details).toEqual({ from: "writer" });
+		expect(prompt.options).toEqual({ streamingBehavior: "followUp", queueChipText: "after the host turn" });
 	});
 });

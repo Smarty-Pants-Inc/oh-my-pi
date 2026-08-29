@@ -67,7 +67,7 @@ export type CollabSessionState = SessionState & {
  */
 export type CollabFrame =
 	| Exclude<GuestFrame, { t: "prompt" }>
-	| { t: "prompt"; text: string; images?: ImageContent[] }
+	| { t: "prompt"; text: string; images?: ImageContent[]; streamingBehavior?: "steer" | "followUp" }
 	// host -> guest
 	| {
 			t: "welcome";

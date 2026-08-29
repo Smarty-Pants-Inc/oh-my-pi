@@ -428,7 +428,7 @@ describe("headless Collab RPC guest", () => {
 		expect(transport.authorityActions).toEqual(["request"]);
 		transport.deliver({ t: "authority", canWrite: true });
 
-		input.send({ id: "prompt", type: "prompt", message: "granted" });
+		input.send({ id: "prompt", type: "prompt", message: "granted", streamingBehavior: "followUp" });
 		expect(await frames.waitFor(isResponse("prompt", "prompt"))).toMatchObject({
 			success: true,
 			data: { agentInvoked: true },
@@ -441,6 +441,7 @@ describe("headless Collab RPC guest", () => {
 			t: "prompt",
 			text: "granted",
 			images: undefined,
+			streamingBehavior: "followUp",
 		});
 
 		input.send({ id: "abort", type: "abort" });

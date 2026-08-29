@@ -493,6 +493,7 @@ export class CollabHost {
 				this.#handlePrompt(
 					frame.text,
 					frame.images,
+					frame.streamingBehavior,
 					metadata?.displayName,
 					metadata?.displayNameRevision,
 					fromPeer,
@@ -625,6 +626,7 @@ export class CollabHost {
 	#handlePrompt(
 		text: string,
 		images: ImageContent[] | undefined,
+		streamingBehavior: "steer" | "followUp" | undefined,
 		displayName: string | undefined,
 		displayNameRevision: number | undefined,
 		fromPeer: number,
@@ -667,7 +669,10 @@ export class CollabHost {
 					details,
 					attribution: "user",
 				},
-				{ streamingBehavior: "steer", queueChipText: attributedText },
+				{
+					streamingBehavior: streamingBehavior === "followUp" ? "followUp" : "steer",
+					queueChipText: attributedText,
+				},
 			)
 			.catch(err => {
 				logger.warn("collab guest prompt failed", { error: String(err) });

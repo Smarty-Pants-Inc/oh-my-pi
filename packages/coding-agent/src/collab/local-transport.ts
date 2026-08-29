@@ -177,7 +177,12 @@ export class LocalCollabTransport implements CollabTransport {
 		if (isFrameRecord(record) && typeof record.fromPeer === "number") {
 			const frame =
 				record.frame.t === "prompt"
-					? { t: "prompt" as const, text: record.frame.text, images: record.frame.images }
+					? {
+							t: "prompt" as const,
+							text: record.frame.text,
+							images: record.frame.images,
+							...(record.frame.streamingBehavior ? { streamingBehavior: record.frame.streamingBehavior } : {}),
+						}
 					: record.frame;
 			const metadata =
 				this.requiresHerdrAttribution && record.frame.t === "prompt"

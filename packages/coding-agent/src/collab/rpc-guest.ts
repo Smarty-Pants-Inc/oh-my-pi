@@ -353,7 +353,12 @@ export class CollabRpcGuest {
 				return this.#sendMutation(
 					id,
 					"prompt",
-					{ t: "prompt", text: command.message, images: command.images },
+					{
+						t: "prompt",
+						text: command.message,
+						images: command.images,
+						streamingBehavior: command.streamingBehavior,
+					},
 					{ agentInvoked: true },
 				);
 			case "abort":
