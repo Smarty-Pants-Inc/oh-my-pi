@@ -97,6 +97,18 @@ describe("parseAgentFields", () => {
 		expect(fields?.tools).toEqual(["glob", "grep", "yield"]);
 	});
 
+	test("parses restricted tool names from boolean frontmatter", () => {
+		expect(
+			parseAgentFields({ name: "reviewer", description: "desc", tools: ["read"], restrictToolNames: true }),
+		).toMatchObject({ tools: ["read", "yield"], restrictToolNames: true });
+		expect(
+			parseAgentFields({ name: "reviewer", description: "desc", restrictToolNames: "false" })?.restrictToolNames,
+		).toBe(false);
+		expect(
+			parseAgentFields({ name: "reviewer", description: "desc", restrictToolNames: "sometimes" })?.restrictToolNames,
+		).toBeUndefined();
+	});
+
 	test("parses autoloadSkills from array frontmatter", () => {
 		const fields = parseAgentFields({
 			name: "oracle",

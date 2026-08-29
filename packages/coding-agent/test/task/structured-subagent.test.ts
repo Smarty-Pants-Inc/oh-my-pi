@@ -14,6 +14,7 @@ import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import * as isolationRunner from "@oh-my-pi/pi-coding-agent/task/isolation-runner";
 import {
 	ENVIRONMENT_SUBAGENT_RUNTIME_PROFILE,
+	resolveSubagentRuntimeToolNames,
 	subagentRuntimeAllows,
 } from "@oh-my-pi/pi-coding-agent/task/runtime-profile";
 import {
@@ -175,6 +176,19 @@ describe("structured subagent primitive", () => {
 			),
 		).rejects.toThrow("isolation, apply, and merge controls are unavailable in plan mode");
 		expect(discover).not.toHaveBeenCalled();
+	});
+	it("honors an agent-owned restricted tool allowlist", async () => {
+		mockDiscovery({ ...AGENT, tools: ["read", "yield"], restrictToolNames: true });
+		const policy = await resolveEffectiveSubagentPolicy(request());
+
+		expect(policy.runtimeProfile.restrictToolNames).toBe(true);
+		expect(resolveSubagentRuntimeToolNames(policy.runtimeProfile, policy.effectiveAgent.tools)).toEqual([
+			"read",
+			"yield",
+		]);
+		expect(subagentRuntimeAllows(policy.runtimeProfile, "mcp")).toBe(false);
+		expect(subagentRuntimeAllows(policy.runtimeProfile, "extensions")).toBe(false);
+		expect(subagentRuntimeAllows(policy.runtimeProfile, "customTools")).toBe(false);
 	});
 	it("propagates a custom thinking-suffixed role alias through policy, dispatch, and settlement", async () => {
 		const customAgent = { ...AGENT, model: ["@reviewer:high"] };
