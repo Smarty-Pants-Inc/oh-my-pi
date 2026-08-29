@@ -58,6 +58,7 @@ function successResponse(request: Record<string, unknown>, paneId = "pane-1"): s
 			pane_id: paneId,
 			address: "127.0.0.1:4321",
 			token: "fresh-bridge-token",
+			route_generation: 1,
 		},
 	});
 }
@@ -128,6 +129,7 @@ describe.skipIf(process.platform === "win32")("Herdr bridge credential discovery
 				address: "127.0.0.1:4321",
 				token: "fresh-bridge-token",
 				paneId: "pane-1",
+				routeGeneration: 1,
 			});
 		});
 	});
@@ -162,6 +164,7 @@ describe.skipIf(process.platform === "win32")("Herdr bridge credential discovery
 					address: "127.0.0.1:4321",
 					token: "fresh-bridge-token",
 					paneId: "pane-current",
+					routeGeneration: 1,
 				});
 				expect(env.HERDR_OMP_BRIDGE_TOKEN).toBeUndefined();
 			},
@@ -183,6 +186,33 @@ describe.skipIf(process.platform === "win32")("Herdr bridge credential discovery
 	it("rejects a discovery result without a usable PID-resolved pane", async () => {
 		await withDiscoveryServer(
 			request => successResponse(request, " "),
+			async socketPath => {
+				await expect(discoverHerdrHostBridge({ socketPath, paneId: "pane-1" })).rejects.toThrow(
+					"malformed local API response",
+				);
+			},
+		);
+	});
+
+	it.each([
+		["missing", undefined],
+		["non-numeric", "1"],
+		["non-positive", 0],
+		["fractional", 1.5],
+		["unsafe", Number.MAX_SAFE_INTEGER + 1],
+	])("fails closed when route_generation is %s", async (_kind, routeGeneration) => {
+		await withDiscoveryServer(
+			request =>
+				JSON.stringify({
+					id: request.id,
+					result: {
+						type: "pane_omp_bridge",
+						pane_id: "pane-1",
+						address: "127.0.0.1:4321",
+						token: "fresh-bridge-token",
+						...(routeGeneration === undefined ? {} : { route_generation: routeGeneration }),
+					},
+				}),
 			async socketPath => {
 				await expect(discoverHerdrHostBridge({ socketPath, paneId: "pane-1" })).rejects.toThrow(
 					"malformed local API response",

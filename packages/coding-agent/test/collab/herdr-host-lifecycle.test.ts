@@ -137,6 +137,7 @@ describe("managed Herdr collab host lifecycle", () => {
 			address: `127.0.0.1:${server.port}`,
 			token: "bridge-token",
 			paneId: "pane-1",
+			routeGeneration: 1,
 		};
 		let discoveryRequests = 0;
 		const lifecycle = createLifecycle(ctx, session, credentials, async discovery => {
@@ -195,7 +196,7 @@ describe("managed Herdr collab host lifecycle", () => {
 		expect(ctx.collabHost).toBe(publicHost);
 	});
 
-	it("uses each canonical ready generation for the next managed rearm", async () => {
+	it("uses the retained discovery and each canonical ready generation for the next managed rearm", async () => {
 		const sessionManager = {
 			getSessionId: () => "session-one",
 			snapshotForReplication: () => ({
@@ -247,11 +248,16 @@ describe("managed Herdr collab host lifecycle", () => {
 			sessionManager,
 			registerSessionChangeCallback: () => () => {},
 		} as unknown as Pick<AgentSession, "registerSessionChangeCallback" | "sessionManager">;
-		const lifecycle = createLifecycle(ctx, session, {
+		const credentials = {
 			address: `127.0.0.1:${server.port}`,
 			token: "bridge-token",
 			paneId: "pane-1",
-		});
+			routeGeneration: 1,
+		};
+		const lifecycle = createLifecycle(ctx, session, credentials, async () => ({
+			...credentials,
+			routeGeneration: canonicalGeneration,
+		}));
 
 		try {
 			await lifecycle.start();
@@ -310,6 +316,7 @@ describe("managed Herdr collab host lifecycle", () => {
 			address: `127.0.0.1:${server.port}`,
 			token: "bridge-token",
 			paneId: "pane-1",
+			routeGeneration: 1,
 		};
 		const firstDiscovery = Promise.withResolvers<HerdrHostBridgeCredentials>();
 		const discoveryStarted = Promise.withResolvers<void>();
@@ -369,6 +376,7 @@ describe("managed Herdr collab host lifecycle", () => {
 			address: "127.0.0.1:1",
 			token: "bridge-token",
 			paneId: "pane-1",
+			routeGeneration: 1,
 		});
 
 		try {
@@ -447,6 +455,7 @@ describe("managed Herdr collab host lifecycle", () => {
 			address: `127.0.0.1:${server.port}`,
 			token: "bridge-token",
 			paneId: "pane-1",
+			routeGeneration: 1,
 		};
 		let discoveryRequests = 0;
 		const lifecycle = createLifecycle(ctx, session, credentials, async () => {
@@ -544,6 +553,7 @@ describe("managed Herdr collab host lifecycle", () => {
 			address: `127.0.0.1:${server.port}`,
 			token: "bridge-token",
 			paneId: "pane-1",
+			routeGeneration: 1,
 		});
 
 		try {
@@ -634,6 +644,7 @@ describe("managed Herdr collab host lifecycle", () => {
 			address: `127.0.0.1:${server.port}`,
 			token: "bridge-token",
 			paneId: "pane-1",
+			routeGeneration: 1,
 		});
 
 		try {
@@ -704,7 +715,13 @@ describe("managed Herdr collab host lifecycle", () => {
 						freshPending = freshPending.slice(newline + 1);
 						if (record.t !== "host") return;
 						freshAnnouncements.push(record);
-						socket.write('{"t":"ready","routeGeneration":1}\n');
+						if (record.routeGeneration !== 7) {
+							socket.write(
+								'{"t":"error","code":"route-generation-mismatch","message":"expected route generation 7"}\n',
+							);
+							return;
+						}
+						socket.write('{"t":"ready","routeGeneration":8}\n');
 					},
 				},
 			});
@@ -727,6 +744,7 @@ describe("managed Herdr collab host lifecycle", () => {
 									pane_id: "pane-current",
 									address: `127.0.0.1:${freshServer.port}`,
 									token: "fresh-token",
+									route_generation: 7,
 								},
 							})}\n`,
 						);
@@ -772,6 +790,7 @@ describe("managed Herdr collab host lifecycle", () => {
 				expect(freshAnnouncements).toHaveLength(1);
 				expect(freshAnnouncements[0]?.token).toBe("fresh-token");
 				expect(freshAnnouncements[0]?.paneId).toBe("pane-current");
+				expect(freshAnnouncements[0]?.routeGeneration).toBe(7);
 				expect(ctx.herdrCollabHost).toBeDefined();
 				expect(errors).toEqual([]);
 			} finally {

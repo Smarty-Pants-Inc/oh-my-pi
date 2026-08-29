@@ -141,7 +141,7 @@ export class HerdrCollabHostLifecycle {
 			await this.#deactivate("session switched");
 			if (this.#stopping || this.#suspended || this.#ctx.collabGuest) return;
 			const refreshed = await discoverHerdrHostBridge(this.#bridge.discovery);
-			this.#bridge = { ...this.#bridge, current: refreshed };
+			this.#bridge = { ...this.#bridge, current: refreshed, routeGeneration: refreshed.routeGeneration };
 			if (this.#stopping || this.#suspended || this.#ctx.collabGuest) return;
 			const discoveredCurrentSessionId = this.#session.sessionManager.getSessionId();
 			const discoveredSessionId = this.#committedSessionId ?? discoveredCurrentSessionId;
