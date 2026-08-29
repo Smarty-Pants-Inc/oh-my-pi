@@ -11,7 +11,7 @@
  *     post-prompt recovery, but the loop is already done) must be drained when
  *     the session settles.
  */
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -255,6 +255,42 @@ describe("AgentSession queued steer delivery", () => {
 			hasPending: true,
 			parkedDraft: "keep after",
 		});
+		await active;
+	});
+
+	it("does not abort an active direct continuation for a stale NOW id", async () => {
+		const { session } = await createSession([
+			{ content: ["active response"], delayMs: 1_000 },
+			{ content: ["interrupt response"], delayMs: 1_000 },
+		]);
+		const activeStarted = Promise.withResolvers<void>();
+		const unsubscribe = session.subscribe(event => {
+			if (event.type === "agent_start") activeStarted.resolve();
+		});
+		const active = session.prompt("active");
+		await activeStarted.promise;
+		unsubscribe();
+
+		await session.prompt("interrupt now", { streamingBehavior: "followUp" });
+		await session.prompt("stale now", { streamingBehavior: "followUp" });
+		const queued = session.getQueuedPrompts();
+		const interruptId = queued.find(prompt => prompt.text === "interrupt now")?.id;
+		const staleId = queued.find(prompt => prompt.text === "stale now")?.id;
+		if (!interruptId || !staleId) throw new Error("Expected queued prompt ids");
+		expect(await session.removeQueuedPrompt(staleId)).toEqual({ status: "updated" });
+
+		const interruptDelivered = nextUserMessage(session, "interrupt now");
+		expect(await session.setQueuedPromptDelivery(interruptId, "interrupt")).toEqual({ status: "updated" });
+		await interruptDelivered;
+		expect(session.isStreaming).toBe(true);
+
+		const abort = spyOn(session, "abort");
+		try {
+			expect(await session.setQueuedPromptDelivery(staleId, "interrupt")).toEqual({ status: "stale" });
+			expect(abort).not.toHaveBeenCalled();
+		} finally {
+			abort.mockRestore();
+		}
 		await active;
 	});
 

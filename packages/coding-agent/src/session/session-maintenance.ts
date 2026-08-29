@@ -1185,6 +1185,17 @@ export class SessionMaintenance {
 		return this.#manualCompactionCleanup;
 	}
 
+	/** Wait until active manual or automatic compaction has fully released its session fence. */
+	async waitForCompaction(): Promise<boolean> {
+		let waited = false;
+		while (true) {
+			const settled = this.#manualCompactionCleanup ?? this.#autoCompactionSettled;
+			if (!settled) return waited;
+			waited = true;
+			await settled;
+		}
+	}
+
 	/** Cancel only automatic maintenance while preserving a manual compaction. */
 	abortAutomaticCompaction(): void {
 		this.#autoCompactionAbortController?.abort();
