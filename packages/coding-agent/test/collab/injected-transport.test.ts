@@ -645,6 +645,94 @@ describe("injected collab transport", () => {
 		expect(refreshes).toEqual([["blocking"], []]);
 	});
 
+	it("finishes terminal host-tool cleanup before a replacement host can register tools", async () => {
+		const oldToolsApplied = Promise.withResolvers<void>();
+		const oldCleanupStarted = Promise.withResolvers<void>();
+		const releaseOldCleanup = Promise.withResolvers<void>();
+		const replacementStarted = Promise.withResolvers<void>();
+		const replacementToolsApplied = Promise.withResolvers<void>();
+		let terminalClosing = false;
+		let didStartReplacement = false;
+		let registeredTools: AgentTool[] = [];
+		let replacementHost: CollabHost | undefined;
+		let replacementTask: Promise<void> | undefined;
+		const ctx = makeHostContext([], {}, undefined, {
+			onRefreshRpcHostTools: async tools => {
+				const names = tools.map(tool => tool.name);
+				if (terminalClosing && names.length === 0) {
+					oldCleanupStarted.resolve();
+					await releaseOldCleanup.promise;
+				}
+				registeredTools = tools;
+				if (names[0] === "old_tool") oldToolsApplied.resolve();
+				if (names[0] === "replacement_tool") replacementToolsApplied.resolve();
+			},
+		});
+		const oldRouter = new InMemoryCollabRouter();
+		const oldTransport = oldRouter.host();
+		const oldHost = new CollabHost(ctx);
+		await oldHost.startWithTransport(oldTransport, {
+			trustedLocal: true,
+			privateHost: true,
+			onTerminated: () => {
+				didStartReplacement = true;
+				replacementStarted.resolve();
+				replacementTask = (async () => {
+					const replacementRouter = new InMemoryCollabRouter();
+					replacementHost = new CollabHost(ctx);
+					await replacementHost.startWithTransport(replacementRouter.host(), {
+						trustedLocal: true,
+						privateHost: true,
+					});
+					const replacementController = replacementRouter.guest();
+					replacementRouter.setAuthority(replacementController.peerId, true);
+					connectRawPeer(replacementController, "replacement controller");
+					await flush();
+					replacementController.send({
+						t: "set-host-tools",
+						reqId: 2,
+						tools: [
+							{
+								name: "replacement_tool",
+								description: "Replacement tool",
+								parameters: { type: "object" },
+							},
+						],
+					});
+					await replacementToolsApplied.promise;
+				})();
+			},
+		});
+		const oldController = oldRouter.guest();
+		oldRouter.setAuthority(oldController.peerId, true);
+		connectRawPeer(oldController, "old controller");
+		await flush();
+		oldController.send({
+			t: "set-host-tools",
+			reqId: 1,
+			tools: [{ name: "old_tool", description: "Old tool", parameters: { type: "object" } }],
+		});
+		await oldToolsApplied.promise;
+
+		try {
+			terminalClosing = true;
+			oldTransport.close();
+			await oldCleanupStarted.promise;
+			expect(didStartReplacement).toBe(false);
+			releaseOldCleanup.resolve();
+			await replacementStarted.promise;
+			const task = replacementTask;
+			if (!task) throw new Error("Expected terminal replacement task");
+			await task;
+			expect(registeredTools.map(tool => tool.name)).toEqual(["replacement_tool"]);
+		} finally {
+			releaseOldCleanup.resolve();
+			await oldHost.stop("test cleanup");
+			await replacementTask?.catch(() => {});
+			await replacementHost?.stop("test cleanup");
+		}
+	});
+
 	it("rejects stale registrations across rapid authority revoke and regrant", async () => {
 		const staleRefreshStarted = Promise.withResolvers<void>();
 		const releaseStaleRefresh = Promise.withResolvers<void>();

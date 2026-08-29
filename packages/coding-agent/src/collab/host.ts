@@ -262,6 +262,7 @@ export class CollabHost {
 	#registryUnsubscribe?: () => void;
 	#stopped = false;
 	#entryAppendedUnsubscribe?: () => void;
+	#teardownPromise: Promise<void> | undefined;
 
 	#trustedLocalTransport = false;
 	#privateHost = false;
@@ -405,9 +406,10 @@ export class CollabHost {
 				this.#ctx.showStatus(`Collab relay connection lost (${reason}), reconnecting…`, { dim: true });
 			} else {
 				terminalReason = reason;
-				this.#notifyTerminated(reason);
-				void this.#teardown();
-				this.#emitCollabNotice("warning", `Collab ended: ${reason}`);
+				void this.#teardown().then(() => {
+					this.#notifyTerminated(reason);
+					this.#emitCollabNotice("warning", `Collab ended: ${reason}`);
+				});
 			}
 		};
 		transport.connect();
@@ -465,12 +467,16 @@ export class CollabHost {
 
 	/** Broadcast a goodbye, detach all taps, and close the socket. */
 	async stop(reason: string): Promise<void> {
-		if (this.#stopped) return;
-		this.#socket?.send({ t: "bye", reason });
+		if (!this.#stopped) this.#socket?.send({ t: "bye", reason });
 		await this.#teardown();
 	}
 
-	async #teardown(): Promise<void> {
+	#teardown(): Promise<void> {
+		this.#teardownPromise ??= this.#runTeardown();
+		return this.#teardownPromise;
+	}
+
+	async #runTeardown(): Promise<void> {
 		if (this.#stopped) return;
 		this.#stopped = true;
 		this.#entryAppendedUnsubscribe?.();
