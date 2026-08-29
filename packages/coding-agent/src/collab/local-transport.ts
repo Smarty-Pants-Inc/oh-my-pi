@@ -161,8 +161,12 @@ export class LocalCollabTransport implements CollabTransport {
 	#parser = new NdjsonRecordParser();
 
 	#receive(data: Uint8Array): void {
+		if (this.#closed) return;
 		try {
-			for (const record of this.#parser.push(data)) this.#dispatch(record);
+			for (const record of this.#parser.push(data)) {
+				this.#dispatch(record);
+				if (this.#closed) return;
+			}
 		} catch (error) {
 			this.#finish(error instanceof Error ? error.message : String(error));
 			this.#socket?.end();
@@ -189,6 +193,11 @@ export class LocalCollabTransport implements CollabTransport {
 		if (!record || typeof record !== "object") return;
 		const value = record as Record<string, unknown>;
 		if (value.t === "ready" && this.#waitForHerdrReady) {
+			if (this.#routeGeneration !== undefined) {
+				this.#finish("duplicate Herdr ready");
+				this.#socket?.end();
+				return;
+			}
 			const routeGeneration = value.routeGeneration;
 			if (typeof routeGeneration !== "number" || !Number.isSafeInteger(routeGeneration) || routeGeneration < 1) {
 				this.#finish("invalid Herdr ready route generation");

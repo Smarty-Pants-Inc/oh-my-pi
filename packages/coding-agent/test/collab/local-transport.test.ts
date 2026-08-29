@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import { OMP_BUILD_ID } from "../../src/build-identity";
 import {
 	createHostBridgeTransport,
@@ -205,6 +205,70 @@ describe("NdjsonRecordParser", () => {
 			}
 		} finally {
 			server.stop(true);
+		}
+	});
+
+	it("fails closed on a coalesced duplicate Herdr ready without dispatching later records", () => {
+		const socket = { write: () => 0, end: () => {} } as unknown as Bun.Socket<undefined>;
+		const connectSpy = spyOn(Bun, "connect").mockImplementation(((
+			options: Bun.TCPSocketConnectOptions<undefined>,
+		) => {
+			options.socket.open?.(socket);
+			options.socket.data?.(
+				socket,
+				Buffer.from(
+					'{"t":"ready","routeGeneration":2}\n{"t":"ready","routeGeneration":999}\n{"t":"peer-authority","peer":7,"canWrite":true}\n{"t":"frame","fromPeer":7,"frame":{"t":"abort"}}\n',
+				),
+			);
+			return Promise.resolve(socket);
+		}) as typeof Bun.connect);
+		try {
+			const events: string[] = [];
+			const transport = createHostBridgeTransport("127.0.0.1:1", "route-token", "pane-7", "session-result", 1);
+			transport.onOpen = () => events.push("open");
+			transport.onControl = () => events.push("control");
+			transport.onFrame = () => events.push("frame");
+			transport.onClose = reason => events.push(`close:${reason}`);
+
+			transport.connect();
+
+			expect(events).toEqual(["open", "close:duplicate Herdr ready"]);
+			expect(transport.routeGeneration).toBe(2);
+			expect(transport.isOpen).toBe(false);
+		} finally {
+			connectSpy.mockRestore();
+		}
+	});
+
+	it("does not dispatch coalesced authority or frames after an invalid Herdr ready", () => {
+		const socket = { write: () => 0, end: () => {} } as unknown as Bun.Socket<undefined>;
+		const connectSpy = spyOn(Bun, "connect").mockImplementation(((
+			options: Bun.TCPSocketConnectOptions<undefined>,
+		) => {
+			options.socket.open?.(socket);
+			options.socket.data?.(
+				socket,
+				Buffer.from(
+					'{"t":"ready","routeGeneration":0}\n{"t":"peer-authority","peer":7,"canWrite":true}\n{"t":"frame","fromPeer":7,"frame":{"t":"abort"}}\n',
+				),
+			);
+			return Promise.resolve(socket);
+		}) as typeof Bun.connect);
+		try {
+			const events: string[] = [];
+			const transport = createHostBridgeTransport("127.0.0.1:1", "route-token", "pane-7", "session-result", 1);
+			transport.onOpen = () => events.push("open");
+			transport.onControl = () => events.push("control");
+			transport.onFrame = () => events.push("frame");
+			transport.onClose = reason => events.push(`close:${reason}`);
+
+			transport.connect();
+
+			expect(events).toEqual(["close:invalid Herdr ready route generation"]);
+			expect(transport.routeGeneration).toBeUndefined();
+			expect(transport.isOpen).toBe(false);
+		} finally {
+			connectSpy.mockRestore();
 		}
 	});
 
