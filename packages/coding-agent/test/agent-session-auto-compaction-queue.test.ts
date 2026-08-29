@@ -548,6 +548,110 @@ describe("AgentSession auto-compaction queue resume", () => {
 		session.agent.clearAllQueues();
 	});
 
+	it.each([
+		["delivery", "manual"],
+		["text", "manual"],
+		["removal", "manual"],
+		["delivery", "automatic"],
+		["now", "manual"],
+		["now", "automatic"],
+	] as const)(
+		"waits to commit a session-backed queued prompt %s until %s compaction settles",
+		async (mutation, compaction) => {
+			session.settings.set("compaction.keepRecentTokens", 1);
+			sessionManager.appendMessage({
+				role: "assistant",
+				content: [{ type: "text", text: "previous answer" }],
+				api: "anthropic-messages",
+				provider: "anthropic",
+				model: "claude-sonnet-4-5",
+				stopReason: "stop",
+				usage: {
+					input: 1_000,
+					output: 100,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 1_100,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				timestamp: Date.now(),
+			});
+			session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+
+			const gate = Promise.withResolvers<void>();
+			(globalThis as typeof globalThis & { __ompManualCompactGate?: Promise<void> }).__ompManualCompactGate =
+				gate.promise;
+			const compactPromise = compaction === "manual" ? session.compact() : session.runIdleCompaction();
+
+			try {
+				while (!getRuntimeSignals().includes("before_compact:enter")) {
+					await Promise.resolve();
+				}
+
+				await session.sendUserMessage("queued during compaction");
+				const queued = session.getQueuedPrompts()[0];
+				if (!queued) throw new Error("Expected a session-backed queued prompt");
+				const targetDelivery = queued.delivery === "steer" ? "afterCurrent" : "steer";
+				if (mutation !== "now") session.agent.state.isStreaming = true;
+				const continueSpy =
+					mutation === "now"
+						? vi.spyOn(session.agent, "continueQueuedMessageBlock").mockImplementation(async (queue, block) => {
+								expect(queue).toBe("steering");
+								expect(block).toEqual([
+									expect.objectContaining({
+										role: "user",
+										content: [{ type: "text", text: "queued during compaction" }],
+										attribution: "user",
+									}),
+								]);
+								session.agent.clearAllQueues();
+							})
+						: undefined;
+
+				let mutationSettled = false;
+				const operation = (
+					mutation === "now"
+						? session.setQueuedPromptDelivery(queued.id, "interrupt")
+						: mutation === "delivery"
+							? session.setQueuedPromptDelivery(queued.id, targetDelivery)
+							: mutation === "text"
+								? session.updateQueuedPromptText(queued.id, "edited after compaction")
+								: session.removeQueuedPrompt(queued.id)
+				).finally(() => {
+					mutationSettled = true;
+				});
+				await Promise.resolve();
+				expect(mutationSettled).toBe(false);
+
+				gate.resolve();
+				await compactPromise;
+				await expect(operation).resolves.toEqual({ status: "updated" });
+				if (mutation === "now") await session.waitForIdle();
+
+				const prompts = session.getQueuedPrompts();
+				if (mutation === "now") {
+					expect(continueSpy).toHaveBeenCalledTimes(1);
+					expect(prompts).toEqual([]);
+				} else if (mutation === "delivery") {
+					expect(prompts[0]).toMatchObject({
+						id: queued.id,
+						text: "queued during compaction",
+						delivery: targetDelivery,
+					});
+				} else if (mutation === "text") {
+					expect(prompts[0]).toMatchObject({ id: queued.id, text: "edited after compaction" });
+				} else {
+					expect(prompts).toEqual([]);
+				}
+			} finally {
+				gate.resolve();
+				await compactPromise;
+				session.agent.state.isStreaming = false;
+				session.agent.clearAllQueues();
+			}
+		},
+	);
+
 	it("cancels an in-flight auto-compaction when manual compact startup aborts", async () => {
 		// Give the branch something to summarize so auto-compaction reaches the
 		// awaited session_before_compact hook, where the test parks it.

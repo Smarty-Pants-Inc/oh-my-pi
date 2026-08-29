@@ -159,7 +159,7 @@ describe("InputController orphaned submit", () => {
 		await editor.onSubmit?.("do not lose me");
 
 		expect(spies.prompt).toHaveBeenCalledWith("do not lose me", {
-			streamingBehavior: "followUp",
+			streamingBehavior: "steer",
 			images: undefined,
 		});
 		expect(spies.steer).not.toHaveBeenCalled();
@@ -220,7 +220,7 @@ describe("InputController orphaned submit", () => {
 
 		await editor.onSubmit?.("look at this [Image #1]");
 
-		expect(spies.prompt).toHaveBeenCalledWith("look at this", { streamingBehavior: "followUp", images: [image] });
+		expect(spies.prompt).toHaveBeenCalledWith("look at this", { streamingBehavior: "steer", images: [image] });
 		expect(ctx.locallySubmittedUserSignatures.has("look at this\u00001")).toBe(true);
 		expect(ctx.editor.pendingImages.length).toBe(0);
 	});
@@ -340,7 +340,7 @@ describe("InputController orphaned submit", () => {
 				await editor.onSubmit?.(forwardedText);
 
 				expect(promptSpy).toHaveBeenCalledWith(forwardedText, {
-					streamingBehavior: "followUp",
+					streamingBehavior: "steer",
 					images: undefined,
 				});
 				expect(titleSpy).toHaveBeenCalledWith(forwardedText);
