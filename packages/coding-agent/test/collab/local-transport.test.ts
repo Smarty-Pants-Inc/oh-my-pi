@@ -122,7 +122,7 @@ describe("NdjsonRecordParser", () => {
 		}
 	});
 
-	it("announces before exposing an open route and waits for Herdr ready", async () => {
+	it("announces before opening and retains Herdr's canonical route generation", async () => {
 		const received = Promise.withResolvers<{ text: string; socket: Bun.Socket<undefined> }>();
 		const server = Bun.listen({
 			hostname: "127.0.0.1",
@@ -160,10 +160,49 @@ describe("NdjsonRecordParser", () => {
 			});
 			expect(opened).toBe(false);
 			expect(transport.isOpen).toBe(false);
-			announced.socket.write('{"t":"ready"}\n');
+			announced.socket.write('{"t":"ready","routeGeneration":2}\n');
 			await ready.promise;
 			expect(transport.isOpen).toBe(true);
+			expect(transport.routeGeneration).toBe(2);
 			transport.close();
+		} finally {
+			server.stop(true);
+		}
+	});
+
+	it("fails closed when Herdr ready omits or contains an invalid canonical route generation", async () => {
+		const readyRecords = [
+			{ t: "ready" },
+			{ t: "ready", routeGeneration: 0 },
+			{ t: "ready", routeGeneration: Number.MAX_SAFE_INTEGER + 1 },
+		];
+		let connection = 0;
+		const server = Bun.listen({
+			hostname: "127.0.0.1",
+			port: 0,
+			socket: {
+				open(socket) {
+					socket.write(`${JSON.stringify(readyRecords[connection++])}\n`);
+				},
+				data() {},
+			},
+		});
+		try {
+			for (let remaining = readyRecords.length; remaining > 0; remaining -= 1) {
+				const transport = createHostBridgeTransport(
+					`127.0.0.1:${server.port}`,
+					"route-token",
+					"pane-7",
+					"session-result",
+					1,
+				);
+				const closed = Promise.withResolvers<string>();
+				transport.onOpen = () => transport.close();
+				transport.onClose = reason => closed.resolve(reason);
+				transport.connect();
+				expect(await closed.promise).toBe("invalid Herdr ready route generation");
+				expect(transport.routeGeneration).toBeUndefined();
+			}
 		} finally {
 			server.stop(true);
 		}

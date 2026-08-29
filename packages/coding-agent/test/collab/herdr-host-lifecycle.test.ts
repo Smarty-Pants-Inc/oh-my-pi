@@ -108,7 +108,7 @@ describe("managed Herdr collab host lifecycle", () => {
 								const index = records.push(record) - 1;
 								waiters.get(index)?.(record);
 								waiters.delete(index);
-								socket.write('{"t":"ready"}\n');
+								socket.write('{"t":"ready","routeGeneration":1}\n');
 							}
 						}
 						newline = pending.indexOf("\n");
@@ -195,6 +195,78 @@ describe("managed Herdr collab host lifecycle", () => {
 		expect(ctx.collabHost).toBe(publicHost);
 	});
 
+	it("uses each canonical ready generation for the next managed rearm", async () => {
+		const sessionManager = {
+			getSessionId: () => "session-one",
+			snapshotForReplication: () => ({
+				header: { type: "session", id: "session-one", timestamp: "2026-01-01T00:00:00Z", cwd: "/host" },
+				entries: [],
+			}),
+		};
+		const ctx = makeContext(sessionManager);
+		const announcedGenerations: number[] = [];
+		let canonicalGeneration = 1;
+		let pending = "";
+		const server = Bun.listen({
+			hostname: "127.0.0.1",
+			port: 0,
+			socket: {
+				open() {},
+				data(socket, data) {
+					pending += data.toString();
+					let newline = pending.indexOf("\n");
+					while (newline >= 0) {
+						const line = pending.slice(0, newline);
+						pending = pending.slice(newline + 1);
+						if (line.trim()) {
+							const record = JSON.parse(line) as Record<string, unknown>;
+							if (record.t === "host") {
+								const routeGeneration = record.routeGeneration;
+								if (typeof routeGeneration !== "number") throw new Error("Expected host route generation");
+								announcedGenerations.push(routeGeneration);
+								if (routeGeneration !== canonicalGeneration) {
+									socket.write(
+										`${JSON.stringify({
+											t: "error",
+											code: "route-generation-mismatch",
+											message: `expected route generation ${canonicalGeneration}`,
+										})}\n`,
+									);
+								} else {
+									canonicalGeneration += 1;
+									socket.write(`${JSON.stringify({ t: "ready", routeGeneration: canonicalGeneration })}\n`);
+								}
+							}
+						}
+						newline = pending.indexOf("\n");
+					}
+				},
+			},
+		});
+		const session = {
+			sessionManager,
+			registerSessionChangeCallback: () => () => {},
+		} as unknown as Pick<AgentSession, "registerSessionChangeCallback" | "sessionManager">;
+		const lifecycle = createLifecycle(ctx, session, {
+			address: `127.0.0.1:${server.port}`,
+			token: "bridge-token",
+			paneId: "pane-1",
+		});
+
+		try {
+			await lifecycle.start();
+			await lifecycle.suspend("test rearm");
+			await lifecycle.resume();
+			await lifecycle.suspend("test rearm");
+			await lifecycle.resume();
+			expect(announcedGenerations).toEqual([1, 2, 3]);
+			expect(canonicalGeneration).toBe(4);
+		} finally {
+			await lifecycle.stop("test cleanup");
+			server.stop(true);
+		}
+	});
+
 	it("does not announce a stale session when the session commits during bridge discovery", async () => {
 		let sessionId = "session-one";
 		let sessionChange: (() => void) | undefined;
@@ -221,7 +293,7 @@ describe("managed Herdr collab host lifecycle", () => {
 					pending = pending.slice(newline + 1);
 					if (record.t !== "host") return;
 					records.push(record);
-					socket.write('{"t":"ready"}\n');
+					socket.write('{"t":"ready","routeGeneration":1}\n');
 				},
 			},
 		});
@@ -283,7 +355,10 @@ describe("managed Herdr collab host lifecycle", () => {
 			options: Bun.TCPSocketConnectOptions<undefined>,
 		) => {
 			options.socket.open?.(socket);
-			options.socket.data?.(socket, Buffer.from('{"t":"ready"}\n{"t":"close","reason":"bridge dropped"}\n'));
+			options.socket.data?.(
+				socket,
+				Buffer.from('{"t":"ready","routeGeneration":2}\n{"t":"close","reason":"bridge dropped"}\n'),
+			);
 			return Promise.resolve(socket);
 		}) as typeof Bun.connect);
 		const session = {
@@ -348,7 +423,7 @@ describe("managed Herdr collab host lifecycle", () => {
 								socket.write(
 									routeBusy
 										? '{"t":"error","code":"route_busy","message":"OMP host route is already active"}\n'
-										: '{"t":"ready"}\n',
+										: '{"t":"ready","routeGeneration":1}\n',
 								);
 							}
 						}
@@ -451,7 +526,7 @@ describe("managed Herdr collab host lifecycle", () => {
 								hostAnnouncements += 1;
 								socket.write(
 									hostAnnouncements === 1
-										? '{"t":"ready"}\n'
+										? '{"t":"ready","routeGeneration":1}\n'
 										: '{"t":"error","code":"route_busy","message":"OMP host route is already active"}\n',
 								);
 							}
@@ -531,7 +606,7 @@ describe("managed Herdr collab host lifecycle", () => {
 								};
 								waiters.get(index)?.(record);
 								waiters.delete(index);
-								socket.write('{"t":"ready"}\n');
+								socket.write('{"t":"ready","routeGeneration":1}\n');
 							}
 						}
 						newline = pending.indexOf("\n");
@@ -629,7 +704,7 @@ describe("managed Herdr collab host lifecycle", () => {
 						freshPending = freshPending.slice(newline + 1);
 						if (record.t !== "host") return;
 						freshAnnouncements.push(record);
-						socket.write('{"t":"ready"}\n');
+						socket.write('{"t":"ready","routeGeneration":1}\n');
 					},
 				},
 			});

@@ -149,24 +149,22 @@ export class HerdrCollabHostLifecycle {
 
 			const next = new CollabHost(this.#ctx);
 			let terminalReason: string | undefined;
+			const transport = createHostBridgeTransport(
+				refreshed.address,
+				refreshed.token,
+				refreshed.paneId,
+				sessionId,
+				this.#bridge.routeGeneration,
+			);
 			try {
-				await next.startWithTransport(
-					createHostBridgeTransport(
-						refreshed.address,
-						refreshed.token,
-						refreshed.paneId,
-						sessionId,
-						this.#bridge.routeGeneration,
-					),
-					{
-						trustedLocal: true,
-						privateHost: true,
-						onTerminated: reason => {
-							terminalReason = reason;
-							this.#handleHostTermination(next, sessionId, reason);
-						},
+				await next.startWithTransport(transport, {
+					trustedLocal: true,
+					privateHost: true,
+					onTerminated: reason => {
+						terminalReason = reason;
+						this.#handleHostTermination(next, sessionId, reason);
 					},
-				);
+				});
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				if (terminalReason !== undefined) throw error;
@@ -189,6 +187,9 @@ export class HerdrCollabHostLifecycle {
 					continue;
 				}
 				throw error;
+			} finally {
+				const routeGeneration = transport.routeGeneration;
+				if (routeGeneration !== undefined) this.#bridge.routeGeneration = routeGeneration;
 			}
 			if (terminalReason !== undefined) throw new Error(terminalReason);
 			if (this.#stopping || this.#suspended || this.#ctx.collabGuest) {
