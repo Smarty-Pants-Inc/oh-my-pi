@@ -400,7 +400,7 @@ describe("NdjsonRecordParser", () => {
 });
 
 describe("LocalCollabTransport attribution", () => {
-	it("forwards trusted prompt attribution only as bridge metadata", async () => {
+	it("preserves prompt request IDs through trusted bridge normalization", async () => {
 		const received = Promise.withResolvers<{ frame: unknown; peer: number; metadata?: unknown }>();
 		const opened = Promise.withResolvers<Bun.Socket<undefined>>();
 		const server = Bun.listen({
@@ -420,10 +420,10 @@ describe("LocalCollabTransport attribution", () => {
 			const socket = await opened.promise;
 			socket.write('{"t":"ready"}\n');
 			socket.write(
-				'{"t":"frame","fromPeer":7,"displayName":"Alice","displayNameRevision":2,"frame":{"t":"prompt","text":"hello","streamingBehavior":"followUp","displayName":"forged","displayNameRevision":99}}\n',
+				'{"t":"frame","fromPeer":7,"displayName":"Alice","displayNameRevision":2,"frame":{"t":"prompt","text":"hello","streamingBehavior":"followUp","requestId":"rpc-42","displayName":"forged","displayNameRevision":99}}\n',
 			);
 			expect(await received.promise).toEqual({
-				frame: { t: "prompt", text: "hello", streamingBehavior: "followUp" },
+				frame: { t: "prompt", text: "hello", streamingBehavior: "followUp", requestId: "rpc-42" },
 				peer: 7,
 				metadata: { displayName: "Alice", displayNameRevision: 2 },
 			});

@@ -189,6 +189,7 @@ export class LocalCollabTransport implements CollabTransport {
 							text: record.frame.text,
 							images: record.frame.images,
 							...(record.frame.streamingBehavior ? { streamingBehavior: record.frame.streamingBehavior } : {}),
+							...(record.frame.requestId !== undefined ? { requestId: record.frame.requestId } : {}),
 						}
 					: record.frame;
 			const metadata =
