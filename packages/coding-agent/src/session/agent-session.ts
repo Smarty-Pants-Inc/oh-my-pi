@@ -9107,6 +9107,9 @@ export class AgentSession {
 		let resumeDrainAfterCompaction = false;
 		try {
 			const activeContinuation = this.#activeDirectUserContinuationSettled;
+			if (activeContinuation && delivery === "interrupt" && !this.#locateQueuedPrompt(id)) {
+				return { status: "stale" };
+			}
 			let interruptedActiveContinuation = false;
 			if (activeContinuation) {
 				if (delivery === "interrupt") {

@@ -8716,7 +8716,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/agent-session.ts",
-      "sha256": "921596640b248c7e6293b9fc96394f4d9ed52a49706153de04722d25318f88e6"
+      "sha256": "2a5fa1d5a6d5d5d39ce182a141712949c9aa19a93d3ad136af84f92162908ee7"
     },
     {
       "path": "packages/coding-agent/src/session/agent-storage.ts",
@@ -11020,5 +11020,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "d068969039ca0a29531b2c54ed086ca1e9c00ad49827962838b8e6d91e2456c5"
+  "rootSha256": "d7edc1fa5eb66c3c2437d91fd25ffbbe17f55f154ad319a96300770bfca38845"
 }
