@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import type { AgentTool } from "@oh-my-pi/pi-agent-core";
 import { CollabHost } from "@oh-my-pi/pi-coding-agent/collab/host";
 import { createHostBridgeTransport, LocalCollabTransport } from "@oh-my-pi/pi-coding-agent/collab/local-transport";
 import { COLLAB_PROTO, type CollabFrame, type CollabUiRequestDraft } from "@oh-my-pi/pi-coding-agent/collab/protocol";
@@ -23,7 +24,12 @@ function makeHostContext(
 	prompts: { content: unknown; details?: unknown; options?: unknown }[],
 	listener: { current?: (event: AgentSessionEvent) => void },
 	onPrompt?: () => void,
-	options?: { getSessionId?: () => string; notices?: NoticeRecord[]; onAbort?: () => void },
+	options?: {
+		getSessionId?: () => string;
+		notices?: NoticeRecord[];
+		onAbort?: () => void;
+		onRefreshRpcHostTools?: (tools: AgentTool[]) => void | Promise<void>;
+	},
 ): InteractiveModeContext {
 	return {
 		settings: { get: () => "" },
@@ -63,6 +69,7 @@ function makeHostContext(
 				options?.onAbort?.();
 				return Promise.resolve();
 			},
+			refreshRpcHostTools: async (tools: AgentTool[]) => options?.onRefreshRpcHostTools?.(tools),
 		},
 		eventBus: undefined,
 		statusLine: {
@@ -413,6 +420,285 @@ describe("injected collab transport", () => {
 		peer.send({ t: "prompt", text: "explicitly authorized" });
 		await flush();
 		expect(prompts.map(prompt => prompt.content)).toEqual(["explicitly authorized"]);
+		await host.stop("test cleanup");
+	});
+
+	it("routes managed host tools only to their controller and clears ownership on replacement", async () => {
+		let registeredTools: AgentTool[] = [];
+		const refreshes: string[][] = [];
+		const ctx = makeHostContext([], {}, undefined, {
+			onRefreshRpcHostTools: tools => {
+				registeredTools = tools;
+				refreshes.push(tools.map(tool => tool.name));
+			},
+		});
+		const router = new InMemoryCollabRouter();
+		const host = new CollabHost(ctx);
+		await host.startWithTransport(router.host(), { trustedLocal: true });
+		const controller = router.guest();
+		const observer = router.guest();
+		router.setAuthority(controller.peerId, true);
+		router.setAuthority(observer.peerId, false);
+		const controllerFrames = connectRawPeer(controller, "controller");
+		const observerFrames = connectRawPeer(observer, "observer");
+		await flush();
+
+		controller.send({
+			t: "set-host-tools",
+			reqId: 1,
+			tools: [{ name: "managed", description: "Managed host tool", parameters: { type: "object" } }],
+		});
+		await flush();
+		expect(registeredTools.map(tool => tool.name)).toEqual(["managed"]);
+		expect(framesOf(controllerFrames, "host-tools-set").at(-1)).toMatchObject({ reqId: 1, toolNames: ["managed"] });
+		expect(framesOf(observerFrames, "host-tools-set")).toEqual([]);
+
+		observer.send({
+			t: "set-host-tools",
+			reqId: 2,
+			tools: [{ name: "spoofed", description: "Spoofed", parameters: { type: "object" } }],
+		});
+		await flush();
+		expect(framesOf(observerFrames, "host-tools-set").at(-1)?.error).toContain("read-only");
+		expect(registeredTools.map(tool => tool.name)).toEqual(["managed"]);
+
+		const updates: unknown[] = [];
+		const execution = registeredTools[0]!.execute("toolu-1", { value: 1 }, undefined, update => updates.push(update));
+		await flush();
+		const call = framesOf(controllerFrames, "host-tool-call").at(-1)?.frame;
+		if (!call) throw new Error("expected managed host tool call");
+		expect(framesOf(observerFrames, "host-tool-call")).toEqual([]);
+
+		observer.send({
+			t: "host-tool-result",
+			frame: {
+				type: "host_tool_result",
+				id: call.id,
+				result: { content: [{ type: "text", text: "spoofed" }] },
+			},
+		});
+		await flush();
+		let settled = false;
+		void execution.then(
+			() => {
+				settled = true;
+			},
+			() => {
+				settled = true;
+			},
+		);
+		await flush();
+		expect(settled).toBe(false);
+
+		controller.send({
+			t: "host-tool-update",
+			frame: {
+				type: "host_tool_update",
+				id: call.id,
+				partialResult: { content: [{ type: "text", text: "working" }] },
+			},
+		});
+		controller.send({
+			t: "host-tool-result",
+			frame: {
+				type: "host_tool_result",
+				id: call.id,
+				result: { content: [{ type: "text", text: "done" }] },
+			},
+		});
+		expect(await execution).toEqual({ content: [{ type: "text", text: "done" }] });
+		expect(updates).toEqual([{ content: [{ type: "text", text: "working" }] }]);
+
+		const abortController = new AbortController();
+		const aborted = registeredTools[0]!.execute("toolu-2", {}, abortController.signal);
+		await flush();
+		const abortedCall = framesOf(controllerFrames, "host-tool-call").at(-1)?.frame;
+		if (!abortedCall) throw new Error("expected abortable host tool call");
+		abortController.abort();
+		await expect(aborted).rejects.toThrow("was aborted");
+		await flush();
+		expect(framesOf(controllerFrames, "host-tool-cancel").at(-1)?.frame.targetId).toBe(abortedCall.id);
+		expect(framesOf(observerFrames, "host-tool-cancel")).toEqual([]);
+
+		const replaced = registeredTools[0]!.execute("toolu-3", {});
+		await flush();
+		router.setAuthority(observer.peerId, true);
+		router.setAuthority(controller.peerId, false);
+		await expect(replaced).rejects.toThrow("lost controller authority");
+		await flush();
+		expect(registeredTools).toEqual([]);
+
+		observer.send({
+			t: "set-host-tools",
+			reqId: 3,
+			tools: [{ name: "replacement", description: "Replacement tool", parameters: { type: "object" } }],
+		});
+		await flush();
+		expect(registeredTools.map(tool => tool.name)).toEqual(["replacement"]);
+		expect(framesOf(observerFrames, "host-tools-set").at(-1)).toMatchObject({ reqId: 3, toolNames: ["replacement"] });
+		observer.close();
+		await flush();
+		expect(registeredTools).toEqual([]);
+		expect(refreshes).toContainEqual([]);
+
+		await host.stop("test cleanup");
+	});
+
+	it("cancels an active call before replacing a writable host-tool owner", async () => {
+		let registeredTools: AgentTool[] = [];
+		const host = new CollabHost(
+			makeHostContext([], {}, undefined, {
+				onRefreshRpcHostTools: tools => {
+					registeredTools = tools;
+				},
+			}),
+		);
+		const router = new InMemoryCollabRouter();
+		await host.startWithTransport(router.host(), { trustedLocal: true });
+		const first = router.guest();
+		const second = router.guest();
+		router.setAuthority(first.peerId, true);
+		router.setAuthority(second.peerId, true);
+		const firstFrames = connectRawPeer(first, "first owner");
+		const secondFrames = connectRawPeer(second, "second owner");
+		await flush();
+
+		first.send({
+			t: "set-host-tools",
+			reqId: 1,
+			tools: [{ name: "first_tool", description: "First tool", parameters: { type: "object" } }],
+		});
+		await flush();
+		const execution = registeredTools[0]!.execute("toolu-first", {});
+		await flush();
+		const call = framesOf(firstFrames, "host-tool-call").at(-1)?.frame;
+		if (!call) throw new Error("expected first owner host tool call");
+
+		second.send({
+			t: "set-host-tools",
+			reqId: 2,
+			tools: [{ name: "second_tool", description: "Second tool", parameters: { type: "object" } }],
+		});
+		await expect(execution).rejects.toThrow("was replaced");
+		await flush();
+
+		expect(framesOf(firstFrames, "host-tool-cancel").filter(frame => frame.frame.targetId === call.id)).toHaveLength(
+			1,
+		);
+		expect(framesOf(secondFrames, "host-tools-set").at(-1)).toMatchObject({ reqId: 2, toolNames: ["second_tool"] });
+		expect(registeredTools.map(tool => tool.name)).toEqual(["second_tool"]);
+
+		await host.stop("test cleanup");
+	});
+
+	it("does not activate queued host-tool registrations after a terminal transport close", async () => {
+		const firstRefreshStarted = Promise.withResolvers<void>();
+		const releaseFirstRefresh = Promise.withResolvers<void>();
+		const finalCleanup = Promise.withResolvers<void>();
+		let terminalClosed = false;
+		let registeredTools: AgentTool[] = [];
+		const refreshes: string[][] = [];
+		const host = new CollabHost(
+			makeHostContext([], {}, undefined, {
+				onRefreshRpcHostTools: async tools => {
+					const names = tools.map(tool => tool.name);
+					refreshes.push(names);
+					if (names[0] === "blocking") {
+						firstRefreshStarted.resolve();
+						await releaseFirstRefresh.promise;
+					}
+					registeredTools = tools;
+					if (terminalClosed && names.length === 0) finalCleanup.resolve();
+				},
+			}),
+		);
+		const router = new InMemoryCollabRouter();
+		const hostTransport = router.host();
+		await host.startWithTransport(hostTransport, { trustedLocal: true });
+		const controller = router.guest();
+		router.setAuthority(controller.peerId, true);
+		connectRawPeer(controller, "controller");
+		await flush();
+		refreshes.length = 0;
+
+		controller.send({
+			t: "set-host-tools",
+			reqId: 1,
+			tools: [{ name: "blocking", description: "Blocking tool", parameters: { type: "object" } }],
+		});
+		await firstRefreshStarted.promise;
+		controller.send({
+			t: "set-host-tools",
+			reqId: 2,
+			tools: [{ name: "queued", description: "Queued tool", parameters: { type: "object" } }],
+		});
+		await flush();
+		terminalClosed = true;
+		hostTransport.close();
+		await flush();
+		releaseFirstRefresh.resolve();
+		await finalCleanup.promise;
+		await flush();
+
+		expect(registeredTools).toEqual([]);
+		expect(refreshes).toEqual([["blocking"], []]);
+	});
+
+	it("rejects stale registrations across rapid authority revoke and regrant", async () => {
+		const staleRefreshStarted = Promise.withResolvers<void>();
+		const releaseStaleRefresh = Promise.withResolvers<void>();
+		const freshApplied = Promise.withResolvers<void>();
+		let registeredTools: AgentTool[] = [];
+		const refreshes: string[][] = [];
+		const host = new CollabHost(
+			makeHostContext([], {}, undefined, {
+				onRefreshRpcHostTools: async tools => {
+					const names = tools.map(tool => tool.name);
+					refreshes.push(names);
+					if (names[0] === "stale") {
+						staleRefreshStarted.resolve();
+						await releaseStaleRefresh.promise;
+					}
+					registeredTools = tools;
+					if (names[0] === "fresh") freshApplied.resolve();
+				},
+			}),
+		);
+		const router = new InMemoryCollabRouter();
+		await host.startWithTransport(router.host(), { trustedLocal: true });
+		const controller = router.guest();
+		router.setAuthority(controller.peerId, true);
+		const frames = connectRawPeer(controller, "controller");
+		await flush();
+		refreshes.length = 0;
+
+		controller.send({
+			t: "set-host-tools",
+			reqId: 1,
+			tools: [{ name: "stale", description: "Stale tool", parameters: { type: "object" } }],
+		});
+		await staleRefreshStarted.promise;
+		router.setAuthority(controller.peerId, false);
+		router.setAuthority(controller.peerId, true);
+		controller.send({
+			t: "set-host-tools",
+			reqId: 2,
+			tools: [{ name: "fresh", description: "Fresh tool", parameters: { type: "object" } }],
+		});
+		await flush();
+		releaseStaleRefresh.resolve();
+		await freshApplied.promise;
+		await flush();
+
+		expect(refreshes).toEqual([["stale"], [], ["fresh"]]);
+		expect(registeredTools.map(tool => tool.name)).toEqual(["fresh"]);
+		expect(framesOf(frames, "host-tools-set").find(frame => frame.reqId === 1)?.error).toContain(
+			"no longer accepted",
+		);
+		expect(framesOf(frames, "host-tools-set").find(frame => frame.reqId === 2)).toMatchObject({
+			toolNames: ["fresh"],
+		});
+
 		await host.stop("test cleanup");
 	});
 

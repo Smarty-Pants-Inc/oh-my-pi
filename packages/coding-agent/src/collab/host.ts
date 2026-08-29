@@ -21,6 +21,19 @@ import type {
 	AgentEvent as WireAgentEvent,
 	SessionEntry as WireSessionEntry,
 } from "@oh-my-pi/pi-wire";
+import {
+	isRpcHostToolResult,
+	isRpcHostToolUpdate,
+	normalizeHostToolDefinitions,
+	RpcHostToolBridge,
+} from "../modes/rpc/host-tools";
+import type {
+	RpcHostToolCallRequest,
+	RpcHostToolCancelRequest,
+	RpcHostToolDefinition,
+	RpcHostToolResult,
+	RpcHostToolUpdate,
+} from "../modes/rpc/rpc-types";
 import type { InteractiveModeContext } from "../modes/types";
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry } from "../registry/agent-registry";
@@ -128,8 +141,28 @@ function isValidHerdrDisplayNameRevision(revision: number | undefined): revision
 }
 type InboundGuestFrame = Extract<
 	CollabFrame,
-	{ t: "hello" | "prompt" | "abort" | "agent-cmd" | "ui-response" | "fetch-transcript" }
+	{
+		t:
+			| "hello"
+			| "prompt"
+			| "abort"
+			| "agent-cmd"
+			| "ui-response"
+			| "fetch-transcript"
+			| "set-host-tools"
+			| "host-tool-update"
+			| "host-tool-result";
+	}
 >;
+
+type HostToolOwner = { peerId: number; bridge: RpcHostToolBridge };
+type HostToolRegistrationFence = {
+	peerId: number;
+	peerGeneration: number;
+	transport: CollabTransport;
+	transportGeneration: number;
+	sessionId: string;
+};
 
 /** Runtime boundary for untyped local bridge records before they enter host handlers. */
 function isInboundGuestFrame(frame: unknown): frame is InboundGuestFrame {
@@ -162,6 +195,12 @@ function isInboundGuestFrame(frame: unknown): frame is InboundGuestFrame {
 			return (
 				typeof value.reqId === "number" && typeof value.agentId === "string" && typeof value.fromByte === "number"
 			);
+		case "set-host-tools":
+			return typeof value.reqId === "number" && Number.isSafeInteger(value.reqId) && Array.isArray(value.tools);
+		case "host-tool-update":
+			return isRpcHostToolUpdate(value.frame);
+		case "host-tool-result":
+			return isRpcHostToolResult(value.frame);
 		default:
 			return false;
 	}
@@ -209,6 +248,11 @@ export class CollabHost {
 	#localPeerAuthority = new Map<number, boolean>();
 	#uiReqSeq = 0;
 	#pendingUi = new Map<number, { request: CollabUiRequest; settle(result: CollabGuestUiResult): void }>();
+	#hostToolOwner: HostToolOwner | undefined;
+	#hostToolMutationTail: Promise<void> = Promise.resolve();
+	#pendingHostToolRegistrations = new Map<number, number>();
+	#hostToolPeerGenerations = new Map<number, number>();
+	#hostToolTransportGeneration = 0;
 	#lastStateJson = "";
 	#stateDebounce: Timer | null = null;
 	#streamingInterval: Timer | null = null;
@@ -345,10 +389,18 @@ export class CollabHost {
 		transport.onClose = (reason, willReconnect) => {
 			if (this.#stopped) return;
 			if (!opened) {
+				this.#invalidateHostTools(
+					undefined,
+					`Collab connection lost before host tool execution completed: ${reason}`,
+				);
 				firstOpen.reject(new Error(reason));
 				return;
 			}
 			if (willReconnect) {
+				this.#invalidateHostTools(
+					undefined,
+					`Collab connection lost before host tool execution completed: ${reason}`,
+				);
 				this.#ctx.showStatus(`Collab relay connection lost (${reason}), reconnecting…`, { dim: true });
 			} else {
 				terminalReason = reason;
@@ -436,8 +488,12 @@ export class CollabHost {
 		this.#streamingInterval = null;
 		for (const pending of this.#pendingUi.values()) pending.settle({ kind: "unavailable" });
 		this.#pendingUi.clear();
+		this.#invalidateHostTools(undefined, "Collab host stopped before host tool execution completed");
+		await this.#hostToolMutationTail;
 		this.#peers.clear();
 		this.#localPeerAuthority.clear();
+		this.#pendingHostToolRegistrations.clear();
+		this.#hostToolPeerGenerations.clear();
 		this.#socket?.close();
 		this.#socket = null;
 		if (this.#privateHost) {
@@ -452,6 +508,7 @@ export class CollabHost {
 	#broadcast(frame: CollabFrame): void {
 		if (this.#stopped || !this.#socket) return;
 		if (this.#ctx.sessionManager.getSessionId() !== this.#sessionId) {
+			this.#invalidateHostTools(undefined, "Collab route changed before host tool execution completed");
 			if (this.#privateHost) return;
 			void this.stop("session switched");
 			this.#emitCollabNotice("warning", "Collab ended: session switched");
@@ -481,8 +538,23 @@ export class CollabHost {
 		metadata?: { displayName?: string; displayNameRevision?: number },
 	): void {
 		if (this.#privateHost && this.#ctx.sessionManager.getSessionId() !== this.#sessionId) {
+			this.#invalidateHostTools(undefined, "Collab route changed before host tool execution completed");
 			if (frame.t === "ui-response") this.#pendingUi.get(frame.reqId)?.settle({ kind: "unavailable" });
-			this.#socket?.send({ t: "error", message: "private collab route is rearming for a session switch" }, fromPeer);
+			if (frame.t === "set-host-tools") {
+				this.#socket?.send(
+					{
+						t: "host-tools-set",
+						reqId: frame.reqId,
+						error: "private collab route is rearming for a session switch",
+					},
+					fromPeer,
+				);
+			} else {
+				this.#socket?.send(
+					{ t: "error", message: "private collab route is rearming for a session switch" },
+					fromPeer,
+				);
+			}
 			return;
 		}
 		switch (frame.t) {
@@ -511,6 +583,15 @@ export class CollabHost {
 			case "fetch-transcript":
 				void this.#handleFetchTranscript(frame.reqId, frame.agentId, frame.fromByte, fromPeer);
 				break;
+			case "set-host-tools":
+				this.#handleSetHostTools(frame.reqId, frame.tools, fromPeer);
+				break;
+			case "host-tool-update":
+				this.#handleHostToolUpdate(frame.frame, fromPeer);
+				break;
+			case "host-tool-result":
+				this.#handleHostToolResult(frame.frame, fromPeer);
+				break;
 		}
 	}
 
@@ -535,6 +616,7 @@ export class CollabHost {
 			);
 			return;
 		}
+		this.#invalidateHostTools(fromPeer, "Collab host tool guest was replaced");
 		const cleanName = name.trim().slice(0, 64) || `guest-${fromPeer}`;
 		const canWrite = this.#trustedLocalTransport
 			? this.#localPeerAuthority.get(fromPeer) === true
@@ -695,6 +777,7 @@ export class CollabHost {
 
 	#handlePeerLeft(peer: number): void {
 		const name = this.#peers.get(peer)?.name;
+		this.#invalidateHostTools(peer, "Collab host tool guest disconnected");
 		this.#peers.delete(peer);
 		this.#localPeerAuthority.delete(peer);
 		if (!this.#privateHost && !this.#hasWritablePeers()) {
@@ -717,6 +800,7 @@ export class CollabHost {
 				this.#socket?.send({ t: "ui-request", request: pending.request }, peer);
 			}
 		} else {
+			this.#invalidateHostTools(peer, "Collab host tool guest lost controller authority");
 			if (!this.#privateHost && !this.#hasWritablePeers()) {
 				for (const pending of [...this.#pendingUi.values()]) pending.settle({ kind: "unavailable" });
 			} else {
@@ -725,6 +809,210 @@ export class CollabHost {
 		}
 		this.#updateStatusSegment();
 		this.#scheduleStateBroadcast();
+	}
+
+	#handleSetHostTools(reqId: number, definitions: RpcHostToolDefinition[], fromPeer: number): void {
+		if (!this.#peers.get(fromPeer)?.canWrite) {
+			this.#sendHostToolsSet(fromPeer, {
+				t: "host-tools-set",
+				reqId,
+				error: "registering host tools is disabled on a read-only link",
+			});
+			return;
+		}
+		const fence = this.#captureHostToolRegistration(fromPeer);
+		if (!fence) {
+			if (this.#ctx.sessionManager.getSessionId() !== this.#sessionId) {
+				this.#invalidateHostTools(undefined, "Collab route changed before host tool execution completed");
+			}
+			this.#sendHostToolsSet(fromPeer, { t: "host-tools-set", reqId, error: "Collab transport is unavailable" });
+			return;
+		}
+		this.#pendingHostToolRegistrations.set(fromPeer, (this.#pendingHostToolRegistrations.get(fromPeer) ?? 0) + 1);
+		this.#hostToolMutationTail = this.#hostToolMutationTail
+			.then(async () => {
+				if (!this.#isHostToolRegistrationAccepted(fence)) {
+					this.#sendHostToolsSet(fromPeer, {
+						t: "host-tools-set",
+						reqId,
+						error: "Collab host tool registration is no longer accepted",
+					});
+					return;
+				}
+				const tools = normalizeHostToolDefinitions(definitions);
+				const previous = this.#hostToolOwner;
+				let owner = previous?.peerId === fromPeer ? previous : undefined;
+				if (!owner) {
+					let nextOwner: HostToolOwner;
+					const bridge = new RpcHostToolBridge(frame => this.#sendHostToolRequest(nextOwner, frame));
+					nextOwner = { peerId: fromPeer, bridge };
+					if (previous) {
+						previous.bridge.close("Collab host tool guest was replaced", this.#canSendHostToolOwner(previous));
+					}
+					owner = nextOwner;
+					this.#hostToolOwner = owner;
+				}
+				try {
+					await this.#ctx.session.refreshRpcHostTools(owner.bridge.setTools(tools));
+				} catch (error) {
+					if (owner !== previous && this.#hostToolOwner === owner) {
+						this.#hostToolOwner = undefined;
+						owner.bridge.close("Collab host tool registration failed");
+						await this.#ctx.session.refreshRpcHostTools([]);
+					}
+					throw error;
+				}
+				if (this.#hostToolOwner !== owner || !this.#isHostToolRegistrationAccepted(fence)) {
+					if (this.#hostToolOwner === owner) {
+						this.#hostToolOwner = undefined;
+						owner.bridge.close("Collab host tool registration expired");
+						await this.#ctx.session.refreshRpcHostTools([]);
+					}
+					this.#sendHostToolsSet(fromPeer, {
+						t: "host-tools-set",
+						reqId,
+						error: "Collab host tool registration is no longer accepted",
+					});
+					return;
+				}
+				if (
+					!this.#sendHostToolsSet(fromPeer, {
+						t: "host-tools-set",
+						reqId,
+						toolNames: tools.map(tool => tool.name),
+					})
+				) {
+					this.#invalidateHostTools(fromPeer, "Collab host tool guest is unavailable");
+				}
+			})
+			.catch(error => {
+				logger.warn("collab host tool registration failed", { error: String(error) });
+				this.#sendHostToolsSet(fromPeer, {
+					t: "host-tools-set",
+					reqId,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			})
+			.finally(() => {
+				const remaining = (this.#pendingHostToolRegistrations.get(fromPeer) ?? 1) - 1;
+				if (remaining > 0) this.#pendingHostToolRegistrations.set(fromPeer, remaining);
+				else this.#pendingHostToolRegistrations.delete(fromPeer);
+			});
+	}
+
+	#captureHostToolRegistration(peerId: number): HostToolRegistrationFence | undefined {
+		const transport = this.#socket;
+		const sessionId = this.#ctx.sessionManager.getSessionId();
+		if (this.#stopped || !transport?.isOpen || !this.#peers.get(peerId)?.canWrite || sessionId !== this.#sessionId)
+			return undefined;
+		return {
+			peerId,
+			peerGeneration: this.#hostToolPeerGenerations.get(peerId) ?? 0,
+			transport,
+			transportGeneration: this.#hostToolTransportGeneration,
+			sessionId,
+		};
+	}
+
+	#isHostToolRegistrationAccepted(fence: HostToolRegistrationFence): boolean {
+		return (
+			!this.#stopped &&
+			this.#socket === fence.transport &&
+			fence.transport.isOpen &&
+			this.#hostToolTransportGeneration === fence.transportGeneration &&
+			(this.#hostToolPeerGenerations.get(fence.peerId) ?? 0) === fence.peerGeneration &&
+			this.#ctx.sessionManager.getSessionId() === fence.sessionId &&
+			fence.sessionId === this.#sessionId &&
+			this.#peers.get(fence.peerId)?.canWrite === true
+		);
+	}
+
+	#sendHostToolsSet(peerId: number, frame: Extract<CollabFrame, { t: "host-tools-set" }>): boolean {
+		const socket = this.#socket;
+		if (this.#stopped || !socket?.isOpen) return false;
+		try {
+			return socket.send(frame, peerId);
+		} catch {
+			return false;
+		}
+	}
+
+	#canSendHostToolOwner(owner: HostToolOwner): boolean {
+		return (
+			!this.#stopped &&
+			this.#hostToolOwner === owner &&
+			this.#peers.get(owner.peerId)?.canWrite === true &&
+			this.#socket?.isOpen === true
+		);
+	}
+
+	#sendHostToolRequest(owner: HostToolOwner, frame: RpcHostToolCallRequest | RpcHostToolCancelRequest): void {
+		const socket = this.#socket;
+		if (this.#hostToolOwner !== owner || !this.#peers.get(owner.peerId)?.canWrite) {
+			owner.bridge.close("Collab host tool guest is unavailable");
+			return;
+		}
+		if (this.#stopped || !socket?.isOpen) {
+			this.#invalidateHostTools(owner.peerId, "Collab host tool guest is unavailable");
+			return;
+		}
+		const sent = socket.send(
+			frame.type === "host_tool_call" ? { t: "host-tool-call", frame } : { t: "host-tool-cancel", frame },
+			owner.peerId,
+		);
+		if (!sent) this.#invalidateHostTools(owner.peerId, "Collab host tool guest is unavailable");
+	}
+
+	#handleHostToolUpdate(frame: RpcHostToolUpdate, fromPeer: number): void {
+		const bridge = this.#hostToolReplyBridge(fromPeer);
+		if (bridge) bridge.handleUpdate(frame);
+	}
+
+	#handleHostToolResult(frame: RpcHostToolResult, fromPeer: number): void {
+		const bridge = this.#hostToolReplyBridge(fromPeer);
+		if (bridge) bridge.handleResult(frame);
+	}
+
+	#hostToolReplyBridge(fromPeer: number): RpcHostToolBridge | undefined {
+		if (!this.#peers.get(fromPeer)?.canWrite) {
+			this.#rejectReadOnly("responding to host tools", fromPeer);
+			return undefined;
+		}
+		if (this.#hostToolOwner?.peerId !== fromPeer) {
+			this.#socket?.send({ t: "error", message: "host tool calls belong to another collab guest" }, fromPeer);
+			return undefined;
+		}
+		return this.#hostToolOwner.bridge;
+	}
+
+	#invalidateHostTools(peerId: number | undefined, message: string): void {
+		if (peerId === undefined) {
+			this.#hostToolTransportGeneration++;
+		} else {
+			this.#hostToolPeerGenerations.set(peerId, (this.#hostToolPeerGenerations.get(peerId) ?? 0) + 1);
+		}
+		const owner = this.#hostToolOwner;
+		const needsCleanup =
+			(peerId === undefined
+				? this.#pendingHostToolRegistrations.size > 0
+				: (this.#pendingHostToolRegistrations.get(peerId) ?? 0) > 0) ||
+			(owner !== undefined && (peerId === undefined || owner.peerId === peerId));
+		if (owner && (peerId === undefined || owner.peerId === peerId)) {
+			this.#hostToolOwner = undefined;
+			owner.bridge.close(message);
+		}
+		if (!needsCleanup) return;
+		this.#hostToolMutationTail = this.#hostToolMutationTail
+			.then(async () => {
+				const current = this.#hostToolOwner;
+				if (peerId !== undefined && current && current.peerId !== peerId) return;
+				if (current) {
+					this.#hostToolOwner = undefined;
+					current.bridge.close(message);
+				}
+				await this.#ctx.session.refreshRpcHostTools([]);
+			})
+			.catch(error => logger.warn("collab host tool cleanup failed", { error: String(error) }));
 	}
 
 	#buildState(): CollabSessionState {

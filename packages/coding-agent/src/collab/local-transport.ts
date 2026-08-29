@@ -68,7 +68,14 @@ function isFrameRecord(record: unknown): record is BridgeFrameRecord {
 	return value.t === "frame" && typeof value.frame === "object" && value.frame !== null;
 }
 export function serializeBridgeFrameRecord(frame: CollabFrame, targetPeer = 0): string {
-	const mutation = frame.t === "prompt" || frame.t === "abort" || frame.t === "agent-cmd" || frame.t === "ui-response";
+	const mutation =
+		frame.t === "prompt" ||
+		frame.t === "abort" ||
+		frame.t === "agent-cmd" ||
+		frame.t === "ui-response" ||
+		frame.t === "set-host-tools" ||
+		frame.t === "host-tool-update" ||
+		frame.t === "host-tool-result";
 	const record = `${JSON.stringify({ t: "frame", targetPeer, mutation, frame })}\n`;
 	if (Buffer.byteLength(record) > MAX_LOCAL_BRIDGE_OUTBOUND_RECORD_BYTES)
 		throw new Error("collab bridge record too large");

@@ -396,8 +396,10 @@ export type WireFrame = GuestFrame | HostFrame;
  *   host), so they must be rejected at hello.
  * - `4`: guest prompts may carry a display name, and persisted prompt details
  *   carry the display-name revision used by identity-aware renderers.
+ * - `5`: managed host tools can be registered and executed through an
+ *   authoritative Collab host without bypassing guest ownership.
  */
-export const COLLAB_PROTO = 4;
+export const COLLAB_PROTO = 5;
 
 /** Parameter key used for intent tracing (e.g. prompt explanation/reasoning) */
 export const INTENT_FIELD = "i";

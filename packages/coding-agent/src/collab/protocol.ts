@@ -25,6 +25,13 @@ import {
 	WRITE_TOKEN_BYTES,
 } from "@oh-my-pi/pi-wire";
 import type { ContextUsage } from "../extensibility/extensions/types";
+import type {
+	RpcHostToolCallRequest,
+	RpcHostToolCancelRequest,
+	RpcHostToolDefinition,
+	RpcHostToolResult,
+	RpcHostToolUpdate,
+} from "../modes/rpc/rpc-types";
 import type { AgentSessionEvent } from "../session/agent-session";
 import type { SessionEntry, SessionHeader } from "../session/session-entries";
 
@@ -68,6 +75,9 @@ export type CollabSessionState = SessionState & {
 export type CollabFrame =
 	| Exclude<GuestFrame, { t: "prompt" }>
 	| { t: "prompt"; text: string; images?: ImageContent[]; streamingBehavior?: "steer" | "followUp" }
+	| { t: "set-host-tools"; reqId: number; tools: RpcHostToolDefinition[] }
+	| { t: "host-tool-update"; frame: RpcHostToolUpdate }
+	| { t: "host-tool-result"; frame: RpcHostToolResult }
 	// host -> guest
 	| {
 			t: "welcome";
@@ -103,6 +113,9 @@ export type CollabFrame =
 	| { t: "agents"; agents: AgentSnapshot[] }
 	| { t: "ui-request"; request: CollabUiRequest }
 	| { t: "ui-request-end"; reqId: number }
+	| { t: "host-tools-set"; reqId: number; toolNames?: string[]; error?: string }
+	| { t: "host-tool-call"; frame: RpcHostToolCallRequest }
+	| { t: "host-tool-cancel"; frame: RpcHostToolCancelRequest }
 	/** Targeted reply to fetch-transcript; `error` marks a terminal read failure that guests must surface without hot retrying. */
 	| { t: "transcript"; reqId: number; text: string; newSize: number; error?: string }
 	| { t: "authority"; canWrite: boolean }

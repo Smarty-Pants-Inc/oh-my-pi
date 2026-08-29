@@ -2,6 +2,8 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentEvent } from "@oh-my-pi/pi-agent-core";
+import { serializeBridgeFrameRecord } from "@oh-my-pi/pi-coding-agent/collab/local-transport";
+import { MAX_LOCAL_BRIDGE_OUTBOUND_RECORD_BYTES } from "@oh-my-pi/pi-coding-agent/collab/protocol";
 import { defineRpcClientTool, RpcClient } from "@oh-my-pi/pi-coding-agent/modes";
 import { RpcHostToolBridge } from "@oh-my-pi/pi-coding-agent/modes/rpc/host-tools";
 import type {
@@ -111,6 +113,27 @@ describe("RpcHostToolBridge", () => {
 			targetId: request.id,
 		});
 		await expect(execution).rejects.toThrow('Host tool "host_wait" was aborted');
+	});
+
+	it("rejects and rolls back a host tool call when transport serialization throws", async () => {
+		const frames: Array<RpcHostToolCallRequest | RpcHostToolCancelRequest> = [];
+		const bridge = new RpcHostToolBridge(frame => {
+			serializeBridgeFrameRecord({ t: "host-tool-call", frame: frame as RpcHostToolCallRequest });
+			frames.push(frame);
+		});
+		const [tool] = bridge.setTools([
+			{
+				name: "host_oversized",
+				description: "Returns oversized arguments",
+				parameters: { type: "object" },
+			},
+		]);
+
+		await expect(
+			tool.execute("toolu_oversized", { value: "x".repeat(MAX_LOCAL_BRIDGE_OUTBOUND_RECORD_BYTES) }),
+		).rejects.toThrow("collab bridge record too large");
+		bridge.close("closed", true);
+		expect(frames).toEqual([]);
 	});
 });
 

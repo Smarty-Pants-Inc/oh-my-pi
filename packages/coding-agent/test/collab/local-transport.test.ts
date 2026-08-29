@@ -8,6 +8,7 @@ import {
 } from "../../src/collab/local-transport";
 import {
 	COLLAB_PROTO,
+	type CollabFrame,
 	MAX_LOCAL_BRIDGE_INBOUND_RECORD_BYTES,
 	MAX_LOCAL_BRIDGE_OUTBOUND_RECORD_BYTES,
 } from "../../src/collab/protocol";
@@ -67,6 +68,36 @@ describe("NdjsonRecordParser", () => {
 		expect(Buffer.byteLength(record)).toBeGreaterThan(1024 * 1024);
 		expect(Buffer.byteLength(record)).toBeLessThanOrEqual(MAX_LOCAL_BRIDGE_OUTBOUND_RECORD_BYTES);
 		expect(new NdjsonRecordParser().push(record)).toEqual([{ t: "frame", targetPeer: 0, mutation: true, frame }]);
+	});
+
+	it("marks guest host-tool registration and replies as controller mutations", () => {
+		const frames: CollabFrame[] = [
+			{
+				t: "set-host-tools",
+				reqId: 1,
+				tools: [{ name: "managed", description: "Managed tool", parameters: { type: "object" } }],
+			},
+			{
+				t: "host-tool-update",
+				frame: {
+					type: "host_tool_update",
+					id: "call-1",
+					partialResult: { content: [{ type: "text", text: "working" }] },
+				},
+			},
+			{
+				t: "host-tool-result",
+				frame: {
+					type: "host_tool_result",
+					id: "call-1",
+					result: { content: [{ type: "text", text: "done" }] },
+				},
+			},
+		];
+
+		expect(
+			frames.map(frame => (JSON.parse(serializeBridgeFrameRecord(frame)) as { mutation: boolean }).mutation),
+		).toEqual([true, true, true]);
 	});
 
 	it("accepts a near-limit outbound prompt after Herdr adds inbound metadata", () => {

@@ -38,6 +38,27 @@ export function isRpcHostToolUpdate(value: unknown): value is RpcHostToolUpdate 
 	return frame.type === "host_tool_update" && typeof frame.id === "string" && isAgentToolResult(frame.partialResult);
 }
 
+export function normalizeHostToolDefinitions(tools: RpcHostToolDefinition[]): RpcHostToolDefinition[] {
+	return tools.map((tool, index) => {
+		const name = typeof tool.name === "string" ? tool.name.trim() : "";
+		if (!name) throw new Error(`Host tool at index ${index} must provide a non-empty name`);
+		const description = typeof tool.description === "string" ? tool.description.trim() : "";
+		if (!description) throw new Error(`Host tool "${name}" must provide a non-empty description`);
+		if (!tool.parameters || typeof tool.parameters !== "object" || Array.isArray(tool.parameters)) {
+			throw new Error(`Host tool "${name}" must provide a JSON Schema object`);
+		}
+		const label = typeof tool.label === "string" && tool.label.trim() ? tool.label.trim() : name;
+		return {
+			name,
+			label,
+			description,
+			parameters: tool.parameters,
+			hidden: tool.hidden === true,
+			loadMode: defaultLoadModeForToolName(name, tool.loadMode),
+		};
+	});
+}
+
 class RpcHostToolAdapter<TParams extends TSchema = TSchema, TTheme extends Theme = Theme>
 	implements AgentTool<TParams, unknown, TTheme>
 {
@@ -172,13 +193,17 @@ export class RpcHostToolBridge {
 			onUpdate,
 		});
 
-		this.#output({
-			type: "host_tool_call",
-			id,
-			toolCallId,
-			toolName: definition.name,
-			arguments: args,
-		});
+		try {
+			this.#output({
+				type: "host_tool_call",
+				id,
+				toolCallId,
+				toolName: definition.name,
+				arguments: args,
+			});
+		} catch (error) {
+			this.#pendingCalls.get(id)?.reject(error instanceof Error ? error : new Error(String(error)));
+		}
 
 		return promise;
 	}
@@ -193,11 +218,18 @@ export class RpcHostToolBridge {
 	}
 
 	/** Reject active and future host tool requests after the RPC client disconnects. */
-	close(message: string): void {
+	close(message: string, cancelPending = false): void {
 		if (!this.#closedError) this.#closedError = new Error(message);
-		const pendingCalls = Array.from(this.#pendingCalls.values());
+		const pendingCalls = Array.from(this.#pendingCalls.entries());
 		this.#pendingCalls.clear();
-		for (const pending of pendingCalls) {
+		if (cancelPending) {
+			for (const [targetId] of pendingCalls) {
+				try {
+					this.#output({ type: "host_tool_cancel", id: Snowflake.next() as string, targetId });
+				} catch {}
+			}
+		}
+		for (const [, pending] of pendingCalls) {
 			pending.reject(this.#closedError);
 		}
 	}

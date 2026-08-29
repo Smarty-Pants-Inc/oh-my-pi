@@ -2,7 +2,13 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { COLLAB_PROTO, type CollabFrame, type CollabSessionState } from "../src/collab/protocol";
+import { serializeBridgeFrameRecord } from "../src/collab/local-transport";
+import {
+	COLLAB_PROTO,
+	type CollabFrame,
+	type CollabSessionState,
+	MAX_LOCAL_BRIDGE_OUTBOUND_RECORD_BYTES,
+} from "../src/collab/protocol";
 import type { CollabTransport, CollabTransportControl } from "../src/collab/relay-client";
 import { CollabRpcGuest } from "../src/collab/rpc-guest";
 import { MAX_RPC_FRAME_BYTES, RpcFrameDecoder } from "../src/modes/rpc/rpc-frame";
@@ -10,6 +16,9 @@ import type {
 	RpcChunkFrame,
 	RpcCollabAuthorityUpdateFrame,
 	RpcCollabStateUpdateFrame,
+	RpcHostToolCallRequest,
+	RpcHostToolCancelRequest,
+	RpcHostToolResult,
 } from "../src/modes/rpc/rpc-types";
 import type { SessionEntry, SessionHeader } from "../src/session/session-entries";
 
@@ -58,22 +67,26 @@ class TestTransport implements CollabTransport {
 	onClose?: (reason: string, willReconnect: boolean) => void;
 	isOpen = true;
 	authorityResult = true;
+	enforceBridgeLimit = false;
+	rejectHostToolResults = false;
 	readonly sent: CollabFrame[] = [];
 	readonly authorityActions: Array<"request" | "release"> = [];
-	#sentWaiters: Array<{ guard: FrameGuard<CollabFrame>; resolve: (frame: CollabFrame) => void }> = [];
+	#sentWaiters: Array<{ guard: (frame: CollabFrame) => boolean; resolve: (frame: CollabFrame) => void }> = [];
 
 	connect(): void {
 		this.onOpen?.();
 	}
 	send(frame: CollabFrame): boolean {
+		if (this.enforceBridgeLimit) serializeBridgeFrameRecord(frame);
+		if (!this.isOpen || (this.rejectHostToolResults && frame.t === "host-tool-result")) return false;
 		this.sent.push(frame);
-		const remaining: Array<{ guard: FrameGuard<CollabFrame>; resolve: (frame: CollabFrame) => void }> = [];
+		const remaining: Array<{ guard: (frame: CollabFrame) => boolean; resolve: (frame: CollabFrame) => void }> = [];
 		for (const waiter of this.#sentWaiters) {
 			if (waiter.guard(frame)) waiter.resolve(frame);
 			else remaining.push(waiter);
 		}
 		this.#sentWaiters = remaining;
-		return this.isOpen;
+		return true;
 	}
 
 	requestAuthority(action: "request" | "release"): boolean {
@@ -81,7 +94,7 @@ class TestTransport implements CollabTransport {
 		return this.isOpen && this.authorityResult;
 	}
 
-	waitForSent<T extends CollabFrame>(guard: FrameGuard<T>): Promise<T> {
+	waitForSent<T extends CollabFrame>(guard: (frame: CollabFrame) => frame is T): Promise<T> {
 		const existing = this.sent.find(guard);
 		if (existing) return Promise.resolve(existing);
 		const { promise, resolve } = Promise.withResolvers<T>();
@@ -191,6 +204,16 @@ function isCollabAuthorityUpdate(frame: object, canWrite?: boolean): frame is Rp
 
 function isRpcChunk(frame: object): frame is RpcChunkFrame {
 	return "type" in frame && frame.type === "rpc_chunk";
+}
+
+function isHostToolCall(id: string): (frame: object) => frame is RpcHostToolCallRequest {
+	return (frame): frame is RpcHostToolCallRequest =>
+		"type" in frame && frame.type === "host_tool_call" && "id" in frame && frame.id === id;
+}
+
+function isHostToolCancel(targetId: string): (frame: object) => frame is RpcHostToolCancelRequest {
+	return (frame): frame is RpcHostToolCancelRequest =>
+		"type" in frame && frame.type === "host_tool_cancel" && "targetId" in frame && frame.targetId === targetId;
 }
 
 function createGuest(): GuestFixture {
@@ -456,6 +479,195 @@ describe("headless Collab RPC guest", () => {
 		expect(await frames.waitFor(isResponse("release_control", "release"))).toMatchObject({ success: true });
 		expect(transport.authorityActions).toEqual(["request", "release"]);
 		input.close();
+		await running;
+	});
+
+	it("registers managed tools and relays calls, updates, results, and cancellation through Collab", async () => {
+		const { transport, input, frames, running } = await startGuest();
+		const tools = [{ name: "managed", description: "Managed host tool", parameters: { type: "object" } }];
+		input.send({ id: "tools", type: "set_host_tools", tools });
+		const registration = await transport.waitForSent(
+			(frame): frame is Extract<CollabFrame, { t: "set-host-tools" }> =>
+				"t" in frame && frame.t === "set-host-tools",
+		);
+		expect(registration.tools).toEqual(tools);
+		transport.deliver({ t: "host-tools-set", reqId: registration.reqId, toolNames: ["managed"] });
+		expect(await frames.waitFor(isResponse("set_host_tools", "tools"))).toMatchObject({
+			success: true,
+			data: { toolNames: ["managed"] },
+		});
+
+		const call: RpcHostToolCallRequest = {
+			type: "host_tool_call",
+			id: "call-1",
+			toolCallId: "toolu-1",
+			toolName: "managed",
+			arguments: { value: 1 },
+		};
+		transport.deliver({ t: "host-tool-call", frame: call });
+		expect(await frames.waitFor(isHostToolCall(call.id))).toEqual(call);
+
+		input.send({
+			type: "host_tool_update",
+			id: call.id,
+			partialResult: { content: [{ type: "text", text: "working" }] },
+		});
+		expect(
+			await transport.waitForSent(
+				(frame): frame is Extract<CollabFrame, { t: "host-tool-update" }> =>
+					"t" in frame && frame.t === "host-tool-update",
+			),
+		).toMatchObject({ frame: { type: "host_tool_update", id: call.id } });
+
+		input.send({
+			type: "host_tool_result",
+			id: call.id,
+			result: { content: [{ type: "text", text: "done" }] },
+		});
+		expect(
+			await transport.waitForSent(
+				(frame): frame is Extract<CollabFrame, { t: "host-tool-result" }> =>
+					"t" in frame && frame.t === "host-tool-result",
+			),
+		).toMatchObject({ frame: { type: "host_tool_result", id: call.id } });
+
+		const cancelledCall = { ...call, id: "call-2", toolCallId: "toolu-2" };
+		transport.deliver({ t: "host-tool-call", frame: cancelledCall });
+		await frames.waitFor(isHostToolCall(cancelledCall.id));
+		transport.deliver({
+			t: "host-tool-cancel",
+			frame: { type: "host_tool_cancel", id: "cancel-2", targetId: cancelledCall.id },
+		});
+		expect(await frames.waitFor(isHostToolCancel(cancelledCall.id))).toMatchObject({ targetId: cancelledCall.id });
+
+		const replacedCall = { ...call, id: "call-3", toolCallId: "toolu-3" };
+		transport.deliver({ t: "host-tool-call", frame: replacedCall });
+		await frames.waitFor(isHostToolCall(replacedCall.id));
+		transport.deliver({ t: "authority", canWrite: false });
+		expect(await frames.waitFor(isHostToolCancel(replacedCall.id))).toMatchObject({ targetId: replacedCall.id });
+
+		input.close();
+		await running;
+	});
+
+	it("does not let an observer register tools or relay another guest's result", async () => {
+		const { transport, input, frames, running } = await startGuest(true);
+		input.send({
+			id: "tools",
+			type: "set_host_tools",
+			tools: [{ name: "blocked", description: "Blocked", parameters: { type: "object" } }],
+		});
+		expect(await frames.waitFor(isResponse("set_host_tools", "tools"))).toMatchObject({
+			success: false,
+			code: "collab_read_only",
+		});
+		input.send({
+			type: "host_tool_result",
+			id: "another-guests-call",
+			result: { content: [{ type: "text", text: "spoofed" }] },
+		});
+		input.send({ id: "state", type: "get_state" });
+		await frames.waitFor(isResponse("get_state", "state"));
+		expect(transport.sent.filter(frame => frame.t === "set-host-tools" || frame.t === "host-tool-result")).toEqual(
+			[],
+		);
+
+		input.close();
+		await running;
+	});
+
+	it("drops an oversized host-tool update without terminating the guest or final call", async () => {
+		const { transport, input, frames, running } = await startGuest();
+		transport.enforceBridgeLimit = true;
+		const call: RpcHostToolCallRequest = {
+			type: "host_tool_call",
+			id: "oversized-update",
+			toolCallId: "toolu-oversized-update",
+			toolName: "managed",
+			arguments: {},
+		};
+		transport.deliver({ t: "host-tool-call", frame: call });
+		await frames.waitFor(isHostToolCall(call.id));
+
+		input.send({
+			type: "host_tool_update",
+			id: call.id,
+			partialResult: {
+				content: [{ type: "text", text: "x".repeat(MAX_LOCAL_BRIDGE_OUTBOUND_RECORD_BYTES) }],
+			},
+		});
+		input.send({ id: "still-running", type: "get_state" });
+		await frames.waitFor(isResponse("get_state", "still-running"));
+		expect(transport.sent.filter(frame => frame.t === "host-tool-update")).toEqual([]);
+
+		input.send({
+			type: "host_tool_result",
+			id: call.id,
+			result: { content: [{ type: "text", text: "done" }] },
+		});
+		expect(
+			await transport.waitForSent(
+				(frame): frame is Extract<CollabFrame, { t: "host-tool-result" }> =>
+					frame.t === "host-tool-result" && frame.frame.id === call.id,
+			),
+		).toMatchObject({ frame: { result: { content: [{ type: "text", text: "done" }] } } });
+
+		input.close();
+		await running;
+	});
+
+	it("falls back for an oversized final result and retains the call if fallback delivery fails", async () => {
+		const { transport, input, frames, running } = await startGuest();
+		transport.enforceBridgeLimit = true;
+		const call: RpcHostToolCallRequest = {
+			type: "host_tool_call",
+			id: "oversized-result",
+			toolCallId: "toolu-oversized-result",
+			toolName: "managed",
+			arguments: {},
+		};
+		transport.deliver({ t: "host-tool-call", frame: call });
+		await frames.waitFor(isHostToolCall(call.id));
+		input.send({
+			type: "host_tool_result",
+			id: call.id,
+			result: { content: [{ type: "text", text: "x".repeat(MAX_LOCAL_BRIDGE_OUTBOUND_RECORD_BYTES) }] },
+		});
+		const fallback = await transport.waitForSent(
+			(frame): frame is Extract<CollabFrame, { t: "host-tool-result" }> =>
+				frame.t === "host-tool-result" && frame.frame.id === call.id,
+		);
+		expect(fallback.frame).toEqual({
+			type: "host_tool_result",
+			id: call.id,
+			result: { content: [{ type: "text", text: "Host tool result could not be delivered over Collab" }] },
+			isError: true,
+		} satisfies RpcHostToolResult);
+
+		input.send({
+			type: "host_tool_result",
+			id: call.id,
+			result: { content: [{ type: "text", text: "duplicate" }] },
+		});
+		input.send({ id: "fallback-complete", type: "get_state" });
+		await frames.waitFor(isResponse("get_state", "fallback-complete"));
+		expect(transport.sent.filter(frame => frame.t === "host-tool-result" && frame.frame.id === call.id)).toHaveLength(
+			1,
+		);
+
+		const retainedCall = { ...call, id: "fallback-undeliverable", toolCallId: "toolu-fallback-undeliverable" };
+		transport.deliver({ t: "host-tool-call", frame: retainedCall });
+		await frames.waitFor(isHostToolCall(retainedCall.id));
+		transport.rejectHostToolResults = true;
+		input.send({
+			type: "host_tool_result",
+			id: retainedCall.id,
+			result: { content: [{ type: "text", text: "x".repeat(MAX_LOCAL_BRIDGE_OUTBOUND_RECORD_BYTES) }] },
+		});
+		input.send({ id: "fallback-failed", type: "get_state" });
+		await frames.waitFor(isResponse("get_state", "fallback-failed"));
+		transport.disconnect();
+		expect(await frames.waitFor(isHostToolCancel(retainedCall.id))).toMatchObject({ targetId: retainedCall.id });
 		await running;
 	});
 

@@ -30,11 +30,15 @@ import type { AgentSession } from "../../session/agent-session";
 import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
 import { executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins";
 import { buildAvailableSlashCommands } from "../../slash-commands/available-commands";
-import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import type { EventBus } from "../../utils/event-bus";
 import { calculateTokensPerSecond } from "../../utils/token-rate";
 import { initializeExtensions } from "../runtime-init";
-import { isRpcHostToolResult, isRpcHostToolUpdate, RpcHostToolBridge } from "./host-tools";
+import {
+	isRpcHostToolResult,
+	isRpcHostToolUpdate,
+	normalizeHostToolDefinitions,
+	RpcHostToolBridge,
+} from "./host-tools";
 import { isRpcHostUriResult, RpcHostUriBridge } from "./host-uris";
 import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameEncoder } from "./rpc-frame";
 import { claimRpcInput, readRpcInputFrames } from "./rpc-input";
@@ -47,7 +51,6 @@ import type {
 	RpcExtensionUISelectOptionDetail,
 	RpcHostToolCallRequest,
 	RpcHostToolCancelRequest,
-	RpcHostToolDefinition,
 	RpcHostToolResult,
 	RpcHostToolUpdate,
 	RpcHostUriCancelRequest,
@@ -492,31 +495,6 @@ export async function handleRpcSessionChange(
 		}
 	}
 	throw new Error("Unsupported RPC session change command");
-}
-
-function normalizeHostToolDefinitions(tools: RpcHostToolDefinition[]): RpcHostToolDefinition[] {
-	return tools.map((tool, index) => {
-		const name = typeof tool.name === "string" ? tool.name.trim() : "";
-		if (!name) {
-			throw new Error(`Host tool at index ${index} must provide a non-empty name`);
-		}
-		const description = typeof tool.description === "string" ? tool.description.trim() : "";
-		if (!description) {
-			throw new Error(`Host tool "${name}" must provide a non-empty description`);
-		}
-		if (!tool.parameters || typeof tool.parameters !== "object" || Array.isArray(tool.parameters)) {
-			throw new Error(`Host tool "${name}" must provide a JSON Schema object`);
-		}
-		const label = typeof tool.label === "string" && tool.label.trim() ? tool.label.trim() : name;
-		return {
-			name,
-			label,
-			description,
-			parameters: tool.parameters,
-			hidden: tool.hidden === true,
-			loadMode: defaultLoadModeForToolName(name, tool.loadMode),
-		};
-	});
 }
 
 function parseValueDialogResponse(

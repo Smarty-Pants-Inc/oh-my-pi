@@ -2,6 +2,7 @@ import { once } from "node:events";
 import * as os from "node:os";
 import type { AgentMessage, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { isRecord } from "@oh-my-pi/pi-utils";
+import { isRpcHostToolResult, isRpcHostToolUpdate } from "../modes/rpc/host-tools";
 import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameEncoder } from "../modes/rpc/rpc-frame";
 import { readRpcInputFrames } from "../modes/rpc/rpc-input";
 import { pageRpcMessages, RPC_MESSAGES_PAGE_BUSY_ERROR, RpcMessagesPageError } from "../modes/rpc/rpc-messages";
@@ -10,6 +11,10 @@ import type {
 	RpcCommand,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
+	RpcHostToolCancelRequest,
+	RpcHostToolDefinition,
+	RpcHostToolResult,
+	RpcHostToolUpdate,
 	RpcResponse,
 	RpcSessionState,
 } from "../modes/rpc/rpc-types";
@@ -157,6 +162,13 @@ export class CollabRpcGuest {
 	#isReady = false;
 	#ended = Promise.withResolvers<void>();
 	#pendingUi = new Map<string, number>();
+	#hostToolReqSeq = 0;
+	#hostToolCancelSeq = 0;
+	#pendingHostToolRegistrations = new Map<
+		number,
+		{ id: string | undefined; resolve: (response: RpcResponse) => void }
+	>();
+	#activeHostToolCalls = new Set<string>();
 	#commandTail: Promise<void> = Promise.resolve();
 
 	#acceptingLiveFrames = false;
@@ -255,7 +267,11 @@ export class CollabRpcGuest {
 				return;
 			case "authority":
 				this.#canWrite = frame.canWrite;
-				if (!this.#canWrite) this.#cancelPendingUi();
+				if (!this.#canWrite) {
+					this.#cancelPendingUi();
+					this.#cancelPendingHostToolRegistrations("Collab control is required", "collab_read_only");
+					this.#cancelActiveHostToolCalls();
+				}
 				this.#emitRpcFrame({ type: "collab_authority_update", canWrite: frame.canWrite });
 				return;
 			case "ui-request":
@@ -263,6 +279,18 @@ export class CollabRpcGuest {
 				return;
 			case "ui-request-end":
 				this.#endUiRequest(frame.reqId);
+				return;
+			case "host-tools-set":
+				this.#handleHostToolsSet(frame.reqId, frame.toolNames, frame.error);
+				return;
+			case "host-tool-call":
+				if (!this.#canWrite) return;
+				this.#activeHostToolCalls.add(frame.frame.id);
+				this.#output.send(frame.frame);
+				return;
+			case "host-tool-cancel":
+				if (!this.#activeHostToolCalls.delete(frame.frame.targetId)) return;
+				this.#output.send(frame.frame);
 				return;
 			case "bye":
 				this.#finish(frame.reason);
@@ -294,10 +322,20 @@ export class CollabRpcGuest {
 	#finish(reason: string): void {
 		if (!this.#isReady) this.#ready.reject(new Error(reason));
 		this.#cancelPendingUi();
+		this.#cancelPendingHostToolRegistrations(reason);
+		this.#cancelActiveHostToolCalls();
 		this.#ended.resolve();
 	}
 
 	#onInput(frame: unknown): void {
+		if (isRpcHostToolUpdate(frame)) {
+			this.#relayHostToolUpdate(frame);
+			return;
+		}
+		if (isRpcHostToolResult(frame)) {
+			this.#relayHostToolResult(frame);
+			return;
+		}
 		if (isRecord(frame) && frame.type === "extension_ui_response" && typeof frame.id === "string") {
 			this.#respondToUi(frame as RpcExtensionUIResponse);
 			return;
@@ -364,6 +402,10 @@ export class CollabRpcGuest {
 			case "abort":
 				if (!this.#canWrite) return errorResponse(id, "abort", "Collab control is required", "collab_read_only");
 				return this.#sendMutation(id, "abort", { t: "abort" });
+			case "set_host_tools":
+				if (!this.#canWrite)
+					return errorResponse(id, "set_host_tools", "Collab control is required", "collab_read_only");
+				return this.#setHostTools(id, command.tools);
 			case "request_control":
 				return this.#requestAuthority(id, "request_control", "request");
 			case "release_control":
@@ -404,6 +446,78 @@ export class CollabRpcGuest {
 		} catch (error) {
 			return errorResponse(id, command, error instanceof Error ? error.message : String(error));
 		}
+	}
+
+	#setHostTools(id: string | undefined, tools: RpcHostToolDefinition[]): Promise<RpcResponse> {
+		const reqId = ++this.#hostToolReqSeq;
+		const { promise, resolve } = Promise.withResolvers<RpcResponse>();
+		this.#pendingHostToolRegistrations.set(reqId, { id, resolve });
+		try {
+			if (this.#transport.send({ t: "set-host-tools", reqId, tools })) return promise;
+		} catch (error) {
+			this.#pendingHostToolRegistrations.delete(reqId);
+			return Promise.resolve(
+				errorResponse(id, "set_host_tools", error instanceof Error ? error.message : String(error)),
+			);
+		}
+		this.#pendingHostToolRegistrations.delete(reqId);
+		return Promise.resolve(errorResponse(id, "set_host_tools", "Collab transport is unavailable"));
+	}
+
+	#handleHostToolsSet(reqId: number, toolNames: string[] | undefined, error: string | undefined): void {
+		const pending = this.#pendingHostToolRegistrations.get(reqId);
+		if (!pending) return;
+		this.#pendingHostToolRegistrations.delete(reqId);
+		pending.resolve(
+			error
+				? errorResponse(pending.id, "set_host_tools", error)
+				: successResponse(pending.id, "set_host_tools", { toolNames: toolNames ?? [] }),
+		);
+	}
+
+	#cancelPendingHostToolRegistrations(message: string, code?: string): void {
+		for (const pending of this.#pendingHostToolRegistrations.values()) {
+			pending.resolve(errorResponse(pending.id, "set_host_tools", message, code));
+		}
+		this.#pendingHostToolRegistrations.clear();
+	}
+
+	#relayHostToolUpdate(frame: RpcHostToolUpdate): void {
+		if (!this.#canWrite || !this.#activeHostToolCalls.has(frame.id)) return;
+		try {
+			this.#transport.send({ t: "host-tool-update", frame });
+		} catch {}
+	}
+
+	#relayHostToolResult(frame: RpcHostToolResult): void {
+		if (!this.#canWrite || !this.#activeHostToolCalls.has(frame.id)) return;
+		try {
+			if (!this.#transport.send({ t: "host-tool-result", frame })) return;
+		} catch {
+			const fallback: RpcHostToolResult = {
+				type: "host_tool_result",
+				id: frame.id,
+				result: { content: [{ type: "text", text: "Host tool result could not be delivered over Collab" }] },
+				isError: true,
+			};
+			try {
+				if (!this.#transport.send({ t: "host-tool-result", frame: fallback })) return;
+			} catch {
+				return;
+			}
+		}
+		this.#activeHostToolCalls.delete(frame.id);
+	}
+
+	#cancelActiveHostToolCalls(): void {
+		for (const targetId of this.#activeHostToolCalls) {
+			this.#output.send({
+				type: "host_tool_cancel",
+				id: `collab-host-tool-cancel-${++this.#hostToolCancelSeq}`,
+				targetId,
+			} satisfies RpcHostToolCancelRequest);
+		}
+		this.#activeHostToolCalls.clear();
 	}
 
 	#rpcState(): RpcSessionState {
