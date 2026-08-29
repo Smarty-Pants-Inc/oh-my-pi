@@ -179,7 +179,8 @@ function isInboundGuestFrame(frame: unknown): frame is InboundGuestFrame {
 			return (
 				typeof value.text === "string" &&
 				(value.displayName === undefined || typeof value.displayName === "string") &&
-				(value.images === undefined || Array.isArray(value.images))
+				(value.images === undefined || Array.isArray(value.images)) &&
+				(value.requestId === undefined || typeof value.requestId === "string")
 			);
 		case "abort":
 			return true;
@@ -549,6 +550,8 @@ export class CollabHost {
 					},
 					fromPeer,
 				);
+			} else if (frame.t === "prompt") {
+				this.#sendPromptError(frame.requestId, "private collab route is rearming for a session switch", fromPeer);
 			} else {
 				this.#socket?.send(
 					{ t: "error", message: "private collab route is rearming for a session switch" },
@@ -566,6 +569,7 @@ export class CollabHost {
 					frame.text,
 					frame.images,
 					frame.streamingBehavior,
+					frame.requestId,
 					metadata?.displayName,
 					metadata?.displayNameRevision,
 					fromPeer,
@@ -709,13 +713,14 @@ export class CollabHost {
 		text: string,
 		images: ImageContent[] | undefined,
 		streamingBehavior: "steer" | "followUp" | undefined,
+		requestId: string | undefined,
 		displayName: string | undefined,
 		displayNameRevision: number | undefined,
 		fromPeer: number,
 	): void {
 		const peer = this.#peers.get(fromPeer);
 		if (!peer?.canWrite) {
-			this.#rejectReadOnly("prompting", fromPeer);
+			this.#sendPromptError(requestId, "prompting is disabled on a read-only link", fromPeer);
 			return;
 		}
 		if (
@@ -724,8 +729,9 @@ export class CollabHost {
 				!isValidHerdrDisplayName(displayName) ||
 				!isValidHerdrDisplayNameRevision(displayNameRevision))
 		) {
-			this.#socket?.send(
-				{ t: "error", message: "trusted local prompt is missing valid attribution or display name revision" },
+			this.#sendPromptError(
+				requestId,
+				"trusted local prompt is missing valid attribution or display name revision",
 				fromPeer,
 			);
 			return;
@@ -758,8 +764,15 @@ export class CollabHost {
 			)
 			.catch(err => {
 				logger.warn("collab guest prompt failed", { error: String(err) });
-				this.#socket?.send({ t: "error", message: `prompt failed: ${String(err)}` }, fromPeer);
+				this.#sendPromptError(requestId, `prompt failed: ${String(err)}`, fromPeer);
 			});
+	}
+
+	#sendPromptError(requestId: string | undefined, message: string, fromPeer: number): void {
+		this.#socket?.send(
+			requestId === undefined ? { t: "error", message } : { t: "prompt-error", requestId, message },
+			fromPeer,
+		);
 	}
 
 	#handleAbort(fromPeer: number): void {

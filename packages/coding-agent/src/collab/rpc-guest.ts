@@ -295,6 +295,9 @@ export class CollabRpcGuest {
 			case "bye":
 				this.#finish(frame.reason);
 				return;
+			case "prompt-error":
+				this.#output.send(errorResponse(frame.requestId, "prompt", frame.message));
+				return;
 			case "error":
 				if (!this.#header) this.#finish(frame.message);
 				else this.#output.send({ type: "notice", level: "error", message: frame.message, source: "collab" });
@@ -396,6 +399,7 @@ export class CollabRpcGuest {
 						text: command.message,
 						images: command.images,
 						streamingBehavior: command.streamingBehavior,
+						requestId: id,
 					},
 					{ agentInvoked: true },
 				);

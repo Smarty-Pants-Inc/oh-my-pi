@@ -465,6 +465,16 @@ describe("headless Collab RPC guest", () => {
 			text: "granted",
 			images: undefined,
 			streamingBehavior: "followUp",
+			requestId: "prompt",
+		});
+		transport.deliver({ t: "prompt-error", requestId: "prompt", message: "prompt failed: rejected" });
+		expect(
+			await frames.waitFor(
+				(frame): frame is object => isResponse("prompt", "prompt")(frame) && frame.success === false,
+			),
+		).toMatchObject({
+			success: false,
+			error: "prompt failed: rejected",
 		});
 
 		input.send({ id: "abort", type: "abort" });

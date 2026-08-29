@@ -27,6 +27,7 @@ function makeHostContext(
 	options?: {
 		getSessionId?: () => string;
 		notices?: NoticeRecord[];
+		promptError?: Error;
 		onAbort?: () => void;
 		onRefreshRpcHostTools?: (tools: AgentTool[]) => void | Promise<void>;
 	},
@@ -60,10 +61,10 @@ function makeHostContext(
 			emitNotice: (level: NoticeRecord["level"], message: string, source?: string) => {
 				options?.notices?.push({ level, message, source });
 			},
-			promptCustomMessage: (message: { content: unknown; details?: unknown }, options: unknown) => {
-				prompts.push({ content: message.content, details: message.details, options });
+			promptCustomMessage: (message: { content: unknown; details?: unknown }, promptOptions: unknown) => {
+				prompts.push({ content: message.content, details: message.details, options: promptOptions });
 				onPrompt?.();
-				return Promise.resolve();
+				return options?.promptError ? Promise.reject(options.promptError) : Promise.resolve();
 			},
 			abort: () => {
 				options?.onAbort?.();
@@ -726,6 +727,26 @@ describe("injected collab transport", () => {
 		}
 	});
 
+	it("correlates asynchronous host prompt failures to the originating RPC request", async () => {
+		const router = new InMemoryCollabRouter();
+		const listener: { current?: (event: AgentSessionEvent) => void } = {};
+		const host = new CollabHost(makeHostContext([], listener, undefined, { promptError: new Error("rejected") }));
+		await host.startWithTransport(router.host(), { trustedLocal: true });
+		const controller = router.guest();
+		router.setAuthority(controller.peerId, true);
+		const frames = connectRawPeer(controller, "controller");
+		await flush();
+
+		controller.send({ t: "prompt", text: "fail", requestId: "rpc-prompt-failure" });
+		await flush();
+		expect(framesOf(frames, "prompt-error").at(-1)).toEqual({
+			t: "prompt-error",
+			requestId: "rpc-prompt-failure",
+			message: "prompt failed: Error: rejected",
+		});
+		await host.stop("test cleanup");
+	});
+
 	it("persists the trusted Herdr display name revision only with valid attribution", async () => {
 		const router = new InMemoryCollabRouter();
 		const prompts: { content: unknown; details?: unknown; options?: unknown }[] = [];
@@ -738,7 +759,7 @@ describe("injected collab transport", () => {
 		const observer = router.guest();
 		router.setAuthority(controller.peerId, true);
 		router.setAuthority(observer.peerId, false);
-		connectRawPeer(controller, "untrusted hello name");
+		const controllerFrames = connectRawPeer(controller, "untrusted hello name");
 		connectRawPeer(observer, "observer");
 		await flush();
 		const image = { type: "image", data: "aW1hZ2U=", mimeType: "image/png" } as const;
@@ -754,7 +775,9 @@ describe("injected collab transport", () => {
 			details: { from: "Alice", displayNameRevision: 2 },
 			options: { queueChipText: "[Alice] says: [Alice] says: raw" },
 		});
-		local.onFrame?.({ t: "prompt", text: "missing revision" }, controller.peerId, { displayName: "Alice" });
+		local.onFrame?.({ t: "prompt", text: "missing revision", requestId: "rpc-prompt-1" }, controller.peerId, {
+			displayName: "Alice",
+		});
 		local.onFrame?.({ t: "prompt", text: "invalid revision" }, controller.peerId, {
 			displayName: "Alice",
 			displayNameRevision: 0,
@@ -768,6 +791,11 @@ describe("injected collab transport", () => {
 			displayNameRevision: 3,
 		});
 		await flush();
+		expect(framesOf(controllerFrames, "prompt-error").at(-1)).toEqual({
+			t: "prompt-error",
+			requestId: "rpc-prompt-1",
+			message: "trusted local prompt is missing valid attribution or display name revision",
+		});
 		expect(prompts).toHaveLength(2);
 		expect(prompts.at(-1)).toMatchObject({
 			content: "[Alice] says: still accepted",

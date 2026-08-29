@@ -74,7 +74,14 @@ export type CollabSessionState = SessionState & {
  */
 export type CollabFrame =
 	| Exclude<GuestFrame, { t: "prompt" }>
-	| { t: "prompt"; text: string; images?: ImageContent[]; streamingBehavior?: "steer" | "followUp" }
+	| {
+			t: "prompt";
+			text: string;
+			images?: ImageContent[];
+			streamingBehavior?: "steer" | "followUp";
+			requestId?: string;
+	  }
+	| { t: "prompt-error"; requestId: string; message: string }
 	| { t: "set-host-tools"; reqId: number; tools: RpcHostToolDefinition[] }
 	| { t: "host-tool-update"; frame: RpcHostToolUpdate }
 	| { t: "host-tool-result"; frame: RpcHostToolResult }
