@@ -819,4 +819,47 @@ describe("UiHelpers.renderInitialMessages — prompt history isolation", () => {
 
 		expect(ctx.editor.addToHistory).not.toHaveBeenCalled();
 	});
+
+	it("replays one response stop on the final visible assistant text segment", async () => {
+		const userMarker = "REPLAY USER PROMPT";
+		const introMarker = "REPLAY INTRO TEXT";
+		const middleMarker = "REPLAY MIDDLE TEXT";
+		const finalMarker = "REPLAY FINAL RESPONSE";
+		const transcript = transcriptWith([
+			{ role: "user", content: userMarker, timestamp: 1 },
+			{
+				role: "assistant",
+				content: [
+					{ type: "thinking", thinking: "REPLAY REASONING" },
+					{ type: "text", text: introMarker },
+					{ type: "toolCall", id: "replay-a", name: "contract_probe_a", arguments: {} },
+					{ type: "text", text: middleMarker },
+					{ type: "toolCall", id: "replay-b", name: "contract_probe_b", arguments: {} },
+					{ type: "text", text: finalMarker },
+				],
+				api: "anthropic-messages",
+				provider: "anthropic",
+				model: "claude-sonnet",
+				usage: emptyUsage,
+				stopReason: "stop",
+				timestamp: 2,
+			},
+		]);
+		const { ctx, chatContainer } = makeRenderCtx(transcript);
+
+		await new UiHelpers(ctx).renderInitialMessages();
+
+		const rawLines = chatContainer.render(120);
+		const plainLines = rawLines.map(line => Bun.stripANSI(line));
+		const userLine = rawLines[plainLines.findIndex(line => line.includes(userMarker))];
+		const introLine = rawLines[plainLines.findIndex(line => line.includes(introMarker))];
+		const middleLine = rawLines[plainLines.findIndex(line => line.includes(middleMarker))];
+		const finalLine = rawLines[plainLines.findIndex(line => line.includes(finalMarker))];
+		const raw = rawLines.join("\n");
+		expect(raw.split("\x1b]133;A;aid=omp-response-")).toHaveLength(2);
+		expect(userLine).not.toContain("\x1b]133;");
+		expect(introLine).not.toContain("\x1b]133;");
+		expect(middleLine).not.toContain("\x1b]133;");
+		expect(finalLine).toContain("\x1b]133;A;aid=omp-response-");
+	});
 });

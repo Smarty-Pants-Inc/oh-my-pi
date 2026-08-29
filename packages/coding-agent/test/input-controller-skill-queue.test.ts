@@ -859,7 +859,7 @@ function createStubInteractiveModeContextForUiHelpers(
 		viewSession: session,
 		compactionQueuedMessages: [],
 		keybindings: {
-			getKeys: (_action: string) => ["alt+up", "shift+up"],
+			getKeys: (_action: string) => ["alt+shift+up", "shift+up"],
 			matches: (_data: string, _action: string) => false,
 		},
 		updatePendingMessagesDisplay,
@@ -919,8 +919,8 @@ describe("UiHelpers / InputController against derived queued custom display", ()
 		expect(rendered).toContain("1. [NEXT] /skill:test-skill arg1 arg2");
 		expect(rendered).not.toContain("Steer:");
 		expect(rendered).toContain("Shift+Up: Manage queued prompts");
-		expect(rendered).toContain(`${formatKeyHints("alt+up")} to restore newest`);
-		expect(rendered).not.toContain("Shift+Up to restore");
+		expect(rendered).toContain(`${formatKeyHints("alt+shift+up")} to restore newest`);
+		expect(rendered).not.toMatch(/(?:^|\s·\s)Shift\+Up to restore newest/);
 	});
 
 	it("shows timing help only while the prompt-steering shortcut is active", async () => {
@@ -935,8 +935,8 @@ describe("UiHelpers / InputController against derived queued custom display", ()
 
 		const rendered = Bun.stripANSI(pendingMessagesContainer.render(120).join("\n"));
 		expect(rendered).toContain("Shift+Up: Edit queued prompt delivery timing");
-		expect(rendered).not.toContain("Shift+Up to restore");
-		expect(rendered).toContain(`${formatKeyHints("alt+up")} to restore newest`);
+		expect(rendered).not.toMatch(/(?:^|\s·\s)Shift\+Up to restore newest/);
+		expect(rendered).toContain(`${formatKeyHints("alt+shift+up")} to restore newest`);
 	});
 
 	it("requests the pending-container repaint after rebuilding and clearing it", async () => {
@@ -981,8 +981,8 @@ describe("UiHelpers / InputController against derived queued custom display", ()
 		expect(rendered).toContain("3. [AFTER] summarize");
 		expect(rendered).not.toContain("Follow-up:");
 		expect(rendered).toContain("Shift+Up: Manage queued prompts");
-		expect(rendered).toContain(`${formatKeyHints("alt+up")} to restore newest`);
-		expect(rendered).not.toContain("Shift+Up to restore");
+		expect(rendered).toContain(`${formatKeyHints("alt+shift+up")} to restore newest`);
+		expect(rendered).not.toMatch(/(?:^|\s·\s)Shift\+Up to restore newest/);
 	});
 
 	it("preserves per-item timing previews, keeps its height, and applies them on Enter", async () => {

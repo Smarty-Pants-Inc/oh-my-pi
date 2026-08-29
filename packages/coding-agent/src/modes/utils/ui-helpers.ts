@@ -553,6 +553,7 @@ export class UiHelpers {
 				this.ctx.addMessageToChat(message, { reuseSettledComponent: options.reuseSettledComponents });
 				const lastChild = this.ctx.chatContainer.children[this.ctx.chatContainer.children.length - 1];
 				const assistantComponent = lastChild instanceof AssistantMessageComponent ? lastChild : undefined;
+				assistantComponent?.setResponseAnchor(timeline.replySegment === timeline.beforeTools);
 				if (assistantComponent) {
 					const usage = message.usage;
 					const explained = sessionContext.cacheMissExplainedAt?.[i] ?? false;
@@ -577,6 +578,7 @@ export class UiHelpers {
 				const appendAssistantSegment = (segment: AssistantMessage | undefined) => {
 					if (!segment || !assistantHasVisibleContent(segment)) return;
 					const component = createAssistantMessageComponent(this.ctx, segment);
+					component.setResponseAnchor(segment === timeline.replySegment);
 					this.ctx.chatContainer.addChild(component);
 				};
 

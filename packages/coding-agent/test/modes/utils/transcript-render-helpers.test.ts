@@ -1,6 +1,9 @@
 import { describe, expect, it } from "bun:test";
 import type { AssistantMessage, Usage } from "@oh-my-pi/pi-ai";
-import { assistantUsageIsBilled } from "../../../src/modes/utils/transcript-render-helpers";
+import {
+	assistantUsageIsBilled,
+	splitAssistantMessageToolTimeline,
+} from "../../../src/modes/utils/transcript-render-helpers";
 
 function usage(overrides: Partial<Usage> = {}): Usage {
 	return {
@@ -11,6 +14,19 @@ function usage(overrides: Partial<Usage> = {}): Usage {
 		totalTokens: 0,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		...overrides,
+	};
+}
+
+function assistant(content: AssistantMessage["content"]): AssistantMessage {
+	return {
+		role: "assistant",
+		content,
+		api: "anthropic-messages",
+		provider: "anthropic",
+		model: "claude",
+		usage: usage(),
+		stopReason: "stop",
+		timestamp: 1,
 	};
 }
 
@@ -34,5 +50,41 @@ describe("assistantUsageIsBilled", () => {
 		const emptyFreeMessage: Pick<AssistantMessage, "usage"> = { usage: usage() };
 		expect(assistantUsageIsBilled(emptyBilledMessage.usage)).toBe(true);
 		expect(assistantUsageIsBilled(emptyFreeMessage.usage)).toBe(false);
+	});
+});
+
+describe("splitAssistantMessageToolTimeline response navigation", () => {
+	it("selects only the final non-empty text segment as the reply stop", () => {
+		const timeline = splitAssistantMessageToolTimeline(
+			assistant([
+				{ type: "thinking", thinking: "reasoning before the reply" },
+				{ type: "text", text: "intro" },
+				{ type: "toolCall", id: "a", name: "read", arguments: {} },
+				{ type: "thinking", thinking: "more reasoning" },
+				{ type: "text", text: "middle" },
+				{ type: "toolCall", id: "b", name: "bash", arguments: {} },
+				{ type: "text", text: "final reply" },
+			]),
+		);
+
+		expect(timeline.replySegment?.content).toEqual([{ type: "text", text: "final reply" }]);
+		expect(
+			splitAssistantMessageToolTimeline(
+				assistant([
+					{ type: "thinking", thinking: "reasoning only" },
+					{ type: "toolCall", id: "only-tool", name: "read", arguments: {} },
+				]),
+			).replySegment,
+		).toBeUndefined();
+	});
+
+	it("does not select aborted or failed partial text as a finalized reply stop", () => {
+		const aborted = assistant([{ type: "text", text: "partial before interrupt" }]);
+		aborted.stopReason = "aborted";
+		const failed = assistant([{ type: "text", text: "partial before provider error" }]);
+		failed.stopReason = "error";
+
+		expect(splitAssistantMessageToolTimeline(aborted).replySegment).toBeUndefined();
+		expect(splitAssistantMessageToolTimeline(failed).replySegment).toBeUndefined();
 	});
 });

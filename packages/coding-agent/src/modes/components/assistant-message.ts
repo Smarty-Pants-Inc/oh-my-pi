@@ -20,6 +20,59 @@ import { canonicalizeMessage, formatThinkingForDisplay, hasDisplayableThinking }
 import { resolveAssistantErrorPresentation } from "../utils/transcript-render-helpers";
 import { type CacheInvalidation, CacheInvalidationMarkerComponent } from "./cache-invalidation-marker";
 
+// Herdr consumes the aid to distinguish OMP reply rows from shell prompts;
+// Ghostty-compatible terminals ignore the option while retaining OSC 133 semantics.
+// The process session lets Herdr discard anchors from an earlier OMP in the same
+// pane; the message timestamp lets it deduplicate redraws and transcript rebuilds.
+// Keep the zone balanced inside one Markdown block: 133;B latches `.input` until
+// 133;C, and leaving it open makes later transcript cells behave like editable
+// prompt input (#8030, #6115).
+const OSC133_RESPONSE_SESSION = `${process.pid}-${Date.now().toString(36)}`;
+let unidentifiedResponseAnchor = 0;
+const responseZoneStart = (message?: AssistantMessage): string => {
+	const replyId = message?.timestamp ?? `component-${++unidentifiedResponseAnchor}`;
+	return `\x1b]133;A;aid=omp-response-${OSC133_RESPONSE_SESSION}:${replyId}\x07`;
+};
+const OSC133_ZONE_CLOSE = "\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07";
+
+class ResponseAnchorMarkdown extends Markdown {
+	constructor(
+		private readonly zoneStart: string,
+		...args: ConstructorParameters<typeof Markdown>
+	) {
+		super(...args);
+	}
+
+	#enabled = false;
+	#zoneSource: readonly string[] | undefined;
+	#zoneLines: string[] | undefined;
+
+	setEnabled(enabled: boolean): void {
+		if (this.#enabled === enabled) return;
+		this.#enabled = enabled;
+		this.#zoneSource = undefined;
+		this.#zoneLines = undefined;
+	}
+
+	override invalidate(): void {
+		super.invalidate();
+		this.#zoneSource = undefined;
+		this.#zoneLines = undefined;
+	}
+
+	override render(width: number): readonly string[] {
+		const lines = super.render(width);
+		if (!this.#enabled || lines.length === 0) return lines;
+		if (this.#zoneSource === lines && this.#zoneLines !== undefined) return this.#zoneLines;
+		const wrapped = lines.slice();
+		wrapped[0] = this.zoneStart + wrapped[0];
+		wrapped[wrapped.length - 1] += OSC133_ZONE_CLOSE;
+		this.#zoneSource = lines;
+		this.#zoneLines = wrapped;
+		return wrapped;
+	}
+}
+
 /**
  * Max lines of a turn-ending provider error rendered inline in the transcript.
  * Bounds pathological error bodies — e.g. a proxy 502 whose body is a full HTML
@@ -195,6 +248,9 @@ export class AssistantMessageComponent extends Container {
 	 * turn's `agent_start`, late tool-result images, and async Kitty conversions.
 	 */
 	#blockVersion = 0;
+	#responseAnchor = false;
+	#responseAnchorTarget: ResponseAnchorMarkdown | undefined;
+	#responseZoneStart: string;
 	/** Whether the last updateContent carried an in-flight streaming partial; such
 	 *  renders bypass the markdown module LRU (see Markdown.transientRenderCache). */
 	#lastUpdateTransient = false;
@@ -237,6 +293,7 @@ export class AssistantMessageComponent extends Container {
 		private proseOnlyThinking = true,
 	) {
 		super();
+		this.#responseZoneStart = responseZoneStart(message);
 		this.#transcriptBlockFinalized = message !== undefined;
 
 		// Slim cache-invalidation divider, populated above the content when this
@@ -264,6 +321,14 @@ export class AssistantMessageComponent extends Container {
 		if (info) {
 			this.#markerSlot.addChild(new CacheInvalidationMarkerComponent(info));
 		}
+		this.#blockVersion++;
+	}
+
+	/** Mark the first visible text block as a terminal-native response stop. */
+	setResponseAnchor(enabled: boolean): void {
+		if (this.#responseAnchor === enabled) return;
+		this.#responseAnchor = enabled;
+		this.#responseAnchorTarget?.setEnabled(enabled);
 		this.#blockVersion++;
 	}
 
@@ -750,6 +815,7 @@ export class AssistantMessageComponent extends Container {
 
 		// Clear content container
 		this.#contentContainer.clear();
+		this.#responseAnchorTarget = undefined;
 		this.#thinkingDots = undefined;
 		this.#hasTruncatableError = false;
 
@@ -777,7 +843,13 @@ export class AssistantMessageComponent extends Container {
 				// Set paddingY=0 to avoid extra spacing before tool executions
 				const trimmed = content.text.trim();
 				const mdOptions = this.#textColorTransform ? { color: this.#textColorTransform } : undefined;
-				const md = new Markdown(trimmed, 1, 0, getMarkdownTheme(), mdOptions, 0);
+				const md: Markdown = this.#responseAnchorTarget
+					? new Markdown(trimmed, 1, 0, getMarkdownTheme(), mdOptions, 0)
+					: new ResponseAnchorMarkdown(this.#responseZoneStart, trimmed, 1, 0, getMarkdownTheme(), mdOptions, 0);
+				if (md instanceof ResponseAnchorMarkdown) {
+					md.setEnabled(this.#responseAnchor);
+					this.#responseAnchorTarget = md;
+				}
 				this.#contentContainer.addChild(md);
 				captureItems?.push({ md, contentIndex: i, blockType: "text", lastText: trimmed });
 				hasRenderedContent = true;

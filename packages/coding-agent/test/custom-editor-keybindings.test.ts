@@ -86,17 +86,17 @@ describe("CustomEditor keybindings", () => {
 		expect(queueSelector).toHaveBeenCalledTimes(1);
 		expect(onDequeue).not.toHaveBeenCalled();
 
-		editor.handleInput("\x1b[1;3A");
+		editor.handleInput("\x1b[1;4A");
 		expect(queueSelector).toHaveBeenCalledTimes(1);
 		expect(onDequeue).toHaveBeenCalledTimes(1);
 	});
 });
 
 describe("shipped dequeue defaults", () => {
-	it("binds both alt+up and shift+up to the steering dequeue", () => {
+	it("binds both alt+shift+up and shift+up to the steering dequeue", () => {
 		const keybindings = KeybindingsManager.inMemory();
 		const keys = keybindings.getKeys("app.message.dequeue");
-		expect(keys).toContain("alt+up");
+		expect(keys).toContain("alt+shift+up");
 		expect(keys).toContain("shift+up");
 	});
 	it("does not steal shift+up from an explicit user binding", () => {
@@ -104,20 +104,19 @@ describe("shipped dequeue defaults", () => {
 			"tui.editor.cursorUp": "shift+up",
 		});
 
-		expect(keybindings.getKeys("app.message.dequeue")).toEqual(["alt+up"]);
+		expect(keybindings.getKeys("app.message.dequeue")).toEqual(["alt+shift+up"]);
 		expect(keybindings.getKeys("tui.editor.cursorUp")).toEqual(["shift+up"]);
 	});
-	it("routes the shipped shift+up default through DEFAULT_ACTION_KEYS to the dequeue handler", () => {
-		// F12: the registry test above does not cover DEFAULT_ACTION_KEYS, the second
-		// defaults table that custom-editor.ts seeds its match set from. Drive a real
-		// editor without calling setActionKeys, so the shipped entry is the only thing
-		// that can make the shift+up wire form (CSI 1;2A) reach onDequeue.
+	it("routes the shipped defaults through DEFAULT_ACTION_KEYS to the dequeue handler", () => {
+		// The registry test above does not cover DEFAULT_ACTION_KEYS, the second
+		// defaults table that custom-editor.ts seeds its match set from.
 		const editor = new CustomEditor(getEditorTheme());
 		const onDequeue = vi.fn();
 
 		editor.onDequeue = onDequeue;
+		editor.handleInput("\x1b[1;4A");
 		editor.handleInput("\x1b[1;2A");
 
-		expect(onDequeue).toHaveBeenCalledTimes(1);
+		expect(onDequeue).toHaveBeenCalledTimes(2);
 	});
 });

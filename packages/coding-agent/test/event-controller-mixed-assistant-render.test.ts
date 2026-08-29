@@ -148,6 +148,41 @@ describe("EventController mixed assistant text/tool rendering", () => {
 		expect(orphan.isTranscriptBlockFinalized()).toBe(true);
 	});
 
+	it("keeps a pre-tool reply candidate mutable until message_end assigns its anchor", async () => {
+		const { controller, chatContainer } = createFixture();
+		const toolCall: ToolCall = {
+			type: "toolCall",
+			id: TOOL_CALL_A_ID,
+			name: "contract_probe_a",
+			arguments: { value: "a" },
+		};
+		const message = assistantMessage([{ type: "text", text: INTRO_MARKER }, toolCall]);
+
+		await controller.handleEvent({ type: "message_start", message: assistantMessage([]) } as Extract<
+			AgentSessionEvent,
+			{ type: "message_start" }
+		>);
+		await controller.handleEvent({ type: "message_update", message } as Extract<
+			AgentSessionEvent,
+			{ type: "message_update" }
+		>);
+
+		const leading = chatContainer.children[0] as Component & {
+			isTranscriptBlockFinalized(): boolean;
+		};
+		expect(leading.isTranscriptBlockFinalized()).toBe(false);
+		expect(chatContainer.peekFinalizedBatch(120, 0)).toBeUndefined();
+		expect(chatContainer.render(120).join("\n")).not.toContain("\x1b]133;A;aid=omp-response-");
+
+		await controller.handleEvent({ type: "message_end", message } as Extract<
+			AgentSessionEvent,
+			{ type: "message_end" }
+		>);
+
+		expect(leading.isTranscriptBlockFinalized()).toBe(true);
+		expect(chatContainer.peekFinalizedBatch(120, 0)?.rows.join("\n")).toContain("\x1b]133;A;aid=omp-response-");
+	});
+
 	it("renders assistant text segments in order around two tool results from one mixed message", async () => {
 		const { controller, chatContainer } = createFixture();
 		const toolCallA: ToolCall = {
@@ -204,6 +239,7 @@ describe("EventController mixed assistant text/tool rendering", () => {
 		} as Extract<AgentSessionEvent, { type: "message_update" }>);
 		const liveLines = chatContainer.render(120).map(line => Bun.stripANSI(line));
 		expect(lineContaining(liveLines, INTRO_MARKER)).toBeLessThan(lineContaining(liveLines, MIDDLE_MARKER));
+		expect(chatContainer.render(120).join("\n")).not.toContain("\x1b]133;A;aid=omp-response-");
 		await controller.handleEvent({
 			type: "tool_execution_start",
 			toolCallId: TOOL_CALL_A_ID,
@@ -235,7 +271,8 @@ describe("EventController mixed assistant text/tool rendering", () => {
 			{ type: "message_end" }
 		>);
 
-		const lines = chatContainer.render(120).map(line => Bun.stripANSI(line));
+		const rawLines = chatContainer.render(120);
+		const lines = rawLines.map(line => Bun.stripANSI(line));
 		const introLine = lineContaining(lines, INTRO_MARKER);
 		const toolResultALine = lineContaining(lines, TOOL_RESULT_A_MARKER);
 		const middleLine = lineContaining(lines, MIDDLE_MARKER);
@@ -247,6 +284,11 @@ describe("EventController mixed assistant text/tool rendering", () => {
 		expect(lines.filter(line => line.includes(MIDDLE_MARKER))).toHaveLength(1);
 		expect(middleLine).toBeLessThan(toolResultBLine);
 		expect(toolResultBLine).toBeLessThan(finalLine);
+		const raw = rawLines.join("\n");
+		expect(raw.split("\x1b]133;A;aid=omp-response-")).toHaveLength(2);
+		expect(rawLines[introLine]).not.toContain("\x1b]133;");
+		expect(rawLines[middleLine]).not.toContain("\x1b]133;");
+		expect(rawLines[finalLine]).toContain("\x1b]133;A;aid=omp-response-");
 	});
 
 	it("keeps assistant text streaming while hiding bash failures and grouped read activity", async () => {

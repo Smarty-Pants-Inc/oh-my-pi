@@ -63,7 +63,7 @@ const DEFAULT_ACTION_KEYS: Record<ConfigurableEditorAction, KeyId[]> = {
 	"app.thinking.toggle": ["ctrl+t"],
 	"app.editor.external": ["ctrl+g"],
 	"app.history.search": ["ctrl+r"],
-	"app.message.dequeue": ["alt+up", "shift+up"],
+	"app.message.dequeue": ["alt+shift+up", "shift+up"],
 	"app.retry": ["alt+r"],
 	"app.clipboard.pasteImage": ["ctrl+v"],
 	"app.clipboard.pasteTextRaw": ["ctrl+shift+v", "alt+shift+v"],
@@ -1099,7 +1099,7 @@ export class CustomEditor extends Editor {
 			}
 
 			// Let an extension override only the exact configured dequeue chord it claims.
-			// Unclaimed chords (for example Alt+Up) keep the native restore behavior.
+			// Unclaimed chords (for example Alt+Shift+Up) keep the native restore behavior.
 			if (this.#matchesAction(canonical, "app.message.dequeue") && this.onDequeue) {
 				const customHandler = this.#customMatchKeys.get(canonical);
 				if (customHandler) {

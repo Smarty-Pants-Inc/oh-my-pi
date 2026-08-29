@@ -184,8 +184,9 @@ export function splitAssistantMessageToolTimeline(message: AssistantAgentMessage
 	beforeTools: AssistantAgentMessage;
 	afterToolCalls: ReadonlyMap<string, AssistantAgentMessage>;
 	hasToolCalls: boolean;
+	replySegment: AssistantAgentMessage | undefined;
 } {
-	const beforeTools: AssistantAgentMessage["content"] = [];
+	const beforeToolsContent: AssistantAgentMessage["content"] = [];
 	const afterToolCalls = new Map<string, AssistantAgentMessage>();
 	let pendingAfterTool: AssistantAgentMessage["content"] = [];
 	let lastToolCallId: string | undefined;
@@ -212,19 +213,26 @@ export function splitAssistantMessageToolTimeline(message: AssistantAgentMessage
 			lastToolCallId = content.id;
 			continue;
 		}
-		if (sawToolCall) {
-			pendingAfterTool.push(content);
-		} else {
-			beforeTools.push(content);
-		}
+		if (sawToolCall) pendingAfterTool.push(content);
+		else beforeToolsContent.push(content);
 	}
 	flushPendingAfterTool();
 
-	if (!sawToolCall) {
-		return { beforeTools: message, afterToolCalls, hasToolCalls: false };
+	const beforeTools = sawToolCall ? displaySegment(beforeToolsContent) : message;
+	const replyEligible = message.stopReason !== "aborted" && message.stopReason !== "error";
+	let replySegment =
+		replyEligible && beforeTools.content.some(content => content.type === "text" && canonicalizeMessage(content.text))
+			? beforeTools
+			: undefined;
+	if (replyEligible) {
+		for (const segment of afterToolCalls.values()) {
+			if (segment.content.some(content => content.type === "text" && canonicalizeMessage(content.text))) {
+				replySegment = segment;
+			}
+		}
 	}
 
-	return { beforeTools: displaySegment(beforeTools), afterToolCalls, hasToolCalls: true };
+	return { beforeTools, afterToolCalls, hasToolCalls: sawToolCall, replySegment };
 }
 
 /**

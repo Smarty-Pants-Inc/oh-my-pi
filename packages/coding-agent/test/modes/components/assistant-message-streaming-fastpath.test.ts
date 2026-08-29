@@ -234,4 +234,43 @@ Average Latency: 1,240 ms
 		const rendered = Bun.stripANSI(component.render(W).join("\n"));
 		expect(rendered).toContain("keep me");
 	});
+
+	it("marks only the first visible reply text row as a balanced terminal response stop", () => {
+		const component = new AssistantMessageComponent();
+		component.updateContent(
+			msg([
+				{ type: "thinking", thinking: "reasoning trace" },
+				{ type: "text", text: "final response" },
+			]),
+		);
+		expect(component.render(W).join("\n")).not.toContain("\x1b]133;");
+
+		component.setResponseAnchor(true);
+		const lines = component.render(W);
+		const thinkingLine = lines.find(line => Bun.stripANSI(line).includes("reasoning trace"));
+		const responseLine = lines.find(line => Bun.stripANSI(line).includes("final response"));
+		expect(thinkingLine).not.toContain("\x1b]133;");
+		expect(responseLine).toStartWith("\x1b]133;A;aid=omp-response-");
+		const raw = lines.join("\n");
+		expect(raw.split("\x1b]133;A;aid=omp-response-")).toHaveLength(2);
+		expect(raw.split("\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07")).toHaveLength(2);
+	});
+
+	it("keeps reply aids stable across redraw and replay while separating messages", () => {
+		const anchoredAid = (message: AssistantMessage): string => {
+			const component = new AssistantMessageComponent(message);
+			component.setResponseAnchor(true);
+			const match = component
+				.render(W)
+				.join("\n")
+				.match(/aid=(omp-response-[^\x07]+)/);
+			expect(match).not.toBeNull();
+			return match![1]!;
+		};
+		const first = msg([{ type: "text", text: "same text" }], { timestamp: 101 });
+		const second = msg([{ type: "text", text: "same text" }], { timestamp: 102 });
+
+		expect(anchoredAid(first)).toBe(anchoredAid(first));
+		expect(anchoredAid(first)).not.toBe(anchoredAid(second));
+	});
 });
