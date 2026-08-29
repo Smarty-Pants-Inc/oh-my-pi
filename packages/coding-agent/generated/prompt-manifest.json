@@ -3262,7 +3262,7 @@
     },
     {
       "id": "tool.bash",
-      "descriptionSha256": "0b788dd2c8a3255a26a277f04bbe4bf4fc15d6d8bf331cbd302621fbc3bd4d5b",
+      "descriptionSha256": "7bcdf38a23d1c9250b46733dd6827dcdc8514d67327bcf7e6fec16ecaee8f9cd",
       "schemaSha256": "3262488c7bfecb7ab7e06798671ef48a3c1436e3f46068f3368569adf26f488b"
     },
     {
@@ -3292,7 +3292,7 @@
     },
     {
       "id": "tool.eval",
-      "descriptionSha256": "b6ec6fab27433289bf48d87080a91a042b3d3d3bad2cd38932f6b269856d16e8",
+      "descriptionSha256": "4e430d333b83a8ae7b8f289c6188f8c5ec6671d0405145058da08964e84d09a8",
       "schemaSha256": "3974f0dba834dc8866a31d34439b27541a14bb9c9f911e71d19a0232aa4425ff"
     },
     {
@@ -3322,7 +3322,7 @@
     },
     {
       "id": "tool.hub",
-      "descriptionSha256": "a25de18577b76593651f28d6c630b3b3ebda63a1ac0bd9c9c82144ada8f61047",
+      "descriptionSha256": "adf345647d307dabc34f7bf083cfc4f4ceaebc6a433c1a66a0c356b39fc9c405",
       "schemaSha256": "6c5ddad215c05322a637bb74647a10229d807bc15adb5aa64ffad29bbf8fb483"
     },
     {
@@ -3393,7 +3393,7 @@
     {
       "id": "tool.todo",
       "descriptionSha256": "c9cb8d1614b17803bc70dcf25933c0473d636fa5398efb45ab01aef3c0b628f6",
-      "schemaSha256": "128c5d45a33c3b9b009577b115503974ec90bc1862d99b636d80e1345eb2709b"
+      "schemaSha256": "fd7687479ccf81643d0a75eae2843bfd041f2490c74e115925dba463b8fed838"
     },
     {
       "id": "tool.tts",
@@ -6256,7 +6256,7 @@
     },
     {
       "path": "packages/coding-agent/generated/tool-contracts.json",
-      "sha256": "37f306c49bb8fb75d77584f3f1605c06a86b3e9b3aa5a9ed5a3311c90cfa37d1"
+      "sha256": "422a3232cb61680eef1e169a0ed8d8e245cc17d825918bdcdce9b93510410432"
     },
     {
       "path": "packages/coding-agent/package.json",
@@ -8404,7 +8404,7 @@
     },
     {
       "path": "packages/coding-agent/src/modes/controllers/input-controller.ts",
-      "sha256": "3c74139fba1ec51710b5fdcda0f89f41404c9b17860ff364e53c44b4131eb644"
+      "sha256": "3c4069b38fdc4f4a7b127176560fd4db00830ce8332cc0474c08cae723818d0d"
     },
     {
       "path": "packages/coding-agent/src/modes/controllers/live-command-controller.ts",
@@ -8564,7 +8564,7 @@
     },
     {
       "path": "packages/coding-agent/src/modes/utils/ui-helpers.ts",
-      "sha256": "c2fcb7fad744022f0fba68143c7f11161f736fc1b3d3c00bd5e9a962714bcf41"
+      "sha256": "ad9b79eaa18df6809ce891afc44ce844ba84b08bca0f119a62f9dfe97b9b4eff"
     },
     {
       "path": "packages/coding-agent/src/modes/workflow.ts",
@@ -8716,7 +8716,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/agent-session.ts",
-      "sha256": "0c6fd751bd18db89819d19b300dc63927d1db6af6cdf181248455f9afd011b90"
+      "sha256": "921596640b248c7e6293b9fc96394f4d9ed52a49706153de04722d25318f88e6"
     },
     {
       "path": "packages/coding-agent/src/session/agent-storage.ts",
@@ -8892,7 +8892,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/session-maintenance.ts",
-      "sha256": "00ae3f44f1e042e550a3b44e648c860903b17dfc196ac531bff6220fd9f216b1"
+      "sha256": "ac7ebf0090be303e24652d025fcfee2548f81c9612ae2c748993147be3a28622"
     },
     {
       "path": "packages/coding-agent/src/session/session-manager.ts",
@@ -11020,5 +11020,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "b07d0c7e6811e8c95aebc75cb1da05b613a177b25e0945c182ca51b96a22c24a"
+  "rootSha256": "d068969039ca0a29531b2c54ed086ca1e9c00ad49827962838b8e6d91e2456c5"
 }
