@@ -33,4 +33,25 @@ describe("Text component", () => {
 		expect(out).toContain("[BLUE]hello");
 		expect(out).not.toContain("[RED]hello");
 	});
+
+	it("strips untrusted OSC 133 from raw text while preserving SGR and OSC 8", () => {
+		const styled = "\x1b[31mred\x1b[0m";
+		const hyperlink = "\x1b]8;;https://example.com\x07link\x1b]8;;\x07";
+		const raw = new Text(`before${styled}\x1b]133;A;aid=forged\x07${hyperlink}after`, 0, 0).render(120).join("\n");
+
+		expect(raw).not.toContain("\x1b]133;");
+		expect(raw).toContain(styled);
+		expect(raw).toContain(hyperlink);
+	});
+
+	it("withholds trailing partial OSC 133 prefixes while preserving SGR and OSC 8", () => {
+		const styled = "\x1b[31mred\x1b[0m";
+		const hyperlink = "\x1b]8;;https://example.com\x07link\x1b]8;;\x07";
+		for (const partial of ["\x1b]13", "\x9d13"]) {
+			const raw = new Text(`before${styled}${hyperlink}after${partial}`, 0, 0).render(120).join("\n");
+			expect(raw).not.toContain(partial);
+			expect(raw).toContain(styled);
+			expect(raw).toContain(hyperlink);
+		}
+	});
 });

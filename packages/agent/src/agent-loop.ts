@@ -681,6 +681,7 @@ function createGateStopMessage(model: Model, reason: string | undefined): Assist
 		},
 		stopReason: "aborted",
 		errorMessage: reason ?? "Stopped before model call",
+		responseAnchorId: crypto.randomUUID(),
 		timestamp: Date.now(),
 	};
 }
@@ -1872,12 +1873,18 @@ async function streamAssistantResponse(
 				);
 			}
 
+			const responseAnchorId = crypto.randomUUID();
+			const stampResponseAnchorId = (message: AssistantMessage): AssistantMessage => {
+				message.responseAnchorId = responseAnchorId;
+				return message;
+			};
+
 			let partialMessage: AssistantMessage | null = null;
 			let addedPartial = false;
 			const completedToolCallIds = new Set<string>();
 			let provisionalStartEvent: Extract<AssistantMessageEvent, { type: "start" }> | undefined;
 			const applyStartEvent = (event: Extract<AssistantMessageEvent, { type: "start" }>): void => {
-				partialMessage = event.partial;
+				partialMessage = stampResponseAnchorId(event.partial);
 				if (addedPartial) {
 					context.messages[context.messages.length - 1] = partialMessage;
 					completedToolCallIds.clear();
@@ -1916,6 +1923,7 @@ async function streamAssistantResponse(
 					config,
 					stream,
 					requestSignal,
+					responseAnchorId,
 				);
 				await finishChat(aborted);
 				return aborted;
@@ -1968,14 +1976,17 @@ async function streamAssistantResponse(
 						}
 					}
 					if (event.type === "done" || event.type === "error") {
-						let finalMessage = recoverTransientErrorToolTurn(
-							retainCompletedToolCalls(await response.result(), completedToolCallIds),
-							context.tools ?? [],
+						let finalMessage = stampResponseAnchorId(
+							recoverTransientErrorToolTurn(
+								retainCompletedToolCalls(await response.result(), completedToolCallIds),
+								context.tools ?? [],
+							),
 						);
 						if (harmonyMitigationEnabled) {
 							const detection = detectHarmonyLeakInAssistantMessage(finalMessage);
 							if (detection) {
 								const recovered = recoverHarmonyToolCall(finalMessage, detection);
+								if (recovered) stampResponseAnchorId(recovered.message);
 								const removed = recovered?.removed ?? extractHarmonyRemoved(finalMessage, detection);
 								if (addedPartial) {
 									emitDiscardedHarmonyPartial(
@@ -2046,7 +2057,7 @@ async function streamAssistantResponse(
 								if (event.type === "toolcall_end") {
 									completedToolCallIds.add(event.toolCall.id);
 								}
-								partialMessage = event.partial;
+								partialMessage = stampResponseAnchorId(event.partial);
 								context.messages[context.messages.length - 1] = partialMessage;
 								config.onAssistantMessageEvent?.(partialMessage, event);
 								// `message` and `assistantMessageEvent.partial` intentionally share one
@@ -2071,11 +2082,12 @@ async function streamAssistantResponse(
 				throw new Error("Provider stream ended before response acceptance");
 			}
 
-			let trailing = await response.result();
+			let trailing = stampResponseAnchorId(await response.result());
 			if (harmonyMitigationEnabled) {
 				const detection = detectHarmonyLeakInAssistantMessage(trailing);
 				if (detection) {
 					const recovered = recoverHarmonyToolCall(trailing, detection);
+					if (recovered) stampResponseAnchorId(recovered.message);
 					const removed = recovered?.removed ?? extractHarmonyRemoved(trailing, detection);
 					if (addedPartial) {
 						emitDiscardedHarmonyPartial(
@@ -2247,6 +2259,7 @@ function emitAbortedAssistantMessage(
 	config: AgentLoopConfig,
 	stream: EventStream<AgentEvent, AgentMessage[]>,
 	requestSignal: AbortSignal | undefined,
+	responseAnchorId: string,
 ): AssistantMessage {
 	const model = config.getModel?.() ?? config.model;
 	const errorMessage = abortReasonText(requestSignal);
@@ -2255,7 +2268,7 @@ function emitAbortedAssistantMessage(
 			? AIError.create(AIError.Flag.Abort)
 			: AIError.classify(requestSignal?.reason) || undefined;
 	const base: AssistantMessage = partialMessage
-		? { ...partialMessage, stopReason: "aborted", errorMessage, errorId }
+		? { ...partialMessage, responseAnchorId, stopReason: "aborted", errorMessage, errorId }
 		: {
 				role: "assistant",
 				content: [],
@@ -2273,6 +2286,7 @@ function emitAbortedAssistantMessage(
 				stopReason: "aborted",
 				errorMessage,
 				errorId,
+				responseAnchorId,
 				timestamp: Date.now(),
 			};
 	// Only tool calls that reached `toolcall_end` survive abort/error replay. A

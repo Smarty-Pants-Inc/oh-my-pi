@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { isSafeResponseAnchorId } from "@oh-my-pi/pi-coding-agent/session/response-anchor";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { MemorySessionStorage, type WriteTextAtomicOptions } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { parseJsonlLenient, TempDir } from "@oh-my-pi/pi-utils";
@@ -18,7 +20,7 @@ afterEach(async () => {
 	await Promise.all(tempDirs.splice(0).map(dir => dir.remove()));
 });
 
-function assistantMessage(text: string) {
+function assistantMessage(text: string): AssistantMessage {
 	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 	if (!model) throw new Error("Expected built-in anthropic model to exist");
 	return {
@@ -130,6 +132,20 @@ describe("SessionManager JSONL software-crash durability", () => {
 			"custom:tool_execution_start",
 			"toolResult",
 		]);
+	});
+
+	it("stamps a new assistant response anchor before its first durable append", () => {
+		const cwd = makeTempDir("@pi-response-anchor-cwd-");
+		const manager = SessionManager.create(cwd, path.join(cwd, "sessions"));
+		const message = assistantMessage("anchored response");
+		manager.appendMessage(message);
+		if (!message.responseAnchorId) throw new Error("Expected a response anchor id");
+
+		expect(isSafeResponseAnchorId(message.responseAnchorId)).toBe(true);
+		const sessionFile = manager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected a persisted session file path");
+		const persisted = readJsonl(sessionFile).find(entry => messageRole(entry) === "assistant");
+		expect(persisted?.message).toMatchObject({ responseAnchorId: message.responseAnchorId });
 	});
 
 	it("publishes fork and branch journals only after referenced artifacts are ready", async () => {

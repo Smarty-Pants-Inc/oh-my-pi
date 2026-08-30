@@ -3,7 +3,10 @@ import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AssistantMessageComponent } from "@oh-my-pi/pi-coding-agent/modes/components/assistant-message";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { MAX_RESPONSE_ANCHOR_ID_BYTES } from "@oh-my-pi/pi-coding-agent/session/response-anchor";
 import { type Component, Container, Markdown } from "@oh-my-pi/pi-tui";
+import { setTerminalTextSizing } from "@oh-my-pi/pi-tui/terminal-capabilities";
+import { visibleWidth } from "@oh-my-pi/pi-tui/utils";
 
 const W = 100;
 
@@ -235,30 +238,112 @@ Average Latency: 1,240 ms
 		expect(rendered).toContain("keep me");
 	});
 
-	it("marks only the first visible reply text row as a balanced terminal response stop", () => {
+	it("marks only the last visible reply text block as a balanced terminal response stop", () => {
 		const component = new AssistantMessageComponent();
 		component.updateContent(
 			msg([
 				{ type: "thinking", thinking: "reasoning trace" },
-				{ type: "text", text: "final response" },
+				{ type: "text", text: "first response block" },
+				{ type: "text", text: "final response block" },
 			]),
 		);
-		expect(component.render(W).join("\n")).not.toContain("\x1b]133;");
-
 		component.setResponseAnchor(true);
+
 		const lines = component.render(W);
-		const thinkingLine = lines.find(line => Bun.stripANSI(line).includes("reasoning trace"));
-		const responseLine = lines.find(line => Bun.stripANSI(line).includes("final response"));
-		expect(thinkingLine).not.toContain("\x1b]133;");
-		expect(responseLine).toStartWith("\x1b]133;A;aid=omp-response-");
+		const firstResponseLine = lines.find(line => Bun.stripANSI(line).includes("first response block"));
+		const finalResponseLine = lines.find(line => Bun.stripANSI(line).includes("final response block"));
+		expect(firstResponseLine).not.toContain("\x1b]133;");
+		expect(finalResponseLine).toStartWith("\x1b]133;A;aid=omp-response-");
 		const raw = lines.join("\n");
 		expect(raw.split("\x1b]133;A;aid=omp-response-")).toHaveLength(2);
 		expect(raw.split("\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07")).toHaveLength(2);
 	});
 
-	it("keeps reply aids stable across redraw and replay while separating messages", () => {
-		const anchoredAid = (message: AssistantMessage): string => {
-			const component = new AssistantMessageComponent(message);
+	it("opens and closes a response zone on the first and last visible glyph rows", () => {
+		setTerminalTextSizing(true);
+		try {
+			const component = new AssistantMessageComponent(msg([{ type: "text", text: "# Sized response heading" }]));
+			component.setResponseAnchor(true);
+			const lines = component.render(W);
+			const visibleRows = lines.flatMap((line, index) => (visibleWidth(line.trim()) > 0 ? [index] : []));
+			const zoneStartRow = lines.findIndex(line => line.includes("\x1b]133;A;aid=omp-response-"));
+			const zoneCloseRow = lines.findIndex(line => line.includes("\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07"));
+
+			expect(visibleRows).toHaveLength(1);
+			expect(zoneStartRow).toBe(visibleRows[0]);
+			expect(zoneCloseRow).toBe(visibleRows[0]);
+			expect(lines[visibleRows[0]! + 1]).toBe("");
+		} finally {
+			setTerminalTextSizing(false);
+		}
+	});
+
+	it("uses a visible candidate in the eligible final segment when trailing Markdown is hidden", () => {
+		const component = new AssistantMessageComponent();
+		component.updateContent(
+			msg([
+				{ type: "text", text: "visible post-tool reply" },
+				{ type: "text", text: "[hidden-reference]: https://example.com" },
+			]),
+		);
+		component.setResponseAnchor(true);
+
+		const lines = component.render(W);
+		const visibleLine = lines.find(line => Bun.stripANSI(line).includes("visible post-tool reply"));
+		expect(visibleLine).toStartWith("\x1b]133;A;aid=omp-response-");
+		expect(lines.join("\n").split("\x1b]133;A;aid=omp-response-")).toHaveLength(2);
+	});
+
+	it("does not let assistant Markdown forge a terminal response zone", () => {
+		const forged = "\x1b]133;A;aid=forged\x07";
+		const component = new AssistantMessageComponent(msg([{ type: "text", text: `before${forged}after` }]));
+		component.setResponseAnchor(true);
+		const raw = component.render(W).join("\n");
+
+		expect(raw).not.toContain("aid=forged");
+		expect(Bun.stripANSI(raw)).toContain("beforeafter");
+	});
+
+	it("does not let an unsafe persisted response anchor id inject terminal controls", () => {
+		const forgedId = "persisted\x07\x1b]133;A;aid=forged\x07";
+		const component = new AssistantMessageComponent(
+			msg([{ type: "text", text: "safe response" }], { timestamp: 222, responseAnchorId: forgedId }),
+		);
+		component.setResponseAnchor(true);
+		const raw = component.render(W).join("\n");
+
+		expect(raw).not.toContain("aid=forged");
+		expect(raw).not.toContain(":222\x07");
+		expect(raw).toMatch(/aid=omp-response-[A-Za-z0-9_-]+:[0-9a-f-]{36}\x07/);
+	});
+
+	it("uses one bounded stable fallback for oversized persisted response anchor ids", () => {
+		const oversizedId = "a".repeat(MAX_RESPONSE_ANCHOR_ID_BYTES + 1);
+		const component = new AssistantMessageComponent(
+			msg([{ type: "text", text: "safe response" }], { timestamp: 222, responseAnchorId: oversizedId }),
+		);
+		component.setResponseAnchor(true);
+		const raw = component.render(W).join("\n");
+		const aid = raw.match(/aid=(omp-response-[^\x07]+)/)?.[1];
+
+		expect(aid).toBeDefined();
+		expect(aid).not.toContain(oversizedId);
+		expect(Buffer.byteLength(aid!)).toBeLessThanOrEqual(256);
+
+		component.updateContent(
+			msg([{ type: "text", text: "updated response" }], { timestamp: 333, responseAnchorId: oversizedId }),
+		);
+		const updatedAid = component
+			.render(W)
+			.join("\n")
+			.match(/aid=(omp-response-[^\x07]+)/)?.[1];
+		expect(updatedAid).toBe(aid);
+	});
+
+	it("keeps reply aids stable across live rendering and replay while separating equal-timestamp messages", () => {
+		const anchoredAid = (message: AssistantMessage, live = false): string => {
+			const component = live ? new AssistantMessageComponent() : new AssistantMessageComponent(message);
+			if (live) component.updateContent(message);
 			component.setResponseAnchor(true);
 			const match = component
 				.render(W)
@@ -267,10 +352,10 @@ Average Latency: 1,240 ms
 			expect(match).not.toBeNull();
 			return match![1]!;
 		};
-		const first = msg([{ type: "text", text: "same text" }], { timestamp: 101 });
-		const second = msg([{ type: "text", text: "same text" }], { timestamp: 102 });
+		const first = msg([{ type: "text", text: "same text" }], { timestamp: 101, responseAnchorId: "anchor-one" });
+		const second = msg([{ type: "text", text: "same text" }], { timestamp: 101, responseAnchorId: "anchor-two" });
 
-		expect(anchoredAid(first)).toBe(anchoredAid(first));
+		expect(anchoredAid(first, true)).toBe(anchoredAid(first));
 		expect(anchoredAid(first)).not.toBe(anchoredAid(second));
 	});
 });

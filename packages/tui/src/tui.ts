@@ -61,6 +61,12 @@ const ERASE_TO_END_OF_LINE = "\x1b[K";
 const LINE_FIT_MIN_SOURCE_CODE_UNITS = 4096;
 const LINE_FIT_MAX_SOURCE_CODE_UNITS = 65536;
 const LINE_FIT_SOURCE_WIDTH_MULTIPLIER = 64;
+// Text and Markdown strip untrusted OSC 133 before their output reaches the
+// renderer. Long-line fitting retains only the exact response-zone shape
+// synthesized by AssistantMessageComponent, so a truncated row stays balanced.
+const TRUSTED_RESPONSE_ZONE_START =
+	/^\x1b\]133;A;aid=omp-response-\d+-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[A-Za-z0-9_-]{1,128}\x07/;
+const RESPONSE_ZONE_CLOSE = "\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07";
 // Hide the hardware cursor before each paint/move write. Ghostty-style bar
 // cursors can otherwise leave visual afterimages while the TUI repaints the
 // row under a visible cursor. Paint writes also disable terminal autowrap:
@@ -2264,6 +2270,8 @@ export class TUI extends Container {
 			Math.max(LINE_FIT_MIN_SOURCE_CODE_UNITS, safeWidth * LINE_FIT_SOURCE_WIDTH_MULTIPLIER),
 		);
 		if (raw.length <= maxSourceLength) return raw;
+		const responseZoneStart = raw.match(TRUSTED_RESPONSE_ZONE_START)?.[0] ?? "";
+		const responseZoneClose = raw.endsWith(RESPONSE_ZONE_CLOSE) ? RESPONSE_ZONE_CLOSE : "";
 
 		let output = "";
 		let cells = 0;
@@ -2324,7 +2332,7 @@ export class TUI extends Container {
 			i = next;
 		}
 
-		return output + SEGMENT_RESET;
+		return responseZoneStart + output + responseZoneClose + SEGMENT_RESET;
 	}
 
 	#ansiSequenceEnd(line: string, start: number): number {

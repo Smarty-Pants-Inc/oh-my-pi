@@ -1,3 +1,4 @@
+import { stripOsc133Sequences } from "@oh-my-pi/pi-utils";
 import type { Component } from "../tui";
 import {
 	applyBackgroundToLine,
@@ -41,7 +42,7 @@ export class Text implements Component {
 	#cachedLines?: string[];
 
 	constructor(text: string = "", paddingX: number = 1, paddingY: number = 1, customBgFn?: (text: string) => string) {
-		this.#text = text;
+		this.#text = stripOsc133Sequences(text);
 		this.#paddingX = paddingX;
 		this.#paddingY = paddingY;
 		this.#customBgFn = customBgFn;
@@ -52,6 +53,7 @@ export class Text implements Component {
 	}
 
 	setText(text: string): boolean {
+		text = stripOsc133Sequences(text);
 		if (text === this.#text) {
 			return false;
 		}

@@ -2230,6 +2230,31 @@ describe("Markdown.render reference stability", () => {
 	});
 });
 
+describe("Markdown terminal control boundary", () => {
+	it("does not pass forged OSC 133 from Markdown source, including raw code cells, to the terminal", () => {
+		const forged = "\x1b]133;A;aid=forged\x07";
+		const raw = new Markdown(`before\n\n\`\`\`\n${forged}raw code\n\`\`\`\n\nafter`, 0, 0, defaultMarkdownTheme)
+			.render(80)
+			.join("\n");
+
+		expect(raw).not.toContain(forged);
+		expect(Bun.stripANSI(raw)).toContain("raw code");
+	});
+
+	it("withholds trailing partial OSC 133 prefixes while preserving SGR and OSC 8", () => {
+		const styled = "\x1b[31mred\x1b[0m";
+		const hyperlink = "\x1b]8;;https://example.com\x07link\x1b]8;;\x07";
+		for (const partial of ["\x1b]13", "\x9d13"]) {
+			const raw = new Markdown(`before${styled}${hyperlink}after${partial}`, 0, 0, defaultMarkdownTheme)
+				.render(80)
+				.join("\n");
+			expect(raw).not.toContain(partial);
+			expect(raw).toContain(styled);
+			expect(raw).toContain(hyperlink);
+		}
+	});
+});
+
 describe("Inline and block HTML tag rendering", () => {
 	const plainLines = (md: string, w = 80): string[] =>
 		new Markdown(md, 0, 0, defaultMarkdownTheme).render(w).map(line => stripVTControlCharacters(line).trimEnd());

@@ -51,7 +51,7 @@ function lineContaining(lines: string[], marker: string): number {
 	return index;
 }
 
-function createFixture(hideToolActivity = false) {
+function createFixture(hideToolActivity = false, hasTransformAssistantMessage = false) {
 	const chatContainer = new TranscriptContainer();
 	chatContainer.setToolActivityVisible(!hideToolActivity);
 	const pendingTools = new Map();
@@ -66,6 +66,7 @@ function createFixture(hideToolActivity = false) {
 		extensionRunner: undefined,
 		isTtsrAbortPending: false,
 		retryAttempt: 0,
+		agent: { transformAssistantMessage: hasTransformAssistantMessage ? vi.fn() : undefined },
 	};
 	let hasDisplayableThinkingContent = false;
 	const ctx = {
@@ -148,7 +149,9 @@ describe("EventController mixed assistant text/tool rendering", () => {
 		expect(orphan.isTranscriptBlockFinalized()).toBe(true);
 	});
 
-	it("keeps a pre-tool reply candidate mutable until message_end assigns its anchor", async () => {
+	it("retires pre-tool text before a live tool preview for an ordinary session", async () => {
+		// A finalized leading block can be offered to native scrollback while the
+		// following tool card stays live and grows with its streaming preview.
 		const { controller, chatContainer } = createFixture();
 		const toolCall: ToolCall = {
 			type: "toolCall",
@@ -170,9 +173,10 @@ describe("EventController mixed assistant text/tool rendering", () => {
 		const leading = chatContainer.children[0] as Component & {
 			isTranscriptBlockFinalized(): boolean;
 		};
-		expect(leading.isTranscriptBlockFinalized()).toBe(false);
-		expect(chatContainer.peekFinalizedBatch(120, 0)).toBeUndefined();
-		expect(chatContainer.render(120).join("\n")).not.toContain("\x1b]133;A;aid=omp-response-");
+		expect(leading.isTranscriptBlockFinalized()).toBe(true);
+		const retired = chatContainer.peekFinalizedBatch(120, 0);
+		expect(retired?.rows.join("\n")).toContain(INTRO_MARKER);
+		expect(retired?.rows.join("\n")).not.toContain("\x1b]133;A;aid=omp-response-");
 
 		await controller.handleEvent({ type: "message_end", message } as Extract<
 			AgentSessionEvent,
@@ -180,7 +184,77 @@ describe("EventController mixed assistant text/tool rendering", () => {
 		>);
 
 		expect(leading.isTranscriptBlockFinalized()).toBe(true);
-		expect(chatContainer.peekFinalizedBatch(120, 0)?.rows.join("\n")).toContain("\x1b]133;A;aid=omp-response-");
+		expect(chatContainer.render(120).join("\n")).not.toContain("\x1b]133;A;aid=omp-response-");
+	});
+
+	it("keeps pre-tool text mutable until message_end when a transform hook exists", async () => {
+		const { controller, chatContainer } = createFixture(false, true);
+		const toolCall: ToolCall = {
+			type: "toolCall",
+			id: TOOL_CALL_A_ID,
+			name: "contract_probe_a",
+			arguments: { value: "preview" },
+		};
+		const preview = assistantMessage([{ type: "text", text: INTRO_MARKER }, toolCall]);
+		const finalText = "FINAL TEXT AFTER TRANSFORM";
+		const final = assistantMessage([{ type: "text", text: finalText }, toolCall]);
+
+		await controller.handleEvent({ type: "message_start", message: assistantMessage([]) } as Extract<
+			AgentSessionEvent,
+			{ type: "message_start" }
+		>);
+		await controller.handleEvent({ type: "message_update", message: preview } as Extract<
+			AgentSessionEvent,
+			{ type: "message_update" }
+		>);
+
+		const leading = chatContainer.children[0] as Component & {
+			isTranscriptBlockFinalized(): boolean;
+		};
+		expect(leading.isTranscriptBlockFinalized()).toBe(false);
+		expect(chatContainer.peekFinalizedBatch(120, 0)).toBeUndefined();
+
+		await controller.handleEvent({ type: "message_end", message: final } as Extract<
+			AgentSessionEvent,
+			{ type: "message_end" }
+		>);
+
+		expect(leading.isTranscriptBlockFinalized()).toBe(true);
+		const rendered = Bun.stripANSI(chatContainer.render(120).join("\n"));
+		expect(rendered).toContain(finalText);
+		expect(rendered).not.toContain(INTRO_MARKER);
+	});
+
+	it("does not use pre-tool text when the final post-tool Markdown has no glyphs", async () => {
+		const { controller, chatContainer } = createFixture();
+		const toolCall: ToolCall = {
+			type: "toolCall",
+			id: TOOL_CALL_A_ID,
+			name: "contract_probe_a",
+			arguments: { value: "a" },
+		};
+		const message = assistantMessage([
+			{ type: "text", text: INTRO_MARKER },
+			toolCall,
+			{ type: "text", text: "[hidden-reference]: https://example.test/reference" },
+		]);
+
+		await controller.handleEvent({ type: "message_start", message: assistantMessage([]) } as Extract<
+			AgentSessionEvent,
+			{ type: "message_start" }
+		>);
+		await controller.handleEvent({ type: "message_update", message } as Extract<
+			AgentSessionEvent,
+			{ type: "message_update" }
+		>);
+		await controller.handleEvent({ type: "message_end", message } as Extract<
+			AgentSessionEvent,
+			{ type: "message_end" }
+		>);
+
+		const raw = chatContainer.render(120).join("\n");
+		expect(Bun.stripANSI(raw)).toContain(INTRO_MARKER);
+		expect(raw).not.toContain("\x1b]133;A;aid=omp-response-");
 	});
 
 	it("renders assistant text segments in order around two tool results from one mixed message", async () => {

@@ -178,6 +178,7 @@ export class LiveCommandController {
 		};
 		component.updateContent(message, { transient: !transcript.final });
 		if (transcript.final) {
+			component.setResponseAnchor(true);
 			component.markTranscriptBlockFinalized();
 			this.#assistantTranscriptComponent = undefined;
 			this.#assistantTranscriptStartedAt = 0;
@@ -192,6 +193,7 @@ export class LiveCommandController {
 	#finalizeAssistantTranscript(): void {
 		const component = this.#assistantTranscriptComponent;
 		if (!component) return;
+		component.setResponseAnchor(true);
 		component.markTranscriptBlockFinalized();
 		this.#assistantTranscriptComponent = undefined;
 		this.#assistantTranscriptStartedAt = 0;

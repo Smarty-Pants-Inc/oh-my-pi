@@ -75,6 +75,9 @@ async function settle(): Promise<void> {
 	await Bun.sleep(0);
 }
 
+const RESPONSE_ZONE_START = "\x1b]133;A;aid=omp-response-123-01234567-89ab-cdef-0123-456789abcdef:anchor\x07";
+const RESPONSE_ZONE_CLOSE = "\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07";
+
 describe("issue #2045: renderer bounds oversized rows", () => {
 	it("preserves visible text after pathological zero-width ANSI prefixes", async () => {
 		const term = new CaptureTerminal(80, 4);
@@ -145,5 +148,62 @@ describe("issue #2045: renderer bounds oversized rows", () => {
 
 		const rendered = term.writes.join("");
 		expect(rendered).toContain(visibleText);
+	});
+
+	it("keeps a response zone balanced around the first and last glyph rows after fitting", async () => {
+		const term = new CaptureTerminal(8, 4);
+		const tui = new TUI(term);
+		const zeroWidthNoise = "\x1b[31m".repeat(1_000);
+		tui.addChild(
+			new RawLinesComponent([
+				`${RESPONSE_ZONE_START}${zeroWidthNoise}first`,
+				`${zeroWidthNoise}last${RESPONSE_ZONE_CLOSE}`,
+			]),
+		);
+		try {
+			tui.start();
+			await settle();
+		} finally {
+			tui.stop();
+		}
+
+		const rendered = term.writes.join("");
+		expect(rendered.split(RESPONSE_ZONE_START)).toHaveLength(2);
+		expect(rendered.split(RESPONSE_ZONE_CLOSE)).toHaveLength(2);
+		const rows = rendered.split("\r\n");
+		expect(rows.findIndex(row => row.includes(RESPONSE_ZONE_START))).toBe(
+			rows.findIndex(row => row.includes("first")),
+		);
+		expect(rows.findIndex(row => row.includes(RESPONSE_ZONE_CLOSE))).toBe(
+			rows.findIndex(row => row.includes("last")),
+		);
+		expect(rendered.indexOf(RESPONSE_ZONE_START)).toBeLessThan(rendered.indexOf("first"));
+		expect(rendered.indexOf(RESPONSE_ZONE_CLOSE)).toBeGreaterThan(rendered.indexOf("last"));
+		expect(rendered).not.toContain("\x1b[31m");
+	});
+
+	it("keeps a one-row response zone balanced when fitting drops zero-width controls", async () => {
+		const term = new CaptureTerminal(8, 4);
+		const tui = new TUI(term);
+		const zeroWidthNoise = "\x1b[31m".repeat(1_000);
+		const visible = "single-row";
+		tui.addChild(new RawLinesComponent([`${RESPONSE_ZONE_START}${zeroWidthNoise}${visible}${RESPONSE_ZONE_CLOSE}`]));
+		try {
+			tui.start();
+			await settle();
+		} finally {
+			tui.stop();
+		}
+
+		const rendered = term.writes.join("");
+		expect(rendered.split(RESPONSE_ZONE_START)).toHaveLength(2);
+		expect(rendered.split(RESPONSE_ZONE_CLOSE)).toHaveLength(2);
+		const rows = rendered.split("\r\n");
+		const visibleRow = rows.findIndex(row => row.includes(visible.slice(0, 8)));
+		expect(rows.findIndex(row => row.includes(RESPONSE_ZONE_START))).toBe(visibleRow);
+		expect(rows.findIndex(row => row.includes(RESPONSE_ZONE_CLOSE))).toBe(visibleRow);
+		expect(rendered.indexOf(RESPONSE_ZONE_START)).toBeLessThan(rendered.indexOf(visible.slice(0, 8)));
+		expect(rendered.indexOf(RESPONSE_ZONE_CLOSE)).toBeGreaterThan(rendered.indexOf(visible.slice(0, 8)));
+		expect(rendered).not.toContain("\x1b[31m");
 	});
 });

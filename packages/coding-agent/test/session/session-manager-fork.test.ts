@@ -1,6 +1,8 @@
 import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import { isSafeResponseAnchorId, responseAnchorIdForEntry } from "@oh-my-pi/pi-coding-agent/session/response-anchor";
 import {
 	CURRENT_SESSION_VERSION,
 	type SessionHeader,
@@ -138,6 +140,98 @@ describe("SessionManager forks", () => {
 			}
 			setAgentDir(previousAgentDir);
 		}
+	});
+
+	it("hydrates distinct stable response anchors for equal-timestamp legacy assistants on load and import", async () => {
+		using tempDir = TempDir.createSync("@omp-legacy-response-anchors-");
+		const cwd = path.join(tempDir.path(), "project");
+		const sessionDir = path.join(tempDir.path(), "sessions");
+		const sourceFile = path.join(sessionDir, "legacy.jsonl");
+		const timestamp = new Date().toISOString();
+		await fs.mkdir(cwd, { recursive: true });
+		await fs.mkdir(sessionDir, { recursive: true });
+		const header: SessionHeader = {
+			type: "session",
+			version: CURRENT_SESSION_VERSION,
+			id: "legacy-response-anchor-source",
+			timestamp,
+			cwd,
+		};
+		const legacyAssistant = (
+			id: string,
+			parentId: string | null,
+			text: string,
+			responseAnchorId?: string,
+		): SessionMessageEntry => {
+			const message: AssistantMessage = {
+				role: "assistant",
+				content: [{ type: "text", text }],
+				api: "anthropic-messages",
+				provider: "anthropic",
+				model: "claude",
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: 777,
+				...(responseAnchorId === undefined ? {} : { responseAnchorId }),
+			};
+			return { type: "message", id, parentId, timestamp, message };
+		};
+		const firstAssistant = legacyAssistant("legacy-anchor-a", null, "first legacy answer", "shared-response-anchor");
+		const duplicateAssistant = legacyAssistant(
+			"legacy-anchor-b",
+			"legacy-anchor-a",
+			"second legacy answer",
+			"shared-response-anchor",
+		);
+		const missingAnchorAssistant = legacyAssistant("legacy-anchor-c", "legacy-anchor-b", "third legacy answer");
+		const sourceText = `${[
+			JSON.stringify(header),
+			JSON.stringify(firstAssistant),
+			JSON.stringify(duplicateAssistant),
+			JSON.stringify(missingAnchorAssistant),
+		].join("\n")}\n`;
+		await Bun.write(sourceFile, sourceText);
+
+		const anchorsFor = (manager: SessionManager): string[] => {
+			const anchors: string[] = [];
+			for (const message of manager.buildSessionContext({ transcript: true }).messages) {
+				if (message.role !== "assistant") continue;
+				if (!message.responseAnchorId) throw new Error("Expected hydrated response anchor id");
+				anchors.push(message.responseAnchorId);
+			}
+			return anchors;
+		};
+
+		const loaded = await SessionManager.open(sourceFile);
+		const loadedAnchors = anchorsFor(loaded);
+		expect(loadedAnchors).toEqual([
+			"shared-response-anchor",
+			responseAnchorIdForEntry("legacy-anchor-b"),
+			responseAnchorIdForEntry("legacy-anchor-c"),
+		]);
+		expect(new Set(loadedAnchors).size).toBe(3);
+		expect(loadedAnchors.every(isSafeResponseAnchorId)).toBe(true);
+		expect(await Bun.file(sourceFile).text()).toBe(sourceText);
+
+		const imported = await SessionManager.forkFrom(sourceFile, cwd, sessionDir, undefined, {
+			suppressBreadcrumb: true,
+		});
+		expect(anchorsFor(imported)).toEqual(loadedAnchors);
+		const importedFile = imported.getSessionFile();
+		if (!importedFile) throw new Error("Expected imported session file");
+		const persistedAnchors = (await loadEntriesFromFile(importedFile)).flatMap(entry =>
+			entry.type === "message" && entry.message.role === "assistant" ? [entry.message.responseAnchorId] : [],
+		);
+		expect(persistedAnchors).toEqual(loadedAnchors);
+		expect(await Bun.file(sourceFile).text()).toBe(sourceText);
+		await Promise.all([loaded.close(), imported.close()]);
 	});
 
 	it("copies source artifacts recursively into the fork by default", async () => {

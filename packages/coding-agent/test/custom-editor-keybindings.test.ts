@@ -119,4 +119,13 @@ describe("shipped dequeue defaults", () => {
 
 		expect(onDequeue).toHaveBeenCalledTimes(2);
 	});
+	it("leaves plain Alt+Up unclaimed for terminal-host response navigation", () => {
+		const editor = new CustomEditor(getEditorTheme());
+		const onDequeue = vi.fn();
+
+		editor.onDequeue = onDequeue;
+		editor.handleInput("\x1b[1;3A");
+
+		expect(onDequeue).not.toHaveBeenCalled();
+	});
 });

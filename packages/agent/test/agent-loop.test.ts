@@ -5143,6 +5143,50 @@ describe("agentLoop streaming snapshots", () => {
 		// partial, never the mutable partial object itself.
 		expect(update.message).not.toBe(livePartial);
 	});
+
+	it("assigns one response anchor before live snapshots and into the final result", async () => {
+		const context: AgentContext = {
+			systemPrompt: ["You are helpful."],
+			messages: [],
+			tools: [],
+		};
+		const config: AgentLoopConfig = {
+			model: createMockModel().model,
+			convertToLlm: identityConverter,
+		};
+		const livePartial = createAssistantMessage([{ type: "text", text: "Hi" }], "stop");
+		const completedMessage = createAssistantMessage([{ type: "text", text: "Hi" }], "stop");
+		const streamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			stream.push({ type: "start", partial: livePartial });
+			stream.push({ type: "text_delta", contentIndex: 0, delta: "Hi", partial: livePartial });
+			stream.push({ type: "done", reason: "stop", message: completedMessage });
+			return stream;
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([createUserMessage("say hi")], context, config, undefined, streamFn);
+		for await (const event of stream) events.push(event);
+		const messages = await stream.result();
+		const snapshots: AssistantMessage[] = [];
+		for (const event of events) {
+			if (
+				(event.type === "message_start" || event.type === "message_end" || event.type === "message_update") &&
+				event.message.role === "assistant"
+			) {
+				snapshots.push(event.message);
+			}
+		}
+
+		expect(snapshots).toHaveLength(3);
+		const responseAnchorId = snapshots[0]?.responseAnchorId;
+		if (!responseAnchorId) throw new Error("Expected response anchor on the first live assistant snapshot");
+		for (const snapshot of snapshots) expect(snapshot.responseAnchorId).toBe(responseAnchorId);
+
+		const finalized = messages.at(-1);
+		if (!finalized || finalized.role !== "assistant") throw new Error("Expected finalized assistant message");
+		expect(finalized.responseAnchorId).toBe(responseAnchorId);
+	});
 });
 
 describe("agentLoop kCursorExecResolved (issue #4348)", () => {

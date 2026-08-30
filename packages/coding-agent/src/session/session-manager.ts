@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type {
+	AssistantMessage,
 	ImageContent,
 	Message,
 	MessageAttribution,
@@ -37,6 +38,7 @@ import {
 	sanitizeRehydratedOpenAIResponsesAssistantMessage,
 	stripInternalDetailsFields,
 } from "./messages";
+import { responseAnchorIdForEntry, stampAssistantResponseAnchorId } from "./response-anchor";
 import { type BuildSessionContextOptions, buildSessionContext, type SessionContext } from "./session-context";
 import {
 	type BranchSummaryEntry,
@@ -215,8 +217,29 @@ function addUsage(target: UsageStatistics, usage: Usage | undefined): void {
 	target.cost += usage.cost.total;
 }
 
-function isAssistantEntry(entry: SessionEntry): boolean {
+function isAssistantEntry(entry: SessionEntry): entry is SessionMessageEntry & { message: AssistantMessage } {
 	return entry.type === "message" && entry.message.role === "assistant";
+}
+
+function stampLoadedAssistantResponseAnchor(entry: SessionEntry): void {
+	if (isAssistantEntry(entry)) stampAssistantResponseAnchorId(entry.message, entry.id);
+}
+
+function stampLoadedAssistantResponseAnchors(entries: readonly SessionEntry[]): void {
+	const seen = new Set<string>();
+	for (const entry of entries) {
+		if (!isAssistantEntry(entry)) continue;
+		stampAssistantResponseAnchorId(entry.message, entry.id);
+		let responseAnchorId = entry.message.responseAnchorId;
+		if (!responseAnchorId || seen.has(responseAnchorId)) {
+			responseAnchorId = responseAnchorIdForEntry(entry.id);
+			for (let suffix = 1; seen.has(responseAnchorId); suffix++) {
+				responseAnchorId = responseAnchorIdForEntry(`${entry.id}:${suffix}`);
+			}
+			entry.message.responseAnchorId = responseAnchorId;
+		}
+		seen.add(responseAnchorId);
+	}
 }
 
 function isDraftOnlyMetadataEntry(entry: SessionEntry): boolean {
@@ -1229,6 +1252,7 @@ export class SessionManager {
 	}
 
 	#applyEntries(header: SessionHeader, entries: SessionEntry[], leafId?: string | null): void {
+		stampLoadedAssistantResponseAnchors(entries);
 		this.#header = header;
 		this.#entries = entries;
 		this.#sessionId = header.id;
@@ -1294,6 +1318,7 @@ export class SessionManager {
 			logger.warn("Dropped session entry appended after terminal release", { type: entry.type });
 			return;
 		}
+		stampLoadedAssistantResponseAnchor(entry);
 		this.#entries.push(entry);
 		this.#index.insert(entry);
 		const batch = this.#atomicEntryBatch;
@@ -2574,7 +2599,9 @@ export class SessionManager {
 			| PythonExecutionMessage
 			| FileMentionMessage,
 	): string {
-		const entry: SessionMessageEntry = { type: "message", ...this.#freshEntryFields(), message };
+		const fields = this.#freshEntryFields();
+		if (message.role === "assistant") stampAssistantResponseAnchorId(message);
+		const entry: SessionMessageEntry = { type: "message", ...fields, message };
 		this.#recordEntry(entry);
 		return entry.id;
 	}
@@ -2595,9 +2622,11 @@ export class SessionManager {
 	): string {
 		if (parentId !== null && !this.#index.has(parentId)) throw new Error(`Entry ${parentId} not found`);
 		const activeLeafId = this.#index.leafId();
+		const id = generateId(this.#index);
+		if (message.role === "assistant") stampAssistantResponseAnchorId(message);
 		const entry: SessionMessageEntry = {
 			type: "message",
-			id: generateId(this.#index),
+			id,
 			parentId,
 			timestamp: nowIso(),
 			message,
@@ -3139,6 +3168,7 @@ export class SessionManager {
 
 		const sourceHeader = sourceEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
 		const journal = restoreSessionJournal(sourceEntries);
+		stampLoadedAssistantResponseAnchors(journal.entries);
 		manager.#resetToNewSession(
 			{
 				parentSession: sourceHeader?.id,

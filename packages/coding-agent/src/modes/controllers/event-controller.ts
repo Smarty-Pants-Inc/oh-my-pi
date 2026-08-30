@@ -1070,17 +1070,10 @@ export class EventController {
 				this.#lastVisibleBlockCount = visibleBlockCount;
 			}
 
-			// Content blocks stream sequentially: a toolCall block can only begin
-			// after every preceding thinking/text block has closed, and the reveal's
-			// setTarget above force-completes the visible text for toolCall messages.
-			// Finalize early only when the leading block cannot still be this message's
-			// final reply segment. A pre-tool text candidate must stay mutable until
-			// message_end assigns its OSC 133 anchor; retiring it first would commit
-			// immutable rows that can no longer receive the marker.
-			if (
-				this.ctx.streamingMessage.content.some(content => content.type === "toolCall") &&
-				timeline.replySegment !== timeline.beforeTools
-			) {
+			// A tool call makes every leading assistant row intermediate only when the
+			// streaming preview is authoritative. A final-message transform may still
+			// rewrite it, so defer retirement until message_end in that case.
+			if (timeline.hasToolCalls && this.ctx.session.agent.transformAssistantMessage === undefined) {
 				this.ctx.streamingComponent.markTranscriptBlockFinalized();
 			}
 			for (let contentIndex = 0; contentIndex < this.ctx.streamingMessage.content.length; contentIndex++) {

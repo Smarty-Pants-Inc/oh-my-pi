@@ -56,6 +56,14 @@ describe("UserMessageComponent magic-keyword highlighting", () => {
 		expect(raw).not.toContain("\x1b]133;");
 	});
 
+	it("does not pass forged OSC 133 from imported user text to the terminal", () => {
+		const forged = "\x1b]133;A;aid=forged\x07";
+		const raw = render(`before${forged}after`);
+
+		expect(raw).not.toContain(forged);
+		expect(Bun.stripANSI(raw)).toContain("beforeafter");
+	});
+
 	it("collapses image markers to identity-colored chip tokens in the rendered bubble", () => {
 		// Wire format stays `[Image #1, WxH]`; the bubble shows the composer's compact chip.
 		const raw = render("please inspect [Image #1, 800x600] before continuing");

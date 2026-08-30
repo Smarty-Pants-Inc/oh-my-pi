@@ -220,17 +220,14 @@ export function splitAssistantMessageToolTimeline(message: AssistantAgentMessage
 
 	const beforeTools = sawToolCall ? displaySegment(beforeToolsContent) : message;
 	const replyEligible = message.stopReason !== "aborted" && message.stopReason !== "error";
-	let replySegment =
-		replyEligible && beforeTools.content.some(content => content.type === "text" && canonicalizeMessage(content.text))
-			? beforeTools
+	const finalSegment = sawToolCall && lastToolCallId ? afterToolCalls.get(lastToolCallId) : beforeTools;
+	// A tool call turns everything before it into intermediate transcript content.
+	// Only text after the final call can be a terminal-navigation reply target.
+	const replySegment =
+		replyEligible &&
+		finalSegment?.content.some(content => content.type === "text" && canonicalizeMessage(content.text))
+			? finalSegment
 			: undefined;
-	if (replyEligible) {
-		for (const segment of afterToolCalls.values()) {
-			if (segment.content.some(content => content.type === "text" && canonicalizeMessage(content.text))) {
-				replySegment = segment;
-			}
-		}
-	}
 
 	return { beforeTools, afterToolCalls, hasToolCalls: sawToolCall, replySegment };
 }

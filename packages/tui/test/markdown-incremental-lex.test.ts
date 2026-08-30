@@ -456,3 +456,26 @@ describe("Markdown OSC 8 tail normalization across streaming appends", () => {
 		expect(streaming.render(60)).toEqual(renderCold(`${truncated}|${ST}`, 60));
 	});
 });
+
+describe("Markdown OSC 133 sanitation across streaming appends", () => {
+	it("strips a split control without changing adjacent SGR or OSC 8 output", () => {
+		const styled = "\x1b[31mred\x1b[0m";
+		const hyperlink = "\x1b]8;;https://example.com\x07link\x1b]8;;\x07";
+		const chunks = [`before${styled}\x1b]13`, "3;A;aid=forged\x1b", `\\${hyperlink}after`];
+		const streaming = new Markdown("", 0, 0, THEME);
+		let text = "";
+		for (const chunk of chunks) {
+			text += chunk;
+			clearRenderCache();
+			streaming.setText(text);
+			expect(streaming.render(60)).toEqual(renderCold(text, 60));
+		}
+
+		const raw = streaming.render(60).join("\n");
+		expect(raw).not.toContain("\x1b]133;");
+		expect(raw).toContain(styled);
+		expect(raw).toContain(hyperlink);
+		expect(Bun.stripANSI(raw)).toContain("before");
+		expect(Bun.stripANSI(raw)).toContain("after");
+	});
+});

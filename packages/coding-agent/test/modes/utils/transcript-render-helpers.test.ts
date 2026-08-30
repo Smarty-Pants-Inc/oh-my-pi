@@ -54,7 +54,7 @@ describe("assistantUsageIsBilled", () => {
 });
 
 describe("splitAssistantMessageToolTimeline response navigation", () => {
-	it("selects only the final non-empty text segment as the reply stop", () => {
+	it("selects only text after the final tool call as the reply stop", () => {
 		const timeline = splitAssistantMessageToolTimeline(
 			assistant([
 				{ type: "thinking", thinking: "reasoning before the reply" },
@@ -71,11 +71,26 @@ describe("splitAssistantMessageToolTimeline response navigation", () => {
 		expect(
 			splitAssistantMessageToolTimeline(
 				assistant([
-					{ type: "thinking", thinking: "reasoning only" },
-					{ type: "toolCall", id: "only-tool", name: "read", arguments: {} },
+					{ type: "text", text: "intro" },
+					{ type: "toolCall", id: "a", name: "read", arguments: {} },
+					{ type: "text", text: "middle after the first tool" },
+					{ type: "toolCall", id: "b", name: "bash", arguments: {} },
 				]),
 			).replySegment,
 		).toBeUndefined();
+	});
+
+	it("keeps a hidden final post-tool segment instead of falling back to pre-tool text", () => {
+		const timeline = splitAssistantMessageToolTimeline(
+			assistant([
+				{ type: "text", text: "visible text before the tool" },
+				{ type: "toolCall", id: "a", name: "read", arguments: {} },
+				{ type: "text", text: "[hidden-reference]: https://example.test/reference" },
+			]),
+		);
+
+		expect(timeline.replySegment).toBe(timeline.afterToolCalls.get("a"));
+		expect(timeline.replySegment).not.toBe(timeline.beforeTools);
 	});
 
 	it("does not select aborted or failed partial text as a finalized reply stop", () => {

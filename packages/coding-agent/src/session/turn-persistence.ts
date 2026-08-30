@@ -9,9 +9,9 @@
  * Long-running sessions with many subagents fired this thousands of times per
  * minute and froze the TUI loop (see issue #3629). The persistence key already
  * encodes a stable logical identity — timestamp + role-specific discriminators
- * — so the structural compare is now the rare collision tiebreaker (e.g. two
- * provider responses at the same millisecond with `undefined` responseId),
- * not the load-bearing check.
+ * — so the structural compare is now the rare legacy collision tiebreaker
+ * (e.g. imported provider responses at the same millisecond without a
+ * responseAnchorId), not the load-bearing check.
  *
  * The helpers here keep that identity in one place and expose the planner so
  * the persistence-ordering logic is unit-testable without standing up an
@@ -26,9 +26,9 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
  * The discriminators chosen per role are precisely the fields that uniquely
  * identify a single logical message instance:
  *
- * - `assistant` — timestamp + provider + model + responseId + stopReason
- *   (responseId is the canonical provider-side id when available; the rest
- *   disambiguate when it is not, e.g. local/dev models).
+ * - `assistant` — timestamp + provider + model + responseId + responseAnchorId
+ *   + stopReason. `responseAnchorId` is generated locally for every live
+ *   response; responseId remains the provider-side identifier when available.
  * - `toolResult` — timestamp + toolCallId + toolName (toolCallId is unique
  *   per execution; toolName guards against synthetic reuse).
  * - `user` / `developer` — timestamp + attribution (attribution distinguishes
@@ -48,6 +48,7 @@ export function sessionMessagePersistenceKey(message: AgentMessage): string | un
 				message.provider,
 				message.model,
 				message.responseId ?? "",
+				message.responseAnchorId ?? "",
 				message.stopReason,
 			].join(":");
 		case "toolResult":
@@ -71,10 +72,10 @@ export function sessionMessagePersistenceKey(message: AgentMessage): string | un
  * Most calls into the persistence path never reach this — keys are unique
  * enough in production that the snapshot lookup short-circuits at the key
  * level. Restoring the structural compare here preserves the pre-#3629
- * contract that two messages with the same metadata BUT different content are
- * distinct (e.g. two assistant turns with `undefined` responseId emitted in
- * the same wall-clock millisecond, which is exactly how the in-memory test
- * harness crafts streamed responses).
+ * contract that two legacy messages with the same metadata BUT different
+ * content are distinct (e.g. imported assistant turns with `undefined`
+ * responseId and responseAnchorId emitted in the same wall-clock millisecond,
+ * which is exactly how the in-memory test harness crafts streamed responses).
  */
 export function sameMessageContent(left: AgentMessage, right: AgentMessage): boolean {
 	if (left === right) return true;

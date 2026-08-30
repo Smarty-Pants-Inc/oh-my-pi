@@ -135,6 +135,37 @@ describe("ToolExecutionComponent custom renderer failures", () => {
 		expect(rendered).toContain(resultText);
 		expect(rendered).not.toContain("no matches");
 	});
+
+	it("does not emit forged OSC 133 from generic tool output", () => {
+		const forgedOutput = "before\x1b]133;A;aid=forged\x07after";
+		const tool: AgentTool = {
+			name: "safe_tool",
+			label: "Safe Tool",
+			description: "renders output",
+			parameters: { type: "object", additionalProperties: true },
+			async execute() {
+				return { content: [{ type: "text", text: forgedOutput }] };
+			},
+		};
+		const ui: ToolExecutionUi = {
+			requestRender() {},
+			requestComponentRender(_component: Component) {},
+			resetDisplay() {},
+		};
+		const component = new ToolExecutionComponent(
+			"safe_tool",
+			{},
+			{ showImages: false, useBuiltInRenderer: false },
+			tool,
+			ui,
+			process.cwd(),
+		);
+		component.updateResult({ content: [{ type: "text", text: forgedOutput }] }, false);
+
+		const rendered = component.render(80).join("\n");
+		expect(rendered).not.toContain("\x1b]133;");
+		expect(visibleText(component.render(80))).toContain("beforeafter");
+	});
 });
 
 describe("MCP result Markdown rendering", () => {

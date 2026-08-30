@@ -9,11 +9,13 @@ import {
 	Spacer,
 	TERMINAL,
 	Text,
+	visibleWidth,
 } from "@oh-my-pi/pi-tui";
 import { formatNumber } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import type { AssistantThinkingRenderer } from "../../extensibility/extensions/types";
 import { getMarkdownTheme, theme } from "../../modes/theme/theme";
+import { createResponseAnchorId, responseAnchorIdOrFallback } from "../../session/response-anchor";
 import { expandKeyHint, getPreviewLines, resolveImageOptions, TRUNCATE_LENGTHS } from "../../tools/render-utils";
 import { convertImageToPng } from "../../utils/image-loading";
 import { canonicalizeMessage, formatThinkingForDisplay, hasDisplayableThinking } from "../../utils/thinking-display";
@@ -23,35 +25,51 @@ import { type CacheInvalidation, CacheInvalidationMarkerComponent } from "./cach
 // Herdr consumes the aid to distinguish OMP reply rows from shell prompts;
 // Ghostty-compatible terminals ignore the option while retaining OSC 133 semantics.
 // The process session lets Herdr discard anchors from an earlier OMP in the same
-// pane; the message timestamp lets it deduplicate redraws and transcript rebuilds.
+// pane. Persisted IDs must pass the shared 128-byte safe-ID bound before they
+// enter OSC; an invalid record instead receives this component's stable fallback.
 // Keep the zone balanced inside one Markdown block: 133;B latches `.input` until
 // 133;C, and leaving it open makes later transcript cells behave like editable
 // prompt input (#8030, #6115).
-const OSC133_RESPONSE_SESSION = `${process.pid}-${Date.now().toString(36)}`;
-let unidentifiedResponseAnchor = 0;
-const responseZoneStart = (message?: AssistantMessage): string => {
-	const replyId = message?.timestamp ?? `component-${++unidentifiedResponseAnchor}`;
-	return `\x1b]133;A;aid=omp-response-${OSC133_RESPONSE_SESSION}:${replyId}\x07`;
-};
+const OSC133_RESPONSE_SESSION = `${process.pid}-${createResponseAnchorId()}`;
+const responseZoneStart = (responseAnchorId: unknown, fallbackId: string): string =>
+	`\x1b]133;A;aid=omp-response-${OSC133_RESPONSE_SESSION}:${responseAnchorIdOrFallback(responseAnchorId, fallbackId)}\x07`;
 const OSC133_ZONE_CLOSE = "\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07";
 
 class ResponseAnchorMarkdown extends Markdown {
-	constructor(
-		private readonly zoneStart: string,
-		...args: ConstructorParameters<typeof Markdown>
-	) {
-		super(...args);
-	}
-
+	#zoneStart: string;
 	#enabled = false;
 	#zoneSource: readonly string[] | undefined;
 	#zoneLines: string[] | undefined;
+
+	constructor(zoneStart: string, ...args: ConstructorParameters<typeof Markdown>) {
+		super(...args);
+		this.#zoneStart = zoneStart;
+	}
 
 	setEnabled(enabled: boolean): void {
 		if (this.#enabled === enabled) return;
 		this.#enabled = enabled;
 		this.#zoneSource = undefined;
 		this.#zoneLines = undefined;
+	}
+
+	setZoneStart(zoneStart: string): void {
+		if (this.#zoneStart === zoneStart) return;
+		this.#zoneStart = zoneStart;
+		this.#zoneSource = undefined;
+		this.#zoneLines = undefined;
+	}
+
+	hasVisibleGlyphCells(width: number): boolean {
+		return this.#visibleGlyphLineIndex(super.render(width)) !== undefined;
+	}
+
+	#visibleGlyphLineIndex(lines: readonly string[], fromEnd = false): number | undefined {
+		for (let offset = 0; offset < lines.length; offset++) {
+			const index = fromEnd ? lines.length - offset - 1 : offset;
+			if (visibleWidth(lines[index]!.trim()) > 0) return index;
+		}
+		return undefined;
 	}
 
 	override invalidate(): void {
@@ -64,9 +82,12 @@ class ResponseAnchorMarkdown extends Markdown {
 		const lines = super.render(width);
 		if (!this.#enabled || lines.length === 0) return lines;
 		if (this.#zoneSource === lines && this.#zoneLines !== undefined) return this.#zoneLines;
+		const firstVisible = this.#visibleGlyphLineIndex(lines);
+		if (firstVisible === undefined) return lines;
+		const lastVisible = this.#visibleGlyphLineIndex(lines, true)!;
 		const wrapped = lines.slice();
-		wrapped[0] = this.zoneStart + wrapped[0];
-		wrapped[wrapped.length - 1] += OSC133_ZONE_CLOSE;
+		wrapped[firstVisible] = this.#zoneStart + wrapped[firstVisible];
+		wrapped[lastVisible] += OSC133_ZONE_CLOSE;
 		this.#zoneSource = lines;
 		this.#zoneLines = wrapped;
 		return wrapped;
@@ -249,7 +270,8 @@ export class AssistantMessageComponent extends Container {
 	 */
 	#blockVersion = 0;
 	#responseAnchor = false;
-	#responseAnchorTarget: ResponseAnchorMarkdown | undefined;
+	#responseAnchorCandidates: ResponseAnchorMarkdown[] = [];
+	#responseAnchorFallbackId = createResponseAnchorId();
 	#responseZoneStart: string;
 	/** Whether the last updateContent carried an in-flight streaming partial; such
 	 *  renders bypass the markdown module LRU (see Markdown.transientRenderCache). */
@@ -293,7 +315,7 @@ export class AssistantMessageComponent extends Container {
 		private proseOnlyThinking = true,
 	) {
 		super();
-		this.#responseZoneStart = responseZoneStart(message);
+		this.#responseZoneStart = responseZoneStart(message?.responseAnchorId, this.#responseAnchorFallbackId);
 		this.#transcriptBlockFinalized = message !== undefined;
 
 		// Slim cache-invalidation divider, populated above the content when this
@@ -324,12 +346,27 @@ export class AssistantMessageComponent extends Container {
 		this.#blockVersion++;
 	}
 
-	/** Mark the first visible text block as a terminal-native response stop. */
+	/** Mark the last visible text block as a terminal-native response stop. */
 	setResponseAnchor(enabled: boolean): void {
 		if (this.#responseAnchor === enabled) return;
 		this.#responseAnchor = enabled;
-		this.#responseAnchorTarget?.setEnabled(enabled);
 		this.#blockVersion++;
+	}
+
+	override render(width: number): readonly string[] {
+		width = Math.max(1, width);
+		let target: ResponseAnchorMarkdown | undefined;
+		if (this.#responseAnchor) {
+			for (let index = this.#responseAnchorCandidates.length - 1; index >= 0; index--) {
+				const candidate = this.#responseAnchorCandidates[index]!;
+				if (candidate.hasVisibleGlyphCells(width)) {
+					target = candidate;
+					break;
+				}
+			}
+		}
+		for (const candidate of this.#responseAnchorCandidates) candidate.setEnabled(candidate === target);
+		return super.render(width);
 	}
 
 	override invalidate(): void {
@@ -506,6 +543,7 @@ export class AssistantMessageComponent extends Container {
 			this.#lastMessage.provider,
 			this.#lastMessage.model,
 			this.#lastMessage.responseId ?? "",
+			this.#lastMessage.responseAnchorId ?? "",
 			this.#lastMessage.stopReason,
 		].join(":");
 	}
@@ -774,6 +812,12 @@ export class AssistantMessageComponent extends Container {
 		this.#lastMessage = message;
 		this.#lastUpdateTransient = opts?.transient === true;
 
+		const nextResponseZoneStart = responseZoneStart(message.responseAnchorId, this.#responseAnchorFallbackId);
+		if (nextResponseZoneStart !== this.#responseZoneStart) {
+			this.#responseZoneStart = nextResponseZoneStart;
+			for (const candidate of this.#responseAnchorCandidates) candidate.setZoneStart(nextResponseZoneStart);
+		}
+
 		// Streaming-speed gauge: only a live, in-flight render of the single
 		// animating hidden-thinking block feeds the shared session tracker. The
 		// token count is the provider's own cumulative output — reasoning tokens when
@@ -815,7 +859,7 @@ export class AssistantMessageComponent extends Container {
 
 		// Clear content container
 		this.#contentContainer.clear();
-		this.#responseAnchorTarget = undefined;
+		this.#responseAnchorCandidates = [];
 		this.#thinkingDots = undefined;
 		this.#hasTruncatableError = false;
 
@@ -840,16 +884,19 @@ export class AssistantMessageComponent extends Container {
 		for (let i = 0; i < message.content.length; i++) {
 			const content = message.content[i];
 			if (content.type === "text" && canonicalizeMessage(content.text)) {
-				// Set paddingY=0 to avoid extra spacing before tool executions
+				// Set paddingY=0 to avoid extra spacing before tool executions.
 				const trimmed = content.text.trim();
 				const mdOptions = this.#textColorTransform ? { color: this.#textColorTransform } : undefined;
-				const md: Markdown = this.#responseAnchorTarget
-					? new Markdown(trimmed, 1, 0, getMarkdownTheme(), mdOptions, 0)
-					: new ResponseAnchorMarkdown(this.#responseZoneStart, trimmed, 1, 0, getMarkdownTheme(), mdOptions, 0);
-				if (md instanceof ResponseAnchorMarkdown) {
-					md.setEnabled(this.#responseAnchor);
-					this.#responseAnchorTarget = md;
-				}
+				const md = new ResponseAnchorMarkdown(
+					this.#responseZoneStart,
+					trimmed,
+					1,
+					0,
+					getMarkdownTheme(),
+					mdOptions,
+					0,
+				);
+				this.#responseAnchorCandidates.push(md);
 				this.#contentContainer.addChild(md);
 				captureItems?.push({ md, contentIndex: i, blockType: "text", lastText: trimmed });
 				hasRenderedContent = true;

@@ -17,6 +17,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AsyncResultEntry } from "@oh-my-pi/pi-coding-agent/session/async-job-delivery";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { isSafeResponseAnchorId } from "@oh-my-pi/pi-coding-agent/session/response-anchor";
 import { type AdvisorStats, SessionAdvisors } from "@oh-my-pi/pi-coding-agent/session/session-advisors";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { Snowflake } from "@oh-my-pi/pi-utils";
@@ -228,12 +229,18 @@ describe("AgentSession.branchFromBtw", () => {
 		expect(promoted?.role).toBe("assistant");
 		if (promoted?.role !== "assistant") throw new Error("Expected promoted assistant message");
 		expectSanitizedBtwAssistant(promoted);
+		if (!promoted.responseAnchorId) throw new Error("Expected promoted response anchor id");
+		const promotedResponseAnchorId = promoted.responseAnchorId;
+		expect(isSafeResponseAnchorId(promotedResponseAnchorId)).toBe(true);
 		const reopened = await SessionManager.open(result.sessionFile!, tempDir, undefined, { suppressBreadcrumb: true });
 		try {
 			expect(JSON.stringify(reopened.getEntries())).toContain(`artifact://${historicalId}`);
 			const reopenedHistoricalPath = await reopened.getArtifactPath(historicalId);
 			expect(reopenedHistoricalPath).toBeString();
 			expect(await fs.promises.readFile(reopenedHistoricalPath as string)).toEqual(historicalBytes);
+			const reopenedPromoted = reopened.buildSessionContext().messages.at(-1);
+			if (reopenedPromoted?.role !== "assistant") throw new Error("Expected persisted promoted assistant message");
+			expect(reopenedPromoted.responseAnchorId).toBe(promotedResponseAnchorId);
 			const targetId = await reopened.saveArtifact("new /btw artifact", "btw");
 			expect(Number(targetId)).toBeGreaterThan(Number(historicalId));
 		} finally {

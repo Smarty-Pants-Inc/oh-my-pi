@@ -1,8 +1,9 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { LiveSessionController } from "@oh-my-pi/pi-coding-agent/live/controller";
+import { LiveSessionController, type LiveTranscript } from "@oh-my-pi/pi-coding-agent/live/controller";
 import { LiveVisualizer } from "@oh-my-pi/pi-coding-agent/live/visualizer";
 import { LiveCommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/live-command-controller";
+import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 
 /** Fake InteractiveModeContext plus typed capture channels for focus/mount traffic. */
@@ -16,6 +17,8 @@ interface ContextHarness {
 	mounted: unknown[];
 	/** Resolves when `ui.setFocus` sees the original editor again. */
 	editorRefocused: Promise<void>;
+	/** Assistant transcript components passed to the chat presenter. */
+	presented: unknown[];
 }
 
 function createContext(): ContextHarness {
@@ -25,8 +28,15 @@ function createContext(): ContextHarness {
 	};
 	const focused: unknown[] = [];
 	const mounted: unknown[] = [];
+	const presented: unknown[] = [];
+	const chatChildren: unknown[] = [];
 	const refocused = Promise.withResolvers<void>();
 	const ctx = {
+		effectiveHideThinkingBlock: false,
+		viewSession: {},
+		proseOnlyThinking: true,
+		hideToolActivity: false,
+		toolOutputExpanded: false,
 		settings: Settings.isolated({ "live.voice": "vale" }),
 		keybindings: { getKeys: vi.fn(() => ["ctrl+l"]) },
 		session: {},
@@ -49,14 +59,21 @@ function createContext(): ContextHarness {
 			requestComponentRender: vi.fn(),
 		},
 		showError: vi.fn(),
-		chatContainer: { children: [] },
-		present: vi.fn(),
+		chatContainer: { children: chatChildren },
+		present: vi.fn((component: unknown) => {
+			presented.push(component);
+			chatChildren.push(component);
+		}),
 	} as unknown as InteractiveModeContext;
-	return { ctx, editor, focused, mounted, editorRefocused: refocused.promise };
+	return { ctx, editor, focused, mounted, presented, editorRefocused: refocused.promise };
 }
 
 afterEach(() => {
 	vi.restoreAllMocks();
+});
+
+beforeAll(async () => {
+	await initTheme(false);
 });
 
 describe("LiveCommandController", () => {
@@ -108,5 +125,54 @@ describe("LiveCommandController", () => {
 		// clears; drain microtasks deterministically instead of sleeping.
 		for (let i = 0; controller.active && i < 20; i++) await Promise.resolve();
 		expect(controller.active).toBe(false);
+	});
+
+	it("anchors an explicitly finalized live assistant transcript", async () => {
+		const { ctx, presented } = createContext();
+		let onTranscript: ((transcript: LiveTranscript | undefined) => void) | undefined;
+		const controller = new LiveCommandController(ctx, options => {
+			onTranscript = options.callbacks.onTranscript;
+			const session = new LiveSessionController(options);
+			vi.spyOn(session, "start").mockResolvedValue();
+			vi.spyOn(session, "stop").mockResolvedValue();
+			return session;
+		});
+
+		try {
+			await controller.handleCommand();
+			if (!onTranscript) throw new Error("Expected live transcript callback");
+			onTranscript({ role: "assistant", turn: 1, text: "final live reply", final: true });
+			const component = presented[0] as { render(width: number): readonly string[] };
+			const raw = component.render(80).join("\n");
+			expect(raw).toContain("\x1b]133;A;aid=omp-response-");
+			expect(raw).toContain("\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07");
+		} finally {
+			await controller.stop();
+		}
+	});
+
+	it("anchors a live assistant transcript when its turn rolls over", async () => {
+		const { ctx, presented } = createContext();
+		let onTranscript: ((transcript: LiveTranscript | undefined) => void) | undefined;
+		const controller = new LiveCommandController(ctx, options => {
+			onTranscript = options.callbacks.onTranscript;
+			const session = new LiveSessionController(options);
+			vi.spyOn(session, "start").mockResolvedValue();
+			vi.spyOn(session, "stop").mockResolvedValue();
+			return session;
+		});
+
+		try {
+			await controller.handleCommand();
+			if (!onTranscript) throw new Error("Expected live transcript callback");
+			onTranscript({ role: "assistant", turn: 1, text: "first live reply", final: false });
+			onTranscript({ role: "assistant", turn: 2, text: "second live reply", final: false });
+			const component = presented[0] as { render(width: number): readonly string[] };
+			const raw = component.render(80).join("\n");
+			expect(raw).toContain("\x1b]133;A;aid=omp-response-");
+			expect(raw).toContain("\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07");
+		} finally {
+			await controller.stop();
+		}
 	});
 });

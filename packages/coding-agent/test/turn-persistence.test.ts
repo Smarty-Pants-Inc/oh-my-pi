@@ -52,19 +52,29 @@ function toolResult(overrides: Partial<Extract<AgentMessage, { role: "toolResult
 }
 
 describe("sessionMessagePersistenceKey", () => {
-	test("assistant identity covers timestamp/provider/model/responseId/stopReason — different content keeps the same key", () => {
-		// Two assistant variants emitted for the same logical turn (one streamed,
-		// one finalized; or one obfuscated, one deobfuscated for display) must
-		// share a key so we never double-persist them on the branch.
-		const a = assistant({ content: [{ type: "text", text: "foo" }], responseId: "resp-1" });
-		const b = assistant({ content: [{ type: "text", text: "foo (deobfuscated)" }], responseId: "resp-1" });
+	test("assistant identity covers timestamp/provider/model/response ids/stopReason — display variants keep the same key", () => {
+		// A live snapshot and its finalized/replayed counterpart share the local
+		// anchor id, so incremental persistence must keep one branch slot.
+		const a = assistant({
+			content: [{ type: "text", text: "foo" }],
+			responseId: "resp-1",
+			responseAnchorId: "anchor-1",
+		});
+		const b = assistant({
+			content: [{ type: "text", text: "foo (deobfuscated)" }],
+			responseId: "resp-1",
+			responseAnchorId: "anchor-1",
+		});
 		expect(sessionMessagePersistenceKey(a)).toBeDefined();
 		expect(sessionMessagePersistenceKey(a)).toBe(sessionMessagePersistenceKey(b));
 	});
 
-	test("assistant identity changes with responseId / stopReason", () => {
-		const base = assistant({ responseId: "resp-1" });
+	test("assistant identity separates equal-timestamp response anchors", () => {
+		const base = assistant({ responseId: "resp-1", responseAnchorId: "anchor-1" });
 		expect(sessionMessagePersistenceKey({ ...base, responseId: "resp-2" })).not.toBe(
+			sessionMessagePersistenceKey(base),
+		);
+		expect(sessionMessagePersistenceKey({ ...base, responseAnchorId: "anchor-2" })).not.toBe(
 			sessionMessagePersistenceKey(base),
 		);
 		expect(sessionMessagePersistenceKey({ ...base, stopReason: "toolUse" })).not.toBe(

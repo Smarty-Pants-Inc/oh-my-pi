@@ -955,6 +955,8 @@ export interface AssistantMessage {
 	contextSnapshot?: ContextSnapshot;
 	retryRecovery?: AssistantRetryRecovery;
 	responseId?: string; // Provider-specific response/message identifier when the upstream API exposes one
+	/** Locally generated durable identifier that correlates terminal reply anchors across live rendering and replay. */
+	responseAnchorId?: string;
 	/**
 	 * Name of the upstream provider an aggregator routed this request to, as
 	 * reported in the response (e.g. OpenRouter's top-level `provider` field:

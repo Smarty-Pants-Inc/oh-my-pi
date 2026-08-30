@@ -1,3 +1,4 @@
+import { stripOsc133Append } from "@oh-my-pi/pi-utils";
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import {
 	Lexer,
@@ -1556,6 +1557,9 @@ function splitPushedHighlightLines(pushed: string): string[] {
 
 export class Markdown implements Component {
 	#text: string;
+	// Raw source verifies cumulative updates before only their new suffix is sanitized.
+	#sourceText: string;
+	#osc133Pending = "";
 	// Suffix of #text a future append could still complete into a match
 	// (see trailingOsc8Partial); drives the append-only fast path.
 	#oscPartialEscape?: string;
@@ -1635,7 +1639,10 @@ export class Markdown implements Component {
 		defaultTextStyle?: DefaultTextStyle,
 		codeBlockIndent: number = 2,
 	) {
-		this.#text = normalizeOsc8Terminators(text);
+		const stripped = stripOsc133Append(text);
+		this.#sourceText = text;
+		this.#osc133Pending = stripped.pending;
+		this.#text = normalizeOsc8Terminators(stripped.text);
 		this.#oscPartialEscape = trailingOsc8Partial(this.#text);
 		this.#paddingX = paddingX;
 		this.#paddingY = paddingY;
@@ -1645,37 +1652,35 @@ export class Markdown implements Component {
 	}
 
 	setText(text: string): boolean {
-		// Identical re-emit (throttled tick): fully normalized already.
-		if (text === this.#text) return false;
-		// Streaming path: append-only growth. Only the memoized pending escape
-		// suffix plus the delta can hold a not-yet-normalized match (a crossing
-		// match starts in the pending suffix; everything else is in the delta).
-		// Normalize that region alone and splice it onto the old prefix;
-		// String.replace returns the input unchanged when nothing matches, so
-		// the common clean-delta frame allocates nothing. Once a match is
-		// rewritten (ST → BEL), the caller's raw text no longer aligns with
-		// #text (2-byte ST vs 1-byte BEL), so later frames fall back to the
-		// cold full-document pass — still byte-correct, just not faster.
-		if (text.length > this.#text.length && text.startsWith(this.#text)) {
+		// Identical re-emits (throttled ticks) need not re-sanitize or re-render.
+		if (text === this.#sourceText) return false;
+		if (text.length > this.#sourceText.length && text.startsWith(this.#sourceText)) {
+			// Live providers send cumulative text. Scan only the new raw bytes plus
+			// the bounded OSC 133 prefix retained from the preceding update.
+			const stripped = stripOsc133Append(text.slice(this.#sourceText.length), this.#osc133Pending);
+			this.#sourceText = text;
+			this.#osc133Pending = stripped.pending;
+			if (!stripped.text) return false;
+
+			// Only the memoized OSC 8 tail plus this clean delta can contain a
+			// terminator that crosses an update boundary.
 			const memoized = this.#oscPartialEscape;
-			const pending = (memoized ?? "") + text.slice(this.#text.length);
+			const pending = (memoized ?? "") + stripped.text;
 			const normalized = normalizeOsc8Terminators(pending);
-			if (normalized !== pending) {
-				// A stored byte was rewritten (ST → BEL on a crossing match): the
-				// stream-prefix lex caches self-invalidate via startsWith guards
-				// against #text, so nothing else needs clearing.
-				text = this.#text.slice(0, this.#text.length - (memoized?.length ?? 0)) + normalized;
-			}
+			const next = this.#text.slice(0, this.#text.length - (memoized?.length ?? 0)) + normalized;
 			this.#oscPartialEscape = trailingOsc8Partial(normalized);
-			this.#text = text;
+			if (next === this.#text) return false;
+			this.#text = next;
 			this.invalidate();
 			return true;
 		}
-		// Non-append edits / cold path: full-document pass.
-		text = normalizeOsc8Terminators(text);
+
+		// A replacement can change controls anywhere, so rebuild its sanitizer state.
+		const stripped = stripOsc133Append(text);
+		this.#sourceText = text;
+		this.#osc133Pending = stripped.pending;
+		text = normalizeOsc8Terminators(stripped.text);
 		this.#oscPartialEscape = trailingOsc8Partial(text);
-		// Equality guard: streaming re-emits identical text on ticks that carried
-		// no delta (throttled provider frames, reconciled tool-execution updates).
 		// Without this, the caller-side `#cachedLines` gets thrown away and the
 		// full lex + wrap runs per re-emit — one of the top CPU hotspots during
 		// streaming (issue #4353). Mirrors `Text.setText`'s guard.
