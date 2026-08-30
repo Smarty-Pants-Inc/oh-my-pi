@@ -181,7 +181,10 @@ export function assistantHasVisibleContent(message: AssistantAgentMessage): bool
  * in one assistant message; keeping every text block in the leading assistant
  * block buries post-tool text above tool results in the transcript.
  */
-export function splitAssistantMessageToolTimeline(message: AssistantAgentMessage): {
+export function splitAssistantMessageToolTimeline(
+	message: AssistantAgentMessage,
+	resolvedToolCallIds?: ReadonlySet<string>,
+): {
 	beforeTools: AssistantAgentMessage;
 	/** Text after each tool call, keyed by that call's content index within this assistant response. */
 	afterToolCalls: ReadonlyMap<number, AssistantAgentMessage>;
@@ -229,7 +232,12 @@ export function splitAssistantMessageToolTimeline(message: AssistantAgentMessage
 	const strippedToolCalls = (message as AssistantAgentMessage & { strippedToolCalls?: number }).strippedToolCalls ?? 0;
 	const hasUnresolvedToolCalls =
 		strippedToolCalls > 0 ||
-		message.content.some(content => content.type === "toolCall" && !isCursorExecResolvedReplay(message, content));
+		message.content.some(
+			content =>
+				content.type === "toolCall" &&
+				!resolvedToolCallIds?.has(content.id) &&
+				!isCursorExecResolvedReplay(message, content),
+		);
 	const replyEligible =
 		message.stopReason !== "aborted" &&
 		message.stopReason !== "error" &&

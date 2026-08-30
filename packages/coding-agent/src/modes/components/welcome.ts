@@ -186,11 +186,12 @@ export class WelcomeComponent implements Component {
 		this.#animStart = performance.now();
 		this.#requestRender();
 		this.#animTimer = setInterval(() => {
+			const requestRender = this.#requestRender;
 			const elapsed = performance.now() - (this.#animStart ?? 0);
 			if (elapsed >= INTRO_MS) {
 				this.#stopAnimation();
 			}
-			this.#requestRender?.();
+			requestRender?.();
 		}, INTRO_TICK_MS);
 	}
 

@@ -95,6 +95,22 @@ describe("splitAssistantMessageToolTimeline response navigation", () => {
 		).toBeUndefined();
 	});
 
+	it("selects a final local-tool reply only when every call has a paired replay result", () => {
+		const mixed = assistant([
+			{ type: "text", text: "intro" },
+			{ type: "toolCall", id: "read-1", name: "read", arguments: {} },
+			{ type: "text", text: "middle" },
+			{ type: "toolCall", id: "grep-1", name: "grep", arguments: {} },
+			{ type: "text", text: "final reply" },
+		]);
+
+		expect(splitAssistantMessageToolTimeline(mixed).replySegment).toBeUndefined();
+		expect(splitAssistantMessageToolTimeline(mixed, new Set(["read-1"])).replySegment).toBeUndefined();
+		expect(splitAssistantMessageToolTimeline(mixed, new Set(["read-1", "grep-1"])).replySegment?.content).toEqual([
+			{ type: "text", text: "final reply" },
+		]);
+	});
+
 	it("requires explicit terminality for a replay response anchor", () => {
 		const terminal = assistant([{ type: "text", text: "final reply" }]);
 		terminal.responseAnchorTerminal = true;

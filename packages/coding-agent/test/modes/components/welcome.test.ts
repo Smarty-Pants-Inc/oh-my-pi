@@ -62,6 +62,26 @@ describe("WelcomeComponent", () => {
 		expect(pickWeightedTip([], 0.5)).toBe("");
 	});
 
+	it("requests the settled frame when the intro completes", () => {
+		vi.useFakeTimers();
+		const welcome = new WelcomeComponent("1.0.0", "model", "provider");
+		const requestRender = vi.fn();
+		try {
+			welcome.playIntro(requestRender);
+			vi.advanceTimersByTime(2_970);
+			expect(welcome.isTranscriptBlockFinalized()).toBe(false);
+			const callsBeforeFinalTick = requestRender.mock.calls.length;
+
+			vi.advanceTimersByTime(33);
+
+			expect(welcome.isTranscriptBlockFinalized()).toBe(true);
+			expect(requestRender).toHaveBeenCalledTimes(callsBeforeFinalTick + 1);
+		} finally {
+			welcome.stopIntro();
+			vi.useRealTimers();
+		}
+	});
+
 	it("truncates a long model name inside the fixed left column and keeps the right column", () => {
 		// Dynamic model labels must not influence the responsive breakpoint: a
 		// long name is truncated with an ellipsis instead of collapsing the right

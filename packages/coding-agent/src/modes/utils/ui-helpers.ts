@@ -552,7 +552,13 @@ export class UiHelpers {
 			if (message.role !== "toolResult") flushPendingUsage();
 			// Assistant messages need special handling for tool calls
 			if (message.role === "assistant") {
-				const timeline = splitAssistantMessageToolTimeline(message);
+				const resolvedToolCallIds = new Set<string>();
+				for (let nextIndex = i + 1; nextIndex < count; nextIndex++) {
+					const nextMessage = messages[nextIndex]!;
+					if (nextMessage.role === "assistant" || nextMessage.role === "user") break;
+					if (nextMessage.role === "toolResult") resolvedToolCallIds.add(nextMessage.toolCallId);
+				}
+				const timeline = splitAssistantMessageToolTimeline(message, resolvedToolCallIds);
 				const terminalReplySegment = timeline.terminalReplySegment;
 				const candidate = preservedLiveResponseAnchorCandidate;
 				const preserveLeadingCandidate = candidate?.matchesReplayMessage(message) ?? false;

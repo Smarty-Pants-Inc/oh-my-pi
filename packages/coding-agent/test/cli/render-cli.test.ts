@@ -74,6 +74,60 @@ describe("omp render reply-zone output", () => {
 		expect(output.match(/\x1b\]133;A;aid=omp-response-[^:\x07]+:render-anchor\x07/g)).toHaveLength(1);
 	});
 
+	it("marks the final segment of a mixed assistant turn after paired local tool results", async () => {
+		sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
+		const anchorId = "mixed-render-anchor";
+		sessionManager.appendMessage({
+			role: "assistant",
+			content: [
+				{ type: "text", text: "MIXED PRE TOOL" },
+				{ type: "toolCall", id: "mixed-read", name: "read", arguments: { path: "one" } },
+				{ type: "text", text: "MIXED BETWEEN TOOLS" },
+				{ type: "toolCall", id: "mixed-grep", name: "grep", arguments: { pattern: "two" } },
+				{ type: "text", text: "MIXED FINAL REPLY" },
+			],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			stopReason: "stop",
+			usage,
+			timestamp: Date.now(),
+			responseAnchorId: anchorId,
+			responseAnchorTerminal: true,
+		});
+		sessionManager.appendMessage({
+			role: "toolResult",
+			toolCallId: "mixed-read",
+			toolName: "read",
+			content: [{ type: "text", text: "first result" }],
+			isError: false,
+			timestamp: Date.now() + 1,
+		});
+		sessionManager.appendMessage({
+			role: "toolResult",
+			toolCallId: "mixed-grep",
+			toolName: "grep",
+			content: [{ type: "text", text: "second result" }],
+			isError: false,
+			timestamp: Date.now() + 2,
+		});
+		await sessionManager.ensureOnDisk();
+		await sessionManager.flush();
+		const sessionFile = sessionManager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected persisted render session");
+
+		expect(await runRenderCommand({ session: sessionFile, width: 120, height: 40 })).toBe(0);
+
+		const output = stdout.join("");
+		const responseZoneStart = output.match(
+			new RegExp(`\\x1b\\]133;A;aid=omp-response-[^:\\x07]+:${anchorId}\\x07`, "g"),
+		);
+		expect(responseZoneStart).toHaveLength(1);
+		const responseZoneStartIndex = output.indexOf(responseZoneStart![0]!);
+		expect(responseZoneStartIndex).toBeGreaterThan(output.indexOf("MIXED BETWEEN TOOLS"));
+		expect(responseZoneStartIndex).toBeLessThan(output.indexOf("MIXED FINAL REPLY"));
+	});
+
 	it("does not create a response zone for a serialized nonterminal stop", async () => {
 		sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
 		sessionManager.appendMessage({
