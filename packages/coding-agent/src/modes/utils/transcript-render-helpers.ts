@@ -5,6 +5,7 @@
  * here keeps the two byte-for-byte identical.
  */
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import { isCursorExecResolved } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { type Component, Text } from "@oh-my-pi/pi-tui";
 import { formatBytes, formatDuration } from "@oh-my-pi/pi-utils";
 import type { AsyncJobType } from "../../async";
@@ -185,6 +186,8 @@ export function splitAssistantMessageToolTimeline(message: AssistantAgentMessage
 	afterToolCalls: ReadonlyMap<string, AssistantAgentMessage>;
 	hasToolCalls: boolean;
 	replySegment: AssistantAgentMessage | undefined;
+	/** `replySegment` only when the persisted agent-end decision is explicitly terminal. */
+	terminalReplySegment: AssistantAgentMessage | undefined;
 } {
 	const beforeToolsContent: AssistantAgentMessage["content"] = [];
 	const afterToolCalls = new Map<string, AssistantAgentMessage>();
@@ -219,7 +222,19 @@ export function splitAssistantMessageToolTimeline(message: AssistantAgentMessage
 	flushPendingAfterTool();
 
 	const beforeTools = sawToolCall ? displaySegment(beforeToolsContent) : message;
-	const replyEligible = message.stopReason !== "aborted" && message.stopReason !== "error";
+	// A transcript rebuild strips unpaired calls but leaves this durable count on
+	// the assistant message. Its visible post-tool prose remains progress, not a
+	// terminal reply, even though the stripped projection has no toolCall block.
+	const strippedToolCalls = (message as AssistantAgentMessage & { strippedToolCalls?: number }).strippedToolCalls ?? 0;
+	const hasUnresolvedToolCalls =
+		strippedToolCalls > 0 ||
+		message.content.some(content => content.type === "toolCall" && !isCursorExecResolved(content));
+	const replyEligible =
+		message.stopReason !== "aborted" &&
+		message.stopReason !== "error" &&
+		message.stopReason !== "length" &&
+		message.stopDetails?.type !== "pause_turn" &&
+		!hasUnresolvedToolCalls;
 	const finalSegment = sawToolCall && lastToolCallId ? afterToolCalls.get(lastToolCallId) : beforeTools;
 	// A tool call turns everything before it into intermediate transcript content.
 	// Only text after the final call can be a terminal-navigation reply target.
@@ -229,7 +244,13 @@ export function splitAssistantMessageToolTimeline(message: AssistantAgentMessage
 			? finalSegment
 			: undefined;
 
-	return { beforeTools, afterToolCalls, hasToolCalls: sawToolCall, replySegment };
+	return {
+		beforeTools,
+		afterToolCalls,
+		hasToolCalls: sawToolCall,
+		replySegment,
+		terminalReplySegment: message.responseAnchorTerminal === true ? replySegment : undefined,
+	};
 }
 
 /**

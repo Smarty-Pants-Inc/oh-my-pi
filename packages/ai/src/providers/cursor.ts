@@ -1161,6 +1161,7 @@ export interface BlockState {
 }
 
 function markCursorExecResolved(block: CursorExecResolvedCarrier): void {
+	block.cursorExecResolved = true;
 	block[kCursorExecResolved] = true;
 }
 
@@ -3677,6 +3678,7 @@ function openOrUpdateEditBlock(
 		id,
 		name: "edit",
 		arguments: nextArgs,
+		cursorExecResolved: true,
 		[kStreamingBlockIndex]: output.content.length,
 		[kStreamingBlockKind]: "cursor-edit",
 		[kStreamingEnvelopeId]: envelopeId || undefined,
@@ -4215,6 +4217,7 @@ export function synthesizeCursorExecToolCall(
 		id: toolCallId,
 		name: toolName,
 		arguments: omitUndefinedArgs(args),
+		cursorExecResolved: true,
 		[kStreamingBlockIndex]: output.content.length,
 		[kStreamingBlockKind]: "cursor-exec",
 		[kCursorExecResolved]: true,
@@ -4326,6 +4329,7 @@ export function processInteractionUpdate(
 			id: scmCall?.args?.toolCallId || update.message.value.callId || crypto.randomUUID(),
 			name: "connect_scm",
 			arguments: repository ? { owner: repository.owner, repo: repository.repo } : {},
+			cursorExecResolved: true,
 			[kStreamingBlockIndex]: output.content.length,
 			[kStreamingBlockKind]: "connect-scm",
 			[kStreamingEnvelopeId]: update.message.value.callId || undefined,
@@ -4392,6 +4396,7 @@ export function processInteractionUpdate(
 					id: callId,
 					name: "todo",
 					arguments: buildTodoDisplayArgs(toolCall),
+					cursorExecResolved: true,
 					[kStreamingBlockIndex]: output.content.length,
 					[kStreamingBlockKind]: "todo",
 					// Only the real envelope id is a correlation key; the minted
@@ -4416,6 +4421,7 @@ export function processInteractionUpdate(
 					id: callId,
 					name: "web_fetch",
 					arguments: url ? { url } : {},
+					cursorExecResolved: true,
 					[kStreamingBlockIndex]: output.content.length,
 					[kStreamingBlockKind]: "web-fetch",
 					[kStreamingEnvelopeId]: update.message.value.callId || undefined,

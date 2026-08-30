@@ -19,6 +19,8 @@ interface ContextHarness {
 	editorRefocused: Promise<void>;
 	/** Assistant transcript components passed to the chat presenter. */
 	presented: unknown[];
+	/** Current simulated chat-container children, mutable to model a rebuild detaching a live block. */
+	chatChildren: unknown[];
 }
 
 function createContext(): ContextHarness {
@@ -65,7 +67,7 @@ function createContext(): ContextHarness {
 			chatChildren.push(component);
 		}),
 	} as unknown as InteractiveModeContext;
-	return { ctx, editor, focused, mounted, presented, editorRefocused: refocused.promise };
+	return { ctx, editor, focused, mounted, presented, chatChildren, editorRefocused: refocused.promise };
 }
 
 afterEach(() => {
@@ -152,7 +154,7 @@ describe("LiveCommandController", () => {
 	});
 
 	it("anchors a live assistant transcript when its turn rolls over", async () => {
-		const { ctx, presented } = createContext();
+		const { ctx, presented, chatChildren } = createContext();
 		let onTranscript: ((transcript: LiveTranscript | undefined) => void) | undefined;
 		const controller = new LiveCommandController(ctx, options => {
 			onTranscript = options.callbacks.onTranscript;
@@ -166,7 +168,11 @@ describe("LiveCommandController", () => {
 			await controller.handleCommand();
 			if (!onTranscript) throw new Error("Expected live transcript callback");
 			onTranscript({ role: "assistant", turn: 1, text: "first live reply", final: false });
+			const firstComponent = presented[0];
+			chatChildren.splice(chatChildren.indexOf(firstComponent), 1);
 			onTranscript({ role: "assistant", turn: 2, text: "second live reply", final: false });
+			expect(chatChildren).toContain(firstComponent);
+			expect(presented.filter(component => component === firstComponent)).toHaveLength(2);
 			const component = presented[0] as { render(width: number): readonly string[] };
 			const raw = component.render(80).join("\n");
 			expect(raw).toContain("\x1b]133;A;aid=omp-response-");
@@ -174,5 +180,31 @@ describe("LiveCommandController", () => {
 		} finally {
 			await controller.stop();
 		}
+	});
+
+	it("re-presents a detached live assistant transcript before stop fallback finalizes it", async () => {
+		const { ctx, presented, chatChildren } = createContext();
+		let onTranscript: ((transcript: LiveTranscript | undefined) => void) | undefined;
+		const controller = new LiveCommandController(ctx, options => {
+			onTranscript = options.callbacks.onTranscript;
+			const session = new LiveSessionController(options);
+			vi.spyOn(session, "start").mockResolvedValue();
+			vi.spyOn(session, "stop").mockResolvedValue();
+			return session;
+		});
+
+		await controller.handleCommand();
+		if (!onTranscript) throw new Error("Expected live transcript callback");
+		onTranscript({ role: "assistant", turn: 1, text: "reply before stop", final: false });
+		const component = presented[0] as { render(width: number): readonly string[] };
+		chatChildren.splice(chatChildren.indexOf(component), 1);
+
+		await controller.stop();
+
+		expect(chatChildren).toContain(component);
+		expect(presented.filter(presentedComponent => presentedComponent === component)).toHaveLength(2);
+		const raw = component.render(80).join("\n");
+		expect(raw).toContain("\x1b]133;A;aid=omp-response-");
+		expect(raw).toContain("\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07");
 	});
 });

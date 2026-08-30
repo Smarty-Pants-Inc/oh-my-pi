@@ -1,5 +1,6 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import type { AssistantMessage, ToolCall, Usage } from "@oh-my-pi/pi-ai";
+import { type CursorExecResolvedCarrier, kCursorExecResolved } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { TranscriptContainer } from "@oh-my-pi/pi-coding-agent/modes/components/transcript-container";
 import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/event-controller";
@@ -30,7 +31,10 @@ function zeroUsage(): Usage {
 	};
 }
 
-function assistantMessage(content: AssistantMessage["content"]): AssistantMessage {
+function assistantMessage(
+	content: AssistantMessage["content"],
+	overrides: Partial<AssistantMessage> = {},
+): AssistantMessage {
 	return {
 		role: "assistant",
 		content,
@@ -40,6 +44,7 @@ function assistantMessage(content: AssistantMessage["content"]): AssistantMessag
 		stopReason: "stop",
 		usage: zeroUsage(),
 		timestamp: 1,
+		...overrides,
 	};
 }
 
@@ -66,6 +71,10 @@ function createFixture(hideToolActivity = false, hasTransformAssistantMessage = 
 		extensionRunner: undefined,
 		isTtsrAbortPending: false,
 		retryAttempt: 0,
+		isStreaming: false,
+		isCompacting: false,
+		messages: [],
+		getContextUsage: () => undefined,
 		agent: { transformAssistantMessage: hasTransformAssistantMessage ? vi.fn() : undefined },
 	};
 	let hasDisplayableThinkingContent = false;
@@ -81,8 +90,8 @@ function createFixture(hideToolActivity = false, hasTransformAssistantMessage = 
 		hideToolActivity,
 		effectiveHideThinkingBlock: false,
 		proseOnlyThinking: true,
-		statusLine: { invalidate: vi.fn() },
-		updateEditorTopBorder: vi.fn(),
+		statusLine: { invalidate: vi.fn(), markActivityEnd: vi.fn(), markActivityStart: vi.fn() },
+		statusContainer: { disposeChildren: vi.fn() },
 		noteDisplayableThinkingContent: vi.fn((message: AssistantMessage) => {
 			const hasThinking = message.content.some(
 				content => content.type === "thinking" && content.thinking.trim() !== "",
@@ -93,7 +102,10 @@ function createFixture(hideToolActivity = false, hasTransformAssistantMessage = 
 		}),
 		session: viewSession,
 		viewSession,
-		sessionManager: { getCwd: () => process.cwd() },
+		sessionManager: { getCwd: () => process.cwd(), getSessionName: () => "test" },
+		flushPendingModelSwitch: vi.fn(async () => {}),
+		flushPendingCommandOutput: vi.fn(),
+		editor: { getText: () => "" },
 		showWarning: vi.fn(),
 		showPinnedError: vi.fn(),
 		clearTransientSessionUi: vi.fn(),
@@ -117,6 +129,22 @@ describe("EventController mixed assistant text/tool rendering", () => {
 		vi.restoreAllMocks();
 		resetSettingsForTest();
 	});
+
+	async function settleTurn(
+		controller: EventController,
+		message: AssistantMessage,
+		willContinue: boolean,
+	): Promise<void> {
+		await controller.handleEvent({ type: "turn_end", message, toolResults: [], willContinue });
+	}
+
+	async function settleAgent(
+		controller: EventController,
+		messages: AssistantMessage[],
+		isTerminal = true,
+	): Promise<void> {
+		await controller.handleEvent({ type: "agent_end", messages, isTerminal });
+	}
 
 	it("finalizes and removes an orphaned streaming component on the next message_start", async () => {
 		// Regression: a stream that died between message_start and message_end
@@ -271,6 +299,8 @@ describe("EventController mixed assistant text/tool rendering", () => {
 			name: "contract_probe_b",
 			arguments: { value: "b" },
 		};
+		(toolCallA as CursorExecResolvedCarrier)[kCursorExecResolved] = true;
+		(toolCallB as CursorExecResolvedCarrier)[kCursorExecResolved] = true;
 		const started = assistantMessage([]);
 		const withFirstToolCall = assistantMessage([{ type: "text", text: INTRO_MARKER }, toolCallA]);
 		const withSecondToolCall = assistantMessage([
@@ -344,6 +374,11 @@ describe("EventController mixed assistant text/tool rendering", () => {
 			AgentSessionEvent,
 			{ type: "message_end" }
 		>);
+		const beforeTerminalSettle = chatContainer.render(120).join("\n");
+		expect(beforeTerminalSettle).not.toContain("\x1b]133;A;aid=omp-response-");
+		await settleTurn(controller, completed, false);
+		expect(chatContainer.render(120).join("\n")).not.toContain("\x1b]133;A;aid=omp-response-");
+		await settleAgent(controller, [completed]);
 
 		const rawLines = chatContainer.render(120);
 		const lines = rawLines.map(line => Bun.stripANSI(line));
@@ -362,7 +397,70 @@ describe("EventController mixed assistant text/tool rendering", () => {
 		expect(raw.split("\x1b]133;A;aid=omp-response-")).toHaveLength(2);
 		expect(rawLines[introLine]).not.toContain("\x1b]133;");
 		expect(rawLines[middleLine]).not.toContain("\x1b]133;");
-		expect(rawLines[finalLine]).toContain("\x1b]133;A;aid=omp-response-");
+		expect(String(rawLines[finalLine])).toContain("\x1b]133;A;aid=omp-response-");
+	});
+
+	it("anchors only the final reply after a local-tool continuation", async () => {
+		const { controller, chatContainer } = createFixture();
+		const toolCall: ToolCall = {
+			type: "toolCall",
+			id: TOOL_CALL_A_ID,
+			name: "contract_probe_a",
+			arguments: { value: "a" },
+		};
+		const progress = assistantMessage([toolCall, { type: "text", text: "LOCAL TOOL PROGRESS" }], {
+			stopReason: "toolUse",
+		});
+		await controller.handleEvent({ type: "message_start", message: assistantMessage([]) });
+		await controller.handleEvent({ type: "message_end", message: progress });
+		expect(chatContainer.render(120).join("\n")).not.toContain("\x1b]133;");
+		await settleTurn(controller, progress, true);
+		expect(chatContainer.render(120).join("\n")).not.toContain("\x1b]133;");
+
+		const final = assistantMessage([{ type: "text", text: "LOCAL TOOL FINAL" }]);
+		await controller.handleEvent({ type: "message_start", message: assistantMessage([]) });
+		await controller.handleEvent({ type: "message_end", message: final });
+		await settleTurn(controller, final, false);
+		expect(chatContainer.render(120).join("\n")).not.toContain("\x1b]133;");
+		await settleAgent(controller, [progress, final]);
+
+		const raw = chatContainer.render(120).join("\n");
+		expect(raw.split("\x1b]133;A;aid=omp-response-")).toHaveLength(2);
+		expect(raw).toContain("LOCAL TOOL FINAL");
+	});
+
+	it("does not anchor a pause_turn progress reply before the resumed final reply", async () => {
+		const { controller, chatContainer } = createFixture();
+		const paused = assistantMessage([{ type: "text", text: "PAUSED PROGRESS" }], {
+			stopDetails: { type: "pause_turn" },
+		});
+		await controller.handleEvent({ type: "message_start", message: assistantMessage([]) });
+		await controller.handleEvent({ type: "message_end", message: paused });
+		await settleTurn(controller, paused, true);
+		expect(chatContainer.render(120).join("\n")).not.toContain("\x1b]133;");
+
+		const final = assistantMessage([{ type: "text", text: "PAUSE FINAL" }]);
+		await controller.handleEvent({ type: "message_start", message: assistantMessage([]) });
+		await controller.handleEvent({ type: "message_end", message: final });
+		await settleTurn(controller, final, false);
+		await settleAgent(controller, [paused, final]);
+
+		const raw = chatContainer.render(120).join("\n");
+		expect(raw.split("\x1b]133;A;aid=omp-response-")).toHaveLength(2);
+		expect(raw).toContain("PAUSE FINAL");
+	});
+
+	it("does not anchor a length-truncated reply during incomplete recovery", async () => {
+		const { controller, chatContainer } = createFixture();
+		const truncated = assistantMessage([{ type: "text", text: "TRUNCATED REPLY" }], {
+			stopReason: "length",
+		});
+		await controller.handleEvent({ type: "message_start", message: assistantMessage([]) });
+		await controller.handleEvent({ type: "message_end", message: truncated });
+		await settleTurn(controller, truncated, false);
+		await settleAgent(controller, [truncated], false);
+
+		expect(chatContainer.render(120).join("\n")).not.toContain("\x1b]133;");
 	});
 
 	it("keeps assistant text streaming while hiding bash failures and grouped read activity", async () => {

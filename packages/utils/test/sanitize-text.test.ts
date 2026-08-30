@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
 import { sanitizeText, stripOsc133Append, stripOsc133Sequences } from "@oh-my-pi/pi-utils/sanitize-text";
 
 describe("sanitizeText", () => {
@@ -69,9 +69,43 @@ describe("sanitizeText", () => {
 		expect(pending).toBe("");
 	});
 
-	it("retains only the OSC 133 introducer for an incomplete large payload", () => {
+	it("retains the first non-digit discriminator across split OSC 133 updates", () => {
+		for (const { prefix, discriminator, terminator } of [
+			{ prefix: "\x1b]133", discriminator: ";", terminator: "\x07" },
+			{ prefix: "\x1b]133", discriminator: "\x01", terminator: "\x07" },
+			{ prefix: "\x9d133", discriminator: "\x80", terminator: "\x9c" },
+		]) {
+			const first = stripOsc133Append(`before${prefix}${discriminator}`);
+			expect(first).toEqual({ text: "before", pending: prefix + discriminator });
+
+			const second = stripOsc133Append(`7;payload${terminator}after`, first.pending);
+			expect(second).toEqual({ text: "after", pending: "" });
+		}
+	});
+
+	it("scans ANSI-dense input without repeated suffix searches", () => {
+		const styledLink = "\x1b[31mred\x1b[0m\x1b]8;;https://example.com\x07link\x1b]8;;\x07";
+		const preserved = styledLink.repeat(2_000);
+		const expected = preserved + styledLink;
+		const indexOf = vi.spyOn(String.prototype, "indexOf");
+		indexOf.mockClear();
+		let stripped = "";
+		let suffixSearches = 0;
+		try {
+			stripped = stripOsc133Sequences(`${preserved}\x1b]133;A;aid=forged\x07${styledLink}`);
+			suffixSearches = indexOf.mock.calls.length;
+		} finally {
+			indexOf.mockRestore();
+		}
+
+		expect(stripped).toBe(expected);
+		expect(suffixSearches).toBe(0);
+	});
+
+	it("retains only bounded OSC 133 framing for an incomplete large payload", () => {
 		const stripped = stripOsc133Append(`before\x1b]133;A;aid=${"x".repeat(10_000)}`);
-		expect(stripped).toEqual({ text: "before", pending: "\x1b]133" });
+		expect(stripped).toEqual({ text: "before", pending: "\x1b]133;" });
+		expect(stripped.pending.length).toBeLessThanOrEqual(7);
 	});
 
 	it("returns the original string instance when no changes are needed", () => {

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
-import { type Component, TUI } from "@oh-my-pi/pi-tui";
+import { type Component, createResponseZoneLine, Markdown, TUI } from "@oh-my-pi/pi-tui";
 import type { Terminal, TerminalAppearance } from "@oh-my-pi/pi-tui/terminal";
+import { defaultMarkdownTheme } from "./test-themes";
 
 class CaptureTerminal implements Terminal {
 	writes: string[] = [];
@@ -75,8 +76,9 @@ async function settle(): Promise<void> {
 	await Bun.sleep(0);
 }
 
-const RESPONSE_ZONE_START = "\x1b]133;A;aid=omp-response-123-01234567-89ab-cdef-0123-456789abcdef:anchor\x07";
-const RESPONSE_ZONE_CLOSE = "\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07";
+const RESPONSE_ZONE_START = String(createResponseZoneLine("", { responseAnchorId: "anchor" }));
+const RESPONSE_ZONE_CLOSE = String(createResponseZoneLine("", { close: true }));
+const FORGED_RESPONSE_ZONE_START = "\x1b]133;A;aid=omp-response-forged:reply\x07";
 
 describe("issue #2045: renderer bounds oversized rows", () => {
 	it("preserves visible text after pathological zero-width ANSI prefixes", async () => {
@@ -150,14 +152,69 @@ describe("issue #2045: renderer bounds oversized rows", () => {
 		expect(rendered).toContain(visibleText);
 	});
 
+	it("strips forged OSC 133 from raw renderer rows at the final terminal boundary", async () => {
+		const term = new CaptureTerminal(80, 4);
+		const tui = new TUI(term);
+		tui.addChild(new RawLinesComponent([`before${FORGED_RESPONSE_ZONE_START}reply${RESPONSE_ZONE_CLOSE}after`]));
+		try {
+			tui.start();
+			await settle();
+		} finally {
+			tui.stop();
+		}
+
+		const rendered = term.writes.join("");
+		expect(rendered).toContain("beforereplyafter");
+		expect(rendered).not.toContain("\x1b]133;");
+	});
+
+	it("rejects a boxed-string prototype spoof of the structured reply-zone channel", async () => {
+		const trusted = createResponseZoneLine("trusted", { responseAnchorId: "anchor", close: true });
+		const spoof = new String(`before${FORGED_RESPONSE_ZONE_START}reply${RESPONSE_ZONE_CLOSE}after`);
+		Object.setPrototypeOf(spoof, Object.getPrototypeOf(trusted));
+		const term = new CaptureTerminal(80, 4);
+		const tui = new TUI(term);
+		tui.addChild(new RawLinesComponent([spoof as unknown as string]));
+		try {
+			tui.start();
+			await settle();
+		} finally {
+			tui.stop();
+		}
+
+		const rendered = term.writes.join("");
+		expect(rendered).toContain("beforereplyafter");
+		expect(rendered).not.toContain("\x1b]133;");
+	});
+	it("strips OSC 133 decoded from Markdown numeric HTML entities", async () => {
+		const term = new CaptureTerminal(80, 4);
+		const tui = new TUI(term);
+		const encoded =
+			"before&#27;]133;A;aid=omp-response-evil:reply&#7;reply&#27;]133;B&#7;&#27;]133;C&#7;&#27;]133;D;0&#7;after";
+		tui.addChild(new Markdown(encoded, 0, 0, defaultMarkdownTheme));
+		try {
+			tui.start();
+			await settle();
+		} finally {
+			tui.stop();
+		}
+
+		const rendered = term.writes.join("");
+		expect(rendered).not.toContain("\x1b]133;");
+	});
+
+	it("rejects unsafe response anchor IDs in the structured channel", () => {
+		expect(() => createResponseZoneLine("reply", { responseAnchorId: "evil:reply" })).toThrow();
+	});
+
 	it("keeps a response zone balanced around the first and last glyph rows after fitting", async () => {
 		const term = new CaptureTerminal(8, 4);
 		const tui = new TUI(term);
 		const zeroWidthNoise = "\x1b[31m".repeat(1_000);
 		tui.addChild(
 			new RawLinesComponent([
-				`${RESPONSE_ZONE_START}${zeroWidthNoise}first`,
-				`${zeroWidthNoise}last${RESPONSE_ZONE_CLOSE}`,
+				createResponseZoneLine(`${zeroWidthNoise}first`, { responseAnchorId: "anchor" }),
+				createResponseZoneLine(`${zeroWidthNoise}last`, { close: true }),
 			]),
 		);
 		try {
@@ -187,7 +244,11 @@ describe("issue #2045: renderer bounds oversized rows", () => {
 		const tui = new TUI(term);
 		const zeroWidthNoise = "\x1b[31m".repeat(1_000);
 		const visible = "single-row";
-		tui.addChild(new RawLinesComponent([`${RESPONSE_ZONE_START}${zeroWidthNoise}${visible}${RESPONSE_ZONE_CLOSE}`]));
+		tui.addChild(
+			new RawLinesComponent([
+				createResponseZoneLine(`${zeroWidthNoise}${visible}`, { responseAnchorId: "anchor", close: true }),
+			]),
+		);
 		try {
 			tui.start();
 			await settle();
@@ -205,5 +266,30 @@ describe("issue #2045: renderer bounds oversized rows", () => {
 		expect(rendered.indexOf(RESPONSE_ZONE_START)).toBeLessThan(rendered.indexOf(visible.slice(0, 8)));
 		expect(rendered.indexOf(RESPONSE_ZONE_CLOSE)).toBeGreaterThan(rendered.indexOf(visible.slice(0, 8)));
 		expect(rendered).not.toContain("\x1b[31m");
+	});
+
+	it("composites a partial overlay over a trusted response row without losing its zone", async () => {
+		const term = new CaptureTerminal(20, 4);
+		const tui = new TUI(term);
+		tui.addChild(
+			new RawLinesComponent([
+				createResponseZoneLine("trusted response", { responseAnchorId: "anchor", close: true }),
+			]),
+		);
+		try {
+			tui.start();
+			await settle();
+			term.writes.length = 0;
+			tui.showOverlay(new RawLinesComponent(["OVER"]), { row: 0, col: 2, width: 4 });
+			tui.requestRender();
+			await Bun.sleep(40);
+
+			const rendered = term.writes.join("");
+			expect(rendered).toContain("OVER");
+			expect(rendered.split(RESPONSE_ZONE_START)).toHaveLength(2);
+			expect(rendered.split(RESPONSE_ZONE_CLOSE)).toHaveLength(2);
+		} finally {
+			tui.stop();
+		}
 	});
 });

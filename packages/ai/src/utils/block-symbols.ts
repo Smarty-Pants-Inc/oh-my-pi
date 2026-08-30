@@ -48,32 +48,23 @@ export const kStreamingBlockKind = Symbol("provider.block.kind");
  * executed server-side (via the coding-agent bridge) and whose result is
  * buffered separately for emission via the assistant-loop stream.
  *
- * `agent-loop.ts` MUST skip execution of blocks carrying this marker —
- * treating them as a fresh runnable tool call would run the same
- * side-effecting tool (bash, write, delete, …) a second time. Symbol-keyed
- * so it never persists across the JSONL round-trip, where rebuild instead
- * pairs the block with its already-persisted `toolResult` message by id.
+ * `kCursorExecResolved` remains process-local for the live dispatch path.
+ * `cursorExecResolved` is retained alongside it so a persisted or collaborative
+ * transcript can still distinguish this settled call from a local continuation.
  */
 export const kCursorExecResolved = Symbol("provider.block.cursorExecResolved");
 
-/** Carries the resolved marker without exposing a string-keyed property. */
-export type CursorExecResolvedCarrier = object & { [kCursorExecResolved]?: true };
+/** Carries live and durable Cursor exec-resolution state. */
+export type CursorExecResolvedCarrier = object & { cursorExecResolved?: true; [kCursorExecResolved]?: true };
 
 /** True when a toolCall block was already executed by Cursor's exec channel. */
 export function isCursorExecResolved(block: CursorExecResolvedCarrier | null | undefined): boolean {
-	return block?.[kCursorExecResolved] === true;
+	return block?.[kCursorExecResolved] === true || block?.cursorExecResolved === true;
 }
 
-/**
- * Copy {@link kCursorExecResolved} onto a cloned/projected toolCall block.
- *
- * Stream projectors (owned/in-band dialect, leaked-thinking heal) rebuild
- * toolCall objects field-by-field. Dropping this marker lets `agent-loop.ts`
- * re-execute a call Cursor already settled — duplicate toolResults and a
- * second bash/write/delete. Partial-JSON is already copied explicitly; this
- * marker is the other load-bearing symbol that must survive the same way.
- */
+/** Copy Cursor exec-resolution state onto a cloned/projected toolCall block. */
 export function copyCursorExecResolved(target: CursorExecResolvedCarrier, source: CursorExecResolvedCarrier): void {
+	if (source.cursorExecResolved === true) target.cursorExecResolved = true;
 	if (source[kCursorExecResolved] === true) target[kCursorExecResolved] = true;
 }
 

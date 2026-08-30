@@ -3309,6 +3309,7 @@ export class AgentSession {
 			| PythonExecutionMessage
 			| FileMentionMessage,
 	): string {
+		if (message.role === "assistant") message.responseAnchorTerminal = false;
 		const cache = this.#persistedMessageKeys;
 		const wasFresh = cache !== undefined && cache.anchor === this.#persistedMessageKeysAnchor();
 		const entryId = this.sessionManager.appendMessage(message);
@@ -3321,6 +3322,20 @@ export class AgentSession {
 			cache.anchor = this.#persistedMessageKeysAnchor();
 		}
 		return entryId;
+	}
+
+	async #persistAssistantResponseAnchorTerminal(message: AssistantMessage, isTerminal: boolean): Promise<boolean> {
+		try {
+			await this.#waitForSessionMessagePersistence(message);
+			if (await this.sessionManager.setAssistantResponseAnchorTerminal(message, isTerminal)) return true;
+		} catch (error) {
+			logger.warn("Failed to persist assistant response terminality", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+		// Never let a live-only terminal decision create a replay anchor.
+		message.responseAnchorTerminal = false;
+		return false;
 	}
 
 	#persistSessionMessageIfMissing(message: AgentMessage): void {
@@ -3548,6 +3563,7 @@ export class AgentSession {
 		// bookkeeping — leaving maintenance looking at the previous (e.g.
 		// toolUse) assistant message and skipping settle-only work.
 		if (event.type === "message_end" && event.message.role === "assistant") {
+			event.message.responseAnchorTerminal = false;
 			this.#lastAssistantMessage = event.message;
 		}
 		// Plan-mode internal transition: stamp `SILENT_ABORT_MARKER` on the
@@ -3833,12 +3849,20 @@ export class AgentSession {
 			// maintenance can emit agent_end, so preserve the state at settle entry.
 			const ttsrAbortPendingAtAgentEnd = this.#ttsr.abortPending;
 			const emitAgentEndNotification = async (options?: { willContinue?: boolean }) => {
+				const isTerminal = options?.willContinue !== true;
+				const terminalityPersisted = msg
+					? await this.#persistAssistantResponseAnchorTerminal(msg, isTerminal)
+					: true;
+				const emittedTerminal = isTerminal && terminalityPersisted;
+				if (fallbackAssistant && fallbackAssistant !== msg) {
+					fallbackAssistant.responseAnchorTerminal = emittedTerminal;
+				}
 				this.#emitRunState("idle");
 				// Public agent_end is held out of the eager display pass and emitted
 				// here after maintenance routing, tagged isTerminal so subscribers can
 				// tell final settles from scheduled continuations.
 				await this.#emitSessionEvent(
-					{ ...event, isTerminal: !options?.willContinue },
+					{ ...event, isTerminal: emittedTerminal },
 					options?.willContinue === true ? undefined : { closeTurnId: settledTurnId },
 				);
 				void this.#emitAgentEndNotification([...activeMessages], options).catch(err => {
@@ -4946,6 +4970,7 @@ export class AgentSession {
 				turnIndex: this.#turnIndex,
 				message: event.message,
 				toolResults: event.toolResults,
+				willContinue: event.willContinue,
 			};
 			await this.#extensionRunner.emit(hookEvent);
 			this.#turnIndex++;

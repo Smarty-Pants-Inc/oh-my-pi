@@ -534,6 +534,7 @@ export class UiHelpers {
 			todoSnapshot = null;
 			previous.seal();
 		};
+		let preservedLiveResponseAnchorCandidate = options.preservedLiveResponseAnchorCandidate;
 		const messages = sessionContext.messages;
 		const count = messages.length;
 		for (let i = 0; i < count; i++) {
@@ -550,10 +551,20 @@ export class UiHelpers {
 			// Assistant messages need special handling for tool calls
 			if (message.role === "assistant") {
 				const timeline = splitAssistantMessageToolTimeline(message);
-				this.ctx.addMessageToChat(message, { reuseSettledComponent: options.reuseSettledComponents });
+				const terminalReplySegment = timeline.terminalReplySegment;
+				const candidate = preservedLiveResponseAnchorCandidate;
+				const preserveLeadingCandidate = candidate?.matchesReplayMessage(message) ?? false;
+				if (preserveLeadingCandidate && candidate) {
+					this.ctx.chatContainer.addChild(candidate);
+					preservedLiveResponseAnchorCandidate = undefined;
+				} else {
+					this.ctx.addMessageToChat(message, { reuseSettledComponent: options.reuseSettledComponents });
+				}
 				const lastChild = this.ctx.chatContainer.children[this.ctx.chatContainer.children.length - 1];
 				const assistantComponent = lastChild instanceof AssistantMessageComponent ? lastChild : undefined;
-				assistantComponent?.setResponseAnchor(timeline.replySegment === timeline.beforeTools);
+				if (!preserveLeadingCandidate) {
+					assistantComponent?.setResponseAnchor(terminalReplySegment === timeline.beforeTools);
+				}
 				if (assistantComponent) {
 					const usage = message.usage;
 					const explained = sessionContext.cacheMissExplainedAt?.[i] ?? false;
@@ -575,10 +586,16 @@ export class UiHelpers {
 				const errorPresentation = resolveAssistantErrorPresentation(message, this.ctx.viewSession.retryAttempt);
 				const hasErrorStop = errorPresentation.kind === "full";
 				const errorMessage = hasErrorStop ? errorPresentation.text : null;
-				const appendAssistantSegment = (segment: AssistantMessage | undefined) => {
-					if (!segment || !assistantHasVisibleContent(segment)) return;
+				const appendAssistantSegment = (toolCallId: string, segment: AssistantMessage | undefined) => {
+					if (
+						options.preservedLivePostToolCallIds?.has(toolCallId) ||
+						!segment ||
+						!assistantHasVisibleContent(segment)
+					) {
+						return;
+					}
 					const component = createAssistantMessageComponent(this.ctx, segment);
-					component.setResponseAnchor(segment === timeline.replySegment);
+					component.setResponseAnchor(segment === terminalReplySegment);
 					this.ctx.chatContainer.addChild(component);
 				};
 
@@ -589,7 +606,7 @@ export class UiHelpers {
 					}
 					const afterToolSegment = timeline.afterToolCalls.get(content.id);
 					if (options.preservedLiveToolCallIds?.has(content.id)) {
-						appendAssistantSegment(afterToolSegment);
+						appendAssistantSegment(content.id, afterToolSegment);
 						continue;
 					}
 					resolveWaitingPoll(content.name);
@@ -629,7 +646,7 @@ export class UiHelpers {
 								readToolCallAssistantComponents.set(content.id, assistantComponent);
 							}
 						}
-						appendAssistantSegment(afterToolSegment);
+						appendAssistantSegment(content.id, afterToolSegment);
 						continue;
 					}
 
@@ -678,7 +695,7 @@ export class UiHelpers {
 					} else {
 						this.ctx.pendingTools.set(content.id, component);
 					}
-					appendAssistantSegment(afterToolSegment);
+					appendAssistantSegment(content.id, afterToolSegment);
 				}
 				// Dangling toolCalls (no result on the resolved path — failed or
 				// retried turns, results on sibling branches) were stripped by the

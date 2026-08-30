@@ -224,6 +224,8 @@ export interface TurnEndEvent {
 	turnIndex: number;
 	message: AgentMessage;
 	toolResults: ToolResultMessage[];
+	/** True when the core agent loop will immediately sample another turn. */
+	willContinue: boolean;
 }
 
 // ============================================================================

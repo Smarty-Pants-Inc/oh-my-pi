@@ -168,11 +168,34 @@ describe("AgentSession subscriber event order", () => {
 			},
 			streamFn: (streamModel, context, options) => mock.stream(streamModel, context, options),
 		});
+		const extensionTurnEnds: boolean[] = [];
+		const extensionRunner = {
+			emit: vi.fn(async (event: { type: string; willContinue?: boolean }) => {
+				if (event.type === "turn_end") extensionTurnEnds.push(event.willContinue ?? false);
+			}),
+			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
+			hasHandlers: vi.fn((eventType: string) => eventType === "turn_end"),
+			emitSessionStop: vi.fn().mockResolvedValue(undefined),
+		} as unknown as ExtensionRunner;
+		const sessionManager = SessionManager.inMemory();
 		session = new AgentSession({
 			agent,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager,
 			settings,
 			modelRegistry,
+			extensionRunner,
+		});
+		const terminalityAtAgentEnd: Array<boolean | undefined> = [];
+		session.subscribe(event => {
+			if (event.type !== "agent_end") return;
+			const persisted = [...sessionManager.getEntries()]
+				.reverse()
+				.find(entry => entry.type === "message" && entry.message.role === "assistant");
+			terminalityAtAgentEnd.push(
+				persisted?.type === "message" && persisted.message.role === "assistant"
+					? persisted.message.responseAnchorTerminal
+					: undefined,
+			);
 		});
 		session.setTodoPhases([
 			{
@@ -188,7 +211,9 @@ describe("AgentSession subscriber event order", () => {
 		await session.waitForIdle();
 		const toolResults = agent.state.messages.filter(message => message.role === "toolResult");
 		expect(toolResults.map(result => result.toolName)).toEqual(tasks.map(() => "todo"));
+		expect(extensionTurnEnds).toEqual([true, false]);
 
 		expect(session.getTodoPhases()[0]?.tasks.map(task => task.status)).toEqual(tasks.map(() => "completed"));
+		expect(terminalityAtAgentEnd).toEqual([true]);
 	});
 });

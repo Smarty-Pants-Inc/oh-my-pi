@@ -2200,7 +2200,7 @@ export class Agent {
 					this.#emit({ type: "message_end", message: toolResult });
 					toolResults.push(toolResult);
 				}
-				this.#emit({ type: "turn_end", message: errorMsg, toolResults });
+				this.#emit({ type: "turn_end", message: errorMsg, toolResults, willContinue: false });
 				turnOpen = false;
 				this.#emit({ type: "agent_end", messages: [errorMsg, ...toolResults] });
 			} else {

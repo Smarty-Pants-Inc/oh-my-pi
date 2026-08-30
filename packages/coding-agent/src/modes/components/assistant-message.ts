@@ -1,6 +1,7 @@
 import type { AssistantMessage, ImageContent } from "@oh-my-pi/pi-ai";
 import {
 	Container,
+	createResponseZoneLine,
 	Image,
 	type ImageBudget,
 	ImageProtocol,
@@ -15,35 +16,29 @@ import { formatNumber } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import type { AssistantThinkingRenderer } from "../../extensibility/extensions/types";
 import { getMarkdownTheme, theme } from "../../modes/theme/theme";
-import { createResponseAnchorId, responseAnchorIdOrFallback } from "../../session/response-anchor";
+import {
+	createResponseAnchorId,
+	isSafeResponseAnchorId,
+	responseAnchorIdOrFallback,
+} from "../../session/response-anchor";
+import { sameMessageContent, sessionMessagePersistenceKey } from "../../session/turn-persistence";
 import { expandKeyHint, getPreviewLines, resolveImageOptions, TRUNCATE_LENGTHS } from "../../tools/render-utils";
 import { convertImageToPng } from "../../utils/image-loading";
 import { canonicalizeMessage, formatThinkingForDisplay, hasDisplayableThinking } from "../../utils/thinking-display";
 import { resolveAssistantErrorPresentation } from "../utils/transcript-render-helpers";
 import { type CacheInvalidation, CacheInvalidationMarkerComponent } from "./cache-invalidation-marker";
 
-// Herdr consumes the aid to distinguish OMP reply rows from shell prompts;
-// Ghostty-compatible terminals ignore the option while retaining OSC 133 semantics.
-// The process session lets Herdr discard anchors from an earlier OMP in the same
-// pane. Persisted IDs must pass the shared 128-byte safe-ID bound before they
-// enter OSC; an invalid record instead receives this component's stable fallback.
-// Keep the zone balanced inside one Markdown block: 133;B latches `.input` until
-// 133;C, and leaving it open makes later transcript cells behave like editable
-// prompt input (#8030, #6115).
-const OSC133_RESPONSE_SESSION = `${process.pid}-${createResponseAnchorId()}`;
-const responseZoneStart = (responseAnchorId: unknown, fallbackId: string): string =>
-	`\x1b]133;A;aid=omp-response-${OSC133_RESPONSE_SESSION}:${responseAnchorIdOrFallback(responseAnchorId, fallbackId)}\x07`;
-const OSC133_ZONE_CLOSE = "\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07";
-
+// Reply markers are carried as structured TUI rows. The final writer strips
+// every textual OSC 133 sequence, then restores only these process-branded edges.
 class ResponseAnchorMarkdown extends Markdown {
-	#zoneStart: string;
+	#responseAnchorId: string;
 	#enabled = false;
 	#zoneSource: readonly string[] | undefined;
 	#zoneLines: string[] | undefined;
 
-	constructor(zoneStart: string, ...args: ConstructorParameters<typeof Markdown>) {
+	constructor(responseAnchorId: string, ...args: ConstructorParameters<typeof Markdown>) {
 		super(...args);
-		this.#zoneStart = zoneStart;
+		this.#responseAnchorId = responseAnchorId;
 	}
 
 	setEnabled(enabled: boolean): void {
@@ -53,9 +48,9 @@ class ResponseAnchorMarkdown extends Markdown {
 		this.#zoneLines = undefined;
 	}
 
-	setZoneStart(zoneStart: string): void {
-		if (this.#zoneStart === zoneStart) return;
-		this.#zoneStart = zoneStart;
+	setResponseAnchorId(responseAnchorId: string): void {
+		if (this.#responseAnchorId === responseAnchorId) return;
+		this.#responseAnchorId = responseAnchorId;
 		this.#zoneSource = undefined;
 		this.#zoneLines = undefined;
 	}
@@ -86,8 +81,17 @@ class ResponseAnchorMarkdown extends Markdown {
 		if (firstVisible === undefined) return lines;
 		const lastVisible = this.#visibleGlyphLineIndex(lines, true)!;
 		const wrapped = lines.slice();
-		wrapped[firstVisible] = this.#zoneStart + wrapped[firstVisible];
-		wrapped[lastVisible] += OSC133_ZONE_CLOSE;
+		if (firstVisible === lastVisible) {
+			wrapped[firstVisible] = createResponseZoneLine(String(wrapped[firstVisible]), {
+				responseAnchorId: this.#responseAnchorId,
+				close: true,
+			});
+		} else {
+			wrapped[firstVisible] = createResponseZoneLine(String(wrapped[firstVisible]), {
+				responseAnchorId: this.#responseAnchorId,
+			});
+			wrapped[lastVisible] = createResponseZoneLine(String(wrapped[lastVisible]), { close: true });
+		}
 		this.#zoneSource = lines;
 		this.#zoneLines = wrapped;
 		return wrapped;
@@ -272,7 +276,7 @@ export class AssistantMessageComponent extends Container {
 	#responseAnchor = false;
 	#responseAnchorCandidates: ResponseAnchorMarkdown[] = [];
 	#responseAnchorFallbackId = createResponseAnchorId();
-	#responseZoneStart: string;
+	#responseAnchorId: string;
 	/** Whether the last updateContent carried an in-flight streaming partial; such
 	 *  renders bypass the markdown module LRU (see Markdown.transientRenderCache). */
 	#lastUpdateTransient = false;
@@ -315,7 +319,7 @@ export class AssistantMessageComponent extends Container {
 		private proseOnlyThinking = true,
 	) {
 		super();
-		this.#responseZoneStart = responseZoneStart(message?.responseAnchorId, this.#responseAnchorFallbackId);
+		this.#responseAnchorId = responseAnchorIdOrFallback(message?.responseAnchorId, this.#responseAnchorFallbackId);
 		this.#transcriptBlockFinalized = message !== undefined;
 
 		// Slim cache-invalidation divider, populated above the content when this
@@ -536,16 +540,30 @@ export class AssistantMessageComponent extends Container {
 	}
 
 	messagePersistenceKey(): string | undefined {
-		if (!this.#lastMessage) return undefined;
-		return [
-			"assistant",
-			this.#lastMessage.timestamp,
-			this.#lastMessage.provider,
-			this.#lastMessage.model,
-			this.#lastMessage.responseId ?? "",
-			this.#lastMessage.responseAnchorId ?? "",
-			this.#lastMessage.stopReason,
-		].join(":");
+		return this.#lastMessage ? sessionMessagePersistenceKey(this.#lastMessage) : undefined;
+	}
+
+	/** Whether a replayed durable entry is this live component's same response. */
+	matchesReplayMessage(message: AssistantMessage): boolean {
+		const current = this.#lastMessage;
+		if (!current) return false;
+		const currentKey = sessionMessagePersistenceKey(current);
+		if (currentKey !== undefined && currentKey === sessionMessagePersistenceKey(message)) {
+			return sameMessageContent(current, message);
+		}
+		if (
+			current.timestamp !== message.timestamp ||
+			current.provider !== message.provider ||
+			current.model !== message.model ||
+			current.responseId !== message.responseId ||
+			current.stopReason !== message.stopReason
+		) {
+			return false;
+		}
+		if (isSafeResponseAnchorId(current.responseAnchorId) && isSafeResponseAnchorId(message.responseAnchorId)) {
+			return false;
+		}
+		return sameMessageContent(current, message);
 	}
 
 	/**
@@ -812,10 +830,12 @@ export class AssistantMessageComponent extends Container {
 		this.#lastMessage = message;
 		this.#lastUpdateTransient = opts?.transient === true;
 
-		const nextResponseZoneStart = responseZoneStart(message.responseAnchorId, this.#responseAnchorFallbackId);
-		if (nextResponseZoneStart !== this.#responseZoneStart) {
-			this.#responseZoneStart = nextResponseZoneStart;
-			for (const candidate of this.#responseAnchorCandidates) candidate.setZoneStart(nextResponseZoneStart);
+		const nextResponseAnchorId = responseAnchorIdOrFallback(message.responseAnchorId, this.#responseAnchorFallbackId);
+		if (nextResponseAnchorId !== this.#responseAnchorId) {
+			this.#responseAnchorId = nextResponseAnchorId;
+			for (const candidate of this.#responseAnchorCandidates) {
+				candidate.setResponseAnchorId(nextResponseAnchorId);
+			}
 		}
 
 		// Streaming-speed gauge: only a live, in-flight render of the single
@@ -888,7 +908,7 @@ export class AssistantMessageComponent extends Container {
 				const trimmed = content.text.trim();
 				const mdOptions = this.#textColorTransform ? { color: this.#textColorTransform } : undefined;
 				const md = new ResponseAnchorMarkdown(
-					this.#responseZoneStart,
+					this.#responseAnchorId,
 					trimmed,
 					1,
 					0,

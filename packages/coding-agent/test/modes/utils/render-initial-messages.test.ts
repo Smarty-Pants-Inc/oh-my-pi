@@ -832,9 +832,9 @@ describe("UiHelpers.renderInitialMessages — prompt history isolation", () => {
 				content: [
 					{ type: "thinking", thinking: "REPLAY REASONING" },
 					{ type: "text", text: introMarker },
-					{ type: "toolCall", id: "replay-a", name: "contract_probe_a", arguments: {} },
+					{ type: "toolCall", id: "replay-a", name: "contract_probe_a", arguments: {}, cursorExecResolved: true },
 					{ type: "text", text: middleMarker },
-					{ type: "toolCall", id: "replay-b", name: "contract_probe_b", arguments: {} },
+					{ type: "toolCall", id: "replay-b", name: "contract_probe_b", arguments: {}, cursorExecResolved: true },
 					{ type: "text", text: finalMarker },
 				],
 				api: "anthropic-messages",
@@ -842,6 +842,7 @@ describe("UiHelpers.renderInitialMessages — prompt history isolation", () => {
 				model: "claude-sonnet",
 				usage: emptyUsage,
 				stopReason: "stop",
+				responseAnchorTerminal: true,
 				timestamp: 2,
 			},
 		]);
@@ -860,6 +861,6 @@ describe("UiHelpers.renderInitialMessages — prompt history isolation", () => {
 		expect(userLine).not.toContain("\x1b]133;");
 		expect(introLine).not.toContain("\x1b]133;");
 		expect(middleLine).not.toContain("\x1b]133;");
-		expect(finalLine).toContain("\x1b]133;A;aid=omp-response-");
+		expect(finalLine?.includes("\x1b]133;A;aid=omp-response-")).toBe(true);
 	});
 });

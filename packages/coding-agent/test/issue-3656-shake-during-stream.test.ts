@@ -1,7 +1,8 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
-import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, ToolResultMessage } from "@oh-my-pi/pi-ai";
+import { type CursorExecResolvedCarrier, kCursorExecResolved } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AssistantMessageComponent } from "@oh-my-pi/pi-coding-agent/modes/components/assistant-message";
@@ -46,6 +47,33 @@ function assistantWithBash(command: string): AssistantMessage {
 		provider: "anthropic",
 		model: "claude-sonnet-4-5",
 		stopReason: "toolUse",
+		usage,
+		timestamp: Date.now(),
+	};
+}
+
+function assistantWithResolvedBashReply(command: string, reply: string): AssistantMessage {
+	const message = assistantWithBash(command);
+	const toolCall = message.content[0];
+	if (toolCall?.type !== "toolCall") throw new Error("Expected bash tool call");
+	toolCall.cursorExecResolved = true;
+	(toolCall as CursorExecResolvedCarrier)[kCursorExecResolved] = true;
+	message.api = "cursor";
+	message.provider = "cursor";
+	message.model = "cursor-model";
+	message.content.push({ type: "text", text: reply });
+	message.stopReason = "stop";
+	return message;
+}
+
+function assistantWithReply(reply: string): AssistantMessage {
+	return {
+		role: "assistant",
+		content: [{ type: "text", text: reply }],
+		api: "anthropic-messages",
+		provider: "anthropic",
+		model: "claude-sonnet-4-5",
+		stopReason: "stop",
 		usage,
 		timestamp: Date.now(),
 	};
@@ -185,6 +213,229 @@ describe("issue #3656 /shake mid-stream preserves the in-flight assistant turn",
 		expect(mode.pendingTools.get("call-1")).toBe(pendingTool);
 	});
 
+	it("reattaches post-tool reply text so message_end can finalize the same visible block", async () => {
+		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => true });
+		const completed = assistantWithResolvedBashReply("echo hi", "FINAL AFTER TOOL");
+		await mode.eventController.handleEvent({
+			type: "message_start",
+			message: { ...completed, content: [] },
+		} as AgentSessionEvent);
+		await mode.eventController.handleEvent({ type: "message_update", message: completed } as AgentSessionEvent);
+
+		const postToolComponent = mode.chatContainer.children.find(
+			child =>
+				child instanceof AssistantMessageComponent &&
+				child !== mode.streamingComponent &&
+				Bun.stripANSI(child.render(120).join("\n")).includes("FINAL AFTER TOOL"),
+		);
+		if (!(postToolComponent instanceof AssistantMessageComponent)) {
+			throw new Error("Expected visible post-tool assistant component");
+		}
+
+		mode.rebuildChatFromMessages();
+		expect(mode.chatContainer.children).toContain(postToolComponent);
+
+		await mode.eventController.handleEvent({
+			type: "tool_execution_end",
+			toolCallId: "call-1",
+			toolName: "bash",
+			result: { content: [{ type: "text", text: "hi" }] },
+			isError: false,
+		} as AgentSessionEvent);
+		await mode.eventController.handleEvent({ type: "message_end", message: completed } as AgentSessionEvent);
+		await mode.eventController.handleEvent({
+			type: "turn_end",
+			message: completed,
+			toolResults: [],
+			willContinue: false,
+		} as AgentSessionEvent);
+		expect(postToolComponent.render(120).join("\n")).not.toContain("\x1b]133;");
+
+		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => false });
+		await mode.eventController.handleEvent({
+			type: "agent_end",
+			messages: [completed],
+			isTerminal: true,
+		} as AgentSessionEvent);
+
+		expect(mode.chatContainer.children).toContain(postToolComponent);
+		expect(String(postToolComponent.render(120).join("\n"))).toContain("\x1b]133;A;aid=omp-response-");
+	});
+	it("anchors a persisted JSON-replayed terminal Cursor reply", () => {
+		const reply = "PERSISTED CURSOR REPLY";
+		const replayed = JSON.parse(JSON.stringify(assistantWithResolvedBashReply("echo hi", reply))) as AssistantMessage;
+		replayed.responseAnchorTerminal = true;
+		const replayedToolCall = replayed.content.find(content => content.type === "toolCall");
+		if (!replayedToolCall) throw new Error("Expected replayed Cursor tool call");
+		expect((replayedToolCall as CursorExecResolvedCarrier)[kCursorExecResolved]).toBeUndefined();
+		expect(replayedToolCall.cursorExecResolved).toBe(true);
+		const result: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: replayedToolCall.id,
+			toolName: replayedToolCall.name,
+			content: [{ type: "text", text: "hi" }],
+			isError: false,
+			timestamp: Date.now(),
+		};
+		session.sessionManager.appendMessage(replayed);
+		session.sessionManager.appendMessage(JSON.parse(JSON.stringify(result)) as ToolResultMessage);
+
+		mode.rebuildChatFromMessages();
+
+		const raw = mode.chatContainer.render(120).join("\n");
+		expect(Bun.stripANSI(raw)).toContain(reply);
+		expect(raw.split("\x1b]133;A;aid=omp-response-")).toHaveLength(2);
+	});
+
+	it("does not anchor unresolved local-tool progress when a rebuild strips its dangling call", () => {
+		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => true });
+		const progress = assistantWithBash("sleep 60");
+		progress.content.push({ type: "text", text: "LOCAL TOOL PROGRESS AFTER REBUILD" });
+		session.sessionManager.appendMessage(progress);
+
+		const rebuilt = session
+			.buildTranscriptSessionContext()
+			.messages.find((message): message is AssistantMessage => message.role === "assistant");
+		if (!rebuilt) throw new Error("Expected rebuilt local-tool message");
+		expect(rebuilt.content.some(block => block.type === "toolCall")).toBe(false);
+		expect((rebuilt as AssistantMessage & { strippedToolCalls?: number }).strippedToolCalls).toBe(1);
+
+		mode.rebuildChatFromMessages();
+
+		expect(mode.chatContainer.render(120).join("\n")).not.toContain("\x1b]133;A;aid=omp-response-");
+	});
+
+	it("renders a post-tool reply once across an active rebuild and retains its terminal anchor candidate", async () => {
+		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => true });
+		const reply = "POST TOOL REPLY REBUILT ONCE";
+		const completed = assistantWithResolvedBashReply("echo hi", reply);
+		await mode.eventController.handleEvent({
+			type: "message_start",
+			message: { ...completed, content: [] },
+		} as AgentSessionEvent);
+		await mode.eventController.handleEvent({ type: "message_update", message: completed } as AgentSessionEvent);
+		await mode.eventController.handleEvent({ type: "message_end", message: completed } as AgentSessionEvent);
+
+		const postToolComponent = mode.chatContainer.children.find(
+			child =>
+				child instanceof AssistantMessageComponent && Bun.stripANSI(child.render(120).join("\n")).includes(reply),
+		);
+		if (!(postToolComponent instanceof AssistantMessageComponent)) {
+			throw new Error("Expected visible post-tool assistant component");
+		}
+		const replayed = JSON.parse(JSON.stringify(completed)) as AssistantMessage;
+		const result: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: "call-1",
+			toolName: "bash",
+			content: [{ type: "text", text: "hi" }],
+			isError: false,
+			timestamp: Date.now(),
+		};
+		session.sessionManager.appendMessage(replayed);
+		session.sessionManager.appendMessage(JSON.parse(JSON.stringify(result)) as ToolResultMessage);
+
+		mode.rebuildChatFromMessages();
+
+		let raw = mode.chatContainer.render(120).join("\n");
+		expect(Bun.stripANSI(raw).split(reply)).toHaveLength(2);
+		expect(mode.chatContainer.children).toContain(postToolComponent);
+		await mode.eventController.handleEvent({
+			type: "turn_end",
+			message: completed,
+			toolResults: [],
+			willContinue: false,
+		} as AgentSessionEvent);
+		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => false });
+		await mode.eventController.handleEvent({
+			type: "agent_end",
+			messages: [completed],
+			isTerminal: true,
+		} as AgentSessionEvent);
+
+		raw = mode.chatContainer.render(120).join("\n");
+		expect(Bun.stripANSI(raw).split(reply)).toHaveLength(2);
+		expect(String(postToolComponent.render(120).join("\n"))).toContain("\x1b]133;A;aid=omp-response-");
+	});
+
+	it("keeps a no-tool reply candidate singular until terminal agent_end resolves its zone", async () => {
+		let streaming = true;
+		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => streaming });
+		const reply = "NO TOOL TERMINAL REPLY REBUILT ONCE";
+		const completed = assistantWithReply(reply);
+		await mode.eventController.handleEvent({
+			type: "message_start",
+			message: { ...completed, content: [] },
+		} as AgentSessionEvent);
+		await mode.eventController.handleEvent({ type: "message_end", message: completed } as AgentSessionEvent);
+		const candidate = mode.chatContainer.children.find(
+			child =>
+				child instanceof AssistantMessageComponent && Bun.stripANSI(child.render(120).join("\n")).includes(reply),
+		);
+		if (!(candidate instanceof AssistantMessageComponent)) {
+			throw new Error("Expected visible no-tool response candidate");
+		}
+		const persisted = JSON.parse(JSON.stringify(completed)) as AssistantMessage;
+		persisted.responseAnchorTerminal = true;
+		session.sessionManager.appendMessage(persisted);
+		mode.rebuildChatFromMessages();
+
+		let raw = mode.chatContainer.render(120).join("\n");
+		expect(Bun.stripANSI(raw).split(reply)).toHaveLength(2);
+		expect(raw).not.toContain("\x1b]133;A;aid=omp-response-");
+		expect(mode.chatContainer.children).toContain(candidate);
+
+		streaming = false;
+		await mode.eventController.handleEvent({
+			type: "agent_end",
+			messages: [completed],
+			isTerminal: true,
+		} as AgentSessionEvent);
+
+		raw = mode.chatContainer.render(120).join("\n");
+		expect(Bun.stripANSI(raw).split(reply)).toHaveLength(2);
+		expect(raw.split("\x1b]133;A;aid=omp-response-")).toHaveLength(2);
+
+		mode.rebuildChatFromMessages();
+		raw = mode.chatContainer.render(120).join("\n");
+		expect(raw.split("\x1b]133;A;aid=omp-response-")).toHaveLength(2);
+	});
+
+	it("keeps a no-tool reply candidate unanchored and singular after nonterminal agent_end", async () => {
+		let streaming = true;
+		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => streaming });
+		const reply = "NO TOOL NONTERMINAL REPLY REBUILT ONCE";
+		const completed = assistantWithReply(reply);
+		await mode.eventController.handleEvent({
+			type: "message_start",
+			message: { ...completed, content: [] },
+		} as AgentSessionEvent);
+		await mode.eventController.handleEvent({ type: "message_end", message: completed } as AgentSessionEvent);
+		const persisted = JSON.parse(JSON.stringify(completed)) as AssistantMessage;
+		persisted.responseAnchorTerminal = false;
+		session.sessionManager.appendMessage(persisted);
+
+		mode.rebuildChatFromMessages();
+
+		let raw = mode.chatContainer.render(120).join("\n");
+		expect(Bun.stripANSI(raw).split(reply)).toHaveLength(2);
+		expect(raw).not.toContain("\x1b]133;A;aid=omp-response-");
+
+		streaming = false;
+		await mode.eventController.handleEvent({
+			type: "agent_end",
+			messages: [completed],
+			isTerminal: false,
+		} as AgentSessionEvent);
+
+		raw = mode.chatContainer.render(120).join("\n");
+		expect(Bun.stripANSI(raw).split(reply)).toHaveLength(2);
+		expect(raw).not.toContain("\x1b]133;A;aid=omp-response-");
+
+		mode.rebuildChatFromMessages();
+		raw = mode.chatContainer.render(120).join("\n");
+		expect(raw).not.toContain("\x1b]133;A;aid=omp-response-");
+	});
 	it("does not preserve in-flight tracking when the session is idle (post-stream rebuilds reset cleanly)", () => {
 		const streamingComponent = new AssistantMessageComponent();
 		mode.chatContainer.addChild(streamingComponent);

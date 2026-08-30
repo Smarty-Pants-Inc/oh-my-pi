@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import * as path from "node:path";
+import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { isBlobRef } from "@oh-my-pi/pi-coding-agent/session/blob-store";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -126,5 +127,51 @@ describe("SessionManager collab replication", () => {
 		const live = manager.getEntry(entry.id);
 		if (live?.type !== "message" || live.message.role !== "user") throw new Error("unexpected live entry");
 		expect(live.message.content).toBe("snapshot me");
+	});
+
+	it("preserves explicit nonterminal response state through JSONL and replica snapshots", async () => {
+		const { manager, cwd } = makeManager();
+		const message: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "still continuing" }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			stopReason: "stop",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		};
+		manager.appendMessage(message);
+		expect(await manager.setAssistantResponseAnchorTerminal(message, false)).toBe(true);
+
+		const snapshot = manager.snapshotForReplication();
+		const replica = SessionManager.inMemory(cwd);
+		for (const entry of snapshot.entries) replica.ingestReplicatedEntry(entry);
+		const replicated = replica
+			.getEntries()
+			.find(entry => entry.type === "message" && entry.message.role === "assistant");
+		if (replicated?.type !== "message" || replicated.message.role !== "assistant") {
+			throw new Error("Expected replicated assistant message");
+		}
+		expect(replicated.message.responseAnchorTerminal).toBe(false);
+
+		const sessionFile = manager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected persisted session file");
+		const { manager: reloaded } = makeManager();
+		await reloaded.setSessionFile(sessionFile);
+		const reloadedAssistant = reloaded
+			.getEntries()
+			.find(entry => entry.type === "message" && entry.message.role === "assistant");
+		if (reloadedAssistant?.type !== "message" || reloadedAssistant.message.role !== "assistant") {
+			throw new Error("Expected reloaded assistant message");
+		}
+		expect(reloadedAssistant.message.responseAnchorTerminal).toBe(false);
 	});
 });

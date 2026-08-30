@@ -841,6 +841,8 @@ export interface ToolCall {
 	id: string;
 	name: string;
 	arguments: Record<string, unknown>;
+	/** True when Cursor's exec channel already ran this call; retained for persisted transcript replay. */
+	cursorExecResolved?: true;
 	[kStreamingPartialJson]?: string;
 	thoughtSignature?: string; // Google-specific: opaque signature for reusing thought context
 	intent?: string; // Harness-level intent metadata extracted from traced tool arguments
@@ -957,6 +959,12 @@ export interface AssistantMessage {
 	responseId?: string; // Provider-specific response/message identifier when the upstream API exposes one
 	/** Locally generated durable identifier that correlates terminal reply anchors across live rendering and replay. */
 	responseAnchorId?: string;
+	/**
+	 * Durable outcome of the agent-end maintenance pass. `false` means this
+	 * response yielded to a scheduled continuation; only explicit `true` may
+	 * create a replay response anchor. Absent values are legacy session data.
+	 */
+	responseAnchorTerminal?: boolean;
 	/**
 	 * Name of the upstream provider an aggregator routed this request to, as
 	 * reported in the response (e.g. OpenRouter's top-level `provider` field:

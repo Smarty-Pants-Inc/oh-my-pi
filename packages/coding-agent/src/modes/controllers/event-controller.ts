@@ -138,6 +138,8 @@ export class EventController {
 	#orphanedToolCompletions = new Map<string, Extract<AgentSessionEvent, { type: "tool_execution_end" }>>();
 	#postToolAssistantComponents = new Map<string, AssistantMessageComponent>();
 	#lastAssistantComponent: AssistantMessageComponent | undefined = undefined;
+	#responseAnchorCandidate: AssistantMessageComponent | undefined = undefined;
+	#responseAnchorCandidateIsLeading = false;
 	// Assistant component whose turn-ending error is currently mirrored in the
 	// pinned banner. Its inline `Error: …` line is suppressed while pinned and
 	// restored when the banner clears at the next `agent_start` (see
@@ -295,6 +297,7 @@ export class EventController {
 			clearTimeout(this.#messageUpdateTimer);
 			this.#messageUpdateTimer = undefined;
 		}
+		this.#settleResponseAnchorCandidate(false);
 		this.#pendingMessageUpdate = undefined;
 		this.#streamingReveal.stop();
 		this.#toolArgsReveal.stop();
@@ -306,6 +309,18 @@ export class EventController {
 		}
 		this.#ircExpiryTimers.clear();
 		this.#liveIrcCards.clear();
+	}
+
+	#settleResponseAnchorCandidate(anchor: boolean): void {
+		const component = this.#responseAnchorCandidate;
+		this.#responseAnchorCandidate = undefined;
+		this.#responseAnchorCandidateIsLeading = false;
+		if (!component) return;
+		if (anchor && !this.ctx.chatContainer.children.includes(component)) {
+			this.ctx.chatContainer.addChild(component);
+		}
+		component.setResponseAnchor(anchor);
+		component.markTranscriptBlockFinalized();
 	}
 
 	#resetReadGroup(): void {
@@ -635,6 +650,16 @@ export class EventController {
 		return this.#executionStartedCallIds.has(toolCallId);
 	}
 
+	/** In-flight post-tool text blocks keyed by their preceding tool call. */
+	livePostToolAssistantSegments(): Iterable<[string, AssistantMessageComponent]> {
+		return this.#postToolAssistantComponents.entries();
+	}
+
+	/** Leading reply text awaiting terminality resolution after `message_end`. */
+	liveLeadingResponseAnchorCandidate(): AssistantMessageComponent | undefined {
+		return this.#responseAnchorCandidateIsLeading ? this.#responseAnchorCandidate : undefined;
+	}
+
 	/**
 	 * Clear every transcript-anchored/turn-scoped piece of state. Used by the
 	 * session focus proxy when re-pointing the transcript at another session:
@@ -647,6 +672,7 @@ export class EventController {
 			this.#messageUpdateTimer = undefined;
 		}
 		this.#pendingMessageUpdate = undefined;
+		this.#settleResponseAnchorCandidate(false);
 		this.#resetReadGroup();
 		this.#lastVisibleBlockCount = 0;
 		this.#renderedCustomMessages.clear();
@@ -746,6 +772,7 @@ export class EventController {
 	}
 
 	async #handleAgentStart(_event: Extract<AgentSessionEvent, { type: "agent_start" }>): Promise<void> {
+		this.#settleResponseAnchorCandidate(false);
 		this.#clearApprovalPreviewGates();
 		this.#toolTimelineComponents.clear();
 		this.#streamedToolCallIdByIndex.clear();
@@ -1034,6 +1061,7 @@ export class EventController {
 	 * sure the live buffer's trailing partial gets flushed.
 	 */
 	#handleTurnEnd(event: Extract<AgentSessionEvent, { type: "turn_end" }>): void {
+		if (event.willContinue) this.#settleResponseAnchorCandidate(false);
 		if (!settings.get("speech.enabled")) return;
 		if (settings.get("speech.mode") !== "yield") {
 			vocalizer.flush();
@@ -1311,18 +1339,26 @@ export class EventController {
 				}
 				this.ctx.lastAssistantUsage = usage;
 			}
-			const responseAnchorEligible = event.message.stopReason !== "aborted" && event.message.stopReason !== "error";
-			this.ctx.streamingComponent.setResponseAnchor(
-				responseAnchorEligible && displayTimeline.replySegment === displayTimeline.beforeTools,
-			);
-			this.ctx.streamingComponent.markTranscriptBlockFinalized();
+			this.#settleResponseAnchorCandidate(false);
+			const replySegment = event.message.stopReason === "length" ? undefined : displayTimeline.replySegment;
+			let responseAnchorCandidate: AssistantMessageComponent | undefined;
+			this.ctx.streamingComponent.setResponseAnchor(false);
+			if (replySegment === displayTimeline.beforeTools) {
+				responseAnchorCandidate = this.ctx.streamingComponent;
+			} else {
+				this.ctx.streamingComponent.markTranscriptBlockFinalized();
+			}
 			let lastPostToolAssistantComponent: AssistantMessageComponent | undefined;
 			for (const [toolCallId, segment] of displayTimeline.afterToolCalls) {
 				const component = this.#upsertPostToolAssistantSegment(toolCallId, segment);
-				component?.setResponseAnchor(responseAnchorEligible && segment === displayTimeline.replySegment);
-				component?.markTranscriptBlockFinalized();
-				if (component) lastPostToolAssistantComponent = component;
+				component?.setResponseAnchor(false);
+				if (component === undefined) continue;
+				if (segment === replySegment) responseAnchorCandidate = component;
+				else component.markTranscriptBlockFinalized();
+				lastPostToolAssistantComponent = component;
 			}
+			this.#responseAnchorCandidate = responseAnchorCandidate;
+			this.#responseAnchorCandidateIsLeading = responseAnchorCandidate === this.ctx.streamingComponent;
 			this.#lastAssistantComponent = lastPostToolAssistantComponent ?? this.ctx.streamingComponent;
 			if (settings.get("display.showTokenUsage") && assistantUsageIsBilled(event.message.usage)) {
 				const readCallIds = groupedReadUsageCallIds(event.message);
@@ -1745,6 +1781,7 @@ export class EventController {
 		// site, so the automatic continuation would otherwise run on the old
 		// model/thinking level until the terminal settle.
 		if (event.isTerminal === false) {
+			this.#settleResponseAnchorCandidate(false);
 			await this.ctx.flushPendingModelSwitch();
 			// Reaching here means the first guard passed, so `isStreaming` is already
 			// false: a command issued from now on mounts immediately. Leaving earlier
@@ -1760,6 +1797,7 @@ export class EventController {
 	}
 
 	async #finishAgentEnd(event: Extract<AgentSessionEvent, { type: "agent_end" }>): Promise<void> {
+		this.#settleResponseAnchorCandidate(true);
 		this.#setTerminalProgress(false);
 		this.ctx.statusLine.markActivityEnd();
 		this.#streamingReveal.stop();

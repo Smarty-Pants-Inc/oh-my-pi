@@ -38,7 +38,7 @@ import {
 	sanitizeRehydratedOpenAIResponsesAssistantMessage,
 	stripInternalDetailsFields,
 } from "./messages";
-import { responseAnchorIdForEntry, stampAssistantResponseAnchorId } from "./response-anchor";
+import { isSafeResponseAnchorId, responseAnchorIdForEntry, stampAssistantResponseAnchorId } from "./response-anchor";
 import { type BuildSessionContextOptions, buildSessionContext, type SessionContext } from "./session-context";
 import {
 	type BranchSummaryEntry,
@@ -222,14 +222,21 @@ function isAssistantEntry(entry: SessionEntry): entry is SessionMessageEntry & {
 }
 
 function stampLoadedAssistantResponseAnchor(entry: SessionEntry): void {
-	if (isAssistantEntry(entry)) stampAssistantResponseAnchorId(entry.message, entry.id);
+	if (!isAssistantEntry(entry)) return;
+	// Old journals have no explicit agent-end terminality. A response anchor
+	// already written by the earlier final-reply feature is the only durable
+	// legacy signal worth preserving; ids synthesized during load stay unknown.
+	if (entry.message.responseAnchorTerminal === undefined && isSafeResponseAnchorId(entry.message.responseAnchorId)) {
+		entry.message.responseAnchorTerminal = true;
+	}
+	stampAssistantResponseAnchorId(entry.message, entry.id);
 }
 
 function stampLoadedAssistantResponseAnchors(entries: readonly SessionEntry[]): void {
 	const seen = new Set<string>();
 	for (const entry of entries) {
 		if (!isAssistantEntry(entry)) continue;
-		stampAssistantResponseAnchorId(entry.message, entry.id);
+		stampLoadedAssistantResponseAnchor(entry);
 		let responseAnchorId = entry.message.responseAnchorId;
 		if (!responseAnchorId || seen.has(responseAnchorId)) {
 			responseAnchorId = responseAnchorIdForEntry(entry.id);
@@ -2583,6 +2590,33 @@ export class SessionManager {
 	 */
 	snapshotForReplication(): { header: SessionHeader; entries: SessionEntry[] } {
 		return { header: cloneDurableSessionJson(this.#header), entries: cloneDurableSessionJson(this.#entries) };
+	}
+
+	/**
+	 * Set the final agent-end classification on a persisted assistant message.
+	 * The identity match serves live sessions; responseAnchorId reaches collab
+	 * replicas, whose deserialized message object is distinct.
+	 */
+	async setAssistantResponseAnchorTerminal(message: AssistantMessage, isTerminal: boolean): Promise<boolean> {
+		let matchingEntry = this.#entries.find(
+			(entry): entry is SessionMessageEntry & { message: AssistantMessage } =>
+				isAssistantEntry(entry) && entry.message === message,
+		);
+		if (!matchingEntry && isSafeResponseAnchorId(message.responseAnchorId)) {
+			for (let i = this.#entries.length - 1; i >= 0; i--) {
+				const entry = this.#entries[i]!;
+				if (isAssistantEntry(entry) && entry.message.responseAnchorId === message.responseAnchorId) {
+					matchingEntry = entry;
+					break;
+				}
+			}
+		}
+		if (!matchingEntry) return false;
+		const changed = matchingEntry.message.responseAnchorTerminal !== isTerminal;
+		matchingEntry.message.responseAnchorTerminal = isTerminal;
+		if (matchingEntry.message !== message) message.responseAnchorTerminal = isTerminal;
+		if (changed) await this.rewriteEntries();
+		return true;
 	}
 
 	/**

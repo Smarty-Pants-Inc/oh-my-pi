@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
-import type { AssistantMessage, Usage } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, ToolCall, Usage } from "@oh-my-pi/pi-ai";
+import { type CursorExecResolvedCarrier, kCursorExecResolved } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import {
 	assistantUsageIsBilled,
 	splitAssistantMessageToolTimeline,
@@ -30,6 +31,12 @@ function assistant(content: AssistantMessage["content"]): AssistantMessage {
 	};
 }
 
+function cursorResolvedToolCall(id: string, name: string): ToolCall {
+	const toolCall: ToolCall = { type: "toolCall", id, name, arguments: {}, cursorExecResolved: true };
+	(toolCall as CursorExecResolvedCarrier)[kCursorExecResolved] = true;
+	return toolCall;
+}
+
 describe("assistantUsageIsBilled", () => {
 	it("suppresses the token badge only for turns that consumed nothing", () => {
 		expect(assistantUsageIsBilled(usage())).toBe(false);
@@ -54,15 +61,15 @@ describe("assistantUsageIsBilled", () => {
 });
 
 describe("splitAssistantMessageToolTimeline response navigation", () => {
-	it("selects only text after the final tool call as the reply stop", () => {
+	it("selects only text after the final Cursor-resolved tool call as the reply stop", () => {
 		const timeline = splitAssistantMessageToolTimeline(
 			assistant([
 				{ type: "thinking", thinking: "reasoning before the reply" },
 				{ type: "text", text: "intro" },
-				{ type: "toolCall", id: "a", name: "read", arguments: {} },
+				cursorResolvedToolCall("a", "read"),
 				{ type: "thinking", thinking: "more reasoning" },
 				{ type: "text", text: "middle" },
-				{ type: "toolCall", id: "b", name: "bash", arguments: {} },
+				cursorResolvedToolCall("b", "bash"),
 				{ type: "text", text: "final reply" },
 			]),
 		);
@@ -72,19 +79,59 @@ describe("splitAssistantMessageToolTimeline response navigation", () => {
 			splitAssistantMessageToolTimeline(
 				assistant([
 					{ type: "text", text: "intro" },
-					{ type: "toolCall", id: "a", name: "read", arguments: {} },
+					cursorResolvedToolCall("a", "read"),
 					{ type: "text", text: "middle after the first tool" },
-					{ type: "toolCall", id: "b", name: "bash", arguments: {} },
+					cursorResolvedToolCall("b", "bash"),
 				]),
 			).replySegment,
 		).toBeUndefined();
+	});
+
+	it("requires explicit terminality for a replay response anchor", () => {
+		const terminal = assistant([{ type: "text", text: "final reply" }]);
+		terminal.responseAnchorTerminal = true;
+		const nonterminal = assistant([{ type: "text", text: "scheduled continuation" }]);
+		nonterminal.responseAnchorTerminal = false;
+
+		expect(splitAssistantMessageToolTimeline(terminal).terminalReplySegment?.content).toEqual([
+			{ type: "text", text: "final reply" },
+		]);
+		expect(splitAssistantMessageToolTimeline(nonterminal).terminalReplySegment).toBeUndefined();
+		expect(
+			splitAssistantMessageToolTimeline(assistant([{ type: "text", text: "legacy unknown" }])).terminalReplySegment,
+		).toBeUndefined();
+	});
+
+	it("keeps a terminal Cursor reply eligible after JSON replay drops its live marker", () => {
+		const replayed = JSON.parse(
+			JSON.stringify(
+				assistant([cursorResolvedToolCall("cursor", "bash"), { type: "text", text: "replayed reply" }]),
+			),
+		) as AssistantMessage;
+		const replayedToolCall = replayed.content.find((content): content is ToolCall => content.type === "toolCall");
+		if (!replayedToolCall) throw new Error("Expected replayed Cursor tool call");
+
+		expect((replayedToolCall as CursorExecResolvedCarrier)[kCursorExecResolved]).toBeUndefined();
+		expect(replayedToolCall.cursorExecResolved).toBe(true);
+		expect(splitAssistantMessageToolTimeline(replayed).replySegment?.content).toEqual([
+			{ type: "text", text: "replayed reply" },
+		]);
+	});
+
+	it("does not turn stripped local-tool progress into a terminal reply", () => {
+		const rebuilt = {
+			...assistant([{ type: "text", text: "local progress after stripped call" }]),
+			strippedToolCalls: 1,
+		};
+
+		expect(splitAssistantMessageToolTimeline(rebuilt).replySegment).toBeUndefined();
 	});
 
 	it("keeps a hidden final post-tool segment instead of falling back to pre-tool text", () => {
 		const timeline = splitAssistantMessageToolTimeline(
 			assistant([
 				{ type: "text", text: "visible text before the tool" },
-				{ type: "toolCall", id: "a", name: "read", arguments: {} },
+				cursorResolvedToolCall("a", "read"),
 				{ type: "text", text: "[hidden-reference]: https://example.test/reference" },
 			]),
 		);
@@ -93,13 +140,35 @@ describe("splitAssistantMessageToolTimeline response navigation", () => {
 		expect(timeline.replySegment).not.toBe(timeline.beforeTools);
 	});
 
-	it("does not select aborted or failed partial text as a finalized reply stop", () => {
+	it("does not select interrupted, failed, truncated, or paused progress as a reply stop", () => {
 		const aborted = assistant([{ type: "text", text: "partial before interrupt" }]);
 		aborted.stopReason = "aborted";
 		const failed = assistant([{ type: "text", text: "partial before provider error" }]);
 		failed.stopReason = "error";
+		const truncated = assistant([{ type: "text", text: "partial at token limit" }]);
+		truncated.stopReason = "length";
+		const paused = assistant([{ type: "text", text: "progress before pause" }]);
+		paused.stopDetails = { type: "pause_turn" };
 
 		expect(splitAssistantMessageToolTimeline(aborted).replySegment).toBeUndefined();
 		expect(splitAssistantMessageToolTimeline(failed).replySegment).toBeUndefined();
+		expect(splitAssistantMessageToolTimeline(truncated).replySegment).toBeUndefined();
+		expect(splitAssistantMessageToolTimeline(paused).replySegment).toBeUndefined();
+	});
+
+	it("rejects a local tool continuation but preserves a terminal Cursor-resolved tool reply", () => {
+		const local = assistant([
+			{ type: "toolCall", id: "local", name: "read", arguments: {} },
+			{ type: "text", text: "local progress" },
+		]);
+		const cursorResolved = assistant([
+			cursorResolvedToolCall("cursor", "read"),
+			{ type: "text", text: "terminal Cursor reply" },
+		]);
+
+		expect(splitAssistantMessageToolTimeline(local).replySegment).toBeUndefined();
+		expect(splitAssistantMessageToolTimeline(cursorResolved).replySegment?.content).toEqual([
+			{ type: "text", text: "terminal Cursor reply" },
+		]);
 	});
 });

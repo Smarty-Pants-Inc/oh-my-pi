@@ -17,7 +17,7 @@
  */
 import * as path from "node:path";
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
-import type { ImageContent } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, ImageContent } from "@oh-my-pi/pi-ai";
 import { getConfigRootDir, logger } from "@oh-my-pi/pi-utils";
 import type { AgentHubRemote, AgentHubRemoteTranscript } from "../modes/components/agent-hub";
 import type { InteractiveModeContext } from "../modes/types";
@@ -625,6 +625,16 @@ export class CollabGuestLink {
 	}
 
 	#applyEvent(event: AgentSessionEvent): void {
+		if (event.type === "agent_end") {
+			const assistant = [...event.messages]
+				.reverse()
+				.find((message): message is AssistantMessage => message.role === "assistant");
+			if (assistant?.responseAnchorTerminal !== undefined) {
+				void this.#ctx.sessionManager
+					.setAssistantResponseAnchorTerminal(assistant, assistant.responseAnchorTerminal)
+					.catch(error => logger.warn("Failed to mirror collab response terminality", { error }));
+			}
+		}
 		// Orphan-delta guard: when joining mid-turn the message_start for the
 		// in-flight assistant message predates the snapshot. message_update
 		// carries the full accumulating message, so synthesize the missing start

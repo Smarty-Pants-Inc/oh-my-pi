@@ -145,6 +145,72 @@ describe("AgentSession owner-routed async delivery", () => {
 		).toBe(true);
 	});
 
+	it("persists a nonterminal assistant stop before an async wake can resume it", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const providerStarted = Promise.withResolvers<void>();
+		const providerGate = Promise.withResolvers<void>();
+		const mock = createMockModel({
+			handler: async () => {
+				providerStarted.resolve();
+				await providerGate.promise;
+				return { content: ["paused reply"] };
+			},
+		});
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			convertToLlm,
+			streamFn: mock.stream,
+		});
+		const authStorage = await AuthStorage.create(":memory:");
+		authStorages.push(authStorage);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const manager = new AsyncJobManager({});
+		AsyncJobManager.setInstance(manager);
+		const sessionManager = SessionManager.inMemory();
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated(),
+			modelRegistry: new ModelRegistry(authStorage),
+			agentId: "SubAgent",
+			asyncJobManager: manager,
+		});
+		const agentEnds: Array<{ event: boolean | undefined; persisted: boolean | undefined }> = [];
+		session.subscribe(event => {
+			if (event.type !== "agent_end") return;
+			const persisted = [...sessionManager.getEntries()]
+				.reverse()
+				.find(entry => entry.type === "message" && entry.message.role === "assistant");
+			agentEnds.push({
+				event: event.isTerminal,
+				persisted:
+					persisted?.type === "message" && persisted.message.role === "assistant"
+						? persisted.message.responseAnchorTerminal
+						: undefined,
+			});
+		});
+
+		const prompt = session.sendUserMessage("wait for the async result");
+		await providerStarted.promise;
+		const originTurnId = session.getCurrentTurnId();
+		expect(originTurnId).toMatch(/^turn-/);
+		const jobGate = Promise.withResolvers<string>();
+		manager.register("bash", "held origin job", async () => await jobGate.promise, {
+			id: "held-origin-job",
+			ownerId: "SubAgent",
+			originTurnId,
+		});
+
+		providerGate.resolve();
+		await prompt;
+		expect(agentEnds).toEqual([{ event: false, persisted: false }]);
+
+		jobGate.resolve("finished after the nonterminal settle");
+		await manager.waitForOwnerJobs("SubAgent");
+		await manager.drainDeliveries({ filter: { ownerId: "SubAgent" } });
+	});
+
 	it("persists an advisor-owned launch completion without starting a turn", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });

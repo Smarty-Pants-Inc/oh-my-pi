@@ -32,11 +32,7 @@ import {
 	wrapInbandToolStream,
 } from "@oh-my-pi/pi-ai/dialect";
 import * as AIError from "@oh-my-pi/pi-ai/error";
-import {
-	type CursorExecResolvedCarrier,
-	copyCursorExecResolved,
-	kCursorExecResolved,
-} from "@oh-my-pi/pi-ai/utils/block-symbols";
+import { copyCursorExecResolved, isCursorExecResolved } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import {
 	createHarmonyAuditEvent,
 	detectHarmonyLeakInAssistantMessage,
@@ -651,7 +647,8 @@ async function emitTurnEnd(
 	context?: Omit<AgentTurnEndContext, "message" | "toolResults">,
 	runHookOnAbortedMessage = false,
 ): Promise<void> {
-	stream.push({ type: "turn_end", message, toolResults });
+	const willContinue = context?.willContinue ?? false;
+	stream.push({ type: "turn_end", message, toolResults, willContinue });
 	const terminalYield = signal?.reason === TERMINAL_TOOL_RESULT_ABORT_REASON;
 	const isAbortedOrError =
 		message.role === "assistant" && (message.stopReason === "aborted" || message.stopReason === "error");
@@ -659,8 +656,7 @@ async function emitTurnEnd(
 	await config.onTurnEnd?.(currentContext.messages, terminalYield ? undefined : signal, {
 		message,
 		toolResults,
-		willContinue: false,
-		...context,
+		willContinue,
 	});
 }
 
@@ -1377,8 +1373,7 @@ async function runLoopBody(
 					// for out-of-band emission; a placeholder aborted result here would
 					// pair a duplicate to the same toolCallId (issue #4348 codex review).
 					const toolCalls = message.content.filter(
-						(c): c is ToolCallContent =>
-							c.type === "toolCall" && (c as CursorExecResolvedCarrier)[kCursorExecResolved] !== true,
+						(c): c is ToolCallContent => c.type === "toolCall" && !isCursorExecResolved(c),
 					);
 					// Provider-built aborted messages (stream error events) carry no
 					// per-tool labels; derive them from a tool-scoped abort signal so
@@ -1432,8 +1427,7 @@ async function runLoopBody(
 				// out-of-band emission — running it here again would duplicate the
 				// same side-effecting call (issue #4348 review by @chatgpt-codex-connector).
 				const toolCalls = message.content.filter(
-					(c): c is ToolCallContent =>
-						c.type === "toolCall" && (c as CursorExecResolvedCarrier)[kCursorExecResolved] !== true,
+					(c): c is ToolCallContent => c.type === "toolCall" && !isCursorExecResolved(c),
 				);
 				const runnableStop = message.stopReason === "toolUse" || message.stopReason === "stop";
 				hasMoreToolCalls = runnableStop && toolCalls.length > 0;
@@ -2366,8 +2360,7 @@ async function prepareToolCallDispatch(
 	const { resolveFallbackTool, intentTracing, beforeToolCall } = config;
 	const prepared = new Map<string, PreparedToolCall>();
 	for (const toolCall of assistantMessage.content) {
-		if (toolCall.type !== "toolCall") continue;
-		if ((toolCall as CursorExecResolvedCarrier)[kCursorExecResolved] === true) continue;
+		if (toolCall.type !== "toolCall" || isCursorExecResolved(toolCall)) continue;
 		const tool = resolveToolForCall(context.tools, toolCall, resolveFallbackTool);
 		const entry: PreparedToolCall = { tool, args: toolCall.arguments as Record<string, unknown> };
 		prepared.set(toolCall.id, entry);
@@ -2466,8 +2459,7 @@ async function executeToolCalls(
 	// deciding to invoke `executeToolCalls`, but skip them here too so the
 	// guarantee lives with the code that would re-run the tool.
 	const toolCalls = assistantMessage.content.filter(
-		(c): c is ToolCallContent =>
-			c.type === "toolCall" && (c as CursorExecResolvedCarrier)[kCursorExecResolved] !== true,
+		(c): c is ToolCallContent => c.type === "toolCall" && !isCursorExecResolved(c),
 	);
 	const emittedToolResults: ToolResultMessage[] = [];
 	const toolCallInfos = toolCalls.map(call => ({ id: call.id, name: call.name }));

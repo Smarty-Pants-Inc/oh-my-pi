@@ -84,6 +84,10 @@ export interface AssistantMessage {
 	model: string;
 	usage: WireUsage;
 	stopReason: StopReason;
+	/** Durable response identity used to match host and guest replay entries. */
+	responseAnchorId?: string;
+	/** Explicit agent-end terminality; omitted for legacy sessions. */
+	responseAnchorTerminal?: boolean;
 	errorMessage?: string;
 	timestamp: number;
 }
@@ -181,7 +185,7 @@ export interface CollabPromptDetails {
 
 export type AgentEvent =
 	| { type: "agent_start" }
-	| { type: "agent_end" }
+	| { type: "agent_end"; messages?: WireMessage[]; isTerminal?: boolean }
 	| { type: "turn_start" }
 	| { type: "turn_end" }
 	| { type: "message_start"; message: WireMessage }

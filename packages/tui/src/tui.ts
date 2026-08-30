@@ -12,9 +12,10 @@
  * provider paint their composed children as a bounded viewport and never
  * touch history. See `docs/tui-core-renderer.md`.
  */
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import { performance } from "node:perf_hooks";
-import { $flag, getDebugLogPath, logger } from "@oh-my-pi/pi-utils";
+import { $flag, getDebugLogPath, logger, stripOsc133Sequences } from "@oh-my-pi/pi-utils";
 import { DEFAULT_MAX_INLINE_IMAGES, ImageBudget } from "./components/image";
 import { isKeyRelease, matchesKey } from "./keys";
 import { LoopWatchdog } from "./loop-watchdog";
@@ -61,12 +62,82 @@ const ERASE_TO_END_OF_LINE = "\x1b[K";
 const LINE_FIT_MIN_SOURCE_CODE_UNITS = 4096;
 const LINE_FIT_MAX_SOURCE_CODE_UNITS = 65536;
 const LINE_FIT_SOURCE_WIDTH_MULTIPLIER = 64;
-// Text and Markdown strip untrusted OSC 133 before their output reaches the
-// renderer. Long-line fitting retains only the exact response-zone shape
-// synthesized by AssistantMessageComponent, so a truncated row stays balanced.
-const TRUSTED_RESPONSE_ZONE_START =
-	/^\x1b\]133;A;aid=omp-response-\d+-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[A-Za-z0-9_-]{1,128}\x07/;
+const RESPONSE_ANCHOR_ID = /^[A-Za-z0-9_-]{1,128}$/;
+const RESPONSE_ZONE_SESSION = `${process.pid}-${randomUUID()}`;
 const RESPONSE_ZONE_CLOSE = "\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07";
+
+function responseZoneStart(responseAnchorId: string): string {
+	return `\x1b]133;A;aid=omp-response-${RESPONSE_ZONE_SESSION}:${responseAnchorId}\x07`;
+}
+
+export interface ResponseZoneLineOptions {
+	readonly responseAnchorId?: string;
+	readonly close?: boolean;
+}
+
+interface ResponseZoneLineMetadata {
+	readonly content: string;
+	readonly responseAnchorId: string | undefined;
+	readonly close: boolean;
+}
+
+const RESPONSE_ZONE_LINES = new WeakMap<object, ResponseZoneLineMetadata>();
+
+/**
+ * Boxed so only the exact row minted through this process-private structured
+ * channel retains reply-zone authority at the final terminal boundary. A copy,
+ * prototype spoof, or textual marker has no WeakMap entry and is stripped.
+ */
+class ResponseZoneLine extends String {
+	constructor(content: string, options: ResponseZoneLineOptions) {
+		const responseAnchorId = options.responseAnchorId;
+		if (responseAnchorId !== undefined && !RESPONSE_ANCHOR_ID.test(responseAnchorId)) {
+			throw new TypeError("Invalid response anchor ID");
+		}
+		const close = options.close === true;
+		super(
+			(responseAnchorId === undefined ? "" : responseZoneStart(responseAnchorId)) +
+				content +
+				(close ? RESPONSE_ZONE_CLOSE : ""),
+		);
+		RESPONSE_ZONE_LINES.set(this, { content, responseAnchorId, close });
+		Object.freeze(this);
+	}
+}
+
+/** Mark one rendered row as an authorized reply-zone edge for the final TUI writer. */
+export function createResponseZoneLine(content: string, options: ResponseZoneLineOptions): string {
+	return new ResponseZoneLine(content, options) as unknown as string;
+}
+
+function responseZoneMetadata(value: unknown): ResponseZoneLineMetadata | undefined {
+	return typeof value === "object" && value !== null ? RESPONSE_ZONE_LINES.get(value) : undefined;
+}
+
+function responseZoneLine(raw: string): { content: string; responseZone: ResponseZoneLineMetadata | undefined } {
+	const responseZone = responseZoneMetadata(raw);
+	return {
+		content: stripOsc133Sequences(responseZone?.content ?? String(raw)),
+		responseZone,
+	};
+}
+
+function applyResponseZone(line: string, responseZone: ResponseZoneLineMetadata | undefined): string {
+	if (!responseZone) return line;
+	const start = responseZone.responseAnchorId ? responseZoneStart(responseZone.responseAnchorId) : "";
+	return start + line + (responseZone.close ? RESPONSE_ZONE_CLOSE : "");
+}
+
+function preserveResponseZoneLine(line: string, responseZone: ResponseZoneLineMetadata | undefined): string {
+	if (!responseZone) return line;
+	return createResponseZoneLine(line, responseZone);
+}
+
+/** Strip untrusted shell-integration controls and restore only a process-minted reply-zone edge. */
+export function prepareTerminalOutputLine(raw: string): string {
+	const { content, responseZone } = responseZoneLine(raw);
+	return applyResponseZone(content, responseZone);
+}
 // Hide the hardware cursor before each paint/move write. Ghostty-style bar
 // cursors can otherwise leave visual afterimages while the TUI repaints the
 // row under a visible cursor. Paint writes also disable terminal autowrap:
@@ -1830,8 +1901,9 @@ export class TUI extends Container {
 			for (let i = 0; i < overlayLines.length; i++) {
 				const idx = row + i;
 				if (idx < 0 || idx >= result.length) continue;
+				const overlayLine = responseZoneLine(overlayLines[i]!).content;
 				const truncatedOverlayLine =
-					visibleWidth(overlayLines[i]) > width ? sliceByColumn(overlayLines[i], 0, width, true) : overlayLines[i];
+					visibleWidth(overlayLine) > width ? sliceByColumn(overlayLine, 0, width, true) : overlayLine;
 				result[idx] = this.#compositeLineAt(result[idx], truncatedOverlayLine, col, width, termWidth);
 			}
 		}
@@ -1846,13 +1918,21 @@ export class TUI extends Container {
 		overlayWidth: number,
 		totalWidth: number,
 	): string {
+		const baseSource = responseZoneLine(baseLine);
+		baseLine = baseSource.content;
+		overlayLine = responseZoneLine(overlayLine).content;
 		if (TERMINAL.isImageLine(baseLine)) {
 			// Full-width overlays such as /switch are opaque: replace the
 			// Unicode placeholder cells so the image cannot cover the modal.
 			// Partial overlays cannot safely splice placement control sequences.
-			if (startCol !== 0 || overlayWidth < totalWidth) return baseLine;
+			if (startCol !== 0 || overlayWidth < totalWidth) {
+				return preserveResponseZoneLine(baseLine, baseSource.responseZone);
+			}
 			const overlay = sliceWithWidth(overlayLine, 0, totalWidth, true);
-			return SEGMENT_RESET + overlay.text + " ".repeat(Math.max(0, totalWidth - overlay.width));
+			return preserveResponseZoneLine(
+				SEGMENT_RESET + overlay.text + " ".repeat(Math.max(0, totalWidth - overlay.width)),
+				baseSource.responseZone,
+			);
 		}
 
 		// Single pass through baseLine extracts both before and after segments
@@ -1889,11 +1969,10 @@ export class TUI extends Container {
 		// - Wide characters at segment boundaries
 		// - Edge cases in segment extraction
 		const resultWidth = visibleWidth(result);
-		if (resultWidth <= totalWidth) {
-			return result;
-		}
-		// Truncate with strict=true to ensure we don't exceed totalWidth
-		return sliceByColumn(result, 0, totalWidth, true);
+		return preserveResponseZoneLine(
+			resultWidth <= totalWidth ? result : sliceByColumn(result, 0, totalWidth, true),
+			baseSource.responseZone,
+		);
 	}
 
 	/**
@@ -2250,17 +2329,18 @@ export class TUI extends Container {
 	}
 
 	#prepareLine(raw: string, width: number): PreparedLine {
-		if (TERMINAL.isImageLine(raw)) {
-			return { raw, width, line: raw };
+		const { content: source, responseZone } = responseZoneLine(raw);
+		if (TERMINAL.isImageLine(source)) {
+			return { raw: source, width, line: source };
 		}
-		const source = this.#lineFitSource(raw, width);
-		const normalized = normalizeTerminalOutput(source);
+		const fitted = this.#lineFitSource(source, width);
+		const normalized = normalizeTerminalOutput(fitted);
 		const asciiWidth = this.#ansiAsciiLineWidth(normalized, width);
-		if ((asciiWidth ?? visibleWidth(normalized)) <= width) {
-			return { raw, width, line: normalized };
-		}
-		const line = truncateToWidth(normalized, width, Ellipsis.Omit);
-		return { raw, width, line };
+		const line =
+			(asciiWidth ?? visibleWidth(normalized)) <= width
+				? normalized
+				: truncateToWidth(normalized, width, Ellipsis.Omit);
+		return { raw: source, width, line: applyResponseZone(line, responseZone) };
 	}
 
 	#lineFitSource(raw: string, width: number): string {
@@ -2270,8 +2350,6 @@ export class TUI extends Container {
 			Math.max(LINE_FIT_MIN_SOURCE_CODE_UNITS, safeWidth * LINE_FIT_SOURCE_WIDTH_MULTIPLIER),
 		);
 		if (raw.length <= maxSourceLength) return raw;
-		const responseZoneStart = raw.match(TRUSTED_RESPONSE_ZONE_START)?.[0] ?? "";
-		const responseZoneClose = raw.endsWith(RESPONSE_ZONE_CLOSE) ? RESPONSE_ZONE_CLOSE : "";
 
 		let output = "";
 		let cells = 0;
@@ -2332,7 +2410,7 @@ export class TUI extends Container {
 			i = next;
 		}
 
-		return responseZoneStart + output + responseZoneClose + SEGMENT_RESET;
+		return output + SEGMENT_RESET;
 	}
 
 	#ansiSequenceEnd(line: string, start: number): number {

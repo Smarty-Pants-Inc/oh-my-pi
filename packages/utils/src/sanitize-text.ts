@@ -32,26 +32,23 @@ function findOsc133Start(
 	text: string,
 	from: number,
 ): { start: number; payloadStart: number; prefix: string } | undefined {
-	for (;;) {
-		const escStart = text.indexOf(ESC_CHAR, from);
-		const c1Start = text.indexOf("\x9d", from);
-		const start = escStart === -1 ? c1Start : c1Start === -1 ? escStart : Math.min(escStart, c1Start);
-		if (start === -1) return undefined;
+	for (let start = from; start < text.length; start++) {
+		const first = text.charCodeAt(start);
+		const prefix =
+			first === 0x1b && text.startsWith(OSC_133_PREFIX, start)
+				? OSC_133_PREFIX
+				: first === 0x9d && text.startsWith(C1_OSC_133_PREFIX, start)
+					? C1_OSC_133_PREFIX
+					: undefined;
+		if (!prefix) continue;
 
-		const prefix = text.startsWith(OSC_133_PREFIX, start)
-			? OSC_133_PREFIX
-			: text.startsWith(C1_OSC_133_PREFIX, start)
-				? C1_OSC_133_PREFIX
-				: undefined;
-		if (prefix) {
-			const payloadStart = start + prefix.length;
-			const next = text.charCodeAt(payloadStart);
-			// OSC 1337 is a distinct sequence; every non-digit terminates the
-			// numeric command, including an incomplete OSC 133 at end-of-input.
-			if (Number.isNaN(next) || next < 0x30 || next > 0x39) return { start, payloadStart, prefix };
-		}
-		from = start + 1;
+		const payloadStart = start + prefix.length;
+		const next = text.charCodeAt(payloadStart);
+		// OSC 1337 is a distinct sequence; every non-digit terminates the
+		// numeric command, including an incomplete OSC 133 at end-of-input.
+		if (Number.isNaN(next) || next < 0x30 || next > 0x39) return { start, payloadStart, prefix };
 	}
+	return undefined;
 }
 
 function osc133End(text: string, from: number): { index: number; complete: boolean } {
@@ -64,8 +61,9 @@ function osc133End(text: string, from: number): { index: number; complete: boole
 }
 
 /**
- * Strip one appended text delta. `pending` carries only an OSC 133 introducer
- * (and a possible ST-leading ESC), never the unbounded discarded payload.
+ * Strip one appended text delta. `pending` carries only an OSC 133 introducer,
+ * its first non-digit discriminator, and a possible ST-leading ESC — never the
+ * unbounded discarded payload.
  */
 export function stripOsc133Append(text: string, pending: string = ""): { text: string; pending: string } {
 	const source = pending + text;
@@ -79,9 +77,11 @@ export function stripOsc133Append(text: string, pending: string = ""): { text: s
 	for (;;) {
 		const end = osc133End(source, sequence.payloadStart);
 		if (!end.complete) {
+			const discriminator = source[sequence.payloadStart] ?? "";
+			const trailingEsc = source.endsWith(ESC_CHAR) && discriminator !== ESC_CHAR ? ESC_CHAR : "";
 			return {
 				text: output.join(""),
-				pending: sequence.prefix + (source.endsWith(ESC_CHAR) ? ESC_CHAR : ""),
+				pending: sequence.prefix + discriminator + trailingEsc,
 			};
 		}
 		sequence = findOsc133Start(source, end.index);

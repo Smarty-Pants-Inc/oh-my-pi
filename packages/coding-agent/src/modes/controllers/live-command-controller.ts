@@ -178,10 +178,8 @@ export class LiveCommandController {
 		};
 		component.updateContent(message, { transient: !transcript.final });
 		if (transcript.final) {
-			component.setResponseAnchor(true);
-			component.markTranscriptBlockFinalized();
-			this.#assistantTranscriptComponent = undefined;
-			this.#assistantTranscriptStartedAt = 0;
+			this.#finalizeAssistantTranscript();
+			return;
 		}
 		if (!this.#ctx.chatContainer.children.includes(component)) {
 			this.#ctx.present(component);
@@ -193,6 +191,9 @@ export class LiveCommandController {
 	#finalizeAssistantTranscript(): void {
 		const component = this.#assistantTranscriptComponent;
 		if (!component) return;
+		if (!this.#ctx.chatContainer.children.includes(component)) {
+			this.#ctx.present(component);
+		}
 		component.setResponseAnchor(true);
 		component.markTranscriptBlockFinalized();
 		this.#assistantTranscriptComponent = undefined;

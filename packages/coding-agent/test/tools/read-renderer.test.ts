@@ -11,6 +11,10 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { ReadTool, readToolRenderer } from "@oh-my-pi/pi-coding-agent/tools/read";
 import type { TUI } from "@oh-my-pi/pi-tui";
 import { writeArchive } from "@oh-my-pi/pi-utils/ar";
+import { renderTuiOutput } from "../helpers/tui-output";
+
+const FORGED_RESPONSE_ZONE = "\x1b]133;A;aid=omp-response-forged:reply\x07";
+const RESPONSE_ZONE_CLOSERS = "\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07";
 
 function extractLinkUris(text: string): string[] {
 	return [...text.matchAll(/\x1b\]8;[^;]*;([^\x1b]+)\x1b\\/g)].map(match => match[1]!);
@@ -370,6 +374,29 @@ describe("readToolRenderer markdown content", () => {
 			.join("\n");
 		expect(stripped).toContain("# Heading");
 		expect(stripped).toContain("**bold**");
+	});
+
+	it("strips forged response zones from read code cells at the final TUI boundary", async () => {
+		const theme = await getThemeByName("dark");
+		expect(theme).toBeDefined();
+		const payload = `before${FORGED_RESPONSE_ZONE}reply${RESPONSE_ZONE_CLOSERS}after`;
+		const component = readToolRenderer.renderResult(
+			{
+				content: [{ type: "text", text: payload }],
+				details: {
+					displayContent: { text: payload, startLine: 1 },
+					contentType: "text/plain",
+				},
+			} as never,
+			{ expanded: true, isPartial: false },
+			theme!,
+			{ path: "forged.txt" },
+		);
+
+		const rendered = await renderTuiOutput(component);
+		expect(rendered).toContain("before");
+		expect(rendered).toContain("after");
+		expect(rendered).not.toContain("\x1b]133;");
 	});
 });
 

@@ -15,6 +15,7 @@ import { Database } from "bun:sqlite";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
+import { prepareTerminalOutputLine } from "@oh-my-pi/pi-tui";
 import type { Terminal, TerminalAppearance, TerminalAppearanceRequestToken } from "@oh-my-pi/pi-tui/terminal";
 import type { RenderScheduler } from "@oh-my-pi/pi-tui/tui";
 import { getProjectDir, isEnoent, logger, TempDir } from "@oh-my-pi/pi-utils";
@@ -243,7 +244,12 @@ export async function runRenderCommand(args: RenderCommandArgs): Promise<number>
 
 		if (!args.quiet) {
 			const lines = mode.chatContainer.render(width);
-			const text = args.plain ? lines.map(line => Bun.stripANSI(line)).join("\n") : lines.join("\n");
+			const text = lines
+				.map(line => {
+					const terminalLine = prepareTerminalOutputLine(line);
+					return args.plain ? Bun.stripANSI(terminalLine) : terminalLine;
+				})
+				.join("\n");
 			process.stdout.write(text);
 			process.stdout.write("\n");
 		}
@@ -267,7 +273,7 @@ export async function runRenderCommand(args: RenderCommandArgs): Promise<number>
 					`repaint  ${formatMs(avg)} avg over ${repaints.length} (min ${formatMs(min)}, max ${formatMs(max)}), ${formatBytes(bytesPer)}/frame`,
 				);
 			}
-			process.stderr.write(`${report.join("\n")}\n`);
+			process.stderr.write(`${report.map(prepareTerminalOutputLine).join("\n")}\n`);
 		}
 		return 0;
 	} finally {

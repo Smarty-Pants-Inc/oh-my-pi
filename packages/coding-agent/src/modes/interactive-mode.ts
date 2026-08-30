@@ -2136,16 +2136,28 @@ export class InteractiveMode implements InteractiveModeContext {
 		// and restore the `pendingTools` map so streaming routes back into them.
 		const liveComponents: Component[] = [];
 		const livePendingTools = new Map<string, ToolExecutionHandle>();
+		const preservedLivePostToolCallIds = new Set<string>();
+		const preservedLiveResponseAnchorCandidate = this.viewSession?.isStreaming
+			? this.eventController.liveLeadingResponseAnchorCandidate()
+			: undefined;
 		if (this.viewSession?.isStreaming) {
 			const liveSet = new Set<Component>();
+			const livePostToolCallIds = new Map<Component, string>();
 			if (this.streamingComponent) liveSet.add(this.streamingComponent);
+			for (const [toolCallId, component] of this.eventController.livePostToolAssistantSegments()) {
+				liveSet.add(component);
+				livePostToolCallIds.set(component, toolCallId);
+			}
 			for (const [id, component] of this.pendingTools) {
 				livePendingTools.set(id, component);
 				liveSet.add(component as unknown as Component);
 			}
 			if (liveSet.size > 0) {
 				for (const child of this.chatContainer.children) {
-					if (liveSet.has(child)) liveComponents.push(child);
+					if (!liveSet.has(child)) continue;
+					liveComponents.push(child);
+					const toolCallId = livePostToolCallIds.get(child);
+					if (toolCallId !== undefined) preservedLivePostToolCallIds.add(toolCallId);
 				}
 			}
 		}
@@ -2224,6 +2236,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.renderSessionContext(context, {
 			reuseSettledComponents: options.reuseSettledComponents,
 			preservedLiveToolCallIds,
+			preservedLivePostToolCallIds,
+			preservedLiveResponseAnchorCandidate,
 		});
 		for (const child of liveComponents) {
 			this.chatContainer.addChild(child);

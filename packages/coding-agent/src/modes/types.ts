@@ -105,6 +105,10 @@ export interface RenderSessionContextOptions {
 	reuseSettledComponents?: boolean;
 	/** Tool calls whose existing live component remains the sole render owner across a rebuild. */
 	preservedLiveToolCallIds?: ReadonlySet<string>;
+	/** Post-tool text whose live component remains the sole render owner across a rebuild. */
+	preservedLivePostToolCallIds?: ReadonlySet<string>;
+	/** Leading reply text retained while its turn's terminality is unresolved. */
+	preservedLiveResponseAnchorCandidate?: AssistantMessageComponent;
 }
 
 export interface InteractiveModeContext {

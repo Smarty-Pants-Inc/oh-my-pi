@@ -152,6 +152,10 @@ describe("agentLoop with AgentMessage", () => {
 		expect(secondCallRoles).toEqual(["user", "assistant"]);
 		// One turn_start per sampling round: the continuation ran as a fresh turn.
 		expect(events.filter(e => e.type === "turn_start")).toHaveLength(2);
+		const turnEnds = events.filter(
+			(event): event is Extract<AgentEvent, { type: "turn_end" }> => event.type === "turn_end",
+		);
+		expect(turnEnds.map(event => event.willContinue)).toEqual([true, false]);
 	});
 
 	it("caps consecutive pause_turn continuations", async () => {
@@ -521,6 +525,10 @@ describe("agentLoop with AgentMessage", () => {
 		if (toolEnd?.type === "tool_execution_end") {
 			expect(toolEnd.isError).toBeFalsy();
 		}
+		const turnEnds = events.filter(
+			(event): event is Extract<AgentEvent, { type: "turn_end" }> => event.type === "turn_end",
+		);
+		expect(turnEnds.map(event => event.willContinue)).toEqual([true, false]);
 	});
 
 	it("surfaces validation error for malformed JSON parse sentinels without leaking __rawJson", async () => {
@@ -4822,10 +4830,9 @@ describe("agentLoopContinue with AgentMessage", () => {
 			],
 		});
 		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const events: AgentEvent[] = [];
 		const stream = agentLoop([createUserMessage("write huge file")], context, config, undefined, mock.stream);
-		for await (const _event of stream) {
-			// drain
-		}
+		for await (const event of stream) events.push(event);
 		const messages = await stream.result();
 
 		// The tool MUST NOT have been executed — the arguments are mid-string and
@@ -4845,6 +4852,10 @@ describe("agentLoopContinue with AgentMessage", () => {
 			.join("\n");
 		expect(text).toContain("stop_reason: length");
 		expect(text).toMatch(/split|chunk/i);
+		const turnEnds = events.filter(
+			(event): event is Extract<AgentEvent, { type: "turn_end" }> => event.type === "turn_end",
+		);
+		expect(turnEnds.map(event => event.willContinue)).toEqual([true, false]);
 	});
 	it("fills whitespace-only error tool results so Anthropic does not 400", async () => {
 		const toolSchema = type({ value: "string" });
@@ -5184,7 +5195,7 @@ describe("agentLoop streaming snapshots", () => {
 		for (const snapshot of snapshots) expect(snapshot.responseAnchorId).toBe(responseAnchorId);
 
 		const finalized = messages.at(-1);
-		if (!finalized || finalized.role !== "assistant") throw new Error("Expected finalized assistant message");
+		if (finalized?.role !== "assistant") throw new Error("Expected finalized assistant message");
 		expect(finalized.responseAnchorId).toBe(responseAnchorId);
 	});
 });
@@ -5269,6 +5280,10 @@ describe("agentLoop kCursorExecResolved (issue #4348)", () => {
 		const endFromLoop = events.find(e => e.type === "tool_execution_end");
 		expect(startFromLoop).toBeUndefined();
 		expect(endFromLoop).toBeUndefined();
+		const turnEnd = events.find(
+			(event): event is Extract<AgentEvent, { type: "turn_end" }> => event.type === "turn_end",
+		);
+		expect(turnEnd?.willContinue).toBe(false);
 
 		// And no duplicate `toolResult` message emitted for the resolved block:
 		// the buffered result flows via the Agent-class path, not agent-loop.
