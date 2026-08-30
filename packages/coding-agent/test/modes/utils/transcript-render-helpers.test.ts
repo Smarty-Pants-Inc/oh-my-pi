@@ -154,7 +154,7 @@ describe("splitAssistantMessageToolTimeline response navigation", () => {
 			]),
 		);
 
-		expect(timeline.replySegment).toBe(timeline.afterToolCalls.get("a"));
+		expect(timeline.replySegment).toBe(timeline.afterToolCalls.get(1));
 		expect(timeline.replySegment).not.toBe(timeline.beforeTools);
 	});
 

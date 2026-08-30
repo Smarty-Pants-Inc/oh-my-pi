@@ -365,11 +365,11 @@ export class ChatTranscriptBuilder {
 			this.container.addChild(component);
 		};
 
-		for (const content of message.content) {
+		for (const [contentIndex, content] of message.content.entries()) {
 			if (content.type !== "toolCall") continue;
 			this.#resolveWaitingPoll(content.name);
 
-			const afterToolSegment = timeline.afterToolCalls.get(content.id);
+			const afterToolSegment = timeline.afterToolCalls.get(contentIndex);
 			if (content.name === "read" && readArgsCollapseIntoGroup(content.arguments)) {
 				if (hasErrorStop && errorMessage) {
 					const group = this.#ensureReadGroup();

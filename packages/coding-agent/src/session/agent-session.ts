@@ -365,6 +365,7 @@ import {
 	queuedImageCount,
 	toRestoredQueuedMessage,
 } from "./queued-messages";
+import { stampAssistantResponseAnchorId } from "./response-anchor";
 import type { ServingModel } from "./retry-fallback-chains";
 import { type AdvisorStats, SessionAdvisors, type SessionAdvisorsHost } from "./session-advisors";
 import { type BuildSessionContextOptions, getRestorableSessionModels, type SessionContext } from "./session-context";
@@ -393,6 +394,7 @@ import {
 import { SessionLifecycleTransaction } from "./session-lifecycle-transaction";
 import {
 	COMPACTION_CHECK_NONE,
+	type CompactionCheckResult,
 	createCodexCompactionContext as createMaintenanceCodexCompactionContext,
 	SessionMaintenance,
 	type SessionMaintenanceHost,
@@ -3563,6 +3565,7 @@ export class AgentSession {
 		// bookkeeping — leaving maintenance looking at the previous (e.g.
 		// toolUse) assistant message and skipping settle-only work.
 		if (event.type === "message_end" && event.message.role === "assistant") {
+			stampAssistantResponseAnchorId(event.message);
 			event.message.responseAnchorTerminal = false;
 			this.#lastAssistantMessage = event.message;
 		}
@@ -3874,6 +3877,25 @@ export class AgentSession {
 					logger.error("Agent end extension notification failed", { err });
 				});
 			};
+			const emitCompactionAgentEnd = async (compaction: CompactionCheckResult): Promise<void> => {
+				const deferredOutcome = compaction.deferredHandoffOutcome;
+				if (compaction.continuationScheduled) {
+					deferredOutcome?.acknowledgeAgentEnd();
+					await emitAgentEndNotification({ willContinue: true });
+					return;
+				}
+				if (!deferredOutcome) {
+					await emitAgentEndNotification();
+					return;
+				}
+
+				const continuationScheduled = await deferredOutcome.continuationScheduled;
+				try {
+					await emitAgentEndNotification(continuationScheduled ? { willContinue: true } : undefined);
+				} finally {
+					deferredOutcome.acknowledgeAgentEnd();
+				}
+			};
 			const usage = this.getSessionStats().tokens;
 			await this.#goalRuntime.onAgentEnd({
 				currentUsage: {
@@ -4036,9 +4058,7 @@ export class AgentSession {
 						automaticContinuationBlocked: compactionResult.automaticContinuationBlocked === true,
 					});
 					this.#recovery.resolveRetry();
-					await emitAgentEndNotification(
-						compactionResult.continuationScheduled ? { willContinue: true } : undefined,
-					);
+					await emitCompactionAgentEnd(compactionResult);
 					return;
 				}
 			}
@@ -4146,7 +4166,7 @@ export class AgentSession {
 				compactionResult.continuationScheduled ||
 				compactionResult.automaticContinuationBlocked
 			) {
-				await emitAgentEndNotification(compactionResult.continuationScheduled ? { willContinue: true } : undefined);
+				await emitCompactionAgentEnd(compactionResult);
 				return;
 			}
 			// Stop-time todo reconciliation only fires at a text-only final stop. A run
@@ -4661,23 +4681,41 @@ export class AgentSession {
 		this.#closeTurn(this.#currentTurnId);
 	}
 
-	#scheduleCompactionContinuation(options: {
+	async #scheduleCompactionContinuation(options: {
 		generation: number;
 		autoContinue: boolean;
 		terminalTextAnswer: boolean;
 		suppressContinuation: boolean;
-	}): boolean {
-		if (options.suppressContinuation) return false;
+		onContinuationScheduled?: (scheduled: boolean) => Promise<void>;
+	}): Promise<boolean> {
+		const notify = async (scheduled: boolean) => {
+			await options.onContinuationScheduled?.(scheduled);
+		};
+		if (options.suppressContinuation) {
+			await notify(false);
+			return false;
+		}
 		if (this.agent.hasQueuedMessages()) {
-			if (!this.#queuedTurnAuthority()) return false;
+			if (!this.#queuedTurnAuthority()) {
+				await notify(false);
+				return false;
+			}
 			// Queue-preserving compaction releases its lifecycle fence after reconnecting;
 			// that release owns the single stranded-queue drain. Scheduling here as well
 			// races the release and can start the same queued turn twice.
+			await notify(true);
 			return true;
 		}
-		if (!options.autoContinue) return false;
+		if (!options.autoContinue) {
+			await notify(false);
+			return false;
+		}
 		const activeGoal = this.#goalModeState?.enabled === true && this.#goalModeState.goal.status === "active";
-		if (!activeGoal) return false;
+		if (!activeGoal) {
+			await notify(false);
+			return false;
+		}
+		await notify(true);
 		return this.#scheduleAutoContinuePrompt(options.generation);
 	}
 

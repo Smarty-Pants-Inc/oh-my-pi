@@ -141,9 +141,19 @@ describe("EventController mixed assistant text/tool rendering", () => {
 	async function settleAgent(
 		controller: EventController,
 		messages: AssistantMessage[],
-		isTerminal = true,
+		{
+			isTerminal = true,
+			responseAnchorId,
+			responseAnchorTerminal,
+		}: { isTerminal?: boolean; responseAnchorId?: string; responseAnchorTerminal?: boolean } = {},
 	): Promise<void> {
-		await controller.handleEvent({ type: "agent_end", messages, isTerminal });
+		await controller.handleEvent({
+			type: "agent_end",
+			messages,
+			isTerminal,
+			responseAnchorId,
+			responseAnchorTerminal,
+		});
 	}
 
 	it("finalizes and removes an orphaned streaming component on the next message_start", async () => {
@@ -378,7 +388,7 @@ describe("EventController mixed assistant text/tool rendering", () => {
 		expect(beforeTerminalSettle).not.toContain("\x1b]133;A;aid=omp-response-");
 		await settleTurn(controller, completed, false);
 		expect(chatContainer.render(120).join("\n")).not.toContain("\x1b]133;A;aid=omp-response-");
-		await settleAgent(controller, [completed]);
+		await settleAgent(controller, [completed], { responseAnchorTerminal: true });
 
 		const rawLines = chatContainer.render(120);
 		const lines = rawLines.map(line => Bun.stripANSI(line));
@@ -398,6 +408,110 @@ describe("EventController mixed assistant text/tool rendering", () => {
 		expect(rawLines[introLine]).not.toContain("\x1b]133;");
 		expect(rawLines[middleLine]).not.toContain("\x1b]133;");
 		expect(String(rawLines[finalLine])).toContain("\x1b]133;A;aid=omp-response-");
+	});
+
+	it("waits for its own agent_end before terminalizing a resumed response", async () => {
+		const { controller, chatContainer } = createFixture();
+		const first = assistantMessage([{ type: "text", text: "DELAYED RESPONSE ONE" }], {
+			responseAnchorId: "response-one",
+		});
+		const second = assistantMessage([{ type: "text", text: "RESUMED RESPONSE TWO" }], {
+			responseAnchorId: "response-two",
+		});
+		const firstAnchor = ":response-one\x07";
+		const secondAnchor = ":response-two\x07";
+
+		await controller.handleEvent({ type: "message_start", message: { ...first, content: [] } });
+		await controller.handleEvent({ type: "message_end", message: first });
+		await controller.handleEvent({ type: "message_start", message: { ...second, content: [] } });
+		await controller.handleEvent({ type: "message_end", message: second });
+
+		// A nonterminal old settle cannot consume the newer response candidate.
+		await settleAgent(controller, [first], {
+			isTerminal: false,
+			responseAnchorId: "response-one",
+			responseAnchorTerminal: false,
+		});
+		expect(chatContainer.render(120).join("\n")).not.toContain(secondAnchor);
+
+		// Its delayed terminal event must not terminalize the newer response either.
+		await settleAgent(controller, [first], {
+			responseAnchorId: "response-one",
+			responseAnchorTerminal: true,
+		});
+		expect(chatContainer.render(120).join("\n")).not.toContain(secondAnchor);
+
+		// Without a durable id, legacy delivery may settle only its exact response.
+		await settleAgent(controller, [first], { responseAnchorTerminal: true });
+		expect(chatContainer.render(120).join("\n")).not.toContain(secondAnchor);
+
+		await settleAgent(controller, [second], {
+			responseAnchorId: "response-two",
+			responseAnchorTerminal: true,
+		});
+
+		const raw = chatContainer.render(120).join("\n");
+		expect(raw).not.toContain(firstAnchor);
+		expect(raw).toContain(secondAnchor);
+		expect(raw.split("\x1b]133;A;aid=omp-response-")).toHaveLength(2);
+	});
+
+	it("keeps post-tool components distinct for consecutive responses that reuse a call index", async () => {
+		const { controller, chatContainer } = createFixture();
+		const firstReply = "FIRST POST-TOOL RESPONSE";
+		const secondReply = "SECOND POST-TOOL RESPONSE";
+		const firstToolCall: ToolCall = {
+			type: "toolCall",
+			id: "toolu_first_response_call",
+			name: "contract_probe_a",
+			arguments: { value: "first" },
+		};
+		const secondToolCall: ToolCall = {
+			type: "toolCall",
+			id: "toolu_second_response_call",
+			name: "contract_probe_a",
+			arguments: { value: "second" },
+		};
+		(firstToolCall as CursorExecResolvedCarrier)[kCursorExecResolved] = true;
+		(secondToolCall as CursorExecResolvedCarrier)[kCursorExecResolved] = true;
+		const first = assistantMessage([firstToolCall, { type: "text", text: firstReply }]);
+		const second = assistantMessage([secondToolCall, { type: "text", text: secondReply }]);
+
+		await controller.handleEvent({ type: "message_start", message: assistantMessage([]) });
+		await controller.handleEvent({
+			type: "message_update",
+			message: first,
+		} as Extract<AgentSessionEvent, { type: "message_update" }>);
+		await controller.handleEvent({ type: "message_end", message: first });
+		const firstComponent = chatContainer.children.find(child =>
+			Bun.stripANSI(child.render(120).join("\n")).includes(firstReply),
+		);
+		if (!firstComponent) throw new Error("Expected first post-tool assistant component");
+		await settleTurn(controller, first, true);
+
+		await controller.handleEvent({ type: "message_start", message: assistantMessage([]) });
+		await controller.handleEvent({
+			type: "message_update",
+			message: second,
+		} as Extract<AgentSessionEvent, { type: "message_update" }>);
+		await controller.handleEvent({ type: "message_end", message: second });
+		const secondComponent = chatContainer.children.find(child =>
+			Bun.stripANSI(child.render(120).join("\n")).includes(secondReply),
+		);
+		if (!secondComponent) throw new Error("Expected second post-tool assistant component");
+		expect(secondComponent).not.toBe(firstComponent);
+		await settleTurn(controller, second, false);
+		await settleAgent(controller, [first, second], { responseAnchorTerminal: true });
+
+		const firstRaw = firstComponent.render(120).join("\n");
+		const secondRaw = secondComponent.render(120).join("\n");
+		const raw = chatContainer.render(120).join("\n");
+		expect(Bun.stripANSI(firstRaw)).toContain(firstReply);
+		expect(Bun.stripANSI(secondRaw)).toContain(secondReply);
+		expect(Bun.stripANSI(raw).indexOf(firstReply)).toBeLessThan(Bun.stripANSI(raw).indexOf(secondReply));
+		expect(firstRaw).not.toContain("\x1b]133;A;aid=omp-response-");
+		expect(secondRaw).toContain("\x1b]133;A;aid=omp-response-");
+		expect(raw.split("\x1b]133;A;aid=omp-response-")).toHaveLength(2);
 	});
 
 	it("anchors only the final reply after a local-tool continuation", async () => {
@@ -422,7 +536,7 @@ describe("EventController mixed assistant text/tool rendering", () => {
 		await controller.handleEvent({ type: "message_end", message: final });
 		await settleTurn(controller, final, false);
 		expect(chatContainer.render(120).join("\n")).not.toContain("\x1b]133;");
-		await settleAgent(controller, [progress, final]);
+		await settleAgent(controller, [progress, final], { responseAnchorTerminal: true });
 
 		const raw = chatContainer.render(120).join("\n");
 		expect(raw.split("\x1b]133;A;aid=omp-response-")).toHaveLength(2);
@@ -443,7 +557,7 @@ describe("EventController mixed assistant text/tool rendering", () => {
 		await controller.handleEvent({ type: "message_start", message: assistantMessage([]) });
 		await controller.handleEvent({ type: "message_end", message: final });
 		await settleTurn(controller, final, false);
-		await settleAgent(controller, [paused, final]);
+		await settleAgent(controller, [paused, final], { responseAnchorTerminal: true });
 
 		const raw = chatContainer.render(120).join("\n");
 		expect(raw.split("\x1b]133;A;aid=omp-response-")).toHaveLength(2);
@@ -458,7 +572,7 @@ describe("EventController mixed assistant text/tool rendering", () => {
 		await controller.handleEvent({ type: "message_start", message: assistantMessage([]) });
 		await controller.handleEvent({ type: "message_end", message: truncated });
 		await settleTurn(controller, truncated, false);
-		await settleAgent(controller, [truncated], false);
+		await settleAgent(controller, [truncated], { isTerminal: false, responseAnchorTerminal: false });
 
 		expect(chatContainer.render(120).join("\n")).not.toContain("\x1b]133;");
 	});

@@ -8,7 +8,7 @@ import { extractTextContent } from "../../commit/utils";
 import { settings } from "../../config/settings";
 import { getEditClipboard } from "../../edit/edit-clipboard";
 import { getFileSnapshotStore } from "../../edit/file-snapshot-store";
-import { AssistantMessageComponent } from "../../modes/components/assistant-message";
+import { AssistantMessageComponent, matchesAssistantReplayMessage } from "../../modes/components/assistant-message";
 import { detectCacheInvalidation } from "../../modes/components/cache-invalidation-marker";
 import {
 	groupedReadUsageCallIds,
@@ -21,11 +21,12 @@ import { ToolExecutionComponent, type ToolExecutionHandle } from "../../modes/co
 import { TtsrNotificationComponent } from "../../modes/components/ttsr-notification";
 import { createUsageRowBlock } from "../../modes/components/usage-row";
 import { getSymbolTheme, theme } from "../../modes/theme/theme";
-import type { InteractiveModeContext, TodoPhase } from "../../modes/types";
+import type { InteractiveModeContext, PreservedLivePostToolComponent, TodoPhase } from "../../modes/types";
 import idleRecapPrompt from "../../prompts/system/recap-user.md" with { type: "text" };
 import type { AgentSessionEvent } from "../../session/agent-session";
 import { isSilentAbort, isUserInvokedSkillPrompt, readQueueChipText, resolveAbortLabel } from "../../session/messages";
 import { localSubmissionSignature } from "../../session/queued-messages";
+import { isSafeResponseAnchorId } from "../../session/response-anchor";
 import { type ApprovalMode, resolveApproval } from "../../tools/approval";
 import { previewLine, TRUNCATE_LENGTHS } from "../../tools/render-utils";
 import { PROPOSE_DEVICE_NAME, writeDeviceDispatch } from "../../tools/resolve";
@@ -78,6 +79,18 @@ interface ApprovalPreviewGate {
 	resolve(): void;
 	reject(reason?: unknown): void;
 	started: boolean;
+}
+
+interface LivePostToolAssistantComponent {
+	sourceMessage: AssistantMessage;
+	toolCallIndex: number;
+	component: AssistantMessageComponent;
+}
+
+interface ResponseAnchorCandidate {
+	component: AssistantMessageComponent;
+	message: AssistantMessage;
+	responseAnchorId: string | undefined;
 }
 
 export class EventController {
@@ -136,9 +149,9 @@ export class EventController {
 	// materializes (`#handleMessageUpdate`). Keyed by call id; ids are unique
 	// per turn, and the map is cleared with the other transcript anchors.
 	#orphanedToolCompletions = new Map<string, Extract<AgentSessionEvent, { type: "tool_execution_end" }>>();
-	#postToolAssistantComponents = new Map<string, AssistantMessageComponent>();
+	#postToolAssistantComponents = new Map<AssistantMessageComponent, Map<number, LivePostToolAssistantComponent>>();
 	#lastAssistantComponent: AssistantMessageComponent | undefined = undefined;
-	#responseAnchorCandidate: AssistantMessageComponent | undefined = undefined;
+	#responseAnchorCandidate: ResponseAnchorCandidate | undefined = undefined;
 	#responseAnchorCandidateIsLeading = false;
 	// Assistant component whose turn-ending error is currently mirrored in the
 	// pinned banner. Its inline `Error: …` line is suppressed while pinned and
@@ -311,11 +324,21 @@ export class EventController {
 		this.#liveIrcCards.clear();
 	}
 
-	#settleResponseAnchorCandidate(anchor: boolean): void {
-		const component = this.#responseAnchorCandidate;
+	#settleResponseAnchorCandidate(anchor: boolean, event?: Extract<AgentSessionEvent, { type: "agent_end" }>): void {
+		const candidate = this.#responseAnchorCandidate;
+		if (!candidate) return;
+		if (event) {
+			if (isSafeResponseAnchorId(candidate.responseAnchorId) && isSafeResponseAnchorId(event.responseAnchorId)) {
+				if (candidate.responseAnchorId !== event.responseAnchorId) return;
+			} else if (!event.messages.includes(candidate.message)) {
+				// Legacy events without an id can settle only their exact response object;
+				// a delayed older event must not consume a newer response candidate.
+				return;
+			}
+		}
 		this.#responseAnchorCandidate = undefined;
 		this.#responseAnchorCandidateIsLeading = false;
-		if (!component) return;
+		const component = candidate.component;
 		if (anchor && !this.ctx.chatContainer.children.includes(component)) {
 			this.ctx.chatContainer.addChild(component);
 		}
@@ -485,19 +508,29 @@ export class EventController {
 	}
 
 	#upsertPostToolAssistantSegment(
-		toolCallId: string,
+		responseComponent: AssistantMessageComponent,
+		sourceMessage: AssistantMessage,
+		toolCallIndex: number,
 		segment: AssistantMessage | undefined,
 	): AssistantMessageComponent | undefined {
 		if (!segment || !assistantHasVisibleContent(segment)) return undefined;
-		const existing = this.#postToolAssistantComponents.get(toolCallId);
+		const toolCall = sourceMessage.content[toolCallIndex];
+		if (toolCall?.type !== "toolCall") return undefined;
+		let responseComponents = this.#postToolAssistantComponents.get(responseComponent);
+		if (!responseComponents) {
+			responseComponents = new Map();
+			this.#postToolAssistantComponents.set(responseComponent, responseComponents);
+		}
+		const existing = responseComponents.get(toolCallIndex);
 		if (existing) {
-			existing.updateContent(segment);
-			return existing;
+			existing.sourceMessage = sourceMessage;
+			existing.component.updateContent(segment);
+			return existing.component;
 		}
 		const component = createAssistantMessageComponent(this.ctx);
 		component.updateContent(segment);
-		this.#postToolAssistantComponents.set(toolCallId, component);
-		if (!this.#insertAfterTranscriptComponent(this.#toolTimelineComponents.get(toolCallId), component)) {
+		responseComponents.set(toolCallIndex, { sourceMessage, toolCallIndex, component });
+		if (!this.#insertAfterTranscriptComponent(this.#toolTimelineComponents.get(toolCall.id), component)) {
 			this.ctx.chatContainer.addChild(component);
 		}
 		return component;
@@ -650,14 +683,22 @@ export class EventController {
 		return this.#executionStartedCallIds.has(toolCallId);
 	}
 
-	/** In-flight post-tool text blocks keyed by their preceding tool call. */
-	livePostToolAssistantSegments(): Iterable<[string, AssistantMessageComponent]> {
-		return this.#postToolAssistantComponents.entries();
+	/** In-flight post-tool text blocks scoped to their response and preceding call occurrence. */
+	*livePostToolAssistantSegments(): Iterable<PreservedLivePostToolComponent> {
+		for (const responseComponents of this.#postToolAssistantComponents.values()) {
+			for (const { sourceMessage, toolCallIndex, component } of responseComponents.values()) {
+				yield {
+					toolCallIndex,
+					component,
+					matchesReplayMessage: message => matchesAssistantReplayMessage(sourceMessage, message),
+				};
+			}
+		}
 	}
 
 	/** Leading reply text awaiting terminality resolution after `message_end`. */
 	liveLeadingResponseAnchorCandidate(): AssistantMessageComponent | undefined {
-		return this.#responseAnchorCandidateIsLeading ? this.#responseAnchorCandidate : undefined;
+		return this.#responseAnchorCandidateIsLeading ? this.#responseAnchorCandidate?.component : undefined;
 	}
 
 	/**
@@ -1078,10 +1119,11 @@ export class EventController {
 		if (!this.#vocalizedMessageUpdates.delete(event)) {
 			this.#vocalizeDelta(event);
 		}
-		if (this.ctx.streamingComponent && event.message.role === "assistant") {
+		const streamingComponent = this.ctx.streamingComponent;
+		if (streamingComponent && event.message.role === "assistant") {
 			const unlockedThinkingVisibility = this.ctx.noteDisplayableThinkingContent(event.message);
 			if (unlockedThinkingVisibility) {
-				this.ctx.streamingComponent.setHideThinkingBlock(this.ctx.effectiveHideThinkingBlock);
+				streamingComponent.setHideThinkingBlock(this.ctx.effectiveHideThinkingBlock);
 				this.#streamingReveal.resyncVisibility();
 			}
 			this.ctx.streamingMessage = event.message;
@@ -1102,7 +1144,7 @@ export class EventController {
 			// streaming preview is authoritative. A final-message transform may still
 			// rewrite it, so defer retirement until message_end in that case.
 			if (timeline.hasToolCalls && this.ctx.session.agent.transformAssistantMessage === undefined) {
-				this.ctx.streamingComponent.markTranscriptBlockFinalized();
+				streamingComponent.markTranscriptBlockFinalized();
 			}
 			for (let contentIndex = 0; contentIndex < this.ctx.streamingMessage.content.length; contentIndex++) {
 				const content = this.ctx.streamingMessage.content[contentIndex]!;
@@ -1208,8 +1250,8 @@ export class EventController {
 					}
 				}
 			}
-			for (const [toolCallId, segment] of timeline.afterToolCalls) {
-				this.#upsertPostToolAssistantSegment(toolCallId, segment);
+			for (const [toolCallIndex, segment] of timeline.afterToolCalls) {
+				this.#upsertPostToolAssistantSegment(streamingComponent, this.ctx.streamingMessage, toolCallIndex, segment);
 			}
 
 			// Update working message with intent from streamed tool arguments
@@ -1256,7 +1298,8 @@ export class EventController {
 				if (mode === "assistant" || mode === "all") vocalizer.flush();
 			}
 		}
-		if (this.ctx.streamingComponent && event.message.role === "assistant") {
+		const streamingComponent = this.ctx.streamingComponent;
+		if (streamingComponent && event.message.role === "assistant") {
 			this.ctx.streamingMessage = event.message;
 			this.#streamingReveal.stop();
 			this.#toolArgsReveal.flushAll();
@@ -1286,7 +1329,7 @@ export class EventController {
 						}
 					: this.ctx.streamingMessage;
 			const displayTimeline = splitAssistantMessageToolTimeline(displayMessage);
-			this.ctx.streamingComponent.updateContent(displayTimeline.beforeTools);
+			streamingComponent.updateContent(displayTimeline.beforeTools);
 
 			if (this.ctx.streamingMessage.stopReason !== "aborted" && this.ctx.streamingMessage.stopReason !== "error") {
 				for (const [toolCallId, component] of this.ctx.pendingTools.entries()) {
@@ -1335,31 +1378,44 @@ export class EventController {
 			if (usage.cacheRead + usage.cacheWrite + usage.input > 0) {
 				if (settings.get("display.cacheMissMarker")) {
 					const invalidation = detectCacheInvalidation(this.ctx.lastAssistantUsage, usage);
-					if (invalidation) this.ctx.streamingComponent.setCacheInvalidation(invalidation);
+					if (invalidation) streamingComponent.setCacheInvalidation(invalidation);
 				}
 				this.ctx.lastAssistantUsage = usage;
 			}
 			this.#settleResponseAnchorCandidate(false);
 			const replySegment = event.message.stopReason === "length" ? undefined : displayTimeline.replySegment;
 			let responseAnchorCandidate: AssistantMessageComponent | undefined;
-			this.ctx.streamingComponent.setResponseAnchor(false);
+			streamingComponent.setResponseAnchor(false);
 			if (replySegment === displayTimeline.beforeTools) {
-				responseAnchorCandidate = this.ctx.streamingComponent;
+				responseAnchorCandidate = streamingComponent;
 			} else {
-				this.ctx.streamingComponent.markTranscriptBlockFinalized();
+				streamingComponent.markTranscriptBlockFinalized();
 			}
 			let lastPostToolAssistantComponent: AssistantMessageComponent | undefined;
-			for (const [toolCallId, segment] of displayTimeline.afterToolCalls) {
-				const component = this.#upsertPostToolAssistantSegment(toolCallId, segment);
+			for (const [toolCallIndex, segment] of displayTimeline.afterToolCalls) {
+				const component = this.#upsertPostToolAssistantSegment(
+					streamingComponent,
+					event.message,
+					toolCallIndex,
+					segment,
+				);
 				component?.setResponseAnchor(false);
 				if (component === undefined) continue;
 				if (segment === replySegment) responseAnchorCandidate = component;
 				else component.markTranscriptBlockFinalized();
 				lastPostToolAssistantComponent = component;
 			}
-			this.#responseAnchorCandidate = responseAnchorCandidate;
-			this.#responseAnchorCandidateIsLeading = responseAnchorCandidate === this.ctx.streamingComponent;
-			this.#lastAssistantComponent = lastPostToolAssistantComponent ?? this.ctx.streamingComponent;
+			this.#responseAnchorCandidate = responseAnchorCandidate
+				? {
+						component: responseAnchorCandidate,
+						message: event.message,
+						responseAnchorId: isSafeResponseAnchorId(event.message.responseAnchorId)
+							? event.message.responseAnchorId
+							: undefined,
+					}
+				: undefined;
+			this.#responseAnchorCandidateIsLeading = responseAnchorCandidate === streamingComponent;
+			this.#lastAssistantComponent = lastPostToolAssistantComponent ?? streamingComponent;
 			if (settings.get("display.showTokenUsage") && assistantUsageIsBilled(event.message.usage)) {
 				const readCallIds = groupedReadUsageCallIds(event.message);
 				const usageAttached =
@@ -1385,7 +1441,7 @@ export class EventController {
 				}
 			}
 			if (displayMessage === event.message) {
-				this.ctx.transcriptMessageComponents.set(event.message, this.ctx.streamingComponent);
+				this.ctx.transcriptMessageComponents.set(event.message, streamingComponent);
 			}
 			this.ctx.streamingComponent = undefined;
 			this.ctx.streamingMessage = undefined;
@@ -1781,7 +1837,7 @@ export class EventController {
 		// site, so the automatic continuation would otherwise run on the old
 		// model/thinking level until the terminal settle.
 		if (event.isTerminal === false) {
-			this.#settleResponseAnchorCandidate(false);
+			this.#settleResponseAnchorCandidate(false, event);
 			await this.ctx.flushPendingModelSwitch();
 			// Reaching here means the first guard passed, so `isStreaming` is already
 			// false: a command issued from now on mounts immediately. Leaving earlier
@@ -1797,7 +1853,7 @@ export class EventController {
 	}
 
 	async #finishAgentEnd(event: Extract<AgentSessionEvent, { type: "agent_end" }>): Promise<void> {
-		this.#settleResponseAnchorCandidate(event.responseAnchorTerminal === true);
+		this.#settleResponseAnchorCandidate(event.responseAnchorTerminal === true, event);
 		this.#setTerminalProgress(false);
 		this.ctx.statusLine.markActivityEnd();
 		this.#streamingReveal.stop();

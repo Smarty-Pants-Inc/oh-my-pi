@@ -536,6 +536,7 @@ export class UiHelpers {
 			previous.seal();
 		};
 		let preservedLiveResponseAnchorCandidate = options.preservedLiveResponseAnchorCandidate;
+		const preservedLivePostToolComponents = [...(options.preservedLivePostToolComponents ?? [])];
 		const messages = sessionContext.messages;
 		const count = messages.length;
 		for (let i = 0; i < count; i++) {
@@ -587,10 +588,13 @@ export class UiHelpers {
 				const errorPresentation = resolveAssistantErrorPresentation(message, this.ctx.viewSession.retryAttempt);
 				const hasErrorStop = errorPresentation.kind === "full";
 				const errorMessage = hasErrorStop ? errorPresentation.text : null;
-				const appendAssistantSegment = (toolCallId: string, segment: AssistantMessage | undefined) => {
-					const preservedComponent = options.preservedLivePostToolComponents?.get(toolCallId);
-					if (preservedComponent) {
-						this.ctx.chatContainer.addChild(preservedComponent);
+				const appendAssistantSegment = (toolCallIndex: number, segment: AssistantMessage | undefined) => {
+					const preservedIndex = preservedLivePostToolComponents.findIndex(
+						preserved => preserved.toolCallIndex === toolCallIndex && preserved.matchesReplayMessage(message),
+					);
+					if (preservedIndex >= 0) {
+						const preserved = preservedLivePostToolComponents.splice(preservedIndex, 1)[0]!;
+						this.ctx.chatContainer.addChild(preserved.component);
 						return;
 					}
 					if (!segment || !assistantHasVisibleContent(segment)) return;
@@ -600,11 +604,11 @@ export class UiHelpers {
 				};
 
 				// Render tool call components
-				for (const content of message.content) {
+				for (const [toolCallIndex, content] of message.content.entries()) {
 					if (content.type !== "toolCall") {
 						continue;
 					}
-					const afterToolSegment = timeline.afterToolCalls.get(content.id);
+					const afterToolSegment = timeline.afterToolCalls.get(toolCallIndex);
 					const preservedToolComponent = options.preservedLiveToolComponents?.get(content.id);
 					if (preservedToolComponent) {
 						resolveWaitingPoll(content.name);
@@ -614,7 +618,7 @@ export class UiHelpers {
 							this.ctx.chatContainer.addChild(preservedToolComponent);
 							reattachedLiveToolComponents.add(preservedToolComponent);
 						}
-						appendAssistantSegment(content.id, afterToolSegment);
+						appendAssistantSegment(toolCallIndex, afterToolSegment);
 						continue;
 					}
 					resolveWaitingPoll(content.name);
@@ -654,7 +658,7 @@ export class UiHelpers {
 								readToolCallAssistantComponents.set(content.id, assistantComponent);
 							}
 						}
-						appendAssistantSegment(content.id, afterToolSegment);
+						appendAssistantSegment(toolCallIndex, afterToolSegment);
 						continue;
 					}
 
@@ -703,7 +707,7 @@ export class UiHelpers {
 					} else {
 						this.ctx.pendingTools.set(content.id, component);
 					}
-					appendAssistantSegment(content.id, afterToolSegment);
+					appendAssistantSegment(toolCallIndex, afterToolSegment);
 				}
 				// Dangling toolCalls (no result on the resolved path — failed or
 				// retried turns, results on sibling branches) were stripped by the

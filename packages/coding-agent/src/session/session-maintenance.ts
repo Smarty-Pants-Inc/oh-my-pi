@@ -92,9 +92,16 @@ import { createCompleteFnFromStreamFn, resolveSettingsCacheRetention } from "./s
 import type { ShakeMode, ShakeResult } from "./shake-types";
 import { resolveSpeculationLeadTokens, SPECULATION_LEAD_MIN_TOKENS } from "./speculation-lead";
 
+export interface DeferredHandoffOutcome {
+	readonly continuationScheduled: Promise<boolean>;
+	acknowledgeAgentEnd(): void;
+}
+
 export type CompactionCheckResult = Readonly<{
 	deferredHandoff: boolean;
 	continuationScheduled: boolean;
+	/** Resolves only after deferred handoff determines whether a continuation can run. */
+	deferredHandoffOutcome?: DeferredHandoffOutcome;
 	automaticContinuationBlocked?: boolean;
 	historyRewritten?: boolean;
 }>;
@@ -234,6 +241,8 @@ interface AutoCompactionOptions {
 	suppressContinuation?: boolean;
 	phase?: CodexCompactionContext["phase"];
 	terminalTextAnswer?: boolean;
+	/** Lets a deferred handoff publish the actual continuation decision before it starts a new turn. */
+	onContinuationScheduled?: (scheduled: boolean) => Promise<void>;
 	/** Mid-turn: splice history then return; do not await UI/extension fan-out. */
 	detachPostCommit?: boolean;
 	semanticDeliveryAcceptance?: Promise<void>;
@@ -318,7 +327,8 @@ export interface SessionMaintenanceHost {
 		autoContinue: boolean;
 		terminalTextAnswer: boolean;
 		suppressContinuation: boolean;
-	}): boolean;
+		onContinuationScheduled?: (scheduled: boolean) => Promise<void>;
+	}): boolean | Promise<boolean>;
 	persistTurnMessagesForMidRunCompaction(context: AgentTurnEndContext | undefined): Promise<boolean>;
 	findLastAssistantMessage(): AssistantMessage | undefined;
 	beginSemanticDeliveryMaintenance(signal?: AbortSignal, exemptAcceptance?: Promise<void>): Promise<() => void>;
@@ -3036,6 +3046,7 @@ export class SessionMaintenance {
 				options.triggerContextTokens,
 				suppressContinuation,
 				options.detachPostCommit === true,
+				options.onContinuationScheduled,
 			);
 			if (outcome !== "fallback") return outcome;
 			return await this.#runAutoCompactionAttempt(
@@ -3063,22 +3074,45 @@ export class SessionMaintenance {
 			reason !== "incomplete" &&
 			reason !== "idle"
 		) {
+			const continuationOutcome = Promise.withResolvers<boolean>();
+			const agentEndAcknowledged = Promise.withResolvers<void>();
+			let continuationOutcomeResolved = false;
+			const resolveContinuationOutcome = (scheduled: boolean) => {
+				if (continuationOutcomeResolved) return;
+				continuationOutcomeResolved = true;
+				continuationOutcome.resolve(scheduled);
+			};
 			this.#host.schedulePostPromptTask(
 				async signal => {
 					await lease.settled;
-					if (this.#host.promptGeneration() !== generation) return;
-					if (signal.aborted) return;
-					await this.runAutoCompaction(reason, willRetry, true, true, {
-						...options,
-						methodIndex,
-						terminalTextAnswer,
-					});
+					if (this.#host.promptGeneration() !== generation || signal.aborted) {
+						resolveContinuationOutcome(false);
+						return;
+					}
+					try {
+						const result = await this.runAutoCompaction(reason, willRetry, true, true, {
+							...options,
+							methodIndex,
+							terminalTextAnswer,
+							onContinuationScheduled: async scheduled => {
+								resolveContinuationOutcome(scheduled);
+								if (scheduled) await agentEndAcknowledged.promise;
+							},
+						});
+						resolveContinuationOutcome(result.continuationScheduled);
+					} catch (error) {
+						resolveContinuationOutcome(false);
+						throw error;
+					}
 				},
-				{ generation },
+				{ generation, onSkip: () => resolveContinuationOutcome(false) },
 			);
 			return {
 				...COMPACTION_CHECK_DEFERRED_HANDOFF,
-				continuationScheduled: shouldAutoContinue,
+				deferredHandoffOutcome: {
+					continuationScheduled: continuationOutcome.promise,
+					acknowledgeAgentEnd: agentEndAcknowledged.resolve,
+				},
 			};
 		}
 
@@ -3133,6 +3167,7 @@ export class SessionMaintenance {
 					shouldAutoContinue,
 					terminalTextAnswer,
 					suppressContinuation,
+					onContinuationScheduled: options.onContinuationScheduled,
 					fallbackFromShake,
 					detachPostCommit: options.detachPostCommit === true,
 					autoCompactionSignal,
@@ -3283,18 +3318,20 @@ export class SessionMaintenance {
 					);
 					let continuationScheduled = false;
 					if (frameRescueCreatedHeadroom) {
-						continuationScheduled = this.#host.scheduleCompactionContinuation({
+						continuationScheduled = await this.#host.scheduleCompactionContinuation({
 							generation,
 							autoContinue: shouldAutoContinue,
 							terminalTextAnswer,
 							suppressContinuation,
+							onContinuationScheduled: options.onContinuationScheduled,
 						});
 					} else {
-						continuationScheduled = this.#host.scheduleCompactionContinuation({
+						continuationScheduled = await this.#host.scheduleCompactionContinuation({
 							generation,
 							autoContinue: false,
 							terminalTextAnswer,
 							suppressContinuation,
+							onContinuationScheduled: options.onContinuationScheduled,
 						});
 					}
 					if (deadEndWarning) {
@@ -3741,6 +3778,7 @@ export class SessionMaintenance {
 				shouldAutoContinue,
 				terminalTextAnswer,
 				suppressContinuation,
+				onContinuationScheduled: options.onContinuationScheduled,
 				fallbackFromShake,
 				detachPostCommit: options.detachPostCommit === true,
 				autoCompactionSignal,
@@ -3833,6 +3871,7 @@ export class SessionMaintenance {
 		willRetry: boolean;
 		generation: number;
 		shouldAutoContinue: boolean;
+		onContinuationScheduled?: (scheduled: boolean) => Promise<void>;
 		terminalTextAnswer: boolean;
 		suppressContinuation: boolean;
 		fallbackFromShake: boolean;
@@ -3977,16 +4016,17 @@ export class SessionMaintenance {
 			{ type: "auto_compaction_end", action, result, aborted: false, willRetry },
 			detachPostCommit,
 		);
-
 		if (retryFits) {
+			await args.onContinuationScheduled?.(true);
 			this.#host.scheduleAgentContinue({ delayMs: 100, generation: args.generation });
 			continuationScheduled = true;
 		} else {
-			continuationScheduled = this.#host.scheduleCompactionContinuation({
+			continuationScheduled = await this.#host.scheduleCompactionContinuation({
 				generation: args.generation,
 				autoContinue: hasHeadroom && args.shouldAutoContinue,
 				terminalTextAnswer: args.terminalTextAnswer,
 				suppressContinuation: args.suppressContinuation,
+				onContinuationScheduled: args.onContinuationScheduled,
 			});
 		}
 
@@ -4016,6 +4056,7 @@ export class SessionMaintenance {
 		triggerContextTokens?: number,
 		suppressContinuation = false,
 		detachPostCommit = false,
+		onContinuationScheduled?: (scheduled: boolean) => Promise<void>,
 	): Promise<CompactionCheckResult | "fallback"> {
 		const action = "shake";
 		try {
@@ -4114,14 +4155,16 @@ export class SessionMaintenance {
 						(reason === "incomplete" && lastAssistant.stopReason === "length");
 					if (shouldDrop) this.#host.agent.replaceMessages(messages.slice(0, -1));
 				}
+				await onContinuationScheduled?.(true);
 				this.#host.scheduleAgentContinue({ delayMs: 100, generation });
 				continuationScheduled = true;
 			} else {
-				continuationScheduled = this.#host.scheduleCompactionContinuation({
+				continuationScheduled = await this.#host.scheduleCompactionContinuation({
 					generation,
 					autoContinue: reason !== "idle" && autoContinue,
 					terminalTextAnswer,
 					suppressContinuation,
+					onContinuationScheduled,
 				});
 			}
 			if (!reclaimed) {

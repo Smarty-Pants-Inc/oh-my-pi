@@ -376,6 +376,83 @@ describe("issue #3656 /shake mid-stream preserves the in-flight assistant turn",
 		expect(Bun.stripANSI(raw).split(reply)).toHaveLength(2);
 		expect(String(postToolComponent.render(120).join("\n"))).toContain("\x1b]133;A;aid=omp-response-");
 	});
+	it("scopes a live post-tool reply to its response when an earlier turn reuses the tool call id", async () => {
+		let streaming = true;
+		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => streaming });
+		const historicReply = "HISTORIC POST TOOL REPLY";
+		const liveReply = "LIVE POST TOOL REPLY";
+		const historic = assistantWithResolvedBashReply("echo HISTORIC TOOL", historicReply);
+		historic.timestamp = 1_000;
+		const completed = assistantWithResolvedBashReply("echo LIVE TOOL", liveReply);
+		completed.timestamp = 2_000;
+		await mode.eventController.handleEvent({
+			type: "message_start",
+			message: { ...completed, content: [] },
+		} as AgentSessionEvent);
+		await mode.eventController.handleEvent({ type: "message_update", message: completed } as AgentSessionEvent);
+		await mode.eventController.handleEvent({ type: "message_end", message: completed } as AgentSessionEvent);
+
+		const livePostToolComponent = mode.chatContainer.children.find(
+			child =>
+				child instanceof AssistantMessageComponent &&
+				Bun.stripANSI(child.render(120).join("\n")).includes(liveReply),
+		);
+		if (!(livePostToolComponent instanceof AssistantMessageComponent)) {
+			throw new Error("Expected visible live post-tool component");
+		}
+
+		const persistedHistoric = JSON.parse(JSON.stringify(historic)) as AssistantMessage;
+		persistedHistoric.responseAnchorTerminal = false;
+		const persistedLive = JSON.parse(JSON.stringify(completed)) as AssistantMessage;
+		persistedLive.responseAnchorTerminal = true;
+		session.sessionManager.appendMessage(persistedHistoric);
+		session.sessionManager.appendMessage({
+			role: "toolResult",
+			toolCallId: "call-1",
+			toolName: "bash",
+			content: [{ type: "text", text: "historic complete" }],
+			isError: false,
+			timestamp: 1_001,
+		});
+		session.sessionManager.appendMessage(persistedLive);
+		session.sessionManager.appendMessage({
+			role: "toolResult",
+			toolCallId: "call-1",
+			toolName: "bash",
+			content: [{ type: "text", text: "live complete" }],
+			isError: false,
+			timestamp: 2_001,
+		});
+
+		mode.rebuildChatFromMessages();
+
+		let raw = mode.chatContainer.render(120).join("\n");
+		const visible = Bun.stripANSI(raw);
+		const positions = ["HISTORIC TOOL", historicReply, "LIVE TOOL", liveReply].map(marker => visible.indexOf(marker));
+		expect(positions.every(position => position >= 0)).toBe(true);
+		expect(positions).toEqual([...positions].sort((left, right) => left - right));
+		expect(visible.split(liveReply)).toHaveLength(2);
+		expect(mode.chatContainer.children.filter(child => child === livePostToolComponent)).toHaveLength(1);
+		expect(raw).not.toContain("\x1b]133;A;aid=omp-response-");
+
+		streaming = false;
+		await mode.eventController.handleEvent({
+			type: "agent_end",
+			messages: [completed],
+			isTerminal: true,
+			responseAnchorTerminal: true,
+		} as AgentSessionEvent);
+
+		raw = mode.chatContainer.render(120).join("\n");
+		expect(raw.split("\x1b]133;A;aid=omp-response-")).toHaveLength(2);
+		expect(livePostToolComponent.render(120).join("\n")).toContain("\x1b]133;A;aid=omp-response-");
+
+		mode.rebuildChatFromMessages();
+		raw = mode.chatContainer.render(120).join("\n");
+		expect(Bun.stripANSI(raw).split(liveReply)).toHaveLength(2);
+		expect(raw.split("\x1b]133;A;aid=omp-response-")).toHaveLength(2);
+	});
+
 	it("keeps each post-tool segment at its matching replay position and anchors only the final response", async () => {
 		let streaming = true;
 		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => streaming });

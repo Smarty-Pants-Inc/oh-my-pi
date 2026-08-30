@@ -100,13 +100,20 @@ export interface InteractiveModeInitOptions {
 
 export type InteractiveSelectorDialogOptions = ExtensionUIDialogOptions & Pick<HookSelectorOptions, "disabledIndices">;
 
+export interface PreservedLivePostToolComponent {
+	/** Position of the preceding tool call within its assistant response. */
+	toolCallIndex: number;
+	component: AssistantMessageComponent;
+	matchesReplayMessage(message: AssistantMessage): boolean;
+}
+
 export interface RenderSessionContextOptions {
 	updateFooter?: boolean;
 	reuseSettledComponents?: boolean;
 	/** Existing live tool components keyed by replayed call id; each is reattached at its transcript slot. */
 	preservedLiveToolComponents?: ReadonlyMap<string, Component>;
-	/** Post-tool live components to reattach immediately after their matching replayed tool call. */
-	preservedLivePostToolComponents?: ReadonlyMap<string, AssistantMessageComponent>;
+	/** Post-tool components scoped to their exact response and preceding call occurrence. */
+	preservedLivePostToolComponents?: readonly PreservedLivePostToolComponent[];
 	/** Leading reply text retained while its turn's terminality is unresolved. */
 	preservedLiveResponseAnchorCandidate?: AssistantMessageComponent;
 }

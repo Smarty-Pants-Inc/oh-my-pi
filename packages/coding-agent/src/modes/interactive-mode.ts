@@ -236,6 +236,7 @@ import type {
 	InteractiveModeContext,
 	InteractiveModeInitOptions,
 	InteractiveSelectorDialogOptions,
+	PreservedLivePostToolComponent,
 	RenderSessionContextOptions,
 	SubmittedUserInput,
 	TodoItem,
@@ -2133,20 +2134,19 @@ export class InteractiveMode implements InteractiveModeContext {
 		// update orphaned components that never re-render and the live LLM output
 		// vanishes from the chat (#3656). Snapshot the in-flight components,
 		// then replay matching post-tool assistant blocks beside their tool calls;
-		// only unmatched live blocks remain at the tail for continued streaming.
 		const liveComponents: Component[] = [];
 		const livePendingTools = new Map<string, ToolExecutionHandle>();
-		const preservedLivePostToolComponents = new Map<string, AssistantMessageComponent>();
+		const preservedLivePostToolComponents: PreservedLivePostToolComponent[] = [];
 		const isStreaming = this.viewSession?.isStreaming === true;
 		const preservedLiveResponseAnchorCandidate = isStreaming
 			? this.eventController.liveLeadingResponseAnchorCandidate()
 			: undefined;
 		const liveSet = new Set<Component>();
-		const livePostToolCallIds = new Map<Component, string>();
+		const livePostToolComponents = new Map<Component, PreservedLivePostToolComponent>();
 		if (isStreaming && this.streamingComponent) liveSet.add(this.streamingComponent);
-		for (const [toolCallId, component] of this.eventController.livePostToolAssistantSegments()) {
-			liveSet.add(component);
-			livePostToolCallIds.set(component, toolCallId);
+		for (const preserved of this.eventController.livePostToolAssistantSegments()) {
+			liveSet.add(preserved.component);
+			livePostToolComponents.set(preserved.component, preserved);
 		}
 		// Parked background tasks remain pending after the primary response goes
 		// idle, so their handles must survive rebuilds independently of isStreaming.
@@ -2158,9 +2158,9 @@ export class InteractiveMode implements InteractiveModeContext {
 			for (const child of this.chatContainer.children) {
 				if (!liveSet.has(child)) continue;
 				liveComponents.push(child);
-				const toolCallId = livePostToolCallIds.get(child);
-				if (toolCallId !== undefined) {
-					preservedLivePostToolComponents.set(toolCallId, child as AssistantMessageComponent);
+				const preserved = livePostToolComponents.get(child);
+				if (preserved && !preservedLivePostToolComponents.includes(preserved)) {
+					preservedLivePostToolComponents.push(preserved);
 				}
 			}
 		}
@@ -2241,13 +2241,19 @@ export class InteractiveMode implements InteractiveModeContext {
 			const index = liveComponents.indexOf(component);
 			if (index >= 0) liveComponents.splice(index, 1);
 		}
-		for (const [toolCallId, component] of preservedLivePostToolComponents) {
-			if (!replayedToolCallIds.has(toolCallId)) {
-				preservedLivePostToolComponents.delete(toolCallId);
+		for (let index = preservedLivePostToolComponents.length - 1; index >= 0; index--) {
+			const preserved = preservedLivePostToolComponents[index]!;
+			const replayed = context.messages.some(message => {
+				if (message.role !== "assistant" || !preserved.matchesReplayMessage(message)) return false;
+				return message.content[preserved.toolCallIndex]?.type === "toolCall";
+			});
+			if (!replayed) {
+				preservedLivePostToolComponents.splice(index, 1);
 				continue;
 			}
-			const index = liveComponents.indexOf(component);
-			if (index >= 0) liveComponents.splice(index, 1);
+			for (let liveIndex = liveComponents.length - 1; liveIndex >= 0; liveIndex--) {
+				if (liveComponents[liveIndex] === preserved.component) liveComponents.splice(liveIndex, 1);
+			}
 		}
 		// Prune the settled-component cache to the messages this rebuild will
 		// actually render. Message objects stay strongly reachable through

@@ -183,16 +183,17 @@ export function assistantHasVisibleContent(message: AssistantAgentMessage): bool
  */
 export function splitAssistantMessageToolTimeline(message: AssistantAgentMessage): {
 	beforeTools: AssistantAgentMessage;
-	afterToolCalls: ReadonlyMap<string, AssistantAgentMessage>;
+	/** Text after each tool call, keyed by that call's content index within this assistant response. */
+	afterToolCalls: ReadonlyMap<number, AssistantAgentMessage>;
 	hasToolCalls: boolean;
 	replySegment: AssistantAgentMessage | undefined;
 	/** `replySegment` only when the persisted agent-end decision is explicitly terminal. */
 	terminalReplySegment: AssistantAgentMessage | undefined;
 } {
 	const beforeToolsContent: AssistantAgentMessage["content"] = [];
-	const afterToolCalls = new Map<string, AssistantAgentMessage>();
+	const afterToolCalls = new Map<number, AssistantAgentMessage>();
 	let pendingAfterTool: AssistantAgentMessage["content"] = [];
-	let lastToolCallId: string | undefined;
+	let lastToolCallIndex: number | undefined;
 	let sawToolCall = false;
 
 	const displaySegment = (content: AssistantAgentMessage["content"]): AssistantAgentMessage => ({
@@ -204,16 +205,16 @@ export function splitAssistantMessageToolTimeline(message: AssistantAgentMessage
 	});
 
 	const flushPendingAfterTool = () => {
-		if (!lastToolCallId || pendingAfterTool.length === 0) return;
-		afterToolCalls.set(lastToolCallId, displaySegment(pendingAfterTool));
+		if (lastToolCallIndex === undefined || pendingAfterTool.length === 0) return;
+		afterToolCalls.set(lastToolCallIndex, displaySegment(pendingAfterTool));
 		pendingAfterTool = [];
 	};
 
-	for (const content of message.content) {
+	for (const [contentIndex, content] of message.content.entries()) {
 		if (content.type === "toolCall") {
 			flushPendingAfterTool();
 			sawToolCall = true;
-			lastToolCallId = content.id;
+			lastToolCallIndex = contentIndex;
 			continue;
 		}
 		if (sawToolCall) pendingAfterTool.push(content);
@@ -235,7 +236,8 @@ export function splitAssistantMessageToolTimeline(message: AssistantAgentMessage
 		message.stopReason !== "length" &&
 		message.stopDetails?.type !== "pause_turn" &&
 		!hasUnresolvedToolCalls;
-	const finalSegment = sawToolCall && lastToolCallId ? afterToolCalls.get(lastToolCallId) : beforeTools;
+	const finalSegment =
+		sawToolCall && lastToolCallIndex !== undefined ? afterToolCalls.get(lastToolCallIndex) : beforeTools;
 	// A tool call turns everything before it into intermediate transcript content.
 	// Only text after the final call can be a terminal-navigation reply target.
 	const replySegment =

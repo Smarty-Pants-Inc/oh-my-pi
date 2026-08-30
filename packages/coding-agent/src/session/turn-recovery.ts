@@ -386,7 +386,13 @@ export class TurnRecovery {
 
 	/** Closes a failed retry saga when no compaction continuation took ownership. */
 	async onErrorSettledWithoutRetry(message: AssistantMessage, compaction: RecoveryCompactionResult): Promise<void> {
-		if (message.stopReason !== "error" || this.#retryAttempt === 0 || compaction.continuationScheduled) return;
+		if (
+			message.stopReason !== "error" ||
+			this.#retryAttempt === 0 ||
+			compaction.deferredHandoff ||
+			compaction.continuationScheduled
+		)
+			return;
 		const attempt = this.#retryAttempt;
 		this.#retryAttempt = 0;
 		await this.#host.emitSessionEvent({

@@ -439,7 +439,59 @@ describe("AgentSession auto-compaction progress guard", () => {
 		expect(noProgress.length).toBe(0);
 	});
 
-	it("marks a queued continuation nonterminal after a settled Cursor exec-resolved tool call", async () => {
+	it("waits for deferred handoff scheduling before marking a response nonterminal", async () => {
+		activateOngoingGoal("deferred-handoff-schedule");
+		session.settings.set("compaction.methodOrder", ["handoff"]);
+		session.settings.set("compaction.keepRecentTokens", 1);
+		session.settings.set("contextPromotion.enabled", false);
+		compactHookEnabled = false;
+		vi.spyOn(session, "getContextUsage").mockReturnValue({ tokens: 1000, contextWindow: 200000, percent: 0.5 });
+
+		const handoffStarted = Promise.withResolvers<void>();
+		const releaseHandoff = Promise.withResolvers<void>();
+		vi.spyOn(compactionModule, "generateHandoffFromContext").mockImplementation(async () => {
+			handoffStarted.resolve();
+			await releaseHandoff.promise;
+			return "handoff document";
+		});
+
+		const agentEnds: Array<{ isTerminal: boolean | undefined; responseAnchorTerminal: boolean | undefined }> = [];
+		const agentEnd = Promise.withResolvers<void>();
+		session.subscribe(event => {
+			if (event.type !== "agent_end") return;
+			agentEnds.push({
+				isTerminal: event.isTerminal,
+				responseAnchorTerminal: event.responseAnchorTerminal,
+			});
+			agentEnd.resolve();
+		});
+
+		const assistantMsg = highUsageAssistant();
+		session.agent.emitExternalEvent({ type: "message_end", message: assistantMsg });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
+
+		await handoffStarted.promise;
+
+		// The goal can end while handoff generation is in flight. The actual
+		// scheduler must then decline the continuation and leave a terminal anchor.
+		session.setGoalModeState(undefined);
+		releaseHandoff.resolve();
+		await agentEnd.promise;
+		await session.waitForIdle();
+
+		expect(agentEnds).toEqual([{ isTerminal: true, responseAnchorTerminal: true }]);
+		expect(sessionManager.getBranch()).toContainEqual(
+			expect.objectContaining({
+				type: "message",
+				message: expect.objectContaining({
+					role: "assistant",
+					responseAnchorTerminal: true,
+				}),
+			}),
+		);
+	});
+
+	it("marks a settled Cursor exec-resolved tool call terminal when deferred scheduling rejects its queued continuation", async () => {
 		const agentEnds: Array<boolean | undefined> = [];
 		const agentEnd = Promise.withResolvers<void>();
 		session.subscribe(event => {
@@ -476,7 +528,7 @@ describe("AgentSession auto-compaction progress guard", () => {
 
 		await agentEnd.promise;
 
-		expect(agentEnds).toEqual([false]);
+		expect(agentEnds).toEqual([true]);
 		session.agent.clearAllQueues();
 	});
 
