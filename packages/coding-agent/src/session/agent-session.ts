@@ -3852,17 +3852,22 @@ export class AgentSession {
 				const isTerminal = options?.willContinue !== true;
 				const terminalityPersisted = msg
 					? await this.#persistAssistantResponseAnchorTerminal(msg, isTerminal)
-					: true;
-				const emittedTerminal = isTerminal && terminalityPersisted;
+					: false;
+				const responseAnchorTerminal = msg ? (terminalityPersisted ? isTerminal : false) : undefined;
 				if (fallbackAssistant && fallbackAssistant !== msg) {
-					fallbackAssistant.responseAnchorTerminal = emittedTerminal;
+					fallbackAssistant.responseAnchorTerminal = responseAnchorTerminal;
 				}
 				this.#emitRunState("idle");
 				// Public agent_end is held out of the eager display pass and emitted
 				// here after maintenance routing, tagged isTerminal so subscribers can
 				// tell final settles from scheduled continuations.
 				await this.#emitSessionEvent(
-					{ ...event, isTerminal: emittedTerminal },
+					{
+						...event,
+						isTerminal,
+						responseAnchorId: msg?.responseAnchorId,
+						responseAnchorTerminal,
+					},
 					options?.willContinue === true ? undefined : { closeTurnId: settledTurnId },
 				);
 				void this.#emitAgentEndNotification([...activeMessages], options).catch(err => {
@@ -4132,16 +4137,6 @@ export class AgentSession {
 				await this.#recovery.persistTerminalEmptyErrorTurn(msg);
 			}
 			await this.#recovery.onErrorSettledWithoutRetry(msg, compactionResult);
-			// Stop-time todo reconciliation only fires at a text-only final stop. A run
-			// that ends still mid-tool-use (deadline hit, context full, etc.) skips the
-			// reminder so we don't pile a follow-up onto an already in-flight turn.
-			// Mid-run sync is handled separately via #takeMidRunTodoNudge so a long
-			// tool-use loop still gets prodded to keep the live HUD honest (issue #3651).
-			const hasToolCalls = msg.content.some(content => content.type === "toolCall");
-			if (hasToolCalls) {
-				await emitAgentEndNotification();
-				return;
-			}
 			// When compaction queued recovery or hit a deliberate dead-end, skip the
 			// rewind/todo/session_stop passes: any reminder or hook continuation we append
 			// here would race the handoff, retry, auto-continue prompt, queued-message
@@ -4152,6 +4147,16 @@ export class AgentSession {
 				compactionResult.automaticContinuationBlocked
 			) {
 				await emitAgentEndNotification(compactionResult.continuationScheduled ? { willContinue: true } : undefined);
+				return;
+			}
+			// Stop-time todo reconciliation only fires at a text-only final stop. A run
+			// that ends still mid-tool-use (deadline hit, context full, etc.) skips the
+			// reminder so we don't pile a follow-up onto an already in-flight turn.
+			// Mid-run sync is handled separately via #takeMidRunTodoNudge so a long
+			// tool-use loop still gets prodded to keep the live HUD honest (issue #3651).
+			const hasToolCalls = msg.content.some(content => content.type === "toolCall");
+			if (hasToolCalls) {
+				await emitAgentEndNotification();
 				return;
 			}
 			if (msg.stopReason !== "error") {

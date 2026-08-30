@@ -49,6 +49,7 @@ function createFixture(streamingMessage: AssistantMessage) {
 	const streamingComponent = {
 		updateContent: vi.fn(),
 		markTranscriptBlockFinalized,
+		setResponseAnchor: vi.fn(),
 	};
 	const ctx = {
 		isInitialized: true,
@@ -64,7 +65,11 @@ function createFixture(streamingMessage: AssistantMessage) {
 		chatContainer: { addChild: vi.fn((child: { seal?(): void }) => mountedComponents.push(child)) },
 		toolOutputExpanded: false,
 		settings,
-		session: { getToolByName: () => undefined, hasBuiltInTool: () => true },
+		session: {
+			getToolByName: () => undefined,
+			hasBuiltInTool: () => true,
+			agent: { transformAssistantMessage: undefined },
+		},
 		viewSession: { getToolByName: () => undefined, hasBuiltInTool: () => true },
 		clearTransientSessionUi: () => {},
 		sessionManager: { getCwd: () => process.cwd() },

@@ -185,7 +185,13 @@ export interface CollabPromptDetails {
 
 export type AgentEvent =
 	| { type: "agent_start" }
-	| { type: "agent_end"; messages?: WireMessage[]; isTerminal?: boolean }
+	| {
+			type: "agent_end";
+			messages?: WireMessage[];
+			isTerminal?: boolean;
+			responseAnchorId?: string;
+			responseAnchorTerminal?: boolean;
+	  }
 	| { type: "turn_start" }
 	| { type: "turn_end" }
 	| { type: "message_start"; message: WireMessage }
@@ -400,8 +406,11 @@ export type WireFrame = GuestFrame | HostFrame;
  *   host), so they must be rejected at hello.
  * - `4`: guest prompts may carry a display name, and persisted prompt details
  *   carry the display-name revision used by identity-aware renderers.
+ * - `5`: terminal `agent_end` events carry scalar response-anchor identity and
+ *   persisted terminality. Older guests would silently fall back to lifecycle
+ *   terminality and could promote an anchor whose journal correction failed.
  */
-export const COLLAB_PROTO = 4;
+export const COLLAB_PROTO = 5;
 
 /** Parameter key used for intent tracing (e.g. prompt explanation/reasoning) */
 export const INTENT_FIELD = "i";

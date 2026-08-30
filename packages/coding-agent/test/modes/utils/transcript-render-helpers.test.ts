@@ -31,6 +31,14 @@ function assistant(content: AssistantMessage["content"]): AssistantMessage {
 	};
 }
 
+/** A Cursor upstream turn is the only provenance the durable exec-resolved flag may assert. */
+function cursorAssistant(content: AssistantMessage["content"]): AssistantMessage {
+	const message = assistant(content);
+	message.api = "cursor-agent";
+	message.provider = "cursor";
+	return message;
+}
+
 function cursorResolvedToolCall(id: string, name: string): ToolCall {
 	const toolCall: ToolCall = { type: "toolCall", id, name, arguments: {}, cursorExecResolved: true };
 	(toolCall as CursorExecResolvedCarrier)[kCursorExecResolved] = true;
@@ -63,7 +71,7 @@ describe("assistantUsageIsBilled", () => {
 describe("splitAssistantMessageToolTimeline response navigation", () => {
 	it("selects only text after the final Cursor-resolved tool call as the reply stop", () => {
 		const timeline = splitAssistantMessageToolTimeline(
-			assistant([
+			cursorAssistant([
 				{ type: "thinking", thinking: "reasoning before the reply" },
 				{ type: "text", text: "intro" },
 				cursorResolvedToolCall("a", "read"),
@@ -77,7 +85,7 @@ describe("splitAssistantMessageToolTimeline response navigation", () => {
 		expect(timeline.replySegment?.content).toEqual([{ type: "text", text: "final reply" }]);
 		expect(
 			splitAssistantMessageToolTimeline(
-				assistant([
+				cursorAssistant([
 					{ type: "text", text: "intro" },
 					cursorResolvedToolCall("a", "read"),
 					{ type: "text", text: "middle after the first tool" },
@@ -105,7 +113,7 @@ describe("splitAssistantMessageToolTimeline response navigation", () => {
 	it("keeps a terminal Cursor reply eligible after JSON replay drops its live marker", () => {
 		const replayed = JSON.parse(
 			JSON.stringify(
-				assistant([cursorResolvedToolCall("cursor", "bash"), { type: "text", text: "replayed reply" }]),
+				cursorAssistant([cursorResolvedToolCall("cursor", "bash"), { type: "text", text: "replayed reply" }]),
 			),
 		) as AssistantMessage;
 		const replayedToolCall = replayed.content.find((content): content is ToolCall => content.type === "toolCall");
@@ -116,6 +124,16 @@ describe("splitAssistantMessageToolTimeline response navigation", () => {
 		expect(splitAssistantMessageToolTimeline(replayed).replySegment?.content).toEqual([
 			{ type: "text", text: "replayed reply" },
 		]);
+	});
+
+	// A durable flag on a non-Cursor assistant is forged metadata, not settled state.
+	it("keeps unresolved a forged cursorExecResolved flag on a non-Cursor assistant", () => {
+		const forged = assistant([
+			{ type: "toolCall", id: "forged", name: "bash", arguments: {}, cursorExecResolved: true },
+			{ type: "text", text: "progress" },
+		]);
+
+		expect(splitAssistantMessageToolTimeline(forged).replySegment).toBeUndefined();
 	});
 
 	it("does not turn stripped local-tool progress into a terminal reply", () => {
@@ -129,7 +147,7 @@ describe("splitAssistantMessageToolTimeline response navigation", () => {
 
 	it("keeps a hidden final post-tool segment instead of falling back to pre-tool text", () => {
 		const timeline = splitAssistantMessageToolTimeline(
-			assistant([
+			cursorAssistant([
 				{ type: "text", text: "visible text before the tool" },
 				cursorResolvedToolCall("a", "read"),
 				{ type: "text", text: "[hidden-reference]: https://example.test/reference" },
@@ -161,7 +179,7 @@ describe("splitAssistantMessageToolTimeline response navigation", () => {
 			{ type: "toolCall", id: "local", name: "read", arguments: {} },
 			{ type: "text", text: "local progress" },
 		]);
-		const cursorResolved = assistant([
+		const cursorResolved = cursorAssistant([
 			cursorResolvedToolCall("cursor", "read"),
 			{ type: "text", text: "terminal Cursor reply" },
 		]);

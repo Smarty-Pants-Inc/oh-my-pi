@@ -103,10 +103,10 @@ export type InteractiveSelectorDialogOptions = ExtensionUIDialogOptions & Pick<H
 export interface RenderSessionContextOptions {
 	updateFooter?: boolean;
 	reuseSettledComponents?: boolean;
-	/** Tool calls whose existing live component remains the sole render owner across a rebuild. */
-	preservedLiveToolCallIds?: ReadonlySet<string>;
-	/** Post-tool text whose live component remains the sole render owner across a rebuild. */
-	preservedLivePostToolCallIds?: ReadonlySet<string>;
+	/** Existing live tool components keyed by replayed call id; each is reattached at its transcript slot. */
+	preservedLiveToolComponents?: ReadonlyMap<string, Component>;
+	/** Post-tool live components to reattach immediately after their matching replayed tool call. */
+	preservedLivePostToolComponents?: ReadonlyMap<string, AssistantMessageComponent>;
 	/** Leading reply text retained while its turn's terminality is unresolved. */
 	preservedLiveResponseAnchorCandidate?: AssistantMessageComponent;
 }

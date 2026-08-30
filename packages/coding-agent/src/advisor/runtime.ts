@@ -143,8 +143,8 @@ export function quarantineAdvisorUnsafeOutput(
 	const unavailableToolNames = new Set<string>();
 	const generatedParts: string[] = [];
 	for (const block of message.content) {
-		// Cursor exec-channel native blocks (bash/read/grep/...) carry durable
-		// exec-resolution state: they already ran server-side through the
+		// Cursor exec-channel native blocks (bash/read/grep/...) carry a process-local
+		// exec-resolution marker: they already ran server-side through the
 		// advisor-scoped CursorExecHandlers bridge, which rejects ungranted
 		// tools in-band ("Tool not available") and lets the model self-correct.
 		// Quarantining them would discard the legitimate advise emitted in the

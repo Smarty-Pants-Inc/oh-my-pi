@@ -325,6 +325,28 @@ describe("shrinkForReplication (#3740 review)", () => {
 		expect(marker).toBeDefined();
 	});
 
+	it("preserves root and nested response anchors through the deepest string clamp", () => {
+		const responseAnchorId = "a".repeat(128);
+		const nestedResponseAnchorId = "b".repeat(128);
+		const detail = Object.fromEntries(
+			Array.from({ length: 6_000 }, (_, index) => [`field-${index}`, "x".repeat(300)]),
+		);
+		const payload = {
+			type: "message_end",
+			responseAnchorId,
+			message: { role: "assistant", responseAnchorId: nestedResponseAnchorId },
+			detail,
+		};
+		expect(Buffer.byteLength(JSON.stringify(payload))).toBeGreaterThan(MAX_REPLICATED_PAYLOAD_BYTES);
+
+		const shrunk = shrinkForReplication(payload);
+
+		expect(Buffer.byteLength(JSON.stringify(shrunk))).toBeLessThanOrEqual(MAX_REPLICATED_PAYLOAD_BYTES);
+		expect(shrunk.responseAnchorId).toBe(responseAnchorId);
+		expect(shrunk.message.responseAnchorId).toBe(nestedResponseAnchorId);
+		expect(shrunk.detail["field-0"]?.length).toBeLessThan(64);
+	});
+
 	it("preserves the wire discriminator on a fully-shrunk payload", () => {
 		// Even the worst-case final pass keeps the discriminator key/value
 		// pairs intact (only string leaves and array tails are touched), so

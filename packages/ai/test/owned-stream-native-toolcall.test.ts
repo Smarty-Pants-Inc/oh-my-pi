@@ -315,6 +315,7 @@ describe("wrapInbandToolStream native tool-call passthrough", () => {
 				id: "cursor-bash-1",
 				name: "bash",
 				arguments: { command: "echo hi" },
+				cursorExecResolved: true,
 			};
 			(block as ToolCall & { [kCursorExecResolved]?: true })[kCursorExecResolved] = true;
 			out.content.push(block);
@@ -325,6 +326,7 @@ describe("wrapInbandToolStream native tool-call passthrough", () => {
 		const calls = message.content.filter((b): b is ToolCall => b.type === "toolCall");
 		expect(calls).toHaveLength(1);
 		expect(isCursorExecResolved(calls[0])).toBe(true);
+		expect(calls[0]!.cursorExecResolved).toBe(true);
 	});
 
 	it("drops a nameless native ghost but keeps the real native call", async () => {

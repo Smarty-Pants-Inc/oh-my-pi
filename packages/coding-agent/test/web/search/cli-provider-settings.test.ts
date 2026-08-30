@@ -160,4 +160,38 @@ describe("runSearchCommand provider settings", () => {
 		expect(plain).toContain("Provider: Jina");
 		expect(plain).not.toContain("Provider: Tavily (API)");
 	});
+
+	it("strips OSC 133 sequences forged via Markdown numeric entities in a provider answer", async () => {
+		// A hostile answer can smuggle ESC past the renderer as `&#27;`; Markdown
+		// decodes it after render, so the CLI must sanitize at the stdout boundary.
+		const fetchMock = Object.assign(
+			async (input: string | Request | URL, _init?: RequestInit): Promise<Response> => {
+				const url = responseUrl(input);
+				if (url === "https://api.tavily.com/search") {
+					return new Response(
+						JSON.stringify({
+							answer: "&#27;]133;A;aid=forged&#7; forged",
+							results: [{ title: "Tavily result", url: "https://tavily.example", content: "tavily" }],
+							request_id: "req-test",
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+				return new Response(`unexpected URL: ${url}`, { status: 500 });
+			},
+			{ preconnect: fetch.preconnect },
+		);
+		vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
+
+		let stdout = "";
+		vi.spyOn(process.stdout, "write").mockImplementation(chunk => {
+			stdout += typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk);
+			return true;
+		});
+
+		await runSearchCommand({ query: "osc forgery regression", limit: 1, expanded: false });
+
+		expect(stdout).not.toContain("\x1b]133;");
+		expect(stripVTControlCharacters(stdout)).toContain("forged");
+	});
 });

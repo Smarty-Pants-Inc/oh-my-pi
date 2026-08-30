@@ -4,7 +4,6 @@ import {
 	CURRENT_SESSION_VERSION,
 	type FileEntry,
 	isSessionEntry,
-	isSessionLeafEntry,
 	type SessionHeader,
 } from "./session-entries";
 
@@ -27,7 +26,7 @@ function migrateV1ToV2(entries: FileEntry[]): void {
 			entry.version = 2;
 			continue;
 		}
-		if (isSessionLeafEntry(entry)) continue;
+		if (!isSessionEntry(entry)) continue;
 
 		entry.id = generateId(ids);
 		entry.parentId = prevId;
@@ -54,7 +53,7 @@ function migrateV2ToV3(entries: FileEntry[]): void {
 			entry.version = 3;
 			continue;
 		}
-		if (isSessionLeafEntry(entry)) continue;
+		if (!isSessionEntry(entry)) continue;
 
 		if (entry.type === "message") {
 			const msg = entry.message as { role?: string };

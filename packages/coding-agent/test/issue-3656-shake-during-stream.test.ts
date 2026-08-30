@@ -58,7 +58,7 @@ function assistantWithResolvedBashReply(command: string, reply: string): Assista
 	if (toolCall?.type !== "toolCall") throw new Error("Expected bash tool call");
 	toolCall.cursorExecResolved = true;
 	(toolCall as CursorExecResolvedCarrier)[kCursorExecResolved] = true;
-	message.api = "cursor";
+	message.api = "cursor-agent";
 	message.provider = "cursor";
 	message.model = "cursor-model";
 	message.content.push({ type: "text", text: reply });
@@ -77,6 +77,23 @@ function assistantWithReply(reply: string): AssistantMessage {
 		usage,
 		timestamp: Date.now(),
 	};
+}
+function assistantWithTwoResolvedBashReplies(): AssistantMessage {
+	const message = assistantWithResolvedBashReply("echo TOOL_A", "MIDDLE BETWEEN TOOLS");
+	message.content.unshift({ type: "text", text: "INTRO BEFORE TOOL_A" });
+	const firstTool = message.content.find(content => content.type === "toolCall");
+	if (!firstTool) throw new Error("Expected first bash tool call");
+	firstTool.id = "call-a";
+	const secondTool = {
+		type: "toolCall" as const,
+		id: "call-b",
+		name: "bash",
+		arguments: { command: "echo TOOL_B" },
+		cursorExecResolved: true as const,
+	};
+	(secondTool as CursorExecResolvedCarrier)[kCursorExecResolved] = true;
+	message.content.push(secondTool, { type: "text", text: "FINAL AFTER TOOL_B" });
+	return message;
 }
 
 describe("issue #3656 /shake mid-stream preserves the in-flight assistant turn", () => {
@@ -256,6 +273,7 @@ describe("issue #3656 /shake mid-stream preserves the in-flight assistant turn",
 			type: "agent_end",
 			messages: [completed],
 			isTerminal: true,
+			responseAnchorTerminal: true,
 		} as AgentSessionEvent);
 
 		expect(mode.chatContainer.children).toContain(postToolComponent);
@@ -351,11 +369,77 @@ describe("issue #3656 /shake mid-stream preserves the in-flight assistant turn",
 			type: "agent_end",
 			messages: [completed],
 			isTerminal: true,
+			responseAnchorTerminal: true,
 		} as AgentSessionEvent);
 
 		raw = mode.chatContainer.render(120).join("\n");
 		expect(Bun.stripANSI(raw).split(reply)).toHaveLength(2);
 		expect(String(postToolComponent.render(120).join("\n"))).toContain("\x1b]133;A;aid=omp-response-");
+	});
+	it("keeps each post-tool segment at its matching replay position and anchors only the final response", async () => {
+		let streaming = true;
+		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => streaming });
+		const completed = assistantWithTwoResolvedBashReplies();
+		await mode.eventController.handleEvent({
+			type: "message_start",
+			message: { ...completed, content: [] },
+		} as AgentSessionEvent);
+		await mode.eventController.handleEvent({ type: "message_update", message: completed } as AgentSessionEvent);
+
+		const middleComponent = mode.chatContainer.children.find(
+			child =>
+				child instanceof AssistantMessageComponent &&
+				Bun.stripANSI(child.render(120).join("\n")).includes("MIDDLE BETWEEN TOOLS"),
+		);
+		const finalComponent = mode.chatContainer.children.find(
+			child =>
+				child instanceof AssistantMessageComponent &&
+				Bun.stripANSI(child.render(120).join("\n")).includes("FINAL AFTER TOOL_B"),
+		);
+		if (
+			!(middleComponent instanceof AssistantMessageComponent) ||
+			!(finalComponent instanceof AssistantMessageComponent)
+		) {
+			throw new Error("Expected visible post-tool assistant components");
+		}
+
+		session.sessionManager.appendMessage(JSON.parse(JSON.stringify(completed)) as AssistantMessage);
+		for (const toolCallId of ["call-a", "call-b"]) {
+			session.sessionManager.appendMessage({
+				role: "toolResult",
+				toolCallId,
+				toolName: "bash",
+				content: [{ type: "text", text: "done" }],
+				isError: false,
+				timestamp: Date.now(),
+			});
+		}
+
+		mode.rebuildChatFromMessages();
+
+		let raw = mode.chatContainer.render(120).join("\n");
+		const visible = Bun.stripANSI(raw);
+		const positions = ["INTRO", "TOOL_A", "MIDDLE BETWEEN TOOLS", "TOOL_B", "FINAL AFTER TOOL_B"].map(marker =>
+			visible.indexOf(marker),
+		);
+		expect(positions.every(position => position >= 0)).toBe(true);
+		expect(positions).toEqual([...positions].sort((left, right) => left - right));
+		expect(mode.chatContainer.children).toContain(middleComponent);
+		expect(mode.chatContainer.children).toContain(finalComponent);
+
+		await mode.eventController.handleEvent({ type: "message_end", message: completed } as AgentSessionEvent);
+		streaming = false;
+		await mode.eventController.handleEvent({
+			type: "agent_end",
+			messages: [completed],
+			isTerminal: true,
+			responseAnchorTerminal: true,
+		} as AgentSessionEvent);
+
+		raw = mode.chatContainer.render(120).join("\n");
+		expect(raw.split("\x1b]133;A;aid=omp-response-")).toHaveLength(2);
+		expect(finalComponent.render(120).join("\n")).toContain("\x1b]133;A;aid=omp-response-");
+		expect(middleComponent.render(120).join("\n")).not.toContain("\x1b]133;A;aid=omp-response-");
 	});
 
 	it("keeps a no-tool reply candidate singular until terminal agent_end resolves its zone", async () => {
@@ -390,6 +474,7 @@ describe("issue #3656 /shake mid-stream preserves the in-flight assistant turn",
 			type: "agent_end",
 			messages: [completed],
 			isTerminal: true,
+			responseAnchorTerminal: true,
 		} as AgentSessionEvent);
 
 		raw = mode.chatContainer.render(120).join("\n");
@@ -401,41 +486,48 @@ describe("issue #3656 /shake mid-stream preserves the in-flight assistant turn",
 		expect(raw.split("\x1b]133;A;aid=omp-response-")).toHaveLength(2);
 	});
 
-	it("keeps a no-tool reply candidate unanchored and singular after nonterminal agent_end", async () => {
-		let streaming = true;
-		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => streaming });
-		const reply = "NO TOOL NONTERMINAL REPLY REBUILT ONCE";
-		const completed = assistantWithReply(reply);
-		await mode.eventController.handleEvent({
-			type: "message_start",
-			message: { ...completed, content: [] },
-		} as AgentSessionEvent);
-		await mode.eventController.handleEvent({ type: "message_end", message: completed } as AgentSessionEvent);
-		const persisted = JSON.parse(JSON.stringify(completed)) as AssistantMessage;
-		persisted.responseAnchorTerminal = false;
-		session.sessionManager.appendMessage(persisted);
+	it.each([
+		["explicitly false", false],
+		["absent", undefined],
+	] as const)(
+		"fails closed on reply anchoring when durable anchor eligibility is %s",
+		async (_case, responseAnchorTerminal) => {
+			let streaming = true;
+			Object.defineProperty(session, "isStreaming", { configurable: true, get: () => streaming });
+			const reply = "NO TOOL ANCHOR-INELIGIBLE REPLY REBUILT ONCE";
+			const completed = assistantWithReply(reply);
+			await mode.eventController.handleEvent({
+				type: "message_start",
+				message: { ...completed, content: [] },
+			} as AgentSessionEvent);
+			await mode.eventController.handleEvent({ type: "message_end", message: completed } as AgentSessionEvent);
+			const persisted = JSON.parse(JSON.stringify(completed)) as AssistantMessage;
+			persisted.responseAnchorTerminal = false;
+			session.sessionManager.appendMessage(persisted);
 
-		mode.rebuildChatFromMessages();
+			mode.rebuildChatFromMessages();
 
-		let raw = mode.chatContainer.render(120).join("\n");
-		expect(Bun.stripANSI(raw).split(reply)).toHaveLength(2);
-		expect(raw).not.toContain("\x1b]133;A;aid=omp-response-");
+			let raw = mode.chatContainer.render(120).join("\n");
+			expect(Bun.stripANSI(raw).split(reply)).toHaveLength(2);
+			expect(raw).not.toContain("\x1b]133;A;aid=omp-response-");
 
-		streaming = false;
-		await mode.eventController.handleEvent({
-			type: "agent_end",
-			messages: [completed],
-			isTerminal: false,
-		} as AgentSessionEvent);
+			streaming = false;
+			await mode.eventController.handleEvent({
+				type: "agent_end",
+				messages: [completed],
+				isTerminal: true,
+				responseAnchorTerminal,
+			} as AgentSessionEvent);
 
-		raw = mode.chatContainer.render(120).join("\n");
-		expect(Bun.stripANSI(raw).split(reply)).toHaveLength(2);
-		expect(raw).not.toContain("\x1b]133;A;aid=omp-response-");
+			raw = mode.chatContainer.render(120).join("\n");
+			expect(Bun.stripANSI(raw).split(reply)).toHaveLength(2);
+			expect(raw).not.toContain("\x1b]133;A;aid=omp-response-");
 
-		mode.rebuildChatFromMessages();
-		raw = mode.chatContainer.render(120).join("\n");
-		expect(raw).not.toContain("\x1b]133;A;aid=omp-response-");
-	});
+			mode.rebuildChatFromMessages();
+			raw = mode.chatContainer.render(120).join("\n");
+			expect(raw).not.toContain("\x1b]133;A;aid=omp-response-");
+		},
+	);
 	it("does not preserve in-flight tracking when the session is idle (post-stream rebuilds reset cleanly)", () => {
 		const streamingComponent = new AssistantMessageComponent();
 		mode.chatContainer.addChild(streamingComponent);

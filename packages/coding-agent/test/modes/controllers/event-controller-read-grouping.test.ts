@@ -77,7 +77,12 @@ function assistantMessage(content: Block[]): AssistantMessage {
 
 function createFixture() {
 	const chatContainer = new TranscriptContainer();
-	const sessionMock = { getToolByName: () => undefined, hasBuiltInTool: () => true, extensionRunner: undefined };
+	const sessionMock = {
+		getToolByName: () => undefined,
+		hasBuiltInTool: () => true,
+		extensionRunner: undefined,
+		agent: { transformAssistantMessage: undefined },
+	};
 	const ctx = {
 		isInitialized: true,
 		init: vi.fn(async () => {}),

@@ -48,18 +48,41 @@ export const kStreamingBlockKind = Symbol("provider.block.kind");
  * executed server-side (via the coding-agent bridge) and whose result is
  * buffered separately for emission via the assistant-loop stream.
  *
- * `kCursorExecResolved` remains process-local for the live dispatch path.
- * `cursorExecResolved` is retained alongside it so a persisted or collaborative
- * transcript can still distinguish this settled call from a local continuation.
+ * Live dispatch authority (agent loop, advisor) keys off the
+ * process-local `kCursorExecResolved` symbol ONLY. The serializable
+ * `cursorExecResolved` boolean is replay/display metadata for a persisted or
+ * collaborative transcript, honored only when the containing assistant carries
+ * verified Cursor provenance (`api === "cursor-agent" && provider ===
+ * "cursor"`).
  */
 export const kCursorExecResolved = Symbol("provider.block.cursorExecResolved");
 
 /** Carries live and durable Cursor exec-resolution state. */
 export type CursorExecResolvedCarrier = object & { cursorExecResolved?: true; [kCursorExecResolved]?: true };
 
-/** True when a toolCall block was already executed by Cursor's exec channel. */
+/** The assistant-message slice needed to verify Cursor provenance. */
+export type CursorProvenanceCarrier = { api?: unknown; provider?: unknown };
+
+/** True when the containing assistant message is a verified Cursor turn. */
+export function hasCursorExecProvenance(message: CursorProvenanceCarrier | null | undefined): boolean {
+	return message?.api === "cursor-agent" && message?.provider === "cursor";
+}
+
+/** Live-dispatch authority: true only when the process-local symbol settles the call. */
 export function isCursorExecResolved(block: CursorExecResolvedCarrier | null | undefined): boolean {
-	return block?.[kCursorExecResolved] === true || block?.cursorExecResolved === true;
+	return block?.[kCursorExecResolved] === true;
+}
+
+/**
+ * Replay/display resolution: the live symbol, or the durable flag when the
+ * containing assistant has verified Cursor provenance.
+ */
+export function isCursorExecResolvedReplay(
+	message: CursorProvenanceCarrier | null | undefined,
+	block: CursorExecResolvedCarrier | null | undefined,
+): boolean {
+	if (isCursorExecResolved(block)) return true;
+	return hasCursorExecProvenance(message) && block?.cursorExecResolved === true;
 }
 
 /** Copy Cursor exec-resolution state onto a cloned/projected toolCall block. */

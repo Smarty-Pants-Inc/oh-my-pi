@@ -459,6 +459,7 @@ export class UiHelpers {
 		}
 
 		let readGroup: ReadToolGroupComponent | null = null;
+		const reattachedLiveToolComponents = new Set<Component>();
 		const readToolCallArgs = new Map<string, Record<string, unknown>>();
 		const readToolCallAssistantComponents = new Map<string, AssistantMessageComponent>();
 		// Defer per-turn metrics until the turn's tool results have materialized.
@@ -587,13 +588,12 @@ export class UiHelpers {
 				const hasErrorStop = errorPresentation.kind === "full";
 				const errorMessage = hasErrorStop ? errorPresentation.text : null;
 				const appendAssistantSegment = (toolCallId: string, segment: AssistantMessage | undefined) => {
-					if (
-						options.preservedLivePostToolCallIds?.has(toolCallId) ||
-						!segment ||
-						!assistantHasVisibleContent(segment)
-					) {
+					const preservedComponent = options.preservedLivePostToolComponents?.get(toolCallId);
+					if (preservedComponent) {
+						this.ctx.chatContainer.addChild(preservedComponent);
 						return;
 					}
+					if (!segment || !assistantHasVisibleContent(segment)) return;
 					const component = createAssistantMessageComponent(this.ctx, segment);
 					component.setResponseAnchor(segment === terminalReplySegment);
 					this.ctx.chatContainer.addChild(component);
@@ -605,7 +605,15 @@ export class UiHelpers {
 						continue;
 					}
 					const afterToolSegment = timeline.afterToolCalls.get(content.id);
-					if (options.preservedLiveToolCallIds?.has(content.id)) {
+					const preservedToolComponent = options.preservedLiveToolComponents?.get(content.id);
+					if (preservedToolComponent) {
+						resolveWaitingPoll(content.name);
+						readGroup?.seal();
+						readGroup = null;
+						if (!reattachedLiveToolComponents.has(preservedToolComponent)) {
+							this.ctx.chatContainer.addChild(preservedToolComponent);
+							reattachedLiveToolComponents.add(preservedToolComponent);
+						}
 						appendAssistantSegment(content.id, afterToolSegment);
 						continue;
 					}
@@ -717,7 +725,7 @@ export class UiHelpers {
 				pendingUsageTimestamp = message.timestamp;
 				pendingReadUsageCallIds = pendingUsage ? groupedReadUsageCallIds(message) : undefined;
 			} else if (message.role === "toolResult") {
-				if (options.preservedLiveToolCallIds?.has(message.toolCallId)) continue;
+				if (options.preservedLiveToolComponents?.has(message.toolCallId)) continue;
 				const pendingReadComponent = this.ctx.pendingTools.get(message.toolCallId);
 				const isReadGroupResult =
 					message.toolName === "read" &&

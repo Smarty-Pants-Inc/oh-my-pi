@@ -5,6 +5,7 @@ import { deterministicUuid } from "@oh-my-pi/pi-ai/utils/deterministic-id";
 // process-session prefix and delimiters.
 export const MAX_RESPONSE_ANCHOR_ID_BYTES = 128;
 const RESPONSE_ANCHOR_ID_RE = new RegExp(`^[A-Za-z0-9_-]{1,${MAX_RESPONSE_ANCHOR_ID_BYTES}}$`);
+const SYNTHESIZED_RESPONSE_ANCHOR_ID_PREFIX = "legacy-";
 
 export function isSafeResponseAnchorId(value: unknown): value is string {
 	return typeof value === "string" && RESPONSE_ANCHOR_ID_RE.test(value);
@@ -16,7 +17,7 @@ export function createResponseAnchorId(): string {
 }
 /** A stable safe response anchor for a durable session entry. */
 export function responseAnchorIdForEntry(entryId: string): string {
-	return `legacy-${deterministicUuid(entryId)}`;
+	return `${SYNTHESIZED_RESPONSE_ANCHOR_ID_PREFIX}${deterministicUuid(entryId)}`;
 }
 
 /** Use the durable entry id on replay; newly appended messages receive a UUID. */

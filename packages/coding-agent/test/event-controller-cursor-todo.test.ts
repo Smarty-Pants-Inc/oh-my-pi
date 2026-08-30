@@ -34,7 +34,7 @@ function createFixture(): Fixture {
 		transcriptMessageComponents: new WeakMap(),
 		pendingTools: new Map(),
 		statusLine: { invalidate: vi.fn(), markActivityStart: vi.fn() },
-		session: { isAborting: false },
+		session: { isAborting: false, agent: { transformAssistantMessage: undefined } },
 		settings: { get: () => false },
 		updateEditorTopBorder: vi.fn(),
 		clearPinnedError: vi.fn(),

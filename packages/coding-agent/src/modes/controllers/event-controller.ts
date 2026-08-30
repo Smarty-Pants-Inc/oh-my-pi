@@ -1797,7 +1797,7 @@ export class EventController {
 	}
 
 	async #finishAgentEnd(event: Extract<AgentSessionEvent, { type: "agent_end" }>): Promise<void> {
-		this.#settleResponseAnchorCandidate(true);
+		this.#settleResponseAnchorCandidate(event.responseAnchorTerminal === true);
 		this.#setTerminalProgress(false);
 		this.ctx.statusLine.markActivityEnd();
 		this.#streamingReveal.stop();

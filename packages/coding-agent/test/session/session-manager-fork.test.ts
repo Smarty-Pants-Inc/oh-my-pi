@@ -234,6 +234,98 @@ describe("SessionManager forks", () => {
 		await Promise.all([loaded.close(), imported.close()]);
 	});
 
+	it("keeps absent legacy terminality unanchored for synthesized and preexisting response ids", async () => {
+		using tempDir = TempDir.createSync("@omp-legacy-response-terminality-");
+		const cwd = path.join(tempDir.path(), "project");
+		const sessionDir = path.join(tempDir.path(), "sessions");
+		const sourceFile = path.join(sessionDir, "legacy.jsonl");
+		const timestamp = new Date().toISOString();
+		const preexistingAnchorId = crypto.randomUUID();
+		await fs.mkdir(cwd, { recursive: true });
+		await fs.mkdir(sessionDir, { recursive: true });
+		const message = (text: string, responseAnchorId?: string): AssistantMessage => ({
+			role: "assistant",
+			content: [{ type: "text", text }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: 777,
+			...(responseAnchorId === undefined ? {} : { responseAnchorId }),
+		});
+		const header: SessionHeader = {
+			type: "session",
+			version: CURRENT_SESSION_VERSION,
+			id: "legacy-response-terminality-source",
+			timestamp,
+			cwd,
+		};
+		await Bun.write(
+			sourceFile,
+			`${[
+				JSON.stringify(header),
+				JSON.stringify({
+					type: "message",
+					id: "legacy-synthesized",
+					parentId: null,
+					timestamp,
+					message: message("synthesized intermediate"),
+				}),
+				JSON.stringify({
+					type: "message",
+					id: "legacy-preexisting",
+					parentId: "legacy-synthesized",
+					timestamp,
+					message: message("preexisting-id intermediate", preexistingAnchorId),
+				}),
+				JSON.stringify({
+					type: "message",
+					id: "legacy-final",
+					parentId: "legacy-preexisting",
+					timestamp,
+					message: { ...message("final", "feature-final-anchor"), responseAnchorTerminal: true },
+				}),
+			].join("\n")}\n`,
+		);
+
+		const expectTerminality = (manager: SessionManager) => {
+			const synthesized = manager.getEntry("legacy-synthesized");
+			const preexisting = manager.getEntry("legacy-preexisting");
+			const final = manager.getEntry("legacy-final");
+			if (synthesized?.type !== "message" || synthesized.message.role !== "assistant") {
+				throw new Error("Expected synthesized legacy assistant");
+			}
+			if (preexisting?.type !== "message" || preexisting.message.role !== "assistant") {
+				throw new Error("Expected preexisting-id legacy assistant");
+			}
+			if (final?.type !== "message" || final.message.role !== "assistant") {
+				throw new Error("Expected final legacy assistant");
+			}
+			expect(synthesized.message.responseAnchorId).toBe(responseAnchorIdForEntry("legacy-synthesized"));
+			expect(synthesized.message.responseAnchorTerminal).toBeUndefined();
+			expect(preexisting.message.responseAnchorId).toBe(preexistingAnchorId);
+			expect(preexisting.message.responseAnchorTerminal).toBeUndefined();
+			expect(final.message.responseAnchorTerminal).toBe(true);
+		};
+
+		const firstLoad = await SessionManager.open(sourceFile);
+		expectTerminality(firstLoad);
+		await firstLoad.rewriteEntries();
+		await firstLoad.close();
+
+		const secondLoad = await SessionManager.open(sourceFile);
+		expectTerminality(secondLoad);
+		await secondLoad.close();
+	});
+
 	it("copies source artifacts recursively into the fork by default", async () => {
 		using tempDir = TempDir.createSync("@omp-session-fork-artifacts-");
 		const { cwd, sessionDir, sourceFile, sourceArtifactsDir } = await createSessionWithArtifacts(tempDir.path());

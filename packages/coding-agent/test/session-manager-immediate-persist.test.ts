@@ -3,7 +3,11 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import { isSafeResponseAnchorId } from "@oh-my-pi/pi-coding-agent/session/response-anchor";
+import {
+	isSafeResponseAnchorId,
+	MAX_RESPONSE_ANCHOR_ID_BYTES,
+} from "@oh-my-pi/pi-coding-agent/session/response-anchor";
+import { RESPONSE_ANCHOR_TERMINAL_ENTRY_TYPE } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { MemorySessionStorage, type WriteTextAtomicOptions } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { parseJsonlLenient, TempDir } from "@oh-my-pi/pi-utils";
@@ -146,6 +150,77 @@ describe("SessionManager JSONL software-crash durability", () => {
 		if (!sessionFile) throw new Error("Expected a persisted session file path");
 		const persisted = readJsonl(sessionFile).find(entry => messageRole(entry) === "assistant");
 		expect(persisted?.message).toMatchObject({ responseAnchorId: message.responseAnchorId });
+	});
+
+	it("appends one bounded terminal correction without rewriting a large prior journal", async () => {
+		const cwd = makeTempDir("@pi-response-anchor-terminal-cwd-");
+		const manager = SessionManager.create(cwd, path.join(cwd, "sessions"));
+		const message = assistantMessage("settled after a large journal");
+		message.responseAnchorTerminal = false;
+		const assistantEntryId = manager.appendMessage(message);
+		let lastEntryId = assistantEntryId;
+		const payload = "x".repeat(512);
+		for (let i = 0; i < 2_048; i++) {
+			lastEntryId = manager.appendMessage({ role: "user", content: `${i}:${payload}`, timestamp: Date.now() });
+		}
+		manager.appendMessageToBranch(
+			{ role: "user", content: "off-branch tail", timestamp: Date.now() },
+			assistantEntryId,
+		);
+		const sessionFile = manager.getSessionFile();
+		if (!sessionFile || !message.responseAnchorId) throw new Error("Expected persisted response anchor");
+		const before = fs.readFileSync(sessionFile, "utf8");
+		expect(Buffer.byteLength(before)).toBeGreaterThan(1_000_000);
+
+		expect(await manager.setAssistantResponseAnchorTerminal(message, true)).toBe(true);
+		const after = fs.readFileSync(sessionFile, "utf8");
+		expect(after.slice(0, before.length)).toBe(before);
+		const correctionText = after.slice(before.length);
+		expect(Buffer.byteLength(correctionText)).toBeLessThanOrEqual(MAX_RESPONSE_ANCHOR_ID_BYTES + 128);
+		expect(correctionText.trimEnd().split("\n")).toHaveLength(1);
+		expect(JSON.parse(correctionText)).toEqual({
+			type: RESPONSE_ANCHOR_TERMINAL_ENTRY_TYPE,
+			responseAnchorId: message.responseAnchorId,
+			terminal: true,
+		});
+		await manager.close();
+
+		const reloaded = await SessionManager.open(sessionFile, path.dirname(sessionFile));
+		const reloadedAssistant = reloaded.getEntry(assistantEntryId);
+		if (reloadedAssistant?.type !== "message" || reloadedAssistant.message.role !== "assistant") {
+			throw new Error("Expected reloaded assistant");
+		}
+		expect(reloadedAssistant.message.responseAnchorTerminal).toBe(true);
+		await reloaded.rewriteEntries();
+		const canonicalEntries = readJsonl(sessionFile);
+		expect(canonicalEntries.some(entry => entry.type === RESPONSE_ANCHOR_TERMINAL_ENTRY_TYPE)).toBe(false);
+		expect(canonicalEntries.find(entry => entry.id === assistantEntryId)?.message).toMatchObject({
+			responseAnchorTerminal: true,
+		});
+		expect(reloaded.getLeafId()).toBe(lastEntryId);
+		await reloaded.close();
+	});
+
+	it("rejects terminal eligibility when the correction append fails", async () => {
+		const cwd = makeTempDir("@pi-response-anchor-terminal-failure-");
+		const manager = SessionManager.create(cwd, path.join(cwd, "sessions"));
+		const message = assistantMessage("must not become terminal without durability");
+		message.responseAnchorTerminal = false;
+		manager.appendMessage(message);
+		const writeSpy = spyOn(fs, "writeSync").mockImplementation(() => {
+			throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
+		});
+
+		try {
+			await expect(manager.setAssistantResponseAnchorTerminal(message, true)).rejects.toThrow("ENOSPC");
+		} finally {
+			writeSpy.mockRestore();
+		}
+		expect(message.responseAnchorTerminal).toBe(false);
+
+		manager.appendMessage({ role: "user", content: "recover journal", timestamp: Date.now() });
+		manager.flushSync();
+		await manager.close();
 	});
 
 	it("publishes fork and branch journals only after referenced artifacts are ready", async () => {

@@ -56,7 +56,7 @@ function createFixture(streamingMessage: AssistantMessage) {
 		settings,
 		statusLine: { invalidate: vi.fn() },
 		updateEditorTopBorder: vi.fn(),
-		streamingComponent: { updateContent: vi.fn(), markTranscriptBlockFinalized: vi.fn() },
+		streamingComponent: { updateContent: vi.fn(), markTranscriptBlockFinalized: vi.fn(), setResponseAnchor: vi.fn() },
 		streamingMessage,
 		transcriptMessageComponents: new WeakMap(),
 		pendingTools,
@@ -70,6 +70,7 @@ function createFixture(streamingMessage: AssistantMessage) {
 			hasBuiltInTool: () => true,
 			isTtsrAbortPending: false,
 			retryAttempt: 0,
+			agent: { transformAssistantMessage: undefined },
 		},
 		viewSession: {
 			getToolByName: () => undefined,

@@ -1,9 +1,11 @@
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { getBlobsDir, isEnoent, parseJsonlLenient } from "@oh-my-pi/pi-utils";
 import { BlobStore, isBlobRef, resolveImageData, resolveImageDataUrl } from "./blob-store";
+import { isSafeResponseAnchorId } from "./response-anchor";
 import { buildSessionContext } from "./session-context";
 import {
 	type FileEntry,
+	isResponseAnchorTerminalEntry,
 	isSessionEntry,
 	isSessionLeafEntry,
 	type RawFileEntry,
@@ -84,15 +86,17 @@ export function parseSessionContent(content: string): SessionLoadResult {
 	return { entries, titleSlot: slot, malformedRecords };
 }
 /**
- * Fold file-level leaf records into the tree state they select. A later tree
- * entry supersedes an earlier record, matching append-order semantics. Files
- * without a leaf record retain the legacy last-entry fallback.
+ * Fold file-level controls into transcript state. Terminal corrections mutate
+ * their assistant message without entering the tree; leaf controls select the
+ * active path. A later tree entry supersedes an earlier leaf record.
  */
 export function restoreSessionJournal(entries: readonly FileEntry[]): {
 	entries: SessionEntry[];
 	leafId: string | null | undefined;
 } {
 	const sessionEntries: SessionEntry[] = [];
+	const terminalByAnchorId = new Map<string, boolean>();
+	const assistantsByAnchorId = new Map<string, { responseAnchorTerminal?: boolean }>();
 	let leafId: string | null | undefined;
 	for (const entry of entries) {
 		if (entry.type === "session") continue;
@@ -100,9 +104,24 @@ export function restoreSessionJournal(entries: readonly FileEntry[]): {
 			leafId = entry.leafId === null || typeof entry.leafId === "string" ? entry.leafId : undefined;
 			continue;
 		}
+		if (isResponseAnchorTerminalEntry(entry)) {
+			if (!isSafeResponseAnchorId(entry.responseAnchorId) || typeof entry.terminal !== "boolean") continue;
+			terminalByAnchorId.set(entry.responseAnchorId, entry.terminal);
+			const message = assistantsByAnchorId.get(entry.responseAnchorId);
+			if (message) message.responseAnchorTerminal = entry.terminal;
+			continue;
+		}
 		if (isSessionEntry(entry)) {
 			sessionEntries.push(entry);
 			leafId = undefined;
+			if (entry.type === "message" && entry.message.role === "assistant") {
+				const responseAnchorId = entry.message.responseAnchorId;
+				if (isSafeResponseAnchorId(responseAnchorId)) {
+					assistantsByAnchorId.set(responseAnchorId, entry.message);
+					const terminal = terminalByAnchorId.get(responseAnchorId);
+					if (terminal !== undefined) entry.message.responseAnchorTerminal = terminal;
+				}
+			}
 		}
 	}
 	return { entries: sessionEntries, leafId };

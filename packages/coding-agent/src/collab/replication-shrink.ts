@@ -21,6 +21,7 @@
  * the cap unenforced for a payload built of many short strings, where no
  * field exceeds the per-string floor.
  */
+import { isSafeResponseAnchorId } from "../session/response-anchor";
 
 /**
  * Per-payload ceiling for host→guest frames. Local NDJSON bridge records are
@@ -91,19 +92,39 @@ function shrinkWalk(value: unknown, stringCap: number, arrayLimit: number): unkn
 	return value;
 }
 
+/** Restore bounded response identities on the two root wire shapes this helper shrinks: events and entries. */
+function restoreResponseAnchorIds(source: unknown, target: unknown): void {
+	if (!source || typeof source !== "object" || Array.isArray(source)) return;
+	if (!target || typeof target !== "object" || Array.isArray(target)) return;
+	const sourceRecord = source as Record<string, unknown>;
+	const targetRecord = target as Record<string, unknown>;
+	if (isSafeResponseAnchorId(sourceRecord.responseAnchorId)) {
+		targetRecord.responseAnchorId = sourceRecord.responseAnchorId;
+	}
+	const sourceMessage = sourceRecord.message;
+	const targetMessage = targetRecord.message;
+	if (!sourceMessage || typeof sourceMessage !== "object" || Array.isArray(sourceMessage)) return;
+	if (!targetMessage || typeof targetMessage !== "object" || Array.isArray(targetMessage)) return;
+	const nestedResponseAnchorId = (sourceMessage as Record<string, unknown>).responseAnchorId;
+	if (isSafeResponseAnchorId(nestedResponseAnchorId)) {
+		(targetMessage as Record<string, unknown>).responseAnchorId = nestedResponseAnchorId;
+	}
+}
+
 /**
  * Return `value` unchanged when its UTF-8 JSON serialization already fits
  * {@link MAX_REPLICATED_PAYLOAD_BYTES}; otherwise return a deep-cloned
  * shadow shrunk along both string and array axes until the payload fits.
  * The function is generic over `T` because the wire shape is preserved:
- * only string leaves and array tails change; discriminator fields, ids, and
- * other small metadata pass through untouched.
+ * only string leaves and array tails change. Valid `responseAnchorId` fields on
+ * the root event/entry and its immediate message are restored after every pass.
  */
 export function shrinkForReplication<T>(value: T): T {
 	if (Buffer.byteLength(JSON.stringify(value)) <= MAX_REPLICATED_PAYLOAD_BYTES) return value;
 	let shrunk: unknown = value;
 	for (const pass of SHRINK_PASSES) {
 		shrunk = shrinkWalk(value, pass.stringCap, pass.arrayLimit);
+		restoreResponseAnchorIds(value, shrunk);
 		if (Buffer.byteLength(JSON.stringify(shrunk)) <= MAX_REPLICATED_PAYLOAD_BYTES) return shrunk as T;
 	}
 	return shrunk as T;

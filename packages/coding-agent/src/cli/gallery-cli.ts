@@ -8,7 +8,7 @@
  * having to provoke each state through a live agent session.
  */
 import type { AgentTool } from "@oh-my-pi/pi-agent-core";
-import type { TUI } from "@oh-my-pi/pi-tui";
+import { prepareTerminalOutputLine, type TUI } from "@oh-my-pi/pi-tui";
 import { getProjectDir } from "@oh-my-pi/pi-utils";
 import { Settings } from "../config/settings";
 import { ToolExecutionComponent } from "../modes/components/tool-execution";
@@ -268,6 +268,11 @@ export async function runGalleryCommand(args: GalleryCommandArgs): Promise<void>
 
 	const lines = sections.flatMap(section => section.lines);
 	lines.push("");
-	const text = lines.map(line => (args.plain ? Bun.stripANSI(line) : line)).join("\n");
+	const text = lines
+		.map(line => {
+			const terminalLine = prepareTerminalOutputLine(line);
+			return args.plain ? Bun.stripANSI(terminalLine) : terminalLine;
+		})
+		.join("\n");
 	process.stdout.write(`${text}\n`);
 }

@@ -439,6 +439,47 @@ describe("AgentSession auto-compaction progress guard", () => {
 		expect(noProgress.length).toBe(0);
 	});
 
+	it("marks a queued continuation nonterminal after a settled Cursor exec-resolved tool call", async () => {
+		const agentEnds: Array<boolean | undefined> = [];
+		const agentEnd = Promise.withResolvers<void>();
+		session.subscribe(event => {
+			if (event.type !== "agent_end") return;
+			agentEnds.push(event.isTerminal);
+			agentEnd.resolve();
+		});
+		const cursorModel = getBundledModel("cursor", "composer-2.5");
+		if (!cursorModel) throw new Error("Expected built-in Cursor model to exist");
+		session.agent.setModel(cursorModel);
+		session.agent.followUp({
+			role: "user",
+			content: "Continue after compaction.",
+			timestamp: Date.now(),
+		});
+		vi.spyOn(session, "getContextUsage").mockReturnValue({ tokens: 1000, contextWindow: 200000, percent: 0.5 });
+		const assistantMsg = {
+			...highUsageAssistant(),
+			api: "cursor-agent" as const,
+			provider: "cursor" as const,
+			model: "composer-2.5",
+			content: [
+				{
+					type: "toolCall" as const,
+					id: "cursor-resolved-call",
+					name: "shell",
+					arguments: { command: "pwd" },
+					cursorExecResolved: true as const,
+				},
+			],
+		};
+		session.agent.emitExternalEvent({ type: "message_end", message: assistantMsg });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
+
+		await agentEnd.promise;
+
+		expect(agentEnds).toEqual([false]);
+		session.agent.clearAllQueues();
+	});
+
 	it("parks agent-attributed IRC when a user turn arrives after compaction selects goal continuation", async () => {
 		activateOngoingGoal("late-user-owner");
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined as never);

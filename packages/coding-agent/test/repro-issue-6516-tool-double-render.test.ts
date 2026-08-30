@@ -1,12 +1,13 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import { Agent } from "@oh-my-pi/pi-agent-core";
+import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ReadToolGroupComponent } from "@oh-my-pi/pi-coding-agent/modes/components/read-tool-group";
 import { ToolExecutionComponent } from "@oh-my-pi/pi-coding-agent/modes/components/tool-execution";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
-import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { buildSessionContext } from "@oh-my-pi/pi-coding-agent/session/session-context";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
@@ -215,39 +216,49 @@ describe("issue #6516 — tool output appears twice", () => {
 		expect(mode.pendingTools.get("call-1")).toBe(live);
 	});
 
-	it("keeps a still-running background task's live handle across a rebuild", () => {
+	it("keeps a parked background task at its transcript slot through streaming and idle rebuilds", async () => {
 		const runningDetails = { async: { state: "running", jobId: "job-1", type: "task" } };
+		const postToolText = "AFTER RUNNING TASK";
+		const laterText = "LATER COMMITTED RESPONSE";
+		const streamedAssistant: AssistantMessage = {
+			role: "assistant",
+			content: [
+				{ type: "toolCall", id: "call-1", name: "task", arguments: { description: "run", prompt: "go" } },
+				{ type: "text", text: postToolText },
+			],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			usage,
+			stopReason: "toolUse",
+			timestamp: 2,
+		};
+		const laterAssistant: AssistantMessage = {
+			...streamedAssistant,
+			content: [{ type: "text", text: laterText }],
+			stopReason: "stop",
+			timestamp: 5,
+		};
 		const entries: SessionEntry[] = [
 			{
 				type: "message",
 				id: "m1",
 				parentId: null,
-				timestamp: Date.now(),
+				timestamp: new Date().toISOString(),
 				message: { role: "user", content: [{ type: "text", text: "spawn it" }], timestamp: 1 },
 			},
 			{
 				type: "message",
 				id: "m2",
 				parentId: "m1",
-				timestamp: Date.now(),
-				message: {
-					role: "assistant",
-					content: [
-						{ type: "toolCall", id: "call-1", name: "task", arguments: { description: "run", prompt: "go" } },
-					],
-					api: "anthropic-messages",
-					provider: "anthropic",
-					model: "claude-sonnet-4-5",
-					usage,
-					stopReason: "toolUse",
-					timestamp: 2,
-				},
+				timestamp: new Date().toISOString(),
+				message: streamedAssistant,
 			},
 			{
 				type: "message",
 				id: "m3",
 				parentId: "m2",
-				timestamp: Date.now(),
+				timestamp: new Date().toISOString(),
 				message: {
 					role: "toolResult",
 					toolCallId: "call-1",
@@ -260,10 +271,15 @@ describe("issue #6516 — tool output appears twice", () => {
 			},
 		] as unknown as SessionEntry[];
 
-		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => true });
-		vi.spyOn(session, "buildTranscriptSessionContext").mockReturnValue(
+		let streaming = true;
+		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => streaming });
+		vi.spyOn(session, "buildTranscriptSessionContext").mockImplementation(() =>
 			buildSessionContext(entries, undefined, undefined, { transcript: true }),
 		);
+		await mode.eventController.handleEvent({
+			type: "message_start",
+			message: { ...streamedAssistant, content: [] },
+		} as AgentSessionEvent);
 
 		const live = new ToolExecutionComponent(
 			"task",
@@ -274,22 +290,97 @@ describe("issue #6516 — tool output appears twice", () => {
 			tempDir.path(),
 			"call-1",
 		);
-		live.updateResult(
-			{ content: [{ type: "text", text: "running…" }], details: runningDetails, isError: false },
-			true,
-			"call-1",
-		);
 		created.push(live);
 		mode.chatContainer.addChild(live);
 		mode.pendingTools.set("call-1", live);
+		await mode.eventController.handleEvent({
+			type: "message_update",
+			message: streamedAssistant,
+		} as AgentSessionEvent);
+		await mode.eventController.handleEvent({
+			type: "tool_execution_end",
+			toolCallId: "call-1",
+			toolName: "task",
+			result: { content: [{ type: "text", text: "running…" }], details: runningDetails, isError: false },
+			isError: false,
+		} as AgentSessionEvent);
+
+		const beforePostTool = mode.chatContainer.children.find(child =>
+			Bun.stripANSI(child.render(120).join("\n")).includes(postToolText),
+		);
+		expect(beforePostTool).toBeDefined();
+		if (!beforePostTool) throw new Error("post-tool text was not rendered before rebuild");
+		expect(mode.chatContainer.children.indexOf(live)).toBeLessThan(
+			mode.chatContainer.children.indexOf(beforePostTool),
+		);
 
 		mode.rebuildChatFromMessages();
 
-		// The still-running task's live handle must survive the rebuild so a later
-		// tool_execution_update/_end settles it instead of stranding on "running",
-		// without also leaving the replayed snapshot on screen.
+		const streamedPostTool = mode.chatContainer.children.find(child =>
+			Bun.stripANSI(child.render(120).join("\n")).includes(postToolText),
+		);
 		expect(mode.pendingTools.get("call-1")).toBe(live);
 		expect(mode.chatContainer.children.filter(child => child instanceof ToolExecutionComponent)).toHaveLength(1);
+		expect(streamedPostTool).toBe(beforePostTool);
+		if (!streamedPostTool) throw new Error("post-tool text was not preserved across streaming rebuild");
+		expect(mode.chatContainer.children.indexOf(live)).toBeLessThan(
+			mode.chatContainer.children.indexOf(streamedPostTool),
+		);
+
+		streaming = false;
+		await mode.eventController.handleEvent({
+			type: "agent_end",
+			messages: [streamedAssistant],
+			isTerminal: true,
+			responseAnchorTerminal: true,
+		} as AgentSessionEvent);
+		entries.push(
+			{
+				type: "message",
+				id: "m4",
+				parentId: "m3",
+				timestamp: new Date().toISOString(),
+				message: { role: "user", content: [{ type: "text", text: "keep going" }], timestamp: 4 },
+			},
+			{
+				type: "message",
+				id: "m5",
+				parentId: "m4",
+				timestamp: new Date().toISOString(),
+				message: laterAssistant,
+			},
+		);
+
+		mode.rebuildChatFromMessages();
+
+		const idlePostTool = mode.chatContainer.children.find(child =>
+			Bun.stripANSI(child.render(120).join("\n")).includes(postToolText),
+		);
+		const laterComponent = mode.chatContainer.children.find(child =>
+			Bun.stripANSI(child.render(120).join("\n")).includes(laterText),
+		);
+		expect(mode.pendingTools.get("call-1")).toBe(live);
+		expect(idlePostTool).toBeDefined();
+		expect(laterComponent).toBeDefined();
+		if (!idlePostTool || !laterComponent) throw new Error("idle transcript markers were not replayed");
+		expect(mode.chatContainer.children.indexOf(live)).toBeLessThan(mode.chatContainer.children.indexOf(idlePostTool));
+		expect(mode.chatContainer.children.indexOf(idlePostTool)).toBeLessThan(
+			mode.chatContainer.children.indexOf(laterComponent),
+		);
+		expect(Bun.stripANSI(mode.chatContainer.render(120).join("\n")).split(postToolText)).toHaveLength(2);
+
+		await mode.eventController.handleEvent({
+			type: "tool_execution_update",
+			toolCallId: "call-1",
+			toolName: "task",
+			args: {},
+			partialResult: {
+				content: [{ type: "text", text: "Background task complete." }],
+				details: { async: { state: "completed", jobId: "job-1", type: "task" } },
+				isError: false,
+			},
+		} as AgentSessionEvent);
+		expect(mode.pendingTools.has("call-1")).toBe(false);
 	});
 
 	it("keeps a shared read group attached while a sibling read is still in flight", () => {

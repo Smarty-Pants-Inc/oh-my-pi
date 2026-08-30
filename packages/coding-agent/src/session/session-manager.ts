@@ -52,7 +52,9 @@ import {
 	type ModeChangeEntry,
 	type ModelChangeEntry,
 	type NewSessionOptions,
+	RESPONSE_ANCHOR_TERMINAL_ENTRY_TYPE,
 	type ResetBoundaryEntry,
+	type ResponseAnchorTerminalEntry,
 	SESSION_LEAF_ENTRY_TYPE,
 	type ServiceTierChangeEntry,
 	type SessionEntry,
@@ -223,12 +225,8 @@ function isAssistantEntry(entry: SessionEntry): entry is SessionMessageEntry & {
 
 function stampLoadedAssistantResponseAnchor(entry: SessionEntry): void {
 	if (!isAssistantEntry(entry)) return;
-	// Old journals have no explicit agent-end terminality. A response anchor
-	// already written by the earlier final-reply feature is the only durable
-	// legacy signal worth preserving; ids synthesized during load stay unknown.
-	if (entry.message.responseAnchorTerminal === undefined && isSafeResponseAnchorId(entry.message.responseAnchorId)) {
-		entry.message.responseAnchorTerminal = true;
-	}
+	// Identity alone never proves that an old assistant ended the run: the
+	// durable-ID feature stamped every assistant, including continuation turns.
 	stampAssistantResponseAnchorId(entry.message, entry.id);
 }
 
@@ -2598,6 +2596,7 @@ export class SessionManager {
 	 * replicas, whose deserialized message object is distinct.
 	 */
 	async setAssistantResponseAnchorTerminal(message: AssistantMessage, isTerminal: boolean): Promise<boolean> {
+		if (this.#released) return false;
 		let matchingEntry = this.#entries.find(
 			(entry): entry is SessionMessageEntry & { message: AssistantMessage } =>
 				isAssistantEntry(entry) && entry.message === message,
@@ -2611,12 +2610,27 @@ export class SessionManager {
 				}
 			}
 		}
-		if (!matchingEntry) return false;
-		const changed = matchingEntry.message.responseAnchorTerminal !== isTerminal;
+		if (!matchingEntry || !isSafeResponseAnchorId(matchingEntry.message.responseAnchorId)) return false;
+		const previousEntryTerminal = matchingEntry.message.responseAnchorTerminal;
+		const previousMessageTerminal = message.responseAnchorTerminal;
 		matchingEntry.message.responseAnchorTerminal = isTerminal;
 		if (matchingEntry.message !== message) message.responseAnchorTerminal = isTerminal;
-		if (changed) await this.rewriteEntries();
-		return true;
+		if (previousEntryTerminal === isTerminal) return true;
+
+		const correction: ResponseAnchorTerminalEntry = {
+			type: RESPONSE_ANCHOR_TERMINAL_ENTRY_TYPE,
+			responseAnchorId: matchingEntry.message.responseAnchorId,
+			terminal: isTerminal,
+		};
+		try {
+			this.#appendToSessionFile(correction);
+			await this.flush();
+			return true;
+		} catch (error) {
+			matchingEntry.message.responseAnchorTerminal = previousEntryTerminal;
+			if (matchingEntry.message !== message) message.responseAnchorTerminal = previousMessageTerminal;
+			throw error;
+		}
 	}
 
 	/**

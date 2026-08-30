@@ -54,7 +54,7 @@ describe("AgentSession subscriber event order", () => {
 		vi.restoreAllMocks();
 	});
 
-	it("delivers message_start before message_end when extension handlers are asymmetric", async () => {
+	it("delivers ordered events and a terminal lifecycle for an unjournaled classifier refusal", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled test model to exist");
 
@@ -95,24 +95,31 @@ describe("AgentSession subscriber event order", () => {
 
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
-			"retry.baseDelayMs": 5,
-			"retry.maxRetries": 1,
+			"retry.enabled": false,
 			"retry.modelFallback": false,
 		});
 		settings.setModelRole("default", `${model.provider}/${model.id}`);
 
+		const sessionManager = SessionManager.inMemory();
 		session = new AgentSession({
 			agent,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager,
 			settings,
 			modelRegistry,
 			extensionRunner,
 		});
 
 		const order: string[] = [];
+		const agentEnds: Array<{ isTerminal: boolean | undefined; responseAnchorTerminal: boolean | undefined }> = [];
 		session.subscribe(event => {
 			if (event.type === "message_start" || event.type === "message_end") {
 				order.push(`${event.type}:${event.message.role}`);
+			}
+			if (event.type === "agent_end") {
+				agentEnds.push({
+					isTerminal: event.isTerminal,
+					responseAnchorTerminal: event.responseAnchorTerminal,
+				});
 			}
 		});
 
@@ -125,6 +132,10 @@ describe("AgentSession subscriber event order", () => {
 			expect(startIndex).toBeGreaterThanOrEqual(0);
 			expect(endIndex).toBeGreaterThan(startIndex);
 		}
+		expect(agentEnds).toEqual([{ isTerminal: true, responseAnchorTerminal: false }]);
+		expect(sessionManager.getEntries()).not.toContainEqual(
+			expect.objectContaining({ type: "message", message: expect.objectContaining({ role: "assistant" }) }),
+		);
 	});
 
 	it("preserves every completion from a batch of exclusive todo calls", async () => {

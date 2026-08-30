@@ -55,6 +55,7 @@ function createStreamingFixture() {
 			setHideThinkingBlock: vi.fn(),
 			markTranscriptBlockFinalized: vi.fn(),
 			updateContent: vi.fn(),
+			setResponseAnchor: vi.fn(),
 		},
 		noteDisplayableThinkingContent: vi.fn(() => false),
 		ensureLoadingAnimation: vi.fn(),
@@ -63,6 +64,7 @@ function createStreamingFixture() {
 		setWorkingMessage: vi.fn(),
 		viewSession,
 		session: {
+			agent: { transformAssistantMessage: undefined },
 			subscribe: (listener: (event: AgentSessionEvent) => void) => {
 				listeners.push(listener);
 				return () => {};

@@ -12,11 +12,19 @@ export const SESSION_TITLE_SLOT_ENTRY_TYPE = "title";
 
 export const TITLE_CHANGE_ENTRY_TYPE = "title_change";
 export const SESSION_LEAF_ENTRY_TYPE = "session_leaf";
+export const RESPONSE_ANCHOR_TERMINAL_ENTRY_TYPE = "response_anchor_terminal";
 
 /** Journal control record that durably selects the active tree leaf without changing transcript history. */
 export interface SessionLeafEntry {
 	type: typeof SESSION_LEAF_ENTRY_TYPE;
 	leafId: string | null;
+}
+
+/** File-level correction folded into its assistant message without changing transcript tree state. */
+export interface ResponseAnchorTerminalEntry {
+	type: typeof RESPONSE_ANCHOR_TERMINAL_ENTRY_TYPE;
+	responseAnchorId: string;
+	terminal: boolean;
 }
 
 export type SessionTitleSource = "auto" | "user";
@@ -311,16 +319,25 @@ export type SessionEntry =
 	| ResetBoundaryEntry;
 
 /** Raw logical file entry after loaders strip any fixed-width title slot. */
-export type FileEntry = SessionHeader | SessionEntry | SessionLeafEntry;
+export type FileEntry = SessionHeader | SessionEntry | SessionLeafEntry | ResponseAnchorTerminalEntry;
 
 /** True for transcript/tree entries, excluding header and file-level leaf control records. */
 export function isSessionEntry(entry: FileEntry): entry is SessionEntry {
-	return entry.type !== "session" && entry.type !== SESSION_LEAF_ENTRY_TYPE;
+	return (
+		entry.type !== "session" &&
+		entry.type !== SESSION_LEAF_ENTRY_TYPE &&
+		entry.type !== RESPONSE_ANCHOR_TERMINAL_ENTRY_TYPE
+	);
 }
 
 /** True for the file-level active-leaf control record. */
 export function isSessionLeafEntry(entry: FileEntry): entry is SessionLeafEntry {
 	return entry.type === SESSION_LEAF_ENTRY_TYPE;
+}
+
+/** True for a file-level assistant response terminality correction. */
+export function isResponseAnchorTerminalEntry(entry: FileEntry): entry is ResponseAnchorTerminalEntry {
+	return entry.type === RESPONSE_ANCHOR_TERMINAL_ENTRY_TYPE;
 }
 
 /** Physical JSONL entry before slot-aware loaders fold the title slot. */

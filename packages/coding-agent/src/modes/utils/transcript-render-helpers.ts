@@ -5,7 +5,7 @@
  * here keeps the two byte-for-byte identical.
  */
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import { isCursorExecResolved } from "@oh-my-pi/pi-ai/utils/block-symbols";
+import { isCursorExecResolvedReplay } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { type Component, Text } from "@oh-my-pi/pi-tui";
 import { formatBytes, formatDuration } from "@oh-my-pi/pi-utils";
 import type { AsyncJobType } from "../../async";
@@ -228,7 +228,7 @@ export function splitAssistantMessageToolTimeline(message: AssistantAgentMessage
 	const strippedToolCalls = (message as AssistantAgentMessage & { strippedToolCalls?: number }).strippedToolCalls ?? 0;
 	const hasUnresolvedToolCalls =
 		strippedToolCalls > 0 ||
-		message.content.some(content => content.type === "toolCall" && !isCursorExecResolved(content));
+		message.content.some(content => content.type === "toolCall" && !isCursorExecResolvedReplay(message, content));
 	const replyEligible =
 		message.stopReason !== "aborted" &&
 		message.stopReason !== "error" &&

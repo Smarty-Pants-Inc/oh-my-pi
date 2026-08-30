@@ -4,6 +4,7 @@
  * Handles `omp q`/`omp web-search` subcommands for testing web search providers.
  */
 
+import { prepareTerminalOutputLine } from "@oh-my-pi/pi-tui";
 import { APP_NAME, getProjectDir } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { applyProviderGlobalsFromSettings } from "../config/provider-globals";
@@ -106,7 +107,7 @@ export async function runSearchCommand(cmd: SearchCommandArgs): Promise<void> {
 	});
 
 	const width = Math.max(60, process.stdout.columns ?? 100);
-	process.stdout.write(`${component.render(width).join("\n")}\n`);
+	process.stdout.write(`${component.render(width).map(prepareTerminalOutputLine).join("\n")}\n`);
 
 	if (result.details?.error) {
 		process.exitCode = 1;

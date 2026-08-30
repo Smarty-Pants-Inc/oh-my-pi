@@ -14,6 +14,10 @@ export type AgentSessionEvent =
 	| (Extract<AgentEvent, { type: "agent_end" }> & {
 			/** False when an async delivery will resume the session before its true final settle. */
 			isTerminal?: boolean;
+			/** Durable identity of the settled response's replay anchor. */
+			responseAnchorId?: string;
+			/** Replay-anchor terminality, independently of the session lifecycle. */
+			responseAnchorTerminal?: boolean;
 	  })
 	| {
 			type: "auto_compaction_start";

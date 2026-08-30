@@ -625,13 +625,18 @@ export class CollabGuestLink {
 	}
 
 	#applyEvent(event: AgentSessionEvent): void {
-		if (event.type === "agent_end") {
-			const assistant = [...event.messages]
-				.reverse()
-				.find((message): message is AssistantMessage => message.role === "assistant");
-			if (assistant?.responseAnchorTerminal !== undefined) {
+		if (
+			event.type === "agent_end" &&
+			event.responseAnchorId !== undefined &&
+			event.responseAnchorTerminal !== undefined
+		) {
+			const assistant = this.#ctx.session.messages.find(
+				(message): message is AssistantMessage =>
+					message.role === "assistant" && message.responseAnchorId === event.responseAnchorId,
+			);
+			if (assistant) {
 				void this.#ctx.sessionManager
-					.setAssistantResponseAnchorTerminal(assistant, assistant.responseAnchorTerminal)
+					.setAssistantResponseAnchorTerminal(assistant, event.responseAnchorTerminal)
 					.catch(error => logger.warn("Failed to mirror collab response terminality", { error }));
 			}
 		}

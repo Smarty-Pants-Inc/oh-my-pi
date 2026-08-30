@@ -2132,32 +2132,35 @@ export class InteractiveMode implements InteractiveModeContext {
 		// references — subsequent `message_update`/`message_end` events would then
 		// update orphaned components that never re-render and the live LLM output
 		// vanishes from the chat (#3656). Snapshot the in-flight components,
-		// clear+replay, then re-append them in their original chat-container order
-		// and restore the `pendingTools` map so streaming routes back into them.
+		// then replay matching post-tool assistant blocks beside their tool calls;
+		// only unmatched live blocks remain at the tail for continued streaming.
 		const liveComponents: Component[] = [];
 		const livePendingTools = new Map<string, ToolExecutionHandle>();
-		const preservedLivePostToolCallIds = new Set<string>();
-		const preservedLiveResponseAnchorCandidate = this.viewSession?.isStreaming
+		const preservedLivePostToolComponents = new Map<string, AssistantMessageComponent>();
+		const isStreaming = this.viewSession?.isStreaming === true;
+		const preservedLiveResponseAnchorCandidate = isStreaming
 			? this.eventController.liveLeadingResponseAnchorCandidate()
 			: undefined;
-		if (this.viewSession?.isStreaming) {
-			const liveSet = new Set<Component>();
-			const livePostToolCallIds = new Map<Component, string>();
-			if (this.streamingComponent) liveSet.add(this.streamingComponent);
-			for (const [toolCallId, component] of this.eventController.livePostToolAssistantSegments()) {
-				liveSet.add(component);
-				livePostToolCallIds.set(component, toolCallId);
-			}
-			for (const [id, component] of this.pendingTools) {
-				livePendingTools.set(id, component);
-				liveSet.add(component as unknown as Component);
-			}
-			if (liveSet.size > 0) {
-				for (const child of this.chatContainer.children) {
-					if (!liveSet.has(child)) continue;
-					liveComponents.push(child);
-					const toolCallId = livePostToolCallIds.get(child);
-					if (toolCallId !== undefined) preservedLivePostToolCallIds.add(toolCallId);
+		const liveSet = new Set<Component>();
+		const livePostToolCallIds = new Map<Component, string>();
+		if (isStreaming && this.streamingComponent) liveSet.add(this.streamingComponent);
+		for (const [toolCallId, component] of this.eventController.livePostToolAssistantSegments()) {
+			liveSet.add(component);
+			livePostToolCallIds.set(component, toolCallId);
+		}
+		// Parked background tasks remain pending after the primary response goes
+		// idle, so their handles must survive rebuilds independently of isStreaming.
+		for (const [id, component] of this.pendingTools) {
+			livePendingTools.set(id, component);
+			liveSet.add(component as unknown as Component);
+		}
+		if (liveSet.size > 0) {
+			for (const child of this.chatContainer.children) {
+				if (!liveSet.has(child)) continue;
+				liveComponents.push(child);
+				const toolCallId = livePostToolCallIds.get(child);
+				if (toolCallId !== undefined) {
+					preservedLivePostToolComponents.set(toolCallId, child as AssistantMessageComponent);
 				}
 			}
 		}
@@ -2168,7 +2171,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		const context = this.viewSession.buildTranscriptSessionContext({
 			collapseCompactedHistory: settings.get("display.collapseCompacted"),
 		});
-		const preservedLiveToolCallIds = new Set<string>();
+		const preservedLiveToolComponents = new Map<string, Component>();
 		// A preserved pending-tool component whose result has already landed in
 		// the replayed transcript is re-rendered by `renderSessionContext` itself
 		// (the toolResult message reconstructs the block with its output). Keeping
@@ -2195,7 +2198,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			// detail reads in tool-execution.ts / event-controller.ts.)
 			const details = message.details as { async?: { state?: string } } | undefined;
 			if (details?.async?.state === "running") {
-				preservedLiveToolCallIds.add(message.toolCallId);
+				preservedLiveToolComponents.set(message.toolCallId, resolved as unknown as Component);
 				continue;
 			}
 			livePendingTools.delete(message.toolCallId);
@@ -2214,12 +2217,36 @@ export class InteractiveMode implements InteractiveModeContext {
 			}
 			if (stillShared) {
 				// The shared component still owns this completed member as well as
-				// its pending sibling. Suppress the replay copy so the group remains
-				// a single on-screen block while future results keep routing to it.
-				preservedLiveToolCallIds.add(message.toolCallId);
+				// its pending sibling. Reattach it at the completed member's slot so
+				// later committed transcript content keeps its chronological place.
+				preservedLiveToolComponents.set(message.toolCallId, resolved as unknown as Component);
 				continue;
 			}
 			const index = liveComponents.indexOf(resolved as unknown as Component);
+			if (index >= 0) liveComponents.splice(index, 1);
+		}
+		const replayedToolCallIds = new Set<string>();
+		for (const message of context.messages) {
+			if (message.role !== "assistant") continue;
+			for (const content of message.content) {
+				if (content.type === "toolCall") replayedToolCallIds.add(content.id);
+			}
+		}
+		for (const [toolCallId, component] of livePendingTools) {
+			if (replayedToolCallIds.has(toolCallId)) {
+				preservedLiveToolComponents.set(toolCallId, component as unknown as Component);
+			}
+		}
+		for (const component of new Set(preservedLiveToolComponents.values())) {
+			const index = liveComponents.indexOf(component);
+			if (index >= 0) liveComponents.splice(index, 1);
+		}
+		for (const [toolCallId, component] of preservedLivePostToolComponents) {
+			if (!replayedToolCallIds.has(toolCallId)) {
+				preservedLivePostToolComponents.delete(toolCallId);
+				continue;
+			}
+			const index = liveComponents.indexOf(component);
 			if (index >= 0) liveComponents.splice(index, 1);
 		}
 		// Prune the settled-component cache to the messages this rebuild will
@@ -2235,8 +2262,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.transcriptMessageComponents = retained;
 		this.renderSessionContext(context, {
 			reuseSettledComponents: options.reuseSettledComponents,
-			preservedLiveToolCallIds,
-			preservedLivePostToolCallIds,
+			preservedLiveToolComponents,
+			preservedLivePostToolComponents,
 			preservedLiveResponseAnchorCandidate,
 		});
 		for (const child of liveComponents) {
