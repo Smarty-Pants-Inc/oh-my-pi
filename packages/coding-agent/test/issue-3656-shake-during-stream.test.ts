@@ -546,7 +546,16 @@ describe("issue #3656 /shake mid-stream preserves the in-flight assistant turn",
 		expect(raw).not.toContain("\x1b]133;A;aid=omp-response-");
 		expect(mode.chatContainer.children).toContain(candidate);
 
+		const rewrittenReply = "NO TOOL TERMINAL REPLY REWRITTEN BY MAINTENANCE";
+		persisted.content = [{ type: "text", text: rewrittenReply }];
+		completed.content = [{ type: "text", text: rewrittenReply }];
 		streaming = false;
+		mode.rebuildChatFromMessages();
+		raw = mode.chatContainer.render(120).join("\n");
+		expect(Bun.stripANSI(raw)).not.toContain(reply);
+		expect(Bun.stripANSI(raw).split(rewrittenReply)).toHaveLength(2);
+		expect(raw).not.toContain("\x1b]133;A;aid=omp-response-");
+		expect(mode.chatContainer.children).toContain(candidate);
 		await mode.eventController.handleEvent({
 			type: "agent_end",
 			messages: [completed],
@@ -555,7 +564,7 @@ describe("issue #3656 /shake mid-stream preserves the in-flight assistant turn",
 		} as AgentSessionEvent);
 
 		raw = mode.chatContainer.render(120).join("\n");
-		expect(Bun.stripANSI(raw).split(reply)).toHaveLength(2);
+		expect(Bun.stripANSI(raw).split(rewrittenReply)).toHaveLength(2);
 		expect(raw.split("\x1b]133;A;aid=omp-response-")).toHaveLength(2);
 
 		mode.rebuildChatFromMessages();

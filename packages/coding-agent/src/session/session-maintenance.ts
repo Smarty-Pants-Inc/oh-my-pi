@@ -243,6 +243,8 @@ interface AutoCompactionOptions {
 	terminalTextAnswer?: boolean;
 	/** Lets a deferred handoff publish the actual continuation decision before it starts a new turn. */
 	onContinuationScheduled?: (scheduled: boolean) => Promise<void>;
+	/** Correct the published settle if continuation ownership is superseded. */
+	onContinuationSuperseded?: () => Promise<void>;
 	/** Mid-turn: splice history then return; do not await UI/extension fan-out. */
 	detachPostCommit?: boolean;
 	semanticDeliveryAcceptance?: Promise<void>;
@@ -328,6 +330,7 @@ export interface SessionMaintenanceHost {
 		terminalTextAnswer: boolean;
 		suppressContinuation: boolean;
 		onContinuationScheduled?: (scheduled: boolean) => Promise<void>;
+		onContinuationSuperseded?: () => Promise<void>;
 	}): boolean | Promise<boolean>;
 	persistTurnMessagesForMidRunCompaction(context: AgentTurnEndContext | undefined): Promise<boolean>;
 	findLastAssistantMessage(): AssistantMessage | undefined;
@@ -365,7 +368,11 @@ export interface SessionMaintenanceHost {
 		reason: "overflow" | "incomplete",
 		message: AssistantMessage,
 		allowDefer: boolean,
-		options: { autoContinue: boolean; triggerContextTokens?: number },
+		options: {
+			autoContinue: boolean;
+			triggerContextTokens?: number;
+			onContinuationSuperseded?: () => Promise<void>;
+		},
 	): Promise<CompactionCheckResult>;
 	parseRetryAfterMsFromError(errorMessage: string): number | undefined;
 	setModelTemporary(
@@ -1864,9 +1871,10 @@ export class SessionMaintenance {
 	 * @param allowDefer If true, a threshold-driven handoff preference may schedule
 	 *   itself as a deferred post-prompt task instead of running inline. Callers running
 	 *   inside the `agent_end` handler set this to true so `session.prompt()` resolves
-	 *   cleanly; callers on the pre-prompt path (where the next agent turn is about to
-	 *   start) set it to false to avoid racing the deferred handoff against the new turn.
+	 *   cleanly; callers on the pre-prompt path set it to false to avoid racing the
+	 *   deferred handoff against the new turn.
 	 * @param autoContinue Whether maintenance may schedule the agent-authored continuation prompt.
+	 * @param continuation Correction callback for a published continuation.
 	 * @returns whether compaction/recovery scheduled a handoff, retry, auto-continue, or
 	 *   queued-message drain that already owns the next turn. Callers MUST skip
 	 *   `session_stop` and other agent continuations when `continuationScheduled`
@@ -1877,6 +1885,7 @@ export class SessionMaintenance {
 		skipAbortedCheck = true,
 		allowDefer = true,
 		autoContinue = true,
+		continuation?: Pick<AutoCompactionOptions, "onContinuationSuperseded">,
 	): Promise<CompactionCheckResult> {
 		// Skip if message was aborted (user cancelled) - unless skipAbortedCheck is false
 		if (skipAbortedCheck && assistantMessage.stopReason === "aborted") return COMPACTION_CHECK_NONE;
@@ -1938,6 +1947,7 @@ export class SessionMaintenance {
 			if (compactionSettings.enabled && hasConfiguredCompactionMethod(compactionSettings)) {
 				return await this.#host.runRecoveryCompactionWithRollback("overflow", assistantMessage, allowDefer, {
 					autoContinue,
+					...continuation,
 				});
 			}
 			if (payloadRejection) {
@@ -2034,6 +2044,7 @@ export class SessionMaintenance {
 				return await this.#host.runRecoveryCompactionWithRollback("incomplete", assistantMessage, allowDefer, {
 					autoContinue,
 					triggerContextTokens: calculateContextTokens(assistantMessage.usage),
+					...continuation,
 				});
 			}
 			// Neither promotion nor compaction is available — surface the dead-end so
@@ -2128,6 +2139,7 @@ export class SessionMaintenance {
 					triggerContextTokens: postMaintenanceContextTokens,
 					phase: "pre_turn",
 					terminalTextAnswer: isTerminalTextAssistantAnswer(assistantMessage),
+					...continuation,
 				});
 			}
 			logger.debug("Auto-compaction threshold satisfied but context promotion took over", {
@@ -3047,6 +3059,7 @@ export class SessionMaintenance {
 				suppressContinuation,
 				options.detachPostCommit === true,
 				options.onContinuationScheduled,
+				options.onContinuationSuperseded,
 			);
 			if (outcome !== "fallback") return outcome;
 			return await this.#runAutoCompactionAttempt(
@@ -3168,6 +3181,7 @@ export class SessionMaintenance {
 					terminalTextAnswer,
 					suppressContinuation,
 					onContinuationScheduled: options.onContinuationScheduled,
+					onContinuationSuperseded: options.onContinuationSuperseded,
 					fallbackFromShake,
 					detachPostCommit: options.detachPostCommit === true,
 					autoCompactionSignal,
@@ -3324,6 +3338,7 @@ export class SessionMaintenance {
 							terminalTextAnswer,
 							suppressContinuation,
 							onContinuationScheduled: options.onContinuationScheduled,
+							onContinuationSuperseded: options.onContinuationSuperseded,
 						});
 					} else {
 						continuationScheduled = await this.#host.scheduleCompactionContinuation({
@@ -3332,6 +3347,7 @@ export class SessionMaintenance {
 							terminalTextAnswer,
 							suppressContinuation,
 							onContinuationScheduled: options.onContinuationScheduled,
+							onContinuationSuperseded: options.onContinuationSuperseded,
 						});
 					}
 					if (deadEndWarning) {
@@ -3779,6 +3795,7 @@ export class SessionMaintenance {
 				terminalTextAnswer,
 				suppressContinuation,
 				onContinuationScheduled: options.onContinuationScheduled,
+				onContinuationSuperseded: options.onContinuationSuperseded,
 				fallbackFromShake,
 				detachPostCommit: options.detachPostCommit === true,
 				autoCompactionSignal,
@@ -3872,6 +3889,7 @@ export class SessionMaintenance {
 		generation: number;
 		shouldAutoContinue: boolean;
 		onContinuationScheduled?: (scheduled: boolean) => Promise<void>;
+		onContinuationSuperseded?: () => Promise<void>;
 		terminalTextAnswer: boolean;
 		suppressContinuation: boolean;
 		fallbackFromShake: boolean;
@@ -4027,6 +4045,7 @@ export class SessionMaintenance {
 				terminalTextAnswer: args.terminalTextAnswer,
 				suppressContinuation: args.suppressContinuation,
 				onContinuationScheduled: args.onContinuationScheduled,
+				onContinuationSuperseded: args.onContinuationSuperseded,
 			});
 		}
 
@@ -4057,6 +4076,7 @@ export class SessionMaintenance {
 		suppressContinuation = false,
 		detachPostCommit = false,
 		onContinuationScheduled?: (scheduled: boolean) => Promise<void>,
+		onContinuationSuperseded?: () => Promise<void>,
 	): Promise<CompactionCheckResult | "fallback"> {
 		const action = "shake";
 		try {
@@ -4165,6 +4185,7 @@ export class SessionMaintenance {
 					terminalTextAnswer,
 					suppressContinuation,
 					onContinuationScheduled,
+					onContinuationSuperseded,
 				});
 			}
 			if (!reclaimed) {

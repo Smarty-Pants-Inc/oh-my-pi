@@ -1,5 +1,12 @@
 import { describe, expect, it } from "bun:test";
-import { type Component, createResponseZoneLine, Markdown, TUI } from "@oh-my-pi/pi-tui";
+import {
+	type Component,
+	CURSOR_MARKER,
+	createResponseZoneLine,
+	Markdown,
+	type TerminalFrameProvider,
+	TUI,
+} from "@oh-my-pi/pi-tui";
 import type { Terminal, TerminalAppearance } from "@oh-my-pi/pi-tui/terminal";
 import { defaultMarkdownTheme } from "./test-themes";
 
@@ -39,6 +46,10 @@ class CaptureTerminal implements Terminal {
 
 	get appearance(): TerminalAppearance | undefined {
 		return undefined;
+	}
+	resize(columns: number, rows: number): void {
+		this.#columns = columns;
+		this.#rows = rows;
 	}
 
 	start(): void {}
@@ -203,6 +214,44 @@ describe("issue #2045: renderer bounds oversized rows", () => {
 		expect(rendered).not.toContain("\x1b]133;");
 	});
 
+	it("strips terminal-equivalent OSC 133 with ignored command controls", async () => {
+		const term = new CaptureTerminal(80, 4);
+		const tui = new TUI(term);
+		tui.addChild(new RawLinesComponent(["before\x1b]\x0013\r3;A;aid=omp-response-evil:reply\x07after"]));
+		try {
+			tui.start();
+			await settle();
+		} finally {
+			tui.stop();
+		}
+
+		const rendered = term.writes.join("");
+		expect(rendered).not.toContain("aid=omp-response-evil");
+		expect(Bun.stripANSI(rendered)).toContain("beforeafter");
+	});
+
+	it("preserves response-zone authority while stripping cursor-like content", async () => {
+		const term = new CaptureTerminal(80, 4);
+		const tui = new TUI(term);
+		tui.addChild(
+			new RawLinesComponent([
+				createResponseZoneLine(`before${CURSOR_MARKER}after`, { responseAnchorId: "anchor", close: true }),
+			]),
+		);
+		try {
+			tui.start();
+			await settle();
+		} finally {
+			tui.stop();
+		}
+
+		const rendered = term.writes.join("");
+		expect(rendered).toContain(RESPONSE_ZONE_START);
+		expect(rendered).toContain(RESPONSE_ZONE_CLOSE);
+		expect(rendered).not.toContain(CURSOR_MARKER);
+		expect(Bun.stripANSI(rendered)).toContain("beforeafter");
+	});
+
 	it("rejects unsafe response anchor IDs in the structured channel", () => {
 		expect(() => createResponseZoneLine("reply", { responseAnchorId: "evil:reply" })).toThrow();
 	});
@@ -288,6 +337,51 @@ describe("issue #2045: renderer bounds oversized rows", () => {
 			expect(rendered).toContain("OVER");
 			expect(rendered.split(RESPONSE_ZONE_START)).toHaveLength(2);
 			expect(rendered.split(RESPONSE_ZONE_CLOSE)).toHaveLength(2);
+		} finally {
+			tui.stop();
+		}
+	});
+	it("marks intentional history resets but leaves startup replay preservable", async () => {
+		const term = new CaptureTerminal(20, 4);
+		const tui = new TUI(term);
+		tui.addChild(new RawLinesComponent(["reply"]));
+		try {
+			tui.start({ clearScrollback: true });
+			await settle();
+			const startup = term.writes.join("");
+			expect(startup).toContain("\x1b[H\x1b[3J\x1b[2J");
+			expect(startup).not.toContain("omp-response-history-reset");
+
+			term.writes.length = 0;
+			tui.requestRender(true, { clearScrollback: true });
+			await settle();
+			const reset = term.writes.join("");
+			expect(reset).toContain("\x1b]133;P;omp-response-history-reset\x07\x1b[H\x1b[3J\x1b[2J");
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("keeps resize rebuild clears preservable by Herdr", async () => {
+		const term = new CaptureTerminal(20, 4);
+		const provider: TerminalFrameProvider = {
+			renderFrame: ({ columns }) => ({ viewport: [`reply@${columns}`] }),
+			resetHistory: () => {},
+			acknowledgeHistory: () => {},
+		};
+		const tui = new TUI(term);
+		tui.setResizeScrollback("rebuild");
+		tui.setFrameProvider(provider);
+		try {
+			tui.start();
+			await settle();
+			term.writes.length = 0;
+			term.resize(30, 4);
+			tui.renderNow();
+
+			const resized = term.writes.join("");
+			expect(resized).toContain("\x1b[H\x1b[3J\x1b[2J");
+			expect(resized).not.toContain("omp-response-history-reset");
 		} finally {
 			tui.stop();
 		}

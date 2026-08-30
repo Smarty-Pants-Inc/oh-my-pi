@@ -503,6 +503,13 @@ type ScheduledAgentContinueOptions = {
 	onError?: (error: unknown) => void;
 };
 
+type ContinuationPublication = {
+	published: boolean;
+	started: boolean;
+	superseded: boolean;
+	terminalize?: () => Promise<void>;
+};
+
 type SessionTitleSource = "auto" | "user";
 type SessionNameTrigger = "replan";
 type SetSessionNameWithTrigger = (
@@ -812,9 +819,14 @@ export class AgentSession {
 	#pendingAbortErrorId?: number;
 
 	#postPromptTasks = new Set<Promise<unknown>>();
+	/** Tasks whose nonterminal response was already published; abort must not strand them. */
+	#committedPostPromptTasks = new Set<Promise<unknown>>();
 	#postPromptTasksPromise: Promise<void> | undefined = undefined;
 	#postPromptTasksResolve: (() => void) | undefined = undefined;
 	#postPromptTasksAbortController = new AbortController();
+	/** Response currently settling and the published nonterminal response awaiting its next agent_start. */
+	#settlingContinuationPublication: ContinuationPublication | undefined;
+	#activeContinuationPublication: ContinuationPublication | undefined;
 
 	readonly #streamingEditGuard: StreamingEditGuard;
 	readonly #loopGuards: LoopGuards;
@@ -822,6 +834,7 @@ export class AgentSession {
 	#abortInProgress = false;
 	/** Exact shared promise for the one teardown currently in flight. */
 	#abortIntent: AbortIntent | undefined;
+	#lastUserInterruptGeneration = -1;
 	#abortPromise: Promise<void> | undefined;
 	// Wire-level agent_end emission deferred until #promptInFlightCount drops to 0.
 	// Internal extension hooks and post-emit work (auto-retry, auto-compaction, todo
@@ -2552,6 +2565,7 @@ export class AgentSession {
 		if (this.#lifecycleTransitionFenceActive) throw new Error("Lifecycle transition fence already active");
 		this.#lifecycleTransitionFenceActive = true;
 		this.#lifecycleTransitionGeneration++;
+		this.#supersedeOutstandingContinuationPublicationsInBackground();
 		let released = false;
 		return () => {
 			if (released) return;
@@ -3522,6 +3536,7 @@ export class AgentSession {
 		// A fresh run supersedes the previously settled (and pruned) refusal
 		// turn: state-based lookups take over again.
 		if (event.type === "agent_start") {
+			this.#markContinuationPublicationStarted();
 			this.#recordAutomaticTurnStarted("agent_start");
 			this.#prunedTerminalRefusal = undefined;
 			this.#emitRunState("running");
@@ -3851,29 +3866,69 @@ export class AgentSession {
 			// TTSR retry work runs concurrently and clears the live flag before
 			// maintenance can emit agent_end, so preserve the state at settle entry.
 			const ttsrAbortPendingAtAgentEnd = this.#ttsr.abortPending;
+			const continuationPublication: ContinuationPublication = {
+				published: false,
+				started: false,
+				superseded: false,
+			};
+			this.#settlingContinuationPublication = continuationPublication;
 			const emitAgentEndNotification = async (options?: { willContinue?: boolean }) => {
-				const isTerminal = options?.willContinue !== true;
-				const terminalityPersisted = msg
+				let willContinue = options?.willContinue === true && !continuationPublication.superseded;
+				let isTerminal = !willContinue;
+				let terminalityPersisted = msg
 					? await this.#persistAssistantResponseAnchorTerminal(msg, isTerminal)
 					: false;
+				// A lifecycle transition can supersede the continuation while persistence
+				// is in flight. Re-check before publishing so no stale nonterminal event escapes.
+				if (willContinue && continuationPublication.superseded) {
+					willContinue = false;
+					isTerminal = true;
+					terminalityPersisted = msg ? await this.#persistAssistantResponseAnchorTerminal(msg, true) : false;
+				}
 				const responseAnchorTerminal = msg ? (terminalityPersisted ? isTerminal : false) : undefined;
 				if (fallbackAssistant && fallbackAssistant !== msg) {
 					fallbackAssistant.responseAnchorTerminal = responseAnchorTerminal;
+				}
+				let resolvePublishedNotification: (() => void) | undefined;
+				if (willContinue) {
+					const publishedNotification = Promise.withResolvers<void>();
+					resolvePublishedNotification = () => publishedNotification.resolve();
+					continuationPublication.published = true;
+					continuationPublication.terminalize = async () => {
+						await publishedNotification.promise;
+						await emitAgentEndNotification();
+					};
+					if (!continuationPublication.started) this.#activeContinuationPublication = continuationPublication;
+				} else {
+					continuationPublication.terminalize = undefined;
+					if (this.#activeContinuationPublication === continuationPublication) {
+						this.#activeContinuationPublication = undefined;
+					}
+				}
+				if (this.#settlingContinuationPublication === continuationPublication) {
+					this.#settlingContinuationPublication = undefined;
 				}
 				this.#emitRunState("idle");
 				// Public agent_end is held out of the eager display pass and emitted
 				// here after maintenance routing, tagged isTerminal so subscribers can
 				// tell final settles from scheduled continuations.
-				await this.#emitSessionEvent(
-					{
-						...event,
-						isTerminal,
-						responseAnchorId: msg?.responseAnchorId,
-						responseAnchorTerminal,
-					},
-					options?.willContinue === true ? undefined : { closeTurnId: settledTurnId },
-				);
-				void this.#emitAgentEndNotification([...activeMessages], options).catch(err => {
+				try {
+					await this.#emitSessionEvent(
+						{
+							...event,
+							isTerminal,
+							responseAnchorId: msg?.responseAnchorId,
+							responseAnchorTerminal,
+						},
+						willContinue ? undefined : { closeTurnId: settledTurnId },
+					);
+				} finally {
+					resolvePublishedNotification?.();
+				}
+				void this.#emitAgentEndNotification(
+					[...activeMessages],
+					willContinue ? { willContinue: true } : undefined,
+				).catch(err => {
 					logger.error("Agent end extension notification failed", { err });
 				});
 			};
@@ -3910,6 +3965,9 @@ export class AgentSession {
 				.find((message): message is AssistantMessage => message.role === "assistant");
 			const msg = this.#lastAssistantMessage ?? fallbackAssistant;
 			this.#lastAssistantMessage = undefined;
+			const compactionContinuation = {
+				onContinuationSuperseded: async () => this.#supersedeContinuationPublication(continuationPublication),
+			};
 			if (!msg) {
 				this.#lastSuccessfulYieldToolCallId = undefined;
 				logger.debug("agent_end maintenance routing", {
@@ -3989,7 +4047,7 @@ export class AgentSession {
 							? "successful-yield-active-goal-checkCompaction"
 							: "post-yield-trailing-stop-active-goal-checkCompaction",
 					);
-					const compactionTask = this.#maintenance.checkCompaction(successfulYieldMessage);
+					const compactionTask = this.#maintenance.checkCompaction(successfulYieldMessage, true, false, false);
 					this.#trackPostPromptTask(compactionTask);
 					await compactionTask;
 				} else if (successfulYieldMessage) {
@@ -4039,7 +4097,7 @@ export class AgentSession {
 					}
 				}
 				maintenanceRoute("active-goal-pre-empt-checkCompaction");
-				const compactionTask = this.#maintenance.checkCompaction(msg);
+				const compactionTask = this.#maintenance.checkCompaction(msg, true, true, true, compactionContinuation);
 				this.#trackPostPromptTask(compactionTask);
 				compactionResult = await compactionTask;
 				checkedCompaction = true;
@@ -4057,6 +4115,7 @@ export class AgentSession {
 						continuationScheduled: compactionResult.continuationScheduled,
 						automaticContinuationBlocked: compactionResult.automaticContinuationBlocked === true,
 					});
+					await this.#recovery.onErrorSettledWithoutRetry(msg, compactionResult);
 					this.#recovery.resolveRetry();
 					await emitCompactionAgentEnd(compactionResult);
 					return;
@@ -4149,7 +4208,7 @@ export class AgentSession {
 
 			if (!checkedCompaction) {
 				maintenanceRoute("bottom-checkCompaction");
-				const compactionTask = this.#maintenance.checkCompaction(msg);
+				const compactionTask = this.#maintenance.checkCompaction(msg, true, true, true, compactionContinuation);
 				this.#trackPostPromptTask(compactionTask);
 				compactionResult = await compactionTask;
 			}
@@ -4226,6 +4285,7 @@ export class AgentSession {
 			.catch(() => {})
 			.finally(() => {
 				this.#postPromptTasks.delete(task);
+				this.#committedPostPromptTasks.delete(task);
 				if (this.#postPromptTasks.size === 0) {
 					this.#resolvePostPromptTasks();
 				}
@@ -4235,7 +4295,7 @@ export class AgentSession {
 	#schedulePostPromptTask(
 		task: (signal: AbortSignal) => Promise<void>,
 		options?: { delayMs?: number; generation?: number; onSkip?: (reason: PostPromptSkipReason) => void },
-	): void {
+	): Promise<void> {
 		const delayMs = options?.delayMs ?? 0;
 		const signal = this.#postPromptTasksAbortController.signal;
 		const scheduled = (async () => {
@@ -4258,12 +4318,52 @@ export class AgentSession {
 			await task(signal);
 		})();
 		this.#trackPostPromptTask(scheduled);
+		return scheduled;
+	}
+	#markContinuationPublicationStarted(): void {
+		for (const publication of [this.#settlingContinuationPublication, this.#activeContinuationPublication]) {
+			if (!publication || publication.superseded) continue;
+			publication.started = true;
+			publication.terminalize = undefined;
+		}
+		this.#activeContinuationPublication = undefined;
 	}
 
-	#skipAgentContinue(reason: AgentContinueSkipReason, options: ScheduledAgentContinueOptions | undefined): void {
+	async #supersedeContinuationPublication(publication: ContinuationPublication | undefined): Promise<void> {
+		if (!publication || publication.started || publication.superseded) return;
+		publication.superseded = true;
+		if (this.#activeContinuationPublication === publication) this.#activeContinuationPublication = undefined;
+		const terminalize = publication.terminalize;
+		publication.terminalize = undefined;
+		if (publication.published && terminalize) await terminalize();
+	}
+
+	async #supersedeOutstandingContinuationPublications(): Promise<void> {
+		const publications = new Set([this.#settlingContinuationPublication, this.#activeContinuationPublication]);
+		for (const publication of publications) await this.#supersedeContinuationPublication(publication);
+	}
+
+	#supersedeContinuationPublicationInBackground(publication: ContinuationPublication | undefined): void {
+		void this.#supersedeContinuationPublication(publication).catch(error => {
+			logger.error("Failed to terminalize a superseded continuation response", { error });
+		});
+	}
+
+	#supersedeOutstandingContinuationPublicationsInBackground(): void {
+		void this.#supersedeOutstandingContinuationPublications().catch(error => {
+			logger.error("Failed to terminalize superseded continuation responses", { error });
+		});
+	}
+
+	#skipAgentContinue(
+		reason: AgentContinueSkipReason,
+		options: ScheduledAgentContinueOptions | undefined,
+		publication: ContinuationPublication | undefined,
+	): void {
 		logger.debug("agent.continue skipped after scheduling", { reason });
 		if (options) this.#automaticTurns.record(options.authority, "deferred", reason);
 		options?.onSkip?.(reason);
+		this.#supersedeContinuationPublicationInBackground(publication);
 	}
 
 	#persistPassiveCustomMessages(messages: readonly AgentMessage[]): void {
@@ -4416,7 +4516,11 @@ export class AgentSession {
 	}
 
 	#scheduleAgentContinue(options?: ScheduledAgentContinueOptions): void {
-		if (!options || !this.#automaticTurns.authorize(options.authority, options.originTurnId)) return;
+		const publication = this.#settlingContinuationPublication ?? this.#activeContinuationPublication;
+		if (!options || !this.#automaticTurns.authorize(options.authority, options.originTurnId)) {
+			this.#supersedeContinuationPublicationInBackground(publication);
+			return;
+		}
 		this.#schedulePostPromptTask(
 			async signal => {
 				let directTurnId: string | undefined;
@@ -4432,18 +4536,18 @@ export class AgentSession {
 				// reset. The first-class fix is in #checkCompaction/the agent_end handler,
 				// but this guard catches anything that bypasses that path.
 				if (signal.aborted || this.#isDisposed || this.isCompacting || this.isGeneratingHandoff) {
-					this.#skipAgentContinue("session-unavailable", options);
+					this.#skipAgentContinue("session-unavailable", options, publication);
 					return;
 				}
-				if (options?.shouldContinue && !options.shouldContinue()) {
-					this.#skipAgentContinue("should-continue-false", options);
+				if (options.shouldContinue && !options.shouldContinue()) {
+					this.#skipAgentContinue("should-continue-false", options, publication);
 					return;
 				}
 				if (
 					options.authority === "active_async_result_wake" &&
 					!this.#automaticTurns.isTurnOpen(options.originTurnId)
 				) {
-					this.#automaticTurns.record(options.authority, "rejected", "originating asynchronous turn closed");
+					this.#skipAgentContinue("should-continue-false", options, publication);
 					return;
 				}
 				if (options.authority === "direct_user_input") {
@@ -4460,21 +4564,21 @@ export class AgentSession {
 							this.isCompacting ||
 							this.isGeneratingHandoff
 						) {
-							this.#skipAgentContinue("session-unavailable", options);
+							this.#skipAgentContinue("session-unavailable", options, publication);
 							return;
 						}
 					} while (this.#semanticDeliveryAcceptances.size > 0);
 					if (options.shouldContinue && !options.shouldContinue()) {
-						this.#skipAgentContinue("should-continue-false", options);
+						this.#skipAgentContinue("should-continue-false", options, publication);
 						return;
 					}
 					if (this.#queuedPromptDeliveryMutationReservations > 0 || this.#queuedPromptDeliveryMutationInFlight) {
-						this.#skipAgentContinue("session-unavailable", options);
+						this.#skipAgentContinue("session-unavailable", options, publication);
 						return;
 					}
 					const directUser = this.#isolateDirectUserContinuationOwner();
 					if (!directUser) {
-						this.#skipAgentContinue("should-continue-false", options);
+						this.#skipAgentContinue("should-continue-false", options, publication);
 						return;
 					}
 					directUserOwner = directUser.owner;
@@ -4494,7 +4598,7 @@ export class AgentSession {
 					inFlight = true;
 					const reverted = await this.#recovery.maybeRestoreRetryFallbackPrimary();
 					if (signal.aborted || this.#isDisposed) {
-						this.#skipAgentContinue("post-restore-unavailable", options);
+						this.#skipAgentContinue("post-restore-unavailable", options, publication);
 						return;
 					}
 					// A cooldown-expiry revert can drop the active window below the
@@ -4505,13 +4609,13 @@ export class AgentSession {
 					if (reverted) {
 						await this.#maintenance.runPrePromptCompactionIfNeeded([]);
 						if (signal.aborted || this.#isDisposed) {
-							this.#skipAgentContinue("post-restore-unavailable", options);
+							this.#skipAgentContinue("post-restore-unavailable", options, publication);
 							return;
 						}
 					}
 					if (this.settings.get("retry.usageAwareFallback")) {
 						if (!(await this.#runQueuedUsageAwarePreflight(signal))) {
-							this.#skipAgentContinue("session-unavailable", options);
+							this.#skipAgentContinue("session-unavailable", options, publication);
 							return;
 						}
 					}
@@ -4524,6 +4628,7 @@ export class AgentSession {
 					await this.#drainInFlightEventHandlers();
 				} catch (error) {
 					this.#recordAutomaticTurnFailed(options.authority, error, continuationTurnId);
+					this.#supersedeContinuationPublicationInBackground(publication);
 					if (directTurnId) this.#closeTurn(directTurnId);
 					logger.warn("agent.continue failed after scheduling", {
 						error: error instanceof Error ? error.message : String(error),
@@ -4542,7 +4647,7 @@ export class AgentSession {
 			{
 				delayMs: options?.delayMs,
 				generation: options?.generation,
-				onSkip: reason => this.#skipAgentContinue(reason, options),
+				onSkip: reason => this.#skipAgentContinue(reason, options, publication),
 			},
 		);
 	}
@@ -4687,6 +4792,7 @@ export class AgentSession {
 		terminalTextAnswer: boolean;
 		suppressContinuation: boolean;
 		onContinuationScheduled?: (scheduled: boolean) => Promise<void>;
+		onContinuationSuperseded?: () => Promise<void>;
 	}): Promise<boolean> {
 		const notify = async (scheduled: boolean) => {
 			await options.onContinuationScheduled?.(scheduled);
@@ -4715,16 +4821,19 @@ export class AgentSession {
 			await notify(false);
 			return false;
 		}
-		await notify(true);
-		return this.#scheduleAutoContinuePrompt(options.generation);
+		return await this.#scheduleAutoContinuePrompt(options.generation, notify, options.onContinuationSuperseded);
 	}
 
-	#scheduleAutoContinuePrompt(generation: number): boolean {
+	async #scheduleAutoContinuePrompt(
+		generation: number,
+		notify: (scheduled: boolean) => Promise<void>,
+		onContinuationSuperseded?: () => Promise<void>,
+	): Promise<boolean> {
 		const continuePrompt = async () => {
 			// Compaction summarizes away the first-message eager preludes, so re-assert the
 			// delegate-via-tasks / phased-todo reminders on this auto-resumed turn. This runs
-			// at invocation (past the abort check below), so an aborted continuation queues
-			// nothing; scoped to this request via prependMessages, never the shared queue.
+			// after the scheduling guards below, so a rejected continuation queues nothing;
+			// scoped to this request via prependMessages, never the shared queue.
 			const eagerNudges = this.#todo.buildPostCompactionEagerNudges();
 			await this.#promptWithMessage(
 				{
@@ -4741,41 +4850,89 @@ export class AgentSession {
 				},
 			);
 		};
-		this.#schedulePostPromptTask(
+		const lifecycleGeneration = this.#lifecycleTransitionGeneration;
+		const prepared = Promise.withResolvers<(() => void) | undefined>();
+		let scheduledTask: Promise<void> | undefined;
+		scheduledTask = this.#schedulePostPromptTask(
 			async signal => {
 				await Promise.resolve();
-				while (this.#lifecycleTransitionFenceActive) {
-					try {
-						await scheduler.wait(1, { signal });
-					} catch {
-						return;
-					}
+				if (this.#promptGeneration !== generation || signal.aborted) {
+					prepared.resolve(undefined);
+					return;
 				}
-				if (this.#promptGeneration !== generation) return;
-				if (signal.aborted) return;
+
+				let requiresActiveGoal = false;
+				let continuation: () => Promise<void>;
 				if (this.agent.hasQueuedMessages()) {
 					const queuedAuthority = this.#queuedTurnAuthority();
-					if (!queuedAuthority) return;
-					this.#scheduleAgentContinue({
-						...queuedAuthority,
-						generation,
-						shouldContinue: () => this.agent.hasQueuedMessages(),
-					});
-					return;
+					if (!queuedAuthority) {
+						prepared.resolve(undefined);
+						return;
+					}
+					continuation = async () => {
+						this.#scheduleAgentContinue({
+							...queuedAuthority,
+							generation,
+							shouldContinue: () => this.agent.hasQueuedMessages(),
+						});
+					};
+				} else {
+					if (this.#goalModeState?.enabled !== true || this.#goalModeState.goal.status !== "active") {
+						this.#automaticTurns.record(
+							"active_goal_continuation",
+							"rejected",
+							"active goal ended before compaction continuation",
+						);
+						prepared.resolve(undefined);
+						return;
+					}
+					requiresActiveGoal = true;
+					continuation = continuePrompt;
 				}
-				if (this.#goalModeState?.enabled !== true || this.#goalModeState.goal.status !== "active") {
-					this.#automaticTurns.record(
-						"active_goal_continuation",
-						"rejected",
-						"active goal ended before compaction continuation",
-					);
-					return;
+
+				const release = Promise.withResolvers<void>();
+				prepared.resolve(release.resolve);
+				// The initial microtask above guarantees assignment before this point.
+				this.#committedPostPromptTasks.add(scheduledTask!);
+				// Resolving `prepared` publishes a nonterminal response. A plain abort cannot
+				// strand that response, but disposal or a lifecycle transition supersedes it.
+				await release.promise;
+				const terminalizeContinuation = async (): Promise<void> => {
+					await onContinuationSuperseded?.();
+				};
+				const terminalizeIfSuperseded = async (): Promise<boolean> => {
+					const userInterrupted = this.#lastUserInterruptGeneration > generation;
+					const activeGoalEnded =
+						requiresActiveGoal &&
+						(this.#goalModeState?.enabled !== true || this.#goalModeState.goal.status !== "active");
+					if (
+						!this.#isDisposed &&
+						!userInterrupted &&
+						!activeGoalEnded &&
+						this.#lifecycleTransitionGeneration === lifecycleGeneration
+					)
+						return false;
+					await terminalizeContinuation();
+					return true;
+				};
+				if (await terminalizeIfSuperseded()) return;
+				while (this.#abortInProgress || this.#lifecycleTransitionFenceActive) await scheduler.wait(1);
+				if (await terminalizeIfSuperseded()) return;
+				try {
+					await continuation();
+				} catch (error) {
+					await terminalizeContinuation();
+					throw error;
 				}
-				await continuePrompt();
 			},
-			{ generation },
+			{ generation, onSkip: () => prepared.resolve(undefined) },
 		);
-		return true;
+
+		const release = await prepared.promise;
+		const scheduled = release !== undefined;
+		await notify(scheduled);
+		release?.();
+		return scheduled;
 	}
 
 	async #cancelPostPromptTasks(): Promise<void> {
@@ -4783,9 +4940,9 @@ export class AgentSession {
 		this.#postPromptTasksAbortController = new AbortController();
 		this.#ttsr.resolveResume();
 
-		const pendingTasks = Array.from(this.#postPromptTasks);
+		const pendingTasks = Array.from(this.#postPromptTasks).filter(task => !this.#committedPostPromptTasks.has(task));
 		if (pendingTasks.length === 0) {
-			this.#resolvePostPromptTasks();
+			if (this.#postPromptTasks.size === 0) this.#resolvePostPromptTasks();
 			return;
 		}
 
@@ -5350,6 +5507,7 @@ export class AgentSession {
 	 */
 	beginDispose(): void {
 		this.#isDisposed = true;
+		this.#supersedeOutstandingContinuationPublicationsInBackground();
 		this.#unsubscribeAgentQueueChanges?.();
 		this.#unsubscribeAgentQueueChanges = undefined;
 		this.#queuedPromptListeners.clear();
@@ -8599,7 +8757,10 @@ export class AgentSession {
 
 	/** Override the lifecycle acceptance fence in focused tests. */
 	setLifecycleTransitionFenceForTests(active: boolean): void {
-		if (active && !this.#lifecycleTransitionFenceActive) this.#lifecycleTransitionGeneration++;
+		if (active && !this.#lifecycleTransitionFenceActive) {
+			this.#lifecycleTransitionGeneration++;
+			this.#supersedeOutstandingContinuationPublicationsInBackground();
+		}
 		this.#lifecycleTransitionFenceActive = active;
 	}
 
@@ -8609,7 +8770,6 @@ export class AgentSession {
 		else this.#disconnectFromAgent();
 	}
 
-	/** Test-only hook after async normalization and immediately before receiver-state acceptance. */
 	private onBeforeCustomMessageAcceptance?: () => void;
 
 	/**
@@ -9851,6 +10011,7 @@ export class AgentSession {
 				intent.preserveToolChoice = false;
 				this.#pendingAbortErrorId = AIError.create(AIError.Flag.UserInterrupt);
 				this.#advisors.autoResumeSuppressed = true;
+				this.#lastUserInterruptGeneration = this.#promptGeneration;
 				intent.strandedAdvisorCards.push(...this.#extractQueuedAdvisorCards());
 				this.abortCompaction();
 				this.agent.abort(USER_INTERRUPT_LABEL);
@@ -9883,6 +10044,9 @@ export class AgentSession {
 	}
 
 	async #performAbort(intent: AbortIntent): Promise<void> {
+		if (intent.reason === USER_INTERRUPT_LABEL) {
+			this.#supersedeOutstandingContinuationPublicationsInBackground();
+		}
 		// Session switch/compact paths disconnect first; explicit aborts should
 		// leave any queued steer/follow-up visible for the user rather than
 		// auto-starting a fresh turn during cleanup.
@@ -9892,6 +10056,7 @@ export class AgentSession {
 			for (const controller of this.#usagePreflightAbortControllers) controller.abort();
 			this.abortRetry();
 			this.#promptGeneration++;
+			if (intent.reason === USER_INTERRUPT_LABEL) this.#lastUserInterruptGeneration = this.#promptGeneration;
 			// Abort the handoff first so generic compaction cancellation cannot replace
 			// the harness reason with an unreasoned "Handoff cancelled".
 			this.#handoff.abortHandoff(new Error(intent.reason ?? "Handoff aborted by session"));

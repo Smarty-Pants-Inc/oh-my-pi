@@ -223,18 +223,18 @@ function isAssistantEntry(entry: SessionEntry): entry is SessionMessageEntry & {
 	return entry.type === "message" && entry.message.role === "assistant";
 }
 
-function stampLoadedAssistantResponseAnchor(entry: SessionEntry): void {
-	if (!isAssistantEntry(entry)) return;
-	// Identity alone never proves that an old assistant ended the run: the
-	// durable-ID feature stamped every assistant, including continuation turns.
+function stampLoadedAssistantResponseAnchor(
+	entry: SessionEntry,
+): entry is SessionMessageEntry & { message: AssistantMessage } {
+	if (!isAssistantEntry(entry) || typeof entry.message.responseAnchorTerminal !== "boolean") return false;
 	stampAssistantResponseAnchorId(entry.message, entry.id);
+	return true;
 }
 
 function stampLoadedAssistantResponseAnchors(entries: readonly SessionEntry[]): void {
 	const seen = new Set<string>();
 	for (const entry of entries) {
-		if (!isAssistantEntry(entry)) continue;
-		stampLoadedAssistantResponseAnchor(entry);
+		if (!stampLoadedAssistantResponseAnchor(entry)) continue;
 		let responseAnchorId = entry.message.responseAnchorId;
 		if (!responseAnchorId || seen.has(responseAnchorId)) {
 			responseAnchorId = responseAnchorIdForEntry(entry.id);

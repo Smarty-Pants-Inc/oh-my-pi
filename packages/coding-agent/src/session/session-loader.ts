@@ -95,7 +95,6 @@ export function restoreSessionJournal(entries: readonly FileEntry[]): {
 	leafId: string | null | undefined;
 } {
 	const sessionEntries: SessionEntry[] = [];
-	const terminalByAnchorId = new Map<string, boolean>();
 	const assistantsByAnchorId = new Map<string, { responseAnchorTerminal?: boolean }>();
 	let leafId: string | null | undefined;
 	for (const entry of entries) {
@@ -106,7 +105,6 @@ export function restoreSessionJournal(entries: readonly FileEntry[]): {
 		}
 		if (isResponseAnchorTerminalEntry(entry)) {
 			if (!isSafeResponseAnchorId(entry.responseAnchorId) || typeof entry.terminal !== "boolean") continue;
-			terminalByAnchorId.set(entry.responseAnchorId, entry.terminal);
 			const message = assistantsByAnchorId.get(entry.responseAnchorId);
 			if (message) message.responseAnchorTerminal = entry.terminal;
 			continue;
@@ -118,8 +116,6 @@ export function restoreSessionJournal(entries: readonly FileEntry[]): {
 				const responseAnchorId = entry.message.responseAnchorId;
 				if (isSafeResponseAnchorId(responseAnchorId)) {
 					assistantsByAnchorId.set(responseAnchorId, entry.message);
-					const terminal = terminalByAnchorId.get(responseAnchorId);
-					if (terminal !== undefined) entry.message.responseAnchorTerminal = terminal;
 				}
 			}
 		}

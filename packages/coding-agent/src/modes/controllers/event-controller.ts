@@ -8,7 +8,8 @@ import { extractTextContent } from "../../commit/utils";
 import { settings } from "../../config/settings";
 import { getEditClipboard } from "../../edit/edit-clipboard";
 import { getFileSnapshotStore } from "../../edit/file-snapshot-store";
-import { AssistantMessageComponent, matchesAssistantReplayMessage } from "../../modes/components/assistant-message";
+import { AssistantMessageComponent } from "../../modes/components/assistant-message";
+import { matchesAssistantReplayMessage } from "../../modes/components/assistant-message-identity";
 import { detectCacheInvalidation } from "../../modes/components/cache-invalidation-marker";
 import {
 	groupedReadUsageCallIds,
@@ -1837,7 +1838,6 @@ export class EventController {
 		// site, so the automatic continuation would otherwise run on the old
 		// model/thinking level until the terminal settle.
 		if (event.isTerminal === false) {
-			this.#settleResponseAnchorCandidate(false, event);
 			await this.ctx.flushPendingModelSwitch();
 			// Reaching here means the first guard passed, so `isStreaming` is already
 			// false: a command issued from now on mounts immediately. Leaving earlier

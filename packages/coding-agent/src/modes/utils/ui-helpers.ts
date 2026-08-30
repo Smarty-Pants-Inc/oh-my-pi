@@ -563,6 +563,7 @@ export class UiHelpers {
 				const candidate = preservedLiveResponseAnchorCandidate;
 				const preserveLeadingCandidate = candidate?.matchesReplayMessage(message) ?? false;
 				if (preserveLeadingCandidate && candidate) {
+					candidate.updateContent(message);
 					this.ctx.chatContainer.addChild(candidate);
 					preservedLiveResponseAnchorCandidate = undefined;
 				} else {
@@ -600,6 +601,7 @@ export class UiHelpers {
 					);
 					if (preservedIndex >= 0) {
 						const preserved = preservedLivePostToolComponents.splice(preservedIndex, 1)[0]!;
+						if (segment) preserved.component.updateContent(segment);
 						this.ctx.chatContainer.addChild(preserved.component);
 						return;
 					}

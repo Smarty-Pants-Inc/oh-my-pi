@@ -65,6 +65,7 @@ const LINE_FIT_SOURCE_WIDTH_MULTIPLIER = 64;
 const RESPONSE_ANCHOR_ID = /^[A-Za-z0-9_-]{1,128}$/;
 const RESPONSE_ZONE_SESSION = `${process.pid}-${randomUUID()}`;
 const RESPONSE_ZONE_CLOSE = "\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07";
+const RESPONSE_HISTORY_RESET = "\x1b]133;P;omp-response-history-reset\x07";
 
 function responseZoneStart(responseAnchorId: string): string {
 	return `\x1b]133;A;aid=omp-response-${RESPONSE_ZONE_SESSION}:${responseAnchorId}\x07`;
@@ -322,6 +323,8 @@ export interface Focusable {
 export interface RenderRequestOptions {
 	/** Clear terminal scrollback for intentional transcript replacement. */
 	clearScrollback?: boolean;
+	/** Let a paired terminal owner retain pre-existing native history during startup replay. */
+	retainPriorNativeScrollback?: boolean;
 }
 /**
  * Controls how a settled terminal resize refreshes native history.
@@ -796,6 +799,7 @@ export class TUI extends Container {
 	#ghosttyInitialImageDelayTimer: RenderTimer | undefined;
 	#ghosttyImageReadyAtMs = 0;
 	#clearScrollbackOnNextRender = false;
+	#retainPriorNativeScrollbackOnNextClear = false;
 	// Consumed by the next frame: a user-driven redraw gesture (resetDisplay,
 	// requestRender(true)) that must rewrite the viewport even when the diff
 	// believes nothing changed.
@@ -1107,7 +1111,10 @@ export class TUI extends Container {
 			this.#querySixelSupport();
 			this.#queryCellSize();
 		}
-		this.requestRender(true, { clearScrollback: options?.clearScrollback === true });
+		this.requestRender(true, {
+			clearScrollback: options?.clearScrollback === true,
+			retainPriorNativeScrollback: true,
+		});
 	}
 	/** Borrow the alternate buffer for stable, history-free resize repainting. */
 	#beginResizeAltPaint(): void {
@@ -1497,7 +1504,7 @@ export class TUI extends Container {
 
 	requestRender(force = false, options?: RenderRequestOptions): void {
 		if (force) {
-			this.#prepareForcedRender(options?.clearScrollback === true);
+			this.#prepareForcedRender(options?.clearScrollback === true, options?.retainPriorNativeScrollback === true);
 			this.#renderRequested = true;
 			this.#renderScheduler.scheduleImmediate(() => {
 				if (this.#stopped || !this.#renderRequested) {
@@ -1518,7 +1525,7 @@ export class TUI extends Container {
 	 */
 	renderNow(options?: RenderRequestOptions): void {
 		if (this.#stopped) return;
-		this.#prepareForcedRender(options?.clearScrollback === true);
+		this.#prepareForcedRender(options?.clearScrollback === true, options?.retainPriorNativeScrollback === true);
 		this.#renderRequested = false;
 		const start = this.#renderScheduler.now();
 		this.#lastRenderAt = start;
@@ -1568,12 +1575,17 @@ export class TUI extends Container {
 		}, delayMs);
 		return true;
 	}
-	#prepareForcedRender(clearScrollback: boolean): void {
-		if (clearScrollback && !this.#clearScrollbackOnNextRender) {
-			this.#frameProvider?.resetHistory?.();
-			if (TERMINAL.imageProtocol === ImageProtocol.Kitty) this.#imageBudget.forgetTransmitted();
+	#prepareForcedRender(clearScrollback: boolean, retainPriorNativeScrollback = false): void {
+		if (clearScrollback) {
+			if (!this.#clearScrollbackOnNextRender) {
+				this.#frameProvider?.resetHistory?.();
+				if (TERMINAL.imageProtocol === ImageProtocol.Kitty) this.#imageBudget.forgetTransmitted();
+				this.#retainPriorNativeScrollbackOnNextClear = retainPriorNativeScrollback;
+			} else {
+				this.#retainPriorNativeScrollbackOnNextClear &&= retainPriorNativeScrollback;
+			}
+			this.#clearScrollbackOnNextRender = true;
 		}
-		this.#clearScrollbackOnNextRender ||= clearScrollback;
 		this.#forceViewportRepaintOnNextRender = true;
 		if (this.#renderTimer) {
 			this.#renderTimer.cancel();
@@ -1985,6 +1997,7 @@ export class TUI extends Container {
 		const markers: { row: number; col: number }[] = [];
 		for (let row = lines.length - 1; row >= 0; row--) {
 			const line = lines[row];
+			const responseZone = responseZoneMetadata(line);
 			let markerIndex = line.indexOf(CURSOR_MARKER);
 			if (markerIndex === -1) continue;
 			const beforeMarker = line.slice(0, markerIndex);
@@ -1994,7 +2007,7 @@ export class TUI extends Container {
 				stripped = stripped.slice(0, markerIndex) + stripped.slice(markerIndex + CURSOR_MARKER.length);
 				markerIndex = stripped.indexOf(CURSOR_MARKER, markerIndex);
 			}
-			lines[row] = stripped;
+			lines[row] = preserveResponseZoneLine(stripped, responseZone);
 		}
 		return markers;
 	}
@@ -2076,7 +2089,7 @@ export class TUI extends Container {
 			return;
 		}
 		if (this.#resizeScrollbackMode === "rebuild") {
-			this.#prepareForcedRender(true);
+			this.#prepareForcedRender(true, true);
 			return;
 		}
 		provider.resetHistory();
@@ -2137,7 +2150,10 @@ export class TUI extends Container {
 		} else {
 			this.#imageBudget.takePurgeIds();
 		}
-		if (destructiveReset) buffer += "\x1b[H\x1b[3J\x1b[2J";
+		if (destructiveReset) {
+			if (!this.#retainPriorNativeScrollbackOnNextClear) buffer += RESPONSE_HISTORY_RESET;
+			buffer += "\x1b[H\x1b[3J\x1b[2J";
+		}
 		const diffable =
 			geometryStable &&
 			historyRows.length === 0 &&
@@ -2223,6 +2239,7 @@ export class TUI extends Container {
 		this.#previousHeight = height;
 		this.#previousFrameLength = rows;
 		this.#clearScrollbackOnNextRender = false;
+		this.#retainPriorNativeScrollbackOnNextClear = false;
 		this.#forceViewportRepaintOnNextRender = false;
 		this.#hasEverRendered = true;
 		this.#resizeReplaySize = undefined;

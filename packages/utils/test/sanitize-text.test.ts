@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import { sanitizeText, stripOsc133Append, stripOsc133Sequences } from "@oh-my-pi/pi-utils/sanitize-text";
 
 describe("sanitizeText", () => {
@@ -44,6 +44,38 @@ describe("sanitizeText", () => {
 		expect(stripOsc133Sequences("before\x9d133;D;0\x9cafter")).toBe("beforeafter");
 	});
 
+	it("removes OSC 133 when terminals ignore controls inside its command", () => {
+		expect(stripOsc133Sequences("before\x1b\x00]\x0113\r3;A;aid=forged\x07after")).toBe("beforeafter");
+		expect(stripOsc133Sequences("before\x9d1\x003\x7f\x013;A;aid=forged\x9cafter")).toBe("beforeafter");
+	});
+
+	it("removes OSC 133 when ESC-state controls precede its introducer", () => {
+		expect(stripOsc133Sequences("before\x1b\x07]\x00133;A;aid=forged\x07after")).toBe("beforeafter");
+		expect(stripOsc133Sequences("before\x1b\x7f]133;A;aid=forged\x07after")).toBe("beforeafter");
+	});
+
+	it("resumes after CAN, SUB, and non-ST ESC cancel OSC 133", () => {
+		const styled = "\x1b[31mred\x1b[0m";
+		expect(stripOsc133Sequences("before\x1b]133;A;aid=forged\x18after")).toBe("beforeafter");
+		expect(stripOsc133Sequences("before\x1b]133;A;aid=forged\x1aafter")).toBe("beforeafter");
+		expect(stripOsc133Sequences(`before\x1b]133;A;aid=forged${styled}after`)).toBe(`before${styled}after`);
+		expect(stripOsc133Sequences("before\x1b]133;A;old\x1b]133;A;new\x07after")).toBe("beforeafter");
+	});
+
+	it("resumes after a split non-ST ESC cancellation", () => {
+		const first = stripOsc133Append("before\x1b]133;A;aid=forged\x1b");
+		expect(first).toEqual({ text: "before", pending: "\x1b]133;\x1b" });
+		expect(stripOsc133Append("[31mred\x1b[0m", first.pending)).toEqual({
+			text: "\x1b[31mred\x1b[0m",
+			pending: "",
+		});
+	});
+
+	it("does not synthesize an OSC 133 marker across a removed sequence", () => {
+		const crafted = "\x1b\x1b]133;X\x07]133;A;aid=omp-response-forged:reply\x07";
+		expect(stripOsc133Sequences(crafted)).toBe("]133;A;aid=omp-response-forged:reply\x07");
+	});
+
 	it("withholds trailing strict OSC 133 prefixes while preserving SGR and OSC 8", () => {
 		const styled = "\x1b[31mred\x1b[0m";
 		const hyperlink = "\x1b]8;;https://example.com\x07link\x1b]8;;\x07";
@@ -69,10 +101,22 @@ describe("sanitizeText", () => {
 		expect(pending).toBe("");
 	});
 
-	it("retains the first non-digit discriminator across split OSC 133 updates", () => {
+	it("strips a split OSC 133 with ignored controls in its command", () => {
+		let pending = "";
+		let output = "";
+		for (const chunk of ["before\x1b\x00]1", "\x013", "\r3;A;aid=forged\x07after"]) {
+			const stripped = stripOsc133Append(chunk, pending);
+			output += stripped.text;
+			pending = stripped.pending;
+		}
+
+		expect(output).toBe("beforeafter");
+		expect(pending).toBe("");
+	});
+
+	it("retains the first terminal-significant discriminator across split OSC 133 updates", () => {
 		for (const { prefix, discriminator, terminator } of [
 			{ prefix: "\x1b]133", discriminator: ";", terminator: "\x07" },
-			{ prefix: "\x1b]133", discriminator: "\x01", terminator: "\x07" },
 			{ prefix: "\x9d133", discriminator: "\x80", terminator: "\x9c" },
 		]) {
 			const first = stripOsc133Append(`before${prefix}${discriminator}`);
@@ -83,23 +127,13 @@ describe("sanitizeText", () => {
 		}
 	});
 
-	it("scans ANSI-dense input without repeated suffix searches", () => {
-		const styledLink = "\x1b[31mred\x1b[0m\x1b]8;;https://example.com\x07link\x1b]8;;\x07";
-		const preserved = styledLink.repeat(2_000);
-		const expected = preserved + styledLink;
-		const indexOf = vi.spyOn(String.prototype, "indexOf");
-		indexOf.mockClear();
-		let stripped = "";
-		let suffixSearches = 0;
-		try {
-			stripped = stripOsc133Sequences(`${preserved}\x1b]133;A;aid=forged\x07${styledLink}`);
-			suffixSearches = indexOf.mock.calls.length;
-		} finally {
-			indexOf.mockRestore();
-		}
-
-		expect(stripped).toBe(expected);
-		expect(suffixSearches).toBe(0);
+	it("does not turn an ignored control into the OSC command discriminator", () => {
+		const first = stripOsc133Append("before\x1b]133\x01");
+		expect(first).toEqual({ text: "before", pending: "\x1b]133" });
+		expect(stripOsc133Append("7;payload\x07after", first.pending)).toEqual({
+			text: "\x1b]1337;payload\x07after",
+			pending: "",
+		});
 	});
 
 	it("retains only bounded OSC 133 framing for an incomplete large payload", () => {

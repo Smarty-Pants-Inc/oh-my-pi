@@ -439,6 +439,119 @@ describe("AgentSession auto-compaction progress guard", () => {
 		expect(noProgress.length).toBe(0);
 	});
 
+	it("completes successful-yield handoff compaction without deferring or auto-continuing", async () => {
+		activateOngoingGoal("successful-yield-handoff");
+		session.settings.set("compaction.methodOrder", ["handoff"]);
+		session.settings.set("compaction.keepRecentTokens", 1);
+		session.settings.set("contextPromotion.enabled", false);
+		compactHookEnabled = false;
+		vi.spyOn(session, "getContextUsage").mockReturnValue({ tokens: 1000, contextWindow: 200000, percent: 0.5 });
+		const handoffSpy = vi.spyOn(compactionModule, "generateHandoffFromContext").mockResolvedValue("handoff document");
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+
+		const agentEnd = Promise.withResolvers<void>();
+		const agentEnds: Array<{ isTerminal: boolean | undefined; responseAnchorTerminal: boolean | undefined }> = [];
+		session.subscribe(event => {
+			if (event.type !== "agent_end") return;
+			agentEnds.push({
+				isTerminal: event.isTerminal,
+				responseAnchorTerminal: event.responseAnchorTerminal,
+			});
+			agentEnd.resolve();
+		});
+
+		const yieldCall = {
+			type: "toolCall" as const,
+			id: "call_successful_yield_handoff",
+			name: "yield",
+			arguments: { status: "progress" },
+		};
+		const assistantMsg: AssistantMessage = {
+			...highUsageAssistant(),
+			content: [yieldCall],
+			stopReason: "toolUse",
+		};
+		session.agent.emitExternalEvent({ type: "message_end", message: assistantMsg });
+		session.agent.emitExternalEvent({
+			type: "tool_execution_end",
+			toolCallId: yieldCall.id,
+			toolName: yieldCall.name,
+			isError: false,
+			result: {
+				content: [{ type: "text", text: "Yielded." }],
+				details: { status: "success" },
+			},
+		});
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
+
+		await agentEnd.promise;
+		await session.waitForIdle();
+
+		expect(handoffSpy).toHaveBeenCalledTimes(1);
+		expect(continueSpy).not.toHaveBeenCalled();
+		expect(agentEnds).toEqual([{ isTerminal: true, responseAnchorTerminal: true }]);
+	});
+
+	it("terminalizes a committed compaction continuation that fails before agent_start", async () => {
+		activateOngoingGoal("post-compaction-prompt-failure");
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockRejectedValue(new Error("prompt failed before start"));
+		vi.spyOn(session, "getContextUsage").mockReturnValue({ tokens: 1000, contextWindow: 200000, percent: 0.5 });
+
+		const agentEnd = Promise.withResolvers<void>();
+		const agentEnds: Array<{ isTerminal: boolean | undefined; responseAnchorTerminal: boolean | undefined }> = [];
+		session.subscribe(event => {
+			if (event.type !== "agent_end") return;
+			agentEnds.push({ isTerminal: event.isTerminal, responseAnchorTerminal: event.responseAnchorTerminal });
+			agentEnd.resolve();
+		});
+
+		const assistantMsg = highUsageAssistant();
+		session.agent.emitExternalEvent({ type: "message_end", message: assistantMsg });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
+		await agentEnd.promise;
+		await session.waitForIdle();
+
+		expect(promptSpy).toHaveBeenCalledTimes(1);
+		expect(agentEnds).toEqual([{ isTerminal: true, responseAnchorTerminal: true }]);
+		expect(sessionManager.getBranch()).toContainEqual(
+			expect.objectContaining({
+				type: "message",
+				message: expect.objectContaining({
+					role: "assistant",
+					responseAnchorTerminal: true,
+				}),
+			}),
+		);
+	});
+
+	it("keeps the response terminal when the goal ends before the post-compaction task is runnable", async () => {
+		activateOngoingGoal("post-compaction-runnable-guard");
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined as never);
+		vi.spyOn(session.agent, "continue").mockResolvedValue();
+		vi.spyOn(session, "getContextUsage").mockReturnValue({ tokens: 1000, contextWindow: 200000, percent: 0.5 });
+
+		const agentEnds: Array<{ isTerminal: boolean | undefined; responseAnchorTerminal: boolean | undefined }> = [];
+		session.subscribe(event => {
+			if (event.type === "auto_compaction_end") {
+				queueMicrotask(() => session.setGoalModeState(undefined));
+			}
+			if (event.type === "agent_end") {
+				agentEnds.push({
+					isTerminal: event.isTerminal,
+					responseAnchorTerminal: event.responseAnchorTerminal,
+				});
+			}
+		});
+
+		const assistantMsg = highUsageAssistant();
+		session.agent.emitExternalEvent({ type: "message_end", message: assistantMsg });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
+		await session.waitForIdle();
+
+		expect(promptSpy).not.toHaveBeenCalled();
+		expect(agentEnds).toEqual([{ isTerminal: true, responseAnchorTerminal: true }]);
+	});
+
 	it("waits for deferred handoff scheduling before marking a response nonterminal", async () => {
 		activateOngoingGoal("deferred-handoff-schedule");
 		session.settings.set("compaction.methodOrder", ["handoff"]);
@@ -492,11 +605,11 @@ describe("AgentSession auto-compaction progress guard", () => {
 	});
 
 	it("marks a settled Cursor exec-resolved tool call terminal when deferred scheduling rejects its queued continuation", async () => {
-		const agentEnds: Array<boolean | undefined> = [];
+		const agentEnds: Array<{ isTerminal: boolean | undefined; responseAnchorTerminal: boolean | undefined }> = [];
 		const agentEnd = Promise.withResolvers<void>();
 		session.subscribe(event => {
 			if (event.type !== "agent_end") return;
-			agentEnds.push(event.isTerminal);
+			agentEnds.push({ isTerminal: event.isTerminal, responseAnchorTerminal: event.responseAnchorTerminal });
 			agentEnd.resolve();
 		});
 		const cursorModel = getBundledModel("cursor", "composer-2.5");
@@ -528,7 +641,16 @@ describe("AgentSession auto-compaction progress guard", () => {
 
 		await agentEnd.promise;
 
-		expect(agentEnds).toEqual([true]);
+		expect(agentEnds).toEqual([{ isTerminal: true, responseAnchorTerminal: true }]);
+		expect(sessionManager.getBranch()).toContainEqual(
+			expect.objectContaining({
+				type: "message",
+				message: expect.objectContaining({
+					role: "assistant",
+					responseAnchorTerminal: true,
+				}),
+			}),
+		);
 		session.agent.clearAllQueues();
 	});
 

@@ -62,6 +62,7 @@ import {
 } from "./retry-fallback-chains";
 import { getLatestCompactionEntry } from "./session-context";
 import { EPHEMERAL_MODEL_CHANGE_ROLE, type SessionEntry } from "./session-entries";
+import type { DeferredHandoffOutcome } from "./session-maintenance";
 import type { SessionManager } from "./session-manager";
 import { sameMessageContent, sessionMessagePersistenceKey } from "./turn-persistence";
 import { classifyUnexpectedStop, isUnexpectedStopCandidate } from "./unexpected-stop-classifier";
@@ -108,6 +109,7 @@ function retryableAssistantTurnEnd(messages: readonly AgentMessage[]): number | 
 export interface RecoveryCompactionResult {
 	deferredHandoff: boolean;
 	continuationScheduled: boolean;
+	deferredHandoffOutcome?: DeferredHandoffOutcome;
 	automaticContinuationBlocked?: boolean;
 	historyRewritten?: boolean;
 }
@@ -168,6 +170,7 @@ export interface TurnRecoveryHost {
 			suppressHandoff?: boolean;
 			phase?: CodexCompactionContext["phase"];
 			terminalTextAnswer?: boolean;
+			onContinuationSuperseded?: () => Promise<void>;
 		},
 	): Promise<RecoveryCompactionResult>;
 	withBashBranchTransition<T>(operation: () => T): T;
@@ -386,13 +389,11 @@ export class TurnRecovery {
 
 	/** Closes a failed retry saga when no compaction continuation took ownership. */
 	async onErrorSettledWithoutRetry(message: AssistantMessage, compaction: RecoveryCompactionResult): Promise<void> {
-		if (
-			message.stopReason !== "error" ||
-			this.#retryAttempt === 0 ||
-			compaction.deferredHandoff ||
-			compaction.continuationScheduled
-		)
-			return;
+		if (message.stopReason !== "error" || this.#retryAttempt === 0) return;
+		const continuationScheduled =
+			compaction.continuationScheduled || (await compaction.deferredHandoffOutcome?.continuationScheduled) === true;
+		if (continuationScheduled) return;
+
 		const attempt = this.#retryAttempt;
 		this.#retryAttempt = 0;
 		await this.#host.emitSessionEvent({
@@ -429,7 +430,11 @@ export class TurnRecovery {
 		reason: "overflow" | "incomplete",
 		message: AssistantMessage,
 		allowDefer: boolean,
-		options: { autoContinue: boolean; triggerContextTokens?: number },
+		options: {
+			autoContinue: boolean;
+			triggerContextTokens?: number;
+			onContinuationSuperseded?: () => Promise<void>;
+		},
 	): Promise<RecoveryCompactionResult> {
 		return this.#runRecoveryCompactionWithRollback(reason, message, allowDefer, options);
 	}
@@ -902,7 +907,11 @@ export class TurnRecovery {
 		reason: "overflow" | "incomplete",
 		assistantMessage: AssistantMessage,
 		allowDefer: boolean,
-		options: { autoContinue: boolean; triggerContextTokens?: number },
+		options: {
+			autoContinue: boolean;
+			triggerContextTokens?: number;
+			onContinuationSuperseded?: () => Promise<void>;
+		},
 	): Promise<RecoveryCompactionResult> {
 		const compactionEntryBefore = getLatestCompactionEntry(this.#host.sessionManager.getBranch());
 		await this.dropPersistedAssistantTurn(assistantMessage);
@@ -910,6 +919,7 @@ export class TurnRecovery {
 			autoContinue: options.autoContinue,
 			triggerContextTokens: options.triggerContextTokens,
 			phase: "mid_turn",
+			onContinuationSuperseded: options.onContinuationSuperseded,
 		});
 		const compactionEntryAfter = getLatestCompactionEntry(this.#host.sessionManager.getBranch());
 		if (result.historyRewritten !== true && compactionEntryAfter === compactionEntryBefore) {

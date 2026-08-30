@@ -577,6 +577,28 @@ describe("EventController mixed assistant text/tool rendering", () => {
 		expect(chatContainer.render(120).join("\n")).not.toContain("\x1b]133;");
 	});
 
+	it("anchors a parked response when a nonterminal continuation is later superseded", async () => {
+		const { controller, chatContainer } = createFixture();
+		const response = assistantMessage([{ type: "text", text: "SUPERSEDED CONTINUATION REPLY" }], {
+			responseAnchorId: "superseded-response",
+		});
+		await controller.handleEvent({ type: "message_start", message: assistantMessage([]) });
+		await controller.handleEvent({ type: "message_end", message: response });
+		await settleAgent(controller, [response], {
+			isTerminal: false,
+			responseAnchorId: "superseded-response",
+			responseAnchorTerminal: false,
+		});
+		expect(chatContainer.render(120).join("\n")).not.toContain(":superseded-response\x07");
+
+		await settleAgent(controller, [response], {
+			isTerminal: true,
+			responseAnchorId: "superseded-response",
+			responseAnchorTerminal: true,
+		});
+		expect(chatContainer.render(120).join("\n")).toContain(":superseded-response\x07");
+	});
+
 	it("keeps assistant text streaming while hiding bash failures and grouped read activity", async () => {
 		const { controller, chatContainer } = createFixture(true);
 		const bashCall: ToolCall = {

@@ -551,6 +551,8 @@ class AssistantMessage(TypedDict, total=False):
     provider: str
     model: str
     responseId: NotRequired[str]
+    responseAnchorId: NotRequired[str]
+    responseAnchorTerminal: NotRequired[bool]
     usage: Usage
     stopReason: StopReason
     errorMessage: NotRequired[str]
@@ -1006,6 +1008,8 @@ class AgentEndEvent:
     type: Literal["agent_end"] = "agent_end"
     message_count: int | None = field(default=None, kw_only=True)
     is_terminal: bool | None = field(default=None, kw_only=True)
+    response_anchor_id: str | None = field(default=None, kw_only=True)
+    response_anchor_terminal: bool | None = field(default=None, kw_only=True)
 
 
 @dataclass(slots=True, frozen=True)
@@ -1018,6 +1022,7 @@ class TurnEndEvent:
     message: AgentMessage
     tool_results: tuple[ToolResultMessage, ...]
     type: Literal["turn_end"] = "turn_end"
+    will_continue: bool = field(default=False, kw_only=True)
 
 
 @dataclass(slots=True, frozen=True)
@@ -1653,6 +1658,8 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
             ),
             message_count=_optional_int(payload, "messageCount"),
             is_terminal=_optional_bool(payload, "isTerminal"),
+            response_anchor_id=_optional_str(payload, "responseAnchorId"),
+            response_anchor_terminal=_optional_bool(payload, "responseAnchorTerminal"),
         )
     if event_type == "turn_start":
         return TurnStartEvent()
@@ -1669,6 +1676,7 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
                 )
                 for item in cast(list[Any], payload.get("toolResults") or [])
             ),
+            will_continue=_optional_bool(payload, "willContinue") is True,
         )
     if event_type == "message_start":
         return MessageStartEvent(

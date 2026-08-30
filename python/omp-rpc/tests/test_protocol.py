@@ -10,6 +10,7 @@ from omp_rpc import (
     MessageUpdateEvent,
     SessionState,
     TodoReminderEvent,
+    TurnEndEvent,
     assistant_text,
     assistant_text_with_thinking,
     parse_notification,
@@ -186,6 +187,8 @@ class ProtocolParsingTests(unittest.TestCase):
                         "api": "anthropic-messages",
                         "provider": "anthropic",
                         "model": "claude-sonnet-4-5",
+                        "responseAnchorId": "session-a:reply-1",
+                        "responseAnchorTerminal": False,
                         "usage": {
                             "input": 1,
                             "output": 1,
@@ -206,6 +209,8 @@ class ProtocolParsingTests(unittest.TestCase):
                 ],
                 "messageCount": 1,
                 "isTerminal": False,
+                "responseAnchorId": "session-a:reply-1",
+                "responseAnchorTerminal": True,
             }
         )
 
@@ -213,11 +218,52 @@ class ProtocolParsingTests(unittest.TestCase):
         self.assertEqual(assistant_text(notification.messages[0]), "hello")
         self.assertEqual(notification.message_count, 1)
         self.assertFalse(notification.is_terminal)
+        self.assertEqual(notification.response_anchor_id, "session-a:reply-1")
+        self.assertTrue(notification.response_anchor_terminal)
+        self.assertEqual(notification.messages[0]["responseAnchorId"], "session-a:reply-1")
+        self.assertFalse(notification.messages[0]["responseAnchorTerminal"])
 
         legacy = AgentEndEvent(notification.messages, "agent_end")
         self.assertEqual(legacy.type, "agent_end")
         self.assertIsNone(legacy.message_count)
         self.assertIsNone(legacy.is_terminal)
+        self.assertIsNone(legacy.response_anchor_id)
+        self.assertIsNone(legacy.response_anchor_terminal)
+
+    def test_parse_turn_end_will_continue_with_legacy_default(self) -> None:
+        assistant = {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "hello"}],
+            "api": "anthropic-messages",
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-5",
+            "usage": {
+                "input": 1,
+                "output": 1,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "totalTokens": 2,
+                "cost": {
+                    "input": 0.0,
+                    "output": 0.0,
+                    "cacheRead": 0.0,
+                    "cacheWrite": 0.0,
+                    "total": 0.0,
+                },
+            },
+            "stopReason": "stop",
+            "timestamp": 1,
+        }
+        continuing = parse_notification(
+            {"type": "turn_end", "message": assistant, "toolResults": [], "willContinue": True}
+        )
+        legacy = parse_notification({"type": "turn_end", "message": assistant, "toolResults": []})
+
+        self.assertIsInstance(continuing, TurnEndEvent)
+        self.assertTrue(continuing.will_continue)
+        self.assertIsInstance(legacy, TurnEndEvent)
+        self.assertFalse(legacy.will_continue)
+        self.assertFalse(TurnEndEvent(continuing.message, ()).will_continue)
 
     def test_parse_current_compaction_variants(self) -> None:
         start = parse_notification(

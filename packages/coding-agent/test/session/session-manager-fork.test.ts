@@ -179,6 +179,7 @@ describe("SessionManager forks", () => {
 				},
 				stopReason: "stop",
 				timestamp: 777,
+				responseAnchorTerminal: true,
 				...(responseAnchorId === undefined ? {} : { responseAnchorId }),
 			};
 			return { type: "message", id, parentId, timestamp, message };
@@ -309,7 +310,7 @@ describe("SessionManager forks", () => {
 			if (final?.type !== "message" || final.message.role !== "assistant") {
 				throw new Error("Expected final legacy assistant");
 			}
-			expect(synthesized.message.responseAnchorId).toBe(responseAnchorIdForEntry("legacy-synthesized"));
+			expect(synthesized.message.responseAnchorId).toBeUndefined();
 			expect(synthesized.message.responseAnchorTerminal).toBeUndefined();
 			expect(preexisting.message.responseAnchorId).toBe(preexistingAnchorId);
 			expect(preexisting.message.responseAnchorTerminal).toBeUndefined();

@@ -75,6 +75,47 @@ function messageTexts(entries: FileEntry[]): string[] {
 	return texts;
 }
 
+describe("restoreSessionJournal response terminal corrections", () => {
+	it("applies a correction only to the assistant occurrence already in the journal", () => {
+		const assistant = (id: string, parentId: string, text: string) =>
+			({
+				type: "message",
+				id,
+				parentId,
+				timestamp: ISO,
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text }],
+					api: "anthropic-messages",
+					provider: "anthropic",
+					model: "test-model",
+					usage: {
+						input: 1,
+						output: 1,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 2,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "stop",
+					timestamp: 1,
+					responseAnchorId: "duplicate-anchor",
+				},
+			}) as unknown as FileEntry;
+		const first = assistant("a1", "s1", "first");
+		const second = assistant("a2", "a1", "second");
+		const restored = sessionLoader.restoreSessionJournal([
+			HEADER as FileEntry,
+			first,
+			{ type: "response_anchor_terminal", responseAnchorId: "duplicate-anchor", terminal: true },
+			second,
+		]);
+		const messages = restored.entries.filter(entry => entry.type === "message");
+
+		expect(messages[0]?.message).toMatchObject({ responseAnchorTerminal: true });
+		expect(messages[1]?.message).not.toHaveProperty("responseAnchorTerminal");
+	});
+});
 describe("loadEntriesFromFileStream (Bun.JSONL parity)", () => {
 	it("visits entries incrementally while skipping malformed lines", async () => {
 		const slotLine = serializeTitleSlot({ title: "Visitor", source: "user", updatedAt: ISO });

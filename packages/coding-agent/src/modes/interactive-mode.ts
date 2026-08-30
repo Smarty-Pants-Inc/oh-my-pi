@@ -2138,9 +2138,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		const livePendingTools = new Map<string, ToolExecutionHandle>();
 		const preservedLivePostToolComponents: PreservedLivePostToolComponent[] = [];
 		const isStreaming = this.viewSession?.isStreaming === true;
-		const preservedLiveResponseAnchorCandidate = isStreaming
-			? this.eventController.liveLeadingResponseAnchorCandidate()
-			: undefined;
+		const preservedLiveResponseAnchorCandidate = this.eventController.liveLeadingResponseAnchorCandidate();
 		const liveSet = new Set<Component>();
 		const livePostToolComponents = new Map<Component, PreservedLivePostToolComponent>();
 		if (isStreaming && this.streamingComponent) liveSet.add(this.streamingComponent);

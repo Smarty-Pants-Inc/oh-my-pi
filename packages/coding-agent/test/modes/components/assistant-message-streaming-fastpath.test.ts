@@ -278,6 +278,18 @@ Average Latency: 1,240 ms
 		}
 	});
 
+	it("keeps a multiline response marker balanced on its anchor row", () => {
+		const component = new AssistantMessageComponent(msg([{ type: "text", text: "anchor row\nsecond row" }]));
+		component.setResponseAnchor(true);
+		const lines = component.render(W);
+		const anchorRow = lines.findIndex(line => Bun.stripANSI(line).includes("anchor row"));
+		const secondRow = lines.findIndex(line => Bun.stripANSI(line).includes("second row"));
+
+		expect(String(lines[anchorRow])).toContain("\x1b]133;A;aid=omp-response-");
+		expect(String(lines[anchorRow])).toContain("\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07");
+		expect(String(lines[secondRow])).not.toContain("\x1b]133;");
+	});
+
 	it("uses a visible candidate in the eligible final segment when trailing Markdown is hidden", () => {
 		const component = new AssistantMessageComponent();
 		component.updateContent(

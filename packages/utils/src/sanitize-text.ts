@@ -14,18 +14,62 @@
 
 const ESC_CHAR = "\x1b";
 
-const OSC_133_PREFIX = "\x1b]133";
-const C1_OSC_133_PREFIX = "\x9d133";
+const C1_OSC_CHAR = "\x9d";
 const C1_ST_CHAR = "\x9c";
-const OSC_133_PREFIXES = [OSC_133_PREFIX, C1_OSC_133_PREFIX] as const;
 
-function trailingOsc133Prefix(text: string): string | undefined {
-	for (const prefix of OSC_133_PREFIXES) {
-		for (let length = prefix.length - 1; length > 0; length--) {
-			if (text.endsWith(prefix.slice(0, length))) return prefix.slice(0, length);
-		}
+function isOscIgnoredControl(code: number): boolean {
+	return (
+		(code >= 0x00 && code <= 0x06) ||
+		(code >= 0x08 && code <= 0x17) ||
+		code === 0x19 ||
+		(code >= 0x1c && code <= 0x1f) ||
+		code === 0x7f
+	);
+}
+
+function isEscapeIgnoredControl(code: number): boolean {
+	return (code >= 0x00 && code <= 0x17) || code === 0x19 || (code >= 0x1c && code <= 0x1f) || code === 0x7f;
+}
+function osc133CandidateAt(text: string, start: number): { prefix: string; payloadStart?: number } | undefined {
+	let index = start;
+	let prefix = "";
+	if (text.charCodeAt(index) === 0x1b) {
+		prefix = ESC_CHAR;
+		index++;
+		while (index < text.length && isEscapeIgnoredControl(text.charCodeAt(index))) index++;
+		if (index === text.length) return { prefix };
+		if (text[index] !== "]") return undefined;
+		prefix += "]";
+		index++;
+	} else if (text.charCodeAt(index) === 0x9d) {
+		prefix = C1_OSC_CHAR;
+		index++;
+	} else {
+		return undefined;
 	}
-	return undefined;
+
+	for (const digit of "133") {
+		while (index < text.length && isOscIgnoredControl(text.charCodeAt(index))) index++;
+		if (index === text.length) return { prefix };
+		if (text[index] !== digit) return undefined;
+		prefix += digit;
+		index++;
+	}
+	while (index < text.length && isOscIgnoredControl(text.charCodeAt(index))) index++;
+	const next = text.charCodeAt(index);
+	if (!Number.isNaN(next) && next >= 0x30 && next <= 0x39) return undefined;
+	return { prefix, payloadStart: index };
+}
+
+function trailingOsc133Prefix(text: string): { start: number; prefix: string } | undefined {
+	let partial: { start: number; prefix: string } | undefined;
+	for (let start = 0; start < text.length; start++) {
+		const first = text.charCodeAt(start);
+		if (first !== 0x1b && first !== 0x9d) continue;
+		const candidate = osc133CandidateAt(text, start);
+		if (candidate && candidate.payloadStart === undefined) partial = { start, prefix: candidate.prefix };
+	}
+	return partial;
 }
 
 function findOsc133Start(
@@ -34,19 +78,10 @@ function findOsc133Start(
 ): { start: number; payloadStart: number; prefix: string } | undefined {
 	for (let start = from; start < text.length; start++) {
 		const first = text.charCodeAt(start);
-		const prefix =
-			first === 0x1b && text.startsWith(OSC_133_PREFIX, start)
-				? OSC_133_PREFIX
-				: first === 0x9d && text.startsWith(C1_OSC_133_PREFIX, start)
-					? C1_OSC_133_PREFIX
-					: undefined;
-		if (!prefix) continue;
-
-		const payloadStart = start + prefix.length;
-		const next = text.charCodeAt(payloadStart);
-		// OSC 1337 is a distinct sequence; every non-digit terminates the
-		// numeric command, including an incomplete OSC 133 at end-of-input.
-		if (Number.isNaN(next) || next < 0x30 || next > 0x39) return { start, payloadStart, prefix };
+		if (first !== 0x1b && first !== 0x9d) continue;
+		const candidate = osc133CandidateAt(text, start);
+		if (candidate?.payloadStart !== undefined)
+			return { start, payloadStart: candidate.payloadStart, prefix: candidate.prefix };
 	}
 	return undefined;
 }
@@ -55,9 +90,20 @@ function osc133End(text: string, from: number): { index: number; complete: boole
 	for (let index = from; index < text.length; index++) {
 		const char = text[index]!;
 		if (char === "\x07" || char === C1_ST_CHAR) return { index: index + 1, complete: true };
-		if (char === ESC_CHAR && text[index + 1] === "\\") return { index: index + 2, complete: true };
+		if (char === "\x18" || char === "\x1a") return { index: index + 1, complete: true };
+		if (char !== ESC_CHAR) continue;
+		if (index + 1 === text.length) return { index: text.length, complete: false };
+		if (text[index + 1] === "\\") return { index: index + 2, complete: true };
+		// ESC followed by anything other than ST cancels the OSC and begins a
+		// fresh escape sequence. Resume scanning at that ESC so its suffix remains.
+		return { index, complete: true };
 	}
 	return { index: text.length, complete: false };
+}
+
+function appendBeforeStrippedSequence(output: string[], segment: string): void {
+	const partial = trailingOsc133Prefix(segment);
+	output.push(partial ? segment.slice(0, partial.start) : segment);
 }
 
 /**
@@ -70,10 +116,13 @@ export function stripOsc133Append(text: string, pending: string = ""): { text: s
 	let sequence = findOsc133Start(source, 0);
 	if (!sequence) {
 		const partial = trailingOsc133Prefix(source);
-		return partial ? { text: source.slice(0, -partial.length), pending: partial } : { text: source, pending: "" };
+		return partial
+			? { text: source.slice(0, partial.start), pending: partial.prefix }
+			: { text: source, pending: "" };
 	}
 
-	const output = [source.slice(0, sequence.start)];
+	const output: string[] = [];
+	appendBeforeStrippedSequence(output, source.slice(0, sequence.start));
 	for (;;) {
 		const end = osc133End(source, sequence.payloadStart);
 		if (!end.complete) {
@@ -88,11 +137,11 @@ export function stripOsc133Append(text: string, pending: string = ""): { text: s
 		if (!sequence) {
 			const suffix = source.slice(end.index);
 			const partial = trailingOsc133Prefix(suffix);
-			if (partial) output.push(suffix.slice(0, -partial.length));
+			if (partial) output.push(suffix.slice(0, partial.start));
 			else output.push(suffix);
-			return { text: output.join(""), pending: partial ?? "" };
+			return { text: output.join(""), pending: partial?.prefix ?? "" };
 		}
-		output.push(source.slice(end.index, sequence.start));
+		appendBeforeStrippedSequence(output, source.slice(end.index, sequence.start));
 	}
 }
 

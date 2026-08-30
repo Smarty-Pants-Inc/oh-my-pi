@@ -1,7 +1,6 @@
 import type { AssistantMessage, ImageContent } from "@oh-my-pi/pi-ai";
 import {
 	Container,
-	createResponseZoneLine,
 	Image,
 	type ImageBudget,
 	ImageProtocol,
@@ -10,93 +9,20 @@ import {
 	Spacer,
 	TERMINAL,
 	Text,
-	visibleWidth,
 } from "@oh-my-pi/pi-tui";
 import { formatNumber } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import type { AssistantThinkingRenderer } from "../../extensibility/extensions/types";
 import { getMarkdownTheme, theme } from "../../modes/theme/theme";
-import {
-	createResponseAnchorId,
-	isSafeResponseAnchorId,
-	responseAnchorIdOrFallback,
-} from "../../session/response-anchor";
-import { sameMessageContent, sessionMessagePersistenceKey } from "../../session/turn-persistence";
+import { createResponseAnchorId, responseAnchorIdOrFallback } from "../../session/response-anchor";
+import { sessionMessagePersistenceKey } from "../../session/turn-persistence";
 import { expandKeyHint, getPreviewLines, resolveImageOptions, TRUNCATE_LENGTHS } from "../../tools/render-utils";
 import { convertImageToPng } from "../../utils/image-loading";
 import { canonicalizeMessage, formatThinkingForDisplay, hasDisplayableThinking } from "../../utils/thinking-display";
 import { resolveAssistantErrorPresentation } from "../utils/transcript-render-helpers";
+import { matchesAssistantReplayMessage } from "./assistant-message-identity";
 import { type CacheInvalidation, CacheInvalidationMarkerComponent } from "./cache-invalidation-marker";
-
-// Reply markers are carried as structured TUI rows. The final writer strips
-// every textual OSC 133 sequence, then restores only these process-branded edges.
-class ResponseAnchorMarkdown extends Markdown {
-	#responseAnchorId: string;
-	#enabled = false;
-	#zoneSource: readonly string[] | undefined;
-	#zoneLines: string[] | undefined;
-
-	constructor(responseAnchorId: string, ...args: ConstructorParameters<typeof Markdown>) {
-		super(...args);
-		this.#responseAnchorId = responseAnchorId;
-	}
-
-	setEnabled(enabled: boolean): void {
-		if (this.#enabled === enabled) return;
-		this.#enabled = enabled;
-		this.#zoneSource = undefined;
-		this.#zoneLines = undefined;
-	}
-
-	setResponseAnchorId(responseAnchorId: string): void {
-		if (this.#responseAnchorId === responseAnchorId) return;
-		this.#responseAnchorId = responseAnchorId;
-		this.#zoneSource = undefined;
-		this.#zoneLines = undefined;
-	}
-
-	hasVisibleGlyphCells(width: number): boolean {
-		return this.#visibleGlyphLineIndex(super.render(width)) !== undefined;
-	}
-
-	#visibleGlyphLineIndex(lines: readonly string[], fromEnd = false): number | undefined {
-		for (let offset = 0; offset < lines.length; offset++) {
-			const index = fromEnd ? lines.length - offset - 1 : offset;
-			if (visibleWidth(lines[index]!.trim()) > 0) return index;
-		}
-		return undefined;
-	}
-
-	override invalidate(): void {
-		super.invalidate();
-		this.#zoneSource = undefined;
-		this.#zoneLines = undefined;
-	}
-
-	override render(width: number): readonly string[] {
-		const lines = super.render(width);
-		if (!this.#enabled || lines.length === 0) return lines;
-		if (this.#zoneSource === lines && this.#zoneLines !== undefined) return this.#zoneLines;
-		const firstVisible = this.#visibleGlyphLineIndex(lines);
-		if (firstVisible === undefined) return lines;
-		const lastVisible = this.#visibleGlyphLineIndex(lines, true)!;
-		const wrapped = lines.slice();
-		if (firstVisible === lastVisible) {
-			wrapped[firstVisible] = createResponseZoneLine(String(wrapped[firstVisible]), {
-				responseAnchorId: this.#responseAnchorId,
-				close: true,
-			});
-		} else {
-			wrapped[firstVisible] = createResponseZoneLine(String(wrapped[firstVisible]), {
-				responseAnchorId: this.#responseAnchorId,
-			});
-			wrapped[lastVisible] = createResponseZoneLine(String(wrapped[lastVisible]), { close: true });
-		}
-		this.#zoneSource = lines;
-		this.#zoneLines = wrapped;
-		return wrapped;
-	}
-}
+import { ResponseAnchorMarkdown } from "./response-anchor-markdown";
 
 /**
  * Max lines of a turn-ending provider error rendered inline in the transcript.
@@ -225,27 +151,6 @@ function lerpHex(from: string, to: string, t: number): string {
 	const g = Math.round(fg + (tg - fg) * k);
 	const b = Math.round(fb + (tb - fb) * k);
 	return `#${((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1)}`;
-}
-
-/** Whether two assistant messages represent the same durable response occurrence. */
-export function matchesAssistantReplayMessage(current: AssistantMessage, message: AssistantMessage): boolean {
-	const currentKey = sessionMessagePersistenceKey(current);
-	if (currentKey !== undefined && currentKey === sessionMessagePersistenceKey(message)) {
-		return sameMessageContent(current, message);
-	}
-	if (
-		current.timestamp !== message.timestamp ||
-		current.provider !== message.provider ||
-		current.model !== message.model ||
-		current.responseId !== message.responseId ||
-		current.stopReason !== message.stopReason
-	) {
-		return false;
-	}
-	if (isSafeResponseAnchorId(current.responseAnchorId) && isSafeResponseAnchorId(message.responseAnchorId)) {
-		return false;
-	}
-	return sameMessageContent(current, message);
 }
 
 /**
