@@ -8,6 +8,7 @@ import {
 	TUI,
 } from "@oh-my-pi/pi-tui";
 import type { Terminal, TerminalAppearance } from "@oh-my-pi/pi-tui/terminal";
+import { ImageProtocol, TERMINAL } from "@oh-my-pi/pi-tui/terminal-capabilities";
 import { defaultMarkdownTheme } from "./test-themes";
 
 class CaptureTerminal implements Terminal {
@@ -214,6 +215,58 @@ describe("issue #2045: renderer bounds oversized rows", () => {
 		expect(rendered).not.toContain("\x1b]133;");
 	});
 
+	it("strips terminal controls decoded from Markdown numeric HTML entities", async () => {
+		const term = new CaptureTerminal(80, 4);
+		const tui = new TUI(term);
+		const encoded =
+			"<span>&#27;[2A&#27;[H&#27;[2J&#27;]52;c;Y2xpcGJvYXJk&#7;&#27;Pqpayload&#27;&#92;&#155;2A</span>reply";
+		tui.addChild(new Markdown(encoded, 0, 0, defaultMarkdownTheme));
+		try {
+			tui.start();
+			await settle();
+		} finally {
+			tui.stop();
+		}
+
+		const rendered = term.writes.join("");
+		expect(rendered).not.toContain("\x1b[2A");
+		expect(rendered).not.toContain("\x1b[H");
+		expect(rendered).not.toContain("\x1b[2J");
+		expect(rendered).not.toContain("\x1b]52;");
+		expect(rendered).not.toContain("\x1bPq");
+		expect(rendered).not.toContain("\u009b");
+		expect(Bun.stripANSI(rendered)).toContain("reply");
+	});
+
+	it("sanitizes image-like Markdown controls even when that protocol is active", async () => {
+		const terminalInfo = TERMINAL as unknown as { imageProtocol: ImageProtocol | null };
+		const originalProtocol = terminalInfo.imageProtocol;
+		const cases = [
+			[ImageProtocol.Kitty, "<span>&#27;_Ga=d,d=A,q=2&#27;&#92;</span>after", "\x1b_Ga=d"],
+			[ImageProtocol.Sixel, "<span>&#27;Pqpayload&#27;&#92;</span>after", "\x1bPq"],
+			[ImageProtocol.Iterm2, "<span>&#27;]1337;File=inline=1:AAAA&#7;</span>after", "\x1b]1337;File="],
+		] as const;
+		try {
+			for (const [protocol, encoded, forbidden] of cases) {
+				terminalInfo.imageProtocol = protocol;
+				const term = new CaptureTerminal(80, 4);
+				const tui = new TUI(term);
+				tui.addChild(new Markdown(encoded, 0, 0, defaultMarkdownTheme));
+				try {
+					tui.start();
+					await settle();
+				} finally {
+					tui.stop();
+				}
+				const rendered = term.writes.join("");
+				expect(rendered).not.toContain(forbidden);
+				expect(Bun.stripANSI(rendered)).toContain("after");
+			}
+		} finally {
+			terminalInfo.imageProtocol = originalProtocol;
+		}
+	});
+
 	it("strips terminal-equivalent OSC 133 with ignored command controls", async () => {
 		const term = new CaptureTerminal(80, 4);
 		const tui = new TUI(term);
@@ -250,6 +303,41 @@ describe("issue #2045: renderer bounds oversized rows", () => {
 		expect(rendered).toContain(RESPONSE_ZONE_CLOSE);
 		expect(rendered).not.toContain(CURSOR_MARKER);
 		expect(Bun.stripANSI(rendered)).toContain("beforeafter");
+	});
+
+	it("keeps a trusted reply anchor while dropping untrusted terminal side effects", async () => {
+		const term = new CaptureTerminal(80, 4);
+		const tui = new TUI(term);
+		const styled = "\x1b[31mstyled\x1b[0m";
+		const hyperlink = "\x1b]8;;https://example.com\x07link\x1b]8;;\x07";
+		const hostile = "\x1b[2A\x1b[H\x1b[2J\x1b]52;c;Y2xpcGJvYXJk\x07\x1bPqpayload\x1b\\\u009b2A";
+		tui.addChild(
+			new RawLinesComponent([
+				createResponseZoneLine(`before${styled}${hyperlink}${hostile}reply`, {
+					responseAnchorId: "anchor",
+					close: true,
+				}),
+			]),
+		);
+		try {
+			tui.start();
+			await settle();
+		} finally {
+			tui.stop();
+		}
+
+		const rendered = term.writes.join("");
+		expect(rendered.split(RESPONSE_ZONE_START)).toHaveLength(2);
+		expect(rendered.split(RESPONSE_ZONE_CLOSE)).toHaveLength(2);
+		expect(rendered).toContain("\x1b[31mstyled\x1b[0m");
+		expect(rendered).toContain(hyperlink);
+		expect(rendered).not.toContain("\x1b[2A");
+		expect(rendered).not.toContain("\x1b[H");
+		expect(rendered).not.toContain("\x1b[2J");
+		expect(rendered).not.toContain("\x1b]52;");
+		expect(rendered).not.toContain("\x1bPq");
+		expect(rendered).not.toContain("\u009b");
+		expect(Bun.stripANSI(rendered)).toContain("beforestyledlinkreply");
 	});
 
 	it("rejects unsafe response anchor IDs in the structured channel", () => {

@@ -34,6 +34,7 @@ import {
 	synchronizedOutputUserOverride,
 	TERMINAL,
 } from "./terminal-capabilities";
+import { sanitizeAroundTrustedImageSegments } from "./trusted-output";
 import {
 	Ellipsis,
 	extractSegments,
@@ -134,10 +135,110 @@ function preserveResponseZoneLine(line: string, responseZone: ResponseZoneLineMe
 	return createResponseZoneLine(line, responseZone);
 }
 
-/** Strip untrusted shell-integration controls and restore only a process-minted reply-zone edge. */
+const MAX_ALLOWED_CSI_BYTES = 4096;
+const MAX_ALLOWED_OSC_BYTES = 8192;
+
+function csiSequenceEnd(value: string, bodyStart: number): number {
+	for (let index = bodyStart; index < value.length; index++) {
+		const code = value.charCodeAt(index);
+		if (code >= 0x40 && code <= 0x7e) return index + 1;
+	}
+	return -1;
+}
+
+function stringSequenceEnd(value: string, bodyStart: number, bellTerminated: boolean): number {
+	for (let index = bodyStart; index < value.length; index++) {
+		const code = value.charCodeAt(index);
+		if (bellTerminated && code === 0x07) return index + 1;
+		if (code === 0x9c) return index + 1;
+		if (code === 0x1b && value.charCodeAt(index + 1) === 0x5c) return index + 2;
+	}
+	return -1;
+}
+
+function isAllowedSgr(value: string, start: number, end: number): boolean {
+	if (end - start > MAX_ALLOWED_CSI_BYTES || value.charCodeAt(end - 1) !== 0x6d) return false;
+	for (let index = start + 2; index < end - 1; index++) {
+		const code = value.charCodeAt(index);
+		if (code < 0x30 || code > 0x3f) return false;
+	}
+	return true;
+}
+
+function isAllowedOsc(value: string, bodyStart: number, end: number): boolean {
+	const terminatorBytes = value.charCodeAt(end - 1) === 0x07 || value.charCodeAt(end - 1) === 0x9c ? 1 : 2;
+	const bodyEnd = end - terminatorBytes;
+	if (bodyEnd - bodyStart > MAX_ALLOWED_OSC_BYTES) return false;
+	const body = value.slice(bodyStart, bodyEnd);
+	for (let index = 0; index < body.length; index++) {
+		const code = body.charCodeAt(index);
+		if (code <= 0x1f || (code >= 0x7f && code <= 0x9f)) return false;
+	}
+	if (body.startsWith("8;")) return body.indexOf(";", 2) !== -1;
+	return body.startsWith("66;") && body.indexOf(";", 3) !== -1;
+}
+
+/**
+ * Preserve printable text, SGR, OSC 8 hyperlinks, and OSC 66 sized text while
+ * dropping cursor movement, erase/mode changes, clipboard OSC, and control
+ * strings. Image rows take their separate validated protocol path.
+ */
+function sanitizeTerminalOutputContent(value: string): string {
+	let output = "";
+	for (let index = 0; index < value.length; ) {
+		const code = value.charCodeAt(index);
+		if (code === 0x1b) {
+			const next = value.charCodeAt(index + 1);
+			if (next === 0x5b) {
+				const end = csiSequenceEnd(value, index + 2);
+				if (end === -1) break;
+				if (isAllowedSgr(value, index, end)) output += value.slice(index, end);
+				index = end;
+				continue;
+			}
+			if (next === 0x5d) {
+				const end = stringSequenceEnd(value, index + 2, true);
+				if (end === -1) break;
+				if (isAllowedOsc(value, index + 2, end)) output += value.slice(index, end);
+				index = end;
+				continue;
+			}
+			if (next === 0x50 || next === 0x58 || next === 0x5e || next === 0x5f) {
+				const end = stringSequenceEnd(value, index + 2, false);
+				if (end === -1) break;
+				index = end;
+				continue;
+			}
+			index = Math.min(index + 2, value.length);
+			continue;
+		}
+		if (code === 0x9b) {
+			const end = csiSequenceEnd(value, index + 1);
+			if (end === -1) break;
+			index = end;
+			continue;
+		}
+		if (code === 0x90 || code === 0x98 || code === 0x9d || code === 0x9e || code === 0x9f) {
+			const end = stringSequenceEnd(value, index + 1, code === 0x9d);
+			if (end === -1) break;
+			index = end;
+			continue;
+		}
+		if (code <= 0x1f || (code >= 0x7f && code <= 0x9f)) {
+			index++;
+			continue;
+		}
+		output += value[index]!;
+		index++;
+	}
+	return output;
+}
+
+/** Strip untrusted controls and restore only a process-minted reply-zone edge. */
 export function prepareTerminalOutputLine(raw: string): string {
 	const { content, responseZone } = responseZoneLine(raw);
-	return applyResponseZone(content, responseZone);
+	const safe = sanitizeAroundTrustedImageSegments(content, sanitizeTerminalOutputContent).content;
+	return applyResponseZone(safe, responseZone);
 }
 // Hide the hardware cursor before each paint/move write. Ghostty-style bar
 // cursors can otherwise leave visual afterimages while the TUI repaints the
@@ -2347,10 +2448,11 @@ export class TUI extends Container {
 
 	#prepareLine(raw: string, width: number): PreparedLine {
 		const { content: source, responseZone } = responseZoneLine(raw);
-		if (TERMINAL.isImageLine(source)) {
-			return { raw: source, width, line: source };
+		const prepared = sanitizeAroundTrustedImageSegments(source, sanitizeTerminalOutputContent);
+		if (prepared.hasTrustedImage) {
+			return { raw: source, width, line: applyResponseZone(prepared.content, responseZone) };
 		}
-		const fitted = this.#lineFitSource(source, width);
+		const fitted = this.#lineFitSource(prepared.content, width);
 		const normalized = normalizeTerminalOutput(fitted);
 		const asciiWidth = this.#ansiAsciiLineWidth(normalized, width);
 		const line =

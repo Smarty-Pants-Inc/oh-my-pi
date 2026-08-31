@@ -11,6 +11,7 @@ import {
 	TERMINAL,
 	wrapTmuxPassthrough,
 } from "@oh-my-pi/pi-tui/terminal-capabilities";
+import { stripTrustedImageMarkers } from "../src/trusted-output";
 import { withoutTerminalMultiplexer } from "./helpers/terminal-multiplexer";
 
 withoutTerminalMultiplexer();
@@ -62,7 +63,7 @@ describe("kitty direct-placement wire format", () => {
 		const lines = image.render(40);
 		budget.endPass();
 		expect(lines.length).toBe(6);
-		const parsed = parseKittyDirectPlacementLine(lines[lines.length - 1]!);
+		const parsed = parseKittyDirectPlacementLine(stripTrustedImageMarkers(lines[lines.length - 1]!));
 		expect(parsed).toEqual({ imageId, placementId: imageId, columns: 4, rows: 6 });
 	});
 

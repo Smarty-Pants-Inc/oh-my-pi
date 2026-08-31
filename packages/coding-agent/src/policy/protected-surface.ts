@@ -883,7 +883,7 @@ const PATH_RULES: readonly PathRule[] = [
 	},
 	{
 		pattern:
-			/(?:^|\/)packages\/coding-agent\/src\/session\/(?:checkpoint-entries|session-entries|session-memory|session-workspace)\.[cm]?[jt]s$/i,
+			/(?:^|\/)packages\/coding-agent\/src\/session\/(?:checkpoint-entries|response-anchor|session-entries|session-memory|session-workspace)\.[cm]?[jt]s$/i,
 		surface: "provider-wrapper",
 	},
 	{

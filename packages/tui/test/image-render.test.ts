@@ -10,6 +10,7 @@ import {
 	setCellDimensions,
 	TERMINAL,
 } from "@oh-my-pi/pi-tui/terminal-capabilities";
+import { stripTrustedImageMarkers } from "../src/trusted-output";
 
 type MutableTerminalInfo = {
 	imageProtocol: ImageProtocol | null;
@@ -198,7 +199,7 @@ describe("terminal image rendering", () => {
 		);
 
 		const lines = image.render(20);
-		const imageLine = lines.at(-1) ?? "";
+		const imageLine = stripTrustedImageMarkers(lines.at(-1) ?? "");
 
 		expect(lines).toHaveLength(3);
 		expect(lines.slice(0, -1)).toEqual(["\x1b[0m", "\x1b[0m"]);
@@ -221,7 +222,7 @@ describe("terminal image rendering", () => {
 		);
 
 		const lines = image.render(20);
-		const imageLine = lines.at(-1) ?? "";
+		const imageLine = stripTrustedImageMarkers(lines.at(-1) ?? "");
 
 		expect(lines).toHaveLength(1);
 		expect(imageLine.startsWith("\x1b_Ga=T")).toBe(true);

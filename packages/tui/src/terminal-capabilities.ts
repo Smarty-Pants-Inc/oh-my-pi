@@ -10,6 +10,7 @@ import {
 	setKittyGraphics,
 } from "./kitty-graphics";
 import { isInsideTmux, wrapTmuxPassthrough, wrapTmuxPassthroughIfNeeded } from "./tmux";
+import { createTrustedImageSegment } from "./trusted-output";
 import type { HangulCompatibilityJamoWidth } from "./utils";
 
 export { isInsideTmux, wrapTmuxPassthrough } from "./tmux";
@@ -1126,7 +1127,7 @@ export function renderImage(
 					columns: fit.columns,
 					rows: fit.rows,
 				});
-				return { lines, rows: fit.rows, transmit };
+				return { lines: lines.map(createTrustedImageSegment), rows: fit.rows, transmit };
 			}
 			// Direct placement: re-emit only the tiny `a=p` on repaints.
 			const sequence = encodeKittyPlacement({

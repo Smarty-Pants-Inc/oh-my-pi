@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
-import { TUI } from "@oh-my-pi/pi-tui";
+import { type Component, TUI } from "@oh-my-pi/pi-tui";
 import { Image, ImageBudget } from "@oh-my-pi/pi-tui/components/image";
 import { Text } from "@oh-my-pi/pi-tui/components/text";
 import {
@@ -16,10 +16,12 @@ import {
 	encodeKittyTransmit,
 	getCellDimensions,
 	ImageProtocol,
+	renderImage,
 	setCellDimensions,
 	TERMINAL,
 	wrapTmuxPassthrough,
 } from "@oh-my-pi/pi-tui/terminal-capabilities";
+import { stripTrustedImageMarkers } from "../src/trusted-output";
 import { withoutTerminalMultiplexer } from "./helpers/terminal-multiplexer";
 
 withoutTerminalMultiplexer();
@@ -410,7 +412,7 @@ describe("Image budget integration", () => {
 		const lines = image.render(20);
 		budget.endPass();
 
-		const last = lines.at(-1) ?? "";
+		const last = stripTrustedImageMarkers(lines.at(-1) ?? "");
 		expect(lines).toHaveLength(4);
 		expect(lines.slice(0, -1)).toEqual(["\x1b[0m", "\x1b[0m", "\x1b[0m"]);
 		expect(last.startsWith("\x1b7\x1b[3A")).toBe(true);
@@ -436,7 +438,7 @@ describe("Image budget integration", () => {
 		const lines = image.render(20);
 		budget.endPass();
 
-		const last = lines.at(-1) ?? "";
+		const last = stripTrustedImageMarkers(lines.at(-1) ?? "");
 		expect(lines).toHaveLength(1);
 		expect(last.startsWith("\x1b_Ga=p")).toBe(true);
 		expect(last).toContain("C=1");
@@ -525,6 +527,38 @@ describe("Image budget + Unicode placeholders", () => {
 		expect(transmits).toHaveLength(1);
 		expect(transmits[0]).toContain("\x1b_Ga=t");
 		expect(transmits[0]).toContain(`i=${id}`);
+	});
+
+	it("preserves directly composed placeholder rows through the final writer", async () => {
+		const result = renderImage(
+			BASE64_ONE_PIXEL_PNG,
+			{ widthPx: 40, heightPx: 40 },
+			{ maxWidthCells: 4, maxHeightCells: 4, imageId: 42 },
+		);
+		const rows = result?.lines?.map(line => `\x1b[31m│\x1b[0m ${line} \x1b[31m│\x1b[0m`) ?? [];
+		const component: Component = {
+			invalidate() {},
+			render: () => rows,
+		};
+		const term = new VirtualTerminal(40, 8);
+		const writes: string[] = [];
+		const realWrite = term.write.bind(term);
+		vi.spyOn(term, "write").mockImplementation((data: string) => {
+			writes.push(data);
+			realWrite(data);
+		});
+		const tui = new TUI(term);
+		tui.addChild(component);
+		try {
+			tui.start();
+			await Bun.sleep(0);
+		} finally {
+			tui.stop();
+		}
+
+		const output = writes.join("");
+		expect(output).toContain("\x1b_Ga=p,U=1");
+		expect(output).not.toContain("omp-image=");
 	});
 
 	it("re-emits the virtual placement (not base64) on a fresh render after cache invalidation", () => {
@@ -631,6 +665,7 @@ describe("TUI inline-image budget", () => {
 			expect(output).toContain("\x1b7\x1b[3A");
 			expect(output).toContain("C=1");
 			expect(output).toContain("\x1b8");
+			expect(output).not.toContain("omp-image=");
 			const viewport = term.getViewport().map(line => line.trimEnd());
 			expect(viewport.slice(0, 5)).toEqual(["", "", "", "", "after-image"]);
 			expect(viewport.slice(0, 4).some(line => line.includes("after-image"))).toBe(false);

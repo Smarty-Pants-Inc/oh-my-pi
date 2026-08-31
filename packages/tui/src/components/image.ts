@@ -7,6 +7,7 @@ import {
 	renderImage,
 	TERMINAL,
 } from "../terminal-capabilities";
+import { createTrustedImageSegment } from "../trusted-output";
 import type { Component } from "../tui";
 
 export interface ImageTheme {
@@ -556,8 +557,8 @@ export class Image implements Component {
 			}
 
 			if (result?.lines) {
-				// Unicode placeholders: the image is already a block of real text-cell
-				// lines (line 0 carries the virtual-placement APC). No cursor moves.
+				// Unicode placeholders are trusted at renderImage(), including direct
+				// consumers that compose their own rows before the final TUI boundary.
 				lines = result.lines;
 			} else if (result) {
 				// Direct placement: return `rows` lines so TUI accounts for image
@@ -581,7 +582,9 @@ export class Image implements Component {
 				const cursorRows = result.rows - 1;
 				const moveUp = cursorRows > 0 ? `\x1b[${cursorRows}A` : "";
 				const placement = moveUp + (result.sequence ?? "");
-				lines.push(cursorRows > 0 ? SAVE_CURSOR + placement + RESTORE_CURSOR : placement);
+				lines.push(
+					createTrustedImageSegment(cursorRows > 0 ? SAVE_CURSOR + placement + RESTORE_CURSOR : placement),
+				);
 			} else {
 				lines = this.#fallbackLines();
 			}
