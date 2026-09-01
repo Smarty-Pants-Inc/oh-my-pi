@@ -1366,6 +1366,35 @@ describe("UiHelpers / InputController against derived queued custom display", ()
 		expect(editor.getText()).toBe("prior draft");
 	});
 
+	it("preserves the edited and prior drafts when a session reset stops an in-flight save", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		queueUserSteer(session, "queued before");
+		const saveStarted = Promise.withResolvers<void>();
+		const releaseSave = Promise.withResolvers<void>();
+		vi.spyOn(session, "updateQueuedPromptText").mockImplementation(async () => {
+			saveStarted.resolve();
+			await releaseSave.promise;
+			return { status: "updated" };
+		});
+		const { ctx, editor, dispatchInput } = createStubInteractiveModeContextForUiHelpers(session);
+		editor.setText("prior draft");
+		const uiHelpers = new UiHelpers(ctx);
+		uiHelpers.editQueuedPrompts();
+		expect(dispatchInput("e")).toEqual({ consume: true });
+		editor.setText("edited queued prompt");
+		expect(dispatchInput("\r")).toEqual({ consume: true });
+		await saveStarted.promise;
+
+		uiHelpers.stopQueuedPromptEditing(false);
+		expect(editor.getText()).toBe("edited queued prompt\n\nprior draft");
+
+		releaseSave.resolve();
+		await waitForImmediate();
+		await waitForImmediate();
+		expect(editor.getText()).toBe("edited queued prompt\n\nprior draft");
+	});
+
 	it("edits one prompt in the composer and restores the prior draft with images", async () => {
 		fixture = await createRealSession();
 		const { session } = fixture;

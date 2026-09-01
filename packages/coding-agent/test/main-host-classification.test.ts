@@ -9,6 +9,7 @@ it("classifies an interactive host before opening auth storage", async () => {
 	const stop = new Error("stop after auth classification");
 	let observedTimeout: number | undefined;
 	let observedInteractive: boolean | undefined;
+	const stdout = vi.spyOn(process.stdout, "write").mockReturnValue(true);
 	const parsed = parseArgs([]);
 	parsed.noExtensions = true;
 
@@ -17,6 +18,7 @@ it("classifies an interactive host before opening auth storage", async () => {
 			runRootCommand(parsed, [], {
 				verifyApprovedStartup: async isInteractive => {
 					observedInteractive = isInteractive;
+					return "PROMPT_POLICY_REVIEW_REQUIRED: drift";
 				},
 				discoverAuthStorage: async () => {
 					observedTimeout = getDbBusyTimeoutMs();
@@ -24,7 +26,11 @@ it("classifies an interactive host before opening auth storage", async () => {
 				},
 			}),
 		).rejects.toBe(stop);
+		expect(stdout.mock.calls.map(([chunk]) => String(chunk)).join("")).toContain(
+			"Warning: PROMPT_POLICY_REVIEW_REQUIRED: drift",
+		);
 	} finally {
+		stdout.mockRestore();
 		setInteractiveHost(previous);
 	}
 
@@ -49,27 +55,24 @@ it("classifies noninteractive launches before enforcing approved startup", async
 	expect(observedInteractive).toBe(false);
 });
 
-it("warns for interactive prompt-policy drift and remains strict otherwise", async () => {
+it("returns interactive prompt-policy drift for the TUI and remains strict otherwise", async () => {
 	const policyError = new Error("PROMPT_POLICY_REVIEW_REQUIRED: drift");
 	const unexpected = new Error("unexpected startup failure");
-	const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
-	try {
+
+	expect(
 		await verifyApprovedStartup(true, async () => {
 			throw policyError;
-		});
-		expect(stderr).toHaveBeenCalledWith("Warning: PROMPT_POLICY_REVIEW_REQUIRED: drift\n");
+		}),
+	).toBe("PROMPT_POLICY_REVIEW_REQUIRED: drift");
 
-		await expect(
-			verifyApprovedStartup(false, async () => {
-				throw policyError;
-			}),
-		).rejects.toBe(policyError);
-		await expect(
-			verifyApprovedStartup(true, async () => {
-				throw unexpected;
-			}),
-		).rejects.toBe(unexpected);
-	} finally {
-		stderr.mockRestore();
-	}
+	await expect(
+		verifyApprovedStartup(false, async () => {
+			throw policyError;
+		}),
+	).rejects.toBe(policyError);
+	await expect(
+		verifyApprovedStartup(true, async () => {
+			throw unexpected;
+		}),
+	).rejects.toBe(unexpected);
 });

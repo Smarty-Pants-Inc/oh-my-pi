@@ -1585,7 +1585,7 @@ interface RunRootCommandDependencies {
 	forceSetupWizard?: boolean;
 	consumeFreshOmpCompanionLaunchEnv?: typeof consumeFreshOmpCompanionLaunchEnv;
 	collabBridge?: CollabBridgeBootstrap;
-	verifyApprovedStartup?: (isInteractive: boolean) => Promise<void>;
+	verifyApprovedStartup?: (isInteractive: boolean) => Promise<string | undefined>;
 	herdrHostBridge?: HerdrHostBridgeBootstrap;
 	runInteractiveMode?: typeof runInteractiveMode;
 }
@@ -1682,7 +1682,8 @@ export async function runRootCommand(
 			stopPendingStartupComposer();
 		}
 		const startupVerifier = deps.verifyApprovedStartup ?? (isBunTestRuntime() ? undefined : verifyApprovedStartup);
-		await startupVerifier?.(isInteractive);
+		const policyWarning = await startupVerifier?.(isInteractive);
+		if (policyWarning) writeStartupNotice(parsedArgs, `${chalk.yellow(`Warning: ${policyWarning}`)}\n`);
 		const automaticHerdrHostBridge =
 			isInteractive && deps.collabBridge === undefined ? deps.herdrHostBridge : undefined;
 		// Auth and settings are independent; start both before awaiting either.

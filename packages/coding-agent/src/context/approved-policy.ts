@@ -220,13 +220,14 @@ export function promptPolicyReviewWarning(error: unknown): string | undefined {
 export async function verifyApprovedStartup(
 	isInteractive: boolean,
 	verify: () => Promise<unknown> = assertApprovedStartup,
-): Promise<void> {
+): Promise<string | undefined> {
 	try {
 		await verify();
+		return undefined;
 	} catch (error) {
 		const warning = isInteractive ? promptPolicyReviewWarning(error) : undefined;
 		if (!warning) throw error;
-		process.stderr.write(`Warning: ${warning}\n`);
+		return warning;
 	}
 }
 /** Startup policy drift is advisory; unrelated verification failures remain strict. */

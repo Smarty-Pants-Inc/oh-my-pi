@@ -1130,6 +1130,8 @@ export class UiHelpers {
 	}
 
 	stopQueuedPromptEditing(render = true): void {
+		const state = this.#queuedPromptEdit;
+		if (state?.mode === "editText" || state?.mode === "savingEdit") this.#preserveEditedPromptAsDraft(state);
 		this.#stopQueuedPromptEditing(render);
 	}
 

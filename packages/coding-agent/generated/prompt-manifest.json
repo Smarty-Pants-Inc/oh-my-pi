@@ -7258,7 +7258,7 @@
     },
     {
       "path": "packages/coding-agent/src/context/approved-policy.ts",
-      "sha256": "9a55682d00d70e8d45f363bfde45765195c7db9dd1200bd66fcb52644c8a4f4d"
+      "sha256": "08da2b7047cba1bba4fc6e4c9cd91935c8212a9fb183ebbc4e7d9147f5e4cd4d"
     },
     {
       "path": "packages/coding-agent/src/context/canonical.ts",
@@ -8270,7 +8270,7 @@
     },
     {
       "path": "packages/coding-agent/src/main.ts",
-      "sha256": "d93abddb43ea20fa7e5d721baea4ff9cc656aefc6cd564f2afb6e2a13dbcebba"
+      "sha256": "c4563af8431eb759705a942d2e03b701559fe49b4b64621d3384556d8eb3941f"
     },
     {
       "path": "packages/coding-agent/src/markit/converters/docx.ts",
@@ -8790,7 +8790,7 @@
     },
     {
       "path": "packages/coding-agent/src/modes/utils/ui-helpers.ts",
-      "sha256": "df70a49f67f52db466fef68aaf281be2c78323cd19325a279caa4618b742af76"
+      "sha256": "ff2f68ddfd7e568bef0c3141703130ef09f433bafdef2e7bccaf970da4409e15"
     },
     {
       "path": "packages/coding-agent/src/modes/workflow.ts",
@@ -11294,5 +11294,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "332e81558ac29435882558961e48b18b89024e292194edd4be4ee20a879f8a14"
+  "rootSha256": "22af3218432afa1d291456e9732a50ae998106144c54fa8a2034d9e0ae200c12"
 }
