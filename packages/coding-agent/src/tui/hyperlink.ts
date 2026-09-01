@@ -38,15 +38,7 @@ function buildFileUri(filePath: string, opts?: { line?: number; col?: number }):
 	return uri.href;
 }
 
-/**
- * Returns true when OSC 8 hyperlinks should be emitted.
- *
- * Respects `tui.hyperlinks` setting:
- * - `"off"`: never
- * - `"auto"`: in Herdr when stdout is a TTY; otherwise when stdout is a TTY and `NO_COLOR` is unset
- * - `"always"`: unconditionally (useful for viewers that support OSC 8 without advertising it)
- * Before settings initialization, returns false so early render paths stay plain text.
- */
+/** Returns whether OSC 8 hyperlinks should be emitted for the active setting. */
 export function isHyperlinkEnabled(): boolean {
 	if (!isSettingsInitialized()) return false;
 	return shouldEnableHyperlinks(settings.get("tui.hyperlinks"), Bun.env, TERMINAL.id, process.stdout.isTTY === true);

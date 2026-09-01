@@ -1,4 +1,4 @@
-import { afterAll, afterEach, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, it } from "bun:test";
 import type { Model } from "@oh-my-pi/pi-ai";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import type { CustomToolContext } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools";
@@ -11,18 +11,38 @@ import {
 } from "@oh-my-pi/pi-coding-agent/tools/image-gen";
 import { removeWithRetries, USER_AGENT } from "@oh-my-pi/pi-utils";
 
-const originalOpenRouterKey = Bun.env.OPENROUTER_API_KEY;
+const IMAGE_API_ENV_KEYS = [
+	"OPENAI_API_KEY",
+	"XAI_API_KEY",
+	"OPENROUTER_API_KEY",
+	"GEMINI_API_KEY",
+	"GOOGLE_API_KEY",
+	"DEEPINFRA_API_KEY",
+] as const;
+type ImageApiEnvKey = (typeof IMAGE_API_ENV_KEYS)[number];
+const originalImageApiEnv: Record<ImageApiEnvKey, string | undefined> = {
+	OPENAI_API_KEY: Bun.env.OPENAI_API_KEY,
+	XAI_API_KEY: Bun.env.XAI_API_KEY,
+	OPENROUTER_API_KEY: Bun.env.OPENROUTER_API_KEY,
+	GEMINI_API_KEY: Bun.env.GEMINI_API_KEY,
+	GOOGLE_API_KEY: Bun.env.GOOGLE_API_KEY,
+	DEEPINFRA_API_KEY: Bun.env.DEEPINFRA_API_KEY,
+};
 const generatedImagePaths: string[] = [];
 
 afterAll(async () => {
 	await Promise.all(generatedImagePaths.map(imagePath => removeWithRetries(imagePath)));
 });
 
+beforeEach(() => {
+	for (const key of IMAGE_API_ENV_KEYS) delete Bun.env[key];
+});
+
 afterEach(() => {
-	if (originalOpenRouterKey === undefined) {
-		delete Bun.env.OPENROUTER_API_KEY;
-	} else {
-		Bun.env.OPENROUTER_API_KEY = originalOpenRouterKey;
+	for (const key of IMAGE_API_ENV_KEYS) {
+		const value = originalImageApiEnv[key];
+		if (value === undefined) delete Bun.env[key];
+		else Bun.env[key] = value;
 	}
 	setImageProviderOrder([]);
 });
@@ -810,5 +830,112 @@ describe("imageGenTool", () => {
 
 		expect(requestUrls).toEqual(["https://api.x.ai/v1/images/generations"]);
 		expect(result.details?.provider).toBe("xai");
+	});
+
+	it("routes DeepInfra image generation through the OpenAI-compatible images endpoint", async () => {
+		let requestUrl: string | undefined;
+		let requestBody: Record<string, unknown> | undefined;
+		const captured: { authorization: string | null } = { authorization: null };
+
+		const fetchMock: typeof fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+			requestUrl = input.toString();
+			requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+			captured.authorization = new Headers(init?.headers).get("authorization");
+			return new Response(
+				JSON.stringify({ data: [{ b64_json: Buffer.from("fake-deepinfra-image").toString("base64"), url: null }] }),
+				{ status: 200, headers: { "content-type": "application/json" } },
+			);
+		}) as unknown as typeof fetch;
+
+		const ctx: CustomToolContext = {
+			fetch: fetchMock,
+			sessionManager: {
+				getCwd: () => "/tmp",
+				getSessionId: () => "test-session",
+			} as unknown as ReadonlySessionManager,
+			modelRegistry: {
+				getApiKeyForProvider: async (provider: string) =>
+					provider === "deepinfra" ? "test-deepinfra-key" : undefined,
+				getProviderBaseUrl: () => undefined,
+				getAll: () => [],
+				authStorage: { rotateSessionCredential: async () => false },
+				resolver: () => async () => "test-deepinfra-key",
+			} as unknown as ModelRegistry,
+			model: undefined,
+			isIdle: () => true,
+			hasQueuedMessages: () => false,
+			abort: () => {},
+		};
+
+		const result = await imageGenTool.execute(
+			"call-deepinfra",
+			{ subject: "a cat", aspect_ratio: "16:9", provider: "deepinfra" },
+			undefined,
+			ctx,
+		);
+		generatedImagePaths.push(...(result.details?.imagePaths ?? []));
+
+		expect(requestUrl).toBe("https://api.deepinfra.com/v1/openai/images/generations");
+		expect(captured.authorization).toBe("Bearer test-deepinfra-key");
+		expect(requestBody).toMatchObject({
+			model: "black-forest-labs/FLUX-2-pro",
+			prompt: "a cat.",
+			n: 1,
+			response_format: "b64_json",
+			size: "1536x1024",
+		});
+		expect(result.details?.provider).toBe("deepinfra");
+		expect(result.details?.model).toBe("black-forest-labs/FLUX-2-pro");
+		expect(result.details?.imageCount).toBe(1);
+		const savedPath = result.details?.imagePaths[0];
+		if (!savedPath) throw new Error("Expected generated image path");
+		expect(await Bun.file(savedPath).bytes()).toEqual(Buffer.from("fake-deepinfra-image"));
+	});
+
+	it("skips DeepInfra for edit requests so an edit-capable provider can serve them", async () => {
+		const requestUrls: string[] = [];
+		const fetchMock: typeof fetch = (async (input: string | URL | Request) => {
+			requestUrls.push(input.toString());
+			throw new Error(`Unexpected provider request: ${input.toString()}`);
+		}) as unknown as typeof fetch;
+
+		const ctx: CustomToolContext = {
+			fetch: fetchMock,
+			sessionManager: {
+				getCwd: () => "/tmp",
+				getSessionId: () => "test-session",
+			} as unknown as ReadonlySessionManager,
+			modelRegistry: {
+				getApiKey: async () => undefined,
+				getApiKeyForProvider: async (provider: string) =>
+					provider === "deepinfra" ? "test-deepinfra-key" : undefined,
+				getProviderBaseUrl: () => undefined,
+				getAll: () => [],
+				authStorage: {
+					hasNonEnvCredential: () => false,
+					rotateSessionCredential: async () => false,
+				},
+				resolver: () => async () => "test-deepinfra-key",
+			} as unknown as ModelRegistry,
+			model: undefined,
+			isIdle: () => true,
+			hasQueuedMessages: () => false,
+			abort: () => {},
+		};
+
+		await expect(
+			imageGenTool.execute(
+				"call-deepinfra-edit",
+				{
+					subject: "a cat",
+					changes: ["make it noir"],
+					input: [{ data: Buffer.from("reference").toString("base64"), mime_type: "image/png" }],
+				},
+				undefined,
+				ctx,
+			),
+		).rejects.toThrow("deepinfra image generation is text-to-image only and cannot edit input images");
+		// DeepInfra was credentialed but must not receive the edit request.
+		expect(requestUrls).toEqual([]);
 	});
 });

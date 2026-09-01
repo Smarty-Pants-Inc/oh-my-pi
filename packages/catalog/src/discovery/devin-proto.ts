@@ -145,6 +145,21 @@ const AuthSourceJson = {
 	AUTH_SOURCE_EMBARCADERO: 8,
 } as const;
 
+/** Devin enum BillingStrategy. */
+export enum BillingStrategy {
+	UNSPECIFIED = 0,
+	CREDITS = 1,
+	QUOTA = 2,
+	ACU = 3,
+}
+
+const BillingStrategyJson = {
+	BILLING_STRATEGY_UNSPECIFIED: 0,
+	BILLING_STRATEGY_CREDITS: 1,
+	BILLING_STRATEGY_QUOTA: 2,
+	BILLING_STRATEGY_ACU: 3,
+} as const;
+
 /** Devin enum CacheControlType. */
 export enum CacheControlType {
 	UNSPECIFIED = 0,
@@ -154,6 +169,23 @@ export enum CacheControlType {
 const CacheControlTypeJson = {
 	CACHE_CONTROL_TYPE_UNSPECIFIED: 0,
 	CACHE_CONTROL_TYPE_EPHEMERAL: 1,
+} as const;
+
+/** Devin enum CascadeCommandsAutoExecution. */
+export enum CascadeCommandsAutoExecution {
+	UNSPECIFIED = 0,
+	OFF = 1,
+	AUTO = 2,
+	EAGER = 3,
+	DISABLED = 4,
+}
+
+const CascadeCommandsAutoExecutionJson = {
+	CASCADE_COMMANDS_AUTO_EXECUTION_UNSPECIFIED: 0,
+	CASCADE_COMMANDS_AUTO_EXECUTION_OFF: 1,
+	CASCADE_COMMANDS_AUTO_EXECUTION_AUTO: 2,
+	CASCADE_COMMANDS_AUTO_EXECUTION_EAGER: 3,
+	CASCADE_COMMANDS_AUTO_EXECUTION_DISABLED: 4,
 } as const;
 
 /** Devin enum ChatMessageRequestType. */
@@ -838,6 +870,21 @@ const ExperimentSourceJson = {
 	EXPERIMENT_SOURCE_EXTENSION: 1,
 	EXPERIMENT_SOURCE_LANGUAGE_SERVER: 2,
 	EXPERIMENT_SOURCE_API_SERVER: 3,
+} as const;
+
+/** Devin enum GracePeriodStatus. */
+export enum GracePeriodStatus {
+	UNSPECIFIED = 0,
+	NONE = 1,
+	ACTIVE = 2,
+	EXPIRED = 3,
+}
+
+const GracePeriodStatusJson = {
+	GRACE_PERIOD_STATUS_UNSPECIFIED: 0,
+	GRACE_PERIOD_STATUS_NONE: 1,
+	GRACE_PERIOD_STATUS_ACTIVE: 2,
+	GRACE_PERIOD_STATUS_EXPIRED: 3,
 } as const;
 
 /** Devin enum Language. */
@@ -1824,6 +1871,77 @@ const ModelTypeJson = {
 	MODEL_TYPE_QUERY: 4,
 } as const;
 
+/** Devin enum Permission. */
+export enum Permission {
+	UNSPECIFIED = 0,
+	ATTRIBUTION_READ = 1,
+	ANALYTICS_READ = 2,
+	LICENSE_READ = 3,
+	TEAM_USER_READ = 4,
+	TEAM_USER_UPDATE = 5,
+	TEAM_USER_DELETE = 6,
+	TEAM_USER_INVITE = 17,
+	INDEXING_READ = 7,
+	INDEXING_CREATE = 8,
+	INDEXING_UPDATE = 9,
+	INDEXING_DELETE = 10,
+	INDEXING_MANAGEMENT = 27,
+	FINETUNING_READ = 19,
+	FINETUNING_CREATE = 20,
+	FINETUNING_UPDATE = 21,
+	FINETUNING_DELETE = 22,
+	SSO_READ = 11,
+	SSO_WRITE = 12,
+	SERVICE_KEY_READ = 13,
+	SERVICE_KEY_CREATE = 14,
+	SERVICE_KEY_UPDATE = 28,
+	SERVICE_KEY_DELETE = 15,
+	ROLE_READ = 23,
+	ROLE_CREATE = 24,
+	ROLE_UPDATE = 25,
+	ROLE_DELETE = 26,
+	BILLING_READ = 16,
+	BILLING_WRITE = 18,
+	EXTERNAL_CHAT_UPDATE = 29,
+	TEAM_SETTINGS_READ = 30,
+	TEAM_SETTINGS_UPDATE = 31,
+}
+
+const PermissionJson = {
+	PERMISSION_UNSPECIFIED: 0,
+	PERMISSION_ATTRIBUTION_READ: 1,
+	PERMISSION_ANALYTICS_READ: 2,
+	PERMISSION_LICENSE_READ: 3,
+	PERMISSION_TEAM_USER_READ: 4,
+	PERMISSION_TEAM_USER_UPDATE: 5,
+	PERMISSION_TEAM_USER_DELETE: 6,
+	PERMISSION_TEAM_USER_INVITE: 17,
+	PERMISSION_INDEXING_READ: 7,
+	PERMISSION_INDEXING_CREATE: 8,
+	PERMISSION_INDEXING_UPDATE: 9,
+	PERMISSION_INDEXING_DELETE: 10,
+	PERMISSION_INDEXING_MANAGEMENT: 27,
+	PERMISSION_FINETUNING_READ: 19,
+	PERMISSION_FINETUNING_CREATE: 20,
+	PERMISSION_FINETUNING_UPDATE: 21,
+	PERMISSION_FINETUNING_DELETE: 22,
+	PERMISSION_SSO_READ: 11,
+	PERMISSION_SSO_WRITE: 12,
+	PERMISSION_SERVICE_KEY_READ: 13,
+	PERMISSION_SERVICE_KEY_CREATE: 14,
+	PERMISSION_SERVICE_KEY_UPDATE: 28,
+	PERMISSION_SERVICE_KEY_DELETE: 15,
+	PERMISSION_ROLE_READ: 23,
+	PERMISSION_ROLE_CREATE: 24,
+	PERMISSION_ROLE_UPDATE: 25,
+	PERMISSION_ROLE_DELETE: 26,
+	PERMISSION_BILLING_READ: 16,
+	PERMISSION_BILLING_WRITE: 18,
+	PERMISSION_EXTERNAL_CHAT_UPDATE: 29,
+	PERMISSION_TEAM_SETTINGS_READ: 30,
+	PERMISSION_TEAM_SETTINGS_UPDATE: 31,
+} as const;
+
 /** Devin enum PromptAnnotationKind. */
 export enum PromptAnnotationKind {
 	UNSPECIFIED = 0,
@@ -1891,6 +2009,19 @@ const ProviderSourceJson = {
 	PROVIDER_SOURCE_CASCADE: 12,
 } as const;
 
+/** Devin enum SandboxEnforcementMode. */
+export enum SandboxEnforcementMode {
+	UNSPECIFIED = 0,
+	OPTIONAL = 1,
+	REQUIRED = 2,
+}
+
+const SandboxEnforcementModeJson = {
+	SANDBOX_ENFORCEMENT_MODE_UNSPECIFIED: 0,
+	SANDBOX_ENFORCEMENT_MODE_OPTIONAL: 1,
+	SANDBOX_ENFORCEMENT_MODE_REQUIRED: 2,
+} as const;
+
 /** Devin enum StopReason. */
 export enum StopReason {
 	UNSPECIFIED = 0,
@@ -1924,6 +2055,29 @@ const StopReasonJson = {
 	STOP_REASON_CONTENT_FILTER: 11,
 	STOP_REASON_NON_INSERTION: 12,
 	STOP_REASON_ERROR: 13,
+} as const;
+
+/** Devin enum TeamsFeatures. */
+export enum TeamsFeatures {
+	UNSPECIFIED = 0,
+	SSO = 1,
+	ATTRIBUTION = 2,
+	PHI = 3,
+	CORTEX = 4,
+	OPENAI_DISABLED = 5,
+	REMOTE_INDEXING_DISABLED = 6,
+	API_KEY_ENABLED = 7,
+}
+
+const TeamsFeaturesJson = {
+	TEAMS_FEATURES_UNSPECIFIED: 0,
+	TEAMS_FEATURES_SSO: 1,
+	TEAMS_FEATURES_ATTRIBUTION: 2,
+	TEAMS_FEATURES_PHI: 3,
+	TEAMS_FEATURES_CORTEX: 4,
+	TEAMS_FEATURES_OPENAI_DISABLED: 5,
+	TEAMS_FEATURES_REMOTE_INDEXING_DISABLED: 6,
+	TEAMS_FEATURES_API_KEY_ENABLED: 7,
 } as const;
 
 /** Devin enum TeamsTier. */
@@ -1996,6 +2150,62 @@ const ToolFormatterTypeJson = {
 	TOOL_FORMATTER_TYPE_SUPERCOMPLETE: 7,
 } as const;
 
+/** Devin enum TransactionStatus. */
+export enum TransactionStatus {
+	UNSPECIFIED = 0,
+	SUCCEEDED = 1,
+	PROCESSING = 2,
+	FAILED = 3,
+	NO_ACTIVE = 4,
+}
+
+const TransactionStatusJson = {
+	TRANSACTION_STATUS_UNSPECIFIED: 0,
+	TRANSACTION_STATUS_SUCCEEDED: 1,
+	TRANSACTION_STATUS_PROCESSING: 2,
+	TRANSACTION_STATUS_FAILED: 3,
+	TRANSACTION_STATUS_NO_ACTIVE: 4,
+} as const;
+
+/** Devin enum UserFeatures. */
+export enum UserFeatures {
+	UNSPECIFIED = 0,
+	CORTEX = 1,
+	CORTEX_TEST = 2,
+}
+
+const UserFeaturesJson = {
+	USER_FEATURES_UNSPECIFIED: 0,
+	USER_FEATURES_CORTEX: 1,
+	USER_FEATURES_CORTEX_TEST: 2,
+} as const;
+
+/** Devin enum UserTeamStatus. */
+export enum UserTeamStatus {
+	UNSPECIFIED = 0,
+	PENDING = 1,
+	APPROVED = 2,
+	REJECTED = 3,
+}
+
+const UserTeamStatusJson = {
+	USER_TEAM_STATUS_UNSPECIFIED: 0,
+	USER_TEAM_STATUS_PENDING: 1,
+	USER_TEAM_STATUS_APPROVED: 2,
+	USER_TEAM_STATUS_REJECTED: 3,
+} as const;
+
+/** Devin message exa.codeium_common_pb.AllowedModelConfig. */
+export interface AllowedModelConfig extends ProtoMessage {
+	modelOrAlias?: ModelOrAlias;
+	creditMultiplier: number;
+}
+
+export const AllowedModelConfigSchema: MessageCodec<AllowedModelConfig> = pb<AllowedModelConfig>("exa.codeium_common_pb.AllowedModelConfig", [
+	{ no: 1, name: "modelOrAlias", kind: "message", T: () => ModelOrAliasSchema },
+	{ no: 2, name: "creditMultiplier", kind: "float" },
+]);
+
 /** Devin message exa.codeium_common_pb.AnthropicInferenceConfig. */
 export interface AnthropicInferenceConfig extends ProtoMessage {
 	thinking: boolean;
@@ -2018,6 +2228,47 @@ export interface ArenaConfig extends ProtoMessage {
 
 export const ArenaConfigSchema: MessageCodec<ArenaConfig> = pb<ArenaConfig>("exa.codeium_common_pb.ArenaConfig", [
 	{ no: 2, name: "tokensPerSecond", kind: "float" },
+]);
+
+/** Devin message exa.api_server_pb.AssignModelRequest. */
+export interface AssignModelRequest extends ProtoMessage {
+	metadata?: Metadata;
+	modelRouterUid: string;
+	cascadeId: string;
+	chatMessagePrompt?: ChatMessagePrompt;
+}
+
+export const AssignModelRequestSchema: MessageCodec<AssignModelRequest> = pb<AssignModelRequest>("exa.api_server_pb.AssignModelRequest", [
+	{ no: 1, name: "metadata", kind: "message", T: () => MetadataSchema },
+	{ no: 2, name: "modelRouterUid", kind: "string" },
+	{ no: 3, name: "cascadeId", kind: "string" },
+	{ no: 5, name: "chatMessagePrompt", kind: "message", T: () => ChatMessagePromptSchema },
+]);
+
+/** Devin message exa.api_server_pb.AssignModelResponse. */
+export interface AssignModelResponse extends ProtoMessage {
+	assignment?: ModelAssignment;
+}
+
+export const AssignModelResponseSchema: MessageCodec<AssignModelResponse> = pb<AssignModelResponse>("exa.api_server_pb.AssignModelResponse", [
+	{ no: 1, name: "assignment", kind: "message", T: () => ModelAssignmentSchema },
+]);
+
+/** Devin message exa.codeium_common_pb.CascadeModelConfigData. */
+export interface CascadeModelConfigData extends ProtoMessage {
+	clientModelConfigs: ClientModelConfig[];
+	clientModelSorts: ClientModelSort[];
+	defaultOverrideModelConfig?: DefaultOverrideModelConfig;
+	arenaModeCostFast: number;
+	arenaModeCostSmart: number;
+}
+
+export const CascadeModelConfigDataSchema: MessageCodec<CascadeModelConfigData> = pb<CascadeModelConfigData>("exa.codeium_common_pb.CascadeModelConfigData", [
+	{ no: 1, name: "clientModelConfigs", kind: "message", T: () => ClientModelConfigSchema, repeat: true },
+	{ no: 2, name: "clientModelSorts", kind: "message", T: () => ClientModelSortSchema, repeat: true },
+	{ no: 3, name: "defaultOverrideModelConfig", kind: "message", T: () => DefaultOverrideModelConfigSchema },
+	{ no: 4, name: "arenaModeCostFast", kind: "float" },
+	{ no: 5, name: "arenaModeCostSmart", kind: "float" },
 ]);
 
 /** Devin message exa.chat_pb.ChatMessagePrompt. */
@@ -2199,6 +2450,30 @@ export const ClientModelConfigSchema: MessageCodec<ClientModelConfig> = pb<Clien
 	{ no: 33, name: "disabledReason", kind: "message", T: () => ModelDisabledReasonSchema },
 ]);
 
+/** Devin message exa.codeium_common_pb.ClientModelGroup. */
+export interface ClientModelGroup extends ProtoMessage {
+	groupName: string;
+	modelLabels: string[];
+}
+
+export const ClientModelGroupSchema: MessageCodec<ClientModelGroup> = pb<ClientModelGroup>("exa.codeium_common_pb.ClientModelGroup", [
+	{ no: 1, name: "groupName", kind: "string" },
+	{ no: 2, name: "modelLabels", kind: "string", repeat: true },
+]);
+
+/** Devin message exa.codeium_common_pb.ClientModelSort. */
+export interface ClientModelSort extends ProtoMessage {
+	name: string;
+	groups: ClientModelGroup[];
+	displayMetric?: string;
+}
+
+export const ClientModelSortSchema: MessageCodec<ClientModelSort> = pb<ClientModelSort>("exa.codeium_common_pb.ClientModelSort", [
+	{ no: 1, name: "name", kind: "string" },
+	{ no: 2, name: "groups", kind: "message", T: () => ClientModelGroupSchema, repeat: true },
+	{ no: 3, name: "displayMetric", kind: "string", optional: true },
+]);
+
 /** Devin message exa.codeium_common_pb.CompletionConfiguration. */
 export interface CompletionConfiguration extends ProtoMessage {
 	numCompletions: bigint;
@@ -2300,6 +2575,29 @@ export const DefaultOverrideModelConfigSchema: MessageCodec<DefaultOverrideModel
 	{ no: 1, name: "modelOrAliasDeprecated", kind: "message", T: () => ModelOrAliasSchema },
 	{ no: 3, name: "modelUid", kind: "string" },
 	{ no: 2, name: "versionId", kind: "string" },
+]);
+
+/** Devin message exa.codeium_common_pb.DevinPlanInfo. */
+export interface DevinPlanInfo extends ProtoMessage {
+	canUseCascade: boolean;
+	canUseCli: boolean;
+	isAdmin: boolean;
+	orgId: string;
+	webappHost: string;
+	devinReviewEnabled?: boolean;
+	apiUrl: string;
+	accountDisplayName: string;
+}
+
+export const DevinPlanInfoSchema: MessageCodec<DevinPlanInfo> = pb<DevinPlanInfo>("exa.codeium_common_pb.DevinPlanInfo", [
+	{ no: 1, name: "canUseCascade", kind: "bool" },
+	{ no: 2, name: "canUseCli", kind: "bool" },
+	{ no: 3, name: "isAdmin", kind: "bool" },
+	{ no: 4, name: "orgId", kind: "string" },
+	{ no: 5, name: "webappHost", kind: "string" },
+	{ no: 6, name: "devinReviewEnabled", kind: "bool", optional: true },
+	{ no: 7, name: "apiUrl", kind: "string" },
+	{ no: 8, name: "accountDisplayName", kind: "string" },
 ]);
 
 /** Devin message exa.codeium_common_pb.ExperimentConfig. */
@@ -2521,6 +2819,26 @@ export const GetUserJwtResponseSchema: MessageCodec<GetUserJwtResponse> = pb<Get
 	{ no: 2, name: "customApiServerUrl", kind: "string" },
 ]);
 
+/** Devin message exa.seat_management_pb.GetUserStatusRequest. */
+export interface GetUserStatusRequest extends ProtoMessage {
+	metadata?: Metadata;
+}
+
+export const GetUserStatusRequestSchema: MessageCodec<GetUserStatusRequest> = pb<GetUserStatusRequest>("exa.seat_management_pb.GetUserStatusRequest", [
+	{ no: 1, name: "metadata", kind: "message", T: () => MetadataSchema },
+]);
+
+/** Devin message exa.seat_management_pb.GetUserStatusResponse. */
+export interface GetUserStatusResponse extends ProtoMessage {
+	userStatus?: UserStatus;
+	planInfo?: PlanInfo;
+}
+
+export const GetUserStatusResponseSchema: MessageCodec<GetUserStatusResponse> = pb<GetUserStatusResponse>("exa.seat_management_pb.GetUserStatusResponse", [
+	{ no: 1, name: "userStatus", kind: "message", T: () => UserStatusSchema },
+	{ no: 2, name: "planInfo", kind: "message", T: () => PlanInfoSchema },
+]);
+
 /** Devin message exa.codeium_common_pb.GoogleInferenceConfig. */
 export interface GoogleInferenceConfig extends ProtoMessage {
 	reasoningEffort: string;
@@ -2560,6 +2878,53 @@ export const InferenceConfigSchema: MessageCodec<InferenceConfig> = pb<Inference
 			{ no: 1, name: "openai", kind: "message", T: () => OpenAIInferenceConfigSchema },
 			{ no: 2, name: "google", kind: "message", T: () => GoogleInferenceConfigSchema },
 			{ no: 3, name: "anthropic", kind: "message", T: () => AnthropicInferenceConfigSchema },
+		],
+	},
+]);
+
+/** Devin message exa.codeium_common_pb.McpLocalServer. */
+export interface McpLocalServer extends ProtoMessage {
+	command: string;
+	args: string[];
+	env: Record<string, string>;
+}
+
+export const McpLocalServerSchema: MessageCodec<McpLocalServer> = pb<McpLocalServer>("exa.codeium_common_pb.McpLocalServer", [
+	{ no: 1, name: "command", kind: "string" },
+	{ no: 2, name: "args", kind: "string", repeat: true },
+	{ no: 3, name: "env", kind: "map", K: "string", V: "string" },
+]);
+
+/** Devin message exa.codeium_common_pb.McpRemoteServer. */
+export interface McpRemoteServer extends ProtoMessage {
+	type: string;
+	url: string;
+	headers: Record<string, string>;
+}
+
+export const McpRemoteServerSchema: MessageCodec<McpRemoteServer> = pb<McpRemoteServer>("exa.codeium_common_pb.McpRemoteServer", [
+	{ no: 1, name: "type", kind: "string" },
+	{ no: 2, name: "url", kind: "string" },
+	{ no: 3, name: "headers", kind: "map", K: "string", V: "string" },
+]);
+
+/** Devin message exa.codeium_common_pb.McpServerConfig. */
+export interface McpServerConfig extends ProtoMessage {
+	serverId: string;
+	configuration:
+		| { case: undefined; value?: undefined }
+		| { case: "local"; value: McpLocalServer }
+		| { case: "remote"; value: McpRemoteServer };
+}
+
+export const McpServerConfigSchema: MessageCodec<McpServerConfig> = pb<McpServerConfig>("exa.codeium_common_pb.McpServerConfig", [
+	{ no: 1, name: "serverId", kind: "string" },
+	{
+		kind: "oneof",
+		name: "configuration",
+		variants: [
+			{ no: 2, name: "local", kind: "message", T: () => McpLocalServerSchema },
+			{ no: 3, name: "remote", kind: "message", T: () => McpRemoteServerSchema },
 		],
 	},
 ]);
@@ -2627,6 +2992,19 @@ export const MetadataSchema: MessageCodec<Metadata> = pb<Metadata>("exa.codeium_
 	{ no: 30, name: "supportedModelDisplays", kind: "enum", E: () => DisplayOptionJson, repeat: true },
 	{ no: 31, name: "f", kind: "string" },
 	{ no: 32, name: "teamId", kind: "string" },
+]);
+
+/** Devin message exa.api_server_pb.ModelAssignment. */
+export interface ModelAssignment extends ProtoMessage {
+	assignmentJwt: string;
+	modelUid: string;
+	harnessUids: string[];
+}
+
+export const ModelAssignmentSchema: MessageCodec<ModelAssignment> = pb<ModelAssignment>("exa.api_server_pb.ModelAssignment", [
+	{ no: 1, name: "assignmentJwt", kind: "string" },
+	{ no: 2, name: "modelUid", kind: "string" },
+	{ no: 3, name: "harnessUids", kind: "string", repeat: true },
 ]);
 
 /** Devin message exa.codeium_common_pb.ModelDimension. */
@@ -2869,6 +3247,130 @@ export const OpenAIInferenceConfigSchema: MessageCodec<OpenAIInferenceConfig> = 
 	{ no: 3, name: "extendedPromptCacheRetention", kind: "bool" },
 ]);
 
+/** Devin message exa.codeium_common_pb.PlanInfo. */
+export interface PlanInfo extends ProtoMessage {
+	teamsTier: TeamsTier;
+	planName: string;
+	hasAutocompleteFastMode: boolean;
+	allowStickyPremiumModels: boolean;
+	hasForgeAccess: boolean;
+	disableCodeSnippetTelemetry: boolean;
+	allowPremiumCommandModels: boolean;
+	hasTabToJump: boolean;
+	maxNumPremiumChatMessages: bigint;
+	maxNumChatInputTokens: bigint;
+	maxCustomChatInstructionCharacters: bigint;
+	maxNumPinnedContextItems: bigint;
+	maxLocalIndexSize: bigint;
+	maxUnclaimedSites: number;
+	monthlyPromptCredits: number;
+	monthlyFlowCredits: number;
+	monthlyFlexCreditPurchaseAmount: number;
+	isTeams: boolean;
+	isEnterprise: boolean;
+	hasPaidFeatures: boolean;
+	canBuyMoreCredits: boolean;
+	cascadeWebSearchEnabled: boolean;
+	canCustomizeAppIcon: boolean;
+	cascadeCanAutoRunCommands: boolean;
+	canGenerateCommitMessages: boolean;
+	knowledgeBaseEnabled: boolean;
+	cascadeAllowedModelsConfig: AllowedModelConfig[];
+	defaultTeamConfig?: TeamConfig;
+	canShareConversations: boolean;
+	canAllowCascadeInBackground: boolean;
+	defaultTeamFeatures: Record<string, TeamsFeaturesMetadata>;
+	browserEnabled: boolean;
+	devinInfo?: DevinPlanInfo;
+	isDevin: boolean;
+	billingStrategy: BillingStrategy;
+	hideDailyQuota: boolean;
+	hideWeeklyQuota: boolean;
+}
+
+export const PlanInfoSchema: MessageCodec<PlanInfo> = pb<PlanInfo>("exa.codeium_common_pb.PlanInfo", [
+	{ no: 1, name: "teamsTier", kind: "enum", E: () => TeamsTierJson },
+	{ no: 2, name: "planName", kind: "string" },
+	{ no: 3, name: "hasAutocompleteFastMode", kind: "bool" },
+	{ no: 4, name: "allowStickyPremiumModels", kind: "bool" },
+	{ no: 5, name: "hasForgeAccess", kind: "bool" },
+	{ no: 11, name: "disableCodeSnippetTelemetry", kind: "bool" },
+	{ no: 15, name: "allowPremiumCommandModels", kind: "bool" },
+	{ no: 23, name: "hasTabToJump", kind: "bool" },
+	{ no: 6, name: "maxNumPremiumChatMessages", kind: "int64" },
+	{ no: 7, name: "maxNumChatInputTokens", kind: "int64" },
+	{ no: 8, name: "maxCustomChatInstructionCharacters", kind: "int64" },
+	{ no: 9, name: "maxNumPinnedContextItems", kind: "int64" },
+	{ no: 10, name: "maxLocalIndexSize", kind: "int64" },
+	{ no: 26, name: "maxUnclaimedSites", kind: "int32" },
+	{ no: 12, name: "monthlyPromptCredits", kind: "int32" },
+	{ no: 13, name: "monthlyFlowCredits", kind: "int32" },
+	{ no: 14, name: "monthlyFlexCreditPurchaseAmount", kind: "int32" },
+	{ no: 17, name: "isTeams", kind: "bool" },
+	{ no: 16, name: "isEnterprise", kind: "bool" },
+	{ no: 32, name: "hasPaidFeatures", kind: "bool" },
+	{ no: 18, name: "canBuyMoreCredits", kind: "bool" },
+	{ no: 19, name: "cascadeWebSearchEnabled", kind: "bool" },
+	{ no: 20, name: "canCustomizeAppIcon", kind: "bool" },
+	{ no: 22, name: "cascadeCanAutoRunCommands", kind: "bool" },
+	{ no: 25, name: "canGenerateCommitMessages", kind: "bool" },
+	{ no: 27, name: "knowledgeBaseEnabled", kind: "bool" },
+	{ no: 21, name: "cascadeAllowedModelsConfig", kind: "message", T: () => AllowedModelConfigSchema, repeat: true },
+	{ no: 24, name: "defaultTeamConfig", kind: "message", T: () => TeamConfigSchema },
+	{ no: 28, name: "canShareConversations", kind: "bool" },
+	{ no: 29, name: "canAllowCascadeInBackground", kind: "bool" },
+	{ no: 30, name: "defaultTeamFeatures", kind: "map", K: "string", V: () => TeamsFeaturesMetadataSchema },
+	{ no: 31, name: "browserEnabled", kind: "bool" },
+	{ no: 33, name: "devinInfo", kind: "message", T: () => DevinPlanInfoSchema },
+	{ no: 34, name: "isDevin", kind: "bool" },
+	{ no: 35, name: "billingStrategy", kind: "enum", E: () => BillingStrategyJson },
+	{ no: 36, name: "hideDailyQuota", kind: "bool" },
+	{ no: 37, name: "hideWeeklyQuota", kind: "bool" },
+]);
+
+/** Devin message exa.codeium_common_pb.PlanStatus. */
+export interface PlanStatus extends ProtoMessage {
+	planInfo?: PlanInfo;
+	planStart?: Timestamp;
+	planEnd?: Timestamp;
+	availablePromptCredits: number;
+	availableFlowCredits: number;
+	availableFlexCredits: number;
+	usedFlexCredits: number;
+	usedFlowCredits: number;
+	usedPromptCredits: number;
+	topUpStatus?: TopUpStatus;
+	wasReducedByOrphanedUsage: boolean;
+	gracePeriodStatus: GracePeriodStatus;
+	gracePeriodEnd?: Timestamp;
+	dailyQuotaRemainingPercent: number;
+	weeklyQuotaRemainingPercent: number;
+	overageBalanceMicros: bigint;
+	dailyQuotaResetAtUnix: bigint;
+	weeklyQuotaResetAtUnix: bigint;
+}
+
+export const PlanStatusSchema: MessageCodec<PlanStatus> = pb<PlanStatus>("exa.codeium_common_pb.PlanStatus", [
+	{ no: 1, name: "planInfo", kind: "message", T: () => PlanInfoSchema },
+	{ no: 2, name: "planStart", kind: "message", T: () => TimestampSchema },
+	{ no: 3, name: "planEnd", kind: "message", T: () => TimestampSchema },
+	{ no: 8, name: "availablePromptCredits", kind: "int32" },
+	{ no: 9, name: "availableFlowCredits", kind: "int32" },
+	{ no: 4, name: "availableFlexCredits", kind: "int32" },
+	{ no: 7, name: "usedFlexCredits", kind: "int32" },
+	{ no: 5, name: "usedFlowCredits", kind: "int32" },
+	{ no: 6, name: "usedPromptCredits", kind: "int32" },
+	{ no: 10, name: "topUpStatus", kind: "message", T: () => TopUpStatusSchema },
+	{ no: 11, name: "wasReducedByOrphanedUsage", kind: "bool" },
+	{ no: 12, name: "gracePeriodStatus", kind: "enum", E: () => GracePeriodStatusJson },
+	{ no: 13, name: "gracePeriodEnd", kind: "message", T: () => TimestampSchema },
+	{ no: 14, name: "dailyQuotaRemainingPercent", kind: "int32" },
+	{ no: 15, name: "weeklyQuotaRemainingPercent", kind: "int32" },
+	{ no: 16, name: "overageBalanceMicros", kind: "int64" },
+	{ no: 17, name: "dailyQuotaResetAtUnix", kind: "int64" },
+	{ no: 18, name: "weeklyQuotaResetAtUnix", kind: "int64" },
+]);
+
 /** Devin message exa.codeium_common_pb.PromoStatus. */
 export interface PromoStatus extends ProtoMessage {
 	isActive: boolean;
@@ -3006,6 +3508,144 @@ export const SingleModelCompletionProfileSchema: MessageCodec<SingleModelComplet
 	{ no: 10, name: "totalModelTime", kind: "double" },
 ]);
 
+/** Devin message exa.codeium_common_pb.TeamConfig. */
+export interface TeamConfig extends ProtoMessage {
+	teamId: string;
+	userPromptCreditCap: number;
+	userFlowCreditCap: number;
+	autoProvisionCascadeSeat: boolean;
+	allowMcpServers: boolean;
+	allowAutoRunCommands: boolean;
+	maxUnclaimedSites: number;
+	allowAppDeployments: boolean;
+	allowSandboxAppDeployments: boolean;
+	allowTeamsAppDeployments: boolean;
+	maxNewSitesPerDay: number;
+	allowGithubReviews: boolean;
+	allowGithubDescriptionEdits: boolean;
+	pullRequestReviewGuidelines: string;
+	pullRequestDescriptionGuidelines: string;
+	disableToolCalls: boolean;
+	allowIndividualLevelAnalytics: boolean;
+	allowConversationSharing?: boolean;
+	pullRequestReviewRateLimit?: number;
+	allowAttribution: boolean;
+	allowedMcpServers: McpServerConfig[];
+	allowGithubAutoReviews: boolean;
+	allowBrowserExperimentalFeatures: boolean;
+	disableToolCallExecutionOutsideWorkspace: boolean;
+	allowVibeAndReplace: boolean;
+	disableDeepwiki: boolean;
+	userAddOnCreditCap: number;
+	disableCodemaps: boolean;
+	allowCodemapSharing: string;
+	disableFastContext: boolean;
+	disableLifeguard: boolean;
+	allowedIpRanges: string[];
+	maxCascadeAutoExecutionLevel: CascadeCommandsAutoExecution;
+	cascadeWebSearchEnabled?: boolean;
+	terminalAllowList: string[];
+	terminalDenyList: string[];
+	cliPermissionsAllow: string[];
+	cliPermissionsDeny: string[];
+	cliPermissionsAsk: string[];
+	defaultModelUid: string;
+	allowArenaMode: boolean;
+	cascadeHooksJson: string;
+	allowBundlingDevinCli: boolean;
+	mcpRegistryUrls: string[];
+	enforceMcpRegistry: boolean;
+	cliDefaultDisabled: boolean;
+	acpRegistryConfig: string;
+	sandboxEnforcementMode: SandboxEnforcementMode;
+	sandboxAllowedDomains: string[];
+	sandboxDeniedDomains: string[];
+	devinTerminalAcpEnabled: boolean;
+	devinCloudAcpEnabled: boolean;
+	userConfiguredBannerEnabled: boolean;
+	userConfiguredBannerLabel: string;
+	userConfiguredBannerColor: string;
+	disableCascade: boolean;
+	extensionPolicy: string;
+	apiKeyExpirationDays?: number;
+	disablePlugins: boolean;
+}
+
+export const TeamConfigSchema: MessageCodec<TeamConfig> = pb<TeamConfig>("exa.codeium_common_pb.TeamConfig", [
+	{ no: 1, name: "teamId", kind: "string" },
+	{ no: 2, name: "userPromptCreditCap", kind: "int32" },
+	{ no: 3, name: "userFlowCreditCap", kind: "int32" },
+	{ no: 4, name: "autoProvisionCascadeSeat", kind: "bool" },
+	{ no: 5, name: "allowMcpServers", kind: "bool" },
+	{ no: 7, name: "allowAutoRunCommands", kind: "bool" },
+	{ no: 9, name: "maxUnclaimedSites", kind: "int32" },
+	{ no: 10, name: "allowAppDeployments", kind: "bool" },
+	{ no: 19, name: "allowSandboxAppDeployments", kind: "bool" },
+	{ no: 20, name: "allowTeamsAppDeployments", kind: "bool" },
+	{ no: 11, name: "maxNewSitesPerDay", kind: "int32" },
+	{ no: 12, name: "allowGithubReviews", kind: "bool" },
+	{ no: 13, name: "allowGithubDescriptionEdits", kind: "bool" },
+	{ no: 14, name: "pullRequestReviewGuidelines", kind: "string" },
+	{ no: 16, name: "pullRequestDescriptionGuidelines", kind: "string" },
+	{ no: 15, name: "disableToolCalls", kind: "bool" },
+	{ no: 17, name: "allowIndividualLevelAnalytics", kind: "bool" },
+	{ no: 18, name: "allowConversationSharing", kind: "bool", optional: true },
+	{ no: 21, name: "pullRequestReviewRateLimit", kind: "int32", optional: true },
+	{ no: 22, name: "allowAttribution", kind: "bool" },
+	{ no: 23, name: "allowedMcpServers", kind: "message", T: () => McpServerConfigSchema, repeat: true },
+	{ no: 24, name: "allowGithubAutoReviews", kind: "bool" },
+	{ no: 25, name: "allowBrowserExperimentalFeatures", kind: "bool" },
+	{ no: 26, name: "disableToolCallExecutionOutsideWorkspace", kind: "bool" },
+	{ no: 27, name: "allowVibeAndReplace", kind: "bool" },
+	{ no: 28, name: "disableDeepwiki", kind: "bool" },
+	{ no: 30, name: "userAddOnCreditCap", kind: "int32" },
+	{ no: 31, name: "disableCodemaps", kind: "bool" },
+	{ no: 32, name: "allowCodemapSharing", kind: "string" },
+	{ no: 33, name: "disableFastContext", kind: "bool" },
+	{ no: 34, name: "disableLifeguard", kind: "bool" },
+	{ no: 35, name: "allowedIpRanges", kind: "string", repeat: true },
+	{ no: 37, name: "maxCascadeAutoExecutionLevel", kind: "enum", E: () => CascadeCommandsAutoExecutionJson },
+	{ no: 38, name: "cascadeWebSearchEnabled", kind: "bool", optional: true },
+	{ no: 39, name: "terminalAllowList", kind: "string", repeat: true },
+	{ no: 40, name: "terminalDenyList", kind: "string", repeat: true },
+	{ no: 41, name: "cliPermissionsAllow", kind: "string", repeat: true },
+	{ no: 42, name: "cliPermissionsDeny", kind: "string", repeat: true },
+	{ no: 43, name: "cliPermissionsAsk", kind: "string", repeat: true },
+	{ no: 44, name: "defaultModelUid", kind: "string" },
+	{ no: 45, name: "allowArenaMode", kind: "bool" },
+	{ no: 46, name: "cascadeHooksJson", kind: "string" },
+	{ no: 47, name: "allowBundlingDevinCli", kind: "bool" },
+	{ no: 49, name: "mcpRegistryUrls", kind: "string", repeat: true },
+	{ no: 60, name: "enforceMcpRegistry", kind: "bool" },
+	{ no: 50, name: "cliDefaultDisabled", kind: "bool" },
+	{ no: 51, name: "acpRegistryConfig", kind: "string" },
+	{ no: 55, name: "sandboxEnforcementMode", kind: "enum", E: () => SandboxEnforcementModeJson },
+	{ no: 56, name: "sandboxAllowedDomains", kind: "string", repeat: true },
+	{ no: 57, name: "sandboxDeniedDomains", kind: "string", repeat: true },
+	{ no: 58, name: "devinTerminalAcpEnabled", kind: "bool" },
+	{ no: 59, name: "devinCloudAcpEnabled", kind: "bool" },
+	{ no: 61, name: "userConfiguredBannerEnabled", kind: "bool" },
+	{ no: 62, name: "userConfiguredBannerLabel", kind: "string" },
+	{ no: 63, name: "userConfiguredBannerColor", kind: "string" },
+	{ no: 64, name: "disableCascade", kind: "bool" },
+	{ no: 65, name: "extensionPolicy", kind: "string" },
+	{ no: 66, name: "apiKeyExpirationDays", kind: "int32", optional: true },
+	{ no: 67, name: "disablePlugins", kind: "bool" },
+]);
+
+/** Devin message exa.codeium_common_pb.TeamsFeaturesMetadata. */
+export interface TeamsFeaturesMetadata extends ProtoMessage {
+	isActive: boolean;
+	stripeSubscriptionId: string;
+	hasAccess: boolean;
+}
+
+export const TeamsFeaturesMetadataSchema: MessageCodec<TeamsFeaturesMetadata> = pb<TeamsFeaturesMetadata>("exa.codeium_common_pb.TeamsFeaturesMetadata", [
+	{ no: 1, name: "isActive", kind: "bool" },
+	{ no: 2, name: "stripeSubscriptionId", kind: "string" },
+	{ no: 3, name: "hasAccess", kind: "bool" },
+]);
+
 /** Devin message google.protobuf.Timestamp. */
 export interface Timestamp extends ProtoMessage {
 	seconds: bigint;
@@ -3015,5 +3655,73 @@ export interface Timestamp extends ProtoMessage {
 export const TimestampSchema: MessageCodec<Timestamp> = pb<Timestamp>("google.protobuf.Timestamp", [
 	{ no: 1, name: "seconds", kind: "int64" },
 	{ no: 2, name: "nanos", kind: "int32" },
+]);
+
+/** Devin message exa.codeium_common_pb.TopUpStatus. */
+export interface TopUpStatus extends ProtoMessage {
+	topUpTransactionStatus: TransactionStatus;
+	topUpEnabled: boolean;
+	monthlyTopUpAmount: number;
+	topUpSpent: number;
+	topUpIncrement: number;
+	topUpCriteriaMet: boolean;
+}
+
+export const TopUpStatusSchema: MessageCodec<TopUpStatus> = pb<TopUpStatus>("exa.codeium_common_pb.TopUpStatus", [
+	{ no: 1, name: "topUpTransactionStatus", kind: "enum", E: () => TransactionStatusJson },
+	{ no: 2, name: "topUpEnabled", kind: "bool" },
+	{ no: 3, name: "monthlyTopUpAmount", kind: "int32" },
+	{ no: 4, name: "topUpSpent", kind: "int32" },
+	{ no: 5, name: "topUpIncrement", kind: "int32" },
+	{ no: 6, name: "topUpCriteriaMet", kind: "bool" },
+]);
+
+/** Devin message exa.codeium_common_pb.UserStatus. */
+export interface UserStatus extends ProtoMessage {
+	pro: boolean;
+	disableTelemetry: boolean;
+	name: string;
+	ignoreChatTelemetrySetting: boolean;
+	teamId: string;
+	teamStatus: UserTeamStatus;
+	email: string;
+	userFeatures: UserFeatures[];
+	teamsFeatures: TeamsFeatures[];
+	teamsTier: TeamsTier;
+	permissions: Permission[];
+	planStatus?: PlanStatus;
+	hasUsedWindsurf: boolean;
+	userUsedPromptCredits: bigint;
+	userUsedFlowCredits: bigint;
+	hasFingerprintSet: boolean;
+	teamConfig?: TeamConfig;
+	cascadeModelConfigData?: CascadeModelConfigData;
+	windsurfProTrialEndTime?: Timestamp;
+	maxNumPremiumChatMessages: bigint;
+	userId: string;
+}
+
+export const UserStatusSchema: MessageCodec<UserStatus> = pb<UserStatus>("exa.codeium_common_pb.UserStatus", [
+	{ no: 1, name: "pro", kind: "bool" },
+	{ no: 2, name: "disableTelemetry", kind: "bool" },
+	{ no: 3, name: "name", kind: "string" },
+	{ no: 4, name: "ignoreChatTelemetrySetting", kind: "bool" },
+	{ no: 5, name: "teamId", kind: "string" },
+	{ no: 6, name: "teamStatus", kind: "enum", E: () => UserTeamStatusJson },
+	{ no: 7, name: "email", kind: "string" },
+	{ no: 9, name: "userFeatures", kind: "enum", E: () => UserFeaturesJson, repeat: true },
+	{ no: 8, name: "teamsFeatures", kind: "enum", E: () => TeamsFeaturesJson, repeat: true },
+	{ no: 10, name: "teamsTier", kind: "enum", E: () => TeamsTierJson },
+	{ no: 11, name: "permissions", kind: "enum", E: () => PermissionJson, repeat: true },
+	{ no: 13, name: "planStatus", kind: "message", T: () => PlanStatusSchema },
+	{ no: 31, name: "hasUsedWindsurf", kind: "bool" },
+	{ no: 28, name: "userUsedPromptCredits", kind: "int64" },
+	{ no: 29, name: "userUsedFlowCredits", kind: "int64" },
+	{ no: 30, name: "hasFingerprintSet", kind: "bool" },
+	{ no: 32, name: "teamConfig", kind: "message", T: () => TeamConfigSchema },
+	{ no: 33, name: "cascadeModelConfigData", kind: "message", T: () => CascadeModelConfigDataSchema },
+	{ no: 34, name: "windsurfProTrialEndTime", kind: "message", T: () => TimestampSchema },
+	{ no: 35, name: "maxNumPremiumChatMessages", kind: "int64" },
+	{ no: 36, name: "userId", kind: "string" },
 ]);
 

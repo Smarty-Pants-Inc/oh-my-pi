@@ -1,5 +1,6 @@
-import { expect, it } from "bun:test";
+import { expect, it, vi } from "bun:test";
 import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
+import { verifyApprovedStartup } from "@oh-my-pi/pi-coding-agent/context/approved-policy";
 import { runRootCommand } from "@oh-my-pi/pi-coding-agent/main";
 import { getDbBusyTimeoutMs, setInteractiveHost } from "@oh-my-pi/pi-utils";
 
@@ -46,4 +47,29 @@ it("classifies noninteractive launches before enforcing approved startup", async
 	).rejects.toBe(stop);
 
 	expect(observedInteractive).toBe(false);
+});
+
+it("warns for interactive prompt-policy drift and remains strict otherwise", async () => {
+	const policyError = new Error("PROMPT_POLICY_REVIEW_REQUIRED: drift");
+	const unexpected = new Error("unexpected startup failure");
+	const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+	try {
+		await verifyApprovedStartup(true, async () => {
+			throw policyError;
+		});
+		expect(stderr).toHaveBeenCalledWith("Warning: PROMPT_POLICY_REVIEW_REQUIRED: drift\n");
+
+		await expect(
+			verifyApprovedStartup(false, async () => {
+				throw policyError;
+			}),
+		).rejects.toBe(policyError);
+		await expect(
+			verifyApprovedStartup(true, async () => {
+				throw unexpected;
+			}),
+		).rejects.toBe(unexpected);
+	} finally {
+		stderr.mockRestore();
+	}
 });

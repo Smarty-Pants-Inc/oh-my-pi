@@ -45,6 +45,7 @@ import {
 	type AdvisorAgent,
 	type AdvisorConfig,
 	AdvisorEmissionGuard,
+	AdvisorLoopGuard,
 	type AdvisorMessageDetails,
 	type AdvisorNote,
 	AdvisorOutputQuarantinedError,
@@ -235,9 +236,7 @@ export interface SessionAdvisorsOptions {
 	contextPrompt?: string;
 	configs?: AdvisorConfig[];
 	streamFn?: StreamFn;
-	transformProviderContext?: (context: Context, model: Model, target?: ContextTarget) => Context | Promise<Context>;
-	/** Advisor spend already persisted for this session, restored on resume. */
-	initialCosts?: ReadonlyMap<string, number>;
+	transformProviderContext?: (context: Context, model: Model) => Context | Promise<Context>;
 }
 
 /** Options accepted when an advisor injects a primary-session message. */
@@ -330,7 +329,16 @@ export class SessionAdvisors {
 	#advisorStatuses = new Map<string, { name: string; status: AdvisorRuntimeStatus }>();
 	#advisorProviderSessionIds = new Map<string, string>();
 	#advisorCosts = new Map<string, number>();
+	/**
+	 * Slugs whose recorded spend ran on an OAuth/subscription model. Kept in
+	 * lockstep with {@link #advisorCosts} so {@link isUsingSubscription} can
+	 * attribute historical advisor spend without rescanning the model catalog
+	 * once the advisor runtime is gone (#10131).
+	 */
+	#advisorSubscriptionSlugs = new Set<string>();
 	#advisorRecorderClosed: Promise<void> = Promise.resolve();
+	/** Holds recorder writes behind the active resume-cost byte snapshot. */
+	#advisorCostSnapshotBarrier: Promise<void> | undefined;
 	#advisorAutoResumeSuppressed = false;
 	#preserveAdvisorAdvice = false;
 	#preserveTerminalYieldAdvice = false;
@@ -359,7 +367,6 @@ export class SessionAdvisors {
 		this.#advisorStreamFn = options.streamFn;
 		this.#completeWithAdvisorStream = createCompleteFnFromStreamFn(options.streamFn ?? streamSimple);
 		this.#transformProviderContext = options.transformProviderContext;
-		if (options.initialCosts) this.#advisorCosts = new Map(options.initialCosts);
 		this.#host.agent.addBeforeInputHook(messages => this.retainPrimaryInput(messages));
 		this.retainPrimaryInput(this.#host.agent.state.messages);
 		if (this.#advisorEnabled) this.#buildAdvisorRuntime();
@@ -635,11 +642,95 @@ export class SessionAdvisors {
 	/** Drop the recorded spend once a conversation boundary has committed. */
 	clearCost(): void {
 		this.#advisorCosts.clear();
+		this.#advisorSubscriptionSlugs.clear();
 	}
 
-	/** Replace the ledger with the spend recorded for the session becoming active. */
-	restoreCost(costs: ReadonlyMap<string, number>): void {
+	/**
+	 * Replace the ledger with the spend recorded for the session becoming active.
+	 * `providersBySlug` (from {@link loadAdvisorTranscriptCosts}) re-derives the
+	 * subscription attribution the torn-down runtime can no longer report.
+	 */
+	restoreCost(costs: ReadonlyMap<string, number>, providersBySlug?: ReadonlyMap<string, ReadonlySet<string>>): void {
 		this.#advisorCosts = new Map(costs);
+		this.#advisorSubscriptionSlugs = this.#deriveSubscriptionSlugs(costs, providersBySlug);
+	}
+
+	/**
+	 * Slugs whose restored spend ran on a provider that currently authenticates
+	 * via OAuth — the persisted-spend equivalent of the live {@link isUsingSubscription}
+	 * check, so resumed sessions attribute subscription usage without a catalog scan.
+	 */
+	#deriveSubscriptionSlugs(
+		costs: ReadonlyMap<string, number>,
+		providersBySlug: ReadonlyMap<string, ReadonlySet<string>> | undefined,
+	): Set<string> {
+		const slugs = new Set<string>();
+		if (!providersBySlug) return slugs;
+		const auth = this.#host.modelRegistry.authStorage;
+		for (const [slug, providers] of providersBySlug) {
+			if ((costs.get(slug) ?? 0) <= 0) continue;
+			for (const provider of providers) {
+				if (auth.hasOAuth(provider)) {
+					slugs.add(slug);
+					break;
+				}
+			}
+		}
+		return slugs;
+	}
+
+	/** Capture the current per-advisor spend ledger. */
+	costSnapshot(): ReadonlyMap<string, number> {
+		return new Map(this.#advisorCosts);
+	}
+	/**
+	 * Freeze active recorder writes after everything billed so far. The returned
+	 * baseline and byte snapshot therefore describe the same turn boundary.
+	 */
+	beginCostRestoreSnapshot(): {
+		costsAtSnapshot: ReadonlyMap<string, number>;
+		ready: Promise<unknown>;
+		release: () => void;
+	} {
+		const costsAtSnapshot = this.costSnapshot();
+		const gate = Promise.withResolvers<void>();
+		this.#advisorCostSnapshotBarrier = gate.promise;
+		const ready = Promise.all(this.#advisors.map(advisor => advisor.recorder.blockWritesUntil(gate.promise)));
+		let released = false;
+		return {
+			costsAtSnapshot,
+			ready,
+			release: () => {
+				if (released) return;
+				released = true;
+				if (this.#advisorCostSnapshotBarrier === gate.promise) this.#advisorCostSnapshotBarrier = undefined;
+				gate.resolve();
+			},
+		};
+	}
+
+	/**
+	 * Restore spend persisted at `costsAtSnapshot`, then add only the process-local
+	 * delta billed after that fixed transcript snapshot. This preserves turns
+	 * completed while the background scan runs without double-counting entries
+	 * the scan already includes.
+	 */
+	restoreInitialCost(
+		costs: ReadonlyMap<string, number>,
+		costsAtSnapshot: ReadonlyMap<string, number>,
+		providersBySlug?: ReadonlyMap<string, ReadonlySet<string>>,
+	): void {
+		const restored = new Map(costs);
+		const subscription = this.#deriveSubscriptionSlugs(costs, providersBySlug);
+		for (const [slug, current] of this.#advisorCosts) {
+			const accrued = current - (costsAtSnapshot.get(slug) ?? 0);
+			if (accrued <= 0) continue;
+			restored.set(slug, (restored.get(slug) ?? 0) + accrued);
+			// The delta billed after the snapshot carries its own live attribution.
+			if (this.#advisorSubscriptionSlugs.has(slug)) subscription.add(slug);
+		}
+		this.#advisorCosts = restored;
+		this.#advisorSubscriptionSlugs = subscription;
 	}
 
 	/**
@@ -762,9 +853,11 @@ export class SessionAdvisors {
 	 * agent steer/follow-up queues, and preserved cards deferred to the next turn —
 	 * so none of them inject into the new conversation.
 	 */
-	#resetAdvisorSessionState(preserveCost: boolean, preserveDeliveries: boolean): void {
-		if (!preserveCost) this.#advisorCosts.clear();
-		this.#primaryRegexSecretValues.clear();
+	#resetAdvisorSessionState(preserveCost: boolean, preserveDeliveries = false): void {
+		if (!preserveCost) {
+			this.#advisorCosts.clear();
+			this.#advisorSubscriptionSlugs.clear();
+		}
 		// Mute the recorder across the re-prime: AdvisorRuntime.reset() aborts the advisor
 		// loop, and that abort can emit an `aborted` message_end we must not attribute to
 		// either session's transcript. Detach, reset, then re-attach the live agent's feed.
@@ -1102,10 +1195,30 @@ export class SessionAdvisors {
 				serviceTierResolver: advisorServiceTierResolver,
 			});
 			advisorAgent.setDisableReasoning(shouldDisableReasoning(advisorThinkingLevel));
+			let advisorLoopGuardStopped = false;
+			// The advisor's own loop needs the same repeated-tool-call bound the
+			// primary gets from `LoopGuards`; nothing else stops it reissuing one
+			// failing call until the update is abandoned.
+			const advisorLoopGuard = new AdvisorLoopGuard({
+				settings: this.#host.settings,
+				name: advisorName,
+				liveMessages: () => advisorAgent.state.messages,
+				appendMessage: message => advisorAgent.appendMessage(message),
+				abort: reason => {
+					advisorLoopGuardStopped = true;
+					advisorAgent.abort(reason);
+				},
+			});
+			advisorAgent.setOnTurnEnd((messages, signal, context) => {
+				if (signal?.aborted) return;
+				advisorLoopGuard.recordTurn(messages, context);
+			});
 
 			const advisorAgentFacade: AdvisorAgent = {
 				prompt: async input => {
 					let quarantined: string | undefined;
+					advisorLoopGuard.reset();
+					advisorLoopGuardStopped = false;
 					try {
 						quarantinedAdvisorOutput = undefined;
 						// Multi-message input (candidate 4) must serialize deterministically
@@ -1121,6 +1234,12 @@ export class SessionAdvisors {
 						else await advisorAgent.prompt(input);
 						quarantined = quarantinedAdvisorOutput;
 					} finally {
+						if (advisorLoopGuardStopped) {
+							// A loop guard stop is a deliberate, bounded silent review, not
+							// a provider failure for AdvisorRuntime to retry/fallback.
+							advisorAgent.state.error = undefined;
+							advisorLoopGuardStopped = false;
+						}
 						quarantinedAdvisorOutput = undefined;
 						currentAdvisorInput = "";
 					}
@@ -1128,6 +1247,8 @@ export class SessionAdvisors {
 				},
 				abort: reason => advisorAgent.abort(reason),
 				reset: () => {
+					advisorLoopGuard.reset();
+					advisorLoopGuardStopped = false;
 					advisorAgent.reset();
 					appendOnlyContext.log.clear();
 				},
@@ -1153,7 +1274,9 @@ export class SessionAdvisors {
 				advisorTranscriptFilename(slug),
 				// On the advisor on→off→on toggle, wait for the prior recorders' closes
 				// so two SessionManagers never hold the same file at once.
-				this.#advisorRecorderClosed,
+				this.#advisorCostSnapshotBarrier
+					? Promise.all([this.#advisorRecorderClosed, this.#advisorCostSnapshotBarrier])
+					: this.#advisorRecorderClosed,
 			);
 			const runtime = new AdvisorRuntime(advisorAgentFacade, {
 				snapshotMessages: () => this.#host.agent.state.messages,
@@ -1162,12 +1285,16 @@ export class SessionAdvisors {
 				obfuscator: this.#host.obfuscator,
 				getModelIdentity: () => formatModelString(advisorRef.agent.state.model),
 				beginAdvisorUpdate: inProgress => {
+					advisorRef.recorder.beginTurn();
 					advisorRef.adviseTool.beginUpdate(inProgress);
 					advisorRef.emissionGuard.beginUpdate();
 				},
 				onTurnError: (error, failedMessages, signal) =>
 					this.#recoverAdvisorTurn(advisorRef, error, failedMessages, signal),
 				onTurnSuccess: async () => {
+					// Commit the delivered batch so retries of a failed turn stay deduped
+					// while this successful turn's context is persisted once (issue #9553).
+					advisorRef.recorder.commitTurn();
 					this.#recordAdvisorMissionSuccess(advisorRef);
 					const fallback = advisorRef.retryFallback;
 					if (!advisorRef.retryFallbackPendingSuccess || !fallback) return;
@@ -1178,6 +1305,7 @@ export class SessionAdvisors {
 						role: fallback.role,
 					});
 				},
+				onTurnAbandoned: () => advisorRef.recorder.abandonTurn(),
 				notifyFailure: error => {
 					this.#advisorStatuses.set(slug, { name: advisorName, status: "error" });
 					const message = error instanceof Error ? error.message : String(error);
@@ -1368,7 +1496,13 @@ export class SessionAdvisors {
 	}
 
 	#recordAdvisorCost(advisor: ActiveAdvisor, message: AssistantMessage): void {
-		this.#advisorCosts.set(advisor.slug, (this.#advisorCosts.get(advisor.slug) ?? 0) + message.usage.cost.total);
+		const cost = message.usage.cost.total;
+		this.#advisorCosts.set(advisor.slug, (this.#advisorCosts.get(advisor.slug) ?? 0) + cost);
+		// Cheap in-memory OAuth-credential check; captured now so subscription
+		// attribution survives the advisor runtime being torn down (#10131).
+		if (cost > 0 && Number.isFinite(cost) && this.#host.modelRegistry.isUsingOAuth(advisor.model)) {
+			this.#advisorSubscriptionSlugs.add(advisor.slug);
+		}
 	}
 
 	/** Subscribe the advisor agent's finalized messages into the transcript recorder.
@@ -1976,13 +2110,17 @@ export class SessionAdvisors {
 		for (const advisorCost of this.#advisorCosts.values()) cost += advisorCost;
 		return cost;
 	}
-	/** Return whether any active or configured advisor is running on an OAuth/subscription model. */
+	/**
+	 * Whether advisor spend should be attributed to an OAuth/subscription plan.
+	 * With live advisors it reflects their current models; once the runtime is
+	 * gone it consults the attribution recorded as spend accrued, so the status
+	 * line never rescans the model catalog per render (#10131).
+	 */
 	isUsingSubscription(): boolean {
 		if (this.#advisors.length > 0) {
 			return this.#advisors.some(a => this.#host.modelRegistry.isUsingOAuth(a.model));
 		}
-		const sel = resolveAdvisorRoleSelection(this.#host.settings, this.#host.modelRegistry.getAvailable());
-		return sel ? this.#host.modelRegistry.isUsingOAuth(sel.model) : false;
+		return this.#advisorSubscriptionSlugs.size > 0;
 	}
 	/**
 	 * Return structured advisor stats for the status command and TUI panel.

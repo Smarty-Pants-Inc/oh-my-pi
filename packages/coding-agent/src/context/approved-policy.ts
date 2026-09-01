@@ -180,9 +180,23 @@ export async function assertApprovedStartup(cwd: string = process.cwd()): Promis
 	if (!(await Bun.file(statePath).exists())) {
 		throw new Error(`PROMPT_POLICY_REVIEW_REQUIRED: missing ${statePath}`);
 	}
-	const activated = parseContextReleaseManifest(await Bun.file(statePath).text());
-	const policy = await loadApprovedPolicy();
-	if (!policy) throw new Error(`PROMPT_POLICY_REVIEW_REQUIRED: missing ${approvedPolicyPath()}`);
+	const activatedSource = await Bun.file(statePath).text();
+	let activated: ContextReleaseManifest;
+	try {
+		activated = parseContextReleaseManifest(activatedSource);
+	} catch (error) {
+		throw new Error(`PROMPT_POLICY_REVIEW_REQUIRED: invalid ${statePath}`, { cause: error });
+	}
+	const policyPath = approvedPolicyPath();
+	const policyFile = Bun.file(policyPath);
+	if (!(await policyFile.exists())) throw new Error(`PROMPT_POLICY_REVIEW_REQUIRED: missing ${policyPath}`);
+	const policySource = await policyFile.text();
+	let policy: ApprovedPolicy;
+	try {
+		policy = parseApprovedPolicy(policySource);
+	} catch (error) {
+		throw new Error(`PROMPT_POLICY_REVIEW_REQUIRED: invalid ${policyPath}`, { cause: error });
+	}
 	const release = await buildContextReleaseManifest(cwd, policy.candidates, {
 		requireCleanCanonicalCheckout: true,
 		stackPackageContentSha256: policy.stackPackageContentSha256,
@@ -203,7 +217,26 @@ export function promptPolicyReviewWarning(error: unknown): string | undefined {
 	return error.message;
 }
 
-/** Startup policy is advisory; offline context commands retain strict diagnostics. */
-export function ensureApprovedStartup(): Promise<ContextReleaseManifest | undefined> {
-	return assertApprovedStartup().catch(() => undefined);
+export async function verifyApprovedStartup(
+	isInteractive: boolean,
+	verify: () => Promise<unknown> = assertApprovedStartup,
+): Promise<void> {
+	try {
+		await verify();
+	} catch (error) {
+		const warning = isInteractive ? promptPolicyReviewWarning(error) : undefined;
+		if (!warning) throw error;
+		process.stderr.write(`Warning: ${warning}\n`);
+	}
+}
+/** Startup policy drift is advisory; unrelated verification failures remain strict. */
+export async function ensureApprovedStartup(
+	verify: () => Promise<ContextReleaseManifest> = assertApprovedStartup,
+): Promise<ContextReleaseManifest | undefined> {
+	try {
+		return await verify();
+	} catch (error) {
+		if (promptPolicyReviewWarning(error)) return undefined;
+		throw error;
+	}
 }

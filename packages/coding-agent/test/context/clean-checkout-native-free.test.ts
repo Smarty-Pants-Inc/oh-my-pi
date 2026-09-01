@@ -12,7 +12,7 @@ interface CommandResult {
 
 const sourceRepository = path.resolve(import.meta.dir, "../../../..");
 const bun = Bun.which("bun") ?? process.execPath;
-const frozenUpstream = "37eee71978951fccf66b21f7e3e2b74596ac9d74";
+const frozenUpstream = "eea5628f13043286e17c4a2ea4fc28b15fda33ca";
 const frozenUpstreamUrl = "https://github.com/can1357/oh-my-pi.git";
 
 async function run(command: string[], cwd: string, env?: Record<string, string | undefined>): Promise<CommandResult> {

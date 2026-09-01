@@ -19,6 +19,17 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 
+function observeAsyncResultEnqueue(session: AgentSession): Promise<void> {
+	const queued = Promise.withResolvers<void>();
+	const enqueue = session.yieldQueue.enqueueWithReceipt.bind(session.yieldQueue);
+	vi.spyOn(session.yieldQueue, "enqueueWithReceipt").mockImplementation((kind, entry) => {
+		const receipt = enqueue(kind, entry);
+		if (kind === "async-result") queued.resolve();
+		return receipt;
+	});
+	return queued.promise;
+}
+
 describe("AgentSession owner-routed async delivery", () => {
 	let session: AgentSession;
 	const authStorages: AuthStorage[] = [];
@@ -88,8 +99,10 @@ describe("AgentSession owner-routed async delivery", () => {
 	it("keeps the exact origin eligible through recovery and closes it before prompt return", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const providerGate = Promise.withResolvers<void>();
+		const providerStarted = Promise.withResolvers<void>();
 		const mock = createMockModel({
 			handler: async () => {
+				providerStarted.resolve();
 				await providerGate.promise;
 				return { content: ["Done"] };
 			},
@@ -116,10 +129,11 @@ describe("AgentSession owner-routed async delivery", () => {
 			asyncJobManager: manager,
 		});
 		const prompt = session.sendUserMessage("start exact-origin turn");
-		while (mock.calls.length === 0) await Bun.sleep(1);
+		await providerStarted.promise;
 		const originTurnId = session.getCurrentTurnId();
 		expect(originTurnId).toMatch(/^turn-/);
 
+		const resultQueued = observeAsyncResultEnqueue(session);
 		manager.register("bash", "origin job", async () => "EXACT ORIGIN RESULT", {
 			id: "origin-job",
 			ownerId: "SubAgent",
@@ -127,7 +141,7 @@ describe("AgentSession owner-routed async delivery", () => {
 		});
 		expect(session.hasPendingAsyncWork()).toBe(true);
 		await manager.waitForOwnerJobs("SubAgent");
-		await manager.drainDeliveries({ filter: { ownerId: "SubAgent" } });
+		await resultQueued;
 		expect(session.hasPendingAsyncWork()).toBe(true);
 
 		providerGate.resolve();
@@ -256,7 +270,7 @@ describe("AgentSession owner-routed async delivery", () => {
 		expect(manager.getJob(otherOwnerJobId)?.status).toBe("completed");
 	});
 
-	it("does not inject a prior session's pending async result after a new session", async () => {
+	it("does not inject a prior session's passive async result after a new session", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
 		const agent = new Agent({
@@ -280,14 +294,16 @@ describe("AgentSession owner-routed async delivery", () => {
 			ownedAsyncJobManager: manager,
 		});
 
-		// Complete an unscoped job. Its result is passive, not a queued follow-up.
+		// A completion without an open origin is persisted but never queued for
+		// automatic injection, so it cannot survive as a wake into a new session.
 		manager.register("task", "prior session", async () => "STALE ASYNC RESULT", {
 			id: "prior-session-job",
 			ownerId: "Main",
 		});
 		await manager.waitForOwnerJobs("Main");
-		await manager.drainDeliveries({ filter: { ownerId: "Main" } });
+		await manager.drainDeliveries({ timeoutMs: 1_000, filter: { ownerId: "Main" } });
 		expect(session.hasPendingAsyncWork()).toBe(false);
+		expect(agent.state.messages.some(message => JSON.stringify(message).includes("STALE ASYNC RESULT"))).toBe(true);
 
 		expect(await session.newSession()).toBe(true);
 		expect(session.hasPendingAsyncWork()).toBe(false);
@@ -364,9 +380,17 @@ describe("AgentSession owner-routed async delivery", () => {
 		expect(session.hasPendingAsyncWork()).toBe(false);
 	});
 
-	it("does not report an unscoped delivered result as pending semantic work", async () => {
+	it("keeps delivery pending until the queued follow-up is injected", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
-		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
+		const providerGate = Promise.withResolvers<void>();
+		const providerStarted = Promise.withResolvers<void>();
+		const mock = createMockModel({
+			handler: async () => {
+				providerStarted.resolve();
+				await providerGate.promise;
+				return { content: ["Done"] };
+			},
+		});
 		const agent = new Agent({
 			getApiKey: () => "test-key",
 			initialState: { model, systemPrompt: ["Test"], tools: [] },
@@ -388,18 +412,29 @@ describe("AgentSession owner-routed async delivery", () => {
 			asyncJobManager: manager,
 		});
 
-		const gate = Promise.withResolvers<string>();
-		manager.register("bash", "gated job", () => gate.promise, { id: "sub-job", ownerId: "SubAgent" });
-		gate.resolve("job finished: QUEUED RESULT");
-		await manager.waitForOwnerJobs("SubAgent");
-		await manager.drainDeliveries({ filter: { ownerId: "SubAgent" } });
+		const prompt = session.sendUserMessage("start queued-result turn");
+		await providerStarted.promise;
+		const originTurnId = session.getCurrentTurnId();
+		expect(originTurnId).toMatch(/^turn-/);
 
-		// The result is already passively persisted and never becomes wake authority.
-		expect(session.hasPendingAsyncWork()).toBe(false);
+		const resultQueued = observeAsyncResultEnqueue(session);
+		manager.register("bash", "queued job", async () => "job finished: QUEUED RESULT", {
+			id: "sub-job",
+			ownerId: "SubAgent",
+			originTurnId,
+		});
+		await manager.waitForOwnerJobs("SubAgent");
+		await resultQueued;
+		expect(session.hasPendingAsyncWork()).toBe(true);
+		expect(manager.isJobResultConsumed("sub-job")).toBe(false);
+
+		providerGate.resolve();
+		await prompt;
 		await session.settleAsyncWork();
+
 		expect(session.hasPendingAsyncWork()).toBe(false);
-		expect(mock.calls.some(call => JSON.stringify(call.context.messages).includes("QUEUED RESULT"))).toBe(false);
-		expect(agent.state.messages.some(message => JSON.stringify(message).includes("QUEUED RESULT"))).toBe(true);
+		expect(manager.isJobResultConsumed("sub-job")).toBe(true);
+		expect(mock.calls.some(call => JSON.stringify(call.context.messages).includes("QUEUED RESULT"))).toBe(true);
 	});
 
 	it("keeps the event loop live until a delayed idle flush runs", async () => {

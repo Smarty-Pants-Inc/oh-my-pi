@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import { createMockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
@@ -36,6 +36,17 @@ function recordCall(value: string, id: string): MockResponse {
 
 function done(text = "done"): MockResponse {
 	return { content: [text], stopReason: "stop" };
+}
+
+function observeAsyncResultEnqueue(session: AgentSession): Promise<void> {
+	const queued = Promise.withResolvers<void>();
+	const enqueue = session.yieldQueue.enqueueWithReceipt.bind(session.yieldQueue);
+	vi.spyOn(session.yieldQueue, "enqueueWithReceipt").mockImplementation((kind, entry) => {
+		const receipt = enqueue(kind, entry);
+		if (kind === "async-result") queued.resolve();
+		return receipt;
+	});
+	return queued.promise;
 }
 
 async function createHarness(
@@ -647,13 +658,14 @@ describe("AgentSession automatic turn authority", () => {
 		await providerStarted.promise;
 		const originTurnId = session.getCurrentTurnId();
 		expect(originTurnId).toMatch(/^turn-/);
+		const resultQueued = observeAsyncResultEnqueue(session);
 		manager.register("task", "queued paused authority probe", async () => "QUEUED PAUSED ASYNC RESULT", {
 			id: "queued-paused-authority-job",
 			ownerId: "AuthorityProbe",
 			originTurnId,
 		});
 		await manager.waitForOwnerJobs("AuthorityProbe");
-		await manager.drainDeliveries({ filter: { ownerId: "AuthorityProbe" } });
+		await resultQueued;
 		expect(session.hasPendingAsyncWork()).toBe(true);
 
 		await session.goalRuntime.pauseGoal();

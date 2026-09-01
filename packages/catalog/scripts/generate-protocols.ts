@@ -15,6 +15,8 @@ const CURSOR_CONSUMER_DIRS = [
 ];
 
 const DEVIN_MESSAGES = [
+	"exa.api_server_pb.AssignModelRequest",
+	"exa.api_server_pb.AssignModelResponse",
 	"exa.chat_pb.ChatMessagePrompt",
 	"exa.codeium_common_pb.ChatToolCall",
 	"exa.chat_pb.ChatToolChoice",
@@ -27,6 +29,8 @@ const DEVIN_MESSAGES = [
 	"exa.api_server_pb.GetCliModelConfigsResponse",
 	"exa.auth_pb.GetUserJwtRequest",
 	"exa.auth_pb.GetUserJwtResponse",
+	"exa.seat_management_pb.GetUserStatusRequest",
+	"exa.seat_management_pb.GetUserStatusResponse",
 	"exa.codeium_common_pb.ImageData",
 	"exa.codeium_common_pb.Metadata",
 	"exa.codeium_common_pb.ModelUsageStats",
@@ -35,11 +39,13 @@ const DEVIN_MESSAGES = [
 	"exa.codeium_common_pb.ModelFeatures",
 ];
 const DEVIN_ENUMS = [
+	"BillingStrategy",
 	"CacheControlType",
 	"ChatMessageRequestType",
 	"ChatMessageSource",
 	"ConversationalPlannerMode",
 	"StopReason",
+	"TeamsTier",
 ];
 
 async function collectCursorSymbols(context: ProtoContext): Promise<{ messages: string[]; enums: string[] }> {

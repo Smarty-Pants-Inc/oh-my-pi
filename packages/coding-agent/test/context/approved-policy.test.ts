@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import {
 	approvedPolicyPath,
+	ensureApprovedStartup,
 	parseApprovedPolicy,
 	promptPolicyReviewWarning,
 	releaseProjectionMismatches,
@@ -42,6 +43,21 @@ describe("approved policy", () => {
 		);
 		expect(promptPolicyReviewWarning(new Error("unrelated startup failure"))).toBeUndefined();
 		expect(promptPolicyReviewWarning("PROMPT_POLICY_REVIEW_REQUIRED: not an Error")).toBeUndefined();
+	});
+
+	it("suppresses only prompt-policy drift in advisory startup checks", async () => {
+		expect(
+			await ensureApprovedStartup(async () => {
+				throw new Error("PROMPT_POLICY_REVIEW_REQUIRED: drift");
+			}),
+		).toBeUndefined();
+
+		const unexpected = new Error("unexpected startup failure");
+		await expect(
+			ensureApprovedStartup(async () => {
+				throw unexpected;
+			}),
+		).rejects.toBe(unexpected);
 	});
 
 	it("uses the shared Smarty Stack policy path by default", () => {

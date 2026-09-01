@@ -7,7 +7,7 @@ import { registeredPromptSource } from "../../src/context/registry";
 const repository = path.resolve(import.meta.dir, "../../../..");
 const cliEntry = path.join(repository, "packages/coding-agent/src/cli.ts");
 const blockNativeImport = path.join(import.meta.dir, "../fixtures/block-native-import.ts");
-const frozenUpstream = "37eee71978951fccf66b21f7e3e2b74596ac9d74";
+const frozenUpstream = "eea5628f13043286e17c4a2ea4fc28b15fda33ca";
 const frozenUpstreamUrl = "https://github.com/can1357/oh-my-pi.git";
 let home = "";
 let historyRepository = "";

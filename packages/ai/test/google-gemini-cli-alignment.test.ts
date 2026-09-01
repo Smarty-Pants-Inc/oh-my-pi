@@ -16,16 +16,19 @@ import type {
 	TJsonSchema,
 } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import type { ModelSpec } from "@oh-my-pi/pi-catalog/types";
 
-function createModel(provider: "google-gemini-cli" | "google-antigravity"): Model<"google-gemini-cli"> {
+function createModel(
+	provider: "google-gemini-cli" | "google-antigravity",
+	id = provider === "google-antigravity" ? "gemini-3-flash" : "gemini-2.5-flash",
+	reasoning = false,
+): Model<"google-gemini-cli"> {
 	return buildModel({
-		id: provider === "google-antigravity" ? "gemini-3-flash" : "gemini-2.5-flash",
-		name: provider,
+		id: id,
+		name: id,
 		api: "google-gemini-cli",
 		provider,
 		baseUrl: "https://example.com",
-		reasoning: false,
+		reasoning: reasoning,
 		input: ["text"],
 		cost: {
 			input: 0,
@@ -263,12 +266,7 @@ describe("Google Gemini CLI alignment", () => {
 				{ role: "user", content: "continue", timestamp: 2 },
 			],
 		});
-		const claudeModel = buildModel({
-			...createModel("google-antigravity"),
-			id: "claude-sonnet-4-6",
-			name: "Claude Sonnet 4.6",
-			reasoning: true,
-		} as ModelSpec<"google-gemini-cli">);
+		const claudeModel = createModel("google-antigravity", "claude-sonnet-4-6", true);
 		const claudePayload = buildRequest(claudeModel, createThinkingContext(claudeModel), "proj-123", {}, true) as {
 			request: {
 				contents: Array<{
@@ -437,12 +435,7 @@ describe("Google Gemini CLI alignment", () => {
 			return new Response('{"error":{"message":"bad request"}}', { status: 400 });
 		};
 
-		const model: Model<"google-gemini-cli"> = buildModel({
-			...createModel("google-antigravity"),
-			id: "claude-sonnet-4-6",
-			name: "Claude Sonnet 4.6",
-			reasoning: true,
-		} as ModelSpec<"google-gemini-cli">);
+		const model: Model<"google-gemini-cli"> = createModel("google-antigravity", "claude-sonnet-4-6", true);
 
 		const result = await streamGoogleGeminiCli(model, createContext(), {
 			apiKey: JSON.stringify({ token: "token", projectId: "proj-123" }),
@@ -494,12 +487,7 @@ describe("Google Gemini CLI alignment", () => {
 			});
 		};
 
-		const model: Model<"google-gemini-cli"> = buildModel({
-			...createModel("google-antigravity"),
-			id: "gemini-3.5-flash",
-			name: "Gemini 3.5 Flash",
-			reasoning: true,
-		} as ModelSpec<"google-gemini-cli">);
+		const model: Model<"google-gemini-cli"> = createModel("google-antigravity", "gemini-3.5-flash", true);
 
 		const events: AssistantMessageEvent[] = [];
 		const stream = streamGoogleGeminiCli(model, createContext(), {
@@ -557,12 +545,7 @@ describe("Google Gemini CLI alignment", () => {
 			});
 		};
 
-		const model: Model<"google-gemini-cli"> = buildModel({
-			...createModel("google-antigravity"),
-			id: "gemini-3.5-flash",
-			name: "Gemini 3.5 Flash",
-			reasoning: true,
-		} as ModelSpec<"google-gemini-cli">);
+		const model: Model<"google-gemini-cli"> = createModel("google-antigravity", "gemini-3.5-flash", true);
 
 		const events: AssistantMessageEvent[] = [];
 		const stream = streamGoogleGeminiCli(model, createContext(), {

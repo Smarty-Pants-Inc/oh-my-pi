@@ -12,6 +12,7 @@ import {
 	type SystemPromptToolMetadata,
 } from "@oh-my-pi/pi-coding-agent/system-prompt";
 import { createTools, type Tool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { getAgentDir, setAgentDir } from "@oh-my-pi/pi-utils/dirs";
 import { cleanupTempHome } from "./helpers/temp-home-cleanup";
 
 const EMPTY_TREE = {
@@ -74,15 +75,21 @@ describe("system prompt tool inventory", () => {
 	let tempDir = "";
 	let tempHomeDir = "";
 	let originalHome: string | undefined;
+	let originalAgentDir = "";
 
 	beforeEach(() => {
 		tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-prompt-inv-"));
 		tempHomeDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-prompt-inv-home-"));
 		originalHome = process.env.HOME;
+		originalAgentDir = getAgentDir();
 		process.env.HOME = tempHomeDir;
+		setAgentDir(path.join(tempHomeDir, ".omp", "agent"));
 	});
 
-	afterEach(cleanupTempHome(() => ({ tempDir, tempHomeDir, originalHome })));
+	afterEach(() => {
+		cleanupTempHome(() => ({ tempDir, tempHomeDir, originalHome }))();
+		setAgentDir(originalAgentDir);
+	});
 
 	async function render(opts: { nativeTools: boolean; inlineToolDescriptors: boolean }): Promise<string> {
 		const { systemPrompt } = await buildSystemPrompt({
@@ -657,7 +664,7 @@ describe("system prompt tool inventory", () => {
 		expect(text).not.toContain("hidden-workflow");
 	});
 
-	it("lists visible skills without adding mandatory workflow doctrine", async () => {
+	it("tells the agent to read matching skills before work", async () => {
 		const { systemPrompt } = await buildSystemPrompt({
 			cwd: tempDir,
 			contextFiles: [],
@@ -677,12 +684,11 @@ describe("system prompt tool inventory", () => {
 		});
 		const text = systemPrompt.join("\n\n");
 
-		expect(text).toContain("<available_skills>");
+		expect(text).toContain("<skills>");
 		expect(text).toContain("- frontend-design: Frontend UI workflow");
-		expect(text).not.toContain("MUST read");
 	});
 
-	it("omits the read-only scout delegation gate in normal context", async () => {
+	it("omits the read-only scout delegation gate when scout is unavailable", async () => {
 		const opts = { toolNames: ["read", "bash", "task"], tools: TOOLS };
 		const withScout = (
 			await buildSystemPrompt({
@@ -707,11 +713,11 @@ describe("system prompt tool inventory", () => {
 			})
 		).systemPrompt.join("\n\n");
 
-		expect(withScout).not.toContain("read-only scout");
+		expect(withScout).toContain("one read-only scout while working is allowed");
 		expect(withoutScout).not.toContain("read-only scout");
 	});
 
-	it("leaves browser verification policy to visible external instructions", async () => {
+	it("does not require browser verification when the browser tool is absent (issue #8139)", async () => {
 		const opts = {
 			cwd: tempDir,
 			contextFiles: [],
@@ -732,7 +738,8 @@ describe("system prompt tool inventory", () => {
 
 		expect(withoutBrowser).not.toContain("browser-drive with `browser`");
 		expect(withoutBrowser).not.toContain("browser-drive with browser");
-		expect(withoutBrowser).not.toContain("behavioral test or smoke test");
+		expect(withoutBrowser).toContain("TUI/CLI");
+		expect(withoutBrowser).toContain("behavioral test or smoke test");
 
 		tools.set("browser", {
 			label: "Browser",
@@ -749,11 +756,13 @@ describe("system prompt tool inventory", () => {
 			})
 		).systemPrompt.join("\n\n");
 
-		expect(withBrowser).not.toContain("browser-drive with `browser`");
-		expect(withBrowser).not.toContain("behavioral test or smoke test");
+		expect(withBrowser).toContain("browser-drive with `browser`");
+		// A browser-only session still needs the smoke-test fallback for
+		// native-desktop surfaces (no computer tool).
+		expect(withBrowser).toContain("behavioral test or smoke test");
 	});
 
-	it("omits todo workflow doctrine regardless of tool availability", async () => {
+	it("omits todo workflow guidance when the todo tool is absent", async () => {
 		const opts = {
 			cwd: tempDir,
 			contextFiles: [],
@@ -771,6 +780,6 @@ describe("system prompt tool inventory", () => {
 		const withTodo = (await buildSystemPrompt({ ...opts, toolNames: ["read", "bash", "todo"] })).systemPrompt.join(
 			"\n\n",
 		);
-		expect(withTodo).not.toContain("Todo calls NEVER alone");
+		expect(withTodo).toContain("Todo calls NEVER alone");
 	});
 });

@@ -34,8 +34,8 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { diff, ref } from "@oh-my-pi/pi-coding-agent/utils/git";
 
 const repository = path.resolve(import.meta.dir, "../../..");
-const scopeBase = "37eee71978951fccf66b21f7e3e2b74596ac9d74";
-const scopeBaseTree = "a20c0452f99155e7adeaecfad28e4afd0223c684";
+const scopeBase = "eea5628f13043286e17c4a2ea4fc28b15fda33ca";
+const scopeBaseTree = "257f25692c75703f3b1b81af47b3fb676b59f879";
 const scopeBaseUrl = "https://github.com/can1357/oh-my-pi.git";
 
 describe("AgentSession before_agent_start typed provider context", () => {
