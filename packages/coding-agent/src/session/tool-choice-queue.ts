@@ -53,6 +53,12 @@ export interface PushOptions {
 	onInvoked?: DirectiveCallbacks["onInvoked"];
 }
 
+/** Transactional ownership of one logical session's tool-choice queue state. */
+export interface ToolChoiceQueueSessionTransition {
+	commit(): void;
+	rollback(): void;
+}
+
 // ── Generators ──────────────────────────────────────────────────────────────
 
 export function* onceGen(choice: ToolChoice): Generator<ToolChoice, void, unknown> {
@@ -287,6 +293,35 @@ export class ToolChoiceQueue {
 		this.#queue = [];
 		this.#pendingInvokers = [];
 		this.#lastResolvedLabel = undefined;
+	}
+
+	/**
+	 * Install an empty logical-session state while retaining the current queue,
+	 * in-flight directive, preview invokers, and served-label cursor for rollback.
+	 * Commit selects the target but keeps the retained snapshot rollback-capable
+	 * until the enclosing owner transaction closes.
+	 */
+	beginSessionTransition(): ToolChoiceQueueSessionTransition {
+		const retainedQueue = this.#queue;
+		const retainedInFlight = this.#inFlight;
+		const retainedLastResolvedLabel = this.#lastResolvedLabel;
+		const retainedPendingInvokers = this.#pendingInvokers;
+		this.#queue = [];
+		this.#inFlight = undefined;
+		this.#lastResolvedLabel = undefined;
+		this.#pendingInvokers = [];
+		let restored = false;
+		return {
+			commit: () => {},
+			rollback: () => {
+				if (restored) return;
+				restored = true;
+				this.#queue = retainedQueue;
+				this.#inFlight = retainedInFlight;
+				this.#lastResolvedLabel = retainedLastResolvedLabel;
+				this.#pendingInvokers = retainedPendingInvokers;
+			},
+		};
 	}
 
 	// ── Observation ───────────────────────────────────────────────────────

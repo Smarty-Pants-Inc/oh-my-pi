@@ -235,7 +235,7 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 		name: "handoff",
 		icon: "handoff",
 		description: "Hand off session context to a new session",
-		acpDescription: "Summarize the session into a handoff document and compact in place",
+		acpDescription: "Summarize the session and hand its context to a new session",
 		inlineHint: "[focus instructions]",
 		allowArgs: true,
 		handle: async (command, runtime) => {
@@ -280,10 +280,9 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 					await runtime.output("Handoff cancelled.");
 					return;
 				}
-				// `savedPath` is deliberately not reported: `SessionHandoff` only writes
-				// the document to disk when `options.autoTriggered` is set, which the
-				// user-invoked path never passes.
-				await runtime.output("Context handed off and compacted in place.");
+				// `savedPath` is deliberately not reported: user-invoked handoff does
+				// not request the auto-maintenance document export path.
+				await runtime.output("Context handed off to a new session.");
 			};
 			if (runtime.runCommandInBackground) {
 				runtime.runCommandInBackground(runHandoff);

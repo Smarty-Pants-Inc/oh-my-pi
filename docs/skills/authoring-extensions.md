@@ -133,6 +133,23 @@ Multiple entry points are supported:
 
 Installed-plugin manifest entries may be `.ts`, `.js`, `.mjs`, or `.cjs`; a manifest entry naming a directory resolves `index.ts`, `index.js`, `index.mjs`, or `index.cjs`. Automatic scanning of native/configured extension directories remains limited to `.ts` and `.js`.
 
+## Replacing the base system prompt builder
+
+An extension may register the session's sole provider-facing base prompt builder:
+
+```ts
+pi.registerSystemPromptBuilder(async ({ options, templates, build }) => {
+  return build({
+    ...templates,
+    project: `${templates.project}\n<my-policy>{{cwd}}</my-policy>`,
+  });
+});
+```
+
+`templates` is the complete raw template set bundled with the running OMP build. `options` contains the dynamic session inputs, and `build()` runs OMP's normal data collection/rendering with a complete replacement template set. A builder may instead return its own `{ systemPrompt, xdevCatalogNames? }` result.
+
+The builder runs for the initial prompt and every later base-prompt rebuild. Exactly one loaded extension may register one; duplicate registration fails closed. Explicit SDK `systemPrompt` overrides still run after the extension builder.
+
 ## Registering commands
 
 ```ts
@@ -226,6 +243,7 @@ Full event catalog: see [extension authoring guide](../extensions.md).
 | Pure event interception (policy, redaction) | **Extension** or **Hook** (both work; extension is preferred) |
 | Legacy hook module already exists | **Hook** (`HookAPI` from `@oh-my-pi/pi-coding-agent/extensibility/hooks`) |
 | Registering a provider, shortcut, or CLI flag | **Extension only** |
+| Replacing the provider-facing base system prompt builder | **Extension only** (`registerSystemPromptBuilder`) |
 | Shipping as a marketplace plugin | **Extension** (use `package.json` manifest) |
 
 Extensions are a strict superset of hooks. New authoring should use `ExtensionAPI`.

@@ -16,6 +16,7 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { createPersistedSubagentReviverFactory } from "@oh-my-pi/pi-coding-agent/task/persisted-revive";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { isOmpInternalSession } from "../../src/context/internal-session";
 
 const tempDirs: TempDir[] = [];
 
@@ -105,7 +106,7 @@ async function createPersistedSession(
 	return sessionFile;
 }
 
-function createFactory(cwd: string, eventBus?: EventBus) {
+function createFactory(cwd: string, eventBus?: EventBus, protectedRuntime = false) {
 	const parentSession = {
 		sessionManager: {
 			getCwd: () => cwd,
@@ -122,6 +123,7 @@ function createFactory(cwd: string, eventBus?: EventBus) {
 		settings: Settings.isolated(),
 		enableLsp: true,
 		eventBus,
+		protectedRuntime,
 	});
 }
 
@@ -132,6 +134,37 @@ afterEach(async () => {
 });
 
 describe("persisted subagent revival", () => {
+	it("keeps persisted prompts transcript-only in a protected runtime", async () => {
+		const cwd = makeTempDir("@pi-protected-revive-");
+		const sessionFile = await createPersistedSession(cwd);
+		const peek = vi.spyOn(SessionManager, "peekSessionInit");
+
+		expect(await createFactory(cwd, undefined, true)(createRef(sessionFile))).toBeUndefined();
+		expect(peek).not.toHaveBeenCalled();
+	});
+
+	it("keeps a cold-revived JSONL prompt subject to protection that activates after factory creation", async () => {
+		const cwd = makeTempDir("@pi-revive-protection-change-");
+		const sessionFile = await createPersistedSession(cwd);
+		let protectedAtRevival = false;
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			if (protectedAtRevival && !isOmpInternalSession(options ?? {})) {
+				throw new Error(
+					"PROMPT_POLICY_REVIEW_REQUIRED: provider-facing system prompt differs from the approved stock prompt",
+				);
+			}
+			return { session: createRevivedSession([]).session } as CreateAgentSessionResult;
+		});
+
+		const ref = createRef(sessionFile);
+		const reviver = await createFactory(cwd)(ref);
+		if (!reviver) throw new Error("Expected a persisted reviver");
+		protectedAtRevival = true;
+		await expect(reviver(ref)).rejects.toThrow(
+			"PROMPT_POLICY_REVIEW_REQUIRED: provider-facing system prompt differs from the approved stock prompt",
+		);
+	});
+
 	it("initializes the extension runtime on cold revival so tool_call handlers are not fail-closed blocked", async () => {
 		const cwd = makeTempDir("@pi-revive-ext-init-");
 		const sessionFile = await createPersistedSession(cwd);

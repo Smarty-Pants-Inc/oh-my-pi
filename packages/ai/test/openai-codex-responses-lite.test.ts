@@ -428,6 +428,45 @@ describe("openai-codex Responses Lite input shaping", () => {
 });
 
 describe("openai-codex fresh execution input shaping", () => {
+	it("maps typed internal context to developer input and never user input", async () => {
+		const model = createCodexModel("gpt-5.1-codex");
+		const instruction: ContextInstruction = {
+			id: "agent.compaction.prompts.compaction-summary-context",
+			sourcePath: "packages/agent/src/compaction/prompts/compaction-summary-context.md",
+			role: "internal_context",
+			target: "main",
+			trigger: "compaction",
+			sha256: "a".repeat(64),
+			renderedText: "Compacted context only.",
+		};
+		const body = await buildTransformedCodexRequestBody(
+			model,
+			{
+				systemPrompt: ["You are a helpful assistant."],
+				instructions: [instruction],
+				messages: [{ role: "user", content: "Continue", timestamp: Date.now() }],
+			},
+			undefined,
+		);
+		const input = body.input as InputItem[];
+		expect(
+			input.some(
+				item =>
+					item.role === "developer" &&
+					Array.isArray(item.content) &&
+					item.content.some(part => "text" in part && part.text === instruction.renderedText),
+			),
+		).toBe(true);
+		expect(
+			input.some(
+				item =>
+					item.role === "user" &&
+					Array.isArray(item.content) &&
+					item.content.some(part => "text" in part && part.text === instruction.renderedText),
+			),
+		).toBe(false);
+	});
+
 	it("adds a user continuation when only instructions would be sent", async () => {
 		const model = createCodexModel("gpt-5.1-codex");
 		const body = await buildTransformedCodexRequestBody(

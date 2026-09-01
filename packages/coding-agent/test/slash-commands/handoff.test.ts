@@ -74,7 +74,7 @@ describe("/handoff dispatch (ACP)", () => {
 
 		handoffFinished.resolve({ document: "doc" });
 		await Promise.all(backgroundTasks);
-		expect(h.output).toHaveBeenCalledWith("Context handed off and compacted in place.");
+		expect(h.output).toHaveBeenCalledWith("Context handed off to a new session.");
 	});
 
 	it("reports success as a single line and never reports a saved path", async () => {
@@ -84,7 +84,7 @@ describe("/handoff dispatch (ACP)", () => {
 		const h = acpRuntime({ handoffResult: { document: "doc", savedPath: "/tmp/handoff.md" } });
 		await executeAcpBuiltinSlashCommand("/handoff", h.runtime);
 		expect(h.output).toHaveBeenCalledTimes(1);
-		expect(h.output).toHaveBeenCalledWith("Context handed off and compacted in place.");
+		expect(h.output).toHaveBeenCalledWith("Context handed off to a new session.");
 	});
 
 	it("reports cancellation when the handoff resolves undefined", async () => {
@@ -119,6 +119,6 @@ describe("/handoff dispatch (ACP)", () => {
 	it("is advertised with the focus hint and the ACP description", () => {
 		const advertised = ACP_BUILTIN_SLASH_COMMANDS.find(c => c.name === "handoff");
 		expect(advertised?.input?.hint).toBe("[focus instructions]");
-		expect(advertised?.description).toBe("Summarize the session into a handoff document and compact in place");
+		expect(advertised?.description).toBe("Summarize the session and hand its context to a new session");
 	});
 });

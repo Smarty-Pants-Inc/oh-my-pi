@@ -17,11 +17,11 @@ import { TempDir } from "@oh-my-pi/pi-utils";
  * idle drain: the message stranded in the queue (visible chip, never delivered)
  * until the next manual prompt.
  *
- * Contract: steering an idle session schedules an immediate `agent.continue()`,
- * so a queued steer is delivered without waiting for the next manual prompt. A
- * queued steer resumes from any tail (continue() injects it before the next
- * provider call), so there is no "non-resumable steer" case. While a turn is
- * still streaming the drain stands down and the steer simply stays queued.
+ * Contract: steering an idle session schedules an immediate exact-block continuation,
+ * so the queued steer is delivered without waiting for the next manual prompt. A
+ * queued steer resumes from any tail because the block is injected before the next
+ * provider call, so there is no "non-resumable steer" case. While a turn is still
+ * streaming the drain stands down and the steer simply stays queued.
  */
 
 function createAssistantMessage(): AssistantMessage {
@@ -98,9 +98,10 @@ describe("AgentSession steer idle drain", () => {
 		tempDir.removeSync();
 	});
 
-	it("delivers a steer queued on an idle resumable session via continue()", async () => {
+	it("delivers a steer queued on an idle resumable session via exact-block continuation", async () => {
 		await createSession([{ role: "user", content: "hello", timestamp: Date.now() }, createAssistantMessage()]);
-		const continueSpy = vi.spyOn(session.agent, "continue").mockImplementation(async () => {
+		const continueSpy = vi.spyOn(session.agent, "continueQueuedMessageBlock").mockImplementation(async () => {
+			session.agent.emitExternalEvent({ type: "agent_start" });
 			session.agent.clearAllQueues();
 		});
 
@@ -114,7 +115,8 @@ describe("AgentSession steer idle drain", () => {
 
 	it("delivers successive idle steers after each successful drain", async () => {
 		await createSession([{ role: "user", content: "hello", timestamp: Date.now() }, createAssistantMessage()]);
-		const continueSpy = vi.spyOn(session.agent, "continue").mockImplementation(async () => {
+		const continueSpy = vi.spyOn(session.agent, "continueQueuedMessageBlock").mockImplementation(async () => {
+			session.agent.emitExternalEvent({ type: "agent_start" });
 			session.agent.clearAllQueues();
 		});
 
@@ -135,7 +137,8 @@ describe("AgentSession steer idle drain", () => {
 			createAssistantMessage(),
 			createToolResultMessage(),
 		]);
-		const continueSpy = vi.spyOn(session.agent, "continue").mockImplementation(async () => {
+		const continueSpy = vi.spyOn(session.agent, "continueQueuedMessageBlock").mockImplementation(async () => {
+			session.agent.emitExternalEvent({ type: "agent_start" });
 			session.agent.clearAllQueues();
 		});
 

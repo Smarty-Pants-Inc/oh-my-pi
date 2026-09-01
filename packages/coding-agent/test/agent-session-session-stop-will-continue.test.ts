@@ -1,9 +1,4 @@
-/**
- * Producer contract: when a session_stop hook schedules a hidden continuation
- * turn, the extension agent_end for that intermediate settle must set
- * willContinue so Warp (and similar subscribers) do not emit a terminal stop
- * before the continuation runs.
- */
+/** A session_stop hook may observe the stop but cannot create an unscoped semantic turn. */
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
@@ -40,13 +35,13 @@ describe("AgentSession session_stop willContinue", () => {
 		tempDir.removeSync();
 	});
 
-	it("marks extension agent_end willContinue when session_stop schedules a hidden turn", async () => {
+	it("ignores session_stop continuation requests and ends without a hidden turn", async () => {
 		const model = getBundledModel("openai", "gpt-5");
 		if (!model) {
 			throw new Error("Expected bundled OpenAI test model to exist");
 		}
 
-		// First settle reaches session_stop; second is the terminal continuation turn.
+		// Only the first response may run; session_stop cannot create another semantic turn.
 		const mock = createMockModel({
 			responses: [
 				{ content: ["first settle"], stopReason: "stop" },
@@ -102,14 +97,10 @@ describe("AgentSession session_stop willContinue", () => {
 		await session.waitForIdle();
 
 		const agentEnds = extensionEmits.filter(event => event.type === "agent_end");
-		// One intermediate settle (continuation scheduled) + one terminal settle.
-		expect(sessionStopCalls).toBe(2);
-		expect(agentEnds).toHaveLength(2);
-		expect(mock.calls).toHaveLength(2);
-		// First settle scheduled the hidden session_stop turn.
-		expect(agentEnds[0]?.willContinue).toBe(true);
-		// Final settle is terminal.
-		expect(agentEnds[1]?.willContinue).toBeFalsy();
+		expect(sessionStopCalls).toBe(1);
+		expect(agentEnds).toHaveLength(1);
+		expect(mock.calls).toHaveLength(1);
+		expect(agentEnds[0]?.willContinue).toBeFalsy();
 		const last = session.agent.state.messages.at(-1);
 		expect(last?.role).toBe("assistant");
 		if (last?.role === "assistant") {

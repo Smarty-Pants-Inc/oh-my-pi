@@ -74,6 +74,7 @@ import {
 	normalizeBareDiscoveryBaseUrl,
 	normalizeLiteLLMDiscoveryBaseUrl,
 	normalizeLlamaCppBaseUrl,
+	normalizeQwenTemplateReasoning,
 } from "./model-discovery";
 import {
 	AUTHORITATIVE_RUNTIME_CATALOG_PROVIDERS,
@@ -923,12 +924,20 @@ export class ModelRegistry {
 		);
 	}
 
+	#builtInDiscoveryCompat(providerId: string): OpenAICompat | undefined {
+		if (providerId !== "vllm" && providerId !== "lm-studio") return undefined;
+		return mergeCompat(
+			this.#providerOverrides.get(providerId)?.compat,
+			this.#runtimeProviderOverrides.get(providerId)?.compat,
+		) as OpenAICompat | undefined;
+	}
+
 	#resolveStartupModelCacheProviderId(providerId: string): string {
 		const baseUrl =
 			this.#runtimeProviderOverrides.get(providerId)?.baseUrl ??
 			this.#providerOverrides.get(providerId)?.baseUrl ??
 			(this.#hasFullSnapshot ? this.getProviderBaseUrl(providerId) : undefined);
-		return resolveModelCacheProviderId(providerId, { baseUrl });
+		return resolveModelCacheProviderId(providerId, { baseUrl, compat: this.#builtInDiscoveryCompat(providerId) });
 	}
 
 	#loadCachedStandardProviderModels(providerIds: readonly string[]): {
@@ -1173,14 +1182,15 @@ export class ModelRegistry {
 	}
 
 	#normalizeDiscoverableModels(providerConfig: DiscoveryProviderConfig, models: Model<Api>[]): Model<Api>[] {
+		const withQwenTemplateReasoning = models.map(normalizeQwenTemplateReasoning);
 		const withDecoderMetadata =
 			providerConfig.discovery.type === "ollama" ||
 			providerConfig.discovery.type === "llama.cpp" ||
 			providerConfig.discovery.type === "lm-studio"
-				? models.map(model =>
+				? withQwenTemplateReasoning.map(model =>
 						buildModel({ ...model, imageInputDecoder: "stb", compat: model.compatConfig } as ModelSpec<Api>),
 					)
-				: models;
+				: withQwenTemplateReasoning;
 
 		const withRemoteCompaction = providerConfig.remoteCompaction
 			? withDecoderMetadata.map(model =>
@@ -1848,6 +1858,7 @@ export class ModelRegistry {
 					apiKey: isDiscoveryBearerApiKey(apiKey) ? apiKey : undefined,
 					baseUrl: this.#descriptorBaseUrl(descriptor.providerId),
 					fetch: this.#fetch,
+					...(managerCompat ? { compat: managerCompat } : {}),
 				};
 				const preparedConfig =
 					getProviderDefinition(descriptor.providerId)?.prepareModelDiscovery?.(discoveryConfig) ??

@@ -9,6 +9,7 @@ import type {
 	ResetCreditTarget,
 	UsageReport,
 } from "@oh-my-pi/pi-ai";
+import { enableProvider, initializeWithSettings, isProviderEnabled } from "@oh-my-pi/pi-coding-agent/capability";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -86,8 +87,8 @@ interface FakeAcpBuiltinSessionManager {
 	setSessionName(name: string, source: string): Promise<boolean>;
 }
 
-function createRuntime() {
-	const settings = Settings.isolated();
+function createRuntime(settingsOverrides: Parameters<typeof Settings.isolated>[0] = {}) {
+	const settings = Settings.isolated(settingsOverrides);
 	const output: string[] = [];
 	let fakeSessionManager: FakeAcpBuiltinSessionManager | undefined;
 	const session: FakeAcpBuiltinSession = {
@@ -856,6 +857,36 @@ describe("wave 3 commands", () => {
 		} finally {
 			setProjectDir(originalProjectDir);
 			await fs.rm(targetDir, { recursive: true, force: true });
+		}
+	});
+
+	it("/move: applies destination provider policy before plugin reload", async () => {
+		const sourceDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-move-source-policy-"));
+		const targetDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-move-target-policy-"));
+		const originalProjectDir = getProjectDir();
+		setProjectDir(sourceDir);
+		const { runtime, fakeSessionManager } = createRuntime({
+			disabledProviders: [{ path: sourceDir, providers: ["claude"] }],
+		});
+		fakeSessionManager._cwd = sourceDir;
+		initializeWithSettings(runtime.settings);
+		expect(isProviderEnabled("claude")).toBe(false);
+		let claudeEnabledDuringReload: boolean | undefined;
+		runtime.reloadPlugins = async () => {
+			claudeEnabledDuringReload = isProviderEnabled("claude");
+		};
+
+		try {
+			await executeAcpBuiltinSlashCommand(`/move ${targetDir}`, runtime);
+			expect(claudeEnabledDuringReload).toBe(true);
+			expect(isProviderEnabled("claude")).toBe(true);
+		} finally {
+			enableProvider("claude");
+			setProjectDir(originalProjectDir);
+			await Promise.all([
+				fs.rm(sourceDir, { recursive: true, force: true }),
+				fs.rm(targetDir, { recursive: true, force: true }),
+			]);
 		}
 	});
 

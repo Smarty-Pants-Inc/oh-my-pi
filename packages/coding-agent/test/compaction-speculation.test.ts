@@ -46,8 +46,8 @@ describe("async speculative compaction", () => {
 	let defaultModel: Model;
 	let sessionManager: SessionManager;
 	let maintenance: SessionMaintenance;
-	let agent: Agent;
 	let events: string[];
+	let emittedEvents: Array<{ type: string; errorMessage?: string }>;
 
 	function appendSummarizableConversation(): void {
 		const text = "conversation ".repeat(8_000);
@@ -58,11 +58,17 @@ describe("async speculative compaction", () => {
 	}
 
 	let maintenanceSettings: Settings;
+	type MaintenanceOptions = {
+		asyncEnabled?: boolean;
+		methodOrder?: CompactionMethod[];
+		generateHandoffDocument?: SessionMaintenanceHost["generateHandoffDocument"];
+		persistHandoffDocument?: SessionMaintenanceHost["persistHandoffDocument"];
+		extensionRunner?: SessionMaintenanceHost["extensionRunner"];
+		buildDisplaySessionContext?: SessionMaintenanceHost["buildDisplaySessionContext"];
+	};
 
-	function createMaintenance(
-		options: { asyncEnabled?: boolean; methodOrder?: CompactionMethod[] } = {},
-	): SessionMaintenance {
-		agent = new Agent({
+	function createMaintenance(options: MaintenanceOptions = {}): SessionMaintenance {
+		const agent = new Agent({
 			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
 		});
 		const settings = Settings.isolated({
@@ -79,7 +85,7 @@ describe("async speculative compaction", () => {
 			sessionManager,
 			settings,
 			modelRegistry,
-			extensionRunner: undefined,
+			extensionRunner: options.extensionRunner,
 			sideStreamFn: async () => {
 				throw new Error("The compact seam should be used instead of the side stream");
 			},
@@ -98,8 +104,9 @@ describe("async speculative compaction", () => {
 			planReferencePath: () => "",
 			nonMessageTokenSource: () => ({}),
 			memoryBackendSession: () => undefined,
-			emitSessionEvent: async (event: { type: string }) => {
+			emitSessionEvent: async (event: { type: string; errorMessage?: string }) => {
 				events.push(event.type);
+				emittedEvents.push(event);
 			},
 			emitNotice: () => {},
 			schedulePostPromptTask: () => {},
@@ -107,10 +114,11 @@ describe("async speculative compaction", () => {
 			scheduleCompactionContinuation: () => false,
 			persistTurnMessagesForMidRunCompaction: async () => false,
 			findLastAssistantMessage: () => undefined,
+			beginSemanticDeliveryMaintenance: async () => () => {},
 			disconnectFromAgent: () => {},
 			reconnectToAgent: () => {},
 			drainStrandedQueuedMessages: () => {},
-			buildDisplaySessionContext: () => sessionManager.buildSessionContext(),
+			buildDisplaySessionContext: options.buildDisplaySessionContext ?? (() => ({ messages: [] })),
 			convertToLlmForSideRequest: (messages: AgentMessage[]) => messages as never,
 			obfuscateTextForProvider: (text: string | undefined) => text,
 			obfuscatePreparationForProvider: <T>(preparation: T) => preparation,
@@ -125,7 +133,8 @@ describe("async speculative compaction", () => {
 			getContextUsage: () => undefined,
 			shake: async () => ({ modified: false, tokensRemoved: 0 }),
 			dropImages: async () => ({ removed: 0 }),
-			generateHandoffDocument: async () => undefined,
+			generateHandoffDocument: options.generateHandoffDocument ?? (async () => undefined),
+			persistHandoffDocument: options.persistHandoffDocument ?? (async () => {}),
 			removeAssistantMessageFromActiveContext: () => {},
 			dropPersistedAssistantTurn: async () => undefined,
 			runRecoveryCompactionWithRollback: async () => ({ deferredHandoff: false, continuationScheduled: false }),
@@ -160,6 +169,7 @@ describe("async speculative compaction", () => {
 		model = defaultModel;
 		sessionManager = SessionManager.inMemory();
 		events = [];
+		emittedEvents = [];
 		appendSummarizableConversation();
 		maintenance = createMaintenance();
 	});
@@ -208,65 +218,173 @@ describe("async speculative compaction", () => {
 		expect(events).toEqual(expect.arrayContaining(["auto_compaction_start", "auto_compaction_end"]));
 	});
 
-	it("replays a user turn appended while remote compaction is in flight", async () => {
-		const bundled = getBundledModel("openai", "gpt-5");
-		if (!bundled) throw new Error("Expected built-in OpenAI model");
-		model = { ...bundled, contextWindow: CONTEXT_WINDOW };
-		authStorage.setRuntimeApiKey("openai", "test-key");
-		maintenance = createMaintenance({ methodOrder: ["remote"] });
-		const started = Promise.withResolvers<void>();
-		const release = Promise.withResolvers<void>();
-		vi.spyOn(compactionModule, "compact").mockImplementation(async preparation => {
-			started.resolve();
-			await release.promise;
-			return {
-				summary: "remote speculative summary",
-				firstKeptEntryId: preparation.firstKeptEntryId,
-				tokensBefore: preparation.tokensBefore,
-				details: {},
-				preserveData: {
-					openaiRemoteCompaction: {
-						version: "v2",
-						provider: model.provider,
-						replacementHistory: [{ type: "compaction_summary", summary: "snapshot" }],
-						usedTokens: 1_000,
-					},
-				},
-			};
+	it("persists a speculative handoff only after its armed compaction commits", async () => {
+		const generated = { document: "speculative handoff" };
+		const generateHandoffDocument = vi.fn<SessionMaintenanceHost["generateHandoffDocument"]>(async () => generated);
+		const persistHandoffDocument = vi.fn<SessionMaintenanceHost["persistHandoffDocument"]>(async result => {
+			const entry = sessionManager.getEntries().findLast(item => item.type === "compaction");
+			expect(entry).toMatchObject({ type: "compaction", method: "handoff" });
+			expect(result).toBe(generated);
+		});
+		maintenance = createMaintenance({
+			methodOrder: ["handoff"],
+			generateHandoffDocument,
+			persistHandoffDocument,
 		});
 
 		maintenance.maybeStartSpeculativeCompaction(SPECULATION_BAND_START, CONTEXT_WINDOW);
-		await started.promise;
-		sessionManager.appendMessage(userMessage("post-snapshot request"));
-		sessionManager.appendMessage({
-			...assistantMessage("", model),
-			content: [{ type: "toolCall", id: "call-after-snapshot", name: "read", arguments: { path: "src/index.ts" } }],
-			stopReason: "toolUse",
-		});
-		sessionManager.appendMessage({
-			role: "toolResult",
-			toolCallId: "call-after-snapshot",
-			toolName: "read",
-			content: [{ type: "text", text: "file contents" }],
-			isError: false,
-			timestamp: Date.now(),
-		});
-		release.resolve();
 		await waitForState("armed");
+
+		expect(generateHandoffDocument).toHaveBeenCalledTimes(1);
+		expect(generateHandoffDocument.mock.calls[0]?.[2]).toBe(true);
+		expect(persistHandoffDocument).not.toHaveBeenCalled();
 
 		await maintenance.runAutoCompaction("threshold", false, false, false, { triggerContextTokens: THRESHOLD });
 
-		expect(agent.state.messages.map(message => message.role)).toEqual([
-			"compactionSummary",
-			"user",
-			"assistant",
-			"toolResult",
-		]);
-		expect(agent.state.messages[1]).toEqual(
-			expect.objectContaining({
-				role: "user",
-				content: [{ type: "text", text: "post-snapshot request" }],
+		expect(persistHandoffDocument).toHaveBeenCalledTimes(1);
+	});
+
+	it("persists a blocking handoff only after its compaction entry commits", async () => {
+		const generated = { document: "blocking handoff" };
+		const generateHandoffDocument = vi.fn<SessionMaintenanceHost["generateHandoffDocument"]>(async () => generated);
+		const persistHandoffDocument = vi.fn<SessionMaintenanceHost["persistHandoffDocument"]>(async result => {
+			const entry = sessionManager.getEntries().findLast(item => item.type === "compaction");
+			expect(entry).toMatchObject({ type: "compaction", method: "handoff" });
+			expect(result).toBe(generated);
+		});
+		maintenance = createMaintenance({
+			methodOrder: ["handoff"],
+			generateHandoffDocument,
+			persistHandoffDocument,
+		});
+
+		await maintenance.runAutoCompaction("threshold", false, false, false, { triggerContextTokens: THRESHOLD });
+
+		expect(generateHandoffDocument.mock.calls[0]?.[2]).toBe(true);
+		expect(persistHandoffDocument).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not persist a blocking handoff when its commit fails and falls back", async () => {
+		const generated = { document: "discarded handoff" };
+		const generateHandoffDocument = vi.fn<SessionMaintenanceHost["generateHandoffDocument"]>(async () => generated);
+		const persistHandoffDocument = vi.fn<SessionMaintenanceHost["persistHandoffDocument"]>(async () => {});
+		const compactSpy = vi.spyOn(compactionModule, "compact").mockImplementation(async preparation => ({
+			summary: "fallback soft summary",
+			firstKeptEntryId: preparation.firstKeptEntryId,
+			tokensBefore: preparation.tokensBefore,
+			details: {},
+		}));
+		vi.spyOn(sessionManager, "appendCompaction").mockImplementationOnce(() => {
+			throw new Error("handoff commit failed");
+		});
+		maintenance = createMaintenance({
+			methodOrder: ["handoff", "soft"],
+			generateHandoffDocument,
+			persistHandoffDocument,
+		});
+
+		await maintenance.runAutoCompaction("threshold", false, false, false, { triggerContextTokens: THRESHOLD });
+
+		expect(persistHandoffDocument).not.toHaveBeenCalled();
+		expect(compactSpy).toHaveBeenCalledTimes(1);
+		const entry = sessionManager.getEntries().findLast(item => item.type === "compaction");
+		expect(entry).toMatchObject({ type: "compaction", method: "soft", summary: "fallback soft summary" });
+	});
+
+	it("does not persist a blocking handoff aborted after generation starts", async () => {
+		const generated = { document: "aborted handoff" };
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<typeof generated>();
+		const generateHandoffDocument = vi.fn<SessionMaintenanceHost["generateHandoffDocument"]>(async () => {
+			started.resolve();
+			return await release.promise;
+		});
+		const persistHandoffDocument = vi.fn<SessionMaintenanceHost["persistHandoffDocument"]>(async () => {});
+		maintenance = createMaintenance({
+			methodOrder: ["handoff"],
+			generateHandoffDocument,
+			persistHandoffDocument,
+		});
+
+		const compaction = maintenance.runAutoCompaction("threshold", false, false, false, {
+			triggerContextTokens: THRESHOLD,
+		});
+		await started.promise;
+		maintenance.abortCompaction();
+		release.resolve(generated);
+		await compaction;
+
+		expect(persistHandoffDocument).not.toHaveBeenCalled();
+		expect(sessionManager.getEntries().filter(item => item.type === "compaction")).toHaveLength(0);
+	});
+
+	it("acknowledges and persists a handoff before post-append display failure without falling back", async () => {
+		const generated = { document: "committed handoff" };
+		const postAppendFailure = new Error("post-append display rebuild failed");
+		const buildDisplaySessionContext = vi.fn<SessionMaintenanceHost["buildDisplaySessionContext"]>(() => {
+			throw postAppendFailure;
+		});
+		const persistHandoffDocument = vi.fn<SessionMaintenanceHost["persistHandoffDocument"]>(async () => {});
+		const compactSpy = vi.spyOn(compactionModule, "compact").mockImplementation(async preparation => ({
+			summary: "unexpected fallback summary",
+			firstKeptEntryId: preparation.firstKeptEntryId,
+			tokensBefore: preparation.tokensBefore,
+			details: {},
+		}));
+		const appendCompactionSpy = vi.spyOn(sessionManager, "appendCompaction");
+		const extensionRunner = {
+			hasHandlers: vi.fn(() => false),
+			emit: vi.fn(async () => {}),
+		} as unknown as SessionMaintenanceHost["extensionRunner"];
+		maintenance = createMaintenance({
+			methodOrder: ["handoff", "soft"],
+			generateHandoffDocument: async () => generated,
+			persistHandoffDocument,
+			buildDisplaySessionContext,
+			extensionRunner,
+		});
+
+		await maintenance.runAutoCompaction("threshold", false, false, false, { triggerContextTokens: THRESHOLD });
+
+		expect(appendCompactionSpy).toHaveBeenCalledTimes(1);
+		expect(persistHandoffDocument).toHaveBeenCalledTimes(1);
+		expect(persistHandoffDocument).toHaveBeenCalledWith(generated);
+		expect(compactSpy).not.toHaveBeenCalled();
+		// A second start would mean onCommitted remained false and method fallback ran.
+		expect(emittedEvents.filter(event => event.type === "auto_compaction_start")).toHaveLength(1);
+		const endEvents = emittedEvents.filter(event => event.type === "auto_compaction_end");
+		expect(endEvents).toHaveLength(1);
+		expect(endEvents[0]?.errorMessage).toContain(postAppendFailure.message);
+		expect(endEvents[0]?.errorMessage).not.toContain("trying the next preferred compaction method");
+		expect(extensionRunner?.emit).not.toHaveBeenCalled();
+	});
+
+	it("persists a committed handoff even when session_compact publication throws", async () => {
+		const generated = { document: "committed handoff" };
+		const publicationFailure = new Error("session_compact publication failed");
+		const extensionRunner = {
+			hasHandlers: vi.fn(() => false),
+			emit: vi.fn(async (event: { type: string }) => {
+				if (event.type === "session_compact") throw publicationFailure;
 			}),
+		} as unknown as SessionMaintenanceHost["extensionRunner"];
+		const persistHandoffDocument = vi.fn<SessionMaintenanceHost["persistHandoffDocument"]>(async () => {});
+		maintenance = createMaintenance({
+			methodOrder: ["handoff"],
+			generateHandoffDocument: async () => generated,
+			persistHandoffDocument,
+			extensionRunner,
+		});
+
+		await maintenance.runAutoCompaction("threshold", false, false, false, { triggerContextTokens: THRESHOLD });
+
+		expect(persistHandoffDocument).toHaveBeenCalledWith(generated);
+		expect(sessionManager.getEntries().findLast(item => item.type === "compaction")).toMatchObject({
+			type: "compaction",
+			method: "handoff",
+		});
+		expect(emittedEvents.findLast(event => event.type === "auto_compaction_end")?.errorMessage).toContain(
+			publicationFailure.message,
 		);
 	});
 
@@ -337,6 +455,77 @@ describe("async speculative compaction", () => {
 		expect(entry?.type === "compaction" ? entry.summary : undefined).toBe("snapcompact archive");
 		// Exactly the speculation's summarizer call — the pass never re-summarized.
 		expect(compactSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it("discards an armed soft summary when the resolved method changes to handoff", async () => {
+		const compactSpy = vi.spyOn(compactionModule, "compact").mockImplementation(async preparation => ({
+			summary: "stale soft summary",
+			firstKeptEntryId: preparation.firstKeptEntryId,
+			tokensBefore: preparation.tokensBefore,
+			details: {},
+		}));
+		const generateHandoffDocument = vi.fn<SessionMaintenanceHost["generateHandoffDocument"]>(async () => ({
+			document: "fresh handoff",
+		}));
+		maintenance = createMaintenance({ methodOrder: ["soft"], generateHandoffDocument });
+		maintenance.maybeStartSpeculativeCompaction(SPECULATION_BAND_START, CONTEXT_WINDOW);
+		await waitForState("armed");
+		maintenanceSettings.override("compaction.methodOrder", ["handoff"]);
+
+		await maintenance.runAutoCompaction("threshold", false, false, false, { triggerContextTokens: THRESHOLD });
+
+		expect(compactSpy).toHaveBeenCalledTimes(1);
+		expect(generateHandoffDocument).toHaveBeenCalledTimes(1);
+		const entry = sessionManager.getEntries().findLast(item => item.type === "compaction");
+		expect(entry).toMatchObject({ type: "compaction", method: "handoff" });
+		expect(entry?.type === "compaction" ? entry.summary : undefined).toContain("fresh handoff");
+	});
+
+	it("recomputes an armed summary when its effective compaction settings change", async () => {
+		let invocation = 0;
+		const compactSpy = vi.spyOn(compactionModule, "compact").mockImplementation(async preparation => ({
+			summary: `summary ${++invocation}`,
+			firstKeptEntryId: preparation.firstKeptEntryId,
+			tokensBefore: preparation.tokensBefore,
+			details: {},
+		}));
+		maintenance.maybeStartSpeculativeCompaction(SPECULATION_BAND_START, CONTEXT_WINDOW);
+		await waitForState("armed");
+		maintenanceSettings.override("compaction.keepRecentTokens", 2);
+
+		await maintenance.runAutoCompaction("threshold", false, false, false, { triggerContextTokens: THRESHOLD });
+
+		expect(compactSpy).toHaveBeenCalledTimes(2);
+		const entry = sessionManager.getEntries().findLast(item => item.type === "compaction");
+		expect(entry?.type === "compaction" ? entry.summary : undefined).toBe("summary 2");
+	});
+
+	it("cancels in-flight speculation when automatic compaction is disabled", async () => {
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		vi.spyOn(compactionModule, "compact").mockImplementation(async preparation => {
+			started.resolve();
+			await release.promise;
+			return {
+				summary: "stale disabled summary",
+				firstKeptEntryId: preparation.firstKeptEntryId,
+				tokensBefore: preparation.tokensBefore,
+				details: {},
+			};
+		});
+		maintenance.maybeStartSpeculativeCompaction(SPECULATION_BAND_START, CONTEXT_WINDOW);
+		await started.promise;
+		expect(maintenance.speculationState).toBe("running");
+
+		maintenanceSettings.clearOverride("compaction.enabled");
+		maintenance.setAutoCompactionEnabled(false);
+		expect(maintenance.speculationState).toBe("idle");
+		release.resolve();
+		for (let microtask = 0; microtask < 10; microtask++) await Promise.resolve();
+		await maintenance.runAutoCompaction("threshold", false, false, false, { triggerContextTokens: THRESHOLD });
+
+		expect(maintenance.speculationState).toBe("idle");
+		expect(sessionManager.getEntries().filter(item => item.type === "compaction")).toHaveLength(0);
 	});
 
 	it("clears an armed speculation when manual compaction starts", async () => {

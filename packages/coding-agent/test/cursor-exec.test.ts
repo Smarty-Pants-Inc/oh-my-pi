@@ -829,6 +829,25 @@ describe("CursorExecHandlers error results", () => {
 		expect(end?.isError).toBe(true);
 	});
 
+	it("forwards shell stream cancellation to the bash tool", async () => {
+		let receivedSignal: AbortSignal | undefined;
+		const bashTool = rewrittenErrorTool("bash");
+		bashTool.execute = async (_id, _args, signal) => {
+			receivedSignal = signal;
+			return { content: [{ type: "text", text: "done" }], details: {} };
+		};
+		const handlers = new CursorExecHandlers({ cwd: ".", tools: new Map([["bash", bashTool]]) });
+		const controller = new AbortController();
+
+		await handlers.shellStream(
+			create(ShellArgsSchema, { toolCallId: "call-shell-signal", command: "ignored" }),
+			{ onStdout: () => {}, onStderr: () => {} },
+			controller.signal,
+		);
+
+		expect(receivedSignal).toBe(controller.signal);
+	});
+
 	it("omits unset optional kwargs from shellStream start events and execute args", async () => {
 		// shellStream bypasses executeTool(), so omitUndefinedArgs must be
 		// applied here directly — otherwise absent cwd/timeout become

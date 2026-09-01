@@ -1,61 +1,13 @@
 name: CI
 
 on:
+   # Mergify speculative branches are checked through their synthetic pull request.
+   # A second push run can be cancelled and make the queue treat smarty-ci as failed.
    push:
       branches: [main]
-      paths:
-         - "packages/**"
-         - "crates/**"
-         - "scripts/**"
-         - "bazel/**"
-         - "MODULE.bazel"
-         - "MODULE.bazel.lock"
-         - "BUILD.bazel"
-         - ".bazelrc"
-         - ".bazelignore"
-         - ".bazelversion"
-         - "Cargo.toml"
-         - "Cargo.lock"
-         - "deny.toml"
-         - "about.toml"
-         - "LICENSE"
-         - "THIRD-PARTY-NOTICES.txt"
-         - "rust-toolchain.toml"
-         - "rustfmt.toml"
-         # A root dependency change (lockfile/catalog/patches) affects every
-         # job; without these a lockfile-only push shipped untested — and a
-         # release retagged onto such a commit never triggered its run.
-         - "bun.lock"
-         - "bunfig.toml"
-         - "package.json"
-         - "patches/**"
-         - ".github/**"
    pull_request:
+      types: [opened, synchronize, reopened, ready_for_review]
       branches: [main]
-      paths:
-         - "packages/**"
-         - "crates/**"
-         - "scripts/**"
-         - "bazel/**"
-         - "MODULE.bazel"
-         - "MODULE.bazel.lock"
-         - "BUILD.bazel"
-         - ".bazelrc"
-         - ".bazelignore"
-         - ".bazelversion"
-         - "Cargo.toml"
-         - "Cargo.lock"
-         - "deny.toml"
-         - "about.toml"
-         - "LICENSE"
-         - "THIRD-PARTY-NOTICES.txt"
-         - "rust-toolchain.toml"
-         - "rustfmt.toml"
-         - "bun.lock"
-         - "bunfig.toml"
-         - "package.json"
-         - "patches/**"
-         - ".github/**"
    workflow_dispatch:
       inputs:
          skip_npm:
@@ -152,12 +104,6 @@ jobs:
          - name: Verify Rust license compliance (cargo-deny 0.20.2)
            run: |
               cargo install --locked --version 0.20.2 cargo-deny
-              # `--offline` needs every workspace crate already in the registry
-              # cache. PR runs use a fresh GitHub-hosted runner (see runs-on
-              # above), where the only prior cargo work is the cargo-deny
-              # install, so nothing populates the index for our own graph and
-              # resolution fails. Non-PR events land on omp-kata, whose Cargo
-              # cache is warm, which is why main stayed green. Fetch first.
               cargo fetch --locked
               cargo deny --locked --offline check licenses sources
          - name: Type check workspace
@@ -473,6 +419,38 @@ jobs:
               OMP_INSTALL_TEST_SKIP_NATIVE_BUILD: "1"
            run: bun run ci:test:install-methods
 
+   smarty_ci:
+      name: smarty-ci
+      if: ${{ always() }}
+      needs: [check, rust_validate, native_addons, test_workspace, test_coding_agent_singleton, test_ts_native, test_coding_agent_ui, test_coding_agent_runtime, test_coding_agent_native, test_smoke, install_methods]
+      runs-on: ubuntu-22.04
+      steps:
+         - name: Require successful validation
+           env:
+              EVENT_NAME: ${{ github.event_name }}
+              CHECK: ${{ needs.check.result }}
+              RUST_VALIDATE: ${{ needs.rust_validate.result }}
+              NATIVE_ADDONS: ${{ needs.native_addons.result }}
+              TEST_WORKSPACE: ${{ needs.test_workspace.result }}
+              TEST_CODING_AGENT_SINGLETON: ${{ needs.test_coding_agent_singleton.result }}
+              TEST_TS_NATIVE: ${{ needs.test_ts_native.result }}
+              TEST_CODING_AGENT_UI: ${{ needs.test_coding_agent_ui.result }}
+              TEST_CODING_AGENT_RUNTIME: ${{ needs.test_coding_agent_runtime.result }}
+              TEST_CODING_AGENT_NATIVE: ${{ needs.test_coding_agent_native.result }}
+              TEST_SMOKE: ${{ needs.test_smoke.result }}
+              INSTALL_METHODS: ${{ needs.install_methods.result }}
+           run: |
+              set -euo pipefail
+              for result in "$CHECK" "$NATIVE_ADDONS" "$TEST_WORKSPACE" \
+                 "$TEST_CODING_AGENT_SINGLETON" "$TEST_TS_NATIVE" \
+                 "$TEST_CODING_AGENT_UI" "$TEST_CODING_AGENT_RUNTIME" \
+                 "$TEST_CODING_AGENT_NATIVE" "$TEST_SMOKE" "$INSTALL_METHODS"; do
+                 test "$result" = success
+              done
+              if [ "$EVENT_NAME" != pull_request ]; then
+                 test "$RUST_VALIDATE" = success
+              fi
+
    # Aggregates every validation job so publish-side release jobs gate on one
    # result. Binary BUILDS deliberately do not wait for this gate — they run
    # in parallel with the test fan-out and only publishing is held back.
@@ -516,7 +494,7 @@ jobs:
          matrix:
             include:
                - {
-                    os: ubuntu-22.04,
+                    os: smarty-linux-16-core,
                     platform: linux,
                     arch: x64,
                     target_id: linux-x64,
@@ -524,7 +502,7 @@ jobs:
                     native_targets: linux-x64-baseline linux-x64-modern,
                  }
                - {
-                    os: ubuntu-22.04,
+                    os: smarty-linux-16-core,
                     platform: linux,
                     libc: musl,
                     arch: x64,
@@ -533,7 +511,7 @@ jobs:
                     native_targets: linux-musl-x64-baseline,
                  }
                - {
-                    os: ubuntu-24.04-arm,
+                    os: smarty-linux-arm-16-core,
                     platform: linux,
                     arch: arm64,
                     target_id: linux-arm64,
@@ -541,7 +519,7 @@ jobs:
                     native_targets: linux-arm64,
                  }
                - {
-                    os: ubuntu-24.04-arm,
+                    os: smarty-linux-arm-16-core,
                     platform: linux,
                     libc: musl,
                     arch: arm64,
@@ -550,7 +528,7 @@ jobs:
                     native_targets: linux-musl-arm64,
                  }
                - {
-                    os: ubuntu-22.04,
+                    os: smarty-linux-16-core,
                     platform: win32,
                     arch: x64,
                     target_id: win32-x64,
@@ -566,10 +544,12 @@ jobs:
            with:
               bun-version: "1.4"
          - name: Cache bun dependencies
-           uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+           uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
            with:
               path: ~/.bun/install/cache
               key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+              restore-keys: |
+                 bun-${{ runner.os }}-
          - run: bun install --frozen-lockfile
          - name: Install prebuilt native addon(s)
            uses: ./.github/actions/native-artifacts
@@ -621,13 +601,13 @@ jobs:
          matrix:
             include:
                - {
-                    os: macos-15-intel,
+                    os: smarty-macos-intel-12-core,
                     target_id: darwin-x64,
                     binary_path: packages/coding-agent/binaries/omp-darwin-x64,
                     native_targets: darwin-x64-baseline,
                  }
                - {
-                    os: macos-14,
+                    os: smarty-macos-arm-5-core,
                     target_id: darwin-arm64,
                     binary_path: packages/coding-agent/binaries/omp-darwin-arm64,
                     native_targets: darwin-arm64,
@@ -643,10 +623,12 @@ jobs:
            with:
               bun-version: "1.4"
          - name: Cache bun dependencies
-           uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+           uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
            with:
               path: ~/.bun/install/cache
               key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+              restore-keys: |
+                 bun-${{ runner.os }}-
          - run: bun install --frozen-lockfile
          # Darwin runners build their own architecture; cross-hosted artifacts
          # do not exist for macOS. The warm workflow keeps these scopes seeded

@@ -56,6 +56,10 @@ interface FinalizableBlock {
 	renderTranscriptBlockEmergencyRow?(width: number): string | undefined;
 }
 
+interface HistoryCommitAwareBlock {
+	markTranscriptHistoryCommitted?(): void;
+}
+
 /**
  * Block lifecycle:
  * - `active`: still mutating; renders live and counts against tool admission.

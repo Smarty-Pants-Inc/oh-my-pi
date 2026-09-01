@@ -144,6 +144,34 @@ function safetyCheckLines(checks: readonly ComputerSafetyCheck[]): string[] {
 	});
 }
 
+function abortError(signal: AbortSignal | undefined): Error {
+	if (signal?.reason instanceof Error) return signal.reason;
+	return new DOMException(typeof signal?.reason === "string" ? signal.reason : "Tool call aborted", "AbortError");
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+	if (signal?.aborted) throw abortError(signal);
+}
+
+async function awaitWithAbort<T>(work: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+	if (!signal) return await work;
+	if (signal.aborted) {
+		void work.then(
+			() => undefined,
+			() => undefined,
+		);
+		throw abortError(signal);
+	}
+	const { promise: interrupted, reject } = Promise.withResolvers<never>();
+	const onAbort = () => reject(abortError(signal));
+	signal.addEventListener("abort", onAbort, { once: true });
+	try {
+		return await Promise.race([work, interrupted]);
+	} finally {
+		signal.removeEventListener("abort", onAbort);
+	}
+}
+
 /**
  * Wraps a tool with extension callbacks for interception.
  * - Emits tool_call event before execution (can block)
@@ -188,6 +216,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		// the loop never saw — nested xd:// device dispatches and direct
 		// (non-loop) execution such as Cursor exec handlers.
 		const loopEmittedToolCall = this.runner.consumeToolCallEmitted(toolCallId, this.tool.name);
+		throwIfAborted(signal);
 		// Resolve approval settings up front. A `deny` on the original input short-circuits before the
 		// runner is touched — an already-denied tool never emits `tool_call` — while the full gate below
 		// re-resolves against the (possibly revised) input so a handler cannot rewrite into a denied or
@@ -241,6 +270,8 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			}
 		}
 
+		throwIfAborted(signal);
+
 		// 2. Full approval gate against the (possibly revised) input that will actually run — resolves
 		// policy and prompts on `effectiveParams`, so the user approves exactly what executes. A revised
 		// input that newly resolves to `deny` is caught here even though the original passed the
@@ -279,34 +310,54 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			const hasApprovalHandlers =
 				this.runner.hasHandlers("tool_approval_requested") || this.runner.hasHandlers("tool_approval_resolved");
 			const sessionId = context?.sessionManager?.getSessionId() ?? "";
-			if (hasApprovalHandlers) {
-				await this.runner.emit({
-					type: "tool_approval_requested",
-					sessionId,
-					toolName: this.tool.name,
-					toolCallId,
-					...(approvalCheck.reason ? { reason: approvalCheck.reason } : {}),
-					approvalMode,
-				});
-			}
-
 			const emitApprovalResolved = async (approved: boolean, reason?: string) => {
 				if (!hasApprovalHandlers) return;
-				await this.runner.emit({
-					type: "tool_approval_resolved",
-					sessionId,
-					toolName: this.tool.name,
-					toolCallId,
-					approved,
-					...(reason ? { reason } : {}),
-				});
+				await this.runner.emitApproval(
+					{
+						type: "tool_approval_resolved",
+						sessionId,
+						toolName: this.tool.name,
+						toolCallId,
+						approved,
+						...(reason ? { reason } : {}),
+					},
+					signal,
+				);
 			};
+			const cancelApproval = async (): Promise<never> => {
+				await emitApprovalResolved(false, "cancelled");
+				throw abortError(signal);
+			};
+			// Build the exact prompt before publishing a request. If a tool's formatter
+			// fails, no external observer may see an approval that can never be shown.
+			const basePrompt = formatApprovalPrompt(this.tool, resolvedArgs, approvalCheck.reason);
+			const safetyPrompt =
+				pendingSafetyChecks.length > 0
+					? `${basePrompt}\nProvider safety checks:\n${safetyCheckLines(pendingSafetyChecks).join("\n")}`
+					: basePrompt;
+
+			if (signal?.aborted) await cancelApproval();
+			if (hasApprovalHandlers) {
+				await this.runner.emitApproval(
+					{
+						type: "tool_approval_requested",
+						sessionId,
+						toolName: this.tool.name,
+						toolCallId,
+						...(approvalCheck.reason ? { reason: approvalCheck.reason } : {}),
+						approvalMode,
+					},
+					signal,
+				);
+			}
+			if (signal?.aborted) await cancelApproval();
 
 			// Provider safety checks fail closed without an interactive prompt. Unlike
 			// ordinary tier approval, no setting or yolo mode may bypass this gate.
 			if (!this.runner.hasUI()) {
 				const reason = "no interactive UI available";
 				await emitApprovalResolved(false, reason);
+				throwIfAborted(signal);
 				if (pendingSafetyChecks.length > 0) {
 					throw new Error(
 						`Tool "${this.tool.name}" has pending provider safety checks but no interactive UI is available.`,
@@ -322,20 +373,18 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			}
 
 			const uiContext = this.runner.getUIContext();
-			const basePrompt = formatApprovalPrompt(this.tool, resolvedArgs, approvalCheck.reason);
-			const safetyPrompt =
-				pendingSafetyChecks.length > 0
-					? `${basePrompt}\nProvider safety checks:\n${safetyCheckLines(pendingSafetyChecks).join("\n")}`
-					: basePrompt;
 			let choice: string | undefined;
 			try {
-				choice = await uiContext.select(safetyPrompt, ["Approve", "Deny"]);
+				choice = await awaitWithAbort(uiContext.select(safetyPrompt, ["Approve", "Deny"], { signal }), signal);
 			} catch (err) {
-				await emitApprovalResolved(false, err instanceof Error ? err.message : "approval aborted");
+				if (signal?.aborted) await cancelApproval();
+				await emitApprovalResolved(false, err instanceof Error ? err.message : "approval failed");
 				throw err;
 			}
+			if (signal?.aborted) await cancelApproval();
 			const approved = choice === "Approve";
 			await emitApprovalResolved(approved, approved ? undefined : "denied by user");
+			throwIfAborted(signal);
 			if (!approved) {
 				throw new Error(`Tool call denied by user: ${this.tool.name}`);
 			}
@@ -344,6 +393,8 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				context.providerSafetyApproved = true;
 			}
 		}
+
+		throwIfAborted(signal);
 
 		// Execute the actual tool
 		let result: AgentToolResult<TDetails, TParameters>;

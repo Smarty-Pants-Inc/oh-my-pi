@@ -7,6 +7,7 @@ import { clearCustomApis } from "@oh-my-pi/pi-ai/api-registry";
 import { createMockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
 import { __providerInFlightForTesting, streamSimple } from "@oh-my-pi/pi-ai/stream";
 import type { Context } from "@oh-my-pi/pi-ai/types";
+import { getDisabledProviders, initializeWithSettings, isProviderEnabled } from "@oh-my-pi/pi-coding-agent/capability";
 import {
 	onAppendOnlyModeChanged,
 	onCodeModeChanged,
@@ -20,6 +21,7 @@ import * as discovery from "@oh-my-pi/pi-coding-agent/discovery";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { AUTO_IMAGE_PROVIDER_ORDER } from "@oh-my-pi/pi-coding-agent/tools/image-providers";
 import { SEARCH_PROVIDER_ORDER } from "@oh-my-pi/pi-coding-agent/web/search/types";
+import { shouldEnableHyperlinks, TERMINAL } from "@oh-my-pi/pi-tui";
 import { getProjectAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import * as fileLock from "@oh-my-pi/pi-utils/file-lock";
 import { YAML } from "bun";
@@ -86,6 +88,49 @@ describe("Settings", () => {
 		await tempDir?.remove();
 	});
 
+	it("recomputes terminal hyperlinks from the default mode when reset discards a global override", async () => {
+		delete Bun.env.PI_NO_HYPERLINKS;
+		await Settings.init({
+			cwd: projectDir,
+			agentDir,
+			inMemory: true,
+			overrides: { "tui.hyperlinks": "always" },
+		});
+		expect(TERMINAL.hyperlinks).toBe(true);
+
+		resetSettingsForTest();
+		expect(TERMINAL.hyperlinks).toBe(
+			shouldEnableHyperlinks("auto", Bun.env, TERMINAL.id, process.stdout.isTTY === true),
+		);
+	});
+
+	it("restores hyperlink environment overrides before recomputing terminal capability", () => {
+		delete Bun.env.PI_NO_HYPERLINKS;
+		Bun.env.PI_FORCE_HYPERLINKS = "1";
+		const forceState = beginSettingsTest();
+
+		Bun.env.PI_NO_HYPERLINKS = "1";
+		delete Bun.env.PI_FORCE_HYPERLINKS;
+		resetSettingsForTest();
+		expect(TERMINAL.hyperlinks).toBe(false);
+
+		restoreSettingsTestState(forceState);
+		expect(process.env.PI_NO_HYPERLINKS).toBeUndefined();
+		expect(process.env.PI_FORCE_HYPERLINKS).toBe("1");
+		expect(TERMINAL.hyperlinks).toBe(true);
+
+		Bun.env.PI_NO_HYPERLINKS = "1";
+		const noHyperlinksState = beginSettingsTest();
+
+		delete Bun.env.PI_NO_HYPERLINKS;
+		resetSettingsForTest();
+		expect(TERMINAL.hyperlinks).toBe(true);
+
+		restoreSettingsTestState(noHyperlinksState);
+		expect(process.env.PI_NO_HYPERLINKS).toBe("1");
+		expect(process.env.PI_FORCE_HYPERLINKS).toBe("1");
+		expect(TERMINAL.hyperlinks).toBe(false);
+	});
 	describe("main config file selection", () => {
 		it("loads and updates an existing config.yaml without creating config.yml", async () => {
 			const yamlConfigPath = path.join(agentDir, "config.yaml");
@@ -146,6 +191,50 @@ describe("Settings", () => {
 			const content = await Bun.file(getConfigPath()).text();
 			expect(content).not.toMatch(/: +$/m);
 			expect(YAML.parse(content)).toEqual({ custom, theme: { dark: "titanium" } });
+		});
+	});
+
+	describe("provider isolation", () => {
+		it("excludes globally disabled providers from initial project settings discovery", async () => {
+			await writeSettings({ disabledProviders: ["claude"] });
+			fs.mkdirSync(path.join(projectDir, ".claude"), { recursive: true });
+			await Bun.write(path.join(projectDir, ".claude", "settings.json"), JSON.stringify({ setupVersion: 1 }));
+			await Bun.write(
+				path.join(getProjectAgentDir(projectDir), "settings.json"),
+				JSON.stringify({ setupVersion: 2 }),
+			);
+
+			for (const load of [
+				() => Settings.init({ cwd: projectDir, agentDir }),
+				() => Settings.loadIsolated({ cwd: projectDir, agentDir }),
+				() => Settings.loadReadOnly({ cwd: projectDir, agentDir }),
+			]) {
+				resetSettingsForTest();
+				expect((await load()).get("setupVersion")).toBe(2);
+			}
+		});
+
+		it("loads destination compatibility settings despite stale source provider state", async () => {
+			const targetDir = tempDir.join("provider-policy-target");
+			await writeSettings({
+				disabledProviders: [{ path: projectDir, providers: ["claude"] }],
+			});
+			fs.mkdirSync(path.join(targetDir, ".claude"), { recursive: true });
+			await Bun.write(path.join(targetDir, ".claude", "settings.json"), JSON.stringify({ setupVersion: 3 }));
+			const savedDisabledProviders = getDisabledProviders();
+
+			try {
+				const active = await Settings.loadIsolated({ cwd: projectDir, agentDir });
+				initializeWithSettings(active);
+				expect(isProviderEnabled("claude")).toBe(false);
+
+				await active.reloadForCwd(targetDir);
+				expect(active.get("setupVersion")).toBe(3);
+				initializeWithSettings(active);
+				expect(isProviderEnabled("claude")).toBe(true);
+			} finally {
+				initializeWithSettings(Settings.isolated({ disabledProviders: savedDisabledProviders }));
+			}
 		});
 	});
 
@@ -442,6 +531,54 @@ describe("Settings", () => {
 			expect(settings.get("setupVersion")).toBe(1);
 			expect(settings.getModelRole("global_role")).toBe("openai/global");
 			expect(settings.getModelRole("project_role")).toBe("openai/project");
+		});
+		it("resynchronizes terminal hyperlinks from a persisted reload", async () => {
+			delete Bun.env.PI_NO_HYPERLINKS;
+			await writeSettings({ tui: { hyperlinks: "off" } });
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(TERMINAL.hyperlinks).toBe(false);
+
+			await writeSettings({ tui: { hyperlinks: "always" } });
+			await settings.reloadFromDisk();
+
+			expect(settings.get("tui.hyperlinks")).toBe("always");
+			expect(TERMINAL.hyperlinks).toBe(true);
+		});
+		it("resynchronizes terminal hyperlinks when a save merges an external config change", async () => {
+			delete Bun.env.PI_NO_HYPERLINKS;
+			await writeSettings({ tui: { hyperlinks: "off" } });
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(TERMINAL.hyperlinks).toBe(false);
+
+			await writeSettings({ tui: { hyperlinks: "always" } });
+			settings.set("setupVersion", 1);
+			await settings.flush();
+
+			expect(settings.get("tui.hyperlinks")).toBe("always");
+			expect(TERMINAL.hyperlinks).toBe(true);
+		});
+
+		it("resynchronizes terminal hyperlinks when a merged config save fails", async () => {
+			delete Bun.env.PI_NO_HYPERLINKS;
+			await writeSettings({ tui: { hyperlinks: "off" } });
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(TERMINAL.hyperlinks).toBe(false);
+
+			await writeSettings({ tui: { hyperlinks: "always" } });
+			const configPath = await fs.promises.realpath(getConfigPath());
+			const rename = fs.promises.rename.bind(fs.promises);
+			vi.spyOn(fs.promises, "rename").mockImplementation(async (source, target) => {
+				if (String(source).endsWith(".tmp") && String(target) === configPath) {
+					throw new FsCodeError("EIO", "injected save failure");
+				}
+				await rename(source, target);
+			});
+
+			settings.set("setupVersion", 1);
+			await expect(settings.flush()).rejects.toThrow("injected save failure");
+
+			expect(settings.get("tui.hyperlinks")).toBe("always");
+			expect(TERMINAL.hyperlinks).toBe(true);
 		});
 		it("retries when a persisted setting changes while files are being read", async () => {
 			await writeSettings({ setupVersion: 1 });
@@ -1422,7 +1559,7 @@ describe("Settings", () => {
 			expect(settings.get("dev.autoqa")).toBe(true);
 			expect(settings.isConfigured("dev.autoqa")).toBe(false);
 			expect(settings.get("todo.remindersMax")).toBe(5);
-			expect(settings.get("todo.reminders")).toBe(true);
+			expect(settings.get("todo.reminders")).toBe(false);
 			expect(settings.isConfigured("todo.reminders")).toBe(false);
 		});
 
@@ -1434,7 +1571,7 @@ describe("Settings", () => {
 			expect(settings.get("dev.autoqaConsent")).toBe("denied");
 			expect(settings.isConfigured("dev.autoqa")).toBe(false);
 			expect(settings.get("todo.remindersMax")).toBe(2);
-			expect(settings.get("todo.reminders")).toBe(true);
+			expect(settings.get("todo.reminders")).toBe(false);
 		});
 
 		it("lets explicit new keys win over legacy nested consent/max values", async () => {
@@ -1448,7 +1585,7 @@ describe("Settings", () => {
 			expect(settings.get("dev.autoqaConsent")).toBe("granted");
 			expect(settings.isConfigured("dev.autoqa")).toBe(false);
 			expect(settings.get("todo.remindersMax")).toBe(9);
-			expect(settings.get("todo.reminders")).toBe(true);
+			expect(settings.get("todo.reminders")).toBe(false);
 		});
 
 		it("preserves recoverable parent booleans alongside legacy leaf keys", async () => {
@@ -1503,7 +1640,7 @@ describe("Settings", () => {
 			expect(reloaded.get("dev.autoqaConsent")).toBe("denied");
 			expect(reloaded.isConfigured("dev.autoqa")).toBe(false);
 			expect(reloaded.get("todo.remindersMax")).toBe(1);
-			expect(reloaded.get("todo.reminders")).toBe(true);
+			expect(reloaded.get("todo.reminders")).toBe(false);
 		});
 
 		it("drops dead BM25-discovery keys and leaves tools.xdev at its default", async () => {

@@ -52,7 +52,7 @@ function buildFileUri(filePath: string, opts?: { line?: number; col?: number }):
  *
  * Respects `tui.hyperlinks` setting:
  * - `"off"`: never
- * - `"auto"`: when `process.stdout.isTTY`, `NO_COLOR` is unset, and the detected terminal reports hyperlink support
+ * - `"auto"`: in Herdr when stdout is a TTY; otherwise when stdout is a TTY and `NO_COLOR` is unset
  * - `"always"`: unconditionally (useful for viewers that support OSC 8 without advertising it)
  * Before settings initialization, returns false so early render paths stay plain text.
  */
@@ -141,7 +141,7 @@ export function urlHyperlink(url: string, displayText: string): string {
  */
 export function urlHyperlinkAlways(url: string, displayText: string): string {
 	if (!isSettingsInitialized()) return displayText;
-	if (settings.get("tui.hyperlinks") === "off") return displayText;
+	if (settings.get("tui.hyperlinks") === "off" || hyperlinksUserOverride(Bun.env) === false) return displayText;
 	const normalized = url.match(/^www\./i) ? `https://${url}` : url;
 	try {
 		const parsed = new URL(normalized);

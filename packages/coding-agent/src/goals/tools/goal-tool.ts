@@ -11,13 +11,15 @@ import type { ToolSession } from "../../tools";
 import { formatErrorDetail, TRUNCATE_LENGTHS } from "../../tools/render-utils";
 import { ToolError } from "../../tools/tool-errors";
 import { framedBlock, renderStatusLine, truncateToWidth } from "../../tui";
-import { completionBudgetReport, remainingTokens } from "../runtime";
-import type { Goal, GoalStatus, GoalToolDetails } from "../state";
+import { completionBudgetReport, remainingTokens, sameRouteFailureLimitLabel } from "../runtime";
+import { type Goal, type GoalStatus, type GoalToolDetails, isCurrentGoalModeState } from "../state";
 
 const goalSchema = type({
-	op: type("'create' | 'get' | 'complete' | 'resume' | 'drop'").describe("goal operation"),
+	op: type("'create' | 'get' | 'complete' | 'block'").describe("goal operation"),
 	"objective?": type("string").describe("goal objective"),
-	"token_budget?": type("number.integer").describe("token budget"),
+	"token_budget?": type("number.integer | null").describe(
+		"must be omitted for agent-created goals; null is accepted only for strict tool schemas",
+	),
 });
 
 export type GoalToolInput = typeof goalSchema.infer;
@@ -48,17 +50,18 @@ function validateCreateParams(params: GoalToolInput): { objective: string; token
 	if (!objective) {
 		throw new ToolError("objective is required when op=create");
 	}
-	const tokenBudget = params.token_budget;
-	if (tokenBudget !== undefined && (!Number.isInteger(tokenBudget) || tokenBudget <= 0)) {
-		throw new ToolError("token_budget must be a positive integer when provided");
+	if (params.token_budget !== undefined && params.token_budget !== null) {
+		throw new ToolError("agent_goal_token_budget_not_allowed: agent-created goals must omit token_budget");
 	}
-	return { objective, tokenBudget };
+	return { objective };
 }
 
 export class GoalTool implements AgentTool<typeof goalSchema, GoalToolDetails> {
 	readonly name = "goal";
 	readonly label = "Goal";
-	readonly description = prompt.render(goalDescription);
+	readonly description = prompt.render(goalDescription, {
+		sameRouteFailureLimit: sameRouteFailureLimitLabel(),
+	});
 	readonly parameters = goalSchema;
 	readonly strict = true;
 	readonly intent = "omit" as const;
@@ -86,16 +89,13 @@ export class GoalTool implements AgentTool<typeof goalSchema, GoalToolDetails> {
 			response = buildGoalToolResponse(created.goal);
 		} else if (params.op === "get") {
 			const state = this.#session.getGoalModeState?.();
-			response = buildGoalToolResponse(state?.goal ?? null);
-		} else if (params.op === "resume") {
-			const resumed = await runtime.resumeGoal();
-			response = buildGoalToolResponse(resumed.goal);
-		} else if (params.op === "drop") {
-			const dropped = await runtime.dropGoal();
-			response = buildGoalToolResponse(dropped ?? null);
-		} else {
+			response = buildGoalToolResponse(isCurrentGoalModeState(state) ? state.goal : null);
+		} else if (params.op === "complete") {
 			const completed = await runtime.completeGoalFromTool();
 			response = buildGoalToolResponse(completed, { includeCompletionReport: true });
+		} else {
+			const blocked = await runtime.blockGoalFromTool();
+			response = buildGoalToolResponse(blocked);
 		}
 		let text: string;
 		if (response.goal) {
@@ -132,10 +132,8 @@ function describeOp(op: string | undefined): string {
 			return "complete";
 		case "get":
 			return "check";
-		case "resume":
-			return "resume";
-		case "drop":
-			return "drop";
+		case "block":
+			return "block";
 		default:
 			return op ?? "?";
 	}
@@ -145,10 +143,13 @@ function goalBadgeColor(status: GoalStatus): ThemeColor {
 	switch (status) {
 		case "complete":
 			return "success";
-		case "budget-limited":
+		case "blocked":
+		case "budget_limited":
+		case "usage_limited":
 			return "warning";
 		case "paused":
 		case "dropped":
+		case "superseded":
 			return "muted";
 		default:
 			return "accent";

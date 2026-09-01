@@ -11,28 +11,7 @@ import { TodoTool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
-/**
- * Regression coverage for issue #3651 and its redesign: the mid-run todo
- * reconciliation nudge keeps the live HUD honest during long runs, but is a
- * gentle MODEL-ONLY hint — deliberately separate from the user-visible
- * stop-time reminder ladder. The contract this defends:
- *
- *   1. Only SUCCESSFUL MUTATING tool results (bash/eval/edit/write/ast_edit)
- *      tick the counter. Read-only exploration (grep/read/glob/lsp) and
- *      errored results never do.
- *   2. At {@link MID_RUN_TODO_NUDGE_MUTATION_THRESHOLD} mutations without a
- *      `todo` call, the aside provider injects a hidden custom message
- *      (`display: false`) — NO `todo_reminder` event, nothing renders.
- *   3. A `todo` tool result resets the counter.
- *   4. At most {@link MID_RUN_TODO_NUDGE_MAX_PER_CYCLE} nudges fire per
- *      prompt cycle.
- *   5. The counter update lands synchronously with the message_end emit.
- *
- * Drives the aside provider directly: the production agent loop polls it
- * between tool-use turns (mid-work boundary in `agent-loop.ts`), so calling it
- * after a batch of synthesized `message_end` events mirrors that injection
- * point without spinning a real model.
- */
+/** Todo state is passive context: tool progress never creates an aside nudge or reminder event. */
 const sharedAuthStorage = createInMemoryAuthStorage();
 sharedAuthStorage.setRuntimeApiKey("anthropic", "test-key");
 const sharedModelRegistry = new ModelRegistry(sharedAuthStorage);
@@ -100,7 +79,7 @@ describe("AgentSession mid-run todo reconciliation nudge", () => {
 	}
 
 	/** Production-shaped tool round trip: assistant toolCall turn + toolResult. */
-	function emitToolResult(toolName: string, opts?: { isError?: boolean }): void {
+	function emitToolResult(toolName: string, opts?: { isError?: boolean; details?: Record<string, unknown> }): void {
 		const toolCallId = `call_${toolName}_${Date.now()}_${Math.random()}`;
 		session.agent.emitExternalEvent({ type: "message_end", message: toolUseAssistant(toolName) });
 		const content: TextContent[] = [{ type: "text", text: "ok" }];
@@ -112,9 +91,13 @@ describe("AgentSession mid-run todo reconciliation nudge", () => {
 				toolName,
 				content,
 				isError: opts?.isError ?? false,
+				details: opts?.details,
 				timestamp: Date.now(),
 			},
 		});
+	}
+	async function settle(): Promise<void> {
+		await Bun.sleep(0);
 	}
 
 	async function drainNudges(): Promise<CustomMessage[]> {
@@ -218,29 +201,11 @@ describe("AgentSession mid-run todo reconciliation nudge", () => {
 		expect(reminderEvents).toEqual([]);
 	});
 
-	it("injects a hidden custom nudge at the threshold — no event, no render", async () => {
+	it("stays silent at the former mutation threshold", async () => {
 		for (let i = 0; i < THRESHOLD; i++) emitToolResult("edit");
 
-		const nudges = await drainNudges();
-		expect(nudges.length).toBe(1);
-		const nudge = nudges[0];
-		// Hidden from the TUI/transcript, visible to the model only.
-		expect(nudge?.display).toBe(false);
-		const text = typeof nudge?.content === "string" ? nudge.content : "";
-		expect(text).toContain("<system-reminder>");
-		expect(text).toContain("3 todo items");
-		// Gentle hint, not the stop-time escalation ladder: no per-task
-		// enumeration, no attempt counter.
-		expect(text).not.toContain("Sweep call sites");
-		expect(text).not.toMatch(/reminder \d\/\d/i);
-
-		// SEPARATE concept from the stop-time reminder: no todo_reminder event,
-		// so nothing renders a TodoReminderComponent or reaches extensions.
-		expect(reminderEvents).toEqual([]);
-
-		// Counter reset: another full runway is required before the next nudge,
-		// so an immediate poll right after firing must NOT re-inject.
 		expect(await drainNudges()).toEqual([]);
+		expect(reminderEvents).toEqual([]);
 	});
 
 	it("errored mutating results do not tick the counter", async () => {
@@ -249,26 +214,44 @@ describe("AgentSession mid-run todo reconciliation nudge", () => {
 		expect(await drainNudges()).toEqual([]);
 	});
 
-	it("does not nudge when a `todo` call has reset the counter mid-window", async () => {
+	it("does not nudge when a mutating `todo` call resets the counter mid-window", async () => {
 		for (let i = 0; i < THRESHOLD - 1; i++) emitToolResult("write");
-		emitToolResult("todo");
+		emitToolResult("todo", { details: { op: "done" } });
 		for (let i = 0; i < THRESHOLD - 1; i++) emitToolResult("write");
 
 		expect(await drainNudges()).toEqual([]);
 		expect(reminderEvents).toEqual([]);
 	});
 
-	it("caps nudges per prompt cycle", async () => {
+	it("stays silent across a read-only `todo view`", async () => {
+		for (let i = 0; i < THRESHOLD - 1; i++) emitToolResult("edit");
+		emitToolResult("todo", { details: { op: "view" } });
+		emitToolResult("edit");
+
+		await settle();
+		expect(await drainNudges()).toHaveLength(0);
+	});
+
+	it("stays silent across a failed todo mutation", async () => {
+		for (let i = 0; i < THRESHOLD - 1; i++) emitToolResult("edit");
+		emitToolResult("todo", { isError: true, details: { op: "done" } });
+		emitToolResult("edit");
+
+		await settle();
+		expect(await drainNudges()).toHaveLength(0);
+	});
+
+	it("never nudges across repeated former threshold windows", async () => {
 		let fired = 0;
 		for (let cycle = 0; cycle < MAX_PER_CYCLE + 2; cycle++) {
 			for (let i = 0; i < THRESHOLD; i++) emitToolResult("edit");
 			fired += (await drainNudges()).length;
 		}
-		expect(fired).toBe(MAX_PER_CYCLE);
+		expect(fired).toBe(0);
 		expect(reminderEvents).toEqual([]);
 	});
 
-	it("counter update lands synchronously with the message_end emit (no microtask drain required)", () => {
+	it("same-task aside polling stays silent after mutations", () => {
 		// Regression for the review on PR #3652: pre-fix the counter update sat
 		// after `await messageEndPersistence.persist(...)`, so the live counter
 		// only caught up once microtasks drained. A poll between the emit burst
@@ -284,7 +267,7 @@ describe("AgentSession mid-run todo reconciliation nudge", () => {
 			.map(entry => (typeof entry === "function" ? entry() : entry))
 			.filter((m): m is NonNullable<typeof m> => Boolean(m))
 			.filter(m => m.role === "custom" && (m as CustomMessage).customType === NUDGE_TYPE);
-		expect(nudges.length).toBe(1);
+		expect(nudges.length).toBe(0);
 	});
 
 	it("stays silent when `todo` is not in the active-tool list, even if `todo.enabled` is still on", async () => {
@@ -300,20 +283,18 @@ describe("AgentSession mid-run todo reconciliation nudge", () => {
 		expect(reminderEvents).toEqual([]);
 	});
 
-	it("does not spend the pre-stop mutation count immediately after a stop-time reminder", async () => {
+	it("never emits a stop-time reminder after mutations", async () => {
 		vi.spyOn(session.agent, "continue").mockResolvedValue();
 		for (let i = 0; i < THRESHOLD - 1; i++) emitToolResult("edit");
 
 		emitTextOnlyStop();
 		await session.waitForIdle();
-		// The stop-time path is the user-visible ladder: it emits the event.
-		expect(reminderEvents.length).toBe(1);
-		expect(reminderEvents[0]?.attempt).toBe(1);
+		expect(reminderEvents.length).toBe(0);
 
 		// The stop-time reminder reset the mutation counter, so one more landed
 		// mutation (crossing the stale pre-reminder threshold) must stay silent.
 		emitToolResult("edit");
 		expect(await drainNudges()).toEqual([]);
-		expect(reminderEvents.length).toBe(1);
+		expect(reminderEvents.length).toBe(0);
 	});
 });

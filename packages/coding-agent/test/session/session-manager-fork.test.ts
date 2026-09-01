@@ -8,6 +8,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { loadEntriesFromFile } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { FileSessionStorage, type WriteTextAtomicOptions } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { getTerminalId } from "@oh-my-pi/pi-tui";
 import { getAgentDir, getTerminalSessionsDir, removeWithRetries, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 
@@ -47,7 +48,26 @@ async function createSessionWithArtifacts(root: string): Promise<{
 	return { cwd, sessionDir, sourceFile, sourceArtifactsDir };
 }
 
-describe("SessionManager.forkFrom", () => {
+class FailingForkStorage extends FileSessionStorage {
+	readonly failure = new Error("target journal publish failed");
+	failNextAtomicWrite = false;
+	failedPath: string | undefined;
+	targetArtifactWasPublished = false;
+
+	override async writeTextAtomic(filePath: string, content: string, options?: WriteTextAtomicOptions): Promise<void> {
+		if (this.failNextAtomicWrite) {
+			this.failNextAtomicWrite = false;
+			this.failedPath = filePath;
+			this.targetArtifactWasPublished = await Bun.file(
+				path.join(filePath.slice(0, -".jsonl".length), "0.bash.log"),
+			).exists();
+			throw this.failure;
+		}
+		await super.writeTextAtomic(filePath, content, options);
+	}
+}
+
+describe("SessionManager forks", () => {
 	it("suppresses terminal breadcrumbs while preserving source history under a new parented session", async () => {
 		using tempDir = TempDir.createSync("@omp-session-fork-");
 		const previousAgentDir = getAgentDir();
@@ -76,6 +96,10 @@ describe("SessionManager.forkFrom", () => {
 			};
 			const sourceText = `${JSON.stringify(sourceHeader)}\n${JSON.stringify(sourceMessage)}\n`;
 			await Bun.write(sourceFile, sourceText);
+			const sourceArtifactsDir = sourceFile.slice(0, -".jsonl".length);
+			await fs.mkdir(path.join(sourceArtifactsDir, "local", "nested"), { recursive: true });
+			await fs.writeFile(path.join(sourceArtifactsDir, "0.bash.log"), "tool output");
+			await fs.writeFile(path.join(sourceArtifactsDir, "local", "nested", "state.json"), "durable state");
 
 			const terminalId = getTerminalId();
 			expect(terminalId).toBeString();
@@ -85,7 +109,6 @@ describe("SessionManager.forkFrom", () => {
 			const forked = await SessionManager.forkFrom(sourceFile, cwd, sessionDir, undefined, {
 				suppressBreadcrumb: true,
 			});
-			await Bun.sleep(10);
 			const cloneFile = forked.getSessionFile();
 			expect(cloneFile).toBeString();
 			if (!cloneFile) throw new Error("expected forked session file");
@@ -101,6 +124,11 @@ describe("SessionManager.forkFrom", () => {
 			expect(cloneHeader?.parentSession).toBe(sourceHeader.id);
 			expect(cloneHeader?.cwd).toBe(cwd);
 			if (cloneMessage?.message.role !== "user") throw new Error("expected forked user message");
+			const cloneArtifactsDir = cloneFile.slice(0, -".jsonl".length);
+			expect(await fs.readFile(path.join(cloneArtifactsDir, "0.bash.log"), "utf8")).toBe("tool output");
+			expect(await fs.readFile(path.join(cloneArtifactsDir, "local", "nested", "state.json"), "utf8")).toBe(
+				"durable state",
+			);
 			expect(cloneMessage.message.content).toBe("hello");
 		} finally {
 			if (previousTermSessionId === undefined) {
@@ -170,5 +198,66 @@ describe("SessionManager.forkFrom", () => {
 
 		expect(await Bun.file(path.join(forkArtifactsDir, "unrelated.txt")).exists()).toBe(false);
 		expect(await Bun.file(unrelatedFile).text()).toBe("must not be copied");
+	});
+
+	it("clones artifacts for a direct in-place fork", async () => {
+		using tempDir = TempDir.createSync("@omp-session-direct-fork-");
+		const previousAgentDir = getAgentDir();
+		setAgentDir(path.join(tempDir.path(), "agent"));
+		try {
+			const cwd = path.join(tempDir.path(), "project");
+			const sessionDir = path.join(tempDir.path(), "sessions");
+			await fs.mkdir(cwd, { recursive: true });
+			const manager = SessionManager.create(cwd, sessionDir);
+			const artifactId = await manager.saveArtifact("direct fork artifact", "bash");
+			await manager.ensureOnDisk();
+			const sourceFile = manager.getSessionFile();
+			if (!sourceFile || artifactId === undefined) throw new Error("expected persisted source session");
+
+			const result = await manager.fork();
+			if (!result) throw new Error("expected persisted fork");
+			const currentSessionFile = manager.getSessionFile();
+			if (!currentSessionFile) throw new Error("expected active fork session file");
+			expect(result.oldSessionFile).toBe(sourceFile);
+			expect(result.newSessionFile).toBe(currentSessionFile);
+			expect(
+				await fs.readFile(path.join(result.oldSessionFile.slice(0, -6), `${artifactId}.bash.log`), "utf8"),
+			).toBe("direct fork artifact");
+			expect(
+				await fs.readFile(path.join(result.newSessionFile.slice(0, -6), `${artifactId}.bash.log`), "utf8"),
+			).toBe("direct fork artifact");
+		} finally {
+			setAgentDir(previousAgentDir);
+		}
+	});
+
+	it("removes a published artifact clone when the target journal never materializes", async () => {
+		using tempDir = TempDir.createSync("@omp-session-fork-rollback-");
+		const previousAgentDir = getAgentDir();
+		setAgentDir(path.join(tempDir.path(), "agent"));
+		try {
+			const cwd = path.join(tempDir.path(), "project");
+			const sessionDir = path.join(tempDir.path(), "sessions");
+			await fs.mkdir(cwd, { recursive: true });
+			const storage = new FailingForkStorage();
+			const manager = SessionManager.create(cwd, sessionDir, storage);
+			await manager.saveArtifact("rollback artifact", "bash");
+			await manager.ensureOnDisk();
+			const sourceFile = manager.getSessionFile();
+			if (!sourceFile) throw new Error("expected persisted source session");
+			storage.failNextAtomicWrite = true;
+
+			await expect(manager.fork()).rejects.toBe(storage.failure);
+
+			const failedPath = storage.failedPath;
+			if (!failedPath) throw new Error("expected attempted target journal path");
+			expect(storage.targetArtifactWasPublished).toBe(true);
+			expect(manager.getSessionFile()).toBe(sourceFile);
+			await expect(fs.stat(failedPath)).rejects.toMatchObject({ code: "ENOENT" });
+			await expect(fs.stat(failedPath.slice(0, -".jsonl".length))).rejects.toMatchObject({ code: "ENOENT" });
+			expect(await fs.readFile(path.join(sourceFile.slice(0, -6), "0.bash.log"), "utf8")).toBe("rollback artifact");
+		} finally {
+			setAgentDir(previousAgentDir);
+		}
 	});
 });

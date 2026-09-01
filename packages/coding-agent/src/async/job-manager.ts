@@ -1,3 +1,4 @@
+import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
 
 const DELIVERY_RETRY_BASE_MS = 500;
@@ -41,6 +42,8 @@ export interface AsyncJob {
 	abortController: AbortController;
 	promise: Promise<void>;
 	resultText?: string;
+	/** Exact terminal content retained for structured completion delivery. */
+	resultContent?: (TextContent | ImageContent)[];
 	errorText?: string;
 	/** Latest tool-render details reported by the running job. */
 	latestDetails?: Record<string, unknown>;
@@ -51,6 +54,8 @@ export interface AsyncJob {
 	 * supply an id (e.g. legacy tests, SDK consumers without an agent context).
 	 */
 	ownerId?: string;
+	/** Direct model turn that created the job; only this still-open turn may wake again. */
+	originTurnId?: string;
 	/**
 	 * Registry id of the subagent this job runs (task/tan/vibe jobs). Lets
 	 * job-view code link a job row to its AgentRegistry ref even when the job
@@ -65,8 +70,12 @@ export interface AsyncJob {
 	queued?: boolean;
 }
 
-/** Delivery callback for a settled job's result text. */
-export type AsyncJobDeliverySink = (jobId: string, text: string, job?: AsyncJob) => void | Promise<void>;
+/**
+ * Delivery callback for a settled job's result text. The concrete job object is
+ * the delivery's ownership token; consumers must carry it through deferred
+ * replay instead of resolving ownership from the reusable string id.
+ */
+export type AsyncJobDeliverySink = (jobId: string, text: string, job: AsyncJob) => void | Promise<void>;
 
 export interface AsyncJobManagerOptions {
 	/**
@@ -83,6 +92,7 @@ export interface AsyncJobManagerOptions {
 }
 
 interface AsyncJobDelivery {
+	job: AsyncJob;
 	jobId: string;
 	text: string;
 	attempt: number;
@@ -109,6 +119,7 @@ export interface AsyncJobRegisterOptions {
 	id?: string;
 	/** Registry id of the agent that owns this job; used to scope cancelAll. */
 	ownerId?: string;
+	originTurnId?: string;
 	/** Registry id of the subagent this job runs; see {@link AsyncJob.agentId}. */
 	agentId?: string;
 	onProgress?: (text: string, details?: Record<string, unknown>) => void | Promise<void>;
@@ -119,10 +130,13 @@ export interface AsyncJobRegisterOptions {
 /**
  * Filter applied to job query/cancel APIs. With `ownerId`, results are
  * restricted to jobs registered by that agent (registry id from
- * `AgentRegistry`, e.g. "Main", "AuthLoader").
+ * `AgentRegistry`, e.g. "Main", "AuthLoader"). `jobs` and `excludeJobs` are
+ * internal identity projections used while lifecycle ownership is reversible.
  */
 export interface AsyncJobFilter {
 	ownerId?: string;
+	jobs?: ReadonlySet<AsyncJob>;
+	excludeJobs?: ReadonlySet<AsyncJob>;
 }
 
 export class AsyncJobManager {
@@ -144,6 +158,7 @@ export class AsyncJobManager {
 	}
 
 	readonly #jobs = new Map<string, AsyncJob>();
+	readonly #discardedJobs = new Set<AsyncJob>();
 	readonly #deliveries: AsyncJobDelivery[] = [];
 	readonly #inFlightDeliveries: AsyncJobDelivery[] = [];
 	readonly #suppressedDeliveries = new Set<string>();
@@ -159,12 +174,16 @@ export class AsyncJobManager {
 	#deliveryQueueChanged = Promise.withResolvers<void>();
 	#disposed = false;
 
+	#matchesFilter(job: AsyncJob, filter?: AsyncJobFilter): boolean {
+		if (filter?.ownerId && job.ownerId !== filter.ownerId) return false;
+		if (filter?.jobs && !filter.jobs.has(job)) return false;
+		return !filter?.excludeJobs?.has(job);
+	}
+
 	#filterJobs(jobs: Iterable<AsyncJob>, filter?: AsyncJobFilter): AsyncJob[] {
-		const ownerId = filter?.ownerId;
-		if (!ownerId) return Array.from(jobs);
 		const out: AsyncJob[] = [];
 		for (const job of jobs) {
-			if (job.ownerId === ownerId) out.push(job);
+			if (!this.#discardedJobs.has(job) && this.#matchesFilter(job, filter)) out.push(job);
 		}
 		return out;
 	}
@@ -193,6 +212,8 @@ export class AsyncJobManager {
 			jobId: string;
 			signal: AbortSignal;
 			reportProgress: (text: string, details?: Record<string, unknown>) => Promise<void>;
+			/** Retain exact terminal blocks alongside the job's text summary. */
+			setResultContent: (content: (TextContent | ImageContent)[]) => void;
 			/** Clear the queued flag once the job actually starts executing. */
 			markRunning: () => void;
 		}) => Promise<string>,
@@ -228,6 +249,7 @@ export class AsyncJobManager {
 			abortController,
 			promise: Promise.resolve(),
 			ownerId: options?.ownerId,
+			originTurnId: options?.originTurnId,
 			agentId: options?.agentId,
 			queued: options?.queued === true,
 		};
@@ -244,40 +266,45 @@ export class AsyncJobManager {
 				});
 			}
 		};
+		// The run callback may throw before its first await, so publish this object
+		// before its failure path performs the concrete-identity delivery check.
+		this.#jobs.set(id, job);
 		job.promise = (async () => {
 			try {
 				const text = await run({
 					jobId: id,
 					signal: abortController.signal,
 					reportProgress,
+					setResultContent: content => {
+						job.resultContent = content;
+					},
 					markRunning: () => {
 						job.queued = false;
 					},
 				});
 				if (job.status === "cancelled") {
 					job.resultText = text;
-					this.#scheduleEviction(id);
+					this.#scheduleEviction(job);
 					return;
 				}
 				job.status = "completed";
 				job.resultText = text;
-				this.#enqueueDelivery(id, text);
-				this.#scheduleEviction(id);
+				this.#enqueueDelivery(job, text);
+				this.#scheduleEviction(job);
 			} catch (error) {
 				if (job.status === "cancelled") {
 					job.errorText = error instanceof Error ? error.message : String(error);
-					this.#scheduleEviction(id);
+					this.#scheduleEviction(job);
 					return;
 				}
 				const errorText = error instanceof Error ? error.message : String(error);
 				job.status = "failed";
 				job.errorText = errorText;
-				this.#enqueueDelivery(id, errorText);
-				this.#scheduleEviction(id);
+				this.#enqueueDelivery(job, errorText);
+				this.#scheduleEviction(job);
 			}
 		})();
 
-		this.#jobs.set(id, job);
 		return id;
 	}
 
@@ -288,21 +315,59 @@ export class AsyncJobManager {
 	 */
 	cancel(id: string, filter?: AsyncJobFilter): boolean {
 		const job = this.#jobs.get(id);
-		if (!job) return false;
-		if (filter?.ownerId && job.ownerId !== filter.ownerId) return false;
+		if (!job || !this.#matchesFilter(job, filter)) return false;
 		if (job.status !== "running") return false;
 		job.status = "cancelled";
 		job.abortController.abort();
-		this.#scheduleEviction(id);
+		this.#scheduleEviction(job);
 		return true;
 	}
 
 	getJob(id: string): AsyncJob | undefined {
-		return this.#jobs.get(id);
+		const job = this.#jobs.get(id);
+		return job && !this.#discardedJobs.has(job) ? job : undefined;
 	}
 
 	getRunningJobs(filter?: AsyncJobFilter): AsyncJob[] {
 		return this.#filterJobs(this.#jobs.values(), filter).filter(job => job.status === "running");
+	}
+
+	countRunningJobs(filter?: AsyncJobFilter): number {
+		let count = 0;
+		for (const job of this.#jobs.values()) {
+			if (!this.#discardedJobs.has(job) && job.status === "running" && this.#matchesFilter(job, filter)) count++;
+		}
+		return count;
+	}
+
+	countRecentFailures(limit = 5, filter?: AsyncJobFilter): number {
+		limit = Math.max(0, Math.floor(limit));
+		if (limit === 0) return 0;
+		const recent: AsyncJob[] = [];
+		for (const job of this.#jobs.values()) {
+			if (this.#discardedJobs.has(job) || job.status === "running" || !this.#matchesFilter(job, filter)) continue;
+			let index = 0;
+			while (index < recent.length && (recent[index]?.startTime ?? 0) >= job.startTime) index++;
+			if (index >= limit) continue;
+			recent.splice(index, 0, job);
+			if (recent.length > limit) recent.pop();
+		}
+		let failures = 0;
+		for (const job of recent) {
+			if (job.status === "failed") failures++;
+		}
+		return failures;
+	}
+
+	countPendingDeliveries(filter?: AsyncJobFilter): number {
+		let count = 0;
+		for (const delivery of this.#deliveries) {
+			if (this.#matchesFilter(delivery.job, filter) && !this.isDeliverySuppressed(delivery.jobId)) count++;
+		}
+		for (const delivery of this.#inFlightDeliveries) {
+			if (this.#matchesFilter(delivery.job, filter) && !this.isDeliverySuppressed(delivery.jobId)) count++;
+		}
+		return count;
 	}
 
 	getRecentJobs(limit = 10, filter?: AsyncJobFilter): AsyncJob[] {
@@ -339,19 +404,28 @@ export class AsyncJobManager {
 	watchJobs(jobIds: string[]): number {
 		const uniqueJobIds = Array.from(new Set(jobIds.map(id => id.trim()).filter(id => id.length > 0)));
 		for (const jobId of uniqueJobIds) {
-			this.#watchedJobs.add(jobId);
+			this.#watchedJobs.set(jobId, (this.#watchedJobs.get(jobId) ?? 0) + 1);
 		}
 		this.#notifyDeliveryQueueChanged();
 		return uniqueJobIds.length;
 	}
 
-	unwatchJobs(jobIds: string[]): number {
+	unwatchJobs(jobIds: string[], options?: { resumeDeliveries?: boolean }): number {
 		const uniqueJobIds = Array.from(new Set(jobIds.map(id => id.trim()).filter(id => id.length > 0)));
 		let removed = 0;
 		for (const jobId of uniqueJobIds) {
-			if (this.#watchedJobs.delete(jobId)) {
-				removed += 1;
+			const watchers = this.#watchedJobs.get(jobId);
+			if (!watchers) continue;
+			removed += 1;
+			if (watchers > 1) {
+				this.#watchedJobs.set(jobId, watchers - 1);
+				continue;
 			}
+			const job = this.#jobs.get(jobId);
+			this.#watchedJobs.delete(jobId);
+			if (options?.resumeDeliveries) this.#resumeSettledDelivery(jobId);
+			// A same-turn manual waiter may acknowledge immediately after unwatch.
+			if (job && job.status !== "running") queueMicrotask(() => this.#scheduleEviction(job));
 		}
 		return removed;
 	}
@@ -400,6 +474,16 @@ export class AsyncJobManager {
 		return before - this.#deliveries.length;
 	}
 
+	#resumeSettledDelivery(jobId: string): void {
+		const job = this.#jobs.get(jobId);
+		if (!job || (job.status !== "completed" && job.status !== "failed")) return;
+		const queued =
+			this.#deliveries.some(delivery => delivery.jobId === jobId) ||
+			this.#inFlightDeliveries.some(delivery => delivery.jobId === jobId);
+		if (queued) return;
+		this.#enqueueDelivery(job, job.status === "completed" ? (job.resultText ?? "") : (job.errorText ?? ""));
+	}
+
 	/**
 	 * Mark settled job results as recovered by a foreground snapshot.
 	 *
@@ -431,13 +515,7 @@ export class AsyncJobManager {
 			const jobId = rawId.trim();
 			if (!jobId) continue;
 			if (!this.#suppressedDeliveries.delete(jobId)) continue;
-			const job = this.#jobs.get(jobId);
-			if (!job || (job.status !== "completed" && job.status !== "failed")) continue;
-			const queued =
-				this.#deliveries.some(delivery => delivery.jobId === jobId) ||
-				this.#inFlightDeliveries.some(delivery => delivery.jobId === jobId);
-			if (queued) continue;
-			this.#enqueueDelivery(jobId, job.status === "completed" ? (job.resultText ?? "") : (job.errorText ?? ""));
+			this.#resumeSettledDelivery(jobId);
 		}
 	}
 
@@ -459,7 +537,7 @@ export class AsyncJobManager {
 		for (const job of this.getRunningJobs(filter)) {
 			job.status = "cancelled";
 			job.abortController.abort(reason);
-			this.#scheduleEviction(job.id);
+			this.#scheduleEviction(job);
 		}
 	}
 
@@ -478,7 +556,54 @@ export class AsyncJobManager {
 		for (const job of this.#filterJobs(this.#jobs.values(), filter)) {
 			if (job.status !== "completed" && job.status !== "failed") continue;
 			this.acknowledgeDeliveries([job.id]);
-			if (this.#evictJob(job.id)) evicted += 1;
+			if (this.#evictJob(job)) evicted += 1;
+		}
+		return evicted;
+	}
+
+	/**
+	 * Cancel and suppress a captured set of jobs without touching newer jobs that
+	 * reused the same owner (or even the same id). Settled captured jobs are
+	 * evicted immediately; running/cancelled jobs stay privately tracked until
+	 * their underlying promise settles, but disappear from every public query.
+	 */
+	discardJobs(jobs: Iterable<AsyncJob>, filter?: AsyncJobFilter): number {
+		const captured: AsyncJob[] = [];
+		for (const job of jobs) {
+			const current = this.#jobs.get(job.id);
+			if (current !== job) continue;
+			if (filter?.ownerId && current.ownerId !== filter.ownerId) continue;
+			captured.push(current);
+		}
+		if (captured.length === 0) return 0;
+
+		const ids = new Set(captured.map(job => job.id));
+		for (const id of ids) this.#suppressedDeliveries.add(id);
+		this.#deliveries.splice(
+			0,
+			this.#deliveries.length,
+			...this.#deliveries.filter(delivery => !ids.has(delivery.jobId)),
+		);
+		this.#inFlightDeliveries.splice(
+			0,
+			this.#inFlightDeliveries.length,
+			...this.#inFlightDeliveries.filter(delivery => !ids.has(delivery.jobId)),
+		);
+
+		let evicted = 0;
+		for (const job of captured) {
+			if (job.status === "running") {
+				job.status = "cancelled";
+				job.abortController.abort();
+				this.#discardedJobs.add(job);
+				this.#scheduleEviction(job);
+				continue;
+			}
+			if (job.status === "cancelled") {
+				this.#discardedJobs.add(job);
+				continue;
+			}
+			if (this.#evictJob(job)) evicted += 1;
 		}
 		return evicted;
 	}
@@ -502,6 +627,15 @@ export class AsyncJobManager {
 		return () => {
 			if (this.#deliverySinks.get(ownerId) === sink) this.#deliverySinks.delete(ownerId);
 		};
+	}
+
+	/**
+	 * Re-enter the normal retry loop after a transition-owned sink replay fails.
+	 * The concrete job identity is the ownership token: a stale delivery must
+	 * never bind to a newer job that reused the same string id.
+	 */
+	requeueDelivery(job: AsyncJob, text: string): boolean {
+		return this.#enqueueDelivery(job, text);
 	}
 
 	/**
@@ -584,7 +718,7 @@ export class AsyncJobManager {
 		const deadline = hasDeadline ? Date.now() + Math.max(timeoutMs, 0) : Number.POSITIVE_INFINITY;
 
 		while (this.hasPendingDeliveries(filter)) {
-			if (filter?.ownerId) {
+			if (filter?.ownerId || filter?.jobs || filter?.excludeJobs) {
 				const delivered = await this.#deliverNextFiltered(filter, deadline);
 				if (delivered) continue;
 				return false;
@@ -631,6 +765,7 @@ export class AsyncJobManager {
 		const drained = await this.drainDeliveries({ timeoutMs: Math.max(deadline - Date.now(), 0) });
 		this.#clearEvictionTimers();
 		this.#jobs.clear();
+		this.#discardedJobs.clear();
 		this.#deliveries.length = 0;
 		this.#notifyDeliveryQueueChanged();
 		this.#inFlightDeliveries.length = 0;
@@ -684,21 +819,19 @@ export class AsyncJobManager {
 		return this.#jobs.delete(jobId);
 	}
 
-	#scheduleEviction(jobId: string): void {
-		if (this.#disposed) return;
+	#scheduleEviction(job: AsyncJob): void {
+		if (this.#disposed || this.#jobs.get(job.id) !== job) return;
+		if (this.#watchedJobs.has(job.id)) return;
 		if (this.#retentionMs <= 0) {
-			this.#evictJob(jobId);
+			this.#evictJob(job);
 			return;
 		}
-		const existing = this.#evictionTimers.get(jobId);
-		if (existing) {
-			clearTimeout(existing);
-		}
+		clearTimeout(this.#evictionTimers.get(job));
 		const timer = setTimeout(() => {
-			this.#evictJob(jobId);
+			this.#evictJob(job);
 		}, this.#retentionMs);
 		timer.unref();
-		this.#evictionTimers.set(jobId, timer);
+		this.#evictionTimers.set(job, timer);
 	}
 
 	#clearEvictionTimers(): void {
@@ -709,18 +842,14 @@ export class AsyncJobManager {
 	}
 
 	#filterDeliveries(filter?: AsyncJobFilter): AsyncJobDelivery[] {
-		const ownerId = filter?.ownerId;
-		if (!ownerId) return this.#deliveries.filter(delivery => !this.isDeliverySuppressed(delivery.jobId));
 		return this.#deliveries.filter(
-			delivery => delivery.ownerId === ownerId && !this.isDeliverySuppressed(delivery.jobId),
+			delivery => this.#matchesFilter(delivery.job, filter) && !this.isDeliverySuppressed(delivery.jobId),
 		);
 	}
 
 	#filterInFlightDeliveries(filter?: AsyncJobFilter): AsyncJobDelivery[] {
-		const ownerId = filter?.ownerId;
-		if (!ownerId) return this.#inFlightDeliveries.filter(delivery => !this.isDeliverySuppressed(delivery.jobId));
 		return this.#inFlightDeliveries.filter(
-			delivery => delivery.ownerId === ownerId && !this.isDeliverySuppressed(delivery.jobId),
+			delivery => this.#matchesFilter(delivery.job, filter) && !this.isDeliverySuppressed(delivery.jobId),
 		);
 	}
 
@@ -728,7 +857,7 @@ export class AsyncJobManager {
 		while (true) {
 			let selected: AsyncJobDelivery | undefined;
 			for (const delivery of this.#deliveries) {
-				if (delivery.ownerId !== filter.ownerId) continue;
+				if (!this.#matchesFilter(delivery.job, filter)) continue;
 				if (this.isDeliverySuppressed(delivery.jobId)) continue;
 				if (!selected || delivery.nextAttemptAt < selected.nextAttemptAt) {
 					selected = delivery;
@@ -762,19 +891,28 @@ export class AsyncJobManager {
 		return this.#suppressedDeliveries.has(jobId) || this.#watchedJobs.has(jobId);
 	}
 
-	#enqueueDelivery(jobId: string, text: string): void {
+	#enqueueDelivery(job: AsyncJob, text: string): boolean {
+		if (this.#jobs.get(job.id) !== job || this.#discardedJobs.has(job)) {
+			logger.warn("Async job delivery dead-lettered: stale job identity", {
+				jobId: job.id,
+				ownerId: job.ownerId,
+			});
+			return false;
+		}
 		// Skip delivery if already acknowledged
-		if (this.isDeliverySuppressed(jobId)) {
-			return;
+		if (this.isDeliverySuppressed(job.id)) {
+			return false;
 		}
 		this.#queueDelivery({
-			jobId,
+			job,
+			jobId: job.id,
 			text,
 			attempt: 0,
 			nextAttemptAt: Date.now(),
-			ownerId: this.#jobs.get(jobId)?.ownerId,
+			ownerId: job.ownerId,
 		});
 		this.#ensureDeliveryLoop();
+		return true;
 	}
 
 	#ensureDeliveryLoop(): void {
@@ -857,6 +995,11 @@ export class AsyncJobManager {
 				delivery.nextAttemptAt = Date.now() + this.#getRetryDelay(delivery.attempt);
 				if (!this.isDeliverySuppressed(delivery.jobId) && this.#jobs.has(delivery.jobId)) {
 					this.#queueDelivery(delivery);
+				} else if (!current) {
+					logger.warn("Async job delivery dead-lettered after failure: stale job identity", {
+						jobId: delivery.jobId,
+						ownerId: delivery.ownerId,
+					});
 				}
 				logger.warn("Async job completion delivery failed", {
 					jobId: delivery.jobId,

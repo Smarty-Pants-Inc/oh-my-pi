@@ -1,4 +1,7 @@
+import { createHash } from "node:crypto";
 import type {
+	ContextInstruction,
+	ContextTarget,
 	ImageContent,
 	Message,
 	MessageAttribution,
@@ -15,6 +18,8 @@ import handoffSummaryContextPrompt from "./prompts/handoff-summary-context.md" w
 const COMPACTION_SUMMARY_TEMPLATE = compactionSummaryContextPrompt;
 const HANDOFF_SUMMARY_TEMPLATE = handoffSummaryContextPrompt;
 const BRANCH_SUMMARY_TEMPLATE = branchSummaryContextPrompt;
+const BRANCH_SUMMARY_SOURCE = "packages/agent/src/compaction/prompts/branch-summary-context.md";
+const COMPACTION_SUMMARY_SOURCE = "packages/agent/src/compaction/prompts/compaction-summary-context.md";
 
 export interface CustomMessage<T = unknown> {
 	role: "custom";
@@ -113,6 +118,62 @@ export function renderCompactionSummaryContext(summary: string): string {
  */
 export function renderHandoffSummaryContext(summary: string): string {
 	return prompt.render(HANDOFF_SUMMARY_TEMPLATE, { summary });
+}
+
+function compactionSummaryInstructionText(message: CompactionSummaryMessage): string {
+	if (message.blocks === undefined) {
+		return message.method === "handoff"
+			? renderHandoffSummaryContext(message.summary)
+			: renderCompactionSummaryContext(message.summary);
+	}
+	return [
+		message.summary,
+		...message.blocks.filter((block): block is TextContent => block.type === "text").map(block => block.text),
+	]
+		.filter(text => text.length > 0)
+		.join("\n\n");
+}
+
+/**
+ * Project persisted compaction summaries onto the semantic instruction seam.
+ * Their model-authored text is context, never a synthetic user turn.
+ */
+export function collectCompactionContextInstructions(
+	messages: readonly AgentMessage[],
+	target: ContextTarget,
+): ContextInstruction[] {
+	const instructions: ContextInstruction[] = [];
+	for (const message of messages) {
+		let id: string;
+		let sourcePath: string;
+		let renderedText: string;
+		let order: number;
+		if (message.role === "branchSummary") {
+			id = "agent.compaction.prompts.branch-summary-context";
+			sourcePath = BRANCH_SUMMARY_SOURCE;
+			renderedText = renderBranchSummaryContext(message.summary);
+			order = 110;
+		} else if (message.role === "compactionSummary") {
+			id = "agent.compaction.prompts.compaction-summary-context";
+			sourcePath = COMPACTION_SUMMARY_SOURCE;
+			renderedText = compactionSummaryInstructionText(message);
+			order = 150;
+		} else {
+			continue;
+		}
+		if (renderedText.trim().length === 0) continue;
+		instructions.push({
+			id,
+			sourcePath,
+			role: "internal_context",
+			target,
+			trigger: "compaction",
+			sha256: createHash("sha256").update(renderedText).digest("hex"),
+			renderedText,
+			order,
+		});
+	}
+	return instructions;
 }
 
 export function createBranchSummaryMessage(summary: string, fromId: string, timestamp: string): BranchSummaryMessage {
@@ -217,37 +278,23 @@ export function convertMessageToLlm(message: AgentMessage): Message | undefined 
 				};
 			}
 			case "branchSummary":
+				return undefined;
+			case "compactionSummary": {
+				const images = (message.blocks ?? message.images ?? []).filter(
+					(block): block is ImageContent => block.type === "image",
+				);
+				if (images.length === 0 && message.providerPayload === undefined) return undefined;
+				// Native replacement history and snapcompact image frames are data
+				// carriers. The authoritative summary text is emitted separately as
+				// typed internal_context by collectCompactionContextInstructions().
 				return {
-					role: "user",
-					content: [
-						{
-							type: "text" as const,
-							text: renderBranchSummaryContext(message.summary),
-						},
-					],
-					attribution: "agent",
-					timestamp: message.timestamp,
-				};
-			case "compactionSummary":
-				return {
-					role: "user",
-					content:
-						message.blocks !== undefined
-							? [{ type: "text" as const, text: message.summary }, ...message.blocks]
-							: [
-									{
-										type: "text" as const,
-										text:
-											message.method === "handoff"
-												? renderHandoffSummaryContext(message.summary)
-												: renderCompactionSummaryContext(message.summary),
-									},
-									...(message.images ?? []),
-								],
+					role: "developer",
+					content: images,
 					attribution: "agent",
 					providerPayload: message.providerPayload,
 					timestamp: message.timestamp,
 				};
+			}
 		}
 	}
 

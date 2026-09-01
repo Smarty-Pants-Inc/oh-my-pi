@@ -76,3 +76,16 @@ describe("WelcomeComponent", () => {
 		expect(plain).toContain("Recent sessions");
 	});
 });
+
+describe("WelcomeComponent branding", () => {
+	it("renders the Smarty-Pants SP mark and lowercase title", () => {
+		const output = Bun.stripANSI(new WelcomeComponent("1.0.0", "model", "provider").render(80).join("\n"));
+
+		expect(output).toContain("sp v1.0.0");
+		expect(output).toContain("  ╔█████╗  ███████╗ ");
+		expect(output).toContain("╚██████╗   ██║");
+		expect(output).toContain("██╚══██║   ██║");
+		expect(output).toContain("  ╚═══╝    ╚═╝");
+		expect(output).not.toContain("omp v1.0.0");
+	});
+});

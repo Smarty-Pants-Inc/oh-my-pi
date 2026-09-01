@@ -51,8 +51,9 @@ import type {
 	TUI,
 } from "@oh-my-pi/pi-tui";
 import type { logger as PiLogger } from "@oh-my-pi/pi-utils";
-import type { KeybindingsManager } from "../../config/keybindings";
+import type { AppKeybinding, KeybindingsManager } from "../../config/keybindings";
 import type { ModelRegistry } from "../../config/model-registry";
+import type { ContextReleaseManifest } from "../../context/manifest";
 import type { EditToolDetails } from "../../edit";
 import type { PythonResult } from "../../eval/py/executor";
 import type { BashResult } from "../../exec/bash-executor";
@@ -62,10 +63,12 @@ import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
 import type { MemoryRuntimeContext } from "../../memory-backend";
 import type { CustomEditor } from "../../modes/components/custom-editor";
 import type { Theme } from "../../modes/theme/theme";
-import type { AsyncJobSnapshot } from "../../session/agent-session";
+import type { AsyncJobCounts, AsyncJobSnapshot } from "../../session/agent-session";
 import type { CompactMode } from "../../session/compact-modes";
+import type { ExecutionEnvironmentProvider } from "../../session/execution-environment";
 import type { CustomMessage, CustomMessagePayload } from "../../session/messages";
 import type { ReadonlySessionManager, SessionManager } from "../../session/session-manager";
+import type { BuildSystemPromptOptions, BuildSystemPromptResult, SystemPromptTemplates } from "../../system-prompt";
 import type {
 	BashToolDetails,
 	BashToolInput,
@@ -104,6 +107,8 @@ import type {
 	SessionCompactingEvent,
 	SessionCompactingResult,
 	SessionEvent,
+	SessionReadyEvent,
+	SessionRollbackEvent,
 	SessionShutdownEvent,
 	SessionStartEvent,
 	SessionStopEvent,
@@ -277,6 +282,9 @@ export interface ExtensionUIContext {
 
 	/** Show a notification to the user. */
 	notify(message: string, type?: "info" | "warning" | "error"): void;
+
+	/** Edit one queued user prompt's delivery timing in the existing TUI queue display. */
+	editQueuedPrompts?(): void;
 
 	/** Listen to raw terminal input (interactive mode only). Returns an unsubscribe function. */
 	onTerminalInput(handler: TerminalInputHandler): () => void;
@@ -452,6 +460,26 @@ export interface ExtensionModelQuery {
 /** Runtime host mode exposed to Pi-compatible extensions. */
 export type ExtensionMode = "tui" | "rpc" | "json" | "print";
 
+/** Delivery boundary assigned to a user-owned queued prompt. */
+export type QueuedPromptDelivery = "interrupt" | "steer" | "afterCurrent";
+
+/** Sanitized user-owned queue item. The id is opaque and valid only while queued. */
+export interface QueuedPrompt {
+	id: string;
+	text: string;
+	delivery: QueuedPromptDelivery;
+	imageCount?: number;
+	customType?: string;
+}
+
+/** Result of an atomic queued-prompt mutation. */
+export type QueuedPromptMutationResult =
+	| { status: "updated" }
+	| { status: "stale" }
+	| { status: "unavailable"; reason: "session_transition" | "queue_mutation" | "no_active_turn" };
+
+export type SetQueuedPromptDeliveryResult = QueuedPromptMutationResult;
+
 export interface ExtensionContext {
 	/** UI methods for user interaction */
 	ui: ExtensionUIContext;
@@ -459,8 +487,12 @@ export interface ExtensionContext {
 	mode: ExtensionMode;
 	/** Get current context usage for the active model. */
 	getContextUsage(): ContextUsage | undefined;
+	/** Whether manual or automatic context compaction is currently active. */
+	isCompacting(): boolean;
 	/** Get a read-only snapshot of async jobs owned by this session. */
 	getAsyncJobSnapshot(): AsyncJobSnapshot | null;
+	/** Get count-only async job state owned by this session. */
+	getAsyncJobCounts(): AsyncJobCounts | null;
 	/** Compact the session context (interactive mode shows UI). */
 	compact(instructionsOrOptions?: string | CompactOptions): Promise<void>;
 	/** Whether UI is available (false in print/RPC mode) */
@@ -479,10 +511,16 @@ export interface ExtensionContext {
 	models: ExtensionModelQuery;
 	/** Whether the agent is idle (not streaming) */
 	isIdle(): boolean;
-	/** Abort the current agent operation */
-	abort(): void;
-	/** Whether there are queued messages waiting */
+	/** Abort the current agent operation and wait for its teardown. */
+	abort(): Promise<void>;
+	/** Whether any visible or hidden message is waiting for this session. */
 	hasPendingMessages(): boolean;
+	/** Get a sanitized snapshot of user-owned queued prompts. */
+	getQueuedPrompts(): readonly QueuedPrompt[];
+	/** Listen for changes to the sanitized queued-prompt snapshot. */
+	onQueuedPromptsChanged(listener: () => void): () => void;
+	/** Atomically change one queued user prompt's delivery boundary. */
+	setQueuedPromptDelivery(id: string, delivery: QueuedPromptDelivery): Promise<SetQueuedPromptDeliveryResult>;
 	/** Gracefully shutdown and exit. */
 	shutdown(): void;
 	/** Get the current effective system prompt. */
@@ -498,15 +536,15 @@ export interface ExtensionContext {
 	 * cleared automatically on `session_shutdown`. Prefer this over raw
 	 * `setInterval` for any extension background work.
 	 */
-	setInterval(callback: (...args: unknown[]) => void, ms?: number, ...args: unknown[]): Timer;
+	setInterval(callback: (...args: unknown[]) => void, ms?: number, ...args: unknown[]): ExtensionTimer;
 	/**
 	 * Schedule a one-shot callback whose throws are contained, mirroring
 	 * {@link setInterval}. Cleared automatically on `session_shutdown` if it has
 	 * not yet fired.
 	 */
-	setTimeout(callback: (...args: unknown[]) => void, ms?: number, ...args: unknown[]): Timer;
+	setTimeout(callback: (...args: unknown[]) => void, ms?: number, ...args: unknown[]): ExtensionTimer;
 	/** Clear a timer scheduled via {@link setInterval} or {@link setTimeout}. */
-	clearTimer(timer: Timer): void;
+	clearTimer(timer: ExtensionTimer): void;
 	/**
 	 * Run the NATIVE built-in implementation of the tool this handler re-registered, with `params`,
 	 * and return its result. Lets a tool that re-registers a built-in (e.g. wrapping `write` to add
@@ -622,6 +660,10 @@ export interface ToolDefinition<TParams extends TSchema = TSchema, TDetails = un
 	parameters: TParams;
 	/** If true, tool is excluded unless explicitly listed in --tools or agent's tools field */
 	hidden?: boolean;
+	/** Stop the current agent run after this tool returns a successful result. */
+	terminalAfterSuccess?: boolean;
+	/** Tool-call scheduling mode. `"exclusive"` forms a barrier around this call. */
+	concurrency?: "shared" | "exclusive";
 	/** If true, tool is registered but not auto-included in the initial active set.
 	 *  The registering extension is responsible for activating/deactivating it via setActiveTools(). */
 	defaultInactive?: boolean;
@@ -716,7 +758,7 @@ export interface ResourcesDiscoverResult {
 }
 
 // ============================================================================
-// Session Events (shared with hooks subsystem)
+// Session Events (payloads shared with hooks except extension-only ready/rollback)
 // ============================================================================
 
 export type {
@@ -728,6 +770,8 @@ export type {
 	SessionCompactEvent,
 	SessionCompactingEvent,
 	SessionEvent,
+	SessionReadyEvent,
+	SessionRollbackEvent,
 	SessionShutdownEvent,
 	SessionStartEvent,
 	SessionSwitchEvent,
@@ -1068,6 +1112,8 @@ export function isToolCallEventType(toolName: string, event: ToolCallEvent): boo
 export type ExtensionEvent =
 	| ResourcesDiscoverEvent
 	| SessionEvent
+	| SessionReadyEvent
+	| SessionRollbackEvent
 	| ContextEvent
 	| BeforeProviderRequestEvent
 	| AfterProviderResponseEvent
@@ -1101,6 +1147,23 @@ export type ExtensionEvent =
 	| ToolResultEvent
 	| ToolApprovalRequestedEvent
 	| ToolApprovalResolvedEvent;
+
+/** Emitted immediately before a committed session mutation. */
+export interface SessionMutationEvent {
+	type: "session_switch" | "session_branch" | "session_tree";
+}
+
+/** Host-only fence emitted before retained capture for session switches and before branch/tree mutation. */
+export interface HostInternalSessionMutationEvent extends SessionMutationEvent {}
+
+/** Host-owned extension binding. Never exposed through public discovery or forwarded to child sessions. */
+export interface HostInternalExtensionBinding {
+	extension: Extension;
+	beforeSessionMutation?: (event: HostInternalSessionMutationEvent, ctx: ExtensionContext) => void | Promise<void>;
+	afterDispatch?: (event: ExtensionEvent, ctx: ExtensionContext) => void | Promise<void>;
+	/** Supplies a host-only terminal-input registrar after the interactive UI exists. */
+	setHostTerminalInput?: (register: (handler: TerminalInputHandler) => () => void) => void;
+}
 
 // ============================================================================
 // Event Results
@@ -1206,6 +1269,64 @@ export type ExtensionServiceTier<Family extends ServiceTierFamily> = Family exte
 		? "flex" | "priority"
 		: ServiceTier;
 
+export interface SystemPromptBuilderContext {
+	/** True only when this session has a user-visible UI that can persist policy warnings. */
+	readonly hasUI: boolean;
+	/** Dynamic inputs collected by the session for this prompt build. */
+	readonly options: Readonly<BuildSystemPromptOptions>;
+	/** Raw templates bundled with the running OMP build. */
+	readonly templates: Readonly<SystemPromptTemplates>;
+	/** Render the stock prompt pipeline with the supplied complete template set. */
+	build(templates?: Readonly<SystemPromptTemplates>): Promise<BuildSystemPromptResult>;
+	/** Fresh installed-state evidence. Undefined only in the explicit Bun test runtime. */
+	readonly releaseManifest?: Readonly<ContextReleaseManifest>;
+}
+
+/** Replaces OMP's normal provider-facing base system prompt builder. */
+export type SystemPromptBuilder = (
+	context: SystemPromptBuilderContext,
+) => BuildSystemPromptResult | Promise<BuildSystemPromptResult>;
+
+/** Opaque handle returned by managed extension timers. */
+export type ExtensionTimer = Timer;
+
+/** Receiver-state decision made atomically with the custom-message queue mutation. */
+export type SendMessageDeliveryMode = "auto" | "interrupt" | "steer" | "afterCurrent" | "explicitPrompt";
+
+export type SendMessageAcceptedDelivery =
+	| "started_turn"
+	| "queued_steer"
+	| "queued_follow_up"
+	| "queued_next_turn"
+	| "plain_append";
+
+export type SendMessageDisposition =
+	| { status: "accepted"; delivery: SendMessageAcceptedDelivery }
+	| {
+			status: "downgraded";
+			delivery: "queued_next_turn" | "plain_append";
+			reason: "client_deferred_turn" | "unscoped_automatic_turn";
+	  }
+	| {
+			status: "unavailable";
+			reason:
+				| "client_deferred_turn"
+				| "session_transition"
+				| "prompt_preflight_cancelled"
+				| "reentrant_extension_handler";
+	  };
+
+export interface SendMessageOptions {
+	/** Host-owned semantic delivery. The host either accepts this exact mode or performs no mutation. */
+	deliveryMode?: SendMessageDeliveryMode;
+	/** Registered scope that lets idle wake-capable semantic delivery start one peer-message turn. */
+	automaticTurnSource?: "peer_message_wake";
+	/** Runs synchronously at idle provider-response acceptance before session lifecycle handoff. */
+	onStartedTurnAccepted?: () => void;
+	/** Legacy delivery controls. Do not combine with `deliveryMode`. */
+	triggerTurn?: boolean;
+	deliverAs?: "steer" | "followUp" | "nextTurn";
+}
 /**
  * ExtensionAPI passed to extension factory functions.
  */
@@ -1235,6 +1356,8 @@ export interface ExtensionAPI {
 
 	on(event: "resources_discover", handler: ExtensionHandler<ResourcesDiscoverEvent, ResourcesDiscoverResult>): void;
 	on(event: "session_start", handler: ExtensionHandler<SessionStartEvent>): void;
+	on(event: "session_ready", handler: ExtensionHandler<SessionReadyEvent>): void;
+	on(event: "session_rollback", handler: ExtensionHandler<SessionRollbackEvent>): void;
 	on(
 		event: "session_before_switch",
 		handler: ExtensionHandler<SessionBeforeSwitchEvent, SessionBeforeSwitchResult>,
@@ -1290,6 +1413,9 @@ export interface ExtensionAPI {
 	on(event: "user_bash", handler: ExtensionHandler<UserBashEvent, UserBashEventResult>): void;
 	on(event: "user_python", handler: ExtensionHandler<UserPythonEvent, UserPythonEventResult>): void;
 	on(event: "mcp_notification", handler: ExtensionHandler<McpNotificationEvent>): void;
+
+	/** Register a fence that runs before a committed session mutation. */
+	registerSessionMutationFence(handler: ExtensionHandler<SessionMutationEvent>): void;
 
 	// =========================================================================
 	// Tool Registration
@@ -1373,6 +1499,8 @@ export interface ExtensionAPI {
 	registerShortcut(
 		shortcut: KeyId,
 		options: {
+			/** Register only while this exact shortcut remains bound to the named app action. */
+			whenKeybinding?: AppKeybinding;
 			description?: string;
 			handler: (ctx: ExtensionContext) => Promise<void> | void;
 		},
@@ -1417,18 +1545,21 @@ export interface ExtensionAPI {
 	// =========================================================================
 
 	/**
-	 * Send a custom message to the session.
+	 * Send a custom message to the session and report the exact host disposition.
 	 *
-	 * `deliverAs: "nextTurn"` keeps the message hidden from the editable pending-message UI.
-	 * If `triggerTurn` is also true while the current turn is still unwinding, the session schedules
-	 * an internal continuation that consumes the message on the next turn.
+	 * `deliveryMode` is selected against receiver state atomically with the queue mutation. A semantic
+	 * request that cannot be honored returns `unavailable` without enqueueing. Legacy `triggerTurn`
+	 * requests may report a client-deferred `downgraded` next-turn enqueue.
 	 */
 	sendMessage<T = unknown>(
 		message: CustomMessagePayload<T>,
-		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
-	): void;
+		options?: SendMessageOptions,
+	): Promise<SendMessageDisposition>;
 
-	/** Send a user prompt: idle starts a turn; streaming queues as steer unless deliverAs is set. */
+	/**
+	 * Send a user prompt: idle starts a turn; streaming queues as steer unless `deliverAs` is set.
+	 * A `followUp` matching a registered extension command executes locally after the active turn.
+	 */
 	sendUserMessage(
 		content: string | (TextContent | ImageContent)[],
 		options?: { deliverAs?: "steer" | "followUp" },
@@ -1478,6 +1609,20 @@ export interface ExtensionAPI {
 
 	/** Set the session name. Persists to the session file. */
 	setSessionName(name: string): Promise<void>;
+
+	// =========================================================================
+	// Execution Environment Registration
+	// =========================================================================
+
+	/** Register this extension's execution environment provider. */
+	registerExecutionEnvironmentProvider(provider: ExecutionEnvironmentProvider): void;
+
+	// =========================================================================
+	// System Prompt Builder Registration
+	// =========================================================================
+
+	/** Register this extension as the session's sole base system prompt builder. */
+	registerSystemPromptBuilder(builder: SystemPromptBuilder): void;
 
 	// =========================================================================
 	// Provider Registration
@@ -1631,6 +1776,8 @@ export interface ExtensionFlag {
 export interface ExtensionShortcut {
 	shortcut: KeyId;
 	description?: string;
+	/** Register only while this exact shortcut remains bound to the named app action. */
+	whenKeybinding?: AppKeybinding;
 	handler: (ctx: ExtensionContext) => Promise<void> | void;
 	extensionPath: string;
 }
@@ -1639,13 +1786,8 @@ type HandlerFn = (...args: unknown[]) => Promise<unknown>;
 
 export type SendMessageHandler = <T = unknown>(
 	message: CustomMessagePayload<T>,
-	/**
-	 * `deliverAs: "nextTurn"` queues hidden custom context for the next turn.
-	 * When paired with `triggerTurn: true` during prompt teardown, the session schedules
-	 * an internal continuation without surfacing the message in the editable pending queue.
-	 */
-	options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
-) => void;
+	options?: SendMessageOptions,
+) => Promise<SendMessageDisposition>;
 
 export type SendUserMessageHandler = (
 	content: string | (TextContent | ImageContent)[],
@@ -1706,8 +1848,12 @@ export interface ExtensionActions {
 export interface ExtensionContextActions {
 	getModel: () => Model | undefined;
 	isIdle: () => boolean;
-	abort: () => void;
+	isCompacting: () => boolean;
+	abort: () => void | Promise<void>;
 	hasPendingMessages: () => boolean;
+	getQueuedPrompts?: () => readonly QueuedPrompt[];
+	onQueuedPromptsChanged?: (listener: () => void) => () => void;
+	setQueuedPromptDelivery?: (id: string, delivery: QueuedPromptDelivery) => Promise<SetQueuedPromptDeliveryResult>;
 	shutdown: () => void;
 	getContextUsage: () => ContextUsage | undefined;
 	compact: (instructionsOrOptions?: string | CompactOptions) => Promise<void>;
@@ -1740,7 +1886,10 @@ export interface Extension {
 	path: string;
 	resolvedPath: string;
 	label?: string;
+	executionEnvironmentProvider?: ExecutionEnvironmentProvider;
+	systemPromptBuilder?: SystemPromptBuilder;
 	handlers: Map<string, HandlerFn[]>;
+	sessionMutationFences: ExtensionHandler<SessionMutationEvent>[];
 	tools: Map<string, RegisteredTool<any, any>>;
 	toolRegistrationListeners?: Set<ToolRegistrationListener>;
 	assistantThinkingRenderers: AssistantThinkingRenderer[];

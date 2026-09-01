@@ -1,6 +1,7 @@
 import { afterAll, afterEach, describe, expect, it, vi } from "bun:test";
 import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
+import { interruptHint } from "@oh-my-pi/pi-coding-agent/modes/shared";
 import { initTheme, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -13,7 +14,7 @@ type Harness = {
 	tempDir: TempDir;
 };
 
-let harness: Harness | undefined;
+const harnesses = new Map<"ordinary" | "companion", Harness>();
 
 function defined<T>(value: T | undefined): T {
 	if (value === undefined) throw new Error("Expected value to be defined");
@@ -30,15 +31,19 @@ function accentGlyphAnsi(sessionName: string): string {
 	return defined(sessionColor.getSessionAccentAnsi(adjustHsv(hex, { s: 0.55, v: 0.65 })));
 }
 
-async function createHarness(sessionName: string): Promise<Harness> {
-	if (harness) {
-		harness.mode.loadingAnimation?.stop();
-		harness.mode.loadingAnimation = undefined;
-		harness.mode.statusContainer.disposeChildren();
-		await harness.sessionManager.setSessionName(sessionName, "user");
-		return harness;
+async function createHarness(
+	sessionName: string,
+	companionStatusTextSink?: (statusText?: string) => void,
+): Promise<Harness> {
+	const key = companionStatusTextSink === undefined ? "ordinary" : "companion";
+	const existing = harnesses.get(key);
+	if (existing) {
+		existing.mode.loadingAnimation?.stop();
+		existing.mode.loadingAnimation = undefined;
+		existing.mode.statusContainer.disposeChildren();
+		await existing.sessionManager.setSessionName(sessionName, "user");
+		return existing;
 	}
-
 	const tempDir = TempDir.createSync("@pi-working-accent-");
 	await Settings.init({ inMemory: true, cwd: tempDir.path() });
 	await initTheme(false);
@@ -60,8 +65,18 @@ async function createHarness(sessionName: string): Promise<Harness> {
 		model: undefined,
 		thinkingLevel: undefined,
 	} as unknown as AgentSession;
-	const mode = new InteractiveMode(session, "test");
-	harness = { mode, sessionManager, tempDir };
+	const mode = new InteractiveMode(
+		session,
+		"test",
+		undefined,
+		undefined,
+		undefined,
+		undefined,
+		undefined,
+		companionStatusTextSink,
+	);
+	const harness = { mode, sessionManager, tempDir };
+	harnesses.set(companionStatusTextSink === undefined ? "ordinary" : "companion", harness);
 	return harness;
 }
 
@@ -89,13 +104,59 @@ afterEach(() => {
 });
 
 afterAll(() => {
-	harness?.mode.stop();
-	harness?.tempDir.removeSync();
-	harness = undefined;
+	for (const harness of harnesses.values()) {
+		harness.mode.stop();
+		harness.tempDir.removeSync();
+	}
+	harnesses.clear();
 	resetSettingsForTest();
 });
 
 describe("InteractiveMode working-message session accent cache", () => {
+	it("updates the anchored loader in place without appending transcript history", async () => {
+		const { mode } = await createHarness("Live status");
+		const transcriptLength = mode.chatContainer.children.length;
+
+		expect(renderLoader(mode)).toBe("");
+		startStableLoader(mode);
+		expect(Bun.stripANSI(renderLoader(mode))).toContain("Working");
+		expect(mode.chatContainer.children).toHaveLength(transcriptLength);
+
+		mode.setWorkingMessage("Inspecting files");
+		const updated = Bun.stripANSI(renderLoader(mode));
+		expect(updated).toContain("Inspecting files");
+		expect(updated).not.toContain("Working");
+		expect(mode.chatContainer.children).toHaveLength(transcriptLength);
+
+		mode.statusContainer.disposeChildren();
+		expect(renderLoader(mode)).toBe("");
+		expect(mode.chatContainer.children).toHaveLength(transcriptLength);
+	});
+
+	it("publishes the canonical loader message without the keyboard hint", async () => {
+		const statuses: Array<string | undefined> = [];
+		const { mode } = await createHarness("Companion status", status => statuses.push(status));
+
+		startStableLoader(mode);
+		expect(statuses.at(-1)).toBe("Working…");
+
+		mode.setWorkingMessage(`Finding top-level files${interruptHint()}`);
+		expect(statuses.at(-1)).toBe("Finding top-level files");
+
+		mode.statusContainer.disposeChildren();
+		expect(statuses.at(-1)).toBeUndefined();
+	});
+
+	it("does not inspect loader status when no companion sink exists", async () => {
+		const { mode } = await createHarness("Ordinary TUI");
+		startStableLoader(mode);
+		const getMessage = vi.spyOn(defined(mode.loadingAnimation), "getMessage");
+
+		mode.setWorkingMessage("Ordinary update");
+
+		expect(getMessage).not.toHaveBeenCalled();
+	});
+
 	it("reuses one computed accent across loader spinner and message colorizers", async () => {
 		const { mode } = await createHarness("Cached session");
 		const getHex = vi.spyOn(sessionColor, "getSessionAccentHex");

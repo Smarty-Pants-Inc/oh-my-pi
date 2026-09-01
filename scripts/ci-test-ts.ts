@@ -63,11 +63,11 @@ const validModes: Record<Mode, true> = {
 
 // `chunkSize` splits a bucket's file list into that-many-file groups, each run as a
 // separate `bun test` child process. A fresh process per chunk resets Bun's
-// heap and reaps any dangling spawned children between groups, keeping peak RSS
-// under the CI runner's OOM ceiling (a single 170–370-file invocation gets
-// SIGKILLed at 137). The singleton/global-state bucket is left whole: its suites
-// co-locate in one process to exercise process-wide state, so they must not split.
-//
+// heap, process globals, and dangling handles between groups, keeping peak RSS
+// under the CI runner's OOM ceiling and preventing one leaked handle from
+// pinning the entire bucket until the watchdog. Singleton/global-state files
+// each run in their own process (`parallel=1`); this costs process startup but
+// avoids pairing suites whose module singletons or cleanup contracts can interact.
 // The UI/TUI bucket uses a smaller chunk (5) than the others: its suites build up
 // native ghostty-vt cells, and bun 1.3.14's GC aborts (SIGTRAP/SIGABRT, exit
 // 133/134 inside DOMGCOutputConstraint marking) once ~10 such files share a heap,
@@ -76,7 +76,7 @@ const validModes: Record<Mode, true> = {
 // 10-file chunk aborts ~50% of runs while either 5-file half is 0/20; halving the
 // chunk keeps each process under the threshold.
 const codingAgentBucketPlans: Record<CodingAgentBucket, { label: string; parallel: number; chunkSize?: number }> = {
-	singleton: { label: "singleton/global-state bucket", parallel: 1 },
+	singleton: { label: "singleton/global-state bucket", parallel: 1, chunkSize: 1 },
 	ui: { label: "UI/TUI bucket", parallel: 1, chunkSize: 5 },
 	runtime: { label: "runtime/session bucket", parallel: 1, chunkSize: 10 },
 	native: { label: "native/tooling/browser/unit bucket", parallel: 1, chunkSize: 10 },
@@ -220,7 +220,7 @@ function rustTestCommand(): TestCommand {
 	return {
 		label: "rust (cargo nextest; skipped if no Rust changes)",
 		cwd: ".",
-		command: ["bun", "scripts/run-rs-task.ts", "test:rs"],
+		command: ["bun", "scripts/run-rs-task.ts", "test:rs", "--changed-only"],
 	};
 }
 
@@ -373,23 +373,27 @@ async function commandsForMode(mode: Mode): Promise<TestCommand[]> {
 
 // The omp-kata runner pods may inject cloud credentials (`AWS_*`) pod-wide via
 // `envFrom`, GitHub Actions injects `GITHUB_TOKEN`,
-// and a host may carry provider API keys. Any of these make env-sensitive code
-// non-deterministic in tests — e.g. leaked AWS creds make `amazon-bedrock` look
-// authenticated and win the provider startup fallback over `anthropic`. Run the
-// suites in a hermetic environment with all credential / cloud-config variables
-// stripped so resolution depends only on the test's own fixtures.
+// and a host may carry provider API keys or Herdr / SSH session markers. Any of
+// these make environment-sensitive tests non-deterministic — e.g. leaked AWS
+// creds make `amazon-bedrock` look authenticated and win the provider startup
+// fallback over `anthropic`, while host markers select TUI integration paths.
+// Strip them so resolution depends only on the test's own fixtures.
 const SCRUBBED_ENV_PREFIXES = ["AWS_", "GOOGLE_CLOUD_"];
-const SCRUBBED_ENV_NAMES = new Set([
-	"GITHUB_TOKEN",
-	"GH_TOKEN",
-	"COPILOT_GITHUB_TOKEN",
-	"GOOGLE_APPLICATION_CREDENTIALS",
-	"ANTHROPIC_OAUTH_TOKEN",
-	"XAI_OAUTH_TOKEN",
-]);
+const SCRUBBED_ENV_NAMES: Record<string, true> = {
+	GITHUB_TOKEN: true,
+	GH_TOKEN: true,
+	COPILOT_GITHUB_TOKEN: true,
+	GOOGLE_APPLICATION_CREDENTIALS: true,
+	ANTHROPIC_OAUTH_TOKEN: true,
+	XAI_OAUTH_TOKEN: true,
+	HERDR_ENV: true,
+	SSH_CONNECTION: true,
+	SSH_TTY: true,
+	SSH_CLIENT: true,
+};
 
 function isScrubbedEnvVar(key: string): boolean {
-	if (SCRUBBED_ENV_NAMES.has(key)) {
+	if (SCRUBBED_ENV_NAMES[key]) {
 		return true;
 	}
 	if (SCRUBBED_ENV_PREFIXES.some(prefix => key.startsWith(prefix))) {
@@ -440,8 +444,8 @@ async function runTestCommand(testCommand: TestCommand): Promise<void> {
 }
 
 // Child env shared by every spawned test process: the parent env with the
-// private test-runtime marker set, all CI credential / cloud-config variables
-// scrubbed (see SCRUBBED_ENV_* above), and GITHUB_ACTIONS cleared.
+// private test-runtime marker set, CI credential / cloud-config and host-session
+// variables scrubbed (see SCRUBBED_ENV_* above), and GITHUB_ACTIONS cleared.
 //
 // GC knobs (both needed — they gate different JSC mechanisms):
 // - `BUN_JSC_useConcurrentGC=0` stops the collector from marking concurrently
@@ -461,9 +465,11 @@ async function runTestCommand(testCommand: TestCommand): Promise<void> {
 // `JSAbortSignal::visitAdditionalChildrenInGCThread` reading a dead `reason`
 // cell), where no marker/concurrency knob applies. That residual crash is
 // handled by retrying crashed chunks in a fresh process (MAX_CHUNK_ATTEMPTS).
-function buildChildEnv(): Record<string, string | undefined> {
+export function buildChildEnv(
+	sourceEnv: Readonly<Record<string, string | undefined>> = Bun.env,
+): Record<string, string | undefined> {
 	const env: Record<string, string | undefined> = {
-		...Bun.env,
+		...sourceEnv,
 		GITHUB_ACTIONS: "",
 		PI_TEST_RUNTIME: "1",
 		BUN_JSC_useConcurrentGC: "0",

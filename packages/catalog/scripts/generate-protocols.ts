@@ -49,7 +49,7 @@ const DEVIN_ENUMS = [
 	"TeamsTier",
 ];
 
-async function collectCursorMessages(): Promise<string[]> {
+async function collectCursorSymbols(context: ProtoContext): Promise<{ messages: string[]; enums: string[] }> {
 	const symbols = new Set<string>();
 	const importPattern = /import(?:\s+type)?\s*\{([^}]*)\}\s*from\s*["']([^"']+)["'];/g;
 	const sourceFiles = await collectTypeScriptFiles(CURSOR_CONSUMER_DIRS);
@@ -63,16 +63,23 @@ async function collectCursorMessages(): Promise<string[]> {
 				const symbol = specifier
 					.trim()
 					.replace(/^type\s+/, "")
-					.replace(/\s+as\s+.+$/, "");
-				if (!symbol) continue;
-				symbols.add(symbol.endsWith("Schema") ? symbol.slice(0, -6) : symbol);
+					.replace(/\s+as\s+.+$/, "")
+					.replace(/Schema$/, "");
+				if (symbol) symbols.add(symbol);
 			}
 		}
 	}
 
-	for (const enumName of CURSOR_ENUMS) symbols.delete(enumName);
-	if (symbols.size === 0) throw new Error("No Cursor protocol consumers found");
-	return [...symbols].sort();
+	const messages: string[] = [];
+	const enums: string[] = [];
+	for (const symbol of symbols) {
+		const resolved = context.lookupType(symbol);
+		if (resolved.kind === "message") messages.push(symbol);
+		else if (resolved.kind === "enum") enums.push(symbol);
+		else throw new Error(`Cursor protocol consumer '${symbol}' was not found`);
+	}
+	if (messages.length === 0) throw new Error("No Cursor protocol consumers found");
+	return { messages: messages.sort(), enums: enums.sort() };
 }
 
 async function collectTypeScriptFiles(directories: string[]): Promise<string[]> {
@@ -103,10 +110,10 @@ async function generateProtocols(): Promise<void> {
 	const cursorSource = await Bun.file(CURSOR_PROTO).text();
 	const cursorContext = new ProtoContext();
 	cursorContext.addFile(parseProto(cursorSource, "agent.proto"));
-
+	const cursorSymbols = await collectCursorSymbols(cursorContext);
 	const cursor = generateProtoTs(cursorContext, {
-		includeMessages: await collectCursorMessages(),
-		includeEnums: CURSOR_ENUMS,
+		includeMessages: cursorSymbols.messages,
+		includeEnums: cursorSymbols.enums,
 		includeDependencies: true,
 		packagePrefix: "Cursor agent",
 		protobufImportPath: "./protobuf",

@@ -884,7 +884,7 @@ export class EventController {
 								typeof content.mimeType === "string",
 						);
 			const imageCount = imageBlocks.length;
-			const signature = `${textContent}\u0000${imageCount}`;
+			const signature = localSubmissionSignature(textContent, imageCount);
 
 			this.#resetReadGroup();
 			this.#resolveDisplaceablePoll();

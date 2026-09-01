@@ -27,6 +27,8 @@ export interface BashExecutorOptions {
 	env?: Record<string, string>;
 	/** Run through the configured user shell instead of brush parsing directly. */
 	useUserShell?: boolean;
+	/** Bypass user snapshots, configured prefixes, and direnv for a pre-sanitized command. */
+	sterile?: boolean;
 	/** Run supported user shells (zsh/fish) on a headless PTY; requires `useUserShell`. */
 	pty?: BashPtyOptions;
 	/** Artifact path/id for full output storage */
@@ -448,7 +450,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		supportsAutoUserShell(shell) &&
 		$env.PI_NO_PTY !== "1" &&
 		!isPersistentShellCdCommand(command);
-	const snapshotPath = bashShell ? await getOrCreateSnapshot(shell, shellEnv) : null;
+	const snapshotPath = bashShell && !options?.sterile ? await getOrCreateSnapshot(shell, shellEnv) : null;
 
 	const minimizer = buildMinimizerOptions(settings.getGroup("shellMinimizer"));
 
@@ -458,14 +460,16 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 	// signal + timeout so an aborted / short-timeout call can't hang on a cold
 	// `.envrc` load before the abort listener is installed. The helper applies
 	// the configured shell `prefix` after any `unset -v` it prepends.
-	const preflight = await applyDirenvPreflight(command, commandCwd ?? process.cwd(), {
-		callerEnv: options?.env,
-		signal: options?.signal,
-		timeoutMs: settings.get("bash.direnvLoadTimeoutMs"),
-		callerTimeoutMs: options?.timeout,
-		direnvSetting: settings.get("bash.direnv"),
-		commandPrefix: prefix,
-	});
+	const preflight = options?.sterile
+		? { command, env: options.env ?? {} }
+		: await applyDirenvPreflight(command, commandCwd ?? process.cwd(), {
+				callerEnv: options?.env,
+				signal: options?.signal,
+				timeoutMs: settings.get("bash.direnvLoadTimeoutMs"),
+				callerTimeoutMs: options?.timeout,
+				direnvSetting: settings.get("bash.direnv"),
+				commandPrefix: prefix,
+			});
 	const commandEnv = buildNonInteractiveEnv(preflight.env);
 	const runCdInPersistentShell = options?.useUserShell === true && !prefix && isPersistentShellCdCommand(command);
 	// Never wrap in cmd.exe: it is only the Windows no-bash fallback for spawn

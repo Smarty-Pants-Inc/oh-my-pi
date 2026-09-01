@@ -82,6 +82,28 @@ afterEach(() => {
 });
 
 describe("azure openai responses streaming", () => {
+	it("maps typed internal context to Azure's developer input channel", async () => {
+		const payload = await captureAzurePayload({
+			instructions: [
+				{
+					id: "goal.continuation",
+					sourcePath: "packages/coding-agent/src/prompts/goals/continuation.md",
+					role: "internal_context",
+					target: "main",
+					trigger: "goal-continuation",
+					sha256: "test-sha256",
+					renderedText: "Continue the active goal without overriding the user.",
+				},
+			],
+			messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }],
+		});
+
+		expect(payload.input).toEqual([
+			{ role: "developer", content: "Continue the active goal without overriding the user." },
+			{ role: "user", content: [{ type: "input_text", text: "Say hello" }] },
+		]);
+	});
+
 	it("serializes each system prompt as an Azure Responses system input item for non-reasoning models", async () => {
 		const payload = await captureAzurePayload({
 			systemPrompt: ["First instruction", "", "Second instruction"],

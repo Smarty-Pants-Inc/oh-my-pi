@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import { scheduler } from "node:timers/promises";
 import { Agent } from "@oh-my-pi/pi-agent-core";
+import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -27,8 +28,7 @@ function getRuntimeSignals(): string[] {
 }
 
 /**
- * Regression test: auto-compaction completion should resume the agent loop when
- * there are queued agent-level messages (follow-up/steering/custom).
+ * Regression tests for authority-scoped queue handling after compaction.
  */
 describe("AgentSession auto-compaction queue resume", () => {
 	let tempDir: TempDir;
@@ -65,6 +65,12 @@ describe("AgentSession auto-compaction queue resume", () => {
 							details: {},
 						},
 					};
+				});
+				pi.on("message_end", async event => {
+					if (event.message.role !== "custom" || event.message.customType !== "peer-message") return;
+					const gate = (globalThis as typeof globalThis & { __ompSemanticPersistenceGate?: Promise<void> })
+						.__ompSemanticPersistenceGate;
+					if (gate) await gate;
 				});
 				pi.on("auto_compaction_start", event => {
 					getRuntimeSignals().push(`compaction:start:${event.reason}`);
@@ -136,6 +142,9 @@ describe("AgentSession auto-compaction queue resume", () => {
 				getRuntimeSignals().length = 0;
 				(globalThis as typeof globalThis & { __ompManualCompactGate?: Promise<void> }).__ompManualCompactGate =
 					undefined;
+				(
+					globalThis as typeof globalThis & { __ompSemanticPersistenceGate?: Promise<void> }
+				).__ompSemanticPersistenceGate = undefined;
 				vi.restoreAllMocks();
 			}
 		}
@@ -145,7 +154,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 		tempDir.removeSync();
 	});
 
-	it("resumes after threshold compaction when only agent-level queued messages exist", async () => {
+	it("does not resume after threshold compaction for an unscoped custom message", async () => {
 		session.agent.followUp({
 			role: "custom",
 			customType: "test",
@@ -156,16 +165,8 @@ describe("AgentSession auto-compaction queue resume", () => {
 
 		expect(session.agent.hasQueuedMessages()).toBe(true);
 
-		const continueSpy = vi.spyOn(session.agent, "continue").mockImplementation(async () => {
-			// Real continue() polls and consumes the queued steering/follow-up
-			// messages. Mirror that here so the stranded-queue drain settles after
-			// one resume instead of rescheduling itself forever (a no-op mock
-			// leaves the queue populated, spinning the drain into an OOM loop).
-			session.agent.clearAllQueues();
-		});
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue(undefined);
 
-		// The continuation is already scheduled when the public agent_end arrives,
-		// so consumers must see it as a non-terminal scheduling pause.
 		const agentEndTerminalStates: Array<boolean | undefined> = [];
 		const { promise: compactionDone, resolve: onCompactionDone } = Promise.withResolvers<void>();
 		session.subscribe((event: AgentSessionEvent) => {
@@ -202,24 +203,18 @@ describe("AgentSession auto-compaction queue resume", () => {
 		session.agent.emitExternalEvent({ type: "message_end", message: assistantMsg });
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
 
-		// Wait for compaction completion, then verify waitForIdle blocks on queued continuation.
+		// The custom message remains queued for the next explicit user turn.
 		await compactionDone;
 		await Promise.resolve();
-		const idlePromise = session.waitForIdle();
-		let idleResolved = false;
-		void idlePromise.then(() => {
-			idleResolved = true;
-		});
-		await Promise.resolve();
-		expect(idleResolved).toBe(false);
-		vi.advanceTimersByTime(200);
-		await idlePromise;
+		await session.waitForIdle();
 
-		expect(continueSpy).toHaveBeenCalledTimes(1);
+		expect(continueSpy).not.toHaveBeenCalled();
+		expect(session.agent.hasQueuedMessages()).toBe(true);
 		const runtimeSignals = getRuntimeSignals();
 		expect(runtimeSignals).toContain("compaction:start:threshold");
 		expect(runtimeSignals.some(signal => signal.startsWith("compaction:end:"))).toBe(true);
-		expect(agentEndTerminalStates).toEqual([false]);
+		expect(agentEndTerminalStates).toEqual([true]);
+		session.agent.clearAllQueues();
 	});
 
 	it("marks manual compaction active before abort teardown can yield", async () => {
@@ -264,6 +259,218 @@ describe("AgentSession auto-compaction queue resume", () => {
 		expect(compactingDuringAbort).toBe(true);
 	});
 
+	it("persists a scoped wake before manual compaction disconnects", async () => {
+		vi.useRealTimers();
+		session.settings.set("compaction.keepRecentTokens", 1);
+		sessionManager.appendMessage({
+			role: "assistant",
+			content: [{ type: "text", text: "previous answer" }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			stopReason: "stop",
+			usage: {
+				input: 1_000,
+				output: 100,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 1_100,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		});
+		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+		session.agent.streamFn = createMockModel({ handler: () => ({ content: ["Done"] }) }).stream;
+
+		const countWakeEntries = () =>
+			sessionManager
+				.getBranch()
+				.filter(
+					entry =>
+						entry.type === "custom_message" &&
+						entry.customType === "peer-message" &&
+						JSON.stringify(entry.content).includes("accepted before manual compaction"),
+				).length;
+		const gate = Promise.withResolvers<void>();
+		(globalThis as typeof globalThis & { __ompManualCompactGate?: Promise<void> }).__ompManualCompactGate =
+			gate.promise;
+		let callbackWakeEntries = -1;
+		let compactPromise: Promise<unknown> | undefined;
+
+		const sending = session.sendCustomMessage(
+			{
+				customType: "peer-message",
+				content: "accepted before manual compaction",
+				display: true,
+				attribution: "agent",
+			},
+			{
+				deliveryMode: "auto",
+				automaticTurnSource: "peer_message_wake",
+				onStartedTurnAccepted: () => {
+					callbackWakeEntries = countWakeEntries();
+					compactPromise = session.compact();
+				},
+			},
+		);
+
+		try {
+			await expect(withTimeout(sending, 1000, "Scoped wake acceptance timed out")).resolves.toEqual({
+				status: "accepted",
+				delivery: "started_turn",
+			});
+			expect(callbackWakeEntries).toBe(0);
+			while (!getRuntimeSignals().includes("before_compact:enter")) {
+				await Promise.resolve();
+			}
+			expect(countWakeEntries()).toBe(1);
+		} finally {
+			gate.resolve();
+			await compactPromise;
+		}
+	});
+
+	it("abortCompaction cancels startup while semantic acceptance is pending", async () => {
+		vi.useRealTimers();
+		session.agent.streamFn = createMockModel({ handler: () => ({ content: ["Done"] }) }).stream;
+		const persistenceGate = Promise.withResolvers<void>();
+		(
+			globalThis as typeof globalThis & { __ompSemanticPersistenceGate?: Promise<void> }
+		).__ompSemanticPersistenceGate = persistenceGate.promise;
+		let compactPromise: Promise<unknown> | undefined;
+		const sending = session.sendCustomMessage(
+			{
+				customType: "peer-message",
+				content: "hold acceptance during compact cancellation",
+				display: true,
+				attribution: "agent",
+			},
+			{
+				deliveryMode: "auto",
+				automaticTurnSource: "peer_message_wake",
+				onStartedTurnAccepted: () => {
+					compactPromise = session.compact();
+					void compactPromise.catch(() => {});
+					session.abortCompaction();
+				},
+			},
+		);
+
+		try {
+			while (!compactPromise) await Bun.sleep(1);
+			await expect(withTimeout(compactPromise, 1_000, "Compaction cancellation timed out")).rejects.toThrow(
+				"Compaction cancelled",
+			);
+			expect(session.isCompacting).toBe(false);
+			await expect(
+				session.sendCustomMessage(
+					{ customType: "probe", content: "after compact cancel", display: false, attribution: "agent" },
+					{ deliveryMode: "steer" },
+				),
+			).resolves.toMatchObject({ status: "accepted" });
+		} finally {
+			persistenceGate.resolve();
+			await sending;
+			await session.waitForIdle();
+		}
+	});
+
+	it("rejects scoped peer wake while manual compaction owns the semantic-delivery fence", async () => {
+		session.settings.set("compaction.keepRecentTokens", 1);
+		vi.useRealTimers();
+		sessionManager.appendMessage({
+			role: "assistant",
+			content: [{ type: "text", text: "previous answer" }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			stopReason: "stop",
+			usage: {
+				input: 1_000,
+				output: 100,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 1_100,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		});
+		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
+		session.agent.streamFn = mock.stream;
+		const countWakeEntries = () =>
+			sessionManager
+				.getBranch()
+				.filter(
+					entry =>
+						entry.type === "custom_message" &&
+						entry.customType === "peer-message" &&
+						JSON.stringify(entry.content).includes("must remain retryable during compaction"),
+				).length;
+
+		const gate = Promise.withResolvers<void>();
+		(globalThis as typeof globalThis & { __ompManualCompactGate?: Promise<void> }).__ompManualCompactGate =
+			gate.promise;
+		const compactPromise = session.compact();
+		while (!getRuntimeSignals().includes("before_compact:enter")) {
+			await Promise.resolve();
+		}
+
+		let committed = false;
+		try {
+			await expect(
+				session.sendCustomMessage(
+					{
+						customType: "peer-message",
+						content: "must remain retryable during compaction",
+						display: true,
+						attribution: "agent",
+					},
+					{
+						deliveryMode: "auto",
+						automaticTurnSource: "peer_message_wake",
+						onStartedTurnAccepted: () => {
+							committed = true;
+						},
+					},
+				),
+			).resolves.toEqual({ status: "unavailable", reason: "session_transition" });
+			expect(committed).toBe(false);
+			expect(mock.calls).toHaveLength(0);
+			expect(countWakeEntries()).toBe(0);
+		} finally {
+			gate.resolve();
+			await compactPromise;
+		}
+
+		expect(countWakeEntries()).toBe(0);
+		await expect(
+			session.sendCustomMessage(
+				{
+					customType: "peer-message",
+					content: "must remain retryable during compaction",
+					display: true,
+					attribution: "agent",
+				},
+				{
+					deliveryMode: "auto",
+					automaticTurnSource: "peer_message_wake",
+					onStartedTurnAccepted: () => {
+						expect(JSON.stringify(session.agent.state.messages)).not.toContain(
+							"must remain retryable during compaction",
+						);
+						expect(countWakeEntries()).toBe(0);
+						committed = true;
+					},
+				},
+			),
+		).resolves.toEqual({ status: "accepted", delivery: "started_turn" });
+		await session.waitForIdle();
+		expect(committed).toBe(true);
+		expect(countWakeEntries()).toBe(1);
+		expect(mock.calls).toHaveLength(1);
+	});
+
 	it("resumes a message queued during manual compaction once it completes (#5800)", async () => {
 		// Regression for #5800 review: manual /compact disconnects the agent
 		// listener before `await abort()`, so the abort-finally stranded-message
@@ -292,9 +499,18 @@ describe("AgentSession auto-compaction queue resume", () => {
 		});
 		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
 
-		const continueSpy = vi.spyOn(session.agent, "continue").mockImplementation(async () => {
-			session.agent.clearAllQueues();
-		});
+		const continueSpy = vi
+			.spyOn(session.agent, "continueQueuedMessageBlock")
+			.mockImplementation(async (_queue, block) => {
+				expect(block).toEqual([
+					expect.objectContaining({
+						role: "user",
+						content: [{ type: "text", text: "please respond after compaction" }],
+						attribution: "user",
+					}),
+				]);
+				session.agent.clearAllQueues();
+			});
 
 		// Park compaction inside its awaited hook so we can queue a follow-up while
 		// the session is disconnected and abort has already run its finally.
@@ -307,12 +523,16 @@ describe("AgentSession auto-compaction queue resume", () => {
 			await Promise.resolve();
 		}
 
-		// A message arrives DURING compaction (post-abort, still disconnected).
-		session.agent.followUp({
+		// An agent-attributed IRC record arrives before the user's message. It must
+		// stay parked while the attributed user owns the resumed direct turn.
+		session.agent.steer({
 			role: "user",
-			content: "please respond after compaction",
+			content: "parent IRC must stay passive",
+			attribution: "agent",
+			steering: true,
 			timestamp: Date.now(),
 		});
+		await session.sendUserMessage("please respond after compaction");
 		expect(session.agent.hasQueuedMessages()).toBe(true);
 
 		gate.resolve();
@@ -321,7 +541,116 @@ describe("AgentSession auto-compaction queue resume", () => {
 
 		// compact()'s finally re-drained the stranded queue after reconnecting.
 		expect(continueSpy).toHaveBeenCalledTimes(1);
+		expect(session.agent.peekSteeringQueue()).toEqual([
+			expect.objectContaining({ content: "parent IRC must stay passive", attribution: "agent" }),
+		]);
+		expect(session.agent.peekFollowUpQueue()).toEqual([]);
+		session.agent.clearAllQueues();
 	});
+
+	it.each([
+		["delivery", "manual"],
+		["text", "manual"],
+		["removal", "manual"],
+		["delivery", "automatic"],
+		["now", "manual"],
+		["now", "automatic"],
+	] as const)(
+		"waits to commit a session-backed queued prompt %s until %s compaction settles",
+		async (mutation, compaction) => {
+			session.settings.set("compaction.keepRecentTokens", 1);
+			sessionManager.appendMessage({
+				role: "assistant",
+				content: [{ type: "text", text: "previous answer" }],
+				api: "anthropic-messages",
+				provider: "anthropic",
+				model: "claude-sonnet-4-5",
+				stopReason: "stop",
+				usage: {
+					input: 1_000,
+					output: 100,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 1_100,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				timestamp: Date.now(),
+			});
+			session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+
+			const gate = Promise.withResolvers<void>();
+			(globalThis as typeof globalThis & { __ompManualCompactGate?: Promise<void> }).__ompManualCompactGate =
+				gate.promise;
+			const compactPromise = compaction === "manual" ? session.compact() : session.runIdleCompaction();
+
+			try {
+				while (!getRuntimeSignals().includes("before_compact:enter")) {
+					await Promise.resolve();
+				}
+
+				await session.sendUserMessage("queued during compaction");
+				const queued = session.getQueuedPrompts()[0];
+				if (!queued) throw new Error("Expected a session-backed queued prompt");
+				const targetDelivery = queued.delivery === "steer" ? "afterCurrent" : "steer";
+				if (mutation !== "now") session.agent.state.isStreaming = true;
+				const continueSpy =
+					mutation === "now"
+						? vi.spyOn(session.agent, "continueQueuedMessageBlock").mockImplementation(async (queue, block) => {
+								expect(queue).toBe("steering");
+								expect(block).toEqual([
+									expect.objectContaining({
+										role: "user",
+										content: [{ type: "text", text: "queued during compaction" }],
+										attribution: "user",
+									}),
+								]);
+								session.agent.clearAllQueues();
+							})
+						: undefined;
+
+				let mutationSettled = false;
+				const operation = (
+					mutation === "now"
+						? session.setQueuedPromptDelivery(queued.id, "interrupt")
+						: mutation === "delivery"
+							? session.setQueuedPromptDelivery(queued.id, targetDelivery)
+							: mutation === "text"
+								? session.updateQueuedPromptText(queued.id, "edited after compaction")
+								: session.removeQueuedPrompt(queued.id)
+				).finally(() => {
+					mutationSettled = true;
+				});
+				await Promise.resolve();
+				expect(mutationSettled).toBe(false);
+
+				gate.resolve();
+				await compactPromise;
+				await expect(operation).resolves.toEqual({ status: "updated" });
+				if (mutation === "now") await session.waitForIdle();
+
+				const prompts = session.getQueuedPrompts();
+				if (mutation === "now") {
+					expect(continueSpy).toHaveBeenCalledTimes(1);
+					expect(prompts).toEqual([]);
+				} else if (mutation === "delivery") {
+					expect(prompts[0]).toMatchObject({
+						id: queued.id,
+						text: "queued during compaction",
+						delivery: targetDelivery,
+					});
+				} else if (mutation === "text") {
+					expect(prompts[0]).toMatchObject({ id: queued.id, text: "edited after compaction" });
+				} else {
+					expect(prompts).toEqual([]);
+				}
+			} finally {
+				gate.resolve();
+				await compactPromise;
+				session.agent.state.isStreaming = false;
+				session.agent.clearAllQueues();
+			}
+		},
+	);
 
 	it("cancels an in-flight auto-compaction when manual compact startup aborts", async () => {
 		// Give the branch something to summarize so auto-compaction reaches the
@@ -956,7 +1285,8 @@ describe("AgentSession auto-compaction queue resume", () => {
 		expect(capturedIsCompacting).toBe(true);
 	});
 
-	it("forwards todo reminder lifecycle signals to extensions", async () => {
+	it("does not emit todo reminder lifecycle signals or continue automatically", async () => {
+		vi.spyOn(session, "getActiveToolNames").mockReturnValue(["todo"]);
 		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
 
 		session.setTodoPhases([
@@ -966,9 +1296,9 @@ describe("AgentSession auto-compaction queue resume", () => {
 			},
 		]);
 
-		const { promise: reminderDone, resolve: onReminderDone } = Promise.withResolvers<void>();
+		const { promise: agentEnd, resolve: onAgentEnd } = Promise.withResolvers<void>();
 		session.subscribe(event => {
-			if (event.type === "todo_reminder") onReminderDone();
+			if (event.type === "agent_end") onAgentEnd();
 		});
 
 		const assistantMsg = {
@@ -993,11 +1323,11 @@ describe("AgentSession auto-compaction queue resume", () => {
 		session.agent.emitExternalEvent({ type: "message_end", message: assistantMsg });
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
 
-		await withTimeout(reminderDone, 1000, "Todo reminder timed out");
+		await withTimeout(agentEnd, 1000, "Agent end timed out");
 		await Promise.resolve();
 
-		expect(getRuntimeSignals()).toContain("todo:1/3");
-		expect(continueSpy).toHaveBeenCalledTimes(1);
+		expect(getRuntimeSignals().some(signal => signal.startsWith("todo:"))).toBe(false);
+		expect(continueSpy).not.toHaveBeenCalled();
 		await session.waitForIdle();
 	});
 });

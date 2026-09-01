@@ -429,7 +429,7 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 		expect(JSON.parse(result.output)).toEqual({ finished: "validated" });
 	});
 
-	it("does not finalize rejected yield arguments after crossing the soft request budget", async () => {
+	it("does not retry rejected yield arguments after crossing the soft request budget", async () => {
 		const settings = Settings.isolated({ "task.softRequestBudget": 1 });
 		const firstAssistantMessage = {
 			role: "assistant" as const,
@@ -551,24 +551,14 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 		});
 
 		expect(abortCountBeforeRejectedYieldExecutionEnd).toBe(0);
-		expect(abortCountBeforeValidYieldExecutionEnd).toBe(0);
-		expect(promptCalls.length).toBeGreaterThanOrEqual(2);
-		expect(promptCalls[1]?.options?.synthetic).toBe(true);
+		expect(abortCountBeforeValidYieldExecutionEnd).toBeUndefined();
+		expect(promptCalls).toHaveLength(1);
 		expect(result.aborted).toBe(false);
 		expect(result.exitCode).toBe(0);
-		expect(result.requests).toBe(3);
+		expect(result.requests).toBe(2);
 		expect(result.abortReason).toBeUndefined();
-		expect(JSON.parse(result.output)).toEqual({ finished: "validated-later" });
-		expect(result.extractedToolData?.yield).toEqual([
-			{
-				data: { finished: "validated-later" },
-				status: "success",
-				error: undefined,
-				type: undefined,
-				useLastTurn: undefined,
-				schemaOverridden: undefined,
-			},
-		]);
+		expect(result.output).toBe("finishing the task");
+		expect(result.extractedToolData?.yield).toBeUndefined();
 	});
 
 	it("resumes the hard budget guard after an incremental yield commits", async () => {

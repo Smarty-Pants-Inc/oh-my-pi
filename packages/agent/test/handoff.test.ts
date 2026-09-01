@@ -2,8 +2,8 @@ import { afterEach, describe, expect, test, vi } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
 import type { AgentMessage, AgentTool } from "@oh-my-pi/pi-agent-core";
 import {
+	collectCompactionContextInstructions,
 	createCompactionSummaryMessage,
-	defaultConvertToLlm,
 	generateHandoff,
 	generateHandoffFromContext,
 	renderHandoffPrompt,
@@ -75,11 +75,9 @@ describe("handoff summary injection", () => {
 
 	function convertedText(method: string | undefined): string {
 		const message = createCompactionSummaryMessage(document, 1000, new Date().toISOString(), { method });
-		const [converted] = defaultConvertToLlm([message]);
-		if (!converted || !Array.isArray(converted.content)) throw new Error("Expected converted content blocks");
-		const block = converted.content[0];
-		if (block?.type !== "text") throw new Error("Expected leading text block");
-		return block.text;
+		const [instruction] = collectCompactionContextInstructions([message], "main");
+		if (!instruction) throw new Error("Expected compaction context instruction");
+		return instruction.renderedText;
 	}
 
 	test("handoff-method summary is framed as the successor's own prior handoff", () => {

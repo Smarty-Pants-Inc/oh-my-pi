@@ -7,7 +7,14 @@
  * compaction item as replacement history.
  */
 
-import type { Api, CodexCompactionContext, FetchImpl, Model, ProviderSessionState } from "@oh-my-pi/pi-ai";
+import type {
+	Api,
+	CacheRetention,
+	CodexCompactionContext,
+	FetchImpl,
+	Model,
+	ProviderSessionState,
+} from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { applyCodexResponsesLiteShape } from "@oh-my-pi/pi-ai/providers/openai-codex/request-transformer";
 import {
@@ -81,6 +88,7 @@ export interface CompactionV2Request {
 	reasoning?: { effort: string; summary: string };
 	sessionId?: string;
 	promptCacheKey?: string;
+	cacheRetention?: CacheRetention;
 }
 
 /** Response collected from the V2 stream and converted into replacement history. */
@@ -201,6 +209,7 @@ export function buildCompactionV2Request(
 		reasoning?: { effort: string; summary: string };
 		sessionId?: string;
 		promptCacheKey?: string;
+		cacheRetention?: CacheRetention;
 		retainedMessageBudget?: number;
 	},
 ): CompactionV2Request {
@@ -213,6 +222,7 @@ export function buildCompactionV2Request(
 		tools: options?.tools,
 		sessionId: options?.sessionId,
 		promptCacheKey: options?.promptCacheKey,
+		cacheRetention: options?.cacheRetention,
 	};
 }
 
@@ -254,6 +264,7 @@ export async function requestCompactionV2Streaming(
 		isCodexResponses && !shouldUseCodexProviderTransport(model)
 			? createOpenAICodexCompatibilityMetadata({
 					sessionId: request.sessionId,
+					cacheRetention: request.cacheRetention,
 					providerSessionState: options?.providerSessionState,
 					requestKind: "compaction",
 					compaction: createOpenAICodexCompactionRequestContext({
@@ -313,7 +324,11 @@ async function attemptCompactionV2Streaming(
 	// Faithful to Codex: append the compaction trigger as the final input item
 	// of an otherwise-normal Responses request, then stream the result. `store`
 	// stays false — compaction must never persist a server-side response object.
-	const cacheOptions = { sessionId: request.sessionId, promptCacheKey: request.promptCacheKey };
+	const cacheOptions = {
+		cacheRetention: request.cacheRetention,
+		sessionId: request.sessionId,
+		promptCacheKey: request.promptCacheKey,
+	};
 	const promptCacheKey = getOpenAIPromptCacheKey(cacheOptions);
 	const body: OpenAICodexCompactionBody = {
 		model: request.model,
@@ -349,6 +364,7 @@ async function attemptCompactionV2Streaming(
 			signal,
 			fetch: fetchImpl,
 			sessionId: request.sessionId,
+			cacheRetention: request.cacheRetention,
 			providerSessionState: options.providerSessionState,
 			preferWebsockets: options.preferWebsockets,
 			responsesLite: model.useResponsesLite,
@@ -395,7 +411,11 @@ function buildCompactionV2Headers(
 	codexMetadata?: OpenAICodexCompatibilityMetadata,
 ): Record<string, string> {
 	const api = compactionV2Api(model);
-	const cacheOptions = { sessionId: request.sessionId, promptCacheKey: request.promptCacheKey };
+	const cacheOptions = {
+		cacheRetention: request.cacheRetention,
+		sessionId: request.sessionId,
+		promptCacheKey: request.promptCacheKey,
+	};
 	const routingSessionId = getOpenAIResponsesRoutingSessionId(cacheOptions);
 	const promptCacheSessionId = getOpenAIPromptCacheKey(cacheOptions);
 	const headers: Record<string, string> =

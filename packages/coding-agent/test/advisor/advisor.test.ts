@@ -3824,13 +3824,24 @@ describe("advisor", () => {
 			expect(failures).toEqual([]);
 		});
 
-		it("surfaces a persistent classifier refusal after one stripped resend", async () => {
+		it("retains prior regex collisions across a persistent classifier refusal", async () => {
 			const promptInputs: Array<string | AgentMessage[]> = [];
 			const failures: unknown[] = [];
 			const state: { messages: AgentMessage[]; error?: string } = { messages: [] };
+			let shouldRefuse = false;
 			const agent: AdvisorAgent = {
 				prompt: async input => {
 					promptInputs.push(input);
+					if (!shouldRefuse) {
+						state.error = undefined;
+						state.messages.push({
+							role: "assistant",
+							content: [],
+							stopReason: "stop",
+							timestamp: promptInputs.length + 1,
+						} as unknown as AgentMessage);
+						return;
+					}
 					state.error = "Refusal (reasoning_extraction): reasoning may not be echoed";
 					state.messages.push({
 						role: "assistant",
@@ -3842,19 +3853,30 @@ describe("advisor", () => {
 					} as unknown as AgentMessage);
 				},
 				abort: () => {},
-				reset: () => {},
+				reset: () => {
+					state.messages.length = 0;
+					state.error = undefined;
+				},
 				rollbackTo: count => {
 					state.messages.length = count;
 					state.error = undefined;
 				},
 				state,
 			};
+			const regexSecret = "tok_abc123";
+			const obfuscator = new SecretObfuscator(
+				[
+					{ type: "plain", content: "OTHERSECRET", friendlyName: "TOKABC123" },
+					{ type: "regex", content: "tok_[a-z0-9]+", mode: "replace" },
+				],
+				"test-key",
+			);
 			const messages = [
 				{
 					role: "assistant",
 					content: [
 						{ type: "thinking", thinking: "private reasoning" },
-						{ type: "text", text: "answer" },
+						{ type: "text", text: `answer with ${regexSecret}` },
 					],
 					timestamp: 1,
 				} as AgentMessage,
@@ -3865,17 +3887,40 @@ describe("advisor", () => {
 					snapshotMessages: () => messages,
 					enqueueAdvice: () => {},
 					notifyFailure: error => failures.push(error),
+					obfuscator,
 				},
 				0,
 			);
 
 			runtime.onTurnEnd(messages);
+			await settleUntil(() => promptInputs.length === 1 && runtime.backlog === 0);
+			expect(state.messages).toHaveLength(1);
+			shouldRefuse = true;
+			messages.push({
+				role: "assistant",
+				content: [
+					{ type: "thinking", thinking: "more private reasoning" },
+					{ type: "text", text: "second answer" },
+				],
+				timestamp: 2,
+			} as AgentMessage);
+			runtime.onTurnEnd(messages);
 			await settleUntil(() => failures.length === 1 && runtime.backlog === 0);
 
-			expect(promptInputs).toHaveLength(2);
-			expect(promptText(promptInputs[0])).toContain("private reasoning");
-			expect(promptText(promptInputs[1])).not.toContain("private reasoning");
+			expect(promptInputs).toHaveLength(3);
+			expect(promptText(promptInputs[1])).toContain("more private reasoning");
+			expect(promptText(promptInputs[2])).not.toContain("more private reasoning");
 			expect(failures).toHaveLength(1);
+			expect(state.messages).toHaveLength(1);
+			const retained = new Set<string>();
+			runtime.copyRetainedRegexSecretValuesTo(retained);
+			expect(retained).toContain(regexSecret);
+
+			runtime.reset("conversation-boundary", { clearRetainedRegexSecretValues: true });
+			const afterReset = new Set<string>();
+			runtime.copyRetainedRegexSecretValuesTo(afterReset);
+			expect(afterReset).toEqual(new Set());
+			expect(state.messages).toEqual([]);
 		});
 
 		it("asks the host to switch models when a refusal outlives the stripped resend", async () => {
@@ -4745,6 +4790,49 @@ describe("advisor", () => {
 			expect(promptInputs).toHaveLength(2);
 			expect(promptText(promptInputs[1])).toContain("new-conversation");
 			expect(promptText(promptInputs[1])).not.toContain("old-conversation");
+		});
+
+		it("does not report success when a reset-aborted advisor prompt resolves", async () => {
+			const firstPromptStarted = Promise.withResolvers<void>();
+			const promptGate = Promise.withResolvers<void>();
+			const state: { messages: AgentMessage[] } = { messages: [] };
+			let successCalls = 0;
+			const agent: AdvisorAgent = {
+				prompt: () => {
+					firstPromptStarted.resolve();
+					return promptGate.promise;
+				},
+				reset: () => {
+					state.messages.length = 0;
+				},
+				abort: () => {
+					state.messages.push({
+						role: "assistant",
+						content: [{ type: "text", text: "aborted output" }],
+						stopReason: "aborted",
+						timestamp: 2,
+					} as unknown as AgentMessage);
+					promptGate.resolve();
+				},
+				state,
+			};
+			const messages: AgentMessage[] = [{ role: "user", content: "old-conversation", timestamp: 1 } as AgentMessage];
+			const runtime = new AdvisorRuntime(agent, {
+				snapshotMessages: () => messages,
+				enqueueAdvice: () => {},
+				onTurnSuccess: () => {
+					successCalls++;
+				},
+			});
+
+			runtime.onTurnEnd(messages);
+			await firstPromptStarted.promise;
+			runtime.reset();
+			await new Promise<void>(resolve => setImmediate(resolve));
+
+			expect(state.messages).toHaveLength(1);
+			expect(runtime.backlog).toBe(0);
+			expect(successCalls).toBe(0);
 		});
 
 		it("retries the interrupted batch after a session transition rolls back", async () => {

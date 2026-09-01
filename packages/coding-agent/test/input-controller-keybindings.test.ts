@@ -100,19 +100,23 @@ async function createContext() {
 	const prompt = vi.fn(async () => {});
 	const retry = vi.fn(async () => true);
 	const abort = vi.fn(async () => {});
+	let extensionRunner: unknown;
 	const session = {
 		isStreaming: false,
 		isCompacting: false,
 		isGeneratingHandoff: false,
 		isBashRunning: false,
 		isEvalRunning: false,
-		extensionRunner: undefined,
+		get extensionRunner() {
+			return extensionRunner;
+		},
 		prompt,
 		queuedMessageCount: 0,
 		abort,
 		retry,
 	};
 	const updatePendingMessagesDisplay = vi.fn();
+	const editQueuedPrompts = vi.fn();
 	const handleBtwBranchKey = vi.fn(async () => true);
 	const handleBtwCopyKey = vi.fn(async () => true);
 	const canBranchBtw = vi.fn(() => false);
@@ -209,6 +213,7 @@ async function createContext() {
 			}
 		},
 		updatePendingMessagesDisplay,
+		editQueuedPrompts,
 		isBashMode: false,
 		isPythonMode: false,
 		hideToolActivity: false,
@@ -251,11 +256,15 @@ async function createContext() {
 		setKeybinding(action: string, keys: KeyId[]) {
 			keyMap[action] = keys;
 		},
+		setExtensionRunner(value: unknown) {
+			extensionRunner = value;
+		},
 		spies: {
 			setActionKeys,
 			showModelSelector,
 			prompt,
 			updatePendingMessagesDisplay,
+			editQueuedPrompts,
 			requestRender,
 			retry,
 			abort,
@@ -297,6 +306,52 @@ describe("InputController keybinding setup", () => {
 		expect(spies.showModelSelector).toHaveBeenNthCalledWith(1, { temporaryOnly: true });
 		expect(spies.showModelSelector).toHaveBeenNthCalledWith(2);
 		expect(spies.resetDisplayAfterAppearanceRefresh).toHaveBeenCalledTimes(1);
+	});
+
+	it("opens the native queue manager on the shipped Shift+Up chord without an extension", async () => {
+		const { InputController, ctx, customHandlers, setKeybinding, spies } = await createContext();
+		const controller = new InputController(ctx);
+
+		setKeybinding("app.message.dequeue", ["alt+up", "shift+up"]);
+		controller.setupKeyHandlers();
+		expect(customHandlers.has("shift+up")).toBe(true);
+		expect(customHandlers.has("alt+up")).toBe(false);
+		customHandlers.get("shift+up")?.();
+		expect(spies.editQueuedPrompts).toHaveBeenCalledTimes(1);
+
+		setKeybinding("app.message.dequeue", ["alt+up"]);
+		controller.setupKeyHandlers();
+		expect(customHandlers.has("shift+up")).toBe(false);
+	});
+
+	it("honors an extension shortcut's app-keybinding guard", async () => {
+		const { InputController, ctx, customHandlers, setExtensionRunner, setKeybinding } = await createContext();
+		const shortcutHandler = vi.fn();
+		const shortcut = {
+			shortcut: "shift+up",
+			whenKeybinding: "app.message.dequeue",
+			description: "Edit queued prompt delivery timing",
+			handler: shortcutHandler,
+			extensionPath: "/test/prompt-steering.ts",
+		};
+		const shortcuts = new Map<string, typeof shortcut>();
+		shortcuts.set("shift+up", shortcut);
+		setExtensionRunner({
+			getShortcuts: () => shortcuts,
+			createCommandContext: () => ({}),
+			emitError: vi.fn(),
+		});
+		const controller = new InputController(ctx);
+
+		setKeybinding("app.message.dequeue", ["alt+up"]);
+		controller.setupKeyHandlers();
+		expect(customHandlers.has("shift+up")).toBe(false);
+
+		setKeybinding("app.message.dequeue", ["alt+up", "shift+up"]);
+		controller.setupKeyHandlers();
+		expect(customHandlers.has("shift+up")).toBe(true);
+		customHandlers.get("shift+up")?.();
+		expect(shortcutHandler).toHaveBeenCalledTimes(1);
 	});
 
 	it("registers the tool activity visibility action", async () => {

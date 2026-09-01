@@ -22,6 +22,7 @@ import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream"
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { bindRenderedInstruction } from "@oh-my-pi/pi-coding-agent/context/registry";
 import * as memoryBackend from "@oh-my-pi/pi-coding-agent/memory-backend";
 import type { MemoryBackend } from "@oh-my-pi/pi-coding-agent/memory-backend/types";
 import { type MnemopiSessionState, setMnemopiSessionState } from "@oh-my-pi/pi-coding-agent/mnemopi/state";
@@ -338,13 +339,15 @@ describe("AgentSession message pipeline", () => {
 
 			expect(contexts).toHaveLength(1);
 			const userMessage = contexts[0]!.messages.find(message => message.role === "user");
-			// The date/cwd reminder rides on the first user turn (#7404); the contract
-			// here is that the undecodable WebP is replaced by the placeholder text.
+			// OMP-authored date/cwd context uses the typed instruction channel; the
+			// user message retains only user content plus the image placeholder.
 			expect(userMessage?.content).toEqual([
-				{ type: "text", text: expect.stringContaining("<system-reminder>") },
 				{ type: "text", text: "inspect this" },
 				{ type: "text", text: "[image omitted: WebP could not be decoded for this model]" },
 			]);
+			expect(contexts[0]!.instructions).toContainEqual(
+				expect.objectContaining({ id: "system.date-cwd-reminder", role: "internal_context" }),
+			);
 		} finally {
 			await session.dispose();
 			authStorage.close();
@@ -407,6 +410,7 @@ describe("AgentSession message pipeline", () => {
 		expect(requestOnPayload).toHaveBeenCalledWith({ original: true, session: true }, undefined);
 		expect(result).toEqual({ original: true, session: true });
 	});
+
 	it("keeps ephemeral side-channel cache key separate from provider routing while preserving websocket state", async () => {
 		const api = "test-ephemeral-side-channel";
 		let capturedOptions: SimpleStreamOptions | undefined;
@@ -681,6 +685,79 @@ describe("AgentSession message pipeline", () => {
 		expect(capturedContext).toBeDefined();
 		// The secret entered only via the user prompt, which the opt-in obfuscator redacts.
 		expect(JSON.stringify(capturedContext)).not.toContain(secret);
+	});
+
+	it("shares replace-regex values between SDK messages and registered instructions", async () => {
+		using tempDir = TempDir.createSync("@pi-sdk-obfuscation-context-");
+		const api = "test-sdk-obfuscation-context";
+		const regexSecret = "ABC12345";
+		const plainSecret = "OTHERSECRET";
+		let capturedContext: Context | undefined;
+		registerCustomApi(api, (_model, requestContext) => {
+			capturedContext = requestContext;
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const message = createAssistantMessage("ok");
+				stream.push({ type: "text_delta", contentIndex: 0, delta: "ok", partial: message });
+				stream.push({ type: "done", reason: "stop", message });
+			});
+			return stream;
+		});
+		await Bun.write(
+			tempDir.join(".omp/secrets.yml"),
+			[
+				"- type: plain",
+				`  content: ${plainSecret}`,
+				`  friendlyName: ${regexSecret}`,
+				"- type: regex",
+				'  content: "(?<=token=)[A-Z0-9]{8}"',
+				"  mode: replace",
+				"",
+			].join("\n"),
+		);
+		const model = buildModel({
+			id: "sdk-obfuscation-context",
+			name: "SDK Obfuscation Context",
+			api,
+			provider: "test-provider",
+			baseUrl: "",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 4096,
+			maxTokens: 1024,
+		} as ModelSpec<Api>) as Model<Api>;
+		const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
+		authStorage.setRuntimeApiKey(model.provider, "test-key");
+		const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
+		const { session: sdkSession } = await createAgentSession({
+			cwd: tempDir.path(),
+			agentDir: tempDir.path(),
+			sessionManager: SessionManager.inMemory(tempDir.path()),
+			authStorage,
+			modelRegistry,
+			settings: Settings.isolated({ "compaction.enabled": false, "secrets.enabled": true }),
+			model,
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			skipPythonPreflight: true,
+			contextInstructions: [bindRenderedInstruction("todo.snapshot", `Instruction contains ${plainSecret}`, "main")],
+		});
+		try {
+			await sdkSession.prompt(`Use token=${regexSecret}`);
+
+			const serialized = JSON.stringify(capturedContext);
+			expect(serialized).not.toContain(plainSecret);
+			expect(serialized).not.toContain(regexSecret);
+		} finally {
+			await sdkSession.dispose();
+			authStorage.close();
+		}
 	});
 
 	it("keeps obfuscated side-channel stable prefix byte-identical to the main turn", async () => {

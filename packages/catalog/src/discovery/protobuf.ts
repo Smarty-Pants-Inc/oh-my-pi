@@ -36,6 +36,8 @@ export interface MessageCodec<T extends ProtoMessage = ProtoMessage> {
 	encode(value: T): Uint8Array;
 	/** Decodes one protobuf message from wire bytes. */
 	decode(value: Uint8Array): T;
+	/** Converts protobuf JSON into a typed message. */
+	fromJson(value: JsonValue): T;
 	/** Converts a message to its protobuf JSON representation. */
 	toJson(value: T): JsonValue;
 }
@@ -47,6 +49,7 @@ export type InferMessage<TCodec> = TCodec extends MessageCodec<infer TMessage> ?
 export interface MessageReference {
 	encode(value: unknown): Uint8Array;
 	decode(value: Uint8Array): ProtoMessage;
+	fromJson(value: JsonValue): ProtoMessage;
 	toJson(value: unknown): JsonValue;
 }
 
@@ -64,10 +67,12 @@ export type ScalarKind =
 
 export type WireType = 0 | 1 | 2 | 5;
 
+export type EnumReference = Readonly<Record<string, number>>;
+
 export interface ScalarFieldDesc {
 	readonly no: number;
 	readonly name: string;
-	readonly kind: ScalarKind;
+	readonly kind: Exclude<ScalarKind, "enum">;
 	readonly optional?: boolean;
 	readonly repeat?: boolean;
 }
@@ -84,20 +89,25 @@ export interface EnumFieldDesc {
 	readonly no: number;
 	readonly name: string;
 	readonly kind: "enum";
+	readonly E: () => EnumReference;
 	readonly optional?: boolean;
 	readonly repeat?: boolean;
 }
 
-export interface MapFieldDesc {
+export type MapFieldDesc = {
 	readonly no: number;
 	readonly name: string;
 	readonly kind: "map";
 	readonly K: "string";
-	readonly V: ScalarKind | (() => MessageReference);
-}
+} & (
+	| { readonly V: Exclude<ScalarKind, "enum"> }
+	| { readonly V: "enum"; readonly E: () => EnumReference }
+	| { readonly V: () => MessageReference }
+);
 
 export type VariantDesc =
-	| { readonly no: number; readonly name: string; readonly kind: ScalarKind }
+	| { readonly no: number; readonly name: string; readonly kind: Exclude<ScalarKind, "enum"> }
+	| { readonly no: number; readonly name: string; readonly kind: "enum"; readonly E: () => EnumReference }
 	| { readonly no: number; readonly name: string; readonly kind: "message"; readonly T: () => MessageReference };
 
 export interface OneofFieldDesc {
@@ -114,6 +124,7 @@ interface ValueCodec<TValue> {
 	readonly defaultValue: TValue | undefined;
 	encode(value: unknown, writer: Writer): void;
 	decode(reader: Reader): TValue;
+	fromJson(value: JsonValue): TValue;
 	toJson(value: unknown): JsonValue;
 	isDefault(value: unknown): boolean;
 }
@@ -122,6 +133,7 @@ interface CompiledField {
 	readonly number: number;
 	encode(message: object, writer: Writer): void;
 	decode(message: object, reader: Reader, wireType: WireType, fieldNumber: number): void;
+	fromJson(message: object, input: { [key: string]: JsonValue }): void;
 	toJson(message: object, output: { [key: string]: JsonValue }): void;
 	initDefault(message: object): void;
 }
@@ -146,6 +158,7 @@ export function pb<T extends ProtoMessage = ProtoMessage>(
 	codec.create = (value?: Partial<T>): T => getCodec().create(value);
 	codec.encode = (value: T): Uint8Array => getCodec().encode(value);
 	codec.decode = (value: Uint8Array): T => getCodec().decode(value);
+	codec.fromJson = (value: JsonValue): T => getCodec().fromJson(value);
 	codec.toJson = (value: T): JsonValue => getCodec().toJson(value);
 
 	return codec;
@@ -174,6 +187,11 @@ export function toJson<TMessage extends ProtoMessage>(codec: MessageCodec<TMessa
 	return codec.toJson(value);
 }
 
+/** Converts protobuf JSON into a typed message using its codec. */
+export function fromJson<TMessage extends ProtoMessage>(codec: MessageCodec<TMessage>, value: JsonValue): TMessage {
+	return codec.fromJson(value);
+}
+
 /** Encodes a JSON value as `google.protobuf.Value`. */
 export function encodeJsonValue(value: JsonValue): Uint8Array {
 	const writer = new Writer();
@@ -188,6 +206,7 @@ export function decodeJsonValue(value: Uint8Array): JsonValue {
 
 function compileCodec<T extends ProtoMessage>(typeName: string, fieldDescs: readonly FieldDesc[]): MessageCodec<T> {
 	const compiledFields: CompiledField[] = [];
+	const knownJsonFields = new Set<string>();
 	const byNumber = new Map<number, CompiledField>();
 
 	for (const desc of fieldDescs) {
@@ -208,12 +227,17 @@ function compileCodec<T extends ProtoMessage>(typeName: string, fieldDescs: read
 			compiledFields.push(msgHandler);
 			byNumber.set(desc.no, msgHandler);
 		} else {
-			const valCodec = scalarValue(desc.kind);
+			const valCodec = desc.kind === "enum" ? enumValue(desc.E) : scalarValue(desc.kind);
 			const scalarHandler = desc.repeat
 				? compileRepeatedField(desc.name, desc.no, valCodec)
 				: compileSingularField(desc.name, desc.no, valCodec, desc.optional);
 			compiledFields.push(scalarHandler);
 			byNumber.set(desc.no, scalarHandler);
+		}
+		if (desc.kind === "oneof") {
+			for (const variant of desc.variants) knownJsonFields.add(variant.name);
+		} else {
+			knownJsonFields.add(desc.name);
 		}
 	}
 
@@ -277,6 +301,17 @@ function compileCodec<T extends ProtoMessage>(typeName: string, fieldDescs: read
 		return message;
 	};
 
+	codec.fromJson = (value: JsonValue): T => {
+		if (!isJsonObject(value)) throw new Error("Expected protobuf JSON object");
+		for (const key of Object.keys(value)) {
+			if (!knownJsonFields.has(key)) throw new Error(`Unknown protobuf JSON field ${key}`);
+		}
+		const message = (typeName ? { $typeName: typeName } : {}) as T;
+		for (const f of compiledFields) f.initDefault(message);
+		for (const f of compiledFields) f.fromJson(message, value);
+		return message;
+	};
+
 	codec.toJson = (value: T): JsonValue => {
 		const output: { [key: string]: JsonValue } = {};
 		for (const f of compiledFields) {
@@ -310,6 +345,10 @@ function compileSingularField(
 		decode(message, reader, wireType, _fieldNumber) {
 			assertWireType(wireType, value.wireType);
 			Reflect.set(message, name, value.decode(reader));
+		},
+		fromJson(message, input) {
+			const jsonValue = input[name];
+			if (jsonValue !== undefined && jsonValue !== null) Reflect.set(message, name, value.fromJson(jsonValue));
 		},
 		toJson(message, output) {
 			const input = Reflect.get(message, name);
@@ -357,6 +396,16 @@ function compileRepeatedField(name: string, number: number, value: ValueCodec<un
 			assertWireType(wireType, value.wireType);
 			target.push(value.decode(reader));
 		},
+		fromJson(message, input) {
+			const jsonValue = input[name];
+			if (jsonValue === undefined || jsonValue === null) return;
+			if (!Array.isArray(jsonValue)) throw new Error(`Expected array for protobuf JSON field ${name}`);
+			Reflect.set(
+				message,
+				name,
+				jsonValue.map(item => value.fromJson(item)),
+			);
+		},
 		toJson(message, output) {
 			const items = Reflect.get(message, name);
 			if (!Array.isArray(items) || items.length === 0) return;
@@ -369,7 +418,8 @@ function compileMapField(desc: MapFieldDesc): CompiledField {
 	const name = desc.name;
 	const number = desc.no;
 	const key = scalarValue("string");
-	const valCodec = typeof desc.V === "function" ? messageValue(desc.V) : scalarValue(desc.V);
+	const valCodec =
+		typeof desc.V === "function" ? messageValue(desc.V) : desc.V === "enum" ? enumValue(desc.E) : scalarValue(desc.V);
 
 	return {
 		number,
@@ -422,6 +472,16 @@ function compileMapField(desc: MapFieldDesc): CompiledField {
 
 			target[entryKey] = entryValue;
 		},
+		fromJson(message, input) {
+			const jsonValue = input[name];
+			if (jsonValue === undefined || jsonValue === null) return;
+			if (!isJsonObject(jsonValue)) throw new Error(`Expected object for protobuf JSON map ${name}`);
+			const target: { [key: string]: unknown } = {};
+			for (const [entryKey, entryValue] of Object.entries(jsonValue)) {
+				target[entryKey] = valCodec.fromJson(entryValue);
+			}
+			Reflect.set(message, name, target);
+		},
 		toJson(message, output) {
 			const input = Reflect.get(message, name);
 			if (!isMessageObject(input)) return;
@@ -440,7 +500,12 @@ function compileOneofField(desc: OneofFieldDesc): CompiledField {
 	const variantsByNumber = new Map<number, { name: string; codec: ValueCodec<unknown> }>();
 
 	for (const variant of desc.variants) {
-		const codec = variant.kind === "message" ? messageValue(variant.T) : scalarValue(variant.kind);
+		const codec =
+			variant.kind === "message"
+				? messageValue(variant.T)
+				: variant.kind === "enum"
+					? enumValue(variant.E)
+					: scalarValue(variant.kind);
 		variantsByName.set(variant.name, { no: variant.no, codec });
 		variantsByNumber.set(variant.no, { name: variant.name, codec });
 	}
@@ -466,6 +531,16 @@ function compileOneofField(desc: OneofFieldDesc): CompiledField {
 			assertWireType(wireType, variant.codec.wireType);
 			Reflect.set(message, name, { case: variant.name, value: variant.codec.decode(reader) });
 		},
+		fromJson(message, input) {
+			let selected: { case: string; value: unknown } | undefined;
+			for (const [variantName, variant] of variantsByName) {
+				const jsonValue = input[variantName];
+				if (jsonValue === undefined || jsonValue === null) continue;
+				if (selected) throw new Error(`Multiple protobuf JSON oneof values for ${name}`);
+				selected = { case: variantName, value: variant.codec.fromJson(jsonValue) };
+			}
+			if (selected) Reflect.set(message, name, selected);
+		},
 		toJson(message, output) {
 			const oneof = Reflect.get(message, name);
 			if (!oneof || typeof oneof !== "object" || !("case" in oneof) || typeof oneof.case !== "string") return;
@@ -482,7 +557,35 @@ function isPackableScalar(value: ValueCodec<unknown>): boolean {
 	return value.wireType === 0 || value.wireType === 1 || value.wireType === 5;
 }
 
-function scalarValue(kind: ScalarKind): ValueCodec<unknown> {
+function enumValue(E: () => EnumReference): ValueCodec<unknown> {
+	let namesByNumber: Map<number, string> | undefined;
+	return scalar(
+		0,
+		0,
+		requireInt32,
+		(value, writer) => writer.int32(value),
+		reader => reader.int32(),
+		value => {
+			if (!namesByNumber) {
+				namesByNumber = new Map<number, string>();
+				for (const [name, number] of Object.entries(E())) {
+					if (!namesByNumber.has(number)) namesByNumber.set(number, name);
+				}
+			}
+			return namesByNumber.get(value) ?? value;
+		},
+		value => value === 0,
+		value => {
+			if (typeof value === "number") return requireInt32(value);
+			const name = requireString(value);
+			const number = E()[name];
+			if (number === undefined) throw new Error(`Unknown protobuf enum value ${name}`);
+			return requireInt32(number);
+		},
+	);
+}
+
+function scalarValue(kind: Exclude<ScalarKind, "enum">): ValueCodec<unknown> {
 	switch (kind) {
 		case "bool":
 			return scalar(
@@ -502,6 +605,7 @@ function scalarValue(kind: ScalarKind): ValueCodec<unknown> {
 				reader => reader.bytes(),
 				value => value.toBase64(),
 				value => value.byteLength === 0,
+				value => Uint8Array.fromBase64(requireString(value)),
 			);
 		case "double":
 			return scalar(
@@ -510,15 +614,6 @@ function scalarValue(kind: ScalarKind): ValueCodec<unknown> {
 				requireNumber,
 				(value, writer) => writer.double(value),
 				reader => reader.double(),
-				value => value,
-			);
-		case "enum":
-			return scalar(
-				0,
-				0,
-				requireInt32,
-				(value, writer) => writer.int32(value),
-				reader => reader.int32(),
 				value => value,
 			);
 		case "float":
@@ -586,6 +681,7 @@ function scalar<TValue>(
 	read: (reader: Reader) => TValue,
 	toJson: (value: TValue) => JsonValue,
 	isDefault: (value: TValue) => boolean = value => value === defaultValue,
+	fromJson: (value: JsonValue) => TValue = validate,
 ): ValueCodec<TValue> {
 	return {
 		wireType,
@@ -596,6 +692,7 @@ function scalar<TValue>(
 		decode(reader) {
 			return read(reader);
 		},
+		fromJson,
 		toJson(value) {
 			return toJson(validate(value));
 		},
@@ -621,6 +718,9 @@ function messageValue(factory: () => MessageReference): ValueCodec<unknown> {
 		},
 		decode(reader) {
 			return getCodec().decode(reader.bytes());
+		},
+		fromJson(value) {
+			return getCodec().fromJson(value);
 		},
 		toJson(value) {
 			return getCodec().toJson(value);
@@ -726,6 +826,10 @@ function isUnknownField(value: unknown): value is ProtoUnknownField & { wireType
 
 function isMessageObject(value: unknown): value is { [key: string]: unknown } {
 	return isRecord(value) && !(value instanceof Uint8Array);
+}
+
+function isJsonObject(value: JsonValue): value is { [key: string]: JsonValue } {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function isWireType(value: number): value is WireType {

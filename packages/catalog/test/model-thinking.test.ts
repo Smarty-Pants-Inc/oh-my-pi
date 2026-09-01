@@ -1213,26 +1213,37 @@ describe("generic chat-template thinking dialect", () => {
 });
 
 describe("Qwen 3.8 local template effort ladder", () => {
-	it("derives the low/medium/xhigh ladder with mandatory effort on local llama.cpp-style backends", () => {
-		const llamaCpp = createModel({
+	it("marks Qwen3.8-2.4T-A95B mandatory while keeping 27B switchable", () => {
+		const qwen27b = createModel({
 			id: "qwen3.8-27b",
 			api: "openai-completions",
-			provider: "llama.cpp",
-			baseUrl: "http://127.0.0.1:8080/v1",
+			provider: "vllm",
+			baseUrl: "http://127.0.0.1:8000/v1",
 		});
-		// Official 3.8 template: reasoning_effort accepts exactly low/medium/xhigh
-		// and raises on `enable_thinking: false` — off must clamp, never disable.
-		expect(llamaCpp.thinking).toEqual({
+		const qwen24t = createModel({
+			id: "Qwen3.8-2.4T-A95B",
+			api: "openai-completions",
+			provider: "vllm",
+			baseUrl: "http://127.0.0.1:8000/v1",
+		});
+
+		// Both expose the template's wire-exact effort ladder, but only 2.4T
+		// has no thinking-off path.
+		expect(qwen27b.thinking).toEqual({
+			mode: "effort",
+			efforts: [Effort.Low, Effort.Medium, Effort.XHigh],
+		});
+		expect(qwen24t.thinking).toEqual({
 			mode: "effort",
 			efforts: [Effort.Low, Effort.Medium, Effort.XHigh],
 			requiresEffort: true,
 		});
-		expect(llamaCpp.compat.qwenTemplateReasoningEffort).toBe(true);
+		expect(qwen27b.compat.qwenTemplateReasoningEffort).toBe(true);
 		// Unsupported tiers clamp onto real wire tiers: high floors to medium
 		// (xhigh is a deliberate opt-in), minimal floors to low.
-		expect(clampThinkingLevelForModel(llamaCpp, Effort.High)).toBe(Effort.Medium);
-		expect(clampThinkingLevelForModel(llamaCpp, Effort.Minimal)).toBe(Effort.Low);
-		expect(minimumSupportedEffort(llamaCpp)).toBe(Effort.Low);
+		expect(clampThinkingLevelForModel(qwen27b, Effort.High)).toBe(Effort.Medium);
+		expect(clampThinkingLevelForModel(qwen27b, Effort.Minimal)).toBe(Effort.Low);
+		expect(minimumSupportedEffort(qwen27b)).toBe(Effort.Low);
 	});
 
 	it("defaults an effort-less clamp to the tier routing to requestModelId, else the floor (issue #9478)", () => {
@@ -1303,6 +1314,31 @@ describe("Qwen 3.8 local template effort ladder", () => {
 		expect(vllm.compat.thinkingFormat).toBe("qwen-chat-template");
 		expect(vllm.compat.reasoningDisableMode).toBe("qwen-template-false");
 		expect(vllm.compat.qwenTemplateReasoningEffort).toBe(true);
+	});
+
+	it("requires explicit backend metadata for arbitrary vLLM provider ids", () => {
+		const prefixedOnly = createModel({
+			id: "qwen3.8-27b",
+			api: "openai-completions",
+			provider: "vllm-fast",
+			baseUrl: "https://vllm.example.com/v1",
+		});
+		expect(prefixedOnly.compat.thinkingFormat).toBe("qwen");
+		expect(prefixedOnly.compat.reasoningDisableMode).toBe("qwen-enable-thinking-false");
+		expect(prefixedOnly.compat.qwenTemplateReasoningEffort).toBe(false);
+
+		const discoveredVllm = createModel({
+			id: "qwen3.8-27b",
+			api: "openai-completions",
+			provider: "gpu-fast",
+			baseUrl: "https://gpu.example.com/v1",
+			compat: { thinkingFormat: "qwen-chat-template", qwenTemplateReasoningEffort: true },
+		});
+		expect(discoveredVllm.compat).toMatchObject({
+			thinkingFormat: "qwen-chat-template",
+			reasoningDisableMode: "qwen-template-false",
+			qwenTemplateReasoningEffort: true,
+		});
 	});
 
 	it("keeps hosted, pre-3.8, and local-Ollama Qwen off the template ladder", () => {

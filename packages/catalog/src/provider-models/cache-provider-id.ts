@@ -1,8 +1,10 @@
+import type { OpenAICompat } from "../types";
 import { PERSONAL_GITHUB_COPILOT_BASE_URL } from "../wire/github-copilot";
 
 export interface ModelCacheProviderIdOptions {
 	apiKey?: string;
 	baseUrl?: string;
+	compat?: Pick<OpenAICompat, "qwenTemplateReasoningEffort">;
 }
 
 const CREDENTIAL_SCOPED_MODEL_CACHE_PROVIDERS: Readonly<Record<string, true>> = {
@@ -50,6 +52,8 @@ export function resolveOllamaModelCacheProviderId(providerId: string, baseUrl?: 
 
 /** Resolve the cache namespace used by a provider's model-manager options without constructing those options. */
 export function resolveModelCacheProviderId(providerId: string, options: ModelCacheProviderIdOptions = {}): string {
+	const qwenTemplateReasoningVariant =
+		options.compat?.qwenTemplateReasoningEffort === false ? ":qwen-template-effort-off" : "";
 	switch (providerId) {
 		case "ollama":
 			return resolveOllamaModelCacheProviderId(providerId, options.baseUrl);
@@ -65,6 +69,11 @@ export function resolveModelCacheProviderId(providerId: string, options: ModelCa
 			// `wireModelIdMode`) before that leak was fixed (issue #9938).
 			return `litellm:rich-v8:${Bun.hash(baseUrl).toString(36)}`;
 		}
+		case "lm-studio":
+			// Qwen template-effort support is derived into cached reasoning/thinking
+			// metadata, so an explicit opt-out needs its own namespace. Default and
+			// explicit true remain equivalent and keep the existing cache identity.
+			return `lm-studio:models-v2${qwenTemplateReasoningVariant}`;
 		case "opencode-go":
 		case "opencode-zen": {
 			// v3: gateway-first rows cached before stencil enrichment carry null
@@ -90,10 +99,11 @@ export function resolveModelCacheProviderId(providerId: string, options: ModelCa
 		case "openrouter":
 			return "openrouter:pseudo-api";
 		case "vllm": {
-			// v2: qwen3.8 rows cached before the reasoning/template-effort upgrade
-			// carry `reasoning: false` and must be refetched.
+			// v2 invalidated qwen3.8 rows cached before the reasoning/template-effort
+			// upgrade. Keep the backend URL identity while separating explicit opt-out
+			// rows whose derived reasoning/thinking metadata is intentionally absent.
 			const baseUrl = options.baseUrl ?? getDefaultModelDiscoveryBaseUrl(providerId)!;
-			return `vllm:models-v2:${Bun.hash(baseUrl).toString(36)}`;
+			return `vllm:models-v2${qwenTemplateReasoningVariant}:${Bun.hash(baseUrl).toString(36)}`;
 		}
 		default:
 			return providerId;

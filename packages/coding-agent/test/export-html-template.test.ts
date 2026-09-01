@@ -19,9 +19,9 @@ interface TemplateProbeResult {
 }
 
 const expectedTemplate: TemplateProbeResult = {
-	chars: 376_586,
-	bytes: 376_742,
-	sha256: "d1832d9fc1e2033e4d998856bfdd7739aa3be94bff74c21154d7fa6a51788269",
+	chars: 376_637,
+	bytes: 376_793,
+	sha256: "16840e2dea23cc3c66e5d70882b19b3301708d6b498b4074a424ade1f11adaac",
 	stableCache: true,
 	assetsRemoved: 0,
 };
@@ -38,7 +38,8 @@ const bundledDependencyStubs: Record<string, string> = {
 	"@oh-my-pi/pi-utils": 'export const APP_NAME = "omp"; export const isEnoent = () => false;',
 	"../../modes/theme/theme":
 		"export const getResolvedThemeColors = async () => ({}); export const getThemeExportColors = async () => ({});",
-	"../../session/session-loader": "export const loadEntriesFromFile = async () => [];",
+	"../../session/session-loader":
+		"export const loadEntriesFromFile = async () => []; export const restoreSessionJournal = () => ({ entries: [] });",
 	"../../session/session-manager":
 		"export class SessionManager { static async open() { return new SessionManager(); } }",
 	"./args": "export const parseExportArgs = () => undefined;",

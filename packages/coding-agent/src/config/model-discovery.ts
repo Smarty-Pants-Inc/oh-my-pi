@@ -593,6 +593,15 @@ export function applyLlamaCppQwenThinking(model: Model<Api>): Model<Api> {
 	} as unknown as ModelSpec<Api>);
 }
 
+/** Restore the reasoning ladder when local Qwen compat proves template effort support. */
+export function normalizeQwenTemplateReasoning(model: Model<Api>): Model<Api> {
+	const compat = model.compat as OpenAICompat | undefined;
+	if (model.api !== "openai-completions" || model.reasoning || compat?.qwenTemplateReasoningEffort !== true) {
+		return model;
+	}
+	return buildModel({ ...model, reasoning: true, compat: model.compatConfig ?? compat } as ModelSpec<Api>);
+}
+
 export async function discoverLlamaCppModels(
 	providerConfig: DiscoveryProviderConfig,
 	ctx: DiscoveryContext,
@@ -843,6 +852,7 @@ export async function discoverOpenAIModelsList(
 				return (await res.json()) as {
 					data?: Array<{
 						id?: string;
+						owned_by?: unknown;
 						max_model_len?: unknown;
 						context_length?: unknown;
 						input?: unknown;
@@ -881,6 +891,11 @@ export async function discoverOpenAIModelsList(
 			providerConfig.discovery.type === "litellm"
 				? resolveLiteLLMApi(undefined, id, providerConfig.api)
 				: providerConfig.api;
+		const isVllmBackend =
+			api === "openai-completions" &&
+			providerConfig.discovery.type !== "lm-studio" &&
+			typeof item.owned_by === "string" &&
+			item.owned_by.trim().toLowerCase() === "vllm";
 		const contextWindow =
 			toPositiveNumberOrUndefined(item.max_model_len) ??
 			toPositiveNumberOrUndefined(item.context_length) ??
@@ -920,6 +935,8 @@ export async function discoverOpenAIModelsList(
 					...(referenceCompat?.omitReasoningEffort !== undefined
 						? { omitReasoningEffort: referenceCompat.omitReasoningEffort }
 						: {}),
+					...(isVllmBackend && isQwenModelId(id) ? { thinkingFormat: "qwen-chat-template" as const } : {}),
+					...(isVllmBackend && isQwen38PlusTemplateEffortModelId(id) ? { qwenTemplateReasoningEffort: true } : {}),
 				},
 			} as ModelSpec<Api>),
 		);

@@ -5,6 +5,7 @@ import * as path from "node:path";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ClientBridge } from "@oh-my-pi/pi-coding-agent/session/client-bridge";
+import type { ExecutionEnvironmentBinding } from "@oh-my-pi/pi-coding-agent/session/execution-environment";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import type { ReadToolDetails } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
@@ -19,7 +20,11 @@ function textOutput(result: AgentToolResult<ReadToolDetails>): string {
 		.join("\n");
 }
 
-function createSession(cwd: string, bridge?: ClientBridge): ToolSession {
+function createSession(
+	cwd: string,
+	bridge?: ClientBridge,
+	executionEnvironment?: ExecutionEnvironmentBinding,
+): ToolSession {
 	return {
 		cwd,
 		hasUI: false,
@@ -29,6 +34,24 @@ function createSession(cwd: string, bridge?: ClientBridge): ToolSession {
 		allocateOutputArtifact: async () => ({ id: "artifact-1", path: path.join(cwd, "artifact-1.log") }),
 		settings: Settings.isolated(),
 		getClientBridge: bridge ? () => bridge : undefined,
+		getExecutionEnvironment: executionEnvironment ? () => executionEnvironment : undefined,
+	};
+}
+
+function createEnvironment(
+	readTextFile: ExecutionEnvironmentBinding["bridge"]["readTextFile"],
+): ExecutionEnvironmentBinding {
+	return {
+		id: "test-environment",
+		sourceRoot: "/local/worktree",
+		remoteRoot: "/workspace",
+		bridge: {
+			readTextFile,
+			writeTextFile: async () => {},
+			createTerminal: async () => {
+				throw new Error("terminal must not be created by read");
+			},
+		},
 	};
 }
 
@@ -87,6 +110,20 @@ describe("read tool ACP fs routing", () => {
 		}
 	});
 
+	it("preserves literal path identity when the ACP bridge returns early", async () => {
+		const filePath = path.join(tmpDir, "foo:100");
+		await fs.writeFile(filePath, "disk content\n");
+		const bridge: ClientBridge = {
+			capabilities: { readTextFile: true },
+			readTextFile: async () => "bridge content\n",
+		};
+
+		const result = await new ReadTool(createSession(tmpDir, bridge)).execute("literal-bridge", { path: "foo:100" });
+
+		expect(textOutput(result)).toContain("bridge content");
+		expect(result.details).toMatchObject({ resolvedPath: filePath, isDirectory: false, literalPath: true });
+	});
+
 	it("applies requested line ranges to bridge content exactly once", async () => {
 		const filePath = path.join(tmpDir, "range.txt");
 		await fs.writeFile(filePath, "disk one\ndisk two\ndisk three\n");
@@ -110,5 +147,102 @@ describe("read tool ACP fs routing", () => {
 		expect(text).toContain("bridge two");
 		expect(text).not.toContain("Line 2 is beyond end");
 		expect(text).not.toContain("disk two");
+	});
+});
+
+describe("read tool execution environment routing", () => {
+	it("reads and formats remote code through exactly one bridge call without local file access", async () => {
+		const bridge = createEnvironment(async () =>
+			[
+				"export function alpha(): string {",
+				"\tconst value = 'remote';",
+				"\treturn value;",
+				"}",
+				"",
+				"export function beta(): number {",
+				"\tconst value = 2;",
+				"\treturn value;",
+				"}",
+			].join("\n"),
+		);
+		const bridgeSpy = spyOn(bridge.bridge, "readTextFile");
+		const localFileSpy = spyOn(Bun, "file").mockImplementation((() => {
+			throw new Error("environment read must not access local files");
+		}) as typeof Bun.file);
+		try {
+			const result = await new ReadTool(createSession("/local/worktree", undefined, bridge)).execute(
+				"environment-read",
+				{
+					path: "src/remote.ts",
+				},
+			);
+
+			expect(bridgeSpy).toHaveBeenCalledTimes(1);
+			expect(bridgeSpy).toHaveBeenCalledWith({ path: "/workspace/src/remote.ts" });
+			expect(textOutput(result)).toContain("export function alpha");
+			expect(result.details?.resolvedPath).toBe("/workspace/src/remote.ts");
+		} finally {
+			localFileSpy.mockRestore();
+		}
+	});
+
+	it("surfaces environment bridge failures without probing or falling back to the local workspace", async () => {
+		const bridge = createEnvironment(async () => {
+			throw new Error("remote file rejected");
+		});
+		const bridgeSpy = spyOn(bridge.bridge, "readTextFile");
+		const localFileSpy = spyOn(Bun, "file").mockImplementation((() => {
+			throw new Error("environment read must not access local files");
+		}) as typeof Bun.file);
+		try {
+			const tool = new ReadTool(createSession("/local/worktree", undefined, bridge));
+			await expect(tool.execute("environment-error", { path: "src/remote.ts" })).rejects.toThrow(
+				"remote file rejected",
+			);
+			expect(bridgeSpy).toHaveBeenCalledTimes(1);
+		} finally {
+			localFileSpy.mockRestore();
+		}
+	});
+
+	it("rejects unsupported and escaping environment targets before bridge or local filesystem access", async () => {
+		const bridge = createEnvironment(async () => "must not be read");
+		const bridgeSpy = spyOn(bridge.bridge, "readTextFile");
+		const localFileSpy = spyOn(Bun, "file").mockImplementation((() => {
+			throw new Error("environment read must not access local files");
+		}) as typeof Bun.file);
+		try {
+			const tool = new ReadTool(createSession("/local/worktree", undefined, bridge));
+			await expect(tool.execute("environment-archive", { path: "archive.zip:member.txt" })).rejects.toThrow(
+				"Archive paths",
+			);
+			await expect(tool.execute("environment-escape", { path: "../outside.ts" })).rejects.toThrow(
+				"outside the workspace",
+			);
+			expect(bridgeSpy).not.toHaveBeenCalled();
+		} finally {
+			localFileSpy.mockRestore();
+		}
+	});
+
+	it("keeps ACP's existing local fallback when no environment is active", async () => {
+		const localDir = await fs.mkdtemp(path.join(os.tmpdir(), "read-acp-fallback-"));
+		try {
+			const localFile = path.join(localDir, "acp-fallback.txt");
+			await fs.writeFile(localFile, "local fallback content\n");
+			const bridge: ClientBridge = {
+				capabilities: { readTextFile: true },
+				readTextFile: async () => {
+					throw new Error("editor buffer unavailable");
+				},
+			};
+
+			const result = await new ReadTool(createSession(localDir, bridge)).execute("acp-fallback", {
+				path: localFile,
+			});
+			expect(textOutput(result)).toContain("local fallback content");
+		} finally {
+			await removeWithRetries(localDir);
+		}
 	});
 });

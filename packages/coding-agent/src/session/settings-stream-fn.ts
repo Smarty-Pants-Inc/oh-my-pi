@@ -11,6 +11,7 @@
  * and OpenRouter response-cache hits across advisor calls.
  */
 import type { StreamFn } from "@oh-my-pi/pi-agent-core";
+import type { SummaryOptions } from "@oh-my-pi/pi-agent-core/compaction";
 import { type SimpleStreamOptions, streamSimple } from "@oh-my-pi/pi-ai";
 import { classifyModel } from "@oh-my-pi/pi-catalog/identity";
 import { type Settings, validateProviderMaxInFlightRequests } from "../config/settings";
@@ -19,6 +20,20 @@ function timeoutSecondsToMs(value: number): number | undefined {
 	if (!Number.isFinite(value) || value < 0) return undefined;
 	if (value === 0) return 0;
 	return Math.max(1, Math.trunc(value * 1000));
+}
+
+/** Resolve the explicit per-request cache setting while preserving provider defaults for `auto`. */
+export function resolveSettingsCacheRetention(settings: Settings): SimpleStreamOptions["cacheRetention"] {
+	const setting = settings.get("providers.cacheRetention");
+	return setting === "auto" ? undefined : setting;
+}
+
+/** Reuse a wrapped stream transport for one-shot completions without bypassing its request policies. */
+export function createCompleteFnFromStreamFn(streamFn: StreamFn): NonNullable<SummaryOptions["completeImpl"]> {
+	return async (model, context, options) => {
+		const stream = await streamFn(model, context, options);
+		return stream.result();
+	};
 }
 
 /**
@@ -43,10 +58,9 @@ export function createSettingsAwareStreamFn(settings: Settings, base: StreamFn =
 					: undefined;
 		// "auto" leaves the option unset so provider defaults and the
 		// PI_CACHE_RETENTION env override keep working; anything else is an
-		// explicit per-request retention (long restores 1h Anthropic TTLs and
-		// implicitly disables the short-entry keep-alive refresh loop).
-		const cacheRetentionSetting = settings.get("providers.cacheRetention");
-		const cacheRetention = cacheRetentionSetting === "auto" ? undefined : cacheRetentionSetting;
+		// explicit per-request retention (long requests each provider's extended
+		// retention and implicitly disables the Anthropic keep-alive refresh loop).
+		const cacheRetention = resolveSettingsCacheRetention(settings);
 		const streamFirstEventTimeoutMs = timeoutSecondsToMs(settings.get("providers.streamFirstEventTimeoutSeconds"));
 		const streamIdleTimeoutMs = timeoutSecondsToMs(settings.get("providers.streamIdleTimeoutSeconds"));
 		// Server-side fallback (opt-in): when the user enables it AND the

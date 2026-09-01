@@ -2,8 +2,11 @@
  * Root command for the coding agent CLI.
  */
 
+import { isBunTestRuntime } from "@oh-my-pi/pi-utils";
 import { Command } from "@oh-my-pi/pi-utils/cli";
 import { type Args as ParsedArgs, parseArgs, reportCliUsageError } from "../cli/args";
+import { takeHerdrHostBridge } from "../collab/herdr-bridge-bootstrap";
+import { ensureApprovedStartup, promptPolicyReviewWarning } from "../context/approved-policy";
 import { runRootCommand } from "../main";
 import { prepareAcpTerminalAuthArgs } from "../modes/acp/terminal-auth";
 import { launchHelp } from "./launch-help";
@@ -18,6 +21,7 @@ export default class Index extends Command {
 	static strict = false;
 
 	async run(): Promise<void> {
+		const herdrHostBridge = takeHerdrHostBridge();
 		const { args } = prepareAcpTerminalAuthArgs(this.argv);
 		let parsed: ParsedArgs;
 		try {
@@ -29,6 +33,21 @@ export default class Index extends Command {
 			}
 			throw error;
 		}
-		await runRootCommand(parsed, args);
+		if (!isBunTestRuntime()) {
+			await runRootCommand(parsed, args, {
+				verifyApprovedStartup: async isInteractive => {
+					try {
+						await ensureApprovedStartup();
+					} catch (error) {
+						const warning = isInteractive ? promptPolicyReviewWarning(error) : undefined;
+						if (!warning) throw error;
+						process.stderr.write(`Warning: ${warning}\n`);
+					}
+				},
+				herdrHostBridge,
+			});
+			return;
+		}
+		await runRootCommand(parsed, args, { herdrHostBridge });
 	}
 }

@@ -48,6 +48,9 @@ export type CompactionQueuedMessage = {
 	text: string;
 	mode: "steer" | "followUp";
 	images?: ImageContent[];
+	/** Submission identity and time used to merge this local queue with the session queue. */
+	id: string;
+	timestamp: number;
 };
 
 export type SubmittedUserInput = {
@@ -67,8 +70,8 @@ export type SubmittedUserInput = {
 	display?: boolean;
 	/** Queue intent if the session is (or becomes) busy when this submission is
 	 *  dispatched: "steer" (interrupt the active turn) or "followUp" (process after
-	 *  it). Normal user Enter carries "steer" to match the streaming-branch Enter;
-	 *  background/continuation submits omit it and default to "followUp". */
+	 *  it). Ordinary Enter and background/continuation submits use "followUp";
+	 *  explicit interrupt paths use "steer". */
 	streamingBehavior?: "steer" | "followUp";
 	cancelled: boolean;
 	started: boolean;
@@ -152,6 +155,12 @@ export interface InteractiveModeContext {
 	mcpManager?: MCPManager;
 	lspServers?: LspStartupServerInfo[];
 	collabHost?: CollabHost;
+	herdrCollabHost?: CollabHost;
+	herdrCollabHostLifecycle?: {
+		stop(reason: string): Promise<void>;
+		suspend(reason: string): Promise<void>;
+		resume(): Promise<void>;
+	};
 	collabGuest?: CollabGuestLink;
 	eventController: EventController;
 	eventBus?: EventBus;
@@ -281,7 +290,7 @@ export interface InteractiveModeContext {
 	 * leak.
 	 */
 	resetTranscript(): void;
-	showStatus(message: string, options?: { dim?: boolean }): void;
+	showStatus(message: string, options?: { dim?: boolean }, rebuild?: () => string): void;
 	showModelCycleTrack(track: string): void;
 	showError(message: string): void;
 	showPinnedError(message: string): void;
@@ -290,6 +299,7 @@ export interface InteractiveModeContext {
 	showNewVersionNotification(newVersion: string): void;
 	clearEditor(): void;
 	updatePendingMessagesDisplay(): void;
+	editQueuedPrompts(): void;
 	queueCompactionMessage(text: string, mode: "steer" | "followUp", images?: ImageContent[]): void;
 	flushCompactionQueue(options?: { willRetry?: boolean }): Promise<void>;
 	flushPendingBashComponents(): void;
@@ -436,7 +446,7 @@ export interface InteractiveModeContext {
 	showCopySelector(): void;
 	showTreeSelector(): void;
 	showSessionSelector(source?: ForeignSessionSource): void;
-	handleResumeSession(sessionPath: string): Promise<void>;
+	handleResumeSession(sessionPath: string): Promise<boolean>;
 	handleSessionDeleteCommand(): Promise<void>;
 	showOAuthSelector(mode: "login" | "logout", providerId?: string): Promise<void>;
 	showSessionPinSelector(): Promise<void>;

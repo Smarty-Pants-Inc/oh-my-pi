@@ -11,7 +11,7 @@
  *     post-prompt recovery, but the loop is already done) must be drained when
  *     the session settles.
  */
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -213,6 +213,172 @@ describe("AgentSession queued steer delivery", () => {
 		expect(mock.calls.length).toBe(3);
 		expect(session.agent.hasQueuedMessages()).toBe(false);
 		expect(session.getQueuedMessages().steering).toEqual([]);
+	});
+
+	it("keeps non-selected prompts visible while a NOW continuation runs", async () => {
+		const { session } = await createSession([
+			{ content: ["active response"], delayMs: 1_000 },
+			{ content: ["interrupt response"], delayMs: 1_000 },
+		]);
+		const activeStarted = Promise.withResolvers<void>();
+		const unsubscribe = session.subscribe(event => {
+			if (event.type === "agent_start") activeStarted.resolve();
+		});
+		const active = session.prompt("active");
+		await activeStarted.promise;
+		unsubscribe();
+		expect(session.isStreaming).toBe(true);
+
+		await session.prompt("keep next", { streamingBehavior: "steer" });
+		await session.prompt("interrupt now", { streamingBehavior: "followUp" });
+		await session.prompt("keep after", { streamingBehavior: "followUp" });
+		const queued = session.getQueuedPrompts();
+		const interruptId = queued.find(prompt => prompt.text === "interrupt now")?.id;
+		const keepAfterId = queued.find(prompt => prompt.text === "keep after")?.id;
+		if (!interruptId || !keepAfterId) throw new Error("Expected queued prompt ids");
+
+		const interruptDelivered = nextUserMessage(session, "interrupt now");
+		expect(await session.setQueuedPromptDelivery(interruptId, "interrupt")).toEqual({ status: "updated" });
+		await interruptDelivered;
+
+		expect(session.isStreaming).toBe(true);
+		expect({
+			prompts: session.getQueuedPrompts().map(prompt => prompt.text),
+			messages: session.getQueuedMessages(),
+			count: session.queuedMessageCount,
+			hasPending: session.hasPendingMessages(),
+			parkedDraft: session.getQueuedPromptDraft(keepAfterId)?.text,
+		}).toEqual({
+			prompts: ["keep next", "keep after"],
+			messages: { steering: ["keep next"], followUp: ["keep after"] },
+			count: 2,
+			hasPending: true,
+			parkedDraft: "keep after",
+		});
+		await active;
+	});
+
+	it("does not abort an active direct continuation for a stale NOW id", async () => {
+		const { session } = await createSession([
+			{ content: ["active response"], delayMs: 1_000 },
+			{ content: ["interrupt response"], delayMs: 1_000 },
+		]);
+		const activeStarted = Promise.withResolvers<void>();
+		const unsubscribe = session.subscribe(event => {
+			if (event.type === "agent_start") activeStarted.resolve();
+		});
+		const active = session.prompt("active");
+		await activeStarted.promise;
+		unsubscribe();
+
+		await session.prompt("interrupt now", { streamingBehavior: "followUp" });
+		await session.prompt("stale now", { streamingBehavior: "followUp" });
+		const queued = session.getQueuedPrompts();
+		const interruptId = queued.find(prompt => prompt.text === "interrupt now")?.id;
+		const staleId = queued.find(prompt => prompt.text === "stale now")?.id;
+		if (!interruptId || !staleId) throw new Error("Expected queued prompt ids");
+		expect(await session.removeQueuedPrompt(staleId)).toEqual({ status: "updated" });
+
+		const interruptDelivered = nextUserMessage(session, "interrupt now");
+		expect(await session.setQueuedPromptDelivery(interruptId, "interrupt")).toEqual({ status: "updated" });
+		await interruptDelivered;
+		expect(session.isStreaming).toBe(true);
+
+		const abort = spyOn(session, "abort");
+		try {
+			expect(await session.setQueuedPromptDelivery(staleId, "interrupt")).toEqual({ status: "stale" });
+			expect(abort).not.toHaveBeenCalled();
+		} finally {
+			abort.mockRestore();
+		}
+		await active;
+	});
+
+	it("lets repeated queued prompts become NOW while a direct continuation runs", async () => {
+		const { session, mock } = await createSession([
+			{ content: ["active response"], delayMs: 1_000 },
+			{ content: ["first interrupt response"], delayMs: 1_000 },
+			{ content: ["late interrupt response"], delayMs: 1_000 },
+			{ content: ["parked interrupt response"] },
+		]);
+		const activeStarted = Promise.withResolvers<void>();
+		const unsubscribe = session.subscribe(event => {
+			if (event.type === "agent_start") activeStarted.resolve();
+		});
+		const active = session.prompt("active");
+		await activeStarted.promise;
+		unsubscribe();
+
+		await session.prompt("first interrupt", { streamingBehavior: "followUp" });
+		await session.prompt("parked interrupt", { streamingBehavior: "followUp" });
+		const initial = session.getQueuedPrompts();
+		const firstId = initial.find(prompt => prompt.text === "first interrupt")?.id;
+		const parkedId = initial.find(prompt => prompt.text === "parked interrupt")?.id;
+		if (!firstId || !parkedId) throw new Error("Expected initial queued prompt ids");
+
+		const firstDelivered = nextUserMessage(session, "first interrupt");
+		expect(await session.setQueuedPromptDelivery(firstId, "interrupt")).toEqual({ status: "updated" });
+		await firstDelivered;
+		expect(session.isStreaming).toBe(true);
+
+		await session.prompt("late interrupt", { streamingBehavior: "followUp" });
+		const lateId = session.getQueuedPrompts().find(prompt => prompt.text === "late interrupt")?.id;
+		if (!lateId) throw new Error("Expected late queued prompt id");
+		session.setLifecycleTransitionFenceForTests(true);
+		expect(await session.setQueuedPromptDelivery(lateId, "interrupt")).toEqual({
+			status: "unavailable",
+			reason: "session_transition",
+		});
+		session.setLifecycleTransitionFenceForTests(false);
+
+		const lateDelivered = nextUserMessage(session, "late interrupt");
+		expect(await session.setQueuedPromptDelivery(lateId, "interrupt")).toEqual({ status: "updated" });
+		await lateDelivered;
+		expect(session.isStreaming).toBe(true);
+
+		const parkedDelivered = nextUserMessage(session, "parked interrupt");
+		expect(await session.setQueuedPromptDelivery(parkedId, "interrupt")).toEqual({ status: "updated" });
+		await parkedDelivered;
+		await active;
+		await session.waitForIdle();
+
+		expect(mock.calls).toHaveLength(4);
+		expect(session.getQueuedPrompts()).toEqual([]);
+	});
+
+	it("clears parked prompts after cancelling a NOW continuation", async () => {
+		const { session, mock } = await createSession([
+			{ content: ["active response"], delayMs: 1_000 },
+			{ content: ["interrupt response"], delayMs: 1_000 },
+		]);
+		const activeStarted = Promise.withResolvers<void>();
+		const unsubscribe = session.subscribe(event => {
+			if (event.type === "agent_start") activeStarted.resolve();
+		});
+		const active = session.prompt("active");
+		await activeStarted.promise;
+		unsubscribe();
+
+		await session.prompt("keep next", { streamingBehavior: "steer" });
+		await session.prompt("interrupt now", { streamingBehavior: "followUp" });
+		await session.prompt("keep after", { streamingBehavior: "followUp" });
+		const interruptId = session.getQueuedPrompts().find(prompt => prompt.text === "interrupt now")?.id;
+		if (!interruptId) throw new Error("Expected interrupt prompt id");
+
+		const interruptDelivered = nextUserMessage(session, "interrupt now");
+		expect(await session.setQueuedPromptDelivery(interruptId, "interrupt")).toEqual({ status: "updated" });
+		await interruptDelivered;
+
+		const restored = await session.clearQueueDurably({ forInterrupt: true });
+		await active;
+		await session.waitForIdle();
+
+		expect(restored).toEqual({
+			steering: [{ text: "keep next", images: undefined }],
+			followUp: [{ text: "keep after", images: undefined }],
+		});
+		expect(session.getQueuedPrompts()).toEqual([]);
+		expect(mock.calls).toHaveLength(2);
 	});
 
 	it("dequeuing an ultrathink prompt mid-stream restores the text and drops its companion notice", async () => {

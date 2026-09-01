@@ -281,12 +281,12 @@ describe("createTools", () => {
 		expect(requestedTools.map(t => t.name)).toEqual(["read", "write"]);
 	});
 
-	it("auto-includes goal when goal mode is active", async () => {
+	it("auto-includes goal when goal runtime is available", async () => {
 		const session = createTestSession({
 			settings: createSettingsWithOverrides({
 				"goal.enabled": true,
 			}),
-			getGoalModeState: () => createActiveGoalState(),
+			getGoalRuntime: () => ({}) as never,
 		});
 		const tools = await createTools(session, ["read"]);
 		const names = tools.map(t => t.name);
@@ -295,13 +295,54 @@ describe("createTools", () => {
 		expect(names).toEqual(["read", "goal", "write"]);
 	});
 
-	it("does not widen a restricted explicit tool list for an active goal", async () => {
+	it("keeps goal unavailable without a runtime", async () => {
+		const session = createTestSession({
+			settings: createSettingsWithOverrides({
+				"goal.enabled": true,
+			}),
+		});
+		const tools = await createTools(session, ["read"]);
+		const names = tools.map(t => t.name);
+
+		expect(names).toEqual(["read"]);
+	});
+
+	it("keeps goal unavailable when the goal setting is disabled", async () => {
+		const session = createTestSession({
+			settings: createSettingsWithOverrides({
+				"goal.enabled": false,
+			}),
+			getGoalRuntime: () => ({}) as never,
+		});
+		const tools = await createTools(session, ["read", "goal"]);
+		const names = tools.map(t => t.name);
+
+		expect(names).toEqual(["read"]);
+	});
+
+	it("keeps goal hidden while goal mode is exiting", async () => {
+		const session = createTestSession({
+			settings: createSettingsWithOverrides({
+				"goal.enabled": true,
+			}),
+			getGoalModeState: () => undefined,
+			isGoalModeExiting: () => true,
+			getGoalRuntime: () => ({}) as never,
+		});
+		const tools = await createTools(session, ["read"]);
+		const names = tools.map(t => t.name);
+
+		expect(names).toEqual(["read"]);
+	});
+
+	it("does not widen a restricted explicit tool list for an available goal", async () => {
 		const session = createTestSession({
 			restrictToolNames: true,
 			settings: createSettingsWithOverrides({
 				"goal.enabled": true,
 			}),
 			getGoalModeState: () => createActiveGoalState(),
+			getGoalRuntime: () => ({}) as never,
 		});
 
 		const tools = await createTools(session, ["read", "write"]);

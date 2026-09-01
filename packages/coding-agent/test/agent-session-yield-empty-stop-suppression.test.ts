@@ -142,13 +142,6 @@ function reminderMessages(messages: AgentMessage[]): AgentMessage[] {
 	});
 }
 
-function assistantText(messages: AgentMessage[]): string {
-	return messages
-		.filter((message): message is Extract<AgentMessage, { role: "assistant" }> => message.role === "assistant")
-		.flatMap(message => message.content.flatMap(content => (content.type === "text" ? [content.text] : [])))
-		.join("\n");
-}
-
 afterEach(async () => {
 	for (const harness of activeHarnesses.splice(0)) {
 		await harness.session.dispose();
@@ -236,32 +229,13 @@ describe("AgentSession yield empty-stop suppression", () => {
 		expect(reminderMessages(session.agent.state.messages)).toHaveLength(1);
 	});
 
-	it("treats an idle IRC wake after a yielded run as a fresh turn for empty-stop retry", async () => {
-		const { session, mock } = await createHarness([
-			// Run 1: terminal yield stops without consuming a trailing provider response.
-			yieldCall("first", "call-yield-before-irc"),
-			// Run 2: an idle IRC wake is a fresh turn, so its empty stop should retry normally.
-			emptyStop(),
-			{ content: ["recovered after IRC retry"], stopReason: "stop" },
-		]);
+	it("persists idle IRC after a yielded run without starting another turn", async () => {
+		const { session, mock } = await createHarness([yieldCall("first", "call-yield-before-irc")]);
 
 		await session.prompt("yield first");
 		await session.waitForIdle();
 		expect(mock.calls).toHaveLength(1);
 		expect(reminderMessages(session.agent.state.messages)).toHaveLength(0);
-
-		const observerEvents: string[] = [];
-		const observerSettled = Promise.withResolvers<void>();
-		session.subscribe(event => {
-			if (event.type === "agent_end") observerEvents.push(`agent_end:${mock.calls.length}`);
-		});
-		session.setIrcWakeTurnObserver(() => {
-			observerEvents.push("started");
-			return () => {
-				observerEvents.push(`finished:${mock.calls.length}`);
-				observerSettled.resolve();
-			};
-		});
 
 		const outcome = await session.deliverIrcMessage({
 			id: "irc-empty-stop-after-yield",
@@ -272,11 +246,26 @@ describe("AgentSession yield empty-stop suppression", () => {
 		} as IrcMessage);
 		expect(outcome).toBe("woken");
 		await session.waitForIdle();
-		await observerSettled.promise;
 
-		expect(mock.calls).toHaveLength(3);
-		expect(reminderMessages(session.agent.state.messages)).toHaveLength(1);
-		expect(assistantText(session.agent.state.messages)).toContain("recovered after IRC retry");
-		expect(observerEvents).toEqual(["started", "agent_end:3", "finished:3"]);
+		expect(mock.calls).toHaveLength(1);
+		expect(reminderMessages(session.agent.state.messages)).toHaveLength(0);
+		expect(
+			session.agent.state.messages.some(
+				message =>
+					message.role === "custom" &&
+					message.customType === "irc:incoming" &&
+					JSON.stringify(message).includes("ping"),
+			),
+		).toBe(true);
+		expect(
+			session.sessionManager
+				.getEntries()
+				.some(
+					entry =>
+						entry.type === "custom_message" &&
+						entry.customType === "irc:incoming" &&
+						JSON.stringify(entry).includes("ping"),
+				),
+		).toBe(true);
 	});
 });

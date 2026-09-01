@@ -30,10 +30,10 @@ export function beginSettingsTest(): SettingsTestState {
 
 export function restoreSettingsTestState(state: SettingsTestState | undefined): void {
 	vi.restoreAllMocks();
+	if (state) restoreEnv(state.env);
 	resetSettingsForTest();
 	if (!state) return;
 
-	restoreEnv(state.env);
 	setProjectDir(state.projectDir);
 	setAgentDir(state.agentDir);
 	setTuiTight(state.tuiTight);

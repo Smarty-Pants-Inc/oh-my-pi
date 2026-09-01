@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { ExecutionEnvironmentProvider } from "@oh-my-pi/pi-coding-agent/session/execution-environment";
 import { TaskTool, taskSchema } from "@oh-my-pi/pi-coding-agent/task";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
@@ -12,9 +13,10 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 // test/task/task-batch.test.ts).
 
 describe("task schema (single-spawn)", () => {
-	it("accepts {agent, task}", () => {
-		const parsed = taskSchema({ agent: "scout", task: "Map the auth module." });
+	it("accepts a direct model selector", () => {
+		const parsed = taskSchema({ agent: "scout", task: "Map the auth module.", model: "openai/gpt-5.6" });
 		expect(parsed instanceof type.errors).toBe(false);
+		if (!(parsed instanceof type.errors)) expect(parsed.model).toBe("openai/gpt-5.6");
 	});
 
 	it("defaults agent to `task` when omitted", () => {
@@ -57,13 +59,25 @@ describe("task spawn validation", () => {
 		vi.restoreAllMocks();
 	});
 
-	function createSession(): ToolSession {
+	function createSession(
+		options: {
+			isolationMode?: "none" | "worktree";
+			provider?: ExecutionEnvironmentProvider;
+			taskDepth?: number;
+			batchEnabled?: boolean;
+		} = {},
+	): ToolSession {
 		return {
 			cwd: "/tmp",
 			hasUI: false,
-			settings: Settings.isolated({ "task.isolation.mode": "none", "task.batch": false }),
+			settings: Settings.isolated({
+				"task.isolation.mode": options.isolationMode ?? "none",
+				"task.batch": options.batchEnabled ?? false,
+			}),
+			taskDepth: options.taskDepth,
 			getSessionFile: () => null,
 			getSessionSpawns: () => "*",
+			getExecutionEnvironmentProvider: () => options.provider,
 		} as unknown as ToolSession;
 	}
 
@@ -73,6 +87,73 @@ describe("task spawn validation", () => {
 		const result = await tool.execute("tool-call", params);
 		return result.content.find(part => part.type === "text")?.text ?? "";
 	}
+
+	it("exposes execution only with isolation, a provider, and task depth zero", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [], projectAgentsDir: null });
+		const provider = {} as ExecutionEnvironmentProvider;
+		const visibleTool = await TaskTool.create(createSession({ isolationMode: "worktree", provider, taskDepth: 0 }));
+		const visible = visibleTool.parameters({
+			task: "Run remotely.",
+			isolated: true,
+			execution: "environment",
+		});
+		const visibleProperties = visibleTool.parameters.toJsonSchema({ io: "input" }).properties as
+			| Record<string, unknown>
+			| undefined;
+		expect(Object.hasOwn(visibleProperties ?? {}, "execution")).toBe(true);
+		expect(visible instanceof type.errors).toBe(false);
+
+		for (const unavailableSession of [
+			createSession({ provider, taskDepth: 0 }),
+			createSession({ isolationMode: "worktree", taskDepth: 0 }),
+			createSession({ isolationMode: "worktree", provider, taskDepth: 1 }),
+		]) {
+			const unavailableTool = await TaskTool.create(unavailableSession);
+			const hidden = unavailableTool.parameters({
+				task: "Run remotely.",
+				isolated: true,
+				execution: "environment",
+			});
+			expect(hidden instanceof type.errors).toBe(true);
+			const hiddenProperties = unavailableTool.parameters.toJsonSchema({ io: "input" }).properties as
+				| Record<string, unknown>
+				| undefined;
+			expect(Object.hasOwn(hiddenProperties ?? {}, "execution")).toBe(false);
+		}
+	});
+
+	it("rejects repaired-away environment intent when no provider is registered", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [], projectAgentsDir: null });
+		const tool = await TaskTool.create(createSession({ isolationMode: "worktree" }));
+		const result = await tool.execute("tool-call", {
+			agent: "task",
+			task: "Run remotely.",
+			isolated: true,
+			execution: "environment",
+		});
+		const text = result.content.find(part => part.type === "text")?.text ?? "";
+		expect(text).toContain("requires a registered execution environment provider");
+	});
+
+	it("rejects batch execution selectors before provider acquisition", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [], projectAgentsDir: null });
+		const provider = {
+			acquire: vi.fn(async () => {
+				throw new Error("batch validation must not acquire an environment");
+			}),
+		} satisfies ExecutionEnvironmentProvider;
+		const tool = await TaskTool.create(
+			createSession({ isolationMode: "worktree", batchEnabled: true, provider, taskDepth: 0 }),
+		);
+		const result = await tool.execute("tool-call", {
+			context: "shared",
+			tasks: [{ name: "A", task: "Run remotely." }],
+			execution: "environment",
+		});
+		const text = result.content.find(part => part.type === "text")?.text ?? "";
+		expect(text).toContain("only available on the flat single-task input");
+		expect(provider.acquire).not.toHaveBeenCalled();
+	});
 
 	it("defaults a missing agent to `task`", async () => {
 		// With no `agent`, execute() normalizes to the `task` default, so the

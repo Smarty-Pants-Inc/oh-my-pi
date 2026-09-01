@@ -24,6 +24,8 @@ export interface InternalResource {
 	size?: number;
 	/** Underlying filesystem path (for debugging, not exposed to agent) */
 	sourcePath?: string;
+	/** False when the resolved content's lines do not map to its backing `sourcePath`. */
+	sourceLineAligned?: boolean;
 	/** Additional notes about resolution */
 	notes?: string[];
 	/**

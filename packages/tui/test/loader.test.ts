@@ -34,14 +34,14 @@ describe("Loader component", () => {
 		tui.stop();
 	});
 
-	it("keeps spinner cadence when animated messages repaint at 30fps", () => {
+	it("keeps spinner cadence when animated messages repaint at 60fps", () => {
 		vi.useFakeTimers();
 		const ui = { requestComponentRender: vi.fn() };
 		const colorMessage = ((text: string) => text) as LoaderMessageColorFn & { animated: true };
 		colorMessage.animated = true;
 		const loader = new Loader(ui as unknown as TUI, text => text, colorMessage, "Checking", ["0", "1", "2", "3"]);
 
-		vi.advanceTimersByTime(170);
+		vi.advanceTimersByTime(200);
 
 		expect(ui.requestComponentRender).toHaveBeenCalledTimes(3);
 		expect(loader.render(20).join("\n")).toContain("2 Checking");
@@ -120,7 +120,7 @@ describe("Loader component", () => {
 
 		expect(ui.requestComponentRender).toHaveBeenCalledTimes(1);
 
-		vi.advanceTimersByTime(34);
+		vi.advanceTimersByTime(17);
 		expect(ui.requestComponentRender).toHaveBeenCalledTimes(2);
 		expect(loader.render(40).join("\n")).toContain("0 Checking-");
 
@@ -142,7 +142,7 @@ describe("Loader component", () => {
 		const loader = new Loader(ui as unknown as TUI, text => text, colorMessage, "Checking", ["0"]);
 
 		expect(ui.requestComponentRender).toHaveBeenCalledTimes(1);
-		vi.advanceTimersByTime(34);
+		vi.advanceTimersByTime(17);
 		expect(ui.requestComponentRender).toHaveBeenCalledTimes(2);
 
 		vi.advanceTimersByTime(200);
@@ -224,7 +224,7 @@ describe("Loader component", () => {
 
 		const initial = loader.render(40);
 		stringWidth.mockClear();
-		vi.advanceTimersByTime(34);
+		vi.advanceTimersByTime(17);
 		const animated = loader.render(40);
 
 		expect(ui.requestComponentRender).toHaveBeenCalledTimes(2);
@@ -248,7 +248,7 @@ describe("Loader component", () => {
 
 		const initial = loader.render(40);
 		stringWidth.mockClear();
-		vi.advanceTimersByTime(80);
+		vi.advanceTimersByTime(200);
 		const advanced = loader.render(40);
 
 		// Advancing the spinner glyph must not re-run the wrap/width pipeline:
@@ -272,7 +272,7 @@ describe("Loader component", () => {
 		);
 
 		loader.render(8);
-		vi.advanceTimersByTime(80);
+		vi.advanceTimersByTime(200);
 		const widerFrame = loader.render(8);
 
 		expect(widerFrame.join("\n")).toContain(">>>>");

@@ -4,6 +4,11 @@ import { createLegacyPiVirtualModulePlugin } from "./legacy-pi-virtual-module";
 /** Native runtime dependencies always resolved from the on-demand install instead of embedded into compiled binaries. */
 export const COMPILED_EXTERNAL_DEPENDENCIES: readonly string[] = Object.freeze(["fastembed", "onnxruntime-node"]);
 
+/** Bun define that turns the source build-identity placeholder into immutable binary data. */
+export function createOmpBuildIdentityDefine(buildId: string): Record<string, string> {
+	return { __OMP_BUILD_ID__: JSON.stringify(buildId) };
+}
+
 /** Inputs shared by local and release coding-agent binary builds. */
 export interface CodingAgentCompileOptions {
 	/** Absolute repository root used for package resolution. */
@@ -14,6 +19,8 @@ export interface CodingAgentCompileOptions {
 	readonly outfile: string;
 	/** Concrete Transformers.js version baked into the tiny-model worker. */
 	readonly transformersVersion: string;
+	/** Immutable OMP build identity baked into the executable; empty for unmanaged builds. */
+	readonly buildId: string;
 	/** Optional cross-compilation runtime target. */
 	readonly target?: Bun.Build.CompileTarget;
 	/** Optional unmodified Bun executable used as the standalone runtime template. */
@@ -39,6 +46,7 @@ export async function compileCodingAgent(options: CodingAgentCompileOptions): Pr
 			root: options.repoRoot,
 			external: [...COMPILED_EXTERNAL_DEPENDENCIES],
 			define: {
+				...createOmpBuildIdentityDefine(options.buildId),
 				"process.env.PI_COMPILED": JSON.stringify("true"),
 				"process.env.PI_TINY_TRANSFORMERS_VERSION": JSON.stringify(options.transformersVersion),
 				"process.env.PI_DOCS_EMBED": JSON.stringify((await buildDocsIndexPayload()).payload),

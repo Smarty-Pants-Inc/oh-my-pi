@@ -510,6 +510,7 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 	async shellStream(
 		args: Parameters<NonNullable<ICursorExecHandlers["shellStream"]>>[0],
 		callbacks: CursorShellStreamCallbacks,
+		signal?: AbortSignal,
 	) {
 		const toolCallId = decodeToolCallId(args.toolCallId);
 		const toolName = "bash";
@@ -571,7 +572,7 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 		};
 
 		try {
-			result = await tool.execute(toolCallId, toolArgs, undefined, onUpdate, this.options.getToolContext?.());
+			result = await tool.execute(toolCallId, toolArgs, signal, onUpdate, this.options.getToolContext?.());
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			result = buildToolErrorResult(message);

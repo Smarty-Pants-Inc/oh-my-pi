@@ -53,7 +53,7 @@ export interface SessionToolsHost {
 	agentKind(): "main" | "sub";
 	isDisposed(): boolean;
 	isStreaming(): boolean;
-	queuedMessageCount(): number;
+	hasPendingMessages(): boolean;
 	planModeEnabled(): boolean;
 	model(): Model | undefined;
 	memoryBackendSession(): MemoryBackendStartOptions["session"];
@@ -189,6 +189,12 @@ const XDEV_MOUNT_NOTICE_MESSAGE_TYPE = "xdev-mount-notice";
 interface XdevMountNoticeDetails {
 	added: string[];
 	removed: string[];
+}
+
+/** Transactional ownership of permission and mount-announcement session state. */
+export interface SessionToolsStateTransition {
+	commit(): void;
+	rollback(): void;
 }
 
 /** Owns tool registration, presentation, prompt rebuilding, skills, and permissions. */
@@ -375,6 +381,32 @@ export class SessionTools {
 	/** Drops cached per-session ACP `allow_always`/`reject_always` decisions. */
 	clearAcpPermissionDecisions(): void {
 		this.#acpPermissionDecisions.clear();
+	}
+
+	/**
+	 * Install clean logical-session permission and mount-announcement state while
+	 * retaining the current state for rollback. Live mount inventory and pending
+	 * host deltas are intentionally not session-owned and remain in place. Commit
+	 * keeps the retained snapshot available until pre-publication selection seals.
+	 */
+	beginSessionTransition(): SessionToolsStateTransition {
+		const retainedPermissionDecisions = this.#acpPermissionDecisions;
+		const retainedAnnouncedMounts = this.#announcedMounts;
+		const retainedAnnouncedMountsSeeded = this.#announcedMountsSeeded;
+		this.#acpPermissionDecisions = new Map();
+		this.#announcedMounts = new Set();
+		this.#announcedMountsSeeded = false;
+		let restored = false;
+		return {
+			commit: () => {},
+			rollback: () => {
+				if (restored) return;
+				restored = true;
+				this.#acpPermissionDecisions = retainedPermissionDecisions;
+				this.#announcedMounts = retainedAnnouncedMounts;
+				this.#announcedMountsSeeded = retainedAnnouncedMountsSeeded;
+			},
+		};
 	}
 
 	/** Drops cached ACP decisions and re-wraps active tools after the client changes. */
@@ -1178,11 +1210,11 @@ export class SessionTools {
 			if (typeof message.content !== "string") continue;
 			let section: "added" | "removed" | undefined;
 			for (const line of message.content.split("\n")) {
-				if (line === "These tools became available:") {
+				if (line === "These tools became available:" || line.startsWith("Available tools.")) {
 					section = "added";
 					continue;
 				}
-				if (line.startsWith("No longer mounted")) {
+				if (line.startsWith("No longer mounted") || line === "Unmounted; writes fail:") {
 					section = "removed";
 					continue;
 				}
@@ -1690,7 +1722,7 @@ export class SessionTools {
 	 * after side-effecting changes; see the memory hooks and {@link syncAfterModelChange}.
 	 *
 	 * The calendar date is deliberately NOT part of the signature: the date/cwd
-	 * reminder rides on the first user turn at request time (`date-cwd-reminder`),
+	 * reminder is added as typed internal context at request time (`date-cwd-reminder`),
 	 * so a session spanning midnight must NOT rebuild a prompt that no longer
 	 * embeds the date — the reminder picks up the new day on its own.
 	 */
@@ -1766,7 +1798,7 @@ export class SessionTools {
 			modelRegistry: this.#host.modelRegistry,
 			model: this.#host.model(),
 			isIdle: () => !this.#host.isStreaming(),
-			hasQueuedMessages: () => this.#host.queuedMessageCount() > 0,
+			hasQueuedMessages: () => this.#host.hasPendingMessages(),
 			abort: () => {
 				this.#host.agent.abort();
 			},

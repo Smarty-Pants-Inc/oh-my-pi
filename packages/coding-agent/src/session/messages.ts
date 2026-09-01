@@ -334,9 +334,6 @@ export type NormalizedCustomMessagePayload<T = unknown> = Pick<
 /** Custom message type for hidden interrupted-thinking continuity context. */
 export const INTERRUPTED_THINKING_MESSAGE_TYPE = "interrupted-thinking";
 
-/** Custom message type for the transient checkpoint-active reminder. */
-export const CHECKPOINT_ACTIVE_REMINDER_TYPE = "checkpoint-active-reminder";
-
 /** Metadata persisted with a hidden interrupted-thinking continuity message. */
 export interface InterruptedThinkingDetails {
 	interruptedAt: number;
@@ -609,12 +606,49 @@ export function readQueueChipText(details: unknown): string | undefined {
 	return typeof candidate === "string" ? candidate : undefined;
 }
 
+/** Extract the durable pending-delivery journal id from transient custom-message details. */
+export function readPendingSemanticDeliveryId(details: unknown): string | undefined {
+	if (typeof details !== "object" || details === null) return undefined;
+	const candidate = (details as { __pendingSemanticDeliveryId?: unknown }).__pendingSemanticDeliveryId;
+	return typeof candidate === "string" ? candidate : undefined;
+}
+
+/** Return a collab prompt copy whose persisted details record whether the model
+ * should receive the steering envelope. Absence remains steering for backward
+ * compatibility with older journals. */
+export function withCollabPromptSteering<T>(message: CustomMessage<T>, steering: boolean): CustomMessage<T> {
+	if (message.customType !== COLLAB_PROMPT_MESSAGE_TYPE) return message;
+	const details: Record<string, unknown> = isRecord(message.details) ? message.details : {};
+	if (details.__ompSteering === steering) return message;
+	return { ...message, details: { ...details, __ompSteering: steering } as T };
+}
+
+function collabPromptUsesSteeringEnvelope(details: unknown): boolean {
+	return !isRecord(details) || details.__ompSteering !== false;
+}
+
 /** Explicit allowlist of `details` field names that are AgentSession-internal
  *  transient bookkeeping and MUST be removed before SessionManager persists
  *  the CustomMessageEntry to disk. Scoped intentionally narrow: only fields
  *  declared here are stripped. Adding a new entry is a deliberate, reviewed
  *  change — unrelated future payload fields are never silently dropped. */
-export const INTERNAL_DETAILS_FIELDS = ["__queueChipText"] as const;
+export const INTERNAL_DETAILS_FIELDS = ["__queueChipText", "__pendingSemanticDeliveryId"] as const;
+
+type InternalDetailsField = (typeof INTERNAL_DETAILS_FIELDS)[number];
+
+/** Clone extension details without changing arrays into objects, then add one transient runtime field. */
+export function withInternalDetailsField<T, K extends InternalDetailsField>(
+	details: T | undefined,
+	field: K,
+	value: string,
+): T & Record<K, string> {
+	const copy = Array.isArray(details)
+		? Object.assign([...details], details)
+		: details !== null && typeof details === "object"
+			? { ...(details as Record<string, unknown>) }
+			: {};
+	return Object.assign(copy, { [field]: value }) as T & Record<K, string>;
+}
 
 /** Return a `details` copy with every key in `INTERNAL_DETAILS_FIELDS`
  *  removed. Returns the input unchanged when there is nothing to strip
@@ -631,9 +665,11 @@ export function stripInternalDetailsFields<T>(details: T | undefined): T | undef
 		}
 	}
 	if (!hit) return details;
-	const cleaned: Record<string, unknown> = { ...obj };
+	const cleaned: unknown[] | Record<string, unknown> = Array.isArray(details)
+		? Object.assign([...details], details)
+		: { ...obj };
 	for (const key of INTERNAL_DETAILS_FIELDS) {
-		delete cleaned[key];
+		Reflect.deleteProperty(cleaned, key);
 	}
 	return cleaned as T;
 }
@@ -698,11 +734,17 @@ type SteeringUserMessage =
 			attribution: "user";
 	  });
 
-function isSteeringUserMessage(message: AgentMessage | undefined): message is SteeringUserMessage {
-	if (message?.role === "user") return message.steering === true;
+function isCollabUserMessage(
+	message: AgentMessage | undefined,
+): message is CustomMessage & { customType: typeof COLLAB_PROMPT_MESSAGE_TYPE; attribution: "user" } {
 	return (
 		message?.role === "custom" && message.customType === COLLAB_PROMPT_MESSAGE_TYPE && message.attribution === "user"
 	);
+}
+
+function isSteeringUserMessage(message: AgentMessage | undefined): message is SteeringUserMessage {
+	if (message?.role === "user") return message.steering === true;
+	return isCollabUserMessage(message) && collabPromptUsesSteeringEnvelope(message.details);
 }
 
 function userMessageWithoutSteering(message: UserMessage): UserMessage {
@@ -1257,6 +1299,16 @@ function convertOne(m: AgentMessage, interruptedNext: boolean): Message[] {
 			if (isSteeringUserMessage(m)) {
 				const converted = convertMessageToLlm(wrapSteeringUserMessage(m));
 				return converted ? [converted] : [];
+			}
+			if (isCollabUserMessage(m)) {
+				return [
+					{
+						role: "user",
+						content: customMessageContentToLlmContent(m.content),
+						attribution: "user",
+						timestamp: m.timestamp,
+					},
+				];
 			}
 			if (isUserInvokedSkillPrompt(m)) {
 				return [

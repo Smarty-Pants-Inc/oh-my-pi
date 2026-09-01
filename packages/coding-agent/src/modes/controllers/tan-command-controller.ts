@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { prompt, Snowflake } from "@oh-my-pi/pi-utils";
+import { markOmpInternalSession } from "../../context/internal-session";
 import backgroundTanDispatchPrompt from "../../prompts/system/background-tan-dispatch.md" with { type: "text" };
 import tanContextSwitchPrompt from "../../prompts/system/tan-context-switch.md" with { type: "text" };
 import { AgentRegistry, MAIN_AGENT_ID } from "../../registry/agent-registry";
@@ -124,30 +125,32 @@ export class TanCommandController {
 
 					let clone: AgentSession | undefined;
 					try {
-						const created = await sdk.createAgentSession({
-							cwd,
-							sessionManager: cloneManager,
-							model,
-							thinkingLevel,
-							systemPrompt,
-							toolNames,
-							providerSessionId: `${parentSessionId}:tan:${Snowflake.next()}`,
-							providerPromptCacheKey: parentPromptCacheKey,
-							modelRegistry,
-							authStorage: modelRegistry.authStorage,
-							settings,
-							hasUI: false,
-							enableMCP: false,
-							customTools,
-							enableLsp,
-							agentId: cloneId,
-							agentDisplayName: "tan",
-							parentTaskPrefix: cloneId,
-							parentAgentId: ownerId,
-							agentRegistry,
-							disableExtensionDiscovery: true,
-							localProtocolOptions,
-						});
+						const created = await sdk.createAgentSession(
+							markOmpInternalSession({
+								cwd,
+								sessionManager: cloneManager,
+								model,
+								thinkingLevel,
+								systemPrompt,
+								toolNames,
+								providerSessionId: `${parentSessionId}:tan:${Snowflake.next()}`,
+								providerPromptCacheKey: parentPromptCacheKey,
+								modelRegistry,
+								authStorage: modelRegistry.authStorage,
+								settings,
+								hasUI: false,
+								enableMCP: false,
+								customTools,
+								enableLsp,
+								agentId: cloneId,
+								agentDisplayName: "tan",
+								parentTaskPrefix: cloneId,
+								parentAgentId: ownerId,
+								agentRegistry,
+								disableExtensionDiscovery: true,
+								localProtocolOptions,
+							}),
+						);
 						clone = created.session;
 						clone.sessionManager?.appendSessionInit?.({
 							systemPrompt: clone.systemPrompt ? clone.systemPrompt.join("\n\n") : systemPrompt.join("\n\n"),

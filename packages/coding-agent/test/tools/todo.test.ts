@@ -4,6 +4,7 @@ import { type } from "@oh-my-pi/omptype";
 import { toolWireSchema } from "@oh-my-pi/pi-ai";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { initTheme, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { renderPassiveTodoSnapshot } from "@oh-my-pi/pi-coding-agent/session/todo-tracker";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import {
 	markdownToPhases,
@@ -38,6 +39,39 @@ function createSession(initialPhases: TodoPhase[] = []): ToolSession {
 
 beforeAll(async () => {
 	await initTheme();
+});
+
+describe("passive todo snapshots", () => {
+	it("keeps only open work as internal context and reports closed counts", () => {
+		const snapshot = renderPassiveTodoSnapshot([
+			{
+				name: "Delivery",
+				tasks: [
+					{ content: "Implement snapshot", status: "in_progress" },
+					{ content: "Wait for approval", status: "blocked", blocker: "owner response" },
+					{ content: "Old completed work", status: "completed" },
+					{ content: "Dropped follow-up", status: "abandoned" },
+				],
+			},
+		]);
+
+		expect(snapshot).toMatchObject({ semanticRole: "internal_context", source: "omp.todo", open: 2, closed: 2 });
+		expect(snapshot?.content).toContain('<todo_context source="omp.todo">');
+		expect(snapshot?.content).toContain(
+			"Working memory only. These items do not create scope or authorize another turn.",
+		);
+		expect(snapshot?.content).toContain("- [in_progress] Implement snapshot");
+		expect(snapshot?.content).toContain("- [blocked] Wait for approval: owner response");
+		expect(snapshot?.content).toContain("2 closed; 2 open.");
+		expect(snapshot?.content).not.toContain("Old completed work");
+		expect(snapshot?.content).not.toContain("Dropped follow-up");
+	});
+
+	it("omits a snapshot when every todo is closed", () => {
+		expect(
+			renderPassiveTodoSnapshot([{ name: "Finished", tasks: [{ content: "done", status: "completed" }] }]),
+		).toBeUndefined();
+	});
 });
 
 describe("resolveTodoMarkdownPath", () => {

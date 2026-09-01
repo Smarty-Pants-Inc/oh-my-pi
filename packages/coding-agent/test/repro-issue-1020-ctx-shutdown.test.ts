@@ -65,6 +65,7 @@ describe("issue #1020 - ctx.shutdown() in interactive mode", () => {
 			): void {
 				capturedContextActions = contextActions;
 			},
+			setHostTerminalInput(): void {},
 			onError(_handler: (error: unknown) => void): void {},
 			getComposerShapes: () => [],
 			async emit(_event: unknown): Promise<void> {},

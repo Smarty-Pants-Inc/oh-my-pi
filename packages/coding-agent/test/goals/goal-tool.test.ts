@@ -52,6 +52,9 @@ function createRuntimeHarness(initialState?: GoalModeState) {
 	return {
 		runtime,
 		getState: () => cloneState(state),
+		setState: (next: GoalModeState | undefined) => {
+			state = cloneState(next);
+		},
 	};
 }
 
@@ -89,9 +92,9 @@ describe("GoalTool", () => {
 		const created = await tool.execute("call-create", {
 			op: "create",
 			objective: "  Create route  ",
-			token_budget: 10,
+			token_budget: undefined,
 		});
-		expect(runtime.createGoal).toHaveBeenCalledWith({ objective: "Create route", tokenBudget: 10 });
+		expect(runtime.createGoal).toHaveBeenCalledWith({ objective: "Create route" });
 		expect(created.details).toMatchObject({
 			op: "create",
 			goal: createGoalState.goal,
@@ -127,6 +130,25 @@ describe("GoalTool", () => {
 		});
 	});
 
+	it("creates an unbounded goal when token_budget is omitted", async () => {
+		const harness = createRuntimeHarness();
+		const tool = new GoalTool(
+			createToolSession({
+				getGoalRuntime: () => harness.runtime,
+				getGoalModeState: () => harness.getState(),
+			}),
+		);
+
+		const result = await tool.execute("call-create-unbounded", {
+			op: "create",
+			objective: "Ship without a ceiling",
+			token_budget: undefined,
+		});
+
+		expect(harness.getState()?.goal.tokenBudget).toBeUndefined();
+		expect(result.details).toMatchObject({ remainingTokens: null });
+	});
+
 	it("rejects create when a goal already exists", async () => {
 		const harness = createRuntimeHarness({
 			enabled: true,
@@ -141,7 +163,7 @@ describe("GoalTool", () => {
 		);
 
 		await expect(
-			tool.execute("call-create", { op: "create", objective: "New goal", token_budget: 10 }),
+			tool.execute("call-create", { op: "create", objective: "New goal", token_budget: undefined }),
 		).rejects.toThrow("cannot create a new goal because this session already has a goal");
 	});
 
@@ -174,7 +196,7 @@ describe("GoalTool", () => {
 		expect(harness.getState()).toBeUndefined();
 	});
 
-	it("rejects op=create when the token_budget is zero or negative", async () => {
+	it("rejects every numeric agent token_budget with a stable machine-readable code", async () => {
 		const harness = createRuntimeHarness();
 		const tool = new GoalTool(
 			createToolSession({
@@ -183,16 +205,15 @@ describe("GoalTool", () => {
 			}),
 		);
 
-		await expect(tool.execute("call-zero", { op: "create", objective: "Ship it", token_budget: 0 })).rejects.toThrow(
-			"token_budget must be a positive integer when provided",
-		);
-		await expect(tool.execute("call-neg", { op: "create", objective: "Ship it", token_budget: -5 })).rejects.toThrow(
-			"token_budget must be a positive integer when provided",
-		);
+		for (const token_budget of [1, 0, -5]) {
+			await expect(
+				tool.execute("call-budget", { op: "create", objective: "Ship it", token_budget }),
+			).rejects.toThrow("agent_goal_token_budget_not_allowed");
+		}
 		expect(harness.getState()).toBeUndefined();
 	});
 
-	it("flips state to exiting and clears enabled when op=complete succeeds (fix #1)", async () => {
+	it("returns completion details while hiding the retained headless exit sentinel from op=get", async () => {
 		const harness = createRuntimeHarness();
 		await harness.runtime.createGoal({ objective: "Ship the release", tokenBudget: 100 });
 		const tool = new GoalTool(
@@ -202,21 +223,20 @@ describe("GoalTool", () => {
 			}),
 		);
 
-		const result = await tool.execute("call-complete", {
+		const completed = await tool.execute("call-complete", {
 			op: "complete",
 			objective: undefined,
 			token_budget: undefined,
 		});
 
-		expect(result.details).toMatchObject({ op: "complete" });
-		const after = harness.getState();
-		expect(after?.enabled).toBe(false);
-		expect(after?.mode).toBe("exiting");
-		expect(after?.reason).toBe("completed");
-		expect(after?.goal.status).toBe("complete");
+		expect(completed.details?.goal?.status).toBe("complete");
+		expect(harness.getState()).toMatchObject({ mode: "exiting", goal: { status: "complete" } });
+		const current = await tool.execute("call-get", { op: "get", objective: undefined, token_budget: undefined });
+		expect(current.details?.goal).toBeNull();
+		expect(current.content).toEqual([{ type: "text", text: "No active goal." }]);
 	});
 
-	it("completes a paused goal (enabled=false) — was broken before fix", async () => {
+	it("rejects complete for a paused goal", async () => {
 		const harness = createRuntimeHarness({
 			enabled: false,
 			mode: "active",
@@ -229,16 +249,17 @@ describe("GoalTool", () => {
 			}),
 		);
 
-		const result = await tool.execute("call-complete", {
-			op: "complete",
-			objective: undefined,
-			token_budget: undefined,
-		});
-		expect(result.details?.goal?.status).toBe("complete");
-		expect(harness.getState()?.goal.status).toBe("complete");
+		await expect(
+			tool.execute("call-complete", {
+				op: "complete",
+				objective: undefined,
+				token_budget: undefined,
+			}),
+		).rejects.toThrow("cannot complete goal because no goal is active");
+		expect(harness.getState()?.goal.status).toBe("paused");
 	});
 
-	it("allows create after previous goal is complete", async () => {
+	it("rejects create until terminal cleanup clears the previous completed goal", async () => {
 		const harness = createRuntimeHarness({
 			enabled: false,
 			mode: "exiting",
@@ -252,7 +273,16 @@ describe("GoalTool", () => {
 			}),
 		);
 
-		const result = await tool.execute("call-create", {
+		await expect(
+			tool.execute("call-create-before-cleanup", {
+				op: "create",
+				objective: "Next goal",
+				token_budget: undefined,
+			}),
+		).rejects.toThrow("terminal cleanup is still in progress");
+		harness.setState(undefined);
+
+		const result = await tool.execute("call-create-after-cleanup", {
 			op: "create",
 			objective: "Next goal",
 			token_budget: undefined,
@@ -279,30 +309,11 @@ describe("GoalTool", () => {
 		expect(result.details?.goal?.objective).toBe("Ship it");
 	});
 
-	it("op=resume re-activates a paused goal", async () => {
-		const harness = createRuntimeHarness({
-			enabled: false,
-			mode: "active",
-			goal: createGoal({ status: "paused" }),
-		});
-		const tool = new GoalTool(
-			createToolSession({
-				getGoalRuntime: () => harness.runtime,
-				getGoalModeState: () => harness.getState(),
-			}),
-		);
-
-		const result = await tool.execute("call-resume", { op: "resume", objective: undefined, token_budget: undefined });
-		expect(result.details?.op).toBe("resume");
-		expect(result.details?.goal?.status).toBe("active");
-		expect(harness.getState()?.enabled).toBe(true);
-	});
-
-	it("op=drop clears goal state", async () => {
+	it("op=block makes an active goal inert", async () => {
 		const harness = createRuntimeHarness({
 			enabled: true,
 			mode: "active",
-			goal: createGoal({ objective: "Drop me" }),
+			goal: createGoal(),
 		});
 		const tool = new GoalTool(
 			createToolSession({
@@ -311,9 +322,32 @@ describe("GoalTool", () => {
 			}),
 		);
 
-		const result = await tool.execute("call-drop", { op: "drop", objective: undefined, token_budget: undefined });
-		expect(result.details?.op).toBe("drop");
-		expect(result.details?.goal?.status).toBe("dropped");
-		expect(harness.getState()).toBeUndefined();
+		const result = await tool.execute("call-block", { op: "block", objective: undefined, token_budget: undefined });
+		expect(result.details?.op).toBe("block");
+		expect(result.details?.goal?.status).toBe("blocked");
+		expect(harness.getState()?.enabled).toBe(false);
+	});
+
+	it("exposes only get, create, complete, and block to the model", () => {
+		const tool = new GoalTool(createToolSession({}));
+
+		for (const op of ["get", "create", "complete", "block"]) {
+			expect(tool.parameters.allows({ op })).toBe(true);
+		}
+		for (const op of ["pause", "resume", "edit", "replace", "budget", "drop", "clear"]) {
+			expect(tool.parameters.allows({ op })).toBe(false);
+		}
+	});
+
+	it("publishes the required model-operation guidance", () => {
+		const tool = new GoalTool(createToolSession({}));
+		expect(tool.description).toBe(`The goal is persistent mission state.
+
+- \`get\`: read the current goal and accounting.
+- \`create\`: start a goal only when the user or system clearly requested persistent goal mode and no unfinished goal exists. Ordinary clear user prose is sufficient; do not parse prose into authorization rules.
+- \`complete\`: use only when the full objective is achieved and the required current evidence supports that claim.
+- \`block\`: use when meaningful progress requires user input, unavailable access, or external-state change, or after two evidence-valid failures of the same route with no materially different safe route.
+
+Do not infer a goal from an ordinary task. Do not use completion or blocking to escape difficult work. Pause, resume, edit, replace, budget, drop, and clear are typed owner/system operations. The two-failure rule is concise model guidance backed by tests; do not build a natural-language route-failure classifier.`);
 	});
 });

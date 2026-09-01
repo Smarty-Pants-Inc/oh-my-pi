@@ -11,11 +11,22 @@ import type { CapturedHttpErrorResponse } from "../utils/http-inspector";
 export const STRIP_TEMPLATE_KWARG_REASONING_EFFORT = Symbol("strip-template-kwarg-reasoning-effort");
 
 /** @internal */
-export type OpenAIReasoningEffortFallback = string | null | typeof STRIP_TEMPLATE_KWARG_REASONING_EFFORT;
+type OpenAIReasoningEffortReplacements = readonly (readonly [rejectedEffort: string, fallback: string | null])[];
+
+interface CombinedOpenAIReasoningEffortFallback {
+	readonly replacements: OpenAIReasoningEffortReplacements;
+	readonly stripTemplateKwarg: true;
+}
+
+export type OpenAIReasoningEffortFallback =
+	| OpenAIReasoningEffortReplacements
+	| typeof STRIP_TEMPLATE_KWARG_REASONING_EFFORT
+	| CombinedOpenAIReasoningEffortFallback;
 
 /** @internal */
 export interface OpenAIReasoningEffortFallbackState {
-	reasoningEffortFallbacks: Map<string, OpenAIReasoningEffortFallback>;
+	reasoningEffortFallbacks: Map<string, Map<string, string | null>>;
+	stripTemplateKwargFallbacks: Set<string>;
 }
 
 const ENABLED_REASONING_VALUES = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
@@ -39,12 +50,37 @@ const REASONING_VALUE_RANK: Readonly<Record<string, number>> = {
 
 /** @internal */
 export function createOpenAIReasoningEffortFallbackState(): OpenAIReasoningEffortFallbackState {
-	return { reasoningEffortFallbacks: new Map() };
+	return { reasoningEffortFallbacks: new Map(), stripTemplateKwargFallbacks: new Set() };
 }
 
 /** @internal */
 export function clearOpenAIReasoningEffortFallbackState(state: OpenAIReasoningEffortFallbackState): void {
 	state.reasoningEffortFallbacks.clear();
+	state.stripTemplateKwargFallbacks.clear();
+}
+
+function isCombinedFallback(
+	fallback: OpenAIReasoningEffortFallback,
+): fallback is CombinedOpenAIReasoningEffortFallback {
+	return typeof fallback === "object" && !Array.isArray(fallback);
+}
+
+function fallbackStripsTemplateKwarg(fallback: OpenAIReasoningEffortFallback): boolean {
+	return fallback === STRIP_TEMPLATE_KWARG_REASONING_EFFORT || isCombinedFallback(fallback);
+}
+
+function fallbackReplacements(fallback: OpenAIReasoningEffortFallback): OpenAIReasoningEffortReplacements {
+	if (fallback === STRIP_TEMPLATE_KWARG_REASONING_EFFORT) return [];
+	return isCombinedFallback(fallback) ? fallback.replacements : fallback;
+}
+
+function composeFallback(
+	replacements: OpenAIReasoningEffortReplacements,
+	stripTemplateKwarg: boolean,
+): OpenAIReasoningEffortFallback {
+	if (!stripTemplateKwarg) return replacements;
+	if (replacements.length === 0) return STRIP_TEMPLATE_KWARG_REASONING_EFFORT;
+	return { replacements, stripTemplateKwarg: true };
 }
 
 /** @internal */
@@ -52,7 +88,11 @@ export function getOpenAIReasoningEffortFallback(
 	state: OpenAIReasoningEffortFallbackState | undefined,
 	key: string,
 ): OpenAIReasoningEffortFallback | undefined {
-	return state?.reasoningEffortFallbacks.get(key);
+	if (!state) return undefined;
+	const remembered = state.reasoningEffortFallbacks.get(key);
+	const stripsTemplateKwarg = state.stripTemplateKwargFallbacks.has(key);
+	if (!remembered && !stripsTemplateKwarg) return undefined;
+	return composeFallback(remembered ? [...remembered] : [], stripsTemplateKwarg);
 }
 
 /** @internal */
@@ -61,7 +101,34 @@ export function rememberOpenAIReasoningEffortFallback(
 	key: string,
 	fallback: OpenAIReasoningEffortFallback,
 ): void {
-	state?.reasoningEffortFallbacks.set(key, fallback);
+	if (!state) return;
+	if (fallbackStripsTemplateKwarg(fallback)) state.stripTemplateKwargFallbacks.add(key);
+	const replacements = fallbackReplacements(fallback);
+	if (replacements.length === 0) return;
+	let remembered = state.reasoningEffortFallbacks.get(key);
+	if (!remembered) {
+		remembered = new Map();
+		state.reasoningEffortFallbacks.set(key, remembered);
+	}
+	for (const [rejectedEffort, replacement] of replacements) remembered.set(rejectedEffort, replacement);
+}
+
+/** @internal */
+export function mergeOpenAIReasoningEffortFallback(
+	current: OpenAIReasoningEffortFallback | undefined,
+	delta: OpenAIReasoningEffortFallback,
+): OpenAIReasoningEffortFallback {
+	const merged = new Map<string, string | null>(current ? fallbackReplacements(current) : []);
+	for (const [rejectedEffort, replacement] of fallbackReplacements(delta)) {
+		for (const [knownRejectedEffort, knownReplacement] of merged) {
+			if (knownReplacement === rejectedEffort) merged.set(knownRejectedEffort, replacement);
+		}
+		merged.set(rejectedEffort, replacement);
+	}
+	return composeFallback(
+		[...merged],
+		(current !== undefined && fallbackStripsTemplateKwarg(current)) || fallbackStripsTemplateKwarg(delta),
+	);
 }
 
 /** @internal */
@@ -114,32 +181,38 @@ function deleteReasoningEffort(reasoning: Record<string, unknown>, parent: Recor
 /** @internal */
 export function applyOpenAIReasoningEffortFallback(params: unknown, fallback: OpenAIReasoningEffortFallback): boolean {
 	if (!isRecord(params)) return false;
-	if (fallback === STRIP_TEMPLATE_KWARG_REASONING_EFFORT) {
+	let strippedTemplateKwarg = false;
+	if (fallbackStripsTemplateKwarg(fallback)) {
 		const kwargs = params.chat_template_kwargs;
-		if (!isRecord(kwargs) || typeof kwargs.reasoning_effort !== "string") return false;
-		const effort = kwargs.reasoning_effort;
-		deleteTemplateKwargReasoningEffort(kwargs, params);
-		// The `qwen-chat-template` dialect rides kwargs alone; keep the effort
-		// selection alive on the standard OpenAI field (Ninfer-style servers
-		// accept it, vLLM-style renderers ignore it).
-		if (typeof params.reasoning_effort !== "string") params.reasoning_effort = effort;
-		return true;
+		if (isRecord(kwargs) && typeof kwargs.reasoning_effort === "string") {
+			const effort = kwargs.reasoning_effort;
+			deleteTemplateKwargReasoningEffort(kwargs, params);
+			// The qwen-chat-template dialect rides kwargs alone; preserve the selected
+			// value on the standard field for providers that reject the kwarg spelling.
+			if (typeof params.reasoning_effort !== "string") params.reasoning_effort = effort;
+			strippedTemplateKwarg = true;
+		}
 	}
-	let changed = false;
+	const currentEffort = readOpenAIReasoningEffort(params)?.toLowerCase();
+	if (!currentEffort) return strippedTemplateKwarg;
+	const scopedFallback = fallbackReplacements(fallback).find(([rejectedEffort]) => rejectedEffort === currentEffort);
+	if (!scopedFallback) return strippedTemplateKwarg;
+	const replacement = scopedFallback[1];
+	let changed = strippedTemplateKwarg;
 	if (typeof params.reasoning_effort === "string") {
-		if (fallback === null) {
+		if (replacement === null) {
 			delete params.reasoning_effort;
 		} else {
-			params.reasoning_effort = fallback;
+			params.reasoning_effort = replacement;
 		}
 		changed = true;
 	}
 	const reasoning = params.reasoning;
 	if (isRecord(reasoning) && typeof reasoning.effort === "string") {
-		if (fallback === null) {
+		if (replacement === null) {
 			changed = deleteReasoningEffort(reasoning, params) || changed;
 		} else {
-			reasoning.effort = fallback;
+			reasoning.effort = replacement;
 			changed = true;
 		}
 	}
@@ -147,10 +220,10 @@ export function applyOpenAIReasoningEffortFallback(params: unknown, fallback: Op
 	// must not leave a stale effort for kwargs-reading renderers.
 	const kwargs = params.chat_template_kwargs;
 	if (isRecord(kwargs) && typeof kwargs.reasoning_effort === "string") {
-		if (fallback === null) {
+		if (replacement === null) {
 			deleteTemplateKwargReasoningEffort(kwargs, params);
 		} else {
-			kwargs.reasoning_effort = fallback;
+			kwargs.reasoning_effort = replacement;
 		}
 		changed = true;
 	}
@@ -309,6 +382,10 @@ function nearestEnabledReasoningFallback(currentEffort: string, allowed: Set<str
 	return best;
 }
 
+function scopedReasoningEffortFallback(rejectedEffort: string, fallback: string | null): OpenAIReasoningEffortFallback {
+	return [[rejectedEffort, fallback]];
+}
+
 /**
  * Text that identifies a rejection of the kwargs spelling itself: the server
  * names `chat_template_kwargs` together with `reasoning_effort` (Ninfer-style
@@ -330,11 +407,22 @@ function resolveStripTemplateKwargFallback(
 	if (effort === undefined) return undefined;
 	const status = extractHttpStatusFromError(error) ?? captured?.status;
 	if (status !== 400 && status !== 422) return undefined;
+	const code = capturedStringField(captured, "code")?.trim().toLowerCase();
+	const param = capturedStringField(captured, "param")?.trim().toLowerCase();
+	if (code === "unknown_parameter" && param === "chat_template_kwargs.reasoning_effort") {
+		return STRIP_TEMPLATE_KWARG_REASONING_EFFORT;
+	}
 	const message = collectMessageParts(error, captured);
 	if (!TEMPLATE_KWARG_EFFORT_PATTERN.test(message) || !FIELD_REJECTION_PATTERN.test(message)) return undefined;
 	// A value-level rejection listing allowed levels wants the value remapped
 	// (in every spelling) by the ordinary flow, not the kwarg stripped.
 	if (parseAllowedReasoningValues(message, effort) !== undefined) return undefined;
+	// Error payloads often name the kwargs path in `param` even when the value,
+	// not the field spelling, was rejected. An explicitly quoted current value
+	// must use the scoped value fallback so later supported efforts stay intact.
+	const errorMessage = capturedStringField(captured, "message") ?? (error instanceof Error ? error.message : "");
+	const quotedEffort = new RegExp(`["'\`]${escapeRegExp(effort)}["'\`]`, "i");
+	if (quotedEffort.test(errorMessage)) return undefined;
 	return STRIP_TEMPLATE_KWARG_REASONING_EFFORT;
 }
 
@@ -353,12 +441,20 @@ export function resolveOpenAIReasoningEffortFallback(
 	const message = collectMessageParts(error, captured);
 	const allowed = parseAllowedReasoningValues(message, currentEffort);
 	const normalizedCurrent = currentEffort.toLowerCase();
-	if (allowed === undefined) return null;
+	if (allowed === undefined) return scopedReasoningEffortFallback(normalizedCurrent, null);
 	if (options?.explicitDisable) {
-		if (normalizedCurrent !== "none" && allowed.has("none")) return "none";
+		if (normalizedCurrent !== "none" && allowed.has("none")) {
+			return scopedReasoningEffortFallback(normalizedCurrent, "none");
+		}
 		const fallback = lowestEnabledAllowedValue(allowed);
-		return fallback && fallback !== normalizedCurrent ? fallback : null;
+		return scopedReasoningEffortFallback(
+			normalizedCurrent,
+			fallback && fallback !== normalizedCurrent ? fallback : null,
+		);
 	}
-	if (normalizedCurrent === "none") return null;
-	return nearestEnabledReasoningFallback(normalizedCurrent, allowed) ?? null;
+	if (normalizedCurrent === "none") return scopedReasoningEffortFallback(normalizedCurrent, null);
+	return scopedReasoningEffortFallback(
+		normalizedCurrent,
+		nearestEnabledReasoningFallback(normalizedCurrent, allowed) ?? null,
+	);
 }

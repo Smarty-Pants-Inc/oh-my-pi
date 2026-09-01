@@ -528,12 +528,44 @@ describe("tool path arrays", () => {
 			path: "apps/grep.txt, packages/grep.txt",
 		});
 		const text = getText(result);
-		const details = result.details as { notes?: string[] } | undefined;
+		const details = result.details as
+			| { notes?: string[]; displayReadTargetLinks?: Array<{ path: string | null; sourceLineAligned?: boolean }> }
+			| undefined;
 
 		expect(text).toContain("Note: interpreted as 2 paths: apps/grep.txt, packages/grep.txt");
 		expect(text).toContain("shared-needle apps");
 		expect(text).toContain("shared-needle packages");
 		expect(details?.notes).toEqual(["Note: interpreted as 2 paths: apps/grep.txt, packages/grep.txt"]);
+		expect(details?.displayReadTargetLinks).toEqual([
+			{ path: path.join(tempDir, "apps", "grep.txt") },
+			{ path: path.join(tempDir, "packages", "grep.txt") },
+		]);
+	});
+
+	it("read preserves selectors on suffix-resolved delimited paths", async () => {
+		const recovered = path.join(tempDir, "nested", "missing", "apps", "recovered.txt");
+		await fs.mkdir(path.dirname(recovered), { recursive: true });
+		await fs.writeFile(recovered, "recovered\n");
+		const tools = await createTools(createTestSession(tempDir));
+		const tool = tools.find(entry => entry.name === "read");
+		expect(tool).toBeDefined();
+		if (!tool) throw new Error("Missing read tool");
+
+		const result = await tool.execute("read-delimited-suffix", {
+			path: "missing/apps/recovered.txt:1-1, packages/grep.txt:1-1",
+		});
+		const details = result.details as
+			| {
+					displayReadTargets?: string[];
+					displayReadTargetLinks?: Array<{ path: string | null; sourceLineAligned?: boolean }>;
+			  }
+			| undefined;
+
+		expect(details?.displayReadTargets).toEqual(["nested/missing/apps/recovered.txt:1-1", "packages/grep.txt:1-1"]);
+		expect(details?.displayReadTargetLinks).toEqual([
+			{ path: recovered },
+			{ path: path.join(tempDir, "packages", "grep.txt") },
+		]);
 	});
 
 	it("read treats semicolon lists as explicit scope before fuzzy suffix recovery", async () => {
@@ -572,7 +604,9 @@ describe("tool path arrays", () => {
 			path: "missing.txt, packages/grep.txt",
 		});
 		const text = getText(result);
-		const details = result.details as { notes?: string[] } | undefined;
+		const details = result.details as
+			| { notes?: string[]; displayReadTargetLinks?: Array<{ path: string | null; sourceLineAligned?: boolean }> }
+			| undefined;
 
 		expect(text).toContain("Note: interpreted as 2 paths: missing.txt, packages/grep.txt");
 		expect(text).toContain("shared-needle packages");
@@ -581,6 +615,47 @@ describe("tool path arrays", () => {
 			"Note: interpreted as 2 paths: missing.txt, packages/grep.txt",
 			"Could not read missing.txt: Path 'missing.txt' not found",
 		]);
+		expect(details?.displayReadTargetLinks).toEqual([
+			{ path: null },
+			{ path: path.join(tempDir, "packages", "grep.txt") },
+		]);
+	});
+
+	it("records transformed line alignment per delimited read target", async () => {
+		const notebookPath = path.join(tempDir, "apps", "notebook.ipynb");
+		await Bun.write(
+			notebookPath,
+			JSON.stringify({
+				cells: [{ cell_type: "markdown", metadata: {}, source: "Notebook line\n" }],
+				metadata: {},
+				nbformat: 4,
+				nbformat_minor: 5,
+			}),
+		);
+		try {
+			const tools = await createTools(createTestSession(tempDir));
+			const tool = tools.find(entry => entry.name === "read");
+			expect(tool).toBeDefined();
+			if (!tool) throw new Error("Missing read tool");
+
+			const result = await tool.execute("read-delimited-mixed-alignment", {
+				path: "apps/notebook.ipynb:1; packages/grep.txt:1",
+			});
+			const details = result.details as
+				| {
+						sourceLineAligned?: boolean;
+						displayReadTargetLinks?: Array<{ path: string | null; sourceLineAligned?: boolean }>;
+				  }
+				| undefined;
+
+			expect(details?.sourceLineAligned).toBeUndefined();
+			expect(details?.displayReadTargetLinks).toEqual([
+				{ path: notebookPath, sourceLineAligned: false },
+				{ path: path.join(tempDir, "packages", "grep.txt") },
+			]);
+		} finally {
+			await fs.rm(notebookPath);
+		}
 	});
 
 	it("ast_grep accepts quoted path and glob filters", async () => {

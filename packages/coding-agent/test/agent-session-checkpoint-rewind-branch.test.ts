@@ -128,6 +128,7 @@ async function createHarness(
 		"todo.reminders": false,
 	});
 	settings.setModelRole("default", `${mock.provider}/${mock.id}`);
+	let session: AgentSession;
 	const agent = new Agent({
 		getApiKey: () => "test-key",
 		initialState: {
@@ -137,6 +138,12 @@ async function createHarness(
 			messages: [],
 		},
 		convertToLlm,
+		transformProviderContext: context => {
+			const instructions = session.buildProviderContextInstructions();
+			return instructions.length > 0
+				? { ...context, instructions: [...(context.instructions ?? []), ...instructions] }
+				: context;
+		},
 		streamFn: mock.stream,
 	});
 
@@ -156,7 +163,7 @@ async function createHarness(
 		extensionRunner = new ExtensionRunner([extension], runtime, tempDir.path(), sessionManager, modelRegistry);
 	}
 
-	const session = new AgentSession({
+	session = new AgentSession({
 		agent,
 		sessionManager,
 		settings,
@@ -236,22 +243,20 @@ describe("AgentSession checkpoint rewind branch context", () => {
 		expect(mock.calls.length).toBe(3);
 		const finalCall = mock.calls[2];
 		if (!finalCall) throw new Error("Expected final post-rewind provider call");
-		const summaryIndex = finalCall.context.messages.findIndex(message => {
-			if (message.role !== "user") return false;
-			const text = messageText(message);
-			const openIndex = text.indexOf("<summary>");
-			const closeIndex = text.indexOf("</summary>", openIndex + "<summary>".length);
-			return (
-				openIndex >= 0 &&
-				closeIndex > openIndex + "<summary>".length &&
-				text.slice(openIndex + "<summary>".length, closeIndex).trim().length > 0
-			);
-		});
+		const summaryInstruction = finalCall.context.instructions?.find(
+			instruction => instruction.id === "agent.compaction.prompts.branch-summary-context",
+		);
+		expect(summaryInstruction?.role).toBe("internal_context");
+		const summaryText = summaryInstruction?.renderedText ?? "";
+		const openIndex = summaryText.indexOf("<summary>");
+		const closeIndex = summaryText.indexOf("</summary>", openIndex + "<summary>".length);
+		expect(openIndex).toBeGreaterThanOrEqual(0);
+		expect(closeIndex).toBeGreaterThan(openIndex + "<summary>".length);
+		expect(summaryText.slice(openIndex + "<summary>".length, closeIndex).trim().length).toBeGreaterThan(0);
 		const reportIndex = finalCall.context.messages.findIndex(
 			message => message.role === "developer" && messageText(message).includes(report),
 		);
-		expect(summaryIndex).toBeGreaterThan(-1);
-		expect(reportIndex).toBeGreaterThan(summaryIndex);
+		expect(reportIndex).toBeGreaterThan(-1);
 		const reportMessage = finalCall.context.messages[reportIndex];
 		if (!reportMessage) throw new Error("Expected rewind report context");
 		const reportText = messageText(reportMessage);
@@ -274,8 +279,8 @@ describe("AgentSession checkpoint rewind branch context", () => {
 		expect(finalThinking?.thinkingSignature).toBe("sig_after_rewind");
 	});
 
-	it("shows a transient checkpoint-active reminder that is branch-cut away on rewind", async () => {
-		const report = "findings: transient reminder";
+	it("delivers checkpoint-active notice as typed internal context until rewind", async () => {
+		const report = "findings: typed checkpoint notice";
 		const proceed = Promise.withResolvers<void>();
 		const { session, mock } = await createHarness(
 			(async function* () {
@@ -296,44 +301,35 @@ describe("AgentSession checkpoint rewind branch context", () => {
 
 		const promptPromise = session.prompt("investigate with a checkpoint");
 		// Pause the model between the checkpoint and rewind calls to observe the
-		// active-checkpoint state: the transient notice must be in the active path.
+		// provider-bound notice while the checkpoint is active.
 		const deadline = Date.now() + 5000;
-		while (
-			!session.messages.some(
-				message => message.role === "custom" && message.customType === "checkpoint-active-reminder",
-			) ||
-			mock.calls.length < 2
-		) {
-			if (Date.now() > deadline) throw new Error("checkpoint reminder/provider call never appeared");
+		while (mock.calls.length < 2 || !session.getCheckpointState()) {
+			if (Date.now() > deadline) throw new Error("checkpoint notice/provider call never appeared");
 			await Bun.sleep(10);
 		}
-		const reminder = session.messages.find(
-			(message): message is Extract<AgentMessage, { role: "custom" }> =>
-				message.role === "custom" && message.customType === "checkpoint-active-reminder",
-		);
-		expect(reminder).toBeDefined();
-		expect(reminder?.content).toContain("MUST `rewind` before yielding");
 		const activeCall = mock.calls[1];
 		expect(activeCall).toBeDefined();
+		const notice = activeCall?.context.instructions?.find(
+			instruction => instruction.id === "system.checkpoint-active-notice",
+		);
+		expect(notice?.role).toBe("internal_context");
+		expect(notice?.renderedText).toContain("Exploration checkpoint active.");
+		expect(notice?.renderedText).toContain("MUST `rewind` before yielding");
 		expect(
 			activeCall?.context.messages.some(message => messageText(message).includes("Exploration checkpoint active.")),
-		).toBe(true);
-		// #checkpointState is set synchronously with the reminder (pre-await), so an
+		).toBe(false);
+		// #checkpointState is set synchronously before provider delivery, so an
 		// immediate rewind would find an active checkpoint, not "No active checkpoint".
 		expect(session.getCheckpointState()).toBeDefined();
 		proceed.resolve();
 		await promptPromise;
 
-		// After rewind the branch cut dropped the reminder from the active path.
-		expect(
-			session.messages.some(
-				message => message.role === "custom" && message.customType === "checkpoint-active-reminder",
-			),
-		).toBe(false);
-
 		// No negation guard anywhere in the model-visible context.
 		const finalCall = mock.calls.at(-1);
 		if (!finalCall) throw new Error("Expected final post-rewind provider call");
+		expect(
+			finalCall.context.instructions?.some(instruction => instruction.id === "system.checkpoint-active-notice"),
+		).toBe(false);
 		for (const message of finalCall.context.messages) {
 			const text = messageText(message);
 			expect(text).not.toContain("NEVER call");
@@ -703,7 +699,7 @@ describe("AgentSession checkpoint rewind branch context", () => {
 			true,
 		);
 	});
-	it("marks extension agent_end willContinue when enforceRewindBeforeYield continues", async () => {
+	it("leaves an open checkpoint inert when the model stops without rewind", async () => {
 		const agentEnds: Array<boolean | undefined> = [];
 
 		const report = "findings: enforced rewind before yield";
@@ -715,7 +711,7 @@ describe("AgentSession checkpoint rewind branch context", () => {
 					],
 					stopReason: "toolUse",
 				},
-				// Text-only stop while checkpoint is open → #enforceRewindBeforeYield.
+				// A text-only stop while the checkpoint remains open is still terminal.
 				{ content: ["done without rewind"], stopReason: "stop" },
 				{
 					content: [{ type: "toolCall", id: "call_rewind", name: "rewind", arguments: { report } }],
@@ -730,16 +726,21 @@ describe("AgentSession checkpoint rewind branch context", () => {
 		await session.prompt("investigate with a checkpoint then yield early");
 		await session.waitForIdle();
 
-		// Intermediate enforceRewindBeforeYield settle, then terminal post-rewind settle.
-		expect(agentEnds.length).toBeGreaterThanOrEqual(2);
-		const continuing = agentEnds.filter(willContinue => willContinue === true);
-		expect(continuing).toHaveLength(1);
-		const intermediateIndex = agentEnds.indexOf(true);
-		expect(intermediateIndex).toBeGreaterThanOrEqual(0);
-		expect(intermediateIndex).toBeLessThan(agentEnds.length - 1);
+		expect(agentEnds).toHaveLength(1);
+		expect(agentEnds).not.toContain(true);
 		expect(agentEnds.at(-1)).toBeFalsy();
-		expect(mock.calls.length).toBeGreaterThanOrEqual(3);
-		expect(expectLastAssistant(session.messages).stopReason).toBe("stop");
+		expect(mock.calls).toHaveLength(2);
+		expect(
+			mock.calls[1]?.context.instructions?.some(
+				instruction =>
+					instruction.id === "system.checkpoint-active-notice" && instruction.role === "internal_context",
+			),
+		).toBe(true);
+		expect(session.getCheckpointState()).toBeDefined();
+		const lastAssistant = session.messages.findLast(message => message.role === "assistant");
+		expect(lastAssistant?.role).toBe("assistant");
+		if (lastAssistant?.role === "assistant") expect(lastAssistant.stopReason).toBe("stop");
+		expect(session.messages.at(-1)?.role).toBe("assistant");
 	});
 
 	it("rehydrates an active checkpoint from an xdev write after branching and resume", async () => {

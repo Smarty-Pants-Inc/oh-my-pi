@@ -4,12 +4,14 @@ import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import type { ResolvedOpenAICompat } from "@oh-my-pi/pi-catalog/types";
 import { clinePassClientHeaders } from "@oh-my-pi/pi-catalog/wire/cline-pass";
 import { $env, logger, parseStreamingJson, parseStreamingJsonThrottled } from "@oh-my-pi/pi-utils";
+import { mapContextInstructions, supportsDeveloperRoleForContext } from "../context-instructions";
 import { renderDemotedThinking } from "../dialect/demotion";
 import * as AIError from "../error";
 import { getKimiCommonHeaders } from "../registry/oauth/kimi";
 import { getEnvApiKey } from "../stream";
 import type {
 	AssistantMessage,
+	CacheRetention,
 	Context,
 	Message,
 	MessageAttribution,
@@ -74,6 +76,7 @@ import {
 	createOpenAIReasoningEffortFallbackKey,
 	createOpenAIReasoningEffortFallbackState,
 	getOpenAIReasoningEffortFallback,
+	mergeOpenAIReasoningEffortFallback,
 	type OpenAIReasoningEffortFallback,
 	type OpenAIReasoningEffortFallbackState,
 	rememberOpenAIReasoningEffortFallback,
@@ -768,6 +771,10 @@ const streamOpenAICompletionsOnce = (
 				activeReasoningEffortFallbackKey = reasoningEffortFallbackKey;
 				const replacedParams = await options?.onPayload?.(params, model);
 				if (replacedParams !== undefined) params = replacedParams as typeof params;
+				// A replacement must not resurrect a field this endpoint already rejected.
+				if (requestReasoningEffortFallback !== undefined) {
+					applyOpenAIReasoningEffortFallback(params, requestReasoningEffortFallback);
+				}
 				activeRequestParams = params;
 				rawRequestDump = {
 					provider: model.provider,
@@ -857,7 +864,6 @@ const streamOpenAICompletionsOnce = (
 					// subsequent request doesn't pay a strict-400 + retry round-trip.
 					disableStrictToolsForScope(providerSessionState, strictToolsScope);
 					disableStrictTools = true;
-					openaiStream = await createCompletionsStream("none");
 				}
 			}
 			if (premiumRequestsTotal !== undefined) {
@@ -1619,8 +1625,15 @@ function applyOpenAIChatCompletionsPromptCachePolicy(
 		params.prompt_cache_key = promptCacheKey;
 	}
 
+	const cacheRetention = resolveCacheRetention(options?.cacheRetention);
+	if (cacheRetention === "none") {
+		if (model.compat.supportsPromptCacheBreakpoints) {
+			params.prompt_cache_options = { mode: "explicit" };
+		}
+		return;
+	}
 	const promptCache = options?.promptCache;
-	if (!promptCache || resolveCacheRetention(options?.cacheRetention) === "none") return;
+	if (!promptCache) return;
 	if (!model.compat.supportsPromptCacheBreakpoints) {
 		if (promptCache.mode === "explicit") {
 			throw new AIError.ConfigurationError(
@@ -1806,7 +1819,7 @@ function buildParams(
 	});
 	const compat = finalPolicy.compat as ResolvedOpenAICompat;
 	const messages = convertMessages(model, context, compat);
-	maybeAddAnthropicCacheControl(compat, messages);
+	maybeAddAnthropicCacheControl(compat, messages, cacheRetention);
 	params.messages = messages;
 	const outputToken = resolveOpenAIOutputTokenParam({
 		field: compat.maxTokensField,
@@ -1890,8 +1903,14 @@ export function parseChunkUsage(
 	return usage;
 }
 
-function maybeAddAnthropicCacheControl(compat: ResolvedOpenAICompat, messages: ChatCompletionMessageParam[]): void {
-	if (compat.cacheControlFormat !== "anthropic") return;
+function maybeAddAnthropicCacheControl(
+	compat: ResolvedOpenAICompat,
+	messages: ChatCompletionMessageParam[],
+	cacheRetention: CacheRetention,
+): void {
+	if (compat.cacheControlFormat !== "anthropic" || cacheRetention === "none") return;
+	const cacheControl =
+		cacheRetention === "long" ? { type: "ephemeral" as const, ttl: "1h" as const } : { type: "ephemeral" as const };
 	// Anthropic-style caching requires cache_control on a text part. Add a breakpoint
 	// on the last user/assistant message (walking backwards until we find text content).
 	for (let i = messages.length - 1; i >= 0; i--) {
@@ -1901,9 +1920,7 @@ function maybeAddAnthropicCacheControl(compat: ResolvedOpenAICompat, messages: C
 		const content = msg.content;
 		if (typeof content === "string") {
 			if (content.trim().length === 0) continue;
-			msg.content = [
-				Object.assign({ type: "text" as const, text: content }, { cache_control: { type: "ephemeral" } }),
-			];
+			msg.content = [Object.assign({ type: "text" as const, text: content }, { cache_control: cacheControl })];
 			return;
 		}
 
@@ -1915,7 +1932,7 @@ function maybeAddAnthropicCacheControl(compat: ResolvedOpenAICompat, messages: C
 		for (let j = content.length - 1; j >= 0; j--) {
 			const part = content[j];
 			if (part?.type === "text" && part.text.trim().length > 0) {
-				Object.assign(part, { cache_control: { type: "ephemeral" } });
+				Object.assign(part, { cache_control: cacheControl });
 				return;
 			}
 		}
@@ -1996,21 +2013,41 @@ export function convertMessages(
 	};
 
 	const systemPrompts = normalizeSystemPrompts(context.systemPrompt);
-	if (systemPrompts.length > 0) {
-		const useDeveloperRole = model.reasoning && compat.supportsDeveloperRole;
-		const role = useDeveloperRole ? "developer" : "system";
+	const useDeveloperRole = model.reasoning && compat.supportsDeveloperRole;
+	const legacyRole: "developer" | "system" = useDeveloperRole ? "developer" : "system";
+	const supportsDeveloperContextRole = supportsDeveloperRoleForContext(model, compat.supportsDeveloperRole);
+	const instructionMessages: Array<{ role: "system" | "developer"; content: string }> = [
+		...systemPrompts.map(content => ({ role: legacyRole, content })),
+		...mapContextInstructions(context.instructions, supportsDeveloperContextRole).map(instruction => ({
+			role: instruction.actualRole,
+			content: instruction.renderedText.toWellFormed(),
+		})),
+	];
+	if (instructionMessages.length > 0) {
 		// Default to one block per ordered system prompt so the leading prefix
 		// stays byte-identical between turns and the provider's KV cache can
 		// reuse it. Hosts whose chat templates reject follow-up system messages
 		// (Qwen via vLLM, MiniMax, Alibaba Dashscope, Qwen Portal, …) opt out
 		// via `compat.supportsMultipleSystemMessages = false`; in that mode we
-		// coalesce into a single message joined by `\n\n`.
+		// coalesce consecutive messages with the same actual role. A role change
+		// remains explicit so semantic system and developer authority are not
+		// flattened together.
 		if (compat.supportsMultipleSystemMessages) {
-			for (const systemPrompt of systemPrompts) {
-				params.push({ role, content: systemPrompt });
-			}
+			params.push(...instructionMessages);
 		} else {
-			params.push({ role, content: systemPrompts.join("\n\n") });
+			for (const message of instructionMessages) {
+				const previous = params.at(-1);
+				if (
+					previous &&
+					(previous.role === "system" || previous.role === "developer") &&
+					previous.role === message.role &&
+					typeof previous.content === "string"
+				) {
+					previous.content = `${previous.content}\n\n${message.content}`;
+				} else {
+					params.push(message);
+				}
+			}
 		}
 	}
 

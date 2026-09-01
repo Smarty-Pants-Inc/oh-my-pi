@@ -13,8 +13,8 @@ describe("SpeechEnhancer rewriting", () => {
 		if (!baseModel) throw new Error("Expected bundled Claude Sonnet 4.5 model");
 		const model = { ...baseModel, reasoning: false };
 		const settings = {
-			get() {
-				return undefined;
+			get(path: string) {
+				return path === "providers.cacheRetention" ? "none" : undefined;
 			},
 			getModelRole(role: string) {
 				return role === "tiny" ? `${model.provider}/${model.id}` : undefined;
@@ -37,11 +37,11 @@ describe("SpeechEnhancer rewriting", () => {
 			"**Spoken text**",
 		);
 		const options = completeSimpleMock.mock.calls[0]?.[2] as
-			| { disableReasoning?: boolean; maxTokens?: number }
+			| { cacheRetention?: string; disableReasoning?: boolean; maxTokens?: number }
 			| undefined;
 
 		expect(rewritten).toBe("Spoken text");
-		expect(options).toMatchObject({ disableReasoning: true, maxTokens: 1536 });
+		expect(options).toMatchObject({ cacheRetention: "none", disableReasoning: true, maxTokens: 1536 });
 	});
 });
 

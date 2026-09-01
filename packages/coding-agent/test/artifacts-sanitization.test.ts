@@ -26,26 +26,38 @@ describe("ArtifactManager tool-type sanitization", () => {
 		const dir = freshDir();
 		const mgr = new ArtifactManager(dir);
 		for (const hostile of ["../../etc/passwd", "mcp__srv/peek", "a\\b\\c", "..", "./escape", "tool name"]) {
-			const { path: filePath } = await mgr.allocatePath(hostile);
-			expect(path.dirname(filePath)).toBe(dir);
-			expect(path.basename(filePath)).toMatch(/^\d+\.[A-Za-z0-9_-]+\.log$/);
+			const allocation = await mgr.allocatePath(hostile);
+			try {
+				expect(path.dirname(allocation.path)).toBe(dir);
+				expect(path.basename(allocation.path)).toMatch(/^\d+\.[A-Za-z0-9_-]+\.log$/);
+			} finally {
+				allocation.release();
+			}
 		}
 	});
 
 	it("caps very long tool names so the filename stays within filesystem limits", async () => {
 		const mgr = new ArtifactManager(freshDir());
-		const { path: filePath } = await mgr.allocatePath("x".repeat(500));
-		const segment = path
-			.basename(filePath)
-			.replace(/^\d+\./, "")
-			.replace(/\.log$/, "");
-		expect(segment.length).toBeLessThanOrEqual(64);
+		const allocation = await mgr.allocatePath("x".repeat(500));
+		try {
+			const segment = path
+				.basename(allocation.path)
+				.replace(/^\d+\./, "")
+				.replace(/\.log$/, "");
+			expect(segment.length).toBeLessThanOrEqual(64);
+		} finally {
+			allocation.release();
+		}
 	});
 
 	it("falls back to a stable segment when nothing survives sanitization", async () => {
 		const mgr = new ArtifactManager(freshDir());
-		const { path: filePath } = await mgr.allocatePath("/../");
-		expect(path.basename(filePath)).toMatch(/^\d+\.tool\.log$/);
+		const allocation = await mgr.allocatePath("/../");
+		try {
+			expect(path.basename(allocation.path)).toMatch(/^\d+\.tool\.log$/);
+		} finally {
+			allocation.release();
+		}
 	});
 
 	// Recovery is keyed on the numeric id, so sanitizing the type segment must not

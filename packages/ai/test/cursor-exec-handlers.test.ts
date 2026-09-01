@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import { EventEmitter } from "node:events";
 import {
 	type BlockState,
 	buildCursorHistoryForTest,
@@ -32,6 +33,7 @@ import {
 	ReadRejectedSchema,
 	ReadResultSchema,
 	ReadSuccessSchema,
+	ShellArgsSchema,
 } from "@oh-my-pi/pi-catalog/discovery/cursor-proto";
 import { create, encodeJsonValue } from "@oh-my-pi/pi-catalog/discovery/protobuf";
 import { logger } from "@oh-my-pi/pi-utils";
@@ -456,6 +458,30 @@ describe("Cursor system prompt encoding", () => {
 		const jsons = buildCursorSystemPromptJsons(["", ""]);
 		expect(jsons).toHaveLength(1);
 		expect(JSON.parse(jsons[0])).toEqual({ role: "system", content: "You are a helpful assistant." });
+		expect(buildCursorRequestContextRules(["", ""])[0]?.content).toBe("You are a helpful assistant.");
+	});
+
+	it("encodes typed internal context as matching system blobs and global rules", () => {
+		const instructions: Context["instructions"] = [
+			{
+				id: "compaction.summary",
+				sourcePath: "packages/agent/src/compaction/prompt.md",
+				role: "internal_context",
+				target: "main",
+				trigger: "compaction",
+				sha256: "test-sha256",
+				renderedText: "Preserve this compacted history.",
+			},
+		];
+		const jsons = buildCursorSystemPromptJsons(["Primary instructions."], instructions, cursorModel);
+		const rules = buildCursorRequestContextRules(["Primary instructions."], instructions, cursorModel);
+
+		expect(jsons.map(json => JSON.parse(json))).toEqual([
+			{ role: "system", content: "Primary instructions." },
+			{ role: "system", content: "Preserve this compacted history." },
+		]);
+		expect(rules.map(rule => rule.content)).toEqual(["Primary instructions.", "Preserve this compacted history."]);
+		expect(rules.every(rule => rule.type?.type.case === "global")).toBe(true);
 	});
 
 	it("maps ordered system prompts to global CursorRule entries", () => {
@@ -468,6 +494,55 @@ describe("Cursor system prompt encoding", () => {
 		expect(rules[1]?.content).toContain(canary);
 		expect(rules[0]?.source).toBe(CursorRuleSource.USER);
 		expect(rules[1]?.type?.type.case).toBe("global");
+	});
+});
+
+describe("Cursor late tool contract evidence", () => {
+	it("awaits the exact request-context tool definitions before transport setup", async () => {
+		const { promise, resolve } = Promise.withResolvers<unknown>();
+		const stream = streamCursor(
+			cursorModel,
+			{
+				messages: [{ role: "user", content: "Use probe.", timestamp: 0 }],
+				tools: [
+					{
+						name: "probe",
+						description: "Probe a value",
+						parameters: {
+							type: "object",
+							properties: { value: { type: "string" } },
+							required: ["value"],
+						},
+					},
+				],
+			},
+			{
+				apiKey: "test-token",
+				onToolContracts: async payload => {
+					await Promise.resolve();
+					resolve(payload);
+					throw new Error("captured Cursor tool contracts");
+				},
+			},
+		);
+
+		const payload = (await promise) as {
+			tools?: Array<{ name?: unknown; description?: unknown; parametersJsonSchema?: unknown }>;
+		};
+		const result = await stream.result();
+		expect(payload.tools).toEqual([
+			{
+				name: "probe",
+				description: "Probe a value",
+				parametersJsonSchema: {
+					type: "object",
+					properties: { value: { type: "string" } },
+					required: ["value"],
+				},
+			},
+		]);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("captured Cursor tool contracts");
 	});
 });
 
@@ -1443,7 +1518,168 @@ describe("Cursor exec local-work tracking (issue #4593)", () => {
 		expect(written.length).toBe(1);
 	});
 
-	it("synthesizes an MCP call while preserving opaque string arguments", async () => {
+	it("revalidates after a local exec handler before writing its result", async () => {
+		const output = cursorAssistantMessage();
+		const stream = new AssistantMessageEventStream();
+		const state = newBlockState();
+		const written: unknown[] = [];
+		const h2Request = {
+			write: (chunk: unknown) => {
+				written.push(chunk);
+				return true;
+			},
+		} as unknown as Parameters<typeof handleServerMessage>[5];
+		const handlerStarted = Promise.withResolvers<void>();
+		const releaseHandler = Promise.withResolvers<void>();
+		const execHandlers: CursorExecHandlers = {
+			async read(args) {
+				handlerStarted.resolve();
+				await releaseHandler.promise;
+				return {
+					role: "toolResult",
+					toolCallId: args.toolCallId,
+					toolName: "read",
+					content: [{ type: "text", text: "newly sensitive file contents" }],
+					isError: false,
+					timestamp: 1,
+				} satisfies ToolResultMessage;
+			},
+		};
+		const serverMsg = create(AgentServerMessageSchema, {
+			message: {
+				case: "execServerMessage",
+				value: create(ExecServerMessageSchema, {
+					id: 1,
+					execId: "exec-guarded-read",
+					message: {
+						case: "readArgs",
+						value: create(ReadArgsSchema, { path: "/tmp/slow-file", toolCallId: "call-guarded-read" }),
+					},
+				}),
+			},
+		});
+		let valid = true;
+		const dispatch = handleServerMessage(
+			serverMsg,
+			output,
+			stream,
+			state,
+			new Map(),
+			h2Request,
+			execHandlers,
+			undefined,
+			{ sawTokenDelta: false },
+			[],
+			undefined,
+			undefined,
+			() => {
+				if (!valid) throw new Error("Cursor request became stale during local exec");
+			},
+		);
+
+		await handlerStarted.promise;
+		valid = false;
+		releaseHandler.resolve();
+
+		await expect(dispatch).rejects.toThrow("Cursor request became stale during local exec");
+		expect(written).toEqual([]);
+	});
+
+	it("rejects stale streamed output immediately and quarantines a late handler result", async () => {
+		vi.useFakeTimers();
+		const output = cursorAssistantMessage();
+		const stream = new AssistantMessageEventStream();
+		const state = newBlockState();
+		const written: unknown[] = [];
+		const h2Request = Object.assign(new EventEmitter(), {
+			closed: false,
+			destroyed: false,
+			write(chunk: unknown) {
+				written.push(chunk);
+				return true;
+			},
+		}) as unknown as Parameters<typeof handleServerMessage>[5];
+		const handlerStarted = Promise.withResolvers<void>();
+		const handlerSettled = Promise.withResolvers<void>();
+		const releaseHandler = Promise.withResolvers<void>();
+		let handlerSignal: AbortSignal | undefined;
+		const onToolResult = vi.fn((result: ToolResultMessage) => result);
+		const execHandlers: CursorExecHandlers = {
+			async shellStream(args, callbacks, signal) {
+				handlerSignal = signal;
+				callbacks.onStdout("delayed output");
+				handlerStarted.resolve();
+				await releaseHandler.promise;
+				handlerSettled.resolve();
+				return {
+					role: "toolResult",
+					toolCallId: args.toolCallId,
+					toolName: "bash",
+					content: [{ type: "text", text: "done" }],
+					isError: false,
+					timestamp: 1,
+				} satisfies ToolResultMessage;
+			},
+		};
+		const serverMsg = create(AgentServerMessageSchema, {
+			message: {
+				case: "execServerMessage",
+				value: create(ExecServerMessageSchema, {
+					id: 1,
+					execId: "exec-guarded-shell-stream",
+					message: {
+						case: "shellStreamArgs",
+						value: create(ShellArgsSchema, {
+							command: "printf delayed",
+							workingDirectory: "/tmp",
+							toolCallId: "call-guarded-shell-stream",
+						}),
+					},
+				}),
+			},
+		});
+		let valid = true;
+		const dispatch = handleServerMessage(
+			serverMsg,
+			output,
+			stream,
+			state,
+			new Map(),
+			h2Request,
+			execHandlers,
+			onToolResult,
+			{ sawTokenDelta: false },
+			[],
+			undefined,
+			undefined,
+			() => {
+				if (!valid) throw new Error("Cursor request became stale before output flush");
+			},
+		);
+
+		try {
+			await handlerStarted.promise;
+			expect(written).toHaveLength(1); // shellStream start frame
+			valid = false;
+			vi.advanceTimersByTime(100);
+			expect(written).toHaveLength(1);
+			await expect(dispatch).rejects.toThrow("Cursor request became stale before output flush");
+			expect(stream.hasPendingLocalWork).toBe(false);
+			expect(handlerSignal?.aborted).toBe(true);
+
+			// This fake intentionally ignores abort. Its eventual result must not enter
+			// the Agent buffer after the provider dispatch has already failed.
+			releaseHandler.resolve();
+			await handlerSettled.promise;
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(onToolResult).not.toHaveBeenCalled();
+		} finally {
+			releaseHandler.resolve();
+			vi.useRealTimers();
+		}
+	});
+	it("synthesizes an MCP call when the exec frame precedes its streamed block", async () => {
 		const output = cursorAssistantMessage();
 		const stream = new AssistantMessageEventStream();
 		const state = newBlockState();

@@ -238,6 +238,20 @@ describe("InspectImageTool", () => {
 		expect(options?.reasoning).toBe("high");
 	});
 
+	it("passes explicit session cache retention into the one-shot request", async () => {
+		const settings = Settings.isolated({ "providers.cacheRetention": "long" });
+		const stub = createCompleteSimpleSuccessStub("Red");
+		const tool = new InspectImageTool(createSession(testDir, visionModel, "test-key", settings), stub.fn);
+
+		await tool.execute("call-cache-retention", {
+			path: imagePath,
+			question: "What dominant color is this image? One word only.",
+		});
+
+		const options = stub.calls[0]?.[2] as { cacheRetention?: string } | undefined;
+		expect(options?.cacheRetention).toBe("long");
+	});
+
 	it("resolves pasted image labels from current attachments without using cwd", async () => {
 		const image: ImageContent = { type: "image", data: TINY_PNG_BASE64, mimeType: "image/png" };
 		const stub = createCompleteSimpleSuccessStub("Attached image inspected");

@@ -19,12 +19,13 @@ import { encodeTextSignatureV1 } from "@oh-my-pi/pi-ai/providers/openai-shared";
 import type { AssistantMessage, Model, ProviderPayload, Usage } from "@oh-my-pi/pi-ai/types";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { buildSessionContext } from "@oh-my-pi/pi-coding-agent/session/session-context";
-import type {
-	CompactionEntry,
-	ModelChangeEntry,
-	SessionEntry,
-	SessionMessageEntry,
-	ThinkingLevelChangeEntry,
+import {
+	type CompactionEntry,
+	isSessionEntry,
+	type ModelChangeEntry,
+	type SessionEntry,
+	type SessionMessageEntry,
+	type ThinkingLevelChangeEntry,
 } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { parseSessionEntries } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { migrateSessionEntries } from "@oh-my-pi/pi-coding-agent/session/session-migrations";
@@ -42,7 +43,7 @@ async function loadLargeSessionEntries(): Promise<SessionEntry[]> {
 	const content = await Bun.file(sessionPath).text();
 	const entries = parseSessionEntries(content);
 	migrateSessionEntries(entries); // Add id/parentId for v1 fixtures
-	return entries.filter((e): e is SessionEntry => e.type !== "session");
+	return entries.filter(isSessionEntry);
 }
 
 function createMockUsage(input: number, output: number, cacheRead = 0, cacheWrite = 0): Usage {
@@ -456,6 +457,7 @@ describe("bigint tool arguments", () => {
 
 		let renderedPrompts = "";
 		for (const call of completeSpy.mock.calls) {
+			for (const instruction of call[1].instructions ?? []) renderedPrompts += instruction.renderedText;
 			for (const message of call[1].messages) {
 				if (typeof message.content === "string") {
 					renderedPrompts += message.content;
@@ -939,8 +941,14 @@ describe("remote compaction setting", () => {
 		const result = await compact(preparation, model, "test-api-key");
 		const promptText = completeSimpleSpy.mock.calls
 			.map(call => {
-				const context = call[1] as { messages?: Array<{ content?: Array<{ text?: string }> }> };
-				return context.messages?.[0]?.content?.[0]?.text ?? "";
+				const context = call[1] as {
+					instructions?: Array<{ renderedText: string }>;
+					messages?: Array<{ content?: Array<{ text?: string }> }>;
+				};
+				return [
+					...(context.instructions?.map(instruction => instruction.renderedText) ?? []),
+					...(context.messages?.flatMap(message => message.content?.map(block => block.text ?? "") ?? []) ?? []),
+				].join("\n");
 			})
 			.join("\n");
 
@@ -993,8 +1001,14 @@ describe("remote compaction setting", () => {
 		const result = await compact(preparation, model, "test-api-key");
 		const promptText = completeSimpleSpy.mock.calls
 			.map(call => {
-				const context = call[1] as { messages?: Array<{ content?: Array<{ text?: string }> }> };
-				return context.messages?.[0]?.content?.[0]?.text ?? "";
+				const context = call[1] as {
+					instructions?: Array<{ renderedText: string }>;
+					messages?: Array<{ content?: Array<{ text?: string }> }>;
+				};
+				return [
+					...(context.instructions?.map(instruction => instruction.renderedText) ?? []),
+					...(context.messages?.flatMap(message => message.content?.map(block => block.text ?? "") ?? []) ?? []),
+				].join("\n");
 			})
 			.join("\n");
 

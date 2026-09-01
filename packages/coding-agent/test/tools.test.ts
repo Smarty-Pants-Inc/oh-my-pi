@@ -13,6 +13,8 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { wrapToolWithMetaNotice } from "@oh-my-pi/pi-coding-agent/tools/output-meta";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
+import { resolveArchiveReadPath } from "@oh-my-pi/pi-coding-agent/tools/read-archive";
+import { resolveSqliteReadPath } from "@oh-my-pi/pi-coding-agent/tools/read-sqlite";
 import * as toolTimeouts from "@oh-my-pi/pi-coding-agent/tools/tool-timeouts";
 import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
 import { $which, removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
@@ -1568,6 +1570,15 @@ describe("Coding Agent Tools", () => {
 			expect(result.details?.isDirectory).toBe(true);
 		});
 
+		it("only dispatches archive and SQLite readers for regular backing files", async () => {
+			const archiveFifo = path.join(testDir, "not-a-file.zip");
+			const sqliteFifo = path.join(testDir, "not-a-file.sqlite");
+			if (!createFifoOrSkip(archiveFifo) || !createFifoOrSkip(sqliteFifo)) return;
+
+			expect(await resolveArchiveReadPath(session, archiveFifo, new Map())).toBeNull();
+			expect(await resolveSqliteReadPath(session, sqliteFifo, new Map())).toBeNull();
+		});
+
 		it("should list zip archives without inflating member payloads", async () => {
 			const archivePath = path.join(testDir, "header-only.zip");
 			fs.writeFileSync(
@@ -1761,6 +1772,7 @@ describe("Coding Agent Tools", () => {
 			expect(output).toContain("question");
 			expect(output).not.toContain("optional context");
 			expect(result.content.some(c => c.type === "image")).toBe(false);
+			expect(result.details?.sourceLineAligned).toBe(false);
 		});
 
 		it("omits inspect_image from the description when the tool is disabled", () => {

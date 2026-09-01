@@ -105,7 +105,7 @@ function generateSnapshotScript(shell: string, snapshotPath: string, rcFile: str
 	const hasRcFile = fs.existsSync(rcFile);
 	const isZsh = shell.includes("zsh");
 	const commonToolsRegex =
-		"^(ls|dir|vdir|cat|head|tail|less|more|grep|egrep|fgrep|rg|find|fd|locate|sed|awk|perl|cp|mv|rm|mkdir|rmdir|touch|chmod|chown|ln|pwd|readlink|stat|cut|sort|uniq|xargs|tee|tr|basename|dirname)$";
+		"^(ls|dir|vdir|cat|head|tail|less|more|grep|egrep|fgrep|rg|find|fd|locate|sed|awk|perl|cp|mv|rm|mkdir|rmdir|touch|chmod|chown|ln|pwd|readlink|stat|cut|sort|uniq|xargs|tee|tr|basename|dirname|git|gh)$";
 
 	// Escape the snapshot path for shell
 	const escapedPath = snapshotPath.replace(/'/g, "'\\''");
@@ -189,9 +189,9 @@ ${optionsScript}
 echo "# Aliases" >> "$SNAPSHOT_FILE"
 # Filter out winpty aliases on Windows to avoid "stdin is not a tty" errors
 if [[ "$OSTYPE" == "msys" ]] || [[ "$OSTYPE" == "cygwin" ]]; then
-   alias 2>/dev/null | grep -v "='winpty " | grep -vE '^alias (${commonToolsRegex})=' | sed 's/^alias //g' | sed 's/^/alias -- /' | head -n 1000 >> "$SNAPSHOT_FILE"
+   alias 2>/dev/null | grep -v "='winpty " | grep -vE '^alias (git|gh)=' | grep -vE '^alias (${commonToolsRegex})=' | sed 's/^alias //g' | sed 's/^/alias -- /' | head -n 1000 >> "$SNAPSHOT_FILE"
 else
-   alias 2>/dev/null | grep -vE '^alias (${commonToolsRegex})=' | sed 's/^alias //g' | sed 's/^/alias -- /' | head -n 1000 >> "$SNAPSHOT_FILE"
+   alias 2>/dev/null | grep -vE '^alias (git|gh)=' | grep -vE '^alias (${commonToolsRegex})=' | sed 's/^alias //g' | sed 's/^/alias -- /' | head -n 1000 >> "$SNAPSHOT_FILE"
 fi
 
 # Export PATH

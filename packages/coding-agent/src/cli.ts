@@ -28,8 +28,17 @@ import { interceptUnhandledRejections } from "@oh-my-pi/pi-utils/postmortem";
 import { setProcessName } from "@oh-my-pi/pi-utils/process-name";
 import { declareWorkerHostEntry, installWorkerInbox, isWorkerHostSelector } from "@oh-my-pi/pi-utils/worker-host";
 import { BLOB_BROKER_WORKER_ARG } from "./blob-broker/protocol";
+import { OMP_BUILD_ID } from "./build-identity";
 import { installProfileAlias, resolveProfileAliasCommandFromProcess } from "./cli/profile-alias";
 import { extractProfileFlags } from "./cli/profile-bootstrap";
+import {
+	captureHerdrBridgeBootstrap,
+	clearHerdrGuestBridgeTokenHandoff,
+	clearHerdrHostBridgeHandoff,
+	type HerdrHostBridgeBootstrap,
+	handoffHerdrGuestBridgeToken,
+	handoffHerdrHostBridge,
+} from "./collab/herdr-bridge-bootstrap";
 import { startJsEvalProcess } from "./eval/js/process-entry";
 import type { WorkerInbound as JsWorkerInbound, WorkerOutbound as JsWorkerOutbound } from "./eval/js/worker-protocol";
 import { DAEMON_BROKER_WORKER_ARG } from "./launch/protocol";
@@ -341,8 +350,13 @@ async function runTinyWorker(): Promise<void> {
 
 /** Run the CLI with the given argv (no `process.argv` prefix). */
 export async function runCli(argv: string[]): Promise<void> {
+	let capturedHerdrHostBridge: HerdrHostBridgeBootstrap | undefined;
+	let capturedHerdrGuestBridgeToken: string | undefined;
 	let resolvedArgv = argv;
 	try {
+		const bootstrap = captureHerdrBridgeBootstrap();
+		capturedHerdrHostBridge = bootstrap.hostBridge;
+		capturedHerdrGuestBridgeToken = bootstrap.guestBridgeToken;
 		const extracted = extractProfileFlags(resolvedArgv);
 		resolvedArgv = extracted.argv;
 		if (extracted.profile !== undefined) {
@@ -385,14 +399,19 @@ export async function runCli(argv: string[]): Promise<void> {
 	// Worker-thread entry dispatch must run before the first `await`: the
 	// stats sync worker's buffering onmessage handler is installed in the
 	// synchronous prefix of `runWorkerEntrypoint`, and Bun flushes the
-	// worker's parked initial messages as soon as the entry module's
-	// top-level evaluation finishes.
+	// worker's parked initial messages as soon as the entry module's top-level
+	// evaluation finishes.
 	if (isWorkerHostSelector(resolvedArgv[0])) {
 		const dispatched = await runWorkerEntrypoint(resolvedArgv[0]);
 		if (!dispatched) {
 			process.stderr.write(`Error: unknown worker selector: ${resolvedArgv[0]}\n`);
 			process.exitCode = 1;
 		}
+		return;
+	}
+
+	if (resolvedArgv.length === 1 && resolvedArgv[0] === "__build-id") {
+		process.stdout.write(`${OMP_BUILD_ID}\n`);
 		return;
 	}
 
@@ -453,9 +472,18 @@ export async function runCli(argv: string[]): Promise<void> {
 			process.exitCode = 1;
 			return;
 		}
+		const command = resolved.argv[0];
+		if (command === "launch" || command === "join" || command === "__collab-host-bridge") {
+			handoffHerdrHostBridge(capturedHerdrHostBridge);
+		}
+		if (command === "__collab-guest-bridge") {
+			handoffHerdrGuestBridgeToken(capturedHerdrGuestBridgeToken);
+		}
 		await run({ bin: APP_NAME, version: VERSION, argv: resolved.argv, commands, metadataHelp: showHelp });
 	} finally {
 		stopStartupComposer?.();
+		clearHerdrHostBridgeHandoff();
+		clearHerdrGuestBridgeTokenHandoff();
 	}
 }
 

@@ -5212,6 +5212,56 @@ describe("openai-codex streaming", () => {
 		expect(fetchMock).not.toHaveBeenCalled();
 	}, 15_000); // real handshake join; 5s default flakes under full-suite load
 
+	it("revalidates after the WebSocket handshake before sending the request", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const token = createCodexTestToken();
+		const socketReady = Promise.withResolvers<GuardedDeferredWebSocket>();
+		const fetchMock = vi.fn(async () => {
+			throw new Error("SSE fallback must not run after a dispatch veto");
+		});
+		let sendCount = 0;
+		class GuardedDeferredWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				socketReady.resolve(this);
+			}
+
+			open(): void {
+				this.readyState = MockWebSocket.OPEN;
+				this.emit("open", new Event("open"));
+			}
+
+			override send(): void {
+				sendCount++;
+			}
+		}
+		global.WebSocket = GuardedDeferredWebSocket as unknown as typeof WebSocket;
+
+		let valid = true;
+		const resultPromise = streamOpenAICodexResponses(
+			createCodexTestModel("https://chatgpt.com/backend-api"),
+			createCodexTestContext(),
+			{
+				fetch: fetchMock as FetchImpl,
+				apiKey: token,
+				sessionId: "ws-dispatch-guard-session",
+				providerSessionState: new Map<string, ProviderSessionState>(),
+				providerDispatchGuard: () => {
+					if (!valid) throw new Error("Codex request became stale during handshake");
+				},
+			},
+		).result();
+		const socket = await socketReady.promise;
+		valid = false;
+		socket.open();
+		const result = await resultPromise;
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("Codex request became stale during handshake");
+		expect(sendCount).toBe(0);
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
 	it("surfaces a whitespace flood arriving after a delivered tool call instead of replaying", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
 		setAgentDir(tempDir.path());

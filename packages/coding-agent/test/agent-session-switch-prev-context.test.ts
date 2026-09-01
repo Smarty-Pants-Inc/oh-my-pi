@@ -1,15 +1,32 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
+import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
+import { raceWithSignal } from "@oh-my-pi/pi-ai/utils/abort";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { AsyncJobSnapshot } from "@oh-my-pi/pi-coding-agent/session/agent-session-types";
+import {
+	ASYNC_INLINE_RESULT_MAX_CHARS,
+	type AsyncResultEntry,
+} from "@oh-my-pi/pi-coding-agent/session/async-job-delivery";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { BashRunner } from "@oh-my-pi/pi-coding-agent/session/bash-runner";
+import type { ClientBridge } from "@oh-my-pi/pi-coding-agent/session/client-bridge";
+import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { type AdvisorStats, SessionAdvisors } from "@oh-my-pi/pi-coding-agent/session/session-advisors";
 import type { BuildSessionContextOptions, SessionContext } from "@oh-my-pi/pi-coding-agent/session/session-context";
+import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import { SessionLifecycleTransaction } from "@oh-my-pi/pi-coding-agent/session/session-lifecycle-transaction";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { OutputSink } from "@oh-my-pi/pi-coding-agent/session/streaming-output";
+import type { XdevState } from "@oh-my-pi/pi-coding-agent/tools/xdev";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { assistantMsg } from "./utilities";
 
 /**
  * Regression for issue #3846: in-TUI `/resume` rebuilt the *previous*
@@ -49,6 +66,7 @@ describe("AgentSession.switchSession previous-context build", () => {
 				await dir.remove();
 			} catch {}
 		}
+		vi.restoreAllMocks();
 	});
 
 	function buildSession(
@@ -57,13 +75,22 @@ describe("AgentSession.switchSession previous-context build", () => {
 	): { session: AgentSession; sessionManager: SessionManager } {
 		const sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
 		const agent = new Agent({
+			getApiKey: () => "test-key",
 			initialState: {
 				model,
 				systemPrompt: ["Test"],
-				tools: [],
-				messages: [],
+				tools: options.tools ?? [],
 			},
+			convertToLlm,
+			...(options.streamFn ? { streamFn: options.streamFn } : {}),
 		});
+		const extensionRunner = new ExtensionRunner(
+			[],
+			new ExtensionRuntime(),
+			tempDir.path(),
+			sessionManager,
+			modelRegistry,
+		);
 		const session = new AgentSession({
 			agent,
 			sessionManager,
@@ -72,7 +99,69 @@ describe("AgentSession.switchSession previous-context build", () => {
 			extensionRunner,
 		});
 		sessions.push(session);
-		return { session, sessionManager };
+		return { session, sessionManager, extensionRunner };
+	}
+
+	function createPendingAdvisorWork(note: string) {
+		const release = Promise.withResolvers<void>();
+		const firstStarted = Promise.withResolvers<void>();
+		const resumed = Promise.withResolvers<void>();
+		const resumedCompleted = Promise.withResolvers<void>();
+		let callCount = 0;
+		const mock = createMockModel({
+			handler: async (_context, options) => {
+				callCount++;
+				if (callCount === 1) {
+					firstStarted.resolve();
+					await raceWithSignal(new Promise<never>(() => {}), options?.signal);
+					throw new Error("aborted advisor attempt unexpectedly resumed");
+				}
+				if (callCount === 2) {
+					resumed.resolve();
+					await raceWithSignal(release.promise, options?.signal);
+					resumedCompleted.resolve();
+					return {
+						content: [{ type: "toolCall", name: "advise", arguments: { note, severity: "nit" } }],
+					};
+				}
+				return { content: [] };
+			},
+		});
+		return {
+			mock,
+			release,
+			firstStarted: firstStarted.promise,
+			resumed: resumed.promise,
+			resumedCompleted: resumedCompleted.promise,
+		};
+	}
+
+	interface StableAdvisorStats {
+		configured: boolean;
+		active: boolean;
+		model: AdvisorStats["model"];
+		cost: number;
+		advisors: Array<{
+			name: string;
+			status: AdvisorStats["advisors"][number]["status"];
+			model: AdvisorStats["advisors"][number]["model"];
+			cost: number;
+		}>;
+	}
+
+	function stableAdvisorStats(stats: AdvisorStats): StableAdvisorStats {
+		return {
+			configured: stats.configured,
+			active: stats.active,
+			model: stats.model,
+			cost: stats.cost,
+			advisors: stats.advisors.map(advisor => ({
+				name: advisor.name,
+				status: advisor.status,
+				model: advisor.model,
+				cost: advisor.cost,
+			})),
+		};
 	}
 
 	/** Wrap `sessionManager.buildSessionContext` so each call's caller-visible
@@ -96,6 +185,76 @@ describe("AgentSession.switchSession previous-context build", () => {
 			restore: () => {
 				sessionManager.buildSessionContext = original;
 			},
+		};
+	}
+
+	async function installDurableMutationBeforePostQuiescenceCapture(
+		session: AgentSession,
+		sessionManager: SessionManager,
+		mutationText: string,
+		failureAfterMutation?: Error,
+	): Promise<{
+		retainedSessionFile: string;
+		retainedRaw: string;
+		retainedEntries: SessionEntry[];
+		retainedMessages: AgentMessage[];
+		flushCalls(): number;
+		durableMutationRaw(): string | undefined;
+		captureCalls(): number;
+		postQuiescenceRaw(): string | undefined;
+		postQuiescenceEntries(): SessionEntry[] | undefined;
+		postQuiescenceMessages(): AgentMessage[] | undefined;
+	}> {
+		await sessionManager.ensureOnDisk();
+		await sessionManager.flush();
+		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+		const retainedSessionFile = sessionManager.getSessionFile();
+		if (!retainedSessionFile) throw new Error("Expected retained session file");
+		const retainedRaw = await fs.readFile(retainedSessionFile, "utf8");
+		const retainedEntries = structuredClone(sessionManager.getEntries());
+		const retainedMessages = structuredClone(session.messages);
+
+		let flushCalls = 0;
+		let durableMutationRaw: string | undefined;
+		const flush = sessionManager.flush.bind(sessionManager);
+		vi.spyOn(sessionManager, "flush").mockImplementation(async () => {
+			const call = ++flushCalls;
+			if (call === 2) {
+				sessionManager.appendMessage({ role: "user", content: mutationText, timestamp: 99 });
+				session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+			}
+			await flush();
+			if (call === 2) durableMutationRaw = await fs.readFile(retainedSessionFile, "utf8");
+			if (call === 2 && failureAfterMutation) throw failureAfterMutation;
+		});
+
+		let captureCalls = 0;
+		let postQuiescenceRaw: string | undefined;
+		let postQuiescenceEntries: SessionEntry[] | undefined;
+		let postQuiescenceMessages: AgentMessage[] | undefined;
+		const capturePersistedSessionFile = sessionManager.capturePersistedSessionFile.bind(sessionManager);
+		vi.spyOn(sessionManager, "capturePersistedSessionFile").mockImplementation(async () => {
+			const snapshot = await capturePersistedSessionFile();
+			captureCalls++;
+			if (captureCalls === 2) {
+				postQuiescenceRaw = snapshot?.content;
+				postQuiescenceEntries = structuredClone(sessionManager.getEntries());
+				postQuiescenceMessages = structuredClone(session.messages);
+			}
+			return snapshot;
+		});
+
+		return {
+			retainedSessionFile,
+			retainedRaw,
+			retainedEntries,
+			retainedMessages,
+			flushCalls: () => flushCalls,
+			durableMutationRaw: () => durableMutationRaw,
+			captureCalls: () => captureCalls,
+			postQuiescenceRaw: () => postQuiescenceRaw,
+			postQuiescenceEntries: () => postQuiescenceEntries,
+			postQuiescenceMessages: () => postQuiescenceMessages,
 		};
 	}
 

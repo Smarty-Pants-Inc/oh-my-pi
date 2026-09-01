@@ -9,6 +9,7 @@ import {
 import type {
 	AssistantMessage,
 	Context,
+	ContextInstruction,
 	FetchImpl,
 	Model,
 	ModelSpec,
@@ -29,6 +30,16 @@ const gpt4oMiniSpec: ModelSpec<"openai-completions"> = (() => {
 	} = getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">;
 	return { ...rest, compat: compatConfig };
 })();
+
+const internalInstruction: ContextInstruction = {
+	id: "goal.continuation",
+	sourcePath: "packages/coding-agent/src/prompts/goals/continuation.md",
+	role: "internal_context",
+	target: "main",
+	trigger: "goal-continuation",
+	sha256: "test-sha256",
+	renderedText: "Continue the active goal without overriding the user.",
+};
 
 function createAbortedSignal(): AbortSignal {
 	const controller = new AbortController();
@@ -115,7 +126,11 @@ function kimiZaiModel(): Model<"openai-completions"> {
 async function captureOpenAICompletionsPayload(
 	model: Model<"openai-completions">,
 	context: Context = baseContext(),
-	options?: { reasoning?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max"; temperature?: number },
+	options?: {
+		reasoning?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+		temperature?: number;
+		cacheRetention?: "short" | "long" | "none";
+	},
 ): Promise<unknown> {
 	const { promise, resolve } = Promise.withResolvers<unknown>();
 	const fetchMock = createMockFetch(["[DONE]"]);
@@ -393,6 +408,26 @@ describe("openai-completions compatibility", () => {
 		expect(unsupportedMessages.slice(0, 3)).toEqual([
 			{ role: "system", content: "stable instructions" },
 			{ role: "system", content: "cacheable policy" },
+			{ role: "user", content: "hello" },
+		]);
+	});
+
+	it("maps typed internal context to an instruction role and never to chat user", () => {
+		const model: Model<"openai-completions"> = buildModel({
+			...gpt4oMiniSpec,
+			api: "openai-completions",
+		} as ModelSpec<"openai-completions">);
+		const context: Context = {
+			instructions: [internalInstruction],
+			messages: [{ role: "user", content: "hello", timestamp: Date.now() }],
+		};
+
+		expect(convertMessages(model, context, model.compat).slice(0, 2)).toEqual([
+			{ role: "developer", content: internalInstruction.renderedText },
+			{ role: "user", content: "hello" },
+		]);
+		expect(convertMessages(model, context, { ...model.compat, supportsDeveloperRole: false }).slice(0, 2)).toEqual([
+			{ role: "system", content: internalInstruction.renderedText },
 			{ role: "user", content: "hello" },
 		]);
 	});
@@ -2379,6 +2414,25 @@ describe("anthropic cache control for OpenAI-compatible chat completions", () =>
 
 		expect(textPart?.text).toBe("cache me");
 		expect(textPart?.cache_control).toEqual({ type: "ephemeral" });
+	});
+
+	it("honors none and long retention for Anthropic cache markers", async () => {
+		const nonePayload = await captureOpenAICompletionsPayload(
+			claudeProxyModel({ cacheControlFormat: "anthropic" }),
+			cacheContext(),
+			{ cacheRetention: "none" },
+		);
+		expect(getLastTextPart(getLastPayloadContent(nonePayload))?.cache_control).toBeUndefined();
+
+		const longPayload = await captureOpenAICompletionsPayload(
+			claudeProxyModel({ cacheControlFormat: "anthropic" }),
+			cacheContext(),
+			{ cacheRetention: "long" },
+		);
+		expect(getLastTextPart(getLastPayloadContent(longPayload))?.cache_control).toEqual({
+			type: "ephemeral",
+			ttl: "1h",
+		});
 	});
 
 	it("preserves OpenRouter Anthropic cache_control detection", async () => {

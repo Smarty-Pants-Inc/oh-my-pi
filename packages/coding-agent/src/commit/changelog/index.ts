@@ -34,6 +34,7 @@ export interface ChangelogFlowInput {
 	model: Model<Api>;
 	apiKey: ApiKey;
 	thinkingLevel?: ThinkingLevel;
+	cacheRetention?: SimpleStreamOptions["cacheRetention"];
 	stagedFiles: string[];
 	dryRun: boolean;
 	maxDiffChars?: number;
@@ -59,6 +60,7 @@ export async function runChangelogFlow({
 	model,
 	apiKey,
 	thinkingLevel,
+	cacheRetention,
 	stagedFiles,
 	dryRun,
 	maxDiffChars,
@@ -91,6 +93,7 @@ export async function runChangelogFlow({
 			model,
 			apiKey,
 			thinkingLevel,
+			cacheRetention,
 			changelogPath: boundary.changelogPath,
 			isPackageChangelog,
 			existingEntries: existingEntries || undefined,

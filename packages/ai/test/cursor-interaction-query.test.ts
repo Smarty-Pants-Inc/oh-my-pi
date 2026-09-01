@@ -75,7 +75,7 @@ function decodeConnectFrame(frame: Buffer): AgentClientMessage {
 	return fromBinary(AgentClientMessageSchema, frame.subarray(5));
 }
 
-async function dispatchQuery(query: InteractionQuery): Promise<Buffer[]> {
+async function dispatchQuery(query: InteractionQuery, providerDispatchGuard?: () => void): Promise<Buffer[]> {
 	const frames: Buffer[] = [];
 	const h2Request = {
 		write(chunk: Buffer) {
@@ -97,6 +97,9 @@ async function dispatchQuery(query: InteractionQuery): Promise<Buffer[]> {
 		undefined,
 		{ sawTokenDelta: false },
 		[],
+		[],
+		undefined,
+		providerDispatchGuard,
 	);
 	return frames;
 }
@@ -116,6 +119,19 @@ describe("cursor interaction query handshake", () => {
 			id: 11,
 			result: { case: "webSearchRequestResponse", value: { result: { case: "approved" } } },
 		});
+	});
+
+	it("checks the dispatch guard before auto-approving a hosted query", async () => {
+		const query = create(InteractionQuerySchema, {
+			id: 12,
+			query: { case: "webSearchRequestQuery", value: create(WebSearchRequestQuerySchema, {}) },
+		});
+
+		await expect(
+			dispatchQuery(query, () => {
+				throw new Error("Cursor request became stale before hosted interaction approval");
+			}),
+		).rejects.toThrow("Cursor request became stale before hosted interaction approval");
 	});
 
 	it("approves hosted Exa search and fetch permission queries", async () => {

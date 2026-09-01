@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, spyOn, vi } from "bun:test
 import type { Api, Model } from "@oh-my-pi/pi-ai";
 import * as ai from "@oh-my-pi/pi-ai";
 import { type GeneratedProvider, getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
 	disposeTerminalTitleState,
 	generateSessionTitle,
@@ -76,6 +77,24 @@ describe("title generator", () => {
 		expect(request?.tools).toBeUndefined();
 		expect(options?.toolChoice).toBeUndefined();
 		expect(options?.disableReasoning).toBe(true);
+	});
+
+	it("disables prompt caching for online title generation when cache retention is none", async () => {
+		const model = getModelOrThrow("claude-sonnet-4-5");
+		const settings = Settings.isolated({
+			"providers.tinyModel": "online",
+			"providers.cacheRetention": "none",
+			modelRoles: { tiny: `${model.provider}/${model.id}` },
+		});
+		const completeSimpleMock = vi.spyOn(ai, "completeSimple").mockResolvedValue({
+			stopReason: "stop",
+			content: [{ type: "text", text: "<title>Structured Title</title>" }],
+		} as never);
+
+		const title = await generateSessionTitle("Investigate the resolver", createRegistry(model), settings);
+
+		expect(title).toBe("Structured Title");
+		expect(completeSimpleMock.mock.calls[0]?.[2]?.cacheRetention).toBe("none");
 	});
 
 	it.each([

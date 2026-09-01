@@ -17,6 +17,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { configureCredentialRedaction } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import { configureProviderMaxInFlightRequests } from "@oh-my-pi/pi-ai/stream";
+import { hyperlinksUserOverride, shouldEnableHyperlinks, TERMINAL } from "@oh-my-pi/pi-tui";
 import {
 	getAgentDbPath,
 	getAgentDir,
@@ -532,6 +533,7 @@ export class Settings {
 		return promise.then(
 			instance => {
 				globalInstance = instance;
+				applyHyperlinkSetting(instance.get("tui.hyperlinks"));
 				clearBoundSettingsMethods();
 				globalInstancePromise = Promise.resolve(instance);
 				return instance;
@@ -1275,14 +1277,10 @@ export class Settings {
 	// ─────────────────────────────────────────────────────────────────────────
 
 	async #load(): Promise<Settings> {
-		// Project settings discovery is independent of the persist chain, while
-		// the persist steps themselves remain sequential. Wait for both branches
-		// to settle so simultaneous failures produce one catchable error without
-		// abandoning the other rejection.
-		const [globalResult, projectResult] = await Promise.allSettled([
-			this.#persist ? this.#loadGlobalSettings() : Promise.resolve(),
-			this.#loadProjectSettings(),
-		]);
+		// Project capability discovery must honor the global provider policy, so
+		// settle that layer before asking providers for project settings.
+		const [globalResult] = await Promise.allSettled([this.#persist ? this.#loadGlobalSettings() : Promise.resolve()]);
+		const [projectResult] = await Promise.allSettled([this.#loadProjectSettings()]);
 		if (globalResult.status === "rejected") throw globalResult.reason;
 		if (projectResult.status === "rejected") throw projectResult.reason;
 
@@ -1307,15 +1305,14 @@ export class Settings {
 	}
 
 	async #loadReadOnly(): Promise<Settings> {
-		const [globalResult, projectResult] = await Promise.allSettled([
-			this.#loadExistingMainYaml(),
-			this.#loadProjectSettings(),
-		]);
-		if (globalResult.status === "rejected") throw globalResult.reason;
-		if (projectResult.status === "rejected") throw projectResult.reason;
-		if (globalResult.value) {
+		const [globalResult] = await Promise.allSettled([this.#loadExistingMainYaml()]);
+		if (globalResult.status === "fulfilled" && globalResult.value) {
 			this.#global = globalResult.value;
 		}
+
+		const [projectResult] = await Promise.allSettled([this.#loadProjectSettings()]);
+		if (globalResult.status === "rejected") throw globalResult.reason;
+		if (projectResult.status === "rejected") throw projectResult.reason;
 
 		this.#project = projectResult.value;
 		this.#configOverlay = await this.#loadConfigOverlays();
@@ -1521,8 +1518,16 @@ export class Settings {
 	async #readProjectSettings(quarantineInvalid: boolean): Promise<ProjectSettingsReadResult> {
 		let shellPathSource: string | undefined;
 		let merged: RawSettings = {};
+		const globalDisabledProviders = getByPath(this.#global, SETTING_PATH_SEGMENTS.disabledProviders);
+		const excludeProviders =
+			resolvePathScopedStringArray("disabledProviders", globalDisabledProviders, this.#cwd) ??
+			stringArrayFromUnknown(globalDisabledProviders);
 		try {
-			const result = await loadCapability(settingsCapability.id, { cwd: this.#cwd });
+			const result = await loadCapability(settingsCapability.id, {
+				cwd: this.#cwd,
+				excludeProviders,
+				ignoreDisabledProviders: true,
+			});
 			for (const item of result.items as SettingsCapabilityItem[]) {
 				if (item.level === "project") {
 					merged = this.#deepMerge(merged, dropSettingsGroupShadows(item.data as RawSettings, item.path));
@@ -2658,6 +2663,7 @@ export class Settings {
 		this.#merged = this.#deepMerge(this.#merged, this.#overrides);
 		this.#resolvedCache.clear();
 		this.#editVariantCache = undefined;
+		if (this === globalInstance) applyHyperlinkSetting(this.get("tui.hyperlinks"));
 	}
 
 	#fireAllHooks(): void {
@@ -2738,6 +2744,23 @@ class SettingSignal<A extends unknown[] = []> {
 			}
 		}
 	}
+}
+
+/** Fires when the effective terminal hyperlink output changes at runtime. */
+const hyperlinkModeSignal = new SettingSignal("tui.hyperlinks");
+
+/** Subscribe to effective terminal hyperlink output changes. */
+export const onHyperlinkModeChanged: (cb: () => void) => () => void = hyperlinkModeSignal.on.bind(hyperlinkModeSignal);
+
+let alwaysHyperlinkOutputEnabled = false;
+
+function applyHyperlinkSetting(mode: SettingValue<"tui.hyperlinks">): void {
+	const enabled = shouldEnableHyperlinks(mode, Bun.env, TERMINAL.id, process.stdout.isTTY === true);
+	const alwaysEnabled = isSettingsInitialized() && mode !== "off" && hyperlinksUserOverride(Bun.env) !== false;
+	const changed = TERMINAL.hyperlinks !== enabled || alwaysHyperlinkOutputEnabled !== alwaysEnabled;
+	TERMINAL.hyperlinks = enabled;
+	alwaysHyperlinkOutputEnabled = alwaysEnabled;
+	if (changed) hyperlinkModeSignal.fire();
 }
 
 const SETTING_HOOKS: Partial<Record<SettingPath, SettingHook<any>>> = {
@@ -2909,6 +2932,8 @@ export function resetSettingsForTest(): void {
 	clearBoundSettingsMethods();
 	configureProviderMaxInFlightRequests(undefined);
 	configureCredentialRedaction(false);
+	// `tui.hyperlinks` is process-global; without settings, restore its default effective mode.
+	applyHyperlinkSetting(getDefault("tui.hyperlinks"));
 }
 
 /**

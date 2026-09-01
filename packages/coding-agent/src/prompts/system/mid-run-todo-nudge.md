@@ -1,3 +1,3 @@
 <system-reminder>
-{{incompleteCount}} todo item{{#if plural}}s{{else}}{{/if}} still open. If you finished a task since last `{{toolRefs.todo}}` update, mark it done now so progress stays visible; otherwise keep working.
+Gentle reminder: {{incompleteCount}} todo item{{#if plural}}s are{{else}} is{{/if}} still open. Reconcile the list now if work finished, became blocked, was added, or is no longer required; use `done`, `block`, `append`, `drop`, or `rm` as appropriate. Otherwise keep working.
 </system-reminder>

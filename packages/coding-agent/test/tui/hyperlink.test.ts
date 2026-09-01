@@ -2,7 +2,12 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import * as os from "node:os";
 import * as path from "node:path";
 import * as url from "node:url";
-import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import {
+	onHyperlinkModeChanged,
+	resetSettingsForTest,
+	Settings,
+	settings,
+} from "@oh-my-pi/pi-coding-agent/config/settings";
 import { LocalProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/local-protocol";
 import { getMarkdownTheme, initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
@@ -57,12 +62,27 @@ afterAll(() => {
 });
 
 afterEach(() => {
-	settings.clearOverride("tui.hyperlinks");
 	if (ORIGINAL_NO_COLOR === undefined) {
 		delete Bun.env.NO_COLOR;
 	} else {
 		Bun.env.NO_COLOR = ORIGINAL_NO_COLOR;
 	}
+	if (ORIGINAL_HERDR_ENV === undefined) {
+		delete Bun.env.HERDR_ENV;
+	} else {
+		Bun.env.HERDR_ENV = ORIGINAL_HERDR_ENV;
+	}
+	if (ORIGINAL_PI_NO_HYPERLINKS === undefined) {
+		delete Bun.env.PI_NO_HYPERLINKS;
+	} else {
+		Bun.env.PI_NO_HYPERLINKS = ORIGINAL_PI_NO_HYPERLINKS;
+	}
+	if (ORIGINAL_PI_FORCE_HYPERLINKS === undefined) {
+		delete Bun.env.PI_FORCE_HYPERLINKS;
+	} else {
+		Bun.env.PI_FORCE_HYPERLINKS = ORIGINAL_PI_FORCE_HYPERLINKS;
+	}
+	settings.clearOverride("tui.hyperlinks");
 });
 
 describe("isHyperlinkEnabled", () => {
@@ -90,11 +110,13 @@ describe("isHyperlinkEnabled", () => {
 	it("returns false in auto mode when NO_COLOR is set", () => {
 		setHyperlinkMode("auto");
 		Bun.env.NO_COLOR = "1";
+		delete Bun.env.HERDR_ENV;
 		expect(isHyperlinkEnabled()).toBe(false);
 	});
 
 	it("returns false in auto mode when stdout is not a TTY", () => {
 		setHyperlinkMode("auto");
+		delete Bun.env.HERDR_ENV;
 		const origTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
 		try {
 			Object.defineProperty(process.stdout, "isTTY", { value: false, configurable: true });
@@ -125,6 +147,97 @@ describe("isHyperlinkEnabled", () => {
 			terminalCaps.setTerminalHyperlinks(origHyperlinks);
 			if (origTTY) {
 				Object.defineProperty(process.stdout, "isTTY", origTTY);
+			} else {
+				Reflect.deleteProperty(process.stdout, "isTTY");
+			}
+		}
+	});
+
+	it("lets PI_NO_HYPERLINKS disable Herdr and always mode", () => {
+		Bun.env.HERDR_ENV = "1";
+		Bun.env.PI_NO_HYPERLINKS = "1";
+		setHyperlinkMode("always");
+		expect(isHyperlinkEnabled()).toBe(false);
+		expect(terminalCaps.TERMINAL.hyperlinks).toBe(false);
+		expect(urlHyperlinkAlways("https://example.com/path", "example")).toBe("example");
+	});
+
+	it("keeps cloned settings from changing process-global hyperlink state", async () => {
+		delete Bun.env.PI_NO_HYPERLINKS;
+		delete Bun.env.PI_FORCE_HYPERLINKS;
+		setHyperlinkMode("off");
+
+		const cloned = await settings.cloneForCwd(path.join(process.cwd(), "cloned-settings"));
+		cloned.override("tui.hyperlinks", "always");
+		expect(cloned.get("tui.hyperlinks")).toBe("always");
+		expect(terminalCaps.TERMINAL.hyperlinks).toBe(false);
+
+		await cloned.cloneForCwd(path.join(process.cwd(), "nested-cloned-settings"));
+		expect(terminalCaps.TERMINAL.hyperlinks).toBe(false);
+
+		setHyperlinkMode("always");
+		expect(terminalCaps.TERMINAL.hyperlinks).toBe(true);
+	});
+
+	it("signals off/auto transitions when only Always links can emit on a non-TTY", () => {
+		const originalTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+		delete Bun.env.HERDR_ENV;
+		delete Bun.env.NO_COLOR;
+		delete Bun.env.PI_NO_HYPERLINKS;
+		delete Bun.env.PI_FORCE_HYPERLINKS;
+		try {
+			Object.defineProperty(process.stdout, "isTTY", { value: false, configurable: true });
+			setHyperlinkMode("off");
+			let changes = 0;
+			const unsubscribe = onHyperlinkModeChanged(() => {
+				changes++;
+			});
+			try {
+				expect(terminalCaps.TERMINAL.hyperlinks).toBe(false);
+				expect(urlHyperlinkAlways("https://example.com/path", "example")).toBe("example");
+
+				setHyperlinkMode("auto");
+				expect(terminalCaps.TERMINAL.hyperlinks).toBe(false);
+				expect(urlHyperlinkAlways("https://example.com/path", "example")).toContain(`${OSC}8;`);
+
+				setHyperlinkMode("off");
+				expect(urlHyperlinkAlways("https://example.com/path", "example")).toBe("example");
+				expect(changes).toBe(2);
+			} finally {
+				unsubscribe();
+			}
+		} finally {
+			if (originalTTY) {
+				Object.defineProperty(process.stdout, "isTTY", originalTTY);
+			} else {
+				Reflect.deleteProperty(process.stdout, "isTTY");
+			}
+		}
+	});
+
+	it("does not signal when auto and always have the same hyperlink output policy", () => {
+		const originalTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+		delete Bun.env.PI_NO_HYPERLINKS;
+		Bun.env.PI_FORCE_HYPERLINKS = "1";
+		try {
+			Object.defineProperty(process.stdout, "isTTY", { value: false, configurable: true });
+			setHyperlinkMode("off");
+			setHyperlinkMode("auto");
+			let changes = 0;
+			const unsubscribe = onHyperlinkModeChanged(() => {
+				changes++;
+			});
+			try {
+				setHyperlinkMode("always");
+				expect(terminalCaps.TERMINAL.hyperlinks).toBe(true);
+				expect(urlHyperlinkAlways("https://example.com/path", "example")).toContain(`${OSC}8;`);
+				expect(changes).toBe(0);
+			} finally {
+				unsubscribe();
+			}
+		} finally {
+			if (originalTTY) {
+				Object.defineProperty(process.stdout, "isTTY", originalTTY);
 			} else {
 				Reflect.deleteProperty(process.stdout, "isTTY");
 			}
@@ -264,6 +377,7 @@ describe("urlHyperlinkAlways", () => {
 	it("wraps HTTP URLs in auto mode even when capability detection would suppress", () => {
 		setHyperlinkMode("auto");
 		Bun.env.NO_COLOR = "1"; // forces isHyperlinkEnabled() to false in auto mode
+		delete Bun.env.HERDR_ENV;
 		const result = urlHyperlinkAlways("www.example.com/path", "example");
 
 		expect(isHyperlinkEnabled()).toBe(false);

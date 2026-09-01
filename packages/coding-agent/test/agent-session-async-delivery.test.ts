@@ -45,7 +45,7 @@ describe("AgentSession owner-routed async delivery", () => {
 		AsyncJobManager.resetForTests();
 	});
 
-	it("injects an owned completion as a follow-up turn and reaches quiescence", async () => {
+	it("persists an unscoped completion without creating a follow-up turn", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
 		const agent = new Agent({
@@ -60,9 +60,10 @@ describe("AgentSession owner-routed async delivery", () => {
 		const manager = new AsyncJobManager({});
 		AsyncJobManager.setInstance(manager);
 
+		const sessionManager = SessionManager.inMemory();
 		session = new AgentSession({
 			agent,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager,
 			settings: Settings.isolated(),
 			modelRegistry: new ModelRegistry(authStorage),
 			agentId: "SubAgent",
@@ -72,14 +73,13 @@ describe("AgentSession owner-routed async delivery", () => {
 		const gate = Promise.withResolvers<string>();
 		manager.register("bash", "gated job", () => gate.promise, { id: "sub-job", ownerId: "SubAgent" });
 
-		// A running owned job holds the session out of quiescence.
-		expect(session.hasPendingAsyncWork()).toBe(true);
+		// A job without a still-open origin cannot hold or re-wake the model loop.
+		expect(session.hasPendingAsyncWork()).toBe(false);
 
 		gate.resolve("job finished: ALL GREEN");
 		await session.settleAsyncWork();
 
-		// The completion routed to THIS session (not a global default sink) and
-		// ran as a follow-up turn whose context carries the job result.
+		// The completion is durable and visible, but it did not enter provider context.
 		expect(session.hasPendingAsyncWork()).toBe(false);
 		const sawResult = mock.calls.some(call =>
 			call.context.messages.some(message => {
@@ -92,10 +92,71 @@ describe("AgentSession owner-routed async delivery", () => {
 				);
 			}),
 		);
-		expect(sawResult).toBe(true);
+		expect(sawResult).toBe(false);
+		expect(agent.state.messages.some(message => JSON.stringify(message).includes("ALL GREEN"))).toBe(true);
 	});
 
-	it("routes an advisor-owned launch completion through the session", async () => {
+	it("keeps the exact origin eligible through recovery and closes it before prompt return", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const providerGate = Promise.withResolvers<void>();
+		const mock = createMockModel({
+			handler: async () => {
+				await providerGate.promise;
+				return { content: ["Done"] };
+			},
+		});
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			convertToLlm,
+			streamFn: mock.stream,
+		});
+		const authStorage = await AuthStorage.create(":memory:");
+		authStorages.push(authStorage);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const manager = new AsyncJobManager({});
+		AsyncJobManager.setInstance(manager);
+
+		const sessionManager = SessionManager.inMemory();
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated(),
+			modelRegistry: new ModelRegistry(authStorage),
+			agentId: "SubAgent",
+			asyncJobManager: manager,
+		});
+		const prompt = session.sendUserMessage("start exact-origin turn");
+		while (mock.calls.length === 0) await Bun.sleep(1);
+		const originTurnId = session.getCurrentTurnId();
+		expect(originTurnId).toMatch(/^turn-/);
+
+		manager.register("bash", "origin job", async () => "EXACT ORIGIN RESULT", {
+			id: "origin-job",
+			ownerId: "SubAgent",
+			originTurnId,
+		});
+		expect(session.hasPendingAsyncWork()).toBe(true);
+		await manager.waitForOwnerJobs("SubAgent");
+		await manager.drainDeliveries({ filter: { ownerId: "SubAgent" } });
+		expect(session.hasPendingAsyncWork()).toBe(true);
+
+		providerGate.resolve();
+		await prompt;
+		await session.settleAsyncWork();
+		expect(session.hasPendingAsyncWork()).toBe(false);
+		expect(mock.calls).toHaveLength(2);
+		expect(
+			mock.calls[1]?.context.messages.some(message => JSON.stringify(message).includes("EXACT ORIGIN RESULT")),
+		).toBe(true);
+		expect(
+			[...agent.state.messages, ...sessionManager.getEntries()].some(message =>
+				JSON.stringify(message).includes("EXACT ORIGIN RESULT"),
+			),
+		).toBe(true);
+	});
+
+	it("persists an advisor-owned launch completion without starting a turn", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
 		const agent = new Agent({
@@ -138,14 +199,17 @@ describe("AgentSession owner-routed async delivery", () => {
 		await session.queueLaunchCompletion(completion);
 		await session.waitForIdle();
 
+		expect(mock.calls).toHaveLength(0);
+		expect(agent.state.messages.some(message => JSON.stringify(message).includes("advisor-worker"))).toBe(true);
 		expect(
-			mock.calls.some(call =>
-				call.context.messages.some(message =>
-					typeof message.content === "string"
-						? message.content.includes("advisor-worker")
-						: message.content.some(content => content.type === "text" && content.text.includes("advisor-worker")),
+			sessionManager
+				.getEntries()
+				.some(
+					entry =>
+						entry.type === "custom_message" &&
+						entry.customType === "launch-completion" &&
+						JSON.stringify(entry).includes("advisor-worker"),
 				),
-			),
 		).toBe(true);
 	});
 

@@ -46,6 +46,35 @@ const StringMapSchema = pb<StringMap>("test.StringMap", [
 	{ no: 1, name: "entries", kind: "map", K: "string", V: "string" },
 ]);
 
+enum TestStatus {
+	UNSPECIFIED = 0,
+	READY = 1,
+}
+
+const TestStatusJson = {
+	TEST_STATUS_UNSPECIFIED: 0,
+	TEST_STATUS_READY: 1,
+	TEST_STATUS_READY_ALIAS: 1,
+} as const;
+
+interface EnumEnvelope extends ProtoMessage {
+	status: TestStatus;
+	statuses: TestStatus[];
+	statusesByName: Record<string, TestStatus>;
+	choice: { case: undefined; value?: undefined } | { case: "statusChoice"; value: TestStatus };
+}
+
+const EnumEnvelopeSchema = pb<EnumEnvelope>("test.EnumEnvelope", [
+	{ no: 1, name: "status", kind: "enum", E: () => TestStatusJson },
+	{ no: 2, name: "statuses", kind: "enum", E: () => TestStatusJson, repeat: true },
+	{ no: 3, name: "statusesByName", kind: "map", K: "string", V: "enum", E: () => TestStatusJson },
+	{
+		kind: "oneof",
+		name: "choice",
+		variants: [{ no: 4, name: "statusChoice", kind: "enum", E: () => TestStatusJson }],
+	},
+]);
+
 it("preserves selected oneofs and explicit optional defaults", () => {
 	const decoded = EnvelopeSchema.decode(
 		EnvelopeSchema.encode({ enabled: false, choice: { case: "text", value: "hello" } }),
@@ -53,6 +82,52 @@ it("preserves selected oneofs and explicit optional defaults", () => {
 
 	expect(decoded).toMatchObject({ enabled: false, choice: { case: "text", value: "hello" } });
 	expect(EnvelopeSchema.toJson(decoded)).toEqual({ enabled: false, text: "hello" });
+});
+
+it("decodes protobuf JSON into typed oneofs and nested messages", () => {
+	const envelope = EnvelopeSchema.fromJson({ enabled: false, text: "hello" });
+	const node = NodeSchema.fromJson({ label: "root", child: { label: "leaf" } });
+
+	expect(envelope).toMatchObject({ enabled: false, choice: { case: "text", value: "hello" } });
+	expect(node.child?.label).toBe("leaf");
+});
+
+it("uses canonical protobuf JSON names for known enums and numbers for unknown values", () => {
+	const known = EnumEnvelopeSchema.create({
+		status: TestStatus.READY,
+		statuses: [TestStatus.READY],
+		statusesByName: { primary: TestStatus.READY },
+		choice: { case: "statusChoice", value: TestStatus.READY },
+	});
+	expect(EnumEnvelopeSchema.toJson(known)).toEqual({
+		status: "TEST_STATUS_READY",
+		statuses: ["TEST_STATUS_READY"],
+		statusesByName: { primary: "TEST_STATUS_READY" },
+		statusChoice: "TEST_STATUS_READY",
+	});
+
+	const parsed = EnumEnvelopeSchema.fromJson({
+		status: "TEST_STATUS_READY_ALIAS",
+		statuses: ["TEST_STATUS_READY", 1],
+		statusesByName: { primary: "TEST_STATUS_READY_ALIAS" },
+		statusChoice: "TEST_STATUS_READY",
+	});
+	expect(parsed).toMatchObject({
+		status: TestStatus.READY,
+		statuses: [TestStatus.READY, TestStatus.READY],
+		statusesByName: { primary: TestStatus.READY },
+		choice: { case: "statusChoice", value: TestStatus.READY },
+	});
+	expect(EnumEnvelopeSchema.toJson(parsed)).toMatchObject({ status: "TEST_STATUS_READY" });
+
+	const unknown = EnumEnvelopeSchema.fromJson({ status: 9 });
+	expect(Number(unknown.status)).toBe(9);
+	expect(EnumEnvelopeSchema.toJson(unknown)).toMatchObject({ status: 9 });
+	expect(Number(EnumEnvelopeSchema.decode(EnumEnvelopeSchema.encode(unknown)).status)).toBe(9);
+	expect(() => EnumEnvelopeSchema.fromJson({ status: "READY" })).toThrow("Unknown protobuf enum value READY");
+	expect(() => EnumEnvelopeSchema.fromJson({ status: "TEST_STATUS_MISSING" })).toThrow(
+		"Unknown protobuf enum value TEST_STATUS_MISSING",
+	);
 });
 
 it("retains unknown wire fields while re-encoding a message", () => {

@@ -17,6 +17,8 @@ import { formatNumber, getProjectDir } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { ModelRegistry } from "../config/model-registry";
 import { Settings } from "../config/settings";
+import { ensureApprovedStartup } from "../context/approved-policy";
+import type { ContextReleaseManifest } from "../context/manifest";
 import { discoverAndLoadExtensions, ExtensionRunner, emitSessionShutdownEvent } from "../extensibility/extensions";
 import { discoverAuthStorage } from "../sdk";
 import { SessionManager } from "../session/session-manager";
@@ -280,6 +282,8 @@ export interface RunModelsListingOptions {
 	disabledExtensionIds?: string[];
 	/** When true, exclude ambient factories and resolve only `additionalExtensionPaths`. */
 	disableExtensionDiscovery?: boolean;
+	/** Approved release used to preflight configured extension sources. */
+	releaseManifest?: ContextReleaseManifest;
 }
 
 export async function runModelsListing(options: RunModelsListingOptions): Promise<void> {
@@ -293,6 +297,7 @@ export async function runModelsListing(options: RunModelsListingOptions): Promis
 		settingsExtensions = [],
 		disabledExtensionIds = [],
 		disableExtensionDiscovery = false,
+		releaseManifest,
 	} = options;
 
 	const eventBus = new EventBus();
@@ -305,6 +310,7 @@ export async function runModelsListing(options: RunModelsListingOptions): Promis
 		eventBus,
 		disableExtensionDiscovery ? undefined : disabledExtensionIds,
 		{ ambient: !disableExtensionDiscovery, includeAmbientHooks: false },
+		releaseManifest ?? (await ensureApprovedStartup()),
 	);
 	const extensionRunner =
 		extensionsResult.extensions.length > 0

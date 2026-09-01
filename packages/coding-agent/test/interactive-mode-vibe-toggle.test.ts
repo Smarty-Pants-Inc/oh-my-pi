@@ -253,7 +253,7 @@ describe("InteractiveMode vibe mode toggle", () => {
 		expect(session.getToolByName("vibe_spawn")).toBeUndefined();
 	});
 
-	it("holds IRC wakes during Vibe teardown until the tools are removed", async () => {
+	it("persists IRC deliveries during Vibe teardown without an autonomous wake", async () => {
 		const toolNamesPerCall: string[][] = [];
 		const firstStarted = Promise.withResolvers<void>();
 		streamFn = (_model, context, options) => {
@@ -300,10 +300,8 @@ describe("InteractiveMode vibe mode toggle", () => {
 		await prompt;
 		await session.waitForIdle();
 
-		expect(toolNamesPerCall).toHaveLength(2);
-		for (const name of VIBE_TOOL_NAMES) {
-			expect(toolNamesPerCall[1]).not.toContain(name);
-		}
+		expect(toolNamesPerCall).toHaveLength(1);
+		expect(toolNamesPerCall[0]).toContain(VIBE_TOOL_NAMES[0]);
 		expect(
 			session.agent.state.messages.filter(
 				message => message.role === "custom" && message.customType === "irc:incoming",

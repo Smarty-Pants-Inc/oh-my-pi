@@ -97,6 +97,9 @@ function createContext(sessionOverride?: InteractiveModeContext["session"]) {
 			customCommands: [],
 			promptTemplates: [],
 			getQueuedMessages: () => ({ steering: [], followUp: [] }),
+			getQueuedPrompts: () => [],
+			getQueuedPromptDraft: (_id: string) => undefined,
+			getQueuedPromptTimestamp: (_id: string) => undefined,
 		} as unknown as InteractiveModeContext["session"]);
 
 	const ctx = {
@@ -217,11 +220,8 @@ describe("InputController orphaned submit", () => {
 
 		await editor.onSubmit?.("look at this [Image #1]");
 
-		expect(spies.prompt).toHaveBeenCalledWith("look at this [Image #1]", {
-			streamingBehavior: "steer",
-			images: [image],
-		});
-		expect(ctx.locallySubmittedUserSignatures.has("look at this [Image #1]\u00001")).toBe(true);
+		expect(spies.prompt).toHaveBeenCalledWith("look at this", { streamingBehavior: "steer", images: [image] });
+		expect(ctx.locallySubmittedUserSignatures.has("look at this\u00001")).toBe(true);
 		expect(ctx.editor.pendingImages.length).toBe(0);
 	});
 
@@ -248,14 +248,13 @@ describe("InputController orphaned submit", () => {
 	it("returns queued images to the pending-image buffer on queue restore", async () => {
 		const { ctx, editor } = createContext();
 		const image = { type: "image" as const, data: "abc", mimeType: "image/png" };
-		const session = ctx.session as unknown as { clearQueue: () => unknown };
-		session.clearQueue = () => ({
-			steering: [{ text: "queued with image", images: [image] }],
-			followUp: [],
-		});
+		const session = ctx.session as unknown as {
+			popLastQueuedMessageDurably: () => Promise<{ text: string; images: (typeof image)[] } | undefined>;
+		};
+		session.popLastQueuedMessageDurably = async () => ({ text: "queued with image", images: [image] });
 		const controller = new InputController(ctx);
 
-		const restored = controller.restoreQueuedMessagesToEditor();
+		const restored = await controller.restoreQueuedMessagesToEditor();
 
 		expect(restored).toBe(1);
 		expect(editor.getText()).toBe("queued with image");

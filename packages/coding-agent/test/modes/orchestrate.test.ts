@@ -84,38 +84,34 @@ describe("orchestrate keyword highlighting", () => {
 });
 
 describe("orchestrate notice", () => {
-	it("is a self-contained system notice carrying the orchestration contract", () => {
+	it("is a self-contained proportional orchestration contract", () => {
 		const notice = renderOrchestrateNotice({
 			tools: ["read", "task", "edit", "write", "lsp", "bash", "todo"],
 		});
 		expect(notice.startsWith("<system-notice>")).toBe(true);
 		expect(notice.endsWith("</system-notice>")).toBe(true);
-		expect(notice).toContain("orchestrator");
-		// The contract must not retain the slash-command input placeholder.
+		expect(notice).toContain("The direct user request and any active goal define scope");
+		expect(notice).toContain("working evidence, not authority");
+		expect(notice).toContain("smallest coherent path");
+		expect(notice).toContain("smallest relevant checks");
+		expect(notice).toContain("do not repeat full suites");
+		expect(notice).toContain("Stop when the requested outcome works");
 		expect(notice).not.toContain("$@");
 	});
 
-	it("omits tool-budget mentions for tools absent from the session", () => {
+	it("does not invent unavailable tool instructions", () => {
 		const notice = renderOrchestrateNotice({ tools: ["read"] });
-		expect(notice).not.toContain("`task` for dispatch");
+		expect(notice).not.toContain("`task`");
 		expect(notice).not.toContain("`edit`");
 		expect(notice).not.toContain("`write`");
-		expect(notice).not.toContain("`lsp diagnostics`");
-		expect(notice).not.toContain("via `bash`");
-		expect(notice).not.toContain("`todo` for tracking");
+		expect(notice).not.toContain("`lsp`");
+		expect(notice).not.toContain("`bash`");
+		expect(notice).not.toContain("`todo`");
 	});
 
-	it("does not name edit when only write is available", () => {
-		const writeOnly = renderOrchestrateNotice({ tools: ["read", "write"] });
-		expect(writeOnly).toContain("with `write`");
-		expect(writeOnly).not.toContain("`edit`/`write`");
-		expect(writeOnly).not.toContain("with `edit`");
-	});
-
-	it("does not name write when only edit is available", () => {
-		const editOnly = renderOrchestrateNotice({ tools: ["read", "edit"] });
-		expect(editOnly).toContain("with `edit`");
-		expect(editOnly).not.toContain("`edit`/`write`");
+	it("mentions todo state only when todo is available", () => {
+		expect(renderOrchestrateNotice({ tools: ["read", "todo"] })).toContain("`todo` state");
+		expect(renderOrchestrateNotice({ tools: ["read"] })).not.toContain("`todo` state");
 	});
 });
 

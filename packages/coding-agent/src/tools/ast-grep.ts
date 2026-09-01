@@ -478,8 +478,7 @@ export const astGrepToolRenderer = {
 		const styledLines = allLines.map((line, index) => {
 			const ctx = contexts[index]!;
 			if (ctx.kind === "dir") {
-				const styled = uiTheme.fg("accent", line);
-				return ctx.headerPath ? fileHyperlink(ctx.headerPath, styled) : styled;
+				return uiTheme.fg("accent", line);
 			}
 			if (ctx.kind === "file") {
 				const styled = uiTheme.fg(ctx.depth === 1 ? "accent" : "dim", line);

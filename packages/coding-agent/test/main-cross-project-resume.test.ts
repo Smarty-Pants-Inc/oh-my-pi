@@ -249,8 +249,8 @@ describe("runRootCommand — cross-project --resume", () => {
 					if (!options) throw new Error("Expected session options");
 					resumedManager = options.sessionManager;
 					sessionOptionsCwd = options.cwd;
-					// Awaited during the switch, so by session creation the destination
-					// preload has already been requested for the resumed project.
+					// Awaited during the switch, so the destination preload has completed
+					// with destination settings before session creation.
 					preloadedDestinationAtCreation = preloadedCwds.includes(resumedProject);
 					throw new Error("stop after session options");
 				},
@@ -273,6 +273,9 @@ describe("runRootCommand — cross-project --resume", () => {
 		expect(parsed.cwd).toBe(resumedProject);
 		expect(sessionOptionsCwd).toBe(resumedProject);
 		expect(preloadedDestinationAtCreation).toBe(true);
+		expect(preloadedPolicies[0]?.includeClaudeRegistry).toBe(false);
+		expect(preloadedPolicies.at(-1)?.includeClaudeRegistry).toBe(true);
+		expect(clearPluginRoots).toHaveBeenCalledWith(undefined, { rewarm: false });
 	}, 15_000);
 
 	it("re-scopes Settings back to the launch project when destination rescope fails", async () => {

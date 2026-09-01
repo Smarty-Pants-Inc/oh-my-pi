@@ -18,6 +18,7 @@
  *   POST /v1/responses                     → OpenAI Responses in/out
  */
 
+import { createHash } from "node:crypto";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { extractHttpStatusFromError, extractRetryHint, logger } from "@oh-my-pi/pi-utils";
 import type { ApiKeyResolver } from "../auth-retry";
@@ -33,6 +34,7 @@ import { completeSimple, streamSimple } from "../stream";
 import type { Api, AssistantMessage, AssistantMessageEventStream, Context, Model, SimpleStreamOptions } from "../types";
 import type { ClientUsageIdentity } from "../usage";
 import { deterministicUuid } from "../utils/deterministic-id";
+import { AssistantMessageEventStream as AssistantMessageEventStreamImpl } from "../utils/event-stream";
 import { parseBind } from "../utils/parse-bind";
 import {
 	captureRequestHeaders,
@@ -67,6 +69,260 @@ export interface AuthGatewayBootOptions extends AuthGatewayServerOptions {
 	resolveModel: ModelResolver;
 	/** Optional supplier for `/v1/models` listing. Returns the full model array. */
 	listModels?: () => Iterable<Model<Api>>;
+	/** Test/embedding override for the bounded pi-native boundary waiter. */
+	boundaryApprovalTtlMs?: number;
+}
+
+const PI_NATIVE_BOUNDARY_APPROVAL_TTL_MS = 30_000;
+const PI_NATIVE_PAYLOAD_BOUNDARY_APIS = new Set<Api>([
+	"anthropic-messages",
+	"bedrock-converse-stream",
+	"openai-completions",
+	"openai-responses",
+	"openrouter",
+	"openai-codex-responses",
+	"azure-openai-responses",
+	"google-generative-ai",
+	"google-gemini-cli",
+	"google-vertex",
+	"ollama-chat",
+	"cursor-agent",
+	"gitlab-duo-agent",
+	"devin-agent",
+]);
+const PI_NATIVE_TOOL_CONTRACT_BOUNDARY_APIS = new Set<Api>(["cursor-agent", "gitlab-duo-agent", "devin-agent"]);
+
+type PiNativeBoundaryResolution = { decision: "keep" } | { decision: "replace"; replacement: unknown };
+
+interface PiNativeBoundarySession {
+	requestId: string;
+	streamId: string;
+	sessionId: string;
+	bearerFingerprint: string;
+	forbiddenSecrets: string[];
+	signal: AbortSignal;
+	sequence: number;
+	emit: (event: piNative.PiNativeBoundaryPreparationEvent) => void;
+}
+
+interface PendingPiNativeBoundaryApproval {
+	preparation: piNative.PiNativeBoundaryPreparation;
+	payload: unknown;
+	bearerFingerprint: string;
+	signal: AbortSignal;
+	timer: NodeJS.Timeout;
+	abort: () => void;
+	resolve: (resolution: PiNativeBoundaryResolution) => void;
+	reject: (error: unknown) => void;
+}
+
+function sha256Utf8(value: string): string {
+	return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function requestBearerFingerprint(req: Request): string {
+	const authorization = req.headers.get("authorization")?.trim() ?? "";
+	const match = authorization.match(/^Bearer\s+(.+)$/i);
+	return sha256Utf8(match?.[1]?.trim() ?? "");
+}
+
+function serializePiNativeBoundaryJson(value: unknown, label: string): string {
+	let serialized: string | undefined;
+	try {
+		serialized = JSON.stringify(value, (_key, entry: unknown) => {
+			if (typeof entry === "function" || typeof entry === "symbol") {
+				throw new TypeError(`${label} contains a non-JSON value`);
+			}
+			if (typeof entry === "number" && !Number.isFinite(entry)) {
+				throw new TypeError(`${label} contains a non-finite number`);
+			}
+			if (ArrayBuffer.isView(entry)) throw new TypeError(`${label} contains binary data`);
+			return entry;
+		});
+	} catch (error) {
+		throw new AIError.ValidationError(
+			`pi-native boundary approval cannot serialize ${label}: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	if (serialized === undefined) {
+		throw new AIError.ValidationError(`pi-native boundary approval cannot serialize ${label}`);
+	}
+	return serialized;
+}
+
+function piNativeBoundaryModel(model: Model<Api>): piNative.PiNativeBoundaryModel {
+	const { baseUrl: _baseUrl, headers: _headers, transport: _transport, ...credentialFree } = model;
+	return { ...credentialFree, baseUrl: "" };
+}
+
+class PiNativeBoundaryApprovalStore {
+	readonly #pending = new Map<string, PendingPiNativeBoundaryApproval>();
+	readonly #pendingByStream = new Map<string, string>();
+	readonly #ttlMs: number;
+
+	constructor(ttlMs: number | undefined) {
+		this.#ttlMs = Math.max(1, Math.floor(ttlMs ?? PI_NATIVE_BOUNDARY_APPROVAL_TTL_MS));
+	}
+
+	async prepare(
+		session: PiNativeBoundarySession,
+		kind: piNative.PiNativeBoundaryApprovalKind,
+		payload: unknown,
+		model: Model<Api>,
+	): Promise<PiNativeBoundaryResolution> {
+		if (session.signal.aborted) throw session.signal.reason ?? new AIError.AbortError("request aborted");
+		if (this.#pendingByStream.has(session.streamId)) {
+			throw new AIError.ValidationError("pi-native boundary approval already has a pending waiter for this stream");
+		}
+		const payloadJson = serializePiNativeBoundaryJson(payload, `${kind} payload`);
+		if (session.forbiddenSecrets.some(secret => secret.length >= 8 && payloadJson.includes(secret))) {
+			throw new AIError.ValidationError("pi-native boundary approval payload contains provider credentials");
+		}
+		const boundaryModel = piNativeBoundaryModel(model);
+		const modelJson = serializePiNativeBoundaryJson(boundaryModel, "model projection");
+		const preparation: piNative.PiNativeBoundaryPreparation = {
+			version: 1,
+			requestId: session.requestId,
+			streamId: session.streamId,
+			sessionId: session.sessionId,
+			sequence: ++session.sequence,
+			preparationId: crypto.randomUUID(),
+			kind,
+			model: boundaryModel,
+			modelSha256: sha256Utf8(modelJson),
+			payloadJson,
+			payloadSha256: sha256Utf8(payloadJson),
+			expiresAt: Date.now() + this.#ttlMs,
+		};
+		const { promise, resolve, reject } = Promise.withResolvers<PiNativeBoundaryResolution>();
+		const abort = (): void => {
+			const pending = this.#take(preparation.preparationId);
+			if (pending) pending.reject(session.signal.reason ?? new AIError.AbortError("request aborted"));
+		};
+		const timer = setTimeout(() => {
+			const pending = this.#take(preparation.preparationId);
+			if (pending) pending.reject(new AIError.ValidationError("pi-native boundary approval expired"));
+		}, this.#ttlMs);
+		this.#pending.set(preparation.preparationId, {
+			preparation,
+			payload,
+			bearerFingerprint: session.bearerFingerprint,
+			signal: session.signal,
+			timer,
+			abort,
+			resolve,
+			reject,
+		});
+		this.#pendingByStream.set(session.streamId, preparation.preparationId);
+		session.signal.addEventListener("abort", abort, { once: true });
+		try {
+			session.emit({
+				type: "pi_boundary_approval",
+				boundaryApproval: preparation,
+			});
+		} catch (error) {
+			this.#take(preparation.preparationId)?.reject(error);
+		}
+		return promise;
+	}
+
+	consume(
+		decision: piNative.PiNativeBoundaryApprovalDecision,
+		bearerFingerprint: string,
+	): { status: number; message: string } {
+		const pending = this.#pending.get(decision.preparationId);
+		if (!pending) {
+			return decision.expiresAt <= Date.now()
+				? { status: 410, message: "boundary approval expired" }
+				: { status: 409, message: "boundary approval is not pending" };
+		}
+		if (pending.bearerFingerprint !== bearerFingerprint) {
+			return { status: 403, message: "boundary approval bearer mismatch" };
+		}
+		const expected = pending.preparation;
+		if (expected.expiresAt <= Date.now()) {
+			return this.#rejectProtocol(decision.preparationId, 410, "boundary approval expired");
+		}
+		if (
+			decision.requestId !== expected.requestId ||
+			decision.streamId !== expected.streamId ||
+			decision.sessionId !== expected.sessionId ||
+			decision.sequence !== expected.sequence ||
+			decision.kind !== expected.kind ||
+			decision.modelSha256 !== expected.modelSha256 ||
+			decision.payloadSha256 !== expected.payloadSha256 ||
+			decision.expiresAt !== expected.expiresAt
+		) {
+			return this.#rejectProtocol(decision.preparationId, 409, "boundary approval custody mismatch");
+		}
+
+		let resolution: PiNativeBoundaryResolution = { decision: "keep" };
+		if (decision.decision === "replace") {
+			const replacementJson = decision.replacementJson;
+			if (!replacementJson || sha256Utf8(replacementJson) !== decision.replacementSha256) {
+				return this.#rejectProtocol(decision.preparationId, 400, "boundary approval replacement hash mismatch");
+			}
+			try {
+				const replacement: unknown = JSON.parse(replacementJson);
+				if (JSON.stringify(replacement) !== replacementJson) {
+					return this.#rejectProtocol(
+						decision.preparationId,
+						400,
+						"boundary approval replacement bytes are not stable JSON",
+					);
+				}
+				resolution = { decision: "replace", replacement };
+			} catch {
+				return this.#rejectProtocol(decision.preparationId, 400, "boundary approval replacement is not JSON");
+			}
+		} else {
+			let currentPayloadJson: string;
+			try {
+				currentPayloadJson = serializePiNativeBoundaryJson(pending.payload, `${expected.kind} payload`);
+			} catch {
+				return this.#rejectProtocol(decision.preparationId, 409, "boundary payload changed after preparation");
+			}
+			if (currentPayloadJson !== expected.payloadJson || sha256Utf8(currentPayloadJson) !== expected.payloadSha256) {
+				return this.#rejectProtocol(decision.preparationId, 409, "boundary payload changed after preparation");
+			}
+		}
+
+		const consumed = this.#take(decision.preparationId);
+		if (!consumed) return { status: 409, message: "boundary approval is not pending" };
+		if (decision.decision === "reject") {
+			consumed.reject(new AIError.ValidationError(decision.error ?? "pi-native boundary approval rejected"));
+		} else {
+			consumed.resolve(resolution);
+		}
+		return { status: 200, message: "approved" };
+	}
+
+	cancelStream(streamId: string, reason: unknown): void {
+		const preparationId = this.#pendingByStream.get(streamId);
+		if (!preparationId) return;
+		this.#take(preparationId)?.reject(reason);
+	}
+
+	close(): void {
+		for (const preparationId of [...this.#pending.keys()]) {
+			this.#take(preparationId)?.reject(new AIError.AbortError("auth-gateway stopped"));
+		}
+	}
+
+	#take(preparationId: string): PendingPiNativeBoundaryApproval | undefined {
+		const pending = this.#pending.get(preparationId);
+		if (!pending) return undefined;
+		this.#pending.delete(preparationId);
+		this.#pendingByStream.delete(pending.preparation.streamId);
+		clearTimeout(pending.timer);
+		pending.signal.removeEventListener("abort", pending.abort);
+		return pending;
+	}
+
+	#rejectProtocol(preparationId: string, status: number, message: string): { status: number; message: string } {
+		this.#take(preparationId)?.reject(new AIError.ValidationError(`pi-native ${message}`));
+		return { status, message };
+	}
 }
 
 // `parseBind` lives in ../utils/parse-bind so the gateway and broker can't
@@ -169,7 +425,10 @@ function buildStreamOptions(parsed: ParsedFormatRequest, api: Api, signal: Abort
 	opts.promptCacheKey = promptCacheKey;
 	opts.sessionId = promptCacheKey;
 	if (options.thinkingBudgets) {
-		opts.thinkingBudgets = { ...(opts.thinkingBudgets ?? {}), ...options.thinkingBudgets };
+		opts.thinkingBudgets = {
+			...(opts.thinkingBudgets ?? {}),
+			...options.thinkingBudgets,
+		};
 	}
 	if (options.explicitThinkingBudgetTokens !== undefined) {
 		// Mirror Rust's `resolve_thinking_budget`: explicit budget pins onto
@@ -263,9 +522,15 @@ async function refreshGatewayApiKeyAfterAuthError(
 			error: message,
 		});
 		if (!switched) return undefined;
-		return storage.getApiKey(provider, sessionId, { modelId: model.id, signal });
+		return storage.getApiKey(provider, sessionId, {
+			modelId: model.id,
+			signal,
+		});
 	}
-	await storage.invalidateCredentialMatching(provider, oldKey, { sessionId, signal });
+	await storage.invalidateCredentialMatching(provider, oldKey, {
+		sessionId,
+		signal,
+	});
 	logger.debug("auth-gateway retrying provider request after credential invalidation", {
 		format,
 		provider,
@@ -473,7 +738,11 @@ async function handleFormatEndpoint(
 	} catch (error) {
 		if (controller.signal.aborted) return clientClosedResponse(route);
 		const classified = classifyGatewayError(error);
-		logger.warn("auth-gateway getApiKey threw", { provider: model.provider, peer, error: classified.message });
+		logger.warn("auth-gateway getApiKey threw", {
+			provider: model.provider,
+			peer,
+			error: classified.message,
+		});
 		return route.module.formatError(classified.status, classified.type, classified.message);
 	}
 	if (controller.signal.aborted) return clientClosedResponse(route);
@@ -550,7 +819,11 @@ async function handleFormatEndpoint(
 		events = streamSimple(model, parsed.context, streamOpts);
 	} catch (error) {
 		const classified = classifyGatewayError(error);
-		logger.warn("auth-gateway streamSimple threw", { format: route.label, error: classified.message, peer });
+		logger.warn("auth-gateway streamSimple threw", {
+			format: route.label,
+			error: classified.message,
+			peer,
+		});
 		return route.module.formatError(classified.status, classified.type, classified.message);
 	}
 	if (controller.signal.aborted) return clientClosedResponse(route);
@@ -596,7 +869,35 @@ async function handleFormatEndpoint(
  * `parseRequest`/`encodeResponse`/`encodeStream` differ from the format-endpoint
  * path.
  */
-async function handlePiNative(bootOpts: AuthGatewayBootOptions, req: Request, peer: string): Promise<Response> {
+async function handlePiNativeBoundaryApproval(
+	approvals: PiNativeBoundaryApprovalStore,
+	req: Request,
+): Promise<Response> {
+	let body: unknown;
+	try {
+		body = await req.json();
+	} catch (error) {
+		return piNative.formatError(400, "invalid_request_error", `Invalid JSON body: ${String(error)}`);
+	}
+	let decision: piNative.PiNativeBoundaryApprovalDecision;
+	try {
+		decision = piNative.parseBoundaryApprovalDecision(body);
+	} catch (error) {
+		return piNative.formatError(400, "invalid_request_error", error instanceof Error ? error.message : String(error));
+	}
+	const result = approvals.consume(decision, requestBearerFingerprint(req));
+	return result.status === 200
+		? json(200, { ok: true })
+		: piNative.formatError(result.status, "boundary_approval_error", result.message);
+}
+
+async function handlePiNative(
+	bootOpts: AuthGatewayBootOptions,
+	approvals: PiNativeBoundaryApprovalStore,
+	req: Request,
+	peer: string,
+	protectedRoute: boolean,
+): Promise<Response> {
 	const startedAt = performance.now();
 	const requestId = crypto.randomUUID();
 	const controller = mirrorRequestAbort(req);
@@ -643,7 +944,11 @@ async function handlePiNative(bootOpts: AuthGatewayBootOptions, req: Request, pe
 	} catch (error) {
 		if (controller.signal.aborted) return aborted();
 		const classified = classifyGatewayError(error);
-		logger.warn("auth-gateway getApiKey threw", { provider: model.provider, peer, error: classified.message });
+		logger.warn("auth-gateway getApiKey threw", {
+			provider: model.provider,
+			peer,
+			error: classified.message,
+		});
 		return piNative.formatError(classified.status, classified.type, classified.message);
 	}
 	if (controller.signal.aborted) return aborted();
@@ -659,7 +964,11 @@ async function handlePiNative(bootOpts: AuthGatewayBootOptions, req: Request, pe
 	// trust the client's options (already allow-listed by `parseRequest`) and
 	// only inject server-controlled fields. The codex sampling strip mirrors
 	// `buildStreamOptions` — Codex rejects every one with a 400 (#3117).
-	const streamOpts: SimpleStreamOptions = { ...parsed.options, apiKey, signal: controller.signal };
+	const streamOpts: SimpleStreamOptions = {
+		...parsed.options,
+		apiKey,
+		signal: controller.signal,
+	};
 	streamOpts.apiKey = buildGatewayApiKeyResolver(
 		bootOpts.storage,
 		model,
@@ -684,6 +993,31 @@ async function handlePiNative(bootOpts: AuthGatewayBootOptions, req: Request, pe
 	const captured = captureRequestHeaders(req.headers);
 	streamOpts.headers = { ...captured, ...(streamOpts.headers ?? {}) };
 	streamOpts.sessionId ??= sessionId;
+	const streamId = crypto.randomUUID();
+	const boundaryEvents = boundaryApproval ? new AssistantMessageEventStreamImpl() : undefined;
+	const boundarySession: PiNativeBoundarySession | undefined = boundaryEvents
+		? {
+				requestId,
+				streamId,
+				sessionId,
+				bearerFingerprint: requestBearerFingerprint(req),
+				forbiddenSecrets: [apiKey, ...Object.values(streamOpts.headers ?? {})],
+				signal: controller.signal,
+				sequence: 0,
+				emit: event => boundaryEvents.deliver(event as unknown as AssistantMessageEvent),
+			}
+		: undefined;
+	if (boundaryApproval?.payload && boundarySession) {
+		streamOpts.onPayload = async (payload, payloadModel) => {
+			const resolution = await approvals.prepare(boundarySession, "payload", payload, payloadModel ?? model);
+			return resolution.decision === "replace" ? resolution.replacement : undefined;
+		};
+	}
+	if (boundaryApproval?.toolContracts && boundarySession) {
+		streamOpts.onToolContracts = async (payload, payloadModel) => {
+			await approvals.prepare(boundarySession, "toolContracts", payload, payloadModel ?? model);
+		};
+	}
 
 	logger.info("auth-gateway request", {
 		requestId,
@@ -720,7 +1054,11 @@ async function handlePiNative(bootOpts: AuthGatewayBootOptions, req: Request, pe
 		} catch (error) {
 			if (controller.signal.aborted) return aborted();
 			const classified = classifyGatewayError(error);
-			logger.warn("auth-gateway non-streaming aborted", { format: "pi-native", error: classified.message, peer });
+			logger.warn("auth-gateway non-streaming aborted", {
+				format: "pi-native",
+				error: classified.message,
+				peer,
+			});
 			return piNative.formatError(classified.status, classified.type, classified.message);
 		}
 	}
@@ -731,7 +1069,11 @@ async function handlePiNative(bootOpts: AuthGatewayBootOptions, req: Request, pe
 		events = streamSimple(model, parsed.context, streamOpts);
 	} catch (error) {
 		const classified = classifyGatewayError(error);
-		logger.warn("auth-gateway streamSimple threw", { format: "pi-native", error: classified.message, peer });
+		logger.warn("auth-gateway streamSimple threw", {
+			format: "pi-native",
+			error: classified.message,
+			peer,
+		});
 		return piNative.formatError(classified.status, classified.type, classified.message);
 	}
 	if (controller.signal.aborted) return aborted();
@@ -838,6 +1180,7 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 	const bind = parseBind(opts.bind ?? DEFAULT_AUTH_GATEWAY_BIND);
 	const tokens = new Set<string>(opts.bearerTokens);
 	const version = opts.version;
+	const boundaryApprovals = new PiNativeBoundaryApprovalStore(opts.boundaryApprovalTtlMs);
 
 	const server = Bun.serve({
 		hostname: bind.hostname,
@@ -857,7 +1200,11 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 					return withCors(json(200, { ok: true, version }), req);
 				}
 				if (!isAuthorized(req, tokens)) {
-					logger.info("auth-gateway request unauthorized", { method: req.method, path: pathname, peer });
+					logger.info("auth-gateway request unauthorized", {
+						method: req.method,
+						path: pathname,
+						peer,
+					});
 					return withCors(json(401, { error: "unauthorized" }), req);
 				}
 
@@ -884,7 +1231,13 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 				// Pi-native fast path. Same auth + provider plumbing as the
 				// foreign-wire routes, just without the wire-format translation.
 				if (req.method === "POST" && pathname === "/v1/pi/stream") {
-					return withCors(await handlePiNative(opts, req, peer), req);
+					return withCors(await handlePiNative(opts, boundaryApprovals, req, peer, false), req);
+				}
+				if (req.method === "POST" && pathname === "/v1/pi/boundary-stream/v1") {
+					return withCors(await handlePiNative(opts, boundaryApprovals, req, peer, true), req);
+				}
+				if (req.method === "POST" && pathname === "/v1/pi/boundary-approval") {
+					return withCors(await handlePiNativeBoundaryApproval(boundaryApprovals, req), req);
 				}
 
 				// Model catalog.
@@ -917,6 +1270,7 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 		port: boundPort,
 		hostname: boundHost,
 		close: async () => {
+			boundaryApprovals.close();
 			server.stop(true);
 		},
 	};

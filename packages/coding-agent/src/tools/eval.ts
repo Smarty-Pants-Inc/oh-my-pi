@@ -548,7 +548,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 		const jobId = autoBgManager.register(
 			"eval",
 			label,
-			async ({ jobId, signal: runSignal, reportProgress }) => {
+			async ({ jobId, signal: runSignal, reportProgress, setResultContent }) => {
 				try {
 					const result = await run(runSignal, (text, details) => {
 						latestText = text;
@@ -556,6 +556,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 						void reportProgress(text, { async: { state: "running", jobId, type: "eval" } });
 						if (forwardUpdates) emitToolUpdate?.(text, details);
 					});
+					setResultContent(result.content);
 					const finalText = result.content.find(block => block.type === "text")?.text ?? "";
 					latestText = finalText;
 					// Hand the full result (images included) to the foreground waiter
@@ -577,7 +578,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 					throw error;
 				}
 			},
-			{ ownerId: session.getAgentId?.() ?? undefined },
+			{ ownerId: session.getAgentId?.() ?? undefined, originTurnId: session.getCurrentTurnId?.() },
 		);
 
 		if (startBackgrounded) {
@@ -743,11 +744,17 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 
 			const sessionFile = session.getSessionFile?.() ?? undefined;
 			const kernelOwnerId = session.getEvalKernelOwnerId?.() ?? undefined;
-			const { path: artifactPath, id: artifactId } = (await session.allocateOutputArtifact?.("eval")) ?? {};
-			session.assertEvalExecutionAllowed?.();
+			const artifact = (await session.allocateOutputArtifact?.("eval")) ?? {};
+			try {
+				session.assertEvalExecutionAllowed?.();
+			} catch (error) {
+				artifact.release?.();
+				throw error;
+			}
 			outputSink = new OutputSink({
-				artifactPath,
-				artifactId,
+				artifactPath: artifact.path,
+				artifactId: artifact.id,
+				artifactRelease: artifact.release,
 				headBytes: resolveOutputSinkHeadBytes(session.settings),
 				maxColumns: resolveOutputMaxColumns(session.settings),
 				onChunk: chunk => {

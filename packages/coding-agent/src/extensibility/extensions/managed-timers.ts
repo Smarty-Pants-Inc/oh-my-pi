@@ -20,20 +20,30 @@ import { logger } from "@oh-my-pi/pi-utils";
 export type ManagedTimerErrorHandler = (event: string, error: string, stack?: string) => void;
 
 export class ManagedTimers {
-	readonly #timers = new Set<Timer>();
+	readonly #timers = new Map<Timer, string | undefined>();
 
 	constructor(private readonly onError: ManagedTimerErrorHandler) {}
 
 	/** Schedule a repeating callback whose throws are contained. */
-	setInterval(callback: (...args: unknown[]) => void, ms?: number, ...args: unknown[]): Timer {
+	setInterval(
+		owner: string | undefined,
+		callback: (...args: unknown[]) => void,
+		ms?: number,
+		...args: unknown[]
+	): Timer {
 		const timer = setInterval(() => this.#run("interval", callback, args), ms, ...args);
 		timer.unref?.();
-		this.#timers.add(timer);
+		this.#timers.set(timer, owner);
 		return timer;
 	}
 
 	/** Schedule a one-shot callback whose throws are contained. Deregisters after it fires. */
-	setTimeout(callback: (...args: unknown[]) => void, ms?: number, ...args: unknown[]): Timer {
+	setTimeout(
+		owner: string | undefined,
+		callback: (...args: unknown[]) => void,
+		ms?: number,
+		...args: unknown[]
+	): Timer {
 		const timer = setTimeout(
 			() => {
 				this.#timers.delete(timer);
@@ -43,7 +53,7 @@ export class ManagedTimers {
 			...args,
 		);
 		timer.unref?.();
-		this.#timers.add(timer);
+		this.#timers.set(timer, owner);
 		return timer;
 	}
 
@@ -55,12 +65,13 @@ export class ManagedTimers {
 	}
 
 	/** Clear every outstanding managed timer. Called on session teardown. */
-	clearAll(): void {
-		for (const timer of this.#timers) {
+	clearAll(retainedOwners: ReadonlySet<string> = new Set()): void {
+		for (const [timer, owner] of this.#timers) {
+			if (owner !== undefined && retainedOwners.has(owner)) continue;
 			clearInterval(timer);
 			clearTimeout(timer);
+			this.#timers.delete(timer);
 		}
-		this.#timers.clear();
 	}
 
 	#run(kind: "interval" | "timeout", callback: (...args: unknown[]) => void, args: unknown[]): void {

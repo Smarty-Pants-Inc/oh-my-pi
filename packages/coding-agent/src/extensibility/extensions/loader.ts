@@ -1,7 +1,7 @@
 /**
  * Extension loader - loads TypeScript extension modules using native Bun import.
  */
-import type * as fs1 from "node:fs";
+import * as fs1 from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
@@ -21,21 +21,28 @@ import { hasFsCode, isEacces, isEnoent, logger } from "@oh-my-pi/pi-utils";
 import { type ExtensionModule, extensionModuleCapability } from "../../capability/extension-module";
 import { type Hook, hookCapability } from "../../capability/hook";
 import { isServiceTierFamily, isServiceTierForFamily } from "../../config/service-tier";
+import { approvedCandidateSourceModule, type ContextReleaseManifest } from "../../context/manifest";
 import { loadCapability } from "../../discovery";
 import { getExtensionNameFromPath } from "../../discovery/helpers";
 import type { ExecOptions } from "../../exec/exec";
 import { execCommand } from "../../exec/exec";
 // Runtime self-reference: dereference this namespace only inside loader functions to keep the index.ts cycle safe.
 import * as PiCodingAgent from "../../index";
+import type { ExecutionEnvironmentProvider } from "../../session/execution-environment";
 import type { CustomMessagePayload } from "../../session/messages";
 import type { FileDeleteFallbackHandler, FileWriteFallbackHandler } from "../../tools/file-write-fallback";
 import { EventBus } from "../../utils/event-bus";
 import * as TypeBox from "../legacy-typebox";
-import { installLegacyPiSpecifierShim, loadLegacyPiModule } from "../plugins/legacy-pi-compat";
+import {
+	type ApprovedLegacyPiModule,
+	installLegacyPiSpecifierShim,
+	loadLegacyPiModule,
+} from "../plugins/legacy-pi-compat";
 import { getAllPluginExtensionPaths } from "../plugins/loader";
 
 import { resolvePath, withHostGuard } from "../utils";
 import type {
+	AppKeybinding,
 	AssistantThinkingRenderer,
 	ComposerShapeDefinition,
 	Extension,
@@ -48,6 +55,9 @@ import type {
 	PreparedExtension,
 	ProviderConfig,
 	RegisteredCommand,
+	SendMessageDisposition,
+	SendMessageOptions,
+	SystemPromptBuilder,
 	ToolDefinition,
 	ToolInfo,
 } from "./types";
@@ -85,7 +95,7 @@ export class ExtensionRuntime implements IExtensionRuntime {
 		this.pendingProviderRegistrations.splice(0, this.pendingProviderRegistrations.length, ...remaining);
 	}
 
-	sendMessage(): void {
+	sendMessage(): Promise<SendMessageDisposition> {
 		throw new ExtensionRuntimeNotInitializedError();
 	}
 
@@ -177,6 +187,10 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 		this.extension.handlers.set(event, list);
 	}
 
+	registerSessionMutationFence(handler: Extension["sessionMutationFences"][number]): void {
+		this.extension.sessionMutationFences.push(handler);
+	}
+
 	registerTool<TParams extends TSchema = TSchema, TDetails = unknown>(tool: ToolDefinition<TParams, TDetails>): void {
 		const registered = {
 			definition: tool,
@@ -212,6 +226,8 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 	registerShortcut(
 		shortcut: KeyId,
 		options: {
+			/** Register only while this exact shortcut remains bound to the named app action. */
+			whenKeybinding?: AppKeybinding;
 			description?: string;
 			handler: (ctx: ExtensionContext) => Promise<void> | void;
 		},
@@ -258,9 +274,9 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 
 	sendMessage<T = unknown>(
 		message: CustomMessagePayload<T>,
-		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
-	): void {
-		this.runtime.sendMessage(message, options);
+		options?: SendMessageOptions,
+	): Promise<SendMessageDisposition> {
+		return this.runtime.sendMessage(message, options);
 	}
 
 	sendUserMessage(
@@ -325,6 +341,20 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 		return this.runtime.setSessionName(name);
 	}
 
+	registerExecutionEnvironmentProvider(provider: ExecutionEnvironmentProvider): void {
+		if (this.extension.executionEnvironmentProvider) {
+			throw new Error(`Extension ${this.extension.path} registered more than one execution environment provider`);
+		}
+		this.extension.executionEnvironmentProvider = provider;
+	}
+
+	registerSystemPromptBuilder(builder: SystemPromptBuilder): void {
+		if (this.extension.systemPromptBuilder) {
+			throw new Error(`Extension ${this.extension.path} registered more than one system prompt builder`);
+		}
+		this.extension.systemPromptBuilder = builder;
+	}
+
 	registerProvider(name: string, config: ProviderConfig): void {
 		this.runtime.registerProvider(name, config, this.extension.path);
 	}
@@ -342,6 +372,7 @@ function createExtension(extensionPath: string, resolvedPath: string): Extension
 		path: extensionPath,
 		resolvedPath,
 		handlers: new Map(),
+		sessionMutationFences: [],
 		tools: new Map(),
 		toolRegistrationListeners: new Set(),
 		assistantThinkingRenderers: [],
@@ -382,7 +413,9 @@ async function runExtensionFactory(
 async function importExtensionModule(extensionPath: string, cwd: string): Promise<PreparedExtension> {
 	const resolvedPath = resolvePath(extensionPath, cwd);
 	try {
-		const module = (await withHostGuard(() => loadLegacyPiModule(resolvedPath))) as LoadedExtensionModule;
+		const module = (await withHostGuard(() =>
+			loadLegacyPiModule(approvedModule?.entryPath ?? resolvedPath, approvedModule),
+		)) as LoadedExtensionModule;
 		const factory = getExtensionFactory(module);
 
 		if (typeof factory !== "function") {
@@ -433,8 +466,9 @@ export async function loadExtensionFromFactory(
 	eventBus: EventBus,
 	runtime: IExtensionRuntime,
 	name = "<inline>",
+	resolvedPath = name,
 ): Promise<Extension> {
-	const extension = createExtension(name, name);
+	const extension = createExtension(name, resolvedPath);
 	const api = new ConcreteExtensionAPI(PiCodingAgent, extension, runtime, cwd, eventBus);
 	await runExtensionFactory(factory, api, runtime);
 	return extension;
@@ -660,8 +694,12 @@ export async function discoverExtensionPaths(
 
 	const addPath = (extPath: string): void => {
 		const resolved = path.resolve(extPath);
-		if (!seen.has(resolved)) {
-			seen.add(resolved);
+		let canonical = resolved;
+		try {
+			canonical = fs1.realpathSync.native(resolved);
+		} catch {}
+		if (!seen.has(canonical)) {
+			seen.add(canonical);
 			allPaths.push(extPath);
 		}
 	};
@@ -756,7 +794,8 @@ export async function discoverAndLoadExtensions(
 	eventBus?: EventBus,
 	disabledExtensionIds?: string[],
 	options: DiscoverExtensionPathOptions = {},
+	releaseManifest?: ContextReleaseManifest,
 ): Promise<LoadExtensionsResult> {
 	const paths = await discoverExtensionPaths(configuredPaths, cwd, disabledExtensionIds, options);
-	return loadExtensions(paths, cwd, eventBus);
+	return loadExtensions(paths, cwd, eventBus, releaseManifest);
 }

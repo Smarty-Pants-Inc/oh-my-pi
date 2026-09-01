@@ -1,8 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
-import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
+import type { ImageContent } from "@oh-my-pi/pi-ai";
+import { type AsyncJob, AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import * as evalIndex from "@oh-my-pi/pi-coding-agent/eval";
+import { buildAsyncResultBatchMessage } from "@oh-my-pi/pi-coding-agent/session/async-job-delivery";
+import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { EvalTool } from "@oh-my-pi/pi-coding-agent/tools/eval";
@@ -39,7 +42,7 @@ function baseResult(overrides: Record<string, unknown> = {}) {
  * blocks until the returned `release()` gate opens — so backgrounding is decided
  * by the tool's own threshold/steer race, never by a guessed sleep.
  */
-function mockGatedCell(finalOutput: string): { release: () => void } {
+function mockGatedCell(finalOutput: string, displayOutputs: unknown[] = []): { release: () => void } {
 	const gate = Promise.withResolvers<void>();
 	vi.spyOn(evalIndex.jsBackend, "execute").mockImplementation((async (
 		_code: string,
@@ -47,7 +50,7 @@ function mockGatedCell(finalOutput: string): { release: () => void } {
 	) => {
 		options.onChunk?.("start\n");
 		await gate.promise;
-		return baseResult({ output: finalOutput });
+		return baseResult({ output: finalOutput, displayOutputs });
 	}) as never);
 	return { release: gate.resolve };
 }
@@ -167,8 +170,97 @@ describe("EvalTool auto-background", () => {
 		expect(deliveries).toHaveLength(1);
 		expect(deliveries[0]?.jobId).toBe(jobId);
 		expect(deliveries[0]?.text).toContain("done");
+		expect(runningJob?.resultContent).toEqual([{ type: "text", text: "start\ndone" }]);
+		const automaticMessage = buildAsyncResultBatchMessage([
+			{ jobId, result: deliveries[0]?.text ?? "", job: runningJob, durationMs: 0, epoch: 0 },
+		]);
+		expect(automaticMessage?.content).toEqual(expect.stringContaining("done"));
 		// Tool-call updates stop once the cell is backgrounded.
 		expect(updates).toEqual(updatesAtBackground);
+		await asyncJobManager.dispose();
+	});
+
+	it("batches two image-bearing backgrounded cells with recoverable job boundaries", async () => {
+		const sourceImages: ImageContent[] = [
+			{ type: "image", data: Buffer.from([0, 1, 2, 3]).toString("base64"), mimeType: "image/png" },
+			{ type: "image", data: Buffer.from([4, 5, 6, 7]).toString("base64"), mimeType: "image/png" },
+		];
+		const deliveries: Array<{ jobId: string; text: string; job: AsyncJob }> = [];
+		const asyncJobManager = new AsyncJobManager({
+			onJobComplete: (jobId, text, job) => {
+				deliveries.push({ jobId, text, job });
+			},
+		});
+		const tool = new EvalTool(
+			makeSession(
+				Settings.isolated({
+					"eval.autoBackground.enabled": true,
+					"eval.autoBackground.thresholdMs": 0,
+				}),
+				asyncJobManager,
+			),
+		);
+
+		const runImageCell = async (
+			callId: string,
+			image: ImageContent,
+		): Promise<{ job: AsyncJob; image: ImageContent }> => {
+			vi.restoreAllMocks();
+			const cell = mockGatedCell("", [image]);
+			const result = await tool.execute(callId, { language: "js", code: `display(${callId})` });
+			const jobId = result.details?.async?.jobId;
+			if (!jobId) throw new Error("expected an image-bearing background job id");
+			const job = asyncJobManager.getJob(jobId);
+			if (!job) throw new Error(`missing background job ${jobId}`);
+			cell.release();
+			await job.promise;
+			await asyncJobManager.drainDeliveries({ timeoutMs: 100 });
+			const retainedImage = job.resultContent?.find((block): block is ImageContent => block.type === "image");
+			if (!retainedImage) throw new Error(`missing retained image for ${jobId}`);
+			return { job, image: retainedImage };
+		};
+
+		const first = await runImageCell("firstImage", sourceImages[0]!);
+		const second = await runImageCell("secondImage", sourceImages[1]!);
+		expect(deliveries.map(delivery => delivery.jobId)).toEqual([first.job.id, second.job.id]);
+
+		const automaticMessage = buildAsyncResultBatchMessage(
+			deliveries.map(delivery => ({
+				jobId: delivery.jobId,
+				result: delivery.text,
+				job: delivery.job,
+				durationMs: 0,
+				epoch: 0,
+			})),
+		);
+		if (!automaticMessage || !Array.isArray(automaticMessage.content)) {
+			throw new Error("expected structured automatic delivery content");
+		}
+		const summary = automaticMessage.content[0];
+		if (summary?.type !== "text") throw new Error("expected automatic delivery summary text");
+		expect(summary.text).toContain(`Image #1: job \`${first.job.id}\``);
+		expect(summary.text).toContain(`Image #2: job \`${second.job.id}\``);
+		expect(summary.text.indexOf(`Image #1: job \`${first.job.id}\``)).toBeLessThan(
+			summary.text.indexOf(`Image #2: job \`${second.job.id}\``),
+		);
+		expect(automaticMessage.content[1]).toBe(first.image);
+		expect(automaticMessage.content[2]).toBe(second.image);
+
+		const converted = convertToLlm([automaticMessage]);
+		const developer = converted.find(message => message.role === "developer");
+		if (developer?.role !== "developer" || !Array.isArray(developer.content)) {
+			throw new Error("expected converted automatic summary");
+		}
+		const developerText = developer.content.map(block => (block.type === "text" ? block.text : "")).join("\n");
+		expect(developerText).toContain(`Image #1: job \`${first.job.id}\``);
+		expect(developerText).toContain(`Image #2: job \`${second.job.id}\``);
+		const user = converted.find(message => message.role === "user");
+		if (user?.role !== "user" || !Array.isArray(user.content)) {
+			throw new Error("expected converted automatic images");
+		}
+		const convertedImages = user.content.filter((block): block is ImageContent => block.type === "image");
+		expect(convertedImages[0]).toBe(first.image);
+		expect(convertedImages[1]).toBe(second.image);
 		await asyncJobManager.dispose();
 	});
 

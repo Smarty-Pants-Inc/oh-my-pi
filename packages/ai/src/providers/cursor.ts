@@ -169,6 +169,7 @@ import {
 	parseStreamingJsonThrottled,
 	sanitizeText,
 } from "@oh-my-pi/pi-utils";
+import { mapContextInstructionsForModel } from "../context-instructions";
 import * as AIError from "../error";
 import type {
 	Api,
@@ -323,7 +324,14 @@ const NOT_IMPLEMENTED = `Not implemented by this client`;
 
 const conversationStateCache = new Map<string, ConversationStateStructure>();
 const conversationBlobStores = new Map<string, Map<string, Uint8Array>>();
+const cursorProviderDispatchGuards = new WeakMap<http2.ClientHttp2Stream, () => void>();
+
+function writeCursorProviderFrame(h2Request: http2.ClientHttp2Stream, frame: Buffer): boolean {
+	cursorProviderDispatchGuards.get(h2Request)?.();
+	return h2Request.write(frame);
+}
 const warnedCursorKimiK3ReplayMessages = new Set<string>();
+const PROVIDER_PAYLOAD_EVIDENCE = Symbol.for("oh-my-pi.provider-payload-evidence");
 /**
  * Base conversation id → rotated wire id (#8345). Cursor's backend can pin a
  * per-conversation rejection (bare `resource_exhausted`, zero tokens) to one
@@ -638,6 +646,7 @@ function streamCursorWithWireMode(
 		let h2Settled = false;
 		let sawTurnEnded = false;
 		let endStreamError: Error | null = null;
+		let dispatchError: Error | null = null;
 		// Blocks the discovered-id retry once the turn produced observable output or
 		// ran a side effect (streamed content/tool call, exec bridge, permission
 		// reply). Pure keepalive heartbeats never set it, so a `not_found` that
@@ -703,7 +712,17 @@ function streamCursorWithWireMode(
 			serializedFallbackWireModelId = builtRequest.fallbackWireModelId;
 			conversationStateCache.set(conversationId, conversationState);
 			const requestContextTools = buildMcpToolDefinitions(context.tools);
-			const requestContextRules = buildCursorRequestContextRules(context.systemPrompt);
+			await options?.onToolContracts?.(
+				{
+					tools: requestContextTools.map(definition => ({
+						name: definition.name,
+						description: definition.description,
+						parametersJsonSchema: decodeJsonValue(definition.inputSchema),
+					})),
+				},
+				model,
+			);
+			const requestContextRules = buildCursorRequestContextRules(context.systemPrompt, context.instructions, model);
 
 			const baseUrl = model.baseUrl || CURSOR_API_URL;
 			const requestPath = "/agent.v1.AgentService/Run";
@@ -744,6 +763,7 @@ function streamCursorWithWireMode(
 					})
 				: undefined;
 
+			if (options?.signal?.aborted) throw new AIError.AbortError();
 			const proxyUrl = getProxyForUrl(model.provider, new URL(baseUrl));
 			if (proxyUrl) {
 				const tlsSocket = await connectProxiedSocket(proxyUrl, baseUrl, {
@@ -758,6 +778,8 @@ function streamCursorWithWireMode(
 			}
 			h2Client.on("error", error => settleH2(mapH2TransportError(error, baseUrl)));
 
+			options?.providerDispatchGuard?.();
+			if (options?.signal?.aborted) throw new AIError.AbortError();
 			h2Request = h2Client.request(requestHeaders);
 
 			stream.push({ type: "start", partial: output });
@@ -868,8 +890,13 @@ function streamCursorWithWireMode(
 							requestContextTools,
 							requestContextRules,
 							onConversationCheckpoint,
+							options?.providerDispatchGuard,
 						).catch(error => {
-							log("error", "handleServerMessage", { error: String(error) });
+							const reason = error instanceof Error ? error : new Error(String(error));
+							dispatchError ??= reason;
+							log("error", "handleServerMessage", { error: String(reason) });
+							settleH2(reason);
+							h2Request?.close();
 						});
 						inFlightDispatches.add(dispatch);
 						void dispatch.finally(() => inFlightDispatches.delete(dispatch));
@@ -945,6 +972,7 @@ function streamCursorWithWireMode(
 			// unpaired and stripped from every rebuilt transcript. Each dispatch
 			// already swallows its own rejection, so this only waits.
 			await drainInFlightDispatches();
+			if (dispatchError) throw dispatchError;
 
 			endCurrentTextBlock(output, stream, state);
 			endCurrentThinkingBlock(output, stream, state);
@@ -1154,7 +1182,9 @@ export async function handleServerMessage(
 	requestContextTools: McpToolDefinition[],
 	requestContextRules: CursorRule[] = [],
 	onConversationCheckpoint?: (checkpoint: ConversationStateStructure) => void,
+	providerDispatchGuard?: () => void,
 ): Promise<void> {
+	if (providerDispatchGuard) cursorProviderDispatchGuards.set(h2Request, providerDispatchGuard);
 	const msgCase = msg.message.case;
 
 	log("serverMessage", msgCase, msg.message.value);
@@ -1188,7 +1218,7 @@ export async function handleServerMessage(
 		// aborts a live stream with "Provider stream stalled while waiting for
 		// the next event" (cursor-grok-4.6-xhigh after a WebFetch/WebSearch
 		// permission prompt).
-		handleInteractionQuery(msg.message.value, h2Request);
+		handleInteractionQuery(msg.message.value, frame => writeCursorProviderFrame(h2Request, frame));
 	} else if (msgCase === "conversationCheckpointUpdate") {
 		handleConversationCheckpointUpdate(msg.message.value, output, usageState, onConversationCheckpoint);
 	}
@@ -1268,7 +1298,7 @@ function handleKvServerMessage(
 		});
 
 		const responseBytes = toBinary(AgentClientMessageSchema, kvClientMessage);
-		h2Request.write(frameConnectMessage(responseBytes));
+		writeCursorProviderFrame(h2Request, frameConnectMessage(responseBytes));
 
 		log("kvClient", "getBlobResult", { blobId: blobIdKey.slice(0, 40) });
 	} else if (kvCase === "setBlobArgs") {
@@ -1289,7 +1319,7 @@ function handleKvServerMessage(
 		});
 
 		const responseBytes = toBinary(AgentClientMessageSchema, kvClientMessage);
-		h2Request.write(frameConnectMessage(responseBytes));
+		writeCursorProviderFrame(h2Request, frameConnectMessage(responseBytes));
 
 		log("kvClient", "setBlobResult", { blobId: blobIdKey.slice(0, 40) });
 	}
@@ -1349,92 +1379,125 @@ async function handleShellStreamArgs(
 
 	sendShellStreamEvent(h2Request, execMsg, { case: "start", value: create(ShellStreamStartSchema, {}) });
 
-	// Buffer for incomplete ANSI sequences across chunks
+	// Buffer for incomplete ANSI sequences across chunks.
 	let stdoutBuffer = "";
 	let stderrBuffer = "";
+	let stdoutFlushTimer: NodeJS.Timeout | undefined;
+	let stderrFlushTimer: NodeJS.Timeout | undefined;
+	let outputOpen = !h2Request.closed && !h2Request.destroyed;
+	let outputFailureReason: unknown;
+	let outputFailureReported = false;
+	const outputFailure = Promise.withResolvers<unknown>();
+	const outputAbortController = new AbortController();
+
+	const clearFlushTimers = () => {
+		clearTimeout(stdoutFlushTimer);
+		clearTimeout(stderrFlushTimer);
+		stdoutFlushTimer = undefined;
+		stderrFlushTimer = undefined;
+	};
+	const closeOutput = () => {
+		outputOpen = false;
+		stdoutBuffer = "";
+		stderrBuffer = "";
+		clearFlushTimers();
+	};
+	const onTransportClose = () => closeOutput();
+	if (typeof h2Request.once === "function") h2Request.once("close", onTransportClose);
 
 	const incompleteEscapeRegex = /\x1b(|\[|\[\d*|\[\?|\[\?\d*|\]\d*;?)$/;
 
 	const flushStdout = () => {
-		if (stdoutBuffer) {
-			let safeEnd = stdoutBuffer.length;
-			const match = stdoutBuffer.match(incompleteEscapeRegex);
-			if (match && match[0].length > 0) {
-				safeEnd = stdoutBuffer.length - match[0].length;
-			}
-			const toSend = stdoutBuffer.slice(0, safeEnd);
-			const remaining = stdoutBuffer.slice(safeEnd);
-			if (toSend) {
-				sendShellStreamEvent(h2Request, execMsg, {
-					case: "stdout",
-					value: create(ShellStreamStdoutSchema, { data: sanitizeText(toSend) }),
-				});
-			}
-			stdoutBuffer = remaining;
+		if (!outputOpen || !stdoutBuffer) return;
+		let safeEnd = stdoutBuffer.length;
+		const match = stdoutBuffer.match(incompleteEscapeRegex);
+		if (match && match[0].length > 0) {
+			safeEnd = stdoutBuffer.length - match[0].length;
 		}
+		const toSend = stdoutBuffer.slice(0, safeEnd);
+		const remaining = stdoutBuffer.slice(safeEnd);
+		if (toSend) {
+			sendShellStreamEvent(h2Request, execMsg, {
+				case: "stdout",
+				value: create(ShellStreamStdoutSchema, { data: sanitizeText(toSend) }),
+			});
+		}
+		stdoutBuffer = remaining;
 	};
 
 	const flushStderr = () => {
-		if (stderrBuffer) {
-			let safeEnd = stderrBuffer.length;
-			const match = stderrBuffer.match(incompleteEscapeRegex);
-			if (match && match[0].length > 0) {
-				safeEnd = stderrBuffer.length - match[0].length;
-			}
-			const toSend = stderrBuffer.slice(0, safeEnd);
-			const remaining = stderrBuffer.slice(safeEnd);
-			if (toSend) {
-				sendShellStreamEvent(h2Request, execMsg, {
-					case: "stderr",
-					value: create(ShellStreamStderrSchema, { data: sanitizeText(toSend) }),
-				});
-			}
-			stderrBuffer = remaining;
+		if (!outputOpen || !stderrBuffer) return;
+		let safeEnd = stderrBuffer.length;
+		const match = stderrBuffer.match(incompleteEscapeRegex);
+		if (match && match[0].length > 0) {
+			safeEnd = stderrBuffer.length - match[0].length;
+		}
+		const toSend = stderrBuffer.slice(0, safeEnd);
+		const remaining = stderrBuffer.slice(safeEnd);
+		if (toSend) {
+			sendShellStreamEvent(h2Request, execMsg, {
+				case: "stderr",
+				value: create(ShellStreamStderrSchema, { data: sanitizeText(toSend) }),
+			});
+		}
+		stderrBuffer = remaining;
+	};
+
+	const reportOutputFailure = (error: unknown) => {
+		if (outputFailureReported) return;
+		outputFailureReported = true;
+		outputFailureReason = error;
+		closeOutput();
+		outputFailure.resolve(error);
+		outputAbortController.abort(error);
+	};
+	const flushSafely = (flush: () => void) => {
+		try {
+			flush();
+		} catch (error) {
+			reportOutputFailure(error);
 		}
 	};
 
-	let stdoutFlushTimer: NodeJS.Timeout | null = null;
-	let stderrFlushTimer: NodeJS.Timeout | null = null;
-
 	const scheduleStdoutFlush = () => {
-		if (!stdoutFlushTimer) {
-			stdoutFlushTimer = setTimeout(() => {
-				stdoutFlushTimer = null;
-				flushStdout();
-			}, 100);
-		}
+		if (!outputOpen || stdoutFlushTimer) return;
+		stdoutFlushTimer = setTimeout(() => {
+			stdoutFlushTimer = undefined;
+			flushSafely(flushStdout);
+		}, 100);
 	};
 
 	const scheduleStderrFlush = () => {
-		if (!stderrFlushTimer) {
-			stderrFlushTimer = setTimeout(() => {
-				stderrFlushTimer = null;
-				flushStderr();
-			}, 100);
-		}
+		if (!outputOpen || stderrFlushTimer) return;
+		stderrFlushTimer = setTimeout(() => {
+			stderrFlushTimer = undefined;
+			flushSafely(flushStderr);
+		}, 100);
 	};
 
 	const streamCallbacks: CursorShellStreamCallbacks = {
 		onStdout(data: string) {
+			if (!outputOpen) return;
 			stdoutBuffer += data;
 			if (stdoutBuffer.includes("\n") || stdoutBuffer.length > 4096) {
 				if (stdoutFlushTimer) {
 					clearTimeout(stdoutFlushTimer);
-					stdoutFlushTimer = null;
+					stdoutFlushTimer = undefined;
 				}
-				flushStdout();
+				flushSafely(flushStdout);
 			} else {
 				scheduleStdoutFlush();
 			}
 		},
 		onStderr(data: string) {
+			if (!outputOpen) return;
 			stderrBuffer += data;
 			if (stderrBuffer.includes("\n") || stderrBuffer.length > 4096) {
 				if (stderrFlushTimer) {
 					clearTimeout(stderrFlushTimer);
-					stderrFlushTimer = null;
+					stderrFlushTimer = undefined;
 				}
-				flushStderr();
+				flushSafely(flushStderr);
 			} else {
 				scheduleStderrFlush();
 			}
@@ -1442,41 +1505,67 @@ async function handleShellStreamArgs(
 	};
 
 	// Prefer the streaming handler — it forwards output chunks in real time.
-	// Falls back to the batch shell handler otherwise.
+	// Falls back to the batch shell handler otherwise. A streaming handler gets
+	// a best-effort cancellation signal; custom handlers may ignore it, so late
+	// results are also quarantined from the shared transcript callback.
 	const streamHandler = execHandlers?.shellStream?.bind(execHandlers);
 	const batchHandler = execHandlers?.shell?.bind(execHandlers);
-	const handler = streamHandler ? (shellArgs: ShellArgs) => streamHandler(shellArgs, streamCallbacks) : batchHandler;
+	const handler: ((shellArgs: ShellArgs) => Promise<CursorExecHandlerResult<ShellResult>>) | undefined = streamHandler
+		? async shellArgs => {
+				const result = await streamHandler(shellArgs, streamCallbacks, outputAbortController.signal);
+				clearFlushTimers();
+				flushSafely(flushStdout);
+				flushSafely(flushStderr);
+				if (outputFailureReported) throw outputFailureReason;
+				return result;
+			}
+		: batchHandler;
+	const guardedOnToolResult: CursorToolResultHandler | undefined = onToolResult
+		? toolResult => (outputFailureReported ? undefined : onToolResult(toolResult))
+		: undefined;
 
-	const { execResult } = await resolveExecHandler(
-		args as any,
-		handler as typeof batchHandler,
-		onToolResult,
-		toolResult => buildShellResultFromToolResult(normalizedArgs as any, toolResult),
-		reason =>
-			buildShellRejectedResult((normalizedArgs as any).command, (normalizedArgs as any).workingDirectory, reason),
-		error =>
-			buildShellFailureResult((normalizedArgs as any).command, (normalizedArgs as any).workingDirectory, error),
-		{ toolCallId: args.toolCallId, toolName: "bash" },
-	);
+	try {
+		const handlerResult = resolveExecHandler(
+			args,
+			handler,
+			guardedOnToolResult,
+			toolResult => buildShellResultFromToolResult(normalizedArgs, toolResult),
+			reason => buildShellRejectedResult(normalizedArgs.command, normalizedArgs.workingDirectory, reason),
+			error => buildShellFailureResult(normalizedArgs.command, normalizedArgs.workingDirectory, error),
+			{ toolCallId: args.toolCallId, toolName: "bash" },
+		);
+		const outcome = await Promise.race([
+			handlerResult.then(value => ({ case: "handler" as const, value })),
+			outputFailure.promise.then(error => ({ case: "outputFailure" as const, error })),
+		]);
+		if (outcome.case === "outputFailure") throw outcome.error;
+		const { execResult } = outcome.value;
+		if (outputFailureReported) throw outputFailureReason;
+		if (!outputOpen) return;
 
-	// When using the batch handler (no shellStream), send buffered stdout/stderr
-	// after execution completes. With shellStream these were already sent in real time.
-	const sendBufferedOutput = !streamHandler;
-	const sanitizedExecResult = sanitizeShellExecResult(execResult);
+		// When using the batch handler (no shellStream), send buffered stdout/stderr
+		// after execution completes. With shellStream these were already sent in real time.
+		const sendBufferedOutput = !streamHandler;
+		const sanitizedExecResult = sanitizeShellExecResult(execResult);
 
-	// Flush any remaining buffered output before sending results
-	if (stdoutFlushTimer) clearTimeout(stdoutFlushTimer);
-	if (stderrFlushTimer) clearTimeout(stderrFlushTimer);
-	flushStdout();
-	flushStderr();
+		clearFlushTimers();
+		flushStdout();
+		flushStderr();
+		if (!outputOpen) return;
 
-	sendShellStreamExitFromResult(h2Request, execMsg, sanitizedExecResult, sendBufferedOutput);
-	// Cursor can keep the turn pending when it receives only stream deltas.
-	// Send the final structured shellResult as completion acknowledgement.
-	sendExecClientMessage(h2Request, execMsg, "shellResult", sanitizedExecResult);
-	sendExecClientStreamClose(h2Request, execMsg);
+		sendShellStreamExitFromResult(h2Request, execMsg, sanitizedExecResult, sendBufferedOutput);
+		if (!outputOpen) return;
+		// Cursor can keep the turn pending when it receives only stream deltas.
+		// Send the final structured shellResult as completion acknowledgement.
+		sendExecClientMessage(h2Request, execMsg, "shellResult", sanitizedExecResult);
+		if (!outputOpen) return;
+		sendExecClientStreamClose(h2Request, execMsg);
 
-	log("shellStream", "done", { elapsed: performance.now() - startTs });
+		log("shellStream", "done", { elapsed: performance.now() - startTs });
+	} finally {
+		closeOutput();
+		if (typeof h2Request.off === "function") h2Request.off("close", onTransportClose);
+	}
 }
 
 function sendShellStreamExitFromResult(
@@ -2528,7 +2617,7 @@ function sendExecClientMessage<TCase extends NonNullable<ExecClientMessage["mess
 	});
 
 	const responseBytes = toBinary(AgentClientMessageSchema, clientMessage);
-	h2Request.write(frameConnectMessage(responseBytes));
+	writeCursorProviderFrame(h2Request, frameConnectMessage(responseBytes));
 
 	log("execClientMessage", messageCase, value);
 }
@@ -2564,7 +2653,7 @@ function sendExecClientThrow(
 	const clientMessage = create(AgentClientMessageSchema, {
 		message: { case: "execClientControlMessage", value: controlMessage },
 	});
-	h2Request.write(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
+	writeCursorProviderFrame(h2Request, frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
 	log("execClientControl", "throw", { id: execMsg.id, execId: execMsg.execId, error, errorCode });
 	sendExecClientStreamClose(h2Request, execMsg);
 }
@@ -2582,7 +2671,7 @@ function sendExecClientStreamClose(h2Request: http2.ClientHttp2Stream, execMsg: 
 		message: { case: "execClientControlMessage", value: closeMessage },
 	});
 	const responseBytes = toBinary(AgentClientMessageSchema, clientMessage);
-	h2Request.write(frameConnectMessage(responseBytes));
+	writeCursorProviderFrame(h2Request, frameConnectMessage(responseBytes));
 	log("execClientControl", "streamClose", { id: execMsg.id, execId: execMsg.execId });
 }
 
@@ -4566,14 +4655,35 @@ function readCursorBlob(blobStore: Map<string, Uint8Array>, blobId: Uint8Array):
 	return data;
 }
 
+/** Ordered model-visible system text shared by Cursor's blob and rule prompt paths. */
+function buildCursorSystemPromptTexts(
+	systemPrompt: readonly string[] | undefined,
+	instructions?: Context["instructions"],
+	model?: Model<"cursor-agent">,
+): string[] {
+	const prompts = [
+		...normalizeSystemPrompts(systemPrompt),
+		...(model
+			? mapContextInstructionsForModel(instructions, model).map(instruction =>
+					instruction.renderedText.toWellFormed(),
+				)
+			: []),
+	];
+	return prompts.length > 0 ? prompts : ["You are a helpful assistant."];
+}
+
 /**
  * Cursor AgentService reconstructs the model prompt from `requestContext.rules`,
  * not from the client-supplied `rootPromptMessagesJson` system blobs. Map each
- * OMP system-prompt entry to a global CursorRule so always-apply rules survive
- * that reconstruction.
+ * ordered OMP system prompt and typed instruction to a global CursorRule so
+ * always-apply context survives that reconstruction.
  */
-export function buildCursorRequestContextRules(systemPrompt: readonly string[] | undefined): CursorRule[] {
-	return normalizeSystemPrompts(systemPrompt).map((content, index) =>
+export function buildCursorRequestContextRules(
+	systemPrompt: readonly string[] | undefined,
+	instructions?: Context["instructions"],
+	model?: Model<"cursor-agent">,
+): CursorRule[] {
+	return buildCursorSystemPromptTexts(systemPrompt, instructions, model).map((content, index) =>
 		create(CursorRuleSchema, {
 			fullPath: `/omp/system-prompt/${index}.mdc`,
 			content,
@@ -4836,12 +4946,14 @@ function findLastUserMessageIndex(messages: Message[]): number {
  * When no system prompts are provided, returns a single default greeting so we never emit
  * an empty `rootPromptMessagesJson` head.
  */
-export function buildCursorSystemPromptJsons(systemPrompt: readonly string[] | undefined): string[] {
-	const systemPrompts = normalizeSystemPrompts(systemPrompt);
-	if (systemPrompts.length === 0) {
-		return [JSON.stringify({ role: "system", content: "You are a helpful assistant." })];
-	}
-	return systemPrompts.map(content => JSON.stringify({ role: "system", content }));
+export function buildCursorSystemPromptJsons(
+	systemPrompt: readonly string[] | undefined,
+	instructions?: Context["instructions"],
+	model?: Model<"cursor-agent">,
+): string[] {
+	return buildCursorSystemPromptTexts(systemPrompt, instructions, model).map(content =>
+		JSON.stringify({ role: "system", content }),
+	);
 }
 
 function collectCursorToolHistory(messages: Message[], historyEnd: number) {
@@ -5257,9 +5369,8 @@ async function buildGrpcRequestForWireMode(
 ): Promise<CursorTransportRequest> {
 	const blobStore = state.blobStore;
 
-	const systemPromptIds = buildCursorSystemPromptJsons(context.systemPrompt).map(json =>
-		storeCursorBlob(blobStore, new TextEncoder().encode(json)),
-	);
+	const systemPromptJsons = buildCursorSystemPromptJsons(context.systemPrompt, context.instructions, model);
+	const systemPromptIds = systemPromptJsons.map(json => storeCursorBlob(blobStore, new TextEncoder().encode(json)));
 
 	const lastUserMessageIndex = findLastUserMessageIndex(context.messages);
 	let activeUserMessageIndex = context.messages.length - 1;
@@ -5388,10 +5499,19 @@ async function buildGrpcRequestForWireMode(
 	if (options?.customSystemPrompt) {
 		runRequest.customSystemPrompt = options.customSystemPrompt;
 	}
+	Object.defineProperty(runRequest, PROVIDER_PAYLOAD_EVIDENCE, {
+		value: {
+			kind: "cursor-root-prompt",
+			rootPromptMessageIds: systemPromptIds.map(id => Buffer.from(id).toString("base64")),
+			rootPromptMessagesJson: systemPromptJsons,
+		},
+		enumerable: false,
+	});
+
+	const replacementPayload = await options?.onPayload?.(runRequest, model);
+	if (replacementPayload !== undefined) runRequest = replacementPayload as typeof runRequest;
 
 	// Tools are sent later via requestContext (exec handshake)
-	const replacementRequest = await options?.onPayload?.(runRequest, model);
-	if (replacementRequest !== undefined) runRequest = replacementRequest as typeof runRequest;
 
 	const discoveredWireModelId = options?.wireModelId ?? model.requestModelId ?? model.id;
 	const serializedParameters = runRequest.requestedModel?.parameters;

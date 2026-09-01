@@ -92,6 +92,9 @@ export async function resolveArtifactFile(url: InternalUrl, context?: ResolveCon
 	if (stat.isDirectory()) {
 		throw new Error(`Artifact ${id} resolved to a directory, not a file`);
 	}
+	if (!stat.isFile()) {
+		throw new Error(`Artifact ${id} resolved to a non-regular file`);
+	}
 	return { id, path: foundPath, size: stat.size };
 }
 
@@ -112,6 +115,7 @@ export class ArtifactProtocolHandler implements ProtocolHandler {
 				contentType: "text/plain",
 				size: artifact.size,
 				sourcePath: artifact.path,
+				isDirectory: false,
 			};
 		}
 
@@ -128,6 +132,7 @@ export class ArtifactProtocolHandler implements ProtocolHandler {
 			contentType: "text/plain",
 			size: artifact.size,
 			sourcePath: artifact.path,
+			isDirectory: false,
 		};
 	}
 

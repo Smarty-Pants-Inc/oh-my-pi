@@ -37,6 +37,17 @@ rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
 rust.toolchain(
     edition = "2024",
     versions = ["nightly/2026-04-29"],
+    # Xcode 27's chained-fixup linker emits Rust proc-macro and shared
+    # libraries that dyld rejects with "mis-aligned LINKEDIT string pool".
+    # Keep Darwin outputs on classic dyld info; other targets stay unchanged.
+    extra_exec_rustc_flags_triples = {
+        "aarch64-apple-darwin": ["-Clink-arg=-Wl,-no_fixup_chains"],
+        "x86_64-apple-darwin": ["-Clink-arg=-Wl,-no_fixup_chains"],
+    },
+    extra_rustc_flags_triples = {
+        "aarch64-apple-darwin": ["-Clink-arg=-Wl,-no_fixup_chains"],
+        "x86_64-apple-darwin": ["-Clink-arg=-Wl,-no_fixup_chains"],
+    },
     # Pinned archive checksums for every toolchain component. Not (only) a
     # supply-chain nicety: rules_rust marks a toolchain-tools repo as
     # reproducible — and therefore eligible for Bazel's repo contents cache —

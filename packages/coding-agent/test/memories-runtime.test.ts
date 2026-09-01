@@ -198,7 +198,7 @@ describe("memories runtime", () => {
 	});
 
 	test("runs phase1 to phase2 and writes consolidated outputs", async () => {
-		const fx = await createFixture();
+		const fx = await createFixture({ "providers.cacheRetention": "short" });
 		const rolloutPath = path.join(fx.sessionDir, "thread-a.jsonl");
 		const rolloutRows = [
 			{ type: "session", id: "thread-a", cwd: fx.agentDir },
@@ -260,6 +260,8 @@ describe("memories runtime", () => {
 		expect(ai.completeSimple).toHaveBeenCalledTimes(2);
 		const phase2Prompt = completeSpy.mock.calls[1]?.[1];
 		expect(phase2Prompt?.systemPrompt?.[0]).toContain("memory-stage-two consolidator");
+		expect(completeSpy.mock.calls[0]?.[2]).toMatchObject({ cacheRetention: "short" });
+		expect(completeSpy.mock.calls[1]?.[2]).toMatchObject({ cacheRetention: "short" });
 	});
 
 	test("clamps stage1 and phase2 reasoning effort against the model's supported range", async () => {

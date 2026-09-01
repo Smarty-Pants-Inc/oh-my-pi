@@ -156,6 +156,11 @@ export const observed = [
 		expect(bundledModuleKeys.has("@oh-my-pi/pi-coding-agent/main")).toBe(false);
 	});
 
+	it("does not bundle explicitly blocked package subpaths", () => {
+		expect(bundledModuleKeys.has("@oh-my-pi/pi-coding-agent/context/internal-session")).toBe(false);
+		expect(bundledModuleKeys.has("@oh-my-pi/pi-coding-agent/context/internal-session.js")).toBe(false);
+	});
+
 	it("does not bundle main-thread-unsafe worker entrypoints", () => {
 		// Worker entry modules throw at top level unless `parentPort` exists.
 		// The compiled legacy registry is imported on the main thread while

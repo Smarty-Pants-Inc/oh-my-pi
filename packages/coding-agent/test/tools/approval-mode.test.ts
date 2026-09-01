@@ -88,12 +88,12 @@ describe("tools.approvalMode setting", () => {
 		return bash;
 	}
 
-	it("yolo mode (default) bypasses approval for non-overriding tool calls", async () => {
+	it("yolo mode (default) executes arbitrary local commands without a second permission layer", async () => {
 		const settings = approvalSettings();
-		const result = await bashTool().execute("yolo", { command: "echo ok" }, undefined, undefined, {
+		const result = await bashTool().execute("yolo", { command: "printenv PATH" }, undefined, undefined, {
 			settings,
 		} as AgentToolContext);
-		expect(textOf(result)).toContain("ok");
+		expect(textOf(result).trim()).not.toBe("");
 	});
 
 	it("always-ask mode rejects exec tools when no UI is available", async () => {
@@ -140,21 +140,22 @@ describe("tools.approvalMode setting", () => {
 		).rejects.toThrow(/requires approval but no interactive UI available/);
 	});
 
-	it("critical bash patterns do not prompt in yolo mode with bash allowed", async () => {
+	it("yolo mode allows Bash writes outside the workspace without a second authority layer", async () => {
 		const settings = approvalSettings({
 			"tools.approvalMode": "yolo",
 			"tools.approval": { bash: "allow" },
 		});
-		const result = await bashTool().execute(
+		const target = path.join(tempDir, "outside-yolo.txt");
+		await bashTool().execute(
 			"critical",
-			{ command: "rm -f /tmp/bun-fake-timer-probe.test.ts" },
+			{ command: `printf yolo > ${JSON.stringify(target)}` },
 			undefined,
 			undefined,
 			{
 				settings,
 			} as AgentToolContext,
 		);
-		expect(textOf(result)).toContain("(no output)");
+		expect(fs.readFileSync(target, "utf8")).toBe("yolo");
 	});
 
 	it("attributes bash pattern denies to tool policy", async () => {
@@ -178,19 +179,17 @@ describe("tools.approvalMode setting", () => {
 		expect(textOf(result)).toContain("override");
 	});
 
-	it("CLI --auto-approve also bypasses safety-override patterns", async () => {
+	it("CLI --auto-approve allows Bash writes outside the workspace", async () => {
 		const settings = approvalSettings({ "tools.approvalMode": "always-ask" });
-		const result = await bashTool().execute(
+		const target = path.join(tempDir, "outside-auto-approve.txt");
+		await bashTool().execute(
 			"cli-critical",
-			{ command: "rm -f /tmp/bun-fake-timer-probe.test.ts" },
+			{ command: `printf override > ${JSON.stringify(target)}` },
 			undefined,
 			undefined,
-			{
-				settings,
-				autoApprove: true,
-			} as AgentToolContext,
+			{ settings, autoApprove: true } as AgentToolContext,
 		);
-		expect(textOf(result)).toContain("(no output)");
+		expect(fs.readFileSync(target, "utf8")).toBe("override");
 	});
 
 	it("xd:// dispatch approval (xdevApproved) suppresses the tier-only re-prompt", async () => {

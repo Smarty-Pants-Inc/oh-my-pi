@@ -18,7 +18,12 @@ import type { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent, PromptOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { ExecutionEnvironmentBinding } from "@oh-my-pi/pi-coding-agent/session/execution-environment";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
+import {
+	ENVIRONMENT_SUBAGENT_RUNTIME_PROFILE,
+	type SubagentRuntimeProfile,
+} from "@oh-my-pi/pi-coding-agent/task/runtime-profile";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 
@@ -273,6 +278,135 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		expect(forwarded?.outputSchemaMode).toBe("strict");
 		expect(persistedInits).toHaveLength(1);
 		expect(persistedInits[0]).toMatchObject({ restrictToolNames: true, tools: ["read", "yield"] });
+	});
+
+	it("propagates only the non-owning binding and restricts environment child construction", async () => {
+		const session = yieldEmittingSession();
+		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+		const sourceRoot = "/tmp/environment-source";
+		const binding = {
+			id: "environment-lease",
+			sourceRoot,
+			remoteRoot: "/workspace",
+			bridge: {},
+		} as unknown as ExecutionEnvironmentBinding;
+		const getTools = vi.fn(() => [{ name: "mcp__hostile", label: "hostile" }]);
+		const mcpManager = { getTools } as unknown as MCPManager;
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "environment-child",
+			worktree: sourceRoot,
+			executionEnvironment: binding,
+			runtimeProfile: ENVIRONMENT_SUBAGENT_RUNTIME_PROFILE,
+			enableLsp: true,
+			enableIrc: true,
+			enableMCP: true,
+			restrictToolNames: false,
+			keepAlive: true,
+			agent: {
+				...baseAgent,
+				tools: ["read", "write", "bash", "task", "hub", "eval"],
+				spawns: "*",
+				prewalk: true,
+			},
+			mcpManager,
+			preloadedExtensionPaths: ["/hostile/extension.ts"],
+			preloadedCustomToolPaths: [
+				{ path: "/hostile/tool.ts", source: { provider: "test", providerName: "Test", level: "project" } },
+			],
+			parentEvalSessionId: "parent-kernel",
+			planReference: { path: `${sourceRoot}/PLAN.md`, content: "Execute the plan." },
+		});
+
+		expect(result.exitCode).toBe(0);
+		const forwarded = spy.mock.calls[0]?.[0];
+		expect(forwarded?.executionEnvironment).toBe(binding);
+		expect(forwarded?.executionEnvironmentProvider).toBeUndefined();
+		expect(forwarded?.toolNames).toEqual(["read", "write", "bash"]);
+		expect(forwarded?.requireYieldTool).toBe(true);
+		expect(forwarded?.restrictToolNames).toBe(true);
+		expect(forwarded?.enableLsp).toBe(false);
+		expect(forwarded?.enableIrc).toBe(false);
+		expect(forwarded?.enableMCP).toBe(false);
+		expect(forwarded?.mcpManager).toBeUndefined();
+		expect(forwarded?.customTools).toBeUndefined();
+		expect(forwarded?.preloadedExtensionPaths).toEqual([]);
+		expect(forwarded?.preloadedCustomToolPaths).toEqual([]);
+		expect(forwarded?.prewalk).toBeUndefined();
+		expect(forwarded?.spawns).toBe("");
+		expect(forwarded?.parentEvalSessionId).toBeUndefined();
+		expect(getTools).not.toHaveBeenCalled();
+
+		const promptText = forwarded?.contextInstructions?.find(
+			instruction => instruction.id === "subagent.base",
+		)?.renderedText;
+		if (!promptText) throw new Error("Expected a registered subagent base instruction");
+		expect(promptText).toContain("/workspace");
+		expect(promptText).toContain("/workspace/PLAN.md");
+		expect(forwarded?.settings?.get("bash.enabled")).toBe(true);
+		expect(promptText).not.toContain(sourceRoot);
+	});
+
+	it("does not infer sandbox policy from a non-owning environment binding", async () => {
+		const session = yieldEmittingSession();
+		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+		const binding = {
+			id: "bridge-only",
+			sourceRoot: "/tmp/bridge-source",
+			remoteRoot: "/workspace",
+			bridge: {},
+		} as unknown as ExecutionEnvironmentBinding;
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "bridge-only-child",
+			executionEnvironment: binding,
+			agent: { ...baseAgent, tools: ["read"], spawns: "*" },
+		});
+
+		expect(result.exitCode).toBe(0);
+		const forwarded = spy.mock.calls[0]?.[0];
+		expect(forwarded?.executionEnvironment).toBe(binding);
+		expect(forwarded?.toolNames).toEqual(["read", "task", "hub"]);
+		expect(forwarded?.spawns).toBe("*");
+		expect(forwarded?.restrictToolNames).toBe(false);
+		expect(forwarded?.enableMCP).toBe(true);
+	});
+
+	it("fails closed for a malformed explicit runtime profile", async () => {
+		const session = yieldEmittingSession();
+		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+		const malformed = {
+			tools: { mode: "unknown" },
+			bash: "inherit",
+			capabilities: {},
+		} as unknown as SubagentRuntimeProfile;
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "malformed-profile-child",
+			runtimeProfile: malformed,
+			agent: { ...baseAgent, tools: ["read", "write", "bash", "task", "hub", "eval"], spawns: "*", prewalk: true },
+			preloadedExtensionPaths: ["/hostile/extension.ts"],
+			preloadedCustomToolPaths: [
+				{ path: "/hostile/tool.ts", source: { provider: "test", providerName: "Test", level: "project" } },
+			],
+			parentEvalSessionId: "host-kernel",
+		});
+
+		expect(result.exitCode).toBe(0);
+		const forwarded = spy.mock.calls[0]?.[0];
+		expect(forwarded?.toolNames).toEqual([]);
+		expect(forwarded?.restrictToolNames).toBe(true);
+		expect(forwarded?.spawns).toBe("");
+		expect(forwarded?.prewalk).toBeUndefined();
+		expect(forwarded?.enableLsp).toBe(false);
+		expect(forwarded?.enableIrc).toBe(false);
+		expect(forwarded?.enableMCP).toBe(false);
+		expect(forwarded?.preloadedExtensionPaths).toEqual([]);
+		expect(forwarded?.preloadedCustomToolPaths).toEqual([]);
+		expect(forwarded?.parentEvalSessionId).toBeUndefined();
 	});
 
 	it("persists bridge-only tools in the enabled Code Mode set", async () => {

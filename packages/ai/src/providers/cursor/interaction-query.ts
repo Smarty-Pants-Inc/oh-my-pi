@@ -1,4 +1,3 @@
-import type http2 from "node:http2";
 import {
 	AgentClientMessageSchema,
 	AskQuestionInteractionResponseSchema,
@@ -31,6 +30,7 @@ type ProtoUnknownBag = { $unknown?: ProtoUnknownField[] };
 
 type InteractionQueryCase = NonNullable<InteractionQuery["query"]["case"]>;
 type InteractionResult = Exclude<InteractionResponse["result"], { case: undefined; value?: undefined }>;
+type InteractionResponseWriter = (frame: Buffer) => boolean;
 
 function frameConnectMessage(data: Uint8Array, flags = 0): Buffer {
 	const frame = Buffer.alloc(5 + data.length);
@@ -70,17 +70,21 @@ function log(type: string, subtype?: string, data?: unknown): void {
 	console.error(`[CURSOR] ${type}${subtype ? `: ${subtype}` : ""}${dataStr}`);
 }
 
-function sendInteractionResponse(h2Request: http2.ClientHttp2Stream, queryId: number, result: InteractionResult): void {
+function sendInteractionResponse(
+	writeFrame: InteractionResponseWriter,
+	queryId: number,
+	result: InteractionResult,
+): void {
 	const response = create(InteractionResponseSchema, { id: queryId, result });
 	const clientMessage = create(AgentClientMessageSchema, {
 		message: { case: "interactionResponse", value: response },
 	});
-	h2Request.write(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
+	writeFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
 	log("interactionResponse", result.case, { id: queryId });
 }
 
 function sendUnknownApprovedInteractionResponse(
-	h2Request: http2.ClientHttp2Stream,
+	writeFrame: InteractionResponseWriter,
 	queryId: number,
 	fieldNo: number,
 ): void {
@@ -91,7 +95,7 @@ function sendUnknownApprovedInteractionResponse(
 	const clientMessage = create(AgentClientMessageSchema, {
 		message: { case: "interactionResponse", value: response },
 	});
-	h2Request.write(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
+	writeFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
 	log("interactionResponse", "unknownApproved", { id: queryId, field: fieldNo });
 }
 
@@ -107,14 +111,14 @@ function sendUnknownApprovedInteractionResponse(
  * Unsupported interactive queries are rejected so the server is not stranded.
  * VM setup is left unanswered rather than reporting a fake success.
  */
-export function handleInteractionQuery(query: InteractionQuery, h2Request: http2.ClientHttp2Stream): void {
+export function handleInteractionQuery(query: InteractionQuery, writeFrame: InteractionResponseWriter): void {
 	const queryCase = query.query.case;
 	log("interactionQuery", queryCase, query.query.value);
 	if (!queryCase) {
 		const unknown = protoUnknownFields(query).find(field => field.wireType === 2 && field.no >= 2);
 		if (unknown) {
 			log("warn", "unknownInteractionQueryApproved", { id: query.id, field: unknown.no });
-			sendUnknownApprovedInteractionResponse(h2Request, query.id, unknown.no);
+			sendUnknownApprovedInteractionResponse(writeFrame, query.id, unknown.no);
 			return;
 		}
 		log("warn", "unknownInteractionQuery", { id: query.id });
@@ -123,7 +127,7 @@ export function handleInteractionQuery(query: InteractionQuery, h2Request: http2
 
 	switch (queryCase) {
 		case "webSearchRequestQuery":
-			sendInteractionResponse(h2Request, query.id, {
+			sendInteractionResponse(writeFrame, query.id, {
 				case: "webSearchRequestResponse",
 				value: create(WebSearchRequestResponseSchema, {
 					result: { case: "approved", value: create(WebSearchRequestResponse_ApprovedSchema, {}) },
@@ -131,7 +135,7 @@ export function handleInteractionQuery(query: InteractionQuery, h2Request: http2
 			});
 			return;
 		case "exaSearchRequestQuery":
-			sendInteractionResponse(h2Request, query.id, {
+			sendInteractionResponse(writeFrame, query.id, {
 				case: "exaSearchRequestResponse",
 				value: create(ExaSearchRequestResponseSchema, {
 					result: { case: "approved", value: create(ExaSearchRequestResponse_ApprovedSchema, {}) },
@@ -139,7 +143,7 @@ export function handleInteractionQuery(query: InteractionQuery, h2Request: http2
 			});
 			return;
 		case "exaFetchRequestQuery":
-			sendInteractionResponse(h2Request, query.id, {
+			sendInteractionResponse(writeFrame, query.id, {
 				case: "exaFetchRequestResponse",
 				value: create(ExaFetchRequestResponseSchema, {
 					result: { case: "approved", value: create(ExaFetchRequestResponse_ApprovedSchema, {}) },
@@ -149,7 +153,7 @@ export function handleInteractionQuery(query: InteractionQuery, h2Request: http2
 		case "webFetchRequestQuery":
 			// Hosted WebFetch permission prompt. Field 9 is what cursor-grok-4.6-xhigh
 			// sends after "I'll fetch the page…"; answering lets the server continue.
-			sendInteractionResponse(h2Request, query.id, {
+			sendInteractionResponse(writeFrame, query.id, {
 				case: "webFetchRequestResponse",
 				value: create(WebFetchRequestResponseSchema, {
 					result: { case: "approved", value: create(WebFetchRequestResponse_ApprovedSchema, {}) },
@@ -157,7 +161,7 @@ export function handleInteractionQuery(query: InteractionQuery, h2Request: http2
 			});
 			return;
 		case "askQuestionInteractionQuery":
-			sendInteractionResponse(h2Request, query.id, {
+			sendInteractionResponse(writeFrame, query.id, {
 				case: "askQuestionInteractionResponse",
 				value: create(AskQuestionInteractionResponseSchema, {
 					result: create(AskQuestionResultSchema, {
@@ -172,7 +176,7 @@ export function handleInteractionQuery(query: InteractionQuery, h2Request: http2
 			});
 			return;
 		case "switchModeRequestQuery":
-			sendInteractionResponse(h2Request, query.id, {
+			sendInteractionResponse(writeFrame, query.id, {
 				case: "switchModeRequestResponse",
 				value: create(SwitchModeRequestResponseSchema, {
 					result: {
@@ -185,7 +189,7 @@ export function handleInteractionQuery(query: InteractionQuery, h2Request: http2
 			});
 			return;
 		case "createPlanRequestQuery":
-			sendInteractionResponse(h2Request, query.id, {
+			sendInteractionResponse(writeFrame, query.id, {
 				case: "createPlanRequestResponse",
 				value: create(CreatePlanRequestResponseSchema, {
 					result: create(CreatePlanResultSchema, {

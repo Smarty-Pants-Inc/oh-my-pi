@@ -19,6 +19,7 @@ import type {
 import memoryConsolidationPrompt from "../prompts/system/memory-consolidation-system.md" with { type: "text" };
 import memoryExtractionPrompt from "../prompts/system/memory-extraction-system.md" with { type: "text" };
 import type { AgentSession } from "../session/agent-session";
+import { resolveSettingsCacheRetention } from "../session/settings-stream-fn";
 import { isTinyMemoryLocalModelKey, ONLINE_MEMORY_MODEL_KEY } from "../tiny/models";
 import { tinyModelClient } from "../tiny/title-client";
 import { shortenPath } from "../tools/render-utils";
@@ -587,6 +588,7 @@ async function resolveMnemopiProviderOptions(
 							apiKey: modelRegistry.resolver(model, sessionId),
 							maxTokens: opts?.maxTokens,
 							temperature: opts?.temperature,
+							cacheRetention: resolveSettingsCacheRetention(settings),
 						},
 					),
 				);

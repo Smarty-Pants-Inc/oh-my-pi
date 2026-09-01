@@ -213,9 +213,8 @@ describe("runSubprocess soft request budget", () => {
 		});
 	}
 
-	it("a budget stop drives one forced final yield and finishes as a normal completion", async () => {
+	it("a budget stop does not restart an assignment to force a yield", async () => {
 		const id = "BudgetScout";
-		let abortCallsAtReminder: number | undefined;
 		const handle = createMockSession(({ promptIndex, emit, pushMessage }) => {
 			if (promptIndex === 1) {
 				// Free-running exploration: budget 2 → stop threshold 3.
@@ -226,51 +225,15 @@ describe("runSubprocess soft request budget", () => {
 				}
 				return;
 			}
-			// The forced wrap-up reminder: answer it with a terminal yield.
-			abortCallsAtReminder = handle.abortCalls();
-			const yieldMessage = {
-				role: "assistant" as const,
-				content: [
-					{
-						type: "toolCall" as const,
-						id: "tool-forced-yield",
-						name: "yield",
-						arguments: { result: { data: { report: "partial findings" } } },
-					},
-				],
-				stopReason: "toolUse" as const,
-			};
-			pushMessage(yieldMessage);
-			emit({ type: "message_end", message: yieldMessage } as unknown as AgentSessionEvent);
-			emit({
-				type: "tool_execution_end",
-				toolCallId: "tool-forced-yield",
-				toolName: "yield",
-				result: {
-					content: [{ type: "text", text: "Result submitted." }],
-					details: { status: "success", data: { report: "partial findings" } },
-				},
-				isError: false,
-			} as AgentSessionEvent);
 		});
 		mockCreateAgentSession(handle.session);
 		registerRunning(id, handle.session);
 
 		const result = await runSubprocess(baseOptions(id));
 
-		// The budget stop aborted the free-running turn exactly once before the
-		// wrap-up reminder; the second abort (after the terminal yield) is the
-		// normal post-yield terminate.
-		expect(abortCallsAtReminder).toBe(1);
-		// The budget stop forces a synthetic terminal yield.
-		expect(handle.prompts).toHaveLength(2);
-		expect(handle.prompts[1]?.options?.synthetic).toBe(true);
-		expect(handle.prompts[1]?.options?.toolChoice).toEqual({ type: "tool", name: "yield" });
-		// The forced yield finalizes as a normal completion, not an abort.
-		expect(result.aborted).toBe(false);
-		expect(result.exitCode).toBe(0);
-		expect(result.abortReason).toBeUndefined();
-		expect(JSON.parse(result.output)).toEqual({ report: "partial findings" });
+		expect(handle.prompts).toHaveLength(1);
+		expect(result.aborted).toBe(true);
+		expect(result.exitCode).toBe(1);
 		// The agent stays a live, adopted peer.
 		expect(AgentRegistry.global().get(id)?.status).toBe("idle");
 		expect(AgentLifecycleManager.global().has(id)).toBe(true);

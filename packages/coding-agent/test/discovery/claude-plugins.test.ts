@@ -2,16 +2,17 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { loadCapability } from "@oh-my-pi/pi-coding-agent/capability";
+import { disableProvider, enableProvider, loadCapability } from "@oh-my-pi/pi-coding-agent/capability";
 import { clearCache as clearFsCache } from "@oh-my-pi/pi-coding-agent/capability/fs";
 import {
 	clearClaudePluginRootsCache,
+	injectPluginDirRoots,
 	listClaudePluginRoots,
 	parseClaudePluginsRegistry,
 } from "@oh-my-pi/pi-coding-agent/discovery/helpers";
 import { loadSlashCommands } from "@oh-my-pi/pi-coding-agent/extensibility/slash-commands";
 import { discoverAgents } from "@oh-my-pi/pi-coding-agent/task/discovery";
-import { __resetDirsFromEnvForTests, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
+import { __resetDirsFromEnvForTests, getPluginsDir, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
 import "@oh-my-pi/pi-coding-agent/discovery/claude-plugins";
 import { type MCPServer, mcpCapability } from "@oh-my-pi/pi-coding-agent/capability/mcp";
 import type { Rule } from "@oh-my-pi/pi-coding-agent/capability/rule";
@@ -152,6 +153,65 @@ describe("listClaudePluginRoots", () => {
 		});
 	});
 
+	test("excludes Claude registry roots under policy while retaining OMP and injected roots", async () => {
+		const claudeRoot = path.join(tempDir, "claude-root");
+		const ompRoot = path.join(tempDir, "omp-root");
+		const explicitRoot = path.join(tempDir, "explicit-root");
+		const claudeRegistryPath = path.join(tempDir, ".claude", "plugins", "installed_plugins.json");
+		const ompRegistryPath = path.join(getPluginsDir(tempDir), "installed_plugins.json");
+		const entry = (installPath: string) => ({
+			scope: "user",
+			installPath,
+			version: "1.0.0",
+			installedAt: "2025-01-01T00:00:00Z",
+			lastUpdated: "2025-01-01T00:00:00Z",
+		});
+
+		await Promise.all([
+			fs.mkdir(path.dirname(claudeRegistryPath), { recursive: true }),
+			fs.mkdir(path.dirname(ompRegistryPath), { recursive: true }),
+			fs.mkdir(path.join(ompRoot, "skills", "omp-skill"), { recursive: true }),
+			fs.mkdir(path.join(explicitRoot, "skills", "explicit-skill"), { recursive: true }),
+		]);
+		await Promise.all([
+			fs.writeFile(
+				claudeRegistryPath,
+				JSON.stringify({ version: 2, plugins: { "claude-plugin@market": [entry(claudeRoot)] } }),
+			),
+			fs.writeFile(
+				ompRegistryPath,
+				JSON.stringify({ version: 2, plugins: { "omp-plugin@market": [entry(ompRoot)] } }),
+			),
+			fs.writeFile(
+				path.join(ompRoot, "skills", "omp-skill", "SKILL.md"),
+				"---\nname: omp-skill\ndescription: OMP skill\n---\nBody\n",
+			),
+			fs.writeFile(
+				path.join(explicitRoot, "skills", "explicit-skill", "SKILL.md"),
+				"---\nname: explicit-skill\ndescription: Explicit skill\n---\nBody\n",
+			),
+		]);
+
+		const enabled = await listClaudePluginRoots(tempDir, tempDir);
+		expect(enabled.roots.map(root => root.id)).toEqual(["claude-plugin@market", "omp-plugin@market"]);
+
+		const disabled = await listClaudePluginRoots(tempDir, tempDir, { includeClaudeRegistry: false });
+		expect(disabled.roots.map(root => root.id)).toEqual(["omp-plugin@market"]);
+
+		try {
+			await injectPluginDirRoots(tempDir, [explicitRoot], tempDir, { includeClaudeRegistry: false });
+			const injected = await listClaudePluginRoots(tempDir, tempDir, { includeClaudeRegistry: false });
+			expect(injected.roots.map(root => root.path)).toEqual([explicitRoot, ompRoot]);
+
+			disableProvider("claude");
+			const skills = await loadCapability<Skill>("skills", { cwd: tempDir });
+			const names = skills.all.filter(skill => skill._source.provider === "claude-plugins").map(skill => skill.name);
+			expect(names).toEqual(expect.arrayContaining(["omp-skill", "explicit-skill"]));
+		} finally {
+			enableProvider("claude");
+			await injectPluginDirRoots(tempDir, [], tempDir);
+		}
+	});
 	test("reads the user plugin registry from CLAUDE_CONFIG_DIR", async () => {
 		const relocated = path.join(tempDir, "relocated-claude");
 		const pluginsDir = path.join(relocated, "plugins");

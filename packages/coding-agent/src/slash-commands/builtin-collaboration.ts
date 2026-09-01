@@ -16,10 +16,8 @@ import { commandConsumed, errorMessage, parseSubcommand, usage } from "./helpers
 import type { SlashCommandSpec } from "./types";
 
 /** Join hint printed by /collab: compact terminal link + clickable browser deep link. */
-function collabLinkHint(host: CollabHost, heading: string, view = false): string {
+function collabLinkHint(link: string, webLink: string, heading: string, view = false): string {
 	const bullet = theme.fg("accent", theme.format.bullet);
-	const link = view ? host.viewLink : host.link;
-	const webLink = view ? host.webViewLink : host.webLink;
 	return [
 		// Keep the URL on the first row: under transcript pressure the status
 		// block is clipped to rendered[0], which used to drop the join link.
@@ -44,8 +42,11 @@ function showCollabQrCode(ctx: InteractiveModeContext, webLink: string): void {
 }
 
 function showCollabLink(ctx: InteractiveModeContext, host: CollabHost, heading: string, view = false): void {
-	ctx.showStatus(collabLinkHint(host, heading, view), { dim: false });
-	showCollabQrCode(ctx, view ? host.webViewLink : host.webLink);
+	const link = view ? host.viewLink : host.link;
+	const webLink = view ? host.webViewLink : host.webLink;
+	const rebuild = () => collabLinkHint(link, webLink, heading, view);
+	ctx.showStatus(rebuild(), { dim: false }, rebuild);
+	showCollabQrCode(ctx, webLink);
 }
 
 export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
@@ -253,9 +254,11 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
 		name: "collab",
 		icon: "broadcast",
 		description: "Share this session live via a relay",
-		inlineHint: "[start|view|stop|status] [relayUrl]",
+		inlineHint: "[start|view|control|release|stop|status] [relayUrl]",
 		subcommands: [
 			{ name: "view", description: "Share a read-only link (guests can watch, not prompt)" },
+			{ name: "control", description: "Request controller authority from the local embedding session" },
+			{ name: "release", description: "Release controller authority to the local embedding session" },
 			{ name: "status", description: "Show link + participants" },
 			{ name: "stop", description: "Stop sharing" },
 		],
@@ -273,6 +276,15 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
 			ctx.editor.setText("");
 			const args = command.args.trim();
 			const { verb, rest } = parseSubcommand(args);
+			if (verb === "control" || verb === "release") {
+				if (!ctx.collabGuest) {
+					ctx.showStatus("Not in a collab session as a guest");
+					return;
+				}
+				if (verb === "control") ctx.collabGuest.requestControl();
+				else ctx.collabGuest.releaseControl();
+				return;
+			}
 			if (verb === "stop") {
 				if (!ctx.collabHost) {
 					ctx.showStatus("Not hosting a collab session");

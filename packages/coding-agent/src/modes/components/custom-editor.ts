@@ -1097,8 +1097,14 @@ export class CustomEditor extends Editor {
 				return;
 			}
 
-			// Intercept configured dequeue shortcut (restore queued message to editor)
+			// Let an extension override only the exact configured dequeue chord it claims.
+			// Unclaimed chords (for example Alt+Up) keep the native restore behavior.
 			if (this.#matchesAction(canonical, "app.message.dequeue") && this.onDequeue) {
+				const customHandler = this.#customMatchKeys.get(canonical);
+				if (customHandler) {
+					customHandler();
+					return;
+				}
 				this.onDequeue();
 				return;
 			}

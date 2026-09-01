@@ -1,9 +1,16 @@
 import { describe, expect, it } from "bun:test";
 import { gunzipSync } from "node:zlib";
-import { streamDevin } from "@oh-my-pi/pi-ai/providers/devin";
+import { type DevinOptions, streamDevin } from "@oh-my-pi/pi-ai/providers/devin";
 import type { AssistantMessage, Context, Model } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import { GetChatMessageRequestSchema, GetUserJwtResponseSchema } from "@oh-my-pi/pi-catalog/discovery/devin-proto";
+import {
+	CacheControlType,
+	ChatMessageRequestType,
+	ChatMessageSource,
+	ConversationalPlannerMode,
+	GetChatMessageRequestSchema,
+	GetUserJwtResponseSchema,
+} from "@oh-my-pi/pi-catalog/discovery/devin-proto";
 import { create, fromBinary, toBinary } from "@oh-my-pi/pi-catalog/discovery/protobuf";
 
 const devinModel: Model<"devin-agent"> = buildModel({
@@ -42,7 +49,7 @@ function assistant(overrides: Partial<AssistantMessage>): AssistantMessage {
 	};
 }
 
-async function captureRequest(context: Context) {
+async function captureRequest(context: Context, options: Omit<DevinOptions, "apiKey" | "fetch"> = {}) {
 	const authPayload = toBinary(GetUserJwtResponseSchema, create(GetUserJwtResponseSchema, { userJwt: "jwt" }));
 	let requestPayload: Uint8Array | undefined;
 	const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
@@ -51,7 +58,7 @@ async function captureRequest(context: Context) {
 		return new Response(new Uint8Array());
 	}) as typeof fetch;
 
-	await streamDevin(devinModel, context, { apiKey: "token", fetch: fetchImpl }).result();
+	await streamDevin(devinModel, context, { ...options, apiKey: "token", fetch: fetchImpl }).result();
 	if (!requestPayload) throw new Error("Devin chat request was not captured");
 	const length = new DataView(requestPayload.buffer, requestPayload.byteOffset, requestPayload.byteLength).getUint32(
 		1,
@@ -115,5 +122,152 @@ describe("streamDevin history handoff", () => {
 		});
 
 		expect(request.prompt).toBe("You are a test.");
+	});
+
+	it("keeps typed internal context in Devin's instruction prompt and out of user history", async () => {
+		const request = await captureRequest({
+			systemPrompt: ["Primary instructions."],
+			instructions: [
+				{
+					id: "compaction.summary",
+					sourcePath: "packages/agent/src/compaction/prompt.md",
+					role: "internal_context",
+					target: "main",
+					trigger: "compaction",
+					sha256: "test-sha256",
+					renderedText: "Preserve this compacted history.",
+				},
+			],
+			messages: [{ role: "user", content: "continue", timestamp: 0 }],
+		});
+
+		expect(request.prompt).toBe("Primary instructions.\n\nPreserve this compacted history.");
+		expect(request.chatMessagePrompts.map(message => message.prompt)).toEqual(["continue"]);
+	});
+
+	it("guards the final request then exports exact Devin tool definitions", async () => {
+		const events: string[] = [];
+		let observedContracts: unknown;
+		let observedPayload: unknown;
+		const request = await captureRequest(
+			{
+				messages: [{ role: "user", content: "use probe", timestamp: 0 }],
+				tools: [
+					{
+						name: "probe",
+						description: "Probe one exact value",
+						parameters: {
+							type: "object",
+							properties: { value: { type: "string" } },
+							required: ["value"],
+						},
+					},
+				],
+			},
+			{
+				onPayload: async payload => {
+					await Promise.resolve();
+					events.push("payload");
+					observedPayload = payload;
+					return {
+						...(payload as object),
+						prompt: "replacement Devin prompt",
+						requestType: "CHAT_MESSAGE_REQUEST_TYPE_GENERAL",
+					};
+				},
+				onToolContracts: async payload => {
+					await Promise.resolve();
+					events.push("contracts");
+					observedContracts = payload;
+				},
+			},
+		);
+
+		expect(events).toEqual(["payload", "contracts"]);
+		expect(observedPayload).toMatchObject({
+			metadata: { apiKey: "", userJwt: "" },
+			requestType: "CHAT_MESSAGE_REQUEST_TYPE_CASCADE",
+			plannerMode: "CONVERSATIONAL_PLANNER_MODE_DEFAULT",
+			systemPromptCacheOptions: { type: "CACHE_CONTROL_TYPE_EPHEMERAL" },
+			chatMessagePrompts: [{ source: "CHAT_MESSAGE_SOURCE_USER" }],
+		});
+		expect(JSON.stringify(observedPayload)).not.toContain("devin-session-token$token");
+		expect(JSON.stringify(observedPayload)).not.toContain("jwt");
+		expect(request.prompt).toBe("replacement Devin prompt");
+		expect(request.requestType).toBe(ChatMessageRequestType.GENERAL);
+		expect(request.plannerMode).toBe(ConversationalPlannerMode.DEFAULT);
+		expect(request.systemPromptCacheOptions?.type).toBe(CacheControlType.EPHEMERAL);
+		expect(request.chatMessagePrompts[0]?.source).toBe(ChatMessageSource.USER);
+		expect(request.metadata?.apiKey).toBe("devin-session-token$token");
+		expect(request.metadata?.userJwt).toBe("jwt");
+		expect(observedContracts).toMatchObject({
+			tools: [
+				{
+					name: "probe",
+					description: "Probe one exact value",
+					jsonSchemaString: expect.stringContaining('"value"'),
+				},
+			],
+		});
+	});
+
+	it("rejects unknown symbolic enum replacements before sending the chat request", async () => {
+		const authPayload = toBinary(GetUserJwtResponseSchema, create(GetUserJwtResponseSchema, { userJwt: "jwt" }));
+		let chatRequests = 0;
+		const result = await streamDevin(
+			devinModel,
+			{ messages: [{ role: "user", content: "hello", timestamp: 0 }] },
+			{
+				apiKey: "token",
+				fetch: (async input => {
+					if (String(input).includes("GetUserJwt")) return new Response(authPayload);
+					chatRequests++;
+					return new Response(new Uint8Array());
+				}) as typeof fetch,
+				onPayload: payload => ({
+					...(payload as Record<string, unknown>),
+					requestType: "CHAT_MESSAGE_REQUEST_TYPE_MISSING",
+				}),
+			},
+		).result();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("Unknown protobuf enum value CHAT_MESSAGE_REQUEST_TYPE_MISSING");
+		expect(chatRequests).toBe(0);
+	});
+
+	it("rejects callback attempts to inject auth before the chat request is sent", async () => {
+		const authPayload = toBinary(
+			GetUserJwtResponseSchema,
+			create(GetUserJwtResponseSchema, { userJwt: "original-jwt" }),
+		);
+		let chatRequests = 0;
+		for (const injected of [
+			{ apiKey: "attacker-key", userJwt: "attacker-jwt" },
+			{ apiKey: "", userJwt: "", api_key: "alias-key", user_jwt: "alias-jwt" },
+		]) {
+			const result = await streamDevin(
+				devinModel,
+				{ messages: [{ role: "user", content: "hello", timestamp: 0 }] },
+				{
+					apiKey: "original-token",
+					fetch: (async input => {
+						if (String(input).includes("GetUserJwt")) return new Response(authPayload);
+						chatRequests++;
+						return new Response(new Uint8Array());
+					}) as typeof fetch,
+					onPayload: payload => ({
+						...(payload as Record<string, unknown>),
+						metadata: {
+							...((payload as { metadata: Record<string, unknown> }).metadata ?? {}),
+							...injected,
+						},
+					}),
+				},
+			).result();
+			expect(result.stopReason).toBe("error");
+			expect(result.errorMessage).toContain("cannot inject or rebind provider credentials");
+		}
+		expect(chatRequests).toBe(0);
 	});
 });

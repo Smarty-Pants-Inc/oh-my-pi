@@ -1,9 +1,12 @@
 import { describe, expect, it } from "bun:test";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import type { ExtensionRuntime } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
-import type { AsyncJobSnapshot } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { AsyncJobCounts, AsyncJobSnapshot } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 
-function createRunner(getAsyncJobSnapshot?: () => AsyncJobSnapshot | null): ExtensionRunner {
+function createRunner(
+	getAsyncJobSnapshot?: () => AsyncJobSnapshot | null,
+	getAsyncJobCounts?: () => AsyncJobCounts | null,
+): ExtensionRunner {
 	const runtime = {
 		flagValues: new Map(),
 		pendingProviderRegistrations: [],
@@ -18,12 +21,15 @@ function createRunner(getAsyncJobSnapshot?: () => AsyncJobSnapshot | null): Exte
 		undefined,
 		undefined,
 		getAsyncJobSnapshot,
+		undefined,
+		getAsyncJobCounts,
 	);
 }
 
 describe("ExtensionRunner async job context", () => {
 	it("defaults to null outside a session", () => {
 		expect(createRunner().createContext().getAsyncJobSnapshot()).toBeNull();
+		expect(createRunner().createContext().getAsyncJobCounts()).toBeNull();
 	});
 
 	it("exposes the owning session snapshot", () => {
@@ -37,5 +43,14 @@ describe("ExtensionRunner async job context", () => {
 				.createContext()
 				.getAsyncJobSnapshot(),
 		).toBe(snapshot);
+	});
+
+	it("exposes count-only state independently of the detailed snapshot", () => {
+		const counts: AsyncJobCounts = { running: 2, recentFailures: 1, pendingDelivery: 3 };
+		expect(
+			createRunner(undefined, () => counts)
+				.createContext()
+				.getAsyncJobCounts(),
+		).toBe(counts);
 	});
 });

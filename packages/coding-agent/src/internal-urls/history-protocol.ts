@@ -127,6 +127,8 @@ export class HistoryProtocolHandler implements ProtocolHandler {
 			contentType: "text/markdown",
 			size: Buffer.byteLength(content, "utf-8"),
 			sourcePath: ref.sessionFile ?? undefined,
+			isDirectory: false,
+			sourceLineAligned: false,
 			notes,
 		};
 	}
@@ -159,6 +161,8 @@ export class HistoryProtocolHandler implements ProtocolHandler {
 			contentType: "text/markdown",
 			size: Buffer.byteLength(content, "utf-8"),
 			sourcePath: sessionFile,
+			isDirectory: false,
+			sourceLineAligned: false,
 			notes: ["Source: session file (read-only, unregistered)"],
 		};
 	}

@@ -1,45 +1,71 @@
 import type { Agent, AgentMessage, AgentTool } from "@oh-my-pi/pi-agent-core";
-import type { AssistantMessage, Message, Model, TextContent, ToolChoice } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, Model, ToolChoice } from "@oh-my-pi/pi-ai";
 import { isRecord, logger, prompt, stringProperty } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
+import { agentBehavior } from "../context/registry";
 import eagerTaskPrompt from "../prompts/system/eager-task.md" with { type: "text" };
 import eagerTodoPrompt from "../prompts/system/eager-todo.md" with { type: "text" };
-import midRunTodoNudgePrompt from "../prompts/system/mid-run-todo-nudge.md" with { type: "text" };
-import { getLatestTodoPhasesFromEntries, isTodoPhase, type TodoItem, type TodoPhase } from "../tools/todo";
+import passiveTodoSnapshotPrompt from "../prompts/todos/current.md" with { type: "text" };
+import { getLatestTodoPhasesFromEntries, isTodoPhase, type TodoPhase } from "../tools/todo";
 import { buildNamedToolChoice } from "../utils/tool-choice";
 import type { AgentSessionEvent } from "./agent-session-events";
 import type { SessionManager } from "./session-manager";
 
-const MID_RUN_NUDGE_MUTATION_THRESHOLD = 12;
-const MID_RUN_NUDGE_MAX_PER_CYCLE = 2;
-const MUTATING_TOOLS: Record<string, true> = {
-	bash: true,
-	eval: true,
-	edit: true,
-	write: true,
-	ast_edit: true,
-};
-const MID_RUN_NUDGE_MESSAGE_TYPE = "mid-run-todo-nudge";
-const MARKDOWN_PROMPT_PREFIX_RE = /^(?:>\s*)?(?:(?:[-*+]|\d+[.)])\s+)*/;
-const PROMPT_LABEL_RE = /^(?:q(?:uestion)?|ask)\s*\d*\s*[:.)-]\s*/i;
-const QUESTION_PROMPT_RE =
-	/^(?:what|which|when|where|why|how|who|whom|whose|do|does|did|can|could|would|will|should|is|are|am|may|shall)\b/i;
-const USER_DIRECTED_PROMPT_RE = /\b(?:you|your|we|our)\b/i;
-const USER_RESPONSE_CUE_RE =
-	/^(?:please\s+)?(?:confirm|reply|choose|pick|decide|advise)\b|^(?:please\s+)?answer\b|^(?:please\s+)?(?:let\s+me\s+know|tell\s+me)\b/i;
-/**
- * A trailing question mark is the universal signal that a line is a question, but
- * the English word/pronoun gates above exist to filter incidental "?" out of prose
- * (e.g. a TypeScript `foo?: string` tail). Non-English text has no cheap word list,
- * yet any non-ASCII character in a "?"/"？"-terminated line reliably marks it as
- * genuine prose — CJK/Japanese/Korean, Spanish `¿…?`, accented Latin — so treat it
- * as a real user-directed question. Fixes non-Latin prompts going undetected (#7803).
- */
-const NON_ASCII_TEXT_RE = /[^\x00-\x7F]/;
+const PASSIVE_TODO_STATUSES = new Set<string>(agentBehavior.todo.contextItems);
 
-interface PromptLine {
-	text: string;
-	hadPromptLabel: boolean;
+export interface PassiveTodoSnapshot {
+	semanticRole: "internal_context";
+	source: "omp.todo";
+	content: string;
+	open: number;
+	closed: number;
+	phases: TodoPhase[];
+}
+
+function snapshotText(value: string): string {
+	return value
+		.replaceAll("\r\n", "\n")
+		.replaceAll("\r", "\n")
+		.replaceAll("\n", "\\n")
+		.replaceAll("\t", "\\t")
+		.replace(/[\u0085\u2028\u2029]/g, " ")
+		.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "")
+		.replaceAll("&", "&amp;")
+		.replaceAll("<", "&lt;")
+		.replaceAll(">", "&gt;");
+}
+
+/** Render the provider-neutral todo working-memory component for a main turn. */
+export function renderPassiveTodoSnapshot(phases: TodoPhase[]): PassiveTodoSnapshot | undefined {
+	const openPhases = phases
+		.map(phase => ({
+			name: snapshotText(phase.name),
+			tasks: phase.tasks
+				.filter(task => PASSIVE_TODO_STATUSES.has(task.status))
+				.map(task =>
+					task.blocker === undefined
+						? { content: snapshotText(task.content), status: task.status }
+						: {
+								content: snapshotText(task.content),
+								status: task.status,
+								blocker: snapshotText(task.blocker),
+							},
+				),
+		}))
+		.filter(phase => phase.tasks.length > 0);
+	const open = openPhases.reduce((count, phase) => count + phase.tasks.length, 0);
+	if (open === 0) return undefined;
+	const closed = phases
+		.flatMap(phase => phase.tasks)
+		.filter(task => task.status === "completed" || task.status === "abandoned").length;
+	return {
+		semanticRole: "internal_context",
+		source: "omp.todo",
+		content: prompt.render(passiveTodoSnapshotPrompt, { phases: openPhases, open, closed }),
+		open,
+		closed,
+		phases: openPhases,
+	};
 }
 
 /** Capabilities the todo tracker borrows from its owning session. */
@@ -48,6 +74,7 @@ export interface TodoTrackerHost {
 	sessionManager: SessionManager;
 	settings: Settings;
 	model(): Model | undefined;
+	usesOwnedToolDialect(): boolean;
 	agentKind(): "main" | "sub";
 	emitSessionEvent(event: AgentSessionEvent): Promise<void>;
 	scheduleAgentContinue(options: { source: string; generation?: number }): void;
@@ -60,14 +87,10 @@ export interface TodoTrackerHost {
 	consumeLastServedToolChoiceLabel(): string | undefined;
 }
 
-/** Owns canonical todo state, eager preludes, and completion reminders. */
+/** Owns canonical todo state, eager preludes, and passive snapshots. */
 export class TodoTracker {
 	readonly #host: TodoTrackerHost;
 	#phases: TodoPhase[] = [];
-	#reminderCount = 0;
-	#reminderAwaitingProgress = false;
-	#mutationsSinceLastTouch = 0;
-	#midRunNudgeCount = 0;
 
 	constructor(host: TodoTrackerHost) {
 		this.#host = host;
@@ -93,23 +116,14 @@ export class TodoTracker {
 		return this.#clonePhases(phases);
 	}
 
-	/** Resets per-prompt reminder and mutation budgets. */
-	resetCycle(): void {
-		this.#reminderCount = 0;
-		this.#reminderAwaitingProgress = false;
-		this.#mutationsSinceLastTouch = 0;
-		this.#midRunNudgeCount = 0;
-	}
+	/** Compatibility no-op: todo state has no per-turn continuation budget. */
+	resetCycle(): void {}
 
-	/** Records a completed tool result before asynchronous event processing begins. */
-	onToolResult(toolName: string, isError: boolean): void {
-		if (toolName === "todo") {
-			this.#mutationsSinceLastTouch = 0;
-		} else if (!isError && MUTATING_TOOLS[toolName]) {
-			this.#mutationsSinceLastTouch++;
-		}
-		this.#reminderAwaitingProgress = false;
-	}
+	/** Compatibility no-op: subagent completion never starts todo reconciliation. */
+	noteTaskCompletion(): void {}
+
+	/** Compatibility no-op: tool results never trigger todo reconciliation. */
+	onToolResult(_toolName: string, _isError: boolean, _details?: Record<string, unknown>): void {}
 
 	/** Detects whether a successful todo result came from an init operation. */
 	onTodoResultDetails(details: Record<string, unknown>, toolCallId: string | undefined): boolean {
@@ -154,7 +168,7 @@ export class TodoTracker {
 		};
 		if (promptText === undefined || mode === "preferred") return { message };
 		const model = this.#host.model();
-		const toolChoice = buildNamedToolChoice("todo", model);
+		const toolChoice = buildNamedToolChoice("todo", model, this.#host.usesOwnedToolDialect());
 		if (!toolChoice) {
 			logger.warn(
 				"Eager todo proceeding with the reminder only because the current model does not support a forced todo tool_choice",
@@ -287,36 +301,15 @@ export class TodoTracker {
 		return true;
 	}
 
-	/** Takes the next hidden mid-run reconciliation nudge, if its budget and guards allow. */
-	takeMidRunNudge(): AgentMessage | null {
-		if (this.#mutationsSinceLastTouch < MID_RUN_NUDGE_MUTATION_THRESHOLD) return null;
-		if (this.#midRunNudgeCount >= MID_RUN_NUDGE_MAX_PER_CYCLE) return null;
-		if (!this.#host.settings.get("todo.enabled") || !this.#host.settings.get("todo.reminders")) return null;
-		if (this.#host.planModeEnabled() || !this.#host.getActiveToolNames().includes("todo")) return null;
-		const incomplete = this.#phases
-			.flatMap(phase => phase.tasks)
-			.filter(task => task.status === "pending" || task.status === "in_progress");
-		if (incomplete.length === 0) return null;
-		this.#mutationsSinceLastTouch = 0;
-		this.#midRunNudgeCount++;
-		const { toolRefs } = this.#buildEagerPreludeContext();
-		const reminder = prompt.render(midRunTodoNudgePrompt, {
-			toolRefs,
-			incompleteCount: incomplete.length,
-			plural: incomplete.length !== 1,
-		});
-		logger.debug("Mid-run todo nudge fired", {
-			incomplete: incomplete.length,
-			nudge: this.#midRunNudgeCount,
-		});
-		return {
-			role: "custom",
-			customType: MID_RUN_NUDGE_MESSAGE_TYPE,
-			content: reminder,
-			display: false,
-			attribution: "agent",
-			timestamp: Date.now(),
-		};
+	/** Todo state never injects a mid-turn nudge. */
+	takeMidRunNudge(): null {
+		return null;
+	}
+
+	/** Renders the compact, provider-neutral working-memory component for a main turn. */
+	buildPassiveSnapshot(): PassiveTodoSnapshot | undefined {
+		if (this.#host.agentKind() !== "main") return undefined;
+		return renderPassiveTodoSnapshot(this.#clonePhases(this.#phases));
 	}
 
 	#buildEagerPreludeContext(): { toolRefs: Record<string, string>; taskBatch: boolean } {
@@ -349,46 +342,4 @@ function toolCallOpFromMessage(message: AgentMessage, toolCallId: string): strin
 		return isRecord(block.arguments) ? stringProperty(block.arguments, "op") : undefined;
 	}
 	return undefined;
-}
-
-function assistantText(message: AssistantMessage): string {
-	return message.content
-		.filter((content): content is TextContent => content.type === "text")
-		.map(content => content.text)
-		.join("\n")
-		.trim();
-}
-
-function promptLine(line: string): PromptLine {
-	const withoutMarkdownPrefix = line.trim().replace(MARKDOWN_PROMPT_PREFIX_RE, "").trim();
-	const withoutPromptLabel = withoutMarkdownPrefix.replace(PROMPT_LABEL_RE, "").trim();
-	return {
-		text: withoutPromptLabel,
-		hadPromptLabel: withoutPromptLabel !== withoutMarkdownPrefix,
-	};
-}
-
-function isQuestionPromptLine(line: string): boolean {
-	const candidate = promptLine(line);
-	if (!/[?？]\s*$/.test(candidate.text)) return false;
-	return (
-		candidate.hadPromptLabel ||
-		QUESTION_PROMPT_RE.test(candidate.text) ||
-		USER_DIRECTED_PROMPT_RE.test(candidate.text) ||
-		NON_ASCII_TEXT_RE.test(candidate.text)
-	);
-}
-
-function isResponseCueLine(line: string): boolean {
-	const candidate = promptLine(line)
-		.text.replace(/[.!?。！？]+$/, "")
-		.trim();
-	return USER_RESPONSE_CUE_RE.test(candidate);
-}
-
-function isAwaitingUserAnswer(message: AssistantMessage): boolean {
-	const text = assistantText(message);
-	if (!text) return false;
-	const lastLine = text.split(/\r?\n/).at(-1)?.trim();
-	return lastLine !== undefined && (isQuestionPromptLine(lastLine) || isResponseCueLine(lastLine));
 }

@@ -32,6 +32,7 @@ import { transformMessages } from "@oh-my-pi/pi-ai/providers/transform-messages"
 import type {
 	Api,
 	AssistantMessage,
+	CacheRetention,
 	CodexCompactionContext,
 	FetchImpl,
 	Message,
@@ -766,6 +767,7 @@ export async function requestOpenAiRemoteCompaction(
 		fetch?: FetchImpl;
 		timeoutMs?: number;
 		sessionId?: string;
+		cacheRetention?: CacheRetention;
 		providerSessionState?: Map<string, ProviderSessionState>;
 		codexCompaction?: CodexCompactionContext;
 	},
@@ -828,6 +830,7 @@ export async function requestOpenAiRemoteCompaction(
 			headers,
 			createOpenAICodexCompatibilityMetadata({
 				sessionId: opts?.sessionId,
+				cacheRetention: opts?.cacheRetention,
 				providerSessionState: opts?.providerSessionState,
 				requestKind: "compaction",
 				compaction: createOpenAICodexCompactionRequestContext({

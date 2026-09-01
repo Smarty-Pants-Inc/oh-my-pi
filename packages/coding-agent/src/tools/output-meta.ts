@@ -738,14 +738,20 @@ async function spillLargeResultToArtifact(
 				maxLines: tailLines,
 			});
 
-	// Replace text blocks with single truncated block, keep images
+	// Consolidate text at its first original position so mixed content keeps its
+	// leading labels before exact image blocks.
 	const newContent: (TextContent | ImageContent)[] = [];
+	let insertedText = false;
 	for (const block of result.content) {
-		if (block.type !== "text") {
+		if (block.type === "text") {
+			if (!insertedText) {
+				newContent.push({ type: "text", text: truncated.content });
+				insertedText = true;
+			}
+		} else {
 			newContent.push(block);
 		}
 	}
-	newContent.push({ type: "text", text: truncated.content });
 
 	// Build truncation meta
 	const outputLines = truncated.outputLines ?? truncated.totalLines;

@@ -67,7 +67,7 @@ describe("read PDF page screenshots", () => {
 			const result = await tool.execute("read-pdf-image", { path: readPath });
 			expect(result.content.some(entry => entry.type === "image" && entry.mimeType === "image/png")).toBe(true);
 			expect(textOf(result)).toContain("Read image file [image/png]");
-			expect(result.details?.resolvedPath).toBe(pdfPath);
+			expect(result.details).toMatchObject({ resolvedPath: pdfPath, sourceLineAligned: false });
 			expect(render).toHaveBeenLastCalledWith(expect.anything(), pdfPath, page, undefined);
 		}
 		expect(tool.approval({ path: `${pdfPath}:p1-img0.png` })).toBe("exec");

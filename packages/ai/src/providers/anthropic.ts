@@ -17,6 +17,7 @@ import {
 	parseStreamingJsonThrottled,
 	readSseEvents,
 } from "@oh-my-pi/pi-utils";
+import { mapContextInstructions } from "../context-instructions";
 import { renderDemotedThinking } from "../dialect/demotion";
 import * as AIError from "../error";
 import { getEnvApiKey, OUTPUT_FALLBACK_BUFFER } from "../stream";
@@ -2045,6 +2046,7 @@ const streamAnthropicOnce = (
 					...createSdkStreamRequestOptions(requestSignal, requestTimeoutMs),
 					maxRetries: 0,
 				};
+				options?.providerDispatchGuard?.();
 				const request: unknown =
 					isOAuthToken && client.beta
 						? client.beta.messages.create(refreshParams, requestOptions)
@@ -2191,6 +2193,7 @@ const streamAnthropicOnce = (
 					maxRetries: 0,
 					...(perRequestHeaders ? { headers: perRequestHeaders } : {}),
 				};
+				options?.providerDispatchGuard?.();
 				const anthropicRequest: unknown =
 					isOAuthToken && client.beta
 						? client.beta.messages.create({ ...params, stream: true }, requestOptions)
@@ -2932,6 +2935,18 @@ export function buildAnthropicSystemBlocks(
 	return blocks.length > 0 ? blocks : undefined;
 }
 
+/** Build the Anthropic system field from legacy and typed instruction inputs. */
+export function buildAnthropicContextSystemBlocks(
+	context: Pick<Context, "systemPrompt" | "instructions">,
+	options: SystemBlockOptions = {},
+): AnthropicSystemBlock[] | undefined {
+	const blocks = buildAnthropicSystemBlocks(context.systemPrompt, options) ?? [];
+	for (const instruction of mapContextInstructions(context.instructions, false)) {
+		blocks.push({ type: "text", text: instruction.renderedText });
+	}
+	return blocks.length > 0 ? blocks : undefined;
+}
+
 export function normalizeExtraBetas(betas?: string[] | string): string[] {
 	if (!betas) return [];
 	const raw = Array.isArray(betas) ? betas : betas.split(",");
@@ -3320,7 +3335,7 @@ function buildParams(
 	const firstUserMessageText = shouldInjectClaudeCodeInstruction
 		? extractClaudeCodeFirstUserMessageText(context.messages)
 		: "";
-	const systemBlocks = buildAnthropicSystemBlocks(context.systemPrompt, {
+	const systemBlocks = buildAnthropicContextSystemBlocks(context, {
 		includeClaudeCodeInstruction: shouldInjectClaudeCodeInstruction,
 		firstUserMessageText,
 	});

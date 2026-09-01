@@ -21,11 +21,13 @@ import {
 	structuredCloneJSON,
 	USER_AGENT,
 } from "@oh-my-pi/pi-utils";
+import { mapContextInstructions } from "../context-instructions";
 import * as AIError from "../error";
 import { getEnvApiKey, isOfficialCodexApiUrl } from "../stream";
 import type {
 	Api,
 	AssistantMessage,
+	CacheRetention,
 	CodexCompactionContext,
 	CodexCompactionRequestContext,
 	Context,
@@ -116,6 +118,7 @@ import {
 	finalizeReasoningThinking,
 	finalizeToolCallArgumentsDone,
 	getOpenAIPromptCacheKey,
+	getOpenAIResponsesRoutingSessionId,
 	hasExecutableIncompleteResponsesToolCalls,
 	isOpenAIResponsesProgressEvent,
 	mapOpenAIResponsesStopReason,
@@ -183,6 +186,7 @@ export interface OpenAICodexCompactionStreamOptions extends OpenAICodexResponses
 /** Inputs for synthesizing Codex request identity outside the normal stream path. */
 export interface OpenAICodexCompatibilityMetadataOptions {
 	sessionId?: string;
+	cacheRetention?: CacheRetention;
 	providerSessionState?: Map<string, ProviderSessionState>;
 	requestKind: OpenAICodexRequestKind;
 	compaction?: CodexCompactionRequestContext;
@@ -726,7 +730,21 @@ export function createOpenAICodexCompatibilityMetadata(
 	options: OpenAICodexCompatibilityMetadataOptions,
 ): OpenAICodexCompatibilityMetadata {
 	const providerState = getCodexProviderSessionState(options.providerSessionState);
-	const sessionId = normalizeOpenAIPromptCacheKey(options.sessionId) ?? crypto.randomUUID();
+	const sessionId = getOpenAIResponsesRoutingSessionId({
+		cacheRetention: options.cacheRetention,
+		sessionId: options.sessionId ?? crypto.randomUUID(),
+	});
+	if (!sessionId) {
+		const installationId = getInstallId();
+		const headers = new Headers();
+		if (options.includeInstallationHeader) {
+			headers.set(OPENAI_HEADERS.INSTALLATION_ID, installationId);
+		}
+		return {
+			clientMetadata: { [OPENAI_HEADERS.INSTALLATION_ID]: installationId },
+			headers: Object.fromEntries(headers.entries()),
+		};
+	}
 	const session = getOrCreateCodexMetadataSessionState(sessionId, providerState);
 	const startNewTurn = resolveCodexStartNewTurn(
 		session,
@@ -1419,6 +1437,7 @@ function createCodexRequestContext(
 	options: OpenAICodexResponsesOptions | undefined,
 	contextOptions: {
 		isolateCompactionTransport: boolean;
+		requestKind?: OpenAICodexRequestKind;
 		startNewTurn?: boolean;
 		turnStartedAtUnixMs?: number;
 	},
@@ -1432,7 +1451,15 @@ function createCodexRequestContext(
 	const baseUrl = model.baseUrl || CODEX_BASE_URL;
 	const url = resolveCodexResponsesUrl(baseUrl);
 
-	const transportSessionId = normalizeOpenAIPromptCacheKey(options?.sessionId);
+	const compaction = options?.codexCompaction;
+	const requestKind = contextOptions.requestKind ?? (compaction ? "compaction" : "turn");
+	const transportSessionId =
+		requestKind === "compaction"
+			? getOpenAIResponsesRoutingSessionId({
+					cacheRetention: options?.cacheRetention,
+					sessionId: options?.sessionId,
+				})
+			: normalizeOpenAIPromptCacheKey(options?.sessionId);
 	const codexClientVersion = CODEX_CLIENT_VERSION;
 	const requestHeaders = { ...(model.headers ?? {}), ...(options?.headers ?? {}) };
 	const rawRequestDump: RawHttpRequestDump = {
@@ -1470,29 +1497,42 @@ function createCodexRequestContext(
 		websocketState.disableWebsocket = sharedWebsocketState.disableWebsocket;
 		websocketState.modelsEtag = sharedWebsocketState.modelsEtag;
 	}
-	const metadataSessionId = transportSessionId ?? crypto.randomUUID();
-	const metadataSession = getOrCreateCodexMetadataSessionState(metadataSessionId, providerSessionState);
-	const compaction = options?.codexCompaction;
-	const requestKind: OpenAICodexRequestKind = compaction ? "compaction" : "turn";
-	const startNewTurn = resolveCodexStartNewTurn(metadataSession, requestKind, compaction, contextOptions.startNewTurn);
+	const metadataSessionId =
+		requestKind === "compaction"
+			? getOpenAIResponsesRoutingSessionId({
+					cacheRetention: options?.cacheRetention,
+					sessionId: options?.sessionId ?? crypto.randomUUID(),
+				})
+			: (transportSessionId ?? crypto.randomUUID());
+	const metadataSession = metadataSessionId
+		? getOrCreateCodexMetadataSessionState(metadataSessionId, providerSessionState)
+		: undefined;
+	const startNewTurn = metadataSession
+		? resolveCodexStartNewTurn(metadataSession, requestKind, compaction, contextOptions.startNewTurn)
+		: (contextOptions.startNewTurn ?? requestKind === "turn");
 	const standaloneCompaction = compaction?.phase === "standalone_turn";
-	clearCodexTurnStatesForNewTurn(metadataSession, startNewTurn, compaction);
-	// Standalone compaction owns a throwaway turn. Every live cell is isolated by
-	// the same credential/backend/model/Lite key as its transport session.
-	const turnState = standaloneCompaction ? {} : getOrCreateCodexTurnState(metadataSession, sessionKey);
-	const requestMetadata = createCodexRequestMetadata(metadataSession, requestKind, {
-		startNewTurn,
-		turnStartedAtUnixMs: compaction
-			? startNewTurn || !metadataSession.turnId
-				? Date.now()
-				: undefined
-			: contextOptions.turnStartedAtUnixMs,
-		clientMetadata: transformedBody.client_metadata,
-		parentTurnId: options?.parentTurnId,
-		compaction,
-		toolNamespacesInfo: options?.toolNamespacesInfo,
-	});
-	transformedBody.client_metadata = requestMetadata.clientMetadata;
+	if (metadataSession) clearCodexTurnStatesForNewTurn(metadataSession, startNewTurn, compaction);
+	// Standalone or cache-disabled compaction owns a throwaway turn. Every live
+	// cell is isolated by the same credential/backend/model/Lite key as its transport session.
+	const turnState =
+		!metadataSession || standaloneCompaction ? {} : getOrCreateCodexTurnState(metadataSession, sessionKey);
+	const requestMetadata = metadataSession
+		? createCodexRequestMetadata(metadataSession, requestKind, {
+				startNewTurn,
+				turnStartedAtUnixMs: compaction
+					? startNewTurn || !metadataSession.turnId
+						? Date.now()
+						: undefined
+					: contextOptions.turnStartedAtUnixMs,
+				clientMetadata: transformedBody.client_metadata,
+				parentTurnId: options?.parentTurnId,
+				compaction,
+				toolNamespacesInfo: options?.toolNamespacesInfo,
+			})
+		: undefined;
+	transformedBody.client_metadata = requestMetadata?.clientMetadata ?? {
+		[OPENAI_HEADERS.INSTALLATION_ID]: getInstallId(),
+	};
 	return {
 		apiKey,
 		accountId,
@@ -1521,6 +1561,7 @@ async function buildCodexRequestContext(
 	const transformedBody = await buildTransformedCodexRequestBody(model, context, options, promptCacheKey);
 	return createCodexRequestContext(model, transformedBody, options, {
 		isolateCompactionTransport: true,
+		requestKind: options?.codexCompaction ? "compaction" : "turn",
 		startNewTurn: options?.codexCompaction ? undefined : !isCodexWithinTurnContinuation(context),
 		turnStartedAtUnixMs: options?.codexCompaction ? undefined : getCodexTurnStartedAtUnixMs(context),
 	});
@@ -1560,10 +1601,18 @@ export async function buildTransformedCodexRequestBody(
 	}
 
 	const systemPrompts = normalizeSystemPrompts(context.systemPrompt);
-	if (systemPrompts.length > 0) {
-		params.instructions = systemPrompts[0];
-	}
-	const developerMessages = systemPrompts.slice(1);
+	const mappedInstructions = mapContextInstructions(context.instructions, true);
+	const systemInstructions = mappedInstructions
+		.filter(instruction => instruction.actualRole === "system")
+		.map(instruction => instruction.renderedText);
+	const primaryInstructions = [...systemPrompts.slice(0, 1), ...systemInstructions];
+	if (primaryInstructions.length > 0) params.instructions = primaryInstructions.join("\n\n");
+	const developerMessages = [
+		...systemPrompts.slice(1),
+		...mappedInstructions
+			.filter(instruction => instruction.actualRole === "developer")
+			.map(instruction => instruction.renderedText),
+	];
 	if (options?.clientMetadata && Object.keys(options.clientMetadata).length > 0) {
 		params.client_metadata = { ...options.clientMetadata };
 	}
@@ -1662,6 +1711,7 @@ export async function openCodexCompactionEventStream(
 	try {
 		requestContext = createCodexRequestContext(model, toCodexRequestBody(body), options, {
 			isolateCompactionTransport: false,
+			requestKind: "compaction",
 		});
 		initial = await openInitialCodexEventStream(model, options, requestSetup, requestContext);
 	} catch (error) {
@@ -1842,6 +1892,7 @@ async function openCodexWebSocketTransport(
 			firstEventTimeoutMs: requestSetup.websocketFirstEventTimeoutMs,
 		},
 		requestSetup.requestSignal,
+		options?.providerDispatchGuard,
 		onSseEvent,
 	);
 	return {
@@ -3802,6 +3853,7 @@ class CodexWebSocketConnection {
 		request: Record<string, unknown>,
 		timeouts: CodexWebSocketRequestTimeouts,
 		signal?: AbortSignal,
+		providerDispatchGuard?: () => void,
 		onSseEvent?: (event: RawSseEvent) => void,
 	): AsyncGenerator<Record<string, unknown>> {
 		if (!this.#socket || this.#socket.readyState !== WebSocket.OPEN) {
@@ -3853,6 +3905,7 @@ class CodexWebSocketConnection {
 			if (!socket || socket.readyState !== WebSocket.OPEN) {
 				throw new CodexWebSocketTransportError(`websocket connection is unavailable`);
 			}
+			providerDispatchGuard?.();
 			try {
 				socket.send(requestPayload);
 			} catch (error) {

@@ -199,6 +199,10 @@ export class AgentTranscriptViewer implements Component {
 		this.#builder.dispose();
 	}
 
+	invalidate(): void {
+		this.#builder.container.invalidate();
+	}
+
 	#stopPolling(): void {
 		if (!this.#pollTimer) return;
 		clearInterval(this.#pollTimer);

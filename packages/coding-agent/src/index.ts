@@ -8,6 +8,7 @@ export { z } from "@oh-my-pi/omptype/zod";
 export { Container, Markdown, Spacer, Text } from "@oh-my-pi/pi-tui";
 // Logging
 export { getAgentDir, logger, VERSION } from "@oh-my-pi/pi-utils";
+export * from "./build-identity";
 export * from "./config/keybindings";
 export * from "./config/model-registry";
 // Prompt templates
@@ -41,6 +42,7 @@ export * from "./sdk";
 export * from "./session/agent-session";
 // Auth and model registry
 export * from "./session/auth-storage";
+export * from "./session/execution-environment";
 export * from "./session/indexed-session-storage";
 export * from "./session/messages";
 export * from "./session/redis-session-storage";

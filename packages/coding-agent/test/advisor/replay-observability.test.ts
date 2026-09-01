@@ -99,6 +99,30 @@ describe("advisor context reset observability", () => {
 		}
 	});
 
+	it("preserves retained regex secrets until a conversation boundary", () => {
+		const agent: AdvisorAgent = {
+			prompt: async () => {},
+			abort: () => {},
+			reset: () => {},
+			state: { messages: [] },
+		};
+		const runtime = new AdvisorRuntime(agent, {
+			snapshotMessages: () => [],
+			enqueueAdvice: () => {},
+		});
+		runtime.retainRegexSecretValues(new Set(["tok_abc123"]));
+
+		runtime.reset("auto-compaction");
+		const retained = new Set<string>();
+		runtime.copyRetainedRegexSecretValuesTo(retained);
+		expect(retained).toEqual(new Set(["tok_abc123"]));
+
+		runtime.reset("conversation-boundary", { clearRetainedRegexSecretValues: true });
+		const cleared = new Set<string>();
+		runtime.copyRetainedRegexSecretValuesTo(cleared);
+		expect(cleared).toEqual(new Set());
+	});
+
 	it("logs quarantine reset reasons while preserving the retry limit", async () => {
 		const recoveryLogged = Promise.withResolvers<void>();
 		const exhaustedLogged = Promise.withResolvers<void>();

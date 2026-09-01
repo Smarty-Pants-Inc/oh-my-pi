@@ -438,6 +438,7 @@ exit 64
 			env: {
 				PATH: Bun.env.PATH ?? "",
 				HOME: shellDir,
+				ZDOTDIR: shellDir,
 				// The command runs through an interactive login zsh, which loads the
 				// system `/etc/zshrc`. On macOS that pulls in
 				// `/etc/zshrc_Apple_Terminal`, and under Apple Terminal it appends

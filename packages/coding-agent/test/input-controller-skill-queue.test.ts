@@ -8,14 +8,15 @@
 import { afterEach, beforeEach, describe, expect, it, type Mock, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
-import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
+import type { ImageContent, TextContent, UserMessage } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { formatKeyHints } from "@oh-my-pi/pi-coding-agent/config/keybindings";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { Skill } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
 import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/event-controller";
 import { InputController } from "@oh-my-pi/pi-coding-agent/modes/controllers/input-controller";
-import { getThemeByName, setThemeInstance } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { getThemeByName, setThemeInstance, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { CompactionQueuedMessage, InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { UiHelpers } from "@oh-my-pi/pi-coding-agent/modes/utils/ui-helpers";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -31,12 +32,19 @@ type StubEditor = {
 	getText: () => string;
 	getExpandedText: () => string;
 	clearDraft: (historyText?: string) => void;
+	setDraft?: (text: string, images?: readonly ImageContent[]) => void;
 	addToHistory: Mock<(...args: unknown[]) => unknown>;
 	onSubmit?: (text: string) => Promise<void>;
 	pendingImages: ImageContent[];
 	pendingImageLinks: (string | undefined)[];
 	imageLinks?: (string | undefined)[];
 };
+
+function waitForImmediate(): Promise<void> {
+	const { promise, resolve } = Promise.withResolvers<void>();
+	setImmediate(resolve);
+	return promise;
+}
 
 type PromptCustomMessage = Mock<
 	(
@@ -162,7 +170,7 @@ describe("InputController skill queue chip metadata", () => {
 		vi.restoreAllMocks();
 	});
 
-	it("passes slash-form queueChipText for streaming skill steers", async () => {
+	it("queues a streaming skill for the next turn", async () => {
 		const { ctx, editor, promptCustomMessage, updatePendingMessagesDisplay, requestRender } =
 			createStubInputControllerContext({ skillCommands, isStreaming: true });
 		const controller = new InputController(ctx);
@@ -181,7 +189,7 @@ describe("InputController skill queue chip metadata", () => {
 		expect(requestRender).toHaveBeenCalledTimes(1);
 	});
 
-	it("queues known skill steers during compaction instead of dispatching immediately", async () => {
+	it("queues known skills for the next turn after compaction", async () => {
 		const { ctx, editor, promptCustomMessage, queueCompactionMessage } = createStubInputControllerContext({
 			skillCommands,
 			isStreaming: false,
@@ -195,6 +203,35 @@ describe("InputController skill queue chip metadata", () => {
 
 		expect(queueCompactionMessage).toHaveBeenCalledWith("/skill:test-skill arg1 arg2", "steer", undefined);
 		expect(promptCustomMessage).not.toHaveBeenCalled();
+	});
+
+	it("queues ordinary Enter for the next turn after compaction", async () => {
+		const { ctx, editor, queueCompactionMessage } = createStubInputControllerContext({
+			skillCommands,
+			isStreaming: false,
+			isCompacting: true,
+		});
+		const controller = new InputController(ctx);
+
+		controller.setupEditorSubmitHandler();
+		editor.setText("plain prompt");
+		await editor.onSubmit?.("plain prompt");
+
+		expect(queueCompactionMessage).toHaveBeenCalledWith("plain prompt", "steer", undefined);
+	});
+
+	it("queues ordinary streaming Enter for the next turn", async () => {
+		const { ctx, editor, prompt } = createStubInputControllerContext({ skillCommands, isStreaming: true });
+		const controller = new InputController(ctx);
+
+		controller.setupEditorSubmitHandler();
+		editor.setText("plain prompt");
+		await editor.onSubmit?.("plain prompt");
+
+		expect(prompt).toHaveBeenCalledWith("plain prompt", {
+			streamingBehavior: "steer",
+			images: undefined,
+		});
 	});
 
 	it("passes slash-form queueChipText for streaming skill follow-ups", async () => {
@@ -405,7 +442,15 @@ describe("compaction skill re-invocation", () => {
 	it("re-invokes a queued skill as a user-attributed skill prompt", async () => {
 		const image: ImageContent = { type: "image", data: "aGVsbG8=", mimeType: "image/png" };
 		const { ctx, promptCustomMessage, promptCustomMessageCalled, prompt, steer, followUp } =
-			createCompactionDrainContext([{ text: "/skill:test-skill arg1 arg2", mode: "followUp", images: [image] }]);
+			createCompactionDrainContext([
+				{
+					id: "skill-follow-up",
+					timestamp: 1,
+					text: "/skill:test-skill arg1 arg2",
+					mode: "followUp",
+					images: [image],
+				},
+			]);
 		const uiHelpers = new UiHelpers(ctx);
 
 		await uiHelpers.flushCompactionQueue({ willRetry: false });
@@ -442,7 +487,13 @@ describe("compaction skill re-invocation", () => {
 		try {
 			const image: ImageContent = { type: "image", data: "cmV0cnk=", mimeType: "image/png" };
 			const { ctx } = createCompactionDrainContext([
-				{ text: "/skill:test-skill retry args", mode: "followUp", images: [image] },
+				{
+					id: "retry-skill",
+					timestamp: 1,
+					text: "/skill:test-skill retry args",
+					mode: "followUp",
+					images: [image],
+				},
 			]);
 			ctx.session = fixture.session;
 			const uiHelpers = new UiHelpers(ctx);
@@ -717,7 +768,10 @@ describe("AgentSession derived queued custom display", () => {
 	});
 });
 
-function createStubInteractiveModeContextForUiHelpers(session: AgentSession) {
+function createStubInteractiveModeContextForUiHelpers(
+	session: AgentSession,
+	options: { shortcutDescription?: string } = {},
+) {
 	let editorText = "";
 	const editor: StubEditor = {
 		setText(text) {
@@ -740,6 +794,12 @@ function createStubInteractiveModeContextForUiHelpers(session: AgentSession) {
 			this.pendingImages = [];
 			this.pendingImageLinks = [];
 		},
+		setDraft(text: string, images?: readonly ImageContent[]) {
+			this.setText(text);
+			this.imageLinks = undefined;
+			this.pendingImages = images ? [...images] : [];
+			this.pendingImageLinks = images ? images.map(() => undefined) : [];
+		},
 		addToHistory: vi.fn(),
 		pendingImages: [] as ImageContent[],
 		pendingImageLinks: [] as (string | undefined)[],
@@ -748,22 +808,82 @@ function createStubInteractiveModeContextForUiHelpers(session: AgentSession) {
 	const requestRender = vi.fn();
 	const requestComponentRender = vi.fn();
 	const updatePendingMessagesDisplay = vi.fn();
+	const inputListeners = new Set<(data: string) => { consume?: boolean; data?: string } | undefined>();
+	let focused: unknown = editor;
+	let overlayVisible = false;
+	const addInputListener = (listener: (data: string) => { consume?: boolean; data?: string } | undefined) => {
+		inputListeners.add(listener);
+		return () => inputListeners.delete(listener);
+	};
+	const dispatchInput = (data: string) => {
+		for (const listener of [...inputListeners]) {
+			const result = listener(data);
+			if (result?.consume) return result;
+		}
+		return undefined;
+	};
+	const showStatus = vi.fn();
+	const showWarning = vi.fn();
+	if (options.shortcutDescription) {
+		Object.defineProperty(session, "extensionRunner", {
+			configurable: true,
+			value: {
+				getShortcuts: () =>
+					new Map([
+						[
+							"shift+up",
+							{
+								shortcut: "shift+up",
+								description: options.shortcutDescription,
+								whenKeybinding: "app.message.dequeue",
+								handler: () => {},
+								extensionPath: "/test/prompt-steering.ts",
+							},
+						],
+					]),
+			},
+		});
+	}
 
 	const ctx = {
 		editor,
-		ui: { requestRender, requestComponentRender },
+		ui: {
+			requestRender,
+			requestComponentRender,
+			addInputListener,
+			getFocused: () => focused,
+			hasOverlay: () => overlayVisible,
+		},
 		pendingMessagesContainer,
 		session,
 		viewSession: session,
 		compactionQueuedMessages: [],
 		keybindings: {
-			getDisplayString: (_action: string) => "Alt+Up",
+			getKeys: (_action: string) => ["alt+up", "shift+up"],
+			matches: (_data: string, _action: string) => false,
 		},
 		updatePendingMessagesDisplay,
+		showStatus,
+		showWarning,
 		locallySubmittedUserSignatures: new Set<string>(),
 	} as unknown as InteractiveModeContext;
 
-	return { ctx, editor, pendingMessagesContainer, requestComponentRender };
+	return {
+		ctx,
+		editor,
+		pendingMessagesContainer,
+		requestComponentRender,
+		dispatchInput,
+		inputListeners,
+		showStatus,
+		showWarning,
+		setFocused: (value: unknown) => {
+			focused = value;
+		},
+		setOverlayVisible: (value: boolean) => {
+			overlayVisible = value;
+		},
+	};
 }
 
 describe("UiHelpers / InputController against derived queued custom display", () => {
@@ -795,9 +915,28 @@ describe("UiHelpers / InputController against derived queued custom display", ()
 		uiHelpers.updatePendingMessagesDisplay();
 
 		const rendered = Bun.stripANSI(pendingMessagesContainer.render(120).join("\n"));
-		expect(rendered).toContain("Steering · 1");
-		expect(rendered).toContain("1. /skill:test-skill arg1 arg2");
+		expect(rendered).toContain("Queued · 1");
+		expect(rendered).toContain("1. [NEXT] /skill:test-skill arg1 arg2");
 		expect(rendered).not.toContain("Steer:");
+		expect(rendered).toContain("Shift+Up: Manage queued prompts");
+		expect(rendered).toContain(`${formatKeyHints("alt+up")} to restore newest`);
+		expect(rendered).not.toContain("Shift+Up to restore");
+	});
+
+	it("shows timing help only while the prompt-steering shortcut is active", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		queueCustomSteer(session, "queued prompt");
+
+		const { ctx, pendingMessagesContainer } = createStubInteractiveModeContextForUiHelpers(session, {
+			shortcutDescription: "Edit queued prompt delivery timing",
+		});
+		new UiHelpers(ctx).updatePendingMessagesDisplay();
+
+		const rendered = Bun.stripANSI(pendingMessagesContainer.render(120).join("\n"));
+		expect(rendered).toContain("Shift+Up: Edit queued prompt delivery timing");
+		expect(rendered).not.toContain("Shift+Up to restore");
+		expect(rendered).toContain(`${formatKeyHints("alt+up")} to restore newest`);
 	});
 
 	it("requests the pending-container repaint after rebuilding and clearing it", async () => {
@@ -836,11 +975,667 @@ describe("UiHelpers / InputController against derived queued custom display", ()
 		new UiHelpers(ctx).updatePendingMessagesDisplay();
 
 		const rendered = Bun.stripANSI(pendingMessagesContainer.render(120).join("\n"));
-		expect(rendered).toContain("After yield · 3");
-		expect(rendered).toContain("1. inspect types");
-		expect(rendered).toContain("2. run tests");
-		expect(rendered).toContain("3. summarize");
+		expect(rendered).toContain("Queued · 3");
+		expect(rendered).toContain("1. [AFTER] inspect types");
+		expect(rendered).toContain("2. [AFTER] run tests");
+		expect(rendered).toContain("3. [AFTER] summarize");
 		expect(rendered).not.toContain("Follow-up:");
+		expect(rendered).toContain("Shift+Up: Manage queued prompts");
+		expect(rendered).toContain(`${formatKeyHints("alt+up")} to restore newest`);
+		expect(rendered).not.toContain("Shift+Up to restore");
+	});
+
+	it("preserves per-item timing previews, keeps its height, and applies them on Enter", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		session.agent.state.isStreaming = true;
+		for (const text of ["first prompt", "second prompt"]) {
+			session.agent.followUp({
+				role: "user",
+				content: text,
+				attribution: "user",
+				timestamp: Date.now(),
+			});
+		}
+
+		const { ctx, pendingMessagesContainer, dispatchInput, inputListeners, showStatus } =
+			createStubInteractiveModeContextForUiHelpers(session);
+		const uiHelpers = new UiHelpers(ctx);
+		uiHelpers.updatePendingMessagesDisplay();
+		const passiveHeight = pendingMessagesContainer.children.length;
+		uiHelpers.editQueuedPrompts();
+		expect(pendingMessagesContainer.children).toHaveLength(passiveHeight);
+
+		expect(dispatchInput("\x1b[A")).toEqual({ consume: true });
+		expect(dispatchInput("\x1b[D")).toEqual({ consume: true });
+		expect(dispatchInput("\x1b[B")).toEqual({ consume: true });
+		expect(dispatchInput("\x1b[D")).toEqual({ consume: true });
+		expect(dispatchInput("\x1b[A")).toEqual({ consume: true });
+		expect(session.getQueuedPrompts().map(prompt => prompt.delivery)).toEqual(["afterCurrent", "afterCurrent"]);
+		let rendered = Bun.stripANSI(pendingMessagesContainer.render(120).join("\n"));
+		expect(rendered).toContain("› 1. [NEXT] first prompt");
+		expect(rendered).toContain("2. [NEXT] second prompt");
+		expect(rendered).toContain("Enter apply · Esc undo");
+
+		expect(dispatchInput("\r")).toEqual({ consume: true });
+		await waitForImmediate();
+		expect(session.getQueuedPrompts()).toEqual([
+			{ id: expect.any(String), text: "first prompt", delivery: "steer" },
+			{ id: expect.any(String), text: "second prompt", delivery: "steer" },
+		]);
+		expect(showStatus).toHaveBeenCalledTimes(2);
+		expect(showStatus).toHaveBeenCalledWith("Queued prompt set to NEXT.");
+		expect(inputListeners.size).toBe(1);
+		rendered = Bun.stripANSI(pendingMessagesContainer.render(120).join("\n"));
+		expect(rendered).toContain("[NEXT] first prompt");
+		expect(rendered).toContain("[NEXT] second prompt");
+		expect(rendered).not.toContain("←/→ preview");
+		session.agent.state.isStreaming = false;
+	});
+
+	it("handles a timing-preview Left before a later focused-subagent listener", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		vi.spyOn(session.agent, "continue").mockResolvedValue(undefined);
+		vi.spyOn(session.agent, "continueQueuedMessageBlock").mockResolvedValue(undefined);
+		session.agent.followUp({
+			role: "user",
+			content: "retime before unfocus",
+			attribution: "user",
+			timestamp: Date.now(),
+		});
+
+		const { ctx, pendingMessagesContainer, dispatchInput, inputListeners } =
+			createStubInteractiveModeContextForUiHelpers(session);
+		const uiHelpers = new UiHelpers(ctx);
+		const focusedSubagentLeft = vi.fn(() => ({ consume: true as const }));
+		inputListeners.add(focusedSubagentLeft);
+		uiHelpers.editQueuedPrompts();
+
+		expect(dispatchInput("\x1b[D")).toEqual({ consume: true });
+		expect(focusedSubagentLeft).not.toHaveBeenCalled();
+		expect(session.getQueuedPrompts()[0]?.delivery).toBe("afterCurrent");
+		expect(Bun.stripANSI(pendingMessagesContainer.render(120).join("\n"))).toContain("[NEXT] retime before unfocus");
+		expect(dispatchInput("\r")).toEqual({ consume: true });
+		await session.waitForIdle();
+		await waitForImmediate();
+		expect(session.getQueuedPrompts()[0]?.delivery).toBe("steer");
+	});
+
+	it("delegates back-to-back timing saves to the session serializer", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		for (const text of ["first prompt", "second prompt"]) queueUserSteer(session, text);
+		const firstSaveStarted = Promise.withResolvers<void>();
+		const releaseFirstSave = Promise.withResolvers<void>();
+		let saveInFlight = false;
+		const setQueuedPromptDelivery = vi.spyOn(session, "setQueuedPromptDelivery").mockImplementation(async () => {
+			if (saveInFlight) return { status: "unavailable", reason: "queue_mutation" };
+			saveInFlight = true;
+			firstSaveStarted.resolve();
+			await releaseFirstSave.promise;
+			saveInFlight = false;
+			return { status: "updated" };
+		});
+		const { ctx, pendingMessagesContainer, dispatchInput, showWarning } =
+			createStubInteractiveModeContextForUiHelpers(session);
+		const uiHelpers = new UiHelpers(ctx);
+
+		uiHelpers.editQueuedPrompts();
+		expect(dispatchInput("\x1b[C")).toEqual({ consume: true });
+		expect(dispatchInput("\r")).toEqual({ consume: true });
+		await firstSaveStarted.promise;
+		expect(Bun.stripANSI(pendingMessagesContainer.render(120).join("\n"))).toContain("[AFTER] second prompt");
+
+		uiHelpers.editQueuedPrompts();
+		expect(dispatchInput("\x1b[A")).toEqual({ consume: true });
+		expect(dispatchInput("\x1b[C")).toEqual({ consume: true });
+		expect(dispatchInput("\r")).toEqual({ consume: true });
+		await Promise.resolve();
+		const callsWhileFirstSaving = setQueuedPromptDelivery.mock.calls.length;
+		const warnedWhileFirstSaving = showWarning.mock.calls.some(
+			([message]) => message === "Another queued prompt change is still being saved.",
+		);
+
+		releaseFirstSave.resolve();
+		await waitForImmediate();
+		await waitForImmediate();
+
+		expect(callsWhileFirstSaving).toBe(2);
+		expect(warnedWhileFirstSaving).toBe(false);
+		expect(setQueuedPromptDelivery).toHaveBeenCalledTimes(2);
+		expect(showWarning).not.toHaveBeenCalledWith("Another queued prompt change is still being saved.");
+	});
+	it("commits timing on Enter and discards it on Escape", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		session.agent.state.isStreaming = true;
+		queueUserSteer(session, "preview timing changes");
+
+		const { ctx, pendingMessagesContainer, dispatchInput, showStatus } =
+			createStubInteractiveModeContextForUiHelpers(session);
+		const uiHelpers = new UiHelpers(ctx);
+		uiHelpers.editQueuedPrompts();
+		expect(dispatchInput("\x1b[C")).toEqual({ consume: true });
+		expect(session.getQueuedPrompts()[0]?.delivery).toBe("steer");
+		expect(Bun.stripANSI(pendingMessagesContainer.render(120).join("\n"))).toContain(
+			"[AFTER] preview timing changes",
+		);
+		expect(dispatchInput("\x1b")).toEqual({ consume: true });
+		await waitForImmediate();
+		expect(session.getQueuedPrompts()[0]?.delivery).toBe("steer");
+		expect(showStatus).not.toHaveBeenCalledWith("Queued prompt set to AFTER.");
+
+		uiHelpers.editQueuedPrompts();
+		expect(dispatchInput("\x1b[C")).toEqual({ consume: true });
+		expect(dispatchInput("\r")).toEqual({ consume: true });
+		await waitForImmediate();
+		expect(session.getQueuedPrompts()[0]?.delivery).toBe("afterCurrent");
+		expect(showStatus).toHaveBeenCalledWith("Queued prompt set to AFTER.");
+		session.agent.state.isStreaming = false;
+	});
+
+	it("preserves a timing preview across unrelated queue changes", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		vi.spyOn(session.agent, "continue").mockResolvedValue(undefined);
+		vi.spyOn(session.agent, "continueQueuedMessageBlock").mockResolvedValue(undefined);
+		session.agent.followUp({
+			role: "user",
+			content: "selected prompt",
+			attribution: "user",
+			timestamp: Date.now(),
+		});
+
+		const { ctx, pendingMessagesContainer, dispatchInput } = createStubInteractiveModeContextForUiHelpers(session);
+		const uiHelpers = new UiHelpers(ctx);
+		uiHelpers.editQueuedPrompts();
+
+		expect(dispatchInput("\x1b[D")).toEqual({ consume: true });
+		expect(session.getQueuedPrompts()[0]?.delivery).toBe("afterCurrent");
+		session.agent.followUp({
+			role: "user",
+			content: "unrelated prompt",
+			attribution: "user",
+			timestamp: Date.now(),
+		});
+
+		const rendered = Bun.stripANSI(pendingMessagesContainer.render(120).join("\n"));
+		expect(rendered).toContain("1. [NEXT] selected prompt");
+		expect(rendered).toContain("Enter apply · Esc undo");
+		expect(dispatchInput("\r")).toEqual({ consume: true });
+		await waitForImmediate();
+		expect(session.getQueuedPrompts().map(prompt => [prompt.text, prompt.delivery])).toEqual([
+			["selected prompt", "steer"],
+			["unrelated prompt", "afterCurrent"],
+		]);
+	});
+
+	it("keeps the timing editor active when compaction starts", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		session.agent.followUp({
+			role: "user",
+			content: "queued prompt",
+			attribution: "user",
+			timestamp: Date.now(),
+		});
+
+		const { ctx, editor, pendingMessagesContainer, dispatchInput, inputListeners } =
+			createStubInteractiveModeContextForUiHelpers(session);
+		editor.setText("unfinished draft");
+		const uiHelpers = new UiHelpers(ctx);
+		uiHelpers.editQueuedPrompts();
+
+		Object.defineProperty(session, "isCompacting", { configurable: true, get: () => true });
+		expect(dispatchInput("\x1b[D")).toEqual({ consume: true });
+		expect(Bun.stripANSI(pendingMessagesContainer.render(120).join("\n"))).toContain("[NEXT] queued prompt");
+		expect(dispatchInput("\x1b")).toEqual({ consume: true });
+		Reflect.deleteProperty(session, "isCompacting");
+
+		expect(inputListeners.size).toBe(1);
+		expect(editor.getText()).toBe("unfinished draft");
+		expect(session.getQueuedPrompts()).toEqual([
+			{ id: expect.any(String), text: "queued prompt", delivery: "afterCurrent" },
+		]);
+	});
+
+	it("passes the first key through when another surface takes focus", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		session.agent.followUp({
+			role: "user",
+			content: "queued prompt",
+			attribution: "user",
+			timestamp: Date.now(),
+		});
+
+		const { ctx, dispatchInput, inputListeners, setFocused } = createStubInteractiveModeContextForUiHelpers(session);
+		const uiHelpers = new UiHelpers(ctx);
+		uiHelpers.editQueuedPrompts();
+		await Promise.resolve();
+
+		setFocused(new Container());
+		expect(dispatchInput("\r")).toBeUndefined();
+		expect(inputListeners.size).toBe(1);
+		expect(session.getQueuedPrompts()[0]?.delivery).toBe("afterCurrent");
+	});
+
+	it("passes the first key through when an overlay covers the editor", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		session.agent.followUp({
+			role: "user",
+			content: "queued prompt",
+			attribution: "user",
+			timestamp: Date.now(),
+		});
+
+		const { ctx, dispatchInput, inputListeners, setOverlayVisible } =
+			createStubInteractiveModeContextForUiHelpers(session);
+		const uiHelpers = new UiHelpers(ctx);
+		uiHelpers.editQueuedPrompts();
+		await Promise.resolve();
+
+		setOverlayVisible(true);
+		expect(dispatchInput("\x1b[D")).toBeUndefined();
+		expect(inputListeners.size).toBe(1);
+		expect(session.getQueuedPrompts()[0]?.delivery).toBe("afterCurrent");
+	});
+
+	it("moves selection to the nearest prompt when the selected prompt leaves the queue", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		const older: UserMessage = {
+			role: "user",
+			content: "older prompt",
+			attribution: "user",
+			timestamp: 1,
+		};
+		const selected: UserMessage = {
+			role: "user",
+			content: "selected prompt",
+			attribution: "user",
+			timestamp: 2,
+		};
+		session.agent.replaceQueues([], [older, selected], true);
+
+		const { ctx, editor, pendingMessagesContainer, dispatchInput, inputListeners, showWarning } =
+			createStubInteractiveModeContextForUiHelpers(session);
+		editor.setText("unfinished draft");
+		const uiHelpers = new UiHelpers(ctx);
+		uiHelpers.editQueuedPrompts();
+		await Promise.resolve();
+
+		session.agent.replaceQueues([], [older], true);
+
+		expect(inputListeners.size).toBe(1);
+		expect(Bun.stripANSI(pendingMessagesContainer.render(120).join("\n"))).toContain("› 1. [AFTER] older prompt");
+		expect(showWarning).not.toHaveBeenCalledWith(
+			"The selected prompt is no longer queued; selection moved to the nearest prompt.",
+		);
+		expect(dispatchInput("\x1b")).toEqual({ consume: true });
+		expect(session.getQueuedPrompts()).toEqual([
+			{ id: expect.any(String), text: "older prompt", delivery: "afterCurrent" },
+		]);
+		expect(editor.getText()).toBe("unfinished draft");
+	});
+
+	it("exits when the session view changes without clearing the editor draft", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		queueUserSteer(session, "queued prompt");
+
+		const { ctx, dispatchInput, editor, inputListeners } = createStubInteractiveModeContextForUiHelpers(session);
+		editor.setText("unfinished draft");
+		const uiHelpers = new UiHelpers(ctx);
+		uiHelpers.editQueuedPrompts();
+		await Promise.resolve();
+
+		Object.defineProperty(ctx, "viewSession", {
+			configurable: true,
+			value: {
+				isCompacting: false,
+				getQueuedMessages: () => ({ steering: [], followUp: [] }),
+				getQueuedPrompts: () => [],
+				getQueuedPromptTimestamp: (_id: string) => undefined,
+			},
+		});
+		expect(dispatchInput("\r")).toBeUndefined();
+
+		expect(inputListeners.size).toBe(1);
+		expect(editor.getText()).toBe("unfinished draft");
+	});
+
+	it("applies NOW on the first Enter", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		queueUserSteer(session, "interrupt candidate");
+		const setQueuedPromptDelivery = vi.spyOn(session, "setQueuedPromptDelivery");
+		const { ctx, pendingMessagesContainer, dispatchInput, showWarning } =
+			createStubInteractiveModeContextForUiHelpers(session);
+		const uiHelpers = new UiHelpers(ctx);
+		uiHelpers.editQueuedPrompts();
+
+		expect(dispatchInput("\x1b[D")).toEqual({ consume: true });
+		expect(setQueuedPromptDelivery).not.toHaveBeenCalled();
+		expect(Bun.stripANSI(pendingMessagesContainer.render(120).join("\n"))).toContain("[NOW] interrupt candidate");
+
+		expect(dispatchInput("\r")).toEqual({ consume: true });
+		expect(setQueuedPromptDelivery).toHaveBeenCalledWith(expect.any(String), "interrupt");
+		await waitForImmediate();
+		expect(showWarning).toHaveBeenCalledWith("Current work already ended; the queued prompt timing was not changed.");
+		expect(Bun.stripANSI(pendingMessagesContainer.render(120).join("\n"))).toContain("[NEXT] interrupt candidate");
+	});
+
+	it("keeps the edited draft visible while a session-backed save is pending", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		session.agent.followUp({
+			role: "user",
+			content: "queued before save",
+			attribution: "user",
+			timestamp: Date.now(),
+		});
+		const saveStarted = Promise.withResolvers<void>();
+		const releaseSave = Promise.withResolvers<void>();
+		const updateQueuedPromptText = session.updateQueuedPromptText.bind(session);
+		vi.spyOn(session, "updateQueuedPromptText").mockImplementation(async (id, text, images, prepared) => {
+			saveStarted.resolve();
+			await releaseSave.promise;
+			return updateQueuedPromptText(id, text, images, prepared);
+		});
+
+		const { ctx, editor, pendingMessagesContainer, dispatchInput } =
+			createStubInteractiveModeContextForUiHelpers(session);
+		editor.setText("prior draft");
+		const uiHelpers = new UiHelpers(ctx);
+		uiHelpers.editQueuedPrompts();
+		expect(dispatchInput("e")).toEqual({ consume: true });
+		editor.setText("edited while waiting");
+		expect(dispatchInput("\r")).toEqual({ consume: true });
+		await saveStarted.promise;
+
+		expect(editor.getText()).toBe("edited while waiting");
+		expect(Bun.stripANSI(pendingMessagesContainer.render(120).join("\n"))).toContain("Saving queued prompt change");
+
+		releaseSave.resolve();
+		await waitForImmediate();
+		await waitForImmediate();
+		expect(session.getQueuedPrompts()[0]?.text).toBe("edited while waiting");
+		expect(editor.getText()).toBe("prior draft");
+	});
+
+	it("edits one prompt in the composer and restores the prior draft with images", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		const queuedImage: ImageContent = { type: "image", mimeType: "image/png", data: "queued" };
+		const addedImage: ImageContent = { type: "image", mimeType: "image/png", data: "added" };
+		const priorImage: ImageContent = { type: "image", mimeType: "image/png", data: "prior" };
+		session.agent.followUp({
+			role: "user",
+			content: [{ type: "text", text: "queued before [Image #1]" }, queuedImage],
+			attribution: "user",
+			timestamp: Date.now(),
+		});
+		const { ctx, editor, dispatchInput, showStatus } = createStubInteractiveModeContextForUiHelpers(session);
+		ctx.locallySubmittedUserSignatures.add("queued before [Image #1]\u00001");
+		editor.setText("prior draft [Image #1]");
+		editor.pendingImages = [priorImage];
+		editor.pendingImageLinks = ["prior-link"];
+		editor.imageLinks = editor.pendingImageLinks;
+		const uiHelpers = new UiHelpers(ctx);
+		uiHelpers.editQueuedPrompts();
+
+		expect(dispatchInput("e")).toEqual({ consume: true });
+		expect(editor.getText()).toBe("queued before [Image #1]");
+		expect(editor.pendingImages).toEqual([queuedImage]);
+		editor.setText("queued after [Image #1] [Image #2]");
+		editor.pendingImages.push(addedImage);
+		editor.pendingImageLinks.push("added-link");
+		expect(dispatchInput("\r")).toEqual({ consume: true });
+		await waitForImmediate();
+		await waitForImmediate();
+
+		const updated = session.getQueuedPrompts()[0];
+		expect(updated).toMatchObject({ text: "queued after [Image #1] [Image #2]", imageCount: 2 });
+		expect(session.getQueuedPromptDraft(updated!.id)?.images).toEqual([queuedImage, addedImage]);
+		expect(editor.getText()).toBe("prior draft [Image #1]");
+		expect(editor.pendingImages).toEqual([priorImage]);
+		expect(editor.pendingImageLinks).toEqual(["prior-link"]);
+		expect(ctx.locallySubmittedUserSignatures.has("queued before [Image #1]\u00001")).toBe(false);
+		expect(ctx.locallySubmittedUserSignatures.has("queued after [Image #1] [Image #2]\u00002")).toBe(true);
+		expect(showStatus).toHaveBeenCalledWith("Queued prompt updated.");
+	});
+
+	it("migrates the exact local signature when editing an image-only prompt", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		const image: ImageContent = { type: "image", mimeType: "image/png", data: "image-only" };
+		session.agent.followUp({
+			role: "user",
+			content: [image],
+			attribution: "user",
+			timestamp: Date.now(),
+		});
+		const { ctx, editor, dispatchInput } = createStubInteractiveModeContextForUiHelpers(session);
+		ctx.locallySubmittedUserSignatures.add("\u00001");
+		const uiHelpers = new UiHelpers(ctx);
+		uiHelpers.editQueuedPrompts();
+
+		expect(dispatchInput("e")).toEqual({ consume: true });
+		expect(editor.getText()).toBe("");
+		expect(editor.pendingImages).toEqual([image]);
+		editor.setText("caption [Image #1]");
+		expect(dispatchInput("\r")).toEqual({ consume: true });
+		await waitForImmediate();
+		await waitForImmediate();
+
+		expect(ctx.locallySubmittedUserSignatures.has("\u00001")).toBe(false);
+		expect(ctx.locallySubmittedUserSignatures.has("caption [Image #1]\u00001")).toBe(true);
+	});
+
+	it("keeps a stale queue edit as an unsent draft", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		queueUserSteer(session, "queued before");
+		const { ctx, editor, dispatchInput, showWarning } = createStubInteractiveModeContextForUiHelpers(session);
+		editor.setText("prior draft");
+		const uiHelpers = new UiHelpers(ctx);
+		uiHelpers.editQueuedPrompts();
+		expect(dispatchInput("e")).toEqual({ consume: true });
+		expect(ctx.locallySubmittedUserSignatures.has("queued before\u00000")).toBe(true);
+		editor.setText("edited but not resent");
+
+		session.agent.clearAllQueues();
+		expect(ctx.locallySubmittedUserSignatures.has("queued before\u00000")).toBe(false);
+
+		expect(editor.getText()).toBe("edited but not resent\n\nprior draft");
+		expect(showWarning).toHaveBeenCalledWith(
+			"That prompt ran while you were editing it. Your edit remains in the composer.",
+		);
+	});
+
+	it("consumes Ctrl+C while an edit save is in flight and restores the prior draft", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		queueUserSteer(session, "queued before");
+		const saveStarted = Promise.withResolvers<void>();
+		const releaseSave = Promise.withResolvers<void>();
+		vi.spyOn(session, "updateQueuedPromptText").mockImplementation(async () => {
+			saveStarted.resolve();
+			await releaseSave.promise;
+			return { status: "updated" };
+		});
+		const { ctx, editor, dispatchInput } = createStubInteractiveModeContextForUiHelpers(session);
+		editor.setText("prior draft");
+		const uiHelpers = new UiHelpers(ctx);
+		uiHelpers.editQueuedPrompts();
+		expect(dispatchInput("e")).toEqual({ consume: true });
+		editor.setText("edited queued prompt");
+		expect(dispatchInput("\r")).toEqual({ consume: true });
+		await saveStarted.promise;
+
+		expect(dispatchInput("\x03")).toEqual({ consume: true });
+		expect(editor.getText()).toBe("edited queued prompt");
+		releaseSave.resolve();
+		await waitForImmediate();
+		await waitForImmediate();
+		expect(editor.getText()).toBe("prior draft");
+	});
+
+	it("confirms targeted removal and keeps predictable selection", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		session.agent.followUp({ role: "user", content: "first", attribution: "user", timestamp: 1 });
+		session.agent.followUp({ role: "user", content: "second", attribution: "user", timestamp: 2 });
+		const { ctx, pendingMessagesContainer, dispatchInput, showStatus } =
+			createStubInteractiveModeContextForUiHelpers(session);
+		const uiHelpers = new UiHelpers(ctx);
+		uiHelpers.editQueuedPrompts();
+
+		expect(dispatchInput("d")).toEqual({ consume: true });
+		ctx.locallySubmittedUserSignatures.add("second\u00000");
+		expect(Bun.stripANSI(pendingMessagesContainer.render(120).join("\n"))).toContain(
+			"Remove only this queued prompt and its attachments?",
+		);
+		expect(dispatchInput("\r")).toEqual({ consume: true });
+		await waitForImmediate();
+		await waitForImmediate();
+
+		expect(session.getQueuedPrompts().map(prompt => prompt.text)).toEqual(["first"]);
+		expect(showStatus).toHaveBeenCalledWith("Queued prompt removed.");
+		expect(Bun.stripANSI(pendingMessagesContainer.render(120).join("\n"))).toContain("› 1. [AFTER] first");
+		expect(ctx.locallySubmittedUserSignatures.has("second\u00000")).toBe(false);
+	});
+
+	it("keeps semantic badges visible in narrow selected rows", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		session.agent.followUp({
+			role: "user",
+			content: "first line\nsecond line\nthird line",
+			attribution: "user",
+			timestamp: Date.now(),
+		});
+		const { ctx, pendingMessagesContainer } = createStubInteractiveModeContextForUiHelpers(session);
+		const uiHelpers = new UiHelpers(ctx);
+		uiHelpers.editQueuedPrompts();
+
+		const narrow = Bun.stripANSI(pendingMessagesContainer.render(32).join("\n"));
+		expect(narrow).toContain("[AFTER]");
+		expect(narrow).toContain("› 1.");
+		expect(narrow).toContain("first line");
+	});
+
+	it("keeps NOW, NEXT, and AFTER badges on their semantic theme colors while selected", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		session.agent.state.isStreaming = true;
+		vi.spyOn(session, "abort").mockResolvedValue(undefined);
+		const next: UserMessage = {
+			role: "user",
+			content: "next prompt",
+			attribution: "user",
+			steering: true,
+			timestamp: 2,
+		};
+		const after: UserMessage = {
+			role: "user",
+			content: "after prompt",
+			attribution: "user",
+			timestamp: 1,
+		};
+		const selected: UserMessage = {
+			role: "user",
+			content: "interrupt immediately",
+			attribution: "user",
+			timestamp: 3,
+		};
+		session.agent.replaceQueues([next], [after, selected], true);
+		const { ctx, pendingMessagesContainer, dispatchInput } = createStubInteractiveModeContextForUiHelpers(session);
+		const uiHelpers = new UiHelpers(ctx);
+		uiHelpers.editQueuedPrompts();
+		expect(dispatchInput("\x1b[D")).toEqual({ consume: true });
+		await waitForImmediate();
+		expect(dispatchInput("\x1b[D")).toEqual({ consume: true });
+		await waitForImmediate();
+
+		const rendered = pendingMessagesContainer.render(120).join("\n");
+		expect(rendered).toContain(theme.bold(theme.fg("warning", "[NOW]")));
+		expect(rendered).toContain(theme.bold(theme.fg("mdLink", "[NEXT]")));
+		expect(rendered).toContain(theme.bold(theme.fg("success", "[AFTER]")));
+		session.agent.state.isStreaming = false;
+	});
+
+	it("merges compaction-local and session prompts into one chronological passive list", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		session.agent.followUp({ role: "user", content: "core middle", attribution: "user", timestamp: 10 });
+		const { ctx, pendingMessagesContainer } = createStubInteractiveModeContextForUiHelpers(session);
+		ctx.compactionQueuedMessages = [
+			{ id: "0001", timestamp: 5, text: "local oldest", mode: "steer" },
+			{ id: "0003", timestamp: 15, text: "local newest", mode: "followUp" },
+		];
+		new UiHelpers(ctx).updatePendingMessagesDisplay();
+
+		const rendered = Bun.stripANSI(pendingMessagesContainer.render(120).join("\n"));
+		expect(rendered).toContain("1. [NEXT] local oldest");
+		expect(rendered).toContain("2. [AFTER] core middle");
+		expect(rendered).toContain("3. [AFTER] local newest");
+	});
+	it("manages compaction-local rows while compaction is active", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		const { ctx, editor, pendingMessagesContainer, dispatchInput, showStatus } =
+			createStubInteractiveModeContextForUiHelpers(session);
+		ctx.compactionQueuedMessages = [{ id: "local", timestamp: 1, text: "local prompt", mode: "followUp" }];
+		Object.defineProperty(session, "isCompacting", { configurable: true, get: () => true });
+		const uiHelpers = new UiHelpers(ctx);
+		uiHelpers.editQueuedPrompts();
+
+		expect(Bun.stripANSI(pendingMessagesContainer.render(120).join("\n"))).toContain("1. [AFTER] local prompt");
+		expect(Bun.stripANSI(pendingMessagesContainer.render(120).join("\n"))).not.toContain("locked during compaction");
+		expect(dispatchInput("e")).toEqual({ consume: true });
+		expect(editor.getText()).toBe("local prompt");
+		editor.setText("edited local prompt");
+		expect(dispatchInput("\r")).toEqual({ consume: true });
+		await waitForImmediate();
+		expect(ctx.compactionQueuedMessages[0]?.text).toBe("edited local prompt");
+		expect(showStatus).toHaveBeenCalledWith("Queued prompt updated.");
+		expect(dispatchInput("\x1b[D")).toEqual({ consume: true });
+		expect(Bun.stripANSI(pendingMessagesContainer.render(120).join("\n"))).toContain("1. [NEXT] edited local prompt");
+		expect(dispatchInput("\r")).toEqual({ consume: true });
+		await waitForImmediate();
+		expect(ctx.compactionQueuedMessages[0]?.mode).toBe("steer");
+		expect(showStatus).toHaveBeenCalledWith("Queued prompt set to NEXT.");
+		uiHelpers.editQueuedPrompts();
+
+		expect(dispatchInput("d")).toEqual({ consume: true });
+		expect(dispatchInput("\r")).toEqual({ consume: true });
+		await waitForImmediate();
+		expect(ctx.compactionQueuedMessages).toEqual([]);
+		Reflect.deleteProperty(session, "isCompacting");
+	});
+
+	it("does not abort compaction when a local prompt previews NOW", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		const abort = vi.spyOn(session, "abort");
+		const { ctx, dispatchInput, showWarning } = createStubInteractiveModeContextForUiHelpers(session);
+		ctx.compactionQueuedMessages = [{ id: "local", timestamp: 1, text: "local prompt", mode: "steer" }];
+		Object.defineProperty(session, "isCompacting", { configurable: true, get: () => true });
+		const uiHelpers = new UiHelpers(ctx);
+		uiHelpers.editQueuedPrompts();
+
+		expect(dispatchInput("\x1b[D")).toEqual({ consume: true });
+		expect(dispatchInput("\r")).toEqual({ consume: true });
+		await waitForImmediate();
+
+		expect(abort).not.toHaveBeenCalled();
+		expect(ctx.compactionQueuedMessages[0]?.mode).toBe("steer");
+		expect(showWarning).toHaveBeenCalledWith("NOW is unavailable during compaction; choose NEXT or AFTER.");
+		Reflect.deleteProperty(session, "isCompacting");
 	});
 
 	it("restores the compact slash form into the editor and clears the queue", async () => {
@@ -850,11 +1645,29 @@ describe("UiHelpers / InputController against derived queued custom display", ()
 
 		const { ctx, editor } = createStubInteractiveModeContextForUiHelpers(session);
 		const controller = new InputController(ctx);
-		const count = controller.restoreQueuedMessagesToEditor();
+		const count = await controller.restoreQueuedMessagesToEditor();
 
 		expect(count).toBe(1);
 		expect(editor.getText()).toBe("/skill:test-skill arg1 arg2");
 		expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+	});
+
+	it("keeps a shared local signature until the last identical prompt is restored", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		const first: UserMessage = { role: "user", content: "same", attribution: "user", timestamp: 1 };
+		const second: UserMessage = { role: "user", content: "same", attribution: "user", timestamp: 2 };
+		session.agent.replaceQueues([], [first, second], true);
+		const { ctx, editor } = createStubInteractiveModeContextForUiHelpers(session);
+		ctx.locallySubmittedUserSignatures.add("same\u00000");
+		const controller = new InputController(ctx);
+
+		expect(await controller.restoreQueuedMessagesToEditor()).toBe(1);
+		expect(ctx.locallySubmittedUserSignatures.has("same\u00000")).toBe(true);
+		expect(session.getQueuedPrompts()).toHaveLength(1);
+		expect(await controller.restoreQueuedMessagesToEditor()).toBe(1);
+		expect(ctx.locallySubmittedUserSignatures.has("same\u00000")).toBe(false);
+		expect(editor.getText()).toBe("same\n\nsame");
 	});
 });
 

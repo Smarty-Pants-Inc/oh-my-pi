@@ -147,7 +147,7 @@ describe("task.batch schema gating", () => {
 
 		expect(tool.description).toContain("Same-file edits are not guaranteed to merge");
 		expect(tool.description).toContain("coordinate through `hub` before editing shared files");
-		expect(tool.description).toContain("Name one integration owner");
+		expect(tool.description).toContain("one integration owner");
 		expect(tool.description).not.toContain("Concurrent edits to the same files auto-resolve");
 	});
 
@@ -158,30 +158,30 @@ describe("task.batch schema gating", () => {
 		expect(tool.description).toContain("spawn-policy default (`scout`)");
 		expect(tool.description).not.toContain("general-purpose worker");
 		expect(tool.description).not.toContain("default worker");
-		expect(tool.description).toContain("Omit `agent` when the spawn-policy default is the best fit");
-		expect(tool.description).toContain("### scout (READ-ONLY)");
+		expect(tool.description).toContain("omit it only when that agent fits the task");
+		expect(tool.description).toContain("### scout (read-only)");
 	});
 
-	it("hides effort by default and exposes it when task.enableEffort is enabled", async () => {
+	it("exposes effort by default and hides it when task.enableEffort is disabled", async () => {
 		mockDiscovery();
 
 		const flatSession = createSession({ settings: { "task.batch": false } });
 		const flat = await TaskTool.create(flatSession);
-		expect(getSchemaProperties(flat).effort).toBeUndefined();
-		expect(flat.description).not.toContain("`effort`");
-
-		flatSession.settings.override("task.enableEffort", true);
 		expect(getSchemaProperties(flat).effort).toBeDefined();
 		expect(flat.description).toContain("`effort`");
 
+		flatSession.settings.override("task.enableEffort", false);
+		expect(getSchemaProperties(flat).effort).toBeUndefined();
+		expect(flat.description).not.toContain("`effort`");
+
 		const batchSession = createSession({ settings: { "task.batch": true } });
 		const batch = await TaskTool.create(batchSession);
-		expect(getBatchItemProperties(batch).effort).toBeUndefined();
-		expect(batch.description).not.toContain("`effort`");
-
-		batchSession.settings.override("task.enableEffort", true);
 		expect(getBatchItemProperties(batch).effort).toBeDefined();
 		expect(batch.description).toContain("`effort`");
+
+		batchSession.settings.override("task.enableEffort", false);
+		expect(getBatchItemProperties(batch).effort).toBeUndefined();
+		expect(batch.description).not.toContain("`effort`");
 	});
 
 	it("keeps isolation boolean-only in the batch item schema", async () => {

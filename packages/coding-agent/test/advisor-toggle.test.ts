@@ -749,11 +749,22 @@ describe("AgentSession advisor toggle", () => {
 		const entryId = sessionManager.getLeafId();
 		if (!entryId) throw new Error("Expected a branchable entry");
 		const createBranchedSession = sessionManager.createBranchedSession.bind(sessionManager);
-		vi.spyOn(sessionManager, "createBranchedSession").mockImplementation(parentId => {
-			const result = createBranchedSession(parentId);
+		function createBranchedSessionMock(parentId: string): string | undefined;
+		function createBranchedSessionMock(
+			parentId: string,
+			beforeJournalPublish: (newSessionFile: string) => void | Promise<void>,
+		): Promise<string | undefined>;
+		function createBranchedSessionMock(
+			parentId: string,
+			beforeJournalPublish?: (newSessionFile: string) => void | Promise<void>,
+		): string | undefined | Promise<string | undefined> {
+			const result = beforeJournalPublish
+				? createBranchedSession(parentId, beforeJournalPublish)
+				: createBranchedSession(parentId);
 			queueMicrotask(() => appendAdvisorCost(advisor, 9, 3));
 			return result;
-		});
+		}
+		vi.spyOn(sessionManager, "createBranchedSession").mockImplementation(createBranchedSessionMock);
 
 		await expect(session.branch(entryId)).resolves.toMatchObject({ cancelled: false });
 		const replacementSessionFile = session.sessionFile;
@@ -770,8 +781,8 @@ describe("AgentSession advisor toggle", () => {
 		appendAdvisorCost(advisor, 0.5, 1);
 		const previousSessionFile = sessionManager.getSessionFile();
 		const fork = sessionManager.fork.bind(sessionManager);
-		vi.spyOn(sessionManager, "fork").mockImplementation(async () => {
-			const result = await fork();
+		vi.spyOn(sessionManager, "fork").mockImplementation(async beforeJournalPublish => {
+			const result = await fork(beforeJournalPublish);
 			// Reproduce the outgoing advisor finalizing after the fork selected its file.
 			appendAdvisorCost(advisor, 9, 2);
 			return result;
@@ -806,26 +817,33 @@ describe("AgentSession advisor toggle", () => {
 		await session.dispose();
 		expect((await loadAdvisorTranscriptCosts(previousSessionFile)).get("")).toBeCloseTo(0.75, 8);
 	});
-	it("resets advisor runtimes after an in-place handoff compaction", async () => {
+	it("starts a fresh handoff session and resets advisor state", async () => {
 		vi.spyOn(compactionModule, "generateHandoffFromContext").mockResolvedValue("## Goal\nContinue from here");
 		const advisor = enableAdvisor();
 		prepareHandoffConversation(advisor);
-		session.settings.set("compaction.keepRecentTokens", 1);
 		const sessionFile = session.sessionFile;
+		expect(session.getAdvisorCost()).toBeCloseTo(0.5, 8);
+		expect(advisor.state.messages).toContainEqual(advisorMessage(0.5, 1));
 
 		const result = await session.handoff();
 
 		expect(result?.document).toContain("Continue from here");
-		expect(session.sessionFile).toBe(sessionFile);
-		const compaction = sessionManager.getBranch().at(-1);
-		expect(compaction).toMatchObject({ type: "compaction" });
-		if (compaction?.type !== "compaction") throw new Error("Expected handoff compaction entry");
-		expect(compaction.summary).toContain("Continue from here");
+		expect(session.sessionFile).not.toBe(sessionFile);
+		expect(sessionManager.getBranch().at(-1)).toMatchObject({ type: "custom_message", customType: "handoff" });
+		expect(session.getAdvisorCost()).toBe(0);
+		expect(advisor.state.messages).toEqual([]);
 	});
 	it("clears advisor cost when a branch skips conversation restore", async () => {
 		const extensionRunner = {
 			hasHandlers: (eventType: string) => eventType === "session_before_branch",
 			emit: async () => ({ skipConversationRestore: true }),
+			emitBeforeSessionMutation: async () => undefined,
+			emitWithHostCompletion: async (
+				_event: { type: string },
+				finalizeBeforeHostCompletion?: () => void | Promise<void>,
+			) => {
+				await finalizeBeforeHostCompletion?.();
+			},
 		} as unknown as ExtensionRunner;
 		const branchDir = TempDir.createSync("@pi-advisor-branch-");
 		const branchManager = SessionManager.create(branchDir.path(), branchDir.path());
@@ -861,13 +879,18 @@ describe("AgentSession advisor toggle", () => {
 			await branchDir.remove().catch(() => {});
 		}
 	});
-	it("clears advisor cost when a branch hook throws after the session changed", async () => {
+	it("restores advisor cost when a branch hook throws after mutation", async () => {
 		const failure = new Error("session_branch handler failed");
 		const extensionRunner = {
 			hasHandlers: () => false,
-			emit: async (event: { type: string }) => {
+			emit: async () => undefined,
+			emitBeforeSessionMutation: async () => undefined,
+			emitWithHostCompletion: async (
+				event: { type: string },
+				finalizeBeforeHostCompletion?: () => void | Promise<void>,
+			) => {
 				if (event.type === "session_branch") throw failure;
-				return undefined;
+				await finalizeBeforeHostCompletion?.();
 			},
 		} as unknown as ExtensionRunner;
 		const branchDir = TempDir.createSync("@pi-advisor-branch-fail-");
@@ -893,12 +916,12 @@ describe("AgentSession advisor toggle", () => {
 
 			await expect(branchSession.branch(entryId)).rejects.toThrow(failure);
 
-			// The hook failed only after the branch had already taken over the transcript,
-			// so the abandoned conversation's spend must not be billed to the new one.
-			expect(branchManager.getSessionFile()).not.toBe(previousSessionFile);
-			expect(branchSession.getAdvisorCost()).toBe(0);
+			// The branch was fenced but its ordinary event failed before finalization, so
+			// rollback restores the retained identity and spend ledger before later work.
+			expect(branchManager.getSessionFile()).toBe(previousSessionFile);
+			expect(branchSession.getAdvisorCost()).toBeCloseTo(0.5, 8);
 			appendAdvisorCost(advisor, 0.25, 2);
-			expect(branchSession.getAdvisorCost()).toBeCloseTo(0.25, 8);
+			expect(branchSession.getAdvisorCost()).toBeCloseTo(0.75, 8);
 		} finally {
 			await branchSession.dispose();
 			await branchDir.remove().catch(() => {});

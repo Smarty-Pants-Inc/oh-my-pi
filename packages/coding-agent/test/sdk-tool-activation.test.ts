@@ -96,7 +96,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		cwd: tempDir,
 		agentDir: tempDir,
 		modelRegistry,
-		sessionManager: SessionManager.inMemory(),
+		sessionManager: SessionManager.inMemory(tempDir),
 		settings: Settings.isolated(),
 		model: getBundledModel("openai", "gpt-4o-mini"),
 		disableExtensionDiscovery: true,
@@ -269,7 +269,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			await session.setModel(fable);
 			expect(session.getToolByName("think")).toBeDefined();
 			expect(session.getActiveToolNames()).toContain("think");
-			expect(session.systemPrompt.join("\n")).toContain("other tools become callable when it completes");
+			expect(session.systemPrompt.join("\n")).toContain("`think` is a private scratchpad; not shown to user.");
 
 			await session.setModel(responses);
 			expect(session.getActiveToolNames()).toContain("think");
@@ -280,7 +280,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 
 			await session.setModel(unsupported);
 			expect(session.getActiveToolNames()).not.toContain("think");
-			expect(session.systemPrompt.join("\n")).not.toContain("other tools become callable when it completes");
+			expect(session.systemPrompt.join("\n")).not.toContain("`think` is a private scratchpad; not shown to user.");
 		} finally {
 			await session.dispose();
 		}
@@ -1504,6 +1504,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		const tempDir = makeTempDir();
 		const releaseStalledRegistration = Promise.withResolvers<void>();
 		const releaseRecoveredRegistration = Promise.withResolvers<void>();
+		const releaseRecoveredPresentation = Promise.withResolvers<void>();
 		const detachedRegistrationExtension: ExtensionFactory = pi => {
 			pi.on("session_start", () => {
 				void releaseStalledRegistration.promise.then(() => {
@@ -1550,25 +1551,39 @@ describe("createAgentSession defaultInactive tool activation", () => {
 					detachedFailure.resolve({ event: error.event, error: error.error });
 				}
 			});
+			const stalledPresentationStarted = Promise.withResolvers<void>();
+			const recoveredPresentationStarted = Promise.withResolvers<AbortSignal>();
 			const recoveredActivation = Promise.withResolvers<void>();
 			const originalSetPresentation = session.setActiveToolPresentation.bind(session);
 			vi.spyOn(session, "setActiveToolPresentation")
-				.mockImplementationOnce((_toolNames, _mountedToolNames, _forcePromptRefresh, signal) =>
-					untilAborted(signal, Promise.withResolvers<void>().promise),
-				)
+				.mockImplementationOnce((_toolNames, _mountedToolNames, _forcePromptRefresh, signal) => {
+					stalledPresentationStarted.resolve();
+					return untilAborted(signal, Promise.withResolvers<void>().promise);
+				})
 				.mockImplementation(async (toolNames, mountedToolNames, forcePromptRefresh, signal) => {
+					if (toolNames.includes("recovered_detached_tool")) {
+						recoveredPresentationStarted.resolve(signal);
+						await releaseRecoveredPresentation.promise;
+					}
 					await originalSetPresentation(toolNames, mountedToolNames, forcePromptRefresh, signal);
 					if (toolNames.includes("recovered_detached_tool")) recoveredActivation.resolve();
 				});
+			vi.useFakeTimers();
 			testSetExtensionHandlerTimeoutMs(10);
 
 			releaseStalledRegistration.resolve();
+			await stalledPresentationStarted.promise;
+			vi.advanceTimersByTime(10);
 			const failure = await detachedFailure.promise;
 			// Restore the default budget before the recovered registration flush:
 			// the 10ms budget was only for reaping the stalled activation, and the
 			// real presentation pass can exceed it under full-suite load.
 			testSetExtensionHandlerTimeoutMs(EXTENSION_HANDLER_TIMEOUT_MS);
 			releaseRecoveredRegistration.resolve();
+			const recoveredSignal = await recoveredPresentationStarted.promise;
+			vi.advanceTimersByTime(11);
+			expect(recoveredSignal.aborted).toBe(false);
+			releaseRecoveredPresentation.resolve();
 			await recoveredActivation.promise;
 
 			expect(failure.event).toBe("tool_registration");
@@ -1576,8 +1591,11 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			expect(session.getToolByName("stalled_detached_tool")).toBeUndefined();
 			expect(session.getToolByName("recovered_detached_tool")?.label).toBe("Recovered Detached Tool");
 		} finally {
+			testSetExtensionHandlerTimeoutMs(EXTENSION_HANDLER_TIMEOUT_MS);
 			releaseStalledRegistration.resolve();
 			releaseRecoveredRegistration.resolve();
+			releaseRecoveredPresentation.resolve();
+			vi.useRealTimers();
 			await session.dispose();
 		}
 	});
@@ -1740,6 +1758,72 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			await session.dispose();
 		}
 	});
+
+	it("activates the late built-in goal for an unrestricted explicit SDK tool list", async () => {
+		const tempDir = makeTempDir();
+		const { session } = await createAgentSession({
+			...baseOptions(tempDir),
+			settings: Settings.isolated({ "goal.enabled": true }),
+			toolNames: ["read"],
+		});
+
+		try {
+			expect(session.getToolByName("goal")).toBeDefined();
+			expect(session.getActiveToolNames()).toContain("goal");
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("activates goal when an extension replaces an explicitly requested built-in", async () => {
+		const tempDir = makeTempDir();
+		const replaceReadExtension: ExtensionFactory = pi => {
+			pi.registerTool({
+				name: "read",
+				label: "Extension Read",
+				description: "Extension replacement for the built-in read tool.",
+				parameters: type({}),
+				async execute() {
+					return { content: [{ type: "text", text: "extension read" }] };
+				},
+			});
+		};
+		const { session } = await createAgentSession({
+			...baseOptions(tempDir),
+			settings: Settings.isolated({ "goal.enabled": true }),
+			extensions: [replaceReadExtension],
+			toolNames: ["read"],
+		});
+
+		try {
+			expect(session.getToolByName("read")?.label).toBe("Extension Read");
+			expect(session.getActiveToolNames()).toEqual(expect.arrayContaining(["read", "goal"]));
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	for (const testCase of [
+		{ label: "an explicit empty list", toolNames: [] },
+		{ label: "the internal no-tools sentinel", toolNames: ["__none__"] },
+		{ label: "an invalid-only list", toolNames: ["not_a_registered_tool"] },
+	]) {
+		it(`does not activate goal for ${testCase.label}`, async () => {
+			const tempDir = makeTempDir();
+			const { session } = await createAgentSession({
+				...baseOptions(tempDir),
+				settings: Settings.isolated({ "goal.enabled": true }),
+				toolNames: testCase.toolNames,
+			});
+
+			try {
+				expect(session.getToolByName("goal")).toBeDefined();
+				expect(session.getActiveToolNames()).not.toContain("goal");
+			} finally {
+				await session.dispose();
+			}
+		});
+	}
 
 	it("normalizes legacy builtin toolNames before selecting the active SDK tools", async () => {
 		const tempDir = makeTempDir();

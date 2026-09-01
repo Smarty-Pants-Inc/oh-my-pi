@@ -12,6 +12,7 @@ import { settings } from "../../config/settings";
 import type { RenderResultOptions } from "../../extensibility/custom-tools/types";
 import { shimmerEnabled, shimmerText } from "../../modes/theme/shimmer";
 import type { Theme } from "../../modes/theme/theme";
+import { buildAsyncResultImageAttachments } from "../../session/async-job-delivery";
 import { USER_INTERRUPT_LABEL } from "../../session/messages";
 import { Ellipsis, Hasher, type RenderCache, renderStatusLine, renderTreeList, truncateToWidth } from "../../tui";
 import type { ToolSession } from "..";
@@ -152,6 +153,7 @@ interface TrackedJobLike {
 	latestDetails?: Record<string, unknown>;
 	resultText?: string;
 	errorText?: string;
+	resultContent?: AsyncJob["resultContent"];
 }
 
 export function snapshotJobs(session: ToolSession, jobs: TrackedJobLike[]): JobSnapshot[] {
@@ -264,6 +266,7 @@ export function buildJobResult(
 	if (lines.length === 0) {
 		lines.push("No background jobs.");
 	}
+	if (attachments.orderText) lines.push("", attachments.orderText);
 
 	const details: CoordinationDetails = {
 		op,
@@ -272,7 +275,7 @@ export function buildJobResult(
 		...(agents.length ? { agents } : {}),
 	};
 	return {
-		content: [{ type: "text", text: lines.join("\n").trimEnd() }],
+		content: [{ type: "text", text: lines.join("\n").trimEnd() }, ...attachments.images],
 		details,
 		// A wait where everything is still running carries no new information
 		// once a later wait exists — same predicate the TUI uses to displace

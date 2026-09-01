@@ -7,6 +7,7 @@ import {
 	BUILTIN_BLOB_DESTINATIONS,
 } from "../blob-broker/destinations";
 import { DEFAULT_RELAY_URL } from "../collab/protocol";
+import { agentBehavior } from "../context/registry";
 import { DEFAULT_LIVE_VOICE, LIVE_VOICE_OPTIONS, LIVE_VOICE_VALUES } from "../live/voices";
 import {
 	COMPACTION_METHOD_CHOICES,
@@ -4093,7 +4094,7 @@ export const SETTINGS_SCHEMA = {
 	// Todo tool
 	"todo.enabled": {
 		type: "boolean",
-		default: true,
+		default: agentBehavior.todo.enabled,
 		ui: {
 			tab: "tools",
 			group: "Available Tools",
@@ -4104,7 +4105,7 @@ export const SETTINGS_SCHEMA = {
 
 	"todo.reminders": {
 		type: "boolean",
-		default: true,
+		default: agentBehavior.todo.stopReminders,
 		ui: {
 			tab: "tools",
 			group: "Todos",
@@ -4133,7 +4134,7 @@ export const SETTINGS_SCHEMA = {
 	"todo.eager": {
 		type: "enum",
 		values: ["default", "preferred", "always"] as const,
-		default: "default",
+		default: agentBehavior.todo.eager,
 		ui: {
 			tab: "tools",
 			group: "Todos",
@@ -4789,7 +4790,7 @@ export const SETTINGS_SCHEMA = {
 
 	"goal.enabled": {
 		type: "boolean",
-		default: true,
+		default: agentBehavior.goal.enabled,
 		ui: {
 			tab: "tasks",
 			group: "Modes",
@@ -4811,7 +4812,7 @@ export const SETTINGS_SCHEMA = {
 
 	"goal.continuationModes": {
 		type: "array",
-		default: ["interactive"],
+		default: agentBehavior.goal.continuationModes,
 		ui: {
 			tab: "tasks",
 			group: "Modes",
@@ -4846,7 +4847,7 @@ export const SETTINGS_SCHEMA = {
 			"block-clone",
 			"rcopy",
 		] as const,
-		default: "none",
+		default: "auto",
 		ui: {
 			tab: "tasks",
 			group: "Isolation",
@@ -4939,7 +4940,7 @@ export const SETTINGS_SCHEMA = {
 	"task.eager": {
 		type: "enum",
 		values: ["default", "preferred", "always"] as const,
-		default: "default",
+		default: agentBehavior.task.eager,
 		ui: {
 			tab: "tasks",
 			group: "Subagents",
@@ -4967,7 +4968,7 @@ export const SETTINGS_SCHEMA = {
 
 	"task.enableEffort": {
 		type: "boolean",
-		default: false,
+		default: true,
 		ui: {
 			tab: "tasks",
 			group: "Subagents",
@@ -5012,7 +5013,7 @@ export const SETTINGS_SCHEMA = {
 
 	"task.maxRecursionDepth": {
 		type: "number",
-		default: 2,
+		default: agentBehavior.task.maxRecursionDepth,
 		ui: {
 			tab: "tasks",
 			group: "Subagents",
@@ -5682,10 +5683,15 @@ export const SETTINGS_SCHEMA = {
 				},
 				{
 					value: "long",
-					label: "Long (1h)",
-					description: "1h TTL where the provider supports it; pricier writes, no keep-alive refresh requests",
+					label: "Long",
+					description:
+						"Extended retention where supported (Anthropic, Bedrock, and compatible gateways: 1h; OpenAI Responses: 24h); pricier writes, no Anthropic keep-alive refresh requests",
 				},
-				{ value: "none", label: "Off", description: "Disable prompt caching and cache-affinity routing" },
+				{
+					value: "none",
+					label: "Off",
+					description: "Disable cache-affinity routing and opt out of prompt caching where supported",
+				},
 			],
 		},
 	},

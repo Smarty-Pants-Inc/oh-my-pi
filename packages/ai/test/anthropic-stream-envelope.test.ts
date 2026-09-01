@@ -927,6 +927,35 @@ describe("anthropic stream envelope handling", () => {
 		expect(capturedOptions?.headers).toEqual({ "X-Umans-Websearch-Provider": "exa" });
 	});
 
+	it("revalidates injected clients immediately before both Anthropic wire calls", async () => {
+		for (const anthropicCacheRefreshRequest of [false, true]) {
+			let valid = true;
+			const create = vi.fn(() => {
+				throw new Error("Anthropic wire call should not run");
+			});
+			const client: AnthropicMessagesClientLike = { messages: { create } };
+			const stream = streamAnthropic(model, context, {
+				client,
+				anthropicCacheRefreshRequest,
+				onPayload: async payload => {
+					valid = false;
+					return payload;
+				},
+				providerDispatchGuard: () => {
+					if (!valid) throw new Error("Anthropic request became stale during preparation");
+				},
+			});
+			for await (const _ of stream) {
+				// drain stream
+			}
+			const result = await stream.result();
+
+			expect(create).not.toHaveBeenCalled();
+			expect(result.stopReason).toBe("error");
+			expect(result.errorMessage).toContain("Anthropic request became stale during preparation");
+		}
+	});
+
 	it("does not send context_management through injected clients", async () => {
 		type CapturedPayload = {
 			thinking?: { type?: string };

@@ -70,14 +70,16 @@ type RustTaskName = keyof typeof TASK_COMMANDS;
 const repoRoot = path.join(import.meta.dir, "..");
 const cargoBinary = await resolveCargoBinary();
 const taskName = process.argv[2];
+const changedOnly = process.argv.slice(3).includes("--changed-only");
 
 if (!isRustTaskName(taskName)) {
 	console.error(`Unknown Rust task: ${taskName ?? "(missing)"}`);
 	process.exit(1);
 }
 
-if (taskName !== "fmt:rs" && !(isCI() || (await hasRustAffectingChanges()))) {
-	console.log(`Skipping ${taskName} (not in CI and no Rust-affecting changes were found).`);
+const forceRun = isCI() && !changedOnly;
+if (taskName !== "fmt:rs" && !(forceRun || (await hasRustAffectingChanges()))) {
+	console.log(`Skipping ${taskName} (no Rust-affecting changes were found).`);
 	process.exit(0);
 }
 

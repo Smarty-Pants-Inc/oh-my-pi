@@ -59,6 +59,10 @@ export function createPersistedSubagentReviverFactory(
 ): PersistedSubagentReviverFactory {
 	const registry = AgentRegistry.global();
 	return async ref => {
+		// The JSONL session_init prompt is user-writable and cannot prove that it was
+		// built from the current approved release. Keep protected cold refs
+		// transcript-only; an in-process reviver still uses the live reviewed options.
+		if (ctx.protectedRuntime) return undefined;
 		const sessionFile = ref.sessionFile;
 		if (!sessionFile) return undefined;
 		const peek = await SessionManager.peekSessionInit(sessionFile);

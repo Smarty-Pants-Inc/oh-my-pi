@@ -26,6 +26,9 @@ function initProxy(init: RequestInit | undefined): string {
 	}
 }
 
+export const COWORK_PROVIDER_DISPATCH_GUARD = Symbol("providerDispatchGuard");
+export const BYPASS_PROVIDER_DISPATCH_GUARD = Symbol("bypassProviderDispatchGuard");
+
 type CoworkTlsOptions = {
 	ca?: string | string[];
 	cert?: string;
@@ -38,6 +41,8 @@ type CoworkTlsOptions = {
 type CoworkRequestInit = RequestInit & {
 	proxy?: string;
 	tls?: CoworkTlsOptions;
+	[COWORK_PROVIDER_DISPATCH_GUARD]?: () => void;
+	[BYPASS_PROVIDER_DISPATCH_GUARD]?: boolean;
 };
 
 type RequestBody = string | Uint8Array;
@@ -142,6 +147,9 @@ async function sendCoworkRequest(
 	const method = init.method ?? "GET";
 	const signal = init.signal ?? undefined;
 	const tlsOptions = resolveTlsOptions(url, init.tls);
+	// Yield once before opening the socket so queued stale-turn invalidations can run.
+	await Promise.resolve();
+	init[COWORK_PROVIDER_DISPATCH_GUARD]?.();
 	const headers = buildOrderedHeaders(url, sourceHeaders, body);
 	const result = Promise.withResolvers<Response>();
 	let request: ClientRequest | undefined;

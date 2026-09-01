@@ -1,0 +1,4 @@
+{
+  "extends": "../tsconfig.workspace.json",
+  "include": ["src/client", "src/extension.ts", "src/index.ts", "src/protocol.ts"]
+}

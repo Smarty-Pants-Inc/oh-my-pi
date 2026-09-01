@@ -1,4 +1,5 @@
 import { beforeAll, describe, expect, it } from "bun:test";
+import { renderSetupSplash } from "@oh-my-pi/pi-coding-agent/modes/setup-wizard/scenes/splash";
 import { runStartupSplash } from "@oh-my-pi/pi-coding-agent/modes/setup-wizard/startup-splash";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
@@ -68,5 +69,14 @@ describe("startup splash", () => {
 		expect(renderRequests).toBeGreaterThan(0);
 		expect(focused).toBe(preSplashEditor);
 		expect(overlayComponent?.render(32)).toHaveLength(8);
+	});
+
+	it("names smarty pants in the compact fallback splash", () => {
+		const lines = renderSetupSplash(32, 14, 0);
+		const plain = lines.join("\n").replace(/\x1b\[[0-9;]*m/g, "");
+		const squashed = plain.replace(/\s+/g, "").toLowerCase();
+		expect(squashed).toContain("smartypants");
+		expect(squashed).not.toContain("smarty-pants");
+		expect(squashed).not.toContain("ohmypi");
 	});
 });

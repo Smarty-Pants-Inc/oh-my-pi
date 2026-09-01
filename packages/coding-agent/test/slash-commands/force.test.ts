@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "bun:test";
+import { resolveOwnedDialectFromEnv } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
@@ -113,5 +114,61 @@ describe("/force slash command", () => {
 		}) satisfies Model<"ollama-chat">;
 
 		expect(buildNamedToolChoice("write", model)).toEqual({ type: "function", name: "write" });
+	});
+
+	it("builds a named Google choice for forced tools", () => {
+		const model = buildModel({
+			id: "gemini-2.5-flash",
+			name: "Gemini 2.5 Flash",
+			api: "google-generative-ai",
+			provider: "google",
+			baseUrl: "https://generativelanguage.googleapis.com/v1beta",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 1_048_576,
+			maxTokens: 65_536,
+		}) satisfies Model<"google-generative-ai">;
+
+		expect(buildNamedToolChoice("todo", model)).toEqual({ type: "function", name: "todo" });
+	});
+
+	it("does not claim forced selection when model compatibility disables it", () => {
+		const model = buildModel({
+			id: "kimi-k2.7-code",
+			name: "Kimi K2.7 Code",
+			api: "openai-completions",
+			provider: "kimi-code",
+			baseUrl: "https://api.kimi.com/coding/v1",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 262_144,
+			maxTokens: 32_768,
+			compat: { supportsForcedToolChoice: false },
+		}) satisfies Model<"openai-completions">;
+
+		expect(buildNamedToolChoice("todo", model)).toBeUndefined();
+	});
+
+	it("expresses a local named requirement for compat-disabled PI_DIALECT sessions", () => {
+		const model = buildModel({
+			id: "kimi-k2.7-code",
+			name: "Kimi K2.7 Code",
+			api: "openai-completions",
+			provider: "kimi-code",
+			baseUrl: "https://api.kimi.com/coding/v1",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 262_144,
+			maxTokens: 32_768,
+			compat: { supportsToolChoice: false, supportsForcedToolChoice: false },
+		}) satisfies Model<"openai-completions">;
+
+		expect(buildNamedToolChoice("todo", model, resolveOwnedDialectFromEnv("glm") !== undefined)).toEqual({
+			type: "function",
+			name: "todo",
+		});
 	});
 });
