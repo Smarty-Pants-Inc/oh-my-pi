@@ -17,17 +17,19 @@ are reported outside this tracked file to avoid a self-referential identity.
 | Upstream version | `18.0.11` |
 | Prior sync base / shared merge base | `4854db856c20e000a3760d793c56d78065dcf83f` |
 | Prior Smarty fork tip | `931a233d51ee528bf30ffc5b7aa93eece82c6295` |
-| Prior Smarty fork tree | `2309e9feb9db7b3728e157d683728a451290270f` |
+| Prior Smarty fork tree | `134ad2f82d86f5aef78cf819f31ccc1cd1c7759b` |
 | Accepted donor | `425752a78590b4720d15b901d611c0f7e98cc3ea` |
 | Donor tree | `134ad2f82d86f5aef78cf819f31ccc1cd1c7759b` |
 | Reconstruction bootstrap | `dc78eba4e50aaf64e7fce9c71075d6e2746e9ae7` |
 | Bootstrap tree | `2309e9feb9db7b3728e157d683728a451290270f` |
 
 The reconstruction branch is based directly on the frozen upstream commit. Its
-bootstrap snapshots the prior fork tip as a bounded behavior inventory, not as
-the final candidate; later commits reconstruct that inventory against the
-18.0.11 architecture, and final review compares the result directly with the
-frozen upstream tree. The branch contains no upstream-sync merge.
+bootstrap records the full pre-reconstruction candidate worktree, not a
+tree-equivalent snapshot of the prior fork tip or accepted donor; both of those
+provenance commits resolve to `134ad2f82d86f5aef78cf819f31ccc1cd1c7759b`.
+Later commits reconcile the bootstrap bytes against the 18.0.11 architecture,
+and final review compares the result directly with the frozen upstream tree.
+The branch contains no upstream-sync merge.
 
 ## Retained Smarty fork baseline
 
@@ -96,7 +98,7 @@ Their retained semantics are now repaired against the 18.0.11 shared runtime sea
 | Same-tree protected evidence | `context diff` could report identical roots and no changed paths while still classifying the unchanged generated prompt manifest as protected. | Parsed manifests are supplied only as semantic inputs; the independently computed changed-path input owns file classification. Equal manifests now produce no protected delta. | Same-tree Git regression in `protected-delta.test.ts` and exact source-candidate-to-topology `context diff`. |
 | CI-portable context evidence | Context-attribution tests read the operator's ambient global `AGENTS.md`, and native-free tests assumed the CI checkout contained `HEAD^` plus the frozen upstream object. | Tests provide exact isolated global source bytes and a local immutable parent commit. The native-free fixture fetches only the frozen upstream commit when its source checkout does not contain it, then executes the ledger refs unchanged; its local `HEAD^..HEAD` check asserts the intentional same-tree result. Production still requires global sources and immutable refs fail closed. | The attribution, native-free CLI, and clean-checkout files pass together without ambient home files or source-checkout parent history. |
 | Exact scope admission | Release candidates and approved policy bound commit/tree identity but not the exact base-to-candidate path set required by §8.6, §17.1, and §23.10. | Each combined-manifest candidate now binds its exact base commit/tree plus reviewed, sorted, unique `scopeCoverage` for every changed path. OMP accepts this map only as caller input, verifies the frozen upstream identity and exact Git diff, and rejects missing/extra paths, broad section labels, or dependencies that do not name a direct changed path in the same map. Activation and approved-policy parsing preserve and compare the same candidate record. | Focused manifest tests reject unknown, missing, duplicate, unsorted, non-equal, circular, self-referential, and non-direct coverage; approved-policy tests prove exact candidate preservation and mismatch detection. |
-| Interactive policy drift | Startup blocked all OMP use on approval drift, while the duplicate capability bridge consumed tool context and contradicted YOLO. | Interactive startup still emits `PROMPT_POLICY_REVIEW_REQUIRED` and continues so the Stack guard can retain a visible warning; offline checks remain strict. The duplicate capability bridge is removed instead of hidden behind discovery. | Approved-policy warning, built-in registry, prompt-manifest, and approval-mode tests. |
+| Interactive policy drift | Startup blocked all OMP use on approval drift, while the duplicate capability bridge consumed tool context and contradicted YOLO. | Interactive startup emits `PROMPT_POLICY_REVIEW_REQUIRED` and continues so the Stack guard can retain a visible warning; noninteractive startup and unrelated verification failures remain strict. Advisory loaders suppress only typed review-required drift. The duplicate capability bridge is removed instead of hidden behind discovery. | Launch-level warning/strictness, approved-policy classification, built-in registry, prompt-manifest, and approval-mode tests. |
 
 Upstream prompt changes to rewind reporting and browser close/kill ownership are
 preserved. New date/cwd and checkpoint sources are registered and generated,
@@ -122,6 +124,9 @@ only the retained Smarty behavior at current shared seams.
 ```sh
 git log --reverse --no-merges --format='%H %s' 4854db856c20e000a3760d793c56d78065dcf83f..425752a78590b4720d15b901d611c0f7e98cc3ea
 git log --cherry-pick --right-only eea5628f13043286e17c4a2ea4fc28b15fda33ca...425752a78590b4720d15b901d611c0f7e98cc3ea --no-merges
+git rev-parse 931a233d51ee528bf30ffc5b7aa93eece82c6295^{tree}
+git rev-parse 425752a78590b4720d15b901d611c0f7e98cc3ea^{tree}
+git rev-parse dc78eba4e50aaf64e7fce9c71075d6e2746e9ae7^{tree}
 git diff --name-only eea5628f13043286e17c4a2ea4fc28b15fda33ca..HEAD
 (cd packages/coding-agent && bun run gen:prompt-manifest:check)
 bun packages/coding-agent/src/cli.ts context manifest --json
