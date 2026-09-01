@@ -847,6 +847,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 	clearTransientSessionUi(): void {
 		this.#hideSessionInfo();
+		this.#uiHelpers.stopQueuedPromptEditing(false);
 		if (this.loadingAnimation) {
 			this.loadingAnimation.stop();
 			this.loadingAnimation = undefined;
