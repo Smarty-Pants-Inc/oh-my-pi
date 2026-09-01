@@ -105,6 +105,9 @@ impl GitRepo {
 			return Ok(());
 		}
 		let patches = parse_patch(patch_text).map_err(ApplyFailure::into_error)?;
+		if !options.cached {
+			validate_patch_worktree_paths(self, &patches, options.reverse)?;
+		}
 		let repo = self.gix()?;
 		let mut state = if options.cached {
 			index_map_at(&repo, options.index_path.as_deref())?
@@ -131,6 +134,10 @@ impl GitRepo {
 		let Ok(patches) = parse_patch(patch_text) else {
 			return Ok(false);
 		};
+		if !options.cached && validate_patch_worktree_paths(self, &patches, options.reverse).is_err()
+		{
+			return Ok(false);
+		}
 		let repo = self.gix()?.with_object_memory();
 		let mut state = if options.cached {
 			index_map_at(&repo, options.index_path.as_deref())?
@@ -213,6 +220,9 @@ impl GitRepo {
 
 	/// Cherry-pick one commit with a fail-clean three-way tree merge.
 	pub fn cherry_pick(&self, rev: &str) -> Result<()> {
+		if self.is_dirty()? {
+			return Err(Error::Conflict { paths: Vec::new() });
+		}
 		let repo = self.gix()?;
 		let picked_id = repo
 			.rev_parse_single(rev)
@@ -1287,6 +1297,7 @@ fn tracked_worktree_map(
 ) -> Result<BTreeMap<String, FileEntry>> {
 	let mut map = BTreeMap::new();
 	for (path, entry) in index {
+		validate_worktree_path(repo, path)?;
 		let absolute = repo.root().join(path);
 		if let Some((bytes, mode)) = read_worktree_entry(&absolute, entry.mode)? {
 			let id = gix_repo
@@ -1502,14 +1513,23 @@ fn write_worktree_entry(
 	entry: &FileEntry,
 	gix_repo: &gix::Repository,
 ) -> Result<()> {
-	validate_repo_path(path).map_err(ApplyFailure::into_error)?;
+	validate_worktree_path(repo, path)?;
 	let absolute = repo.root().join(path);
 	if let Some(parent) = absolute.parent() {
 		fs::create_dir_all(parent)?;
 	}
 	let bytes = blob_bytes(gix_repo, entry.id)?;
+	match fs::symlink_metadata(&absolute) {
+		Ok(metadata) if metadata.is_dir() => {
+			return Err(Error::PatchFailed {
+				message: format!("refusing to replace directory: {path}"),
+			});
+		},
+		Ok(_) => fs::remove_file(&absolute)?,
+		Err(err) if err.kind() == std::io::ErrorKind::NotFound => {},
+		Err(err) => return Err(err.into()),
+	}
 	if entry.mode == Mode::SYMLINK {
-		let _ = fs::remove_file(&absolute);
 		#[cfg(unix)]
 		{
 			use std::os::unix::{ffi::OsStrExt, fs::symlink};
@@ -1534,7 +1554,7 @@ fn write_worktree_entry(
 }
 
 fn remove_worktree_path(repo: &GitRepo, path: &str) -> Result<()> {
-	validate_repo_path(path).map_err(ApplyFailure::into_error)?;
+	validate_worktree_path(repo, path)?;
 	let absolute = repo.root().join(path);
 	match fs::remove_file(&absolute) {
 		Ok(()) => {},
@@ -1549,6 +1569,43 @@ fn remove_worktree_path(repo: &GitRepo, path: &str) -> Result<()> {
 		match fs::remove_dir(current) {
 			Ok(()) => directory = current.parent(),
 			Err(_) => break,
+		}
+	}
+	Ok(())
+}
+
+fn validate_patch_worktree_paths(
+	repo: &GitRepo,
+	patches: &[FilePatch],
+	reverse: bool,
+) -> Result<()> {
+	for patch in patches {
+		let (source, target, ..) = patch_sides(patch, reverse);
+		for path in [source, target].into_iter().flatten() {
+			validate_worktree_path(repo, path)?;
+		}
+	}
+	Ok(())
+}
+
+fn validate_worktree_path(repo: &GitRepo, path: &str) -> Result<()> {
+	validate_repo_path(path).map_err(ApplyFailure::into_error)?;
+	let relative = Path::new(path);
+	let mut current = repo.root().to_owned();
+	for component in relative
+		.components()
+		.take(relative.components().count().saturating_sub(1))
+	{
+		current.push(component);
+		match fs::symlink_metadata(&current) {
+			Ok(metadata) if metadata.file_type().is_symlink() => {
+				return Err(Error::PatchFailed {
+					message: format!("unsafe patch path through symlink: {path}"),
+				});
+			},
+			Ok(_) => {},
+			Err(err) if err.kind() == std::io::ErrorKind::NotFound => {},
+			Err(err) => return Err(err.into()),
 		}
 	}
 	Ok(())
@@ -2092,5 +2149,58 @@ mod tests {
 		assert!(repository.stash_try_pop(false).expect("pop second"));
 		assert_eq!(git(temp.path(), &["rev-parse", "refs/stash"]), first);
 		assert_eq!(fs::read(temp.path().join("file.txt")).expect("second restored"), b"second\n");
+	}
+
+	#[test]
+	fn release_blocker_cherry_pick_preserves_staged_data() {
+		let temp = init(&[("file.txt", b"base\n")]);
+		let base_branch = git(temp.path(), &["branch", "--show-current"])
+			.trim()
+			.to_owned();
+		git(temp.path(), &["checkout", "-qb", "topic"]);
+		fs::write(temp.path().join("file.txt"), b"topic\n").expect("topic edit");
+		git(temp.path(), &["commit", "-qam", "topic"]);
+		let topic = git(temp.path(), &["rev-parse", "HEAD"]);
+		git(temp.path(), &["checkout", "-q", &base_branch]);
+		fs::write(temp.path().join("unrelated.txt"), b"staged\n").expect("unrelated edit");
+		git(temp.path(), &["add", "unrelated.txt"]);
+		let before_head = git(temp.path(), &["rev-parse", "HEAD"]);
+		let before_index = fs::read(temp.path().join(".git/index")).expect("index before");
+		assert!(matches!(repo(temp.path()).cherry_pick(topic.trim()), Err(Error::Conflict { .. })));
+		assert_eq!(git(temp.path(), &["rev-parse", "HEAD"]), before_head);
+		assert_eq!(fs::read(temp.path().join(".git/index")).expect("index after"), before_index);
+		assert_eq!(git(temp.path(), &["show", ":unrelated.txt"]), "staged\n");
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn release_blocker_patch_rejects_symlink_ancestor() {
+		use std::os::unix::fs::symlink;
+
+		let temp = init(&[("file.txt", b"base\n")]);
+		fs::create_dir(temp.path().join("link")).expect("link directory");
+		fs::write(temp.path().join("link/escaped.txt"), b"escaped\n").expect("patch source");
+		let output = Command::new("git")
+			.current_dir(temp.path())
+			.args(["diff", "--no-index", "--", "/dev/null", "link/escaped.txt"])
+			.output()
+			.expect("generate patch");
+		assert_eq!(output.status.code(), Some(1));
+		let patch = String::from_utf8(output.stdout).expect("patch is UTF-8");
+		fs::remove_dir_all(temp.path().join("link")).expect("remove patch source");
+		let outside = tempfile::tempdir().expect("outside");
+		symlink(outside.path(), temp.path().join("link")).expect("link outside");
+		let repository = repo(temp.path());
+		assert!(
+			!repository
+				.can_apply_patch(&patch, &ApplyOptions::default())
+				.expect("check")
+		);
+		assert!(
+			repository
+				.apply_patch(&patch, &ApplyOptions::default())
+				.is_err()
+		);
+		assert!(!outside.path().join("escaped.txt").exists());
 	}
 }
