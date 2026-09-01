@@ -121,6 +121,7 @@ impl GitRepo {
 		if options.cached {
 			write_index_map_at(&repo, &state, options.index_path.as_deref())?;
 		} else {
+			validate_worktree_map_paths(self, &state)?;
 			write_patch_worktree(self, &patches, options.reverse, &state)?;
 		}
 		Ok(())
@@ -148,7 +149,13 @@ impl GitRepo {
 			augment_patch_sources(self, &repo, &mut state, &patches, options.reverse)?;
 		}
 		match apply_patches_to_map(&repo, &mut state, &patches, options) {
-			Ok(()) => Ok(true),
+			Ok(()) => {
+				if !options.cached && validate_worktree_map_paths(self, &state).is_err() {
+					Ok(false)
+				} else {
+					Ok(true)
+				}
+			},
 			Err(Error::PatchFailed { .. } | Error::Conflict { .. }) => Ok(false),
 			Err(err) => Err(err),
 		}
@@ -285,13 +292,32 @@ impl GitRepo {
 			.message_raw()
 			.map_err(|err| Error::backend("git cherry-pick message", err))?
 			.to_str_lossy();
-		repo
-			.commit_as(committer, author, "HEAD", message.as_ref(), merged_tree, [head_id])
+		let commit = repo
+			.new_commit_as(committer, author, message.as_ref(), merged_tree, [head_id])
 			.map_err(|err| Error::backend("git cherry-pick commit", err))?;
+		let new_id = commit.id;
 		let merged = tree_map(&repo, merged_tree)?;
 		let previous = index_map(&repo)?;
 		write_worktree_map(self, &previous, &merged)?;
-		write_index_map(&repo, &merged)
+		write_index_map(&repo, &merged)?;
+		repo
+			.edit_reference(gix::refs::transaction::RefEdit {
+				change: gix::refs::transaction::Change::Update {
+					log:      gix::refs::transaction::LogChange {
+						mode:                gix::refs::transaction::RefLog::AndReference,
+						force_create_reflog: false,
+						message:             "cherry-pick".into(),
+					},
+					expected: gix::refs::transaction::PreviousValue::MustExistAndMatch(head_id.into()),
+					new:      gix::refs::Target::Object(new_id),
+				},
+				name:   "HEAD"
+					.try_into()
+					.map_err(|err| Error::backend("git cherry-pick", err))?,
+				deref:  true,
+			})
+			.map_err(|err| Error::backend("git cherry-pick update HEAD", err))?;
+		Ok(())
 	}
 
 	/// Clear cherry-pick state; fail-clean single-commit picks create none.
@@ -1487,12 +1513,21 @@ fn write_patch_worktree(
 	}
 	Ok(())
 }
-
 fn write_worktree_map(
 	repo: &GitRepo,
 	previous: &BTreeMap<String, FileEntry>,
 	next: &BTreeMap<String, FileEntry>,
 ) -> Result<()> {
+	validate_worktree_map_paths(repo, next)?;
+	for (path, entry) in next {
+		if (previous.get(path) != Some(entry) || !repo.root().join(path).exists())
+			&& matches!(fs::symlink_metadata(repo.root().join(path)), Ok(metadata) if metadata.is_dir())
+		{
+			return Err(Error::PatchFailed {
+				message: format!("refusing to replace directory: {path}"),
+			});
+		}
+	}
 	let gix_repo = repo.gix()?;
 	for path in previous.keys() {
 		if !next.contains_key(path) {
@@ -1502,6 +1537,29 @@ fn write_worktree_map(
 	for (path, entry) in next {
 		if previous.get(path) != Some(entry) || !repo.root().join(path).exists() {
 			write_worktree_entry(repo, path, entry, &gix_repo)?;
+		}
+	}
+	Ok(())
+}
+
+fn validate_worktree_map_paths(repo: &GitRepo, map: &BTreeMap<String, FileEntry>) -> Result<()> {
+	for path in map.keys() {
+		validate_worktree_path(repo, path)?;
+		let mut prefix = String::new();
+		let components: Vec<_> = path.split('/').collect();
+		for component in components.iter().take(components.len().saturating_sub(1)) {
+			if !prefix.is_empty() {
+				prefix.push('/');
+			}
+			prefix.push_str(component);
+			if map
+				.get(&prefix)
+				.is_some_and(|entry| entry.mode == Mode::SYMLINK)
+			{
+				return Err(Error::PatchFailed {
+					message: format!("refusing path through symlink: {path}"),
+				});
+			}
 		}
 	}
 	Ok(())
@@ -1619,6 +1677,13 @@ fn validate_repo_path(path: &str) -> std::result::Result<(), ApplyFailure> {
 		}) || path.is_empty()
 	{
 		return Err(ApplyFailure::Invalid(format!("unsafe patch path: {path}")));
+	}
+	let options = gix::validate::path::component::Options::default();
+	for component in candidate.components() {
+		let name = gix::path::os_str_into_bstr(component.as_os_str())
+			.map_err(|err| ApplyFailure::Invalid(format!("unsafe patch path {path}: {err}")))?;
+		gix::validate::path::component(name, None, options)
+			.map_err(|err| ApplyFailure::Invalid(format!("unsafe patch path {path}: {err}")))?;
 	}
 	Ok(())
 }
@@ -2170,6 +2235,93 @@ mod tests {
 		assert_eq!(git(temp.path(), &["rev-parse", "HEAD"]), before_head);
 		assert_eq!(fs::read(temp.path().join(".git/index")).expect("index after"), before_index);
 		assert_eq!(git(temp.path(), &["show", ":unrelated.txt"]), "staged\n");
+	}
+
+	#[test]
+	fn release_blocker_cherry_pick_materialization_failure_is_fail_clean() {
+		let temp = init(&[("file.txt", b"base\n"), (".gitignore", b"collision/\n")]);
+		let base_branch = git(temp.path(), &["branch", "--show-current"]);
+		git(temp.path(), &["checkout", "-qb", "topic"]);
+		fs::write(temp.path().join("collision"), b"picked file\n").unwrap();
+		git(temp.path(), &["add", "collision"]);
+		git(temp.path(), &["commit", "-qm", "add collision file"]);
+		let topic = git(temp.path(), &["rev-parse", "HEAD"]);
+		git(temp.path(), &["checkout", "-q", base_branch.trim()]);
+		fs::create_dir(temp.path().join("collision")).unwrap();
+		fs::write(temp.path().join("collision/ignored"), b"keep\n").unwrap();
+		let before_head = git(temp.path(), &["rev-parse", "HEAD"]);
+		let before_index = fs::read(temp.path().join(".git/index")).unwrap();
+		assert!(repo(temp.path()).cherry_pick(topic.trim()).is_err());
+		assert_eq!(git(temp.path(), &["rev-parse", "HEAD"]), before_head);
+		assert_eq!(fs::read(temp.path().join(".git/index")).unwrap(), before_index);
+		assert_eq!(fs::read(temp.path().join("collision/ignored")).unwrap(), b"keep\n");
+	}
+
+	#[test]
+	fn release_blocker_patch_rejects_created_symlink_prefix_without_partial_apply() {
+		let temp = init(&[("file.txt", b"base\n")]);
+		let repository = repo(temp.path());
+		let patch = concat!(
+			"diff --git a/link b/link\n",
+			"new file mode 100644\n",
+			"--- /dev/null\n",
+			"+++ b/link\n",
+			"@@ -0,0 +1 @@\n",
+			"+placeholder\n",
+			"diff --git a/link b/link\n",
+			"old mode 100644\n",
+			"new mode 120000\n",
+			"--- a/link\n",
+			"+++ b/link\n",
+			"@@ -1 +1 @@\n",
+			"-placeholder\n",
+			"+outside\n",
+			"diff --git a/link/escaped b/link/escaped\n",
+			"new file mode 100644\n",
+			"--- /dev/null\n",
+			"+++ b/link/escaped\n",
+			"@@ -0,0 +1 @@\n",
+			"+escaped\n",
+		);
+		let before_index = fs::read(temp.path().join(".git/index")).unwrap();
+		assert!(
+			!repository
+				.can_apply_patch(patch, &ApplyOptions::default())
+				.unwrap()
+		);
+		assert!(!temp.path().join("link").exists());
+		assert!(
+			repository
+				.apply_patch(patch, &ApplyOptions::default())
+				.is_err()
+		);
+		assert!(!temp.path().join("link").exists());
+		assert_eq!(fs::read(temp.path().join(".git/index")).unwrap(), before_index);
+	}
+
+	#[test]
+	fn release_blocker_patch_rejects_git_metadata_path() {
+		let temp = init(&[("file.txt", b"base\n")]);
+		let repository = repo(temp.path());
+		let patch = concat!(
+			"diff --git a/.git/hooks/owned b/.git/hooks/owned\n",
+			"new file mode 100644\n",
+			"--- /dev/null\n",
+			"+++ b/.git/hooks/owned\n",
+			"@@ -0,0 +1 @@\n",
+			"+owned\n",
+		);
+		assert!(
+			!repository
+				.can_apply_patch(patch, &ApplyOptions::default())
+				.unwrap()
+		);
+		assert!(
+			repository
+				.apply_patch(patch, &ApplyOptions::default())
+				.is_err()
+		);
+		assert!(!temp.path().join(".git/hooks/owned").exists());
 	}
 
 	#[cfg(unix)]

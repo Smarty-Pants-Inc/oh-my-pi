@@ -121,7 +121,6 @@ impl GitRepo {
 	/// Create a commit and return its object id.
 	pub fn commit_create(&self, message: &str, options: &CommitOptions) -> Result<String> {
 		let repo = self.gix()?;
-		run_commit_hook(self, &repo, "pre-commit", &[])?;
 		let mut head = repo
 			.head()
 			.map_err(|err| Error::backend("git commit", err))?;
@@ -129,7 +128,16 @@ impl GitRepo {
 			.try_peel_to_id()
 			.map_err(|err| Error::backend("git commit", err))?
 			.map(|id| id.detach());
-		let index = load_index_or_head(&repo, "git commit")?;
+		let mut index = load_index_or_head(&repo, "git commit")?;
+		if index
+			.entries()
+			.iter()
+			.any(|entry| entry.stage() != gix::index::entry::Stage::Unconflicted)
+		{
+			return Err(Error::backend("git commit", "cannot commit with unmerged index entries"));
+		}
+		run_commit_hook(self, &repo, "pre-commit", &[])?;
+		index = load_index_or_head(&repo, "git commit")?;
 		if index
 			.entries()
 			.iter()
@@ -527,11 +535,24 @@ impl GitRepo {
 		if !linked.is_linked_worktree() || !force && linked.is_dirty()? {
 			return Ok(false);
 		}
-		let admin = linked.info().git_dir.clone();
-		fs::remove_dir_all(path)?;
-		if admin.starts_with(self.info().common_dir.join("worktrees")) {
-			fs::remove_dir_all(admin)?;
+		let canonical = |candidate: &Path| {
+			fs::canonicalize(candidate).unwrap_or_else(|_| normalize_path(candidate))
+		};
+		let requested_root = canonical(path);
+		let linked_root = canonical(linked.root());
+		let owner_common = canonical(&self.info().common_dir);
+		let linked_common = canonical(&linked.info().common_dir);
+		let admin = canonical(&linked.info().git_dir);
+		let owner_worktrees = owner_common.join("worktrees");
+		if requested_root != linked_root
+			|| linked_common != owner_common
+			|| !admin.starts_with(&owner_worktrees)
+			|| admin == owner_worktrees
+		{
+			return Ok(false);
 		}
+		fs::remove_dir_all(&linked_root)?;
+		fs::remove_dir_all(admin)?;
 		Ok(true)
 	}
 
@@ -1162,6 +1183,13 @@ fn ensure_no_symlink_ancestor(root: &Path, path: &Path, operation: &'static str)
 	}) {
 		return Err(Error::backend(operation, "path escapes worktree"));
 	}
+	let options = gix::validate::path::component::Options::default();
+	for component in relative.components() {
+		let name = gix::path::os_str_into_bstr(component.as_os_str())
+			.map_err(|err| Error::backend(operation, format!("unsafe worktree path: {err}")))?;
+		gix::validate::path::component(name, None, options)
+			.map_err(|err| Error::backend(operation, format!("unsafe worktree path: {err}")))?;
+	}
 	let mut current = root.to_owned();
 	for component in relative
 		.components()
@@ -1639,6 +1667,36 @@ mod tests {
 		);
 		assert_eq!(git(temp.path(), &["rev-parse", "HEAD"]), before);
 	}
+	#[cfg(unix)]
+	#[test]
+	fn release_blocker_unmerged_index_skips_pre_commit_hook() {
+		let (temp, repo) = fixture();
+		git(temp.path(), &["checkout", "-qb", "side"]);
+		fs::write(temp.path().join("a"), "side\n").unwrap();
+		git(temp.path(), &["commit", "-qam", "side"]);
+		git(temp.path(), &["checkout", "-q", "main"]);
+		fs::write(temp.path().join("a"), "main\n").unwrap();
+		git(temp.path(), &["commit", "-qam", "main"]);
+		let merge = Command::new("git")
+			.arg("-C")
+			.arg(temp.path())
+			.args(["merge", "side"])
+			.output()
+			.unwrap();
+		assert!(!merge.status.success());
+		write_hook(
+			&temp.path().join(".git/hooks/pre-commit"),
+			"git add a\necho ran > .git/hook-ran",
+			true,
+		);
+		assert!(
+			repo
+				.commit_create("must fail", &CommitOptions::default())
+				.is_err()
+		);
+		assert!(!temp.path().join(".git/hook-ran").exists());
+		assert!(!git(temp.path(), &["ls-files", "-u"]).is_empty());
+	}
 
 	#[test]
 	fn release_blocker_clean_honors_nested_and_configured_ignores() {
@@ -1696,6 +1754,14 @@ mod tests {
 			.unwrap();
 		assert_eq!(fs::read_to_string(&sentinel).unwrap(), "unchanged\n");
 		assert_eq!(fs::read_to_string(temp.path().join("a")).unwrap(), "one\n");
+		assert!(
+			ensure_no_symlink_ancestor(
+				temp.path(),
+				&temp.path().join(".git/hooks/owned"),
+				"git restore",
+			)
+			.is_err()
+		);
 	}
 
 	#[test]
@@ -1709,6 +1775,41 @@ mod tests {
 		assert!(!repo.worktree_remove(temp.path(), true).unwrap());
 		assert!(temp.path().join(".git").exists());
 		assert!(repo.worktree_remove(linked.path(), true).unwrap());
+	}
+	#[test]
+	fn release_blocker_worktree_remove_rejects_nested_root() {
+		let (temp, repo) = fixture();
+		let linked = tempfile::tempdir().unwrap();
+		repo.worktree_add(linked.path(), "main", true).unwrap();
+		fs::create_dir(linked.path().join("nested")).unwrap();
+		fs::write(linked.path().join("nested/file"), "keep\n").unwrap();
+		assert!(
+			!repo
+				.worktree_remove(&linked.path().join("nested"), true)
+				.unwrap()
+		);
+		assert!(linked.path().join("nested/file").exists());
+		assert!(
+			git(temp.path(), &["worktree", "list", "--porcelain"])
+				.contains(linked.path().to_string_lossy().as_ref())
+		);
+		assert!(repo.worktree_remove(linked.path(), true).unwrap());
+	}
+
+	#[test]
+	fn release_blocker_worktree_remove_rejects_foreign_common_dir() {
+		let (caller_temp, caller) = fixture();
+		let (owner_temp, owner) = fixture();
+		let linked = tempfile::tempdir().unwrap();
+		owner.worktree_add(linked.path(), "main", true).unwrap();
+		assert!(!caller.worktree_remove(linked.path(), true).unwrap());
+		assert!(linked.path().exists());
+		assert!(
+			git(owner_temp.path(), &["worktree", "list", "--porcelain"])
+				.contains(linked.path().to_string_lossy().as_ref())
+		);
+		assert!(owner.worktree_remove(linked.path(), true).unwrap());
+		drop(caller_temp);
 	}
 
 	#[cfg(unix)]
