@@ -1287,7 +1287,7 @@ describe("Qwen 3.8 local template effort ladder", () => {
 		expect(defaultSupportedEffort(floorDefault)).toBe(minimumSupportedEffort(floorDefault));
 	});
 
-	it("preserves an authored cached ladder and backfills mandatory thinking", () => {
+	it("preserves an authored cached ladder while keeping switchable Qwen optional", () => {
 		const cached = createModel({
 			id: "qwen3.8-27b",
 			api: "openai-completions",
@@ -1298,7 +1298,6 @@ describe("Qwen 3.8 local template effort ladder", () => {
 		expect(cached.thinking).toEqual({
 			mode: "effort",
 			efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High],
-			requiresEffort: true,
 		});
 	});
 

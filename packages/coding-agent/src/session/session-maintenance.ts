@@ -3363,11 +3363,12 @@ export class SessionMaintenance {
 							terminalTextAnswer,
 							suppressContinuation,
 						});
-					} else if (!suppressContinuation && this.#host.agent.hasQueuedMessages()) {
-						this.#host.scheduleAgentContinue({
-							source: "frame-rescue-queued-message",
-							delayMs: 100,
+					} else {
+						continuationScheduled = this.#host.scheduleCompactionContinuation({
 							generation,
+							autoContinue: false,
+							terminalTextAnswer,
+							suppressContinuation,
 						});
 					}
 					if (deadEndWarning) {

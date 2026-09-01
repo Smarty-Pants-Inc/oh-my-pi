@@ -683,11 +683,10 @@ describe("structured subagent primitive", () => {
 			preloadedPreparedExtensions: preparedExtensions,
 			preloadedCustomToolPaths: customToolPaths,
 		});
-		expect(options[1]?.restrictToolNames).toBe(false);
 		expect(options[1]?.extensionRoots?.()).toEqual(extensionRoots());
 		explicitRoot = "/plugins/explicit-after-spawn";
 		expect(options[1]?.extensionRoots?.().explicit).toEqual([explicitRoot]);
-		expect(options[2]).toMatchObject({ enableMCP: false });
+		expect(options[2]?.runtimeProfile?.capabilities.mcp).toBe(false);
 		expect(options[2]?.mcpManager).toBeUndefined();
 		expect(options[3]?.runtimeProfile).toMatchObject({
 			restrictToolNames: true,

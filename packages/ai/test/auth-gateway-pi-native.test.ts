@@ -521,6 +521,7 @@ describe("pi-native gateway cache controls", () => {
 		const storage = await AuthStorage.create(path.join(dir, "auth.db"));
 		storage.setRuntimeApiKey("openai", "provider-key");
 		let upstreamCalls = 0;
+		const approvalTtlMs = 1_000;
 		const upstream = Bun.serve({
 			hostname: "127.0.0.1",
 			port: 0,
@@ -561,7 +562,7 @@ describe("pi-native gateway cache controls", () => {
 			bearerTokens: ["gateway-token", "other-valid-token"],
 			storage,
 			resolveModel: () => providerModel,
-			boundaryApprovalTtlMs: 80,
+			boundaryApprovalTtlMs: approvalTtlMs,
 			version: "test",
 		});
 		const clientModel = {
@@ -683,7 +684,7 @@ describe("pi-native gateway cache controls", () => {
 				streamPiNative(clientModel, baseContext, {
 					apiKey: "gateway-token",
 					onPayload: async () => {
-						await Bun.sleep(120);
+						await Bun.sleep(approvalTtlMs + 200);
 					},
 				}).result(),
 			).rejects.toThrow(/expired/);

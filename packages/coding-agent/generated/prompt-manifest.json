@@ -67,19 +67,6 @@
       "sha256": "9d6a20b0668b445d53bae3588ec9a45f6739294007ff7e7e3620ec6047f84304"
     },
     {
-      "id": "advisor.mission-context",
-      "path": "packages/coding-agent/src/prompts/advisor/mission-context.md",
-      "role": "system",
-      "target": [
-        "side_model"
-      ],
-      "trigger": "side_request",
-      "visibility": "model",
-      "defaultEnabled": false,
-      "order": 850,
-      "sha256": "225f29edcf50c8214800b475f2d047f92ca57c9b0e04c511fa07d95677d3c66f"
-    },
-    {
       "id": "agent-creation-architect",
       "path": "packages/coding-agent/src/prompts/system/agent-creation-architect.md",
       "role": "system",
@@ -654,19 +641,6 @@
       "sha256": "b1dc585565919e3c1bf63bb2d8060e2214e6b9116da21c2a7346f5c771ca0699"
     },
     {
-      "id": "checkpoint-active-notice",
-      "path": "packages/coding-agent/src/prompts/system/checkpoint-active-notice.md",
-      "role": "system",
-      "target": [
-        "main"
-      ],
-      "trigger": "optional_mode",
-      "visibility": "model",
-      "defaultEnabled": false,
-      "order": 1440,
-      "sha256": "50f1139971de9abfa9d80a6a650001d675596f0d9e9517055f481ee5cb040550"
-    },
-    {
       "id": "ci-green-request",
       "path": "packages/coding-agent/src/prompts/ci-green-request.md",
       "role": "internal_context",
@@ -951,19 +925,6 @@
       "defaultEnabled": false,
       "order": 1460,
       "sha256": "6b5f31e7937ca7c769a6a5007de475ab250e67e7d2920357da1e62f6bd61475a"
-    },
-    {
-      "id": "date-cwd-reminder",
-      "path": "packages/coding-agent/src/prompts/system/date-cwd-reminder.md",
-      "role": "system",
-      "target": [
-        "main"
-      ],
-      "trigger": "recovery",
-      "visibility": "model",
-      "defaultEnabled": false,
-      "order": 1480,
-      "sha256": "624bf012a8960a5546eb5b555e63221a87612a3dcd608f84976c66ab48a92769"
     },
     {
       "id": "discovery.builtin-rules.go-add-cleanup",
@@ -1445,6 +1406,19 @@
       "defaultEnabled": false,
       "order": 490,
       "sha256": "4b9e4f20010345fbaccb3f0ef7f9325465b8e6777bf3a0918d156b247cc16207"
+    },
+    {
+      "id": "goal.advisor_mission",
+      "path": "packages/coding-agent/src/prompts/advisor/mission-context.md",
+      "role": "internal_context",
+      "target": [
+        "side_model"
+      ],
+      "trigger": "goal_updated",
+      "visibility": "model",
+      "defaultEnabled": false,
+      "order": 995,
+      "sha256": "225f29edcf50c8214800b475f2d047f92ca57c9b0e04c511fa07d95677d3c66f"
     },
     {
       "id": "goal.budget_limited",
@@ -2336,11 +2310,11 @@
     {
       "id": "subagent-user-prompt",
       "path": "packages/coding-agent/src/prompts/system/subagent-user-prompt.md",
-      "role": "system",
+      "role": "internal_context",
       "target": [
         "subagent"
       ],
-      "trigger": "optional_mode",
+      "trigger": "subagent_start",
       "visibility": "model",
       "defaultEnabled": false,
       "order": 1920,
@@ -2349,7 +2323,7 @@
     {
       "id": "subagent.base",
       "path": "packages/coding-agent/src/prompts/system/subagent-system-prompt.md",
-      "role": "system",
+      "role": "internal_context",
       "target": [
         "subagent"
       ],
@@ -2373,6 +2347,20 @@
       "sha256": "97510849683321dd1da5d3c265c669b7f92a6936630e063d5ff3a1735a07256a"
     },
     {
+      "id": "system.checkpoint-active-notice",
+      "path": "packages/coding-agent/src/prompts/system/checkpoint-active-notice.md",
+      "role": "internal_context",
+      "target": [
+        "main",
+        "subagent"
+      ],
+      "trigger": "checkpoint_active",
+      "visibility": "model",
+      "defaultEnabled": false,
+      "order": 1310,
+      "sha256": "50f1139971de9abfa9d80a6a650001d675596f0d9e9517055f481ee5cb040550"
+    },
+    {
       "id": "system.custom",
       "path": "packages/coding-agent/src/prompts/system/custom-system-prompt.md",
       "role": "system",
@@ -2384,6 +2372,21 @@
       "defaultEnabled": false,
       "order": 1470,
       "sha256": "91848b90b637eb1ced960813e256e676ac245718afd8f6f5c8083fe6e406d1cc"
+    },
+    {
+      "id": "system.date-cwd-reminder",
+      "path": "packages/coding-agent/src/prompts/system/date-cwd-reminder.md",
+      "role": "internal_context",
+      "target": [
+        "main",
+        "subagent",
+        "side_model"
+      ],
+      "trigger": "provider_request",
+      "visibility": "model",
+      "defaultEnabled": false,
+      "order": 1350,
+      "sha256": "624bf012a8960a5546eb5b555e63221a87612a3dcd608f84976c66ab48a92769"
     },
     {
       "id": "system.project_context",
@@ -5423,7 +5426,7 @@
     },
     {
       "path": "packages/ai/src/providers/openai-responses.ts",
-      "sha256": "4cf042a86645c6deec535136880971214674ecebfdb445aab5d5874c4c99dbea"
+      "sha256": "5e733df3774d3f5b02ff2f9c0544b5350f2b422d2fe81e68c7eb3ca13baacb82"
     },
     {
       "path": "packages/ai/src/providers/openai-shared.ts",
@@ -6798,6 +6801,10 @@
       "sha256": "404e490966bd28037121542fd673c8ccfe5ae933014e323d9e389bab50cc96ef"
     },
     {
+      "path": "packages/coding-agent/src/cli/git-tui/ai-stage.ts",
+      "sha256": "960fe2e979cabd0c3e86e3e6c206fdb4627607d69126974148a81aead4c2821e"
+    },
+    {
       "path": "packages/coding-agent/src/cli/initial-message.ts",
       "sha256": "0b3d1a8d2be5c7e5f040a5c2b92e093be3eaaf57027c09eab748b82a8e169f26"
     },
@@ -6847,7 +6854,7 @@
     },
     {
       "path": "packages/coding-agent/src/collab/guest.ts",
-      "sha256": "5fbd95fc1c814e0eec152ef21211f1411197f215b15169a96d31c556b0a1f621"
+      "sha256": "c4f2aaa28c2445bf046c8afb786542909fdfdb15c9fd02db4f275be0b9a2c1bf"
     },
     {
       "path": "packages/coding-agent/src/collab/herdr-bridge-bootstrap.ts",
@@ -7067,7 +7074,7 @@
     },
     {
       "path": "packages/coding-agent/src/commit/conventional/inference.ts",
-      "sha256": "c2eb469369400b76f9b94469a6b8f24d6245d04c9072a3a703d90a3773776a1f"
+      "sha256": "c17973d5855aa024c422357924f84a97f1f133b52a93fc115b89a2b034f10670"
     },
     {
       "path": "packages/coding-agent/src/commit/conventional/map-reduce.ts",
@@ -7103,7 +7110,7 @@
     },
     {
       "path": "packages/coding-agent/src/commit/conventional/service.ts",
-      "sha256": "09a862e998b3b71c8fe2ba5f6506490dae40527aa48f7a62667de65a37c1bc00"
+      "sha256": "7ac2510565c7a543e31c4ef8f34c3a6e59784bd25f43b655a1cb0022ea97f329"
     },
     {
       "path": "packages/coding-agent/src/commit/conventional/text.ts",
@@ -7207,7 +7214,7 @@
     },
     {
       "path": "packages/coding-agent/src/config/model-registry.ts",
-      "sha256": "6464930fb5e1c29d5426eae94dd65a2f9c81b4f8283d16697cbc23368cc01f54"
+      "sha256": "7fd32f746036204c71836f8e5fb4b330d75b71b8b745341591b86a4368f762f2"
     },
     {
       "path": "packages/coding-agent/src/config/model-resolver.ts",
@@ -7263,7 +7270,7 @@
     },
     {
       "path": "packages/coding-agent/src/context/implementation-sources.ts",
-      "sha256": "56d2d174c33ec4bca0e0d56c536ac582c0c618bcda766d164429b0ea37ae1b70"
+      "sha256": "5305975a850b42d802a86c922c9d5b9e774e944ab9603a48fc48af82e6707066"
     },
     {
       "path": "packages/coding-agent/src/context/internal-session.ts",
@@ -7271,7 +7278,7 @@
     },
     {
       "path": "packages/coding-agent/src/context/manifest.ts",
-      "sha256": "aba3e773b6c2eff4f49110d883790589ac955cc09e08fb6acee6a604915ec2f8"
+      "sha256": "3fca5a1fbccd0211bf81df28147a2285b92de07d6c027c9a6a91a5c1f42bc524"
     },
     {
       "path": "packages/coding-agent/src/context/prompt-sources.generated.ts",
@@ -8683,7 +8690,7 @@
     },
     {
       "path": "packages/coding-agent/src/modes/interactive-mode.ts",
-      "sha256": "bb8dc78b6bb4781a903e04843328c692cf54135724fec22f8d78364957f80d50"
+      "sha256": "930230d93451d5478830839ba002e11de47c668beb3d43c2bbe237b5bd107dcc"
     },
     {
       "path": "packages/coding-agent/src/modes/loop-limit.ts",
@@ -8815,7 +8822,7 @@
     },
     {
       "path": "packages/coding-agent/src/prompt-registry.yml",
-      "sha256": "566b165c4f144db1caedd4a4586886ecddfe2df1736b945c995cb174c561b7e2"
+      "sha256": "e8a19746383ffb7821d79d481fe4ab8fbe9eddb2efc79003564c461ead800b06"
     },
     {
       "path": "packages/coding-agent/src/registry/agent-lifecycle.ts",
@@ -8935,7 +8942,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/agent-session.ts",
-      "sha256": "4fdc110a3fad038fb3829857e927d98de1bedba7d879ed06236a46e565519c04"
+      "sha256": "e4d22c6854da77d1acaa2f0c42772b2f169eb7222f780cbf412fcebc77f7b1e9"
     },
     {
       "path": "packages/coding-agent/src/session/agent-storage.ts",
@@ -8947,7 +8954,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/artifacts.ts",
-      "sha256": "48a0cf678e2726984ba78b6cdd1356270345bb339dfa2508c9066e1cddab49de"
+      "sha256": "894346ec07c43cdaff1d79c1689b9a60cfe62c84570b782b0682b8de09b67854"
     },
     {
       "path": "packages/coding-agent/src/session/async-job-delivery.ts",
@@ -9071,7 +9078,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/session-advisors.ts",
-      "sha256": "11f5fd2bcf6f73015c04bc89e6579bb4f3653c6e63dd01d07fcf95ce92c69f19"
+      "sha256": "87a119488082a2e14ee1fac9189e97bb3b7d32ad1b69effb7e961b708f5c69d5"
     },
     {
       "path": "packages/coding-agent/src/session/session-context.ts",
@@ -9111,7 +9118,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/session-maintenance.ts",
-      "sha256": "857aa23d627e2df00be120906876755849abf7d90114ec4e0af7497185186a7b"
+      "sha256": "b3808e23e0a32a85e486ba10075338dd9bc2bb9953289c641415c1465246d7b9"
     },
     {
       "path": "packages/coding-agent/src/session/session-manager.ts",
@@ -11287,5 +11294,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "1792a7d85a0868b459a9c3307e30dbce5e1d4018147b0fb58dcc1e02de3ac4f8"
+  "rootSha256": "618e6473e6b506da66f91d874ef12151e911a8248a28bdb1f086bfd19945016f"
 }

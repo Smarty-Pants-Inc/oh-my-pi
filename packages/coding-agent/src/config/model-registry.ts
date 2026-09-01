@@ -924,11 +924,15 @@ export class ModelRegistry {
 	}
 
 	#resolveStartupModelCacheProviderId(providerId: string): string {
+		const runtimeOverride = this.#runtimeProviderOverrides.get(providerId);
+		const configuredOverride = this.#providerOverrides.get(providerId);
 		const baseUrl =
-			this.#runtimeProviderOverrides.get(providerId)?.baseUrl ??
-			this.#providerOverrides.get(providerId)?.baseUrl ??
+			runtimeOverride?.baseUrl ??
+			configuredOverride?.baseUrl ??
 			(this.#hasFullSnapshot ? this.getProviderBaseUrl(providerId) : undefined);
-		return resolveModelCacheProviderId(providerId, { baseUrl });
+		const rawCompat = runtimeOverride?.compat ?? configuredOverride?.compat;
+		const compat = rawCompat && "qwenTemplateReasoningEffort" in rawCompat ? rawCompat : undefined;
+		return resolveModelCacheProviderId(providerId, { baseUrl, compat });
 	}
 
 	#loadCachedStandardProviderModels(providerIds: readonly string[]): {
@@ -1513,9 +1517,6 @@ export class ModelRegistry {
 			return resolveOllamaModelCacheProviderId(providerConfig.provider, providerConfig.baseUrl);
 		}
 		if (providerConfig.discovery.type === "openai-models-list") {
-			// context-v4 keeps the v3 input-modality and bare-URL split while
-			// invalidating rows cached before backend ownership and centralized KDL
-			// policy were projected into Qwen dialect compatibility.
 			return providerConfig.discovery.injectV1 === false
 				? `${providerConfig.provider}:openai-models-list-bare-context-v4`
 				: `${providerConfig.provider}:openai-models-list-context-v4`;
@@ -1841,10 +1842,15 @@ export class ModelRegistry {
 				hasExplicitVllmConfig ||
 				canUseSharedCatalogWithoutAuth
 			) {
+				const rawCompat =
+					this.#runtimeProviderOverrides.get(descriptor.providerId)?.compat ??
+					this.#providerOverrides.get(descriptor.providerId)?.compat;
+				const compat = rawCompat && "qwenTemplateReasoningEffort" in rawCompat ? rawCompat : undefined;
 				const discoveryConfig = {
 					apiKey: isDiscoveryBearerApiKey(apiKey) ? apiKey : undefined,
 					baseUrl: this.#descriptorBaseUrl(descriptor.providerId),
 					fetch: this.#fetch,
+					compat,
 				};
 				const preparedConfig =
 					getProviderDefinition(descriptor.providerId)?.prepareModelDiscovery?.(discoveryConfig) ??

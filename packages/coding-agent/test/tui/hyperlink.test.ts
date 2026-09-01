@@ -30,9 +30,6 @@ const ORIGINAL_NO_COLOR = Bun.env.NO_COLOR;
 const ORIGINAL_HERDR_ENV = Bun.env.HERDR_ENV;
 const ORIGINAL_PI_NO_HYPERLINKS = Bun.env.PI_NO_HYPERLINKS;
 const ORIGINAL_PI_FORCE_HYPERLINKS = Bun.env.PI_FORCE_HYPERLINKS;
-// Detected OSC 8 capability, captured at import before any test mutates the
-// runtime flag.
-const DETECTED_HYPERLINKS = terminalCaps.TERMINAL.hyperlinks;
 
 /** Extract the hyperlink URI from a wrapped string. Returns undefined if not wrapped. */
 function extractLinkUri(text: string): string | undefined {
@@ -137,14 +134,15 @@ describe("isHyperlinkEnabled", () => {
 		delete Bun.env.NO_COLOR;
 		const origTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
 		const origHyperlinks = terminalCaps.TERMINAL.hyperlinks;
+		const detectedHyperlinks = terminalCaps.shouldEnableHyperlinks("auto", Bun.env, terminalCaps.TERMINAL.id, true);
 		try {
 			Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
-			// auto mirrors the capability detected at import...
-			expect(isHyperlinkEnabled()).toBe(DETECTED_HYPERLINKS);
+			// Auto mirrors the capability policy resolved before runtime mutation.
+			expect(isHyperlinkEnabled()).toBe(detectedHyperlinks);
 			// ...and a prior always/off application that flipped the runtime flag
 			// must not poison it (regression: #10196 review).
-			terminalCaps.setTerminalHyperlinks(!DETECTED_HYPERLINKS);
-			expect(isHyperlinkEnabled()).toBe(DETECTED_HYPERLINKS);
+			terminalCaps.setTerminalHyperlinks(!detectedHyperlinks);
+			expect(isHyperlinkEnabled()).toBe(detectedHyperlinks);
 		} finally {
 			terminalCaps.setTerminalHyperlinks(origHyperlinks);
 			if (origTTY) {

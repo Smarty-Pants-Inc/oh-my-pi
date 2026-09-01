@@ -1121,6 +1121,7 @@ function applyOpenAIResponsesPromptCachePolicy(
 		return;
 	}
 
+	delete params.prompt_cache_retention;
 	const mode = promptCache?.mode ?? "implicit";
 	params.prompt_cache_options = {
 		mode,

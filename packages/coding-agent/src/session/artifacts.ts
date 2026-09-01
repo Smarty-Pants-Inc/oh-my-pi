@@ -287,7 +287,15 @@ export class ArtifactManager {
 			path: artifactPath,
 			reservation,
 			settled: settled.promise,
-			write: content => handle.writeFile(content),
+			write: async content => {
+				const expectedBytes = Buffer.byteLength(content);
+				await handle.writeFile(content);
+				const { size } = await handle.stat();
+				if (size !== expectedBytes) {
+					throw new Error(`Artifact size mismatch: found ${size} of ${expectedBytes} bytes`);
+				}
+				await Bun.file(artifactPath).slice(0, Math.min(expectedBytes, 1)).arrayBuffer();
+			},
 			release: () => {
 				if (released) return;
 				released = true;

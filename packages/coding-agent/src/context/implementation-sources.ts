@@ -321,6 +321,7 @@ export const IMPLEMENTATION_SOURCE_GLOBS = [
 	"packages/coding-agent/src/cli/setup-cli.ts",
 	"packages/coding-agent/src/cli/ssh-cli.ts",
 	"packages/coding-agent/src/cli/usage-cli.ts",
+	"packages/coding-agent/src/cli/git-tui/ai-stage.ts",
 	"packages/coding-agent/src/collab/host.ts",
 	"packages/coding-agent/src/commit/agentic/agent.ts",
 	"packages/coding-agent/src/commit/agentic/tools/**/*.ts",

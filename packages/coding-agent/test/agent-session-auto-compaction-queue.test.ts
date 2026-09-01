@@ -577,6 +577,11 @@ describe("AgentSession auto-compaction queue resume", () => {
 				timestamp: Date.now(),
 			});
 			session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+			const delayedContinuation =
+				mutation === "now" && compaction === "automatic" ? Promise.withResolvers<void>() : undefined;
+			if (delayedContinuation) {
+				vi.spyOn(scheduler, "wait").mockImplementation(async () => delayedContinuation.promise);
+			}
 
 			const gate = Promise.withResolvers<void>();
 			(globalThis as typeof globalThis & { __ompManualCompactGate?: Promise<void> }).__ompManualCompactGate =
@@ -626,7 +631,11 @@ describe("AgentSession auto-compaction queue resume", () => {
 				gate.resolve();
 				await compactPromise;
 				await expect(operation).resolves.toEqual({ status: "updated" });
-				if (mutation === "now") await session.waitForIdle();
+				if (mutation === "now") {
+					delayedContinuation?.resolve();
+					await Promise.resolve();
+					await session.waitForIdle();
+				}
 
 				const prompts = session.getQueuedPrompts();
 				if (mutation === "now") {
@@ -644,6 +653,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 					expect(prompts).toEqual([]);
 				}
 			} finally {
+				delayedContinuation?.resolve();
 				gate.resolve();
 				await compactPromise;
 				session.agent.state.isStreaming = false;

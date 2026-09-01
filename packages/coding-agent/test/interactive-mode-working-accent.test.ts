@@ -117,7 +117,7 @@ describe("InteractiveMode working-message session accent cache", () => {
 		const { mode } = await createHarness("Live status");
 		const transcriptLength = mode.chatContainer.children.length;
 
-		expect(renderLoader(mode)).toBe("");
+		expect(Bun.stripANSI(renderLoader(mode))).toContain("Live status");
 		startStableLoader(mode);
 		expect(Bun.stripANSI(renderLoader(mode))).toContain("Working");
 		expect(mode.chatContainer.children).toHaveLength(transcriptLength);
@@ -129,7 +129,7 @@ describe("InteractiveMode working-message session accent cache", () => {
 		expect(mode.chatContainer.children).toHaveLength(transcriptLength);
 
 		mode.statusContainer.disposeChildren();
-		expect(renderLoader(mode)).toBe("");
+		expect(Bun.stripANSI(renderLoader(mode))).toContain("Live status");
 		expect(mode.chatContainer.children).toHaveLength(transcriptLength);
 	});
 

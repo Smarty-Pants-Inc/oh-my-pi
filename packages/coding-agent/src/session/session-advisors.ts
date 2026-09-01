@@ -367,6 +367,8 @@ export class SessionAdvisors {
 		this.#advisorStreamFn = options.streamFn;
 		this.#completeWithAdvisorStream = createCompleteFnFromStreamFn(options.streamFn ?? streamSimple);
 		this.#transformProviderContext = options.transformProviderContext;
+		this.#host.agent.addBeforeInputHook(messages => this.retainPrimaryInput(messages));
+		this.retainPrimaryInput(this.#host.agent.state.messages);
 		if (this.#advisorEnabled) this.#buildAdvisorRuntime();
 	}
 

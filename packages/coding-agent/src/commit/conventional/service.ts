@@ -6,6 +6,7 @@ import { getCommitCacheDbPath } from "@oh-my-pi/pi-utils";
 import { ModelRegistry } from "../../config/model-registry";
 import { Settings } from "../../config/settings";
 import { discoverAuthStorage, loadCliExtensionProviders } from "../../sdk";
+import { resolveSettingsCacheRetention } from "../../session/settings-stream-fn";
 import { resolvePrimaryModel, resolveSmolModel } from "../model-selection";
 import type { ConventionalCommit } from "../types";
 import { CommitInferenceCache } from "./cache";
@@ -121,6 +122,7 @@ async function createOmpInference(
 			config,
 			cache,
 			authStorage,
+			cacheRetention: resolveSettingsCacheRetention(settings),
 			onProgress: options.onProgress,
 			signal: options.signal,
 		});

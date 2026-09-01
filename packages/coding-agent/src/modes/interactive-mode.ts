@@ -217,7 +217,11 @@ import {
 } from "./loop-limit";
 import { OAuthManualInputManager } from "./oauth-manual-input";
 import { getRunningSubagentBadgeAgentIds, getRunningSubagentBadgeRegistry } from "./running-subagent-badge";
-import { type ObservableSession, SessionObserverRegistry } from "./session-observer-registry";
+import {
+	type ObservableSession,
+	type SessionObserverChangeKind,
+	SessionObserverRegistry,
+} from "./session-observer-registry";
 import { createSessionTeardown, type SessionTeardown } from "./session-teardown";
 import { runProviderSetupWizard } from "./setup-wizard/lazy";
 import { sanitizeStatusText } from "./shared";
@@ -661,6 +665,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	#nextAppearanceRequestToken = 1;
 	#appearanceRefreshRequest: { token: TerminalAppearanceRequestToken; deadline: number } | undefined;
 	todoPhases: TodoPhase[] = [];
+	/** Session that owns the plan currently rendered in {@link todoPhases}. */
+	#todoPhasesOwner?: AgentSession;
 	hideThinkingBlock = false;
 	#sessionsWithDisplayableThinkingContent = new WeakSet<AgentSession>();
 	/** Whether the visible session has produced thinking content the user can reveal. */
@@ -880,6 +886,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	#subagentEventBus?: EventBus;
 	#eventBusUnsubscribers: Array<() => void> = [];
 	#observerUiSyncTimer?: NodeJS.Timeout;
+	#observerUiSyncNeedsTodoReconcile = false;
 	#agentRegistryUnsubscribe?: () => void;
 	#agentRegistrySubscriptionTarget?: AgentRegistry;
 	#mcpStatusOrder: string[] = [];
@@ -1297,8 +1304,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 		this.#observerRegistry.setMainSession(this.sessionManager.getSessionFile() ?? undefined);
 		this.syncRunningSubagentBadge();
-		this.#observerRegistry.onChange(() => {
-			this.#scheduleObserverUiSync();
+		this.#observerRegistry.onChange(kind => {
+			this.#scheduleObserverUiSync(kind);
 		});
 		// Let the transient todo tool result light up pending todos executed by a
 		// live subagent, matching the sticky HUD's active set (#5873).
@@ -2387,6 +2394,40 @@ export class InteractiveMode implements InteractiveModeContext {
 		return out;
 	}
 
+	/** Reconcile completed nested work only into a focused worker's visible plan. */
+	#reconcileTodosWithSubagents(): void {
+		const owner = this.#todoPhasesOwner ?? this.session;
+		// The main session owns its canonical todo transitions. This UI helper is
+		// only for a focused worker whose nested child has completed.
+		if (owner === this.session) return;
+		const completedDescriptions: string[] = [];
+		for (const session of this.#observerRegistry.getSessions()) {
+			if (session.kind !== "subagent" || session.status !== "completed") continue;
+			const description =
+				session.description?.trim() || session.progress?.description?.trim() || session.label?.trim();
+			if (description) completedDescriptions.push(description);
+		}
+		if (completedDescriptions.length === 0) return;
+
+		let mutated = false;
+		const next: TodoPhase[] = this.todoPhases.map(phase => ({
+			name: phase.name,
+			tasks: phase.tasks.map(task => {
+				if (task.status !== "pending" && task.status !== "in_progress" && task.status !== "blocked") return task;
+				if (!todoMatchesAnyDescription(task.content, completedDescriptions)) return task;
+				mutated = true;
+				return { content: task.content, status: "completed" as const };
+			}),
+		}));
+		if (!mutated) return;
+
+		owner.setTodoPhases(next);
+		this.todoPhases = next;
+		this.#syncTodoAutoClearTimer();
+		this.#renderTodoList();
+		this.ui.requestRender();
+	}
+
 	#cancelTodoAutoClearTimer(): void {
 		if (!this.#todoAutoClearTimer) return;
 		clearTimeout(this.#todoAutoClearTimer);
@@ -2476,7 +2517,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		return active ?? nonEmpty[nonEmpty.length - 1];
 	}
 
-	#scheduleObserverUiSync(): void {
+	#scheduleObserverUiSync(kind: SessionObserverChangeKind): void {
+		if (kind === "lifecycle") this.#observerUiSyncNeedsTodoReconcile = true;
 		if (this.#observerUiSyncTimer) return;
 		this.#observerUiSyncTimer = setTimeout(() => {
 			this.#observerUiSyncTimer = undefined;
@@ -2487,6 +2529,10 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	#flushObserverUiSync(): void {
 		this.syncRunningSubagentBadge({ requestRender: false });
+		if (this.#observerUiSyncNeedsTodoReconcile) {
+			this.#observerUiSyncNeedsTodoReconcile = false;
+			this.#reconcileTodosWithSubagents();
+		}
 		this.#syncTodoAutoClearTimer();
 		this.#renderTodoList();
 		this.#renderSubagentList();
@@ -2498,6 +2544,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			clearTimeout(this.#observerUiSyncTimer);
 			this.#observerUiSyncTimer = undefined;
 		}
+		this.#observerUiSyncNeedsTodoReconcile = false;
 	}
 
 	#renderTodoList(): void {
@@ -2695,6 +2742,7 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	async #loadTodoList(source: AgentSession = this.session): Promise<void> {
 		this.todoPhases = source.getTodoPhases();
+		this.#todoPhasesOwner = source;
 		this.#syncTodoAutoClearTimer();
 		this.#renderTodoList();
 	}
@@ -5826,6 +5874,7 @@ export class InteractiveMode implements InteractiveModeContext {
 				},
 			];
 		}
+		this.#todoPhasesOwner = this.viewSession;
 		this.#syncTodoAutoClearTimer();
 		this.#renderTodoList();
 		this.ui.requestRender();

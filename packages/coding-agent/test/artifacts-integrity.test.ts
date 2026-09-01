@@ -19,13 +19,24 @@ describe("ArtifactManager write integrity", () => {
 		for (const dir of dirs.splice(0)) removeSyncWithRetries(dir);
 	});
 
-	it("rejects a short write instead of publishing an unreadable artifact id", async () => {
+	it("rejects a short reserved write instead of publishing an unreadable artifact id", async () => {
 		const manager = new ArtifactManager(freshDir());
-		vi.spyOn(Bun, "write").mockResolvedValue(1);
+		const realOpen = fs.open.bind(fs);
+		vi.spyOn(fs, "open").mockImplementation(async (target, flags, mode) => {
+			const handle = await realOpen(target, flags, mode);
+			if (String(target).endsWith(".task.log")) {
+				const realWriteFile = handle.writeFile.bind(handle);
+				vi.spyOn(handle, "writeFile").mockImplementation(async () => {
+					await realWriteFile("x");
+				});
+			}
+			return handle;
+		});
 
 		await expect(manager.save("complete report", "task")).rejects.toThrow(
-			"Artifact write incomplete: wrote 1 of 15 bytes",
+			"Artifact size mismatch: found 1 of 15 bytes",
 		);
+		expect(await manager.listFiles()).toEqual([]);
 	});
 
 	it("leaves no discoverable file when the staged write falls short", async () => {

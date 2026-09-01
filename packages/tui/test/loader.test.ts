@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, setSystemTime, spyOn, vi } from "bun:test";
 import { Container, TUI } from "@oh-my-pi/pi-tui";
-import { Loader, type LoaderMessageColorFn } from "@oh-my-pi/pi-tui/components/loader";
+import { Loader, type LoaderMessageColorFn, SPINNER_ADVANCE_MS } from "@oh-my-pi/pi-tui/components/loader";
 import { visibleWidth } from "@oh-my-pi/pi-tui/utils";
 import { VirtualTerminal } from "./virtual-terminal";
 
@@ -173,10 +173,10 @@ describe("Loader component", () => {
 
 		expect(ui.requestComponentRender).toHaveBeenCalledTimes(1);
 		lastFrameCostMs = 40;
-		vi.advanceTimersByTime(80);
+		vi.advanceTimersByTime(Math.ceil(SPINNER_ADVANCE_MS));
 		expect(ui.requestComponentRender).toHaveBeenCalledTimes(2);
 
-		vi.advanceTimersByTime(359);
+		vi.advanceTimersByTime(358);
 		expect(ui.requestComponentRender).toHaveBeenCalledTimes(2);
 		vi.advanceTimersByTime(1);
 		expect(ui.requestComponentRender).toHaveBeenCalledTimes(3);
@@ -200,10 +200,10 @@ describe("Loader component", () => {
 		);
 
 		expect(ui.requestComponentRender).toHaveBeenCalledTimes(1);
-		vi.advanceTimersByTime(80);
+		vi.advanceTimersByTime(Math.ceil(SPINNER_ADVANCE_MS));
 		expect(ui.requestComponentRender).toHaveBeenCalledTimes(2);
 
-		vi.advanceTimersByTime(1_799);
+		vi.advanceTimersByTime(1_798);
 		expect(ui.requestComponentRender).toHaveBeenCalledTimes(2);
 		vi.advanceTimersByTime(1);
 		expect(ui.requestComponentRender).toHaveBeenCalledTimes(3);
@@ -348,6 +348,8 @@ describe("Loader component", () => {
 		vi.useFakeTimers();
 		const ui = { requestDirectWrite: vi.fn(), requestComponentRender: vi.fn() };
 		let step = 0;
+		let now = 0;
+		spyOn(performance, "now").mockImplementation(() => now);
 		const loader = new Loader(
 			ui as unknown as TUI,
 			t => t,
@@ -364,7 +366,8 @@ describe("Loader component", () => {
 		step = 1;
 		expect(loader.render(20).join("\n")).toContain("step 0");
 
-		vi.advanceTimersByTime(80); // first spinner advance re-evaluates the fn
+		now = SPINNER_ADVANCE_MS;
+		vi.advanceTimersByTime(Math.ceil(SPINNER_ADVANCE_MS)); // first spinner advance re-evaluates the fn
 		expect(loader.render(20).join("\n")).toContain("step 1");
 		expect(loader.render(20).join("\n")).not.toContain("step 0");
 

@@ -496,6 +496,7 @@ export class CollabGuestLink {
 		if (this.#left) return;
 
 		// Resume through AgentSession without adopting the host's cwd.
+		this.#replicaSessionMayBeActive = true;
 		const switched = await this.#ctx.session.switchSession(replicaPath, { preserveLocalCwd: true });
 		if (switched === false) {
 			throw new Error("Collab replica activation was cancelled");

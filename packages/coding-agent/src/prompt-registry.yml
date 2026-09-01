@@ -18,6 +18,8 @@ triggers:
   - async_result
   - extension_event
   - user_selected_skill
+  - provider_request
+  - checkpoint_active
 
 prompts:
   - id: agent.compaction.prompts.auto-handoff-threshold-focus
@@ -620,14 +622,14 @@ prompts:
     visibility: model
     defaultEnabled: false
     order: 840
-  - id: advisor.mission-context
+  - id: goal.advisor_mission
     path: prompts/advisor/mission-context.md
-    role: system
+    role: internal_context
     target: [side_model]
-    trigger: side_request
+    trigger: goal_updated
     visibility: model
     defaultEnabled: false
-    order: 850
+    order: 995
   - id: advisor
     path: prompts/advisor/system.md
     role: system
@@ -1092,14 +1094,14 @@ prompts:
     visibility: model
     defaultEnabled: false
     order: 1430
-  - id: checkpoint-active-notice
+  - id: system.checkpoint-active-notice
     path: prompts/system/checkpoint-active-notice.md
-    role: system
-    target: [main]
-    trigger: optional_mode
+    role: internal_context
+    target: [main, subagent]
+    trigger: checkpoint_active
     visibility: model
     defaultEnabled: false
-    order: 1440
+    order: 1310
   - id: commit-message-system
     path: prompts/system/commit-message-system.md
     role: system
@@ -1124,14 +1126,14 @@ prompts:
     visibility: model
     defaultEnabled: false
     order: 1470
-  - id: date-cwd-reminder
+  - id: system.date-cwd-reminder
     path: prompts/system/date-cwd-reminder.md
-    role: system
-    target: [main]
-    trigger: recovery
+    role: internal_context
+    target: [main, subagent, side_model]
+    trigger: provider_request
     visibility: model
     defaultEnabled: false
-    order: 1480
+    order: 1350
   - id: eager-task
     path: prompts/system/eager-task.md
     role: system
@@ -1470,7 +1472,7 @@ prompts:
     order: 1900
   - id: subagent.base
     path: prompts/system/subagent-system-prompt.md
-    role: system
+    role: internal_context
     target: [subagent]
     trigger: subagent_start
     visibility: model
@@ -1478,9 +1480,9 @@ prompts:
     order: 100
   - id: subagent-user-prompt
     path: prompts/system/subagent-user-prompt.md
-    role: system
+    role: internal_context
     target: [subagent]
-    trigger: optional_mode
+    trigger: subagent_start
     visibility: model
     defaultEnabled: false
     order: 1920

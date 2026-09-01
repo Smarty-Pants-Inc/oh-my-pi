@@ -304,7 +304,7 @@ describe("createTools", () => {
 		const tools = await createTools(session, ["read"]);
 		const names = tools.map(t => t.name);
 
-		expect(names).toEqual(["read"]);
+		expect(names).toEqual(["read", "write"]);
 	});
 
 	it("keeps goal unavailable when the goal setting is disabled", async () => {
@@ -317,7 +317,7 @@ describe("createTools", () => {
 		const tools = await createTools(session, ["read", "goal"]);
 		const names = tools.map(t => t.name);
 
-		expect(names).toEqual(["read"]);
+		expect(names).toEqual(["read", "write"]);
 	});
 
 	it("keeps goal hidden while goal mode is exiting", async () => {
@@ -332,7 +332,7 @@ describe("createTools", () => {
 		const tools = await createTools(session, ["read"]);
 		const names = tools.map(t => t.name);
 
-		expect(names).toEqual(["read"]);
+		expect(names).toEqual(["read", "write"]);
 	});
 
 	it("does not widen a restricted explicit tool list for an available goal", async () => {

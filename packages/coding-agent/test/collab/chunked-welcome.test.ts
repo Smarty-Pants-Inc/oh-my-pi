@@ -136,7 +136,7 @@ function makeCancelledSwitchGuestContext(
 		},
 		session: {
 			switchSession,
-			newSession: () => Promise.resolve(),
+			newSession: () => Promise.resolve(true),
 			messages: [],
 			agent: {
 				state: { model: undefined },

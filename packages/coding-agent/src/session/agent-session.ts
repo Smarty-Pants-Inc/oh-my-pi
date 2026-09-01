@@ -4260,10 +4260,6 @@ export class AgentSession {
 				return;
 			}
 			if (msg.stopReason !== "error") {
-				if (this.#enforceRewindBeforeYield()) {
-					await emitAgentEndNotification({ willContinue: true });
-					return;
-				}
 				const planModeContinuationScheduled = await this.#enforcePlanModeDecisionAtSettle();
 				if (planModeContinuationScheduled) {
 					await emitAgentEndNotification({ willContinue: true });
@@ -10591,27 +10587,6 @@ export class AgentSession {
 		return undefined;
 	}
 
-	#enforceRewindBeforeYield(): boolean {
-		if (!this.#checkpointState || this.#pendingRewindReport) {
-			return false;
-		}
-		const reminder = [
-			"<system-warning>",
-			"You are in an active checkpoint. You MUST call rewind with your investigation findings before yielding. Do NOT yield without completing the checkpoint.",
-			"</system-warning>",
-		].join("\n");
-		this.agent.appendMessage({
-			role: "developer",
-			content: [{ type: "text", text: reminder }],
-			attribution: "agent",
-			timestamp: Date.now(),
-		});
-		this.#scheduleAgentContinue({
-			source: "checkpoint-rewind-reminder",
-			generation: this.#promptGeneration,
-		});
-		return true;
-	}
 	#extractRewindReport(messages: AgentMessage[]): string | undefined {
 		const checkpointState = this.#checkpointState;
 		if (!checkpointState) return undefined;
@@ -10739,14 +10714,7 @@ export class AgentSession {
 
 		this.agent.appendMessage(reminderMessage);
 		this.sessionManager.appendMessage(reminderMessage);
-		this.#scheduleAgentContinue({
-			source: "plan-mode-reminder",
-			generation: this.#promptGeneration,
-			// If the continuation never runs (new prompt, dispose, compaction,
-			// handoff), the forced choice must not leak onto an unrelated turn.
-			onSkip: () => this.#toolChoiceQueue.removeByLabel("plan-mode-decision"),
-		});
-		return true;
+		return false;
 	}
 
 	/**
