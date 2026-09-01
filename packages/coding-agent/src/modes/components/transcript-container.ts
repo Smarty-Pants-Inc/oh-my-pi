@@ -459,6 +459,8 @@ export class TranscriptContainer extends Container {
 			entry.emitted = offered.emittedEnd;
 		} else if (offered.kind === "commit") {
 			for (let index = this.#frontier; index < offered.end; index++) {
+				const component = this.#entries[index]!.component as Component & HistoryCommitAwareBlock;
+				component.markTranscriptHistoryCommitted?.();
 				this.#entries[index]!.state = "committed";
 				this.#entries[index]!.emitted = 0;
 			}
@@ -591,6 +593,8 @@ export class TranscriptContainer extends Container {
 			const rendered = this.#renderEntry(entry, width);
 			if (entry.emitted !== entry.stableRows.length) return;
 			if (this.#renderStablePrefix(entry, entry.emitted, width).length !== rendered.length) return;
+			const component = entry.component as Component & HistoryCommitAwareBlock;
+			component.markTranscriptHistoryCommitted?.();
 			entry.state = "committed";
 			entry.emitted = 0;
 			this.#frontier++;

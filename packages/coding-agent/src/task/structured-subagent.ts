@@ -520,9 +520,11 @@ function buildExecutorOptions(
 		// recursive sub-discovery; preloaded paths only avoid re-scanning/reusing
 		// parent-bound extension instances while constructing the child.
 		extensionRoots: session.effectiveExtensionRoots?.bind(session),
-		preloadedExtensionPaths: restrictToolNames ? [] : session.extensionPaths,
-		preloadedPreparedExtensions: restrictToolNames ? [] : session.preparedExtensions,
-		preloadedCustomToolPaths: restrictToolNames ? [] : session.customToolPaths,
+		preloadedExtensionPaths: subagentRuntimeAllows(runtimeProfile, "extensions") ? session.extensionPaths : [],
+		preloadedPreparedExtensions: subagentRuntimeAllows(runtimeProfile, "extensions")
+			? session.preparedExtensions
+			: [],
+		preloadedCustomToolPaths: subagentRuntimeAllows(runtimeProfile, "customTools") ? session.customToolPaths : [],
 		localProtocolOptions,
 		parentArtifactManager: session.getArtifactManager?.() ?? undefined,
 		parentHindsightSessionState: session.getHindsightSessionState?.(),

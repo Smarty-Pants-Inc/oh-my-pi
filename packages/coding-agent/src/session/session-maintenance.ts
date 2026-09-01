@@ -231,6 +231,10 @@ interface SpeculationRun {
 interface AutoCompactionOptions {
 	autoContinue?: boolean;
 	triggerContextTokens?: number;
+	/** Tokens from pending messages included in triggerContextTokens but absent from the prepared history. */
+	pendingContextTokens?: number;
+	/** Stored context before pending messages, measured before preparation rewrites its representation. */
+	preparedContextTokens?: number;
 	suppressContinuation?: boolean;
 	phase?: CodexCompactionContext["phase"];
 	terminalTextAnswer?: boolean;
@@ -1684,7 +1688,10 @@ export class SessionMaintenance {
 		return tokens;
 	}
 
-	async runPrePromptCompactionIfNeeded(messages: AgentMessage[]): Promise<void> {
+	async runPrePromptCompactionIfNeeded(
+		messages: AgentMessage[],
+		semanticDeliveryAcceptance?: Promise<void>,
+	): Promise<void> {
 		const model = this.#model;
 		if (!model) return;
 		const contextWindow = model.contextWindow ?? 0;
@@ -2981,6 +2988,7 @@ export class SessionMaintenance {
 			pendingContextTokens?: number;
 			/** Stored context before pending messages, measured before preparation rewrites its representation. */
 			preparedContextTokens?: number;
+			semanticDeliveryAcceptance?: Promise<void>;
 			suppressContinuation?: boolean;
 			phase?: CodexCompactionContext["phase"];
 			terminalTextAnswer?: boolean;
@@ -3360,9 +3368,6 @@ export class SessionMaintenance {
 							source: "frame-rescue-queued-message",
 							delayMs: 100,
 							generation,
-							autoContinue: false,
-							terminalTextAnswer,
-							suppressContinuation,
 						});
 					}
 					if (deadEndWarning) {

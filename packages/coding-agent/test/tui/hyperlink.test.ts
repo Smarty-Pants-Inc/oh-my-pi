@@ -12,7 +12,6 @@ import { LocalProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/lo
 import { getMarkdownTheme, initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import {
-	applyHyperlinkSetting,
 	fileHyperlink,
 	isHyperlinkEnabled,
 	tryResolveInternalUrlSync,
@@ -28,8 +27,11 @@ const ST = "\x1b\\";
 const BEL = "\x07";
 const LINK_END = `${OSC}8;;${ST}`;
 const ORIGINAL_NO_COLOR = Bun.env.NO_COLOR;
-// Detected OSC 8 capability, captured at import exactly as hyperlink.ts snapshots
-// it — before any test mutates the runtime flag.
+const ORIGINAL_HERDR_ENV = Bun.env.HERDR_ENV;
+const ORIGINAL_PI_NO_HYPERLINKS = Bun.env.PI_NO_HYPERLINKS;
+const ORIGINAL_PI_FORCE_HYPERLINKS = Bun.env.PI_FORCE_HYPERLINKS;
+// Detected OSC 8 capability, captured at import before any test mutates the
+// runtime flag.
 const DETECTED_HYPERLINKS = terminalCaps.TERMINAL.hyperlinks;
 
 /** Extract the hyperlink URI from a wrapped string. Returns undefined if not wrapped. */
@@ -451,7 +453,6 @@ describe("chat markdown links honor tui.hyperlinks", () => {
 	});
 
 	function renderChatLink(): string {
-		applyHyperlinkSetting();
 		const md = new terminalCaps.Markdown(
 			"See [the docs](https://example.com/path) for details.",
 			0,
@@ -500,7 +501,7 @@ describe("chat markdown links honor tui.hyperlinks", () => {
 	});
 });
 
-describe("applyHyperlinkSetting on project-scoped reload", () => {
+describe("tui.hyperlinks on project-scoped reload", () => {
 	// A cross-project reload (`/move`, resume, rollback) fires SETTING_HOOKS via
 	// Settings.reloadForCwd → the tui.hyperlinks hook reapplies the policy, so
 	// renderers gating on TERMINAL.hyperlinks never keep the previous project's

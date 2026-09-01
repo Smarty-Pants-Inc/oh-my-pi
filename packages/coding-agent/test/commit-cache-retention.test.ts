@@ -11,6 +11,7 @@ import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import * as systemPrompt from "@oh-my-pi/pi-coding-agent/system-prompt";
 import * as gitModule from "@oh-my-pi/pi-coding-agent/utils/git";
 import { setProjectDir, TempDir } from "@oh-my-pi/pi-utils";
+import { $ } from "bun";
 import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "./helpers/settings-test-state";
 
 const DIFF = `diff --git a/src/a.ts b/src/a.ts
@@ -49,14 +50,19 @@ function mockCompletions() {
 
 async function setupLegacyCommit({
 	cacheRetention,
-	mapReduceMinFiles = 4,
+	mapReduceThreshold = 5_000,
 }: {
 	cacheRetention: "long" | "none";
-	mapReduceMinFiles?: number;
+	mapReduceThreshold?: number;
 }) {
 	project = await TempDir.create("@commit-cache-retention-");
 	setProjectDir(project.path());
 	await Bun.write(project.join("CHANGELOG.md"), "# Changelog\n\n## [Unreleased]\n\n### Fixed\n");
+	await $`git init --initial-branch=main`.cwd(project.path()).quiet();
+	await $`git add CHANGELOG.md`.cwd(project.path()).quiet();
+	await $`git -c user.name=Fixture -c user.email=fixture@example.invalid commit -m baseline`
+		.cwd(project.path())
+		.quiet();
 
 	authStorage = new AuthStorage(new SqliteAuthCredentialStore(new Database(":memory:")));
 	await authStorage.reload();
@@ -66,7 +72,7 @@ async function setupLegacyCommit({
 	vi.spyOn(Settings, "init").mockResolvedValue(
 		Settings.isolated({
 			"providers.cacheRetention": cacheRetention,
-			"commit.mapReduceMinFiles": mapReduceMinFiles,
+			"commit.mapReduceThreshold": mapReduceThreshold,
 		}),
 	);
 	vi.spyOn(ModelRegistry.prototype, "refresh").mockResolvedValue(undefined);
@@ -116,9 +122,7 @@ describe("legacy commit cache retention", () => {
 	});
 
 	it("passes an explicit setting through map and reduce completions", async () => {
-		process.env.PI_COMMIT_MAP_REDUCE = "true";
-		Bun.env.PI_COMMIT_MAP_REDUCE = "true";
-		await setupLegacyCommit({ cacheRetention: "long", mapReduceMinFiles: 1 });
+		await setupLegacyCommit({ cacheRetention: "long", mapReduceThreshold: 1 });
 		const completionSpy = mockCompletions();
 
 		const result = await runCommitCommand({ legacy: true, push: false, dryRun: true, noChangelog: true });

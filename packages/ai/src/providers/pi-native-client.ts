@@ -15,6 +15,8 @@
  * route every LLM call through a credential-holding sidecar so the slot
  * itself stays credential-free.
  */
+
+import { createHash } from "node:crypto";
 import * as os from "node:os";
 import { getAppName, getInstallId, readSseJson } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";

@@ -29,12 +29,24 @@ export enum ConversationSearchSource {
 	CLOUD_CACHE = 2,
 }
 
+const ConversationSearchSourceJson = {
+	CONVERSATION_SEARCH_SOURCE_UNSPECIFIED: 0,
+	CONVERSATION_SEARCH_SOURCE_LOCAL: 1,
+	CONVERSATION_SEARCH_SOURCE_CLOUD_CACHE: 2,
+} as const;
+
 /** Cursor agent enum CursorRuleSource. */
 export enum CursorRuleSource {
 	UNSPECIFIED = 0,
 	TEAM = 1,
 	USER = 2,
 }
+
+const CursorRuleSourceJson = {
+	CURSOR_RULE_SOURCE_UNSPECIFIED: 0,
+	CURSOR_RULE_SOURCE_TEAM: 1,
+	CURSOR_RULE_SOURCE_USER: 2,
+} as const;
 
 /** Cursor agent enum DiagnosticSeverity. */
 export enum DiagnosticSeverity {
@@ -44,6 +56,14 @@ export enum DiagnosticSeverity {
 	INFORMATION = 3,
 	HINT = 4,
 }
+
+const DiagnosticSeverityJson = {
+	DIAGNOSTIC_SEVERITY_UNSPECIFIED: 0,
+	DIAGNOSTIC_SEVERITY_ERROR: 1,
+	DIAGNOSTIC_SEVERITY_WARNING: 2,
+	DIAGNOSTIC_SEVERITY_INFORMATION: 3,
+	DIAGNOSTIC_SEVERITY_HINT: 4,
+} as const;
 
 /** Cursor agent enum ForceBackgroundShellStatus. */
 export enum ForceBackgroundShellStatus {

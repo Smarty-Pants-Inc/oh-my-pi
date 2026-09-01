@@ -1043,12 +1043,6 @@ function impliesMandatoryReasoning(facts: IdentityFacts, modelId: string): boole
 	return false;
 }
 
-function isQwenTemplateReasoningEffortCompat(compat: CompatOf<Api>): boolean {
-	return (
-		compat !== undefined && "qwenTemplateReasoningEffort" in compat && compat.qwenTemplateReasoningEffort === true
-	);
-}
-
 function resolveThinkingPolicy<TApi extends Api>(
 	spec: ModelSpec<TApi>,
 	facts: IdentityFacts,
@@ -1085,8 +1079,7 @@ function resolveThinkingPolicy<TApi extends Api>(
 	if (rule.effortBudgets !== undefined) config.effortBudgets = rule.effortBudgets;
 	const supportsDisplay = rule.supportsDisplay ?? defaultSupportsDisplay(spec, facts);
 	if (supportsDisplay) config.supportsDisplay = true;
-	const requiresEffort =
-		rule.requiresEffort ?? (impliesMandatoryReasoning(facts, spec.id) || isQwenTemplateReasoningEffortCompat(compat));
+	const requiresEffort = rule.requiresEffort ?? impliesMandatoryReasoning(facts, spec.id);
 	if (requiresEffort) config.requiresEffort = true;
 	if (rule.suppressWhenOff) config.suppressWhenOff = true;
 	return config;
@@ -1138,9 +1131,7 @@ function fillExplicitThinking<TApi extends Api>(
 	const needsDisplay =
 		thinking.supportsDisplay === undefined && (rule.supportsDisplay ?? defaultSupportsDisplay(spec, facts));
 	const needsRequiresEffort =
-		thinking.requiresEffort === undefined &&
-		(rule.requiresEffort ??
-			(impliesMandatoryReasoning(facts, spec.id) || isQwenTemplateReasoningEffortCompat(compat)));
+		thinking.requiresEffort === undefined && (rule.requiresEffort ?? impliesMandatoryReasoning(facts, spec.id));
 	const needsDefaultLevel = thinking.defaultLevel === undefined && rule.defaultLevel !== undefined;
 	if (effortMap === undefined && !needsDisplay && !needsRequiresEffort && !needsDefaultLevel) {
 		return thinking;

@@ -2,9 +2,9 @@ import type { TUI } from "../tui";
 import { getPaddingX, padding, sliceByColumn, visibleWidth } from "../utils";
 import { Text } from "./text";
 
-const RENDER_INTERVAL_MS = 1000 / 30;
+const RENDER_INTERVAL_MS = 1000 / 60;
 /** Milliseconds between spinner-frame advances; exported so time-derived spinners elsewhere tick at the Loader cadence. */
-export const SPINNER_ADVANCE_MS = 80;
+export const SPINNER_ADVANCE_MS = RENDER_INTERVAL_MS * 5;
 const RENDER_BACKPRESSURE_MULTIPLIER = 9;
 const MAX_BACKPRESSURE_FRAME_COST_MS = 200;
 
@@ -152,7 +152,7 @@ export class Loader extends Text {
 	}
 
 	getMessage(): string {
-		return this.message;
+		return this.#resolveMessage();
 	}
 
 	#scheduleTick(intervalMs: number, delayMs: number): void {

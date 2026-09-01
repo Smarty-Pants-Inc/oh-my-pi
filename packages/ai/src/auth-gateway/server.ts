@@ -31,7 +31,15 @@ import * as openaiChat from "../providers/openai-chat-server";
 import * as openaiResponses from "../providers/openai-responses-server";
 import * as piNative from "../providers/pi-native-server";
 import { completeSimple, streamSimple } from "../stream";
-import type { Api, AssistantMessage, AssistantMessageEventStream, Context, Model, SimpleStreamOptions } from "../types";
+import type {
+	Api,
+	AssistantMessage,
+	AssistantMessageEvent,
+	AssistantMessageEventStream,
+	Context,
+	Model,
+	SimpleStreamOptions,
+} from "../types";
 import type { ClientUsageIdentity } from "../usage";
 import { deterministicUuid } from "../utils/deterministic-id";
 import { AssistantMessageEventStream as AssistantMessageEventStreamImpl } from "../utils/event-stream";
@@ -926,6 +934,33 @@ async function handlePiNative(
 	if (!model) {
 		return piNative.formatError(404, "invalid_request_error", `Unknown model: ${parsed.modelId}`);
 	}
+	const boundaryApproval =
+		parsed.boundaryApproval && (parsed.boundaryApproval.payload || parsed.boundaryApproval.toolContracts)
+			? parsed.boundaryApproval
+			: undefined;
+	if (protectedRoute !== (boundaryApproval !== undefined)) {
+		return piNative.formatError(
+			400,
+			"boundary_approval_route_mismatch",
+			protectedRoute
+				? "pi-native boundary stream requires at least one approval callback"
+				: "pi-native boundary approval requires /v1/pi/boundary-stream/v1",
+		);
+	}
+	if (boundaryApproval?.payload && !PI_NATIVE_PAYLOAD_BOUNDARY_APIS.has(model.api)) {
+		return piNative.formatError(
+			400,
+			"boundary_approval_unsupported",
+			`pi-native payload boundary approval is unsupported for API ${model.api}`,
+		);
+	}
+	if (boundaryApproval?.toolContracts && !PI_NATIVE_TOOL_CONTRACT_BOUNDARY_APIS.has(model.api)) {
+		return piNative.formatError(
+			400,
+			"boundary_approval_unsupported",
+			`pi-native tool-contract boundary approval is unsupported for API ${model.api}`,
+		);
+	}
 	const client = resolveClientIdentity(req.headers);
 	// Pi-native already parsed `streamOpts.sessionId` (when set by the
 	// client); fall back to the derived key so credential-stickiness lines
@@ -1081,6 +1116,20 @@ async function handlePiNative(
 		.result()
 		.then(message => recordGatewayUsage(bootOpts.storage, model, client, message))
 		.catch(() => {});
+	if (boundaryEvents && boundarySession) {
+		const providerEvents = events;
+		void (async () => {
+			try {
+				for await (const event of providerEvents) boundaryEvents.push(event);
+				if (!boundaryEvents.done) boundaryEvents.end();
+			} catch (error) {
+				boundaryEvents.fail(error);
+			} finally {
+				approvals.cancelStream(boundarySession.streamId, new AIError.AbortError("pi-native stream ended"));
+			}
+		})();
+		events = boundaryEvents;
+	}
 
 	const sseStream = piNative.encodeStream(events, parsed.modelId, parsed.options, {
 		signal: controller.signal,

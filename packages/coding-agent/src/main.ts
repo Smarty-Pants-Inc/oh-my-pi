@@ -12,6 +12,7 @@ import { EventLoopKeepalive, type ThinkingLevel } from "@oh-my-pi/pi-agent-core"
 import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
 import {
 	$env,
+	consumeFreshOmpCompanionLaunchEnv,
 	directoryIsMissing,
 	getLogPath,
 	getProjectDir,
@@ -695,6 +696,7 @@ async function runInteractiveMode(
 			eventBus,
 			startupLease?.composer,
 			subagentEventBus,
+			companionStatusTextSink,
 		);
 		startupLease?.adopt();
 	} catch (error) {
@@ -951,15 +953,14 @@ async function switchToResumedProject(
 		sessionManager.setCwdWithoutRelocation(launchCwd);
 		return { cwd: launchCwd, chdirFailed: resumedCwd };
 	}
-	clearPluginRootsAndCaches();
+	clearPluginRootsAndCaches(undefined, { rewarm: false });
 	resetCapabilities();
 	const cwd = getProjectDir();
-	// clearPluginRootsAndCaches only kicks off an unawaited re-warm; await a fresh
-	// destination preload so sync consumers (plugin-provided LSP/DAP config) never
-	// read the launch project's stale/empty roots during session creation.
+	// Re-scope before preloading so plugin roots use the destination's provider policy.
 	try {
-		await preloadPluginRoots(os.homedir(), cwd);
 		await activeSettings.reloadForCwd(cwd);
+		initializeWithSettings(activeSettings);
+		await preloadPluginRoots(os.homedir(), cwd, { includeClaudeRegistry: isProviderEnabled("claude") });
 		if (normalizePathForComparison(sessionManager.getCwd()) !== normalizePathForComparison(cwd)) {
 			sessionManager.adoptRecordedCwd();
 		}
@@ -971,12 +972,13 @@ async function switchToResumedProject(
 		try {
 			setProjectDir(launchCwd);
 			sessionManager.setCwdWithoutRelocation(launchCwd);
-			clearPluginRootsAndCaches();
-			await preloadPluginRoots(os.homedir(), launchCwd);
+			clearPluginRootsAndCaches(undefined, { rewarm: false });
 			// Settings.#cwd was already assigned the destination; re-scope it
 			// back so path-derived values and project saves target the launch
 			// project, not the failed resume target.
 			await activeSettings.reloadForCwd(launchCwd);
+			initializeWithSettings(activeSettings);
+			await preloadPluginRoots(os.homedir(), launchCwd, { includeClaudeRegistry: isProviderEnabled("claude") });
 		} catch (rollbackError) {
 			throw new SessionResolutionError(
 				`Could not switch to resumed project ${resumedCwd} (${error instanceof Error ? error.message : String(error)}); failed to restore launch directory ${launchCwd}: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
@@ -2104,6 +2106,7 @@ export async function runRootCommand(
 
 			const eventBus = new EventBus();
 			const subagentEventBus = new EventBus();
+			const releaseManifest = await ensureApprovedStartup();
 			const extensionsResult = parsedArgs.trustedExtensions?.length
 				? await loadTrustedSessionExtensions(sessionOptions, cwd, eventBus, releaseManifest)
 				: await loadSessionExtensions(sessionOptions, cwd, settingsInstance, eventBus, releaseManifest);
@@ -2245,6 +2248,7 @@ export async function runRootCommand(
 					enableLsp: sessionOptions.enableLsp ?? true,
 					eventBus,
 					subagentEventBus,
+					protectedRuntime: protectedRuntime === true,
 				}),
 				Math.trunc(Number(settingsInstance.get("task.agentIdleTtlMs") ?? 420_000) || 0),
 			);

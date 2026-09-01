@@ -285,10 +285,49 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 		});
 		opts.onSubprocessResult?.(result);
 		// A successful result cannot be captured while deferred owner jobs or
-		// shutdown hooks may still write the worktree. Failed runs skip capture,
-		// so their cleanup remains asynchronous.
-		if (deferredCleanup && result.exitCode === 0) {
-			await deferredCleanup;
+		// shutdown hooks may still write the worktree. Environment-backed deferred
+		// runs keep their lease until that cleanup settles and intentionally skip
+		// sync/capture because the child may still own remote state.
+		if (deferredCleanup) {
+			if (lease) return rememberAgentArtifacts(result);
+			if (result.exitCode === 0) await deferredCleanup;
+		}
+
+		if (lease) {
+			const childSucceeded = result.exitCode === 0 && !result.error && !result.aborted;
+			let syncFailed = false;
+			let syncError: unknown;
+			if (childSucceeded && !opts.baseOptions.signal?.aborted) {
+				try {
+					await lease.syncBack(opts.baseOptions.signal);
+				} catch (error) {
+					syncFailed = true;
+					syncError = error;
+				}
+			}
+
+			const releaseResult = await releaseLease();
+			if (syncFailed) {
+				let failed = lifecycleFailure(result, leaseFailureMessage("sync-back", lease, syncError));
+				if (!releaseResult.ok) {
+					failed = lifecycleFailure(failed, leaseFailureMessage("release", lease, releaseResult.error));
+				}
+				return rememberAgentArtifacts(failed);
+			}
+			if (!releaseResult.ok) {
+				return rememberAgentArtifacts(
+					lifecycleFailure(result, leaseFailureMessage("release", lease, releaseResult.error)),
+				);
+			}
+			if (childSucceeded && opts.baseOptions.signal?.aborted) {
+				return rememberAgentArtifacts(
+					lifecycleFailure(
+						{ ...result, aborted: true },
+						"Execution environment task was cancelled before capture",
+					),
+				);
+			}
+			if (!childSucceeded) return rememberAgentArtifacts(result);
 		}
 		if (opts.mergeMode === "branch" && result.exitCode === 0) {
 			try {
@@ -419,7 +458,6 @@ export interface IsolationMergeOutcome {
  */
 export async function mergeIsolatedChanges(opts: IsolationMergeOptions): Promise<IsolationMergeOutcome> {
 	const { result, repoRoot, mergeMode } = opts;
-	const repo = vcs.requireGit(repoRoot);
 	try {
 		if (mergeMode === "branch") {
 			if (!result.branchName && result.exitCode === 0 && !result.aborted && result.error) {
@@ -473,6 +511,7 @@ export async function mergeIsolatedChanges(opts: IsolationMergeOptions): Promise
 			return { summary, changesApplied, hadAnyChanges, mergedBranchForNestedPatches };
 		}
 
+		const repo = vcs.requireGit(repoRoot);
 		// Patch mode: apply the patch from a successful run. A failed or
 		// aborted run has nothing to apply and must not block the result.
 		let changesApplied: boolean;

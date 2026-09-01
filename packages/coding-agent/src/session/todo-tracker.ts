@@ -77,7 +77,7 @@ export interface TodoTrackerHost {
 	usesOwnedToolDialect(): boolean;
 	agentKind(): "main" | "sub";
 	emitSessionEvent(event: AgentSessionEvent): Promise<void>;
-	scheduleAgentContinue(options: { source: string; generation?: number }): void;
+	queueTodoReconciliation(): (() => void) | undefined;
 	promptGeneration(): number;
 	hasPendingAsyncWake(): boolean;
 	getActiveToolNames(): string[];
@@ -209,96 +209,9 @@ export class TodoTracker {
 		return nudges;
 	}
 
-	/** Checks a terminal assistant turn and schedules continuation for incomplete todos. */
-	async checkCompletion(message: AssistantMessage): Promise<boolean> {
-		if (this.#host.consumeLastServedToolChoiceLabel() === "user-force") return false;
-		if (this.#host.planModeEnabled()) return false;
-		if (this.#reminderAwaitingProgress) {
-			logger.debug("Todo completion: prior reminder still awaiting agent action; staying silent", {
-				attempt: this.#reminderCount,
-			});
-			return false;
-		}
-		if (!this.#host.settings.get("todo.reminders") || !this.#host.settings.get("todo.enabled")) {
-			this.#reminderCount = 0;
-			this.#reminderAwaitingProgress = false;
-			return false;
-		}
-		const remindersMax = this.#host.settings.get("todo.remindersMax");
-		if (this.#reminderCount >= remindersMax) {
-			logger.debug("Todo completion: max reminders reached", { count: this.#reminderCount });
-			return false;
-		}
-		const phases = this.phases;
-		if (phases.length === 0) {
-			this.#reminderCount = 0;
-			this.#reminderAwaitingProgress = false;
-			return false;
-		}
-		const incompleteByPhase = phases
-			.map(phase => ({
-				name: phase.name,
-				tasks: phase.tasks
-					.filter(
-						(task): task is TodoItem & { status: "pending" | "in_progress" } =>
-							task.status === "pending" || task.status === "in_progress",
-					)
-					.map(task => ({ content: task.content, status: task.status })),
-			}))
-			.filter(phase => phase.tasks.length > 0);
-		const incomplete = incompleteByPhase.flatMap(phase => phase.tasks);
-		if (incomplete.length === 0) {
-			this.#reminderCount = 0;
-			this.#reminderAwaitingProgress = false;
-			return false;
-		}
-		if (isAwaitingUserAnswer(message)) {
-			logger.debug("Todo completion: assistant is waiting for user input; skipping reminder", {
-				incomplete: incomplete.length,
-			});
-			return false;
-		}
-		if (this.#host.hasPendingAsyncWake()) {
-			logger.debug("Todo completion: async jobs in flight will re-wake the loop; skipping reminder", {
-				incomplete: incomplete.length,
-			});
-			return false;
-		}
-		this.#reminderCount++;
-		const todoList = incompleteByPhase
-			.map(phase => `- ${phase.name}\n${phase.tasks.map(task => `  - ${task.content}`).join("\n")}`)
-			.join("\n");
-		const reminder =
-			`<system-reminder>\n` +
-			`You stopped with ${incomplete.length} incomplete todo item(s):\n${todoList}\n\n` +
-			`Please continue working on these tasks or mark them complete if finished.\n` +
-			`(Reminder ${this.#reminderCount}/${remindersMax})\n` +
-			`</system-reminder>`;
-		logger.debug("Todo completion: sending reminder", {
-			incomplete: incomplete.length,
-			attempt: this.#reminderCount,
-		});
-		await this.#host.emitSessionEvent({
-			type: "todo_reminder",
-			todos: incomplete,
-			attempt: this.#reminderCount,
-			maxAttempts: remindersMax,
-		});
-		const reminderMessage: Message = {
-			role: "developer",
-			content: [{ type: "text", text: reminder }],
-			attribution: "agent",
-			timestamp: Date.now(),
-		};
-		this.#mutationsSinceLastTouch = 0;
-		this.#reminderAwaitingProgress = true;
-		this.#host.agent.appendMessage(reminderMessage);
-		this.#host.sessionManager.appendMessage(reminderMessage);
-		this.#host.scheduleAgentContinue({
-			source: "todo-reminder",
-			generation: this.#host.promptGeneration(),
-		});
-		return true;
+	/** Todo state never schedules a turn after the model stops. */
+	async checkCompletion(_message: AssistantMessage): Promise<boolean> {
+		return false;
 	}
 
 	/** Todo state never injects a mid-turn nudge. */

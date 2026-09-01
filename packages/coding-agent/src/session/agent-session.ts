@@ -274,7 +274,6 @@ import type {
 	SessionStats,
 	UsageFallbackConfirmer,
 } from "./agent-session-types";
-import { writeArtifact } from "./artifacts";
 import {
 	ASYNC_INLINE_RESULT_MAX_CHARS,
 	ASYNC_PREVIEW_MAX_CHARS,
@@ -495,8 +494,15 @@ type AgentContinueSkipReason =
 	| "should-continue-false"
 	| "post-restore-unavailable";
 
+type AutomaticTurnContinuationOptions = {
+	authority: AutomaticTurnSource;
+	originTurnId?: string;
+};
+
 type ScheduledAgentContinueOptions = {
-	source: string;
+	source?: string;
+	authority?: AutomaticTurnSource;
+	originTurnId?: string;
 	delayMs?: number;
 	generation?: number;
 	shouldContinue?: () => boolean;
@@ -692,6 +698,7 @@ export class AgentSession {
 	readonly #advisors: SessionAdvisors;
 	/** Resolves once the resume-time advisor spend backfill settles. */
 	#advisorCostRestore: Promise<void> = Promise.resolve();
+	#advisorsInitialized = false;
 	#goalTurnCounter = 0;
 	#planReferenceSent = false;
 	#planReferencePath = "local://PLAN.md";
@@ -867,7 +874,8 @@ export class AgentSession {
 	#promptGeneration = 0;
 	#promptSequence = 0;
 	#skippedPostTurnSpeculationCompletion: Promise<void> | undefined;
-	#pendingAgentEndEmit: AgentSessionEvent | undefined;
+	#pendingAgentEndEmit: { event: AgentSessionEvent; closeTurnId?: string } | undefined;
+	#inFlightBeforeAgentEndCallbacks: Array<() => void | Promise<void>> = [];
 	#inFlightSettledCallbacks: Array<() => void | Promise<void>> = [];
 	#inFlightSettling = false;
 	#inFlightQuiescenceWaiters = new Set<() => void>();
@@ -1151,8 +1159,10 @@ export class AgentSession {
 		const pending = this.#pendingAgentEndEmit;
 		if (!pending) return;
 		this.#pendingAgentEndEmit = undefined;
-		if (pending.type !== "agent_end" || pending.isTerminal === false) {
-			this.#emit(pending);
+		const { event, closeTurnId } = pending;
+		if (event.type !== "agent_end" || event.isTerminal === false) {
+			this.#closeTurn(closeTurnId);
+			this.#emit(event);
 			return;
 		}
 
@@ -1169,7 +1179,8 @@ export class AgentSession {
 			this.#canAutoContinueForFollowUp() &&
 			this.agent.hasQueuedMessages();
 		const ircContinuation = canDrain && !this.#isDisposed && !this.#planModeState?.enabled && this.#irc.hasPending();
-		this.#emit(queuedContinuation || ircContinuation ? { ...pending, isTerminal: false } : pending);
+		this.#closeTurn(closeTurnId);
+		this.#emit(queuedContinuation || ircContinuation ? { ...event, isTerminal: false } : event);
 	}
 
 	/**
@@ -2897,37 +2908,68 @@ export class AgentSession {
 		job: AsyncJob,
 	): Promise<void> {
 		if (this.#isDisposed || manager.isDeliverySuppressed(jobId)) return;
-		// Snapshot the generation before the async format step: a `/new` during it
-		// bumps the epoch, so this delivery belongs to the replaced session and
-		// must not enqueue — the suppression marker alone is unreliable because
-		// job-id reuse clears it.
 		const epoch = this.#asyncDeliveryEpoch;
 		const formatted = await this.#formatAsyncResultForFollowUp(text);
-		if (this.#isDisposed) return;
-		if (epoch !== this.#asyncDeliveryEpoch) return;
-		if (manager.isDeliverySuppressed(jobId)) return;
-		const durationMs = job ? Math.max(0, Date.now() - job.startTime) : undefined;
-		await this.yieldQueue.enqueueWithReceipt<AsyncResultEntry>("async-result", {
+		if (this.#isDisposed || epoch !== this.#asyncDeliveryEpoch || manager.isDeliverySuppressed(jobId)) return;
+		const transition = this.#asyncSessionTransition;
+		if (transition && transition.manager === manager) {
+			if (transition.selectedOutcome === "rollback") transition.retainedJobs.add(job);
+			transition.deferredDeliveries.push({ manager, jobId, text, job, formatted });
+			return;
+		}
+		await this.#enqueueFormattedAsyncJobResult(manager, jobId, formatted, job, epoch);
+	}
+
+	async #enqueueFormattedAsyncJobResult(
+		manager: AsyncJobManager,
+		jobId: string,
+		formatted: string,
+		job: AsyncJob,
+		epoch: number,
+	): Promise<void> {
+		if (this.#isDisposed || epoch !== this.#asyncDeliveryEpoch || manager.isDeliverySuppressed(jobId)) return;
+		const entry: AsyncResultEntry = {
 			jobId,
 			result: formatted,
 			job,
-			durationMs,
+			durationMs: Math.max(0, Date.now() - job.startTime),
 			epoch,
+			originTurnId: job.originTurnId,
+		};
+		if (!this.#automaticTurns.isTurnOpen(job.originTurnId)) {
+			await this.#persistPassiveAsyncResult(entry);
+			return;
+		}
+		this.#queuedAsyncResults.set(jobId, entry);
+		await this.yieldQueue.enqueueWithReceipt<AsyncResultEntry>(ASYNC_RESULT_MESSAGE_TYPE, entry);
+	}
 
+	async #persistPassiveAsyncResult(entry: AsyncResultEntry): Promise<void> {
+		this.#queuedAsyncResults.delete(entry.jobId);
+		const message = buildAsyncResultBatchMessage([entry]);
+		if (!message) return;
+		if (this.isStreaming) {
+			this.agent.appendMessage(message);
+			this.sessionManager.appendCustomMessageEntry(
+				message.customType,
+				message.content,
+				message.display,
+				message.details,
+				message.attribution ?? "agent",
+			);
+			return;
+		}
+		await this.sendCustomMessage(message).catch(error => {
+			logger.warn("Failed to persist passive async result", { error: String(error), jobId: entry.jobId });
 		});
 	}
 
 	async #formatAsyncResultForFollowUp(result: string): Promise<string> {
-		if (result.length <= ASYNC_INLINE_RESULT_MAX_CHARS) {
-			return result;
-		}
+		if (result.length <= ASYNC_INLINE_RESULT_MAX_CHARS) return result;
 		const preview = `${result.slice(0, ASYNC_PREVIEW_MAX_CHARS)}\n\n[Output truncated. Showing first ${ASYNC_PREVIEW_MAX_CHARS.toLocaleString()} characters.]`;
 		try {
-			const { path: artifactPath, id: artifactId } = await this.sessionManager.allocateArtifactPath("async");
-			if (artifactPath && artifactId) {
-				await writeArtifact(artifactPath, result);
-				return `${preview}\nFull output: artifact://${artifactId}`;
-			}
+			const artifactId = await this.sessionManager.saveArtifact(result, "async");
+			if (artifactId) return `${preview}\nFull output: artifact://${artifactId}`;
 		} catch (error) {
 			logger.warn("Failed to persist async follow-up artifact", {
 				error: error instanceof Error ? error.message : String(error),
@@ -3411,22 +3453,44 @@ export class AgentSession {
 		return true;
 	}
 
-	#persistMessageEnd(message: AgentMessage): void {
-		if (message.role === "hookMessage" || message.role === "custom") {
-			// Prewalk's plan nudge is a one-run steering instruction. Persisting it would
-			// resurrect the consumed prompt on resume, fork, or any context rebuild.
-			if (!isPrewalkPlanNudge(message)) {
-				this.sessionManager.appendCustomMessageEntry(
-					message.customType,
-					message.content,
-					message.display,
-					message.details,
-					message.attribution ?? "agent",
-					// Preserve the initiating message's own timestamp: the entry
-					// otherwise records emission time, which on rebuild excludes
-					// provider preparation / hook time from the prompt→yield anchor.
-					message.timestamp,
-				);
+	async #persistMessageEnd(message: AgentMessage): Promise<void> {
+		const requireDurablePersistence = this.#messageEndPersistenceWaiters.has(message);
+		let failure: unknown;
+		try {
+			if (message.role === "hookMessage" || message.role === "custom") {
+				// Prewalk's plan nudge is a one-run steering instruction. Persisting it would
+				// resurrect the consumed prompt on resume, fork, or any context rebuild.
+				if (!isPrewalkPlanNudge(message)) {
+					const pendingSemanticDeliveryId = readPendingSemanticDeliveryId(message.details);
+					if (pendingSemanticDeliveryId && this.#pendingSemanticDeliveryIds.has(pendingSemanticDeliveryId)) {
+						await this.sessionManager.appendEntriesAtomically(() => {
+							this.sessionManager.appendCustomMessageEntry(
+								message.customType,
+								message.content,
+								message.display,
+								message.details,
+								message.attribution ?? "agent",
+								message.timestamp,
+							);
+							this.#appendPendingSemanticDeliverySettlement(pendingSemanticDeliveryId, "delivered");
+						});
+						this.#pendingSemanticDeliveryIds.delete(pendingSemanticDeliveryId);
+					} else {
+						this.sessionManager.appendCustomMessageEntry(
+							message.customType,
+							message.content,
+							message.display,
+							message.details,
+							message.attribution ?? "agent",
+							message.timestamp,
+						);
+					}
+				}
+				if (message.role === "custom" && message.customType === "ttsr-injection") {
+					this.#ttsr.markInjectedFromDetails(message.details);
+				}
+			} else {
+				this.#persistSessionMessageIfMissing(message);
 			}
 			if (requireDurablePersistence) {
 				await this.sessionManager.ensureOnDisk();
@@ -4196,6 +4260,10 @@ export class AgentSession {
 				return;
 			}
 			if (msg.stopReason !== "error") {
+				if (this.#enforceRewindBeforeYield()) {
+					await emitAgentEndNotification({ willContinue: true });
+					return;
+				}
 				const planModeContinuationScheduled = await this.#enforcePlanModeDecisionAtSettle();
 				if (planModeContinuationScheduled) {
 					await emitAgentEndNotification({ willContinue: true });
@@ -4275,6 +4343,154 @@ export class AgentSession {
 		})();
 		this.#trackPostPromptTask(scheduled);
 	}
+	#persistPassiveCustomMessages(messages: readonly AgentMessage[]): void {
+		for (const message of messages) {
+			if (message.role !== "custom") {
+				throw new Error(`Passive automatic delivery requires a custom message, received ${message.role}`);
+			}
+			this.agent.appendMessage(message);
+			this.sessionManager.appendCustomMessageEntry(
+				message.customType,
+				message.content,
+				message.display,
+				message.details,
+				message.attribution ?? "agent",
+			);
+			if (message.customType === ASYNC_RESULT_MESSAGE_TYPE && isRecord(message.details)) {
+				const jobs = message.details.jobs;
+				if (Array.isArray(jobs)) {
+					for (const job of jobs) {
+						if (isRecord(job) && typeof job.jobId === "string") this.#queuedAsyncResults.delete(job.jobId);
+					}
+				}
+			}
+		}
+	}
+
+	async #promptAutomaticTurn(
+		messages: AgentMessage | AgentMessage[],
+		options: AutomaticTurnContinuationOptions,
+	): Promise<void> {
+		if (!this.#automaticTurns.authorize(options.authority, options.originTurnId)) {
+			throw new Error(`Automatic turn denied for ${options.authority}`);
+		}
+		if (options.authority === "active_async_result_wake" && !this.#automaticTurns.isTurnOpen(options.originTurnId)) {
+			this.#automaticTurns.record(
+				options.authority,
+				"rejected",
+				"originating asynchronous turn closed",
+				options.originTurnId,
+			);
+			throw new Error("Automatic turn denied because its asynchronous origin closed");
+		}
+		this.#armAutomaticTurnStart(options.authority, options.originTurnId);
+		try {
+			await this.agent.prompt(messages);
+		} catch (error) {
+			this.#recordAutomaticTurnFailed(options.authority, error, options.originTurnId);
+			throw error;
+		}
+	}
+
+	#syncAgentQueueModes(): void {
+		const directUserActive = this.#activeDirectUserContinuationOwner !== undefined;
+		this.agent.setSteeringMode(directUserActive ? "one-at-a-time" : this.#desiredSteeringMode);
+		this.agent.setFollowUpMode(directUserActive ? "one-at-a-time" : this.#desiredFollowUpMode);
+		this.agent.setInterruptMode(directUserActive ? "wait" : this.#desiredInterruptMode);
+	}
+
+	#isolateDirectUserContinuationOwner():
+		| {
+				owner: AgentMessage;
+				queue?: "steering" | "followUp";
+				block?: AgentMessage[];
+				restore: () => void;
+		  }
+		| undefined {
+		if (this.#activeDirectUserContinuationOwner) return undefined;
+		const steering = [...this.agent.peekSteeringQueue()];
+		const followUp = [...this.agent.peekFollowUpQueue()];
+		const pendingAskReanswerOwner = this.#pendingAskReanswerOwner;
+		const transcriptTail = this.agent.state.messages.at(-1);
+		const transcriptOwner =
+			pendingAskReanswerOwner && transcriptTail === pendingAskReanswerOwner ? pendingAskReanswerOwner : undefined;
+		const steeringOwnerIndex = transcriptOwner ? -1 : steering.findIndex(isUserQueuedMessage);
+		const followUpOwnerIndex =
+			transcriptOwner || steeringOwnerIndex >= 0 ? -1 : followUp.findIndex(isUserQueuedMessage);
+		const queue = steeringOwnerIndex >= 0 ? "steering" : followUpOwnerIndex >= 0 ? "followUp" : undefined;
+		const ownerIndex = steeringOwnerIndex >= 0 ? steeringOwnerIndex : followUpOwnerIndex;
+		const queuedOwner = queue ? (queue === "steering" ? steering : followUp)[ownerIndex] : undefined;
+		const owner = transcriptOwner ?? queuedOwner;
+		if (!owner) {
+			this.#pendingAskReanswerOwner = undefined;
+			return undefined;
+		}
+		const block = queue ? this.#queuedOwnerBlock(queue === "steering" ? steering : followUp, ownerIndex) : [];
+		const blockMessages = new Set(block);
+		const parkedQueues = {
+			steering: steering.filter(message => !blockMessages.has(message)),
+			followUp: followUp.filter(message => !blockMessages.has(message)),
+		};
+		this.#parkedDirectUserQueues = parkedQueues;
+		this.#activeDirectUserContinuationOwner = owner;
+		const continuationSettled = Promise.withResolvers<void>();
+		this.#activeDirectUserContinuationSettled = continuationSettled.promise;
+		this.#pendingAskReanswerOwner = undefined;
+		this.#syncAgentQueueModes();
+		let restored = false;
+		let queuesIsolated = false;
+		const detachQueueGuard = this.agent.addBeforeQueuedMessageDequeueHook(() => {
+			if (this.#activeDirectUserContinuationOwner !== owner) return;
+			const currentSteering = [...this.agent.peekSteeringQueue()];
+			const currentFollowUp = [...this.agent.peekFollowUpQueue()];
+			const extraSteering = currentSteering.filter(message => !blockMessages.has(message));
+			const extraFollowUp = currentFollowUp.filter(message => !blockMessages.has(message));
+			if (extraSteering.length === 0 && extraFollowUp.length === 0) return;
+			parkedQueues.steering.push(...extraSteering);
+			parkedQueues.followUp.push(...extraFollowUp);
+			this.agent.replaceQueues(
+				currentSteering.filter(message => blockMessages.has(message)),
+				currentFollowUp.filter(message => blockMessages.has(message)),
+				true,
+			);
+		});
+		const restore = () => {
+			if (restored) return;
+			restored = true;
+			try {
+				detachQueueGuard();
+				if (!queuesIsolated) return;
+				const currentSteering = [...this.agent.peekSteeringQueue()].filter(message => !blockMessages.has(message));
+				const currentFollowUp = [...this.agent.peekFollowUpQueue()].filter(message => !blockMessages.has(message));
+				const ownerPending =
+					queuedOwner !== undefined &&
+					(this.agent.peekSteeringQueue().includes(owner) || this.agent.peekFollowUpQueue().includes(owner));
+				this.agent.replaceQueues(
+					[...(ownerPending && queue === "steering" ? block : []), ...parkedQueues.steering, ...currentSteering],
+					[...(ownerPending && queue === "followUp" ? block : []), ...parkedQueues.followUp, ...currentFollowUp],
+					true,
+				);
+			} finally {
+				if (this.#parkedDirectUserQueues === parkedQueues) this.#parkedDirectUserQueues = undefined;
+				if (this.#activeDirectUserContinuationOwner === owner) {
+					this.#activeDirectUserContinuationOwner = undefined;
+					this.#syncAgentQueueModes();
+				}
+				if (this.#activeDirectUserContinuationSettled === continuationSettled.promise) {
+					this.#activeDirectUserContinuationSettled = undefined;
+				}
+				continuationSettled.resolve();
+			}
+		};
+		try {
+			this.agent.replaceQueues(queue === "steering" ? block : [], queue === "followUp" ? block : [], true);
+			queuesIsolated = true;
+		} catch (error) {
+			restore();
+			throw error;
+		}
+		return { owner, queue, block: queue ? block : undefined, restore };
+	}
 
 	#skipAgentContinue(reason: AgentContinueSkipReason, request: ScheduledAgentContinueRequest): void {
 		logger.debug("agent.continue skipped after scheduling", {
@@ -4282,6 +4498,9 @@ export class AgentSession {
 			source: request.options.source,
 			schedulerToken: request.schedulerToken,
 		});
+		if (request.options.authority) {
+			this.#automaticTurns.record(request.options.authority, "deferred", reason, request.options.originTurnId);
+		}
 		request.options.onSkip?.(reason);
 	}
 
@@ -4297,6 +4516,12 @@ export class AgentSession {
 		signal: AbortSignal,
 		request: ScheduledAgentContinueRequest,
 		coalescedSources: Set<string>,
+		continuation?: {
+			authority: AutomaticTurnSource;
+			originTurnId?: string;
+			directUserQueue?: "steering" | "followUp";
+			directUserBlock?: AgentMessage[];
+		},
 	): Promise<AgentContinueOutcome> {
 		try {
 			const reverted = await this.#recovery.maybeRestoreRetryFallbackPrimary();
@@ -4319,13 +4544,32 @@ export class AgentSession {
 					return { status: "skipped", reason: "session-unavailable" };
 				}
 			}
-			await this.agent.continue(signal);
+			if (continuation) {
+				this.#armAutomaticTurnStart(continuation.authority, continuation.originTurnId);
+				if (continuation.directUserQueue && continuation.directUserBlock) {
+					await this.agent.continueQueuedMessageBlock(
+						continuation.directUserQueue,
+						continuation.directUserBlock,
+						signal,
+					);
+				} else {
+					await this.agent.continue(signal);
+				}
+				await this.#drainInFlightEventHandlers();
+			} else {
+				await this.agent.continue(signal);
+			}
 			return { status: "completed" };
 		} catch (error) {
+			if (continuation) {
+				this.#recordAutomaticTurnFailed(continuation.authority, error, continuation.originTurnId);
+			}
 			logger.warn("agent.continue failed after scheduling", {
-				source: request.options.source,
+				source: request.options.source ?? request.options.authority ?? "scheduled-continuation",
 				schedulerToken: request.schedulerToken,
-				coalescedSources: [...coalescedSources].filter(source => source !== request.options.source),
+				coalescedSources: [...coalescedSources].filter(
+					source => source !== (request.options.source ?? request.options.authority ?? "scheduled-continuation"),
+				),
 				error: error instanceof Error ? error.message : String(error),
 				stack: error instanceof Error ? error.stack : undefined,
 			});
@@ -4334,29 +4578,25 @@ export class AgentSession {
 	}
 
 	#scheduleAgentContinue(options: ScheduledAgentContinueOptions): void {
+		const source = options.source ?? options.authority ?? "scheduled-continuation";
 		const request: ScheduledAgentContinueRequest = {
 			schedulerToken: ++this.#agentContinueSchedulerToken,
 			options,
 		};
 		logger.debug("agent.continue scheduled", {
-			source: options.source,
+			source,
 			schedulerToken: request.schedulerToken,
 		});
 		this.#schedulePostPromptTask(
 			async signal => {
 				let directTurnId: string | undefined;
-				let continuationTurnId: string | undefined;
-				let directUserOwner: AgentMessage | undefined;
 				let restoreDirectUserQueues: (() => void) | undefined;
 				let directUserQueue: "steering" | "followUp" | undefined;
 				let directUserBlock: AgentMessage[] | undefined;
 				let inFlight = false;
-				// Defense in depth: if compaction/handoff slipped onto the post-prompt queue
-				// alongside us (e.g. via a scheduler we don't own), refuse to start a fresh
-				// streaming turn — agent.continue() here would race the handoff's session
-				// reset. The first-class fix is in #checkCompaction/the agent_end handler,
-				// but this guard catches anything that bypasses that path.
-				if (signal.aborted || this.#isDisposed || this.isCompacting || this.isGeneratingHandoff) {
+				const sessionUnavailable = () =>
+					signal.aborted || this.#isDisposed || this.isCompacting || this.isGeneratingHandoff;
+				if (sessionUnavailable()) {
 					this.#skipAgentContinue("session-unavailable", request);
 					return;
 				}
@@ -4365,39 +4605,92 @@ export class AgentSession {
 					return;
 				}
 
-				const active = this.#activeAgentContinue;
-				if (active) {
-					active.coalescedSources.add(options.source);
-					logger.debug("agent.continue coalesced after scheduling", {
-						source: options.source,
-						schedulerToken: request.schedulerToken,
-						activeSource: active.source,
-						activeSchedulerToken: active.schedulerToken,
-					});
-					this.#handleAgentContinueOutcome(await active.promise, request);
-					return;
+				while (this.#activeAgentContinue) {
+					const active = this.#activeAgentContinue;
+					if (!options.authority) {
+						active.coalescedSources.add(source);
+						logger.debug("agent.continue coalesced after scheduling", {
+							source,
+							schedulerToken: request.schedulerToken,
+							activeSource: active.source,
+							activeSchedulerToken: active.schedulerToken,
+						});
+						this.#handleAgentContinueOutcome(await active.promise, request);
+						return;
+					}
+					await active.promise;
+					if (sessionUnavailable()) {
+						this.#skipAgentContinue("session-unavailable", request);
+						return;
+					}
+					if (options.shouldContinue && !options.shouldContinue()) {
+						this.#skipAgentContinue("should-continue-false", request);
+						return;
+					}
+				}
+
+				const authority = options.authority;
+				if (authority && !this.#automaticTurns.authorize(authority, options.originTurnId)) return;
+				if (authority === "direct_user_input") {
+					do {
+						try {
+							await this.#waitForSemanticDeliveryAcceptances(undefined, signal);
+						} catch (error) {
+							if (!signal.aborted) throw error;
+						}
+						if (
+							sessionUnavailable() ||
+							this.#lifecycleTransitionFenceActive ||
+							this.#queuedPromptDeliveryMutationReservations > 0 ||
+							this.#queuedPromptDeliveryMutationInFlight
+						) {
+							this.#skipAgentContinue("session-unavailable", request);
+							return;
+						}
+					} while (this.#semanticDeliveryAcceptances.size > 0);
+					if (options.shouldContinue && !options.shouldContinue()) {
+						this.#skipAgentContinue("should-continue-false", request);
+						return;
+					}
+					const directUser = this.#isolateDirectUserContinuationOwner();
+					if (!directUser) {
+						this.#skipAgentContinue("should-continue-false", request);
+						return;
+					}
+					restoreDirectUserQueues = directUser.restore;
+					directUserQueue = directUser.queue;
+					directUserBlock = directUser.block;
+					this.#closeCurrentTurn();
+					directTurnId = this.#automaticTurns.openTurn();
+					this.#currentTurnId = directTurnId;
 				}
 
 				this.#beginInFlight();
-				const coalescedSources = new Set([options.source]);
-				const promise = this.#runAgentContinue(signal, request, coalescedSources);
+				inFlight = true;
+				const coalescedSources = new Set<string>([source]);
+				const continuation = authority
+					? {
+							authority,
+							originTurnId: directTurnId ?? options.originTurnId ?? this.#currentTurnId,
+							...(directUserQueue && directUserBlock ? { directUserQueue, directUserBlock } : {}),
+						}
+					: undefined;
+				const promise = this.#runAgentContinue(signal, request, coalescedSources, continuation);
 				const attempt: ActiveAgentContinue = {
 					schedulerToken: request.schedulerToken,
-					source: options.source,
+					source,
 					coalescedSources,
 					promise,
 				};
 				this.#activeAgentContinue = attempt;
 				try {
-					this.#handleAgentContinueOutcome(await promise, request);
+					const outcome = await promise;
+					if (outcome.status !== "completed" && directTurnId) this.#closeTurn(directTurnId);
+					this.#handleAgentContinueOutcome(outcome, request);
 				} finally {
-					// Clear the active attempt BEFORE #endInFlight(): the settle drain it
-					// triggers (#drainStrandedQueuedMessages -> queued-message-drain) runs
-					// synchronously and must start a fresh continue for messages queued
-					// after this attempt's final poll, not coalesce onto the finished one.
-					if (this.#activeAgentContinue === attempt) {
-						this.#activeAgentContinue = undefined;
-					}
+					// Clear the active attempt before #endInFlight(): its synchronous settle
+					// drain must start a new continuation instead of joining this completed one.
+					if (this.#activeAgentContinue === attempt) this.#activeAgentContinue = undefined;
 					this.#usagePreflightReadyForNextModelCall = false;
 					try {
 						restoreDirectUserQueues?.();
@@ -4556,8 +4849,11 @@ export class AgentSession {
 	}): boolean {
 		if (options.suppressContinuation) return false;
 		if (this.agent.hasQueuedMessages()) {
+			const queuedAuthority = this.#queuedTurnAuthority();
+			if (!queuedAuthority) return false;
 			this.#scheduleAgentContinue({
 				source: "compaction-queued-message",
+				...queuedAuthority,
 				delayMs: 100,
 				generation: options.generation,
 				shouldContinue: () => this.agent.hasQueuedMessages(),
@@ -4613,6 +4909,7 @@ export class AgentSession {
 					if (!queuedAuthority) return;
 					this.#scheduleAgentContinue({
 						source: "auto-continue-queued-message",
+						...queuedAuthority,
 						generation,
 						shouldContinue: () => this.agent.hasQueuedMessages(),
 					});
@@ -5204,6 +5501,9 @@ export class AgentSession {
 	 */
 	beginDispose(): void {
 		this.#isDisposed = true;
+		this.#unsubscribeAgentQueueChanges?.();
+		this.#unsubscribeAgentQueueChanges = undefined;
+		this.#queuedPromptListeners.clear();
 		this.#fallbackDiscoveryRevalidationAbortController.abort();
 		this.#queuedMessageDrainBlocked = false;
 		this.#usagePreflightReadyForNextModelCall = false;
@@ -6878,16 +7178,11 @@ export class AgentSession {
 	 */
 
 	async prompt(text: string, options?: PromptOptions): Promise<boolean> {
-		// Stamp the operator's submission instant before ANY async preprocessing —
-		// command execution, image normalization, vision-model description — so the
-		// prompt→yield delta includes the whole wait, whatever path the prompt takes.
+		// Stamp the operator's submission instant before any asynchronous preprocessing
+		// so prompt-to-yield timing includes command, image, and vision work.
 		const submittedAt = Date.now();
-		// A manual `/compact` runs with the agent subscription disconnected until its
-		// cleanup finally re-drains the preserved queues. Starting a turn before then
-		// would neither persist nor forward its events and could race the in-flight
-		// history rewrite. `abort` still overtakes compaction; ordinary prompts wait
-		// here. No-op when no manual compaction is active.
-		await this.#maintenance.manualCompactionCleanup;
+		const abort = this.#abortPromise;
+		if (abort) await abort;
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		const queueDuringSemanticMaintenance =
 			this.#semanticDeliveryMaintenanceFenceActive &&
@@ -6972,16 +7267,16 @@ export class AgentSession {
 			const streamingBehavior = options?.streamingBehavior;
 			if (!streamingBehavior) throw new AgentBusyError();
 
-			// Steer/follow-up the keyword notices BEFORE the queued user message so the
-			// model reads the steering notice ahead of the prompt it modifies.
-			for (const notice of keywordNotices) {
-				await this.#queueCustomMessage(notice, streamingBehavior);
-			}
-			if (streamingBehavior === "followUp") {
-				await this.#queueUserMessage(expandedText, options?.images, "followUp", submittedAt);
-			} else {
-				await this.#queueUserMessage(expandedText, options?.images, "steer", submittedAt);
-			}
+			// Queue keyword notices and their owning user message as one accepted batch so
+			// a lifecycle transition cannot strand a notice without the prompt it modifies.
+			await this.#queueUserMessage(
+				expandedText,
+				options?.images,
+				streamingBehavior === "followUp" ? "followUp" : "steer",
+				submittedAt,
+				lifecycleGeneration,
+				keywordNotices,
+			);
 			return true;
 		}
 
@@ -7213,6 +7508,9 @@ export class AgentSession {
 		this.#beginInFlight();
 		const generation = this.#promptGeneration;
 		this.#promptSequence++;
+		let restorePromptMessages: (() => void) | undefined;
+		let promptMessagesCommitted = false;
+		const previousPlanReferenceSent = this.#planReferenceSent;
 		try {
 			if (provisionalPeerMessageWake) this.#provisionalPeerMessageWake = provisionalPeerMessageWake;
 			await this.#recovery.maybeRestoreRetryFallbackPrimary();
@@ -7702,11 +8000,13 @@ export class AgentSession {
 			this.#throwIfExtensionCommand(text);
 		}
 
+		const lifecycleGeneration = this.#lifecycleTransitionGeneration;
+		this.#assertQueuedUserMessageCanStart(lifecycleGeneration);
 		const expandedText = expandPromptTemplate(text, [...this.#promptTemplates]);
 		// Stamp before image preprocessing so a queued image steer measures from
 		// the operator's submission, not after the vision-model description.
 		const submittedAt = Date.now();
-		await this.#queueUserMessage(expandedText, images, "steer", submittedAt);
+		await this.#queueUserMessage(expandedText, images, "steer", submittedAt, lifecycleGeneration);
 	}
 
 	/**
@@ -7730,7 +8030,7 @@ export class AgentSession {
 		// from the operator's submission, not after the vision-model description.
 		const submittedAt = Date.now();
 		if (!options?.synthetic) {
-			await this.#queueUserMessage(expandedText, images, "followUp", submittedAt);
+			await this.#queueUserMessage(expandedText, images, "followUp", submittedAt, lifecycleGeneration);
 			return;
 		}
 		// Synthetic branch: agent-initiated hidden developer message. Bypass
@@ -7794,6 +8094,8 @@ export class AgentSession {
 		images: ImageContent[] | undefined,
 		mode: "steer" | "followUp",
 		timestamp?: number,
+		lifecycleGeneration?: number,
+		prependMessages: readonly CustomMessage[] = [],
 	): Promise<void> {
 		const acceptedLifecycleGeneration = lifecycleGeneration ?? this.#lifecycleTransitionGeneration;
 		this.#assertQueuedUserMessageCanStart(acceptedLifecycleGeneration);
@@ -7827,28 +8129,17 @@ export class AgentSession {
 			role: "user",
 			content,
 			attribution: "user",
-			timestamp: Date.now(),
+			timestamp: timestamp ?? Date.now(),
 			...(mode === "steer" ? { steering: true } : {}),
 		};
 		if (mode === "followUp") {
 			for (const prependMessage of normalizedPrependMessages) this.agent.followUp(prependMessage);
 			if (imageDescriptionNotice) this.agent.followUp(imageDescriptionNotice);
-			this.agent.followUp({
-				role: "user",
-				content,
-				attribution: "user",
-				timestamp: timestamp ?? Date.now(),
-			});
+			this.agent.followUp(userMessage);
 		} else {
 			for (const prependMessage of normalizedPrependMessages) this.agent.steer(prependMessage);
 			if (imageDescriptionNotice) this.agent.steer(imageDescriptionNotice);
-			this.agent.steer({
-				role: "user",
-				content,
-				steering: true,
-				attribution: "user",
-				timestamp: timestamp ?? Date.now(),
-			});
+			this.agent.steer(userMessage);
 		}
 		this.#attachPendingExplicitPromptMessages(userMessage);
 		this.#scheduleIdleQueueDrain();
@@ -7893,6 +8184,7 @@ export class AgentSession {
 		this.#queuedMessageDrainScheduled = true;
 		this.#scheduleAgentContinue({
 			source: "queued-message-drain",
+			...queuedAuthority,
 			shouldContinue: () => {
 				this.#queuedMessageDrainScheduled = false;
 				return (
@@ -7914,13 +8206,11 @@ export class AgentSession {
 		return true;
 	}
 
-	#queuedTurnAuthority(): Pick<ScheduledAgentContinueOptions, "authority" | "originTurnId"> | undefined {
+	#queuedTurnAuthority(): AutomaticTurnContinuationOptions | undefined {
 		return this.#messageTurnAuthority([...this.agent.peekSteeringQueue(), ...this.agent.peekFollowUpQueue()]);
 	}
 
-	#yieldTurnAuthority(
-		messages: readonly AgentMessage[],
-	): Pick<ScheduledAgentContinueOptions, "authority" | "originTurnId"> | undefined {
+	#yieldTurnAuthority(messages: readonly AgentMessage[]): AutomaticTurnContinuationOptions | undefined {
 		for (const message of messages) {
 			if (message.role !== "custom" || message.customType !== ASYNC_RESULT_MESSAGE_TYPE) continue;
 			const jobs = isRecord(message.details) ? message.details.jobs : undefined;
@@ -7933,9 +8223,7 @@ export class AgentSession {
 		return undefined;
 	}
 
-	#messageTurnAuthority(
-		messages: readonly AgentMessage[],
-	): Pick<ScheduledAgentContinueOptions, "authority" | "originTurnId"> | undefined {
+	#messageTurnAuthority(messages: readonly AgentMessage[]): AutomaticTurnContinuationOptions | undefined {
 		if (messages.some(isUserQueuedMessage)) return { authority: "direct_user_input" };
 		for (const message of messages) {
 			if (message.role !== "custom" || message.customType !== ASYNC_RESULT_MESSAGE_TYPE) continue;
@@ -11009,98 +11297,26 @@ export class AgentSession {
 			})) as SessionBeforeSwitchResult | undefined;
 			if (result?.cancel) return false;
 		}
-
-		this.#disconnectFromAgent();
-		await this.abort({ goalReason: "internal" });
-		await this.#sessionBeforeSwitchReconciler?.();
-
-		await this.#bash.flushPending();
-		// Flush pending writes before switching so restore snapshots reflect committed state.
-		await this.sessionManager.flush();
-		const previousSessionState = this.sessionManager.captureState();
-		const bashTransition = this.#bash.beginSessionTransition();
-		// Only same-session reloads compare against the prior context to detect
-		// rollback edits (`#didSessionMessagesChange` below). Building it for a
-		// different-session switch is a pure waste — and on huge pre-fix sessions
-		// it materializes every persisted snapcompact frame plus the
-		// `openaiRemoteCompaction.replacementHistory` payload into messages,
-		// blowing the heap before the new session even loads (issue #3846). The
-		// error-recovery path rebuilds the context on demand from the restored
-		// state instead.
-		const previousSessionContext = switchingToDifferentSession ? undefined : this.buildDisplaySessionContext();
-		// switchSession replaces these arrays wholesale during load/rollback, so retaining
-		// the existing message objects is sufficient and avoids structured-clone failures for
-		// extension/custom metadata that is valid to persist but not cloneable.
-		const previousAgentMessages = [...this.agent.state.messages];
-		const previousSteeringMessages = [...this.agent.peekSteeringQueue()];
-		const previousFollowUpMessages = [...this.agent.peekFollowUpQueue()];
-		const previousPendingNextTurnMessages = [...this.#pendingNextTurnMessages];
-		const previousScheduledHiddenNextTurnGeneration = this.#scheduledHiddenNextTurnGeneration;
-		const previousQueuedMessageDrainBlocked = this.#queuedMessageDrainBlocked;
-		const previousUsagePreflightReadyForNextModelCall = this.#usagePreflightReadyForNextModelCall;
-		const previousUsagePreflightReadyModel = this.#usagePreflightReadyModel;
-		const previousModel = this.model;
-		const previousThinkingLevel = this.thinkingLevel;
-		const previousAutoThinking = this.isAutoThinking;
-		const previousAutoResolvedLevel = this.autoResolvedThinkingLevel();
-		const previousServiceTierByFamily = this.serviceTierByFamily;
-		const previousTools = [...this.agent.state.tools];
-		const previousBaseSystemPrompt = this.#tools.baseSystemPrompt;
-		const previousSystemPrompt = this.agent.state.systemPrompt;
-		const previousBaseSystemPromptBeforeMemoryPromotion = this.#memory.promotionSnapshot;
-		const previousFreshProviderSessionId = this.#freshProviderSessionId;
-		const previousInheritedProviderPromptCacheKey = this.#inheritedProviderPromptCacheKey;
-
-		// Snapshot the full checkpoint runtime state: the success path calls
-		// #rehydrateCheckpointRewindState(), which clears and rebuilds all four
-		// fields from the target branch. On rollback every one must be restored,
-		// or a failed switch leaks the target session's checkpoint state.
-		const previousCheckpointState = this.#checkpointState;
-		const previousPendingRewindReport = this.#pendingRewindReport;
-		const previousLastCompletedRewind = this.#lastCompletedRewind;
-		const previousRewoundToolResultIds = new Set(this.#rewoundToolResultIds);
-
-		this.agent.clearAllQueues();
-		this.#pendingNextTurnMessages = [];
-		this.#scheduledHiddenNextTurnGeneration = undefined;
-		this.#queuedMessageDrainBlocked = false;
-		this.#usagePreflightReadyForNextModelCall = false;
-		this.#usagePreflightReadyModel = undefined;
-
+		const previousCwd = this.sessionManager.getCwd();
 		let cwdChangeTarget: string | undefined;
+		const lifecycle = await this.#beginLifecycleTransaction();
 		try {
 			if (this.#extensionRunner) {
 				lifecycle.markPublicationStarted();
 				await this.#extensionRunner.emitBeforeSessionMutation({ type: "session_switch" });
 			}
-			await this.sessionManager.setSessionFile(sessionPath);
-			this.#bash.markSessionTransition(bashTransition);
-			const newCwd = this.sessionManager.getCwd();
-			const recordedCwd = this.sessionManager.getRecordedCwd() ?? previousSessionState.cwd;
-			if (options?.preserveLocalCwd) {
-				this.sessionManager.setCwdWithoutRelocation(previousSessionState.cwd);
-			} else {
-				if (!options?.onCwdChange && path.resolve(recordedCwd) !== path.resolve(previousSessionState.cwd)) {
-					throw SESSION_CWD_CHANGE_REJECTED;
-				}
-				if (options?.onCwdChange) {
-					if (path.resolve(newCwd) !== path.resolve(previousSessionState.cwd)) {
-						cwdChangeTarget = newCwd;
-						if (!(await options.onCwdChange(newCwd, previousSessionState.cwd))) {
-							throw SESSION_CWD_CHANGE_REJECTED;
-						}
-					} else if (path.resolve(recordedCwd) !== path.resolve(previousSessionState.cwd)) {
-						throw SESSION_CWD_CHANGE_REJECTED;
-					}
-				}
-			}
-			if (switchingToDifferentSession) {
-				this.#freshProviderSessionId = undefined;
-				this.#clearInheritedProviderPromptCacheKey();
-				this.#adoptInheritedProviderPromptCacheKey();
-			}
-			this.#syncAgentSessionId(undefined, false);
-			this.#memory.rekeyForCurrentSessionId();
+			await this.#sessionBeforeSwitchReconciler?.();
+			await lifecycle.captureRetained({ capturePersistedSessionFile: true });
+			await this.abort({ goalReason: "internal", preserveToolChoice: true });
+			await this.#bash.flushPending();
+			await this.sessionManager.flush();
+			await this.#advisors.drainAndDetachRecorders();
+			await lifecycle.recaptureRetained({ capturePersistedSessionFile: true });
+			const targetPersistedSessionFile = await this.sessionManager.capturePersistedSessionFileAt(sessionPath);
+			// A same-session reload alone needs a prior transcript for rollback-change
+			// detection; avoid materializing a potentially huge unrelated transcript.
+			const previousSessionContext = switchingToDifferentSession ? undefined : this.buildDisplaySessionContext();
+			await lifecycle.acquireOwnership();
 
 			if (this.#extensionRunner) {
 				await this.#extensionRunner.emit({
@@ -11120,6 +11336,25 @@ export class AgentSession {
 			this.#usagePreflightReadyModel = undefined;
 
 			await this.sessionManager.setSessionFile(sessionPath);
+			const newCwd = this.sessionManager.getCwd();
+			const recordedCwd = this.sessionManager.getRecordedCwd() ?? previousCwd;
+			if (options?.preserveLocalCwd) {
+				this.sessionManager.setCwdWithoutRelocation(previousCwd);
+			} else {
+				if (!options?.onCwdChange && path.resolve(recordedCwd) !== path.resolve(previousCwd)) {
+					throw SESSION_CWD_CHANGE_REJECTED;
+				}
+				if (options?.onCwdChange) {
+					if (path.resolve(newCwd) !== path.resolve(previousCwd)) {
+						cwdChangeTarget = newCwd;
+						if (!(await options.onCwdChange(newCwd, previousCwd))) {
+							throw SESSION_CWD_CHANGE_REJECTED;
+						}
+					} else if (path.resolve(recordedCwd) !== path.resolve(previousCwd)) {
+						throw SESSION_CWD_CHANGE_REJECTED;
+					}
+				}
+			}
 			const targetArtifactTransaction = await this.sessionManager.beginArtifactTransaction();
 			lifecycle.bindResource("target artifact transaction", {
 				finalize: () => targetArtifactTransaction.commit(),
@@ -11262,65 +11497,16 @@ export class AgentSession {
 			}
 			return true;
 		} catch (error) {
-			this.sessionManager.restoreState(previousSessionState);
-			this.#freshProviderSessionId = previousFreshProviderSessionId;
-			this.#syncAgentSessionId(previousSessionState.sessionId, false);
-			this.#memory.rekeyForCurrentSessionId();
-			this.agent.setTools(previousTools);
-			this.#tools.setBaseSystemPrompt(previousBaseSystemPrompt);
-			this.#memory.restorePromotionSnapshot(previousBaseSystemPromptBeforeMemoryPromotion);
-			this.agent.setSystemPrompt(previousSystemPrompt);
-			this.agent.replaceMessages(previousAgentMessages);
-			this.agent.replaceQueues(previousSteeringMessages, previousFollowUpMessages);
-			this.#pendingNextTurnMessages = previousPendingNextTurnMessages;
-			this.#scheduledHiddenNextTurnGeneration = previousScheduledHiddenNextTurnGeneration;
-			this.#queuedMessageDrainBlocked = previousQueuedMessageDrainBlocked;
-			this.#usagePreflightReadyForNextModelCall = previousUsagePreflightReadyForNextModelCall;
-			this.#usagePreflightReadyModel = previousUsagePreflightReadyModel;
-			this.#inheritedProviderPromptCacheKey = previousInheritedProviderPromptCacheKey;
-			this.#checkpointState = previousCheckpointState;
-			this.#pendingRewindReport = previousPendingRewindReport;
-			this.#lastCompletedRewind = previousLastCompletedRewind;
-			this.#rewoundToolResultIds = previousRewoundToolResultIds;
-			// The try block may have already reached #setModelWithProviderSessionReset
-			// for the target session's model, which emits `model_changed` for it.
-			// Restoring here bypasses that method (it also resets provider-session
-			// state we're already unwinding above), so if the rollback actually
-			// changes the model back, emit the corrective event ourselves —
-			// otherwise ACP/RPC/TUI keep advertising the never-committed target.
-			// Deferred until after restoreThinkingSnapshot below: #emit's listeners
-			// (ACP's #handleLifetimeEvent -> #pushConfigOptionUpdate) read
-			// session state synchronously before their first await, so emitting
-			// here — before the target session's thinking level is unwound —
-			// would push a { previousModel, target-session-thinking } config that
-			// was never a real session state.
-			let modelRolledBack = false;
-			if (previousModel) {
-				const rolledBackModel = this.model;
-				this.agent.setModel(previousModel);
-				modelRolledBack = !modelsAreEqual(rolledBackModel, previousModel);
-			}
-			this.#models.restoreThinkingSnapshot(previousThinkingLevel, previousAutoThinking, previousAutoResolvedLevel);
-			this.#models.restoreServiceTiers(previousServiceTierByFamily);
-			if (modelRolledBack) {
-				this.#emit({ type: "model_changed" });
-			}
-			this.#todo.syncFromBranch();
-			this.#advisors.resetAllRuntimes();
-			this.#advisors.reattachRecorderFeeds();
-			this.#reconnectToAgent();
-			try {
-				await this.#sessionSwitchReconciler?.();
-			} catch (reconcileError) {
-				logger.warn("Failed to reconcile session mode after switch rollback", {
-					targetSessionFile: sessionPath,
-					error: String(reconcileError),
-				});
-			}
+			await lifecycle.rollback({
+				cause: error,
+				message: "Session switch failed and rollback was incomplete",
+				reconcileMode: true,
+				preserveNewerRetainedMutations: switchingToDifferentSession,
+			});
 			if (cwdChangeTarget && error !== SESSION_CWD_CHANGE_REJECTED && options?.onCwdChange) {
 				let rollbackFailure: string | undefined;
 				try {
-					if (!(await options.onCwdChange(previousSessionState.cwd, cwdChangeTarget))) {
+					if (!(await options.onCwdChange(previousCwd, cwdChangeTarget))) {
 						rollbackFailure = "cwd rollback was rejected";
 					}
 				} catch (rollbackError) {
@@ -11328,13 +11514,11 @@ export class AgentSession {
 				}
 				if (rollbackFailure) {
 					this.beginDispose();
-					this.#bash.finishSessionTransition(bashTransition, false);
-					logger.warn("Failed to restore cwd after session switch", { cwd: previousSessionState.cwd });
+					logger.warn("Failed to restore cwd after session switch", { cwd: previousCwd });
 					const original = error instanceof Error ? error.message : String(error);
 					throw new Error(`${original} (${rollbackFailure}; the process may remain in ${cwdChangeTarget})`);
 				}
 			}
-			this.#bash.finishSessionTransition(bashTransition, false);
 			if (error === SESSION_CWD_CHANGE_REJECTED) return false;
 			throw error;
 		}
@@ -11978,7 +12162,7 @@ export class AgentSession {
 	 * guards as every other post-prompt continuation.
 	 */
 	resumeAfterAskReanswer(): void {
-		this.#scheduleAgentContinue({ source: "ask-reanswer" });
+		this.#scheduleAgentContinue({ source: "ask-reanswer", authority: "direct_user_input" });
 	}
 
 	/**

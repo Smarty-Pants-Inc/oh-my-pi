@@ -36,6 +36,8 @@ export interface PersistedSubagentReviveContext {
 	eventBus?: EventBus;
 	/** Root-scoped observability bus the revived run's frames also publish to. */
 	subagentEventBus?: EventBus;
+	/** Protected sessions never trust a mutable persisted system prompt across processes. */
+	protectedRuntime: boolean;
 }
 
 /**

@@ -14,6 +14,7 @@ import {
 	ChatToolDefinitionSchema,
 	CompletionConfigurationSchema,
 	ConversationalPlannerMode,
+	type GetChatMessageRequest,
 	GetChatMessageRequestSchema,
 	GetChatMessageResponseSchema,
 	GetUserJwtRequestSchema,
@@ -189,7 +190,11 @@ export const streamDevin: StreamFunction<"devin-agent"> = (
 				assignment = await assignDevinModel(model, turn, chatBaseUrl, fetchImpl, options?.signal);
 				output.upstreamModel = assignment.modelUid;
 			}
-			const request = buildDevinChatRequest(model, context, options, turn, assignment);
+			let request = buildDevinChatRequest(model, context, options, turn, assignment);
+			if (options?.onPayload !== undefined) {
+				const { apiKey, userJwt } = devinCliMetadata(turn.apiKey, turn.userJwt);
+				request = await applyDevinPayloadGuard(request, model, options, apiKey, userJwt);
+			}
 			const reqBytes = toBinary(GetChatMessageRequestSchema, request);
 			// Serialize before observation so a local callback cannot mutate the
 			// already-approved contracts between evidence capture and transport.
@@ -618,7 +623,12 @@ function buildDevinChatRequest(
 			: DEVIN_DEFAULT_STOP_PATTERNS;
 	return create(GetChatMessageRequestSchema, {
 		metadata: create(MetadataSchema, devinCliMetadata(turn.apiKey, turn.userJwt)),
-		prompt: normalizeSystemPrompts(context.systemPrompt).join("\n\n"),
+		prompt: [
+			...normalizeSystemPrompts(context.systemPrompt),
+			...mapContextInstructionsForModel(context.instructions, model).map(instruction =>
+				instruction.renderedText.toWellFormed(),
+			),
+		].join("\n\n"),
 		chatMessagePrompts: buildChatMessagePrompts(turn.messages, turn.cascadeId, model),
 		chatModelUid: assignment?.modelUid ?? options?.chatModelUid ?? model.requestModelId ?? model.id,
 		...(assignment ? { modelAssignmentJwt: assignment.assignmentJwt } : undefined),
@@ -649,6 +659,86 @@ function buildDevinChatRequest(
 			}),
 		),
 	});
+}
+
+/**
+ * Expose a credential-free JSON request to the final-payload hook, then
+ * restore the gateway-owned credentials only after validating its replacement.
+ */
+async function applyDevinPayloadGuard(
+	request: GetChatMessageRequest,
+	model: Model<"devin-agent">,
+	options: DevinOptions,
+	apiKey: string,
+	userJwt: string,
+): Promise<GetChatMessageRequest> {
+	const payload = toJson(GetChatMessageRequestSchema, request) as Record<string, JsonValue>;
+	const metadata = payload.metadata;
+	if (typeof metadata !== "object" || metadata === null || Array.isArray(metadata)) {
+		throw new AIError.ValidationError("Devin request metadata is missing before onPayload");
+	}
+	const modelAssignmentJwt = request.modelAssignmentJwt;
+	const arenaAssignmentJwt = request.arenaAssignmentJwt;
+	const credentialFreePayload: Record<string, JsonValue> = {
+		...payload,
+		metadata: { ...metadata, apiKey: "", userJwt: "" },
+	};
+	if (modelAssignmentJwt !== undefined) credentialFreePayload.modelAssignmentJwt = "";
+	if (arenaAssignmentJwt !== undefined) credentialFreePayload.arenaAssignmentJwt = "";
+
+	const replacement = await options.onPayload?.(credentialFreePayload, model);
+	const candidate = replacement ?? credentialFreePayload;
+	let normalized: JsonValue;
+	try {
+		const json = JSON.stringify(candidate);
+		if (json === undefined) throw new TypeError("replacement is not JSON");
+		normalized = JSON.parse(json) as JsonValue;
+	} catch (error) {
+		throw new AIError.ValidationError(
+			`Devin onPayload replacement must be JSON-safe: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	if (typeof normalized !== "object" || normalized === null || Array.isArray(normalized)) {
+		throw new AIError.ValidationError("Devin onPayload replacement must preserve the request object");
+	}
+	const finalMetadata = normalized.metadata;
+	const authFields =
+		typeof finalMetadata === "object" && finalMetadata !== null && !Array.isArray(finalMetadata)
+			? Object.entries(finalMetadata).filter(([key]) => {
+					const normalizedKey = key.replaceAll("_", "").replaceAll("-", "").toLowerCase();
+					return normalizedKey === "apikey" || normalizedKey === "userjwt";
+				})
+			: [];
+	if (
+		typeof finalMetadata !== "object" ||
+		finalMetadata === null ||
+		Array.isArray(finalMetadata) ||
+		authFields.length !== 2 ||
+		authFields.some(([key, value]) => (key !== "apiKey" && key !== "userJwt") || value !== "") ||
+		finalMetadata.apiKey !== "" ||
+		finalMetadata.userJwt !== "" ||
+		(modelAssignmentJwt === undefined
+			? normalized.modelAssignmentJwt !== undefined
+			: normalized.modelAssignmentJwt !== "") ||
+		(arenaAssignmentJwt === undefined
+			? normalized.arenaAssignmentJwt !== undefined
+			: normalized.arenaAssignmentJwt !== "")
+	) {
+		throw new AIError.ValidationError("Devin onPayload replacement cannot inject or rebind provider credentials");
+	}
+	try {
+		const restored: Record<string, JsonValue> = {
+			...normalized,
+			metadata: { ...finalMetadata, apiKey, userJwt },
+		};
+		if (modelAssignmentJwt !== undefined) restored.modelAssignmentJwt = modelAssignmentJwt;
+		if (arenaAssignmentJwt !== undefined) restored.arenaAssignmentJwt = arenaAssignmentJwt;
+		return fromJson(GetChatMessageRequestSchema, restored);
+	} catch (error) {
+		throw new AIError.ValidationError(
+			`Devin onPayload replacement is not a valid request: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
 }
 
 /** Flatten one user/developer turn into a Cascade USER prompt with inline images. */

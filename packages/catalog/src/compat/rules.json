@@ -6033,7 +6033,30 @@
 				}
 			},
 			{
-				"source": "classes/qwen.kdl:41",
+				"source": "classes/qwen.kdl:45",
+				"class": "qwen",
+				"providers": [
+					"llama.cpp",
+					"lm-studio"
+				],
+				"revision": [
+					{
+						"op": ">=",
+						"revision": "3.8.0"
+					}
+				],
+				"models": [
+					{
+						"kind": "glob",
+						"value": "*qwen3.8-2.4t-a95b*"
+					}
+				],
+				"thinking": {
+					"requiresEffort": true
+				}
+			},
+			{
+				"source": "classes/qwen.kdl:40",
 				"class": "qwen",
 				"providers": [
 					"llama.cpp",
@@ -6055,12 +6078,33 @@
 						"low",
 						"medium",
 						"xhigh"
-					],
+					]
+				}
+			},
+			{
+				"source": "classes/qwen.kdl:56",
+				"class": "qwen",
+				"providers": [
+					"vllm"
+				],
+				"revision": [
+					{
+						"op": ">=",
+						"revision": "3.8.0"
+					}
+				],
+				"models": [
+					{
+						"kind": "glob",
+						"value": "*qwen3.8-2.4t-a95b*"
+					}
+				],
+				"thinking": {
 					"requiresEffort": true
 				}
 			},
 			{
-				"source": "classes/qwen.kdl:50",
+				"source": "classes/qwen.kdl:51",
 				"class": "qwen",
 				"providers": [
 					"vllm"
@@ -6081,12 +6125,11 @@
 						"low",
 						"medium",
 						"xhigh"
-					],
-					"requiresEffort": true
+					]
 				}
 			},
 			{
-				"source": "classes/qwen.kdl:60",
+				"source": "classes/qwen.kdl:63",
 				"class": "qwen",
 				"providers": [
 					"alibaba-token-plan"
@@ -6097,7 +6140,7 @@
 				}
 			},
 			{
-				"source": "classes/qwen.kdl:64",
+				"source": "classes/qwen.kdl:67",
 				"class": "qwen",
 				"providers": [
 					"alibaba-token-plan"
@@ -6119,7 +6162,7 @@
 				}
 			},
 			{
-				"source": "classes/qwen.kdl:68",
+				"source": "classes/qwen.kdl:71",
 				"class": "qwen",
 				"providers": [
 					"alibaba-token-plan"

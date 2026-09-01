@@ -3965,11 +3965,14 @@ export function lmStudioModelManagerOptions(
 				mapModel: (entry, defaults) => {
 					const reference = references.get(defaults.id);
 					const model = mapWithBundledReference(entry, defaults, reference);
+					const identity = classifyModel("lm-studio", model.id, { lenient: true });
 					return {
 						...model,
 						reasoning:
 							model.reasoning ||
-							(compat?.qwenTemplateReasoningEffort !== false && isQwen38PlusTemplateEffortModelId(model.id)),
+							(compat?.qwenTemplateReasoningEffort !== false &&
+								identity.class === "qwen" &&
+								revisionAtLeast(identity.revision, "3.8")),
 						...(compat ? { compat: { ...(model.compat ?? {}), ...compat } } : {}),
 					};
 				},
@@ -5805,11 +5808,14 @@ export function vllmModelManagerOptions(config?: VllmModelManagerConfig): ModelM
 						...model,
 						contextWindow: toPositiveNumber(entry.max_model_len, model.contextWindow),
 						// vLLM's /v1/models reports no reasoning capability. Qwen 3.8+
-						// open weights always think (the template cannot disable it), so
-						// light up the effort dial; buildModel derives the template
-						// ladder from the id + local-backend compat.
+						// open weights expose the template effort dial, so mark the
+						// capability unless the configured provider explicitly disables it.
 						reasoning:
-							model.reasoning || (identity.class === "qwen" && revisionAtLeast(identity.revision, "3.8")),
+							model.reasoning ||
+							(compat?.qwenTemplateReasoningEffort !== false &&
+								identity.class === "qwen" &&
+								revisionAtLeast(identity.revision, "3.8")),
+						...(compat ? { compat: { ...(model.compat ?? {}), ...compat } } : {}),
 					};
 				},
 				fetch: config?.fetch,

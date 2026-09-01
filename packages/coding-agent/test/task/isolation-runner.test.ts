@@ -7,6 +7,7 @@ import type {
 	ExecutionEnvironmentLease,
 	ExecutionEnvironmentProvider,
 } from "@oh-my-pi/pi-coding-agent/session/execution-environment";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import {
 	applyEligibleNestedPatches,
@@ -705,6 +706,64 @@ describe("runIsolatedSubprocess", () => {
 		vi.spyOn(worktreeModule, "cleanupIsolation").mockRejectedValue(new Error("cleanup failed"));
 		const onSubprocessResult = vi.fn((child: SingleResult) => {
 			sessionManager.recordEvalSubagentOutput(child.usage?.output ?? 0);
+		});
+
+		await expect(
+			runIsolatedSubprocess({
+				baseOptions: {
+					cwd: "/repo",
+					agent: {
+						name: "task",
+						description: "Task agent",
+						systemPrompt: "test",
+						source: "bundled",
+					},
+					task: "Do work",
+					index: 0,
+					id: "UsageAccounting",
+				},
+				context: {
+					repoRoot: "/repo",
+					baseline: {
+						root: {
+							repoRoot: "/repo",
+							headCommit: "base",
+							staged: "",
+							unstaged: "",
+							untracked: [],
+							untrackedPatch: "",
+						},
+						nested: [],
+					},
+				},
+				preferredBackend: undefined,
+				agentId: "UsageAccounting",
+				mergeMode: "patch",
+				artifactsDir: "/artifacts",
+				buildFailureResult: error => result({ exitCode: 1, error: String(error) }),
+				onSubprocessResult,
+			}),
+		).rejects.toThrow("cleanup failed");
+
+		expect(onSubprocessResult).toHaveBeenCalledTimes(1);
+		expect(sessionManager.getTurnBudget()).toEqual({
+			total: 100_000,
+			spent: 1_234,
+			hard: true,
+		});
+	});
+
+	it("releases an environment lease before deferred worktree cleanup", async () => {
+		const events: string[] = [];
+		const isolationDir = "/repo/.omp/isolation/EnvironmentTask";
+		const cleanupGate = Promise.withResolvers<void>();
+		const { capture } = setupLifecycleMocks(events, isolationDir);
+		const environment = fakeEnvironment(events, isolationDir);
+		let deferredCleanup: Promise<void> | undefined;
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			events.push("child");
+			options.onCleanupDeferred?.(cleanupGate.promise);
+			return result({ id: "EnvironmentTask", exitCode: 1, aborted: true, error: "cleanup pending" });
 		});
 
 		const outcome = await runIsolatedSubprocess(

@@ -213,6 +213,17 @@ export function buildJobResult(
 	});
 	const jobResults = snapshotJobs(session, uniqueJobs);
 	const alreadyConsumed = new Set(jobResults.filter(job => manager.isJobResultConsumed(job.id)).map(job => job.id));
+	// Capture image blocks before acknowledging terminal jobs, because acknowledgement
+	// suppresses their automatic async-result delivery.
+	const attachments = buildAsyncResultImageAttachments(
+		uniqueJobs.map(job => {
+			const latest = manager.getJob(job.id) ?? job;
+			return {
+				jobId: latest.id,
+				resultContent: latest.status === "running" ? undefined : latest.resultContent,
+			};
+		}),
+	);
 
 	manager.consumeJobResults(jobResults.filter(j => j.status !== "running").map(j => j.id));
 

@@ -33,17 +33,18 @@ class "qwen" {
 	}
 	// Qwen 3.8+ open-weight chat templates steer thinking depth through the
 	// `reasoning_effort` template kwarg (wire-exact low/medium/xhigh, template
-	// default xhigh) and raise on `enable_thinking: false`, so local
-	// llama.cpp-style hosts route the selected effort onto the template instead
-	// of always reasoning at xhigh. vLLM ignores top-level
-	// `enable_thinking`, so it rides the chat-template-kwargs dialect.
+	// default xhigh). The 2.4T-A95B checkpoint has no thinking-off path; smaller
+	// checkpoints remain switchable. llama.cpp-style hosts route the selected
+	// effort onto the template, while vLLM uses chat-template kwargs.
 	on "llama.cpp" "lm-studio" {
 		revision ">=3.8" {
 			supports-reasoning-effort #true
 			template-reasoning-effort #true
 			thinking-efforts "low" "medium" "xhigh"
 			thinking-format "qwen"
-			thinking-requires-effort #true
+			models "*qwen3.8-2.4t-a95b*" {
+				thinking-requires-effort #true
+			}
 		}
 	}
 	on "vllm" {
@@ -52,7 +53,9 @@ class "qwen" {
 			template-reasoning-effort #true
 			thinking-efforts "low" "medium" "xhigh"
 			thinking-format "qwen-chat-template"
-			thinking-requires-effort #true
+			models "*qwen3.8-2.4t-a95b*" {
+				thinking-requires-effort #true
+			}
 		}
 	}
 	// DashScope compatible-mode text-only families reject image_url content.

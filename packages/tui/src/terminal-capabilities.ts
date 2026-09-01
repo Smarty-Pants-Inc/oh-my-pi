@@ -462,6 +462,20 @@ export function shouldEnableHyperlinksByDefault(
 	return true;
 }
 
+/** Resolve terminal capability, environment overrides, and the user-facing hyperlink mode. */
+export function shouldEnableHyperlinks(
+	mode: HyperlinkMode,
+	env: NodeJS.ProcessEnv = Bun.env,
+	terminalId: TerminalId = TERMINAL_ID,
+	stdoutIsTty: boolean = process.stdout.isTTY === true,
+): boolean {
+	const override = hyperlinksUserOverride(env);
+	if (override === false || mode === "off") return false;
+	if (mode === "always" || override === true) return true;
+	const supported = shouldEnableHyperlinksByDefault(env, terminalId);
+	return supported && stdoutIsTty && (env.HERDR_ENV === "1" || !env.NO_COLOR);
+}
+
 function getFallbackImageProtocol(
 	terminalId: TerminalId,
 	env: NodeJS.ProcessEnv = Bun.env,

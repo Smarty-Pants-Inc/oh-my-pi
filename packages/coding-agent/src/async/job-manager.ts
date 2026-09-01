@@ -162,9 +162,9 @@ export class AsyncJobManager {
 	readonly #deliveries: AsyncJobDelivery[] = [];
 	readonly #inFlightDeliveries: AsyncJobDelivery[] = [];
 	readonly #suppressedDeliveries = new Set<string>();
-	readonly #watchedJobs = new Set<string>();
+	readonly #watchedJobs = new Map<string, number>();
 	readonly #consumedJobResults = new Set<string>();
-	readonly #evictionTimers = new Map<string, NodeJS.Timeout>();
+	readonly #evictionTimers = new Map<AsyncJob, NodeJS.Timeout>();
 	readonly #pollEscalation = new Map<string | undefined, PollEscalationState>();
 	readonly #deliverySinks = new Map<string, AsyncJobDeliverySink>();
 	readonly #onJobComplete: AsyncJobManagerOptions["onJobComplete"];
@@ -810,13 +810,15 @@ export class AsyncJobManager {
 		return candidate;
 	}
 
-	#evictJob(jobId: string): boolean {
-		clearTimeout(this.#evictionTimers.get(jobId));
-		this.#evictionTimers.delete(jobId);
-		this.#suppressedDeliveries.delete(jobId);
-		this.#watchedJobs.delete(jobId);
-		this.#consumedJobResults.delete(jobId);
-		return this.#jobs.delete(jobId);
+	#evictJob(job: AsyncJob): boolean {
+		if (this.#jobs.get(job.id) !== job) return false;
+		clearTimeout(this.#evictionTimers.get(job));
+		this.#evictionTimers.delete(job);
+		this.#suppressedDeliveries.delete(job.id);
+		this.#watchedJobs.delete(job.id);
+		this.#consumedJobResults.delete(job.id);
+		this.#discardedJobs.delete(job);
+		return this.#jobs.delete(job.id);
 	}
 
 	#scheduleEviction(job: AsyncJob): void {
@@ -987,13 +989,14 @@ export class AsyncJobManager {
 		const promise = (async () => {
 			this.#inFlightDeliveries.push(delivery);
 			try {
-				await sink(delivery.jobId, delivery.text, this.#jobs.get(delivery.jobId));
+				await sink(delivery.jobId, delivery.text, delivery.job);
 				this.#consumeJobResult(delivery.jobId);
 			} catch (error) {
 				delivery.attempt += 1;
 				delivery.lastError = error instanceof Error ? error.message : String(error);
 				delivery.nextAttemptAt = Date.now() + this.#getRetryDelay(delivery.attempt);
-				if (!this.isDeliverySuppressed(delivery.jobId) && this.#jobs.has(delivery.jobId)) {
+				const current = this.#jobs.get(delivery.job.id) === delivery.job && !this.#discardedJobs.has(delivery.job);
+				if (current && !this.isDeliverySuppressed(delivery.jobId)) {
 					this.#queueDelivery(delivery);
 				} else if (!current) {
 					logger.warn("Async job delivery dead-lettered after failure: stale job identity", {

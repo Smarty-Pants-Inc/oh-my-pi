@@ -133,6 +133,18 @@ export enum AuthSource {
 	EMBARCADERO = 8,
 }
 
+const AuthSourceJson = {
+	AUTH_SOURCE_CODEIUM: 0,
+	AUTH_SOURCE_DEEPNOTE: 1,
+	AUTH_SOURCE_CODESANDBOX: 2,
+	AUTH_SOURCE_STACKBLITZ: 3,
+	AUTH_SOURCE_VALTOWN: 4,
+	AUTH_SOURCE_HEX: 5,
+	AUTH_SOURCE_ZAPIER: 6,
+	AUTH_SOURCE_SUPERBLOCKS: 7,
+	AUTH_SOURCE_EMBARCADERO: 8,
+} as const;
+
 /** Devin enum BillingStrategy. */
 export enum BillingStrategy {
 	UNSPECIFIED = 0,
@@ -141,11 +153,23 @@ export enum BillingStrategy {
 	ACU = 3,
 }
 
+const BillingStrategyJson = {
+	BILLING_STRATEGY_UNSPECIFIED: 0,
+	BILLING_STRATEGY_CREDITS: 1,
+	BILLING_STRATEGY_QUOTA: 2,
+	BILLING_STRATEGY_ACU: 3,
+} as const;
+
 /** Devin enum CacheControlType. */
 export enum CacheControlType {
 	UNSPECIFIED = 0,
 	EPHEMERAL = 1,
 }
+
+const CacheControlTypeJson = {
+	CACHE_CONTROL_TYPE_UNSPECIFIED: 0,
+	CACHE_CONTROL_TYPE_EPHEMERAL: 1,
+} as const;
 
 /** Devin enum CascadeCommandsAutoExecution. */
 export enum CascadeCommandsAutoExecution {
@@ -155,6 +179,14 @@ export enum CascadeCommandsAutoExecution {
 	EAGER = 3,
 	DISABLED = 4,
 }
+
+const CascadeCommandsAutoExecutionJson = {
+	CASCADE_COMMANDS_AUTO_EXECUTION_UNSPECIFIED: 0,
+	CASCADE_COMMANDS_AUTO_EXECUTION_OFF: 1,
+	CASCADE_COMMANDS_AUTO_EXECUTION_AUTO: 2,
+	CASCADE_COMMANDS_AUTO_EXECUTION_EAGER: 3,
+	CASCADE_COMMANDS_AUTO_EXECUTION_DISABLED: 4,
+} as const;
 
 /** Devin enum ChatMessageRequestType. */
 export enum ChatMessageRequestType {
@@ -833,6 +865,13 @@ export enum ExperimentSource {
 	API_SERVER = 3,
 }
 
+const ExperimentSourceJson = {
+	EXPERIMENT_SOURCE_UNSPECIFIED: 0,
+	EXPERIMENT_SOURCE_EXTENSION: 1,
+	EXPERIMENT_SOURCE_LANGUAGE_SERVER: 2,
+	EXPERIMENT_SOURCE_API_SERVER: 3,
+} as const;
+
 /** Devin enum GracePeriodStatus. */
 export enum GracePeriodStatus {
 	UNSPECIFIED = 0,
@@ -840,6 +879,13 @@ export enum GracePeriodStatus {
 	ACTIVE = 2,
 	EXPIRED = 3,
 }
+
+const GracePeriodStatusJson = {
+	GRACE_PERIOD_STATUS_UNSPECIFIED: 0,
+	GRACE_PERIOD_STATUS_NONE: 1,
+	GRACE_PERIOD_STATUS_ACTIVE: 2,
+	GRACE_PERIOD_STATUS_EXPIRED: 3,
+} as const;
 
 /** Devin enum Language. */
 export enum Language {
@@ -1817,6 +1863,14 @@ export enum ModelType {
 	QUERY = 4,
 }
 
+const ModelTypeJson = {
+	MODEL_TYPE_UNSPECIFIED: 0,
+	MODEL_TYPE_COMPLETION: 1,
+	MODEL_TYPE_CHAT: 2,
+	MODEL_TYPE_EMBED: 3,
+	MODEL_TYPE_QUERY: 4,
+} as const;
+
 /** Devin enum Permission. */
 export enum Permission {
 	UNSPECIFIED = 0,
@@ -1852,6 +1906,41 @@ export enum Permission {
 	TEAM_SETTINGS_READ = 30,
 	TEAM_SETTINGS_UPDATE = 31,
 }
+
+const PermissionJson = {
+	PERMISSION_UNSPECIFIED: 0,
+	PERMISSION_ATTRIBUTION_READ: 1,
+	PERMISSION_ANALYTICS_READ: 2,
+	PERMISSION_LICENSE_READ: 3,
+	PERMISSION_TEAM_USER_READ: 4,
+	PERMISSION_TEAM_USER_UPDATE: 5,
+	PERMISSION_TEAM_USER_DELETE: 6,
+	PERMISSION_TEAM_USER_INVITE: 17,
+	PERMISSION_INDEXING_READ: 7,
+	PERMISSION_INDEXING_CREATE: 8,
+	PERMISSION_INDEXING_UPDATE: 9,
+	PERMISSION_INDEXING_DELETE: 10,
+	PERMISSION_INDEXING_MANAGEMENT: 27,
+	PERMISSION_FINETUNING_READ: 19,
+	PERMISSION_FINETUNING_CREATE: 20,
+	PERMISSION_FINETUNING_UPDATE: 21,
+	PERMISSION_FINETUNING_DELETE: 22,
+	PERMISSION_SSO_READ: 11,
+	PERMISSION_SSO_WRITE: 12,
+	PERMISSION_SERVICE_KEY_READ: 13,
+	PERMISSION_SERVICE_KEY_CREATE: 14,
+	PERMISSION_SERVICE_KEY_UPDATE: 28,
+	PERMISSION_SERVICE_KEY_DELETE: 15,
+	PERMISSION_ROLE_READ: 23,
+	PERMISSION_ROLE_CREATE: 24,
+	PERMISSION_ROLE_UPDATE: 25,
+	PERMISSION_ROLE_DELETE: 26,
+	PERMISSION_BILLING_READ: 16,
+	PERMISSION_BILLING_WRITE: 18,
+	PERMISSION_EXTERNAL_CHAT_UPDATE: 29,
+	PERMISSION_TEAM_SETTINGS_READ: 30,
+	PERMISSION_TEAM_SETTINGS_UPDATE: 31,
+} as const;
 
 /** Devin enum PromptAnnotationKind. */
 export enum PromptAnnotationKind {
@@ -1905,12 +1994,33 @@ export enum ProviderSource {
 	CASCADE = 12,
 }
 
+const ProviderSourceJson = {
+	PROVIDER_SOURCE_UNSPECIFIED: 0,
+	PROVIDER_SOURCE_AUTOCOMPLETE: 1,
+	PROVIDER_SOURCE_CHAT: 2,
+	PROVIDER_SOURCE_COMMAND_GENERATE: 4,
+	PROVIDER_SOURCE_COMMAND_EDIT: 5,
+	PROVIDER_SOURCE_SUPERCOMPLETE: 6,
+	PROVIDER_SOURCE_COMMAND_PLAN: 7,
+	PROVIDER_SOURCE_QUERY: 8,
+	PROVIDER_SOURCE_FAST_APPLY: 9,
+	PROVIDER_SOURCE_COMMAND_TERMINAL: 10,
+	PROVIDER_SOURCE_TAB_JUMP: 11,
+	PROVIDER_SOURCE_CASCADE: 12,
+} as const;
+
 /** Devin enum SandboxEnforcementMode. */
 export enum SandboxEnforcementMode {
 	UNSPECIFIED = 0,
 	OPTIONAL = 1,
 	REQUIRED = 2,
 }
+
+const SandboxEnforcementModeJson = {
+	SANDBOX_ENFORCEMENT_MODE_UNSPECIFIED: 0,
+	SANDBOX_ENFORCEMENT_MODE_OPTIONAL: 1,
+	SANDBOX_ENFORCEMENT_MODE_REQUIRED: 2,
+} as const;
 
 /** Devin enum StopReason. */
 export enum StopReason {
@@ -1930,6 +2040,23 @@ export enum StopReason {
 	ERROR = 13,
 }
 
+const StopReasonJson = {
+	STOP_REASON_UNSPECIFIED: 0,
+	STOP_REASON_INCOMPLETE: 1,
+	STOP_REASON_STOP_PATTERN: 2,
+	STOP_REASON_MAX_TOKENS: 3,
+	STOP_REASON_MIN_LOG_PROB: 4,
+	STOP_REASON_MAX_NEWLINES: 5,
+	STOP_REASON_EXIT_SCOPE: 6,
+	STOP_REASON_NONFINITE_LOGIT_OR_PROB: 7,
+	STOP_REASON_FIRST_NON_WHITESPACE_LINE: 8,
+	STOP_REASON_PARTIAL: 9,
+	STOP_REASON_FUNCTION_CALL: 10,
+	STOP_REASON_CONTENT_FILTER: 11,
+	STOP_REASON_NON_INSERTION: 12,
+	STOP_REASON_ERROR: 13,
+} as const;
+
 /** Devin enum TeamsFeatures. */
 export enum TeamsFeatures {
 	UNSPECIFIED = 0,
@@ -1941,6 +2068,17 @@ export enum TeamsFeatures {
 	REMOTE_INDEXING_DISABLED = 6,
 	API_KEY_ENABLED = 7,
 }
+
+const TeamsFeaturesJson = {
+	TEAMS_FEATURES_UNSPECIFIED: 0,
+	TEAMS_FEATURES_SSO: 1,
+	TEAMS_FEATURES_ATTRIBUTION: 2,
+	TEAMS_FEATURES_PHI: 3,
+	TEAMS_FEATURES_CORTEX: 4,
+	TEAMS_FEATURES_OPENAI_DISABLED: 5,
+	TEAMS_FEATURES_REMOTE_INDEXING_DISABLED: 6,
+	TEAMS_FEATURES_API_KEY_ENABLED: 7,
+} as const;
 
 /** Devin enum TeamsTier. */
 export enum TeamsTier {
@@ -2001,6 +2139,17 @@ export enum ToolFormatterType {
 	SUPERCOMPLETE = 7,
 }
 
+const ToolFormatterTypeJson = {
+	TOOL_FORMATTER_TYPE_UNSPECIFIED: 0,
+	TOOL_FORMATTER_TYPE_LLAMA_3: 1,
+	TOOL_FORMATTER_TYPE_HERMES: 2,
+	TOOL_FORMATTER_TYPE_XML: 3,
+	TOOL_FORMATTER_TYPE_CHAT_TRANSCRIPT: 4,
+	TOOL_FORMATTER_TYPE_KIMI: 5,
+	TOOL_FORMATTER_TYPE_QWENCODER: 6,
+	TOOL_FORMATTER_TYPE_SUPERCOMPLETE: 7,
+} as const;
+
 /** Devin enum TransactionStatus. */
 export enum TransactionStatus {
 	UNSPECIFIED = 0,
@@ -2010,12 +2159,26 @@ export enum TransactionStatus {
 	NO_ACTIVE = 4,
 }
 
+const TransactionStatusJson = {
+	TRANSACTION_STATUS_UNSPECIFIED: 0,
+	TRANSACTION_STATUS_SUCCEEDED: 1,
+	TRANSACTION_STATUS_PROCESSING: 2,
+	TRANSACTION_STATUS_FAILED: 3,
+	TRANSACTION_STATUS_NO_ACTIVE: 4,
+} as const;
+
 /** Devin enum UserFeatures. */
 export enum UserFeatures {
 	UNSPECIFIED = 0,
 	CORTEX = 1,
 	CORTEX_TEST = 2,
 }
+
+const UserFeaturesJson = {
+	USER_FEATURES_UNSPECIFIED: 0,
+	USER_FEATURES_CORTEX: 1,
+	USER_FEATURES_CORTEX_TEST: 2,
+} as const;
 
 /** Devin enum UserTeamStatus. */
 export enum UserTeamStatus {
@@ -2024,6 +2187,13 @@ export enum UserTeamStatus {
 	APPROVED = 2,
 	REJECTED = 3,
 }
+
+const UserTeamStatusJson = {
+	USER_TEAM_STATUS_UNSPECIFIED: 0,
+	USER_TEAM_STATUS_PENDING: 1,
+	USER_TEAM_STATUS_APPROVED: 2,
+	USER_TEAM_STATUS_REJECTED: 3,
+} as const;
 
 /** Devin message exa.codeium_common_pb.AllowedModelConfig. */
 export interface AllowedModelConfig extends ProtoMessage {
@@ -3119,7 +3289,7 @@ export interface PlanInfo extends ProtoMessage {
 }
 
 export const PlanInfoSchema: MessageCodec<PlanInfo> = pb<PlanInfo>("exa.codeium_common_pb.PlanInfo", [
-	{ no: 1, name: "teamsTier", kind: "enum" },
+	{ no: 1, name: "teamsTier", kind: "enum", E: () => TeamsTierJson },
 	{ no: 2, name: "planName", kind: "string" },
 	{ no: 3, name: "hasAutocompleteFastMode", kind: "bool" },
 	{ no: 4, name: "allowStickyPremiumModels", kind: "bool" },
@@ -3153,7 +3323,7 @@ export const PlanInfoSchema: MessageCodec<PlanInfo> = pb<PlanInfo>("exa.codeium_
 	{ no: 31, name: "browserEnabled", kind: "bool" },
 	{ no: 33, name: "devinInfo", kind: "message", T: () => DevinPlanInfoSchema },
 	{ no: 34, name: "isDevin", kind: "bool" },
-	{ no: 35, name: "billingStrategy", kind: "enum" },
+	{ no: 35, name: "billingStrategy", kind: "enum", E: () => BillingStrategyJson },
 	{ no: 36, name: "hideDailyQuota", kind: "bool" },
 	{ no: 37, name: "hideWeeklyQuota", kind: "bool" },
 ]);
@@ -3192,7 +3362,7 @@ export const PlanStatusSchema: MessageCodec<PlanStatus> = pb<PlanStatus>("exa.co
 	{ no: 6, name: "usedPromptCredits", kind: "int32" },
 	{ no: 10, name: "topUpStatus", kind: "message", T: () => TopUpStatusSchema },
 	{ no: 11, name: "wasReducedByOrphanedUsage", kind: "bool" },
-	{ no: 12, name: "gracePeriodStatus", kind: "enum" },
+	{ no: 12, name: "gracePeriodStatus", kind: "enum", E: () => GracePeriodStatusJson },
 	{ no: 13, name: "gracePeriodEnd", kind: "message", T: () => TimestampSchema },
 	{ no: 14, name: "dailyQuotaRemainingPercent", kind: "int32" },
 	{ no: 15, name: "weeklyQuotaRemainingPercent", kind: "int32" },
@@ -3434,7 +3604,7 @@ export const TeamConfigSchema: MessageCodec<TeamConfig> = pb<TeamConfig>("exa.co
 	{ no: 33, name: "disableFastContext", kind: "bool" },
 	{ no: 34, name: "disableLifeguard", kind: "bool" },
 	{ no: 35, name: "allowedIpRanges", kind: "string", repeat: true },
-	{ no: 37, name: "maxCascadeAutoExecutionLevel", kind: "enum" },
+	{ no: 37, name: "maxCascadeAutoExecutionLevel", kind: "enum", E: () => CascadeCommandsAutoExecutionJson },
 	{ no: 38, name: "cascadeWebSearchEnabled", kind: "bool", optional: true },
 	{ no: 39, name: "terminalAllowList", kind: "string", repeat: true },
 	{ no: 40, name: "terminalDenyList", kind: "string", repeat: true },
@@ -3449,7 +3619,7 @@ export const TeamConfigSchema: MessageCodec<TeamConfig> = pb<TeamConfig>("exa.co
 	{ no: 60, name: "enforceMcpRegistry", kind: "bool" },
 	{ no: 50, name: "cliDefaultDisabled", kind: "bool" },
 	{ no: 51, name: "acpRegistryConfig", kind: "string" },
-	{ no: 55, name: "sandboxEnforcementMode", kind: "enum" },
+	{ no: 55, name: "sandboxEnforcementMode", kind: "enum", E: () => SandboxEnforcementModeJson },
 	{ no: 56, name: "sandboxAllowedDomains", kind: "string", repeat: true },
 	{ no: 57, name: "sandboxDeniedDomains", kind: "string", repeat: true },
 	{ no: 58, name: "devinTerminalAcpEnabled", kind: "bool" },
@@ -3498,7 +3668,7 @@ export interface TopUpStatus extends ProtoMessage {
 }
 
 export const TopUpStatusSchema: MessageCodec<TopUpStatus> = pb<TopUpStatus>("exa.codeium_common_pb.TopUpStatus", [
-	{ no: 1, name: "topUpTransactionStatus", kind: "enum" },
+	{ no: 1, name: "topUpTransactionStatus", kind: "enum", E: () => TransactionStatusJson },
 	{ no: 2, name: "topUpEnabled", kind: "bool" },
 	{ no: 3, name: "monthlyTopUpAmount", kind: "int32" },
 	{ no: 4, name: "topUpSpent", kind: "int32" },
@@ -3537,12 +3707,12 @@ export const UserStatusSchema: MessageCodec<UserStatus> = pb<UserStatus>("exa.co
 	{ no: 3, name: "name", kind: "string" },
 	{ no: 4, name: "ignoreChatTelemetrySetting", kind: "bool" },
 	{ no: 5, name: "teamId", kind: "string" },
-	{ no: 6, name: "teamStatus", kind: "enum" },
+	{ no: 6, name: "teamStatus", kind: "enum", E: () => UserTeamStatusJson },
 	{ no: 7, name: "email", kind: "string" },
-	{ no: 9, name: "userFeatures", kind: "enum", repeat: true },
-	{ no: 8, name: "teamsFeatures", kind: "enum", repeat: true },
-	{ no: 10, name: "teamsTier", kind: "enum" },
-	{ no: 11, name: "permissions", kind: "enum", repeat: true },
+	{ no: 9, name: "userFeatures", kind: "enum", E: () => UserFeaturesJson, repeat: true },
+	{ no: 8, name: "teamsFeatures", kind: "enum", E: () => TeamsFeaturesJson, repeat: true },
+	{ no: 10, name: "teamsTier", kind: "enum", E: () => TeamsTierJson },
+	{ no: 11, name: "permissions", kind: "enum", E: () => PermissionJson, repeat: true },
 	{ no: 13, name: "planStatus", kind: "message", T: () => PlanStatusSchema },
 	{ no: 31, name: "hasUsedWindsurf", kind: "bool" },
 	{ no: 28, name: "userUsedPromptCredits", kind: "int64" },

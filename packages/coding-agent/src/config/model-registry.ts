@@ -74,7 +74,6 @@ import {
 	normalizeBareDiscoveryBaseUrl,
 	normalizeLiteLLMDiscoveryBaseUrl,
 	normalizeLlamaCppBaseUrl,
-	normalizeQwenTemplateReasoning,
 } from "./model-discovery";
 import {
 	AUTHORITATIVE_RUNTIME_CATALOG_PROVIDERS,
@@ -924,20 +923,12 @@ export class ModelRegistry {
 		);
 	}
 
-	#builtInDiscoveryCompat(providerId: string): OpenAICompat | undefined {
-		if (providerId !== "vllm" && providerId !== "lm-studio") return undefined;
-		return mergeCompat(
-			this.#providerOverrides.get(providerId)?.compat,
-			this.#runtimeProviderOverrides.get(providerId)?.compat,
-		) as OpenAICompat | undefined;
-	}
-
 	#resolveStartupModelCacheProviderId(providerId: string): string {
 		const baseUrl =
 			this.#runtimeProviderOverrides.get(providerId)?.baseUrl ??
 			this.#providerOverrides.get(providerId)?.baseUrl ??
 			(this.#hasFullSnapshot ? this.getProviderBaseUrl(providerId) : undefined);
-		return resolveModelCacheProviderId(providerId, { baseUrl, compat: this.#builtInDiscoveryCompat(providerId) });
+		return resolveModelCacheProviderId(providerId, { baseUrl });
 	}
 
 	#loadCachedStandardProviderModels(providerIds: readonly string[]): {
@@ -1182,15 +1173,14 @@ export class ModelRegistry {
 	}
 
 	#normalizeDiscoverableModels(providerConfig: DiscoveryProviderConfig, models: Model<Api>[]): Model<Api>[] {
-		const withQwenTemplateReasoning = models.map(normalizeQwenTemplateReasoning);
 		const withDecoderMetadata =
 			providerConfig.discovery.type === "ollama" ||
 			providerConfig.discovery.type === "llama.cpp" ||
 			providerConfig.discovery.type === "lm-studio"
-				? withQwenTemplateReasoning.map(model =>
+				? models.map(model =>
 						buildModel({ ...model, imageInputDecoder: "stb", compat: model.compatConfig } as ModelSpec<Api>),
 					)
-				: withQwenTemplateReasoning;
+				: models;
 
 		const withRemoteCompaction = providerConfig.remoteCompaction
 			? withDecoderMetadata.map(model =>
@@ -1523,15 +1513,12 @@ export class ModelRegistry {
 			return resolveOllamaModelCacheProviderId(providerConfig.provider, providerConfig.baseUrl);
 		}
 		if (providerConfig.discovery.type === "openai-models-list") {
-			// context-v3 invalidates rows cached before server-advertised input
-			// modalities were parsed from `/v1/models`; warm v2 rows pinned
-			// vision-capable ids at `input: ["text"]` until a forced refresh.
-			// `injectV1: false` additionally splits off its own namespace: rows
-			// cached from the `/v1`-injected URL can hold a different (smaller)
-			// model set and must never satisfy a bare provider's cache read.
+			// context-v4 keeps the v3 input-modality and bare-URL split while
+			// invalidating rows cached before backend ownership and centralized KDL
+			// policy were projected into Qwen dialect compatibility.
 			return providerConfig.discovery.injectV1 === false
-				? `${providerConfig.provider}:openai-models-list-bare-context-v3`
-				: `${providerConfig.provider}:openai-models-list-context-v3`;
+				? `${providerConfig.provider}:openai-models-list-bare-context-v4`
+				: `${providerConfig.provider}:openai-models-list-context-v4`;
 		}
 		if (providerConfig.discovery.type === "litellm") {
 			// rich-v4 invalidates rows whose `compatConfig` retained a colliding
@@ -1858,7 +1845,6 @@ export class ModelRegistry {
 					apiKey: isDiscoveryBearerApiKey(apiKey) ? apiKey : undefined,
 					baseUrl: this.#descriptorBaseUrl(descriptor.providerId),
 					fetch: this.#fetch,
-					...(managerCompat ? { compat: managerCompat } : {}),
 				};
 				const preparedConfig =
 					getProviderDefinition(descriptor.providerId)?.prepareModelDiscovery?.(discoveryConfig) ??

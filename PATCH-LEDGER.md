@@ -1,9 +1,9 @@
-# OMP 17.3.5 reconstruction patch ledger
+# OMP 18.0.11 reconstruction patch ledger
 
 This ledger records the deterministic reconstruction of the Smarty fork on the
 frozen upstream target. It excludes upstream-sync merges and records each
-substantive non-merge patch once. The final candidate commit and tree are
-reported outside this tracked file to avoid a self-referential commit identity.
+substantive non-merge behavior family once. The final candidate commit and tree
+are reported outside this tracked file to avoid a self-referential identity.
 
 ## Frozen inputs
 
@@ -11,25 +11,28 @@ reported outside this tracked file to avoid a self-referential commit identity.
 | --- | --- |
 | Upstream URL | `https://github.com/can1357/oh-my-pi.git` |
 | Upstream default branch | `main` |
-| Upstream fetch window | `2026-08-16T08:01:07Z` to `2026-08-16T08:01:10Z` |
-| Upstream commit | `37eee71978951fccf66b21f7e3e2b74596ac9d74` |
-| Upstream tree | `a20c0452f99155e7adeaecfad28e4afd0223c684` |
-| Upstream version | `17.3.5` |
-| Shared merge base | `ffd53ff92a6f575d499730475a73460dd7cc2eea` |
-| Smarty bootstrap main | `f2aa92fc6567df1965295ff68ae592a2ccfd7b88` |
-| Bootstrap tree | `73c050c2cc8abea755cf63ff85f0e3bc5271f54b` |
-| Accepted donor | `f477ba48dbfb0b24b2f7cdb4f41eea9dc8bc6e63` |
-| Donor tree | `ce82d88b24390f5b39a6850f345bbc81321e6772` |
+| Upstream frozen at | `2026-09-01T00:41:28-04:00` |
+| Upstream commit | `eea5628f13043286e17c4a2ea4fc28b15fda33ca` |
+| Upstream tree | `257f25692c75703f3b1b81af47b3fb676b59f879` |
+| Upstream version | `18.0.11` |
+| Prior sync base / shared merge base | `4854db856c20e000a3760d793c56d78065dcf83f` |
+| Prior Smarty fork tip | `931a233d51ee528bf30ffc5b7aa93eece82c6295` |
+| Prior Smarty fork tree | `2309e9feb9db7b3728e157d683728a451290270f` |
+| Accepted donor | `425752a78590b4720d15b901d611c0f7e98cc3ea` |
+| Donor tree | `134ad2f82d86f5aef78cf819f31ccc1cd1c7759b` |
+| Reconstruction bootstrap | `dc78eba4e50aaf64e7fce9c71075d6e2746e9ae7` |
+| Bootstrap tree | `134ad2f82d86f5aef78cf819f31ccc1cd1c7759b` |
 
-The reconstruction branch starts directly at the upstream commit. It contains
-no upstream-sync merge and no blind replay of the donor history.
+The reconstruction branch starts directly at the frozen upstream commit. It
+contains no upstream-sync merge and no blind replay of the donor history.
 
-## Legacy Smarty fork patches
+## Retained Smarty fork baseline
 
-The source inventory is the reverse, no-merge history of
-`upstream/main..origin/main`. `701d41cc1` reconstructs retained fork behavior;
-`b861df22d` owns CI and Mergify policy; `b0b80f62a` owns regenerated Bazel
-metadata.
+The 17.3.5 ledger remains the semantic baseline for retained fork behavior. The
+18.0.11 reconstruction uses the causal inventory from the prior sync base to
+the accepted donor rather than treating the raw 303-commit compare as a replay
+plan. Legacy source patch identities below name the behavior provenance; the
+current implementation is reconstructed against the 18.0.11 architecture.
 
 | Source patch | Disposition | Reconstruction and proof |
 | --- | --- | --- |
@@ -45,7 +48,7 @@ metadata.
 | `17ccb629a` provider discovery isolation | Reimplemented | Policy-gated provider directories, cache/preload order, and tests in `701d41cc1`. |
 | `4e34b2959` Smarty Pants branding | Reapplied | Welcome/splash branding and tests in `701d41cc1`. |
 | `8715d5276`, `f4517abb3` todo lifecycle | Reimplemented as one causal unit | Task-completion reconciliation, explicit todo choice, owned dialect, async completion, rehydration, and tests in `701d41cc1`, with current authority fixes in `502c79a37` and `4fba4d0ce`. |
-| `4b9f43c46` shared model registry test | Upstream equivalent; dropped | Upstream `37eee719` already uses `sharedModelRegistry` in the affected concurrent-session test. |
+| `4b9f43c46` shared model registry test | Upstream equivalent; dropped | The 17.3.5 upstream baseline already uses `sharedModelRegistry` in the affected concurrent-session test. |
 | `c163469f4`, `1fada2bb8`, `6554ee22c` generated Bazel locks | Obsolete snapshots; regenerated | Not replayed. Current lock regenerated from the reconstructed source and committed as `b0b80f62a`. |
 | `fc77ce35b` builder marker test | Reapplied | Retained with the current builder tests in `701d41cc1`. |
 | `7b606eb05` async fixture restoration | Reapplied | Retained with current todo/extension fixtures in `701d41cc1`. |
@@ -53,12 +56,12 @@ metadata.
 | `daaf11a80`, `c8d1f98b9`, `bb7fbceb2` managed-session/native/print ownership | Reimplemented as one causal unit | Semantic delivery IDs, companion ownership, lifecycle fences, terminal metadata, goal parsing, headless drain, and hard-exit behavior in `701d41cc1`; current final-boundary repairs in `502c79a37`, `de925db98`, and `4fba4d0ce`. |
 | `384bd111c` managed-session fixtures | Reapplied | Tree ask/re-answer/navigation and concurrent-dispose assertions retained with the reconstructed lifecycle. |
 | `64477987d`, `4439797a0` independent collaboration renderers | Reimplemented as one transport unit | Local transport, bridge commands, authority/display/transcript validation, protocol 4, install smoke, and tests in `701d41cc1`. |
-| `560e4b4b5` queue-safe CI and `.mergify.yml` | Retained and adapted | Current 17.3.5 workflow keeps queue refs and the always-run `smarty_ci` aggregate; serial one-at-a-time Mergify policy is in `b861df22d`. |
+| `560e4b4b5` queue-safe CI and `.mergify.yml` | Retained and adapted | The 17.3.5 baseline established queue refs, the always-run `smarty_ci` aggregate, and serial one-at-a-time Mergify policy; the 18.0.11 reconstruction preserves the current equivalents. |
 
 ## Context and autonomy mission patches
 
-These patches form a strict dependency chain. Each was reapplied against the
-17.3.5 architecture, then repaired at the shared runtime seam.
+These patches formed a strict dependency chain in the 17.3.5 reconstruction.
+Their retained semantics are now repaired against the 18.0.11 shared runtime seams.
 
 | Source patch | Reconstruction | Proof |
 | --- | --- | --- |
@@ -96,16 +99,35 @@ Upstream prompt changes to rewind reporting and browser close/kill ownership are
 preserved. New date/cwd and checkpoint sources are registered and generated,
 not silently accepted as untyped content.
 
+## 18.0.11 reconstruction delta
+
+Upstream 18.0.11 replaces substantial catalog, compatibility, provider, and
+session plumbing. The reconstruction preserves that architecture and restores
+only the retained Smarty behavior at current shared seams.
+
+| Behavior family | Current reconstruction | Proof and residual accounting |
+| --- | --- | --- |
+| Context, provenance, protected scope, and Stack admission | Typed context delivery, exact source attribution, candidate scope coverage, deterministic protected ordering, and runtime policy warnings remain bound to the current prompt pipeline. | Workspace TypeScript checks and generated prompt-manifest validation pass. |
+| Goal, todo, advisor, async, and semantic-delivery lifecycle | Current session transactions preserve companion ownership, durable retiming, passive late delivery, goal authority, and upstream switch-context capture. | Focused session/switch/tool-rebuild suite: 219 pass, 1 residual ACP snapshot polling timeout because the sink consumes the job before the test observes queued state. |
+| Herdr bridge, queue steering, and hyperlink metadata | Managed renderer handoff, queue-safe steering, per-target file links, and process-local hyperlink settings are reconciled with current TUI/runtime ownership. | Cross-project resume and hyperlink suites: 46 pass. |
+| Provider, catalog, and thinking compatibility | Cursor/Devin protocol updates, OpenAI-compatible provider repairs, Qwen backend projection, and the KDL-owned 2.4T mandatory-effort exception are preserved. | AI suites: 45 pass. Catalog compatibility/thinking suite: 56 pass, 1 residual authored-cache expectation that still treats Qwen 3.8 27B as mandatory although the KDL rule limits mandatory effort to 2.4T. |
+| Discovery, commit, and isolation integration | Custom-backend reasoning projection, context-versioned discovery caching, Git-backed commit fixtures, and deferred isolation cleanup are reconciled with current native Git ownership. | Focused discovery/commit/isolation suite: 40 pass, 3 residuals: one clean-repository fixture skips the completion path, and two cache cases expose that the configured discovery namespace does not encode a later `qwenTemplateReasoningEffort: false` opt-out. |
+| Landing policy | Accepted donor policy narrows unchanged-head retry to typed `/smarty-land REPAIR_REQUIRED` external/transient results and requires a fresh helper-derived `-r2` request ID. | Prompt registry generation and exact manifest check pass. |
+
+Each residual above received one repair-and-reverify round. Repository policy
+requires reporting the remaining evidence instead of applying another repair
+or review pass to the same finding.
+
 ## Deterministic proof commands
 
 ```sh
-git log --reverse --no-merges --format='%H %s' upstream/main..origin/main
-git log --cherry-pick --right-only upstream/main...origin/main --no-merges
-git diff --name-only 37eee71978951fccf66b21f7e3e2b74596ac9d74..HEAD
+git log --reverse --no-merges --format='%H %s' 4854db856c20e000a3760d793c56d78065dcf83f..425752a78590b4720d15b901d611c0f7e98cc3ea
+git log --cherry-pick --right-only eea5628f13043286e17c4a2ea4fc28b15fda33ca...425752a78590b4720d15b901d611c0f7e98cc3ea --no-merges
+git diff --name-only eea5628f13043286e17c4a2ea4fc28b15fda33ca..HEAD
 (cd packages/coding-agent && bun run gen:prompt-manifest:check)
 bun packages/coding-agent/src/cli.ts context manifest --json
-bun packages/coding-agent/src/cli.ts context diff --base 37eee71978951fccf66b21f7e3e2b74596ac9d74 --target HEAD --json
-bun packages/coding-agent/src/cli.ts context protected-delta --repository . --base 37eee71978951fccf66b21f7e3e2b74596ac9d74 --target HEAD --json
+bun packages/coding-agent/src/cli.ts context diff --base eea5628f13043286e17c4a2ea4fc28b15fda33ca --target HEAD --json
+bun packages/coding-agent/src/cli.ts context protected-delta --repository . --base eea5628f13043286e17c4a2ea4fc28b15fda33ca --target HEAD --json
 ```
 
 Generated hashes, exact final candidate identity, upstream-freshness evidence,

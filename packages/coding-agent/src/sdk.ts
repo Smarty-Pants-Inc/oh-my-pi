@@ -687,6 +687,8 @@ export interface CreateAgentSessionResult {
 	eventBus: EventBus;
 	/** Root-scoped bus carrying this session tree's `task:subagent:*` frames. */
 	subagentEventBus?: EventBus;
+	/** Whether this session is bound to an approved protected release. */
+	protectedRuntime?: boolean;
 }
 
 export type DialectFormat = "auto" | "native" | Dialect;
@@ -816,7 +818,9 @@ export async function loadSessionExtensions(
 ): Promise<LoadExtensionsResult> {
 	const activeReleaseManifest = releaseManifest ?? (await startupReleaseManifest());
 	const paths = await discoverSessionExtensionPaths(options, cwd, settings);
-	const result = await logger.time("loadExtensions", loadExtensions, paths, cwd, eventBus, activeReleaseManifest);
+	const result = await logger.time("loadExtensions", () =>
+		loadExtensions(paths, cwd, eventBus, activeReleaseManifest),
+	);
 	for (const { path, error } of result.errors) {
 		logger.error("Failed to load extension", { path, error });
 	}
@@ -1332,10 +1336,18 @@ export function testSetApprovedStartupManifest(manifest: ContextReleaseManifest 
 }
 
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
+	let releaseManifest = await startupReleaseManifest();
+	if (releaseManifest && path.resolve(options.agentDir ?? getAgentDir()) !== canonicalAgentDirPath()) {
+		logger.warn("Prompt policy requires review; continuing with the requested agent directory", {
+			error: `PROMPT_POLICY_REVIEW_REQUIRED: runtime agent directory must be ${canonicalAgentDirPath()}`,
+			agentDir: path.resolve(options.agentDir ?? getAgentDir()),
+		});
+		releaseManifest = undefined;
+	}
 	const extensionRoots = options.extensionRoots?.();
 	const explicit = extensionRoots?.explicit ?? options.additionalExtensionPaths ?? [];
 	const mode = extensionRoots?.mode ?? (options.disableExtensionDiscovery ? "explicit-only" : "merge");
-	return await withOmpExtensionRootScope(explicit, mode, () => createAgentSessionScoped(options));
+	return await withOmpExtensionRootScope(explicit, mode, () => createAgentSessionScoped(options, releaseManifest));
 }
 
 async function createAgentSessionScoped(
@@ -2175,6 +2187,18 @@ async function createAgentSessionScoped(
 			// instances, paths, or factories.
 			extensionPaths = [];
 			extensionsResult = await loadExtensions([], cwd, eventBus, releaseManifest);
+		} else if (releaseManifest) {
+			// Protected sessions reconstruct extension state from source paths instead
+			// of treating caller-owned factories, paths, or registrations as evidence.
+			extensionPaths = await logger.time("discoverSessionExtensionPaths", () =>
+				discoverSessionExtensionPaths(options, cwd, settings),
+			);
+			extensionsResult = await logger.time("loadExtensions", () =>
+				loadExtensions(extensionPaths, cwd, eventBus, releaseManifest),
+			);
+			for (const { path, error } of extensionsResult.errors) {
+				logger.error("Failed to load extension", { path, error });
+			}
 		} else if (options.preloadedExtensions) {
 			extensionsResult = {
 				...options.preloadedExtensions,
@@ -2199,14 +2223,7 @@ async function createAgentSessionScoped(
 			}
 		} else if (options.preloadedExtensionPaths) {
 			extensionPaths = options.preloadedExtensionPaths;
-			extensionsResult = await logger.time(
-				"loadExtensions",
-				loadExtensions,
-				extensionPaths,
-				cwd,
-				eventBus,
-				releaseManifest,
-			);
+			extensionsResult = await logger.time("loadExtensions", () => loadExtensions(extensionPaths, cwd, eventBus));
 			for (const { path, error } of extensionsResult.errors) {
 				logger.error("Failed to load extension", { path, error });
 			}
@@ -2214,14 +2231,7 @@ async function createAgentSessionScoped(
 			extensionPaths = await logger.time("discoverSessionExtensionPaths", () =>
 				discoverSessionExtensionPaths(options, cwd, settings),
 			);
-			extensionsResult = await logger.time(
-				"loadExtensions",
-				loadExtensions,
-				extensionPaths,
-				cwd,
-				eventBus,
-				releaseManifest,
-			);
+			extensionsResult = await logger.time("loadExtensions", () => loadExtensions(extensionPaths, cwd, eventBus));
 			for (const { path, error } of extensionsResult.errors) {
 				logger.error("Failed to load extension", { path, error });
 			}
@@ -4501,6 +4511,7 @@ async function createAgentSessionScoped(
 			startBackgroundModelDiscovery: startRuntimeDiscovery,
 			eventBus,
 			subagentEventBus,
+			protectedRuntime: releaseManifest !== undefined,
 		};
 	} catch (error) {
 		// Release the subscription if the throw happened after install but before the

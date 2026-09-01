@@ -15,6 +15,7 @@ import { configureCredentialRedaction } from "@oh-my-pi/pi-ai/providers/transfor
 import type {
 	CodexCompactionRequestContext,
 	Context,
+	ContextInstruction,
 	FetchImpl,
 	ModelSpec,
 	ProviderSessionState,

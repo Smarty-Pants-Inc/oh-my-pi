@@ -263,7 +263,7 @@ describe("ExtensionRunner", () => {
 
 		runner.initialize(
 			{
-				sendMessage: () => {},
+				sendMessage: async () => ({ status: "accepted", delivery: "plain_append" }),
 				sendUserMessage: () => {},
 				appendEntry: () => {},
 				setLabel: () => {},
@@ -280,6 +280,7 @@ describe("ExtensionRunner", () => {
 			{
 				getModel: () => undefined,
 				isIdle: () => true,
+				isCompacting: () => false,
 				abort: () => {},
 				hasPendingMessages: () => false,
 				shutdown: () => {},

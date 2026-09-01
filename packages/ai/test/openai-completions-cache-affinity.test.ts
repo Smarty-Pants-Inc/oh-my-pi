@@ -133,11 +133,11 @@ describe("OpenAI Chat Completions explicit prompt cache policy", () => {
 			...openAI56CompletionsSpec,
 			id: "gpt-5.5",
 			api: "openai-completions",
-			compat: buildOpenAICompat({
+			compat: resolveModelPolicy({
 				...openAI56CompletionsSpec,
 				id: "gpt-5.5",
 				api: "openai-completions",
-			}),
+			}).compat,
 		};
 		const { body } = await captureSimpleRequest({ cacheRetention: "none" }, earlierModel, historicalContext);
 

@@ -8,6 +8,8 @@
 import { type ApiKey, type FetchImpl, withAuth } from "@oh-my-pi/pi-ai";
 import type { Api, Model, RemoteCompactionConfig } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { compareRevision, parseRevision } from "@oh-my-pi/pi-catalog/compat/revision";
+import { classifyModel } from "@oh-my-pi/pi-catalog/compat/taxonomy";
 import {
 	getBundledModelReferenceIndex,
 	inheritReferenceThinking,
@@ -593,15 +595,6 @@ export function applyLlamaCppQwenThinking(model: Model<Api>): Model<Api> {
 	} as unknown as ModelSpec<Api>);
 }
 
-/** Restore the reasoning ladder when local Qwen compat proves template effort support. */
-export function normalizeQwenTemplateReasoning(model: Model<Api>): Model<Api> {
-	const compat = model.compat as OpenAICompat | undefined;
-	if (model.api !== "openai-completions" || model.reasoning || compat?.qwenTemplateReasoningEffort !== true) {
-		return model;
-	}
-	return buildModel({ ...model, reasoning: true, compat: model.compatConfig ?? compat } as ModelSpec<Api>);
-}
-
 export async function discoverLlamaCppModels(
 	providerConfig: DiscoveryProviderConfig,
 	ctx: DiscoveryContext,
@@ -813,6 +806,15 @@ function extractOpenAIModelsListInputCapabilities(item: {
 	return modalities.has("image") ? ["text", "image"] : ["text"];
 }
 
+function revisionAtLeast(revision: string | undefined, floor: string): boolean {
+	if (revision === undefined) return false;
+	const parsedRevision = parseRevision(revision);
+	const parsedFloor = parseRevision(floor);
+	return (
+		parsedRevision !== undefined && parsedFloor !== undefined && compareRevision(parsedRevision, parsedFloor) >= 0
+	);
+}
+
 export async function discoverOpenAIModelsList(
 	providerConfig: DiscoveryProviderConfig,
 	ctx: DiscoveryContext,
@@ -875,6 +877,21 @@ export async function discoverOpenAIModelsList(
 	for (const item of models) {
 		const id = item.id;
 		if (!id) continue;
+		const ownedBy = typeof item.owned_by === "string" ? item.owned_by.trim().toLowerCase() : undefined;
+		const backendProvider =
+			providerConfig.discovery.type === "lm-studio" || providerConfig.provider === "lm-studio"
+				? "lm-studio"
+				: providerConfig.provider === "vllm" || ownedBy === "vllm"
+					? "vllm"
+					: undefined;
+		const identity = classifyModel(backendProvider ?? providerConfig.provider, id, { lenient: true });
+		const providerCompat = providerConfig.compat as OpenAICompat | undefined;
+		const supportsQwenTemplateEffort =
+			providerConfig.api === "openai-completions" &&
+			backendProvider !== undefined &&
+			providerCompat?.qwenTemplateReasoningEffort !== false &&
+			identity.class === "qwen" &&
+			revisionAtLeast(identity.revision, "3.8");
 		const nativeMetadataForModel = nativeMetadata?.get(id);
 		// Thin OpenAI-compatible proxies frequently omit `context_length`/
 		// `max_model_len` on `/v1/models`, leaving discovered models pinned at
@@ -891,11 +908,6 @@ export async function discoverOpenAIModelsList(
 			providerConfig.discovery.type === "litellm"
 				? resolveLiteLLMApi(undefined, id, providerConfig.api)
 				: providerConfig.api;
-		const isVllmBackend =
-			api === "openai-completions" &&
-			providerConfig.discovery.type !== "lm-studio" &&
-			typeof item.owned_by === "string" &&
-			item.owned_by.trim().toLowerCase() === "vllm";
 		const contextWindow =
 			toPositiveNumberOrUndefined(item.max_model_len) ??
 			toPositiveNumberOrUndefined(item.context_length) ??
@@ -909,7 +921,7 @@ export async function discoverOpenAIModelsList(
 				api,
 				provider: providerConfig.provider,
 				baseUrl,
-				reasoning: reference?.reasoning ?? false,
+				reasoning: (reference?.reasoning ?? false) || supportsQwenTemplateEffort,
 				thinking: inheritReferenceThinking(undefined, reference, providerConfig.provider),
 				input: nativeMetadataForModel?.input ??
 					extractOpenAIModelsListInputCapabilities(item) ??
@@ -932,11 +944,16 @@ export async function discoverOpenAIModelsList(
 					...(referenceCompat?.reasoningEffortMap
 						? { reasoningEffortMap: referenceCompat.reasoningEffortMap }
 						: {}),
+					...(ownedBy === "vllm" && providerConfig.provider !== "vllm" && supportsQwenTemplateEffort
+						? {
+								supportsReasoningEffort: true,
+								thinkingFormat: "qwen-chat-template" as const,
+								qwenTemplateReasoningEffort: true,
+							}
+						: {}),
 					...(referenceCompat?.omitReasoningEffort !== undefined
 						? { omitReasoningEffort: referenceCompat.omitReasoningEffort }
 						: {}),
-					...(isVllmBackend && isQwenModelId(id) ? { thinkingFormat: "qwen-chat-template" as const } : {}),
-					...(isVllmBackend && isQwen38PlusTemplateEffortModelId(id) ? { qwenTemplateReasoningEffort: true } : {}),
 				},
 			} as ModelSpec<Api>),
 		);

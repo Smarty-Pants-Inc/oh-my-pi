@@ -14,7 +14,6 @@ const CURSOR_CONSUMER_DIRS = [
 	path.join(PACKAGES_DIR, "coding-agent/test"),
 ];
 
-const CURSOR_ENUMS = ["CursorRuleSource", "ForceBackgroundShellStatus", "ForceBackgroundSubagentStatus"];
 const DEVIN_MESSAGES = [
 	"exa.api_server_pb.AssignModelRequest",
 	"exa.api_server_pb.AssignModelResponse",

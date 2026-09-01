@@ -213,12 +213,18 @@ describe("runRootCommand — cross-project --resume", () => {
 	it("uses the destination cwd after access returns during resume", async () => {
 		const match = buildGlobalMatch(resumedProject);
 		vi.spyOn(sessionListingModule, "resolveResumableSession").mockResolvedValue(match);
-		const settings = Settings.isolated({ "marketplace.autoUpdate": "off" });
+		const settings = Settings.isolated({
+			disabledProviders: [{ path: launchProject, providers: ["claude"] }],
+			"marketplace.autoUpdate": "off",
+		});
 		const reloadForCwd = vi.spyOn(settings, "reloadForCwd");
 		const preloadedCwds: (string | undefined)[] = [];
-		vi.spyOn(pluginHelpers, "preloadPluginRoots").mockImplementation(async (_home, cwd) => {
+		const preloadedPolicies: Array<{ includeClaudeRegistry?: boolean } | undefined> = [];
+		vi.spyOn(pluginHelpers, "preloadPluginRoots").mockImplementation(async (_home, cwd, policy) => {
 			preloadedCwds.push(cwd);
+			preloadedPolicies.push(policy);
 		});
+		const clearPluginRoots = vi.spyOn(pluginHelpers, "clearPluginRootsAndCaches");
 		const realAccess = fs.promises.access.bind(fs.promises);
 		let deniedProbes = 2;
 		const access = vi.spyOn(fs.promises, "access").mockImplementation(async (target, mode) => {

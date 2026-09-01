@@ -3,6 +3,7 @@ import { getProjectDir } from "@oh-my-pi/pi-utils";
 import { ModelRegistry } from "../config/model-registry";
 import { Settings } from "../config/settings";
 import { discoverAuthStorage, loadCliExtensionProviders } from "../sdk";
+import { resolveSettingsCacheRetention } from "../session/settings-stream-fn";
 import { runAgenticCommit } from "./agentic";
 import { runChangelogFlow } from "./changelog";
 import { formatConventionalCommit } from "./conventional/normalization";
@@ -74,11 +75,13 @@ async function updateChangelog(cwd: string, args: CommitCommandArgs): Promise<vo
 	await loadCliExtensionProviders(registry, settings, cwd);
 	const primary = await resolvePrimaryModel(args.model, settings, registry);
 	const commitSettings = settings.getGroup("commit");
+	const cacheRetention = resolveSettingsCacheRetention(settings);
 	await runChangelogFlow({
 		cwd,
 		model: primary.model,
 		apiKey: primary.apiKey,
 		thinkingLevel: primary.thinkingLevel,
+		cacheRetention,
 		stagedFiles: await vcs.requireGit(cwd).changedFiles({ cached: true }),
 		dryRun: false,
 		maxDiffChars: commitSettings.changelogMaxDiffChars,

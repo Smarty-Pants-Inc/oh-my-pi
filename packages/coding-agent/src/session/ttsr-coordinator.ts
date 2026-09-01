@@ -454,6 +454,7 @@ export class TtsrCoordinator {
 					this.#markInjected(details.rules);
 				}
 				this.#host.scheduleAgentContinue({
+					source: "ttsr-injection",
 					generation,
 					onError: () => this.resolveResume(),
 				});

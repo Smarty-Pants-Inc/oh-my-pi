@@ -1419,12 +1419,25 @@ export class SessionManager {
 			needsRewrite: this.#rewriteRequired,
 			draftOnlySessionCleanupArmed: this.#draftOnlySessionCleanupArmed,
 			fallbackRuntimeOnly: this.#fallbackRuntimeOnly,
-			// Entries are snapshotted by reference (switch/reload replaces the
-			// array wholesale). The header is cloned: moveTo mutates it in place
-			// (cwd, additionalDirectories), so a by-reference capture would let
-			// a rollback observe the move it is undoing.
-			header: structuredClone(this.#header),
-			entries: [...this.#entries],
+			// Durable lifecycle checkpoints already own exact JSONL bytes. They may
+			// borrow the live journal to avoid a second transcript-sized success-path copy;
+			// rollback reloads the durable preimage before publishing retained state.
+			header: options.copyJournal === false ? this.#header : cloneDurableSessionJson(this.#header),
+			entries: options.copyJournal === false ? this.#entries : cloneDurableSessionJson(this.#entries),
+			leafId: this.#index.leafId(),
+			forceFileCreation: this.#forceFileCreation,
+			turnBudgetTotal: this.#turnBudgetTotal,
+			turnBudgetHard: this.#turnBudgetHard,
+			turnOutputBaseline: this.#turnOutputBaseline,
+			turnEvalOutput: this.#turnEvalOutput,
+			// Manager identity is intentionally retained for adopted/shared managers;
+			// beginArtifactTransaction() snapshots and restores their mutable state in place.
+			artifactManager: this.#artifactManager,
+			artifactManagerSessionFile: this.#artifactManagerSessionFile,
+			adoptedArtifactManager: this.#adoptedArtifactManager,
+			inMemoryArtifacts: this.#inMemoryArtifacts ? new Map(this.#inMemoryArtifacts) : null,
+			inMemoryArtifactCounter: this.#inMemoryArtifactCounter,
+			breadcrumbFresh: this.#breadcrumbFresh,
 		};
 	}
 
@@ -1589,16 +1602,23 @@ export class SessionManager {
 		this.#rewriteRequired = snapshot.needsRewrite;
 		this.#draftOnlySessionCleanupArmed = snapshot.draftOnlySessionCleanupArmed;
 		this.#fallbackRuntimeOnly = snapshot.fallbackRuntimeOnly;
-		this.#applyEntries(snapshot.header, [...snapshot.entries]);
-		this.#additionalDirectories = snapshot.header.additionalDirectories ?? [];
-		this.#sessionName = snapshot.sessionName;
-
-		this.#titleSource = snapshot.titleSource;
-		this.#titleUpdatedAt = snapshot.titleUpdatedAt;
-		this.#hasTitleSlot = snapshot.hasTitleSlot;
-		this.#artifactManager = null;
-		this.#artifactManagerSessionFile = null;
-		this.#adoptedArtifactManager = null;
+		this.#applyEntries(header, entries, leafId);
+		this.#additionalDirectories = [...(header.additionalDirectories ?? [])];
+		this.#sessionName = sessionName;
+		this.#titleSource = titleSource;
+		this.#titleUpdatedAt = titleUpdatedAt;
+		this.#hasTitleSlot = hasTitleSlot;
+		this.#forceFileCreation = snapshot.forceFileCreation;
+		this.#turnBudgetTotal = snapshot.turnBudgetTotal;
+		this.#turnBudgetHard = snapshot.turnBudgetHard;
+		this.#turnOutputBaseline = snapshot.turnOutputBaseline;
+		this.#turnEvalOutput = snapshot.turnEvalOutput;
+		this.#artifactManager = snapshot.artifactManager;
+		this.#artifactManagerSessionFile = snapshot.artifactManagerSessionFile;
+		this.#adoptedArtifactManager = snapshot.adoptedArtifactManager;
+		this.#inMemoryArtifacts = snapshot.inMemoryArtifacts ? new Map(snapshot.inMemoryArtifacts) : null;
+		this.#inMemoryArtifactCounter = snapshot.inMemoryArtifactCounter;
+		this.#breadcrumbFresh = snapshot.breadcrumbFresh;
 
 		if (this.#sessionFile) this.#rememberBreadcrumb(this.#cwd, this.#sessionFile, snapshot.breadcrumbFresh);
 		if (this.#sessionFile) {
@@ -1756,6 +1776,7 @@ export class SessionManager {
 		await this.#drainAndCloseWriter();
 		this.#clearDiskError();
 		this.#reconcileSessionDirForFallback();
+		const ownedArtifactClone = beforeJournalPublish ? undefined : await this.beginArtifactCloneTransaction();
 
 		const timestamp = nowIso();
 		const newSessionId = mintSessionId();

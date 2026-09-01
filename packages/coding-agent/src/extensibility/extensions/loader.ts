@@ -410,7 +410,11 @@ async function runExtensionFactory(
 	}
 }
 
-async function importExtensionModule(extensionPath: string, cwd: string): Promise<PreparedExtension> {
+async function importExtensionModule(
+	extensionPath: string,
+	cwd: string,
+	approvedModule?: ApprovedLegacyPiModule,
+): Promise<PreparedExtension> {
 	const resolvedPath = resolvePath(extensionPath, cwd);
 	try {
 		const module = (await withHostGuard(() =>
@@ -482,8 +486,44 @@ export async function loadExtensionFromFactory(
  * sequentially in the original path order, so registration semantics
  * (last-wins collisions, shared runtime flag defaults) stay deterministic.
  */
-export async function loadExtensions(paths: string[], cwd: string, eventBus?: EventBus): Promise<LoadExtensionsResult> {
-	const preparedExtensions = await Promise.all(paths.map(extPath => importExtensionModule(extPath, cwd)));
+export async function loadExtensions(
+	paths: string[],
+	cwd: string,
+	eventBus?: EventBus,
+	releaseManifest?: ContextReleaseManifest,
+): Promise<LoadExtensionsResult> {
+	const uniquePaths: string[] = [];
+	const seen = new Set<string>();
+	for (const extPath of paths) {
+		const resolvedPath = resolvePath(extPath, cwd);
+		let canonicalPath = resolvedPath;
+		try {
+			canonicalPath = await fs.realpath(resolvedPath);
+		} catch {}
+		if (seen.has(canonicalPath)) continue;
+		seen.add(canonicalPath);
+		uniquePaths.push(extPath);
+	}
+
+	const approvedModules = releaseManifest
+		? await Promise.all(
+				uniquePaths.map(extPath => approvedCandidateSourceModule(resolvePath(extPath, cwd), releaseManifest)),
+			)
+		: uniquePaths.map(() => undefined);
+	const preparedExtensions = await Promise.all(
+		uniquePaths.map((extPath, index) => {
+			const approvedModule = approvedModules[index];
+			if (releaseManifest && !approvedModule) {
+				return Promise.resolve({
+					path: extPath,
+					factory: null,
+					resolvedPath: resolvePath(extPath, cwd),
+					error: `PROMPT_POLICY_REVIEW_REQUIRED: extension source is not approved: ${extPath}`,
+				} satisfies PreparedExtension);
+			}
+			return importExtensionModule(extPath, cwd, approvedModule);
+		}),
+	);
 	return bindPreparedExtensions(preparedExtensions, cwd, eventBus);
 }
 

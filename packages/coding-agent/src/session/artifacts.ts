@@ -10,6 +10,20 @@ import type { FileHandle } from "node:fs/promises";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { replaceFileAtomically } from "../utils/atomic-file";
+import {
+	type ArtifactPublication,
+	commitClonePublication,
+	commitRelocationPublication,
+	publishArtifactGraph,
+	rollbackArtifactPublication,
+} from "./artifact-durability";
+
+export {
+	reconcileArtifactOperationsSync,
+	reconcileArtifactOperationsUnderRootSync,
+	removeArtifactOperationIntent,
+	writeArtifactDeletionIntent,
+} from "./artifact-durability";
 
 /**
  * Sanitize a tool name for safe use as the middle segment of the artifact
@@ -426,45 +440,14 @@ export class ArtifactManager {
 		state.transactionTail = predecessor.catch(() => undefined).then(() => turn.promise);
 		await predecessor.catch(() => undefined);
 
-	/**
-	 * Allocate a new artifact path and ID without writing content.
-	 *
-	 * @param toolType Tool name for file extension (e.g., "bash", "read")
-	 */
-	async allocatePath(toolType: string): Promise<{ id: string; path: string }> {
-		await this.#ensureDir();
-		const id = String(this.allocateId());
-		const filename = `${id}.${sanitizeToolType(toolType)}.log`;
-		return { id, path: path.join(this.#dir, filename) };
-	}
-
-	/**
-	 * Save content as an artifact and return the artifact ID.
-	 *
-	 * @param content Full content to save
-	 * @param toolType Tool name for file extension (e.g., "bash", "read")
-	 * @returns Artifact ID (numeric string)
-	 */
-	async save(content: string, toolType: string): Promise<string> {
-		const { id, path } = await this.allocatePath(toolType);
-		await writeArtifact(path, content);
-		return id;
-	}
-
-	/**
-	 * Check if an artifact exists.
-	 * @param id Artifact ID (numeric string)
-	 */
-	async exists(id: string): Promise<boolean> {
-		const files = await this.listFiles();
-		return files.some(f => f.startsWith(`${id}.`));
-	}
-
-	/**
-	 * List all artifact files in the directory.
-	 * Returns empty array if directory doesn't exist.
-	 */
-	async listFiles(): Promise<string[]> {
+		const token = Symbol("artifactTransaction");
+		let released = false;
+		const release = (): void => {
+			if (released) return;
+			released = true;
+			if (state.activeTransaction?.token === token) state.activeTransaction = null;
+			turn.resolve();
+		};
 		try {
 			while (true) {
 				await this.#waitForWriters();
