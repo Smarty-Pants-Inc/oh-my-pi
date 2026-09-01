@@ -53,7 +53,7 @@ import {
 import { ModelsConfigFile } from "./config/models-config";
 import { serviceTierSettingToTier } from "./config/service-tier";
 import { getDefault, type SettingPath, Settings, type SettingValue, settings } from "./config/settings";
-import { ensureApprovedStartup } from "./context/approved-policy";
+import { ensureApprovedStartup, verifyApprovedStartup } from "./context/approved-policy";
 import type { ContextReleaseManifest } from "./context/manifest";
 import { initializeWithSettings, isProviderEnabled } from "./discovery";
 import {
@@ -1681,7 +1681,8 @@ export async function runRootCommand(
 		if (!isInteractive) {
 			stopPendingStartupComposer();
 		}
-		await deps.verifyApprovedStartup?.(isInteractive);
+		const startupVerifier = deps.verifyApprovedStartup ?? (isBunTestRuntime() ? undefined : verifyApprovedStartup);
+		await startupVerifier?.(isInteractive);
 		const automaticHerdrHostBridge =
 			isInteractive && deps.collabBridge === undefined ? deps.herdrHostBridge : undefined;
 		// Auth and settings are independent; start both before awaiting either.
