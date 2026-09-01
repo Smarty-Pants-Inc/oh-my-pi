@@ -1,4 +1,4 @@
-import { afterAll, afterEach, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, it } from "bun:test";
 import type { Model } from "@oh-my-pi/pi-ai";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import type { CustomToolContext } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools";
@@ -11,18 +11,38 @@ import {
 } from "@oh-my-pi/pi-coding-agent/tools/image-gen";
 import { removeWithRetries, USER_AGENT } from "@oh-my-pi/pi-utils";
 
-const originalOpenRouterKey = Bun.env.OPENROUTER_API_KEY;
+const IMAGE_API_ENV_KEYS = [
+	"OPENAI_API_KEY",
+	"XAI_API_KEY",
+	"OPENROUTER_API_KEY",
+	"GEMINI_API_KEY",
+	"GOOGLE_API_KEY",
+	"DEEPINFRA_API_KEY",
+] as const;
+type ImageApiEnvKey = (typeof IMAGE_API_ENV_KEYS)[number];
+const originalImageApiEnv: Record<ImageApiEnvKey, string | undefined> = {
+	OPENAI_API_KEY: Bun.env.OPENAI_API_KEY,
+	XAI_API_KEY: Bun.env.XAI_API_KEY,
+	OPENROUTER_API_KEY: Bun.env.OPENROUTER_API_KEY,
+	GEMINI_API_KEY: Bun.env.GEMINI_API_KEY,
+	GOOGLE_API_KEY: Bun.env.GOOGLE_API_KEY,
+	DEEPINFRA_API_KEY: Bun.env.DEEPINFRA_API_KEY,
+};
 const generatedImagePaths: string[] = [];
 
 afterAll(async () => {
 	await Promise.all(generatedImagePaths.map(imagePath => removeWithRetries(imagePath)));
 });
 
+beforeEach(() => {
+	for (const key of IMAGE_API_ENV_KEYS) delete Bun.env[key];
+});
+
 afterEach(() => {
-	if (originalOpenRouterKey === undefined) {
-		delete Bun.env.OPENROUTER_API_KEY;
-	} else {
-		Bun.env.OPENROUTER_API_KEY = originalOpenRouterKey;
+	for (const key of IMAGE_API_ENV_KEYS) {
+		const value = originalImageApiEnv[key];
+		if (value === undefined) delete Bun.env[key];
+		else Bun.env[key] = value;
 	}
 	setImageProviderOrder([]);
 });

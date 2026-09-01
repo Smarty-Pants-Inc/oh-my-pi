@@ -21,10 +21,13 @@ are reported outside this tracked file to avoid a self-referential identity.
 | Accepted donor | `425752a78590b4720d15b901d611c0f7e98cc3ea` |
 | Donor tree | `134ad2f82d86f5aef78cf819f31ccc1cd1c7759b` |
 | Reconstruction bootstrap | `dc78eba4e50aaf64e7fce9c71075d6e2746e9ae7` |
-| Bootstrap tree | `134ad2f82d86f5aef78cf819f31ccc1cd1c7759b` |
+| Bootstrap tree | `2309e9feb9db7b3728e157d683728a451290270f` |
 
-The reconstruction branch starts directly at the frozen upstream commit. It
-contains no upstream-sync merge and no blind replay of the donor history.
+The reconstruction branch is based directly on the frozen upstream commit. Its
+bootstrap snapshots the prior fork tip as a bounded behavior inventory, not as
+the final candidate; later commits reconstruct that inventory against the
+18.0.11 architecture, and final review compares the result directly with the
+frozen upstream tree. The branch contains no upstream-sync merge.
 
 ## Retained Smarty fork baseline
 
@@ -37,8 +40,8 @@ current implementation is reconstructed against the 18.0.11 architecture.
 | Source patch | Disposition | Reconstruction and proof |
 | --- | --- | --- |
 | `06e8550b3` fork foundation | Reimplemented | Compaction input budget, goal budget/exit rules, Mach-O repair, tests, and retained fork instruction metadata in `701d41cc1`. Focused compaction, goal, and native-script tests pass. |
-| Fork-only `.gitignore` and package changelog edits | `DROP_OBSOLETE` | Scope admission found no Phase 1 requirement for these metadata deltas. `.gitignore`, `packages/agent/CHANGELOG.md`, and `packages/coding-agent/CHANGELOG.md` are restored byte-for-byte to upstream blobs `c4cea6ff0e9f3dc3e48b42bdd8856d2fb9c87160`, `f47be5dbb6f6a4fc505a5cfd2b87ed8a9a37f2c2`, and `4901d84f73388c60160c3cab32841414c7c1b7b2`. Runtime changes remain accounted for by their source-patch rows. |
-| Unmapped compatibility-only bytes | `DROP_OBSOLETE` | Scope admission found no directly changed implementation anchor for `packages/catalog/test/variant-collapse.test.ts`, `packages/coding-agent/test/profile-alias.test.ts`, `packages/coding-agent/test/update-cli.test.ts`, or `packages/mnemopi/test/native-vector-parity.test.ts`; the lazy worker/smoke import delta in `packages/coding-agent/src/cli.ts` also does not implement a Phase 1 requirement. All five paths are restored byte-for-byte to frozen upstream `37eee71978951fccf66b21f7e3e2b74596ac9d74`. The eval agent-bridge runtime-profile assertions remain as the runnable dependency of the mapped structured-subagent profile seam. |
+| Fork-only `.gitignore` and package changelog edits | `DROP_OBSOLETE` | Scope admission found no Phase 1 requirement for these metadata deltas. `.gitignore`, `packages/agent/CHANGELOG.md`, and `packages/coding-agent/CHANGELOG.md` are restored byte-for-byte to frozen-upstream blobs `c4cea6ff0e9f3dc3e48b42bdd8856d2fb9c87160`, `1b1d4981c6ca2e99ad3789f4123bcc42aa28d5ec`, and `d4cbcd4435cdcf7a347385592fabaac3c63f2a7c`. Runtime changes remain accounted for by their source-patch rows. |
+| Unmapped compatibility-only bytes | `DROP_OBSOLETE` | `packages/catalog/test/variant-collapse.test.ts` remains absent. `packages/coding-agent/test/profile-alias.test.ts`, `packages/coding-agent/test/update-cli.test.ts`, and `packages/mnemopi/test/native-vector-parity.test.ts` match frozen-upstream blobs `0f5485ad1968c7ef96780b9b5ad86b9c8e02c2bc`, `d8de2885c7c931561f2b9d9c8aa7b2e774dd288e`, and `2a7340675b8f83313879f1d58509699b5259b1c2`. The retained `packages/coding-agent/src/cli.ts` deltas are limited to the mapped managed-build identity and Herdr bridge bootstrap. The eval agent-bridge runtime-profile assertions remain as the runnable dependency of the mapped structured-subagent profile seam. |
 | `17a9926b6`, `5410c7d40` extension settlement | Reimplemented as one causal unit | In-flight follow-up ownership, before-`agent_end` settlement, stale-generation rejection, UI/runtime callers, and tests in `701d41cc1`. Extension runner/session tests pass. |
 | `ead22a62e`, `2d42042fc` stabilizer tests | Split: `ead22a62e` `DROP_OBSOLETE`; `2d42042fc` reapplied | The timeout-only native-vector edit has no changed implementation anchor and is restored to frozen upstream. The abort/deadline queue ownership assertion remains mapped to the retained agent loop contract. |
 | `5a50f0ee4` provider-neutral execution environments and Cloudflare adapter | Reimplemented | New Cloudflare package and current execution-environment seam in `701d41cc1`. Package check passes; 81 tests pass and the two opt-in real-service tests skip by contract. |
@@ -105,18 +108,14 @@ Upstream 18.0.11 replaces substantial catalog, compatibility, provider, and
 session plumbing. The reconstruction preserves that architecture and restores
 only the retained Smarty behavior at current shared seams.
 
-| Behavior family | Current reconstruction | Proof and residual accounting |
+| Behavior family | Current reconstruction | Proof |
 | --- | --- | --- |
-| Context, provenance, protected scope, and Stack admission | Typed context delivery, exact source attribution, candidate scope coverage, deterministic protected ordering, and runtime policy warnings remain bound to the current prompt pipeline. | Workspace TypeScript checks and generated prompt-manifest validation pass. |
-| Goal, todo, advisor, async, and semantic-delivery lifecycle | Current session transactions preserve companion ownership, durable retiming, passive late delivery, goal authority, and upstream switch-context capture. | Focused session/switch/tool-rebuild suite: 219 pass, 1 residual ACP snapshot polling timeout because the sink consumes the job before the test observes queued state. |
-| Herdr bridge, queue steering, and hyperlink metadata | Managed renderer handoff, queue-safe steering, per-target file links, and process-local hyperlink settings are reconciled with current TUI/runtime ownership. | Cross-project resume and hyperlink suites: 46 pass. |
-| Provider, catalog, and thinking compatibility | Cursor/Devin protocol updates, OpenAI-compatible provider repairs, Qwen backend projection, and the KDL-owned 2.4T mandatory-effort exception are preserved. | AI suites: 45 pass. Catalog compatibility/thinking suite: 56 pass, 1 residual authored-cache expectation that still treats Qwen 3.8 27B as mandatory although the KDL rule limits mandatory effort to 2.4T. |
-| Discovery, commit, and isolation integration | Custom-backend reasoning projection, context-versioned discovery caching, Git-backed commit fixtures, and deferred isolation cleanup are reconciled with current native Git ownership. | Focused discovery/commit/isolation suite: 40 pass, 3 residuals: one clean-repository fixture skips the completion path, and two cache cases expose that the configured discovery namespace does not encode a later `qwenTemplateReasoningEffort: false` opt-out. |
-| Landing policy | Accepted donor policy narrows unchanged-head retry to typed `/smarty-land REPAIR_REQUIRED` external/transient results and requires a fresh helper-derived `-r2` request ID. | Prompt registry generation and exact manifest check pass. |
-
-Each residual above received one repair-and-reverify round. Repository policy
-requires reporting the remaining evidence instead of applying another repair
-or review pass to the same finding.
+| Context, provenance, protected scope, and Stack admission | Typed context delivery, exact source attribution, candidate scope coverage, deterministic protected ordering, and runtime policy warnings remain bound to the current prompt pipeline. | Workspace TypeScript checks, generated prompt-manifest validation, focused context suites, and the complete local test command pass. |
+| Goal, todo, advisor, async, and semantic-delivery lifecycle | Current session transactions preserve companion ownership, durable retiming, passive late delivery, goal authority, and upstream switch-context capture. | Complete local runtime/session and coding-agent suites pass, including switch-context, async-job, hub-wait, and deferred-delivery coverage. |
+| Herdr bridge, queue steering, and hyperlink metadata | Managed renderer handoff, queue-safe steering, per-target file links, and process-local hyperlink settings are reconciled with current TUI/runtime ownership. | Complete local test command passes, including cross-project resume, bridge bootstrap, collaboration, and hyperlink suites. |
+| Provider, catalog, and thinking compatibility | Cursor/Devin protocol updates, OpenAI-compatible provider repairs, Qwen backend projection, and the KDL-owned 2.4T mandatory-effort exception are preserved. | Complete local AI, catalog, and coding-agent suites pass, including isolated image-provider routing coverage. |
+| Discovery, commit, and isolation integration | Custom-backend reasoning projection, context-versioned discovery caching, Git-backed commit fixtures, and deferred isolation cleanup are reconciled with current native Git ownership. | Complete local discovery, commit, task-isolation, and clean-checkout context suites pass. |
+| Landing policy | Accepted donor policy narrows unchanged-head retry to typed `/smarty-land REPAIR_REQUIRED` external/transient results and requires a fresh helper-derived `-r2` request ID. | Prompt registry generation, exact manifest check, and the complete local test command pass. |
 
 ## Deterministic proof commands
 

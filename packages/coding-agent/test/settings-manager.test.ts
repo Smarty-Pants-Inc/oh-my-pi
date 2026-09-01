@@ -566,8 +566,8 @@ describe("Settings", () => {
 
 			await writeSettings({ tui: { hyperlinks: "always" } });
 			const configPath = await fs.promises.realpath(getConfigPath());
-			const rename = fs.promises.rename.bind(fs.promises);
-			vi.spyOn(fs.promises, "rename").mockImplementation(async (source, target) => {
+			const rename = fsp.rename.bind(fsp);
+			vi.spyOn(fsp, "rename").mockImplementation(async (source, target) => {
 				if (String(source).endsWith(".tmp") && String(target) === configPath) {
 					throw new FsCodeError("EIO", "injected save failure");
 				}
