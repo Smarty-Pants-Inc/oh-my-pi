@@ -10294,6 +10294,7 @@ export class AgentSession {
 			this.agent.reset();
 			this.agent.replaceMessages(targetContext.messages);
 			this.#clearCheckpointRuntimeState();
+			this.#clearSessionScopedToolState();
 			this.#todo.syncFromBranch();
 			this.#todo.resetCycle();
 			this.#pendingNextTurnMessages = [];
