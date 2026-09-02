@@ -200,6 +200,84 @@ describe("RPC artifact and blob adapters", () => {
 		}
 	});
 
+	it("lists and reads active image attachments and tool artifacts", async () => {
+		const store = new BlobStore(path.join(tempDir.path(), "blobs"));
+		const manager = SessionManager.inMemory(tempDir.path());
+		const getBlobStore = spyOn(manager, "getBlobStore").mockReturnValue(store);
+		const attachmentData = Buffer.from("active image attachment");
+		const toolArtifactData = Buffer.from("active tool image artifact");
+		try {
+			const attachment = await store.put(attachmentData);
+			const toolArtifact = await store.put(toolArtifactData);
+			manager.appendMessage({
+				role: "user",
+				content: [{ type: "image", data: attachment.ref, mimeType: "image/png" }],
+				timestamp: 0,
+			});
+			manager.appendMessage({
+				role: "toolResult",
+				toolCallId: "image-tool-call",
+				toolName: "image_tool",
+				content: [{ type: "text", text: "generated image" }],
+				details: { images: [{ data: toolArtifact.ref, mimeType: "image/png" }] },
+				isError: false,
+				timestamp: 0,
+			});
+			const session = fakeSession({ sessionManager: manager });
+			const expectedBlobs = [
+				{ hash: attachment.hash, size: attachmentData.byteLength },
+				{ hash: toolArtifact.hash, size: toolArtifactData.byteLength },
+			].sort((left, right) => left.hash.localeCompare(right.hash, "en"));
+
+			expect(await executeRpcSessionDataCommand(session, { type: "blob_list" })).toMatchObject({
+				success: true,
+				data: { blobs: expectedBlobs },
+			});
+			expect(
+				await executeRpcSessionDataCommand(session, { type: "blob_read", hash: attachment.hash }),
+			).toMatchObject({
+				success: true,
+				data: { hash: attachment.hash, content: attachmentData.toString("base64") },
+			});
+			expect(
+				await executeRpcSessionDataCommand(session, { type: "blob_read", hash: toolArtifact.hash }),
+			).toMatchObject({
+				success: true,
+				data: { hash: toolArtifact.hash, content: toolArtifactData.toString("base64") },
+			});
+		} finally {
+			getBlobStore.mockRestore();
+		}
+	});
+
+	it("does not authorize blob refs planted in prompts or custom details", async () => {
+		const store = new BlobStore(path.join(tempDir.path(), "blobs"));
+		const manager = SessionManager.inMemory(tempDir.path());
+		const getBlobStore = spyOn(manager, "getBlobStore").mockReturnValue(store);
+		try {
+			const foreignBlob = await store.put(Buffer.from("foreign session blob"));
+			manager.appendMessage({ role: "user", content: foreignBlob.ref, timestamp: 0 });
+			manager.appendCustomMessageEntry("untrusted", "No attachment.", false, {
+				detail: foreignBlob.ref,
+				images: [{ data: foreignBlob.ref, mimeType: "image/png" }],
+			});
+			const session = fakeSession({ sessionManager: manager });
+
+			expect(await executeRpcSessionDataCommand(session, { type: "blob_list" })).toMatchObject({
+				success: true,
+				data: { blobs: [] },
+			});
+			expect(
+				await executeRpcSessionDataCommand(session, { type: "blob_read", hash: foreignBlob.hash }),
+			).toMatchObject({
+				success: false,
+				code: "not-found",
+			});
+		} finally {
+			getBlobStore.mockRestore();
+		}
+	});
+
 	it("rejects hash and size mismatches before a blob mutation intent", () => {
 		const store = new BlobStore(path.join(tempDir.path(), "blobs"));
 		const session = fakeSession({ sessionManager: { getBlobStore: () => store } });

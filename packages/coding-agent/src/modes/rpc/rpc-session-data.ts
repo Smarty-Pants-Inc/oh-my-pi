@@ -3,10 +3,11 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import { isRecord } from "@oh-my-pi/pi-utils";
+import * as snapcompact from "@oh-my-pi/snapcompact";
 import { parseSkillInvocation } from "../../extensibility/skills";
 import type { AgentSession } from "../../session/agent-session";
 import { BLOB_HASH_RE, parseBlobRef } from "../../session/blob-store";
-import { prepareEntryForPersistence } from "../../session/session-persistence";
+import { isImageDataPayload, prepareEntryForPersistence } from "../../session/session-persistence";
 import {
 	getRpcHistoryChunk,
 	getRpcHistoryDigest,
@@ -360,26 +361,109 @@ async function writeArtifact(
 	return { id, size: Buffer.byteLength(command.content, "utf8") };
 }
 
-function collectBlobHashes(value: unknown, hashes: Set<string>): void {
-	if (typeof value === "string") {
-		const hash = parseBlobRef(value);
-		if (hash) hashes.add(hash);
+function collectBlobHash(value: unknown, hashes: Set<string>): void {
+	if (typeof value !== "string") return;
+	const hash = parseBlobRef(value);
+	if (hash) hashes.add(hash);
+}
+
+function collectImageContentBlobHashes(content: unknown, hashes: Set<string>): void {
+	if (!Array.isArray(content)) return;
+	for (const block of content) {
+		if (!isRecord(block) || block.type !== "image" || !isImageDataPayload(block)) continue;
+		collectBlobHash(block.data, hashes);
+	}
+}
+
+function collectToolDetailBlobHashes(details: unknown, hashes: Set<string>): void {
+	if (!isRecord(details) || !Array.isArray(details.images)) return;
+	for (const image of details.images) {
+		if (!isRecord(image) || !isImageDataPayload(image)) continue;
+		collectBlobHash(image.data, hashes);
+	}
+}
+
+function collectComputerScreenshotBlobHash(providerMetadata: unknown, hashes: Set<string>): void {
+	if (
+		!isRecord(providerMetadata) ||
+		providerMetadata.type !== "computer" ||
+		!isRecord(providerMetadata.screenshot) ||
+		providerMetadata.screenshot.type !== "computer_screenshot"
+	) {
 		return;
 	}
-	if (Array.isArray(value)) {
-		for (const item of value) collectBlobHashes(item, hashes);
+	collectBlobHash(providerMetadata.screenshot.image_url, hashes);
+}
+
+function collectResponsesGeneratedImageBlobHashes(providerPayload: unknown, hashes: Set<string>): void {
+	if (
+		!isRecord(providerPayload) ||
+		providerPayload.type !== "openaiResponsesHistory" ||
+		!Array.isArray(providerPayload.items)
+	) {
 		return;
 	}
-	if (!isRecord(value)) return;
-	for (const item of Object.values(value)) collectBlobHashes(item, hashes);
+	for (const item of providerPayload.items) {
+		if (
+			!isRecord(item) ||
+			item.type !== "image_generation_call" ||
+			typeof item.id !== "string" ||
+			item.status !== "completed"
+		) {
+			continue;
+		}
+		collectBlobHash(item.result, hashes);
+	}
+}
+
+function collectMessageBlobHashes(message: unknown, hashes: Set<string>): void {
+	if (!isRecord(message)) return;
+	switch (message.role) {
+		case "user":
+		case "developer":
+		case "custom":
+		case "hookMessage":
+			collectImageContentBlobHashes(message.content, hashes);
+			return;
+		case "assistant":
+			collectImageContentBlobHashes(message.content, hashes);
+			collectResponsesGeneratedImageBlobHashes(message.providerPayload, hashes);
+			return;
+		case "toolResult":
+			collectImageContentBlobHashes(message.content, hashes);
+			collectToolDetailBlobHashes(message.details, hashes);
+			collectComputerScreenshotBlobHash(message.providerMetadata, hashes);
+			return;
+	}
+}
+
+function collectEntryBlobHashes(entry: unknown, hashes: Set<string>): void {
+	if (!isRecord(entry)) return;
+	switch (entry.type) {
+		case "message":
+			collectMessageBlobHashes(entry.message, hashes);
+			return;
+		case "custom_message":
+			collectImageContentBlobHashes(entry.content, hashes);
+			return;
+		case "compaction": {
+			const archive = isRecord(entry.preserveData) ? snapcompact.getPreservedArchive(entry.preserveData) : undefined;
+			if (!archive) return;
+			for (const frame of archive.frames) {
+				if (!isImageDataPayload(frame)) continue;
+				collectBlobHash(frame.data, hashes);
+			}
+		}
+	}
 }
 
 function activeSessionBlobHashes(session: AgentSession): Set<string> {
 	const manager = session.sessionManager;
 	const blobStore = manager.getBlobStore();
 	const hashes = new Set<string>();
-	// Live entries rehydrate blob refs to inline data, so inspect their canonical persistence form.
-	for (const entry of manager.getBranch()) collectBlobHashes(prepareEntryForPersistence(entry, blobStore), hashes);
+	// Blob refs are capabilities: inspect only canonical image carriers after persistence.
+	for (const entry of manager.getBranch())
+		collectEntryBlobHashes(prepareEntryForPersistence(entry, blobStore), hashes);
 	return hashes;
 }
 
