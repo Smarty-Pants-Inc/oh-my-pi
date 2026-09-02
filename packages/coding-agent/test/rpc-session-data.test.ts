@@ -250,6 +250,108 @@ describe("RPC artifact and blob adapters", () => {
 		}
 	});
 
+	it("lists and reads provider-native Responses input images without authorizing nearby strings", async () => {
+		const store = new BlobStore(path.join(tempDir.path(), "blobs"));
+		const manager = SessionManager.inMemory(tempDir.path());
+		const getBlobStore = spyOn(manager, "getBlobStore").mockReturnValue(store);
+		try {
+			const trusted = await store.put(Buffer.from("provider-native image URL"));
+			const hostile = await store.put(Buffer.from("arbitrary provider string"));
+			manager.appendMessage({
+				role: "user",
+				content: "native image history",
+				providerPayload: {
+					type: "openaiResponsesHistory",
+					items: [
+						{
+							type: "message",
+							role: "user",
+							content: [
+								{ type: "input_text", text: "look here", image_url: hostile.ref },
+								{ type: "input_image", detail: "auto", image_url: trusted.ref },
+								{ type: "input_image", image_url: { ref: hostile.ref } },
+							],
+							metadata: { image_url: hostile.ref },
+						},
+						{
+							type: "not_message",
+							role: "user",
+							content: [{ type: "input_image", image_url: hostile.ref }],
+						},
+						{ type: "function_call_output", output: { image_url: hostile.ref } },
+					],
+				},
+				timestamp: 0,
+			});
+			const session = fakeSession({ sessionManager: manager });
+
+			expect(await executeRpcSessionDataCommand(session, { type: "blob_list" })).toMatchObject({
+				success: true,
+				data: { blobs: [{ hash: trusted.hash, size: Buffer.from("provider-native image URL").byteLength }] },
+			});
+			expect(await executeRpcSessionDataCommand(session, { type: "blob_read", hash: trusted.hash })).toMatchObject({
+				success: true,
+				data: { hash: trusted.hash, content: Buffer.from("provider-native image URL").toString("base64") },
+			});
+			expect(await executeRpcSessionDataCommand(session, { type: "blob_read", hash: hostile.hash })).toMatchObject({
+				success: false,
+				code: "not-found",
+			});
+		} finally {
+			getBlobStore.mockRestore();
+		}
+	});
+
+	it("lists and reads remote compaction Responses input images without authorizing nearby strings", async () => {
+		const store = new BlobStore(path.join(tempDir.path(), "blobs"));
+		const manager = SessionManager.inMemory(tempDir.path());
+		const getBlobStore = spyOn(manager, "getBlobStore").mockReturnValue(store);
+		try {
+			const trusted = await store.put(Buffer.from("remote compaction image URL"));
+			const hostile = await store.put(Buffer.from("arbitrary compaction string"));
+			manager.appendCompaction("remote summary", undefined, "entry-1", 1, {
+				preserveData: {
+					openaiRemoteCompaction: {
+						replacementHistory: [
+							{
+								type: "message",
+								role: "user",
+								content: [
+									{ type: "input_text", text: "retained", image_url: hostile.ref },
+									{ type: "input_image", detail: "auto", image_url: trusted.ref },
+									{ type: "input_image", image_url: { ref: hostile.ref } },
+								],
+								metadata: { image_url: hostile.ref },
+							},
+							{
+								type: "not_message",
+								role: "user",
+								content: [{ type: "input_image", image_url: hostile.ref }],
+							},
+							{ type: "function_call_output", output: { image_url: hostile.ref } },
+						],
+					},
+				},
+			});
+			const session = fakeSession({ sessionManager: manager });
+
+			expect(await executeRpcSessionDataCommand(session, { type: "blob_list" })).toMatchObject({
+				success: true,
+				data: { blobs: [{ hash: trusted.hash, size: Buffer.from("remote compaction image URL").byteLength }] },
+			});
+			expect(await executeRpcSessionDataCommand(session, { type: "blob_read", hash: trusted.hash })).toMatchObject({
+				success: true,
+				data: { hash: trusted.hash, content: Buffer.from("remote compaction image URL").toString("base64") },
+			});
+			expect(await executeRpcSessionDataCommand(session, { type: "blob_read", hash: hostile.hash })).toMatchObject({
+				success: false,
+				code: "not-found",
+			});
+		} finally {
+			getBlobStore.mockRestore();
+		}
+	});
+
 	it("does not authorize blob refs planted in prompts or custom details", async () => {
 		const store = new BlobStore(path.join(tempDir.path(), "blobs"));
 		const manager = SessionManager.inMemory(tempDir.path());

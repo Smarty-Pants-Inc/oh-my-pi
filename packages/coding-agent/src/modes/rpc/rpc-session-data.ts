@@ -395,7 +395,28 @@ function collectComputerScreenshotBlobHash(providerMetadata: unknown, hashes: Se
 	collectBlobHash(providerMetadata.screenshot.image_url, hashes);
 }
 
-function collectResponsesGeneratedImageBlobHashes(providerPayload: unknown, hashes: Set<string>): void {
+function isResponsesMessageItem(
+	item: Record<string, unknown>,
+): item is Record<string, unknown> & { content: unknown[] } {
+	return (
+		(item.type === undefined || item.type === "message") &&
+		(item.role === "user" || item.role === "assistant" || item.role === "system" || item.role === "developer") &&
+		Array.isArray(item.content)
+	);
+}
+
+function collectResponsesInputImageBlobHashes(items: unknown, hashes: Set<string>): void {
+	if (!Array.isArray(items)) return;
+	for (const item of items) {
+		if (!isRecord(item) || !isResponsesMessageItem(item)) continue;
+		for (const part of item.content) {
+			if (!isRecord(part) || part.type !== "input_image") continue;
+			collectBlobHash(part.image_url, hashes);
+		}
+	}
+}
+
+function collectResponsesHistoryBlobHashes(providerPayload: unknown, hashes: Set<string>): void {
 	if (
 		!isRecord(providerPayload) ||
 		providerPayload.type !== "openaiResponsesHistory" ||
@@ -403,6 +424,7 @@ function collectResponsesGeneratedImageBlobHashes(providerPayload: unknown, hash
 	) {
 		return;
 	}
+	collectResponsesInputImageBlobHashes(providerPayload.items, hashes);
 	for (const item of providerPayload.items) {
 		if (
 			!isRecord(item) ||
@@ -416,18 +438,34 @@ function collectResponsesGeneratedImageBlobHashes(providerPayload: unknown, hash
 	}
 }
 
+function collectOpenAiRemoteCompactionBlobHashes(preserveData: unknown, hashes: Set<string>): void {
+	if (!isRecord(preserveData)) return;
+	const remoteCompaction = preserveData.openaiRemoteCompaction;
+	if (
+		!isRecord(remoteCompaction) ||
+		!Array.isArray(remoteCompaction.replacementHistory) ||
+		!remoteCompaction.replacementHistory.every(isRecord)
+	) {
+		return;
+	}
+	collectResponsesInputImageBlobHashes(remoteCompaction.replacementHistory, hashes);
+}
+
 function collectMessageBlobHashes(message: unknown, hashes: Set<string>): void {
 	if (!isRecord(message)) return;
 	switch (message.role) {
 		case "user":
 		case "developer":
+			collectImageContentBlobHashes(message.content, hashes);
+			collectResponsesHistoryBlobHashes(message.providerPayload, hashes);
+			return;
 		case "custom":
 		case "hookMessage":
 			collectImageContentBlobHashes(message.content, hashes);
 			return;
 		case "assistant":
 			collectImageContentBlobHashes(message.content, hashes);
-			collectResponsesGeneratedImageBlobHashes(message.providerPayload, hashes);
+			collectResponsesHistoryBlobHashes(message.providerPayload, hashes);
 			return;
 		case "toolResult":
 			collectImageContentBlobHashes(message.content, hashes);
@@ -448,11 +486,14 @@ function collectEntryBlobHashes(entry: unknown, hashes: Set<string>): void {
 			return;
 		case "compaction": {
 			const archive = isRecord(entry.preserveData) ? snapcompact.getPreservedArchive(entry.preserveData) : undefined;
-			if (!archive) return;
-			for (const frame of archive.frames) {
-				if (!isImageDataPayload(frame)) continue;
-				collectBlobHash(frame.data, hashes);
+			if (archive) {
+				for (const frame of archive.frames) {
+					if (!isImageDataPayload(frame)) continue;
+					collectBlobHash(frame.data, hashes);
+				}
 			}
+			collectOpenAiRemoteCompactionBlobHashes(entry.preserveData, hashes);
+			return;
 		}
 	}
 }
