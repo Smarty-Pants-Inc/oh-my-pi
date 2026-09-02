@@ -105,10 +105,17 @@ describe("RPC artifact and blob adapters", () => {
 	it("validates and stores canonical content-addressed blobs exactly once", async () => {
 		const blobsDir = path.join(tempDir.path(), "blobs");
 		const store = new BlobStore(blobsDir);
+		const manager = SessionManager.inMemory(tempDir.path());
+		const getBlobStore = spyOn(manager, "getBlobStore").mockReturnValue(store);
 		const put = spyOn(store, "put");
-		const session = fakeSession({ sessionManager: { getBlobStore: () => store } });
 		const data = Buffer.from("canonical blob");
 		const hash = new Bun.SHA256().update(data).digest("hex");
+		manager.appendMessage({
+			role: "user",
+			content: [{ type: "image", data: `blob:sha256:${hash}`, mimeType: "image/png" }],
+			timestamp: 0,
+		});
+		const session = fakeSession({ sessionManager: manager });
 		const command: Extract<RpcMutationCommand, { type: "blob_write" }> = {
 			type: "blob_write",
 			hash,
@@ -145,6 +152,51 @@ describe("RPC artifact and blob adapters", () => {
 		} finally {
 			ledger.close();
 			put.mockRestore();
+			getBlobStore.mockRestore();
+		}
+	});
+
+	it("does not enumerate or read blobs from another session history", async () => {
+		const store = new BlobStore(path.join(tempDir.path(), "blobs"));
+		const current = SessionManager.inMemory(tempDir.path());
+		const other = SessionManager.inMemory(tempDir.path());
+		const currentBlobStore = spyOn(current, "getBlobStore").mockReturnValue(store);
+		const otherBlobStore = spyOn(other, "getBlobStore").mockReturnValue(store);
+		const currentData = Buffer.from("current session blob");
+		const otherData = Buffer.from("other session blob");
+		try {
+			const currentBlob = await store.put(currentData);
+			const otherBlob = await store.put(otherData);
+			current.appendMessage({
+				role: "user",
+				content: [{ type: "image", data: currentBlob.ref, mimeType: "image/png" }],
+				timestamp: 0,
+			});
+			other.appendMessage({
+				role: "user",
+				content: [{ type: "image", data: otherBlob.ref, mimeType: "image/png" }],
+				timestamp: 0,
+			});
+			const currentSession = fakeSession({ sessionManager: current });
+			const otherSession = fakeSession({ sessionManager: other });
+
+			expect(await executeRpcSessionDataCommand(currentSession, { type: "blob_list" })).toMatchObject({
+				success: true,
+				data: { blobs: [{ hash: currentBlob.hash, size: currentData.byteLength }] },
+			});
+			expect(
+				await executeRpcSessionDataCommand(currentSession, { type: "blob_read", hash: otherBlob.hash }),
+			).toMatchObject({
+				success: false,
+				code: "not-found",
+			});
+			expect(await executeRpcSessionDataCommand(otherSession, { type: "blob_list" })).toMatchObject({
+				success: true,
+				data: { blobs: [{ hash: otherBlob.hash, size: otherData.byteLength }] },
+			});
+		} finally {
+			currentBlobStore.mockRestore();
+			otherBlobStore.mockRestore();
 		}
 	});
 

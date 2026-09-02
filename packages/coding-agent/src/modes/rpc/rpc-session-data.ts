@@ -5,7 +5,8 @@ import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import { isRecord } from "@oh-my-pi/pi-utils";
 import { parseSkillInvocation } from "../../extensibility/skills";
 import type { AgentSession } from "../../session/agent-session";
-import { BLOB_HASH_RE } from "../../session/blob-store";
+import { BLOB_HASH_RE, parseBlobRef } from "../../session/blob-store";
+import { prepareEntryForPersistence } from "../../session/session-persistence";
 import {
 	getRpcHistoryChunk,
 	getRpcHistoryDigest,
@@ -359,9 +360,39 @@ async function writeArtifact(
 	return { id, size: Buffer.byteLength(command.content, "utf8") };
 }
 
+function collectBlobHashes(value: unknown, hashes: Set<string>): void {
+	if (typeof value === "string") {
+		const hash = parseBlobRef(value);
+		if (hash) hashes.add(hash);
+		return;
+	}
+	if (Array.isArray(value)) {
+		for (const item of value) collectBlobHashes(item, hashes);
+		return;
+	}
+	if (!isRecord(value)) return;
+	for (const item of Object.values(value)) collectBlobHashes(item, hashes);
+}
+
+function activeSessionBlobHashes(session: AgentSession): Set<string> {
+	const manager = session.sessionManager;
+	const blobStore = manager.getBlobStore();
+	const hashes = new Set<string>();
+	// Live entries rehydrate blob refs to inline data, so inspect their canonical persistence form.
+	for (const entry of manager.getBranch()) collectBlobHashes(prepareEntryForPersistence(entry, blobStore), hashes);
+	return hashes;
+}
+
 async function listBlobs(session: AgentSession): Promise<RpcBlobListResult> {
-	const blobs = await session.sessionManager.getBlobStore().list();
-	if (blobs.length > MAX_LIST_RESULTS) throw new Error(`Blob list exceeds ${MAX_LIST_RESULTS} entries`);
+	const blobStore = session.sessionManager.getBlobStore();
+	const blobs: RpcBlobInfo[] = [];
+	for (const hash of activeSessionBlobHashes(session)) {
+		const blob = await blobStore.getInfo(hash);
+		if (!blob) continue;
+		blobs.push(blob);
+		if (blobs.length > MAX_LIST_RESULTS) throw new Error(`Blob list exceeds ${MAX_LIST_RESULTS} entries`);
+	}
+	blobs.sort((left, right) => left.hash.localeCompare(right.hash, "en"));
 	return { blobs };
 }
 
@@ -372,7 +403,16 @@ async function readBlob(
 	if (typeof command.hash !== "string" || !BLOB_HASH_RE.test(command.hash)) {
 		throw new RpcSessionDataError("Blob hash must be exactly 64 lowercase hexadecimal characters", "protocol-error");
 	}
-	const data = await session.sessionManager.getBlobStore().get(command.hash);
+	if (!activeSessionBlobHashes(session).has(command.hash)) {
+		throw new RpcSessionDataError(`Blob ${command.hash} was not found`, "not-found");
+	}
+	const blobStore = session.sessionManager.getBlobStore();
+	const info = await blobStore.getInfo(command.hash);
+	if (!info) throw new RpcSessionDataError(`Blob ${command.hash} was not found`, "not-found");
+	if (info.size > MAX_BLOB_BYTES) {
+		throw new RpcSessionDataError(`Blob exceeds ${MAX_BLOB_BYTES} bytes`, "blob_too_large");
+	}
+	const data = await blobStore.get(command.hash);
 	if (!data) throw new RpcSessionDataError(`Blob ${command.hash} was not found`, "not-found");
 	if (data.byteLength > MAX_BLOB_BYTES) {
 		throw new RpcSessionDataError(`Blob exceeds ${MAX_BLOB_BYTES} bytes`, "blob_too_large");

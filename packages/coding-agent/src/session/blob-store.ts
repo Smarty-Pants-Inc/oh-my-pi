@@ -185,6 +185,18 @@ export class BlobStore {
 		}
 	}
 
+	/** Return canonical metadata for one regular blob, or null when absent. */
+	async getInfo(hash: string): Promise<BlobInfo | null> {
+		if (!BLOB_HASH_RE.test(hash)) return null;
+		try {
+			const stat = await fsp.lstat(path.join(this.dir, hash));
+			return stat.isFile() ? { hash, size: stat.size } : null;
+		} catch (err) {
+			if (isEnoent(err)) return null;
+			throw err;
+		}
+	}
+
 	/** List canonical extensionless blobs in lexical hash order. */
 	async list(): Promise<BlobInfo[]> {
 		let entries: fs.Dirent[];
