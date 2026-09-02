@@ -30,6 +30,7 @@ import {
 	type RpcCommandDispatchResult,
 	type RpcResponse,
 } from "../modes/rpc/rpc-types";
+import { parseSlashCommand } from "../slash-commands/helpers/parse";
 import type { InteractiveModeContext } from "../modes/types";
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry } from "../registry/agent-registry";
@@ -106,6 +107,14 @@ const COLLAB_BUS_CHANNELS = [
 	TASK_SUBAGENT_LIFECYCLE_CHANNEL,
 	TASK_SUBAGENT_PROGRESS_CHANNEL,
 ] as const satisfies readonly BusChannel[];
+
+function isAcpHandoffPrompt(command: RpcCommand): boolean {
+	return (
+		command.type === "prompt" &&
+		typeof command.message === "string" &&
+		parseSlashCommand(command.message)?.name === "handoff"
+	);
+}
 
 function isValidHerdrDisplayName(name: string): boolean {
 	if (name.trim() !== name || Buffer.byteLength(name) > 64) return false;
@@ -880,7 +889,9 @@ export class CollabHost {
 			command.type === "fork" ||
 			command.type === "new_session" ||
 			command.type === "switch_session" ||
-			command.type === "branch";
+			command.type === "branch" ||
+			command.type === "handoff" ||
+			isAcpHandoffPrompt(command);
 		if (transition) this.#rpcSessionTransitions.add(requestKey);
 		const predecessorSessionId = this.#ctx.sessionManager.getSessionId();
 		let result: RpcCommandDispatchResult;

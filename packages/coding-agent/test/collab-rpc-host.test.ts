@@ -375,6 +375,87 @@ describe("hidden agentd RPC host bootstrap", () => {
 		}
 	});
 
+	test("rejects direct and ACP /handoff guest requests before Agentd predecessor rebind", async () => {
+		const testContext = createContext();
+		const transport = new TestTransport();
+		const authority = createAuthority();
+		const host = new CollabHost(testContext.context);
+		const handoffs: RpcMutationCommand[] = [
+			{ id: "managed-handoff", type: "handoff", customInstructions: "preserve predecessor" },
+			{ id: "managed-handoff-prompt", type: "prompt", message: "/handoff: preserve predecessor" },
+		];
+		await host.startWithTransport(transport, {
+			privateHost: true,
+			agentdManagedHost: true,
+			rpcAuthority: Promise.resolve(authority),
+		});
+		try {
+			transport.control({ t: "peer-authority", peer: 7, canWrite: true });
+			transport.deliver({ t: "hello", proto: COLLAB_PROTO, name: "guest" });
+			await transport.waitForFrame("welcome");
+
+			for (const [index, command] of handoffs.entries()) {
+				const requestId = 80 + index;
+				transport.deliver({ t: "rpc-request", requestId, command });
+				const result = await transport.waitForFrame("rpc-result", index + 1);
+				expect(result).toMatchObject({
+					requestId,
+					response: {
+						id: command.id,
+						command: command.type,
+						success: false,
+						code: "agentd-managed",
+						error: "Session lifecycle transitions are managed by Agentd",
+					},
+				});
+			}
+
+			expect(authority.commands).toEqual([]);
+			expect(testContext.context.sessionManager.getSessionId()).toBe("session-parent");
+			transport.deliver({ t: "rpc-read", requestId: 99, command: { id: "predecessor-state", type: "get_state" } });
+			const state = await transport.waitForFrame("rpc-read-result");
+			expect(state).toMatchObject({
+				requestId: 99,
+				response: { id: "predecessor-state", command: "get_state", success: true },
+			});
+			expect(authority.commands).toEqual([{ id: "predecessor-state", type: "get_state" }]);
+			expect(testContext.context.sessionManager.getSessionId()).toBe("session-parent");
+			expect(transport.closed).toBe(false);
+		} finally {
+			await host.stop("test complete");
+		}
+	});
+
+	test("leaves direct and ACP /handoff requests available on non-Agentd Collab routes", async () => {
+		const transport = new TestTransport();
+		const authority = createAuthority();
+		const host = new CollabHost(createContext().context);
+		const handoffs: RpcMutationCommand[] = [
+			{ id: "unmanaged-handoff", type: "handoff", customInstructions: "normal route" },
+			{ id: "unmanaged-handoff-prompt", type: "prompt", message: "/handoff normal route" },
+		];
+		await host.startWithTransport(transport, { rpcAuthority: Promise.resolve(authority) });
+		try {
+			transport.control({ t: "peer-authority", peer: 7, canWrite: true });
+			transport.deliver({ t: "hello", proto: COLLAB_PROTO, name: "guest" });
+			await transport.waitForFrame("welcome");
+
+			for (const [index, command] of handoffs.entries()) {
+				const requestId = 90 + index;
+				transport.deliver({ t: "rpc-request", requestId, command });
+				const result = await transport.waitForFrame("rpc-result", index + 1);
+				expect(result).toMatchObject({
+					requestId,
+					response: { id: command.id, command: command.type, success: true },
+				});
+			}
+
+			expect(authority.commands).toEqual(handoffs);
+		} finally {
+			await host.stop("test complete");
+		}
+	});
+
 	test("forwards shared sidechannels once and leaves host-owned channels with the direct client", async () => {
 		const testContext = createContext();
 		const transport = new TestTransport();
