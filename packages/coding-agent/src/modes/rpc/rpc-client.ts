@@ -71,7 +71,7 @@ import type {
 	RpcSubagentSnapshot,
 	RpcSubagentSubscriptionLevel,
 } from "./rpc-types";
-import { isRpcEndpointIdentity, isRpcMutationCommand, RPC_HERDR_AGENTD_HOST_CAPABILITY } from "./rpc-types";
+import { isRpcDurableMutationCommand, isRpcEndpointIdentity, RPC_HERDR_AGENTD_HOST_CAPABILITY } from "./rpc-types";
 
 /** Process transport consumed by {@link RpcClient}. */
 export interface RpcAgentProcess {
@@ -262,7 +262,7 @@ function redactSecretError(error: unknown, ...secrets: Array<string | undefined>
 	for (const secret of secrets) {
 		if (secret) message = message.split(secret).join("[REDACTED]");
 	}
-	return message === original.message ? original : new Error(message, { cause: original });
+	return message === original.message && original.cause === undefined ? original : new Error(message);
 }
 
 function isRpcResponse(value: unknown): value is RpcResponse {
@@ -1711,7 +1711,7 @@ export class RpcClient {
 			throw new Error("Client not started");
 		}
 
-		const durableMutation = isRpcMutationCommand(command) && command.mutation !== undefined;
+		const durableMutation = isRpcDurableMutationCommand(command) && command.mutation !== undefined;
 		if (durableMutation && !this.#ready?.capabilities.includes("mutation-receipts")) {
 			return Promise.reject(
 				new RpcCommandError(
@@ -1725,6 +1725,18 @@ export class RpcClient {
 
 		const id = `req_${++this.#requestId}`;
 		const fullCommand = { ...command, id } as RpcCommand;
+		let serializedCommand: string;
+		try {
+			serializedCommand = this.#serializeFrame(fullCommand);
+		} catch (error) {
+			return Promise.reject(
+				new RpcCommandError(
+					`Failed to serialize RPC ${command.type} command: ${error instanceof Error ? error.message : String(error)}`,
+					command.type,
+					"protocol-error",
+				),
+			);
+		}
 		const { promise, resolve, reject } = Promise.withResolvers<RpcResponse>();
 		let settled = false;
 		const timeoutId =
@@ -1764,7 +1776,7 @@ export class RpcClient {
 			this.#pendingRequests.delete(id);
 			pendingRequest.reject(transportLossError(pendingRequest, error));
 		};
-		void this.#writeFrame(fullCommand).catch(rejectWriteFailure);
+		void this.#writeSerializedFrame(serializedCommand).catch(rejectWriteFailure);
 		return promise;
 	}
 
@@ -1823,10 +1835,19 @@ export class RpcClient {
 		}
 	}
 
+	#serializeFrame(frame: RpcCommand | RpcControlFrame): string {
+		return `${JSON.stringify(frame)}\n`;
+	}
+
 	async #writeFrame(frame: RpcCommand | RpcControlFrame): Promise<void> {
+		if (!this.#process?.stdin) throw new Error("Client not started");
+		await this.#writeSerializedFrame(this.#serializeFrame(frame));
+	}
+
+	async #writeSerializedFrame(serializedFrame: string): Promise<void> {
 		const stdin = this.#process?.stdin;
 		if (!stdin) throw new Error("Client not started");
-		await stdin.write(`${JSON.stringify(frame)}\n`);
+		await stdin.write(serializedFrame);
 		await stdin.flush?.();
 	}
 

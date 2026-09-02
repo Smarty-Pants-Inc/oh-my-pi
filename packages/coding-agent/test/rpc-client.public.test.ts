@@ -284,7 +284,7 @@ describe("RpcClient public launch and request seams", () => {
 	test("redacts the initial direct token from launch failures", async () => {
 		const token = "initial-launch-secret";
 		const spawn = spyOn(ptree, "spawn").mockImplementation(() => {
-			throw new Error(`launch failed with ${token}`);
+			throw new Error(`launch failed with ${token}`, { cause: new Error(`nested launch failure with ${token}`) });
 		});
 		try {
 			using client = new RpcClient({
@@ -292,7 +292,12 @@ describe("RpcClient public launch and request seams", () => {
 			});
 			const starting = client.start();
 			await expect(starting).rejects.toThrow("launch failed with [REDACTED]");
-			await starting.catch(error => expect(String(error)).not.toContain(token));
+			await starting.catch(error => {
+				if (!(error instanceof Error)) throw new Error("Expected an Error");
+				expect(String(error)).not.toContain(token);
+				expect(error.cause).toBeUndefined();
+				expect(Bun.inspect(error)).not.toContain(token);
+			});
 		} finally {
 			spawn.mockRestore();
 		}
@@ -614,6 +619,33 @@ describe("RpcClient public launch and request seams", () => {
 				}),
 			).rejects.toMatchObject({ command: "prompt", code: "protocol-error" });
 			expect(received).toEqual([]);
+		} finally {
+			spawn.mockRestore();
+		}
+	});
+
+	test("rejects local durable serialization failures before any bytes reach the agent", async () => {
+		const received: Array<Record<string, unknown>> = [];
+		const spawn = spyOn(ptree, "spawn").mockImplementation(() => createRpcChild(received));
+
+		try {
+			using client = new RpcClient({ cliPath: "/repo/dist/cli.js" });
+			await client.start();
+			const cyclic: { self?: unknown } = {};
+			cyclic.self = cyclic;
+			for (const [name, details] of [
+				["bigint", 1n],
+				["cycle", cyclic],
+			] as const) {
+				await expect(
+					client.sendCustomMessage(
+						{ customType: "local-serialization", content: "must not dispatch", display: false, details },
+						{ commandId: `authority-${name}`, runtimeId: "runtime-1", generation: 1 },
+					),
+				).rejects.toMatchObject({ command: "custom_message", code: "protocol-error" });
+			}
+			expect(received).toEqual([]);
+			await expect(client.request({ type: "get_state" })).resolves.toMatchObject({ success: true });
 		} finally {
 			spawn.mockRestore();
 		}

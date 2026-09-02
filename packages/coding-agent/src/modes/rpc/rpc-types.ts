@@ -112,6 +112,12 @@ export type RpcMutationOperation = {
 	[K in RpcCommandType]: (typeof RPC_COMMAND_CLASSIFICATION)[K] extends "mutation" ? K : never;
 }[RpcCommandType];
 
+const RPC_CONNECTION_LOCAL_MUTATION_OPERATIONS: Partial<Record<RpcMutationOperation, true>> = {
+	set_host_tools: true,
+	set_host_uri_schemes: true,
+	set_subagent_subscription: true,
+};
+
 /** Bounded OMP-native session outcome recorded with a durable mutation receipt. */
 export interface RpcMutationSessionOutcome {
 	status: "completed" | "cancelled" | "rejected";
@@ -262,6 +268,12 @@ type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K>
 export type RpcCommandInput = DistributiveOmit<RpcCommand, "id">;
 
 export type RpcMutationCommand = Extract<RpcCommand, { type: RpcMutationOperation }>;
+
+/** Mutable connection-local configuration that must be applied again after reconnect. */
+export type RpcDurableMutationCommand = Exclude<
+	RpcMutationCommand,
+	{ type: "set_host_tools" | "set_host_uri_schemes" | "set_subagent_subscription" }
+>;
 export type RpcReadCommand = Exclude<RpcCommand, RpcMutationCommand>;
 
 type RpcCommandClassificationCoverage =
@@ -291,6 +303,11 @@ export function isRpcMutationContext(value: unknown): value is RpcMutationContex
 export function isRpcMutationCommand(value: unknown): value is RpcMutationCommand {
 	if (!isRecord(value) || typeof value.type !== "string") return false;
 	return RPC_COMMAND_CLASSIFICATION[value.type as RpcCommandType] === "mutation";
+}
+
+/** True for mutations whose outcomes can safely be persisted and replayed across processes. */
+export function isRpcDurableMutationCommand(value: unknown): value is RpcDurableMutationCommand {
+	return isRpcMutationCommand(value) && !RPC_CONNECTION_LOCAL_MUTATION_OPERATIONS[value.type];
 }
 
 /** Canonical discriminator-only read classification used by Collab routing. */

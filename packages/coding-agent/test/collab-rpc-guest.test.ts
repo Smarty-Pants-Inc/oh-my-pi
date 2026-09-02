@@ -189,6 +189,35 @@ describe("CollabRpcGuest", () => {
 		}
 	});
 
+	it("reapplies connection-local configuration retries without a durable receipt", async () => {
+		const transport = new TestTransport();
+		const guest = new CollabRpcGuest({ transport, session: createSession(), roomId: "room-configuration" });
+		await hydrate(guest, transport);
+		const command: Extract<RpcMutationCommand, { type: "set_host_tools" }> = {
+			type: "set_host_tools",
+			tools: [],
+			mutation: { commandId: "authority-host-tools", runtimeId: "runtime-1", generation: 1 },
+		};
+		for (const id of ["host-tools", "host-tools-retry"]) {
+			const pending = guest.handleCommand({ ...command, id });
+			await Promise.resolve();
+			const request = transport.sent.at(-1);
+			if (request?.t !== "rpc-request") throw new Error("Expected forwarded connection-local configuration");
+			transport.deliver({
+				t: "rpc-result",
+				requestId: request.requestId,
+				response: {
+					id,
+					type: "response",
+					command: "set_host_tools",
+					success: true,
+					data: { toolNames: [] },
+				},
+			});
+			expect(await pending).toMatchObject({ id, success: true, data: { toolNames: [] } });
+		}
+	});
+
 	it("forwards collab events, RPC output, and control sidechannels without local authority", async () => {
 		const transport = new TestTransport();
 		const guest = new CollabRpcGuest({ transport, session: createSession(), roomId: "room-events" });

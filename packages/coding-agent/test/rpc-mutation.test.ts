@@ -11,6 +11,7 @@ import {
 } from "../src/modes/rpc/rpc-mode";
 import { fingerprintRpcMutation, RpcMutationLedger } from "../src/modes/rpc/rpc-mutation";
 import {
+	isRpcDurableMutationCommand,
 	isRpcMutationCommand,
 	RPC_COMMAND_CLASSIFICATION,
 	type RpcCommand,
@@ -59,6 +60,14 @@ it("classifies every RPC command discriminator from one exhaustive table", () =>
 	expect(mutationContextCoverage).toBe(true);
 	for (const [type, classification] of Object.entries(RPC_COMMAND_CLASSIFICATION)) {
 		expect(isRpcMutationCommand({ type } as RpcCommand)).toBe(classification === "mutation");
+	}
+});
+
+it("keeps connection-local configuration mutable without durable receipts", () => {
+	for (const type of ["set_host_tools", "set_host_uri_schemes", "set_subagent_subscription"] as const) {
+		const command = { type } as unknown as RpcCommand;
+		expect(isRpcMutationCommand(command)).toBe(true);
+		expect(isRpcDurableMutationCommand(command)).toBe(false);
 	}
 });
 
@@ -311,6 +320,111 @@ describe("RpcMutationLedger", () => {
 			expect(response).toMatchObject({ success: false, code: "not-found" });
 			expect(executions).toBe(0);
 			ledger.close();
+			const db = new Database(dbPath, { readonly: true });
+			const row = db.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM rpc_mutations").get();
+			db.close();
+			expect(row?.count).toBe(0);
+		});
+	});
+
+	it("replays a completed mutation before mutable preflight reads current session state", async () => {
+		await withLedgerDb(async dbPath => {
+			const ledger = new RpcMutationLedger(dbPath);
+			let toolIsActive = true;
+			let executions = 0;
+			const session = {
+				sessionId: "session-1",
+				getActiveToolNames: () => (toolIsActive ? ["remote-tool"] : []),
+				resolveNamedToolChoice: (name: string) => {
+					if (name !== "remote-tool" || !toolIsActive) throw new Error("tool is inactive");
+					return { type: "function", name };
+				},
+			} as unknown as AgentSession;
+			const command: Extract<RpcMutationCommand, { type: "prompt" }> = {
+				id: "prompt-with-tool",
+				type: "prompt",
+				message: "run the configured tool",
+				toolChoice: "remote-tool",
+				mutation: { commandId: "authority-tool-choice", runtimeId: "runtime-1", generation: 1 },
+			};
+			try {
+				const first = await dispatchRpcCanonicalCommand(session, command, ledger, async () => {
+					executions++;
+					return {
+						id: command.id,
+						type: "response",
+						command: "prompt",
+						success: true,
+						data: { agentInvoked: true },
+					} as RpcResponse;
+				});
+				toolIsActive = false;
+				const replay = await dispatchRpcCanonicalCommand(
+					session,
+					{ ...command, id: "prompt-with-tool-retry" },
+					ledger,
+					async () => {
+						throw new Error("replayed prompt must not execute");
+					},
+				);
+				expect(executions).toBe(1);
+				expect(first).toMatchObject({ success: true, receipt: { replayed: false } });
+				expect(replay).toMatchObject({
+					id: "prompt-with-tool-retry",
+					success: true,
+					receipt: { replayed: true },
+				});
+			} finally {
+				ledger.close();
+			}
+		});
+	});
+
+	it("reapplies connection-local configuration instead of replaying it from the durable ledger", async () => {
+		await withLedgerDb(async dbPath => {
+			const ledger = new RpcMutationLedger(dbPath);
+			const session = { sessionId: "session-1" } as AgentSession;
+			const commands: RpcMutationCommand[] = [
+				{
+					id: "host-tools",
+					type: "set_host_tools",
+					tools: [],
+					mutation: { commandId: "authority-host-tools", runtimeId: "runtime-1", generation: 1 },
+				},
+				{
+					id: "host-uri-schemes",
+					type: "set_host_uri_schemes",
+					schemes: [],
+					mutation: { commandId: "authority-host-uri-schemes", runtimeId: "runtime-1", generation: 1 },
+				},
+				{
+					id: "subagent-subscription",
+					type: "set_subagent_subscription",
+					level: "off",
+					mutation: { commandId: "authority-subagent-subscription", runtimeId: "runtime-1", generation: 1 },
+				},
+			];
+			let applications = 0;
+			try {
+				for (const command of commands) {
+					const first = await dispatchRpcCanonicalCommand(session, command, ledger, async () => {
+						applications++;
+						return { id: command.id, type: "response", command: command.type, success: true } as RpcResponse;
+					});
+					const retry = { ...command, id: `${command.id}-retry` };
+					const replay = await dispatchRpcCanonicalCommand(session, retry, ledger, async () => {
+						applications++;
+						return { id: retry.id, type: "response", command: retry.type, success: true } as RpcResponse;
+					});
+					expect(first).toMatchObject({ success: true, command: command.type });
+					expect(replay).toMatchObject({ success: true, command: command.type });
+					expect("receipt" in first).toBe(false);
+					expect("receipt" in replay).toBe(false);
+				}
+			} finally {
+				ledger.close();
+			}
+			expect(applications).toBe(commands.length * 2);
 			const db = new Database(dbPath, { readonly: true });
 			const row = db.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM rpc_mutations").get();
 			db.close();

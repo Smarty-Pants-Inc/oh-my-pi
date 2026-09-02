@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { getConfigRootDir, isRecord } from "@oh-my-pi/pi-utils";
 import {
 	isRpcMutationContext,
+	type RpcDurableMutationCommand,
 	type RpcMutationCommand,
 	type RpcMutationOperation,
 	type RpcMutationReceipt,
@@ -181,9 +182,10 @@ CREATE TABLE IF NOT EXISTS rpc_mutations (
 	}
 
 	async execute(
-		command: RpcMutationCommand,
+		command: RpcDurableMutationCommand,
 		getSessionId: () => string,
 		execute: () => Promise<RpcResponse>,
+		preflight?: () => RpcResponse | undefined,
 	): Promise<RpcResponse> {
 		if (!isRpcMutationContext(command.mutation)) {
 			return mutationError(command, "A valid mutation context is required", "protocol-error");
@@ -197,11 +199,14 @@ CREATE TABLE IF NOT EXISTS rpc_mutations (
 		const context = command.mutation;
 		const claim = this.#db.transaction(() => {
 			const existing = this.#select.get(context.commandId);
-			if (existing) return existing;
+			if (existing) return { existing };
+			const preflightError = preflight?.();
+			if (preflightError) return { preflightError };
 			this.#insert.run(context.commandId, context.runtimeId, context.generation, command.type, fingerprint);
-			return null;
+			return {};
 		});
-		const existing = claim.immediate();
+		const { existing, preflightError } = claim.immediate();
+		if (preflightError) return preflightError;
 		if (existing) {
 			if (
 				existing.runtime_id !== context.runtimeId ||
@@ -246,7 +251,7 @@ CREATE TABLE IF NOT EXISTS rpc_mutations (
 	}
 
 	async #executeClaimed(
-		command: RpcMutationCommand,
+		command: RpcDurableMutationCommand,
 		getSessionId: () => string,
 		execute: () => Promise<RpcResponse>,
 	): Promise<RpcResponse> {

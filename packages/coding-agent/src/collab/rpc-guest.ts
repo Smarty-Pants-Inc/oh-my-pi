@@ -5,6 +5,7 @@ import { getConfigRootDir, logger } from "@oh-my-pi/pi-utils";
 import { runRpcMode } from "../modes/rpc/rpc-mode";
 import { fingerprintRpcMutation } from "../modes/rpc/rpc-mutation";
 import {
+	isRpcDurableMutationCommand,
 	isRpcEndpointIdentity,
 	isRpcMutationCommand,
 	isRpcMutationContext,
@@ -320,7 +321,7 @@ export class CollabRpcGuest {
 			);
 			return;
 		}
-		if (!isRpcMutationCommand(command)) {
+		if (!isRpcDurableMutationCommand(command)) {
 			pending.resolve(response);
 			return;
 		}
@@ -458,7 +459,7 @@ export class CollabRpcGuest {
 	#settlePending(reason: string, mutationCode: "ambiguous" | "unavailable"): void {
 		for (const [requestId, pending] of this.#pendingRequests) {
 			if (pending.timer) clearTimeout(pending.timer);
-			const mutation = isRpcMutationCommand(pending.command);
+			const mutation = isRpcDurableMutationCommand(pending.command);
 			pending.resolve(
 				this.#responseError(
 					pending.command,

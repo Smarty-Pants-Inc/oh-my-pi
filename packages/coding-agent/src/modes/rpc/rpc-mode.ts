@@ -45,6 +45,7 @@ import { executeRpcSessionDataCommand, validateRpcMutationBeforeIntent } from ".
 import { buildRpcSessionState } from "./rpc-state";
 import { RpcSubagentRegistry, readRpcSubagentTranscript } from "./rpc-subagents";
 import {
+	isRpcDurableMutationCommand,
 	isRpcHerdrAgentdRebindControl,
 	isRpcHerdrAgentdRebindControlFrame,
 	isRpcMutationCommand,
@@ -283,13 +284,19 @@ export async function dispatchRpcCanonicalCommand(
 	execute: () => Promise<RpcResponse>,
 ): Promise<RpcResponse> {
 	if (!isRpcMutationCommand(command)) return execute();
-	const preflightError = validateRpcMutationBeforeIntent(session, command);
-	if (preflightError) return preflightError;
-	if (!command.mutation) return execute();
+	if (!isRpcDurableMutationCommand(command)) return execute();
+	const preflight = () => validateRpcMutationBeforeIntent(session, command);
+	if (!command.mutation) {
+		const preflightError = preflight();
+		if (preflightError) return preflightError;
+		return execute();
+	}
 	if (!mutationLedger) {
+		const preflightError = preflight();
+		if (preflightError) return preflightError;
 		return rpcError(command.id, command.type, "Durable mutation receipts are unavailable", "unavailable");
 	}
-	return mutationLedger.execute(command, () => session.sessionId, execute);
+	return mutationLedger.execute(command, () => session.sessionId, execute, preflight);
 }
 
 /** Fork while deferring endpoint rebind publication until the response frame has flushed. */
