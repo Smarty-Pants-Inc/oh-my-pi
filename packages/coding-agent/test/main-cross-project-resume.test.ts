@@ -95,6 +95,90 @@ describe("createSessionManager — cross-project --resume", () => {
 	});
 });
 
+describe("SessionManager.open — recorded cwd adoption", () => {
+	it("keeps the launch cwd when the recorded cwd cannot be probed", async () => {
+		const root = await fsp.mkdtemp(path.join(os.tmpdir(), "omp-xproj-denied-"));
+		const launchProject = path.join(root, "launch");
+		const deniedProject = path.join(root, "denied");
+		await fsp.mkdir(launchProject);
+		const match = buildGlobalMatch(deniedProject);
+		await Bun.write(
+			match.session.path,
+			`${JSON.stringify({
+				type: "session",
+				id: match.session.id,
+				cwd: deniedProject,
+				timestamp: new Date(0).toISOString(),
+			})}\n`,
+		);
+		const realStat = fs.promises.stat.bind(fs.promises) as (
+			path: fs.PathLike,
+			options?: fs.StatOptions,
+		) => Promise<fs.Stats>;
+		const stat = vi.spyOn(fs.promises, "stat").mockImplementation((async (
+			target: fs.PathLike,
+			options?: fs.StatOptions,
+		) => {
+			if (normalizePathForComparison(String(target)) === normalizePathForComparison(deniedProject)) {
+				throw Object.assign(new Error("operation not permitted"), { code: "EACCES" });
+			}
+			return realStat(target, options);
+		}) as typeof fs.promises.stat);
+		try {
+			const manager = await SessionManager.open(match.session.path, undefined, undefined, {
+				initialCwd: launchProject,
+			});
+			try {
+				expect(manager.getCwd()).toBe(launchProject);
+			} finally {
+				await manager.close();
+			}
+		} finally {
+			stat.mockRestore();
+			await fsp.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps the launch cwd when the recorded cwd denies search permission", async () => {
+		const root = await fsp.mkdtemp(path.join(os.tmpdir(), "omp-xproj-noexec-"));
+		const launchProject = path.join(root, "launch");
+		const deniedProject = path.join(root, "denied");
+		await fsp.mkdir(launchProject);
+		await fsp.mkdir(deniedProject);
+		const match = buildGlobalMatch(deniedProject);
+		await Bun.write(
+			match.session.path,
+			`${JSON.stringify({
+				type: "session",
+				id: match.session.id,
+				cwd: deniedProject,
+				timestamp: new Date(0).toISOString(),
+			})}\n`,
+		);
+		const realAccess = fs.promises.access.bind(fs.promises);
+		const access = vi.spyOn(fs.promises, "access").mockImplementation(async (target, mode) => {
+			if (normalizePathForComparison(String(target)) === normalizePathForComparison(deniedProject)) {
+				throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+			}
+			return realAccess(target, mode);
+		});
+
+		try {
+			const manager = await SessionManager.open(match.session.path, undefined, undefined, {
+				initialCwd: launchProject,
+			});
+			try {
+				expect(manager.getCwd()).toBe(launchProject);
+			} finally {
+				await manager.close();
+			}
+		} finally {
+			access.mockRestore();
+			await fsp.rm(root, { recursive: true, force: true });
+		}
+	});
+});
+
 describe("runRootCommand — cross-project --resume", () => {
 	let root: string;
 	let launchProject: string;
@@ -126,7 +210,7 @@ describe("runRootCommand — cross-project --resume", () => {
 		await fsp.rm(root, { recursive: true, force: true });
 	});
 
-	it("uses the destination provider policy and plugin roots before session creation", async () => {
+	it("uses the destination cwd after access returns during resume", async () => {
 		const match = buildGlobalMatch(resumedProject);
 		vi.spyOn(sessionListingModule, "resolveResumableSession").mockResolvedValue(match);
 		const settings = Settings.isolated({
@@ -134,8 +218,6 @@ describe("runRootCommand — cross-project --resume", () => {
 			"marketplace.autoUpdate": "off",
 		});
 		const reloadForCwd = vi.spyOn(settings, "reloadForCwd");
-		// The launch project disables Claude, but its path-scoped policy must not
-		// leak into the resumed project. Record each requested preload policy.
 		const preloadedCwds: (string | undefined)[] = [];
 		const preloadedPolicies: Array<{ includeClaudeRegistry?: boolean } | undefined> = [];
 		vi.spyOn(pluginHelpers, "preloadPluginRoots").mockImplementation(async (_home, cwd, policy) => {
@@ -143,6 +225,15 @@ describe("runRootCommand — cross-project --resume", () => {
 			preloadedPolicies.push(policy);
 		});
 		const clearPluginRoots = vi.spyOn(pluginHelpers, "clearPluginRootsAndCaches");
+		const realAccess = fs.promises.access.bind(fs.promises);
+		let deniedProbes = 2;
+		const access = vi.spyOn(fs.promises, "access").mockImplementation(async (target, mode) => {
+			if (deniedProbes > 0 && path.basename(String(target)) === "resumed") {
+				deniedProbes -= 1;
+				throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+			}
+			return realAccess(target, mode);
+		});
 		const authStorage = await AuthStorage.create(path.join(root, "auth.db"));
 		const rawArgs = ["--cwd", launchProject, "--resume", "019e84ed", "--print"];
 		const parsed = parseArgs(rawArgs);
@@ -152,6 +243,7 @@ describe("runRootCommand — cross-project --resume", () => {
 		parsed.noTools = true;
 		parsed.noLsp = true;
 		let resumedManager: SessionManager | undefined;
+
 		let preloadedDestinationAtCreation = false;
 		let sessionOptionsCwd: string | undefined;
 
@@ -172,9 +264,11 @@ describe("runRootCommand — cross-project --resume", () => {
 		} catch (error) {
 			if (!(error instanceof Error) || error.message !== "stop after session options") throw error;
 		} finally {
+			access.mockRestore();
 			authStorage.close();
 			await resumedManager?.close();
 		}
+		expect(deniedProbes).toBe(0);
 
 		expect(getProjectDir()).toBe(resumedProject);
 		// process.cwd() reports the physical path (/private/var/... on macOS) while
@@ -189,6 +283,93 @@ describe("runRootCommand — cross-project --resume", () => {
 		expect(preloadedPolicies.at(-1)?.includeClaudeRegistry).toBe(true);
 		expect(clearPluginRoots).toHaveBeenCalledWith(undefined, { rewarm: false });
 	}, 15_000);
+
+	it("re-scopes Settings back to the launch project when destination rescope fails", async () => {
+		const match = buildGlobalMatch(resumedProject);
+		vi.spyOn(sessionListingModule, "resolveResumableSession").mockResolvedValue(match);
+		const settings = Settings.isolated({ "marketplace.autoUpdate": "off" });
+		const reloadForCwd = vi.spyOn(settings, "reloadForCwd").mockImplementation(async cwd => {
+			if (normalizePathForComparison(cwd) === normalizePathForComparison(resumedProject)) {
+				throw new Error("destination config unreadable");
+			}
+		});
+		vi.spyOn(pluginHelpers, "preloadPluginRoots").mockResolvedValue(undefined);
+		const authStorage = await AuthStorage.create(path.join(root, "auth.db"));
+		const parsed = parseArgs(["--resume", "019e84ed", "--print"]);
+		parsed.noExtensions = true;
+		parsed.noSkills = true;
+		parsed.noRules = true;
+		parsed.noTools = true;
+		parsed.noLsp = true;
+		let resumedManager: SessionManager | undefined;
+
+		try {
+			await runRootCommand(parsed, ["--resume", "019e84ed", "--print"], {
+				discoverAuthStorage: async () => authStorage,
+				settings,
+				createAgentSession: async options => {
+					if (!options) throw new Error("Expected session options");
+					resumedManager = options.sessionManager;
+					throw new Error("stop after session options");
+				},
+			});
+		} catch (error) {
+			if (!(error instanceof Error) || error.message !== "stop after session options") throw error;
+		} finally {
+			reloadForCwd.mockRestore();
+			authStorage.close();
+			await resumedManager?.close();
+		}
+
+		// The destination read rejected, so the fallback must re-scope Settings
+		// back to the launch project; otherwise path-derived values and saves
+		// would still target the failed resume target.
+		expect(getProjectDir()).toBe(launchProject);
+		expect(resumedManager?.getCwd()).toBe(launchProject);
+		expect(settings.getCwd()).toBe(launchProject);
+	});
+
+	it("rolls back the session manager when the resumed cwd is denied", async () => {
+		const match = buildGlobalMatch(resumedProject);
+		vi.spyOn(sessionListingModule, "resolveResumableSession").mockResolvedValue(match);
+		const settings = Settings.isolated({ "marketplace.autoUpdate": "off" });
+		const authStorage = await AuthStorage.create(path.join(root, "auth.db"));
+		const originalChdir = process.chdir.bind(process);
+		const chdir = vi.spyOn(process, "chdir").mockImplementation(dir => {
+			if (normalizePathForComparison(dir) === normalizePathForComparison(resumedProject)) {
+				throw new Error("operation not permitted");
+			}
+			originalChdir(dir);
+		});
+		const parsed = parseArgs(["--resume", "019e84ed", "--print"]);
+		parsed.noExtensions = true;
+		parsed.noSkills = true;
+		parsed.noRules = true;
+		parsed.noTools = true;
+		parsed.noLsp = true;
+		let resumedManager: SessionManager | undefined;
+
+		try {
+			await runRootCommand(parsed, ["--resume", "019e84ed", "--print"], {
+				discoverAuthStorage: async () => authStorage,
+				settings,
+				createAgentSession: async options => {
+					if (!options) throw new Error("Expected session options");
+					resumedManager = options.sessionManager;
+					throw new Error("stop after session options");
+				},
+			});
+		} catch (error) {
+			if (!(error instanceof Error) || error.message !== "stop after session options") throw error;
+		} finally {
+			chdir.mockRestore();
+			authStorage.close();
+			await resumedManager?.close();
+		}
+
+		expect(getProjectDir()).toBe(launchProject);
+		expect(resumedManager?.getCwd()).toBe(launchProject);
+	});
 
 	it("re-resolves the model scope from the resumed project's enabledModels after the switch", async () => {
 		const match = buildGlobalMatch(resumedProject);

@@ -161,6 +161,7 @@ export function snapshotJobs(session: ToolSession, jobs: TrackedJobLike[]): JobS
 	return jobs.map(j => {
 		const current = session.asyncJobManager?.getJob(j.id);
 		const latest = current ?? j;
+		const resultConsumed = session.asyncJobManager?.isJobResultConsumed(latest.id) === true;
 		let resolvedModel: string | undefined;
 		if (latest.type === "task") {
 			const progressValue = latest.latestDetails?.progress;
@@ -189,8 +190,8 @@ export function snapshotJobs(session: ToolSession, jobs: TrackedJobLike[]): JobS
 			label: latest.label,
 			durationMs: Math.max(0, now - latest.startTime),
 			...(resolvedModel ? { resolvedModel } : {}),
-			...(latest.resultText ? { resultText: latest.resultText } : {}),
-			...(latest.errorText ? { errorText: latest.errorText } : {}),
+			...(!resultConsumed && latest.resultText ? { resultText: latest.resultText } : {}),
+			...(!resultConsumed && latest.errorText ? { errorText: latest.errorText } : {}),
 		};
 	});
 }
@@ -211,8 +212,9 @@ export function buildJobResult(
 		return true;
 	});
 	const jobResults = snapshotJobs(session, uniqueJobs);
-	// Capture exact image blocks before acknowledging terminal jobs, because
-	// acknowledgement suppresses their automatic async-result delivery.
+	const alreadyConsumed = new Set(jobResults.filter(job => manager.isJobResultConsumed(job.id)).map(job => job.id));
+	// Capture image blocks before acknowledging terminal jobs, because acknowledgement
+	// suppresses their automatic async-result delivery.
 	const attachments = buildAsyncResultImageAttachments(
 		uniqueJobs.map(job => {
 			const latest = manager.getJob(job.id) ?? job;
@@ -223,7 +225,7 @@ export function buildJobResult(
 		}),
 	);
 
-	manager.acknowledgeDeliveries(jobResults.filter(j => j.status !== "running").map(j => j.id));
+	manager.consumeJobResults(jobResults.filter(j => j.status !== "running").map(j => j.id));
 
 	const completed = jobResults.filter(j => j.status !== "running");
 	const running = jobResults.filter(j => j.status === "running");
@@ -241,6 +243,13 @@ export function buildJobResult(
 		for (const j of completed) {
 			lines.push(`### ${j.id} [${j.type}] — ${j.status}`);
 			lines.push(`Label: ${j.label}`);
+			if (j.status !== "cancelled") {
+				lines.push(
+					alreadyConsumed.has(j.id)
+						? "Delivery: already delivered or recovered."
+						: "Delivery: not auto-delivered; recovered by this snapshot.",
+				);
+			}
 			if (j.resultText) {
 				lines.push("```", j.resultText, "```");
 			}

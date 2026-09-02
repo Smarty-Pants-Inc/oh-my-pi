@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -521,6 +521,7 @@ describe("pi-native gateway cache controls", () => {
 		const storage = await AuthStorage.create(path.join(dir, "auth.db"));
 		storage.setRuntimeApiKey("openai", "provider-key");
 		let upstreamCalls = 0;
+		const approvalTtlMs = 1_000;
 		const upstream = Bun.serve({
 			hostname: "127.0.0.1",
 			port: 0,
@@ -561,7 +562,7 @@ describe("pi-native gateway cache controls", () => {
 			bearerTokens: ["gateway-token", "other-valid-token"],
 			storage,
 			resolveModel: () => providerModel,
-			boundaryApprovalTtlMs: 80,
+			boundaryApprovalTtlMs: approvalTtlMs,
 			version: "test",
 		});
 		const clientModel = {
@@ -683,7 +684,7 @@ describe("pi-native gateway cache controls", () => {
 				streamPiNative(clientModel, baseContext, {
 					apiKey: "gateway-token",
 					onPayload: async () => {
-						await Bun.sleep(120);
+						await Bun.sleep(approvalTtlMs + 200);
 					},
 				}).result(),
 			).rejects.toThrow(/expired/);
@@ -807,6 +808,91 @@ describe("pi-native gateway cache controls", () => {
 		}
 	});
 });
+
+describe("pi-native gateway usage attribution", () => {
+	it("records observed usage under the caller's x-omp-* identity, host-fallback when absent", async () => {
+		registerMockApi();
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gw-pi-native-usage-"));
+		const storage = await AuthStorage.create(path.join(dir, "auth.db"));
+		storage.setRuntimeApiKey("openrouter", "test-key");
+		const recorded: Array<{
+			provider: string;
+			model: string;
+			usage: { input: number; output: number; cacheRead: number; cacheWrite: number };
+			costUsd?: number;
+			client?: { installId: string; hostname?: string; app?: string };
+		}> = [];
+		const spy = vi.spyOn(storage, "recordObservedUsage").mockImplementation(entry => {
+			recorded.push(entry);
+		});
+		const mock = createMockModel({ provider: "openrouter", id: "pi-native-usage" });
+		const handle = startAuthGateway({
+			bind: "127.0.0.1:0",
+			bearerTokens: ["test-token"],
+			storage,
+			resolveModel: () => mock,
+			version: "test",
+		});
+
+		try {
+			const usage = { input: 100, output: 20, cacheRead: 5, cacheWrite: 2, cost: { total: 0.75 } };
+			mock.push({ content: ["ok"], usage });
+			const attributed = await fetch(`${handle.url}/v1/pi/stream`, {
+				method: "POST",
+				headers: {
+					Authorization: "Bearer test-token",
+					"Content-Type": "application/json",
+					"x-omp-install-id": "robomp-install",
+					"x-omp-hostname": "robomp-box",
+					"x-omp-app": "robomp",
+				},
+				body: JSON.stringify({ modelId: "pi-native-usage", context: baseContext, stream: false }),
+			});
+			expect(attributed.status).toBe(200);
+			await attributed.json();
+			expect(recorded).toHaveLength(1);
+			expect(recorded[0]).toMatchObject({
+				provider: "openrouter",
+				model: "pi-native-usage",
+				usage: { input: 100, output: 20, cacheRead: 5, cacheWrite: 2 },
+				costUsd: 0.75,
+				client: { installId: "robomp-install", hostname: "robomp-box", app: "robomp" },
+			});
+
+			// No identity headers → the burn still lands somewhere: the gateway
+			// host's own install id under the `gateway` app label.
+			mock.push({ content: ["ok"], usage });
+			const anonymous = await fetch(`${handle.url}/v1/pi/stream`, {
+				method: "POST",
+				headers: { Authorization: "Bearer test-token", "Content-Type": "application/json" },
+				body: JSON.stringify({ modelId: "pi-native-usage", context: baseContext, stream: false }),
+			});
+			expect(anonymous.status).toBe(200);
+			await anonymous.json();
+			expect(recorded).toHaveLength(2);
+			expect(recorded[1]?.client?.app).toBe("gateway");
+			expect(recorded[1]?.client?.installId.length).toBeGreaterThan(0);
+
+			// Zero-usage turns (pre-flight failures) never record.
+			mock.push({ content: ["ok"] });
+			const zeroUsage = await fetch(`${handle.url}/v1/pi/stream`, {
+				method: "POST",
+				headers: { Authorization: "Bearer test-token", "Content-Type": "application/json" },
+				body: JSON.stringify({ modelId: "pi-native-usage", context: baseContext, stream: false }),
+			});
+			expect(zeroUsage.status).toBe(200);
+			await zeroUsage.json();
+			expect(recorded).toHaveLength(2);
+		} finally {
+			spy.mockRestore();
+			await handle.close();
+			storage.close();
+			await fs.rm(dir, { recursive: true, force: true });
+			clearCustomApis();
+		}
+	});
+});
+
 describe("pi-native encodeStream", () => {
 	it("ships every AssistantMessageEvent verbatim, terminated by [DONE]", async () => {
 		// Pi-native is omp-talks-to-omp: the client feeds parsed events directly

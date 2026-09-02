@@ -777,6 +777,8 @@ export class ExtensionRunner {
 			contextActions.setQueuedPromptDelivery ??
 			(async () => ({ status: "unavailable", reason: "session_transition" }));
 		this.#shutdownHandler = contextActions.shutdown;
+		this.#getContextUsageFn = contextActions.getContextUsage;
+		this.#compactFn = contextActions.compact;
 		this.#getSystemPromptFn = contextActions.getSystemPrompt;
 
 		// Command context actions (optional, only for interactive mode)

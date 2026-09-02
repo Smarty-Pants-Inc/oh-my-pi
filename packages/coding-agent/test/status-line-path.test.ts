@@ -82,6 +82,7 @@ function createPathContext(): SegmentContext {
 		speculationBlinkOn: true,
 		subagentCount: 0,
 		activeMs: 0,
+		turnElapsedMs: null,
 		activeRepo: null,
 		worktree: null,
 		git: {

@@ -125,7 +125,7 @@ prompts:
     trigger: compaction
     visibility: conditional
     defaultEnabled: false
-    order: 215
+    order: 220
   - id: agent.compaction.prompts.snapcompact-archive-context
     path: _agent/compaction/prompts/snapcompact-archive-context.md
     role: internal_context
@@ -133,7 +133,7 @@ prompts:
     trigger: compaction
     visibility: conditional
     defaultEnabled: false
-    order: 220
+    order: 230
   - id: agent.compaction.prompts.summarization-system
     path: _agent/compaction/prompts/summarization-system.md
     role: system
@@ -141,7 +141,7 @@ prompts:
     trigger: compaction
     visibility: conditional
     defaultEnabled: false
-    order: 230
+    order: 240
   - id: autoresearch.command-resume
     path: autoresearch/command-resume.md
     role: system
@@ -149,7 +149,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 240
+    order: 250
   - id: autoresearch.prompt-setup
     path: autoresearch/prompt-setup.md
     role: system
@@ -157,7 +157,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 250
+    order: 260
   - id: autoresearch.prompt
     path: autoresearch/prompt.md
     role: system
@@ -165,7 +165,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 260
+    order: 270
   - id: autoresearch.resume-message
     path: autoresearch/resume-message.md
     role: system
@@ -173,7 +173,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 270
+    order: 280
   - id: cleanse.assignment
     path: cleanse/prompts/assignment.md
     role: system
@@ -181,7 +181,7 @@ prompts:
     trigger: side_request
     visibility: model
     defaultEnabled: false
-    order: 280
+    order: 290
   - id: cleanse.discovery
     path: cleanse/prompts/discovery.md
     role: system
@@ -189,7 +189,7 @@ prompts:
     trigger: side_request
     visibility: model
     defaultEnabled: false
-    order: 290
+    order: 300
   - id: cleanse.follow-up
     path: cleanse/prompts/follow-up.md
     role: system
@@ -197,8 +197,7 @@ prompts:
     trigger: side_request
     visibility: model
     defaultEnabled: false
-    order: 295
-
+    order: 310
   - id: commit.agentic.analyze-file
     path: commit/agentic/prompts/analyze-file.md
     role: system
@@ -206,7 +205,7 @@ prompts:
     trigger: side_request
     visibility: model
     defaultEnabled: false
-    order: 300
+    order: 320
   - id: commit.agentic.session-user
     path: commit/agentic/prompts/session-user.md
     role: internal_context
@@ -214,7 +213,7 @@ prompts:
     trigger: side_request
     visibility: model
     defaultEnabled: false
-    order: 310
+    order: 330
   - id: commit.agentic.split-confirm
     path: commit/agentic/prompts/split-confirm.md
     role: system
@@ -222,7 +221,7 @@ prompts:
     trigger: side_request
     visibility: model
     defaultEnabled: false
-    order: 320
+    order: 340
   - id: commit.agentic
     path: commit/agentic/prompts/system.md
     role: system
@@ -230,23 +229,55 @@ prompts:
     trigger: side_request
     visibility: model
     defaultEnabled: false
-    order: 330
-  - id: commit.analysis-system
-    path: commit/prompts/analysis-system.md
+    order: 350
+  - id: commit.conventional.analysis
+    path: commit/conventional/prompts/analysis.md
     role: system
     target: [side_model]
     trigger: side_request
     visibility: model
     defaultEnabled: false
-    order: 340
-  - id: commit.analysis-user
-    path: commit/prompts/analysis-user.md
-    role: internal_context
+    order: 360
+  - id: commit.conventional.fast
+    path: commit/conventional/prompts/fast.md
+    role: system
     target: [side_model]
     trigger: side_request
     visibility: model
     defaultEnabled: false
-    order: 350
+    order: 370
+  - id: commit.conventional.map
+    path: commit/conventional/prompts/map.md
+    role: system
+    target: [side_model]
+    trigger: side_request
+    visibility: model
+    defaultEnabled: false
+    order: 380
+  - id: commit.conventional.reduce
+    path: commit/conventional/prompts/reduce.md
+    role: system
+    target: [side_model]
+    trigger: side_request
+    visibility: model
+    defaultEnabled: false
+    order: 390
+  - id: commit.conventional.summary-rewrite
+    path: commit/conventional/prompts/summary-rewrite.md
+    role: system
+    target: [side_model]
+    trigger: side_request
+    visibility: model
+    defaultEnabled: false
+    order: 400
+  - id: commit.conventional.summary
+    path: commit/conventional/prompts/summary.md
+    role: system
+    target: [side_model]
+    trigger: side_request
+    visibility: model
+    defaultEnabled: false
+    order: 410
   - id: commit.changelog-system
     path: commit/prompts/changelog-system.md
     role: system
@@ -254,7 +285,7 @@ prompts:
     trigger: side_request
     visibility: model
     defaultEnabled: false
-    order: 360
+    order: 420
   - id: commit.changelog-user
     path: commit/prompts/changelog-user.md
     role: internal_context
@@ -262,63 +293,7 @@ prompts:
     trigger: side_request
     visibility: model
     defaultEnabled: false
-    order: 370
-  - id: commit.file-observer-system
-    path: commit/prompts/file-observer-system.md
-    role: system
-    target: [side_model]
-    trigger: side_request
-    visibility: model
-    defaultEnabled: false
-    order: 380
-  - id: commit.file-observer-user
-    path: commit/prompts/file-observer-user.md
-    role: internal_context
-    target: [side_model]
-    trigger: side_request
-    visibility: model
-    defaultEnabled: false
-    order: 390
-  - id: commit.reduce-system
-    path: commit/prompts/reduce-system.md
-    role: system
-    target: [side_model]
-    trigger: side_request
-    visibility: model
-    defaultEnabled: false
-    order: 400
-  - id: commit.reduce-user
-    path: commit/prompts/reduce-user.md
-    role: internal_context
-    target: [side_model]
-    trigger: side_request
-    visibility: model
-    defaultEnabled: false
-    order: 410
-  - id: commit.summary-retry
-    path: commit/prompts/summary-retry.md
-    role: system
-    target: [side_model]
-    trigger: recovery
-    visibility: model
-    defaultEnabled: false
-    order: 420
-  - id: commit.summary-system
-    path: commit/prompts/summary-system.md
-    role: system
-    target: [side_model]
-    trigger: side_request
-    visibility: model
-    defaultEnabled: false
     order: 430
-  - id: commit.summary-user
-    path: commit/prompts/summary-user.md
-    role: internal_context
-    target: [side_model]
-    trigger: side_request
-    visibility: model
-    defaultEnabled: false
-    order: 440
   - id: commit.types-description
     path: commit/prompts/types-description.md
     role: system
@@ -326,7 +301,7 @@ prompts:
     trigger: side_request
     visibility: model
     defaultEnabled: false
-    order: 450
+    order: 440
   - id: compress.request
     path: compress/prompts/request.md
     role: internal_context
@@ -334,7 +309,7 @@ prompts:
     trigger: compaction
     visibility: model
     defaultEnabled: false
-    order: 460
+    order: 450
   - id: compress.review
     path: compress/prompts/review.md
     role: system
@@ -342,7 +317,7 @@ prompts:
     trigger: compaction
     visibility: model
     defaultEnabled: false
-    order: 470
+    order: 460
   - id: compress
     path: compress/prompts/system.md
     role: system
@@ -350,7 +325,7 @@ prompts:
     trigger: compaction
     visibility: model
     defaultEnabled: false
-    order: 480
+    order: 470
   - id: discovery.builtin-rules.go-add-cleanup
     path: discovery/builtin-rules/go-add-cleanup.md
     role: system
@@ -358,7 +333,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 490
+    order: 480
   - id: discovery.builtin-rules.go-bench-loop
     path: discovery/builtin-rules/go-bench-loop.md
     role: system
@@ -366,7 +341,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 500
+    order: 490
   - id: discovery.builtin-rules.go-exp-promoted
     path: discovery/builtin-rules/go-exp-promoted.md
     role: system
@@ -374,7 +349,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 510
+    order: 500
   - id: discovery.builtin-rules.go-ioutil
     path: discovery/builtin-rules/go-ioutil.md
     role: system
@@ -382,7 +357,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 520
+    order: 510
   - id: discovery.builtin-rules.go-join-hostport
     path: discovery/builtin-rules/go-join-hostport.md
     role: system
@@ -390,7 +365,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 530
+    order: 520
   - id: discovery.builtin-rules.go-new-expr
     path: discovery/builtin-rules/go-new-expr.md
     role: system
@@ -398,7 +373,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 540
+    order: 530
   - id: discovery.builtin-rules.go-rand-v2
     path: discovery/builtin-rules/go-rand-v2.md
     role: system
@@ -406,7 +381,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 550
+    order: 540
   - id: discovery.builtin-rules.go-range-int
     path: discovery/builtin-rules/go-range-int.md
     role: system
@@ -414,7 +389,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 560
+    order: 550
   - id: discovery.builtin-rules.rs-box-leak
     path: discovery/builtin-rules/rs-box-leak.md
     role: system
@@ -422,7 +397,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 570
+    order: 560
   - id: discovery.builtin-rules.rs-future-prelude
     path: discovery/builtin-rules/rs-future-prelude.md
     role: system
@@ -430,7 +405,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 580
+    order: 570
   - id: discovery.builtin-rules.rs-lazylock
     path: discovery/builtin-rules/rs-lazylock.md
     role: system
@@ -438,7 +413,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 590
+    order: 580
   - id: discovery.builtin-rules.rs-match-ergonomics
     path: discovery/builtin-rules/rs-match-ergonomics.md
     role: system
@@ -446,7 +421,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 600
+    order: 590
   - id: discovery.builtin-rules.rs-parking-lot
     path: discovery/builtin-rules/rs-parking-lot.md
     role: system
@@ -454,7 +429,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 610
+    order: 600
   - id: discovery.builtin-rules.rs-result-type
     path: discovery/builtin-rules/rs-result-type.md
     role: system
@@ -462,7 +437,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 620
+    order: 610
   - id: discovery.builtin-rules.ts-bare-catch
     path: discovery/builtin-rules/ts-bare-catch.md
     role: system
@@ -470,7 +445,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 630
+    order: 620
   - id: discovery.builtin-rules.ts-import-type
     path: discovery/builtin-rules/ts-import-type.md
     role: system
@@ -478,7 +453,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 640
+    order: 630
   - id: discovery.builtin-rules.ts-no-any
     path: discovery/builtin-rules/ts-no-any.md
     role: system
@@ -486,7 +461,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 650
+    order: 640
   - id: discovery.builtin-rules.ts-no-deprecated-leftovers
     path: discovery/builtin-rules/ts-no-deprecated-leftovers.md
     role: system
@@ -494,7 +469,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 660
+    order: 650
   - id: discovery.builtin-rules.ts-no-dynamic-import
     path: discovery/builtin-rules/ts-no-dynamic-import.md
     role: system
@@ -502,7 +477,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 670
+    order: 660
   - id: discovery.builtin-rules.ts-no-inline-cast-access
     path: discovery/builtin-rules/ts-no-inline-cast-access.md
     role: system
@@ -510,7 +485,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 680
+    order: 670
   - id: discovery.builtin-rules.ts-no-local-is-record
     path: discovery/builtin-rules/ts-no-local-is-record.md
     role: system
@@ -518,7 +493,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 690
+    order: 680
   - id: discovery.builtin-rules.ts-no-return-type
     path: discovery/builtin-rules/ts-no-return-type.md
     role: system
@@ -526,7 +501,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 700
+    order: 690
   - id: discovery.builtin-rules.ts-no-test-timers
     path: discovery/builtin-rules/ts-no-test-timers.md
     role: system
@@ -534,7 +509,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 710
+    order: 700
   - id: discovery.builtin-rules.ts-no-tiny-functions
     path: discovery/builtin-rules/ts-no-tiny-functions.md
     role: system
@@ -542,7 +517,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 720
+    order: 710
   - id: discovery.builtin-rules.ts-promise-with-resolvers
     path: discovery/builtin-rules/ts-promise-with-resolvers.md
     role: system
@@ -550,7 +525,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 730
+    order: 720
   - id: discovery.builtin-rules.ts-redundant-clear-guard
     path: discovery/builtin-rules/ts-redundant-clear-guard.md
     role: system
@@ -558,9 +533,17 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 740
+    order: 730
   - id: discovery.builtin-rules.ts-set-map
     path: discovery/builtin-rules/ts-set-map.md
+    role: system
+    target: [main]
+    trigger: optional_mode
+    visibility: model
+    defaultEnabled: false
+    order: 740
+  - id: edit.auto-repair
+    path: edit/auto-repair.md
     role: system
     target: [main]
     trigger: optional_mode
@@ -574,16 +557,31 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 755
-  - id: edit.auto-repair
-    path: edit/auto-repair.md
+    order: 760
+  - id: if-bench.cat-directive
+    path: if-bench/prompts/cat-directive.md
     role: system
     target: [main]
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 756
-
+    order: 770
+  - id: if-bench
+    path: if-bench/prompts/system.md
+    role: system
+    target: [main]
+    trigger: optional_mode
+    visibility: model
+    defaultEnabled: false
+    order: 780
+  - id: if-bench.turn
+    path: if-bench/prompts/turn.md
+    role: system
+    target: [main]
+    trigger: optional_mode
+    visibility: model
+    defaultEnabled: false
+    order: 790
   - id: live.agent-final-message
     path: live/prompts/agent-final-message.md
     role: system
@@ -591,7 +589,7 @@ prompts:
     trigger: side_request
     visibility: model
     defaultEnabled: false
-    order: 760
+    order: 800
   - id: live.live-instructions
     path: live/prompts/live-instructions.md
     role: system
@@ -599,7 +597,7 @@ prompts:
     trigger: side_request
     visibility: model
     defaultEnabled: false
-    order: 770
+    order: 810
   - id: advisor.active-repo-watchdog
     path: prompts/advisor/active-repo-watchdog.md
     role: system
@@ -607,7 +605,7 @@ prompts:
     trigger: side_request
     visibility: model
     defaultEnabled: false
-    order: 780
+    order: 820
   - id: advisor.advise-tool
     path: prompts/advisor/advise-tool.md
     role: system
@@ -615,7 +613,7 @@ prompts:
     trigger: side_request
     visibility: model
     defaultEnabled: false
-    order: 790
+    order: 830
   - id: advisor.context-files
     path: prompts/advisor/context-files.md
     role: system
@@ -623,7 +621,15 @@ prompts:
     trigger: side_request
     visibility: model
     defaultEnabled: false
-    order: 800
+    order: 840
+  - id: goal.advisor_mission
+    path: prompts/advisor/mission-context.md
+    role: internal_context
+    target: [side_model]
+    trigger: goal_updated
+    visibility: model
+    defaultEnabled: false
+    order: 995
   - id: advisor
     path: prompts/advisor/system.md
     role: system
@@ -631,7 +637,7 @@ prompts:
     trigger: side_request
     visibility: model
     defaultEnabled: false
-    order: 810
+    order: 860
   - id: agents.designer
     path: prompts/agents/designer.md
     role: system
@@ -639,7 +645,7 @@ prompts:
     trigger: subagent_start
     visibility: model
     defaultEnabled: false
-    order: 820
+    order: 870
   - id: agents.frontmatter
     path: prompts/agents/frontmatter.md
     role: system
@@ -647,7 +653,7 @@ prompts:
     trigger: subagent_start
     visibility: model
     defaultEnabled: false
-    order: 830
+    order: 880
   - id: agents.init
     path: prompts/agents/init.md
     role: system
@@ -655,7 +661,7 @@ prompts:
     trigger: subagent_start
     visibility: model
     defaultEnabled: false
-    order: 840
+    order: 890
   - id: agents.librarian
     path: prompts/agents/librarian.md
     role: system
@@ -663,7 +669,7 @@ prompts:
     trigger: subagent_start
     visibility: model
     defaultEnabled: false
-    order: 850
+    order: 900
   - id: agents.reviewer
     path: prompts/agents/reviewer.md
     role: system
@@ -671,7 +677,7 @@ prompts:
     trigger: subagent_start
     visibility: model
     defaultEnabled: false
-    order: 860
+    order: 910
   - id: agents.scout
     path: prompts/agents/scout.md
     role: system
@@ -679,7 +685,7 @@ prompts:
     trigger: subagent_start
     visibility: model
     defaultEnabled: false
-    order: 870
+    order: 920
   - id: agents.security-reviewer
     path: prompts/agents/security-reviewer.md
     role: system
@@ -687,7 +693,7 @@ prompts:
     trigger: subagent_start
     visibility: model
     defaultEnabled: false
-    order: 880
+    order: 930
   - id: agents.task
     path: prompts/agents/task.md
     role: system
@@ -695,7 +701,7 @@ prompts:
     trigger: subagent_start
     visibility: model
     defaultEnabled: false
-    order: 890
+    order: 940
   - id: bench
     path: prompts/bench.md
     role: system
@@ -703,7 +709,7 @@ prompts:
     trigger: side_request
     visibility: model
     defaultEnabled: false
-    order: 900
+    order: 950
   - id: bench.cache-prefix-chunk
     path: prompts/bench/cache-prefix-chunk.md
     role: system
@@ -711,7 +717,7 @@ prompts:
     trigger: side_request
     visibility: model
     defaultEnabled: false
-    order: 910
+    order: 960
   - id: bench.cache-prefix
     path: prompts/bench/cache-prefix.md
     role: system
@@ -719,7 +725,7 @@ prompts:
     trigger: side_request
     visibility: model
     defaultEnabled: false
-    order: 920
+    order: 970
   - id: bench.cache-suffix
     path: prompts/bench/cache-suffix.md
     role: system
@@ -727,7 +733,7 @@ prompts:
     trigger: side_request
     visibility: model
     defaultEnabled: false
-    order: 930
+    order: 980
   - id: bench.chat
     path: prompts/bench/chat.md
     role: system
@@ -735,7 +741,7 @@ prompts:
     trigger: side_request
     visibility: model
     defaultEnabled: false
-    order: 935
+    order: 990
   - id: bench.generation
     path: prompts/bench/generation.md
     role: system
@@ -743,7 +749,7 @@ prompts:
     trigger: side_request
     visibility: model
     defaultEnabled: false
-    order: 936
+    order: 1000
   - id: bench.prefill-instruction
     path: prompts/bench/prefill-instruction.md
     role: system
@@ -751,8 +757,7 @@ prompts:
     trigger: side_request
     visibility: model
     defaultEnabled: false
-    order: 937
-
+    order: 1010
   - id: ci-green-request
     path: prompts/ci-green-request.md
     role: internal_context
@@ -760,7 +765,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 940
+    order: 1020
   - id: dry-balance-bench
     path: prompts/dry-balance-bench.md
     role: system
@@ -768,7 +773,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 950
+    order: 1030
   - id: goal.budget_limited
     path: prompts/goals/goal-budget-limit.md
     role: internal_context
@@ -776,7 +781,7 @@ prompts:
     trigger: goal_budget_limited
     visibility: model
     defaultEnabled: false
-    order: 960
+    order: 1040
   - id: goal.continuation
     path: prompts/goals/goal-continuation.md
     role: internal_context
@@ -800,7 +805,7 @@ prompts:
     trigger: active_goal
     visibility: model
     defaultEnabled: false
-    order: 990
+    order: 1070
   - id: goal.objective_updated
     path: prompts/goals/goal-objective-updated.md
     role: internal_context
@@ -808,7 +813,7 @@ prompts:
     trigger: goal_updated
     visibility: model
     defaultEnabled: false
-    order: 1000
+    order: 1080
   - id: goals.goal-todo-context
     path: prompts/goals/goal-todo-context.md
     role: internal_context
@@ -816,7 +821,7 @@ prompts:
     trigger: active_goal
     visibility: model
     defaultEnabled: false
-    order: 1010
+    order: 1090
   - id: goals.guided-goal-interview
     path: prompts/goals/guided-goal-interview.md
     role: internal_context
@@ -824,7 +829,7 @@ prompts:
     trigger: active_goal
     visibility: model
     defaultEnabled: false
-    order: 1020
+    order: 1100
   - id: memories.consolidation-system
     path: prompts/memories/consolidation_system.md
     role: system
@@ -832,7 +837,7 @@ prompts:
     trigger: side_request
     visibility: model
     defaultEnabled: false
-    order: 1030
+    order: 1110
   - id: memories.consolidation
     path: prompts/memories/consolidation.md
     role: system
@@ -840,7 +845,7 @@ prompts:
     trigger: side_request
     visibility: model
     defaultEnabled: false
-    order: 1040
+    order: 1120
   - id: memories.read-path
     path: prompts/memories/read-path.md
     role: system
@@ -848,7 +853,39 @@ prompts:
     trigger: side_request
     visibility: model
     defaultEnabled: false
-    order: 1050
+    order: 1130
+  - id: memories.sharpshooter-consolidate-input
+    path: prompts/memories/sharpshooter-consolidate-input.md
+    role: system
+    target: [side_model]
+    trigger: side_request
+    visibility: model
+    defaultEnabled: false
+    order: 1140
+  - id: memories.sharpshooter-consolidate-system
+    path: prompts/memories/sharpshooter-consolidate-system.md
+    role: system
+    target: [side_model]
+    trigger: side_request
+    visibility: model
+    defaultEnabled: false
+    order: 1150
+  - id: memories.sharpshooter-extract-input
+    path: prompts/memories/sharpshooter-extract-input.md
+    role: system
+    target: [side_model]
+    trigger: side_request
+    visibility: model
+    defaultEnabled: false
+    order: 1160
+  - id: memories.sharpshooter-extract-system
+    path: prompts/memories/sharpshooter-extract-system.md
+    role: system
+    target: [side_model]
+    trigger: side_request
+    visibility: model
+    defaultEnabled: false
+    order: 1170
   - id: memories.stage-one-input
     path: prompts/memories/stage_one_input.md
     role: system
@@ -856,7 +893,7 @@ prompts:
     trigger: side_request
     visibility: model
     defaultEnabled: false
-    order: 1060
+    order: 1180
   - id: memories.stage-one-system
     path: prompts/memories/stage_one_system.md
     role: system
@@ -864,7 +901,7 @@ prompts:
     trigger: side_request
     visibility: model
     defaultEnabled: false
-    order: 1070
+    order: 1190
   - id: provider.internal_context
     path: prompts/providers/internal-context.md
     role: internal_context
@@ -880,7 +917,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1090
+    order: 1210
   - id: review-headless-request
     path: prompts/review-headless-request.md
     role: internal_context
@@ -888,7 +925,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1100
+    order: 1220
   - id: review-request
     path: prompts/review-request.md
     role: internal_context
@@ -896,7 +933,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1110
+    order: 1230
   - id: security.scan-coordinator
     path: prompts/security/scan-coordinator.md
     role: system
@@ -904,7 +941,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1120
+    order: 1240
   - id: security.scan-request
     path: prompts/security/scan-request.md
     role: internal_context
@@ -912,7 +949,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1130
+    order: 1250
   - id: security.validate-request
     path: prompts/security/validate-request.md
     role: internal_context
@@ -920,7 +957,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1140
+    order: 1260
   - id: session.launch-completion
     path: prompts/session/launch-completion.md
     role: system
@@ -928,7 +965,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1150
+    order: 1270
   - id: skills.autoload
     path: prompts/skills/autoload.md
     role: system
@@ -936,7 +973,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1160
+    order: 1280
   - id: skill.smarty_mergify_policy
     path: prompts/skills/smarty-mergify-policy.md
     role: internal_context
@@ -952,7 +989,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1180
+    order: 1300
   - id: steering.parent-irc
     path: prompts/steering/parent-irc.md
     role: internal_context
@@ -960,7 +997,7 @@ prompts:
     trigger: steering
     visibility: model
     defaultEnabled: false
-    order: 1190
+    order: 1310
   - id: steering.user-interjection
     path: prompts/steering/user-interjection.md
     role: internal_context
@@ -968,7 +1005,7 @@ prompts:
     trigger: steering
     visibility: model
     defaultEnabled: false
-    order: 1200
+    order: 1320
   - id: active-repo-context
     path: prompts/system/active-repo-context.md
     role: system
@@ -976,7 +1013,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1210
+    order: 1330
   - id: agent-creation-architect
     path: prompts/system/agent-creation-architect.md
     role: system
@@ -984,7 +1021,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1220
+    order: 1340
   - id: agent-creation-user
     path: prompts/system/agent-creation-user.md
     role: internal_context
@@ -992,7 +1029,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1230
+    order: 1350
   - id: auto-continue
     path: prompts/system/auto-continue.md
     role: system
@@ -1000,7 +1037,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1240
+    order: 1360
   - id: auto-thinking-difficulty-local
     path: prompts/system/auto-thinking-difficulty-local.md
     role: system
@@ -1008,7 +1045,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1250
+    order: 1370
   - id: auto-thinking-difficulty
     path: prompts/system/auto-thinking-difficulty.md
     role: system
@@ -1016,7 +1053,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1260
+    order: 1380
   - id: autolearn-guidance-learn
     path: prompts/system/autolearn-guidance-learn.md
     role: system
@@ -1024,7 +1061,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1270
+    order: 1390
   - id: autolearn-guidance
     path: prompts/system/autolearn-guidance.md
     role: system
@@ -1032,7 +1069,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1280
+    order: 1400
   - id: autolearn-nudge-autocontinue
     path: prompts/system/autolearn-nudge-autocontinue.md
     role: system
@@ -1040,7 +1077,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1290
+    order: 1410
   - id: background-tan-dispatch
     path: prompts/system/background-tan-dispatch.md
     role: system
@@ -1048,7 +1085,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1300
+    order: 1420
   - id: btw-user
     path: prompts/system/btw-user.md
     role: internal_context
@@ -1056,7 +1093,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1310
+    order: 1430
   - id: system.checkpoint-active-notice
     path: prompts/system/checkpoint-active-notice.md
     role: internal_context
@@ -1064,7 +1101,7 @@ prompts:
     trigger: checkpoint_active
     visibility: model
     defaultEnabled: false
-    order: 1320
+    order: 1310
   - id: commit-message-system
     path: prompts/system/commit-message-system.md
     role: system
@@ -1072,7 +1109,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1330
+    order: 1450
   - id: computer-safety
     path: prompts/system/computer-safety.md
     role: system
@@ -1080,7 +1117,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1340
+    order: 1460
   - id: system.custom
     path: prompts/system/custom-system-prompt.md
     role: system
@@ -1088,7 +1125,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1350
+    order: 1470
   - id: system.date-cwd-reminder
     path: prompts/system/date-cwd-reminder.md
     role: internal_context
@@ -1096,7 +1133,7 @@ prompts:
     trigger: provider_request
     visibility: model
     defaultEnabled: false
-    order: 1360
+    order: 1350
   - id: eager-task
     path: prompts/system/eager-task.md
     role: system
@@ -1104,7 +1141,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1370
+    order: 1490
   - id: eager-todo
     path: prompts/system/eager-todo.md
     role: system
@@ -1112,7 +1149,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1380
+    order: 1500
   - id: empty-stop-retry
     path: prompts/system/empty-stop-retry.md
     role: system
@@ -1120,7 +1157,7 @@ prompts:
     trigger: recovery
     visibility: model
     defaultEnabled: false
-    order: 1390
+    order: 1510
   - id: gemini-tool-call-reminder
     path: prompts/system/gemini-tool-call-reminder.md
     role: system
@@ -1128,7 +1165,23 @@ prompts:
     trigger: recovery
     visibility: model
     defaultEnabled: false
-    order: 1400
+    order: 1520
+  - id: git-ai-stage-files
+    path: prompts/system/git-ai-stage-files.md
+    role: system
+    target: [main]
+    trigger: optional_mode
+    visibility: model
+    defaultEnabled: false
+    order: 1530
+  - id: git-ai-stage-hunk
+    path: prompts/system/git-ai-stage-hunk.md
+    role: system
+    target: [main]
+    trigger: optional_mode
+    visibility: model
+    defaultEnabled: false
+    order: 1540
   - id: interrupted-thinking
     path: prompts/system/interrupted-thinking.md
     role: system
@@ -1136,7 +1189,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1410
+    order: 1550
   - id: irc-autoreply
     path: prompts/system/irc-autoreply.md
     role: system
@@ -1144,7 +1197,7 @@ prompts:
     trigger: steering
     visibility: model
     defaultEnabled: false
-    order: 1420
+    order: 1560
   - id: irc-incoming
     path: prompts/system/irc-incoming.md
     role: system
@@ -1152,7 +1205,7 @@ prompts:
     trigger: steering
     visibility: model
     defaultEnabled: false
-    order: 1430
+    order: 1570
   - id: manual-continue
     path: prompts/system/manual-continue.md
     role: system
@@ -1160,7 +1213,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1440
+    order: 1580
   - id: mcp-xdev-guidance
     path: prompts/system/mcp-xdev-guidance.md
     role: system
@@ -1168,7 +1221,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1450
+    order: 1590
   - id: memory-consolidation-system
     path: prompts/system/memory-consolidation-system.md
     role: system
@@ -1176,7 +1229,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1460
+    order: 1600
   - id: memory-extraction-system
     path: prompts/system/memory-extraction-system.md
     role: system
@@ -1184,7 +1237,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1470
+    order: 1610
   - id: mid-run-todo-nudge
     path: prompts/system/mid-run-todo-nudge.md
     role: system
@@ -1192,7 +1245,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1480
+    order: 1620
   - id: omfg-user
     path: prompts/system/omfg-user.md
     role: internal_context
@@ -1200,7 +1253,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1490
+    order: 1630
   - id: orchestrate-notice
     path: prompts/system/orchestrate-notice.md
     role: system
@@ -1208,7 +1261,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1500
+    order: 1640
   - id: personalities.default
     path: prompts/system/personalities/default.md
     role: system
@@ -1216,7 +1269,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1510
+    order: 1650
   - id: personalities.friendly
     path: prompts/system/personalities/friendly.md
     role: system
@@ -1224,7 +1277,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1520
+    order: 1660
   - id: personalities.pragmatic
     path: prompts/system/personalities/pragmatic.md
     role: system
@@ -1232,39 +1285,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1530
-  - id: plan-mode-active
-    path: prompts/system/plan-mode-active.md
-    role: system
-    target: [main]
-    trigger: optional_mode
-    visibility: model
-    defaultEnabled: false
-    order: 1540
-  - id: plan-mode-approved
-    path: prompts/system/plan-mode-approved.md
-    role: system
-    target: [main]
-    trigger: optional_mode
-    visibility: model
-    defaultEnabled: false
-    order: 1550
-  - id: plan-mode-compact-instructions
-    path: prompts/system/plan-mode-compact-instructions.md
-    role: system
-    target: [main]
-    trigger: compaction
-    visibility: model
-    defaultEnabled: false
-    order: 1560
-  - id: plan-mode-reference
-    path: prompts/system/plan-mode-reference.md
-    role: system
-    target: [main]
-    trigger: optional_mode
-    visibility: model
-    defaultEnabled: false
-    order: 1570
+    order: 1670
   - id: plan-filename
     path: prompts/system/plan-filename.md
     role: system
@@ -1272,7 +1293,39 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1575
+    order: 1680
+  - id: plan-mode-active
+    path: prompts/system/plan-mode-active.md
+    role: system
+    target: [main]
+    trigger: optional_mode
+    visibility: model
+    defaultEnabled: false
+    order: 1690
+  - id: plan-mode-approved
+    path: prompts/system/plan-mode-approved.md
+    role: system
+    target: [main]
+    trigger: optional_mode
+    visibility: model
+    defaultEnabled: false
+    order: 1700
+  - id: plan-mode-compact-instructions
+    path: prompts/system/plan-mode-compact-instructions.md
+    role: system
+    target: [main]
+    trigger: compaction
+    visibility: model
+    defaultEnabled: false
+    order: 1710
+  - id: plan-mode-reference
+    path: prompts/system/plan-mode-reference.md
+    role: system
+    target: [main]
+    trigger: optional_mode
+    visibility: model
+    defaultEnabled: false
+    order: 1720
   - id: plan-mode-subagent
     path: prompts/system/plan-mode-subagent.md
     role: system
@@ -1280,7 +1333,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1580
+    order: 1730
   - id: plan-mode-tool-decision-reminder
     path: prompts/system/plan-mode-tool-decision-reminder.md
     role: system
@@ -1288,7 +1341,7 @@ prompts:
     trigger: recovery
     visibility: model
     defaultEnabled: false
-    order: 1590
+    order: 1740
   - id: plan-yolo-handoff
     path: prompts/system/plan-yolo-handoff.md
     role: system
@@ -1296,7 +1349,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1600
+    order: 1750
   - id: prewalk-checklist
     path: prompts/system/prewalk-checklist.md
     role: system
@@ -1304,7 +1357,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1610
+    order: 1760
   - id: prewalk-continue
     path: prompts/system/prewalk-continue.md
     role: system
@@ -1312,7 +1365,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1620
+    order: 1770
   - id: prewalk-plan
     path: prompts/system/prewalk-plan.md
     role: system
@@ -1320,7 +1373,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1630
+    order: 1780
   - id: system.project_context
     path: prompts/system/project-prompt.md
     role: system
@@ -1328,7 +1381,7 @@ prompts:
     trigger: startup
     visibility: model
     defaultEnabled: true
-    order: 1640
+    order: 1790
   - id: recap-user
     path: prompts/system/recap-user.md
     role: internal_context
@@ -1336,7 +1389,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1650
+    order: 1800
   - id: resolve-device-reminder
     path: prompts/system/resolve-device-reminder.md
     role: system
@@ -1344,7 +1397,7 @@ prompts:
     trigger: recovery
     visibility: model
     defaultEnabled: false
-    order: 1660
+    order: 1810
   - id: rewind-report
     path: prompts/system/rewind-report.md
     role: system
@@ -1352,7 +1405,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1670
+    order: 1820
   - id: side-channel-no-tools
     path: prompts/system/side-channel-no-tools.md
     role: system
@@ -1360,7 +1413,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1680
+    order: 1830
   - id: snapcompact-context-frames-note
     path: prompts/system/snapcompact-context-frames-note.md
     role: system
@@ -1368,7 +1421,7 @@ prompts:
     trigger: compaction
     visibility: model
     defaultEnabled: false
-    order: 1690
+    order: 1840
   - id: snapcompact-context-stub
     path: prompts/system/snapcompact-context-stub.md
     role: system
@@ -1376,7 +1429,7 @@ prompts:
     trigger: compaction
     visibility: model
     defaultEnabled: false
-    order: 1700
+    order: 1850
   - id: snapcompact-system-frames-note
     path: prompts/system/snapcompact-system-frames-note.md
     role: system
@@ -1384,7 +1437,7 @@ prompts:
     trigger: compaction
     visibility: model
     defaultEnabled: false
-    order: 1710
+    order: 1860
   - id: snapcompact-system-stub
     path: prompts/system/snapcompact-system-stub.md
     role: system
@@ -1392,7 +1445,7 @@ prompts:
     trigger: compaction
     visibility: model
     defaultEnabled: false
-    order: 1720
+    order: 1870
   - id: snapcompact-toolresult-note
     path: prompts/system/snapcompact-toolresult-note.md
     role: system
@@ -1400,7 +1453,7 @@ prompts:
     trigger: compaction
     visibility: model
     defaultEnabled: false
-    order: 1730
+    order: 1880
   - id: speech-rewrite
     path: prompts/system/speech-rewrite.md
     role: system
@@ -1408,7 +1461,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1740
+    order: 1890
   - id: subagent-async-pending
     path: prompts/system/subagent-async-pending.md
     role: system
@@ -1416,7 +1469,7 @@ prompts:
     trigger: subagent_result
     visibility: model
     defaultEnabled: false
-    order: 1750
+    order: 1900
   - id: subagent.base
     path: prompts/system/subagent-system-prompt.md
     role: internal_context
@@ -1432,7 +1485,7 @@ prompts:
     trigger: subagent_start
     visibility: model
     defaultEnabled: false
-    order: 1770
+    order: 1920
   - id: system.base
     path: prompts/system/system-prompt.md
     role: system
@@ -1448,7 +1501,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1790
+    order: 1940
   - id: task-label
     path: prompts/system/task-label.md
     role: system
@@ -1456,7 +1509,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1800
+    order: 1950
   - id: thinking-loop-redirect
     path: prompts/system/thinking-loop-redirect.md
     role: system
@@ -1464,7 +1517,7 @@ prompts:
     trigger: recovery
     visibility: model
     defaultEnabled: false
-    order: 1810
+    order: 1960
   - id: title-marker-instruction
     path: prompts/system/title-marker-instruction.md
     role: system
@@ -1472,7 +1525,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1820
+    order: 1970
   - id: title-system
     path: prompts/system/title-system.md
     role: system
@@ -1480,7 +1533,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1830
+    order: 1980
   - id: tool-call-loop-redirect
     path: prompts/system/tool-call-loop-redirect.md
     role: system
@@ -1488,7 +1541,7 @@ prompts:
     trigger: recovery
     visibility: model
     defaultEnabled: false
-    order: 1840
+    order: 1990
   - id: ttsr-interrupt
     path: prompts/system/ttsr-interrupt.md
     role: system
@@ -1496,7 +1549,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1850
+    order: 2000
   - id: ttsr-tool-reminder
     path: prompts/system/ttsr-tool-reminder.md
     role: system
@@ -1504,7 +1557,7 @@ prompts:
     trigger: recovery
     visibility: model
     defaultEnabled: false
-    order: 1860
+    order: 2010
   - id: ultrathink-notice
     path: prompts/system/ultrathink-notice.md
     role: system
@@ -1512,7 +1565,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1870
+    order: 2020
   - id: unexpected-stop-classifier
     path: prompts/system/unexpected-stop-classifier.md
     role: system
@@ -1520,7 +1573,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1880
+    order: 2030
   - id: unexpected-stop-retry
     path: prompts/system/unexpected-stop-retry.md
     role: system
@@ -1528,7 +1581,7 @@ prompts:
     trigger: recovery
     visibility: model
     defaultEnabled: false
-    order: 1890
+    order: 2040
   - id: vibe-mode-active
     path: prompts/system/vibe-mode-active.md
     role: system
@@ -1536,7 +1589,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1900
+    order: 2050
   - id: web-search
     path: prompts/system/web-search.md
     role: system
@@ -1544,7 +1597,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1910
+    order: 2060
   - id: workflow-notice
     path: prompts/system/workflow-notice.md
     role: system
@@ -1552,7 +1605,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1920
+    order: 2070
   - id: xdev-mount-notice
     path: prompts/system/xdev-mount-notice.md
     role: system
@@ -1560,7 +1613,7 @@ prompts:
     trigger: optional_mode
     visibility: model
     defaultEnabled: false
-    order: 1930
+    order: 2080
   - id: todo.snapshot
     path: prompts/todos/current.md
     role: internal_context
@@ -1576,7 +1629,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 1950
+    order: 2100
   - id: tool.approve
     path: prompts/tools/approve.md
     role: system
@@ -1584,7 +1637,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 1960
+    order: 2110
   - id: tool.ask
     path: prompts/tools/ask.md
     role: system
@@ -1592,7 +1645,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 1970
+    order: 2120
   - id: tool.ast-edit
     path: prompts/tools/ast-edit.md
     role: system
@@ -1600,7 +1653,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 1980
+    order: 2130
   - id: tool.ast-grep
     path: prompts/tools/ast-grep.md
     role: system
@@ -1608,7 +1661,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 1990
+    order: 2140
   - id: tool.async-result
     path: prompts/tools/async-result.md
     role: system
@@ -1616,7 +1669,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2000
+    order: 2150
   - id: tool.bash
     path: prompts/tools/bash.md
     role: system
@@ -1624,7 +1677,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2010
+    order: 2160
   - id: tool.browser
     path: prompts/tools/browser.md
     role: system
@@ -1632,7 +1685,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2020
+    order: 2170
   - id: tool.checkpoint
     path: prompts/tools/checkpoint.md
     role: system
@@ -1640,7 +1693,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2040
+    order: 2180
   - id: tool.computer
     path: prompts/tools/computer.md
     role: system
@@ -1648,7 +1701,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2050
+    order: 2190
   - id: tool.debug
     path: prompts/tools/debug.md
     role: system
@@ -1656,7 +1709,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2060
+    order: 2200
   - id: tool.eval-code-mode
     path: prompts/tools/eval-code-mode.md
     role: system
@@ -1664,7 +1717,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2065
+    order: 2210
   - id: tool.eval
     path: prompts/tools/eval.md
     role: system
@@ -1672,7 +1725,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2070
+    order: 2220
   - id: tool.github
     path: prompts/tools/github.md
     role: system
@@ -1680,7 +1733,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2080
+    order: 2230
   - id: tool.glob
     path: prompts/tools/glob.md
     role: system
@@ -1688,7 +1741,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2090
+    order: 2240
   - id: tool.goal
     path: prompts/tools/goal.md
     role: system
@@ -1696,7 +1749,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2100
+    order: 2250
   - id: tool.grep
     path: prompts/tools/grep.md
     role: system
@@ -1704,7 +1757,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2110
+    order: 2260
   - id: tool.hub
     path: prompts/tools/hub.md
     role: system
@@ -1712,7 +1765,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2120
+    order: 2270
   - id: tool.image-attachment-describe-system
     path: prompts/tools/image-attachment-describe-system.md
     role: system
@@ -1720,7 +1773,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2130
+    order: 2280
   - id: tool.image-attachment-describe
     path: prompts/tools/image-attachment-describe.md
     role: system
@@ -1728,7 +1781,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2140
+    order: 2290
   - id: tool.image-gen
     path: prompts/tools/image-gen.md
     role: system
@@ -1736,7 +1789,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2150
+    order: 2300
   - id: tool.inspect-image-system
     path: prompts/tools/inspect-image-system.md
     role: system
@@ -1744,7 +1797,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2160
+    order: 2310
   - id: tool.inspect-image
     path: prompts/tools/inspect-image.md
     role: system
@@ -1752,7 +1805,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2170
+    order: 2320
   - id: tool.learn
     path: prompts/tools/learn.md
     role: system
@@ -1760,7 +1813,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2180
+    order: 2330
   - id: tool.lsp-late-diagnostic
     path: prompts/tools/lsp-late-diagnostic.md
     role: system
@@ -1768,7 +1821,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2190
+    order: 2340
   - id: tool.lsp
     path: prompts/tools/lsp.md
     role: system
@@ -1776,7 +1829,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2200
+    order: 2350
   - id: tool.manage-skill
     path: prompts/tools/manage-skill.md
     role: system
@@ -1784,7 +1837,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2210
+    order: 2360
   - id: tool.memory-edit
     path: prompts/tools/memory-edit.md
     role: system
@@ -1792,7 +1845,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2220
+    order: 2370
   - id: tool.patch
     path: prompts/tools/patch.md
     role: system
@@ -1800,7 +1853,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2230
+    order: 2380
   - id: tool.read
     path: prompts/tools/read.md
     role: system
@@ -1808,7 +1861,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2240
+    order: 2390
   - id: tool.recall
     path: prompts/tools/recall.md
     role: system
@@ -1816,7 +1869,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2250
+    order: 2400
   - id: tool.reflect
     path: prompts/tools/reflect.md
     role: system
@@ -1824,7 +1877,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2260
+    order: 2410
   - id: tool.replace
     path: prompts/tools/replace.md
     role: system
@@ -1832,7 +1885,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2270
+    order: 2420
   - id: tool.retain
     path: prompts/tools/retain.md
     role: system
@@ -1840,7 +1893,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2280
+    order: 2430
   - id: tool.rewind
     path: prompts/tools/rewind.md
     role: system
@@ -1848,7 +1901,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2290
+    order: 2440
   - id: tool.rewrite
     path: prompts/tools/rewrite.md
     role: system
@@ -1856,7 +1909,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2300
+    order: 2450
   - id: tool.security-publish
     path: prompts/tools/security-publish.md
     role: system
@@ -1864,7 +1917,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2310
+    order: 2460
   - id: tool.security-scan
     path: prompts/tools/security-scan.md
     role: system
@@ -1872,7 +1925,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2320
+    order: 2470
   - id: tool.task-async-contract
     path: prompts/tools/task-async-contract.md
     role: system
@@ -1880,7 +1933,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2330
+    order: 2480
   - id: tool.task-summary
     path: prompts/tools/task-summary.md
     role: system
@@ -1888,7 +1941,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2340
+    order: 2490
   - id: tool.task
     path: prompts/tools/task.md
     role: system
@@ -1896,7 +1949,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2350
+    order: 2500
   - id: tool.todo
     path: prompts/tools/todo.md
     role: system
@@ -1904,7 +1957,15 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2360
+    order: 2510
+  - id: tool.tts
+    path: prompts/tools/tts.md
+    role: system
+    target: [main, subagent]
+    trigger: tool_available
+    visibility: model
+    defaultEnabled: true
+    order: 2520
   - id: tool.vibe-kill
     path: prompts/tools/vibe-kill.md
     role: system
@@ -1912,7 +1973,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2370
+    order: 2530
   - id: tool.vibe-list
     path: prompts/tools/vibe-list.md
     role: system
@@ -1920,7 +1981,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2380
+    order: 2540
   - id: tool.vibe-send
     path: prompts/tools/vibe-send.md
     role: system
@@ -1928,7 +1989,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2390
+    order: 2550
   - id: tool.vibe-spawn
     path: prompts/tools/vibe-spawn.md
     role: system
@@ -1936,7 +1997,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2400
+    order: 2560
   - id: tool.vibe-turn-result
     path: prompts/tools/vibe-turn-result.md
     role: system
@@ -1944,7 +2005,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2410
+    order: 2570
   - id: tool.vibe-wait
     path: prompts/tools/vibe-wait.md
     role: system
@@ -1952,7 +2013,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2420
+    order: 2580
   - id: tool.web-search
     path: prompts/tools/web-search.md
     role: system
@@ -1960,7 +2021,15 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2430
+    order: 2590
+  - id: tool.write-device-only
+    path: prompts/tools/write-device-only.md
+    role: system
+    target: [main, subagent]
+    trigger: tool_available
+    visibility: model
+    defaultEnabled: true
+    order: 2600
   - id: tool.write
     path: prompts/tools/write.md
     role: system
@@ -1968,7 +2037,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2440
+    order: 2610
   - id: tool.yield
     path: prompts/tools/yield.md
     role: system
@@ -1976,15 +2045,7 @@ prompts:
     trigger: tool_available
     visibility: model
     defaultEnabled: true
-    order: 2445
-  - id: goal.advisor_mission
-    path: prompts/advisor/mission-context.md
-    role: internal_context
-    target: [side_model]
-    trigger: goal_updated
-    visibility: model
-    defaultEnabled: false
-    order: 995
+    order: 2620
 
 nonModelDocumentation:
   - modes/components/snapcompact-shape-preview-doc.md

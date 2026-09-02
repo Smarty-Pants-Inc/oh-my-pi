@@ -29,6 +29,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import {
 	convertToLlm,
 	readPendingSemanticDeliveryId,
+	shouldRenderAbortReason,
 	USER_INTERRUPT_LABEL,
 } from "@oh-my-pi/pi-coding-agent/session/messages";
 import {
@@ -3196,7 +3197,98 @@ describe("AgentSession concurrent prompt guard", () => {
 		expect(stopEvents[0]?.messages.some(message => message.role === "user")).toBe(true);
 	});
 
-	it("does not use a session_stop reason to create a hidden turn", async () => {
+	it("reports streaming while a tool is still executing", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const blockingTool: AgentTool = {
+			name: "blocking_tool",
+			label: "Blocking Tool",
+			description: "Waits until the test releases it",
+			parameters: type({}),
+			execute: async () => {
+				started.resolve();
+				await release.promise;
+				return { content: [{ type: "text" as const, text: "done" }] };
+			},
+		};
+		let streamCall = 0;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [blockingTool] },
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				const toolTurn = ++streamCall === 1;
+				queueMicrotask(() => {
+					const message: AssistantMessage = toolTurn
+						? {
+								role: "assistant",
+								content: [
+									{
+										type: "toolCall",
+										id: "call-blocking",
+										name: "blocking_tool",
+										arguments: {},
+									},
+								],
+								api: "anthropic-messages",
+								provider: "anthropic",
+								model: model.id,
+								usage: {
+									input: 0,
+									output: 0,
+									cacheRead: 0,
+									cacheWrite: 0,
+									totalTokens: 0,
+									cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+								},
+								stopReason: "toolUse",
+								timestamp: Date.now(),
+							}
+						: {
+								role: "assistant",
+								content: [{ type: "text", text: "finished" }],
+								api: "anthropic-messages",
+								provider: "anthropic",
+								model: model.id,
+								usage: {
+									input: 0,
+									output: 0,
+									cacheRead: 0,
+									cacheWrite: 0,
+									totalTokens: 0,
+									cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+								},
+								stopReason: "stop",
+								timestamp: Date.now(),
+							};
+					stream.push({ type: "start", partial: message });
+					stream.push({ type: "done", reason: toolTurn ? "toolUse" : "stop", message });
+				});
+				return stream;
+			},
+			convertToLlm,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			modelRegistry: sharedModelRegistry,
+		});
+
+		const prompt = session.prompt("Run the blocking tool");
+		await started.promise;
+
+		// `UiHelpers.renderInitialMessages` uses this exact predicate to retain
+		// dangling toolCalls in pendingTools during a focus rebuild.
+		expect(session.isStreaming).toBe(true);
+
+		release.resolve();
+		await prompt;
+		expect(session.isStreaming).toBe(false);
+	});
+
+	it("uses non-empty session_stop reason when additional context is empty", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const mock = createMockModel({
 			handler: () => ({ content: ["Done"] }),
@@ -3765,6 +3857,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		const modelRegistry = sharedModelRegistry;
 		const settings = Settings.isolated();
 		const deliveryGate = Promise.withResolvers<void>();
+		const deliveryGateB = Promise.withResolvers<void>();
 		const delivered: string[] = [];
 		const started = new Set<string>();
 		const asyncJobManager = new AsyncJobManager({
@@ -3810,6 +3903,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		});
 		asyncJobManager.registerDeliverySink("acp-session-b", async jobId => {
 			started.add(jobId);
+			await deliveryGateB.promise;
 			delivered.push(jobId);
 		});
 
@@ -3817,13 +3911,16 @@ describe("AgentSession concurrent prompt guard", () => {
 			asyncJobManager.register("bash", "A", async () => "A", { id: "job-a", ownerId: "acp-session-a" });
 			await waitFor(() => started.has("job-a"));
 			asyncJobManager.register("bash", "B", async () => "B", { id: "job-b", ownerId: "acp-session-b" });
-			await waitFor(() => asyncJobManager.getDeliveryState({ ownerId: "acp-session-b" }).queued > 0);
+			await waitFor(() => started.has("job-b"));
 
 			expect(sessionB.getAsyncJobSnapshot()?.delivery.pendingJobIds).not.toContain("job-a");
-			await expect(sessionB.drainAsyncJobDeliveriesForAcp({ timeoutMs: 1_000 })).resolves.toBe(true);
+			const drain = sessionB.drainAsyncJobDeliveriesForAcp({ timeoutMs: 1_000 });
+			deliveryGateB.resolve();
+			await expect(drain).resolves.toBe(true);
 			expect(delivered).toEqual(["job-b"]);
 		} finally {
 			deliveryGate.resolve();
+			deliveryGateB.resolve();
 			await sessionB.dispose();
 		}
 	});
@@ -4234,6 +4331,20 @@ describe("AgentSession TTSR resume gate", () => {
 				: "";
 		expect(text).toContain("Tool execution was aborted: TTSR matched rule: no-unwrap");
 		expect(text).not.toContain("Request was aborted");
+
+		// The persisted aborted assistant turn must not render as an error on
+		// resume/`/tree`/rebuild: TTSR interruption is control flow, so AgentSession
+		// stamps the SilentAbort flag and `shouldRenderAbortReason` returns false.
+		const abortedAssistant = sessionManager
+			.getEntries()
+			.find(
+				entry =>
+					entry.type === "message" && entry.message.role === "assistant" && entry.message.stopReason === "aborted",
+			);
+		expect(abortedAssistant?.type).toBe("message");
+		if (abortedAssistant?.type === "message" && abortedAssistant.message.role === "assistant") {
+			expect(shouldRenderAbortReason(abortedAssistant.message)).toBe(false);
+		}
 	});
 
 	it("labels only the matching aborted tool placeholder with the TTSR rule reason", async () => {

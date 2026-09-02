@@ -266,7 +266,7 @@ const PATH_RULES: readonly PathRule[] = [
 	{ pattern: /(?:^|\/)packages\/agent\/src\/types\.[cm]?[jt]s$/i, surface: "capability" },
 	{
 		pattern:
-			/(?:^|\/)packages\/catalog\/src\/(?:build|effort|fireworks-model-id|hosts|model-cache|model-manager|model-thinking|model-tokenizer|models|openai-pricing|utils|variant-collapse)\.[cm]?[jt]s$/i,
+			/(?:^|\/)packages\/catalog\/src\/(?:build|cline-pass-model-id|effort|fireworks-model-id|hosts|model-cache|model-manager|model-thinking|model-tokenizer|models|openai-pricing|utils|variant-collapse)\.[cm]?[jt]s$/i,
 		surface: "provider-mapping",
 	},
 	{ pattern: /(?:^|\/)packages\/catalog\/src\/index\.[cm]?[jt]s$/i, surface: "provider-mapping" },
@@ -441,6 +441,16 @@ const PATH_RULES: readonly PathRule[] = [
 	{
 		pattern:
 			/(?:^|\/)packages\/coding-agent\/src\/(?:advisor\/(?:advise-tool|config|delta-split|emission-guard|runtime|watchdog)|async\/job-manager|autolearn\/(?:controller|managed-skills)|autoresearch\/(?:git|helpers|index|state|storage|tools\/.*)|capability\/.*|cleanse\/agent|cli\/(?:auth-gateway-cli|bench-cli|dry-balance-cli)|collab\/host|commit\/(?:agentic\/(?:agent|tools\/.*)|analysis\/.*|changelog\/.*|map-reduce\/.*|pipeline)|compress\/(?:index|protocol|session)|config\/(?:append-only-context-mode|prompt-templates|provider-globals|settings-schema|settings)|discovery\/.*|eval\/completion-bridge|extensibility\/(?:custom-commands\/(?:bundled\/.*|loader)|custom-tools\/wrapper|extensions\/(?:compact-handler|runner)|hooks\/(?:loader|runner|tool-wrapper)|legacy-pi-ai-shim|legacy-pi-coding-agent-shim|legacy-typebox|plugins\/(?:legacy-pi-compat|loader|runtime-config)|skills|slash-commands|tool-event-input)|internal-urls\/.*|live\/(?:controller|protocol|transport)|mcp\/(?:client|config|loader|manager|tool-bridge|tool-cache|transports\/.*|types)|modes\/(?:acp\/acp-agent|components\/agents-hub|controllers\/(?:btw-controller|event-controller|input-controller|omfg-controller|tan-command-controller)|interactive-mode|orchestrate|rpc\/rpc-mode|skill-command|ultrathink|workflow)|secrets\/.*|security\/(?:coordinator|publication)|session\/(?:async-job-delivery|bash-runner|blob-store|claude-session-store|codex-session-store|compact-modes|eval-runner|execution-environment|foreign-session-import|foreign-session-jsonl|irc-bridge|launch-completion|messages|prewalk|provider-image-budget|queued-messages|session-advisors|session-context|session-handoff|session-history-format|session-loader|session-maintenance|session-manager|session-migrations|session-persistence|session-provider-boundary|settings-stream-fn|snapcompact-inline|stream-guards|streaming-output|ttsr-coordinator|turn-persistence|turn-recovery|unexpected-stop-classifier|yield-queue)|slash-commands\/helpers\/security|tiny\/(?:models|title-client|title-protocol|worker)|tts\/speech-enhancer|utils\/(?:active-repo-context|command-args|commit-message-generator|image-loading|image-resize|image-vision-fallback|local-date|prompt-path|title-generator)|vibe\/runtime|web\/search\/.*|workspace-tree)\.[cm]?[jt]s$/i,
+		surface: "provider-wrapper",
+	},
+	{
+		pattern:
+			/(?:^|\/)packages\/coding-agent\/src\/(?:advisor\/message-fingerprint|cli\/git-tui\/ai-stage|session\/tool-call-loop-redirect|sharpshooter\/.*|utils\/(?:atomic-file|github|repo-lock)|vibe\/lifecycle)\.[cm]?[jt]s$/i,
+		surface: "provider-wrapper",
+	},
+	{
+		pattern:
+			/(?:^|\/)packages\/coding-agent\/src\/commit\/conventional\/resources\/(?:commit_types|validation_data)\.json$/i,
 		surface: "provider-wrapper",
 	},
 	{
