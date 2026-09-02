@@ -25,6 +25,14 @@ import {
 	WRITE_TOKEN_BYTES,
 } from "@oh-my-pi/pi-wire";
 import type { ContextUsage } from "../extensibility/extensions/types";
+import type {
+	RpcCommand,
+	RpcControlFrame,
+	RpcEndpointIdentity,
+	RpcMutationCommand,
+	RpcReadCommand,
+	RpcResponse,
+} from "../modes/rpc/rpc-types";
 import type { AgentSessionEvent } from "../session/agent-session";
 import type { SessionEntry, SessionHeader } from "../session/session-entries";
 
@@ -65,13 +73,21 @@ export type CollabFrame =
 	// guest -> host (hello/abort/agent-cmd/fetch-transcript/ui-response are taken verbatim from the wire grammar)
 	| Exclude<GuestFrame, { t: "prompt" }>
 	| { t: "prompt"; text: string; images?: ImageContent[] }
+	| { t: "rpc-mutation"; requestId: number; command: RpcMutationCommand }
+	| { t: "rpc-read"; requestId: number; command: RpcReadCommand }
+	| { t: "rpc-request"; requestId: number; command: RpcCommand }
+	| { t: "rpc-control"; frame: RpcControlFrame }
 	// host -> guest
 	| {
 			t: "welcome";
 			proto: number;
+			/** Present only on explicitly trusted private Collab transports. */
+			rpc?: RpcEndpointIdentity;
 			header: SessionHeader;
 			state: CollabSessionState;
 			agents: AgentSnapshot[];
+			/** Host-authoritative identity of the peer receiving this snapshot. */
+			participant?: CollabParticipant;
 			/**
 			 * Total number of `SessionEntry` items the host will deliver in the
 			 * `snapshot-chunk` frames that follow. The guest stays in the
@@ -94,6 +110,7 @@ export type CollabFrame =
 	| { t: "entry"; entry: SessionEntry }
 	| { t: "event"; event: AgentSessionEvent }
 	| { t: "state"; state: CollabSessionState }
+	| { t: "authority"; canWrite: boolean }
 	/** Mirrored EventBus traffic (task subagent lifecycle/progress channels only). */
 	| { t: "bus"; channel: BusChannel; data: unknown }
 	/** Full agent-registry snapshot (debounced on registry change). */
@@ -102,6 +119,19 @@ export type CollabFrame =
 	| { t: "ui-request-end"; reqId: number }
 	/** Targeted reply to fetch-transcript; `error` marks a terminal read failure that guests must surface without hot retrying. */
 	| { t: "transcript"; reqId: number; text: string; newSize: number; error?: string }
+	| { t: "rpc-mutation-result"; requestId: number; response: RpcResponse }
+	| { t: "rpc-read-result"; requestId: number; response: RpcResponse }
+	| { t: "rpc-result"; requestId: number; response: RpcResponse }
+	| { t: "rpc-output"; output: object }
+	| {
+			t: "rpc-chunk";
+			chunkId: string;
+			index: number;
+			count: number;
+			byteLength: number;
+			mutation: boolean;
+			data: string;
+	  }
 	| { t: "bye"; reason: string }
 	| { t: "error"; message: string };
 

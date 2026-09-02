@@ -11,9 +11,10 @@
  * - Extension UI: Extension UI requests are emitted, client responds with extension_ui_response
  */
 import { once } from "node:events";
+import type { ToolChoice } from "@oh-my-pi/pi-ai";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
-import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { $env, isRecord, Snowflake } from "@oh-my-pi/pi-utils";
+import type { Participant } from "@oh-my-pi/pi-wire";
 import { reset as resetCapabilities } from "../../capability";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
 import {
@@ -32,30 +33,40 @@ import { executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins
 import { buildAvailableSlashCommands } from "../../slash-commands/available-commands";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import type { EventBus } from "../../utils/event-bus";
-import { calculateTokensPerSecond } from "../../utils/token-rate";
 import { initializeExtensions } from "../runtime-init";
 import { isRpcHostToolResult, isRpcHostToolUpdate, RpcHostToolBridge } from "./host-tools";
 import { isRpcHostUriResult, RpcHostUriBridge } from "./host-uris";
 import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameEncoder } from "./rpc-frame";
+import { buildRpcEndpointIdentity } from "./rpc-identity";
 import { claimRpcInput, readRpcInputFrames } from "./rpc-input";
 import { pageRpcMessages, RPC_MESSAGES_PAGE_BUSY_ERROR, RpcMessagesPageError } from "./rpc-messages";
+import { RpcMutationLedger } from "./rpc-mutation";
+import { executeRpcSessionDataCommand, validateRpcMutationBeforeIntent } from "./rpc-session-data";
+import { buildRpcSessionState } from "./rpc-state";
 import { RpcSubagentRegistry, readRpcSubagentTranscript } from "./rpc-subagents";
-import type {
-	RpcCommand,
-	RpcExtensionUIRequest,
-	RpcExtensionUIResponse,
-	RpcExtensionUISelectOptionDetail,
-	RpcHostToolCallRequest,
-	RpcHostToolCancelRequest,
-	RpcHostToolDefinition,
-	RpcHostToolResult,
-	RpcHostToolUpdate,
-	RpcHostUriCancelRequest,
-	RpcHostUriRequest,
-	RpcHostUriResult,
-	RpcResponse,
-	RpcSessionState,
-	RpcSubagentSubscriptionLevel,
+import {
+	isRpcHerdrAgentdRebindControl,
+	isRpcHerdrAgentdRebindControlFrame,
+	isRpcMutationCommand,
+	type RpcCanonicalAuthority,
+	type RpcCanonicalDispatchContext,
+	type RpcCommand,
+	type RpcCommandDispatchResult,
+	type RpcControlFrame,
+	type RpcEndpointIdentity,
+	type RpcExtensionUIRequest,
+	type RpcExtensionUIResponse,
+	type RpcExtensionUISelectOptionDetail,
+	type RpcHostToolCallRequest,
+	type RpcHostToolCancelRequest,
+	type RpcHostToolDefinition,
+	type RpcHostToolResult,
+	type RpcHostToolUpdate,
+	type RpcHostUriCancelRequest,
+	type RpcHostUriRequest,
+	type RpcHostUriResult,
+	type RpcResponse,
+	type RpcSubagentSubscriptionLevel,
 } from "./rpc-types";
 
 // Re-export types for consumers
@@ -89,7 +100,7 @@ export class RpcPendingExtensionRequests extends Map<string, PendingExtensionReq
 	}
 }
 
-type RpcOutput = (
+export type RpcOutput = (
 	obj:
 		| RpcResponse
 		| RpcExtensionUIRequest
@@ -98,7 +109,20 @@ type RpcOutput = (
 		| RpcHostUriRequest
 		| RpcHostUriCancelRequest
 		| object,
-) => void;
+) => void | Promise<void>;
+
+export function rpcSuccess<T extends RpcCommand["type"]>(
+	id: string | undefined,
+	command: T,
+	data?: object | null,
+): RpcResponse {
+	if (data === undefined) return { id, type: "response", command, success: true } as RpcResponse;
+	return { id, type: "response", command, success: true, data } as RpcResponse;
+}
+
+export function rpcError(id: string | undefined, command: string, message: string, code?: string): RpcResponse {
+	return { id, type: "response", command, success: false, error: message, ...(code ? { code } : {}) };
+}
 
 export type RpcSessionChangeCommand = Extract<
 	RpcCommand,
@@ -119,6 +143,7 @@ export async function tryRunRpcSkillCommand(
 	session: RpcSkillCommandSession,
 	text: string,
 	streamingBehavior: "steer" | "followUp" = "steer",
+	toolChoice?: ToolChoice,
 ): Promise<RpcSkillCommandResult | false> {
 	if (!session.skillsSettings?.enableSkillCommands) return false;
 	const parsed = parseSkillInvocation(text);
@@ -134,7 +159,7 @@ export async function tryRunRpcSkillCommand(
 			details: built.details,
 			attribution: "user",
 		},
-		{ streamingBehavior },
+		{ streamingBehavior, toolChoice },
 	);
 	return { agentInvoked: true };
 }
@@ -188,8 +213,8 @@ export class RpcExtensionUserMessageTracker {
 
 	#trackAgentMessageTaskForScope(scope: RpcExtensionUserMessageScope, task: Promise<unknown>): void {
 		const scopedTask = task.then(
-			() => {
-				scope.hasAgentMessageTask = true;
+			started => {
+				if (started !== false) scope.hasAgentMessageTask = true;
 			},
 			() => {},
 		);
@@ -250,12 +275,50 @@ export function watchAndReportLocalOnlyPromptResult(input: {
 	});
 }
 
+/** Execute a command through the canonical durable-mutation boundary when provenance is present. */
+export async function dispatchRpcCanonicalCommand(
+	session: AgentSession,
+	command: RpcCommand,
+	mutationLedger: RpcMutationLedger | undefined,
+	execute: () => Promise<RpcResponse>,
+): Promise<RpcResponse> {
+	if (!isRpcMutationCommand(command)) return execute();
+	const preflightError = validateRpcMutationBeforeIntent(session, command);
+	if (preflightError) return preflightError;
+	if (!command.mutation) return execute();
+	if (!mutationLedger) {
+		return rpcError(command.id, command.type, "Durable mutation receipts are unavailable", "unavailable");
+	}
+	return mutationLedger.execute(command, () => session.sessionId, execute);
+}
+
+/** Fork while deferring endpoint rebind publication until the response frame has flushed. */
+export async function executeRpcForkMutation(
+	session: AgentSession,
+	command: Extract<RpcCommand, { type: "fork" }>,
+	mutationLedger: RpcMutationLedger | undefined,
+	subagentRegistry?: Pick<RpcSubagentRegistry, "clear">,
+): Promise<RpcCommandDispatchResult> {
+	let publishSessionChange: (() => void) | undefined;
+	const response = await dispatchRpcCanonicalCommand(session, command, mutationLedger, async () => {
+		const forked = await session.fork(
+			publish => {
+				publishSessionChange = publish;
+			},
+			command.entryId === undefined ? undefined : { entryId: command.entryId },
+		);
+		if (forked) subagentRegistry?.clear();
+		return rpcSuccess(command.id, "fork", { sessionId: session.sessionId, cancelled: !forked });
+	});
+	return publishSessionChange ? { response, afterResponse: publishSessionChange } : { response };
+}
+
 /**
  * Dependencies for {@link dispatchRpcInputFrame}. Provided by the RPC mode
  * entrypoint; broken out so tests can drive the input loop with stubs.
  */
 export interface RpcInputFrameDeps {
-	handleCommand: (command: RpcCommand) => Promise<RpcResponse>;
+	handleCommand: (command: RpcCommand) => Promise<RpcResponse | RpcCommandDispatchResult>;
 	output: RpcOutput;
 	errorResponse: (id: string | undefined, command: string, message: string) => RpcResponse;
 	trackBackgroundTask?: (task: Promise<void>) => void;
@@ -263,6 +326,7 @@ export interface RpcInputFrameDeps {
 	onHostToolResult: (frame: RpcHostToolResult) => void;
 	onHostToolUpdate: (frame: RpcHostToolUpdate) => void;
 	onHostUriResult: (frame: RpcHostUriResult) => void;
+	interceptControlFrame?: (frame: RpcControlFrame) => boolean;
 }
 
 /**
@@ -278,28 +342,34 @@ function isRpcExtensionUIResponse(value: unknown): value is RpcExtensionUIRespon
 
 /** Dispatch side-channel frames that must overtake the serialized command queue. */
 export function dispatchRpcControlFrame(parsed: unknown, deps: RpcInputFrameDeps): boolean {
-	if (isRpcExtensionUIResponse(parsed)) {
-		const pending = deps.pendingExtensionRequests.get(parsed.id);
-		if (pending) pending.resolve(parsed);
+	if (isRpcHerdrAgentdRebindControl(parsed)) {
+		deps.interceptControlFrame?.(
+			isRpcHerdrAgentdRebindControlFrame(parsed) ? parsed : { type: "clear_herdr_agentd_rebind" },
+		);
 		return true;
 	}
 
-	if (isRpcHostToolResult(parsed)) {
-		deps.onHostToolResult(parsed);
-		return true;
-	}
+	let frame: RpcControlFrame | undefined;
+	if (isRpcExtensionUIResponse(parsed)) frame = parsed;
+	else if (isRpcHostToolResult(parsed)) frame = parsed;
+	else if (isRpcHostToolUpdate(parsed)) frame = parsed;
+	else if (isRpcHostUriResult(parsed)) frame = parsed;
+	if (!frame) return false;
+	if (deps.interceptControlFrame?.(frame)) return true;
 
-	if (isRpcHostToolUpdate(parsed)) {
-		deps.onHostToolUpdate(parsed);
-		return true;
+	if (frame.type === "extension_ui_response") {
+		const pending = deps.pendingExtensionRequests.get(frame.id);
+		if (pending) pending.resolve(frame);
+	} else if (frame.type === "host_tool_result") {
+		deps.onHostToolResult(frame);
+	} else if (frame.type === "host_tool_update") {
+		deps.onHostToolUpdate(frame);
+	} else if (frame.type === "host_uri_result") {
+		deps.onHostUriResult(frame);
+	} else {
+		return false;
 	}
-
-	if (isRpcHostUriResult(parsed)) {
-		deps.onHostUriResult(parsed);
-		return true;
-	}
-
-	return false;
+	return true;
 }
 
 /**
@@ -319,35 +389,27 @@ export function dispatchRpcControlFrame(parsed: unknown, deps: RpcInputFrameDeps
  */
 export function dispatchRpcInputFrame(parsed: unknown, deps: RpcInputFrameDeps): Promise<void> | undefined {
 	if (dispatchRpcControlFrame(parsed, deps)) return undefined;
-	// Regular RPC command. The transport contract states each remaining frame
-	// is an {@link RpcCommand}; `handleCommand`'s `default` arm surfaces
-	// unknown discriminants as an error response, so we do not shape-check
-	// the union here.
 	const command = parsed as RpcCommand;
+	const dispatch = async (): Promise<void> => {
+		const handled = await deps.handleCommand(command);
+		const result = "response" in handled ? handled : { response: handled };
+		await deps.output(result.response);
+		await result.afterResponse?.();
+	};
 
-	// `bash` can run for a long time. Dispatch it in the background so a
-	// subsequent `abort_bash` frame can be read and handled without waiting
-	// for the shell command to finish on its own. The response is emitted
-	// when `handleCommand` resolves; clients correlate via `command.id`.
 	if (command.type === "bash") {
-		const task = (async () => {
-			try {
-				deps.output(await deps.handleCommand(command));
-			} catch (err: unknown) {
-				const message = err instanceof Error ? err.message : String(err);
-				deps.output(deps.errorResponse(command.id, "bash", message));
-			}
-		})();
+		const task = dispatch().catch(async (err: unknown) => {
+			const message = err instanceof Error ? err.message : String(err);
+			await deps.output(deps.errorResponse(command.id, "bash", message));
+		});
 		deps.trackBackgroundTask?.(task);
 		return undefined;
 	}
 
-	return (async () => {
-		deps.output(await deps.handleCommand(command));
-	})();
+	return dispatch();
 }
 
-/** Serializes ordinary RPC commands while allowing control frames to dispatch immediately. */
+/** Serializes ordinary RPC commands while allowing controls and provenanced streaming prompts to overtake. */
 export class RpcInputDispatcher {
 	#tail: Promise<void> = Promise.resolve();
 	#tasks = new Set<Promise<void>>();
@@ -370,15 +432,25 @@ export class RpcInputDispatcher {
 				return;
 			}
 
+			if (
+				command.type === "abort" ||
+				command.type === "abort_bash" ||
+				command.type === "abort_and_prompt" ||
+				(command.type === "prompt" && command.mutation !== undefined && command.streamingBehavior !== undefined)
+			) {
+				const task = this.#dispatchCommand(command);
+				this.#tasks.add(task);
+				void task.finally(() => this.#tasks.delete(task));
+				return;
+			}
+
 			const task = this.#tail.then(
-				() => this.#dispatchSerialCommand(command),
-				() => this.#dispatchSerialCommand(command),
+				() => this.#dispatchCommand(command),
+				() => this.#dispatchCommand(command),
 			);
 			this.#tail = task.catch(() => {});
 			this.#tasks.add(task);
-			void task.finally(() => {
-				this.#tasks.delete(task);
-			});
+			void task.finally(() => this.#tasks.delete(task));
 		} catch (err: unknown) {
 			const message = err instanceof Error ? err.message : String(err);
 			this.#deps.output(this.#deps.errorResponse(undefined, "parse", `Failed to parse command: ${message}`));
@@ -392,13 +464,13 @@ export class RpcInputDispatcher {
 		}
 	}
 
-	async #dispatchSerialCommand(command: RpcCommand): Promise<void> {
+	async #dispatchCommand(command: RpcCommand): Promise<void> {
 		try {
 			const awaited = dispatchRpcInputFrame(command, this.#deps);
 			if (awaited) await awaited;
 		} catch (err: unknown) {
 			const message = err instanceof Error ? err.message : String(err);
-			this.#deps.output(this.#deps.errorResponse(command.id, command.type, message));
+			await this.#deps.output(this.#deps.errorResponse(command.id, command.type, message));
 		} finally {
 			await this.#afterSerialCommand?.();
 		}
@@ -692,6 +764,21 @@ export function requestRpcDialog<T>(
 	output({ type: "extension_ui_request", id, ...request } as RpcExtensionUIRequest);
 	return promise;
 }
+/** Optional composition points for a replica-backed RPC session. */
+export interface RpcModeOptions {
+	identity?: RpcEndpointIdentity;
+	participant?: Participant;
+	externalEvents?: {
+		subscribe(listener: (event: object) => void): () => void;
+		onTerminal?(listener: (reason: string) => void): () => void;
+	};
+	interceptCommand?: (command: RpcCommand) => RpcResponse | undefined | Promise<RpcResponse | undefined>;
+	onBeforeSessionDispose?: (reason: string) => void | Promise<void>;
+	interceptControlFrame?: (frame: RpcControlFrame) => boolean | void;
+	onForkRejectedOrCancelled?: () => void | Promise<void>;
+	publishAuthority?: (authority: RpcCanonicalAuthority) => void;
+}
+
 /**
  * Run in RPC mode.
  * Listens for JSON commands on stdin, outputs events and responses on stdout.
@@ -701,6 +788,7 @@ export async function runRpcMode(
 	setToolUIContext?: (uiContext: ExtensionUIContext, hasUI: boolean) => void,
 	subagentEventBus?: EventBus,
 	input: ReadableStream<Uint8Array> = claimRpcInput(),
+	options: RpcModeOptions = {},
 ): Promise<never> {
 	// Signal to RPC clients that the server is ready to accept commands
 	// Suppress terminal notifications: they write \x07 (BEL) or OSC sequences directly to
@@ -708,13 +796,32 @@ export async function runRpcMode(
 	// breaks JSON.parse. In RPC mode stdout is the JSON protocol channel — nothing else
 	// may write there.
 	process.env.PI_NOTIFICATIONS = "off";
+	let compositionStopTask: Promise<void> | undefined;
+	const stopComposition = (reason: string): Promise<void> => {
+		compositionStopTask ??= Promise.resolve(options.onBeforeSessionDispose?.(reason));
+		return compositionStopTask;
+	};
+	let disposeTask: Promise<void> | undefined;
+	const disposeForRpcShutdown = (reason: string): Promise<void> => {
+		disposeTask ??= (async () => {
+			await stopComposition(reason);
+			await session.dispose();
+		})();
+		return disposeTask;
+	};
+	const adapterMode = options.interceptCommand !== undefined;
+	const identity = options.identity ?? buildRpcEndpointIdentity();
 
 	const frameEncoder = new RpcFrameEncoder();
 	// Ordered stdout writer honoring backpressure: chunked v2 frames are produced
 	// lazily by the encoder and written one physical line at a time, so a near-limit
 	// logical frame never materializes its full base64 transport in memory.
+	const mutationLedger = adapterMode ? undefined : new RpcMutationLedger();
+	const authorityOutputListeners = new Set<(output: object) => void>();
+	let readyPublished = false;
+	const bufferedStartupOutput: object[] = [];
 	let stdoutQueue: Promise<void> = Promise.resolve();
-	const writeFrames = (frames: Iterable<string>) => {
+	const writeFrames = (frames: Iterable<string>): Promise<void> => {
 		stdoutQueue = stdoutQueue
 			.then(async () => {
 				for (const line of frames) {
@@ -723,44 +830,49 @@ export async function runRpcMode(
 			})
 			// stdout gone (host exited) — nothing left to deliver; keep the queue alive.
 			.catch(() => {});
+		return stdoutQueue;
 	};
-	writeFrames(
-		frameEncoder.encodeFrames({
-			type: "ready",
-			protocolVersion: 1,
-			supportedProtocolVersions: [1, 2],
-			maxFrameBytes: MAX_RPC_FRAME_BYTES,
-			maxReassembledFrameBytes: MAX_RPC_REASSEMBLED_BYTES,
-		}),
-	);
-	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
-		writeFrames(frameEncoder.encodeFrames(obj));
+	const output: RpcOutput = obj => {
+		if (!readyPublished) {
+			bufferedStartupOutput.push(obj);
+			return Promise.resolve();
+		}
+		const written = writeFrames(frameEncoder.encodeFrames(obj));
 		if (isRecord(obj) && obj.type === "response" && obj.command === "negotiate_protocol" && obj.success === true)
 			frameEncoder.setProtocolVersion(2);
+		if (!isRecord(obj) || obj.type !== "response") {
+			for (const listener of authorityOutputListeners) listener(obj);
+		}
+		return written;
 	};
+	const externalTermination = Promise.withResolvers<string>();
+	let externalTerminationReason: string | undefined;
+	const bufferedExternalEvents: object[] = [];
+	const unsubscribeExternalEvents = options.externalEvents?.subscribe(event => {
+		if (!readyPublished) {
+			bufferedExternalEvents.push(event);
+			return;
+		}
+		void output(event);
+	});
+	const unsubscribeExternalTermination = options.externalEvents?.onTerminal?.(reason => {
+		if (externalTerminationReason !== undefined) return;
+		externalTerminationReason = reason;
+		if (readyPublished) void output({ type: "collab_terminal", code: "unavailable", reason });
+		externalTermination.resolve(reason);
+	});
 	const emitRpcTitles = shouldEmitRpcTitles();
 
-	const success = <T extends RpcCommand["type"]>(
-		id: string | undefined,
-		command: T,
-		data?: object | null,
-	): RpcResponse => {
-		if (data === undefined) {
-			return { id, type: "response", command, success: true } as RpcResponse;
-		}
-		return { id, type: "response", command, success: true, data } as RpcResponse;
-	};
-
-	const error = (id: string | undefined, command: string, message: string, code?: string): RpcResponse => {
-		return { id, type: "response", command, success: false, error: message, ...(code ? { code } : {}) };
-	};
+	const success = rpcSuccess;
+	const error = rpcError;
 
 	const extensionUserMessageTracker = new RpcExtensionUserMessageTracker();
 
 	const pendingExtensionRequests = new RpcPendingExtensionRequests();
-	const hostToolBridge = new RpcHostToolBridge(output);
-	const hostUriBridge = new RpcHostUriBridge(output);
-	const subagentRegistry = subagentEventBus ? new RpcSubagentRegistry(subagentEventBus, output) : undefined;
+	const hostToolBridge = adapterMode ? undefined : new RpcHostToolBridge(output);
+	const hostUriBridge = adapterMode ? undefined : new RpcHostUriBridge(output);
+	const subagentRegistry =
+		!adapterMode && subagentEventBus ? new RpcSubagentRegistry(subagentEventBus, output) : undefined;
 
 	// Shutdown request flag (wrapped in object to allow mutation with const)
 	const shutdownState = { requested: false };
@@ -950,36 +1062,10 @@ export async function runRpcMode(
 		}
 	}
 
-	// Wire up UI context for tool execution (ask tool, etc.) and extensions.
-	// A single shared instance routes all responses received on stdin to the
-	// correct waiting promise regardless of which code path created the request.
-	const rpcUiContext = new RpcExtensionUIContext(pendingExtensionRequests, output);
-	setToolUIContext?.(rpcUiContext, true);
-
-	// Set up extensions with RPC-based UI context
-	await initializeExtensions(session, {
-		mode: "rpc",
-		reportSendError: (action, err) => {
-			output(error(undefined, action, err.message));
-		},
-		reportRuntimeError: err => {
-			output({ type: "extension_error", extensionPath: err.extensionPath, event: err.event, error: err.error });
-		},
-		onShutdown: () => {
-			shutdownState.requested = true;
-		},
-		trackAgentInvokingMessage: task => {
-			extensionUserMessageTracker.trackAgentMessageTask(task);
-		},
-		uiContext: rpcUiContext,
-	});
-
-	// Output all agent events as JSON
-	session.subscribe(event => {
-		output(event);
-	});
-
 	const getAvailableCommands = async () => buildAvailableSlashCommands(session);
+	const emitAvailableCommandsUpdate = async () => {
+		await output({ type: "available_commands_update", commands: await getAvailableCommands() });
+	};
 	const reloadPluginState = async () => {
 		const cwd = session.sessionManager.getCwd();
 		const projectPath = await resolveActiveProjectRegistryPath(cwd);
@@ -994,18 +1080,50 @@ export async function runRpcMode(
 		);
 		await emitAvailableCommandsUpdate();
 	};
-	const emitAvailableCommandsUpdate = async () => {
-		output({ type: "available_commands_update", commands: await getAvailableCommands() });
-	};
-	session.subscribeCommandMetadataChanged(() => {
-		void emitAvailableCommandsUpdate();
-	});
-	await emitAvailableCommandsUpdate();
+	const rpcUiContext = adapterMode ? undefined : new RpcExtensionUIContext(pendingExtensionRequests, output);
+	let unsubscribeSession: (() => void) | undefined;
+	let unsubscribeCommands: (() => void) | undefined;
+	if (!adapterMode) {
+		if (!rpcUiContext) throw new Error("Direct RPC UI context failed to initialize");
+		setToolUIContext?.(rpcUiContext, true);
+		await initializeExtensions(session, {
+			mode: "rpc",
+			reportSendError: (action, err) => {
+				void output(error(undefined, action, err.message));
+			},
+			reportRuntimeError: err => {
+				void output({
+					type: "extension_error",
+					extensionPath: err.extensionPath,
+					event: err.event,
+					error: err.error,
+				});
+			},
+			onShutdown: () => {
+				shutdownState.requested = true;
+			},
+			trackAgentInvokingMessage: task => {
+				extensionUserMessageTracker.trackAgentMessageTask(task);
+			},
+			uiContext: rpcUiContext,
+		});
+		unsubscribeSession = session.subscribe(event => {
+			void output(event);
+		});
+		unsubscribeCommands = session.subscribeCommandMetadataChanged(() => {
+			void emitAvailableCommandsUpdate();
+		});
+		await emitAvailableCommandsUpdate();
+	}
 
 	// Handle a single command
-	const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
+	const executeCommand = async (
+		command: RpcCommand,
+		dispatchContext?: RpcCanonicalDispatchContext,
+	): Promise<RpcResponse> => {
+		const sessionDataResponse = await executeRpcSessionDataCommand(session, command);
+		if (sessionDataResponse) return sessionDataResponse;
 		const id = command.id;
-
 		switch (command.type) {
 			case "negotiate_protocol": {
 				if (command.protocolVersion !== 2)
@@ -1018,10 +1136,14 @@ export async function runRpcMode(
 			// =================================================================
 
 			case "prompt": {
-				const skillResult = await tryRunRpcSkillCommand(session, command.message, command.streamingBehavior);
-				if (skillResult) {
-					return success(id, "prompt", skillResult);
-				}
+				const toolChoice = command.toolChoice ? session.resolveNamedToolChoice(command.toolChoice) : undefined;
+				const skillResult = await tryRunRpcSkillCommand(
+					session,
+					command.message,
+					command.streamingBehavior,
+					toolChoice,
+				);
+				if (skillResult) return success(id, "prompt", skillResult);
 				const builtinResult = await executeAcpBuiltinSlashCommand(command.message, {
 					session,
 					sessionManager: session.sessionManager,
@@ -1040,6 +1162,14 @@ export async function runRpcMode(
 				});
 				if (builtinResult !== false) {
 					if ("prompt" in builtinResult) {
+						if (command.mutation) {
+							const agentInvoked = await session.prompt(builtinResult.prompt, {
+								images: command.images,
+								streamingBehavior: command.streamingBehavior,
+								toolChoice,
+							});
+							return success(id, "prompt", { agentInvoked });
+						}
 						watchAndReportLocalOnlyPromptResult({
 							id,
 							startPrompt: () => session.prompt(builtinResult.prompt, { images: command.images }),
@@ -1056,9 +1186,15 @@ export async function runRpcMode(
 					return success(id, "prompt", { agentInvoked: builtinResult.agentInvoked === true });
 				}
 
-				// Don't await - events will stream
-				// Extension commands are executed immediately, file prompt templates are expanded
-				// If streaming and streamingBehavior specified, queues via steer/followUp
+				if (command.mutation) {
+					const agentInvoked = await session.prompt(command.message, {
+						images: command.images,
+						streamingBehavior: command.streamingBehavior,
+						toolChoice,
+					});
+					return success(id, "prompt", { agentInvoked });
+				}
+				// Don't await legacy prompts; events stream after the response.
 				watchAndReportLocalOnlyPromptResult({
 					id,
 					startPrompt: () =>
@@ -1090,10 +1226,19 @@ export async function runRpcMode(
 
 			case "abort_and_prompt": {
 				await session.abort({ reason: USER_INTERRUPT_LABEL });
-				session
-					.prompt(command.message, { images: command.images })
-					.catch(e => output(error(id, "abort_and_prompt", e.message)));
+				const prompt = session.prompt(command.message, { images: command.images });
+				if (command.mutation) {
+					await prompt;
+				} else {
+					void prompt.catch(e => output(error(id, "abort_and_prompt", e.message)));
+				}
 				return success(id, "abort_and_prompt");
+			}
+
+			case "collab_ui_response": {
+				return dispatchContext
+					? dispatchContext.handleCollabUiResponse(command)
+					: error(id, "collab_ui_response", `Unknown Collab UI request: ${command.reqId}`, "not-found");
 			}
 
 			case "new_session":
@@ -1109,34 +1254,7 @@ export async function runRpcMode(
 			// =================================================================
 
 			case "get_state": {
-				const state: RpcSessionState = {
-					model: session.model,
-					thinkingLevel: session.thinkingLevel,
-					isStreaming: session.isStreaming,
-					isCompacting: session.isCompacting,
-					steeringMode: session.steeringMode,
-					followUpMode: session.followUpMode,
-					interruptMode: session.interruptMode,
-					sessionFile: session.sessionFile,
-					sessionId: session.sessionId,
-					sessionName: session.sessionName,
-					autoCompactionEnabled: session.autoCompactionEnabled,
-					queuedMessageCount: session.queuedMessageCount,
-					todoPhases: session.getTodoPhases(),
-					fastModeEnabled: session.isFastModeEnabled(),
-					tokensPerSecond: calculateTokensPerSecond(session.messages, session.isStreaming),
-					fastModeActive: session.isFastModeActive(),
-					messageCount: session.messages.length,
-					systemPrompt: session.systemPrompt,
-					dumpTools: session.agent.state.tools.map(tool => ({
-						name: tool.name,
-						description: tool.description,
-						parameters: toolWireSchema(tool),
-						examples: tool.examples,
-					})),
-					contextUsage: session.getContextUsage(),
-				};
-				return success(id, "get_state", state);
+				return success(id, "get_state", buildRpcSessionState(session));
 			}
 
 			case "set_fast_mode": {
@@ -1160,6 +1278,7 @@ export async function runRpcMode(
 			}
 
 			case "set_host_tools": {
+				if (!hostToolBridge) return error(id, "set_host_tools", "Host tools are unavailable");
 				const tools = normalizeHostToolDefinitions(command.tools);
 				const rpcTools = hostToolBridge.setTools(tools);
 				await session.refreshRpcHostTools(rpcTools);
@@ -1167,6 +1286,7 @@ export async function runRpcMode(
 			}
 
 			case "set_host_uri_schemes": {
+				if (!hostUriBridge) return error(id, "set_host_uri_schemes", "Host URI schemes are unavailable");
 				try {
 					const schemes = hostUriBridge.setSchemes(command.schemes);
 					return success(id, "set_host_uri_schemes", { schemes });
@@ -1484,6 +1604,57 @@ export async function runRpcMode(
 		}
 	};
 
+	let rpcSourcesClosed = false;
+	const unsubscribeRpcSources = (): void => {
+		if (rpcSourcesClosed) return;
+		rpcSourcesClosed = true;
+		for (const unsubscribe of [
+			unsubscribeExternalEvents,
+			unsubscribeExternalTermination,
+			unsubscribeSession,
+			unsubscribeCommands,
+		]) {
+			try {
+				unsubscribe?.();
+			} catch {}
+		}
+	};
+
+	const handleCommand = async (
+		command: RpcCommand,
+		dispatchContext?: RpcCanonicalDispatchContext,
+	): Promise<RpcResponse | RpcCommandDispatchResult> => {
+		if (externalTerminationReason !== undefined) {
+			return error(
+				command.id,
+				command.type,
+				`Collab transport is unavailable: ${externalTerminationReason}`,
+				"unavailable",
+			);
+		}
+		if (adapterMode) {
+			const intercepted = await options.interceptCommand?.(command);
+			return (
+				intercepted ?? error(command.id, command.type, "Collab transport did not handle command", "unavailable")
+			);
+		}
+		if (command.type !== "fork") {
+			return dispatchRpcCanonicalCommand(session, command, mutationLedger, () =>
+				executeCommand(command, dispatchContext),
+			);
+		}
+		try {
+			const result = await executeRpcForkMutation(session, command, mutationLedger, subagentRegistry);
+			if (result.afterResponse || !options.onForkRejectedOrCancelled) return result;
+			return { ...result, afterResponse: options.onForkRejectedOrCancelled };
+		} catch (cause) {
+			const response = error(command.id, "fork", cause instanceof Error ? cause.message : String(cause));
+			return options.onForkRejectedOrCancelled
+				? { response, afterResponse: options.onForkRejectedOrCancelled }
+				: response;
+		}
+	};
+
 	// Deferred shutdown (pi.shutdown() from an extension) must not kill the
 	// process while a background-dispatched bash still owes the client its
 	// response frame. The coordinator drains tracked tasks before exiting and
@@ -1491,12 +1662,9 @@ export async function runRpcMode(
 	const shutdownCoordinator = new RpcShutdownCoordinator({
 		isShutdownRequested: () => shutdownState.requested,
 		performShutdown: async () => {
-			// Route through the idempotent session.dispose() so the browser
-			// reaper (releaseTabsForOwner) and other bounded teardown run before
-			// the process exits. dispose() also emits `session_shutdown`, so we
-			// must NOT emit it separately here or the event fires twice. Skipping
-			// dispose left OMP-owned Chromium alive after RPC shutdown (#5643).
-			await session.dispose();
+			unsubscribeRpcSources();
+			mutationLedger?.close();
+			await disposeForRpcShutdown("RPC shutdown requested");
 			process.exit(0);
 		},
 	});
@@ -1507,10 +1675,41 @@ export async function runRpcMode(
 		errorResponse: error,
 		trackBackgroundTask: task => shutdownCoordinator.track(task),
 		pendingExtensionRequests,
-		onHostToolResult: frame => hostToolBridge.handleResult(frame),
-		onHostToolUpdate: frame => hostToolBridge.handleUpdate(frame),
-		onHostUriResult: frame => hostUriBridge.handleResult(frame),
+		onHostToolResult: frame => hostToolBridge?.handleResult(frame),
+		onHostToolUpdate: frame => hostToolBridge?.handleUpdate(frame),
+		onHostUriResult: frame => hostUriBridge?.handleResult(frame),
+		interceptControlFrame: options.interceptControlFrame
+			? frame => {
+					const handled = options.interceptControlFrame?.(frame);
+					return adapterMode || handled === true;
+				}
+			: undefined,
 	};
+	writeFrames(
+		frameEncoder.encodeFrames({
+			type: "ready",
+			...identity,
+			maxFrameBytes: MAX_RPC_FRAME_BYTES,
+			maxReassembledFrameBytes: MAX_RPC_REASSEMBLED_BYTES,
+			...(options.participant ? { participant: options.participant } : {}),
+		}),
+	);
+	readyPublished = true;
+	options.publishAuthority?.({
+		identity,
+		dispatch: handleCommand,
+		dispatchControl: frame => dispatchRpcControlFrame(frame, dispatchFrameDeps),
+		subscribeOutput: listener => {
+			authorityOutputListeners.add(listener);
+			return () => authorityOutputListeners.delete(listener);
+		},
+	});
+	if (options.publishAuthority) await Promise.resolve();
+	for (const event of bufferedStartupOutput.splice(0)) void output(event);
+	for (const event of bufferedExternalEvents.splice(0)) void output(event);
+	if (externalTerminationReason !== undefined) {
+		void output({ type: "collab_terminal", code: "unavailable", reason: externalTerminationReason });
+	}
 
 	const inputDispatcher = new RpcInputDispatcher({
 		deps: dispatchFrameDeps,
@@ -1523,24 +1722,44 @@ export async function runRpcMode(
 	// line-by-line by readRpcInputFrames so a single malformed line is reported
 	// as an error frame and the loop keeps running instead of throwing out of
 	// the reader and killing the whole process (issue #5194).
-	await readRpcInputFrames(
+	const inputComplete = readRpcInputFrames(
 		input ?? Bun.stdin.stream(),
 		parsed => inputDispatcher.dispatch(parsed),
-		message => output(error(undefined, "parse", message)),
+		message => {
+			void output(error(undefined, "parse", message));
+		},
 	);
+	const terminalReason = await Promise.race([inputComplete.then(() => undefined), externalTermination.promise]);
+	unsubscribeRpcSources();
+	if (adapterMode)
+		await stopComposition(terminalReason ? `Collab transport ended: ${terminalReason}` : "RPC input closed");
 
-	// stdin closed — RPC client is gone. Fail pending side-channel requests
-	// first so active/queued commands can settle, then drain accepted work.
-	pendingExtensionRequests.rejectAll("RPC client disconnected before extension UI response completed");
-	hostToolBridge.close("RPC client disconnected before host tool execution completed");
-	hostUriBridge.clear("RPC client disconnected before host URI request completed");
+	// stdin closed or the authoritative Collab transport ended. Fail pending
+	// side-channel work first so active/queued commands can settle, then drain accepted work.
+	pendingExtensionRequests.rejectAll(
+		terminalReason === undefined
+			? "RPC client disconnected before extension UI response completed"
+			: `Collab transport ended: ${terminalReason}`,
+	);
+	hostToolBridge?.close(
+		terminalReason === undefined
+			? "RPC client disconnected before host tool execution completed"
+			: `Collab transport ended: ${terminalReason}`,
+	);
+	hostUriBridge?.clear(
+		terminalReason === undefined
+			? "RPC client disconnected before host URI request completed"
+			: `Collab transport ended: ${terminalReason}`,
+	);
 	await inputDispatcher.drain();
 	await shutdownCoordinator.drain();
 	subagentRegistry?.dispose();
-	// Dispose the main session before exiting so the browser reaper and other
-	// bounded teardown run on the stdin-EOF path too (#5643). Idempotent: a
-	// prior pi.shutdown() through the coordinator makes this await settle
-	// immediately.
-	await session.dispose();
+	mutationLedger?.close();
+	if (terminalReason !== undefined) {
+		await stdoutQueue;
+		await disposeForRpcShutdown(`Collab transport ended: ${terminalReason}`);
+		process.exit(1);
+	}
+	await disposeForRpcShutdown("RPC input closed");
 	process.exit(0);
 }

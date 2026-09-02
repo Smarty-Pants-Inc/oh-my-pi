@@ -10,6 +10,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
 import type {
 	RpcCommand,
+	RpcControlFrame,
 	RpcExtensionUIResponse,
 	RpcHostToolCallRequest,
 	RpcHostToolCancelRequest,
@@ -226,6 +227,43 @@ describe("dispatchRpcInputFrame", () => {
 
 		expect(outputs).toEqual([bashResponse]);
 	});
+});
+
+test("intercepts every sidechannel before local RPC handlers", () => {
+	const localHandlers: string[] = [];
+	const forwarded: RpcControlFrame[] = [];
+	const { deps } = makeDeps(async command => ({
+		id: command.id,
+		type: "response",
+		command: command.type,
+		success: false,
+		error: "unexpected command",
+	}));
+	deps.onHostToolResult = () => localHandlers.push("tool-result");
+	deps.onHostToolUpdate = () => localHandlers.push("tool-update");
+	deps.onHostUriResult = () => localHandlers.push("uri-result");
+	deps.interceptControlFrame = frame => {
+		forwarded.push(frame);
+		return true;
+	};
+	const frames: RpcControlFrame[] = [
+		{ type: "extension_ui_response", id: "ui-1", cancelled: true },
+		{
+			type: "host_tool_result",
+			id: "tool-1",
+			result: { content: [{ type: "text", text: "done" }], details: {} },
+		},
+		{
+			type: "host_tool_update",
+			id: "tool-1",
+			partialResult: { content: [{ type: "text", text: "working" }], details: {} },
+		},
+		{ type: "host_uri_result", id: "uri-1", content: "value" },
+		{ type: "clear_herdr_agentd_rebind" },
+	];
+	for (const frame of frames) expect(dispatchRpcInputFrame(frame, deps)).toBeUndefined();
+	expect(forwarded).toEqual(frames);
+	expect(localHandlers).toEqual([]);
 });
 
 describe("RpcInputDispatcher", () => {

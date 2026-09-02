@@ -12,7 +12,7 @@
 import { timingSafeEqual } from "node:crypto";
 import * as fs from "node:fs/promises";
 import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
-import { logger } from "@oh-my-pi/pi-utils";
+import { isRecord, logger } from "@oh-my-pi/pi-utils";
 import type {
 	BusChannel,
 	CollabUiRequest,
@@ -21,6 +21,15 @@ import type {
 	AgentEvent as WireAgentEvent,
 	SessionEntry as WireSessionEntry,
 } from "@oh-my-pi/pi-wire";
+import {
+	isRpcMutationCommand,
+	isRpcReadCommand,
+	RPC_CAPABILITIES,
+	type RpcCanonicalAuthority,
+	type RpcCommand,
+	type RpcCommandDispatchResult,
+	type RpcResponse,
+} from "../modes/rpc/rpc-types";
 import type { InteractiveModeContext } from "../modes/types";
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry } from "../registry/agent-registry";
@@ -28,6 +37,7 @@ import type { AgentSessionEvent } from "../session/agent-session";
 import { stripImagesFromMessage, USER_INTERRUPT_LABEL } from "../session/messages";
 import type { SessionEntry as StoredSessionEntry } from "../session/session-entries";
 import { TASK_SUBAGENT_LIFECYCLE_CHANNEL, TASK_SUBAGENT_PROGRESS_CHANNEL } from "../task/types";
+import type { EventBus } from "../utils/event-bus";
 import { generateRoomKey, generateWriteToken, importRoomKey } from "./crypto";
 import { collabDisplayName } from "./display-name";
 import {
@@ -43,8 +53,9 @@ import {
 	generateRoomId,
 	parseCollabLink,
 } from "./protocol";
-import { CollabSocket } from "./relay-client";
+import { CollabSocket, type CollabTransport } from "./relay-client";
 import { shrinkForReplication } from "./replication-shrink";
+import { CollabRpcFrameReassembler, sendCollabRpcFrame } from "./rpc-frames";
 
 /** Events that change the footer state guests render. */
 const STATE_TRIGGER_EVENTS: Record<string, true> = {
@@ -62,6 +73,8 @@ const STATE_DEBOUNCE_MS = 100;
 const AGENTS_DEBOUNCE_MS = 100;
 const STREAMING_STATE_INTERVAL_MS = 2000;
 const WELCOME_IMAGE_STRIP_THRESHOLD = 24 * 1024 * 1024;
+const COLLAB_RPC_CAPABILITIES = ["collab-rpc-guest", "rpc-all-commands", "rpc-inner-chunks"] as const;
+const MAX_ACTIVE_RPC_REQUESTS = 256;
 const WIRE_AGENT_EVENT_TYPES: Record<WireAgentEvent["type"], true> = {
 	agent_start: true,
 	agent_end: true,
@@ -120,9 +133,34 @@ const SNAPSHOT_CHUNK_BYTES = 512 * 1024;
  */
 export type CollabGuestUiResult = { kind: "answered"; value: CollabUiResponseValue } | { kind: "unavailable" };
 
+export interface CollabHostTransportOptions {
+	rpcAuthority?: Promise<RpcCanonicalAuthority>;
+	/** Agentd owns session identity on this private route. */
+	agentdManagedHost?: boolean;
+}
+
+type RpcResultFrameType = "rpc-result" | "rpc-mutation-result" | "rpc-read-result";
+
+/** Narrow host surface shared by interactive and headless private bridges. */
+export interface CollabHostContext {
+	session: InteractiveModeContext["session"];
+	sessionManager: InteractiveModeContext["sessionManager"];
+	settings: Pick<InteractiveModeContext["settings"], "get">;
+	subagentEventBus?: EventBus;
+	eventBus?: EventBus;
+	statusLine: Pick<
+		InteractiveModeContext["statusLine"],
+		"setCollabStatus" | "invalidate" | "getCachedContextBreakdown"
+	>;
+	ui: Pick<InteractiveModeContext["ui"], "requestRender">;
+	showStatus: InteractiveModeContext["showStatus"];
+	updatePendingMessagesDisplay: InteractiveModeContext["updatePendingMessagesDisplay"];
+	collabHost?: CollabHost;
+}
+
 export class CollabHost {
-	#ctx: InteractiveModeContext;
-	#socket: CollabSocket | null = null;
+	#ctx: CollabHostContext;
+	#socket: CollabTransport | null = null;
 	#link = "";
 	#webLink = "";
 	#viewLink = "";
@@ -131,6 +169,15 @@ export class CollabHost {
 	#sessionId = "";
 	#unsubscribe?: () => void;
 	#peers = new Map<number, { name: string; canWrite: boolean }>();
+	#localPeerAuthority = new Map<number, boolean>();
+	#rpcPeers = new Set<number>();
+	#rpcAuthorityPromise: Promise<RpcCanonicalAuthority> | undefined;
+	#agentdManagedHost = false;
+	#rpcAuthority: RpcCanonicalAuthority | undefined;
+	#rpcAuthorityUnsubscribe: (() => void) | undefined;
+	#rpcReassembler = new CollabRpcFrameReassembler();
+	#activeRpcRequests = new Set<string>();
+	#rpcSessionTransitions = new Set<string>();
 	#uiReqSeq = 0;
 	#pendingUi = new Map<number, { request: CollabUiRequest; settle(result: CollabGuestUiResult): void }>();
 	#lastStateJson = "";
@@ -141,7 +188,7 @@ export class CollabHost {
 	#registryUnsubscribe?: () => void;
 	#stopped = false;
 
-	constructor(ctx: InteractiveModeContext) {
+	constructor(ctx: CollabHostContext) {
 		this.#ctx = ctx;
 	}
 
@@ -222,23 +269,41 @@ export class CollabHost {
 		if ("error" in parsed) throw new Error(parsed.error);
 		const key = await importRoomKey(rawKey);
 
-		const socket = new CollabSocket({ wsUrl: parsed.wsUrl, role: "host", key });
-		this.#socket = socket;
-		this.#sessionId = this.#ctx.sessionManager.getSessionId();
+		await this.startWithTransport(new CollabSocket({ wsUrl: parsed.wsUrl, role: "host", key }));
+	}
 
+	/** Start a trusted private bridge without creating a public relay room. */
+	async startWithTransport(transport: CollabTransport, options: CollabHostTransportOptions = {}): Promise<void> {
+		this.#rpcAuthorityPromise = options.rpcAuthority;
+		this.#agentdManagedHost = options.agentdManagedHost === true;
+		this.#socket = transport;
+		this.#sessionId = this.#ctx.sessionManager.getSessionId();
 		const firstOpen = Promise.withResolvers<void>();
 		let opened = false;
-		socket.onOpen = () => {
-			if (!opened) {
-				opened = true;
-				firstOpen.resolve();
+		transport.onOpen = () => {
+			if (opened) return;
+			opened = true;
+			firstOpen.resolve();
+		};
+		transport.onFrame = (frame, fromPeer) => {
+			if (!this.#rpcAuthorityPromise) {
+				this.#handleFrame(frame, fromPeer);
+				return;
+			}
+			try {
+				const reassembled = this.#rpcReassembler.push(frame, fromPeer);
+				const inbound = reassembled.handled ? reassembled.frame : frame;
+				if (inbound) this.#handleFrame(inbound, fromPeer);
+			} catch (error) {
+				logger.warn("collab host rejected invalid RPC chunks", { fromPeer, error: String(error) });
+				this.#socket?.send({ t: "error", message: "invalid chunked RPC frame" }, fromPeer);
 			}
 		};
-		socket.onFrame = (frame, fromPeer) => this.#handleFrame(frame, fromPeer);
-		socket.onControl = msg => {
-			if (msg.t === "peer-left") this.#handlePeerLeft(msg.peer);
+		transport.onControl = message => {
+			if (message.t === "peer-left") this.#handlePeerLeft(message.peer);
+			else if (message.t === "peer-authority") this.#setPeerAuthority(message.peer, message.canWrite);
 		};
-		socket.onClose = (reason, willReconnect) => {
+		transport.onClose = (reason, willReconnect) => {
 			if (this.#stopped) return;
 			if (!opened) {
 				firstOpen.reject(new Error(reason));
@@ -246,36 +311,30 @@ export class CollabHost {
 			}
 			if (willReconnect) {
 				this.#ctx.showStatus(`Collab relay connection lost (${reason}), reconnecting…`, { dim: true });
-			} else {
-				void this.#teardown();
-				this.#ctx.session.emitNotice("warning", `Collab ended: ${reason}`, "collab");
+				return;
 			}
+			void this.#teardown();
+			this.#ctx.session.emitNotice("warning", `Collab ended: ${reason}`, "collab");
 		};
-		socket.connect();
-
+		transport.connect();
 		const timeout = setTimeout(
 			() => firstOpen.reject(new Error("timed out connecting to relay")),
 			CONNECT_TIMEOUT_MS,
 		);
 		try {
 			await firstOpen.promise;
-		} catch (err) {
+		} catch (error) {
 			this.#stopped = true;
-			socket.close();
+			transport.close();
 			this.#socket = null;
-			throw err;
+			throw error;
 		} finally {
 			clearTimeout(timeout);
 		}
-
 		this.#unsubscribe = this.#ctx.session.subscribe(event => {
 			if (isWireAgentEvent(event)) this.#broadcast({ t: "event", event: shrinkForReplication(event) });
 			this.#onEventForState(event);
 		});
-		// Subagent frames publish on the session tree's observability bus at
-		// any spawn depth; mirroring from it is what lets nested agents reach
-		// guests at all. Embedders on the previous constructor signature only
-		// wire a session bus — fall back to it so depth-1 frames keep flowing.
 		const observabilityBus = this.#ctx.subagentEventBus ?? this.#ctx.eventBus;
 		if (observabilityBus) {
 			for (const channel of COLLAB_BUS_CHANNELS) {
@@ -287,11 +346,14 @@ export class CollabHost {
 		this.#registryUnsubscribe = AgentRegistry.global().onChange(() => this.#scheduleAgentsBroadcast());
 		this.#ctx.sessionManager.onEntryAppended = entry => {
 			if (isWireSessionEntry(entry)) this.#broadcast({ t: "entry", entry: shrinkForReplication(entry) });
-			// Model/thinking/title changes land as entries while idle; refresh
-			// guest state promptly (debounce + JSON diff dedupe).
 			this.#scheduleStateBroadcast();
 		};
 		this.#updateStatusSegment();
+		if (this.#rpcAuthorityPromise) {
+			void this.#getRpcAuthority().catch(error =>
+				logger.warn("collab RPC authority initialization failed", { error: String(error) }),
+			);
+		}
 	}
 
 	/** Broadcast a goodbye, detach all taps, and close the socket. */
@@ -319,6 +381,16 @@ export class CollabHost {
 		this.#streamingInterval = null;
 		for (const pending of this.#pendingUi.values()) pending.settle({ kind: "unavailable" });
 		this.#pendingUi.clear();
+		this.#rpcAuthorityUnsubscribe?.();
+		this.#rpcAuthorityUnsubscribe = undefined;
+		this.#rpcAuthority = undefined;
+		this.#rpcAuthorityPromise = undefined;
+		this.#agentdManagedHost = false;
+		this.#rpcReassembler.close();
+		this.#rpcPeers.clear();
+		this.#activeRpcRequests.clear();
+		this.#rpcSessionTransitions.clear();
+		this.#localPeerAuthority.clear();
 		this.#peers.clear();
 		this.#socket?.close();
 		this.#socket = null;
@@ -328,7 +400,7 @@ export class CollabHost {
 	}
 
 	#broadcast(frame: CollabFrame): void {
-		if (this.#stopped || !this.#socket) return;
+		if (this.#stopped || !this.#socket || this.#rpcSessionTransitions.size > 0) return;
 		if (this.#ctx.sessionManager.getSessionId() !== this.#sessionId) {
 			void this.stop("session switched");
 			this.#ctx.session.emitNotice("warning", "Collab ended: session switched", "collab");
@@ -340,7 +412,10 @@ export class CollabHost {
 	#handleFrame(frame: CollabFrame, fromPeer: number): void {
 		switch (frame.t) {
 			case "hello":
-				this.#handleHello(frame.name, frame.proto, frame.writeToken, fromPeer);
+				void this.#handleHello(frame.name, frame.proto, frame.writeToken, fromPeer).catch(error => {
+					logger.warn("collab host welcome failed", { fromPeer, error: String(error) });
+					this.#socket?.send({ t: "error", message: "RPC authority failed to initialize" }, fromPeer);
+				});
 				break;
 			case "prompt":
 				this.#handlePrompt(frame.text, frame.images, fromPeer);
@@ -356,6 +431,26 @@ export class CollabHost {
 				break;
 			case "fetch-transcript":
 				void this.#handleFetchTranscript(frame.reqId, frame.agentId, frame.fromByte, fromPeer);
+				break;
+			case "rpc-mutation":
+				void this.#handleRpcMutation(frame.requestId, frame.command, fromPeer).catch(error =>
+					logger.warn("collab RPC mutation transport failed", { fromPeer, error: String(error) }),
+				);
+				break;
+			case "rpc-read":
+				void this.#handleRpcRead(frame.requestId, frame.command, fromPeer).catch(error =>
+					logger.warn("collab RPC read transport failed", { fromPeer, error: String(error) }),
+				);
+				break;
+			case "rpc-request":
+				void this.#handleRpcRequest(frame.requestId, frame.command, fromPeer, "rpc-result").catch(error =>
+					logger.warn("collab RPC transport failed", { fromPeer, error: String(error) }),
+				);
+				break;
+			case "rpc-control":
+				void this.#handleRpcControl(frame.frame, fromPeer).catch(error =>
+					logger.warn("collab RPC control failed", { fromPeer, error: String(error) }),
+				);
 				break;
 			default:
 				logger.debug("collab host ignoring unexpected frame", { type: frame.t, fromPeer });
@@ -375,7 +470,7 @@ export class CollabHost {
 		this.#socket?.send({ t: "error", message: `${action} is disabled on a read-only link` }, fromPeer);
 	}
 
-	#handleHello(name: string, proto: number, writeToken: string | undefined, fromPeer: number): void {
+	async #handleHello(name: string, proto: number, writeToken: string | undefined, fromPeer: number): Promise<void> {
 		if (proto !== COLLAB_PROTO) {
 			this.#socket?.send(
 				{ t: "error", message: `protocol mismatch: host speaks v${COLLAB_PROTO}, guest sent v${proto}` },
@@ -384,8 +479,11 @@ export class CollabHost {
 			return;
 		}
 		const cleanName = name.trim().slice(0, 64) || `guest-${fromPeer}`;
-		const canWrite = this.#verifyWriteToken(writeToken);
+		const canWrite = this.#rpcAuthorityPromise
+			? this.#localPeerAuthority.get(fromPeer) === true
+			: this.#verifyWriteToken(writeToken);
 		this.#peers.set(fromPeer, { name: cleanName, canWrite });
+		const authority = this.#rpcAuthorityPromise ? await this.#getRpcAuthority() : undefined;
 
 		// Snapshot and send synchronously: no awaits between snapshot, welcome,
 		// and chunk sends, so subsequent broadcast frames (entry/event/state/bus)
@@ -406,15 +504,31 @@ export class CollabHost {
 			{
 				t: "welcome",
 				proto: COLLAB_PROTO,
+				...(authority
+					? {
+							rpc: {
+								...authority.identity,
+								capabilities: [
+									...new Set([
+										...RPC_CAPABILITIES,
+										...authority.identity.capabilities,
+										...COLLAB_RPC_CAPABILITIES,
+									]),
+								],
+							},
+						}
+					: {}),
 				header: snapshot.header,
 				state: this.#buildState(),
 				agents: this.#snapshotAgents(),
+				participant: { name: cleanName, role: "guest", readOnly: !canWrite },
 				entryCount: entries.length,
 				readOnly: canWrite ? undefined : true,
 			},
 			fromPeer,
 		);
 		this.#sendSnapshotChunks(entries, fromPeer);
+		if (authority) this.#rpcPeers.add(fromPeer);
 		if (canWrite) {
 			for (const pending of this.#pendingUi.values()) {
 				socket.send({ t: "ui-request", request: pending.request }, fromPeer);
@@ -462,6 +576,184 @@ export class CollabHost {
 			}
 			socket.send({ t: "snapshot-chunk", entries: batch, final: i >= entries.length }, fromPeer);
 		}
+	}
+
+	async #getRpcAuthority(): Promise<RpcCanonicalAuthority> {
+		if (this.#rpcAuthority) return this.#rpcAuthority;
+		const pending = this.#rpcAuthorityPromise;
+		if (!pending) throw new Error("Collab RPC is unavailable on this transport");
+		const authority = await pending;
+		if (this.#stopped) throw new Error("Collab host stopped before RPC authority became ready");
+		if (this.#rpcAuthority) return this.#rpcAuthority;
+		this.#rpcAuthority = authority;
+		this.#rpcAuthorityUnsubscribe = authority.subscribeOutput(output => this.#forwardRpcOutput(output));
+		return authority;
+	}
+
+	#forwardRpcOutput(output: object): void {
+		if (this.#stopped || !this.#socket || this.#rpcSessionTransitions.size > 0) return;
+		if (isRecord(output) && output.type === "response") return;
+		if (isWireAgentEvent(output as AgentSessionEvent)) return;
+		for (const peerId of this.#rpcPeers) {
+			try {
+				sendCollabRpcFrame(this.#socket, { t: "rpc-output", output }, peerId);
+			} catch (error) {
+				logger.warn("collab RPC output exceeded transport bounds", { peerId, error: String(error) });
+			}
+		}
+	}
+
+	#rpcFailure(command: Pick<RpcCommand, "id" | "type">, error: string, code: string): RpcResponse {
+		return { id: command.id, type: "response", command: command.type, success: false, error, code };
+	}
+
+	async #handleRpcControl(frame: unknown, fromPeer: number): Promise<void> {
+		if (!this.#rpcAuthorityPromise) return;
+		const peer = this.#peers.get(fromPeer);
+		if (!peer || !this.#rpcPeers.has(fromPeer)) return;
+		if (!peer.canWrite) {
+			this.#rejectReadOnly("RPC control", fromPeer);
+			return;
+		}
+		if (
+			isRecord(frame) &&
+			(frame.type === "prepare_herdr_agentd_rebind" || frame.type === "clear_herdr_agentd_rebind")
+		) {
+			this.#socket?.send({ t: "error", message: "agentd rebind control is unavailable to Collab guests" }, fromPeer);
+			return;
+		}
+		const authority = await this.#getRpcAuthority();
+		if (!authority.dispatchControl(frame)) {
+			this.#socket?.send({ t: "error", message: "invalid RPC control frame" }, fromPeer);
+		}
+	}
+
+	async #handleRpcMutation(
+		requestId: number,
+		command: Extract<CollabFrame, { t: "rpc-mutation" }>["command"],
+		fromPeer: number,
+	): Promise<void> {
+		await this.#handleRpcRequest(requestId, command, fromPeer, "rpc-mutation-result");
+	}
+
+	async #handleRpcRead(
+		requestId: number,
+		command: Extract<CollabFrame, { t: "rpc-read" }>["command"],
+		fromPeer: number,
+	): Promise<void> {
+		await this.#handleRpcRequest(requestId, command, fromPeer, "rpc-read-result");
+	}
+
+	async #handleRpcRequest(
+		requestId: number,
+		command: RpcCommand,
+		fromPeer: number,
+		resultType: RpcResultFrameType,
+	): Promise<void> {
+		if (!this.#rpcAuthorityPromise) return;
+		if (!Number.isSafeInteger(requestId) || requestId < 0) {
+			this.#socket?.send({ t: "error", message: "invalid RPC request id" }, fromPeer);
+			return;
+		}
+		const validCommand =
+			resultType === "rpc-mutation-result"
+				? isRpcMutationCommand(command)
+				: resultType === "rpc-read-result"
+					? isRpcReadCommand(command)
+					: isRpcMutationCommand(command) || isRpcReadCommand(command);
+		if (!validCommand) {
+			this.#socket?.send({ t: "error", message: "invalid RPC command classification" }, fromPeer);
+			return;
+		}
+		const requestKey = `${fromPeer}:${requestId}`;
+		if (this.#activeRpcRequests.has(requestKey) || this.#activeRpcRequests.size >= MAX_ACTIVE_RPC_REQUESTS) {
+			await this.#sendRpcResult(
+				resultType,
+				requestId,
+				this.#rpcFailure(command, "Too many active or duplicate Collab RPC requests", "unavailable"),
+				fromPeer,
+			);
+			return;
+		}
+		this.#activeRpcRequests.add(requestKey);
+		const transition =
+			command.type === "fork" ||
+			command.type === "new_session" ||
+			command.type === "switch_session" ||
+			command.type === "branch";
+		if (transition) this.#rpcSessionTransitions.add(requestKey);
+		let result: RpcCommandDispatchResult;
+		try {
+			const peer = this.#peers.get(fromPeer);
+			if (!peer || !this.#rpcPeers.has(fromPeer)) {
+				result = { response: this.#rpcFailure(command, "Collab RPC peer is unavailable", "unavailable") };
+			} else if (isRpcMutationCommand(command) && !peer.canWrite) {
+				result = {
+					response: this.#rpcFailure(command, `${command.type} is disabled on a read-only link`, "read-only"),
+				};
+			} else if (this.#agentdManagedHost && transition) {
+				result = {
+					response: this.#rpcFailure(
+						command,
+						"Session lifecycle transitions are managed by Agentd",
+						"agentd-managed",
+					),
+				};
+			} else {
+				const authority = await this.#getRpcAuthority();
+				const handled = await authority.dispatch(command, {
+					handleCollabUiResponse: uiResponse => {
+						const pending = this.#pendingUi.get(uiResponse.reqId);
+						if (!pending) {
+							return this.#rpcFailure(uiResponse, `Unknown Collab UI request: ${uiResponse.reqId}`, "not-found");
+						}
+						pending.settle({ kind: "answered", value: uiResponse.value });
+						return {
+							id: uiResponse.id,
+							type: "response",
+							command: "collab_ui_response",
+							success: true,
+						};
+					},
+				});
+				result = "response" in handled ? handled : { response: handled };
+			}
+		} catch (error) {
+			result = {
+				response: this.#rpcFailure(
+					command,
+					error instanceof Error ? error.message : String(error),
+					isRpcMutationCommand(command) ? "ambiguous" : "unavailable",
+				),
+			};
+		}
+		try {
+			await this.#sendRpcResult(resultType, requestId, result.response, fromPeer);
+			const currentSessionId = this.#ctx.sessionManager.getSessionId();
+			if (currentSessionId !== this.#sessionId) this.#sessionId = currentSessionId;
+			await result.afterResponse?.();
+		} finally {
+			this.#activeRpcRequests.delete(requestKey);
+			this.#rpcSessionTransitions.delete(requestKey);
+		}
+	}
+
+	async #sendRpcResult(
+		resultType: RpcResultFrameType,
+		requestId: number,
+		response: RpcResponse,
+		fromPeer: number,
+	): Promise<void> {
+		const socket = this.#socket;
+		if (!socket) throw new Error("Collab transport closed before the RPC response was sent");
+		const frame: CollabFrame =
+			resultType === "rpc-result"
+				? { t: "rpc-result", requestId, response }
+				: resultType === "rpc-mutation-result"
+					? { t: "rpc-mutation-result", requestId, response }
+					: { t: "rpc-read-result", requestId, response };
+		sendCollabRpcFrame(socket, frame, fromPeer);
+		await socket.flush?.();
 	}
 
 	#handleUiResponse(reqId: number, value: CollabUiResponseValue, fromPeer: number): void {
@@ -518,9 +810,29 @@ export class CollabHost {
 			.catch(err => logger.warn("collab guest abort failed", { error: String(err) }));
 	}
 
+	#setPeerAuthority(peerId: number, canWrite: boolean): void {
+		if (!this.#rpcAuthorityPromise) return;
+		this.#localPeerAuthority.set(peerId, canWrite);
+		const peer = this.#peers.get(peerId);
+		if (!peer || peer.canWrite === canWrite) return;
+		peer.canWrite = canWrite;
+		this.#socket?.send({ t: "authority", canWrite }, peerId);
+		if (canWrite) {
+			for (const pending of this.#pendingUi.values()) {
+				this.#socket?.send({ t: "ui-request", request: pending.request }, peerId);
+			}
+		}
+		this.#scheduleStateBroadcast();
+	}
+
 	#handlePeerLeft(peer: number): void {
 		const name = this.#peers.get(peer)?.name;
 		this.#peers.delete(peer);
+		this.#rpcPeers.delete(peer);
+		this.#localPeerAuthority.delete(peer);
+		for (const requestKey of this.#activeRpcRequests) {
+			if (requestKey.startsWith(`${peer}:`)) this.#activeRpcRequests.delete(requestKey);
+		}
 		if (name) this.#ctx.session.emitNotice("info", `${name} left the collab session`, "collab");
 		this.#updateStatusSegment();
 		this.#scheduleStateBroadcast();

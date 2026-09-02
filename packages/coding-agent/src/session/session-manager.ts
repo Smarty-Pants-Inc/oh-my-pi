@@ -1285,6 +1285,11 @@ export class SessionManager {
 		return this.#blobs.putSync(data, options);
 	}
 
+	/** Native content-addressed store used by session persistence and RPC adapters. */
+	getBlobStore(): BlobStore {
+		return this.#blobs;
+	}
+
 	captureState(): SessionManagerStateSnapshot {
 		return {
 			cwd: this.#cwd,

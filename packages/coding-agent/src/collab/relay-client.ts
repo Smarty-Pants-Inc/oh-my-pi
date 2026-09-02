@@ -25,18 +25,33 @@ const WS_BACKPRESSURE_THRESHOLD = 64 * 1024;
 const WS_BACKPRESSURE_DRAIN_THRESHOLD = 32 * 1024;
 const WS_BACKPRESSURE_DRAIN_RETRY_MS = 25;
 
+/** Private transport control used by trusted local embedders; public relays never emit it. */
+export type CollabTransportControl = RelayControlMessage | { t: "peer-authority"; peer: number; canWrite: boolean };
+
 export interface CollabSocketOptions {
 	/** wss://host[:port]/r/<roomId> — no query string. */
 	wsUrl: string;
 	role: "host" | "guest";
 	key: CryptoKey;
 }
+/** Common transport surface for encrypted relay and trusted local bridge links. */
+export interface CollabTransport {
+	onOpen?: () => void;
+	onFrame?: (frame: CollabFrame, fromPeer: number) => void;
+	onControl?: (msg: CollabTransportControl) => void;
+	onClose?: (reason: string, willReconnect: boolean) => void;
+	connect(): void;
+	send(frame: CollabFrame, targetPeer?: number): void;
+	/** Resolve after every previously accepted frame has reached the underlying transport. */
+	flush?(): Promise<void>;
+	close(): void;
+}
 
 export class CollabSocket {
 	/** Fires after every successful (re)connect. */
 	onOpen?: () => void;
 	onFrame?: (frame: CollabFrame, fromPeer: number) => void;
-	onControl?: (msg: RelayControlMessage) => void;
+	onControl?: (msg: CollabTransportControl) => void;
 	/** Fires once per terminal close (intentional, fatal code, or bad key). willReconnect=true for transient drops that will retry. */
 	onClose?: (reason: string, willReconnect: boolean) => void;
 

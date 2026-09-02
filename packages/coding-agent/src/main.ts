@@ -31,6 +31,10 @@ import { buildInitialMessage } from "./cli/initial-message";
 import { selectSession } from "./cli/session-picker";
 import { applyStartupCwd } from "./cli/startup-cwd";
 import { getLatestRelease } from "./cli/update-cli";
+import type { ManagedHerdrHostBridge } from "./collab/herdr-host-lifecycle";
+import type { CollabRpcGuestBridge } from "./collab/rpc-guest";
+import { runCollabRpcGuest } from "./collab/rpc-guest";
+import { runCollabRpcHost } from "./collab/rpc-host";
 import { findConfigFile } from "./config";
 import { ModelRegistry } from "./config/model-registry";
 import {
@@ -1380,6 +1384,8 @@ interface RunRootCommandDependencies {
 	createForeignSessionStore?: (source: ForeignSessionSource) => ForeignSessionStore;
 	settings?: Settings;
 	forceSetupWizard?: boolean;
+	collabRpcGuest?: CollabRpcGuestBridge;
+	collabRpcHost?: ManagedHerdrHostBridge;
 }
 const DEFAULT_RUN_ROOT_DEPENDENCIES: RunRootCommandDependencies = {};
 
@@ -2015,7 +2021,7 @@ export async function runRootCommand(
 				notifs.push({ kind: "error", message: modelRegistryError.message });
 			}
 
-			if (!isInteractive && !session.model) {
+			if (!isInteractive && !session.model && !deps.collabRpcGuest) {
 				if (modelRegistryError) {
 					process.stderr.write(`${chalk.red(modelRegistryError.message)}\n\n`);
 				}
@@ -2031,10 +2037,22 @@ export async function runRootCommand(
 			}
 
 			if (mode === "rpc" || mode === "rpc-ui") {
-				// Branch-only protocol runner: keep RPC host code out of normal interactive startup.
-				const runRpcMode: RunRpcMode = (await import("./modes/rpc/rpc-mode")).runRpcMode;
 				stopStartupWatchdog();
-				await runRpcMode(session, mode === "rpc-ui" ? setToolUIContext : undefined, subagentEventBus, rpcInput);
+				if (deps.collabRpcGuest) {
+					await runCollabRpcGuest(session, deps.collabRpcGuest, subagentEventBus, rpcInput);
+				} else if (deps.collabRpcHost) {
+					await runCollabRpcHost(
+						session,
+						deps.collabRpcHost,
+						mode === "rpc-ui" ? setToolUIContext : undefined,
+						subagentEventBus,
+						rpcInput,
+					);
+				} else {
+					// Branch-only protocol runner: keep RPC host code out of normal interactive startup.
+					const runRpcMode: RunRpcMode = (await import("./modes/rpc/rpc-mode")).runRpcMode;
+					await runRpcMode(session, mode === "rpc-ui" ? setToolUIContext : undefined, subagentEventBus, rpcInput);
+				}
 			} else if (isInteractive) {
 				const versionCheckPromise = checkForNewVersion(VERSION).catch(() => undefined);
 				const startupChangelog = await startupChangelogPromise;

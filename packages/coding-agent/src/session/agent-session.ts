@@ -416,6 +416,28 @@ type MessageEndPersistenceSlot = {
 
 type PostPromptSkipReason = "aborted" | "stale-generation";
 
+export type CustomMessageAdmissionDisposition =
+	| { status: "accepted"; delivery: "queued_steer" | "plain_append" }
+	| { status: "unavailable"; reason: "session_busy" | "session_closed" };
+
+export type CustomMessageAdmissionOptions = {
+	deliveryMode: "steer";
+	when?: "idle" | "any";
+	triggerTurn?: never;
+	deliverAs?: never;
+	queueChipText?: never;
+	acceptTerminalEmptyStop?: never;
+};
+
+type LegacyCustomMessageOptions = {
+	deliveryMode?: undefined;
+	when?: undefined;
+	triggerTurn?: boolean;
+	deliverAs?: "steer" | "followUp" | "nextTurn";
+	queueChipText?: string;
+	acceptTerminalEmptyStop?: boolean;
+};
+
 type AgentContinueSkipReason =
 	| PostPromptSkipReason
 	| "session-unavailable"
@@ -1799,12 +1821,8 @@ export class AgentSession {
 		this.#toolChoiceQueue.clearPendingInvokers();
 	}
 
-	/**
-	 * Force the next model call to target a specific active tool, then terminate
-	 * the agent loop. Pushes a two-step sequence [forced, "none"] so the model
-	 * calls exactly the forced tool once and then cannot call another.
-	 */
-	setForcedToolChoice(toolName: string): void {
+	/** Resolve one exact active tool name to the current provider's native choice shape. */
+	resolveNamedToolChoice(toolName: string): ToolChoice {
 		if (!this.getActiveToolNames().includes(toolName)) {
 			throw new Error(`Tool "${toolName}" is not currently active.`);
 		}
@@ -1813,7 +1831,16 @@ export class AgentSession {
 		if (!forced || typeof forced === "string") {
 			throw new Error("Current model does not support forcing a specific tool.");
 		}
+		return forced;
+	}
 
+	/**
+	 * Force the next model call to target a specific active tool, then terminate
+	 * the agent loop. Pushes a two-step sequence [forced, "none"] so the model
+	 * calls exactly the forced tool once and then cannot call another.
+	 */
+	setForcedToolChoice(toolName: string): void {
+		const forced = this.resolveNamedToolChoice(toolName);
 		this.#toolChoiceQueue.pushSequence([forced, "none"], {
 			label: "user-force",
 			onRejected: info => (info.reason === "unavailable" ? "drop_sequence" : "requeue"),
@@ -5138,6 +5165,17 @@ export class AgentSession {
 		return this.#providerBoundary.buildDisplaySessionContext();
 	}
 
+	/** Reload a trusted replicated transcript without lifecycle hooks, cancellation, or provider mutation. */
+	async reloadReplicatedSession(sessionPath: string): Promise<void> {
+		await this.sessionManager.setSessionFile(sessionPath);
+		this.refreshReplicatedSessionContext();
+	}
+
+	/** Rebuild visible conversation semantics after ingesting a replicated transcript entry. */
+	refreshReplicatedSessionContext(): void {
+		this.agent.replaceMessages(this.buildDisplaySessionContext().messages);
+	}
+
 	/**
 	 * Transcript for TUI display. Full history is kept for export/resume-style
 	 * callers; live chat can collapse compacted history to keep the hot render
@@ -6696,21 +6734,24 @@ export class AgentSession {
 	 * - Not streaming + triggerTurn: appends to state/session, starts new turn unless the client cannot own it
 	 * - Not streaming + no trigger: appends to state/session, no turn
 	 *
-	 * @returns true iff this call synchronously started a new turn (awaited
-	 * `agent.prompt`); false when the message was queued/appended without a turn
-	 * — including when `triggerTurn` is downgraded because the client defers
-	 * agent-initiated turns. Callers that must mirror the resulting `agent_end`
-	 * use this to avoid acting on a turn that never ran.
+	 * Legacy calls return whether they synchronously started a turn. The RPC-only
+	 * semantic-steer overload instead returns the receiver-state admission result.
 	 */
 	async sendCustomMessage<T = unknown>(
 		message: CustomMessagePayload<T>,
-		options?: {
-			triggerTurn?: boolean;
-			deliverAs?: "steer" | "followUp" | "nextTurn";
-			queueChipText?: string;
-			acceptTerminalEmptyStop?: boolean;
-		},
-	): Promise<boolean> {
+		options: CustomMessageAdmissionOptions,
+	): Promise<CustomMessageAdmissionDisposition>;
+	async sendCustomMessage<T = unknown>(
+		message: CustomMessagePayload<T>,
+		options?: LegacyCustomMessageOptions,
+	): Promise<boolean>;
+	async sendCustomMessage<T = unknown>(
+		message: CustomMessagePayload<T>,
+		options?: LegacyCustomMessageOptions | CustomMessageAdmissionOptions,
+	): Promise<boolean | CustomMessageAdmissionDisposition> {
+		const semanticOptions: CustomMessageAdmissionOptions | undefined =
+			options?.deliveryMode === "steer" ? options : undefined;
+		if (semanticOptions && this.#isDisposed) return { status: "unavailable", reason: "session_closed" };
 		const normalizedPayload = normalizeCustomMessagePayload<T>(message);
 		const details =
 			options?.queueChipText && options.deliverAs !== "nextTurn"
@@ -6731,6 +6772,27 @@ export class AgentSession {
 			timestamp: Date.now(),
 		};
 		const normalizedAppMessage = await this.#normalizeAgentMessageImages(appMessage);
+		if (semanticOptions) {
+			if (this.#isDisposed) return { status: "unavailable", reason: "session_closed" };
+			if (semanticOptions.when === "idle" && this.isStreaming) {
+				return { status: "unavailable", reason: "session_busy" };
+			}
+			if (this.isStreaming) {
+				this.#allowQueuedMessageDrainRetry();
+				this.agent.steer(normalizedAppMessage);
+				this.#scheduleIdleQueueDrain();
+				return { status: "accepted", delivery: "queued_steer" };
+			}
+			this.agent.appendMessage(normalizedAppMessage);
+			this.sessionManager.appendCustomMessageEntry(
+				normalizedAppMessage.customType,
+				normalizedAppMessage.content,
+				normalizedAppMessage.display,
+				normalizedAppMessage.details,
+				normalizedAppMessage.attribution,
+			);
+			return { status: "accepted", delivery: "plain_append" };
+		}
 		if (this.isStreaming) {
 			if (options?.deliverAs === "nextTurn") {
 				this.#queueHiddenNextTurnMessage(normalizedAppMessage, options?.triggerTurn ?? false);
@@ -7299,13 +7361,17 @@ export class AgentSession {
 	}
 
 	/**
-	 * Fork the current session, creating a new session file with the exact same state.
-	 * Copies all entries and artifacts to the new session.
-	 * Unlike newSession(), this preserves all messages in the agent state.
+	 * Fork the current session into a new persisted session.
+	 * Without `entryId`, preserves the full tree and current messages. With `entryId`,
+	 * materializes only the canonical root-to-entry path. Artifacts are copied in both cases.
 	 * @returns true if completed, false if cancelled by hook or not persisting
 	 */
-	async fork(): Promise<boolean> {
+	async fork(deferSessionChange?: (publish: () => void) => void, options?: { entryId?: string }): Promise<boolean> {
 		this.#assertVibeSessionTransitionAllowed("fork the session");
+		const entryId = options?.entryId;
+		if (entryId !== undefined && !this.sessionManager.getEntry(entryId)) {
+			throw new Error(`Entry ${entryId} not found`);
+		}
 		const previousSessionFile = this.sessionFile;
 		const previousSessionId = this.sessionManager.getSessionId();
 
@@ -7332,10 +7398,17 @@ export class AgentSession {
 			await this.#advisors.drainAndDetachRecorders();
 			const bashTransition = this.#bash.beginSessionTransition();
 
-			// Fork the session (creates new session file with same entries)
+			// Fork the whole session, or materialize the exact canonical branch requested by agentd.
 			let forkResult: { oldSessionFile: string; newSessionFile: string } | undefined;
 			try {
-				forkResult = await this.sessionManager.fork();
+				if (entryId === undefined) {
+					forkResult = await this.sessionManager.fork();
+				} else {
+					const newSessionFile = this.sessionManager.createBranchedSession(entryId);
+					if (previousSessionFile && newSessionFile) {
+						forkResult = { oldSessionFile: previousSessionFile, newSessionFile };
+					}
+				}
 			} catch (error) {
 				this.#bash.finishSessionTransition(bashTransition, false);
 				throw error;
@@ -7355,10 +7428,17 @@ export class AgentSession {
 			// Update agent session ID
 			this.#freshProviderSessionId = undefined;
 			this.#adoptInheritedProviderPromptCacheKey();
-			this.#syncAgentSessionId();
+			this.#syncAgentSessionId(undefined, false);
 			this.#memory.rekeyForCurrentSessionId();
 			this.#advisors.reattachRecorderFeeds();
 			advisorRecordersDetached = false;
+			if (entryId !== undefined) {
+				const sessionContext = this.buildDisplaySessionContext();
+				this.agent.replaceMessages(sessionContext.messages);
+				this.#rehydrateCheckpointRewindState();
+				this.#todo.syncFromBranch();
+				this.#closeCodexProviderSessionsForHistoryRewrite();
+			}
 			await this.#memory.resetContextForNewTranscript();
 
 			// Emit session_switch event with reason "fork" to hooks
@@ -7369,6 +7449,10 @@ export class AgentSession {
 					previousSessionFile,
 				});
 			}
+
+			const publishSessionChange = () => this.#notifySessionChangeCallbacks();
+			if (deferSessionChange) deferSessionChange(publishSessionChange);
+			else publishSessionChange();
 
 			return true;
 		} finally {
@@ -8692,7 +8776,7 @@ export class AgentSession {
 			this.#todo.syncFromBranch();
 			this.#freshProviderSessionId = undefined;
 			this.#clearInheritedProviderPromptCacheKey();
-			this.#syncAgentSessionId();
+			this.#syncAgentSessionId(undefined, false);
 			this.#memory.rekeyForCurrentSessionId();
 			await this.#memory.resetContextForNewTranscript();
 
@@ -8712,6 +8796,8 @@ export class AgentSession {
 				this.#advisors.resetSessionState();
 				this.#closeCodexProviderSessionsForHistoryRewrite();
 			}
+
+			this.#notifySessionChangeCallbacks();
 
 			this.#advisors.reattachRecorderFeeds();
 			advisorRecordersDetached = false;
@@ -8822,7 +8908,7 @@ export class AgentSession {
 			this.sessionManager.appendMessage(sanitizeAssistantForReparentedHistory(assistantMessage));
 			this.#todo.syncFromBranch();
 			this.#freshProviderSessionId = undefined;
-			this.#syncAgentSessionId();
+			this.#syncAgentSessionId(undefined, false);
 			this.#memory.rekeyForCurrentSessionId();
 			await this.#memory.resetContextForNewTranscript();
 
@@ -8838,6 +8924,8 @@ export class AgentSession {
 			this.agent.replaceMessages(sessionContext.messages);
 			this.#advisors.resetSessionState();
 			this.#closeCodexProviderSessionsForHistoryRewrite();
+
+			this.#notifySessionChangeCallbacks();
 			advisorRecordersDetached = false;
 
 			return { cancelled: false, sessionFile: this.sessionFile };
