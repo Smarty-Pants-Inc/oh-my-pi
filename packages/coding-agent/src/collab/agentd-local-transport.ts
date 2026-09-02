@@ -44,10 +44,10 @@ const AGENTD_BRIDGE_ENV_KEYS = [
 
 /** Capture the redeemed direct tuple once, then remove every bridge claim from the child environment. */
 export function captureHerdrAgentdHostBridge(
+	token: string | undefined,
 	env: Record<string, string | undefined> = process.env,
 ): RpcHerdrAgentdHostBridge {
 	const address = env.HERDR_OMP_BRIDGE;
-	const token = env.HERDR_OMP_BRIDGE_TOKEN;
 	const paneId = env.HERDR_PANE_ID;
 	const routeGeneration = Number(env.HERDR_OMP_ROUTE_GENERATION);
 	for (const key of AGENTD_BRIDGE_ENV_KEYS) delete env[key];

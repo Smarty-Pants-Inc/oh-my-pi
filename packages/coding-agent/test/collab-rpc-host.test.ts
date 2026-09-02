@@ -227,7 +227,7 @@ describe("hidden agentd RPC host bootstrap", () => {
 			HERDR_OMP_GUEST_BRIDGE_TOKEN: "guest-secret",
 		};
 
-		expect(captureHerdrAgentdHostBridge(env)).toEqual({
+		expect(captureHerdrAgentdHostBridge(env.HERDR_OMP_BRIDGE_TOKEN, env)).toEqual({
 			address: "127.0.0.1:43123",
 			paneId: "pane-7",
 			routeGeneration: 3,
@@ -244,7 +244,9 @@ describe("hidden agentd RPC host bootstrap", () => {
 			HERDR_OMP_ROUTE_GENERATION: "1",
 		};
 
-		expect(() => captureHerdrAgentdHostBridge(env)).toThrow("valid direct Herdr bridge tuple");
+		expect(() => captureHerdrAgentdHostBridge(env.HERDR_OMP_BRIDGE_TOKEN, env)).toThrow(
+			"valid direct Herdr bridge tuple",
+		);
 		for (const key of BRIDGE_ENV_KEYS) expect(env[key]).toBeUndefined();
 	});
 

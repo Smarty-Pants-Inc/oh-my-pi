@@ -38,6 +38,7 @@ import {
 	type HerdrHostBridgeBootstrap,
 	handoffHerdrGuestBridgeToken,
 	handoffHerdrHostBridge,
+	handoffHerdrHostBridgeToken,
 } from "./collab/herdr-bridge-bootstrap";
 import { startJsEvalProcess } from "./eval/js/process-entry";
 import type { WorkerInbound as JsWorkerInbound, WorkerOutbound as JsWorkerOutbound } from "./eval/js/worker-protocol";
@@ -351,11 +352,13 @@ async function runTinyWorker(): Promise<void> {
 /** Run the CLI with the given argv (no `process.argv` prefix). */
 export async function runCli(argv: string[]): Promise<void> {
 	let capturedHerdrHostBridge: HerdrHostBridgeBootstrap | undefined;
+	let capturedHerdrHostBridgeToken: string | undefined;
 	let capturedHerdrGuestBridgeToken: string | undefined;
 	let resolvedArgv = argv;
 	try {
 		const bootstrap = captureHerdrBridgeBootstrap();
 		capturedHerdrHostBridge = bootstrap.hostBridge;
+		capturedHerdrHostBridgeToken = bootstrap.hostBridgeToken;
 		capturedHerdrGuestBridgeToken = bootstrap.guestBridgeToken;
 		const extracted = extractProfileFlags(resolvedArgv);
 		resolvedArgv = extracted.argv;
@@ -476,7 +479,10 @@ export async function runCli(argv: string[]): Promise<void> {
 		if (command === "launch" || command === "join" || command === "__collab-host-bridge") {
 			handoffHerdrHostBridge(capturedHerdrHostBridge);
 		}
-		if (command === "__collab-guest-bridge") {
+		if (command === "__collab-rpc-host") {
+			handoffHerdrHostBridgeToken(capturedHerdrHostBridgeToken);
+		}
+		if (command === "__collab-guest-bridge" || command === "__collab-rpc-guest") {
 			handoffHerdrGuestBridgeToken(capturedHerdrGuestBridgeToken);
 		}
 		await run({ bin: APP_NAME, version: VERSION, argv: resolved.argv, commands, metadataHelp: showHelp });

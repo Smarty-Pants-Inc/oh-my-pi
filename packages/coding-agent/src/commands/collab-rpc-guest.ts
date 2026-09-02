@@ -1,6 +1,7 @@
 import { Command } from "@oh-my-pi/pi-utils/cli";
 import type { Args } from "../cli/args";
 import { parseArgs, reportCliUsageError } from "../cli/args";
+import { takeHerdrGuestBridgeToken } from "../collab/herdr-bridge-bootstrap";
 import { runRootCommand } from "../main";
 /** Owner-only entry point for an adopted agentd Collab session. */
 export class CollabRpcGuestCommand extends Command {
@@ -8,12 +9,11 @@ export class CollabRpcGuestCommand extends Command {
 	static strict = false;
 
 	async run(): Promise<void> {
+		const token = takeHerdrGuestBridgeToken();
 		const [address, roomId, ...argv] = this.argv;
 		if (!address || !roomId || argv[0] !== "--token-env" || argv.includes("--token-env", 1)) {
 			throw new Error("__collab-rpc-guest requires <bridge-address> <room-id> --token-env");
 		}
-		const token = process.env.HERDR_OMP_GUEST_BRIDGE_TOKEN;
-		delete process.env.HERDR_OMP_GUEST_BRIDGE_TOKEN;
 		if (!token || token.trim() !== token || token.includes("\0")) {
 			throw new Error("__collab-rpc-guest requires HERDR_OMP_GUEST_BRIDGE_TOKEN");
 		}
