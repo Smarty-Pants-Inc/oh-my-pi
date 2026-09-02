@@ -315,7 +315,6 @@ describe("AgentSession concurrent prompt guard", () => {
 	it("rejects reentrant extension compaction throughout scoped semantic acceptance", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const compactErrors: string[] = [];
-		let current: AgentSession;
 		let handlerActive = false;
 		const extensionRunner = {
 			hasHandlers: vi.fn((eventType: string) => eventType === "message_end"),
@@ -346,7 +345,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			streamFn: createMockModel({ handler: () => ({ content: ["Done"] }) }).stream,
 			convertToLlm,
 		});
-		current = new AgentSession({
+		const current = new AgentSession({
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated(),
@@ -2885,7 +2884,6 @@ describe("AgentSession concurrent prompt guard", () => {
 		const extensionRuntime = new ExtensionRuntime();
 		let mutatorCalls = 0;
 		let commandCalls = 0;
-		let sourceFile: string | undefined;
 		let childFile: string | undefined;
 		let childTurn: Promise<unknown> | undefined;
 		const childGoal = {
@@ -3012,7 +3010,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			extensionRunner,
 			toolRegistry: new Map(tools.map(tool => [tool.name, tool])),
 		});
-		sourceFile = session.sessionFile;
+		const sourceFile = session.sessionFile;
 		if (!sourceFile) throw new Error("Expected persisted source session");
 		await initializeExtensions(session, {
 			reportSendError: (_action, error) => {
@@ -5058,5 +5056,144 @@ describe("AgentSession TTSR resume gate", () => {
 		expect(session.model?.id).toBe(largeModel.id);
 		expect(session.isStreaming).toBe(false);
 		expect(extensionRunner.emitSessionStop).toHaveBeenCalledTimes(1);
+	});
+});
+
+describe("AgentSession semantic custom-message admission", () => {
+	let session: AgentSession | undefined;
+
+	afterEach(async () => {
+		await session?.dispose();
+		vi.restoreAllMocks();
+	});
+
+	it("persists an admitted idle steer without starting a prompt", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: createMockModel({ handler: () => ({ content: ["unused"] }) }).stream,
+			convertToLlm,
+		});
+		const sessionManager = SessionManager.inMemory();
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated(),
+			modelRegistry: sharedModelRegistry,
+		});
+
+		expect(
+			await session.sendCustomMessage({ customType: "rpc", content: "idle message" }, { deliveryMode: "steer" }),
+		).toEqual({ status: "accepted", delivery: "plain_append" });
+		expect(session.messages.at(-1)).toMatchObject({ role: "custom", content: "idle message" });
+		expect(sessionManager.getEntries().at(-1)).toMatchObject({ type: "custom_message", content: "idle message" });
+	});
+
+	it("queues an admitted steer while streaming", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: createMockModel({ handler: () => ({ content: ["unused"] }) }).stream,
+			convertToLlm,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			modelRegistry: sharedModelRegistry,
+		});
+		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => true });
+		expect(
+			await session.sendCustomMessage(
+				{ customType: "rpc", content: "busy message" },
+				{
+					deliveryMode: "steer",
+					when: "idle",
+				},
+			),
+		).toEqual({ status: "unavailable", reason: "session_busy" });
+
+		expect(
+			await session.sendCustomMessage({ customType: "rpc", content: "queued message" }, { deliveryMode: "steer" }),
+		).toEqual({ status: "accepted", delivery: "queued_steer" });
+		expect(session.agent.peekSteeringQueue()).toMatchObject([{ role: "custom", content: "queued message" }]);
+	});
+
+	it("rejects semantic admission after disposal", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: createMockModel({ handler: () => ({ content: ["unused"] }) }).stream,
+			convertToLlm,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			modelRegistry: sharedModelRegistry,
+		});
+		await session.dispose();
+
+		expect(
+			await session.sendCustomMessage({ customType: "rpc", content: "closed message" }, { deliveryMode: "steer" }),
+		).toEqual({ status: "unavailable", reason: "session_transition" });
+	});
+});
+
+describe("AgentSession committed session-change callbacks", () => {
+	it("rebinds only after a fork's session-switch hook commits", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const switchStarted = Promise.withResolvers<void>();
+		const switchReleased = Promise.withResolvers<void>();
+		const extensionRunner = {
+			emit: vi.fn((event: { type: string }) => {
+				if (event.type !== "session_switch") return Promise.resolve(undefined);
+				switchStarted.resolve();
+				return switchReleased.promise;
+			}),
+			emitBeforeSessionMutation: vi.fn().mockResolvedValue(undefined),
+			emitWithHostCompletion: vi.fn(async (_event: { type: string }, completion?: () => void | Promise<void>) =>
+				completion?.(),
+			),
+			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
+			hasHandlers: vi.fn(() => false),
+		} as unknown as ExtensionRunner;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: createMockModel({ handler: () => ({ content: ["done"] }) }).stream,
+			convertToLlm,
+		});
+		const tempDir = path.join(os.tmpdir(), `pi-session-change-test-${Snowflake.next()}`);
+		fs.mkdirSync(tempDir, { recursive: true });
+		const sessionManager = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+		const session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated(),
+			modelRegistry: sharedModelRegistry,
+			extensionRunner,
+		});
+		let rebinds = 0;
+		session.registerSessionChangeCallback(() => {
+			rebinds++;
+		});
+
+		try {
+			await session.prompt("Persist the source session");
+			const fork = session.fork();
+			await switchStarted.promise;
+			expect(rebinds).toBe(0);
+			switchReleased.resolve();
+			expect(await fork).toBe(true);
+			expect(rebinds).toBe(1);
+		} finally {
+			switchReleased.resolve();
+			await session.dispose();
+			removeSyncWithRetries(tempDir);
+		}
 	});
 });

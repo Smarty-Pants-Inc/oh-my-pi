@@ -162,7 +162,6 @@ describe("AgentSession plan-mode convergence", () => {
 			: [askTool, writeTool, readTool];
 		let deviceOnlyWrite = options?.deviceOnlyWrite === true;
 		let pendingFullWriteDescription = false;
-		let currentAgent: Agent | undefined;
 		const xdev: XdevState | undefined = options?.xdev
 			? {
 					tools: toolRegistry,
@@ -183,7 +182,7 @@ describe("AgentSession plan-mode convergence", () => {
 			},
 			streamFn: mock.stream,
 		});
-		currentAgent = agent;
+		const currentAgent = agent;
 
 		let advisorMock: MockModel | undefined;
 		let advisorStreamFn: StreamFn | undefined;

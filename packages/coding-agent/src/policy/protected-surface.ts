@@ -495,8 +495,17 @@ const PATH_RULES: readonly PathRule[] = [
 	},
 	{
 		pattern:
-			/(?:^|\/)packages\/coding-agent\/src\/modes\/components\/(?:agent-hub|agent-transcript-viewer)\.[cm]?[jt]s$/i,
+			/(?:^|\/)packages\/coding-agent\/src\/(?:activity\/index|modes\/components\/(?:agent-hub|agent-transcript-viewer))\.[cm]?[jt]s$/i,
 		surface: "subagent",
+	},
+	{
+		pattern:
+			/(?:^|\/)packages\/coding-agent\/src\/modes\/rpc\/(?:rpc-history|rpc-identity|rpc-mutation|rpc-session-data|rpc-state|rpc-types)\.[cm]?[jt]s$/i,
+		surface: "provider-wrapper",
+	},
+	{
+		pattern: /(?:^|\/)packages\/coding-agent\/src\/session\/inline-edit-recovery\.[cm]?[jt]s$/i,
+		surface: "provider-wrapper",
 	},
 	{
 		pattern: /(?:^|\/)packages\/coding-agent\/src\/cli\/(?:flag-tables|profile-bootstrap|startup-cwd)\.[cm]?[jt]s$/i,

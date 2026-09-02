@@ -382,7 +382,6 @@ it("clears the active public guest when a reconnect ends before welcome so the p
 	globalThis.WebSocket = CapturingWebSocket as unknown as typeof WebSocket;
 
 	const order: string[] = [];
-	let ctx: InteractiveModeContext | undefined;
 	let collabGuestAtResume: InteractiveModeContext["collabGuest"] | "not called" = "not called";
 	const h = await openHarness({
 		returnSessionFile: "/local/session.jsonl",
@@ -398,7 +397,7 @@ it("clears the active public guest when a reconnect ends before welcome so the p
 			},
 		},
 	});
-	ctx = h.ctx;
+	const ctx = h.ctx;
 	expect(guestSockets).toHaveLength(1);
 	expect(h.ctx.collabGuest).toBe(h.guest);
 

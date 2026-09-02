@@ -43,17 +43,16 @@ if (Bun.env.MOCK_RPC_EXIT_BEFORE_READY) {
 
 let protocolV2Enabled = false;
 process.stdout.write(
-	`${JSON.stringify(
-		supportsProtocolV2
-			? {
-					type: "ready",
-					protocolVersion: 1,
-					supportedProtocolVersions: [1, 2],
-					maxFrameBytes: 1024 * 1024,
-					maxReassembledFrameBytes: 64 * 1024 * 1024,
-				}
-			: { type: "ready" },
-	)}\n`,
+	`${JSON.stringify({
+		type: "ready",
+		buildId: "mock-rpc-agent",
+		version: "test",
+		protocolVersion: 1,
+		supportedProtocolVersions: [1, 2],
+		capabilities: ["stdio-rpc", "messages-page"],
+		maxFrameBytes: 1024 * 1024,
+		maxReassembledFrameBytes: 64 * 1024 * 1024,
+	})}\n`,
 );
 
 function writeFrame(frame: Record<string, unknown>): void {
@@ -84,15 +83,6 @@ for await (const raw of console) {
 	try {
 		const frame = JSON.parse(raw) as Record<string, unknown>;
 		if (frame && typeof frame === "object" && typeof frame.type === "string") {
-			if (Bun.env.MOCK_RPC_EXIT_ON_COMMAND) {
-				process.stderr.write(Bun.env.MOCK_RPC_EXIT_STDERR ?? "");
-				process.exit(Number(Bun.env.MOCK_RPC_EXIT_ON_COMMAND));
-			}
-			if (Bun.env.MOCK_RPC_INVALID_OUTPUT === "1") {
-				process.stdout.write("{invalid-json\n");
-				continue;
-			}
-			if (Bun.env.MOCK_RPC_IGNORE_COMMANDS === "1") continue;
 			const id = typeof frame.id === "string" ? frame.id : undefined;
 			if (frame.type === "negotiate_protocol" && frame.protocolVersion === 2) {
 				writeFrame({
@@ -105,6 +95,15 @@ for await (const raw of console) {
 				protocolV2Enabled = true;
 				continue;
 			}
+			if (Bun.env.MOCK_RPC_EXIT_ON_COMMAND) {
+				process.stderr.write(Bun.env.MOCK_RPC_EXIT_STDERR ?? "");
+				process.exit(Number(Bun.env.MOCK_RPC_EXIT_ON_COMMAND));
+			}
+			if (Bun.env.MOCK_RPC_INVALID_OUTPUT === "1") {
+				process.stdout.write("{invalid-json\n");
+				continue;
+			}
+			if (Bun.env.MOCK_RPC_IGNORE_COMMANDS === "1") continue;
 			if (frame.type === "get_messages_page") {
 				if (Bun.env.MOCK_RPC_PAGE_BUSY === "1") {
 					writeFrame({

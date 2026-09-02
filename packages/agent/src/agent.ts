@@ -1319,7 +1319,6 @@ export class Agent {
 			if (companions) this.#queuedMessageCompanions.delete(message);
 			let settled = false;
 			const restore = companions?.restore ?? (() => {});
-			let claim: InFlightQueuedMessageCompanions;
 			const seal = () => {
 				if (settled) return;
 				this.#inFlightQueuedMessageCompanions = this.#inFlightQueuedMessageCompanions.filter(
@@ -1351,7 +1350,7 @@ export class Agent {
 					claim.restore(claim.messages);
 				}
 			};
-			claim = {
+			const claim: InFlightQueuedMessageCompanions = {
 				owner: message,
 				messages: [],
 				restore,

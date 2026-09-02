@@ -521,14 +521,15 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 		state.heartbeatTimer = undefined;
 		if (state.disabled || state.quiesced || state.shutdown || generation !== state.generation) return;
 		try {
-			let ref: ManagedTimerRef | undefined;
-			const timer = ctx.setTimeout(() => {
-				if (state.heartbeatTimer !== ref) return;
-				state.heartbeatTimer = undefined;
-				if (state.disabled || state.quiesced || state.shutdown || generation !== state.generation) return;
-				sample(ctx, generation, true);
-			}, HEARTBEAT_MS);
-			ref = { ctx, timer };
+			const ref: ManagedTimerRef = {
+				ctx,
+				timer: ctx.setTimeout(() => {
+					if (state.heartbeatTimer !== ref) return;
+					state.heartbeatTimer = undefined;
+					if (state.disabled || state.quiesced || state.shutdown || generation !== state.generation) return;
+					sample(ctx, generation, true);
+				}, HEARTBEAT_MS),
+			};
 			state.heartbeatTimer = ref;
 		} catch {
 			disable("sampling_fault", 0, ctx);
@@ -623,12 +624,13 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 		const elapsed = Math.max(0, Date.now() - state.lastEmissionAt);
 		const delay = state.lastEmissionAt === 0 ? 0 : Math.max(0, EMIT_COALESCE_MS - elapsed);
 		try {
-			let ref: ManagedTimerRef | undefined;
-			const timer = ctx.setTimeout(() => {
-				if (state.emitTimer !== ref) return;
-				flushPending(ctx, generation);
-			}, delay);
-			ref = { ctx, timer };
+			const ref: ManagedTimerRef = {
+				ctx,
+				timer: ctx.setTimeout(() => {
+					if (state.emitTimer !== ref) return;
+					flushPending(ctx, generation);
+				}, delay),
+			};
 			state.emitTimer = ref;
 		} catch {
 			disable("sampling_fault", 0, ctx);
@@ -658,12 +660,13 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 		state.sampleTimer = undefined;
 		if (state.disabled || state.quiesced || state.shutdown || generation !== state.generation) return;
 		try {
-			let ref: ManagedTimerRef | undefined;
-			const timer = ctx.setInterval(() => {
-				if (state.sampleTimer !== ref) return;
-				sample(ctx, generation);
-			}, SAMPLE_INTERVAL_MS);
-			ref = { ctx, timer };
+			const ref: ManagedTimerRef = {
+				ctx,
+				timer: ctx.setInterval(() => {
+					if (state.sampleTimer !== ref) return;
+					sample(ctx, generation);
+				}, SAMPLE_INTERVAL_MS),
+			};
 			state.sampleTimer = ref;
 		} catch {
 			disable("sampling_fault", 0, ctx);
@@ -675,43 +678,44 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 		clearTimer(state.abortTimer);
 		state.abortTimer = undefined;
 		try {
-			let ref: ManagedTimerRef | undefined;
-			const timer = ctx.setTimeout(() => {
-				if (state.abortTimer !== ref) return;
-				state.abortTimer = undefined;
-				if (
-					state.disabled ||
-					state.quiesced ||
-					state.shutdown ||
-					generation !== state.generation ||
-					workEpoch !== state.workEpoch
-				)
-					return;
-				let abortResult: void | Promise<void>;
-				try {
-					abortResult = ctx.abort();
-				} catch {
-					disable("event_fault", 0, ctx);
-					return;
-				}
-				const abortPromise = Promise.resolve(abortResult);
-				state.abortPromise = abortPromise;
-				void abortPromise
-					.catch(() => {
-						if (
-							!state.disabled &&
-							!state.shutdown &&
-							generation === state.generation &&
-							workEpoch === state.workEpoch
-						) {
-							disable("event_fault", 0, ctx);
-						}
-					})
-					.finally(() => {
-						if (state.abortPromise === abortPromise) state.abortPromise = undefined;
-					});
-			}, 0);
-			ref = { ctx, timer };
+			const ref: ManagedTimerRef = {
+				ctx,
+				timer: ctx.setTimeout(() => {
+					if (state.abortTimer !== ref) return;
+					state.abortTimer = undefined;
+					if (
+						state.disabled ||
+						state.quiesced ||
+						state.shutdown ||
+						generation !== state.generation ||
+						workEpoch !== state.workEpoch
+					)
+						return;
+					let abortResult: void | Promise<void>;
+					try {
+						abortResult = ctx.abort();
+					} catch {
+						disable("event_fault", 0, ctx);
+						return;
+					}
+					const abortPromise = Promise.resolve(abortResult);
+					state.abortPromise = abortPromise;
+					void abortPromise
+						.catch(() => {
+							if (
+								!state.disabled &&
+								!state.shutdown &&
+								generation === state.generation &&
+								workEpoch === state.workEpoch
+							) {
+								disable("event_fault", 0, ctx);
+							}
+						})
+						.finally(() => {
+							if (state.abortPromise === abortPromise) state.abortPromise = undefined;
+						});
+				}, 0),
+			};
 			state.abortTimer = ref;
 		} catch {
 			disable("event_fault", 0, ctx);
@@ -721,14 +725,15 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 	const scheduleRequestedSnapshot = (ctx: ExtensionContext, generation: number): void => {
 		if (state.requestTimer || state.disabled || state.quiesced || generation !== state.generation) return;
 		try {
-			let ref: ManagedTimerRef | undefined;
-			const timer = ctx.setTimeout(() => {
-				if (state.requestTimer !== ref) return;
-				state.requestTimer = undefined;
-				if (state.disabled || state.quiesced || state.shutdown || generation !== state.generation) return;
-				sample(ctx, generation, true);
-			}, 0);
-			ref = { ctx, timer };
+			const ref: ManagedTimerRef = {
+				ctx,
+				timer: ctx.setTimeout(() => {
+					if (state.requestTimer !== ref) return;
+					state.requestTimer = undefined;
+					if (state.disabled || state.quiesced || state.shutdown || generation !== state.generation) return;
+					sample(ctx, generation, true);
+				}, 0),
+			};
 			state.requestTimer = ref;
 		} catch {
 			disable("event_fault", 0, ctx);
@@ -740,14 +745,15 @@ export function createFreshOmpCompanionController(secret: Uint8Array): FreshOmpC
 		state.commandTimer = undefined;
 		state.commandDeadline = Date.now() + COMMAND_TIMEOUT_MS;
 		try {
-			let ref: ManagedTimerRef | undefined;
-			const timer = ctx.setTimeout(() => {
-				if (state.commandTimer !== ref) return;
-				state.commandTimer = undefined;
-				if (generation !== state.generation) return;
-				discardCommandCapture();
-			}, COMMAND_TIMEOUT_MS);
-			ref = { ctx, timer };
+			const ref: ManagedTimerRef = {
+				ctx,
+				timer: ctx.setTimeout(() => {
+					if (state.commandTimer !== ref) return;
+					state.commandTimer = undefined;
+					if (generation !== state.generation) return;
+					discardCommandCapture();
+				}, COMMAND_TIMEOUT_MS),
+			};
 			state.commandTimer = ref;
 		} catch {
 			disable("parser_fault", 0, ctx);

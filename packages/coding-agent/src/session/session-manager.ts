@@ -49,6 +49,7 @@ import {
 	type LabelEntry,
 	type ModeChangeEntry,
 	type ModelChangeEntry,
+	type ModelUsageEntry,
 	type NewSessionOptions,
 	type ResetBoundaryEntry,
 	SESSION_LEAF_ENTRY_TYPE,
@@ -194,6 +195,7 @@ function taskUsageFrom(details: unknown): Usage | undefined {
 }
 
 function entryUsage(entry: SessionEntry): Usage | undefined {
+	if (entry.type === "model_usage") return entry.usage;
 	if (entry.type !== "message") return undefined;
 	const message = entry.message;
 	if (message.role === "assistant") return message.usage;
@@ -213,6 +215,19 @@ function addUsage(target: UsageStatistics, usage: Usage | undefined): void {
 	target.orchestrationCacheRead += usage.orchestration?.cacheRead ?? 0;
 	target.premiumRequests += usage.premiumRequests ?? 0;
 	target.cost += usage.cost.total;
+}
+
+/**
+ * Zero the monetary attribution on one usage record in place, leaving token
+ * counts untouched. Cost, credit meters, and premium-request counts describe
+ * billing; forks that must not inherit spend (see {@link SessionManager.forkFrom}
+ * `resetInheritedCost`) drop them while keeping the tokens compaction relies on.
+ */
+function resetUsageCost(usage: Usage | undefined): void {
+	if (!usage) return;
+	usage.cost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
+	usage.credits = undefined;
+	usage.premiumRequests = undefined;
 }
 
 function isAssistantEntry(entry: SessionEntry): boolean {
@@ -640,9 +655,9 @@ export class SessionManager {
 		}
 	}
 
-	#rememberBreadcrumb(cwd: string, sessionFile: string, fresh = false): void {
+	#rememberBreadcrumb(cwd: string, sessionFile: string, fresh = false, suppressBreadcrumb = false): void {
 		this.#breadcrumbFresh = fresh;
-		if (!this.#suppressBreadcrumb) writeTerminalBreadcrumb(cwd, sessionFile, fresh);
+		if (!this.#suppressBreadcrumb && !suppressBreadcrumb) writeTerminalBreadcrumb(cwd, sessionFile, fresh);
 	}
 
 	/**
@@ -1377,7 +1392,7 @@ export class SessionManager {
 	}
 
 	#notifySessionNameListeners(): void {
-		for (const callback of [...this.#sessionNameChangedCallbacks]) {
+		for (const callback of Array.from(this.#sessionNameChangedCallbacks)) {
 			try {
 				callback();
 			} catch (err) {
@@ -1401,6 +1416,11 @@ export class SessionManager {
 	/** Synchronous variant of {@link putBlob} for rebuild-only render paths. */
 	putBlobSync(data: Buffer, options?: BlobPutOptions): BlobPutResult {
 		return this.#blobs.putSync(data, options);
+	}
+
+	/** Native content-addressed store used by session persistence and RPC adapters. */
+	getBlobStore(): BlobStore {
+		return this.#blobs;
 	}
 
 	captureState(options: { copyJournal?: boolean } = {}): SessionManagerStateSnapshot {
@@ -1663,11 +1683,15 @@ export class SessionManager {
 		}
 	}
 	/** Switch to a different session file (resume / branch). */
-	async setSessionFile(sessionFile: string): Promise<void> {
-		await this.#setSessionFile(sessionFile);
+	async setSessionFile(sessionFile: string, options?: { suppressBreadcrumb?: boolean }): Promise<void> {
+		await this.#setSessionFile(sessionFile, undefined, options?.suppressBreadcrumb === true);
 	}
 
-	async #setSessionFile(sessionFile: string, loadedSession?: SessionLoadResult): Promise<void> {
+	async #setSessionFile(
+		sessionFile: string,
+		loadedSession?: SessionLoadResult,
+		suppressBreadcrumb = false,
+	): Promise<void> {
 		await this.#drainAndCloseWriter();
 		this.#clearDiskError();
 		this.#draftOnlySessionCleanupArmed = false;
@@ -1681,7 +1705,7 @@ export class SessionManager {
 		}
 
 		this.#sessionFile = resolvedSessionFile;
-		this.#rememberBreadcrumb(this.#cwd, resolvedSessionFile);
+		this.#rememberBreadcrumb(this.#cwd, resolvedSessionFile, false, suppressBreadcrumb);
 
 		const { entries: fileEntries, titleSlot } = loaded;
 		if (fileEntries.length === 0) {
@@ -1712,7 +1736,7 @@ export class SessionManager {
 			this.#cwd = headerCwd;
 			this.#sessionDir = path.dirname(resolvedSessionFile);
 			this.#fallbackRuntimeOnly = false;
-			this.#rememberBreadcrumb(this.#cwd, resolvedSessionFile);
+			this.#rememberBreadcrumb(this.#cwd, resolvedSessionFile, false, suppressBreadcrumb);
 		} else if (headerCwd && headerCwd !== path.resolve(this.#cwd)) {
 			// Header cwd not enterable: keep runtime cwd but mark fallback
 			// so workspace changes stay runtime-only until the transcript
@@ -2726,6 +2750,30 @@ export class SessionManager {
 		return entry.id;
 	}
 
+	/** Record usage on its initiating branch without moving a successor branch or session. */
+	appendModelUsage(
+		usage: Pick<
+			ModelUsageEntry,
+			"purpose" | "role" | "api" | "provider" | "model" | "usage" | "stopReason" | "errorMessage"
+		>,
+		owner: { sessionId: string; parentId: string | null },
+	): string | undefined {
+		if (this.#sessionId !== owner.sessionId || (owner.parentId !== null && !this.#index.has(owner.parentId))) {
+			return undefined;
+		}
+		const activeLeafId = this.#index.leafId();
+		const entry: ModelUsageEntry = {
+			type: "model_usage",
+			id: generateId(this.#index),
+			parentId: owner.parentId,
+			timestamp: nowIso(),
+			...usage,
+		};
+		this.#recordEntry(entry);
+		if (activeLeafId !== owner.parentId) this.#index.setLeaf(activeLeafId);
+		return entry.id;
+	}
+
 	/** Append a thinking level change as child of current leaf, then advance leaf. Returns entry id. */
 	appendThinkingLevelChange(thinkingLevel?: string, configured?: string): string {
 		const entry: ThinkingLevelChangeEntry = {
@@ -3250,7 +3298,12 @@ export class SessionManager {
 		cwd: string,
 		sessionDir?: string,
 		storage: SessionStorage = new FileSessionStorage(),
-		options?: { copyArtifacts?: boolean; suppressBreadcrumb?: boolean; sessionFile?: string },
+		options?: {
+			copyArtifacts?: boolean;
+			suppressBreadcrumb?: boolean;
+			sessionFile?: string;
+			resetInheritedCost?: boolean;
+		},
 	): Promise<SessionManager> {
 		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
 		const manager = new SessionManager(cwd, dir, true, storage);
@@ -3263,6 +3316,7 @@ export class SessionManager {
 
 		const sourceHeader = sourceEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
 		const journal = restoreSessionJournal(sourceEntries);
+		if (options?.resetInheritedCost) SessionManager.#resetInheritedUsageCost(journal.entries);
 		manager.#resetToNewSession(
 			{
 				parentSession: sourceHeader?.id,
@@ -3319,6 +3373,21 @@ export class SessionManager {
 			if (failures.length === 1) throw operationError;
 			throw new AggregateError(failures, "Fork failed and target cleanup was incomplete");
 		}
+	}
+
+	/**
+	 * Zero the monetary attribution (cost, credits, premium requests) on the
+	 * forked history's assistant turns and completed `task` results, in place.
+	 *
+	 * A tan fork is a fresh agent that inherits the parent's transcript purely
+	 * for context; its spend must reflect only its own work. Session cost is
+	 * derived by summing `usage.cost` over the transcript, so without this the
+	 * clone's Agent Hub row would open at the parent's entire accumulated cost.
+	 * Token counts are left intact — compaction anchors and context math depend
+	 * on them — since only billing attribution is inherited, not context size.
+	 */
+	static #resetInheritedUsageCost(history: SessionEntry[]): void {
+		for (const entry of history) resetUsageCost(entryUsage(entry));
 	}
 
 	/**

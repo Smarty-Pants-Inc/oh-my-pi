@@ -156,7 +156,7 @@ describe("Agent", () => {
 	it("classifies agent-authored steering as a parent steering message", async () => {
 		const toolSchema = type({ value: type("string") });
 		const executed: string[] = [];
-		let agent: Agent;
+		const agentRef = {} as { current: Agent };
 		const tool: AgentTool<typeof toolSchema, { value: string }> = {
 			name: "echo",
 			label: "Echo",
@@ -166,7 +166,7 @@ describe("Agent", () => {
 			async execute(_toolCallId, params) {
 				executed.push(params.value);
 				if (params.value === "first") {
-					agent.steer({
+					agentRef.current.steer({
 						role: "user",
 						content: "parent steering",
 						attribution: "agent",
@@ -190,11 +190,12 @@ describe("Agent", () => {
 				{ content: ["done"] },
 			],
 		});
-		agent = new Agent({
+		const agent = new Agent({
 			initialState: { model: mock.model, systemPrompt: ["Test"], tools: [tool], messages: [] },
 			streamFn: mock.stream,
 			interruptMode: "immediate",
 		});
+		agentRef.current = agent;
 		const events: AgentEvent[] = [];
 		const unsubscribe = agent.subscribe(event => events.push(event));
 
@@ -219,7 +220,7 @@ describe("Agent", () => {
 	it("classifies user-attributed custom steering as a queued user message", async () => {
 		const toolSchema = type({ value: type("string") });
 		const executed: string[] = [];
-		let agent: Agent;
+		const agentRef = {} as { current: Agent };
 		const tool: AgentTool<typeof toolSchema, { value: string }> = {
 			name: "echo",
 			label: "Echo",
@@ -229,7 +230,7 @@ describe("Agent", () => {
 			async execute(_toolCallId, params) {
 				executed.push(params.value);
 				if (params.value === "first") {
-					agent.steer({
+					agentRef.current.steer({
 						role: "custom",
 						customType: "visible-user-steer",
 						content: "visible custom steering",
@@ -237,7 +238,7 @@ describe("Agent", () => {
 						attribution: "user",
 						timestamp: Date.now(),
 					});
-					agent.steer({
+					agentRef.current.steer({
 						role: "user",
 						content: "normal user steering",
 						timestamp: Date.now(),
@@ -261,12 +262,13 @@ describe("Agent", () => {
 				{ content: ["done"] },
 			],
 		});
-		agent = new Agent({
+		const agent = new Agent({
 			initialState: { model: mock.model, systemPrompt: ["Test"], tools: [tool], messages: [] },
 			streamFn: mock.stream,
 			steeringMode: "one-at-a-time",
 			interruptMode: "immediate",
 		});
+		agentRef.current = agent;
 		const events: AgentEvent[] = [];
 		const unsubscribe = agent.subscribe(event => events.push(event));
 
@@ -334,7 +336,6 @@ describe("Agent", () => {
 	it("classifies hidden user-attributed custom steering as a system advisory", async () => {
 		const toolSchema = type({ value: type("string") });
 		const executed: string[] = [];
-		let agent: Agent;
 		const tool: AgentTool<typeof toolSchema, { value: string }> = {
 			name: "echo",
 			label: "Echo",
@@ -376,7 +377,7 @@ describe("Agent", () => {
 				{ content: ["visible handled"] },
 			],
 		});
-		agent = new Agent({
+		const agent = new Agent({
 			initialState: { model: mock.model, systemPrompt: ["Test"], tools: [tool], messages: [] },
 			streamFn: mock.stream,
 			steeringMode: "one-at-a-time",
@@ -421,7 +422,7 @@ describe("Agent", () => {
 		for (const scenario of cases) {
 			const toolSchema = type({ value: type("string") });
 			const executed: string[] = [];
-			let agent: Agent;
+			const agentRef = {} as { current: Agent };
 			const tool: AgentTool<typeof toolSchema, { value: string }> = {
 				name: "echo",
 				label: "Echo",
@@ -433,14 +434,14 @@ describe("Agent", () => {
 					if (params.value === "first") {
 						for (const source of scenario.order) {
 							if (source === "agent") {
-								agent.steer({
+								agentRef.current.steer({
 									role: "user",
 									content: "parent steering",
 									attribution: "agent",
 									timestamp: Date.now(),
 								});
 							} else {
-								agent.steer({
+								agentRef.current.steer({
 									role: "custom",
 									customType: "advisor",
 									content: "advisor steering",
@@ -469,11 +470,12 @@ describe("Agent", () => {
 					{ content: ["done"] },
 				],
 			});
-			agent = new Agent({
+			const agent = new Agent({
 				initialState: { model: mock.model, systemPrompt: ["Test"], tools: [tool], messages: [] },
 				streamFn: mock.stream,
 				interruptMode: "immediate",
 			});
+			agentRef.current = agent;
 			const events: AgentEvent[] = [];
 			const unsubscribe = agent.subscribe(event => events.push(event));
 
@@ -653,7 +655,6 @@ describe("Agent", () => {
 		const executed: string[] = [];
 		const secondStarted = Promise.withResolvers<void>();
 		let claim: AgentQueuedMessageClaim | undefined;
-		let agent: Agent;
 		const tool: AgentTool<typeof parameters, { value: string }> = {
 			name: "step",
 			label: "Step",
@@ -683,7 +684,7 @@ describe("Agent", () => {
 				{ content: ["done"] },
 			],
 		});
-		agent = new Agent({
+		const agent = new Agent({
 			initialState: { model: mock.model, systemPrompt: ["Test"], tools: [tool], messages: [] },
 			streamFn: mock.stream,
 			interruptMode: "immediate",

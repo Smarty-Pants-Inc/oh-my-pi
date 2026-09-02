@@ -29,9 +29,11 @@ export interface HerdrOmpBridgeEnvironment {
 
 let pendingHostBridge: HerdrHostBridgeBootstrap | undefined;
 let pendingGuestBridgeToken: string | undefined;
+let pendingHostBridgeToken: string | undefined;
 
 export interface HerdrBridgeBootstrap {
 	hostBridge?: HerdrHostBridgeBootstrap;
+	hostBridgeToken?: string;
 	guestBridgeToken?: string;
 }
 
@@ -54,12 +56,13 @@ export function captureHerdrBridgeBootstrap(
 			? { socketPath, paneId }
 			: undefined;
 	let currentHostBridge: HerdrHostBridgeCredentials | undefined;
-	if (hostToken?.trim() && address?.trim() && paneId?.trim()) {
-		currentHostBridge = { address, token: hostToken, paneId };
+	const hostBridgeToken = hostToken?.trim() ? hostToken : undefined;
+	if (hostBridgeToken && address?.trim() && paneId?.trim()) {
+		currentHostBridge = { address, token: hostBridgeToken, paneId };
 	}
 	const guestBridgeToken = guestToken?.trim() ? guestToken : undefined;
 	const hostBridge = hostBridgeDiscovery ? { current: currentHostBridge, discovery: hostBridgeDiscovery } : undefined;
-	return { hostBridge, guestBridgeToken };
+	return { hostBridge, hostBridgeToken, guestBridgeToken };
 }
 
 const DISCOVERY_TIMEOUT_MS = 1_000;
@@ -235,6 +238,10 @@ export function handoffHerdrHostBridge(bootstrap: HerdrHostBridgeBootstrap | und
 	pendingHostBridge = bootstrap;
 }
 
+export function handoffHerdrHostBridgeToken(token: string | undefined): void {
+	pendingHostBridgeToken = token;
+}
+
 export function handoffHerdrGuestBridgeToken(token: string | undefined): void {
 	pendingGuestBridgeToken = token;
 }
@@ -245,6 +252,12 @@ export function takeHerdrHostBridge(): HerdrHostBridgeBootstrap | undefined {
 	return bootstrap;
 }
 
+export function takeHerdrHostBridgeToken(): string | undefined {
+	const token = pendingHostBridgeToken;
+	pendingHostBridgeToken = undefined;
+	return token;
+}
+
 export function takeHerdrGuestBridgeToken(): string | undefined {
 	const token = pendingGuestBridgeToken;
 	pendingGuestBridgeToken = undefined;
@@ -253,6 +266,7 @@ export function takeHerdrGuestBridgeToken(): string | undefined {
 
 export function clearHerdrHostBridgeHandoff(): void {
 	pendingHostBridge = undefined;
+	pendingHostBridgeToken = undefined;
 }
 
 export function clearHerdrGuestBridgeTokenHandoff(): void {

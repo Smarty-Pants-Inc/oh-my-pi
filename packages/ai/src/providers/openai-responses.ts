@@ -196,9 +196,7 @@ function isRetryableOpenAIResponsesStreamFailure(error: unknown): boolean {
 }
 
 interface OpenAIResponsesProviderSessionState
-	extends ProviderSessionState,
-		OpenAIStrictToolsState,
-		OpenAIReasoningEffortFallbackState {
+	extends ProviderSessionState, OpenAIStrictToolsState, OpenAIReasoningEffortFallbackState {
 	nativeHistoryReplayWarmed: boolean;
 	/** Stateful `previous_response_id` chain baselines, keyed by baseUrl/model/session. */
 	chains: Map<string, OpenAIResponsesChainState>;

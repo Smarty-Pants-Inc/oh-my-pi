@@ -45,7 +45,8 @@ export class CollabGuestBridge extends Command {
 	static strict = false;
 
 	async run(): Promise<void> {
-		let [address, roomId, tokenArg, ...args] = this.argv;
+		const [address, roomId, tokenArgInitial, ...args] = this.argv;
+		let tokenArg = tokenArgInitial;
 		if (tokenArg && tokenArg !== "--token-env") {
 			handoffHerdrGuestBridgeToken(tokenArg);
 			tokenArg = "--token-env";

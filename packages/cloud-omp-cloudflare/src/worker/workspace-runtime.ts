@@ -41,13 +41,7 @@ import {
 import { WorkspaceMutationFence } from "./workspace-mutation-fence";
 import type { WorkspaceRow, WorkspaceStateStore } from "./workspace-state-store";
 
-export type {
-	RuntimeEvent,
-	RuntimeHandle,
-	RuntimeLike,
-	RuntimeResult,
-	WorkspaceLike,
-} from "./execution-supervisor";
+export type { RuntimeEvent, RuntimeHandle, RuntimeLike, RuntimeResult, WorkspaceLike } from "./execution-supervisor";
 
 const DEFAULT_CLEANUP_TIMEOUT_MS = MAX_COMMAND_TIMEOUT_MS;
 const encoder = new TextEncoder();

@@ -10,6 +10,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
 import type {
 	RpcCommand,
+	RpcControlFrame,
 	RpcExtensionUIResponse,
 	RpcHostToolCallRequest,
 	RpcHostToolCancelRequest,
@@ -28,12 +29,13 @@ const makeDeps = (
 		output: obj => {
 			outputs.push(obj as OutputFrame);
 		},
-		errorResponse: (id, command, message) => ({
+		errorResponse: (id, command, message, code) => ({
 			id,
 			type: "response",
 			command,
 			success: false,
 			error: message,
+			...(code ? { code } : {}),
 		}),
 		pendingExtensionRequests: options?.pendingExtensionRequests ?? new Map<string, PendingExtensionRequest>(),
 		onHostToolResult: () => {},
@@ -228,9 +230,45 @@ describe("dispatchRpcInputFrame", () => {
 	});
 });
 
+test("intercepts every sidechannel before local RPC handlers", () => {
+	const localHandlers: string[] = [];
+	const forwarded: RpcControlFrame[] = [];
+	const { deps } = makeDeps(async command => ({
+		id: command.id,
+		type: "response",
+		command: command.type,
+		success: false,
+		error: "unexpected command",
+	}));
+	deps.onHostToolResult = () => localHandlers.push("tool-result");
+	deps.onHostToolUpdate = () => localHandlers.push("tool-update");
+	deps.onHostUriResult = () => localHandlers.push("uri-result");
+	deps.interceptControlFrame = frame => {
+		forwarded.push(frame);
+		return true;
+	};
+	const frames: RpcControlFrame[] = [
+		{ type: "extension_ui_response", id: "ui-1", cancelled: true },
+		{
+			type: "host_tool_result",
+			id: "tool-1",
+			result: { content: [{ type: "text", text: "done" }], details: {} },
+		},
+		{
+			type: "host_tool_update",
+			id: "tool-1",
+			partialResult: { content: [{ type: "text", text: "working" }], details: {} },
+		},
+		{ type: "host_uri_result", id: "uri-1", content: "value" },
+		{ type: "clear_herdr_agentd_rebind" },
+	];
+	for (const frame of frames) expect(dispatchRpcInputFrame(frame, deps)).toBeUndefined();
+	expect(forwarded).toEqual(frames);
+	expect(localHandlers).toEqual([]);
+});
+
 describe("RpcInputDispatcher", () => {
 	test("control frames resolve extension UI requests while an ordinary command is active", async () => {
-		let depsRef: RpcInputFrameDeps;
 		const { deps, outputs } = makeDeps(async command => {
 			if (command.type !== "prompt") throw new Error(`unexpected command type: ${command.type}`);
 			const response = await requestExtensionInput(depsRef, "ui-active", "Continue?");
@@ -242,7 +280,7 @@ describe("RpcInputDispatcher", () => {
 				data: { agentInvoked: "value" in response && response.value === "continue" },
 			};
 		});
-		depsRef = deps;
+		const depsRef = deps;
 		const dispatcher = new RpcInputDispatcher({ deps });
 
 		dispatcher.dispatch({ id: "prompt-1", type: "prompt", message: "ask extension" });
@@ -352,6 +390,117 @@ describe("RpcInputDispatcher", () => {
 		expect((outputs[1] as RpcResponse).command).toBe("get_state");
 	});
 
+	test("serializes canonical Collab commands behind direct RPC commands", async () => {
+		const releaseDirect = Promise.withResolvers<void>();
+		const started: string[] = [];
+		const { deps, outputs } = makeDeps(async command => {
+			started.push(command.id ?? "");
+			if (command.type === "set_auto_retry") {
+				await releaseDirect.promise;
+				return { id: command.id, type: "response", command: "set_auto_retry", success: true };
+			}
+			if (command.type === "set_steering_mode") {
+				return { id: command.id, type: "response", command: "set_steering_mode", success: true };
+			}
+			throw new Error(`unexpected command type: ${command.type}`);
+		});
+		const dispatcher = new RpcInputDispatcher({ deps });
+
+		dispatcher.dispatch({ id: "stdin", type: "set_auto_retry", enabled: true });
+		const collab = dispatcher.dispatchCanonical({ id: "collab", type: "set_steering_mode", mode: "all" });
+		await flushMicrotasks();
+
+		expect(started).toEqual(["stdin"]);
+		expect(outputs).toEqual([]);
+
+		releaseDirect.resolve();
+		await expect(collab).resolves.toEqual({
+			id: "collab",
+			type: "response",
+			command: "set_steering_mode",
+			success: true,
+		});
+		await dispatcher.drain();
+
+		expect(started).toEqual(["stdin", "collab"]);
+		expect(outputs).toEqual([{ id: "stdin", type: "response", command: "set_auto_retry", success: true }]);
+	});
+
+	test("checks extension shutdown after a canonical response is sent exactly once", async () => {
+		let shutdownRequested = false;
+		let shutdowns = 0;
+		const order: string[] = [];
+		const shutdownCoordinator = new RpcShutdownCoordinator({
+			isShutdownRequested: () => shutdownRequested,
+			performShutdown: async () => {
+				order.push("shutdown");
+				shutdowns++;
+			},
+		});
+		const { deps } = makeDeps(async command => {
+			expect(command).toMatchObject({ id: "guest-extension", type: "prompt" });
+			// Mirrors a guest extension command calling pi.shutdown().
+			shutdownRequested = true;
+			return { id: command.id, type: "response", command: "prompt", success: true };
+		});
+		const dispatcher = new RpcInputDispatcher({
+			deps,
+			afterSerialCommand: () => shutdownCoordinator.checkShutdownRequested(),
+		});
+
+		const result = await dispatcher.dispatchCanonical({
+			id: "guest-extension",
+			type: "prompt",
+			message: "/guest-shutdown",
+		});
+		expect(result).toMatchObject({ response: { id: "guest-extension", success: true } });
+		if (!("afterResponse" in result)) throw new Error("Expected canonical response completion hook");
+		order.push("response");
+		await result.afterResponse?.();
+		await result.afterResponse?.();
+		await dispatcher.drain();
+
+		expect(order).toEqual(["response", "shutdown"]);
+		expect(shutdowns).toBe(1);
+	});
+
+	test("publishes canonical handler errors before deferred shutdown", async () => {
+		let shutdownRequested = false;
+		let shutdowns = 0;
+		const order: string[] = [];
+		const shutdownCoordinator = new RpcShutdownCoordinator({
+			isShutdownRequested: () => shutdownRequested,
+			performShutdown: async () => {
+				order.push("shutdown");
+				shutdowns++;
+			},
+		});
+		const { deps } = makeDeps(async () => {
+			shutdownRequested = true;
+			throw new Error("mutation outcome is unknown");
+		});
+		const dispatcher = new RpcInputDispatcher({
+			deps,
+			afterSerialCommand: () => shutdownCoordinator.checkShutdownRequested(),
+		});
+
+		const result = await dispatcher.dispatchCanonical({ id: "failed", type: "set_auto_retry", enabled: true });
+		expect(result).toMatchObject({
+			response: {
+				id: "failed",
+				success: false,
+				error: "mutation outcome is unknown",
+				code: "ambiguous",
+			},
+		});
+		if (!("afterResponse" in result)) throw new Error("Expected canonical response completion hook");
+		order.push("response");
+		await result.afterResponse?.();
+		await dispatcher.drain();
+		expect(order).toEqual(["response", "shutdown"]);
+		expect(shutdowns).toBe(1);
+	});
+
 	test("serial command rejection emits an error response and does not poison the queue", async () => {
 		const started: string[] = [];
 		const { deps, outputs } = makeDeps(async command => {
@@ -458,7 +607,6 @@ describe("RpcInputDispatcher", () => {
 		const disconnectMessage = "RPC client disconnected before extension UI response completed";
 		const pendingExtensionRequests = new RpcPendingExtensionRequests();
 		const started: string[] = [];
-		let depsRef: RpcInputFrameDeps;
 		const { deps, outputs } = makeDeps(
 			async command => {
 				if (command.type !== "prompt") throw new Error(`unexpected command type: ${command.type}`);
@@ -474,7 +622,7 @@ describe("RpcInputDispatcher", () => {
 			},
 			{ pendingExtensionRequests },
 		);
-		depsRef = deps;
+		const depsRef = deps;
 		const dispatcher = new RpcInputDispatcher({ deps });
 
 		dispatcher.dispatch({ id: "active", type: "prompt", message: "active dialog" });

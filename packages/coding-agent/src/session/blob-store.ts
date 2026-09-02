@@ -21,6 +21,11 @@ export interface BlobPutResult {
 	displayPath: string;
 	get ref(): string;
 }
+/** Canonical blob metadata exposed by bounded RPC listing. */
+export interface BlobInfo {
+	hash: string;
+	size: number;
+}
 
 /**
  * Content-addressed blob store for externalizing large binary data (images) from session JSONL files.
@@ -112,6 +117,7 @@ export class BlobStore {
 				return `${BLOB_PREFIX}${hash}`;
 			},
 		};
+		await fsp.mkdir(this.dir, { recursive: true });
 
 		await Bun.write(blobPath, data);
 		await ensureDisplayPath(blobPath, displayPath, data);
@@ -142,8 +148,9 @@ export class BlobStore {
 		return result;
 	}
 
-	/** Read blob by hash, returns Buffer or null if not found. */
+	/** Read blob by hash, returns Buffer or null if the hash is invalid or absent. */
 	async get(hash: string): Promise<Buffer | null> {
+		if (!BLOB_HASH_RE.test(hash)) return null;
 		const blobPath = path.join(this.dir, hash);
 		try {
 			const file = Bun.file(blobPath);
@@ -157,6 +164,7 @@ export class BlobStore {
 
 	/** Synchronous variant of {@link get}. */
 	getSync(hash: string): Buffer | null {
+		if (!BLOB_HASH_RE.test(hash)) return null;
 		const blobPath = path.join(this.dir, hash);
 		try {
 			return fs.readFileSync(blobPath);
@@ -166,14 +174,46 @@ export class BlobStore {
 		}
 	}
 
-	/** Check if a blob exists. */
+	/** Check if a canonical blob exists. */
 	async has(hash: string): Promise<boolean> {
+		if (!BLOB_HASH_RE.test(hash)) return false;
 		try {
 			await fsp.access(path.join(this.dir, hash));
 			return true;
 		} catch {
 			return false;
 		}
+	}
+
+	/** Return canonical metadata for one regular blob, or null when absent. */
+	async getInfo(hash: string): Promise<BlobInfo | null> {
+		if (!BLOB_HASH_RE.test(hash)) return null;
+		try {
+			const stat = await fsp.lstat(path.join(this.dir, hash));
+			return stat.isFile() ? { hash, size: stat.size } : null;
+		} catch (err) {
+			if (isEnoent(err)) return null;
+			throw err;
+		}
+	}
+
+	/** List canonical extensionless blobs in lexical hash order. */
+	async list(): Promise<BlobInfo[]> {
+		let entries: fs.Dirent[];
+		try {
+			entries = await fsp.readdir(this.dir, { withFileTypes: true });
+		} catch (error) {
+			if (isEnoent(error)) return [];
+			throw error;
+		}
+		const blobs: BlobInfo[] = [];
+		for (const entry of entries) {
+			if (!entry.isFile() || !BLOB_HASH_RE.test(entry.name)) continue;
+			const stat = await fsp.stat(path.join(this.dir, entry.name));
+			blobs.push({ hash: entry.name, size: stat.size });
+		}
+		blobs.sort((left, right) => left.hash.localeCompare(right.hash, "en"));
+		return blobs;
 	}
 }
 

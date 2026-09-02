@@ -622,14 +622,12 @@ describe("AgentSession.switchSession previous-context build", () => {
 		});
 		const finishBashTransition = BashRunner.prototype.finishSessionTransition;
 		const bashSelections: boolean[] = [];
-		vi.spyOn(BashRunner.prototype, "finishSessionTransition").mockImplementation(function (
-			this: BashRunner,
-			transition,
-			success,
-		) {
-			bashSelections.push(success);
-			return finishBashTransition.call(this, transition, success);
-		});
+		vi.spyOn(BashRunner.prototype, "finishSessionTransition").mockImplementation(
+			function (this: BashRunner, transition, success) {
+				bashSelections.push(success);
+				return finishBashTransition.call(this, transition, success);
+			},
+		);
 		const published: string[] = [];
 		const emitWithHostCompletion = extensionRunner.emitWithHostCompletion.bind(extensionRunner);
 		vi.spyOn(extensionRunner, "emitWithHostCompletion").mockImplementation(
@@ -769,17 +767,15 @@ describe("AgentSession.switchSession previous-context build", () => {
 			};
 		});
 		const finishBashTransition = BashRunner.prototype.finishSessionTransition;
-		vi.spyOn(BashRunner.prototype, "finishSessionTransition").mockImplementation(function (
-			this: BashRunner,
-			transition,
-			success,
-		) {
-			finishBashTransition.call(this, transition, success);
-			if (success) {
-				expect(advisorSelected).toBe(true);
-				bashSelected = true;
-			}
-		});
+		vi.spyOn(BashRunner.prototype, "finishSessionTransition").mockImplementation(
+			function (this: BashRunner, transition, success) {
+				finishBashTransition.call(this, transition, success);
+				if (success) {
+					expect(advisorSelected).toBe(true);
+					bashSelected = true;
+				}
+			},
+		);
 
 		await expect(session.switchSession(targetSessionFile)).resolves.toBe(true);
 		expect(artifactFinalized).toBe(true);
@@ -3683,14 +3679,13 @@ describe("AgentSession.switchSession previous-context build", () => {
 			};
 		});
 		const awaitSessionTransition = BashRunner.prototype.awaitSessionTransition;
-		vi.spyOn(BashRunner.prototype, "awaitSessionTransition").mockImplementation(async function (
-			this: BashRunner,
-			transition,
-		) {
-			bashSettlementAttempts++;
-			if (bashSettlementAttempts === 1) throw failure;
-			await awaitSessionTransition.call(this, transition);
-		});
+		vi.spyOn(BashRunner.prototype, "awaitSessionTransition").mockImplementation(
+			async function (this: BashRunner, transition) {
+				bashSettlementAttempts++;
+				if (bashSettlementAttempts === 1) throw failure;
+				await awaitSessionTransition.call(this, transition);
+			},
+		);
 		vi.spyOn(extensionRunner, "hasHandlers").mockImplementation(eventType => eventType === "session_tree");
 		const rollbackPublicationStarted = Promise.withResolvers<void>();
 		const allowRollbackPublication = Promise.withResolvers<void>();
@@ -4180,7 +4175,6 @@ describe("AgentSession.switchSession previous-context build", () => {
 			[retainedMountedTool.name, retainedMountedTool],
 			[targetMountedTool.name, targetMountedTool],
 		]);
-		let session: AgentSession;
 		const xdev: XdevState = {
 			tools: toolRegistry as XdevState["tools"],
 			mountedNames: new Set(),
@@ -4202,7 +4196,7 @@ describe("AgentSession.switchSession previous-context build", () => {
 			convertToLlm,
 			streamFn: primaryMock.stream,
 		});
-		session = new AgentSession({
+		const session = new AgentSession({
 			agent,
 			sessionManager,
 			settings: Settings.isolated({ "compaction.enabled": false }),
@@ -4661,24 +4655,22 @@ describe("AgentSession.switchSession previous-context build", () => {
 		const allowPrepareRollback = Promise.withResolvers<void>();
 		const prepareRollback = BashRunner.prototype.prepareRollback;
 		let bashRollbackPrepared = false;
-		vi.spyOn(BashRunner.prototype, "prepareRollback").mockImplementation(async function (
-			this: BashRunner,
-			transition,
-		) {
-			prepareRollbackStarted.resolve();
-			await allowPrepareRollback.promise;
-			await prepareRollback.call(this, transition);
-			bashRollbackPrepared = true;
-		});
+		vi.spyOn(BashRunner.prototype, "prepareRollback").mockImplementation(
+			async function (this: BashRunner, transition) {
+				prepareRollbackStarted.resolve();
+				await allowPrepareRollback.promise;
+				await prepareRollback.call(this, transition);
+				bashRollbackPrepared = true;
+			},
+		);
 		const rollbackSessionTransition = BashRunner.prototype.rollbackSessionTransition;
 		let bashOwnershipSelected = false;
-		vi.spyOn(BashRunner.prototype, "rollbackSessionTransition").mockImplementation(async function (
-			this: BashRunner,
-			transition,
-		) {
-			await rollbackSessionTransition.call(this, transition);
-			bashOwnershipSelected = true;
-		});
+		vi.spyOn(BashRunner.prototype, "rollbackSessionTransition").mockImplementation(
+			async function (this: BashRunner, transition) {
+				await rollbackSessionTransition.call(this, transition);
+				bashOwnershipSelected = true;
+			},
+		);
 		const discardJobs = vi.spyOn(asyncManager, "discardJobs");
 
 		let artifactRollbackStarted = false;
