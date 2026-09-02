@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import { Agent } from "@oh-my-pi/pi-agent-core";
+import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { ModelRegistry } from "../src/config/model-registry";
@@ -15,15 +16,28 @@ describe("AgentSession exact-entry fork", () => {
 	let authStorage: AuthStorage;
 	let session: AgentSession;
 	let manager: SessionManager;
+	let providerRequests: string[];
 
 	beforeEach(() => {
 		tempDir = TempDir.createSync("omp-fork-entry-");
 		authStorage = createInMemoryAuthStorage();
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		providerRequests = [];
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled test model");
+		const mock = createMockModel({
+			handler: async context => {
+				providerRequests.push(JSON.stringify(context.messages));
+				return { content: ["child response"], stopReason: "stop" };
+			},
+		});
 		manager = SessionManager.create(tempDir.path(), tempDir.path());
 		session = new AgentSession({
-			agent: new Agent({ initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			agent: new Agent({
+				getApiKey: () => "test-key",
+				initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+				streamFn: mock.stream,
+			}),
 			sessionManager: manager,
 			settings: Settings.isolated({ "advisor.enabled": false, "compaction.enabled": false }),
 			modelRegistry: new ModelRegistry(authStorage),
@@ -87,5 +101,49 @@ describe("AgentSession exact-entry fork", () => {
 		} finally {
 			unregister();
 		}
+	});
+
+	it("drops queued delivery from discarded history before running the copied entry", async () => {
+		const keptEntry = "keep exact entry";
+		const discardedEntry = "discarded branch entry";
+		const discardedSteer = "discarded queued steer";
+		const discardedFollowUp = "discarded queued follow-up";
+		const childPrompt = "child prompt";
+		manager.appendMessage({ role: "user", content: keptEntry, timestamp: 1 });
+		const entryId = manager.getLeafId();
+		if (!entryId) throw new Error("Expected exact fork entry");
+		manager.appendMessage({ role: "user", content: discardedEntry, timestamp: 2 });
+		session.agent.replaceMessages(manager.buildSessionContext().messages);
+		await manager.flush();
+
+		session.agent.steer({
+			role: "user",
+			content: discardedSteer,
+			steering: true,
+			attribution: "user",
+			timestamp: 3,
+		});
+		session.agent.followUp({
+			role: "user",
+			content: discardedFollowUp,
+			attribution: "user",
+			timestamp: 4,
+		});
+		expect(session.agent.hasQueuedMessages()).toBe(true);
+
+		expect(await session.fork(undefined, { entryId })).toBe(true);
+		expect(session.messages).toEqual([{ role: "user", content: keptEntry, timestamp: 1 }]);
+		expect(session.agent.hasQueuedMessages()).toBe(false);
+
+		await session.prompt(childPrompt);
+		await session.waitForIdle();
+
+		expect(providerRequests).toHaveLength(1);
+		const childRequest = providerRequests[0]!;
+		expect(childRequest).toContain(keptEntry);
+		expect(childRequest).toContain(childPrompt);
+		expect(childRequest).not.toContain(discardedEntry);
+		expect(childRequest).not.toContain(discardedSteer);
+		expect(childRequest).not.toContain(discardedFollowUp);
 	});
 });

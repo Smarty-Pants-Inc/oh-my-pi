@@ -10438,6 +10438,14 @@ export class AgentSession {
 			this.#syncAgentSessionId(undefined, false, false);
 			this.#recovery.reanchorServedAttribution(previousSessionId);
 			if (entryId !== undefined) {
+				this.agent.clearSteeringQueue();
+				this.agent.clearFollowUpQueue();
+				this.#pendingNextTurnMessages = [];
+				this.#pendingExplicitPromptMessages = [];
+				this.#pendingSemanticDeliveryIds.clear();
+				this.#queuedMessageDrainBlocked = false;
+				this.#usagePreflightReadyForNextModelCall = false;
+				this.#usagePreflightReadyModel = undefined;
 				this.#rehydrateCheckpointRewindState();
 				this.#todo.syncFromBranch();
 			}
