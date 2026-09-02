@@ -35,9 +35,13 @@ import { applyStartupCwd } from "./cli/startup-cwd";
 import { getLatestRelease } from "./cli/update-cli";
 import { CollabGuestLink, getCollabGuestRestorationCompletion } from "./collab/guest";
 import { type HerdrHostBridgeBootstrap, resolveHerdrHostBridge } from "./collab/herdr-bridge-bootstrap";
+import type { ManagedHerdrAgentdHostBridge } from "./collab/herdr-agentd-host-lifecycle";
 import { HerdrCollabHostLifecycle, type ManagedHerdrHostBridge } from "./collab/herdr-host-lifecycle";
 import { CollabHost } from "./collab/host";
 import { createHostBridgeTransport, LocalCollabTransport } from "./collab/local-transport";
+import type { CollabRpcGuestBridge } from "./collab/rpc-guest";
+import { runCollabRpcGuest } from "./collab/rpc-guest";
+import { runCollabRpcHost } from "./collab/rpc-host";
 import { findConfigFile } from "./config";
 import { ModelRegistry } from "./config/model-registry";
 import {
@@ -1597,6 +1601,8 @@ interface RunRootCommandDependencies {
 	verifyApprovedStartup?: (isInteractive: boolean) => Promise<string | undefined>;
 	herdrHostBridge?: HerdrHostBridgeBootstrap;
 	runInteractiveMode?: typeof runInteractiveMode;
+	collabRpcGuest?: CollabRpcGuestBridge;
+	collabRpcHost?: ManagedHerdrAgentdHostBridge;
 }
 const DEFAULT_RUN_ROOT_DEPENDENCIES: RunRootCommandDependencies = {};
 async function disposeSessionAndQuit(session: AgentSession, code: number): Promise<void> {
@@ -2289,7 +2295,7 @@ export async function runRootCommand(
 				notifs.push({ kind: "error", message: modelRegistryError.message });
 			}
 
-			if (!isInteractive && !session.model) {
+			if (!isInteractive && !session.model && !deps.collabRpcGuest && !deps.collabRpcHost) {
 				if (modelRegistryError) {
 					process.stderr.write(`${chalk.red(modelRegistryError.message)}\n\n`);
 				}
@@ -2306,9 +2312,22 @@ export async function runRootCommand(
 			}
 
 			if (mode === "rpc" || mode === "rpc-ui") {
-				const runRpcMode: RunRpcMode = (await import("./modes/rpc/rpc-mode")).runRpcMode;
 				stopStartupWatchdog();
-				await runRpcMode(session, mode === "rpc-ui" ? setToolUIContext : undefined, subagentEventBus, rpcInput);
+				if (deps.collabRpcGuest) {
+					await runCollabRpcGuest(session, deps.collabRpcGuest, subagentEventBus, rpcInput);
+				} else if (deps.collabRpcHost) {
+					await runCollabRpcHost(
+						session,
+						deps.collabRpcHost,
+						mode === "rpc-ui" ? setToolUIContext : undefined,
+						subagentEventBus,
+						rpcInput,
+					);
+				} else {
+					// Branch-only protocol runner: keep RPC host code out of normal interactive startup.
+					const runRpcMode: RunRpcMode = (await import("./modes/rpc/rpc-mode")).runRpcMode;
+					await runRpcMode(session, mode === "rpc-ui" ? setToolUIContext : undefined, subagentEventBus, rpcInput);
+				}
 			} else if (isInteractive) {
 				const versionCheckPromise = checkForNewVersion(VERSION).catch(() => undefined);
 				const startupChangelog = await startupChangelogPromise;

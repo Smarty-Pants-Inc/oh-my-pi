@@ -46,6 +46,8 @@ export interface CollabTransport {
 	send(frame: CollabFrame, targetPeer?: number): boolean;
 	/** Request or release controller authority when the embedding transport supports it. */
 	requestAuthority?(action: "request" | "release"): boolean;
+	/** Resolve after every previously accepted frame has reached the underlying transport. */
+	flush?(): Promise<void>;
 	close(): void;
 }
 

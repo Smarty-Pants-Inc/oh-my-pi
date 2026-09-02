@@ -4,15 +4,23 @@
  * Spawns the agent in RPC mode and provides a typed API for all operations.
  */
 
-import { isPromise } from "node:util/types";
 import type { AgentEvent, AgentMessage, AgentToolResult, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
 import { isRecord, ptree, readJsonl } from "@oh-my-pi/pi-utils";
-import type { FileSink } from "bun";
+import type { CollabUiResponseValue } from "@oh-my-pi/pi-wire";
+import { validateHerdrBridgeAddress } from "../../collab/agentd-local-transport";
 import type { BashResult } from "../../exec/bash-executor";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
 import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameDecoder, type RpcProtocolVersion } from "./rpc-frame";
+import type {
+	RpcHistoryChunk,
+	RpcHistoryChunkOptions,
+	RpcHistoryDigest,
+	RpcHistoryPage,
+	RpcHistoryPageOptions,
+	RpcHistorySnapshot,
+} from "./rpc-history";
 import {
 	RPC_MESSAGES_PAGE_BUSY_ERROR,
 	RPC_MESSAGES_PAGE_STALE_ERROR,
@@ -20,17 +28,40 @@ import {
 	type RpcMessagesPageOptions,
 } from "./rpc-messages";
 import type {
+	RpcArtifactListResult,
+	RpcArtifactReadResult,
+	RpcArtifactWriteResult,
+	RpcBlobListResult,
+	RpcBlobReadResult,
+	RpcBlobWriteResult,
+	RpcCustomMessagePayload,
+	RpcCustomMessageResult,
+} from "./rpc-session-data";
+import type {
 	RpcAvailableCommandsUpdateFrame,
 	RpcAvailableSlashCommand,
+	RpcCollabFrame,
+	RpcCollabTerminalFrame,
 	RpcCommand,
+	RpcCommandInput,
+	RpcControlFrame,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
 	RpcHandoffResult,
+	RpcHerdrAgentdHostBridge,
 	RpcHostToolCallRequest,
 	RpcHostToolCancelRequest,
 	RpcHostToolDefinition,
 	RpcHostToolResult,
 	RpcHostToolUpdate,
+	RpcHostUriCancelRequest,
+	RpcHostUriRequest,
+	RpcHostUriResult,
+	RpcHostUriSchemeDefinition,
+	RpcMutationContext,
+	RpcMutationReceipt,
+	RpcPrepareHerdrAgentdRebindFrame,
+	RpcReadyFrame,
 	RpcResponse,
 	RpcSessionState,
 	RpcSubagentEventFrame,
@@ -40,17 +71,13 @@ import type {
 	RpcSubagentSnapshot,
 	RpcSubagentSubscriptionLevel,
 } from "./rpc-types";
-
-/** Distributive Omit that works with union types */
-type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : never;
-
-/** RpcCommand without the id field (for internal send) */
-type RpcCommandBody = DistributiveOmit<RpcCommand, "id">;
+import { isRpcEndpointIdentity, isRpcMutationCommand, RPC_HERDR_AGENTD_HOST_CAPABILITY } from "./rpc-types";
 
 /** Process transport consumed by {@link RpcClient}. */
 export interface RpcAgentProcess {
 	stdin: {
 		write(data: string | Uint8Array): unknown;
+		flush?(): unknown;
 	};
 	stdout: ReadableStream<Uint8Array>;
 	peekStderr(): string;
@@ -59,19 +86,17 @@ export interface RpcAgentProcess {
 }
 
 export interface RpcClientOptions {
-	/** Path to the CLI entry point (default: `dist/cli.js`). */
+	/** Path to the CLI entry point (default: searches for dist/cli.js) */
 	cliPath?: string;
+	/** Complete executable command to run instead of the default `bun <cliPath> --mode rpc`. */
+	launchCommand?: readonly string[];
 	/**
-	 * Agent launcher override. An argv prefix receives the normal RPC/model args
-	 * appended; a builder receives those args and returns the complete argv.
-	 * Builders support transports such as SSH that must quote the final argv.
-	 * Ignored when {@link spawn} is provided.
+	 * Agent launcher override. An argv prefix receives normal RPC/model args;
+	 * a builder receives those args and returns the complete argv.
+	 * Ignored when {@link spawn} or {@link launchCommand} is provided.
 	 */
 	command?: string[] | ((agentArgs: string[]) => string[]);
-	/**
-	 * Spawn the RPC agent over a custom transport instead of a local child process.
-	 * Takes precedence over {@link command}.
-	 */
+	/** Spawn the RPC agent over a custom transport instead of a local child process. */
 	spawn?: (agentArgs: string[]) => RpcAgentProcess | Promise<RpcAgentProcess>;
 	/** Working directory for the agent */
 	cwd?: string;
@@ -89,6 +114,24 @@ export interface RpcClientOptions {
 	terminationGraceMs?: number;
 	/** Custom tools owned by the embedding host and exposed over the RPC transport */
 	customTools?: RpcClientCustomTool[];
+	/** Already-redeemed direct tuple for the single-runtime `__collab-rpc-host` composition. */
+	herdrAgentdHost?: RpcHerdrAgentdHostBridge;
+}
+
+export interface RpcPromptOptions {
+	images?: ImageContent[];
+	streamingBehavior?: "steer" | "followUp";
+}
+
+export interface RpcDurablePromptOptions extends RpcPromptOptions {
+	mutation: RpcMutationContext;
+	/** Exact active tool name for this prompt's first model call. */
+	toolChoice?: string;
+}
+
+export interface RpcForkAtEntryOptions {
+	entryId: string;
+	mutation: RpcMutationContext;
 }
 
 export type ModelInfo = Pick<Model, "provider" | "id" | "contextWindow" | "reasoning" | "thinking">;
@@ -99,6 +142,13 @@ export type RpcSubagentLifecycleListener = (payload: RpcSubagentLifecycleFrame["
 export type RpcSubagentProgressListener = (payload: RpcSubagentProgressFrame["payload"]) => void;
 export type RpcSubagentEventListener = (payload: RpcSubagentEventFrame["payload"]) => void;
 export type RpcAvailableCommandsUpdateListener = (commands: RpcAvailableSlashCommand[]) => void;
+export type RpcCollabFrameListener = (frame: RpcCollabFrame) => void;
+export type RpcUnavailableListener = (frame: RpcCollabTerminalFrame) => void;
+export type RpcExtensionUIRequestListener = (request: RpcExtensionUIRequest) => void;
+export type RpcHostToolCallListener = (request: RpcHostToolCallRequest) => void;
+export type RpcHostToolCancelListener = (request: RpcHostToolCancelRequest) => void;
+export type RpcHostUriRequestListener = (request: RpcHostUriRequest) => void;
+export type RpcHostUriCancelListener = (request: RpcHostUriCancelRequest) => void;
 
 export interface RpcClientToolContext<TDetails = unknown> {
 	toolCallId: string;
@@ -157,6 +207,64 @@ const sessionEventTypes = new Set<AgentSessionEvent["type"]>([
 	"goal_updated",
 ]);
 
+function validateLaunchCommand(command: unknown): string[] {
+	if (
+		!Array.isArray(command) ||
+		command.length === 0 ||
+		typeof command[0] !== "string" ||
+		command[0].trim().length === 0
+	) {
+		throw new Error("RpcClient launchCommand must contain a non-empty executable");
+	}
+	if (command.some(argument => typeof argument !== "string")) {
+		throw new Error("RpcClient launchCommand must contain only strings");
+	}
+	return [...command];
+}
+
+function validateHerdrAgentdHostBridge(value: RpcHerdrAgentdHostBridge): RpcHerdrAgentdHostBridge {
+	if (process.platform === "win32") {
+		throw new Error("RpcClient herdrAgentdHost is unavailable on Windows");
+	}
+	try {
+		validateHerdrBridgeAddress(value.address);
+	} catch {
+		throw new Error("RpcClient herdrAgentdHost address is invalid");
+	}
+	if (
+		!value.paneId ||
+		value.paneId.trim() !== value.paneId ||
+		value.paneId.includes("\0") ||
+		value.paneId.length > 256
+	) {
+		throw new Error("RpcClient herdrAgentdHost paneId is invalid");
+	}
+	if (!Number.isSafeInteger(value.routeGeneration) || value.routeGeneration < 1) {
+		throw new Error("RpcClient herdrAgentdHost routeGeneration must be a positive integer");
+	}
+	if (!value.token || value.token.trim() !== value.token || value.token.includes("\0")) {
+		throw new Error("RpcClient herdrAgentdHost token is invalid");
+	}
+	return { ...value };
+}
+
+function buildHerdrAgentdRebindFrame(input: RpcHerdrAgentdHostBridge): RpcPrepareHerdrAgentdRebindFrame {
+	const bridge = validateHerdrAgentdHostBridge(input);
+	if (bridge.routeGeneration !== 1) {
+		throw new Error("RpcClient Herdr agentd successor routeGeneration must be 1");
+	}
+	return { type: "prepare_herdr_agentd_rebind", ...bridge };
+}
+
+function redactSecretError(error: unknown, ...secrets: Array<string | undefined>): Error {
+	const original = error instanceof Error ? error : new Error(String(error));
+	let message = original.message;
+	for (const secret of secrets) {
+		if (secret) message = message.split(secret).join("[REDACTED]");
+	}
+	return message === original.message ? original : new Error(message, { cause: original });
+}
+
 function isRpcResponse(value: unknown): value is RpcResponse {
 	if (!isRecord(value)) return false;
 	if (value.type !== "response") return false;
@@ -169,13 +277,27 @@ function isRpcResponse(value: unknown): value is RpcResponse {
 	return true;
 }
 
-function supportsRpcProtocolV2(value: Record<string, unknown>): boolean {
+function supportsRpcProtocolV2(value: RpcReadyFrame): boolean {
 	return (
 		value.type === "ready" &&
 		Array.isArray(value.supportedProtocolVersions) &&
 		value.supportedProtocolVersions.includes(2) &&
 		value.maxFrameBytes === MAX_RPC_FRAME_BYTES &&
 		value.maxReassembledFrameBytes === MAX_RPC_REASSEMBLED_BYTES
+	);
+}
+
+function isRpcReadyFrame(value: unknown): value is RpcReadyFrame {
+	if (!isRecord(value) || !isRpcEndpointIdentity(value)) return false;
+	return (
+		value.type === "ready" &&
+		typeof value.maxFrameBytes === "number" &&
+		typeof value.maxReassembledFrameBytes === "number" &&
+		(value.participant === undefined ||
+			(isRecord(value.participant) &&
+				typeof value.participant.name === "string" &&
+				(value.participant.role === "host" || value.participant.role === "guest") &&
+				(value.participant.readOnly === undefined || typeof value.participant.readOnly === "boolean")))
 	);
 }
 
@@ -213,6 +335,21 @@ function isRpcAvailableCommandsUpdateFrame(value: unknown): value is RpcAvailabl
 	return value.type === "available_commands_update" && Array.isArray(value.commands);
 }
 
+function isRpcCollabFrameEvent(value: unknown): value is { type: "collab_frame"; frame: RpcCollabFrame } {
+	return (
+		isRecord(value) && value.type === "collab_frame" && isRecord(value.frame) && typeof value.frame.t === "string"
+	);
+}
+
+function isRpcCollabTerminalFrame(value: unknown): value is RpcCollabTerminalFrame {
+	return (
+		isRecord(value) &&
+		value.type === "collab_terminal" &&
+		value.code === "unavailable" &&
+		typeof value.reason === "string"
+	);
+}
+
 function isRpcHostToolCallRequest(value: unknown): value is RpcHostToolCallRequest {
 	if (!isRecord(value)) return false;
 	return (
@@ -227,6 +364,21 @@ function isRpcHostToolCallRequest(value: unknown): value is RpcHostToolCallReque
 function isRpcHostToolCancelRequest(value: unknown): value is RpcHostToolCancelRequest {
 	if (!isRecord(value)) return false;
 	return value.type === "host_tool_cancel" && typeof value.id === "string" && typeof value.targetId === "string";
+}
+
+function isRpcHostUriRequest(value: unknown): value is RpcHostUriRequest {
+	if (!isRecord(value)) return false;
+	return (
+		value.type === "host_uri_request" &&
+		typeof value.id === "string" &&
+		(value.operation === "read" || value.operation === "write") &&
+		typeof value.url === "string"
+	);
+}
+
+function isRpcHostUriCancelRequest(value: unknown): value is RpcHostUriCancelRequest {
+	if (!isRecord(value)) return false;
+	return value.type === "host_uri_cancel" && typeof value.id === "string" && typeof value.targetId === "string";
 }
 
 function isRpcExtensionUiRequest(value: unknown): value is RpcExtensionUIRequest {
@@ -249,6 +401,7 @@ export class RpcCommandError extends Error {
 		message: string,
 		readonly command: string,
 		readonly code?: string,
+		readonly receipt?: RpcMutationReceipt,
 	) {
 		super(message);
 		this.name = "RpcCommandError";
@@ -267,6 +420,22 @@ function isPageFallbackError(error: unknown): boolean {
 // RPC Client
 // ============================================================================
 
+interface PendingRpcRequest {
+	command: RpcCommand["type"];
+	durableMutation: boolean;
+	resolve(response: RpcResponse): void;
+	reject(error: Error): void;
+}
+
+function transportLossError(request: PendingRpcRequest, error: Error): Error {
+	if (!request.durableMutation) return error;
+	return new RpcCommandError(
+		`RPC mutation may have executed before transport loss: ${error.message}`,
+		request.command,
+		"ambiguous",
+	);
+}
+
 export class RpcClient {
 	#process: RpcAgentProcess | null = null;
 	#reaping: Promise<void> | null = null;
@@ -276,14 +445,23 @@ export class RpcClient {
 	#subagentProgressListeners = new Set<RpcSubagentProgressListener>();
 	#subagentEventListeners = new Set<RpcSubagentEventListener>();
 	#availableCommandsUpdateListeners = new Set<RpcAvailableCommandsUpdateListener>();
-	#pendingRequests: Map<string, { resolve: (response: RpcResponse) => void; reject: (error: Error) => void }> =
-		new Map();
+	#collabFrameListeners = new Set<RpcCollabFrameListener>();
+	#unavailableListeners = new Set<RpcUnavailableListener>();
+	#pendingRequests = new Map<string, PendingRpcRequest>();
 	#customTools: RpcClientCustomTool[] = [];
 	#pendingHostToolCalls = new Map<string, { controller: AbortController }>();
 	#requestId = 0;
 	#protocolVersion: RpcProtocolVersion = 1;
-	#extensionUiListeners: Set<(req: RpcExtensionUIRequest) => void> = new Set();
+	#extensionUiListeners: Set<RpcExtensionUIRequestListener> = new Set();
+	#hostToolCallListeners = new Set<RpcHostToolCallListener>();
+	#hostToolCancelListeners = new Set<RpcHostToolCancelListener>();
+	#hostUriRequestListeners = new Set<RpcHostUriRequestListener>();
+	#hostUriCancelListeners = new Set<RpcHostUriCancelListener>();
+	#pendingHostUriRequests = new Set<string>();
 	#abortController = new AbortController();
+	#ready: RpcReadyFrame | undefined;
+	#unavailable: RpcCollabTerminalFrame | undefined;
+	#herdrAgentdRebindTokens: string[] = [];
 
 	constructor(private options: RpcClientOptions = {}) {
 		this.#customTools = [...(options.customTools ?? [])];
@@ -306,35 +484,60 @@ export class RpcClient {
 		// Mint a fresh controller so a previous stop()'s abort does not
 		// short-circuit the new stdout reader (issue #4079).
 		this.#abortController = new AbortController();
+		this.#ready = undefined;
+		this.#unavailable = undefined;
+		this.#pendingHostUriRequests.clear();
 		this.#protocolVersion = 1;
+		this.#herdrAgentdRebindTokens = [];
 
-		const cliPath = this.options.cliPath ?? "dist/cli.js";
-		const args = ["--mode", "rpc"];
+		const herdrAgentdHost = this.options.herdrAgentdHost
+			? validateHerdrAgentdHostBridge(this.options.herdrAgentdHost)
+			: undefined;
+		const args: string[] = [];
+		if (this.options.provider) args.push("--provider", this.options.provider);
+		if (this.options.model) args.push("--model", this.options.model);
+		if (this.options.sessionDir) args.push("--session-dir", this.options.sessionDir);
+		if (this.options.args) args.push(...this.options.args);
 
-		if (this.options.provider) {
-			args.push("--provider", this.options.provider);
+		const environment: Record<string, string | undefined> = { ...Bun.env, ...this.options.env };
+		if (herdrAgentdHost) {
+			delete environment.HERDR_SOCKET_PATH;
+			delete environment.HERDR_OMP_GUEST_BRIDGE_TOKEN;
+			environment.HERDR_OMP_BRIDGE = herdrAgentdHost.address;
+			environment.HERDR_OMP_BRIDGE_TOKEN = herdrAgentdHost.token;
+			environment.HERDR_PANE_ID = herdrAgentdHost.paneId;
+			environment.HERDR_OMP_ROUTE_GENERATION = String(herdrAgentdHost.routeGeneration);
 		}
-		if (this.options.model) {
-			args.push("--model", this.options.model);
+
+		let child: RpcAgentProcess;
+		try {
+			if (this.options.spawn) {
+				child = await this.options.spawn([...(herdrAgentdHost ? [] : ["--mode", "rpc"]), ...args]);
+			} else {
+				const cliPath = this.options.cliPath ?? "dist/cli.js";
+				const launchCommand = this.options.launchCommand
+					? validateLaunchCommand(this.options.launchCommand)
+					: undefined;
+				if (herdrAgentdHost && launchCommand && !launchCommand.includes("__collab-rpc-host")) {
+					throw new Error("RpcClient herdrAgentdHost requires the __collab-rpc-host launch command");
+				}
+				let command: string[];
+				if (launchCommand) {
+					command = [...launchCommand, ...args];
+				} else if (herdrAgentdHost) {
+					command = ["bun", cliPath, "__collab-rpc-host", ...args];
+				} else {
+					const agentArgs = ["--mode", "rpc", ...args];
+					command =
+						typeof this.options.command === "function"
+							? this.options.command(agentArgs)
+							: [...(this.options.command ?? ["bun", cliPath]), ...agentArgs];
+				}
+				child = ptree.spawn(command, { cwd: this.options.cwd, env: environment, stdin: "pipe" });
+			}
+		} catch (error) {
+			throw redactSecretError(error, herdrAgentdHost?.token);
 		}
-		if (this.options.sessionDir) {
-			args.push("--session-dir", this.options.sessionDir);
-		}
-		if (this.options.args) {
-			args.push(...this.options.args);
-		}
-		const child = this.options.spawn
-			? await this.options.spawn(args)
-			: ptree.spawn(
-					typeof this.options.command === "function"
-						? this.options.command(args)
-						: [...(this.options.command ?? ["bun", cliPath]), ...args],
-					{
-						cwd: this.options.cwd,
-						env: { ...Bun.env, ...this.options.env },
-						stdin: "pipe",
-					},
-				);
 		this.#process = child;
 
 		// Wait for the "ready" signal or process exit
@@ -348,9 +551,11 @@ export class RpcClient {
 			if (this.#process !== child) return;
 
 			this.#process = null;
+			this.#herdrAgentdRebindTokens = [];
 			this.#abortController.abort(error);
 			const pendingRequests = Array.from(this.#pendingRequests.values());
 			this.#pendingRequests.clear();
+			this.#pendingHostUriRequests.clear();
 			for (const pendingCall of this.#pendingHostToolCalls.values()) pendingCall.controller.abort(error);
 			this.#pendingHostToolCalls.clear();
 
@@ -360,7 +565,7 @@ export class RpcClient {
 				// The process may already have exited.
 			}
 			await this.#waitForExit(child);
-			for (const request of pendingRequests) request.reject(error);
+			for (const request of pendingRequests) request.reject(transportLossError(request, error));
 		};
 
 		// Process lines in background, intercepting the ready signal.
@@ -368,6 +573,21 @@ export class RpcClient {
 		void (async () => {
 			for await (const line of lines) {
 				if (!readySettled && isRecord(line) && line.type === "ready") {
+					if (!isRpcReadyFrame(line)) {
+						throw new RpcCommandError(
+							"RPC ready frame is missing required identity or capability fields",
+							"ready",
+							"protocol-error",
+						);
+					}
+					if (herdrAgentdHost && !line.capabilities.includes(RPC_HERDR_AGENTD_HOST_CAPABILITY)) {
+						throw new RpcCommandError(
+							"RPC host composition did not advertise the required Herdr capability",
+							"ready",
+							"protocol-error",
+						);
+					}
+					this.#ready = line;
 					protocolV2Supported = supportsRpcProtocolV2(line);
 					readySettled = true;
 					readyResolve();
@@ -400,8 +620,9 @@ export class RpcClient {
 				),
 				Bun.sleep(100).then(() => null),
 			]);
-			const error =
-				exitResult === null
+			const error = this.#unavailable
+				? new RpcCommandError(this.#unavailable.reason, "collab", "unavailable")
+				: exitResult === null
 					? new Error(`Agent output stream ended unexpectedly. Stderr: ${child.peekStderr()}`)
 					: "exitCode" in exitResult
 						? new Error(`Agent process exited with code ${exitResult.exitCode}. Stderr: ${child.peekStderr()}`)
@@ -416,7 +637,11 @@ export class RpcClient {
 				readyReject(error);
 				return;
 			}
-			await reapAfterOutputFailure(new Error(`Agent output reader failed: ${error.message}`, { cause: error }));
+			await reapAfterOutputFailure(
+				this.#unavailable
+					? new RpcCommandError(this.#unavailable.reason, "collab", "unavailable")
+					: new Error(`Agent output reader failed: ${error.message}`, { cause: error }),
+			);
 		});
 
 		// Also race against process exit (in case stdout closes before we read it)
@@ -462,9 +687,9 @@ export class RpcClient {
 		} catch (cause) {
 			// Startup failed after spawning the child. Reap it before returning
 			// so a retry cannot inherit a live worker or its session lock.
-			const error = cause instanceof Error ? cause : new Error(String(cause));
+			const error = redactSecretError(cause, herdrAgentdHost?.token);
 			await reapAfterOutputFailure(error);
-			throw cause;
+			throw error;
 		} finally {
 			clearTimeout(readyTimeout);
 		}
@@ -474,14 +699,16 @@ export class RpcClient {
 	 * Stop the RPC agent process.
 	 */
 	stop(): Promise<void> {
+		this.#herdrAgentdRebindTokens = [];
 		if (!this.#process) return this.#reaping ?? Promise.resolve();
 
 		const error = new Error("Client stopped");
 		const child = this.#process;
+		this.#pendingHostUriRequests.clear();
 		child.kill(undefined, this.options.terminationGraceMs);
 		this.#abortController.abort(error);
 		this.#process = null;
-		for (const request of this.#pendingRequests.values()) request.reject(error);
+		for (const request of this.#pendingRequests.values()) request.reject(transportLossError(request, error));
 		this.#pendingRequests.clear();
 		for (const pendingCall of this.#pendingHostToolCalls.values()) {
 			pendingCall.controller.abort(error);
@@ -507,6 +734,16 @@ export class RpcClient {
 			if (this.#reaping === reaping) this.#reaping = null;
 		});
 		return reaping;
+	}
+
+	/** Immutable identity and capabilities received from the server's ready frame. */
+	get ready(): RpcReadyFrame | undefined {
+		return this.#ready;
+	}
+
+	/** Terminal authoritative availability state, when a replica-backed endpoint has closed. */
+	get unavailable(): RpcCollabTerminalFrame | undefined {
+		return this.#unavailable;
 	}
 
 	/**
@@ -567,11 +804,64 @@ export class RpcClient {
 		return () => this.#availableCommandsUpdateListeners.delete(listener);
 	}
 
+	/** Subscribe to authoritative Collab host frames forwarded by a replica-backed RPC endpoint. */
+	onCollabFrame(listener: RpcCollabFrameListener): () => void {
+		this.#collabFrameListeners.add(listener);
+		return () => this.#collabFrameListeners.delete(listener);
+	}
+
+	/** Subscribe to extension UI and permission requests emitted by the RPC server. */
+	onExtensionUIRequest(listener: RpcExtensionUIRequestListener): () => void {
+		this.#extensionUiListeners.add(listener);
+		return () => this.#extensionUiListeners.delete(listener);
+	}
+
+	/**
+	 * Subscribe to raw host-tool call frames. When at least one listener is
+	 * registered, it takes precedence over `customTools` for new calls.
+	 */
+	onHostToolCall(listener: RpcHostToolCallListener): () => void {
+		this.#hostToolCallListeners.add(listener);
+		return () => this.#hostToolCallListeners.delete(listener);
+	}
+
+	/** Subscribe to raw host-tool cancellation frames. */
+	onHostToolCancel(listener: RpcHostToolCancelListener): () => void {
+		this.#hostToolCancelListeners.add(listener);
+		return () => this.#hostToolCancelListeners.delete(listener);
+	}
+
+	/** Subscribe to raw host-URI request frames. */
+	onHostUriRequest(listener: RpcHostUriRequestListener): () => void {
+		this.#hostUriRequestListeners.add(listener);
+		return () => this.#hostUriRequestListeners.delete(listener);
+	}
+
+	/** Subscribe to raw host-URI cancellation frames. */
+	onHostUriCancel(listener: RpcHostUriCancelListener): () => void {
+		this.#hostUriCancelListeners.add(listener);
+		return () => this.#hostUriCancelListeners.delete(listener);
+	}
+
+	/** Subscribe to authoritative replica endpoint closure. */
+	onUnavailable(listener: RpcUnavailableListener): () => void {
+		this.#unavailableListeners.add(listener);
+		return () => this.#unavailableListeners.delete(listener);
+	}
+
 	/**
 	 * Get collected stderr output (useful for debugging).
 	 */
 	getStderr(): string {
 		return this.#process?.peekStderr() ?? "";
+	}
+
+	/**
+	 * Send one canonical RPC command and return its validated raw response.
+	 * Transport request IDs are assigned by this client.
+	 */
+	request(command: RpcCommandInput, timeout?: number | null): Promise<RpcResponse> {
+		return this.#send(command, timeout);
 	}
 
 	#startTimeout(timeoutMs: number, onTimeout: () => void): NodeJS.Timeout {
@@ -585,12 +875,37 @@ export class RpcClient {
 	// =========================================================================
 
 	/**
-	 * Send a prompt to the agent.
-	 * Returns immediately after sending; use onEvent() to receive streaming events.
-	 * Use waitForIdle() to wait for completion.
+	 * Send a prompt to the agent. Legacy calls return after dispatch; calls with
+	 * mutation provenance resolve only after the durable terminal receipt exists.
+	 * Use onEvent() to receive streaming events.
 	 */
-	async prompt(message: string, images?: ImageContent[]): Promise<void> {
-		await this.#send({ type: "prompt", message, images });
+	prompt(message: string, options: RpcDurablePromptOptions): Promise<RpcMutationReceipt>;
+	prompt(message: string, options?: RpcPromptOptions): Promise<void>;
+	prompt(message: string, images?: ImageContent[]): Promise<void>;
+	prompt(
+		message: string,
+		images: ImageContent[] | undefined,
+		mutation: RpcMutationContext,
+	): Promise<RpcMutationReceipt>;
+	async prompt(
+		message: string,
+		imagesOrOptions?: ImageContent[] | RpcPromptOptions | RpcDurablePromptOptions,
+		legacyMutation?: RpcMutationContext,
+	): Promise<void | RpcMutationReceipt> {
+		const options = Array.isArray(imagesOrOptions) ? undefined : imagesOrOptions;
+		const images = Array.isArray(imagesOrOptions) ? imagesOrOptions : options?.images;
+		const durableOptions = options && "mutation" in options ? (options as RpcDurablePromptOptions) : undefined;
+		const mutation = legacyMutation ?? durableOptions?.mutation;
+		const toolChoice = durableOptions?.toolChoice;
+		const receipt = this.#getMutationReceipt(
+			await this.#send(
+				{ type: "prompt", message, images, mutation, toolChoice, streamingBehavior: options?.streamingBehavior },
+				mutation ? null : 30_000,
+			),
+		);
+		if (mutation && !receipt)
+			throw new RpcCommandError("Prompt response omitted its durable receipt", "prompt", "protocol-error");
+		return receipt;
 	}
 
 	/**
@@ -610,8 +925,100 @@ export class RpcClient {
 	/**
 	 * Abort current operation.
 	 */
-	async abort(): Promise<void> {
-		await this.#send({ type: "abort" });
+	abort(): Promise<void>;
+	abort(mutation: RpcMutationContext): Promise<RpcMutationReceipt>;
+	async abort(mutation?: RpcMutationContext): Promise<void | RpcMutationReceipt> {
+		const receipt = this.#getMutationReceipt(await this.#send({ type: "abort", mutation }, mutation ? null : 30_000));
+		if (mutation && !receipt)
+			throw new RpcCommandError("Abort response omitted its durable receipt", "abort", "protocol-error");
+		return receipt;
+	}
+
+	/** Answer an authoritative Collab UI request forwarded by a replica-backed endpoint. */
+	respondToCollabUi(reqId: number, value?: CollabUiResponseValue): Promise<void>;
+	respondToCollabUi(
+		reqId: number,
+		value: CollabUiResponseValue | undefined,
+		mutation: RpcMutationContext,
+	): Promise<RpcMutationReceipt>;
+	async respondToCollabUi(
+		reqId: number,
+		value?: CollabUiResponseValue,
+		mutation?: RpcMutationContext,
+	): Promise<void | RpcMutationReceipt> {
+		const receipt = this.#getMutationReceipt(
+			await this.#send({ type: "collab_ui_response", reqId, value, mutation }),
+		);
+		if (mutation && !receipt) {
+			throw new RpcCommandError(
+				"Collab UI response omitted its durable receipt",
+				"collab_ui_response",
+				"protocol-error",
+			);
+		}
+		return receipt;
+	}
+
+	/** Stage one transient credential tuple for the next committed agentd-owned Herdr session route. */
+	async prepareHerdrAgentdRebind(input: RpcHerdrAgentdHostBridge): Promise<void> {
+		if (!this.#process?.stdin) throw new Error("Client not started");
+		if (!this.#ready?.capabilities.includes(RPC_HERDR_AGENTD_HOST_CAPABILITY)) {
+			throw new RpcCommandError(
+				"RPC endpoint does not advertise agentd-owned Herdr hosting",
+				"prepare_herdr_agentd_rebind",
+				"protocol-error",
+			);
+		}
+		const frame = buildHerdrAgentdRebindFrame(input);
+		this.#herdrAgentdRebindTokens = [
+			input.token,
+			...this.#herdrAgentdRebindTokens.filter(token => token !== input.token),
+		].slice(0, 2);
+		try {
+			await this.#writeFrame(frame);
+		} catch (error) {
+			throw redactSecretError(error, ...this.#herdrAgentdRebindTokens, this.options.herdrAgentdHost?.token);
+		}
+	}
+
+	/** Discard any transient credential tuple staged for an agentd-owned Herdr successor route. */
+	async clearHerdrAgentdRebind(): Promise<void> {
+		if (!this.#process?.stdin) throw new Error("Client not started");
+		if (!this.#ready?.capabilities.includes(RPC_HERDR_AGENTD_HOST_CAPABILITY)) {
+			throw new RpcCommandError(
+				"RPC endpoint does not advertise agentd-owned Herdr hosting",
+				"clear_herdr_agentd_rebind",
+				"protocol-error",
+			);
+		}
+		try {
+			await this.#writeFrame({ type: "clear_herdr_agentd_rebind" });
+		} catch (error) {
+			throw redactSecretError(error, ...this.#herdrAgentdRebindTokens, this.options.herdrAgentdHost?.token);
+		}
+		this.#herdrAgentdRebindTokens = [];
+	}
+
+	/** Respond to an extension UI or permission request after its frame is physically flushed. */
+	respondToExtensionUI(response: RpcExtensionUIResponse): Promise<void> {
+		return this.#writeFrame(response);
+	}
+
+	/** Send a canonical host-tool partial result frame and await its physical flush. */
+	sendHostToolUpdate(update: RpcHostToolUpdate): Promise<void> {
+		return this.#writeFrame(update);
+	}
+
+	/** Send a canonical host-tool terminal result frame and await its physical flush. */
+	sendHostToolResult(result: RpcHostToolResult): Promise<void> {
+		return this.#writeFrame(result);
+	}
+
+	/** Send a canonical host-URI terminal result frame and await its physical flush. */
+	sendHostUriResult(result: RpcHostUriResult): Promise<void> {
+		if (!this.#process?.stdin) return Promise.reject(new Error("Client not started"));
+		if (!this.#pendingHostUriRequests.delete(result.id)) return Promise.resolve();
+		return this.#writeFrame(result);
 	}
 
 	/**
@@ -841,6 +1248,123 @@ export class RpcClient {
 		return this.#getData(response);
 	}
 
+	/** Fork the persisted native session. Provenance calls also return the durable receipt. */
+	fork(): Promise<{ sessionId: string; cancelled: boolean }>;
+	fork(mutation: RpcMutationContext): Promise<{ sessionId: string; cancelled: boolean; receipt: RpcMutationReceipt }>;
+	fork(
+		options: RpcForkAtEntryOptions,
+	): Promise<{ sessionId: string; cancelled: boolean; receipt: RpcMutationReceipt }>;
+	async fork(
+		mutationOrOptions?: RpcMutationContext | RpcForkAtEntryOptions,
+	): Promise<{ sessionId: string; cancelled: boolean; receipt?: RpcMutationReceipt }> {
+		const atEntry = mutationOrOptions && "entryId" in mutationOrOptions ? mutationOrOptions : undefined;
+		if (atEntry && !this.#ready?.capabilities.includes("fork-entry")) {
+			throw new RpcCommandError("RPC endpoint does not advertise exact-entry forks", "fork", "protocol-error");
+		}
+		const mutation = atEntry ? atEntry.mutation : (mutationOrOptions as RpcMutationContext | undefined);
+		const response = await this.#send(
+			{ type: "fork", entryId: atEntry?.entryId, mutation },
+			mutation ? null : 30_000,
+		);
+		const data = this.#getData<{ sessionId: string; cancelled: boolean }>(response);
+		if (!mutation) return data;
+		const receipt = this.#getMutationReceipt(response);
+		if (!receipt) throw new RpcCommandError("Fork response omitted its durable receipt", "fork", "protocol-error");
+		return { ...data, receipt };
+	}
+
+	/** List native ArtifactManager files for the current session. */
+	async listArtifacts(): Promise<RpcArtifactListResult> {
+		return this.#getData(await this.#send({ type: "artifact_list" }));
+	}
+
+	/** Read one bounded UTF-8 ArtifactManager file by canonical numeric ID. */
+	async readArtifact(artifactId: string): Promise<RpcArtifactReadResult> {
+		return this.#getData(await this.#send({ type: "artifact_read", artifactId }));
+	}
+
+	/** Write durable text through ArtifactManager and return its mutation receipt. */
+	async writeArtifact(
+		content: string,
+		mutation: RpcMutationContext,
+		toolType?: string,
+	): Promise<RpcArtifactWriteResult & { receipt: RpcMutationReceipt }> {
+		const response = await this.#send({ type: "artifact_write", content, toolType, mutation }, null);
+		const data = this.#getData<RpcArtifactWriteResult>(response);
+		const receipt = this.#getMutationReceipt(response);
+		if (!receipt)
+			throw new RpcCommandError(
+				"Artifact write response omitted its durable receipt",
+				"artifact_write",
+				"protocol-error",
+			);
+		return { ...data, receipt };
+	}
+
+	/** List canonical content-addressed blobs. */
+	async listBlobs(): Promise<RpcBlobListResult> {
+		return this.#getData(await this.#send({ type: "blob_list" }));
+	}
+
+	/** Read one bounded blob as canonical base64. */
+	async readBlob(hash: string): Promise<RpcBlobReadResult> {
+		return this.#getData(await this.#send({ type: "blob_read", hash }));
+	}
+
+	/** Write one binary blob after hashing it into the canonical command shape. */
+	async writeBlob(
+		data: Buffer,
+		mutation: RpcMutationContext,
+	): Promise<RpcBlobWriteResult & { receipt: RpcMutationReceipt }> {
+		const hash = new Bun.SHA256().update(data).digest("hex");
+		const response = await this.#send(
+			{ type: "blob_write", hash, size: data.byteLength, content: data.toString("base64"), mutation },
+			null,
+		);
+		const result = this.#getData<RpcBlobWriteResult>(response);
+		const receipt = this.#getMutationReceipt(response);
+		if (!receipt)
+			throw new RpcCommandError("Blob write response omitted its durable receipt", "blob_write", "protocol-error");
+		return { ...result, receipt };
+	}
+
+	/** Inject one generic custom message without transport-specific delivery controls. */
+	async sendCustomMessage(
+		message: RpcCustomMessagePayload,
+		mutation: RpcMutationContext,
+	): Promise<RpcCustomMessageResult & { receipt: RpcMutationReceipt }> {
+		const response = await this.#send({ type: "custom_message", ...message, mutation }, null);
+		const result = this.#getData<RpcCustomMessageResult>(response);
+		const receipt = this.#getMutationReceipt(response);
+		if (!receipt)
+			throw new RpcCommandError(
+				"Custom message response omitted its durable receipt",
+				"custom_message",
+				"protocol-error",
+			);
+		return { ...result, receipt };
+	}
+
+	/** Return a complete exact history snapshot when it fits the bounded snapshot response. */
+	async getHistorySnapshot(): Promise<RpcHistorySnapshot> {
+		return this.#getData(await this.#send({ type: "history_snapshot" }));
+	}
+
+	/** Return one canonical typed history page. */
+	async getHistoryPage(options: RpcHistoryPageOptions = {}): Promise<RpcHistoryPage> {
+		return this.#getData(await this.#send({ type: "history_page", ...options }));
+	}
+
+	/** Return one byte-bounded chunk of the exact serialized history snapshot. */
+	async getHistoryChunk(options: RpcHistoryChunkOptions = {}): Promise<RpcHistoryChunk> {
+		return this.#getData(await this.#send({ type: "history_chunk", ...options }));
+	}
+
+	/** Return the SHA-256 digest and exact snapshot bounds without transferring history. */
+	async getHistoryDigest(): Promise<RpcHistoryDigest> {
+		return this.#getData(await this.#send({ type: "history_digest" }));
+	}
+
 	/**
 	 * Get messages available for branching.
 	 */
@@ -939,29 +1463,36 @@ export class RpcClient {
 						}
 						if (req.method !== "input" || !onManualCodeInput) return;
 						void Promise.resolve(onManualCodeInput({ title: req.title, placeholder: req.placeholder }))
-							.then(value => {
-								this.#writeFrame({
+							.then(value =>
+								this.respondToExtensionUI({
 									type: "extension_ui_response",
 									id: req.id,
 									value,
-								});
-							})
-							.catch(() => {
-								this.#writeFrame({
+								}),
+							)
+							.catch(() =>
+								this.respondToExtensionUI({
 									type: "extension_ui_response",
 									id: req.id,
 									cancelled: true,
-								});
-							});
+								}),
+							)
+							.catch(() => {});
 					}
 				: undefined;
-		if (listener) this.#extensionUiListeners.add(listener);
+		const unsubscribe = listener ? this.onExtensionUIRequest(listener) : undefined;
 		try {
 			const response = await this.#send({ type: "login", providerId }, 600_000);
 			return this.#getData<{ providerId: string }>(response);
 		} finally {
-			if (listener) this.#extensionUiListeners.delete(listener);
+			unsubscribe?.();
 		}
+	}
+
+	/** Backward-compatible alias for resolving a host URI request. */
+	respondHostUri(response: RpcHostUriResult): Promise<void> {
+		this.#pendingHostUriRequests.delete(response.id);
+		return this.#writeFrame(response);
 	}
 
 	/**
@@ -983,6 +1514,15 @@ export class RpcClient {
 		}));
 		const response = await this.#send({ type: "set_host_tools", tools: definitions });
 		return this.#getData<{ toolNames: string[] }>(response).toolNames;
+	}
+
+	/**
+	 * Replace the host-owned URI schemes exposed to the RPC session.
+	 * Changes take effect before the next tool call.
+	 */
+	async setHostUriSchemes(schemes: RpcHostUriSchemeDefinition[]): Promise<string[]> {
+		const response = await this.#send({ type: "set_host_uri_schemes", schemes });
+		return this.#getData<{ schemes: string[] }>(response).schemes;
 	}
 
 	// =========================================================================
@@ -1066,7 +1606,11 @@ export class RpcClient {
 		}
 
 		if (isRpcHostToolCallRequest(data)) {
-			void this.#handleHostToolCall(data);
+			if (this.#hostToolCallListeners.size > 0) {
+				for (const listener of this.#hostToolCallListeners) listener(data);
+			} else {
+				void this.#handleHostToolCall(data);
+			}
 			return;
 		}
 
@@ -1078,7 +1622,28 @@ export class RpcClient {
 		}
 
 		if (isRpcHostToolCancelRequest(data)) {
+			for (const listener of this.#hostToolCancelListeners) listener(data);
 			this.#pendingHostToolCalls.get(data.targetId)?.controller.abort();
+			return;
+		}
+
+		if (isRpcHostUriRequest(data)) {
+			this.#pendingHostUriRequests.add(data.id);
+			if (this.#hostUriRequestListeners.size > 0) {
+				for (const listener of this.#hostUriRequestListeners) listener(data);
+			} else {
+				void this.sendHostUriResult({
+					type: "host_uri_result",
+					id: data.id,
+					isError: true,
+					error: "No host URI request handler is registered",
+				}).catch(() => {});
+			}
+			return;
+		}
+
+		if (isRpcHostUriCancelRequest(data)) {
+			for (const listener of this.#hostUriCancelListeners) listener(data);
 			return;
 		}
 
@@ -1110,6 +1675,24 @@ export class RpcClient {
 			return;
 		}
 
+		if (isRpcCollabFrameEvent(data)) {
+			for (const listener of this.#collabFrameListeners) {
+				listener(data.frame);
+			}
+			return;
+		}
+
+		if (isRpcCollabTerminalFrame(data)) {
+			this.#unavailable = data;
+			for (const listener of this.#unavailableListeners) listener(data);
+			for (const [id, pending] of this.#pendingRequests) {
+				if (pending.durableMutation) continue;
+				this.#pendingRequests.delete(id);
+				pending.reject(new RpcCommandError(data.reason, pending.command, "unavailable"));
+			}
+			return;
+		}
+
 		if (!isAgentSessionEvent(data)) return;
 
 		for (const listener of this.#sessionEventListeners) {
@@ -1123,25 +1706,44 @@ export class RpcClient {
 		}
 	}
 
-	#send(command: RpcCommandBody, timeoutMs = 30_000): Promise<RpcResponse> {
+	#send(command: RpcCommandInput, timeoutMs?: number | null): Promise<RpcResponse> {
 		if (!this.#process?.stdin) {
 			throw new Error("Client not started");
 		}
+
+		const durableMutation = isRpcMutationCommand(command) && command.mutation !== undefined;
+		if (durableMutation && !this.#ready?.capabilities.includes("mutation-receipts")) {
+			return Promise.reject(
+				new RpcCommandError(
+					"RPC endpoint does not advertise durable mutation receipts",
+					command.type,
+					"protocol-error",
+				),
+			);
+		}
+		const effectiveTimeoutMs = timeoutMs === undefined ? (durableMutation ? null : 30_000) : timeoutMs;
 
 		const id = `req_${++this.#requestId}`;
 		const fullCommand = { ...command, id } as RpcCommand;
 		const { promise, resolve, reject } = Promise.withResolvers<RpcResponse>();
 		let settled = false;
-		const timeoutId = this.#startTimeout(timeoutMs, () => {
-			if (settled) return;
-			this.#pendingRequests.delete(id);
-			settled = true;
-			reject(
-				new Error(`Timeout waiting for response to ${command.type}. Stderr: ${this.#process?.peekStderr() ?? ""}`),
-			);
-		});
+		const timeoutId =
+			effectiveTimeoutMs === null
+				? undefined
+				: this.#startTimeout(effectiveTimeoutMs, () => {
+						if (settled) return;
+						this.#pendingRequests.delete(id);
+						settled = true;
+						reject(
+							new Error(
+								`Timeout waiting for response to ${command.type}. Stderr: ${this.#process?.peekStderr() ?? ""}`,
+							),
+						);
+					});
 
-		this.#pendingRequests.set(id, {
+		const pendingRequest: PendingRpcRequest = {
+			command: command.type,
+			durableMutation,
 			resolve: response => {
 				if (settled) return;
 				settled = true;
@@ -1154,22 +1756,22 @@ export class RpcClient {
 				clearTimeout(timeoutId);
 				reject(error);
 			},
-		});
+		};
+		this.#pendingRequests.set(id, pendingRequest);
 
-		this.#writeFrame(fullCommand, err => {
+		const rejectWriteFailure = (error: Error): void => {
+			if (this.#pendingRequests.get(id) !== pendingRequest) return;
 			this.#pendingRequests.delete(id);
-			if (settled) return;
-			settled = true;
-			clearTimeout(timeoutId);
-			reject(err);
-		});
+			pendingRequest.reject(transportLossError(pendingRequest, error));
+		};
+		void this.#writeFrame(fullCommand).catch(rejectWriteFailure);
 		return promise;
 	}
 
 	async #handleHostToolCall(request: RpcHostToolCallRequest): Promise<void> {
 		const tool = this.#customTools.find(candidate => candidate.name === request.toolName);
 		if (!tool) {
-			this.#writeFrame({
+			await this.#writeFrame({
 				type: "host_tool_result",
 				id: request.id,
 				result: {
@@ -1186,11 +1788,11 @@ export class RpcClient {
 
 		const sendUpdate = (partialResult: RpcClientToolResult<unknown>): void => {
 			if (controller.signal.aborted) return;
-			this.#writeFrame({
+			void this.#writeFrame({
 				type: "host_tool_update",
 				id: request.id,
 				partialResult: normalizeToolResult(partialResult),
-			} satisfies RpcHostToolUpdate);
+			} satisfies RpcHostToolUpdate).catch(() => {});
 		};
 
 		try {
@@ -1200,14 +1802,14 @@ export class RpcClient {
 				sendUpdate,
 			});
 			if (controller.signal.aborted) return;
-			this.#writeFrame({
+			await this.#writeFrame({
 				type: "host_tool_result",
 				id: request.id,
 				result: normalizeToolResult(result),
 			} satisfies RpcHostToolResult);
 		} catch (error) {
 			if (controller.signal.aborted) return;
-			this.#writeFrame({
+			await this.#writeFrame({
 				type: "host_tool_result",
 				id: request.id,
 				result: {
@@ -1215,38 +1817,38 @@ export class RpcClient {
 					details: {},
 				},
 				isError: true,
-			} satisfies RpcHostToolResult);
+			} satisfies RpcHostToolResult).catch(() => {});
 		} finally {
 			this.#pendingHostToolCalls.delete(request.id);
 		}
 	}
 
-	#writeFrame(
-		frame: RpcCommand | RpcExtensionUIResponse | RpcHostToolResult | RpcHostToolUpdate,
-		onError?: (error: Error) => void,
-	): void {
-		if (!this.#process?.stdin) {
-			throw new Error("Client not started");
-		}
-		const stdin = this.#process.stdin;
-		stdin.write(`${JSON.stringify(frame)}\n`);
-		if (!("flush" in stdin)) return;
-		const flushResult = (stdin as FileSink).flush();
-		if (isPromise(flushResult)) {
-			flushResult.catch((err: Error) => {
-				onError?.(err);
-			});
-		}
+	async #writeFrame(frame: RpcCommand | RpcControlFrame): Promise<void> {
+		const stdin = this.#process?.stdin;
+		if (!stdin) throw new Error("Client not started");
+		await stdin.write(`${JSON.stringify(frame)}\n`);
+		await stdin.flush?.();
 	}
 
 	#getData<T>(response: RpcResponse): T {
 		if (!response.success) {
 			const errorResponse = response as Extract<RpcResponse, { success: false }>;
-			throw new RpcCommandError(errorResponse.error, errorResponse.command, errorResponse.code);
+			throw new RpcCommandError(
+				errorResponse.error,
+				errorResponse.command,
+				errorResponse.code,
+				errorResponse.receipt,
+			);
 		}
 		// Type assertion: we trust response.data matches T based on the command sent.
 		// This is safe because each public method specifies the correct T for its command.
 		const successResponse = response as Extract<RpcResponse, { success: true; data: unknown }>;
 		return successResponse.data as T;
+	}
+
+	#getMutationReceipt(response: RpcResponse): RpcMutationReceipt | undefined {
+		if (!response.success)
+			throw new RpcCommandError(response.error, response.command, response.code, response.receipt);
+		return "receipt" in response ? response.receipt : undefined;
 	}
 }

@@ -108,6 +108,10 @@
     },
     "./context/internal-session": null,
     "./context/internal-session.js": null,
+    "./rpc": {
+      "types": "./src/rpc/index.ts",
+      "import": "./src/rpc/index.ts"
+    },
     "./*": {
       "types": "./src/*.ts",
       "import": "./src/*.ts"

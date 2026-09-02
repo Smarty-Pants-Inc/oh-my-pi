@@ -2145,12 +2145,8 @@ export class AgentSession {
 		return format !== "native" && (format !== "auto" || this.model?.supportsTools === false);
 	}
 
-	/**
-	 * Force the next model call to target a specific active tool, then terminate
-	 * the agent loop. Pushes a two-step sequence [forced, "none"] so the model
-	 * calls exactly the forced tool once and then cannot call another.
-	 */
-	setForcedToolChoice(toolName: string): void {
+	/** Resolve one exact active tool name to the current provider's native choice shape. */
+	resolveNamedToolChoice(toolName: string): ToolChoice {
 		if (!this.getActiveToolNames().includes(toolName)) {
 			throw new Error(`Tool "${toolName}" is not currently active.`);
 		}
@@ -2159,7 +2155,16 @@ export class AgentSession {
 		if (!forced || typeof forced === "string") {
 			throw new Error("Current model does not support forcing a specific tool.");
 		}
+		return forced;
+	}
 
+	/**
+	 * Force the next model call to target a specific active tool, then terminate
+	 * the agent loop. Pushes a two-step sequence [forced, "none"] so the model
+	 * calls exactly the forced tool once and then cannot call another.
+	 */
+	setForcedToolChoice(toolName: string): void {
+		const forced = this.resolveNamedToolChoice(toolName);
 		this.#toolChoiceQueue.pushSequence([forced, "none"], {
 			label: "user-force",
 			onRejected: info => (info.reason === "unavailable" ? "drop_sequence" : "requeue"),
@@ -6571,6 +6576,18 @@ export class AgentSession {
 		this.agent.replaceMessages(messages);
 	}
 
+	/** Reload a trusted replicated transcript without lifecycle hooks, cancellation, or provider mutation. */
+	async reloadReplicatedSession(sessionPath: string): Promise<void> {
+		await this.sessionManager.setSessionFile(sessionPath);
+		this.refreshReplicatedSessionContext();
+	}
+
+	/** Rebuild visible conversation semantics after ingesting a replicated transcript entry. */
+	refreshReplicatedSessionContext(): void {
+		const context = this.buildDisplaySessionContext();
+		this.#replaceMessagesFromSessionContext(context);
+	}
+
 	/**
 	 * Transcript for TUI display. Full history is kept for export/resume-style
 	 * callers; live chat can collapse compacted history to keep the hot render
@@ -7370,7 +7387,6 @@ export class AgentSession {
 			return true;
 		}
 
-		const promptAttribution = options?.attribution ?? (options?.synthetic ? "agent" : "user");
 		if (externalThinkingToolChoice) {
 			this.#toolChoiceQueue.pushOnce(externalThinkingToolChoice, {
 				label: "external-thinking",
@@ -8885,6 +8901,9 @@ export class AgentSession {
 		if (options?.deliveryMode && this.#isDisposed) return { status: "unavailable", reason: "session_transition" };
 		const lifecycleGeneration = this.#lifecycleTransitionGeneration;
 		const semanticMode = options?.deliveryMode;
+		if (options?.when === "idle" && (this.isStreaming || this.isCompacting || this.#lifecycleTransitionFenceActive)) {
+			return { status: "unavailable", reason: "session_busy" };
+		}
 		if (options?.automaticTurnSource !== undefined && options.automaticTurnSource !== "peer_message_wake") {
 			throw new Error('automaticTurnSource must be "peer_message_wake"');
 		}
@@ -8921,6 +8940,9 @@ export class AgentSession {
 		};
 		this.#advisors.retainPrimaryInput([appMessage]);
 		const normalizedAppMessage = await this.#normalizeAgentMessageImages(appMessage);
+		if (options?.when === "idle" && (this.isStreaming || this.isCompacting || this.#lifecycleTransitionFenceActive)) {
+			return { status: "unavailable", reason: "session_busy" };
+		}
 		if (semanticMode) {
 			const acceptance = this.#beginSemanticDeliveryAcceptance();
 			try {
@@ -10337,13 +10359,17 @@ export class AgentSession {
 	}
 
 	/**
-	 * Fork the current session, creating a new session file with the exact same state.
-	 * Copies all entries and artifacts to the new session.
-	 * Unlike newSession(), this preserves all messages in the agent state.
+	 * Fork the current session into a new persisted session.
+	 * Without `entryId`, preserves the full tree and current messages. With `entryId`,
+	 * materializes only the canonical root-to-entry path. Artifacts are copied in both cases.
 	 * @returns true if completed, false if cancelled by hook or not persisting
 	 */
-	async fork(): Promise<boolean> {
+	async fork(deferSessionChange?: (publish: () => void) => void, options?: { entryId?: string }): Promise<boolean> {
 		this.#assertVibeSessionTransitionAllowed("fork the session");
+		const entryId = options?.entryId;
+		if (entryId !== undefined && !this.sessionManager.getEntry(entryId)) {
+			throw new Error(`Entry ${entryId} not found`);
+		}
 		const previousSessionFile = this.sessionFile;
 		const previousSessionId = this.sessionManager.getSessionId();
 
@@ -11685,6 +11711,7 @@ export class AgentSession {
 			} else {
 				await lifecycle.commit(commitOptions);
 			}
+
 			return { selectedText, selectedImages, cancelled: false };
 		} catch (error) {
 			await lifecycle.rollback({
@@ -11810,6 +11837,7 @@ export class AgentSession {
 			} else {
 				await lifecycle.commit(commitOptions);
 			}
+
 			return { cancelled: false, sessionFile: this.sessionFile };
 		} catch (error) {
 			await lifecycle.rollback({

@@ -128,7 +128,16 @@ function write(frame) {
 	process.stdout.write(JSON.stringify(frame) + "\\n");
 }
 
-write({ type: "ready" });
+write({
+	type: "ready",
+	protocolVersion: 1,
+	supportedProtocolVersions: [1, 2],
+	maxFrameBytes: 1,
+	maxReassembledFrameBytes: 1,
+	buildId: "test-rpc-host-tools",
+	version: "test",
+	capabilities: []
+});
 
 process.stdin.on("data", chunk => {
 	buffer += chunk.toString("utf8");

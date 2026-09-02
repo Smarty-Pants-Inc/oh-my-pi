@@ -17,11 +17,11 @@ describe("OMP build identity", () => {
 		};
 		const moduleProbe = await $`bun ${probeEntry}`.cwd(packageDir).env(env).quiet().nothrow();
 		expect(moduleProbe.exitCode).toBe(0);
-		expect(moduleProbe.text()).toBe("\n");
+		expect(moduleProbe.text()).toMatch(/^source-[0-9a-f]+\n$/);
 
 		const cliProbe = await $`bun ${cliEntry} __build-id`.cwd(packageDir).env(env).quiet().nothrow();
 		expect(cliProbe.exitCode).toBe(0);
-		expect(cliProbe.text()).toBe("\n");
+		expect(cliProbe.text()).toBe(moduleProbe.text());
 	});
 
 	it("uses only the dedicated manager argument for immutable source releases", async () => {

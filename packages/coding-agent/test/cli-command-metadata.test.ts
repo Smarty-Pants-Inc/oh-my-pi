@@ -6,7 +6,7 @@ import {
 	renderCommandHelp,
 	renderRootHelp,
 } from "@oh-my-pi/pi-utils/cli";
-import { commands } from "../src/cli-commands";
+import { commands, isSubcommand } from "../src/cli-commands";
 
 function captureStdout(render: () => void): string {
 	const chunks: string[] = [];
@@ -49,5 +49,10 @@ describe("CLI command help metadata", () => {
 			const description = commandOutput.split("\n", 1)[0];
 			expect(metadataRoot).toContain(`  ${name.padEnd(maxNameLength + 2)}${description}`);
 		}
+	});
+
+	it("registers the Collab RPC guest selector as hidden", () => {
+		expect(isSubcommand("__collab-rpc-guest")).toBe(true);
+		expect(commands.find(entry => entry.name === "__collab-rpc-guest")?.help?.hidden).toBe(true);
 	});
 });
