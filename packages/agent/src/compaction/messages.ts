@@ -291,7 +291,6 @@ export function convertMessageToLlm(message: AgentMessage): Message | undefined 
 					role: "developer",
 					content: images,
 					attribution: "agent",
-					historyRewriteAt: message.timestamp,
 					providerPayload: message.providerPayload,
 					timestamp: message.timestamp,
 				};

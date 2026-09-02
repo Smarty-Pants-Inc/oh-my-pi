@@ -4916,7 +4916,7 @@
     },
     {
       "path": "packages/agent/src/compaction/messages.ts",
-      "sha256": "a1d0b0c4721cfa607459788e804b8c0bc0ec948ca97ce447ac7423c2df2037a6"
+      "sha256": "3a5ebaa5c3b7e635b52f62e39bae3f1389c72047f4d613ff8cf9c7d14a77f719"
     },
     {
       "path": "packages/agent/src/compaction/openai.ts",
@@ -11356,5 +11356,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "06c3bff9b52b603cceda17cf14bfc13bdf5b40cd9b1ccd5a3433865f513b145d"
+  "rootSha256": "5c6ff3a19d22bdb333f8ee76ef2b5207e2b5c7519ffe99509b1430960f18bf9d"
 }
