@@ -622,6 +622,14 @@ prompts:
     visibility: model
     defaultEnabled: false
     order: 840
+  - id: advisor.memory-context
+    path: prompts/advisor/memory-context.md
+    role: system
+    target: [side_model]
+    trigger: side_request
+    visibility: model
+    defaultEnabled: false
+    order: 850
   - id: goal.advisor_mission
     path: prompts/advisor/mission-context.md
     role: internal_context
@@ -1542,6 +1550,14 @@ prompts:
     visibility: model
     defaultEnabled: false
     order: 1990
+  - id: tool-roster-notice
+    path: prompts/system/tool-roster-notice.md
+    role: system
+    target: [main]
+    trigger: optional_mode
+    visibility: model
+    defaultEnabled: false
+    order: 1995
   - id: ttsr-interrupt
     path: prompts/system/ttsr-interrupt.md
     role: system
