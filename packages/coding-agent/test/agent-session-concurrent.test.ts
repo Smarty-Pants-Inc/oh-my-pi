@@ -5154,6 +5154,10 @@ describe("AgentSession committed session-change callbacks", () => {
 				switchStarted.resolve();
 				return switchReleased.promise;
 			}),
+			emitBeforeSessionMutation: vi.fn().mockResolvedValue(undefined),
+			emitWithHostCompletion: vi.fn(async (_event: { type: string }, completion?: () => void | Promise<void>) =>
+				completion?.(),
+			),
 			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
 			hasHandlers: vi.fn(() => false),
 		} as unknown as ExtensionRunner;
