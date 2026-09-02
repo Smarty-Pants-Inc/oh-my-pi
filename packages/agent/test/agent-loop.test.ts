@@ -185,7 +185,10 @@ describe("agentLoop with AgentMessage", () => {
 		// First response leaks a harmony payload as visible assistant text; the
 		// retry is clean. Mitigation only engages for openai-codex.
 		const leak = "Some prose. analysis to=functions.edit code 大发官网";
-		const mock = createMockModel({ responses: [{ content: [leak] }, { content: ["clean retry response"] }] });
+		const mock = createMockModel({
+			provider: "openai-codex",
+			responses: [{ content: [leak] }, { content: ["clean retry response"] }],
+		});
 		const config: AgentLoopConfig = { model: harmonyModel, convertToLlm: identityConverter };
 
 		const events: AgentEvent[] = [];
@@ -239,6 +242,49 @@ describe("agentLoop with AgentMessage", () => {
 		// retried — a hard-abort would have left `executed` empty and consumed the
 		// "done" response as a clean retry instead.
 		expect(executed).toEqual([leakyArg]);
+		expect(mock.calls).toHaveLength(2);
+	});
+
+	it("dispatches a tool call appended by transformAssistantMessage on a stop turn", async () => {
+		// In-text edit recovery (coding-agent) rewrites a text-only `stop` turn into
+		// a synthetic tool call inside this hook; the loop must scan tool calls
+		// AFTER the transform so the appended call is validated and executed.
+		const toolSchema = type({ input: "string" });
+		const executed: string[] = [];
+		const tool: AgentTool<typeof toolSchema, { input: string }> = {
+			name: "edit",
+			label: "Edit",
+			description: "Edit tool",
+			parameters: toolSchema,
+			async execute(_toolCallId, params) {
+				executed.push(params.input);
+				return { content: [{ type: "text", text: "ok" }], details: { input: params.input } };
+			},
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const mock = createMockModel({
+			responses: [{ content: ["stray payload turn"], stopReason: "stop" }, { content: ["done"] }],
+		});
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			transformAssistantMessage: message => {
+				const stray = message.content.some(block => block.type === "text" && block.text.includes("stray payload"));
+				if (!stray || message.content.some(block => block.type === "toolCall")) return;
+				message.content.push({
+					type: "toolCall",
+					id: "recovered-1",
+					name: "edit",
+					arguments: { input: "payload" },
+				});
+			},
+		};
+		const messages = await agentLoop([createUserMessage("go")], context, config, undefined, mock.stream).result();
+
+		expect(executed).toEqual(["payload"]);
+		const toolResult = messages.find(m => m.role === "toolResult") as ToolResultMessage | undefined;
+		expect(toolResult?.toolCallId).toBe("recovered-1");
+		// The paired result went back to the provider for a second turn.
 		expect(mock.calls).toHaveLength(2);
 	});
 
@@ -3913,7 +3959,10 @@ describe("agentLoop pre-model-call gate", () => {
 
 	it("closes an open Harmony retry turn when the gate stops the retry", async () => {
 		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [] };
-		const mock = createMockModel({ responses: [{ content: ["Some prose. analysis to=functions.edit code"] }] });
+		const mock = createMockModel({
+			provider: "openai-codex",
+			responses: [{ content: ["Some prose. analysis to=functions.edit code"] }],
+		});
 		const retryModel = { ...harmonyModel, id: "retry-model" };
 		let gateCalls = 0;
 		let turnEndCalls = 0;
