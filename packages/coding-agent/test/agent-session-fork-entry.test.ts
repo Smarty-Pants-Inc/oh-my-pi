@@ -52,7 +52,7 @@ describe("AgentSession exact-entry fork", () => {
 
 		let sessionChanges = 0;
 		const unregister = session.registerSessionChangeCallback(() => sessionChanges++);
-		let publish: (() => void) | undefined;
+		let publish: (() => void | Promise<void>) | undefined;
 		try {
 			expect(
 				await session.fork(
@@ -82,7 +82,7 @@ describe("AgentSession exact-entry fork", () => {
 			if (!artifactPath) throw new Error("Expected copied artifact");
 			expect(await fs.readFile(artifactPath, "utf8")).toBe("artifact payload");
 
-			publish?.();
+			await publish?.();
 			expect(sessionChanges).toBe(1);
 		} finally {
 			unregister();

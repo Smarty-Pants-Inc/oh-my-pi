@@ -10364,7 +10364,10 @@ export class AgentSession {
 	 * materializes only the canonical root-to-entry path. Artifacts are copied in both cases.
 	 * @returns true if completed, false if cancelled by hook or not persisting
 	 */
-	async fork(deferSessionChange?: (publish: () => void) => void, options?: { entryId?: string }): Promise<boolean> {
+	async fork(
+		deferSessionChange?: (publish: () => void | Promise<void>) => void,
+		options?: { entryId?: string },
+	): Promise<boolean> {
 		this.#assertVibeSessionTransitionAllowed("fork the session");
 		const entryId = options?.entryId;
 		if (entryId !== undefined && !this.sessionManager.getEntry(entryId)) {
@@ -10421,9 +10424,12 @@ export class AgentSession {
 
 			if (!previousSessionFile) throw forkCancelled;
 			if (!artifactCloneTransaction) throw new Error("Persisted fork did not acquire an artifact clone transaction");
-			const forkResult = await this.sessionManager.fork(newSessionFile =>
-				artifactCloneTransaction.publish(newSessionFile),
-			);
+			const forkResult =
+				entryId === undefined
+					? await this.sessionManager.fork(newSessionFile => artifactCloneTransaction.publish(newSessionFile))
+					: await this.sessionManager.createBranchedSession(entryId, newSessionFile =>
+							artifactCloneTransaction.publish(newSessionFile),
+						);
 			if (!forkResult) throw forkCancelled;
 			lifecycle.markTarget();
 
@@ -10431,16 +10437,34 @@ export class AgentSession {
 			this.#adoptInheritedProviderPromptCacheKey();
 			this.#syncAgentSessionId(undefined, false, false);
 			this.#recovery.reanchorServedAttribution(previousSessionId);
+			if (entryId !== undefined) {
+				this.#rehydrateCheckpointRewindState();
+				this.#todo.syncFromBranch();
+			}
 			this.#memory.rekeyForCurrentSessionId();
 			await this.#memory.resetContextForNewTranscript();
+			if (entryId !== undefined) {
+				this.#replaceMessagesFromSessionContext(this.buildDisplaySessionContext());
+			}
 
 			await this.sessionManager.ensureOnDisk();
 			const commitOptions: SessionLifecycleCommitOptions = {
 				preserveToolState: true,
 				preserveAdvisorState: true,
 				preserveAdvisorCost: true,
+				finalizeProviderSessions:
+					entryId === undefined ? undefined : () => this.#closeCodexProviderSessionsForHistoryRewrite(),
 			};
-			if (this.#extensionRunner) {
+			if (deferSessionChange) {
+				const activate = await lifecycle.prepareCommit(commitOptions);
+				deferSessionChange(async () => {
+					if (this.#extensionRunner) {
+						await this.#extensionRunner.emitWithHostCompletion({ type: "session_ready" }, () => activate);
+					} else {
+						await activate();
+					}
+				});
+			} else if (this.#extensionRunner) {
 				await this.#extensionRunner.emitWithHostCompletion({ type: "session_ready" }, () =>
 					lifecycle.prepareCommit(commitOptions),
 				);

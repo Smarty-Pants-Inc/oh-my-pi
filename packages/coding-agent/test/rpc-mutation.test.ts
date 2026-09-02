@@ -328,7 +328,10 @@ describe("RpcMutationLedger", () => {
 					return sessionId;
 				},
 				sessionManager: { getEntry: (entryId: string) => ({ id: entryId }) },
-				async fork(deferSessionChange?: (publish: () => void) => void, options?: { entryId?: string }) {
+				async fork(
+					deferSessionChange?: (publish: () => void | Promise<void>) => void,
+					options?: { entryId?: string },
+				) {
 					forkCalls++;
 					entries.push(options?.entryId);
 					sessionId = "session-child";
@@ -467,9 +470,11 @@ describe("RpcMutationLedger", () => {
 				get sessionId() {
 					return sessionId;
 				},
-				async fork(deferSessionChange?: (publish: () => void) => void) {
+				async fork(deferSessionChange?: (publish: () => void | Promise<void>) => void) {
 					sessionId = "session-child";
-					deferSessionChange?.(() => order.push("rebind"));
+					deferSessionChange?.(() => {
+						order.push("rebind");
+					});
 					return true;
 				},
 			} as AgentSession;

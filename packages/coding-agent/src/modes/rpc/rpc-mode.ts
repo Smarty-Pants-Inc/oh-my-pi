@@ -299,7 +299,7 @@ export async function executeRpcForkMutation(
 	mutationLedger: RpcMutationLedger | undefined,
 	subagentRegistry?: Pick<RpcSubagentRegistry, "clear">,
 ): Promise<RpcCommandDispatchResult> {
-	let publishSessionChange: (() => void) | undefined;
+	let publishSessionChange: RpcCommandDispatchResult["afterResponse"];
 	const response = await dispatchRpcCanonicalCommand(session, command, mutationLedger, async () => {
 		const forked = await session.fork(
 			publish => {

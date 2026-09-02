@@ -155,7 +155,11 @@ export class HerdrAgentdHostLifecycle {
 			return;
 		}
 		const host = new CollabHost(this.#context);
-		await host.startWithTransport(transport, { agentdManagedHost: true, rpcAuthority: this.#rpcAuthority });
+		await host.startWithTransport(transport, {
+			privateHost: true,
+			agentdManagedHost: true,
+			rpcAuthority: this.#rpcAuthority,
+		});
 		if (this.#stopped || this.#session.sessionManager.getSessionId() !== sessionId) {
 			await host.stop("session switched");
 			return;
@@ -191,7 +195,11 @@ export class HerdrAgentdHostLifecycle {
 							sessionId,
 							prepared.frame.routeGeneration,
 						),
-						{ agentdManagedHost: true, rpcAuthority: this.#rpcAuthority },
+						{
+							privateHost: true,
+							agentdManagedHost: true,
+							rpcAuthority: this.#rpcAuthority,
+						},
 					),
 					cancelled.promise.then(reason => {
 						throw new Error(reason);

@@ -8,8 +8,8 @@ import {
 	HerdrAgentdHostLifecycle,
 	type ManagedHerdrAgentdHostBridge,
 } from "../../src/collab/herdr-agentd-host-lifecycle";
-import type { CollabHostContext } from "../../src/collab/host";
-import type { RpcHerdrAgentdHostBridge } from "../../src/modes/rpc/rpc-types";
+import { CollabHost, type CollabHostContext } from "../../src/collab/host";
+import type { RpcCanonicalAuthority, RpcHerdrAgentdHostBridge } from "../../src/modes/rpc/rpc-types";
 import { AgentRegistry } from "../../src/registry/agent-registry";
 import type { AgentSession } from "../../src/session/agent-session";
 
@@ -184,6 +184,7 @@ function createLifecycle(
 	sessionManager: { getSessionId(): string },
 	registerSessionChangeCallback: (callback: () => void) => () => void,
 	bridge: RpcHerdrAgentdHostBridge,
+	rpcAuthority?: Promise<RpcCanonicalAuthority>,
 ): HerdrAgentdHostLifecycle {
 	const session = {
 		sessionManager,
@@ -193,7 +194,7 @@ function createLifecycle(
 	managedBridge.role = "host";
 	managedBridge.managed = true;
 	managedBridge.runtimeOwner = "agentd";
-	return new HerdrAgentdHostLifecycle(createContext(sessionManager), session, managedBridge);
+	return new HerdrAgentdHostLifecycle(createContext(sessionManager), session, managedBridge, rpcAuthority);
 }
 
 function credentials(server: { port: number }, token = "bridge-token"): RpcHerdrAgentdHostBridge {
@@ -250,6 +251,45 @@ describe("agentd Herdr host lifecycle", () => {
 		} finally {
 			await lifecycle.stop("test cleanup");
 			bridge.server.stop(true);
+		}
+	});
+
+	it("marks initial and successor agentd hosts private for session mismatch guards", async () => {
+		let sessionId = "session-one";
+		let sessionChange: (() => void) | undefined;
+		const rpcAuthority = Promise.withResolvers<RpcCanonicalAuthority>().promise;
+		const startWithTransport = vi.spyOn(CollabHost.prototype, "startWithTransport").mockResolvedValue(undefined);
+		const lifecycle = createLifecycle(
+			{ getSessionId: () => sessionId },
+			callback => {
+				sessionChange = callback;
+				return () => {
+					if (sessionChange === callback) sessionChange = undefined;
+				};
+			},
+			credentials({ port: 1 }),
+			rpcAuthority,
+		);
+
+		try {
+			await lifecycle.start();
+			lifecycle.handleControlFrame({
+				type: "prepare_herdr_agentd_rebind",
+				address: "127.0.0.1:2",
+				paneId: "pane-1",
+				routeGeneration: 1,
+				token: "successor-token",
+			});
+			sessionId = "session-two";
+			if (!sessionChange) throw new Error("Expected a session change callback after route startup");
+			sessionChange();
+			await lifecycle.whenIdle();
+
+			const expectedOptions = { privateHost: true, agentdManagedHost: true, rpcAuthority };
+			expect(startWithTransport).toHaveBeenNthCalledWith(1, expect.anything(), expectedOptions);
+			expect(startWithTransport).toHaveBeenNthCalledWith(2, expect.anything(), expectedOptions);
+		} finally {
+			await lifecycle.stop("test cleanup");
 		}
 	});
 
