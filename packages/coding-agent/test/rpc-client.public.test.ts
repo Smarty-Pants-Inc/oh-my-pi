@@ -361,6 +361,31 @@ describe("RpcClient public launch and request seams", () => {
 		}
 	});
 
+	test("forwards advisor_yielded through session event listeners", async () => {
+		const received: Array<Record<string, unknown>> = [];
+		const control: RpcChildControl = {};
+		const spawn = spyOn(ptree, "spawn").mockImplementation(() => createRpcChild(received, control));
+
+		try {
+			using client = new RpcClient({ cliPath: "/repo/dist/cli.js" });
+			const yielded = Promise.withResolvers<void>();
+			const events: string[] = [];
+			client.onSessionEvent(event => {
+				events.push(event.type);
+				if (event.type === "advisor_yielded") yielded.resolve();
+			});
+			await client.start();
+			if (!control.emitFrame) throw new Error("Expected RPC child frame emitter");
+			control.emitFrame({ type: "advisor_yielded" });
+			await yielded.promise;
+
+			expect(events).toEqual(["advisor_yielded"]);
+			await client.stop();
+		} finally {
+			spawn.mockRestore();
+		}
+	});
+
 	test("preserves legacy void mutation signatures and owns durable Collab UI responses", async () => {
 		const received: Array<Record<string, unknown>> = [];
 		const spawn = spyOn(ptree, "spawn").mockImplementation(() => createRpcChild(received));

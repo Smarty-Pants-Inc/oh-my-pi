@@ -655,9 +655,9 @@ export class SessionManager {
 		}
 	}
 
-	#rememberBreadcrumb(cwd: string, sessionFile: string, fresh = false): void {
+	#rememberBreadcrumb(cwd: string, sessionFile: string, fresh = false, suppressBreadcrumb = false): void {
 		this.#breadcrumbFresh = fresh;
-		if (!this.#suppressBreadcrumb) writeTerminalBreadcrumb(cwd, sessionFile, fresh);
+		if (!this.#suppressBreadcrumb && !suppressBreadcrumb) writeTerminalBreadcrumb(cwd, sessionFile, fresh);
 	}
 
 	/**
@@ -1683,11 +1683,15 @@ export class SessionManager {
 		}
 	}
 	/** Switch to a different session file (resume / branch). */
-	async setSessionFile(sessionFile: string): Promise<void> {
-		await this.#setSessionFile(sessionFile);
+	async setSessionFile(sessionFile: string, options?: { suppressBreadcrumb?: boolean }): Promise<void> {
+		await this.#setSessionFile(sessionFile, undefined, options?.suppressBreadcrumb === true);
 	}
 
-	async #setSessionFile(sessionFile: string, loadedSession?: SessionLoadResult): Promise<void> {
+	async #setSessionFile(
+		sessionFile: string,
+		loadedSession?: SessionLoadResult,
+		suppressBreadcrumb = false,
+	): Promise<void> {
 		await this.#drainAndCloseWriter();
 		this.#clearDiskError();
 		this.#draftOnlySessionCleanupArmed = false;
@@ -1701,7 +1705,7 @@ export class SessionManager {
 		}
 
 		this.#sessionFile = resolvedSessionFile;
-		this.#rememberBreadcrumb(this.#cwd, resolvedSessionFile);
+		this.#rememberBreadcrumb(this.#cwd, resolvedSessionFile, false, suppressBreadcrumb);
 
 		const { entries: fileEntries, titleSlot } = loaded;
 		if (fileEntries.length === 0) {
@@ -1732,7 +1736,7 @@ export class SessionManager {
 			this.#cwd = headerCwd;
 			this.#sessionDir = path.dirname(resolvedSessionFile);
 			this.#fallbackRuntimeOnly = false;
-			this.#rememberBreadcrumb(this.#cwd, resolvedSessionFile);
+			this.#rememberBreadcrumb(this.#cwd, resolvedSessionFile, false, suppressBreadcrumb);
 		} else if (headerCwd && headerCwd !== path.resolve(this.#cwd)) {
 			// Header cwd not enterable: keep runtime cwd but mark fallback
 			// so workspace changes stay runtime-only until the transcript

@@ -760,6 +760,14 @@ export class CollabHost {
 		if (this.#stopped || !this.#socket || this.#rpcSessionTransitions.size > 0) return;
 		if (isRecord(output) && output.type === "response") return;
 		if (isWireAgentEvent(output as AgentSessionEvent)) return;
+		if (
+			isRecord(output) &&
+			(output.type === "host_tool_call" ||
+				output.type === "host_tool_cancel" ||
+				output.type === "host_uri_request" ||
+				output.type === "host_uri_cancel")
+		)
+			return;
 		for (const peerId of this.#rpcPeers) {
 			try {
 				sendCollabRpcFrame(this.#socket, { t: "rpc-output", output }, peerId);
@@ -828,7 +836,12 @@ export class CollabHost {
 					? isRpcReadCommand(command)
 					: isRpcMutationCommand(command) || isRpcReadCommand(command);
 		if (!validCommand) {
-			this.#socket?.send({ t: "error", message: "invalid RPC command classification" }, fromPeer);
+			await this.#sendRpcResult(
+				resultType,
+				requestId,
+				this.#rpcFailure(command, `Unknown command: ${command.type}`, "protocol-error"),
+				fromPeer,
+			);
 			return;
 		}
 		const requestKey = `${fromPeer}:${requestId}`;

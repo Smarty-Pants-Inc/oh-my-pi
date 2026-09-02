@@ -389,6 +389,42 @@ describe("RpcInputDispatcher", () => {
 		expect((outputs[1] as RpcResponse).command).toBe("get_state");
 	});
 
+	test("serializes canonical Collab commands behind direct RPC commands", async () => {
+		const releaseDirect = Promise.withResolvers<void>();
+		const started: string[] = [];
+		const { deps, outputs } = makeDeps(async command => {
+			started.push(command.id ?? "");
+			if (command.type === "set_auto_retry") {
+				await releaseDirect.promise;
+				return { id: command.id, type: "response", command: "set_auto_retry", success: true };
+			}
+			if (command.type === "set_steering_mode") {
+				return { id: command.id, type: "response", command: "set_steering_mode", success: true };
+			}
+			throw new Error(`unexpected command type: ${command.type}`);
+		});
+		const dispatcher = new RpcInputDispatcher({ deps });
+
+		dispatcher.dispatch({ id: "stdin", type: "set_auto_retry", enabled: true });
+		const collab = dispatcher.dispatchCanonical({ id: "collab", type: "set_steering_mode", mode: "all" });
+		await flushMicrotasks();
+
+		expect(started).toEqual(["stdin"]);
+		expect(outputs).toEqual([]);
+
+		releaseDirect.resolve();
+		await expect(collab).resolves.toEqual({
+			id: "collab",
+			type: "response",
+			command: "set_steering_mode",
+			success: true,
+		});
+		await dispatcher.drain();
+
+		expect(started).toEqual(["stdin", "collab"]);
+		expect(outputs).toEqual([{ id: "stdin", type: "response", command: "set_auto_retry", success: true }]);
+	});
+
 	test("serial command rejection emits an error response and does not poison the queue", async () => {
 		const started: string[] = [];
 		const { deps, outputs } = makeDeps(async command => {

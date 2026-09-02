@@ -270,6 +270,78 @@ describe("CollabRpcGuest", () => {
 		expect(terminals).toEqual(["host closed"]);
 	});
 
+	it("returns unavailable when the transport rejects a forwarded RPC request", async () => {
+		const transport = new TestTransport();
+		const guest = new CollabRpcGuest({ transport, session: createSession(), roomId: "room-send-rejected" });
+		await hydrate(guest, transport);
+		transport.close();
+
+		expect(await guest.handleCommand({ id: "send-rejected", type: "get_state" })).toMatchObject({
+			success: false,
+			code: "unavailable",
+		});
+	});
+
+	it("accepts legacy mutations and receipt-free policy rejections", async () => {
+		const transport = new TestTransport();
+		const guest = new CollabRpcGuest({ transport, session: createSession(), roomId: "room-policy-rejections" });
+		await hydrate(guest, transport);
+
+		const legacy = guest.handleCommand({ id: "legacy-abort", type: "abort" });
+		await Promise.resolve();
+		const legacyRequest = transport.sent.at(-1);
+		if (legacyRequest?.t !== "rpc-request") throw new Error("Expected forwarded legacy mutation");
+		transport.deliver({
+			t: "rpc-result",
+			requestId: legacyRequest.requestId,
+			response: { id: "legacy-abort", type: "response", command: "abort", success: true },
+		});
+		expect(await legacy).toMatchObject({ success: true, command: "abort" });
+
+		const readOnly = mutation("policy-read-only");
+		readOnly.id = "policy-read-only";
+		const readOnlyPending = guest.handleCommand(readOnly);
+		await Promise.resolve();
+		const readOnlyRequest = transport.sent.at(-1);
+		if (readOnlyRequest?.t !== "rpc-request") throw new Error("Expected forwarded read-only mutation");
+		transport.deliver({
+			t: "rpc-result",
+			requestId: readOnlyRequest.requestId,
+			response: {
+				id: readOnly.id,
+				type: "response",
+				command: "prompt",
+				success: false,
+				error: "prompt is disabled on a read-only link",
+				code: "read-only",
+			},
+		});
+		expect(await readOnlyPending).toMatchObject({ success: false, code: "read-only" });
+
+		const managed: RpcMutationCommand = {
+			id: "policy-agentd-managed",
+			type: "fork",
+			mutation: { commandId: "policy-agentd-managed", runtimeId: "runtime-1", generation: 2 },
+		};
+		const managedPending = guest.handleCommand(managed);
+		await Promise.resolve();
+		const managedRequest = transport.sent.at(-1);
+		if (managedRequest?.t !== "rpc-request") throw new Error("Expected forwarded managed mutation");
+		transport.deliver({
+			t: "rpc-result",
+			requestId: managedRequest.requestId,
+			response: {
+				id: managed.id,
+				type: "response",
+				command: "fork",
+				success: false,
+				error: "Session lifecycle transitions are managed by Agentd",
+				code: "agentd-managed",
+			},
+		});
+		expect(await managedPending).toMatchObject({ success: false, code: "agentd-managed" });
+	});
+
 	it("rejects a welcome that lacks the durable guest capability handshake", async () => {
 		const transport = new TestTransport();
 		const guest = new CollabRpcGuest({ transport, session: createSession(), roomId: "room-capability" });

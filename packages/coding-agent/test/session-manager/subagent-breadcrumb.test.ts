@@ -116,4 +116,41 @@ describe("SessionManager subagent breadcrumb isolation", () => {
 			await resumed.close();
 		}
 	});
+
+	it("keeps --continue on the owner when a renderer replica reloads", async () => {
+		const mainFile = await createParentSession();
+		const replicaFile = path.join(testAgentDir, "renderer-replica.jsonl");
+		const source = await SessionManager.open(replicaFile, undefined, undefined, {
+			initialCwd: cwd,
+			suppressBreadcrumb: true,
+		});
+		source.appendMessage({ role: "user", content: "replica work", timestamp: 2 });
+		source.appendMessage(makeAssistantMessage());
+		await source.flush();
+		await source.close();
+		writeBreadcrumb(cwd, mainFile);
+
+		const replica = await SessionManager.open(mainFile, undefined, undefined, {
+			initialCwd: cwd,
+			suppressBreadcrumb: true,
+		});
+		try {
+			await replica.setSessionFile(replicaFile, { suppressBreadcrumb: true });
+		} finally {
+			await replica.close();
+		}
+
+		const crumb = await readTerminalBreadcrumbEntry();
+		expect(crumb?.sessionFile).toBe(mainFile);
+
+		const resumed = await SessionManager.continueRecent(cwd);
+		try {
+			expect(resumed.getSessionFile()).toBe(path.resolve(mainFile));
+			const dump = JSON.stringify(resumed.getEntries());
+			expect(dump).toContain("main work");
+			expect(dump).not.toContain("replica work");
+		} finally {
+			await resumed.close();
+		}
+	});
 });

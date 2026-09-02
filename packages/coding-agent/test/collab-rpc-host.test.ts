@@ -295,6 +295,38 @@ describe("hidden agentd RPC host bootstrap", () => {
 		await host.stop("test complete");
 	});
 
+	test("returns a correlated RPC error for an unclassified command", async () => {
+		const transport = new TestTransport();
+		const authority = createAuthority();
+		const host = new CollabHost(createContext().context);
+		try {
+			await host.startWithTransport(transport, { rpcAuthority: Promise.resolve(authority) });
+			transport.deliver({ t: "hello", proto: COLLAB_PROTO, name: "guest" });
+			await transport.waitForFrame("welcome");
+			transport.deliver({
+				t: "rpc-request",
+				requestId: 73,
+				command: { id: "unknown-73", type: "unknown_command" },
+			} as unknown as CollabFrame);
+
+			const result = await transport.waitForFrame("rpc-result");
+			expect(result).toMatchObject({
+				requestId: 73,
+				response: {
+					id: "unknown-73",
+					command: "unknown_command",
+					success: false,
+					code: "protocol-error",
+					error: "Unknown command: unknown_command",
+				},
+			});
+			expect(authority.commands).toEqual([]);
+			expect(sentFrames(transport, "error")).toHaveLength(0);
+		} finally {
+			await host.stop("test complete");
+		}
+	});
+
 	test("rejects every guest session lifecycle command before Agentd route side effects", async () => {
 		const transport = new TestTransport();
 		const authority = createAuthority();
@@ -335,7 +367,7 @@ describe("hidden agentd RPC host bootstrap", () => {
 		}
 	});
 
-	test("forwards controls and sidechannels once without duplicating session events", async () => {
+	test("forwards shared sidechannels once and leaves host-owned channels with the direct client", async () => {
 		const testContext = createContext();
 		const transport = new TestTransport();
 		const authority = createAuthority();
@@ -349,6 +381,10 @@ describe("hidden agentd RPC host bootstrap", () => {
 		testContext.emit(event);
 		authority.emit(event);
 		authority.emit({ type: "extension_ui_request", id: "ui-1", method: "notify", message: "sidechannel" });
+		authority.emit({ type: "host_tool_call", id: "tool-1" });
+		authority.emit({ type: "host_tool_cancel", id: "tool-1" });
+		authority.emit({ type: "host_uri_request", id: "uri-1" });
+		authority.emit({ type: "host_uri_cancel", id: "uri-1" });
 		expect(sentFrames(transport, "event")).toHaveLength(1);
 		expect(sentFrames(transport, "rpc-output")).toHaveLength(1);
 

@@ -325,7 +325,10 @@ export async function executeRpcForkMutation(
  * entrypoint; broken out so tests can drive the input loop with stubs.
  */
 export interface RpcInputFrameDeps {
-	handleCommand: (command: RpcCommand) => Promise<RpcResponse | RpcCommandDispatchResult>;
+	handleCommand: (
+		command: RpcCommand,
+		dispatchContext?: RpcCanonicalDispatchContext,
+	) => Promise<RpcResponse | RpcCommandDispatchResult>;
 	output: RpcOutput;
 	errorResponse: (id: string | undefined, command: string, message: string) => RpcResponse;
 	trackBackgroundTask?: (task: Promise<void>) => void;
@@ -419,7 +422,7 @@ export function dispatchRpcInputFrame(parsed: unknown, deps: RpcInputFrameDeps):
 /** Serializes ordinary RPC commands while allowing controls and provenanced streaming prompts to overtake. */
 export class RpcInputDispatcher {
 	#tail: Promise<void> = Promise.resolve();
-	#tasks = new Set<Promise<void>>();
+	#tasks = new Set<Promise<unknown>>();
 	readonly #deps: RpcInputFrameDeps;
 	readonly #afterSerialCommand: (() => Promise<void>) | undefined;
 
@@ -439,29 +442,21 @@ export class RpcInputDispatcher {
 				return;
 			}
 
-			if (
-				command.type === "abort" ||
-				command.type === "abort_bash" ||
-				command.type === "abort_and_prompt" ||
-				(command.type === "prompt" && command.mutation !== undefined && command.streamingBehavior !== undefined)
-			) {
-				const task = this.#dispatchCommand(command);
-				this.#tasks.add(task);
-				void task.finally(() => this.#tasks.delete(task));
-				return;
-			}
-
-			const task = this.#tail.then(
-				() => this.#dispatchCommand(command),
-				() => this.#dispatchCommand(command),
-			);
-			this.#tail = task.catch(() => {});
-			this.#tasks.add(task);
-			void task.finally(() => this.#tasks.delete(task));
+			this.#track(this.#enqueue(command, () => this.#dispatchCommand(command)));
 		} catch (err: unknown) {
 			const message = err instanceof Error ? err.message : String(err);
 			this.#deps.output(this.#deps.errorResponse(undefined, "parse", `Failed to parse command: ${message}`));
 		}
+	}
+
+	/** Dispatch a private Collab command through the same serial queue as stdin. */
+	dispatchCanonical(
+		command: RpcCommand,
+		dispatchContext?: RpcCanonicalDispatchContext,
+	): Promise<RpcResponse | RpcCommandDispatchResult> {
+		const task = this.#enqueue(command, () => this.#deps.handleCommand(command, dispatchContext));
+		this.#track(task);
+		return task;
 	}
 
 	/** Await every accepted serial command, including commands queued before EOF. */
@@ -469,6 +464,33 @@ export class RpcInputDispatcher {
 		while (this.#tasks.size > 0) {
 			await Promise.allSettled(Array.from(this.#tasks));
 		}
+	}
+
+	#shouldOvertake(command: RpcCommand): boolean {
+		return (
+			command.type === "abort" ||
+			command.type === "abort_bash" ||
+			command.type === "abort_and_prompt" ||
+			(command.type === "prompt" && command.mutation !== undefined && command.streamingBehavior !== undefined)
+		);
+	}
+
+	#enqueue<T>(command: RpcCommand, dispatch: () => Promise<T>): Promise<T> {
+		if (this.#shouldOvertake(command)) return dispatch();
+		const task = this.#tail.then(dispatch, dispatch);
+		this.#tail = task.then(
+			() => {},
+			() => {},
+		);
+		return task;
+	}
+
+	#track<T>(task: Promise<T>): void {
+		this.#tasks.add(task);
+		void task.then(
+			() => this.#tasks.delete(task),
+			() => this.#tasks.delete(task),
+		);
 	}
 
 	async #dispatchCommand(command: RpcCommand): Promise<void> {
@@ -1693,6 +1715,11 @@ export async function runRpcMode(
 				}
 			: undefined,
 	};
+	const inputDispatcher = new RpcInputDispatcher({
+		deps: dispatchFrameDeps,
+		afterSerialCommand: () => shutdownCoordinator.checkShutdownRequested(),
+	});
+
 	writeFrames(
 		frameEncoder.encodeFrames({
 			type: "ready",
@@ -1705,7 +1732,7 @@ export async function runRpcMode(
 	readyPublished = true;
 	options.publishAuthority?.({
 		identity,
-		dispatch: handleCommand,
+		dispatch: (command, dispatchContext) => inputDispatcher.dispatchCanonical(command, dispatchContext),
 		dispatchControl: frame => dispatchRpcControlFrame(frame, dispatchFrameDeps),
 		subscribeOutput: listener => {
 			authorityOutputListeners.add(listener);
@@ -1718,11 +1745,6 @@ export async function runRpcMode(
 	if (externalTerminationReason !== undefined) {
 		void output({ type: "collab_terminal", code: "unavailable", reason: externalTerminationReason });
 	}
-
-	const inputDispatcher = new RpcInputDispatcher({
-		deps: dispatchFrameDeps,
-		afterSerialCommand: () => shutdownCoordinator.checkShutdownRequested(),
-	});
 
 	// Keep the stdin reader moving: side-channel frames dispatch immediately,
 	// ordinary commands serialize through inputDispatcher, and bash remains

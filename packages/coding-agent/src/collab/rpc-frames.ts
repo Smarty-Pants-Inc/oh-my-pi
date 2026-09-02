@@ -35,10 +35,7 @@ function frameCarriesMutation(frame: ReassembledRpcFrame): boolean {
 export function sendCollabRpcFrame(transport: CollabTransport, frame: ReassembledRpcFrame, targetPeer = 0): boolean {
 	const bytes = Buffer.from(JSON.stringify(frame));
 	if (bytes.byteLength > MAX_LOGICAL_FRAME_BYTES) throw new Error("collab RPC logical frame too large");
-	if (bytes.byteLength <= MAX_DIRECT_FRAME_BYTES) {
-		transport.send(frame, targetPeer);
-		return true;
-	}
+	if (bytes.byteLength <= MAX_DIRECT_FRAME_BYTES) return transport.send(frame, targetPeer);
 
 	const count = Math.ceil(bytes.byteLength / CHUNK_DATA_BYTES);
 	const chunkId = crypto.randomUUID();
@@ -54,7 +51,7 @@ export function sendCollabRpcFrame(transport: CollabTransport, frame: Reassemble
 			mutation,
 			data: bytes.subarray(start, Math.min(start + CHUNK_DATA_BYTES, bytes.byteLength)).toString("base64"),
 		};
-		transport.send(chunk, targetPeer);
+		if (!transport.send(chunk, targetPeer)) return false;
 	}
 	return true;
 }

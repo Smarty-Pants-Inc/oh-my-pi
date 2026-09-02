@@ -9,6 +9,11 @@ class RecordingTransport implements CollabTransport {
 	onControl: CollabTransport["onControl"];
 	onClose: CollabTransport["onClose"];
 	readonly sent: CollabFrame[] = [];
+	readonly acceptedFrames: number;
+
+	constructor(acceptedFrames = Infinity) {
+		this.acceptedFrames = acceptedFrames;
+	}
 
 	get isOpen(): boolean {
 		return true;
@@ -18,6 +23,7 @@ class RecordingTransport implements CollabTransport {
 	close(): void {}
 
 	send(frame: CollabFrame): boolean {
+		if (this.sent.length >= this.acceptedFrames) return false;
 		this.sent.push(frame);
 		return true;
 	}
@@ -38,6 +44,15 @@ it("reassembles multi-record RPC output without changing its authority classific
 	}
 	expect(reassembled).toEqual(logical);
 	reassembler.close();
+});
+
+it("propagates a rejected chunk send", () => {
+	const transport = new RecordingTransport(1);
+	const logical = { t: "rpc-output" as const, output: { type: "artifact", payload: "x".repeat(2 * 1024 * 1024) } };
+
+	expect(sendCollabRpcFrame(transport, logical, 7)).toBe(false);
+	expect(transport.sent).toHaveLength(1);
+	expect(transport.sent[0]?.t).toBe("rpc-chunk");
 });
 
 it("rejects chunk metadata that could allocate beyond the logical frame bound", () => {

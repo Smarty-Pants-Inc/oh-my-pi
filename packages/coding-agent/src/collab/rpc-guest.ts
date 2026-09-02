@@ -327,18 +327,17 @@ export class CollabRpcGuest {
 		}
 		const context = command.mutation;
 		if (!isRpcMutationContext(context)) {
-			pending.resolve(
-				!response.success && response.receipt === undefined && response.code === "protocol-error"
-					? response
-					: this.#responseError(command, "Collab host returned an invalid mutation rejection", "protocol-error"),
-			);
+			pending.resolve(response);
 			return;
 		}
 		const receipt = response.receipt;
 		const receiptFreeTerminal =
 			!response.success &&
 			receipt === undefined &&
-			(response.code === "ambiguous" || response.code === "unavailable");
+			(response.code === "ambiguous" ||
+				response.code === "unavailable" ||
+				response.code === "read-only" ||
+				response.code === "agentd-managed");
 		const validReceipt =
 			receipt !== undefined &&
 			receipt.commandId === context.commandId &&

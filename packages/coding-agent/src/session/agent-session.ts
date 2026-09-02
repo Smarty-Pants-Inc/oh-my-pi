@@ -6578,7 +6578,7 @@ export class AgentSession {
 
 	/** Reload a trusted replicated transcript without lifecycle hooks, cancellation, or provider mutation. */
 	async reloadReplicatedSession(sessionPath: string): Promise<void> {
-		await this.sessionManager.setSessionFile(sessionPath);
+		await this.sessionManager.setSessionFile(sessionPath, { suppressBreadcrumb: true });
 		this.refreshReplicatedSessionContext();
 	}
 
