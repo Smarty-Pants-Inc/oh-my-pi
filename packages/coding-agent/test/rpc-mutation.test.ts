@@ -635,4 +635,93 @@ describe("RpcMutationLedger", () => {
 			ledger.close();
 		});
 	});
+
+	it("recovers a persisted fork activation from stored-success replay after response flush loss", async () => {
+		await withLedgerDb(async dbPath => {
+			let sessionId = "session-parent";
+			let forkCalls = 0;
+			let publications = 0;
+			const session = {
+				get sessionId() {
+					return sessionId;
+				},
+				async fork(deferSessionChange?: (publish: () => void | Promise<void>) => void) {
+					forkCalls++;
+					sessionId = "session-child";
+					deferSessionChange?.(() => {
+						publications++;
+					});
+					return true;
+				},
+			} as AgentSession;
+			const command: Extract<RpcMutationCommand, { type: "fork" }> = {
+				id: "fork-flush-loss",
+				type: "fork",
+				mutation: { commandId: "authority-fork-flush-loss", runtimeId: "runtime-1", generation: 1 },
+			};
+			const firstLedger = new RpcMutationLedger(dbPath);
+			try {
+				const first = dispatchRpcInputFrame(command, {
+					handleCommand: request => executeRpcForkMutation(session, request as typeof command, firstLedger),
+					output: async () => {
+						throw new Error("synthetic flush failure");
+					},
+					errorResponse: (id, responseCommand, message) => ({
+						id,
+						type: "response",
+						command: responseCommand,
+						success: false,
+						error: message,
+					}),
+					pendingExtensionRequests: new Map(),
+					onHostToolResult: () => {},
+					onHostToolUpdate: () => {},
+					onHostUriResult: () => {},
+				});
+				if (!first) throw new Error("Expected fork dispatch promise");
+				await expect(first).rejects.toThrow("synthetic flush failure");
+			} finally {
+				firstLedger.close();
+			}
+			expect(publications).toBe(0);
+
+			const replayLedger = new RpcMutationLedger(dbPath);
+			try {
+				const responses: RpcResponse[] = [];
+				const replay = dispatchRpcInputFrame(
+					{ ...command, id: "fork-flush-replay" },
+					{
+						handleCommand: request => executeRpcForkMutation(session, request as typeof command, replayLedger),
+						output: response => {
+							responses.push(response as RpcResponse);
+						},
+						errorResponse: (id, responseCommand, message) => ({
+							id,
+							type: "response",
+							command: responseCommand,
+							success: false,
+							error: message,
+						}),
+						pendingExtensionRequests: new Map(),
+						onHostToolResult: () => {},
+						onHostToolUpdate: () => {},
+						onHostUriResult: () => {},
+					},
+				);
+				if (!replay) throw new Error("Expected fork replay dispatch promise");
+				await replay;
+				expect(responses).toMatchObject([
+					{
+						id: "fork-flush-replay",
+						success: true,
+						receipt: { replayed: true, session: { sessionId: "session-child" } },
+					},
+				]);
+			} finally {
+				replayLedger.close();
+			}
+			expect(forkCalls).toBe(1);
+			expect(publications).toBe(1);
+		});
+	});
 });

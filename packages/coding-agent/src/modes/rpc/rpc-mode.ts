@@ -299,6 +299,13 @@ export async function dispatchRpcCanonicalCommand(
 	return mutationLedger.execute(command, () => session.sessionId, execute, preflight);
 }
 
+interface PendingRpcForkActivation {
+	afterResponse(): Promise<void>;
+}
+
+/** A durable terminal cannot serialize this live lifecycle continuation; retain it for replay after a lost response. */
+const pendingRpcForkActivations = new WeakMap<AgentSession, Map<string, PendingRpcForkActivation>>();
+
 /** Fork while deferring endpoint rebind publication until the response frame has flushed. */
 export async function executeRpcForkMutation(
 	session: AgentSession,
@@ -306,6 +313,7 @@ export async function executeRpcForkMutation(
 	mutationLedger: RpcMutationLedger | undefined,
 	subagentRegistry?: Pick<RpcSubagentRegistry, "clear">,
 ): Promise<RpcCommandDispatchResult> {
+	const mutationCommandId = command.mutation?.commandId;
 	let publishSessionChange: RpcCommandDispatchResult["afterResponse"];
 	const response = await dispatchRpcCanonicalCommand(session, command, mutationLedger, async () => {
 		const forked = await session.fork(
@@ -317,7 +325,42 @@ export async function executeRpcForkMutation(
 		if (forked) subagentRegistry?.clear();
 		return rpcSuccess(command.id, "fork", { sessionId: session.sessionId, cancelled: !forked });
 	});
-	return publishSessionChange ? { response, afterResponse: publishSessionChange } : { response };
+	const publish = publishSessionChange;
+	const durableSuccess =
+		response.success &&
+		mutationCommandId !== undefined &&
+		response.receipt?.commandId === mutationCommandId &&
+		response.receipt?.operation === "fork";
+	if (!publish) {
+		if (!durableSuccess || !mutationCommandId) return { response };
+		const pendingActivation = pendingRpcForkActivations.get(session)?.get(mutationCommandId);
+		return pendingActivation ? { response, afterResponse: pendingActivation.afterResponse } : { response };
+	}
+	if (!mutationCommandId || !durableSuccess) return { response, afterResponse: publish };
+
+	const activations = pendingRpcForkActivations.get(session) ?? new Map<string, PendingRpcForkActivation>();
+	pendingRpcForkActivations.set(session, activations);
+	let activation: Promise<void> | undefined;
+	const pendingActivation: PendingRpcForkActivation = {
+		afterResponse: () => {
+			if (activation) return activation;
+			activation = Promise.resolve()
+				.then(publish)
+				.then(
+					() => {
+						activations.delete(mutationCommandId);
+						if (activations.size === 0) pendingRpcForkActivations.delete(session);
+					},
+					error => {
+						activation = undefined;
+						throw error;
+					},
+				);
+			return activation;
+		},
+	};
+	activations.set(mutationCommandId, pendingActivation);
+	return { response, afterResponse: pendingActivation.afterResponse };
 }
 
 /**
@@ -454,7 +497,10 @@ export class RpcInputDispatcher {
 		command: RpcCommand,
 		dispatchContext?: RpcCanonicalDispatchContext,
 	): Promise<RpcResponse | RpcCommandDispatchResult> {
-		const task = this.#enqueue(command, () => this.#deps.handleCommand(command, dispatchContext));
+		const task = this.#enqueue(command, async () => {
+			const rejection = dispatchContext?.validateExecution?.(command);
+			return rejection ?? this.#deps.handleCommand(command, dispatchContext);
+		});
 		this.#track(task);
 		return task;
 	}

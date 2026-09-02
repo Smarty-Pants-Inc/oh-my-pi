@@ -272,7 +272,9 @@ export class CollabHost {
 	#rpcAuthorityPromise: Promise<RpcCanonicalAuthority> | undefined;
 	#agentdManagedHost = false;
 	#rpcAuthority: RpcCanonicalAuthority | undefined;
+	#rpcAuthorityEpoch = 0;
 	#rpcAuthorityUnsubscribe: (() => void) | undefined;
+	#rpcAuthoritySessionUnsubscribe: (() => void) | undefined;
 	#rpcReassembler = new CollabRpcFrameReassembler();
 	#activeRpcRequests = new Set<string>();
 	#rpcSessionTransitions = new Set<string>();
@@ -450,6 +452,11 @@ export class CollabHost {
 		}
 		if (terminalReason !== undefined) throw new Error(terminalReason);
 		if (this.#stopped) throw new Error("collab transport closed during startup");
+		if (this.#privateHost && this.#rpcAuthorityPromise) {
+			this.#rpcAuthoritySessionUnsubscribe = this.#ctx.session.registerSessionChangeCallback(() => {
+				this.#rpcAuthorityEpoch++;
+			});
+		}
 		this.#unsubscribe = this.#ctx.session.subscribe(event => {
 			if (isWireAgentEvent(event)) this.#broadcast({ t: "event", event: shrinkForReplication(event) });
 			this.#onEventForState(event);
@@ -517,6 +524,9 @@ export class CollabHost {
 		this.#streamingInterval = null;
 		for (const pending of this.#pendingUi.values()) pending.settle({ kind: "unavailable" });
 		this.#pendingUi.clear();
+		this.#rpcAuthoritySessionUnsubscribe?.();
+		this.#rpcAuthoritySessionUnsubscribe = undefined;
+		this.#rpcAuthorityEpoch++;
 		this.#rpcAuthorityUnsubscribe?.();
 		this.#rpcAuthorityUnsubscribe = undefined;
 		this.#rpcAuthority = undefined;
@@ -752,6 +762,7 @@ export class CollabHost {
 		if (this.#stopped) throw new Error("Collab host stopped before RPC authority became ready");
 		if (this.#rpcAuthority) return this.#rpcAuthority;
 		this.#rpcAuthority = authority;
+		this.#rpcAuthorityEpoch++;
 		this.#rpcAuthorityUnsubscribe = authority.subscribeOutput(output => this.#forwardRpcOutput(output));
 		return authority;
 	}
@@ -794,6 +805,16 @@ export class CollabHost {
 			(frame.type === "prepare_herdr_agentd_rebind" || frame.type === "clear_herdr_agentd_rebind")
 		) {
 			this.#socket?.send({ t: "error", message: "agentd rebind control is unavailable to Collab guests" }, fromPeer);
+			return;
+		}
+		if (
+			isRecord(frame) &&
+			(frame.type === "host_tool_result" || frame.type === "host_tool_update" || frame.type === "host_uri_result")
+		) {
+			this.#socket?.send(
+				{ t: "error", message: "host tool and URI responders are owned by the direct RPC client" },
+				fromPeer,
+			);
 			return;
 		}
 		const authority = await this.#getRpcAuthority();
@@ -861,6 +882,7 @@ export class CollabHost {
 			command.type === "switch_session" ||
 			command.type === "branch";
 		if (transition) this.#rpcSessionTransitions.add(requestKey);
+		const predecessorSessionId = this.#ctx.sessionManager.getSessionId();
 		let result: RpcCommandDispatchResult;
 		try {
 			const peer = this.#peers.get(fromPeer);
@@ -869,6 +891,14 @@ export class CollabHost {
 			} else if (isRpcMutationCommand(command) && !peer.canWrite) {
 				result = {
 					response: this.#rpcFailure(command, `${command.type} is disabled on a read-only link`, "read-only"),
+				};
+			} else if (
+				command.type === "set_host_tools" ||
+				command.type === "set_host_uri_schemes" ||
+				command.type === "set_subagent_subscription"
+			) {
+				result = {
+					response: this.#rpcFailure(command, `${command.type} is owned by the direct RPC client`, "unavailable"),
 				};
 			} else if (this.#agentdManagedHost && transition) {
 				result = {
@@ -880,6 +910,7 @@ export class CollabHost {
 				};
 			} else {
 				const authority = await this.#getRpcAuthority();
+				const authorityEpoch = this.#rpcAuthorityEpoch;
 				const handled = await authority.dispatch(command, {
 					handleCollabUiResponse: uiResponse => {
 						const pending = this.#pendingUi.get(uiResponse.reqId);
@@ -894,6 +925,24 @@ export class CollabHost {
 							success: true,
 						};
 					},
+					validateExecution: this.#privateHost
+						? queuedCommand => {
+								if (
+									this.#stopped ||
+									this.#socket === null ||
+									this.#ctx.sessionManager.getSessionId() !== predecessorSessionId ||
+									this.#rpcAuthority !== authority ||
+									this.#rpcAuthorityEpoch !== authorityEpoch
+								) {
+									return this.#rpcFailure(
+										queuedCommand,
+										"Private Collab RPC route was replaced before the command could execute",
+										"unavailable",
+									);
+								}
+								return undefined;
+							}
+						: undefined,
 				});
 				result = "response" in handled ? handled : { response: handled };
 			}
@@ -909,7 +958,7 @@ export class CollabHost {
 		try {
 			await this.#sendRpcResult(resultType, requestId, result.response, fromPeer);
 			const currentSessionId = this.#ctx.sessionManager.getSessionId();
-			if (currentSessionId !== this.#sessionId) this.#sessionId = currentSessionId;
+			if (!this.#privateHost && currentSessionId !== this.#sessionId) this.#sessionId = currentSessionId;
 			await result.afterResponse?.();
 		} finally {
 			this.#activeRpcRequests.delete(requestKey);

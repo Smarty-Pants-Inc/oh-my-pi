@@ -635,6 +635,8 @@ export interface RpcCanonicalDispatchContext {
 	handleCollabUiResponse(
 		command: Extract<RpcCommand, { type: "collab_ui_response" }>,
 	): RpcResponse | Promise<RpcResponse>;
+	/** Reject execution when the private route that accepted this request was replaced while it waited. */
+	validateExecution?(command: RpcCommand): RpcResponse | undefined;
 }
 
 /** Shared authoritative dispatcher exposed by direct RPC mode to private Collab hosting. */

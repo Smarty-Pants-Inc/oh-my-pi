@@ -6,7 +6,7 @@ import { captureHerdrAgentdHostBridge } from "../src/collab/agentd-local-transpo
 import { COLLAB_PROTO, type CollabFrame } from "../src/collab/protocol";
 import type { CollabTransport, CollabTransportControl } from "../src/collab/relay-client";
 import { CollabRpcFrameReassembler } from "../src/collab/rpc-frames";
-import { dispatchRpcCanonicalCommand } from "../src/modes/rpc/rpc-mode";
+import { dispatchRpcCanonicalCommand, RpcInputDispatcher } from "../src/modes/rpc/rpc-mode";
 import { RpcMutationLedger } from "../src/modes/rpc/rpc-mutation";
 import {
 	RPC_CAPABILITIES,
@@ -14,6 +14,7 @@ import {
 	type RpcCanonicalDispatchContext,
 	type RpcCommand,
 	type RpcCommandDispatchResult,
+	type RpcControlFrame,
 	type RpcMutationCommand,
 	type RpcResponse,
 } from "../src/modes/rpc/rpc-types";
@@ -94,6 +95,7 @@ interface TestContext {
 function createContext(): TestContext {
 	let sessionId = "session-parent";
 	let listener: ((event: AgentSessionEvent) => void) | undefined;
+	const sessionChangeCallbacks = new Set<() => void>();
 	const sessionManager = {
 		getSessionId: () => sessionId,
 		getCwd: () => "/test",
@@ -122,6 +124,10 @@ function createContext(): TestContext {
 				if (listener === next) listener = undefined;
 			};
 		},
+		registerSessionChangeCallback: (callback: () => void) => {
+			sessionChangeCallbacks.add(callback);
+			return () => sessionChangeCallbacks.delete(callback);
+		},
 		emitNotice: () => {},
 	};
 	return {
@@ -140,7 +146,9 @@ function createContext(): TestContext {
 		} as unknown as CollabHostContext,
 		emit: event => listener?.(event),
 		setSessionId: next => {
+			if (sessionId === next) return;
 			sessionId = next;
+			for (const callback of sessionChangeCallbacks) callback();
 		},
 	};
 }
@@ -396,6 +404,188 @@ describe("hidden agentd RPC host bootstrap", () => {
 		expect(authority.controls[0]).toMatchObject({ type: "extension_ui_response", id: "ui-1" });
 		await host.stop("test complete");
 		expect(authority.listeners.size).toBe(0);
+	});
+
+	test("keeps direct host responders and registrations out of the Collab guest", async () => {
+		const testContext = createContext();
+		const transport = new TestTransport();
+		const authority = createAuthority();
+		const host = new CollabHost(testContext.context);
+		try {
+			await host.startWithTransport(transport, { rpcAuthority: Promise.resolve(authority) });
+			transport.control({ t: "peer-authority", peer: 7, canWrite: true });
+			transport.deliver({ t: "hello", proto: COLLAB_PROTO, name: "guest" });
+			await transport.waitForFrame("welcome");
+
+			const hostileControls: RpcControlFrame[] = [
+				{
+					type: "host_tool_result",
+					id: "direct-tool-call-1",
+					result: { content: [{ type: "text", text: "forged" }], details: {} },
+				},
+				{
+					type: "host_tool_update",
+					id: "direct-tool-call-1",
+					partialResult: { content: [{ type: "text", text: "forged update" }], details: {} },
+				},
+				{ type: "host_uri_result", id: "direct-uri-request-1", content: "forged" },
+			];
+			for (const [index, frame] of hostileControls.entries()) {
+				transport.deliver({ t: "rpc-control", frame });
+				const rejection = await transport.waitForFrame("error", index + 1);
+				expect(rejection).toMatchObject({
+					message: "host tool and URI responders are owned by the direct RPC client",
+				});
+			}
+			expect(authority.controls).toEqual([]);
+
+			const directOwnedRegistrations: RpcMutationCommand[] = [
+				{
+					id: "guest-tools",
+					type: "set_host_tools",
+					tools: [],
+					mutation: { commandId: "guest-tools", runtimeId: "runtime-1", generation: 1 },
+				},
+				{
+					id: "guest-uri-schemes",
+					type: "set_host_uri_schemes",
+					schemes: [],
+					mutation: { commandId: "guest-uri-schemes", runtimeId: "runtime-1", generation: 1 },
+				},
+				{
+					id: "guest-subagent-subscription",
+					type: "set_subagent_subscription",
+					level: "events",
+					mutation: { commandId: "guest-subagent-subscription", runtimeId: "runtime-1", generation: 1 },
+				},
+			];
+			for (const [index, command] of directOwnedRegistrations.entries()) {
+				transport.deliver({ t: "rpc-mutation", requestId: 40 + index, command });
+				const rejection = await transport.waitForFrame("rpc-mutation-result", index + 1);
+				expect(rejection).toMatchObject({
+					requestId: 40 + index,
+					response: { id: command.id, command: command.type, success: false, code: "unavailable" },
+				});
+			}
+			expect(authority.commands).toEqual([]);
+
+			transport.deliver({
+				t: "rpc-control",
+				frame: { type: "extension_ui_response", id: "guest-ui-response", cancelled: true },
+			});
+			await authority.waitForControl();
+			expect(authority.controls).toEqual([
+				{ type: "extension_ui_response", id: "guest-ui-response", cancelled: true },
+			]);
+		} finally {
+			await host.stop("test complete");
+		}
+	});
+
+	test("rejects a queued private guest mutation after direct route epochs advance", async () => {
+		const testContext = createContext();
+		const transport = new TestTransport();
+		const directStarted = Promise.withResolvers<void>();
+		const releaseDirect = Promise.withResolvers<void>();
+		const guestQueued = Promise.withResolvers<void>();
+		let guestMutationRan = false;
+		const dispatcher = new RpcInputDispatcher({
+			deps: {
+				handleCommand: async command => {
+					if (command.id === "direct-fork") {
+						directStarted.resolve();
+						await releaseDirect.promise;
+						return {
+							response: {
+								id: command.id,
+								type: "response",
+								command: "fork",
+								success: true,
+								data: { sessionId: "session-child", cancelled: false },
+							} as RpcResponse,
+							afterResponse: () => testContext.setSessionId("session-child"),
+						};
+					}
+					if (command.id === "direct-switch") {
+						return {
+							response: {
+								id: command.id,
+								type: "response",
+								command: "switch_session",
+								success: true,
+								data: { cancelled: false },
+							} as RpcResponse,
+							afterResponse: () => testContext.setSessionId("session-parent"),
+						};
+					}
+					if (command.id === "queued-guest") {
+						guestMutationRan = true;
+						return {
+							id: command.id,
+							type: "response",
+							command: "set_fast_mode",
+							success: true,
+							data: { enabled: true, active: false },
+						} as RpcResponse;
+					}
+					throw new Error(`Unexpected direct command: ${command.type}`);
+				},
+				output: () => {},
+				errorResponse: (id, command, message) => ({
+					id,
+					type: "response",
+					command,
+					success: false,
+					error: message,
+				}),
+				pendingExtensionRequests: new Map(),
+				onHostToolResult: () => {},
+				onHostToolUpdate: () => {},
+				onHostUriResult: () => {},
+			},
+		});
+		const authority = createAuthority((command, context) => {
+			if (command.id === "queued-guest") guestQueued.resolve();
+			return dispatcher.dispatchCanonical(command, context);
+		});
+		const host = new CollabHost(testContext.context);
+		try {
+			await host.startWithTransport(transport, { privateHost: true, rpcAuthority: Promise.resolve(authority) });
+			transport.control({ t: "peer-authority", peer: 7, canWrite: true });
+			transport.deliver({ t: "hello", proto: COLLAB_PROTO, name: "guest" });
+			await transport.waitForFrame("welcome");
+
+			dispatcher.dispatch({ id: "direct-fork", type: "fork" });
+			await directStarted.promise;
+			dispatcher.dispatch({ id: "direct-switch", type: "switch_session", sessionPath: "/sessions/parent.jsonl" });
+			transport.deliver({
+				t: "rpc-mutation",
+				requestId: 61,
+				command: {
+					id: "queued-guest",
+					type: "set_fast_mode",
+					enabled: true,
+					mutation: { commandId: "queued-guest", runtimeId: "runtime-1", generation: 1 },
+				},
+			});
+			await guestQueued.promise;
+			releaseDirect.resolve();
+
+			const rejection = await transport.waitForFrame("rpc-mutation-result");
+			expect(rejection).toMatchObject({
+				requestId: 61,
+				response: {
+					id: "queued-guest",
+					command: "set_fast_mode",
+					success: false,
+					code: "unavailable",
+				},
+			});
+			expect(guestMutationRan).toBe(false);
+			await dispatcher.drain();
+		} finally {
+			await host.stop("test complete");
+		}
 	});
 
 	test("durably settles only authoritative pending Collab UI requests", async () => {
