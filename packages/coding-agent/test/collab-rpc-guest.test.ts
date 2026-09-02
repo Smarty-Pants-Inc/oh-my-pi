@@ -1,8 +1,9 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { COLLAB_PROTO, type CollabFrame } from "../src/collab/protocol";
 import type { CollabTransport } from "../src/collab/relay-client";
 import { CollabRpcGuest, type CollabRpcGuestSession } from "../src/collab/rpc-guest";
@@ -187,6 +188,57 @@ describe("CollabRpcGuest", () => {
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
 		}
+	});
+
+	it("refreshes same-selector model metadata without reapplying an equivalent state frame", async () => {
+		const initialModel = buildModel({
+			id: "host-model",
+			name: "Host Model",
+			api: "openai-completions",
+			provider: "host",
+			baseUrl: "https://host.invalid/v1",
+			reasoning: false,
+			input: ["text"],
+			supportsTools: true,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 8_192,
+		});
+		const transport = new TestTransport();
+		const session = createSession();
+		const setModel = spyOn(session.agent, "setModel");
+		const guest = new CollabRpcGuest({ transport, session, roomId: "room-model-metadata" });
+		const initialWelcome = welcome();
+		const hydration = guest.start();
+		transport.deliver({ ...initialWelcome, state: { ...initialWelcome.state, model: initialModel } });
+		transport.deliver({ t: "snapshot-chunk", entries: [entry], final: true });
+		await hydration;
+
+		expect(setModel).toHaveBeenCalledTimes(1);
+		const equivalentState = { ...initialWelcome.state, model: structuredClone(initialModel) };
+		transport.deliver({ t: "state", state: equivalentState });
+		await Bun.sleep(0);
+		expect(guest.state).toBe(equivalentState);
+		expect(setModel).toHaveBeenCalledTimes(1);
+
+		const refreshedModel = {
+			...initialModel,
+			name: "Host Model Extended",
+			contextWindow: 1_000_000,
+			supportsTools: false,
+		};
+		const refreshedState = { ...initialWelcome.state, model: refreshedModel };
+		transport.deliver({ t: "state", state: refreshedState });
+		await Bun.sleep(0);
+		expect(guest.state).toBe(refreshedState);
+		expect(setModel).toHaveBeenCalledTimes(2);
+		expect(session.agent.state.model).toMatchObject({
+			id: "host-model",
+			provider: "host",
+			name: "Host Model Extended",
+			contextWindow: 1_000_000,
+			supportsTools: false,
+		});
 	});
 
 	it("reapplies connection-local configuration retries without a durable receipt", async () => {

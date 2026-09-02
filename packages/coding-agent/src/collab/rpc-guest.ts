@@ -395,11 +395,7 @@ export class CollabRpcGuest {
 
 	#applyState(state: CollabSessionState): void {
 		this.state = state;
-		if (
-			state.model &&
-			(this.#session.agent.state.model?.id !== state.model.id ||
-				this.#session.agent.state.model?.provider !== state.model.provider)
-		) {
+		if (state.model && !Bun.deepEquals(this.#session.agent.state.model, state.model)) {
 			this.#session.agent.setModel(state.model);
 		}
 		const thinkingLevel = state.thinkingLevel as ThinkingLevel | undefined;
