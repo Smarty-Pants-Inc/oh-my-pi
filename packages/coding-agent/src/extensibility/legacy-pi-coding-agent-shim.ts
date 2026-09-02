@@ -878,7 +878,7 @@ export class DefaultPackageManager {
  * callbacks, `additional*Paths`, `extensionFactories`, `settingsManager`,
  * `eventBus`) plus the discovery results, and the sibling `createAgentSession`
  * override below translates them into OMP's native session options
- * (`disableExtensionDiscovery`, `preloadedExtensionPaths`, `extensions`,
+ * (`disableExtensionDiscovery`, prepared/path extension preloads, `extensions`,
  * `skills`, `promptTemplates`, `contextFiles`, `settings`, `eventBus`,
  * `systemPrompt`) before delegating to `../sdk`.
  *
@@ -1388,10 +1388,14 @@ export async function createAgentSession(
 	}
 
 	// Route the loader's already-loaded extension result through the SDK's
-	// `preloadedExtensions` seam. Protected sessions rebuild verified sources
-	// using the forwarded discovery options; unprotected sessions reuse this
-	// snapshot, preserving the caller's `noExtensions: true` opt-out.
-	if (rest.preloadedExtensions === undefined && rest.preloadedExtensionPaths === undefined) {
+	// `preloadedExtensions` seam. Skipping this branch would let
+	// `createAgentSession` re-run its own discovery and undo the caller's
+	// `noExtensions: true`.
+	if (
+		rest.preloadedExtensions === undefined &&
+		rest.preloadedPreparedExtensions === undefined &&
+		rest.preloadedExtensionPaths === undefined
+	) {
 		forwarded.preloadedExtensions = state.extensionsResult;
 	}
 

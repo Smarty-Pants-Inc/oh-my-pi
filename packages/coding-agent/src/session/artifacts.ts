@@ -9,6 +9,7 @@ import type { Stats } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { replaceFileAtomically } from "../utils/atomic-file";
 import {
 	type ArtifactPublication,
 	commitClonePublication,
@@ -196,9 +197,50 @@ function commitRelocationBinding(
 }
 
 /**
- * Manages artifact storage for a session. Managers created for the same path in
- * one process share allocator, lease, and transaction state; filesystem `wx`
- * reservations extend the one-writer guarantee across processes.
+ * Persist an artifact only when the filesystem confirms the complete payload is
+ * readable, then swap it into place atomically.
+ *
+ * Content is staged to a temporary sibling and verified (byte count, on-disk
+ * size, readability) before an atomic `rename` publishes it. `agent://<id>`
+ * discovers `${id}.md` by scanning the artifacts directory rather than reading
+ * `result.outputPath`, so a direct in-place write that fell short would leave a
+ * truncated file resolvable as incomplete output and a failed follow-up write
+ * would destroy the prior valid artifact. Staging keeps both hazards out: on
+ * any failure the temp file is removed and the existing artifact at `path` is
+ * untouched.
+ *
+ * Returns the verified UTF-8 byte count.
+ */
+export async function writeArtifact(path: string, content: string): Promise<number> {
+	const expectedBytes = Buffer.byteLength(content);
+	const tempPath = `${path}.tmp-${crypto.randomUUID()}`;
+	try {
+		const writtenBytes = await Bun.write(tempPath, content);
+		if (writtenBytes !== expectedBytes) {
+			throw new Error(`Artifact write incomplete: wrote ${writtenBytes} of ${expectedBytes} bytes`);
+		}
+		const file = Bun.file(tempPath);
+		if (file.size !== expectedBytes) {
+			throw new Error(`Artifact size mismatch: found ${file.size} of ${expectedBytes} bytes`);
+		}
+		await file.slice(0, Math.min(expectedBytes, 1)).arrayBuffer();
+		await replaceFileAtomically(tempPath, path);
+	} catch (error) {
+		await fs.rm(tempPath, { force: true });
+		throw error;
+	}
+	return expectedBytes;
+}
+
+/**
+ * Manages artifact storage for a session.
+ *
+ * Artifacts are stored with sequential IDs in the session's artifact directory.
+ * The directory is created lazily on first write.
+ *
+ * Subagents do not own their own `ArtifactManager`. The parent's instance is
+ * adopted via `SessionManager.adoptArtifactManager`, so the whole parent +
+ * subagent tree shares one ID space and one directory.
  */
 export class ArtifactManager {
 	readonly #binding: ArtifactDirectoryBinding;
@@ -245,7 +287,15 @@ export class ArtifactManager {
 			path: artifactPath,
 			reservation,
 			settled: settled.promise,
-			write: content => handle.writeFile(content),
+			write: async content => {
+				const expectedBytes = Buffer.byteLength(content);
+				await handle.writeFile(content);
+				const { size } = await handle.stat();
+				if (size !== expectedBytes) {
+					throw new Error(`Artifact size mismatch: found ${size} of ${expectedBytes} bytes`);
+				}
+				await Bun.file(artifactPath).slice(0, Math.min(expectedBytes, 1)).arrayBuffer();
+			},
 			release: () => {
 				if (released) return;
 				released = true;

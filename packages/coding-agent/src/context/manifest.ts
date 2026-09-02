@@ -18,8 +18,8 @@ export const CONTENT_MANIFEST_SCHEMA = "omp.prompt_manifest.v1" as const;
 export const RELEASE_MANIFEST_SCHEMA = "omp.context_release_manifest.v1" as const;
 export const OMP_REPOSITORY = "Smarty-Pants-Inc/oh-my-pi";
 const OMP_SCOPE_BASE = {
-	commit: "37eee71978951fccf66b21f7e3e2b74596ac9d74",
-	tree: "a20c0452f99155e7adeaecfad28e4afd0223c684",
+	commit: "eea5628f13043286e17c4a2ea4fc28b15fda33ca",
+	tree: "257f25692c75703f3b1b81af47b3fb676b59f879",
 } as const;
 const OMP_SCOPE_BASE_URL = "https://github.com/can1357/oh-my-pi.git";
 const MATERIALIZED_STACK_PACKAGE_METADATA_PATHS: Record<string, true> = {

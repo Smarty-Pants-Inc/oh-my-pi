@@ -11,6 +11,7 @@ import type { Api, Model, ServiceTierByFamily, Usage } from "@oh-my-pi/pi-ai";
 import { logger, popLoopPhase, pushLoopPhase, untilAborted } from "@oh-my-pi/pi-utils";
 import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, AsyncJobManager } from "../async";
 import type { Rule } from "../capability/rule";
+import type { EffectiveExtensionRoots } from "../capability/types";
 import { ModelRegistry } from "../config/model-registry";
 import {
 	formatModelSelectorValue,
@@ -32,6 +33,7 @@ import type { ToolPathWithSource } from "../extensibility/custom-tools";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import { runExtensionCompact, runExtensionSetModel } from "../extensibility/extensions/compact-handler";
 import { getSessionSlashCommands } from "../extensibility/extensions/get-commands-handler";
+import type { PreparedExtension } from "../extensibility/extensions/types";
 import { buildSkillPromptMessage, type Skill } from "../extensibility/skills";
 import type { HindsightSessionState } from "../hindsight/state";
 import type { LocalProtocolOptions } from "../internal-urls";
@@ -39,10 +41,11 @@ import type { MCPManager } from "../mcp/manager";
 import type { MnemopiSessionState } from "../mnemopi/state";
 import { initializeExtensions } from "../modes/runtime-init";
 import { AgentLifecycleManager, type AgentReviver } from "../registry/agent-lifecycle";
-import { AgentRegistry } from "../registry/agent-registry";
+import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
+import { ensurePersistedRoster, isCurrentSessionRosterRef } from "../registry/persisted-agents";
 import { type CreateAgentSessionOptions, createAgentSession, discoverAuthStorage } from "../sdk";
 import type { AgentSession, AgentSessionEvent, Prewalk } from "../session/agent-session";
-import type { ArtifactManager } from "../session/artifacts";
+import { type ArtifactManager, writeArtifact } from "../session/artifacts";
 import { ASYNC_RESULT_MESSAGE_TYPE } from "../session/async-job-delivery";
 import type { AuthStorage } from "../session/auth-storage";
 import { type ExecutionEnvironmentBinding, mapExecutionEnvironmentPath } from "../session/execution-environment";
@@ -53,10 +56,12 @@ import { type ConfiguredThinkingLevel, prewalkWouldBeNoop, resolveTaskEffortLeve
 import type { ContextFileEntry, ToolSession } from "../tools";
 import { resolveEvalBackends } from "../tools/eval-backends";
 import { isIrcEnabled } from "../tools/hub";
+import { LIST_STATUS_ORDER } from "../tools/hub/messaging";
+import { DEFAULT_HUB_LIST_LIMIT } from "../tools/hub/types";
 import { normalizeSchema } from "../tools/jtd-to-json-schema";
 import { buildOutputValidator, summarizeValidationFailure } from "../tools/output-schema-validator";
 import { ToolAbortError } from "../tools/tool-errors";
-import type { EventBus } from "../utils/event-bus";
+import { type EventBus, emitSubagentFrame } from "../utils/event-bus";
 import { trackLateCleanup } from "../utils/late-cleanup";
 import type { WorkspaceTree } from "../workspace-tree";
 import { attributeSubagentError } from "./error-attribution";
@@ -284,19 +289,58 @@ function installSubagentRetryFallbackChain(args: {
 	return role;
 }
 
-function renderIrcPeerRoster(selfId: string): string {
-	const peers = AgentRegistry.global()
-		.list()
-		.filter(ref => ref.id !== selfId && ref.status !== "aborted" && ref.kind !== "advisor");
-	if (peers.length === 0) return "- (no other agents)";
-	const lines = peers.map(
-		peer =>
-			`- \`${peer.id}\` — ${peer.displayName} (${peer.kind}, ${peer.status})${peer.activity ? `: ${peer.activity}` : ""}`,
-	);
-	if (peers.some(peer => peer.status === "idle" || peer.status === "parked")) {
-		lines.push("Idle/parked peers are not gone: messaging them wakes (or revives) them.");
+export interface IrcPeerRosterRow {
+	id: string;
+	displayName: string;
+	kind: string;
+	status: string;
+	activity?: string;
+}
+
+export interface IrcPeerRosterData {
+	/** Live (running+idle) peer rows, bounded at DEFAULT_HUB_LIST_LIMIT. */
+	peers: IrcPeerRosterRow[];
+	/** Current-root parked refs, counted but never named. */
+	parkedCount: number;
+	/** Live rows dropped by the bound; the prompt reports them truthfully. */
+	omittedCount: number;
+}
+
+export function collectIrcPeerRoster(
+	registry: AgentRegistry,
+	selfId: string,
+	rootSessionFile?: string,
+): IrcPeerRosterData {
+	// Same ordering as `hub list`: running before idle, then newest activity
+	// first — so the cap keeps the newest relevant siblings, not an
+	// insertion-order prefix.
+	const live = registry
+		.listVisibleTo(selfId)
+		.sort(
+			(a, b) =>
+				(LIST_STATUS_ORDER[a.status] ?? 9) - (LIST_STATUS_ORDER[b.status] ?? 9) || b.lastActivity - a.lastActivity,
+		);
+	const limit = DEFAULT_HUB_LIST_LIMIT;
+	const omittedCount = Math.max(0, live.length - limit);
+	const peers = (omittedCount > 0 ? live.slice(0, limit) : live).map(peer => ({
+		id: peer.id,
+		displayName: peer.displayName,
+		kind: peer.kind,
+		status: peer.status,
+		activity: peer.activity,
+	}));
+	let parkedCount = 0;
+	for (const ref of registry.list()) {
+		if (
+			ref.id !== selfId &&
+			ref.kind !== "advisor" &&
+			ref.status === "parked" &&
+			isCurrentSessionRosterRef(ref, rootSessionFile)
+		) {
+			parkedCount++;
+		}
 	}
-	return lines.join("\n");
+	return { peers, parkedCount, omittedCount };
 }
 
 function withAbortTimeout<T>(
@@ -442,6 +486,7 @@ export interface ExecutorOptions {
 	persistArtifacts?: boolean;
 	artifactsDir?: string;
 	eventBus?: EventBus;
+	subagentEventBus?: EventBus;
 	contextFiles?: ContextFileEntry[];
 	skills?: Skill[];
 	promptTemplates?: PromptTemplate[];
@@ -449,11 +494,18 @@ export interface ExecutorOptions {
 	/** Parent-discovered rules, forwarded to skip rule discovery in the subagent. */
 	rules?: Rule[];
 	/**
+	 * Parent session's live extension-root policy. Forwarded separately from
+	 * `preloadedExtensionPaths`, which only controls extension module loading.
+	 */
+	extensionRoots?: () => EffectiveExtensionRoots;
+	/**
 	 * Parent's discovered extension source paths. Forwarded to skip the
 	 * extension FS scan in the subagent; the subagent then re-binds each
 	 * extension against its own `ExtensionAPI` (cwd, eventBus, runtime).
 	 */
 	preloadedExtensionPaths?: string[];
+	/** Parent-imported extension factories rebound to the child runtime. */
+	preloadedPreparedExtensions?: readonly PreparedExtension[];
 	/**
 	 * Parent's discovered custom-tool source paths. Forwarded to skip the
 	 * `.omp/tools/` FS scan in the subagent; the subagent then re-binds each
@@ -938,6 +990,7 @@ interface RunMonitorArgs {
 	signal?: AbortSignal;
 	onProgress?: (progress: AgentProgress) => void;
 	eventBus?: EventBus;
+	subagentEventBus?: EventBus;
 	parentToolCallId?: string;
 	detached?: boolean;
 	sessionFile?: string;
@@ -1273,19 +1326,18 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		const activityGist =
 			progress.lastIntent ?? (progress.currentTool ? `running ${progress.currentTool}` : undefined);
 		if (activityGist) AgentRegistry.global().setActivity(id, activityGist);
-		if (args.eventBus) {
-			args.eventBus.emit(TASK_SUBAGENT_PROGRESS_CHANNEL, {
-				index,
-				agent: agent.name,
-				agentSource: agent.source,
-				task,
-				parentToolCallId: args.parentToolCallId,
-				detached: args.detached,
-				assignment,
-				progress: { ...progress },
-				sessionFile: args.sessionFile,
-			});
-		}
+		const progressPayload = {
+			index,
+			agent: agent.name,
+			agentSource: agent.source,
+			task,
+			parentToolCallId: args.parentToolCallId,
+			detached: args.detached,
+			assignment,
+			progress: { ...progress },
+			sessionFile: args.sessionFile,
+		};
+		emitSubagentFrame(args.eventBus, args.subagentEventBus, TASK_SUBAGENT_PROGRESS_CHANNEL, progressPayload);
 		lastProgressEmitMs = Date.now();
 	};
 
@@ -1384,11 +1436,8 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	};
 
 	const emitSubagentEvent = (event: AgentSessionEvent) => {
-		if (!args.eventBus) return;
-		args.eventBus.emit(TASK_SUBAGENT_EVENT_CHANNEL, {
-			id,
-			event,
-		});
+		const payload = { id, event };
+		emitSubagentFrame(args.eventBus, args.subagentEventBus, TASK_SUBAGENT_EVENT_CHANNEL, payload);
 	};
 
 	const recordExtractedToolData = (toolName: string, data: unknown): void => {
@@ -2009,6 +2058,7 @@ interface FinalizeRunArgs {
 	signal?: AbortSignal;
 	artifactsDir?: string;
 	eventBus?: EventBus;
+	subagentEventBus?: EventBus;
 	parentToolCallId?: string;
 	detached?: boolean;
 	/**
@@ -2090,15 +2140,20 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 	let outputMeta: { lineCount: number; charCount: number } | undefined;
 	let outputPath: string | undefined;
 	if (args.artifactsDir && (!args.followUpTurn || hasYield)) {
-		outputPath = path.join(args.artifactsDir, `${id}.md`);
+		const candidatePath = path.join(args.artifactsDir, `${id}.md`);
 		try {
-			await Bun.write(outputPath, rawOutput);
+			await writeArtifact(candidatePath, rawOutput);
+			outputPath = candidatePath;
 			outputMeta = {
 				lineCount: rawOutput.split("\n").length,
 				charCount: rawOutput.length,
 			};
-		} catch {
-			// Non-fatal
+		} catch (error) {
+			logger.warn("Failed to persist subagent output artifact", {
+				agentId: id,
+				path: candidatePath,
+				error: error instanceof Error ? error.message : String(error),
+			});
 		}
 	}
 
@@ -2128,19 +2183,18 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 	monitor.scheduleProgress(true);
 
 	// Emit lifecycle end event after finalization so yield status is reflected
-	if (args.eventBus) {
-		args.eventBus.emit(TASK_SUBAGENT_LIFECYCLE_CHANNEL, {
-			id,
-			agent: agent.name,
-			parentToolCallId: args.parentToolCallId,
-			detached: args.detached,
-			agentSource: agent.source,
-			description: progress.description,
-			status: progress.status as "completed" | "failed" | "aborted",
-			sessionFile: args.sessionFile,
-			index,
-		});
-	}
+	const settledPayload = {
+		id,
+		agent: agent.name,
+		parentToolCallId: args.parentToolCallId,
+		detached: args.detached,
+		agentSource: agent.source,
+		description: progress.description,
+		status: progress.status as "completed" | "failed" | "aborted",
+		sessionFile: args.sessionFile,
+		index,
+	};
+	emitSubagentFrame(args.eventBus, args.subagentEventBus, TASK_SUBAGENT_LIFECYCLE_CHANNEL, settledPayload);
 
 	return {
 		index,
@@ -2187,6 +2241,7 @@ export interface IrcWakeTurnMonitorOptions {
 	/** Explicit pre-expansion model role alias selected for this run. */
 	modelRole?: string;
 	eventBus?: EventBus;
+	subagentEventBus?: EventBus;
 	parentToolCallId?: string;
 	/** Fallback session file when the registry ref carries none. */
 	sessionFile?: string;
@@ -2232,6 +2287,7 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 			modelOverride: options.modelOverride,
 			modelRole: options.modelRole,
 			eventBus: options.eventBus,
+			subagentEventBus: options.subagentEventBus,
 			parentToolCallId: options.parentToolCallId,
 			detached: true,
 			sessionFile,
@@ -2240,19 +2296,18 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 			maxRuntimeMs,
 		});
 
-		if (options.eventBus) {
-			options.eventBus.emit(TASK_SUBAGENT_LIFECYCLE_CHANNEL, {
-				id,
-				agent: agent.name,
-				parentToolCallId: options.parentToolCallId,
-				detached: true,
-				agentSource: agent.source,
-				description: options.description,
-				status: "started",
-				sessionFile,
-				index,
-			});
-		}
+		const startedPayload = {
+			id,
+			agent: agent.name,
+			parentToolCallId: options.parentToolCallId,
+			detached: true,
+			agentSource: agent.source,
+			description: options.description,
+			status: "started",
+			sessionFile,
+			index,
+		} as const;
+		emitSubagentFrame(options.eventBus, options.subagentEventBus, TASK_SUBAGENT_LIFECYCLE_CHANNEL, startedPayload);
 
 		turnMonitor.setActiveSession(session);
 		const unsubscribeTurn = turnMonitor.attach(session);
@@ -2294,6 +2349,7 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 					outputSchemaSource: options.outputSchemaSource,
 					artifactsDir: options.artifactsDir,
 					eventBus: options.eventBus,
+					subagentEventBus: options.subagentEventBus,
 					parentToolCallId: options.parentToolCallId,
 					detached: true,
 					followUpTurn: true,
@@ -2452,6 +2508,7 @@ export interface FollowUpTurnOptions {
 	signal?: AbortSignal;
 	onProgress?: (progress: AgentProgress) => void;
 	eventBus?: EventBus;
+	subagentEventBus?: EventBus;
 	parentToolCallId?: string;
 	/**
 	 * When set, a turn that produces a `yield` result (re)writes `<artifactsDir>/<id>.md`
@@ -2492,6 +2549,7 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 		signal,
 		onProgress: options.onProgress,
 		eventBus: options.eventBus,
+		subagentEventBus: options.subagentEventBus,
 		parentToolCallId: options.parentToolCallId,
 		detached: true,
 		sessionFile,
@@ -2500,19 +2558,18 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 		maxRuntimeMs: options.maxRuntimeMs ?? 0,
 	});
 
-	if (options.eventBus) {
-		options.eventBus.emit(TASK_SUBAGENT_LIFECYCLE_CHANNEL, {
-			id,
-			agent: agent.name,
-			parentToolCallId: options.parentToolCallId,
-			detached: true,
-			agentSource: agent.source,
-			description: options.description,
-			status: "started",
-			sessionFile,
-			index,
-		});
-	}
+	const startedPayload = {
+		id,
+		agent: agent.name,
+		parentToolCallId: options.parentToolCallId,
+		detached: true,
+		agentSource: agent.source,
+		description: options.description,
+		status: "started",
+		sessionFile,
+		index,
+	} as const;
+	emitSubagentFrame(options.eventBus, options.subagentEventBus, TASK_SUBAGENT_LIFECYCLE_CHANNEL, startedPayload);
 
 	monitor.setActiveSession(session);
 	const unsubscribe = monitor.attach(session);
@@ -2545,6 +2602,7 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 		signal,
 		artifactsDir: options.artifactsDir,
 		eventBus: options.eventBus,
+		subagentEventBus: options.subagentEventBus,
 		parentToolCallId: options.parentToolCallId,
 		detached: true,
 		followUpTurn: true,
@@ -2721,6 +2779,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		signal,
 		onProgress,
 		eventBus: options.eventBus,
+		subagentEventBus: options.subagentEventBus,
 		parentToolCallId: options.parentToolCallId,
 		detached: options.detached,
 		sessionFile: subtaskSessionFile,
@@ -2740,6 +2799,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			modelOverride,
 			modelRole,
 			eventBus: options.eventBus,
+			subagentEventBus: options.subagentEventBus,
 			parentToolCallId: options.parentToolCallId,
 			sessionFile: subtaskSessionFile,
 			maxRuntimeMs,
@@ -2978,6 +3038,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			}
 
 			const { normalized: normalizedOutputSchema } = normalizeSchema(outputSchema);
+			// Root resolved by the latest roster ensure; the prompt callback renders
+			// live peer rows scoped to it, so a session switch hides stale parked trees.
+			let ircRootSessionFile: string | undefined;
 			let planReferencePath = options.planReference?.path ?? "";
 			if (planReferencePath && options.executionEnvironment) {
 				try {
@@ -2991,30 +3054,34 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			// the same JSONL file re-invokes createAgentSession with the exact options
 			// of the original run (same agent id, tools, model, system prompt,
 			// artifacts dir) — only the SessionManager differs.
-			const subagentContextInstructions = [
-				renderInstruction(
-					"subagent.base",
-					{
-						agent: agent.systemPrompt,
-						context: options.context?.trim() ?? "",
-						planReference: options.planReference?.content ?? "",
-						planReferencePath,
-						operationalRoot: options.executionEnvironment?.remoteRoot ?? "",
-						worktree: worktree ?? "",
-						outputSchema: normalizedOutputSchema,
-						outputSchemaOverridesAgent: options.outputSchemaOverridesAgent === true,
-						ircPeers: ircEnabled ? renderIrcPeerRoster(id) : "",
-						ircSelfId: ircEnabled ? id : "",
-					},
-					"subagent",
-				),
-				renderInstruction("subagent-user-prompt", {}, "subagent"),
-			];
-
 			const buildSubagentSessionOptions = (
 				sessionManagerForRun: SessionManager,
 				expectedAgentRef: CreateAgentSessionOptions["expectedAgentRef"],
 			): CreateAgentSessionOptions => {
+				const ircRoster = ircEnabled
+					? collectIrcPeerRoster(AgentRegistry.global(), id, ircRootSessionFile)
+					: undefined;
+				const contextInstructions = [
+					renderInstruction(
+						"subagent.base",
+						{
+							agent: agent.systemPrompt,
+							context: options.context?.trim() ?? "",
+							planReference: options.planReference?.content ?? "",
+							planReferencePath,
+							operationalRoot: options.executionEnvironment?.remoteRoot ?? "",
+							worktree: worktree ?? "",
+							outputSchema: normalizedOutputSchema,
+							outputSchemaOverridesAgent: options.outputSchemaOverridesAgent === true,
+							ircPeers: ircRoster?.peers ?? [],
+							ircParkedCount: ircRoster?.parkedCount ?? 0,
+							ircOmittedCount: ircRoster?.omittedCount ?? 0,
+							ircSelfId: ircEnabled ? id : "",
+						},
+						"subagent",
+					),
+					renderInstruction("subagent-user-prompt", {}, "subagent"),
+				];
 				const sessionOptions: CreateAgentSessionOptions = {
 					cwd: worktree ?? cwd,
 					additionalDirectories: worktree !== undefined ? undefined : options.additionalDirectories,
@@ -3039,14 +3106,18 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					restrictToolNames,
 					disableExtensionDiscovery: restrictToolNames || undefined,
 					requireYieldTool: true,
-					contextInstructions: subagentContextInstructions,
+					contextInstructions,
 					contextFiles: options.contextFiles,
 					skills: options.skills,
 					promptTemplates: options.promptTemplates,
 					workspaceTree: options.workspaceTree,
 					rules: options.rules,
+					extensionRoots: options.extensionRoots,
 					preloadedExtensionPaths: subagentRuntimeAllows(runtimeProfile, "extensions")
 						? options.preloadedExtensionPaths
+						: [],
+					preloadedPreparedExtensions: subagentRuntimeAllows(runtimeProfile, "extensions")
+						? options.preloadedPreparedExtensions
 						: [],
 					preloadedCustomToolPaths: subagentRuntimeAllows(runtimeProfile, "customTools")
 						? options.preloadedCustomToolPaths
@@ -3056,6 +3127,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					prewalk,
 					spawns: spawnsEnv,
 					taskDepth: childDepth,
+					subagentEventBus: options.subagentEventBus,
 					parentHindsightSessionState: options.parentHindsightSessionState,
 					parentMnemopiSessionState: options.parentMnemopiSessionState,
 					parentTaskPrefix: id,
@@ -3064,7 +3136,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					agentDisplayName: agent.name,
 					expectedAgentRef,
 					enableLsp: lspEnabled,
-					enableIrc: subagentRuntimeAllows(runtimeProfile, "irc"),
+					enableIrc: ircEnabled,
 					skipPythonPreflight,
 					enableMCP,
 					mcpManager,
@@ -3086,6 +3158,15 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				sessionManager.adoptArtifactManager(options.parentArtifactManager);
 			}
 			sessionOpenedAt = performance.now();
+			if (ircEnabled) {
+				ircRootSessionFile = await ensurePersistedRoster(
+					AgentRegistry.global(),
+					sessionManager.getSessionFile() ??
+						sessionFile ??
+						AgentRegistry.global().get(id)?.sessionFile ??
+						AgentRegistry.global().get(MAIN_AGENT_ID)?.sessionFile,
+				);
+			}
 
 			const sessionPromise = createAgentSession(buildSubagentSessionOptions(sessionManager, null));
 			let session: AgentSession;
@@ -3116,6 +3197,15 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					if (options.parentArtifactManager) {
 						reopened.adoptArtifactManager(options.parentArtifactManager);
 					}
+					if (ircEnabled) {
+						ircRootSessionFile = await ensurePersistedRoster(
+							AgentRegistry.global(),
+							reopened.getSessionFile() ??
+								sessionFile ??
+								AgentRegistry.global().get(id)?.sessionFile ??
+								AgentRegistry.global().get(MAIN_AGENT_ID)?.sessionFile,
+						);
+					}
 					const { session: revived } = await createAgentSession(
 						buildSubagentSessionOptions(reopened, expectedAgentRef),
 					);
@@ -3136,19 +3226,18 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			}
 
 			// Emit lifecycle start event
-			if (options.eventBus) {
-				options.eventBus.emit(TASK_SUBAGENT_LIFECYCLE_CHANNEL, {
-					id,
-					agent: agent.name,
-					parentToolCallId: options.parentToolCallId,
-					detached: options.detached,
-					agentSource: agent.source,
-					description: options.description,
-					status: "started",
-					sessionFile: subtaskSessionFile,
-					index,
-				});
-			}
+			const startedPayload = {
+				id,
+				agent: agent.name,
+				parentToolCallId: options.parentToolCallId,
+				detached: options.detached,
+				agentSource: agent.source,
+				description: options.description,
+				status: "started" as const,
+				sessionFile: subtaskSessionFile,
+				index,
+			};
+			emitSubagentFrame(options.eventBus, options.subagentEventBus, TASK_SUBAGENT_LIFECYCLE_CHANNEL, startedPayload);
 
 			// Todos are parent-owned bookkeeping and stripped from subagents —
 			// except under prewalk, whose plan nudge + todo gate require the
@@ -3159,11 +3248,20 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			if (filteredSubagentTools.length !== subagentToolNames.length) {
 				await awaitAbortable(session.setActiveToolsByName(filteredSubagentTools));
 			}
+			const enabledSubagentTools = session.getEnabledToolNames();
+			// The enabled set includes the synthetic write transport injected for
+			// explicit tool lists that omitted write. `session_init.tools` is later
+			// replayed as an explicit grant during cold revival, so persist write
+			// only when the original agent contract granted it.
+			const persistedSubagentTools =
+				toolNames !== undefined && !toolNames.includes("write")
+					? enabledSubagentTools.filter(name => name !== "write")
+					: enabledSubagentTools;
 
 			session.sessionManager.appendSessionInit({
 				systemPrompt: session.agent.state.systemPrompt.join("\n\n"),
 				task,
-				tools: session.getEnabledToolNames(),
+				tools: persistedSubagentTools,
 				agent: agent.name,
 				modelRole: modelRole ?? resolveExplicitModelRole(modelOverride ?? agent.model, subagentSettings),
 				resolvedModel: progress.resolvedModel,
@@ -3298,8 +3396,16 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			let deferredSessionShutdown: Promise<void> | undefined;
 			const deferCleanup = (completion: Promise<void>): void => {
 				lateCleanups.push(completion);
+				// The run's terminal outcome (a successful `yield`, or a genuine
+				// abort) is already settled; `aborted` reflects the authoritative
+				// run status after the abort-signal reconciliation below. Late
+				// cleanup (advisor drain, session disposal, owner-job reaping)
+				// draining past the deadline is orthogonal — it MUST NOT downgrade
+				// a non-aborted run to `aborted`, which discarded valid `agent()`
+				// results (issue #9670). The deferred work still completes
+				// asynchronously via `lateCleanups`/`onCleanupDeferred`.
+				if (!aborted) return;
 				exitCode = 1;
-				aborted = true;
 				abortReasonText = `cleanup exceeded ${cleanupGraceMs} ms`;
 				error ??= `Task aborted. Cleanup did not finish within ${cleanupGraceMs} ms. ${cleanupChangeStatus}`;
 			};
@@ -3451,6 +3557,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		signal,
 		artifactsDir: options.artifactsDir,
 		eventBus: options.eventBus,
+		subagentEventBus: options.subagentEventBus,
 		parentToolCallId: options.parentToolCallId,
 		detached: options.detached,
 		sessionFile: subtaskSessionFile,

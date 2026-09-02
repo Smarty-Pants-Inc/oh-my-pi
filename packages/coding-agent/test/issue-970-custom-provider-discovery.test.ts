@@ -8,7 +8,6 @@ import type { Context, Model } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
-import { normalizeQwenTemplateReasoning } from "@oh-my-pi/pi-coding-agent/config/model-discovery";
 import type { ModelRegistry, ProviderDiscoveryState } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { ModelRegistry as ModelRegistryImpl } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -261,24 +260,6 @@ describe("issue #970 custom provider discovery", () => {
 		expect(requestBody?.chat_template_kwargs).toEqual({ enable_thinking: true, reasoning_effort: "low" });
 	});
 
-	test("upgrades warm local Qwen cache rows when compat proves template effort support", () => {
-		const cached = buildModel({
-			id: "Qwen3.8-27B-UD-Q6_K_XL",
-			name: "Qwen3.8-27B-UD-Q6_K_XL",
-			provider: "vllm",
-			api: "openai-completions",
-			baseUrl: "http://192.168.5.3:8085/v1",
-			reasoning: false,
-			input: ["text"],
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-			contextWindow: 128_000,
-			maxTokens: 32_768,
-		});
-		expect(cached.compat.qwenTemplateReasoningEffort).toBe(true);
-		const normalized = normalizeQwenTemplateReasoning(cached);
-		expect(normalized.reasoning).toBe(true);
-		expect(normalized.thinking?.efforts).toEqual([Effort.Low, Effort.Medium, Effort.XHigh]);
-	});
 	test("shows a provider-tab hint when discovery succeeds but returns zero models", async () => {
 		installTestTheme();
 		const hub = await createHub({

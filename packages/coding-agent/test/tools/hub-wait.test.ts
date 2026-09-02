@@ -235,8 +235,7 @@ describe("hub unified wait", () => {
 		const registry = AgentRegistry.global();
 		registry.register({ id: SELF_ID, displayName: "main", kind: "main", session: null });
 
-		const manager = new AsyncJobManager({});
-		manager.registerDeliverySink(SELF_ID, () => {});
+		const manager = new AsyncJobManager({ onJobComplete: () => {} });
 		const firstImage: ImageContent = { type: "image", data: "c3BpbGwtZmlyc3Q=", mimeType: "image/png" };
 		const secondImage: ImageContent = { type: "image", data: "c3BpbGwtc2Vjb25k", mimeType: "image/jpeg" };
 		const hugeResult = `spill payload start\n${"x".repeat(8_192)}\nspill payload end`;

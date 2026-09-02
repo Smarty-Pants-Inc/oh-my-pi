@@ -10,6 +10,8 @@ import type {
 } from "@oh-my-pi/pi-agent-core/types";
 import type { Message, ToolChoice } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { createUserMessage } from "./helpers";
 
 function identityConverter(messages: AgentMessage[]): Message[] {
@@ -17,6 +19,7 @@ function identityConverter(messages: AgentMessage[]): Message[] {
 }
 
 const emptySchema = type({});
+const harmonyModel = buildModel({ ...getBundledModel("openai-codex", "gpt-5.4") });
 
 /**
  * Build a host that gates `resolve` as a soft requirement while a preview is
@@ -244,12 +247,9 @@ describe("agentLoop soft tool requirement", () => {
 		// coding-agent's ToolChoiceQueue.nextToolChoice advancing its generator.
 		const queue: ToolChoice[] = [{ type: "tool", name: "resolve" }];
 		const leak = "Some prose. analysis to=functions.edit code 大发官网";
-		const mock = createMockModel({
-			provider: "openai-codex",
-			responses: [{ content: [leak] }, { content: ["clean retry"] }],
-		});
+		const mock = createMockModel({ responses: [{ content: [leak] }, { content: ["clean retry"] }] });
 		const config: AgentLoopConfig = {
-			model: mock.model,
+			model: harmonyModel,
 			convertToLlm: identityConverter,
 			getToolChoice: () => queue.shift(),
 		};

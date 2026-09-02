@@ -9,17 +9,9 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import * as systemPrompt from "@oh-my-pi/pi-coding-agent/system-prompt";
-import * as gitModule from "@oh-my-pi/pi-coding-agent/utils/git";
 import { setProjectDir, TempDir } from "@oh-my-pi/pi-utils";
+import { $ } from "bun";
 import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "./helpers/settings-test-state";
-
-const DIFF = `diff --git a/src/a.ts b/src/a.ts
-index 0000000..1111111 100644
---- a/src/a.ts
-+++ b/src/a.ts
-@@ -0,0 +1 @@
-+export const retained = true;
-`;
 
 let authStorage: AuthStorage | undefined;
 let project: TempDir | undefined;
@@ -29,6 +21,14 @@ function assistantText(text: string) {
 	return {
 		role: "assistant",
 		content: [{ type: "text", text }],
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
 		stopReason: "stop",
 	} as never;
 }
@@ -37,26 +37,36 @@ function mockCompletions() {
 	return vi.spyOn(ai, "completeSimple").mockImplementation(async (_model, context) => {
 		const toolName = context.tools?.[0]?.name;
 		if (toolName === "create_changelog_entries") return assistantText('{"entries":{}}');
-		if (toolName === "create_conventional_analysis") {
-			return assistantText(
-				'{"type":"fix","scope":null,"details":[{"text":"retain cache setting"}],"issue_refs":[]}',
-			);
+		const systemPrompt = context.systemPrompt?.join("\n") ?? "";
+		if (systemPrompt.includes("extracting grounded observations")) {
+			return assistantText("# a.ts\n- retained cache setting");
 		}
-		if (toolName === "create_commit_summary") return assistantText("retain cache setting");
-		return assistantText("Observed the changed file.");
+		if (systemPrompt.includes("commit message specialist")) {
+			return assistantText("<summary>retained cache setting</summary>");
+		}
+		return assistantText("# fix: update\n\n- Retained cache setting.");
 	});
 }
 
 async function setupLegacyCommit({
 	cacheRetention,
-	mapReduceMinFiles = 4,
+	mapReduceThreshold = 5_000,
 }: {
 	cacheRetention: "long" | "none";
-	mapReduceMinFiles?: number;
+	mapReduceThreshold?: number;
 }) {
 	project = await TempDir.create("@commit-cache-retention-");
 	setProjectDir(project.path());
 	await Bun.write(project.join("CHANGELOG.md"), "# Changelog\n\n## [Unreleased]\n\n### Fixed\n");
+	await $`git init --initial-branch=main`.cwd(project.path()).quiet();
+	await $`git add CHANGELOG.md`.cwd(project.path()).quiet();
+	await $`git -c user.name=Fixture -c user.email=fixture@example.invalid commit -m baseline`
+		.cwd(project.path())
+		.quiet();
+	await Bun.write(
+		project.join("a.ts"),
+		`${Array.from({ length: 201 }, (_, index) => `export const retained${index} = true;`).join("\n")}\n`,
+	);
 
 	authStorage = new AuthStorage(new SqliteAuthCredentialStore(new Database(":memory:")));
 	await authStorage.reload();
@@ -66,7 +76,8 @@ async function setupLegacyCommit({
 	vi.spyOn(Settings, "init").mockResolvedValue(
 		Settings.isolated({
 			"providers.cacheRetention": cacheRetention,
-			"commit.mapReduceMinFiles": mapReduceMinFiles,
+			"commit.mapReduceThreshold": mapReduceThreshold,
+			"commit.cacheEnabled": false,
 		}),
 	);
 	vi.spyOn(ModelRegistry.prototype, "refresh").mockResolvedValue(undefined);
@@ -75,15 +86,6 @@ async function setupLegacyCommit({
 	vi.spyOn(systemPrompt, "loadProjectContextFiles").mockResolvedValue([]);
 	vi.spyOn(modelSelection, "resolvePrimaryModel").mockResolvedValue({ model, apiKey: "test-key" });
 	vi.spyOn(modelSelection, "resolveSmolModel").mockResolvedValue({ model, apiKey: "test-key" });
-	const diffSpy = vi
-		.spyOn(gitModule, "diff")
-		.mockImplementation((async (_cwd, options = {}) =>
-			options.stat ? " src/a.ts | 1 +\n" : DIFF) as typeof gitModule.diff);
-	Object.assign(diffSpy, {
-		changedFiles: vi.fn().mockResolvedValue(["src/a.ts"]),
-		numstat: vi.fn().mockResolvedValue([{ path: "src/a.ts", additions: 1, deletions: 0 }]),
-	});
-	vi.spyOn(gitModule.log, "subjects").mockResolvedValue([]);
 	vi.spyOn(process.stdout, "write").mockImplementation(() => true);
 }
 
@@ -101,7 +103,7 @@ afterEach(async () => {
 });
 
 describe("legacy commit cache retention", () => {
-	it("passes an explicit setting to changelog, analysis, and summary completions", async () => {
+	it("passes an explicit setting through direct analysis and summary completions", async () => {
 		await setupLegacyCommit({ cacheRetention: "none" });
 		const completionSpy = mockCompletions();
 
@@ -109,16 +111,14 @@ describe("legacy commit cache retention", () => {
 
 		expect(result).toEqual({ usedFallback: false });
 
-		expect(completionSpy).toHaveBeenCalledTimes(3);
+		expect(completionSpy).toHaveBeenCalledTimes(2);
 		for (const [, , options] of completionSpy.mock.calls) {
 			expect(options?.cacheRetention).toBe("none");
 		}
 	});
 
 	it("passes an explicit setting through map and reduce completions", async () => {
-		process.env.PI_COMMIT_MAP_REDUCE = "true";
-		Bun.env.PI_COMMIT_MAP_REDUCE = "true";
-		await setupLegacyCommit({ cacheRetention: "long", mapReduceMinFiles: 1 });
+		await setupLegacyCommit({ cacheRetention: "long", mapReduceThreshold: 1 });
 		const completionSpy = mockCompletions();
 
 		const result = await runCommitCommand({ legacy: true, push: false, dryRun: true, noChangelog: true });

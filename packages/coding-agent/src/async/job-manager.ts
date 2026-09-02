@@ -163,6 +163,7 @@ export class AsyncJobManager {
 	readonly #inFlightDeliveries: AsyncJobDelivery[] = [];
 	readonly #suppressedDeliveries = new Set<string>();
 	readonly #watchedJobs = new Map<string, number>();
+	readonly #consumedJobResults = new Set<string>();
 	readonly #evictionTimers = new Map<AsyncJob, NodeJS.Timeout>();
 	readonly #pollEscalation = new Map<string | undefined, PollEscalationState>();
 	readonly #deliverySinks = new Map<string, AsyncJobDeliverySink>();
@@ -235,6 +236,7 @@ export class AsyncJobManager {
 
 		const id = this.#resolveJobId(options?.id);
 		this.#suppressedDeliveries.delete(id);
+		this.#consumedJobResults.delete(id);
 		const abortController = new AbortController();
 		const startTime = Date.now();
 
@@ -480,6 +482,27 @@ export class AsyncJobManager {
 			this.#inFlightDeliveries.some(delivery => delivery.jobId === jobId);
 		if (queued) return;
 		this.#enqueueDelivery(job, job.status === "completed" ? (job.resultText ?? "") : (job.errorText ?? ""));
+	}
+
+	/**
+	 * Mark settled job results as recovered by a foreground snapshot.
+	 *
+	 * Suppresses queued delivery and marks retained bodies as consumed so later
+	 * snapshots report execution state without replaying the same result.
+	 */
+	consumeJobResults(jobIds: string[]): number {
+		const uniqueJobIds = Array.from(new Set(jobIds.map(id => id.trim()).filter(id => id.length > 0)));
+		this.acknowledgeDeliveries(uniqueJobIds);
+		let consumed = 0;
+		for (const jobId of uniqueJobIds) {
+			if (this.#consumeJobResult(jobId)) consumed += 1;
+		}
+		return consumed;
+	}
+
+	/** True once a result was auto-delivered or recovered by a foreground snapshot. */
+	isJobResultConsumed(jobId: string): boolean {
+		return this.#consumedJobResults.has(jobId);
 	}
 
 	/**
@@ -748,9 +771,18 @@ export class AsyncJobManager {
 		this.#inFlightDeliveries.length = 0;
 		this.#suppressedDeliveries.clear();
 		this.#watchedJobs.clear();
+		this.#consumedJobResults.clear();
 		this.#pollEscalation.clear();
 		this.#deliverySinks.clear();
 		return jobsSettled && drained;
+	}
+
+	#consumeJobResult(jobId: string): boolean {
+		const job = this.#jobs.get(jobId);
+		if (!job || job.status === "running" || this.#consumedJobResults.has(jobId)) return false;
+		if (job.resultText === undefined && job.errorText === undefined) return false;
+		this.#consumedJobResults.add(jobId);
+		return true;
 	}
 
 	#resolveJobId(preferredId?: string): string {
@@ -784,6 +816,7 @@ export class AsyncJobManager {
 		this.#evictionTimers.delete(job);
 		this.#suppressedDeliveries.delete(job.id);
 		this.#watchedJobs.delete(job.id);
+		this.#consumedJobResults.delete(job.id);
 		this.#discardedJobs.delete(job);
 		return this.#jobs.delete(job.id);
 	}
@@ -922,7 +955,7 @@ export class AsyncJobManager {
 			}
 
 			this.#deliveries.shift();
-			await this.#deliverDelivery(delivery);
+			void this.#deliverDelivery(delivery);
 		}
 	}
 
@@ -957,6 +990,7 @@ export class AsyncJobManager {
 			this.#inFlightDeliveries.push(delivery);
 			try {
 				await sink(delivery.jobId, delivery.text, delivery.job);
+				this.#consumeJobResult(delivery.jobId);
 			} catch (error) {
 				delivery.attempt += 1;
 				delivery.lastError = error instanceof Error ? error.message : String(error);

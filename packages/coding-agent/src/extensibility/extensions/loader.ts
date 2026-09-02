@@ -52,6 +52,7 @@ import type {
 	ExtensionRuntime as IExtensionRuntime,
 	LoadExtensionsResult,
 	MessageRenderer,
+	PreparedExtension,
 	ProviderConfig,
 	RegisteredCommand,
 	SendMessageDisposition,
@@ -409,17 +410,11 @@ async function runExtensionFactory(
 	}
 }
 
-interface ImportedExtensionModule {
-	factory: ExtensionFactory | null;
-	resolvedPath: string;
-	error: string | null;
-}
-
 async function importExtensionModule(
 	extensionPath: string,
 	cwd: string,
 	approvedModule?: ApprovedLegacyPiModule,
-): Promise<ImportedExtensionModule> {
+): Promise<PreparedExtension> {
 	const resolvedPath = resolvePath(extensionPath, cwd);
 	try {
 		const module = (await withHostGuard(() =>
@@ -429,22 +424,23 @@ async function importExtensionModule(
 
 		if (typeof factory !== "function") {
 			return {
+				path: extensionPath,
 				factory: null,
 				resolvedPath,
 				error: `Extension does not export a valid factory function: ${extensionPath}`,
 			};
 		}
 
-		return { factory, resolvedPath, error: null };
+		return { path: extensionPath, factory, resolvedPath, error: null };
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
-		return { factory: null, resolvedPath, error: `Failed to load extension: ${message}` };
+		return { path: extensionPath, factory: null, resolvedPath, error: `Failed to load extension: ${message}` };
 	}
 }
 
 async function bindExtension(
 	extensionPath: string,
-	imported: ImportedExtensionModule,
+	imported: PreparedExtension,
 	cwd: string,
 	eventBus: EventBus,
 	runtime: IExtensionRuntime,
@@ -496,11 +492,6 @@ export async function loadExtensions(
 	eventBus?: EventBus,
 	releaseManifest?: ContextReleaseManifest,
 ): Promise<LoadExtensionsResult> {
-	const extensions: Extension[] = [];
-	const errors: Array<{ path: string; error: string }> = [];
-	const resolvedEventBus = eventBus ?? new EventBus();
-	const runtime = new ExtensionRuntime();
-
 	const uniquePaths: string[] = [];
 	const seen = new Set<string>();
 	for (const extPath of paths) {
@@ -514,36 +505,44 @@ export async function loadExtensions(
 		uniquePaths.push(extPath);
 	}
 
-	// In protected mode, capture and attest every configured graph before any
-	// extension module evaluation or factory invocation.
 	const approvedModules = releaseManifest
 		? await Promise.all(
 				uniquePaths.map(extPath => approvedCandidateSourceModule(resolvePath(extPath, cwd), releaseManifest)),
 			)
 		: uniquePaths.map(() => undefined);
-	const imported = await Promise.all(
+	const preparedExtensions = await Promise.all(
 		uniquePaths.map((extPath, index) => {
 			const approvedModule = approvedModules[index];
-			return releaseManifest && !approvedModule
-				? Promise.resolve(null)
-				: importExtensionModule(extPath, cwd, approvedModule);
+			if (releaseManifest && !approvedModule) {
+				return Promise.resolve({
+					path: extPath,
+					factory: null,
+					resolvedPath: resolvePath(extPath, cwd),
+					error: `PROMPT_POLICY_REVIEW_REQUIRED: extension source is not approved: ${extPath}`,
+				} satisfies PreparedExtension);
+			}
+			return importExtensionModule(extPath, cwd, approvedModule);
 		}),
 	);
+	return bindPreparedExtensions(preparedExtensions, cwd, eventBus);
+}
 
-	for (let i = 0; i < uniquePaths.length; i++) {
-		const extPath = uniquePaths[i]!;
-		const importedExtension = imported[i]!;
-		if (!importedExtension) {
-			errors.push({
-				path: extPath,
-				error: `PROMPT_POLICY_REVIEW_REQUIRED: extension source is not approved: ${extPath}`,
-			});
-			continue;
-		}
-		const { extension, error } = await bindExtension(extPath, importedExtension, cwd, resolvedEventBus, runtime);
+/** Bind previously imported extension factories to a fresh session runtime. */
+export async function bindPreparedExtensions(
+	preparedExtensions: readonly PreparedExtension[],
+	cwd: string,
+	eventBus?: EventBus,
+): Promise<LoadExtensionsResult> {
+	const extensions: Extension[] = [];
+	const errors: Array<{ path: string; error: string }> = [];
+	const resolvedEventBus = eventBus ?? new EventBus();
+	const runtime = new ExtensionRuntime();
+
+	for (const prepared of preparedExtensions) {
+		const { extension, error } = await bindExtension(prepared.path, prepared, cwd, resolvedEventBus, runtime);
 
 		if (error) {
-			errors.push({ path: extPath, error });
+			errors.push({ path: prepared.path, error });
 			continue;
 		}
 
@@ -556,6 +555,7 @@ export async function loadExtensions(
 		extensions,
 		errors,
 		runtime,
+		preparedExtensions: [...preparedExtensions],
 	};
 }
 
@@ -708,12 +708,9 @@ async function discoverHooksInPackageRoot(root: string): Promise<string[]> {
  * `.omp`/`.pi` extension capabilities, JS/TS hook factories, the
  * installed-plugin tree, and any configured paths.
  *
- * Subagents reuse the parent's collected paths via the SDK's
- * `preloadedExtensionPaths` option, then call {@link loadExtensions} themselves
- * so each session rebuilds Extension instances bound to its OWN
- * `ExtensionAPI` (cwd, eventBus, runtime). Forwarding the parent's
- * `LoadExtensionsResult` directly would reuse handlers/tools/commands that
- * closed over the parent's `cwd` and event bus.
+ * The root session imports these paths once and forwards prepared factories to
+ * subagents. Each child rebinds fresh Extension instances to its OWN
+ * ExtensionAPI (cwd, eventBus, runtime) without re-evaluating the module graph.
  */
 export interface DiscoverExtensionPathOptions {
 	/** Include ambient native extensions, hooks, and installed plugins. */

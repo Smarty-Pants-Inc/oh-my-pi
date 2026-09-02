@@ -44,6 +44,8 @@ const TRIGGERS = [
 	"async_result",
 	"extension_event",
 	"user_selected_skill",
+	"provider_request",
+	"checkpoint_active",
 ] as const;
 
 const SPECIAL_IDS: Readonly<Record<string, string>> = {
@@ -58,6 +60,9 @@ const SPECIAL_IDS: Readonly<Record<string, string>> = {
 	"prompts/goals/goal-objective-updated.md": "goal.objective_updated",
 	"prompts/todos/current.md": "todo.snapshot",
 	"prompts/skills/smarty-mergify-policy.md": "skill.smarty_mergify_policy",
+	"prompts/advisor/mission-context.md": "goal.advisor_mission",
+	"prompts/system/checkpoint-active-notice.md": "system.checkpoint-active-notice",
+	"prompts/system/date-cwd-reminder.md": "system.date-cwd-reminder",
 };
 
 const SPECIAL_ORDERS: Readonly<Record<string, number>> = {
@@ -67,6 +72,9 @@ const SPECIAL_ORDERS: Readonly<Record<string, number>> = {
 	"goal.active": 490,
 	"goal.continuation": 500,
 	"todo.snapshot": 510,
+	"goal.advisor_mission": 995,
+	"system.checkpoint-active-notice": 1310,
+	"system.date-cwd-reminder": 1350,
 	"skill.smarty_mergify_policy": 520,
 };
 
@@ -81,6 +89,8 @@ function promptId(sourcePath: string): string {
 }
 
 function targetFor(sourcePath: string): ContextTarget[] {
+	if (sourcePath === "prompts/system/checkpoint-active-notice.md") return ["main", "subagent"];
+	if (sourcePath === "prompts/system/date-cwd-reminder.md") return ["main", "subagent", "side_model"];
 	if (
 		sourcePath === "_agent/compaction/prompts/branch-summary-context.md" ||
 		sourcePath === "_agent/compaction/prompts/compaction-summary-context.md"
@@ -107,6 +117,15 @@ function targetFor(sourcePath: string): ContextTarget[] {
 }
 
 function roleFor(sourcePath: string): ContextRole {
+	if (
+		sourcePath === "prompts/advisor/mission-context.md" ||
+		sourcePath === "prompts/system/checkpoint-active-notice.md" ||
+		sourcePath === "prompts/system/date-cwd-reminder.md" ||
+		sourcePath === "prompts/system/subagent-system-prompt.md" ||
+		sourcePath === "prompts/system/subagent-user-prompt.md"
+	) {
+		return "internal_context";
+	}
 	if (sourcePath.startsWith("_agent/compaction/")) {
 		return sourcePath.endsWith("summarization-system.md") ? "system" : "internal_context";
 	}
@@ -128,6 +147,9 @@ function roleFor(sourcePath: string): ContextRole {
 }
 
 function triggerFor(sourcePath: string): (typeof TRIGGERS)[number] {
+	if (sourcePath === "prompts/advisor/mission-context.md") return "goal_updated";
+	if (sourcePath === "prompts/system/checkpoint-active-notice.md") return "checkpoint_active";
+	if (sourcePath === "prompts/system/date-cwd-reminder.md") return "provider_request";
 	if (sourcePath.startsWith("_agent/compaction/")) return "compaction";
 	if (sourcePath === "prompts/skills/smarty-mergify-policy.md") return "user_selected_skill";
 	if (sourcePath.includes("goal-continuation")) return "active_goal_idle";
@@ -136,7 +158,13 @@ function triggerFor(sourcePath: string): (typeof TRIGGERS)[number] {
 	if (sourcePath.includes("goal-") || sourcePath.includes("/goals/")) return "active_goal";
 	if (sourcePath.includes("/todos/")) return "todos_present";
 	if (sourcePath.startsWith("prompts/tools/")) return "tool_available";
-	if (sourcePath.includes("subagent-system") || sourcePath.startsWith("prompts/agents/")) return "subagent_start";
+	if (
+		sourcePath === "prompts/system/subagent-system-prompt.md" ||
+		sourcePath === "prompts/system/subagent-user-prompt.md" ||
+		sourcePath.startsWith("prompts/agents/")
+	) {
+		return "subagent_start";
+	}
 	if (sourcePath.includes("task-summary") || sourcePath.includes("subagent-async")) return "subagent_result";
 	if (sourcePath.includes("async-result")) return "async_result";
 	if (sourcePath.includes("compact") || sourcePath.startsWith("compress/")) return "compaction";

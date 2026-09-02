@@ -2,12 +2,7 @@ telemetry = false
 
 [install]
 minimumReleaseAge = 259200 # 3 days in seconds
-minimumReleaseAgeExcludes = [
-  "@types/bun",
-  "bun-types",
-  "kitty-vt-wasm",
-  "@cloudflare/computer", # preview package has no stable release older than the policy window
-]
+minimumReleaseAgeExcludes = ["@types/bun", "bun-types", "kitty-vt-wasm", "@stencil-hq/vibemon"]
 linker = "hoisted"
 exact = true
 saveTextLockfile = true

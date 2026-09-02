@@ -577,6 +577,11 @@ describe("AgentSession auto-compaction queue resume", () => {
 				timestamp: Date.now(),
 			});
 			session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+			const delayedContinuation =
+				mutation === "now" && compaction === "automatic" ? Promise.withResolvers<void>() : undefined;
+			if (delayedContinuation) {
+				vi.spyOn(scheduler, "wait").mockImplementation(async () => delayedContinuation.promise);
+			}
 
 			const gate = Promise.withResolvers<void>();
 			(globalThis as typeof globalThis & { __ompManualCompactGate?: Promise<void> }).__ompManualCompactGate =
@@ -626,7 +631,11 @@ describe("AgentSession auto-compaction queue resume", () => {
 				gate.resolve();
 				await compactPromise;
 				await expect(operation).resolves.toEqual({ status: "updated" });
-				if (mutation === "now") await session.waitForIdle();
+				if (mutation === "now") {
+					delayedContinuation?.resolve();
+					await Promise.resolve();
+					await session.waitForIdle();
+				}
 
 				const prompts = session.getQueuedPrompts();
 				if (mutation === "now") {
@@ -644,6 +653,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 					expect(prompts).toEqual([]);
 				}
 			} finally {
+				delayedContinuation?.resolve();
 				gate.resolve();
 				await compactPromise;
 				session.agent.state.isStreaming = false;
@@ -1058,12 +1068,11 @@ describe("AgentSession auto-compaction queue resume", () => {
 		expect(getRuntimeSignals()).toContain("compaction:start:threshold");
 	});
 
-	it("resolves a pending retry before active-goal compaction continuation returns", async () => {
-		// Codex review on #3175: a retry can succeed with a non-empty text stop
-		// that is already over the active-goal compaction threshold. If the
-		// compaction pre-empt schedules its own continuation before the normal
-		// bottom-of-handler `#resolveRetry()` call runs, the session stays
-		// `isRetrying` and later prompt/idle gates remain blocked.
+	it("settles a successful retry before active-goal compaction continuation starts", async () => {
+		// A retry can succeed with a non-empty text stop that is already over the
+		// active-goal compaction threshold. The successful message itself must
+		// close the retry lifecycle before agent_end routes into compaction, so
+		// early terminal routes cannot leave prompt/idle gates blocked.
 		vi.useRealTimers();
 		const now = Date.now();
 		session.setGoalModeState({
@@ -1148,7 +1157,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 		};
 		session.agent.emitExternalEvent({ type: "message_end", message: recoveredOverThreshold });
 		await withTimeout(retryEnded, 1000, "Retry end timed out");
-		expect(session.isRetrying).toBe(true);
+		expect(session.isRetrying).toBe(false);
 
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [recoveredOverThreshold] });
 

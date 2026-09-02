@@ -14,7 +14,7 @@
  * silently reporting a successful no-op navigation (review on #5895).
  */
 import { describe, expect, it, vi } from "bun:test";
-import { Agent, type AgentToolResult } from "@oh-my-pi/pi-agent-core";
+import { Agent, AgentBusyError, type AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ExtensionRunner, ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
@@ -137,6 +137,21 @@ function newAnswerResult(): AgentToolResult<AskToolDetails> {
 			selectedOptions: ["production"],
 		},
 	};
+}
+
+async function commitAskReanswerOwner(session: AgentSession, sessionManager: SessionManager): Promise<void> {
+	sessionManager.appendMessage(userMsg("please deploy"));
+	const askCallId = "ask-call-owner";
+	sessionManager.appendMessage(toolCallMsg(askCallId, "ask", { questions: ORIGINAL_QUESTIONS }));
+	const staleResultId = sessionManager.appendMessage(
+		toolResultMsg(askCallId, "ask", "User selected: staging", staleAnswerResult().details),
+	);
+	sessionManager.appendMessage(assistantMsg("deploying to staging"));
+	const result = await session.navigateTree(staleResultId, {
+		allowAskReopen: true,
+		reanswerAskResult: newAnswerResult(),
+	});
+	if (!result.askReanswerCommitted) throw new Error("Expected a committed ask re-answer owner");
 }
 
 describe("AgentSession tree navigation onto an ask toolResult", () => {
@@ -570,6 +585,75 @@ describe("AgentSession tree navigation onto an ask toolResult", () => {
 			await session.waitForIdle();
 			expect(continueSpy).toHaveBeenCalledTimes(1);
 		} finally {
+			await ctx.cleanup();
+		}
+	});
+
+	it("coalesces concurrent continuation sources instead of calling a busy agent", async () => {
+		const ctx = await createTestSession({ inMemory: true });
+		const { session, sessionManager } = ctx;
+		await commitAskReanswerOwner(session, sessionManager);
+		const releaseContinue = Promise.withResolvers<void>();
+		const continueStarted = Promise.withResolvers<void>();
+		let continueInFlight = false;
+		const continueSpy = vi.spyOn(session.agent, "continue").mockImplementation(async () => {
+			if (continueInFlight) throw new AgentBusyError();
+			continueInFlight = true;
+			session.agent.emitExternalEvent({ type: "agent_start" });
+			continueStarted.resolve();
+			await releaseContinue.promise;
+			continueInFlight = false;
+		});
+		try {
+			session.resumeAfterAskReanswer();
+			session.resumeAfterAskReanswer();
+			await continueStarted.promise;
+			releaseContinue.resolve();
+			await session.waitForIdle();
+
+			expect(continueSpy).toHaveBeenCalledTimes(1);
+		} finally {
+			releaseContinue.resolve();
+			continueSpy.mockRestore();
+			await ctx.cleanup();
+		}
+	});
+
+	it("starts a fresh continue for work queued while a scheduled continuation settles", async () => {
+		// A continuation scheduled during the previous attempt's settle drain
+		// (#endInFlight -> #drainStrandedQueuedMessages -> queued-message-drain)
+		// must run its own continuation dispatch, not coalesce onto the finished
+		// attempt and strand the queued message until the next prompt.
+		const ctx = await createTestSession({ inMemory: true });
+		const { session, sessionManager } = ctx;
+		await commitAskReanswerOwner(session, sessionManager);
+		let calls = 0;
+		const continueSpy = vi.spyOn(session.agent, "continue").mockImplementation(async () => {
+			calls++;
+			session.agent.emitExternalEvent({ type: "agent_start" });
+			// The turn ended with a steer stranded past its final queue poll.
+			session.agent.steer({
+				role: "user",
+				content: "stranded",
+				steering: true,
+				attribution: "user",
+				timestamp: Date.now(),
+			});
+		});
+		const queuedContinueSpy = vi.spyOn(session.agent, "continueQueuedMessageBlock").mockImplementation(async () => {
+			calls++;
+			session.agent.emitExternalEvent({ type: "agent_start" });
+			session.agent.replaceQueues([], []);
+		});
+		try {
+			session.resumeAfterAskReanswer();
+			await session.waitForIdle();
+
+			expect(calls).toBe(2);
+			expect(session.agent.hasQueuedMessages()).toBe(false);
+		} finally {
+			continueSpy.mockRestore();
+			queuedContinueSpy.mockRestore();
 			await ctx.cleanup();
 		}
 	});
