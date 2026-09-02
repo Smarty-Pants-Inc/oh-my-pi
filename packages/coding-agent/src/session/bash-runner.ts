@@ -687,8 +687,7 @@ export class BashRunner {
 	}
 
 	#trackTargetSettlement<T>(target: BashSessionTarget, settlement: Promise<T>): Promise<T> {
-		let tracked: Promise<T>;
-		tracked = settlement.finally(() => {
+		const tracked = settlement.finally(() => {
 			target.pendingSettlements.delete(tracked);
 		});
 		target.pendingSettlements.add(tracked);
@@ -700,8 +699,7 @@ export class BashRunner {
 		lifetime: BashCommandLifetime,
 		settlement: Promise<T>,
 	): Promise<T> {
-		let tracked: Promise<T>;
-		tracked = settlement.finally(() => {
+		const tracked = settlement.finally(() => {
 			target.commandSettlements.delete(tracked);
 			target.commandLifetimes.delete(lifetime);
 		});

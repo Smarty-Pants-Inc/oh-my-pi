@@ -339,6 +339,7 @@ describe("InputController keybinding setup", () => {
 		setExtensionRunner({
 			getShortcuts: () => shortcuts,
 			createCommandContext: () => ({}),
+			runScoped: <T>(fn: () => T) => fn(),
 			emitError: vi.fn(),
 		});
 		const controller = new InputController(ctx);

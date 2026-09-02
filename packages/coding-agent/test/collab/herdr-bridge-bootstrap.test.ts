@@ -72,7 +72,10 @@ it("leaves Windows startup unchanged while managed delivery is deferred", () => 
 		HERDR_PANE_ID: "pane-1",
 	};
 
-	expect(captureHerdrBridgeBootstrap(env, "win32")).toEqual({ guestBridgeToken: "guest-token" });
+	expect(captureHerdrBridgeBootstrap(env, "win32")).toEqual({
+		hostBridgeToken: "current-token",
+		guestBridgeToken: "guest-token",
+	});
 	expect(env.HERDR_OMP_BRIDGE_TOKEN).toBeUndefined();
 	expect(env.HERDR_OMP_GUEST_BRIDGE_TOKEN).toBeUndefined();
 });

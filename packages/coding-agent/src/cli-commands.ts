@@ -17,9 +17,21 @@ import {
 	STRING_VALUE_FLAGS,
 	VALUELESS_FLAGS,
 } from "./cli/flag-tables";
+import { BuildIdCommand } from "./commands/build-id";
 import { launchHelp } from "./commands/launch-help";
 
 export const commands: CommandEntry[] = [
+	{ name: "__build-id", load: () => Promise.resolve(BuildIdCommand), help: { hidden: true } },
+	{
+		name: "__collab-rpc-guest",
+		load: () => import("./commands/collab-rpc-guest").then(m => m.CollabRpcGuestCommand),
+		help: { hidden: true },
+	},
+	{
+		name: "__collab-rpc-host",
+		load: () => import("./commands/collab-rpc-host").then(m => m.CollabRpcHostCommand),
+		help: { hidden: true },
+	},
 	{ name: "launch", load: () => import("./commands/launch").then(m => m.default), help: launchHelp },
 	{
 		name: "acp",

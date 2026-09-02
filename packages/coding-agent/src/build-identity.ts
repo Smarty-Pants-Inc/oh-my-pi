@@ -17,4 +17,5 @@ function takeManagedSourceBuildId(): string {
 delete process.env.OMP_MANAGED_BUILD_ID;
 
 /** Immutable identity embedded in standalone binaries or supplied by the managed immutable source launcher. */
-export const OMP_BUILD_ID = embeddedBuildId ?? takeManagedSourceBuildId();
+export const OMP_BUILD_ID =
+	embeddedBuildId ?? (takeManagedSourceBuildId() || `source-${Bun.hash(import.meta.dir).toString(16)}`);

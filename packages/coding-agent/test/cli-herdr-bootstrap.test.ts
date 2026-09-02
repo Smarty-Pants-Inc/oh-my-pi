@@ -72,7 +72,7 @@ async function withDiscoveryProbe(
 describe("Herdr bridge CLI bootstrap", () => {
 	it.each(bridgeTokenEnvNames)("scrubs %s before lazy command modules and descendants run", async tokenEnvName => {
 		await Promise.all(
-			["plugin", "update", "auth-broker", "join"].map(async command => {
+			["plugin", "update", "auth-broker", "join", "__collab-rpc-guest", "__collab-rpc-host"].map(async command => {
 				expect(await runProbe(command, tokenEnvName)).toContain("HERDR_CHILD_TOKENS=<absent>|<absent>;EXIT=0");
 			}),
 		);

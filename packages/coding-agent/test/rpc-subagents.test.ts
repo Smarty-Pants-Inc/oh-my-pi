@@ -387,7 +387,16 @@ const progress = {
 	cost: 0,
 	durationMs: 0
 };
-write({ type: "ready" });
+write({
+	type: "ready",
+	protocolVersion: 1,
+	supportedProtocolVersions: [1, 2],
+	maxFrameBytes: 1,
+	maxReassembledFrameBytes: 1,
+	buildId: "test-rpc-subagents",
+	version: "test",
+	capabilities: []
+});
 process.stdin.on("data", chunk => {
 	buffer += chunk.toString("utf8");
 	let index = buffer.indexOf("\\n");

@@ -90,7 +90,6 @@ interface FakeAcpBuiltinSessionManager {
 function createRuntime(settingsOverrides: Parameters<typeof Settings.isolated>[0] = {}) {
 	const settings = Settings.isolated(settingsOverrides);
 	const output: string[] = [];
-	let fakeSessionManager: FakeAcpBuiltinSessionManager | undefined;
 	const session: FakeAcpBuiltinSession = {
 		fastMode: false,
 		forcedToolChoice: undefined as string | undefined,
@@ -174,7 +173,7 @@ function createRuntime(settingsOverrides: Parameters<typeof Settings.isolated>[0
 		async setModel(_model: unknown) {},
 	};
 	const typedSession = session as unknown as AgentSession & FakeAcpBuiltinSession;
-	fakeSessionManager = {
+	const fakeSessionManager = {
 		_sessionFile: undefined as string | undefined,
 		_cwd: "/tmp/project",
 		_entries: [] as { type: string }[],

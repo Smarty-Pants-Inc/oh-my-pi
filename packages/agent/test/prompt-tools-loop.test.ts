@@ -146,7 +146,6 @@ describe("agentLoop with owned in-band tool calls", () => {
 		let resolveRuns = 0;
 		let resolvePending = true;
 		const schema = type({ op: "string" });
-		let config: AgentLoopConfig;
 		const todoTool: AgentTool<typeof schema, { op: string }> = {
 			name: "todo",
 			label: "Todo",
@@ -181,7 +180,7 @@ describe("agentLoop with owned in-band tool calls", () => {
 			],
 		});
 		const reminder = createUserMessage("<system-reminder>Resolve the pending preview.</system-reminder>");
-		config = {
+		const config: AgentLoopConfig = {
 			model: mock.model,
 			convertToLlm: identityConverter,
 			dialect: "glm",

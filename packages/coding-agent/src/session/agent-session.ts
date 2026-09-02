@@ -147,6 +147,7 @@ import type {
 	MessageEndEvent,
 	MessageStartEvent,
 	MessageUpdateEvent,
+	PreparedExtension,
 	SessionBeforeBranchResult,
 	SessionBeforeSwitchResult,
 	SessionBeforeTreeResult,
@@ -197,9 +198,7 @@ import autoContinuePrompt from "../prompts/system/auto-continue.md" with { type:
 import interruptedThinkingTemplate from "../prompts/system/interrupted-thinking.md" with { type: "text" };
 import planModeActivePrompt from "../prompts/system/plan-mode-active.md" with { type: "text" };
 import planModeReferencePrompt from "../prompts/system/plan-mode-reference.md" with { type: "text" };
-import planModeToolDecisionReminderPrompt from "../prompts/system/plan-mode-tool-decision-reminder.md" with {
-	type: "text",
-};
+import planModeToolDecisionReminderPrompt from "../prompts/system/plan-mode-tool-decision-reminder.md" with { type: "text" };
 import rewindReportTemplate from "../prompts/system/rewind-report.md" with { type: "text" };
 import sideChannelNoToolsReminder from "../prompts/system/side-channel-no-tools.md" with { type: "text" };
 import vibeModeActivePrompt from "../prompts/system/vibe-mode-active.md" with { type: "text" };
@@ -369,7 +368,12 @@ import {
 	toRestoredQueuedMessage,
 } from "./queued-messages";
 import type { ServingModel } from "./retry-fallback-chains";
-import { type AdvisorStats, SessionAdvisors, type SessionAdvisorsHost } from "./session-advisors";
+import {
+	type AdvisorStats,
+	type AdvisorStatusOverviewEntry,
+	SessionAdvisors,
+	type SessionAdvisorsHost,
+} from "./session-advisors";
 import { type BuildSessionContextOptions, getRestorableSessionModels, type SessionContext } from "./session-context";
 import { formatSessionDumpText } from "./session-dump-format";
 import {
@@ -415,7 +419,7 @@ import { YieldQueue, type YieldQueueTransaction } from "./yield-queue";
 
 export * from "./agent-session-events";
 export * from "./agent-session-types";
-export type { AdvisorStats, PerAdvisorStat } from "./session-advisors";
+export type { AdvisorStats, AdvisorStatusOverviewEntry, PerAdvisorStat } from "./session-advisors";
 
 import { LoopGuards, type StreamGuardsHost, StreamingEditGuard } from "./stream-guards";
 import { TodoTracker, type TodoTrackerHost } from "./todo-tracker";
@@ -643,6 +647,26 @@ export class AgentSession {
 		return this.#extensionRoots();
 	}
 
+	/** Parent-imported extension factories, forwarded to session forks (`/tan`) to rebind runtime providers. */
+	readonly #preparedExtensions: readonly PreparedExtension[] | undefined;
+
+	/**
+	 * Session-independent imported extension factories safe to rebind in child
+	 * sessions. A `/tan` fork forwards these as `preloadedPreparedExtensions`
+	 * so the child re-registers the parent's runtime providers.
+	 */
+	get preparedExtensions(): readonly PreparedExtension[] | undefined {
+		return this.#preparedExtensions;
+	}
+
+	/** Source paths of the parent's loaded extensions; forwarded to `/tan` forks as the prepared-extension fallback. */
+	readonly #extensionPaths: readonly string[] | undefined;
+
+	/** Source paths of loaded extensions, forwarded to child sessions when prepared factories are unavailable. */
+	get extensionPaths(): readonly string[] | undefined {
+		return this.#extensionPaths;
+	}
+
 	#powerAssertion: MacOSPowerAssertion | undefined;
 
 	readonly configWarnings: string[] = [];
@@ -667,6 +691,7 @@ export class AgentSession {
 	/** Last (enable, providerId) tuple resolved by `#syncAppendOnlyContext` — used to skip no-op invalidations. */
 	#lastAppendOnlyResolution?: { enable: boolean; providerId: string | undefined };
 	#eventListeners: AgentSessionEventListener[] = [];
+	#activeToolExecutionUpdates = new Map<string, Extract<AgentSessionEvent, { type: "tool_execution_update" }>>();
 	#runStateListeners = new Set<(state: "running" | "idle") => void>();
 	#commandMetadataChangedListeners: CommandMetadataChangedListener[] = [];
 	#sessionChangeCallbacks = new Set<SessionChangeRegistration>();
@@ -787,7 +812,7 @@ export class AgentSession {
 	#autolearnCaptureAbortController: AbortController | undefined;
 	#autolearnCaptureTask: Promise<void> | undefined;
 	#isDisposed = false;
-	#fallbackDiscoveryRevalidationAbortController = new AbortController();
+	#modelDiscoveryAbortController = new AbortController();
 	/** Process-wide by default (double-spend safety across sessions); injectable for tests. */
 	#codexResetCoordinator: CodexAutoRedeemCoordinator;
 	// Extension system
@@ -1242,6 +1267,8 @@ export class AgentSession {
 				configured: this.settings.get("extensions") ?? [],
 				configuredLevel: this.settings.extensionsSourceLevel(),
 			}));
+		this.#preparedExtensions = config.preparedExtensions;
+		this.#extensionPaths = config.extensionPaths;
 		this.#codexResetCoordinator = config.codexResetCoordinator ?? defaultCodexAutoRedeemCoordinator;
 		const bashHost: BashRunnerHost = {
 			agent: this.agent,
@@ -1329,6 +1356,7 @@ export class AgentSession {
 			getEnabledToolNames: () => this.getEnabledToolNames(),
 			toolRegistry: () => this.#tools.registry,
 			planModeEnabled: () => this.#planModeState?.enabled === true,
+			prewalkWillHandoff: () => this.#prewalk.willHandoff,
 			consumeLastServedToolChoiceLabel: () => this.#toolChoiceQueue.consumeLastServedLabel(),
 		};
 		this.#todo = new TodoTracker(todoHost);
@@ -1885,6 +1913,7 @@ export class AgentSession {
 			watchdogPrompt: config.advisorWatchdogPrompt,
 			sharedInstructions: config.advisorSharedInstructions,
 			contextPrompt: config.advisorContextPrompt,
+			memoryPrompt: config.advisorMemoryPrompt,
 			configs: config.advisorConfigs,
 			streamFn: config.advisorStreamFn,
 			transformProviderContext: config.transformProviderContext,
@@ -2039,10 +2068,12 @@ export class AgentSession {
 		// fire-and-forget (before the session in the SDK path, right after it in
 		// the CLI path), so discovery-backed providers (e.g. GitHub Copilot, or a
 		// models.yml LiteLLM provider with a cold cache) may not be populated yet.
-		// Reactivate a `no_model` advisor (#9010) and retract stale
-		// retry.fallbackChains warnings (#10048) once discovery settles.
+		// Reactivate a `no_model` advisor (#9010), retract stale
+		// retry.fallbackChains warnings (#10048), and rebind the active model to
+		// its refreshed same-selector entry (#10488) once discovery settles.
 		void this.#retryInactiveAdvisorAfterModelDiscovery();
 		void this.#revalidateFallbackChainsAfterModelDiscovery();
+		if (config.rebindModelAfterDiscovery) void this.#rebindActiveModelAfterModelDiscovery();
 	}
 	/** Model registry for API key resolution and model discovery */
 	get modelRegistry(): ModelRegistry {
@@ -2114,12 +2145,8 @@ export class AgentSession {
 		return format !== "native" && (format !== "auto" || this.model?.supportsTools === false);
 	}
 
-	/**
-	 * Force the next model call to target a specific active tool, then terminate
-	 * the agent loop. Pushes a two-step sequence [forced, "none"] so the model
-	 * calls exactly the forced tool once and then cannot call another.
-	 */
-	setForcedToolChoice(toolName: string): void {
+	/** Resolve one exact active tool name to the current provider's native choice shape. */
+	resolveNamedToolChoice(toolName: string): ToolChoice {
 		if (!this.getActiveToolNames().includes(toolName)) {
 			throw new Error(`Tool "${toolName}" is not currently active.`);
 		}
@@ -2128,7 +2155,16 @@ export class AgentSession {
 		if (!forced || typeof forced === "string") {
 			throw new Error("Current model does not support forcing a specific tool.");
 		}
+		return forced;
+	}
 
+	/**
+	 * Force the next model call to target a specific active tool, then terminate
+	 * the agent loop. Pushes a two-step sequence [forced, "none"] so the model
+	 * calls exactly the forced tool once and then cannot call another.
+	 */
+	setForcedToolChoice(toolName: string): void {
+		const forced = this.resolveNamedToolChoice(toolName);
 		this.#toolChoiceQueue.pushSequence([forced, "none"], {
 			label: "user-force",
 			onRejected: info => (info.reason === "unavailable" ? "drop_sequence" : "requeue"),
@@ -2717,8 +2753,7 @@ export class AgentSession {
 	}
 
 	#forwardLaunchCompletionReceipt(delivery: DeferredLaunchCompletionDelivery): void {
-		let forwarding: Promise<void>;
-		forwarding = this.#enqueueLaunchCompletion(delivery.notification)
+		const forwarding = this.#enqueueLaunchCompletion(delivery.notification)
 			.then(delivery.resolve, delivery.reject)
 			.finally(() => this.#activeLaunchCompletionReceiptForwards.delete(forwarding));
 		this.#activeLaunchCompletionReceiptForwards.add(forwarding);
@@ -2895,8 +2930,7 @@ export class AgentSession {
 
 		const deferred = { manager, jobId, text, job };
 		const delivery = this.#deliverAsyncJobResultNow(manager, jobId, text, job);
-		let tracked: Promise<void>;
-		tracked = delivery.finally(() => this.#activeAsyncJobDeliveries.delete(tracked));
+		const tracked = delivery.finally(() => this.#activeAsyncJobDeliveries.delete(tracked));
 		this.#activeAsyncJobDeliveries.set(tracked, deferred);
 		return tracked;
 	}
@@ -3117,6 +3151,14 @@ export class AgentSession {
 		event: AgentSessionEvent,
 		options: { detachExtensions?: boolean; closeTurnId?: string } = {},
 	): Promise<void> {
+		if (event.type === "tool_execution_update") {
+			// Returned background calls have no later tool result to persist their
+			// terminal frame. Keep the latest update for future focus rebuilds;
+			// logical session transitions clear the cache.
+			this.#activeToolExecutionUpdates.set(event.toolCallId, event);
+		} else if (event.type === "tool_execution_end") {
+			this.#activeToolExecutionUpdates.delete(event.toolCallId);
+		}
 		if (event.type === "message_update") {
 			this.#emit(event);
 			void this.#queueExtensionEvent(event);
@@ -3202,7 +3244,7 @@ export class AgentSession {
 	 * provider-backed compaction and must not block switching sessions.
 	 */
 	async settleInFlightMessagePersistence(): Promise<void> {
-		await Promise.allSettled([...this.#pendingMessageEndPersistence.values()]);
+		await Promise.allSettled(this.#pendingMessageEndPersistence.values());
 	}
 
 	/**
@@ -3213,7 +3255,7 @@ export class AgentSession {
 	 */
 	async #drainInFlightEventHandlers(): Promise<void> {
 		while (this.#inFlightEventHandlers.size > 0) {
-			await Promise.allSettled([...this.#inFlightEventHandlers]);
+			await Promise.allSettled(this.#inFlightEventHandlers);
 		}
 	}
 
@@ -5299,6 +5341,15 @@ export class AgentSession {
 	}
 
 	/**
+	 * Snapshot the latest unpersisted display result for each active tool or
+	 * returned background call. Focus rebuilds replay these after reconstructing
+	 * persisted transcript state.
+	 */
+	activeToolExecutionUpdates(): readonly Extract<AgentSessionEvent, { type: "tool_execution_update" }>[] {
+		return [...this.#activeToolExecutionUpdates.values()];
+	}
+
+	/**
 	 * Observe authoritative run-state transitions before public `agent_end`
 	 * deferral, for lifecycle owners that must not remain stale while prompts unwind.
 	 */
@@ -5500,7 +5551,7 @@ export class AgentSession {
 		this.#unsubscribeAgentQueueChanges?.();
 		this.#unsubscribeAgentQueueChanges = undefined;
 		this.#queuedPromptListeners.clear();
-		this.#fallbackDiscoveryRevalidationAbortController.abort();
+		this.#modelDiscoveryAbortController.abort();
 		this.#queuedMessageDrainBlocked = false;
 		this.#usagePreflightReadyForNextModelCall = false;
 		this.#detachUsageBeforeQueueDequeue?.();
@@ -6263,17 +6314,9 @@ export class AgentSession {
 		return this.#tools.resolveActiveEditMode();
 	}
 
-	#syncAfterModelChange(previousEditMode: EditMode): Promise<void> {
-		return this.#tools.syncAfterModelChange(previousEditMode);
-	}
-
 	/** Enabled MCP tools in their current presentation partition. */
 	getSelectedMCPToolNames(): string[] {
 		return this.#tools.getSelectedMCPToolNames();
-	}
-
-	#applyActiveToolsByName(toolNames: string[]): Promise<void> {
-		return this.#tools.applyActiveToolsByName(toolNames);
 	}
 
 	/** Rediscovers reloadable skills and refreshes prompt metadata. */
@@ -6529,6 +6572,18 @@ export class AgentSession {
 	#replaceMessagesFromSessionContext(context: SessionContext, messages = context.messages): void {
 		this.#rehydrateGoalModeState(context.mode, context.modeData);
 		this.agent.replaceMessages(messages);
+	}
+
+	/** Reload a trusted replicated transcript without lifecycle hooks, cancellation, or provider mutation. */
+	async reloadReplicatedSession(sessionPath: string): Promise<void> {
+		await this.sessionManager.setSessionFile(sessionPath, { suppressBreadcrumb: true });
+		this.refreshReplicatedSessionContext();
+	}
+
+	/** Rebuild visible conversation semantics after ingesting a replicated transcript entry. */
+	refreshReplicatedSessionContext(): void {
+		const context = this.buildDisplaySessionContext();
+		this.#replaceMessagesFromSessionContext(context);
 	}
 
 	/**
@@ -6817,6 +6872,10 @@ export class AgentSession {
 		this.#toolChoiceQueue.clear();
 		this.#tools.clearAcpPermissionDecisions();
 		this.#tools.resetAnnouncedMounts();
+		// A `/new`, session switch, or tree navigation reuses tool-call ids, so a
+		// still-cached background-task snapshot from the old conversation must not
+		// survive to be replayed by a focus rebuild in the reset session (#10447).
+		this.#activeToolExecutionUpdates.clear();
 	}
 
 	/**
@@ -7303,6 +7362,29 @@ export class AgentSession {
 			? await this.#buildImageDescriptionNotice(normalizedImages)
 			: undefined;
 
+		// A concurrent prompt() can start a turn during the awaits above: image
+		// normalization and the vision-description call suspend after the
+		// isStreaming check at the top, so two callers — the CLI initial message
+		// and a freshly typed submission — can both observe an idle session.
+		// Re-check before dispatch so the loser queues exactly like the early
+		// branch instead of racing #promptWithMessage into AgentBusyError. No
+		// await sits between this check and #beginInFlight, so the winner's
+		// in-flight increment is visible to every later re-check.
+		if (this.isStreaming) {
+			const streamingBehavior = options?.streamingBehavior;
+			if (!streamingBehavior) throw new AgentBusyError();
+			await this.#queueUserMessage(
+				expandedText,
+				options?.images,
+				streamingBehavior,
+				submittedAt,
+				lifecycleGeneration,
+				keywordNotices,
+				{ images: normalizedImages, descriptionNotice: imageDescriptionNotice },
+			);
+			return true;
+		}
+
 		if (externalThinkingToolChoice) {
 			this.#toolChoiceQueue.pushOnce(externalThinkingToolChoice, {
 				label: "external-thinking",
@@ -7577,10 +7659,10 @@ export class AgentSession {
 				return false;
 			}
 
-			// A pending xd:// delta accompanies the next user-authored prompt,
-			// never an agent-initiated continuation. Reserve its pre-user position,
-			// but consume it only after before_agent_start determines whether the
-			// final provider prompt still carries the base xd:// catalog.
+			// Pending tool-roster and xd:// deltas accompany the next user-authored
+			// prompt, never an agent-initiated continuation. Reserve their pre-user
+			// position, but consume xd:// only after before_agent_start determines
+			// whether the final provider prompt still carries the base catalog.
 			const xdevMountNoticeIndex = messages.length;
 			messages.push(message);
 			const explicitPromptMessages = options?.consumeExplicitPromptMessages
@@ -7696,8 +7778,14 @@ export class AgentSession {
 			const xdevMountNotice = isUserQueuedMessage(message)
 				? this.#tools.takePendingXdevMountNotice(baseXdevCatalogDelivered)
 				: undefined;
-			if (xdevMountNotice) {
-				messages.splice(xdevMountNoticeIndex, 0, xdevMountNotice);
+			const toolRosterNotice = isUserQueuedMessage(message) ? this.#tools.takePendingToolRosterNotice() : undefined;
+			if (xdevMountNotice || toolRosterNotice) {
+				messages.splice(
+					xdevMountNoticeIndex,
+					0,
+					...(xdevMountNotice ? [xdevMountNotice] : []),
+					...(toolRosterNotice ? [toolRosterNotice] : []),
+				);
 			}
 
 			await this.#maintenance.runPrePromptCompactionIfNeeded(messages, automaticTurn?.semanticDeliveryAcceptance);
@@ -7835,7 +7923,7 @@ export class AgentSession {
 		const ctx = this.#extensionRunner.createCommandContext();
 
 		try {
-			await command.handler(args, ctx);
+			await this.#extensionRunner.runScoped(() => command.handler(args, ctx));
 			return true;
 		} catch (err) {
 			// Emit error via extension runner
@@ -8092,6 +8180,7 @@ export class AgentSession {
 		timestamp?: number,
 		lifecycleGeneration?: number,
 		prependMessages: readonly CustomMessage[] = [],
+		preprocessed?: { images: ImageContent[] | undefined; descriptionNotice: CustomMessage | undefined },
 	): Promise<void> {
 		const acceptedLifecycleGeneration = lifecycleGeneration ?? this.#lifecycleTransitionGeneration;
 		this.#assertQueuedUserMessageCanStart(acceptedLifecycleGeneration);
@@ -8108,16 +8197,21 @@ export class AgentSession {
 		// while streaming) is a deliberate resume; re-enable advisor auto-resume that
 		// a user interrupt suppressed.
 		this.#advisors.autoResumeSuppressed = false;
-		const normalizedImages = await this.#normalizeImagesForModel(images);
+		// The pre-dispatch re-check in prompt() arrives with normalization and the
+		// vision description already done — reuse them instead of paying a second
+		// vision-model request for the same attachment.
+		const normalizedImages = preprocessed ? preprocessed.images : await this.#normalizeImagesForModel(images);
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (normalizedImages?.length) {
 			content.push(...normalizedImages);
 		}
 		// Text-only model + image attachment: describe via a vision model and enqueue the
 		// description as a hidden companion immediately before the user message.
-		const imageDescriptionNotice = normalizedImages?.length
-			? await this.#buildImageDescriptionNotice(normalizedImages)
-			: undefined;
+		const imageDescriptionNotice = preprocessed
+			? preprocessed.descriptionNotice
+			: normalizedImages?.length
+				? await this.#buildImageDescriptionNotice(normalizedImages)
+				: undefined;
 		this.onBeforePromptAcceptance?.();
 		this.#assertQueuedUserMessageCanStart(acceptedLifecycleGeneration);
 		this.#allowQueuedMessageDrainRetry();
@@ -8805,6 +8899,9 @@ export class AgentSession {
 		if (options?.deliveryMode && this.#isDisposed) return { status: "unavailable", reason: "session_transition" };
 		const lifecycleGeneration = this.#lifecycleTransitionGeneration;
 		const semanticMode = options?.deliveryMode;
+		if (options?.when === "idle" && (this.isStreaming || this.isCompacting || this.#lifecycleTransitionFenceActive)) {
+			return { status: "unavailable", reason: "session_busy" };
+		}
 		if (options?.automaticTurnSource !== undefined && options.automaticTurnSource !== "peer_message_wake") {
 			throw new Error('automaticTurnSource must be "peer_message_wake"');
 		}
@@ -8841,6 +8938,9 @@ export class AgentSession {
 		};
 		this.#advisors.retainPrimaryInput([appMessage]);
 		const normalizedAppMessage = await this.#normalizeAgentMessageImages(appMessage);
+		if (options?.when === "idle" && (this.isStreaming || this.isCompacting || this.#lifecycleTransitionFenceActive)) {
+			return { status: "unavailable", reason: "session_busy" };
+		}
 		if (semanticMode) {
 			const acceptance = this.#beginSemanticDeliveryAcceptance();
 			try {
@@ -10051,8 +10151,7 @@ export class AgentSession {
 		this.#pendingAbortErrorId = userInterrupt ? AIError.create(AIError.Flag.UserInterrupt) : undefined;
 		if (userInterrupt) this.#advisors.autoResumeSuppressed = true;
 
-		let operation: Promise<void>;
-		operation = this.#performAbort(intent).finally(() => {
+		const operation = this.#performAbort(intent).finally(() => {
 			if (this.#abortIntent === intent) this.#abortIntent = undefined;
 			if (this.#abortPromise === operation) this.#abortPromise = undefined;
 			this.#drainStrandedQueuedMessages();
@@ -10195,6 +10294,7 @@ export class AgentSession {
 			this.agent.reset();
 			this.agent.replaceMessages(targetContext.messages);
 			this.#clearCheckpointRuntimeState();
+			this.#clearSessionScopedToolState();
 			this.#todo.syncFromBranch();
 			this.#todo.resetCycle();
 			this.#pendingNextTurnMessages = [];
@@ -10257,13 +10357,20 @@ export class AgentSession {
 	}
 
 	/**
-	 * Fork the current session, creating a new session file with the exact same state.
-	 * Copies all entries and artifacts to the new session.
-	 * Unlike newSession(), this preserves all messages in the agent state.
+	 * Fork the current session into a new persisted session.
+	 * Without `entryId`, preserves the full tree and current messages. With `entryId`,
+	 * materializes only the canonical root-to-entry path. Artifacts are copied in both cases.
 	 * @returns true if completed, false if cancelled by hook or not persisting
 	 */
-	async fork(): Promise<boolean> {
+	async fork(
+		deferSessionChange?: (publish: () => void | Promise<void>) => void,
+		options?: { entryId?: string },
+	): Promise<boolean> {
 		this.#assertVibeSessionTransitionAllowed("fork the session");
+		const entryId = options?.entryId;
+		if (entryId !== undefined && !this.sessionManager.getEntry(entryId)) {
+			throw new Error(`Entry ${entryId} not found`);
+		}
 		const previousSessionFile = this.sessionFile;
 		const previousSessionId = this.sessionManager.getSessionId();
 
@@ -10315,9 +10422,12 @@ export class AgentSession {
 
 			if (!previousSessionFile) throw forkCancelled;
 			if (!artifactCloneTransaction) throw new Error("Persisted fork did not acquire an artifact clone transaction");
-			const forkResult = await this.sessionManager.fork(newSessionFile =>
-				artifactCloneTransaction.publish(newSessionFile),
-			);
+			const forkResult =
+				entryId === undefined
+					? await this.sessionManager.fork(newSessionFile => artifactCloneTransaction.publish(newSessionFile))
+					: await this.sessionManager.createBranchedSession(entryId, newSessionFile =>
+							artifactCloneTransaction.publish(newSessionFile),
+						);
 			if (!forkResult) throw forkCancelled;
 			lifecycle.markTarget();
 
@@ -10325,16 +10435,43 @@ export class AgentSession {
 			this.#adoptInheritedProviderPromptCacheKey();
 			this.#syncAgentSessionId(undefined, false, false);
 			this.#recovery.reanchorServedAttribution(previousSessionId);
+			if (entryId !== undefined) {
+				this.agent.clearSteeringQueue();
+				this.agent.clearFollowUpQueue();
+				this.#pendingNextTurnMessages = [];
+				this.#pendingExplicitPromptMessages = [];
+				this.#pendingSemanticDeliveryIds.clear();
+				this.#queuedMessageDrainBlocked = false;
+				this.#usagePreflightReadyForNextModelCall = false;
+				this.#usagePreflightReadyModel = undefined;
+				this.#rehydrateCheckpointRewindState();
+				this.#todo.syncFromBranch();
+			}
 			this.#memory.rekeyForCurrentSessionId();
 			await this.#memory.resetContextForNewTranscript();
+			if (entryId !== undefined) {
+				this.#replaceMessagesFromSessionContext(this.buildDisplaySessionContext());
+				this.#rehydratePendingSemanticDeliveries();
+			}
 
 			await this.sessionManager.ensureOnDisk();
 			const commitOptions: SessionLifecycleCommitOptions = {
 				preserveToolState: true,
 				preserveAdvisorState: true,
 				preserveAdvisorCost: true,
+				finalizeProviderSessions:
+					entryId === undefined ? undefined : () => this.#closeCodexProviderSessionsForHistoryRewrite(),
 			};
-			if (this.#extensionRunner) {
+			if (deferSessionChange) {
+				const activate = await lifecycle.prepareCommit(commitOptions);
+				deferSessionChange(async () => {
+					if (this.#extensionRunner) {
+						await this.#extensionRunner.emitWithHostCompletion({ type: "session_ready" }, () => activate);
+					} else {
+						await activate();
+					}
+				});
+			} else if (this.#extensionRunner) {
 				await this.#extensionRunner.emitWithHostCompletion({ type: "session_ready" }, () =>
 					lifecycle.prepareCommit(commitOptions),
 				);
@@ -10743,7 +10880,6 @@ export class AgentSession {
 	): Promise<void> {
 		const currentModel = this.model;
 		const isChanging = !currentModel || !modelsAreEqual(currentModel, model);
-		const codeModeChanged = this.#tools.codeModeChangesBetween(currentModel, model);
 		if (currentModel) {
 			if (options.closeProviderSessions !== false) this.#closeProviderSessionsForModelSwitch(currentModel, model);
 			if (isChanging) {
@@ -10768,10 +10904,14 @@ export class AgentSession {
 			this.#emit({ type: "model_changed" });
 		}
 
+		await this.#reconcileModelDependentState(currentModel, model);
+	}
+
+	async #reconcileModelDependentState(previousModel: Model | undefined, model: Model): Promise<void> {
 		// Re-evaluate append-only context mode — provider or setting may have changed
 		this.#syncAppendOnlyContext(model);
 
-		if (codeModeChanged || this.#tools.codeModeDirectWireMetadataChanged()) {
+		if (this.#tools.codeModeChangesBetween(previousModel, model) || this.#tools.codeModeDirectWireMetadataChanged()) {
 			try {
 				await this.#tools.reconcileCodeMode();
 			} catch (error) {
@@ -10780,9 +10920,8 @@ export class AgentSession {
 		}
 
 		// inspect_image auto mode keys off model image capability. Reconcile
-		// centrally here so retry-fallback model changes (turn-recovery.ts),
-		// which bypass syncAfterModelChange, cannot leave the tool set stale —
-		// callers await, so a scheduled retry never races the reconciled slate.
+		// centrally here so retry-fallback and metadata-only model changes cannot
+		// leave the tool set stale.
 		try {
 			await this.#tools.reconcileInspectImageAfterModelChange();
 		} catch (error) {
@@ -11603,6 +11742,7 @@ export class AgentSession {
 			} else {
 				await lifecycle.commit(commitOptions);
 			}
+
 			return { selectedText, selectedImages, cancelled: false };
 		} catch (error) {
 			await lifecycle.rollback({
@@ -11728,6 +11868,7 @@ export class AgentSession {
 			} else {
 				await lifecycle.commit(commitOptions);
 			}
+
 			return { cancelled: false, sessionFile: this.sessionFile };
 		} catch (error) {
 			await lifecycle.rollback({
@@ -12846,13 +12987,48 @@ export class AgentSession {
 	 */
 	async #revalidateFallbackChainsAfterModelDiscovery(): Promise<void> {
 		if (this.#isDisposed || !this.#recovery.hasPendingDiscoveryDeferredFallbackValidation()) return;
-		await this.#modelRegistry.awaitInitialBackgroundRefresh(
-			this.#fallbackDiscoveryRevalidationAbortController.signal,
-		);
+		await this.#modelRegistry.awaitInitialBackgroundRefresh(this.#modelDiscoveryAbortController.signal);
 		if (this.#isDisposed) return;
 		if (this.#recovery.revalidateRetryFallbackChainsAfterDiscovery()) {
 			this.#emit({ type: "config_warnings_changed" });
 		}
+	}
+
+	/**
+	 * Rebind the active model to its refreshed registry entry once the initial
+	 * background discovery settles.
+	 *
+	 * Startup resolves the active model from the pre-discovery catalog snapshot
+	 * (`main.ts` fires `refreshInBackground` only after the session is built), so
+	 * a discovery-backed provider that re-clamps or splits a selector after the
+	 * fact leaves the live model holding stale metadata. GitHub Copilot caps a
+	 * tiered base selector (e.g. `github-copilot/gpt-5.6-sol`) to its default-tier
+	 * context window and synthesizes a separate `-1m` sibling only during live
+	 * discovery; the bundled base entry still carries the full long-context
+	 * window, so a fresh session runs with the 1.05M window that contradicts the
+	 * 400K catalog value until the user re-selects the same model. Re-look-up the
+	 * active selector post-discovery and, when its context window changed, fold
+	 * the refreshed spec into the live model. Same selector, so this is a metadata
+	 * refresh with no provider-session reset; reconcile model-dependent tools and
+	 * append-only state before `model_changed` notifies the status line and RPC
+	 * subscribers. Issue #10488.
+	 */
+	async #rebindActiveModelAfterModelDiscovery(): Promise<void> {
+		const boundAtStartup = this.model;
+		if (this.#isDisposed || !boundAtStartup) return;
+		if (typeof this.#modelRegistry.awaitInitialBackgroundRefresh !== "function") return;
+		await this.#modelRegistry.awaitInitialBackgroundRefresh(this.#modelDiscoveryAbortController.signal);
+		if (this.#isDisposed) return;
+		// Only silently re-metadata the startup-bound selector: bail if the user
+		// switched models while discovery was in flight.
+		const current = this.model;
+		if (!current || !modelsAreEqual(current, boundAtStartup)) return;
+		const refreshed = this.#modelRegistry.find(current.provider, current.id);
+		if (!refreshed || refreshed.contextWindow === current.contextWindow) return;
+		this.agent.setModel(refreshed);
+		await this.#reconcileModelDependentState(current, refreshed);
+		if (this.#isDisposed) return;
+		this.#emit({ type: "model_changed" });
 	}
 
 	/**
@@ -12883,6 +13059,15 @@ export class AgentSession {
 	 */
 	setAdvisorContextPrompt(contextPrompt: string | undefined): void {
 		this.#advisors.setContextPrompt(contextPrompt);
+	}
+
+	/**
+	 * Refresh the memory backend instructions advisor sessions run against.
+	 * Store-only: live advisors pick the new value up at their next runtime
+	 * build (compaction, reset, toggle) — see `SessionAdvisors#setMemoryPrompt`.
+	 */
+	setAdvisorMemoryPrompt(memoryPrompt: string | undefined): void {
+		this.#advisors.setMemoryPrompt(memoryPrompt);
 	}
 
 	/**
@@ -12929,7 +13114,7 @@ export class AgentSession {
 	 * flag and per-advisor name/status without computing token/cost breakdowns.
 	 * Avoids re-tokenizing the advisor transcript on every render frame.
 	 */
-	getAdvisorStatusOverview(): { configured: boolean; advisors: { name: string; status: AdvisorRuntimeStatus }[] } {
+	getAdvisorStatusOverview(): { configured: boolean; advisors: AdvisorStatusOverviewEntry[] } {
 		return this.#advisors.getAdvisorStatusOverview();
 	}
 

@@ -7,6 +7,9 @@
 import type { AgentMessage, AgentToolResult, ThinkingLevel, ToolLoadMode } from "@oh-my-pi/pi-agent-core";
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type { Effort, ImageContent, Model, ToolExample } from "@oh-my-pi/pi-ai";
+import { isRecord } from "@oh-my-pi/pi-utils";
+import type { CollabUiResponseValue, Participant } from "@oh-my-pi/pi-wire";
+import type { CollabFrame } from "../../collab/protocol";
 import type { BashResult } from "../../exec/bash-executor";
 import type { ContextUsage } from "../../extensibility/extensions/types";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
@@ -19,78 +22,299 @@ import type {
 	SubagentProgressPayload,
 } from "../../task";
 import type { TodoPhase } from "../../tools/todo";
+import type { RpcHistoryChunk, RpcHistoryDigest, RpcHistoryPage, RpcHistorySnapshot } from "./rpc-history";
 import type { RpcMessagesPage } from "./rpc-messages";
+import type {
+	RpcArtifactListResult,
+	RpcArtifactReadResult,
+	RpcArtifactWriteResult,
+	RpcBlobListResult,
+	RpcBlobReadResult,
+	RpcBlobWriteResult,
+	RpcCustomMessageContent,
+	RpcCustomMessageResult,
+} from "./rpc-session-data";
+
+const MAX_RPC_MUTATION_ID_LENGTH = 256;
 
 // ============================================================================
 // RPC Commands (stdin)
 // ============================================================================
+
+/** Authority provenance required for retry-safe OMP mutations. */
+export interface RpcMutationContext {
+	commandId: string;
+	runtimeId: string;
+	generation: number;
+}
+
+/** Canonical classification for every RPC command discriminator. */
+export const RPC_COMMAND_CLASSIFICATION = {
+	negotiate_protocol: "read",
+	prompt: "mutation",
+	steer: "mutation",
+	follow_up: "mutation",
+	abort: "mutation",
+	abort_and_prompt: "mutation",
+	new_session: "mutation",
+	custom_message: "mutation",
+	get_state: "read",
+	set_fast_mode: "mutation",
+	get_available_commands: "read",
+	set_todos: "mutation",
+	set_host_tools: "mutation",
+	set_host_uri_schemes: "mutation",
+	set_subagent_subscription: "mutation",
+	get_subagents: "read",
+	get_subagent_messages: "read",
+	set_model: "mutation",
+	cycle_model: "mutation",
+	get_available_models: "read",
+	set_thinking_level: "mutation",
+	cycle_thinking_level: "mutation",
+	set_steering_mode: "mutation",
+	set_follow_up_mode: "mutation",
+	set_interrupt_mode: "mutation",
+	compact: "mutation",
+	set_auto_compaction: "mutation",
+	set_auto_retry: "mutation",
+	abort_retry: "mutation",
+	bash: "mutation",
+	abort_bash: "mutation",
+	get_session_stats: "read",
+	export_html: "mutation",
+	switch_session: "mutation",
+	branch: "mutation",
+	fork: "mutation",
+	collab_ui_response: "mutation",
+	artifact_list: "read",
+	artifact_read: "read",
+	artifact_write: "mutation",
+	blob_list: "read",
+	blob_read: "read",
+	blob_write: "mutation",
+	history_snapshot: "read",
+	history_page: "read",
+	history_chunk: "read",
+	history_digest: "read",
+	get_branch_messages: "read",
+	get_last_assistant_text: "read",
+	set_session_name: "mutation",
+	handoff: "mutation",
+	get_messages: "read",
+	get_messages_page: "read",
+	get_login_providers: "read",
+	login: "mutation",
+} as const satisfies Record<string, "read" | "mutation">;
+
+export type RpcCommandType = keyof typeof RPC_COMMAND_CLASSIFICATION;
+export type RpcMutationOperation = {
+	[K in RpcCommandType]: (typeof RPC_COMMAND_CLASSIFICATION)[K] extends "mutation" ? K : never;
+}[RpcCommandType];
+
+const RPC_CONNECTION_LOCAL_MUTATION_OPERATIONS: Partial<Record<RpcMutationOperation, true>> = {
+	set_host_tools: true,
+	set_host_uri_schemes: true,
+	set_subagent_subscription: true,
+};
+
+/** Bounded OMP-native session outcome recorded with a durable mutation receipt. */
+export interface RpcMutationSessionOutcome {
+	status: "completed" | "cancelled" | "rejected";
+	sessionId: string;
+	previousSessionId?: string;
+	agentInvoked?: boolean;
+}
+
+/** Durable OMP evidence returned for authority-scoped mutations. */
+export interface RpcMutationReceipt extends RpcMutationContext {
+	owner: "omp";
+	operation: RpcMutationOperation;
+	fingerprint: string;
+	replayed: boolean;
+	session: RpcMutationSessionOutcome;
+}
+
+export const RPC_HERDR_AGENTD_HOST_CAPABILITY = "herdr-agentd-host";
+
+export const RPC_CAPABILITIES = [
+	"stdio-rpc",
+	"messages-page",
+	"extension-ui",
+	"host-tools",
+	"host-uris",
+	"mutation-receipts",
+	"fork",
+	"fork-entry",
+	"prompt-tool-choice",
+	"custom-messages",
+	"custom-message-when-idle",
+	"artifacts",
+	"blobs",
+	"exact-history",
+] as const satisfies readonly string[];
+
+type RpcMutatingCommand<T extends { type: RpcMutationOperation }> = T & { mutation?: RpcMutationContext };
+type RpcDurableMutatingCommand<T extends { type: RpcMutationOperation }> = T & { mutation: RpcMutationContext };
 
 export type RpcCommand =
 	// Protocol
 	| { id?: string; type: "negotiate_protocol"; protocolVersion: number }
 
 	// Prompting
-	| { id?: string; type: "prompt"; message: string; images?: ImageContent[]; streamingBehavior?: "steer" | "followUp" }
-	| { id?: string; type: "steer"; message: string; images?: ImageContent[] }
-	| { id?: string; type: "follow_up"; message: string; images?: ImageContent[] }
-	| { id?: string; type: "abort" }
-	| { id?: string; type: "abort_and_prompt"; message: string; images?: ImageContent[] }
-	| { id?: string; type: "new_session"; parentSession?: string }
+	| RpcMutatingCommand<{
+			id?: string;
+			type: "prompt";
+			message: string;
+			images?: ImageContent[];
+			streamingBehavior?: "steer" | "followUp";
+			toolChoice?: string;
+	  }>
+	| RpcMutatingCommand<{ id?: string; type: "steer"; message: string; images?: ImageContent[] }>
+	| RpcMutatingCommand<{ id?: string; type: "follow_up"; message: string; images?: ImageContent[] }>
+	| RpcMutatingCommand<{ id?: string; type: "abort" }>
+	| RpcMutatingCommand<{ id?: string; type: "abort_and_prompt"; message: string; images?: ImageContent[] }>
+	| RpcMutatingCommand<{ id?: string; type: "new_session"; parentSession?: string }>
+	| RpcDurableMutatingCommand<{
+			id?: string;
+			type: "custom_message";
+			customType: string;
+			content: RpcCustomMessageContent;
+			display: boolean;
+			details?: unknown;
+			when?: "idle" | "any";
+	  }>
 
 	// State
 	| { id?: string; type: "get_state" }
-	| { id?: string; type: "set_fast_mode"; enabled: boolean }
+	| RpcMutatingCommand<{ id?: string; type: "set_fast_mode"; enabled: boolean }>
 	| { id?: string; type: "get_available_commands" }
-	| { id?: string; type: "set_todos"; phases: TodoPhase[] }
-	| { id?: string; type: "set_host_tools"; tools: RpcHostToolDefinition[] }
-	| { id?: string; type: "set_host_uri_schemes"; schemes: RpcHostUriSchemeDefinition[] }
-	| { id?: string; type: "set_subagent_subscription"; level: RpcSubagentSubscriptionLevel }
+	| RpcMutatingCommand<{ id?: string; type: "set_todos"; phases: TodoPhase[] }>
+	| RpcMutatingCommand<{ id?: string; type: "set_host_tools"; tools: RpcHostToolDefinition[] }>
+	| RpcMutatingCommand<{ id?: string; type: "set_host_uri_schemes"; schemes: RpcHostUriSchemeDefinition[] }>
+	| RpcMutatingCommand<{
+			id?: string;
+			type: "set_subagent_subscription";
+			level: RpcSubagentSubscriptionLevel;
+	  }>
 	| { id?: string; type: "get_subagents" }
 	| { id?: string; type: "get_subagent_messages"; subagentId?: string; sessionFile?: string; fromByte?: number }
 
 	// Model
-	| { id?: string; type: "set_model"; provider: string; modelId: string }
-	| { id?: string; type: "cycle_model" }
+	| RpcMutatingCommand<{ id?: string; type: "set_model"; provider: string; modelId: string }>
+	| RpcMutatingCommand<{ id?: string; type: "cycle_model" }>
 	| { id?: string; type: "get_available_models" }
 
 	// Thinking
-	| { id?: string; type: "set_thinking_level"; level: ThinkingLevel }
-	| { id?: string; type: "cycle_thinking_level" }
+	| RpcMutatingCommand<{ id?: string; type: "set_thinking_level"; level: ThinkingLevel }>
+	| RpcMutatingCommand<{ id?: string; type: "cycle_thinking_level" }>
 
 	// Queue modes
-	| { id?: string; type: "set_steering_mode"; mode: "all" | "one-at-a-time" }
-	| { id?: string; type: "set_follow_up_mode"; mode: "all" | "one-at-a-time" }
-	| { id?: string; type: "set_interrupt_mode"; mode: "immediate" | "wait" }
+	| RpcMutatingCommand<{ id?: string; type: "set_steering_mode"; mode: "all" | "one-at-a-time" }>
+	| RpcMutatingCommand<{ id?: string; type: "set_follow_up_mode"; mode: "all" | "one-at-a-time" }>
+	| RpcMutatingCommand<{ id?: string; type: "set_interrupt_mode"; mode: "immediate" | "wait" }>
 
 	// Compaction
-	| { id?: string; type: "compact"; customInstructions?: string }
-	| { id?: string; type: "set_auto_compaction"; enabled: boolean }
+	| RpcMutatingCommand<{ id?: string; type: "compact"; customInstructions?: string }>
+	| RpcMutatingCommand<{ id?: string; type: "set_auto_compaction"; enabled: boolean }>
 
 	// Retry
-	| { id?: string; type: "set_auto_retry"; enabled: boolean }
-	| { id?: string; type: "abort_retry" }
+	| RpcMutatingCommand<{ id?: string; type: "set_auto_retry"; enabled: boolean }>
+	| RpcMutatingCommand<{ id?: string; type: "abort_retry" }>
 
 	// Bash
-	| { id?: string; type: "bash"; command: string }
-	| { id?: string; type: "abort_bash" }
+	| RpcMutatingCommand<{ id?: string; type: "bash"; command: string }>
+	| RpcMutatingCommand<{ id?: string; type: "abort_bash" }>
 
 	// Session
 	| { id?: string; type: "get_session_stats" }
-	| { id?: string; type: "export_html"; outputPath?: string }
-	| { id?: string; type: "switch_session"; sessionPath: string }
-	| { id?: string; type: "branch"; entryId: string }
+	| RpcMutatingCommand<{ id?: string; type: "export_html"; outputPath?: string }>
+	| RpcMutatingCommand<{ id?: string; type: "switch_session"; sessionPath: string }>
+	| RpcMutatingCommand<{ id?: string; type: "branch"; entryId: string }>
+	| RpcMutatingCommand<{ id?: string; type: "fork"; entryId?: string }>
+	| RpcMutatingCommand<{ id?: string; type: "collab_ui_response"; reqId: number; value?: CollabUiResponseValue }>
+	| { id?: string; type: "artifact_list" }
+	| { id?: string; type: "artifact_read"; artifactId: string }
+	| RpcDurableMutatingCommand<{ id?: string; type: "artifact_write"; content: string; toolType?: string }>
+	| { id?: string; type: "blob_list" }
+	| { id?: string; type: "blob_read"; hash: string }
+	| RpcDurableMutatingCommand<{
+			id?: string;
+			type: "blob_write";
+			hash: string;
+			size: number;
+			content: string;
+	  }>
 	| { id?: string; type: "get_branch_messages" }
 	| { id?: string; type: "get_last_assistant_text" }
-	| { id?: string; type: "set_session_name"; name: string }
-	| { id?: string; type: "handoff"; customInstructions?: string }
+	| RpcMutatingCommand<{ id?: string; type: "set_session_name"; name: string }>
+	| RpcMutatingCommand<{ id?: string; type: "handoff"; customInstructions?: string }>
 
 	// Messages
 	| { id?: string; type: "get_messages" }
 	| { id?: string; type: "get_messages_page"; cursor?: string; limit?: number }
+	| { id?: string; type: "history_snapshot" }
+	| { id?: string; type: "history_page"; scope?: "entries" | "branch"; cursor?: string; limit?: number }
+	| { id?: string; type: "history_chunk"; cursor?: string; limit?: number }
+	| { id?: string; type: "history_digest" }
 
 	// Login
 	| { id?: string; type: "get_login_providers" }
-	| { id?: string; type: "login"; providerId: string };
+	| RpcMutatingCommand<{ id?: string; type: "login"; providerId: string }>;
+
+/** A canonical RPC command before the client assigns its transport request ID. */
+type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
+
+export type RpcCommandInput = DistributiveOmit<RpcCommand, "id">;
+
+export type RpcMutationCommand = Extract<RpcCommand, { type: RpcMutationOperation }>;
+
+/** Mutable connection-local configuration that must be applied again after reconnect. */
+export type RpcDurableMutationCommand = Exclude<
+	RpcMutationCommand,
+	{ type: "set_host_tools" | "set_host_uri_schemes" | "set_subagent_subscription" }
+>;
+export type RpcReadCommand = Exclude<RpcCommand, RpcMutationCommand>;
+
+type RpcCommandClassificationCoverage =
+	| Exclude<RpcCommand["type"], RpcCommandType>
+	| Exclude<RpcCommandType, RpcCommand["type"]>;
+const rpcCommandClassificationCoverage: RpcCommandClassificationCoverage extends never ? true : false = true;
+void rpcCommandClassificationCoverage;
+
+export function isRpcMutationContext(value: unknown): value is RpcMutationContext {
+	return (
+		isRecord(value) &&
+		typeof value.commandId === "string" &&
+		value.commandId.length > 0 &&
+		value.commandId.isWellFormed() &&
+		Buffer.byteLength(value.commandId, "utf8") <= MAX_RPC_MUTATION_ID_LENGTH &&
+		typeof value.runtimeId === "string" &&
+		value.runtimeId.length > 0 &&
+		value.runtimeId.isWellFormed() &&
+		Buffer.byteLength(value.runtimeId, "utf8") <= MAX_RPC_MUTATION_ID_LENGTH &&
+		typeof value.generation === "number" &&
+		Number.isSafeInteger(value.generation) &&
+		value.generation >= 0
+	);
+}
+
+/** Canonical discriminator-only classification used by every RPC transport. */
+export function isRpcMutationCommand(value: unknown): value is RpcMutationCommand {
+	if (!isRecord(value) || typeof value.type !== "string") return false;
+	return RPC_COMMAND_CLASSIFICATION[value.type as RpcCommandType] === "mutation";
+}
+
+/** True for mutations whose outcomes can safely be persisted and replayed across processes. */
+export function isRpcDurableMutationCommand(value: unknown): value is RpcDurableMutationCommand {
+	return isRpcMutationCommand(value) && !RPC_CONNECTION_LOCAL_MUTATION_OPERATIONS[value.type];
+}
+
+/** Canonical discriminator-only read classification used by Collab routing. */
+export function isRpcReadCommand(value: unknown): value is RpcReadCommand {
+	if (!isRecord(value) || typeof value.type !== "string") return false;
+	return RPC_COMMAND_CLASSIFICATION[value.type as RpcCommandType] === "read";
+}
 
 // ============================================================================
 // RPC State
@@ -141,12 +365,37 @@ export interface RpcPromptResultFrame {
 	agentInvoked: boolean;
 }
 
-export interface RpcReadyFrame {
-	type: "ready";
+export interface RpcEndpointIdentity {
+	/** Immutable build identity of the process accepting commands. */
+	buildId: string;
+	/** Exact OMP package version of the process accepting commands. */
+	version: string;
 	protocolVersion: 1;
-	supportedProtocolVersions: [1, 2];
+	supportedProtocolVersions: readonly [1, 2];
+	capabilities: readonly string[];
+}
+
+export function isRpcEndpointIdentity(value: unknown): value is RpcEndpointIdentity {
+	return (
+		isRecord(value) &&
+		typeof value.buildId === "string" &&
+		typeof value.version === "string" &&
+		value.protocolVersion === 1 &&
+		Array.isArray(value.supportedProtocolVersions) &&
+		value.supportedProtocolVersions.length === 2 &&
+		value.supportedProtocolVersions[0] === 1 &&
+		value.supportedProtocolVersions[1] === 2 &&
+		Array.isArray(value.capabilities) &&
+		value.capabilities.every(capability => typeof capability === "string")
+	);
+}
+
+export interface RpcReadyFrame extends RpcEndpointIdentity {
+	type: "ready";
 	maxFrameBytes: number;
 	maxReassembledFrameBytes: number;
+	/** Authoritative Collab participant identity for a replica-backed endpoint. */
+	participant?: Participant;
 }
 
 export interface RpcChunkFrame {
@@ -193,7 +442,7 @@ export interface RpcSubagentMessagesResult {
 // ============================================================================
 
 // Success responses with data
-export type RpcResponse =
+type RpcResponsePayload =
 	// Protocol
 	| {
 			id?: string;
@@ -204,12 +453,19 @@ export type RpcResponse =
 	  }
 
 	// Prompting (async - events follow)
-	| { id?: string; type: "response"; command: "prompt"; success: true; data?: { agentInvoked: boolean } }
+	| {
+			id?: string;
+			type: "response";
+			command: "prompt";
+			success: true;
+			data?: { agentInvoked: boolean };
+	  }
 	| { id?: string; type: "response"; command: "steer"; success: true }
 	| { id?: string; type: "response"; command: "follow_up"; success: true }
 	| { id?: string; type: "response"; command: "abort"; success: true }
 	| { id?: string; type: "response"; command: "abort_and_prompt"; success: true }
 	| { id?: string; type: "response"; command: "new_session"; success: true; data: { cancelled: boolean } }
+	| { id?: string; type: "response"; command: "custom_message"; success: true; data: RpcCustomMessageResult }
 
 	// State
 	| { id?: string; type: "response"; command: "get_state"; success: true; data: RpcSessionState }
@@ -310,6 +566,20 @@ export type RpcResponse =
 	| {
 			id?: string;
 			type: "response";
+			command: "fork";
+			success: true;
+			data: { sessionId: string; cancelled: boolean };
+	  }
+	| { id?: string; type: "response"; command: "collab_ui_response"; success: true }
+	| { id?: string; type: "response"; command: "artifact_list"; success: true; data: RpcArtifactListResult }
+	| { id?: string; type: "response"; command: "artifact_read"; success: true; data: RpcArtifactReadResult }
+	| { id?: string; type: "response"; command: "artifact_write"; success: true; data: RpcArtifactWriteResult }
+	| { id?: string; type: "response"; command: "blob_list"; success: true; data: RpcBlobListResult }
+	| { id?: string; type: "response"; command: "blob_read"; success: true; data: RpcBlobReadResult }
+	| { id?: string; type: "response"; command: "blob_write"; success: true; data: RpcBlobWriteResult }
+	| {
+			id?: string;
+			type: "response";
 			command: "get_branch_messages";
 			success: true;
 			data: { messages: Array<{ entryId: string; text: string }> };
@@ -327,6 +597,10 @@ export type RpcResponse =
 	// Messages
 	| { id?: string; type: "response"; command: "get_messages"; success: true; data: { messages: AgentMessage[] } }
 	| { id?: string; type: "response"; command: "get_messages_page"; success: true; data: RpcMessagesPage }
+	| { id?: string; type: "response"; command: "history_snapshot"; success: true; data: RpcHistorySnapshot }
+	| { id?: string; type: "response"; command: "history_page"; success: true; data: RpcHistoryPage }
+	| { id?: string; type: "response"; command: "history_chunk"; success: true; data: RpcHistoryChunk }
+	| { id?: string; type: "response"; command: "history_digest"; success: true; data: RpcHistoryDigest }
 
 	// Login
 	| {
@@ -339,7 +613,42 @@ export type RpcResponse =
 	| { id?: string; type: "response"; command: "login"; success: true; data: { providerId: string } }
 
 	// Error response (any command can fail); `code` is an optional machine-readable reason.
-	| { id?: string; type: "response"; command: string; success: false; error: string; code?: string };
+	| {
+			id?: string;
+			type: "response";
+			command: string;
+			success: false;
+			error: string;
+			code?: string;
+	  };
+
+export type RpcResponse = RpcResponsePayload & { receipt?: RpcMutationReceipt };
+
+/** A canonical command result whose publication may be deferred until its response is flushed. */
+export interface RpcCommandDispatchResult {
+	response: RpcResponse;
+	afterResponse?: () => void | Promise<void>;
+}
+
+/** Per-dispatch authority owned by the exact private Collab host receiving a command. */
+export interface RpcCanonicalDispatchContext {
+	handleCollabUiResponse(
+		command: Extract<RpcCommand, { type: "collab_ui_response" }>,
+	): RpcResponse | Promise<RpcResponse>;
+	/** Reject execution when the private route that accepted this request was replaced while it waited. */
+	validateExecution?(command: RpcCommand): RpcResponse | undefined;
+}
+
+/** Shared authoritative dispatcher exposed by direct RPC mode to private Collab hosting. */
+export interface RpcCanonicalAuthority {
+	identity: RpcEndpointIdentity;
+	dispatch(
+		command: RpcCommand,
+		context?: RpcCanonicalDispatchContext,
+	): Promise<RpcResponse | RpcCommandDispatchResult>;
+	dispatchControl(frame: unknown): boolean;
+	subscribeOutput(listener: (output: object) => void): () => void;
+}
 
 // ============================================================================
 // Subagent Events (stdout)
@@ -362,11 +671,30 @@ export interface RpcSubagentEventFrame {
 
 export type RpcSubagentFrame = RpcSubagentLifecycleFrame | RpcSubagentProgressFrame | RpcSubagentEventFrame;
 
-export type RpcSessionEventFrame = AgentSessionEvent | RpcSubagentFrame;
+/** Existing Collab host frames forwarded unchanged through the RPC composition. */
+export type RpcCollabFrame = Extract<
+	CollabFrame,
+	{ t: "bus" | "agents" | "ui-request" | "ui-request-end" | "transcript" | "authority" | "bye" | "error" }
+>;
+
+export interface RpcCollabFrameEvent {
+	type: "collab_frame";
+	frame: RpcCollabFrame;
+}
+
+/** Authoritative terminal availability signal for a replica-backed RPC endpoint. */
+export interface RpcCollabTerminalFrame {
+	type: "collab_terminal";
+	code: "unavailable";
+	reason: string;
+}
+
+export type RpcSessionEventFrame = AgentSessionEvent | RpcSubagentFrame | RpcCollabFrameEvent | RpcCollabTerminalFrame;
 
 // ============================================================================
 // Extension UI Events (stdout)
 // ============================================================================
+
 /** Positional presentation metadata for an RPC select option. */
 export interface RpcExtensionUISelectOptionDetail {
 	description?: string;
@@ -375,8 +703,8 @@ export interface RpcExtensionUISelectOptionDetail {
 /** Emitted when an extension needs user input */
 export type RpcExtensionUIRequest =
 	| {
-			type: "extension_ui_request";
 			id: string;
+			type: "extension_ui_request";
 			method: "select";
 			title: string;
 			options: string[];
@@ -549,8 +877,49 @@ export type RpcExtensionUIResponse =
 	| { type: "extension_ui_response"; id: string; confirmed: boolean }
 	| { type: "extension_ui_response"; id: string; cancelled: true; timedOut?: boolean };
 
-// ============================================================================
-// Helper type for extracting command types
-// ============================================================================
+/** Direct one-use bridge tuple redeemed by agentd for an OMP-owned Herdr host route. */
+export interface RpcHerdrAgentdHostBridge {
+	address: string;
+	paneId: string;
+	routeGeneration: number;
+	token: string;
+}
 
-export type RpcCommandType = RpcCommand["type"];
+/** One-use credential provision for the next committed agentd-owned Herdr session route. */
+export interface RpcPrepareHerdrAgentdRebindFrame extends RpcHerdrAgentdHostBridge {
+	type: "prepare_herdr_agentd_rebind";
+}
+
+/** Explicitly discard any staged agentd-owned Herdr successor route. */
+export interface RpcClearHerdrAgentdRebindFrame {
+	type: "clear_herdr_agentd_rebind";
+}
+
+export type RpcHerdrAgentdRebindControlFrame = RpcPrepareHerdrAgentdRebindFrame | RpcClearHerdrAgentdRebindFrame;
+
+/** True for the two dedicated Herdr rebind control discriminators, even when malformed. */
+export function isRpcHerdrAgentdRebindControl(value: unknown): boolean {
+	if (!isRecord(value)) return false;
+	return value.type === "prepare_herdr_agentd_rebind" || value.type === "clear_herdr_agentd_rebind";
+}
+
+/** Structural guard for a valid dedicated Herdr rebind control frame. */
+export function isRpcHerdrAgentdRebindControlFrame(value: unknown): value is RpcHerdrAgentdRebindControlFrame {
+	if (!isRecord(value)) return false;
+	if (value.type === "clear_herdr_agentd_rebind") return true;
+	return (
+		value.type === "prepare_herdr_agentd_rebind" &&
+		typeof value.address === "string" &&
+		typeof value.paneId === "string" &&
+		typeof value.routeGeneration === "number" &&
+		typeof value.token === "string"
+	);
+}
+
+/** Client-to-agent side-channel frames that may overtake serialized commands. */
+export type RpcControlFrame =
+	| RpcExtensionUIResponse
+	| RpcHostToolResult
+	| RpcHostToolUpdate
+	| RpcHostUriResult
+	| RpcHerdrAgentdRebindControlFrame;

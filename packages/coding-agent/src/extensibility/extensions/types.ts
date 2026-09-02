@@ -1313,12 +1313,15 @@ export type SendMessageDisposition =
 				| "client_deferred_turn"
 				| "session_transition"
 				| "prompt_preflight_cancelled"
-				| "reentrant_extension_handler";
+				| "reentrant_extension_handler"
+				| "session_busy";
 	  };
 
 export interface SendMessageOptions {
 	/** Host-owned semantic delivery. The host either accepts this exact mode or performs no mutation. */
 	deliveryMode?: SendMessageDeliveryMode;
+	/** Admission policy for externally sourced custom messages. `idle` rejects rather than queues while the session is busy. */
+	when?: "idle" | "any";
 	/** Registered scope that lets idle wake-capable semantic delivery start one peer-message turn. */
 	automaticTurnSource?: "peer_message_wake";
 	/** Runs synchronously at idle provider-response acceptance before session lifecycle handoff. */
