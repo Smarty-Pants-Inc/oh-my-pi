@@ -40,8 +40,6 @@ import { HerdrCollabHostLifecycle, type ManagedHerdrHostBridge } from "./collab/
 import { CollabHost } from "./collab/host";
 import { createHostBridgeTransport, LocalCollabTransport } from "./collab/local-transport";
 import type { CollabRpcGuestBridge } from "./collab/rpc-guest";
-import { runCollabRpcGuest } from "./collab/rpc-guest";
-import { runCollabRpcHost } from "./collab/rpc-host";
 import { findConfigFile } from "./config";
 import { ModelRegistry } from "./config/model-registry";
 import {
@@ -2314,8 +2312,10 @@ export async function runRootCommand(
 			if (mode === "rpc" || mode === "rpc-ui") {
 				stopStartupWatchdog();
 				if (deps.collabRpcGuest) {
+					const { runCollabRpcGuest } = await import("./collab/rpc-guest");
 					await runCollabRpcGuest(session, deps.collabRpcGuest, subagentEventBus, rpcInput);
 				} else if (deps.collabRpcHost) {
+					const { runCollabRpcHost } = await import("./collab/rpc-host");
 					await runCollabRpcHost(
 						session,
 						deps.collabRpcHost,
