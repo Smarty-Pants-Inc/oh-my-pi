@@ -132,7 +132,9 @@ describe("approved source-linked extension snapshots", () => {
 			},
 		};
 		await extensionModule.default(api);
-		await (await extensionModule.loadLazyFactory())(api);
+		await (
+			await extensionModule.loadLazyFactory()
+		)(api);
 
 		expect(await Bun.file(moduleMarker).text()).toBe("approved-module\n");
 		expect(await Bun.file(factoryMarker).text()).toBe("approved-factory:approved\n");

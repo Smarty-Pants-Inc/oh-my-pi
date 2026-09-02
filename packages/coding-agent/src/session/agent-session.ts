@@ -2753,8 +2753,7 @@ export class AgentSession {
 	}
 
 	#forwardLaunchCompletionReceipt(delivery: DeferredLaunchCompletionDelivery): void {
-		let forwarding: Promise<void>;
-		forwarding = this.#enqueueLaunchCompletion(delivery.notification)
+		const forwarding = this.#enqueueLaunchCompletion(delivery.notification)
 			.then(delivery.resolve, delivery.reject)
 			.finally(() => this.#activeLaunchCompletionReceiptForwards.delete(forwarding));
 		this.#activeLaunchCompletionReceiptForwards.add(forwarding);
@@ -2931,8 +2930,7 @@ export class AgentSession {
 
 		const deferred = { manager, jobId, text, job };
 		const delivery = this.#deliverAsyncJobResultNow(manager, jobId, text, job);
-		let tracked: Promise<void>;
-		tracked = delivery.finally(() => this.#activeAsyncJobDeliveries.delete(tracked));
+		const tracked = delivery.finally(() => this.#activeAsyncJobDeliveries.delete(tracked));
 		this.#activeAsyncJobDeliveries.set(tracked, deferred);
 		return tracked;
 	}
@@ -10153,8 +10151,7 @@ export class AgentSession {
 		this.#pendingAbortErrorId = userInterrupt ? AIError.create(AIError.Flag.UserInterrupt) : undefined;
 		if (userInterrupt) this.#advisors.autoResumeSuppressed = true;
 
-		let operation: Promise<void>;
-		operation = this.#performAbort(intent).finally(() => {
+		const operation = this.#performAbort(intent).finally(() => {
 			if (this.#abortIntent === intent) this.#abortIntent = undefined;
 			if (this.#abortPromise === operation) this.#abortPromise = undefined;
 			this.#drainStrandedQueuedMessages();
@@ -10453,6 +10450,7 @@ export class AgentSession {
 			await this.#memory.resetContextForNewTranscript();
 			if (entryId !== undefined) {
 				this.#replaceMessagesFromSessionContext(this.buildDisplaySessionContext());
+				this.#rehydratePendingSemanticDeliveries();
 			}
 
 			await this.sessionManager.ensureOnDisk();

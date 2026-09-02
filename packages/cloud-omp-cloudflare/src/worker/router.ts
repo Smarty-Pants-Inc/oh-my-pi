@@ -16,21 +16,20 @@ import {
 } from "./validation";
 import type { CloudOmpWorkspace as CloudOmpWorkspaceRpcSource } from "./workspace-object";
 
-export interface WorkspaceRpc
-	extends Pick<
-		CloudOmpWorkspaceRpcSource,
-		| "createWorkspace"
-		| "readFile"
-		| "writeFile"
-		| "getManifest"
-		| "createExec"
-		| "getExec"
-		| "killExec"
-		| "deleteExec"
-		| "quiesce"
-		| "release"
-		| "restartForTest"
-	> {}
+export interface WorkspaceRpc extends Pick<
+	CloudOmpWorkspaceRpcSource,
+	| "createWorkspace"
+	| "readFile"
+	| "writeFile"
+	| "getManifest"
+	| "createExec"
+	| "getExec"
+	| "killExec"
+	| "deleteExec"
+	| "quiesce"
+	| "release"
+	| "restartForTest"
+> {}
 
 export interface WorkspaceNamespace {
 	idFromName(name: string): DurableObjectId;

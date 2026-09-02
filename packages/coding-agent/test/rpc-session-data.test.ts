@@ -13,6 +13,7 @@ import type { RpcCommand, RpcMutationCommand, RpcResponse } from "../src/modes/r
 import type { AgentSession } from "../src/session/agent-session";
 import { BlobStore } from "../src/session/blob-store";
 import { SessionManager } from "../src/session/session-manager";
+import { SETTLED_SEMANTIC_DELIVERY_TYPE } from "../src/session/session-entries";
 
 let tempDir: TempDir;
 
@@ -302,6 +303,48 @@ describe("RPC artifact and blob adapters", () => {
 		}
 	});
 
+	it("lists and reads replay image-generation results despite a stale generating status", async () => {
+		const store = new BlobStore(path.join(tempDir.path(), "blobs"));
+		const manager = SessionManager.inMemory(tempDir.path());
+		const getBlobStore = spyOn(manager, "getBlobStore").mockReturnValue(store);
+		try {
+			const result = await store.put(Buffer.from("replayed generated image"));
+			manager.appendMessage({
+				role: "assistant",
+				content: [],
+				api: "openai-responses",
+				provider: "openai",
+				model: "gpt-5",
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				providerPayload: {
+					type: "openaiResponsesHistory",
+					items: [{ type: "image_generation_call", id: "ig-replay", status: "generating", result: result.ref }],
+				},
+				timestamp: 0,
+			});
+			const session = fakeSession({ sessionManager: manager });
+
+			expect(await executeRpcSessionDataCommand(session, { type: "blob_list" })).toMatchObject({
+				success: true,
+				data: { blobs: [{ hash: result.hash, size: Buffer.from("replayed generated image").byteLength }] },
+			});
+			expect(await executeRpcSessionDataCommand(session, { type: "blob_read", hash: result.hash })).toMatchObject({
+				success: true,
+				data: { hash: result.hash, content: Buffer.from("replayed generated image").toString("base64") },
+			});
+		} finally {
+			getBlobStore.mockRestore();
+		}
+	});
+
 	it("lists and reads remote compaction Responses input images without authorizing nearby strings", async () => {
 		const store = new BlobStore(path.join(tempDir.path(), "blobs"));
 		const manager = SessionManager.inMemory(tempDir.path());
@@ -375,6 +418,62 @@ describe("RPC artifact and blob adapters", () => {
 				success: false,
 				code: "not-found",
 			});
+		} finally {
+			getBlobStore.mockRestore();
+		}
+	});
+
+	it("lists only unsettled durable pending semantic delivery images", async () => {
+		const store = new BlobStore(path.join(tempDir.path(), "blobs"));
+		const manager = SessionManager.inMemory(tempDir.path());
+		const getBlobStore = spyOn(manager, "getBlobStore").mockReturnValue(store);
+		try {
+			const pendingImage = await store.put(Buffer.from("pending semantic image"));
+			const deliveredImage = await store.put(Buffer.from("delivered semantic image"));
+			const cancelledImage = await store.put(Buffer.from("cancelled semantic image"));
+			const malformedImage = await store.put(Buffer.from("malformed pending image"));
+			const foreignImage = await store.put(Buffer.from("untrusted custom image"));
+			const appendPending = (imageRef: string): string =>
+				manager.appendCustomEntry("omp:pending-semantic-delivery", {
+					v: 1,
+					kind: "followUp",
+					message: {
+						role: "custom",
+						customType: "rpc",
+						content: [{ type: "image", data: imageRef, mimeType: "image/png" }],
+						display: false,
+						timestamp: 0,
+					},
+				});
+			const deliveredPendingId = appendPending(deliveredImage.ref);
+			const cancelledPendingId = appendPending(cancelledImage.ref);
+			appendPending(pendingImage.ref);
+			manager.appendCustomEntry(SETTLED_SEMANTIC_DELIVERY_TYPE, {
+				pendingId: deliveredPendingId,
+				outcome: "delivered",
+			});
+			manager.appendCustomEntry(SETTLED_SEMANTIC_DELIVERY_TYPE, {
+				pendingId: cancelledPendingId,
+				outcome: "cancelled",
+			});
+			manager.appendCustomEntry("omp:pending-semantic-delivery", {
+				message: { role: "custom", content: [{ type: "image", data: malformedImage.ref, mimeType: "image/png" }] },
+			});
+			manager.appendCustomEntry("untrusted", {
+				message: { role: "custom", content: [{ type: "image", data: foreignImage.ref, mimeType: "image/png" }] },
+			});
+			const session = fakeSession({ sessionManager: manager });
+
+			expect(await executeRpcSessionDataCommand(session, { type: "blob_list" })).toMatchObject({
+				success: true,
+				data: { blobs: [{ hash: pendingImage.hash, size: Buffer.from("pending semantic image").byteLength }] },
+			});
+			for (const image of [foreignImage, deliveredImage, cancelledImage, malformedImage]) {
+				expect(await executeRpcSessionDataCommand(session, { type: "blob_read", hash: image.hash })).toMatchObject({
+					success: false,
+					code: "not-found",
+				});
+			}
 		} finally {
 			getBlobStore.mockRestore();
 		}

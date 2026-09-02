@@ -336,7 +336,6 @@ describe("Agent", () => {
 	it("classifies hidden user-attributed custom steering as a system advisory", async () => {
 		const toolSchema = type({ value: type("string") });
 		const executed: string[] = [];
-		let agent: Agent;
 		const tool: AgentTool<typeof toolSchema, { value: string }> = {
 			name: "echo",
 			label: "Echo",
@@ -378,7 +377,7 @@ describe("Agent", () => {
 				{ content: ["visible handled"] },
 			],
 		});
-		agent = new Agent({
+		const agent = new Agent({
 			initialState: { model: mock.model, systemPrompt: ["Test"], tools: [tool], messages: [] },
 			streamFn: mock.stream,
 			steeringMode: "one-at-a-time",
@@ -656,7 +655,6 @@ describe("Agent", () => {
 		const executed: string[] = [];
 		const secondStarted = Promise.withResolvers<void>();
 		let claim: AgentQueuedMessageClaim | undefined;
-		let agent: Agent;
 		const tool: AgentTool<typeof parameters, { value: string }> = {
 			name: "step",
 			label: "Step",
@@ -686,7 +684,7 @@ describe("Agent", () => {
 				{ content: ["done"] },
 			],
 		});
-		agent = new Agent({
+		const agent = new Agent({
 			initialState: { model: mock.model, systemPrompt: ["Test"], tools: [tool], messages: [] },
 			streamFn: mock.stream,
 			interruptMode: "immediate",

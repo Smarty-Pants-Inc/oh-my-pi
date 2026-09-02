@@ -131,7 +131,6 @@ async function createHarness(
 		"todo.reminders": false,
 	});
 	settings.setModelRole("default", `${mock.provider}/${mock.id}`);
-	let session: AgentSession;
 	const toolRegistry = new Map(tools.map(tool => [tool.name, tool]));
 	const agent = new Agent({
 		getApiKey: () => "test-key",
@@ -168,7 +167,7 @@ async function createHarness(
 		extensionRunner = new ExtensionRunner([extension], runtime, tempDir.path(), sessionManager, modelRegistry);
 	}
 
-	session = new AgentSession({
+	const session = new AgentSession({
 		agent,
 		sessionManager,
 		settings,

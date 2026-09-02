@@ -315,7 +315,6 @@ describe("AgentSession concurrent prompt guard", () => {
 	it("rejects reentrant extension compaction throughout scoped semantic acceptance", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const compactErrors: string[] = [];
-		let current: AgentSession;
 		let handlerActive = false;
 		const extensionRunner = {
 			hasHandlers: vi.fn((eventType: string) => eventType === "message_end"),
@@ -346,7 +345,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			streamFn: createMockModel({ handler: () => ({ content: ["Done"] }) }).stream,
 			convertToLlm,
 		});
-		current = new AgentSession({
+		const current = new AgentSession({
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated(),
@@ -2885,7 +2884,6 @@ describe("AgentSession concurrent prompt guard", () => {
 		const extensionRuntime = new ExtensionRuntime();
 		let mutatorCalls = 0;
 		let commandCalls = 0;
-		let sourceFile: string | undefined;
 		let childFile: string | undefined;
 		let childTurn: Promise<unknown> | undefined;
 		const childGoal = {
@@ -3012,7 +3010,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			extensionRunner,
 			toolRegistry: new Map(tools.map(tool => [tool.name, tool])),
 		});
-		sourceFile = session.sessionFile;
+		const sourceFile = session.sessionFile;
 		if (!sourceFile) throw new Error("Expected persisted source session");
 		await initializeExtensions(session, {
 			reportSendError: (_action, error) => {

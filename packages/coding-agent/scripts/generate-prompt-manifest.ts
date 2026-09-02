@@ -312,9 +312,8 @@ async function main(): Promise<void> {
 	await writeOrCheck(generatedSourcesPath, formatSourceModule(registeredEntries), check);
 	// Live generation captures exact contracts once. Check/offline paths verify
 	// the canonical sidecar without importing native-backed tool modules.
-	const { buildGeneratedToolContractManifest, buildToolContractSnapshot } = await import(
-		"../src/context/tool-contracts"
-	);
+	const { buildGeneratedToolContractManifest, buildToolContractSnapshot } =
+		await import("../src/context/tool-contracts");
 	let toolSchemas: Array<{ id: string; descriptionSha256: string; schemaSha256: string }>;
 	if (!check) {
 		const snapshot = await buildToolContractSnapshot();

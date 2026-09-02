@@ -365,7 +365,6 @@ function makeNewSessionInputHarness() {
 	let commandActions: ExtensionCommandContextActions | undefined;
 	let uiContext: ExtensionUIContext | undefined;
 	let newSession = async (): Promise<boolean> => true;
-	let setHostTerminalInput: ((register: (handler: InputListener) => () => void) => void) | undefined;
 	const sessionManager = {
 		getSessionId: () => "018f1d74-7f7b-7d31-8d93-9a21c7b95bb1",
 		getSessionName: () => "Companion test",
@@ -389,6 +388,15 @@ function makeNewSessionInputHarness() {
 		}
 		if (current) ordinaryTuiInput.push(current);
 	};
+	const companion = createFreshOmpCompanionController(COMPANION_SECRET);
+	companion.factory({
+		on: (type: ExtensionEvent["type"], handler: RegisteredHandler) => handlers.set(type, handler),
+		registerTool: vi.fn(),
+		getThinkingLevel: () => "high",
+		logger: { warn: vi.fn() },
+	} as unknown as ExtensionAPI);
+	const setHostTerminalInput = companion.setHostTerminalInput;
+
 	const extensionRunner = {
 		initialize: vi.fn(
 			(
@@ -445,14 +453,6 @@ function makeNewSessionInputHarness() {
 	} as unknown as InteractiveModeContext;
 	ctx.editorContainer.addChild(ctx.editor);
 	const controller = new ExtensionUiController(ctx);
-	const companion = createFreshOmpCompanionController(COMPANION_SECRET);
-	companion.factory({
-		on: (type: ExtensionEvent["type"], handler: RegisteredHandler) => handlers.set(type, handler),
-		registerTool: vi.fn(),
-		getThinkingLevel: () => "high",
-		logger: { warn: vi.fn() },
-	} as unknown as ExtensionAPI);
-	setHostTerminalInput = companion.setHostTerminalInput;
 	const companionContext = {
 		get ui() {
 			if (!uiContext) throw new Error("Extension UI context was not initialized");

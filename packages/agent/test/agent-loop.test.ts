@@ -3537,7 +3537,6 @@ describe("agentLoop pre-model-call gate", () => {
 				{ content: ["should not be reached"] },
 			],
 		});
-		let agent: Agent;
 		const tool: AgentTool<typeof echoToolSchema> = {
 			name: "echo",
 			label: "Echo",
@@ -3549,7 +3548,7 @@ describe("agentLoop pre-model-call gate", () => {
 				return { content: [{ type: "text", text: `ok:${params.value}` }], details: { value: params.value } };
 			},
 		};
-		agent = new Agent({ streamFn: mock.stream });
+		const agent = new Agent({ streamFn: mock.stream });
 		agent.setTools([tool]);
 		let gateCalls = 0;
 		agent.setBeforeModelCall(() => (++gateCalls === 2 ? { stop: true, reason: "over budget" } : undefined));

@@ -1,4 +1,5 @@
 import type { AutocompleteItem } from "@oh-my-pi/pi-tui";
+import type { AvailableCommand } from "@oh-my-pi/pi-utils/acp";
 import { COLLAB_GUEST_ALLOWED_COMMANDS } from "../collab/guest";
 import { BUILTIN_COLLABORATION_SLASH_COMMANDS } from "./builtin-collaboration";
 import {
@@ -42,6 +43,29 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 	...BUILTIN_MARKETPLACE_SLASH_COMMANDS,
 	...BUILTIN_CONTROL_SLASH_COMMANDS,
 ];
+
+/**
+ * All names (primary + aliases) reserved by handled ACP builtins. Extension
+ * commands with these names would be captured before their handlers run.
+ */
+export const ACP_BUILTIN_RESERVED_NAMES: ReadonlySet<string> = new Set(
+	BUILTIN_SLASH_COMMAND_REGISTRY.filter(command => command.handle !== undefined).flatMap(command => [
+		command.name,
+		...(command.aliases ?? []),
+	]),
+);
+
+/** Commands advertised to ACP clients, excluding TUI-only builtins. */
+export const ACP_BUILTIN_SLASH_COMMANDS: AvailableCommand[] = BUILTIN_SLASH_COMMAND_REGISTRY.filter(
+	command => command.handle !== undefined,
+).map(command => {
+	const hint = command.acpInputHint ?? command.inlineHint;
+	return {
+		name: command.name,
+		description: command.acpDescription ?? command.description,
+		input: hint ? { hint } : undefined,
+	};
+});
 
 const BUILTIN_SLASH_COMMAND_LOOKUP = new Map<string, SlashCommandSpec>();
 for (const command of BUILTIN_SLASH_COMMAND_REGISTRY) {

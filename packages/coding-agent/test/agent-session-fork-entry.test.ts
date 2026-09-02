@@ -146,4 +146,26 @@ describe("AgentSession exact-entry fork", () => {
 		expect(childRequest).not.toContain(discardedSteer);
 		expect(childRequest).not.toContain(discardedFollowUp);
 	});
+
+	it("rehydrates an unresolved pending delivery retained by an exact-entry fork", async () => {
+		manager.appendMessage({ role: "user", content: "keep", timestamp: 1 });
+		const pendingId = manager.appendCustomEntry("omp:pending-semantic-delivery", {
+			v: 1,
+			kind: "followUp",
+			message: {
+				role: "custom",
+				customType: "rpc",
+				content: "retained pending follow-up",
+				display: false,
+				attribution: "agent",
+				timestamp: 2,
+			},
+		});
+		await manager.flush();
+
+		expect(await session.fork(undefined, { entryId: pendingId })).toBe(true);
+		expect(session.agent.peekFollowUpQueue()).toContainEqual(
+			expect.objectContaining({ content: "retained pending follow-up" }),
+		);
+	});
 });

@@ -8,6 +8,7 @@ import { parseSkillInvocation } from "../../extensibility/skills";
 import type { AgentSession } from "../../session/agent-session";
 import { BLOB_HASH_RE, parseBlobRef } from "../../session/blob-store";
 import { isImageDataPayload, prepareEntryForPersistence } from "../../session/session-persistence";
+import { PENDING_SEMANTIC_DELIVERY_TYPE, SETTLED_SEMANTIC_DELIVERY_TYPE } from "../../session/session-entries";
 import {
 	getRpcHistoryChunk,
 	getRpcHistoryDigest,
@@ -430,7 +431,7 @@ function collectResponsesHistoryBlobHashes(providerPayload: unknown, hashes: Set
 			!isRecord(item) ||
 			item.type !== "image_generation_call" ||
 			typeof item.id !== "string" ||
-			item.status !== "completed"
+			typeof item.result !== "string"
 		) {
 			continue;
 		}
@@ -475,7 +476,24 @@ function collectMessageBlobHashes(message: unknown, hashes: Set<string>): void {
 	}
 }
 
-function collectEntryBlobHashes(entry: unknown, hashes: Set<string>): void {
+function collectSettledSemanticDeliveryIds(entries: readonly unknown[]): Set<string> {
+	const settled = new Set<string>();
+	for (const entry of entries) {
+		if (
+			!isRecord(entry) ||
+			entry.type !== "custom" ||
+			entry.customType !== SETTLED_SEMANTIC_DELIVERY_TYPE ||
+			!isRecord(entry.data) ||
+			typeof entry.data.pendingId !== "string"
+		) {
+			continue;
+		}
+		settled.add(entry.data.pendingId);
+	}
+	return settled;
+}
+
+function collectEntryBlobHashes(entry: unknown, hashes: Set<string>, settledPendingIds: ReadonlySet<string>): void {
 	if (!isRecord(entry)) return;
 	switch (entry.type) {
 		case "message":
@@ -484,6 +502,24 @@ function collectEntryBlobHashes(entry: unknown, hashes: Set<string>): void {
 		case "custom_message":
 			collectImageContentBlobHashes(entry.content, hashes);
 			return;
+		case "custom": {
+			const data = entry.data;
+			if (
+				entry.customType !== PENDING_SEMANTIC_DELIVERY_TYPE ||
+				typeof entry.id !== "string" ||
+				settledPendingIds.has(entry.id) ||
+				!isRecord(data) ||
+				data.v !== 1 ||
+				(data.kind !== "steer" && data.kind !== "followUp" && data.kind !== "explicitPrompt") ||
+				!isRecord(data.message) ||
+				data.message.role !== "custom" ||
+				!Array.isArray(data.message.content)
+			) {
+				return;
+			}
+			collectImageContentBlobHashes(data.message.content, hashes);
+			return;
+		}
 		case "compaction": {
 			const archive = isRecord(entry.preserveData) ? snapcompact.getPreservedArchive(entry.preserveData) : undefined;
 			if (archive) {
@@ -503,8 +539,9 @@ function activeSessionBlobHashes(session: AgentSession): Set<string> {
 	const blobStore = manager.getBlobStore();
 	const hashes = new Set<string>();
 	// Blob refs are capabilities: inspect only canonical image carriers after persistence.
-	for (const entry of manager.getBranch())
-		collectEntryBlobHashes(prepareEntryForPersistence(entry, blobStore), hashes);
+	const entries = manager.getBranch().map(entry => prepareEntryForPersistence(entry, blobStore));
+	const settledPendingIds = collectSettledSemanticDeliveryIds(entries);
+	for (const entry of entries) collectEntryBlobHashes(entry, hashes, settledPendingIds);
 	return hashes;
 }
 

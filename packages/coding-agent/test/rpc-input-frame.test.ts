@@ -29,12 +29,13 @@ const makeDeps = (
 		output: obj => {
 			outputs.push(obj as OutputFrame);
 		},
-		errorResponse: (id, command, message) => ({
+		errorResponse: (id, command, message, code) => ({
 			id,
 			type: "response",
 			command,
 			success: false,
 			error: message,
+			...(code ? { code } : {}),
 		}),
 		pendingExtensionRequests: options?.pendingExtensionRequests ?? new Map<string, PendingExtensionRequest>(),
 		onHostToolResult: () => {},
@@ -423,6 +424,81 @@ describe("RpcInputDispatcher", () => {
 
 		expect(started).toEqual(["stdin", "collab"]);
 		expect(outputs).toEqual([{ id: "stdin", type: "response", command: "set_auto_retry", success: true }]);
+	});
+
+	test("checks extension shutdown after a canonical response is sent exactly once", async () => {
+		let shutdownRequested = false;
+		let shutdowns = 0;
+		const order: string[] = [];
+		const shutdownCoordinator = new RpcShutdownCoordinator({
+			isShutdownRequested: () => shutdownRequested,
+			performShutdown: async () => {
+				order.push("shutdown");
+				shutdowns++;
+			},
+		});
+		const { deps } = makeDeps(async command => {
+			expect(command).toMatchObject({ id: "guest-extension", type: "prompt" });
+			// Mirrors a guest extension command calling pi.shutdown().
+			shutdownRequested = true;
+			return { id: command.id, type: "response", command: "prompt", success: true };
+		});
+		const dispatcher = new RpcInputDispatcher({
+			deps,
+			afterSerialCommand: () => shutdownCoordinator.checkShutdownRequested(),
+		});
+
+		const result = await dispatcher.dispatchCanonical({
+			id: "guest-extension",
+			type: "prompt",
+			message: "/guest-shutdown",
+		});
+		expect(result).toMatchObject({ response: { id: "guest-extension", success: true } });
+		if (!("afterResponse" in result)) throw new Error("Expected canonical response completion hook");
+		order.push("response");
+		await result.afterResponse?.();
+		await result.afterResponse?.();
+		await dispatcher.drain();
+
+		expect(order).toEqual(["response", "shutdown"]);
+		expect(shutdowns).toBe(1);
+	});
+
+	test("publishes canonical handler errors before deferred shutdown", async () => {
+		let shutdownRequested = false;
+		let shutdowns = 0;
+		const order: string[] = [];
+		const shutdownCoordinator = new RpcShutdownCoordinator({
+			isShutdownRequested: () => shutdownRequested,
+			performShutdown: async () => {
+				order.push("shutdown");
+				shutdowns++;
+			},
+		});
+		const { deps } = makeDeps(async () => {
+			shutdownRequested = true;
+			throw new Error("mutation outcome is unknown");
+		});
+		const dispatcher = new RpcInputDispatcher({
+			deps,
+			afterSerialCommand: () => shutdownCoordinator.checkShutdownRequested(),
+		});
+
+		const result = await dispatcher.dispatchCanonical({ id: "failed", type: "set_auto_retry", enabled: true });
+		expect(result).toMatchObject({
+			response: {
+				id: "failed",
+				success: false,
+				error: "mutation outcome is unknown",
+				code: "ambiguous",
+			},
+		});
+		if (!("afterResponse" in result)) throw new Error("Expected canonical response completion hook");
+		order.push("response");
+		await result.afterResponse?.();
+		await dispatcher.drain();
+		expect(order).toEqual(["response", "shutdown"]);
+		expect(shutdowns).toBe(1);
 	});
 
 	test("serial command rejection emits an error response and does not poison the queue", async () => {

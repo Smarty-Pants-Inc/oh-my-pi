@@ -349,7 +349,6 @@ describe("AgentSession.branchFromBtw", () => {
 	it("commits a /btw branch by discarding retained running work and its queued receipt", async () => {
 		const asyncManager = new AsyncJobManager({ retentionMs: 60_000 });
 		const observedContexts: string[] = [];
-		let activeSession: AgentSession;
 		const jobGate = Promise.withResolvers<string>();
 		const jobMarker = "/btw discarded deferred owner job";
 		const jobId = asyncManager.register("task", "retained /btw job", () => jobGate.promise, {
@@ -371,7 +370,7 @@ describe("AgentSession.branchFromBtw", () => {
 				},
 			),
 		} as unknown as ExtensionRunner;
-		activeSession = await createSession({
+		const activeSession = await createSession({
 			extensionRunner,
 			asyncJobManager: asyncManager,
 			handler: context => {
@@ -456,7 +455,6 @@ describe("AgentSession.branchFromBtw", () => {
 				updatedAt: 2,
 			},
 		};
-		let activeSession: AgentSession;
 		let replacementSessionFile: string | undefined;
 		let rollbackAtDispatch:
 			| {
@@ -525,7 +523,7 @@ describe("AgentSession.branchFromBtw", () => {
 				},
 			),
 		} as unknown as ExtensionRunner;
-		activeSession = await createSession({
+		const activeSession = await createSession({
 			extensionRunner,
 			advisorStreamFn: pendingAdvisor.mock.stream,
 			handler: primaryHandler,

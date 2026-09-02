@@ -446,13 +446,12 @@ describe("setup wizard short terminals", () => {
 		const ctx = shortTerminalCtx(24);
 		const allThemesLoaded = Promise.withResolvers<void>();
 		let waitForAllThemes = false;
-		let component: SetupWizardComponent;
 		ctx.ui.requestRender = () => {
 			if (!waitForAllThemes) return;
 			const frame = component.render(80).map(line => Bun.stripANSI(line));
 			if (frame.some(line => line.includes("Type to search"))) allThemesLoaded.resolve();
 		};
-		component = new SetupWizardComponent(ctx, [themeSetupScene]);
+		const component = new SetupWizardComponent(ctx, [themeSetupScene]);
 		void component.run();
 		component.handleInput("\r"); // splash → scene
 		const nowSpy = skipDissolve();

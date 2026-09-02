@@ -373,7 +373,7 @@ export interface RpcInputFrameDeps {
 		dispatchContext?: RpcCanonicalDispatchContext,
 	) => Promise<RpcResponse | RpcCommandDispatchResult>;
 	output: RpcOutput;
-	errorResponse: (id: string | undefined, command: string, message: string) => RpcResponse;
+	errorResponse: (id: string | undefined, command: string, message: string, code?: string) => RpcResponse;
 	trackBackgroundTask?: (task: Promise<void>) => void;
 	pendingExtensionRequests: Map<string, PendingExtensionRequest>;
 	onHostToolResult: (frame: RpcHostToolResult) => void;
@@ -485,7 +485,9 @@ export class RpcInputDispatcher {
 				return;
 			}
 
-			this.#track(this.#enqueue(command, () => this.#dispatchCommand(command)));
+			this.#track(
+				this.#enqueue(command, () => this.#dispatchWithSerialCompletion(() => this.#dispatchCommand(command))),
+			);
 		} catch (err: unknown) {
 			const message = err instanceof Error ? err.message : String(err);
 			this.#deps.output(this.#deps.errorResponse(undefined, "parse", `Failed to parse command: ${message}`));
@@ -498,8 +500,15 @@ export class RpcInputDispatcher {
 		dispatchContext?: RpcCanonicalDispatchContext,
 	): Promise<RpcResponse | RpcCommandDispatchResult> {
 		const task = this.#enqueue(command, async () => {
-			const rejection = dispatchContext?.validateExecution?.(command);
-			return rejection ?? this.#deps.handleCommand(command, dispatchContext);
+			try {
+				const rejection = dispatchContext?.validateExecution?.(command);
+				const handled = rejection ?? (await this.#deps.handleCommand(command, dispatchContext));
+				return this.#attachSerialCompletion(handled);
+			} catch (error: unknown) {
+				const message = error instanceof Error ? error.message : String(error);
+				const code = isRpcMutationCommand(command) ? "ambiguous" : "unavailable";
+				return this.#attachSerialCompletion(this.#deps.errorResponse(command.id, command.type, message, code));
+			}
 		});
 		this.#track(task);
 		return task;
@@ -539,6 +548,35 @@ export class RpcInputDispatcher {
 		);
 	}
 
+	async #dispatchWithSerialCompletion<T>(dispatch: () => Promise<T>): Promise<T> {
+		try {
+			return await dispatch();
+		} finally {
+			await this.#afterSerialCommand?.();
+		}
+	}
+
+	#attachSerialCompletion(result: RpcResponse | RpcCommandDispatchResult): RpcResponse | RpcCommandDispatchResult {
+		if (!this.#afterSerialCommand) return result;
+		const dispatchResult = "response" in result ? result : { response: result };
+		let completion: Promise<void> | undefined;
+		return {
+			response: dispatchResult.response,
+			afterResponse: () => {
+				if (!completion) {
+					completion = (async () => {
+						try {
+							await dispatchResult.afterResponse?.();
+						} finally {
+							await this.#afterSerialCommand?.();
+						}
+					})();
+				}
+				return completion;
+			},
+		};
+	}
+
 	async #dispatchCommand(command: RpcCommand): Promise<void> {
 		try {
 			const awaited = dispatchRpcInputFrame(command, this.#deps);
@@ -546,8 +584,6 @@ export class RpcInputDispatcher {
 		} catch (err: unknown) {
 			const message = err instanceof Error ? err.message : String(err);
 			await this.#deps.output(this.#deps.errorResponse(command.id, command.type, message));
-		} finally {
-			await this.#afterSerialCommand?.();
 		}
 	}
 }
