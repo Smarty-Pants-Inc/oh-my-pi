@@ -326,17 +326,28 @@ export async function executeRpcForkMutation(
 		return rpcSuccess(command.id, "fork", { sessionId: session.sessionId, cancelled: !forked });
 	});
 	const publish = publishSessionChange;
-	const durableSuccess =
+	const receipt = response.receipt;
+	const durableCompletedFork =
 		response.success &&
 		mutationCommandId !== undefined &&
-		response.receipt?.commandId === mutationCommandId &&
-		response.receipt?.operation === "fork";
+		receipt?.commandId === mutationCommandId &&
+		receipt.operation === "fork" &&
+		receipt.session.status === "completed";
 	if (!publish) {
-		if (!durableSuccess || !mutationCommandId) return { response };
+		if (!durableCompletedFork || !mutationCommandId) return { response };
 		const pendingActivation = pendingRpcForkActivations.get(session)?.get(mutationCommandId);
-		return pendingActivation ? { response, afterResponse: pendingActivation.afterResponse } : { response };
+		if (pendingActivation) return { response, afterResponse: pendingActivation.afterResponse };
+		if (receipt?.replayed && session.sessionId === receipt.session.sessionId) return { response };
+		return {
+			response: rpcError(
+				command.id,
+				"fork",
+				"Fork mutation completed without a recoverable session activation",
+				"ambiguous",
+			),
+		};
 	}
-	if (!mutationCommandId || !durableSuccess) return { response, afterResponse: publish };
+	if (!mutationCommandId || !durableCompletedFork) return { response, afterResponse: publish };
 
 	const activations = pendingRpcForkActivations.get(session) ?? new Map<string, PendingRpcForkActivation>();
 	pendingRpcForkActivations.set(session, activations);

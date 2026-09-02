@@ -636,7 +636,7 @@ describe("RpcMutationLedger", () => {
 		});
 	});
 
-	it("recovers a persisted fork activation from stored-success replay after response flush loss", async () => {
+	it("rejects fresh-session fork replay without activation while recovering the same-process continuation", async () => {
 		await withLedgerDb(async dbPath => {
 			let sessionId = "session-parent";
 			let forkCalls = 0;
@@ -682,6 +682,31 @@ describe("RpcMutationLedger", () => {
 				await expect(first).rejects.toThrow("synthetic flush failure");
 			} finally {
 				firstLedger.close();
+			}
+			expect(publications).toBe(0);
+
+			const restartedSession = {
+				sessionId: "session-parent",
+				async fork() {
+					throw new Error("stored fork replay must not execute again");
+				},
+			} as unknown as AgentSession;
+			const restartedLedger = new RpcMutationLedger(dbPath);
+			try {
+				const restartedReplay = await executeRpcForkMutation(
+					restartedSession,
+					{ ...command, id: "fork-restart-replay" },
+					restartedLedger,
+				);
+				expect(restartedReplay.response).toMatchObject({
+					id: "fork-restart-replay",
+					success: false,
+					code: "ambiguous",
+				});
+				expect("receipt" in restartedReplay.response).toBe(false);
+				expect(restartedReplay.afterResponse).toBeUndefined();
+			} finally {
+				restartedLedger.close();
 			}
 			expect(publications).toBe(0);
 

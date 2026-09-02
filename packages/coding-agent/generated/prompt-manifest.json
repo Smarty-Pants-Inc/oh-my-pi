@@ -8776,7 +8776,7 @@
     },
     {
       "path": "packages/coding-agent/src/modes/rpc/rpc-mode.ts",
-      "sha256": "0c403d51e77ea00352a49b981d37cb0c77b1dbfab480ecfba221dd4c116b1710"
+      "sha256": "fec74ece46d35e74296038ed5bf1b3c34a4f940d98beb0f8df8a6e541c8b85ac"
     },
     {
       "path": "packages/coding-agent/src/modes/rpc/rpc-mutation.ts",
@@ -11356,5 +11356,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "5c6ff3a19d22bdb333f8ee76ef2b5207e2b5c7519ffe99509b1430960f18bf9d"
+  "rootSha256": "44e5880665fa57d2162befbbbaeee0df27d33c1c8690a13336e63e83836ae3da"
 }
