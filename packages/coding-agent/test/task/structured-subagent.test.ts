@@ -347,6 +347,29 @@ describe("structured subagent primitive", () => {
 		).rejects.toThrow("within the active enabledModels scope");
 	});
 
+	it("keeps an unauthenticated explicit selector in the policy catalog", async () => {
+		const parent = model("parent", "parent");
+		const child = model("child", "child");
+		const modelRegistry = {
+			getAvailable: () => [parent],
+			getAll: () => [parent, child],
+			awaitBackgroundRefresh: async () => {},
+		} as unknown as ModelRegistry;
+		mockDiscovery();
+
+		const policy = await resolveEffectiveSubagentPolicy(
+			request({ session: session({ modelRegistry }), model: "child/child" }),
+		);
+
+		expect(policy.allowedModels?.map(candidate => `${candidate.provider}/${candidate.id}`)).toEqual([
+			"parent/parent",
+		]);
+		expect(policy.modelCandidates?.map(candidate => `${candidate.provider}/${candidate.id}`)).toEqual([
+			"parent/parent",
+			"child/child",
+		]);
+	});
+
 	it("rejects an explicit empty model selector before applying lower-precedence defaults", async () => {
 		const customAgent = { ...AGENT, model: ["@definition"] };
 		mockDiscovery(customAgent);

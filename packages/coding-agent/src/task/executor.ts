@@ -424,6 +424,8 @@ export interface ExecutorOptions {
 	modelSelectionExplicit?: boolean;
 	/** Models allowed by the parent session's path-scoped model policy. */
 	allowedModels?: Model<Api>[];
+	/** Models visible to explicit selectors, including unauthenticated providers within policy scope. */
+	modelCandidates?: Model<Api>[];
 
 	/**
 	 * Active model selector of the parent session, used as an auth-aware fallback
@@ -530,7 +532,6 @@ export interface ExecutorOptions {
 	parentArtifactManager?: ArtifactManager;
 	parentHindsightSessionState?: HindsightSessionState;
 	parentMnemopiSessionState?: MnemopiSessionState;
-	/** Parent agent's eval executor session id. Subagents reuse it so eval state is shared. */
 	parentEvalSessionId?: string;
 	/**
 	 * Parent agent's OpenTelemetry configuration. When defined, the subagent's
@@ -2875,6 +2876,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			checkAbort();
 
 			const availableModels = options.allowedModels ?? modelRegistry.getAvailable?.();
+			const modelCandidates = options.modelCandidates ?? availableModels;
 			const configuredModelPatterns = resolveConfiguredModelPatterns(modelPatterns, settings);
 			const inheritedRetryFallbackChain =
 				configuredModelPatterns.length === 1
@@ -2882,7 +2884,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 							subagentSettings,
 							modelRegistry,
 							modelRole ?? resolveExplicitModelRole(modelPatterns, subagentSettings),
-							availableModels,
+							modelCandidates,
 						)
 					: undefined;
 			const {
@@ -2899,6 +2901,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					settings,
 					id,
 					availableModels,
+					modelCandidates,
 				),
 			);
 			if (options.modelSelectionExplicit && modelPatterns.length > 0 && !model) {
@@ -2928,7 +2931,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					modelPatterns,
 					modelRegistry,
 					subagentSettings,
-					availableModels,
+					modelCandidates,
 				),
 				inheritedFallbackChain: inheritedRetryFallbackChain,
 				model,

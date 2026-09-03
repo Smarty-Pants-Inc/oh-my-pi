@@ -94,6 +94,27 @@ describe("issue #985: subagent dispatch auth fallback", () => {
 		expect(result.model?.id).toBe("deepseek-v4-pro");
 	});
 
+	test("falls back when the unauthenticated candidate is only in the policy catalog", async () => {
+		const registry = createMockRegistry({
+			models: [parentModel],
+			authedProviders: new Set(["deepseek"]),
+		});
+
+		const result = await resolveModelOverrideWithAuthFallback(
+			["qwen3.6-plus-free"],
+			"deepseek/deepseek-v4-pro",
+			registry,
+			undefined,
+			undefined,
+			[parentModel],
+			[parentModel, unauthedTaskModel],
+		);
+
+		expect(result.authFallbackUsed).toBe(true);
+		expect(result.model?.provider).toBe("deepseek");
+		expect(result.model?.id).toBe("deepseek-v4-pro");
+	});
+
 	test("tries later candidates in a configured role chain after an unauthenticated first candidate", async () => {
 		const settings = Settings.isolated({
 			modelRoles: { task: "qwen3.6-plus-free,deepseek/shared-id" },

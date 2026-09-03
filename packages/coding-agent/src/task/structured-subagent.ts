@@ -17,6 +17,7 @@ import {
 	resolveAllowedModels,
 	resolveConfiguredModelPatterns,
 	resolveModelOverride,
+	resolveModelPolicyModels,
 } from "../config/model-resolver";
 import type { LocalProtocolOptions } from "../internal-urls";
 import { registerArtifactsDir } from "../internal-urls/registry-helpers";
@@ -151,6 +152,8 @@ export interface EffectiveSubagentPolicy {
 	modelSelectionExplicit: boolean;
 	/** Models allowed by the active path-scoped policy, when a registry is available. */
 	allowedModels?: Model<Api>[];
+	/** Policy-visible models used to validate explicit selectors, including providers without credentials. */
+	modelCandidates?: Model<Api>[];
 	parentActiveModelPattern?: string;
 	schema: StructuredSubagentSchemaResolution;
 	planMode: boolean;
@@ -394,6 +397,7 @@ export async function resolveEffectiveSubagentPolicy(
 	const modelSelectionExplicit = modelSelectionSource !== "session";
 	const modelRegistry = request.session.modelRegistry;
 	let allowedModels: Model<Api>[] | undefined;
+	let modelCandidates: Model<Api>[] | undefined;
 	if (modelRegistry) {
 		await modelRegistry.awaitBackgroundRefresh?.();
 		allowedModels = await resolveAllowedModels(
@@ -401,8 +405,9 @@ export async function resolveEffectiveSubagentPolicy(
 			request.session.settings,
 			getModelMatchPreferences(request.session.settings),
 		);
+		modelCandidates = resolveModelPolicyModels(modelRegistry, request.session.settings);
 		if (modelOverride.length > 0) {
-			const resolved = resolveModelOverride(modelOverride, modelRegistry, request.session.settings, allowedModels);
+			const resolved = resolveModelOverride(modelOverride, modelRegistry, request.session.settings, modelCandidates);
 			if (!resolved.model) {
 				const scope =
 					request.session.settings.get("enabledModels").length > 0 ? " within the active enabledModels scope" : "";
@@ -457,6 +462,7 @@ export async function resolveEffectiveSubagentPolicy(
 		modelSelectionSource,
 		modelSelectionExplicit,
 		...(allowedModels ? { allowedModels } : {}),
+		...(modelCandidates ? { modelCandidates } : {}),
 		parentActiveModelPattern,
 		schema,
 		execution,
@@ -552,6 +558,7 @@ function buildExecutorOptions(
 		modelRole: policy.modelRole,
 		modelSelectionExplicit: policy.modelSelectionExplicit,
 		allowedModels: policy.allowedModels,
+		modelCandidates: policy.modelCandidates,
 		parentActiveModelPattern: policy.parentActiveModelPattern,
 		thinkingLevel: policy.effectiveAgent.thinkingLevel,
 		effort: request.effort,

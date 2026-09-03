@@ -1561,6 +1561,10 @@ export function resolveModelOverride(
  * Ordered selectors are tried in order; an unavailable candidate does not
  * prevent a later candidate from being used. The parent model is considered
  * only after every requested candidate is known but unauthenticated.
+ *
+ * `availableModels` is the auth-filtered set used for normal selection. When
+ * explicit selectors also need to see models without credentials, callers pass
+ * the policy-scoped `modelCandidates` catalog separately.
  */
 export async function resolveModelOverrideWithAuthFallback(
 	modelPatterns: string[],
@@ -1569,6 +1573,7 @@ export async function resolveModelOverrideWithAuthFallback(
 	settings?: Settings,
 	sessionId?: string,
 	availableModels?: Model<Api>[],
+	modelCandidates?: Model<Api>[],
 ): Promise<{
 	model?: Model<Api>;
 	thinkingLevel?: ConfiguredThinkingLevel;
@@ -1578,7 +1583,14 @@ export async function resolveModelOverrideWithAuthFallback(
 }> {
 	if (modelPatterns.length === 0) return { explicitThinkingLevel: false, authFallbackUsed: false };
 	const available = availableModels ?? modelRegistry.getAvailable();
+	const candidates = modelCandidates ?? available;
 	const orderedPatterns = modelPatterns.flatMap(pattern => resolveConfiguredModelPatterns(pattern, settings));
+	const resolveCandidate = (pattern: string) => {
+		const preferred = resolveModelOverride([pattern], modelRegistry, settings, available);
+		if (preferred.model && candidates.some(candidate => modelsAreEqual(candidate, preferred.model))) return preferred;
+		if (candidates === available) return preferred;
+		return resolveModelOverride([pattern], modelRegistry, settings, candidates);
+	};
 	let firstResolved:
 		| {
 				model?: Model<Api>;
@@ -1589,7 +1601,7 @@ export async function resolveModelOverrideWithAuthFallback(
 		| undefined;
 	let warning: string | undefined;
 	for (const pattern of orderedPatterns) {
-		const candidate = resolveModelOverride([pattern], modelRegistry, settings, available);
+		const candidate = resolveCandidate(pattern);
 		if (!warning && candidate.warning) warning = candidate.warning;
 		if (!candidate.model) continue;
 		firstResolved ??= candidate;
@@ -1605,7 +1617,7 @@ export async function resolveModelOverrideWithAuthFallback(
 	if (!parentActiveModelPattern) {
 		return { ...firstResolved, authFallbackUsed: false, warning: firstResolved.warning ?? warning };
 	}
-	const fallback = resolveModelOverride([parentActiveModelPattern], modelRegistry, settings, available);
+	const fallback = resolveCandidate(parentActiveModelPattern);
 	if (!fallback.model || modelsAreEqual(fallback.model, firstResolved.model)) {
 		return { ...firstResolved, authFallbackUsed: false, warning: firstResolved.warning ?? warning };
 	}
@@ -1807,14 +1819,14 @@ export async function resolveAllowedModels(
  * a UI picker should treat an empty list as "hide the picker entry", matching how the SDK
  * surfaces the same misconfiguration during session initialization.
  */
-export function filterAvailableModelsByEnabledPatterns(
-	available: Model<Api>[],
+function filterModelsByEnabledPatterns(
+	models: Model<Api>[],
 	patterns: readonly string[],
 	settings?: Settings,
 ): Model<Api>[] {
-	if (patterns.length === 0) return available;
+	if (patterns.length === 0) return models;
 
-	const context = buildPreferenceContext(available, undefined);
+	const context = buildPreferenceContext(models, undefined);
 	const allowedModels: Model<Api>[] = [];
 	const addAllowed = (model: Model<Api>) => {
 		allowedModels.push(model);
@@ -1822,7 +1834,7 @@ export function filterAvailableModelsByEnabledPatterns(
 
 	for (const pattern of patterns) {
 		if (pattern.includes("*") || pattern.includes("?") || pattern.includes("[")) {
-			for (const model of resolveGlobScopePattern(pattern, available).models) {
+			for (const model of resolveGlobScopePattern(pattern, models).models) {
 				addAllowed(model);
 			}
 			continue;
@@ -1830,18 +1842,45 @@ export function filterAvailableModelsByEnabledPatterns(
 
 		// Mirror resolveModelScope: role aliases resolve to the role's model.
 		if (settings && modelRoleAliasPrefixLength(pattern) !== undefined) {
-			const { model } = resolveModelRoleValue(pattern, available, { settings });
+			const { model } = resolveModelRoleValue(pattern, models, { settings });
 			if (model) addAllowed(model);
 			continue;
 		}
 
-		const { model } = parseModelPatternWithContext(pattern, available, context);
+		const { model } = parseModelPatternWithContext(pattern, models, context);
 		if (model) {
 			addAllowed(model);
 		}
 	}
 
-	return includeSyntheticAllowedModels(available, allowedModels);
+	return includeSyntheticAllowedModels(models, allowedModels);
+}
+
+export function filterAvailableModelsByEnabledPatterns(
+	available: Model<Api>[],
+	patterns: readonly string[],
+	settings?: Settings,
+): Model<Api>[] {
+	return filterModelsByEnabledPatterns(available, patterns, settings);
+}
+
+/**
+ * Resolve the model catalog visible to explicit selectors under the active
+ * provider and enabled-model policy. Unlike {@link resolveAllowedModels}, this
+ * retains models whose providers have no credentials so auth-aware dispatch can
+ * inspect them before falling back to the parent's authenticated model.
+ *
+ * A registry without `getAll` is supported for lightweight embedding/test
+ * facades and naturally falls back to its auth-filtered model set.
+ */
+export function resolveModelPolicyModels(
+	modelRegistry: Pick<ModelRegistry, "getAvailable"> & Partial<Pick<ModelRegistry, "getAll">>,
+	settings?: Settings,
+): Model<Api>[] {
+	const allModels = modelRegistry.getAll?.() ?? modelRegistry.getAvailable();
+	const disabledProviders = new Set(settings?.get("disabledProviders") ?? []);
+	const visibleModels = allModels.filter(model => !disabledProviders.has(model.provider));
+	return filterModelsByEnabledPatterns(visibleModels, settings?.get("enabledModels") ?? [], settings);
 }
 function findExactCliModel(
 	selector: string,
