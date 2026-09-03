@@ -83,8 +83,8 @@ describe("tracked context manifest", () => {
 
 	it("accepts only the active immutable materialized Stack package", async () => {
 		const repositoryRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-materialized-extension-"));
-		const stackRoot = path.join(repositoryRoot, "home/.smarty-stack");
-		const packageRoot = path.join(stackRoot, "versions/0.20.11");
+		const stackRoot = path.join(repositoryRoot, "home/.smarty/stack");
+		const packageRoot = path.join(stackRoot, "versions/0.20.12");
 		const currentRoot = path.join(stackRoot, "current");
 		const relativeEntry = "extensions/smarty-prompt-guard/src/index.ts";
 		const entryPath = path.join(packageRoot, relativeEntry);
@@ -104,7 +104,7 @@ describe("tracked context manifest", () => {
 			await fs.mkdir(path.dirname(entryPath), { recursive: true });
 			const provenance = {
 				schema: "smarty.stack.provenance.v1",
-				version: "0.20.11",
+				version: "0.20.12",
 				repository,
 				commit,
 				tree,
@@ -134,7 +134,7 @@ describe("tracked context manifest", () => {
 			}
 			const manifest = {
 				schema: "smarty.stack.release_manifest.v1",
-				version: "0.20.11",
+				version: "0.20.12",
 				createdAt: "2026-08-22",
 				status: "protected_candidate_requires_external_approval",
 				files: [...files]
@@ -155,7 +155,7 @@ describe("tracked context manifest", () => {
 				.map(([relative, digest]) => `${digest}  ${relative}`)
 				.join("\n");
 			await Bun.write(path.join(packageRoot, "SHA256SUMS.txt"), `${checksums}\n`);
-			await fs.symlink(path.join("versions", "0.20.11"), currentRoot);
+			await fs.symlink(path.join("versions", "0.20.12"), currentRoot);
 			const result = Bun.spawnSync(["git", "init", "-q"], { cwd: repositoryRoot, stdout: "pipe", stderr: "pipe" });
 			expect(result.exitCode).toBe(0);
 			const release = {
@@ -167,6 +167,9 @@ describe("tracked context manifest", () => {
 			await chmodTree(packageRoot, 0o555, 0o444);
 			expect(await isApprovedCandidateSource(entryPath, release)).toBe(false);
 			expect(await isApprovedCandidateSource(currentEntryPath, release)).toBe(true);
+			const legacyRoot = path.join(repositoryRoot, "home/.smarty-stack");
+			await fs.symlink(path.join(".smarty", "stack"), legacyRoot);
+			expect(await isApprovedCandidateSource(path.join(legacyRoot, "current", relativeEntry), release)).toBe(false);
 		} finally {
 			try {
 				await chmodTree(packageRoot, 0o755, 0o644);
@@ -228,11 +231,11 @@ describe("tracked context manifest", () => {
 				Bun.write(path.join(repositoryRoot, ".gitignore"), "packages/plugin/src/store.js\n"),
 				Bun.write(
 					path.join(packageRoot, "MANIFEST.json"),
-					'{"schema":"smarty.stack.release_manifest.v1","version":"0.20.11","createdAt":"2026-08-22","status":"protected_candidate_requires_external_approval","files":[]}\n',
+					'{"schema":"smarty.stack.release_manifest.v1","version":"0.20.12","createdAt":"2026-08-22","status":"protected_candidate_requires_external_approval","files":[]}\n',
 				),
 				Bun.write(
 					path.join(packageRoot, "PROVENANCE.json"),
-					'{"schema":"smarty.stack.provenance.v1","version":"0.20.11","repository":"Smarty-Pants-Inc/smarty-dev","commit":null,"tree":null,"createdAt":"2026-08-22","purpose":"test","sources":[],"authority":"test","recovery":"test","nonclaims":[]}\n',
+					'{"schema":"smarty.stack.provenance.v1","version":"0.20.12","repository":"Smarty-Pants-Inc/smarty-dev","commit":null,"tree":null,"createdAt":"2026-08-22","purpose":"test","sources":[],"authority":"test","recovery":"test","nonclaims":[]}\n',
 				),
 				Bun.write(path.join(packageRoot, "SHA256SUMS.txt"), ""),
 			]);

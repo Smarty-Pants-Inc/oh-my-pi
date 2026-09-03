@@ -78,9 +78,9 @@ function writeMaterializedPromptBuilderPackage(
 	const repository = "Smarty-Pants-Inc/smarty-stack";
 	const commit = "a".repeat(40);
 	const tree = "b".repeat(40);
-	const version = "0.20.11";
+	const version = "0.20.12";
 	const createdAt = "2026-08-22";
-	const stackRoot = path.join(root, ".smarty-stack");
+	const stackRoot = path.join(root, ".smarty/stack");
 	const packageRoot = path.join(stackRoot, "versions", version);
 	const currentRoot = path.join(stackRoot, "current");
 	const sourcePath = "extensions/smarty-prompt-guard/src/index.ts";
