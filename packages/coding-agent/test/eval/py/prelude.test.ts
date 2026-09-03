@@ -43,10 +43,40 @@ describe("python prelude", () => {
 		expect(signature).toContain("limit");
 	});
 
-	it("exposes the per-call model keyword on agent()", () => {
-		const match = PYTHON_PRELUDE.match(/def\s+agent\([\s\S]*?\n\s*\):/);
-		expect(match?.[0]).toContain("model=None");
-		expect(PYTHON_PRELUDE).toContain('args["model"] = model');
+	it("forwards the per-call model keyword through the agent bridge", async () => {
+		const requests: unknown[] = [];
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch: async request => {
+				expect(new URL(request.url).pathname).toBe("/v1/tool");
+				requests.push(await request.json());
+				return Response.json({
+					ok: true,
+					value: { text: "child output" },
+				});
+			},
+		});
+
+		try {
+			const result = await runPrelude('print(agent("do work", model="smoke/child"))', {
+				PI_TOOL_BRIDGE_URL: server.url.toString(),
+				PI_TOOL_BRIDGE_TOKEN: "test-token",
+				PI_TOOL_BRIDGE_SESSION: "test-session",
+			});
+
+			expect(result).toEqual({ stdout: "child output\n", stderr: "", exitCode: 0 });
+			expect(requests).toEqual([
+				{
+					session: "test-session",
+					run: null,
+					name: "__agent__",
+					args: { prompt: "do work", model: "smoke/child", agent: "task" },
+				},
+			]);
+		} finally {
+			server.stop(true);
+		}
 	});
 
 	it("appends line selectors to delegated URI paths", async () => {
