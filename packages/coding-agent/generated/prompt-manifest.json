@@ -2684,7 +2684,7 @@
       "visibility": "model",
       "defaultEnabled": true,
       "order": 2220,
-      "sha256": "73aaea628489a3586dde784a1ebe3d39354d0828a4c5c339f8b48cd973f97cda"
+      "sha256": "af877aad17a366c8d51909bf2118a343f10ef1cd06fbde1ebb05a8c02c32e76e"
     },
     {
       "id": "tool.eval-code-mode",
@@ -3060,7 +3060,7 @@
       "visibility": "model",
       "defaultEnabled": true,
       "order": 2500,
-      "sha256": "2e83f463fbe532bce20d89e09789782183a7bc633a2bd09b969fb9d0e23f19f4"
+      "sha256": "071fbf509f0ebf2019d347653915d5e4438bc2eefb30ba63a039bac5c99850bc"
     },
     {
       "id": "tool.task-async-contract",
@@ -3424,7 +3424,7 @@
     },
     {
       "id": "tool.eval",
-      "descriptionSha256": "4e430d333b83a8ae7b8f289c6188f8c5ec6671d0405145058da08964e84d09a8",
+      "descriptionSha256": "33f6f272f227d9aad512ccaf6d90444581a8dee7712ad092204159c77792261c",
       "schemaSha256": "3974f0dba834dc8866a31d34439b27541a14bb9c9f911e71d19a0232aa4425ff"
     },
     {
@@ -4584,7 +4584,7 @@
     },
     {
       "path": "docs/python-repl.md",
-      "sha256": "21c73af7fed00cb8b18747c954399f47b5cb8c569b7ae14b31784bf34dd6b379"
+      "sha256": "0f456faf06f82d0f865981e0f07555ddfa7ab9ad3546612a6e68a568c275c0a9"
     },
     {
       "path": "docs/resolve-tool-runtime.md",
@@ -4664,7 +4664,7 @@
     },
     {
       "path": "docs/task-agent-discovery.md",
-      "sha256": "f4ca61d900aa1830372055c28a95f3b340f4058fd95f00ce937c16d100294586"
+      "sha256": "c5a3b2bf8746ab84e22de260e6c7d2b79bc68008587060de14f898c77e214696"
     },
     {
       "path": "docs/theme.md",
@@ -4756,7 +4756,7 @@
     },
     {
       "path": "docs/tools/eval.md",
-      "sha256": "a96b7a02f104d494f50485f75c9bf9559886d2de19c2d3bf83fea8479dabfe13"
+      "sha256": "051bc186f9b170b99c673e5d9b8721d1a214c4298efae8564606479a3f6a6499"
     },
     {
       "path": "docs/tools/generate_image.md",
@@ -4824,7 +4824,7 @@
     },
     {
       "path": "docs/tools/task.md",
-      "sha256": "1a2628f03732c96ddf251a98f314a1d46b935fc78e326d7ad1f49f3526ab3ccf"
+      "sha256": "277d81810b198362000f96585b0baaf49f1f2e4888da08c89d1ae63c84b442b1"
     },
     {
       "path": "docs/tools/todo.md",
@@ -7592,7 +7592,7 @@
     },
     {
       "path": "packages/coding-agent/src/eval/agent-bridge.ts",
-      "sha256": "996a6be5d05e88de53a37176ae3ddb587aef283025695e2c97998c85152e0ab4"
+      "sha256": "4b85fadc1319498fbc893701ad559da02bb48892ab64701d66e3b5c0bb64c350"
     },
     {
       "path": "packages/coding-agent/src/eval/backend-helpers.ts",
@@ -7644,7 +7644,7 @@
     },
     {
       "path": "packages/coding-agent/src/eval/jl/prelude.jl",
-      "sha256": "f463acb91d1be45b9ef5c3e50602571683a60c1c17a276a34cdcf80b0ed98484"
+      "sha256": "ab51b785c3650f7e0015e4bd5927772703cde893d4ad062d31b906f81845c810"
     },
     {
       "path": "packages/coding-agent/src/eval/jl/prelude.ts",
@@ -7692,7 +7692,7 @@
     },
     {
       "path": "packages/coding-agent/src/eval/js/shared/prelude.txt",
-      "sha256": "6eb651666a3f180533284e6e3a1a9f68437ecd767bc6825f634f864c98fa9706"
+      "sha256": "75f5c0e360851ec1c8970df9e6f1ce20637e6c5677330b17dc27c45b657c1a75"
     },
     {
       "path": "packages/coding-agent/src/eval/js/shared/rewrite-imports.ts",
@@ -7744,7 +7744,7 @@
     },
     {
       "path": "packages/coding-agent/src/eval/py/prelude.py",
-      "sha256": "66c2eada3277d5a78450f091a673db3bef210e7a9a9e36b9f0408d31f85515e0"
+      "sha256": "27ababcefeede6af2392db0e9ad3af53a0ee107098f3485c420cbe22e2112698"
     },
     {
       "path": "packages/coding-agent/src/eval/py/prelude.ts",
@@ -7780,7 +7780,7 @@
     },
     {
       "path": "packages/coding-agent/src/eval/rb/prelude.rb",
-      "sha256": "fe3568b8b27a0ac85a0c1d51a11b9e0d250e82f22b0529f2c0dae63845f09261"
+      "sha256": "53b19dca5153003fdf23ca30b6c8dad6322137a61efac10a820e49c317fd21ef"
     },
     {
       "path": "packages/coding-agent/src/eval/rb/prelude.ts",
@@ -9492,7 +9492,7 @@
     },
     {
       "path": "packages/coding-agent/src/task/executor.ts",
-      "sha256": "120fa8d6b51f5c75b8e2a29de05bbf9d358e38d7293c2c18f807776c793e5d1d"
+      "sha256": "edd108c6c86bc56d2771d11d3982755d971d38c6b4c1a158dea774538b6057be"
     },
     {
       "path": "packages/coding-agent/src/task/index.ts",
@@ -9560,7 +9560,7 @@
     },
     {
       "path": "packages/coding-agent/src/task/structured-subagent.ts",
-      "sha256": "2355b09a6a7768910679bb0998730140bd4959731cd58fe238481f08db76dca2"
+      "sha256": "270c4caa39ff58e6b0ef2dcceffbcc7a14ea08e5a3eca707904e87a6ad66588c"
     },
     {
       "path": "packages/coding-agent/src/task/subprocess-tool-registry.ts",
@@ -9568,7 +9568,7 @@
     },
     {
       "path": "packages/coding-agent/src/task/types.ts",
-      "sha256": "3e9010d3bc6e4223fd53e2c9ff7a4a94ef21e97582d411329aade3f2242049fa"
+      "sha256": "32754c744d03440170310aaf63a7707372859a5d11c6e0c0b514f5f1cd85a76d"
     },
     {
       "path": "packages/coding-agent/src/task/worktree.ts",

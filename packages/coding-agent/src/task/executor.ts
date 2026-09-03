@@ -16,6 +16,7 @@ import { ModelRegistry } from "../config/model-registry";
 import {
 	formatModelSelectorValue,
 	formatModelStringWithRouting,
+	normalizeModelPatternList,
 	resolveAgentAdvisorSelection,
 	resolveAgentPrewalkPattern,
 	resolveConfiguredModelPatterns,
@@ -159,17 +160,6 @@ const agentEventTypes = new Set<AgentEvent["type"]>([
 const isAgentEvent = (event: AgentSessionEvent): event is AgentEvent =>
 	agentEventTypes.has(event.type as AgentEvent["type"]);
 
-function normalizeModelPatterns(value: string | string[] | undefined): string[] {
-	if (!value) return [];
-	if (Array.isArray(value)) {
-		return value.map(entry => entry.trim()).filter(Boolean);
-	}
-	return value
-		.split(",")
-		.map(entry => entry.trim())
-		.filter(Boolean);
-}
-
 const SUBAGENT_RETRY_FALLBACK_ROLE_PREFIX = "subagent:";
 
 interface SubagentRetryFallbackCandidate {
@@ -181,12 +171,13 @@ function resolveSubagentRetryFallbackCandidates(
 	modelPatterns: string[],
 	modelRegistry: ModelRegistry,
 	settings: Settings,
+	availableModels?: Model<Api>[],
 ): SubagentRetryFallbackCandidate[] {
 	const candidates: SubagentRetryFallbackCandidate[] = [];
 	const seen = new Set<string>();
 	const disabledProviders = new Set(settings.get("disabledProviders"));
 	for (const pattern of modelPatterns) {
-		const resolved = resolveModelOverride([pattern], modelRegistry, settings);
+		const resolved = resolveModelOverride([pattern], modelRegistry, settings, availableModels);
 		if (!resolved.model) continue;
 		if (disabledProviders.has(resolved.model.provider)) continue;
 		const selector = resolved.explicitThinkingLevel
@@ -219,6 +210,7 @@ function resolveSubagentInheritedRetryFallbackChain(
 	settings: Settings,
 	modelRegistry: ModelRegistry,
 	role: string | undefined,
+	availableModels?: Model<Api>[],
 ): string[] | undefined {
 	const configuredChains = settings.get("retry.fallbackChains");
 	// An explicitly emptied role chain means "no fallbacks", not "inherit
@@ -233,7 +225,7 @@ function resolveSubagentInheritedRetryFallbackChain(
 	}
 	const disabledProviders = new Set(settings.get("disabledProviders"));
 	return fallbackChain.filter(entry => {
-		const resolved = resolveModelOverride([entry], modelRegistry, settings);
+		const resolved = resolveModelOverride([entry], modelRegistry, settings, availableModels);
 		return !resolved.model || !disabledProviders.has(resolved.model.provider);
 	});
 }
@@ -428,6 +420,11 @@ export interface ExecutorOptions {
 	modelOverride?: string | string[];
 	/** Explicit pre-expansion model role alias selected for this run. */
 	modelRole?: string;
+	/** Whether model patterns came from an explicit request, settings, or agent. */
+	modelSelectionExplicit?: boolean;
+	/** Models allowed by the parent session's path-scoped model policy. */
+	allowedModels?: Model<Api>[];
+
 	/**
 	 * Active model selector of the parent session, used as an auth-aware fallback
 	 * if the resolved subagent model has no working credentials. See #985.
@@ -2750,7 +2747,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		toolNames = Array.from(new Set(expanded));
 	}
 
-	const modelPatterns = normalizeModelPatterns(modelOverride ?? agent.model);
+	const modelPatterns = normalizeModelPatternList(modelOverride ?? agent.model);
 	const sessionFile = subtaskSessionFile ?? null;
 	const spawnsEnv = !subagentRuntimeAllows(runtimeProfile, "spawns")
 		? ""
@@ -2873,8 +2870,11 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			} else {
 				logger.debug("runSubagent: reusing parent modelRegistry; skipping refresh");
 			}
+			const backgroundRefresh = modelRegistry.awaitBackgroundRefresh?.();
+			if (backgroundRefresh) await awaitAbortable(backgroundRefresh);
 			checkAbort();
 
+			const availableModels = options.allowedModels ?? modelRegistry.getAvailable?.();
 			const configuredModelPatterns = resolveConfiguredModelPatterns(modelPatterns, settings);
 			const inheritedRetryFallbackChain =
 				configuredModelPatterns.length === 1
@@ -2882,6 +2882,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 							subagentSettings,
 							modelRegistry,
 							modelRole ?? resolveExplicitModelRole(modelPatterns, subagentSettings),
+							availableModels,
 						)
 					: undefined;
 			const {
@@ -2897,8 +2898,14 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					modelRegistry,
 					settings,
 					id,
+					availableModels,
 				),
 			);
+			if (options.modelSelectionExplicit && modelPatterns.length > 0 && !model) {
+				throw new Error(
+					`Requested subagent model selector did not resolve to an available model: ${modelPatterns.join(", ")}`,
+				);
+			}
 			if (modelResolutionWarning) {
 				logger.warn("Subagent model resolution warning", {
 					warning: modelResolutionWarning,
@@ -2906,6 +2913,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				});
 			}
 			if (authFallbackUsed && model) {
+				progress.resolvedModelIsFallback = true;
 				logger.warn("Subagent model has no working credentials; falling back to parent session model", {
 					requested: modelPatterns,
 					parentModel: options.parentActiveModelPattern,
@@ -2916,7 +2924,12 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			const retryFallbackRole = installSubagentRetryFallbackChain({
 				settings: subagentSettings,
 				id,
-				candidates: resolveSubagentRetryFallbackCandidates(modelPatterns, modelRegistry, subagentSettings),
+				candidates: resolveSubagentRetryFallbackCandidates(
+					modelPatterns,
+					modelRegistry,
+					subagentSettings,
+					availableModels,
+				),
 				inheritedFallbackChain: inheritedRetryFallbackChain,
 				model,
 				authFallbackUsed,
@@ -2976,9 +2989,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				settingsOverride: settings.get("task.agentPrewalk")[agent.name],
 				agentPrewalk: resolveAgentPrewalkDefault(agent, settings.get("task.prewalk")),
 			});
-			if (prewalkPattern && subagentRuntimeAllows(runtimeProfile, "prewalk")) {
-				await awaitAbortable(modelRegistry.awaitBackgroundRefresh());
-				const resolvedPrewalk = resolveModelOverride([prewalkPattern], modelRegistry, settings);
+			if (prewalkPattern && subagentRuntimeAllows(runtimeProfile, "prewalk") && availableModels) {
+				const resolvedPrewalk = resolveModelOverride([prewalkPattern], modelRegistry, settings, availableModels);
 				const target = resolvedPrewalk.model;
 				if (!target || !modelRegistry.hasConfiguredAuth(target)) {
 					logger.warn("Subagent prewalk target unavailable; skipping prewalk", {
@@ -3091,6 +3103,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					settings: subagentSettings,
 					executionEnvironment: options.executionEnvironment,
 					model,
+					initialModelFallback: authFallbackUsed,
 					modelPattern: model || modelOverride === undefined ? undefined : modelPatterns,
 					modelPatternAuthFallback:
 						model || modelOverride === undefined ? undefined : options.parentActiveModelPattern,

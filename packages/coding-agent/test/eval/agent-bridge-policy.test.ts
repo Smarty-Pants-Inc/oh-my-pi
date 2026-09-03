@@ -309,19 +309,54 @@ describe("runEvalAgent", () => {
 		expect(secondOptions.outputSchemaOverridesAgent).toBeUndefined();
 	});
 
-	it("drops a per-call model argument on agent() (removed, issue #6438)", async () => {
+	it("forwards a per-call model argument ahead of agent defaults", async () => {
 		mockAgents();
 		const runSpy = vi.spyOn(taskExecutor, "runSubprocess").mockImplementation(async options => singleResult(options));
 
-		// The schema strips unknown keys; a legacy `model` argument is silently
-		// discarded so resolution is identical to omitting it — the agent's own
-		// frontmatter model applies (issue #6438).
-		await runEvalAgent({ prompt: "work", model: "default" }, { session: makeSession() });
-		await runEvalAgent({ prompt: "work" }, { session: makeSession() });
+		await runEvalAgent({ prompt: "work", model: "p/request" }, { session: makeSession() });
+		await runEvalAgent({ prompt: "work", model: ["p/first", "p/second"] }, { session: makeSession() });
 
-		const withModel = runSpy.mock.calls[0]?.[0];
-		const withoutModel = runSpy.mock.calls[1]?.[0];
-		expect(withModel?.modelOverride).toEqual(withoutModel?.modelOverride);
+		expect(runSpy.mock.calls[0]?.[0].modelOverride).toEqual(["p/request"]);
+		expect(runSpy.mock.calls[1]?.[0].modelOverride).toEqual(["p/first", "p/second"]);
+	});
+
+	it("exposes auth fallback state in eval progress and result details", async () => {
+		mockAgents();
+		const statuses: unknown[] = [];
+		const runSpy = vi.spyOn(taskExecutor, "runSubprocess").mockImplementation(async options => {
+			options.onProgress?.({
+				index: options.index,
+				id: options.id,
+				agent: options.agent.name,
+				agentSource: options.agent.source,
+				status: "running",
+				task: options.task,
+				assignment: options.assignment,
+				recentTools: [],
+				recentOutput: [],
+				toolCount: 0,
+				requests: 0,
+				tokens: 0,
+				cost: 0,
+				durationMs: 0,
+				resolvedModel: "p/parent",
+				resolvedModelIsFallback: true,
+			});
+			return singleResult(options, {
+				resolvedModel: "p/parent",
+				resolvedModelIsFallback: true,
+			});
+		});
+
+		const result = await runEvalAgent(
+			{ prompt: "work", model: "p/request" },
+			{ session: makeSession(), emitStatus: event => statuses.push(event) },
+		);
+
+		expect(runSpy).toHaveBeenCalledTimes(1);
+		expect(statuses).toContainEqual(expect.objectContaining({ model: "p/parent", modelFallback: true }));
+		expect(result.details.model).toBe("p/parent");
+		expect(result.details.modelFallback).toBe(true);
 	});
 	it("returns host-parsed data for caller, agent, and inherited schemas", async () => {
 		const agentSchema = { type: "object" };

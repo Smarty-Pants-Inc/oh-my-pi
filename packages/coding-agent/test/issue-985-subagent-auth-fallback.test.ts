@@ -6,6 +6,7 @@ import {
 	type ModelLookupRegistry,
 	resolveModelOverrideWithAuthFallback,
 } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 
 /**
  * Regression test for #985.
@@ -93,6 +94,27 @@ describe("issue #985: subagent dispatch auth fallback", () => {
 		expect(result.model?.id).toBe("deepseek-v4-pro");
 	});
 
+	test("tries later candidates in a configured role chain after an unauthenticated first candidate", async () => {
+		const settings = Settings.isolated({
+			modelRoles: { task: "qwen3.6-plus-free,deepseek/shared-id" },
+		});
+		const registry = createMockRegistry({
+			models: [parentModel, unauthedTaskModel, sharedModel],
+			authedProviders: new Set(["deepseek"]),
+		});
+
+		const result = await resolveModelOverrideWithAuthFallback(
+			["@task"],
+			"deepseek/deepseek-v4-pro",
+			registry,
+			settings,
+		);
+
+		expect(result.authFallbackUsed).toBe(false);
+		expect(result.model?.provider).toBe("deepseek");
+		expect(result.model?.id).toBe("shared-id");
+	});
+
 	test("does not fall back when resolved subagent model has working auth", async () => {
 		const registry = createMockRegistry({
 			models: [parentModel, unauthedTaskModel],
@@ -176,14 +198,36 @@ describe("issue #985: subagent dispatch auth fallback", () => {
 		expect(result.model?.provider).toBe("opencode-zen");
 		expect(result.model?.id).toBe("qwen3.6-plus-free");
 	});
+	test("falls back to a keyless parent model when the requested model has no auth", async () => {
+		const localParent = buildModel({
+			id: "local-model",
+			name: "Local Model",
+			api: "openai-completions",
+			provider: "ollama",
+			baseUrl: "http://127.0.0.1:11434/v1",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128000,
+			maxTokens: 8192,
+		});
+		const registry: ModelLookupRegistry & { getApiKey(model: Model<Api>): Promise<string | undefined> } = {
+			getAvailable: () => [localParent, unauthedTaskModel],
+			getApiKey: async (model: Model<Api>) => (model.provider === "ollama" ? kNoAuth : undefined),
+		} as never;
+
+		const result = await resolveModelOverrideWithAuthFallback(["qwen3.6-plus-free"], "ollama/local-model", registry);
+
+		expect(result.authFallbackUsed).toBe(true);
+		expect(result.model?.provider).toBe("ollama");
+		expect(result.model?.id).toBe("local-model");
+	});
 });
 
 describe("issue #5325: sessionId forwarded to getApiKey for session-sticky OAuth", () => {
-	// The pre-flight auth check in resolveModelOverrideWithAuthFallback calls
-	// getApiKey without a session id. For providers with session-sticky OAuth
-	// credentials, this can return undefined even though the credential is
-	// usable once the subagent session starts. The fix forwards a sessionId
-	// so session-sticky credentials resolve during the pre-flight check.
+	// The pre-flight auth check in resolveModelOverrideWithAuthFallback forwards the
+	// child session id. For providers with session-sticky OAuth credentials, this
+	// lets the check recognize a credential that is usable once the subagent starts.
 	test("forwards sessionId to getApiKey for the primary model", async () => {
 		let receivedSessionId: string | undefined;
 		const registry: ModelLookupRegistry & { getApiKey(model: Model<Api>): Promise<string | undefined> } = {

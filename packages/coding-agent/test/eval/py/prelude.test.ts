@@ -43,6 +43,12 @@ describe("python prelude", () => {
 		expect(signature).toContain("limit");
 	});
 
+	it("exposes the per-call model keyword on agent()", () => {
+		const match = PYTHON_PRELUDE.match(/def\s+agent\([\s\S]*?\n\s*\):/);
+		expect(match?.[0]).toContain("model=None");
+		expect(PYTHON_PRELUDE).toContain('args["model"] = model');
+	});
+
 	it("appends line selectors to delegated URI paths", async () => {
 		const requests: unknown[] = [];
 		const server = Bun.serve({

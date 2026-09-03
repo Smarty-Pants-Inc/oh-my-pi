@@ -495,6 +495,7 @@ if "__omp_prelude_loaded__" not in globals():
         apply=None,
         merge=None,
         handle=False,
+        model=None,
     ):
         """Run a subagent and return its final output or structured data.
 
@@ -503,6 +504,8 @@ if "__omp_prelude_loaded__" not in globals():
         reference and metadata, with parsed data under `"data"` when available.
         """
         args = {"prompt": prompt}
+        if model is not None:
+            args["model"] = model
         if agent is not None:
             args["agent"] = agent
         if label is not None:

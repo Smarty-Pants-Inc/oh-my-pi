@@ -1050,7 +1050,11 @@ function getModelRoleAlias(value: string, settings?: ModelRoleLookup): string | 
 /** Normalize comma-separated or array model selectors into an ordered pattern list. */
 export function normalizeModelPatternList(value: string | string[] | undefined): string[] {
 	if (!value) return [];
-	const patterns = Array.isArray(value) ? value.flatMap(pattern => pattern.split(",")) : value.split(",");
+	const patterns = Array.isArray(value)
+		? value.flatMap(pattern => (typeof pattern === "string" ? pattern.split(",") : []))
+		: typeof value === "string"
+			? value.split(",")
+			: [];
 	return patterns.map(pattern => pattern.trim()).filter(Boolean);
 }
 
@@ -1223,6 +1227,7 @@ export interface AgentModelPatternResolutionOptions {
 
 interface EffectiveAgentModelSelection {
 	source?: string | string[];
+	sourceKind: AgentModelSelectionSource;
 	patterns: string[];
 }
 
@@ -1233,12 +1238,12 @@ function resolveEffectiveAgentModelSelection(
 
 	const requestPatterns = resolveConfiguredModelPatterns(requestModel, settings);
 	if (requestPatterns.length > 0) {
-		return { source: requestModel, patterns: requestPatterns };
+		return { source: requestModel, sourceKind: "request", patterns: requestPatterns };
 	}
 
 	const overridePatterns = resolveConfiguredModelPatterns(settingsOverride, settings);
 	if (overridePatterns.length > 0) {
-		return { source: settingsOverride, patterns: overridePatterns };
+		return { source: settingsOverride, sourceKind: "settings", patterns: overridePatterns };
 	}
 
 	const normalizedAgentPatterns = normalizeModelPatternList(agentModel);
@@ -1250,15 +1255,19 @@ function resolveEffectiveAgentModelSelection(
 			singleAgentPattern === formatModelRoleAlias("task") ||
 			singleAgentPattern === `${LEGACY_MODEL_ROLE_ALIAS_PREFIX}task`
 		) {
-			return { source: agentModel, patterns: configuredAgentPatterns };
+			return { source: agentModel, sourceKind: "agent", patterns: configuredAgentPatterns };
 		}
-		if (!agentInheritsSessionModel) return { source: agentModel, patterns: configuredAgentPatterns };
+		if (!agentInheritsSessionModel)
+			return { source: agentModel, sourceKind: "agent", patterns: configuredAgentPatterns };
 	}
 
 	const fallback =
 		activeModelPattern?.trim() || fallbackModelPattern?.trim() || settings?.getModelRole("default")?.trim() || "";
-	return { patterns: resolveConfiguredModelPatterns(fallback, settings) };
+	return { sourceKind: "session", patterns: resolveConfiguredModelPatterns(fallback, settings) };
 }
+
+/** Effective model patterns plus the precedence source that supplied them. */
+export type AgentModelSelectionSource = "request" | "settings" | "agent" | "session";
 
 /** Effective agent model patterns paired with the pre-expansion role alias behind them. */
 export interface AgentModelSelection {
@@ -1277,6 +1286,18 @@ export interface AgentModelSelection {
 export function resolveAgentModelSelection(options: AgentModelPatternResolutionOptions): AgentModelSelection {
 	const { source, patterns } = resolveEffectiveAgentModelSelection(options);
 	return { patterns, role: resolveExplicitModelRole(source, options.settings) };
+}
+/** Effective model patterns paired with their precedence source. */
+export interface AgentModelSelectionWithSource extends AgentModelSelection {
+	source: AgentModelSelectionSource;
+}
+
+/** Resolve model patterns, role identity, and precedence source in one call. */
+export function resolveAgentModelSelectionWithSource(
+	options: AgentModelPatternResolutionOptions,
+): AgentModelSelectionWithSource {
+	const { source, sourceKind, patterns } = resolveEffectiveAgentModelSelection(options);
+	return { patterns, role: resolveExplicitModelRole(source, options.settings), source: sourceKind };
 }
 
 /** Effective agent model patterns alone, for callers with no interest in role identity. */
@@ -1503,14 +1524,18 @@ export function resolveModelFromSettings(options: {
 
 /**
  * Resolve a list of override patterns to the first matching model.
+ *
+ * `availableModels` lets callers apply a path-scoped policy without creating a
+ * second registry facade. Omitted means the registry's normal available set.
  */
 export function resolveModelOverride(
 	modelPatterns: string[],
 	modelRegistry: ModelLookupRegistry,
 	settings?: Settings,
+	availableModels?: Model<Api>[],
 ): { model?: Model<Api>; thinkingLevel?: ConfiguredThinkingLevel; explicitThinkingLevel: boolean; warning?: string } {
 	if (modelPatterns.length === 0) return { explicitThinkingLevel: false };
-	const availableModels = modelRegistry.getAvailable();
+	const available = availableModels ?? modelRegistry.getAvailable();
 	const matchPreferences = getModelMatchPreferences(settings);
 	let warning: string | undefined;
 	for (const pattern of modelPatterns) {
@@ -1519,7 +1544,7 @@ export function resolveModelOverride(
 			thinkingLevel,
 			explicitThinkingLevel,
 			warning: patternWarning,
-		} = resolveModelRoleValue(pattern, availableModels, {
+		} = resolveModelRoleValue(pattern, available, {
 			settings,
 			matchPreferences,
 		});
@@ -1532,30 +1557,10 @@ export function resolveModelOverride(
 }
 
 /**
- * Resolve a list of override patterns to the first matching model, with an
- * auth-aware fallback to the parent session's active model.
- *
- * If the resolved subagent model has no working credentials (provider has no
- * usable auth), and the parent's active model resolves with working auth,
- * use the parent's model instead. This prevents subagent dispatch from
- * silently routing to a provider the user can't actually call (e.g.
- * `modelRoles.task` pointing at an unqualified id whose only available
- * provider variant has no configured credentials — see #985).
- *
- * `sessionId` is forwarded to `getApiKey` so that session-sticky OAuth
- * credentials resolve correctly during the pre-flight auth check. Without it,
- * providers with multiple OAuth accounts may return `undefined` even though
- * the credential is usable once the subagent session starts — see #5325.
- *
- * Keyless-by-design providers (llama.cpp, ollama, lm-studio) advertise the
- * `kNoAuth` sentinel from `getApiKey` to signal that they do not require
- * credentials. Those are treated as authenticated here so an explicitly
- * configured local model is never silently rerouted to the parent's remote
- * provider (see #1008).
- *
- * If neither the subagent nor the parent has working auth, returns the
- * primary resolution unchanged so the existing error path still surfaces
- * a meaningful failure downstream.
+ * Resolve a list of override patterns with auth-aware candidate selection.
+ * Ordered selectors are tried in order; an unavailable candidate does not
+ * prevent a later candidate from being used. The parent model is considered
+ * only after every requested candidate is known but unauthenticated.
  */
 export async function resolveModelOverrideWithAuthFallback(
 	modelPatterns: string[],
@@ -1563,6 +1568,7 @@ export async function resolveModelOverrideWithAuthFallback(
 	modelRegistry: ModelLookupRegistry & Pick<ModelRegistry, "getApiKey">,
 	settings?: Settings,
 	sessionId?: string,
+	availableModels?: Model<Api>[],
 ): Promise<{
 	model?: Model<Api>;
 	thinkingLevel?: ConfiguredThinkingLevel;
@@ -1570,29 +1576,48 @@ export async function resolveModelOverrideWithAuthFallback(
 	authFallbackUsed: boolean;
 	warning?: string;
 }> {
-	const primary = resolveModelOverride(modelPatterns, modelRegistry, settings);
-	if (!primary.model || !parentActiveModelPattern) {
-		return { ...primary, authFallbackUsed: false };
+	if (modelPatterns.length === 0) return { explicitThinkingLevel: false, authFallbackUsed: false };
+	const available = availableModels ?? modelRegistry.getAvailable();
+	const orderedPatterns = modelPatterns.flatMap(pattern => resolveConfiguredModelPatterns(pattern, settings));
+	let firstResolved:
+		| {
+				model?: Model<Api>;
+				thinkingLevel?: ConfiguredThinkingLevel;
+				explicitThinkingLevel: boolean;
+				warning?: string;
+		  }
+		| undefined;
+	let warning: string | undefined;
+	for (const pattern of orderedPatterns) {
+		const candidate = resolveModelOverride([pattern], modelRegistry, settings, available);
+		if (!warning && candidate.warning) warning = candidate.warning;
+		if (!candidate.model) continue;
+		firstResolved ??= candidate;
+		const key = await modelRegistry.getApiKey(candidate.model, sessionId);
+		if (key === kNoAuth || isAuthenticated(key)) {
+			return { ...candidate, authFallbackUsed: false, warning: candidate.warning ?? warning };
+		}
+	}
+	if (!firstResolved) {
+		return { explicitThinkingLevel: false, authFallbackUsed: false, warning };
 	}
 
-	const primaryKey = await modelRegistry.getApiKey(primary.model, sessionId);
-	if (primaryKey === kNoAuth || isAuthenticated(primaryKey)) {
-		return { ...primary, authFallbackUsed: false };
+	if (!parentActiveModelPattern) {
+		return { ...firstResolved, authFallbackUsed: false, warning: firstResolved.warning ?? warning };
 	}
-
-	const fallback = resolveModelOverride([parentActiveModelPattern], modelRegistry, settings);
-	if (!fallback.model) {
-		return { ...primary, authFallbackUsed: false };
-	}
-	if (modelsAreEqual(fallback.model, primary.model)) {
-		return { ...primary, authFallbackUsed: false };
+	const fallback = resolveModelOverride([parentActiveModelPattern], modelRegistry, settings, available);
+	if (!fallback.model || modelsAreEqual(fallback.model, firstResolved.model)) {
+		return { ...firstResolved, authFallbackUsed: false, warning: firstResolved.warning ?? warning };
 	}
 	const fallbackKey = await modelRegistry.getApiKey(fallback.model, sessionId);
-	if (!isAuthenticated(fallbackKey)) {
-		return { ...primary, authFallbackUsed: false };
+	if (fallbackKey !== kNoAuth && !isAuthenticated(fallbackKey)) {
+		return { ...firstResolved, authFallbackUsed: false, warning: firstResolved.warning ?? warning };
 	}
-
-	return { ...fallback, authFallbackUsed: true, warning: primary.warning ?? fallback.warning };
+	return {
+		...fallback,
+		authFallbackUsed: true,
+		warning: firstResolved.warning ?? warning ?? fallback.warning,
+	};
 }
 
 /**

@@ -50,7 +50,7 @@ Parsing comes from frontmatter via `parseAgentFields()` (`src/discovery/helpers.
 
 OMP discovers user agents from `~/.omp/agent/agents/*.md` and project agents from `.omp/agents/*.md`.
 
-Give the agent a role alias in frontmatter, then dispatch it by name. For model routing, task dispatch sets only `agent`; it does not set a worker model:
+Give the agent a role alias in frontmatter, then dispatch it by name. A task or eval caller may also supply a per-spawn `model` selector; when omitted, the agent's role-backed model remains the source of routing:
 
 `~/.omp/agent/agents/reviewer.md`:
 
@@ -200,13 +200,14 @@ A missing name fails preflight with `Unknown agent "...". Available: ...`; no su
 
 ## Model and structured-output precedence
 
-For task dispatch, model precedence is:
+For task and eval subagent dispatch, model precedence is:
 
-1. `task.agentModelOverrides[agentName]`
-2. the agent frontmatter's prioritized `model` list
-3. the parent's active model, then its configured/default model fallback
+1. the invocation's `model` selector (task item or eval `agent(..., model=...)`)
+2. `task.agentModelOverrides[agentName]`
+3. the agent frontmatter's prioritized `model` list
+4. the parent's active model, then its configured/default model fallback
 
-Role aliases in either of the first two sources are expanded through `modelRoles`. The shared eval bridge can also supply an invocation-local model override ahead of the settings override; the task wire schema does not expose that field.
+Role aliases in any source are expanded through `modelRoles`. The resolved selectors are checked against the effective path-scoped `enabledModels` policy after the model registry's background refresh settles. An explicit selector that does not resolve within that scope fails semantic preflight before artifacts, jobs, or child sessions are allocated. Ordered selectors remain ordered, so a later candidate can be used when an earlier candidate has no working credentials; an auth fallback to the parent model is reported in runtime progress and eval result details.
 
 Runtime output schema precedence is:
 

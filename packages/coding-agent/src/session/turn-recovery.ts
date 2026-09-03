@@ -230,9 +230,11 @@ export interface TurnRecoveryHost {
 	withBashBranchTransition<T>(operation: () => T): T;
 }
 
-/** Construction-time retry state restored from model selection. */
+/** Construction-time model state restored from selection. */
 export interface TurnRecoveryOptions {
 	initialRetryFallback?: InitialRetryFallbackState;
+	/** Mark the initial model as auth-fallback routed without arming retry recovery. */
+	initialModelFallback?: boolean;
 }
 
 type PendingRetryError = {
@@ -307,6 +309,8 @@ export class TurnRecovery {
 				lastAppliedFallbackThinkingLevel: host.configuredThinkingLevel(),
 				pinned: options.initialRetryFallback.pinned ?? false,
 			};
+		}
+		if (options.initialRetryFallback || options.initialModelFallback) {
 			this.#markFallbackRouted();
 		}
 		this.#validateRetryFallbackChains();

@@ -227,17 +227,17 @@ function validateEffort(effort: TaskEffort | undefined, label: string): string |
 	return `${label} has an invalid \`effort\` value ${JSON.stringify(effort)}. Use "lo", "med", or "hi".`;
 }
 
-function validateModel(model: string | string[] | undefined, label: string): string | undefined {
+function validateModel(model: unknown, label: string): string | undefined {
 	if (model === undefined) return undefined;
-	if (typeof model === "string" && model.trim()) return undefined;
+	const selectors = typeof model === "string" ? [model] : Array.isArray(model) ? model : undefined;
 	if (
-		Array.isArray(model) &&
-		model.length > 0 &&
-		model.every(selector => typeof selector === "string" && selector.trim())
+		!selectors ||
+		selectors.length === 0 ||
+		selectors.some(selector => typeof selector !== "string" || !selector.split(",").some(pattern => pattern.trim()))
 	) {
-		return undefined;
+		return `${label} has an invalid \`model\` selector. Use a non-empty model string or list of model strings.`;
 	}
-	return `${label} has an invalid \`model\` selector. Use a non-empty model string or list of model strings.`;
+	return undefined;
 }
 
 function validateSpawnParams(params: TaskParams, batchEnabled: boolean): string | undefined {
@@ -521,6 +521,14 @@ export async function refreshAgentDiscovery(cwd: string, extensionRoots?: Effect
 	}
 }
 
+function formatModelForApproval(model: unknown): string | undefined {
+	const selectors = typeof model === "string" ? [model] : Array.isArray(model) ? model : [];
+	const normalized = selectors.filter(
+		(selector): selector is string => typeof selector === "string" && !!selector.trim(),
+	);
+	return normalized.length > 0 ? truncateForPrompt(normalized.join(" → ")) : undefined;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Tool Class
 // ═══════════════════════════════════════════════════════════════════════════
@@ -544,6 +552,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		if (typeof params.name === "string" && params.name.trim()) {
 			lines.push(`Name: ${truncateForPrompt(params.name)}`);
 		}
+		const model = formatModelForApproval(params.model);
+		if (model) lines.push(`Model: ${model}`);
 		if (typeof params.task === "string") {
 			lines.push(`Task:\n${truncateForPrompt(params.task)}`);
 		}
@@ -567,6 +577,15 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			}
 			const agentSummary = [...agentCounts].map(([agent, count]) => `${agent} ×${count}`).join(", ");
 			lines.push(`Batch agents: ${truncateForPrompt(agentSummary)}`);
+			const modelSummary = tasks
+				.map((item, index) => {
+					if (!item || typeof item !== "object" || !("model" in item)) return undefined;
+					const model = formatModelForApproval(item.model);
+					return model ? `${index + 1}:${model}` : undefined;
+				})
+				.filter((model): model is string => model !== undefined)
+				.join(", ");
+			if (modelSummary) lines.push(`Batch models: ${truncateForPrompt(modelSummary)}`);
 
 			const firstTask = tasks[0];
 			if (firstTask && typeof firstTask === "object") {
@@ -574,6 +593,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					lines.push(`Name: ${truncateForPrompt(firstTask.name)}`);
 				}
 				lines.push(`Agent: ${truncateForPrompt(effectiveAgent(firstTask))}`);
+				const itemModel = formatModelForApproval("model" in firstTask ? firstTask.model : undefined);
+				if (itemModel) lines.push(`Model: ${itemModel}`);
 				if ("task" in firstTask && typeof firstTask.task === "string") {
 					lines.push(`Task:\n${truncateForPrompt(firstTask.task)}`);
 				}
@@ -694,6 +715,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			assignment: (params.task ?? "").trim(),
 			context: this.#isBatchEnabled() ? params.context?.trim() || undefined : undefined,
 			agent: params.agent,
+			...(Object.hasOwn(params, "model") ? { model: params.model } : {}),
 			...(Object.hasOwn(params, "outputSchema") ? { outputSchema: params.outputSchema } : {}),
 			...(Object.hasOwn(params, "schemaMode") ? { schemaMode: params.schemaMode } : {}),
 			...(params.effort !== undefined ? { effort: params.effort } : {}),

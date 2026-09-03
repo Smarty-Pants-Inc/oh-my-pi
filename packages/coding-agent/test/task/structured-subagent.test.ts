@@ -2,6 +2,8 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
+import type { Api, Model } from "@oh-my-pi/pi-ai";
+import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
 	artifactsDirsFromRegistry,
@@ -43,6 +45,8 @@ function session(
 		isolationMode?: "none" | "worktree";
 		isolationApply?: boolean;
 		modelRoles?: Record<string, string>;
+		modelRegistry?: ModelRegistry;
+		enabledModels?: string[];
 		provider?: ExecutionEnvironmentProvider;
 		taskDepth?: number;
 	} = {},
@@ -56,9 +60,11 @@ function session(
 			"task.isolation.mode": options.isolationMode ?? "none",
 			"task.enableLsp": true,
 			...(options.modelRoles ? { modelRoles: options.modelRoles } : {}),
+			...(options.enabledModels ? { enabledModels: options.enabledModels } : {}),
 			...(options.isolationApply !== undefined ? { "task.isolation.apply": options.isolationApply } : {}),
 		}),
 		taskDepth: options.taskDepth,
+		modelRegistry: options.modelRegistry,
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
 		getPlanModeState: () => (options.planMode ? { enabled: true } : undefined),
@@ -91,6 +97,21 @@ function result(): SingleResult {
 		tokens: 0,
 		requests: 1,
 	};
+}
+
+function model(provider: string, id: string): Model<Api> {
+	return {
+		id,
+		name: id,
+		api: "openai-responses",
+		provider,
+		baseUrl: "https://example.test/v1",
+		reasoning: false,
+		input: ["text"],
+		cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 128_000,
+		maxTokens: 4_096,
+	} as Model<Api>;
 }
 
 function mockDiscovery(agent: AgentDefinition = AGENT): void {
@@ -265,9 +286,13 @@ describe("structured subagent primitive", () => {
 
 		const requestPolicy = await resolveEffectiveSubagentPolicy(request({ session: roleSession, model: "@request" }));
 		expect(requestPolicy.modelRole).toBe("request");
+		expect(requestPolicy.modelSelectionSource).toBe("request");
+		expect(requestPolicy.modelSelectionExplicit).toBe(true);
 
 		const overridePolicy = await resolveEffectiveSubagentPolicy(request({ session: roleSession }));
 		expect(overridePolicy.modelRole).toBe("override");
+		expect(overridePolicy.modelSelectionSource).toBe("settings");
+		expect(overridePolicy.modelSelectionExplicit).toBe(true);
 
 		const concreteOverrideSession = session({
 			modelRoles: {
@@ -286,15 +311,50 @@ describe("structured subagent primitive", () => {
 		);
 		expect(definitionPolicy.modelRole).toBe("definition");
 	});
-	it("falls through an empty request selector to the agent definition role", async () => {
+	it("awaits model refresh and rejects selectors outside the active enabledModels scope", async () => {
+		const allowed = model("p", "allowed");
+		const denied = model("p", "denied");
+		let getAvailableCalls = 0;
+		const refreshStarted = Promise.withResolvers<void>();
+		const releaseRefresh = Promise.withResolvers<void>();
+		const modelRegistry = {
+			getAvailable: () => {
+				getAvailableCalls += 1;
+				return [allowed, denied];
+			},
+			awaitBackgroundRefresh: async () => {
+				refreshStarted.resolve();
+				await releaseRefresh.promise;
+			},
+			getApiKey: async () => "test-key",
+		} as unknown as ModelRegistry;
+		mockDiscovery();
+		const childSession = session({ modelRegistry, enabledModels: ["p/allowed"] });
+		const pending = resolveEffectiveSubagentPolicy(request({ session: childSession, model: "p/allowed" }));
+
+		await refreshStarted.promise;
+		expect(getAvailableCalls).toBe(0);
+		releaseRefresh.resolve();
+		const policy = await pending;
+
+		expect(policy.modelSelectionSource).toBe("request");
+		expect(policy.modelSelectionExplicit).toBe(true);
+		expect(policy.modelOverride).toEqual(["p/allowed"]);
+		expect(policy.allowedModels?.map(candidate => candidate.id)).toEqual(["allowed"]);
+
+		await expect(
+			resolveEffectiveSubagentPolicy(request({ session: childSession, model: "p/denied" })),
+		).rejects.toThrow("within the active enabledModels scope");
+	});
+
+	it("rejects an explicit empty model selector before applying lower-precedence defaults", async () => {
 		const customAgent = { ...AGENT, model: ["@definition"] };
 		mockDiscovery(customAgent);
 		const childSession = session({ modelRoles: { definition: "openai/gpt-4o" } });
 
-		const policy = await resolveEffectiveSubagentPolicy(request({ session: childSession, model: "" }));
-
-		expect(policy.modelRole).toBe("definition");
-		expect(policy.modelOverride).toEqual(["openai/gpt-4o"]);
+		await expect(resolveEffectiveSubagentPolicy(request({ session: childSession, model: "" }))).rejects.toThrow(
+			"requested subagent `model` selector is empty",
+		);
 	});
 
 	it("falls through an empty configured override to the agent definition role", async () => {

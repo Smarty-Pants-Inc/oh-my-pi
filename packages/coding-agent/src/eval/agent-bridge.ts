@@ -24,6 +24,7 @@ const agentArgsSchema = type({
 	prompt: "string>0",
 	"agent?": "string>0",
 	"label?": "string",
+	"model?": "string | string[]",
 	"schema?": "unknown",
 	"schemaMode?": "'permissive' | 'strict'",
 	"isolated?": "boolean",
@@ -37,6 +38,7 @@ interface EvalAgentArgs {
 	prompt: string;
 	agent?: string;
 	label?: string;
+	model?: string | string[];
 	schema?: unknown;
 	schemaMode?: StructuredSubagentSchemaMode;
 	isolated?: boolean;
@@ -59,6 +61,8 @@ export interface EvalAgentResult {
 		agent: string;
 		id: string;
 		model?: string | string[];
+		/** True when auth-aware runtime routing served a fallback model. */
+		modelFallback?: boolean;
 		structured: boolean;
 		schemaSource?: "caller" | "agent" | "session";
 		schemaMode?: StructuredSubagentSchemaMode;
@@ -88,7 +92,7 @@ function trimToUndefined(value: string | undefined): string | undefined {
 function emitProgressStatus(emitStatus: ((event: JsStatusEvent) => void) | undefined, progress: AgentProgress): void {
 	if (!emitStatus) return;
 	const preview = (progress.assignment ?? progress.task ?? "").split("\n")[0]?.slice(0, 120);
-	emitStatus({
+	const event: JsStatusEvent = {
 		op: "agent",
 		id: progress.id,
 		agent: progress.agent,
@@ -104,7 +108,9 @@ function emitProgressStatus(emitStatus: ((event: JsStatusEvent) => void) | undef
 		cost: progress.cost,
 		durationMs: progress.durationMs,
 		model: progress.resolvedModel,
-	});
+		...(progress.resolvedModelIsFallback === true ? { modelFallback: true } : {}),
+	};
+	emitStatus(event);
 }
 
 function buildSubagentFailureMessage(agentName: string, result: SingleResult): string {
@@ -143,6 +149,7 @@ export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOption
 			options.emitStatus,
 			() =>
 				runStructuredSubagent({
+					...(Object.hasOwn(parsed, "model") ? { model: parsed.model } : {}),
 					session: options.session,
 					invocationKind: "eval",
 					assignment: parsed.prompt,
@@ -206,6 +213,7 @@ export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOption
 				agent: result.agent,
 				id: result.id,
 				...(model !== undefined ? { model } : {}),
+				...(result.resolvedModelIsFallback === true ? { modelFallback: true } : {}),
 				structured,
 				...(schemaSource !== undefined ? { schemaSource } : {}),
 				...(schemaMode !== undefined ? { schemaMode } : {}),

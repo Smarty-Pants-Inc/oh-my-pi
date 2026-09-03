@@ -21,7 +21,7 @@ Execution waits for each assignment to finish.
   - `name`: Optional stable identifier.
   - `agent`: Optional agent type. Omit it to use `{{defaultAgent}}`.
   - `task`: Complete, self-contained assignment.
-  - `model`: Optional direct model selector. It overrides the selected agent's default model.
+  - `model`: Optional direct selector or ordered selector list. It overrides settings and the selected agent's model; role aliases expand through `modelRoles`, candidates must resolve within the active `enabledModels` policy, and an auth-unusable selection may fall back to the parent's active model with fallback state reported in progress/results.
 {{#if effortEnabled}}  - `effort`: Optional reasoning level: `"lo"`, `"med"`, or `"hi"`.
 {{/if}}  - `outputSchema`: Optional result schema.
   - `schemaMode`: `"permissive"` (default) or `"strict"`.
@@ -31,7 +31,7 @@ Execution waits for each assignment to finish.
 - `name`: Optional stable identifier.
 - `agent`: Optional agent type. Omit it to use `{{defaultAgent}}`.
 - `task`: Complete, self-contained assignment.
-- `model`: Optional direct model selector. It overrides the selected agent's default model.
+- `model`: Optional direct selector or ordered selector list. It overrides settings and the selected agent's model; candidates must resolve within the active `enabledModels` policy, and an auth-unusable selection may fall back to the parent's active model with fallback state reported in results.
 {{#if effortEnabled}}- `effort`: Optional reasoning level: `"lo"`, `"med"`, or `"hi"`.
 {{/if}}- `outputSchema`: Optional result schema.
 - `schemaMode`: `"permissive"` (default) or `"strict"`.

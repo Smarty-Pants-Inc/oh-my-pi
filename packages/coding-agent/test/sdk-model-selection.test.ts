@@ -474,6 +474,10 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		try {
 			expect(session.model?.provider).toBe(parentModel.provider);
 			expect(session.model?.id).toBe(parentModel.id);
+			expect(session.servingModel).toEqual({
+				selector: `${parentModel.provider}/${parentModel.id}:high`,
+				isFallback: true,
+			});
 			expect(modelFallbackMessage).toBeUndefined();
 		} finally {
 			await session.dispose();
