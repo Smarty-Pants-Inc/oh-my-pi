@@ -2,7 +2,6 @@ import { Database } from "bun:sqlite";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
-import { formatHashlineHeader, stripHashlinePrefixes } from "@oh-my-pi/hashline";
 import { type } from "@oh-my-pi/omptype";
 import type {
 	AgentTool,
@@ -21,7 +20,7 @@ import {
 	readArchiveEntries,
 	writeArchive,
 } from "@oh-my-pi/pi-utils/ar";
-import { canonicalSnapshotKey, getFileSnapshotStore } from "../edit/file-snapshot-store";
+import { getEditStore } from "../edit/store";
 import { normalizeToLF } from "../edit/normalize";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { InternalUrlRouter } from "../internal-urls";
@@ -40,6 +39,7 @@ import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import { routeWriteThroughBridge } from "./acp-bridge";
 import { resolveToolTier, truncateForPrompt } from "./approval";
 import { assertEditableFile } from "./auto-generated-guard";
+import { formatHashlineHeader, stripHashlinePrefixes } from "./hashline-format";
 import {
 	type ConflictEntry,
 	conflictRegionPresent,
@@ -331,9 +331,10 @@ export interface WriteToolDetails {
  * line-number prefixes (for example legacy or malformed hashline echoes).
  */
 function stripWriteContentWithPotentialLooseHeader(lines: string[]): { text: string; stripped: boolean } {
-	const cleaned = stripHashlinePrefixes(lines);
-	if (cleaned !== lines) {
-		return { text: cleaned.join("\n"), stripped: true };
+	const originalText = lines.join("\n");
+	const cleanedText = stripHashlinePrefixes(lines).join("\n");
+	if (cleanedText !== originalText) {
+		return { text: cleanedText, stripped: true };
 	}
 
 	const headerIndex = lines.findIndex(line => line.trim().length > 0);
@@ -342,11 +343,12 @@ function stripWriteContentWithPotentialLooseHeader(lines: string[]): { text: str
 	}
 
 	const linesWithoutHeader = lines.slice(0, headerIndex).concat(lines.slice(headerIndex + 1));
-	const cleanedWithoutHeader = stripHashlinePrefixes(linesWithoutHeader);
-	if (cleanedWithoutHeader === linesWithoutHeader) {
-		return { text: lines.join("\n"), stripped: false };
+	const textWithoutHeader = linesWithoutHeader.join("\n");
+	const cleanedWithoutHeader = stripHashlinePrefixes(linesWithoutHeader).join("\n");
+	if (cleanedWithoutHeader === textWithoutHeader) {
+		return { text: originalText, stripped: false };
 	}
-	return { text: cleanedWithoutHeader.join("\n"), stripped: true };
+	return { text: cleanedWithoutHeader, stripped: true };
 }
 
 /**
@@ -378,7 +380,7 @@ function stripWriteContent(session: ToolSession, content: string): { text: strin
 function maybeWriteSnapshotHeader(session: ToolSession, absolutePath: string, content: string): string | undefined {
 	if (!resolveFileDisplayMode(session).hashLines) return undefined;
 	const normalized = normalizeToLF(content);
-	const tag = getFileSnapshotStore(session).record(canonicalSnapshotKey(absolutePath), normalized, []);
+	const tag = getEditStore(session).recordSnapshot(absolutePath, normalized, []);
 	return formatHashlineHeader(formatPathRelativeToCwd(absolutePath, session.cwd), tag);
 }
 
@@ -506,7 +508,7 @@ function parseSqliteWriteTarget(subPath: string, queryString: string): { table: 
 	return { table, key };
 }
 
-function assertEnvironmentWriteSupported(writePath: string, content: string): void {
+function assertEnvironmentWriteSupported(writePath: string, content: string, sourceContent = content): void {
 	if (parseConflictUri(writePath)) {
 		throw new ToolError("Environment writes only support ordinary workspace files, not conflict:// targets");
 	}
@@ -517,8 +519,8 @@ function assertEnvironmentWriteSupported(writePath: string, content: string): vo
 		throw new ToolError("Environment writes do not support SQLite table or row targets");
 	}
 	if (
-		content.includes("\0") ||
-		new TextDecoder("utf-8", { fatal: true }).decode(new TextEncoder().encode(content)) !== content
+		sourceContent.includes("\0") ||
+		new TextDecoder("utf-8", { fatal: true }).decode(new TextEncoder().encode(sourceContent)) !== sourceContent
 	) {
 		throw new ToolError("Environment writes require strict UTF-8 text content");
 	}
@@ -884,7 +886,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		await writethroughNoop(absolutePath, newContent, signal);
 		invalidateFsScanAfterWrite(absolutePath);
 		this.session.bumpFileMutationVersion?.(absolutePath);
-		this.session.fileSnapshotStore?.invalidate(absolutePath);
+		getEditStore(this.session).invalidate(absolutePath);
 		const history = this.session.conflictHistory;
 		history?.invalidate(entry.id);
 		if (history) {
@@ -1063,7 +1065,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			await writethroughNoop(absolutePath, text, signal);
 			invalidateFsScanAfterWrite(absolutePath);
 			this.session.bumpFileMutationVersion?.(absolutePath);
-			this.session.fileSnapshotStore?.invalidate(absolutePath);
+			getEditStore(this.session).invalidate(absolutePath);
 			for (const entry of resolvedEntries) history.invalidate(entry.id);
 			for (const entry of staleEntries) history.invalidate(entry.id);
 			const header = maybeWriteSnapshotHeader(this.session, absolutePath, text);
@@ -1126,13 +1128,14 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 	async #writeEnvironment(
 		writePath: string,
 		content: string,
+		sourceContent: string,
 		stripped: boolean,
 		onUpdate: AgentToolUpdateCallback<WriteToolDetails> | undefined,
 	): Promise<AgentToolResult<WriteToolDetails> | undefined> {
 		const environment = this.session.getExecutionEnvironment?.();
 		if (!environment) return undefined;
 
-		assertEnvironmentWriteSupported(writePath, content);
+		assertEnvironmentWriteSupported(writePath, content, sourceContent);
 		let remotePath: string;
 		try {
 			remotePath = mapExecutionEnvironmentPath(environment, writePath);
@@ -1283,7 +1286,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			// any local existence probe, archive/database inspection, LSP, snapshot,
 			// mode, ACP, or disk read/write behavior.
 			if (!internalRouter.canHandle(path)) {
-				const environmentResult = await this.#writeEnvironment(path, cleanContent, stripped, onUpdate);
+				const environmentResult = await this.#writeEnvironment(path, cleanContent, content, stripped, onUpdate);
 				if (environmentResult) return environmentResult;
 			}
 

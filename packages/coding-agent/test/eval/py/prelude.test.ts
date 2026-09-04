@@ -43,40 +43,104 @@ describe("python prelude", () => {
 		expect(signature).toContain("limit");
 	});
 
-	it("forwards the per-call model keyword through the agent bridge", async () => {
-		const requests: unknown[] = [];
+	it("forwards model selectors and records terminal model metadata", async () => {
+		const requests: Array<{ name?: string; args?: Record<string, unknown> }> = [];
 		const server = Bun.serve({
 			hostname: "127.0.0.1",
 			port: 0,
 			fetch: async request => {
-				expect(new URL(request.url).pathname).toBe("/v1/tool");
-				requests.push(await request.json());
-				return Response.json({
-					ok: true,
-					value: { text: "child output" },
-				});
+				const body = (await request.json()) as { name?: string; args?: Record<string, unknown> };
+				requests.push(body);
+				if (body.name === "__agent__") {
+					return Response.json({ ok: true, value: { id: "agent-1", agent: "task" } });
+				}
+				if (body.name === "__wait__") {
+					return Response.json({
+						ok: true,
+						value: {
+							items: [
+								{
+									kind: "agent",
+									id: "agent-1",
+									status: "completed",
+									text: "done",
+									model: "p/selected",
+									modelFallback: true,
+								},
+							],
+						},
+					});
+				}
+				return Response.json({ ok: false, error: `unexpected bridge call ${body.name}` });
 			},
 		});
 
 		try {
-			const result = await runPrelude('print(agent("do work", model="smoke/child"))', {
-				PI_TOOL_BRIDGE_URL: server.url.toString(),
-				PI_TOOL_BRIDGE_TOKEN: "test-token",
-				PI_TOOL_BRIDGE_SESSION: "test-session",
-			});
-
-			expect(result).toEqual({ stdout: "child output\n", stderr: "", exitCode: 0 });
-			expect(requests).toEqual([
+			const result = await runPrelude(
+				[
+					'h = agent("inspect", model=["p/first", "p/second"])',
+					"print(h.wait())",
+					'print(json.dumps({"model": h.model, "model_fallback": h.model_fallback}, sort_keys=True))',
+				].join("\n"),
 				{
-					session: "test-session",
-					run: null,
-					name: "__agent__",
-					args: { prompt: "do work", model: "smoke/child", agent: "task" },
+					PI_TOOL_BRIDGE_URL: server.url.toString(),
+					PI_TOOL_BRIDGE_TOKEN: "test-token",
+					PI_TOOL_BRIDGE_SESSION: "test-session",
 				},
-			]);
+			);
+
+			expect(result).toEqual({
+				stdout: 'done\n{"model": "p/selected", "model_fallback": true}\n',
+				stderr: "",
+				exitCode: 0,
+			});
+			expect(requests[0]?.args).toMatchObject({
+				prompt: "inspect",
+				model: ["p/first", "p/second"],
+			});
 		} finally {
 			server.stop(true);
 		}
+	});
+
+	it("infers eval tool schemas and replaces definitions by name", async () => {
+		const result = await runPrelude(
+			[
+				"from typing import Annotated, Literal, Optional",
+				"@tool",
+				"def word_count(text: Annotated[str, 'Text to split'], sep: Literal[' ', ','] = ' ', limit: Optional[int] = None) -> dict:",
+				'    """Count words in text."""',
+				"    return {'count': len(text.split(sep))}",
+				"first = __omp_tools__['word_count'].describe()",
+				"@tool(name='word_count', description='Replacement')",
+				"def replacement(text: str) -> dict:",
+				"    return {'count': 1}",
+				"print(json.dumps({'first': first, 'current': __omp_tools__['word_count'].describe(), 'defined': tool.defined()}, sort_keys=True))",
+				"print(tool.undefine('word_count'), tool.defined())",
+			].join("\n"),
+			{},
+		);
+
+		expect(result.exitCode).toBe(0);
+		const lines = result.stdout.trim().split("\n");
+		const value = JSON.parse(lines[0] ?? "{}");
+		expect(value.first).toEqual({
+			name: "word_count",
+			description: "Count words in text.",
+			parameters: {
+				type: "object",
+				properties: {
+					text: { type: "string", description: "Text to split" },
+					sep: { enum: [" ", ","], default: " " },
+					limit: { anyOf: [{ type: "integer" }, { type: "null" }], default: null },
+				},
+				required: ["text"],
+				additionalProperties: false,
+			},
+		});
+		expect(value.current.description).toBe("Replacement");
+		expect(value.defined).toEqual(["word_count"]);
+		expect(lines[1]).toBe("True []");
 	});
 
 	it("appends line selectors to delegated URI paths", async () => {
@@ -127,22 +191,7 @@ describe("python prelude", () => {
 		}
 	});
 
-	it("exposes isolation artifacts on the agent() handle node", () => {
-		// agent(..., handle=True) is the only escape hatch for
-		// recovering apply=False patch/branch/nested artifacts (the bare
-		// schema return is just the parsed object), so the helper MUST
-		// translate the bridge's camelCase details onto the node — otherwise
-		// an isolated apply=False workflow loses captured nested patches.
-		expect(PYTHON_PRELUDE).toContain('("model", "model")');
-		expect(PYTHON_PRELUDE).toContain('("modelFallback", "model_fallback")');
-		expect(PYTHON_PRELUDE).toContain('("patchPath", "patch_path")');
-		expect(PYTHON_PRELUDE).toContain('("branchName", "branch_name")');
-		expect(PYTHON_PRELUDE).toContain('("nestedPatches", "nested_patches")');
-		expect(PYTHON_PRELUDE).toContain('("changesApplied", "changes_applied")');
-		expect(PYTHON_PRELUDE).toContain('("isolationSummary", "isolation_summary")');
-	});
-
-	it("bypasses discovered proxies for parallel loopback bridge calls", async () => {
+	it("bypasses discovered proxies for loopback bridge calls", async () => {
 		let proxyRequests = 0;
 		const bridge = Bun.serve({
 			hostname: "127.0.0.1",
@@ -151,7 +200,7 @@ describe("python prelude", () => {
 				const body = (await request.json()) as { name?: string; args?: { path?: string } };
 				return Response.json({
 					ok: true,
-					value: body.name === "__concurrency__" ? { limit: 3 } : body.args?.path,
+					value: body.args?.path,
 				});
 			},
 		});
@@ -170,8 +219,13 @@ describe("python prelude", () => {
 			// is the hermetic equivalent for this subprocess test.
 			const result = await runPrelude(
 				[
-					'paths = ["one.ts", "two.ts", "three.ts"]',
-					'print(parallel([lambda path=path: tool.read({"path": path}) for path in paths]))',
+					"async def main():",
+					'    paths = ["one.ts", "two.ts", "three.ts"]',
+					"    results = []",
+					"    for path in paths:",
+					'        results.append(await tool.read({"path": path}))',
+					"    print(results)",
+					"asyncio.run(main())",
 				].join("\n"),
 				{
 					PI_TOOL_BRIDGE_URL: bridge.url.toString(),

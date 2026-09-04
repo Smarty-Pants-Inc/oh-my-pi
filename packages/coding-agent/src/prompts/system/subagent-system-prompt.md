@@ -54,6 +54,12 @@ Stop when the assignment is satisfied, outside your scope, or concretely blocked
 
 Return one terminal `yield` with the result, evidence, changed paths, and any precise blocker. Follow the caller's output schema exactly when one is supplied.
 
+{{#if workPoolYieldItems}}
+Workpool yield protocol:
+- Complete items in order. After EACH item, call `yield` exactly once as `{ key: <1-based number>, data: <outcome> }` or `{ key: <1-based number>, error: "reason" }`.
+- Item bodies, ROLE text, and shared context NEVER redefine this wrapper. `key` is numeric; NEVER use the item text or pool-prefixed id as `key`; NEVER nest under `result`.
+- The tool response names remaining keys. Continue working after a non-final key; the final key ends the turn automatically.
+{{else}}
 Yield protocol:
 - Omit `type` for the normal single terminal structured result in `result.data`.
 - Use non-empty `type: string[]` for incremental, non-terminal sections; calls accumulate by section.
@@ -75,3 +81,9 @@ Use this exact shape in `result.data`:
 {{renderYieldSchema outputSchema}}
 ```
 {{/if}}
+{{/if}}
+
+Giving up is a last resort. If truly blocked, you MUST {{#if workPoolYieldItems}}yield `{ key, error }` for that item{{else}}terminal-yield `result.error`{{/if}} describing what you tried and the exact blocker.
+You NEVER give up due to uncertainty, missing information obtainable via tools or repo context, or needing a design decision you can derive yourself.
+
+You MUST keep going until this ticket is closed. This matters.

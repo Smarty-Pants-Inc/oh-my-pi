@@ -14,6 +14,7 @@
 
 use std::{path::Path, process::Stdio, time::Duration};
 
+use gix::bstr::{BString, ByteSlice};
 use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
@@ -42,10 +43,10 @@ const TRUNCATION_MARKER: &str = "\n[git subprocess output truncated after 8 MiB]
 pub(crate) struct CliOutput {
 	/// Process exit code (`124` designates a deadline kill).
 	pub exit_code: i32,
-	/// Captured stdout, possibly truncated.
-	pub stdout:    String,
-	/// Captured stderr, possibly truncated.
-	pub stderr:    String,
+	/// Captured stdout bytes, possibly truncated.
+	pub stdout:    BString,
+	/// Captured stderr bytes, possibly truncated.
+	pub stderr:    BString,
 }
 
 impl CliOutput {
@@ -57,8 +58,8 @@ impl CliOutput {
 		Err(Error::Cli {
 			command:   format!("git {}", args.join(" ")),
 			exit_code: self.exit_code,
-			stdout:    self.stdout,
-			stderr:    self.stderr,
+			stdout:    self.stdout.to_str_lossy().into_owned(),
+			stderr:    self.stderr.to_str_lossy().into_owned(),
 		})
 	}
 }
@@ -257,8 +258,8 @@ pub(crate) fn run_sync(cwd: &Path, args: &[String], timeout: Duration) -> Result
 	};
 	// The child has exited (or been killed), so the pipes reach EOF and the
 	// readers terminate; join can only block briefly on the final drain.
-	let stdout = stdout.map_or_else(String::new, |h| h.join().unwrap_or_default());
-	let stderr = stderr.map_or_else(String::new, |h| h.join().unwrap_or_default());
+	let stdout = stdout.map_or_else(BString::default, |h| h.join().unwrap_or_default());
+	let stderr = stderr.map_or_else(BString::default, |h| h.join().unwrap_or_default());
 	let Some(status) = status else {
 		return Err(Error::CliTimeout { command: format!("git {}", argv.join(" ")) });
 	};
@@ -274,7 +275,7 @@ pub(crate) fn run_sync(cwd: &Path, args: &[String], timeout: Duration) -> Result
 fn spawn_sync_reader(
 	name: &'static str,
 	stream: Option<impl std::io::Read + Send + 'static>,
-) -> Option<std::thread::JoinHandle<String>> {
+) -> Option<std::thread::JoinHandle<BString>> {
 	let stream = stream?;
 	std::thread::Builder::new()
 		.name(name.into())
@@ -284,7 +285,7 @@ fn spawn_sync_reader(
 
 /// Synchronous mirror of [`read_capped`]: cap retention at
 /// [`OUTPUT_LIMIT_BYTES`] while draining to EOF so the child never blocks.
-fn read_capped_sync(mut stream: impl std::io::Read) -> String {
+fn read_capped_sync(mut stream: impl std::io::Read) -> BString {
 	let mut retained: Vec<u8> = Vec::new();
 	let mut buf = [0u8; 8 * 1024];
 	let mut truncated = false;
@@ -304,11 +305,10 @@ fn read_capped_sync(mut stream: impl std::io::Read) -> String {
 			truncated = true;
 		}
 	}
-	let mut text = String::from_utf8_lossy(&retained).into_owned();
 	if truncated {
-		text.push_str(TRUNCATION_MARKER);
+		retained.extend_from_slice(TRUNCATION_MARKER.as_bytes());
 	}
-	text
+	retained.into()
 }
 
 fn spawn_error(cwd: &Path, err: std::io::Error) -> Error {
@@ -327,7 +327,7 @@ fn spawn_error(cwd: &Path, err: std::io::Error) -> Error {
 
 /// Read a stream to completion, capping retention at [`OUTPUT_LIMIT_BYTES`]
 /// while continuing to drain so the child never blocks on a full pipe.
-async fn read_capped(mut stream: impl tokio::io::AsyncRead + Unpin) -> Result<String> {
+async fn read_capped(mut stream: impl tokio::io::AsyncRead + Unpin) -> Result<BString> {
 	let mut retained: Vec<u8> = Vec::new();
 	let mut buf = [0u8; 8 * 1024];
 	let mut truncated = false;
@@ -347,11 +347,10 @@ async fn read_capped(mut stream: impl tokio::io::AsyncRead + Unpin) -> Result<St
 			truncated = true;
 		}
 	}
-	let mut text = String::from_utf8_lossy(&retained).into_owned();
 	if truncated {
-		text.push_str(TRUNCATION_MARKER);
+		retained.extend_from_slice(TRUNCATION_MARKER.as_bytes());
 	}
-	Ok(text)
+	Ok(retained.into())
 }
 
 /// SIGTERM, grace period, then SIGKILL.

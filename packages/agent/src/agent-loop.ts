@@ -75,6 +75,7 @@ import type {
 	AgentMessage,
 	AgentPreModelCallResult,
 	AgentTool,
+	AgentToolArgStream,
 	AgentToolCall,
 	AgentToolResult,
 	AgentTurnEndContext,
@@ -932,7 +933,10 @@ function extractIntent(args: Record<string, unknown>): { intent?: string; stripp
 	if (typeof intent !== "string") {
 		return { strippedArgs };
 	}
-	const trimmed = intent.trim();
+	const trimmed = intent
+		.trim()
+		.replace(/\s*\.+$/, "")
+		.trim();
 	return { intent: trimmed.length > 0 ? trimmed : undefined, strippedArgs };
 }
 
@@ -1953,6 +1957,17 @@ async function streamAssistantResponse(
 					stream.push({ type: "message_start", message: snapshotAssistantMessage(partialMessage) });
 				}
 			};
+			const argStreams = new Map<number, { id: string; stream: AgentToolArgStream }>();
+			const cancelArgStreams = (): void => {
+				for (const { id, stream: argStream } of argStreams.values()) {
+					try {
+						argStream.cancel();
+					} catch (error) {
+						logger.debug("Tool argument stream cancel failed", { toolCallId: id, error });
+					}
+				}
+				argStreams.clear();
+			};
 
 			const responseIterator = response[Symbol.asyncIterator]();
 			const finishAbortedStream = async (): Promise<AssistantMessage> => {
@@ -2087,6 +2102,52 @@ async function streamAssistantResponse(
 					// when the LLM is streaming chunks faster than the loop can rest.
 					await yieldIfDue();
 
+					if (event.type === "toolcall_start") {
+						const block = event.partial.content[event.contentIndex];
+						if (block?.type === "toolCall") {
+							const tool = resolveToolForCall(context.tools, block, config.resolveFallbackTool);
+							if (tool?.openArgStream) {
+								try {
+									const argStream = tool.openArgStream({
+										toolCallId: block.id,
+										toolName: block.name,
+										customWireName: block.customWireName,
+										emit: update =>
+											stream.push({
+												type: "tool_stream_update",
+												toolCallId: block.id,
+												toolName: block.name,
+												update,
+											}),
+									});
+									if (argStream) argStreams.set(event.contentIndex, { id: block.id, stream: argStream });
+								} catch (error) {
+									logger.debug("Tool argument stream open failed", { toolCallId: block.id, error });
+								}
+							}
+						}
+					} else if (event.type === "toolcall_delta") {
+						const entry = argStreams.get(event.contentIndex);
+						if (entry) {
+							try {
+								entry.stream.push(event.delta);
+							} catch (error) {
+								logger.debug("Tool argument stream push failed", { toolCallId: entry.id, error });
+							}
+						}
+					} else if (event.type === "toolcall_end") {
+						const entry = argStreams.get(event.contentIndex);
+						if (entry) {
+							try {
+								entry.stream.end(event.toolCall.arguments);
+							} catch (error) {
+								logger.debug("Tool argument stream end failed", { toolCallId: entry.id, error });
+							} finally {
+								argStreams.delete(event.contentIndex);
+							}
+						}
+					}
+
 					switch (event.type) {
 						case "start":
 							applyStartEvent(event);
@@ -2125,6 +2186,7 @@ async function streamAssistantResponse(
 				}
 			} finally {
 				detachAbortListener?.();
+				cancelArgStreams();
 			}
 
 			if (!providerResponseAccepted) {
@@ -2626,8 +2688,9 @@ async function executeToolCalls(
 			// Queued steering hard-aborts only interruptible waits and raises the
 			// cooperative soft signal for everything else: the boundary dequeue
 			// below injects the message as soon as running tools finish (or
-			// background themselves), and not-yet-started tools are skipped.
-			// Idempotent — a second steer poll after the abort is a no-op.
+			// background themselves), and not-yet-started interruptible waits
+			// are skipped. Idempotent — a second steer poll after the abort is
+			// a no-op.
 			if (!steeringAbortController.signal.aborted) {
 				interruptState.triggered = true;
 				interruptState.source = steeringSource ?? "unknown";
@@ -2681,16 +2744,13 @@ async function executeToolCalls(
 	};
 
 	const runTool = async (record: (typeof records)[number], index: number): Promise<void> => {
-		// A pending interrupt preempts not-yet-started tools so the message
-		// injects promptly. A peer-IRC interrupt is the exception: it aborts
-		// interruptible waits only and leaves non-interruptible foreground work
-		// untouched (see the emit branch below and the `does not abort a
-		// non-interruptible foreground tool` case). That guarantee must hold for
-		// work still queued behind the aborted wait too — otherwise a batched
-		// `todo`/`write` gets dropped as "Skipped due to pending peer interrupt"
-		// purely for being ordered after the wait (#7493). User/system steering
-		// still preempts everything queued.
-		if (interruptState.triggered && (record.interruptible || interruptState.source !== "irc")) {
+		// User and peer steering preserve already-emitted non-interruptible calls:
+		// their generation cost is sunk, and retrying them is usually redundant.
+		// System and parent-agent steering may preempt queued calls, except `yield`:
+		// once emitted, it is the child's result commit boundary and must settle.
+		const governingSteer = interruptState.source === "system" || interruptState.source === "agent";
+		const mustCommitYield = record.toolCall.name === "yield";
+		if (interruptState.triggered && !mustCommitYield && (record.interruptible || governingSteer)) {
 			// Skip both span emission and the collector orphan record here. The
 			// tail sweep below (after `Promise.allSettled`) is the single path
 			// that handles "no result message was produced" — it calls
@@ -2905,8 +2965,8 @@ async function executeToolCalls(
 
 	// While tool calls are in flight, queued steering or interrupting IRC would
 	// otherwise wait out the tools' own window. Poll only non-consuming queues:
-	// detection hard-aborts interruptible waits, soft-signals cooperative tools
-	// (auto-background bash), and skips not-yet-started tools, so the boundary
+	// detection hard-aborts interruptible waits (running or not yet started)
+	// and soft-signals cooperative tools (auto-background bash), so the boundary
 	// dequeue below injects the message promptly. Gated on immediate-interrupt
 	// mode; checkSteering is idempotent (no-op once triggered).
 	const watchSteeringWhileRunning =

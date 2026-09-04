@@ -1678,7 +1678,13 @@ fn validate_repo_path(path: &str) -> std::result::Result<(), ApplyFailure> {
 	{
 		return Err(ApplyFailure::Invalid(format!("unsafe patch path: {path}")));
 	}
-	let options = gix::validate::path::component::Options::default();
+	// Match Git's platform defaults: Unix files may contain characters reserved
+	// only on Windows.
+	let options = gix::validate::path::component::Options {
+		protect_windows: cfg!(windows),
+		protect_hfs:     cfg!(target_os = "macos"),
+		protect_ntfs:    cfg!(windows),
+	};
 	for component in candidate.components() {
 		let name = gix::path::os_str_into_bstr(component.as_os_str())
 			.map_err(|err| ApplyFailure::Invalid(format!("unsafe patch path {path}: {err}")))?;

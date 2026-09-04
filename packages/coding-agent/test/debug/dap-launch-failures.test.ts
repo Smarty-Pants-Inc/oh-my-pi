@@ -496,7 +496,7 @@ describe("DAP launch failure handling", () => {
 					resolvedCommand: process.execPath,
 					connectMode: "socket",
 				};
-				await expect(DapClient.spawn({ adapter, cwd, socketReadyTimeoutMs: 2_000 })).rejects.toThrow(
+				await expect(DapClient.spawn({ adapter, cwd, socketReadyTimeoutMs: 1_000 })).rejects.toThrow(
 					/did not connect within/,
 				);
 				await Bun.sleep(500);
