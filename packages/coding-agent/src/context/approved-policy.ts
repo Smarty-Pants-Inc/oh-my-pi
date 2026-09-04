@@ -105,7 +105,7 @@ export function parseApprovedPolicy(source: string): ApprovedPolicy {
 }
 
 export function approvedPolicyPath(explicitPath?: string): string {
-	return explicitPath ?? path.join(os.homedir(), ".smarty-stack/policy/approved-policy.json");
+	return explicitPath ?? path.join(os.homedir(), ".smarty/stack/policy/approved-policy.json");
 }
 
 export async function loadApprovedPolicy(explicitPath?: string): Promise<ApprovedPolicy | undefined> {
