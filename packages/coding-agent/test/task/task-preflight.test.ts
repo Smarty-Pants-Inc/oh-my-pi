@@ -285,4 +285,41 @@ describe("task async preflight", () => {
 		expect(jobs.getJob("Valid")).toBeUndefined();
 		expect(jobs.getJob("Invalid")).toBeUndefined();
 	});
+
+	it("aborts model-discovery preflight before allocating or dispatching", async () => {
+		mockDiscovery();
+		const available = model("p", "available");
+		const refreshStarted = Promise.withResolvers<void>();
+		const refreshGate = Promise.withResolvers<void>();
+		const jobs = manager();
+		const register = vi.spyOn(jobs, "register");
+		const runSubprocess = vi.spyOn(executorModule, "runSubprocess").mockResolvedValue(resultFor("unexpected"));
+		const session = createSession({
+			manager: jobs,
+			modelRegistry: modelRegistry([available], async () => {
+				refreshStarted.resolve();
+				await refreshGate.promise;
+			}),
+		});
+		const allocate = vi.fn(async () => "unexpected");
+		session.agentOutputManager = { allocate } as unknown as ToolSession["agentOutputManager"];
+		const tool = await TaskTool.create(session);
+		const controller = new AbortController();
+
+		const pending = tool.execute(
+			"abort-preflight",
+			{ agent: "task", name: "Cancelled", task: "Work." } as TaskParams,
+			controller.signal,
+		);
+		await refreshStarted.promise;
+		controller.abort(new Error("cancelled during model discovery"));
+		const output = await pending;
+		refreshGate.resolve();
+
+		expect(textOf(output)).toContain("cancelled during model discovery");
+		expect(register).not.toHaveBeenCalled();
+		expect(allocate).not.toHaveBeenCalled();
+		expect(runSubprocess).not.toHaveBeenCalled();
+		expect(jobs.getJob("Cancelled")).toBeUndefined();
+	});
 });

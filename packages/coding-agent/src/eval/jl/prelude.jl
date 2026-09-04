@@ -574,6 +574,8 @@ function agent(prompt::String; agent="task", label=nothing, schema=nothing, sche
         node["data"] = parsed
     end
     for (src_key, dst_key) in (
+        ("model", "model"),
+        ("modelFallback", "model_fallback"),
         ("isolated", "isolated"),
         ("patchPath", "patch_path"),
         ("branchName", "branch_name"),

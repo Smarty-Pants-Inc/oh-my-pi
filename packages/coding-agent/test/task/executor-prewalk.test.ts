@@ -199,7 +199,9 @@ describe("runSubprocess per-agent prewalk", () => {
 		const spy = vi
 			.spyOn(sdkModule, "createAgentSession")
 			.mockResolvedValue(createSessionResult(yieldEmittingSession()));
-		const settings = Settings.isolated();
+		const settings = Settings.isolated({
+			"retry.fallbackChains": { smol: ["missing/*"] },
+		});
 		settings.setModelRole("smol", `${target.provider}/${target.id}`);
 		settings.set("task.prewalk", true);
 
@@ -207,12 +209,15 @@ describe("runSubprocess per-agent prewalk", () => {
 			...baseOptions("subagent-default-prewalk-discovery", settings),
 			modelRegistry: registry,
 			agent: baseAgent,
+			modelCandidates: [primary, target],
 		});
 		expect(spy).not.toHaveBeenCalled();
 
 		refreshGate.resolve();
 		expect((await run).exitCode).toBe(0);
-		expect(spy.mock.calls[0]?.[0]?.prewalk?.target.id).toBe(target.id);
+		const created = spy.mock.calls[0]?.[0];
+		expect(created?.prewalk?.target.id).toBe(target.id);
+		expect(created?.settings?.get("retry.fallbackChains").smol).toEqual([]);
 	});
 
 	it("reports the prewalk target as the active model after handoff", async () => {

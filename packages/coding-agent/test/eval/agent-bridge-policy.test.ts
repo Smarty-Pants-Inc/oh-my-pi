@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { Settings } from "../../src/config/settings";
+import type { ModelRegistry } from "../../src/config/model-registry";
 import { runEvalAgent } from "../../src/eval/agent-bridge";
 import { EVAL_TIMEOUT_PAUSE_OP, EVAL_TIMEOUT_RESUME_OP } from "../../src/eval/bridge-timeout";
 import { IdleTimeout } from "../../src/eval/idle-timeout";
@@ -49,6 +50,7 @@ interface SessionOptions {
 	modelString?: string;
 	enableLsp?: boolean;
 	settings?: Settings;
+	modelRegistry?: ModelRegistry;
 	outputManager?: AgentOutputManager;
 	planMode?: boolean;
 	outputSchema?: unknown;
@@ -68,6 +70,7 @@ function makeSession(options: SessionOptions = {}): ToolSession {
 		hasUI: false,
 		settings,
 		taskDepth: options.depth ?? 0,
+		modelRegistry: options.modelRegistry,
 		enableLsp: options.enableLsp ?? true,
 		agentOutputManager: options.outputManager,
 		getSessionFile: () => options.sessionFile ?? null,
@@ -357,6 +360,36 @@ describe("runEvalAgent", () => {
 		expect(statuses).toContainEqual(expect.objectContaining({ model: "p/parent", modelFallback: true }));
 		expect(result.details.model).toBe("p/parent");
 		expect(result.details.modelFallback).toBe(true);
+	});
+
+	it("aborts model-discovery preflight before allocating or dispatching an eval agent", async () => {
+		mockAgents();
+		const refreshStarted = Promise.withResolvers<void>();
+		const refreshGate = Promise.withResolvers<void>();
+		const modelRegistry = {
+			awaitBackgroundRefresh: async () => {
+				refreshStarted.resolve();
+				await refreshGate.promise;
+			},
+			getAvailable: () => [],
+			getAll: () => [],
+		} as unknown as ModelRegistry;
+		const allocate = vi.fn(async () => "unexpected");
+		const runSpy = vi.spyOn(taskExecutor, "runSubprocess").mockImplementation(async options => singleResult(options));
+		const session = makeSession({
+			modelRegistry,
+			outputManager: { allocate } as unknown as AgentOutputManager,
+		});
+		const controller = new AbortController();
+
+		const pending = runEvalAgent({ prompt: "work" }, { session, signal: controller.signal });
+		await refreshStarted.promise;
+		controller.abort(new Error("cancelled during model discovery"));
+		await expect(pending).rejects.toThrow("cancelled during model discovery");
+		refreshGate.resolve();
+
+		expect(allocate).not.toHaveBeenCalled();
+		expect(runSpy).not.toHaveBeenCalled();
 	});
 	it("returns host-parsed data for caller, agent, and inherited schemas", async () => {
 		const agentSchema = { type: "object" };

@@ -236,6 +236,32 @@ function resolveSubagentInheritedRetryFallbackChain(
 	});
 }
 
+function scopeSubagentRetryFallbackChains(
+	settings: Settings,
+	modelRegistry: ModelRegistry,
+	availableModels: Model<Api>[],
+): void {
+	const existingFallbackChains = settings.get("retry.fallbackChains");
+	if (!existingFallbackChains || typeof existingFallbackChains !== "object" || Array.isArray(existingFallbackChains)) {
+		return;
+	}
+	const scopedFallbackChains: Record<string, string[]> = {};
+	for (const role in existingFallbackChains) {
+		const chain = existingFallbackChains[role];
+		if (!Array.isArray(chain) || !chain.every(entry => typeof entry === "string")) {
+			if (chain !== undefined) scopedFallbackChains[role] = chain;
+			continue;
+		}
+		scopedFallbackChains[role] = resolveSubagentRetryFallbackCandidates(
+			chain,
+			modelRegistry,
+			settings,
+			availableModels,
+		).map(candidate => candidate.selector);
+	}
+	settings.override("retry.fallbackChains", scopedFallbackChains);
+}
+
 function installSubagentRetryFallbackChain(args: {
 	settings: Settings;
 	id: string;
@@ -2894,6 +2920,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 
 			const availableModels = options.allowedModels ?? modelRegistry.getAvailable?.();
 			const modelCandidates = options.modelCandidates ?? availableModels;
+			const hasScopedModelCatalog = options.modelCandidates !== undefined || options.allowedModels !== undefined;
+			if (hasScopedModelCatalog && modelCandidates) {
+				scopeSubagentRetryFallbackChains(subagentSettings, modelRegistry, modelCandidates);
+			}
 			const configuredModelPatterns = resolveConfiguredModelPatterns(modelPatterns, settings);
 			const inheritedRetryFallbackChain =
 				configuredModelPatterns.length === 1
@@ -2902,7 +2932,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 							modelRegistry,
 							modelRole ?? resolveExplicitModelRole(modelPatterns, subagentSettings),
 							modelCandidates,
-							options.modelCandidates !== undefined || options.allowedModels !== undefined,
+							hasScopedModelCatalog,
 						)
 					: undefined;
 			const {

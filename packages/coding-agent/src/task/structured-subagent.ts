@@ -8,7 +8,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
 import type { Api, Model } from "@oh-my-pi/pi-ai";
-import { $env, Snowflake } from "@oh-my-pi/pi-utils";
+import { $env, Snowflake, untilAborted } from "@oh-my-pi/pi-utils";
 import {
 	type AgentModelSelectionSource,
 	getModelMatchPreferences,
@@ -279,7 +279,7 @@ function assertDepthAndSpawnAllowed(request: StructuredSubagentRequest, agentNam
 export async function resolveEffectiveSubagentPolicy(
 	request: StructuredSubagentRequest,
 ): Promise<EffectiveSubagentPolicy> {
-	await request.session.settings.reloadFromDisk();
+	await untilAborted(request.signal, request.session.settings.reloadFromDisk());
 	const spawnPolicy = resolveSpawnPolicy(request.session.getSessionSpawns());
 	const agentName = request.agent?.trim() || spawnPolicy.defaultAgent;
 	const planMode = request.session.getPlanModeState?.()?.enabled === true;
@@ -325,7 +325,10 @@ export async function resolveEffectiveSubagentPolicy(
 	assertPlanControlsAllowed(request, planMode);
 	assertDepthAndSpawnAllowed(request, agentName);
 
-	const discovery = await discoverAgents(request.session.cwd, undefined, request.session.effectiveExtensionRoots?.());
+	const discovery = await untilAborted(
+		request.signal,
+		discoverAgents(request.session.cwd, undefined, request.session.effectiveExtensionRoots?.()),
+	);
 	const agent = getAgent(discovery.agents, agentName);
 	if (!agent) {
 		const available = discovery.agents.map(candidate => candidate.name).join(", ") || "none";
@@ -399,11 +402,15 @@ export async function resolveEffectiveSubagentPolicy(
 	let allowedModels: Model<Api>[] | undefined;
 	let modelCandidates: Model<Api>[] | undefined;
 	if (modelRegistry) {
-		await modelRegistry.awaitBackgroundRefresh?.();
-		allowedModels = await resolveAllowedModels(
-			modelRegistry,
-			request.session.settings,
-			getModelMatchPreferences(request.session.settings),
+		const backgroundRefresh = modelRegistry.awaitBackgroundRefresh?.();
+		if (backgroundRefresh) await untilAborted(request.signal, backgroundRefresh);
+		allowedModels = await untilAborted(
+			request.signal,
+			resolveAllowedModels(
+				modelRegistry,
+				request.session.settings,
+				getModelMatchPreferences(request.session.settings),
+			),
 		);
 		modelCandidates = resolveModelPolicyModels(modelRegistry, request.session.settings);
 		if (modelOverride.length > 0) {

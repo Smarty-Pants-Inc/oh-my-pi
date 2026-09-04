@@ -265,7 +265,52 @@ describe("subagent runtime model resolution", () => {
 
 		expect(childModelRole).toBeUndefined();
 		expect(childFallbackChains?.["subagent:scoped-inherited-fallback"]).toBeUndefined();
-		expect(childFallbackChains?.default).toEqual(["blocked/*"]);
+		expect(childFallbackChains?.default).toEqual([]);
+	});
+
+	it("keeps auth-fallback retries inside the scoped model catalog", async () => {
+		const requested = model("requested", "unauthenticated");
+		const parent = model("allowed", "parent");
+		const excluded = model("blocked", "outside");
+		let childFallbackChains: Record<string, string[]> | undefined;
+		let childModelRole: string | undefined;
+		let childStartingModel: Model<Api> | undefined;
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			if (!options) throw new Error("Expected createAgentSession options");
+			childFallbackChains = options.settings?.get("retry.fallbackChains") as Record<string, string[]> | undefined;
+			childModelRole = options.settings?.getModelRoles()["subagent:scoped-auth-fallback"];
+			childStartingModel = options.model;
+			return { session: createYieldingSession(), extensionsResult: {}, setToolUIContext: () => {} } as never;
+		});
+
+		const result = await runSubprocess({
+			cwd: "/tmp",
+			agent: { name: "task", description: "test", systemPrompt: "test", source: "bundled" },
+			task: "work",
+			index: 0,
+			id: "scoped-auth-fallback",
+			modelOverride: `${requested.provider}/${requested.id}`,
+			parentActiveModelPattern: `${parent.provider}/${parent.id}`,
+			settings: Settings.isolated({
+				modelRoles: { default: `${parent.provider}/${parent.id}` },
+				"retry.fallbackChains": { default: ["blocked/*"] },
+			}),
+			modelRegistry: {
+				refresh: async () => {},
+				getAvailable: () => [parent, excluded],
+				getApiKey: async (candidate: Model<Api>) =>
+					candidate.provider === requested.provider ? undefined : "test-key",
+			} as never,
+			allowedModels: [parent],
+			modelCandidates: [requested, parent],
+			enableLsp: false,
+		});
+
+		expect(childStartingModel).toBe(parent);
+		expect(result.resolvedModelIsFallback).toBe(true);
+		expect(childModelRole).toBeUndefined();
+		expect(childFallbackChains?.["subagent:scoped-auth-fallback"]).toBeUndefined();
+		expect(childFallbackChains?.default).toEqual([]);
 	});
 
 	it("inherits the aliased role's chain, not the default chain, for a role-alias subagent model", async () => {

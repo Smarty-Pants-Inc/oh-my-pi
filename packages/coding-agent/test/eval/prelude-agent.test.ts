@@ -1,6 +1,9 @@
 import { describe, expect, it } from "bun:test";
 import * as vm from "node:vm";
 import { JAVASCRIPT_PRELUDE_SOURCE } from "../../src/eval/js/shared/prelude";
+import { JULIA_PRELUDE } from "../../src/eval/jl/prelude";
+import { PYTHON_PRELUDE } from "../../src/eval/py/prelude";
+import { RUBY_PRELUDE } from "../../src/eval/rb/prelude";
 
 /**
  * The eval `agent()` helper grows a `handle` option that turns its bare
@@ -30,7 +33,10 @@ describe("eval js agent() handle", () => {
 		const sandbox = loadPrelude(async (name, args) => {
 			seenName = name;
 			seenArgs = args as Record<string, unknown>;
-			return { text: "hello world", details: { agent: "task", id: "abc123", model: "m", structured: false } };
+			return {
+				text: "hello world",
+				details: { agent: "task", id: "abc123", model: "m", modelFallback: true, structured: false },
+			};
 		});
 		const node = await (sandbox.agent as AgentHelper)("say hi", { handle: true });
 		expect(seenName).toBe("__agent__");
@@ -41,7 +47,18 @@ describe("eval js agent() handle", () => {
 			handle: "agent://abc123",
 			id: "abc123",
 			agent: "task",
+			model: "m",
+			modelFallback: true,
 		});
+	});
+
+	it("maps model provenance onto every shipped handle helper", () => {
+		expect(PYTHON_PRELUDE).toContain('("model", "model")');
+		expect(PYTHON_PRELUDE).toContain('("modelFallback", "model_fallback")');
+		expect(RUBY_PRELUDE).toContain('"model" => "model"');
+		expect(RUBY_PRELUDE).toContain('"modelFallback" => "model_fallback"');
+		expect(JULIA_PRELUDE).toContain('("model", "model")');
+		expect(JULIA_PRELUDE).toContain('("modelFallback", "model_fallback")');
 	});
 
 	it("returns bare text by default (backward compatible)", async () => {

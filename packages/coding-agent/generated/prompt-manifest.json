@@ -2684,7 +2684,7 @@
       "visibility": "model",
       "defaultEnabled": true,
       "order": 2220,
-      "sha256": "af877aad17a366c8d51909bf2118a343f10ef1cd06fbde1ebb05a8c02c32e76e"
+      "sha256": "f9a4ba991838df4712024630923ecd5e12acbdcacd12827b33c67c7d13b8c122"
     },
     {
       "id": "tool.eval-code-mode",
@@ -3424,7 +3424,7 @@
     },
     {
       "id": "tool.eval",
-      "descriptionSha256": "33f6f272f227d9aad512ccaf6d90444581a8dee7712ad092204159c77792261c",
+      "descriptionSha256": "1875ddce7af9b3ae75bc325c6636ab765109234b377b780b9d411b49b11a5b71",
       "schemaSha256": "3974f0dba834dc8866a31d34439b27541a14bb9c9f911e71d19a0232aa4425ff"
     },
     {
@@ -4756,7 +4756,7 @@
     },
     {
       "path": "docs/tools/eval.md",
-      "sha256": "051bc186f9b170b99c673e5d9b8721d1a214c4298efae8564606479a3f6a6499"
+      "sha256": "a359f9db567e495ed908d11ec7b203a4702f057898d6d4a1d079f38985e4589d"
     },
     {
       "path": "docs/tools/generate_image.md",
@@ -6456,7 +6456,7 @@
     },
     {
       "path": "packages/coding-agent/generated/tool-contracts.json",
-      "sha256": "5fa398e9b258d658f9fa349e31c2a8446772138cd2bbf30e52ea8e4c0bfe3604"
+      "sha256": "713c38a79ecb6e420af64ba39a7ee9fe16a86f421716ef58d4162906a7fb1d8a"
     },
     {
       "path": "packages/coding-agent/package.json",
@@ -7644,7 +7644,7 @@
     },
     {
       "path": "packages/coding-agent/src/eval/jl/prelude.jl",
-      "sha256": "ab51b785c3650f7e0015e4bd5927772703cde893d4ad062d31b906f81845c810"
+      "sha256": "b3d451f9ca06eb2600db750e9232638ed0137cce4a3270a5555d95b1a5f342d3"
     },
     {
       "path": "packages/coding-agent/src/eval/jl/prelude.ts",
@@ -7692,7 +7692,7 @@
     },
     {
       "path": "packages/coding-agent/src/eval/js/shared/prelude.txt",
-      "sha256": "75f5c0e360851ec1c8970df9e6f1ce20637e6c5677330b17dc27c45b657c1a75"
+      "sha256": "f6d56f85db50bba893838d2fdf3764f62425555e04053e8e4434aab22032ade8"
     },
     {
       "path": "packages/coding-agent/src/eval/js/shared/rewrite-imports.ts",
@@ -7744,7 +7744,7 @@
     },
     {
       "path": "packages/coding-agent/src/eval/py/prelude.py",
-      "sha256": "27ababcefeede6af2392db0e9ad3af53a0ee107098f3485c420cbe22e2112698"
+      "sha256": "a2881e29407ff1abd1fcd9874e235fcf81ff62e25e5033e3c52e180f025abab2"
     },
     {
       "path": "packages/coding-agent/src/eval/py/prelude.ts",
@@ -7780,7 +7780,7 @@
     },
     {
       "path": "packages/coding-agent/src/eval/rb/prelude.rb",
-      "sha256": "53b19dca5153003fdf23ca30b6c8dad6322137a61efac10a820e49c317fd21ef"
+      "sha256": "3cd251871cd00a0e6e5d72af712b86bc3c4cf99722edffdeffdcf0bae821932a"
     },
     {
       "path": "packages/coding-agent/src/eval/rb/prelude.ts",
@@ -9492,11 +9492,11 @@
     },
     {
       "path": "packages/coding-agent/src/task/executor.ts",
-      "sha256": "7584c705ab6702e62a639c9d951f9af33561633d91c3ddcc61e8bf7763526259"
+      "sha256": "bea623a55e13570b3e2107fe4f0d37d44d3818284e2bb910c98918db2c035c8f"
     },
     {
       "path": "packages/coding-agent/src/task/index.ts",
-      "sha256": "a21a9c3e845c9f362c5d2664cdb5c7d15abaa98350f07c4bb6d21b0a41a946bb"
+      "sha256": "7de0daea6f33a82566f5ee1bbae83fa79cab9a0c0a00c62c7ffca9aa9fb64746"
     },
     {
       "path": "packages/coding-agent/src/task/isolation-ownership.ts",
@@ -9560,7 +9560,7 @@
     },
     {
       "path": "packages/coding-agent/src/task/structured-subagent.ts",
-      "sha256": "8001d37a112e789ab656d3310e42e4db57f10d722420ffe686102a0302e10b13"
+      "sha256": "56f23000315ff9e5f1a4735e344b08400428db8c6c9f3f127f1b7913007b4314"
     },
     {
       "path": "packages/coding-agent/src/task/subprocess-tool-registry.ts",
@@ -11356,5 +11356,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "7f4e2330ef37b5e43787dc254a9306bfd4398c73072dcc5ad80ee9ea03441fe4"
+  "rootSha256": "ab259ed7865f58224e08a0e8c2b0327021fd811b19874dd2e5deac3d2f167cb3"
 }

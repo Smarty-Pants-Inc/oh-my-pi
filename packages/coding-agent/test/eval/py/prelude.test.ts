@@ -133,6 +133,8 @@ describe("python prelude", () => {
 		// schema return is just the parsed object), so the helper MUST
 		// translate the bridge's camelCase details onto the node — otherwise
 		// an isolated apply=False workflow loses captured nested patches.
+		expect(PYTHON_PRELUDE).toContain('("model", "model")');
+		expect(PYTHON_PRELUDE).toContain('("modelFallback", "model_fallback")');
 		expect(PYTHON_PRELUDE).toContain('("patchPath", "patch_path")');
 		expect(PYTHON_PRELUDE).toContain('("branchName", "branch_name")');
 		expect(PYTHON_PRELUDE).toContain('("nestedPatches", "nested_patches")');

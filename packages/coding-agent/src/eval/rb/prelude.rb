@@ -421,6 +421,8 @@ unless defined?($__omp_prelude_loaded) && $__omp_prelude_loaded
     }
     node["data"] = parsed if has_data || !schema.nil?
     {
+      "model" => "model",
+      "modelFallback" => "model_fallback",
       "isolated" => "isolated",
       "patchPath" => "patch_path",
       "branchName" => "branch_name",

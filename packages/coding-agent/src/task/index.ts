@@ -708,7 +708,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	 * normalized task params rather than smuggling internal policy over the
 	 * task wire contract.
 	 */
-	#resolveSpawnPreflight(params: TaskParams) {
+	#resolveSpawnPreflight(params: TaskParams, signal?: AbortSignal) {
 		return resolveEffectiveSubagentPolicy({
 			session: this.session,
 			invocationKind: "task",
@@ -725,6 +725,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			enableLsp: (this.session.enableLsp ?? true) && this.session.settings.get("task.enableLsp"),
 			enableIrc: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
 			maxRuntimeMs: this.session.settings.get("task.maxRuntimeMs"),
+			signal,
 		});
 	}
 
@@ -761,7 +762,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const preflights = await Promise.all(
 			normalizedSpawnParams.map(async spawn => {
 				try {
-					return { policy: await this.#resolveSpawnPreflight(spawn) };
+					return { policy: await this.#resolveSpawnPreflight(spawn, signal) };
 				} catch (error) {
 					return { error: error instanceof StructuredSubagentError ? error.message : String(error) };
 				}
