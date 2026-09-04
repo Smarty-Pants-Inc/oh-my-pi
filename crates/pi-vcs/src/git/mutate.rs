@@ -141,7 +141,7 @@ impl GitRepo {
 	/// Reset selected index entries to HEAD while preserving the worktree.
 	pub fn unstage(&self, files: &[String]) -> Result<()> {
 		let repo = self.gix()?;
-		let head = head_tree(&repo)?;
+		let head = head_tree(&repo, "git reset")?;
 		let head_index = index_for_tree(&repo, head.as_ref())?;
 		let mut current = load_index_or_head(&repo, "git reset")?;
 		copy_index_paths(&mut current, &head_index, files);
@@ -1157,20 +1157,23 @@ fn commit_tree(repo: &gix::Repository, id: &gix::hash::ObjectId) -> Result<gix::
 		.map_err(|e| Error::backend("git commit", e))
 }
 
-fn head_tree(repo: &gix::Repository) -> Result<Option<gix::hash::ObjectId>> {
+fn head_tree(
+	repo: &gix::Repository,
+	operation: &'static str,
+) -> Result<Option<gix::hash::ObjectId>> {
 	match repo
 		.head()
-		.map_err(|e| Error::backend("git reset", e))?
+		.map_err(|e| Error::backend(operation, e))?
 		.try_peel_to_id()
-		.map_err(|e| Error::backend("git reset", e))?
+		.map_err(|e| Error::backend(operation, e))?
 	{
 		Some(id) => Ok(Some(
 			id.object()
-				.map_err(|e| Error::backend("git reset", e))?
+				.map_err(|e| Error::backend(operation, e))?
 				.peel_to_commit()
-				.map_err(|e| Error::backend("git reset", e))?
+				.map_err(|e| Error::backend(operation, e))?
 				.tree_id()
-				.map_err(|e| Error::backend("git reset", e))?
+				.map_err(|e| Error::backend(operation, e))?
 				.detach(),
 		)),
 		None => Ok(None),
@@ -1439,41 +1442,45 @@ fn checkout_tree(
 	filter_ref_name: FilterRef<'_>,
 ) -> Result<()> {
 	let tree = commit_tree(repo, &commit)?;
-	let mut target = repo
+	let target = repo
 		.index_from_tree(&tree)
 		.map_err(|e| Error::backend("git checkout", e))?;
 	let current = load_index_or_head(repo, "git checkout")?;
+	let head_index = if overwrite {
+		None
+	} else {
+		let head = head_tree(repo, "git checkout")?;
+		Some(index_for_tree(repo, head.as_ref())?)
+	};
+	let comparison = head_index.as_ref().unwrap_or(&current);
 
 	let mut changed_paths = BTreeSet::new();
-	for (entry, path) in target.entries_mut_with_paths() {
+	for entry in target.entries() {
+		let path = entry.path(&target);
 		if !overwrite
-			&& let Some(old) = current.entry_by_path(path)
-			&& old.id == entry.id
-			&& old.mode == entry.mode
+			&& comparison
+				.entry_by_path(path)
+				.is_some_and(|old| old.id == entry.id && old.mode == entry.mode)
 		{
-			entry.stat = old.stat;
 			continue;
 		}
 		changed_paths.insert(path.to_owned());
 	}
-	let affected_current: BTreeSet<BString> = current
-		.entries()
-		.iter()
-		.filter_map(|entry| {
-			let path = entry.path(&current);
-			target
-				.entry_by_path(path)
-				.is_none_or(|new| new.id != entry.id || new.mode != entry.mode)
-				.then(|| path.to_owned())
-		})
-		.collect();
+	let mut affected_paths = changed_paths.clone();
+	affected_paths.extend(comparison.entries().iter().filter_map(|entry| {
+		let path = entry.path(comparison);
+		target
+			.entry_by_path(path)
+			.is_none_or(|new| new.id != entry.id || new.mode != entry.mode)
+			.then(|| path.to_owned())
+	}));
 
 	if !overwrite {
 		let (dirty_tracked, _, staged) = collect_worktree_changes(repo, "git checkout")?;
 		let mut local_changes = dirty_tracked;
 		local_changes.extend(staged);
 		let mut conflicts = local_changes
-			.intersection(&affected_current)
+			.intersection(&affected_paths)
 			.map(|path| path.to_str_lossy().into_owned())
 			.collect::<Vec<_>>();
 		conflicts.extend(
@@ -1493,7 +1500,7 @@ fn checkout_tree(
 	let mut collisions = Vec::new();
 	for path in &changed_paths {
 		if let Some(ancestor) =
-			checkout_ancestor_collision(owner.root(), path.as_bstr(), &current, &affected_current)?
+			checkout_ancestor_collision(owner.root(), path.as_bstr(), &current, &affected_paths)?
 		{
 			collisions.push(ancestor);
 			continue;
@@ -1535,17 +1542,29 @@ fn checkout_tree(
 		.iter()
 		.map(|entry| entry.path(&target).to_owned())
 		.collect();
-	let mut removed = current
+	let mut removed = comparison
 		.entries()
 		.iter()
 		.filter_map(|entry| {
-			let path = entry.path(&current);
+			let path = entry.path(comparison);
 			(!target_paths.contains(path)).then(|| path.to_owned())
 		})
 		.collect::<Vec<_>>();
 	removed.sort_by(path_depth_descending);
 	for path in &removed {
 		remove_absent_worktree_path(owner.root(), path.as_bstr(), "git checkout")?;
+	}
+
+	let mut final_index = target.clone();
+	if !overwrite {
+		final_index.remove_entries(|_, path, _| !affected_paths.contains(path));
+		for entry in current.entries() {
+			let path = entry.path(&current);
+			if !affected_paths.contains(path) {
+				final_index.dangerously_push_entry(entry.stat, entry.id, entry.flags, entry.mode, path);
+			}
+		}
+		final_index.sort_entries();
 	}
 
 	let mut checkout_index = target.clone();
@@ -1583,7 +1602,7 @@ fn checkout_tree(
 	.map_err(|e| Error::backend("git checkout", e))?;
 	validate_checkout_outcome("git checkout", &outcome)?;
 	ensure_gitlink_directories(owner.root(), &checkout_index, "git checkout")?;
-	for (entry, path) in target.entries_mut_with_paths() {
+	for (entry, path) in final_index.entries_mut_with_paths() {
 		if changed_paths.contains(path) {
 			entry.stat = checkout_index
 				.entry_by_path(path)
@@ -1591,7 +1610,7 @@ fn checkout_tree(
 				.stat;
 		}
 	}
-	target
+	final_index
 		.write(INDEX_WRITE)
 		.map_err(|e| Error::backend("git checkout", e))
 }
@@ -1600,7 +1619,7 @@ fn checkout_ancestor_collision(
 	root: &Path,
 	path: &BStr,
 	current: &gix::index::File,
-	affected_current: &BTreeSet<BString>,
+	affected_paths: &BTreeSet<BString>,
 ) -> Result<Option<String>> {
 	let bytes: &[u8] = path.as_ref();
 	for (offset, byte) in bytes.iter().enumerate() {
@@ -1611,7 +1630,7 @@ fn checkout_ancestor_collision(
 		let full = validated_worktree_path(root, ancestor, "git checkout")?;
 		match fs::symlink_metadata(&full) {
 			Ok(metadata) if metadata.is_dir() => {
-				if current.entry_by_path(ancestor).is_some() && affected_current.contains(ancestor) {
+				if current.entry_by_path(ancestor).is_some() && affected_paths.contains(ancestor) {
 					if directory_has_entries(&full)? {
 						return Ok(Some(ancestor.to_str_lossy().into_owned()));
 					}
@@ -1619,7 +1638,7 @@ fn checkout_ancestor_collision(
 				}
 			},
 			Ok(_) => {
-				if current.entry_by_path(ancestor).is_some() && affected_current.contains(ancestor) {
+				if current.entry_by_path(ancestor).is_some() && affected_paths.contains(ancestor) {
 					return Ok(None);
 				}
 				return Ok(Some(ancestor.to_str_lossy().into_owned()));
@@ -1878,6 +1897,16 @@ fn path_is_descendant(path: &BStr, ancestor: &BStr) -> bool {
 		.is_some_and(|remainder| remainder.starts_with(b"/"))
 }
 
+fn path_is_same_or_descendant(path: &BStr, ancestor: &BStr) -> bool {
+	let path: &[u8] = path.as_ref();
+	let ancestor: &[u8] = ancestor.as_ref();
+	let ancestor = ancestor.strip_suffix(b"/").unwrap_or(ancestor);
+	path == ancestor
+		|| path
+			.strip_prefix(ancestor)
+			.is_some_and(|remainder| remainder.starts_with(b"/"))
+}
+
 fn directory_has_entries(path: &Path) -> Result<bool> {
 	Ok(fs::read_dir(path)?.next().transpose()?.is_some())
 }
@@ -1918,10 +1947,20 @@ fn reject_sparse_restore(
 	for index in [source, tracked] {
 		for entry in index.entries() {
 			let path = entry.path(index);
+			let selected = restore_selects(path, requested)
+				|| entry.mode == gix::index::entry::Mode::DIR
+					&& (requested.iter().any(|wanted| {
+						!wanted.is_empty()
+							&& path_is_same_or_descendant(wanted.as_bytes().as_bstr(), path)
+					}) || source.entries().iter().any(|source_entry| {
+						let source_path = source_entry.path(source);
+						restore_selects(source_path, requested)
+							&& path_is_same_or_descendant(source_path, path)
+					}));
 			if entry
 				.flags
 				.contains(gix::index::entry::Flags::SKIP_WORKTREE)
-				&& restore_selects(path, requested)
+				&& selected
 			{
 				return Err(Error::backend(
 					"git restore",
@@ -3408,6 +3447,42 @@ mod tests {
 		assert!(!temp.path().join("a").exists());
 	}
 
+	#[test]
+	fn checkout_carries_staged_modification_on_unchanged_path() {
+		let (temp, repo) = fixture();
+		repo.create_branch("other", "HEAD", false).unwrap();
+		git(temp.path(), &["checkout", "-q", "other"]);
+		fs::write(temp.path().join("b"), "other\n").unwrap();
+		git(temp.path(), &["commit", "-qam", "other branch"]);
+		git(temp.path(), &["checkout", "-q", "main"]);
+		fs::write(temp.path().join("a"), "staged\n").unwrap();
+		git(temp.path(), &["add", "a"]);
+
+		repo.checkout("other").unwrap();
+
+		assert_eq!(fs::read_to_string(temp.path().join("a")).unwrap(), "staged\n");
+		assert_eq!(git(temp.path(), &["status", "--porcelain", "a"]), "M  a");
+		assert_eq!(fs::read_to_string(temp.path().join("b")).unwrap(), "other\n");
+	}
+
+	#[test]
+	fn checkout_carries_staged_addition_absent_from_both_trees() {
+		let (temp, repo) = fixture();
+		repo.create_branch("other", "HEAD", false).unwrap();
+		git(temp.path(), &["checkout", "-q", "other"]);
+		fs::write(temp.path().join("b"), "other\n").unwrap();
+		git(temp.path(), &["commit", "-qam", "other branch"]);
+		git(temp.path(), &["checkout", "-q", "main"]);
+		fs::write(temp.path().join("added"), "staged addition\n").unwrap();
+		git(temp.path(), &["add", "added"]);
+
+		repo.checkout("other").unwrap();
+
+		assert_eq!(fs::read_to_string(temp.path().join("added")).unwrap(), "staged addition\n");
+		assert_eq!(git(temp.path(), &["status", "--porcelain", "added"]), "A  added");
+		assert_eq!(fs::read_to_string(temp.path().join("b")).unwrap(), "other\n");
+	}
+
 	#[cfg(unix)]
 	#[test]
 	fn checkout_uses_clean_filters_for_dirty_detection() {
@@ -3639,6 +3714,41 @@ mod tests {
 				.restore(&RestoreOptions { files: vec![String::new()], ..Default::default() })
 				.is_err()
 		);
+	}
+
+	#[test]
+	fn restore_rejects_descendant_of_collapsed_sparse_directory() {
+		let (temp, repo) = fixture();
+		fs::create_dir_all(temp.path().join("included")).unwrap();
+		fs::create_dir_all(temp.path().join("vendor")).unwrap();
+		fs::write(temp.path().join("included/file"), "included\n").unwrap();
+		fs::write(temp.path().join("vendor/file"), "excluded\n").unwrap();
+		git(temp.path(), &["add", "included/file", "vendor/file"]);
+		git(temp.path(), &["commit", "-qm", "sparse tree"]);
+		git(temp.path(), &["sparse-checkout", "init", "--cone", "--sparse-index"]);
+		git(temp.path(), &["sparse-checkout", "set", "included"]);
+		assert!(!temp.path().join("vendor/file").exists());
+		let index = load_index_or_head(&repo.gix().unwrap(), "test").unwrap();
+		assert!(index.entries().iter().any(|entry| {
+			entry.mode == gix::index::entry::Mode::DIR
+				&& entry
+					.flags
+					.contains(gix::index::entry::Flags::SKIP_WORKTREE)
+		}));
+		let index_before = fs::read(temp.path().join(".git/index")).unwrap();
+
+		assert!(
+			repo
+				.restore(&RestoreOptions {
+					source: Some("HEAD".into()),
+					worktree: true,
+					files: vec!["vendor/file".into()],
+					..Default::default()
+				})
+				.is_err()
+		);
+		assert!(!temp.path().join("vendor/file").exists());
+		assert_eq!(fs::read(temp.path().join(".git/index")).unwrap(), index_before);
 	}
 
 	#[test]
