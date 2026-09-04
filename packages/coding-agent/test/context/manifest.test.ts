@@ -83,7 +83,7 @@ describe("tracked context manifest", () => {
 
 	it("accepts only the active immutable materialized Stack package", async () => {
 		const repositoryRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-materialized-extension-"));
-		const stackRoot = path.join(repositoryRoot, "home/.smarty-stack");
+		const stackRoot = path.join(repositoryRoot, "home/.smarty/stack");
 		const packageRoot = path.join(stackRoot, "versions/0.20.11");
 		const currentRoot = path.join(stackRoot, "current");
 		const relativeEntry = "extensions/smarty-prompt-guard/src/index.ts";
