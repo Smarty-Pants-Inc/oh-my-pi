@@ -604,6 +604,7 @@ impl GitRepo {
 		}
 
 		let source_index = load_index_or_head(&repo, "git worktree add")?;
+		ensure_sparse_checkout_inactive(&repo, &source_index, "git worktree add")?;
 		let target_tree = commit_tree(&repo, &id)?;
 		let target_index = repo
 			.index_from_tree(&target_tree)
@@ -1434,6 +1435,21 @@ enum FilterRef<'a> {
 	Set(Option<&'a str>),
 }
 
+fn ensure_sparse_checkout_inactive(
+	repo: &gix::Repository,
+	index: &gix::index::File,
+	operation: &'static str,
+) -> Result<()> {
+	let config = repo.config_snapshot();
+	let configured = config
+		.boolean("core.sparseCheckout")
+		.unwrap_or_else(|| config.string("core.sparseCheckout").is_some());
+	if index.is_sparse() || configured {
+		return Err(Error::backend(operation, "sparse checkout/index is not supported safely"));
+	}
+	Ok(())
+}
+
 fn checkout_tree(
 	owner: &GitRepo,
 	repo: &gix::Repository,
@@ -1446,6 +1462,7 @@ fn checkout_tree(
 		.index_from_tree(&tree)
 		.map_err(|e| Error::backend("git checkout", e))?;
 	let current = load_index_or_head(repo, "git checkout")?;
+	ensure_sparse_checkout_inactive(repo, &current, "git checkout")?;
 	let head_index = if overwrite {
 		None
 	} else {
@@ -3749,6 +3766,64 @@ mod tests {
 		);
 		assert!(!temp.path().join("vendor/file").exists());
 		assert_eq!(fs::read(temp.path().join(".git/index")).unwrap(), index_before);
+	}
+
+	#[test]
+	fn sparse_checkout_mutations_fail_before_side_effects() {
+		let (temp, repo) = fixture();
+		fs::create_dir_all(temp.path().join("included")).unwrap();
+		fs::create_dir_all(temp.path().join("vendor")).unwrap();
+		fs::write(temp.path().join("included/file"), "included\n").unwrap();
+		fs::write(temp.path().join("vendor/file"), "base\n").unwrap();
+		git(temp.path(), &["add", "included/file", "vendor/file"]);
+		git(temp.path(), &["commit", "-qm", "sparse base"]);
+		repo.create_branch("other", "HEAD", false).unwrap();
+		git(temp.path(), &["checkout", "-q", "other"]);
+		fs::write(temp.path().join("vendor/file"), "target\n").unwrap();
+		git(temp.path(), &["commit", "-qam", "change excluded file"]);
+		let target = git(temp.path(), &["rev-parse", "HEAD"]);
+		git(temp.path(), &["checkout", "-q", "main"]);
+		git(temp.path(), &["sparse-checkout", "init", "--cone", "--sparse-index"]);
+		git(temp.path(), &["sparse-checkout", "set", "included"]);
+
+		let head_before = git(temp.path(), &["rev-parse", "HEAD"]);
+		let index_path = temp.path().join(".git/index");
+		let index_before = fs::read(&index_path).unwrap();
+		assert!(!temp.path().join("vendor/file").exists());
+
+		let checkout_error = repo.checkout("other").unwrap_err();
+		assert!(checkout_error.to_string().contains("sparse checkout"));
+		assert_eq!(git(temp.path(), &["rev-parse", "HEAD"]), head_before);
+		assert_eq!(fs::read(&index_path).unwrap(), index_before);
+		assert!(!temp.path().join("vendor/file").exists());
+
+		let reset_error = repo.reset(ResetMode::Hard, Some(&target)).unwrap_err();
+		assert!(reset_error.to_string().contains("sparse checkout"));
+		assert_eq!(git(temp.path(), &["rev-parse", "HEAD"]), head_before);
+		assert_eq!(fs::read(&index_path).unwrap(), index_before);
+		assert!(!temp.path().join("vendor/file").exists());
+
+		let linked_parent = tempfile::tempdir().unwrap();
+		let linked = linked_parent.path().join("linked");
+		let worktree_error = repo
+			.worktree_add(&linked, &target, WorktreeAddOptions {
+				detach:       false,
+				clone:        WorktreeClone::Off,
+				keep_changes: false,
+			})
+			.unwrap_err();
+		assert!(worktree_error.to_string().contains("sparse checkout"));
+		assert!(!linked.exists());
+		let branch = format!("refs/heads/{target}");
+		assert!(
+			!Command::new("git")
+				.arg("-C")
+				.arg(temp.path())
+				.args(["show-ref", "--verify", "--quiet", &branch])
+				.status()
+				.unwrap()
+				.success()
+		);
 	}
 
 	#[test]
