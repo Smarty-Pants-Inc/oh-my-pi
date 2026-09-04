@@ -233,6 +233,41 @@ describe("subagent runtime model resolution", () => {
 		expect(childFallbackChains?.["existing-local-role"]).toEqual(["other-provider/other-model"]);
 	});
 
+	it("excludes inherited retry fallbacks outside the scoped model catalog", async () => {
+		const primary = model("allowed", "primary");
+		const excluded = model("blocked", "outside");
+		let childFallbackChains: Record<string, string[]> | undefined;
+		let childModelRole: string | undefined;
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			if (!options) throw new Error("Expected createAgentSession options");
+			childFallbackChains = options.settings?.get("retry.fallbackChains") as Record<string, string[]> | undefined;
+			childModelRole = options.settings?.getModelRoles()["subagent:scoped-inherited-fallback"];
+			return { session: createYieldingSession(), extensionsResult: {}, setToolUIContext: () => {} } as never;
+		});
+
+		await runSubprocess({
+			cwd: "/tmp",
+			agent: { name: "task", description: "test", systemPrompt: "test", source: "bundled" },
+			task: "work",
+			index: 0,
+			id: "scoped-inherited-fallback",
+			modelOverride: `${primary.provider}/${primary.id}`,
+			settings: Settings.isolated({ "retry.fallbackChains": { default: ["blocked/*"] } }),
+			modelRegistry: {
+				refresh: async () => {},
+				getAvailable: () => [primary, excluded],
+				getApiKey: async () => "test-key",
+			} as never,
+			allowedModels: [primary],
+			modelCandidates: [primary],
+			enableLsp: false,
+		});
+
+		expect(childModelRole).toBeUndefined();
+		expect(childFallbackChains?.["subagent:scoped-inherited-fallback"]).toBeUndefined();
+		expect(childFallbackChains?.default).toEqual(["blocked/*"]);
+	});
+
 	it("inherits the aliased role's chain, not the default chain, for a role-alias subagent model", async () => {
 		const fast = model("fast", "hy3");
 		const slow = model("slow", "opus");

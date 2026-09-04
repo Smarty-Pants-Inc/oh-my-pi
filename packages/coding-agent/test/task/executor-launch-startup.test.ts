@@ -124,12 +124,15 @@ it("refreshes the model catalog before resolving an explicit selector", async ()
 	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 	if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");
 
+	let refreshed = false;
 	const refreshGate = Promise.withResolvers<void>();
 	const refreshStarted = Promise.withResolvers<void>();
-	vi.spyOn(ModelRegistry.prototype, "refresh").mockImplementation(() => {
+	vi.spyOn(ModelRegistry.prototype, "refresh").mockImplementation(async () => {
 		refreshStarted.resolve();
-		return refreshGate.promise;
+		await refreshGate.promise;
+		refreshed = true;
 	});
+	vi.spyOn(ModelRegistry.prototype, "getAvailable").mockImplementation(() => (refreshed ? [model] : []));
 	vi.spyOn(ModelRegistry.prototype, "hasConfiguredAuth").mockReturnValue(true);
 	vi.spyOn(ModelRegistry.prototype, "getApiKey").mockResolvedValue("test-key");
 
@@ -149,8 +152,6 @@ it("refreshes the model catalog before resolving an explicit selector", async ()
 		authStorage,
 		modelOverride: selector,
 		modelSelectionExplicit: true,
-		allowedModels: [model],
-		modelCandidates: [model],
 		enableLsp: false,
 		enableIrc: false,
 	});
@@ -161,4 +162,42 @@ it("refreshes the model catalog before resolving an explicit selector", async ()
 	refreshGate.resolve();
 	expect((await run).exitCode).toBe(0);
 	expect(createSpy.mock.calls[0]?.[0]?.model).toBe(model);
+});
+
+it("fails an explicit selector that remains unresolved after refresh", async () => {
+	const tempDir = TempDir.createSync("@pi-task-unresolved-model-");
+	tempDirs.push(tempDir);
+	const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
+	authStorages.push(authStorage);
+
+	const refreshGate = Promise.withResolvers<void>();
+	const refreshStarted = Promise.withResolvers<void>();
+	vi.spyOn(ModelRegistry.prototype, "refresh").mockImplementation(async () => {
+		refreshStarted.resolve();
+		await refreshGate.promise;
+	});
+	vi.spyOn(ModelRegistry.prototype, "getAvailable").mockReturnValue([]);
+	const createSpy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(sessionResult(yieldingSession()));
+
+	const run = runSubprocess({
+		cwd: tempDir.path(),
+		artifactsDir: tempDir.path(),
+		agent: { name: "task", description: "test", systemPrompt: "test", source: "bundled" },
+		task: "test",
+		index: 0,
+		id: "task-unresolved-model-refresh",
+		authStorage,
+		modelOverride: "missing/model",
+		modelSelectionExplicit: true,
+		enableLsp: false,
+		enableIrc: false,
+	});
+
+	await refreshStarted.promise;
+	expect(createSpy).not.toHaveBeenCalled();
+	refreshGate.resolve();
+	const result = await run;
+	expect(result.exitCode).toBe(1);
+	expect(result.error).toContain("Requested subagent model selector did not resolve to an available model");
+	expect(createSpy).not.toHaveBeenCalled();
 });

@@ -211,6 +211,7 @@ function resolveSubagentInheritedRetryFallbackChain(
 	modelRegistry: ModelRegistry,
 	role: string | undefined,
 	availableModels?: Model<Api>[],
+	strictModelScope = false,
 ): string[] | undefined {
 	const configuredChains = settings.get("retry.fallbackChains");
 	// An explicitly emptied role chain means "no fallbacks", not "inherit
@@ -222,6 +223,11 @@ function resolveSubagentInheritedRetryFallbackChain(
 		!fallbackChain.every(entry => typeof entry === "string")
 	) {
 		return undefined;
+	}
+	if (strictModelScope) {
+		return resolveSubagentRetryFallbackCandidates(fallbackChain, modelRegistry, settings, availableModels).map(
+			candidate => candidate.selector,
+		);
 	}
 	const disabledProviders = new Set(settings.get("disabledProviders"));
 	return fallbackChain.filter(entry => {
@@ -2749,6 +2755,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	}
 
 	const modelPatterns = normalizeModelPatternList(modelOverride ?? agent.model);
+	const prewalkPattern = resolveAgentPrewalkPattern({
+		settingsOverride: settings.get("task.agentPrewalk")[agent.name],
+		agentPrewalk: resolveAgentPrewalkDefault(agent, settings.get("task.prewalk")),
+	});
 	const sessionFile = subtaskSessionFile ?? null;
 	const spawnsEnv = !subagentRuntimeAllows(runtimeProfile, "spawns")
 		? ""
@@ -2872,8 +2882,12 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				logger.debug("runSubagent: reusing parent modelRegistry; skipping refresh");
 			}
 			const backgroundRefresh = modelRegistry.awaitBackgroundRefresh?.();
-			const waitForRefreshBeforeModelResolution = modelPatterns.length > 0;
-			if (backgroundRefresh && waitForRefreshBeforeModelResolution) {
+			const waitForRefreshBeforeSessionConfiguration =
+				modelPatterns.length > 0 ||
+				(options.allowedModels === undefined &&
+					prewalkPattern !== undefined &&
+					subagentRuntimeAllows(runtimeProfile, "prewalk"));
+			if (backgroundRefresh && waitForRefreshBeforeSessionConfiguration) {
 				await awaitAbortable(backgroundRefresh);
 			}
 			checkAbort();
@@ -2888,6 +2902,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 							modelRegistry,
 							modelRole ?? resolveExplicitModelRole(modelPatterns, subagentSettings),
 							modelCandidates,
+							options.modelCandidates !== undefined || options.allowedModels !== undefined,
 						)
 					: undefined;
 			const {
@@ -2991,10 +3006,6 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			// Resolution failures skip prewalk instead of failing the spawn.
 			const restrictToolNames = subagentRuntimeRestrictsToolNames(runtimeProfile);
 			let prewalk: Prewalk | undefined;
-			const prewalkPattern = resolveAgentPrewalkPattern({
-				settingsOverride: settings.get("task.agentPrewalk")[agent.name],
-				agentPrewalk: resolveAgentPrewalkDefault(agent, settings.get("task.prewalk")),
-			});
 			if (prewalkPattern && subagentRuntimeAllows(runtimeProfile, "prewalk") && availableModels) {
 				const resolvedPrewalk = resolveModelOverride([prewalkPattern], modelRegistry, settings, availableModels);
 				const target = resolvedPrewalk.model;
@@ -3188,12 +3199,13 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			}
 
 			const sessionPromise = createAgentSession(buildSubagentSessionOptions(sessionManager, null));
-			// Default model selection inside createAgentSession can overlap a registry refresh.
-			// Explicit selectors still wait above so they resolve against the refreshed catalog.
+			// Default model selection inside createAgentSession can overlap a registry refresh
+			// when no discovery-backed prewalk lookup is required. Explicit selectors and
+			// prewalk targets wait above so they resolve against the refreshed catalog.
 			sessionPromise.catch(() => {});
 			let session: AgentSession;
 			try {
-				if (backgroundRefresh && !waitForRefreshBeforeModelResolution) {
+				if (backgroundRefresh && !waitForRefreshBeforeSessionConfiguration) {
 					await awaitAbortable(backgroundRefresh);
 				}
 				({ session } = await awaitAbortable(sessionPromise));

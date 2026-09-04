@@ -188,6 +188,33 @@ describe("runSubprocess per-agent prewalk", () => {
 		expect(spy.mock.calls[0]?.[0]?.prewalk?.target.id).toBe(target.id);
 	});
 
+	it("waits for discovery before resolving prewalk for the default-model task agent", async () => {
+		const models = [primary];
+		const registry = createModelRegistry(models);
+		const refreshGate = Promise.withResolvers<void>();
+		vi.spyOn(registry, "awaitBackgroundRefresh").mockImplementation(async () => {
+			await refreshGate.promise;
+			models.push(target);
+		});
+		const spy = vi
+			.spyOn(sdkModule, "createAgentSession")
+			.mockResolvedValue(createSessionResult(yieldEmittingSession()));
+		const settings = Settings.isolated();
+		settings.setModelRole("smol", `${target.provider}/${target.id}`);
+		settings.set("task.prewalk", true);
+
+		const run = runSubprocess({
+			...baseOptions("subagent-default-prewalk-discovery", settings),
+			modelRegistry: registry,
+			agent: baseAgent,
+		});
+		expect(spy).not.toHaveBeenCalled();
+
+		refreshGate.resolve();
+		expect((await run).exitCode).toBe(0);
+		expect(spy.mock.calls[0]?.[0]?.prewalk?.target.id).toBe(target.id);
+	});
+
 	it("reports the prewalk target as the active model after handoff", async () => {
 		const progressModels: string[] = [];
 		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(
