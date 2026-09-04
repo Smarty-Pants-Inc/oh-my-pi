@@ -61,7 +61,7 @@ describe("approved policy", () => {
 	});
 
 	it("uses the shared Smarty Stack policy path by default", () => {
-		expect(approvedPolicyPath()).toEndWith(path.join(".smarty-stack", "policy", "approved-policy.json"));
+		expect(approvedPolicyPath()).toEndWith(path.join(".smarty", "stack", "policy", "approved-policy.json"));
 		expect(approvedPolicyPath("/tmp/diagnostic-policy.json")).toBe("/tmp/diagnostic-policy.json");
 		Bun.env.SMARTY_APPROVED_POLICY_PATH = "/tmp/decoy-policy.json";
 		try {

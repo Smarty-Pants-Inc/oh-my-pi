@@ -925,7 +925,11 @@ async function isApprovedMaterializedCandidateSource(
 	const stackRoot = path.dirname(versions);
 	if (path.basename(versions) !== "versions" || path.basename(root) !== manifest.version) return false;
 	let current = path.dirname(absoluteSource);
-	while (path.basename(current) !== "current" || path.basename(path.dirname(current)) !== ".smarty-stack") {
+	while (
+		path.basename(current) !== "current" ||
+		path.basename(path.dirname(current)) !== "stack" ||
+		path.basename(path.dirname(path.dirname(current))) !== ".smarty"
+	) {
 		const parent = path.dirname(current);
 		if (parent === current) return false;
 		current = parent;
