@@ -1,5 +1,6 @@
 import { afterEach, expect, it, vi } from "bun:test";
 import { AuthStorage } from "@oh-my-pi/pi-ai";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { ExtensionRuntime } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
@@ -13,33 +14,9 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 const authStorages: AuthStorage[] = [];
 const tempDirs: TempDir[] = [];
 
-afterEach(async () => {
-	vi.restoreAllMocks();
-	for (const authStorage of authStorages.splice(0)) await authStorage.close();
-	for (const tempDir of tempDirs.splice(0)) tempDir[Symbol.dispose]();
-});
-
-it("overlaps registry refresh with session-file opening and session setup", async () => {
-	const tempDir = TempDir.createSync("@pi-task-launch-");
-	tempDirs.push(tempDir);
-	const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
-	authStorages.push(authStorage);
-
-	const refreshGate = Promise.withResolvers<void>();
-	vi.spyOn(ModelRegistry.prototype, "refresh").mockImplementation(() => refreshGate.promise);
-
-	const sessionManager = SessionManager.inMemory(tempDir.path());
-	const openGate = Promise.withResolvers<SessionManager>();
-	const openStarted = Promise.withResolvers<void>();
-	const openSpy = vi.spyOn(SessionManager, "open").mockImplementation(() => {
-		openStarted.resolve();
-		return openGate.promise;
-	});
-
-	const sessionCreationStarted = Promise.withResolvers<void>();
-	let sessionCreated = false;
+function yieldingSession(): AgentSession {
 	const listeners: Array<(event: AgentSessionEvent) => void> = [];
-	const session = {
+	return {
 		state: { messages: [] },
 		agent: { state: { systemPrompt: ["test"] } },
 		model: undefined,
@@ -72,16 +49,47 @@ it("overlaps registry refresh with session-file opening and session setup", asyn
 		setIrcWakeTurnObserver: () => {},
 		subscribeRunState: () => () => {},
 	} as unknown as AgentSession;
+}
+
+function sessionResult(session: AgentSession): CreateAgentSessionResult {
+	return {
+		session,
+		extensionsResult: { extensions: [], errors: [], runtime: new ExtensionRuntime() },
+		setToolUIContext: () => {},
+		eventBus: new EventBus(),
+	};
+}
+
+afterEach(async () => {
+	vi.restoreAllMocks();
+	for (const authStorage of authStorages.splice(0)) await authStorage.close();
+	for (const tempDir of tempDirs.splice(0)) tempDir[Symbol.dispose]();
+});
+
+it("overlaps registry refresh with session-file opening and session setup", async () => {
+	const tempDir = TempDir.createSync("@pi-task-launch-");
+	tempDirs.push(tempDir);
+	const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
+	authStorages.push(authStorage);
+
+	const refreshGate = Promise.withResolvers<void>();
+	vi.spyOn(ModelRegistry.prototype, "refresh").mockImplementation(() => refreshGate.promise);
+
+	const sessionManager = SessionManager.inMemory(tempDir.path());
+	const openGate = Promise.withResolvers<SessionManager>();
+	const openStarted = Promise.withResolvers<void>();
+	const openSpy = vi.spyOn(SessionManager, "open").mockImplementation(() => {
+		openStarted.resolve();
+		return openGate.promise;
+	});
+
+	const sessionCreationStarted = Promise.withResolvers<void>();
+	let sessionCreated = false;
+	const session = yieldingSession();
 	vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async () => {
 		sessionCreationStarted.resolve();
 		sessionCreated = true;
-		const result: CreateAgentSessionResult = {
-			session,
-			extensionsResult: { extensions: [], errors: [], runtime: new ExtensionRuntime() },
-			setToolUIContext: () => {},
-			eventBus: new EventBus(),
-		};
-		return result;
+		return sessionResult(session);
 	});
 
 	const run = runSubprocess({
@@ -106,4 +114,51 @@ it("overlaps registry refresh with session-file opening and session setup", asyn
 
 	refreshGate.resolve();
 	expect((await run).exitCode).toBe(0);
+});
+
+it("refreshes the model catalog before resolving an explicit selector", async () => {
+	const tempDir = TempDir.createSync("@pi-task-explicit-model-");
+	tempDirs.push(tempDir);
+	const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
+	authStorages.push(authStorage);
+	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+	if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");
+
+	const refreshGate = Promise.withResolvers<void>();
+	const refreshStarted = Promise.withResolvers<void>();
+	vi.spyOn(ModelRegistry.prototype, "refresh").mockImplementation(() => {
+		refreshStarted.resolve();
+		return refreshGate.promise;
+	});
+	vi.spyOn(ModelRegistry.prototype, "hasConfiguredAuth").mockReturnValue(true);
+	vi.spyOn(ModelRegistry.prototype, "getApiKey").mockResolvedValue("test-key");
+
+	let sessionCreated = false;
+	const createSpy = vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async () => {
+		sessionCreated = true;
+		return sessionResult(yieldingSession());
+	});
+	const selector = `${model.provider}/${model.id}`;
+	const run = runSubprocess({
+		cwd: tempDir.path(),
+		artifactsDir: tempDir.path(),
+		agent: { name: "task", description: "test", systemPrompt: "test", source: "bundled" },
+		task: "test",
+		index: 0,
+		id: "task-explicit-model-refresh",
+		authStorage,
+		modelOverride: selector,
+		modelSelectionExplicit: true,
+		allowedModels: [model],
+		modelCandidates: [model],
+		enableLsp: false,
+		enableIrc: false,
+	});
+
+	await refreshStarted.promise;
+	expect(sessionCreated).toBe(false);
+
+	refreshGate.resolve();
+	expect((await run).exitCode).toBe(0);
+	expect(createSpy.mock.calls[0]?.[0]?.model).toBe(model);
 });

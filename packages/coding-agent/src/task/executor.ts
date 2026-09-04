@@ -2872,7 +2872,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				logger.debug("runSubagent: reusing parent modelRegistry; skipping refresh");
 			}
 			const backgroundRefresh = modelRegistry.awaitBackgroundRefresh?.();
-			if (backgroundRefresh) await awaitAbortable(backgroundRefresh);
+			const waitForRefreshBeforeModelResolution = modelPatterns.length > 0;
+			if (backgroundRefresh && waitForRefreshBeforeModelResolution) {
+				await awaitAbortable(backgroundRefresh);
+			}
 			checkAbort();
 
 			const availableModels = options.allowedModels ?? modelRegistry.getAvailable?.();
@@ -3185,8 +3188,14 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			}
 
 			const sessionPromise = createAgentSession(buildSubagentSessionOptions(sessionManager, null));
+			// Default model selection inside createAgentSession can overlap a registry refresh.
+			// Explicit selectors still wait above so they resolve against the refreshed catalog.
+			sessionPromise.catch(() => {});
 			let session: AgentSession;
 			try {
+				if (backgroundRefresh && !waitForRefreshBeforeModelResolution) {
+					await awaitAbortable(backgroundRefresh);
+				}
 				({ session } = await awaitAbortable(sessionPromise));
 			} catch (err) {
 				// Abort raced session startup. The session may still resolve later
