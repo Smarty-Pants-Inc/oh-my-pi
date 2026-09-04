@@ -2727,6 +2727,14 @@ async function createAgentSessionScoped(
 					}
 				}
 				model = selectedModel;
+				if (
+					patternIndex > 0 ||
+					(deferredAuthSelection?.fallbackUsed === true &&
+						deferredAuthModel &&
+						modelsAreEqual(selectedModel, deferredAuthModel))
+				) {
+					initialModelFallback = true;
+				}
 				initialRetryFallback =
 					retryFallback && usageFallbackTriggered ? { ...retryFallback, pinned: true } : retryFallback;
 				modelFallbackMessage = undefined;

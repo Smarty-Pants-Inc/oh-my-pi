@@ -416,9 +416,13 @@ export async function resolveEffectiveSubagentPolicy(
 	} = resolveAgentModelSelectionWithSource(modelResolution);
 	const modelSelectionExplicit = modelSelectionSource !== "session";
 	const modelRegistry = request.session.modelRegistry;
+	const modelPolicyActive =
+		request.session.settings.get("enabledModels").length > 0 ||
+		request.session.settings.get("disabledProviders").length > 0;
+	const requiresCompleteModelCatalog = modelSelectionExplicit || modelPolicyActive;
 	let allowedModels: Model<Api>[] | undefined;
 	let modelCandidates: Model<Api>[] | undefined;
-	if (modelRegistry) {
+	if (modelRegistry && requiresCompleteModelCatalog) {
 		const backgroundRefresh = modelRegistry.awaitBackgroundRefresh?.();
 		if (backgroundRefresh) await untilAborted(request.signal, backgroundRefresh);
 		allowedModels = await untilAborted(

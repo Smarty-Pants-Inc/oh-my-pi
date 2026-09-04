@@ -3129,6 +3129,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				thinkingLevel: resolvedThinkingLevel,
 				explicitThinkingLevel,
 				authFallbackUsed,
+				fallbackUsed,
 				warning: modelResolutionWarning,
 			} = await awaitAbortable(
 				resolveModelOverrideWithAuthFallback(
@@ -3141,7 +3142,13 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					modelCandidates,
 				),
 			);
-			if (modelSelectionExplicit && modelPatterns.length > 0 && !model) {
+			const deferExplicitModelResolution =
+				modelSelectionExplicit &&
+				modelPatterns.length > 0 &&
+				!model &&
+				!registryFromParent &&
+				subagentRuntimeAllows(runtimeProfile, "extensions");
+			if (modelSelectionExplicit && modelPatterns.length > 0 && !model && !deferExplicitModelResolution) {
 				throw new Error(
 					`Requested subagent model selector did not resolve to an available model: ${modelPatterns.join(", ")}`,
 				);
@@ -3152,8 +3159,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					requested: modelPatterns,
 				});
 			}
-			if (authFallbackUsed && model) {
+			if (fallbackUsed && model) {
 				progress.resolvedModelIsFallback = true;
+			}
+			if (authFallbackUsed && model) {
 				logger.warn("Subagent model has no working credentials; falling back to parent session model", {
 					requested: modelPatterns,
 					parentModel: options.parentActiveModelPattern,
@@ -3341,7 +3350,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					settings: subagentSettings,
 					executionEnvironment: options.executionEnvironment,
 					model,
-					initialModelFallback: authFallbackUsed,
+					initialModelFallback: fallbackUsed,
 					modelPattern: model || modelOverride === undefined ? undefined : modelPatterns,
 					modelPatternAuthFallback:
 						model || modelOverride === undefined ? undefined : options.parentActiveModelPattern,
@@ -3425,17 +3434,33 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			// prewalk targets wait above so they resolve against the refreshed catalog.
 			sessionPromise.catch(() => {});
 			let session: AgentSession;
+			let modelFallbackMessage: string | undefined;
 			try {
 				if (backgroundRefresh && !waitForRefreshBeforeSessionConfiguration) {
 					await awaitAbortable(backgroundRefresh);
 				}
-				({ session } = await awaitAbortable(sessionPromise));
+				const created = await awaitAbortable(sessionPromise);
+				session = created.session;
+				modelFallbackMessage = created.modelFallbackMessage;
 			} catch (err) {
 				// Abort raced session startup. The session may still resolve later
 				// holding live LSP/MCP child processes — dispose it when it does so
 				// a cancelled subagent cannot leak them.
 				void sessionPromise.then(created => created.session.dispose()).catch(() => {});
 				throw err;
+			}
+			if (deferExplicitModelResolution && !session.model) {
+				try {
+					await session.dispose();
+				} catch {}
+				throw new Error(
+					modelFallbackMessage ??
+						`Requested subagent model selector did not resolve after extension loading: ${modelPatterns.join(", ")}`,
+				);
+			}
+			if (deferExplicitModelResolution && session.servingModel) {
+				progress.resolvedModel = session.servingModel.selector;
+				progress.resolvedModelIsFallback = session.servingModel.isFallback;
 			}
 			sessionCreatedAt = performance.now();
 

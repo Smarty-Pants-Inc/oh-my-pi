@@ -132,6 +132,7 @@ describe("issue #985: subagent dispatch auth fallback", () => {
 		);
 
 		expect(result.authFallbackUsed).toBe(false);
+		expect(result.fallbackUsed).toBe(true);
 		expect(result.model?.provider).toBe("deepseek");
 		expect(result.model?.id).toBe("shared-id");
 	});

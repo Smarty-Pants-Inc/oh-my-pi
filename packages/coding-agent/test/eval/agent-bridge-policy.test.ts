@@ -418,7 +418,7 @@ describe("runEvalAgent", () => {
 		});
 		const controller = new AbortController();
 
-		const pending = runEvalAgent({ prompt: "work" }, { session, signal: controller.signal });
+		const pending = runEvalAgent({ prompt: "work", model: "p/request" }, { session, signal: controller.signal });
 		await refreshStarted.promise;
 		controller.abort(new Error("cancelled during model discovery"));
 		await expect(pending).rejects.toThrow("cancelled during model discovery");

@@ -308,7 +308,7 @@ describe("task async preflight", () => {
 
 		const pending = tool.execute(
 			"abort-preflight",
-			{ agent: "task", name: "Cancelled", task: "Work." } as TaskParams,
+			{ agent: "task", name: "Cancelled", task: "Work.", model: "p/available" } as TaskParams,
 			controller.signal,
 		);
 		await refreshStarted.promise;

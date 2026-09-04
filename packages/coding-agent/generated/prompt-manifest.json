@@ -7203,7 +7203,7 @@
     },
     {
       "path": "packages/coding-agent/src/config/model-resolver.ts",
-      "sha256": "7d2b89e5910405552afd9e518222589f0205f9d03fb079ab9f821ba746bc2911"
+      "sha256": "56f7a7835034e4622e0bd356afe79509210889f684ff020b4cfca0034060c810"
     },
     {
       "path": "packages/coding-agent/src/config/model-roles.ts",
@@ -8703,7 +8703,7 @@
     },
     {
       "path": "packages/coding-agent/src/sdk.ts",
-      "sha256": "622cfe5e7cac8c0faea9863e5bc11829d5efacb941af29590345622fbac296de"
+      "sha256": "1ba45d8e4846965c0a29f13dd20edf4c768954c021102857dd4308845775bb7e"
     },
     {
       "path": "packages/coding-agent/src/secrets/index.ts",
@@ -9319,7 +9319,7 @@
     },
     {
       "path": "packages/coding-agent/src/task/executor.ts",
-      "sha256": "da270b0899a6283f2920f4b97741737f3eacd18caa401b3d3150df72ecca397e"
+      "sha256": "16c02248afba05c748d4c14c4f6cd9d7f1582cf6f7c9022f9ea07b2820e58c26"
     },
     {
       "path": "packages/coding-agent/src/task/index.ts",
@@ -9391,7 +9391,7 @@
     },
     {
       "path": "packages/coding-agent/src/task/structured-subagent.ts",
-      "sha256": "db3ca9412be5ec37d225f93ddb5daab623d588676449f55244d50da2085fd8ef"
+      "sha256": "68a6cbfca9009af9d0318da40d26bef49b2adf753c0da369ea16867fdb9d2e03"
     },
     {
       "path": "packages/coding-agent/src/task/subprocess-tool-registry.ts",
@@ -11147,5 +11147,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "dd0e142ed202afa17f67ff5d232528eb7bca6e80a7efc915662b0e57676232ea"
+  "rootSha256": "a69d1b096e840f79d30d983d0883c84f7a16b729effe5f90a03d16cb16f2c72e"
 }

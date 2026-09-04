@@ -326,6 +326,41 @@ describe("structured subagent primitive", () => {
 		);
 		expect(definitionPolicy.modelRole).toBe("definition");
 	});
+	it("dispatches inherited session defaults without awaiting model refresh for task or eval", async () => {
+		mockDiscovery();
+		const dispatched: executorModule.ExecutorOptions[] = [];
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			dispatched.push(options);
+			return result();
+		});
+
+		for (const invocationKind of ["task", "eval"] as const) {
+			const modelRegistry = {
+				awaitBackgroundRefresh: () => {
+					throw new Error("inherited session defaults must not await shared preflight refresh");
+				},
+				getAvailable: () => {
+					throw new Error("inherited session defaults must not snapshot the model catalog");
+				},
+				getAll: () => {
+					throw new Error("inherited session defaults must not snapshot the model catalog");
+				},
+			} as unknown as ModelRegistry;
+			const childSession = session({ modelRegistry });
+			childSession.getActiveModelString = () => "p/session-default";
+			childSession.getModelString = () => "p/session-default";
+
+			const settled = await runStructuredSubagent(
+				request({ session: childSession, invocationKind, retainArtifacts: true }),
+			);
+			const options = dispatched.at(-1);
+			expect(options?.modelOverride).toEqual(["p/session-default"]);
+			expect(options?.modelSelectionExplicit).toBe(false);
+			expect(options?.allowedModels).toBeUndefined();
+			expect(options?.modelCandidates).toBeUndefined();
+			await fs.rm(settled.artifactsDir, { recursive: true, force: true });
+		}
+	});
 	it("awaits model refresh and rejects selectors outside the active enabledModels scope", async () => {
 		const allowed = model("p", "allowed");
 		const denied = model("p", "denied");

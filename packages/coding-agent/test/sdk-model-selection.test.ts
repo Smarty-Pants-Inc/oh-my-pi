@@ -145,6 +145,21 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		}
 	});
 
+	test("marks a later deferred selector as fallback without a parent model", async () => {
+		const { session, modelFallbackMessage } = await createAgentSession(
+			buildSessionOptions(["missing-provider/missing-model", "runtime-provider/runtime-fallback-model"]),
+		);
+
+		try {
+			expect(session.model?.provider).toBe("runtime-provider");
+			expect(session.model?.id).toBe("runtime-fallback-model");
+			expect(session.servingModel?.isFallback).toBe(true);
+			expect(modelFallbackMessage).toBeUndefined();
+		} finally {
+			await session.dispose();
+		}
+	});
+
 	test("resolves explicit dynamic-only modelPattern from fresh runtime cache", async () => {
 		const authStorage = createInMemoryAuthStorage();
 		authStoragesToClose.push(authStorage);
@@ -531,6 +546,7 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		try {
 			expect(session.model?.provider).toBe("runtime-provider");
 			expect(session.model?.id).toBe("runtime-fallback-model");
+			expect(session.servingModel?.isFallback).toBe(true);
 			expect(getApiKeySpy.mock.calls).toContainEqual([
 				expect.objectContaining({ id: "runtime-fallback-model" }),
 				providerSessionId,

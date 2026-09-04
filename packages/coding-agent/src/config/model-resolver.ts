@@ -1623,10 +1623,15 @@ export async function resolveModelOverrideWithAuthFallback(
 	model?: Model<Api>;
 	thinkingLevel?: ConfiguredThinkingLevel;
 	explicitThinkingLevel: boolean;
+	/** True only when the authenticated parent model replaced every requested candidate. */
 	authFallbackUsed: boolean;
+	/** True when selection advanced beyond the configured primary for any reason. */
+	fallbackUsed: boolean;
 	warning?: string;
 }> {
-	if (modelPatterns.length === 0) return { explicitThinkingLevel: false, authFallbackUsed: false };
+	if (modelPatterns.length === 0) {
+		return { explicitThinkingLevel: false, authFallbackUsed: false, fallbackUsed: false };
+	}
 	const available = availableModels ?? modelRegistry.getAvailable();
 	const candidates = modelCandidates ?? available;
 	const orderedPatterns = modelPatterns.flatMap(pattern => resolveConfiguredModelPatterns(pattern, settings));
@@ -1644,35 +1649,60 @@ export async function resolveModelOverrideWithAuthFallback(
 				warning?: string;
 		  }
 		| undefined;
+	let firstResolvedIsFallback = false;
 	let warning: string | undefined;
-	for (const pattern of orderedPatterns) {
+	for (const [patternIndex, pattern] of orderedPatterns.entries()) {
 		const candidate = resolveCandidate(pattern);
 		if (!warning && candidate.warning) warning = candidate.warning;
 		if (!candidate.model) continue;
-		firstResolved ??= candidate;
+		if (!firstResolved) {
+			firstResolved = candidate;
+			firstResolvedIsFallback = patternIndex > 0;
+		}
 		const key = await modelRegistry.getApiKey(candidate.model, sessionId);
 		if (key === kNoAuth || isAuthenticated(key)) {
-			return { ...candidate, authFallbackUsed: false, warning: candidate.warning ?? warning };
+			return {
+				...candidate,
+				authFallbackUsed: false,
+				fallbackUsed: patternIndex > 0,
+				warning: candidate.warning ?? warning,
+			};
 		}
 	}
 	if (!firstResolved) {
-		return { explicitThinkingLevel: false, authFallbackUsed: false, warning };
+		return { explicitThinkingLevel: false, authFallbackUsed: false, fallbackUsed: false, warning };
 	}
 
 	if (!parentActiveModelPattern) {
-		return { ...firstResolved, authFallbackUsed: false, warning: firstResolved.warning ?? warning };
+		return {
+			...firstResolved,
+			authFallbackUsed: false,
+			fallbackUsed: firstResolvedIsFallback,
+			warning: firstResolved.warning ?? warning,
+		};
 	}
 	const fallback = resolveCandidate(parentActiveModelPattern);
 	if (!fallback.model || modelsAreEqual(fallback.model, firstResolved.model)) {
-		return { ...firstResolved, authFallbackUsed: false, warning: firstResolved.warning ?? warning };
+		return {
+			...firstResolved,
+			authFallbackUsed: false,
+			fallbackUsed: firstResolvedIsFallback,
+			warning: firstResolved.warning ?? warning,
+		};
 	}
 	const fallbackKey = await modelRegistry.getApiKey(fallback.model, sessionId);
 	if (fallbackKey !== kNoAuth && !isAuthenticated(fallbackKey)) {
-		return { ...firstResolved, authFallbackUsed: false, warning: firstResolved.warning ?? warning };
+		return {
+			...firstResolved,
+			authFallbackUsed: false,
+			fallbackUsed: firstResolvedIsFallback,
+			warning: firstResolved.warning ?? warning,
+		};
 	}
 	return {
 		...fallback,
 		authFallbackUsed: true,
+		fallbackUsed: true,
 		warning: firstResolved.warning ?? warning ?? fallback.warning,
 	};
 }
