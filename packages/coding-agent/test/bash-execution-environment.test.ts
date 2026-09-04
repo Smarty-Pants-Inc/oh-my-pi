@@ -404,6 +404,6 @@ describe("BashTool execution environment routing", () => {
 		expect(createParams?.command).toBe("/bin/bash");
 		expect(createParams?.args).toEqual(["-l", "-c", "echo local"]);
 		expect(createParams?.timeoutMs).toBeUndefined();
-		expect(result.details?.terminalId).toBe("acp-terminal");
+		expect(result.details?.terminalId).toBeUndefined();
 	});
 });

@@ -396,6 +396,7 @@ describe("AgentSession queued prompt seam", () => {
 	it("retimes only the selected owner and its contiguous preceding companions", async () => {
 		const agent = createAgent();
 		const target = createSession(agent);
+		agent.state.isStreaming = true;
 		const existingSteer = userMessage("existing steer", 10, true);
 		const earlierFollowUp = userMessage("earlier follow-up", 20);
 		const unrelatedHidden = customMessage("other-hidden", "do not move", {
@@ -452,6 +453,7 @@ describe("AgentSession queued prompt seam", () => {
 			id,
 			delivery: "afterCurrent",
 		});
+		agent.state.isStreaming = false;
 	});
 
 	it("notifies only for visible identity or delivery changes through one agent subscription", () => {
@@ -598,6 +600,7 @@ describe("AgentSession queued prompt seam", () => {
 	it("converts a collab prompt retimed to after-current as a raw user turn", async () => {
 		const agent = createAgent();
 		const target = createSession(agent);
+		agent.state.isStreaming = true;
 		const owner = customMessage(COLLAB_PROMPT_MESSAGE_TYPE, "guest follow-up", {
 			display: true,
 			attribution: "user",
@@ -615,5 +618,6 @@ describe("AgentSession queued prompt seam", () => {
 		expect(converted[0]?.role).toBe("user");
 		expect(JSON.stringify(converted[0])).toContain("guest follow-up");
 		expect(JSON.stringify(converted[0])).not.toContain("system-notice");
+		agent.state.isStreaming = false;
 	});
 });

@@ -1794,7 +1794,53 @@ describe("Settings", () => {
 			expect(settings.get("compaction.methodOrder")).toEqual(["soft"]);
 		});
 	});
+
+	describe("task isolation defaults", () => {
+		it("enables isolated subagents by default", () => {
+			expect(Settings.isolated().get("task.isolation.enabled")).toBe(true);
+		});
+	});
 	describe("migrations", () => {
+		it("migrates nested task isolation mode none to disabled", async () => {
+			await writeSettings({ task: { isolation: { mode: "none" } } });
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			expect(settings.get("task.isolation.enabled")).toBe(false);
+			expect(settings.get("isolation.backend")).toBe("auto");
+			settings.set("display.showTokenUsage", true);
+			await settings.flush();
+			const saved = await readSettings();
+			expect((saved.task as Record<string, Record<string, unknown>>).isolation).toEqual({ enabled: false });
+		});
+
+		it("migrates flat task isolation mode to enabled with its backend", async () => {
+			await writeSettings({ [["task", "isolation", "mode"].join(".")]: "reflink" });
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			expect(settings.get("task.isolation.enabled")).toBe(true);
+			expect(settings.get("isolation.backend")).toBe("reflink");
+		});
+
+		it("renames legacy isolation backends during mode migration", async () => {
+			await writeSettings({ task: { isolation: { mode: "worktree" } }, isolation: { backend: "fuse-overlay" } });
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			expect(settings.get("task.isolation.enabled")).toBe(true);
+			expect(settings.get("isolation.backend")).toBe("overlayfs");
+		});
+
+		it("keeps explicit task isolation enabled over a legacy mode", async () => {
+			await writeSettings({ task: { isolation: { enabled: false, mode: "reflink" } } });
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			expect(settings.get("task.isolation.enabled")).toBe(false);
+			expect(settings.get("isolation.backend")).toBe("reflink");
+		});
+
 		it("consolidates legacy Exa suite toggles onto exa.enabled", async () => {
 			await writeSettings({
 				exa: {

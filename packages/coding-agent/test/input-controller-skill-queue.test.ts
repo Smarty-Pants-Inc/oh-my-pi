@@ -1036,8 +1036,7 @@ describe("UiHelpers / InputController against derived queued custom display", ()
 	it("handles a timing-preview Left before a later focused-subagent listener", async () => {
 		fixture = await createRealSession();
 		const { session } = fixture;
-		vi.spyOn(session.agent, "continue").mockResolvedValue(undefined);
-		vi.spyOn(session.agent, "continueQueuedMessageBlock").mockResolvedValue(undefined);
+		session.agent.state.isStreaming = true;
 		session.agent.followUp({
 			role: "user",
 			content: "retime before unfocus",
@@ -1057,9 +1056,9 @@ describe("UiHelpers / InputController against derived queued custom display", ()
 		expect(session.getQueuedPrompts()[0]?.delivery).toBe("afterCurrent");
 		expect(Bun.stripANSI(pendingMessagesContainer.render(120).join("\n"))).toContain("[NEXT] retime before unfocus");
 		expect(dispatchInput("\r")).toEqual({ consume: true });
-		await session.waitForIdle();
 		await waitForImmediate();
 		expect(session.getQueuedPrompts()[0]?.delivery).toBe("steer");
+		session.agent.state.isStreaming = false;
 	});
 
 	it("delegates back-to-back timing saves to the session serializer", async () => {
@@ -1138,8 +1137,7 @@ describe("UiHelpers / InputController against derived queued custom display", ()
 	it("preserves a timing preview across unrelated queue changes", async () => {
 		fixture = await createRealSession();
 		const { session } = fixture;
-		vi.spyOn(session.agent, "continue").mockResolvedValue(undefined);
-		vi.spyOn(session.agent, "continueQueuedMessageBlock").mockResolvedValue(undefined);
+		session.agent.state.isStreaming = true;
 		session.agent.followUp({
 			role: "user",
 			content: "selected prompt",
@@ -1169,6 +1167,7 @@ describe("UiHelpers / InputController against derived queued custom display", ()
 			["selected prompt", "steer"],
 			["unrelated prompt", "afterCurrent"],
 		]);
+		session.agent.state.isStreaming = false;
 	});
 
 	it("keeps the timing editor active when compaction starts", async () => {

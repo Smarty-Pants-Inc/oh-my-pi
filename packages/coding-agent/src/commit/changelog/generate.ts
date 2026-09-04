@@ -30,6 +30,7 @@ export const changelogTool = {
 export interface ChangelogPromptInput {
 	model: Model<Api>;
 	apiKey: ApiKey;
+	sessionId: string;
 	thinkingLevel?: ThinkingLevel;
 	cacheRetention?: SimpleStreamOptions["cacheRetention"];
 	changelogPath: string;
@@ -42,6 +43,7 @@ export interface ChangelogPromptInput {
 export async function generateChangelogEntries({
 	model,
 	apiKey,
+	sessionId,
 	thinkingLevel,
 	cacheRetention,
 	changelogPath,
@@ -67,6 +69,7 @@ export async function generateChangelogEntries({
 			},
 			{
 				apiKey,
+				sessionId,
 				maxTokens: 1200,
 				reasoning: toReasoningEffort(thinkingLevel),
 				cacheRetention,

@@ -212,6 +212,7 @@ import { connectProxiedSocket, getProxyForUrl } from "../utils/proxy";
 import { createRequestDebugSession, isRequestDebugEnabled, type RequestDebugResponseLog } from "../utils/request-debug";
 import { sanitizeSchemaForCursor, toolWireSchema } from "../utils/schema";
 import { formatConnectEndStreamError } from "./connect-error-detail";
+import mcpExternalHandoffMessage from "./cursor-external-tool-handoff.md" with { type: "text" };
 import {
 	buildMcpStateResult,
 	buildNeutralHookResult,
@@ -350,6 +351,8 @@ export interface CursorOptions extends StreamOptions {
 	conversationId?: string;
 	execHandlers?: CursorExecHandlers;
 	onToolResult?: CursorToolResultHandler;
+	/** Treat unhandled MCP calls as accepted handoffs to an external executor. */
+	externalToolExecutor?: boolean;
 	/** Wire model id selected after thinking-effort routing (`resolveWireModelId`). */
 	wireModelId?: string;
 }
@@ -711,7 +714,10 @@ function streamCursorWithWireMode(
 			const { requestBytes, conversationState } = builtRequest;
 			serializedFallbackWireModelId = builtRequest.fallbackWireModelId;
 			conversationStateCache.set(conversationId, conversationState);
-			const requestContextTools = buildMcpToolDefinitions(context.tools);
+			const requestContextTools = buildMcpToolDefinitions(
+				context.tools,
+				model.requiresCursorToolSchemaProjection === true,
+			);
 			await options?.onToolContracts?.(
 				{
 					tools: requestContextTools.map(definition => ({
@@ -891,6 +897,7 @@ function streamCursorWithWireMode(
 							requestContextRules,
 							onConversationCheckpoint,
 							options?.providerDispatchGuard,
+							options?.externalToolExecutor,
 						).catch(error => {
 							const reason = error instanceof Error ? error : new Error(String(error));
 							dispatchError ??= reason;
@@ -1182,9 +1189,11 @@ export async function handleServerMessage(
 	requestContextTools: McpToolDefinition[],
 	requestContextRules: CursorRule[] = [],
 	onConversationCheckpoint?: (checkpoint: ConversationStateStructure) => void,
-	providerDispatchGuard?: () => void,
+	providerDispatchGuard?: (() => void) | boolean,
+	externalToolExecutor = false,
 ): Promise<void> {
-	if (providerDispatchGuard) cursorProviderDispatchGuards.set(h2Request, providerDispatchGuard);
+	if (typeof providerDispatchGuard === "function") cursorProviderDispatchGuards.set(h2Request, providerDispatchGuard);
+	else if (typeof providerDispatchGuard === "boolean") externalToolExecutor = providerDispatchGuard;
 	const msgCase = msg.message.case;
 
 	log("serverMessage", msgCase, msg.message.value);
@@ -1209,6 +1218,7 @@ export async function handleServerMessage(
 				output,
 				stream,
 				state,
+				externalToolExecutor,
 			),
 		);
 	} else if (msgCase === "interactionQuery") {
@@ -1686,6 +1696,7 @@ async function handleExecServerMessage(
 	output: AssistantMessage,
 	stream: AssistantMessageEventStream,
 	state: BlockState,
+	externalToolExecutor: boolean,
 ): Promise<void> {
 	const execCase = execMsg.message.case;
 	log("exec", "dispatch", { execCase, execId: execMsg.execId, hasHandlers: !!execHandlers });
@@ -2034,7 +2045,10 @@ async function handleExecServerMessage(
 				execHandlers?.mcp?.bind(execHandlers),
 				onToolResult,
 				toolResult => buildMcpResultFromToolResult(mcpCall, toolResult),
-				_reason => buildMcpToolNotFoundResult(mcpCall),
+				_reason =>
+					externalToolExecutor && !execHandlers?.mcp
+						? buildMcpExternalHandoffResult()
+						: buildMcpToolNotFoundResult(mcpCall),
 				error => buildMcpErrorResult(error),
 				execHandlers?.mcp ? { toolCallId: mcpCall.toolCallId, toolName: mcpCall.toolName } : null,
 			);
@@ -4098,6 +4112,27 @@ function buildMcpResultFromToolResult(_mcpCall: CursorMcpCall, toolResult: ToolR
 	});
 }
 
+const MCP_EXTERNAL_HANDOFF_MESSAGE = mcpExternalHandoffMessage.trim();
+
+function buildMcpExternalHandoffResult() {
+	return create(McpResultSchema, {
+		result: {
+			case: "success",
+			value: create(McpSuccessSchema, {
+				content: [
+					create(McpToolResultContentItemSchema, {
+						content: {
+							case: "text",
+							value: create(McpTextContentSchema, { text: MCP_EXTERNAL_HANDOFF_MESSAGE }),
+						},
+					}),
+				],
+				isError: false,
+			}),
+		},
+	});
+}
+
 function buildMcpToolNotFoundResult(mcpCall: CursorMcpCall) {
 	return create(McpResultSchema, {
 		result: {
@@ -4722,7 +4757,10 @@ function isJsonValue(value: unknown): value is JsonValue {
 	return true;
 }
 
-export function buildMcpToolDefinitions(tools: Tool[] | undefined): McpToolDefinition[] {
+export function buildMcpToolDefinitions(
+	tools: Tool[] | undefined,
+	requiresCursorToolSchemaProjection = false,
+): McpToolDefinition[] {
 	if (!tools || tools.length === 0) {
 		return [];
 	}
@@ -4742,7 +4780,8 @@ export function buildMcpToolDefinitions(tools: Tool[] | undefined): McpToolDefin
 	const forwarded = writeTool ? [...advertisedTools, writeTool] : advertisedTools;
 
 	return forwarded.map(tool => {
-		const jsonSchema = sanitizeSchemaForCursor(toolWireSchema(tool));
+		const wireSchema = toolWireSchema(tool);
+		const jsonSchema = requiresCursorToolSchemaProjection ? sanitizeSchemaForCursor(wireSchema) : wireSchema;
 		const schemaValue: JsonValue =
 			jsonSchema !== null && !Array.isArray(jsonSchema) && isJsonValue(jsonSchema)
 				? jsonSchema

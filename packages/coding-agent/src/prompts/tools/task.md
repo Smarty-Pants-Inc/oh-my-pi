@@ -10,32 +10,46 @@ Execution returns job IDs immediately; completed results are delivered automatic
 Execution waits for each assignment to finish.
 {{/if}}
 
+# Async Job Contract
+- Results auto-deliver. A settled `hub jobs`/`hub wait` snapshot is the delivery; no duplicate `async-result` follows.
+- Job IDs are process-local and expire roughly five minutes after settlement. Afterward, use the agent ID with `hub send`, `agent://<id>`, or `history://<id>`.
+- With `outputSchema`, a result's parsed payload — when present — is served at `agent://<id>` (fields via `agent://<id>?q=.<field>`) regardless of validity; a schema-violating (invalid) result also previews the payload inline in the auto-delivered follow-up.
+- `completed` means successful yield/job exit, not artifact acceptance. Verify claimed changes.
+
+
 # Task Design
 - Pick each item's most specific available agent. Omitting `agent` selects the spawn-policy default (`{{defaultAgent}}`); omit it only when that agent fits the task. Otherwise pass the specialist explicitly.
 - Parallelize independent ownership. Same-file edits are not guaranteed to merge.{{#if ircEnabled}} Have siblings coordinate through `hub` before editing shared files.{{/if}} Keep coupled changes under one integration owner.
 
 # Inputs
 {{#if batchEnabled}}
-- `context`: Shared goal, constraints, and contracts for every assignment.
-- `tasks[]`: Independent assignments to run concurrently when appropriate.
-  - `name`: Optional stable identifier.
-  - `agent`: Optional agent type. Omit it to use `{{defaultAgent}}`.
+- `context`: Shared goal, constraints, and contracts for every assignment. Applies to the entire batch; do not duplicate this background into individual tasks.
+- `tasks[]`: Array of subagents to spawn.
+  - `name`: A stable CamelCase identifier (≤32 chars), used to address the agent (IRC, job ids). Generated automatically if omitted.
+  - `agent`: The agent type to spawn (e.g. {{#if scoutAvailable}}`scout`, {{/if}}`reviewer`). Omitting `agent` selects the spawn-policy default (`{{defaultAgent}}`).
   - `task`: Complete, self-contained assignment.
   - `model`: Optional direct model selector. It overrides the selected agent's default model.
-{{#if effortEnabled}}  - `effort`: Optional reasoning level: `"lo"`, `"med"`, or `"hi"`.
+{{#if evalToolsEnabled}}  - `tools`: Names of eval-defined tools (`@tool` in Python, `tool(fn, {…})` in JS) to expose to this subagent.
+{{/if}}{{#if effortEnabled}}  - `effort`: Scale with complexity: `"lo"`|`"med"`|`"hi"`.
 {{/if}}  - `outputSchema`: Optional result schema.
   - `schemaMode`: `"permissive"` (default) or `"strict"`.
 {{#if isolationEnabled}}  - `isolated`: Run in a dedicated worktree.
 {{/if}}
 {{else}}
-- `name`: Optional stable identifier.
-- `agent`: Optional agent type. Omit it to use `{{defaultAgent}}`.
-- `task`: Complete, self-contained assignment.
-- `model`: Optional direct model selector. It overrides the selected agent's default model.
-{{#if effortEnabled}}- `effort`: Optional reasoning level: `"lo"`, `"med"`, or `"hi"`.
-{{/if}}- `outputSchema`: Optional result schema.
-- `schemaMode`: `"permissive"` (default) or `"strict"`.
-{{#if isolationEnabled}}- `isolated`: Run in a dedicated worktree.
+- `name`: A stable CamelCase identifier (≤32 chars), used to address the agent (IRC, job ids). Generated automatically if omitted.
+- `agent`: The agent type to spawn (e.g. {{#if scoutAvailable}}`scout`, {{/if}}`reviewer`). Omitting `agent` selects the spawn-policy default (`{{defaultAgent}}`).
+- `task`: Complete, self-contained instructions. One-liners or missing acceptance criteria are prohibited.
+{{#if evalToolsEnabled}}- `tools`: Names of eval-defined tools (`@tool` in Python, `tool(fn, {…})` in JS) to expose to this subagent.
+{{/if}}{{#if effortEnabled}}- `effort`: Scale with complexity: `"lo"`|`"med"`|`"hi"`.
+{{/if}}- `model`: Optional direct model selector. It overrides the selected agent's default model.
+- `outputSchema`: Invocation-specific JSON Schema. Overrides the selected agent and parent-session schemas.
+- `schemaMode`: `"permissive"` (default) accepts a retry-exhausted invalid result with a warning; `"strict"` fails it.
+{{#if isolationEnabled}}
+{{#if applyIsolatedChanges}}
+- `isolated`: Run in a dedicated worktree; successful changes are automatically applied to the parent checkout.
+{{else}}
+- `isolated`: Run in a dedicated worktree; changes are retained as patch or branch artifacts without modifying the parent checkout.
+{{/if}}
 {{/if}}
 {{/if}}
 

@@ -1,7 +1,7 @@
 import * as path from "node:path";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { parseArchivePathCandidates } from "@oh-my-pi/pi-utils/ar";
-import { getFileSnapshotStore, parseSeenLinesFromHashlineBody } from "../edit/file-snapshot-store";
+import { getEditStore } from "../edit/store";
 import { normalizeToLF } from "../edit/normalize";
 import type { ToolSession } from "../sdk";
 import { type ExecutionEnvironmentBinding, mapExecutionEnvironmentPath } from "../session/execution-environment";
@@ -10,8 +10,7 @@ import { CONVERTIBLE_EXTENSIONS } from "../utils/markit";
 import { splitPathAndSel } from "./path-utils";
 import type { ReadToolDetails } from "./read";
 import {
-	buildInMemoryMultiRangeResult,
-	buildInMemoryTextResult,
+	buildInMemorySelectorResult,
 	countTextLines,
 	formatSummaryElisionFooter,
 	type HashlineHeaderContext,
@@ -19,7 +18,7 @@ import {
 	markMarkdownContentType,
 	prependHashlineHeader,
 } from "./read-format";
-import { isMultiRange, isRawSelector, parseSel, selToOffsetLimit } from "./read-selector";
+import { parseSel } from "./read-selector";
 import { isProseSummaryPath, renderSummary, trySummarizeText } from "./read-summary";
 import { parseSqlitePathCandidates } from "./sqlite-reader";
 import { ToolAbortError, ToolError, throwIfAborted } from "./tool-errors";
@@ -75,7 +74,7 @@ export async function readEnvironmentFile(
 
 	const details = markMarkdownContentType(
 		session,
-		{ resolvedPath: remotePath, fileSize: Buffer.byteLength(text, "utf-8") },
+		{ resolvedPath: remotePath, fileSize: Buffer.byteLength(text, "utf-8"), isDirectory: false },
 		remotePath,
 	);
 	if (
@@ -93,20 +92,17 @@ export async function readEnvironmentFile(
 			);
 			let summaryHashContext: HashlineHeaderContext | undefined;
 			if (resolveFileDisplayMode(session).hashLines) {
-				const tag = getFileSnapshotStore(session).record(remotePath, normalizeToLF(text));
+				const tag = getEditStore(session).recordSnapshot(remotePath, normalizeToLF(text));
 				summaryHashContext = hashlineHeaderContext(remotePath, tag);
 			}
 			const bodyText = footer ? `${renderedSummary.text}\n\n${footer}` : renderedSummary.text;
 			const modelText = prependHashlineHeader(bodyText, summaryHashContext);
 			if (summaryHashContext?.tag) {
-				getFileSnapshotStore(session).recordSeenLines(
-					remotePath,
-					summaryHashContext.tag,
-					parseSeenLinesFromHashlineBody(renderedSummary.text),
-				);
+				getEditStore(session).recordSeenLinesFromBody(remotePath, summaryHashContext.tag, renderedSummary.text);
 			}
 			return toolResult<ReadToolDetails>({
 				...details,
+				sourceLineAligned: false,
 				displayContent: { text: renderedSummary.displayText, startLine: 1 },
 				summary: {
 					lines: countTextLines(renderedSummary.text),
@@ -120,21 +116,9 @@ export async function readEnvironmentFile(
 		}
 	}
 
-	if (isMultiRange(parsed) && parsed.kind === "lines") {
-		return buildInMemoryMultiRangeResult(session, text, parsed.ranges, {
-			details,
-			sourcePath: remotePath,
-			entityLabel: "file",
-			raw: isRawSelector(parsed),
-			environment: true,
-		});
-	}
-	const { offset, limit } = selToOffsetLimit(parsed);
-	return buildInMemoryTextResult(session, text, offset, limit, {
+	return buildInMemorySelectorResult(session, text, parsed, {
 		details,
 		sourcePath: remotePath,
 		entityLabel: "file",
-		raw: isRawSelector(parsed),
-		environment: true,
 	});
 }

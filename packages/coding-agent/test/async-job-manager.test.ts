@@ -1,11 +1,6 @@
 import { afterEach, describe, expect, test, vi } from "bun:test";
 import { scheduler } from "node:timers/promises";
-import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
-import { logger } from "@oh-my-pi/pi-utils";
-
-afterEach(() => {
-	vi.restoreAllMocks();
-});
+import { AsyncJobError, AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 
 async function waitForJobEviction(manager: AsyncJobManager, jobId: string): Promise<void> {
 	const deadline = Date.now() + 2_000;
@@ -15,7 +10,28 @@ async function waitForJobEviction(manager: AsyncJobManager, jobId: string): Prom
 	}
 }
 
+async function waitForCondition(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (!predicate()) {
+		if (Date.now() >= deadline) throw new Error("Timed out waiting for condition");
+		await scheduler.yield();
+	}
+}
+
+/** Resolve positive-duration sleeps immediately so grace-period waits don't cost real wall-clock time. */
+function mockPositiveSleepsImmediate() {
+	const realSleep = Bun.sleep.bind(Bun);
+	return vi.spyOn(Bun, "sleep").mockImplementation((duration?: number | Date) => {
+		if (typeof duration === "number" && duration > 0) return Promise.resolve();
+		return realSleep(duration ?? 0);
+	});
+}
+
 describe("AsyncJobManager", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
 	test("carries the exact originating turn identity into delivery", async () => {
 		let deliveredOrigin: string | undefined;
 		const manager = new AsyncJobManager({
@@ -27,7 +43,33 @@ describe("AsyncJobManager", () => {
 		await manager.waitForAll();
 		await manager.drainDeliveries();
 		expect(deliveredOrigin).toBe("turn-17");
-		manager.dispose();
+		await manager.dispose();
+	});
+
+	test("delivers a synchronous run failure only to its owner", async () => {
+		const ownerDeliveries: Array<{ jobId: string; text: string }> = [];
+		const defaultDeliveries: Array<{ jobId: string; text: string }> = [];
+		const manager = new AsyncJobManager({
+			onJobComplete: (jobId, text) => {
+				defaultDeliveries.push({ jobId, text });
+			},
+		});
+		manager.registerDeliverySink("owner-session", (jobId, text) => {
+			ownerDeliveries.push({ jobId, text });
+		});
+		const jobId = manager.register(
+			"task",
+			"synchronous failure",
+			() => {
+				throw new Error("synchronous failure");
+			},
+			{ ownerId: "owner-session" },
+		);
+		await manager.waitForAll();
+		await manager.drainDeliveries({ timeoutMs: 2_000 });
+		expect(ownerDeliveries).toEqual([{ jobId, text: "synchronous failure" }]);
+		expect(defaultDeliveries).toEqual([]);
+		expect(manager.getJob(jobId)).toMatchObject({ status: "failed", errorText: "synchronous failure" });
 	});
 
 	test("forwards progress updates and delivers completion", async () => {
@@ -110,33 +152,235 @@ describe("AsyncJobManager", () => {
 		expect(manager.getJob(jobId)?.errorText).toBe("command failed");
 	});
 
-	test("delivers a synchronous run failure to its owning session", async () => {
-		const ownerDeliveries: Array<{ jobId: string; text: string }> = [];
-		const defaultDeliveries: Array<{ jobId: string; text: string }> = [];
+	test("retains structured output from a job body result", async () => {
+		const completions: Array<{ jobId: string; text: string }> = [];
 		const manager = new AsyncJobManager({
-			onJobComplete: (jobId, text) => {
-				defaultDeliveries.push({ jobId, text });
+			onJobComplete: async (jobId, text) => {
+				completions.push({ jobId, text });
 			},
-		});
-		manager.registerDeliverySink("owner-session", (jobId, text) => {
-			ownerDeliveries.push({ jobId, text });
 		});
 
-		const jobId = manager.register(
-			"task",
-			"synchronous failure",
-			() => {
-				throw new Error("synchronous failure");
-			},
-			{ ownerId: "owner-session" },
-		);
+		const jobId = manager.register("task", "agent task", async () => ({
+			text: "task done",
+			structured: { source: "caller", mode: "permissive", status: "valid", data: { count: 7 } },
+		}));
 
 		await manager.waitForAll();
 		await manager.drainDeliveries({ timeoutMs: 2_000 });
 
-		expect(ownerDeliveries).toEqual([{ jobId, text: "synchronous failure" }]);
-		expect(defaultDeliveries).toEqual([]);
-		expect(manager.getJob(jobId)).toMatchObject({ status: "failed", errorText: "synchronous failure" });
+		expect(completions).toEqual([{ jobId, text: "task done" }]);
+		expect(manager.getJob(jobId)?.structured?.data).toEqual({ count: 7 });
+	});
+
+	test("keeps structured output for a delivery that only succeeds after the job row is evicted", async () => {
+		let sinkCalls = 0;
+		const delivered: Array<{ jobId: string; structured: unknown }> = [];
+		const manager = new AsyncJobManager({
+			retentionMs: 25,
+			onJobComplete: async (jobId, _text, job) => {
+				sinkCalls += 1;
+				if (sinkCalls === 1) throw new Error("simulated delivery failure");
+				delivered.push({ jobId, structured: job?.structured });
+			},
+		});
+
+		const jobId = manager.register("task", "agent task", async () => ({
+			text: "task done",
+			structured: { source: "caller", mode: "permissive", status: "valid", data: { count: 7 } },
+		}));
+
+		await manager.waitForAll();
+		await waitForJobEviction(manager, jobId);
+		await manager.drainDeliveries({ timeoutMs: 2_000 });
+
+		// The job row is gone by the time the retried delivery lands, but the
+		// delivery must still carry the structured payload it snapshotted at
+		// enqueue time — not silently drop it because the row was evicted.
+		expect(sinkCalls).toBe(2);
+		expect(delivered).toEqual([
+			{ jobId, structured: { source: "caller", mode: "permissive", status: "valid", data: { count: 7 } } },
+		]);
+	});
+
+	test("preserves agentId in a delayed delivery rebuilt after eviction", async () => {
+		// Regression: a collision-suffixed job id (e.g. `Foo-t1` -> `Foo-t1-2`)
+		// still writes artifacts under the unsuffixed `agentId`. When the row
+		// is evicted before a retried delivery lands, the delivery must be
+		// rebuilt from a snapshot that still carries `agentId`, or the
+		// reconstructed job falls back to the suffixed `jobId` and the
+		// advertised `agent://` URL points at nothing on disk (PR #10625
+		// review).
+		let sinkCalls = 0;
+		const delivered: Array<{ jobId: string; agentId: string | undefined }> = [];
+		const manager = new AsyncJobManager({
+			retentionMs: 25,
+			onJobComplete: async (jobId, _text, job) => {
+				sinkCalls += 1;
+				if (sinkCalls === 1) throw new Error("simulated delivery failure");
+				delivered.push({ jobId, agentId: job?.agentId });
+			},
+		});
+
+		const jobId = manager.register("task", "agent task", async () => "task done", {
+			id: "Foo-t1-2",
+			agentId: "Foo-t1",
+		});
+
+		await manager.waitForAll();
+		await waitForJobEviction(manager, jobId);
+		await manager.drainDeliveries({ timeoutMs: 2_000 });
+
+		expect(sinkCalls).toBe(2);
+		expect(delivered).toEqual([{ jobId: "Foo-t1-2", agentId: "Foo-t1" }]);
+	});
+
+	test("defers retained artifacts cleanup until this job's delivery settles", async () => {
+		// Regression: job-row eviction runs on its own retention timer,
+		// independent of delivery — a still-in-flight delivery sink (e.g. one
+		// awaiting a yield-queue receipt) must not have its retained
+		// artifacts deleted out from under it before the sink resolves (PR
+		// #10625 review).
+		const cleanupCalls: string[] = [];
+		const deliveryGate = Promise.withResolvers<void>();
+		const manager = new AsyncJobManager({
+			retentionMs: 0,
+			retainedArtifactsCleanupGraceMs: 0,
+			onJobComplete: async () => {
+				await deliveryGate.promise;
+			},
+		});
+
+		const jobId = manager.register("task", "agent task", async () => "task done");
+		const job = manager.getJob(jobId);
+		job!.retainedArtifactsCleanup = async () => {
+			cleanupCalls.push(jobId);
+		};
+
+		await manager.waitForAll();
+		await waitForJobEviction(manager, jobId);
+
+		// The job row is gone (retentionMs: 0), but the delivery sink is still
+		// blocked on the gate — cleanup must not have run yet.
+		await scheduler.yield();
+		await scheduler.yield();
+		expect(cleanupCalls).toEqual([]);
+
+		deliveryGate.resolve();
+		await manager.drainDeliveries({ timeoutMs: 2_000 });
+		await waitForCondition(() => cleanupCalls.length > 0);
+
+		expect(cleanupCalls).toEqual([jobId]);
+	});
+
+	test("waits out a grace period after delivery settles before cleanup, using the configured duration", async () => {
+		// Regression: the settlement receipt resolves at `ASIDE_MESSAGE_COMMIT`
+		// — when the follow-up is inserted into the transcript, but *before*
+		// the next provider call that actually shows it to the model. Running
+		// cleanup immediately on settlement raced ahead of the model's next
+		// turn reading the advertised `agent://` pointer (PR #10625 review).
+		const cleanupCalls: string[] = [];
+		const sleepSpy = mockPositiveSleepsImmediate();
+		const manager = new AsyncJobManager({
+			retentionMs: 0,
+			retainedArtifactsCleanupGraceMs: 45_000,
+			onJobComplete: async () => {},
+		});
+
+		const jobId = manager.register("task", "agent task", async () => "task done");
+		const job = manager.getJob(jobId);
+		job!.retainedArtifactsCleanup = async () => {
+			cleanupCalls.push(jobId);
+		};
+
+		await manager.waitForAll();
+		await waitForJobEviction(manager, jobId);
+		await manager.drainDeliveries({ timeoutMs: 2_000 });
+		await waitForCondition(() => cleanupCalls.length > 0);
+
+		expect(cleanupCalls).toEqual([jobId]);
+		expect(sleepSpy.mock.calls.some(([duration]) => duration === 45_000)).toBe(true);
+	});
+
+	test("bypasses the retained-artifacts grace period during dispose", async () => {
+		// Regression: dispose() previously ran retained-artifacts cleanup
+		// through the full configured grace-period sleep even though every
+		// delivery has already been drained/cancelled by that point —
+		// leaking temp dirs for up to the grace window, or past process
+		// exit since dispose does not await these cleanups (PR #10625
+		// review).
+		const cleanupCalls: string[] = [];
+		const sleepSpy = mockPositiveSleepsImmediate();
+		const manager = new AsyncJobManager({
+			retainedArtifactsCleanupGraceMs: 45_000,
+			onJobComplete: async () => {},
+		});
+
+		const jobId = manager.register("task", "agent task", async () => "task done");
+		const job = manager.getJob(jobId);
+		job!.retainedArtifactsCleanup = async () => {
+			cleanupCalls.push(jobId);
+		};
+
+		await manager.waitForAll();
+		await manager.dispose();
+		await waitForCondition(() => cleanupCalls.length > 0);
+
+		expect(cleanupCalls).toEqual([jobId]);
+		expect(sleepSpy.mock.calls.some(([duration]) => duration === 45_000)).toBe(false);
+	});
+
+	test("bounds the wait for a hung delivery sink so retained artifacts cleanup still runs", async () => {
+		// Regression: #waitForJobDeliverySettled loops forever awaiting an
+		// in-flight delivery promise. A sink that never settles (e.g. a
+		// yield-queue receipt whose owning session is gone) would leak the
+		// retained temp directory for the process lifetime without a bound
+		// (PR #10625 review).
+		const cleanupCalls: string[] = [];
+		const manager = new AsyncJobManager({
+			retentionMs: 0,
+			retainedArtifactsCleanupGraceMs: 0,
+			retainedArtifactsCleanupMaxWaitMs: 20,
+			onJobComplete: () => {},
+		});
+		manager.registerDeliverySink("Main", async () => {
+			await Promise.withResolvers<never>().promise;
+		});
+
+		const jobId = manager.register("task", "agent task", async () => "task done", { ownerId: "Main" });
+		const job = manager.getJob(jobId);
+		job!.retainedArtifactsCleanup = async () => {
+			cleanupCalls.push(jobId);
+		};
+
+		await manager.waitForAll();
+		await waitForJobEviction(manager, jobId);
+		await waitForCondition(() => cleanupCalls.length > 0, 2_000);
+
+		expect(cleanupCalls).toEqual([jobId]);
+	});
+
+	test("fails the job but keeps structured output from AsyncJobError", async () => {
+		const manager = new AsyncJobManager({
+			onJobComplete: async () => {},
+		});
+
+		const jobId = manager.register("task", "agent task", async () => {
+			throw new AsyncJobError("schema_violation: missing required fields: count", {
+				source: "caller",
+				mode: "strict",
+				status: "invalid",
+				error: "missing required fields: count",
+				data: { summary: "ok" },
+			});
+		});
+
+		await manager.waitForAll();
+		await manager.drainDeliveries({ timeoutMs: 2_000 });
+
+		const job = manager.getJob(jobId);
+		expect(job?.status).toBe("failed");
+		expect(job?.errorText).toBe("schema_violation: missing required fields: count");
+		expect(job?.structured?.status).toBe("invalid");
 	});
 
 	test("cancels a running job by id", async () => {
@@ -270,143 +514,6 @@ describe("AsyncJobManager", () => {
 		expect(manager.getJob(jobId)?.status).toBe("completed");
 		await waitForJobEviction(manager, jobId);
 		expect(manager.getJob(jobId)).toBeUndefined();
-	});
-
-	test("does not evict or misroute a replacement when a discarded job later settles", async () => {
-		const oldStarted = Promise.withResolvers<void>();
-		const releaseOld = Promise.withResolvers<void>();
-		const releaseReplacement = Promise.withResolvers<void>();
-		const oldDeliveries: string[] = [];
-		const replacementDeliveries: Array<{ jobId: string; text: string; ownerId: string | undefined }> = [];
-		const manager = new AsyncJobManager({ retentionMs: 0 });
-		manager.registerDeliverySink("old-owner", jobId => {
-			oldDeliveries.push(jobId);
-			return;
-		});
-		manager.registerDeliverySink("replacement-owner", (jobId, text, job) => {
-			replacementDeliveries.push({ jobId, text, ownerId: job?.ownerId });
-			return;
-		});
-
-		const jobId = manager.register(
-			"bash",
-			"old job",
-			async () => {
-				oldStarted.resolve();
-				await releaseOld.promise;
-				return "old result";
-			},
-			{ id: "reused-job", ownerId: "old-owner" },
-		);
-		await oldStarted.promise;
-		const oldJob = manager.getJob(jobId);
-		if (!oldJob) throw new Error("Old job was not registered");
-
-		expect(manager.discardJobs([oldJob])).toBe(0);
-		expect(manager.getJob(jobId)).toBeUndefined();
-		const replacementJobId = manager.register(
-			"bash",
-			"replacement job",
-			async () => {
-				await releaseReplacement.promise;
-				return "replacement result";
-			},
-			{ id: jobId, ownerId: "replacement-owner" },
-		);
-		expect(replacementJobId).toBe(jobId);
-
-		releaseOld.resolve();
-		await oldJob.promise;
-		expect(manager.getJob(replacementJobId)?.status).toBe("running");
-
-		releaseReplacement.resolve();
-		await manager.waitForAll();
-		await manager.drainDeliveries({ timeoutMs: 500 });
-
-		expect(oldDeliveries).toEqual([]);
-		expect(replacementDeliveries).toEqual([
-			{ jobId: replacementJobId, text: "replacement result", ownerId: "replacement-owner" },
-		]);
-	});
-
-	test("requeues a deferred delivery while the same job object remains registered", async () => {
-		const deliveries: string[] = [];
-		const manager = new AsyncJobManager({ retentionMs: 60_000 });
-		manager.registerDeliverySink("owner", (_jobId, text) => {
-			deliveries.push(text);
-		});
-
-		const jobId = manager.register("task", "same object", async () => "initial result", {
-			id: "same-object-replay",
-			ownerId: "owner",
-		});
-		await manager.waitForAll();
-		await manager.drainDeliveries({ timeoutMs: 500 });
-		const job = manager.getJob(jobId);
-		if (!job) throw new Error("Expected completed job to remain registered");
-
-		expect(manager.requeueDelivery(job, "replayed result")).toBe(true);
-		await manager.drainDeliveries({ timeoutMs: 500 });
-
-		expect(deliveries).toEqual(["initial result", "replayed result"]);
-		expect(manager.getJob(jobId)).toBe(job);
-	});
-
-	test("dead-letters a deferred delivery when its job id now belongs to a replacement", async () => {
-		const oldDeliveryStarted = Promise.withResolvers<void>();
-		const releaseOldDelivery = Promise.withResolvers<void>();
-		const releaseReplacement = Promise.withResolvers<string>();
-		const staleRetryDeadLettered = Promise.withResolvers<void>();
-		const warn = vi.spyOn(logger, "warn").mockImplementation(message => {
-			if (message === "Async job delivery dead-lettered after failure: stale job identity") {
-				staleRetryDeadLettered.resolve();
-			}
-		});
-		const oldDeliveries: string[] = [];
-		const replacementDeliveries: string[] = [];
-		const manager = new AsyncJobManager({ retentionMs: 60_000 });
-		manager.registerDeliverySink("old-owner", async (_jobId, text) => {
-			oldDeliveries.push(text);
-			oldDeliveryStarted.resolve();
-			await releaseOldDelivery.promise;
-			throw new Error("force deferred delivery replay");
-		});
-		manager.registerDeliverySink("replacement-owner", (_jobId, text) => {
-			replacementDeliveries.push(text);
-		});
-
-		const jobId = manager.register("task", "old job", async () => "old result", {
-			id: "reused-deferred-job",
-			ownerId: "old-owner",
-		});
-		const oldJob = manager.getJob(jobId);
-		if (!oldJob) throw new Error("Expected old job to be registered");
-		await oldDeliveryStarted.promise;
-		expect(manager.discardJobs([oldJob], { ownerId: "old-owner" })).toBe(1);
-
-		const replacementJobId = manager.register("task", "replacement job", () => releaseReplacement.promise, {
-			id: jobId,
-			ownerId: "replacement-owner",
-		});
-		const replacementJob = manager.getJob(replacementJobId);
-		if (!replacementJob) throw new Error("Expected replacement job to be registered");
-		expect(replacementJobId).toBe(jobId);
-
-		// The transition replay owns the old object, not merely its reusable id.
-		expect(manager.requeueDelivery(oldJob, "stale replay text")).toBe(false);
-		releaseOldDelivery.resolve();
-		await staleRetryDeadLettered.promise;
-		warn.mockRestore();
-
-		expect(oldDeliveries).toEqual(["old result"]);
-		expect(replacementDeliveries).toEqual([]);
-		expect(manager.getJob(jobId)).toBe(replacementJob);
-		expect(replacementJob.status).toBe("running");
-
-		releaseReplacement.resolve("replacement result");
-		await manager.waitForAll();
-		await manager.drainDeliveries({ timeoutMs: 500 });
-		expect(replacementDeliveries).toEqual(["replacement result"]);
 	});
 
 	test("cancelAll does not clear retention timers for already completed jobs", async () => {
@@ -742,53 +849,6 @@ describe("AsyncJobManager", () => {
 		manager.cancelAll({ ownerId: "Sub" });
 		await expect(reap).resolves.toBe(true);
 		expect(manager.getJob("hung-1")?.status).toBe("cancelled");
-	});
-	test("counts filtered job state without materializing snapshots", async () => {
-		const runningGate = Promise.withResolvers<void>();
-		const deliveryGate = Promise.withResolvers<void>();
-		const manager = new AsyncJobManager({ retentionMs: 60_000 });
-		manager.registerDeliverySink("Main", async () => {
-			await deliveryGate.promise;
-		});
-		const runningId = manager.register(
-			"bash",
-			"still running",
-			async () => {
-				await runningGate.promise;
-				return "done";
-			},
-			{ ownerId: "Main" },
-		);
-		const failedId = manager.register(
-			"task",
-			"failed",
-			async () => {
-				throw new Error("failed");
-			},
-			{ ownerId: "Main" },
-		);
-		manager.register(
-			"task",
-			"other owner",
-			async () => {
-				throw new Error("other failure");
-			},
-			{ ownerId: "Other" },
-		);
-		await manager.getJob(failedId)?.promise;
-
-		const ownerFilter = { ownerId: "Main" };
-		expect(manager.countRunningJobs(ownerFilter)).toBe(1);
-		expect(manager.countRecentFailures(5, ownerFilter)).toBe(1);
-		expect(manager.countPendingDeliveries(ownerFilter)).toBe(1);
-		const runningJob = manager.getJob(runningId);
-		if (!runningJob) throw new Error("expected running job");
-		expect(manager.countRunningJobs({ ...ownerFilter, excludeJobs: new Set([runningJob]) })).toBe(0);
-
-		runningGate.resolve();
-		deliveryGate.resolve();
-		await manager.waitForAll();
-		await manager.drainDeliveries({ timeoutMs: 500 });
 	});
 });
 

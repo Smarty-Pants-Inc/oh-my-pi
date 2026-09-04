@@ -1,8 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import * as path from "node:path";
-import { isRecord, readJsonl } from "@oh-my-pi/pi-utils";
+import { isRecord, readJsonl, TempDir } from "@oh-my-pi/pi-utils";
 
 async function expectRpcOwnsStdin(): Promise<void> {
+	using agentDir = TempDir.createSync("@pi-rpc-stdin-lock-");
 	const cliPath = path.join(import.meta.dir, "..", "src", "cli.ts");
 	const extensionPath = path.join(import.meta.dir, "fixtures", "locked-stdin-reader.ts");
 	const child = Bun.spawn(
@@ -20,7 +21,12 @@ async function expectRpcOwnsStdin(): Promise<void> {
 		],
 		{
 			cwd: path.join(import.meta.dir, ".."),
-			env: { ...Bun.env, PI_NO_TITLE: "1" },
+			env: {
+				...Bun.env,
+				PI_CODING_AGENT_DIR: agentDir.path(),
+				PI_NO_TITLE: "1",
+				PI_TEST_RUNTIME: "1",
+			},
 			stdin: "pipe",
 			stdout: "pipe",
 			stderr: "pipe",
