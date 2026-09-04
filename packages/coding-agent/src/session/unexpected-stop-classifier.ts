@@ -108,6 +108,7 @@ async function classifyOnline(text: string, deps: ClassifyUnexpectedStopDeps): P
 				},
 				{
 					apiKey: deps.registry.resolver(model, deps.sessionId),
+					sessionId: deps.sessionId,
 					maxTokens,
 					disableReasoning: true,
 					metadata,

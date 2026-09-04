@@ -150,7 +150,7 @@ export interface IsolatedRunOptions {
 	executionEnvironmentProvider?: ExecutionEnvironmentProvider;
 	/** Context returned by {@link prepareIsolationContext}. Baseline is cloned per spawn. */
 	context: IsolationContext;
-	/** PAL backend hint from `parseIsolationMode(...)` (undefined ⇒ resolver picks). */
+	/** PAL backend hint from `parseIsolationBackend(...)` (undefined ⇒ resolver picks). */
 	preferredBackend: IsoBackendKind | undefined;
 	/** Stable id used as the isolation worktree namespace and as the branch suffix. */
 	agentId: string;

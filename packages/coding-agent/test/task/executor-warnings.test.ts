@@ -22,6 +22,42 @@ describe("subagent warning injection", () => {
 		expect(result.hasYield).toBe(true);
 	});
 
+	it("marks structured output invalid, not silently valid, when a schema-bearing yield has no data", () => {
+		const result = finalizeSubprocessOutput({
+			rawOutput: "partial output",
+			exitCode: 0,
+			stderr: "",
+			doneAborted: false,
+			signalAborted: false,
+			yieldItems: [{ status: "success" }],
+			outputSchema: { type: "object", properties: { count: { type: "number" } }, required: ["count"] },
+			outputSchemaSource: "caller",
+			outputSchemaMode: "strict",
+		});
+
+		expect(result.structuredOutput?.status).toBe("invalid");
+		expect(result.structuredOutput?.error).toBe(SUBAGENT_WARNING_NULL_YIELD);
+		expect(result.structuredOutput?.data).toBeUndefined();
+		expect(result.exitCode).not.toBe(0);
+	});
+
+	it("leaves the exit code untouched for a null yield in permissive mode", () => {
+		const result = finalizeSubprocessOutput({
+			rawOutput: "partial output",
+			exitCode: 0,
+			stderr: "",
+			doneAborted: false,
+			signalAborted: false,
+			yieldItems: [{ status: "success" }],
+			outputSchema: { type: "object", properties: { count: { type: "number" } }, required: ["count"] },
+			outputSchemaSource: "caller",
+			outputSchemaMode: "permissive",
+		});
+
+		expect(result.structuredOutput?.status).toBe("invalid");
+		expect(result.exitCode).toBe(0);
+	});
+
 	it("fails structured completion directly when the subagent exits without output", () => {
 		const result = finalizeSubprocessOutput({
 			rawOutput: "",

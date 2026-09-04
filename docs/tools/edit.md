@@ -3,14 +3,13 @@
 > Applies source edits. The default `hashline` mode consumes one line-anchored patch string and edits existing files directly.
 
 ## Source
-- Entry and mode registration: `packages/coding-agent/src/edit/index.ts`
-- Hashline schema: `packages/coding-agent/src/edit/hashline/params.ts`
-- Model-facing hashline prompt: `packages/hashline/src/prompt.md`
-- Canonical constrained-decoding grammar: `packages/hashline/src/grammar.lark`
-- Parser and application: `packages/hashline/src/input.ts`, `packages/hashline/src/parser.ts`, `packages/hashline/src/apply.ts`
-- Snapshot validation/recovery: `packages/hashline/src/snapshots.ts`, `packages/hashline/src/patcher.ts`, `packages/hashline/src/recovery.ts`
-- Coding-agent execution/result shaping: `packages/coding-agent/src/edit/hashline/execute.ts`
-- Streaming preview strategy: `packages/coding-agent/src/edit/streaming.ts`, `packages/coding-agent/src/edit/hashline/diff.ts`
+- Entry, schema, and host writer: `packages/coding-agent/src/edit/index.ts`, `packages/coding-agent/src/edit/schemas.ts`, `packages/coding-agent/src/edit/store.ts`
+- Model-facing hashline prompt: `crates/pi-edit/prompts/hashline.md`
+- Canonical constrained-decoding grammar: `crates/pi-edit/grammars/hashline.lark`
+- Parser and application: `crates/pi-edit/src/modes/hashline/input.rs`, `crates/pi-edit/src/modes/hashline/parser.rs`, `crates/pi-edit/src/modes/hashline/apply.rs`, `crates/pi-edit/src/modes/hashline/patcher.rs`
+- Snapshot validation and recovery: `crates/pi-edit/src/store.rs`, `crates/pi-edit/src/modes/hashline/recovery.rs`
+- Native binding: `crates/pi-natives/src/edit.rs`
+- Streaming preview and result shaping: `crates/pi-edit/src/modes/hashline/preview.rs`, `packages/coding-agent/src/edit/renderer.ts`
 
 ## Mode selection and availability
 

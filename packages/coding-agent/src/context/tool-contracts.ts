@@ -208,7 +208,6 @@ async function manifestSession() {
 		hasUI: true,
 		settings: Settings.isolated({
 			"tools.xdev": false,
-			"task.isolation.mode": "auto",
 			"security.enabled": true,
 			"autolearn.enabled": true,
 			"memory.backend": "mnemopi",

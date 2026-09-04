@@ -51,6 +51,7 @@ export class OmpCommitInference implements CommitInference {
 	readonly #cacheRetention?: SimpleStreamOptions["cacheRetention"];
 	readonly #onProgress?: CommitProgress;
 	readonly #signal?: AbortSignal;
+	readonly #sessionId = Bun.randomUUIDv7();
 
 	constructor(options: {
 		primary: ResolvedCommitModel;
@@ -126,6 +127,7 @@ export class OmpCommitInference implements CommitInference {
 					},
 					{
 						apiKey: target.apiKey,
+						sessionId: this.#sessionId,
 						maxTokens: 16_384,
 						reasoning,
 						cacheRetention: this.#cacheRetention,

@@ -751,6 +751,11 @@ describe("tracked context manifest", () => {
 		const promptPaths = new Set(trackedContentManifest().prompts.map(prompt => prompt.path));
 		for (const required of [
 			"docs/approval-mode.md",
+			"crates/pi-edit/grammars/hashline.lark",
+			"crates/pi-edit/prompts/hashline.md",
+			"crates/pi-edit/src/lib.rs",
+			"crates/pi-edit/src/modes/hashline/parser.rs",
+			"crates/pi-natives/src/edit.rs",
 			"crates/pi-natives/src/shell.rs",
 			"crates/pi-natives/src/fonts/Silver.ttf",
 			"crates/pi-shell/src/minimizer/engine.rs",
@@ -768,7 +773,6 @@ describe("tracked context manifest", () => {
 			"packages/catalog/src/discovery/protobuf.ts",
 			"packages/catalog/src/provider-models/descriptors.ts",
 			"packages/catalog/src/wire/codex.ts",
-			"packages/hashline/src/prompt.md",
 			"packages/mnemopi/src/core/beam/recall.ts",
 			"packages/mnemopi/src/core/memory.ts",
 			"packages/natives/native/desktop.js",

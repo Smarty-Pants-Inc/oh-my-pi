@@ -481,6 +481,8 @@ export interface StreamOptions {
 	 * as the prompt-cache key when `promptCacheKey` is not set.
 	 */
 	sessionId?: string;
+	/** @internal True when streamSimple supplied sessionId rather than the caller. */
+	sessionIdGenerated?: boolean;
 	/**
 	 * Optional prompt-cache identity. OpenAI-family providers use this for
 	 * `prompt_cache_key` payloads and cache-affinity headers such as
@@ -658,6 +660,8 @@ export interface SimpleStreamOptions extends Omit<StreamOptions, "apiKey"> {
 	 * A rejecting transformer is swallowed and the reserved payload stands in.
 	 */
 	cursorOnToolResult?: CursorToolResultHandler;
+	/** Cursor hands unhandled MCP calls to an external executor instead of reporting them as missing. */
+	cursorExternalToolExecutor?: boolean;
 	/**
 	 * Amazon Bedrock Guardrail settings forwarded through transports that do not
 	 * dispatch directly to the Bedrock provider. Model-level values take
@@ -666,6 +670,13 @@ export interface SimpleStreamOptions extends Omit<StreamOptions, "apiKey"> {
 	guardrailIdentifier?: string;
 	guardrailVersion?: string;
 	guardrailTrace?: "enabled" | "disabled" | "enabled_full";
+	/**
+	 * Bedrock invocation-log tags forwarded through transports that do not dispatch
+	 * directly to the Bedrock provider. Unlike the guardrail fields above, these
+	 * MERGE per key with the model's own `requestMetadata` (these win) rather than
+	 * replacing it wholesale — they are independent attribution tags, not one value.
+	 */
+	requestMetadata?: Record<string, string>;
 	/** Optional tool choice override for compatible providers */
 	toolChoice?: ToolChoice;
 	/** OpenAI service tier for processing priority/cost control. Ignored by non-OpenAI providers. */

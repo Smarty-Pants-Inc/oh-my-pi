@@ -1297,6 +1297,7 @@ export type SendMessageAcceptedDelivery =
 	| "started_turn"
 	| "queued_steer"
 	| "queued_follow_up"
+	| "queued_aside"
 	| "queued_next_turn"
 	| "plain_append";
 
@@ -1328,7 +1329,7 @@ export interface SendMessageOptions {
 	onStartedTurnAccepted?: () => void;
 	/** Legacy delivery controls. Do not combine with `deliveryMode`. */
 	triggerTurn?: boolean;
-	deliverAs?: "steer" | "followUp" | "nextTurn";
+	deliverAs?: "steer" | "followUp" | "nextTurn" | "aside";
 }
 /**
  * ExtensionAPI passed to extension factory functions.
@@ -1552,7 +1553,8 @@ export interface ExtensionAPI {
 	 *
 	 * `deliveryMode` is selected against receiver state atomically with the queue mutation. A semantic
 	 * request that cannot be honored returns `unavailable` without enqueueing. Legacy `triggerTurn`
-	 * requests may report a client-deferred `downgraded` next-turn enqueue.
+	 * requests may report a client-deferred `downgraded` next-turn enqueue. `deliverAs: "aside"`
+	 * injects at the next step boundary without interrupting an in-flight tool batch.
 	 */
 	sendMessage<T = unknown>(
 		message: CustomMessagePayload<T>,
@@ -1565,7 +1567,7 @@ export interface ExtensionAPI {
 	 */
 	sendUserMessage(
 		content: string | (TextContent | ImageContent)[],
-		options?: { deliverAs?: "steer" | "followUp" },
+		options?: { deliverAs?: "steer" | "followUp" | "aside" },
 	): void;
 
 	/** Append a custom entry to the session for state persistence (not sent to LLM). */
@@ -1648,10 +1650,8 @@ export interface ExtensionAPI {
 	 *   models: [
 	 *     {
 	 *       id: "claude-sonnet-4@20250514",
-	 *       name: "Claude Sonnet 4 (Vertex)",
 	 *       reasoning: true,
 	 *       thinking: { mode: "anthropic-adaptive", efforts: ["minimal", "low", "medium", "high"] },
-	 *       input: ["text", "image"],
 	 *       cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
 	 *       contextWindow: 200000,
 	 *       maxTokens: 64000,
@@ -1792,9 +1792,11 @@ export type SendMessageHandler = <T = unknown>(
 	options?: SendMessageOptions,
 ) => Promise<SendMessageDisposition>;
 
+/** `deliverAs: "aside"` injects at the next step boundary without interrupting the in-flight tool
+ *  batch while streaming; idle still starts a turn. */
 export type SendUserMessageHandler = (
 	content: string | (TextContent | ImageContent)[],
-	options?: { deliverAs?: "steer" | "followUp" },
+	options?: { deliverAs?: "steer" | "followUp" | "aside" },
 ) => void;
 
 export type AppendEntryHandler = <T = unknown>(customType: string, data?: T) => void;

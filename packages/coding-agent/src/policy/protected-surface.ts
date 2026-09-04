@@ -146,8 +146,13 @@ const PATH_RULES: readonly PathRule[] = [
 	},
 	{ pattern: /(?:^|\/)generated\/prompt-manifest\.json$/i, surface: "prompt-entry" },
 	{ pattern: /(?:^|\/)generated\/tool-contracts\.json$/i, surface: "tool-schema" },
-	{ pattern: /(?:^|\/)packages\/hashline\/src\/prompt\.md$/i, surface: "prompt-content" },
-	{ pattern: /(?:^|\/)packages\/(?:hashline|omptype|wire)\/src\//i, surface: "tool-schema" },
+	{ pattern: /(?:^|\/)crates\/pi-edit\/prompts\/.*\.md$/i, surface: "prompt-content" },
+	{
+		pattern: /(?:^|\/)crates\/pi-edit\/(?:grammars\/.*\.lark|src\/.*\.rs)$/i,
+		surface: "tool-schema",
+	},
+	{ pattern: /(?:^|\/)crates\/pi-natives\/src\/edit\.rs$/i, surface: "tool-schema" },
+	{ pattern: /(?:^|\/)packages\/(?:omptype|wire)\/src\//i, surface: "tool-schema" },
 	{
 		pattern:
 			/(?:^|\/)crates\/(?:pi-natives\/src\/(?:ast|block|crash_handler|diff|glob|glob_util|grep|html|iofs|lib|pdf|ps|pty|shell|snapcompact|summary|task|tokens|utils|vectors)|pi-ast\/src\/(?:block|lib|ops|summary)|pi-shell\/(?:build|src\/.*)|pi-walker\/src\/(?:cache|lib))\.rs$/i,
@@ -346,11 +351,11 @@ const PATH_RULES: readonly PathRule[] = [
 		surface: "provider-mapping",
 	},
 	{
-		pattern: /(?:^|\/)packages\/ai\/src\/registry\/[^/]+\.[cm]?[jt]s$/i,
+		pattern: /(?:^|\/)packages\/ai\/src\/registry\/.*\.(?:html|[cm]?[jt]s)$/i,
 		surface: "provider-mapping",
 	},
 	{
-		pattern: /(?:^|\/)packages\/ai\/src\/registry\/[^/]+\.[cm]?[jt]s$/i,
+		pattern: /(?:^|\/)packages\/ai\/src\/registry\/.*\.(?:html|[cm]?[jt]s)$/i,
 		surface: "provider-wrapper",
 	},
 	{
@@ -434,6 +439,16 @@ const PATH_RULES: readonly PathRule[] = [
 		pattern: /(?:^|\/)packages\/coding-agent\/src\/tiny\/completion-prompt\.[cm]?[jt]s$/i,
 		surface: "prompt-entry",
 	},
+	{
+		pattern: /(?:^|\/)packages\/coding-agent\/src\/tiny\/.*\.(?:py|[cm]?[jt]s)$/i,
+		surface: "provider-wrapper",
+	},
+	{ pattern: /(?:^|\/)packages\/coding-agent\/src\/utils\/video\.[cm]?[jt]s$/i, surface: "capability" },
+	{
+		pattern: /(?:^|\/)packages\/coding-agent\/src\/web\/firecrawl\.[cm]?[jt]s$/i,
+		surface: "provider-wrapper",
+	},
+	{ pattern: /(?:^|\/)packages\/utils\/src\/json-lexer\.[cm]?[jt]s$/i, surface: "tool-schema" },
 	{
 		pattern: /(?:^|\/)packages\/coding-agent\/src\/utils\/resume-command\.[cm]?[jt]s$/i,
 		surface: "provider-wrapper",
@@ -902,7 +917,7 @@ const PATH_RULES: readonly PathRule[] = [
 	},
 	{
 		pattern:
-			/(?:^|\/)packages\/coding-agent\/src\/session\/(?:checkpoint-entries|session-entries|session-memory|session-workspace)\.[cm]?[jt]s$/i,
+			/(?:^|\/)packages\/coding-agent\/src\/session\/(?:checkpoint-entries|session-entries|session-memory|session-workspace|session-worktree)\.[cm]?[jt]s$/i,
 		surface: "provider-wrapper",
 	},
 	{
@@ -999,6 +1014,10 @@ const PATH_RULES: readonly PathRule[] = [
 	{
 		pattern: /(?:^|\/)packages\/coding-agent\/src\/session\/session-stats\.[cm]?[jt]s$/i,
 		surface: "provider-mapping",
+	},
+	{
+		pattern: /(?:^|\/)packages\/coding-agent\/src\/stats\/.*\.[cm]?[jt]s$/i,
+		surface: "provider-wrapper",
 	},
 	{
 		pattern: /(?:^|\/)packages\/coding-agent\/src\/modes\/(?:emoji-autocomplete\.[cm]?[jt]s|data\/emojis\.json)$/i,
