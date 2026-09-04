@@ -399,10 +399,6 @@ impl GitRepo {
 			validate_restore_paths(selected_source, &index, &requested)?;
 			reject_sparse_restore(selected_source, &index, &requested)?;
 		}
-		let index_lock = options
-			.staged
-			.then(|| acquire_index_lock(&index, "git restore"))
-			.transpose()?;
 
 		if options.staged {
 			let staged_source = resolved_source
@@ -411,6 +407,10 @@ impl GitRepo {
 				.expect("staged restore source was resolved");
 			copy_index_paths_selected(&mut index, staged_source, &requested);
 		}
+		let index_lock = options
+			.staged
+			.then(|| prepare_locked_index(&index, "git restore"))
+			.transpose()?;
 		if restore_worktree {
 			let source_index = if options.source.is_some() {
 				resolved_source
@@ -438,7 +438,7 @@ impl GitRepo {
 			)?;
 		}
 		if let Some(lock) = index_lock {
-			write_locked_index(&index, lock, "git restore")?;
+			commit_index_lock(lock, "git restore")?;
 		}
 		Ok(())
 	}
@@ -1414,30 +1414,26 @@ fn copy_index_paths_selected(
 	dest.sort_entries();
 }
 
-fn acquire_index_lock(
+fn prepare_locked_index(
 	index: &gix::index::File,
 	operation: &'static str,
 ) -> Result<gix::lock::File> {
-	gix::lock::File::acquire_to_update_resource(
+	let lock = gix::lock::File::acquire_to_update_resource(
 		index.path(),
 		gix::lock::acquire::Fail::Immediately,
 		None,
 	)
-	.map_err(|err| Error::backend(operation, err))
-}
-
-fn write_locked_index(
-	index: &gix::index::File,
-	lock: gix::lock::File,
-	operation: &'static str,
-) -> Result<()> {
+	.map_err(|err| Error::backend(operation, err))?;
 	let mut lock = std::io::BufWriter::with_capacity(64 * 1024, lock);
 	index
 		.write_to(&mut lock, INDEX_WRITE)
 		.map_err(|err| Error::backend(operation, err))?;
-	let lock = lock
+	lock
 		.into_inner()
-		.map_err(|err| Error::backend(operation, err.into_error()))?;
+		.map_err(|err| Error::backend(operation, err.into_error()))
+}
+
+fn commit_index_lock(lock: gix::lock::File, operation: &'static str) -> Result<()> {
 	lock
 		.commit()
 		.map(|_| ())
