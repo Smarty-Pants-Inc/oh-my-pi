@@ -5,7 +5,7 @@ use std::{
 	path::{Path, PathBuf},
 };
 
-use gix::bstr::ByteSlice;
+use gix::bstr::{BStr, BString, ByteSlice};
 
 use super::{
 	GitRepo,
@@ -588,7 +588,7 @@ impl GitRepo {
 			let args = ["merge-base".to_owned(), a.to_owned(), b.to_owned()];
 			let out = super::cli::run_sync(self.root(), &args, super::cli::SYNC_TIMEOUT)?;
 			return match out.exit_code {
-				0 => Ok(nonempty(out.stdout.trim())),
+				0 => Ok(nonempty(out.stdout.to_str_lossy().trim())),
 				1 => Ok(None),
 				_ => out.into_checked(&args).map(|_| None),
 			};
@@ -706,17 +706,24 @@ impl GitRepo {
 
 	/// List index paths, or untracked paths when `others` is true.
 	pub fn ls_files(&self, others: bool, exclude_standard: bool) -> Result<Vec<String>> {
-		self.ls_files_at_paths(others, exclude_standard, &BTreeSet::new())
+		let mut out = self
+			.ls_files_bytes_at_paths(others, exclude_standard, &BTreeSet::new())?
+			.into_iter()
+			.map(|path| path.to_str_lossy().into_owned())
+			.collect::<Vec<_>>();
+		out.sort();
+		out.dedup();
+		Ok(out)
 	}
 
-	pub(crate) fn ls_files_at_paths(
+	pub(crate) fn ls_files_bytes_at_paths(
 		&self,
 		others: bool,
 		exclude_standard: bool,
 		paths: &BTreeSet<String>,
-	) -> Result<Vec<String>> {
+	) -> Result<Vec<BString>> {
 		if self.is_reftable() {
-			let mut args = vec!["ls-files".to_owned()];
+			let mut args = vec!["ls-files".to_owned(), "-z".to_owned()];
 			if others {
 				args.push("--others".to_owned());
 			}
@@ -727,30 +734,45 @@ impl GitRepo {
 				args.push("--".to_owned());
 				args.extend(paths.iter().map(|path| literal_pathspec(path)));
 			}
-			return Ok(cli_text_owned(self.root(), &args, super::cli::SYNC_TIMEOUT)?
-				.lines()
-				.filter(|line| !line.is_empty())
-				.map(str::to_owned)
-				.collect());
+			let stdout = cli_bytes_owned(self.root(), &args, super::cli::SYNC_TIMEOUT)?;
+			let mut out = stdout
+				.split(|byte| *byte == 0)
+				.filter(|path| !path.is_empty())
+				.map(BString::from)
+				.collect::<Vec<_>>();
+			out.sort();
+			out.dedup();
+			return Ok(out);
 		}
+		let repo = self.gix()?;
+		Self::ls_files_bytes_at_paths_with_repo(&repo, others, exclude_standard, paths)
+	}
+
+	pub(crate) fn ls_files_bytes_at_paths_with_repo(
+		repo: &gix::Repository,
+		others: bool,
+		exclude_standard: bool,
+		paths: &BTreeSet<String>,
+	) -> Result<Vec<BString>> {
 		if !others {
-			let repo = self.gix()?;
-			let index = load_index_or_empty(&repo, "git ls-files")?;
+			let index = load_index_or_empty(repo, "git ls-files")?;
 			let mut out: Vec<_> = index
 				.entries()
 				.iter()
 				.filter(|e| e.stage() == gix::index::entry::Stage::Unconflicted)
-				.map(|e| bytes_to_path(e.path(&index)))
+				.map(|e| e.path(&index).to_owned())
 				.filter(|path| {
-					paths.is_empty() || paths.iter().any(|wanted| path_matches(path, wanted))
+					paths.is_empty()
+						|| paths
+							.iter()
+							.any(|wanted| byte_path_matches(path.as_bstr(), wanted))
 				})
 				.collect();
 			out.sort();
 			out.dedup();
 			return Ok(out);
 		}
-		let repo = self.gix()?;
-		let mut platform = status_with_fresh_index(&repo, "git ls-files")?
+		let mut platform = status_with_fresh_index(repo, "git ls-files")?
 			.untracked_files(gix::status::UntrackedFiles::Files);
 		if !exclude_standard {
 			platform = platform.dirwalk_options(|opts| {
@@ -773,11 +795,12 @@ impl GitRepo {
 					|| (!exclude_standard
 						&& matches!(entry.status, gix::dir::entry::Status::Ignored(_)));
 				if wanted {
-					out.push(bytes_to_path(entry.rela_path.as_bstr()));
+					out.push(entry.rela_path);
 				}
 			}
 		}
 		out.sort();
+		out.dedup();
 		Ok(out)
 	}
 
@@ -1033,13 +1056,18 @@ fn cli_try(cwd: &Path, args: &[&str]) -> Result<Option<String>> {
 	if out.exit_code != 0 {
 		return Ok(None);
 	}
-	Ok(nonempty(out.stdout.trim()))
+	Ok(nonempty(out.stdout.to_str_lossy().trim()))
 }
 fn cli_text(cwd: &Path, args: &[&str]) -> Result<String> {
 	let owned: Vec<_> = args.iter().map(|v| (*v).to_owned()).collect();
 	cli_text_owned(cwd, &owned, super::cli::SYNC_TIMEOUT)
 }
 fn cli_text_owned(cwd: &Path, args: &[String], timeout: std::time::Duration) -> Result<String> {
+	Ok(cli_bytes_owned(cwd, args, timeout)?
+		.to_str_lossy()
+		.into_owned())
+}
+fn cli_bytes_owned(cwd: &Path, args: &[String], timeout: std::time::Duration) -> Result<BString> {
 	Ok(super::cli::run_sync(cwd, args, timeout)?
 		.into_checked(args)?
 		.stdout)
@@ -1192,6 +1220,16 @@ fn parse_commit_details(raw: &str) -> CommitDetails {
 }
 pub(crate) fn literal_pathspec(path: &str) -> String {
 	format!(":(literal){path}")
+}
+
+fn byte_path_matches(path: &BStr, wanted: &str) -> bool {
+	let path: &[u8] = path.as_ref();
+	let wanted = wanted.trim_end_matches('/').as_bytes();
+	wanted.is_empty()
+		|| path == wanted
+		|| path
+			.strip_prefix(wanted)
+			.is_some_and(|rest| rest.starts_with(b"/"))
 }
 
 fn path_matches(path: &str, wanted: &str) -> bool {

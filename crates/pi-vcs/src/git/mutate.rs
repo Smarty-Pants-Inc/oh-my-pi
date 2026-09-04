@@ -91,7 +91,7 @@ impl GitRepo {
 	/// under the index name. Unrelated names that share an inode (hardlinks)
 	/// and distinct NFC/NFD files when precompose is off stay separate.
 	pub fn stage_files(&self, files: &[String]) -> Result<()> {
-		let repo = self.gix()?;
+		let repo = self.gix_fresh()?;
 		let mut index = load_index_or_head(&repo, "git add")?;
 		let all = files.is_empty();
 		let mut requested: BTreeSet<String> = files
@@ -106,31 +106,32 @@ impl GitRepo {
 		if precompose_unicode_enabled(&repo) {
 			requested = remap_composed_index_paths(self.root(), &index, requested);
 		}
-		let mut selected = collect_stage_paths(self, &requested, all)?;
+		let mut selected = collect_stage_paths(&repo, &requested, all)?;
 		for entry in index.entries() {
-			let path = entry.path(&index).to_str_lossy().into_owned();
-			if (all
+			let path = entry.path(&index);
+			if all
 				|| requested
 					.iter()
-					.any(|wanted| stage_path_matches(&path, wanted)))
-				&& fs::symlink_metadata(self.root().join(&path)).is_ok()
+					.any(|wanted| stage_path_matches(path, wanted))
 			{
-				selected.insert(path);
+				let full = checked_worktree_path(self.root(), path, "git add")?;
+				if fs::symlink_metadata(full).is_ok() {
+					selected.insert(path.to_owned());
+				}
 			}
 		}
 		index.remove_entries(|_, path, _| {
-			let path = path.to_str_lossy();
 			(all
 				|| requested
 					.iter()
-					.any(|wanted| stage_path_matches(&path, wanted)))
-				&& !selected.contains(path.as_ref())
+					.any(|wanted| stage_path_matches(path, wanted)))
+				&& !selected.contains(path)
 		});
 		let (mut pipeline, filter_index) = repo
 			.filter_pipeline(None)
 			.map_err(|err| Error::backend("git add", err))?;
 		for path in selected {
-			stage_one(&mut pipeline, &filter_index, self.root(), &mut index, &path)?;
+			stage_one(&mut pipeline, &filter_index, self.root(), &mut index, path.as_bstr())?;
 		}
 		index.sort_entries();
 		index
@@ -140,7 +141,7 @@ impl GitRepo {
 
 	/// Reset selected index entries to HEAD while preserving the worktree.
 	pub fn unstage(&self, files: &[String]) -> Result<()> {
-		let repo = self.gix()?;
+		let repo = self.gix_fresh()?;
 		let head = head_tree(&repo, "git reset")?;
 		let head_index = index_for_tree(&repo, head.as_ref())?;
 		let mut current = load_index_or_head(&repo, "git reset")?;
@@ -152,7 +153,7 @@ impl GitRepo {
 
 	/// Create a commit and return its object id.
 	pub fn commit_create(&self, message: &str, options: &CommitOptions) -> Result<String> {
-		let repo = self.gix()?;
+		let repo = self.gix_fresh()?;
 		let mut head = repo
 			.head()
 			.map_err(|err| Error::backend("git commit", err))?;
@@ -295,7 +296,7 @@ impl GitRepo {
 
 	/// Create or force-move a local branch.
 	pub fn create_branch(&self, name: &str, start: &str, force: bool) -> Result<()> {
-		let repo = self.gix()?;
+		let repo = self.gix_fresh()?;
 		let id = resolve_commit(&repo, start)?;
 		let full = format!("refs/heads/{name}");
 		if force && branch_is_checked_out(&self.info().common_dir, &full) {
@@ -326,7 +327,7 @@ impl GitRepo {
 
 	/// Delete a local branch, returning false for missing or unsafe deletion.
 	pub fn delete_branch(&self, name: &str, force: bool) -> Result<bool> {
-		let repo = self.gix()?;
+		let repo = self.gix_fresh()?;
 		let full = format!("refs/heads/{name}");
 		if branch_is_checked_out(&self.info().common_dir, &full) {
 			return Ok(false);
@@ -518,7 +519,7 @@ impl GitRepo {
 			if !wanted {
 				continue;
 			}
-			let full = self.root().join(entry.rela_path.to_str_lossy().as_ref());
+			let full = checked_worktree_path(self.root(), entry.rela_path.as_bstr(), "git clean")?;
 			remove_existing(&full)?;
 			prune_empty_parents(self.root(), full.parent(), &paths)?;
 		}
@@ -527,7 +528,7 @@ impl GitRepo {
 
 	/// Replace an index file with the entries from `treeish`.
 	pub fn read_tree(&self, treeish: &str, index_path: Option<&Path>) -> Result<()> {
-		let repo = self.gix()?;
+		let repo = self.gix_fresh()?;
 		let tree = resolve_tree(&repo, treeish)?;
 		let mut index = repo
 			.index_from_tree(&tree)
@@ -561,7 +562,7 @@ impl GitRepo {
 	/// Add a remote idempotently when its URL already matches.
 	pub fn remote_add(&self, name: &str, url: &str) -> Result<()> {
 		let key = format!("remote.{name}.url");
-		let repo = self.gix()?;
+		let repo = self.gix_fresh()?;
 		if let Some(existing) = repo.config_snapshot().string(&key) {
 			let existing = existing.to_str_lossy();
 			if existing == url {
@@ -1197,14 +1198,14 @@ fn index_for_tree(
 }
 
 fn collect_stage_paths(
-	repo: &GitRepo,
+	repo: &gix::Repository,
 	requested: &BTreeSet<String>,
 	all: bool,
-) -> Result<BTreeSet<String>> {
+) -> Result<BTreeSet<BString>> {
 	let untracked = if all || requested.contains("") {
-		repo.ls_files(true, true)?
+		GitRepo::ls_files_bytes_at_paths_with_repo(repo, true, true, &BTreeSet::new())?
 	} else {
-		repo.ls_files_at_paths(true, true, requested)?
+		GitRepo::ls_files_bytes_at_paths_with_repo(repo, true, true, requested)?
 	};
 	Ok(untracked.into_iter().collect())
 }
@@ -1222,12 +1223,14 @@ fn normalize_stage_path(path: &str) -> String {
 	}
 }
 
-fn stage_path_matches(path: &str, wanted: &str) -> bool {
+fn stage_path_matches(path: &BStr, wanted: &str) -> bool {
+	let path: &[u8] = path.as_ref();
+	let wanted = wanted.as_bytes();
 	wanted.is_empty()
 		|| path == wanted
 		|| path
 			.strip_prefix(wanted)
-			.is_some_and(|remainder| remainder.starts_with('/'))
+			.is_some_and(|remainder| remainder.starts_with(b"/"))
 }
 
 fn remap_composed_index_paths(
@@ -1322,22 +1325,25 @@ fn stage_one(
 	filter_index: &gix::index::State,
 	root: &Path,
 	index: &mut gix::index::File,
-	path: &str,
+	path: &BStr,
 ) -> Result<()> {
-	ensure_no_symlink_ancestor(root, &root.join(path), "git add")?;
+	checked_worktree_path(root, path, "git add")?;
 	let Some((id, kind, _)) = pipeline
-		.worktree_file_to_object(path.as_bytes().as_bstr(), filter_index)
+		.worktree_file_to_object(path, filter_index)
 		.map_err(|err| Error::backend("git add", err))?
 	else {
-		return Err(Error::backend("git add", format!("path is not trackable: {path}")));
+		return Err(Error::backend(
+			"git add",
+			format!("path is not trackable: {}", path.to_str_lossy()),
+		));
 	};
-	index.remove_entries(|_, p, _| p == path.as_bytes().as_bstr());
+	index.remove_entries(|_, candidate, _| candidate == path);
 	index.dangerously_push_entry(
 		Default::default(),
 		id,
 		gix::index::entry::Flags::empty(),
 		kind.into(),
-		path.as_bytes().as_bstr(),
+		path,
 	);
 	Ok(())
 }
@@ -2435,6 +2441,18 @@ mod tests {
 			.to_owned()
 	}
 
+	#[cfg(target_os = "linux")]
+	fn git_bytes(dir: &Path, args: &[&str]) -> Vec<u8> {
+		let output = Command::new("git")
+			.arg("-C")
+			.arg(dir)
+			.args(args)
+			.output()
+			.unwrap();
+		assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+		output.stdout
+	}
+
 	fn fixture() -> (TempDir, GitRepo) {
 		let temp = tempfile::tempdir().unwrap();
 		git(temp.path(), &["init", "-q", "-b", "main"]);
@@ -2489,8 +2507,29 @@ mod tests {
 	}
 
 	#[test]
+	fn unstage_refreshes_head_after_out_of_band_commit() {
+		let (temp, repo) = fixture();
+		drop(repo.gix().unwrap());
+		fs::write(temp.path().join("a"), "committed later\n").unwrap();
+		git(temp.path(), &["add", "a"]);
+		git(temp.path(), &["commit", "-qm", "advance head"]);
+
+		fs::write(temp.path().join("a"), "staged later\n").unwrap();
+		git(temp.path(), &["add", "a"]);
+		repo.unstage(&["a".into()]).unwrap();
+
+		assert_eq!(git(temp.path(), &["show", ":a"]), "committed later");
+		assert_eq!(fs::read_to_string(temp.path().join("a")).unwrap(), "staged later\n");
+	}
+
+	#[test]
 	fn stage_all_skips_nested_gitignore_like_git_add() {
 		let (temp, repo) = fixture();
+		drop(repo.gix().unwrap());
+		let excludes = temp.path().join(".git/global-excludes");
+		fs::write(&excludes, "global-secret\n").unwrap();
+		git(temp.path(), &["config", "core.excludesFile", excludes.to_str().unwrap()]);
+		fs::write(temp.path().join("global-secret"), "ignored\n").unwrap();
 		fs::create_dir_all(temp.path().join("tests/e2e/screenshots")).unwrap();
 		fs::write(temp.path().join("tests/e2e/.gitignore"), "screenshots/\ntest-results/\n").unwrap();
 		fs::write(temp.path().join("tests/e2e/screenshots/homepage.png"), "png").unwrap();
@@ -2498,6 +2537,10 @@ mod tests {
 		repo.stage_files(&[]).unwrap();
 		let status = git(temp.path(), &["status", "--porcelain"]);
 		assert!(!status.contains("screenshots"), "nested-ignored screenshot was staged:\n{status}");
+		assert!(
+			!status.contains("global-secret"),
+			"out-of-band global exclude was ignored: fresh collector staged {status}"
+		);
 		assert!(
 			status.contains("tests/e2e/.gitignore"),
 			"gitignore itself should be staged:\n{status}"
@@ -2805,6 +2848,56 @@ mod tests {
 			repo.write_tree(Some(&alternate)).unwrap(),
 			git(temp.path(), &["rev-parse", "HEAD^{tree}"])
 		);
+	}
+
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn stage_all_preserves_and_adds_non_utf8_paths() {
+		use std::os::unix::ffi::OsStrExt;
+
+		let (temp, repo) = fixture();
+		let tracked_name = b"tracked-\xff.txt";
+		let tracked = temp.path().join(OsStr::from_bytes(tracked_name));
+		fs::write(&tracked, "original\n").unwrap();
+		git(temp.path(), &["add", "-A"]);
+		git(temp.path(), &["commit", "-qm", "track non-utf8 path"]);
+
+		fs::write(&tracked, "changed\n").unwrap();
+		let untracked_name = b"untracked-\xfe.txt";
+		let untracked = temp.path().join(OsStr::from_bytes(untracked_name));
+		fs::write(&untracked, "new\n").unwrap();
+
+		repo.stage_files(&[]).unwrap();
+
+		let files = git_bytes(temp.path(), &["ls-files", "-z"]);
+		let files = files.split(|byte| *byte == 0).collect::<Vec<_>>();
+		assert!(files.contains(&tracked_name.as_slice()));
+		assert!(files.contains(&untracked_name.as_slice()));
+		let staged = git_bytes(temp.path(), &["diff", "--cached", "--name-only", "-z"]);
+		let staged = staged.split(|byte| *byte == 0).collect::<Vec<_>>();
+		assert!(staged.contains(&tracked_name.as_slice()));
+		assert!(staged.contains(&untracked_name.as_slice()));
+	}
+
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn clean_preserves_tracked_path_that_lossily_matches_untracked_path() {
+		use std::os::unix::ffi::OsStrExt;
+
+		let (temp, repo) = fixture();
+		let tracked = temp.path().join("lossy-\u{fffd}.txt");
+		fs::write(&tracked, "tracked\n").unwrap();
+		repo.stage_files(&["lossy-\u{fffd}.txt".into()]).unwrap();
+		repo
+			.commit_create("tracked lossy path", &CommitOptions::default())
+			.unwrap();
+
+		let untracked = temp.path().join(OsStr::from_bytes(b"lossy-\xff.txt"));
+		fs::write(&untracked, "untracked\n").unwrap();
+		repo.clean(&CleanOptions::default()).unwrap();
+
+		assert_eq!(fs::read_to_string(tracked).unwrap(), "tracked\n");
+		assert!(!untracked.exists());
 	}
 
 	#[test]
@@ -3367,6 +3460,8 @@ mod tests {
 		fs::write(temp.path().join(".gitattributes"), "filtered.txt filter=upper\n").unwrap();
 		git(temp.path(), &["add", ".gitattributes"]);
 		git(temp.path(), &["commit", "-qm", "attributes"]);
+		drop(repo.gix().unwrap());
+		// The clean-filter config is written out of band after the cached open.
 		git(temp.path(), &["config", "filter.upper.clean", "tr a-z A-Z"]);
 		git(temp.path(), &["config", "filter.upper.required", "true"]);
 		fs::write(temp.path().join("filtered.txt"), "lowercase\n").unwrap();
