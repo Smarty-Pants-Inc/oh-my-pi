@@ -552,7 +552,7 @@ describe("runEvalAgent", () => {
 		).not.toContain("Cleanup");
 	});
 
-	it("maps successful and failed subagent results", async () => {
+	it("maps successful and failed subagent results with terminal model metadata", async () => {
 		mockAgents();
 		const runSpy = vi.spyOn(taskExecutor, "runSubprocess");
 		runSpy.mockImplementationOnce(async options =>
@@ -562,21 +562,50 @@ describe("runEvalAgent", () => {
 				resolvedModel: "p/model",
 			}),
 		);
-		runSpy.mockImplementationOnce(async options =>
-			singleResult(options, {
+		runSpy.mockImplementationOnce(async options => {
+			options.onProgress?.({
+				index: options.index,
+				id: options.id,
+				agent: options.agent.name,
+				agentSource: options.agent.source,
+				status: "running",
+				task: options.task,
+				assignment: options.assignment,
+				recentTools: [],
+				recentOutput: [],
+				toolCount: 0,
+				requests: 0,
+				tokens: 0,
+				cost: 0,
+				durationMs: 0,
+				resolvedModel: "p/parent",
+				resolvedModelIsFallback: true,
+			});
+			return singleResult(options, {
 				exitCode: 1,
 				output: "",
 				stderr: "stderr",
 				error: "boom",
-			}),
-		);
+				resolvedModel: "p/parent",
+				resolvedModelIsFallback: true,
+			});
+		});
 
 		const result = await runEvalAgentAndWait({ prompt: "hello" }, { session: makeSession() });
 		expect(result).toEqual({
 			text: "done",
 			details: { agent: "task", id: "0-EvalAgent", model: "p/model", structured: false },
 		});
-		await expect(runEvalAgentAndWait({ prompt: "fail" }, { session: makeSession() })).rejects.toThrow("boom");
+
+		const failureSession = makeSession();
+		const handle = await runEvalAgent({ prompt: "fail" }, { session: failureSession });
+		const waited = await runEvalWait({ items: [{ kind: "agent", id: handle.id }] }, { session: failureSession });
+		expect(waited.items[0]).toMatchObject({
+			status: "failed",
+			error: "boom",
+			model: "p/parent",
+			modelFallback: true,
+		});
 	});
 
 	// Regression: a runtime-limit abort returns exitCode=1, stderr="", error=undefined,

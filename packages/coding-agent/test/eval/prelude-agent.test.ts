@@ -98,6 +98,27 @@ describe("eval js agent() handle", () => {
 		};
 		expect(await plain.wait()).toBe('{"k":1}');
 	});
+
+	it("records model metadata before a failed wait throws", async () => {
+		const sandbox = loadPrelude(async name => {
+			if (name === "__agent__") return { id: "id-fail", agent: "task" };
+			if (name === "__wait__") {
+				return {
+					items: [{ status: "failed", error: "boom", model: "p/parent", modelFallback: true }],
+				};
+			}
+			throw new Error(`unexpected bridge call ${name}`);
+		});
+		const handle = (await (sandbox.agent as AgentHelper)("fail")) as {
+			wait(): Promise<unknown>;
+			model?: string;
+			modelFallback?: boolean;
+		};
+
+		await expect(handle.wait()).rejects.toThrow("boom");
+		expect(handle.model).toBe("p/parent");
+		expect(handle.modelFallback).toBe(true);
+	});
 });
 
 describe("eval js read() URI delegation", () => {

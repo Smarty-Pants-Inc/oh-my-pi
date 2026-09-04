@@ -7483,7 +7483,7 @@
     },
     {
       "path": "packages/coding-agent/src/eval/handle-bridge.ts",
-      "sha256": "c9773a1c712afff6eac0eb0b9cd495ef144092f0c11bbe7cd54d712785acfc51"
+      "sha256": "676028cf0db1ce30b79b95b0f0f139ad48cf4acd61f7032877efc7dd2f9e12f4"
     },
     {
       "path": "packages/coding-agent/src/eval/idle-timeout.ts",
@@ -7527,7 +7527,7 @@
     },
     {
       "path": "packages/coding-agent/src/eval/js/shared/prelude.txt",
-      "sha256": "93addc42cee7084d9eef3b2d22f021b7f21b0c7fe1b17a5919964b14a4eae846"
+      "sha256": "64a7e5c3681797ad40bdcae7348bc0a4a4aed30175565adaccd808366dc574a4"
     },
     {
       "path": "packages/coding-agent/src/eval/js/shared/rewrite-imports.ts",
@@ -7579,7 +7579,7 @@
     },
     {
       "path": "packages/coding-agent/src/eval/py/prelude.py",
-      "sha256": "8a3fe42556878c1f5ed7a87e8795d9b5bb7ecfae49e8b85a969281232f449e09"
+      "sha256": "f5ec6c04f796d1c0e2dce7cd0f7d1a64e7945265473bb05b286e962fddb37763"
     },
     {
       "path": "packages/coding-agent/src/eval/py/prelude.ts",
@@ -8703,7 +8703,7 @@
     },
     {
       "path": "packages/coding-agent/src/sdk.ts",
-      "sha256": "ddfa1a3e6dd9e8e085b0b1067db05737d8bf0f07c5311a940882865e1153eb4a"
+      "sha256": "622cfe5e7cac8c0faea9863e5bc11829d5efacb941af29590345622fbac296de"
     },
     {
       "path": "packages/coding-agent/src/secrets/index.ts",
@@ -9319,7 +9319,7 @@
     },
     {
       "path": "packages/coding-agent/src/task/executor.ts",
-      "sha256": "15098eaa6abdf8b2ef2df5667f20ab3ded44b7cde5d67a42ce80b14392d8cebd"
+      "sha256": "da270b0899a6283f2920f4b97741737f3eacd18caa401b3d3150df72ecca397e"
     },
     {
       "path": "packages/coding-agent/src/task/index.ts",
@@ -11147,5 +11147,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "d75234652c040279a41370d00228cf8af1e5657c79a331b5baaf45eb6368d580"
+  "rootSha256": "dd0e142ed202afa17f67ff5d232528eb7bca6e80a7efc915662b0e57676232ea"
 }

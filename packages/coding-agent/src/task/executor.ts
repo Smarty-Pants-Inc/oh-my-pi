@@ -16,14 +16,17 @@ import type { EffectiveExtensionRoots } from "../capability/types";
 import { ModelRegistry } from "../config/model-registry";
 import {
 	formatModelSelectorValue,
+	getModelMatchPreferences,
 	formatModelStringWithRouting,
 	normalizeModelPatternList,
 	resolveAgentAdvisorSelection,
 	resolveAgentPrewalkPattern,
+	resolveAllowedModels,
 	resolveConfiguredModelPatterns,
 	resolveExplicitModelRole,
 	resolveModelOverride,
 	resolveModelOverrideWithAuthFallback,
+	resolveModelPolicyModels,
 } from "../config/model-resolver";
 import type { PromptTemplate } from "../config/prompt-templates";
 import { buildServiceTierByFamily, resolveSubagentServiceTier } from "../config/service-tier";
@@ -2949,6 +2952,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	}
 
 	const modelPatterns = normalizeModelPatternList(modelOverride ?? agent.model);
+	const modelSelectionExplicit = options.modelSelectionExplicit === true;
 	const prewalkPattern = resolveAgentPrewalkPattern({
 		settingsOverride: settings.get("task.agentPrewalk")[agent.name],
 		agentPrewalk: resolveAgentPrewalkDefault(agent, settings.get("task.prewalk")),
@@ -3076,8 +3080,12 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				logger.debug("runSubagent: reusing parent modelRegistry; skipping refresh");
 			}
 			const backgroundRefresh = modelRegistry.awaitBackgroundRefresh?.();
+			const modelPolicyNeedsRefresh =
+				options.allowedModels === undefined &&
+				(settings.get("enabledModels").length > 0 || settings.get("disabledProviders").length > 0);
 			const waitForRefreshBeforeSessionConfiguration =
-				modelPatterns.length > 0 ||
+				modelSelectionExplicit ||
+				modelPolicyNeedsRefresh ||
 				(options.allowedModels === undefined &&
 					prewalkPattern !== undefined &&
 					subagentRuntimeAllows(runtimeProfile, "prewalk"));
@@ -3086,10 +3094,23 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			}
 			checkAbort();
 
-			const availableModels = options.allowedModels ?? modelRegistry.getAvailable?.();
-			const modelCandidates = options.modelCandidates ?? availableModels;
-			const hasScopedModelCatalog = options.modelCandidates !== undefined || options.allowedModels !== undefined;
-			if (hasScopedModelCatalog && modelCandidates) {
+			const canResolveModelPolicy =
+				typeof modelRegistry.getAvailable === "function" && typeof modelRegistry.getAll === "function";
+			const availableModels =
+				options.allowedModels ??
+				(canResolveModelPolicy
+					? await awaitAbortable(
+							resolveAllowedModels(modelRegistry, subagentSettings, getModelMatchPreferences(subagentSettings)),
+						)
+					: modelRegistry.getAvailable?.());
+			const modelCandidates =
+				options.modelCandidates ??
+				(canResolveModelPolicy ? resolveModelPolicyModels(modelRegistry, subagentSettings) : availableModels);
+			const hasScopedModelCatalog =
+				options.modelCandidates !== undefined ||
+				options.allowedModels !== undefined ||
+				(canResolveModelPolicy && waitForRefreshBeforeSessionConfiguration);
+			if (hasScopedModelCatalog) {
 				scopeSubagentRetryFallbackChains(subagentSettings, modelRegistry, modelCandidates);
 			}
 			const configuredModelPatterns = resolveConfiguredModelPatterns(modelPatterns, settings);
@@ -3120,7 +3141,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					modelCandidates,
 				),
 			);
-			if (options.modelSelectionExplicit && modelPatterns.length > 0 && !model) {
+			if (modelSelectionExplicit && modelPatterns.length > 0 && !model) {
 				throw new Error(
 					`Requested subagent model selector did not resolve to an available model: ${modelPatterns.join(", ")}`,
 				);

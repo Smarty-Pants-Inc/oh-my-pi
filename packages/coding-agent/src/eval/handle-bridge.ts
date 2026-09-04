@@ -91,18 +91,19 @@ function resolveHandle(ref: EvalHandleRef, options: EvalHandleBridgeOptions): Re
 
 function agentSnapshot(ref: EvalHandleRef, job: AsyncJob): EvalHandleSnapshot {
 	if (job.status === "running") return { ...ref, status: "running" };
-	if (job.status === "failed") {
-		return { ...ref, status: "failed", error: job.errorText || "Agent failed" };
-	}
-	if (job.status === "cancelled") {
-		return { ...ref, status: "cancelled", error: job.errorText || job.resultText || "Agent cancelled" };
-	}
 
-	const snapshot: EvalHandleSnapshot = { ...ref, status: "completed", text: job.resultText ?? "" };
+	const snapshot: EvalHandleSnapshot =
+		job.status === "failed"
+			? { ...ref, status: "failed", error: job.errorText || "Agent failed" }
+			: job.status === "cancelled"
+				? { ...ref, status: "cancelled", error: job.errorText || job.resultText || "Agent cancelled" }
+				: { ...ref, status: "completed", text: job.resultText ?? "" };
 	const evalResult = job.latestDetails?.evalResult;
 	if (isUnknownRecord(evalResult)) {
-		if (typeof evalResult.text === "string") snapshot.text = evalResult.text;
-		if (Object.hasOwn(evalResult, "data")) snapshot.data = evalResult.data;
+		if (snapshot.status === "completed") {
+			if (typeof evalResult.text === "string") snapshot.text = evalResult.text;
+			if (Object.hasOwn(evalResult, "data")) snapshot.data = evalResult.data;
+		}
 		const details = evalResult.details;
 		if (isUnknownRecord(details)) {
 			const model = details.model;
@@ -110,6 +111,18 @@ function agentSnapshot(ref: EvalHandleRef, job: AsyncJob): EvalHandleSnapshot {
 				snapshot.model = model;
 			}
 			if (details.modelFallback === true) snapshot.modelFallback = true;
+		}
+	}
+	const progress = job.latestDetails?.progress;
+	if (Array.isArray(progress)) {
+		for (let index = progress.length - 1; index >= 0; index -= 1) {
+			const item = progress[index];
+			if (!isUnknownRecord(item)) continue;
+			if (snapshot.model === undefined && typeof item.resolvedModel === "string") {
+				snapshot.model = item.resolvedModel;
+			}
+			if (item.resolvedModelIsFallback === true) snapshot.modelFallback = true;
+			if (snapshot.model !== undefined && snapshot.modelFallback === true) break;
 		}
 	}
 	return snapshot;

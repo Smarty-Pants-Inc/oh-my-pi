@@ -2,6 +2,7 @@ import { afterEach, expect, it, vi } from "bun:test";
 import { AuthStorage } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ExtensionRuntime } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
@@ -66,7 +67,7 @@ afterEach(async () => {
 	for (const tempDir of tempDirs.splice(0)) tempDir[Symbol.dispose]();
 });
 
-it("overlaps registry refresh with session-file opening and session setup", async () => {
+it("overlaps registry refresh for an inherited session-model selector", async () => {
 	const tempDir = TempDir.createSync("@pi-task-launch-");
 	tempDirs.push(tempDir);
 	const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
@@ -100,6 +101,8 @@ it("overlaps registry refresh with session-file opening and session setup", asyn
 		index: 0,
 		id: "task-launch-overlap",
 		authStorage,
+		modelOverride: "session/default",
+		modelSelectionExplicit: false,
 		enableLsp: false,
 		enableIrc: false,
 	});
@@ -162,6 +165,80 @@ it("refreshes the model catalog before resolving an explicit selector", async ()
 	refreshGate.resolve();
 	expect((await run).exitCode).toBe(0);
 	expect(createSpy.mock.calls[0]?.[0]?.model).toBe(model);
+});
+
+it("uses the policy catalog for auth fallback when the executor creates its registry", async () => {
+	const tempDir = TempDir.createSync("@pi-task-local-registry-fallback-");
+	tempDirs.push(tempDir);
+	const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
+	authStorages.push(authStorage);
+	const requested = getBundledModel("opencode-zen", "qwen3.6-plus-free");
+	const parent = getBundledModel("anthropic", "claude-sonnet-4-5");
+	if (!requested || !parent) throw new Error("Expected requested and parent fallback models to exist");
+
+	vi.spyOn(ModelRegistry.prototype, "refresh").mockResolvedValue();
+	vi.spyOn(ModelRegistry.prototype, "getAvailable").mockReturnValue([parent]);
+	vi.spyOn(ModelRegistry.prototype, "getAll").mockReturnValue([requested, parent]);
+	vi.spyOn(ModelRegistry.prototype, "getApiKey").mockImplementation(async model =>
+		model.provider === parent.provider ? "test-key" : undefined,
+	);
+	const createSpy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(sessionResult(yieldingSession()));
+
+	const result = await runSubprocess({
+		cwd: tempDir.path(),
+		artifactsDir: tempDir.path(),
+		agent: { name: "task", description: "test", systemPrompt: "test", source: "bundled" },
+		task: "test",
+		index: 0,
+		id: "task-local-registry-fallback",
+		authStorage,
+		settings: Settings.isolated({
+			enabledModels: [`${requested.provider}/${requested.id}`, `${parent.provider}/${parent.id}`],
+		}),
+		modelOverride: `${requested.provider}/${requested.id}`,
+		modelSelectionExplicit: true,
+		parentActiveModelPattern: `${parent.provider}/${parent.id}`,
+		enableLsp: false,
+		enableIrc: false,
+	});
+
+	expect(result.exitCode).toBe(0);
+	expect(createSpy.mock.calls[0]?.[0]).toMatchObject({ model: parent, initialModelFallback: true });
+});
+
+it("rejects an out-of-scope explicit selector when the executor creates its registry", async () => {
+	const tempDir = TempDir.createSync("@pi-task-local-registry-scope-");
+	tempDirs.push(tempDir);
+	const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
+	authStorages.push(authStorage);
+	const requested = getBundledModel("opencode-zen", "qwen3.6-plus-free");
+	const allowed = getBundledModel("anthropic", "claude-sonnet-4-5");
+	if (!requested || !allowed) throw new Error("Expected requested and allowed models to exist");
+
+	vi.spyOn(ModelRegistry.prototype, "refresh").mockResolvedValue();
+	vi.spyOn(ModelRegistry.prototype, "getAvailable").mockReturnValue([requested, allowed]);
+	vi.spyOn(ModelRegistry.prototype, "getAll").mockReturnValue([requested, allowed]);
+	vi.spyOn(ModelRegistry.prototype, "getApiKey").mockResolvedValue("test-key");
+	const createSpy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(sessionResult(yieldingSession()));
+
+	const result = await runSubprocess({
+		cwd: tempDir.path(),
+		artifactsDir: tempDir.path(),
+		agent: { name: "task", description: "test", systemPrompt: "test", source: "bundled" },
+		task: "test",
+		index: 0,
+		id: "task-local-registry-scope",
+		authStorage,
+		settings: Settings.isolated({ enabledModels: [`${allowed.provider}/${allowed.id}`] }),
+		modelOverride: `${requested.provider}/${requested.id}`,
+		modelSelectionExplicit: true,
+		enableLsp: false,
+		enableIrc: false,
+	});
+
+	expect(result.exitCode).toBe(1);
+	expect(result.error).toContain("Requested subagent model selector did not resolve to an available model");
+	expect(createSpy).not.toHaveBeenCalled();
 });
 
 it("fails an explicit selector that remains unresolved after refresh", async () => {

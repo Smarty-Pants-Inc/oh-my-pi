@@ -189,13 +189,13 @@ if (!globalThis.__omp_js_prelude_loaded__) {
 
 	const resolveHandleSnapshot = (handle, snapshot) => {
 		const status = snapshot?.status ?? "failed";
-		if (status === "running") throw timeoutError(`${handle.kind} handle ${handle.id} is still running`);
-		if (status === "failed" || status === "cancelled") {
-			throw new Error(snapshot?.error || `${handle.kind} handle ${handle.id} failed`);
-		}
 		if (handle instanceof AgentHandle) {
 			handle.model = snapshot?.model;
 			handle.modelFallback = snapshot?.modelFallback === true;
+		}
+		if (status === "running") throw timeoutError(`${handle.kind} handle ${handle.id} is still running`);
+		if (status === "failed" || status === "cancelled") {
+			throw new Error(snapshot?.error || `${handle.kind} handle ${handle.id} failed`);
 		}
 		const value = hasOwn(snapshot ?? {}, "data")
 			? snapshot.data

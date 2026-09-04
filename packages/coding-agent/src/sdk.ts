@@ -80,6 +80,7 @@ import {
 	resolveCliModel,
 	resolveConfiguredModelPatterns,
 	resolveModelOverrideWithAuthFallback,
+	resolveModelPolicyModels,
 	resolveModelRoleValue,
 } from "./config/model-resolver";
 import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate } from "./config/prompt-templates";
@@ -2476,8 +2477,8 @@ async function createAgentSessionScoped(
 					modelRegistry.refresh("online-if-uncached"),
 				);
 			}
-			const allModels = modelRegistry.getAll();
-			const availableModels = modelRegistry.getAvailable();
+			const availableModels = await resolveAllowedModels(modelRegistry, settings, matchPreferences);
+			const modelCandidates = resolveModelPolicyModels(modelRegistry, settings);
 			const expandedModelPatterns = deferredModelPatterns.flatMap(pattern =>
 				pattern.split(",").flatMap(selector => {
 					const trimmedSelector = selector.trim();
@@ -2510,7 +2511,8 @@ async function createAgentSessionScoped(
 						const originalSelector = resolved.configuredPatterns[0];
 						const availableOriginal = parseModelPattern(originalSelector, availableModels, matchPreferences);
 						const originalModel =
-							availableOriginal.model ?? parseModelPattern(originalSelector, allModels, matchPreferences).model;
+							availableOriginal.model ??
+							parseModelPattern(originalSelector, modelCandidates, matchPreferences).model;
 						const chainKey = resolveRetryFallbackChainKey(
 							fallbackContext,
 							originalSelector,
@@ -2556,7 +2558,7 @@ async function createAgentSessionScoped(
 				({ pattern }) => parseModelPattern(pattern, availableModels, matchPreferences).model,
 			)
 				? availableModels
-				: allModels;
+				: modelCandidates;
 			const deferredAuthSelection = options.modelPatternAuthFallback
 				? await resolveModelOverrideWithAuthFallback(
 						expandedModelPatterns.map(({ pattern }) => pattern),
@@ -2565,7 +2567,7 @@ async function createAgentSessionScoped(
 						settings,
 						providerSessionId,
 						availableModels,
-						allModels,
+						modelCandidates,
 					)
 				: undefined;
 			const deferredAuthModel = deferredAuthSelection?.model;

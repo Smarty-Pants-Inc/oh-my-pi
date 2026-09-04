@@ -703,6 +703,9 @@ if "__omp_prelude_loaded__" not in globals():
 
     def _handle_value(handle, snapshot):
         status = snapshot.get("status") if isinstance(snapshot, dict) else "failed"
+        if isinstance(handle, AgentHandle) and isinstance(snapshot, dict):
+            handle.model = snapshot.get("model")
+            handle.model_fallback = snapshot.get("modelFallback") is True
         if status == "running":
             raise TimeoutError(f"{handle.kind} handle {handle.id} is still running")
         if status in ("failed", "cancelled"):
@@ -712,9 +715,6 @@ if "__omp_prelude_loaded__" not in globals():
                 else f"{handle.kind} handle {handle.id} failed"
             )
             raise RuntimeError(message or f"{handle.kind} handle {handle.id} failed")
-        if isinstance(handle, AgentHandle) and isinstance(snapshot, dict):
-            handle.model = snapshot.get("model")
-            handle.model_fallback = snapshot.get("modelFallback") is True
         if isinstance(snapshot, dict) and "data" in snapshot:
             value = snapshot["data"]
         else:
