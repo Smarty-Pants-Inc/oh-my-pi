@@ -2,7 +2,12 @@ import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getDisabledProviders, setDisabledProviders } from "@oh-my-pi/pi-coding-agent/capability";
+import {
+	getDisabledProviders,
+	getEnabledProviders,
+	setDisabledProviders,
+	setEnabledProviders,
+} from "@oh-my-pi/pi-coding-agent/capability";
 import type { LoadContext } from "@oh-my-pi/pi-coding-agent/capability/types";
 import {
 	findAllNearestProjectConfigDirs,
@@ -48,6 +53,7 @@ describe("PI_CONFIG_DIR", () => {
 
 	test("disabled compatibility providers omit their ambient roots dynamically", () => {
 		const savedDisabledProviders = getDisabledProviders();
+		const savedEnabledProviders = getEnabledProviders();
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "omp-config-roots-"));
 		const compatibilityRoots = [".claude", ".codex", ".gemini"];
 
@@ -60,6 +66,7 @@ describe("PI_CONFIG_DIR", () => {
 			}
 			fs.writeFileSync(path.join(cwd, ".omp", "native.md"), "native");
 
+			setEnabledProviders(["claude", "codex", "gemini"]);
 			setDisabledProviders(["claude", "codex", "gemini"]);
 
 			expect(getConfigDirs("commands", { cwd }).map(({ source, level }) => [source, level])).toEqual([
@@ -92,6 +99,7 @@ describe("PI_CONFIG_DIR", () => {
 			]);
 		} finally {
 			setDisabledProviders(savedDisabledProviders);
+			setEnabledProviders(savedEnabledProviders);
 			fs.rmSync(cwd, { recursive: true, force: true });
 		}
 	});

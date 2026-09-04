@@ -393,7 +393,7 @@ function deriveSessionId(modelId: string, context: Context): string {
 }
 
 function buildStreamOptions(parsed: ParsedFormatRequest, api: Api, signal: AbortSignal): SimpleStreamOptions {
-	const opts: SimpleStreamOptions = { signal };
+	const opts: SimpleStreamOptions = { signal, cursorExternalToolExecutor: true };
 	const { options } = parsed;
 	// Codex backend rejects every sampling control with
 	// `Unsupported parameter: …` (#3117). Strip the full set for that one
@@ -1006,6 +1006,7 @@ async function handlePiNative(
 		...parsed.options,
 		apiKey,
 		signal: controller.signal,
+		cursorExternalToolExecutor: true,
 	};
 	streamOpts.apiKey = buildGatewayApiKeyResolver(
 		bootOpts.storage,

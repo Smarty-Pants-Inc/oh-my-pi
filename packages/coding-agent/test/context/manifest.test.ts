@@ -83,7 +83,7 @@ describe("tracked context manifest", () => {
 
 	it("accepts only the active immutable materialized Stack package", async () => {
 		const repositoryRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-materialized-extension-"));
-		const stackRoot = path.join(repositoryRoot, "home/.smarty-stack");
+		const stackRoot = path.join(repositoryRoot, "home/.smarty/stack");
 		const packageRoot = path.join(stackRoot, "versions/0.20.11");
 		const currentRoot = path.join(stackRoot, "current");
 		const relativeEntry = "extensions/smarty-prompt-guard/src/index.ts";
@@ -167,6 +167,11 @@ describe("tracked context manifest", () => {
 			await chmodTree(packageRoot, 0o555, 0o444);
 			expect(await isApprovedCandidateSource(entryPath, release)).toBe(false);
 			expect(await isApprovedCandidateSource(currentEntryPath, release)).toBe(true);
+			const legacyStackRoot = path.join(repositoryRoot, "home/.smarty-stack");
+			await fs.symlink(stackRoot, legacyStackRoot);
+			expect(await isApprovedCandidateSource(path.join(legacyStackRoot, "current", relativeEntry), release)).toBe(
+				false,
+			);
 		} finally {
 			try {
 				await chmodTree(packageRoot, 0o755, 0o644);
@@ -751,6 +756,11 @@ describe("tracked context manifest", () => {
 		const promptPaths = new Set(trackedContentManifest().prompts.map(prompt => prompt.path));
 		for (const required of [
 			"docs/approval-mode.md",
+			"crates/pi-edit/grammars/hashline.lark",
+			"crates/pi-edit/prompts/hashline.md",
+			"crates/pi-edit/src/lib.rs",
+			"crates/pi-edit/src/modes/hashline/parser.rs",
+			"crates/pi-natives/src/edit.rs",
 			"crates/pi-natives/src/shell.rs",
 			"crates/pi-natives/src/fonts/Silver.ttf",
 			"crates/pi-shell/src/minimizer/engine.rs",
@@ -768,7 +778,6 @@ describe("tracked context manifest", () => {
 			"packages/catalog/src/discovery/protobuf.ts",
 			"packages/catalog/src/provider-models/descriptors.ts",
 			"packages/catalog/src/wire/codex.ts",
-			"packages/hashline/src/prompt.md",
 			"packages/mnemopi/src/core/beam/recall.ts",
 			"packages/mnemopi/src/core/memory.ts",
 			"packages/natives/native/desktop.js",

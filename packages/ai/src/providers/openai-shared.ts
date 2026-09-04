@@ -115,6 +115,7 @@ import type {
 	ResponseStatus,
 	ResponseStreamEvent,
 } from "./openai-responses-wire";
+import { applyInferenceHeaders, setHeaderIfAbsent } from "./inference-headers";
 import { transformMessages } from "./transform-messages";
 import { joinTextWithImagePlaceholder, NON_VISION_IMAGE_PLACEHOLDER, partitionVisionContent } from "./vision-guard";
 
@@ -157,6 +158,8 @@ export interface OpenAIRequestSetupModel extends OpenAIModelIdentity {
 export interface OpenAICacheOptions {
 	cacheRetention?: CacheRetention;
 	sessionId?: string;
+	/** @internal Distinguishes streamSimple's routing identity from caller cache intent. */
+	sessionIdGenerated?: boolean;
 	promptCacheKey?: string;
 }
 
@@ -172,7 +175,7 @@ export interface OpenAIRequestSetupOptions {
 		apiVersion: string;
 		deploymentName: string;
 	};
-	openAISessionId?: string;
+	sessionId?: string;
 	promptCacheSessionId?: string;
 }
 
@@ -204,14 +207,6 @@ function applyCoreWeaveProjectHeader(headers: Record<string, string>): void {
 	if (projectHeaders) {
 		headers[COREWEAVE_PROJECT_HEADER] = projectHeaders[COREWEAVE_PROJECT_HEADER];
 	}
-}
-
-function setHeaderIfAbsent(headers: Record<string, string>, name: string, value: string): void {
-	const normalizedName = name.toLowerCase();
-	for (const existingName in headers) {
-		if (existingName.toLowerCase() === normalizedName) return;
-	}
-	headers[name] = value;
 }
 
 export function resolveOpenAIRequestSetup(
@@ -308,10 +303,12 @@ export function resolveOpenAIRequestSetup(
 		query = { "api-version": options.azureChatCompletions.apiVersion };
 	}
 
-	if (options.openAISessionId && model.provider === "openai") {
-		setHeaderIfAbsent(headers, "session_id", options.openAISessionId);
-		setHeaderIfAbsent(headers, "x-client-request-id", options.openAISessionId);
-	}
+	const sessionId = options.sessionId ?? options.promptCacheSessionId;
+	applyInferenceHeaders(headers, {
+		provider: model.provider,
+		protocol: "openai",
+		sessionId,
+	});
 	if (options.promptCacheSessionId && model.compat?.promptCacheSessionHeader) {
 		setHeaderIfAbsent(headers, model.compat.promptCacheSessionHeader, options.promptCacheSessionId);
 	}
@@ -475,7 +472,8 @@ export function normalizeOpenRouterResponsesSessionId(sessionId: string | undefi
 /** Resolve a prompt-cache identity, falling back to the provider session unless caching is disabled. */
 export function getOpenAIPromptCacheKey(options: OpenAICacheOptions | undefined): string | undefined {
 	if (resolveCacheRetention(options?.cacheRetention) === "none") return undefined;
-	return normalizeOpenAIPromptCacheKey(options?.promptCacheKey ?? options?.sessionId);
+	const sessionId = options?.sessionIdGenerated ? undefined : options?.sessionId;
+	return normalizeOpenAIPromptCacheKey(options?.promptCacheKey ?? sessionId);
 }
 
 export function getOpenAIResponsesRoutingSessionId(
@@ -2124,6 +2122,19 @@ function parseResponseReasoningReplayItem(signature: string | undefined): Respon
 	}
 }
 
+/**
+ * Non-empty `reasoning_text` shipped for a synthesized reasoning item when no
+ * thinking text survived history reconstruction. DeepSeek-family Responses
+ * targets (e.g. opencode-go) reject BOTH a missing reasoning item and one whose
+ * `reasoning_text` is empty — "The reasoning_text in the thinking mode must be
+ * passed back to the API" (#8248 covered the missing case, #10690 the empty
+ * one). The item's presence plus a non-empty payload is what satisfies the
+ * contract; the exact text is immaterial once the source turn's reasoning is
+ * gone. Kept out of `reasoning_content="."`-territory since DeepSeek rejects the
+ * bare-dot synthetic placeholder on the chat-completions path.
+ */
+export const SYNTHETIC_REASONING_REPLAY_PLACEHOLDER = "reasoning unavailable";
+
 export function convertResponsesAssistantMessage<TApi extends Api>(
 	assistantMsg: AssistantMessage,
 	model: Model<TApi>,
@@ -2281,12 +2292,15 @@ export function convertResponsesAssistantMessage<TApi extends Api>(
 	if (requiresReasoningItem && !reasoningItemEmitted && outputItems.length > 0) {
 		// Replay the demoted reasoning (already present in `content` as visible
 		// text) as a structured reasoning item so the thinking-mode continuation
-		// carries the `reasoning_text` the provider requires. The text may be empty
-		// when the source turn was minted by another model and its reasoning is
-		// already folded into the message text; the item's presence is what
-		// satisfies the provider contract, mirroring the empty `reasoning_content`
-		// placeholder used on the chat-completions path.
-		const reasoningText = carriedReasoningTexts.join("\n");
+		// carries the `reasoning_text` the provider requires. When no thinking
+		// text survived reconstruction (source turn minted by another model, or
+		// reasoning dropped by compaction/archive budget) the carried text is
+		// empty — and DeepSeek-family targets reject an empty `reasoning_text`
+		// exactly like a missing item (#10690), so substitute a non-empty
+		// placeholder. The `id` still prefers a surviving upstream item id.
+		const carriedReasoningText = carriedReasoningTexts.join("\n");
+		const reasoningText =
+			carriedReasoningText.length > 0 ? carriedReasoningText : SYNTHETIC_REASONING_REPLAY_PLACEHOLDER;
 		const reasoningId =
 			synthesizedReasoningItemId ?? `rs_${Bun.hash(`${model.id}:${msgIndex}:${reasoningText}`).toString(36)}`;
 		const reasoningItem: ResponseReasoningItem = {

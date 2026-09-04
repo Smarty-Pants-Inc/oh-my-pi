@@ -116,6 +116,7 @@ export async function generateCommitMessage(
 					},
 					{
 						apiKey: registry.resolver(candidate.model, sessionId),
+						sessionId,
 						maxTokens,
 						reasoning: toReasoningEffort(candidate.thinkingLevel),
 						cacheRetention: resolveSettingsCacheRetention(settings),
