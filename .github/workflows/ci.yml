@@ -601,15 +601,15 @@ jobs:
          matrix:
             include:
                - {
-os: smarty-macos-intel-12-core,
-					platform: darwin,
+                    os: smarty-macos-intel-12-core,
+                    platform: darwin,
                     target_id: darwin-x64,
                     binary_path: packages/coding-agent/binaries/omp-darwin-x64,
                     native_targets: darwin-x64-baseline,
                  }
                - {
-os: smarty-macos-arm-5-core,
-					platform: darwin,
+                    os: smarty-macos-arm-5-core,
+                    platform: darwin,
                     target_id: darwin-arm64,
                     binary_path: packages/coding-agent/binaries/omp-darwin-arm64,
                     native_targets: darwin-arm64,
