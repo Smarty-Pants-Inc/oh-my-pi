@@ -94,10 +94,7 @@ impl GitRepo {
 		let repo = self.gix_fresh()?;
 		let mut index = load_index_or_head(&repo, "git add")?;
 		let all = files.is_empty();
-		let mut requested: BTreeSet<String> = files
-			.iter()
-			.map(|path| normalize_stage_path(path))
-			.collect();
+		let mut requested = normalize_mutation_paths(files, "git add")?;
 		for path in &requested {
 			if !path.is_empty() {
 				ensure_no_symlink_ancestor(self.root(), &self.root().join(path), "git add")?;
@@ -114,8 +111,13 @@ impl GitRepo {
 					.iter()
 					.any(|wanted| stage_path_matches(path, wanted))
 			{
+				if stage_selected_symlink_ancestor(self.root(), path, &requested, all)? {
+					continue;
+				}
 				let full = checked_worktree_path(self.root(), path, "git add")?;
-				if fs::symlink_metadata(full).is_ok() {
+				if fs::symlink_metadata(full).is_ok_and(|metadata| {
+					!metadata.is_dir() || entry.mode == gix::index::entry::Mode::COMMIT
+				}) {
 					selected.insert(path.to_owned());
 				}
 			}
@@ -145,7 +147,7 @@ impl GitRepo {
 		let head = head_tree(&repo, "git reset")?;
 		let head_index = index_for_tree(&repo, head.as_ref())?;
 		let mut current = load_index_or_head(&repo, "git reset")?;
-		copy_index_paths(&mut current, &head_index, files);
+		copy_index_paths(&mut current, &head_index, files, "git reset")?;
 		current
 			.write(INDEX_WRITE)
 			.map_err(|err| Error::backend("git reset", err))
@@ -190,7 +192,7 @@ impl GitRepo {
 					.as_ref(),
 			)?;
 			let mut partial = base;
-			copy_index_paths(&mut partial, &index, &options.files);
+			copy_index_paths(&mut partial, &index, &options.files, "git commit")?;
 			write_index_tree(&repo, &partial)?
 		};
 		let (parents, inherited_author) = if options.amend {
@@ -376,7 +378,7 @@ impl GitRepo {
 	pub fn restore(&self, options: &RestoreOptions) -> Result<()> {
 		let repo = self.gix_fresh()?;
 		let restore_worktree = options.worktree || !options.staged;
-		let requested = normalize_restore_paths(&options.files)?;
+		let requested = normalize_mutation_paths(&options.files, "git restore")?;
 		let mut index = load_index_or_head(&repo, "git restore")?;
 		let original_index =
 			(restore_worktree && (options.staged || options.source.is_some())).then(|| index.clone());
@@ -397,6 +399,10 @@ impl GitRepo {
 			validate_restore_paths(selected_source, &index, &requested)?;
 			reject_sparse_restore(selected_source, &index, &requested)?;
 		}
+		let index_lock = options
+			.staged
+			.then(|| acquire_index_lock(&index, "git restore"))
+			.transpose()?;
 
 		if options.staged {
 			let staged_source = resolved_source
@@ -431,10 +437,8 @@ impl GitRepo {
 				filter_ref_name,
 			)?;
 		}
-		if options.staged {
-			index
-				.write(INDEX_WRITE)
-				.map_err(|e| Error::backend("git restore", e))?;
+		if let Some(lock) = index_lock {
+			write_locked_index(&index, lock, "git restore")?;
 		}
 		Ok(())
 	}
@@ -457,16 +461,8 @@ impl GitRepo {
 		// `.` (and `./`) normalize to "" and mean "everything", so they drop out
 		// of the restriction set. A literally empty string is rejected the way
 		// git rejects it instead of silently widening to the whole worktree.
-		let mut paths = BTreeSet::new();
-		for raw in &options.paths {
-			if raw.is_empty() {
-				return Err(Error::backend("git clean", "empty string is not a valid pathspec"));
-			}
-			let normalized = normalize_stage_path(raw);
-			if !normalized.is_empty() {
-				paths.insert(normalized);
-			}
-		}
+		let mut paths = normalize_mutation_paths(&options.paths, "git clean")?;
+		paths.remove("");
 
 		// Fresh open: the cached handle snapshots config, so a
 		// `core.excludesFile` configured after first use would be missed and
@@ -1210,16 +1206,36 @@ fn collect_stage_paths(
 	Ok(untracked.into_iter().collect())
 }
 
+fn normalize_mutation_paths(files: &[String], operation: &'static str) -> Result<BTreeSet<String>> {
+	let mut requested = BTreeSet::new();
+	for raw in files {
+		if raw.is_empty() {
+			return Err(Error::backend(operation, "empty string is not a valid pathspec"));
+		}
+		requested.insert(normalize_stage_path(raw));
+	}
+	Ok(requested)
+}
+
 fn normalize_stage_path(path: &str) -> String {
-	let normalized = path.replace('\\', "/");
-	let mut relative = normalized.as_str();
+	let normalized = if cfg!(windows) && path.contains('\\') {
+		std::borrow::Cow::Owned(path.replace('\\', "/"))
+	} else {
+		std::borrow::Cow::Borrowed(path)
+	};
+	let mut relative = normalized.as_ref();
 	while let Some(stripped) = relative.strip_prefix("./") {
 		relative = stripped;
 	}
-	if relative == "." {
+	if relative.is_empty() || relative == "." {
 		String::new()
 	} else {
-		relative.trim_end_matches('/').to_owned()
+		let trimmed = relative.trim_end_matches('/');
+		if trimmed.is_empty() {
+			relative.to_owned()
+		} else {
+			trimmed.to_owned()
+		}
 	}
 }
 
@@ -1231,6 +1247,30 @@ fn stage_path_matches(path: &BStr, wanted: &str) -> bool {
 		|| path
 			.strip_prefix(wanted)
 			.is_some_and(|remainder| remainder.starts_with(b"/"))
+}
+
+fn stage_selected_symlink_ancestor(
+	root: &Path,
+	path: &BStr,
+	requested: &BTreeSet<String>,
+	all: bool,
+) -> Result<bool> {
+	validated_worktree_path(root, path, "git add")?;
+	let path_bytes: &[u8] = path.as_ref();
+	for (offset, byte) in path_bytes.iter().enumerate() {
+		if *byte != b'/' || offset == 0 {
+			continue;
+		}
+		let ancestor = path_bytes[..offset].as_bstr();
+		let full = validated_worktree_path(root, ancestor, "git add")?;
+		if fs::symlink_metadata(full).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+			return Ok(all
+				|| requested
+					.iter()
+					.any(|wanted| stage_path_matches(ancestor, wanted)));
+		}
+	}
+	Ok(false)
 }
 
 fn remap_composed_index_paths(
@@ -1348,9 +1388,15 @@ fn stage_one(
 	Ok(())
 }
 
-fn copy_index_paths(dest: &mut gix::index::File, source: &gix::index::File, files: &[String]) {
-	let requested = files.iter().cloned().collect();
+fn copy_index_paths(
+	dest: &mut gix::index::File,
+	source: &gix::index::File,
+	files: &[String],
+	operation: &'static str,
+) -> Result<()> {
+	let requested = normalize_mutation_paths(files, operation)?;
 	copy_index_paths_selected(dest, source, &requested);
+	Ok(())
 }
 
 fn copy_index_paths_selected(
@@ -1366,6 +1412,36 @@ fn copy_index_paths_selected(
 		}
 	}
 	dest.sort_entries();
+}
+
+fn acquire_index_lock(
+	index: &gix::index::File,
+	operation: &'static str,
+) -> Result<gix::lock::File> {
+	gix::lock::File::acquire_to_update_resource(
+		index.path(),
+		gix::lock::acquire::Fail::Immediately,
+		None,
+	)
+	.map_err(|err| Error::backend(operation, err))
+}
+
+fn write_locked_index(
+	index: &gix::index::File,
+	lock: gix::lock::File,
+	operation: &'static str,
+) -> Result<()> {
+	let mut lock = std::io::BufWriter::with_capacity(64 * 1024, lock);
+	index
+		.write_to(&mut lock, INDEX_WRITE)
+		.map_err(|err| Error::backend(operation, err))?;
+	let lock = lock
+		.into_inner()
+		.map_err(|err| Error::backend(operation, err.into_error()))?;
+	lock
+		.commit()
+		.map(|_| ())
+		.map_err(|err| Error::backend(operation, err))
 }
 
 #[derive(Default)]
@@ -1889,17 +1965,6 @@ fn checked_worktree_path(root: &Path, path: &BStr, operation: &'static str) -> R
 	let full = validated_worktree_path(root, path, operation)?;
 	ensure_no_symlink_ancestor(root, &full, operation)?;
 	Ok(full)
-}
-
-fn normalize_restore_paths(files: &[String]) -> Result<BTreeSet<String>> {
-	let mut requested = BTreeSet::new();
-	for raw in files {
-		if raw.is_empty() {
-			return Err(Error::backend("git restore", "empty string is not a valid pathspec"));
-		}
-		requested.insert(normalize_stage_path(raw));
-	}
-	Ok(requested)
 }
 
 fn restore_selects(path: &BStr, requested: &BTreeSet<String>) -> bool {
@@ -2523,6 +2588,58 @@ mod tests {
 	}
 
 	#[test]
+	fn selected_mutations_reject_empty_paths_and_normalize_directories() {
+		let (temp, repo) = fixture();
+		fs::create_dir(temp.path().join("dir")).unwrap();
+		fs::write(temp.path().join("dir/one"), "base\n").unwrap();
+		git(temp.path(), &["add", "dir/one"]);
+		git(temp.path(), &["commit", "-qm", "directory base"]);
+
+		fs::write(temp.path().join("dir/one"), "changed\n").unwrap();
+		fs::write(temp.path().join("b"), "changed b\n").unwrap();
+		fs::write(temp.path().join("new"), "new\n").unwrap();
+		let status_before = git(temp.path(), &["status", "--porcelain"]);
+		assert!(repo.stage_files(&[String::new()]).is_err());
+		assert_eq!(git(temp.path(), &["status", "--porcelain"]), status_before);
+
+		git(temp.path(), &["add", "dir/one", "b"]);
+		let index_path = temp.path().join(".git/index");
+		let index_before = fs::read(&index_path).unwrap();
+		assert!(repo.unstage(&[String::new()]).is_err());
+		assert_eq!(fs::read(&index_path).unwrap(), index_before);
+		repo.unstage(&["dir/".into()]).unwrap();
+		assert_eq!(git(temp.path(), &["diff", "--cached", "--name-only"]), "b");
+
+		let head_before = git(temp.path(), &["rev-parse", "HEAD"]);
+		assert!(
+			repo
+				.commit_create("invalid", &CommitOptions {
+					files: vec![String::new()],
+					..Default::default()
+				})
+				.is_err()
+		);
+		assert_eq!(git(temp.path(), &["rev-parse", "HEAD"]), head_before);
+		assert!(
+			repo
+				.clean(&CleanOptions { paths: vec![String::new()], ..Default::default() })
+				.is_err()
+		);
+		assert!(temp.path().join("new").exists());
+
+		repo.stage_files(&["dir/".into()]).unwrap();
+		repo
+			.commit_create("directory only", &CommitOptions {
+				files: vec!["dir/".into()],
+				..Default::default()
+			})
+			.unwrap();
+		assert_eq!(git(temp.path(), &["show", "HEAD:dir/one"]), "changed");
+		assert_eq!(git(temp.path(), &["show", "HEAD:b"]), "two");
+		assert_eq!(git(temp.path(), &["show", ":b"]), "changed b");
+	}
+
+	#[test]
 	fn stage_all_skips_nested_gitignore_like_git_add() {
 		let (temp, repo) = fixture();
 		drop(repo.gix().unwrap());
@@ -2621,6 +2738,43 @@ mod tests {
 			status.contains("?? x/"),
 			"pattern lookalike directory should stay untracked:\n{status}"
 		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn stage_handles_file_directory_replacements() {
+		use std::os::unix::fs::symlink;
+
+		let (temp, repo) = fixture();
+		fs::create_dir(temp.path().join("dir-shape")).unwrap();
+		fs::write(temp.path().join("dir-shape/file"), "nested\n").unwrap();
+		fs::write(temp.path().join("file-shape"), "file\n").unwrap();
+		git(temp.path(), &["add", "dir-shape/file", "file-shape"]);
+		git(temp.path(), &["commit", "-qm", "shape base"]);
+
+		fs::remove_dir_all(temp.path().join("dir-shape")).unwrap();
+		fs::write(temp.path().join("target"), "target\n").unwrap();
+		symlink("target", temp.path().join("dir-shape")).unwrap();
+		fs::remove_file(temp.path().join("file-shape")).unwrap();
+		fs::create_dir(temp.path().join("file-shape")).unwrap();
+		fs::write(temp.path().join("file-shape/child"), "child\n").unwrap();
+
+		repo
+			.stage_files(&["dir-shape".into(), "file-shape".into()])
+			.unwrap();
+		let files = git(temp.path(), &["ls-files"]);
+		assert!(files.lines().any(|path| path == "dir-shape"), "{files}");
+		assert!(!files.lines().any(|path| path == "dir-shape/file"), "{files}");
+		assert!(files.lines().any(|path| path == "file-shape/child"), "{files}");
+		assert!(!files.lines().any(|path| path == "file-shape"), "{files}");
+		let staged = git(temp.path(), &["ls-files", "--stage"]);
+		let symlink_entry = staged
+			.lines()
+			.find(|line| line.ends_with("\tdir-shape"))
+			.unwrap();
+		assert!(symlink_entry.starts_with("120000 "), "{symlink_entry}");
+		assert_eq!(git(temp.path(), &["show", ":dir-shape"]), "target");
+		assert_eq!(git(temp.path(), &["show", ":file-shape/child"]), "child");
 	}
 
 	#[cfg(target_os = "macos")]
@@ -3494,6 +3648,51 @@ mod tests {
 
 	#[cfg(unix)]
 	#[test]
+	fn selected_mutations_preserve_backslash_paths() {
+		let (temp, repo) = fixture();
+		let backslash = r"slash\name";
+		let slash = "slash/name";
+		fs::create_dir(temp.path().join("slash")).unwrap();
+		fs::write(temp.path().join(backslash), "backslash base\n").unwrap();
+		fs::write(temp.path().join(slash), "slash base\n").unwrap();
+		repo
+			.stage_files(&[backslash.to_owned(), slash.to_owned()])
+			.unwrap();
+		repo
+			.commit_create("slash base", &CommitOptions::default())
+			.unwrap();
+
+		fs::write(temp.path().join(backslash), "backslash staged\n").unwrap();
+		fs::write(temp.path().join(slash), "slash changed\n").unwrap();
+		repo.stage_files(&[backslash.to_owned()]).unwrap();
+		assert_eq!(git(temp.path(), &["show", &format!(":{backslash}")]), "backslash staged");
+		assert_eq!(git(temp.path(), &["show", &format!(":{slash}")]), "slash base");
+		repo.unstage(&[backslash.to_owned()]).unwrap();
+		assert_eq!(git(temp.path(), &["show", &format!(":{backslash}")]), "backslash base");
+
+		git(temp.path(), &["add", "--", backslash, slash]);
+		fs::write(temp.path().join(backslash), "backslash dirty\n").unwrap();
+		fs::write(temp.path().join(slash), "slash dirty\n").unwrap();
+		repo
+			.restore(&RestoreOptions { files: vec![backslash.to_owned()], ..Default::default() })
+			.unwrap();
+		assert_eq!(fs::read_to_string(temp.path().join(backslash)).unwrap(), "backslash staged\n");
+		assert_eq!(fs::read_to_string(temp.path().join(slash)).unwrap(), "slash dirty\n");
+
+		let clean_backslash = r"clean\name";
+		let clean_slash = "clean/name";
+		fs::create_dir(temp.path().join("clean")).unwrap();
+		fs::write(temp.path().join(clean_backslash), "remove\n").unwrap();
+		fs::write(temp.path().join(clean_slash), "keep\n").unwrap();
+		repo
+			.clean(&CleanOptions { paths: vec![clean_backslash.to_owned()], ..Default::default() })
+			.unwrap();
+		assert!(!temp.path().join(clean_backslash).exists());
+		assert!(temp.path().join(clean_slash).exists());
+	}
+
+	#[cfg(unix)]
+	#[test]
 	fn restore_applies_smudge_filter() {
 		let (temp, repo) = fixture();
 		fs::write(temp.path().join(".gitattributes"), "filtered.txt filter=upper\n").unwrap();
@@ -3778,6 +3977,31 @@ mod tests {
 		);
 		assert_eq!(fs::read(&index_path).unwrap(), index_before);
 		assert_eq!(fs::read_to_string(&sentinel).unwrap(), "outside\n");
+	}
+
+	#[test]
+	fn restore_locks_index_before_worktree_mutation() {
+		let (temp, repo) = fixture();
+		fs::write(temp.path().join("a"), "staged\n").unwrap();
+		git(temp.path(), &["add", "a"]);
+		fs::write(temp.path().join("a"), "dirty\n").unwrap();
+		let lock_path = temp.path().join(".git/index.lock");
+		fs::write(&lock_path, "held\n").unwrap();
+
+		assert!(
+			repo
+				.restore(&RestoreOptions {
+					staged: true,
+					worktree: true,
+					files: vec!["a".into()],
+					..Default::default()
+				})
+				.is_err()
+		);
+		assert_eq!(fs::read_to_string(temp.path().join("a")).unwrap(), "dirty\n");
+		assert_eq!(git(temp.path(), &["show", ":a"]), "staged");
+		assert_eq!(fs::read_to_string(&lock_path).unwrap(), "held\n");
+		fs::remove_file(lock_path).unwrap();
 	}
 
 	#[test]
