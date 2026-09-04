@@ -457,9 +457,7 @@ describe("DAP launch failure handling", () => {
 				resolvedCommand: process.execPath,
 				connectMode: "socket",
 			};
-			await expect(DapClient.spawn({ adapter, cwd, socketReadyTimeoutMs: 2_000 })).rejects.toThrow(
-				/Socket not ready/,
-			);
+			await expect(DapClient.spawn({ adapter, cwd, socketReadyTimeoutMs: 300 })).rejects.toThrow(/Socket not ready/);
 			// Wait for the kill signal to propagate to the detached adapter.
 			await Bun.sleep(500);
 			const adapterPid = Number(await Bun.file(pidFilePath).text());
