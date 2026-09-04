@@ -1794,6 +1794,12 @@ describe("Settings", () => {
 			expect(settings.get("compaction.methodOrder")).toEqual(["soft"]);
 		});
 	});
+
+	describe("task isolation defaults", () => {
+		it("enables isolated subagents by default", () => {
+			expect(Settings.isolated().get("task.isolation.enabled")).toBe(true);
+		});
+	});
 	describe("migrations", () => {
 		it("migrates nested task isolation mode none to disabled", async () => {
 			await writeSettings({ task: { isolation: { mode: "none" } } });

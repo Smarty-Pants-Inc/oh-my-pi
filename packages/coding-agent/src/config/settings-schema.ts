@@ -4854,7 +4854,7 @@ export const SETTINGS_SCHEMA = {
 	// Delegation
 	"task.isolation.enabled": {
 		type: "boolean",
-		default: false,
+		default: true,
 		ui: {
 			tab: "tasks",
 			group: "Isolation",

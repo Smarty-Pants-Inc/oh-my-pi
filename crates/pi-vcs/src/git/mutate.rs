@@ -98,6 +98,11 @@ impl GitRepo {
 			.iter()
 			.map(|path| normalize_stage_path(path))
 			.collect();
+		for path in &requested {
+			if !path.is_empty() {
+				ensure_no_symlink_ancestor(self.root(), &self.root().join(path), "git add")?;
+			}
+		}
 		if precompose_unicode_enabled(&repo) {
 			requested = remap_composed_index_paths(self.root(), &index, requested);
 		}
@@ -121,8 +126,11 @@ impl GitRepo {
 					.any(|wanted| stage_path_matches(&path, wanted)))
 				&& !selected.contains(path.as_ref())
 		});
+		let (mut pipeline, filter_index) = repo
+			.filter_pipeline(None)
+			.map_err(|err| Error::backend("git add", err))?;
 		for path in selected {
-			stage_one(&repo, self.root(), &mut index, &path)?;
+			stage_one(&mut pipeline, &filter_index, self.root(), &mut index, &path)?;
 		}
 		index.sort_entries();
 		index
@@ -145,7 +153,6 @@ impl GitRepo {
 	/// Create a commit and return its object id.
 	pub fn commit_create(&self, message: &str, options: &CommitOptions) -> Result<String> {
 		let repo = self.gix()?;
-		run_commit_hook(self, &repo, "pre-commit", &[])?;
 		let mut head = repo
 			.head()
 			.map_err(|err| Error::backend("git commit", err))?;
@@ -153,7 +160,23 @@ impl GitRepo {
 			.try_peel_to_id()
 			.map_err(|err| Error::backend("git commit", err))?
 			.map(|id| id.detach());
-		let index = load_index_or_head(&repo, "git commit")?;
+		let mut index = load_index_or_head(&repo, "git commit")?;
+		if index
+			.entries()
+			.iter()
+			.any(|entry| entry.stage() != gix::index::entry::Stage::Unconflicted)
+		{
+			return Err(Error::backend("git commit", "cannot commit with unmerged index entries"));
+		}
+		run_commit_hook(self, &repo, "pre-commit", &[])?;
+		index = load_index_or_head(&repo, "git commit")?;
+		if index
+			.entries()
+			.iter()
+			.any(|entry| entry.stage() != gix::index::entry::Stage::Unconflicted)
+		{
+			return Err(Error::backend("git commit", "cannot commit with unmerged index entries"));
+		}
 		let tree = if options.files.is_empty() {
 			write_index_tree(&repo, &index)?
 		} else {
@@ -788,14 +811,27 @@ impl GitRepo {
 		let Some(linked) = Self::discover(path)? else {
 			return Ok(false);
 		};
-		if !force && tracked_worktree_dirty(&linked)? {
+		if !linked.is_linked_worktree() || !force && linked.is_dirty()? {
 			return Ok(false);
 		}
-		let admin = linked.info().git_dir.clone();
-		fs::remove_dir_all(path)?;
-		if admin.starts_with(self.info().common_dir.join("worktrees")) {
-			fs::remove_dir_all(admin)?;
+		let canonical = |candidate: &Path| {
+			fs::canonicalize(candidate).unwrap_or_else(|_| normalize_path(candidate))
+		};
+		let requested_root = canonical(path);
+		let linked_root = canonical(linked.root());
+		let owner_common = canonical(&self.info().common_dir);
+		let linked_common = canonical(&linked.info().common_dir);
+		let admin = canonical(&linked.info().git_dir);
+		let owner_worktrees = owner_common.join("worktrees");
+		if requested_root != linked_root
+			|| linked_common != owner_common
+			|| !admin.starts_with(&owner_worktrees)
+			|| admin == owner_worktrees
+		{
+			return Ok(false);
 		}
+		fs::remove_dir_all(&linked_root)?;
+		fs::remove_dir_all(admin)?;
 		Ok(true)
 	}
 
@@ -1193,52 +1229,28 @@ fn same_worktree_file(_: &fs::Metadata, _: &fs::Metadata) -> bool {
 }
 
 fn stage_one(
-	repo: &gix::Repository,
+	pipeline: &mut gix::filter::Pipeline<'_>,
+	filter_index: &gix::index::State,
 	root: &Path,
 	index: &mut gix::index::File,
 	path: &str,
 ) -> Result<()> {
-	let full = root.join(path);
-	let metadata = fs::symlink_metadata(&full)?;
-	let (data, mode) = if metadata.file_type().is_symlink() {
-		(
-			fs::read_link(&full)?
-				.to_string_lossy()
-				.into_owned()
-				.into_bytes(),
-			gix::index::entry::Mode::SYMLINK,
-		)
-	} else {
-		let mode = if is_executable(&metadata) {
-			gix::index::entry::Mode::FILE_EXECUTABLE
-		} else {
-			gix::index::entry::Mode::FILE
-		};
-		(fs::read(&full)?, mode)
+	ensure_no_symlink_ancestor(root, &root.join(path), "git add")?;
+	let Some((id, kind, _)) = pipeline
+		.worktree_file_to_object(path.as_bytes().as_bstr(), filter_index)
+		.map_err(|err| Error::backend("git add", err))?
+	else {
+		return Err(Error::backend("git add", format!("path is not trackable: {path}")));
 	};
-	let id = repo
-		.write_blob(&data)
-		.map_err(|e| Error::backend("git add", e))?
-		.detach();
 	index.remove_entries(|_, p, _| p == path.as_bytes().as_bstr());
 	index.dangerously_push_entry(
 		Default::default(),
 		id,
 		gix::index::entry::Flags::empty(),
-		mode,
+		kind.into(),
 		path.as_bytes().as_bstr(),
 	);
 	Ok(())
-}
-
-#[cfg(unix)]
-fn is_executable(meta: &fs::Metadata) -> bool {
-	use std::os::unix::fs::PermissionsExt;
-	meta.permissions().mode() & 0o111 != 0
-}
-#[cfg(not(unix))]
-fn is_executable(_: &fs::Metadata) -> bool {
-	false
 }
 
 fn copy_index_paths(dest: &mut gix::index::File, source: &gix::index::File, files: &[String]) {
@@ -1480,10 +1492,74 @@ fn restore_index_paths(
 				.try_into_blob()
 				.map_err(|e| Error::backend("git restore", e))?;
 			let full = root.join(path.as_ref());
+			ensure_no_symlink_ancestor(root, &full, "git restore")?;
 			if let Some(parent) = full.parent() {
 				fs::create_dir_all(parent)?;
 			}
-			fs::write(full, &blob.data)?;
+			match fs::symlink_metadata(&full) {
+				Ok(metadata) if metadata.is_dir() => {
+					return Err(Error::backend(
+						"git restore",
+						format!("refusing to replace directory: {}", full.display()),
+					));
+				},
+				Ok(_) => fs::remove_file(&full)?,
+				Err(err) if err.kind() == std::io::ErrorKind::NotFound => {},
+				Err(err) => return Err(err.into()),
+			}
+			if entry.mode == gix::index::entry::Mode::SYMLINK {
+				#[cfg(unix)]
+				{
+					use std::os::unix::{ffi::OsStrExt, fs::symlink};
+					symlink(OsStr::from_bytes(&blob.data), &full)?;
+				}
+				#[cfg(not(unix))]
+				fs::write(&full, &blob.data)?;
+			} else {
+				fs::write(&full, &blob.data)?;
+			}
+		}
+	}
+	Ok(())
+}
+
+fn ensure_no_symlink_ancestor(root: &Path, path: &Path, operation: &'static str) -> Result<()> {
+	let Some(relative) = path.strip_prefix(root).ok() else {
+		return Err(Error::backend(operation, "path escapes worktree"));
+	};
+	if relative.components().any(|component| {
+		matches!(
+			component,
+			std::path::Component::ParentDir
+				| std::path::Component::RootDir
+				| std::path::Component::Prefix(_)
+		)
+	}) {
+		return Err(Error::backend(operation, "path escapes worktree"));
+	}
+	let options = gix::validate::path::component::Options::default();
+	for component in relative.components() {
+		let name = gix::path::os_str_into_bstr(component.as_os_str())
+			.map_err(|err| Error::backend(operation, format!("unsafe worktree path: {err}")))?;
+		gix::validate::path::component(name, None, options)
+			.map_err(|err| Error::backend(operation, format!("unsafe worktree path: {err}")))?;
+	}
+	let mut current = root.to_owned();
+	for component in relative
+		.components()
+		.take(relative.components().count().saturating_sub(1))
+	{
+		current.push(component);
+		match fs::symlink_metadata(&current) {
+			Ok(metadata) if metadata.file_type().is_symlink() => {
+				return Err(Error::backend(
+					operation,
+					format!("symlink ancestor in worktree path: {}", current.display()),
+				));
+			},
+			Ok(_) => {},
+			Err(err) if err.kind() == std::io::ErrorKind::NotFound => {},
+			Err(err) => return Err(err.into()),
 		}
 	}
 	Ok(())
@@ -1674,22 +1750,6 @@ fn branch_is_checked_out(common: &Path, full_ref: &str) -> bool {
 	entries.filter_map(std::result::Result::ok).any(|entry| {
 		fs::read_to_string(entry.path().join("HEAD")).is_ok_and(|head| head.trim() == expected)
 	})
-}
-
-fn tracked_worktree_dirty(repo: &GitRepo) -> Result<bool> {
-	let gix = repo.gix()?;
-	let index = load_index_or_head(&gix, "git worktree remove")?;
-	for entry in index.entries() {
-		if worktree_id(
-			&gix,
-			&repo.root().join(entry.path(&index).to_str_lossy().as_ref()),
-			entry.mode,
-		)? != Some(entry.id)
-		{
-			return Ok(true);
-		}
-	}
-	Ok(false)
 }
 
 fn snapshot_refs(repo: &gix::Repository) -> Result<Vec<(String, gix::hash::ObjectId)>> {
@@ -2536,5 +2596,180 @@ mod tests {
 		);
 		assert!(repo.worktree_prune().is_ok());
 		let _ = fs::remove_dir_all(linked);
+	}
+	#[test]
+	fn release_blocker_commit_rejects_unmerged_index() {
+		let (temp, repo) = fixture();
+		git(temp.path(), &["checkout", "-qb", "side"]);
+		fs::write(temp.path().join("a"), "side\n").unwrap();
+		git(temp.path(), &["commit", "-qam", "side"]);
+		git(temp.path(), &["checkout", "-q", "main"]);
+		fs::write(temp.path().join("a"), "main\n").unwrap();
+		git(temp.path(), &["commit", "-qam", "main"]);
+		let before = git(temp.path(), &["rev-parse", "HEAD"]);
+		let merge = Command::new("git")
+			.arg("-C")
+			.arg(temp.path())
+			.args(["merge", "side"])
+			.output()
+			.unwrap();
+		assert!(!merge.status.success());
+		assert!(!git(temp.path(), &["ls-files", "-u"]).is_empty());
+		assert!(
+			repo
+				.commit_create("must fail", &CommitOptions::default())
+				.is_err()
+		);
+		assert_eq!(git(temp.path(), &["rev-parse", "HEAD"]), before);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn release_blocker_unmerged_index_skips_pre_commit_hook() {
+		let (temp, repo) = fixture();
+		git(temp.path(), &["checkout", "-qb", "side"]);
+		fs::write(temp.path().join("a"), "side\n").unwrap();
+		git(temp.path(), &["commit", "-qam", "side"]);
+		git(temp.path(), &["checkout", "-q", "main"]);
+		fs::write(temp.path().join("a"), "main\n").unwrap();
+		git(temp.path(), &["commit", "-qam", "main"]);
+		let merge = Command::new("git")
+			.arg("-C")
+			.arg(temp.path())
+			.args(["merge", "side"])
+			.output()
+			.unwrap();
+		assert!(!merge.status.success());
+		write_hook(
+			&temp.path().join(".git/hooks/pre-commit"),
+			"git add a\necho ran > .git/hook-ran",
+			true,
+		);
+		assert!(
+			repo
+				.commit_create("must fail", &CommitOptions::default())
+				.is_err()
+		);
+		assert!(!temp.path().join(".git/hook-ran").exists());
+		assert!(!git(temp.path(), &["ls-files", "-u"]).is_empty());
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn release_blocker_stage_and_restore_do_not_follow_symlinks() {
+		use std::os::unix::fs::symlink;
+
+		let (temp, repo) = fixture();
+		let outside = tempfile::tempdir().unwrap();
+		fs::write(outside.path().join("secret"), "outside\n").unwrap();
+		symlink(outside.path(), temp.path().join("escape")).unwrap();
+		repo.stage_files(&["escape".into()]).unwrap();
+		let staged = git(temp.path(), &["ls-files", "--stage", "escape"]);
+		assert!(!staged.is_empty());
+		assert!(!staged.contains("escape/secret"));
+		assert!(repo.stage_files(&["escape/secret".into()]).is_err());
+
+		let sentinel = outside.path().join("sentinel");
+		fs::write(&sentinel, "unchanged\n").unwrap();
+		fs::remove_file(temp.path().join("a")).unwrap();
+		symlink(&sentinel, temp.path().join("a")).unwrap();
+		repo
+			.restore(&RestoreOptions { files: vec!["a".into()], ..Default::default() })
+			.unwrap();
+		assert_eq!(fs::read_to_string(&sentinel).unwrap(), "unchanged\n");
+		assert_eq!(fs::read_to_string(temp.path().join("a")).unwrap(), "one\n");
+		assert!(
+			ensure_no_symlink_ancestor(
+				temp.path(),
+				&temp.path().join(".git/hooks/owned"),
+				"git restore",
+			)
+			.is_err()
+		);
+	}
+
+	#[test]
+	fn release_blocker_worktree_remove_protects_dirty_and_primary() {
+		let (temp, repo) = fixture();
+		let linked = tempfile::tempdir().unwrap();
+		repo
+			.worktree_add(linked.path(), "main", WorktreeAddOptions {
+				detach:       true,
+				clone:        WorktreeClone::Off,
+				keep_changes: false,
+			})
+			.unwrap();
+		fs::write(linked.path().join("a"), "staged\n").unwrap();
+		git(linked.path(), &["add", "a"]);
+		assert!(!repo.worktree_remove(linked.path(), false).unwrap());
+		git(linked.path(), &["reset", "--hard", "HEAD"]);
+		fs::write(linked.path().join("untracked"), "keep\n").unwrap();
+		assert!(!repo.worktree_remove(linked.path(), false).unwrap());
+		assert!(linked.path().join("untracked").exists());
+		assert!(!repo.worktree_remove(temp.path(), true).unwrap());
+		assert!(temp.path().join(".git").exists());
+		assert!(repo.worktree_remove(linked.path(), true).unwrap());
+	}
+
+	#[test]
+	fn release_blocker_worktree_remove_rejects_nested_root() {
+		let (temp, repo) = fixture();
+		let linked = tempfile::tempdir().unwrap();
+		repo
+			.worktree_add(linked.path(), "main", WorktreeAddOptions {
+				detach:       true,
+				clone:        WorktreeClone::Off,
+				keep_changes: false,
+			})
+			.unwrap();
+		fs::create_dir(linked.path().join("nested")).unwrap();
+		fs::write(linked.path().join("nested/file"), "keep\n").unwrap();
+		assert!(
+			!repo
+				.worktree_remove(&linked.path().join("nested"), true)
+				.unwrap()
+		);
+		assert!(linked.path().join("nested/file").exists());
+		assert!(
+			git(temp.path(), &["worktree", "list", "--porcelain"])
+				.contains(linked.path().to_string_lossy().as_ref())
+		);
+		assert!(repo.worktree_remove(linked.path(), true).unwrap());
+	}
+
+	#[test]
+	fn release_blocker_worktree_remove_rejects_foreign_common_dir() {
+		let (caller_temp, caller) = fixture();
+		let (owner_temp, owner) = fixture();
+		let linked = tempfile::tempdir().unwrap();
+		owner
+			.worktree_add(linked.path(), "main", WorktreeAddOptions {
+				detach:       true,
+				clone:        WorktreeClone::Off,
+				keep_changes: false,
+			})
+			.unwrap();
+		assert!(!caller.worktree_remove(linked.path(), true).unwrap());
+		assert!(linked.path().exists());
+		assert!(
+			git(owner_temp.path(), &["worktree", "list", "--porcelain"])
+				.contains(linked.path().to_string_lossy().as_ref())
+		);
+		assert!(owner.worktree_remove(linked.path(), true).unwrap());
+		drop(caller_temp);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn release_blocker_stage_applies_clean_filter() {
+		let (temp, repo) = fixture();
+		fs::write(temp.path().join(".gitattributes"), "filtered.txt filter=upper\n").unwrap();
+		git(temp.path(), &["add", ".gitattributes"]);
+		git(temp.path(), &["commit", "-qm", "attributes"]);
+		git(temp.path(), &["config", "filter.upper.clean", "tr a-z A-Z"]);
+		git(temp.path(), &["config", "filter.upper.required", "true"]);
+		fs::write(temp.path().join("filtered.txt"), "lowercase\n").unwrap();
+		repo.stage_files(&["filtered.txt".into()]).unwrap();
+		assert_eq!(git(temp.path(), &["show", ":filtered.txt"]), "LOWERCASE");
 	}
 }

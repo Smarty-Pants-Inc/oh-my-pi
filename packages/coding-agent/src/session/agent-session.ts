@@ -978,15 +978,14 @@ export class AgentSession {
 	}
 
 	#acquirePowerAssertion(): void {
-		if (process.platform !== "darwin") return;
 		if (isBunTestRuntime()) return;
 		if (this.#powerAssertion) return;
-		const mode = this.settings.get("power.sleepPrevention");
-		if (mode === "off") return;
+		const options = powerAssertionOptions(this.settings.get("power.sleepPrevention"));
+		if (!options) return;
 		try {
-			this.#powerAssertion = PowerAssertion.start(powerAssertionOptions(mode));
+			this.#powerAssertion = PowerAssertion.start(options);
 		} catch (error) {
-			logger.warn("Failed to acquire macOS power assertion", { error: String(error) });
+			logger.warn("Failed to acquire power assertion", { error: String(error) });
 		}
 	}
 
@@ -997,7 +996,7 @@ export class AgentSession {
 		try {
 			assertion.stop();
 		} catch (error) {
-			logger.warn("Failed to release macOS power assertion", { error: String(error) });
+			logger.warn("Failed to release power assertion", { error: String(error) });
 		}
 	}
 
@@ -3182,7 +3181,19 @@ export class AgentSession {
 		const args = summarizeToolArguments(event.args);
 		if (args) data.args = args;
 		if (event.intent) data.intent = event.intent;
-		this.sessionManager.appendCustomEntry(TOOL_EXECUTION_START_CUSTOM_TYPE, data);
+		try {
+			this.sessionManager.appendCustomEntry(TOOL_EXECUTION_START_CUSTOM_TYPE, data);
+			// Agent events can overtake the async assistant-message persistence path.
+			// Materialize the marker now so an immediate crash still leaves resume evidence.
+			this.sessionManager.ensureOnDiskSync();
+		} catch (error) {
+			logger.error("Failed to record tool execution start", {
+				sessionId: this.sessionManager.getSessionId(),
+				sessionFile: this.sessionManager.getSessionFile(),
+				toolCallId: event.toolCallId,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
 	}
 
 	#recordSessionExit(reason: postmortem.Reason | "dispose"): void {

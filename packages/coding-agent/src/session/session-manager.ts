@@ -2006,6 +2006,13 @@ export class SessionManager {
 		await this.#rewriteAtomically();
 	}
 
+	/** Force the current journal onto disk before returning, including pre-assistant diagnostic entries. */
+	ensureOnDiskSync(): void {
+		if (!this.#persist || !this.#sessionFile) return;
+		this.#forceFileCreation = true;
+		this.flushSync();
+	}
+
 	/** Persist this session's transcript as a newly identified OMP session. */
 	async persistCopy(
 		options?: { sessionDir?: string; suppressBreadcrumb?: boolean },
