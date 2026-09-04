@@ -370,6 +370,31 @@ describe("structured subagent primitive", () => {
 		]);
 	});
 
+	it("keeps an authenticated role fallback in the policy catalog", async () => {
+		const unauthenticated = model("p", "unauthenticated");
+		const authenticated = model("p", "authenticated");
+		const modelRegistry = {
+			getAvailable: () => [authenticated],
+			getAll: () => [unauthenticated, authenticated],
+			awaitBackgroundRefresh: async () => {},
+		} as unknown as ModelRegistry;
+		mockDiscovery();
+
+		const policy = await resolveEffectiveSubagentPolicy(
+			request({
+				session: session({
+					modelRegistry,
+					enabledModels: ["@task"],
+					modelRoles: { task: "p/unauthenticated,p/authenticated" },
+				}),
+				model: "@task",
+			}),
+		);
+
+		expect(policy.allowedModels?.map(candidate => candidate.id)).toEqual(["authenticated"]);
+		expect(policy.modelCandidates?.map(candidate => candidate.id)).toEqual(["unauthenticated", "authenticated"]);
+	});
+
 	it("rejects an explicit empty model selector before applying lower-precedence defaults", async () => {
 		const customAgent = { ...AGENT, model: ["@definition"] };
 		mockDiscovery(customAgent);

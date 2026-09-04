@@ -1877,10 +1877,17 @@ export function resolveModelPolicyModels(
 	modelRegistry: Pick<ModelRegistry, "getAvailable"> & Partial<Pick<ModelRegistry, "getAll">>,
 	settings?: Settings,
 ): Model<Api>[] {
-	const allModels = modelRegistry.getAll?.() ?? modelRegistry.getAvailable();
+	const availableModels = modelRegistry.getAvailable();
+	const allModels = modelRegistry.getAll?.() ?? availableModels;
 	const disabledProviders = new Set(settings?.get("disabledProviders") ?? []);
+	const enabledPatterns = settings?.get("enabledModels") ?? [];
 	const visibleModels = allModels.filter(model => !disabledProviders.has(model.provider));
-	return filterModelsByEnabledPatterns(visibleModels, settings?.get("enabledModels") ?? [], settings);
+	const policyModels = filterModelsByEnabledPatterns(visibleModels, enabledPatterns, settings);
+	const visibleAvailableModels = availableModels.filter(model => !disabledProviders.has(model.provider));
+	for (const model of filterModelsByEnabledPatterns(visibleAvailableModels, enabledPatterns, settings)) {
+		if (!policyModels.some(candidate => modelsAreEqual(candidate, model))) policyModels.push(model);
+	}
+	return policyModels;
 }
 function findExactCliModel(
 	selector: string,

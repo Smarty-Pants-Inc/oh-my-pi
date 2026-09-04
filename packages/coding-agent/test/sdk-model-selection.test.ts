@@ -8,7 +8,7 @@ import { writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { resolveModelCacheProviderId } from "@oh-my-pi/pi-catalog/provider-models";
 import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
-import { ModelRegistry, type ProviderConfigInput } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { kNoAuth, ModelRegistry, type ProviderConfigInput } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { getModelMatchPreferences, resolveModelScope } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { buildSessionOptions as buildCliSessionOptions } from "@oh-my-pi/pi-coding-agent/main";
@@ -479,6 +479,75 @@ describe("createAgentSession deferred model pattern resolution", () => {
 				isFallback: true,
 			});
 			expect(modelFallbackMessage).toBeUndefined();
+		} finally {
+			await session.dispose();
+			getApiKeySpy.mockRestore();
+		}
+	});
+
+	test("uses a later authenticated deferred model before the parent fallback", async () => {
+		const parentModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!parentModel) {
+			throw new Error("Expected bundled anthropic parent model");
+		}
+		const authStorage = createInMemoryAuthStorage();
+		authStoragesToClose.push(authStorage);
+		authStorage.setRuntimeApiKey(parentModel.provider, "test-key");
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "ordered-auth-models.yml"));
+		const sessionManager = SessionManager.inMemory();
+		const providerSessionId = sessionManager.getSessionId();
+		const getApiKeySpy = vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async requested => {
+			if (requested.id === "runtime-model") return undefined;
+			if (requested.id === "runtime-fallback-model") return "test-key";
+			if (requested.provider === parentModel.provider) return "test-key";
+			return undefined;
+		});
+		const { session } = await createAgentSession({
+			...buildSessionOptions(["runtime-provider/runtime-model", "runtime-provider/runtime-fallback-model"]),
+			authStorage,
+			modelRegistry,
+			sessionManager,
+			modelPatternAuthFallback: `${parentModel.provider}/${parentModel.id}`,
+		});
+
+		try {
+			expect(session.model?.provider).toBe("runtime-provider");
+			expect(session.model?.id).toBe("runtime-fallback-model");
+			expect(getApiKeySpy.mock.calls).toContainEqual([
+				expect.objectContaining({ id: "runtime-fallback-model" }),
+				providerSessionId,
+			]);
+		} finally {
+			await session.dispose();
+			getApiKeySpy.mockRestore();
+		}
+	});
+
+	test("accepts a keyless parent for deferred auth fallback", async () => {
+		const parentModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!parentModel) {
+			throw new Error("Expected bundled anthropic parent model");
+		}
+		const authStorage = createInMemoryAuthStorage();
+		authStoragesToClose.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "keyless-fallback-models.yml"));
+		const getApiKeySpy = vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async requested => {
+			if (requested.provider === "runtime-provider") return undefined;
+			if (requested.provider === parentModel.provider) return kNoAuth;
+			return undefined;
+		});
+		const { session } = await createAgentSession({
+			...buildSessionOptions("runtime-provider/runtime-model"),
+			authStorage,
+			modelRegistry,
+			sessionManager: SessionManager.inMemory(),
+			modelPatternAuthFallback: `${parentModel.provider}/${parentModel.id}`,
+		});
+
+		try {
+			expect(session.model?.provider).toBe(parentModel.provider);
+			expect(session.model?.id).toBe(parentModel.id);
+			expect(session.servingModel?.isFallback).toBe(true);
 		} finally {
 			await session.dispose();
 			getApiKeySpy.mockRestore();

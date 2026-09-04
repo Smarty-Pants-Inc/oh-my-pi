@@ -30,6 +30,7 @@ import {
 	prewarmOpenAICodexResponses,
 } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import { FALLBACK_DIALECT, preferredDialect } from "@oh-my-pi/pi-catalog/identity";
+import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import type { Component } from "@oh-my-pi/pi-tui";
 import {
 	$env,
@@ -72,6 +73,7 @@ import {
 	resolveAllowedModels,
 	resolveCliModel,
 	resolveConfiguredModelPatterns,
+	resolveModelOverrideWithAuthFallback,
 	resolveModelRoleValue,
 } from "./config/model-resolver";
 import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate } from "./config/prompt-templates";
@@ -2540,11 +2542,52 @@ async function createAgentSessionScoped(
 			)
 				? availableModels
 				: allModels;
+			const deferredAuthSelection = options.modelPatternAuthFallback
+				? await resolveModelOverrideWithAuthFallback(
+						expandedModelPatterns.map(({ pattern }) => pattern),
+						options.modelPatternAuthFallback,
+						modelRegistry,
+						settings,
+						providerSessionId,
+						availableModels,
+						allModels,
+					)
+				: undefined;
+			const deferredAuthModel = deferredAuthSelection?.model;
+			let deferredAuthPatternIndex = -1;
+			if (deferredAuthModel && !deferredAuthSelection.authFallbackUsed) {
+				deferredAuthPatternIndex = expandedModelPatterns.findIndex(({ pattern }) => {
+					const candidate = parseModelPattern(pattern, resolutionModels, matchPreferences);
+					return candidate.model ? modelsAreEqual(candidate.model, deferredAuthModel) : false;
+				});
+			}
+			if (deferredAuthModel && deferredAuthSelection.authFallbackUsed) {
+				model = deferredAuthModel;
+				initialModelFallback = true;
+				modelFallbackMessage = undefined;
+				if (deferredAuthSelection.explicitThinkingLevel) {
+					restoredSessionThinkingLevel = deferredAuthSelection.thinkingLevel;
+				}
+				thinkingLevel = pickInitialThinkingLevel(deferredAuthModel);
+				autoThinking = thinkingLevel === AUTO_THINKING;
+				effectiveThinkingLevel = concreteThinkingLevel(thinkingLevel);
+				effectiveThinkingLevel = logger.time("resolveThinkingLevelForModel", () =>
+					autoThinking
+						? resolveProvisionalAutoLevel(deferredAuthModel)
+						: resolveThinkingLevelForModel(deferredAuthModel, effectiveThinkingLevel),
+				);
+				preconnectModelHost(deferredAuthModel.baseUrl);
+			}
 			let usageFallbackTriggered = false;
-			for (let patternIndex = 0; patternIndex < expandedModelPatterns.length; patternIndex += 1) {
+			for (let patternIndex = 0; !model && patternIndex < expandedModelPatterns.length; patternIndex += 1) {
 				const { pattern, retryFallback } = expandedModelPatterns[patternIndex];
 				const primary = parseModelPattern(pattern, resolutionModels, matchPreferences);
-				if (!primary.model || (retryFallback && !hasModelAuth(primary.model))) continue;
+				if (!primary.model || patternIndex < deferredAuthPatternIndex) continue;
+				if (retryFallback && !options.modelPatternAuthFallback && !hasModelAuth(primary.model)) continue;
+				if (options.modelPatternAuthFallback && patternIndex > deferredAuthPatternIndex) {
+					const candidateKey = await modelRegistry.getApiKey(primary.model, providerSessionId);
+					if (candidateKey !== kNoAuth && !isAuthenticated(candidateKey)) continue;
+				}
 				let hasUsageFallbackCandidate = false;
 				for (
 					let candidateIndex = patternIndex + 1;
@@ -2608,7 +2651,7 @@ async function createAgentSessionScoped(
 						}
 					}
 				}
-				let selectedModel = primary.model;
+				const selectedModel = primary.model;
 				let selectedThinkingLevel = primary.thinkingLevel;
 				let selectedExplicitThinkingLevel = primary.explicitThinkingLevel;
 				// A chain entry without its own `:level` suffix inherits the
@@ -2618,27 +2661,7 @@ async function createAgentSessionScoped(
 					selectedThinkingLevel = retryFallback.originalThinkingLevel;
 					selectedExplicitThinkingLevel = true;
 				}
-				let authFallbackUsed = false;
-				if (options.modelPatternAuthFallback) {
-					const primaryKey = await modelRegistry.getApiKey(primary.model);
-					if (primaryKey !== kNoAuth && !isAuthenticated(primaryKey)) {
-						const fallback = parseModelPattern(
-							options.modelPatternAuthFallback,
-							resolutionModels,
-							matchPreferences,
-						);
-						if (fallback.model) {
-							const fallbackKey = await modelRegistry.getApiKey(fallback.model);
-							if (isAuthenticated(fallbackKey)) {
-								selectedModel = fallback.model;
-								selectedThinkingLevel = fallback.thinkingLevel;
-								selectedExplicitThinkingLevel = fallback.explicitThinkingLevel;
-								authFallbackUsed = true;
-							}
-						}
-					}
-				}
-				if (!authFallbackUsed && options.modelPatternFallbackRole) {
+				if (options.modelPatternFallbackRole) {
 					const primarySelector = formatModelSelectorValue(
 						formatModelStringWithRouting(primary.model),
 						primary.thinkingLevel,
@@ -2689,7 +2712,6 @@ async function createAgentSessionScoped(
 				model = selectedModel;
 				initialRetryFallback =
 					retryFallback && usageFallbackTriggered ? { ...retryFallback, pinned: true } : retryFallback;
-				initialModelFallback ||= authFallbackUsed;
 				modelFallbackMessage = undefined;
 
 				if (selectedExplicitThinkingLevel) {
