@@ -508,7 +508,7 @@ function parseSqliteWriteTarget(subPath: string, queryString: string): { table: 
 	return { table, key };
 }
 
-function assertEnvironmentWriteSupported(writePath: string, content: string): void {
+function assertEnvironmentWriteSupported(writePath: string, content: string, sourceContent = content): void {
 	if (parseConflictUri(writePath)) {
 		throw new ToolError("Environment writes only support ordinary workspace files, not conflict:// targets");
 	}
@@ -519,8 +519,8 @@ function assertEnvironmentWriteSupported(writePath: string, content: string): vo
 		throw new ToolError("Environment writes do not support SQLite table or row targets");
 	}
 	if (
-		content.includes("\0") ||
-		new TextDecoder("utf-8", { fatal: true }).decode(new TextEncoder().encode(content)) !== content
+		sourceContent.includes("\0") ||
+		new TextDecoder("utf-8", { fatal: true }).decode(new TextEncoder().encode(sourceContent)) !== sourceContent
 	) {
 		throw new ToolError("Environment writes require strict UTF-8 text content");
 	}
@@ -1128,13 +1128,14 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 	async #writeEnvironment(
 		writePath: string,
 		content: string,
+		sourceContent: string,
 		stripped: boolean,
 		onUpdate: AgentToolUpdateCallback<WriteToolDetails> | undefined,
 	): Promise<AgentToolResult<WriteToolDetails> | undefined> {
 		const environment = this.session.getExecutionEnvironment?.();
 		if (!environment) return undefined;
 
-		assertEnvironmentWriteSupported(writePath, content);
+		assertEnvironmentWriteSupported(writePath, content, sourceContent);
 		let remotePath: string;
 		try {
 			remotePath = mapExecutionEnvironmentPath(environment, writePath);
@@ -1285,7 +1286,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			// any local existence probe, archive/database inspection, LSP, snapshot,
 			// mode, ACP, or disk read/write behavior.
 			if (!internalRouter.canHandle(path)) {
-				const environmentResult = await this.#writeEnvironment(path, cleanContent, stripped, onUpdate);
+				const environmentResult = await this.#writeEnvironment(path, cleanContent, content, stripped, onUpdate);
 				if (environmentResult) return environmentResult;
 			}
 

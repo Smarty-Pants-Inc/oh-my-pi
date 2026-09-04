@@ -2746,10 +2746,11 @@ async function executeToolCalls(
 	const runTool = async (record: (typeof records)[number], index: number): Promise<void> => {
 		// User and peer steering preserve already-emitted non-interruptible calls:
 		// their generation cost is sunk, and retrying them is usually redundant.
-		// System and parent-agent steering can still preempt queued calls because
-		// those messages may change the governing instruction before side effects.
+		// System and parent-agent steering may preempt queued calls, except `yield`:
+		// once emitted, it is the child's result commit boundary and must settle.
 		const governingSteer = interruptState.source === "system" || interruptState.source === "agent";
-		if (interruptState.triggered && (record.interruptible || governingSteer)) {
+		const mustCommitYield = record.toolCall.name === "yield";
+		if (interruptState.triggered && !mustCommitYield && (record.interruptible || governingSteer)) {
 			// Skip both span emission and the collector orphan record here. The
 			// tail sweep below (after `Promise.allSettled`) is the single path
 			// that handles "no result message was produced" — it calls

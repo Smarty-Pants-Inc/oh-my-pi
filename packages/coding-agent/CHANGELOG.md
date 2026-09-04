@@ -4,14 +4,18 @@
 
 ### Fixed
 
-- Preserved the full parsed payload of a schema-invalid background task result: it is now persisted to the `<id>.json` sidecar and advertised via `agent://<id>` alongside the inline preview, instead of only showing a size-capped, unrecoverable inline JSON block.
-- Delayed retained-artifact cleanup for background task spawns by a grace period after delivery settles, so the model's next turn has time to read the advertised `agent://` pointer before the backing files are removed.
-- Background (non-blocking) `task` spawns with an `outputSchema` now deliver their parsed structured output and expose it at `agent://<id>`.
-- `hub wait`/`jobs` no longer inlines a truncated (and potentially invalid) JSON block for schema-valid background job results; it now points to `agent://<id>` instead, matching the async-result follow-up.
-- A detached background `task` that fails without valid structured output now keeps its temporary artifacts until eviction instead of deleting them immediately, so the failed agent stays interrogable via `agent://<id>`/`history://<id>`.
-- Fixed a stale `<id>.json` structured-output sidecar surviving when the serialized payload was `undefined`.
-- `AsyncJobManager.dispose()` no longer sleeps out the full retained-artifacts grace period on shutdown.
-- Retained-artifacts cleanup for a background task now gives up waiting on a hung delivery sink after a bounded timeout, instead of waiting on it forever and leaking the retained temp directory for the process lifetime.
+- Fixed two idle subagents exchanging a single IRC message ping-ponging forever: wake-turn relays are now tagged and never relayed back, so each automated relay is delivered exactly once instead of waking a reciprocal relay until manual cancellation.
+
+## [18.1.8] - 2026-09-03
+
+### Fixed
+
+- Improved background task results with structured output schemas: parsed results are now available through the `agent://<id>` resource, while large or invalid inline JSON is replaced with a reliable pointer to the complete result.
+- Background task artifacts are retained long enough for follow-up turns to read them, including failed tasks that lack valid structured output, and are cleaned up without blocking shutdown or leaking resources.
+- Fixed context compaction incorrectly accepting archived history that was larger because of opaque reasoning data, allowing the next compaction strategy to run instead.
+- Fixed the Model Hub sidebar jumping to the top when provider refreshes rebuild the list; the focused model, or its nearest remaining entry, is now preserved.
+- Fixed the `inspect_image` status hint showing the wrong model after switching between image-capable model roles.
+- Fixed multi-minute TUI freezes during subagent activity and batch execution.
 
 ## [18.1.7] - 2026-09-03
 
@@ -35,6 +39,9 @@
 - Local tiny models for titles, memory, and automatic thinking classification now share on-demand workers across omp processes, reducing redundant resource usage; workers stop automatically after inactivity.
 - PI_TINY_DEVICE=metal now selects the MLX backend on macOS.
 - Updated agent reactions to trigger on the opening emoji instead of requiring a newline, consuming any following whitespace.
+### Added
+
+- Added the `worktree.cleanSource` setting to reset and clean the original checkout when creating a worktree with `/wt`.
 
 ### Fixed
 
