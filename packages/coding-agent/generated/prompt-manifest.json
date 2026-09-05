@@ -3513,7 +3513,7 @@
     },
     {
       "id": "tool.task",
-      "descriptionSha256": "c102e17f186268ccb424dec9e7a055fe5d3ce09925f503f341ae37f04488846d",
+      "descriptionSha256": "fa43757f6c62af0f79491c7bb797b4fab553e04883c3aefd826aa14da4500393",
       "schemaSha256": "e05927b9fab81da62b6b4b6cc8384878fed2a2b463affbca20177bdcf6c05d26"
     },
     {
@@ -6407,7 +6407,7 @@
     },
     {
       "path": "packages/coding-agent/generated/tool-contracts.json",
-      "sha256": "1d724f3f73bc8d9d01b4e40027d364923fbf09f221c1ecd1afd6f69ad8deb36d"
+      "sha256": "a22420f6b5ec3ee1c06f913cd1903d4ce565374b9b90849390c38d5f70e6d996"
     },
     {
       "path": "packages/coding-agent/package.json",
@@ -8939,7 +8939,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/retry-fallback-chains.ts",
-      "sha256": "59d4e1aab8efbfc84df07a35f73fbae23b075797f6e6c9aa5e8a790a604edae3"
+      "sha256": "1fe606f3866805a4355fe4d7b26b72c7033debecb820b04a1df1a154839d0777"
     },
     {
       "path": "packages/coding-agent/src/session/role-models.ts",
@@ -9095,7 +9095,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/turn-recovery.ts",
-      "sha256": "6a6efbc51c676fd23817a0a91865d5c2c777aebe41e95fb0e959271b8c2caafa"
+      "sha256": "901ac369ffa5a3f81ad137945784c9ae0bcdb38bc75f0f3c43a1aa8896be827f"
     },
     {
       "path": "packages/coding-agent/src/session/unexpected-stop-classifier.ts",
@@ -11147,5 +11147,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "a69d1b096e840f79d30d983d0883c84f7a16b729effe5f90a03d16cb16f2c72e"
+  "rootSha256": "02565602b214c544008abd877a213e616159d1fe7f9a1a2fdd1d917a8d1f843f"
 }
