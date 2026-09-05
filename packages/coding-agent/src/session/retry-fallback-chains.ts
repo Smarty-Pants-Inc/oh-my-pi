@@ -48,6 +48,8 @@ export interface ActiveRetryFallbackState {
 	originalSelector: string;
 	originalThinkingLevel: ConfiguredThinkingLevel | undefined;
 	lastAppliedFallbackThinkingLevel: ConfiguredThinkingLevel | undefined;
+	/** Whether restoring the original selector must retain earlier fallback routing. */
+	originalWasFallbackRouted: boolean;
 	pinned: boolean;
 	/**
 	 * Set once a turn on the fallback target settles successfully. Until then the
