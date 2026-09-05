@@ -15,8 +15,6 @@ Execution waits for each assignment to finish.
 - Job IDs are process-local and expire roughly five minutes after settlement. Afterward, use the agent ID with `hub send`, `agent://<id>`, or `history://<id>`.
 - With `outputSchema`, a result's parsed payload — when present — is served at `agent://<id>` (fields via `agent://<id>?q=.<field>`) regardless of validity; a schema-violating (invalid) result also previews the payload inline in the auto-delivered follow-up.
 - `completed` means successful yield/job exit, not artifact acceptance. Verify claimed changes.
-
-
 # Task Design
 - Pick each item's most specific available agent. Omitting `agent` selects the spawn-policy default (`{{defaultAgent}}`); omit it only when that agent fits the task. Otherwise pass the specialist explicitly.
 - Parallelize independent ownership. Same-file edits are not guaranteed to merge.{{#if ircEnabled}} Have siblings coordinate through `hub` before editing shared files.{{/if}} Keep coupled changes under one integration owner.

@@ -30,6 +30,7 @@ import {
 	prewarmOpenAICodexResponses,
 } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import { FALLBACK_DIALECT, preferredDialect } from "@oh-my-pi/pi-catalog/identity";
+import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import type { Component } from "@oh-my-pi/pi-tui";
 import {
 	$env,
@@ -78,6 +79,8 @@ import {
 	resolveAllowedModels,
 	resolveCliModel,
 	resolveConfiguredModelPatterns,
+	resolveModelOverrideWithAuthFallback,
+	resolveModelPolicyModels,
 	resolveModelRoleValue,
 } from "./config/model-resolver";
 import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate } from "./config/prompt-templates";
@@ -418,6 +421,8 @@ export interface CreateAgentSessionOptions {
 	 * so caller-owned routing and limits remain authoritative.
 	 */
 	rebindModelAfterDiscovery?: boolean;
+	/** Whether the supplied model was selected by auth fallback rather than as the requested primary. */
+	initialModelFallback?: boolean;
 	/** Raw model pattern(s) (e.g. from --model CLI flag) to resolve after extensions load.
 	 * Used when model lookup is deferred because extension-provided models aren't registered yet. */
 	modelPattern?: string | string[];
@@ -1600,6 +1605,8 @@ async function createAgentSessionScoped(
 	let model = options.model;
 	let modelFallbackMessage: string | undefined;
 	let initialRetryFallback: InitialRetryFallbackState | undefined;
+	let initialModelFallback = options.initialModelFallback === true;
+
 	// Identify session model strings to restore in fallback order. We do an
 	// initial pass here so model-dependent setup (thinking-level resolution,
 	// host preconnect) can use the restored model; extension-registered
@@ -2470,8 +2477,8 @@ async function createAgentSessionScoped(
 					modelRegistry.refresh("online-if-uncached"),
 				);
 			}
-			const allModels = modelRegistry.getAll();
-			const availableModels = modelRegistry.getAvailable();
+			const availableModels = await resolveAllowedModels(modelRegistry, settings, matchPreferences);
+			const modelCandidates = resolveModelPolicyModels(modelRegistry, settings);
 			const expandedModelPatterns = deferredModelPatterns.flatMap(pattern =>
 				pattern.split(",").flatMap(selector => {
 					const trimmedSelector = selector.trim();
@@ -2504,7 +2511,8 @@ async function createAgentSessionScoped(
 						const originalSelector = resolved.configuredPatterns[0];
 						const availableOriginal = parseModelPattern(originalSelector, availableModels, matchPreferences);
 						const originalModel =
-							availableOriginal.model ?? parseModelPattern(originalSelector, allModels, matchPreferences).model;
+							availableOriginal.model ??
+							parseModelPattern(originalSelector, modelCandidates, matchPreferences).model;
 						const chainKey = resolveRetryFallbackChainKey(
 							fallbackContext,
 							originalSelector,
@@ -2550,12 +2558,53 @@ async function createAgentSessionScoped(
 				({ pattern }) => parseModelPattern(pattern, availableModels, matchPreferences).model,
 			)
 				? availableModels
-				: allModels;
+				: modelCandidates;
+			const deferredAuthSelection = options.modelPatternAuthFallback
+				? await resolveModelOverrideWithAuthFallback(
+						expandedModelPatterns.map(({ pattern }) => pattern),
+						options.modelPatternAuthFallback,
+						modelRegistry,
+						settings,
+						providerSessionId,
+						availableModels,
+						modelCandidates,
+					)
+				: undefined;
+			const deferredAuthModel = deferredAuthSelection?.model;
+			let deferredAuthPatternIndex = -1;
+			if (deferredAuthModel && !deferredAuthSelection.authFallbackUsed) {
+				deferredAuthPatternIndex = expandedModelPatterns.findIndex(({ pattern }) => {
+					const candidate = parseModelPattern(pattern, resolutionModels, matchPreferences);
+					return candidate.model ? modelsAreEqual(candidate.model, deferredAuthModel) : false;
+				});
+			}
+			if (deferredAuthModel && deferredAuthSelection.authFallbackUsed) {
+				model = deferredAuthModel;
+				initialModelFallback = true;
+				modelFallbackMessage = undefined;
+				if (deferredAuthSelection.explicitThinkingLevel) {
+					restoredSessionThinkingLevel = deferredAuthSelection.thinkingLevel;
+				}
+				thinkingLevel = pickInitialThinkingLevel(deferredAuthModel);
+				autoThinking = thinkingLevel === AUTO_THINKING;
+				effectiveThinkingLevel = concreteThinkingLevel(thinkingLevel);
+				effectiveThinkingLevel = logger.time("resolveThinkingLevelForModel", () =>
+					autoThinking
+						? resolveProvisionalAutoLevel(deferredAuthModel)
+						: resolveThinkingLevelForModel(deferredAuthModel, effectiveThinkingLevel),
+				);
+				preconnectModelHost(deferredAuthModel.baseUrl);
+			}
 			let usageFallbackTriggered = false;
-			for (let patternIndex = 0; patternIndex < expandedModelPatterns.length; patternIndex += 1) {
+			for (let patternIndex = 0; !model && patternIndex < expandedModelPatterns.length; patternIndex += 1) {
 				const { pattern, retryFallback } = expandedModelPatterns[patternIndex];
 				const primary = parseModelPattern(pattern, resolutionModels, matchPreferences);
-				if (!primary.model || (retryFallback && !hasModelAuth(primary.model))) continue;
+				if (!primary.model || patternIndex < deferredAuthPatternIndex) continue;
+				if (retryFallback && !options.modelPatternAuthFallback && !hasModelAuth(primary.model)) continue;
+				if (options.modelPatternAuthFallback && patternIndex > deferredAuthPatternIndex) {
+					const candidateKey = await modelRegistry.getApiKey(primary.model, providerSessionId);
+					if (candidateKey !== kNoAuth && !isAuthenticated(candidateKey)) continue;
+				}
 				let hasUsageFallbackCandidate = false;
 				for (
 					let candidateIndex = patternIndex + 1;
@@ -2619,7 +2668,7 @@ async function createAgentSessionScoped(
 						}
 					}
 				}
-				let selectedModel = primary.model;
+				const selectedModel = primary.model;
 				let selectedThinkingLevel = primary.thinkingLevel;
 				let selectedExplicitThinkingLevel = primary.explicitThinkingLevel;
 				// A chain entry without its own `:level` suffix inherits the
@@ -2629,27 +2678,7 @@ async function createAgentSessionScoped(
 					selectedThinkingLevel = retryFallback.originalThinkingLevel;
 					selectedExplicitThinkingLevel = true;
 				}
-				let authFallbackUsed = false;
-				if (options.modelPatternAuthFallback) {
-					const primaryKey = await modelRegistry.getApiKey(primary.model);
-					if (primaryKey !== kNoAuth && !isAuthenticated(primaryKey)) {
-						const fallback = parseModelPattern(
-							options.modelPatternAuthFallback,
-							resolutionModels,
-							matchPreferences,
-						);
-						if (fallback.model) {
-							const fallbackKey = await modelRegistry.getApiKey(fallback.model);
-							if (isAuthenticated(fallbackKey)) {
-								selectedModel = fallback.model;
-								selectedThinkingLevel = fallback.thinkingLevel;
-								selectedExplicitThinkingLevel = fallback.explicitThinkingLevel;
-								authFallbackUsed = true;
-							}
-						}
-					}
-				}
-				if (!authFallbackUsed && options.modelPatternFallbackRole) {
+				if (options.modelPatternFallbackRole) {
 					const primarySelector = formatModelSelectorValue(
 						formatModelStringWithRouting(primary.model),
 						primary.thinkingLevel,
@@ -2698,9 +2727,18 @@ async function createAgentSessionScoped(
 					}
 				}
 				model = selectedModel;
+				if (
+					patternIndex > 0 ||
+					(deferredAuthSelection?.fallbackUsed === true &&
+						deferredAuthModel &&
+						modelsAreEqual(selectedModel, deferredAuthModel))
+				) {
+					initialModelFallback = true;
+				}
 				initialRetryFallback =
 					retryFallback && usageFallbackTriggered ? { ...retryFallback, pinned: true } : retryFallback;
 				modelFallbackMessage = undefined;
+
 				if (selectedExplicitThinkingLevel) {
 					restoredSessionThinkingLevel = selectedThinkingLevel;
 				}
@@ -3981,6 +4019,7 @@ async function createAgentSessionScoped(
 			thinkingLevel: autoThinking ? AUTO_THINKING : effectiveThinkingLevel,
 			thinkingLevelCeiling: options.thinkingLevelCeiling,
 			initialRetryFallback,
+			initialModelFallback,
 			prewalk: options.prewalk,
 			planYolo: options.planYolo,
 			serviceTierByFamily: initialServiceTierByFamily,

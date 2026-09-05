@@ -33,9 +33,10 @@ describe("eval js agent() handle", () => {
 		});
 		const handle = (await (sandbox.agent as AgentHelper)("say hi", {
 			label: "Greeter",
+			model: ["p/first", "p/second"],
 		})) as Record<string, unknown>;
+		expect(seenArgs).toEqual({ prompt: "say hi", label: "Greeter", model: ["p/first", "p/second"] });
 		expect(seenName).toBe("__agent__");
-		expect(seenArgs).toEqual({ prompt: "say hi", label: "Greeter" });
 		expect(handle.kind).toBe("agent");
 		expect(handle.id).toBe("abc123");
 		expect(handle.agent).toBe("task");
@@ -75,21 +76,48 @@ describe("eval js agent() handle", () => {
 		await expect((sandbox.agent as AgentHelper)("x")).rejects.toThrow("agent() did not return a handle");
 	});
 
-	it("parses wait() text as JSON only when a schema was given", async () => {
+	it("parses wait output and records the resolved model on the handle", async () => {
 		const sandbox = loadPrelude(async name => {
 			if (name === "__agent__") return { id: "id-9", agent: "task" };
-			if (name === "__wait__") return { items: [{ status: "completed", text: '{"k":1}' }] };
+			if (name === "__wait__") {
+				return {
+					items: [{ status: "completed", text: '{"k":1}', model: "p/selected", modelFallback: true }],
+				};
+			}
 			throw new Error(`unexpected bridge call ${name}`);
 		});
 		const withSchema = (await (sandbox.agent as AgentHelper)("emit", {
 			schema: { type: "object" },
-		})) as { wait(): Promise<unknown> };
+		})) as { wait(): Promise<unknown>; model?: string; modelFallback?: boolean };
 		expect(await withSchema.wait()).toEqual({ k: 1 });
+		expect(withSchema.model).toBe("p/selected");
+		expect(withSchema.modelFallback).toBe(true);
 
 		const plain = (await (sandbox.agent as AgentHelper)("emit")) as {
 			wait(): Promise<unknown>;
 		};
 		expect(await plain.wait()).toBe('{"k":1}');
+	});
+
+	it("records model metadata before a failed wait throws", async () => {
+		const sandbox = loadPrelude(async name => {
+			if (name === "__agent__") return { id: "id-fail", agent: "task" };
+			if (name === "__wait__") {
+				return {
+					items: [{ status: "failed", error: "boom", model: "p/parent", modelFallback: true }],
+				};
+			}
+			throw new Error(`unexpected bridge call ${name}`);
+		});
+		const handle = (await (sandbox.agent as AgentHelper)("fail")) as {
+			wait(): Promise<unknown>;
+			model?: string;
+			modelFallback?: boolean;
+		};
+
+		await expect(handle.wait()).rejects.toThrow("boom");
+		expect(handle.model).toBe("p/parent");
+		expect(handle.modelFallback).toBe(true);
 	});
 });
 

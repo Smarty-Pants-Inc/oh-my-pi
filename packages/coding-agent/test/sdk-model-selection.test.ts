@@ -8,7 +8,7 @@ import { writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { resolveModelCacheProviderId } from "@oh-my-pi/pi-catalog/provider-models";
 import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
-import { ModelRegistry, type ProviderConfigInput } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { kNoAuth, ModelRegistry, type ProviderConfigInput } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { getModelMatchPreferences, resolveModelScope } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { buildSessionOptions as buildCliSessionOptions } from "@oh-my-pi/pi-coding-agent/main";
@@ -139,6 +139,21 @@ describe("createAgentSession deferred model pattern resolution", () => {
 			expect(session.model).toBeDefined();
 			expect(session.model?.provider).toBe("runtime-provider");
 			expect(session.model?.id).toBe("runtime-model");
+			expect(modelFallbackMessage).toBeUndefined();
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	test("marks a later deferred selector as fallback without a parent model", async () => {
+		const { session, modelFallbackMessage } = await createAgentSession(
+			buildSessionOptions(["missing-provider/missing-model", "runtime-provider/runtime-fallback-model"]),
+		);
+
+		try {
+			expect(session.model?.provider).toBe("runtime-provider");
+			expect(session.model?.id).toBe("runtime-fallback-model");
+			expect(session.servingModel?.isFallback).toBe(true);
 			expect(modelFallbackMessage).toBeUndefined();
 		} finally {
 			await session.dispose();
@@ -474,7 +489,99 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		try {
 			expect(session.model?.provider).toBe(parentModel.provider);
 			expect(session.model?.id).toBe(parentModel.id);
+			expect(session.servingModel).toEqual({
+				selector: `${parentModel.provider}/${parentModel.id}:high`,
+				isFallback: true,
+			});
 			expect(modelFallbackMessage).toBeUndefined();
+		} finally {
+			await session.dispose();
+			getApiKeySpy.mockRestore();
+		}
+	});
+
+	test("keeps deferred explicit modelPattern inside enabledModels", async () => {
+		const parentModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!parentModel) throw new Error("Expected bundled anthropic parent model");
+		const settings = Settings.isolated({ enabledModels: [`${parentModel.provider}/${parentModel.id}`] });
+
+		const { session, modelFallbackMessage } = await createAgentSession({
+			...buildSessionOptions("runtime-provider/runtime-model"),
+			settings,
+		});
+
+		try {
+			expect(session.model).toBeUndefined();
+			expect(modelFallbackMessage).toBe('Model "runtime-provider/runtime-model" not found');
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	test("uses a later authenticated deferred model before the parent fallback", async () => {
+		const parentModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!parentModel) {
+			throw new Error("Expected bundled anthropic parent model");
+		}
+		const authStorage = createInMemoryAuthStorage();
+		authStoragesToClose.push(authStorage);
+		authStorage.setRuntimeApiKey(parentModel.provider, "test-key");
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "ordered-auth-models.yml"));
+		const sessionManager = SessionManager.inMemory();
+		const providerSessionId = sessionManager.getSessionId();
+		const getApiKeySpy = vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async requested => {
+			if (requested.id === "runtime-model") return undefined;
+			if (requested.id === "runtime-fallback-model") return "test-key";
+			if (requested.provider === parentModel.provider) return "test-key";
+			return undefined;
+		});
+		const { session } = await createAgentSession({
+			...buildSessionOptions(["runtime-provider/runtime-model", "runtime-provider/runtime-fallback-model"]),
+			authStorage,
+			modelRegistry,
+			sessionManager,
+			modelPatternAuthFallback: `${parentModel.provider}/${parentModel.id}`,
+		});
+
+		try {
+			expect(session.model?.provider).toBe("runtime-provider");
+			expect(session.model?.id).toBe("runtime-fallback-model");
+			expect(session.servingModel?.isFallback).toBe(true);
+			expect(getApiKeySpy.mock.calls).toContainEqual([
+				expect.objectContaining({ id: "runtime-fallback-model" }),
+				providerSessionId,
+			]);
+		} finally {
+			await session.dispose();
+			getApiKeySpy.mockRestore();
+		}
+	});
+
+	test("accepts a keyless parent for deferred auth fallback", async () => {
+		const parentModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!parentModel) {
+			throw new Error("Expected bundled anthropic parent model");
+		}
+		const authStorage = createInMemoryAuthStorage();
+		authStoragesToClose.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "keyless-fallback-models.yml"));
+		const getApiKeySpy = vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async requested => {
+			if (requested.provider === "runtime-provider") return undefined;
+			if (requested.provider === parentModel.provider) return kNoAuth;
+			return undefined;
+		});
+		const { session } = await createAgentSession({
+			...buildSessionOptions("runtime-provider/runtime-model"),
+			authStorage,
+			modelRegistry,
+			sessionManager: SessionManager.inMemory(),
+			modelPatternAuthFallback: `${parentModel.provider}/${parentModel.id}`,
+		});
+
+		try {
+			expect(session.model?.provider).toBe(parentModel.provider);
+			expect(session.model?.id).toBe(parentModel.id);
+			expect(session.servingModel?.isFallback).toBe(true);
 		} finally {
 			await session.dispose();
 			getApiKeySpy.mockRestore();

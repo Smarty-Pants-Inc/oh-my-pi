@@ -7,8 +7,18 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
-import { $env, Snowflake } from "@oh-my-pi/pi-utils";
-import { resolveAgentModelSelection } from "../config/model-resolver";
+import type { Api, Model } from "@oh-my-pi/pi-ai";
+import { $env, Snowflake, untilAborted } from "@oh-my-pi/pi-utils";
+import {
+	type AgentModelSelectionSource,
+	getModelMatchPreferences,
+	normalizeModelPatternList,
+	resolveAgentModelSelectionWithSource,
+	resolveAllowedModels,
+	resolveConfiguredModelPatterns,
+	resolveModelOverride,
+	resolveModelPolicyModels,
+} from "../config/model-resolver";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import type { LocalProtocolOptions } from "../internal-urls";
 import { registerArtifactsDir } from "../internal-urls/registry-helpers";
@@ -150,6 +160,14 @@ export interface EffectiveSubagentPolicy {
 	modelOverride?: string | string[];
 	/** Explicit pre-expansion model role alias selected for this run. */
 	modelRole?: string;
+	/** Precedence source for the effective model patterns. */
+	modelSelectionSource: AgentModelSelectionSource;
+	/** True when a caller, settings override, or agent definition selected the patterns. */
+	modelSelectionExplicit: boolean;
+	/** Models allowed by the active path-scoped policy, when a registry is available. */
+	allowedModels?: Model<Api>[];
+	/** Policy-visible models used to validate explicit selectors, including providers without credentials. */
+	modelCandidates?: Model<Api>[];
 	parentActiveModelPattern?: string;
 	schema: StructuredSubagentSchemaResolution;
 	planMode: boolean;
@@ -278,7 +296,7 @@ function assertDepthAndSpawnAllowed(request: StructuredSubagentRequest, agentNam
 export async function resolveEffectiveSubagentPolicy(
 	request: StructuredSubagentRequest,
 ): Promise<EffectiveSubagentPolicy> {
-	await request.session.settings.reloadFromDisk();
+	await untilAborted(request.signal, request.session.settings.reloadFromDisk());
 	const spawnPolicy = resolveSpawnPolicy(request.session.getSessionSpawns());
 	const agentName = request.agent?.trim() || spawnPolicy.defaultAgent;
 	const planMode = request.session.getPlanModeState?.()?.enabled === true;
@@ -324,7 +342,10 @@ export async function resolveEffectiveSubagentPolicy(
 	assertPlanControlsAllowed(request, planMode);
 	assertDepthAndSpawnAllowed(request, agentName);
 
-	const discovery = await discoverAgents(request.session.cwd, undefined, request.session.effectiveExtensionRoots?.());
+	const discovery = await untilAborted(
+		request.signal,
+		discoverAgents(request.session.cwd, undefined, request.session.effectiveExtensionRoots?.()),
+	);
 	const agent = getAgent(discovery.agents, agentName);
 	if (!agent) {
 		const available = discovery.agents.map(candidate => candidate.name).join(", ") || "none";
@@ -361,6 +382,21 @@ export async function resolveEffectiveSubagentPolicy(
 		}
 	}
 	const agentModelOverrides = request.session.settings.get("task.agentModelOverrides");
+	const hasRequestModel = request.model !== undefined;
+	const requestSelectors = normalizeModelPatternList(request.model);
+	if (hasRequestModel && requestSelectors.length === 0) {
+		throw new StructuredSubagentError(
+			"preflight",
+			"The requested subagent `model` selector is empty. Use a model string or ordered list of model strings.",
+		);
+	}
+	const configuredRequestPatterns = resolveConfiguredModelPatterns(request.model, request.session.settings);
+	if (hasRequestModel && configuredRequestPatterns.length === 0) {
+		throw new StructuredSubagentError(
+			"preflight",
+			`The requested subagent model ${JSON.stringify(request.model)} does not resolve to a configured model selector.`,
+		);
+	}
 	const parentActiveModelPattern = request.session.getActiveModelString?.();
 	const modelResolution = {
 		requestModel: request.model,
@@ -373,7 +409,48 @@ export async function resolveEffectiveSubagentPolicy(
 	// Role identity and patterns come from one call so they cannot be derived
 	// from different sources: the expansion below discards the alias, and the
 	// child's inherited retry-fallback chain is keyed off the role.
-	const { patterns: modelOverride, role: modelRole } = resolveAgentModelSelection(modelResolution);
+	const {
+		patterns: modelOverride,
+		role: modelRole,
+		source: modelSelectionSource,
+	} = resolveAgentModelSelectionWithSource(modelResolution);
+	const modelSelectionExplicit = modelSelectionSource !== "session";
+	const modelRegistry = request.session.modelRegistry;
+	const modelPolicyActive =
+		request.session.settings.get("enabledModels").length > 0 ||
+		request.session.settings.get("disabledProviders").length > 0;
+	const requiresCompleteModelCatalog = modelSelectionExplicit || modelPolicyActive;
+	let allowedModels: Model<Api>[] | undefined;
+	let modelCandidates: Model<Api>[] | undefined;
+	if (modelRegistry && requiresCompleteModelCatalog) {
+		const backgroundRefresh = modelRegistry.awaitBackgroundRefresh?.();
+		if (backgroundRefresh) await untilAborted(request.signal, backgroundRefresh);
+		allowedModels = await untilAborted(
+			request.signal,
+			resolveAllowedModels(
+				modelRegistry,
+				request.session.settings,
+				getModelMatchPreferences(request.session.settings),
+			),
+		);
+		modelCandidates = resolveModelPolicyModels(modelRegistry, request.session.settings);
+		if (modelOverride.length > 0) {
+			const resolved = resolveModelOverride(modelOverride, modelRegistry, request.session.settings, modelCandidates);
+			if (!resolved.model) {
+				const scope =
+					request.session.settings.get("enabledModels").length > 0 ? " within the active enabledModels scope" : "";
+				throw new StructuredSubagentError(
+					"preflight",
+					`Subagent model selector${scope} did not resolve to an available model: ${modelOverride.join(", ")}`,
+				);
+			}
+		} else if (allowedModels.length === 0) {
+			throw new StructuredSubagentError(
+				"preflight",
+				"No available subagent model satisfies the active model policy.",
+			);
+		}
+	}
 	const isolationEnabled = request.session.settings.get("task.isolation.enabled");
 	const isIsolated = request.isolation?.requested === true;
 	if (isIsolated && !isolationEnabled) {
@@ -410,6 +487,10 @@ export async function resolveEffectiveSubagentPolicy(
 		effectiveAgent,
 		modelOverride,
 		modelRole,
+		modelSelectionSource,
+		modelSelectionExplicit,
+		...(allowedModels ? { allowedModels } : {}),
+		...(modelCandidates ? { modelCandidates } : {}),
 		parentActiveModelPattern,
 		schema,
 		execution,
@@ -503,6 +584,9 @@ function buildExecutorOptions(
 		acquiredAt: request.acquiredAt,
 		modelOverride: policy.modelOverride,
 		modelRole: policy.modelRole,
+		modelSelectionExplicit: policy.modelSelectionExplicit,
+		allowedModels: policy.allowedModels,
+		modelCandidates: policy.modelCandidates,
 		parentActiveModelPattern: policy.parentActiveModelPattern,
 		thinkingLevel: policy.effectiveAgent.thinkingLevel,
 		effort: request.effort,

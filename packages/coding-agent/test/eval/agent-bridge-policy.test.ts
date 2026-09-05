@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { AsyncJobManager } from "../../src/async";
+import type { ModelRegistry } from "../../src/config/model-registry";
 import { Settings } from "../../src/config/settings";
 import { runEvalAgent, type EvalAgentBridgeOptions, type EvalAgentResult } from "../../src/eval/agent-bridge";
 import { EVAL_TIMEOUT_PAUSE_OP, EVAL_TIMEOUT_RESUME_OP } from "../../src/eval/bridge-timeout";
@@ -78,6 +79,7 @@ interface SessionOptions {
 	modelString?: string;
 	enableLsp?: boolean;
 	settings?: Settings;
+	modelRegistry?: ModelRegistry;
 	outputManager?: AgentOutputManager;
 	planMode?: boolean;
 	outputSchema?: unknown;
@@ -100,6 +102,7 @@ function makeSession(options: SessionOptions = {}): ToolSession {
 		settings,
 		asyncJobManager,
 		taskDepth: options.depth ?? 0,
+		modelRegistry: options.modelRegistry,
 		enableLsp: options.enableLsp ?? true,
 		agentOutputManager: options.outputManager,
 		getSessionFile: () => options.sessionFile ?? null,
@@ -340,19 +343,89 @@ describe("runEvalAgent", () => {
 		expect(secondOptions.outputSchemaOverridesAgent).toBeUndefined();
 	});
 
-	it("drops a per-call model argument on agent() (removed, issue #6438)", async () => {
+	it("forwards a per-call model argument ahead of agent defaults", async () => {
 		mockAgents();
 		const runSpy = vi.spyOn(taskExecutor, "runSubprocess").mockImplementation(async options => singleResult(options));
 
-		// The schema strips unknown keys; a legacy `model` argument is silently
-		// discarded so resolution is identical to omitting it — the agent's own
-		// frontmatter model applies (issue #6438).
-		await runEvalAgentAndWait({ prompt: "work", model: "default" }, { session: makeSession() });
-		await runEvalAgentAndWait({ prompt: "work" }, { session: makeSession() });
+		await runEvalAgentAndWait({ prompt: "work", model: "p/request" }, { session: makeSession() });
+		await runEvalAgentAndWait({ prompt: "work", model: ["p/first", "p/second"] }, { session: makeSession() });
 
-		const withModel = runSpy.mock.calls[0]?.[0];
-		const withoutModel = runSpy.mock.calls[1]?.[0];
-		expect(withModel?.modelOverride).toEqual(withoutModel?.modelOverride);
+		expect(runSpy.mock.calls[0]?.[0].modelOverride).toEqual(["p/request"]);
+		expect(runSpy.mock.calls[1]?.[0].modelOverride).toEqual(["p/first", "p/second"]);
+	});
+
+	it("exposes auth fallback state in eval progress, terminal snapshots, and result details", async () => {
+		mockAgents();
+		const runSpy = vi.spyOn(taskExecutor, "runSubprocess").mockImplementation(async options => {
+			options.onProgress?.({
+				index: options.index,
+				id: options.id,
+				agent: options.agent.name,
+				agentSource: options.agent.source,
+				status: "running",
+				task: options.task,
+				assignment: options.assignment,
+				recentTools: [],
+				recentOutput: [],
+				toolCount: 0,
+				requests: 0,
+				tokens: 0,
+				cost: 0,
+				durationMs: 0,
+				resolvedModel: "p/parent",
+				resolvedModelIsFallback: true,
+			});
+			return singleResult(options, {
+				resolvedModel: "p/parent",
+				resolvedModelIsFallback: true,
+			});
+		});
+		const session = makeSession();
+		const handle = await runEvalAgent({ prompt: "work", model: "p/request" }, { session });
+		const waited = await runEvalWait({ items: [{ kind: "agent", id: handle.id }] }, { session });
+		const snapshot = waited.items[0];
+		const job = session.asyncJobManager?.getJob(handle.id);
+		const result = job?.latestDetails?.evalResult;
+
+		expect(runSpy).toHaveBeenCalledTimes(1);
+		expect(job?.latestDetails?.progress).toContainEqual(
+			expect.objectContaining({ resolvedModel: "p/parent", resolvedModelIsFallback: true }),
+		);
+		expect(snapshot).toMatchObject({ model: "p/parent", modelFallback: true });
+		expect(isEvalAgentResult(result) ? result.details : undefined).toMatchObject({
+			model: "p/parent",
+			modelFallback: true,
+		});
+	});
+
+	it("aborts model-discovery preflight before allocating or dispatching an eval agent", async () => {
+		mockAgents();
+		const refreshStarted = Promise.withResolvers<void>();
+		const refreshGate = Promise.withResolvers<void>();
+		const modelRegistry = {
+			awaitBackgroundRefresh: async () => {
+				refreshStarted.resolve();
+				await refreshGate.promise;
+			},
+			getAvailable: () => [],
+			getAll: () => [],
+		} as unknown as ModelRegistry;
+		const allocate = vi.fn(async () => "unexpected");
+		const runSpy = vi.spyOn(taskExecutor, "runSubprocess").mockImplementation(async options => singleResult(options));
+		const session = makeSession({
+			modelRegistry,
+			outputManager: { allocate } as unknown as AgentOutputManager,
+		});
+		const controller = new AbortController();
+
+		const pending = runEvalAgent({ prompt: "work", model: "p/request" }, { session, signal: controller.signal });
+		await refreshStarted.promise;
+		controller.abort(new Error("cancelled during model discovery"));
+		await expect(pending).rejects.toThrow("cancelled during model discovery");
+		refreshGate.resolve();
+
+		expect(allocate).not.toHaveBeenCalled();
+		expect(runSpy).not.toHaveBeenCalled();
 	});
 	it("returns host-parsed data for caller, agent, and inherited schemas", async () => {
 		const agentSchema = { type: "object" };
@@ -479,7 +552,7 @@ describe("runEvalAgent", () => {
 		).not.toContain("Cleanup");
 	});
 
-	it("maps successful and failed subagent results", async () => {
+	it("maps successful and failed subagent results with terminal model metadata", async () => {
 		mockAgents();
 		const runSpy = vi.spyOn(taskExecutor, "runSubprocess");
 		runSpy.mockImplementationOnce(async options =>
@@ -489,21 +562,50 @@ describe("runEvalAgent", () => {
 				resolvedModel: "p/model",
 			}),
 		);
-		runSpy.mockImplementationOnce(async options =>
-			singleResult(options, {
+		runSpy.mockImplementationOnce(async options => {
+			options.onProgress?.({
+				index: options.index,
+				id: options.id,
+				agent: options.agent.name,
+				agentSource: options.agent.source,
+				status: "running",
+				task: options.task,
+				assignment: options.assignment,
+				recentTools: [],
+				recentOutput: [],
+				toolCount: 0,
+				requests: 0,
+				tokens: 0,
+				cost: 0,
+				durationMs: 0,
+				resolvedModel: "p/parent",
+				resolvedModelIsFallback: true,
+			});
+			return singleResult(options, {
 				exitCode: 1,
 				output: "",
 				stderr: "stderr",
 				error: "boom",
-			}),
-		);
+				resolvedModel: "p/parent",
+				resolvedModelIsFallback: true,
+			});
+		});
 
 		const result = await runEvalAgentAndWait({ prompt: "hello" }, { session: makeSession() });
 		expect(result).toEqual({
 			text: "done",
 			details: { agent: "task", id: "0-EvalAgent", model: "p/model", structured: false },
 		});
-		await expect(runEvalAgentAndWait({ prompt: "fail" }, { session: makeSession() })).rejects.toThrow("boom");
+
+		const failureSession = makeSession();
+		const handle = await runEvalAgent({ prompt: "fail" }, { session: failureSession });
+		const waited = await runEvalWait({ items: [{ kind: "agent", id: handle.id }] }, { session: failureSession });
+		expect(waited.items[0]).toMatchObject({
+			status: "failed",
+			error: "boom",
+			model: "p/parent",
+			modelFallback: true,
+		});
 	});
 
 	// Regression: a runtime-limit abort returns exitCode=1, stderr="", error=undefined,

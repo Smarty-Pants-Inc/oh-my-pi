@@ -102,7 +102,7 @@ Write a concise unexpected tool-behavior report to `xd://report_issue` with `{{t
 - `agent://<id>[/<path>]`: subagent output
 - `history://<id>`: read-only agent transcript
 - `artifact://<id>`: artifact content
-{{#if securityEnabled}}- `security://scans[/<id>/...]`: read-only scan data{{/if}}
+{{#if securityEnabled}}- `security://scans[/<id>/…]`: read-only scan data{{/if}}
 {{#if hasObsidian}}- `vault://<vault>/<path>`: Obsidian content{{/if}}
 - `mcp://<uri>`: MCP resource
 - `issue://<N>` and `pr://<N>`: GitHub issue or pull request

@@ -29,6 +29,7 @@ const agentArgsSchema = type({
 	prompt: "string>0",
 	"agent?": "string>0",
 	"label?": "string",
+	"model?": "string | string[]",
 	"schema?": "unknown",
 	"schemaMode?": "'permissive' | 'strict'",
 	"isolated?": "boolean",
@@ -42,6 +43,7 @@ interface EvalAgentArgs {
 	prompt: string;
 	agent?: string;
 	label?: string;
+	model?: string | string[];
 	schema?: unknown;
 	schemaMode?: StructuredSubagentSchemaMode;
 	isolated?: boolean;
@@ -70,6 +72,8 @@ export interface EvalAgentResult {
 		agent: string;
 		id: string;
 		model?: string | string[];
+		/** True when auth-aware runtime routing served a fallback model. */
+		modelFallback?: boolean;
 		structured: boolean;
 		schemaSource?: "caller" | "agent" | "session";
 		schemaMode?: StructuredSubagentSchemaMode;
@@ -149,6 +153,7 @@ async function buildEvalAgentResult(execution: StructuredSubagentResult): Promis
 			agent: result.agent,
 			id: result.id,
 			...(model !== undefined ? { model } : {}),
+			...(result.resolvedModelIsFallback === true ? { modelFallback: true } : {}),
 			structured,
 			...(schemaSource !== undefined ? { schemaSource } : {}),
 			...(schemaMode !== undefined ? { schemaMode } : {}),
@@ -192,11 +197,13 @@ export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOption
 			session: options.session,
 			invocationKind: "eval",
 			assignment: parsed.prompt,
+			...(Object.hasOwn(parsed, "model") ? { model: parsed.model } : {}),
 			...(parsed.agent !== undefined ? { agent: parsed.agent } : {}),
 			...(Object.hasOwn(parsed, "schema") ? { outputSchema: parsed.schema } : {}),
 			...(parsed.schemaMode !== undefined ? { schemaMode: parsed.schemaMode } : {}),
 			...(isolation ? { isolation } : {}),
 			...(customTools ? { customTools } : {}),
+			signal: options.signal,
 			keepAlive: false,
 		});
 		const manager = options.session.asyncJobManager;
@@ -216,6 +223,7 @@ export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOption
 						session: options.session,
 						invocationKind: "eval",
 						assignment: parsed.prompt,
+						...(Object.hasOwn(parsed, "model") ? { model: parsed.model } : {}),
 						...(parsed.agent !== undefined ? { agent: parsed.agent } : {}),
 						...(Object.hasOwn(parsed, "schema") ? { outputSchema: parsed.schema } : {}),
 						...(parsed.schemaMode !== undefined ? { schemaMode: parsed.schemaMode } : {}),

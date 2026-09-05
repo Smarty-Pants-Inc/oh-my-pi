@@ -43,6 +43,123 @@ describe("python prelude", () => {
 		expect(signature).toContain("limit");
 	});
 
+	it("forwards model selectors and records terminal model metadata", async () => {
+		const requests: Array<{ name?: string; args?: Record<string, unknown> }> = [];
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch: async request => {
+				const body = (await request.json()) as { name?: string; args?: Record<string, unknown> };
+				requests.push(body);
+				if (body.name === "__agent__") {
+					return Response.json({ ok: true, value: { id: "agent-1", agent: "task" } });
+				}
+				if (body.name === "__wait__") {
+					return Response.json({
+						ok: true,
+						value: {
+							items: [
+								{
+									kind: "agent",
+									id: "agent-1",
+									status: "completed",
+									text: "done",
+									model: "p/selected",
+									modelFallback: true,
+								},
+							],
+						},
+					});
+				}
+				return Response.json({ ok: false, error: `unexpected bridge call ${body.name}` });
+			},
+		});
+
+		try {
+			const result = await runPrelude(
+				[
+					'h = agent("inspect", model=["p/first", "p/second"])',
+					"print(h.wait())",
+					'print(json.dumps({"model": h.model, "model_fallback": h.model_fallback}, sort_keys=True))',
+				].join("\n"),
+				{
+					PI_TOOL_BRIDGE_URL: server.url.toString(),
+					PI_TOOL_BRIDGE_TOKEN: "test-token",
+					PI_TOOL_BRIDGE_SESSION: "test-session",
+				},
+			);
+
+			expect(result).toEqual({
+				stdout: 'done\n{"model": "p/selected", "model_fallback": true}\n',
+				stderr: "",
+				exitCode: 0,
+			});
+			expect(requests[0]?.args).toMatchObject({
+				prompt: "inspect",
+				model: ["p/first", "p/second"],
+			});
+		} finally {
+			server.stop(true);
+		}
+	});
+
+	it("records model metadata before a failed wait raises", async () => {
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch: async request => {
+				const body = (await request.json()) as { name?: string };
+				if (body.name === "__agent__") {
+					return Response.json({ ok: true, value: { id: "agent-fail", agent: "task" } });
+				}
+				if (body.name === "__wait__") {
+					return Response.json({
+						ok: true,
+						value: {
+							items: [
+								{
+									kind: "agent",
+									id: "agent-fail",
+									status: "failed",
+									error: "boom",
+									model: "p/parent",
+									modelFallback: true,
+								},
+							],
+						},
+					});
+				}
+				return Response.json({ ok: false, error: `unexpected bridge call ${body.name}` });
+			},
+		});
+
+		try {
+			const result = await runPrelude(
+				[
+					'h = agent("fail")',
+					"try:",
+					"    h.wait()",
+					"except RuntimeError as error:",
+					"    print(str(error))",
+					'print(json.dumps({"model": h.model, "model_fallback": h.model_fallback}, sort_keys=True))',
+				].join("\n"),
+				{
+					PI_TOOL_BRIDGE_URL: server.url.toString(),
+					PI_TOOL_BRIDGE_TOKEN: "test-token",
+					PI_TOOL_BRIDGE_SESSION: "test-session",
+				},
+			);
+
+			expect(result).toEqual({
+				stdout: 'boom\n{"model": "p/parent", "model_fallback": true}\n',
+				stderr: "",
+				exitCode: 0,
+			});
+		} finally {
+			server.stop(true);
+		}
+	});
+
 	it("infers eval tool schemas and replaces definitions by name", async () => {
 		const result = await runPrelude(
 			[
