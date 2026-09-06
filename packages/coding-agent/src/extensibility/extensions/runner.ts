@@ -148,6 +148,24 @@ export function assertApprovedInputUnchanged(
 	}
 }
 
+const PROMPT_AFFECTING_EXTENSION_EVENTS = [
+	"input",
+	"context",
+	"before_provider_request",
+	"before_agent_start",
+] as const;
+
+export async function assertApprovedPromptAffectingExtensions(
+	extensions: Extension[],
+	releaseManifest: ContextReleaseManifest | undefined,
+): Promise<void> {
+	if (!releaseManifest) return;
+	for (const extension of extensions) {
+		if (!PROMPT_AFFECTING_EXTENSION_EVENTS.some(event => extension.handlers.get(event)?.length)) continue;
+		if (await isApprovedCandidateSource(extension.resolvedPath, releaseManifest)) continue;
+		throw new Error(`PROMPT_POLICY_REVIEW_REQUIRED: extension source is not approved: ${extension.path}`);
+	}
+}
 export type ExtensionErrorListener = (error: ExtensionError) => void;
 
 export const EXTENSION_HANDLER_TIMEOUT_MS = 30_000;

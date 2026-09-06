@@ -112,6 +112,7 @@ import {
 import { discoverCustomToolPaths, loadCustomTools, type ToolPathWithSource } from "./extensibility/custom-tools";
 import type { CustomTool, CustomToolContext, CustomToolSessionEvent } from "./extensibility/custom-tools/types";
 import {
+	assertApprovedPromptAffectingExtensions,
 	bindPreparedExtensions,
 	discoverAndLoadExtensions,
 	discoverExtensionPaths,
@@ -2281,6 +2282,7 @@ async function createAgentSessionScoped(
 		// Load inline extensions from factories. Caller-provided factories are safe
 		// to rebind, so preserve them with file-backed prepared extensions for
 		// `/tan` and other child sessions.
+		const firstInlineExtensionIndex = extensionsResult.extensions.length;
 		const rebindableInlineExtensionCount = options.extensions?.length ?? 0;
 		if (inlineExtensions.length > 0) {
 			for (let i = 0; i < inlineExtensions.length; i++) {
@@ -2306,6 +2308,13 @@ async function createAgentSessionScoped(
 				}
 			}
 		}
+		await assertApprovedPromptAffectingExtensions(
+			extensionsResult.extensions.slice(
+				firstInlineExtensionIndex,
+				firstInlineExtensionIndex + rebindableInlineExtensionCount,
+			),
+			releaseManifest,
+		);
 		toolSession.preparedExtensions = extensionsResult.preparedExtensions;
 
 		resolvedExecutionEnvironmentProvider = options.executionEnvironmentProvider;
