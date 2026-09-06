@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
@@ -99,11 +100,14 @@ function createSession(
 		taskEnableLsp?: boolean;
 	} = {},
 ): ToolSession {
+	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+	if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");
 	const modelRegistry = {
 		authStorage: undefined,
 		refresh: async () => {},
-		getAvailable: () => [],
-		getApiKey: async () => null,
+		getAvailable: () => [model],
+		hasConfiguredAuth: () => true,
+		getApiKey: async () => "test-key",
 	} as unknown as ModelRegistry;
 
 	return {

@@ -145,15 +145,17 @@ describe("task approval details surface the dispatch", () => {
 		} as unknown as ToolSession);
 	}
 
-	it("surfaces agent, name, and task for a flat spawn", async () => {
+	it("surfaces agent, name, task, and ordered model selectors for a flat spawn", async () => {
 		const tool = await makeTool();
 		const lines = tool.formatApprovalDetails({
 			agent: "reviewer",
 			name: "ReviewAuth",
 			task: "audit the auth module",
+			model: ["p/first", "p/second"],
 		});
 		expect(lines).toContain("Agent: reviewer");
 		expect(lines).toContain("Name: ReviewAuth");
+		expect(lines).toContain("Model: p/first → p/second");
 		expect(lines).toContain("Task:\naudit the auth module");
 	});
 
@@ -164,9 +166,10 @@ describe("task approval details surface the dispatch", () => {
 			tasks: [
 				{
 					name: "DbMigrator",
+					model: ["p/first", "p/second"],
 					task: "migrate the schema",
 				},
-				{ task: "second item" },
+				{ task: "second item", model: "p/other" },
 			],
 		});
 		expect(lines).toContain("Context:\nshared background");
@@ -174,6 +177,7 @@ describe("task approval details surface the dispatch", () => {
 		expect(lines).toContain("Name: DbMigrator");
 		expect(lines).toContain("Agent: scout");
 		expect(lines).toContain("Task:\nmigrate the schema");
+		expect(lines).toContain("Batch models: 1:p/first → p/second, 2:p/other");
 		expect(lines).toContain("+1 more task");
 	});
 

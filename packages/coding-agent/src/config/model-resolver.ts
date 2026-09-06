@@ -1095,7 +1095,11 @@ function getModelRoleAlias(value: string, settings?: ModelRoleLookup): string | 
 /** Normalize comma-separated or array model selectors into an ordered pattern list. */
 export function normalizeModelPatternList(value: string | string[] | undefined): string[] {
 	if (!value) return [];
-	const patterns = Array.isArray(value) ? value.flatMap(pattern => pattern.split(",")) : value.split(",");
+	const patterns = Array.isArray(value)
+		? value.flatMap(pattern => (typeof pattern === "string" ? pattern.split(",") : []))
+		: typeof value === "string"
+			? value.split(",")
+			: [];
 	return patterns.map(pattern => pattern.trim()).filter(Boolean);
 }
 
@@ -1268,6 +1272,7 @@ export interface AgentModelPatternResolutionOptions {
 
 interface EffectiveAgentModelSelection {
 	source?: string | string[];
+	sourceKind: AgentModelSelectionSource;
 	patterns: string[];
 }
 
@@ -1278,12 +1283,12 @@ function resolveEffectiveAgentModelSelection(
 
 	const requestPatterns = resolveConfiguredModelPatterns(requestModel, settings);
 	if (requestPatterns.length > 0) {
-		return { source: requestModel, patterns: requestPatterns };
+		return { source: requestModel, sourceKind: "request", patterns: requestPatterns };
 	}
 
 	const overridePatterns = resolveConfiguredModelPatterns(settingsOverride, settings);
 	if (overridePatterns.length > 0) {
-		return { source: settingsOverride, patterns: overridePatterns };
+		return { source: settingsOverride, sourceKind: "settings", patterns: overridePatterns };
 	}
 
 	const normalizedAgentPatterns = normalizeModelPatternList(agentModel);
@@ -1295,15 +1300,19 @@ function resolveEffectiveAgentModelSelection(
 			singleAgentPattern === formatModelRoleAlias("task") ||
 			singleAgentPattern === `${LEGACY_MODEL_ROLE_ALIAS_PREFIX}task`
 		) {
-			return { source: agentModel, patterns: configuredAgentPatterns };
+			return { source: agentModel, sourceKind: "agent", patterns: configuredAgentPatterns };
 		}
-		if (!agentInheritsSessionModel) return { source: agentModel, patterns: configuredAgentPatterns };
+		if (!agentInheritsSessionModel)
+			return { source: agentModel, sourceKind: "agent", patterns: configuredAgentPatterns };
 	}
 
 	const fallback =
 		activeModelPattern?.trim() || fallbackModelPattern?.trim() || settings?.getModelRole("default")?.trim() || "";
-	return { patterns: resolveConfiguredModelPatterns(fallback, settings) };
+	return { sourceKind: "session", patterns: resolveConfiguredModelPatterns(fallback, settings) };
 }
+
+/** Effective model patterns plus the precedence source that supplied them. */
+export type AgentModelSelectionSource = "request" | "settings" | "agent" | "session";
 
 /** Effective agent model patterns paired with the pre-expansion role alias behind them. */
 export interface AgentModelSelection {
@@ -1322,6 +1331,18 @@ export interface AgentModelSelection {
 export function resolveAgentModelSelection(options: AgentModelPatternResolutionOptions): AgentModelSelection {
 	const { source, patterns } = resolveEffectiveAgentModelSelection(options);
 	return { patterns, role: resolveExplicitModelRole(source, options.settings) };
+}
+/** Effective model patterns paired with their precedence source. */
+export interface AgentModelSelectionWithSource extends AgentModelSelection {
+	source: AgentModelSelectionSource;
+}
+
+/** Resolve model patterns, role identity, and precedence source in one call. */
+export function resolveAgentModelSelectionWithSource(
+	options: AgentModelPatternResolutionOptions,
+): AgentModelSelectionWithSource {
+	const { source, sourceKind, patterns } = resolveEffectiveAgentModelSelection(options);
+	return { patterns, role: resolveExplicitModelRole(source, options.settings), source: sourceKind };
 }
 
 /** Effective agent model patterns alone, for callers with no interest in role identity. */
@@ -1548,14 +1569,18 @@ export function resolveModelFromSettings(options: {
 
 /**
  * Resolve a list of override patterns to the first matching model.
+ *
+ * `availableModels` lets callers apply a path-scoped policy without creating a
+ * second registry facade. Omitted means the registry's normal available set.
  */
 export function resolveModelOverride(
 	modelPatterns: string[],
 	modelRegistry: ModelLookupRegistry,
 	settings?: Settings,
+	availableModels?: Model<Api>[],
 ): { model?: Model<Api>; thinkingLevel?: ConfiguredThinkingLevel; explicitThinkingLevel: boolean; warning?: string } {
 	if (modelPatterns.length === 0) return { explicitThinkingLevel: false };
-	const availableModels = modelRegistry.getAvailable();
+	const available = availableModels ?? modelRegistry.getAvailable();
 	const matchPreferences = getModelMatchPreferences(settings);
 	let warning: string | undefined;
 	for (const pattern of modelPatterns) {
@@ -1564,7 +1589,7 @@ export function resolveModelOverride(
 			thinkingLevel,
 			explicitThinkingLevel,
 			warning: patternWarning,
-		} = resolveModelRoleValue(pattern, availableModels, {
+		} = resolveModelRoleValue(pattern, available, {
 			settings,
 			matchPreferences,
 		});
@@ -1577,30 +1602,14 @@ export function resolveModelOverride(
 }
 
 /**
- * Resolve a list of override patterns to the first matching model, with an
- * auth-aware fallback to the parent session's active model.
+ * Resolve a list of override patterns with auth-aware candidate selection.
+ * Ordered selectors are tried in order; an unavailable candidate does not
+ * prevent a later candidate from being used. The parent model is considered
+ * only after every requested candidate is known but unauthenticated.
  *
- * If the resolved subagent model has no working credentials (provider has no
- * usable auth), and the parent's active model resolves with working auth,
- * use the parent's model instead. This prevents subagent dispatch from
- * silently routing to a provider the user can't actually call (e.g.
- * `modelRoles.task` pointing at an unqualified id whose only available
- * provider variant has no configured credentials — see #985).
- *
- * `sessionId` is forwarded to `getApiKey` so that session-sticky OAuth
- * credentials resolve correctly during the pre-flight auth check. Without it,
- * providers with multiple OAuth accounts may return `undefined` even though
- * the credential is usable once the subagent session starts — see #5325.
- *
- * Keyless-by-design providers (llama.cpp, ollama, lm-studio) advertise the
- * `kNoAuth` sentinel from `getApiKey` to signal that they do not require
- * credentials. Those are treated as authenticated here so an explicitly
- * configured local model is never silently rerouted to the parent's remote
- * provider (see #1008).
- *
- * If neither the subagent nor the parent has working auth, returns the
- * primary resolution unchanged so the existing error path still surfaces
- * a meaningful failure downstream.
+ * `availableModels` is the auth-filtered set used for normal selection. When
+ * explicit selectors also need to see models without credentials, callers pass
+ * the policy-scoped `modelCandidates` catalog separately.
  */
 export async function resolveModelOverrideWithAuthFallback(
 	modelPatterns: string[],
@@ -1608,36 +1617,94 @@ export async function resolveModelOverrideWithAuthFallback(
 	modelRegistry: ModelLookupRegistry & Pick<ModelRegistry, "getApiKey">,
 	settings?: Settings,
 	sessionId?: string,
+	availableModels?: Model<Api>[],
+	modelCandidates?: Model<Api>[],
 ): Promise<{
 	model?: Model<Api>;
 	thinkingLevel?: ConfiguredThinkingLevel;
 	explicitThinkingLevel: boolean;
+	/** True only when the authenticated parent model replaced every requested candidate. */
 	authFallbackUsed: boolean;
+	/** True when selection advanced beyond the configured primary for any reason. */
+	fallbackUsed: boolean;
 	warning?: string;
 }> {
-	const primary = resolveModelOverride(modelPatterns, modelRegistry, settings);
-	if (!primary.model || !parentActiveModelPattern) {
-		return { ...primary, authFallbackUsed: false };
+	if (modelPatterns.length === 0) {
+		return { explicitThinkingLevel: false, authFallbackUsed: false, fallbackUsed: false };
+	}
+	const available = availableModels ?? modelRegistry.getAvailable();
+	const candidates = modelCandidates ?? available;
+	const orderedPatterns = modelPatterns.flatMap(pattern => resolveConfiguredModelPatterns(pattern, settings));
+	const resolveCandidate = (pattern: string) => {
+		const preferred = resolveModelOverride([pattern], modelRegistry, settings, available);
+		if (preferred.model && candidates.some(candidate => modelsAreEqual(candidate, preferred.model))) return preferred;
+		if (candidates === available) return preferred;
+		return resolveModelOverride([pattern], modelRegistry, settings, candidates);
+	};
+	let firstResolved:
+		| {
+				model?: Model<Api>;
+				thinkingLevel?: ConfiguredThinkingLevel;
+				explicitThinkingLevel: boolean;
+				warning?: string;
+		  }
+		| undefined;
+	let firstResolvedIsFallback = false;
+	let warning: string | undefined;
+	for (const [patternIndex, pattern] of orderedPatterns.entries()) {
+		const candidate = resolveCandidate(pattern);
+		if (!warning && candidate.warning) warning = candidate.warning;
+		if (!candidate.model) continue;
+		if (!firstResolved) {
+			firstResolved = candidate;
+			firstResolvedIsFallback = patternIndex > 0;
+		}
+		const key = await modelRegistry.getApiKey(candidate.model, sessionId);
+		if (key === kNoAuth || isAuthenticated(key)) {
+			return {
+				...candidate,
+				authFallbackUsed: false,
+				fallbackUsed: patternIndex > 0,
+				warning: candidate.warning ?? warning,
+			};
+		}
+	}
+	if (!firstResolved) {
+		return { explicitThinkingLevel: false, authFallbackUsed: false, fallbackUsed: false, warning };
 	}
 
-	const primaryKey = await modelRegistry.getApiKey(primary.model, sessionId);
-	if (primaryKey === kNoAuth || isAuthenticated(primaryKey)) {
-		return { ...primary, authFallbackUsed: false };
+	if (!parentActiveModelPattern) {
+		return {
+			...firstResolved,
+			authFallbackUsed: false,
+			fallbackUsed: firstResolvedIsFallback,
+			warning: firstResolved.warning ?? warning,
+		};
 	}
-
-	const fallback = resolveModelOverride([parentActiveModelPattern], modelRegistry, settings);
-	if (!fallback.model) {
-		return { ...primary, authFallbackUsed: false };
-	}
-	if (modelsAreEqual(fallback.model, primary.model)) {
-		return { ...primary, authFallbackUsed: false };
+	const fallback = resolveCandidate(parentActiveModelPattern);
+	if (!fallback.model || modelsAreEqual(fallback.model, firstResolved.model)) {
+		return {
+			...firstResolved,
+			authFallbackUsed: false,
+			fallbackUsed: firstResolvedIsFallback,
+			warning: firstResolved.warning ?? warning,
+		};
 	}
 	const fallbackKey = await modelRegistry.getApiKey(fallback.model, sessionId);
-	if (!isAuthenticated(fallbackKey)) {
-		return { ...primary, authFallbackUsed: false };
+	if (fallbackKey !== kNoAuth && !isAuthenticated(fallbackKey)) {
+		return {
+			...firstResolved,
+			authFallbackUsed: false,
+			fallbackUsed: firstResolvedIsFallback,
+			warning: firstResolved.warning ?? warning,
+		};
 	}
-
-	return { ...fallback, authFallbackUsed: true, warning: primary.warning ?? fallback.warning };
+	return {
+		...fallback,
+		authFallbackUsed: true,
+		fallbackUsed: true,
+		warning: firstResolved.warning ?? warning ?? fallback.warning,
+	};
 }
 
 /**
@@ -1827,14 +1894,14 @@ export async function resolveAllowedModels(
  * a UI picker should treat an empty list as "hide the picker entry", matching how the SDK
  * surfaces the same misconfiguration during session initialization.
  */
-export function filterAvailableModelsByEnabledPatterns(
-	available: Model<Api>[],
+function filterModelsByEnabledPatterns(
+	models: Model<Api>[],
 	patterns: readonly string[],
 	settings?: Settings,
 ): Model<Api>[] {
-	if (patterns.length === 0) return available;
+	if (patterns.length === 0) return models;
 
-	const context = buildPreferenceContext(available, undefined);
+	const context = buildPreferenceContext(models, undefined);
 	const allowedModels: Model<Api>[] = [];
 	const addAllowed = (model: Model<Api>) => {
 		allowedModels.push(model);
@@ -1842,7 +1909,7 @@ export function filterAvailableModelsByEnabledPatterns(
 
 	for (const pattern of patterns) {
 		if (pattern.includes("*") || pattern.includes("?") || pattern.includes("[")) {
-			for (const model of resolveGlobScopePattern(pattern, available).models) {
+			for (const model of resolveGlobScopePattern(pattern, models).models) {
 				addAllowed(model);
 			}
 			continue;
@@ -1850,18 +1917,52 @@ export function filterAvailableModelsByEnabledPatterns(
 
 		// Mirror resolveModelScope: role aliases resolve to the role's model.
 		if (settings && modelRoleAliasPrefixLength(pattern) !== undefined) {
-			const { model } = resolveModelRoleValue(pattern, available, { settings });
+			const { model } = resolveModelRoleValue(pattern, models, { settings });
 			if (model) addAllowed(model);
 			continue;
 		}
 
-		const { model } = parseModelPatternWithContext(pattern, available, context);
+		const { model } = parseModelPatternWithContext(pattern, models, context);
 		if (model) {
 			addAllowed(model);
 		}
 	}
 
-	return includeSyntheticAllowedModels(available, allowedModels);
+	return includeSyntheticAllowedModels(models, allowedModels);
+}
+
+export function filterAvailableModelsByEnabledPatterns(
+	available: Model<Api>[],
+	patterns: readonly string[],
+	settings?: Settings,
+): Model<Api>[] {
+	return filterModelsByEnabledPatterns(available, patterns, settings);
+}
+
+/**
+ * Resolve the model catalog visible to explicit selectors under the active
+ * provider and enabled-model policy. Unlike {@link resolveAllowedModels}, this
+ * retains models whose providers have no credentials so auth-aware dispatch can
+ * inspect them before falling back to the parent's authenticated model.
+ *
+ * A registry without `getAll` is supported for lightweight embedding/test
+ * facades and naturally falls back to its auth-filtered model set.
+ */
+export function resolveModelPolicyModels(
+	modelRegistry: Pick<ModelRegistry, "getAvailable"> & Partial<Pick<ModelRegistry, "getAll">>,
+	settings?: Settings,
+): Model<Api>[] {
+	const availableModels = modelRegistry.getAvailable();
+	const allModels = modelRegistry.getAll?.() ?? availableModels;
+	const disabledProviders = new Set(settings?.get("disabledProviders") ?? []);
+	const enabledPatterns = settings?.get("enabledModels") ?? [];
+	const visibleModels = allModels.filter(model => !disabledProviders.has(model.provider));
+	const policyModels = filterModelsByEnabledPatterns(visibleModels, enabledPatterns, settings);
+	const visibleAvailableModels = availableModels.filter(model => !disabledProviders.has(model.provider));
+	for (const model of filterModelsByEnabledPatterns(visibleAvailableModels, enabledPatterns, settings)) {
+		if (!policyModels.some(candidate => modelsAreEqual(candidate, model))) policyModels.push(model);
+	}
+	return policyModels;
 }
 function findExactCliModel(
 	selector: string,

@@ -233,9 +233,11 @@ export interface TurnRecoveryHost {
 	withBashBranchTransition<T>(operation: () => T): T;
 }
 
-/** Construction-time retry state restored from model selection. */
+/** Construction-time model state restored from selection. */
 export interface TurnRecoveryOptions {
 	initialRetryFallback?: InitialRetryFallbackState;
+	/** Mark the initial model as auth-fallback routed without arming retry recovery. */
+	initialModelFallback?: boolean;
 }
 
 type PendingRetryError = {
@@ -309,8 +311,11 @@ export class TurnRecovery {
 			this.#activeRetryFallback = {
 				...options.initialRetryFallback,
 				lastAppliedFallbackThinkingLevel: host.configuredThinkingLevel(),
+				originalWasFallbackRouted: false,
 				pinned: options.initialRetryFallback.pinned ?? false,
 			};
+		}
+		if (options.initialRetryFallback || options.initialModelFallback) {
 			this.#markFallbackRouted();
 		}
 		this.#validateRetryFallbackChains();
@@ -1500,6 +1505,16 @@ export class TurnRecovery {
 		this.#fallbackRoutedFor = undefined;
 	}
 
+	/** Finishes a retry fallback while retaining any routing state it nested inside. */
+	#finishRetryFallbackRestore(originalWasFallbackRouted: boolean): void {
+		this.#activeRetryFallback = undefined;
+		if (originalWasFallbackRouted) {
+			this.#markFallbackRouted();
+		} else {
+			this.#fallbackRoutedFor = undefined;
+		}
+	}
+
 	/** Checks whether a fallback selector remains in cooldown. */
 	isRetryFallbackSelectorSuppressed(selector: RetryFallbackSelector): boolean {
 		return this.#host.modelRegistry.isSelectorSuppressed(selector.raw);
@@ -1796,6 +1811,7 @@ export class TurnRecovery {
 		// candidate as fallback-routed. Attribution itself is safe regardless — it
 		// names the last model that served, which this swap has not changed.
 		const routedBeforeSwap = this.#fallbackRoutedFor;
+		const originalWasFallbackRouted = this.#fallbackRouted;
 		const servedBeforeSwap = this.#activeRetryFallback?.served;
 		this.#markFallbackRouted();
 		if (this.#activeRetryFallback) this.#activeRetryFallback.served = false;
@@ -1822,6 +1838,7 @@ export class TurnRecovery {
 				originalSelector: currentSelector,
 				originalThinkingLevel: currentThinkingLevel,
 				lastAppliedFallbackThinkingLevel: nextThinkingLevel,
+				originalWasFallbackRouted,
 				pinned: options?.pinFallback === true,
 			};
 		} else {
@@ -2011,6 +2028,7 @@ export class TurnRecovery {
 			originalSelector: originalSelectorRaw,
 			originalThinkingLevel,
 			lastAppliedFallbackThinkingLevel,
+			originalWasFallbackRouted,
 		} = this.#activeRetryFallback;
 		const originalSelector = parseRetryFallbackSelector(originalSelectorRaw, this.#host.modelRegistry);
 		if (!originalSelector) {
@@ -2028,7 +2046,7 @@ export class TurnRecovery {
 		const currentSelector = formatRetryFallbackSelector(currentModel, this.#host.thinkingLevel());
 		if (currentSelector === originalSelector.raw) {
 			if (!this.isRetryFallbackSelectorSuppressed(originalSelector)) {
-				this.clearActiveRetryFallback();
+				this.#finishRetryFallbackRestore(originalWasFallbackRouted);
 			}
 			return false;
 		}
@@ -2049,11 +2067,11 @@ export class TurnRecovery {
 		const thinkingToApply =
 			currentThinkingLevel === lastAppliedFallbackThinkingLevel ? originalThinkingLevel : currentThinkingLevel;
 		const primarySelector = formatModelStringWithRouting(primaryModel);
-		// Clear before the swap: `setModelWithProviderSessionReset` and
-		// `setThinkingLevel` both notify subscribers, and an observer reading
-		// attribution in that window would see the restored primary still tagged
-		// as fallback-served.
-		this.clearActiveRetryFallback();
+		// Finish before the swap: `setModelWithProviderSessionReset` and
+		// `setThinkingLevel` both notify subscribers. The restored selector must
+		// retain routing ownership when this retry chain nested inside an earlier
+		// auth/order fallback, but a configured primary must shed it immediately.
+		this.#finishRetryFallbackRestore(originalWasFallbackRouted);
 		await this.#host.setModelWithProviderSessionReset(primaryModel);
 		this.#host.sessionManager.appendModelChange(primarySelector, EPHEMERAL_MODEL_CHANGE_ROLE);
 		this.#host.settings.getStorage()?.recordModelUsage(primarySelector);

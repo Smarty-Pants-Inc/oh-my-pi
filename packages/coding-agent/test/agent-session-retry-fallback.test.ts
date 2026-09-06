@@ -1591,6 +1591,66 @@ describe("AgentSession retry fallback", () => {
 		});
 	});
 
+	it("clears startup retry attribution when its configured primary restores", async () => {
+		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const startupFallback = getBundledModel("openai", "gpt-4o-mini");
+		if (!primaryModel || !startupFallback) {
+			throw new Error("Expected bundled startup restore models to exist");
+		}
+
+		let now = Date.now();
+		vi.spyOn(Date, "now").mockImplementation(() => now);
+		const primarySelector = `${primaryModel.provider}/${primaryModel.id}`;
+		modelRegistry.suppressSelector(primarySelector, now + 200);
+		const requestedModels: string[] = [];
+		const mock = createMockModel();
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model: startupFallback, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (model, context, options) => {
+				requestedModels.push(`${model.provider}/${model.id}`);
+				mock.push({ content: [`ok:${model.provider}/${model.id}`] });
+				return mock.stream(model, context, options);
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.fallbackChains": {
+				default: [`${startupFallback.provider}/${startupFallback.id}`],
+			},
+			"retry.fallbackRevertPolicy": "cooldown-expiry",
+		});
+		settings.setModelRole("default", primarySelector);
+
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+			initialRetryFallback: {
+				role: "default",
+				originalSelector: primarySelector,
+				originalThinkingLevel: undefined,
+			},
+			// Startup retry selection itself marks the selected model as a fallback;
+			// it does not make the configured primary fallback-routed on restoration.
+			initialModelFallback: true,
+		});
+
+		await session.prompt("Serve on the startup fallback");
+		await session.waitForIdle();
+		expect(session.servingModel).toEqual({
+			selector: `${startupFallback.provider}/${startupFallback.id}`,
+			isFallback: true,
+		});
+
+		now += 240;
+		await session.prompt("Restore the configured primary");
+		await session.waitForIdle();
+		expect(requestedModels).toEqual([`${startupFallback.provider}/${startupFallback.id}`, primarySelector]);
+		expect(session.servingModel).toEqual({ selector: primarySelector, isFallback: false });
+	});
+
 	it("keeps advisor fallback recovery on its role chain when another role shares its model", async () => {
 		const mainModel = getBundledModel("openai", "gpt-4o-mini");
 		const advisorPrimary = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -4484,6 +4544,77 @@ describe("AgentSession retry fallback", () => {
 		expect(session.servingModel).toEqual({
 			selector: `${primaryModel.provider}/${primaryModel.id}`,
 			isFallback: false,
+		});
+	});
+
+	it("retains initial auth fallback attribution after a nested retry fallback restores", async () => {
+		const configuredPrimary = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const authFallback = getBundledModel("openai", "gpt-4o-mini");
+		const retryFallback = getBundledModel("openai", "gpt-4o");
+		if (!configuredPrimary || !authFallback || !retryFallback) {
+			throw new Error("Expected bundled nested fallback models to exist");
+		}
+
+		const requestedModels: string[] = [];
+		const mock = createMockModel();
+		let authFallbackAttempts = 0;
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model: authFallback, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (model, context, options) => {
+				const selector = `${model.provider}/${model.id}`;
+				requestedModels.push(selector);
+				if (selector === `${authFallback.provider}/${authFallback.id}` && authFallbackAttempts++ === 0) {
+					mock.push({ throw: "rate limit exceeded retry-after-ms=200" });
+				} else {
+					mock.push({ content: [`ok:${selector}`] });
+				}
+				return mock.stream(model, context, options);
+			},
+		});
+
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 5,
+			"retry.fallbackChains": {
+				[`${authFallback.provider}/${authFallback.id}`]: [`${retryFallback.provider}/${retryFallback.id}`],
+			},
+			"retry.fallbackRevertPolicy": "cooldown-expiry",
+		});
+		settings.setModelRole("default", `${configuredPrimary.provider}/${configuredPrimary.id}`);
+
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+			initialModelFallback: true,
+		});
+		let now = Date.now();
+		vi.spyOn(Date, "now").mockImplementation(() => now);
+
+		await session.prompt("Nested retry fallback");
+		await session.waitForIdle();
+		expect(requestedModels).toEqual([
+			`${authFallback.provider}/${authFallback.id}`,
+			`${retryFallback.provider}/${retryFallback.id}`,
+		]);
+		expect(session.servingModel).toEqual({
+			selector: `${retryFallback.provider}/${retryFallback.id}`,
+			isFallback: true,
+		});
+
+		now += 240;
+		await session.prompt("Restore the authenticated selector");
+		await session.waitForIdle();
+		expect(requestedModels).toEqual([
+			`${authFallback.provider}/${authFallback.id}`,
+			`${retryFallback.provider}/${retryFallback.id}`,
+			`${authFallback.provider}/${authFallback.id}`,
+		]);
+		expect(session.servingModel).toEqual({
+			selector: `${authFallback.provider}/${authFallback.id}`,
+			isFallback: true,
 		});
 	});
 
