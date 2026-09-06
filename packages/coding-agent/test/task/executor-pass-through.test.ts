@@ -620,4 +620,35 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		expect(result.exitCode).toBe(0);
 		expect(initSpy).toHaveBeenCalledWith(expect.objectContaining({ modelRole: "reviewer" }));
 	});
+
+	it("falls back to the authenticated parent when an explicit child exists only in the policy catalog", async () => {
+		const parent = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const child = getBundledModel("opencode-zen", "qwen3.6-plus-free");
+		if (!parent || !child) throw new Error("Expected parent and child fallback models to be bundled");
+		const session = yieldEmittingSession();
+		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+		const modelRegistry = {
+			authStorage: {},
+			refresh: async () => {},
+			getAvailable: () => [parent],
+			getApiKey: async (model: Model) => (model.provider === parent.provider ? "test-key" : undefined),
+		} as unknown as ModelRegistry;
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "subagent-auth-fallback",
+			modelOverride: `${child.provider}/${child.id}`,
+			modelSelectionExplicit: true,
+			allowedModels: [parent],
+			modelCandidates: [parent, child],
+			parentActiveModelPattern: `${parent.provider}/${parent.id}`,
+			modelRegistry,
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(result.resolvedModel).toBe(`${parent.provider}/${parent.id}`);
+		expect(result.resolvedModelIsFallback).toBe(true);
+		expect(spy.mock.calls[0]?.[0]?.model).toBe(parent);
+		expect(spy.mock.calls[0]?.[0]?.initialModelFallback).toBe(true);
+	});
 });

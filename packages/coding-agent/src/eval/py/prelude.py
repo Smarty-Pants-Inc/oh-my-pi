@@ -665,13 +665,15 @@ if "__omp_prelude_loaded__" not in globals():
     class AgentHandle(_Handle):
         """Background subagent handle returned by ``agent()``."""
 
-        __slots__ = ("agent", "handle")
+        __slots__ = ("agent", "handle", "model", "model_fallback")
         kind = "agent"
 
         def __init__(self, id, agent, schema=None):
             super().__init__(id, schema)
             self.agent = agent
             self.handle = f"agent://{id}"
+            self.model = None
+            self.model_fallback = False
 
         def __repr__(self):
             return f"<agent {self.id} ({self.agent})>"
@@ -701,6 +703,9 @@ if "__omp_prelude_loaded__" not in globals():
 
     def _handle_value(handle, snapshot):
         status = snapshot.get("status") if isinstance(snapshot, dict) else "failed"
+        if isinstance(handle, AgentHandle) and isinstance(snapshot, dict):
+            handle.model = snapshot.get("model")
+            handle.model_fallback = snapshot.get("modelFallback") is True
         if status == "running":
             raise TimeoutError(f"{handle.kind} handle {handle.id} is still running")
         if status in ("failed", "cancelled"):
@@ -773,6 +778,7 @@ if "__omp_prelude_loaded__" not in globals():
         *,
         agent=None,
         label=None,
+        model=None,
         schema=None,
         schema_mode=None,
         isolated=None,
@@ -782,6 +788,8 @@ if "__omp_prelude_loaded__" not in globals():
     ):
         """Start a background subagent and return its handle."""
         args = {"prompt": prompt}
+        if model is not None:
+            args["model"] = model
         if agent is not None:
             args["agent"] = agent
         if label is not None:

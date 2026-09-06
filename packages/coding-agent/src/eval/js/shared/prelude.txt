@@ -155,6 +155,8 @@ if (!globalThis.__omp_js_prelude_loaded__) {
 			super("agent", id, schema);
 			this.agent = agentName;
 			this.handle = `agent://${id}`;
+			this.model = undefined;
+			this.modelFallback = false;
 		}
 
 		toString() {
@@ -187,6 +189,10 @@ if (!globalThis.__omp_js_prelude_loaded__) {
 
 	const resolveHandleSnapshot = (handle, snapshot) => {
 		const status = snapshot?.status ?? "failed";
+		if (handle instanceof AgentHandle) {
+			handle.model = snapshot?.model;
+			handle.modelFallback = snapshot?.modelFallback === true;
+		}
 		if (status === "running") throw timeoutError(`${handle.kind} handle ${handle.id} is still running`);
 		if (status === "failed" || status === "cancelled") {
 			throw new Error(snapshot?.error || `${handle.kind} handle ${handle.id} failed`);
@@ -253,8 +259,8 @@ if (!globalThis.__omp_js_prelude_loaded__) {
 			"agent",
 			opts,
 			rest,
-			["agent", "label", "schema", "isolated", "apply", "merge", "schemaMode", "tools"],
-			"{ agent, label, schema, schemaMode, isolated, apply, merge, tools }",
+			["agent", "label", "schema", "isolated", "apply", "merge", "schemaMode", "tools", "model"],
+			"{ agent, label, model, schema, schemaMode, isolated, apply, merge, tools }",
 		);
 		const result = await globalThis.__omp_call_tool__("__agent__", { prompt, ...options });
 		if (!result || typeof result.id !== "string") throw new Error("agent() did not return a handle");

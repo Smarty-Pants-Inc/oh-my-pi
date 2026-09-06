@@ -485,7 +485,7 @@ export interface AgentProgress {
 	modelRole?: string;
 	/** Resolved model display string in the form `<provider>/<id>`, optionally suffixed with `:<thinkingLevel>` when the level was set explicitly. Undefined when the model could not be resolved. */
 	resolvedModel?: string;
-	/** True when {@link resolvedModel} is the target of an active retry fallback (not the originally configured model). Lets observer-only UIs (collab guests, Agent Hub rows with no live session) flag the fallback and keep the provider. */
+	/** True when {@link resolvedModel} was reached by auth-aware or retry fallback routing rather than the configured primary. */
 	resolvedModelIsFallback?: boolean;
 	/** Data extracted by registered subprocess tool handlers (keyed by tool name) */
 	extractedToolData?: Record<string, unknown[]>;
@@ -556,7 +556,7 @@ export interface SingleResult {
 	modelRole?: string;
 	/** Resolved model display string in the form `<provider>/<id>`, optionally suffixed with `:<thinkingLevel>` when the level was set explicitly. Omitted from tool-result JSON when undefined to keep wire payloads small. */
 	resolvedModel?: string;
-	/** True when {@link resolvedModel} is the target of an active retry fallback. Mirrors {@link AgentProgress.resolvedModelIsFallback} onto the settled result. */
+	/** True when {@link resolvedModel} was reached by auth-aware or retry fallback routing. Mirrors {@link AgentProgress.resolvedModelIsFallback} onto the settled result. */
 	resolvedModelIsFallback?: boolean;
 	error?: string;
 	aborted?: boolean;

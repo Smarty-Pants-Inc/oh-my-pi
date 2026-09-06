@@ -203,7 +203,7 @@ it("does not defer external aborts for a completion bridge call", async () => {
 
 it("hands the tool bridge the unshielded signal so a deferred phase still cancels subagents", async () => {
 	// Regression: the bridge used to receive the kernel shield, so `agent()`
-	// fan-outs from a Python/Ruby/Julia cell survived a turn cancel and kept
+	// fan-outs from a Python cell survived a turn cancel and kept
 	// running until they finished on their own.
 	const abortController = new AbortController();
 	const entered = Promise.withResolvers<void>();
