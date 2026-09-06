@@ -6735,7 +6735,7 @@
     },
     {
       "path": "packages/coding-agent/src/cli/agents-cli.ts",
-      "sha256": "79914ff082eef0fe68fd691266b8cd53e4b24e941c560ef0d8bf33fcdad408b5"
+      "sha256": "254cf6de575c337823cfa764021947694c0f7b3faa45038ed2d9a32945c791ee"
     },
     {
       "path": "packages/coding-agent/src/cli/args.ts",
@@ -6835,7 +6835,7 @@
     },
     {
       "path": "packages/coding-agent/src/collab/guest.ts",
-      "sha256": "4d17014105256ac1321bfa41a8b3c0ba85c6560649399ed54e3657b5cf2e7ebe"
+      "sha256": "8c19a0d3329dbe75b2d96e9028c9e5171d38b7f07f5ce864f6eb973bf5b70092"
     },
     {
       "path": "packages/coding-agent/src/collab/herdr-bridge-bootstrap.ts",
@@ -6843,7 +6843,7 @@
     },
     {
       "path": "packages/coding-agent/src/collab/host.ts",
-      "sha256": "339b8d905f48ad7bc1a8c26a3778f144c1afbc1070318f17b24bc3d69d0d153f"
+      "sha256": "b1b83d23adb66cc503f12299dec8b2f048cf3b71692ad4c3244cb3e6601c6f47"
     },
     {
       "path": "packages/coding-agent/src/collab/local-transport.ts",
@@ -6851,11 +6851,11 @@
     },
     {
       "path": "packages/coding-agent/src/collab/protocol.ts",
-      "sha256": "287888fb92204a3a114884c465312cdf05ff18c8a3c3f65961abdb21ff82021c"
+      "sha256": "3d3c752f31e29ca03383f206881df59932ae2a05e5474923d6d296f831d0f505"
     },
     {
       "path": "packages/coding-agent/src/collab/relay-client.ts",
-      "sha256": "bb2406fcfe335b527fccdda3fe334084dcff7c20a1905989faf56031ae89b9ce"
+      "sha256": "713c30346abae8645c03f0995256340f82759573dd0bcf342a0ffef71a1a7bd2"
     },
     {
       "path": "packages/coding-agent/src/collab/replication-shrink.ts",
@@ -7379,7 +7379,7 @@
     },
     {
       "path": "packages/coding-agent/src/discovery/helpers.ts",
-      "sha256": "d1cbe2512804664a9be83a58ea6e39ac0acfda64a52417dadd179df181036b28"
+      "sha256": "c7ec255f71a61f4bdf6f1139b84ff1cf057e60ebe3363c64a79ccd43cde105b4"
     },
     {
       "path": "packages/coding-agent/src/discovery/index.ts",
@@ -7803,7 +7803,7 @@
     },
     {
       "path": "packages/coding-agent/src/goals/tools/goal-tool.ts",
-      "sha256": "854999e7b601202c8306a6be94cad62303530322b9cabab3ab76748828d78afe"
+      "sha256": "48673b56708b8d373004b2f24e4419b99f00098d1feae67bd1e44db36154c701"
     },
     {
       "path": "packages/coding-agent/src/hindsight/backend.ts",
@@ -8111,7 +8111,7 @@
     },
     {
       "path": "packages/coding-agent/src/main.ts",
-      "sha256": "7b2119c469184d073478461e06409c428ce09866deef677c06228eee1b913ff9"
+      "sha256": "efb745205fb953a255e96d74acb96256690ed74eadfdbb8297b61217c622c4c1"
     },
     {
       "path": "packages/coding-agent/src/markit/converters/docx.ts",
@@ -8531,7 +8531,7 @@
     },
     {
       "path": "packages/coding-agent/src/modes/interactive-mode.ts",
-      "sha256": "1bdcee8d5db786edd0a3f81126cf1bf6179406afde2e42b5992db9da975db1f5"
+      "sha256": "453107724369a4280bebf39726625f2ed764142ed8a22c57264aa3a7587f8a19"
     },
     {
       "path": "packages/coding-agent/src/modes/loop-limit.ts",
@@ -9391,7 +9391,7 @@
     },
     {
       "path": "packages/coding-agent/src/task/structured-subagent.ts",
-      "sha256": "68a6cbfca9009af9d0318da40d26bef49b2adf753c0da369ea16867fdb9d2e03"
+      "sha256": "721cd9db19465afaac3a4d07c2074d937139c83f46ac7fa13927c9c693b428ab"
     },
     {
       "path": "packages/coding-agent/src/task/subprocess-tool-registry.ts",
@@ -9399,7 +9399,7 @@
     },
     {
       "path": "packages/coding-agent/src/task/types.ts",
-      "sha256": "bf5f90573941c6eb9177fc02ae665e6379babe26f701464249477f0f55d6711d"
+      "sha256": "47962f4297da6bbb17d29a5172174a231f5f19bafe1d5751e07bc8024b409f4c"
     },
     {
       "path": "packages/coding-agent/src/task/workpool-yield.ts",
@@ -11147,5 +11147,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "02565602b214c544008abd877a213e616159d1fe7f9a1a2fdd1d917a8d1f843f"
+  "rootSha256": "9a6af0043d1e23fbe72617429b97208ff7e414eef7cb23eb2dd83609ee403c05"
 }

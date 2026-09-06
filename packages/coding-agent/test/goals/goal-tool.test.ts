@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "bun:test";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { completionBudgetReport, GoalRuntime } from "@oh-my-pi/pi-coding-agent/goals/runtime";
 import type { Goal, GoalModeState, GoalTokenUsage } from "@oh-my-pi/pi-coding-agent/goals/state";
 import { GoalTool } from "@oh-my-pi/pi-coding-agent/goals/tools/goal-tool";
@@ -32,8 +33,11 @@ function cloneState(state: GoalModeState | undefined): GoalModeState | undefined
 	return state ? { ...state, goal: { ...state.goal } } : undefined;
 }
 
-function createToolSession(overrides: Partial<ToolSession>): ToolSession {
-	return overrides as ToolSession;
+function createToolSession(overrides: Partial<ToolSession> = {}): ToolSession {
+	return {
+		settings: Settings.isolated({ "todo.enabled": false, "todo.reminders": false }),
+		...overrides,
+	} as ToolSession;
 }
 
 function createRuntimeHarness(initialState?: GoalModeState) {
@@ -179,6 +183,27 @@ describe("GoalTool", () => {
 		await expect(
 			tool.execute("call-complete", { op: "complete", objective: undefined, token_budget: undefined }),
 		).rejects.toThrow("cannot complete goal because no goal is active");
+	});
+
+	it("blocks completion while todo reminders track unfinished work", async () => {
+		const runtime = { completeGoalFromTool: vi.fn() };
+		const tool = new GoalTool(
+			createToolSession({
+				getGoalRuntime: () => runtime as unknown as GoalRuntime,
+				settings: Settings.isolated({ "todo.enabled": true, "todo.reminders": true }),
+				isToolActive: name => name === "todo",
+				getTodoPhases: () => [
+					{ name: "Verification", tasks: [{ content: "Run focused checks", status: "in_progress" }] },
+				],
+			}),
+		);
+
+		await expect(
+			tool.execute("call-complete", { op: "complete", objective: undefined, token_budget: undefined }),
+		).rejects.toThrow(
+			"goal_completion_blocked_by_open_todos: complete or abandon pending and in-progress todo tasks before completing the goal",
+		);
+		expect(runtime.completeGoalFromTool).not.toHaveBeenCalled();
 	});
 
 	it("rejects op=create when the objective is missing or only whitespace", async () => {

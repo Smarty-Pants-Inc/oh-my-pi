@@ -56,6 +56,19 @@ function validateCreateParams(params: GoalToolInput): { objective: string; token
 	return { objective };
 }
 
+function hasOpenTodoTasks(session: ToolSession): boolean {
+	if (
+		!session.settings.get("todo.enabled") ||
+		!session.settings.get("todo.reminders") ||
+		session.isToolActive?.("todo") !== true
+	) {
+		return false;
+	}
+	return (session.getTodoPhases?.() ?? []).some(phase =>
+		phase.tasks.some(task => task.status === "pending" || task.status === "in_progress"),
+	);
+}
+
 export class GoalTool implements AgentTool<typeof goalSchema, GoalToolDetails> {
 	readonly name = "goal";
 	readonly label = "Goal";
@@ -91,6 +104,11 @@ export class GoalTool implements AgentTool<typeof goalSchema, GoalToolDetails> {
 			const state = this.#session.getGoalModeState?.();
 			response = buildGoalToolResponse(isCurrentGoalModeState(state) ? state.goal : null);
 		} else if (params.op === "complete") {
+			if (hasOpenTodoTasks(this.#session)) {
+				throw new ToolError(
+					"goal_completion_blocked_by_open_todos: complete or abandon pending and in-progress todo tasks before completing the goal",
+				);
+			}
 			const completed = await runtime.completeGoalFromTool();
 			response = buildGoalToolResponse(completed, { includeCompletionReport: true });
 		} else {
