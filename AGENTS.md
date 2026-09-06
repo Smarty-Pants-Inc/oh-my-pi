@@ -283,6 +283,10 @@ Smarty Dev parent update that pins the matching `repos/omp` gitlink and
 only through that landed parent's `bin/omp-fork` and `bin/smarty-dev-sync`
 commands.
 
+OMP post-land verification must use `bun run ci:post-land`. Keep that command
+self-bootstrapping from a pristine detached worktree with no pre-existing
+`node_modules`; never substitute an ad hoc caller command.
+
 A direct user request to land or activate authorizes that routine transaction. Keep hashes, receipts, policy records, and exact-tree proofs as internal evidence. Ask again only when purpose or scope materially changes, or when a real external blocker requires user input. Do not turn normal landing into a user-facing approval ceremony.
 
 Agent-started goals are intentional fork behavior: `goal` must be available
