@@ -93,6 +93,7 @@ export class LocalCollabTransport implements CollabTransport {
 	readonly #address: string;
 	readonly #announce?: Record<string, unknown>;
 	readonly #waitForHerdrReady: boolean;
+	#routeGeneration: number | undefined;
 
 	constructor(
 		address: string,
@@ -108,6 +109,11 @@ export class LocalCollabTransport implements CollabTransport {
 
 	get isOpen(): boolean {
 		return this.#opened && !this.#closed;
+	}
+
+	/** Canonical generation assigned by Herdr after host admission. */
+	get routeGeneration(): number | undefined {
+		return this.#routeGeneration;
 	}
 
 	connect(): void {
@@ -189,6 +195,13 @@ export class LocalCollabTransport implements CollabTransport {
 		if (!record || typeof record !== "object") return;
 		const value = record as Record<string, unknown>;
 		if (value.t === "ready" && this.#waitForHerdrReady) {
+			const routeGeneration = value.routeGeneration;
+			if (typeof routeGeneration !== "number" || !Number.isSafeInteger(routeGeneration) || routeGeneration < 1) {
+				this.#finish("invalid Herdr bridge ready generation");
+				this.#socket?.end();
+				return;
+			}
+			this.#routeGeneration = routeGeneration;
 			this.#open();
 		} else if (value.t === "error" && typeof value.message === "string") {
 			const reason =

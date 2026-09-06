@@ -769,7 +769,7 @@ async function runInteractiveMode(
 				hostBridge.token,
 				hostBridge.paneId,
 				bridge.ompSessionId,
-				bridge.routeGeneration,
+				hostBridge.routeGeneration,
 			),
 			{ trustedLocal: true },
 		);
@@ -2272,7 +2272,6 @@ export async function runRootCommand(
 							role: "host",
 							managed: true,
 							...automaticHerdrHostBridge,
-							routeGeneration: 1,
 						}
 					: undefined);
 			const activeCompanionController = companionController;

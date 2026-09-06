@@ -7,14 +7,18 @@ export interface HerdrBridgeDiscovery {
 	paneId: string;
 }
 
-export interface HerdrHostBridgeCredentials {
+export interface HerdrHostBridgeConnection {
 	address: string;
 	token: string;
 	paneId: string;
 }
 
+export interface HerdrHostBridgeCredentials extends HerdrHostBridgeConnection {
+	routeGeneration: number;
+}
+
 export interface HerdrHostBridgeBootstrap {
-	current?: HerdrHostBridgeCredentials;
+	current?: HerdrHostBridgeConnection;
 	discovery: HerdrBridgeDiscovery;
 }
 
@@ -55,7 +59,7 @@ export function captureHerdrBridgeBootstrap(
 		platform !== "win32" && bridgeCapable && socketPath?.trim() && paneId?.trim()
 			? { socketPath, paneId }
 			: undefined;
-	let currentHostBridge: HerdrHostBridgeCredentials | undefined;
+	let currentHostBridge: HerdrHostBridgeConnection | undefined;
 	const hostBridgeToken = hostToken?.trim() ? hostToken : undefined;
 	if (hostBridgeToken && address?.trim() && paneId?.trim()) {
 		currentHostBridge = { address, token: hostBridgeToken, paneId };
@@ -202,6 +206,7 @@ export async function discoverHerdrHostBridge(discovery: HerdrBridgeDiscovery): 
 		throw discoveryFailure("malformed local API response");
 	}
 	const result = record.result as Record<string, unknown>;
+	const routeGeneration = result.route_generation;
 	if (
 		result.type !== "pane_omp_bridge" ||
 		typeof result.pane_id !== "string" ||
@@ -210,7 +215,10 @@ export async function discoverHerdrHostBridge(discovery: HerdrBridgeDiscovery): 
 		typeof result.address !== "string" ||
 		!result.address.trim() ||
 		typeof result.token !== "string" ||
-		!result.token.trim()
+		!result.token.trim() ||
+		typeof routeGeneration !== "number" ||
+		!Number.isSafeInteger(routeGeneration) ||
+		routeGeneration < 1
 	) {
 		throw discoveryFailure("malformed local API response");
 	}
@@ -223,6 +231,7 @@ export async function discoverHerdrHostBridge(discovery: HerdrBridgeDiscovery): 
 		address: result.address,
 		token: result.token,
 		paneId: result.pane_id,
+		routeGeneration,
 	};
 }
 

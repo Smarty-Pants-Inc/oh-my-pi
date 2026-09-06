@@ -546,7 +546,10 @@ describe("injected collab transport", () => {
 			options: Bun.TCPSocketConnectOptions<undefined>,
 		) => {
 			options.socket.open?.(socket);
-			options.socket.data?.(socket, Buffer.from('{"t":"ready"}\n{"t":"close","reason":"bridge dropped"}\n'));
+			options.socket.data?.(
+				socket,
+				Buffer.from('{"t":"ready","routeGeneration":1}\n{"t":"close","reason":"bridge dropped"}\n'),
+			);
 			return Promise.resolve(socket);
 		}) as typeof Bun.connect);
 		const intervalSpy = spyOn(globalThis, "setInterval").mockImplementation(

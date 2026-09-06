@@ -6839,7 +6839,7 @@
     },
     {
       "path": "packages/coding-agent/src/collab/herdr-bridge-bootstrap.ts",
-      "sha256": "082e4c434235f57bd0650d09e4f408c5201f2dd7fc0c0b56353ab50b4ff4635b"
+      "sha256": "974eedf9a8898bca1510355a85ca0314b9f24751f8b609556eddb9f866440365"
     },
     {
       "path": "packages/coding-agent/src/collab/host.ts",
@@ -6847,7 +6847,7 @@
     },
     {
       "path": "packages/coding-agent/src/collab/local-transport.ts",
-      "sha256": "5087d4f88686d5e7a67ed7bc433efcae8e091ce8713932459c8e3b6e5e74839e"
+      "sha256": "6f51e9b6e605f7e9055837cf3687a08d89512eaea1bdad5857829bf635626fea"
     },
     {
       "path": "packages/coding-agent/src/collab/protocol.ts",
@@ -7803,7 +7803,7 @@
     },
     {
       "path": "packages/coding-agent/src/goals/tools/goal-tool.ts",
-      "sha256": "48673b56708b8d373004b2f24e4419b99f00098d1feae67bd1e44db36154c701"
+      "sha256": "ab6197afffee203cc5ad05e502ba57f9c6f1a1a53b3b00d80bfc74a855d0805d"
     },
     {
       "path": "packages/coding-agent/src/hindsight/backend.ts",
@@ -8111,7 +8111,7 @@
     },
     {
       "path": "packages/coding-agent/src/main.ts",
-      "sha256": "efb745205fb953a255e96d74acb96256690ed74eadfdbb8297b61217c622c4c1"
+      "sha256": "82ab9f85f1b0cc1e57f54bb33cac6b9646c89237656f7f171db0fd4de9e37dfd"
     },
     {
       "path": "packages/coding-agent/src/markit/converters/docx.ts",
@@ -11147,5 +11147,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "9a6af0043d1e23fbe72617429b97208ff7e414eef7cb23eb2dd83609ee403c05"
+  "rootSha256": "a038cdc8a06f3f5ec2fb89ecc724850d1a5a91da0576f3669fa3c3dae8db3e99"
 }

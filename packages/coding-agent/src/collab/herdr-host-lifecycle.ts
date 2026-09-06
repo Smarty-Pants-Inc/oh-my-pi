@@ -11,7 +11,6 @@ import { createHostBridgeTransport } from "./local-transport";
 export interface ManagedHerdrHostBridge extends HerdrHostBridgeBootstrap {
 	role: "host";
 	managed: true;
-	routeGeneration: number;
 }
 
 type SessionChangeSource = Pick<AgentSession, "registerSessionChangeCallback" | "sessionManager">;
@@ -32,6 +31,7 @@ export class HerdrCollabHostLifecycle {
 	#started = false;
 	#stopping = false;
 	#suspended = false;
+	#routeGeneration: number | undefined;
 
 	constructor(ctx: InteractiveModeContext, session: SessionChangeSource, bridge: ManagedHerdrHostBridge) {
 		this.#ctx = ctx;
@@ -68,6 +68,11 @@ export class HerdrCollabHostLifecycle {
 
 	whenIdle(): Promise<void> {
 		return this.#tail;
+	}
+
+	/** Canonical generation assigned to the active private bridge route. */
+	get routeGeneration(): number | undefined {
+		return this.#routeGeneration;
 	}
 
 	async suspend(reason: string): Promise<void> {
@@ -150,25 +155,23 @@ export class HerdrCollabHostLifecycle {
 			if (discoveredCurrentSessionId !== sessionId || discoveredSessionId !== sessionId) continue;
 
 			const next = new CollabHost(this.#ctx);
+			const transport = createHostBridgeTransport(
+				refreshed.address,
+				refreshed.token,
+				refreshed.paneId,
+				sessionId,
+				refreshed.routeGeneration,
+			);
 			let terminalReason: string | undefined;
 			try {
-				await next.startWithTransport(
-					createHostBridgeTransport(
-						refreshed.address,
-						refreshed.token,
-						refreshed.paneId,
-						sessionId,
-						this.#bridge.routeGeneration,
-					),
-					{
-						trustedLocal: true,
-						privateHost: true,
-						onTerminated: reason => {
-							terminalReason = reason;
-							this.#handleHostTermination(next, reason);
-						},
+				await next.startWithTransport(transport, {
+					trustedLocal: true,
+					privateHost: true,
+					onTerminated: reason => {
+						terminalReason = reason;
+						this.#handleHostTermination(next, reason);
 					},
-				);
+				});
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				if (terminalReason !== undefined) throw error;
@@ -184,6 +187,10 @@ export class HerdrCollabHostLifecycle {
 				throw error;
 			}
 			if (terminalReason !== undefined) throw new Error(terminalReason);
+			const assignedRouteGeneration = transport.routeGeneration;
+			if (assignedRouteGeneration === undefined)
+				throw new Error("Herdr bridge opened without an assigned route generation");
+			this.#routeGeneration = assignedRouteGeneration;
 			if (this.#stopping || this.#suspended || this.#ctx.collabGuest) {
 				await next.stop(this.#stopping ? "session stopped" : suspendedReason);
 				return;
@@ -203,6 +210,7 @@ export class HerdrCollabHostLifecycle {
 		if (this.#host !== host) return;
 		this.#host = undefined;
 		this.#activeSessionId = undefined;
+		this.#routeGeneration = undefined;
 		if (this.#ctx.herdrCollabHost === host) this.#ctx.herdrCollabHost = undefined;
 		if (this.#stopping || this.#suspended || this.#ctx.collabGuest) return;
 		void this.#enqueueRearm(true, undefined, `after terminal close (${reason})`, true).catch(() => {});
@@ -212,6 +220,7 @@ export class HerdrCollabHostLifecycle {
 		const host = this.#host;
 		this.#host = undefined;
 		this.#activeSessionId = undefined;
+		this.#routeGeneration = undefined;
 		if (host) await host.stop(reason);
 		if (this.#ctx.herdrCollabHost === host) this.#ctx.herdrCollabHost = undefined;
 	}

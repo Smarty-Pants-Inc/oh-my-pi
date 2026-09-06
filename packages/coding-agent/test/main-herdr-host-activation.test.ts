@@ -277,7 +277,6 @@ describe("automatic Herdr host activation", () => {
 			role: "host",
 			managed: true,
 			discovery: { socketPath: "/tmp/stale-herdr.sock", paneId: "pane-1" },
-			routeGeneration: 1,
 		} as const;
 
 		await expect(startManagedHerdrHost(mode, session, bridge, false)).resolves.toBeUndefined();
@@ -424,7 +423,6 @@ describe("automatic Herdr host activation", () => {
 						socketPath: `/tmp/herdr-${scenario.name}.sock`,
 						paneId: "pane-9",
 					},
-					routeGeneration: 1,
 				});
 				expect(bridge).not.toHaveProperty("ompSessionId");
 				await manager?.close();

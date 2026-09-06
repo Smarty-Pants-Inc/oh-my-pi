@@ -58,6 +58,7 @@ function successResponse(request: Record<string, unknown>, paneId = "pane-1"): s
 			pane_id: paneId,
 			address: "127.0.0.1:4321",
 			token: "fresh-bridge-token",
+			route_generation: 1,
 		},
 	});
 }
@@ -131,6 +132,7 @@ describe.skipIf(process.platform === "win32")("Herdr bridge credential discovery
 				address: "127.0.0.1:4321",
 				token: "fresh-bridge-token",
 				paneId: "pane-1",
+				routeGeneration: 1,
 			});
 		});
 	});
@@ -165,6 +167,7 @@ describe.skipIf(process.platform === "win32")("Herdr bridge credential discovery
 					address: "127.0.0.1:4321",
 					token: "fresh-bridge-token",
 					paneId: "pane-current",
+					routeGeneration: 1,
 				});
 				expect(env.HERDR_OMP_BRIDGE_TOKEN).toBeUndefined();
 			},
@@ -193,6 +196,30 @@ describe.skipIf(process.platform === "win32")("Herdr bridge credential discovery
 			},
 		);
 	});
+
+	it.each([undefined, 0, 1.5, Number.MAX_SAFE_INTEGER + 1])(
+		"rejects an invalid route_generation",
+		async routeGeneration => {
+			await withDiscoveryServer(
+				request =>
+					JSON.stringify({
+						id: request.id,
+						result: {
+							type: "pane_omp_bridge",
+							pane_id: "pane-1",
+							address: "127.0.0.1:4321",
+							token: "fresh-bridge-token",
+							route_generation: routeGeneration,
+						},
+					}),
+				async socketPath => {
+					await expect(discoverHerdrHostBridge({ socketPath, paneId: "pane-1" })).rejects.toThrow(
+						"malformed local API response",
+					);
+				},
+			);
+		},
+	);
 
 	it("rejects a non-socket local API path", async () => {
 		const root = await fs.mkdtemp(path.join("/tmp", "omp-herdr-discovery-file-"));
