@@ -2,6 +2,7 @@ import { afterEach, expect, it, vi } from "bun:test";
 import { AuthStorage, type Api, type Model } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { isOmpInternalSession } from "../../src/context/internal-session";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { PreparedExtension } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { ExtensionRuntime } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
@@ -67,6 +68,33 @@ afterEach(async () => {
 	vi.restoreAllMocks();
 	for (const authStorage of authStorages.splice(0)) await authStorage.close();
 	for (const tempDir of tempDirs.splice(0)) tempDir[Symbol.dispose]();
+});
+it("marks unrestricted subagent sessions as OMP internal prompt authority", async () => {
+	const tempDir = TempDir.createSync("@pi-task-internal-prompt-");
+	tempDirs.push(tempDir);
+	const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
+	authStorages.push(authStorage);
+
+	let internal = false;
+	vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+		internal = isOmpInternalSession(options);
+		return sessionResult(yieldingSession());
+	});
+
+	const result = await runSubprocess({
+		cwd: tempDir.path(),
+		artifactsDir: tempDir.path(),
+		agent: { name: "task", description: "test", systemPrompt: "test", source: "bundled" },
+		task: "test",
+		index: 0,
+		id: "task-internal-prompt",
+		authStorage,
+		enableLsp: false,
+		enableIrc: false,
+	});
+
+	expect(result.exitCode).toBe(0);
+	expect(internal).toBe(true);
 });
 
 it("overlaps registry refresh for an inherited session-model selector", async () => {
