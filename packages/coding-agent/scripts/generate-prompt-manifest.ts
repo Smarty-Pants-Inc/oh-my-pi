@@ -59,7 +59,6 @@ const SPECIAL_IDS: Readonly<Record<string, string>> = {
 	"prompts/goals/goal-budget-limit.md": "goal.budget_limited",
 	"prompts/goals/goal-objective-updated.md": "goal.objective_updated",
 	"prompts/todos/current.md": "todo.snapshot",
-	"prompts/skills/smarty-mergify-policy.md": "skill.smarty_mergify_policy",
 	"prompts/advisor/mission-context.md": "goal.advisor_mission",
 	"prompts/system/checkpoint-active-notice.md": "system.checkpoint-active-notice",
 	"prompts/system/date-cwd-reminder.md": "system.date-cwd-reminder",
@@ -75,7 +74,6 @@ const SPECIAL_ORDERS: Readonly<Record<string, number>> = {
 	"goal.advisor_mission": 995,
 	"system.checkpoint-active-notice": 1310,
 	"system.date-cwd-reminder": 1350,
-	"skill.smarty_mergify_policy": 520,
 };
 
 function promptId(sourcePath: string): string {
@@ -98,7 +96,6 @@ function targetFor(sourcePath: string): ContextTarget[] {
 		return ["main", "subagent"];
 	}
 	if (sourcePath.startsWith("_agent/compaction/")) return ["side_model"];
-	if (sourcePath === "prompts/skills/smarty-mergify-policy.md") return ["main", "subagent"];
 	if (sourcePath === "prompts/providers/internal-context.md") return ["main", "subagent", "side_model"];
 	if (sourcePath.includes("subagent") || sourcePath.startsWith("prompts/agents/") || sourcePath.startsWith("task/")) {
 		return ["subagent"];
@@ -131,7 +128,6 @@ function roleFor(sourcePath: string): ContextRole {
 	}
 	if (
 		sourcePath === "prompts/providers/internal-context.md" ||
-		sourcePath === "prompts/skills/smarty-mergify-policy.md" ||
 		sourcePath.includes("goal-") ||
 		sourcePath.includes("/goals/") ||
 		sourcePath.includes("/todos/") ||
@@ -151,7 +147,6 @@ function triggerFor(sourcePath: string): (typeof TRIGGERS)[number] {
 	if (sourcePath === "prompts/system/checkpoint-active-notice.md") return "checkpoint_active";
 	if (sourcePath === "prompts/system/date-cwd-reminder.md") return "provider_request";
 	if (sourcePath.startsWith("_agent/compaction/")) return "compaction";
-	if (sourcePath === "prompts/skills/smarty-mergify-policy.md") return "user_selected_skill";
 	if (sourcePath.includes("goal-continuation")) return "active_goal_idle";
 	if (sourcePath.includes("goal-objective-updated")) return "goal_updated";
 	if (sourcePath.includes("goal-budget")) return "goal_budget_limited";

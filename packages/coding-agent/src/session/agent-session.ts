@@ -130,7 +130,6 @@ import {
 	type RuntimeMcpInstruction,
 } from "../context/explain";
 import { bindRenderedInstruction, renderInstruction } from "../context/registry";
-import { smartyMergifySkillInstruction } from "../context/smarty-skills";
 import type { RenderedToolContractExport } from "../context/tool-contracts";
 import { RawSseDebugBuffer } from "../debug/raw-sse-buffer";
 import { getEditStore } from "../edit/store";
@@ -6941,11 +6940,6 @@ export class AgentSession {
 			const todo = this.#todo.buildPassiveSnapshot();
 			if (todo) instructions.push(bindRenderedInstruction("todo.snapshot", todo.content));
 		}
-		const skillPolicy = smartyMergifySkillInstruction(
-			this.agent.state.messages,
-			this.#agentKind === "sub" ? "subagent" : "main",
-		);
-		if (skillPolicy) instructions.push(skillPolicy);
 		if (this.#checkpointState) {
 			const checkpoint = renderInstruction(
 				"system.checkpoint-active-notice",

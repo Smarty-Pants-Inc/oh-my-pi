@@ -966,14 +966,6 @@ prompts:
     visibility: model
     defaultEnabled: false
     order: 1270
-  - id: skill.smarty_mergify_policy
-    path: prompts/skills/smarty-mergify-policy.md
-    role: internal_context
-    target: [main, subagent]
-    trigger: user_selected_skill
-    visibility: model
-    defaultEnabled: false
-    order: 520
   - id: skills.user-invocation
     path: prompts/skills/user-invocation.md
     role: system

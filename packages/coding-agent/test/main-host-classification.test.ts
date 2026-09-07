@@ -2,7 +2,7 @@ import { expect, it, vi } from "bun:test";
 import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
 import { verifyApprovedStartup } from "@oh-my-pi/pi-coding-agent/context/approved-policy";
 import { runRootCommand } from "@oh-my-pi/pi-coding-agent/main";
-import { getDbBusyTimeoutMs, setInteractiveHost } from "@oh-my-pi/pi-utils";
+import { getDbBusyTimeoutMs, setInteractiveHost, TempDir } from "@oh-my-pi/pi-utils";
 
 it("classifies an interactive host before opening auth storage", async () => {
 	const previous = setInteractiveHost(false);
@@ -75,4 +75,42 @@ it("returns interactive prompt-policy drift for the TUI and remains strict other
 			throw unexpected;
 		}),
 	).rejects.toBe(unexpected);
+});
+
+it("starts a noninteractive source process without approved-policy files", async () => {
+	using tempDir = TempDir.createSync("@omp-policy-free-startup-");
+	const probePath = tempDir.join("probe.ts");
+	await Bun.write(
+		probePath,
+		[
+			`import { parseArgs } from ${JSON.stringify(new URL("../src/cli/args.ts", import.meta.url).href)};`,
+			`import { Settings } from ${JSON.stringify(new URL("../src/config/settings.ts", import.meta.url).href)};`,
+			`import { runRootCommand } from ${JSON.stringify(new URL("../src/main.ts", import.meta.url).href)};`,
+			'const reachedAuth = new Error("auth startup reached");',
+			"try {",
+			'  await runRootCommand(parseArgs(["--mode", "json", "--no-extensions"]), [], {',
+			"    settings: Settings.isolated(),",
+			"    discoverAuthStorage: async () => { throw reachedAuth; },",
+			"  });",
+			"  process.exit(1);",
+			"} catch (error) {",
+			"  if (error !== reachedAuth) throw error;",
+			'  process.stdout.write("auth startup reached\\n");',
+			"}",
+		].join("\n"),
+	);
+	const child = Bun.spawn([process.execPath, probePath], {
+		cwd: tempDir.path(),
+		env: { ...process.env, HOME: tempDir.path() },
+		stdin: "ignore",
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	const [exitCode, stdout, stderr] = await Promise.all([
+		child.exited,
+		new Response(child.stdout).text(),
+		new Response(child.stderr).text(),
+	]);
+	expect(exitCode, stderr).toBe(0);
+	expect(stdout).toContain("auth startup reached");
 });

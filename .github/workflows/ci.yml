@@ -399,8 +399,16 @@ jobs:
          - uses: ./.github/actions/native-artifacts
            with:
               targets: linux-x64-baseline linux-x64-modern
-         - name: CLI smoke test
-           run: bun run ci:test:smoke
+         - name: Verify canonical post-land check from a clean worktree
+           shell: bash
+           run: |
+              verifier="${RUNNER_TEMP}/omp-post-land-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+              trap 'git worktree remove --force "$verifier"' EXIT
+              git worktree add --detach "$verifier" HEAD
+              mkdir -p "$verifier/packages/natives/native"
+              cp packages/natives/native/*.node "$verifier/packages/natives/native/"
+              test ! -e "$verifier/node_modules"
+              (cd "$verifier" && bun run ci:post-land)
 
    install_methods:
       name: Install method smoke tests

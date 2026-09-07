@@ -272,18 +272,26 @@ Rejected, with measurements, so nobody re-litigates them: **sccache** (cannot ca
 
 ## Smarty-managed fork
 
-`smarty-dev` is the sole OMP promotion authority. The old Smarty App patch
+`smarty-dev` provides the managed OMP build and installation tooling. The old Smarty App patch
 replay and `omp-fork-manager.mjs` routes are archival; do not use them.
 
-Land OMP changes through the current fetched `smarty-dev/bin/smarty-review`
-and `smarty-dev/bin/smarty-land` transactions. Never merge, queue, requeue, or
-push protected branches directly. After the exact OMP commit lands, land a
-Smarty Dev parent update that pins the matching `repos/omp` gitlink and
-`integrations/omp/release.json`. Build, install, select, verify, and roll back
-only through that landed parent's `bin/omp-fork` and `bin/smarty-dev-sync`
-commands.
+Land OMP changes through normal GitHub pull requests. Follow the existing protected-branch and
+review rules, require `smarty-ci` on the exact PR head, then, when authorized, post
+`@mergifyio queue default` to the configured serial `default` queue. Never push or merge a
+protected branch directly; verify the remote default branch after Mergify lands the PR.
 
-A direct user request to land or activate authorizes that routine transaction. Keep hashes, receipts, policy records, and exact-tree proofs as internal evidence. Ask again only when purpose or scope materially changes, or when a real external blocker requires user input. Do not turn normal landing into a user-facing approval ceremony.
+After the exact OMP commit lands, update the Smarty Dev parent to pin the matching `repos/omp`
+gitlink and `integrations/omp/release.json`. Build, install, select, verify, and roll back only
+through that landed parent's `bin/omp-fork` and `bin/smarty-dev-sync` commands.
+
+OMP post-land verification must use `bun run ci:post-land`. Keep that command
+self-bootstrapping from a pristine detached worktree with no pre-existing
+`node_modules`; never substitute an ad hoc caller command.
+
+A direct user request to land or activate authorizes that operation. Keep commit, CI, queue, and
+remote-default verification evidence internally. Ask again only when purpose or scope materially
+changes, or when a real external blocker requires user input. Do not turn normal landing into a
+user-facing approval ceremony.
 
 Agent-started goals are intentional fork behavior: `goal` must be available
 when `goal.enabled` is true and the session has a `GoalRuntime`, even before the

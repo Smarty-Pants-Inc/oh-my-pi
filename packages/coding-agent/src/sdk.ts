@@ -87,7 +87,7 @@ import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate
 import { applyProviderGlobalsFromSettings } from "./config/provider-globals";
 import { buildServiceTierByFamily } from "./config/service-tier";
 import { Settings, type SkillsSettings } from "./config/settings";
-import { ensureApprovedStartup, promptPolicyReviewWarning } from "./context/approved-policy";
+import { promptPolicyReviewWarning } from "./context/approved-policy";
 import { captureRuntimeContextEvidence, isRuntimeContextEvidencePayload } from "./context/explain";
 import { isOmpInternalSession } from "./context/internal-session";
 import { type ContextReleaseManifest, canonicalAgentDirPath } from "./context/manifest";
@@ -112,6 +112,7 @@ import {
 import { discoverCustomToolPaths, loadCustomTools, type ToolPathWithSource } from "./extensibility/custom-tools";
 import type { CustomTool, CustomToolContext, CustomToolSessionEvent } from "./extensibility/custom-tools/types";
 import {
+	assertApprovedPromptAffectingExtensions,
 	bindPreparedExtensions,
 	discoverAndLoadExtensions,
 	discoverExtensionPaths,
@@ -1348,7 +1349,7 @@ export function createAutoLearnCaptureRunner(
 let testApprovedStartupManifest: ContextReleaseManifest | undefined;
 
 async function startupReleaseManifest(): Promise<ContextReleaseManifest | undefined> {
-	return isBunTestRuntime() ? testApprovedStartupManifest : await ensureApprovedStartup();
+	return isBunTestRuntime() ? testApprovedStartupManifest : undefined;
 }
 
 export function testSetApprovedStartupManifest(manifest: ContextReleaseManifest | undefined): void {
@@ -2281,6 +2282,7 @@ async function createAgentSessionScoped(
 		// Load inline extensions from factories. Caller-provided factories are safe
 		// to rebind, so preserve them with file-backed prepared extensions for
 		// `/tan` and other child sessions.
+		const firstInlineExtensionIndex = extensionsResult.extensions.length;
 		const rebindableInlineExtensionCount = options.extensions?.length ?? 0;
 		if (inlineExtensions.length > 0) {
 			for (let i = 0; i < inlineExtensions.length; i++) {
@@ -2306,6 +2308,13 @@ async function createAgentSessionScoped(
 				}
 			}
 		}
+		await assertApprovedPromptAffectingExtensions(
+			extensionsResult.extensions.slice(
+				firstInlineExtensionIndex,
+				firstInlineExtensionIndex + rebindableInlineExtensionCount,
+			),
+			releaseManifest,
+		);
 		toolSession.preparedExtensions = extensionsResult.preparedExtensions;
 
 		resolvedExecutionEnvironmentProvider = options.executionEnvironmentProvider;

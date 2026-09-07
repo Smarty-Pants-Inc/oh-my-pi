@@ -1240,7 +1240,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			return sessions.map(s => ({ name: s.name, timeAgo: s.timeAgo }));
 		});
 		const startupQuiet = settings.get("startup.quiet");
-		this.composer.setPreferences({ quiet: startupQuiet });
+		this.composer.setPreferences({ quiet: startupQuiet || options.suppressWelcome });
 		this.composer.updateWelcome({
 			version: this.#version,
 			modelName,
@@ -5414,6 +5414,10 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	truncateTranscriptFromMessage(message: AgentMessage): boolean {
 		return this.#uiHelpers.truncateTranscriptFromMessage(message);
+	}
+
+	refreshModelDisplay(): void {
+		this.#updateWelcomeModel();
 	}
 
 	getUserMessageText(message: Message): string {

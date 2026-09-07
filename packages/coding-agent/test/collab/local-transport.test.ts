@@ -160,14 +160,52 @@ describe("NdjsonRecordParser", () => {
 			});
 			expect(opened).toBe(false);
 			expect(transport.isOpen).toBe(false);
-			announced.socket.write('{"t":"ready"}\n');
+			announced.socket.write('{"t":"ready","routeGeneration":4}\n');
 			await ready.promise;
 			expect(transport.isOpen).toBe(true);
+			expect(transport.routeGeneration).toBe(4);
 			transport.close();
 		} finally {
 			server.stop(true);
 		}
 	});
+
+	it.each([undefined, 0, 1.5, Number.MAX_SAFE_INTEGER + 1])(
+		"rejects a ready record without an assigned positive safe generation",
+		async routeGeneration => {
+			const server = Bun.listen({
+				hostname: "127.0.0.1",
+				port: 0,
+				socket: {
+					open(socket) {
+						socket.write(`${JSON.stringify({ t: "ready", routeGeneration })}\n`);
+					},
+					data() {},
+				},
+			});
+			try {
+				const transport = createHostBridgeTransport(
+					`127.0.0.1:${server.port}`,
+					"route-token",
+					"pane-7",
+					"session-result",
+					1,
+				);
+				const closed = Promise.withResolvers<string>();
+				let opened = false;
+				transport.onOpen = () => {
+					opened = true;
+				};
+				transport.onClose = reason => closed.resolve(reason);
+				transport.connect();
+				expect(await closed.promise).toBe("invalid Herdr bridge ready generation");
+				expect(opened).toBe(false);
+				expect(transport.routeGeneration).toBeUndefined();
+			} finally {
+				server.stop(true);
+			}
+		},
+	);
 
 	it("opens a guest bridge on TCP connection and sends hello without Herdr ready", async () => {
 		const received = Promise.withResolvers<unknown[]>();
@@ -207,6 +245,36 @@ describe("NdjsonRecordParser", () => {
 					frame: { t: "hello", proto: COLLAB_PROTO, name: "guest" },
 				},
 			]);
+			transport.close();
+		} finally {
+			server.stop(true);
+		}
+	});
+
+	it("writes replica readiness as a local bridge record", async () => {
+		const received = Promise.withResolvers<string>();
+		const server = Bun.listen({
+			hostname: "127.0.0.1",
+			port: 0,
+			socket: {
+				open(socket) {
+					socket.write('{"t":"ready"}\n');
+				},
+				data(_socket, data) {
+					received.resolve(data.toString());
+				},
+			},
+		});
+		try {
+			const transport = new LocalCollabTransport(`127.0.0.1:${server.port}`);
+			const opened = Promise.withResolvers<void>();
+			transport.onOpen = () => {
+				transport.notifyReplicaReady();
+				opened.resolve();
+			};
+			transport.connect();
+			await opened.promise;
+			expect(await received.promise).toBe('{"t":"replica-ready"}\n');
 			transport.close();
 		} finally {
 			server.stop(true);

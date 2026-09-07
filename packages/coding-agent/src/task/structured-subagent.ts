@@ -471,7 +471,8 @@ export async function resolveEffectiveSubagentPolicy(
 		execution === "environment"
 			? ENVIRONMENT_SUBAGENT_RUNTIME_PROFILE
 			: createLocalSubagentRuntimeProfile({
-					restrictToolNames: planMode || request.session.restrictToolNames === true,
+					restrictToolNames:
+						planMode || request.session.restrictToolNames === true || effectiveAgent.restrictToolNames === true,
 					enableSpawns: !planMode,
 					enableLsp,
 					enableIrc,

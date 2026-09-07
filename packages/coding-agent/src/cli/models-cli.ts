@@ -17,7 +17,6 @@ import { formatNumber, getProjectDir } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { ModelRegistry } from "../config/model-registry";
 import { Settings } from "../config/settings";
-import { ensureApprovedStartup } from "../context/approved-policy";
 import type { ContextReleaseManifest } from "../context/manifest";
 import { discoverAndLoadExtensions, ExtensionRunner, emitSessionShutdownEvent } from "../extensibility/extensions";
 import { discoverAuthStorage } from "../sdk";
@@ -310,7 +309,7 @@ export async function runModelsListing(options: RunModelsListingOptions): Promis
 		eventBus,
 		disableExtensionDiscovery ? undefined : disabledExtensionIds,
 		{ ambient: !disableExtensionDiscovery, includeAmbientHooks: false },
-		releaseManifest ?? (await ensureApprovedStartup()),
+		releaseManifest,
 	);
 	const extensionRunner =
 		extensionsResult.extensions.length > 0

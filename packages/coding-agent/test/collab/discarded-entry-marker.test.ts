@@ -38,8 +38,10 @@ beforeAll(installInMemoryRelay);
 afterAll(uninstallInMemoryRelay);
 
 describe("discarded entry branch replication", () => {
-	it("keeps the pre-discard conversation connected on a guest snapshot", async () => {
+	it("connects visible messages across internal entries without crossing reset boundaries", async () => {
 		const manager = SessionManager.inMemory();
+		manager.appendMessage({ role: "user", content: "cleared snapshot", timestamp: Date.now() });
+		const snapshotResetId = manager.appendResetBoundary();
 		const priorId = manager.appendMessage({ role: "user", content: "prior", timestamp: Date.now() });
 		const discardedId = manager.appendMessage({
 			role: "assistant",
@@ -61,6 +63,7 @@ describe("discarded entry branch replication", () => {
 		await manager.discardEntryDurably(discardedId);
 		const markerId = manager.getBranch().at(-1)?.id;
 		if (!markerId) throw new Error("Expected a durable branch marker");
+		const hiddenSnapshotId = manager.appendCustomEntry("tool_execution_start");
 		const reminderId = manager.appendMessage({ role: "developer", content: "retry", timestamp: Date.now() });
 
 		const host = new CollabHost(makeHostContext(manager));
@@ -73,9 +76,11 @@ describe("discarded entry branch replication", () => {
 			socket = new CollabSocket({ wsUrl: parsed.wsUrl, role: "guest", key });
 			const frames: CollabFrame[] = [];
 			const complete = Promise.withResolvers<void>();
+			let entryReceived = Promise.withResolvers<void>();
 			socket.onFrame = frame => {
 				frames.push(frame);
 				if (frame.t === "snapshot-chunk" && frame.final) complete.resolve();
+				if (frame.t === "entry") entryReceived.resolve();
 			};
 			socket.onOpen = () => socket?.send({ t: "hello", proto: COLLAB_PROTO, name: "replication test" });
 			socket.connect();
@@ -86,7 +91,33 @@ describe("discarded entry branch replication", () => {
 				if (frame.t !== "snapshot-chunk") continue;
 				for (const entry of frame.entries) guest.ingestReplicatedEntry(entry);
 			}
+			expect(guest.getEntry(hiddenSnapshotId)).toBeUndefined();
+			expect(guest.getEntry(snapshotResetId)).toBeUndefined();
 			expect(guest.getBranch().map(entry => entry.id)).toEqual([priorId, markerId, reminderId]);
+			expect(guest.buildSessionContext().messages).toEqual(manager.buildSessionContext().messages);
+
+			const liveFrameStart = frames.length;
+			const hiddenLiveId = manager.appendCustomEntry("tool_execution_start");
+			const liveId = manager.appendMessage({ role: "developer", content: "live retry", timestamp: Date.now() });
+			await entryReceived.promise;
+			for (const frame of frames.slice(liveFrameStart)) {
+				if (frame.t === "entry") guest.ingestReplicatedEntry(frame.entry);
+			}
+			expect(guest.getEntry(hiddenLiveId)).toBeUndefined();
+			expect(guest.getBranch().map(entry => entry.id)).toEqual([priorId, markerId, reminderId, liveId]);
+
+			const resetFrameStart = frames.length;
+			entryReceived = Promise.withResolvers<void>();
+			const liveResetId = manager.appendResetBoundary();
+			manager.appendCustomEntry("tool_execution_start");
+			const afterResetId = manager.appendMessage({ role: "user", content: "after reset", timestamp: Date.now() });
+			await entryReceived.promise;
+			for (const frame of frames.slice(resetFrameStart)) {
+				if (frame.t === "entry") guest.ingestReplicatedEntry(frame.entry);
+			}
+			expect(guest.getEntry(liveResetId)).toBeUndefined();
+			expect(guest.getBranch().map(entry => entry.id)).toEqual([afterResetId]);
+			expect(guest.buildSessionContext().messages).toEqual(manager.buildSessionContext().messages);
 		} finally {
 			socket?.close();
 			await host.stop("test done");

@@ -195,7 +195,6 @@ export const IMPLEMENTATION_SOURCE_GLOBS = [
 	"packages/coding-agent/src/context/implementation-sources.ts",
 	"packages/coding-agent/src/context/prompt-sources.generated.ts",
 	"packages/coding-agent/src/context/registry.ts",
-	"packages/coding-agent/src/context/smarty-skills.ts",
 	"packages/coding-agent/src/context/tool-contracts.ts",
 	"packages/coding-agent/src/cursor-bridge-tools.ts",
 	"packages/coding-agent/src/cursor.ts",
