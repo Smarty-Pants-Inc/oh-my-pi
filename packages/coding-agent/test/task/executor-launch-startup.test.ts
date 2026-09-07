@@ -77,7 +77,7 @@ it("marks unrestricted subagent sessions as OMP internal prompt authority", asyn
 
 	let internal = false;
 	vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
-		internal = isOmpInternalSession(options);
+		internal = options !== undefined && isOmpInternalSession(options);
 		return sessionResult(yieldingSession());
 	});
 
