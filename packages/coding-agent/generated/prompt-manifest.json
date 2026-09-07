@@ -2151,20 +2151,6 @@
       "sha256": "ff1e270f7497cab10af77c5fc71c6f4422d448627c22aa39160466d14c33e6cd"
     },
     {
-      "id": "skill.smarty_mergify_policy",
-      "path": "packages/coding-agent/src/prompts/skills/smarty-mergify-policy.md",
-      "role": "internal_context",
-      "target": [
-        "main",
-        "subagent"
-      ],
-      "trigger": "user_selected_skill",
-      "visibility": "model",
-      "defaultEnabled": false,
-      "order": 520,
-      "sha256": "87bf04950c88f38b5eb98f21e0862df12d4c2aacd564f35301bd03fc909bcc73"
-    },
-    {
       "id": "skillful-notice",
       "path": "packages/coding-agent/src/prompts/system/skillful-notice.md",
       "role": "system",
@@ -7251,11 +7237,11 @@
     },
     {
       "path": "packages/coding-agent/src/context/explain.ts",
-      "sha256": "dc7e86d26a3cf8eb1e0aae84e0c2d3664bbb8933b0be04996fc2a9dc7bf58c72"
+      "sha256": "e7d050e4c9d84aa4f88c529353ca92bf4bd77705948adda5877d565a6cfe4d4a"
     },
     {
       "path": "packages/coding-agent/src/context/implementation-sources.ts",
-      "sha256": "35cb758968e079d468f71079ec89a0afde7470687939fe7f4e5718b01b1d327d"
+      "sha256": "a78b96fbef4a1ab0b86f445bb5bfb714af9a829e96874fe81bb174776b206c56"
     },
     {
       "path": "packages/coding-agent/src/context/internal-session.ts",
@@ -7267,15 +7253,11 @@
     },
     {
       "path": "packages/coding-agent/src/context/prompt-sources.generated.ts",
-      "sha256": "8a37fe64c646c31fe259cca85339c0c84977a1d86e797744ddf83047093ba758"
+      "sha256": "90aaadf17719b88c33562015cf6e48521800da3876e1c2d290b0ec45c6f27255"
     },
     {
       "path": "packages/coding-agent/src/context/registry.ts",
       "sha256": "a4cdbc4d46c4c11deecb670cb2089e120725cd302ffc9c9627df3d7c4349a871"
-    },
-    {
-      "path": "packages/coding-agent/src/context/smarty-skills.ts",
-      "sha256": "fb28fb4547529c02a787919f1576526083bf9c0f2a76acdfc2382431b2a8c053"
     },
     {
       "path": "packages/coding-agent/src/context/tool-contracts.ts",
@@ -8687,7 +8669,7 @@
     },
     {
       "path": "packages/coding-agent/src/prompt-registry.yml",
-      "sha256": "af16044d24efe86d585abe33a6f4ed24cb6aaeef790707027ad6749ee2154e81"
+      "sha256": "f0be75574bb0b49ef52bc89af10e65e48029816ffc539f4c8820bc25397bcc4a"
     },
     {
       "path": "packages/coding-agent/src/registry/agent-lifecycle.ts",
@@ -8807,7 +8789,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/agent-session.ts",
-      "sha256": "0a850b3d24f1cb1e8a7d96f2fee765f3bc571a12a22fe2728482eea746186880"
+      "sha256": "64ee9d73d878f147453dc6d46e2108ef8c88c0c4275ae1b65948354a2c616db7"
     },
     {
       "path": "packages/coding-agent/src/session/agent-storage.ts",
@@ -11147,5 +11129,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "d096a466fe704e19b6d5b9afd0645a35f44e4ec76f1a0af2ef06893e7900b707"
+  "rootSha256": "403e3165633b6bd4fb13d4315cff397c238ebfe0d948038821b035aedd9aba64"
 }

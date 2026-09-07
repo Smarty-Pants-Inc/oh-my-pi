@@ -252,7 +252,6 @@ describe("native-free context CLI", () => {
 
 		expect(nativeFree.components).toEqual(normalComponents);
 		expect(componentIds).toContain("mcp-xdev-guidance");
-		expect(componentIds).toContain("skill.smarty_mergify_policy");
 		expect(componentIds.filter(id => String(id).startsWith("external.skill."))).toHaveLength(3);
 		const mcpPotential = normalComponents.find(component => String(component.id).startsWith("external.mcp.config."));
 		expect(mcpPotential).toMatchObject({

@@ -20,7 +20,6 @@ import {
 	registeredPromptRepositoryPath,
 	registeredPromptSource,
 } from "./registry";
-import { SMARTY_MERGIFY_SKILLS } from "./smarty-skills";
 import type { RenderedToolContractExport } from "./tool-contracts";
 
 export interface RuntimeMcpInstruction {
@@ -782,8 +781,6 @@ export async function explainContext(options: {
 			const selected = isSkill ? selectedSkills.get(source.id.slice("external.skill.".length)) : undefined;
 			const renderedContent = selected?.renderedText ?? source.content;
 			const contentSha256 = sha256(renderedContent);
-			const hasSmartyWrapper =
-				isSkill && SMARTY_MERGIFY_SKILLS.includes(source.id.slice("external.skill.".length) as never);
 			components.push({
 				id: source.id,
 				source: source.source,
@@ -809,9 +806,8 @@ export async function explainContext(options: {
 				sha256: contentSha256,
 				provider,
 				model,
-				renderedWrapper: hasSmartyWrapper
-					? "exact user-selected skill prompt followed by skill.smarty_mergify_policy"
-					: source.kind === "mcp"
+				renderedWrapper:
+					source.kind === "mcp"
 						? "configuration provenance only; never rendered as server instructions"
 						: selected
 							? "exact runtime user-selected skill prompt"

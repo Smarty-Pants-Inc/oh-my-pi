@@ -296,7 +296,6 @@ const PATH_RULES: readonly PathRule[] = [
 	},
 	{ pattern: /(?:^|\/)src\/context\/(?:registry|prompt-sources\.generated)\.[cm]?[jt]s$/i, surface: "prompt-entry" },
 	{ pattern: /(?:^|\/)src\/context\/tool-contracts\.[cm]?[jt]s$/i, surface: "tool-schema" },
-	{ pattern: /(?:^|\/)src\/context\/smarty-skills\.[cm]?[jt]s$/i, surface: "provider-wrapper" },
 	{
 		pattern: /(?:^|\/)packages\/ai\/src\/(?:context-instructions|types|index)\.[cm]?[jt]s$/i,
 		surface: "provider-mapping",
