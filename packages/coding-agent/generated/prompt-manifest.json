@@ -9319,7 +9319,7 @@
     },
     {
       "path": "packages/coding-agent/src/task/executor.ts",
-      "sha256": "16c02248afba05c748d4c14c4f6cd9d7f1582cf6f7c9022f9ea07b2820e58c26"
+      "sha256": "1ba51fee712739c0902a03fc5f9de7b20efbd31c19f6fdba0a9f83502c72d5b7"
     },
     {
       "path": "packages/coding-agent/src/task/index.ts",
@@ -11147,5 +11147,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "02565602b214c544008abd877a213e616159d1fe7f9a1a2fdd1d917a8d1f843f"
+  "rootSha256": "08fb2c5fa179250c158f89ff0d9ac0577b48f82a4fcaa13de84acc10a06e8715"
 }
