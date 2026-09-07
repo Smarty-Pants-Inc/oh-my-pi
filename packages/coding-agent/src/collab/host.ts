@@ -225,14 +225,14 @@ function projectWireSessionEntry(
 ): ReplicatedSessionEntry | null {
 	const parentId = entry.parentId === null ? null : (nearestWireAncestorByEntryId.get(entry.parentId) ?? null);
 	if (!isWireSessionEntry(entry)) {
-		nearestWireAncestorByEntryId.set(entry.id, parentId);
+		nearestWireAncestorByEntryId.set(entry.id, entry.type === "reset_boundary" ? null : parentId);
 		return null;
 	}
 	nearestWireAncestorByEntryId.set(entry.id, entry.id);
 	return parentId === entry.parentId ? entry : { ...entry, parentId };
 }
 
-/** Remove non-wire entries while reconnecting every retained child to its nearest retained ancestor. */
+/** Remove non-wire entries while reconnecting retained children without crossing `/clear` boundaries. */
 function projectWireSessionEntries(entries: readonly StoredSessionEntry[]): {
 	entries: ReplicatedSessionEntry[];
 	nearestWireAncestorByEntryId: Map<string, string | null>;

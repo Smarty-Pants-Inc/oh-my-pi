@@ -6843,7 +6843,7 @@
     },
     {
       "path": "packages/coding-agent/src/collab/host.ts",
-      "sha256": "b1b83d23adb66cc503f12299dec8b2f048cf3b71692ad4c3244cb3e6601c6f47"
+      "sha256": "f8d9d342b45d9c63ce3023c91dd262f736fcf39eb5300033b7f12a4eefa533ef"
     },
     {
       "path": "packages/coding-agent/src/collab/local-transport.ts",
@@ -11147,5 +11147,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "045bb296fb474915b5d04bec8c1eaf6ecf754c35328a28b1331bc46f7ccfa405"
+  "rootSha256": "d096a466fe704e19b6d5b9afd0645a35f44e4ec76f1a0af2ef06893e7900b707"
 }
