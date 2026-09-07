@@ -6791,7 +6791,7 @@
     },
     {
       "path": "packages/coding-agent/src/cli/models-cli.ts",
-      "sha256": "964c2f4af585976ed573430f7cf37a3cec45e3c9eb36ef16f4ff5575fd70b080"
+      "sha256": "0cb30ca924f4fc9e0ed3cf79a83df9fcfab0f012b1ec35f4685a489679593445"
     },
     {
       "path": "packages/coding-agent/src/cli/plugin-cli.ts",
@@ -8111,7 +8111,7 @@
     },
     {
       "path": "packages/coding-agent/src/main.ts",
-      "sha256": "7b2119c469184d073478461e06409c428ce09866deef677c06228eee1b913ff9"
+      "sha256": "1e11c0294cc980d0738e22e74d8850163e4ad31e8ea93e00d9ceb265ef7b263a"
     },
     {
       "path": "packages/coding-agent/src/markit/converters/docx.ts",
@@ -8703,7 +8703,7 @@
     },
     {
       "path": "packages/coding-agent/src/sdk.ts",
-      "sha256": "1ba45d8e4846965c0a29f13dd20edf4c768954c021102857dd4308845775bb7e"
+      "sha256": "7cb4eb9595e679f38e71ff0adc94b5ac13523f67bd4085d7d829535263fffd5c"
     },
     {
       "path": "packages/coding-agent/src/secrets/index.ts",
@@ -11147,5 +11147,5 @@
     }
   ],
   "behaviorSha256": "15f2427b935ad99845be0bfc74a2d8caaa4bbdfd99032b10a3f196e5f31d476a",
-  "rootSha256": "08fb2c5fa179250c158f89ff0d9ac0577b48f82a4fcaa13de84acc10a06e8715"
+  "rootSha256": "2ed137be5b2f4d9a6169cac7a0f392d4766e930c19ac16ddcdeca3679959a712"
 }

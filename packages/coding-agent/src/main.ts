@@ -55,7 +55,6 @@ import {
 import { ModelsConfigFile } from "./config/models-config";
 import { serviceTierSettingToTier } from "./config/service-tier";
 import { getDefault, type SettingPath, Settings, type SettingValue, settings } from "./config/settings";
-import { ensureApprovedStartup, verifyApprovedStartup } from "./context/approved-policy";
 import type { ContextReleaseManifest } from "./context/manifest";
 import { initializeWithSettings, isProviderEnabled } from "./discovery";
 import {
@@ -521,7 +520,7 @@ async function loadTrustedSessionExtensions(
 			throw new Error(`Trusted extension must be a module file, not a directory: ${trustedPath}`);
 		}
 	}
-	return loadExtensions(paths, cwd, eventBus, releaseManifest ?? (await ensureApprovedStartup()));
+	return loadExtensions(paths, cwd, eventBus, releaseManifest);
 }
 
 /**
@@ -1697,8 +1696,7 @@ export async function runRootCommand(
 		if (!isInteractive) {
 			stopPendingStartupComposer();
 		}
-		const startupVerifier = deps.verifyApprovedStartup ?? (isBunTestRuntime() ? undefined : verifyApprovedStartup);
-		const policyWarning = await startupVerifier?.(isInteractive);
+		const policyWarning = await deps.verifyApprovedStartup?.(isInteractive);
 		if (policyWarning) writeStartupNotice(parsedArgs, `${chalk.yellow(`Warning: ${policyWarning}`)}\n`);
 		const automaticHerdrHostBridge =
 			isInteractive && deps.collabBridge === undefined ? deps.herdrHostBridge : undefined;
@@ -2124,7 +2122,7 @@ export async function runRootCommand(
 
 			const eventBus = new EventBus();
 			const subagentEventBus = new EventBus();
-			const releaseManifest = await ensureApprovedStartup();
+			const releaseManifest: ContextReleaseManifest | undefined = undefined;
 			const extensionsResult = parsedArgs.trustedExtensions?.length
 				? await loadTrustedSessionExtensions(sessionOptions, cwd, eventBus, releaseManifest)
 				: await loadSessionExtensions(sessionOptions, cwd, settingsInstance, eventBus, releaseManifest);
