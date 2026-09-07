@@ -5,6 +5,8 @@
 ### Fixed
 
 - Fixed two idle subagents exchanging a single IRC message ping-ponging forever: wake-turn relays are now tagged and never relayed back, so each automated relay is delivered exactly once instead of waking a reciprocal relay until manual cancellation.
+- Fixed protected native subagents failing startup because unrestricted OMP-created sessions were not recognized as internal prompt-authority sessions.
+- Removed external approved-policy enforcement from normal OMP startup; sessions now use the configured extensions and built-in system prompt without policy-state activation.
 
 ## [18.1.8] - 2026-09-03
 

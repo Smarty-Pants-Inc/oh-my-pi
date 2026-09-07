@@ -87,7 +87,7 @@ import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate
 import { applyProviderGlobalsFromSettings } from "./config/provider-globals";
 import { buildServiceTierByFamily } from "./config/service-tier";
 import { Settings, type SkillsSettings } from "./config/settings";
-import { ensureApprovedStartup, promptPolicyReviewWarning } from "./context/approved-policy";
+import { promptPolicyReviewWarning } from "./context/approved-policy";
 import { captureRuntimeContextEvidence, isRuntimeContextEvidencePayload } from "./context/explain";
 import { isOmpInternalSession } from "./context/internal-session";
 import { type ContextReleaseManifest, canonicalAgentDirPath } from "./context/manifest";
@@ -1349,7 +1349,7 @@ export function createAutoLearnCaptureRunner(
 let testApprovedStartupManifest: ContextReleaseManifest | undefined;
 
 async function startupReleaseManifest(): Promise<ContextReleaseManifest | undefined> {
-	return isBunTestRuntime() ? testApprovedStartupManifest : await ensureApprovedStartup();
+	return isBunTestRuntime() ? testApprovedStartupManifest : undefined;
 }
 
 export function testSetApprovedStartupManifest(manifest: ContextReleaseManifest | undefined): void {

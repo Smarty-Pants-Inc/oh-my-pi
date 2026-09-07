@@ -3410,7 +3410,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						firstChatDispatchAt ??= performance.now();
 					},
 				};
-				return restrictToolNames ? markOmpInternalSession(sessionOptions) : sessionOptions;
+				return markOmpInternalSession(sessionOptions);
 			};
 
 			const sessionManager = await awaitAbortable(sessionManagerPromise);
